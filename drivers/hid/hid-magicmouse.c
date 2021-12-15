@@ -121,19 +121,6 @@ MODULE_PARM_DESC(report_undeciphered, "Report undeciphered multi-touch state fie
 #define TRACKPAD2_RES_Y \
 	((TRACKPAD2_MAX_Y - TRACKPAD2_MIN_Y) / (TRACKPAD2_DIMENSION_Y / 100))
 
-/* These are fallback values, since the real values will be queried from the device. */
-#define J314_TP_DIMENSION_X (float)13000
-#define J314_TP_MIN_X -5900
-#define J314_TP_MAX_X 6500
-#define J314_TP_RES_X \
-	((J314_TP_MAX_X - J314_TP_MIN_X) / (J314_TP_DIMENSION_X / 100))
-#define J314_TP_DIMENSION_Y (float)8100
-#define J314_TP_MIN_Y -200
-#define J314_TP_MAX_Y 7400
-#define J314_TP_RES_Y \
-	((J314_TP_MAX_Y - J314_TP_MIN_Y) / (J314_TP_DIMENSION_Y / 100))
-
-#define J314_TP_MAX_FINGER_ORIENTATION 16384
 
 struct magicmouse_input_ops {
 	int (*raw_event)(struct hid_device *hdev,
@@ -1353,25 +1340,8 @@ static int magicmouse_probe(struct hid_device *hdev,
 		return -ENOMEM;
 	}
 
-	// internal trackpad use a data format use input ops to avoid
-	// conflicts with the report ID.
-	if (id->bus == BUS_HOST) {
-		struct device_node *np;
-
-		np = of_get_child_by_name(hdev->dev.parent->of_node,
-				      "multi-touch");
-		msc->mtp_c1fe =
-			of_device_is_compatible(np, "apple,j700-multitouch");
-		of_node_put(np);
-		msc->input_ops.raw_event = magicmouse_raw_event_mtp;
-		msc->input_ops.setup_input = magicmouse_setup_input_mtp;
-	} else if (id->bus == BUS_SPI) {
-		msc->input_ops.raw_event = magicmouse_raw_event_spi;
-		msc->input_ops.setup_input = magicmouse_setup_input_spi;
-	} else {
-		msc->input_ops.raw_event = magicmouse_raw_event_usb;
-		msc->input_ops.setup_input = magicmouse_setup_input_usb;
-	}
+	msc->input_ops.raw_event = magicmouse_raw_event_usb;
+	msc->input_ops.setup_input = magicmouse_setup_input_usb;
 
 	msc->scroll_accel = SCROLL_ACCEL_DEFAULT;
 	msc->hdev = hdev;
