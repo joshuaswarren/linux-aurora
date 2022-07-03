@@ -19,7 +19,6 @@
 struct apple_rtkit_helper {
 	struct device *dev;
 	struct apple_rtkit *rtk;
-	bool inherited;
 
 	void __iomem *asc_base;
 
@@ -78,8 +77,6 @@ static int apple_rtkit_helper_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct apple_rtkit_helper *helper;
-	const struct property *handoff;
-	u32 inherited;
 	int ret;
 
 	/* 44 bits for addresses in standard RTKit requests */
@@ -106,30 +103,6 @@ static int apple_rtkit_helper_probe(struct platform_device *pdev)
 					"Failed to map SRAM region");
 	}
 
-	handoff = of_find_property(dev->of_node, "linux-enablement-mac,rtkit-inherited", NULL);
-	helper->inherited = handoff != NULL;
-	if (handoff && handoff->length) {
-		if (handoff->length != sizeof(inherited) ||
-		    of_property_read_u32(dev->of_node, handoff->name, &inherited) ||
-		    inherited > 1)
-			return dev_err_probe(dev, -EINVAL, "Invalid RTKit ownership flag\n");
-		helper->inherited = inherited == 1;
-	}
-	if (helper->inherited) {
-		/*
-		 * A previous boot stage explicitly transferred ownership of the
-		 * running RTKit session and its reserved shared buffers. Do not
-		 * reset or quiesce that session while Linux owns the helper.
-		 */
-		if (!(readl_relaxed(helper->asc_base + APPLE_ASC_CPU_CONTROL) &
-		      APPLE_ASC_CPU_CONTROL_RUN))
-			return dev_err_probe(dev, -ENODEV,
-					     "Inherited RTKit firmware is not running");
-
-		dev_info(dev, "Adopting inherited running RTKit firmware\n");
-		return 0;
-	}
-
 	helper->rtk =
 		devm_apple_rtkit_init(dev, helper, NULL, 0, &apple_rtkit_helper_ops);
 	if (IS_ERR(helper->rtk))
@@ -140,11 +113,7 @@ static int apple_rtkit_helper_probe(struct platform_device *pdev)
 		       helper->asc_base + APPLE_ASC_CPU_CONTROL);
 
 	/* Works for both wake and boot */
-	/* Match the measured J813 MTP handoff ordering used by m1n1/Windows. */
-	if (of_device_is_compatible(dev->of_node, "apple,t8142-mtp"))
-		ret = apple_rtkit_wake_early_ap(helper->rtk);
-	else
-		ret = apple_rtkit_wake(helper->rtk);
+	ret = apple_rtkit_wake(helper->rtk);
 	if (ret != 0)
 		return dev_err_probe(dev, ret, "Failed to wake up coprocessor");
 
@@ -154,9 +123,6 @@ static int apple_rtkit_helper_probe(struct platform_device *pdev)
 static void apple_rtkit_helper_remove(struct platform_device *pdev)
 {
 	struct apple_rtkit_helper *helper = platform_get_drvdata(pdev);
-
-	if (helper->inherited)
-		return;
 
 	if (apple_rtkit_is_running(helper->rtk))
 		apple_rtkit_quiesce(helper->rtk);
