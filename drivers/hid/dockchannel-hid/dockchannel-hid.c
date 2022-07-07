@@ -19,7 +19,6 @@
 #include <linux/unaligned.h>
 #include <linux/of.h>
 #include "../hid-ids.h"
-#include "dockchannel-hid-protocol.h"
 
 #define COMMAND_TIMEOUT_MS 1000
 #define START_TIMEOUT_MS 2000
@@ -75,6 +74,7 @@ struct dchid_init_hdr {
 #define INIT_TERMINATOR		2
 #define INIT_PRODUCT_NAME	7
 
+#define CMD_RESET_INTERFACE 0x40
 #define CMD_SEND_FIRMWARE 0x95
 #define CMD_ENABLE_INTERFACE 0xb4
 #define CMD_ACK_GPIO_CMD 0xa1
@@ -156,7 +156,6 @@ struct dchid_iface {
 	uint8_t tx_seq;
 	bool deferred;
 	bool starting;
-	bool startup_failed;
 	bool open;
 	struct completion ready;
 
@@ -166,7 +165,6 @@ struct dchid_iface {
 	struct gpio_desc *gpio;
 	char gpio_name[MAX_GPIO_NAME];
 	int gpio_id;
-	bool gpio_request_seen;
 
 	struct mutex out_mutex;
 	u32 out_flags;
@@ -177,8 +175,6 @@ struct dchid_iface {
 	struct completion out_complete;
 
 	u32 keyboard_layout_id;
-	u32 power_method;
-	bool inherited_power_method_2;
 };
 
 struct dockchannel_hid {
@@ -215,11 +211,6 @@ static struct dchid_iface *
 dchid_get_interface(struct dockchannel_hid *dchid, int index, const char *name)
 {
 	struct dchid_iface *iface;
-	const char *firmware_name;
-	bool explicit_power_method;
-	bool j700_firmware;
-	bool multi_touch;
-	bool no_stm;
 
 	if (index >= MAX_INTERFACES) {
 		dev_err(dchid->dev, "Interface index %d out of range\n", index);
@@ -255,33 +246,6 @@ dchid_get_interface(struct dockchannel_hid *dchid, int index, const char *name)
 		dev_warn(dchid->dev, "No OF node for subdevice %s, ignoring.", name);
 		return NULL;
 	}
-
-	explicit_power_method = !of_property_read_u32(iface->of_node,
-						      "apple,power-method",
-						      &iface->power_method);
-	if (!explicit_power_method) {
-		no_stm = of_property_read_bool(dchid->dev->of_node, "apple,no-stm");
-		j700_firmware =
-			!of_property_read_string(iface->of_node, "firmware-name",
-						 &firmware_name) &&
-			!strcmp(firmware_name, "apple/tpmtfw-j700.bin");
-		multi_touch = !strcmp(name, "multi-touch");
-		iface->power_method = dchid_default_pm(no_stm, multi_touch, j700_firmware);
-		iface->inherited_power_method_2 =
-			iface->power_method == DCHID_POWER_METHOD_2;
-	}
-	/*
-	 * J813's MTP firmware owns the touch reset line. Its Windows bring-up
-	 * uses the v2 Will/Has power messages, including the 50 ms ON delay,
-	 * without a GPIO_REQUEST or an external AFE GPIO operation.
-	 */
-	if (iface->power_method == DCHID_POWER_METHOD_2 &&
-	    !strcmp(name, "multi-touch") && of_machine_is_compatible("apple,j813"))
-		iface->inherited_power_method_2 = true;
-
-	if (iface->power_method == DCHID_POWER_METHOD_2 &&
-	    !iface->inherited_power_method_2)
-		strscpy(iface->gpio_name, "afe-reset", MAX_GPIO_NAME);
 
 	dchid->ifaces[index] = iface;
 	return iface;
@@ -406,89 +370,9 @@ static int dchid_enable_interface(struct dchid_iface *iface)
 
 static int dchid_reset_interface(struct dchid_iface *iface, int state)
 {
-	u8 msg[DCHID_POWER_METHOD_1_CMD_SIZE];
+	u8 msg[] = { CMD_RESET_INTERFACE, 1, iface->index, state };
 
-	dchid_pm1_command(iface->index, state, msg);
 	return dchid_comm_cmd(iface->dchid, msg, sizeof(msg));
-}
-
-static int dchid_power_method_2_transition(struct dchid_iface *iface,
-					   bool has_changed)
-{
-	u8 msg[DCHID_POWER_METHOD_2_CMD_SIZE];
-
-	dchid_pm2_command(iface->index, has_changed, msg);
-	return dchid_comm_cmd(iface->dchid, msg, sizeof(msg));
-}
-
-static int dchid_inherited_pm2_transition(struct dchid_iface *iface, u8 state)
-{
-	u8 msg[DCHID_POWER_METHOD_2_CMD_SIZE];
-	int ret;
-
-	dchid_pm2_state_command(iface->index, state, false, msg);
-	ret = dchid_comm_cmd(iface->dchid, msg, sizeof(msg));
-	if (ret < 0)
-		return ret;
-
-	/* Match the J700 transaction that reached the Touch-ready event. */
-	if (state == DCHID_POWER_STATE_ON)
-		msleep(50);
-
-	dchid_pm2_state_command(iface->index, state, true, msg);
-	return dchid_comm_cmd(iface->dchid, msg, sizeof(msg));
-}
-
-static bool dchid_j700_power_v2(struct dchid_iface *iface)
-{
-	return of_machine_is_compatible("apple,j700") &&
-	       !of_property_present(iface->of_node, "apple,power-method") &&
-	       iface->index == 1 && !strcmp(iface->name, "multi-touch");
-}
-
-static int dchid_j700_set_power(struct dchid_iface *iface, u8 state)
-{
-	struct {
-		u8 command;
-		u8 version;
-		u8 iface;
-		u8 state;
-		u8 did_change;
-		__le32 status;
-	} __packed msg = {
-		.command = DCHID_CMD_RESET_INTERFACE,
-		.version = 2,
-		.iface = iface->index,
-		.state = state,
-	};
-	int ret;
-
-	/*
-	 * J700 MTP_SYS selects PowerMethod=2. Its comm firmware accepts only
-	 * nine-byte v2 reports: will-change, platform function, has-changed.
-	 * The pinned power-sequence uses physical High for 50 ms on power-off
-	 * and Low with no delay on power-on. Use raw levels for this platform
-	 * function, independent of the legacy DT's active-low GPIO flag.
-	 * macsmc-gpio maps it to pKW8(pcIO, 0x10000, 0x130000).
-	 */
-	if (state != 0 && state != 2)
-		return -EINVAL;
-
-	ret = dchid_comm_cmd(iface->dchid, &msg, sizeof(msg));
-	if (ret < 0)
-		return ret;
-
-	ret = gpiod_set_raw_value_cansleep(iface->gpio, state == 0);
-	if (ret < 0)
-		return ret;
-	if (state == 0)
-		fsleep(50000);
-
-	msg.did_change = 1;
-	ret = dchid_comm_cmd(iface->dchid, &msg, sizeof(msg));
-	dev_info(iface->dchid->dev, "J700 MTP power-v2 state=%u result=%d\n",
-		 state, ret);
-	return ret;
 }
 
 static int dchid_send_firmware(struct dchid_iface *iface, void *firmware, size_t size)
@@ -570,11 +454,9 @@ done:
 	return ret;
 }
 
-static int dchid_request_gpio(struct dchid_iface *iface,
-			      enum gpiod_flags flags)
+static int dchid_request_gpio(struct dchid_iface *iface)
 {
 	char prop_name[MAX_GPIO_NAME + 16];
-	int ret;
 
 	if (iface->gpio)
 		return 0;
@@ -584,16 +466,12 @@ static int dchid_request_gpio(struct dchid_iface *iface,
 
 	snprintf(prop_name, sizeof(prop_name), "apple,%s", iface->gpio_name);
 
-	iface->gpio = devm_gpiod_get_index(iface->dchid->dev, prop_name, 0,
-					   flags);
+	iface->gpio = devm_gpiod_get_index(iface->dchid->dev, prop_name, 0, GPIOD_OUT_LOW);
 
 	if (IS_ERR_OR_NULL(iface->gpio)) {
-		ret = iface->gpio ? PTR_ERR(iface->gpio) : -ENODEV;
-		dev_err(iface->dchid->dev,
-			"Failed to request GPIO %s-gpios: %d\n",
-			prop_name, ret);
+		dev_err(iface->dchid->dev, "Failed to request GPIO %s-gpios\n", prop_name);
 		iface->gpio = NULL;
-		return ret;
+		return -1;
 	}
 
 	return 0;
@@ -601,14 +479,9 @@ static int dchid_request_gpio(struct dchid_iface *iface,
 
 static int dchid_start_interface(struct dchid_iface *iface)
 {
-	bool power_method_2;
-	bool inherited_power_method_2;
 	void *fw;
 	size_t size;
 	int ret;
-
-	if (iface->startup_failed)
-		return -EIO;
 
 	if (iface->starting) {
 		dev_warn(iface->dchid->dev, "Interface %s is already starting", iface->name);
@@ -619,72 +492,20 @@ static int dchid_start_interface(struct dchid_iface *iface)
 
 	iface->starting = true;
 
-	power_method_2 = iface->power_method == DCHID_POWER_METHOD_2;
-	inherited_power_method_2 = iface->inherited_power_method_2;
-	if (iface->power_method != DCHID_POWER_METHOD_1 && !power_method_2) {
-		dev_err(iface->dchid->dev,
-			"Unsupported power method %u for %s\n",
-			iface->power_method, iface->name);
-		ret = -EINVAL;
-		goto err;
-	}
-
 	/* Look to see if we need firmware */
 	ret = dchid_get_firmware(iface, &fw, &size);
-	if (ret < 0) {
-		dev_err(iface->dchid->dev,
-			"Failed to load firmware for %s: %d\n",
-			iface->name, ret);
+	if (ret < 0)
 		goto err;
-	}
 
-	if (power_method_2 && (!fw || !size)) {
-		dev_err(iface->dchid->dev,
-			"Power method 2 for %s requires firmware\n",
-			iface->name);
-		ret = -EINVAL;
-		goto err;
-	}
-	if (power_method_2 && !inherited_power_method_2 &&
-	    !iface->gpio_name[0]) {
-		dev_err(iface->dchid->dev,
-			"Explicit power method 2 for %s requires afe-reset\n",
-			iface->name);
-		ret = -EINVAL;
-		goto err;
-	}
-
-	if (dchid_j700_power_v2(iface) && !iface->gpio) {
-		/* Do not toggle the line before the will-change notification. */
-		iface->gpio = devm_gpiod_get_index(iface->dchid->dev,
-						 "apple,afe-reset", 0, GPIOD_ASIS);
-		if (IS_ERR(iface->gpio)) {
-			ret = PTR_ERR(iface->gpio);
-			iface->gpio = NULL;
-			goto err;
-		}
-	}
-
-	/* Dynamic requests include ID zero; Power Method 2 uses afe-reset. */
-	if (!dchid_j700_power_v2(iface) && !inherited_power_method_2 &&
-	    (iface->gpio_request_seen || power_method_2)) {
-		ret = dchid_request_gpio(iface, power_method_2 ?
-					 GPIOD_OUT_HIGH : GPIOD_OUT_LOW);
+	/* If we need a GPIO, make sure we have it. */
+	if (iface->gpio_id) {
+		ret = dchid_request_gpio(iface);
 		if (ret < 0)
 			goto err;
-
-		if (power_method_2) {
-			/* GPIO descriptors use logical values for active-low lines. */
-			gpiod_set_value_cansleep(iface->gpio, 1);
-			msleep(50);
-		}
 	}
 
 	/* Only multi-touch has firmware */
 	if (fw && size) {
-
-		if (dchid_j700_power_v2(iface))
-			iface->startup_failed = true;
 
 		/* Send firmware to the device */
 		dev_info(iface->dchid->dev, "Sending firmware for %s\n", iface->name);
@@ -694,44 +515,10 @@ static int dchid_start_interface(struct dchid_iface *iface)
 			goto err;
 		}
 
-		dev_info(iface->dchid->dev,
-			 "Powering on %s with power method %u\n",
-			 iface->name, iface->power_method);
-		if (dchid_j700_power_v2(iface)) {
-			ret = dchid_j700_set_power(iface, DCHID_POWER_STATE_OFF);
-			if (ret < 0)
-				goto err;
-			ret = dchid_j700_set_power(iface, DCHID_POWER_STATE_ON);
-			if (ret < 0)
-				goto err;
-		} else if (power_method_2) {
-			if (inherited_power_method_2) {
-				ret = dchid_inherited_pm2_transition(iface, DCHID_POWER_STATE_OFF);
-				if (ret < 0)
-					goto err;
-
-				ret = dchid_inherited_pm2_transition(iface, DCHID_POWER_STATE_ON);
-				if (ret < 0)
-					goto err;
-			} else {
-				ret = dchid_power_method_2_transition(iface, false);
-				if (ret < 0)
-					goto err;
-
-				gpiod_set_value_cansleep(iface->gpio, 0);
-
-				ret = dchid_power_method_2_transition(iface, true);
-				if (ret < 0) {
-					gpiod_set_value_cansleep(iface->gpio, 1);
-					goto err;
-				}
-			}
-		} else {
-			ret = dchid_reset_interface(iface,
-						    DCHID_POWER_STATE_ON);
-			if (ret < 0)
-				goto err;
-		}
+		/* After loading firmware, multi-touch needs a reset */
+		dev_info(iface->dchid->dev, "Resetting %s\n", iface->name);
+		dchid_reset_interface(iface, 0);
+		dchid_reset_interface(iface, 2);
 	}
 
 	return 0;
@@ -776,14 +563,11 @@ static int dchid_open(struct hid_device *hdev)
 
 		if (!wait_for_completion_timeout(&iface->ready, msecs_to_jiffies(START_TIMEOUT_MS))) {
 			dev_err(iface->dchid->dev, "iface %s start timed out\n", iface->name);
-			/* A failed sensor boot must not poison every later open. */
-			iface->starting = false;
 			return -ETIMEDOUT;
 		}
 	}
 
 	iface->open = true;
-	iface->startup_failed = false;
 	return 0;
 }
 
@@ -809,6 +593,12 @@ static int dchid_get_report_cmd(struct dchid_iface *iface, u8 reportnum, void *b
 	return ret <= 0 ? ret : ret - 1;
 }
 
+/* Note: buf includes report number! */
+static int dchid_set_report(struct dchid_iface *iface, void *buf, size_t len)
+{
+	return dchid_cmd(iface, HID_OUTPUT_REPORT, REQ_SET_REPORT, buf, len, NULL, 0);
+}
+
 static int dchid_raw_request(struct hid_device *hdev,
 				unsigned char reportnum, __u8 *buf, size_t len,
 				unsigned char rtype, int reqtype)
@@ -820,7 +610,7 @@ static int dchid_raw_request(struct hid_device *hdev,
 		buf[0] = reportnum;
 		return dchid_cmd(iface, rtype, REQ_GET_REPORT, &reportnum, 1, buf + 1, len - 1);
 	case HID_REQ_SET_REPORT:
-		return dchid_cmd(iface, rtype, REQ_SET_REPORT, buf, len, NULL, 0);
+		return dchid_set_report(iface, buf, len);
 	default:
 		return -EIO;
 	}
@@ -1021,7 +811,7 @@ static void dchid_handle_init(struct dockchannel_hid *dchid, void *data, size_t 
 			if (sizeof(*req) > length)
 				break;
 
-			if (iface->gpio_request_seen) {
+			if (iface->gpio_id) {
 				dev_err(dchid->dev,
 					"Cannot request more than one GPIO per interface!\n");
 				break;
@@ -1029,7 +819,6 @@ static void dchid_handle_init(struct dockchannel_hid *dchid, void *data, size_t 
 
 			strscpy(iface->gpio_name, req->name, MAX_GPIO_NAME);
 			iface->gpio_id = req->id;
-			iface->gpio_request_seen = true;
 			break;
 		}
 
@@ -1088,14 +877,7 @@ static void dchid_handle_gpio(struct dockchannel_hid *dchid, void *data, size_t 
 		goto err;
 	}
 
-	if (!iface->gpio_request_seen) {
-		dev_err(dchid->dev,
-			"Got GPIO command without a request for %s\n",
-			iface->name);
-		goto err;
-	}
-
-	if (dchid_request_gpio(iface, GPIOD_OUT_LOW) < 0)
+	if (dchid_request_gpio(iface) < 0)
 		goto err;
 
 	if (!iface->gpio || cmd->gpio != iface->gpio_id) {
@@ -1326,11 +1108,6 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 	}
 
 	dchid->dev = dev;
-	/* Neo firmware has no STM interface from which to obtain identity. */
-	if (of_property_read_bool(dev->of_node, "apple,no-stm")) {
-		dchid->device_id.vendor_id = HOST_VENDOR_ID_APPLE;
-		dchid->id_ready = true;
-	}
 
 	/*
 	 * First make sure all the GPIOs are available, in cased we need to defer.
