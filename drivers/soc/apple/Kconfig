@@ -4,18 +4,6 @@ if ARCH_APPLE || COMPILE_TEST
 
 menu "Apple SoC drivers"
 
-config APPLE_ANE_BRINGUP
-	tristate "Apple T8140 ANE bring-up driver"
-	depends on OF && PM && PM_GENERIC_DOMAINS
-	select MFD_SYSCON
-	help
-	  Experimental J700 ANE resource validation and ANE_SYS runtime power
-	  management. This does not start ANE firmware or execute inference.
-	  Optional read-only PMGR diagnostics report ANE child power states.
-	  The ANE engine, PMP notification, DART and exclave protocols remain
-	  unimplemented. No accelerator device or command submission is exposed.
-	  Leave disabled unless testing ANE bring-up on a MacBook Neo.
-
 config APPLE_DOCKCHANNEL
 	tristate "Apple DockChannel FIFO"
 	depends on ARCH_APPLE || COMPILE_TEST
