@@ -21,6 +21,16 @@ __rust_helper void rust_helper_iounmap(void __iomem *addr)
 }
 #endif /* CONFIG_HAS_IOMEM */
 
+__rust_helper void rust_helper_memcpy_fromio(void *to, const void __iomem *from, long count)
+{
+	memcpy_fromio(to, from, count);
+}
+
+__rust_helper void rust_helper_memcpy_toio(void __iomem *to, const void *from, size_t count)
+{
+	memcpy_toio(to, from, count);
+}
+
 __rust_helper u8 rust_helper_readb(const void __iomem *addr)
 {
 	return readb(addr);
