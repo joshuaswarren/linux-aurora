@@ -507,7 +507,10 @@ static int hidinput_apple_event(struct hid_device *hid, struct input_dev *input,
 				table = macbookpro_dedicated_esc_fn_keys;
 				break;
 			default:
-				table = magic_keyboard_2021_and_2024_fn_keys;
+				if (fnmode == FKEYS_IGNORE)
+					table = apple_fn_keys_minimal;
+				else
+					table = magic_keyboard_2021_and_2024_fn_keys;
 				break;
 			}
 			break;
@@ -993,6 +996,11 @@ static int apple_probe(struct hid_device *hdev,
 	    hdev->type != HID_TYPE_SPI_KEYBOARD)
 		return -ENODEV;
 
+	// key remapping will happen in xkeyboard-config so ignore
+	// APPLE_ISO_TILDE_QUIRK
+	if ((id->bus == BUS_SPI || id->bus == BUS_HOST) && fnmode == FKEYS_IGNORE)
+		quirks &= ~APPLE_ISO_TILDE_QUIRK;
+
 	asc = devm_kzalloc(&hdev->dev, sizeof(*asc), GFP_KERNEL);
 	if (asc == NULL) {
 		hid_err(hdev, "can't alloc apple descriptor\n");
@@ -1251,7 +1259,7 @@ static const struct hid_device_id apple_devices[] = {
 	{ HID_USB_DEVICE(USB_VENDOR_ID_APPLE, USB_DEVICE_ID_APPLE_GEYSER1_TP_ONLY),
 		.driver_data = APPLE_NUMLOCK_EMULATION | APPLE_HAS_FN },
 	{ HID_SPI_DEVICE(SPI_VENDOR_ID_APPLE, HID_ANY_ID),
-		.driver_data = APPLE_HAS_FN | APPLE_ISO_TILDE_QUIRK },
+		.driver_data = APPLE_HAS_FN | APPLE_ISO_TILDE_QUIRK },  // TODO: remove APPLE_ISO_TILDE_QUIRK
 	{ HID_USB_DEVICE(USB_VENDOR_ID_APPLE, USB_DEVICE_ID_APPLE_MAGIC_KEYBOARD_2021),
 		.driver_data = APPLE_HAS_FN | APPLE_ISO_TILDE_QUIRK | APPLE_RDESC_BATTERY },
 	{ HID_BLUETOOTH_DEVICE(BT_VENDOR_ID_APPLE, USB_DEVICE_ID_APPLE_MAGIC_KEYBOARD_2021),
@@ -1265,7 +1273,7 @@ static const struct hid_device_id apple_devices[] = {
 	{ HID_BLUETOOTH_DEVICE(BT_VENDOR_ID_APPLE, USB_DEVICE_ID_APPLE_MAGIC_KEYBOARD_NUMPAD_2021),
 		.driver_data = APPLE_HAS_FN | APPLE_ISO_TILDE_QUIRK },
 	{ HID_DEVICE(BUS_HOST, HID_GROUP_ANY, HOST_VENDOR_ID_APPLE, HID_ANY_ID),
-		.driver_data = APPLE_HAS_FN | APPLE_ISO_TILDE_QUIRK },
+		.driver_data = APPLE_HAS_FN | APPLE_ISO_TILDE_QUIRK },  // TODO: remove APPLE_ISO_TILDE_QUIRK
 	{ HID_USB_DEVICE(USB_VENDOR_ID_APPLE, USB_DEVICE_ID_APPLE_MAGIC_KEYBOARD_2024),
 		.driver_data = APPLE_HAS_FN | APPLE_ISO_TILDE_QUIRK | APPLE_RDESC_BATTERY },
 	{ HID_BLUETOOTH_DEVICE(BT_VENDOR_ID_APPLE, USB_DEVICE_ID_APPLE_MAGIC_KEYBOARD_2024),
