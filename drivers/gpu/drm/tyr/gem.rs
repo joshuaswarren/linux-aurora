@@ -23,13 +23,8 @@ pub(crate) struct BoData {
     flags: u32,
 }
 
-/// Provides a way to pass arguments when creating BoData
-/// as required by the gem::DriverObject trait.
-pub(crate) struct BoCreateArgs {
-    flags: u32,
-}
-
-impl gem::DriverObject for BoData {
+#[vtable]
+impl gem::DriverObject for TyrObject {
     type Driver = TyrDrmDriver;
     type Args = BoCreateArgs;
 
