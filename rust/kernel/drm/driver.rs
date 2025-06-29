@@ -19,7 +19,7 @@ use core::{
 };
 
 /// Driver use the GEM memory manager. This should be set for all modern drivers.
-pub(crate) const FEAT_GEM: u32 = bindings::drm_driver_feature_DRIVER_GEM;
+pub const FEAT_GEM: u32 = bindings::drm_driver_feature_DRIVER_GEM;
 /// Driver supports dedicated render nodes.
 pub const FEAT_RENDER: u32 = bindings::drm_driver_feature_DRIVER_RENDER;
 /// Driver supports DRM sync objects for explicit synchronization of command submission.
@@ -125,6 +125,9 @@ pub trait Driver {
 
     /// Driver metadata
     const INFO: DriverInfo;
+
+    /// Feature flags
+    const FEATURES: u32;
 
     /// IOCTL list. See `kernel::drm::ioctl::declare_drm_ioctls!{}`.
     const IOCTLS: &'static [drm::ioctl::DrmIoctlDescriptor];
