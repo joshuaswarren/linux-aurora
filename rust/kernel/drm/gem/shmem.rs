@@ -19,8 +19,12 @@ use crate::{
         DeviceContext,
         Registered, //
     },
-    error::to_result,
+    error::{
+        from_err_ptr,
+        to_result, //
+    },
     prelude::*,
+    scatterlist,
     sync::aref::ARef,
     types::Opaque, //
 };
@@ -184,6 +188,23 @@ impl<T: DriverObject, C: DeviceContext> Object<T, C> {
 
         // SAFETY: We're recovering the Kbox<> we created in gem_create_object()
         let _ = unsafe { KBox::from_raw(this) };
+    }
+
+    /// Creates (if necessary) and returns an immutable reference to a scatter-gather table of DMA
+    /// pages for this object.
+    ///
+    /// This will pin the object in memory.
+    #[inline]
+    pub fn sg_table(&self) -> Result<&scatterlist::SGTable> {
+        // SAFETY:
+        // - drm_gem_shmem_get_pages_sgt is thread-safe.
+        // - drm_gem_shmem_get_pages_sgt returns either a valid pointer to a scatterlist, or an
+        //   error pointer.
+        let sgt = from_err_ptr(unsafe { bindings::drm_gem_shmem_get_pages_sgt(self.as_raw_shmem()) })?;
+
+        // SAFETY: We checked above that `sgt` is not an error pointer, so it must be a valid
+        // pointer to a scatterlist
+        Ok(unsafe { scatterlist::SGTable::from_raw(sgt) })
     }
 }
 
