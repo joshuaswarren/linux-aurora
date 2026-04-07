@@ -2664,7 +2664,6 @@ F:	include/linux/soc/apple/*
 F:	include/uapi/drm/asahi_drm.h
 F:	net/bluetooth/brcm.c
 F:	net/bluetooth/brcm.h
-F:	tools/testing/selftests/hwmon/macsmc-float-test.py
 
 ARM/ARTPEC MACHINE SUPPORT
 M:	Jesper Nilsson <jesper.nilsson@axis.com>
