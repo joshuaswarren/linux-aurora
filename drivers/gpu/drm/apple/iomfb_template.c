@@ -2246,56 +2246,30 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 
 	for_each_oldnew_plane_in_state(state, plane, old_state, new_state, plane_idx) {
 		struct apple_plane_state *apple_state = to_apple_plane_state(new_state);
-		struct apple_plane *apple_plane = to_apple_plane(plane);
+		struct apple_plane *apl_plane = to_apple_plane(plane);
 
 		/* skip planes not for this crtc */
 		if (old_state->crtc != crtc && new_state->crtc != crtc)
 			continue;
 
-		l = apple_plane->iomfb_surface;
-		req->swap.swap_enabled |= BIT(l);
+		req->swap.swap_enabled |= BIT(apl_plane->iomfb_surf);
 
 		/* the old framebuffer was retained by dcp_flush() already */
 
 		if (!new_state->fb || !new_state->visible) {
 			continue;
 		}
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
-		/*
-		 * The firmware fetches straight from the display DART; a
-		 * surface it cannot translate is the app NMI of
-		 * iomfb_poweroff.  Check the surface's first and last page in
-		 * the display domain before handing the address over, and
-		 * keep the last good surface instead of a refused one.
-		 */
-		if (dcp->disp_iommu_dom && apple_state->surf.buf_size) {
-			dma_addr_t first = apple_state->iova;
-			dma_addr_t last = first + apple_state->surf.buf_size - 1;
-
-			if (!iommu_iova_to_phys(dcp->disp_iommu_dom, first) ||
-			    !iommu_iova_to_phys(dcp->disp_iommu_dom, last)) {
-				dev_warn_ratelimited(dcp->dev,
-					"fb %u: surface %pad+%#x is not mapped in the display DART, not scanning it out\n",
-					new_state->fb->base.id, &first,
-					apple_state->surf.buf_size);
-				continue;
-			}
-		}
-#endif
-		req->surf_null[l] = false;
+		req->surf_null[apl_plane->iomfb_surf] = false;
 		has_surface = 1;
 
-		req->swap.src_rect[l] = apple_state->src_rect;
-		req->swap.dst_rect[l] = apple_state->dst_rect;
+		req->swap.src_rect[apl_plane->iomfb_surf] = apple_state->src_rect;
+		req->swap.dst_rect[apl_plane->iomfb_surf] = apple_state->dst_rect;
 
 		if (dcp->notch_height > 0)
-			req->swap.dst_rect[l].y += dcp->notch_height;
+			req->swap.dst_rect[apl_plane->iomfb_surf].y += dcp->notch_height;
 
-		req->surf_iova[l] = apple_state->iova;
-		req->surf[l].base = apple_state->surf;
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
-		req->swap.surf_flags[l] = dcp_h17p_surf_flags;
-#endif
+		req->surf_iova[apl_plane->iomfb_surf] = apple_state->iova;
+		req->surf[apl_plane->iomfb_surf].base = apple_state->surf;
 
 		/* Use sRGB colorspace only for internal panels. External
 		 * displays are expected to have EDID and user space can use
@@ -2303,8 +2277,8 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		 * colors.
 		 */
 		if (dcp->connector_type == DRM_MODE_CONNECTOR_eDP &&
-		    req->surf[l].base.colorspace == DCP_COLORSPACE_BG_SRGB)
-			req->surf[l].base.colorspace = DCP_COLORSPACE_NATIVE;
+		    req->surf[apl_plane->iomfb_surf].base.colorspace == DCP_COLORSPACE_BG_SRGB)
+			req->surf[apl_plane->iomfb_surf].base.colorspace = DCP_COLORSPACE_NATIVE;
 	}
 
 	if (!has_surface && !crtc_state->color_mgmt_changed) {

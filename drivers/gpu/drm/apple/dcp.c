@@ -2315,6 +2315,11 @@ static int dcp_platform_probe(struct platform_device *pdev)
 		dev_err(dev, "Failed to get dp-phy: %ld\n", PTR_ERR(dcp->phy));
 		return PTR_ERR(dcp->phy);
 	}
+
+	if (of_property_read_u32_array(dev->of_node, "apple,iomfb-surfaces",
+				       dcp->iomfb_surfaces, DCP_MAX_PLANES))
+		dcp->iomfb_surfaces[0] = 1;
+
 	if (dcp->phy) {
 		int ret;
 		/*

@@ -24,7 +24,7 @@
 #include "iomfb-surface.h"
 #include "epic/dpavservep.h"
 
-#define DCP_MAX_PLANES APPLE_DCP_MAX_SURFACES
+#define DCP_MAX_PLANES 4
 
 struct apple_dcp;
 
@@ -238,6 +238,8 @@ struct apple_dcp {
 	 * everything below is mostly used inside IOMFB but it could make     *
 	 * sense to keep some of the members in apple_dcp.                    *
 	 **********************************************************************/
+
+	u32 iomfb_surfaces[DCP_MAX_PLANES];
 
 	/* clock rate request by dcp in */
 	struct clk *clk;

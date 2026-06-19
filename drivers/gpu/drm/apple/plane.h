@@ -14,7 +14,7 @@
 
 struct apple_plane {
 	struct drm_plane base;
-	u32 iomfb_surface;
+	u8 iomfb_surf;
 };
 
 #define to_apple_plane(x) container_of(x, struct apple_plane, base)
@@ -31,7 +31,7 @@ struct apple_plane_state {
 
 #define to_apple_plane_state(x) container_of(x, struct apple_plane_state, base)
 
-struct drm_plane *apple_plane_init(struct drm_device *dev,
+struct apple_plane *apple_plane_init(struct drm_device *dev,
 				   unsigned long possible_crtcs,
 				   u32 iomfb_surface,
 				   bool supports_l10r,
