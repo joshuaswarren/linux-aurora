@@ -158,6 +158,19 @@ static int _skcipher_recvmsg(struct socket *sock, struct msghdr *msg,
 		cflags |= CRYPTO_SKCIPHER_REQ_CONT;
 	}
 
+	/*
+	 * Force synchronous processing.  The async (AIO) path passed the
+	 * socket-wide ctx->iv into the request, which the worker
+	 * dereferenced after the socket lock had been dropped, letting a
+	 * concurrent sendmsg(ALG_SET_IV) inject an attacker IV.  Mainline
+	 * removed the AIO socket path in commit fcc77d33a34c ("net: Remove
+	 * support for AIO on sockets"); the minimal stable fix is to always
+	 * complete synchronously, so ctx->iv is only ever dereferenced under
+	 * the socket lock.  This also keeps the IV chaining intact: for
+	 * ciphers with statesize == 0 (e.g. ctr, cbc) the chained IV is
+	 * carried by the req->iv writeback into ctx->iv, which is only
+	 * consistent on the synchronous path.
+	 */
 	skcipher_request_set_callback(&areq->cra_u.skcipher_req,
 				      cflags |
 				      CRYPTO_TFM_REQ_MAY_SLEEP |
@@ -166,11 +179,9 @@ static int _skcipher_recvmsg(struct socket *sock, struct msghdr *msg,
 	err = crypto_wait_req(ctx->enc ?
 		crypto_skcipher_encrypt(&areq->cra_u.skcipher_req) :
 		crypto_skcipher_decrypt(&areq->cra_u.skcipher_req),
-					 &ctx->wait);
-
+				 &ctx->wait);
 	if (!err)
-		err = algif_skcipher_export(
-			sk, &areq->cra_u.skcipher_req);
+		err = algif_skcipher_export(sk, &areq->cra_u.skcipher_req);
 
 free:
 	af_alg_free_resources(areq);
