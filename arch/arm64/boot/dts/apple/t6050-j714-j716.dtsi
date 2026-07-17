@@ -1,0 +1,36 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * MacBook Pro (14/16-inch, 2026)
+ *
+ * This file contains the parts common to J414 and J416 devices with both M5 Pro and M5 Max.
+ *
+ * target-type: J714s / J714c / J716s / J716c
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+/ {
+	chassis-type = "laptop";
+
+	aliases {
+	};
+
+	chosen {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		framebuffer0: framebuffer@0 {
+			compatible = "apple,simple-framebuffer", "simple-framebuffer";
+			reg = <0 0 0 0>; /* To be filled by loader */
+			/* Format properties will be added by loader */
+			status = "disabled";
+			//power-domains = <&ps_disp_fe>;
+		};
+	};
+
+	memory@10000000000 {
+		device_type = "memory";
+		reg = <0x100 0 0x2 0>; /* To be filled by loader */
+	};
+};
