@@ -18,6 +18,8 @@
 #include "avd.h"
 #include "avd-inst.h"
 
+#define PPS_NUM		8
+
 #define NEW_TILE_ID	BIT(0)
 #define NEW_SLICE	BIT(1)
 
@@ -43,7 +45,6 @@
 #define HEVC_FLAG_TMVP_EN(v)	FIELD_PREP(BIT(21), !!(v))
 
 #define HEVC_SCL_DIMS	0x127ffff
-#define HEVC_DMA_CONFIG	BIT(26)
 
 static inline u32 mv_color_size(u32 w, u32 h)
 {
@@ -108,10 +109,10 @@ static void stream_refs(struct avd_ctx *ctx, struct avd_hevc_run *run)
 
 	dst = vb2_to_avd_decoded_buf(&run->base.bufs.dst->vb2_buf);
 
-	push(ctx->dev->variant->quirks & AVD_QUIRK_HEVC_V5_HEADER ?
-		     HEVC_DMA_CONFIG : 0, "reference_dma_config");
-	pusha(hevc_ctx->bufs.mv_above_info.addr, "mv_above_info", 7);
-	pusha(run->addresses.mv_color, "mv_color", 0);
+	push(INST_DMA2, "cm3_dma_config_6");
+	pusha(hevc_ctx->bufs.pps_tile[1].addr, "hdr_9c_pps_tile_addr_lsb8", 7);
+	pusha(run->addresses.sps, "hdr_bc_sps_tile_addr_lsb8",
+	      sl->slice_pic_order_cnt);
 
 	push(0, "");
 	push(0, "");
@@ -123,9 +124,12 @@ static void stream_refs(struct avd_ctx *ctx, struct avd_hevc_run *run)
 
 		ref_buf = avd_get_ref_buf(ctx, &dst->base.vb, dpb->timestamp);
 
-		dma_addr_t comp_addr = vb2_dma_contig_plane_dma_addr(
-					       &ref_buf->base.vb.vb2_buf, 0) +
-				       ref_buf->comp.start_offset;
+		dma_addr_t rvra_addr =
+			vb2_dma_contig_plane_dma_addr(&ref_buf->base.vb.vb2_buf,
+						      0) +
+			(ref_buf->base.vb.planes[0].length -
+			 sps_size(fmt_width(ctx), fmt_height(ctx)) -
+			 ref_buf->rvra.size);
 
 		push(AVD_REF_NUM(decode->num_active_dpb_entries - 1) |
 			     AVD_REF_FLAG_CONST |
@@ -143,6 +147,7 @@ static void stream_refs(struct avd_ctx *ctx, struct avd_hevc_run *run)
 static void set_scaling_lists(struct avd_ctx *ctx, struct avd_hevc_run *run)
 {
 	const struct v4l2_ctrl_hevc_scaling_matrix *s = run->scaling_matrix;
+	struct avd_dev *avd = ctx->dev;
 	int i, j, k;
 
 	u8 (*dc_16x16)[3] = (u8(*)[3])s->scaling_list_dc_coef_16x16;
@@ -302,8 +307,13 @@ static void set_header(struct avd_ctx *ctx, struct avd_hevc_run *run)
 
 	bool is_intra = run->sl[0].slice_type == V4L2_HEVC_SLICE_TYPE_I;
 
-	push(AVD_OP_HDR | AVD_OP_HDR_FLAG_DECOMP(ctx->decomp) |
-		     AVD_OP_HDR_FLAG_INTRA(is_intra) | AVD_OP_HDR_CONST |
+	push(AVD_OP_EXEC | AVD_OP_EXEC_FIFO_IDX(ctx->fifo_idx) |
+		     AVD_OP_EXEC_FLAG_START_REV3(avd->variant->revision == 3) |
+		     AVD_OP_EXEC_FLAG_START_REV4(avd->variant->revision == 4),
+	     "inst_fifo_start");
+
+	push(AVD_OP_HDR | AVD_OP_HDR_FLAG0 | AVD_OP_HDR_FLAG_INTRA(is_intra) |
+		     AVD_OP_HDR_CONST |
 		     AVD_OP_HDR_FLAG_PIPE_STATE(
 			     !(avd->variant->quirks & AVD_QUIRK_NO_PIPE_STATE)),
 	     "hdr_34_start_hdr");
@@ -364,23 +374,19 @@ static void set_header(struct avd_ctx *ctx, struct avd_hevc_run *run)
 	pusha(hevc_ctx->bufs.lf_above_info.addr, "scratch_addr", 2);
 
 	if (pps->flags & V4L2_HEVC_PPS_FLAG_TILES_ENABLED) {
-		pusha(hevc_ctx->bufs.lf_left.addr,
-		      "scratch_addr", 3);
-		pusha(hevc_ctx->bufs.lf_left_info.addr,
-		      "scratch_addr", 4);
-		if (avd->variant->quirks & AVD_QUIRK_HEVC_V5_HEADER)
-			pusha(0, "reserved_scratch", 0);
-		pusha(hevc_ctx->bufs.az_above.addr,
-		      "scratch_addr", 8);
-		pusha(hevc_ctx->bufs.sw_left.addr,
-		      "scratch_addr", 9);
+		pusha(hevc_ctx->bufs.pps_tile[4].addr,
+		      "hdr_dc_pps_tile_addr_lsb8", 3);
+		pusha(hevc_ctx->bufs.pps_tile[5].addr,
+		      "hdr_dc_pps_tile_addr_lsb8", 4);
+		pusha(hevc_ctx->bufs.pps_tile[6].addr,
+		      "hdr_dc_pps_tile_addr_lsb8", 8);
+		pusha(hevc_ctx->bufs.pps_tile[7].addr,
+		      "hdr_dc_pps_tile_addr_lsb8", 9);
 	} else {
 		pusha(0, "", 3);
 		pusha(0, "", 4);
-		if (avd->variant->quirks & AVD_QUIRK_HEVC_V5_HEADER)
-			pusha(0, "reserved_scratch", 0);
-		pusha(hevc_ctx->bufs.az_above.addr,
-		      "scratch_addr", 8);
+		pusha(hevc_ctx->bufs.pps_tile[4].addr,
+		      "hdr_dc_pps_tile_addr_lsb8", 8);
 		pusha(0, "", 9);
 	}
 
@@ -418,6 +424,7 @@ static void stream_weights(struct avd_ctx *ctx, struct avd_hevc_run *run,
 	u8 chroma_log2_weight_denom;
 	const struct v4l2_ctrl_hevc_pps *pps = run->pps;
 	const struct v4l2_hevc_pred_weight_table *pred = &sl->pred_weight_table;
+	struct avd_dev *avd = ctx->dev;
 	bool has_luma_weights =
 		((pps->flags & V4L2_HEVC_PPS_FLAG_WEIGHTED_PRED) &&
 		 sl->slice_type == V4L2_HEVC_SLICE_TYPE_P) ||
@@ -640,13 +647,12 @@ static void stream_slice_mv(struct avd_ctx *ctx, struct avd_hevc_run *run,
 	     "slc_a8c_cmd_ref_type");
 
 	if (ref_valid) {
-		dma_addr_t mv_color_addr =
+		dma_addr_t sps_tile_addr =
 			vb2_dma_contig_plane_dma_addr(&ref->base.vb.vb2_buf,
 						      0) +
-			round_down(ref->base.vb.planes[0].length -
-				   mv_color_size(fmt_width(ctx), fmt_height(ctx)),
-				   AVD_ALIGN);
-		pusha(mv_color_addr, "slc_bd4_sps_tile_addr2_lsb8",
+			(ref->base.vb.planes[0].length -
+			 sps_size(fmt_width(ctx), fmt_height(ctx)));
+		pusha(sps_tile_addr, "slc_bd4_sps_tile_addr2_lsb8",
 		      decode->dpb[ref_list[sl->collocated_ref_idx]]
 			      .pic_order_cnt_val);
 	}
@@ -656,8 +662,8 @@ static void set_slice(struct avd_ctx *ctx, struct avd_hevc_run *run,
 		      const struct v4l2_ctrl_hevc_slice_params *sl, u32 size,
 		      u32 offset, u32 flags)
 {
-	dma_addr_t slc_addr =
-		run->base.coded_in + offset + sl->data_byte_offset;
+	struct avd_dev *avd = ctx->dev;
+	dma_addr_t slc_addr = run->addresses.sl + offset + sl->data_byte_offset;
 	push(AVD_OP_CODED_DATA | flags | AVD_OP_CODED_DATA_ADDR(slc_addr >> 32),
 	     "cm3_cmd_set_coded_slice");
 	push((u32)(slc_addr & 0xffffffff), "slc_bd8_slice_addr");
@@ -668,9 +674,9 @@ static int submit_slice_segment(struct avd_ctx *ctx, struct avd_hevc_run *run,
 				const struct v4l2_ctrl_hevc_slice_params *sl,
 				int row, int col, u32 col_bd[23],
 				u32 row_bd[23], u32 pic_in_cts_width,
-				u32 pic_in_cts_height, bool first_slice,
-				bool hflip, bool vflip, u32 coded_flags,
-				u32 last_tile_block)
+				u32 pic_in_cts_height, bool is_last,
+				bool first_slice, bool hflip, bool vflip,
+				u32 coded_flags, u32 last_tile_block)
 {
 	const struct v4l2_ctrl_hevc_pps *pps = run->pps;
 	u32 tb_x, tb_y, tile_block, tile_boundary;
@@ -725,6 +731,9 @@ static int submit_slice_segment(struct avd_ctx *ctx, struct avd_hevc_run *run,
 	push(AVD_SL_DIM_END_COL(1) |
 		     (coded_flags & NEW_SLICE ? tile_block : tile_boundary),
 	     "cm3_set_mv_xy");
+
+	push(AVD_OP_EXEC | AVD_OP_EXEC_FLAG_END(is_last),
+	     "cm3_cmd_inst_fifo_end");
 
 	return last_tile_block;
 }
@@ -834,6 +843,30 @@ static void compute_tile_ids(struct avd_hevc_run *run, u32 pic_in_ctbs_width,
 							  x]] = tile_idx;
 }
 
+static int avd_wait_submission_queue(struct avd_ctx *ctx)
+{
+	struct avd_dev *avd = ctx->dev;
+	u32 max = readl_relaxed(avd->ctrl +
+				avd->variant->submit_queue_max_offset +
+				(ctx->vp_slot) * 4);
+	u32 cur = readl_relaxed(avd->ctrl +
+				avd->variant->submit_queue_status_offset +
+				(ctx->vp_slot) * 4);
+
+	/* pr_info("%d/%d\n", cur, max); */
+
+	if (cur == max) {
+		dev_err(avd->dev, "instruction que full! %d/%d", cur, max);
+		return 1;
+	}
+
+	if (cur >= max / 2) {
+		/* TODO: to high? low? Has weird side effects??? */
+		usleep_range(100, 150);
+	}
+	return 0;
+}
+
 struct sl_ctx {
 	u32 ctx_col;
 	u32 ctx_row;
@@ -883,12 +916,12 @@ static int stream_slices(struct avd_ctx *ctx, struct avd_hevc_run *run)
 		to = tiles_enabled ? sl->num_entry_point_offsets + 1 : 1;
 		if (tiles_enabled &&
 		    sl->num_entry_point_offsets + entry_point_idx >
-			    run->num_entry_point_offsets) {
+			    run->num_entry_point_offsets + 1) {
 			dev_err(ctx->dev->dev,
-				"too few entry points: has %d, needs %d",
+				"to few entry points! has: %d, needs > %d",
 				run->num_entry_point_offsets,
 				sl->num_entry_point_offsets + entry_point_idx);
-			return -EINVAL;
+			goto done;
 		}
 		for (i = 0; i < to; i++) {
 			first_segment = i == 0;
@@ -914,14 +947,12 @@ static int stream_slices(struct avd_ctx *ctx, struct avd_hevc_run *run)
 				new_offset = size + sl->data_byte_offset;
 			}
 
-			tile_id = tile_info->tile_ids
-					  [tile_info->ctb_addr_rs_to_ts
-						   [sl->slice_segment_addr]];
+			tile_id = tile_ids
+				[ctb_addr_rs_to_ts[sl->slice_segment_addr]];
 			last_tile_id =
 				first_slice ?
 					-1 :
-					tile_info->tile_ids
-						[tile_info->ctb_addr_rs_to_ts
+					tile_ids[ctb_addr_rs_to_ts
 							 [run->sl[s - 1]
 								  .slice_segment_addr]];
 
@@ -1399,17 +1430,12 @@ static void avd_hevc_submit(struct avd_ctx *ctx)
 	struct avd_hevc_ctx *hevc_ctx = ctx->priv;
 	struct avd_dev *avd = ctx->dev;
 
-	writel(AVD_OP_EXEC |
-		       AVD_OP_EXEC_FLAG_START_REV4(avd->variant->revision ==
-						   4) |
-		       AVD_OP_EXEC_FLAG_START_REV3(avd->variant->revision ==
-						   3) |
-		       AVD_OP_EXEC_FIFO_IDX(ctx->fifo_idx) |
-		       AVD_OP_EXEC_FIFO_MASK(avd->variant->fifo_slots),
-	       avd->ctrl + avd->variant->submit_offset);
-	for (int i = 0; i < hevc_ctx->submit_num - 1; i++) {
-		writel(AVD_OP_EXEC | AVD_OP_EXEC_FIFO_IDX(ctx->fifo_idx) |
-			       AVD_OP_EXEC_FIFO_MASK(avd->variant->fifo_slots),
+	for (int i = 0; i < hevc_ctx->submit_num; i++) {
+		writel(0x2b000000 |
+			       (i == 0 ? (avd->variant->revision == 3 ? 0x100 :
+									0x200) :
+					 0) |
+			       (ctx->fifo_idx << 4) | avd->variant->fifo_slots,
 		       avd->ctrl + avd->variant->submit_offset);
 	}
 }

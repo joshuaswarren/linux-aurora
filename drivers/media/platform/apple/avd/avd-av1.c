@@ -55,11 +55,6 @@
 		: AV1_DIV_ROUND_UP_POW2((_value_), (_n_)));		\
 })
 
-#define AV1_REF_SCALE_SHIFT	14
-#define SUPERRES_SCALE_BITS	14
-#define SUPERRES_EXTRA_BITS	8
-#define SUPERRES_SCALE_MASK	((1 << 14) - 1)
-
 #define AV1_CODEC_MODE_INTRABC(v)	FIELD_PREP(BIT(28), !!(v))
 
 #define AV1_HDR_JNT_COMP(v)		FIELD_PREP(BIT(0), !!(v))
@@ -347,49 +342,42 @@ static void set_refs(struct avd_ctx *ctx, struct avd_av1_run *run)
 	dst = vb2_to_avd_decoded_buf(&run->base.bufs.dst->vb2_buf);
 
 	push(0, "ref_cnst0");
-	pusha(av1_ctx->bufs.mv_above_info.addr, "mv_above_info", 0);
+	pusha(av1_ctx->bufs.ref.addr, "unk_ref_buf", 0);
 
 	for (i = 0; i < 4; i++)
 		push(0, "ref_cnst1");
 
 	for (i = 0; i < (intrabc ? 1 : V4L2_AV1_REFS_PER_FRAME); i++) {
-		if (intrabc) {
-			ref = dst;
-		} else {
-			ref_idx = i + V4L2_AV1_REF_LAST_FRAME;
-			ref = avd_get_ref_buf(
-				ctx, &dst->base.vb,
-				frame->reference_frame_ts
-					[frame->ref_frame_idx[i]]);
-		}
+		ref_idx = frame->ref_frame_idx[i] + 1;
+
+		ref = avd_get_ref_buf(ctx, &dst->base.vb,
+				      frame->reference_frame_ts[ref_idx]);
 		addr = vb2_dma_contig_plane_dma_addr(&ref->base.vb.vb2_buf, 0) +
-		       ref->comp.start_offset;
+		       (ref->base.vb.planes[0].length - ref->rvra.size);
 
 		if (!intrabc) {
 			int shift =
 				(gm->flags[ref_idx] &
 				 V4L2_AV1_GLOBAL_MOTION_FLAG_IS_TRANSLATION) ?
-					(WARPEDMODEL_PREC_BITS -
-					 2) - (frame->flags & V4L2_AV1_FRAME_FLAG_ALLOW_HIGH_PRECISION_MV ?
-						       1 :
-						       0) :
-					10;
+					WARPEDMODEL_PREC_BITS - 3 :
+					10 /* why? */;
 			push(AV1_GM_TYPE(gm->type[ref_idx]) |
-				     AV1_GM_PARAM0(gm->params[ref_idx][0] >>
-						   shift) |
-				     AV1_GM_PARAM1(gm->params[ref_idx][1] >>
-						   shift),
+				     AV1_GM_PARAM0(gm->params[ref_idx][0] >> shift) |
+				     AV1_GM_PARAM1(gm->params[ref_idx][1] >> shift),
 			     "ref_gm_mv");
-			push(AV1_GM_VALID(!(V4L2_AV1_GLOBAL_MOTION_IS_INVALID(
-						    ref_idx) &
-					    gm->invalid)) |
+			/* TODO: precison or something, does not always fit */
+			push(AV1_GM_VALID(!(V4L2_AV1_GLOBAL_MOTION_IS_INVALID(ref_idx) & gm->invalid)) |
 				     AV1_GM_PARAM0(AV1_DIV_ROUND_UP_POW2_SIGNED(
 					     gm->params[ref_idx][2], 1)) |
 				     AV1_GM_PARAM1(AV1_DIV_ROUND_UP_POW2_SIGNED(
 					     gm->params[ref_idx][3], 1)),
 			     "ref_gm_param");
-			push(AV1_GM_PARAM1(gm->params[ref_idx][5] >> 1) |
-				     AV1_GM_PARAM0(gm->params[ref_idx][4] >> 1),
+			/* TODO: this does not quite fit */
+			push(AV1_GM_PARAM1(gm->params[ref_idx][5] / 2) |
+				     AV1_GM_PARAM0(AV1_DIV_ROUND_UP_POW2_SIGNED(
+					     gm->params[ref_idx][4] -
+						     gm->params[ref_idx][3],
+					     2)),
 			     "ref_gm_unk2");
 			avd_av1_dec_get_shear_params(&gm->params[ref_idx][0],
 						     &alpha, &beta, &gamma,
@@ -402,13 +390,12 @@ static void set_refs(struct avd_ctx *ctx, struct avd_av1_run *run)
 				     AV1_GM_PARAM_SHEAR1(gamma),
 			     "ref_gm_delta_gamma");
 		}
-		push(AVD_REF_FLAG_CONST |
-			     AV1_REF_ORDER_HINT(
-				     intrabc ? 0 : frame->order_hints[ref_idx]),
+		push(AVD_REF_FLAG_CONST | frame->order_hints[ref_idx],
 		     "ref_flag");
 		push(AVD_HDR_HEIGHT(ref->av1.height) |
 			     AVD_HDR_WIDTH(ref->av1.width),
 		     "ref_height_width");
+		push(0x40004000, "ref_cnst4");
 
 		x_scale = ((ref->av1.upscaled_width << AV1_REF_SCALE_SHIFT) +
 			   (width / 2)) /
@@ -536,34 +523,23 @@ static void set_ref_hints(struct avd_ctx *ctx, struct avd_av1_run *run,
 	int i, ref_idx;
 	struct avd_decoded_buffer *dst, *ref;
 	dst = vb2_to_avd_decoded_buf(&run->base.bufs.dst->vb2_buf);
-
-	for (i = 0; i < 3; i++) {
-		if (selected_refs[i] < V4L2_AV1_REF_LAST_FRAME) {
-			push(0, "");
-			push(0, "");
-		} else {
-			ref_idx = frame->ref_frame_idx[selected_refs[i] -
-						       V4L2_AV1_REF_LAST_FRAME];
-			ref = avd_get_ref_buf(
-				ctx, &dst->base.vb,
-				frame->reference_frame_ts[ref_idx]);
-
-			push(AV1_ORDER_HINT0(ref->av1.order_hints[3]) |
-				     AV1_ORDER_HINT1(ref->av1.order_hints[2]) |
-				     AV1_ORDER_HINT2(ref->av1.order_hints[1]) |
-				     AV1_ORDER_HINT_REF(
-					     (frame->flags &
-					      V4L2_AV1_FRAME_FLAG_USE_REF_FRAME_MVS) ?
-						     selected_refs[i] :
-						     0),
-			     "order_hints0");
-
-			push(AV1_ORDER_HINT0(ref->av1.order_hints[7]) |
-				     AV1_ORDER_HINT1(ref->av1.order_hints[6]) |
-				     AV1_ORDER_HINT2(ref->av1.order_hints[5]) |
-				     AV1_ORDER_HINT3(ref->av1.order_hints[4]),
-			     "order_hints1");
-		}
+	/* TODO: this is very wrong! */
+	for (i = 0; i < V4L2_AV1_TOTAL_REFS_PER_FRAME / 2; i++) {
+		ref_idx = frame->ref_frame_idx[i + 3] + 1;
+		ref = avd_get_ref_buf(ctx, &dst->base.vb,
+				      frame->reference_frame_ts[ref_idx]);
+#define ORDER_HINT(v) ref->av1.order_hints[ref->av1.ref_frame_idx[v] + 1]
+		/* TODO: high bits set */
+		push(AV1_ORDER_HINT0(ORDER_HINT(0)) |
+			     AV1_ORDER_HINT1(ORDER_HINT(1)) |
+			     AV1_ORDER_HINT2(ORDER_HINT(2)) |
+			     AV1_ORDER_HINT3(ORDER_HINT(4)),
+		     "order_hints0");
+		push(AV1_ORDER_HINT0(ORDER_HINT(6)) |
+			     AV1_ORDER_HINT1(ORDER_HINT(5)) |
+			     AV1_ORDER_HINT2(ORDER_HINT(3)),
+		     "order_hints1");
+#undef ORDER_HINT
 	}
 }
 
@@ -633,23 +609,16 @@ static void set_header(struct avd_ctx *ctx, struct avd_av1_run *run)
 	const struct v4l2_av1_cdef *cdef = &frame->cdef;
 	const struct v4l2_av1_segmentation *seg = &frame->segmentation;
 	u32 bytesperline;
-	int i, segid, segval, ref_idx;
-	int step_x, initial_subpel_x;
-	u8 selected_refs[3] = { 0, 0, 0 };
+	int i, segid, segval;
 	bool coded_lossless = frame->tx_mode == V4L2_AV1_TX_MODE_ONLY_4X4;
 	bool intrabc = !!(frame->flags & V4L2_AV1_FRAME_FLAG_ALLOW_INTRABC);
 	bool intra_only = !!((frame->frame_type == V4L2_AV1_KEY_FRAME ||
 			      frame->frame_type == V4L2_AV1_INTRA_ONLY_FRAME));
-	bool cdef_enabled =
-		!(!(seq->flags & V4L2_AV1_SEQUENCE_FLAG_ENABLE_CDEF) ||
-		  frame->flags & V4L2_AV1_FRAME_FLAG_ALLOW_INTRABC ||
-		  coded_lossless);
-
-	struct avd_decoded_buffer *dst, *ref;
-	dma_addr_t ref_addr;
-	dst = vb2_to_avd_decoded_buf(&run->base.bufs.dst->vb2_buf);
-
-	push(AVD_OP_HDR | AVD_OP_HDR_FLAG_DECOMP(ctx->decomp) |
+	push(AVD_OP_EXEC |
+		     AVD_OP_EXEC_FLAG_START_REV4(avd->variant->revision == 4) |
+		     AVD_OP_EXEC_FIFO_IDX(ctx->fifo_idx),
+	     "vp_start");
+	push(AVD_OP_HDR | AVD_OP_HDR_FLAG0 |
 		     AVD_OP_HDR_FLAG_INTRA(intra_only && !intrabc) |
 		     AVD_OP_HDR_CONST | AVD_OP_HDR_FLAG_PIPE_STATE(1),
 	     "op_hdr");
@@ -678,28 +647,42 @@ static void set_header(struct avd_ctx *ctx, struct avd_av1_run *run)
 		     AV1_HDR_DUAL_FILTER(
 			     seq->flags &
 			     V4L2_AV1_SEQUENCE_FLAG_ENABLE_DUAL_FILTER) |
-		     AV1_HDR_ORDER_HINT_BITS((seq->order_hint_bits - 1)) |
-		     AV1_HDR_ORDER_HINT(
-			     seq->flags &
-			     V4L2_AV1_SEQUENCE_FLAG_ENABLE_ORDER_HINT) |
-		     AV1_HDR_MASKED_COMPOUND(
+		     AV1_HDR_INTRA_EDGE_FILTER(
 			     seq->flags &
 			     V4L2_AV1_SEQUENCE_FLAG_ENABLE_MASKED_COMPOUND) |
-		     AV1_HDR_INTERINTRA_COMPOUND(
-			     seq->flags &
-			     V4L2_AV1_SEQUENCE_FLAG_ENABLE_INTERINTRA_COMPOUND) |
 		     AV1_HDR_INTRA_EDGE_FILTER(
 			     seq->flags &
 			     V4L2_AV1_SEQUENCE_FLAG_ENABLE_INTRA_EDGE_FILTER) |
-		     AV1_HDR_FILTER_INTRA(
-			     seq->flags &
-			     V4L2_AV1_SEQUENCE_FLAG_ENABLE_FILTER_INTRA) |
 		     AV1_HDR_128X128_SUPERBLOCK(
 			     seq->flags &
 			     V4L2_AV1_SEQUENCE_FLAG_USE_128X128_SUPERBLOCK) |
 		     AV1_HDR_SCREEN_CONTENT_TOOLS(
 			     frame->flags &
-			     V4L2_AV1_FRAME_FLAG_ALLOW_SCREEN_CONTENT_TOOLS),
+			     V4L2_AV1_FRAME_FLAG_ALLOW_SCREEN_CONTENT_TOOLS) |
+
+		     /* TODO: this seems like a coincidence */
+		     !!!(seq->flags & V4L2_AV1_SEQUENCE_FLAG_ENABLE_ORDER_HINT)
+			     << 1 |
+		     !!(seq->flags &
+			V4L2_AV1_SEQUENCE_FLAG_ENABLE_WARPED_MOTION)
+			     << 2 |
+		     !!(seq->flags &
+			V4L2_AV1_SEQUENCE_FLAG_ENABLE_MASKED_COMPOUND)
+			     << 3 |
+
+		     /* i dont now which of these flags are the right ones */
+		     !!(seq->flags &
+			(V4L2_AV1_SEQUENCE_FLAG_ENABLE_REF_FRAME_MVS |
+			 V4L2_AV1_SEQUENCE_FLAG_ENABLE_ORDER_HINT))
+			     << 4 |
+		     !!(seq->flags &
+			(V4L2_AV1_SEQUENCE_FLAG_ENABLE_INTERINTRA_COMPOUND |
+			 V4L2_AV1_SEQUENCE_FLAG_ENABLE_FILTER_INTRA))
+			     << 7 |
+		     !!(seq->flags &
+			(V4L2_AV1_SEQUENCE_FLAG_ENABLE_INTERINTRA_COMPOUND |
+			 V4L2_AV1_SEQUENCE_FLAG_ENABLE_FILTER_INTRA))
+			     << 9,
 	     "hdr_common");
 
 	push(AV1_FLAGS_TX_MODE_LARGEST(frame->tx_mode ==
@@ -714,10 +697,8 @@ static void set_header(struct avd_ctx *ctx, struct avd_av1_run *run)
 			     V4L2_AV1_FRAME_FLAG_ALLOW_WARPED_MOTION) |
 		     AV1_FLAGS_SKIP_MODE(
 			     frame->flags &
-			     V4L2_AV1_FRAME_FLAG_SKIP_MODE_PRESENT) |
-		     AV1_FLAGS_MOTION_IS_SWITCHABLE(
-			     frame->flags &
-			     V4L2_AV1_FRAME_FLAG_IS_MOTION_MODE_SWITCHABLE) |
+			     (V4L2_AV1_FRAME_FLAG_SKIP_MODE_ALLOWED |
+			      V4L2_AV1_FRAME_FLAG_SKIP_MODE_PRESENT)) |
 		     AV1_FLAGS_INTRABC(frame->flags &
 				       V4L2_AV1_FRAME_FLAG_ALLOW_INTRABC) |
 		     AV1_FLAGS_INTEGER_MV(
@@ -731,9 +712,6 @@ static void set_header(struct avd_ctx *ctx, struct avd_av1_run *run)
 		     AV1_FLAGS_HIGH_PRECISION_MV(
 			     frame->flags &
 			     V4L2_AV1_FRAME_FLAG_ALLOW_HIGH_PRECISION_MV) |
-		     AV1_FLAGS_REF_FRAME_MVS(
-			     frame->flags &
-			     V4L2_AV1_FRAME_FLAG_USE_REF_FRAME_MVS) |
 		     AV1_FLAGS_SEG_TEMPORAL_UPDATE(
 			     frame->segmentation.flags &
 			     V4L2_AV1_SEGMENTATION_FLAG_TEMPORAL_UPDATE) |
@@ -742,23 +720,38 @@ static void set_header(struct avd_ctx *ctx, struct avd_av1_run *run)
 			     V4L2_AV1_SEGMENTATION_FLAG_UPDATE_MAP) |
 		     AV1_FLAGS_SEG_ENABLED(frame->segmentation.flags &
 					   V4L2_AV1_SEGMENTATION_FLAG_ENABLED) |
-		     /* im not sure this is correct */
 		     AV1_FLAGS_SEG_UPDATE_DATA(
 			     frame->segmentation.flags &
 			     V4L2_AV1_SEGMENTATION_FLAG_UPDATE_DATA) |
-		     AV1_FLAGS_SKIP_MODE1(
-			     frame->flags & V4L2_AV1_FRAME_FLAG_SKIP_MODE_ALLOWED ?
-				     frame->skip_mode_frame[1] - 1 :
-				     7) |
-		     AV1_FLAGS_SKIP_MODE0(
-			     frame->flags & V4L2_AV1_FRAME_FLAG_SKIP_MODE_ALLOWED ?
-				     frame->skip_mode_frame[0] - 1 :
-				     7) |
 		     AV1_FLAGS_ORDER_HINT(frame->order_hint) |
-		     AV1_FLAGS_INTRA(intra_only),
-	     "av1_flags0");
+		     AV1_FLAGS_INTRA(intra_only) |
 
-	set_ref_hdr(ctx, run);
+		     !!(frame->flags &
+			(V4L2_AV1_FRAME_FLAG_USE_REF_FRAME_MVS |
+			 V4L2_AV1_FRAME_FLAG_IS_MOTION_MODE_SWITCHABLE))
+			     << 12 |
+		     /*
+			 * bit 20-22 are always set together
+			 * bit 17-19 are also sat most of the time
+			 * they dont seem to make a difference
+			 */
+		     /* TODO not true */
+		     !(frame->frame_type == V4L2_AV1_KEY_FRAME) << 5,
+	     "av1_flags0");
+	push(
+		/*
+			 * something skip mode / refs related?
+			 * bits 0-20 are set sometimes
+			 * with bit 7, 10, 13, 16 and 19 being the most common
+			 */
+		BIT(7) | BIT(25) | (true ? BIT(22) : BIT(23)) |
+
+			AV1_FLAGS_REFERENCE_SELECT(
+				frame->flags &
+				V4L2_AV1_FRAME_FLAG_REFERENCE_SELECT) |
+			AV1_FLAGS_INTERPOLATION_FILTER(
+				frame->interpolation_filter),
+		"av1_flags1");
 
 	for (segid = 0; segid < V4L2_AV1_MAX_SEGMENTS; segid++) {
 #define SEG_FEAT_EN(feat) \
@@ -838,39 +831,24 @@ static void set_header(struct avd_ctx *ctx, struct avd_av1_run *run)
 
 	push(AV1_QP_PRESENT(frame->quantization.flags &
 			    V4L2_AV1_QUANTIZATION_FLAG_DELTA_Q_PRESENT) |
-		     AV1_QP_DELTA_RES(frame->quantization.delta_q_res) |
 		     AV1_QP_BASE_IDX(frame->quantization.base_q_idx) |
-		     AV1_QP_Y_DC(frame->quantization.delta_q_y_dc) |
+		     AV1_QP_DELTA_RES(frame->quantization.delta_q_res) |
 		     AV1_QP_U_DC(frame->quantization.delta_q_u_dc) |
-		     AV1_QP_U_AC(frame->quantization.delta_q_u_ac),
+		     AV1_QP_Y_DC(frame->quantization.delta_q_y_dc),
 	     "qp_base_q_idx");
 
-	push(AV1_QP_V_DC(frame->quantization.delta_q_v_dc) |
-		     AV1_QP_V_AC(frame->quantization.delta_q_v_ac) |
-		     AV1_QP_QMATRIX(frame->quantization.flags &
-				    V4L2_AV1_QUANTIZATION_FLAG_USING_QMATRIX) |
-		     AV1_QP_QM_Y(frame->quantization.qm_y) |
-		     AV1_QP_QM_U(frame->quantization.qm_u) |
-		     AV1_QP_QM_V(frame->quantization.qm_v),
-	     "qp_qm");
-
+	/* TODO: test294 test35 */
+	push(0, "unk");
+	/* TODO: bit 29-31 */
 	push(AV1_LF_DELTA_ENABLED(frame->loop_filter.flags &
 				  V4L2_AV1_LOOP_FILTER_FLAG_DELTA_ENABLED) |
-		     AV1_LF_DELTA_PRESENT(
-			     frame->loop_filter.flags &
-			     V4L2_AV1_LOOP_FILTER_FLAG_DELTA_LF_PRESENT) |
-		     AV1_LF_DELTA_MULTI(
-			     frame->loop_filter.flags &
-			     V4L2_AV1_LOOP_FILTER_FLAG_DELTA_LF_MULTI) |
-		     AV1_LF_DELTA_RES(frame->loop_filter.delta_lf_res) |
-		     AV1_LF_SHARPNESS(frame->loop_filter.sharpness) |
 		     AV1_LF_LV0(frame->loop_filter.level[0]) |
 		     AV1_LF_LV1(frame->loop_filter.level[1]) |
 		     AV1_LF_LV2(frame->loop_filter.level[2]) |
 		     AV1_LF_LV3(frame->loop_filter.level[3]),
 	     "lf_update");
-
-	push(AV1_LF_REF0(frame->loop_filter.ref_deltas[0]) |
+	push(AV1_LF_SHARPNESS(frame->loop_filter.sharpness) |
+		     AV1_LF_REF0(frame->loop_filter.ref_deltas[0]) |
 		     AV1_LF_REF1(frame->loop_filter.ref_deltas[1]) |
 		     AV1_LF_REF2(frame->loop_filter.ref_deltas[2]) |
 		     AV1_LF_REF3(frame->loop_filter.ref_deltas[3]),
@@ -881,22 +859,22 @@ static void set_header(struct avd_ctx *ctx, struct avd_av1_run *run)
 		     AV1_LF_REF2(frame->loop_filter.ref_deltas[6]) |
 		     AV1_LF_REF3(frame->loop_filter.ref_deltas[7]),
 	     "lf_ref_deltas");
+	/* TODO */
+	push(0, "lf_unk");
 
-	push(AV1_LF_MODE0(frame->loop_filter.mode_deltas[0]) |
-		     AV1_LF_MODE1(frame->loop_filter.mode_deltas[1]),
-	     "lf_mode");
-
-#define AVD_AV1_SEC_FIXUP(i) ((i) == 4 ? 3 : i)
-
-#define AV1_CDEF_PACK_ONE(i)                                          \
-	(AV1_CDEF_Y_PRI(cdef->y_pri_strength[i]) |                    \
-	 AV1_CDEF_Y_SEC(AVD_AV1_SEC_FIXUP(cdef->y_sec_strength[i])) | \
-	 AV1_CDEF_UV_PRI(cdef->uv_pri_strength[i]) |                  \
-	 AV1_CDEF_UV_SEC(AVD_AV1_SEC_FIXUP(cdef->uv_sec_strength[i])))
+#define AV1_CDEF_PACK_ONE(i)                         \
+	(AV1_CDEF_Y_PRI(cdef->y_pri_strength[i]) |   \
+	 AV1_CDEF_Y_SEC(cdef->y_sec_strength[i]) |   \
+	 AV1_CDEF_UV_PRI(cdef->uv_pri_strength[i]) | \
+	 AV1_CDEF_UV_SEC(cdef->uv_sec_strength[i]))
 
 #define AV1_CDEF_PACK(i)                            \
 	AV1_CDEF_HI(AV1_CDEF_PACK_ONE(((i) * 2))) | \
 		AV1_CDEF_LO(AV1_CDEF_PACK_ONE(((i) * 2) + 1))
+	bool cdef_enabled =
+		!(!(seq->flags & V4L2_AV1_SEQUENCE_FLAG_ENABLE_CDEF) ||
+		  frame->flags & V4L2_AV1_FRAME_FLAG_ALLOW_INTRABC ||
+		  coded_lossless);
 	push(AV1_CDEF_EN(cdef_enabled) | AV1_CDEF_BITS(frame->cdef.bits) |
 		     AV1_CDEF_DAMPING(frame->cdef.damping_minus_3) |
 		     AV1_CDEF_PACK(0),
@@ -907,23 +885,15 @@ static void set_header(struct avd_ctx *ctx, struct avd_av1_run *run)
 #undef AV1_CDEF_PACK_ONE
 #undef AV1_CDEF_PACK
 
-	push(AV1_SUPERRES_USE(frame->flags & V4L2_AV1_FRAME_FLAG_USE_SUPERRES) |
-		     AV1_SUPERRES_DENOM(
-			     frame->flags & V4L2_AV1_FRAME_FLAG_USE_SUPERRES ?
-				     (frame->superres_denom - 1) :
-				     0) |
-		     AV1_SUPERRES_UPSCALE(frame->upscaled_width - 1),
-	     "superres");
-
-	calc_upscale(frame->frame_width_minus_1 + 1, frame->upscaled_width, 0,
-		     &step_x, &initial_subpel_x);
-	push(AV1_UPSCALE_UPSCX(initial_subpel_x) | AV1_UPSCALE_STEPX(step_x),
-	     "upscale_p0");
-	calc_upscale(frame->frame_width_minus_1 + 1, frame->upscaled_width,
-		     !!(seq->flags & V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_X),
-		     &step_x, &initial_subpel_x);
-	push(AV1_UPSCALE_UPSCX(initial_subpel_x) | AV1_UPSCALE_STEPX(step_x),
-	     "upscale_p1");
+	/* TODO: this is wrong, maybe has something to do with superres */
+	push((frame->flags & V4L2_AV1_FRAME_FLAG_USE_SUPERRES ?
+		      (frame->superres_denom - 1) << 28 :
+		      0) |
+		     frame->upscaled_width - 1,
+	     "upscaled_width");
+	/* something superres related? test35 */
+	push(0x200000, "flag_unk0");
+	push(0x200000, "flag_unk1");
 
 	u8 restoration_unit_size[V4L2_AV1_NUM_PLANES_MAX] = { 3, 3, 3 };
 
@@ -944,6 +914,16 @@ static void set_header(struct avd_ctx *ctx, struct avd_av1_run *run)
 		     AV1_LR_UNIT1(restoration_unit_size[1]) |
 		     AV1_LR_UNIT2(restoration_unit_size[2]),
 	     "lr");
+
+	push(0, "cnst3");
+	push(0, "cnst3");
+	pusha(av1_ctx->bufs.pipe_state.addr, "pipe_state", 0);
+	for (i = 0; i < 10; i++)
+		pusha(av1_ctx->bufs.const_unk[i + 2].addr, "const_unk", i + 2);
+
+	push(0, "mark_section");
+
+	push_rvra(avd, ctx, run->addresses.rvra, ctx->rvra.offsets);
 
 	push(0, "");
 	push(0, "");
@@ -975,8 +955,8 @@ static void set_header(struct avd_ctx *ctx, struct avd_av1_run *run)
 
 	push(0, "mark_section");
 
-	push(AVD_HDR_HEIGHT(frame->render_height_minus_1 + 1) |
-		     AVD_HDR_WIDTH(frame->render_width_minus_1 + 1),
+	push(AVD_HDR_HEIGHT(frame->frame_height_minus_1) |
+		     AVD_HDR_WIDTH(frame->frame_width_minus_1),
 	     "height_width_3");
 	if (!intra_only || intrabc)
 		set_refs(ctx, run);
@@ -996,52 +976,47 @@ static void set_tiles(struct avd_ctx *ctx, struct avd_av1_run *run)
 
 	av1_ctx->submit_num = tile_info->tile_cols * tile_info->tile_rows;
 
-	for (row = 0; row < tile_info->tile_rows; row++) {
-		for (col = 0; col < tile_info->tile_cols; col++) {
-			ctx->job.num++;
-			tile_id = row * tile_info->tile_cols + col;
+	for (col = 0; col < tile_info->tile_cols; col++) {
+		for (row = 0; row < tile_info->tile_rows; row++) {
+			is_last = col == tile_info->tile_cols - 1 &&
+				  row == tile_info->tile_rows - 1;
+			int tile_id = row * tile_info->tile_cols + col;
 			tile_group = &run->tile_group[tile_id];
 
 			push(AVD_OP_CODED_DATA |
 				     AVD_OP_CODED_DATA_ADDR(
-					     (run->base.coded_in +
+					     (run->addresses.sl +
 					      tile_group->tile_offset) >>
 					     32),
-			     "tile_start");
-			push((u32)((run->base.coded_in +
+			     "set_coded_data");
+			push((u32)((run->addresses.sl +
 				    tile_group->tile_offset) &
 				   0xffffffff),
-			     "tile_addr");
+			     "coded_data_addr");
 			push(tile_group->tile_size, "tile_size");
 
-			sb_row =
-				tile_info->mi_row_starts[tile_group->tile_row] >>
-				sb_shift;
-			sb_col =
-				tile_info->mi_col_starts[tile_group->tile_col] >>
-				sb_shift;
+			/* TODO */
+			int row_start =
+				tile_info->mi_row_starts[tile_group->tile_row];
+			int col_start =
+				tile_info->mi_col_starts[tile_group->tile_col];
 			push(AVD_OP_SL_DIM_START |
-				     AVD_OP_SL_DIM_START_Y(sb_row) |
-				     AVD_OP_SL_DIM_START_X(sb_col),
-			     "tile_op_start");
+				     AVD_OP_SL_DIM_START_Y(row_start) |
+				     AVD_OP_SL_DIM_START_X(col_start),
+			     "sl_dim_start");
 
-			push(AVD_SL_DIM_END_ROW(
-				     !(frame->flags &
-				       V4L2_AV1_FRAME_FLAG_DISABLE_FRAME_END_UPDATE_CDF) &&
-						     tile_id ==
-							     tile_info->context_update_tile_id ?
-					     8 :
-					     0) |
-				     AVD_SL_DIM_END_COL(col) |
+			push(0 | /* AVD_SL_DIM_END_ROW(TODO) |  */
 				     AVD_SL_DIM_END_Y(
-					     sb_row +
+					     row_start +
 					     tile_info->height_in_sbs_minus_1
 						     [tile_group->tile_row]) |
 				     AVD_SL_DIM_END_X(
-					     sb_col +
+					     col_start +
 					     tile_info->width_in_sbs_minus_1
 						     [tile_group->tile_col]),
-			     "tile_op_end");
+			     "sl_dim_end");
+			push(AVD_OP_EXEC | AVD_OP_EXEC_FLAG_END(is_last),
+			     "end");
 #ifdef DEBUG_INST
 			pr_info("\n");
 #endif
@@ -1156,10 +1131,10 @@ static int avd_av1_run_preamble(struct avd_ctx *ctx, struct avd_av1_run *run)
 	run->addresses.color =
 		run->base.y_out + AVD_AV1_COLOR_OFFSET(dst_len, tlb_len);
 
-	run->addresses.probs_out =
-		run->base.y_out + AVD_AV1_CDFS_OFFSET(dst_len, tlb_len);
-	return 0;
-}
+	run->addresses.uv =
+		run->addresses.y +
+		ctx->decoded_fmt.fmt.pix_mp.plane_fmt[0].bytesperline *
+			ALIGN(ctx->decoded_fmt.fmt.pix_mp.height, 16);
 
 static int avd_av1_alloc_work_bufs(struct avd_ctx *ctx, struct avd_av1_run *run)
 {
@@ -1302,10 +1277,12 @@ static int avd_av1_run(struct avd_ctx *ctx)
 		return ret;
 	}
 
-	dst = vb2_to_avd_decoded_buf(&run.base.bufs.dst->vb2_buf);
-	update_dec_buf_info(dst, run.seq, run.frame);
+	avd->variant->configure_stream(avd, av1_ctx->bufs.inst.addr,
+				       ctx->fifo_idx, ctx->vp_slot);
 
-	avd_av1_set_prob(ctx, &run);
+	avd_av1_default_coeff_probs(run.frame->quantization.base_q_idx,
+				    av1_ctx->bufs.probs[1].cpu);
+	avd_av1_set_default_cdfs(av1_ctx->bufs.probs[1].cpu);
 
 	set_header(ctx, &run);
 	set_tiles(ctx, &run);
@@ -1334,6 +1311,26 @@ static int avd_av1_alloc_bufs(struct avd_ctx *ctx)
 			    sizeof(struct avd_av1_cdfs));
 	if (ret)
 		return ret;
+
+	for (i = 0; i < 2; i++) {
+		ret = avd_buf_alloc(avd, &av1_ctx->bufs.probs[i],
+				    sizeof(struct avd_av1_cdfs));
+		if (ret)
+			return ret;
+	}
+
+	for (i = 0; i < 5; i++) {
+		ret = avd_buf_alloc(avd, &av1_ctx->bufs.unk[i], 0x4000);
+		if (ret)
+			return ret;
+	}
+
+	for (i = 0; i < 12; i++) {
+		ret = avd_buf_alloc(avd, &av1_ctx->bufs.const_unk[i],
+				    0x10000 * 4);
+		if (ret)
+			return ret;
+	}
 
 	return 0;
 }
@@ -1420,7 +1417,22 @@ static void avd_av1_submit(struct avd_ctx *ctx)
 		       AVD_OP_EXEC_FIFO_IDX(ctx->fifo_idx) |
 		       AVD_OP_EXEC_FIFO_MASK(avd->variant->fifo_slots),
 	       avd->ctrl + avd->variant->submit_offset);
+#ifdef DEBUG_INST
+	pr_info("%8lx | %s %2d\n",
+		AVD_OP_EXEC |
+			AVD_OP_EXEC_FLAG_START_REV4(avd->variant->revision ==
+						    4) |
+			AVD_OP_EXEC_FIFO_IDX(ctx->fifo_idx) |
+			AVD_OP_EXEC_FIFO_MASK(avd->variant->fifo_slots),
+		"submit", 0);
+#endif
 	for (int i = 0; i < av1_ctx->submit_num - 1; i++) {
+#ifdef DEBUG_INST
+		pr_info("%8lx | %s %2d\n",
+			AVD_OP_EXEC | AVD_OP_EXEC_FIFO_IDX(ctx->fifo_idx) |
+				AVD_OP_EXEC_FIFO_MASK(avd->variant->fifo_slots),
+			"submit", i + 1);
+#endif
 		writel(AVD_OP_EXEC | AVD_OP_EXEC_FIFO_IDX(ctx->fifo_idx) |
 			       AVD_OP_EXEC_FIFO_MASK(avd->variant->fifo_slots),
 		       avd->ctrl + avd->variant->submit_offset);
