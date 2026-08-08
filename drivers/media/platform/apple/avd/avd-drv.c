@@ -35,7 +35,32 @@ static void calc_tile_meta(u32 w, u32 h, u32 bpb, u32 tile_dim,
 	meta_tile_w = roundup_pow_of_two(tiles_width);
 	meta_tile_h = roundup_pow_of_two(tiles_height);
 
-	*meta = ALIGN(meta_tile_w * meta_tile_h * meta_hdr_bytes, 16);
+	switch (image_fmt) {
+	case AVD_IMG_FMT_420_8BIT:
+	case AVD_IMG_FMT_420_10BIT:
+		size2 /= 2;
+		break;
+	default:
+		break;
+	}
+
+	size1 = max((roundup_pow_of_two(width) * roundup_pow_of_two(height)) / 32,
+			 0x100u);
+	/* TODO: how big? */
+
+	rvra->size = round_up(size0 + size1 + size2, 0x4000);
+	rvra->size +=
+		(width < 1000 ? 0 : width < 1800 ? 2 : width < 3800 ? 3 : 9) * 0x4000;
+	/* TODO */
+	rvra->size +=
+		(height < 1000 ? 0 : height < 1800 ? 2 : height < 3800 ? 3 : 9) * 0x4000;
+	/* TODO */
+	rvra->size += 0x10000;
+
+	rvra->offsets[1] = 0;
+	rvra->offsets[0] = size0;
+	rvra->offsets[3] = size0 + size1;
+	rvra->offsets[2] = size0 + size1 + size2;
 }
 
 void fill_comp(struct avd_comp *comp, enum avd_image_fmt image_fmt, u32 width,
