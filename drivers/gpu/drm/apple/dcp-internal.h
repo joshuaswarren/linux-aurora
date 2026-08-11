@@ -234,12 +234,12 @@ struct apple_dcp {
 	bool adopting_session;
 	struct apple_dcp_surface_order iomfb_surfaces;
 
+	DECLARE_BITMAP(iomfb_surfaces, DCP_MAX_PLANES);
+
 	/************* IOMFB **************************************************
 	 * everything below is mostly used inside IOMFB but it could make     *
 	 * sense to keep some of the members in apple_dcp.                    *
 	 **********************************************************************/
-
-	u32 iomfb_surfaces[DCP_MAX_PLANES];
 
 	/* clock rate request by dcp in */
 	struct clk *clk;

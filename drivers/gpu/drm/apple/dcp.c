@@ -991,88 +991,11 @@ bool dcp_fw_compat_is_12_x(struct platform_device *pdev)
 	return dcp->fw_compat == DCP_FIRMWARE_V_12_3;
 }
 
-const u32 *dcp_get_iomfb_surfaces(struct platform_device *pdev, u32 *count)
+unsigned long* dcp_get_iomfb_surfaces(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 
-	*count = dcp->iomfb_surfaces.count;
-	return dcp->iomfb_surfaces.id;
-}
-
-static int dcp_t8140_require_pmc(struct apple_dcp *dcp)
-{
-	void __iomem *pmgr;
-	u32 before, target_write, after;
-	int ret;
-
-	if (!of_device_is_compatible(dcp->dev->of_node, "apple,t8140-dcp"))
-		return 0;
-
-	/*
-	 * The shipping J700 ADT marks PMC on from boot.  The in-tree T8140 DT
-	 * models the domain but does not keep it on, so mirror the PMGR
-	 * provider's power-on sequence before DCP firmware accesses PMC.
-	 */
-	pmgr = ioremap(APPLE_T8140_PMGR_BASE, APPLE_T8140_PMGR_SIZE);
-	if (!pmgr)
-		return dev_err_probe(dcp->dev, -ENOMEM,
-				     "failed to map T8140 PMGR registers\n");
-
-	before = readl(pmgr + APPLE_T8140_PMGR_PMC);
-	target_write = before &
-		~(APPLE_T8140_PMGR_DEV_DISABLE |
-		  APPLE_T8140_PMGR_PS_RESET |
-		  APPLE_T8140_PMGR_AUTO_ENABLE |
-		  APPLE_T8140_PMGR_WAS_CLKGATED |
-		  APPLE_T8140_PMGR_WAS_PWRGATED |
-		  APPLE_T8140_PMGR_PS_TARGET);
-	target_write |= APPLE_T8140_PMGR_PS_ACTIVE;
-	writel(target_write, pmgr + APPLE_T8140_PMGR_PMC);
-
-	ret = readl_poll_timeout_atomic(pmgr + APPLE_T8140_PMGR_PMC, after,
-					((after & APPLE_T8140_PMGR_PS_ACTUAL) >> 4) ==
-						APPLE_T8140_PMGR_PS_ACTIVE,
-					1, 100);
-	if (!ret) {
-		target_write |= APPLE_T8140_PMGR_AUTO_ENABLE;
-		writel(target_write, pmgr + APPLE_T8140_PMGR_PMC);
-		after = readl(pmgr + APPLE_T8140_PMGR_PMC);
-	}
-
-	dev_info(dcp->dev,
-		 "DCP25G83_PMC_PREREQUISITE before %#x target_write %#x after %#x target %#x actual %#x auto %u result %d\n",
-		 before, target_write, after,
-		 (u32)(after & APPLE_T8140_PMGR_PS_TARGET),
-		 (u32)((after & APPLE_T8140_PMGR_PS_ACTUAL) >> 4),
-		 !!(after & APPLE_T8140_PMGR_AUTO_ENABLE), ret);
-	iounmap(pmgr);
-
-	return ret;
-}
-
-static void dcp_t8140_observe_disp_pmp_report(struct apple_dcp *dcp)
-{
-	void __iomem *pmp;
-	u64 status, target, actual;
-
-	if (!of_device_is_compatible(dcp->dev->of_node, "apple,t8140-dcp"))
-		return;
-
-	pmp = ioremap(APPLE_T8140_PMP_BASE, APPLE_T8140_PMP_SIZE);
-	if (!pmp) {
-		dev_warn(dcp->dev, "failed to observe T8140 PMP report registers\n");
-		return;
-	}
-
-	status = readq(pmp + APPLE_T8140_PMP_STATUS);
-	target = readq(pmp + APPLE_T8140_PMP_TGT_READ);
-	actual = readq(pmp + APPLE_T8140_PMP_ACTUAL);
-	dev_info(dcp->dev,
-		 "DCP25G83_PMP_DISP_REPORT_OBSERVE status %#llx target %#llx actual %#llx requested %u active %u\n",
-		 status, target, actual,
-		 !!(target & APPLE_T8140_PMP_DISP_REPORT),
-		 !!(actual & APPLE_T8140_PMP_DISP_REPORT));
-	iounmap(pmp);
+	return dcp->iomfb_surfaces;
 }
 
 int dcp_start(struct platform_device *pdev)
@@ -2260,8 +2183,8 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	enum dcp_firmware_version fw_compat;
 	struct device *dev = &pdev->dev;
 	struct apple_dcp *dcp;
-	int num_surfaces;
-	u32 surface_ids[DCP_MAX_PLANES];
+	int surf, num_surfs;
+	u32 surf_en;
 	u32 mux_index;
 	int ret;
 
@@ -2316,9 +2239,27 @@ static int dcp_platform_probe(struct platform_device *pdev)
 		return PTR_ERR(dcp->phy);
 	}
 
-	if (of_property_read_u32_array(dev->of_node, "apple,iomfb-surfaces",
-				       dcp->iomfb_surfaces, DCP_MAX_PLANES))
-		dcp->iomfb_surfaces[0] = 1;
+	bitmap_zero(dcp->iomfb_surfaces, DCP_MAX_PLANES);
+	num_surfs = of_property_count_elems_of_size(dev->of_node,
+						    "apple,iomfb-surfaces",
+						    sizeof(u32));
+	if (num_surfs == -ENODATA) {
+		set_bit(0, dcp->iomfb_surfaces);
+		set_bit(1, dcp->iomfb_surfaces);
+	} else if (num_surfs < 0) {
+		return num_surfs;
+	} else if (num_surfs > DCP_MAX_PLANES) {
+		dev_err(dev, "Number of iomfb-surfaces (%d) exceeds DCP_MAX_PLANES\n",
+			num_surfs);
+		return -EINVAL;
+	}
+
+	surf = 0;
+	of_property_for_each_u32(dev->of_node, "apple,iomfb-surfaces", surf_en) {
+		if (surf_en)
+			set_bit(surf, dcp->iomfb_surfaces);
+		surf++;
+	}
 
 	if (dcp->phy) {
 		int ret;
