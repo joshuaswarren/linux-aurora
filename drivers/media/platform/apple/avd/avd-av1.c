@@ -202,15 +202,12 @@
 #define AV1_REF_SCALE_X(v)	FIELD_PREP(GENMASK(31, 16), v)
 #define AV1_REF_SCALE_Y(v)	FIELD_PREP(GENMASK(15, 0), v)
 
-/* not sure what this is? mv data or something? */
-#define AVD_AV1_REF_BUF_SIZE	0xf000
+#define AVD_CDFS_SIZE	(sizeof(struct avd_av1_cdfs))
 
-#define AVD_AV1_CDFS_OFFSET(dst_len)		((dst_len) - sizeof(struct avd_av1_cdfs))
-
-#define AVD_AV1_REF_OFFSET(dst_len) \
-	(AVD_AV1_CDFS_OFFSET(dst_len) - AVD_AV1_REF_BUF_SIZE)
-#define AVD_AV1_RVRA_OFFSET(dst_len, rvra_size) \
-	(AVD_AV1_CDFS_OFFSET(dst_len) - (rvra_size))
+#define AVD_AV1_TLB_OFFSET(dst, tlb) \
+	(ALIGN_DOWN(dst, AVD_ALIGN) - ALIGN(tlb, AVD_ALIGN))
+#define AVD_AV1_CDFS_OFFSET(dst, tlb) \
+	(AVD_AV1_TLB_OFFSET(dst, tlb) - ALIGN(AVD_CDFS_SIZE, AVD_ALIGN))
 
 struct avd_av1_run {
 	struct avd_run base;
@@ -221,7 +218,7 @@ struct avd_av1_run {
 		dma_addr_t sl;
 		dma_addr_t rvra;
 		dma_addr_t probs_out;
-		dma_addr_t mv; /* no sure */
+		dma_addr_t priv_tlb;
 	} addresses;
 
 	const struct v4l2_ctrl_av1_sequence *seq;
@@ -826,7 +823,7 @@ static void set_header(struct avd_ctx *ctx, struct avd_av1_run *run)
 	pusha((dma_addr_t)0, "", 0);
 	pusha((dma_addr_t)0, "", 1);
 
-	pusha(run->addresses.mv, "cur_ref_addr", 0);
+	pusha(run->addresses.priv_tlb, "cur_ref_addr", 0);
 
 	for (i = 0; i < 3; i++) {
 		if (selected_refs[i] < V4L2_AV1_REF_LAST_FRAME) {
@@ -837,10 +834,12 @@ static void set_header(struct avd_ctx *ctx, struct avd_av1_run *run)
 			ref = avd_get_ref_buf(
 				ctx, &dst->base.vb,
 				frame->reference_frame_ts[ref_idx]);
-			ref_addr = vb2_dma_contig_plane_dma_addr(
-					   &ref->base.vb.vb2_buf, 0) +
-				   AVD_AV1_REF_OFFSET(
-					   ref->base.vb.planes[0].length);
+			ref_addr =
+				vb2_dma_contig_plane_dma_addr(
+					&ref->base.vb.vb2_buf, 0) +
+				AVD_AV1_TLB_OFFSET(
+					ref->base.vb.vb2_buf.planes[0].length,
+					ref->av1.priv_tlb_size);
 
 			pusha(ref_addr, "ref", ref_idx);
 		}
@@ -1085,7 +1084,8 @@ static void avd_av1_set_prob(struct avd_ctx *ctx, struct avd_av1_run *run)
 		memcpy(av1_ctx->bufs.probs.cpu,
 		       vb2_plane_vaddr(&ref->base.vb.vb2_buf, 0) +
 			       AVD_AV1_CDFS_OFFSET(
-				       ref->base.vb.vb2_buf.planes[0].length),
+				       ref->base.vb.vb2_buf.planes[0].length,
+				       ref->av1.priv_tlb_size),
 		       sizeof(struct avd_av1_cdfs));
 	}
 
@@ -1094,9 +1094,18 @@ static void avd_av1_set_prob(struct avd_ctx *ctx, struct avd_av1_run *run)
 	 * enabled
 	 */
 	memcpy(vb2_plane_vaddr(&dst->base.vb.vb2_buf, 0) +
-		       AVD_AV1_CDFS_OFFSET(
-			       dst->base.vb.vb2_buf.planes[0].length),
+		       AVD_AV1_CDFS_OFFSET(dst->base.vb.vb2_buf.planes[0].length,
+					   dst->av1.priv_tlb_size),
 	       av1_ctx->bufs.probs.cpu, sizeof(struct avd_av1_cdfs));
+}
+
+static int avd_priv_tlb_size(int h, int w)
+{
+	/*
+	 * in reality its dependent on quality
+	 * 64 with lower quality
+	 */
+	return ALIGN(w, 128) * ALIGN(h, 128) / 16;
 }
 
 static void update_dec_buf_info(struct avd_decoded_buffer *buf,
@@ -1110,6 +1119,10 @@ static void update_dec_buf_info(struct avd_decoded_buffer *buf,
 	buf->av1.bit_depth = seq->bit_depth;
 	buf->av1.frame_type = frame->frame_type;
 	buf->av1.intrabc = frame->flags & V4L2_AV1_FRAME_FLAG_ALLOW_INTRABC;
+
+	buf->av1.priv_tlb_size =
+		avd_priv_tlb_size(frame->frame_width_minus_1 + 1,
+				  frame->frame_height_minus_1 + 1);
 
 	for (i = 0; i < V4L2_AV1_TOTAL_REFS_PER_FRAME; i++)
 		buf->av1.order_hints[i] = frame->order_hints[i];
@@ -1148,8 +1161,8 @@ static int avd_av1_run_preamble(struct avd_ctx *ctx, struct avd_av1_run *run)
 	run->grain = ctrl->p_cur.p;
 
 	dst_len = run->base.bufs.dst->vb2_buf.planes[0].length;
-	tlb_len = avd_color_size(run->frame->frame_width_minus_1 + 1,
-				 run->frame->frame_height_minus_1 + 1);
+	tlb_len = avd_priv_tlb_size(run->frame->frame_width_minus_1 + 1,
+				    run->frame->frame_height_minus_1 + 1);
 
 	run->addresses.color =
 		run->base.y_out + AVD_AV1_COLOR_OFFSET(dst_len, tlb_len);
@@ -1162,10 +1175,11 @@ static int avd_av1_run_preamble(struct avd_ctx *ctx, struct avd_av1_run *run)
 	run->addresses.rvra =
 		run->addresses.y + AVD_AV1_RVRA_OFFSET(dst_len, ctx->rvra.size);
 
-	run->addresses.mv = run->addresses.y + AVD_AV1_REF_OFFSET(dst_len);
+	run->addresses.priv_tlb =
+		run->base.y_out + AVD_AV1_TLB_OFFSET(dst_len, tlb_len);
 
 	run->addresses.probs_out =
-		run->addresses.y + AVD_AV1_CDFS_OFFSET(dst_len);
+		run->base.y_out + AVD_AV1_CDFS_OFFSET(dst_len, tlb_len);
 
 	return 0;
 }
@@ -1189,6 +1203,7 @@ static int avd_av1_run(struct avd_ctx *ctx)
 		avd_run_postamble(ctx, &run.base);
 		return ret;
 	}
+
 	dst = vb2_to_avd_decoded_buf(&run.base.bufs.dst->vb2_buf);
 	update_dec_buf_info(dst, run.seq, run.frame);
 
@@ -1398,8 +1413,9 @@ static int avd_av1_try_ctrl(struct avd_ctx *ctx, struct v4l2_ctrl *ctrl)
 static void avd_av1_adjust_decoded_fmt(struct avd_ctx *ctx,
 				       struct v4l2_pix_format_mplane *pix_mp)
 {
-	pix_mp->plane_fmt[0].sizeimage += sizeof(struct avd_av1_cdfs);
-	pix_mp->plane_fmt[0].sizeimage += AVD_AV1_REF_BUF_SIZE;
+	pix_mp->plane_fmt[0].sizeimage += ALIGN(AVD_CDFS_SIZE, AVD_ALIGN);
+	pix_mp->plane_fmt[0].sizeimage += ALIGN(
+		avd_priv_tlb_size(pix_mp->width, pix_mp->height), AVD_ALIGN);
 }
 
 const struct avd_coded_fmt_ops avd_av1_fmt_ops = {

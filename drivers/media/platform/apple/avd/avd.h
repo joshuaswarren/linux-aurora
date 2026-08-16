@@ -38,14 +38,9 @@
 #define VP_SLOT_NONE		255
 #define INST_FIFO_SLOT_NONE	255
 
-/*
- * AVD needs most addresses to be aligned to 256
- * the only exception are the compressed buffers, they are aligned to 128
- * instead
- */
+/* AVD needs most addresses to be aligned to 256 */
 #define AVD_ALIGN	256
-/* hevc, with a b slice where all references are active and weights are sent */
-#define AVD_MAX_INST	512
+
 
 struct avd_ctx;
 struct avd_dev;
@@ -96,6 +91,7 @@ struct avd_av1_decoded_buffer_info {
 	u32 order_hints[V4L2_AV1_TOTAL_REFS_PER_FRAME];
 	u8 ref_frame_idx[V4L2_AV1_REFS_PER_FRAME];
 	bool intrabc;
+	size_t priv_tlb_size;
 };
 
 struct avd_hevc_decoded_buffer_info {
