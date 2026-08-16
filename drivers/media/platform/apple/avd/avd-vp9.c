@@ -326,7 +326,7 @@ static void set_header(struct avd_ctx *ctx, struct avd_vp9_run *run)
 	push(AVD_HDR_HEIGHT(frame->frame_height_minus_1) |
 		     AVD_HDR_WIDTH(frame->frame_width_minus_1),
 	     "hdr_28_height_width_shift3");
-	push(0, "cm3_dma_config_0");
+	push(0, "");
 	push(AVD_HDR_HEIGHT(frame->frame_height_minus_1) |
 		     AVD_HDR_WIDTH(frame->frame_width_minus_1),
 	     "hdr_38_height_width_shift3");
@@ -410,7 +410,7 @@ static void set_header(struct avd_ctx *ctx, struct avd_vp9_run *run)
 
 	push(0, "");
 
-	push_comp(ctx, run->base.comp_out, ctx->comp.offsets);
+	push(0, "");
 
 	pusha((u64)0, "packed_fmt_scratch", 0);
 

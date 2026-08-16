@@ -109,7 +109,7 @@ static void stream_refs(struct avd_ctx *ctx, struct avd_hevc_run *run)
 
 	dst = vb2_to_avd_decoded_buf(&run->base.bufs.dst->vb2_buf);
 
-	push(INST_DMA2, "cm3_dma_config_6");
+	push(0, "");
 	pusha(hevc_ctx->bufs.pps_tile[1].addr, "hdr_9c_pps_tile_addr_lsb8", 7);
 	pusha(run->addresses.sps, "hdr_bc_sps_tile_addr_lsb8",
 	      sl->slice_pic_order_cnt);
@@ -355,14 +355,14 @@ static void set_header(struct avd_ctx *ctx, struct avd_hevc_run *run)
 			     !(avd->variant->quirks & AVD_QUIRK_NO_PIPE_STATE)),
 	     "hdr_98_const_30");
 
-	push(dma_config, "dma_config");
+	push(0, "");
 	push(0, "");
 
 	if (avd->variant->revision == 3)
 		push(0, "zero");
 
-	push(dma_config, "dma_config");
-	push(dma_config, "dma_config");
+	push(0, "");
+	push(0, "");
 
 	if (avd->variant->revision == 3)
 		push(0, "zero");

@@ -103,11 +103,9 @@ static void stream_refs(struct avd_ctx *ctx, struct avd_h264_run *run)
 	struct avd_decoded_buffer *dst, *ref;
 	dma_addr_t addr;
 
-	dst = vb2_to_avd_decoded_buf(&run->base.bufs.dst->vb2_buf);
-
 	push(0, "");
-	pusha(h264_ctx->bufs.mv_above_info.addr, "mv_above_info", 7);
-	pusha(run->addresses.mv_color, "mv_color", 0);
+	pusha(h264_ctx->bufs.pps_tile[4].addr, "hdr_9c_pps_tile_addr_lsb8", 7);
+	pusha(run->addresses.sps, "hdr_bc_sps_tile_addr_lsb8", 0);
 
 	push(0, "");
 	push(0, "");
@@ -265,8 +263,8 @@ static void stream_hdr(struct avd_ctx *ctx, struct avd_h264_run *run)
 			     !(avd->variant->quirks & AVD_QUIRK_NO_PIPE_STATE)),
 	     "hdr_58_const_3a");
 
-	push(INST_DMA2, "cm3_dma_config_1");
-	push(INST_DMA1, "cm3_dma_config_2");
+	push(0, "");
+	push(0, "");
 
 	if (avd->variant->revision == 3)
 		push(0, "zero");
@@ -281,9 +279,9 @@ static void stream_hdr(struct avd_ctx *ctx, struct avd_h264_run *run)
 	else if (!(avd->variant->quirks & AVD_QUIRK_NO_PIPE_STATE))
 		pusha(h264_ctx->bufs.pipe_state.addr, "pipe_state", 0);
 
-	pusha(h264_ctx->bufs.ip_above.addr, "ip_above", 1);
-	pusha(h264_ctx->bufs.lf_above.addr, "lf_above", 2);
-	pusha(h264_ctx->bufs.lf_above_info.addr, "lf_above_info", 3);
+	pusha(h264_ctx->bufs.pps_tile[1].addr, "hdr_9c_pps_tile_addr_lsb8", 1);
+	pusha(h264_ctx->bufs.pps_tile[2].addr, "hdr_9c_pps_tile_addr_lsb8", 2);
+	pusha(h264_ctx->bufs.pps_tile[3].addr, "hdr_9c_pps_tile_addr_lsb8", 3);
 	push(0, "");
 
 	push_comp(ctx, run->base.comp_out, ctx->comp.offsets);
