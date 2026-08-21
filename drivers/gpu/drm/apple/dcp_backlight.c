@@ -200,6 +200,7 @@ static int drm_crtc_set_brightness(struct apple_dcp *dcp)
 	}
 
 	state->acquire_ctx = &ctx;
+retry:
 	crtc_state = drm_atomic_get_crtc_state(state, crtc);
 	if (IS_ERR(crtc_state)) {
 		ret = PTR_ERR(crtc_state);
@@ -208,9 +209,41 @@ static int drm_crtc_set_brightness(struct apple_dcp *dcp)
 
 	crtc_state->color_mgmt_changed |= true;
 
+	/*
+	 * The brightness travels inside a swap, and on H17P a swap without a
+	 * surface is refused (iomfb_flush keeps the last surface on the panel
+	 * rather than risk the firmware's null-fetch NMI).  A commit that only
+	 * touches the CRTC therefore never reaches the firmware unless the
+	 * compositor happens to draw a frame -- which it does not under
+	 * swaylock: swayidle's dim to 0 went out on the lock screen's last
+	 * frame and the restore on the next touch sat in sysfs forever while
+	 * the panel stayed dark (hb118, 2026-09-19 18:58).  Carry the
+	 * primary plane's current state, so the flush re-submits the surface
+	 * that is already on the panel together with the new level.
+	 */
+	if (crtc->primary) {
+		struct drm_plane_state *plane_state =
+			drm_atomic_get_plane_state(state, crtc->primary);
+
+		if (IS_ERR(plane_state)) {
+			ret = PTR_ERR(plane_state);
+			goto fail;
+		}
+	}
+
 	ret = drm_atomic_commit(state);
+	if (ret == -EDEADLK) {
+		drm_atomic_state_clear(state);
+		drm_modeset_backoff(&ctx);
+		goto retry;
+	}
 
 fail:
+	if (ret == -EDEADLK) {
+		drm_atomic_state_clear(state);
+		drm_modeset_backoff(&ctx);
+		goto retry;
+	}
 	drm_atomic_state_put(state);
 done:
 	drm_modeset_drop_locks(&ctx);
