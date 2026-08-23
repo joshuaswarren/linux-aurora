@@ -45,6 +45,10 @@
 #define MT7920_FIRMWARE_WM	"mediatek/WIFI_RAM_CODE_MT7961_1a.bin"
 #define MT7921_FIRMWARE_WM	"mediatek/WIFI_RAM_CODE_MT7961_1.bin"
 #define MT7922_FIRMWARE_WM	"mediatek/WIFI_RAM_CODE_MT7922_1.bin"
+#define MT7932_FIRMWARE_WM	"mediatek/WIFI_RAM_CODE_MT7932_1.bin"
+#define MT7932_WCAL		"mediatek/j700-mt7932-wcal.bin"
+#define MT7932_ONE_TIME_CAL \
+	"mediatek/j700-mt7932-one-time-cal.bin"
 #define MT7925_FIRMWARE_WM	"mediatek/mt7925/WIFI_RAM_CODE_MT7925_1_1.bin"
 #define MT7927_FIRMWARE_WM	"mediatek/mt7927/WIFI_RAM_CODE_MT6639_2_1.bin"
 
@@ -52,6 +56,7 @@
 #define MT7920_ROM_PATCH	"mediatek/WIFI_MT7961_patch_mcu_1a_2_hdr.bin"
 #define MT7921_ROM_PATCH	"mediatek/WIFI_MT7961_patch_mcu_1_2_hdr.bin"
 #define MT7922_ROM_PATCH	"mediatek/WIFI_MT7922_patch_mcu_1_1_hdr.bin"
+#define MT7932_ROM_PATCH	"mediatek/WIFI_MT7932_patch_mcu_1_2_hdr.bin"
 #define MT7925_ROM_PATCH	"mediatek/mt7925/WIFI_MT7925_PATCH_MCU_1_1_hdr.bin"
 #define MT7927_ROM_PATCH	"mediatek/mt7927/WIFI_MT6639_PATCH_MCU_2_1_hdr.bin"
 
@@ -520,6 +525,8 @@ static inline char *mt792x_ram_name(struct mt792x_dev *dev)
 		return MT7920_FIRMWARE_WM;
 	case 0x7922:
 		return MT7922_FIRMWARE_WM;
+	case 0x7932:
+		return MT7932_FIRMWARE_WM;
 	case 0x7925:
 		return MT7925_FIRMWARE_WM;
 	case 0x7927:
@@ -538,6 +545,8 @@ static inline char *mt792x_patch_name(struct mt792x_dev *dev)
 		return MT7920_ROM_PATCH;
 	case 0x7922:
 		return MT7922_ROM_PATCH;
+	case 0x7932:
+		return MT7932_ROM_PATCH;
 	case 0x7925:
 		return MT7925_ROM_PATCH;
 	case 0x7927:
