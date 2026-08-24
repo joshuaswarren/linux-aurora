@@ -771,6 +771,110 @@ pub(crate) const fn g17_gfx1_callback_ack_payload(
     }
 }
 
+/// Host-side management-message routes established in all three pinned
+/// generic RTBuddy images.
+///
+/// Despite the firmware-side callback-ACK terminology above, type 0x0b is
+/// not the host's type-7 power ACK. The two messages wake different fields
+/// belonging to different objects.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum G17HostManagementMessageRoute {
+    /// `_handlePowerAck()` updates and wakes `RTBuddy + 0x158`.
+    IopStatusPowerAck,
+    /// The handler stores the low word and wakes management endpoint +0x108.
+    Gfx1CallbackRemoteState,
+}
+
+/// Object containing the field used as the matching sleep/wakeup event.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum G17HostManagementWakeObject {
+    RtBuddy,
+    ManagementEndpoint,
+}
+
+/// Fail-closed result for an incoming management-message type not covered by
+/// this bounded power-route model.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum G17HostManagementMessageError {
+    UnprovenMessageType,
+}
+
+/// Target-pinned generic RTBuddy text locations proving the two host routes.
+///
+/// These offsets are relative to each image's `__TEXT_EXEC` VM address. The
+/// independently extracted G17P, G17G, and G17S images normalize exactly.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17HostManagementRouteEvidence {
+    pub(crate) management_handler_text_offset: u32,
+    pub(crate) type0b_remote_state_branch_text_offset: u32,
+    pub(crate) wait_remote_state_text_offset: u32,
+    pub(crate) handle_power_ack_text_offset: u32,
+    pub(crate) perform_power_change_text_offset: u32,
+    pub(crate) set_iop_status_text_offset: u32,
+}
+
+pub(crate) const G17_HOST_MANAGEMENT_MESSAGE_TYPE_SHIFT: u32 = 52;
+pub(crate) const G17_HOST_MANAGEMENT_MESSAGE_TYPE_MASK: u64 = 0xf;
+pub(crate) const G17_HOST_POWER_ACK_MESSAGE_TYPE: u8 = 0x07;
+pub(crate) const G17_HOST_GFX1_CALLBACK_MESSAGE_TYPE: u8 = 0x0b;
+pub(crate) const G17_HOST_MANAGEMENT_REMOTE_STATE_WORD_OFFSET: u32 = 0x108;
+pub(crate) const G17_HOST_RTBUDDY_IOP_STATUS_WORD_OFFSET: u32 = 0x158;
+
+/// The firmware sender loads its endpoint argument from callback-object +8.
+/// The pinned static corpus does not establish that this value is management
+/// endpoint 0 for every callback, so the end-to-end sender route stays closed.
+pub(crate) const G17_GFX1_CALLBACK_MANAGEMENT_ENDPOINT_LINK_PROVEN: bool = false;
+
+pub(crate) const fn g17_host_management_route_evidence(
+    target: G17Gfx1PowerEvidenceTarget,
+) -> G17HostManagementRouteEvidence {
+    match target {
+        G17Gfx1PowerEvidenceTarget::G17P
+        | G17Gfx1PowerEvidenceTarget::G17G
+        | G17Gfx1PowerEvidenceTarget::G17S => G17HostManagementRouteEvidence {
+            management_handler_text_offset: 0x0002_cda4,
+            type0b_remote_state_branch_text_offset: 0x0002_ce90,
+            wait_remote_state_text_offset: 0x0002_d908,
+            handle_power_ack_text_offset: 0x0002_dea0,
+            perform_power_change_text_offset: 0x0001_abf8,
+            set_iop_status_text_offset: 0x0001_ca64,
+        },
+    }
+}
+
+/// Decode only the two incoming host power routes relevant to the GFX1
+/// callback-completion linkage question.
+pub(crate) const fn g17_host_management_message_route(
+    _target: G17Gfx1PowerEvidenceTarget,
+    message: u64,
+) -> Result<G17HostManagementMessageRoute, G17HostManagementMessageError> {
+    let message_type = ((message >> G17_HOST_MANAGEMENT_MESSAGE_TYPE_SHIFT)
+        & G17_HOST_MANAGEMENT_MESSAGE_TYPE_MASK) as u8;
+
+    match message_type {
+        G17_HOST_POWER_ACK_MESSAGE_TYPE => Ok(G17HostManagementMessageRoute::IopStatusPowerAck),
+        G17_HOST_GFX1_CALLBACK_MESSAGE_TYPE => {
+            Ok(G17HostManagementMessageRoute::Gfx1CallbackRemoteState)
+        }
+        _ => Err(G17HostManagementMessageError::UnprovenMessageType),
+    }
+}
+
+pub(crate) const fn g17_host_management_route_wake_field(
+    route: G17HostManagementMessageRoute,
+) -> (G17HostManagementWakeObject, u32) {
+    match route {
+        G17HostManagementMessageRoute::IopStatusPowerAck => (
+            G17HostManagementWakeObject::RtBuddy,
+            G17_HOST_RTBUDDY_IOP_STATUS_WORD_OFFSET,
+        ),
+        G17HostManagementMessageRoute::Gfx1CallbackRemoteState => (
+            G17HostManagementWakeObject::ManagementEndpoint,
+            G17_HOST_MANAGEMENT_REMOTE_STATE_WORD_OFFSET,
+        ),
+    }
+}
+
 /// Exact values observed in the shared G15-G17 host recovery word.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[repr(u32)]
@@ -1079,6 +1183,92 @@ mod tests {
             }
         }
 
+        assert!(!EXECUTABLE_GFX1_POWER_SEQUENCE_AVAILABLE);
+        assert!(!EXECUTABLE_G17_RECOVERY_HANDSHAKE_AVAILABLE);
+    }
+
+    #[test]
+    fn g17_host_management_power_routes_are_target_pinned() {
+        let exact = G17HostManagementRouteEvidence {
+            management_handler_text_offset: 0x0002_cda4,
+            type0b_remote_state_branch_text_offset: 0x0002_ce90,
+            wait_remote_state_text_offset: 0x0002_d908,
+            handle_power_ack_text_offset: 0x0002_dea0,
+            perform_power_change_text_offset: 0x0001_abf8,
+            set_iop_status_text_offset: 0x0001_ca64,
+        };
+
+        for target in G17_GFX1_POWER_EVIDENCE_TARGETS {
+            assert_eq!(g17_host_management_route_evidence(target), exact);
+        }
+
+        assert_eq!(G17_HOST_MANAGEMENT_MESSAGE_TYPE_SHIFT, 52);
+        assert_eq!(G17_HOST_MANAGEMENT_MESSAGE_TYPE_MASK, 0xf);
+        assert_eq!(G17_HOST_POWER_ACK_MESSAGE_TYPE, 7);
+        assert_eq!(G17_HOST_GFX1_CALLBACK_MESSAGE_TYPE, 0xb);
+        assert_eq!(G17_HOST_MANAGEMENT_REMOTE_STATE_WORD_OFFSET, 0x108);
+        assert_eq!(G17_HOST_RTBUDDY_IOP_STATUS_WORD_OFFSET, 0x158);
+        assert!(!G17_GFX1_CALLBACK_MANAGEMENT_ENDPOINT_LINK_PROVEN);
+        assert!(!EXECUTABLE_GFX1_POWER_SEQUENCE_AVAILABLE);
+        assert!(!EXECUTABLE_G17_RECOVERY_HANDSHAKE_AVAILABLE);
+    }
+
+    #[test]
+    fn g17_host_management_type0b_is_not_the_iop_status_power_ack() {
+        let power_ack = 0x0070_0000_0000_0001;
+
+        for target in G17_GFX1_POWER_EVIDENCE_TARGETS {
+            let power_route = g17_host_management_message_route(target, power_ack).unwrap();
+            assert_eq!(
+                power_route,
+                G17HostManagementMessageRoute::IopStatusPowerAck
+            );
+            assert_eq!(
+                g17_host_management_route_wake_field(power_route),
+                (
+                    G17HostManagementWakeObject::RtBuddy,
+                    G17_HOST_RTBUDDY_IOP_STATUS_WORD_OFFSET,
+                )
+            );
+
+            for internal_state in [4, 5, 6, 7, 8, 0x10, 0x20, 0x21] {
+                let payload = g17_gfx1_callback_ack_payload(target, internal_state).unwrap();
+                let completion = G17_GFX1_CALLBACK_ACK_MESSAGE_TYPE_BITS | u64::from(payload);
+                let completion_route =
+                    g17_host_management_message_route(target, completion).unwrap();
+
+                assert_eq!(
+                    completion_route,
+                    G17HostManagementMessageRoute::Gfx1CallbackRemoteState
+                );
+                assert_eq!(
+                    g17_host_management_route_wake_field(completion_route),
+                    (
+                        G17HostManagementWakeObject::ManagementEndpoint,
+                        G17_HOST_MANAGEMENT_REMOTE_STATE_WORD_OFFSET,
+                    )
+                );
+                assert_eq!(completion as u32, u32::from(payload));
+                assert_ne!(completion_route, power_route);
+            }
+
+            for message_type in [0, 1, 4, 6, 8, 0xc, 0xf] {
+                assert_eq!(
+                    g17_host_management_message_route(target, message_type << 52),
+                    Err(G17HostManagementMessageError::UnprovenMessageType)
+                );
+            }
+        }
+
+        assert_ne!(
+            G17HostManagementWakeObject::ManagementEndpoint,
+            G17HostManagementWakeObject::RtBuddy
+        );
+        assert_ne!(
+            G17_HOST_MANAGEMENT_REMOTE_STATE_WORD_OFFSET,
+            G17_HOST_RTBUDDY_IOP_STATUS_WORD_OFFSET
+        );
+        assert!(!G17_GFX1_CALLBACK_MANAGEMENT_ENDPOINT_LINK_PROVEN);
         assert!(!EXECUTABLE_GFX1_POWER_SEQUENCE_AVAILABLE);
         assert!(!EXECUTABLE_G17_RECOVERY_HANDSHAKE_AVAILABLE);
     }
