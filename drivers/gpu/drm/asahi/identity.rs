@@ -441,6 +441,87 @@ pub(crate) struct G17sSksmCompletionRoute {
     pub(crate) processed_count_mmio_offset: u32,
 }
 
+/// Exact G17S firmware order for publishing one host event.
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub(crate) enum G17sFirmwareEventProducerStep {
+    LoadSharedWriteIndex,
+    AdvanceAndWrap8,
+    WaitUntilNextDiffersFromSharedRead,
+    ReloadSharedWriteIndex,
+    CopyEntry,
+    DsbSyBeforeWriteIndex,
+    PublishSharedWriteIndex,
+    DsbSyBeforeNotification,
+    NotifyHost,
+}
+
+/// Role-specific entry points and runtime globals in the pinned G17S bundle.
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub(crate) struct G17sFirmwareEventProducerRoleConfig {
+    pub(crate) role: SubmissionFirmwareRole,
+    pub(crate) enqueue_text_offset: u32,
+    pub(crate) runtime_pointer_global_image_offset: u32,
+    pub(crate) notification_send_text_offset: u32,
+}
+
+/// Exact G17S firmware-event producer and host interrupt bridge.
+///
+/// This proves how an already-formed event reaches the host event consumer.
+/// It does not prove that the SKSM processed-count store creates such an event.
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub(crate) struct G17sFirmwareEventProducerConfig {
+    pub(crate) roles: [G17sFirmwareEventProducerRoleConfig; 2],
+    pub(crate) ring_pointer_pair_offset: u16,
+    pub(crate) shared_indices_pointer_pair_offset: u8,
+    pub(crate) entries_pointer_pair_offset: u8,
+    pub(crate) shared_read_index_offset: u8,
+    pub(crate) shared_write_index_offset: u8,
+    pub(crate) entry_stride: u8,
+    pub(crate) copied_entry_bytes: u8,
+    pub(crate) index_mask: u8,
+    pub(crate) notification_endpoint_service_id: u8,
+    pub(crate) notification_message: u64,
+    pub(crate) notification_message_type_shift: u8,
+    pub(crate) notification_message_type_mask: u8,
+    pub(crate) notification_argument2: u64,
+    pub(crate) rtbuddy_received_message_text_offset: u32,
+    pub(crate) host_received_message_text_offset: u32,
+    pub(crate) host_message_type: u8,
+    pub(crate) host_event_source_setup_text_offset: u32,
+    pub(crate) host_event_source_array_offset: u16,
+    pub(crate) host_interrupt_selector_offset: u16,
+    pub(crate) host_interrupt_indices: [u8; 2],
+    pub(crate) filter_event_source_signal_vtable_offset: u16,
+    pub(crate) interrupt_source_get_index_vtable_offset: u16,
+    pub(crate) accelerator_firmware_pointer_offset: u16,
+    pub(crate) accelerator_handle_interrupt_text_offset: u32,
+    pub(crate) firmware_handle_event_vtable_offset: u16,
+    pub(crate) firmware_handle_event_text_offset: u32,
+    pub(crate) steps: [G17sFirmwareEventProducerStep; 9],
+    pub(crate) direct_cache_maintenance_before_publish: bool,
+    pub(crate) sksm_processed_count_causal_link_proven: bool,
+    pub(crate) normal_classic_submission_acknowledgment_proven: bool,
+}
+
+/// Pure producer-side ring slot and next shared write index.
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub(crate) struct G17sFirmwareEventProducerNextEntry {
+    pub(crate) entry_offset_from_entries_base: u16,
+    pub(crate) published_write_index: u8,
+}
+
+/// Pure host interrupt route selected by the pinned type-2 notification path.
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub(crate) struct G17sFirmwareEventInterruptRoute {
+    pub(crate) raw_interrupt_index: u8,
+    pub(crate) drains_firmware_event_rings: bool,
+}
+
 /// Exact host order for consuming one pinned G17S firmware-event entry.
 #[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -458,8 +539,8 @@ pub(crate) enum G17sHostFirmwareEventStep {
 /// Exact G17S host firmware-event-ring interrupt and consumer contract.
 ///
 /// This describes the host consumer of firmware events. The firmware-side
-/// producer and a causal link from SKSM processed-count MMIO to these
-/// interrupts are not proved.
+/// producer is independently pinned below, but a causal link from SKSM
+/// processed-count MMIO to these interrupts is not proved.
 #[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub(crate) struct G17sHostFirmwareEventConsumerConfig {
@@ -536,6 +617,8 @@ pub(crate) enum SubmissionConfigError {
     UnexpectedG17sFirmwareRecoveryDrainConfig,
     /// The supplied G17S SKSM completion consumer differs from pinned code.
     UnexpectedG17sSksmCompletionConsumerConfig,
+    /// The supplied G17S firmware-event producer differs from pinned code.
+    UnexpectedG17sFirmwareEventProducerConfig,
     /// The supplied G17S host firmware-event consumer differs from pinned code.
     UnexpectedG17sHostFirmwareEventConsumerConfig,
     /// The priority is outside the four published data-master ring groups.
@@ -558,6 +641,14 @@ pub(crate) enum SubmissionConfigError {
     G17sHostFirmwareEventRingEmpty,
     /// The event-type bit selected by the host's 64-bit mask is disabled.
     G17sHostFirmwareEventTypeDisabled,
+    /// The firmware-event producer's shared read index is outside 8 bits.
+    G17sFirmwareEventReadIndexOutOfRange,
+    /// The firmware-event producer's shared write index is outside 8 bits.
+    G17sFirmwareEventWriteIndexOutOfRange,
+    /// The next firmware-event write index would collide with shared read.
+    G17sFirmwareEventRingFull,
+    /// The host bridge selector is neither recovered interrupt index 0 nor 4.
+    G17sFirmwareEventInterruptIndexUnsupported,
     /// The shared read index is outside the host's eight-bit ring index space.
     DataMasterReadIndexOutOfRange,
     /// The shared write index is outside the host's eight-bit ring index space.
@@ -594,9 +685,14 @@ pub(crate) const GROUNDED_G17S_FIRMWARE_RECOVERY_DRAIN_CONFIG_AVAILABLE: bool = 
 /// It does not establish classic submission-ring acknowledgment.
 #[allow(dead_code)]
 pub(crate) const GROUNDED_G17S_SKSM_COMPLETION_CONSUMER_CONFIG_AVAILABLE: bool = true;
+/// A pure model of the two pinned G17S firmware-event producers and their
+/// type-2 host interrupt bridge is available. It does not connect SKSM's
+/// processed-count store to event production.
+#[allow(dead_code)]
+pub(crate) const GROUNDED_G17S_FIRMWARE_EVENT_PRODUCER_CONFIG_AVAILABLE: bool = true;
 /// A pure model of the distinct G17S host firmware-event consumer is
-/// available. Its firmware producer and SKSM-completion causal link remain
-/// unproved.
+/// available. Its producer is pinned, while the SKSM-completion causal link
+/// remains unproved.
 #[allow(dead_code)]
 pub(crate) const GROUNDED_G17S_HOST_FIRMWARE_EVENT_CONSUMER_CONFIG_AVAILABLE: bool = true;
 /// The symbolic meaning of the firmware shared-data caching-option numbers,
@@ -769,6 +865,81 @@ const G17S_SKSM_COMPLETION_CONSUMER_CONFIG: G17sSksmCompletionConsumerConfig =
         normal_classic_submission_acknowledgment_proven: false,
     };
 
+// Pinned Mac17,9/J714s/T6050 firmware-to-host event evidence:
+// GFX SHA-256:
+// 317de35b447e2a4cce0fb467f0ab04baa42fceee8a3f55998ecf3c624d30031b
+// GFX1 SHA-256:
+// 5d719208e12be6bfa754ca8486f36739fce74b0c45618ad9a0f44a189feeb345
+// com.apple.AGXFirmwareKextG17XRTBuddy SHA-256:
+// a22b8ae9be6d2ed2b742f37117de2361ef72964e94728a377c8cd2834b10b892
+// com.apple.AGXG17X SHA-256:
+// ccbe120a3a197038216426b507b5409873397b947308239b4ecc75d76759e87f
+//
+// The firmware entry points copy an opaque event; they do not manufacture
+// completion semantics. Neither contains a direct cache-maintenance operation.
+// Their two DSB SY instructions order the entry copy, shared write-index store,
+// and endpoint-0x20 notification. The host decodes message type 2, signals the
+// configured filter interrupt source at raw index 0 or 4, and reaches the
+// existing handleEvent drain path. No caller edge from the SKSM processed-count
+// publication to either event producer is claimed.
+const G17S_FIRMWARE_EVENT_PRODUCER_CONFIG: G17sFirmwareEventProducerConfig =
+    G17sFirmwareEventProducerConfig {
+        roles: [
+            G17sFirmwareEventProducerRoleConfig {
+                role: SubmissionFirmwareRole::Gfx,
+                enqueue_text_offset: 0x23560,
+                runtime_pointer_global_image_offset: 0x104888,
+                notification_send_text_offset: 0x35a90,
+            },
+            G17sFirmwareEventProducerRoleConfig {
+                role: SubmissionFirmwareRole::Gfx1,
+                enqueue_text_offset: 0x290f0,
+                runtime_pointer_global_image_offset: 0x100e08,
+                notification_send_text_offset: 0x3c804,
+            },
+        ],
+        ring_pointer_pair_offset: 0x1c0,
+        shared_indices_pointer_pair_offset: 0x00,
+        entries_pointer_pair_offset: 0x08,
+        shared_read_index_offset: 0x00,
+        shared_write_index_offset: 0x20,
+        entry_stride: 0x48,
+        copied_entry_bytes: 0x48,
+        index_mask: 0xff,
+        notification_endpoint_service_id: 0x20,
+        notification_message: 0x0042_0000_0000_0000,
+        notification_message_type_shift: 48,
+        notification_message_type_mask: 0x3f,
+        notification_argument2: 0,
+        rtbuddy_received_message_text_offset: 0x2430,
+        host_received_message_text_offset: 0x5f2a0,
+        host_message_type: 2,
+        host_event_source_setup_text_offset: 0x150bc,
+        host_event_source_array_offset: 0x5b8,
+        host_interrupt_selector_offset: 0x72c,
+        host_interrupt_indices: [0, 4],
+        filter_event_source_signal_vtable_offset: 0x258,
+        interrupt_source_get_index_vtable_offset: 0x1e8,
+        accelerator_firmware_pointer_offset: 0x598,
+        accelerator_handle_interrupt_text_offset: 0x757c,
+        firmware_handle_event_vtable_offset: 0x320,
+        firmware_handle_event_text_offset: 0x4c388,
+        steps: [
+            G17sFirmwareEventProducerStep::LoadSharedWriteIndex,
+            G17sFirmwareEventProducerStep::AdvanceAndWrap8,
+            G17sFirmwareEventProducerStep::WaitUntilNextDiffersFromSharedRead,
+            G17sFirmwareEventProducerStep::ReloadSharedWriteIndex,
+            G17sFirmwareEventProducerStep::CopyEntry,
+            G17sFirmwareEventProducerStep::DsbSyBeforeWriteIndex,
+            G17sFirmwareEventProducerStep::PublishSharedWriteIndex,
+            G17sFirmwareEventProducerStep::DsbSyBeforeNotification,
+            G17sFirmwareEventProducerStep::NotifyHost,
+        ],
+        direct_cache_maintenance_before_publish: false,
+        sksm_processed_count_causal_link_proven: false,
+        normal_classic_submission_acknowledgment_proven: false,
+    };
+
 // Pinned Mac17,9/J714s/T6050 host evidence:
 // com.apple.AGXG17X SHA-256:
 // ccbe120a3a197038216426b507b5409873397b947308239b4ecc75d76759e87f
@@ -814,7 +985,7 @@ const G17S_HOST_FIRMWARE_EVENT_CONSUMER_CONFIG: G17sHostFirmwareEventConsumerCon
             G17sHostFirmwareEventStep::PublishSharedReadIndex,
             G17sHostFirmwareEventStep::DispatchIfSupported,
         ],
-        firmware_event_producer_ordering_proven: false,
+        firmware_event_producer_ordering_proven: true,
         sksm_processed_count_interrupt_link_proven: false,
         normal_classic_submission_acknowledgment_proven: false,
     };
@@ -1821,6 +1992,177 @@ pub(crate) const fn g17s_sksm_completion_advance_read_index(
     Ok(read_index.wrapping_add(1) % capacity)
 }
 
+/// Return the exact two-role G17S firmware-event producer and host bridge.
+#[allow(dead_code)]
+pub(crate) const fn g17s_firmware_event_producer_config(
+    gpu_gen: GpuGen,
+    gpu_variant: GpuVariant,
+) -> Option<G17sFirmwareEventProducerConfig> {
+    if matches!((gpu_gen, gpu_variant), (GpuGen::G17, GpuVariant::S)) {
+        Some(G17S_FIRMWARE_EVENT_PRODUCER_CONFIG)
+    } else {
+        None
+    }
+}
+
+/// Select the exact producer entry point for one G17S firmware role.
+#[allow(dead_code)]
+pub(crate) const fn g17s_firmware_event_producer_role_config(
+    gpu_gen: GpuGen,
+    gpu_variant: GpuVariant,
+    role: SubmissionFirmwareRole,
+) -> Result<G17sFirmwareEventProducerRoleConfig, SubmissionConfigError> {
+    let Some(config) = g17s_firmware_event_producer_config(gpu_gen, gpu_variant) else {
+        return Err(SubmissionConfigError::UnsupportedTarget);
+    };
+
+    Ok(match role {
+        SubmissionFirmwareRole::Gfx => config.roles[0],
+        SubmissionFirmwareRole::Gfx1 => config.roles[1],
+    })
+}
+
+/// Validate an externally recovered G17S event producer and interrupt bridge.
+#[allow(dead_code)]
+pub(crate) const fn validate_g17s_firmware_event_producer_config(
+    gpu_gen: GpuGen,
+    gpu_variant: GpuVariant,
+    supplied: G17sFirmwareEventProducerConfig,
+) -> Result<G17sFirmwareEventProducerConfig, SubmissionConfigError> {
+    let Some(expected) = g17s_firmware_event_producer_config(gpu_gen, gpu_variant) else {
+        return Err(SubmissionConfigError::UnsupportedTarget);
+    };
+
+    if !matches!(
+        supplied.roles,
+        [
+            G17sFirmwareEventProducerRoleConfig {
+                role: SubmissionFirmwareRole::Gfx,
+                enqueue_text_offset: 0x23560,
+                runtime_pointer_global_image_offset: 0x104888,
+                notification_send_text_offset: 0x35a90,
+            },
+            G17sFirmwareEventProducerRoleConfig {
+                role: SubmissionFirmwareRole::Gfx1,
+                enqueue_text_offset: 0x290f0,
+                runtime_pointer_global_image_offset: 0x100e08,
+                notification_send_text_offset: 0x3c804,
+            },
+        ]
+    ) || supplied.ring_pointer_pair_offset != expected.ring_pointer_pair_offset
+        || supplied.shared_indices_pointer_pair_offset
+            != expected.shared_indices_pointer_pair_offset
+        || supplied.entries_pointer_pair_offset != expected.entries_pointer_pair_offset
+        || supplied.shared_read_index_offset != expected.shared_read_index_offset
+        || supplied.shared_write_index_offset != expected.shared_write_index_offset
+        || supplied.entry_stride != expected.entry_stride
+        || supplied.copied_entry_bytes != expected.copied_entry_bytes
+        || supplied.index_mask != expected.index_mask
+        || supplied.notification_endpoint_service_id != expected.notification_endpoint_service_id
+        || supplied.notification_message != expected.notification_message
+        || supplied.notification_message_type_shift != expected.notification_message_type_shift
+        || supplied.notification_message_type_mask != expected.notification_message_type_mask
+        || supplied.notification_argument2 != expected.notification_argument2
+        || supplied.rtbuddy_received_message_text_offset
+            != expected.rtbuddy_received_message_text_offset
+        || supplied.host_received_message_text_offset != expected.host_received_message_text_offset
+        || supplied.host_message_type != expected.host_message_type
+        || supplied.host_event_source_setup_text_offset
+            != expected.host_event_source_setup_text_offset
+        || supplied.host_event_source_array_offset != expected.host_event_source_array_offset
+        || supplied.host_interrupt_selector_offset != expected.host_interrupt_selector_offset
+        || !matches!(supplied.host_interrupt_indices, [0, 4])
+        || supplied.filter_event_source_signal_vtable_offset
+            != expected.filter_event_source_signal_vtable_offset
+        || supplied.interrupt_source_get_index_vtable_offset
+            != expected.interrupt_source_get_index_vtable_offset
+        || supplied.accelerator_firmware_pointer_offset
+            != expected.accelerator_firmware_pointer_offset
+        || supplied.accelerator_handle_interrupt_text_offset
+            != expected.accelerator_handle_interrupt_text_offset
+        || supplied.firmware_handle_event_vtable_offset
+            != expected.firmware_handle_event_vtable_offset
+        || supplied.firmware_handle_event_text_offset != expected.firmware_handle_event_text_offset
+        || !matches!(
+            supplied.steps,
+            [
+                G17sFirmwareEventProducerStep::LoadSharedWriteIndex,
+                G17sFirmwareEventProducerStep::AdvanceAndWrap8,
+                G17sFirmwareEventProducerStep::WaitUntilNextDiffersFromSharedRead,
+                G17sFirmwareEventProducerStep::ReloadSharedWriteIndex,
+                G17sFirmwareEventProducerStep::CopyEntry,
+                G17sFirmwareEventProducerStep::DsbSyBeforeWriteIndex,
+                G17sFirmwareEventProducerStep::PublishSharedWriteIndex,
+                G17sFirmwareEventProducerStep::DsbSyBeforeNotification,
+                G17sFirmwareEventProducerStep::NotifyHost,
+            ]
+        )
+        || supplied.direct_cache_maintenance_before_publish
+        || supplied.sksm_processed_count_causal_link_proven
+        || supplied.normal_classic_submission_acknowledgment_proven
+        || ((supplied.notification_message >> supplied.notification_message_type_shift)
+            & supplied.notification_message_type_mask as u64)
+            != supplied.host_message_type as u64
+    {
+        Err(SubmissionConfigError::UnexpectedG17sFirmwareEventProducerConfig)
+    } else {
+        Ok(expected)
+    }
+}
+
+/// Apply the exact producer-side G17S event-ring index calculation. This pure
+/// helper does not copy the entry, execute either barrier, store, or notify.
+#[allow(dead_code)]
+pub(crate) const fn g17s_firmware_event_producer_next_entry(
+    gpu_gen: GpuGen,
+    gpu_variant: GpuVariant,
+    shared_read_index: u32,
+    shared_write_index: u32,
+) -> Result<G17sFirmwareEventProducerNextEntry, SubmissionConfigError> {
+    let Some(config) = g17s_firmware_event_producer_config(gpu_gen, gpu_variant) else {
+        return Err(SubmissionConfigError::UnsupportedTarget);
+    };
+    if shared_read_index > config.index_mask as u32 {
+        return Err(SubmissionConfigError::G17sFirmwareEventReadIndexOutOfRange);
+    }
+    if shared_write_index > config.index_mask as u32 {
+        return Err(SubmissionConfigError::G17sFirmwareEventWriteIndexOutOfRange);
+    }
+
+    let published_write_index = shared_write_index.wrapping_add(1) & config.index_mask as u32;
+    if published_write_index == shared_read_index {
+        return Err(SubmissionConfigError::G17sFirmwareEventRingFull);
+    }
+
+    Ok(G17sFirmwareEventProducerNextEntry {
+        entry_offset_from_entries_base: shared_write_index as u16 * config.entry_stride as u16,
+        published_write_index: published_write_index as u8,
+    })
+}
+
+/// Validate the raw interrupt selected by the G17S type-2 host notification.
+/// Both recovered indices converge on the firmware-event drain path.
+#[allow(dead_code)]
+pub(crate) const fn g17s_firmware_event_interrupt_route(
+    gpu_gen: GpuGen,
+    gpu_variant: GpuVariant,
+    raw_interrupt_index: u8,
+) -> Result<G17sFirmwareEventInterruptRoute, SubmissionConfigError> {
+    let Some(config) = g17s_firmware_event_producer_config(gpu_gen, gpu_variant) else {
+        return Err(SubmissionConfigError::UnsupportedTarget);
+    };
+    if raw_interrupt_index != config.host_interrupt_indices[0]
+        && raw_interrupt_index != config.host_interrupt_indices[1]
+    {
+        return Err(SubmissionConfigError::G17sFirmwareEventInterruptIndexUnsupported);
+    }
+
+    Ok(G17sFirmwareEventInterruptRoute {
+        raw_interrupt_index,
+        drains_firmware_event_rings: true,
+    })
+}
+
 /// Return the exact host firmware-event consumer contract from the pinned
 /// G17S host. Other identities are deliberately unsupported.
 #[allow(dead_code)]
@@ -1889,7 +2231,7 @@ pub(crate) const fn validate_g17s_host_firmware_event_consumer_config(
                 G17sHostFirmwareEventStep::DispatchIfSupported,
             ]
         )
-        || supplied.firmware_event_producer_ordering_proven
+        || !supplied.firmware_event_producer_ordering_proven
         || supplied.sksm_processed_count_interrupt_link_proven
         || supplied.normal_classic_submission_acknowledgment_proven
     {
@@ -3592,6 +3934,237 @@ mod tests {
     }
 
     #[test]
+    fn g17s_firmware_event_producer_and_interrupt_bridge_are_exact() {
+        let config = g17s_firmware_event_producer_config(GpuGen::G17, GpuVariant::S)
+            .expect("G17S should have a pinned two-role event producer");
+        assert_eq!(config, G17S_FIRMWARE_EVENT_PRODUCER_CONFIG);
+        assert_eq!(
+            config.roles,
+            [
+                G17sFirmwareEventProducerRoleConfig {
+                    role: SubmissionFirmwareRole::Gfx,
+                    enqueue_text_offset: 0x23560,
+                    runtime_pointer_global_image_offset: 0x104888,
+                    notification_send_text_offset: 0x35a90,
+                },
+                G17sFirmwareEventProducerRoleConfig {
+                    role: SubmissionFirmwareRole::Gfx1,
+                    enqueue_text_offset: 0x290f0,
+                    runtime_pointer_global_image_offset: 0x100e08,
+                    notification_send_text_offset: 0x3c804,
+                },
+            ]
+        );
+        assert_eq!(config.ring_pointer_pair_offset, 0x1c0);
+        assert_eq!(config.shared_indices_pointer_pair_offset, 0);
+        assert_eq!(config.entries_pointer_pair_offset, 8);
+        assert_eq!(config.shared_read_index_offset, 0);
+        assert_eq!(config.shared_write_index_offset, 0x20);
+        assert_eq!(config.entry_stride, 0x48);
+        assert_eq!(config.copied_entry_bytes, 0x48);
+        assert_eq!(config.index_mask, 0xff);
+        assert_eq!(config.notification_endpoint_service_id, 0x20);
+        assert_eq!(config.notification_message, 0x0042_0000_0000_0000);
+        assert_eq!(config.notification_message_type_shift, 48);
+        assert_eq!(config.notification_message_type_mask, 0x3f);
+        assert_eq!(
+            (config.notification_message >> config.notification_message_type_shift)
+                & config.notification_message_type_mask as u64,
+            config.host_message_type as u64
+        );
+        assert_eq!(config.notification_argument2, 0);
+        assert_eq!(config.rtbuddy_received_message_text_offset, 0x2430);
+        assert_eq!(config.host_received_message_text_offset, 0x5f2a0);
+        assert_eq!(config.host_message_type, 2);
+        assert_eq!(config.host_event_source_setup_text_offset, 0x150bc);
+        assert_eq!(config.host_event_source_array_offset, 0x5b8);
+        assert_eq!(config.host_interrupt_selector_offset, 0x72c);
+        assert_eq!(config.host_interrupt_indices, [0, 4]);
+        assert_eq!(config.filter_event_source_signal_vtable_offset, 0x258);
+        assert_eq!(config.interrupt_source_get_index_vtable_offset, 0x1e8);
+        assert_eq!(config.accelerator_firmware_pointer_offset, 0x598);
+        assert_eq!(config.accelerator_handle_interrupt_text_offset, 0x757c);
+        assert_eq!(config.firmware_handle_event_vtable_offset, 0x320);
+        assert_eq!(config.firmware_handle_event_text_offset, 0x4c388);
+        assert_eq!(
+            config.steps,
+            [
+                G17sFirmwareEventProducerStep::LoadSharedWriteIndex,
+                G17sFirmwareEventProducerStep::AdvanceAndWrap8,
+                G17sFirmwareEventProducerStep::WaitUntilNextDiffersFromSharedRead,
+                G17sFirmwareEventProducerStep::ReloadSharedWriteIndex,
+                G17sFirmwareEventProducerStep::CopyEntry,
+                G17sFirmwareEventProducerStep::DsbSyBeforeWriteIndex,
+                G17sFirmwareEventProducerStep::PublishSharedWriteIndex,
+                G17sFirmwareEventProducerStep::DsbSyBeforeNotification,
+                G17sFirmwareEventProducerStep::NotifyHost,
+            ]
+        );
+        assert!(!config.direct_cache_maintenance_before_publish);
+        assert!(!config.sksm_processed_count_causal_link_proven);
+        assert!(!config.normal_classic_submission_acknowledgment_proven);
+        assert_eq!(
+            validate_g17s_firmware_event_producer_config(GpuGen::G17, GpuVariant::S, config,),
+            Ok(config)
+        );
+
+        assert_eq!(
+            g17s_firmware_event_producer_role_config(
+                GpuGen::G17,
+                GpuVariant::S,
+                SubmissionFirmwareRole::Gfx,
+            ),
+            Ok(config.roles[0])
+        );
+        assert_eq!(
+            g17s_firmware_event_producer_role_config(
+                GpuGen::G17,
+                GpuVariant::S,
+                SubmissionFirmwareRole::Gfx1,
+            ),
+            Ok(config.roles[1])
+        );
+
+        for unexpected in [
+            G17sFirmwareEventProducerConfig {
+                roles: [config.roles[1], config.roles[0]],
+                ..config
+            },
+            G17sFirmwareEventProducerConfig {
+                ring_pointer_pair_offset: 0x1b8,
+                ..config
+            },
+            G17sFirmwareEventProducerConfig {
+                entry_stride: 0x40,
+                ..config
+            },
+            G17sFirmwareEventProducerConfig {
+                notification_message: 0x0043_0000_0000_0000,
+                ..config
+            },
+            G17sFirmwareEventProducerConfig {
+                host_interrupt_indices: [4, 0],
+                ..config
+            },
+            G17sFirmwareEventProducerConfig {
+                steps: [
+                    G17sFirmwareEventProducerStep::LoadSharedWriteIndex,
+                    G17sFirmwareEventProducerStep::AdvanceAndWrap8,
+                    G17sFirmwareEventProducerStep::WaitUntilNextDiffersFromSharedRead,
+                    G17sFirmwareEventProducerStep::ReloadSharedWriteIndex,
+                    G17sFirmwareEventProducerStep::CopyEntry,
+                    G17sFirmwareEventProducerStep::PublishSharedWriteIndex,
+                    G17sFirmwareEventProducerStep::DsbSyBeforeWriteIndex,
+                    G17sFirmwareEventProducerStep::DsbSyBeforeNotification,
+                    G17sFirmwareEventProducerStep::NotifyHost,
+                ],
+                ..config
+            },
+            G17sFirmwareEventProducerConfig {
+                direct_cache_maintenance_before_publish: true,
+                ..config
+            },
+            G17sFirmwareEventProducerConfig {
+                sksm_processed_count_causal_link_proven: true,
+                ..config
+            },
+            G17sFirmwareEventProducerConfig {
+                normal_classic_submission_acknowledgment_proven: true,
+                ..config
+            },
+        ] {
+            assert_eq!(
+                validate_g17s_firmware_event_producer_config(
+                    GpuGen::G17,
+                    GpuVariant::S,
+                    unexpected,
+                ),
+                Err(SubmissionConfigError::UnexpectedG17sFirmwareEventProducerConfig)
+            );
+        }
+
+        assert_eq!(
+            g17s_firmware_event_producer_next_entry(GpuGen::G17, GpuVariant::S, 0, 0),
+            Ok(G17sFirmwareEventProducerNextEntry {
+                entry_offset_from_entries_base: 0,
+                published_write_index: 1,
+            })
+        );
+        assert_eq!(
+            g17s_firmware_event_producer_next_entry(GpuGen::G17, GpuVariant::S, 1, 0xff),
+            Ok(G17sFirmwareEventProducerNextEntry {
+                entry_offset_from_entries_base: 0x47b8,
+                published_write_index: 0,
+            })
+        );
+        assert_eq!(
+            g17s_firmware_event_producer_next_entry(GpuGen::G17, GpuVariant::S, 1, 0),
+            Err(SubmissionConfigError::G17sFirmwareEventRingFull)
+        );
+        assert_eq!(
+            g17s_firmware_event_producer_next_entry(GpuGen::G17, GpuVariant::S, 0x100, 0),
+            Err(SubmissionConfigError::G17sFirmwareEventReadIndexOutOfRange)
+        );
+        assert_eq!(
+            g17s_firmware_event_producer_next_entry(GpuGen::G17, GpuVariant::S, 0, 0x100),
+            Err(SubmissionConfigError::G17sFirmwareEventWriteIndexOutOfRange)
+        );
+
+        for raw_interrupt_index in [0, 4] {
+            assert_eq!(
+                g17s_firmware_event_interrupt_route(
+                    GpuGen::G17,
+                    GpuVariant::S,
+                    raw_interrupt_index,
+                ),
+                Ok(G17sFirmwareEventInterruptRoute {
+                    raw_interrupt_index,
+                    drains_firmware_event_rings: true,
+                })
+            );
+        }
+        assert_eq!(
+            g17s_firmware_event_interrupt_route(GpuGen::G17, GpuVariant::S, 1),
+            Err(SubmissionConfigError::G17sFirmwareEventInterruptIndexUnsupported)
+        );
+
+        for (gpu_gen, gpu_variant) in [
+            (GpuGen::G16, GpuVariant::S),
+            (GpuGen::G17, GpuVariant::P),
+            (GpuGen::G17, GpuVariant::G),
+            (GpuGen::G17, GpuVariant::C),
+        ] {
+            assert_eq!(
+                g17s_firmware_event_producer_config(gpu_gen, gpu_variant),
+                None
+            );
+            assert_eq!(
+                validate_g17s_firmware_event_producer_config(gpu_gen, gpu_variant, config),
+                Err(SubmissionConfigError::UnsupportedTarget)
+            );
+            assert_eq!(
+                g17s_firmware_event_producer_role_config(
+                    gpu_gen,
+                    gpu_variant,
+                    SubmissionFirmwareRole::Gfx,
+                ),
+                Err(SubmissionConfigError::UnsupportedTarget)
+            );
+            assert_eq!(
+                g17s_firmware_event_producer_next_entry(gpu_gen, gpu_variant, 0, 0),
+                Err(SubmissionConfigError::UnsupportedTarget)
+            );
+            assert_eq!(
+                g17s_firmware_event_interrupt_route(gpu_gen, gpu_variant, 0),
+                Err(SubmissionConfigError::UnsupportedTarget)
+            );
+        }
+
+        assert!(GROUNDED_G17S_FIRMWARE_EVENT_PRODUCER_CONFIG_AVAILABLE);
+        assert!(!EXECUTABLE_G15_G17_SUBMISSION_AVAILABLE);
+    }
+
+    #[test]
     fn g17s_host_firmware_event_consumer_is_exact_and_fail_closed() {
         let config = g17s_host_firmware_event_consumer_config(GpuGen::G17, GpuVariant::S)
             .expect("G17S should have a pinned host firmware-event consumer");
@@ -3637,7 +4210,7 @@ mod tests {
                 G17sHostFirmwareEventStep::DispatchIfSupported,
             ]
         );
-        assert!(!config.firmware_event_producer_ordering_proven);
+        assert!(config.firmware_event_producer_ordering_proven);
         assert!(!config.sksm_processed_count_interrupt_link_proven);
         assert!(!config.normal_classic_submission_acknowledgment_proven);
         assert_eq!(
@@ -3688,7 +4261,7 @@ mod tests {
                 ..config
             },
             G17sHostFirmwareEventConsumerConfig {
-                firmware_event_producer_ordering_proven: true,
+                firmware_event_producer_ordering_proven: false,
                 ..config
             },
             G17sHostFirmwareEventConsumerConfig {
