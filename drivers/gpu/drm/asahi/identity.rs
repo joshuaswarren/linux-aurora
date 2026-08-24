@@ -121,21 +121,93 @@ pub(crate) enum DataMasterRingPublicationStep {
     StoreWriteIndex,
 }
 
+/// Exact host-side storage used for the three data-master ring indices.
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub(crate) enum DataMasterRingIndexBacking {
+    /// One slice of an `AGXFirmware::allocateSharedData` batch.
+    FirmwareSharedData {
+        resource_owner_object_offset: u16,
+        cpu_object_offset: u8,
+        firmware_object_offset: u8,
+        read_index_offset: u8,
+        cfi_index_offset: u8,
+        write_index_offset: u8,
+        slice_size: u8,
+        caching_options: u8,
+        allocate_shared_data_arg: bool,
+        batch_ring_count: u8,
+        release_zeroes_owner_slot: bool,
+    },
+    /// Three cells allocated from an `AGXFenderScratchRAM` object.
+    FenderScratchRam {
+        scratch_object_offset: u8,
+        read_cpu_pointer_offset: u8,
+        cfi_cpu_pointer_offset: u8,
+        write_cpu_pointer_offset: u8,
+        read_firmware_pointer_offset: u8,
+        cfi_firmware_pointer_offset: u8,
+        write_firmware_pointer_offset: u8,
+        entries_write_allocator_offset: u8,
+        read_cfi_allocator_offset: u8,
+        index_allocation_size: u8,
+        entries_write_mapping_options: u32,
+        read_cfi_mapping_options: u32,
+        cleanup_frees_allocations_proven: bool,
+    },
+}
+
+/// Exact construction path for the 256 data-master ring entries.
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub(crate) enum DataMasterRingEntryBacking {
+    /// One slice of an `AGXFirmware::allocateSharedData` batch.
+    FirmwareSharedData {
+        resource_owner_object_offset: u16,
+        slice_size: u16,
+        caching_options: u8,
+        allocate_shared_data_arg: bool,
+        batch_ring_count: u8,
+        release_zeroes_owner_slot: bool,
+    },
+    /// One allocation from the writable `AGXFenderScratchRAM` pool.
+    FenderScratchRam {
+        allocator_offset: u8,
+        allocation_size: u16,
+        mapping_options: u32,
+        cleanup_frees_allocation_proven: bool,
+    },
+}
+
+/// Host mutation policy independently visible in the ring vtable methods.
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub(crate) enum DataMasterRingHostIndexMutation {
+    /// Read, CFI, and write setters all store directly into shared data.
+    DirectSharedStores,
+    /// Read/CFI setters trap; the write setter stores while holding the
+    /// Fender ScratchRAM lock.
+    LockedScratchWriteOnly,
+}
+
 /// Exact host-visible geometry and publication contract of a data-master ring.
 #[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub(crate) struct DataMasterRingConfig {
-    pub(crate) shared_control_object_offset: u8,
-    pub(crate) entries_object_offset: u8,
-    pub(crate) read_index_offset: u8,
-    pub(crate) write_index_offset: u8,
+    pub(crate) index_backing: DataMasterRingIndexBacking,
+    pub(crate) entry_backing: DataMasterRingEntryBacking,
+    pub(crate) entries_cpu_object_offset: u8,
+    pub(crate) entries_firmware_object_offset: u8,
+    pub(crate) host_index_mutation: DataMasterRingHostIndexMutation,
     pub(crate) get_read_index_vtable_offset: u8,
     pub(crate) get_write_index_vtable_offset: u8,
     pub(crate) set_write_index_vtable_offset: u8,
     pub(crate) entry_stride: u8,
     pub(crate) index_count: u16,
     pub(crate) usable_entry_count: u16,
-    pub(crate) cold_init_control_count: u8,
+    pub(crate) cold_init_ring_count: u8,
+    pub(crate) shared_data_cacheability_names_proven: bool,
+    pub(crate) firmware_consumer_ownership_proven: bool,
     pub(crate) publication_steps: [DataMasterRingPublicationStep; 6],
 }
 
@@ -184,9 +256,10 @@ pub(crate) const GROUNDED_FIRMWARE_KICK_ENDPOINT_CONFIG_AVAILABLE: bool = true;
 /// every target supported by the firmware-kick word encoder.
 #[allow(dead_code)]
 pub(crate) const GROUNDED_DATA_MASTER_RING_CONFIG_AVAILABLE: bool = true;
-/// Backing-allocation selection/cacheability, firmware consumer ownership,
-/// transport selection on dual-stack targets, and teardown are not modeled,
-/// so command submission must remain disconnected from these helpers.
+/// The symbolic meaning of the firmware shared-data caching-option numbers,
+/// firmware consumer ownership, and transport selection on dual-stack targets
+/// are not proved, so command submission must remain disconnected from these
+/// helpers.
 #[allow(dead_code)]
 pub(crate) const EXECUTABLE_G15_G17_SUBMISSION_AVAILABLE: bool = false;
 
@@ -221,23 +294,141 @@ const DATA_MASTER_RING_PUBLICATION_STEPS: [DataMasterRingPublicationStep; 6] = [
     DataMasterRingPublicationStep::IncrementAndWrap8,
     DataMasterRingPublicationStep::StoreWriteIndex,
 ];
-const DATA_MASTER_RING_CONFIG_SINGLE_ROLE: DataMasterRingConfig = DataMasterRingConfig {
-    shared_control_object_offset: 0x08,
-    entries_object_offset: 0x18,
-    read_index_offset: 0x00,
-    write_index_offset: 0x20,
+
+// Host corpus SHA-256:
+// mac15g: 7e207cc2a4c669623cd7242b74e166c63ba9e4aa625307db6567fae342a897b3
+// mac15s: d0a5c876ce14c8ee2ec893cbf280ef57d214add2a0da74aaa9066f86795eed39
+// mac15j (G15C/D): 146ce4df57416c3f03115727f04c4448078100d8c87b1f3893ff0cf2ae2acb37
+// mac16g: 8bc6795041ba43f9a3b95c4623f17605c0969980eec08bfb782d25a1557c5a7a
+// mac16j (G16S/C): ba728ba6e68539fd21774788bbbe3e0035bf45c8e627944fa4f4b22648af3f20
+// mac17p: f804073df6367dceb1902bbc42fecb85d88def1a7d8a9b75a1c7b7efd0231507
+// mac17g: 41432db82f74cc38aa51dbdac6def58004d8649a01f8b863a1858e723a9d6822
+// mac17j (G17S/C): ccbe120a3a197038216426b507b5409873397b947308239b4ecc75d76759e87f
+const fn data_master_ring_shared_indices(
+    resource_owner_object_offset: u16,
+) -> DataMasterRingIndexBacking {
+    DataMasterRingIndexBacking::FirmwareSharedData {
+        resource_owner_object_offset,
+        cpu_object_offset: 0x08,
+        firmware_object_offset: 0x10,
+        read_index_offset: 0x00,
+        cfi_index_offset: 0x10,
+        write_index_offset: 0x20,
+        slice_size: 0x30,
+        caching_options: 0,
+        allocate_shared_data_arg: false,
+        batch_ring_count: 12,
+        release_zeroes_owner_slot: true,
+    }
+}
+
+const fn data_master_ring_shared_entries(
+    resource_owner_object_offset: u16,
+) -> DataMasterRingEntryBacking {
+    DataMasterRingEntryBacking::FirmwareSharedData {
+        resource_owner_object_offset,
+        slice_size: 0x1800,
+        caching_options: 1,
+        allocate_shared_data_arg: false,
+        batch_ring_count: 12,
+        release_zeroes_owner_slot: true,
+    }
+}
+
+const DATA_MASTER_RING_SCRATCH_INDICES_CLEANUP: DataMasterRingIndexBacking =
+    DataMasterRingIndexBacking::FenderScratchRam {
+        scratch_object_offset: 0x28,
+        read_cpu_pointer_offset: 0x30,
+        cfi_cpu_pointer_offset: 0x38,
+        write_cpu_pointer_offset: 0x40,
+        read_firmware_pointer_offset: 0x48,
+        cfi_firmware_pointer_offset: 0x50,
+        write_firmware_pointer_offset: 0x58,
+        entries_write_allocator_offset: 0x98,
+        read_cfi_allocator_offset: 0xa0,
+        index_allocation_size: 0x04,
+        entries_write_mapping_options: 0x0400_0101,
+        read_cfi_mapping_options: 0x0400_1101,
+        cleanup_frees_allocations_proven: true,
+    };
+const DATA_MASTER_RING_SCRATCH_INDICES_NO_PROVEN_CLEANUP: DataMasterRingIndexBacking =
+    DataMasterRingIndexBacking::FenderScratchRam {
+        scratch_object_offset: 0x28,
+        read_cpu_pointer_offset: 0x30,
+        cfi_cpu_pointer_offset: 0x38,
+        write_cpu_pointer_offset: 0x40,
+        read_firmware_pointer_offset: 0x48,
+        cfi_firmware_pointer_offset: 0x50,
+        write_firmware_pointer_offset: 0x58,
+        entries_write_allocator_offset: 0x98,
+        read_cfi_allocator_offset: 0xa0,
+        index_allocation_size: 0x04,
+        entries_write_mapping_options: 0x0400_0101,
+        read_cfi_mapping_options: 0x0400_1101,
+        cleanup_frees_allocations_proven: false,
+    };
+const DATA_MASTER_RING_SCRATCH_ENTRIES: DataMasterRingEntryBacking =
+    DataMasterRingEntryBacking::FenderScratchRam {
+        allocator_offset: 0x98,
+        allocation_size: 0x1800,
+        mapping_options: 0x0400_0101,
+        cleanup_frees_allocation_proven: true,
+    };
+
+const fn data_master_ring_shared_config(
+    entry_resource_owner_object_offset: u16,
+    index_resource_owner_object_offset: u16,
+    cold_init_ring_count: u8,
+) -> DataMasterRingConfig {
+    DataMasterRingConfig {
+        index_backing: data_master_ring_shared_indices(index_resource_owner_object_offset),
+        entry_backing: data_master_ring_shared_entries(entry_resource_owner_object_offset),
+        entries_cpu_object_offset: 0x18,
+        entries_firmware_object_offset: 0x20,
+        host_index_mutation: DataMasterRingHostIndexMutation::DirectSharedStores,
+        get_read_index_vtable_offset: 0x30,
+        get_write_index_vtable_offset: 0x38,
+        set_write_index_vtable_offset: 0x10,
+        entry_stride: 0x18,
+        index_count: 0x100,
+        usable_entry_count: 0xff,
+        cold_init_ring_count,
+        shared_data_cacheability_names_proven: false,
+        firmware_consumer_ownership_proven: false,
+        publication_steps: DATA_MASTER_RING_PUBLICATION_STEPS,
+    }
+}
+
+const DATA_MASTER_RING_CONFIG_G15G: DataMasterRingConfig =
+    data_master_ring_shared_config(0x310, 0x548, 12);
+const DATA_MASTER_RING_CONFIG_G16X: DataMasterRingConfig =
+    data_master_ring_shared_config(0x350, 0x588, 12);
+const DATA_MASTER_RING_CONFIG_G17P_G17X: DataMasterRingConfig =
+    data_master_ring_shared_config(0x350, 0x588, 24);
+const DATA_MASTER_RING_CONFIG_G17G: DataMasterRingConfig =
+    data_master_ring_shared_config(0x358, 0x590, 24);
+const DATA_MASTER_RING_CONFIG_SCRATCH_ENTRIES: DataMasterRingConfig = DataMasterRingConfig {
+    index_backing: DATA_MASTER_RING_SCRATCH_INDICES_CLEANUP,
+    entry_backing: DATA_MASTER_RING_SCRATCH_ENTRIES,
+    entries_cpu_object_offset: 0x18,
+    entries_firmware_object_offset: 0x20,
+    host_index_mutation: DataMasterRingHostIndexMutation::LockedScratchWriteOnly,
     get_read_index_vtable_offset: 0x30,
     get_write_index_vtable_offset: 0x38,
     set_write_index_vtable_offset: 0x10,
     entry_stride: 0x18,
     index_count: 0x100,
     usable_entry_count: 0xff,
-    cold_init_control_count: 12,
+    cold_init_ring_count: 12,
+    shared_data_cacheability_names_proven: false,
+    firmware_consumer_ownership_proven: false,
     publication_steps: DATA_MASTER_RING_PUBLICATION_STEPS,
 };
-const DATA_MASTER_RING_CONFIG_DUAL_ROLE: DataMasterRingConfig = DataMasterRingConfig {
-    cold_init_control_count: 24,
-    ..DATA_MASTER_RING_CONFIG_SINGLE_ROLE
+const DATA_MASTER_RING_CONFIG_SCRATCH_INDICES: DataMasterRingConfig = DataMasterRingConfig {
+    index_backing: DATA_MASTER_RING_SCRATCH_INDICES_NO_PROVEN_CLEANUP,
+    entry_backing: data_master_ring_shared_entries(0x318),
+    host_index_mutation: DataMasterRingHostIndexMutation::LockedScratchWriteOnly,
+    ..DATA_MASTER_RING_CONFIG_G16X
 };
 
 /// Identity and userspace-visible architecture axes decoded from GPU ID MMIO.
@@ -476,13 +667,19 @@ pub(crate) const fn validate_firmware_kick_endpoint_config(
 ///
 /// The pinned G15G/X, G16G/X, G17P, G17G and G17X hosts all use 256 indices,
 /// reserve one slot to distinguish full from empty, and address 24-byte entries
-/// with the current write index. The host initializes 12 shared ring controls
-/// on single-role G15/G16 and 24 on dual-role G17. Publication is ordered as
-/// recorded here, including the `dmb ish` before the write-index update.
+/// with the current write index. Their backing differs materially: G15S/C/D
+/// allocate indices and entries from Fender ScratchRAM, G16G puts only the
+/// indices there, and the other targets use firmware shared-data batches. The
+/// host initializes 12 rings on single-role G15/G16 and 24 on dual-role G17.
+/// Publication is ordered as recorded here, including the `dmb ish` before the
+/// write-index update.
 ///
-/// This deliberately does not identify which cached or uncached firmware-data
-/// allocation backs the ring, prove firmware-side consumer ownership, or make
-/// the host object offsets an executable ABI.
+/// ScratchRAM CPU mappings are exactly inhibit-cache; read/CFI are additionally
+/// read-only. Generic entries and indices are distinct 12-ring batches with raw
+/// caching-option values 1 and 0 respectively. Each batch is owned and released
+/// through one target-specific `AGXFirmware` slot. The stripped option names and
+/// firmware-side consumer ownership remain unproved, and no host object offset
+/// is executable.
 #[allow(dead_code)]
 pub(crate) const fn data_master_ring_config(
     gpu_gen: GpuGen,
@@ -492,9 +689,165 @@ pub(crate) const fn data_master_ring_config(
     use GpuVariant::*;
 
     match (gpu_gen, gpu_variant) {
-        (G15, G | S | C | D) | (G16, G | S | C) => Some(DATA_MASTER_RING_CONFIG_SINGLE_ROLE),
-        (G17, P | G | S | C) => Some(DATA_MASTER_RING_CONFIG_DUAL_ROLE),
+        (G15, G) => Some(DATA_MASTER_RING_CONFIG_G15G),
+        (G15, S | C | D) => Some(DATA_MASTER_RING_CONFIG_SCRATCH_ENTRIES),
+        (G16, G) => Some(DATA_MASTER_RING_CONFIG_SCRATCH_INDICES),
+        (G16, S | C) => Some(DATA_MASTER_RING_CONFIG_G16X),
+        (G17, P | S | C) => Some(DATA_MASTER_RING_CONFIG_G17P_G17X),
+        (G17, G) => Some(DATA_MASTER_RING_CONFIG_G17G),
         _ => None,
+    }
+}
+
+const fn data_master_ring_index_backing_matches(
+    supplied: DataMasterRingIndexBacking,
+    expected: DataMasterRingIndexBacking,
+) -> bool {
+    use DataMasterRingIndexBacking::*;
+
+    match (supplied, expected) {
+        (
+            FirmwareSharedData {
+                resource_owner_object_offset: supplied_owner,
+                cpu_object_offset: supplied_cpu,
+                firmware_object_offset: supplied_firmware,
+                read_index_offset: supplied_read,
+                cfi_index_offset: supplied_cfi,
+                write_index_offset: supplied_write,
+                slice_size: supplied_size,
+                caching_options: supplied_caching,
+                allocate_shared_data_arg: supplied_arg,
+                batch_ring_count: supplied_count,
+                release_zeroes_owner_slot: supplied_release,
+            },
+            FirmwareSharedData {
+                resource_owner_object_offset: expected_owner,
+                cpu_object_offset: expected_cpu,
+                firmware_object_offset: expected_firmware,
+                read_index_offset: expected_read,
+                cfi_index_offset: expected_cfi,
+                write_index_offset: expected_write,
+                slice_size: expected_size,
+                caching_options: expected_caching,
+                allocate_shared_data_arg: expected_arg,
+                batch_ring_count: expected_count,
+                release_zeroes_owner_slot: expected_release,
+            },
+        ) => {
+            supplied_owner == expected_owner
+                && supplied_cpu == expected_cpu
+                && supplied_firmware == expected_firmware
+                && supplied_read == expected_read
+                && supplied_cfi == expected_cfi
+                && supplied_write == expected_write
+                && supplied_size == expected_size
+                && supplied_caching == expected_caching
+                && supplied_arg == expected_arg
+                && supplied_count == expected_count
+                && supplied_release == expected_release
+        }
+        (
+            FenderScratchRam {
+                scratch_object_offset: supplied_scratch,
+                read_cpu_pointer_offset: supplied_read_cpu,
+                cfi_cpu_pointer_offset: supplied_cfi_cpu,
+                write_cpu_pointer_offset: supplied_write_cpu,
+                read_firmware_pointer_offset: supplied_read_firmware,
+                cfi_firmware_pointer_offset: supplied_cfi_firmware,
+                write_firmware_pointer_offset: supplied_write_firmware,
+                entries_write_allocator_offset: supplied_write_allocator,
+                read_cfi_allocator_offset: supplied_read_cfi_allocator,
+                index_allocation_size: supplied_size,
+                entries_write_mapping_options: supplied_write_options,
+                read_cfi_mapping_options: supplied_read_cfi_options,
+                cleanup_frees_allocations_proven: supplied_cleanup,
+            },
+            FenderScratchRam {
+                scratch_object_offset: expected_scratch,
+                read_cpu_pointer_offset: expected_read_cpu,
+                cfi_cpu_pointer_offset: expected_cfi_cpu,
+                write_cpu_pointer_offset: expected_write_cpu,
+                read_firmware_pointer_offset: expected_read_firmware,
+                cfi_firmware_pointer_offset: expected_cfi_firmware,
+                write_firmware_pointer_offset: expected_write_firmware,
+                entries_write_allocator_offset: expected_write_allocator,
+                read_cfi_allocator_offset: expected_read_cfi_allocator,
+                index_allocation_size: expected_size,
+                entries_write_mapping_options: expected_write_options,
+                read_cfi_mapping_options: expected_read_cfi_options,
+                cleanup_frees_allocations_proven: expected_cleanup,
+            },
+        ) => {
+            supplied_scratch == expected_scratch
+                && supplied_read_cpu == expected_read_cpu
+                && supplied_cfi_cpu == expected_cfi_cpu
+                && supplied_write_cpu == expected_write_cpu
+                && supplied_read_firmware == expected_read_firmware
+                && supplied_cfi_firmware == expected_cfi_firmware
+                && supplied_write_firmware == expected_write_firmware
+                && supplied_write_allocator == expected_write_allocator
+                && supplied_read_cfi_allocator == expected_read_cfi_allocator
+                && supplied_size == expected_size
+                && supplied_write_options == expected_write_options
+                && supplied_read_cfi_options == expected_read_cfi_options
+                && supplied_cleanup == expected_cleanup
+        }
+        _ => false,
+    }
+}
+
+const fn data_master_ring_entry_backing_matches(
+    supplied: DataMasterRingEntryBacking,
+    expected: DataMasterRingEntryBacking,
+) -> bool {
+    use DataMasterRingEntryBacking::*;
+
+    match (supplied, expected) {
+        (
+            FirmwareSharedData {
+                resource_owner_object_offset: supplied_owner,
+                slice_size: supplied_size,
+                caching_options: supplied_caching,
+                allocate_shared_data_arg: supplied_arg,
+                batch_ring_count: supplied_count,
+                release_zeroes_owner_slot: supplied_release,
+            },
+            FirmwareSharedData {
+                resource_owner_object_offset: expected_owner,
+                slice_size: expected_size,
+                caching_options: expected_caching,
+                allocate_shared_data_arg: expected_arg,
+                batch_ring_count: expected_count,
+                release_zeroes_owner_slot: expected_release,
+            },
+        ) => {
+            supplied_owner == expected_owner
+                && supplied_size == expected_size
+                && supplied_caching == expected_caching
+                && supplied_arg == expected_arg
+                && supplied_count == expected_count
+                && supplied_release == expected_release
+        }
+        (
+            FenderScratchRam {
+                allocator_offset: supplied_allocator,
+                allocation_size: supplied_size,
+                mapping_options: supplied_options,
+                cleanup_frees_allocation_proven: supplied_cleanup,
+            },
+            FenderScratchRam {
+                allocator_offset: expected_allocator,
+                allocation_size: expected_size,
+                mapping_options: expected_options,
+                cleanup_frees_allocation_proven: expected_cleanup,
+            },
+        ) => {
+            supplied_allocator == expected_allocator
+                && supplied_size == expected_size
+                && supplied_options == expected_options
+                && supplied_cleanup == expected_cleanup
+        }
+        _ => false,
     }
 }
 
@@ -509,17 +862,31 @@ pub(crate) const fn validate_data_master_ring_config(
         return Err(SubmissionConfigError::UnsupportedTarget);
     };
 
-    if supplied.shared_control_object_offset != expected.shared_control_object_offset
-        || supplied.entries_object_offset != expected.entries_object_offset
-        || supplied.read_index_offset != expected.read_index_offset
-        || supplied.write_index_offset != expected.write_index_offset
+    if !data_master_ring_index_backing_matches(supplied.index_backing, expected.index_backing)
+        || !data_master_ring_entry_backing_matches(supplied.entry_backing, expected.entry_backing)
+        || supplied.entries_cpu_object_offset != expected.entries_cpu_object_offset
+        || supplied.entries_firmware_object_offset != expected.entries_firmware_object_offset
+        || !matches!(
+            (supplied.host_index_mutation, expected.host_index_mutation),
+            (
+                DataMasterRingHostIndexMutation::DirectSharedStores,
+                DataMasterRingHostIndexMutation::DirectSharedStores,
+            ) | (
+                DataMasterRingHostIndexMutation::LockedScratchWriteOnly,
+                DataMasterRingHostIndexMutation::LockedScratchWriteOnly,
+            )
+        )
         || supplied.get_read_index_vtable_offset != expected.get_read_index_vtable_offset
         || supplied.get_write_index_vtable_offset != expected.get_write_index_vtable_offset
         || supplied.set_write_index_vtable_offset != expected.set_write_index_vtable_offset
         || supplied.entry_stride != expected.entry_stride
         || supplied.index_count != expected.index_count
         || supplied.usable_entry_count != expected.usable_entry_count
-        || supplied.cold_init_control_count != expected.cold_init_control_count
+        || supplied.cold_init_ring_count != expected.cold_init_ring_count
+        || supplied.shared_data_cacheability_names_proven
+            != expected.shared_data_cacheability_names_proven
+        || supplied.firmware_consumer_ownership_proven
+            != expected.firmware_consumer_ownership_proven
         || !matches!(
             supplied.publication_steps,
             [
@@ -743,12 +1110,7 @@ mod tests {
             );
         }
 
-        for gpu_variant in [
-            GpuVariant::P,
-            GpuVariant::G,
-            GpuVariant::S,
-            GpuVariant::C,
-        ] {
+        for gpu_variant in [GpuVariant::P, GpuVariant::G, GpuVariant::S, GpuVariant::C] {
             assert_eq!(
                 encode_firmware_kick_route(GpuGen::G17, gpu_variant, 7, 7),
                 Ok(FirmwareKickRoute {
@@ -757,10 +1119,7 @@ mod tests {
                 })
             );
         }
-        for (gpu_gen, gpu_variant) in [
-            (GpuGen::G15, GpuVariant::G),
-            (GpuGen::G16, GpuVariant::G),
-        ] {
+        for (gpu_gen, gpu_variant) in [(GpuGen::G15, GpuVariant::G), (GpuGen::G16, GpuVariant::G)] {
             assert_eq!(
                 encode_firmware_kick_route(gpu_gen, gpu_variant, 7, 7),
                 Ok(FirmwareKickRoute {
@@ -888,53 +1247,137 @@ mod tests {
 
     #[test]
     fn data_master_ring_geometry_and_publication_are_exact() {
-        for (gpu_gen, gpu_variant, cold_init_control_count) in [
-            (GpuGen::G15, GpuVariant::G, 12),
-            (GpuGen::G15, GpuVariant::S, 12),
-            (GpuGen::G15, GpuVariant::C, 12),
-            (GpuGen::G15, GpuVariant::D, 12),
-            (GpuGen::G16, GpuVariant::G, 12),
-            (GpuGen::G16, GpuVariant::S, 12),
-            (GpuGen::G16, GpuVariant::C, 12),
-            (GpuGen::G17, GpuVariant::P, 24),
-            (GpuGen::G17, GpuVariant::G, 24),
-            (GpuGen::G17, GpuVariant::S, 24),
-            (GpuGen::G17, GpuVariant::C, 24),
+        for (gpu_gen, gpu_variant, expected) in [
+            (GpuGen::G15, GpuVariant::G, DATA_MASTER_RING_CONFIG_G15G),
+            (
+                GpuGen::G15,
+                GpuVariant::S,
+                DATA_MASTER_RING_CONFIG_SCRATCH_ENTRIES,
+            ),
+            (
+                GpuGen::G15,
+                GpuVariant::C,
+                DATA_MASTER_RING_CONFIG_SCRATCH_ENTRIES,
+            ),
+            (
+                GpuGen::G15,
+                GpuVariant::D,
+                DATA_MASTER_RING_CONFIG_SCRATCH_ENTRIES,
+            ),
+            (
+                GpuGen::G16,
+                GpuVariant::G,
+                DATA_MASTER_RING_CONFIG_SCRATCH_INDICES,
+            ),
+            (GpuGen::G16, GpuVariant::S, DATA_MASTER_RING_CONFIG_G16X),
+            (GpuGen::G16, GpuVariant::C, DATA_MASTER_RING_CONFIG_G16X),
+            (
+                GpuGen::G17,
+                GpuVariant::P,
+                DATA_MASTER_RING_CONFIG_G17P_G17X,
+            ),
+            (GpuGen::G17, GpuVariant::G, DATA_MASTER_RING_CONFIG_G17G),
+            (
+                GpuGen::G17,
+                GpuVariant::S,
+                DATA_MASTER_RING_CONFIG_G17P_G17X,
+            ),
+            (
+                GpuGen::G17,
+                GpuVariant::C,
+                DATA_MASTER_RING_CONFIG_G17P_G17X,
+            ),
         ] {
             let config = data_master_ring_config(gpu_gen, gpu_variant)
                 .expect("target should have a pinned data-master ring contract");
-            assert_eq!(config.shared_control_object_offset, 0x08);
-            assert_eq!(config.entries_object_offset, 0x18);
-            assert_eq!(config.read_index_offset, 0x00);
-            assert_eq!(config.write_index_offset, 0x20);
+            assert_eq!(config, expected);
+            assert_eq!(config.entries_cpu_object_offset, 0x18);
+            assert_eq!(config.entries_firmware_object_offset, 0x20);
             assert_eq!(config.get_read_index_vtable_offset, 0x30);
             assert_eq!(config.get_write_index_vtable_offset, 0x38);
             assert_eq!(config.set_write_index_vtable_offset, 0x10);
             assert_eq!(config.entry_stride, 0x18);
             assert_eq!(config.index_count, 0x100);
             assert_eq!(config.usable_entry_count, 0xff);
-            assert_eq!(config.cold_init_control_count, cold_init_control_count);
+            assert!(!config.shared_data_cacheability_names_proven);
+            assert!(!config.firmware_consumer_ownership_proven);
             assert_eq!(config.publication_steps, DATA_MASTER_RING_PUBLICATION_STEPS);
             assert_eq!(
                 validate_data_master_ring_config(gpu_gen, gpu_variant, config),
                 Ok(config)
             );
 
+            for recovered_layout in [
+                DATA_MASTER_RING_CONFIG_G15G,
+                DATA_MASTER_RING_CONFIG_SCRATCH_ENTRIES,
+                DATA_MASTER_RING_CONFIG_SCRATCH_INDICES,
+                DATA_MASTER_RING_CONFIG_G16X,
+                DATA_MASTER_RING_CONFIG_G17P_G17X,
+                DATA_MASTER_RING_CONFIG_G17G,
+            ] {
+                let validation =
+                    validate_data_master_ring_config(gpu_gen, gpu_variant, recovered_layout);
+                if recovered_layout == config {
+                    assert_eq!(validation, Ok(config));
+                } else {
+                    assert_eq!(
+                        validation,
+                        Err(SubmissionConfigError::UnexpectedDataMasterRingConfig)
+                    );
+                }
+            }
+
+            let alternate_index_backing = if matches!(
+                config.index_backing,
+                DataMasterRingIndexBacking::FirmwareSharedData { .. }
+            ) {
+                DATA_MASTER_RING_SCRATCH_INDICES_CLEANUP
+            } else {
+                data_master_ring_shared_indices(0x548)
+            };
+            let alternate_entry_backing = if matches!(
+                config.entry_backing,
+                DataMasterRingEntryBacking::FirmwareSharedData { .. }
+            ) {
+                DATA_MASTER_RING_SCRATCH_ENTRIES
+            } else {
+                data_master_ring_shared_entries(0x310)
+            };
+            let alternate_host_index_mutation = match config.host_index_mutation {
+                DataMasterRingHostIndexMutation::DirectSharedStores => {
+                    DataMasterRingHostIndexMutation::LockedScratchWriteOnly
+                }
+                DataMasterRingHostIndexMutation::LockedScratchWriteOnly => {
+                    DataMasterRingHostIndexMutation::DirectSharedStores
+                }
+            };
             for unexpected in [
                 DataMasterRingConfig {
-                    shared_control_object_offset: 0x10,
+                    index_backing: alternate_index_backing,
                     ..config
                 },
                 DataMasterRingConfig {
-                    entries_object_offset: 0x20,
+                    entry_backing: alternate_entry_backing,
                     ..config
                 },
                 DataMasterRingConfig {
-                    read_index_offset: 0x04,
+                    entries_cpu_object_offset: 0x20,
                     ..config
                 },
                 DataMasterRingConfig {
-                    write_index_offset: 0x24,
+                    entries_firmware_object_offset: 0x28,
+                    ..config
+                },
+                DataMasterRingConfig {
+                    host_index_mutation: alternate_host_index_mutation,
+                    ..config
+                },
+                DataMasterRingConfig {
+                    shared_data_cacheability_names_proven: true,
+                    ..config
+                },
+                DataMasterRingConfig {
+                    firmware_consumer_ownership_proven: true,
                     ..config
                 },
                 DataMasterRingConfig {
@@ -962,7 +1405,7 @@ mod tests {
                     ..config
                 },
                 DataMasterRingConfig {
-                    cold_init_control_count: cold_init_control_count + 1,
+                    cold_init_ring_count: config.cold_init_ring_count + 1,
                     ..config
                 },
                 DataMasterRingConfig {
@@ -1025,7 +1468,7 @@ mod tests {
                 validate_data_master_ring_config(
                     gpu_gen,
                     gpu_variant,
-                    DATA_MASTER_RING_CONFIG_SINGLE_ROLE,
+                    DATA_MASTER_RING_CONFIG_G15G,
                 ),
                 Err(SubmissionConfigError::UnsupportedTarget)
             );
@@ -1036,6 +1479,154 @@ mod tests {
         }
 
         assert!(GROUNDED_DATA_MASTER_RING_CONFIG_AVAILABLE);
+        assert!(!EXECUTABLE_G15_G17_SUBMISSION_AVAILABLE);
+    }
+
+    #[test]
+    fn data_master_ring_backing_and_host_ownership_are_target_pinned() {
+        assert_eq!(
+            DATA_MASTER_RING_SCRATCH_INDICES_CLEANUP,
+            DataMasterRingIndexBacking::FenderScratchRam {
+                scratch_object_offset: 0x28,
+                read_cpu_pointer_offset: 0x30,
+                cfi_cpu_pointer_offset: 0x38,
+                write_cpu_pointer_offset: 0x40,
+                read_firmware_pointer_offset: 0x48,
+                cfi_firmware_pointer_offset: 0x50,
+                write_firmware_pointer_offset: 0x58,
+                entries_write_allocator_offset: 0x98,
+                read_cfi_allocator_offset: 0xa0,
+                index_allocation_size: 0x04,
+                entries_write_mapping_options: 0x0400_0101,
+                read_cfi_mapping_options: 0x0400_1101,
+                cleanup_frees_allocations_proven: true,
+            }
+        );
+        assert_eq!(
+            DATA_MASTER_RING_SCRATCH_INDICES_NO_PROVEN_CLEANUP,
+            DataMasterRingIndexBacking::FenderScratchRam {
+                scratch_object_offset: 0x28,
+                read_cpu_pointer_offset: 0x30,
+                cfi_cpu_pointer_offset: 0x38,
+                write_cpu_pointer_offset: 0x40,
+                read_firmware_pointer_offset: 0x48,
+                cfi_firmware_pointer_offset: 0x50,
+                write_firmware_pointer_offset: 0x58,
+                entries_write_allocator_offset: 0x98,
+                read_cfi_allocator_offset: 0xa0,
+                index_allocation_size: 0x04,
+                entries_write_mapping_options: 0x0400_0101,
+                read_cfi_mapping_options: 0x0400_1101,
+                cleanup_frees_allocations_proven: false,
+            }
+        );
+        assert_eq!(
+            DATA_MASTER_RING_SCRATCH_ENTRIES,
+            DataMasterRingEntryBacking::FenderScratchRam {
+                allocator_offset: 0x98,
+                allocation_size: 0x1800,
+                mapping_options: 0x0400_0101,
+                cleanup_frees_allocation_proven: true,
+            }
+        );
+
+        fn assert_shared_indices(backing: DataMasterRingIndexBacking, owner_offset: u16) {
+            assert_eq!(backing, data_master_ring_shared_indices(owner_offset));
+            assert_eq!(
+                backing,
+                DataMasterRingIndexBacking::FirmwareSharedData {
+                    resource_owner_object_offset: owner_offset,
+                    cpu_object_offset: 0x08,
+                    firmware_object_offset: 0x10,
+                    read_index_offset: 0x00,
+                    cfi_index_offset: 0x10,
+                    write_index_offset: 0x20,
+                    slice_size: 0x30,
+                    caching_options: 0,
+                    allocate_shared_data_arg: false,
+                    batch_ring_count: 12,
+                    release_zeroes_owner_slot: true,
+                }
+            );
+        }
+
+        fn assert_shared_entries(backing: DataMasterRingEntryBacking, owner_offset: u16) {
+            assert_eq!(backing, data_master_ring_shared_entries(owner_offset));
+            assert_eq!(
+                backing,
+                DataMasterRingEntryBacking::FirmwareSharedData {
+                    resource_owner_object_offset: owner_offset,
+                    slice_size: 0x1800,
+                    caching_options: 1,
+                    allocate_shared_data_arg: false,
+                    batch_ring_count: 12,
+                    release_zeroes_owner_slot: true,
+                }
+            );
+        }
+
+        let g15g = data_master_ring_config(GpuGen::G15, GpuVariant::G).unwrap();
+        assert_shared_entries(g15g.entry_backing, 0x310);
+        assert_shared_indices(g15g.index_backing, 0x548);
+        assert_eq!(
+            g15g.host_index_mutation,
+            DataMasterRingHostIndexMutation::DirectSharedStores
+        );
+
+        for (gpu_gen, gpu_variant) in [
+            (GpuGen::G15, GpuVariant::S),
+            (GpuGen::G15, GpuVariant::C),
+            (GpuGen::G15, GpuVariant::D),
+        ] {
+            let config = data_master_ring_config(gpu_gen, gpu_variant).unwrap();
+            assert_eq!(
+                config.index_backing,
+                DATA_MASTER_RING_SCRATCH_INDICES_CLEANUP
+            );
+            assert_eq!(config.entry_backing, DATA_MASTER_RING_SCRATCH_ENTRIES);
+            assert_eq!(
+                config.host_index_mutation,
+                DataMasterRingHostIndexMutation::LockedScratchWriteOnly
+            );
+        }
+
+        let g16g = data_master_ring_config(GpuGen::G16, GpuVariant::G).unwrap();
+        assert_eq!(
+            g16g.index_backing,
+            DATA_MASTER_RING_SCRATCH_INDICES_NO_PROVEN_CLEANUP
+        );
+        assert_shared_entries(g16g.entry_backing, 0x318);
+        assert_eq!(
+            g16g.host_index_mutation,
+            DataMasterRingHostIndexMutation::LockedScratchWriteOnly
+        );
+
+        for (gpu_gen, gpu_variant, entry_owner, index_owner) in [
+            (GpuGen::G16, GpuVariant::S),
+            (GpuGen::G16, GpuVariant::C),
+            (GpuGen::G17, GpuVariant::P),
+            (GpuGen::G17, GpuVariant::G),
+            (GpuGen::G17, GpuVariant::S),
+            (GpuGen::G17, GpuVariant::C),
+        ]
+        .map(|(gpu_gen, gpu_variant)| {
+            let owners = match (gpu_gen, gpu_variant) {
+                (GpuGen::G17, GpuVariant::G) => (0x358, 0x590),
+                _ => (0x350, 0x588),
+            };
+            (gpu_gen, gpu_variant, owners.0, owners.1)
+        }) {
+            let config = data_master_ring_config(gpu_gen, gpu_variant).unwrap();
+            assert_shared_entries(config.entry_backing, entry_owner);
+            assert_shared_indices(config.index_backing, index_owner);
+            assert_eq!(
+                config.host_index_mutation,
+                DataMasterRingHostIndexMutation::DirectSharedStores
+            );
+            assert!(!config.shared_data_cacheability_names_proven);
+            assert!(!config.firmware_consumer_ownership_proven);
+        }
+
         assert!(!EXECUTABLE_G15_G17_SUBMISSION_AVAILABLE);
     }
 
