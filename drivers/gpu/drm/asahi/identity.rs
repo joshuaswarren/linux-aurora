@@ -374,6 +374,73 @@ pub(crate) struct G17sFirmwareRecoveryDrainRoute {
     pub(crate) expected_entry_type_ordinal: u8,
 }
 
+/// Exact per-entry order in the pinned G17S SKSM completion consumer.
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub(crate) enum G17sSksmCompletionEntryStep {
+    ValidateEntry,
+    HandleIfAccepted,
+    AdvanceReadIndexModuloCapacity,
+}
+
+/// Exact G17S SKSM completion descriptor and consumer contract.
+///
+/// This is separate from the classic submission rings and does not prove
+/// normal classic-ring firmware acknowledgment.
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub(crate) struct G17sSksmCompletionConsumerConfig {
+    pub(crate) consumer_text_offset: u32,
+    pub(crate) entry_validator_text_offset: u32,
+    pub(crate) entry_handler_text_offset: u32,
+    pub(crate) cache_clean_invalidate_text_offset: u32,
+    pub(crate) descriptor_table_offset: u16,
+    pub(crate) host_resource_table_accelerator_offset: u32,
+    pub(crate) host_capacity_accelerator_offset: u32,
+    pub(crate) host_present_pointer_source_subobject_offset: u8,
+    pub(crate) host_entries_pointer_source_subobject_offset: u8,
+    pub(crate) host_initial_read_index: u32,
+    pub(crate) host_resource_count: u8,
+    pub(crate) firmware_consumed_descriptor_count: u8,
+    pub(crate) descriptor_record_stride: u8,
+    pub(crate) present_pointer_offset: u8,
+    pub(crate) entries_pointer_offset: u8,
+    pub(crate) capacity_offset: u8,
+    pub(crate) entry_stride_offset: u8,
+    pub(crate) mmio_selector_offset: u8,
+    pub(crate) read_index_offset: u8,
+    pub(crate) host_entry_stride: u8,
+    pub(crate) host_selector_by_record: [u8; 4],
+    pub(crate) firmware_record_order: [u8; 3],
+    pub(crate) producer_mmio_base_offset: u32,
+    pub(crate) processed_count_mmio_base_offset: u32,
+    pub(crate) mmio_selector_stride: u8,
+    pub(crate) minimum_raw_producer_value: u32,
+    pub(crate) producer_count_shift: u8,
+    pub(crate) processed_count_mmio_store_width: u8,
+    pub(crate) supported_modes: [u8; 2],
+    pub(crate) entry_steps: [G17sSksmCompletionEntryStep; 3],
+    pub(crate) cache_clean_invalidate_precedes_entry_reads: bool,
+    pub(crate) handler_return_precedes_read_index_store: bool,
+    pub(crate) current_descriptor_work_precedes_its_mmio_publication: bool,
+    pub(crate) direct_barrier_before_mmio_publication: bool,
+    pub(crate) mmio_publication_is_release_store: bool,
+    pub(crate) host_prepare_mappings_covers_all_resources: bool,
+    pub(crate) host_release_zeroes_all_resource_slots: bool,
+    pub(crate) normal_classic_submission_acknowledgment_proven: bool,
+}
+
+/// Pure route for one descriptor visited by the G17S SKSM completion consumer.
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub(crate) struct G17sSksmCompletionRoute {
+    pub(crate) descriptor_record: u8,
+    pub(crate) descriptor_offset: u8,
+    pub(crate) mmio_selector: u8,
+    pub(crate) producer_mmio_offset: u32,
+    pub(crate) processed_count_mmio_offset: u32,
+}
+
 /// Refusals made by the target-pinned SKSM submission preflight.
 #[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -396,10 +463,18 @@ pub(crate) enum SubmissionConfigError {
     UnexpectedDataMasterFirmwareTableConfig,
     /// The supplied G17S recovery drain differs from the pinned firmware.
     UnexpectedG17sFirmwareRecoveryDrainConfig,
+    /// The supplied G17S SKSM completion consumer differs from pinned code.
+    UnexpectedG17sSksmCompletionConsumerConfig,
     /// The priority is outside the four published data-master ring groups.
     DataMasterPriorityOutOfRange,
     /// The priority is outside the four G17S firmware recovery groups.
     G17sFirmwareRecoveryPriorityOutOfRange,
+    /// The ordinal is outside the three G17S completion descriptors consumed.
+    G17sSksmCompletionDescriptorOutOfRange,
+    /// The G17S SKSM completion descriptor has an invalid zero capacity.
+    G17sSksmCompletionCapacityZero,
+    /// The low producer/status word does not indicate a completion entry.
+    G17sSksmCompletionProducerNotReady,
     /// The shared read index is outside the host's eight-bit ring index space.
     DataMasterReadIndexOutOfRange,
     /// The shared write index is outside the host's eight-bit ring index space.
@@ -432,6 +507,10 @@ pub(crate) const GROUNDED_DATA_MASTER_FIRMWARE_TABLE_CONFIG_AVAILABLE: bool = tr
 /// available. It is deliberately not a normal submission acknowledgment.
 #[allow(dead_code)]
 pub(crate) const GROUNDED_G17S_FIRMWARE_RECOVERY_DRAIN_CONFIG_AVAILABLE: bool = true;
+/// A pure model of the distinct G17S SKSM completion consumer is available.
+/// It does not establish classic submission-ring acknowledgment.
+#[allow(dead_code)]
+pub(crate) const GROUNDED_G17S_SKSM_COMPLETION_CONSUMER_CONFIG_AVAILABLE: bool = true;
 /// The symbolic meaning of the firmware shared-data caching-option numbers,
 /// firmware consumer ownership, and transport selection on dual-stack targets
 /// are not proved, so command submission must remain disconnected from these
@@ -545,6 +624,61 @@ const G17S_FIRMWARE_RECOVERY_DRAIN_CONFIG: G17sFirmwareRecoveryDrainConfig =
             G17sFirmwareRecoveryStatusStep::DsbSy,
         ],
         normal_submission_acknowledgment_proven: false,
+    };
+
+// Pinned Mac17,9/J714s/T6050 evidence:
+// host com.apple.AGXG17X SHA-256:
+// ccbe120a3a197038216426b507b5409873397b947308239b4ecc75d76759e87f
+// firmware GFX SHA-256:
+// 317de35b447e2a4cce0fb467f0ab04baa42fceee8a3f55998ecf3c624d30031b
+// The host populates four records at 0xfffffe0008b4caf8. Its initFirmwareData
+// call passes firmware-data+0x2714, while the firmware consumer at GFX
+// text+0xe730 visits only records 1, 3 and 0. No G17C parity is inferred from
+// the shared host kext.
+const G17S_SKSM_COMPLETION_CONSUMER_CONFIG: G17sSksmCompletionConsumerConfig =
+    G17sSksmCompletionConsumerConfig {
+        consumer_text_offset: 0xe730,
+        entry_validator_text_offset: 0xbd44,
+        entry_handler_text_offset: 0xbfa8,
+        cache_clean_invalidate_text_offset: 0x2bf24,
+        descriptor_table_offset: 0x2714,
+        host_resource_table_accelerator_offset: 0x1e5b8,
+        host_capacity_accelerator_offset: 0x11228,
+        host_present_pointer_source_subobject_offset: 0x58,
+        host_entries_pointer_source_subobject_offset: 0x50,
+        host_initial_read_index: 0,
+        host_resource_count: 4,
+        firmware_consumed_descriptor_count: 3,
+        descriptor_record_stride: 0x20,
+        present_pointer_offset: 0x00,
+        entries_pointer_offset: 0x08,
+        capacity_offset: 0x10,
+        entry_stride_offset: 0x14,
+        mmio_selector_offset: 0x18,
+        read_index_offset: 0x1c,
+        host_entry_stride: 0x40,
+        host_selector_by_record: [0, 1, 2, 3],
+        firmware_record_order: [1, 3, 0],
+        producer_mmio_base_offset: 0x21168,
+        processed_count_mmio_base_offset: 0x21188,
+        mmio_selector_stride: 8,
+        minimum_raw_producer_value: 0x1_0000,
+        producer_count_shift: 16,
+        processed_count_mmio_store_width: 8,
+        supported_modes: [0, 2],
+        entry_steps: [
+            G17sSksmCompletionEntryStep::ValidateEntry,
+            G17sSksmCompletionEntryStep::HandleIfAccepted,
+            G17sSksmCompletionEntryStep::AdvanceReadIndexModuloCapacity,
+        ],
+        cache_clean_invalidate_precedes_entry_reads: true,
+        handler_return_precedes_read_index_store: true,
+        current_descriptor_work_precedes_its_mmio_publication: true,
+        direct_barrier_before_mmio_publication: false,
+        mmio_publication_is_release_store: false,
+        host_prepare_mappings_covers_all_resources: true,
+        host_release_zeroes_all_resource_slots: true,
+        normal_classic_submission_acknowledgment_proven: false,
     };
 
 const fn make_data_master_firmware_table_config(
@@ -1399,6 +1533,154 @@ pub(crate) const fn g17s_firmware_recovery_cfi_initial_value(
     } else {
         Ok(write_index_snapshot)
     }
+}
+
+/// Return the exact SKSM completion consumer contract from the pinned G17S
+/// host and GFX firmware. Other identities are deliberately unsupported.
+#[allow(dead_code)]
+pub(crate) const fn g17s_sksm_completion_consumer_config(
+    gpu_gen: GpuGen,
+    gpu_variant: GpuVariant,
+) -> Option<G17sSksmCompletionConsumerConfig> {
+    if matches!((gpu_gen, gpu_variant), (GpuGen::G17, GpuVariant::S)) {
+        Some(G17S_SKSM_COMPLETION_CONSUMER_CONFIG)
+    } else {
+        None
+    }
+}
+
+/// Validate an externally recovered G17S SKSM completion consumer contract.
+#[allow(dead_code)]
+pub(crate) const fn validate_g17s_sksm_completion_consumer_config(
+    gpu_gen: GpuGen,
+    gpu_variant: GpuVariant,
+    supplied: G17sSksmCompletionConsumerConfig,
+) -> Result<G17sSksmCompletionConsumerConfig, SubmissionConfigError> {
+    let Some(expected) = g17s_sksm_completion_consumer_config(gpu_gen, gpu_variant) else {
+        return Err(SubmissionConfigError::UnsupportedTarget);
+    };
+
+    if supplied.consumer_text_offset != expected.consumer_text_offset
+        || supplied.entry_validator_text_offset != expected.entry_validator_text_offset
+        || supplied.entry_handler_text_offset != expected.entry_handler_text_offset
+        || supplied.cache_clean_invalidate_text_offset
+            != expected.cache_clean_invalidate_text_offset
+        || supplied.descriptor_table_offset != expected.descriptor_table_offset
+        || supplied.host_resource_table_accelerator_offset
+            != expected.host_resource_table_accelerator_offset
+        || supplied.host_capacity_accelerator_offset != expected.host_capacity_accelerator_offset
+        || supplied.host_present_pointer_source_subobject_offset
+            != expected.host_present_pointer_source_subobject_offset
+        || supplied.host_entries_pointer_source_subobject_offset
+            != expected.host_entries_pointer_source_subobject_offset
+        || supplied.host_initial_read_index != expected.host_initial_read_index
+        || supplied.host_resource_count != expected.host_resource_count
+        || supplied.firmware_consumed_descriptor_count
+            != expected.firmware_consumed_descriptor_count
+        || supplied.descriptor_record_stride != expected.descriptor_record_stride
+        || supplied.present_pointer_offset != expected.present_pointer_offset
+        || supplied.entries_pointer_offset != expected.entries_pointer_offset
+        || supplied.capacity_offset != expected.capacity_offset
+        || supplied.entry_stride_offset != expected.entry_stride_offset
+        || supplied.mmio_selector_offset != expected.mmio_selector_offset
+        || supplied.read_index_offset != expected.read_index_offset
+        || supplied.host_entry_stride != expected.host_entry_stride
+        || !matches!(supplied.host_selector_by_record, [0, 1, 2, 3])
+        || !matches!(supplied.firmware_record_order, [1, 3, 0])
+        || supplied.producer_mmio_base_offset != expected.producer_mmio_base_offset
+        || supplied.processed_count_mmio_base_offset != expected.processed_count_mmio_base_offset
+        || supplied.mmio_selector_stride != expected.mmio_selector_stride
+        || supplied.minimum_raw_producer_value != expected.minimum_raw_producer_value
+        || supplied.producer_count_shift != expected.producer_count_shift
+        || supplied.processed_count_mmio_store_width != expected.processed_count_mmio_store_width
+        || !matches!(supplied.supported_modes, [0, 2])
+        || !matches!(
+            supplied.entry_steps,
+            [
+                G17sSksmCompletionEntryStep::ValidateEntry,
+                G17sSksmCompletionEntryStep::HandleIfAccepted,
+                G17sSksmCompletionEntryStep::AdvanceReadIndexModuloCapacity,
+            ]
+        )
+        || !supplied.cache_clean_invalidate_precedes_entry_reads
+        || !supplied.handler_return_precedes_read_index_store
+        || !supplied.current_descriptor_work_precedes_its_mmio_publication
+        || supplied.direct_barrier_before_mmio_publication
+        || supplied.mmio_publication_is_release_store
+        || !supplied.host_prepare_mappings_covers_all_resources
+        || !supplied.host_release_zeroes_all_resource_slots
+        || supplied.normal_classic_submission_acknowledgment_proven
+    {
+        Err(SubmissionConfigError::UnexpectedG17sSksmCompletionConsumerConfig)
+    } else {
+        Ok(expected)
+    }
+}
+
+/// Select one of the three completion descriptors visited by the G17S GFX
+/// firmware, without reading shared memory or MMIO.
+#[allow(dead_code)]
+pub(crate) const fn g17s_sksm_completion_route(
+    gpu_gen: GpuGen,
+    gpu_variant: GpuVariant,
+    visit_ordinal: u8,
+) -> Result<G17sSksmCompletionRoute, SubmissionConfigError> {
+    let Some(config) = g17s_sksm_completion_consumer_config(gpu_gen, gpu_variant) else {
+        return Err(SubmissionConfigError::UnsupportedTarget);
+    };
+    if visit_ordinal >= config.firmware_consumed_descriptor_count {
+        return Err(SubmissionConfigError::G17sSksmCompletionDescriptorOutOfRange);
+    }
+
+    let record = config.firmware_record_order[visit_ordinal as usize];
+    let selector = config.host_selector_by_record[record as usize];
+    Ok(G17sSksmCompletionRoute {
+        descriptor_record: record,
+        descriptor_offset: record * config.descriptor_record_stride,
+        mmio_selector: selector,
+        producer_mmio_offset: config.producer_mmio_base_offset
+            + selector as u32 * config.mmio_selector_stride as u32,
+        processed_count_mmio_offset: config.processed_count_mmio_base_offset
+            + selector as u32 * config.mmio_selector_stride as u32,
+    })
+}
+
+/// Decode the processed-count field read from the G17S producer/status MMIO
+/// word. The recovered code compares and shifts only its low 32 bits.
+#[allow(dead_code)]
+pub(crate) const fn g17s_sksm_completion_producer_count(
+    gpu_gen: GpuGen,
+    gpu_variant: GpuVariant,
+    raw_status: u64,
+) -> Result<u32, SubmissionConfigError> {
+    let Some(config) = g17s_sksm_completion_consumer_config(gpu_gen, gpu_variant) else {
+        return Err(SubmissionConfigError::UnsupportedTarget);
+    };
+    let low_status = raw_status as u32;
+    if low_status < config.minimum_raw_producer_value {
+        return Err(SubmissionConfigError::G17sSksmCompletionProducerNotReady);
+    }
+
+    Ok(low_status >> config.producer_count_shift)
+}
+
+/// Apply one exact G17S SKSM completion read-index advancement. The firmware
+/// performs 32-bit add/divide/remainder/store after each processed entry.
+#[allow(dead_code)]
+pub(crate) const fn g17s_sksm_completion_advance_read_index(
+    gpu_gen: GpuGen,
+    gpu_variant: GpuVariant,
+    read_index: u32,
+    capacity: u32,
+) -> Result<u32, SubmissionConfigError> {
+    if g17s_sksm_completion_consumer_config(gpu_gen, gpu_variant).is_none() {
+        return Err(SubmissionConfigError::UnsupportedTarget);
+    }
+    if capacity == 0 {
+        return Err(SubmissionConfigError::G17sSksmCompletionCapacityZero);
+    }
+
+    Ok(read_index.wrapping_add(1) % capacity)
 }
 
 const fn data_master_ring_index_backing_matches(
@@ -2716,6 +2998,310 @@ mod tests {
         }
 
         assert!(GROUNDED_G17S_FIRMWARE_RECOVERY_DRAIN_CONFIG_AVAILABLE);
+        assert!(!EXECUTABLE_G15_G17_SUBMISSION_AVAILABLE);
+    }
+
+    #[test]
+    fn g17s_sksm_completion_consumer_is_exact_and_distinct_from_classic_ack() {
+        let config = g17s_sksm_completion_consumer_config(GpuGen::G17, GpuVariant::S)
+            .expect("G17S should have a pinned SKSM completion consumer");
+        assert_eq!(config, G17S_SKSM_COMPLETION_CONSUMER_CONFIG);
+        assert_eq!(config.host_resource_count, 4);
+        assert_eq!(config.firmware_consumed_descriptor_count, 3);
+        assert_eq!(config.descriptor_record_stride, 0x20);
+        assert_eq!(config.host_entry_stride, 0x40);
+        assert_eq!(config.host_selector_by_record, [0, 1, 2, 3]);
+        assert_eq!(config.firmware_record_order, [1, 3, 0]);
+        assert_eq!(config.minimum_raw_producer_value, 0x1_0000);
+        assert_eq!(
+            config.entry_steps,
+            [
+                G17sSksmCompletionEntryStep::ValidateEntry,
+                G17sSksmCompletionEntryStep::HandleIfAccepted,
+                G17sSksmCompletionEntryStep::AdvanceReadIndexModuloCapacity,
+            ]
+        );
+        assert!(config.cache_clean_invalidate_precedes_entry_reads);
+        assert!(config.handler_return_precedes_read_index_store);
+        assert!(config.current_descriptor_work_precedes_its_mmio_publication);
+        assert!(!config.direct_barrier_before_mmio_publication);
+        assert!(!config.mmio_publication_is_release_store);
+        assert!(!config.normal_classic_submission_acknowledgment_proven);
+        assert_eq!(
+            validate_g17s_sksm_completion_consumer_config(GpuGen::G17, GpuVariant::S, config,),
+            Ok(config)
+        );
+
+        for unexpected in [
+            G17sSksmCompletionConsumerConfig {
+                consumer_text_offset: 0xe734,
+                ..config
+            },
+            G17sSksmCompletionConsumerConfig {
+                entry_validator_text_offset: 0xbd48,
+                ..config
+            },
+            G17sSksmCompletionConsumerConfig {
+                entry_handler_text_offset: 0xbfac,
+                ..config
+            },
+            G17sSksmCompletionConsumerConfig {
+                cache_clean_invalidate_text_offset: 0x2bf28,
+                ..config
+            },
+            G17sSksmCompletionConsumerConfig {
+                descriptor_table_offset: 0x2718,
+                ..config
+            },
+            G17sSksmCompletionConsumerConfig {
+                host_resource_table_accelerator_offset: 0x1e5c0,
+                ..config
+            },
+            G17sSksmCompletionConsumerConfig {
+                host_capacity_accelerator_offset: 0x1122c,
+                ..config
+            },
+            G17sSksmCompletionConsumerConfig {
+                host_present_pointer_source_subobject_offset: 0x50,
+                ..config
+            },
+            G17sSksmCompletionConsumerConfig {
+                host_entries_pointer_source_subobject_offset: 0x58,
+                ..config
+            },
+            G17sSksmCompletionConsumerConfig {
+                host_initial_read_index: 1,
+                ..config
+            },
+            G17sSksmCompletionConsumerConfig {
+                host_resource_count: 3,
+                ..config
+            },
+            G17sSksmCompletionConsumerConfig {
+                firmware_consumed_descriptor_count: 4,
+                ..config
+            },
+            G17sSksmCompletionConsumerConfig {
+                descriptor_record_stride: 0x18,
+                ..config
+            },
+            G17sSksmCompletionConsumerConfig {
+                present_pointer_offset: 0x08,
+                ..config
+            },
+            G17sSksmCompletionConsumerConfig {
+                entries_pointer_offset: 0x00,
+                ..config
+            },
+            G17sSksmCompletionConsumerConfig {
+                capacity_offset: 0x14,
+                ..config
+            },
+            G17sSksmCompletionConsumerConfig {
+                entry_stride_offset: 0x10,
+                ..config
+            },
+            G17sSksmCompletionConsumerConfig {
+                mmio_selector_offset: 0x1c,
+                ..config
+            },
+            G17sSksmCompletionConsumerConfig {
+                read_index_offset: 0x18,
+                ..config
+            },
+            G17sSksmCompletionConsumerConfig {
+                host_entry_stride: 0x20,
+                ..config
+            },
+            G17sSksmCompletionConsumerConfig {
+                host_selector_by_record: [1, 0, 2, 3],
+                ..config
+            },
+            G17sSksmCompletionConsumerConfig {
+                firmware_record_order: [1, 0, 3],
+                ..config
+            },
+            G17sSksmCompletionConsumerConfig {
+                producer_mmio_base_offset: 0x21188,
+                ..config
+            },
+            G17sSksmCompletionConsumerConfig {
+                processed_count_mmio_base_offset: 0x21168,
+                ..config
+            },
+            G17sSksmCompletionConsumerConfig {
+                mmio_selector_stride: 4,
+                ..config
+            },
+            G17sSksmCompletionConsumerConfig {
+                minimum_raw_producer_value: 0x1000,
+                ..config
+            },
+            G17sSksmCompletionConsumerConfig {
+                producer_count_shift: 8,
+                ..config
+            },
+            G17sSksmCompletionConsumerConfig {
+                processed_count_mmio_store_width: 4,
+                ..config
+            },
+            G17sSksmCompletionConsumerConfig {
+                supported_modes: [0, 1],
+                ..config
+            },
+            G17sSksmCompletionConsumerConfig {
+                entry_steps: [
+                    G17sSksmCompletionEntryStep::ValidateEntry,
+                    G17sSksmCompletionEntryStep::AdvanceReadIndexModuloCapacity,
+                    G17sSksmCompletionEntryStep::HandleIfAccepted,
+                ],
+                ..config
+            },
+            G17sSksmCompletionConsumerConfig {
+                cache_clean_invalidate_precedes_entry_reads: false,
+                ..config
+            },
+            G17sSksmCompletionConsumerConfig {
+                handler_return_precedes_read_index_store: false,
+                ..config
+            },
+            G17sSksmCompletionConsumerConfig {
+                current_descriptor_work_precedes_its_mmio_publication: false,
+                ..config
+            },
+            G17sSksmCompletionConsumerConfig {
+                direct_barrier_before_mmio_publication: true,
+                ..config
+            },
+            G17sSksmCompletionConsumerConfig {
+                mmio_publication_is_release_store: true,
+                ..config
+            },
+            G17sSksmCompletionConsumerConfig {
+                host_prepare_mappings_covers_all_resources: false,
+                ..config
+            },
+            G17sSksmCompletionConsumerConfig {
+                host_release_zeroes_all_resource_slots: false,
+                ..config
+            },
+            G17sSksmCompletionConsumerConfig {
+                normal_classic_submission_acknowledgment_proven: true,
+                ..config
+            },
+        ] {
+            assert_eq!(
+                validate_g17s_sksm_completion_consumer_config(
+                    GpuGen::G17,
+                    GpuVariant::S,
+                    unexpected,
+                ),
+                Err(SubmissionConfigError::UnexpectedG17sSksmCompletionConsumerConfig)
+            );
+        }
+
+        for (ordinal, expected) in [
+            (
+                0,
+                G17sSksmCompletionRoute {
+                    descriptor_record: 1,
+                    descriptor_offset: 0x20,
+                    mmio_selector: 1,
+                    producer_mmio_offset: 0x21170,
+                    processed_count_mmio_offset: 0x21190,
+                },
+            ),
+            (
+                1,
+                G17sSksmCompletionRoute {
+                    descriptor_record: 3,
+                    descriptor_offset: 0x60,
+                    mmio_selector: 3,
+                    producer_mmio_offset: 0x21180,
+                    processed_count_mmio_offset: 0x211a0,
+                },
+            ),
+            (
+                2,
+                G17sSksmCompletionRoute {
+                    descriptor_record: 0,
+                    descriptor_offset: 0x00,
+                    mmio_selector: 0,
+                    producer_mmio_offset: 0x21168,
+                    processed_count_mmio_offset: 0x21188,
+                },
+            ),
+        ] {
+            assert_eq!(
+                g17s_sksm_completion_route(GpuGen::G17, GpuVariant::S, ordinal),
+                Ok(expected)
+            );
+        }
+        assert_eq!(
+            g17s_sksm_completion_route(GpuGen::G17, GpuVariant::S, 3),
+            Err(SubmissionConfigError::G17sSksmCompletionDescriptorOutOfRange)
+        );
+
+        for (raw_status, expected) in [
+            (
+                0xffff,
+                Err(SubmissionConfigError::G17sSksmCompletionProducerNotReady),
+            ),
+            (0x1_0000, Ok(1)),
+            (0x1234_5678, Ok(0x1234)),
+            (0xffff_ffff_0001_0000, Ok(1)),
+        ] {
+            assert_eq!(
+                g17s_sksm_completion_producer_count(GpuGen::G17, GpuVariant::S, raw_status,),
+                expected
+            );
+        }
+        for (read_index, capacity, expected) in [(0, 8, 1), (7, 8, 0), (10, 8, 3), (u32::MAX, 8, 0)]
+        {
+            assert_eq!(
+                g17s_sksm_completion_advance_read_index(
+                    GpuGen::G17,
+                    GpuVariant::S,
+                    read_index,
+                    capacity,
+                ),
+                Ok(expected)
+            );
+        }
+        assert_eq!(
+            g17s_sksm_completion_advance_read_index(GpuGen::G17, GpuVariant::S, 0, 0),
+            Err(SubmissionConfigError::G17sSksmCompletionCapacityZero)
+        );
+
+        for (gpu_gen, gpu_variant) in [
+            (GpuGen::G16, GpuVariant::S),
+            (GpuGen::G17, GpuVariant::P),
+            (GpuGen::G17, GpuVariant::G),
+            (GpuGen::G17, GpuVariant::C),
+        ] {
+            assert_eq!(
+                g17s_sksm_completion_consumer_config(gpu_gen, gpu_variant),
+                None
+            );
+            assert_eq!(
+                validate_g17s_sksm_completion_consumer_config(gpu_gen, gpu_variant, config),
+                Err(SubmissionConfigError::UnsupportedTarget)
+            );
+            assert_eq!(
+                g17s_sksm_completion_route(gpu_gen, gpu_variant, 0),
+                Err(SubmissionConfigError::UnsupportedTarget)
+            );
+            assert_eq!(
+                g17s_sksm_completion_producer_count(gpu_gen, gpu_variant, 0x1_0000),
+                Err(SubmissionConfigError::UnsupportedTarget)
+            );
+            assert_eq!(
+                g17s_sksm_completion_advance_read_index(gpu_gen, gpu_variant, 0, 1),
+                Err(SubmissionConfigError::UnsupportedTarget)
+            );
+        }
+
+        assert!(GROUNDED_G17S_SKSM_COMPLETION_CONSUMER_CONFIG_AVAILABLE);
         assert!(!EXECUTABLE_G15_G17_SUBMISSION_AVAILABLE);
     }
 
