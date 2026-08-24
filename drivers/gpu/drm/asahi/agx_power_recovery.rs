@@ -9,10 +9,9 @@
 //! The power-transition grammar, ordered PIO operations, and idle-poll
 //! behavior are byte-confirmed only for the pinned G17S GFX1 image. The
 //! recovery word, host writes, and no-op reset hook are byte-confirmed in
-//! pinned G15G, G16G, G17G, G17S, and G17P host drivers. Their shared values
-//! are modeled here without reusing generation-specific structure offsets
-//! (`0x5190` on the pinned G15/G16 layouts and `0x4ae0` on the pinned G17
-//! layouts).
+//! pinned G15G/G15S/G15C, G16G/G16X, and G17G/G17S/G17P host drivers. Their
+//! shared values are modeled here without reusing target-specific structure
+//! offsets (`0x5190` on G15 and G16G, but `0x4ae0` on G16X and G17).
 
 /// The grounded, pure validation model is available.
 pub(crate) const GROUNDED_POWER_RECOVERY_MODEL_AVAILABLE: bool = true;
@@ -21,15 +20,25 @@ pub(crate) const GROUNDED_POWER_RECOVERY_MODEL_AVAILABLE: bool = true;
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum RecoveryEvidenceTarget {
     G15G,
+    G15S,
+    G15C,
+    G15D,
     G16G,
+    G16S,
+    G16C,
     G17P,
     G17G,
     G17S,
 }
 
-pub(crate) const RECOVERY_EVIDENCE_TARGETS: [RecoveryEvidenceTarget; 5] = [
+pub(crate) const RECOVERY_EVIDENCE_TARGETS: [RecoveryEvidenceTarget; 10] = [
     RecoveryEvidenceTarget::G15G,
+    RecoveryEvidenceTarget::G15S,
+    RecoveryEvidenceTarget::G15C,
+    RecoveryEvidenceTarget::G15D,
     RecoveryEvidenceTarget::G16G,
+    RecoveryEvidenceTarget::G16S,
+    RecoveryEvidenceTarget::G16C,
     RecoveryEvidenceTarget::G17P,
     RecoveryEvidenceTarget::G17G,
     RecoveryEvidenceTarget::G17S,
@@ -403,25 +412,42 @@ pub(crate) enum RecoveryWordState {
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum G15G16RecoveryLayoutEvidenceTarget {
     G15G,
+    G15S,
+    G15C,
+    G15D,
     G16G,
+    G16S,
+    G16C,
 }
 
 pub(crate) const G15_G16_RECOVERY_LAYOUT_EVIDENCE_TARGETS:
-    [G15G16RecoveryLayoutEvidenceTarget; 2] = [
+    [G15G16RecoveryLayoutEvidenceTarget; 7] = [
         G15G16RecoveryLayoutEvidenceTarget::G15G,
+        G15G16RecoveryLayoutEvidenceTarget::G15S,
+        G15G16RecoveryLayoutEvidenceTarget::G15C,
+        G15G16RecoveryLayoutEvidenceTarget::G15D,
         G15G16RecoveryLayoutEvidenceTarget::G16G,
+        G15G16RecoveryLayoutEvidenceTarget::G16S,
+        G15G16RecoveryLayoutEvidenceTarget::G16C,
     ];
 
 /// Offset from the mapped firmware-state base, not from the host object.
-pub(crate) const G15_G16_RECOVERY_WORD_OFFSET: u32 = 0x5190;
+pub(crate) const G15_AND_G16G_RECOVERY_WORD_OFFSET: u32 = 0x5190;
+
+/// G16X uses the later mapped-state location for both proven target variants.
+pub(crate) const G16X_RECOVERY_WORD_OFFSET: u32 = 0x4ae0;
 
 pub(crate) const fn g15_g16_recovery_word_offset(
     target: G15G16RecoveryLayoutEvidenceTarget,
 ) -> u32 {
     match target {
-        G15G16RecoveryLayoutEvidenceTarget::G15G | G15G16RecoveryLayoutEvidenceTarget::G16G => {
-            G15_G16_RECOVERY_WORD_OFFSET
-        }
+        G15G16RecoveryLayoutEvidenceTarget::G15G
+        | G15G16RecoveryLayoutEvidenceTarget::G15S
+        | G15G16RecoveryLayoutEvidenceTarget::G15C
+        | G15G16RecoveryLayoutEvidenceTarget::G15D
+        | G15G16RecoveryLayoutEvidenceTarget::G16G => G15_AND_G16G_RECOVERY_WORD_OFFSET,
+        G15G16RecoveryLayoutEvidenceTarget::G16S
+        | G15G16RecoveryLayoutEvidenceTarget::G16C => G16X_RECOVERY_WORD_OFFSET,
     }
 }
 
@@ -711,25 +737,51 @@ mod tests {
     }
 
     #[test]
-    fn g15g_and_g16g_use_the_pinned_mapped_state_offset() {
-        assert_eq!(G15_G16_RECOVERY_WORD_OFFSET, 0x5190);
+    fn g15_and_g16_variants_use_artifact_specific_mapped_state_offsets() {
+        assert_eq!(G15_AND_G16G_RECOVERY_WORD_OFFSET, 0x5190);
+        assert_eq!(G16X_RECOVERY_WORD_OFFSET, 0x4ae0);
         assert_eq!(
             G15_G16_RECOVERY_LAYOUT_EVIDENCE_TARGETS,
             [
                 G15G16RecoveryLayoutEvidenceTarget::G15G,
+                G15G16RecoveryLayoutEvidenceTarget::G15S,
+                G15G16RecoveryLayoutEvidenceTarget::G15C,
+                G15G16RecoveryLayoutEvidenceTarget::G15D,
                 G15G16RecoveryLayoutEvidenceTarget::G16G,
+                G15G16RecoveryLayoutEvidenceTarget::G16S,
+                G15G16RecoveryLayoutEvidenceTarget::G16C,
             ]
         );
 
-        for target in G15_G16_RECOVERY_LAYOUT_EVIDENCE_TARGETS {
-            assert_eq!(g15_g16_recovery_word_offset(target), 0x5190);
+        let targets_and_offsets = [
+            (G15G16RecoveryLayoutEvidenceTarget::G15G, 0x5190),
+            (G15G16RecoveryLayoutEvidenceTarget::G15S, 0x5190),
+            (G15G16RecoveryLayoutEvidenceTarget::G15C, 0x5190),
+            (G15G16RecoveryLayoutEvidenceTarget::G15D, 0x5190),
+            (G15G16RecoveryLayoutEvidenceTarget::G16G, 0x5190),
+            (G15G16RecoveryLayoutEvidenceTarget::G16S, 0x4ae0),
+            (G15G16RecoveryLayoutEvidenceTarget::G16C, 0x4ae0),
+        ];
+        for (target, expected_offset) in targets_and_offsets {
+            assert_eq!(g15_g16_recovery_word_offset(target), expected_offset);
             for raw in 0..=3 {
                 assert_eq!(
-                    decode_g15_g16_recovery_word_at_offset(target, 0x5190, raw),
+                    decode_g15_g16_recovery_word_at_offset(target, expected_offset, raw),
                     Ok(decode_recovery_word(raw).unwrap())
                 );
             }
-            for wrong_offset in [0, 0x4ae0, 0x518c, 0x5194, u32::MAX] {
+            let other_layout_offset = if expected_offset == 0x5190 {
+                0x4ae0
+            } else {
+                0x5190
+            };
+            for wrong_offset in [
+                0,
+                other_layout_offset,
+                expected_offset - 4,
+                expected_offset + 4,
+                u32::MAX,
+            ] {
                 assert_eq!(
                     decode_g15_g16_recovery_word_at_offset(target, wrong_offset, 1),
                     Err(RecoveryError::UnexpectedWordOffset)
@@ -741,7 +793,7 @@ mod tests {
             assert_eq!(
                 decode_g15_g16_recovery_word_at_offset(
                     G15G16RecoveryLayoutEvidenceTarget::G15G,
-                    G15_G16_RECOVERY_WORD_OFFSET,
+                    G15_AND_G16G_RECOVERY_WORD_OFFSET,
                     raw,
                 ),
                 Err(RecoveryError::UnknownWordValue)
@@ -1001,7 +1053,12 @@ mod tests {
             RECOVERY_EVIDENCE_TARGETS,
             [
                 RecoveryEvidenceTarget::G15G,
+                RecoveryEvidenceTarget::G15S,
+                RecoveryEvidenceTarget::G15C,
+                RecoveryEvidenceTarget::G15D,
                 RecoveryEvidenceTarget::G16G,
+                RecoveryEvidenceTarget::G16S,
+                RecoveryEvidenceTarget::G16C,
                 RecoveryEvidenceTarget::G17P,
                 RecoveryEvidenceTarget::G17G,
                 RecoveryEvidenceTarget::G17S,
