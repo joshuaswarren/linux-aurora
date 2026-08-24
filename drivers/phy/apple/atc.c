@@ -1235,17 +1235,39 @@ static int atcphy_configure_pipehandler_usb3(struct apple_atcphy *atcphy, bool h
 	return 0;
 }
 
-static bool atcphy_dummy_is_ready(struct apple_atcphy *atcphy)
+static int atcphy_configure_pipehandler_usb4(struct apple_atcphy *atcphy)
 {
-	u32 mux = readl(atcphy->regs.pipehandler + PIPEHANDLER_MUX_CTRL);
-	u32 override = readl(atcphy->regs.pipehandler + PIPEHANDLER_NONSELECTED_OVERRIDE);
-	u32 req = readl(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_REQ);
-	u32 ack = readl(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_ACK);
+	int ret;
 
-	return (mux & (PIPEHANDLER_MUX_CTRL_CLK | PIPEHANDLER_MUX_CTRL_DATA)) ==
-		(FIELD_PREP(PIPEHANDLER_MUX_CTRL_CLK, PIPEHANDLER_MUX_CTRL_CLK_DUMMY) |
-		 FIELD_PREP(PIPEHANDLER_MUX_CTRL_DATA, PIPEHANDLER_MUX_CTRL_DATA_DUMMY)) &&
-		(override & PIPEHANDLER_DUMMY_PHY_EN) && !((req | ack) & PIPEHANDLER_LOCK_EN);
+	ret = atcphy_pipehandler_check(atcphy);
+	if (ret)
+		return ret;
+
+	/* Force disable link detection */
+	clear32(atcphy->regs.pipehandler + PIPEHANDLER_OVERRIDE_VALUES,
+		PIPEHANDLER_OVERRIDE_VAL_RXDETECT0 | PIPEHANDLER_OVERRIDE_VAL_RXDETECT1);
+	set32(atcphy->regs.pipehandler + PIPEHANDLER_OVERRIDE, PIPEHANDLER_OVERRIDE_RXVALID);
+	set32(atcphy->regs.pipehandler + PIPEHANDLER_OVERRIDE, PIPEHANDLER_OVERRIDE_RXDETECT);
+
+	ret = atcphy_pipehandler_lock(atcphy);
+	if (ret) {
+		dev_err(atcphy->dev, "Failed to lock pipehandler\n");
+		return ret;
+	}
+
+	/* Configure PIPE mux to the USB4/Thunderbolt controller */
+	atcphy_pipehandler_set_mux(atcphy, PIPEHANDLER_MUX_CTRL_DATA_USB4,
+				   PIPEHANDLER_MUX_CTRL_CLK_USB4);
+
+	/* Remove link detection override */
+	clear32(atcphy->regs.pipehandler + PIPEHANDLER_OVERRIDE, PIPEHANDLER_OVERRIDE_RXVALID);
+	clear32(atcphy->regs.pipehandler + PIPEHANDLER_OVERRIDE, PIPEHANDLER_OVERRIDE_RXDETECT);
+
+	ret = atcphy_pipehandler_unlock(atcphy);
+	if (ret)
+		dev_warn(atcphy->dev, "Failed to unlock pipehandler\n");
+
+	return 0;
 }
 
 static int atcphy_configure_pipehandler_dummy(struct apple_atcphy *atcphy)
@@ -1301,10 +1323,8 @@ static int atcphy_configure_pipehandler(struct apple_atcphy *atcphy, bool host)
 			atcphy->pipehandler_up = true;
 		break;
 	case ATCPHY_PIPEHANDLER_STATE_USB4:
-		dev_warn(atcphy->dev,
-			 "ATCPHY_PIPEHANDLER_STATE_USB4 not implemented; falling back to USB2\n");
-		ret = atcphy_configure_pipehandler_dummy(atcphy);
-		atcphy->pipehandler_up = false;
+		ret = atcphy_configure_pipehandler_usb4(atcphy);
+		atcphy->pipehandler_up = true;
 		break;
 	case ATCPHY_PIPEHANDLER_STATE_DUMMY:
 		ret = atcphy_configure_pipehandler_dummy(atcphy);
