@@ -101,7 +101,10 @@ pub(crate) fn decode_gpu_identity(family: u8, variant: u8, num_dies: u8) -> Opti
             _ => return None,
         },
 
-        (0x7, 0) => (G15, P, 3, Legacy),
+        // G15P is A16, not an M3 GPU. Apple's compiler routes
+        // applegpu_g15p through the AGX2 backend even though the design
+        // generation is 15. Keep USC generation independent from gpu_gen.
+        (0x7, 0) => (G15, P, 2, Legacy),
         (0x7, 2) => (G15, G, 3, Legacy),
         (0x7, 3) => (G15, S, 3, Legacy),
         (0x7, 4) => match num_dies {
@@ -195,6 +198,10 @@ mod tests {
         assert_eq!(g14.usc_generation, 2);
         assert_eq!(g14.gpu_hal_generation, GpuHalGeneration::Legacy);
 
+        let g15p = id(0x7, 0, 1);
+        assert_eq!(g15p.gpu_gen, GpuGen::G15);
+        assert_eq!(g15p.usc_generation, 2);
+
         let g15 = id(0x7, 2, 1);
         assert_eq!(g15.usc_generation, 3);
         assert_eq!(g15.gpu_hal_generation, GpuHalGeneration::Legacy);
@@ -206,6 +213,53 @@ mod tests {
         let g17g = id(0xb, 2, 1);
         assert_eq!(g17g.gpu_gen, GpuGen::G17);
         assert_eq!(g17g.gpu_hal_generation, GpuHalGeneration::Hal300);
+    }
+
+    #[test]
+    fn g15_g16_g17_role_and_submission_routing_is_exact() {
+        for (variant, dies) in [(0, 1), (2, 1), (3, 1), (4, 1), (4, 2)] {
+            let g15 = id(0x7, variant, dies);
+            assert_eq!(g15.gpu_gen, GpuGen::G15);
+            assert_eq!(g15.usc_generation, if variant == 0 { 2 } else { 3 });
+            assert_eq!(g15.gpu_hal_generation, GpuHalGeneration::Legacy);
+            assert_eq!(g15.firmware_roles, FirmwareRoleTopology::Single);
+            assert_eq!(g15.submission_transport, SubmissionTransport::Classic);
+            assert_eq!(g15.uat_input_address_bits, 42);
+        }
+
+        for (family, variant, transport) in [
+            (0x8, 0, SubmissionTransport::Classic),
+            (0xa, 2, SubmissionTransport::Classic),
+            (0xa, 3, SubmissionTransport::ClassicAndSksm),
+            (0xa, 4, SubmissionTransport::ClassicAndSksm),
+        ] {
+            let g16 = id(family, variant, 1);
+            assert_eq!(g16.gpu_gen, GpuGen::G16);
+            assert_eq!(g16.gpu_hal_generation, GpuHalGeneration::Hal200);
+            assert_eq!(g16.firmware_roles, FirmwareRoleTopology::Single);
+            assert_eq!(g16.submission_transport, transport);
+            assert_eq!(g16.uat_input_address_bits, 42);
+        }
+
+        for variant in [0, 5] {
+            let g17_hal200 = id(0xa, variant, 1);
+            assert_eq!(g17_hal200.gpu_gen, GpuGen::G17);
+            assert_eq!(g17_hal200.gpu_hal_generation, GpuHalGeneration::Hal200);
+            assert_eq!(g17_hal200.firmware_roles, FirmwareRoleTopology::Dual);
+            assert_eq!(
+                g17_hal200.submission_transport,
+                SubmissionTransport::ClassicAndSksm
+            );
+        }
+
+        for variant in [2, 3, 4] {
+            let g17_hal300 = id(0xb, variant, 1);
+            assert_eq!(g17_hal300.gpu_gen, GpuGen::G17);
+            assert_eq!(g17_hal300.gpu_hal_generation, GpuHalGeneration::Hal300);
+            assert_eq!(g17_hal300.firmware_roles, FirmwareRoleTopology::Dual);
+            assert_eq!(g17_hal300.submission_transport, SubmissionTransport::Sksm);
+            assert_eq!(g17_hal300.uat_input_address_bits, 42);
+        }
     }
 
     #[test]
