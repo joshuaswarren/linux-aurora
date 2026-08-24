@@ -16,6 +16,7 @@ mod float;
 mod fw;
 mod g17_boot;
 mod g17_initdata;
+mod g17_rtkit;
 mod gem;
 mod gpu;
 mod hw;
