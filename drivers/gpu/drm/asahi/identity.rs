@@ -62,6 +62,38 @@ pub(crate) enum SubmissionTransport {
     Sksm,
 }
 
+/// Target subclass instantiated by Apple's data-master channel factory.
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub(crate) enum SubmissionChannelClassFamily {
+    /// `AGX{CL,3D,TA}ChannelG16_SKSM`.
+    G16Sksm,
+    /// `AGX::PI_300::G::A0::{CL,3D,TA}ChannelSKSM`.
+    G17GSksm,
+    /// `AGX::PI_300::X::A0::{CL,3D,TA}ChannelSKSM`.
+    G17XSksm,
+}
+
+/// Exact target channel selection recovered from Apple's factory overrides.
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub(crate) enum SubmissionChannelSelection {
+    /// Each factory directly allocates its SKSM subclass without consulting
+    /// runtime state or branching to a classic SKU subclass.
+    FixedSksm,
+}
+
+/// Exact class and allocation sizes selected by the three channel factories.
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub(crate) struct SubmissionChannelSelectionConfig {
+    pub(crate) selection: SubmissionChannelSelection,
+    pub(crate) class_family: SubmissionChannelClassFamily,
+    pub(crate) cl_object_size: u16,
+    pub(crate) three_d_object_size: u16,
+    pub(crate) ta_object_size: u16,
+}
+
 /// Exact host-reported bit layout used to insert a queue ID in an SKSM kick.
 #[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -284,6 +316,8 @@ pub(crate) enum SubmissionConfigError {
     UnsupportedTarget,
     /// The supplied configuration differs from the target's exact host values.
     UnexpectedSksmKickQueueIdConfig,
+    /// The supplied channel selection differs from the target's factory code.
+    UnexpectedSubmissionChannelSelectionConfig,
     /// The kick index does not fit the three-bit host field.
     KickIndexOutOfRange,
     /// The opaque firmware message type does not fit the six-bit host field.
@@ -308,6 +342,10 @@ pub(crate) enum SubmissionConfigError {
 /// G16X/G17 host targets below.
 #[allow(dead_code)]
 pub(crate) const GROUNDED_SKSM_KICK_QUEUE_ID_CONFIG_AVAILABLE: bool = true;
+/// A pure channel-factory selection validator is available for independently
+/// pinned G16X, G17P, G17G and G17X host drivers.
+#[allow(dead_code)]
+pub(crate) const GROUNDED_SUBMISSION_CHANNEL_SELECTION_CONFIG_AVAILABLE: bool = true;
 /// A pure endpoint-binding validator is available for every target supported
 /// by the firmware-kick word encoder.
 #[allow(dead_code)]
@@ -331,6 +369,35 @@ const SKSM_KICK_QUEUE_ID_CONFIG: SksmKickQueueIdConfig = SksmKickQueueIdConfig {
     shift: 40,
     mask: 0x7f,
 };
+// Target channel-factory entry points in the pinned host corpus:
+// mac16j: text+0x92704/0x92778/0x927f0 (CL/3D/TA)
+// mac17p: text+0x95080/0x950f4/0x9516c (CL/3D/TA)
+// mac17g: text+0x8a638/0x8a6ac/0x8a724 (CL/3D/TA)
+// mac17j: text+0x8ac78/0x8acec/0x8ad64 (CL/3D/TA)
+const SUBMISSION_CHANNEL_SELECTION_G16_SKSM: SubmissionChannelSelectionConfig =
+    SubmissionChannelSelectionConfig {
+        selection: SubmissionChannelSelection::FixedSksm,
+        class_family: SubmissionChannelClassFamily::G16Sksm,
+        cl_object_size: 0x1d0,
+        three_d_object_size: 0x1d8,
+        ta_object_size: 0x1e0,
+    };
+const SUBMISSION_CHANNEL_SELECTION_G17G_SKSM: SubmissionChannelSelectionConfig =
+    SubmissionChannelSelectionConfig {
+        selection: SubmissionChannelSelection::FixedSksm,
+        class_family: SubmissionChannelClassFamily::G17GSksm,
+        cl_object_size: 0x1d0,
+        three_d_object_size: 0x1d8,
+        ta_object_size: 0x1e0,
+    };
+const SUBMISSION_CHANNEL_SELECTION_G17X_SKSM: SubmissionChannelSelectionConfig =
+    SubmissionChannelSelectionConfig {
+        selection: SubmissionChannelSelection::FixedSksm,
+        class_family: SubmissionChannelClassFamily::G17XSksm,
+        cl_object_size: 0x1d0,
+        three_d_object_size: 0x1d8,
+        ta_object_size: 0x1e0,
+    };
 const FIRMWARE_KICK_TAG: u64 = 0x0080_0000_0000_0000;
 const FIRMWARE_KICK_INDEX_MASK: u8 = 0x07;
 const FIRMWARE_KICK_INDEX_SHIFT: u32 = 2;
@@ -687,6 +754,70 @@ pub(crate) fn decode_gpu_identity(family: u8, variant: u8, num_dies: u8) -> Opti
         submission_transport,
         uat_input_address_bits,
     })
+}
+
+/// Return the exact data-master channel factory selection for one target.
+///
+/// The pinned G16X and G17P target accelerators directly construct the
+/// `G16_SKSM` CL, 3D and TA subclasses even though both generic SKU and SKSM
+/// stacks are linked into those binaries. The pinned HAL300 G17G and G17X
+/// target accelerators likewise directly construct their target SKSM
+/// subclasses. None of the twelve recovered factory methods reads target
+/// state or contains a classic-versus-SKSM branch. G17A is deliberately
+/// absent because it has no independent target artifact.
+#[allow(dead_code)]
+pub(crate) const fn submission_channel_selection_config(
+    gpu_gen: GpuGen,
+    gpu_variant: GpuVariant,
+) -> Option<SubmissionChannelSelectionConfig> {
+    use GpuGen::*;
+    use GpuVariant::*;
+
+    match (gpu_gen, gpu_variant) {
+        (G16, S | C) | (G17, P) => Some(SUBMISSION_CHANNEL_SELECTION_G16_SKSM),
+        (G17, G) => Some(SUBMISSION_CHANNEL_SELECTION_G17G_SKSM),
+        (G17, S | C) => Some(SUBMISSION_CHANNEL_SELECTION_G17X_SKSM),
+        _ => None,
+    }
+}
+
+/// Validate an externally recovered target channel factory selection.
+#[allow(dead_code)]
+pub(crate) const fn validate_submission_channel_selection_config(
+    gpu_gen: GpuGen,
+    gpu_variant: GpuVariant,
+    supplied: SubmissionChannelSelectionConfig,
+) -> Result<SubmissionChannelSelectionConfig, SubmissionConfigError> {
+    let Some(expected) = submission_channel_selection_config(gpu_gen, gpu_variant) else {
+        return Err(SubmissionConfigError::UnsupportedTarget);
+    };
+
+    if !matches!(
+        (supplied.selection, expected.selection),
+        (
+            SubmissionChannelSelection::FixedSksm,
+            SubmissionChannelSelection::FixedSksm,
+        )
+    ) || !matches!(
+        (supplied.class_family, expected.class_family),
+        (
+            SubmissionChannelClassFamily::G16Sksm,
+            SubmissionChannelClassFamily::G16Sksm,
+        ) | (
+            SubmissionChannelClassFamily::G17GSksm,
+            SubmissionChannelClassFamily::G17GSksm,
+        ) | (
+            SubmissionChannelClassFamily::G17XSksm,
+            SubmissionChannelClassFamily::G17XSksm,
+        )
+    ) || supplied.cl_object_size != expected.cl_object_size
+        || supplied.three_d_object_size != expected.three_d_object_size
+        || supplied.ta_object_size != expected.ta_object_size
+    {
+        Err(SubmissionConfigError::UnexpectedSubmissionChannelSelectionConfig)
+    } else {
+        Ok(expected)
+    }
 }
 
 /// Return the independently recovered SKSM queue-ID layout for one target.
@@ -1337,6 +1468,99 @@ mod tests {
             assert_eq!(g17_hal300.submission_transport, SubmissionTransport::Sksm);
             assert_eq!(g17_hal300.uat_input_address_bits, 42);
         }
+    }
+
+    #[test]
+    fn submission_channel_selection_is_fixed_sksm_and_target_pinned() {
+        for (gpu_gen, gpu_variant, expected) in [
+            (
+                GpuGen::G16,
+                GpuVariant::S,
+                SUBMISSION_CHANNEL_SELECTION_G16_SKSM,
+            ),
+            (
+                GpuGen::G16,
+                GpuVariant::C,
+                SUBMISSION_CHANNEL_SELECTION_G16_SKSM,
+            ),
+            (
+                GpuGen::G17,
+                GpuVariant::P,
+                SUBMISSION_CHANNEL_SELECTION_G16_SKSM,
+            ),
+            (
+                GpuGen::G17,
+                GpuVariant::G,
+                SUBMISSION_CHANNEL_SELECTION_G17G_SKSM,
+            ),
+            (
+                GpuGen::G17,
+                GpuVariant::S,
+                SUBMISSION_CHANNEL_SELECTION_G17X_SKSM,
+            ),
+            (
+                GpuGen::G17,
+                GpuVariant::C,
+                SUBMISSION_CHANNEL_SELECTION_G17X_SKSM,
+            ),
+        ] {
+            assert_eq!(
+                submission_channel_selection_config(gpu_gen, gpu_variant),
+                Some(expected)
+            );
+            assert_eq!(
+                validate_submission_channel_selection_config(gpu_gen, gpu_variant, expected),
+                Ok(expected)
+            );
+
+            let wrong_family = match expected.class_family {
+                SubmissionChannelClassFamily::G16Sksm => SubmissionChannelClassFamily::G17GSksm,
+                SubmissionChannelClassFamily::G17GSksm | SubmissionChannelClassFamily::G17XSksm => {
+                    SubmissionChannelClassFamily::G16Sksm
+                }
+            };
+            for unexpected in [
+                SubmissionChannelSelectionConfig {
+                    class_family: wrong_family,
+                    ..expected
+                },
+                SubmissionChannelSelectionConfig {
+                    cl_object_size: 0x1d8,
+                    ..expected
+                },
+                SubmissionChannelSelectionConfig {
+                    three_d_object_size: 0x1e0,
+                    ..expected
+                },
+                SubmissionChannelSelectionConfig {
+                    ta_object_size: 0x1e8,
+                    ..expected
+                },
+            ] {
+                assert_eq!(
+                    validate_submission_channel_selection_config(gpu_gen, gpu_variant, unexpected,),
+                    Err(SubmissionConfigError::UnexpectedSubmissionChannelSelectionConfig)
+                );
+            }
+        }
+
+        for (gpu_gen, gpu_variant) in [
+            (GpuGen::G15, GpuVariant::G),
+            (GpuGen::G16, GpuVariant::G),
+            (GpuGen::G17, GpuVariant::A),
+        ] {
+            assert_eq!(
+                validate_submission_channel_selection_config(
+                    gpu_gen,
+                    gpu_variant,
+                    SUBMISSION_CHANNEL_SELECTION_G16_SKSM,
+                ),
+                Err(SubmissionConfigError::UnsupportedTarget)
+            );
+        }
+
+        assert!(GROUNDED_SUBMISSION_CHANNEL_SELECTION_CONFIG_AVAILABLE);
+        assert!(!EXECUTABLE_G15_G17_SUBMISSION_AVAILABLE);
     }
 
     #[test]
