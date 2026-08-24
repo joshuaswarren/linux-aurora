@@ -62,6 +62,65 @@ pub(crate) enum SubmissionTransport {
     Sksm,
 }
 
+/// Exact host-reported bit layout used to insert a queue ID in an SKSM kick.
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub(crate) struct SksmKickQueueIdConfig {
+    pub(crate) shift: u8,
+    pub(crate) mask: u8,
+}
+
+/// Firmware role selected by Apple's host kick sender.
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub(crate) enum SubmissionFirmwareRole {
+    Gfx,
+    Gfx1,
+}
+
+/// Exact role and wire word produced for one host firmware kick.
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub(crate) struct FirmwareKickRoute {
+    pub(crate) role: SubmissionFirmwareRole,
+    pub(crate) message: u64,
+}
+
+/// Refusals made by the target-pinned SKSM submission preflight.
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub(crate) enum SubmissionConfigError {
+    /// No independent pinned artifact proves SKSM configuration for the target.
+    UnsupportedTarget,
+    /// The supplied configuration differs from the target's exact host values.
+    UnexpectedSksmKickQueueIdConfig,
+    /// The kick index does not fit the three-bit host field.
+    KickIndexOutOfRange,
+    /// The opaque firmware message type does not fit the six-bit host field.
+    FirmwareMessageTypeOutOfRange,
+}
+
+/// A pure submission configuration validator is available for the exact
+/// G16X/G17 host targets below.
+#[allow(dead_code)]
+pub(crate) const GROUNDED_SKSM_KICK_QUEUE_ID_CONFIG_AVAILABLE: bool = true;
+/// Queue construction, transport selection on dual-stack targets, shared
+/// memory ownership, and the complete firmware notification sequence are not
+/// modeled, so command submission must remain disconnected from this helper.
+#[allow(dead_code)]
+pub(crate) const EXECUTABLE_G15_G17_SUBMISSION_AVAILABLE: bool = false;
+
+const SKSM_KICK_QUEUE_ID_CONFIG: SksmKickQueueIdConfig = SksmKickQueueIdConfig {
+    shift: 40,
+    mask: 0x7f,
+};
+const FIRMWARE_KICK_TAG: u64 = 0x0080_0000_0000_0000;
+const FIRMWARE_KICK_INDEX_MASK: u8 = 0x07;
+const FIRMWARE_KICK_INDEX_SHIFT: u32 = 2;
+const FIRMWARE_MESSAGE_TYPE_MASK: u8 = 0x3f;
+const FIRMWARE_MESSAGE_TYPE_SHIFT: u32 = 48;
+const G17_GFX1_FIRMWARE_MESSAGE_TYPE: u8 = 0x07;
+
 /// Identity and userspace-visible architecture axes decoded from GPU ID MMIO.
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub(crate) struct GpuIdentity {
@@ -154,6 +213,88 @@ pub(crate) fn decode_gpu_identity(family: u8, variant: u8, num_dies: u8) -> Opti
         submission_transport,
         uat_input_address_bits,
     })
+}
+
+/// Return the independently recovered SKSM queue-ID layout for one target.
+///
+/// The values are byte-identical in the pinned G16X (G16S/C), G17P, G17G and
+/// G17X (G17S/C) host drivers. G17A is deliberately absent: sharing a host
+/// kext with G17P is not independent target evidence. Classic-only targets do
+/// not have an SKSM layout, while the presence of a layout on G16X/G17P does
+/// not resolve their still-unknown classic-versus-SKSM runtime selector.
+#[allow(dead_code)]
+pub(crate) const fn sksm_kick_queue_id_config(
+    gpu_gen: GpuGen,
+    gpu_variant: GpuVariant,
+) -> Option<SksmKickQueueIdConfig> {
+    use GpuGen::*;
+    use GpuVariant::*;
+
+    match (gpu_gen, gpu_variant) {
+        (G16, S | C) | (G17, P | G | S | C) => Some(SKSM_KICK_QUEUE_ID_CONFIG),
+        _ => None,
+    }
+}
+
+/// Validate externally recovered SKSM queue-ID properties for one target.
+#[allow(dead_code)]
+pub(crate) const fn validate_sksm_kick_queue_id_config(
+    gpu_gen: GpuGen,
+    gpu_variant: GpuVariant,
+    shift: u8,
+    mask: u8,
+) -> Result<SksmKickQueueIdConfig, SubmissionConfigError> {
+    let Some(expected) = sksm_kick_queue_id_config(gpu_gen, gpu_variant) else {
+        return Err(SubmissionConfigError::UnsupportedTarget);
+    };
+
+    if shift != expected.shift || mask != expected.mask {
+        Err(SubmissionConfigError::UnexpectedSksmKickQueueIdConfig)
+    } else {
+        Ok(expected)
+    }
+}
+
+/// Encode the exact cross-generation host firmware-kick word and role route.
+///
+/// Pinned G15/G16 hosts always send through their single `GFX` role. Every
+/// pinned G17 host instead selects `GFX1` only for opaque message type seven;
+/// all other six-bit message types use `GFX`. The destination endpoint and
+/// the complete queue publication/notification lifecycle remain deliberately
+/// outside this model.
+#[allow(dead_code)]
+pub(crate) const fn encode_firmware_kick_route(
+    gpu_gen: GpuGen,
+    gpu_variant: GpuVariant,
+    kick_index: u8,
+    message_type: u8,
+) -> Result<FirmwareKickRoute, SubmissionConfigError> {
+    use GpuGen::*;
+    use GpuVariant::*;
+
+    let target_is_proven = matches!(
+        (gpu_gen, gpu_variant),
+        (G15, G | S | C | D) | (G16, G | S | C) | (G17, P | G | S | C)
+    );
+    if !target_is_proven {
+        return Err(SubmissionConfigError::UnsupportedTarget);
+    }
+    if kick_index > FIRMWARE_KICK_INDEX_MASK {
+        return Err(SubmissionConfigError::KickIndexOutOfRange);
+    }
+    if message_type > FIRMWARE_MESSAGE_TYPE_MASK {
+        return Err(SubmissionConfigError::FirmwareMessageTypeOutOfRange);
+    }
+
+    let role = match (gpu_gen, message_type) {
+        (G17, G17_GFX1_FIRMWARE_MESSAGE_TYPE) => SubmissionFirmwareRole::Gfx1,
+        _ => SubmissionFirmwareRole::Gfx,
+    };
+    let message = FIRMWARE_KICK_TAG
+        | ((message_type as u64) << FIRMWARE_MESSAGE_TYPE_SHIFT)
+        | ((kick_index as u64) << FIRMWARE_KICK_INDEX_SHIFT);
+
+    Ok(FirmwareKickRoute { role, message })
 }
 
 #[cfg(test)]
@@ -259,6 +400,120 @@ mod tests {
             assert_eq!(g17_hal300.firmware_roles, FirmwareRoleTopology::Dual);
             assert_eq!(g17_hal300.submission_transport, SubmissionTransport::Sksm);
             assert_eq!(g17_hal300.uat_input_address_bits, 42);
+        }
+    }
+
+    #[test]
+    fn sksm_kick_queue_id_config_is_exact_and_target_pinned() {
+        for (gpu_gen, gpu_variant) in [
+            (GpuGen::G16, GpuVariant::S),
+            (GpuGen::G16, GpuVariant::C),
+            (GpuGen::G17, GpuVariant::P),
+            (GpuGen::G17, GpuVariant::G),
+            (GpuGen::G17, GpuVariant::S),
+            (GpuGen::G17, GpuVariant::C),
+        ] {
+            assert_eq!(
+                validate_sksm_kick_queue_id_config(gpu_gen, gpu_variant, 40, 0x7f),
+                Ok(SKSM_KICK_QUEUE_ID_CONFIG)
+            );
+            assert_eq!(
+                validate_sksm_kick_queue_id_config(gpu_gen, gpu_variant, 39, 0x7f),
+                Err(SubmissionConfigError::UnexpectedSksmKickQueueIdConfig)
+            );
+            assert_eq!(
+                validate_sksm_kick_queue_id_config(gpu_gen, gpu_variant, 40, 0xff),
+                Err(SubmissionConfigError::UnexpectedSksmKickQueueIdConfig)
+            );
+        }
+
+        for (gpu_gen, gpu_variant) in [
+            (GpuGen::G15, GpuVariant::G),
+            (GpuGen::G15, GpuVariant::S),
+            (GpuGen::G15, GpuVariant::C),
+            (GpuGen::G15, GpuVariant::D),
+            (GpuGen::G16, GpuVariant::P),
+            (GpuGen::G16, GpuVariant::G),
+            (GpuGen::G17, GpuVariant::A),
+        ] {
+            assert_eq!(
+                validate_sksm_kick_queue_id_config(gpu_gen, gpu_variant, 40, 0x7f),
+                Err(SubmissionConfigError::UnsupportedTarget)
+            );
+        }
+
+        assert!(GROUNDED_SKSM_KICK_QUEUE_ID_CONFIG_AVAILABLE);
+        assert!(!EXECUTABLE_G15_G17_SUBMISSION_AVAILABLE);
+    }
+
+    #[test]
+    fn firmware_kick_word_and_g17_role_route_are_exact() {
+        for (gpu_gen, gpu_variant) in [
+            (GpuGen::G15, GpuVariant::G),
+            (GpuGen::G15, GpuVariant::S),
+            (GpuGen::G15, GpuVariant::C),
+            (GpuGen::G15, GpuVariant::D),
+            (GpuGen::G16, GpuVariant::G),
+            (GpuGen::G16, GpuVariant::S),
+            (GpuGen::G16, GpuVariant::C),
+            (GpuGen::G17, GpuVariant::P),
+            (GpuGen::G17, GpuVariant::G),
+            (GpuGen::G17, GpuVariant::S),
+            (GpuGen::G17, GpuVariant::C),
+        ] {
+            assert_eq!(
+                encode_firmware_kick_route(gpu_gen, gpu_variant, 4, 3),
+                Ok(FirmwareKickRoute {
+                    role: SubmissionFirmwareRole::Gfx,
+                    message: 0x0083_0000_0000_0010,
+                })
+            );
+        }
+
+        for gpu_variant in [
+            GpuVariant::P,
+            GpuVariant::G,
+            GpuVariant::S,
+            GpuVariant::C,
+        ] {
+            assert_eq!(
+                encode_firmware_kick_route(GpuGen::G17, gpu_variant, 7, 7),
+                Ok(FirmwareKickRoute {
+                    role: SubmissionFirmwareRole::Gfx1,
+                    message: 0x0087_0000_0000_001c,
+                })
+            );
+        }
+        for (gpu_gen, gpu_variant) in [
+            (GpuGen::G15, GpuVariant::G),
+            (GpuGen::G16, GpuVariant::G),
+        ] {
+            assert_eq!(
+                encode_firmware_kick_route(gpu_gen, gpu_variant, 7, 7),
+                Ok(FirmwareKickRoute {
+                    role: SubmissionFirmwareRole::Gfx,
+                    message: 0x0087_0000_0000_001c,
+                })
+            );
+        }
+
+        assert_eq!(
+            encode_firmware_kick_route(GpuGen::G17, GpuVariant::G, 8, 3),
+            Err(SubmissionConfigError::KickIndexOutOfRange)
+        );
+        assert_eq!(
+            encode_firmware_kick_route(GpuGen::G17, GpuVariant::G, 0, 0x40),
+            Err(SubmissionConfigError::FirmwareMessageTypeOutOfRange)
+        );
+        for (gpu_gen, gpu_variant) in [
+            (GpuGen::G15, GpuVariant::P),
+            (GpuGen::G16, GpuVariant::P),
+            (GpuGen::G17, GpuVariant::A),
+        ] {
+            assert_eq!(
+                encode_firmware_kick_route(gpu_gen, gpu_variant, 0, 3),
+                Err(SubmissionConfigError::UnsupportedTarget)
+            );
         }
     }
 
