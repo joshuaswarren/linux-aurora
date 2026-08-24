@@ -6,8 +6,9 @@
 //!
 //! This module contains only pure validation and host-side recovery writes.
 //! It performs no MMIO, mailbox traffic, ASC reset, or firmware-state write.
-//! The power-transition grammar, ordered PIO operations, and idle-poll
-//! behavior are byte-confirmed only for the pinned G17S GFX1 image. The
+//! The power-transition grammar and idle-poll behavior are independently
+//! byte-confirmed in pinned G17G/G17P/G17S GFX1 images. Only G17S establishes
+//! the ordered direct PIO prefix and following firmware operations. The
 //! recovery word, host writes, and no-op reset hook are byte-confirmed in
 //! pinned G15G/G15S/G15C, G16G/G16X, and G17G/G17S/G17P host drivers. Their
 //! shared values are modeled here without reusing target-specific structure
@@ -44,10 +45,10 @@ pub(crate) const RECOVERY_EVIDENCE_TARGETS: [RecoveryEvidenceTarget; 10] = [
     RecoveryEvidenceTarget::G17S,
 ];
 
-/// G17S establishes the internal transition grammar, semantic PIO types, one
-/// idle poll, and the intervening firmware-operation order. The physical bases
-/// for types 0/0x0b, G17G/G17P firmware parity, and the opaque helper ownership
-/// remain unproved.
+/// G17 GFX1 images establish the internal transition grammar and one idle
+/// poll. Only G17S establishes the direct PIO prefix and intervening
+/// firmware-operation order. The physical bases for types 0/0x0b and the
+/// opaque helper ownership remain unproved.
 pub(crate) const EXECUTABLE_GFX1_POWER_SEQUENCE_AVAILABLE: bool = false;
 
 /// The firmware writes and cross-role 0x22/0x23 protocol remain unproved, so
@@ -160,7 +161,7 @@ pub(crate) fn validate_t6050_g17s_perf_state_mirrors(
     Ok(())
 }
 
-/// G17S GFX1 internal power states whose numeric names are string-confirmed.
+/// G17 GFX1 internal power states whose numeric names are string-confirmed.
 pub(crate) const GFX1_POWER_SLEEP: u8 = 0x08;
 pub(crate) const GFX1_POWER_NAP: u8 = 0x10;
 
@@ -169,6 +170,45 @@ pub(crate) const GFX1_POWER_NAP: u8 = 0x10;
 /// Its private Apple enum name is not known, so the numeric value is kept
 /// without assigning a semantic name.
 pub(crate) const GFX1_POWER_INTERMEDIATE_21: u8 = 0x21;
+
+/// G17 targets with independently pinned GFX1 transition and idle-poll bytes.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum G17Gfx1PowerEvidenceTarget {
+    G17P,
+    G17G,
+    G17S,
+}
+
+pub(crate) const G17_GFX1_POWER_EVIDENCE_TARGETS: [G17Gfx1PowerEvidenceTarget; 3] = [
+    G17Gfx1PowerEvidenceTarget::G17P,
+    G17Gfx1PowerEvidenceTarget::G17G,
+    G17Gfx1PowerEvidenceTarget::G17S,
+];
+
+/// How the pinned transition callback reaches its pre-idle work.
+///
+/// The G17G/G17P helper bodies and hardware ownership are opaque. The callback
+/// bytes prove only that the direct G17S PIO prefix is absent before these
+/// exact calls; they do not prove that the helpers perform equivalent writes.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum G17Gfx1PreIdleEntryEvidence {
+    OpaqueHelper { helper_text_offset: u32 },
+    G17SDirectPioPrefix,
+}
+
+pub(crate) const fn g17_gfx1_pre_idle_entry_evidence(
+    target: G17Gfx1PowerEvidenceTarget,
+) -> G17Gfx1PreIdleEntryEvidence {
+    match target {
+        G17Gfx1PowerEvidenceTarget::G17P => G17Gfx1PreIdleEntryEvidence::OpaqueHelper {
+            helper_text_offset: 0x0003_5f5c,
+        },
+        G17Gfx1PowerEvidenceTarget::G17G => G17Gfx1PreIdleEntryEvidence::OpaqueHelper {
+            helper_text_offset: 0x0003_5db4,
+        },
+        G17Gfx1PowerEvidenceTarget::G17S => G17Gfx1PreIdleEntryEvidence::G17SDirectPioPrefix,
+    }
+}
 
 /// Semantic G17 PIO types used by the pinned G17S GFX1 transition callback.
 ///
@@ -347,26 +387,45 @@ pub(crate) const G17S_CAPTURED_SGX_PHYS_BASE: u64 = 0x21_0000_0000;
 pub(crate) const G17S_GFX1_IDLE_STATUS_PHYS: u64 =
     G17S_CAPTURED_SGX_PHYS_BASE + G17_PIO_SLOT_24_RELATIVE_OFFSET as u64;
 
-/// Exact G17S GFX1 idle-poll fields.
-pub(crate) const G17S_GFX1_IDLE_POLL_MASK: u32 = 1;
-pub(crate) const G17S_GFX1_IDLE_POLL_EXPECTED: u32 = 1;
-pub(crate) const G17S_GFX1_IDLE_POLL_TIMEOUT_TICKS: u32 = 0x1770;
+/// Exact common G17 GFX1 idle-poll fields.
+pub(crate) const G17_GFX1_IDLE_POLL_MASK: u32 = 1;
+pub(crate) const G17_GFX1_IDLE_POLL_EXPECTED: u32 = 1;
+pub(crate) const G17_GFX1_IDLE_POLL_TIMEOUT_TICKS: u32 = 0x1770;
 /// Maximum printed by the pinned firmware for the `0x1770`-tick deadline.
-pub(crate) const G17S_GFX1_IDLE_POLL_REPORTED_MAX_US: u32 = 250;
+pub(crate) const G17_GFX1_IDLE_POLL_REPORTED_MAX_US: u32 = 250;
 
-/// Apply the pinned firmware's timebase-delta reporting conversion.
+/// G17S-compatible names retained for the captured physical-address witness.
+pub(crate) const G17S_GFX1_IDLE_POLL_MASK: u32 = G17_GFX1_IDLE_POLL_MASK;
+pub(crate) const G17S_GFX1_IDLE_POLL_EXPECTED: u32 = G17_GFX1_IDLE_POLL_EXPECTED;
+pub(crate) const G17S_GFX1_IDLE_POLL_TIMEOUT_TICKS: u32 = G17_GFX1_IDLE_POLL_TIMEOUT_TICKS;
+pub(crate) const G17S_GFX1_IDLE_POLL_REPORTED_MAX_US: u32 = G17_GFX1_IDLE_POLL_REPORTED_MAX_US;
+
+/// Apply the pinned G17 firmware's timebase-delta reporting conversion.
 ///
 /// This is evidence for its diagnostic output, not a Linux timeout source.
-pub(crate) const fn g17s_gfx1_report_timebase_delta_us(delta_ticks: u32) -> u32 {
+pub(crate) const fn g17_gfx1_report_timebase_delta_us(delta_ticks: u32) -> u32 {
     ((delta_ticks as u64 * 0xaaaa_aaab) >> 36) as u32
 }
 
-/// Test the exact success predicate used by the G17S GFX1 idle poll.
-pub(crate) const fn g17s_gfx1_idle_poll_satisfied(status: u32) -> bool {
-    status & G17S_GFX1_IDLE_POLL_MASK == G17S_GFX1_IDLE_POLL_EXPECTED
+/// Apply the shared conversion to the original G17S witness.
+pub(crate) const fn g17s_gfx1_report_timebase_delta_us(delta_ticks: u32) -> u32 {
+    g17_gfx1_report_timebase_delta_us(delta_ticks)
 }
 
-/// Fail-closed result for the bounded G17S GFX1 transition grammar.
+/// Test the exact success predicate used by the common G17 GFX1 idle poll.
+pub(crate) const fn g17_gfx1_idle_poll_satisfied(
+    _target: G17Gfx1PowerEvidenceTarget,
+    status: u32,
+) -> bool {
+    status & G17_GFX1_IDLE_POLL_MASK == G17_GFX1_IDLE_POLL_EXPECTED
+}
+
+/// Test the G17S witness through the common G17 idle-poll predicate.
+pub(crate) const fn g17s_gfx1_idle_poll_satisfied(status: u32) -> bool {
+    g17_gfx1_idle_poll_satisfied(G17Gfx1PowerEvidenceTarget::G17S, status)
+}
+
+/// Fail-closed result for the bounded G17 GFX1 transition grammar.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum PowerTransitionError {
     /// Direct SLEEP-to-NAP and NAP-to-SLEEP paths reach firmware aborts.
@@ -375,11 +434,12 @@ pub(crate) enum PowerTransitionError {
     UnprovenTransition,
 }
 
-/// Validate only the four proven G17S bridge edges.
+/// Validate only the four independently proven G17 bridge edges.
 ///
 /// Same-state requests and unknown values are deliberately rejected. This
-/// function must not be used as proof that G17G or G17P share the grammar.
-pub(crate) const fn validate_g17s_gfx1_power_transition(
+/// proves the transition grammar, not target helper equivalence or ownership.
+pub(crate) const fn validate_g17_gfx1_power_transition(
+    _target: G17Gfx1PowerEvidenceTarget,
     old: u8,
     new: u8,
 ) -> Result<(), PowerTransitionError> {
@@ -396,6 +456,14 @@ pub(crate) const fn validate_g17s_gfx1_power_transition(
     } else {
         Err(PowerTransitionError::UnprovenTransition)
     }
+}
+
+/// Validate the G17S witness through the common G17 transition grammar.
+pub(crate) const fn validate_g17s_gfx1_power_transition(
+    old: u8,
+    new: u8,
+) -> Result<(), PowerTransitionError> {
+    validate_g17_gfx1_power_transition(G17Gfx1PowerEvidenceTarget::G17S, old, new)
 }
 
 /// Exact values observed in the shared G15-G17 host recovery word.
@@ -610,6 +678,79 @@ mod tests {
                 Err(PowerTransitionError::UnprovenTransition)
             );
         }
+    }
+
+    #[test]
+    fn g17_power_transition_and_poll_parity_excludes_direct_pio_prefix() {
+        assert_eq!(
+            G17_GFX1_POWER_EVIDENCE_TARGETS,
+            [
+                G17Gfx1PowerEvidenceTarget::G17P,
+                G17Gfx1PowerEvidenceTarget::G17G,
+                G17Gfx1PowerEvidenceTarget::G17S,
+            ]
+        );
+        assert_eq!(
+            g17_gfx1_pre_idle_entry_evidence(G17Gfx1PowerEvidenceTarget::G17P),
+            G17Gfx1PreIdleEntryEvidence::OpaqueHelper {
+                helper_text_offset: 0x0003_5f5c,
+            }
+        );
+        assert_eq!(
+            g17_gfx1_pre_idle_entry_evidence(G17Gfx1PowerEvidenceTarget::G17G),
+            G17Gfx1PreIdleEntryEvidence::OpaqueHelper {
+                helper_text_offset: 0x0003_5db4,
+            }
+        );
+        assert_eq!(
+            g17_gfx1_pre_idle_entry_evidence(G17Gfx1PowerEvidenceTarget::G17S),
+            G17Gfx1PreIdleEntryEvidence::G17SDirectPioPrefix
+        );
+
+        let valid_edges = [
+            (GFX1_POWER_SLEEP, GFX1_POWER_INTERMEDIATE_21),
+            (GFX1_POWER_NAP, GFX1_POWER_INTERMEDIATE_21),
+            (GFX1_POWER_INTERMEDIATE_21, GFX1_POWER_SLEEP),
+            (GFX1_POWER_INTERMEDIATE_21, GFX1_POWER_NAP),
+        ];
+        for target in G17_GFX1_POWER_EVIDENCE_TARGETS {
+            for edge in valid_edges {
+                assert_eq!(
+                    validate_g17_gfx1_power_transition(target, edge.0, edge.1),
+                    Ok(())
+                );
+            }
+            assert_eq!(
+                validate_g17_gfx1_power_transition(
+                    target,
+                    GFX1_POWER_SLEEP,
+                    GFX1_POWER_NAP,
+                ),
+                Err(PowerTransitionError::DirectSleepNapIsFatal)
+            );
+            assert_eq!(
+                validate_g17_gfx1_power_transition(
+                    target,
+                    GFX1_POWER_INTERMEDIATE_21,
+                    GFX1_POWER_INTERMEDIATE_21,
+                ),
+                Err(PowerTransitionError::UnprovenTransition)
+            );
+            assert!(!g17_gfx1_idle_poll_satisfied(target, 0));
+            assert!(g17_gfx1_idle_poll_satisfied(target, 1));
+            assert!(!g17_gfx1_idle_poll_satisfied(target, 2));
+            assert!(g17_gfx1_idle_poll_satisfied(target, u32::MAX));
+        }
+
+        assert_eq!(G17_GFX1_IDLE_POLL_MASK, 1);
+        assert_eq!(G17_GFX1_IDLE_POLL_EXPECTED, 1);
+        assert_eq!(G17_GFX1_IDLE_POLL_TIMEOUT_TICKS, 0x1770);
+        assert_eq!(G17_GFX1_IDLE_POLL_REPORTED_MAX_US, 250);
+        assert_eq!(
+            g17_gfx1_report_timebase_delta_us(G17_GFX1_IDLE_POLL_TIMEOUT_TICKS),
+            G17_GFX1_IDLE_POLL_REPORTED_MAX_US
+        );
+        assert!(!EXECUTABLE_GFX1_POWER_SEQUENCE_AVAILABLE);
     }
 
     #[test]
