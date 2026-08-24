@@ -310,7 +310,7 @@ impl File {
             gpu_revision: gpu.get_dyncfg().id.gpu_rev as u32,
             chip_id: gpu.get_cfg().chip_id,
 
-            num_dies: gpu.get_cfg().num_dies,
+            num_dies: gpu.get_dyncfg().id.num_dies,
             num_clusters_total: gpu.get_dyncfg().id.num_clusters,
             num_cores_per_cluster: gpu.get_dyncfg().id.num_cores,
             core_masks: [0; uapi::DRM_ASAHI_MAX_CLUSTERS as usize],
@@ -324,6 +324,9 @@ impl File {
             max_frequency_khz: gpu.get_dyncfg().pwr.max_frequency_khz(),
 
             command_timestamp_frequency_hz: 1_000_000_000, // User timestamps always in nanoseconds
+
+            usc_generation: gpu.get_dyncfg().id.usc_generation,
+            gpu_hal_generation: gpu.get_dyncfg().id.gpu_hal_generation as u32,
         };
 
         for (i, mask) in gpu.get_dyncfg().id.core_masks.iter().enumerate() {

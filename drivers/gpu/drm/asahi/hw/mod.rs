@@ -6,6 +6,7 @@
 
 use crate::driver::AsahiDevice;
 use crate::fw::types::*;
+pub(crate) use crate::identity::{GpuGen, GpuHalGeneration, GpuVariant};
 use kernel::c_str;
 use kernel::prelude::*;
 
@@ -15,25 +16,6 @@ pub(crate) mod t600x;
 pub(crate) mod t602x;
 pub(crate) mod t8103;
 pub(crate) mod t8112;
-
-/// GPU generation enumeration. Note: Part of the UABI.
-#[derive(Debug, PartialEq, Copy, Clone)]
-#[repr(u32)]
-pub(crate) enum GpuGen {
-    G13 = 13,
-    G14 = 14,
-}
-
-/// GPU variant enumeration. Note: Part of the UABI.
-#[derive(Debug, PartialEq, Copy, Clone)]
-#[repr(u32)]
-pub(crate) enum GpuVariant {
-    P = 'P' as u32,
-    G = 'G' as u32,
-    S = 'S' as u32,
-    C = 'C' as u32,
-    D = 'D' as u32,
-}
 
 /// GPU revision enumeration. Note: Part of the UABI.
 #[derive(Debug, PartialEq, Copy, Clone)]
@@ -316,10 +298,16 @@ pub(crate) struct GpuIdConfig {
     pub(crate) gpu_gen: GpuGen,
     /// GPU variant type (should match static config).
     pub(crate) gpu_variant: GpuVariant,
+    /// Unified shader core generation.
+    pub(crate) usc_generation: u32,
+    /// Apple GPU HAL generation (0 for the pre-numbered generations).
+    pub(crate) gpu_hal_generation: GpuHalGeneration,
     /// GPU silicon revision.
     pub(crate) gpu_rev: GpuRevision,
     /// GPU silicon revision ID (firmware enum).
     pub(crate) gpu_rev_id: GpuRevisionID,
+    /// Number of GPU dies read from the ID register.
+    pub(crate) num_dies: u32,
     /// Total number of GPU clusters.
     pub(crate) num_clusters: u32,
     /// Maximum number of GPU cores per cluster.
