@@ -221,8 +221,8 @@ fn refuse_g17_probe(pdev: &platform::Device<Core>) -> Error {
         dev_err!(
             pdev.as_ref(),
             "{}{}",
-            "G17 preflight: G17S SLEEP/NAP/0x21 PIO order and one 250us-reported poll are grounded, ",
-            "but slot 0/0xb physical bases, G17G/G17P firmware parity, and intervening operations are incomplete\n"
+            "G17 preflight: G17S PIO type identities, transition order, intervening state/sync order, and one 250us-reported poll are grounded, ",
+            "but type 0/0xb physical bases, opaque helper ownership, and G17G/G17P firmware parity are incomplete\n"
         );
     }
     if missing.contains(g17_boot::missing::RECOVERY_HANDSHAKE) {
