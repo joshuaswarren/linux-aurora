@@ -47,8 +47,8 @@ pub(crate) const RECOVERY_EVIDENCE_TARGETS: [RecoveryEvidenceTarget; 10] = [
 
 /// G17 GFX1 images establish the internal transition grammar and one idle
 /// poll. Only G17S establishes the direct PIO prefix and intervening
-/// firmware-operation order. The physical bases for types 0/0x0b and the
-/// opaque helper ownership remain unproved.
+/// firmware-operation order. G17G/G17P establish a physical type-0 mapping
+/// but leave type 0x0b unbound; neither fact proves Linux MMIO ownership.
 pub(crate) const EXECUTABLE_GFX1_POWER_SEQUENCE_AVAILABLE: bool = false;
 
 /// The firmware writes and cross-role 0x22/0x23 protocol remain unproved, so
@@ -232,8 +232,9 @@ pub(crate) const fn g17_gfx1_pre_idle_entry_evidence(
 /// Semantic G17 PIO types used by the pinned G17S GFX1 transition callback.
 ///
 /// The firmware's 52-entry name/type table and type-indexed 0x28-byte PIO
-/// descriptor copier directly pair these names and numeric values. Their
-/// physical mappings are a separate, still-unproved property.
+/// descriptor copier directly pair these names and numeric values. G17S
+/// physical mappings remain unproved; independently pinned G17G/G17P host
+/// mappings are modeled below.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum G17PioSlot {
@@ -415,6 +416,118 @@ pub(crate) const G17_PIO_SLOT_24_MAP_EVIDENCE_TARGETS: [G17PioMapEvidenceTarget;
 /// Exact common slot-0x24 relative mapping; the complete family tables differ.
 pub(crate) const G17_PIO_SLOT_24_RELATIVE_OFFSET: u32 = 0x00d4_0000;
 pub(crate) const G17_PIO_SLOT_24_SIZE: u32 = 0x4000;
+
+/// G17 targets whose physical SGX and host-created PIO bindings are pinned.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum G17HostPioPhysicalEvidenceTarget {
+    G17P,
+    G17G,
+}
+
+pub(crate) const G17_HOST_PIO_PHYSICAL_EVIDENCE_TARGETS: [G17HostPioPhysicalEvidenceTarget; 2] = [
+    G17HostPioPhysicalEvidenceTarget::G17P,
+    G17HostPioPhysicalEvidenceTarget::G17G,
+];
+
+/// Exact opaque `meta-sw-interrupt` tuple copied by the pinned host.
+///
+/// Only the first u64 has a proven use here: the host aligns it down to the
+/// host I/O page size and installs it as PIO type 0. The second u64 and
+/// trailing u32 deliberately remain unnamed.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17MetaSwInterruptEvidence {
+    pub(crate) first_u64: u64,
+    pub(crate) second_u64: u64,
+    pub(crate) trailing_u32: u32,
+}
+
+/// Source from which the pinned host constructs one physical PIO binding.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum G17HostPioBindingSource {
+    MetaSwInterrupt,
+    SgxRelativeOffsetTable,
+}
+
+/// One exact physical binding created by the pinned macOS host.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17HostPioPhysicalBinding {
+    pub(crate) phys_base: u64,
+    pub(crate) size: u32,
+    pub(crate) source: G17HostPioBindingSource,
+}
+
+/// Exact target input used to derive the pinned host's physical PIO map.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17HostPioPhysicalEvidence {
+    pub(crate) sgx_phys_base: u64,
+    pub(crate) host_io_page_size: u32,
+    pub(crate) meta_sw_interrupt: G17MetaSwInterruptEvidence,
+}
+
+/// The macOS host constructs these mappings, but Linux ownership is unproved.
+pub(crate) const G17_HOST_PIO_LINUX_MMIO_OWNERSHIP_PROVEN: bool = false;
+
+pub(crate) const fn g17_host_pio_physical_evidence(
+    target: G17HostPioPhysicalEvidenceTarget,
+) -> G17HostPioPhysicalEvidence {
+    match target {
+        G17HostPioPhysicalEvidenceTarget::G17P => G17HostPioPhysicalEvidence {
+            sgx_phys_base: 0x2_7000_0000,
+            host_io_page_size: 0x4000,
+            meta_sw_interrupt: G17MetaSwInterruptEvidence {
+                first_u64: 0x3_0101_4048,
+                second_u64: 0x3_0101_4248,
+                trailing_u32: 0x4000,
+            },
+        },
+        G17HostPioPhysicalEvidenceTarget::G17G => G17HostPioPhysicalEvidence {
+            sgx_phys_base: 0x3_7000_0000,
+            host_io_page_size: 0x4000,
+            meta_sw_interrupt: G17MetaSwInterruptEvidence {
+                first_u64: 0x3_8101_4048,
+                second_u64: 0x3_8101_4248,
+                trailing_u32: 0x4000,
+            },
+        },
+    }
+}
+
+/// Derive only the physical bindings established by the pinned target host.
+///
+/// Type 0 comes from `meta-sw-interrupt`; type 0x24 comes from the target SGX
+/// base plus its exact relative-table record. Type 0x0b remains `None`: both
+/// hosts zero the descriptor arena, omit it from their complete ten-record
+/// relative tables, and do not populate it in their configure-device chains.
+pub(crate) const fn g17_host_pio_physical_binding(
+    target: G17HostPioPhysicalEvidenceTarget,
+    slot: G17PioSlot,
+) -> Option<G17HostPioPhysicalBinding> {
+    let evidence = g17_host_pio_physical_evidence(target);
+
+    match slot {
+        G17PioSlot::GpcAicSwInt => Some(G17HostPioPhysicalBinding {
+            phys_base: evidence.meta_sw_interrupt.first_u64
+                & !((evidence.host_io_page_size as u64) - 1),
+            size: evidence.host_io_page_size,
+            source: G17HostPioBindingSource::MetaSwInterrupt,
+        }),
+        G17PioSlot::PushTelemetryDashboardConfigSpace => None,
+        G17PioSlot::FenderRegsMcw => Some(G17HostPioPhysicalBinding {
+            phys_base: evidence.sgx_phys_base + G17_PIO_SLOT_24_RELATIVE_OFFSET as u64,
+            size: G17_PIO_SLOT_24_SIZE,
+            source: G17HostPioBindingSource::SgxRelativeOffsetTable,
+        }),
+    }
+}
+
+/// Validate an observed binding, including the proven absence of type 0x0b.
+pub(crate) fn validate_g17_host_pio_physical_binding(
+    target: G17HostPioPhysicalEvidenceTarget,
+    slot: G17PioSlot,
+    binding: Option<G17HostPioPhysicalBinding>,
+) -> bool {
+    binding == g17_host_pio_physical_binding(target, slot)
+}
 
 /// Captured T6050/J714s SGX base and the derived G17S poll address.
 ///
@@ -925,6 +1038,122 @@ mod tests {
                 G17PioMapEvidenceTarget::G17S,
             ]
         );
+    }
+
+    #[test]
+    fn g17g_and_g17p_physical_pio_bindings_are_target_specific() {
+        let g17p = g17_host_pio_physical_evidence(G17HostPioPhysicalEvidenceTarget::G17P);
+        let g17g = g17_host_pio_physical_evidence(G17HostPioPhysicalEvidenceTarget::G17G);
+
+        assert_eq!(g17p.sgx_phys_base, 0x2_7000_0000);
+        assert_eq!(g17g.sgx_phys_base, 0x3_7000_0000);
+        assert_eq!(g17p.host_io_page_size, 0x4000);
+        assert_eq!(g17g.host_io_page_size, 0x4000);
+        assert_eq!(
+            g17p.meta_sw_interrupt,
+            G17MetaSwInterruptEvidence {
+                first_u64: 0x3_0101_4048,
+                second_u64: 0x3_0101_4248,
+                trailing_u32: 0x4000,
+            }
+        );
+        assert_eq!(
+            g17g.meta_sw_interrupt,
+            G17MetaSwInterruptEvidence {
+                first_u64: 0x3_8101_4048,
+                second_u64: 0x3_8101_4248,
+                trailing_u32: 0x4000,
+            }
+        );
+        assert_eq!(
+            G17_HOST_PIO_PHYSICAL_EVIDENCE_TARGETS,
+            [
+                G17HostPioPhysicalEvidenceTarget::G17P,
+                G17HostPioPhysicalEvidenceTarget::G17G,
+            ]
+        );
+        assert!(!G17_HOST_PIO_LINUX_MMIO_OWNERSHIP_PROVEN);
+        assert!(!EXECUTABLE_GFX1_POWER_SEQUENCE_AVAILABLE);
+    }
+
+    #[test]
+    fn g17g_and_g17p_pio_bindings_fail_closed_for_unbound_slot_0b() {
+        let g17p_slot0 = Some(G17HostPioPhysicalBinding {
+            phys_base: 0x3_0101_4000,
+            size: 0x4000,
+            source: G17HostPioBindingSource::MetaSwInterrupt,
+        });
+        let g17g_slot0 = Some(G17HostPioPhysicalBinding {
+            phys_base: 0x3_8101_4000,
+            size: 0x4000,
+            source: G17HostPioBindingSource::MetaSwInterrupt,
+        });
+        let g17p_slot24 = Some(G17HostPioPhysicalBinding {
+            phys_base: 0x2_70d4_0000,
+            size: 0x4000,
+            source: G17HostPioBindingSource::SgxRelativeOffsetTable,
+        });
+        let g17g_slot24 = Some(G17HostPioPhysicalBinding {
+            phys_base: 0x3_70d4_0000,
+            size: 0x4000,
+            source: G17HostPioBindingSource::SgxRelativeOffsetTable,
+        });
+
+        assert!(validate_g17_host_pio_physical_binding(
+            G17HostPioPhysicalEvidenceTarget::G17P,
+            G17PioSlot::GpcAicSwInt,
+            g17p_slot0,
+        ));
+        assert!(validate_g17_host_pio_physical_binding(
+            G17HostPioPhysicalEvidenceTarget::G17G,
+            G17PioSlot::GpcAicSwInt,
+            g17g_slot0,
+        ));
+        assert!(validate_g17_host_pio_physical_binding(
+            G17HostPioPhysicalEvidenceTarget::G17P,
+            G17PioSlot::FenderRegsMcw,
+            g17p_slot24,
+        ));
+        assert!(validate_g17_host_pio_physical_binding(
+            G17HostPioPhysicalEvidenceTarget::G17G,
+            G17PioSlot::FenderRegsMcw,
+            g17g_slot24,
+        ));
+
+        for target in G17_HOST_PIO_PHYSICAL_EVIDENCE_TARGETS {
+            assert_eq!(
+                g17_host_pio_physical_binding(
+                    target,
+                    G17PioSlot::PushTelemetryDashboardConfigSpace
+                ),
+                None
+            );
+            assert!(validate_g17_host_pio_physical_binding(
+                target,
+                G17PioSlot::PushTelemetryDashboardConfigSpace,
+                None,
+            ));
+            assert!(!validate_g17_host_pio_physical_binding(
+                target,
+                G17PioSlot::PushTelemetryDashboardConfigSpace,
+                g17p_slot0,
+            ));
+        }
+
+        assert!(!validate_g17_host_pio_physical_binding(
+            G17HostPioPhysicalEvidenceTarget::G17G,
+            G17PioSlot::GpcAicSwInt,
+            g17p_slot0,
+        ));
+        assert!(!validate_g17_host_pio_physical_binding(
+            G17HostPioPhysicalEvidenceTarget::G17P,
+            G17PioSlot::FenderRegsMcw,
+            Some(G17HostPioPhysicalBinding {
+                phys_base: 0x2_70d4_0000,
+                size: 0x2000,
+                source: G17HostPioBindingSource::SgxRelativeOffsetTable,
+            }),
+        ));
     }
 
     #[test]
