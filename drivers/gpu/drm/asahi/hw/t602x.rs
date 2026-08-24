@@ -54,6 +54,7 @@ pub(crate) const HWCONFIG_T6022: super::HwConfig = HwConfig {
 
     base_clock_hz: 24_000_000,
     uat_oas: 42,
+    uat_ias: 39,
     num_dies: 2,
     max_num_clusters: 8,
     max_num_cores: 10,

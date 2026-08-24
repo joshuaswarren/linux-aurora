@@ -14,6 +14,7 @@ pub(crate) const HWCONFIG: super::HwConfig = HwConfig {
 
     base_clock_hz: 24_000_000,
     uat_oas: 40,
+    uat_ias: 39,
     num_dies: 1,
     max_num_clusters: 1,
     max_num_cores: 10,

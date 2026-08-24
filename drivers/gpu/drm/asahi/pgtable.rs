@@ -31,16 +31,11 @@ use kernel::{
 };
 
 use crate::debug::*;
-use crate::util::align;
+use crate::{uat::UatGeometry, util::align};
+
+pub(crate) use crate::uat::{UAT_PGBIT, UAT_PGMSK, UAT_PGSZ};
 
 const DEBUG_CLASS: DebugFlags = DebugFlags::PgTable;
-
-/// Number of bits in a page offset.
-pub(crate) const UAT_PGBIT: usize = 14;
-/// UAT page size.
-pub(crate) const UAT_PGSZ: usize = 1 << UAT_PGBIT;
-/// UAT page offset mask.
-pub(crate) const UAT_PGMSK: usize = UAT_PGSZ - 1;
 
 type Pte = AtomicU64;
 
@@ -51,17 +46,13 @@ const PTE_SIZE: usize = 1 << PTE_BIT;
 const UAT_NPTE: usize = UAT_PGSZ / size_of::<Pte>();
 
 /// Number of address bits to address a level
-const UAT_LVBIT: usize = UAT_PGBIT - PTE_BIT;
+const UAT_LVBIT: usize = crate::uat::UAT_LVBIT;
 /// Number of entries per level
 const UAT_LVSZ: usize = UAT_NPTE;
 /// Mask of level bits
 const UAT_LVMSK: u64 = (UAT_LVSZ - 1) as u64;
 
-const UAT_LEVELS: usize = 3;
-
-/// UAT input address space
-pub(crate) const UAT_IAS: usize = 39;
-const UAT_IASMSK: u64 = (1u64 << UAT_IAS) - 1;
+const UAT_LEVELS: usize = crate::uat::UAT_LEVELS;
 
 const PTE_TYPE_BITS: u64 = 3;
 const PTE_TYPE_LEAF_TABLE: u64 = 3;
@@ -255,29 +246,39 @@ pub(crate) struct UatPageTable {
     ttb: PhysicalAddr,
     ttb_owned: bool,
     va_range: Range<u64>,
+    geometry: UatGeometry,
     oas_mask: u64,
 }
 
 impl UatPageTable {
-    pub(crate) fn new(oas: u32) -> Result<Self> {
-        mod_pr_debug!("UATPageTable::new: oas={}\n", oas);
+    pub(crate) fn new(ias: u8, oas: u32) -> Result<Self> {
+        mod_pr_debug!("UATPageTable::new: ias={} oas={}\n", ias, oas);
+        let geometry = UatGeometry::new(ias).ok_or(EINVAL)?;
         let ttb_page = Page::alloc_page(GFP_KERNEL | __GFP_ZERO)?;
         let ttb = Page::into_phys(ttb_page);
         Ok(UatPageTable {
             ttb,
             ttb_owned: true,
-            va_range: 0..(1u64 << UAT_IAS),
+            va_range: 0..geometry.root_size(),
+            geometry,
             oas_mask: (1u64 << oas) - 1,
         })
     }
 
-    pub(crate) fn new_with_ttb(ttb: PhysicalAddr, va_range: Range<u64>, oas: u32) -> Result<Self> {
+    pub(crate) fn new_with_ttb(
+        ttb: PhysicalAddr,
+        va_range: Range<u64>,
+        ias: u8,
+        oas: u32,
+    ) -> Result<Self> {
         mod_pr_debug!(
-            "UATPageTable::new_with_ttb: ttb={:#x} range={:#x?} oas={}\n",
+            "UATPageTable::new_with_ttb: ttb={:#x} range={:#x?} ias={} oas={}\n",
             ttb,
             va_range,
+            ias,
             oas
         );
+        let geometry = UatGeometry::new(ias).ok_or(EINVAL)?;
         if ttb & (UAT_PGMSK as PhysicalAddr) != 0 {
             return Err(EINVAL);
         }
@@ -297,6 +298,7 @@ impl UatPageTable {
             ttb,
             ttb_owned: false,
             va_range,
+            geometry,
             oas_mask: (1u64 << oas) - 1,
         })
     }
@@ -333,10 +335,11 @@ impl UatPageTable {
             return Ok(());
         }
 
-        let mut iova = iova_range.start & UAT_IASMSK;
+        let ias_mask = self.geometry.root_mask();
+        let mut iova = iova_range.start & ias_mask;
         let mut last_iova = iova;
         // Handle the case where iova_range.end is just at the top boundary of the IAS
-        let end = ((iova_range.end - 1) & UAT_IASMSK) + 1;
+        let end = ((iova_range.end - 1) & ias_mask) + 1;
 
         let mut pt_addr: [Option<PhysicalAddr>; UAT_LEVELS] = Default::default();
         pt_addr[UAT_LEVELS - 1] = Some(self.ttb);
@@ -565,7 +568,7 @@ impl UatPageTable {
     pub(crate) fn dump_pages(&mut self, iova_range: Range<u64>) -> Result<KVVec<DumpedPage>> {
         let mut pages = KVVec::new();
         let oas_mask = self.oas_mask;
-        let iova_base = self.va_range.start & !UAT_IASMSK;
+        let iova_base = self.va_range.start & !self.geometry.root_mask();
         self.with_pages(iova_range, false, false, |iova, ptes| {
             let iova = iova | iova_base;
             for (idx, ppte) in ptes.iter().enumerate() {
