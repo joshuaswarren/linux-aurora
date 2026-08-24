@@ -3,6 +3,7 @@
 
 //! Driver for the Apple AGX GPUs found in Apple Silicon SoCs.
 
+mod agx_power_recovery;
 mod alloc;
 mod buffer;
 mod channel;

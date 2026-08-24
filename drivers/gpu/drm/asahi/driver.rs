@@ -220,13 +220,17 @@ fn refuse_g17_probe(pdev: &platform::Device<Core>) -> Error {
     if missing.contains(g17_boot::missing::GFX1_POWER_SEQUENCE) {
         dev_err!(
             pdev.as_ref(),
-            "G17 preflight: GFX1 power-transition mapping is incomplete\n"
+            "{}{}",
+            "G17 preflight: G17S SLEEP/NAP/0x21 validation is grounded, ",
+            "but G17G/G17P parity, PIO mappings, polling, and settle timing are incomplete\n"
         );
     }
     if missing.contains(g17_boot::missing::RECOVERY_HANDSHAKE) {
         dev_err!(
             pdev.as_ref(),
-            "G17 preflight: dual-role recovery handshake is incomplete\n"
+            "{}{}",
+            "G17 preflight: recovery word states 0..3 and host writes 1->2/3->0 are ",
+            "grounded, but firmware writes and the cross-role 0x22/0x23 handshake are incomplete\n"
         );
     }
     if missing.contains(g17_boot::missing::SUBMISSION_TRANSPORT) {
