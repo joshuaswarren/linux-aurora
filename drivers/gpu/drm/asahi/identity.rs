@@ -86,6 +86,23 @@ pub(crate) struct FirmwareKickRoute {
     pub(crate) message: u64,
 }
 
+/// Exact RTBuddy endpoint binding used by Apple's host firmware-kick sender.
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub(crate) struct FirmwareKickEndpointConfig {
+    pub(crate) sender_vtable_offset: u16,
+    pub(crate) gated_sender_vtable_offset: u16,
+    pub(crate) endpoint_service_id_offset: u16,
+    pub(crate) message_endpoint_id: u8,
+    pub(crate) message_endpoint_object_offset: u16,
+    pub(crate) async_note_endpoint_id: u8,
+    pub(crate) async_note_endpoint_object_offset: u16,
+    pub(crate) endpoint_send_vtable_offset: u16,
+    pub(crate) sender_arg2: u8,
+    pub(crate) endpoint_send_arg2: u8,
+    pub(crate) endpoint_send_arg3: u8,
+}
+
 /// Refusals made by the target-pinned SKSM submission preflight.
 #[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -98,12 +115,18 @@ pub(crate) enum SubmissionConfigError {
     KickIndexOutOfRange,
     /// The opaque firmware message type does not fit the six-bit host field.
     FirmwareMessageTypeOutOfRange,
+    /// The supplied endpoint binding differs from the target's exact host values.
+    UnexpectedFirmwareKickEndpointConfig,
 }
 
 /// A pure submission configuration validator is available for the exact
 /// G16X/G17 host targets below.
 #[allow(dead_code)]
 pub(crate) const GROUNDED_SKSM_KICK_QUEUE_ID_CONFIG_AVAILABLE: bool = true;
+/// A pure endpoint-binding validator is available for every target supported
+/// by the firmware-kick word encoder.
+#[allow(dead_code)]
+pub(crate) const GROUNDED_FIRMWARE_KICK_ENDPOINT_CONFIG_AVAILABLE: bool = true;
 /// Queue construction, transport selection on dual-stack targets, shared
 /// memory ownership, and the complete firmware notification sequence are not
 /// modeled, so command submission must remain disconnected from this helper.
@@ -120,6 +143,19 @@ const FIRMWARE_KICK_INDEX_SHIFT: u32 = 2;
 const FIRMWARE_MESSAGE_TYPE_MASK: u8 = 0x3f;
 const FIRMWARE_MESSAGE_TYPE_SHIFT: u32 = 48;
 const G17_GFX1_FIRMWARE_MESSAGE_TYPE: u8 = 0x07;
+const FIRMWARE_KICK_ENDPOINT_CONFIG: FirmwareKickEndpointConfig = FirmwareKickEndpointConfig {
+    sender_vtable_offset: 0x8a8,
+    gated_sender_vtable_offset: 0x8b0,
+    endpoint_service_id_offset: 0x88,
+    message_endpoint_id: 0x20,
+    message_endpoint_object_offset: 0x128,
+    async_note_endpoint_id: 0x21,
+    async_note_endpoint_object_offset: 0x130,
+    endpoint_send_vtable_offset: 0x1e8,
+    sender_arg2: 0,
+    endpoint_send_arg2: 0,
+    endpoint_send_arg3: 1,
+};
 
 /// Identity and userspace-visible architecture axes decoded from GPU ID MMIO.
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -295,6 +331,62 @@ pub(crate) const fn encode_firmware_kick_route(
         | ((kick_index as u64) << FIRMWARE_KICK_INDEX_SHIFT);
 
     Ok(FirmwareKickRoute { role, message })
+}
+
+/// Return the exact RTBuddy endpoint route used by one host firmware kick.
+///
+/// The host's kick call is vtable slot 0x8a8, which is the asynchronous-note
+/// sender rather than the ordinary message sender at slot 0x898. The gated
+/// sender consequently dereferences the endpoint-0x21 object at offset 0x130;
+/// endpoint 0x20 is bound separately at offset 0x128. These values and the
+/// opaque endpoint-send arguments are byte-identical in the pinned G15G/X,
+/// G16G/X, G17P, G17G and G17X RTBuddy drivers.
+///
+/// This does not prove queue allocation, shared-memory ownership, publication,
+/// cache maintenance, acknowledgment, or teardown ordering.
+#[allow(dead_code)]
+pub(crate) const fn firmware_kick_endpoint_config(
+    gpu_gen: GpuGen,
+    gpu_variant: GpuVariant,
+) -> Option<FirmwareKickEndpointConfig> {
+    use GpuGen::*;
+    use GpuVariant::*;
+
+    match (gpu_gen, gpu_variant) {
+        (G15, G | S | C | D) | (G16, G | S | C) | (G17, P | G | S | C) => {
+            Some(FIRMWARE_KICK_ENDPOINT_CONFIG)
+        }
+        _ => None,
+    }
+}
+
+/// Validate externally recovered RTBuddy endpoint-binding properties.
+#[allow(dead_code)]
+pub(crate) const fn validate_firmware_kick_endpoint_config(
+    gpu_gen: GpuGen,
+    gpu_variant: GpuVariant,
+    supplied: FirmwareKickEndpointConfig,
+) -> Result<FirmwareKickEndpointConfig, SubmissionConfigError> {
+    let Some(expected) = firmware_kick_endpoint_config(gpu_gen, gpu_variant) else {
+        return Err(SubmissionConfigError::UnsupportedTarget);
+    };
+
+    if supplied.sender_vtable_offset != expected.sender_vtable_offset
+        || supplied.gated_sender_vtable_offset != expected.gated_sender_vtable_offset
+        || supplied.endpoint_service_id_offset != expected.endpoint_service_id_offset
+        || supplied.message_endpoint_id != expected.message_endpoint_id
+        || supplied.message_endpoint_object_offset != expected.message_endpoint_object_offset
+        || supplied.async_note_endpoint_id != expected.async_note_endpoint_id
+        || supplied.async_note_endpoint_object_offset != expected.async_note_endpoint_object_offset
+        || supplied.endpoint_send_vtable_offset != expected.endpoint_send_vtable_offset
+        || supplied.sender_arg2 != expected.sender_arg2
+        || supplied.endpoint_send_arg2 != expected.endpoint_send_arg2
+        || supplied.endpoint_send_arg3 != expected.endpoint_send_arg3
+    {
+        Err(SubmissionConfigError::UnexpectedFirmwareKickEndpointConfig)
+    } else {
+        Ok(expected)
+    }
 }
 
 #[cfg(test)]
@@ -515,6 +607,102 @@ mod tests {
                 Err(SubmissionConfigError::UnsupportedTarget)
             );
         }
+    }
+
+    #[test]
+    fn firmware_kick_endpoint_binding_is_exact_and_target_pinned() {
+        for (gpu_gen, gpu_variant) in [
+            (GpuGen::G15, GpuVariant::G),
+            (GpuGen::G15, GpuVariant::S),
+            (GpuGen::G15, GpuVariant::C),
+            (GpuGen::G15, GpuVariant::D),
+            (GpuGen::G16, GpuVariant::G),
+            (GpuGen::G16, GpuVariant::S),
+            (GpuGen::G16, GpuVariant::C),
+            (GpuGen::G17, GpuVariant::P),
+            (GpuGen::G17, GpuVariant::G),
+            (GpuGen::G17, GpuVariant::S),
+            (GpuGen::G17, GpuVariant::C),
+        ] {
+            assert_eq!(
+                validate_firmware_kick_endpoint_config(
+                    gpu_gen,
+                    gpu_variant,
+                    FIRMWARE_KICK_ENDPOINT_CONFIG,
+                ),
+                Ok(FIRMWARE_KICK_ENDPOINT_CONFIG)
+            );
+
+            for unexpected in [
+                FirmwareKickEndpointConfig {
+                    sender_vtable_offset: 0x898,
+                    ..FIRMWARE_KICK_ENDPOINT_CONFIG
+                },
+                FirmwareKickEndpointConfig {
+                    gated_sender_vtable_offset: 0x8a0,
+                    ..FIRMWARE_KICK_ENDPOINT_CONFIG
+                },
+                FirmwareKickEndpointConfig {
+                    endpoint_service_id_offset: 0x80,
+                    ..FIRMWARE_KICK_ENDPOINT_CONFIG
+                },
+                FirmwareKickEndpointConfig {
+                    message_endpoint_id: 0x21,
+                    ..FIRMWARE_KICK_ENDPOINT_CONFIG
+                },
+                FirmwareKickEndpointConfig {
+                    message_endpoint_object_offset: 0x130,
+                    ..FIRMWARE_KICK_ENDPOINT_CONFIG
+                },
+                FirmwareKickEndpointConfig {
+                    async_note_endpoint_id: 0x20,
+                    ..FIRMWARE_KICK_ENDPOINT_CONFIG
+                },
+                FirmwareKickEndpointConfig {
+                    async_note_endpoint_object_offset: 0x128,
+                    ..FIRMWARE_KICK_ENDPOINT_CONFIG
+                },
+                FirmwareKickEndpointConfig {
+                    endpoint_send_vtable_offset: 0x1e0,
+                    ..FIRMWARE_KICK_ENDPOINT_CONFIG
+                },
+                FirmwareKickEndpointConfig {
+                    sender_arg2: 1,
+                    ..FIRMWARE_KICK_ENDPOINT_CONFIG
+                },
+                FirmwareKickEndpointConfig {
+                    endpoint_send_arg2: 1,
+                    ..FIRMWARE_KICK_ENDPOINT_CONFIG
+                },
+                FirmwareKickEndpointConfig {
+                    endpoint_send_arg3: 0,
+                    ..FIRMWARE_KICK_ENDPOINT_CONFIG
+                },
+            ] {
+                assert_eq!(
+                    validate_firmware_kick_endpoint_config(gpu_gen, gpu_variant, unexpected),
+                    Err(SubmissionConfigError::UnexpectedFirmwareKickEndpointConfig)
+                );
+            }
+        }
+
+        for (gpu_gen, gpu_variant) in [
+            (GpuGen::G15, GpuVariant::P),
+            (GpuGen::G16, GpuVariant::P),
+            (GpuGen::G17, GpuVariant::A),
+        ] {
+            assert_eq!(
+                validate_firmware_kick_endpoint_config(
+                    gpu_gen,
+                    gpu_variant,
+                    FIRMWARE_KICK_ENDPOINT_CONFIG,
+                ),
+                Err(SubmissionConfigError::UnsupportedTarget)
+            );
+        }
+
+        assert!(GROUNDED_FIRMWARE_KICK_ENDPOINT_CONFIG_AVAILABLE);
+        assert!(!EXECUTABLE_G15_G17_SUBMISSION_AVAILABLE);
     }
 
     #[test]
