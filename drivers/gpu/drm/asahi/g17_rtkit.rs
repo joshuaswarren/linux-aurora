@@ -14,6 +14,12 @@
 //! disassembly. Keeping the layer disconnected from the existing transport
 //! lets later bring-up validate captured messages without making G17 bootable.
 
+/// Receive-side validation and the proved field encoders are available.
+pub(crate) const GROUNDED_CODEC_AVAILABLE: bool = true;
+/// HELLO/EPMAP payload positions and the complete lifecycle remain unproved,
+/// so no executable Linux transport may consume this codec yet.
+pub(crate) const EXECUTABLE_TRANSPORT_AVAILABLE: bool = false;
+
 /// The complete endpoint set in both recovered G17 firmware roles.
 pub(crate) const EXPECTED_ENDPOINTS: [u8; 4] = [0x00, 0x01, 0x20, 0x21];
 
