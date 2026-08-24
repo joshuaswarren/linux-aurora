@@ -669,6 +669,108 @@ pub(crate) const fn validate_g17s_gfx1_power_transition(
     validate_g17_gfx1_power_transition(G17Gfx1PowerEvidenceTarget::G17S, old, new)
 }
 
+/// Target-specific locations independently establishing the callback-to-ACK
+/// prefix in each pinned G17 GFX1 image.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17Gfx1CallbackAckEvidence {
+    pub(crate) worker_text_offset: u32,
+    pub(crate) release_helper_text_offset: u32,
+    pub(crate) payload_mapper_text_offset: u32,
+    pub(crate) sender_text_offset: u32,
+}
+
+pub(crate) const fn g17_gfx1_callback_ack_evidence(
+    target: G17Gfx1PowerEvidenceTarget,
+) -> G17Gfx1CallbackAckEvidence {
+    match target {
+        G17Gfx1PowerEvidenceTarget::G17P => G17Gfx1CallbackAckEvidence {
+            worker_text_offset: 0x0003_b030,
+            release_helper_text_offset: 0x0003_5484,
+            payload_mapper_text_offset: 0x0003_8dc8,
+            sender_text_offset: 0x0003_dc00,
+        },
+        G17Gfx1PowerEvidenceTarget::G17G => G17Gfx1CallbackAckEvidence {
+            worker_text_offset: 0x0003_ae34,
+            release_helper_text_offset: 0x0003_52e8,
+            payload_mapper_text_offset: 0x0003_8bdc,
+            sender_text_offset: 0x0003_da48,
+        },
+        G17Gfx1PowerEvidenceTarget::G17S => G17Gfx1CallbackAckEvidence {
+            worker_text_offset: 0x0004_0258,
+            release_helper_text_offset: 0x0003_a70c,
+            payload_mapper_text_offset: 0x0003_e000,
+            sender_text_offset: 0x0004_2f00,
+        },
+    }
+}
+
+/// Exact ordered prefix from one firmware power callback through its ACK.
+///
+/// Optional callbacks are skipped when their pointers are null. The release
+/// helper's CASL body is exact, but its matching acquisition and ownership
+/// contract are not. The worker can also run a target-state hook after the ACK;
+/// neither that hook nor any later worker action is represented here.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum G17Gfx1CallbackAckStep {
+    InvokeOptionalPreCallback,
+    InvokeRegisteredCallbacks,
+    InvokeOptionalPostCallback,
+    ReleaseFirmwareLocalObjectCasl,
+    MapCompletionPayload,
+    SendType0bCompletionMessage,
+}
+
+pub(crate) const G17_GFX1_CALLBACK_ACK_PREFIX: [G17Gfx1CallbackAckStep; 6] = [
+    G17Gfx1CallbackAckStep::InvokeOptionalPreCallback,
+    G17Gfx1CallbackAckStep::InvokeRegisteredCallbacks,
+    G17Gfx1CallbackAckStep::InvokeOptionalPostCallback,
+    G17Gfx1CallbackAckStep::ReleaseFirmwareLocalObjectCasl,
+    G17Gfx1CallbackAckStep::MapCompletionPayload,
+    G17Gfx1CallbackAckStep::SendType0bCompletionMessage,
+];
+
+/// High message-type bits ORed with the mapped payload before the send.
+pub(crate) const G17_GFX1_CALLBACK_ACK_MESSAGE_TYPE_BITS: u64 = 0x00b0_0000_0000_0000;
+/// The only sender status for which the worker retries the ACK.
+pub(crate) const G17_GFX1_CALLBACK_ACK_RETRY_STATUS: u32 = 0x8000_000e;
+
+pub(crate) fn validate_g17_gfx1_callback_ack_prefix(
+    _target: G17Gfx1PowerEvidenceTarget,
+    steps: &[G17Gfx1CallbackAckStep],
+) -> bool {
+    steps == G17_GFX1_CALLBACK_ACK_PREFIX
+}
+
+/// Fail-closed results from the common internal-state-to-payload mapper.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum G17Gfx1CallbackAckError {
+    /// Internal state 3 branches to a firmware abort instead of returning.
+    FatalInternalState,
+    /// The firmware's default is zero, but Linux must not accept an unknown.
+    UnprovenInternalState,
+}
+
+/// Decode only independently established internal states and table entries.
+///
+/// The pinned mapper returns zero for other numeric inputs. Rejecting that
+/// default prevents an unknown state from becoming an apparently valid ACK.
+pub(crate) const fn g17_gfx1_callback_ack_payload(
+    _target: G17Gfx1PowerEvidenceTarget,
+    internal_state: u8,
+) -> Result<u16, G17Gfx1CallbackAckError> {
+    match internal_state {
+        3 => Err(G17Gfx1CallbackAckError::FatalInternalState),
+        4 => Ok(3),
+        5 => Ok(0x203),
+        6 | 7 => Ok(0),
+        GFX1_POWER_SLEEP => Ok(0x201),
+        GFX1_POWER_NAP => Ok(0),
+        0x20 => Ok(0x10),
+        GFX1_POWER_INTERMEDIATE_21 => Ok(0x20),
+        _ => Err(G17Gfx1CallbackAckError::UnprovenInternalState),
+    }
+}
+
 /// Exact values observed in the shared G15-G17 host recovery word.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[repr(u32)]
@@ -881,6 +983,104 @@ mod tests {
                 Err(PowerTransitionError::UnprovenTransition)
             );
         }
+    }
+
+    #[test]
+    fn g17_callback_ack_prefix_is_exact_and_target_pinned() {
+        assert_eq!(
+            g17_gfx1_callback_ack_evidence(G17Gfx1PowerEvidenceTarget::G17P),
+            G17Gfx1CallbackAckEvidence {
+                worker_text_offset: 0x0003_b030,
+                release_helper_text_offset: 0x0003_5484,
+                payload_mapper_text_offset: 0x0003_8dc8,
+                sender_text_offset: 0x0003_dc00,
+            }
+        );
+        assert_eq!(
+            g17_gfx1_callback_ack_evidence(G17Gfx1PowerEvidenceTarget::G17G),
+            G17Gfx1CallbackAckEvidence {
+                worker_text_offset: 0x0003_ae34,
+                release_helper_text_offset: 0x0003_52e8,
+                payload_mapper_text_offset: 0x0003_8bdc,
+                sender_text_offset: 0x0003_da48,
+            }
+        );
+        assert_eq!(
+            g17_gfx1_callback_ack_evidence(G17Gfx1PowerEvidenceTarget::G17S),
+            G17Gfx1CallbackAckEvidence {
+                worker_text_offset: 0x0004_0258,
+                release_helper_text_offset: 0x0003_a70c,
+                payload_mapper_text_offset: 0x0003_e000,
+                sender_text_offset: 0x0004_2f00,
+            }
+        );
+
+        for target in G17_GFX1_POWER_EVIDENCE_TARGETS {
+            assert!(validate_g17_gfx1_callback_ack_prefix(
+                target,
+                &G17_GFX1_CALLBACK_ACK_PREFIX
+            ));
+        }
+
+        let mut wrong_order = G17_GFX1_CALLBACK_ACK_PREFIX;
+        wrong_order.swap(2, 3);
+        assert!(!validate_g17_gfx1_callback_ack_prefix(
+            G17Gfx1PowerEvidenceTarget::G17S,
+            &wrong_order
+        ));
+        assert!(!validate_g17_gfx1_callback_ack_prefix(
+            G17Gfx1PowerEvidenceTarget::G17P,
+            &G17_GFX1_CALLBACK_ACK_PREFIX[..5]
+        ));
+
+        let mut wrong_sender = G17_GFX1_CALLBACK_ACK_PREFIX;
+        wrong_sender[5] = G17Gfx1CallbackAckStep::MapCompletionPayload;
+        assert!(!validate_g17_gfx1_callback_ack_prefix(
+            G17Gfx1PowerEvidenceTarget::G17G,
+            &wrong_sender
+        ));
+        assert_eq!(
+            G17_GFX1_CALLBACK_ACK_MESSAGE_TYPE_BITS,
+            0x00b0_0000_0000_0000
+        );
+        assert_eq!(G17_GFX1_CALLBACK_ACK_RETRY_STATUS, 0x8000_000e);
+        assert!(!EXECUTABLE_GFX1_POWER_SEQUENCE_AVAILABLE);
+    }
+
+    #[test]
+    fn g17_callback_ack_payload_mapper_fails_closed() {
+        let exact_cases = [
+            (4, 3),
+            (5, 0x203),
+            (6, 0),
+            (7, 0),
+            (GFX1_POWER_SLEEP, 0x201),
+            (GFX1_POWER_NAP, 0),
+            (0x20, 0x10),
+            (GFX1_POWER_INTERMEDIATE_21, 0x20),
+        ];
+
+        for target in G17_GFX1_POWER_EVIDENCE_TARGETS {
+            for (internal_state, payload) in exact_cases {
+                assert_eq!(
+                    g17_gfx1_callback_ack_payload(target, internal_state),
+                    Ok(payload)
+                );
+            }
+            assert_eq!(
+                g17_gfx1_callback_ack_payload(target, 3),
+                Err(G17Gfx1CallbackAckError::FatalInternalState)
+            );
+            for internal_state in [0, 1, 2, 9, 0x22, u8::MAX] {
+                assert_eq!(
+                    g17_gfx1_callback_ack_payload(target, internal_state),
+                    Err(G17Gfx1CallbackAckError::UnprovenInternalState)
+                );
+            }
+        }
+
+        assert!(!EXECUTABLE_GFX1_POWER_SEQUENCE_AVAILABLE);
+        assert!(!EXECUTABLE_G17_RECOVERY_HANDSHAKE_AVAILABLE);
     }
 
     #[test]
