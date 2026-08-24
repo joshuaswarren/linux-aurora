@@ -399,6 +399,33 @@ pub(crate) enum RecoveryWordState {
     FirmwareStoppedForPostRecovery = 3,
 }
 
+/// G17 host targets with an independently pinned `+0x4ae0` recovery word.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum G17RecoveryLayoutEvidenceTarget {
+    G17P,
+    G17G,
+    G17S,
+}
+
+pub(crate) const G17_RECOVERY_LAYOUT_EVIDENCE_TARGETS: [G17RecoveryLayoutEvidenceTarget; 3] = [
+    G17RecoveryLayoutEvidenceTarget::G17P,
+    G17RecoveryLayoutEvidenceTarget::G17G,
+    G17RecoveryLayoutEvidenceTarget::G17S,
+];
+
+/// Offset from the mapped firmware-state base, not from the host object.
+pub(crate) const G17_RECOVERY_WORD_OFFSET: u32 = 0x4ae0;
+
+pub(crate) const fn g17_recovery_word_offset(
+    target: G17RecoveryLayoutEvidenceTarget,
+) -> u32 {
+    match target {
+        G17RecoveryLayoutEvidenceTarget::G17P
+        | G17RecoveryLayoutEvidenceTarget::G17G
+        | G17RecoveryLayoutEvidenceTarget::G17S => G17_RECOVERY_WORD_OFFSET,
+    }
+}
+
 /// Host-owned recovery phase whose write is directly established.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum HostResumePhase {
@@ -409,6 +436,7 @@ pub(crate) enum HostResumePhase {
 /// Fail-closed recovery-word validation errors.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum RecoveryError {
+    UnexpectedWordOffset,
     UnknownWordValue,
     FirmwareNotStoppedForPhase,
 }
@@ -422,6 +450,19 @@ pub(crate) const fn decode_recovery_word(raw: u32) -> Result<RecoveryWordState, 
         3 => Ok(RecoveryWordState::FirmwareStoppedForPostRecovery),
         _ => Err(RecoveryError::UnknownWordValue),
     }
+}
+
+/// Decode a G17 recovery word only at the exact target-backed location.
+pub(crate) const fn decode_g17_recovery_word_at_offset(
+    target: G17RecoveryLayoutEvidenceTarget,
+    observed_offset: u32,
+    raw: u32,
+) -> Result<RecoveryWordState, RecoveryError> {
+    if observed_offset != g17_recovery_word_offset(target) {
+        return Err(RecoveryError::UnexpectedWordOffset);
+    }
+
+    decode_recovery_word(raw)
 }
 
 /// Return the exact host value for one directly established resume edge.
@@ -625,6 +666,46 @@ mod tests {
         for raw in [4, 0x22, 0x23, u32::MAX] {
             assert_eq!(
                 decode_recovery_word(raw),
+                Err(RecoveryError::UnknownWordValue)
+            );
+        }
+    }
+
+    #[test]
+    fn g17p_recovery_word_uses_the_cross_g17_mapped_state_offset() {
+        assert_eq!(G17_RECOVERY_WORD_OFFSET, 0x4ae0);
+        assert_eq!(
+            G17_RECOVERY_LAYOUT_EVIDENCE_TARGETS,
+            [
+                G17RecoveryLayoutEvidenceTarget::G17P,
+                G17RecoveryLayoutEvidenceTarget::G17G,
+                G17RecoveryLayoutEvidenceTarget::G17S,
+            ]
+        );
+
+        for target in G17_RECOVERY_LAYOUT_EVIDENCE_TARGETS {
+            assert_eq!(g17_recovery_word_offset(target), 0x4ae0);
+            for raw in 0..=3 {
+                assert_eq!(
+                    decode_g17_recovery_word_at_offset(target, 0x4ae0, raw),
+                    Ok(decode_recovery_word(raw).unwrap())
+                );
+            }
+            for wrong_offset in [0, 0x4adc, 0x4ae4, u32::MAX] {
+                assert_eq!(
+                    decode_g17_recovery_word_at_offset(target, wrong_offset, 1),
+                    Err(RecoveryError::UnexpectedWordOffset)
+                );
+            }
+        }
+
+        for raw in [4, 0x22, 0x23, u32::MAX] {
+            assert_eq!(
+                decode_g17_recovery_word_at_offset(
+                    G17RecoveryLayoutEvidenceTarget::G17P,
+                    G17_RECOVERY_WORD_OFFSET,
+                    raw,
+                ),
                 Err(RecoveryError::UnknownWordValue)
             );
         }
