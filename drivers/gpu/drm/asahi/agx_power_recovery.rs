@@ -45,6 +45,43 @@ pub(crate) const EXECUTABLE_GFX1_POWER_SEQUENCE_AVAILABLE: bool = false;
 /// Linux must not execute G17 recovery from this host-write subset.
 pub(crate) const EXECUTABLE_G17_RECOVERY_HANDSHAKE_AVAILABLE: bool = false;
 
+/// Pinned G17 host targets whose `halGetPMConfig()` return block is exact.
+///
+/// The six fields remain semantically opaque. In particular, the G17P block
+/// follows its HAL200 implementation rather than the dual-role G17 topology,
+/// while the pinned G17G and G17S hosts share the HAL300 block.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum G17PmConfigEvidenceTarget {
+    G17P,
+    G17G,
+    G17S,
+}
+
+pub(crate) const G17_PM_CONFIG_EVIDENCE_TARGETS: [G17PmConfigEvidenceTarget; 3] = [
+    G17PmConfigEvidenceTarget::G17P,
+    G17PmConfigEvidenceTarget::G17G,
+    G17PmConfigEvidenceTarget::G17S,
+];
+
+/// Exact opaque six-u64 blocks returned by the pinned host implementations.
+///
+/// These constants are diagnostic evidence only. Unknown field semantics and
+/// the absence of pinned G17A/G17C host witnesses keep them out of executable
+/// power or init-data paths.
+pub(crate) const G17_HAL200_PM_CONFIG_OPAQUE: [u64; 6] = [0x4, 0x4, 0x1800, 0x8, 0x8, 0x10];
+pub(crate) const G17_HAL300_PM_CONFIG_OPAQUE: [u64; 6] = [0x10, 0x40, 0x1800, 0x8, 0x8, 0x40];
+
+pub(crate) const fn g17_pm_config_for_evidence_target(
+    target: G17PmConfigEvidenceTarget,
+) -> &'static [u64; 6] {
+    match target {
+        G17PmConfigEvidenceTarget::G17P => &G17_HAL200_PM_CONFIG_OPAQUE,
+        G17PmConfigEvidenceTarget::G17G | G17PmConfigEvidenceTarget::G17S => {
+            &G17_HAL300_PM_CONFIG_OPAQUE
+        }
+    }
+}
+
 /// G17S GFX1 internal power states whose numeric names are string-confirmed.
 pub(crate) const GFX1_POWER_SLEEP: u8 = 0x08;
 pub(crate) const GFX1_POWER_NAP: u8 = 0x10;
@@ -562,6 +599,32 @@ mod tests {
         for event in [0, 0x21, 0x24, u8::MAX] {
             assert!(!validate_g17s_gfx1_recovery_power_event(event));
         }
+    }
+
+    #[test]
+    fn g17_pm_config_follows_the_proven_hal_boundary() {
+        assert_eq!(
+            g17_pm_config_for_evidence_target(G17PmConfigEvidenceTarget::G17P),
+            &G17_HAL200_PM_CONFIG_OPAQUE
+        );
+        for target in [
+            G17PmConfigEvidenceTarget::G17G,
+            G17PmConfigEvidenceTarget::G17S,
+        ] {
+            assert_eq!(
+                g17_pm_config_for_evidence_target(target),
+                &G17_HAL300_PM_CONFIG_OPAQUE
+            );
+        }
+        assert_ne!(G17_HAL200_PM_CONFIG_OPAQUE, G17_HAL300_PM_CONFIG_OPAQUE);
+        assert_eq!(
+            G17_PM_CONFIG_EVIDENCE_TARGETS,
+            [
+                G17PmConfigEvidenceTarget::G17P,
+                G17PmConfigEvidenceTarget::G17G,
+                G17PmConfigEvidenceTarget::G17S,
+            ]
+        );
     }
 
     #[test]
