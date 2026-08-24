@@ -103,6 +103,51 @@ pub(crate) struct FirmwareKickEndpointConfig {
     pub(crate) endpoint_send_arg3: u8,
 }
 
+/// Exact host-side ordering around one data-master ring publication.
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub(crate) enum DataMasterRingPublicationStep {
+    /// Select the slot at the current write index after checking for full.
+    SelectNextEntry,
+    /// The opaque, target-specific command entry has been fully encoded.
+    RecordEncoded,
+    /// Execute the host's inner-shareable data memory barrier.
+    DmbIsh,
+    /// Read the current shared write index again.
+    ReadWriteIndex,
+    /// Increment the write index and truncate it to eight bits.
+    IncrementAndWrap8,
+    /// Store the new shared write index before notifying firmware.
+    StoreWriteIndex,
+}
+
+/// Exact host-visible geometry and publication contract of a data-master ring.
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub(crate) struct DataMasterRingConfig {
+    pub(crate) shared_control_object_offset: u8,
+    pub(crate) entries_object_offset: u8,
+    pub(crate) read_index_offset: u8,
+    pub(crate) write_index_offset: u8,
+    pub(crate) get_read_index_vtable_offset: u8,
+    pub(crate) get_write_index_vtable_offset: u8,
+    pub(crate) set_write_index_vtable_offset: u8,
+    pub(crate) entry_stride: u8,
+    pub(crate) index_count: u16,
+    pub(crate) usable_entry_count: u16,
+    pub(crate) cold_init_control_count: u8,
+    pub(crate) publication_steps: [DataMasterRingPublicationStep; 6],
+}
+
+/// Pure result of applying the host's full/wrap calculation to one ring state.
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub(crate) struct DataMasterRingNextEntry {
+    /// Byte offset from the backing pointer loaded at ring object +0x18.
+    pub(crate) entry_offset_from_entries_base: u16,
+    pub(crate) published_write_index: u8,
+}
+
 /// Refusals made by the target-pinned SKSM submission preflight.
 #[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -117,6 +162,14 @@ pub(crate) enum SubmissionConfigError {
     FirmwareMessageTypeOutOfRange,
     /// The supplied endpoint binding differs from the target's exact host values.
     UnexpectedFirmwareKickEndpointConfig,
+    /// The supplied data-master ring contract differs from exact host values.
+    UnexpectedDataMasterRingConfig,
+    /// The shared read index is outside the host's eight-bit ring index space.
+    DataMasterReadIndexOutOfRange,
+    /// The shared write index is outside the host's eight-bit ring index space.
+    DataMasterWriteIndexOutOfRange,
+    /// Advancing the write index would collide with the shared read index.
+    DataMasterRingFull,
 }
 
 /// A pure submission configuration validator is available for the exact
@@ -127,9 +180,13 @@ pub(crate) const GROUNDED_SKSM_KICK_QUEUE_ID_CONFIG_AVAILABLE: bool = true;
 /// by the firmware-kick word encoder.
 #[allow(dead_code)]
 pub(crate) const GROUNDED_FIRMWARE_KICK_ENDPOINT_CONFIG_AVAILABLE: bool = true;
-/// Queue construction, transport selection on dual-stack targets, shared
-/// memory ownership, and the complete firmware notification sequence are not
-/// modeled, so command submission must remain disconnected from this helper.
+/// A pure data-master ring geometry and publication validator is available for
+/// every target supported by the firmware-kick word encoder.
+#[allow(dead_code)]
+pub(crate) const GROUNDED_DATA_MASTER_RING_CONFIG_AVAILABLE: bool = true;
+/// Backing-allocation selection/cacheability, firmware consumer ownership,
+/// transport selection on dual-stack targets, and teardown are not modeled,
+/// so command submission must remain disconnected from these helpers.
 #[allow(dead_code)]
 pub(crate) const EXECUTABLE_G15_G17_SUBMISSION_AVAILABLE: bool = false;
 
@@ -155,6 +212,32 @@ const FIRMWARE_KICK_ENDPOINT_CONFIG: FirmwareKickEndpointConfig = FirmwareKickEn
     sender_arg2: 0,
     endpoint_send_arg2: 0,
     endpoint_send_arg3: 1,
+};
+const DATA_MASTER_RING_PUBLICATION_STEPS: [DataMasterRingPublicationStep; 6] = [
+    DataMasterRingPublicationStep::SelectNextEntry,
+    DataMasterRingPublicationStep::RecordEncoded,
+    DataMasterRingPublicationStep::DmbIsh,
+    DataMasterRingPublicationStep::ReadWriteIndex,
+    DataMasterRingPublicationStep::IncrementAndWrap8,
+    DataMasterRingPublicationStep::StoreWriteIndex,
+];
+const DATA_MASTER_RING_CONFIG_SINGLE_ROLE: DataMasterRingConfig = DataMasterRingConfig {
+    shared_control_object_offset: 0x08,
+    entries_object_offset: 0x18,
+    read_index_offset: 0x00,
+    write_index_offset: 0x20,
+    get_read_index_vtable_offset: 0x30,
+    get_write_index_vtable_offset: 0x38,
+    set_write_index_vtable_offset: 0x10,
+    entry_stride: 0x18,
+    index_count: 0x100,
+    usable_entry_count: 0xff,
+    cold_init_control_count: 12,
+    publication_steps: DATA_MASTER_RING_PUBLICATION_STEPS,
+};
+const DATA_MASTER_RING_CONFIG_DUAL_ROLE: DataMasterRingConfig = DataMasterRingConfig {
+    cold_init_control_count: 24,
+    ..DATA_MASTER_RING_CONFIG_SINGLE_ROLE
 };
 
 /// Identity and userspace-visible architecture axes decoded from GPU ID MMIO.
@@ -387,6 +470,104 @@ pub(crate) const fn validate_firmware_kick_endpoint_config(
     } else {
         Ok(expected)
     }
+}
+
+/// Return the exact host-side data-master ring contract for one target.
+///
+/// The pinned G15G/X, G16G/X, G17P, G17G and G17X hosts all use 256 indices,
+/// reserve one slot to distinguish full from empty, and address 24-byte entries
+/// with the current write index. The host initializes 12 shared ring controls
+/// on single-role G15/G16 and 24 on dual-role G17. Publication is ordered as
+/// recorded here, including the `dmb ish` before the write-index update.
+///
+/// This deliberately does not identify which cached or uncached firmware-data
+/// allocation backs the ring, prove firmware-side consumer ownership, or make
+/// the host object offsets an executable ABI.
+#[allow(dead_code)]
+pub(crate) const fn data_master_ring_config(
+    gpu_gen: GpuGen,
+    gpu_variant: GpuVariant,
+) -> Option<DataMasterRingConfig> {
+    use GpuGen::*;
+    use GpuVariant::*;
+
+    match (gpu_gen, gpu_variant) {
+        (G15, G | S | C | D) | (G16, G | S | C) => Some(DATA_MASTER_RING_CONFIG_SINGLE_ROLE),
+        (G17, P | G | S | C) => Some(DATA_MASTER_RING_CONFIG_DUAL_ROLE),
+        _ => None,
+    }
+}
+
+/// Validate an externally recovered host-side data-master ring contract.
+#[allow(dead_code)]
+pub(crate) const fn validate_data_master_ring_config(
+    gpu_gen: GpuGen,
+    gpu_variant: GpuVariant,
+    supplied: DataMasterRingConfig,
+) -> Result<DataMasterRingConfig, SubmissionConfigError> {
+    let Some(expected) = data_master_ring_config(gpu_gen, gpu_variant) else {
+        return Err(SubmissionConfigError::UnsupportedTarget);
+    };
+
+    if supplied.shared_control_object_offset != expected.shared_control_object_offset
+        || supplied.entries_object_offset != expected.entries_object_offset
+        || supplied.read_index_offset != expected.read_index_offset
+        || supplied.write_index_offset != expected.write_index_offset
+        || supplied.get_read_index_vtable_offset != expected.get_read_index_vtable_offset
+        || supplied.get_write_index_vtable_offset != expected.get_write_index_vtable_offset
+        || supplied.set_write_index_vtable_offset != expected.set_write_index_vtable_offset
+        || supplied.entry_stride != expected.entry_stride
+        || supplied.index_count != expected.index_count
+        || supplied.usable_entry_count != expected.usable_entry_count
+        || supplied.cold_init_control_count != expected.cold_init_control_count
+        || !matches!(
+            supplied.publication_steps,
+            [
+                DataMasterRingPublicationStep::SelectNextEntry,
+                DataMasterRingPublicationStep::RecordEncoded,
+                DataMasterRingPublicationStep::DmbIsh,
+                DataMasterRingPublicationStep::ReadWriteIndex,
+                DataMasterRingPublicationStep::IncrementAndWrap8,
+                DataMasterRingPublicationStep::StoreWriteIndex,
+            ]
+        )
+    {
+        Err(SubmissionConfigError::UnexpectedDataMasterRingConfig)
+    } else {
+        Ok(expected)
+    }
+}
+
+/// Apply the exact host full/wrap and entry-offset calculation to ring state.
+///
+/// This is a pure diagnostic. It neither reserves an entry nor publishes an
+/// index, and therefore carries no shared-memory ownership claim.
+#[allow(dead_code)]
+pub(crate) const fn data_master_ring_next_entry(
+    gpu_gen: GpuGen,
+    gpu_variant: GpuVariant,
+    read_index: u16,
+    write_index: u16,
+) -> Result<DataMasterRingNextEntry, SubmissionConfigError> {
+    let Some(config) = data_master_ring_config(gpu_gen, gpu_variant) else {
+        return Err(SubmissionConfigError::UnsupportedTarget);
+    };
+    if read_index >= config.index_count {
+        return Err(SubmissionConfigError::DataMasterReadIndexOutOfRange);
+    }
+    if write_index >= config.index_count {
+        return Err(SubmissionConfigError::DataMasterWriteIndexOutOfRange);
+    }
+
+    let published_write_index = write_index.wrapping_add(1) as u8;
+    if published_write_index == read_index as u8 {
+        return Err(SubmissionConfigError::DataMasterRingFull);
+    }
+
+    Ok(DataMasterRingNextEntry {
+        entry_offset_from_entries_base: write_index * config.entry_stride as u16,
+        published_write_index,
+    })
 }
 
 #[cfg(test)]
@@ -702,6 +883,159 @@ mod tests {
         }
 
         assert!(GROUNDED_FIRMWARE_KICK_ENDPOINT_CONFIG_AVAILABLE);
+        assert!(!EXECUTABLE_G15_G17_SUBMISSION_AVAILABLE);
+    }
+
+    #[test]
+    fn data_master_ring_geometry_and_publication_are_exact() {
+        for (gpu_gen, gpu_variant, cold_init_control_count) in [
+            (GpuGen::G15, GpuVariant::G, 12),
+            (GpuGen::G15, GpuVariant::S, 12),
+            (GpuGen::G15, GpuVariant::C, 12),
+            (GpuGen::G15, GpuVariant::D, 12),
+            (GpuGen::G16, GpuVariant::G, 12),
+            (GpuGen::G16, GpuVariant::S, 12),
+            (GpuGen::G16, GpuVariant::C, 12),
+            (GpuGen::G17, GpuVariant::P, 24),
+            (GpuGen::G17, GpuVariant::G, 24),
+            (GpuGen::G17, GpuVariant::S, 24),
+            (GpuGen::G17, GpuVariant::C, 24),
+        ] {
+            let config = data_master_ring_config(gpu_gen, gpu_variant)
+                .expect("target should have a pinned data-master ring contract");
+            assert_eq!(config.shared_control_object_offset, 0x08);
+            assert_eq!(config.entries_object_offset, 0x18);
+            assert_eq!(config.read_index_offset, 0x00);
+            assert_eq!(config.write_index_offset, 0x20);
+            assert_eq!(config.get_read_index_vtable_offset, 0x30);
+            assert_eq!(config.get_write_index_vtable_offset, 0x38);
+            assert_eq!(config.set_write_index_vtable_offset, 0x10);
+            assert_eq!(config.entry_stride, 0x18);
+            assert_eq!(config.index_count, 0x100);
+            assert_eq!(config.usable_entry_count, 0xff);
+            assert_eq!(config.cold_init_control_count, cold_init_control_count);
+            assert_eq!(config.publication_steps, DATA_MASTER_RING_PUBLICATION_STEPS);
+            assert_eq!(
+                validate_data_master_ring_config(gpu_gen, gpu_variant, config),
+                Ok(config)
+            );
+
+            for unexpected in [
+                DataMasterRingConfig {
+                    shared_control_object_offset: 0x10,
+                    ..config
+                },
+                DataMasterRingConfig {
+                    entries_object_offset: 0x20,
+                    ..config
+                },
+                DataMasterRingConfig {
+                    read_index_offset: 0x04,
+                    ..config
+                },
+                DataMasterRingConfig {
+                    write_index_offset: 0x24,
+                    ..config
+                },
+                DataMasterRingConfig {
+                    get_read_index_vtable_offset: 0x28,
+                    ..config
+                },
+                DataMasterRingConfig {
+                    get_write_index_vtable_offset: 0x30,
+                    ..config
+                },
+                DataMasterRingConfig {
+                    set_write_index_vtable_offset: 0x18,
+                    ..config
+                },
+                DataMasterRingConfig {
+                    entry_stride: 0x20,
+                    ..config
+                },
+                DataMasterRingConfig {
+                    index_count: 0xff,
+                    ..config
+                },
+                DataMasterRingConfig {
+                    usable_entry_count: 0x100,
+                    ..config
+                },
+                DataMasterRingConfig {
+                    cold_init_control_count: cold_init_control_count + 1,
+                    ..config
+                },
+                DataMasterRingConfig {
+                    publication_steps: [
+                        DataMasterRingPublicationStep::SelectNextEntry,
+                        DataMasterRingPublicationStep::RecordEncoded,
+                        DataMasterRingPublicationStep::ReadWriteIndex,
+                        DataMasterRingPublicationStep::DmbIsh,
+                        DataMasterRingPublicationStep::IncrementAndWrap8,
+                        DataMasterRingPublicationStep::StoreWriteIndex,
+                    ],
+                    ..config
+                },
+            ] {
+                assert_eq!(
+                    validate_data_master_ring_config(gpu_gen, gpu_variant, unexpected),
+                    Err(SubmissionConfigError::UnexpectedDataMasterRingConfig)
+                );
+            }
+
+            assert_eq!(
+                data_master_ring_next_entry(gpu_gen, gpu_variant, 0, 0),
+                Ok(DataMasterRingNextEntry {
+                    entry_offset_from_entries_base: 0,
+                    published_write_index: 1,
+                })
+            );
+            assert_eq!(
+                data_master_ring_next_entry(gpu_gen, gpu_variant, 1, 0xff),
+                Ok(DataMasterRingNextEntry {
+                    entry_offset_from_entries_base: 0x17e8,
+                    published_write_index: 0,
+                })
+            );
+            assert_eq!(
+                data_master_ring_next_entry(gpu_gen, gpu_variant, 0, 0xff),
+                Err(SubmissionConfigError::DataMasterRingFull)
+            );
+            assert_eq!(
+                data_master_ring_next_entry(gpu_gen, gpu_variant, 0x0b, 0x0a),
+                Err(SubmissionConfigError::DataMasterRingFull)
+            );
+            assert_eq!(
+                data_master_ring_next_entry(gpu_gen, gpu_variant, 0x100, 0),
+                Err(SubmissionConfigError::DataMasterReadIndexOutOfRange)
+            );
+            assert_eq!(
+                data_master_ring_next_entry(gpu_gen, gpu_variant, 0, 0x100),
+                Err(SubmissionConfigError::DataMasterWriteIndexOutOfRange)
+            );
+        }
+
+        for (gpu_gen, gpu_variant) in [
+            (GpuGen::G15, GpuVariant::P),
+            (GpuGen::G16, GpuVariant::P),
+            (GpuGen::G17, GpuVariant::A),
+        ] {
+            assert_eq!(data_master_ring_config(gpu_gen, gpu_variant), None);
+            assert_eq!(
+                validate_data_master_ring_config(
+                    gpu_gen,
+                    gpu_variant,
+                    DATA_MASTER_RING_CONFIG_SINGLE_ROLE,
+                ),
+                Err(SubmissionConfigError::UnsupportedTarget)
+            );
+            assert_eq!(
+                data_master_ring_next_entry(gpu_gen, gpu_variant, 0, 0),
+                Err(SubmissionConfigError::UnsupportedTarget)
+            );
+        }
+
+        assert!(GROUNDED_DATA_MASTER_RING_CONFIG_AVAILABLE);
         assert!(!EXECUTABLE_G15_G17_SUBMISSION_AVAILABLE);
     }
 
