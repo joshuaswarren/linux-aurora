@@ -14,6 +14,7 @@ mod event;
 mod file;
 mod float;
 mod fw;
+mod g17_boot;
 mod gem;
 mod gpu;
 mod hw;
