@@ -820,10 +820,110 @@ pub(crate) const G17_HOST_GFX1_CALLBACK_MESSAGE_TYPE: u8 = 0x0b;
 pub(crate) const G17_HOST_MANAGEMENT_REMOTE_STATE_WORD_OFFSET: u32 = 0x108;
 pub(crate) const G17_HOST_RTBUDDY_IOP_STATUS_WORD_OFFSET: u32 = 0x158;
 
-/// The firmware sender loads its endpoint argument from callback-object +8.
-/// The pinned static corpus does not establish that this value is management
-/// endpoint 0 for every callback, so the end-to-end sender route stays closed.
-pub(crate) const G17_GFX1_CALLBACK_MANAGEMENT_ENDPOINT_LINK_PROVEN: bool = false;
+/// Target-specific GFX1 text offsets proving the callback endpoint dataflow.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17Gfx1CallbackEndpointEvidence {
+    pub(crate) endpoint_request_store_text_offset: u32,
+    pub(crate) endpoint_allocator_call_text_offset: u32,
+    pub(crate) endpoint_allocator_sentinel_compare_text_offset: u32,
+    pub(crate) endpoint_allocator_dynamic_store_text_offset: u32,
+    pub(crate) endpoint_result_load_text_offset: u32,
+    pub(crate) endpoint_handle_shift_text_offset: u32,
+    pub(crate) callback_endpoint_store_text_offset: u32,
+    pub(crate) callback_registration_load_text_offset: u32,
+    pub(crate) callback_registration_context_text_offset: u32,
+    pub(crate) callback_handler_text_offset: u32,
+    pub(crate) callback_context_store_text_offset: u32,
+    pub(crate) completion_context_load_text_offset: u32,
+    pub(crate) completion_endpoint_load_text_offset: u32,
+    pub(crate) completion_send_call_text_offset: u32,
+}
+
+pub(crate) const G17_GFX1_CALLBACK_REQUESTED_ENDPOINT_SLOT: u8 = 0;
+pub(crate) const G17_GFX1_CALLBACK_DYNAMIC_ENDPOINT_SENTINEL: u8 = 0xff;
+pub(crate) const G17_GFX1_CALLBACK_ENDPOINT_HANDLE_SHIFT: u32 = 16;
+pub(crate) const G17_GFX1_CALLBACK_ENDPOINT_FIELD_OFFSET: u32 = 8;
+pub(crate) const G17_GFX1_CALLBACK_CONTEXT_FIELD_OFFSET: u32 = 0x40;
+
+/// The exact constructors request endpoint slot 0, not the allocator's 0xff
+/// dynamic-slot sentinel. The successful path therefore retains zero, shifts
+/// it by 16, stores it at callback-object +8, registers the same object as the
+/// handler context, and later reloads that zero for the completion sender.
+pub(crate) const G17_GFX1_CALLBACK_MANAGEMENT_ENDPOINT_LINK_PROVEN: bool = true;
+
+pub(crate) const fn g17_gfx1_callback_endpoint_evidence(
+    target: G17Gfx1PowerEvidenceTarget,
+) -> G17Gfx1CallbackEndpointEvidence {
+    match target {
+        G17Gfx1PowerEvidenceTarget::G17P => G17Gfx1CallbackEndpointEvidence {
+            endpoint_request_store_text_offset: 0x0003_2d7c,
+            endpoint_allocator_call_text_offset: 0x0003_2d80,
+            endpoint_allocator_sentinel_compare_text_offset: 0x0003_6c70,
+            endpoint_allocator_dynamic_store_text_offset: 0x0003_6cc4,
+            endpoint_result_load_text_offset: 0x0003_2da4,
+            endpoint_handle_shift_text_offset: 0x0003_2e84,
+            callback_endpoint_store_text_offset: 0x0003_2ea0,
+            callback_registration_load_text_offset: 0x0003_2f20,
+            callback_registration_context_text_offset: 0x0003_e088,
+            callback_handler_text_offset: 0x0003_89e4,
+            callback_context_store_text_offset: 0x0003_8af0,
+            completion_context_load_text_offset: 0x0003_b184,
+            completion_endpoint_load_text_offset: 0x0003_b198,
+            completion_send_call_text_offset: 0x0003_b1a0,
+        },
+        G17Gfx1PowerEvidenceTarget::G17G => G17Gfx1CallbackEndpointEvidence {
+            endpoint_request_store_text_offset: 0x0003_2be8,
+            endpoint_allocator_call_text_offset: 0x0003_2bec,
+            endpoint_allocator_sentinel_compare_text_offset: 0x0003_6a84,
+            endpoint_allocator_dynamic_store_text_offset: 0x0003_6ad8,
+            endpoint_result_load_text_offset: 0x0003_2c10,
+            endpoint_handle_shift_text_offset: 0x0003_2cec,
+            callback_endpoint_store_text_offset: 0x0003_2d08,
+            callback_registration_load_text_offset: 0x0003_2d88,
+            callback_registration_context_text_offset: 0x0003_df28,
+            callback_handler_text_offset: 0x0003_87f8,
+            callback_context_store_text_offset: 0x0003_8904,
+            completion_context_load_text_offset: 0x0003_af88,
+            completion_endpoint_load_text_offset: 0x0003_af9c,
+            completion_send_call_text_offset: 0x0003_afa4,
+        },
+        G17Gfx1PowerEvidenceTarget::G17S => G17Gfx1CallbackEndpointEvidence {
+            endpoint_request_store_text_offset: 0x0003_800c,
+            endpoint_allocator_call_text_offset: 0x0003_8010,
+            endpoint_allocator_sentinel_compare_text_offset: 0x0003_bea8,
+            endpoint_allocator_dynamic_store_text_offset: 0x0003_befc,
+            endpoint_result_load_text_offset: 0x0003_8034,
+            endpoint_handle_shift_text_offset: 0x0003_8110,
+            callback_endpoint_store_text_offset: 0x0003_812c,
+            callback_registration_load_text_offset: 0x0003_81ac,
+            callback_registration_context_text_offset: 0x0004_33c0,
+            callback_handler_text_offset: 0x0003_dc1c,
+            callback_context_store_text_offset: 0x0003_dd28,
+            completion_context_load_text_offset: 0x0004_03ac,
+            completion_endpoint_load_text_offset: 0x0004_03c0,
+            completion_send_call_text_offset: 0x0004_03c8,
+        },
+    }
+}
+
+/// Validate the complete static value chain without registering an endpoint
+/// or sending a management message.
+pub(crate) const fn g17_gfx1_callback_endpoint_link_is_exact(
+    _target: G17Gfx1PowerEvidenceTarget,
+    requested_slot: u8,
+    allocator_result_slot: u8,
+    callback_endpoint_handle: u32,
+    registration_endpoint_handle: u32,
+    completion_endpoint_handle: u32,
+) -> bool {
+    requested_slot == G17_GFX1_CALLBACK_REQUESTED_ENDPOINT_SLOT
+        && requested_slot != G17_GFX1_CALLBACK_DYNAMIC_ENDPOINT_SENTINEL
+        && allocator_result_slot == requested_slot
+        && callback_endpoint_handle
+            == (allocator_result_slot as u32) << G17_GFX1_CALLBACK_ENDPOINT_HANDLE_SHIFT
+        && registration_endpoint_handle == callback_endpoint_handle
+        && completion_endpoint_handle == callback_endpoint_handle
+}
 
 pub(crate) const fn g17_host_management_route_evidence(
     target: G17Gfx1PowerEvidenceTarget,
@@ -1208,7 +1308,101 @@ mod tests {
         assert_eq!(G17_HOST_GFX1_CALLBACK_MESSAGE_TYPE, 0xb);
         assert_eq!(G17_HOST_MANAGEMENT_REMOTE_STATE_WORD_OFFSET, 0x108);
         assert_eq!(G17_HOST_RTBUDDY_IOP_STATUS_WORD_OFFSET, 0x158);
-        assert!(!G17_GFX1_CALLBACK_MANAGEMENT_ENDPOINT_LINK_PROVEN);
+        assert!(G17_GFX1_CALLBACK_MANAGEMENT_ENDPOINT_LINK_PROVEN);
+        assert!(!EXECUTABLE_GFX1_POWER_SEQUENCE_AVAILABLE);
+        assert!(!EXECUTABLE_G17_RECOVERY_HANDSHAKE_AVAILABLE);
+    }
+
+    #[test]
+    fn g17_gfx1_callback_endpoint_zero_dataflow_is_target_pinned() {
+        let evidence = [
+            (
+                G17Gfx1PowerEvidenceTarget::G17P,
+                G17Gfx1CallbackEndpointEvidence {
+                    endpoint_request_store_text_offset: 0x0003_2d7c,
+                    endpoint_allocator_call_text_offset: 0x0003_2d80,
+                    endpoint_allocator_sentinel_compare_text_offset: 0x0003_6c70,
+                    endpoint_allocator_dynamic_store_text_offset: 0x0003_6cc4,
+                    endpoint_result_load_text_offset: 0x0003_2da4,
+                    endpoint_handle_shift_text_offset: 0x0003_2e84,
+                    callback_endpoint_store_text_offset: 0x0003_2ea0,
+                    callback_registration_load_text_offset: 0x0003_2f20,
+                    callback_registration_context_text_offset: 0x0003_e088,
+                    callback_handler_text_offset: 0x0003_89e4,
+                    callback_context_store_text_offset: 0x0003_8af0,
+                    completion_context_load_text_offset: 0x0003_b184,
+                    completion_endpoint_load_text_offset: 0x0003_b198,
+                    completion_send_call_text_offset: 0x0003_b1a0,
+                },
+            ),
+            (
+                G17Gfx1PowerEvidenceTarget::G17G,
+                G17Gfx1CallbackEndpointEvidence {
+                    endpoint_request_store_text_offset: 0x0003_2be8,
+                    endpoint_allocator_call_text_offset: 0x0003_2bec,
+                    endpoint_allocator_sentinel_compare_text_offset: 0x0003_6a84,
+                    endpoint_allocator_dynamic_store_text_offset: 0x0003_6ad8,
+                    endpoint_result_load_text_offset: 0x0003_2c10,
+                    endpoint_handle_shift_text_offset: 0x0003_2cec,
+                    callback_endpoint_store_text_offset: 0x0003_2d08,
+                    callback_registration_load_text_offset: 0x0003_2d88,
+                    callback_registration_context_text_offset: 0x0003_df28,
+                    callback_handler_text_offset: 0x0003_87f8,
+                    callback_context_store_text_offset: 0x0003_8904,
+                    completion_context_load_text_offset: 0x0003_af88,
+                    completion_endpoint_load_text_offset: 0x0003_af9c,
+                    completion_send_call_text_offset: 0x0003_afa4,
+                },
+            ),
+            (
+                G17Gfx1PowerEvidenceTarget::G17S,
+                G17Gfx1CallbackEndpointEvidence {
+                    endpoint_request_store_text_offset: 0x0003_800c,
+                    endpoint_allocator_call_text_offset: 0x0003_8010,
+                    endpoint_allocator_sentinel_compare_text_offset: 0x0003_bea8,
+                    endpoint_allocator_dynamic_store_text_offset: 0x0003_befc,
+                    endpoint_result_load_text_offset: 0x0003_8034,
+                    endpoint_handle_shift_text_offset: 0x0003_8110,
+                    callback_endpoint_store_text_offset: 0x0003_812c,
+                    callback_registration_load_text_offset: 0x0003_81ac,
+                    callback_registration_context_text_offset: 0x0004_33c0,
+                    callback_handler_text_offset: 0x0003_dc1c,
+                    callback_context_store_text_offset: 0x0003_dd28,
+                    completion_context_load_text_offset: 0x0004_03ac,
+                    completion_endpoint_load_text_offset: 0x0004_03c0,
+                    completion_send_call_text_offset: 0x0004_03c8,
+                },
+            ),
+        ];
+
+        for (target, exact) in evidence {
+            assert_eq!(g17_gfx1_callback_endpoint_evidence(target), exact);
+            assert!(g17_gfx1_callback_endpoint_link_is_exact(
+                target, 0, 0, 0, 0, 0
+            ));
+            assert!(!g17_gfx1_callback_endpoint_link_is_exact(
+                target, 0xff, 0, 0, 0, 0
+            ));
+            assert!(!g17_gfx1_callback_endpoint_link_is_exact(
+                target, 0, 1, 1 << 16, 1 << 16, 1 << 16
+            ));
+            assert!(!g17_gfx1_callback_endpoint_link_is_exact(
+                target, 0, 0, 1, 0, 0
+            ));
+            assert!(!g17_gfx1_callback_endpoint_link_is_exact(
+                target, 0, 0, 0, 1, 0
+            ));
+            assert!(!g17_gfx1_callback_endpoint_link_is_exact(
+                target, 0, 0, 0, 0, 1
+            ));
+        }
+
+        assert_eq!(G17_GFX1_CALLBACK_REQUESTED_ENDPOINT_SLOT, 0);
+        assert_eq!(G17_GFX1_CALLBACK_DYNAMIC_ENDPOINT_SENTINEL, 0xff);
+        assert_eq!(G17_GFX1_CALLBACK_ENDPOINT_HANDLE_SHIFT, 16);
+        assert_eq!(G17_GFX1_CALLBACK_ENDPOINT_FIELD_OFFSET, 8);
+        assert_eq!(G17_GFX1_CALLBACK_CONTEXT_FIELD_OFFSET, 0x40);
+        assert!(G17_GFX1_CALLBACK_MANAGEMENT_ENDPOINT_LINK_PROVEN);
         assert!(!EXECUTABLE_GFX1_POWER_SEQUENCE_AVAILABLE);
         assert!(!EXECUTABLE_G17_RECOVERY_HANDSHAKE_AVAILABLE);
     }
@@ -1268,7 +1462,7 @@ mod tests {
             G17_HOST_MANAGEMENT_REMOTE_STATE_WORD_OFFSET,
             G17_HOST_RTBUDDY_IOP_STATUS_WORD_OFFSET
         );
-        assert!(!G17_GFX1_CALLBACK_MANAGEMENT_ENDPOINT_LINK_PROVEN);
+        assert!(G17_GFX1_CALLBACK_MANAGEMENT_ENDPOINT_LINK_PROVEN);
         assert!(!EXECUTABLE_GFX1_POWER_SEQUENCE_AVAILABLE);
         assert!(!EXECUTABLE_G17_RECOVERY_HANDSHAKE_AVAILABLE);
     }
