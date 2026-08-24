@@ -82,6 +82,75 @@ pub(crate) const fn g17_pm_config_for_evidence_target(
     }
 }
 
+/// One raw `{ frequency, voltage }` record from the captured T6050 ADT.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct T6050PerfState {
+    pub(crate) freq_hz: u32,
+    pub(crate) volt_mv: u32,
+}
+
+/// Exact shape of the captured T6050/G17S main performance-state properties.
+pub(crate) const T6050_G17S_PERF_STATE_COUNT: u32 = 14;
+pub(crate) const T6050_G17S_PERF_STATE_TABLE_COUNT: u32 = 2;
+const T6050_G17S_MAIN_PERF_STATE_RECORDS: usize =
+    T6050_G17S_PERF_STATE_COUNT as usize * T6050_G17S_PERF_STATE_TABLE_COUNT as usize;
+
+/// Fail-closed validation errors for the captured T6050 `*1` mirror contract.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum T6050PerfStateMirrorError {
+    UnexpectedPerfStateCount,
+    UnexpectedPerfStateTableCount,
+    UnexpectedMainCoreShape,
+    UnexpectedMainSramShape,
+    UnexpectedCoreMirrorShape,
+    UnexpectedSramMirrorShape,
+    CoreMirrorMismatch,
+    SramMirrorMismatch,
+}
+
+/// Validate the exact captured T6050/G17S `perf-states1` mirror relationship.
+///
+/// `perf-states1` and `perf-states-sram1` duplicate table 1, the second half
+/// of their corresponding two-table main properties. This proves neither a
+/// consumer nor a third power domain, so this function only validates input.
+pub(crate) fn validate_t6050_g17s_perf_state_mirrors(
+    perf_state_count: u32,
+    perf_state_table_count: u32,
+    perf_states: &[T6050PerfState],
+    perf_states_sram: &[T6050PerfState],
+    perf_states1: &[T6050PerfState],
+    perf_states_sram1: &[T6050PerfState],
+) -> Result<(), T6050PerfStateMirrorError> {
+    if perf_state_count != T6050_G17S_PERF_STATE_COUNT {
+        return Err(T6050PerfStateMirrorError::UnexpectedPerfStateCount);
+    }
+    if perf_state_table_count != T6050_G17S_PERF_STATE_TABLE_COUNT {
+        return Err(T6050PerfStateMirrorError::UnexpectedPerfStateTableCount);
+    }
+    if perf_states.len() != T6050_G17S_MAIN_PERF_STATE_RECORDS {
+        return Err(T6050PerfStateMirrorError::UnexpectedMainCoreShape);
+    }
+    if perf_states_sram.len() != T6050_G17S_MAIN_PERF_STATE_RECORDS {
+        return Err(T6050PerfStateMirrorError::UnexpectedMainSramShape);
+    }
+    if perf_states1.len() != T6050_G17S_PERF_STATE_COUNT as usize {
+        return Err(T6050PerfStateMirrorError::UnexpectedCoreMirrorShape);
+    }
+    if perf_states_sram1.len() != T6050_G17S_PERF_STATE_COUNT as usize {
+        return Err(T6050PerfStateMirrorError::UnexpectedSramMirrorShape);
+    }
+
+    let table1_start = T6050_G17S_PERF_STATE_COUNT as usize;
+    if perf_states1 != &perf_states[table1_start..] {
+        return Err(T6050PerfStateMirrorError::CoreMirrorMismatch);
+    }
+    if perf_states_sram1 != &perf_states_sram[table1_start..] {
+        return Err(T6050PerfStateMirrorError::SramMirrorMismatch);
+    }
+
+    Ok(())
+}
+
 /// G17S GFX1 internal power states whose numeric names are string-confirmed.
 pub(crate) const GFX1_POWER_SLEEP: u8 = 0x08;
 pub(crate) const GFX1_POWER_NAP: u8 = 0x10;
@@ -624,6 +693,143 @@ mod tests {
                 G17PmConfigEvidenceTarget::G17G,
                 G17PmConfigEvidenceTarget::G17S,
             ]
+        );
+    }
+
+    #[test]
+    fn t6050_perf_states1_properties_are_exact_table1_mirrors() {
+        const FREQUENCIES: [u32; 14] = [
+            0,
+            338_000_000,
+            486_000_000,
+            636_000_000,
+            796_000_000,
+            888_000_000,
+            988_000_000,
+            1_084_000_000,
+            1_182_000_000,
+            1_278_000_000,
+            1_374_000_000,
+            1_470_000_000,
+            1_578_000_000,
+            1_620_000_000,
+        ];
+        const CORE_VOLTS_0: [u32; 14] = [
+            125, 605, 620, 655, 705, 715, 745, 770, 800, 840, 880, 925, 1000, 1025,
+        ];
+        const CORE_VOLTS_1: [u32; 14] = [
+            125, 605, 635, 655, 705, 715, 745, 770, 800, 840, 880, 925, 1000, 1040,
+        ];
+        const SRAM_VOLTS_0: [u32; 14] = [
+            775, 775, 775, 775, 775, 775, 775, 775, 800, 840, 880, 925, 1000, 1025,
+        ];
+        const SRAM_VOLTS_1: [u32; 14] = [
+            775, 775, 775, 775, 775, 775, 775, 775, 800, 840, 880, 925, 1000, 1040,
+        ];
+        const EMPTY: T6050PerfState = T6050PerfState {
+            freq_hz: 0,
+            volt_mv: 0,
+        };
+
+        let mut core = [EMPTY; 28];
+        let mut sram = [EMPTY; 28];
+        let mut core_mirror = [EMPTY; 14];
+        let mut sram_mirror = [EMPTY; 14];
+        for index in 0..14 {
+            core[index] = T6050PerfState {
+                freq_hz: FREQUENCIES[index],
+                volt_mv: CORE_VOLTS_0[index],
+            };
+            core[index + 14] = T6050PerfState {
+                freq_hz: FREQUENCIES[index],
+                volt_mv: CORE_VOLTS_1[index],
+            };
+            sram[index] = T6050PerfState {
+                freq_hz: FREQUENCIES[index],
+                volt_mv: SRAM_VOLTS_0[index],
+            };
+            sram[index + 14] = T6050PerfState {
+                freq_hz: FREQUENCIES[index],
+                volt_mv: SRAM_VOLTS_1[index],
+            };
+            core_mirror[index] = core[index + 14];
+            sram_mirror[index] = sram[index + 14];
+        }
+
+        let validate = |core: &[T6050PerfState],
+                        sram: &[T6050PerfState],
+                        core_mirror: &[T6050PerfState],
+                        sram_mirror: &[T6050PerfState]| {
+            validate_t6050_g17s_perf_state_mirrors(
+                T6050_G17S_PERF_STATE_COUNT,
+                T6050_G17S_PERF_STATE_TABLE_COUNT,
+                core,
+                sram,
+                core_mirror,
+                sram_mirror,
+            )
+        };
+
+        assert_eq!(validate(&core, &sram, &core_mirror, &sram_mirror), Ok(()));
+        assert_eq!(
+            &core_mirror[..],
+            &core[T6050_G17S_PERF_STATE_COUNT as usize..]
+        );
+        assert_ne!(
+            &core_mirror[..],
+            &core[..T6050_G17S_PERF_STATE_COUNT as usize]
+        );
+
+        core_mirror[2].volt_mv -= 1;
+        assert_eq!(
+            validate(&core, &sram, &core_mirror, &sram_mirror),
+            Err(T6050PerfStateMirrorError::CoreMirrorMismatch)
+        );
+        core_mirror[2].volt_mv += 1;
+        sram_mirror[13].volt_mv -= 1;
+        assert_eq!(
+            validate(&core, &sram, &core_mirror, &sram_mirror),
+            Err(T6050PerfStateMirrorError::SramMirrorMismatch)
+        );
+        sram_mirror[13].volt_mv += 1;
+
+        assert_eq!(
+            validate_t6050_g17s_perf_state_mirrors(
+                13,
+                T6050_G17S_PERF_STATE_TABLE_COUNT,
+                &core,
+                &sram,
+                &core_mirror,
+                &sram_mirror,
+            ),
+            Err(T6050PerfStateMirrorError::UnexpectedPerfStateCount)
+        );
+        assert_eq!(
+            validate_t6050_g17s_perf_state_mirrors(
+                T6050_G17S_PERF_STATE_COUNT,
+                3,
+                &core,
+                &sram,
+                &core_mirror,
+                &sram_mirror,
+            ),
+            Err(T6050PerfStateMirrorError::UnexpectedPerfStateTableCount)
+        );
+        assert_eq!(
+            validate(&core[..27], &sram, &core_mirror, &sram_mirror),
+            Err(T6050PerfStateMirrorError::UnexpectedMainCoreShape)
+        );
+        assert_eq!(
+            validate(&core, &sram[..27], &core_mirror, &sram_mirror),
+            Err(T6050PerfStateMirrorError::UnexpectedMainSramShape)
+        );
+        assert_eq!(
+            validate(&core, &sram, &core_mirror[..13], &sram_mirror),
+            Err(T6050PerfStateMirrorError::UnexpectedCoreMirrorShape)
+        );
+        assert_eq!(
+            validate(&core, &sram, &core_mirror, &sram_mirror[..13]),
+            Err(T6050PerfStateMirrorError::UnexpectedSramMirrorShape)
         );
     }
 
