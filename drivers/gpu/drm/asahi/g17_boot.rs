@@ -415,6 +415,18 @@ mod tests {
         assert!(g17_rtkit::GROUNDED_CODEC_AVAILABLE);
         assert!(!g17_rtkit::EXECUTABLE_TRANSPORT_AVAILABLE);
         assert!(agx_power_recovery::GROUNDED_POWER_RECOVERY_MODEL_AVAILABLE);
+        assert!(
+            agx_power_recovery::validate_g17s_gfx1_sleep_to_21_pio_prefix(
+                &agx_power_recovery::G17S_GFX1_SLEEP_TO_21_PIO_PREFIX,
+            )
+        );
+        assert!(agx_power_recovery::g17s_gfx1_idle_poll_satisfied(1));
+        assert_eq!(
+            agx_power_recovery::g17s_gfx1_report_timebase_delta_us(
+                agx_power_recovery::G17S_GFX1_IDLE_POLL_TIMEOUT_TICKS,
+            ),
+            agx_power_recovery::G17S_GFX1_IDLE_POLL_REPORTED_MAX_US
+        );
         assert!(!agx_power_recovery::EXECUTABLE_GFX1_POWER_SEQUENCE_AVAILABLE);
         assert!(!agx_power_recovery::EXECUTABLE_G17_RECOVERY_HANDSHAKE_AVAILABLE);
     }
