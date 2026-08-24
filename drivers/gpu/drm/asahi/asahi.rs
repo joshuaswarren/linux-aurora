@@ -17,6 +17,7 @@ mod fw;
 mod gem;
 mod gpu;
 mod hw;
+mod identity;
 mod initdata;
 mod mem;
 mod microseq;

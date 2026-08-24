@@ -191,6 +191,37 @@ struct drm_asahi_params_global {
 	 * seconds, rather than hardcoding a particular firmware's rate.
 	 */
 	__u64 command_timestamp_frequency_hz;
+
+	/**
+	 * @usc_generation: Unified shader core (USC) ISA generation.
+	 *
+	 * This is 2 for G13/G14 and 3 for G15/G16/G17. It does not
+	 * distinguish the binary encoding groups within AGX3.
+	 */
+	__u32 usc_generation;
+
+	/**
+	 * @gpu_hal_generation: Apple GPU HAL/command-stream generation.
+	 *
+	 * This is DRM_ASAHI_GPU_HAL_LEGACY for G13-G15,
+	 * DRM_ASAHI_GPU_HAL_200 for G16 and G17P/G17A, and
+	 * DRM_ASAHI_GPU_HAL_300 for G17G/G17S/G17C.
+	 */
+	__u32 gpu_hal_generation;
+};
+
+/**
+ * enum drm_asahi_gpu_hal_generation - GPU HAL/command-stream generation
+ */
+enum drm_asahi_gpu_hal_generation {
+	/** @DRM_ASAHI_GPU_HAL_LEGACY: GPU predates Apple's numbered HALs. */
+	DRM_ASAHI_GPU_HAL_LEGACY = 0,
+
+	/** @DRM_ASAHI_GPU_HAL_200: Apple HAL200 command stream. */
+	DRM_ASAHI_GPU_HAL_200 = 200,
+
+	/** @DRM_ASAHI_GPU_HAL_300: Apple HAL300 command stream. */
+	DRM_ASAHI_GPU_HAL_300 = 300,
 };
 
 /**

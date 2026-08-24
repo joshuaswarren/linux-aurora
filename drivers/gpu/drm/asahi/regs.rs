@@ -7,7 +7,7 @@
 //! the few operations that require that, mainly reading the MMU fault status, reading GPU ID
 //! information, and starting the GPU firmware coprocessor.
 
-use crate::hw;
+use crate::{hw, identity};
 use kernel::{
     c_str,
     device::Core,
@@ -242,11 +242,24 @@ impl Resources {
             id_clusters
         );
 
-        let gpu_gen = (id_version >> 24) & 0xff;
+        let family = ((id_version >> 24) & 0xff) as u8;
+        let variant = ((id_version >> 16) & 0xff) as u8;
+        let num_dies = (id_counts_1 >> 16) & 0xf;
+        let identity =
+            identity::decode_gpu_identity(family, variant, num_dies as u8).ok_or_else(|| {
+                dev_err!(
+                    self.dev.as_ref(),
+                    "Unknown GPU identity (family {:#x}, variant {:#x}, dies {})\n",
+                    family,
+                    variant,
+                    num_dies
+                );
+                ENODEV
+            })?;
 
         let mut core_mask_regs = KVec::new();
 
-        let num_clusters = match gpu_gen {
+        let num_clusters = match family {
             4 | 5 => {
                 // G13 | G14G
                 core_mask_regs.push(self.sgx_read32::<CORE_MASK_0>(), GFP_KERNEL)?;
@@ -261,8 +274,25 @@ impl Resources {
                 // Clusters per die * num dies
                 ((id_counts_1 >> 8) & 0xff) * ((id_counts_1 >> 16) & 0xf)
             }
+            0x7 | 0x8 | 0xa | 0xb => {
+                // Identity is known, but the August RE does not yet establish
+                // the G15+ core-mask register bank. Do not guess the G14X
+                // layout or imply that firmware submission is supported.
+                dev_err!(
+                    self.dev.as_ref(),
+                    "GPU {:?}{:?} identity decoded (USC {}, HAL {:?}, {:?} firmware, {:?} submission, {}-bit UAT), but G15+ topology support is not implemented\n",
+                    identity.gpu_gen,
+                    identity.gpu_variant,
+                    identity.usc_generation,
+                    identity.gpu_hal_generation,
+                    identity.firmware_roles,
+                    identity.submission_transport,
+                    identity.uat_input_address_bits
+                );
+                return Err(ENODEV);
+            }
             a => {
-                dev_err!(self.dev.as_ref(), "Unknown GPU generation {}\n", a);
+                dev_err!(self.dev.as_ref(), "Unsupported GPU family {:#x}\n", a);
                 return Err(ENODEV);
             }
         };
@@ -333,33 +363,13 @@ impl Resources {
         };
 
         Ok(hw::GpuIdConfig {
-            gpu_gen: match (id_version >> 24) & 0xff {
-                4 => hw::GpuGen::G13,
-                5 => hw::GpuGen::G14,
-                6 => hw::GpuGen::G14, // G14X has a separate ID
-                a => {
-                    dev_err!(self.dev.as_ref(), "Unknown GPU generation {}\n", a);
-                    return Err(ENODEV);
-                }
-            },
-            gpu_variant: match (id_version >> 16) & 0xff {
-                1 => hw::GpuVariant::P, // Guess
-                2 => hw::GpuVariant::G,
-                3 => hw::GpuVariant::S,
-                4 => {
-                    if num_clusters > 4 {
-                        hw::GpuVariant::D
-                    } else {
-                        hw::GpuVariant::C
-                    }
-                }
-                a => {
-                    dev_err!(self.dev.as_ref(), "Unknown GPU variant {}\n", a);
-                    return Err(ENODEV);
-                }
-            },
+            gpu_gen: identity.gpu_gen,
+            gpu_variant: identity.gpu_variant,
+            usc_generation: identity.usc_generation,
+            gpu_hal_generation: identity.gpu_hal_generation,
             gpu_rev,
             gpu_rev_id,
+            num_dies,
             num_clusters,
             num_cores,
             num_frags: num_cores, // Used to be id_counts_1[15:8] but does not work for G14X
