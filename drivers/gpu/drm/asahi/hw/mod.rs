@@ -193,6 +193,8 @@ pub(crate) struct HwConfig {
     pub(crate) base_clock_hz: u32,
     /// Output address space for the UAT on this SoC.
     pub(crate) uat_oas: u32,
+    /// Input-address bits translated by each UAT root.
+    pub(crate) uat_ias: u8,
     /// Number of dies on this SoC.
     pub(crate) num_dies: u32,
     /// Maximum number of clusters on this SoC.

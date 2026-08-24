@@ -80,8 +80,6 @@ pub(crate) use pgtable::{
     UAT_PGSZ, //
 };
 
-use pgtable::UAT_IAS;
-
 use pin_init;
 
 const DEBUG_CLASS: DebugFlags = DebugFlags::Mmu;
@@ -98,8 +96,9 @@ const UAT_USER_CTX: usize = UAT_NUM_CTX - UAT_USER_CTX_START;
 
 /// Lower/user base VA
 pub(crate) const IOVA_USER_BASE: u64 = UAT_PGSZ as u64;
-/// Lower/user top VA
-pub(crate) const IOVA_USER_TOP: u64 = 1 << (UAT_IAS as u64);
+/// Lower/user top VA. The exposed user ABI remains at 39 bits until the
+/// generation-specific 42-bit PTE/update policies are implemented.
+pub(crate) const IOVA_USER_TOP: u64 = 1 << 39;
 /// Lower/user VA range
 pub(crate) const IOVA_USER_RANGE: Range<u64> = IOVA_USER_BASE..IOVA_USER_TOP;
 
@@ -1017,9 +1016,9 @@ impl Vm {
         let is_kernel = ttb.is_some();
 
         let page_table = if let Some(ttb) = ttb {
-            UatPageTable::new_with_ttb(ttb, IOVA_KERN_RANGE, cfg.uat_oas)?
+            UatPageTable::new_with_ttb(ttb, IOVA_KERN_RANGE, cfg.uat_ias, cfg.uat_oas)?
         } else {
-            UatPageTable::new(cfg.uat_oas)?
+            UatPageTable::new(cfg.uat_ias, cfg.uat_oas)?
         };
 
         let (va_range, gpuvm_range) = if is_kernel {
@@ -1576,6 +1575,19 @@ impl Uat {
         map_kernel_to_user: bool,
     ) -> Result<Self> {
         dev_info!(dev.as_ref(), "MMU: Initializing...\n");
+
+        // G15+ expands the walk to 42 input bits, but also replaces the
+        // leaf PTE attribute encoding and secure page-table update protocol.
+        // Geometry is parameterized independently; do not activate it until
+        // those policies have been implemented from evidence.
+        if cfg.uat_ias != 39 {
+            dev_err!(
+                dev.as_ref(),
+                "MMU: {}-bit UAT roots require an unsupported PTE/update policy\n",
+                cfg.uat_ias
+            );
+            return Err(ENODEV);
+        }
 
         let inner = Self::make_inner(dev)?;
 
