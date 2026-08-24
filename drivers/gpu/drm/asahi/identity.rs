@@ -308,6 +308,72 @@ pub(crate) struct DataMasterFirmwareRingRoute {
     pub(crate) entries_firmware_pointer_offset: u16,
 }
 
+/// Data-master order used by the pinned G17S firmware recovery drain.
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub(crate) enum G17sFirmwareRecoveryDataMaster {
+    Ta,
+    ThreeD,
+    Compute,
+}
+
+/// Exact direct ordering of the recovery-status stores and barriers.
+///
+/// `RecoveryBody` deliberately does not flatten barriers in called helpers.
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub(crate) enum G17sFirmwareRecoveryStatusStep {
+    StoreActive,
+    DsbSy,
+    RecoveryBody,
+    StoreInactive,
+}
+
+/// Exact G17S firmware-only recovery drain/discard contract.
+///
+/// This describes recovery handling, not normal submission consumption or
+/// acknowledgment.
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub(crate) struct G17sFirmwareRecoveryDrainConfig {
+    pub(crate) handler_text_offset: u32,
+    pub(crate) runtime_pointer_global_image_offset: u32,
+    pub(crate) recovery_status_pointer_global_image_offset: u32,
+    pub(crate) recovery_status_field_offset: u8,
+    pub(crate) recovery_status_active_value: u32,
+    pub(crate) recovery_status_inactive_value: u32,
+    pub(crate) descriptor_table_offset: u8,
+    pub(crate) priority_count: u8,
+    pub(crate) data_master_count: u8,
+    pub(crate) priority_stride: u8,
+    pub(crate) descriptor_record_stride: u8,
+    pub(crate) read_index_pointer_offset: u8,
+    pub(crate) cfi_index_pointer_offset: u8,
+    pub(crate) write_index_pointer_offset: u8,
+    pub(crate) entries_pointer_offset: u8,
+    pub(crate) entry_stride: u8,
+    pub(crate) read_index_mask: u8,
+    pub(crate) maximum_read_advancements_per_master: u8,
+    pub(crate) cfi_initialized_from_write_index: bool,
+    pub(crate) cfi_initialization_order: [G17sFirmwareRecoveryDataMaster; 3],
+    pub(crate) drain_attempt_order: [G17sFirmwareRecoveryDataMaster; 3],
+    pub(crate) expected_entry_type_ordinals: [u8; 3],
+    pub(crate) direct_status_steps: [G17sFirmwareRecoveryStatusStep; 5],
+    pub(crate) normal_submission_acknowledgment_proven: bool,
+}
+
+/// Pure descriptor route for one G17S recovery priority/data-master pair.
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub(crate) struct G17sFirmwareRecoveryDrainRoute {
+    pub(crate) record_offset_from_runtime_base: u16,
+    pub(crate) read_index_pointer_offset_from_runtime_base: u16,
+    pub(crate) cfi_index_pointer_offset_from_runtime_base: u16,
+    pub(crate) write_index_pointer_offset_from_runtime_base: u16,
+    pub(crate) entries_pointer_offset_from_runtime_base: u16,
+    pub(crate) expected_entry_type_ordinal: u8,
+}
+
 /// Refusals made by the target-pinned SKSM submission preflight.
 #[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -328,8 +394,12 @@ pub(crate) enum SubmissionConfigError {
     UnexpectedDataMasterRingConfig,
     /// The supplied firmware ring-table contract differs from exact host values.
     UnexpectedDataMasterFirmwareTableConfig,
+    /// The supplied G17S recovery drain differs from the pinned firmware.
+    UnexpectedG17sFirmwareRecoveryDrainConfig,
     /// The priority is outside the four published data-master ring groups.
     DataMasterPriorityOutOfRange,
+    /// The priority is outside the four G17S firmware recovery groups.
+    G17sFirmwareRecoveryPriorityOutOfRange,
     /// The shared read index is outside the host's eight-bit ring index space.
     DataMasterReadIndexOutOfRange,
     /// The shared write index is outside the host's eight-bit ring index space.
@@ -358,6 +428,10 @@ pub(crate) const GROUNDED_DATA_MASTER_RING_CONFIG_AVAILABLE: bool = true;
 /// is available for the same independently pinned G15-G17 host corpus.
 #[allow(dead_code)]
 pub(crate) const GROUNDED_DATA_MASTER_FIRMWARE_TABLE_CONFIG_AVAILABLE: bool = true;
+/// A pure model of the G17S firmware recovery drain/discard writer is
+/// available. It is deliberately not a normal submission acknowledgment.
+#[allow(dead_code)]
+pub(crate) const GROUNDED_G17S_FIRMWARE_RECOVERY_DRAIN_CONFIG_AVAILABLE: bool = true;
 /// The symbolic meaning of the firmware shared-data caching-option numbers,
 /// firmware consumer ownership, and transport selection on dual-stack targets
 /// are not proved, so command submission must remain disconnected from these
@@ -425,6 +499,53 @@ const DATA_MASTER_RING_PUBLICATION_STEPS: [DataMasterRingPublicationStep; 6] = [
     DataMasterRingPublicationStep::IncrementAndWrap8,
     DataMasterRingPublicationStep::StoreWriteIndex,
 ];
+
+// Pinned Mac17,9/J714s/T6050 firmware bundle SHA-256:
+// GFX:  317de35b447e2a4cce0fb467f0ab04baa42fceee8a3f55998ecf3c624d30031b
+// GFX1: 5d719208e12be6bfa754ca8486f36739fce74b0c45618ad9a0f44a189feeb345
+// The modeled recovery handler is GFX text+0x2649c. GFX1 is included only to
+// pin the exact two-role bundle; no GFX1 recovery writer is claimed.
+const G17S_FIRMWARE_RECOVERY_DRAIN_CONFIG: G17sFirmwareRecoveryDrainConfig =
+    G17sFirmwareRecoveryDrainConfig {
+        handler_text_offset: 0x2649c,
+        runtime_pointer_global_image_offset: 0x104888,
+        recovery_status_pointer_global_image_offset: 0x1047b8,
+        recovery_status_field_offset: 0x0c,
+        recovery_status_active_value: 1,
+        recovery_status_inactive_value: 0,
+        descriptor_table_offset: 0x20,
+        priority_count: 4,
+        data_master_count: 3,
+        priority_stride: 0x60,
+        descriptor_record_stride: 0x20,
+        read_index_pointer_offset: 0x00,
+        cfi_index_pointer_offset: 0x08,
+        write_index_pointer_offset: 0x10,
+        entries_pointer_offset: 0x18,
+        entry_stride: 0x18,
+        read_index_mask: 0xff,
+        maximum_read_advancements_per_master: 0x14,
+        cfi_initialized_from_write_index: true,
+        cfi_initialization_order: [
+            G17sFirmwareRecoveryDataMaster::Ta,
+            G17sFirmwareRecoveryDataMaster::ThreeD,
+            G17sFirmwareRecoveryDataMaster::Compute,
+        ],
+        drain_attempt_order: [
+            G17sFirmwareRecoveryDataMaster::Ta,
+            G17sFirmwareRecoveryDataMaster::ThreeD,
+            G17sFirmwareRecoveryDataMaster::Compute,
+        ],
+        expected_entry_type_ordinals: [0, 1, 2],
+        direct_status_steps: [
+            G17sFirmwareRecoveryStatusStep::StoreActive,
+            G17sFirmwareRecoveryStatusStep::DsbSy,
+            G17sFirmwareRecoveryStatusStep::RecoveryBody,
+            G17sFirmwareRecoveryStatusStep::StoreInactive,
+            G17sFirmwareRecoveryStatusStep::DsbSy,
+        ],
+        normal_submission_acknowledgment_proven: false,
+    };
 
 const fn make_data_master_firmware_table_config(
     descriptor_table_cpu_pointer_object_offset: u16,
@@ -1124,6 +1245,160 @@ pub(crate) const fn data_master_firmware_ring_route(
         entries_firmware_pointer_offset: descriptor_record_offset
             + config.entries_firmware_pointer_offset as u16,
     })
+}
+
+/// Return the exact recovery drain/discard contract from the pinned G17S
+/// firmware bundle. Other G17 variants, including G17C, are intentionally not
+/// inferred from the G17S image.
+#[allow(dead_code)]
+pub(crate) const fn g17s_firmware_recovery_drain_config(
+    gpu_gen: GpuGen,
+    gpu_variant: GpuVariant,
+) -> Option<G17sFirmwareRecoveryDrainConfig> {
+    if matches!((gpu_gen, gpu_variant), (GpuGen::G17, GpuVariant::S)) {
+        Some(G17S_FIRMWARE_RECOVERY_DRAIN_CONFIG)
+    } else {
+        None
+    }
+}
+
+/// Validate an externally recovered G17S recovery drain/discard contract.
+#[allow(dead_code)]
+pub(crate) const fn validate_g17s_firmware_recovery_drain_config(
+    gpu_gen: GpuGen,
+    gpu_variant: GpuVariant,
+    supplied: G17sFirmwareRecoveryDrainConfig,
+) -> Result<G17sFirmwareRecoveryDrainConfig, SubmissionConfigError> {
+    let Some(expected) = g17s_firmware_recovery_drain_config(gpu_gen, gpu_variant) else {
+        return Err(SubmissionConfigError::UnsupportedTarget);
+    };
+
+    if supplied.handler_text_offset != expected.handler_text_offset
+        || supplied.runtime_pointer_global_image_offset
+            != expected.runtime_pointer_global_image_offset
+        || supplied.recovery_status_pointer_global_image_offset
+            != expected.recovery_status_pointer_global_image_offset
+        || supplied.recovery_status_field_offset != expected.recovery_status_field_offset
+        || supplied.recovery_status_active_value != expected.recovery_status_active_value
+        || supplied.recovery_status_inactive_value != expected.recovery_status_inactive_value
+        || supplied.descriptor_table_offset != expected.descriptor_table_offset
+        || supplied.priority_count != expected.priority_count
+        || supplied.data_master_count != expected.data_master_count
+        || supplied.priority_stride != expected.priority_stride
+        || supplied.descriptor_record_stride != expected.descriptor_record_stride
+        || supplied.read_index_pointer_offset != expected.read_index_pointer_offset
+        || supplied.cfi_index_pointer_offset != expected.cfi_index_pointer_offset
+        || supplied.write_index_pointer_offset != expected.write_index_pointer_offset
+        || supplied.entries_pointer_offset != expected.entries_pointer_offset
+        || supplied.entry_stride != expected.entry_stride
+        || supplied.read_index_mask != expected.read_index_mask
+        || supplied.maximum_read_advancements_per_master
+            != expected.maximum_read_advancements_per_master
+        || !supplied.cfi_initialized_from_write_index
+        || !matches!(
+            supplied.cfi_initialization_order,
+            [
+                G17sFirmwareRecoveryDataMaster::Ta,
+                G17sFirmwareRecoveryDataMaster::ThreeD,
+                G17sFirmwareRecoveryDataMaster::Compute,
+            ]
+        )
+        || !matches!(
+            supplied.drain_attempt_order,
+            [
+                G17sFirmwareRecoveryDataMaster::Ta,
+                G17sFirmwareRecoveryDataMaster::ThreeD,
+                G17sFirmwareRecoveryDataMaster::Compute,
+            ]
+        )
+        || !matches!(supplied.expected_entry_type_ordinals, [0, 1, 2])
+        || !matches!(
+            supplied.direct_status_steps,
+            [
+                G17sFirmwareRecoveryStatusStep::StoreActive,
+                G17sFirmwareRecoveryStatusStep::DsbSy,
+                G17sFirmwareRecoveryStatusStep::RecoveryBody,
+                G17sFirmwareRecoveryStatusStep::StoreInactive,
+                G17sFirmwareRecoveryStatusStep::DsbSy,
+            ]
+        )
+        || supplied.normal_submission_acknowledgment_proven
+    {
+        Err(SubmissionConfigError::UnexpectedG17sFirmwareRecoveryDrainConfig)
+    } else {
+        Ok(expected)
+    }
+}
+
+/// Select one descriptor in the G17S recovery table without touching firmware
+/// memory.
+#[allow(dead_code)]
+pub(crate) const fn g17s_firmware_recovery_drain_route(
+    gpu_gen: GpuGen,
+    gpu_variant: GpuVariant,
+    priority: u8,
+    data_master: G17sFirmwareRecoveryDataMaster,
+) -> Result<G17sFirmwareRecoveryDrainRoute, SubmissionConfigError> {
+    let Some(config) = g17s_firmware_recovery_drain_config(gpu_gen, gpu_variant) else {
+        return Err(SubmissionConfigError::UnsupportedTarget);
+    };
+    if priority >= config.priority_count {
+        return Err(SubmissionConfigError::G17sFirmwareRecoveryPriorityOutOfRange);
+    }
+
+    let ordinal = match data_master {
+        G17sFirmwareRecoveryDataMaster::Ta => 0u16,
+        G17sFirmwareRecoveryDataMaster::ThreeD => 1,
+        G17sFirmwareRecoveryDataMaster::Compute => 2,
+    };
+    let record_offset = config.descriptor_table_offset as u16
+        + priority as u16 * config.priority_stride as u16
+        + ordinal * config.descriptor_record_stride as u16;
+
+    Ok(G17sFirmwareRecoveryDrainRoute {
+        record_offset_from_runtime_base: record_offset,
+        read_index_pointer_offset_from_runtime_base: record_offset
+            + config.read_index_pointer_offset as u16,
+        cfi_index_pointer_offset_from_runtime_base: record_offset
+            + config.cfi_index_pointer_offset as u16,
+        write_index_pointer_offset_from_runtime_base: record_offset
+            + config.write_index_pointer_offset as u16,
+        entries_pointer_offset_from_runtime_base: record_offset
+            + config.entries_pointer_offset as u16,
+        expected_entry_type_ordinal: ordinal as u8,
+    })
+}
+
+/// Apply the exact firmware recovery read-index update. The firmware uses a
+/// 32-bit load/add/mask/store, so malformed upper bits are discarded rather
+/// than rejected by this diagnostic.
+#[allow(dead_code)]
+pub(crate) const fn g17s_firmware_recovery_advance_read_index(
+    gpu_gen: GpuGen,
+    gpu_variant: GpuVariant,
+    read_index: u32,
+) -> Result<u32, SubmissionConfigError> {
+    let Some(config) = g17s_firmware_recovery_drain_config(gpu_gen, gpu_variant) else {
+        return Err(SubmissionConfigError::UnsupportedTarget);
+    };
+
+    Ok(read_index.wrapping_add(1) & config.read_index_mask as u32)
+}
+
+/// Return the exact CFI value installed before G17S recovery begins draining
+/// one priority. The recovered firmware copies the snapshotted write index
+/// without truncation.
+#[allow(dead_code)]
+pub(crate) const fn g17s_firmware_recovery_cfi_initial_value(
+    gpu_gen: GpuGen,
+    gpu_variant: GpuVariant,
+    write_index_snapshot: u32,
+) -> Result<u32, SubmissionConfigError> {
+    if g17s_firmware_recovery_drain_config(gpu_gen, gpu_variant).is_none() {
+        Err(SubmissionConfigError::UnsupportedTarget)
+    } else {
+        Ok(write_index_snapshot)
+    }
 }
 
 const fn data_master_ring_index_backing_matches(
@@ -2222,6 +2497,225 @@ mod tests {
         }
 
         assert!(GROUNDED_DATA_MASTER_FIRMWARE_TABLE_CONFIG_AVAILABLE);
+        assert!(!EXECUTABLE_G15_G17_SUBMISSION_AVAILABLE);
+    }
+
+    #[test]
+    fn g17s_firmware_recovery_drain_is_exact_and_not_normal_acknowledgment() {
+        let config = g17s_firmware_recovery_drain_config(GpuGen::G17, GpuVariant::S)
+            .expect("G17S should have a pinned firmware recovery drain");
+        assert_eq!(config, G17S_FIRMWARE_RECOVERY_DRAIN_CONFIG);
+        assert_eq!(config.recovery_status_active_value, 1);
+        assert_eq!(config.recovery_status_inactive_value, 0);
+        assert_eq!(
+            config.direct_status_steps,
+            [
+                G17sFirmwareRecoveryStatusStep::StoreActive,
+                G17sFirmwareRecoveryStatusStep::DsbSy,
+                G17sFirmwareRecoveryStatusStep::RecoveryBody,
+                G17sFirmwareRecoveryStatusStep::StoreInactive,
+                G17sFirmwareRecoveryStatusStep::DsbSy,
+            ]
+        );
+        assert_eq!(
+            validate_g17s_firmware_recovery_drain_config(GpuGen::G17, GpuVariant::S, config,),
+            Ok(config)
+        );
+        assert!(!config.normal_submission_acknowledgment_proven);
+
+        for unexpected in [
+            G17sFirmwareRecoveryDrainConfig {
+                handler_text_offset: 0x264a0,
+                ..config
+            },
+            G17sFirmwareRecoveryDrainConfig {
+                runtime_pointer_global_image_offset: 0x104890,
+                ..config
+            },
+            G17sFirmwareRecoveryDrainConfig {
+                recovery_status_pointer_global_image_offset: 0x1047c0,
+                ..config
+            },
+            G17sFirmwareRecoveryDrainConfig {
+                recovery_status_field_offset: 0x10,
+                ..config
+            },
+            G17sFirmwareRecoveryDrainConfig {
+                recovery_status_active_value: 0,
+                ..config
+            },
+            G17sFirmwareRecoveryDrainConfig {
+                recovery_status_inactive_value: 1,
+                ..config
+            },
+            G17sFirmwareRecoveryDrainConfig {
+                descriptor_table_offset: 0x28,
+                ..config
+            },
+            G17sFirmwareRecoveryDrainConfig {
+                priority_count: 3,
+                ..config
+            },
+            G17sFirmwareRecoveryDrainConfig {
+                data_master_count: 4,
+                ..config
+            },
+            G17sFirmwareRecoveryDrainConfig {
+                priority_stride: 0x80,
+                ..config
+            },
+            G17sFirmwareRecoveryDrainConfig {
+                descriptor_record_stride: 0x28,
+                ..config
+            },
+            G17sFirmwareRecoveryDrainConfig {
+                read_index_pointer_offset: 0x08,
+                ..config
+            },
+            G17sFirmwareRecoveryDrainConfig {
+                cfi_index_pointer_offset: 0x10,
+                ..config
+            },
+            G17sFirmwareRecoveryDrainConfig {
+                write_index_pointer_offset: 0x18,
+                ..config
+            },
+            G17sFirmwareRecoveryDrainConfig {
+                entries_pointer_offset: 0x20,
+                ..config
+            },
+            G17sFirmwareRecoveryDrainConfig {
+                entry_stride: 0x20,
+                ..config
+            },
+            G17sFirmwareRecoveryDrainConfig {
+                read_index_mask: 0x7f,
+                ..config
+            },
+            G17sFirmwareRecoveryDrainConfig {
+                maximum_read_advancements_per_master: 0x15,
+                ..config
+            },
+            G17sFirmwareRecoveryDrainConfig {
+                cfi_initialized_from_write_index: false,
+                ..config
+            },
+            G17sFirmwareRecoveryDrainConfig {
+                cfi_initialization_order: [
+                    G17sFirmwareRecoveryDataMaster::ThreeD,
+                    G17sFirmwareRecoveryDataMaster::Ta,
+                    G17sFirmwareRecoveryDataMaster::Compute,
+                ],
+                ..config
+            },
+            G17sFirmwareRecoveryDrainConfig {
+                drain_attempt_order: [
+                    G17sFirmwareRecoveryDataMaster::Ta,
+                    G17sFirmwareRecoveryDataMaster::Compute,
+                    G17sFirmwareRecoveryDataMaster::ThreeD,
+                ],
+                ..config
+            },
+            G17sFirmwareRecoveryDrainConfig {
+                expected_entry_type_ordinals: [0, 2, 1],
+                ..config
+            },
+            G17sFirmwareRecoveryDrainConfig {
+                direct_status_steps: [
+                    G17sFirmwareRecoveryStatusStep::StoreActive,
+                    G17sFirmwareRecoveryStatusStep::RecoveryBody,
+                    G17sFirmwareRecoveryStatusStep::DsbSy,
+                    G17sFirmwareRecoveryStatusStep::StoreInactive,
+                    G17sFirmwareRecoveryStatusStep::DsbSy,
+                ],
+                ..config
+            },
+            G17sFirmwareRecoveryDrainConfig {
+                normal_submission_acknowledgment_proven: true,
+                ..config
+            },
+        ] {
+            assert_eq!(
+                validate_g17s_firmware_recovery_drain_config(
+                    GpuGen::G17,
+                    GpuVariant::S,
+                    unexpected,
+                ),
+                Err(SubmissionConfigError::UnexpectedG17sFirmwareRecoveryDrainConfig)
+            );
+        }
+
+        for priority in 0..4 {
+            for (data_master, ordinal) in [
+                (G17sFirmwareRecoveryDataMaster::Ta, 0u16),
+                (G17sFirmwareRecoveryDataMaster::ThreeD, 1),
+                (G17sFirmwareRecoveryDataMaster::Compute, 2),
+            ] {
+                let record_offset = 0x20 + priority as u16 * 0x60 + ordinal * 0x20;
+                assert_eq!(
+                    g17s_firmware_recovery_drain_route(
+                        GpuGen::G17,
+                        GpuVariant::S,
+                        priority,
+                        data_master,
+                    ),
+                    Ok(G17sFirmwareRecoveryDrainRoute {
+                        record_offset_from_runtime_base: record_offset,
+                        read_index_pointer_offset_from_runtime_base: record_offset,
+                        cfi_index_pointer_offset_from_runtime_base: record_offset + 0x08,
+                        write_index_pointer_offset_from_runtime_base: record_offset + 0x10,
+                        entries_pointer_offset_from_runtime_base: record_offset + 0x18,
+                        expected_entry_type_ordinal: ordinal as u8,
+                    })
+                );
+            }
+        }
+        assert_eq!(
+            g17s_firmware_recovery_drain_route(
+                GpuGen::G17,
+                GpuVariant::S,
+                4,
+                G17sFirmwareRecoveryDataMaster::Ta,
+            ),
+            Err(SubmissionConfigError::G17sFirmwareRecoveryPriorityOutOfRange)
+        );
+
+        for (read_index, expected) in [(0, 1), (0xfe, 0xff), (0xff, 0), (0xffff_ffff, 0)] {
+            assert_eq!(
+                g17s_firmware_recovery_advance_read_index(GpuGen::G17, GpuVariant::S, read_index,),
+                Ok(expected)
+            );
+        }
+        assert_eq!(
+            g17s_firmware_recovery_cfi_initial_value(GpuGen::G17, GpuVariant::S, 0x1234_5678,),
+            Ok(0x1234_5678)
+        );
+
+        for (gpu_gen, gpu_variant) in [
+            (GpuGen::G16, GpuVariant::S),
+            (GpuGen::G17, GpuVariant::P),
+            (GpuGen::G17, GpuVariant::G),
+            (GpuGen::G17, GpuVariant::C),
+        ] {
+            assert_eq!(
+                g17s_firmware_recovery_drain_config(gpu_gen, gpu_variant),
+                None
+            );
+            assert_eq!(
+                validate_g17s_firmware_recovery_drain_config(gpu_gen, gpu_variant, config,),
+                Err(SubmissionConfigError::UnsupportedTarget)
+            );
+            assert_eq!(
+                g17s_firmware_recovery_advance_read_index(gpu_gen, gpu_variant, 0),
+                Err(SubmissionConfigError::UnsupportedTarget)
+            );
+            assert_eq!(
+                g17s_firmware_recovery_cfi_initial_value(gpu_gen, gpu_variant, 0),
+                Err(SubmissionConfigError::UnsupportedTarget)
+            );
+        }
+
+        assert!(GROUNDED_G17S_FIRMWARE_RECOVERY_DRAIN_CONFIG_AVAILABLE);
         assert!(!EXECUTABLE_G15_G17_SUBMISSION_AVAILABLE);
     }
 
