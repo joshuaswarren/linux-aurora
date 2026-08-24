@@ -9,35 +9,85 @@
 //! deliberately contains no endpoint numbers, MMIO writes, power-state names,
 //! or recovery messages.
 
+#[cfg(not(test))]
+use crate::{g17_initdata, g17_rtkit};
+#[cfg(test)]
+#[path = "g17_initdata.rs"]
+mod g17_initdata;
+#[cfg(test)]
+#[path = "g17_rtkit.rs"]
+mod g17_rtkit;
+
 /// Design generation that requires the dual-role contract.
 const G17_GENERATION: u32 = 17;
 
 /// Evidence required before Linux may hand init-data to either G17 role.
-const ROLE_RESOURCES_AND_ROOTS: u8 = 1 << 0;
-const GFX1_POWER_MAPPING: u8 = 1 << 1;
-const RECOVERY_WIRE_PROTOCOL: u8 = 1 << 2;
-const SUBMISSION_HANDOFF: u8 = 1 << 3;
-const REQUIRED_PRE_HANDOFF_EVIDENCE: u8 =
-    ROLE_RESOURCES_AND_ROOTS | GFX1_POWER_MAPPING | RECOVERY_WIRE_PROTOCOL | SUBMISSION_HANDOFF;
+pub(crate) mod missing {
+    pub(crate) const FIRMWARE_IDENTITY: u16 = 1 << 0;
+    pub(crate) const ROLE_RESOURCES: u16 = 1 << 1;
+    pub(crate) const TOPOLOGY_REGISTERS: u16 = 1 << 2;
+    pub(crate) const UAT_HANDOFF: u16 = 1 << 3;
+    pub(crate) const INITDATA_GRAPH: u16 = 1 << 4;
+    pub(crate) const RTKIT_TRANSPORT: u16 = 1 << 5;
+    pub(crate) const GFX1_POWER_SEQUENCE: u16 = 1 << 6;
+    pub(crate) const RECOVERY_HANDSHAKE: u16 = 1 << 7;
+    pub(crate) const SUBMISSION_TRANSPORT: u16 = 1 << 8;
+}
 
-// The pinned G17 corpus proves the topology and boot predicates, but none of
-// these target/build-specific runtime interfaces completely enough to execute.
-const IMPLEMENTED_PRE_HANDOFF_EVIDENCE: u8 = 0;
+const REQUIRED_PRE_HANDOFF_EVIDENCE: u16 = missing::FIRMWARE_IDENTITY
+    | missing::ROLE_RESOURCES
+    | missing::TOPOLOGY_REGISTERS
+    | missing::UAT_HANDOFF
+    | missing::INITDATA_GRAPH
+    | missing::RTKIT_TRANSPORT
+    | missing::GFX1_POWER_SEQUENCE
+    | missing::RECOVERY_HANDSHAKE
+    | missing::SUBMISSION_TRANSPORT;
+
+/// Exact fail-closed result returned to the probe boundary.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct MissingEvidence(u16);
+
+impl MissingEvidence {
+    pub(crate) const fn bits(self) -> u16 {
+        self.0
+    }
+
+    pub(crate) const fn contains(self, evidence: u16) -> bool {
+        self.0 & evidence != 0
+    }
+}
+
+const fn implemented_pre_handoff_evidence() -> u16 {
+    let mut implemented = 0;
+
+    // These constants deliberately distinguish useful offline codecs from an
+    // executable firmware ABI. When either module becomes complete, this gate
+    // changes with the implementation rather than a disconnected probe flag.
+    if g17_initdata::GROUNDED_LAYOUT_AVAILABLE && g17_initdata::BOOTABLE_LAYOUT_AVAILABLE {
+        implemented |= missing::INITDATA_GRAPH;
+    }
+    if g17_rtkit::GROUNDED_CODEC_AVAILABLE && g17_rtkit::EXECUTABLE_TRANSPORT_AVAILABLE {
+        implemented |= missing::RTKIT_TRANSPORT;
+    }
+
+    implemented
+}
 
 /// Require all runtime evidence before any G17 ASC is started.
 ///
 /// Older, already-supported generations do not use this gate. The caller maps
 /// an error to `ENODEV` before MMIO initialization or firmware CPU startup.
-pub(crate) const fn pre_handoff_gate(gpu_generation: u32) -> Result<(), u8> {
+pub(crate) const fn pre_handoff_gate(gpu_generation: u32) -> Result<(), MissingEvidence> {
     if gpu_generation != G17_GENERATION {
         return Ok(());
     }
 
-    let missing = REQUIRED_PRE_HANDOFF_EVIDENCE & !IMPLEMENTED_PRE_HANDOFF_EVIDENCE;
-    if missing == 0 {
+    let missing_bits = REQUIRED_PRE_HANDOFF_EVIDENCE & !implemented_pre_handoff_evidence();
+    if missing_bits == 0 {
         Ok(())
     } else {
-        Err(missing)
+        Err(MissingEvidence(missing_bits))
     }
 }
 
@@ -331,6 +381,24 @@ mod tests {
         assert!(pre_handoff_gate(14).is_ok());
         assert!(pre_handoff_gate(15).is_ok());
         assert!(pre_handoff_gate(16).is_ok());
-        assert_eq!(pre_handoff_gate(17), Err(REQUIRED_PRE_HANDOFF_EVIDENCE));
+        let missing = pre_handoff_gate(17).unwrap_err();
+        assert_eq!(missing.bits(), REQUIRED_PRE_HANDOFF_EVIDENCE);
+        for evidence in [
+            missing::FIRMWARE_IDENTITY,
+            missing::ROLE_RESOURCES,
+            missing::TOPOLOGY_REGISTERS,
+            missing::UAT_HANDOFF,
+            missing::INITDATA_GRAPH,
+            missing::RTKIT_TRANSPORT,
+            missing::GFX1_POWER_SEQUENCE,
+            missing::RECOVERY_HANDSHAKE,
+            missing::SUBMISSION_TRANSPORT,
+        ] {
+            assert!(missing.contains(evidence));
+        }
+        assert!(g17_initdata::GROUNDED_LAYOUT_AVAILABLE);
+        assert!(!g17_initdata::BOOTABLE_LAYOUT_AVAILABLE);
+        assert!(g17_rtkit::GROUNDED_CODEC_AVAILABLE);
+        assert!(!g17_rtkit::EXECUTABLE_TRANSPORT_AVAILABLE);
     }
 }

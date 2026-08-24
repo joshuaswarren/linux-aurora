@@ -49,6 +49,13 @@ pub(crate) struct AsahiDriver {
     drm: ARef<drm::Device<Self>>,
 }
 
+/// A matched device either has a complete legacy hardware configuration or is
+/// an exact, diagnostic-only target whose firmware boundary remains closed.
+pub(crate) enum ProbeConfig {
+    Supported(&'static hw::HwConfig),
+    T6050G17S,
+}
+
 unsafe impl Send for AsahiDriver {}
 unsafe impl Sync for AsahiDriver {}
 
@@ -116,42 +123,125 @@ kernel::of_device_table!(
     [
         (
             of::DeviceId::new(c_str!("apple,agx-t8103")),
-            &hw::t8103::HWCONFIG
+            ProbeConfig::Supported(&hw::t8103::HWCONFIG)
         ),
         (
             of::DeviceId::new(c_str!("apple,agx-t8112")),
-            &hw::t8112::HWCONFIG
+            ProbeConfig::Supported(&hw::t8112::HWCONFIG)
         ),
         (
             of::DeviceId::new(c_str!("apple,agx-t6000")),
-            &hw::t600x::HWCONFIG_T6000
+            ProbeConfig::Supported(&hw::t600x::HWCONFIG_T6000)
         ),
         (
             of::DeviceId::new(c_str!("apple,agx-t6001")),
-            &hw::t600x::HWCONFIG_T6001
+            ProbeConfig::Supported(&hw::t600x::HWCONFIG_T6001)
         ),
         (
             of::DeviceId::new(c_str!("apple,agx-t6002")),
-            &hw::t600x::HWCONFIG_T6002
+            ProbeConfig::Supported(&hw::t600x::HWCONFIG_T6002)
         ),
         (
             of::DeviceId::new(c_str!("apple,agx-t6020")),
-            &hw::t602x::HWCONFIG_T6020
+            ProbeConfig::Supported(&hw::t602x::HWCONFIG_T6020)
         ),
         (
             of::DeviceId::new(c_str!("apple,agx-t6021")),
-            &hw::t602x::HWCONFIG_T6021
+            ProbeConfig::Supported(&hw::t602x::HWCONFIG_T6021)
         ),
         (
             of::DeviceId::new(c_str!("apple,agx-t6022")),
-            &hw::t602x::HWCONFIG_T6022
+            ProbeConfig::Supported(&hw::t602x::HWCONFIG_T6022)
+        ),
+        // This is the literal compatible captured from the J714s/T6050 ADT.
+        // It intentionally selects no HwConfig: unproved power/MMIO fields
+        // must never be represented by copied or zero-filled legacy values.
+        (
+            of::DeviceId::new(c_str!("gpu,t6050")),
+            ProbeConfig::T6050G17S
         ),
     ]
 );
 
+fn refuse_g17_probe(pdev: &platform::Device<Core>) -> Error {
+    let Err(missing) = g17_boot::pre_handoff_gate(hw::GpuGen::G17 as u32) else {
+        dev_err!(
+            pdev.as_ref(),
+            "G17 diagnostic target remained selected after its preflight opened\n"
+        );
+        return EINVAL;
+    };
+
+    dev_info!(
+        pdev.as_ref(),
+        "Matched captured T6050/G17S GPU identity; grounded init-data and RTKit codecs are diagnostic-only\n"
+    );
+    dev_err!(
+        pdev.as_ref(),
+        "G17 preflight missing evidence {:#x}; refusing before DMA setup, MMIO mapping, UAT ownership, or GFX/GFX1 ASC start\n",
+        missing.bits()
+    );
+    if missing.contains(g17_boot::missing::FIRMWARE_IDENTITY) {
+        dev_err!(
+            pdev.as_ref(),
+            "G17 preflight: paired firmware identity selection is not wired\n"
+        );
+    }
+    if missing.contains(g17_boot::missing::ROLE_RESOURCES) {
+        dev_err!(
+            pdev.as_ref(),
+            "G17 preflight: distinct GFX/GFX1 resource plumbing is not wired\n"
+        );
+    }
+    if missing.contains(g17_boot::missing::TOPOLOGY_REGISTERS) {
+        dev_err!(
+            pdev.as_ref(),
+            "G17 preflight: G17 core-mask register bank is not proven\n"
+        );
+    }
+    if missing.contains(g17_boot::missing::UAT_HANDOFF) {
+        dev_err!(
+            pdev.as_ref(),
+            "G17 preflight: SPTM/UAT ownership handoff is not implemented\n"
+        );
+    }
+    if missing.contains(g17_boot::missing::INITDATA_GRAPH) {
+        dev_err!(
+            pdev.as_ref(),
+            "G17 preflight: init-data graph has grounded fields but is not boot-complete\n"
+        );
+    }
+    if missing.contains(g17_boot::missing::RTKIT_TRANSPORT) {
+        dev_err!(
+            pdev.as_ref(),
+            "G17 preflight: RTKit codec is grounded but HELLO/EPMAP transmit is unproved\n"
+        );
+    }
+    if missing.contains(g17_boot::missing::GFX1_POWER_SEQUENCE) {
+        dev_err!(
+            pdev.as_ref(),
+            "G17 preflight: GFX1 power-transition mapping is incomplete\n"
+        );
+    }
+    if missing.contains(g17_boot::missing::RECOVERY_HANDSHAKE) {
+        dev_err!(
+            pdev.as_ref(),
+            "G17 preflight: dual-role recovery handshake is incomplete\n"
+        );
+    }
+    if missing.contains(g17_boot::missing::SUBMISSION_TRANSPORT) {
+        dev_err!(
+            pdev.as_ref(),
+            "G17 preflight: SKSM queue submission and completion are incomplete\n"
+        );
+    }
+
+    ENODEV
+}
+
 /// Platform Driver implementation for `AsahiDriver`.
 impl platform::Driver for AsahiDriver {
-    type IdInfo = &'static hw::HwConfig;
+    type IdInfo = ProbeConfig;
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
 
     /// Device probe function.
@@ -163,7 +253,10 @@ impl platform::Driver for AsahiDriver {
 
         dev_info!(pdev.as_ref(), "Probing...\n");
 
-        let cfg = info.ok_or(ENODEV)?;
+        let cfg = match info.ok_or(ENODEV)? {
+            ProbeConfig::Supported(cfg) => *cfg,
+            ProbeConfig::T6050G17S => return Err(refuse_g17_probe(pdev)),
+        };
 
         // G17 requires two physical ASC roles with distinct transports and
         // init-data roots, but one shared GPU/UAT owner. Refuse before any
@@ -174,7 +267,7 @@ impl platform::Driver for AsahiDriver {
             dev_err!(
                 pdev.as_ref(),
                 "G17 dual-role pre-handoff is incomplete (missing evidence mask {:#x}); refusing to start GFX/GFX1\n",
-                missing
+                missing.bits()
             );
             return Err(ENODEV);
         }

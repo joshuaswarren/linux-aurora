@@ -16,6 +16,12 @@
 
 use core::result::Result;
 
+/// The recovered fields are sufficient for offline validation and encoding.
+pub(crate) const GROUNDED_LAYOUT_AVAILABLE: bool = true;
+/// Unknown configuration, channel, queue and power fields still make the
+/// generated object graph unsafe to hand to firmware.
+pub(crate) const BOOTABLE_LAYOUT_AVAILABLE: bool = false;
+
 pub(crate) const ROOT_SIZE: usize = 0x0c8;
 pub(crate) const RUNTIME_POINTERS_SIZE: usize = 0x4c0;
 pub(crate) const HW_GLOBALS_SIZE: usize = 0x2828;
