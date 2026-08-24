@@ -420,6 +420,17 @@ mod tests {
                 &agx_power_recovery::G17S_GFX1_SLEEP_TO_21_PIO_PREFIX,
             )
         );
+        assert!(
+            agx_power_recovery::validate_g17s_gfx1_pre_idle_firmware_ops(
+                &agx_power_recovery::G17S_GFX1_PRE_IDLE_FIRMWARE_OPS,
+            )
+        );
+        assert_eq!(
+            agx_power_recovery::g17s_pio_mapped_pointer_offset(
+                agx_power_recovery::G17PioSlot::PushTelemetryDashboardConfigSpace,
+            ),
+            0x1c0
+        );
         assert!(agx_power_recovery::g17s_gfx1_idle_poll_satisfied(1));
         assert_eq!(
             agx_power_recovery::g17s_gfx1_report_timebase_delta_us(

@@ -35,9 +35,10 @@ pub(crate) const RECOVERY_EVIDENCE_TARGETS: [RecoveryEvidenceTarget; 5] = [
     RecoveryEvidenceTarget::G17S,
 ];
 
-/// G17S establishes the internal transition grammar, numeric PIO slots, and
-/// one idle poll. The physical bases for slots 0/0x0b, G17G/G17P firmware
-/// parity, and the intervening firmware-only operations remain unproved.
+/// G17S establishes the internal transition grammar, semantic PIO types, one
+/// idle poll, and the intervening firmware-operation order. The physical bases
+/// for types 0/0x0b, G17G/G17P firmware parity, and the opaque helper ownership
+/// remain unproved.
 pub(crate) const EXECUTABLE_GFX1_POWER_SEQUENCE_AVAILABLE: bool = false;
 
 /// The firmware writes and cross-role 0x22/0x23 protocol remain unproved, so
@@ -54,18 +55,31 @@ pub(crate) const GFX1_POWER_NAP: u8 = 0x10;
 /// without assigning a semantic name.
 pub(crate) const GFX1_POWER_INTERMEDIATE_21: u8 = 0x21;
 
-/// Numeric G17 PIO slots used by the pinned G17S GFX1 transition callback.
+/// Semantic G17 PIO types used by the pinned G17S GFX1 transition callback.
 ///
-/// The exact Apple semantic names of slots 0 and 0x0b are not established by
-/// a direct reference, so the model deliberately keeps numeric names. The
-/// host G17S/G17G/G17P relative-offset tables and G17S GFX1 firmware all
-/// contain the same byte-exact slot-0x24 record.
+/// The firmware's 52-entry name/type table and type-indexed 0x28-byte PIO
+/// descriptor copier directly pair these names and numeric values. Their
+/// physical mappings are a separate, still-unproved property.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum G17PioSlot {
-    Slot00 = 0x00,
-    Slot0b = 0x0b,
-    Slot24 = 0x24,
+    GpcAicSwInt = 0x00,
+    PushTelemetryDashboardConfigSpace = 0x0b,
+    FenderRegsMcw = 0x24,
+}
+
+/// Exact PIO descriptor layout used by the pinned firmware's type copier.
+pub(crate) const G17S_PIO_DESCRIPTOR_SIZE: u32 = 0x28;
+pub(crate) const G17S_PIO_DESCRIPTOR_POINTER_OFFSET: u32 = 0x08;
+
+/// Offset of one type's descriptor from the firmware PIO descriptor mirror.
+pub(crate) const fn g17s_pio_descriptor_offset(slot: G17PioSlot) -> u32 {
+    slot as u32 * G17S_PIO_DESCRIPTOR_SIZE
+}
+
+/// Offset of the callback's mapped-pointer field from the descriptor mirror.
+pub(crate) const fn g17s_pio_mapped_pointer_offset(slot: G17PioSlot) -> u32 {
+    g17s_pio_descriptor_offset(slot) + G17S_PIO_DESCRIPTOR_POINTER_OFFSET
 }
 
 /// One exact 32-bit PIO operation in firmware execution order.
@@ -89,12 +103,12 @@ pub(crate) enum G17PioOp {
 /// and before the idle poll. Consequently this is not an executable sequence.
 pub(crate) const G17S_GFX1_SLEEP_TO_21_PIO_PREFIX: [G17PioOp; 2] = [
     G17PioOp::Write {
-        slot: G17PioSlot::Slot00,
+        slot: G17PioSlot::GpcAicSwInt,
         offset: 0x430,
         value: 0x0800_0000,
     },
     G17PioOp::Write {
-        slot: G17PioSlot::Slot0b,
+        slot: G17PioSlot::PushTelemetryDashboardConfigSpace,
         offset: 0x354,
         value: 0x0020_0000,
     },
@@ -103,17 +117,17 @@ pub(crate) const G17S_GFX1_SLEEP_TO_21_PIO_PREFIX: [G17PioOp; 2] = [
 /// Ordered PIO prefix for G17S GFX1 `0x21 -> SLEEP/NAP`.
 pub(crate) const G17S_GFX1_21_TO_LOW_POWER_PIO_PREFIX: [G17PioOp; 3] = [
     G17PioOp::Write {
-        slot: G17PioSlot::Slot00,
+        slot: G17PioSlot::GpcAicSwInt,
         offset: 0x630,
         value: 0x0800_0000,
     },
     G17PioOp::SetBits {
-        slot: G17PioSlot::Slot0b,
+        slot: G17PioSlot::PushTelemetryDashboardConfigSpace,
         offset: 0x758,
         mask: 0x0000_0b00,
     },
     G17PioOp::Write {
-        slot: G17PioSlot::Slot0b,
+        slot: G17PioSlot::PushTelemetryDashboardConfigSpace,
         offset: 0x254,
         value: 0x0020_0000,
     },
@@ -127,6 +141,70 @@ pub(crate) fn validate_g17s_gfx1_sleep_to_21_pio_prefix(ops: &[G17PioOp]) -> boo
 /// Validate only the exact observed `0x21 -> SLEEP/NAP` PIO prefix.
 pub(crate) fn validate_g17s_gfx1_21_to_low_power_pio_prefix(ops: &[G17PioOp]) -> bool {
     ops == G17S_GFX1_21_TO_LOW_POWER_PIO_PREFIX
+}
+
+/// One exact firmware-internal operation between the G17S PIO writes and poll.
+///
+/// Addresses are offsets from the firmware text or global-data virtual base.
+/// Helper calls deliberately remain opaque: their machine-code targets and
+/// object addresses are proven, but Linux ownership and equivalent semantics
+/// are not.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum G17SFirmwareOp {
+    OpaqueHelperCall {
+        helper_text_offset: u32,
+        object_global_offset: u32,
+    },
+    AtomicAdd32 {
+        global_offset: u32,
+        addend: i32,
+    },
+    RejectBothNonZero32 {
+        root_global_offset: u32,
+        pointer_offset: u32,
+        field_offset: u32,
+        global_offset: u32,
+    },
+    AtomicSetBits64 {
+        global_offset: u32,
+        mask: u64,
+    },
+}
+
+/// Ordered G17S operations after the `SLEEP/NAP -> 0x21` PIO writes and before
+/// the type-0x24 idle poll.
+pub(crate) const G17S_GFX1_PRE_IDLE_FIRMWARE_OPS: [G17SFirmwareOp; 6] = [
+    G17SFirmwareOp::OpaqueHelperCall {
+        helper_text_offset: 0x0003_b1d8,
+        object_global_offset: 0x0000_0df0,
+    },
+    G17SFirmwareOp::AtomicAdd32 {
+        global_offset: 0x0000_21e0,
+        addend: -1,
+    },
+    G17SFirmwareOp::RejectBothNonZero32 {
+        root_global_offset: 0x0000_0e08,
+        pointer_offset: 0x481,
+        field_offset: 0x38,
+        global_offset: 0x0000_2d10,
+    },
+    G17SFirmwareOp::AtomicSetBits64 {
+        global_offset: 0x0000_11a0,
+        mask: 0x0800_0000,
+    },
+    G17SFirmwareOp::OpaqueHelperCall {
+        helper_text_offset: 0x0003_a8e8,
+        object_global_offset: 0x0000_11a0,
+    },
+    G17SFirmwareOp::OpaqueHelperCall {
+        helper_text_offset: 0x0003_b1d8,
+        object_global_offset: 0x0000_0dd8,
+    },
+];
+
+/// Validate only the byte-confirmed G17S pre-idle firmware-operation order.
+pub(crate) fn validate_g17s_gfx1_pre_idle_firmware_ops(ops: &[G17SFirmwareOp]) -> bool {
+    ops == G17S_GFX1_PRE_IDLE_FIRMWARE_OPS
 }
 
 /// G17 host targets with the byte-identical slot-0x24 relative-map record.
@@ -337,7 +415,7 @@ mod tests {
 
         let mut wrong_value = G17S_GFX1_SLEEP_TO_21_PIO_PREFIX;
         wrong_value[1] = G17PioOp::Write {
-            slot: G17PioSlot::Slot0b,
+            slot: G17PioSlot::PushTelemetryDashboardConfigSpace,
             offset: 0x354,
             value: 0x0020_0001,
         };
@@ -345,7 +423,7 @@ mod tests {
 
         let mut wrong_kind = G17S_GFX1_21_TO_LOW_POWER_PIO_PREFIX;
         wrong_kind[1] = G17PioOp::Write {
-            slot: G17PioSlot::Slot0b,
+            slot: G17PioSlot::PushTelemetryDashboardConfigSpace,
             offset: 0x758,
             value: 0x0000_0b00,
         };
@@ -354,8 +432,62 @@ mod tests {
     }
 
     #[test]
+    fn g17s_pio_type_names_and_descriptor_indices_are_exact() {
+        assert_eq!(G17PioSlot::GpcAicSwInt as u8, 0x00);
+        assert_eq!(
+            G17PioSlot::PushTelemetryDashboardConfigSpace as u8,
+            0x0b
+        );
+        assert_eq!(G17PioSlot::FenderRegsMcw as u8, 0x24);
+        assert_eq!(G17S_PIO_DESCRIPTOR_SIZE, 0x28);
+        assert_eq!(G17S_PIO_DESCRIPTOR_POINTER_OFFSET, 8);
+        assert_eq!(
+            g17s_pio_mapped_pointer_offset(G17PioSlot::GpcAicSwInt),
+            0x008
+        );
+        assert_eq!(
+            g17s_pio_mapped_pointer_offset(
+                G17PioSlot::PushTelemetryDashboardConfigSpace
+            ),
+            0x1c0
+        );
+        assert_eq!(
+            g17s_pio_mapped_pointer_offset(G17PioSlot::FenderRegsMcw),
+            0x5a8
+        );
+    }
+
+    #[test]
+    fn g17s_pre_idle_firmware_ops_require_exact_order_and_width() {
+        assert!(validate_g17s_gfx1_pre_idle_firmware_ops(
+            &G17S_GFX1_PRE_IDLE_FIRMWARE_OPS
+        ));
+
+        let mut wrong_order = G17S_GFX1_PRE_IDLE_FIRMWARE_OPS;
+        wrong_order.swap(0, 1);
+        assert!(!validate_g17s_gfx1_pre_idle_firmware_ops(&wrong_order));
+
+        let mut wrong_width = G17S_GFX1_PRE_IDLE_FIRMWARE_OPS;
+        wrong_width[3] = G17SFirmwareOp::AtomicAdd32 {
+            global_offset: 0x0000_11a0,
+            addend: 0x0800_0000,
+        };
+        assert!(!validate_g17s_gfx1_pre_idle_firmware_ops(&wrong_width));
+
+        let mut wrong_helper_object = G17S_GFX1_PRE_IDLE_FIRMWARE_OPS;
+        wrong_helper_object[5] = G17SFirmwareOp::OpaqueHelperCall {
+            helper_text_offset: 0x0003_b1d8,
+            object_global_offset: 0x0000_0df0,
+        };
+        assert!(!validate_g17s_gfx1_pre_idle_firmware_ops(
+            &wrong_helper_object
+        ));
+        assert!(!validate_g17s_gfx1_pre_idle_firmware_ops(&[]));
+    }
+
+    #[test]
     fn g17s_idle_poll_has_exact_map_predicate_and_reported_deadline() {
-        assert_eq!(G17PioSlot::Slot24 as u8, 0x24);
+        assert_eq!(G17PioSlot::FenderRegsMcw as u8, 0x24);
         assert_eq!(G17_PIO_SLOT_24_RELATIVE_OFFSET, 0x00d4_0000);
         assert_eq!(G17_PIO_SLOT_24_SIZE, 0x4000);
         assert_eq!(G17S_GFX1_IDLE_STATUS_PHYS, 0x21_00d4_0000);
