@@ -220,6 +220,62 @@ pub(crate) struct DataMasterRingNextEntry {
     pub(crate) published_write_index: u8,
 }
 
+/// Data-master ordinal passed to Apple's command-entry encoder.
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub(crate) enum DataMasterClass {
+    Ta,
+    ThreeD,
+    Cl,
+}
+
+/// Host index handoff performed before publishing firmware ring pointers.
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub(crate) enum DataMasterFirmwareIndexHandoff {
+    /// For each priority, copy each ring's write index to read, then copy each
+    /// ring's write index to CFI.
+    MirrorReadAndCfiToWrite,
+    /// Scratch-backed read/CFI setters trap, and `initFirmwareData` performs
+    /// no host stores through them before publishing their firmware pointers.
+    NoHostReadOrCfiStore,
+}
+
+/// Exact host-side publication layout for firmware data-master ring pointers.
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub(crate) struct DataMasterFirmwareTableConfig {
+    pub(crate) descriptor_table_cpu_pointer_object_offset: u16,
+    pub(crate) ta_ring_object_base_offset: u16,
+    pub(crate) three_d_ring_object_base_offset: u16,
+    pub(crate) cl_ring_object_base_offset: u16,
+    pub(crate) ring_object_stride: u8,
+    pub(crate) priority_count: u8,
+    pub(crate) data_master_count: u8,
+    pub(crate) descriptor_record_stride: u8,
+    pub(crate) read_index_firmware_pointer_offset: u8,
+    pub(crate) cfi_index_firmware_pointer_offset: u8,
+    pub(crate) write_index_firmware_pointer_offset: u8,
+    pub(crate) entries_firmware_pointer_offset: u8,
+    pub(crate) index_handoff: DataMasterFirmwareIndexHandoff,
+    pub(crate) firmware_read_index_acknowledgment_writer_proven: bool,
+    pub(crate) dual_stack_runtime_selector_proven: bool,
+}
+
+/// Pure class/priority selection within Apple's classic submit methods and
+/// corresponding firmware descriptor table.
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub(crate) struct DataMasterFirmwareRingRoute {
+    pub(crate) encoder_data_master_ordinal: u8,
+    pub(crate) ring_object_offset: u16,
+    pub(crate) descriptor_record_offset: u16,
+    pub(crate) read_index_firmware_pointer_offset: u16,
+    pub(crate) cfi_index_firmware_pointer_offset: u16,
+    pub(crate) write_index_firmware_pointer_offset: u16,
+    pub(crate) entries_firmware_pointer_offset: u16,
+}
+
 /// Refusals made by the target-pinned SKSM submission preflight.
 #[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -236,6 +292,10 @@ pub(crate) enum SubmissionConfigError {
     UnexpectedFirmwareKickEndpointConfig,
     /// The supplied data-master ring contract differs from exact host values.
     UnexpectedDataMasterRingConfig,
+    /// The supplied firmware ring-table contract differs from exact host values.
+    UnexpectedDataMasterFirmwareTableConfig,
+    /// The priority is outside the four published data-master ring groups.
+    DataMasterPriorityOutOfRange,
     /// The shared read index is outside the host's eight-bit ring index space.
     DataMasterReadIndexOutOfRange,
     /// The shared write index is outside the host's eight-bit ring index space.
@@ -256,6 +316,10 @@ pub(crate) const GROUNDED_FIRMWARE_KICK_ENDPOINT_CONFIG_AVAILABLE: bool = true;
 /// every target supported by the firmware-kick word encoder.
 #[allow(dead_code)]
 pub(crate) const GROUNDED_DATA_MASTER_RING_CONFIG_AVAILABLE: bool = true;
+/// A pure firmware ring-table publication and classic class/priority selector
+/// is available for the same independently pinned G15-G17 host corpus.
+#[allow(dead_code)]
+pub(crate) const GROUNDED_DATA_MASTER_FIRMWARE_TABLE_CONFIG_AVAILABLE: bool = true;
 /// The symbolic meaning of the firmware shared-data caching-option numbers,
 /// firmware consumer ownership, and transport selection on dual-stack targets
 /// are not proved, so command submission must remain disconnected from these
@@ -294,6 +358,33 @@ const DATA_MASTER_RING_PUBLICATION_STEPS: [DataMasterRingPublicationStep; 6] = [
     DataMasterRingPublicationStep::IncrementAndWrap8,
     DataMasterRingPublicationStep::StoreWriteIndex,
 ];
+
+const fn make_data_master_firmware_table_config(
+    descriptor_table_cpu_pointer_object_offset: u16,
+    ta_ring_object_base_offset: u16,
+    three_d_ring_object_base_offset: u16,
+    cl_ring_object_base_offset: u16,
+    ring_object_stride: u8,
+    index_handoff: DataMasterFirmwareIndexHandoff,
+) -> DataMasterFirmwareTableConfig {
+    DataMasterFirmwareTableConfig {
+        descriptor_table_cpu_pointer_object_offset,
+        ta_ring_object_base_offset,
+        three_d_ring_object_base_offset,
+        cl_ring_object_base_offset,
+        ring_object_stride,
+        priority_count: 4,
+        data_master_count: 3,
+        descriptor_record_stride: 0x20,
+        read_index_firmware_pointer_offset: 0x00,
+        cfi_index_firmware_pointer_offset: 0x08,
+        write_index_firmware_pointer_offset: 0x10,
+        entries_firmware_pointer_offset: 0x18,
+        index_handoff,
+        firmware_read_index_acknowledgment_writer_proven: false,
+        dual_stack_runtime_selector_proven: false,
+    }
+}
 
 // Host corpus SHA-256:
 // mac15g: 7e207cc2a4c669623cd7242b74e166c63ba9e4aa625307db6567fae342a897b3
@@ -430,6 +521,79 @@ const DATA_MASTER_RING_CONFIG_SCRATCH_INDICES: DataMasterRingConfig = DataMaster
     host_index_mutation: DataMasterRingHostIndexMutation::LockedScratchWriteOnly,
     ..DATA_MASTER_RING_CONFIG_G16X
 };
+
+const DATA_MASTER_FIRMWARE_TABLE_CONFIG_G15G: DataMasterFirmwareTableConfig =
+    make_data_master_firmware_table_config(
+        0x800,
+        0x368,
+        0x408,
+        0x4a8,
+        0x28,
+        DataMasterFirmwareIndexHandoff::MirrorReadAndCfiToWrite,
+    );
+const DATA_MASTER_FIRMWARE_TABLE_CONFIG_G15S: DataMasterFirmwareTableConfig =
+    make_data_master_firmware_table_config(
+        0xbc0,
+        0x368,
+        0x548,
+        0x728,
+        0x78,
+        DataMasterFirmwareIndexHandoff::NoHostReadOrCfiStore,
+    );
+const DATA_MASTER_FIRMWARE_TABLE_CONFIG_G15C_D: DataMasterFirmwareTableConfig =
+    make_data_master_firmware_table_config(
+        0xbc0,
+        0x368,
+        0x548,
+        0x728,
+        0x78,
+        DataMasterFirmwareIndexHandoff::NoHostReadOrCfiStore,
+    );
+const DATA_MASTER_FIRMWARE_TABLE_CONFIG_G16G: DataMasterFirmwareTableConfig =
+    make_data_master_firmware_table_config(
+        0xbc8,
+        0x370,
+        0x550,
+        0x730,
+        0x78,
+        DataMasterFirmwareIndexHandoff::NoHostReadOrCfiStore,
+    );
+const DATA_MASTER_FIRMWARE_TABLE_CONFIG_G16X: DataMasterFirmwareTableConfig =
+    make_data_master_firmware_table_config(
+        0x840,
+        0x3a8,
+        0x448,
+        0x4e8,
+        0x28,
+        DataMasterFirmwareIndexHandoff::MirrorReadAndCfiToWrite,
+    );
+const DATA_MASTER_FIRMWARE_TABLE_CONFIG_G17P: DataMasterFirmwareTableConfig =
+    make_data_master_firmware_table_config(
+        0xa80,
+        0x3a8,
+        0x448,
+        0x4e8,
+        0x28,
+        DataMasterFirmwareIndexHandoff::MirrorReadAndCfiToWrite,
+    );
+const DATA_MASTER_FIRMWARE_TABLE_CONFIG_G17G: DataMasterFirmwareTableConfig =
+    make_data_master_firmware_table_config(
+        0xa88,
+        0x3b0,
+        0x450,
+        0x4f0,
+        0x28,
+        DataMasterFirmwareIndexHandoff::MirrorReadAndCfiToWrite,
+    );
+const DATA_MASTER_FIRMWARE_TABLE_CONFIG_G17X: DataMasterFirmwareTableConfig =
+    make_data_master_firmware_table_config(
+        0xa80,
+        0x3a8,
+        0x448,
+        0x4e8,
+        0x28,
+        DataMasterFirmwareIndexHandoff::MirrorReadAndCfiToWrite,
+    );
 
 /// Identity and userspace-visible architecture axes decoded from GPU ID MMIO.
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -697,6 +861,138 @@ pub(crate) const fn data_master_ring_config(
         (G17, G) => Some(DATA_MASTER_RING_CONFIG_G17G),
         _ => None,
     }
+}
+
+/// Return the exact ring-pointer table published by `initFirmwareData`.
+///
+/// Each pinned host publishes four priorities in priority-major order. Within
+/// each priority, TA, 3D and CL occupy three consecutive 0x20-byte records.
+/// Each record carries firmware pointers for read, CFI, write and entries at
+/// offsets 0, 8, 0x10 and 0x18. The corresponding submit methods independently
+/// select a ring object as the class base plus `priority * ring_object_stride`
+/// and pass ordinals 0, 1 and 2 to their command encoders.
+///
+/// This describes the classic submit-method ring path only. The firmware code
+/// that advances the read index and the runtime selector between classic and
+/// SKSM stacks have not been pinned, so both claims remain explicitly false.
+#[allow(dead_code)]
+pub(crate) const fn data_master_firmware_table_config(
+    gpu_gen: GpuGen,
+    gpu_variant: GpuVariant,
+) -> Option<DataMasterFirmwareTableConfig> {
+    use GpuGen::*;
+    use GpuVariant::*;
+
+    match (gpu_gen, gpu_variant) {
+        (G15, G) => Some(DATA_MASTER_FIRMWARE_TABLE_CONFIG_G15G),
+        (G15, S) => Some(DATA_MASTER_FIRMWARE_TABLE_CONFIG_G15S),
+        (G15, C | D) => Some(DATA_MASTER_FIRMWARE_TABLE_CONFIG_G15C_D),
+        (G16, G) => Some(DATA_MASTER_FIRMWARE_TABLE_CONFIG_G16G),
+        (G16, S | C) => Some(DATA_MASTER_FIRMWARE_TABLE_CONFIG_G16X),
+        (G17, P) => Some(DATA_MASTER_FIRMWARE_TABLE_CONFIG_G17P),
+        (G17, G) => Some(DATA_MASTER_FIRMWARE_TABLE_CONFIG_G17G),
+        (G17, S | C) => Some(DATA_MASTER_FIRMWARE_TABLE_CONFIG_G17X),
+        _ => None,
+    }
+}
+
+const fn data_master_firmware_index_handoff_matches(
+    supplied: DataMasterFirmwareIndexHandoff,
+    expected: DataMasterFirmwareIndexHandoff,
+) -> bool {
+    matches!(
+        (supplied, expected),
+        (
+            DataMasterFirmwareIndexHandoff::MirrorReadAndCfiToWrite,
+            DataMasterFirmwareIndexHandoff::MirrorReadAndCfiToWrite,
+        ) | (
+            DataMasterFirmwareIndexHandoff::NoHostReadOrCfiStore,
+            DataMasterFirmwareIndexHandoff::NoHostReadOrCfiStore,
+        )
+    )
+}
+
+/// Validate an externally recovered firmware ring-pointer table contract.
+#[allow(dead_code)]
+pub(crate) const fn validate_data_master_firmware_table_config(
+    gpu_gen: GpuGen,
+    gpu_variant: GpuVariant,
+    supplied: DataMasterFirmwareTableConfig,
+) -> Result<DataMasterFirmwareTableConfig, SubmissionConfigError> {
+    let Some(expected) = data_master_firmware_table_config(gpu_gen, gpu_variant) else {
+        return Err(SubmissionConfigError::UnsupportedTarget);
+    };
+
+    if supplied.descriptor_table_cpu_pointer_object_offset
+        != expected.descriptor_table_cpu_pointer_object_offset
+        || supplied.ta_ring_object_base_offset != expected.ta_ring_object_base_offset
+        || supplied.three_d_ring_object_base_offset != expected.three_d_ring_object_base_offset
+        || supplied.cl_ring_object_base_offset != expected.cl_ring_object_base_offset
+        || supplied.ring_object_stride != expected.ring_object_stride
+        || supplied.priority_count != expected.priority_count
+        || supplied.data_master_count != expected.data_master_count
+        || supplied.descriptor_record_stride != expected.descriptor_record_stride
+        || supplied.read_index_firmware_pointer_offset
+            != expected.read_index_firmware_pointer_offset
+        || supplied.cfi_index_firmware_pointer_offset != expected.cfi_index_firmware_pointer_offset
+        || supplied.write_index_firmware_pointer_offset
+            != expected.write_index_firmware_pointer_offset
+        || supplied.entries_firmware_pointer_offset != expected.entries_firmware_pointer_offset
+        || !data_master_firmware_index_handoff_matches(
+            supplied.index_handoff,
+            expected.index_handoff,
+        )
+        || supplied.firmware_read_index_acknowledgment_writer_proven
+            != expected.firmware_read_index_acknowledgment_writer_proven
+        || supplied.dual_stack_runtime_selector_proven
+            != expected.dual_stack_runtime_selector_proven
+    {
+        Err(SubmissionConfigError::UnexpectedDataMasterFirmwareTableConfig)
+    } else {
+        Ok(expected)
+    }
+}
+
+/// Select the exact ring object and firmware descriptor record for one class
+/// and priority without reading or modifying any shared state.
+#[allow(dead_code)]
+pub(crate) const fn data_master_firmware_ring_route(
+    gpu_gen: GpuGen,
+    gpu_variant: GpuVariant,
+    data_master: DataMasterClass,
+    priority: u8,
+) -> Result<DataMasterFirmwareRingRoute, SubmissionConfigError> {
+    let Some(config) = data_master_firmware_table_config(gpu_gen, gpu_variant) else {
+        return Err(SubmissionConfigError::UnsupportedTarget);
+    };
+    if priority >= config.priority_count {
+        return Err(SubmissionConfigError::DataMasterPriorityOutOfRange);
+    }
+
+    let (encoder_data_master_ordinal, ring_object_base_offset) = match data_master {
+        DataMasterClass::Ta => (0u8, config.ta_ring_object_base_offset),
+        DataMasterClass::ThreeD => (1, config.three_d_ring_object_base_offset),
+        DataMasterClass::Cl => (2, config.cl_ring_object_base_offset),
+    };
+    let ring_object_offset =
+        ring_object_base_offset + priority as u16 * config.ring_object_stride as u16;
+    let descriptor_record_offset = (priority as u16 * config.data_master_count as u16
+        + encoder_data_master_ordinal as u16)
+        * config.descriptor_record_stride as u16;
+
+    Ok(DataMasterFirmwareRingRoute {
+        encoder_data_master_ordinal,
+        ring_object_offset,
+        descriptor_record_offset,
+        read_index_firmware_pointer_offset: descriptor_record_offset
+            + config.read_index_firmware_pointer_offset as u16,
+        cfi_index_firmware_pointer_offset: descriptor_record_offset
+            + config.cfi_index_firmware_pointer_offset as u16,
+        write_index_firmware_pointer_offset: descriptor_record_offset
+            + config.write_index_firmware_pointer_offset as u16,
+        entries_firmware_pointer_offset: descriptor_record_offset
+            + config.entries_firmware_pointer_offset as u16,
+    })
 }
 
 const fn data_master_ring_index_backing_matches(
@@ -1479,6 +1775,229 @@ mod tests {
         }
 
         assert!(GROUNDED_DATA_MASTER_RING_CONFIG_AVAILABLE);
+        assert!(!EXECUTABLE_G15_G17_SUBMISSION_AVAILABLE);
+    }
+
+    #[test]
+    fn data_master_firmware_table_and_class_priority_route_are_exact() {
+        for (gpu_gen, gpu_variant, expected) in [
+            (
+                GpuGen::G15,
+                GpuVariant::G,
+                DATA_MASTER_FIRMWARE_TABLE_CONFIG_G15G,
+            ),
+            (
+                GpuGen::G15,
+                GpuVariant::S,
+                DATA_MASTER_FIRMWARE_TABLE_CONFIG_G15S,
+            ),
+            (
+                GpuGen::G15,
+                GpuVariant::C,
+                DATA_MASTER_FIRMWARE_TABLE_CONFIG_G15C_D,
+            ),
+            (
+                GpuGen::G15,
+                GpuVariant::D,
+                DATA_MASTER_FIRMWARE_TABLE_CONFIG_G15C_D,
+            ),
+            (
+                GpuGen::G16,
+                GpuVariant::G,
+                DATA_MASTER_FIRMWARE_TABLE_CONFIG_G16G,
+            ),
+            (
+                GpuGen::G16,
+                GpuVariant::S,
+                DATA_MASTER_FIRMWARE_TABLE_CONFIG_G16X,
+            ),
+            (
+                GpuGen::G16,
+                GpuVariant::C,
+                DATA_MASTER_FIRMWARE_TABLE_CONFIG_G16X,
+            ),
+            (
+                GpuGen::G17,
+                GpuVariant::P,
+                DATA_MASTER_FIRMWARE_TABLE_CONFIG_G17P,
+            ),
+            (
+                GpuGen::G17,
+                GpuVariant::G,
+                DATA_MASTER_FIRMWARE_TABLE_CONFIG_G17G,
+            ),
+            (
+                GpuGen::G17,
+                GpuVariant::S,
+                DATA_MASTER_FIRMWARE_TABLE_CONFIG_G17X,
+            ),
+            (
+                GpuGen::G17,
+                GpuVariant::C,
+                DATA_MASTER_FIRMWARE_TABLE_CONFIG_G17X,
+            ),
+        ] {
+            let config = data_master_firmware_table_config(gpu_gen, gpu_variant)
+                .expect("target should have a pinned firmware ring-table contract");
+            assert_eq!(config, expected);
+            assert_eq!(config.priority_count, 4);
+            assert_eq!(config.data_master_count, 3);
+            assert_eq!(config.descriptor_record_stride, 0x20);
+            assert_eq!(config.read_index_firmware_pointer_offset, 0x00);
+            assert_eq!(config.cfi_index_firmware_pointer_offset, 0x08);
+            assert_eq!(config.write_index_firmware_pointer_offset, 0x10);
+            assert_eq!(config.entries_firmware_pointer_offset, 0x18);
+            assert!(!config.firmware_read_index_acknowledgment_writer_proven);
+            assert!(!config.dual_stack_runtime_selector_proven);
+            assert_eq!(
+                validate_data_master_firmware_table_config(gpu_gen, gpu_variant, config),
+                Ok(config)
+            );
+
+            let alternate_handoff = match config.index_handoff {
+                DataMasterFirmwareIndexHandoff::MirrorReadAndCfiToWrite => {
+                    DataMasterFirmwareIndexHandoff::NoHostReadOrCfiStore
+                }
+                DataMasterFirmwareIndexHandoff::NoHostReadOrCfiStore => {
+                    DataMasterFirmwareIndexHandoff::MirrorReadAndCfiToWrite
+                }
+            };
+            for unexpected in [
+                DataMasterFirmwareTableConfig {
+                    descriptor_table_cpu_pointer_object_offset: config
+                        .descriptor_table_cpu_pointer_object_offset
+                        + 8,
+                    ..config
+                },
+                DataMasterFirmwareTableConfig {
+                    ta_ring_object_base_offset: config.ta_ring_object_base_offset + 8,
+                    ..config
+                },
+                DataMasterFirmwareTableConfig {
+                    three_d_ring_object_base_offset: config.three_d_ring_object_base_offset + 8,
+                    ..config
+                },
+                DataMasterFirmwareTableConfig {
+                    cl_ring_object_base_offset: config.cl_ring_object_base_offset + 8,
+                    ..config
+                },
+                DataMasterFirmwareTableConfig {
+                    ring_object_stride: config.ring_object_stride + 8,
+                    ..config
+                },
+                DataMasterFirmwareTableConfig {
+                    priority_count: 5,
+                    ..config
+                },
+                DataMasterFirmwareTableConfig {
+                    data_master_count: 4,
+                    ..config
+                },
+                DataMasterFirmwareTableConfig {
+                    descriptor_record_stride: 0x28,
+                    ..config
+                },
+                DataMasterFirmwareTableConfig {
+                    read_index_firmware_pointer_offset: 0x08,
+                    ..config
+                },
+                DataMasterFirmwareTableConfig {
+                    cfi_index_firmware_pointer_offset: 0x10,
+                    ..config
+                },
+                DataMasterFirmwareTableConfig {
+                    write_index_firmware_pointer_offset: 0x18,
+                    ..config
+                },
+                DataMasterFirmwareTableConfig {
+                    entries_firmware_pointer_offset: 0x20,
+                    ..config
+                },
+                DataMasterFirmwareTableConfig {
+                    index_handoff: alternate_handoff,
+                    ..config
+                },
+                DataMasterFirmwareTableConfig {
+                    firmware_read_index_acknowledgment_writer_proven: true,
+                    ..config
+                },
+                DataMasterFirmwareTableConfig {
+                    dual_stack_runtime_selector_proven: true,
+                    ..config
+                },
+            ] {
+                assert_eq!(
+                    validate_data_master_firmware_table_config(gpu_gen, gpu_variant, unexpected,),
+                    Err(SubmissionConfigError::UnexpectedDataMasterFirmwareTableConfig)
+                );
+            }
+
+            for (data_master, ordinal, base_offset) in [
+                (DataMasterClass::Ta, 0, config.ta_ring_object_base_offset),
+                (
+                    DataMasterClass::ThreeD,
+                    1,
+                    config.three_d_ring_object_base_offset,
+                ),
+                (DataMasterClass::Cl, 2, config.cl_ring_object_base_offset),
+            ] {
+                for priority in 0..config.priority_count {
+                    let record_offset = (priority as u16 * 3 + ordinal as u16) * 0x20;
+                    assert_eq!(
+                        data_master_firmware_ring_route(
+                            gpu_gen,
+                            gpu_variant,
+                            data_master,
+                            priority,
+                        ),
+                        Ok(DataMasterFirmwareRingRoute {
+                            encoder_data_master_ordinal: ordinal,
+                            ring_object_offset: base_offset
+                                + priority as u16 * config.ring_object_stride as u16,
+                            descriptor_record_offset: record_offset,
+                            read_index_firmware_pointer_offset: record_offset,
+                            cfi_index_firmware_pointer_offset: record_offset + 0x08,
+                            write_index_firmware_pointer_offset: record_offset + 0x10,
+                            entries_firmware_pointer_offset: record_offset + 0x18,
+                        })
+                    );
+                }
+                assert_eq!(
+                    data_master_firmware_ring_route(
+                        gpu_gen,
+                        gpu_variant,
+                        data_master,
+                        config.priority_count,
+                    ),
+                    Err(SubmissionConfigError::DataMasterPriorityOutOfRange)
+                );
+            }
+        }
+
+        for (gpu_gen, gpu_variant) in [
+            (GpuGen::G15, GpuVariant::P),
+            (GpuGen::G16, GpuVariant::P),
+            (GpuGen::G17, GpuVariant::A),
+        ] {
+            assert_eq!(
+                data_master_firmware_table_config(gpu_gen, gpu_variant),
+                None
+            );
+            assert_eq!(
+                validate_data_master_firmware_table_config(
+                    gpu_gen,
+                    gpu_variant,
+                    DATA_MASTER_FIRMWARE_TABLE_CONFIG_G15G,
+                ),
+                Err(SubmissionConfigError::UnsupportedTarget)
+            );
+            assert_eq!(
+                data_master_firmware_ring_route(gpu_gen, gpu_variant, DataMasterClass::Ta, 0,),
+                Err(SubmissionConfigError::UnsupportedTarget)
+            );
+        }
+
+        assert!(GROUNDED_DATA_MASTER_FIRMWARE_TABLE_CONFIG_AVAILABLE);
         assert!(!EXECUTABLE_G15_G17_SUBMISSION_AVAILABLE);
     }
 
