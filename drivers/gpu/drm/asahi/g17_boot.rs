@@ -6,11 +6,15 @@
 //! `GFX1` owns the observed internal power transitions. They have distinct
 //! transports and init-data roots, but both roots belong to one GPU/UAT
 //! address-space owner. This module models only the proven host-side gates; it
-//! deliberately contains no endpoint numbers, MMIO writes, power-state names,
-//! or recovery messages.
+//! deliberately contains no endpoint numbers or MMIO writes. Grounded power
+//! and recovery validation is kept in the disconnected
+//! [`agx_power_recovery`] module.
 
 #[cfg(not(test))]
-use crate::{g17_initdata, g17_rtkit};
+use crate::{agx_power_recovery, g17_initdata, g17_rtkit};
+#[cfg(test)]
+#[path = "agx_power_recovery.rs"]
+mod agx_power_recovery;
 #[cfg(test)]
 #[path = "g17_initdata.rs"]
 mod g17_initdata;
@@ -69,6 +73,16 @@ const fn implemented_pre_handoff_evidence() -> u16 {
     }
     if g17_rtkit::GROUNDED_CODEC_AVAILABLE && g17_rtkit::EXECUTABLE_TRANSPORT_AVAILABLE {
         implemented |= missing::RTKIT_TRANSPORT;
+    }
+    if agx_power_recovery::GROUNDED_POWER_RECOVERY_MODEL_AVAILABLE
+        && agx_power_recovery::EXECUTABLE_GFX1_POWER_SEQUENCE_AVAILABLE
+    {
+        implemented |= missing::GFX1_POWER_SEQUENCE;
+    }
+    if agx_power_recovery::GROUNDED_POWER_RECOVERY_MODEL_AVAILABLE
+        && agx_power_recovery::EXECUTABLE_G17_RECOVERY_HANDSHAKE_AVAILABLE
+    {
+        implemented |= missing::RECOVERY_HANDSHAKE;
     }
 
     implemented
@@ -400,5 +414,8 @@ mod tests {
         assert!(!g17_initdata::BOOTABLE_LAYOUT_AVAILABLE);
         assert!(g17_rtkit::GROUNDED_CODEC_AVAILABLE);
         assert!(!g17_rtkit::EXECUTABLE_TRANSPORT_AVAILABLE);
+        assert!(agx_power_recovery::GROUNDED_POWER_RECOVERY_MODEL_AVAILABLE);
+        assert!(!agx_power_recovery::EXECUTABLE_GFX1_POWER_SEQUENCE_AVAILABLE);
+        assert!(!agx_power_recovery::EXECUTABLE_G17_RECOVERY_HANDSHAKE_AVAILABLE);
     }
 }
