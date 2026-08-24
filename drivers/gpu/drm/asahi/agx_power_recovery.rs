@@ -185,28 +185,47 @@ pub(crate) const G17_GFX1_POWER_EVIDENCE_TARGETS: [G17Gfx1PowerEvidenceTarget; 3
     G17Gfx1PowerEvidenceTarget::G17S,
 ];
 
-/// How the pinned transition callback reaches its pre-idle work.
+/// Exact target-specific call site for the shared pre-idle CAS helper.
 ///
-/// The G17G/G17P helper bodies and hardware ownership are opaque. The callback
-/// bytes prove only that the direct G17S PIO prefix is absent before these
-/// exact calls; they do not prove that the helpers perform equivalent writes.
+/// The three helper bodies have the same 53-instruction normalized dataflow:
+/// their only body-local atomic access compares `1` and replaces it with `0`
+/// at the passed firmware-global object. G17S executes its direct PIO prefix
+/// before the same helper, while G17G/G17P reach the helper without that
+/// prefix. Thus the helper cannot account for the missing target PIO writes.
+/// Its private name and the ownership of its scheduler slow path stay opaque.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub(crate) enum G17Gfx1PreIdleEntryEvidence {
-    OpaqueHelper { helper_text_offset: u32 },
-    G17SDirectPioPrefix,
+pub(crate) struct G17Gfx1PreIdleEntryEvidence {
+    pub(crate) helper_text_offset: u32,
+    pub(crate) helper_object_vm_offset: u32,
+    pub(crate) direct_pio_prefix_before_helper: bool,
 }
+
+pub(crate) const G17_GFX1_PRE_IDLE_HELPER_WINDOW_SIZE: u32 = 0xd4;
+pub(crate) const G17_GFX1_PRE_IDLE_HELPER_INSTRUCTION_COUNT: u32 = 53;
+pub(crate) const G17_GFX1_PRE_IDLE_HELPER_CAS_COMPARE: u64 = 1;
+pub(crate) const G17_GFX1_PRE_IDLE_HELPER_CAS_REPLACEMENT: u64 = 0;
+/// No helper body directly resolves or accesses a PIO descriptor.
+pub(crate) const G17_GFX1_PRE_IDLE_HELPER_CONTAINS_DIRECT_PIO_ACCESS: bool = false;
 
 pub(crate) const fn g17_gfx1_pre_idle_entry_evidence(
     target: G17Gfx1PowerEvidenceTarget,
 ) -> G17Gfx1PreIdleEntryEvidence {
     match target {
-        G17Gfx1PowerEvidenceTarget::G17P => G17Gfx1PreIdleEntryEvidence::OpaqueHelper {
+        G17Gfx1PowerEvidenceTarget::G17P => G17Gfx1PreIdleEntryEvidence {
             helper_text_offset: 0x0003_5f5c,
+            helper_object_vm_offset: 0x000f_90f0,
+            direct_pio_prefix_before_helper: false,
         },
-        G17Gfx1PowerEvidenceTarget::G17G => G17Gfx1PreIdleEntryEvidence::OpaqueHelper {
+        G17Gfx1PowerEvidenceTarget::G17G => G17Gfx1PreIdleEntryEvidence {
             helper_text_offset: 0x0003_5db4,
+            helper_object_vm_offset: 0x000f_3c30,
+            direct_pio_prefix_before_helper: false,
         },
-        G17Gfx1PowerEvidenceTarget::G17S => G17Gfx1PreIdleEntryEvidence::G17SDirectPioPrefix,
+        G17Gfx1PowerEvidenceTarget::G17S => G17Gfx1PreIdleEntryEvidence {
+            helper_text_offset: 0x0003_b1d8,
+            helper_object_vm_offset: 0x0010_0df0,
+            direct_pio_prefix_before_helper: true,
+        },
     }
 }
 
@@ -252,11 +271,11 @@ pub(crate) enum G17PioOp {
     },
 }
 
-/// Ordered PIO prefix for G17S GFX1 `SLEEP -> 0x21`.
+/// Ordered PIO prefix for G17S GFX1 `0x21 -> SLEEP`.
 ///
 /// Firmware-internal synchronization and state checks occur after this prefix
 /// and before the idle poll. Consequently this is not an executable sequence.
-pub(crate) const G17S_GFX1_SLEEP_TO_21_PIO_PREFIX: [G17PioOp; 2] = [
+pub(crate) const G17S_GFX1_21_TO_SLEEP_PIO_PREFIX: [G17PioOp; 2] = [
     G17PioOp::Write {
         slot: G17PioSlot::GpcAicSwInt,
         offset: 0x430,
@@ -269,8 +288,8 @@ pub(crate) const G17S_GFX1_SLEEP_TO_21_PIO_PREFIX: [G17PioOp; 2] = [
     },
 ];
 
-/// Ordered PIO prefix for G17S GFX1 `0x21 -> SLEEP/NAP`.
-pub(crate) const G17S_GFX1_21_TO_LOW_POWER_PIO_PREFIX: [G17PioOp; 3] = [
+/// Ordered PIO prefix for G17S GFX1 `SLEEP/NAP -> 0x21`.
+pub(crate) const G17S_GFX1_LOW_POWER_TO_21_PIO_PREFIX: [G17PioOp; 3] = [
     G17PioOp::Write {
         slot: G17PioSlot::GpcAicSwInt,
         offset: 0x630,
@@ -288,14 +307,31 @@ pub(crate) const G17S_GFX1_21_TO_LOW_POWER_PIO_PREFIX: [G17PioOp; 3] = [
     },
 ];
 
-/// Validate only the exact observed `SLEEP -> 0x21` PIO prefix.
-pub(crate) fn validate_g17s_gfx1_sleep_to_21_pio_prefix(ops: &[G17PioOp]) -> bool {
-    ops == G17S_GFX1_SLEEP_TO_21_PIO_PREFIX
+/// Compatibility alias retained for the original, reversed direction name.
+pub(crate) const G17S_GFX1_SLEEP_TO_21_PIO_PREFIX: [G17PioOp; 2] =
+    G17S_GFX1_21_TO_SLEEP_PIO_PREFIX;
+/// Compatibility alias retained for the original, reversed direction name.
+pub(crate) const G17S_GFX1_21_TO_LOW_POWER_PIO_PREFIX: [G17PioOp; 3] =
+    G17S_GFX1_LOW_POWER_TO_21_PIO_PREFIX;
+
+/// Validate only the exact observed `0x21 -> SLEEP` PIO prefix.
+pub(crate) fn validate_g17s_gfx1_21_to_sleep_pio_prefix(ops: &[G17PioOp]) -> bool {
+    ops == G17S_GFX1_21_TO_SLEEP_PIO_PREFIX
 }
 
-/// Validate only the exact observed `0x21 -> SLEEP/NAP` PIO prefix.
+/// Validate only the exact observed `SLEEP/NAP -> 0x21` PIO prefix.
+pub(crate) fn validate_g17s_gfx1_low_power_to_21_pio_prefix(ops: &[G17PioOp]) -> bool {
+    ops == G17S_GFX1_LOW_POWER_TO_21_PIO_PREFIX
+}
+
+/// Compatibility wrapper retained for the original, reversed direction name.
+pub(crate) fn validate_g17s_gfx1_sleep_to_21_pio_prefix(ops: &[G17PioOp]) -> bool {
+    validate_g17s_gfx1_21_to_sleep_pio_prefix(ops)
+}
+
+/// Compatibility wrapper retained for the original, reversed direction name.
 pub(crate) fn validate_g17s_gfx1_21_to_low_power_pio_prefix(ops: &[G17PioOp]) -> bool {
-    ops == G17S_GFX1_21_TO_LOW_POWER_PIO_PREFIX
+    validate_g17s_gfx1_low_power_to_21_pio_prefix(ops)
 }
 
 /// One exact firmware-internal operation between the G17S PIO writes and poll.
@@ -326,8 +362,8 @@ pub(crate) enum G17SFirmwareOp {
     },
 }
 
-/// Ordered G17S operations after the `SLEEP/NAP -> 0x21` PIO writes and before
-/// the type-0x24 idle poll.
+/// Ordered G17S operations after the `0x21 -> SLEEP` PIO writes and before the
+/// type-0x24 idle poll.
 pub(crate) const G17S_GFX1_PRE_IDLE_FIRMWARE_OPS: [G17SFirmwareOp; 6] = [
     G17SFirmwareOp::OpaqueHelperCall {
         helper_text_offset: 0x0003_b1d8,
@@ -681,7 +717,7 @@ mod tests {
     }
 
     #[test]
-    fn g17_power_transition_and_poll_parity_excludes_direct_pio_prefix() {
+    fn g17_pre_idle_helper_is_shared_but_direct_pio_prefix_is_not() {
         assert_eq!(
             G17_GFX1_POWER_EVIDENCE_TARGETS,
             [
@@ -692,20 +728,33 @@ mod tests {
         );
         assert_eq!(
             g17_gfx1_pre_idle_entry_evidence(G17Gfx1PowerEvidenceTarget::G17P),
-            G17Gfx1PreIdleEntryEvidence::OpaqueHelper {
+            G17Gfx1PreIdleEntryEvidence {
                 helper_text_offset: 0x0003_5f5c,
+                helper_object_vm_offset: 0x000f_90f0,
+                direct_pio_prefix_before_helper: false,
             }
         );
         assert_eq!(
             g17_gfx1_pre_idle_entry_evidence(G17Gfx1PowerEvidenceTarget::G17G),
-            G17Gfx1PreIdleEntryEvidence::OpaqueHelper {
+            G17Gfx1PreIdleEntryEvidence {
                 helper_text_offset: 0x0003_5db4,
+                helper_object_vm_offset: 0x000f_3c30,
+                direct_pio_prefix_before_helper: false,
             }
         );
         assert_eq!(
             g17_gfx1_pre_idle_entry_evidence(G17Gfx1PowerEvidenceTarget::G17S),
-            G17Gfx1PreIdleEntryEvidence::G17SDirectPioPrefix
+            G17Gfx1PreIdleEntryEvidence {
+                helper_text_offset: 0x0003_b1d8,
+                helper_object_vm_offset: 0x0010_0df0,
+                direct_pio_prefix_before_helper: true,
+            }
         );
+        assert_eq!(G17_GFX1_PRE_IDLE_HELPER_WINDOW_SIZE, 0xd4);
+        assert_eq!(G17_GFX1_PRE_IDLE_HELPER_INSTRUCTION_COUNT, 53);
+        assert_eq!(G17_GFX1_PRE_IDLE_HELPER_CAS_COMPARE, 1);
+        assert_eq!(G17_GFX1_PRE_IDLE_HELPER_CAS_REPLACEMENT, 0);
+        assert!(!G17_GFX1_PRE_IDLE_HELPER_CONTAINS_DIRECT_PIO_ACCESS);
 
         let valid_edges = [
             (GFX1_POWER_SLEEP, GFX1_POWER_INTERMEDIATE_21),
@@ -754,34 +803,48 @@ mod tests {
     }
 
     #[test]
-    fn g17s_power_pio_prefixes_require_exact_order_and_operation_kind() {
+    fn g17s_power_pio_prefixes_require_exact_direction_order_and_kind() {
+        assert!(validate_g17s_gfx1_21_to_sleep_pio_prefix(
+            &G17S_GFX1_21_TO_SLEEP_PIO_PREFIX
+        ));
+        assert!(validate_g17s_gfx1_low_power_to_21_pio_prefix(
+            &G17S_GFX1_LOW_POWER_TO_21_PIO_PREFIX
+        ));
+        assert_eq!(
+            G17S_GFX1_SLEEP_TO_21_PIO_PREFIX,
+            G17S_GFX1_21_TO_SLEEP_PIO_PREFIX
+        );
+        assert_eq!(
+            G17S_GFX1_21_TO_LOW_POWER_PIO_PREFIX,
+            G17S_GFX1_LOW_POWER_TO_21_PIO_PREFIX
+        );
         assert!(validate_g17s_gfx1_sleep_to_21_pio_prefix(
-            &G17S_GFX1_SLEEP_TO_21_PIO_PREFIX
+            &G17S_GFX1_21_TO_SLEEP_PIO_PREFIX
         ));
         assert!(validate_g17s_gfx1_21_to_low_power_pio_prefix(
-            &G17S_GFX1_21_TO_LOW_POWER_PIO_PREFIX
+            &G17S_GFX1_LOW_POWER_TO_21_PIO_PREFIX
         ));
 
-        let mut wrong_order = G17S_GFX1_SLEEP_TO_21_PIO_PREFIX;
+        let mut wrong_order = G17S_GFX1_21_TO_SLEEP_PIO_PREFIX;
         wrong_order.swap(0, 1);
-        assert!(!validate_g17s_gfx1_sleep_to_21_pio_prefix(&wrong_order));
+        assert!(!validate_g17s_gfx1_21_to_sleep_pio_prefix(&wrong_order));
 
-        let mut wrong_value = G17S_GFX1_SLEEP_TO_21_PIO_PREFIX;
+        let mut wrong_value = G17S_GFX1_21_TO_SLEEP_PIO_PREFIX;
         wrong_value[1] = G17PioOp::Write {
             slot: G17PioSlot::PushTelemetryDashboardConfigSpace,
             offset: 0x354,
             value: 0x0020_0001,
         };
-        assert!(!validate_g17s_gfx1_sleep_to_21_pio_prefix(&wrong_value));
+        assert!(!validate_g17s_gfx1_21_to_sleep_pio_prefix(&wrong_value));
 
-        let mut wrong_kind = G17S_GFX1_21_TO_LOW_POWER_PIO_PREFIX;
+        let mut wrong_kind = G17S_GFX1_LOW_POWER_TO_21_PIO_PREFIX;
         wrong_kind[1] = G17PioOp::Write {
             slot: G17PioSlot::PushTelemetryDashboardConfigSpace,
             offset: 0x758,
             value: 0x0000_0b00,
         };
-        assert!(!validate_g17s_gfx1_21_to_low_power_pio_prefix(&wrong_kind));
-        assert!(!validate_g17s_gfx1_sleep_to_21_pio_prefix(&[]));
+        assert!(!validate_g17s_gfx1_low_power_to_21_pio_prefix(&wrong_kind));
+        assert!(!validate_g17s_gfx1_21_to_sleep_pio_prefix(&[]));
     }
 
     #[test]
