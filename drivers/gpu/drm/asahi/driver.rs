@@ -23,6 +23,7 @@ use kernel::{
 use crate::{
     debug,
     file,
+    g17_boot,
     gem::AsahiObject,
     gpu,
     hw,
@@ -163,6 +164,20 @@ impl platform::Driver for AsahiDriver {
         dev_info!(pdev.as_ref(), "Probing...\n");
 
         let cfg = info.ok_or(ENODEV)?;
+
+        // G17 requires two physical ASC roles with distinct transports and
+        // init-data roots, but one shared GPU/UAT owner. Refuse before any
+        // MMIO setup or ASC start until the target-specific GFX1 resources,
+        // power mapping, recovery wire protocol, and submission handoff are
+        // all implemented from evidence.
+        if let Err(missing) = g17_boot::pre_handoff_gate(cfg.gpu_gen as u32) {
+            dev_err!(
+                pdev.as_ref(),
+                "G17 dual-role pre-handoff is incomplete (missing evidence mask {:#x}); refusing to start GFX/GFX1\n",
+                missing
+            );
+            return Err(ENODEV);
+        }
 
         unsafe { pdev.dma_set_mask_and_coherent(DmaMask::try_new(cfg.uat_oas)?)? };
 
