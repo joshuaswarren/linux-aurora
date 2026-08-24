@@ -114,6 +114,128 @@ pub(crate) enum FirmwareRole {
     Gfx1 = 1,
 }
 
+/// G17 variants with exact paired nested-firmware evidence.
+///
+/// G17G/G17P and other variants are deliberately absent because the pinned
+/// corpus contains no equivalent role-paired nested images for them.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[repr(u8)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum G17FirmwareVariant {
+    G17S = b'S',
+    G17C = b'C',
+}
+
+/// Fail-closed variant decoding for diagnostic firmware selection.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum FirmwareIdentityError {
+    UnknownVariant,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const fn decode_g17_firmware_variant(
+    raw: u8,
+) -> Result<G17FirmwareVariant, FirmwareIdentityError> {
+    match raw {
+        b'S' => Ok(G17FirmwareVariant::G17S),
+        b'C' => Ok(G17FirmwareVariant::G17C),
+        _ => Err(FirmwareIdentityError::UnknownVariant),
+    }
+}
+
+/// One exact nested Mach-O identity from the pinned role-paired FTAB corpus.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct G17NestedFirmwareIdentity {
+    pub(crate) entry_tag: [u8; 4],
+    pub(crate) uuid: [u8; 16],
+    pub(crate) sha256: [u8; 32],
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+const G17S_GFX_FIRMWARE_IDENTITY: G17NestedFirmwareIdentity = G17NestedFirmwareIdentity {
+    entry_tag: *b"a010",
+    uuid: [
+        0x05, 0x23, 0x65, 0x20, 0x33, 0xf1, 0x3d, 0x41, 0x83, 0xcb, 0x16, 0x9f, 0xaa, 0xad,
+        0xbc, 0xa7,
+    ],
+    sha256: [
+        0x31, 0x7d, 0xe3, 0x5b, 0x44, 0x7e, 0x2a, 0x4c, 0xce, 0x0f, 0xb4, 0x67, 0xf0, 0xab,
+        0x04, 0xba, 0xa4, 0x2f, 0xce, 0xee, 0x8a, 0x3f, 0x55, 0x99, 0x8e, 0xcf, 0x3c, 0x62,
+        0x4d, 0x30, 0x03, 0x1b,
+    ],
+};
+
+#[cfg_attr(not(test), allow(dead_code))]
+const G17C_GFX_FIRMWARE_IDENTITY: G17NestedFirmwareIdentity = G17NestedFirmwareIdentity {
+    entry_tag: *b"a000",
+    uuid: [
+        0x21, 0xa1, 0x77, 0xa0, 0xc2, 0x7b, 0x30, 0x59, 0xa3, 0xb0, 0x05, 0x6c, 0xdd, 0xac,
+        0x65, 0x8b,
+    ],
+    sha256: [
+        0x61, 0xa3, 0x59, 0x3e, 0x78, 0x68, 0x67, 0x29, 0x40, 0x5b, 0x77, 0xe1, 0x67, 0xdd,
+        0x74, 0xbf, 0xb2, 0x5b, 0x0c, 0xe5, 0x82, 0x29, 0x65, 0x08, 0x54, 0x40, 0x4b, 0x3f,
+        0xd5, 0x3f, 0xd8, 0x9a,
+    ],
+};
+
+#[cfg_attr(not(test), allow(dead_code))]
+const G17S_GFX1_FIRMWARE_IDENTITY: G17NestedFirmwareIdentity = G17NestedFirmwareIdentity {
+    entry_tag: *b"a010",
+    uuid: [
+        0x0e, 0x98, 0xaf, 0xb8, 0x06, 0x80, 0x3b, 0x15, 0x93, 0x2e, 0x91, 0x0d, 0x0a, 0x1c,
+        0xcd, 0x78,
+    ],
+    sha256: [
+        0x5d, 0x71, 0x92, 0x08, 0xe1, 0x2b, 0xe6, 0xbf, 0xa7, 0x54, 0xca, 0x84, 0x86, 0xf3,
+        0x67, 0x39, 0xfc, 0xe7, 0x4b, 0x0c, 0x45, 0x61, 0x8a, 0xd9, 0xa0, 0xf4, 0x4a, 0x18,
+        0x9f, 0xee, 0xb3, 0x45,
+    ],
+};
+
+#[cfg_attr(not(test), allow(dead_code))]
+const G17C_GFX1_FIRMWARE_IDENTITY: G17NestedFirmwareIdentity = G17NestedFirmwareIdentity {
+    entry_tag: *b"a000",
+    uuid: [
+        0xfe, 0xb8, 0x1f, 0x4a, 0xf0, 0x75, 0x34, 0x49, 0xa6, 0x62, 0x3c, 0x01, 0xc0, 0x99,
+        0x4b, 0x4f,
+    ],
+    sha256: [
+        0xcf, 0x81, 0x13, 0xa8, 0xbc, 0x4a, 0x62, 0xc3, 0x76, 0xd1, 0x1a, 0x4d, 0xc5, 0xd5,
+        0xc5, 0x42, 0x99, 0x14, 0xb9, 0x5a, 0xb2, 0xd2, 0x19, 0x0a, 0x0e, 0xba, 0xd3, 0x27,
+        0x8a, 0x32, 0x34, 0x68,
+    ],
+};
+
+/// Select only an exact role/variant nested-firmware identity.
+///
+/// This proves the contents of the pinned containers, not a live G17C target
+/// or Linux ownership of FTAB extraction, fixups, or firmware loading.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const fn g17_nested_firmware_identity(
+    role: FirmwareRole,
+    variant: G17FirmwareVariant,
+) -> &'static G17NestedFirmwareIdentity {
+    match (role, variant) {
+        (FirmwareRole::Gfx, G17FirmwareVariant::G17S) => &G17S_GFX_FIRMWARE_IDENTITY,
+        (FirmwareRole::Gfx, G17FirmwareVariant::G17C) => &G17C_GFX_FIRMWARE_IDENTITY,
+        (FirmwareRole::Gfx1, G17FirmwareVariant::G17S) => &G17S_GFX1_FIRMWARE_IDENTITY,
+        (FirmwareRole::Gfx1, G17FirmwareVariant::G17C) => &G17C_GFX1_FIRMWARE_IDENTITY,
+    }
+}
+
+/// Validate tag, UUID, and hash together; no field is sufficient by itself.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn validate_g17_nested_firmware_identity(
+    role: FirmwareRole,
+    variant: G17FirmwareVariant,
+    observed: &G17NestedFirmwareIdentity,
+) -> bool {
+    observed == g17_nested_firmware_identity(role, variant)
+}
+
 const ROLE_COUNT: usize = 2;
 const KICK_ORDER: [FirmwareRole; ROLE_COUNT] = [FirmwareRole::Gfx, FirmwareRole::Gfx1];
 
@@ -387,6 +509,59 @@ mod tests {
             Err(BootError::RootMutationAfterKick)
         );
         assert!(!boot.kick_gate_open());
+    }
+
+    #[test]
+    fn nested_firmware_identity_is_exact_per_role_and_variant() {
+        for role in [FirmwareRole::Gfx, FirmwareRole::Gfx1] {
+            let g17s = g17_nested_firmware_identity(role, G17FirmwareVariant::G17S);
+            let g17c = g17_nested_firmware_identity(role, G17FirmwareVariant::G17C);
+            assert_eq!(g17s.entry_tag, *b"a010");
+            assert_eq!(g17c.entry_tag, *b"a000");
+            assert_ne!(g17s.uuid, g17c.uuid);
+            assert_ne!(g17s.sha256, g17c.sha256);
+            assert!(validate_g17_nested_firmware_identity(
+                role,
+                G17FirmwareVariant::G17S,
+                g17s,
+            ));
+            assert!(validate_g17_nested_firmware_identity(
+                role,
+                G17FirmwareVariant::G17C,
+                g17c,
+            ));
+
+            let mut changed = *g17s;
+            changed.sha256[0] ^= 1;
+            assert!(!validate_g17_nested_firmware_identity(
+                role,
+                G17FirmwareVariant::G17S,
+                &changed,
+            ));
+            assert!(!validate_g17_nested_firmware_identity(
+                role,
+                G17FirmwareVariant::G17C,
+                g17s,
+            ));
+        }
+
+        assert_eq!(
+            decode_g17_firmware_variant(b'S'),
+            Ok(G17FirmwareVariant::G17S)
+        );
+        assert_eq!(
+            decode_g17_firmware_variant(b'C'),
+            Ok(G17FirmwareVariant::G17C)
+        );
+        for raw in [b'G', b'P', b'A', 0, u8::MAX] {
+            assert_eq!(
+                decode_g17_firmware_variant(raw),
+                Err(FirmwareIdentityError::UnknownVariant)
+            );
+        }
+
+        let missing = pre_handoff_gate(G17_GENERATION).unwrap_err();
+        assert!(missing.contains(missing::FIRMWARE_IDENTITY));
     }
 
     #[test]
