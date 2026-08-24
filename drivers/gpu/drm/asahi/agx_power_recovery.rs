@@ -399,6 +399,32 @@ pub(crate) enum RecoveryWordState {
     FirmwareStoppedForPostRecovery = 3,
 }
 
+/// G15/G16 host targets with an independently pinned `+0x5190` recovery word.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum G15G16RecoveryLayoutEvidenceTarget {
+    G15G,
+    G16G,
+}
+
+pub(crate) const G15_G16_RECOVERY_LAYOUT_EVIDENCE_TARGETS:
+    [G15G16RecoveryLayoutEvidenceTarget; 2] = [
+        G15G16RecoveryLayoutEvidenceTarget::G15G,
+        G15G16RecoveryLayoutEvidenceTarget::G16G,
+    ];
+
+/// Offset from the mapped firmware-state base, not from the host object.
+pub(crate) const G15_G16_RECOVERY_WORD_OFFSET: u32 = 0x5190;
+
+pub(crate) const fn g15_g16_recovery_word_offset(
+    target: G15G16RecoveryLayoutEvidenceTarget,
+) -> u32 {
+    match target {
+        G15G16RecoveryLayoutEvidenceTarget::G15G | G15G16RecoveryLayoutEvidenceTarget::G16G => {
+            G15_G16_RECOVERY_WORD_OFFSET
+        }
+    }
+}
+
 /// G17 host targets with an independently pinned `+0x4ae0` recovery word.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum G17RecoveryLayoutEvidenceTarget {
@@ -450,6 +476,19 @@ pub(crate) const fn decode_recovery_word(raw: u32) -> Result<RecoveryWordState, 
         3 => Ok(RecoveryWordState::FirmwareStoppedForPostRecovery),
         _ => Err(RecoveryError::UnknownWordValue),
     }
+}
+
+/// Decode a G15/G16 recovery word only at the exact target-backed location.
+pub(crate) const fn decode_g15_g16_recovery_word_at_offset(
+    target: G15G16RecoveryLayoutEvidenceTarget,
+    observed_offset: u32,
+    raw: u32,
+) -> Result<RecoveryWordState, RecoveryError> {
+    if observed_offset != g15_g16_recovery_word_offset(target) {
+        return Err(RecoveryError::UnexpectedWordOffset);
+    }
+
+    decode_recovery_word(raw)
 }
 
 /// Decode a G17 recovery word only at the exact target-backed location.
@@ -666,6 +705,45 @@ mod tests {
         for raw in [4, 0x22, 0x23, u32::MAX] {
             assert_eq!(
                 decode_recovery_word(raw),
+                Err(RecoveryError::UnknownWordValue)
+            );
+        }
+    }
+
+    #[test]
+    fn g15g_and_g16g_use_the_pinned_mapped_state_offset() {
+        assert_eq!(G15_G16_RECOVERY_WORD_OFFSET, 0x5190);
+        assert_eq!(
+            G15_G16_RECOVERY_LAYOUT_EVIDENCE_TARGETS,
+            [
+                G15G16RecoveryLayoutEvidenceTarget::G15G,
+                G15G16RecoveryLayoutEvidenceTarget::G16G,
+            ]
+        );
+
+        for target in G15_G16_RECOVERY_LAYOUT_EVIDENCE_TARGETS {
+            assert_eq!(g15_g16_recovery_word_offset(target), 0x5190);
+            for raw in 0..=3 {
+                assert_eq!(
+                    decode_g15_g16_recovery_word_at_offset(target, 0x5190, raw),
+                    Ok(decode_recovery_word(raw).unwrap())
+                );
+            }
+            for wrong_offset in [0, 0x4ae0, 0x518c, 0x5194, u32::MAX] {
+                assert_eq!(
+                    decode_g15_g16_recovery_word_at_offset(target, wrong_offset, 1),
+                    Err(RecoveryError::UnexpectedWordOffset)
+                );
+            }
+        }
+
+        for raw in [4, 0x22, 0x23, u32::MAX] {
+            assert_eq!(
+                decode_g15_g16_recovery_word_at_offset(
+                    G15G16RecoveryLayoutEvidenceTarget::G15G,
+                    G15_G16_RECOVERY_WORD_OFFSET,
+                    raw,
+                ),
                 Err(RecoveryError::UnknownWordValue)
             );
         }
