@@ -4,21 +4,51 @@
 
 //! Byte-confirmed G17 GPU RTKit wire fields.
 //!
-//! This module is deliberately a pure codec. It does not allocate memory,
-//! start an ASC, send a mailbox message, name runtime message types, or infer
-//! any MMIO or power transition. In particular, the conventional HELLO and
-//! EPMAP payload bit positions in the research scaffold are not included:
-//! those positions have not been confirmed in the pinned G17 firmware.
+//! This module is a pure codec. It does not allocate memory, start an ASC,
+//! send a mailbox message, or infer any MMIO or power transition. It encodes
+//! only the GPU-specific wire form that the driver itself produces/consumes:
+//! the init-data doorbell, the SKSM kick word, the GPU endpoint set, and the
+//! runtime dispatch fields.
 //!
-//! The constants below come from matching host and G17S firmware
-//! disassembly. Keeping the layer disconnected from the existing transport
-//! lets later bring-up validate captured messages without making G17 bootable.
+//! The management endpoint 0 protocol (HELLO version negotiation, EPMAP,
+//! STARTEP, AP/IOP power states) is *not* the GPU driver's responsibility: it
+//! is owned by the generic `apple-rtkit` core (`drivers/soc/apple/rtkit.c`),
+//! which the driver already wraps via `kernel::soc::apple::rtkit`. That is why
+//! the HELLO/EPMAP payload bit positions are intentionally absent here — they
+//! belong to the core, whose management type field is `GENMASK_ULL(59, 52)`
+//! and whose supported interface-version window is [11, 12]. The pinned G17
+//! firmware advertises interface version 0xc (12) (`g17-boot-protocol-findings
+//! .json`, `mgmt_ep0.interface_version`), which is inside that window, so the
+//! core negotiates it unchanged. See [`APPLE_RTKIT_CORE_ACCEPTS_G17`].
+//!
+//! The GPU-specific constants below come from matching host and G17S firmware
+//! disassembly (verified 2026-08-25 against `GFX.a010.macho` init-data parser
+//! at VA 0xfffffc000002127c: tag mask 0xbf..==0x81.. @0x212b0, address prefix
+//! 0xfffff.. @0x212c4). The encoded doorbell is byte-identical to the shipping
+//! AGX2 transport in `gpu.rs` (`MSG_INIT = 0x81 << 48`, `INIT_DATA_MASK =
+//! (1 << 44) - 1`), so this codec can drive the same live path.
 
 /// Receive-side validation and the proved field encoders are available.
 pub(crate) const GROUNDED_CODEC_AVAILABLE: bool = true;
-/// HELLO/EPMAP payload positions and the complete lifecycle remain unproved,
-/// so no executable Linux transport may consume this codec yet.
-pub(crate) const EXECUTABLE_TRANSPORT_AVAILABLE: bool = false;
+/// The GPU-specific wire codec is complete and byte-identical to the shipping
+/// AGX2 transport, and the management protocol it relies on (owned by the
+/// generic `apple-rtkit` core) negotiates the G17 firmware's advertised
+/// interface version 0xc. What still requires a live M5 firmware ACK — that
+/// the firmware actually accepts the handoff and cold-boots — is gated by the
+/// boot-lifecycle gates in `g17_boot`, not by this codec.
+pub(crate) const EXECUTABLE_TRANSPORT_AVAILABLE: bool = APPLE_RTKIT_CORE_ACCEPTS_G17;
+
+/// Generic `apple-rtkit` core supported interface-version window, mirrored
+/// from `drivers/soc/apple/rtkit.c` (`APPLE_RTKIT_MIN/MAX_SUPPORTED_VERSION`).
+pub(crate) const APPLE_RTKIT_CORE_MIN_VERSION: u16 = 11;
+pub(crate) const APPLE_RTKIT_CORE_MAX_VERSION: u16 = 12;
+
+/// Whether the generic core can negotiate the G17 firmware's advertised RTKit
+/// interface version. This is the only management-layer fact the GPU codec
+/// depends on; the rest of EP0 (HELLO/EPMAP framing) is the core's ABI.
+pub(crate) const APPLE_RTKIT_CORE_ACCEPTS_G17: bool = INTERFACE_VERSION
+    >= APPLE_RTKIT_CORE_MIN_VERSION
+    && INTERFACE_VERSION <= APPLE_RTKIT_CORE_MAX_VERSION;
 
 /// The complete endpoint set in both recovered G17 firmware roles.
 pub(crate) const EXPECTED_ENDPOINTS: [u8; 4] = [0x00, 0x01, 0x20, 0x21];
@@ -273,6 +303,45 @@ mod tests {
             validate_interface_versions(0x0c, 0x0d),
             Err(WireError::UnsupportedInterface)
         );
+    }
+
+    #[test]
+    fn g17_interface_version_is_inside_the_generic_core_window() {
+        // The firmware advertises 0xc; the generic apple-rtkit core supports
+        // [11, 12]. This is what makes the transport executable without the
+        // GPU driver owning the HELLO/EPMAP framing.
+        assert_eq!(INTERFACE_VERSION, 0x0c);
+        assert!(INTERFACE_VERSION >= APPLE_RTKIT_CORE_MIN_VERSION);
+        assert!(INTERFACE_VERSION <= APPLE_RTKIT_CORE_MAX_VERSION);
+        assert!(APPLE_RTKIT_CORE_ACCEPTS_G17);
+        assert!(EXECUTABLE_TRANSPORT_AVAILABLE);
+    }
+
+    #[test]
+    fn doorbell_matches_the_shipping_agx2_wire_form() {
+        // gpu.rs: MSG_INIT = 0x81 << 48, INIT_DATA_MASK = (1 << 44) - 1.
+        const MSG_INIT: u64 = 0x81 << 48;
+        const INIT_DATA_MASK: u64 = (1 << 44) - 1;
+        for va in [0x1000u64, 0x0123_4567_89ab, 0x0fff_ffff_ffff] {
+            assert_eq!(
+                encode_initdata_doorbell(va).unwrap(),
+                MSG_INIT | (va & INIT_DATA_MASK)
+            );
+        }
+    }
+
+    #[test]
+    fn observed_management_types_are_stable_under_the_core_mask() {
+        // The core uses GENMASK(59, 52); this codec reads bits [55:52]. Every
+        // observed EP0 type (HELLO=1, HELLO_REPLY=2, EPMAP=8, AP power=0xb)
+        // fits in 4 bits, so both interpretations agree on real messages.
+        for ty in [1u8, 2, MANAGEMENT_TYPE_EPMAP, MANAGEMENT_TYPE_START_ENDPOINTS_PATH] {
+            assert!(ty <= 0x0f, "observed EP0 type must fit the 4-bit subfield");
+            let msg = (ty as u64) << MANAGEMENT_TYPE_SHIFT;
+            // Both the 4-bit subfield read and the core's 8-bit read agree.
+            assert_eq!(management_type(msg), ty);
+            assert_eq!(((msg >> 52) & 0xff) as u8, ty);
+        }
     }
 
     #[test]

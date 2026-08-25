@@ -79,6 +79,12 @@ impl MissingEvidence {
 /// hardware families 0x7/0x8/0xa/0xb, i.e. G15's family byte `0x7` included).
 pub(crate) const G15_TOPOLOGY_REGISTERS_IMPLEMENTED: bool = true;
 
+/// Whether the G15 firmware's advertised RTKit interface version has been
+/// confirmed to fall inside the apple-rtkit core's supported window. Unlike
+/// G17 (firmware on disk, version 0xc verified), the G15 `GFX` image is absent
+/// from the corpus, so this cannot be grounded offline and stays false.
+pub(crate) const G15_FIRMWARE_INTERFACE_VERSION_CONFIRMED: bool = false;
+
 const fn implemented_pre_handoff_evidence() -> u16 {
     let mut implemented = 0;
 
@@ -90,7 +96,15 @@ const fn implemented_pre_handoff_evidence() -> u16 {
     if g15_initdata::GROUNDED_LAYOUT_AVAILABLE && g15_initdata::BOOTABLE_LAYOUT_AVAILABLE {
         implemented |= missing::INITDATA_GRAPH;
     }
-    if g17_rtkit::GROUNDED_CODEC_AVAILABLE && g17_rtkit::EXECUTABLE_TRANSPORT_AVAILABLE {
+    // The shared GPU wire codec is executable (byte-identical to G17/AGX2), but
+    // G15's transport is only ready once its firmware's advertised RTKit
+    // interface version is confirmed inside the apple-rtkit core window. The
+    // G15 `GFX` image is not on disk, so that stays unconfirmed and this bit
+    // fails closed independently of the shared codec constant.
+    if g17_rtkit::GROUNDED_CODEC_AVAILABLE
+        && g17_rtkit::EXECUTABLE_TRANSPORT_AVAILABLE
+        && G15_FIRMWARE_INTERFACE_VERSION_CONFIRMED
+    {
         implemented |= missing::RTKIT_TRANSPORT;
     }
 
@@ -300,11 +314,16 @@ mod tests {
         ] {
             assert!(missing.contains(evidence));
         }
-        // The underlying modules are grounded but not executable/bootable.
+        // The underlying modules are grounded but not bootable for G15. The
+        // shared GPU wire codec is now executable (grounded on the on-disk M5
+        // firmware), but G15's transport still fails closed because the G15
+        // firmware's RTKit interface version cannot be confirmed offline.
         assert!(g15_initdata::GROUNDED_LAYOUT_AVAILABLE);
         assert!(!g15_initdata::BOOTABLE_LAYOUT_AVAILABLE);
         assert!(g17_rtkit::GROUNDED_CODEC_AVAILABLE);
-        assert!(!g17_rtkit::EXECUTABLE_TRANSPORT_AVAILABLE);
+        assert!(g17_rtkit::EXECUTABLE_TRANSPORT_AVAILABLE);
+        assert!(!G15_FIRMWARE_INTERFACE_VERSION_CONFIRMED);
+        assert!(missing.contains(missing::RTKIT_TRANSPORT));
     }
 
     #[test]
