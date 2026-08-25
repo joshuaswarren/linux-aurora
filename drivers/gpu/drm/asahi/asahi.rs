@@ -15,6 +15,8 @@ mod event;
 mod file;
 mod float;
 mod fw;
+mod g15_boot;
+mod g15_initdata;
 mod g17_boot;
 mod g17_initdata;
 mod g17_rtkit;
