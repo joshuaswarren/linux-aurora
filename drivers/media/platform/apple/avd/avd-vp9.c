@@ -39,6 +39,8 @@
 
 #define VP9_FEAT_LVL_ALT_Q(v)	FIELD_PREP(GENMASK(21, 12), v)
 
+#define VP9_MAX_TILE_COLS	(1 << 4)
+
 struct avd_vp9_seg_probs {
 	u8 tree_probs[7];
 	u8 pred_probs[3];
@@ -649,41 +651,6 @@ static int avd_vp9_alloc_bufs(struct avd_ctx *ctx)
 			return ret;
 	}
 
-	ret = avd_buf_alloc(avd, &vp9_ctx->bufs.seg, 0x200);
-	if (ret)
-		return ret;
-
-	/* scratch buffer? */
-	ret = avd_buf_alloc(avd, &vp9_ctx->bufs.tiles[1], 0x200);
-	if (ret)
-		return ret;
-
-	/* TODO */
-	size = (((ctx->decoded_fmt.fmt.pix_mp.height - 1) *
-		 (ctx->decoded_fmt.fmt.pix_mp.height - 1) / 0x10000) +
-		2) *
-	       0x4000;
-	ret = avd_buf_alloc(avd, &vp9_ctx->bufs.tiles[0], size);
-	if (ret)
-		return ret;
-	ret = avd_buf_alloc(avd, &vp9_ctx->bufs.tiles[2], size);
-	if (ret)
-		return ret;
-
-	for (int i = 0; i < 2; i++) {
-		ret = avd_buf_alloc(avd, &vp9_ctx->bufs.color[i], size);
-		if (ret)
-			return ret;
-	}
-
-	ret = avd_buf_alloc(avd, &vp9_ctx->bufs.above_info, size + 0xc000);
-	if (ret)
-		return ret;
-
-	ret = avd_buf_alloc(avd, &vp9_ctx->bufs.state, size);
-	if (ret)
-		return ret;
-
 	ret = avd_buf_alloc(avd, &vp9_ctx->bufs.probs,
 			    sizeof(struct avd_vp9_probs));
 	if (ret)
@@ -694,21 +661,51 @@ static int avd_vp9_alloc_bufs(struct avd_ctx *ctx)
 	if (ret)
 		return ret;
 
-#ifdef AVD_DEBUG
-#define DBG_BUF(name, buf)                                           \
-	pr_info("   %10s %12llx %8lx", name, vp9_ctx->bufs.buf.addr, \
-		vp9_ctx->bufs.buf.size)
-	pr_info("buffers:");
-	DBG_BUF("state", state);
-	DBG_BUF("above_info", above_info);
-	DBG_BUF("seg", seg);
-	DBG_BUF("tiles[0]", tiles[0]);
-	DBG_BUF("tiles[1]", tiles[1]);
-	DBG_BUF("tiles[2]", tiles[2]);
-	DBG_BUF("color[0]", color[0]);
-	DBG_BUF("color[1]", color[1]);
-	pr_info("\n");
-#endif
+	ret = avd_buf_alloc(avd, &vp9_ctx->bufs.above_info,
+			    DIV_ROUND_UP(w, 16) * DIV_ROUND_UP(h, 64) * 144);
+	if (ret)
+		return ret;
+
+	ret = avd_buf_alloc(avd, &vp9_ctx->bufs.color[0],
+			    DIV_ROUND_UP(w, 16) * 4 * bit_depth +
+				    (VP9_MAX_TILE_COLS - 1) * 128);
+	if (ret)
+		return ret;
+	ret = avd_buf_alloc(avd, &vp9_ctx->bufs.color[1],
+			    DIV_ROUND_UP(w, 8) * 16 * bit_depth);
+	if (ret)
+		return ret;
+
+	/*
+	 * randomly needs more space when resizing?
+	 * maybe it does not need it?
+	 */
+	ret = avd_buf_alloc(avd, &vp9_ctx->bufs.seg, DIV_ROUND_UP(w, 8) * 24);
+	if (ret)
+		return ret;
+
+	ret = avd_buf_alloc(avd, &vp9_ctx->bufs.tiles[0],
+			    DIV_ROUND_UP(h, 8) * 16 * bit_depth);
+	if (ret)
+		return ret;
+
+	ret = avd_buf_alloc(avd, &vp9_ctx->bufs.tiles[1],
+			    DIV_ROUND_UP(h, 64) * 16);
+	if (ret)
+		return ret;
+
+	ret = avd_buf_alloc(avd, &vp9_ctx->bufs.tiles[2],
+			    bit_depth * 36 * DIV_ROUND_UP(h, 8) +
+				    bit_depth * 18 * DIV_ROUND_UP(h, 16));
+	if (ret)
+		return ret;
+
+	ret = avd_buf_alloc(avd, &vp9_ctx->bufs.state,
+			    DIV_ROUND_UP(w, 64) * 288 +
+				    (VP9_MAX_TILE_COLS - 1) * 128);
+	if (ret)
+		return ret;
+
 	return 0;
 }
 
