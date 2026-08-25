@@ -116,6 +116,8 @@ pub(crate) enum SubmissionError {
     RingSizeZero,
     /// A producer index must identify an entry inside its ring.
     RingIndexOutOfRange,
+    /// G17 exposes four priority groups in its runtime channel table.
+    ChannelPriorityOutOfRange,
 }
 
 /// Encode a work-submission doorbell exactly as `gpu.rs::run_job` does:
@@ -168,6 +170,70 @@ pub(crate) const CHANNEL_STATE_READ_PTR_OFFSET: u32 = 0x00;
 pub(crate) const CHANNEL_STATE_WRITE_PTR_OFFSET: u32 = 0x20;
 /// Total `ChannelState` size.
 pub(crate) const CHANNEL_STATE_SIZE: u32 = 0x40;
+
+// ---------------------------------------------------------------------------
+// 2a. G17 runtime channel descriptors -- native AGX3 layout.
+//
+//     Grounded first-hand from the G17S firmware recovery scanner at GFX
+//     0xfffffc000000ff8c-0xfffffc00000103dc. runtime_pointers+0x20 holds four
+//     priority groups of three descriptors (vertex, fragment, compute). Each
+//     descriptor is 0x20 bytes: the firmware dereferences cursor pointers at
+//     +0x00/+0x08/+0x10 and obtains the command-entry array from +0x18. It
+//     advances through that array in 0x18-byte records. The final descriptor
+//     ends at runtime_pointers+0x1a0, immediately before the independent cursor
+//     pair at +0x1a0/+0x1a8.
+// ---------------------------------------------------------------------------
+
+/// First G17 channel descriptor in `runtime_pointers`.
+pub(crate) const G17_CHANNEL_DESCRIPTOR_TABLE_OFFSET: u32 = 0x20;
+/// Vertex, fragment, and compute descriptors per priority group.
+pub(crate) const G17_CHANNEL_DESCRIPTORS_PER_PRIORITY: u32 = 3;
+/// Priority groups scanned by the G17 firmware.
+pub(crate) const G17_CHANNEL_PRIORITY_COUNT: u8 = 4;
+/// Total descriptor count: four priorities times three submission pipes.
+pub(crate) const G17_CHANNEL_DESCRIPTOR_COUNT: u32 = 12;
+/// Native G17 descriptor stride. AGX2 `ChannelRing` is only 0x10 bytes.
+pub(crate) const G17_CHANNEL_DESCRIPTOR_STRIDE: u32 = 0x20;
+/// G17 command-entry stride used by all three pipe rings.
+pub(crate) const G17_CHANNEL_ENTRY_STRIDE: u32 = 0x18;
+
+/// Pointer fields inside one native G17 channel descriptor.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17ChannelDescriptorLayout {
+    /// Pointer to the cursor advanced after an entry has been dispatched.
+    pub(crate) dispatch_cursor: u32,
+    /// Pointer to the cursor advanced after the entry range is made coherent.
+    pub(crate) coherency_cursor: u32,
+    /// Pointer to the producer cursor sampled before scanning the ring.
+    pub(crate) producer_cursor: u32,
+    /// GPU pointer to the first 0x18-byte command entry.
+    pub(crate) entries: u32,
+}
+
+pub(crate) const G17_CHANNEL_DESCRIPTOR_LAYOUT: G17ChannelDescriptorLayout =
+    G17ChannelDescriptorLayout {
+        dispatch_cursor: 0x00,
+        coherency_cursor: 0x08,
+        producer_cursor: 0x10,
+        entries: 0x18,
+    };
+
+/// Return the runtime-pointer byte offset of a native G17 pipe descriptor.
+///
+/// The table is priority-major and pipe-minor. Refuse priority values outside
+/// the four groups that the firmware scans instead of aliasing the independent
+/// cursor pair at `runtime_pointers+0x1a0`.
+pub(crate) const fn g17_channel_descriptor_offset(
+    priority: u8,
+    pipe: PipeType,
+) -> Result<u32, SubmissionError> {
+    if priority >= G17_CHANNEL_PRIORITY_COUNT {
+        return Err(SubmissionError::ChannelPriorityOutOfRange);
+    }
+
+    let index = priority as u32 * G17_CHANNEL_DESCRIPTORS_PER_PRIORITY + pipe as u32;
+    Ok(G17_CHANNEL_DESCRIPTOR_TABLE_OFFSET + index * G17_CHANNEL_DESCRIPTOR_STRIDE)
+}
 
 // ---------------------------------------------------------------------------
 // 3. Work-queue command ring (the actual SKSM producer ring).
@@ -572,16 +638,15 @@ pub(crate) struct SubmissionAbiLedger {
 
 /// The doorbell is byte-grounded (§1); the SKSM kick word/record and host
 /// queue-timestamp producer are AGX3 forks grounded first-hand (§2-§5). The
-/// channel/ring producer *records* are
-/// the AGX2 layouts the driver writes; the G17 firmware consumer offsets were
-/// not read first-hand this pass, and the host findings show the channel
-/// *descriptor* array may widen to 0x20 on AGX3 — so both stay unconfirmed and
-/// fail-closed.
+/// channel/ring producer *records* are the AGX2 layouts the driver writes; the
+/// G17 firmware consumer offsets were not read first-hand this pass. The G17
+/// channel descriptor is a grounded AGX3 fork (§2a), while the state records
+/// remain unconfirmed and fail-closed.
 pub(crate) const SUBMISSION_ABI_LEDGER: SubmissionAbiLedger = SubmissionAbiLedger {
     tx_doorbell: AbiProvenance::IdenticalToAgx2,
     channel_state: AbiProvenance::Agx2InheritedUnconfirmed,
     ring_state: AbiProvenance::Agx2InheritedUnconfirmed,
-    channel_descriptor: AbiProvenance::Agx2InheritedUnconfirmed,
+    channel_descriptor: AbiProvenance::ForkedAgx3Grounded,
     command_types: AbiProvenance::Agx2InheritedUnconfirmed,
     kick_word: AbiProvenance::ForkedAgx3Grounded,
     kick_queue_producer: AbiProvenance::ForkedAgx3Grounded,
@@ -595,11 +660,10 @@ pub(crate) const SUBMISSION_ABI_LEDGER: SubmissionAbiLedger = SubmissionAbiLedge
 /// unresolved selector.
 pub(crate) const HOST_SKSM_ADD_KICKS_PATH_SELECTED: bool = true;
 
-/// Whether the AGX3 per-pipe channel *descriptor* stride is proven. The host
-/// findings record `runtime_pointers+0x020` as a "13 × 0x20" array while the
-/// AGX2 `raw::ChannelRing` descriptor is 0x10 bytes. Not grounded first-hand
-/// here, so `false`.
-pub(crate) const CHANNEL_DESCRIPTOR_STRIDE_CONFIRMED: bool = false;
+/// Whether the AGX3 per-pipe channel *descriptor* stride is proven. The G17S
+/// firmware directly walks twelve 0x20-byte entries at
+/// `runtime_pointers+0x020..0x19f` (§2a).
+pub(crate) const CHANNEL_DESCRIPTOR_STRIDE_CONFIRMED: bool = true;
 
 /// The offline-unprovable pieces that keep the transport non-executable. Each
 /// needs a live M5.
@@ -711,6 +775,50 @@ mod tests {
         assert_eq!(RING_STATE_RB_SIZE_OFFSET, 0x50);
         assert_eq!(RING_ENTRY_BYTES, 8);
         assert_eq!(HOST_MAX_OUTSTANDING_JOB_SLOTS, 127);
+    }
+
+    #[test]
+    fn g17_channel_descriptor_geometry_matches_the_firmware_walk() {
+        assert_eq!(G17_CHANNEL_DESCRIPTOR_TABLE_OFFSET, 0x20);
+        assert_eq!(G17_CHANNEL_DESCRIPTORS_PER_PRIORITY, 3);
+        assert_eq!(G17_CHANNEL_PRIORITY_COUNT, 4);
+        assert_eq!(G17_CHANNEL_DESCRIPTOR_COUNT, 12);
+        assert_eq!(G17_CHANNEL_DESCRIPTOR_STRIDE, 0x20);
+        assert_eq!(G17_CHANNEL_ENTRY_STRIDE, 0x18);
+        assert_eq!(
+            G17_CHANNEL_DESCRIPTOR_LAYOUT,
+            G17ChannelDescriptorLayout {
+                dispatch_cursor: 0x00,
+                coherency_cursor: 0x08,
+                producer_cursor: 0x10,
+                entries: 0x18,
+            }
+        );
+
+        for priority in 0..G17_CHANNEL_PRIORITY_COUNT {
+            for (pipe, pipe_index) in [
+                (PipeType::Vertex, 0u32),
+                (PipeType::Fragment, 1),
+                (PipeType::Compute, 2),
+            ] {
+                let linear = priority as u32 * 3 + pipe_index;
+                assert_eq!(
+                    g17_channel_descriptor_offset(priority, pipe),
+                    Ok(0x20 + linear * 0x20)
+                );
+            }
+        }
+
+        // Descriptor eleven occupies 0x180..0x19f. Priority four must not
+        // alias the independent cursor pair beginning at +0x1a0.
+        assert_eq!(
+            g17_channel_descriptor_offset(3, PipeType::Compute),
+            Ok(0x180)
+        );
+        assert_eq!(
+            g17_channel_descriptor_offset(4, PipeType::Vertex),
+            Err(SubmissionError::ChannelPriorityOutOfRange)
+        );
     }
 
     #[test]
@@ -1041,8 +1149,8 @@ mod tests {
             SUBMISSION_ABI_LEDGER.kick_record,
             AbiProvenance::ForkedAgx3Grounded
         );
-        // The channel/ring producer records and the descriptor stride are not
-        // grounded first-hand: kept unconfirmed and fail-closed.
+        // The channel/ring state records stay inherited and fail-closed. The
+        // widened native descriptor geometry is grounded first-hand.
         assert_eq!(
             SUBMISSION_ABI_LEDGER.channel_state,
             AbiProvenance::Agx2InheritedUnconfirmed
@@ -1053,13 +1161,13 @@ mod tests {
         );
         assert_eq!(
             SUBMISSION_ABI_LEDGER.channel_descriptor,
-            AbiProvenance::Agx2InheritedUnconfirmed
+            AbiProvenance::ForkedAgx3Grounded
         );
         assert_eq!(
             SUBMISSION_ABI_LEDGER.command_types,
             AbiProvenance::Agx2InheritedUnconfirmed
         );
-        assert!(!CHANNEL_DESCRIPTOR_STRIDE_CONFIRMED);
+        assert!(CHANNEL_DESCRIPTOR_STRIDE_CONFIRMED);
     }
 
     #[test]
