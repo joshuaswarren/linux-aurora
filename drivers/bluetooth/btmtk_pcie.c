@@ -5,7 +5,6 @@
  * Copyright (C) 2026 Aurora Silicon
  */
 
-#include <linux/atomic.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/firmware.h>
@@ -13,7 +12,6 @@
 #include <linux/io.h>
 #include <linux/jiffies.h>
 #include <linux/module.h>
-#include <linux/mutex.h>
 #include <linux/overflow.h>
 #include <linux/pci.h>
 #include <linux/timer.h>
@@ -48,9 +46,7 @@
 
 #define MTK_PCIE_FW_B0 \
 	"mediatek/MT7932B0_OS_TypeB_0.1.44.0_241001003711.bin"
-#define MTK_PCIE_FW_B1_CURRENT \
-	"mediatek/MT7932B1_OS_TypeB_2.0.177.0_260706180356.bin"
-#define MTK_PCIE_FW_B1_COMPAT \
+#define MTK_PCIE_FW_B1 \
 	"mediatek/MT7932B1_OS_TypeB_0.1.133.0_260128190103.bin"
 #define MTK_PCIE_PTX \
 	"mediatek/MT7932_PTB_IzubaA_0.1.0.0_20251021141303.ptx"
@@ -70,7 +66,6 @@
 #define MTK_PCIE_BAR0_IMAGE_LENGTH	0x33818
 #define MTK_PCIE_BAR0_IMAGE_RESPONSE	0x3381c
 #define MTK_PCIE_BAR0_HOST_CONTROL	0x33828
-#define MTK_PCIE_BAR0_SLEEP_CONTROL	0x3382c
 #define MTK_PCIE_BAR0_CONTEXT_DMA_LO	0x33830
 #define MTK_PCIE_BAR0_CONTEXT_DMA_HI	0x33834
 #define MTK_PCIE_BAR0_WINDOW_BASE_LO	0x3383c
@@ -98,18 +93,6 @@
 #define MTK_PCIE_IPC_DESCRIPTOR_STATE	0x0f
 #define MTK_PCIE_IPC_TOTAL_BYTES		0xea6b0
 #define MTK_PCIE_IPC_STATUS_TIMEOUT_MS	1000
-#define MTK_PCIE_SLEEP_TIMEOUT_MS	1000
-
-enum btmtk_pcie_sleep_state {
-	MTK_PCIE_SLEEP_ACTIVE,
-	MTK_PCIE_SLEEP_UNUSED_1,
-	MTK_PCIE_SLEEP_HOST,
-	MTK_PCIE_SLEEP_UNUSED_3,
-	MTK_PCIE_SLEEP_WAKE_WAIT,
-	MTK_PCIE_SLEEP_HOST_WAIT,
-	MTK_PCIE_SLEEP_D3,
-	MTK_PCIE_SLEEP_D0_WAIT,
-};
 
 struct btmtk_pcie_ipc_context {
 	u8 reserved_00[0x08];
@@ -151,27 +134,6 @@ struct btmtk_pcie_ring_layout {
 	u8 doorbell_bit;
 	bool tx;
 	bool valid;
-};
-
-struct btmtk_pcie_firmware_candidates {
-	const char * const *names;
-	size_t count;
-};
-
-static const char * const btmtk_pcie_b0_firmware[] = {
-	MTK_PCIE_FW_B0,
-};
-
-/*
- * Apple bluetoothd does not pin an MT7932 versioned filename.  It maps the
- * AppleSunriseRomVersion B1 property to the MT7932B1 prefix and scans its
- * firmware directory for the matching TypeB image.  request_firmware() has
- * no prefix lookup, so keep the current Apple image first and retain the
- * previously qualified image as an explicit compatibility fallback.
- */
-static const char * const btmtk_pcie_b1_firmware[] = {
-	MTK_PCIE_FW_B1_CURRENT,
-	MTK_PCIE_FW_B1_COMPAT,
 };
 
 static const struct btmtk_pcie_ring_layout
@@ -218,30 +180,20 @@ struct btmtk_pcie_dev {
 	u8 firmware_trailer[MTK_PCIE_FW_TRAILER_SIZE];
 	spinlock_t ipc_lock;
 	spinlock_t ring_lock;
-	struct mutex sleep_lock; /* Serialize wake and system-power transitions. */
 	wait_queue_head_t ipc_wait;
 	struct timer_list ipc_timer;
 	struct hci_dev *hdev;
 	u8 ipc_state;
 	u8 remote_status;
-	u8 sleep_state;
-	u32 sleep_notification;
 	int ipc_error;
-	int sleep_error;
 	bool rom_version_valid;
 	bool firmware_active;
 	bool bus_master_enabled;
 	bool context_published;
 	bool irq_registered;
-	bool irq_vectors_allocated;
-	int irq_vector;
-	bool firmware_irq_expected;
-	bool ipc_irq_enabled;
 	bool rings_prepared;
 	bool hci_registered;
-	atomic_t hci_error_notified;
 	bool radio_config_loaded;
-	bool system_suspended;
 	bool stopping;
 };
 
@@ -269,21 +221,6 @@ module_param(enable_hci, bool, 0444);
 static bool load_radio_config;
 module_param(load_radio_config, bool, 0444);
 
-/*
- * AppleSunriseBluetooth does a device-visible companion-function attach
- * before userspace supplies the dedicated Bluetooth image: enable 64-bit DMA,
- * set PCI bus mastering, select the single MSI source, read config 0x48c,
- * read logical core ID 0x70010200 through the 0x23014/0xfe3b8 remap, program
- * BAR0 0xfe3b4 = 0x7000188a, and allocate the IPC backing store.  Keep that
- * exact pre-firmware subset independent from the numbered Bluetooth firmware
- * gates so it can be combined with the MT7932 Wi-Fi bring-up as one bounded
- * package-liveness discriminator.
- */
-static bool apple_attach;
-module_param(apple_attach, bool, 0444);
-MODULE_PARM_DESC(apple_attach,
-		 "Replay Apple's MT793b PCI attach; gate=4..8 may continue the BT lifecycle");
-
 /* Keep the hardware gate selectable within J700's measured U-Boot bootargs
  * limit.  The explicit Boolean parameters remain available for offline
  * contracts, while gate=N enables exactly the prerequisite prefix through N.
@@ -293,24 +230,6 @@ module_param(gate, uint, 0444);
 
 static int btmtk_pcie_apply_gate_selector(void)
 {
-	if (apple_attach) {
-		if (probe_remap || activate_firmware || start_ipc ||
-		    prepare_rings || enable_hci || load_radio_config)
-			return -EINVAL;
-		if (gate && (gate < 4 || gate > 8))
-			return -EINVAL;
-
-		probe_rom_version = true;
-		probe_remap = true;
-		prepare_ipc = true;
-		activate_firmware = gate >= 4;
-		start_ipc = gate >= 5;
-		prepare_rings = gate >= 6;
-		enable_hci = gate >= 7;
-		load_radio_config = gate >= 8;
-		return 0;
-	}
-
 	if (!gate)
 		return 0;
 	if (gate < 2 || gate > 8)
@@ -448,22 +367,12 @@ static int btmtk_pcie_prepare_ipc(struct btmtk_pcie_dev *bdev)
 
 	btmtk_pcie_fill_ipc_context(ipc);
 	pci_read_config_word(bdev->pdev, PCI_COMMAND, &command);
-	if (apple_attach) {
-		if (!(command & PCI_COMMAND_MASTER) ||
-		    !bdev->bus_master_enabled || !bdev->irq_registered)
-			return -EIO;
-	} else if (command & PCI_COMMAND_MASTER) {
+	if (command & PCI_COMMAND_MASTER)
 		return -EBUSY;
-	}
 
-	if (apple_attach)
-		dev_info(&bdev->pdev->dev,
-			 "J700_MT793B_APPLE_ATTACH_IPC_PASS: total=%zu span=%llu context=104 tr=24/24 cr=4/4 peri=16 rings=10 depth=128 published=0 pci_master=1 irq=1 firmware=0 hci=0\n",
-			 ipc->total_bytes, span);
-	else
-		dev_info(&bdev->pdev->dev,
-			 "J700_MT793B_IPC_LAYOUT_PASS: total=%zu span=%llu context=104 tr=24/24 cr=4/4 peri=16 rings=10 depth=128 published=0 pci_master=0 irq=0 firmware=0 hci=0\n",
-			 ipc->total_bytes, span);
+	dev_info(&bdev->pdev->dev,
+		 "J700_MT793B_IPC_LAYOUT_PASS: total=%zu span=%llu context=104 tr=24/24 cr=4/4 peri=16 rings=10 depth=128 published=0 pci_master=0 irq=0 firmware=0 hci=0\n",
+		 ipc->total_bytes, span);
 
 	return 0;
 }
@@ -475,20 +384,17 @@ static bool btmtk_pcie_bar0_has(struct btmtk_pcie_dev *bdev, u32 offset)
 	return length >= sizeof(u32) && offset <= length - sizeof(u32);
 }
 
-static int btmtk_pcie_select_firmware(
-	struct btmtk_pcie_dev *bdev,
-	struct btmtk_pcie_firmware_candidates *candidates)
+static int btmtk_pcie_select_firmware(struct btmtk_pcie_dev *bdev,
+				      const char **name)
 {
 	if (!bdev->rom_version_valid)
 		return -EINVAL;
 	if (bdev->rom_version == 0) {
-		candidates->names = btmtk_pcie_b0_firmware;
-		candidates->count = ARRAY_SIZE(btmtk_pcie_b0_firmware);
+		*name = MTK_PCIE_FW_B0;
 		return 0;
 	}
 	if (bdev->rom_version == 1) {
-		candidates->names = btmtk_pcie_b1_firmware;
-		candidates->count = ARRAY_SIZE(btmtk_pcie_b1_firmware);
+		*name = MTK_PCIE_FW_B1;
 		return 0;
 	}
 
@@ -496,29 +402,17 @@ static int btmtk_pcie_select_firmware(
 }
 
 static int btmtk_pcie_load_firmware_image(struct btmtk_pcie_dev *bdev,
-					  const struct btmtk_pcie_firmware_candidates *candidates,
-					  const char **loaded_name,
+					  const char *name,
 					  size_t *body_length,
 					  size_t *aligned_length)
 {
-	struct btmtk_pcie_dma_region *image = &bdev->ipc->image;
-	const struct firmware *firmware = NULL;
+	const struct firmware *firmware;
 	const u8 *trailer;
-	size_t index;
 	size_t body, aligned;
-	int err = -ENOENT;
+	int err;
 
-	for (index = 0; index < candidates->count; index++) {
-		err = request_firmware(&firmware, candidates->names[index],
-				       &bdev->pdev->dev);
-		if (!err) {
-			*loaded_name = candidates->names[index];
-			break;
-		}
-		if (err != -ENOENT)
-			return err;
-	}
-	if (!firmware)
+	err = request_firmware(&firmware, name, &bdev->pdev->dev);
+	if (err)
 		return err;
 	if (firmware->size <= MTK_PCIE_FW_TRAILER_SIZE) {
 		err = -EINVAL;
@@ -538,28 +432,13 @@ static int btmtk_pcie_load_firmware_image(struct btmtk_pcie_dev *bdev,
 		err = -EINVAL;
 		goto out_release;
 	}
-	if (image->vaddr) {
-		err = -EBUSY;
-		goto out_release;
-	}
 
-	/*
-	 * The patch image is a temporary DMA object, not part of the persistent
-	 * IPC window published at 0x3383c..0x33844.  Apple frees it as soon as
-	 * image response 1 and boot stage 2 are observed, before publishing the
-	 * IPC context.  Accounting it through btmtk_pcie_alloc_region() would
-	 * permanently enlarge dma_min/dma_end even after activation completes.
-	 */
-	image->vaddr = dma_alloc_coherent(&bdev->pdev->dev, aligned,
-					  &image->dma, GFP_KERNEL);
-	if (!image->vaddr) {
-		err = -ENOMEM;
+	err = btmtk_pcie_alloc_region(bdev, &bdev->ipc->image, aligned);
+	if (err)
 		goto out_release;
-	}
-	image->size = aligned;
-	memcpy(image->vaddr, firmware->data, body);
+	memcpy(bdev->ipc->image.vaddr, firmware->data, body);
 	if (aligned != body)
-		memset(image->vaddr + body, 0, aligned - body);
+		memset(bdev->ipc->image.vaddr + body, 0, aligned - body);
 	memcpy(bdev->firmware_trailer, trailer, MTK_PCIE_FW_TRAILER_SIZE);
 	*body_length = body;
 	*aligned_length = aligned;
@@ -567,21 +446,6 @@ static int btmtk_pcie_load_firmware_image(struct btmtk_pcie_dev *bdev,
 out_release:
 	release_firmware(firmware);
 	return err;
-}
-
-static void btmtk_pcie_free_firmware_image(struct btmtk_pcie_dev *bdev)
-{
-	struct btmtk_pcie_dma_region *image;
-
-	if (!bdev->ipc)
-		return;
-	image = &bdev->ipc->image;
-	if (!image->vaddr)
-		return;
-
-	dma_free_coherent(&bdev->pdev->dev, image->size, image->vaddr,
-			  image->dma);
-	memset(image, 0, sizeof(*image));
 }
 
 static void btmtk_pcie_select_fwdl_window(struct btmtk_pcie_dev *bdev)
@@ -606,8 +470,7 @@ static int btmtk_pcie_activate_firmware(struct btmtk_pcie_dev *bdev)
 		MTK_PCIE_BAR0_TRANSPORT_REMAP,
 		MTK_PCIE_BAR0_FALLBACK_SEL,
 	};
-	struct btmtk_pcie_firmware_candidates candidates;
-	const char *firmware_name = NULL;
+	const char *firmware_name;
 	size_t body_length, aligned_length;
 	u32 boot_config = 0, response = 0, semaphore = 0;
 	u16 command;
@@ -618,10 +481,10 @@ static int btmtk_pcie_activate_firmware(struct btmtk_pcie_dev *bdev)
 			return -ENXIO;
 	}
 
-	err = btmtk_pcie_select_firmware(bdev, &candidates);
+	err = btmtk_pcie_select_firmware(bdev, &firmware_name);
 	if (err)
 		return err;
-	err = btmtk_pcie_load_firmware_image(bdev, &candidates, &firmware_name,
+	err = btmtk_pcie_load_firmware_image(bdev, firmware_name,
 					     &body_length, &aligned_length);
 	if (err)
 		return err;
@@ -630,8 +493,7 @@ static int btmtk_pcie_activate_firmware(struct btmtk_pcie_dev *bdev)
 	err = pci_read_config_word(bdev->pdev, PCI_COMMAND, &command);
 	if (err != PCIBIOS_SUCCESSFUL || !(command & PCI_COMMAND_MASTER)) {
 		pci_clear_master(bdev->pdev);
-		err = -EIO;
-		goto out_free_image;
+		return -EIO;
 	}
 	bdev->bus_master_enabled = true;
 
@@ -658,7 +520,6 @@ static int btmtk_pcie_activate_firmware(struct btmtk_pcie_dev *bdev)
 	}
 
 	dma_wmb();
-	WRITE_ONCE(bdev->firmware_irq_expected, true);
 	writel(BIT(11), bdev->bar0 + MTK_PCIE_BAR0_DOORBELL);
 	for (attempt = 0; attempt < 1000; attempt++) {
 		response = readl(bdev->bar0 + MTK_PCIE_BAR0_IMAGE_RESPONSE);
@@ -680,28 +541,16 @@ static int btmtk_pcie_activate_firmware(struct btmtk_pcie_dev *bdev)
 
 	btmtk_pcie_select_fwdl_window(bdev);
 	writel(1, bdev->bar0 + MTK_PCIE_BAR0_FWDL_RELEASE);
-	btmtk_pcie_free_firmware_image(bdev);
-	WRITE_ONCE(bdev->firmware_irq_expected, false);
 	bdev->firmware_active = true;
-	if (apple_attach)
-		dev_info(&bdev->pdev->dev,
-			 "J700_MT793B_FWDL_PASS: firmware=%s rom=B%u body=%zu aligned=%zu semaphore=1 doorbell=11 response=1 boot_stage=2 release=1 image_dma_released=1 context_published=0 ipc_running=0 irq=1 irq_registered_early=1 hci=0\n",
-			 firmware_name, bdev->rom_version, body_length,
-			 aligned_length);
-	else
-		dev_info(&bdev->pdev->dev,
-			 "J700_MT793B_FWDL_PASS: firmware=%s rom=B%u body=%zu aligned=%zu semaphore=1 doorbell=11 response=1 boot_stage=2 release=1 image_dma_released=1 context_published=0 ipc_running=0 irq=0 hci=0\n",
-			 firmware_name, bdev->rom_version, body_length,
-			 aligned_length);
+	dev_info(&bdev->pdev->dev,
+		 "J700_MT793B_FWDL_PASS: firmware=MT7932B%u body=%zu aligned=%zu semaphore=1 doorbell=11 response=1 boot_stage=2 release=1 context_published=0 ipc_running=0 irq=0 hci=0\n",
+		 bdev->rom_version, body_length, aligned_length);
 
 	return 0;
 
 out_clear_master:
-	WRITE_ONCE(bdev->firmware_irq_expected, false);
 	pci_clear_master(bdev->pdev);
 	bdev->bus_master_enabled = false;
-out_free_image:
-	btmtk_pcie_free_firmware_image(bdev);
 	return err;
 }
 
@@ -712,15 +561,6 @@ static void btmtk_pcie_set_host_control(struct btmtk_pcie_dev *bdev,
 	/* The firmware must observe the new control state before its doorbell. */
 	wmb();
 	writel(BIT(13), bdev->bar0 + MTK_PCIE_BAR0_DOORBELL);
-}
-
-static void btmtk_pcie_notify_hci_error(struct btmtk_pcie_dev *bdev)
-{
-	struct hci_dev *hdev = READ_ONCE(bdev->hdev);
-
-	if (!hdev || atomic_xchg(&bdev->hci_error_notified, 1))
-		return;
-	hci_reset_dev(hdev);
 }
 
 static void btmtk_pcie_ipc_timer(struct timer_list *timer)
@@ -736,7 +576,6 @@ static void btmtk_pcie_ipc_timer(struct timer_list *timer)
 	}
 	spin_unlock_irqrestore(&bdev->ipc_lock, flags);
 	wake_up_all(&bdev->ipc_wait);
-	btmtk_pcie_notify_hci_error(bdev);
 }
 
 static void btmtk_pcie_arm_ipc_timer(struct btmtk_pcie_dev *bdev)
@@ -754,8 +593,6 @@ static int btmtk_pcie_publish_context(struct btmtk_pcie_dev *bdev)
 
 	if (!ipc || !ipc->dma_window_valid)
 		return -EINVAL;
-	if (ipc->image.vaddr)
-		return -EBUSY;
 	span = ipc->dma_end - ipc->dma_min;
 	if (span > U32_MAX)
 		return -ERANGE;
@@ -958,119 +795,6 @@ static int btmtk_pcie_process_rings(struct btmtk_pcie_dev *bdev)
 	return 0;
 }
 
-static void btmtk_pcie_set_sleep_control(struct btmtk_pcie_dev *bdev,
-					 u32 state)
-{
-	writel(state, bdev->bar0 + MTK_PCIE_BAR0_SLEEP_CONTROL);
-	/* The sleep-control value must be visible before doorbell bit 12. */
-	wmb();
-	writel(BIT(12), bdev->bar0 + MTK_PCIE_BAR0_DOORBELL);
-}
-
-static void btmtk_pcie_handle_sleep_notification(struct btmtk_pcie_dev *bdev)
-{
-	struct btmtk_pcie_ipc *ipc = bdev->ipc;
-	unsigned long flags;
-	u32 control = U32_MAX;
-	u32 notification;
-	bool wake = false;
-
-	notification = le32_to_cpu(READ_ONCE(*((__le32 *)ipc->peri_info.vaddr +
-							 2)));
-
-	spin_lock_irqsave(&bdev->ipc_lock, flags);
-	if (notification == bdev->sleep_notification)
-		goto out_unlock;
-	bdev->sleep_notification = notification;
-
-	switch (bdev->sleep_state) {
-	case MTK_PCIE_SLEEP_ACTIVE:
-		if (notification == 1) {
-			bdev->sleep_state = MTK_PCIE_SLEEP_HOST;
-			control = 1;
-		}
-		break;
-	case MTK_PCIE_SLEEP_HOST:
-	case MTK_PCIE_SLEEP_WAKE_WAIT:
-		if (notification == 0) {
-			bdev->sleep_state = MTK_PCIE_SLEEP_ACTIVE;
-			control = 0;
-			wake = true;
-		}
-		break;
-	case MTK_PCIE_SLEEP_HOST_WAIT:
-		if (notification == 3) {
-			bdev->sleep_state = MTK_PCIE_SLEEP_D3;
-			wake = true;
-		}
-		break;
-	case MTK_PCIE_SLEEP_D0_WAIT:
-		if (notification == 0) {
-			bdev->sleep_state = MTK_PCIE_SLEEP_ACTIVE;
-			control = 0;
-			wake = true;
-		} else if (notification == 1) {
-			bdev->sleep_state = MTK_PCIE_SLEEP_HOST;
-			control = 1;
-		}
-		break;
-	default:
-		break;
-	}
-	if (control != U32_MAX)
-		btmtk_pcie_set_sleep_control(bdev, control);
-
-out_unlock:
-	spin_unlock_irqrestore(&bdev->ipc_lock, flags);
-	if (wake)
-		wake_up_all(&bdev->ipc_wait);
-}
-
-static int btmtk_pcie_ensure_active(struct btmtk_pcie_dev *bdev)
-{
-	unsigned long flags;
-	long timeout;
-	u32 control = U32_MAX;
-	int err = 0;
-
-	mutex_lock(&bdev->sleep_lock);
-	spin_lock_irqsave(&bdev->ipc_lock, flags);
-	if (bdev->system_suspended || bdev->stopping) {
-		err = -EHOSTDOWN;
-	} else if (bdev->sleep_state == MTK_PCIE_SLEEP_HOST) {
-		bdev->sleep_state = MTK_PCIE_SLEEP_WAKE_WAIT;
-		control = 2;
-	} else if (bdev->sleep_state != MTK_PCIE_SLEEP_ACTIVE &&
-		   bdev->sleep_state != MTK_PCIE_SLEEP_WAKE_WAIT) {
-		err = -EHOSTDOWN;
-	}
-	if (control != U32_MAX)
-		btmtk_pcie_set_sleep_control(bdev, control);
-	spin_unlock_irqrestore(&bdev->ipc_lock, flags);
-
-	if (err)
-		goto out_unlock;
-	if (READ_ONCE(bdev->sleep_state) == MTK_PCIE_SLEEP_ACTIVE)
-		goto out_unlock;
-
-	timeout = wait_event_timeout(bdev->ipc_wait,
-				     READ_ONCE(bdev->sleep_state) ==
-					     MTK_PCIE_SLEEP_ACTIVE ||
-				     READ_ONCE(bdev->sleep_error) ||
-				     READ_ONCE(bdev->stopping),
-				     msecs_to_jiffies(MTK_PCIE_SLEEP_TIMEOUT_MS));
-	if (!timeout)
-		err = -ETIMEDOUT;
-	else if (READ_ONCE(bdev->sleep_error))
-		err = READ_ONCE(bdev->sleep_error);
-	else if (READ_ONCE(bdev->sleep_state) != MTK_PCIE_SLEEP_ACTIVE)
-		err = -EHOSTDOWN;
-
-out_unlock:
-	mutex_unlock(&bdev->sleep_lock);
-	return err;
-}
-
 static irqreturn_t btmtk_pcie_irq(int irq, void *data)
 {
 	struct btmtk_pcie_dev *bdev = data;
@@ -1078,7 +802,7 @@ static irqreturn_t btmtk_pcie_irq(int irq, void *data)
 	unsigned long flags;
 	u32 control = 0;
 	u8 remote, state;
-	bool notify_error = false, publish = false, wake = false;
+	bool publish = false, wake = false;
 	int err = 0;
 
 	if (READ_ONCE(bdev->stopping))
@@ -1106,7 +830,6 @@ static irqreturn_t btmtk_pcie_irq(int irq, void *data)
 	} else if (state == 2 && remote == 4) {
 		bdev->ipc_state = 4;
 		bdev->ipc_error = -EIO;
-		notify_error = true;
 		wake = true;
 	} else if (state == 4 && remote == 3) {
 		bdev->ipc_state = 3;
@@ -1139,15 +862,11 @@ static irqreturn_t btmtk_pcie_irq(int irq, void *data)
 	}
 	if (wake)
 		wake_up_all(&bdev->ipc_wait);
-	if (notify_error)
-		btmtk_pcie_notify_hci_error(bdev);
-	btmtk_pcie_handle_sleep_notification(bdev);
 	if (READ_ONCE(bdev->rings_prepared)) {
 		err = btmtk_pcie_process_rings(bdev);
 		if (err) {
 			if (READ_ONCE(bdev->hdev))
 				bdev->hdev->stat.err_rx++;
-			btmtk_pcie_notify_hci_error(bdev);
 			dev_err_ratelimited(dev,
 					    "MT793b invalid RX ring state: %d\n",
 					    err);
@@ -1159,131 +878,19 @@ static irqreturn_t btmtk_pcie_irq(int irq, void *data)
 
 static void btmtk_pcie_quiesce(struct btmtk_pcie_dev *bdev)
 {
-	unsigned long flags;
-
 	WRITE_ONCE(bdev->stopping, true);
-	WRITE_ONCE(bdev->ipc_irq_enabled, false);
-	WRITE_ONCE(bdev->firmware_irq_expected, false);
 	timer_shutdown_sync(&bdev->ipc_timer);
 	if (bdev->irq_registered)
-		devm_free_irq(&bdev->pdev->dev, bdev->irq_vector, bdev);
+		devm_free_irq(&bdev->pdev->dev, bdev->pdev->irq, bdev);
 	bdev->irq_registered = false;
-	if (bdev->irq_vectors_allocated)
-		pci_free_irq_vectors(bdev->pdev);
-	bdev->irq_vectors_allocated = false;
-	bdev->irq_vector = 0;
 	if (bdev->bus_master_enabled) {
 		pci_clear_master(bdev->pdev);
 		bdev->bus_master_enabled = false;
 	}
-	btmtk_pcie_free_firmware_image(bdev);
-	spin_lock_irqsave(&bdev->ipc_lock, flags);
-	bdev->sleep_error = -ENODEV;
-	spin_unlock_irqrestore(&bdev->ipc_lock, flags);
-	wake_up_all(&bdev->ipc_wait);
-}
-
-static irqreturn_t btmtk_pcie_irq_dispatch(int irq, void *data)
-{
-	struct btmtk_pcie_dev *bdev = data;
-
-	if (READ_ONCE(bdev->ipc_irq_enabled))
-		return btmtk_pcie_irq(irq, data);
-
-	/*
-	 * Apple installs this handler before userspace supplies the Bluetooth
-	 * image.  During image activation its ISR treats the edge as handled,
-	 * reads image-response/config 0x48c, and releases the firmware semaphore.
-	 * The bounded Linux download path polls those same two values, so claiming
-	 * the expected edge is sufficient; there is no device ACK register.  Do
-	 * not claim unrelated shared interrupts before firmware activation.
-	 */
-	if (READ_ONCE(bdev->firmware_irq_expected))
-		return IRQ_HANDLED;
-
-	return IRQ_NONE;
-}
-
-static int btmtk_pcie_request_msi(struct btmtk_pcie_dev *bdev)
-{
-	int err;
-
-	if (bdev->irq_registered || bdev->irq_vectors_allocated)
-		return -EBUSY;
-
-	err = pci_alloc_irq_vectors(bdev->pdev, 1, 1, PCI_IRQ_MSI);
-	if (err < 0)
-		return err;
-	bdev->irq_vectors_allocated = true;
-
-	bdev->irq_vector = pci_irq_vector(bdev->pdev, 0);
-	if (bdev->irq_vector < 0) {
-		err = bdev->irq_vector;
-		goto free_vectors;
-	}
-	err = devm_request_irq(&bdev->pdev->dev, bdev->irq_vector,
-			       btmtk_pcie_irq_dispatch, 0, KBUILD_MODNAME, bdev);
-	if (err)
-		goto free_vectors;
-	bdev->irq_registered = true;
-
-	return 0;
-
-free_vectors:
-	pci_free_irq_vectors(bdev->pdev);
-	bdev->irq_vectors_allocated = false;
-	bdev->irq_vector = 0;
-	return err;
-}
-
-static int btmtk_pcie_apple_attach_pci(struct btmtk_pcie_dev *bdev)
-{
-	u16 command;
-	int err;
-
-	if (bdev->pdev->device != MTK_PCIE_DEVICE_MT7932_BT)
-		return -ENODEV;
-	if (!btmtk_pcie_bar0_has(bdev, MTK_PCIE_BAR0_TRANSPORT_REMAP))
-		return -ENXIO;
-
-	err = dma_set_mask_and_coherent(&bdev->pdev->dev, DMA_BIT_MASK(64));
-	if (err)
-		return err;
-
-	pci_set_master(bdev->pdev);
-	err = pci_read_config_word(bdev->pdev, PCI_COMMAND, &command);
-	if (err != PCIBIOS_SUCCESSFUL || !(command & PCI_COMMAND_MASTER)) {
-		pci_clear_master(bdev->pdev);
-		return -EIO;
-	}
-	bdev->bus_master_enabled = true;
-
-	err = btmtk_pcie_request_msi(bdev);
-	if (err) {
-		pci_clear_master(bdev->pdev);
-		bdev->bus_master_enabled = false;
-		return err;
-	}
-	bdev->irq_registered = true;
-
-	dev_info(&bdev->pdev->dev,
-		 "J700_MT793B_APPLE_ATTACH_PCI_PASS: delay_ms=100 probe_async=1 dma_mask=64 pci_master=1 irq=%d irq_type=msi irq_shared=0 firmware=0 hci=0\n",
-		 bdev->irq_vector);
-
-	return 0;
-}
-
-static void btmtk_pcie_apple_attach_transport(struct btmtk_pcie_dev *bdev)
-{
-	writel(MTK_PCIE_TRANSPORT_REMAP,
-	       bdev->bar0 + MTK_PCIE_BAR0_TRANSPORT_REMAP);
-	dev_info(&bdev->pdev->dev,
-		 "J700_MT793B_APPLE_ATTACH_REMAP_PASS: bar0=0xfe3b4 value=0x7000188a firmware=0 context_published=0 hci=0\n");
 }
 
 static int btmtk_pcie_start_ipc(struct btmtk_pcie_dev *bdev)
 {
-	bool reused_early_irq;
 	long timeout;
 	int err;
 
@@ -1294,22 +901,17 @@ static int btmtk_pcie_start_ipc(struct btmtk_pcie_dev *bdev)
 
 	bdev->ipc_state = 0;
 	bdev->remote_status = 0xff;
-	bdev->sleep_state = MTK_PCIE_SLEEP_ACTIVE;
-	bdev->sleep_notification = 0;
 	bdev->ipc_error = 0;
-	bdev->sleep_error = 0;
-	bdev->system_suspended = false;
 	bdev->context_published = false;
 	bdev->stopping = false;
-	reused_early_irq = bdev->irq_registered;
-	if (!reused_early_irq) {
-		err = btmtk_pcie_request_msi(bdev);
-		if (err)
-			return err;
-	}
-	WRITE_ONCE(bdev->ipc_irq_enabled, true);
+	err = devm_request_irq(&bdev->pdev->dev, bdev->pdev->irq,
+			       btmtk_pcie_irq, IRQF_SHARED, KBUILD_MODNAME,
+			       bdev);
+	if (err)
+		return err;
+	bdev->irq_registered = true;
 
-	btmtk_pcie_irq(bdev->irq_vector, bdev);
+	btmtk_pcie_irq(bdev->pdev->irq, bdev);
 	timeout = wait_event_timeout(bdev->ipc_wait,
 				     READ_ONCE(bdev->ipc_state) == 2 ||
 				     READ_ONCE(bdev->ipc_error),
@@ -1323,8 +925,7 @@ static int btmtk_pcie_start_ipc(struct btmtk_pcie_dev *bdev)
 	}
 
 	dev_info(&bdev->pdev->dev,
-		 "J700_MT793B_IPC_STATE2_PASS: context_published=1 ipc_state=2 irq=1 irq_type=msi irq_shared=0 early_irq_reused=%u irq_ack_register=none rings_advertised=0 rx_primed=0 upper_ready=0 hci=0\n",
-		 reused_early_irq);
+		 "J700_MT793B_IPC_STATE2_PASS: context_published=1 ipc_state=2 irq=1 irq_ack_register=none rings_advertised=0 rx_primed=0 upper_ready=0 hci=0\n");
 
 	return 0;
 }
@@ -1607,19 +1208,6 @@ static int btmtk_pcie_hci_setup(struct hci_dev *hdev)
 	if (bdev->pdev->device != MTK_PCIE_DEVICE_MT7932_BT)
 		return -ENODEV;
 
-	/*
-	 * Apple bluetoothd resets Sunrise before loading BTCAL and PTX; the
-	 * subsequent Sunrise core-init writes the board address before ordinary
-	 * HCI discovery.  Linux normally calls hdev->setup before its own reset,
-	 * so HCI_QUIRK_RESET_ON_CLOSE suppresses that later reset and leaves this
-	 * callback responsible for the reset-first ordering on every open.
-	 */
-	bdev->radio_config_loaded = false;
-	err = __hci_cmd_sync_status(hdev, HCI_OP_RESET, 0, NULL,
-				    HCI_INIT_TIMEOUT);
-	if (err)
-		return err;
-
 	err = request_firmware(&address, MTK_PCIE_BT_ADDRESS, &bdev->pdev->dev);
 	if (err)
 		return err;
@@ -1658,7 +1246,7 @@ static int btmtk_pcie_hci_setup(struct hci_dev *hdev)
 
 	bdev->radio_config_loaded = true;
 	dev_info(&bdev->pdev->dev,
-		 "J700_MT793B_RADIO_CONFIG_PASS: srs_opcode=fdd0 bdaddr_opcode=fc1a order=reset-then-btcal-then-ptx-then-bdaddr btcal_bytes=%zu ptx_bytes=%zu bdaddr_bytes=6 max_chunk=240 ptx_prefix=01042000 hci=1 radio_unvalidated=1\n",
+		 "J700_MT793B_RADIO_CONFIG_PASS: srs_opcode=fdd0 bdaddr_opcode=fc1a order=btcal-then-ptx-then-bdaddr btcal_bytes=%zu ptx_bytes=%zu bdaddr_bytes=6 max_chunk=240 ptx_prefix=01042000 hci=1 radio_unvalidated=1\n",
 		 calibration->size, ptx->size);
 
 release_ptx:
@@ -1697,33 +1285,19 @@ static int btmtk_pcie_hci_send_frame(struct hci_dev *hdev,
 	if (READ_ONCE(bdev->stopping) || READ_ONCE(bdev->ipc_state) != 2 ||
 	    !READ_ONCE(bdev->rings_prepared))
 		return -ENODEV;
-	err = btmtk_pcie_ensure_active(bdev);
-	if (err)
-		return err;
 	err = btmtk_pcie_hci_tx_layout(skb, &ring, &length);
 	if (err)
 		return err;
 	layout = &btmtk_pcie_ring_layout[ring];
 
 	dma_rmb();
-	/*
-	 * Serialize the final ACTIVE check through descriptor publication.  The
-	 * IRQ sleep machine uses ipc_lock for its ACTIVE-to-HOST transition, so a
-	 * notification cannot race between wake completion and the TX doorbell.
-	 */
-	spin_lock_irqsave(&bdev->ipc_lock, flags);
-	if (bdev->stopping || bdev->system_suspended ||
-	    bdev->sleep_state != MTK_PCIE_SLEEP_ACTIVE) {
-		err = -EHOSTDOWN;
-		goto out_unlock_ipc;
-	}
-	spin_lock(&bdev->ring_lock);
+	spin_lock_irqsave(&bdev->ring_lock, flags);
 	hia = le16_to_cpu(READ_ONCE(tr_hia[ring])) & 0x7f;
 	tia = le16_to_cpu(READ_ONCE(tr_tia[ring])) & 0x7f;
 	next = (hia + 1) & 0x7f;
 	if (next == tia) {
 		err = -ENOSPC;
-		goto out_unlock_ring;
+		goto out_unlock;
 	}
 
 	descriptor = ipc->ring[ring].vaddr + hia * layout->stride;
@@ -1741,10 +1315,8 @@ static int btmtk_pcie_hci_send_frame(struct hci_dev *hdev,
 	       bdev->bar0 + MTK_PCIE_BAR0_DOORBELL);
 	err = 0;
 
-out_unlock_ring:
-	spin_unlock(&bdev->ring_lock);
-out_unlock_ipc:
-	spin_unlock_irqrestore(&bdev->ipc_lock, flags);
+out_unlock:
+	spin_unlock_irqrestore(&bdev->ring_lock, flags);
 	if (err) {
 		hdev->stat.err_tx++;
 		return err;
@@ -1768,18 +1340,17 @@ out_unlock_ipc:
 	return 0;
 }
 
-static struct hci_dev *btmtk_pcie_detach_hci(struct btmtk_pcie_dev *bdev)
+static void btmtk_pcie_unregister_hci(struct btmtk_pcie_dev *bdev)
 {
 	struct hci_dev *hdev = bdev->hdev;
 
+	WRITE_ONCE(bdev->hdev, NULL);
 	if (!hdev)
-		return NULL;
+		return;
 	if (bdev->hci_registered)
 		hci_unregister_dev(hdev);
-	WRITE_ONCE(bdev->hdev, NULL);
 	bdev->hci_registered = false;
-
-	return hdev;
+	hci_free_dev(hdev);
 }
 
 static int btmtk_pcie_register_hci(struct btmtk_pcie_dev *bdev)
@@ -1798,12 +1369,6 @@ static int btmtk_pcie_register_hci(struct btmtk_pcie_dev *bdev)
 	hdev->close = btmtk_pcie_hci_close;
 	hdev->send = btmtk_pcie_hci_send_frame;
 	hdev->setup = btmtk_pcie_hci_setup;
-	if (load_radio_config &&
-	    bdev->pdev->device == MTK_PCIE_DEVICE_MT7932_BT) {
-		/* setup() owns reset + board-data restoration on every open. */
-		hci_set_quirk(hdev, HCI_QUIRK_RESET_ON_CLOSE);
-		hci_set_quirk(hdev, HCI_QUIRK_NON_PERSISTENT_SETUP);
-	}
 	hci_set_drvdata(hdev, bdev);
 	SET_HCIDEV_DEV(hdev, &bdev->pdev->dev);
 	WRITE_ONCE(bdev->hdev, hdev);
@@ -1818,10 +1383,7 @@ static int btmtk_pcie_register_hci(struct btmtk_pcie_dev *bdev)
 
 	err = btmtk_pcie_process_rings(bdev);
 	if (err) {
-		hdev = btmtk_pcie_detach_hci(bdev);
-		/* Synchronize IRQ/timer readers before releasing hdev. */
-		btmtk_pcie_quiesce(bdev);
-		hci_free_dev(hdev);
+		btmtk_pcie_unregister_hci(bdev);
 		return err;
 	}
 	dev_info(&bdev->pdev->dev,
@@ -1829,161 +1391,6 @@ static int btmtk_pcie_register_hci(struct btmtk_pcie_dev *bdev)
 
 	return 0;
 }
-
-static int btmtk_pcie_suspend(struct device *dev)
-{
-	struct pci_dev *pdev = to_pci_dev(dev);
-	struct btmtk_pcie_dev *bdev = pci_get_drvdata(pdev);
-	unsigned long flags;
-	long timeout;
-	int err;
-
-	if (!bdev || !bdev->hci_registered || !bdev->firmware_active)
-		return 0;
-
-	err = hci_suspend_dev(bdev->hdev);
-	if (err)
-		return err;
-	err = btmtk_pcie_ensure_active(bdev);
-	if (err)
-		goto resume_hci;
-
-	mutex_lock(&bdev->sleep_lock);
-	spin_lock_irqsave(&bdev->ipc_lock, flags);
-	if (bdev->sleep_state != MTK_PCIE_SLEEP_ACTIVE || bdev->stopping) {
-		err = -EBUSY;
-		spin_unlock_irqrestore(&bdev->ipc_lock, flags);
-		goto unlock_resume_hci;
-	}
-	bdev->sleep_state = MTK_PCIE_SLEEP_HOST_WAIT;
-	btmtk_pcie_set_sleep_control(bdev, 3);
-	spin_unlock_irqrestore(&bdev->ipc_lock, flags);
-
-	/*
-	 * Sunrise intercepts its synthetic 0xfc6f host-sleep command here:
-	 * control 3 is written to 0x3382c and doorbell bit 12 is rung.  The
-	 * firmware reaches notification 3 before the PCI function enters D3.
-	 */
-	timeout = wait_event_timeout(bdev->ipc_wait,
-				     READ_ONCE(bdev->sleep_state) ==
-					     MTK_PCIE_SLEEP_D3 ||
-				     READ_ONCE(bdev->sleep_error) ||
-				     READ_ONCE(bdev->stopping),
-				     msecs_to_jiffies(MTK_PCIE_SLEEP_TIMEOUT_MS));
-	if (!timeout) {
-		err = -ETIMEDOUT;
-		goto wake_controller;
-	}
-	if (READ_ONCE(bdev->sleep_error)) {
-		err = READ_ONCE(bdev->sleep_error);
-		goto wake_controller;
-	}
-	if (READ_ONCE(bdev->sleep_state) != MTK_PCIE_SLEEP_D3) {
-		err = -EHOSTDOWN;
-		goto wake_controller;
-	}
-
-	WRITE_ONCE(bdev->system_suspended, true);
-	mutex_unlock(&bdev->sleep_lock);
-	return 0;
-
-wake_controller:
-	spin_lock_irqsave(&bdev->ipc_lock, flags);
-	if (bdev->sleep_state != MTK_PCIE_SLEEP_ACTIVE) {
-		bdev->sleep_state = MTK_PCIE_SLEEP_D0_WAIT;
-		btmtk_pcie_set_sleep_control(bdev, 0);
-	}
-	spin_unlock_irqrestore(&bdev->ipc_lock, flags);
-	wait_event_timeout(bdev->ipc_wait,
-			   READ_ONCE(bdev->sleep_state) ==
-				   MTK_PCIE_SLEEP_ACTIVE ||
-			   READ_ONCE(bdev->sleep_error) ||
-			   READ_ONCE(bdev->stopping),
-			   msecs_to_jiffies(MTK_PCIE_SLEEP_TIMEOUT_MS));
-unlock_resume_hci:
-	mutex_unlock(&bdev->sleep_lock);
-resume_hci:
-	hci_resume_dev(bdev->hdev);
-	return err;
-}
-
-static int btmtk_pcie_resume(struct device *dev)
-{
-	struct pci_dev *pdev = to_pci_dev(dev);
-	struct btmtk_pcie_dev *bdev = pci_get_drvdata(pdev);
-	unsigned long flags;
-	long timeout;
-	int err = 0;
-
-	if (!bdev || !bdev->hci_registered || !bdev->firmware_active)
-		return 0;
-
-	mutex_lock(&bdev->sleep_lock);
-	spin_lock_irqsave(&bdev->ipc_lock, flags);
-	WRITE_ONCE(bdev->system_suspended, false);
-	if (bdev->sleep_state == MTK_PCIE_SLEEP_D3) {
-		bdev->sleep_state = MTK_PCIE_SLEEP_D0_WAIT;
-		btmtk_pcie_set_sleep_control(bdev, 0);
-	} else if (bdev->sleep_state != MTK_PCIE_SLEEP_ACTIVE) {
-		err = -EHOSTDOWN;
-	}
-	spin_unlock_irqrestore(&bdev->ipc_lock, flags);
-	if (err)
-		goto out_unlock;
-	if (READ_ONCE(bdev->sleep_state) == MTK_PCIE_SLEEP_D0_WAIT) {
-		timeout = wait_event_timeout(bdev->ipc_wait,
-					     READ_ONCE(bdev->sleep_state) ==
-						     MTK_PCIE_SLEEP_ACTIVE ||
-					     READ_ONCE(bdev->sleep_error) ||
-					     READ_ONCE(bdev->stopping),
-					     msecs_to_jiffies(MTK_PCIE_SLEEP_TIMEOUT_MS));
-		if (!timeout)
-			err = -ETIMEDOUT;
-		else if (READ_ONCE(bdev->sleep_error))
-			err = READ_ONCE(bdev->sleep_error);
-		else if (READ_ONCE(bdev->sleep_state) !=
-			 MTK_PCIE_SLEEP_ACTIVE)
-			err = -EHOSTDOWN;
-	}
-
-out_unlock:
-	mutex_unlock(&bdev->sleep_lock);
-	if (err)
-		return err;
-	return hci_resume_dev(bdev->hdev);
-}
-
-static int btmtk_pcie_freeze(struct device *dev)
-{
-	struct btmtk_pcie_dev *bdev = pci_get_drvdata(to_pci_dev(dev));
-
-	/*
-	 * Sunrise hibernation depends on private, cross-function SoC-reset
-	 * notifications.  Do not snapshot an active DMA transport without that
-	 * coordination; ordinary system suspend remains fully supported above.
-	 */
-	if (bdev && (bdev->bus_master_enabled || bdev->irq_registered)) {
-		dev_err(dev,
-			"MT793b hibernation requires unavailable platform reset coordination\n");
-		return -EOPNOTSUPP;
-	}
-
-	return 0;
-}
-
-static int btmtk_pcie_thaw(struct device *dev)
-{
-	return 0;
-}
-
-static const struct dev_pm_ops btmtk_pcie_pm_ops = {
-	.suspend = btmtk_pcie_suspend,
-	.resume = btmtk_pcie_resume,
-	.freeze = btmtk_pcie_freeze,
-	.thaw = btmtk_pcie_thaw,
-	.poweroff = btmtk_pcie_freeze,
-	.restore = btmtk_pcie_thaw,
-};
 
 static int btmtk_pcie_read_chip_id(struct btmtk_pcie_dev *bdev, u32 *chip_id)
 {
@@ -2009,7 +1416,7 @@ static int btmtk_pcie_probe(struct pci_dev *pdev,
 	void __iomem * const *iomap;
 	u16 command, subsystem_vendor, subsystem_device;
 	u8 revision;
-	u32 chip_id = 0, rom_config;
+	u32 chip_id, rom_config;
 	u8 rom_version;
 	int err;
 
@@ -2020,8 +1427,6 @@ static int btmtk_pcie_probe(struct pci_dev *pdev,
 			gate, err);
 		return err;
 	}
-	if (apple_attach)
-		msleep(100);
 
 	err = pcim_enable_device(pdev);
 	if (err)
@@ -2045,8 +1450,6 @@ static int btmtk_pcie_probe(struct pci_dev *pdev,
 	bdev->fallback_chip_id = id->driver_data;
 	spin_lock_init(&bdev->ipc_lock);
 	spin_lock_init(&bdev->ring_lock);
-	atomic_set(&bdev->hci_error_notified, 0);
-	mutex_init(&bdev->sleep_lock);
 	init_waitqueue_head(&bdev->ipc_wait);
 	timer_setup(&bdev->ipc_timer, btmtk_pcie_ipc_timer, 0);
 	pci_set_drvdata(pdev, bdev);
@@ -2094,16 +1497,6 @@ static int btmtk_pcie_probe(struct pci_dev *pdev,
 		return -EINVAL;
 	}
 
-	if (apple_attach) {
-		err = btmtk_pcie_apple_attach_pci(bdev);
-		if (err) {
-			dev_err(&pdev->dev,
-				"J700_MT793B_PCIE_GATE_FAIL: stage=apple-attach-pci ret=%d\n",
-				err);
-			return err;
-		}
-	}
-
 	if (probe_rom_version) {
 		err = pci_read_config_dword(pdev, MTK_PCIE_ROM_VERSION_CONFIG,
 					   &rom_config);
@@ -2111,8 +1504,6 @@ static int btmtk_pcie_probe(struct pci_dev *pdev,
 			dev_err(&pdev->dev,
 				"J700_MT793B_PCIE_GATE_FAIL: stage=rom-config-48c ret=%d\n",
 				err);
-			if (apple_attach)
-				btmtk_pcie_quiesce(bdev);
 			return -EIO;
 		}
 
@@ -2121,72 +1512,46 @@ static int btmtk_pcie_probe(struct pci_dev *pdev,
 			dev_err(&pdev->dev,
 				"J700_MT793B_PCIE_GATE_FAIL: stage=rom-version raw=%08x bits6to4=%u\n",
 				rom_config, rom_version);
-			if (apple_attach)
-				btmtk_pcie_quiesce(bdev);
 			return -ENODEV;
 		}
 		bdev->rom_version = rom_version;
 		bdev->rom_version_valid = true;
 
-		if (apple_attach)
-			dev_info(&pdev->dev,
-				 "J700_MT793B_ROM_VERSION_PASS: config_offset=48c raw=%08x bits6to4=%u firmware=MT7932B%u dma=enabled pci_master=1 irq=1 hci=0\n",
-				 rom_config, rom_version, rom_version);
-		else
-			dev_info(&pdev->dev,
-				 "J700_MT793B_ROM_VERSION_PASS: config_offset=48c raw=%08x bits6to4=%u firmware=MT7932B%u dma=0 hci=0\n",
-				 rom_config, rom_version, rom_version);
+		dev_info(&pdev->dev,
+			 "J700_MT793B_ROM_VERSION_PASS: config_offset=48c raw=%08x bits6to4=%u firmware=MT7932B%u dma=0 hci=0\n",
+			 rom_config, rom_version, rom_version);
 	}
 
 	if (!probe_remap) {
-		if (!apple_attach) {
-			dev_info(&pdev->dev,
-				 "J700_MT793B_PCIE_GATE_READY: remap_write=0 mmio_reads=0 rom_config_read=%u dma=0 hci=0\n",
-				 probe_rom_version);
-			return 0;
-		}
-	} else {
-		err = btmtk_pcie_read_chip_id(bdev, &chip_id);
-		if (err) {
-			dev_err(&pdev->dev,
-				"J700_MT793B_PCIE_GATE_FAIL: stage=chip-id ret=%d\n",
-				err);
-			if (apple_attach)
-				btmtk_pcie_quiesce(bdev);
-			return err;
-		}
-
-		if (!chip_id) {
-			if (apple_attach)
-				dev_info(&pdev->dev,
-					 "J700_MT793B_CHIP_ID_DEFERRED: register=70010200 value=00000000 source=pre-conninfra exact_remap=23014/fe3b8 dma=enabled pci_master=1 irq=1 hci=0\n");
-			else
-				dev_info(&pdev->dev,
-					 "J700_MT793B_CHIP_ID_DEFERRED: register=70010200 value=00000000 source=pre-conninfra exact_remap=23014/fe3b8 dma=0 hci=0\n");
-		} else {
-			if ((chip_id & 0xffff) != 0x7922 &&
-			    (chip_id & 0xffff) != 0x7923 &&
-			    (chip_id & 0xffff) != 0x7932) {
-				dev_err(&pdev->dev,
-					"J700_MT793B_PCIE_GATE_FAIL: stage=chip-id value=%08x\n",
-					chip_id);
-				if (apple_attach)
-					btmtk_pcie_quiesce(bdev);
-				return -ENODEV;
-			}
-			if (apple_attach)
-				dev_info(&pdev->dev,
-					 "J700_MT793B_CHIP_ID_PASS: register=70010200 value=%08x core=%04x remap=70010000 bar0_selector=23014 fallback_selector=fe3b8 fallback=188d1890 bar0_window=c0200 dma=enabled pci_master=1 irq=1 hci=0\n",
-					 chip_id, chip_id & 0xffff);
-			else
-				dev_info(&pdev->dev,
-					 "J700_MT793B_CHIP_ID_PASS: register=70010200 value=%08x core=%04x remap=70010000 bar0_selector=23014 fallback_selector=fe3b8 fallback=188d1890 bar0_window=c0200 dma=0 hci=0\n",
-					 chip_id, chip_id & 0xffff);
-		}
+		dev_info(&pdev->dev,
+			 "J700_MT793B_PCIE_GATE_READY: remap_write=0 mmio_reads=0 rom_config_read=%u dma=0 hci=0\n",
+			 probe_rom_version);
+		return 0;
 	}
 
-	if (apple_attach)
-		btmtk_pcie_apple_attach_transport(bdev);
+	err = btmtk_pcie_read_chip_id(bdev, &chip_id);
+	if (err) {
+		dev_err(&pdev->dev,
+			"J700_MT793B_PCIE_GATE_FAIL: stage=chip-id ret=%d\n",
+			err);
+		return err;
+	}
+
+	if (!chip_id) {
+		dev_info(&pdev->dev,
+			 "J700_MT793B_CHIP_ID_DEFERRED: register=70010200 value=00000000 source=pre-conninfra exact_remap=23014/fe3b8 dma=0 hci=0\n");
+	} else if ((chip_id & 0xffff) != 0x7922 &&
+	    (chip_id & 0xffff) != 0x7923 &&
+	    (chip_id & 0xffff) != 0x7932) {
+		dev_err(&pdev->dev,
+			"J700_MT793B_PCIE_GATE_FAIL: stage=chip-id value=%08x\n",
+			chip_id);
+		return -ENODEV;
+	} else {
+		dev_info(&pdev->dev,
+			 "J700_MT793B_CHIP_ID_PASS: register=70010200 value=%08x core=%04x remap=70010000 bar0_selector=23014 fallback_selector=fe3b8 fallback=188d1890 bar0_window=c0200 dma=0 hci=0\n",
+			 chip_id, chip_id & 0xffff);
+	}
 
 	if (prepare_ipc) {
 		err = btmtk_pcie_prepare_ipc(bdev);
@@ -2194,17 +1559,8 @@ static int btmtk_pcie_probe(struct pci_dev *pdev,
 			dev_err(&pdev->dev,
 				"J700_MT793B_PCIE_GATE_FAIL: stage=ipc-layout ret=%d\n",
 				err);
-			if (apple_attach)
-				btmtk_pcie_quiesce(bdev);
 			return err;
 		}
-	}
-	if (apple_attach) {
-		dev_info(&pdev->dev,
-			 "J700_MT793B_APPLE_ATTACH_READY: order=dma-master-irq-config48c-chip-id-remap-ipc chip_id=%08x published=0 firmware=0 hci=0\n",
-			 chip_id);
-		if (!activate_firmware)
-			return 0;
 	}
 	if (activate_firmware) {
 		err = btmtk_pcie_activate_firmware(bdev);
@@ -2212,8 +1568,6 @@ static int btmtk_pcie_probe(struct pci_dev *pdev,
 			dev_err(&pdev->dev,
 				"J700_MT793B_PCIE_GATE_FAIL: stage=firmware-activation ret=%d\n",
 				err);
-			if (apple_attach)
-				btmtk_pcie_quiesce(bdev);
 			return err;
 		}
 	}
@@ -2253,21 +1607,12 @@ static int btmtk_pcie_probe(struct pci_dev *pdev,
 static void btmtk_pcie_remove(struct pci_dev *pdev)
 {
 	struct btmtk_pcie_dev *bdev = pci_get_drvdata(pdev);
-	struct hci_dev *hdev;
 
 	if (bdev) {
-		/* Keep transport live through HCI unregister, as Sunrise does. */
-		hdev = btmtk_pcie_detach_hci(bdev);
 		btmtk_pcie_quiesce(bdev);
-		if (hdev)
-			hci_free_dev(hdev);
+		btmtk_pcie_unregister_hci(bdev);
 		bdev->firmware_active = false;
 	}
-}
-
-static void btmtk_pcie_shutdown(struct pci_dev *pdev)
-{
-	btmtk_pcie_remove(pdev);
 }
 
 static const struct pci_device_id btmtk_pcie_table[] = {
@@ -2286,40 +1631,14 @@ static struct pci_driver btmtk_pcie_driver = {
 	.id_table = btmtk_pcie_table,
 	.probe = btmtk_pcie_probe,
 	.remove = btmtk_pcie_remove,
-	.shutdown = btmtk_pcie_shutdown,
-	.driver.pm = pm_sleep_ptr(&btmtk_pcie_pm_ops),
 };
-
-static int __init btmtk_pcie_init(void)
-{
-	if (apple_attach)
-		btmtk_pcie_driver.driver.probe_type =
-			PROBE_PREFER_ASYNCHRONOUS;
-
-	return pci_register_driver(&btmtk_pcie_driver);
-}
-
-static void __exit btmtk_pcie_exit(void)
-{
-	pci_unregister_driver(&btmtk_pcie_driver);
-}
-
-/*
- * The J700 Wi-Fi probe waits synchronously for FW_START.  A normal
- * device_initcall here is linked after drivers/net and cannot register until
- * that wait has failed, while Apple attaches the companion PCI function in
- * parallel.  Register before the device-driver initcall level so 14c3:793b
- * is already claimed when the Apple PCIe host enumerates the package.
- */
-subsys_initcall(btmtk_pcie_init);
-module_exit(btmtk_pcie_exit);
+module_pci_driver(btmtk_pcie_driver);
 
 MODULE_AUTHOR("Aurora Silicon");
 MODULE_DESCRIPTION("MediaTek MT79xx Bluetooth PCIe transport");
 MODULE_LICENSE("Dual BSD/GPL");
 MODULE_FIRMWARE(MTK_PCIE_FW_B0);
-MODULE_FIRMWARE(MTK_PCIE_FW_B1_CURRENT);
-MODULE_FIRMWARE(MTK_PCIE_FW_B1_COMPAT);
+MODULE_FIRMWARE(MTK_PCIE_FW_B1);
 MODULE_FIRMWARE(MTK_PCIE_PTX);
 MODULE_FIRMWARE(MTK_PCIE_BT_CALIBRATION);
 MODULE_FIRMWARE(MTK_PCIE_BT_ADDRESS);

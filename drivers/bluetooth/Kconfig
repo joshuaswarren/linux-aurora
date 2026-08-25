@@ -317,23 +317,30 @@ config BT_HCIMT79XX_PCIE
 	select BT_MTK
 	select FW_LOADER
 	help
-	  Experimental PCIe transport for MediaTek MT79xx Bluetooth functions,
-	  including the MT7932 companion function with PCI ID 14c3:793b used by
-	  Apple J700 systems.
+	  Experimental PCIe transport plumbing for MediaTek MT79xx Bluetooth
+	  functions, including the MT7932 Bluetooth function with PCI ID
+	  14c3:793b used by Apple J700 systems.
 
-	  The default behavior is a fail-closed BAR and chip-identity inventory.
-	  The apple_attach parameter replays Apple's pre-firmware companion attach:
-	  64-bit DMA, PCI bus mastering, one non-shared MSI vector, config 0x48c,
-	  the remapped core-ID read, transport remap, and IPC allocation. Used alone
-	  it stops before firmware or HCI registration. With gate=4..8 it continues
-	  through the recovered image activation, IPC state machine, ring transport,
-	  HCI registration, and Sunrise board-radio setup. The full path also
-	  implements the MT7932 IPC host-sleep handshake and wake-before-TX rule.
-
-	  The radio gate requires the matching Izuba PTX plus separately captured
-	  J700 board-calibration and local-address blobs for the 0xfdd0 SRS and
-	  0xfc1a address commands. All activation gates remain explicit and
-	  hardware-unvalidated.
+	  The default implementation is a fail-closed BAR and chip-identity
+	  inventory gate. An explicit bring-up parameter may allocate the recovered
+	  coherent IPC layout, but does not publish it to the device, enable PCI bus
+	  mastering, request an IRQ, load firmware, or register an HCI controller.
+	  A second explicit development parameter compiles the recovered bounded
+	  firmware DMA/semaphore sequence for later staged validation; it remains
+	  off by default and does not publish the IPC context or register HCI.
+	  A final separate development parameter compiles the exact shared-IRQ,
+	  context-publication and INIT-to-RUNNING handshake while deliberately
+	  leaving ring advertisement, RX priming and HCI registration disabled.
+	  One further default-off parameter prepares the exact ten Apple control
+	  records and 127 receive offers on rings 2, 4, 6, 8 and 10, but still
+	  sends no initialization commands and does not register HCI.
+	  A final default-off compile gate consumes/refills the proven receive
+	  descriptors, emits command/ACL/SCO/ISO transmit descriptors, and registers
+	  an HCI PCI device. It has no hardware validation or radio claim.
+	  A further default-off setup gate encodes the exact Sunrise 0xfdd0 SRS
+	  command and 0xfc1a address write. It requires the pinned Izuba PTX plus
+	  separately captured J700 board-calibration and local-address blobs. It is
+	  compile-only and has no runner.
 
 	  Say Y here only for bounded platform bring-up.
 
