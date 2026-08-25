@@ -26,6 +26,7 @@ use crate::{
     g15_boot,
     g17_boot,
     g17_firmware,
+    g17_power_preflight,
     gem::AsahiObject,
     gpu,
     hw,
@@ -317,9 +318,7 @@ fn refuse_agx3_probe(pdev: &platform::Device<Core>, soc: &'static hw::agx3::SocC
 
     match expected.gpu_gen {
         hw::GpuGen::G15 => refuse_g15_probe(pdev),
-        hw::GpuGen::G17 => {
-            refuse_g17_probe(pdev, expected.gpu_variant, loaded_g17_firmware.as_ref())
-        }
+        hw::GpuGen::G17 => refuse_g17_probe(pdev, &expected, loaded_g17_firmware.as_ref()),
         gen => {
             dev_err!(
                 pdev.as_ref(),
@@ -395,9 +394,35 @@ fn refuse_g15_probe(pdev: &platform::Device<Core>) -> Error {
 
 fn refuse_g17_probe(
     pdev: &platform::Device<Core>,
-    gpu_variant: identity::GpuVariant,
+    identity: &identity::GpuIdentity,
     firmware: Option<&g17_firmware::G17FirmwareIdentityAdmission>,
 ) -> Error {
+    let power_preflight = match g17_power_preflight::G17PowerPreflight::new(identity) {
+        Ok(preflight) => preflight,
+        Err(e) => {
+            dev_err!(
+                pdev.as_ref(),
+                "G17: no exact target-bound cold-boot/power preflight: {:?}; refusing\n",
+                e
+            );
+            return ENODEV;
+        }
+    };
+    let Err(power_missing) = power_preflight.execution_gate() else {
+        dev_err!(
+            pdev.as_ref(),
+            "G17 diagnostic target remained selected after its power execution gate opened\n"
+        );
+        return EINVAL;
+    };
+    dev_info!(
+        pdev.as_ref(),
+        "G17 {:?} cold-boot/power model selected; live execution evidence still missing {:#x}\n",
+        power_preflight.target(),
+        power_missing.bits()
+    );
+
+    let gpu_variant = identity.gpu_variant;
     let gate = if gpu_variant == identity::GpuVariant::S {
         g17_boot::pre_handoff_gate_with_identity(
             hw::GpuGen::G17 as u32,
