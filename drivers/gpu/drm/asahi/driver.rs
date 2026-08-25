@@ -382,7 +382,7 @@ fn refuse_g17_probe(pdev: &platform::Device<Core>) -> Error {
     if missing.contains(g17_boot::missing::FIRMWARE_IDENTITY) {
         dev_err!(
             pdev.as_ref(),
-            "G17 preflight: paired firmware identity selection is not wired\n"
+            "G17 preflight: strict paired FTAB/Mach-O identity admission is implemented, but authoritative iBoot/m1n1 role-image observation is not wired\n"
         );
     }
     if missing.contains(g17_boot::missing::ROLE_RESOURCES) {
