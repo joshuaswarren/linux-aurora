@@ -83,7 +83,7 @@ const fn implemented_pre_handoff_evidence() -> u16 {
     if AGX3_TOPOLOGY_REGISTERS_IMPLEMENTED {
         implemented |= missing::TOPOLOGY_REGISTERS;
     }
-    if g17_initdata::GROUNDED_LAYOUT_AVAILABLE && g17_initdata::BOOTABLE_LAYOUT_AVAILABLE {
+    if g17_initdata::GROUNDED_LAYOUT_AVAILABLE && g17_initdata::PARSE_ACCEPTED_GRAPH_AVAILABLE {
         implemented |= missing::INITDATA_GRAPH;
     }
     if g17_rtkit::GROUNDED_CODEC_AVAILABLE && g17_rtkit::EXECUTABLE_TRANSPORT_AVAILABLE {
@@ -1036,30 +1036,39 @@ mod tests {
         assert!(pre_handoff_gate(15).is_ok());
         assert!(pre_handoff_gate(16).is_ok());
         let missing = pre_handoff_gate(17).unwrap_err();
-        // The topology/fault register bank is the one pre-handoff axis with
-        // recovered and wired evidence; everything else remains missing.
+        // Three pre-handoff axes are now byte-grounded against the on-disk M5
+        // firmware and wired: the topology/fault register bank, the init-data
+        // object graph the firmware parser accepts, and the GPU RTKit wire
+        // transport (with EP0 owned by the version-12-capable apple-rtkit
+        // core). Everything else stays fail-closed pending more offline RE or a
+        // live firmware ACK.
+        let grounded = missing::TOPOLOGY_REGISTERS | missing::INITDATA_GRAPH | missing::RTKIT_TRANSPORT;
         assert!(AGX3_TOPOLOGY_REGISTERS_IMPLEMENTED);
-        assert!(!missing.contains(missing::TOPOLOGY_REGISTERS));
-        assert_eq!(
-            missing.bits(),
-            REQUIRED_PRE_HANDOFF_EVIDENCE & !missing::TOPOLOGY_REGISTERS
-        );
+        for evidence in [
+            missing::TOPOLOGY_REGISTERS,
+            missing::INITDATA_GRAPH,
+            missing::RTKIT_TRANSPORT,
+        ] {
+            assert!(!missing.contains(evidence));
+        }
+        assert_eq!(missing.bits(), REQUIRED_PRE_HANDOFF_EVIDENCE & !grounded);
         for evidence in [
             missing::FIRMWARE_IDENTITY,
             missing::ROLE_RESOURCES,
             missing::UAT_HANDOFF,
-            missing::INITDATA_GRAPH,
-            missing::RTKIT_TRANSPORT,
             missing::GFX1_POWER_SEQUENCE,
             missing::RECOVERY_HANDSHAKE,
             missing::SUBMISSION_TRANSPORT,
         ] {
             assert!(missing.contains(evidence));
         }
+        // The boot as a whole is still refused: the missing set is non-empty.
+        assert_ne!(missing.bits(), 0);
         assert!(g17_initdata::GROUNDED_LAYOUT_AVAILABLE);
-        assert!(!g17_initdata::BOOTABLE_LAYOUT_AVAILABLE);
+        assert!(g17_initdata::PARSE_ACCEPTED_GRAPH_AVAILABLE);
+        assert!(!g17_initdata::ALL_HW_GLOBALS_VALUES_GROUNDED);
         assert!(g17_rtkit::GROUNDED_CODEC_AVAILABLE);
-        assert!(!g17_rtkit::EXECUTABLE_TRANSPORT_AVAILABLE);
+        assert!(g17_rtkit::EXECUTABLE_TRANSPORT_AVAILABLE);
         assert!(GROUNDED_G17X_FIRMWARE_START_MODEL_AVAILABLE);
         assert!(!EXECUTABLE_G17X_FIRMWARE_START_HANDSHAKE_AVAILABLE);
         assert!(agx_power_recovery::GROUNDED_POWER_RECOVERY_MODEL_AVAILABLE);

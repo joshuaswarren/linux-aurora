@@ -110,10 +110,19 @@ pub(crate) const IOVA_USER_RANGE: Range<u64> = IOVA_USER_BASE..IOVA_USER_TOP;
 /// The 42-bit walk geometry, the kernel-half VA layout, and the leaf PTE
 /// policy below this boundary are implemented and host-tested (the AGX3 leaf
 /// PTE encoder is byte-identical to AGX2: AGXG17X `encodePTEFlags`
-/// @ 0xfffffe0008b9975c). The Handoff struct layout is firmware-ABI and has
-/// only been observed for AGX2 firmware builds, so [`Uat::new`] fails closed
-/// on exactly this constant for 42-bit parts. Flip it only with evidence
-/// from a G15+ firmware build.
+/// @ 0xfffffe0008b9975c). The [`Handoff`] struct is not an ordinary firmware
+/// input struct that can be byte-grounded from a disassembler: it is a live
+/// AP<->firmware PPL coherence region driven by a Dekker mutual-exclusion
+/// handshake and a `magic_ap`/`magic_fw` exchange (`PPL_MAGIC`), managed by
+/// the RTKit MMU/PPL runtime, not by the AGX message handlers. The on-disk M5
+/// `GFX.a010.macho` confirms the region exists on G17 (`"MMU uat_handoff !map"`
+/// / `"PPL handoff !vm export"` @ 0x2b570 / 0x2b518) but does not expose its
+/// exact field offsets, and — critically — [`Handoff::init`] blocks until the
+/// firmware writes `magic_fw == PPL_MAGIC`, so a correct layout can only ever
+/// be *confirmed* by a live boot ACK. This is therefore the one gate that
+/// stays fail-closed by design: it is exactly the "needs a live firmware ACK"
+/// boundary. [`Uat::new`] fails closed on it for 42-bit parts. Flip it only
+/// once a live G15+/G17 boot completes the PPL handshake.
 const AGX3_FIRMWARE_HANDOFF_VALIDATED: bool = false;
 
 /// Return the evidence-backed UAT root geometry for this SoC.

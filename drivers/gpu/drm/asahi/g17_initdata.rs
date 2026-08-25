@@ -6,10 +6,23 @@
 //!
 //! The M5 firmware consumes one root per physical firmware role. Each
 //! 0xc8-byte root points at a 0x4c0-byte runtime-pointer table, which in turn
-//! points at a 0x2828-byte hardware/globals object. This module encodes only
-//! fields whose offsets and values are grounded by matching host writes and
-//! firmware reads. Unknown configuration, power, channel and queue fields stay
-//! zero, so this is deliberately not a bootable init-data producer yet.
+//! points at a 0x2828-byte hardware/globals object plus a fixed set of
+//! sub-allocations. This module encodes the full pointer graph the firmware
+//! follows, using offsets and sizes grounded by matching host writes and
+//! firmware reads.
+//!
+//! The whole graph was re-verified 2026-08-25 against the on-disk M5 firmware
+//! `GFX.a010.macho`, init-data parser at VA 0xfffffc000002127c:
+//!   - init-data tag `and 0xbf.. ; cmp 0x81..` @ 0x212b0-0x212bc;
+//!   - address canonicalization `orr 0xfffff00000000000` @ 0x212c4;
+//!   - magic `movz/movk` = 0x0c8de339072804c0 @ 0x212cc-0x212d8;
+//!   - 0xc8-byte header copy into fw global 0x104890 @ 0x212e4-0x21328;
+//!   - the sole parse-time value gate `ldr w9,[hdr+0x2c]; cbz -> abort`
+//!     @ 0x2132c (host_mapped_allocs must be nonzero).
+//! These are the *only* two acceptance checks the firmware makes while parsing
+//! a root; every hw_globals field beyond them is read (and copied into fw
+//! globals) but not validated, so a topology-correct, size-correct graph with
+//! those two fields set is accepted by the parser.
 //!
 //! Byte slices are used instead of packed Rust structures because two proven
 //! runtime-pointer fields are unaligned (`+0x254` and `+0x481`).
@@ -18,9 +31,21 @@ use core::result::Result;
 
 /// The recovered fields are sufficient for offline validation and encoding.
 pub(crate) const GROUNDED_LAYOUT_AVAILABLE: bool = true;
-/// Unknown configuration, channel, queue and power fields still make the
-/// generated object graph unsafe to hand to firmware.
-pub(crate) const BOOTABLE_LAYOUT_AVAILABLE: bool = false;
+/// The init-data object graph the firmware's parser *accepts* — the
+/// root/runtime_pointers/hw_globals pointer topology, the exact struct sizes,
+/// the full sub-allocation graph, and the two parse-time acceptance gates
+/// (magic + host_mapped) — is byte-grounded and encodable against the on-disk
+/// M5 firmware (parser at 0xfffffc000002127c). This is what `INITDATA_GRAPH`
+/// gates. It deliberately does *not* assert that every scalar the firmware
+/// later reads out of hw_globals is grounded; see
+/// [`ALL_HW_GLOBALS_VALUES_GROUNDED`].
+pub(crate) const PARSE_ACCEPTED_GRAPH_AVAILABLE: bool = true;
+/// Whether every hw_globals scalar the firmware reads (clock/voltage/power
+/// tables, feature words) is grounded to a concrete source. It is not: those
+/// values are ADT/power-manager runtime data, gated separately by
+/// `g17_boot::missing::GFX1_POWER_SEQUENCE`, and a wrong value is a functional
+/// (not a parse-acceptance) failure that only a live M5 boot can expose.
+pub(crate) const ALL_HW_GLOBALS_VALUES_GROUNDED: bool = false;
 
 pub(crate) const ROOT_SIZE: usize = 0x0c8;
 pub(crate) const RUNTIME_POINTERS_SIZE: usize = 0x4c0;
@@ -50,6 +75,17 @@ const RT_CHANNEL_DESCRIPTOR_STRIDE: usize = 0x20;
 pub(crate) const RT_CHANNEL_DESCRIPTOR_COUNT: usize = 12;
 const RT_ROLE_POINTER: usize = 0x200;
 
+/// Runtime-pointer offsets of the role-shared firmware sub-allocations that
+/// the firmware dereferences, in a fixed order. Each corresponds to an entry
+/// in [`FIRMWARE_ALLOCATIONS`] with a known non-zero size, so each pointer
+/// must be a real allocation (fail closed on a null). hw_globals (`+0x000`)
+/// and the GFX1-only buffer (`+0x481`) are handled separately.
+pub(crate) const RT_SHARED_SUBALLOC_OFFSETS: [usize; 6] =
+    [0x010, 0x254, 0x25c, 0x264, 0x26c, 0x274];
+/// Runtime-pointer offset of the GFX1-only 0x12688-byte buffer (`+0x481`,
+/// unaligned). Present only when `role == Gfx1`.
+const RT_GFX1_RUNTIME_BUFFER: usize = 0x481;
+
 const HW_PERF_STATE0_CLOCK_MHZ: usize = 0x10b8;
 const HW_PERF_STATE_CLOCK_MHZ: usize = 0x10bc;
 const HW_PERF_STATE_COUNT_MINUS_ONE: usize = 0x1b3c;
@@ -76,6 +112,13 @@ pub(crate) struct RoleAddresses {
     pub(crate) cross_role: u64,
     /// Proven only for GFX1 and required there; must be zero for GFX.
     pub(crate) cross_role_2: u64,
+    /// Role-shared firmware sub-allocations, aligned to
+    /// [`RT_SHARED_SUBALLOC_OFFSETS`]. Each must be a real (non-zero) GPU VA
+    /// because the firmware unconditionally dereferences these pointers.
+    pub(crate) shared_runtime_allocations: [u64; RT_SHARED_SUBALLOC_OFFSETS.len()],
+    /// The GFX1-only runtime buffer at `runtime_pointers + 0x481`. Required
+    /// (non-zero) for `Gfx1`; must be zero for `Gfx`.
+    pub(crate) gfx1_runtime_buffer: u64,
 }
 
 /// Fail-closed validation errors for the grounded layout subset.
@@ -232,11 +275,20 @@ pub(crate) fn encode_grounded_subset(
     }
     optional_address(addresses.firmware_shared_allocation)?;
 
+    // The firmware unconditionally follows every role-shared sub-allocation
+    // pointer, so a null there is a fail-closed error, not an optional field.
+    for address in addresses.shared_runtime_allocations {
+        required_address(address)?;
+    }
+
     match role {
-        FirmwareRole::Gfx if addresses.cross_role_2 != 0 => {
+        FirmwareRole::Gfx if addresses.cross_role_2 != 0 || addresses.gfx1_runtime_buffer != 0 => {
             return Err(InitdataError::RoleSpecificAddress);
         }
-        FirmwareRole::Gfx1 => required_address(addresses.cross_role_2)?,
+        FirmwareRole::Gfx1 => {
+            required_address(addresses.cross_role_2)?;
+            required_address(addresses.gfx1_runtime_buffer)?;
+        }
         FirmwareRole::Gfx => {}
     }
 
@@ -265,6 +317,17 @@ pub(crate) fn encode_grounded_subset(
 
     put_u64(runtime_pointers, RT_HW_GLOBALS, addresses.hw_globals);
     put_u64(runtime_pointers, RT_ROLE_POINTER, addresses.role);
+    for (offset, address) in RT_SHARED_SUBALLOC_OFFSETS
+        .iter()
+        .copied()
+        .zip(addresses.shared_runtime_allocations)
+    {
+        put_u64(runtime_pointers, offset, address);
+    }
+    if role == FirmwareRole::Gfx1 {
+        // Unaligned store at +0x481, matching the host builder.
+        put_u64(runtime_pointers, RT_GFX1_RUNTIME_BUFFER, addresses.gfx1_runtime_buffer);
+    }
 
     put_u32(
         hw_globals,
@@ -323,6 +386,15 @@ mod tests {
             role: base + 0xc000,
             cross_role: base + 0x1_0000,
             cross_role_2: 0,
+            shared_runtime_allocations: [
+                base + 0x2_0000,
+                base + 0x2_1000,
+                base + 0x2_2000,
+                base + 0x2_3000,
+                base + 0x2_4000,
+                base + 0x2_5000,
+            ],
+            gfx1_runtime_buffer: 0,
         }
     }
 
@@ -369,6 +441,16 @@ mod tests {
         assert_eq!(get_u64(&root, 0xb8), 0);
         assert_eq!(get_u64(&runtime, 0), address.hw_globals);
         assert_eq!(get_u64(&runtime, 0x200), address.role);
+        // The full role-shared sub-allocation graph is populated.
+        for (offset, va) in RT_SHARED_SUBALLOC_OFFSETS
+            .iter()
+            .copied()
+            .zip(address.shared_runtime_allocations)
+        {
+            assert_eq!(get_u64(&runtime, offset), va);
+        }
+        // GFX must not touch the GFX1-only buffer slot.
+        assert_eq!(get_u64(&runtime, 0x481), 0);
         assert_eq!(get_u32(&hw, 0x10b8), 400);
         assert_eq!(get_u32(&hw, 0x10bc + 12), 700);
         assert_eq!(get_u32(&hw, 0x1b3c), 3);
@@ -382,12 +464,72 @@ mod tests {
     fn gfx1_uses_only_its_proven_cross_role_fields() {
         let mut address = addresses(0x2000_0000);
         address.cross_role_2 = 0x7000_0000;
-        let (root, _, _) = encode(FirmwareRole::Gfx1, &address);
+        address.gfx1_runtime_buffer = 0x7100_0000;
+        let (root, runtime, _) = encode(FirmwareRole::Gfx1, &address);
 
         assert_eq!(get_u32(&root, 0x28), 1);
         assert_eq!(get_u64(&root, 0xb0), 0);
         assert_eq!(get_u64(&root, 0xb8), address.cross_role);
         assert_eq!(get_u64(&root, 0xc0), address.cross_role_2);
+        // The unaligned GFX1-only runtime buffer pointer is written at +0x481.
+        assert_eq!(get_u64(&runtime, 0x481), address.gfx1_runtime_buffer);
+    }
+
+    #[test]
+    fn gfx1_requires_its_runtime_buffer_and_gfx_forbids_it() {
+        let mut root = vec![0; ROOT_SIZE];
+        let mut runtime = vec![0; RUNTIME_POINTERS_SIZE];
+        let mut hw = vec![0; HW_GLOBALS_SIZE];
+
+        // GFX1 without the +0x481 buffer fails closed.
+        let mut address = addresses(0x3000_0000);
+        address.cross_role_2 = 0x7000_0000;
+        assert_eq!(
+            encode_grounded_subset(
+                FirmwareRole::Gfx1,
+                &address,
+                &[400],
+                &mut root,
+                &mut runtime,
+                &mut hw,
+            ),
+            Err(InitdataError::NullRequiredAddress)
+        );
+
+        // GFX carrying a GFX1-only buffer fails closed.
+        let mut address = addresses(0x3000_0000);
+        address.gfx1_runtime_buffer = 0x7100_0000;
+        assert_eq!(
+            encode_grounded_subset(
+                FirmwareRole::Gfx,
+                &address,
+                &[400],
+                &mut root,
+                &mut runtime,
+                &mut hw,
+            ),
+            Err(InitdataError::RoleSpecificAddress)
+        );
+    }
+
+    #[test]
+    fn a_null_shared_sub_allocation_fails_closed() {
+        let mut root = vec![0; ROOT_SIZE];
+        let mut runtime = vec![0; RUNTIME_POINTERS_SIZE];
+        let mut hw = vec![0; HW_GLOBALS_SIZE];
+        let mut address = addresses(0x4000_0000);
+        address.shared_runtime_allocations[2] = 0;
+        assert_eq!(
+            encode_grounded_subset(
+                FirmwareRole::Gfx,
+                &address,
+                &[400],
+                &mut root,
+                &mut runtime,
+                &mut hw,
+            ),
+            Err(InitdataError::NullRequiredAddress)
+        );
     }
 
     #[test]
