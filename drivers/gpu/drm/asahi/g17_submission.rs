@@ -14,7 +14,10 @@
 //! host-side reset images for `_AGFIChannelState` and
 //! `AGXUncachedFWChannelMem`. The provenance ledger explicitly separates
 //! byte-grounded G17 fields from inherited producer records whose G17 consumer
-//! offsets still need first-hand confirmation.
+//! offsets still need first-hand confirmation. The native G17 channel-command
+//! dispatcher is also modeled: it reads the tag at command offset zero, uses
+//! an AGX3-specific accepted set through tag 18, and assigns tag 6 to the
+//! SKSM-forbidden PM-rebuild command rather than AGX2's init-buffer command.
 //!
 //! Grounding is first-hand from the on-disk M5 role macho `GFX.a010.macho`
 //! (`g17s a0, SKSM Enabled`) and the pinned G17P/G17G/G17X host-kext
@@ -730,22 +733,73 @@ pub(crate) const fn prepare_sksm_add_kicks_mmio(
 }
 
 // ---------------------------------------------------------------------------
-// 7. Command types at command offset 0. These are inherited from AGX2
-//    `fw/workqueue.rs::CommandType`; the G17 consumer's numeric dispatch has
-//    not yet been grounded first-hand. A KSM completion entry outside its
-//    accepted set aborts with the fatal string at GFX 0xe710, but that string
-//    alone does not prove the tag values below.
+// 7. Native G17 channel-command dispatch.
+//
+//    Grounded first-hand from `agfaProcessChannelCommand` at GFX
+//    0xfffffc00000122c0-0xfffffc0000012364 and its 19-entry jump table at
+//    0xfffffc0000013654. The firmware validates at least four bytes, loads the
+//    u32 tag from command offset zero, rejects tags above 18, and dispatches
+//    the exact set below. Tags 8/10/11/13/17 share the invalid-command fatal
+//    path at 0x13610. Tag 6 reaches the dedicated
+//    `kAGFIChannelCommandTypePMRebuild must not be received in SKSM` fatal at
+//    0x135f4. Therefore AGX2's `InitBuffer = 6` must not be reused on G17.
+//
+//    The optional pre-dispatch filter at 0x12318-0x12338 uses literal mask
+//    0x1d03f for tags <= 16. Its accepted set is exposed separately so a
+//    future live producer can preserve that gate instead of conflating it
+//    with the complete jump-table dispatch.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[repr(u32)]
-pub(crate) enum CommandType {
+pub(crate) enum G17KnownCommandType {
     RunVertex = 0,
     RunFragment = 1,
     RunBlitter = 2,
     RunCompute = 3,
     Barrier = 4,
-    InitBuffer = 6,
+    PmRebuild = 6,
+}
+
+/// Highest tag admitted by the native G17 jump-table bounds check.
+pub(crate) const G17_CHANNEL_COMMAND_TYPE_MAX: u32 = 18;
+
+/// Tags whose jump-table entries reach a normal processing case.
+pub(crate) const G17_CHANNEL_COMMAND_PROCESS_MASK: u32 = 0x0005_d2bf;
+/// Tag 6 has a dedicated PM-rebuild-in-SKSM fatal path.
+pub(crate) const G17_CHANNEL_COMMAND_PM_REBUILD_MASK: u32 = 0x0000_0040;
+/// In-range tags whose jump-table entries reach the invalid-command fatal.
+pub(crate) const G17_CHANNEL_COMMAND_INVALID_MASK: u32 = 0x0002_2d00;
+/// Literal mask used by the optional pre-dispatch filter for tags <= 16.
+pub(crate) const G17_CHANNEL_COMMAND_PREFILTER_MASK: u32 = 0x0001_d03f;
+
+/// Firmware disposition for one raw command tag.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum G17ChannelCommandDisposition {
+    Process,
+    PmRebuildForbidden,
+    Invalid,
+}
+
+/// Classify a raw tag exactly like the native G17 jump table.
+pub(crate) const fn classify_g17_channel_command(raw: u32) -> G17ChannelCommandDisposition {
+    if raw > G17_CHANNEL_COMMAND_TYPE_MAX {
+        return G17ChannelCommandDisposition::Invalid;
+    }
+
+    let bit = 1u32 << raw;
+    if bit & G17_CHANNEL_COMMAND_PROCESS_MASK != 0 {
+        G17ChannelCommandDisposition::Process
+    } else if bit & G17_CHANNEL_COMMAND_PM_REBUILD_MASK != 0 {
+        G17ChannelCommandDisposition::PmRebuildForbidden
+    } else {
+        G17ChannelCommandDisposition::Invalid
+    }
+}
+
+/// Apply the firmware's optional `tag <= 16 && bit(tag) & 0x1d03f` filter.
+pub(crate) const fn g17_channel_command_prefilter_allows(raw: u32) -> bool {
+    raw <= 16 && ((1u32 << raw) & G17_CHANNEL_COMMAND_PREFILTER_MASK) != 0
 }
 
 // ---------------------------------------------------------------------------
@@ -785,7 +839,8 @@ pub(crate) struct SubmissionAbiLedger {
 /// channel/ring producer *records* are the AGX2 layouts the driver writes; the
 /// G17 firmware consumer offsets were not read first-hand this pass. The G17
 /// channel descriptor is a grounded AGX3 fork (§2a), while the state records
-/// remain unconfirmed and fail-closed.
+/// remain unconfirmed and fail-closed. The command dispatch is a grounded AGX3
+/// fork (§7): in particular, inherited AGX2 `InitBuffer = 6` is rejected.
 pub(crate) const SUBMISSION_ABI_LEDGER: SubmissionAbiLedger = SubmissionAbiLedger {
     tx_doorbell: AbiProvenance::IdenticalToAgx2,
     channel_state: AbiProvenance::Agx2InheritedUnconfirmed,
@@ -793,7 +848,7 @@ pub(crate) const SUBMISSION_ABI_LEDGER: SubmissionAbiLedger = SubmissionAbiLedge
     channel_descriptor: AbiProvenance::ForkedAgx3Grounded,
     host_channel_state_reset: AbiProvenance::ForkedAgx3Grounded,
     host_uncached_channel_reset: AbiProvenance::ForkedAgx3Grounded,
-    command_types: AbiProvenance::Agx2InheritedUnconfirmed,
+    command_types: AbiProvenance::ForkedAgx3Grounded,
     kick_word: AbiProvenance::ForkedAgx3Grounded,
     kick_queue_producer: AbiProvenance::ForkedAgx3Grounded,
     host_add_kicks_mmio: AbiProvenance::ForkedAgx3Grounded,
@@ -1362,13 +1417,53 @@ mod tests {
     }
 
     #[test]
-    fn command_types_match_agx2() {
-        assert_eq!(CommandType::RunVertex as u32, 0);
-        assert_eq!(CommandType::RunFragment as u32, 1);
-        assert_eq!(CommandType::RunBlitter as u32, 2);
-        assert_eq!(CommandType::RunCompute as u32, 3);
-        assert_eq!(CommandType::Barrier as u32, 4);
-        assert_eq!(CommandType::InitBuffer as u32, 6);
+    fn g17_command_dispatch_matches_the_firmware_jump_table() {
+        assert_eq!(G17KnownCommandType::RunVertex as u32, 0);
+        assert_eq!(G17KnownCommandType::RunFragment as u32, 1);
+        assert_eq!(G17KnownCommandType::RunBlitter as u32, 2);
+        assert_eq!(G17KnownCommandType::RunCompute as u32, 3);
+        assert_eq!(G17KnownCommandType::Barrier as u32, 4);
+        assert_eq!(G17KnownCommandType::PmRebuild as u32, 6);
+
+        assert_eq!(G17_CHANNEL_COMMAND_TYPE_MAX, 18);
+        assert_eq!(G17_CHANNEL_COMMAND_PROCESS_MASK, 0x0005_d2bf);
+        assert_eq!(G17_CHANNEL_COMMAND_PM_REBUILD_MASK, 0x0000_0040);
+        assert_eq!(G17_CHANNEL_COMMAND_INVALID_MASK, 0x0002_2d00);
+        assert_eq!(
+            G17_CHANNEL_COMMAND_PROCESS_MASK
+                | G17_CHANNEL_COMMAND_PM_REBUILD_MASK
+                | G17_CHANNEL_COMMAND_INVALID_MASK,
+            (1 << (G17_CHANNEL_COMMAND_TYPE_MAX + 1)) - 1
+        );
+
+        for raw in 0..=G17_CHANNEL_COMMAND_TYPE_MAX {
+            let expected = match raw {
+                0 | 1 | 2 | 3 | 4 | 5 | 7 | 9 | 12 | 14 | 15 | 16 | 18 => {
+                    G17ChannelCommandDisposition::Process
+                }
+                6 => G17ChannelCommandDisposition::PmRebuildForbidden,
+                8 | 10 | 11 | 13 | 17 => G17ChannelCommandDisposition::Invalid,
+                _ => unreachable!(),
+            };
+            assert_eq!(classify_g17_channel_command(raw), expected);
+        }
+        assert_eq!(
+            classify_g17_channel_command(19),
+            G17ChannelCommandDisposition::Invalid
+        );
+        assert_eq!(
+            classify_g17_channel_command(u32::MAX),
+            G17ChannelCommandDisposition::Invalid
+        );
+    }
+
+    #[test]
+    fn g17_command_prefilter_matches_literal_mask() {
+        assert_eq!(G17_CHANNEL_COMMAND_PREFILTER_MASK, 0x0001_d03f);
+        for raw in 0..=20 {
+            let expected = matches!(raw, 0 | 1 | 2 | 3 | 4 | 5 | 12 | 14 | 15 | 16);
+            assert_eq!(g17_channel_command_prefilter_allows(raw), expected);
+        }
     }
 
     #[test]
@@ -1418,7 +1513,7 @@ mod tests {
         );
         assert_eq!(
             SUBMISSION_ABI_LEDGER.command_types,
-            AbiProvenance::Agx2InheritedUnconfirmed
+            AbiProvenance::ForkedAgx3Grounded
         );
         assert!(CHANNEL_DESCRIPTOR_STRIDE_CONFIRMED);
     }
