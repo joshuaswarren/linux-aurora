@@ -63,12 +63,26 @@ impl MissingEvidence {
     }
 }
 
+/// The AGX3 topology/fault register bank is recovered and wired.
+///
+/// All eight AGX3 kexts in the pinned `26A5378n` corpus use the G14X register
+/// family: per-cluster core-enable masks are three u32 words at `0xe01500`
+/// (AGXG17X `readChipInfo` @ 0xfffffe0008b4b220, AGXG15G @
+/// 0xfffffe0008af22f0), and the MMU fault registers are
+/// FAULT_INFO=`0xd8c0`/FAULT_ADDR=`0xd8c8` with the acknowledge write at
+/// `0xd800` (AGXG17X @ 0xfffffe0008b58c04). `regs.rs` decodes hardware
+/// families 0x7/0x8/0xa/0xb with this bank.
+pub(crate) const AGX3_TOPOLOGY_REGISTERS_IMPLEMENTED: bool = true;
+
 const fn implemented_pre_handoff_evidence() -> u16 {
     let mut implemented = 0;
 
     // These constants deliberately distinguish useful offline codecs from an
     // executable firmware ABI. When either module becomes complete, this gate
     // changes with the implementation rather than a disconnected probe flag.
+    if AGX3_TOPOLOGY_REGISTERS_IMPLEMENTED {
+        implemented |= missing::TOPOLOGY_REGISTERS;
+    }
     if g17_initdata::GROUNDED_LAYOUT_AVAILABLE && g17_initdata::BOOTABLE_LAYOUT_AVAILABLE {
         implemented |= missing::INITDATA_GRAPH;
     }
@@ -1022,11 +1036,17 @@ mod tests {
         assert!(pre_handoff_gate(15).is_ok());
         assert!(pre_handoff_gate(16).is_ok());
         let missing = pre_handoff_gate(17).unwrap_err();
-        assert_eq!(missing.bits(), REQUIRED_PRE_HANDOFF_EVIDENCE);
+        // The topology/fault register bank is the one pre-handoff axis with
+        // recovered and wired evidence; everything else remains missing.
+        assert!(AGX3_TOPOLOGY_REGISTERS_IMPLEMENTED);
+        assert!(!missing.contains(missing::TOPOLOGY_REGISTERS));
+        assert_eq!(
+            missing.bits(),
+            REQUIRED_PRE_HANDOFF_EVIDENCE & !missing::TOPOLOGY_REGISTERS
+        );
         for evidence in [
             missing::FIRMWARE_IDENTITY,
             missing::ROLE_RESOURCES,
-            missing::TOPOLOGY_REGISTERS,
             missing::UAT_HANDOFF,
             missing::INITDATA_GRAPH,
             missing::RTKIT_TRANSPORT,
