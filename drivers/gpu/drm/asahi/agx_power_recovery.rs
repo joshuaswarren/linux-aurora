@@ -975,6 +975,144 @@ pub(crate) const fn g17_host_management_route_wake_field(
     }
 }
 
+// -------------------------------------------------------------------------
+// GFX1_POWER_SEQUENCE — scheduler-role power-kick command acceptance.
+//
+// Grounded 2026-08-25 by disassembling `GFX.a010.macho` (`otool -tvV`). The
+// remote-power-kick DECODE lives in the GFX/scheduler role, not GFX1: only
+// `GFX.strings.txt` carries `agfaRemotePowerKick`,
+// `AGFASchedulerProcessPowerKick`, `AGFAPowerMetricsServerTask`. The GFX1 role
+// owns the transition grammar modeled above; this block adds the command
+// acceptance the scheduler enforces before any power effect.
+//
+//   `agfaRemotePowerKick` decoder @ 0xfffffc00000237e4 — a pure exact-value
+//   equality tree (no MMIO):
+//     accept 0x0010_0000 @0xfffffc0000023840 (`cmp x0,#0x100,lsl#12`; OR-in
+//            `ldsetal` @0xfffffc0000023854)
+//     accept 0x0100_0000 @0xfffffc000002386c (`mov w8,#0x1000000; cmp; b.ne`)
+//     accept 0x8000_0000 @0xfffffc000002381c-…3820 (`mov w8,#-0x80000000; cmp`)
+//     abort  {0x40,0x80,0x100,0x200,0x2_0000_0000,0x20_0000_0000,
+//            0x100_0000_0000} @0xfffffc0000023898-…38fc → `_RTK_abort`
+//            "Unrecognized remote power kick value" @0xfffffc0000023970
+//     else   `retab` silent no-op @0xfffffc0000023910
+//   `AGFASchedulerProcessPowerKick` switch @ 0xfffffc0000026e34 — recognized
+//     event bits {0x10_0000,0x400_0000,0x800_0000,0x1000_0000,0x2000_0000,
+//     0x4000_0000}, default aborts "Unknown message received".
+//   `AGFAPowerMetricsServerTask` @ 0xfffffc000002a800 — the pending-mask
+//     highest set-bit index must be < 2 (`clz`/`eor #0x3f`; `cmp w8,#2;
+//     b.hs` @0xfffffc000002a878), i.e. mask ⊆ {0x1,0x2}, else "Invalid Power
+//     Server Kick" @0xfffffc000002a8ac.
+//
+// These are OFFLINE acceptance contracts: a driver can emit only accepted
+// values and never a self-panicking bit, verified purely from these bytes.
+// They do NOT make the sequence executable — the effects, the cross-ASC
+// delivery, and the PMP doorbell physical bases (host-provided initdata
+// `[x24+0x678]`, absent from the machos) are live-only. So
+// `EXECUTABLE_GFX1_POWER_SEQUENCE_AVAILABLE` stays false.
+// -------------------------------------------------------------------------
+
+/// Firmware VA of the `agfaRemotePowerKick` exact-value decoder.
+pub(crate) const G17_REMOTE_POWER_KICK_DECODER_VA: u64 = 0xffff_fc00_0002_37e4;
+/// Firmware VA of the decoder's `_RTK_abort` default ("Unrecognized ...").
+pub(crate) const G17_REMOTE_POWER_KICK_ABORT_VA: u64 = 0xffff_fc00_0002_3970;
+/// The only three remote-power-kick bit values the decoder accepts.
+pub(crate) const G17_REMOTE_POWER_KICK_ACCEPT: [u64; 3] =
+    [0x0010_0000, 0x0100_0000, 0x8000_0000];
+/// The seven bit values the decoder explicitly self-panics on.
+pub(crate) const G17_REMOTE_POWER_KICK_FORBIDDEN: [u64; 7] = [
+    0x40,
+    0x80,
+    0x100,
+    0x200,
+    0x2_0000_0000,
+    0x20_0000_0000,
+    0x100_0000_0000,
+];
+/// Recognized scheduler power-event bits (`AGFASchedulerProcessPowerKick`).
+pub(crate) const G17_SCHEDULER_POWER_EVENT_ACCEPT: [u64; 6] = [
+    0x0010_0000,
+    0x0400_0000,
+    0x0800_0000,
+    0x1000_0000,
+    0x2000_0000,
+    0x4000_0000,
+];
+/// Allowed power-server pending-mask bits (highest set-bit index must be < 2).
+pub(crate) const G17_POWER_SERVER_KICK_MASK_ALLOWED: u32 = 0b11;
+
+/// The scheduler-role power-kick command acceptance contract is byte-grounded.
+/// This is a necessary condition for a correct kick; it does not by itself
+/// make the GFX1 power sequence executable (see the module-level note).
+pub(crate) const GROUNDED_POWER_KICK_COMMAND_DECODE_AVAILABLE: bool = true;
+
+/// Outcome of the `agfaRemotePowerKick` exact-value decoder for one value.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum RemotePowerKickClass {
+    /// One of the three accepted bits: causes a real power effect.
+    Accepted,
+    /// One of the seven forbidden bits: the firmware calls `_RTK_abort`.
+    ForbiddenPanic,
+    /// Any other value: the decoder returns via `retab` with no effect.
+    IgnoredNoOp,
+}
+
+/// Mirror the exact-value equality tree at 0xfffffc00000237e4.
+pub(crate) const fn classify_remote_power_kick(value: u64) -> RemotePowerKickClass {
+    let mut i = 0;
+    while i < G17_REMOTE_POWER_KICK_ACCEPT.len() {
+        if value == G17_REMOTE_POWER_KICK_ACCEPT[i] {
+            return RemotePowerKickClass::Accepted;
+        }
+        i += 1;
+    }
+    let mut j = 0;
+    while j < G17_REMOTE_POWER_KICK_FORBIDDEN.len() {
+        if value == G17_REMOTE_POWER_KICK_FORBIDDEN[j] {
+            return RemotePowerKickClass::ForbiddenPanic;
+        }
+        j += 1;
+    }
+    RemotePowerKickClass::IgnoredNoOp
+}
+
+/// Fail-closed reasons a remote power kick must not be emitted.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum PowerKickEmitError {
+    /// The value self-panics the firmware (`_RTK_abort`).
+    ForbiddenPanicBit,
+    /// The value is silently ignored, so emitting it is a driver bug.
+    UnrecognizedNoOp,
+}
+
+/// Fail-closed: only permit emitting a remote power kick the firmware accepts.
+pub(crate) const fn validate_remote_power_kick_emit(
+    value: u64,
+) -> Result<(), PowerKickEmitError> {
+    match classify_remote_power_kick(value) {
+        RemotePowerKickClass::Accepted => Ok(()),
+        RemotePowerKickClass::ForbiddenPanic => Err(PowerKickEmitError::ForbiddenPanicBit),
+        RemotePowerKickClass::IgnoredNoOp => Err(PowerKickEmitError::UnrecognizedNoOp),
+    }
+}
+
+/// Whether a scheduler power-event bit is one the firmware recognizes.
+pub(crate) const fn scheduler_power_event_recognized(event: u64) -> bool {
+    let mut i = 0;
+    while i < G17_SCHEDULER_POWER_EVENT_ACCEPT.len() {
+        if event == G17_SCHEDULER_POWER_EVENT_ACCEPT[i] {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Whether a power-server pending mask stays within the firmware bound
+/// (no set bit at index >= 2). A zero mask has nothing to dispatch.
+pub(crate) const fn power_server_kick_mask_in_bounds(mask: u32) -> bool {
+    mask & !G17_POWER_SERVER_KICK_MASK_ALLOWED == 0
+}
+
 /// Exact values observed in the shared G15-G17 host recovery word.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[repr(u32)]
@@ -1109,8 +1247,11 @@ pub(crate) const fn decode_g17_recovery_word_at_offset(
 
 /// Return the exact host value for one directly established resume edge.
 ///
-/// This deliberately exposes neither inferred firmware edge (`0 -> 1` or
-/// `2 -> 3`). The caller must observe the matching stopped value first.
+/// This models only the two HOST-owned edges. The firmware-owned edges are
+/// now byte-grounded separately (see [`firmware_recovery_word_write`]): the
+/// firmware writes 1 at recovery start and 0 at recovery complete, and never
+/// writes 2 or 3 — so the earlier `2 -> 3` inference is refuted. The caller
+/// must observe the matching stopped value first.
 pub(crate) const fn host_resume_recovery(
     phase: HostResumePhase,
     observed_raw: u32,
@@ -1145,6 +1286,115 @@ pub(crate) const G17S_GFX1_RECOVERY_POWER_EVENTS: [u8; 2] = [0x22, 0x23];
 
 pub(crate) const fn validate_g17s_gfx1_recovery_power_event(event: u8) -> bool {
     event == G17S_GFX1_RECOVERY_POWER_EVENTS[0] || event == G17S_GFX1_RECOVERY_POWER_EVENTS[1]
+}
+
+// -------------------------------------------------------------------------
+// RECOVERY_HANDSHAKE — the GFX/scheduler recovery FSM firmware-write side.
+//
+// Grounded 2026-08-25 by disassembling `GFX.a010.macho` (`otool -tvV`). The
+// recovery state machine is GFX-only (GFX1 carries only the
+// `agfaHRBEnabledQueuesHalt` string, no recovery dispatch).
+//
+//   `AGFASchedulerProcessRecovery` outer decode @ 0xfffffc0000026274 — a cmp
+//   ladder accepting exactly three recovery-cause bits, default aborts:
+//     0x0200_0000 @0xfffffc0000026288 (`mov w8,#0x2000000; cmp; b.eq`)
+//     0x0100_0000 @0xfffffc0000026294 (`mov w8,#0x1000000; cmp; b.eq`)
+//     0x0080_0000 @0xfffffc00000262a0 (`cmp x0,#0x800,lsl#12; b.ne` default)
+//     default    → `_RTK_abort` "Unexpected recovery type %llu!"
+//                  @0xfffffc000002647c-…6498
+//
+//   Recovery-word firmware-write side — the host-shared status struct is
+//   reached through the firmware BSS pointer global 0xfffffc00000_1047b8
+//   (set from initdata); the recovery word is `[status+0xc]`. The firmware
+//   writes it in exactly two places, both `dsb sy`-fenced, and never reads it:
+//     write 1 at recovery START @0xfffffc0000026728
+//            (`ldr x8,[x20,#0x7b8]; mov w9,#1; str w9,[x8,#0xc]; dsb sy`)
+//     write 0 at recovery END   @0xfffffc0000026d58
+//            (`ldr x8,[x20,#0x7b8]; str wzr,[x8,#0xc]; dsb sy`)
+//   An exhaustive pointer-tracked store scan finds no firmware write of 2 or
+//   3 to this word. This completes — and corrects — the note's "firmware
+//   writes incomplete": the firmware side is {1 -> begin, 0 -> complete}; the
+//   earlier guess that the firmware writes 2->3 is refuted. States 2 and 3
+//   (HostResumedPreRecovery / FirmwareStoppedForPostRecovery) are written by
+//   the HOST, and the firmware never observes them because it never reads the
+//   word.
+//
+// OFFLINE-grounded: recovery-type acceptance and the two firmware-write edges.
+// LIVE-only (keeps this fail-closed): (a) the host-visible DRAM behind the
+// initdata pointer 0x1047b8 actually carrying the 1/0 to the host, and (b) the
+// cross-role 0x22 (gfx_iop_msgs) / 0x23 (gfx_iop_ints) delivery to/from the
+// GFX1 power role — the endpoint descriptors are chained-fixup DATA, not in
+// `__text`, and delivery requires the peer ASC. So
+// `EXECUTABLE_G17_RECOVERY_HANDSHAKE_AVAILABLE` stays false.
+// -------------------------------------------------------------------------
+
+/// Firmware VA of the `AGFASchedulerProcessRecovery` outer decoder.
+pub(crate) const G17_RECOVERY_DISPATCH_VA: u64 = 0xffff_fc00_0002_6274;
+/// Firmware VA of the "Unexpected recovery type" abort pad.
+pub(crate) const G17_RECOVERY_TYPE_ABORT_VA: u64 = 0xffff_fc00_0002_647c;
+/// The only three recovery-cause bits the outer decoder accepts.
+pub(crate) const G17_RECOVERY_TYPE_ACCEPT: [u64; 3] =
+    [0x0080_0000, 0x0100_0000, 0x0200_0000];
+
+/// Firmware BSS pointer global holding the host-shared status struct.
+pub(crate) const G17_FW_STATUS_STRUCT_PTR_GLOBAL_VA: u64 = 0xffff_fc00_0010_47b8;
+/// Byte offset of the recovery word inside the host-shared status struct.
+pub(crate) const G17_RECOVERY_WORD_STRUCT_OFFSET: u32 = 0xc;
+/// Firmware store site that writes 1 at recovery start.
+pub(crate) const G17_RECOVERY_WORD_FW_WRITE_BEGIN_VA: u64 = 0xffff_fc00_0002_6728;
+/// Firmware store site that writes 0 at recovery complete.
+pub(crate) const G17_RECOVERY_WORD_FW_WRITE_COMPLETE_VA: u64 = 0xffff_fc00_0002_6d58;
+/// The only two values the firmware ever writes to the recovery word.
+pub(crate) const G17_RECOVERY_WORD_FW_WRITTEN_VALUES: [u32; 2] = [1, 0];
+
+/// Recovery-type acceptance and the recovery-word firmware-write side are
+/// byte-grounded. This does not make the handshake executable: the cross-role
+/// 0x22/0x23 delivery and the host-visible DRAM are live-only (see the note).
+pub(crate) const GROUNDED_RECOVERY_WORD_FIRMWARE_WRITE_SIDE_AVAILABLE: bool = true;
+
+/// The two firmware-driven recovery-word edges, grounded from the two stores.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum FirmwareRecoveryEdge {
+    /// Recovery start: firmware writes 1 (`FirmwareStoppedForPreRecovery`).
+    Begin,
+    /// Recovery complete: firmware writes 0 (`RunningOrPostRecoveryResumed`).
+    Complete,
+}
+
+/// The state the firmware writes to the recovery word for a given edge.
+pub(crate) const fn firmware_recovery_word_write(
+    edge: FirmwareRecoveryEdge,
+) -> RecoveryWordState {
+    match edge {
+        FirmwareRecoveryEdge::Begin => RecoveryWordState::FirmwareStoppedForPreRecovery,
+        FirmwareRecoveryEdge::Complete => RecoveryWordState::RunningOrPostRecoveryResumed,
+    }
+}
+
+/// Whether the firmware ever writes a given raw value to the recovery word.
+/// Grounded to exactly {0, 1}; a model claiming the firmware writes 2 or 3 is
+/// refuted by the exhaustive store scan.
+pub(crate) const fn firmware_writes_recovery_value(raw: u32) -> bool {
+    raw == 0 || raw == 1
+}
+
+/// Fail-closed recovery-type validation error.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum RecoveryTypeError {
+    UnexpectedRecoveryType,
+}
+
+/// Fail-closed: only the three accepted recovery-cause bits avoid the
+/// firmware's "Unexpected recovery type" abort.
+pub(crate) const fn validate_recovery_type(raw: u64) -> Result<(), RecoveryTypeError> {
+    let mut i = 0;
+    while i < G17_RECOVERY_TYPE_ACCEPT.len() {
+        if raw == G17_RECOVERY_TYPE_ACCEPT[i] {
+            return Ok(());
+        }
+        i += 1;
+    }
+    Err(RecoveryTypeError::UnexpectedRecoveryType)
 }
 
 #[cfg(test)]
@@ -2220,5 +2470,94 @@ mod tests {
                 RecoveryEvidenceTarget::G17S,
             ]
         );
+    }
+
+    #[test]
+    fn remote_power_kick_acceptance_is_byte_exact() {
+        // Grounded decoder 0xfffffc00000237e4: exactly three accepted bits.
+        assert_eq!(G17_REMOTE_POWER_KICK_ACCEPT, [0x0010_0000, 0x0100_0000, 0x8000_0000]);
+        assert_eq!(G17_REMOTE_POWER_KICK_DECODER_VA, 0xffff_fc00_0002_37e4);
+        assert_eq!(G17_REMOTE_POWER_KICK_ABORT_VA, 0xffff_fc00_0002_3970);
+        for accepted in G17_REMOTE_POWER_KICK_ACCEPT {
+            assert_eq!(classify_remote_power_kick(accepted), RemotePowerKickClass::Accepted);
+            assert!(validate_remote_power_kick_emit(accepted).is_ok());
+        }
+        for forbidden in G17_REMOTE_POWER_KICK_FORBIDDEN {
+            assert_eq!(
+                classify_remote_power_kick(forbidden),
+                RemotePowerKickClass::ForbiddenPanic
+            );
+            assert_eq!(
+                validate_remote_power_kick_emit(forbidden),
+                Err(PowerKickEmitError::ForbiddenPanicBit)
+            );
+        }
+        // An unlisted value is silently ignored by the firmware, so emitting
+        // it is a driver bug, not a panic.
+        assert_eq!(classify_remote_power_kick(0x1234), RemotePowerKickClass::IgnoredNoOp);
+        assert_eq!(
+            validate_remote_power_kick_emit(0x1234),
+            Err(PowerKickEmitError::UnrecognizedNoOp)
+        );
+        assert!(GROUNDED_POWER_KICK_COMMAND_DECODE_AVAILABLE);
+        // Deepening the offline model must not silently open the live gate.
+        assert!(!EXECUTABLE_GFX1_POWER_SEQUENCE_AVAILABLE);
+    }
+
+    #[test]
+    fn scheduler_events_and_power_server_bound_are_exact() {
+        for event in G17_SCHEDULER_POWER_EVENT_ACCEPT {
+            assert!(scheduler_power_event_recognized(event));
+        }
+        assert!(!scheduler_power_event_recognized(0x1));
+        assert!(!scheduler_power_event_recognized(0x8000_0000));
+        // Power-server pending mask: no set bit at index >= 2.
+        assert!(power_server_kick_mask_in_bounds(0x1));
+        assert!(power_server_kick_mask_in_bounds(0x2));
+        assert!(power_server_kick_mask_in_bounds(0x3));
+        assert!(!power_server_kick_mask_in_bounds(0x4));
+        assert!(!power_server_kick_mask_in_bounds(0x5));
+    }
+
+    #[test]
+    fn recovery_type_and_firmware_word_writes_are_byte_exact() {
+        // Outer decode 0xfffffc0000026274: three accepted recovery-cause bits.
+        assert_eq!(G17_RECOVERY_TYPE_ACCEPT, [0x0080_0000, 0x0100_0000, 0x0200_0000]);
+        assert_eq!(G17_RECOVERY_DISPATCH_VA, 0xffff_fc00_0002_6274);
+        assert_eq!(G17_RECOVERY_TYPE_ABORT_VA, 0xffff_fc00_0002_647c);
+        for accepted in G17_RECOVERY_TYPE_ACCEPT {
+            assert!(validate_recovery_type(accepted).is_ok());
+        }
+        assert_eq!(
+            validate_recovery_type(0x40_0000),
+            Err(RecoveryTypeError::UnexpectedRecoveryType)
+        );
+        assert_eq!(
+            validate_recovery_type(0),
+            Err(RecoveryTypeError::UnexpectedRecoveryType)
+        );
+
+        // Recovery-word firmware-write side: writes 1 at begin, 0 at complete.
+        assert_eq!(G17_FW_STATUS_STRUCT_PTR_GLOBAL_VA, 0xffff_fc00_0010_47b8);
+        assert_eq!(G17_RECOVERY_WORD_STRUCT_OFFSET, 0xc);
+        assert_eq!(G17_RECOVERY_WORD_FW_WRITE_BEGIN_VA, 0xffff_fc00_0002_6728);
+        assert_eq!(G17_RECOVERY_WORD_FW_WRITE_COMPLETE_VA, 0xffff_fc00_0002_6d58);
+        assert_eq!(G17_RECOVERY_WORD_FW_WRITTEN_VALUES, [1, 0]);
+        assert_eq!(
+            firmware_recovery_word_write(FirmwareRecoveryEdge::Begin),
+            RecoveryWordState::FirmwareStoppedForPreRecovery
+        );
+        assert_eq!(
+            firmware_recovery_word_write(FirmwareRecoveryEdge::Complete),
+            RecoveryWordState::RunningOrPostRecoveryResumed
+        );
+        // The firmware writes only {0,1}; the earlier 2->3 guess is refuted.
+        assert!(firmware_writes_recovery_value(0));
+        assert!(firmware_writes_recovery_value(1));
+        assert!(!firmware_writes_recovery_value(2));
+        assert!(!firmware_writes_recovery_value(3));
+        assert!(GROUNDED_RECOVERY_WORD_FIRMWARE_WRITE_SIDE_AVAILABLE);
+        // The cross-role 0x22/0x23 delivery stays live-only.
+        assert!(!EXECUTABLE_G17_RECOVERY_HANDSHAKE_AVAILABLE);
     }
 }

@@ -429,14 +429,16 @@ fn refuse_g17_probe(pdev: &platform::Device<Core>) -> Error {
         dev_err!(
             pdev.as_ref(),
             "{}{}",
-            "G17 preflight: recovery word states 0..3 and host writes 1->2/3->0 are ",
-            "grounded, but firmware writes and the cross-role 0x22/0x23 handshake are incomplete\n"
+            "G17 preflight: recovery word states 0..3, host writes 1->2/3->0, and firmware writes 1 at begin/0 at completion are grounded, ",
+            "but host-visible DRAM causality and the cross-role 0x22/0x23 handshake are incomplete\n"
         );
     }
     if missing.contains(g17_boot::missing::SUBMISSION_TRANSPORT) {
         dev_err!(
             pdev.as_ref(),
-            "G17 preflight: SKSM queue submission and completion are incomplete\n"
+            "{}{}",
+            "G17 preflight: submission producer subset is grounded (EP 0x21 doorbell byte-identical to AGX2, SKSM kick word and 0x20-strided kick-record table forked and cited), ",
+            "but the SKSM hardware kick-FIFO MMIO scratch, the doorbell round-trip, and the completion IRQ can only be confirmed on a live M5\n"
         );
     }
 
