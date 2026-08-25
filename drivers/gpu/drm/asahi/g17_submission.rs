@@ -10,9 +10,11 @@
 //! execution. It allocates no memory, starts no ASC, sends no mailbox message,
 //! and touches no MMIO. It models the EP 0x21 work-submission doorbell, the
 //! channel/work-queue ring producer indices, the SKSM kick word/record, and the
-//! host queue-timestamp plus `addKicks` MMIO producer. The provenance ledger
-//! explicitly separates byte-grounded G17 fields from inherited producer
-//! records whose G17 consumer offsets still need first-hand confirmation.
+//! host queue-timestamp plus `addKicks` MMIO producer. It also models the exact
+//! host-side reset images for `_AGFIChannelState` and
+//! `AGXUncachedFWChannelMem`. The provenance ledger explicitly separates
+//! byte-grounded G17 fields from inherited producer records whose G17 consumer
+//! offsets still need first-hand confirmation.
 //!
 //! Grounding is first-hand from the on-disk M5 role macho `GFX.a010.macho`
 //! (`g17s a0, SKSM Enabled`) and the pinned G17P/G17G/G17X host-kext
@@ -233,6 +235,146 @@ pub(crate) const fn g17_channel_descriptor_offset(
 
     let index = priority as u32 * G17_CHANNEL_DESCRIPTORS_PER_PRIORITY + pipe as u32;
     Ok(G17_CHANNEL_DESCRIPTOR_TABLE_OFFSET + index * G17_CHANNEL_DESCRIPTOR_STRIDE)
+}
+
+// ---------------------------------------------------------------------------
+// 2b. G17 host channel-reset images -- native AGX3 layout.
+//
+//     Grounded first-hand from byte-identical `AGXChannel::resetChannelState`
+//     implementations in the pinned G17P host at 0xfffffe00089f2a60, G17G at
+//     0xfffffe0008b225ac, and G17X at 0xfffffe0008ae6a6c. The host clears all
+//     0x80 bytes of `_AGFIChannelState`, then writes the fields below. Its
+//     separate `AGXUncachedFWChannelMem` reset touches only seven u32 fields
+//     through +0x63; bytes between them are deliberately preserved here.
+//
+//     These are independent host-reset records. They do not prove that the
+//     inherited AGX2 ChannelState/RingState names in sections 2/3 describe the
+//     G17 firmware consumer, so those ledger entries remain fail-closed.
+// ---------------------------------------------------------------------------
+
+/// Full byte extent cleared by the G17 host for `_AGFIChannelState`.
+pub(crate) const G17_HOST_CHANNEL_STATE_RESET_SIZE: usize = 0x80;
+/// Last byte touched by the G17 host's uncached-channel reset stores.
+pub(crate) const G17_UNCACHED_CHANNEL_RESET_WRITE_EXTENT: usize = 0x64;
+/// All three in-scope host families use the identical reset layout.
+pub(crate) const G17_HOST_CHANNEL_RESET_TARGETS_CONFIRMED: bool = true;
+
+/// Offsets written after the host clears `_AGFIChannelState`.
+///
+/// Names are intentionally structural until the firmware consumer supplies
+/// first-hand semantics for every field.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17HostChannelStateResetLayout {
+    pub(crate) gpu_va_00: usize,
+    pub(crate) gpu_va_08: usize,
+    pub(crate) gpu_va_10: usize,
+    pub(crate) zero_18: usize,
+    pub(crate) zero_1c: usize,
+    pub(crate) zero_20: usize,
+    pub(crate) sentinel_24: usize,
+    pub(crate) fixed_4_28: usize,
+    pub(crate) sentinel_40: usize,
+    pub(crate) word_44: usize,
+    pub(crate) zero_58: usize,
+    pub(crate) gpu_va_70: usize,
+}
+
+pub(crate) const G17_HOST_CHANNEL_STATE_RESET_LAYOUT: G17HostChannelStateResetLayout =
+    G17HostChannelStateResetLayout {
+        gpu_va_00: 0x00,
+        gpu_va_08: 0x08,
+        gpu_va_10: 0x10,
+        zero_18: 0x18,
+        zero_1c: 0x1c,
+        zero_20: 0x20,
+        sentinel_24: 0x24,
+        fixed_4_28: 0x28,
+        sentinel_40: 0x40,
+        word_44: 0x44,
+        zero_58: 0x58,
+        gpu_va_70: 0x70,
+    };
+
+/// Runtime values copied by the host into the structural G17 reset image.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17HostChannelStateResetValues {
+    pub(crate) gpu_va_00: u64,
+    pub(crate) gpu_va_08: u64,
+    pub(crate) gpu_va_10: u64,
+    pub(crate) word_44: u32,
+    pub(crate) gpu_va_70: u64,
+}
+
+/// Fields touched in `AGXUncachedFWChannelMem` during a G17 channel reset.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17UncachedChannelResetLayout {
+    pub(crate) zero_00: usize,
+    pub(crate) zero_10: usize,
+    pub(crate) zero_20: usize,
+    pub(crate) zero_30: usize,
+    pub(crate) zero_40: usize,
+    pub(crate) sentinel_50: usize,
+    pub(crate) byte_extent_60: usize,
+}
+
+pub(crate) const G17_UNCACHED_CHANNEL_RESET_LAYOUT: G17UncachedChannelResetLayout =
+    G17UncachedChannelResetLayout {
+        zero_00: 0x00,
+        zero_10: 0x10,
+        zero_20: 0x20,
+        zero_30: 0x30,
+        zero_40: 0x40,
+        sentinel_50: 0x50,
+        byte_extent_60: 0x60,
+    };
+
+fn put_u32_le(raw: &mut [u8], offset: usize, value: u32) {
+    raw[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_u64_le(raw: &mut [u8], offset: usize, value: u64) {
+    raw[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+/// Build the exact 0x80-byte `_AGFIChannelState` reset image.
+pub(crate) fn encode_g17_host_channel_state_reset(
+    values: G17HostChannelStateResetValues,
+) -> [u8; G17_HOST_CHANNEL_STATE_RESET_SIZE] {
+    let mut raw = [0u8; G17_HOST_CHANNEL_STATE_RESET_SIZE];
+    let layout = G17_HOST_CHANNEL_STATE_RESET_LAYOUT;
+
+    put_u64_le(&mut raw, layout.gpu_va_00, values.gpu_va_00);
+    put_u64_le(&mut raw, layout.gpu_va_08, values.gpu_va_08);
+    put_u64_le(&mut raw, layout.gpu_va_10, values.gpu_va_10);
+    put_u32_le(&mut raw, layout.zero_18, 0);
+    put_u32_le(&mut raw, layout.zero_1c, 0);
+    put_u32_le(&mut raw, layout.zero_20, 0);
+    put_u32_le(&mut raw, layout.sentinel_24, u32::MAX);
+    put_u32_le(&mut raw, layout.fixed_4_28, 4);
+    put_u32_le(&mut raw, layout.sentinel_40, u32::MAX);
+    put_u32_le(&mut raw, layout.word_44, values.word_44);
+    put_u32_le(&mut raw, layout.zero_58, 0);
+    put_u64_le(&mut raw, layout.gpu_va_70, values.gpu_va_70);
+    raw
+}
+
+/// Apply only the seven uncached reset stores made by the G17 host.
+///
+/// The host does not clear the intervening bytes in `resetChannelState`; a
+/// caller-provided image therefore stays intact outside the proven stores.
+pub(crate) fn apply_g17_uncached_channel_reset(
+    raw: &mut [u8; G17_UNCACHED_CHANNEL_RESET_WRITE_EXTENT],
+    byte_extent: u32,
+) {
+    let layout = G17_UNCACHED_CHANNEL_RESET_LAYOUT;
+
+    put_u32_le(raw, layout.zero_00, 0);
+    put_u32_le(raw, layout.zero_10, 0);
+    put_u32_le(raw, layout.zero_20, 0);
+    put_u32_le(raw, layout.zero_30, 0);
+    put_u32_le(raw, layout.zero_40, 0);
+    put_u32_le(raw, layout.sentinel_50, u32::MAX);
+    put_u32_le(raw, layout.byte_extent_60, byte_extent);
 }
 
 // ---------------------------------------------------------------------------
@@ -629,6 +771,8 @@ pub(crate) struct SubmissionAbiLedger {
     pub(crate) channel_state: AbiProvenance,
     pub(crate) ring_state: AbiProvenance,
     pub(crate) channel_descriptor: AbiProvenance,
+    pub(crate) host_channel_state_reset: AbiProvenance,
+    pub(crate) host_uncached_channel_reset: AbiProvenance,
     pub(crate) command_types: AbiProvenance,
     pub(crate) kick_word: AbiProvenance,
     pub(crate) kick_queue_producer: AbiProvenance,
@@ -647,6 +791,8 @@ pub(crate) const SUBMISSION_ABI_LEDGER: SubmissionAbiLedger = SubmissionAbiLedge
     channel_state: AbiProvenance::Agx2InheritedUnconfirmed,
     ring_state: AbiProvenance::Agx2InheritedUnconfirmed,
     channel_descriptor: AbiProvenance::ForkedAgx3Grounded,
+    host_channel_state_reset: AbiProvenance::ForkedAgx3Grounded,
+    host_uncached_channel_reset: AbiProvenance::ForkedAgx3Grounded,
     command_types: AbiProvenance::Agx2InheritedUnconfirmed,
     kick_word: AbiProvenance::ForkedAgx3Grounded,
     kick_queue_producer: AbiProvenance::ForkedAgx3Grounded,
@@ -819,6 +965,105 @@ mod tests {
             g17_channel_descriptor_offset(4, PipeType::Vertex),
             Err(SubmissionError::ChannelPriorityOutOfRange)
         );
+    }
+
+    #[test]
+    fn g17_host_channel_state_reset_matches_all_three_pinned_hosts() {
+        let values = G17HostChannelStateResetValues {
+            gpu_va_00: 0x0011_2233_4455_6677,
+            gpu_va_08: 0x8899_aabb_ccdd_eeff,
+            gpu_va_10: 0x1020_3040_5060_7080,
+            word_44: 0x7654_3210,
+            gpu_va_70: 0xfedc_ba98_7654_3210,
+        };
+        let raw = encode_g17_host_channel_state_reset(values);
+        let layout = G17_HOST_CHANNEL_STATE_RESET_LAYOUT;
+
+        assert_eq!(raw.len(), 0x80);
+        assert_eq!(
+            &raw[layout.gpu_va_00..layout.gpu_va_00 + 8],
+            &values.gpu_va_00.to_le_bytes()
+        );
+        assert_eq!(
+            &raw[layout.gpu_va_08..layout.gpu_va_08 + 8],
+            &values.gpu_va_08.to_le_bytes()
+        );
+        assert_eq!(
+            &raw[layout.gpu_va_10..layout.gpu_va_10 + 8],
+            &values.gpu_va_10.to_le_bytes()
+        );
+        assert_eq!(&raw[layout.zero_18..layout.zero_18 + 4], &[0; 4]);
+        assert_eq!(&raw[layout.zero_1c..layout.zero_1c + 4], &[0; 4]);
+        assert_eq!(&raw[layout.zero_20..layout.zero_20 + 4], &[0; 4]);
+        assert_eq!(
+            &raw[layout.sentinel_24..layout.sentinel_24 + 4],
+            &u32::MAX.to_le_bytes()
+        );
+        assert_eq!(
+            &raw[layout.fixed_4_28..layout.fixed_4_28 + 4],
+            &4u32.to_le_bytes()
+        );
+        assert_eq!(
+            &raw[layout.sentinel_40..layout.sentinel_40 + 4],
+            &u32::MAX.to_le_bytes()
+        );
+        assert_eq!(
+            &raw[layout.word_44..layout.word_44 + 4],
+            &values.word_44.to_le_bytes()
+        );
+        assert_eq!(&raw[layout.zero_58..layout.zero_58 + 4], &[0; 4]);
+        assert_eq!(
+            &raw[layout.gpu_va_70..layout.gpu_va_70 + 8],
+            &values.gpu_va_70.to_le_bytes()
+        );
+
+        // resetChannelState clears the entire record before its scalar stores.
+        // Every byte outside the nonzero runtime/fixed ranges stays zero.
+        for (index, byte) in raw.iter().enumerate() {
+            let nonzero_field = (0x00..0x18).contains(&index)
+                || (0x24..0x2c).contains(&index)
+                || (0x40..0x48).contains(&index)
+                || (0x70..0x78).contains(&index);
+            if !nonzero_field {
+                assert_eq!(*byte, 0, "unexpected reset byte at {index:#x}");
+            }
+        }
+        assert!(G17_HOST_CHANNEL_RESET_TARGETS_CONFIRMED);
+    }
+
+    #[test]
+    fn g17_uncached_channel_reset_preserves_unwritten_bytes() {
+        let mut raw = [0xa5; G17_UNCACHED_CHANNEL_RESET_WRITE_EXTENT];
+        let byte_extent = 0x800;
+        apply_g17_uncached_channel_reset(&mut raw, byte_extent);
+        let layout = G17_UNCACHED_CHANNEL_RESET_LAYOUT;
+
+        for offset in [
+            layout.zero_00,
+            layout.zero_10,
+            layout.zero_20,
+            layout.zero_30,
+            layout.zero_40,
+        ] {
+            assert_eq!(&raw[offset..offset + 4], &[0; 4]);
+        }
+        assert_eq!(
+            &raw[layout.sentinel_50..layout.sentinel_50 + 4],
+            &u32::MAX.to_le_bytes()
+        );
+        assert_eq!(
+            &raw[layout.byte_extent_60..layout.byte_extent_60 + 4],
+            &byte_extent.to_le_bytes()
+        );
+
+        for (index, byte) in raw.iter().enumerate() {
+            let written = [0x00usize, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60]
+                .iter()
+                .any(|offset| (*offset..*offset + 4).contains(&index));
+            if !written {
+                assert_eq!(*byte, 0xa5, "unproven byte changed at {index:#x}");
+            }
+        }
     }
 
     #[test]
@@ -1161,6 +1406,14 @@ mod tests {
         );
         assert_eq!(
             SUBMISSION_ABI_LEDGER.channel_descriptor,
+            AbiProvenance::ForkedAgx3Grounded
+        );
+        assert_eq!(
+            SUBMISSION_ABI_LEDGER.host_channel_state_reset,
+            AbiProvenance::ForkedAgx3Grounded
+        );
+        assert_eq!(
+            SUBMISSION_ABI_LEDGER.host_uncached_channel_reset,
             AbiProvenance::ForkedAgx3Grounded
         );
         assert_eq!(
