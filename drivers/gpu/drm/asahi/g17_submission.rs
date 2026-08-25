@@ -589,6 +589,12 @@ pub(crate) const SUBMISSION_ABI_LEDGER: SubmissionAbiLedger = SubmissionAbiLedge
     kick_record: AbiProvenance::ForkedAgx3Grounded,
 };
 
+/// The pinned G17P/G17G/G17X hosts all use the target-specific §6 MMIO
+/// publication for `KSMKickQueue::addKicks`. EP 0x21 remains the separate
+/// channel/work-ring doorbell; the two producers are complementary, not an
+/// unresolved selector.
+pub(crate) const HOST_SKSM_ADD_KICKS_PATH_SELECTED: bool = true;
+
 /// Whether the AGX3 per-pipe channel *descriptor* stride is proven. The host
 /// findings record `runtime_pointers+0x020` as a "13 × 0x20" array while the
 /// AGX2 `raw::ChannelRing` descriptor is 0x10 bytes. Not grounded first-hand
@@ -603,10 +609,6 @@ pub(crate) struct SubmissionLiveGaps {
     /// grounded, but their silicon bridge, live aperture values, and ordering
     /// against the firmware consumer still need an on-device witness.
     pub(crate) sksm_hardware_kick_fifo_mmio_scratch_proven: bool,
-    /// The firmware has both the AGX2 doorbell+ring path and the SKSM kick
-    /// FIFO; which one a Linux submission must use on an "SKSM Enabled" build
-    /// cannot be decided from the image.
-    pub(crate) legacy_doorbell_ring_path_drives_sksm_completion_proven: bool,
     /// The kick -> execute -> completion IRQ handshake is a live event.
     pub(crate) doorbell_round_trip_proven: bool,
     pub(crate) completion_irq_route_proven: bool,
@@ -616,7 +618,6 @@ impl SubmissionLiveGaps {
     /// True only if every live gap is closed.
     pub(crate) const fn all_proven(&self) -> bool {
         self.sksm_hardware_kick_fifo_mmio_scratch_proven
-            && self.legacy_doorbell_ring_path_drives_sksm_completion_proven
             && self.doorbell_round_trip_proven
             && self.completion_irq_route_proven
     }
@@ -625,7 +626,6 @@ impl SubmissionLiveGaps {
 /// All live gaps are open (fail-closed).
 pub(crate) const SUBMISSION_LIVE_GAPS: SubmissionLiveGaps = SubmissionLiveGaps {
     sksm_hardware_kick_fifo_mmio_scratch_proven: false,
-    legacy_doorbell_ring_path_drives_sksm_completion_proven: false,
     doorbell_round_trip_proven: false,
     completion_irq_route_proven: false,
 };
@@ -1036,6 +1036,7 @@ mod tests {
             SUBMISSION_ABI_LEDGER.host_add_kicks_mmio,
             AbiProvenance::ForkedAgx3Grounded
         );
+        assert!(HOST_SKSM_ADD_KICKS_PATH_SELECTED);
         assert_eq!(
             SUBMISSION_ABI_LEDGER.kick_record,
             AbiProvenance::ForkedAgx3Grounded
@@ -1067,7 +1068,6 @@ mod tests {
         assert!(!EXECUTABLE_SUBMISSION_TRANSPORT_AVAILABLE);
         assert!(!SUBMISSION_LIVE_GAPS.all_proven());
         assert!(!SUBMISSION_LIVE_GAPS.sksm_hardware_kick_fifo_mmio_scratch_proven);
-        assert!(!SUBMISSION_LIVE_GAPS.legacy_doorbell_ring_path_drives_sksm_completion_proven);
         assert!(!SUBMISSION_LIVE_GAPS.doorbell_round_trip_proven);
         assert!(!SUBMISSION_LIVE_GAPS.completion_irq_route_proven);
 
@@ -1075,7 +1075,6 @@ mod tests {
         // gate is wired to the evidence, not hard-coded.
         let proven = SubmissionLiveGaps {
             sksm_hardware_kick_fifo_mmio_scratch_proven: true,
-            legacy_doorbell_ring_path_drives_sksm_completion_proven: true,
             doorbell_round_trip_proven: true,
             completion_irq_route_proven: true,
         };
