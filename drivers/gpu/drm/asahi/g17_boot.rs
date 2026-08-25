@@ -314,7 +314,8 @@ pub(crate) fn validate_g17_nested_firmware_identity(
     observed == g17_nested_firmware_identity(role, variant)
 }
 
-/// The G17X host/RTBuddy firmware-start model is exact but diagnostic only.
+/// The G17P/G17G/G17S host/RTBuddy firmware-start model is exact but
+/// diagnostic only.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const GROUNDED_G17X_FIRMWARE_START_MODEL_AVAILABLE: bool = true;
 
@@ -323,7 +324,106 @@ pub(crate) const GROUNDED_G17X_FIRMWARE_START_MODEL_AVAILABLE: bool = true;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const EXECUTABLE_G17X_FIRMWARE_START_HANDSHAKE_AVAILABLE: bool = false;
 
-/// Exact host-side offsets for one role record in the pinned G17X driver.
+/// Pinned host targets which prove the dual-role boot lifecycle.
+///
+/// G17P is the A18 Pro HAL200 target, G17G is M5, and G17S is M5 Pro/Max.
+/// Requiring an explicit target is load-bearing: G17G shifts multiple host
+/// object fields relative to G17P/G17S even though the control flow is the
+/// same.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum G17HostBootEvidenceTarget {
+    G17P,
+    G17G,
+    G17S,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const G17_HOST_BOOT_EVIDENCE_TARGETS: [G17HostBootEvidenceTarget; 3] = [
+    G17HostBootEvidenceTarget::G17P,
+    G17HostBootEvidenceTarget::G17G,
+    G17HostBootEvidenceTarget::G17S,
+];
+
+/// Target-specific host object layout used by the boot and cold-boot gates.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct G17HostBootLayout {
+    pub(crate) role_record_base: u32,
+    pub(crate) combined_started: u32,
+    pub(crate) accelerator: u16,
+    pub(crate) event_source: u16,
+    pub(crate) host_booted: u16,
+    pub(crate) cold_boot_role0: u16,
+    pub(crate) cold_boot_role1: u16,
+}
+
+/// Exact text entry points in each hash-pinned host image.
+///
+/// Sources are the `com.apple.AGXG17P`, `com.apple.AGXG17G`, and
+/// `com.apple.AGXG17X` images pinned by
+/// `GPU_G17_POWER_BOOT_RECOVERY_2026-08-24.md`. These addresses are
+/// provenance anchors, not callable Linux addresses.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct G17HostBootTextEvidence {
+    pub(crate) boot_firmware_va: u64,
+    pub(crate) notify_started_va: u64,
+    pub(crate) complete_cold_boot_va: u64,
+    pub(crate) cold_boot_done_va: u64,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const fn g17_host_boot_layout(target: G17HostBootEvidenceTarget) -> G17HostBootLayout {
+    match target {
+        G17HostBootEvidenceTarget::G17P | G17HostBootEvidenceTarget::G17S => G17HostBootLayout {
+            role_record_base: 0x1980,
+            combined_started: 0x1a6d,
+            accelerator: 0x2a0,
+            event_source: 0x3d0,
+            host_booted: 0x2b0,
+            cold_boot_role0: 0x0b78,
+            cold_boot_role1: 0x0ca8,
+        },
+        G17HostBootEvidenceTarget::G17G => G17HostBootLayout {
+            role_record_base: 0x19c8,
+            combined_started: 0x1ab5,
+            accelerator: 0x2a8,
+            event_source: 0x3e0,
+            host_booted: 0x2b8,
+            cold_boot_role0: 0x0b80,
+            cold_boot_role1: 0x0cb0,
+        },
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const fn g17_host_boot_text_evidence(
+    target: G17HostBootEvidenceTarget,
+) -> G17HostBootTextEvidence {
+    match target {
+        G17HostBootEvidenceTarget::G17P => G17HostBootTextEvidence {
+            boot_firmware_va: 0xffff_fe00_08a4_4ce0,
+            notify_started_va: 0xffff_fe00_08a2_e744,
+            complete_cold_boot_va: 0xffff_fe00_08a2_368c,
+            cold_boot_done_va: 0xffff_fe00_08a2_36c0,
+        },
+        G17HostBootEvidenceTarget::G17G => G17HostBootTextEvidence {
+            boot_firmware_va: 0xffff_fe00_08b7_666c,
+            notify_started_va: 0xffff_fe00_08b5_fe60,
+            complete_cold_boot_va: 0xffff_fe00_08b5_4de4,
+            cold_boot_done_va: 0xffff_fe00_08b5_4e18,
+        },
+        G17HostBootEvidenceTarget::G17S => G17HostBootTextEvidence {
+            boot_firmware_va: 0xffff_fe00_08b3_9754,
+            notify_started_va: 0xffff_fe00_08b2_25c0,
+            complete_cold_boot_va: 0xffff_fe00_08b1_765c,
+            cold_boot_done_va: 0xffff_fe00_08b1_7690,
+        },
+    }
+}
+
+/// Exact host-side offsets for one role record in a pinned G17 driver.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct G17xRoleHostOffsets {
@@ -334,15 +434,18 @@ pub(crate) struct G17xRoleHostOffsets {
     pub(crate) timestamp: u32,
 }
 
-const G17X_ROLE_RECORD_BASE: u32 = 0x1980;
 const G17X_ROLE_RECORD_STRIDE: u32 = 0x38;
 
 /// Derive the exact GFX/GFX1 record fields used by `bootFirmware()` and
 /// `notifyFirmwareStarted()`. Both roles use the same layout, not the same
 /// transport object.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) const fn g17x_role_host_offsets(role: FirmwareRole) -> G17xRoleHostOffsets {
-    let record = G17X_ROLE_RECORD_BASE + role as u32 * G17X_ROLE_RECORD_STRIDE;
+pub(crate) const fn g17_role_host_offsets(
+    target: G17HostBootEvidenceTarget,
+    role: FirmwareRole,
+) -> G17xRoleHostOffsets {
+    let record =
+        g17_host_boot_layout(target).role_record_base + role as u32 * G17X_ROLE_RECORD_STRIDE;
 
     G17xRoleHostOffsets {
         rtbuddy_object: record,
@@ -397,52 +500,63 @@ pub(crate) const G15C_G16X_BOOT_ROLE_COUNT: u8 = 1;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const G17X_BOOT_ROLE_COUNT: u8 = 2;
 
-/// Exact G17X boot order. The wait is satisfied by either role's callback,
-/// but both role-start calls must first return nonzero.
+/// Exact target-specific G17 boot order. The wait is satisfied by either
+/// role's callback, but both role-start calls must first return nonzero.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) const G17X_HOST_BOOT_OPS: [G17xHostBootOp; 8] = [
-    G17xHostBootOp::ClearRoleStarted {
-        role: FirmwareRole::Gfx,
-        offset: 0x19a8,
-    },
-    G17xHostBootOp::ClearRoleStarted {
-        role: FirmwareRole::Gfx1,
-        offset: 0x19e0,
-    },
-    G17xHostBootOp::ClearCombinedStarted { offset: 0x1a6d },
-    G17xHostBootOp::StartRole {
-        role: FirmwareRole::Gfx,
-        rtbuddy_object: 0x1980,
-        firmware_map: 0x19a0,
-        vtable_slot: G15C_G16X_G17X_ROLE_START_VTABLE_SLOT,
-    },
-    G17xHostBootOp::StartRole {
-        role: FirmwareRole::Gfx1,
-        rtbuddy_object: 0x19b8,
-        firmware_map: 0x19d8,
-        vtable_slot: G15C_G16X_G17X_ROLE_START_VTABLE_SLOT,
-    },
-    G17xHostBootOp::RequireBothRoleStarts,
-    G17xHostBootOp::WaitForEitherRoleStarted {
-        combined_offset: 0x1a6d,
-        accelerator_offset: 0x2a0,
-        event_source_offset: 0x3d0,
-        event_vtable_slot: 0x210,
-        deadline_helper_arg0: 50,
-        deadline_helper_arg1: 1_000_000,
-        event_arg3: 0,
-        continue_result: 1,
-    },
-    G17xHostBootOp::MarkHostBootedAndNotifyAccelerator {
-        offset: 0x2b0,
-        name_vtable_slot: 0x38,
-        notify_vtable_slot: 0xa68,
-    },
-];
+pub(crate) const fn g17_host_boot_ops(target: G17HostBootEvidenceTarget) -> [G17xHostBootOp; 8] {
+    let layout = g17_host_boot_layout(target);
+    let gfx = g17_role_host_offsets(target, FirmwareRole::Gfx);
+    let gfx1 = g17_role_host_offsets(target, FirmwareRole::Gfx1);
+
+    [
+        G17xHostBootOp::ClearRoleStarted {
+            role: FirmwareRole::Gfx,
+            offset: gfx.started,
+        },
+        G17xHostBootOp::ClearRoleStarted {
+            role: FirmwareRole::Gfx1,
+            offset: gfx1.started,
+        },
+        G17xHostBootOp::ClearCombinedStarted {
+            offset: layout.combined_started,
+        },
+        G17xHostBootOp::StartRole {
+            role: FirmwareRole::Gfx,
+            rtbuddy_object: gfx.rtbuddy_object,
+            firmware_map: gfx.firmware_map,
+            vtable_slot: G15C_G16X_G17X_ROLE_START_VTABLE_SLOT,
+        },
+        G17xHostBootOp::StartRole {
+            role: FirmwareRole::Gfx1,
+            rtbuddy_object: gfx1.rtbuddy_object,
+            firmware_map: gfx1.firmware_map,
+            vtable_slot: G15C_G16X_G17X_ROLE_START_VTABLE_SLOT,
+        },
+        G17xHostBootOp::RequireBothRoleStarts,
+        G17xHostBootOp::WaitForEitherRoleStarted {
+            combined_offset: layout.combined_started,
+            accelerator_offset: layout.accelerator,
+            event_source_offset: layout.event_source,
+            event_vtable_slot: 0x210,
+            deadline_helper_arg0: 50,
+            deadline_helper_arg1: 1_000_000,
+            event_arg3: 0,
+            continue_result: 1,
+        },
+        G17xHostBootOp::MarkHostBootedAndNotifyAccelerator {
+            offset: layout.host_booted,
+            name_vtable_slot: 0x38,
+            notify_vtable_slot: 0xa68,
+        },
+    ]
+}
 
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn validate_g17x_host_boot_ops(ops: &[G17xHostBootOp]) -> bool {
-    ops == G17X_HOST_BOOT_OPS
+pub(crate) fn validate_g17_host_boot_ops(
+    target: G17HostBootEvidenceTarget,
+    ops: &[G17xHostBootOp],
+) -> bool {
+    ops == g17_host_boot_ops(target)
 }
 
 /// Role-local transport endpoint binding recovered from G17X RTBuddy.
@@ -558,41 +672,50 @@ pub(crate) enum G17xNotifyStartedOp {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) const G17X_NOTIFY_STARTED_OPS: [G17xNotifyStartedOp; 7] = [
-    G17xNotifyStartedOp::SetRoleStarted {
-        relative_offset: 0x28,
-    },
-    G17xNotifyStartedOp::StoreTimestamp {
-        relative_offset: 0x30,
-    },
-    G17xNotifyStartedOp::SetCombinedStarted {
-        absolute_offset: 0x1a6d,
-    },
-    G17xNotifyStartedOp::WakeCombinedStarted {
-        accelerator_offset: 0x2a0,
-        event_source_offset: 0x3d0,
-        vtable_slot: 0x208,
-        argument: 0,
-    },
-    G17xNotifyStartedOp::QueryRoleToken {
-        source_relative_offset: 0x10,
-        source_vtable_slot: 0x158,
-        firmware_vtable_slot: 0x2d0,
-        firmware_argument: 0,
-    },
-    G17xNotifyStartedOp::EncodeStartedMessage {
-        prefix: 0x0081_0000_0000_0000,
-        token_bits: 44,
-    },
-    G17xNotifyStartedOp::SendRoleMessage {
-        endpoint_relative_offset: 0,
-        vtable_slot: 0x898,
-    },
-];
+pub(crate) const fn g17_notify_started_ops(
+    target: G17HostBootEvidenceTarget,
+) -> [G17xNotifyStartedOp; 7] {
+    let layout = g17_host_boot_layout(target);
+
+    [
+        G17xNotifyStartedOp::SetRoleStarted {
+            relative_offset: 0x28,
+        },
+        G17xNotifyStartedOp::StoreTimestamp {
+            relative_offset: 0x30,
+        },
+        G17xNotifyStartedOp::SetCombinedStarted {
+            absolute_offset: layout.combined_started,
+        },
+        G17xNotifyStartedOp::WakeCombinedStarted {
+            accelerator_offset: layout.accelerator,
+            event_source_offset: layout.event_source,
+            vtable_slot: 0x208,
+            argument: 0,
+        },
+        G17xNotifyStartedOp::QueryRoleToken {
+            source_relative_offset: 0x10,
+            source_vtable_slot: 0x158,
+            firmware_vtable_slot: 0x2d0,
+            firmware_argument: 0,
+        },
+        G17xNotifyStartedOp::EncodeStartedMessage {
+            prefix: 0x0081_0000_0000_0000,
+            token_bits: 44,
+        },
+        G17xNotifyStartedOp::SendRoleMessage {
+            endpoint_relative_offset: 0,
+            vtable_slot: 0x898,
+        },
+    ]
+}
 
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn validate_g17x_notify_started_ops(ops: &[G17xNotifyStartedOp]) -> bool {
-    ops == G17X_NOTIFY_STARTED_OPS
+pub(crate) fn validate_g17_notify_started_ops(
+    target: G17HostBootEvidenceTarget,
+    ops: &[G17xNotifyStartedOp],
+) -> bool {
+    ops == g17_notify_started_ops(target)
 }
 
 /// Exact remaining boundaries which keep the diagnostic model non-executable.
@@ -1120,13 +1243,21 @@ mod tests {
     }
 
     #[test]
-    fn g17x_role_records_are_distinct_but_have_one_exact_layout() {
+    fn g17_role_records_are_target_specific_and_role_distinct() {
         assert_eq!(G15C_G16X_BOOT_ROLE_COUNT, 1);
         assert_eq!(G17X_BOOT_ROLE_COUNT, 2);
         assert_eq!(G15C_G16X_G17X_ROLE_START_VTABLE_SLOT, 0x888);
+        assert_eq!(
+            G17_HOST_BOOT_EVIDENCE_TARGETS,
+            [
+                G17HostBootEvidenceTarget::G17P,
+                G17HostBootEvidenceTarget::G17G,
+                G17HostBootEvidenceTarget::G17S,
+            ]
+        );
 
         assert_eq!(
-            g17x_role_host_offsets(FirmwareRole::Gfx),
+            g17_role_host_offsets(G17HostBootEvidenceTarget::G17S, FirmwareRole::Gfx),
             G17xRoleHostOffsets {
                 rtbuddy_object: 0x1980,
                 token_source_object: 0x1990,
@@ -1136,7 +1267,7 @@ mod tests {
             }
         );
         assert_eq!(
-            g17x_role_host_offsets(FirmwareRole::Gfx1),
+            g17_role_host_offsets(G17HostBootEvidenceTarget::G17S, FirmwareRole::Gfx1),
             G17xRoleHostOffsets {
                 rtbuddy_object: 0x19b8,
                 token_source_object: 0x19c8,
@@ -1145,13 +1276,41 @@ mod tests {
                 timestamp: 0x19e8,
             }
         );
+        assert_eq!(
+            g17_role_host_offsets(G17HostBootEvidenceTarget::G17G, FirmwareRole::Gfx),
+            G17xRoleHostOffsets {
+                rtbuddy_object: 0x19c8,
+                token_source_object: 0x19d8,
+                firmware_map: 0x19e8,
+                started: 0x19f0,
+                timestamp: 0x19f8,
+            }
+        );
+        assert_eq!(
+            g17_role_host_offsets(G17HostBootEvidenceTarget::G17G, FirmwareRole::Gfx1),
+            G17xRoleHostOffsets {
+                rtbuddy_object: 0x1a00,
+                token_source_object: 0x1a10,
+                firmware_map: 0x1a20,
+                started: 0x1a28,
+                timestamp: 0x1a30,
+            }
+        );
+        assert_eq!(
+            g17_role_host_offsets(G17HostBootEvidenceTarget::G17P, FirmwareRole::Gfx),
+            g17_role_host_offsets(G17HostBootEvidenceTarget::G17S, FirmwareRole::Gfx)
+        );
     }
 
     #[test]
-    fn g17x_host_boot_order_and_either_role_wait_are_exact() {
-        assert!(validate_g17x_host_boot_ops(&G17X_HOST_BOOT_OPS));
+    fn g17_host_boot_order_and_either_role_wait_are_target_exact() {
+        let g17s = g17_host_boot_ops(G17HostBootEvidenceTarget::G17S);
+        assert!(validate_g17_host_boot_ops(
+            G17HostBootEvidenceTarget::G17S,
+            &g17s
+        ));
         assert_eq!(
-            G17X_HOST_BOOT_OPS[3],
+            g17s[3],
             G17xHostBootOp::StartRole {
                 role: FirmwareRole::Gfx,
                 rtbuddy_object: 0x1980,
@@ -1160,7 +1319,7 @@ mod tests {
             }
         );
         assert_eq!(
-            G17X_HOST_BOOT_OPS[4],
+            g17s[4],
             G17xHostBootOp::StartRole {
                 role: FirmwareRole::Gfx1,
                 rtbuddy_object: 0x19b8,
@@ -1169,7 +1328,7 @@ mod tests {
             }
         );
         assert_eq!(
-            G17X_HOST_BOOT_OPS[6],
+            g17s[6],
             G17xHostBootOp::WaitForEitherRoleStarted {
                 combined_offset: 0x1a6d,
                 accelerator_offset: 0x2a0,
@@ -1182,7 +1341,7 @@ mod tests {
             }
         );
         assert_eq!(
-            G17X_HOST_BOOT_OPS[7],
+            g17s[7],
             G17xHostBootOp::MarkHostBootedAndNotifyAccelerator {
                 offset: 0x2b0,
                 name_vtable_slot: 0x38,
@@ -1190,10 +1349,77 @@ mod tests {
             }
         );
 
-        let mut wrong_order = G17X_HOST_BOOT_OPS;
+        let g17g = g17_host_boot_ops(G17HostBootEvidenceTarget::G17G);
+        assert!(validate_g17_host_boot_ops(
+            G17HostBootEvidenceTarget::G17G,
+            &g17g
+        ));
+        assert_eq!(
+            g17g[6],
+            G17xHostBootOp::WaitForEitherRoleStarted {
+                combined_offset: 0x1ab5,
+                accelerator_offset: 0x2a8,
+                event_source_offset: 0x3e0,
+                event_vtable_slot: 0x210,
+                deadline_helper_arg0: 50,
+                deadline_helper_arg1: 1_000_000,
+                event_arg3: 0,
+                continue_result: 1,
+            }
+        );
+        assert!(!validate_g17_host_boot_ops(
+            G17HostBootEvidenceTarget::G17S,
+            &g17g
+        ));
+
+        let mut wrong_order = g17s;
         wrong_order.swap(3, 4);
-        assert!(!validate_g17x_host_boot_ops(&wrong_order));
-        assert!(!validate_g17x_host_boot_ops(&G17X_HOST_BOOT_OPS[..7]));
+        assert!(!validate_g17_host_boot_ops(
+            G17HostBootEvidenceTarget::G17S,
+            &wrong_order
+        ));
+        assert!(!validate_g17_host_boot_ops(
+            G17HostBootEvidenceTarget::G17S,
+            &g17s[..7]
+        ));
+    }
+
+    #[test]
+    fn g17_host_boot_text_and_cold_boot_flags_are_target_pinned() {
+        assert_eq!(
+            g17_host_boot_text_evidence(G17HostBootEvidenceTarget::G17P),
+            G17HostBootTextEvidence {
+                boot_firmware_va: 0xffff_fe00_08a4_4ce0,
+                notify_started_va: 0xffff_fe00_08a2_e744,
+                complete_cold_boot_va: 0xffff_fe00_08a2_368c,
+                cold_boot_done_va: 0xffff_fe00_08a2_36c0,
+            }
+        );
+        assert_eq!(
+            g17_host_boot_text_evidence(G17HostBootEvidenceTarget::G17G),
+            G17HostBootTextEvidence {
+                boot_firmware_va: 0xffff_fe00_08b7_666c,
+                notify_started_va: 0xffff_fe00_08b5_fe60,
+                complete_cold_boot_va: 0xffff_fe00_08b5_4de4,
+                cold_boot_done_va: 0xffff_fe00_08b5_4e18,
+            }
+        );
+        assert_eq!(
+            g17_host_boot_text_evidence(G17HostBootEvidenceTarget::G17S),
+            G17HostBootTextEvidence {
+                boot_firmware_va: 0xffff_fe00_08b3_9754,
+                notify_started_va: 0xffff_fe00_08b2_25c0,
+                complete_cold_boot_va: 0xffff_fe00_08b1_765c,
+                cold_boot_done_va: 0xffff_fe00_08b1_7690,
+            }
+        );
+
+        let g17p = g17_host_boot_layout(G17HostBootEvidenceTarget::G17P);
+        let g17g = g17_host_boot_layout(G17HostBootEvidenceTarget::G17G);
+        let g17s = g17_host_boot_layout(G17HostBootEvidenceTarget::G17S);
+        assert_eq!((g17p.cold_boot_role0, g17p.cold_boot_role1), (0xb78, 0xca8));
+        assert_eq!((g17g.cold_boot_role0, g17g.cold_boot_role1), (0xb80, 0xcb0));
+        assert_eq!((g17s.cold_boot_role0, g17s.cold_boot_role1), (0xb78, 0xca8));
     }
 
     #[test]
@@ -1227,29 +1453,55 @@ mod tests {
     }
 
     #[test]
-    fn g17x_started_callback_message_and_wakeup_are_exact() {
-        assert!(validate_g17x_notify_started_ops(&G17X_NOTIFY_STARTED_OPS));
+    fn g17_started_callback_message_and_wakeup_are_target_exact() {
+        let g17s = g17_notify_started_ops(G17HostBootEvidenceTarget::G17S);
+        assert!(validate_g17_notify_started_ops(
+            G17HostBootEvidenceTarget::G17S,
+            &g17s
+        ));
         assert_eq!(
-            G17X_NOTIFY_STARTED_OPS[5],
+            g17s[5],
             G17xNotifyStartedOp::EncodeStartedMessage {
                 prefix: 0x0081_0000_0000_0000,
                 token_bits: 44,
             }
         );
         assert_eq!(
-            G17X_NOTIFY_STARTED_OPS[6],
+            g17s[6],
             G17xNotifyStartedOp::SendRoleMessage {
                 endpoint_relative_offset: 0,
                 vtable_slot: 0x898,
             }
         );
 
-        let mut wrong_message = G17X_NOTIFY_STARTED_OPS;
+        let g17g = g17_notify_started_ops(G17HostBootEvidenceTarget::G17G);
+        assert!(validate_g17_notify_started_ops(
+            G17HostBootEvidenceTarget::G17G,
+            &g17g
+        ));
+        assert_eq!(
+            g17g[3],
+            G17xNotifyStartedOp::WakeCombinedStarted {
+                accelerator_offset: 0x2a8,
+                event_source_offset: 0x3e0,
+                vtable_slot: 0x208,
+                argument: 0,
+            }
+        );
+        assert!(!validate_g17_notify_started_ops(
+            G17HostBootEvidenceTarget::G17S,
+            &g17g
+        ));
+
+        let mut wrong_message = g17s;
         wrong_message[5] = G17xNotifyStartedOp::EncodeStartedMessage {
             prefix: 0x0081_0000_0000_0000,
             token_bits: 43,
         };
-        assert!(!validate_g17x_notify_started_ops(&wrong_message));
+        assert!(!validate_g17_notify_started_ops(
+            G17HostBootEvidenceTarget::G17S,
+            &wrong_message
+        ));
     }
 
     #[test]
