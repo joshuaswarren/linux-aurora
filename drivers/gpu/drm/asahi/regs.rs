@@ -42,9 +42,25 @@ const ID_CLUSTERS: usize = 0xd0401c;
 const CORE_MASK_0: usize = 0xd01500;
 const CORE_MASK_1: usize = 0xd01514;
 
+// The "G14X" register family is shared by G14X (t602x) and every AGX3 part
+// (G15/G16/G17). The ID block at 0xd04000 is unchanged, and the per-cluster
+// core-enable masks are three u32 words at 0xe01500 (stride 4): AGXG17X
+// `readChipInfo` builds the offset (`mov w23,#0x1500; movk w23,#0xe0,lsl#16`
+// @ 0xfffffe0008b4b220) and reads [base], [base+4], [base+8]; the identical
+// pattern appears in all eight AGX3 kexts of the pinned 26A5378n corpus
+// (e.g. AGXG15G @ 0xfffffe0008af22f0).
 const CORE_MASKS_G14X: usize = 0xe01500;
+// MMU fault registers for the same family: AGXG17X fault-read helper
+// @ 0xfffffe0008b58c04 reads FAULT_INFO=0xd8c0 and FAULT_ADDR=0xd8c8 and
+// writes the acknowledge word to 0xd800 (AGXG15G equivalent
+// @ 0xfffffe0008af1f64). The fault address register holds VA >> 6.
 const FAULT_INFO_G14X: usize = 0xd8c0;
 const FAULT_ADDR_G14X: usize = 0xd8c8;
+/// Fault acknowledge/clear register (write-only). Recovered from the same
+/// helpers as the fault registers above; the ack value encoding is not yet
+/// modelled, so the driver does not write it.
+#[allow(dead_code)]
+const FAULT_ACK_G14X: usize = 0xd800;
 
 /// Enum representing the unit that caused an MMU fault.
 #[allow(non_camel_case_types)]
@@ -266,30 +282,17 @@ impl Resources {
                 core_mask_regs.push(self.sgx_read32::<CORE_MASK_1>(), GFP_KERNEL)?;
                 (id_clusters >> 12) & 0xff
             }
-            6 => {
-                // G14X
+            6 | 0x7 | 0x8 | 0xa | 0xb => {
+                // G14X and every AGX3 family share the G14X register bank
+                // (see the CORE_MASKS_G14X provenance comment above): three
+                // u32 core-enable mask words at 0xe01500, and the cluster
+                // count is the clusters-per-die x dies product from the
+                // unchanged ID block.
                 core_mask_regs.push(self.sgx_read32::<CORE_MASKS_G14X>(), GFP_KERNEL)?;
                 core_mask_regs.push(self.sgx_read32::<{ CORE_MASKS_G14X + 4 }>(), GFP_KERNEL)?;
                 core_mask_regs.push(self.sgx_read32::<{ CORE_MASKS_G14X + 8 }>(), GFP_KERNEL)?;
                 // Clusters per die * num dies
                 ((id_counts_1 >> 8) & 0xff) * ((id_counts_1 >> 16) & 0xf)
-            }
-            0x7 | 0x8 | 0xa | 0xb => {
-                // Identity is known, but the August RE does not yet establish
-                // the G15+ core-mask register bank. Do not guess the G14X
-                // layout or imply that firmware submission is supported.
-                dev_err!(
-                    self.dev.as_ref(),
-                    "GPU {:?}{:?} identity decoded (USC {}, HAL {:?}, {:?} firmware, {:?} submission, {}-bit UAT), but G15+ topology support is not implemented\n",
-                    identity.gpu_gen,
-                    identity.gpu_variant,
-                    identity.usc_generation,
-                    identity.gpu_hal_generation,
-                    identity.firmware_roles,
-                    identity.submission_transport,
-                    identity.uat_input_address_bits
-                );
-                return Err(ENODEV);
             }
             a => {
                 dev_err!(self.dev.as_ref(), "Unsupported GPU family {:#x}\n", a);
@@ -382,7 +385,12 @@ impl Resources {
 
     /// Get the fault information from the MMU status register, if one occurred.
     pub(crate) fn get_fault_info(&self, cfg: &'static hw::HwConfig) -> Option<FaultInfo> {
-        let g14x = cfg.gpu_core as u32 >= hw::GpuCore::G14S as u32;
+        // The G14X fault-register bank and fault-word decode carry unchanged
+        // to every AGX3 part (see the FAULT_INFO_G14X provenance comment).
+        // `gpu_core` is a firmware-ABI value that only exists for the AGX2
+        // targets, so AGX3 membership is keyed off the design generation.
+        let g14x = cfg.gpu_core as u32 >= hw::GpuCore::G14S as u32
+            || cfg.gpu_gen as u32 >= hw::GpuGen::G15 as u32;
 
         let fault_info = if g14x {
             self.sgx_read64::<FAULT_INFO_G14X>()
