@@ -9,10 +9,10 @@
 //! wire form that hands a compiled command buffer to the firmware for
 //! execution. It allocates no memory, starts no ASC, sends no mailbox message,
 //! and touches no MMIO. It models the EP 0x21 work-submission doorbell, the
-//! channel/work-queue ring producer indices, and the SKSM kick word/record
-//! layout the firmware consumes. The provenance ledger explicitly separates
-//! byte-grounded G17 fields from inherited producer records whose G17 consumer
-//! offsets still need first-hand confirmation.
+//! channel/work-queue ring producer indices, and the SKSM kick word/record plus
+//! host queue-timestamp producer the firmware consumes. The provenance ledger
+//! explicitly separates byte-grounded G17 fields from inherited producer
+//! records whose G17 consumer offsets still need first-hand confirmation.
 //!
 //! Grounding is first-hand from the on-disk M5 role macho `GFX.a010.macho`
 //! (`g17s a0, SKSM Enabled`). Addresses are firmware VAs
@@ -100,6 +100,14 @@ pub(crate) enum SubmissionError {
     QueueIdOutOfRange,
     /// A SKSM timestamp outside the 40-bit [39:0] field.
     KickTimestampOutOfRange,
+    /// The runtime queue geometry must contain between 1 and 256 stamps.
+    KickStampCountOutOfRange,
+    /// The timestamp's low-byte slot does not exist in this queue geometry.
+    KickStampIndexOutOfRange,
+    /// A zero-byte entry stride would alias every queue entry.
+    KickEntryStrideZero,
+    /// Multiplying the slot by the runtime entry stride overflowed u32.
+    KickEntryOffsetOverflow,
     /// A ring with zero entries cannot advance a producer index.
     RingSizeZero,
     /// A producer index must identify an entry inside its ring.
@@ -292,7 +300,133 @@ pub(crate) const fn decode_kick_word(word: u64) -> Result<SksmKickWord, Submissi
 }
 
 // ---------------------------------------------------------------------------
-// 5. Command types at command offset 0. These are inherited from AGX2
+// 5. Host SKSM kick-queue producer transaction (AGX3-specific).
+//
+//    Grounded from G17S KSMKickQueue::encodeKickEntry at host text
+//    0xfffffe0008b51f74-0xfffffe0008b521c4. The current timestamp at queue
+//    +0x48 selects `entry_base + low8(timestamp) * entry_stride`; the current
+//    40-bit timestamp is returned for the doorbell, then the low-byte slot is
+//    advanced modulo runtime `num_stamps`. Wrapping the slot to zero increments
+//    the 32-bit stamp in bits [39:8]. This coupling is load-bearing: choosing a
+//    different entry slot from the one encoded in the doorbell desynchronizes
+//    the queue and can reach the firmware's out-of-order rejection path.
+// ---------------------------------------------------------------------------
+
+/// Stamp sequence in bits [39:8] of a host SKSM timestamp.
+pub(crate) const KICK_STAMP_SHIFT: u32 = 8;
+pub(crate) const KICK_STAMP_MASK: u64 = u32::MAX as u64;
+/// Entry/stamp slot in bits [7:0] of a host SKSM timestamp.
+pub(crate) const KICK_STAMP_INDEX_MASK: u64 = 0xff;
+/// The low-byte slot representation permits at most 256 runtime stamps.
+pub(crate) const KICK_NUM_STAMPS_MAX: u16 = 256;
+
+/// Decoded host-side timestamp state before a kick is published.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct KickTimestamp {
+    pub(crate) stamp: u32,
+    pub(crate) stamp_index: u8,
+}
+
+/// Pure result of preparing one host SKSM kick-queue producer transaction.
+///
+/// The caller must still encode the complete target-specific entry, execute
+/// the recovered `dmb ish`, update the submitted counter, and perform the live
+/// MMIO/doorbell operation. This structure only makes the entry selection,
+/// doorbell timestamp, and next producer timestamp indivisible.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct PreparedKickSubmission {
+    /// Slot selected from the current timestamp's low byte.
+    pub(crate) entry_index: u8,
+    /// Byte offset from the runtime queue entry base.
+    pub(crate) entry_offset: u32,
+    /// Current 40-bit timestamp consumed by this entry.
+    pub(crate) timestamp: u64,
+    /// `timestamp | (queue_id << 40)`, sent only after publication barriers.
+    pub(crate) doorbell_word: u64,
+    /// Timestamp stored at queue +0x48 for the following submission.
+    pub(crate) next_timestamp: u64,
+}
+
+/// Decode the exact host timestamp split: stamp[31:0] followed by slot[7:0].
+pub(crate) const fn decode_kick_timestamp(
+    timestamp: u64,
+) -> Result<KickTimestamp, SubmissionError> {
+    if timestamp & !KICK_TS_MASK != 0 {
+        return Err(SubmissionError::KickTimestampOutOfRange);
+    }
+
+    Ok(KickTimestamp {
+        stamp: ((timestamp >> KICK_STAMP_SHIFT) & KICK_STAMP_MASK) as u32,
+        stamp_index: (timestamp & KICK_STAMP_INDEX_MASK) as u8,
+    })
+}
+
+/// Encode the host timestamp layout without a queue ID.
+pub(crate) const fn encode_kick_timestamp(timestamp: KickTimestamp) -> u64 {
+    ((timestamp.stamp as u64) << KICK_STAMP_SHIFT) | timestamp.stamp_index as u64
+}
+
+/// Prepare the exact entry-slot/doorbell/next-timestamp tuple for one kick.
+///
+/// `num_stamps` and `entry_stride` are intentionally runtime inputs: Apple's
+/// host loads both from the per-queue geometry rather than hard-coding them.
+/// Invalid geometry is rejected before an entry address or doorbell is
+/// produced. No shared memory, counter, barrier, MMIO, or endpoint state is
+/// mutated here.
+pub(crate) const fn prepare_kick_submission(
+    current_timestamp: u64,
+    queue_id: u8,
+    num_stamps: u16,
+    entry_stride: u32,
+) -> Result<PreparedKickSubmission, SubmissionError> {
+    let current = match decode_kick_timestamp(current_timestamp) {
+        Ok(timestamp) => timestamp,
+        Err(err) => return Err(err),
+    };
+
+    if num_stamps == 0 || num_stamps > KICK_NUM_STAMPS_MAX {
+        return Err(SubmissionError::KickStampCountOutOfRange);
+    }
+    if current.stamp_index as u16 >= num_stamps {
+        return Err(SubmissionError::KickStampIndexOutOfRange);
+    }
+    if entry_stride == 0 {
+        return Err(SubmissionError::KickEntryStrideZero);
+    }
+
+    let index = current.stamp_index as u32;
+    if index != 0 && entry_stride > u32::MAX / index {
+        return Err(SubmissionError::KickEntryOffsetOverflow);
+    }
+    let entry_offset = index * entry_stride;
+
+    let doorbell_word = match encode_kick_word(current_timestamp, queue_id) {
+        Ok(word) => word,
+        Err(err) => return Err(err),
+    };
+
+    let next_index = ((current.stamp_index as u16 + 1) % num_stamps) as u8;
+    let next_stamp = if next_index == 0 {
+        current.stamp.wrapping_add(1)
+    } else {
+        current.stamp
+    };
+    let next_timestamp = encode_kick_timestamp(KickTimestamp {
+        stamp: next_stamp,
+        stamp_index: next_index,
+    });
+
+    Ok(PreparedKickSubmission {
+        entry_index: current.stamp_index,
+        entry_offset,
+        timestamp: current_timestamp,
+        doorbell_word,
+        next_timestamp,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 6. Command types at command offset 0. These are inherited from AGX2
 //    `fw/workqueue.rs::CommandType`; the G17 consumer's numeric dispatch has
 //    not yet been grounded first-hand. A KSM completion entry outside its
 //    accepted set aborts with the fatal string at GFX 0xe710, but that string
@@ -311,7 +445,7 @@ pub(crate) enum CommandType {
 }
 
 // ---------------------------------------------------------------------------
-// 6. Provenance ledger + live gaps.
+// 7. Provenance ledger + live gaps.
 // ---------------------------------------------------------------------------
 
 /// How each submission-ABI component was grounded, so reuse-vs-fork is explicit.
@@ -335,11 +469,13 @@ pub(crate) struct SubmissionAbiLedger {
     pub(crate) channel_descriptor: AbiProvenance,
     pub(crate) command_types: AbiProvenance,
     pub(crate) kick_word: AbiProvenance,
+    pub(crate) kick_queue_producer: AbiProvenance,
     pub(crate) kick_record: AbiProvenance,
 }
 
-/// The doorbell is byte-grounded (§1); the SKSM kick word/record are AGX3
-/// forks grounded first-hand (§2-§4). The channel/ring producer *records* are
+/// The doorbell is byte-grounded (§1); the SKSM kick word/record and host
+/// queue-timestamp producer are AGX3 forks grounded first-hand (§2-§5). The
+/// channel/ring producer *records* are
 /// the AGX2 layouts the driver writes; the G17 firmware consumer offsets were
 /// not read first-hand this pass, and the host findings show the channel
 /// *descriptor* array may widen to 0x20 on AGX3 — so both stay unconfirmed and
@@ -351,6 +487,7 @@ pub(crate) const SUBMISSION_ABI_LEDGER: SubmissionAbiLedger = SubmissionAbiLedge
     channel_descriptor: AbiProvenance::Agx2InheritedUnconfirmed,
     command_types: AbiProvenance::Agx2InheritedUnconfirmed,
     kick_word: AbiProvenance::ForkedAgx3Grounded,
+    kick_queue_producer: AbiProvenance::ForkedAgx3Grounded,
     kick_record: AbiProvenance::ForkedAgx3Grounded,
 };
 
@@ -523,6 +660,135 @@ mod tests {
     }
 
     #[test]
+    fn kick_queue_preparation_couples_slot_doorbell_and_next_timestamp() {
+        let timestamp = encode_kick_timestamp(KickTimestamp {
+            stamp: 0x1234_5678,
+            stamp_index: 7,
+        });
+        let prepared = prepare_kick_submission(timestamp, 0x2a, 16, 0x180).unwrap();
+
+        assert_eq!(prepared.entry_index, 7);
+        assert_eq!(prepared.entry_offset, 7 * 0x180);
+        assert_eq!(prepared.timestamp, 0x12_3456_7807);
+        assert_eq!(prepared.doorbell_word, 0x2a12_3456_7807);
+        assert_eq!(
+            decode_kick_word(prepared.doorbell_word),
+            Ok(SksmKickWord {
+                timestamp: prepared.timestamp,
+                queue_id: 0x2a,
+                mask_selector: 0,
+            })
+        );
+        assert_eq!(
+            decode_kick_timestamp(prepared.next_timestamp),
+            Ok(KickTimestamp {
+                stamp: 0x1234_5678,
+                stamp_index: 8,
+            })
+        );
+    }
+
+    #[test]
+    fn kick_queue_timestamp_wrap_matches_the_host_divide_remainder_sequence() {
+        // Slot 15 wraps modulo 16, so the host adds 0x100 to the timestamp:
+        // the low byte becomes zero and the 32-bit stamp increments.
+        let timestamp = encode_kick_timestamp(KickTimestamp {
+            stamp: 0x1234_5678,
+            stamp_index: 15,
+        });
+        let prepared = prepare_kick_submission(timestamp, 0x7f, 16, 0x180).unwrap();
+        assert_eq!(prepared.entry_index, 15);
+        assert_eq!(prepared.entry_offset, 15 * 0x180);
+        assert_eq!(
+            decode_kick_timestamp(prepared.next_timestamp),
+            Ok(KickTimestamp {
+                stamp: 0x1234_5679,
+                stamp_index: 0,
+            })
+        );
+
+        // A 256-slot queue is representable despite num_stamps being larger
+        // than u8; slot 255 wraps and the 32-bit stamp wraps exactly like the
+        // host's masked add.
+        let timestamp = encode_kick_timestamp(KickTimestamp {
+            stamp: u32::MAX,
+            stamp_index: 0xff,
+        });
+        let prepared = prepare_kick_submission(timestamp, 0x40, 256, 0x180).unwrap();
+        assert_eq!(prepared.entry_index, 0xff);
+        assert_eq!(
+            decode_kick_timestamp(prepared.next_timestamp),
+            Ok(KickTimestamp {
+                stamp: 0,
+                stamp_index: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn kick_queue_preparation_matches_all_runtime_stamp_geometries() {
+        for num_stamps in 1u16..=KICK_NUM_STAMPS_MAX {
+            for index in 0u16..num_stamps {
+                let current = KickTimestamp {
+                    stamp: 0x89ab_cdef,
+                    stamp_index: index as u8,
+                };
+                let timestamp = encode_kick_timestamp(current);
+                let prepared = prepare_kick_submission(timestamp, 3, num_stamps, 0x180).unwrap();
+                let expected_index = (index + 1) % num_stamps;
+                let expected_stamp = if expected_index == 0 {
+                    current.stamp.wrapping_add(1)
+                } else {
+                    current.stamp
+                };
+
+                assert_eq!(prepared.entry_index, index as u8);
+                assert_eq!(prepared.entry_offset, index as u32 * 0x180);
+                assert_eq!(prepared.timestamp, timestamp);
+                assert_eq!(
+                    decode_kick_timestamp(prepared.next_timestamp),
+                    Ok(KickTimestamp {
+                        stamp: expected_stamp,
+                        stamp_index: expected_index as u8,
+                    })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn kick_queue_preparation_rejects_unrepresentable_state_before_publication() {
+        assert_eq!(
+            prepare_kick_submission(1 << 40, 0, 1, 0x180),
+            Err(SubmissionError::KickTimestampOutOfRange)
+        );
+        assert_eq!(
+            prepare_kick_submission(0, 0, 0, 0x180),
+            Err(SubmissionError::KickStampCountOutOfRange)
+        );
+        assert_eq!(
+            prepare_kick_submission(0, 0, 257, 0x180),
+            Err(SubmissionError::KickStampCountOutOfRange)
+        );
+        assert_eq!(
+            prepare_kick_submission(4, 0, 4, 0x180),
+            Err(SubmissionError::KickStampIndexOutOfRange)
+        );
+        assert_eq!(
+            prepare_kick_submission(0, 0, 1, 0),
+            Err(SubmissionError::KickEntryStrideZero)
+        );
+        assert_eq!(
+            prepare_kick_submission(2, 0, 3, u32::MAX),
+            Err(SubmissionError::KickEntryOffsetOverflow)
+        );
+        assert_eq!(
+            prepare_kick_submission(0, 0x80, 1, 0x180),
+            Err(SubmissionError::QueueIdOutOfRange)
+        );
+    }
+
+    #[test]
     fn kick_record_table_uses_the_firmware_geometry() {
         // add x2,x22,#0x10 ; add x2,x2,QID,lsl#5 -> base 0x10, stride 0x20.
         assert_eq!(KICK_RECORD_TABLE_BASE, 0x10);
@@ -585,6 +851,10 @@ mod tests {
         );
         assert_eq!(
             SUBMISSION_ABI_LEDGER.kick_word,
+            AbiProvenance::ForkedAgx3Grounded
+        );
+        assert_eq!(
+            SUBMISSION_ABI_LEDGER.kick_queue_producer,
             AbiProvenance::ForkedAgx3Grounded
         );
         assert_eq!(
