@@ -7,10 +7,12 @@
 //! This parser accepts only the exact recovered GFX/GFX1 `rkos/ftab`
 //! container geometry, selects the entry for one proven G17 variant, validates
 //! the nested Mach-O structure, UUID, size, and whole-image SHA-256, and then
-//! returns one opaque admission for the pair. It performs no firmware request,
-//! IMG4 verification, relocation, mapping, or hardware operation. In
-//! particular, callers must supply the authoritative bytes from the boot
-//! handoff; a separately requested filesystem copy is not handoff evidence.
+//! returns one opaque admission for the pair. A separate loaded-segment path
+//! validates the exact versioned m1n1 handoff, role-scoped UUID/segment
+//! geometry, and SHA-256 of the actual immutable `__TEXT` carveouts. Neither
+//! path performs a firmware request, IMG4 verification, relocation, power
+//! operation, UAT takeover, ASC start, or submission. A separately requested
+//! filesystem copy is never authoritative handoff evidence.
 
 #[cfg(test)]
 use super::{
@@ -19,6 +21,19 @@ use super::{
 #[cfg(not(test))]
 use crate::g17_boot::{
     decode_g17_firmware_variant, g17_nested_firmware_identity, FirmwareRole, G17FirmwareVariant,
+};
+
+#[cfg(not(test))]
+use core::slice;
+#[cfg(not(test))]
+use kernel::{
+    c_str,
+    io::{
+        mem::{Mem, MemFlag},
+        resource::Resource,
+    },
+    of,
+    prelude::*,
 };
 
 const MAX_CONTAINER_SIZE: usize = 16 * 1024 * 1024;
@@ -156,11 +171,88 @@ pub(crate) enum G17FirmwareError {
     Gfx1Invalid,
 }
 
+/// Rejection reasons for the authoritative loaded-segment handoff.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum G17LoadedFirmwareError {
+    UnsupportedVariant,
+    MissingGfx,
+    MissingGfx1,
+    InvalidGfx,
+    InvalidGfx1,
+    OverlappingPhysicalSegments,
+}
+
+/// One role as observed in the versioned m1n1 loaded-firmware handoff.
+///
+/// All slices are borrowed from the same handoff snapshot. `physical` comes
+/// from the named reserved-memory resources, while `remaps` comes from the
+/// role metadata and must match it exactly. `text` is the actual mapped
+/// `__TEXT` resource, never a filesystem firmware copy.
+#[derive(Debug, Copy, Clone)]
+pub(crate) struct G17LoadedRoleObservation<'a> {
+    pub(crate) role: FirmwareRole,
+    pub(crate) uuid: &'a [u8],
+    pub(crate) segment_names: &'a [u8],
+    pub(crate) iovas: &'a [u64],
+    pub(crate) remaps: &'a [u64],
+    pub(crate) physical: &'a [u64],
+    pub(crate) physical_sizes: &'a [u32],
+    pub(crate) sizes: &'a [u32],
+    pub(crate) flags: &'a [u32],
+    pub(crate) text: &'a [u8],
+}
+
+#[derive(Debug, Copy, Clone)]
+struct G17LoadedRoleIdentity {
+    role: FirmwareRole,
+    uuid: &'static [u8],
+    iovas: [u64; 3],
+    sizes: [u32; 3],
+    flags: [u32; 3],
+    text_sha256: [u8; 32],
+}
+
+const G17_LOADED_SEGMENT_NAMES: &[u8] = b"__TEXT\0__DATA\0__DATA_SHARED_RO\0";
+
+const G17S_LOADED_GFX: G17LoadedRoleIdentity = G17LoadedRoleIdentity {
+    role: FirmwareRole::Gfx,
+    uuid: b"05236520-33F1-3D41-83CB-169FAAADBCA7\0",
+    iovas: [
+        0xffff_fc00_0000_0000,
+        0xffff_fc00_0005_0000,
+        0xffff_fc00_0010_c000,
+    ],
+    sizes: [0x5_0000, 0xb_c000, 0x8000],
+    flags: [0x1, 0x10, 0x0],
+    text_sha256: [
+        0x55, 0x14, 0xe1, 0x38, 0x5e, 0x88, 0x2c, 0x5a, 0xcb, 0x37, 0x3d, 0xef, 0x5f, 0xbe, 0x87,
+        0xb5, 0xd2, 0x18, 0x2d, 0xd1, 0x73, 0xee, 0xaf, 0x59, 0x3b, 0xb9, 0x1e, 0x35, 0x54, 0xd2,
+        0x76, 0x28,
+    ],
+};
+
+const G17S_LOADED_GFX1: G17LoadedRoleIdentity = G17LoadedRoleIdentity {
+    role: FirmwareRole::Gfx1,
+    uuid: b"0E98AFB8-0680-3B15-932E-910D0A1CCD78\0",
+    iovas: [
+        0xffff_fc00_0000_0000,
+        0xffff_fc00_0005_4000,
+        0xffff_fc00_0010_8000,
+    ],
+    sizes: [0x5_4000, 0xb_4000, 0x8000],
+    flags: [0x1, 0x10, 0x0],
+    text_sha256: [
+        0x66, 0xcb, 0x87, 0x04, 0x78, 0xa5, 0x6b, 0xc9, 0x4d, 0x9d, 0x1c, 0x21, 0x0b, 0xd5, 0x1a,
+        0xda, 0xe0, 0x5d, 0xa0, 0xd6, 0x78, 0x59, 0x97, 0xe0, 0xb4, 0xff, 0x42, 0xee, 0x2a, 0x61,
+        0x6f, 0xbe,
+    ],
+};
+
 /// Proof that both role images were validated for one variant in one call.
 ///
-/// The fields are intentionally private. Only [`admit_g17_firmware_pair`] can
-/// construct this value outside tests, so a static expected-identity lookup
-/// cannot accidentally clear the runtime gate.
+/// The fields are intentionally private. Only the atomic raw-container and
+/// loaded-segment pair validators can construct this value outside tests, so a
+/// static expected-identity lookup cannot accidentally clear the runtime gate.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct G17FirmwareIdentityAdmission {
     variant: G17FirmwareVariant,
@@ -415,6 +507,350 @@ fn sha256(data: &[u8]) -> [u8; 32] {
     digest
 }
 
+fn validate_loaded_role(
+    observed: &G17LoadedRoleObservation<'_>,
+    expected: &G17LoadedRoleIdentity,
+) -> bool {
+    if observed.role != expected.role
+        || observed.uuid != expected.uuid
+        || observed.segment_names != G17_LOADED_SEGMENT_NAMES
+        || observed.iovas != expected.iovas
+        || observed.sizes != expected.sizes
+        || observed.flags != expected.flags
+        || observed.remaps.len() != 3
+        || observed.physical.len() != 3
+        || observed.physical_sizes != expected.sizes
+        || observed.remaps != observed.physical
+        || observed.text.len() != expected.sizes[0] as usize
+        || sha256(observed.text) != expected.text_sha256
+    {
+        return false;
+    }
+
+    for index in 0..3 {
+        let size = expected.sizes[index] as u64;
+        if observed.physical[index] & 0x3fff != 0
+            || size & 0x3fff != 0
+            || observed.physical[index].checked_add(size).is_none()
+        {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn role_segments_overlap(role: &G17LoadedRoleObservation<'_>) -> bool {
+    for left_index in 0..3 {
+        let left_start = role.physical[left_index];
+        let Some(left_end) = left_start.checked_add(role.sizes[left_index] as u64) else {
+            return true;
+        };
+        for right_index in left_index + 1..3 {
+            let right_start = role.physical[right_index];
+            let Some(right_end) = right_start.checked_add(role.sizes[right_index] as u64) else {
+                return true;
+            };
+            if left_start < right_end && right_start < left_end {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn role_pairs_overlap(
+    left: &G17LoadedRoleObservation<'_>,
+    right: &G17LoadedRoleObservation<'_>,
+) -> bool {
+    for left_index in 0..3 {
+        let left_start = left.physical[left_index];
+        let Some(left_end) = left_start.checked_add(left.sizes[left_index] as u64) else {
+            return true;
+        };
+
+        for right_index in 0..3 {
+            let right_start = right.physical[right_index];
+            let Some(right_end) = right_start.checked_add(right.sizes[right_index] as u64) else {
+                return true;
+            };
+            if left_start < right_end && right_start < left_end {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn admit_g17_loaded_pair_against(
+    raw_variant: u8,
+    gfx: Option<&G17LoadedRoleObservation<'_>>,
+    gfx1: Option<&G17LoadedRoleObservation<'_>>,
+    expected_gfx: &G17LoadedRoleIdentity,
+    expected_gfx1: &G17LoadedRoleIdentity,
+) -> Result<G17FirmwareIdentityAdmission, G17LoadedFirmwareError> {
+    // This path is intentionally narrower than the raw FTAB validator. The
+    // captured live handoff proves only the G17S/a010 role pair.
+    if raw_variant != G17FirmwareVariant::G17S as u8 {
+        return Err(G17LoadedFirmwareError::UnsupportedVariant);
+    }
+
+    let gfx = gfx.ok_or(G17LoadedFirmwareError::MissingGfx)?;
+    let gfx1 = gfx1.ok_or(G17LoadedFirmwareError::MissingGfx1)?;
+    if !validate_loaded_role(gfx, expected_gfx) {
+        return Err(G17LoadedFirmwareError::InvalidGfx);
+    }
+    if !validate_loaded_role(gfx1, expected_gfx1) {
+        return Err(G17LoadedFirmwareError::InvalidGfx1);
+    }
+    if role_segments_overlap(gfx) || role_segments_overlap(gfx1) || role_pairs_overlap(gfx, gfx1) {
+        return Err(G17LoadedFirmwareError::OverlappingPhysicalSegments);
+    }
+
+    Ok(G17FirmwareIdentityAdmission {
+        variant: G17FirmwareVariant::G17S,
+    })
+}
+
+/// Atomically admit the exact G17S role pair from loaded segment evidence.
+///
+/// Unlike [`admit_g17_firmware_pair`], this accepts no FTAB or Mach-O bytes.
+/// It derives G17S only when both role-scoped UUIDs, all six named segment
+/// resources, the exact IOVA/size/flag geometry, and both actual loaded
+/// `__TEXT` hashes agree in one call. G17C/G17G/G17P are deliberately rejected.
+pub(crate) fn admit_g17_loaded_pair(
+    raw_variant: u8,
+    gfx: Option<&G17LoadedRoleObservation<'_>>,
+    gfx1: Option<&G17LoadedRoleObservation<'_>>,
+) -> Result<G17FirmwareIdentityAdmission, G17LoadedFirmwareError> {
+    admit_g17_loaded_pair_against(raw_variant, gfx, gfx1, &G17S_LOADED_GFX, &G17S_LOADED_GFX1)
+}
+
+#[cfg(not(test))]
+#[derive(Debug)]
+pub(crate) enum G17LoadedHandoffError {
+    MissingNode,
+    InvalidEnvelope,
+    InvalidResources,
+    MappingFailed,
+    Admission(G17LoadedFirmwareError),
+}
+
+#[cfg(not(test))]
+struct RoleReservedResources {
+    text: Resource,
+    physical: [u64; 3],
+    sizes: [u32; 3],
+}
+
+#[cfg(not(test))]
+fn read_role_resources(
+    node: &of::Node,
+    names: [&CStr; 3],
+) -> Result<RoleReservedResources, G17LoadedHandoffError> {
+    let text = node
+        .reserved_mem_region_to_resource_byname(names[0])
+        .map_err(|_| G17LoadedHandoffError::InvalidResources)?;
+    let data = node
+        .reserved_mem_region_to_resource_byname(names[1])
+        .map_err(|_| G17LoadedHandoffError::InvalidResources)?;
+    let shared_ro = node
+        .reserved_mem_region_to_resource_byname(names[2])
+        .map_err(|_| G17LoadedHandoffError::InvalidResources)?;
+
+    let physical = [text.start(), data.start(), shared_ro.start()];
+    let sizes = [
+        text.size()
+            .try_into()
+            .map_err(|_| G17LoadedHandoffError::InvalidResources)?,
+        data.size()
+            .try_into()
+            .map_err(|_| G17LoadedHandoffError::InvalidResources)?,
+        shared_ro
+            .size()
+            .try_into()
+            .map_err(|_| G17LoadedHandoffError::InvalidResources)?,
+    ];
+
+    Ok(RoleReservedResources {
+        text,
+        physical,
+        sizes,
+    })
+}
+
+#[cfg(not(test))]
+fn unique_nonzero_phandles(phandles: &[u32]) -> bool {
+    if phandles.len() != 6 {
+        return false;
+    }
+    for (index, phandle) in phandles.iter().enumerate() {
+        if *phandle == 0 || phandles[index + 1..].contains(phandle) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Parse, map, and atomically admit the version-one m1n1 loaded-firmware
+/// handoff. Only the two named immutable `__TEXT` reserved-memory resources
+/// are mapped. The other four resources contribute physical geometry only.
+///
+/// Callers must invoke this before mapping SGX MMIO. Success proves firmware
+/// identity only and grants no power, UAT, recovery, transport, or submission
+/// ownership.
+#[cfg(not(test))]
+pub(crate) fn admit_g17_loaded_pair_from_handoff(
+    raw_variant: u8,
+) -> Result<G17FirmwareIdentityAdmission, G17LoadedHandoffError> {
+    const COMPATIBLE: &[u8] = b"apple,g17-firmware-handoff-v1\0";
+    const MEMORY_REGION_NAMES: &[u8] = concat!(
+        "gfx-fw-text\0gfx-fw-data\0gfx-fw-shared-ro\0",
+        "gfx1-fw-text\0gfx1-fw-data\0gfx1-fw-shared-ro\0"
+    )
+    .as_bytes();
+
+    if raw_variant != G17FirmwareVariant::G17S as u8 {
+        return Err(G17LoadedHandoffError::Admission(
+            G17LoadedFirmwareError::UnsupportedVariant,
+        ));
+    }
+
+    let chosen = of::chosen().ok_or(G17LoadedHandoffError::MissingNode)?;
+    let mut handoff = None;
+    for node in chosen.children() {
+        let matches = node
+            .get_property::<KVec<u8>>(c_str!("compatible"))
+            .map(|value| value.as_slice() == COMPATIBLE)
+            .unwrap_or(false);
+        if matches {
+            if handoff.replace(node).is_some() {
+                return Err(G17LoadedHandoffError::InvalidEnvelope);
+            }
+        }
+    }
+    let handoff = handoff.ok_or(G17LoadedHandoffError::MissingNode)?;
+
+    let compatible: KVec<u8> = handoff
+        .get_property(c_str!("compatible"))
+        .map_err(|_| G17LoadedHandoffError::InvalidEnvelope)?;
+    let version: u32 = handoff
+        .get_property(c_str!("apple,handoff-version"))
+        .map_err(|_| G17LoadedHandoffError::InvalidEnvelope)?;
+    let memory_region_names: KVec<u8> = handoff
+        .get_property(c_str!("memory-region-names"))
+        .map_err(|_| G17LoadedHandoffError::InvalidEnvelope)?;
+    let memory_regions: KVec<u32> = handoff
+        .get_property(c_str!("memory-region"))
+        .map_err(|_| G17LoadedHandoffError::InvalidEnvelope)?;
+    if compatible.as_slice() != COMPATIBLE
+        || version != 1
+        || memory_region_names.as_slice() != MEMORY_REGION_NAMES
+        || !unique_nonzero_phandles(&memory_regions)
+    {
+        return Err(G17LoadedHandoffError::InvalidEnvelope);
+    }
+
+    let gfx_uuid: KVec<u8> = handoff
+        .get_property(c_str!("apple,gfx-firmware-uuid"))
+        .map_err(|_| G17LoadedHandoffError::InvalidEnvelope)?;
+    let gfx_names: KVec<u8> = handoff
+        .get_property(c_str!("apple,gfx-segment-names"))
+        .map_err(|_| G17LoadedHandoffError::InvalidEnvelope)?;
+    let gfx_iovas: KVec<u64> = handoff
+        .get_property(c_str!("apple,gfx-segment-iovas"))
+        .map_err(|_| G17LoadedHandoffError::InvalidEnvelope)?;
+    let gfx_remaps: KVec<u64> = handoff
+        .get_property(c_str!("apple,gfx-segment-remaps"))
+        .map_err(|_| G17LoadedHandoffError::InvalidEnvelope)?;
+    let gfx_sizes: KVec<u32> = handoff
+        .get_property(c_str!("apple,gfx-segment-sizes"))
+        .map_err(|_| G17LoadedHandoffError::InvalidEnvelope)?;
+    let gfx_flags: KVec<u32> = handoff
+        .get_property(c_str!("apple,gfx-segment-flags"))
+        .map_err(|_| G17LoadedHandoffError::InvalidEnvelope)?;
+
+    let gfx1_uuid: KVec<u8> = handoff
+        .get_property(c_str!("apple,gfx1-firmware-uuid"))
+        .map_err(|_| G17LoadedHandoffError::InvalidEnvelope)?;
+    let gfx1_names: KVec<u8> = handoff
+        .get_property(c_str!("apple,gfx1-segment-names"))
+        .map_err(|_| G17LoadedHandoffError::InvalidEnvelope)?;
+    let gfx1_iovas: KVec<u64> = handoff
+        .get_property(c_str!("apple,gfx1-segment-iovas"))
+        .map_err(|_| G17LoadedHandoffError::InvalidEnvelope)?;
+    let gfx1_remaps: KVec<u64> = handoff
+        .get_property(c_str!("apple,gfx1-segment-remaps"))
+        .map_err(|_| G17LoadedHandoffError::InvalidEnvelope)?;
+    let gfx1_sizes: KVec<u32> = handoff
+        .get_property(c_str!("apple,gfx1-segment-sizes"))
+        .map_err(|_| G17LoadedHandoffError::InvalidEnvelope)?;
+    let gfx1_flags: KVec<u32> = handoff
+        .get_property(c_str!("apple,gfx1-segment-flags"))
+        .map_err(|_| G17LoadedHandoffError::InvalidEnvelope)?;
+
+    let gfx_resources = read_role_resources(
+        &handoff,
+        [
+            c_str!("gfx-fw-text"),
+            c_str!("gfx-fw-data"),
+            c_str!("gfx-fw-shared-ro"),
+        ],
+    )?;
+    let gfx1_resources = read_role_resources(
+        &handoff,
+        [
+            c_str!("gfx1-fw-text"),
+            c_str!("gfx1-fw-data"),
+            c_str!("gfx1-fw-shared-ro"),
+        ],
+    )?;
+
+    // SAFETY: These are bootloader-reserved, `no-map`, immutable firmware
+    // text resources. This function exposes only shared byte slices for
+    // hashing, performs no write and initiates no DMA, and drops both mappings
+    // before returning the identity-only admission token.
+    let gfx_text = unsafe { Mem::try_new(gfx_resources.text, MemFlag::WB.into()) }
+        .map_err(|_| G17LoadedHandoffError::MappingFailed)?;
+    // SAFETY: Same handoff and read-only hashing contract as GFX above.
+    let gfx1_text = unsafe { Mem::try_new(gfx1_resources.text, MemFlag::WB.into()) }
+        .map_err(|_| G17LoadedHandoffError::MappingFailed)?;
+    // SAFETY: Each mapping is valid for `size()` bytes until the corresponding
+    // `Mem` is dropped below, and neither underlying carveout is writable by
+    // the host or firmware according to the exact `__TEXT` handoff flags.
+    let gfx_text_bytes = unsafe { slice::from_raw_parts(gfx_text.ptr(), gfx_text.size()) };
+    let gfx1_text_bytes = unsafe { slice::from_raw_parts(gfx1_text.ptr(), gfx1_text.size()) };
+
+    let gfx = G17LoadedRoleObservation {
+        role: FirmwareRole::Gfx,
+        uuid: &gfx_uuid,
+        segment_names: &gfx_names,
+        iovas: &gfx_iovas,
+        remaps: &gfx_remaps,
+        physical: &gfx_resources.physical,
+        physical_sizes: &gfx_resources.sizes,
+        sizes: &gfx_sizes,
+        flags: &gfx_flags,
+        text: gfx_text_bytes,
+    };
+    let gfx1 = G17LoadedRoleObservation {
+        role: FirmwareRole::Gfx1,
+        uuid: &gfx1_uuid,
+        segment_names: &gfx1_names,
+        iovas: &gfx1_iovas,
+        remaps: &gfx1_remaps,
+        physical: &gfx1_resources.physical,
+        physical_sizes: &gfx1_resources.sizes,
+        sizes: &gfx1_sizes,
+        flags: &gfx1_flags,
+        text: gfx1_text_bytes,
+    };
+
+    admit_g17_loaded_pair(raw_variant, Some(&gfx), Some(&gfx1))
+        .map_err(G17LoadedHandoffError::Admission)
+}
+
 fn validate_selected_nested(
     role: FirmwareRole,
     variant: G17FirmwareVariant,
@@ -465,6 +901,101 @@ pub(crate) fn admit_g17_firmware_pair(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct LoadedWitness {
+        role: FirmwareRole,
+        uuid: Vec<u8>,
+        segment_names: Vec<u8>,
+        iovas: [u64; 3],
+        remaps: [u64; 3],
+        physical: [u64; 3],
+        physical_sizes: [u32; 3],
+        sizes: [u32; 3],
+        flags: [u32; 3],
+        text: Vec<u8>,
+    }
+
+    impl LoadedWitness {
+        fn observation(&self) -> G17LoadedRoleObservation<'_> {
+            G17LoadedRoleObservation {
+                role: self.role,
+                uuid: &self.uuid,
+                segment_names: &self.segment_names,
+                iovas: &self.iovas,
+                remaps: &self.remaps,
+                physical: &self.physical,
+                physical_sizes: &self.physical_sizes,
+                sizes: &self.sizes,
+                flags: &self.flags,
+                text: &self.text,
+            }
+        }
+    }
+
+    fn synthetic_loaded_pair() -> (
+        LoadedWitness,
+        LoadedWitness,
+        G17LoadedRoleIdentity,
+        G17LoadedRoleIdentity,
+    ) {
+        let gfx_text = vec![0x53; 0x4000];
+        let gfx1_text = vec![0xa1; 0x4000];
+        let sizes = [0x4000; 3];
+        let flags = [1, 0x10, 0];
+        let gfx_iovas = [
+            0xffff_fc00_0000_0000,
+            0xffff_fc00_0000_4000,
+            0xffff_fc00_0000_8000,
+        ];
+        let gfx1_iovas = [
+            0xffff_fd00_0000_0000,
+            0xffff_fd00_0000_4000,
+            0xffff_fd00_0000_8000,
+        ];
+        let gfx_physical = [0x1_0000, 0x1_4000, 0x1_8000];
+        let gfx1_physical = [0x2_0000, 0x2_4000, 0x2_8000];
+        let gfx_expected = G17LoadedRoleIdentity {
+            role: FirmwareRole::Gfx,
+            uuid: G17S_LOADED_GFX.uuid,
+            iovas: gfx_iovas,
+            sizes,
+            flags,
+            text_sha256: sha256(&gfx_text),
+        };
+        let gfx1_expected = G17LoadedRoleIdentity {
+            role: FirmwareRole::Gfx1,
+            uuid: G17S_LOADED_GFX1.uuid,
+            iovas: gfx1_iovas,
+            sizes,
+            flags,
+            text_sha256: sha256(&gfx1_text),
+        };
+        let gfx = LoadedWitness {
+            role: FirmwareRole::Gfx,
+            uuid: gfx_expected.uuid.to_vec(),
+            segment_names: G17_LOADED_SEGMENT_NAMES.to_vec(),
+            iovas: gfx_iovas,
+            remaps: gfx_physical,
+            physical: gfx_physical,
+            physical_sizes: sizes,
+            sizes,
+            flags,
+            text: gfx_text,
+        };
+        let gfx1 = LoadedWitness {
+            role: FirmwareRole::Gfx1,
+            uuid: gfx1_expected.uuid.to_vec(),
+            segment_names: G17_LOADED_SEGMENT_NAMES.to_vec(),
+            iovas: gfx1_iovas,
+            remaps: gfx1_physical,
+            physical: gfx1_physical,
+            physical_sizes: sizes,
+            sizes,
+            flags,
+            text: gfx1_text,
+        };
+        (gfx, gfx1, gfx_expected, gfx1_expected)
+    }
 
     fn hex<const N: usize>(text: &str) -> [u8; N] {
         assert_eq!(text.len(), N * 2);
@@ -664,6 +1195,236 @@ mod tests {
         assert_eq!(
             select_nested(FirmwareRole::Gfx, G17FirmwareVariant::G17S, &too_large),
             Err(G17FirmwareError::ContainerTooLarge)
+        );
+    }
+
+    #[test]
+    fn loaded_pair_admission_is_atomic_and_g17s_only() {
+        let (gfx, gfx1, expected_gfx, expected_gfx1) = synthetic_loaded_pair();
+        let admission = admit_g17_loaded_pair_against(
+            b'S',
+            Some(&gfx.observation()),
+            Some(&gfx1.observation()),
+            &expected_gfx,
+            &expected_gfx1,
+        )
+        .unwrap();
+        assert_eq!(admission.variant(), G17FirmwareVariant::G17S);
+        assert_eq!(
+            admit_g17_loaded_pair(b'S', Some(&gfx.observation()), Some(&gfx1.observation()),),
+            Err(G17LoadedFirmwareError::InvalidGfx)
+        );
+
+        for variant in [b'C', b'G', b'P', b'A', 0, u8::MAX] {
+            assert_eq!(
+                admit_g17_loaded_pair_against(
+                    variant,
+                    Some(&gfx.observation()),
+                    Some(&gfx1.observation()),
+                    &expected_gfx,
+                    &expected_gfx1,
+                ),
+                Err(G17LoadedFirmwareError::UnsupportedVariant)
+            );
+        }
+    }
+
+    #[test]
+    fn loaded_pair_rejects_missing_swapped_mixed_and_duplicate_roles() {
+        let (gfx, mut gfx1, expected_gfx, expected_gfx1) = synthetic_loaded_pair();
+        assert_eq!(
+            admit_g17_loaded_pair_against(
+                b'S',
+                None,
+                Some(&gfx1.observation()),
+                &expected_gfx,
+                &expected_gfx1,
+            ),
+            Err(G17LoadedFirmwareError::MissingGfx)
+        );
+        assert_eq!(
+            admit_g17_loaded_pair_against(
+                b'S',
+                Some(&gfx.observation()),
+                None,
+                &expected_gfx,
+                &expected_gfx1,
+            ),
+            Err(G17LoadedFirmwareError::MissingGfx1)
+        );
+        assert_eq!(
+            admit_g17_loaded_pair_against(
+                b'S',
+                Some(&gfx1.observation()),
+                Some(&gfx.observation()),
+                &expected_gfx,
+                &expected_gfx1,
+            ),
+            Err(G17LoadedFirmwareError::InvalidGfx)
+        );
+        assert_eq!(
+            admit_g17_loaded_pair_against(
+                b'S',
+                Some(&gfx.observation()),
+                Some(&gfx.observation()),
+                &expected_gfx,
+                &expected_gfx1,
+            ),
+            Err(G17LoadedFirmwareError::InvalidGfx1)
+        );
+
+        gfx1.uuid
+            .copy_from_slice(b"FEB81F4A-F075-3449-A662-3C01C0994B4F\0");
+        assert_eq!(
+            admit_g17_loaded_pair_against(
+                b'S',
+                Some(&gfx.observation()),
+                Some(&gfx1.observation()),
+                &expected_gfx,
+                &expected_gfx1,
+            ),
+            Err(G17LoadedFirmwareError::InvalidGfx1)
+        );
+    }
+
+    #[test]
+    fn loaded_pair_rejects_every_geometry_and_byte_mismatch() {
+        let (gfx, mut gfx1, expected_gfx, expected_gfx1) = synthetic_loaded_pair();
+
+        gfx1.physical_sizes[1] += 0x4000;
+        assert_eq!(
+            admit_g17_loaded_pair_against(
+                b'S',
+                Some(&gfx.observation()),
+                Some(&gfx1.observation()),
+                &expected_gfx,
+                &expected_gfx1,
+            ),
+            Err(G17LoadedFirmwareError::InvalidGfx1)
+        );
+        gfx1.physical_sizes[1] -= 0x4000;
+
+        gfx1.sizes[1] += 0x4000;
+        assert_eq!(
+            admit_g17_loaded_pair_against(
+                b'S',
+                Some(&gfx.observation()),
+                Some(&gfx1.observation()),
+                &expected_gfx,
+                &expected_gfx1,
+            ),
+            Err(G17LoadedFirmwareError::InvalidGfx1)
+        );
+        gfx1.sizes[1] -= 0x4000;
+
+        gfx1.iovas[1] += 0x4000;
+        assert_eq!(
+            admit_g17_loaded_pair_against(
+                b'S',
+                Some(&gfx.observation()),
+                Some(&gfx1.observation()),
+                &expected_gfx,
+                &expected_gfx1,
+            ),
+            Err(G17LoadedFirmwareError::InvalidGfx1)
+        );
+        gfx1.iovas[1] -= 0x4000;
+
+        gfx1.flags[1] ^= 1;
+        assert_eq!(
+            admit_g17_loaded_pair_against(
+                b'S',
+                Some(&gfx.observation()),
+                Some(&gfx1.observation()),
+                &expected_gfx,
+                &expected_gfx1,
+            ),
+            Err(G17LoadedFirmwareError::InvalidGfx1)
+        );
+        gfx1.flags[1] ^= 1;
+
+        gfx1.remaps[1] += 0x4000;
+        assert_eq!(
+            admit_g17_loaded_pair_against(
+                b'S',
+                Some(&gfx.observation()),
+                Some(&gfx1.observation()),
+                &expected_gfx,
+                &expected_gfx1,
+            ),
+            Err(G17LoadedFirmwareError::InvalidGfx1)
+        );
+        gfx1.remaps[1] -= 0x4000;
+
+        gfx1.segment_names[0] ^= 1;
+        assert_eq!(
+            admit_g17_loaded_pair_against(
+                b'S',
+                Some(&gfx.observation()),
+                Some(&gfx1.observation()),
+                &expected_gfx,
+                &expected_gfx1,
+            ),
+            Err(G17LoadedFirmwareError::InvalidGfx1)
+        );
+        gfx1.segment_names[0] ^= 1;
+
+        gfx1.text[0x123] ^= 1;
+        assert_eq!(
+            admit_g17_loaded_pair_against(
+                b'S',
+                Some(&gfx.observation()),
+                Some(&gfx1.observation()),
+                &expected_gfx,
+                &expected_gfx1,
+            ),
+            Err(G17LoadedFirmwareError::InvalidGfx1)
+        );
+    }
+
+    #[test]
+    fn loaded_pair_rejects_overlapping_or_unaligned_physical_resources() {
+        let (gfx, mut gfx1, expected_gfx, expected_gfx1) = synthetic_loaded_pair();
+        gfx1.physical[0] = gfx.physical[2];
+        gfx1.remaps[0] = gfx.physical[2];
+        assert_eq!(
+            admit_g17_loaded_pair_against(
+                b'S',
+                Some(&gfx.observation()),
+                Some(&gfx1.observation()),
+                &expected_gfx,
+                &expected_gfx1,
+            ),
+            Err(G17LoadedFirmwareError::OverlappingPhysicalSegments)
+        );
+
+        gfx1.physical[0] = 0x2_0001;
+        gfx1.remaps[0] = 0x2_0001;
+        assert_eq!(
+            admit_g17_loaded_pair_against(
+                b'S',
+                Some(&gfx.observation()),
+                Some(&gfx1.observation()),
+                &expected_gfx,
+                &expected_gfx1,
+            ),
+            Err(G17LoadedFirmwareError::InvalidGfx1)
+        );
+    }
+
+    #[test]
+    fn production_loaded_g17s_identity_constants_are_exact() {
+        assert_eq!(G17S_LOADED_GFX.uuid.len(), 37);
+        assert_eq!(G17S_LOADED_GFX1.uuid.len(), 37);
+        assert_eq!(G17S_LOADED_GFX.sizes, [0x50000, 0xbc000, 0x8000]);
+        assert_eq!(G17S_LOADED_GFX1.sizes, [0x54000, 0xb4000, 0x8000]);
+        assert_eq!(
+            G17S_LOADED_GFX.text_sha256,
+            hex("5514e1385e882c5acb373def5fbe87b5d2182dd173eeaf593bb91e3554d27628")
+        );
+        assert_eq!(
+            G17S_LOADED_GFX1.text_sha256,
+            hex("66cb870478a56bc94d9d1c210bd51adae05da0d6785997e0b4ff42ee2a616fbe")
         );
     }
 
