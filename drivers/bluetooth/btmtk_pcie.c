@@ -252,7 +252,7 @@ module_param(load_radio_config, bool, 0444);
  * AppleSunriseBluetooth does a device-visible companion-function attach
  * before userspace supplies the dedicated Bluetooth image: enable 64-bit DMA,
  * set PCI bus mastering, select the single MSI source, read config 0x48c,
- * program
+ * read logical core ID 0x70010200 through the 0x23014/0xfe3b8 remap, program
  * BAR0 0xfe3b4 = 0x7000188a, and allocate the IPC backing store.  Keep that
  * exact pre-firmware subset independent from the numbered Bluetooth firmware
  * gates so it can be combined with the MT7932 Wi-Fi bring-up as one bounded
@@ -280,6 +280,7 @@ static int btmtk_pcie_apply_gate_selector(void)
 			return -EINVAL;
 
 		probe_rom_version = true;
+		probe_remap = true;
 		prepare_ipc = true;
 		activate_firmware = gate >= 4;
 		start_ipc = gate >= 5;
@@ -1636,7 +1637,7 @@ static int btmtk_pcie_probe(struct pci_dev *pdev,
 	void __iomem * const *iomap;
 	u16 command, subsystem_vendor, subsystem_device;
 	u8 revision;
-	u32 chip_id, rom_config;
+	u32 chip_id = 0, rom_config;
 	u8 rom_version;
 	int err;
 
@@ -1688,8 +1689,7 @@ static int btmtk_pcie_probe(struct pci_dev *pdev,
 		 &pdev->resource[0].end, &pdev->resource[2].start,
 		 &pdev->resource[2].end, bdev->fallback_chip_id);
 
-	if (prepare_ipc &&
-	    (!probe_rom_version || (!probe_remap && !apple_attach))) {
+	if (prepare_ipc && (!probe_rom_version || !probe_remap)) {
 		dev_err(&pdev->dev,
 			"J700_MT793B_PCIE_GATE_FAIL: stage=ipc-prerequisite require_rom=1 require_remap=1\n");
 		return -EINVAL;
@@ -1777,12 +1777,18 @@ static int btmtk_pcie_probe(struct pci_dev *pdev,
 			dev_err(&pdev->dev,
 				"J700_MT793B_PCIE_GATE_FAIL: stage=chip-id ret=%d\n",
 				err);
+			if (apple_attach)
+				btmtk_pcie_quiesce(bdev);
 			return err;
 		}
 
 		if (!chip_id) {
-			dev_info(&pdev->dev,
-				 "J700_MT793B_CHIP_ID_DEFERRED: register=70010200 value=00000000 source=pre-conninfra exact_remap=23014/fe3b8 dma=0 hci=0\n");
+			if (apple_attach)
+				dev_info(&pdev->dev,
+					 "J700_MT793B_CHIP_ID_DEFERRED: register=70010200 value=00000000 source=pre-conninfra exact_remap=23014/fe3b8 dma=enabled pci_master=1 irq=1 hci=0\n");
+			else
+				dev_info(&pdev->dev,
+					 "J700_MT793B_CHIP_ID_DEFERRED: register=70010200 value=00000000 source=pre-conninfra exact_remap=23014/fe3b8 dma=0 hci=0\n");
 		} else {
 			if ((chip_id & 0xffff) != 0x7922 &&
 			    (chip_id & 0xffff) != 0x7923 &&
@@ -1790,11 +1796,18 @@ static int btmtk_pcie_probe(struct pci_dev *pdev,
 				dev_err(&pdev->dev,
 					"J700_MT793B_PCIE_GATE_FAIL: stage=chip-id value=%08x\n",
 					chip_id);
+				if (apple_attach)
+					btmtk_pcie_quiesce(bdev);
 				return -ENODEV;
 			}
-			dev_info(&pdev->dev,
-				 "J700_MT793B_CHIP_ID_PASS: register=70010200 value=%08x core=%04x remap=70010000 bar0_selector=23014 fallback_selector=fe3b8 fallback=188d1890 bar0_window=c0200 dma=0 hci=0\n",
-				 chip_id, chip_id & 0xffff);
+			if (apple_attach)
+				dev_info(&pdev->dev,
+					 "J700_MT793B_CHIP_ID_PASS: register=70010200 value=%08x core=%04x remap=70010000 bar0_selector=23014 fallback_selector=fe3b8 fallback=188d1890 bar0_window=c0200 dma=enabled pci_master=1 irq=1 hci=0\n",
+					 chip_id, chip_id & 0xffff);
+			else
+				dev_info(&pdev->dev,
+					 "J700_MT793B_CHIP_ID_PASS: register=70010200 value=%08x core=%04x remap=70010000 bar0_selector=23014 fallback_selector=fe3b8 fallback=188d1890 bar0_window=c0200 dma=0 hci=0\n",
+					 chip_id, chip_id & 0xffff);
 		}
 	}
 
@@ -1814,7 +1827,8 @@ static int btmtk_pcie_probe(struct pci_dev *pdev,
 	}
 	if (apple_attach) {
 		dev_info(&pdev->dev,
-			 "J700_MT793B_APPLE_ATTACH_READY: order=dma-master-irq-config48c-remap-ipc published=0 firmware=0 hci=0\n");
+			 "J700_MT793B_APPLE_ATTACH_READY: order=dma-master-irq-config48c-chip-id-remap-ipc chip_id=%08x published=0 firmware=0 hci=0\n",
+			 chip_id);
 		if (!activate_firmware)
 			return 0;
 	}
