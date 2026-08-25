@@ -19,6 +19,19 @@ pub(crate) const UAT_LVBIT: usize = UAT_PGBIT - 3; // log2(sizeof(u64))
 /// Number of translation levels.
 pub(crate) const UAT_LEVELS: usize = 3;
 
+/// Offset of the driver-managed kernel VA window base from the upper
+/// canonical base of the selected root.
+///
+/// This reproduces the AGX2-proven placement (`0xffffffa000000000` for the
+/// 39-bit root) and carries the same driver-chosen offset to the 42-bit root
+/// (`0xfffffc2000000000`). The offset itself is a driver policy, not a
+/// hardware constant; whether AGX3 firmware builds constrain the kernel-half
+/// window further is unvalidated, and `mmu.rs` fails closed before any AGX3
+/// firmware shares MMU state.
+const KERNEL_VA_WINDOW_BASE_OFFSET: u64 = 0x20_0000_0000;
+/// Offset of the driver-managed kernel VA window top (see above).
+const KERNEL_VA_WINDOW_TOP_OFFSET: u64 = 0x30_0000_0000;
+
 /// UAT input-address geometry for one TTBR root.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct UatGeometry {
@@ -69,9 +82,18 @@ impl UatGeometry {
     }
 
     /// Canonical base of the upper/TTBR1 address space.
-    #[cfg(test)]
     pub(crate) const fn upper_canonical_base(self) -> u64 {
         !self.root_mask()
+    }
+
+    /// Base of the driver-managed kernel VA window inside the upper root.
+    pub(crate) const fn kernel_va_base(self) -> u64 {
+        self.upper_canonical_base() + KERNEL_VA_WINDOW_BASE_OFFSET
+    }
+
+    /// Top of the driver-managed kernel VA window inside the upper root.
+    pub(crate) const fn kernel_va_top(self) -> u64 {
+        self.upper_canonical_base() + KERNEL_VA_WINDOW_TOP_OFFSET
     }
 }
 
@@ -129,6 +151,40 @@ mod tests {
 
         assert_eq!(old.root_index(kernel_iova), 2);
         assert_eq!(new.root_index(kernel_iova), 58);
+    }
+
+    #[test]
+    fn kernel_window_reproduces_the_proven_39_bit_layout_and_recomputes_for_42() {
+        let old = UatGeometry::new(39).unwrap();
+        let new = UatGeometry::new(42).unwrap();
+
+        // AGX2-proven placement, byte-for-byte.
+        assert_eq!(old.kernel_va_base(), 0xffff_ffa0_0000_0000);
+        assert_eq!(old.kernel_va_top(), 0xffff_ffb0_0000_0000);
+
+        // Same driver-chosen offset under the bit-42 selector.
+        assert_eq!(new.kernel_va_base(), 0xffff_fc20_0000_0000);
+        assert_eq!(new.kernel_va_top(), 0xffff_fc30_0000_0000);
+
+        for geometry in [old, new] {
+            let base = geometry.kernel_va_base();
+            let top = geometry.kernel_va_top();
+            assert!(base < top);
+            // The window is upper-half canonical for its root: every bit
+            // above the root width is set, and the window stays inside
+            // one root's translation range.
+            assert_eq!(
+                base & !geometry.root_mask(),
+                geometry.upper_canonical_base()
+            );
+            assert_eq!(
+                (top - 1) & !geometry.root_mask(),
+                geometry.upper_canonical_base()
+            );
+            // Both ends land in the top-level table.
+            assert!(geometry.root_index(base) < geometry.root_entries());
+            assert!(geometry.root_index(top - 1) < geometry.root_entries());
+        }
     }
 
     #[test]
