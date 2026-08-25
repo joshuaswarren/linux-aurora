@@ -27,6 +27,7 @@ use crate::{
     gem::AsahiObject,
     gpu,
     hw,
+    identity,
     regs, //
 };
 
@@ -50,10 +51,13 @@ pub(crate) struct AsahiDriver {
 }
 
 /// A matched device either has a complete legacy hardware configuration or is
-/// an exact, diagnostic-only target whose firmware boundary remains closed.
+/// an exact AGX3 identification target whose firmware boundary remains closed.
 pub(crate) enum ProbeConfig {
     Supported(&'static hw::HwConfig),
-    T6050G17S,
+    /// AGX3 (G15/G16/G17) target: chip identification and the read-only
+    /// topology decode run at probe time, then the probe fails closed before
+    /// DMA setup, ASC start, or any MMIO write.
+    Agx3Diagnostic(&'static hw::agx3::SocConfig),
 }
 
 unsafe impl Send for AsahiDriver {}
@@ -153,15 +157,145 @@ kernel::of_device_table!(
             of::DeviceId::new(c_str!("apple,agx-t6022")),
             ProbeConfig::Supported(&hw::t602x::HWCONFIG_T6022)
         ),
-        // This is the literal compatible captured from the J714s/T6050 ADT.
-        // It intentionally selects no HwConfig: unproved power/MMIO fields
-        // must never be represented by copied or zero-filled legacy values.
+        // AGX3 (G15/G16/G17) identification targets. These intentionally
+        // select no HwConfig: unproved power/MMIO/firmware-tuning fields
+        // must never be represented by copied or zero-filled legacy values,
+        // and the probe fails closed before any firmware handoff.
+        (
+            of::DeviceId::new(c_str!("apple,agx-t8122")),
+            ProbeConfig::Agx3Diagnostic(&hw::agx3::T8122)
+        ),
+        (
+            of::DeviceId::new(c_str!("apple,agx-t6030")),
+            ProbeConfig::Agx3Diagnostic(&hw::agx3::T6030)
+        ),
+        (
+            of::DeviceId::new(c_str!("apple,agx-t6031")),
+            ProbeConfig::Agx3Diagnostic(&hw::agx3::T6031)
+        ),
+        (
+            of::DeviceId::new(c_str!("apple,agx-t6032")),
+            ProbeConfig::Agx3Diagnostic(&hw::agx3::T6032)
+        ),
+        (
+            of::DeviceId::new(c_str!("apple,agx-t8132")),
+            ProbeConfig::Agx3Diagnostic(&hw::agx3::T8132)
+        ),
+        (
+            of::DeviceId::new(c_str!("apple,agx-t6040")),
+            ProbeConfig::Agx3Diagnostic(&hw::agx3::T6040)
+        ),
+        (
+            of::DeviceId::new(c_str!("apple,agx-t6041")),
+            ProbeConfig::Agx3Diagnostic(&hw::agx3::T6041)
+        ),
+        (
+            of::DeviceId::new(c_str!("apple,agx-t8142")),
+            ProbeConfig::Agx3Diagnostic(&hw::agx3::T8142)
+        ),
+        (
+            of::DeviceId::new(c_str!("apple,agx-t6050")),
+            ProbeConfig::Agx3Diagnostic(&hw::agx3::T6050)
+        ),
+        (
+            of::DeviceId::new(c_str!("apple,agx-t6051")),
+            ProbeConfig::Agx3Diagnostic(&hw::agx3::T6051)
+        ),
+        // The literal compatible captured from the J714s/T6050 ADT.
         (
             of::DeviceId::new(c_str!("gpu,t6050")),
-            ProbeConfig::T6050G17S
+            ProbeConfig::Agx3Diagnostic(&hw::agx3::T6050)
         ),
     ]
 );
+
+/// Identify an AGX3 target as far as read-only evidence allows, then refuse.
+///
+/// This logs the statically decoded identity, performs the read-only SGX
+/// identification (ID block + core-enable masks; no DMA mask, no ASC start,
+/// no MMIO write), cross-checks the two, and then fails closed at the
+/// generation-specific firmware boundary.
+fn refuse_agx3_probe(pdev: &platform::Device<Core>, soc: &'static hw::agx3::SocConfig) -> Error {
+    let Some(expected) =
+        identity::decode_gpu_identity(soc.hw_family, soc.hw_variant, soc.num_dies as u8)
+    else {
+        dev_err!(
+            pdev.as_ref(),
+            "AGX3: static identity for chip {:#x} does not decode\n",
+            soc.chip_id
+        );
+        return EINVAL;
+    };
+
+    if expected.uat_input_address_bits != soc.uat_ias {
+        dev_err!(
+            pdev.as_ref(),
+            "AGX3: static UAT width for chip {:#x} disagrees with the identity decode\n",
+            soc.chip_id
+        );
+        return EINVAL;
+    }
+
+    dev_info!(
+        pdev.as_ref(),
+        "AGX3: matched {:?}{:?} (chip {:#x}, USC gen {}, HAL {:?}, {:?} firmware roles, {:?} submission, {}-bit UAT roots, {}-bit OAS)\n",
+        expected.gpu_gen,
+        expected.gpu_variant,
+        soc.chip_id,
+        expected.usc_generation,
+        expected.gpu_hal_generation,
+        expected.firmware_roles,
+        expected.submission_transport,
+        soc.uat_ias,
+        soc.uat_oas
+    );
+
+    match regs::Resources::new(pdev) {
+        Ok(res) => match res.get_gpu_id() {
+            Ok(id) => {
+                dev_info!(
+                    pdev.as_ref(),
+                    "AGX3: hardware reports {:?}{:?} rev {:?}, {} dies, {} clusters, {} cores/cluster, {} active cores\n",
+                    id.gpu_gen,
+                    id.gpu_variant,
+                    id.gpu_rev,
+                    id.num_dies,
+                    id.num_clusters,
+                    id.num_cores,
+                    id.total_active_cores
+                );
+                if id.gpu_gen != soc.gpu_gen || id.gpu_variant != soc.gpu_variant {
+                    dev_warn!(
+                        pdev.as_ref(),
+                        "AGX3: hardware identity {:?}{:?} does not match the matched compatible ({:?}{:?})\n",
+                        id.gpu_gen,
+                        id.gpu_variant,
+                        soc.gpu_gen,
+                        soc.gpu_variant
+                    );
+                }
+            }
+            Err(e) => dev_warn!(pdev.as_ref(), "AGX3: GPU ID decode failed: {:?}\n", e),
+        },
+        Err(e) => dev_warn!(
+            pdev.as_ref(),
+            "AGX3: SGX MMIO region unavailable: {:?}\n",
+            e
+        ),
+    }
+
+    match expected.gpu_gen {
+        hw::GpuGen::G17 => refuse_g17_probe(pdev),
+        gen => {
+            dev_err!(
+                pdev.as_ref(),
+                "AGX3: no firmware handoff for {:?}: the HwConfig firmware-tuning blocks, init-data layout, and Handoff ABI are not grounded for this generation; refusing before DMA setup or ASC start\n",
+                gen
+            );
+            ENODEV
+        }
+    }
+}
 
 fn refuse_g17_probe(pdev: &platform::Device<Core>) -> Error {
     let Err(missing) = g17_boot::pre_handoff_gate(hw::GpuGen::G17 as u32) else {
@@ -174,7 +308,7 @@ fn refuse_g17_probe(pdev: &platform::Device<Core>) -> Error {
 
     dev_info!(
         pdev.as_ref(),
-        "Matched captured T6050/G17S GPU identity; grounded init-data and RTKit codecs are diagnostic-only\n"
+        "G17 identity decoded; grounded init-data and RTKit codecs are diagnostic-only\n"
     );
     dev_err!(
         pdev.as_ref(),
@@ -194,6 +328,8 @@ fn refuse_g17_probe(pdev: &platform::Device<Core>) -> Error {
         );
     }
     if missing.contains(g17_boot::missing::TOPOLOGY_REGISTERS) {
+        // Cannot fire while regs.rs wires the proven G14X-family bank for
+        // AGX3; kept for the case where that evidence is ever withdrawn.
         dev_err!(
             pdev.as_ref(),
             "G17 preflight: G17 core-mask register bank is not proven\n"
@@ -259,7 +395,7 @@ impl platform::Driver for AsahiDriver {
 
         let cfg = match info.ok_or(ENODEV)? {
             ProbeConfig::Supported(cfg) => *cfg,
-            ProbeConfig::T6050G17S => return Err(refuse_g17_probe(pdev)),
+            ProbeConfig::Agx3Diagnostic(soc) => return Err(refuse_agx3_probe(pdev, soc)),
         };
 
         // G17 requires two physical ASC roles with distinct transports and
