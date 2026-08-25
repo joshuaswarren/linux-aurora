@@ -25,6 +25,7 @@ use crate::{
     file,
     g15_boot,
     g17_boot,
+    g17_firmware,
     gem::AsahiObject,
     gpu,
     hw,
@@ -251,6 +252,35 @@ fn refuse_agx3_probe(pdev: &platform::Device<Core>, soc: &'static hw::agx3::SocC
         soc.uat_oas
     );
 
+    // The G17S loaded-firmware handoff is reserved memory, not GPU MMIO. It
+    // must be mapped and hashed before touching the SGX register aperture so
+    // firmware identity can never be inferred from a powered or partially
+    // initialized GPU. Other G17 variants never consume these G17S carveouts.
+    // This token grants identity only.
+    let loaded_g17_firmware = if expected.gpu_gen == hw::GpuGen::G17
+        && expected.gpu_variant == identity::GpuVariant::S
+    {
+        match g17_firmware::admit_g17_loaded_pair_from_handoff(expected.gpu_variant as u32 as u8) {
+            Ok(admission) => {
+                dev_info!(
+                    pdev.as_ref(),
+                    "G17: exact versioned GFX/GFX1 loaded-segment identity admitted before SGX MMIO\n"
+                );
+                Some(admission)
+            }
+            Err(e) => {
+                dev_err!(
+                    pdev.as_ref(),
+                    "G17S: loaded-segment firmware identity rejected; refusing before SGX MMIO: {:?}\n",
+                    e
+                );
+                return ENODEV;
+            }
+        }
+    } else {
+        None
+    };
+
     match regs::Resources::new(pdev) {
         Ok(res) => match res.get_gpu_id() {
             Ok(id) => {
@@ -287,7 +317,9 @@ fn refuse_agx3_probe(pdev: &platform::Device<Core>, soc: &'static hw::agx3::SocC
 
     match expected.gpu_gen {
         hw::GpuGen::G15 => refuse_g15_probe(pdev),
-        hw::GpuGen::G17 => refuse_g17_probe(pdev),
+        hw::GpuGen::G17 => {
+            refuse_g17_probe(pdev, expected.gpu_variant, loaded_g17_firmware.as_ref())
+        }
         gen => {
             dev_err!(
                 pdev.as_ref(),
@@ -361,8 +393,21 @@ fn refuse_g15_probe(pdev: &platform::Device<Core>) -> Error {
     ENODEV
 }
 
-fn refuse_g17_probe(pdev: &platform::Device<Core>) -> Error {
-    let Err(missing) = g17_boot::pre_handoff_gate(hw::GpuGen::G17 as u32) else {
+fn refuse_g17_probe(
+    pdev: &platform::Device<Core>,
+    gpu_variant: identity::GpuVariant,
+    firmware: Option<&g17_firmware::G17FirmwareIdentityAdmission>,
+) -> Error {
+    let gate = if gpu_variant == identity::GpuVariant::S {
+        g17_boot::pre_handoff_gate_with_identity(
+            hw::GpuGen::G17 as u32,
+            g17_boot::G17FirmwareVariant::G17S,
+            firmware,
+        )
+    } else {
+        g17_boot::pre_handoff_gate(hw::GpuGen::G17 as u32)
+    };
+    let Err(missing) = gate else {
         dev_err!(
             pdev.as_ref(),
             "G17 diagnostic target remained selected after its preflight opened\n"
@@ -374,15 +419,35 @@ fn refuse_g17_probe(pdev: &platform::Device<Core>) -> Error {
         pdev.as_ref(),
         "G17 identity decoded; grounded init-data and RTKit codecs are diagnostic-only\n"
     );
+    if firmware.is_some() {
+        let Err(default_missing) = g17_boot::pre_handoff_gate(hw::GpuGen::G17 as u32) else {
+            dev_err!(
+                pdev.as_ref(),
+                "G17: default pre-handoff unexpectedly opened\n"
+            );
+            return EINVAL;
+        };
+        if missing.bits() != default_missing.bits() & !g17_boot::missing::FIRMWARE_IDENTITY {
+            dev_err!(
+                pdev.as_ref(),
+                "G17: loaded-firmware admission changed a non-identity gate; refusing\n"
+            );
+            return EINVAL;
+        }
+        dev_info!(
+            pdev.as_ref(),
+            "G17: loaded GFX/GFX1 evidence cleared only the firmware-identity bit; all execution gates remain closed\n"
+        );
+    }
     dev_err!(
         pdev.as_ref(),
-        "G17 preflight missing evidence {:#x}; refusing before DMA setup, MMIO mapping, UAT ownership, or GFX/GFX1 ASC start\n",
+        "G17 preflight missing evidence {:#x}; refusing before DMA setup, any MMIO write, UAT ownership, or GFX/GFX1 ASC start\n",
         missing.bits()
     );
     if missing.contains(g17_boot::missing::FIRMWARE_IDENTITY) {
         dev_err!(
             pdev.as_ref(),
-            "G17 preflight: strict paired FTAB/Mach-O identity admission is implemented, but authoritative iBoot/m1n1 role-image observation is not wired\n"
+            "G17 preflight: no exact versioned m1n1 loaded-segment GFX/GFX1 identity was admitted\n"
         );
     }
     if missing.contains(g17_boot::missing::ROLE_RESOURCES) {

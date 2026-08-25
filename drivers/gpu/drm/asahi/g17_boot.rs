@@ -147,10 +147,10 @@ pub(crate) const fn pre_handoff_gate(gpu_generation: u32) -> Result<(), MissingE
 
 /// Apply the pre-handoff gate with an optional byte-validated role pair.
 ///
-/// Current probe code intentionally calls [`pre_handoff_gate`] because the
-/// authoritative iBoot/m1n1 role-image handoff is not connected yet. This
-/// seam prevents a static expected-identity lookup or unrelated firmware file
-/// from clearing the bit.
+/// The diagnostic G17S probe supplies the opaque result of the exact versioned
+/// m1n1 loaded-segment handoff validator here. Other variants remain on
+/// [`pre_handoff_gate`]. This seam prevents a static expected-identity lookup
+/// or unrelated firmware file from clearing the bit.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const fn pre_handoff_gate_with_identity(
     gpu_generation: u32,
