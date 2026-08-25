@@ -328,9 +328,10 @@ config BT_HCIMT79XX_PCIE
 	  The independent apple_attach parameter replays Apple's MT793b
 	  pre-firmware companion attach so it can be tested alongside MT7932 Wi-Fi:
 	  64-bit DMA, PCI bus mastering, one non-shared MSI vector, config 0x48c,
-	  transport remap, and IPC allocation. Used alone, it stops before context
-	  publication, Bluetooth firmware, and HCI registration. With gate=4..8, it
-	  continues through the selected firmware, IPC, rings, HCI, and radio stages.
+	  the remapped core-ID read, transport remap, and IPC allocation. Used alone,
+	  it stops before context publication, Bluetooth firmware, and HCI
+	  registration. With gate=4..8, it continues through the selected firmware,
+	  IPC, rings, HCI, and radio stages.
 	  A second explicit development parameter compiles the recovered bounded
 	  firmware DMA/semaphore sequence for later staged validation; it remains
 	  off by default and does not publish the IPC context or register HCI.
