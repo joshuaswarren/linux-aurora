@@ -12,10 +12,13 @@
 //! [`agx_power_recovery`] module.
 
 #[cfg(not(test))]
-use crate::{agx_power_recovery, g17_initdata, g17_rtkit, g17_submission};
+use crate::{agx_power_recovery, g17_firmware, g17_initdata, g17_rtkit, g17_submission};
 #[cfg(test)]
 #[path = "agx_power_recovery.rs"]
 mod agx_power_recovery;
+#[cfg(test)]
+#[path = "g17_firmware.rs"]
+mod g17_firmware;
 #[cfg(test)]
 #[path = "g17_initdata.rs"]
 mod g17_initdata;
@@ -77,8 +80,20 @@ impl MissingEvidence {
 /// families 0x7/0x8/0xa/0xb with this bank.
 pub(crate) const AGX3_TOPOLOGY_REGISTERS_IMPLEMENTED: bool = true;
 
-const fn implemented_pre_handoff_evidence() -> u16 {
+const fn implemented_pre_handoff_evidence(
+    expected_variant: Option<G17FirmwareVariant>,
+    firmware: Option<&g17_firmware::G17FirmwareIdentityAdmission>,
+) -> u16 {
     let mut implemented = 0;
+
+    // Only the opaque result of atomic GFX/GFX1 byte validation may satisfy
+    // firmware identity. Selecting the expected static table is insufficient,
+    // and an admission for one GPU variant cannot satisfy another variant.
+    if let (Some(expected), Some(admission)) = (expected_variant, firmware) {
+        if expected as u8 == admission.variant() as u8 {
+            implemented |= missing::FIRMWARE_IDENTITY;
+        }
+    }
 
     // These constants deliberately distinguish useful offline codecs from an
     // executable firmware ABI. When either module becomes complete, this gate
@@ -127,11 +142,35 @@ const fn implemented_pre_handoff_evidence() -> u16 {
 /// Older, already-supported generations do not use this gate. The caller maps
 /// an error to `ENODEV` before MMIO initialization or firmware CPU startup.
 pub(crate) const fn pre_handoff_gate(gpu_generation: u32) -> Result<(), MissingEvidence> {
+    apply_pre_handoff_gate(gpu_generation, None, None)
+}
+
+/// Apply the pre-handoff gate with an optional byte-validated role pair.
+///
+/// Current probe code intentionally calls [`pre_handoff_gate`] because the
+/// authoritative iBoot/m1n1 role-image handoff is not connected yet. This
+/// seam prevents a static expected-identity lookup or unrelated firmware file
+/// from clearing the bit.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const fn pre_handoff_gate_with_identity(
+    gpu_generation: u32,
+    expected_variant: G17FirmwareVariant,
+    firmware: Option<&g17_firmware::G17FirmwareIdentityAdmission>,
+) -> Result<(), MissingEvidence> {
+    apply_pre_handoff_gate(gpu_generation, Some(expected_variant), firmware)
+}
+
+const fn apply_pre_handoff_gate(
+    gpu_generation: u32,
+    expected_variant: Option<G17FirmwareVariant>,
+    firmware: Option<&g17_firmware::G17FirmwareIdentityAdmission>,
+) -> Result<(), MissingEvidence> {
     if gpu_generation != G17_GENERATION {
         return Ok(());
     }
 
-    let missing_bits = REQUIRED_PRE_HANDOFF_EVIDENCE & !implemented_pre_handoff_evidence();
+    let missing_bits = REQUIRED_PRE_HANDOFF_EVIDENCE
+        & !implemented_pre_handoff_evidence(expected_variant, firmware);
     if missing_bits == 0 {
         Ok(())
     } else {
@@ -183,6 +222,7 @@ pub(crate) const fn decode_g17_firmware_variant(
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct G17NestedFirmwareIdentity {
     pub(crate) entry_tag: [u8; 4],
+    pub(crate) size: u32,
     pub(crate) uuid: [u8; 16],
     pub(crate) sha256: [u8; 32],
 }
@@ -190,6 +230,7 @@ pub(crate) struct G17NestedFirmwareIdentity {
 #[cfg_attr(not(test), allow(dead_code))]
 const G17S_GFX_FIRMWARE_IDENTITY: G17NestedFirmwareIdentity = G17NestedFirmwareIdentity {
     entry_tag: *b"a010",
+    size: 0x11_9a90,
     uuid: [
         0x05, 0x23, 0x65, 0x20, 0x33, 0xf1, 0x3d, 0x41, 0x83, 0xcb, 0x16, 0x9f, 0xaa, 0xad, 0xbc,
         0xa7,
@@ -204,6 +245,7 @@ const G17S_GFX_FIRMWARE_IDENTITY: G17NestedFirmwareIdentity = G17NestedFirmwareI
 #[cfg_attr(not(test), allow(dead_code))]
 const G17C_GFX_FIRMWARE_IDENTITY: G17NestedFirmwareIdentity = G17NestedFirmwareIdentity {
     entry_tag: *b"a000",
+    size: 0x11_9a90,
     uuid: [
         0x21, 0xa1, 0x77, 0xa0, 0xc2, 0x7b, 0x30, 0x59, 0xa3, 0xb0, 0x05, 0x6c, 0xdd, 0xac, 0x65,
         0x8b,
@@ -218,6 +260,7 @@ const G17C_GFX_FIRMWARE_IDENTITY: G17NestedFirmwareIdentity = G17NestedFirmwareI
 #[cfg_attr(not(test), allow(dead_code))]
 const G17S_GFX1_FIRMWARE_IDENTITY: G17NestedFirmwareIdentity = G17NestedFirmwareIdentity {
     entry_tag: *b"a010",
+    size: 0x11_5aa8,
     uuid: [
         0x0e, 0x98, 0xaf, 0xb8, 0x06, 0x80, 0x3b, 0x15, 0x93, 0x2e, 0x91, 0x0d, 0x0a, 0x1c, 0xcd,
         0x78,
@@ -232,6 +275,7 @@ const G17S_GFX1_FIRMWARE_IDENTITY: G17NestedFirmwareIdentity = G17NestedFirmware
 #[cfg_attr(not(test), allow(dead_code))]
 const G17C_GFX1_FIRMWARE_IDENTITY: G17NestedFirmwareIdentity = G17NestedFirmwareIdentity {
     entry_tag: *b"a000",
+    size: 0x11_5aa8,
     uuid: [
         0xfe, 0xb8, 0x1f, 0x4a, 0xf0, 0x75, 0x34, 0x49, 0xa6, 0x62, 0x3c, 0x01, 0xc0, 0x99, 0x4b,
         0x4f,
@@ -986,6 +1030,14 @@ mod tests {
             let g17c = g17_nested_firmware_identity(role, G17FirmwareVariant::G17C);
             assert_eq!(g17s.entry_tag, *b"a010");
             assert_eq!(g17c.entry_tag, *b"a000");
+            assert_eq!(g17s.size, g17c.size);
+            assert_eq!(
+                g17s.size,
+                match role {
+                    FirmwareRole::Gfx => 0x11_9a90,
+                    FirmwareRole::Gfx1 => 0x11_5aa8,
+                }
+            );
             assert_ne!(g17s.uuid, g17c.uuid);
             assert_ne!(g17s.sha256, g17c.sha256);
             assert!(validate_g17_nested_firmware_identity(
@@ -1030,6 +1082,41 @@ mod tests {
 
         let missing = pre_handoff_gate(G17_GENERATION).unwrap_err();
         assert!(missing.contains(missing::FIRMWARE_IDENTITY));
+    }
+
+    #[test]
+    fn only_an_atomic_pair_admission_clears_firmware_identity() {
+        let default_missing = pre_handoff_gate(G17_GENERATION).unwrap_err();
+        assert!(default_missing.contains(missing::FIRMWARE_IDENTITY));
+
+        for variant in [G17FirmwareVariant::G17S, G17FirmwareVariant::G17C] {
+            let admission = g17_firmware::G17FirmwareIdentityAdmission::test_only(variant);
+            assert_eq!(admission.variant(), variant);
+            let admitted =
+                pre_handoff_gate_with_identity(G17_GENERATION, variant, Some(&admission))
+                    .unwrap_err();
+            assert!(!admitted.contains(missing::FIRMWARE_IDENTITY));
+            assert_eq!(
+                admitted.bits(),
+                default_missing.bits() & !missing::FIRMWARE_IDENTITY
+            );
+
+            for generation in 13..G17_GENERATION {
+                assert!(
+                    pre_handoff_gate_with_identity(generation, variant, Some(&admission)).is_ok()
+                );
+            }
+
+            let wrong_variant = match variant {
+                G17FirmwareVariant::G17S => G17FirmwareVariant::G17C,
+                G17FirmwareVariant::G17C => G17FirmwareVariant::G17S,
+            };
+            let mismatched =
+                pre_handoff_gate_with_identity(G17_GENERATION, wrong_variant, Some(&admission))
+                    .unwrap_err();
+            assert!(mismatched.contains(missing::FIRMWARE_IDENTITY));
+            assert_eq!(mismatched.bits(), default_missing.bits());
+        }
     }
 
     #[test]
