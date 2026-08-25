@@ -9,13 +9,14 @@
 //! wire form that hands a compiled command buffer to the firmware for
 //! execution. It allocates no memory, starts no ASC, sends no mailbox message,
 //! and touches no MMIO. It models the EP 0x21 work-submission doorbell, the
-//! channel/work-queue ring producer indices, and the SKSM kick word/record plus
-//! host queue-timestamp producer the firmware consumes. The provenance ledger
+//! channel/work-queue ring producer indices, the SKSM kick word/record, and the
+//! host queue-timestamp plus `addKicks` MMIO producer. The provenance ledger
 //! explicitly separates byte-grounded G17 fields from inherited producer
 //! records whose G17 consumer offsets still need first-hand confirmation.
 //!
 //! Grounding is first-hand from the on-disk M5 role macho `GFX.a010.macho`
-//! (`g17s a0, SKSM Enabled`). Addresses are firmware VAs
+//! (`g17s a0, SKSM Enabled`) and the pinned G17P/G17G/G17X host-kext
+//! `KSMKickQueue::addKicks` implementations. Firmware addresses are VAs
 //! (0xfffffc0000000000 + fileoff - 0x4000). See
 //! `research/gpu/GPU_AGX3_G17_SUBMISSION_2026-08-25.md`.
 //!
@@ -24,9 +25,10 @@
 //! and cited; [`EXECUTABLE_SUBMISSION_TRANSPORT_AVAILABLE`] states whether a
 //! submission can be driven to completion offline. It is `false`: the SKSM
 //! completion path is a hardware kick FIFO the firmware reads through indexed
-//! MMIO scratch registers whose addresses live in the host kext / silicon, not
-//! in the firmware image, and the doorbell round-trip + completion IRQ can only
-//! be confirmed on a live M5. See [`SUBMISSION_LIVE_GAPS`].
+//! MMIO scratch registers. The host publication form is grounded, but its live
+//! aperture values, silicon bridge to the firmware scratch consumer, round
+//! trip, and completion IRQ can only be confirmed on-device. See
+//! [`SUBMISSION_LIVE_GAPS`].
 
 /// The submission producer subset is byte-grounded against the M5 firmware.
 /// See [`SUBMISSION_ABI_LEDGER`] for the inherited, still-unconfirmed pieces.
@@ -108,6 +110,8 @@ pub(crate) enum SubmissionError {
     KickEntryStrideZero,
     /// Multiplying the slot by the runtime entry stride overflowed u32.
     KickEntryOffsetOverflow,
+    /// The runtime MMIO aperture selector or base offset overflowed u32.
+    KickMmioOffsetOverflow,
     /// A ring with zero entries cannot advance a producer index.
     RingSizeZero,
     /// A producer index must identify an entry inside its ring.
@@ -331,8 +335,8 @@ pub(crate) struct KickTimestamp {
 ///
 /// The caller must still encode the complete target-specific entry, execute
 /// the recovered `dmb ish`, update the submitted counter, and perform the live
-/// MMIO/doorbell operation. This structure only makes the entry selection,
-/// doorbell timestamp, and next producer timestamp indivisible.
+/// target-specific `addKicks` MMIO publication. This structure only makes the
+/// entry selection, queue identity, and next producer timestamp indivisible.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct PreparedKickSubmission {
     /// Slot selected from the current timestamp's low byte.
@@ -341,8 +345,8 @@ pub(crate) struct PreparedKickSubmission {
     pub(crate) entry_offset: u32,
     /// Current 40-bit timestamp consumed by this entry.
     pub(crate) timestamp: u64,
-    /// `timestamp | (queue_id << 40)`, sent only after publication barriers.
-    pub(crate) doorbell_word: u64,
+    /// Queue whose target-specific `addKicks` tag must be published later.
+    pub(crate) queue_id: u8,
     /// Timestamp stored at queue +0x48 for the following submission.
     pub(crate) next_timestamp: u64,
 }
@@ -400,10 +404,9 @@ pub(crate) const fn prepare_kick_submission(
     }
     let entry_offset = index * entry_stride;
 
-    let doorbell_word = match encode_kick_word(current_timestamp, queue_id) {
-        Ok(word) => word,
-        Err(err) => return Err(err),
-    };
+    if queue_id > KICK_QID_MASK as u8 {
+        return Err(SubmissionError::QueueIdOutOfRange);
+    }
 
     let next_index = ((current.stamp_index as u16 + 1) % num_stamps) as u8;
     let next_stamp = if next_index == 0 {
@@ -420,13 +423,106 @@ pub(crate) const fn prepare_kick_submission(
         entry_index: current.stamp_index,
         entry_offset,
         timestamp: current_timestamp,
-        doorbell_word,
+        queue_id,
         next_timestamp,
     })
 }
 
 // ---------------------------------------------------------------------------
-// 6. Command types at command offset 0. These are inherited from AGX2
+// 6. Host addKicks MMIO publication (AGX3-specific).
+//
+//    The host does not write the firmware-side `timestamp | (qid << 40)` word
+//    directly.  The pinned G17P/G17G/G17X implementations publish a
+//    target-specific 64-bit queue tag followed by the 32-bit add count to two
+//    runtime-selected aperture offsets.  The runtime bank selector is
+//    multiplied by nine for every target.  This is a pure description of the
+//    two ordered stores; it performs no MMIO.
+// ---------------------------------------------------------------------------
+
+/// Host producer family with an independently recovered `addKicks` tag.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum SksmAddKicksTarget {
+    /// A18 Pro / HAL200 (`AGXKSMKickQueueG16`).
+    G17P,
+    /// M5 / HAL300 G target.
+    G17G,
+    /// M5 Pro/Max HAL300 X-family target (G17S/G17C host implementation).
+    G17X,
+}
+
+/// Runtime aperture geometry loaded by Apple's host immediately before the
+/// two publication stores.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct SksmAddKicksMmioGeometry {
+    pub(crate) tag_offset_base: u32,
+    pub(crate) count_offset_base: u32,
+    pub(crate) aperture_index: u32,
+}
+
+/// Exact ordered values and offsets for one host `addKicks` publication.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct PreparedSksmAddKicksMmio {
+    /// First store: 64-bit target tag to `tag_offset`.
+    pub(crate) tag_offset: u32,
+    pub(crate) tag: u64,
+    /// Second store: 32-bit number of newly published kicks.
+    pub(crate) count_offset: u32,
+    pub(crate) add_count: u32,
+}
+
+const fn sksm_add_kicks_tag(target: SksmAddKicksTarget, queue_id: u8) -> u64 {
+    match target {
+        // mac17p 0x8a57b28-0x8a57b34: base bit 42, qid at bit 43.
+        SksmAddKicksTarget::G17P => G17P_ADD_KICKS_TAG | ((queue_id as u64) << 43),
+        // mac17g 0x8b91978-0x8b91984: base bit 43, qid at bit 44.
+        SksmAddKicksTarget::G17G => G17G_ADD_KICKS_TAG | ((queue_id as u64) << 44),
+        // mac17j 0x8b53144-0x8b53154: G17G form plus host-family bit 53.
+        SksmAddKicksTarget::G17X => G17X_ADD_KICKS_TAG | ((queue_id as u64) << 44),
+    }
+}
+
+const G17P_ADD_KICKS_TAG: u64 = 0x0000_0400_0002_1018;
+const G17G_ADD_KICKS_TAG: u64 = 0x0000_0800_0002_1018;
+const G17X_ADD_KICKS_TAG: u64 = 0x0020_0800_0002_1018;
+const SKSM_ADD_KICKS_APERTURE_SCALE: u32 = 9;
+
+/// Prepare the host's two ordered MMIO stores without touching the aperture.
+pub(crate) const fn prepare_sksm_add_kicks_mmio(
+    target: SksmAddKicksTarget,
+    queue_id: u8,
+    add_count: u32,
+    geometry: SksmAddKicksMmioGeometry,
+) -> Result<PreparedSksmAddKicksMmio, SubmissionError> {
+    if queue_id > KICK_QID_MASK as u8 {
+        return Err(SubmissionError::QueueIdOutOfRange);
+    }
+
+    let bank_offset = match geometry
+        .aperture_index
+        .checked_mul(SKSM_ADD_KICKS_APERTURE_SCALE)
+    {
+        Some(offset) => offset,
+        None => return Err(SubmissionError::KickMmioOffsetOverflow),
+    };
+    let tag_offset = match geometry.tag_offset_base.checked_add(bank_offset) {
+        Some(offset) => offset,
+        None => return Err(SubmissionError::KickMmioOffsetOverflow),
+    };
+    let count_offset = match geometry.count_offset_base.checked_add(bank_offset) {
+        Some(offset) => offset,
+        None => return Err(SubmissionError::KickMmioOffsetOverflow),
+    };
+
+    Ok(PreparedSksmAddKicksMmio {
+        tag_offset,
+        tag: sksm_add_kicks_tag(target, queue_id),
+        count_offset,
+        add_count,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 7. Command types at command offset 0. These are inherited from AGX2
 //    `fw/workqueue.rs::CommandType`; the G17 consumer's numeric dispatch has
 //    not yet been grounded first-hand. A KSM completion entry outside its
 //    accepted set aborts with the fatal string at GFX 0xe710, but that string
@@ -445,7 +541,7 @@ pub(crate) enum CommandType {
 }
 
 // ---------------------------------------------------------------------------
-// 7. Provenance ledger + live gaps.
+// 8. Provenance ledger + live gaps.
 // ---------------------------------------------------------------------------
 
 /// How each submission-ABI component was grounded, so reuse-vs-fork is explicit.
@@ -470,6 +566,7 @@ pub(crate) struct SubmissionAbiLedger {
     pub(crate) command_types: AbiProvenance,
     pub(crate) kick_word: AbiProvenance,
     pub(crate) kick_queue_producer: AbiProvenance,
+    pub(crate) host_add_kicks_mmio: AbiProvenance,
     pub(crate) kick_record: AbiProvenance,
 }
 
@@ -488,6 +585,7 @@ pub(crate) const SUBMISSION_ABI_LEDGER: SubmissionAbiLedger = SubmissionAbiLedge
     command_types: AbiProvenance::Agx2InheritedUnconfirmed,
     kick_word: AbiProvenance::ForkedAgx3Grounded,
     kick_queue_producer: AbiProvenance::ForkedAgx3Grounded,
+    host_add_kicks_mmio: AbiProvenance::ForkedAgx3Grounded,
     kick_record: AbiProvenance::ForkedAgx3Grounded,
 };
 
@@ -501,9 +599,9 @@ pub(crate) const CHANNEL_DESCRIPTOR_STRIDE_CONFIRMED: bool = false;
 /// needs a live M5.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct SubmissionLiveGaps {
-    /// The kick word is delivered through an indexed MMIO scratch FIFO
-    /// (`str index,[x13]; ldr [x14]/[x15]` @ 0x10c6c-0x10c88); the register
-    /// addresses are in the host kext / silicon, not the firmware image.
+    /// Host `addKicks` publication and firmware scratch consumption are both
+    /// grounded, but their silicon bridge, live aperture values, and ordering
+    /// against the firmware consumer still need an on-device witness.
     pub(crate) sksm_hardware_kick_fifo_mmio_scratch_proven: bool,
     /// The firmware has both the AGX2 doorbell+ring path and the SKSM kick
     /// FIFO; which one a Linux submission must use on an "SKSM Enabled" build
@@ -633,7 +731,8 @@ mod tests {
         assert_eq!(KICK_QID_MASK, 0x7f);
         assert_eq!(KICK_SELECTOR_BIT, 46);
 
-        // Compose a kick like the host: TS | (QID << 40); QID bit 6 == selector.
+        // Compose the exact word consumed from the firmware scratch FIFO;
+        // QID bit 6 is the mask selector.
         let ts = 0x89_abcd_ef42u64;
         let word = encode_kick_word(ts, 0x7f).unwrap();
         assert_eq!(
@@ -660,7 +759,7 @@ mod tests {
     }
 
     #[test]
-    fn kick_queue_preparation_couples_slot_doorbell_and_next_timestamp() {
+    fn kick_queue_preparation_couples_slot_queue_and_next_timestamp() {
         let timestamp = encode_kick_timestamp(KickTimestamp {
             stamp: 0x1234_5678,
             stamp_index: 7,
@@ -670,15 +769,7 @@ mod tests {
         assert_eq!(prepared.entry_index, 7);
         assert_eq!(prepared.entry_offset, 7 * 0x180);
         assert_eq!(prepared.timestamp, 0x12_3456_7807);
-        assert_eq!(prepared.doorbell_word, 0x2a12_3456_7807);
-        assert_eq!(
-            decode_kick_word(prepared.doorbell_word),
-            Ok(SksmKickWord {
-                timestamp: prepared.timestamp,
-                queue_id: 0x2a,
-                mask_selector: 0,
-            })
-        );
+        assert_eq!(prepared.queue_id, 0x2a);
         assert_eq!(
             decode_kick_timestamp(prepared.next_timestamp),
             Ok(KickTimestamp {
@@ -789,6 +880,90 @@ mod tests {
     }
 
     #[test]
+    fn host_add_kicks_tags_match_all_three_pinned_producers() {
+        let geometry = SksmAddKicksMmioGeometry {
+            tag_offset_base: 0x100,
+            count_offset_base: 0x104,
+            aperture_index: 3,
+        };
+
+        for queue_id in 0u8..=0x7f {
+            let p = prepare_sksm_add_kicks_mmio(SksmAddKicksTarget::G17P, queue_id, 5, geometry)
+                .unwrap();
+            assert_eq!(p.tag, 0x0000_0400_0002_1018 | ((queue_id as u64) << 43));
+            assert_eq!(p.tag_offset, 0x11b);
+            assert_eq!(p.count_offset, 0x11f);
+            assert_eq!(p.add_count, 5);
+
+            let g = prepare_sksm_add_kicks_mmio(
+                SksmAddKicksTarget::G17G,
+                queue_id,
+                0x89ab_cdef,
+                geometry,
+            )
+            .unwrap();
+            assert_eq!(g.tag, 0x0000_0800_0002_1018 | ((queue_id as u64) << 44));
+
+            let x =
+                prepare_sksm_add_kicks_mmio(SksmAddKicksTarget::G17X, queue_id, u32::MAX, geometry)
+                    .unwrap();
+            assert_eq!(x.tag, 0x0020_0800_0002_1018 | ((queue_id as u64) << 44));
+            assert_eq!(x.add_count, u32::MAX);
+        }
+    }
+
+    #[test]
+    fn host_add_kicks_mmio_offsets_fail_closed_on_overflow() {
+        let valid = SksmAddKicksMmioGeometry {
+            tag_offset_base: 0,
+            count_offset_base: 0,
+            aperture_index: u32::MAX / SKSM_ADD_KICKS_APERTURE_SCALE,
+        };
+        let publication =
+            prepare_sksm_add_kicks_mmio(SksmAddKicksTarget::G17G, 0, 1, valid).unwrap();
+        assert_eq!(
+            publication.tag_offset,
+            (u32::MAX / SKSM_ADD_KICKS_APERTURE_SCALE) * SKSM_ADD_KICKS_APERTURE_SCALE
+        );
+
+        assert_eq!(
+            prepare_sksm_add_kicks_mmio(
+                SksmAddKicksTarget::G17P,
+                0x80,
+                1,
+                SksmAddKicksMmioGeometry {
+                    tag_offset_base: 0,
+                    count_offset_base: 4,
+                    aperture_index: 0,
+                },
+            ),
+            Err(SubmissionError::QueueIdOutOfRange)
+        );
+        for geometry in [
+            SksmAddKicksMmioGeometry {
+                tag_offset_base: 0,
+                count_offset_base: 0,
+                aperture_index: u32::MAX / SKSM_ADD_KICKS_APERTURE_SCALE + 1,
+            },
+            SksmAddKicksMmioGeometry {
+                tag_offset_base: u32::MAX,
+                count_offset_base: 0,
+                aperture_index: 1,
+            },
+            SksmAddKicksMmioGeometry {
+                tag_offset_base: 0,
+                count_offset_base: u32::MAX,
+                aperture_index: 1,
+            },
+        ] {
+            assert_eq!(
+                prepare_sksm_add_kicks_mmio(SksmAddKicksTarget::G17X, 0, 1, geometry),
+                Err(SubmissionError::KickMmioOffsetOverflow)
+            );
+        }
+    }
+
+    #[test]
     fn kick_record_table_uses_the_firmware_geometry() {
         // add x2,x22,#0x10 ; add x2,x2,QID,lsl#5 -> base 0x10, stride 0x20.
         assert_eq!(KICK_RECORD_TABLE_BASE, 0x10);
@@ -855,6 +1030,10 @@ mod tests {
         );
         assert_eq!(
             SUBMISSION_ABI_LEDGER.kick_queue_producer,
+            AbiProvenance::ForkedAgx3Grounded
+        );
+        assert_eq!(
+            SUBMISSION_ABI_LEDGER.host_add_kicks_mmio,
             AbiProvenance::ForkedAgx3Grounded
         );
         assert_eq!(
