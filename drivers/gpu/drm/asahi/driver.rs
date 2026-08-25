@@ -23,6 +23,7 @@ use kernel::{
 use crate::{
     debug,
     file,
+    g15_boot,
     g17_boot,
     gem::AsahiObject,
     gpu,
@@ -285,6 +286,7 @@ fn refuse_agx3_probe(pdev: &platform::Device<Core>, soc: &'static hw::agx3::SocC
     }
 
     match expected.gpu_gen {
+        hw::GpuGen::G15 => refuse_g15_probe(pdev),
         hw::GpuGen::G17 => refuse_g17_probe(pdev),
         gen => {
             dev_err!(
@@ -295,6 +297,68 @@ fn refuse_agx3_probe(pdev: &platform::Device<Core>, soc: &'static hw::agx3::SocC
             ENODEV
         }
     }
+}
+
+/// Report the grounded-vs-UNKNOWN state of the single-role G15 (M3) boot, then
+/// fail closed. G15 is the easiest AGX3 target — one `GFX` role, classic
+/// device-control-ring submission — but the firmware image is not on disk and
+/// the init-data/RTKit graph is not boot-complete offline.
+fn refuse_g15_probe(pdev: &platform::Device<Core>) -> Error {
+    let Err(missing) = g15_boot::pre_handoff_gate(hw::GpuGen::G15 as u32) else {
+        dev_err!(
+            pdev.as_ref(),
+            "G15 diagnostic target remained selected after its preflight opened\n"
+        );
+        return EINVAL;
+    };
+
+    dev_info!(
+        pdev.as_ref(),
+        "G15 identity decoded (single-role GFX, classic submission); grounded init-data root and shared RTKit codec are diagnostic-only\n"
+    );
+    dev_err!(
+        pdev.as_ref(),
+        "G15 preflight missing evidence {:#x}; refusing before DMA setup, MMIO mapping, UAT ownership, or GFX ASC start\n",
+        missing.bits()
+    );
+    if missing.contains(g15_boot::missing::FIRMWARE_IMAGE) {
+        dev_err!(
+            pdev.as_ref(),
+            "G15 preflight: the G15 GFX RTKit firmware image and its nested identity are not available offline\n"
+        );
+    }
+    if missing.contains(g15_boot::missing::UAT_HANDOFF) {
+        dev_err!(
+            pdev.as_ref(),
+            "G15 preflight: the dual-TTBR 42-bit UAT/Handoff firmware-shared state is not validated\n"
+        );
+    }
+    if missing.contains(g15_boot::missing::INITDATA_GRAPH) {
+        dev_err!(
+            pdev.as_ref(),
+            "G15 preflight: init-data root and runtime-pointer graph are grounded, but hw_globals and struct sizes are not boot-complete\n"
+        );
+    }
+    if missing.contains(g15_boot::missing::RTKIT_TRANSPORT) {
+        dev_err!(
+            pdev.as_ref(),
+            "G15 preflight: the GPU RTKit codec is grounded but HELLO/EPMAP transmit is unproved\n"
+        );
+    }
+    if missing.contains(g15_boot::missing::INTERFACE_VERSION) {
+        dev_err!(
+            pdev.as_ref(),
+            "G15 preflight: the EP0 RTKit interface version for this firmware/OS build is unknown\n"
+        );
+    }
+    if missing.contains(g15_boot::missing::SUBMISSION_TRANSPORT) {
+        dev_err!(
+            pdev.as_ref(),
+            "G15 preflight: classic register-list submission is not implemented\n"
+        );
+    }
+
+    ENODEV
 }
 
 fn refuse_g17_probe(pdev: &platform::Device<Core>) -> Error {
