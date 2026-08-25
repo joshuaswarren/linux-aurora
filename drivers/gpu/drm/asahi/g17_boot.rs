@@ -12,7 +12,7 @@
 //! [`agx_power_recovery`] module.
 
 #[cfg(not(test))]
-use crate::{agx_power_recovery, g17_initdata, g17_rtkit};
+use crate::{agx_power_recovery, g17_initdata, g17_rtkit, g17_submission};
 #[cfg(test)]
 #[path = "agx_power_recovery.rs"]
 mod agx_power_recovery;
@@ -22,6 +22,9 @@ mod g17_initdata;
 #[cfg(test)]
 #[path = "g17_rtkit.rs"]
 mod g17_rtkit;
+#[cfg(test)]
+#[path = "g17_submission.rs"]
+mod g17_submission;
 
 /// Design generation that requires the dual-role contract.
 const G17_GENERATION: u32 = 17;
@@ -83,6 +86,12 @@ const fn implemented_pre_handoff_evidence() -> u16 {
     if AGX3_TOPOLOGY_REGISTERS_IMPLEMENTED {
         implemented |= missing::TOPOLOGY_REGISTERS;
     }
+    // The per-role resource-ownership contract is byte-grounded, but the
+    // firmware performs no parse-time role check (see FW-3), so Linux cannot
+    // execute the live per-role allocation/mapping from offline evidence.
+    if GROUNDED_ROLE_RESOURCE_OWNERSHIP_AVAILABLE && EXECUTABLE_ROLE_RESOURCES_AVAILABLE {
+        implemented |= missing::ROLE_RESOURCES;
+    }
     if g17_initdata::GROUNDED_LAYOUT_AVAILABLE && g17_initdata::PARSE_ACCEPTED_GRAPH_AVAILABLE {
         implemented |= missing::INITDATA_GRAPH;
     }
@@ -98,6 +107,16 @@ const fn implemented_pre_handoff_evidence() -> u16 {
         && agx_power_recovery::EXECUTABLE_G17_RECOVERY_HANDSHAKE_AVAILABLE
     {
         implemented |= missing::RECOVERY_HANDSHAKE;
+    }
+    // The submission producer subset is byte-grounded (EP 0x21 doorbell
+    // byte-identical to AGX2; SKSM kick word + 0x20-strided kick-record table
+    // forked and cited), but the SKSM hardware kick-FIFO MMIO scratch, the
+    // doorbell round-trip, and the completion IRQ are live-only, so the
+    // transport is not executable offline (see `g17_submission`).
+    if g17_submission::GROUNDED_SUBMISSION_PRODUCER_AVAILABLE
+        && g17_submission::EXECUTABLE_SUBMISSION_TRANSPORT_AVAILABLE
+    {
+        implemented |= missing::SUBMISSION_TRANSPORT;
     }
 
     implemented
@@ -715,6 +734,139 @@ impl DualRoleBoot {
     }
 }
 
+// -------------------------------------------------------------------------
+// ROLE_RESOURCES — per-role firmware resource ownership.
+//
+// Grounded 2026-08-25 by disassembling the on-disk M5 firmware
+// `GFX.a010.macho` / `GFX1.a010.macho` (`otool -tvV`). The three facts below
+// are read first-hand from the bytes; every address is `0xfffffc...`.
+//
+//   FW-1  The init-data parser copies the 0xc8-byte root header into the
+//         firmware global at 0x104890 (`adrp x9, 0xfffffc0000104000 ;
+//         add x9, x9, #0x890` @ 0x212e8-0x212ec, `str q0,[x9]` @ 0x212f0).
+//   FW-2  The *only* parse-time value gate is the host_mapped_allocations
+//         word at root+0x2c = global 0x1048bc (`ldr w9,[x9,#0x2c]` @ 0x2132c;
+//         `cbz w9, abort` @ 0x21330). Already modeled by g17_initdata.
+//   FW-3  The role selector root+0x28 = global 0x1048b8 is written by the
+//         header copy but is **never read** by any GFX firmware code: page
+//         0xfffffc0000104000 is referenced 418 times, none at offset 0x8b8,
+//         and the only two 0x8b8 loads/stores in the image (0x39fe0/0x39fec)
+//         target the unrelated page 0xfffffc0000072000. So the firmware does
+//         **not** self-validate the host-declared role.
+//   FW-4  Role 1 (GFX1) owns a role-specific runtime resource at
+//         runtime_pointers+0x481 (unaligned): the `#0x481` field offset is
+//         referenced 78 times in `GFX1.a010.macho` and 0 times in
+//         `GFX.a010.macho`. Its host allocation size (0x12688) is a host
+//         alloc-table fact, not a firmware constant.
+//
+// Consequence: ROLE_RESOURCES is *not* a firmware parse-time acceptance
+// check. Role identity is intrinsic to which nested image is loaded
+// (a010/a000 per variant), and because the firmware trusts root+0x28 blindly
+// (FW-3), the driver's own validator is the sole boundary that keeps a role
+// from being handed the wrong resource set. The ownership *contract* is
+// groundable and encodable offline; the actual per-role allocation and UAT
+// mapping is live DMA. The gate therefore stays fail-closed:
+// `EXECUTABLE_ROLE_RESOURCES_AVAILABLE = false`.
+// -------------------------------------------------------------------------
+
+/// Firmware global that receives the copied init-data root header (FW-1).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const G17_ROOT_HEADER_FW_GLOBAL: u64 = 0xffff_fc00_0010_4890;
+/// Byte offset of the role selector inside the copied root header (root+0x28).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const G17_ROOT_ROLE_SELECTOR_OFFSET: u32 = 0x28;
+/// Number of times the GFX1-only runtime resource offset (+0x481) is
+/// referenced in each role image: proven role-specific ownership (FW-4).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const G17_GFX1_RUNTIME_RESOURCE_REFS_IN_GFX1: u32 = 78;
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const G17_GFX1_RUNTIME_RESOURCE_REFS_IN_GFX: u32 = 0;
+
+/// The per-role resource-ownership *contract* is byte-grounded and encodable
+/// offline (FW-1..FW-4). This does not assert that the driver has wired the
+/// live allocation/mapping.
+pub(crate) const GROUNDED_ROLE_RESOURCE_OWNERSHIP_AVAILABLE: bool = true;
+/// Whether Linux may execute the per-role resource plumbing. It may not:
+/// there is no firmware parse-time role check to satisfy (FW-3), so the
+/// driver's validator is the safety boundary, and the actual sub-allocation
+/// and UAT mapping is a live DMA activity that cannot be validated from the
+/// machos. A wrong role/resource pairing is silently accepted by the firmware
+/// and only fails as a functional fault a live M5 boot exposes.
+pub(crate) const EXECUTABLE_ROLE_RESOURCES_AVAILABLE: bool = false;
+
+/// Fail-closed per-role resource-ownership description.
+///
+/// Both roles share exactly one GPU/UAT owner ([`SharedGpuUatOwner`]); only
+/// GFX1 owns the runtime resource at runtime_pointers+0x481 (FW-4).
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct RoleResourceOwnership {
+    pub(crate) role: FirmwareRole,
+    /// A non-zero GPU VA for the GFX1-only runtime resource (rt+0x481).
+    /// Required for GFX1, must be zero for GFX.
+    pub(crate) gfx1_runtime_resource: u64,
+}
+
+/// Fail-closed role-resource validation errors.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum RoleResourceError {
+    /// GFX carried a GFX1-only resource, or GFX1 omitted its required one.
+    RoleSpecificResourceViolation,
+    /// A required resource pointer was null.
+    NullRequiredResource,
+    /// The two roles did not resolve to one shared GPU/UAT owner.
+    SharedOwnerAliasViolation,
+}
+
+/// Validate one role's resource ownership, fail-closed.
+///
+/// Because the firmware never self-validates the role (FW-3), this is the only
+/// place a role/resource mismatch is caught before handoff. It refuses a null
+/// required resource and any cross-role resource ownership.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn validate_role_resource_ownership(
+    ownership: &RoleResourceOwnership,
+) -> Result<(), RoleResourceError> {
+    match ownership.role {
+        FirmwareRole::Gfx => {
+            if ownership.gfx1_runtime_resource != 0 {
+                return Err(RoleResourceError::RoleSpecificResourceViolation);
+            }
+        }
+        FirmwareRole::Gfx1 => {
+            if ownership.gfx1_runtime_resource == 0 {
+                return Err(RoleResourceError::NullRequiredResource);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate that the two roles in a boot resolve to one GPU/UAT owner and hold
+/// mutually consistent, role-correct resources, fail-closed.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn validate_dual_role_resources(
+    boot: &DualRoleBoot,
+    ownership: &[RoleResourceOwnership; ROLE_COUNT],
+) -> Result<(), RoleResourceError> {
+    if !core::ptr::eq(
+        boot.owner_for(FirmwareRole::Gfx),
+        boot.owner_for(FirmwareRole::Gfx1),
+    ) {
+        return Err(RoleResourceError::SharedOwnerAliasViolation);
+    }
+    if ownership[FirmwareRole::Gfx.index()].role != FirmwareRole::Gfx
+        || ownership[FirmwareRole::Gfx1.index()].role != FirmwareRole::Gfx1
+    {
+        return Err(RoleResourceError::RoleSpecificResourceViolation);
+    }
+    for one in ownership {
+        validate_role_resource_ownership(one)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1042,7 +1194,8 @@ mod tests {
         // transport (with EP0 owned by the version-12-capable apple-rtkit
         // core). Everything else stays fail-closed pending more offline RE or a
         // live firmware ACK.
-        let grounded = missing::TOPOLOGY_REGISTERS | missing::INITDATA_GRAPH | missing::RTKIT_TRANSPORT;
+        let grounded =
+            missing::TOPOLOGY_REGISTERS | missing::INITDATA_GRAPH | missing::RTKIT_TRANSPORT;
         assert!(AGX3_TOPOLOGY_REGISTERS_IMPLEMENTED);
         for evidence in [
             missing::TOPOLOGY_REGISTERS,
@@ -1097,5 +1250,115 @@ mod tests {
         );
         assert!(!agx_power_recovery::EXECUTABLE_GFX1_POWER_SEQUENCE_AVAILABLE);
         assert!(!agx_power_recovery::EXECUTABLE_G17_RECOVERY_HANDSHAKE_AVAILABLE);
+        // ROLE_RESOURCES: the ownership contract is grounded, but there is no
+        // firmware parse-time role check to satisfy, so it stays fail-closed.
+        assert!(GROUNDED_ROLE_RESOURCE_OWNERSHIP_AVAILABLE);
+        assert!(!EXECUTABLE_ROLE_RESOURCES_AVAILABLE);
+    }
+
+    #[test]
+    fn role_resource_ownership_fails_closed_on_cross_role_and_null() {
+        // Byte-grounded asymmetry: only GFX1 references the +0x481 resource.
+        assert_eq!(G17_GFX1_RUNTIME_RESOURCE_REFS_IN_GFX, 0);
+        assert_eq!(G17_GFX1_RUNTIME_RESOURCE_REFS_IN_GFX1, 78);
+        assert_eq!(G17_ROOT_ROLE_SELECTOR_OFFSET, 0x28);
+        assert_eq!(G17_ROOT_HEADER_FW_GLOBAL, 0xffff_fc00_0010_4890);
+
+        // GFX must not own the GFX1-only resource.
+        assert_eq!(
+            validate_role_resource_ownership(&RoleResourceOwnership {
+                role: FirmwareRole::Gfx,
+                gfx1_runtime_resource: 0x1000,
+            }),
+            Err(RoleResourceError::RoleSpecificResourceViolation)
+        );
+        // GFX1 must have a non-null resource.
+        assert_eq!(
+            validate_role_resource_ownership(&RoleResourceOwnership {
+                role: FirmwareRole::Gfx1,
+                gfx1_runtime_resource: 0,
+            }),
+            Err(RoleResourceError::NullRequiredResource)
+        );
+        // The correct pairing validates.
+        assert!(validate_role_resource_ownership(&RoleResourceOwnership {
+            role: FirmwareRole::Gfx,
+            gfx1_runtime_resource: 0,
+        })
+        .is_ok());
+        assert!(validate_role_resource_ownership(&RoleResourceOwnership {
+            role: FirmwareRole::Gfx1,
+            gfx1_runtime_resource: 0x2000,
+        })
+        .is_ok());
+    }
+
+    #[test]
+    fn dual_role_resources_require_one_owner_and_role_correct_sets() {
+        let boot = DualRoleBoot::new();
+        let good = [
+            RoleResourceOwnership {
+                role: FirmwareRole::Gfx,
+                gfx1_runtime_resource: 0,
+            },
+            RoleResourceOwnership {
+                role: FirmwareRole::Gfx1,
+                gfx1_runtime_resource: 0x3000,
+            },
+        ];
+        assert!(validate_dual_role_resources(&boot, &good).is_ok());
+
+        // Swapped roles fail closed.
+        let swapped = [good[1], good[0]];
+        assert_eq!(
+            validate_dual_role_resources(&boot, &swapped),
+            Err(RoleResourceError::RoleSpecificResourceViolation)
+        );
+
+        // The gate branch never sets ROLE_RESOURCES while it is non-executable.
+        let missing = pre_handoff_gate(17).unwrap_err();
+        assert!(missing.contains(missing::ROLE_RESOURCES));
+    }
+
+    #[test]
+    fn submission_transport_is_grounded_but_stays_fail_closed() {
+        // The producer subset is real (doorbell byte-identical to AGX2, SKSM
+        // kick word + record forked and cited), but not executable offline.
+        assert!(g17_submission::GROUNDED_SUBMISSION_PRODUCER_AVAILABLE);
+        assert!(!g17_submission::EXECUTABLE_SUBMISSION_TRANSPORT_AVAILABLE);
+        assert!(!g17_submission::SUBMISSION_LIVE_GAPS.all_proven());
+        // The gate branch never sets SUBMISSION_TRANSPORT while it is
+        // non-executable; the boot as a whole stays refused.
+        let missing = pre_handoff_gate(17).unwrap_err();
+        assert!(missing.contains(missing::SUBMISSION_TRANSPORT));
+    }
+
+    #[test]
+    fn submission_kick_constants_do_not_drift_from_the_rtkit_codec() {
+        // Both modules cite the same firmware kick-word/record bytes; assert
+        // they agree through the public API so a future edit to one cannot
+        // silently diverge. The record table geometry must match
+        // g17_rtkit::kick_queue_record_offset exactly.
+        for qid in [0u8, 1, 0x7f] {
+            assert_eq!(
+                g17_submission::kick_record_offset(qid).unwrap(),
+                g17_rtkit::kick_queue_record_offset(qid).unwrap()
+            );
+        }
+        assert_eq!(
+            g17_submission::kick_record_offset(0x80),
+            Err(g17_submission::SubmissionError::QueueIdOutOfRange)
+        );
+        // The decoded kick word agrees field-for-field with KickWord.
+        let word = g17_rtkit::KickWord::encode(0x7f, 0x89ab_cdef, 0x42).unwrap();
+        assert_eq!(
+            g17_submission::encode_kick_word(0x89_abcd_ef42, 0x7f).unwrap(),
+            word
+        );
+        let via_submission = g17_submission::decode_kick_word(word).unwrap();
+        let via_rtkit = g17_rtkit::KickWord::decode_strict(word).unwrap();
+        assert_eq!(via_submission.timestamp, via_rtkit.timestamp);
+        assert_eq!(via_submission.queue_id, via_rtkit.queue_id);
+        assert_eq!(via_submission.mask_selector, via_rtkit.mask_selector);
     }
 }
