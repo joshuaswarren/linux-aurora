@@ -545,28 +545,48 @@ static int avd_h264_alloc_bufs(struct avd_ctx *ctx)
 		}
 	}
 
-	/* TODO: VERY ugly
-	 * Does it actually need this much?
-	 * */
-	for (int i = 0; i < 5; i++) {
-		u32 mul = fmt_width(ctx) / 16;
-		u32 size = i == 0 ? 0x20000 :
-			   i == 1 ? (16 + 8 + 8) * mul :
-			   i == 2 ? ctx->decoded_fmt.fmt.pix_mp.plane_fmt[0]
-							    .bytesperline >
-						    2048 ?
-				    0xc000 :
-				    (64 + 1 * 32 + 1 * 32) * mul :
-				    32 * mul;
-		ret = avd_buf_alloc(dev, &h264_ctx->bufs.pps_tile[i],
-				    max(size, 0x8000));
-		if (ret) {
-			dev_err(dev->dev, "pps[%d] alloc failed\n", i);
-			return ret;
-		}
-	}
+	mb = DIV_ROUND_UP(w, 16);
+
+	ret = avd_buf_alloc(dev, &h264_ctx->bufs.pps_tile[0], mb * 20);
+	if (ret)
+		return ret;
+
+	ret = avd_buf_alloc(dev, &h264_ctx->bufs.pps_tile[1],
+			    bit_depth * 4 * mb);
+	if (ret)
+		return ret;
+
+	ret = avd_buf_alloc(dev, &h264_ctx->bufs.pps_tile[2],
+			    bit_depth * 4 * 4 * mb);
+	if (ret)
+		return ret;
+
+	ret = avd_buf_alloc(dev, &h264_ctx->bufs.pps_tile[3], 32 * mb);
+	if (ret)
+		return ret;
+
+	ret = avd_buf_alloc(dev, &h264_ctx->bufs.pps_tile[4], 32 * mb);
+	if (ret)
+		return ret;
 
 	return 0;
+}
+
+static void avd_h264_free_bufs(struct avd_ctx *ctx)
+{
+	struct avd_h264_ctx *h264_ctx = ctx->priv;
+	struct avd_dev *dev = ctx->dev;
+
+	if (!h264_ctx)
+		return;
+
+	avd_buf_free(dev, &h264_ctx->bufs.pipe_state);
+	avd_buf_free(dev, &h264_ctx->bufs.inst);
+
+	for (int i = 0; i < 5; i++)
+		avd_buf_free(dev, &h264_ctx->bufs.pps_tile[i]);
+
+	kfree(h264_ctx);
 }
 
 static int avd_h264_validate_pps(struct avd_ctx *ctx,
