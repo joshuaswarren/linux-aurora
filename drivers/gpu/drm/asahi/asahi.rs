@@ -5,6 +5,7 @@
 
 mod agx_power_recovery;
 mod alloc;
+mod apple_gpu_topology;
 mod buffer;
 mod channel;
 #[cfg(CONFIG_DEV_COREDUMP)]
