@@ -15,9 +15,10 @@
 //! `AGXUncachedFWChannelMem`. The provenance ledger explicitly separates
 //! byte-grounded G17 fields from inherited producer records whose G17 consumer
 //! offsets still need first-hand confirmation. The native G17 channel-command
-//! dispatcher is also modeled: it reads the tag at command offset zero, uses
-//! an AGX3-specific accepted set through tag 18, and assigns tag 6 to the
-//! SKSM-forbidden PM-rebuild command rather than AGX2's init-buffer command.
+//! dispatcher is also modeled for the exact A18 Pro/G17P identity: it reads a
+//! little-endian u32 tag at command offset zero, keeps unresolved and nested
+//! SKU meanings out of the top-level enum, and separates the host's `Nop=17`
+//! name from the firmware's fatal rejection of that value.
 //!
 //! Grounding is first-hand from the on-disk M5 role macho `GFX.a010.macho`
 //! (`g17s a0, SKSM Enabled`), all three pinned A18 Pro `g17p` firmware variants
@@ -129,6 +130,16 @@ pub(crate) enum SubmissionError {
     ChannelPriorityOutOfRange,
     /// This native channel layout is not grounded for the selected identity.
     ChannelAbiUnconfirmed,
+    /// The top-level channel-command tag ABI is not grounded for this target.
+    CommandAbiUnconfirmed,
+    /// A top-level channel command must expose its complete four-byte tag.
+    CommandHeaderTooShort,
+    /// The host/firmware meaning of this in-range top-level tag is unresolved.
+    CommandTagUnresolved,
+    /// This value is not a grounded G17P top-level command tag.
+    CommandTagInvalid,
+    /// The host names this tag, but the matched firmware rejects it fatally.
+    CommandTagRejectedByFirmware,
 }
 
 /// Encode a work-submission doorbell exactly as `gpu.rs::run_job` does:
@@ -405,7 +416,7 @@ pub(crate) fn apply_g17_uncached_channel_reset(
 //     +0x60. This is not AGX2's read@0/write@0x20 `ChannelState`.
 // ---------------------------------------------------------------------------
 
-/// Silicon/host identity used to admit a native G17 channel-state ABI.
+/// Silicon/host identity used to admit native G17 submission ABIs.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum G17ChannelAbiTarget {
     /// A18 Pro: G17P host and `g17p` firmware.
@@ -939,73 +950,210 @@ pub(crate) const fn prepare_sksm_add_kicks_mmio(
 }
 
 // ---------------------------------------------------------------------------
-// 7. Native G17 channel-command dispatch.
+// 7. A18 Pro / G17P top-level channel-command dispatch.
 //
-//    Grounded first-hand from `agfaProcessChannelCommand` at GFX
-//    0xfffffc00000122c0-0xfffffc0000012364 and its 19-entry jump table at
-//    0xfffffc0000013654. The firmware validates at least four bytes, loads the
-//    u32 tag from command offset zero, rejects tags above 18, and dispatches
-//    the exact set below. Tags 8/10/11/13/17 share the invalid-command fatal
-//    path at 0x13610. Tag 6 reaches the dedicated
-//    `kAGFIChannelCommandTypePMRebuild must not be received in SKSM` fatal at
-//    0x135f4. Therefore AGX2's `InitBuffer = 6` must not be reused on G17.
+//    This ABI is deliberately identity-scoped, just like §2c. The pinned G17P
+//    host grounds the top-level names below through its command-request and
+//    submit paths. The matching a000 firmware dispatcher is
+//    `agfaProcessChannelCommand` at 0xfffffc0000010fa8 with the 19-entry table
+//    at 0xfffffc000001233c. The b000/b100 dispatcher starts at
+//    0xfffffc0000010f14 and uses the byte-identical table at
+//    0xfffffc00000122a8.
 //
-//    The optional pre-dispatch filter at 0x12318-0x12338 uses literal mask
-//    0x1d03f for tags <= 16. Its accepted set is exposed separately so a
-//    future live producer can preserve that gate instead of conflating it
-//    with the complete jump-table dispatch.
+//    All three firmware variants validate at least four bytes, load a u32 tag
+//    from command offset zero, and reject tags above 18. Their jump tables
+//    process 0/1/2/3/4/5/7/9/12/14/15/16/18. Tag 6 reaches the dedicated
+//    `PMRebuild must not be received in SKSM` fatal, while 8/10/11/13/17
+//    reach the invalid-command fatal. The host nevertheless names 17 `Nop`;
+//    that producer identity is preserved, but the admission helper rejects it
+//    because the matched consumer cannot process it.
+//
+//    Tags 6/8/10/11 remain semantically unresolved instead of inheriting an
+//    AGX2 or nested SKU-stream meaning. SKU-stream opcodes are a distinct
+//    nested domain and intentionally have no representation in the top-level
+//    enum. M5-family identities remain fail-closed pending their own paired
+//    producer/consumer pass.
+//
+//    The optional pre-dispatch filter uses literal mask 0x1d03f for tags <=
+//    16. It is exposed separately so a future live producer can preserve that
+//    gate instead of conflating it with complete jump-table dispatch.
 // ---------------------------------------------------------------------------
 
+/// Offset and width of the little-endian top-level command tag.
+pub(crate) const G17P_TOP_LEVEL_COMMAND_TAG_OFFSET: u32 = 0;
+pub(crate) const G17P_TOP_LEVEL_COMMAND_TAG_WIDTH: u32 = 4;
+
+/// Host-grounded G17P top-level command types.
+///
+/// This type intentionally excludes unresolved tags and every nested
+/// SKU-stream opcode. `Nop` records the host ABI but is rejected by
+/// [`admit_g17p_top_level_command`] because all matched firmware variants send
+/// tag 17 to the invalid-command fatal path.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[repr(u32)]
-pub(crate) enum G17KnownCommandType {
-    RunVertex = 0,
-    RunFragment = 1,
-    RunBlitter = 2,
-    RunCompute = 3,
+pub(crate) enum G17PTopLevelCommandType {
+    Ta = 0,
+    ThreeD = 1,
+    FastBlit = 2,
+    Cl = 3,
     Barrier = 4,
-    PmRebuild = 6,
+    PmGrow = 5,
+    RemoteNode = 7,
+    SharedEventSignal = 9,
+    AddFinalFrgGtpcKick = 12,
+    KsmKickQueueAddKicks = 14,
+    ConfigUpdate = 15,
+    EntrySignal = 16,
+    Nop = 17,
+    LateEvalEventSignal = 18,
 }
 
-/// Highest tag admitted by the native G17 jump-table bounds check.
-pub(crate) const G17_CHANNEL_COMMAND_TYPE_MAX: u32 = 18;
+/// Highest tag admitted by the G17P jump-table bounds check.
+pub(crate) const G17P_CHANNEL_COMMAND_TYPE_MAX: u32 = 18;
 
-/// Tags whose jump-table entries reach a normal processing case.
-pub(crate) const G17_CHANNEL_COMMAND_PROCESS_MASK: u32 = 0x0005_d2bf;
+/// Tags named by the pinned host's top-level ABI, including rejected `Nop`.
+pub(crate) const G17P_TOP_LEVEL_COMMAND_KNOWN_MASK: u32 = 0x0007_d2bf;
+/// In-range top-level tags whose host/firmware semantics remain unresolved.
+pub(crate) const G17P_TOP_LEVEL_COMMAND_UNRESOLVED_MASK: u32 = 0x0000_0d40;
+/// Tag 13 is in range but is neither a grounded host type nor unresolved.
+pub(crate) const G17P_TOP_LEVEL_COMMAND_INVALID_MASK: u32 = 0x0000_2000;
+
+/// Tags whose firmware jump-table entries reach a normal processing case.
+pub(crate) const G17P_CHANNEL_COMMAND_PROCESS_MASK: u32 = 0x0005_d2bf;
 /// Tag 6 has a dedicated PM-rebuild-in-SKSM fatal path.
-pub(crate) const G17_CHANNEL_COMMAND_PM_REBUILD_MASK: u32 = 0x0000_0040;
+pub(crate) const G17P_CHANNEL_COMMAND_PM_REBUILD_MASK: u32 = 0x0000_0040;
 /// In-range tags whose jump-table entries reach the invalid-command fatal.
-pub(crate) const G17_CHANNEL_COMMAND_INVALID_MASK: u32 = 0x0002_2d00;
+pub(crate) const G17P_CHANNEL_COMMAND_INVALID_MASK: u32 = 0x0002_2d00;
 /// Literal mask used by the optional pre-dispatch filter for tags <= 16.
-pub(crate) const G17_CHANNEL_COMMAND_PREFILTER_MASK: u32 = 0x0001_d03f;
+pub(crate) const G17P_CHANNEL_COMMAND_PREFILTER_MASK: u32 = 0x0001_d03f;
 
 /// Firmware disposition for one raw command tag.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub(crate) enum G17ChannelCommandDisposition {
+pub(crate) enum G17PChannelCommandDisposition {
     Process,
-    PmRebuildForbidden,
-    Invalid,
+    PmRebuildForbiddenFatal,
+    InvalidCommandFatal,
 }
 
-/// Classify a raw tag exactly like the native G17 jump table.
-pub(crate) const fn classify_g17_channel_command(raw: u32) -> G17ChannelCommandDisposition {
-    if raw > G17_CHANNEL_COMMAND_TYPE_MAX {
-        return G17ChannelCommandDisposition::Invalid;
+/// Admit the command ABI only for the exact paired G17P identity.
+const fn ensure_g17p_command_abi(target: G17ChannelAbiTarget) -> Result<(), SubmissionError> {
+    match target {
+        G17ChannelAbiTarget::A18ProG17P => Ok(()),
+        G17ChannelAbiTarget::M5G17G | G17ChannelAbiTarget::M5ProMaxG17X => {
+            Err(SubmissionError::CommandAbiUnconfirmed)
+        }
+    }
+}
+
+/// Read the complete little-endian u32 tag at top-level command offset zero.
+const fn g17p_raw_top_level_command_tag(command: &[u8]) -> Result<u32, SubmissionError> {
+    let offset = G17P_TOP_LEVEL_COMMAND_TAG_OFFSET as usize;
+    let end = offset + G17P_TOP_LEVEL_COMMAND_TAG_WIDTH as usize;
+    if command.len() < end {
+        return Err(SubmissionError::CommandHeaderTooShort);
+    }
+    Ok(u32::from_le_bytes([
+        command[offset],
+        command[offset + 1],
+        command[offset + 2],
+        command[offset + 3],
+    ]))
+}
+
+/// Decode a host-grounded top-level G17P command name.
+///
+/// This records producer identity only. Call
+/// [`admit_g17p_top_level_command`] before treating a decoded tag as
+/// consumable by the matched firmware.
+pub(crate) const fn decode_g17p_top_level_command(
+    target: G17ChannelAbiTarget,
+    command: &[u8],
+) -> Result<G17PTopLevelCommandType, SubmissionError> {
+    match ensure_g17p_command_abi(target) {
+        Ok(()) => {}
+        Err(error) => return Err(error),
+    }
+
+    let raw = match g17p_raw_top_level_command_tag(command) {
+        Ok(raw) => raw,
+        Err(error) => return Err(error),
+    };
+    match raw {
+        0 => Ok(G17PTopLevelCommandType::Ta),
+        1 => Ok(G17PTopLevelCommandType::ThreeD),
+        2 => Ok(G17PTopLevelCommandType::FastBlit),
+        3 => Ok(G17PTopLevelCommandType::Cl),
+        4 => Ok(G17PTopLevelCommandType::Barrier),
+        5 => Ok(G17PTopLevelCommandType::PmGrow),
+        7 => Ok(G17PTopLevelCommandType::RemoteNode),
+        9 => Ok(G17PTopLevelCommandType::SharedEventSignal),
+        12 => Ok(G17PTopLevelCommandType::AddFinalFrgGtpcKick),
+        14 => Ok(G17PTopLevelCommandType::KsmKickQueueAddKicks),
+        15 => Ok(G17PTopLevelCommandType::ConfigUpdate),
+        16 => Ok(G17PTopLevelCommandType::EntrySignal),
+        17 => Ok(G17PTopLevelCommandType::Nop),
+        18 => Ok(G17PTopLevelCommandType::LateEvalEventSignal),
+        6 | 8 | 10 | 11 => Err(SubmissionError::CommandTagUnresolved),
+        _ => Err(SubmissionError::CommandTagInvalid),
+    }
+}
+
+/// Classify a raw tag exactly like the matched G17P firmware jump table.
+pub(crate) const fn classify_g17p_channel_command(
+    target: G17ChannelAbiTarget,
+    raw: u32,
+) -> Result<G17PChannelCommandDisposition, SubmissionError> {
+    match ensure_g17p_command_abi(target) {
+        Ok(()) => {}
+        Err(error) => return Err(error),
+    }
+
+    if raw > G17P_CHANNEL_COMMAND_TYPE_MAX {
+        return Ok(G17PChannelCommandDisposition::InvalidCommandFatal);
     }
 
     let bit = 1u32 << raw;
-    if bit & G17_CHANNEL_COMMAND_PROCESS_MASK != 0 {
-        G17ChannelCommandDisposition::Process
-    } else if bit & G17_CHANNEL_COMMAND_PM_REBUILD_MASK != 0 {
-        G17ChannelCommandDisposition::PmRebuildForbidden
+    if bit & G17P_CHANNEL_COMMAND_PROCESS_MASK != 0 {
+        Ok(G17PChannelCommandDisposition::Process)
+    } else if bit & G17P_CHANNEL_COMMAND_PM_REBUILD_MASK != 0 {
+        Ok(G17PChannelCommandDisposition::PmRebuildForbiddenFatal)
     } else {
-        G17ChannelCommandDisposition::Invalid
+        Ok(G17PChannelCommandDisposition::InvalidCommandFatal)
+    }
+}
+
+/// Decode a top-level tag and require a normal matched-firmware dispatch case.
+///
+/// In particular, host-grounded `Nop = 17` is rejected here because the
+/// firmware sends it to the invalid-command fatal path.
+pub(crate) const fn admit_g17p_top_level_command(
+    target: G17ChannelAbiTarget,
+    command: &[u8],
+) -> Result<G17PTopLevelCommandType, SubmissionError> {
+    let command_type = match decode_g17p_top_level_command(target, command) {
+        Ok(command_type) => command_type,
+        Err(error) => return Err(error),
+    };
+    match classify_g17p_channel_command(target, command_type as u32) {
+        Ok(G17PChannelCommandDisposition::Process) => Ok(command_type),
+        Ok(
+            G17PChannelCommandDisposition::PmRebuildForbiddenFatal
+            | G17PChannelCommandDisposition::InvalidCommandFatal,
+        ) => Err(SubmissionError::CommandTagRejectedByFirmware),
+        Err(error) => Err(error),
     }
 }
 
 /// Apply the firmware's optional `tag <= 16 && bit(tag) & 0x1d03f` filter.
-pub(crate) const fn g17_channel_command_prefilter_allows(raw: u32) -> bool {
-    raw <= 16 && ((1u32 << raw) & G17_CHANNEL_COMMAND_PREFILTER_MASK) != 0
+pub(crate) const fn g17p_channel_command_prefilter_allows(
+    target: G17ChannelAbiTarget,
+    raw: u32,
+) -> Result<bool, SubmissionError> {
+    match ensure_g17p_command_abi(target) {
+        Ok(()) => {}
+        Err(error) => return Err(error),
+    }
+    Ok(raw <= 16 && ((1u32 << raw) & G17P_CHANNEL_COMMAND_PREFILTER_MASK) != 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -1017,7 +1165,7 @@ pub(crate) const fn g17_channel_command_prefilter_allows(raw: u32) -> bool {
 pub(crate) enum AbiProvenance {
     /// Byte-identical to the shipping AGX2 producer; reused unchanged.
     IdenticalToAgx2,
-    /// AGX3-specific, grounded first-hand from the M5 firmware this pass.
+    /// AGX3-specific, grounded first-hand from matched host/firmware artifacts.
     ForkedAgx3Grounded,
     /// AGX2 layout the driver produces; the G17 firmware's *own* consumer
     /// offsets were not read first-hand this pass. Kept fail-closed.
@@ -1034,7 +1182,7 @@ pub(crate) struct SubmissionAbiLedger {
     pub(crate) channel_descriptor: AbiProvenance,
     pub(crate) host_channel_state_reset: AbiProvenance,
     pub(crate) host_uncached_channel_reset: AbiProvenance,
-    pub(crate) command_types: AbiProvenance,
+    pub(crate) g17p_command_types: AbiProvenance,
     pub(crate) kick_word: AbiProvenance,
     pub(crate) kick_queue_producer: AbiProvenance,
     pub(crate) host_add_kicks_mmio: AbiProvenance,
@@ -1046,8 +1194,9 @@ pub(crate) struct SubmissionAbiLedger {
 /// generic channel/ring producer records remain inherited and fail-closed.
 /// A separate G17P-only channel-state entry records the matched A18 Pro host
 /// producer and firmware consumer (§2c); it does not admit either M5 family.
-/// The command dispatch is a grounded AGX3 fork (§7): in particular, inherited
-/// AGX2 `InitBuffer = 6` is rejected.
+/// The command dispatch is a grounded, G17P-only AGX3 fork (§7): the M5
+/// identities remain fail-closed, unresolved values do not inherit AGX2 or
+/// nested SKU meanings, and the host's `Nop = 17` is not firmware-admitted.
 pub(crate) const SUBMISSION_ABI_LEDGER: SubmissionAbiLedger = SubmissionAbiLedger {
     tx_doorbell: AbiProvenance::IdenticalToAgx2,
     channel_state: AbiProvenance::Agx2InheritedUnconfirmed,
@@ -1056,7 +1205,7 @@ pub(crate) const SUBMISSION_ABI_LEDGER: SubmissionAbiLedger = SubmissionAbiLedge
     channel_descriptor: AbiProvenance::ForkedAgx3Grounded,
     host_channel_state_reset: AbiProvenance::ForkedAgx3Grounded,
     host_uncached_channel_reset: AbiProvenance::ForkedAgx3Grounded,
-    command_types: AbiProvenance::ForkedAgx3Grounded,
+    g17p_command_types: AbiProvenance::ForkedAgx3Grounded,
     kick_word: AbiProvenance::ForkedAgx3Grounded,
     kick_queue_producer: AbiProvenance::ForkedAgx3Grounded,
     host_add_kicks_mmio: AbiProvenance::ForkedAgx3Grounded,
@@ -1696,53 +1845,201 @@ mod tests {
     }
 
     #[test]
-    fn g17_command_dispatch_matches_the_firmware_jump_table() {
-        assert_eq!(G17KnownCommandType::RunVertex as u32, 0);
-        assert_eq!(G17KnownCommandType::RunFragment as u32, 1);
-        assert_eq!(G17KnownCommandType::RunBlitter as u32, 2);
-        assert_eq!(G17KnownCommandType::RunCompute as u32, 3);
-        assert_eq!(G17KnownCommandType::Barrier as u32, 4);
-        assert_eq!(G17KnownCommandType::PmRebuild as u32, 6);
-
-        assert_eq!(G17_CHANNEL_COMMAND_TYPE_MAX, 18);
-        assert_eq!(G17_CHANNEL_COMMAND_PROCESS_MASK, 0x0005_d2bf);
-        assert_eq!(G17_CHANNEL_COMMAND_PM_REBUILD_MASK, 0x0000_0040);
-        assert_eq!(G17_CHANNEL_COMMAND_INVALID_MASK, 0x0002_2d00);
-        assert_eq!(
-            G17_CHANNEL_COMMAND_PROCESS_MASK
-                | G17_CHANNEL_COMMAND_PM_REBUILD_MASK
-                | G17_CHANNEL_COMMAND_INVALID_MASK,
-            (1 << (G17_CHANNEL_COMMAND_TYPE_MAX + 1)) - 1
-        );
-
-        for raw in 0..=G17_CHANNEL_COMMAND_TYPE_MAX {
-            let expected = match raw {
-                0 | 1 | 2 | 3 | 4 | 5 | 7 | 9 | 12 | 14 | 15 | 16 | 18 => {
-                    G17ChannelCommandDisposition::Process
-                }
-                6 => G17ChannelCommandDisposition::PmRebuildForbidden,
-                8 | 10 | 11 | 13 | 17 => G17ChannelCommandDisposition::Invalid,
-                _ => unreachable!(),
-            };
-            assert_eq!(classify_g17_channel_command(raw), expected);
+    fn g17p_top_level_command_names_match_the_host_abi() {
+        let known = [
+            (G17PTopLevelCommandType::Ta, 0),
+            (G17PTopLevelCommandType::ThreeD, 1),
+            (G17PTopLevelCommandType::FastBlit, 2),
+            (G17PTopLevelCommandType::Cl, 3),
+            (G17PTopLevelCommandType::Barrier, 4),
+            (G17PTopLevelCommandType::PmGrow, 5),
+            (G17PTopLevelCommandType::RemoteNode, 7),
+            (G17PTopLevelCommandType::SharedEventSignal, 9),
+            (G17PTopLevelCommandType::AddFinalFrgGtpcKick, 12),
+            (G17PTopLevelCommandType::KsmKickQueueAddKicks, 14),
+            (G17PTopLevelCommandType::ConfigUpdate, 15),
+            (G17PTopLevelCommandType::EntrySignal, 16),
+            (G17PTopLevelCommandType::Nop, 17),
+            (G17PTopLevelCommandType::LateEvalEventSignal, 18),
+        ];
+        for (command_type, raw) in known {
+            assert_eq!(command_type as u32, raw);
         }
+
+        assert_eq!(G17P_TOP_LEVEL_COMMAND_TAG_OFFSET, 0);
+        assert_eq!(G17P_TOP_LEVEL_COMMAND_TAG_WIDTH, 4);
+        assert_eq!(G17P_CHANNEL_COMMAND_TYPE_MAX, 18);
+        assert_eq!(G17P_TOP_LEVEL_COMMAND_KNOWN_MASK, 0x0007_d2bf);
+        assert_eq!(G17P_TOP_LEVEL_COMMAND_UNRESOLVED_MASK, 0x0000_0d40);
+        assert_eq!(G17P_TOP_LEVEL_COMMAND_INVALID_MASK, 0x0000_2000);
         assert_eq!(
-            classify_g17_channel_command(19),
-            G17ChannelCommandDisposition::Invalid
-        );
-        assert_eq!(
-            classify_g17_channel_command(u32::MAX),
-            G17ChannelCommandDisposition::Invalid
+            G17P_TOP_LEVEL_COMMAND_KNOWN_MASK
+                | G17P_TOP_LEVEL_COMMAND_UNRESOLVED_MASK
+                | G17P_TOP_LEVEL_COMMAND_INVALID_MASK,
+            (1 << (G17P_CHANNEL_COMMAND_TYPE_MAX + 1)) - 1
         );
     }
 
     #[test]
-    fn g17_command_prefilter_matches_literal_mask() {
-        assert_eq!(G17_CHANNEL_COMMAND_PREFILTER_MASK, 0x0001_d03f);
+    fn g17p_top_level_command_decoder_reads_exact_little_endian_bytes() {
+        let known = [
+            G17PTopLevelCommandType::Ta,
+            G17PTopLevelCommandType::ThreeD,
+            G17PTopLevelCommandType::FastBlit,
+            G17PTopLevelCommandType::Cl,
+            G17PTopLevelCommandType::Barrier,
+            G17PTopLevelCommandType::PmGrow,
+            G17PTopLevelCommandType::RemoteNode,
+            G17PTopLevelCommandType::SharedEventSignal,
+            G17PTopLevelCommandType::AddFinalFrgGtpcKick,
+            G17PTopLevelCommandType::KsmKickQueueAddKicks,
+            G17PTopLevelCommandType::ConfigUpdate,
+            G17PTopLevelCommandType::EntrySignal,
+            G17PTopLevelCommandType::Nop,
+            G17PTopLevelCommandType::LateEvalEventSignal,
+        ];
+        for command_type in known {
+            let mut command = [0xa5; 9];
+            command[..4].copy_from_slice(&(command_type as u32).to_le_bytes());
+            assert_eq!(
+                decode_g17p_top_level_command(G17ChannelAbiTarget::A18ProG17P, &command),
+                Ok(command_type)
+            );
+        }
+
+        for length in 0..4 {
+            assert_eq!(
+                decode_g17p_top_level_command(
+                    G17ChannelAbiTarget::A18ProG17P,
+                    &[0, 0, 0, 0][..length]
+                ),
+                Err(SubmissionError::CommandHeaderTooShort)
+            );
+        }
+
+        // The dispatcher reads all four little-endian bytes at offset zero;
+        // it neither truncates to byte zero nor scans for a nested opcode.
+        assert_eq!(
+            decode_g17p_top_level_command(
+                G17ChannelAbiTarget::A18ProG17P,
+                &[0, 0, 0, 1, 18, 0, 0, 0]
+            ),
+            Err(SubmissionError::CommandTagInvalid)
+        );
+    }
+
+    #[test]
+    fn g17p_top_level_command_decode_fails_closed_by_tag_and_identity() {
+        for raw in [6u32, 8, 10, 11] {
+            assert_eq!(
+                decode_g17p_top_level_command(G17ChannelAbiTarget::A18ProG17P, &raw.to_le_bytes()),
+                Err(SubmissionError::CommandTagUnresolved)
+            );
+        }
+        for raw in [13u32, 19, u32::MAX] {
+            assert_eq!(
+                decode_g17p_top_level_command(G17ChannelAbiTarget::A18ProG17P, &raw.to_le_bytes()),
+                Err(SubmissionError::CommandTagInvalid)
+            );
+        }
+        for target in [
+            G17ChannelAbiTarget::M5G17G,
+            G17ChannelAbiTarget::M5ProMaxG17X,
+        ] {
+            assert_eq!(
+                decode_g17p_top_level_command(target, &0u32.to_le_bytes()),
+                Err(SubmissionError::CommandAbiUnconfirmed)
+            );
+            assert_eq!(
+                classify_g17p_channel_command(target, 0),
+                Err(SubmissionError::CommandAbiUnconfirmed)
+            );
+        }
+    }
+
+    #[test]
+    fn g17p_command_dispatch_matches_the_firmware_jump_table() {
+        assert_eq!(G17P_CHANNEL_COMMAND_PROCESS_MASK, 0x0005_d2bf);
+        assert_eq!(G17P_CHANNEL_COMMAND_PM_REBUILD_MASK, 0x0000_0040);
+        assert_eq!(G17P_CHANNEL_COMMAND_INVALID_MASK, 0x0002_2d00);
+        assert_eq!(
+            G17P_CHANNEL_COMMAND_PROCESS_MASK
+                | G17P_CHANNEL_COMMAND_PM_REBUILD_MASK
+                | G17P_CHANNEL_COMMAND_INVALID_MASK,
+            (1 << (G17P_CHANNEL_COMMAND_TYPE_MAX + 1)) - 1
+        );
+
+        for raw in 0..=G17P_CHANNEL_COMMAND_TYPE_MAX {
+            let expected = match raw {
+                0 | 1 | 2 | 3 | 4 | 5 | 7 | 9 | 12 | 14 | 15 | 16 | 18 => {
+                    G17PChannelCommandDisposition::Process
+                }
+                6 => G17PChannelCommandDisposition::PmRebuildForbiddenFatal,
+                8 | 10 | 11 | 13 | 17 => G17PChannelCommandDisposition::InvalidCommandFatal,
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                classify_g17p_channel_command(G17ChannelAbiTarget::A18ProG17P, raw),
+                Ok(expected)
+            );
+        }
+        for raw in [19, u32::MAX] {
+            assert_eq!(
+                classify_g17p_channel_command(G17ChannelAbiTarget::A18ProG17P, raw),
+                Ok(G17PChannelCommandDisposition::InvalidCommandFatal)
+            );
+        }
+
+        // Host ABI identity and matched-firmware admission intentionally split.
+        let nop = (G17PTopLevelCommandType::Nop as u32).to_le_bytes();
+        assert_eq!(
+            decode_g17p_top_level_command(G17ChannelAbiTarget::A18ProG17P, &nop),
+            Ok(G17PTopLevelCommandType::Nop)
+        );
+        assert_eq!(
+            admit_g17p_top_level_command(G17ChannelAbiTarget::A18ProG17P, &nop),
+            Err(SubmissionError::CommandTagRejectedByFirmware)
+        );
+
+        for command_type in [
+            G17PTopLevelCommandType::Ta,
+            G17PTopLevelCommandType::ThreeD,
+            G17PTopLevelCommandType::FastBlit,
+            G17PTopLevelCommandType::Cl,
+            G17PTopLevelCommandType::Barrier,
+            G17PTopLevelCommandType::PmGrow,
+            G17PTopLevelCommandType::RemoteNode,
+            G17PTopLevelCommandType::SharedEventSignal,
+            G17PTopLevelCommandType::AddFinalFrgGtpcKick,
+            G17PTopLevelCommandType::KsmKickQueueAddKicks,
+            G17PTopLevelCommandType::ConfigUpdate,
+            G17PTopLevelCommandType::EntrySignal,
+            G17PTopLevelCommandType::LateEvalEventSignal,
+        ] {
+            assert_eq!(
+                admit_g17p_top_level_command(
+                    G17ChannelAbiTarget::A18ProG17P,
+                    &(command_type as u32).to_le_bytes()
+                ),
+                Ok(command_type)
+            );
+        }
+    }
+
+    #[test]
+    fn g17p_command_prefilter_matches_literal_mask() {
+        assert_eq!(G17P_CHANNEL_COMMAND_PREFILTER_MASK, 0x0001_d03f);
         for raw in 0..=20 {
             let expected = matches!(raw, 0 | 1 | 2 | 3 | 4 | 5 | 12 | 14 | 15 | 16);
-            assert_eq!(g17_channel_command_prefilter_allows(raw), expected);
+            assert_eq!(
+                g17p_channel_command_prefilter_allows(G17ChannelAbiTarget::A18ProG17P, raw),
+                Ok(expected)
+            );
         }
+        assert_eq!(
+            g17p_channel_command_prefilter_allows(G17ChannelAbiTarget::M5G17G, 0),
+            Err(SubmissionError::CommandAbiUnconfirmed)
+        );
     }
 
     #[test]
@@ -1795,7 +2092,7 @@ mod tests {
             AbiProvenance::ForkedAgx3Grounded
         );
         assert_eq!(
-            SUBMISSION_ABI_LEDGER.command_types,
+            SUBMISSION_ABI_LEDGER.g17p_command_types,
             AbiProvenance::ForkedAgx3Grounded
         );
         assert!(CHANNEL_DESCRIPTOR_STRIDE_CONFIRMED);
