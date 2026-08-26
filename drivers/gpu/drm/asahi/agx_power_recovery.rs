@@ -460,6 +460,13 @@ pub(crate) struct G17AdtRegisterRange {
     pub(crate) size: u32,
 }
 
+/// Literal power-ownership property on one D93AP RTBuddy nub.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum G17AdtPowerManagementProperty {
+    UserPowerManaged,
+    PowerManaged,
+}
+
 /// Exact public D93AP/T8140 topology required before A18 Pro live bring-up.
 ///
 /// This is parsed from `DeviceTree.d93ap.im4p` in iPhone17,1 23G83
@@ -475,15 +482,18 @@ pub(crate) struct T8140G17PAdtTopology {
     pub(crate) gfx_asc_regs: [G17AdtRegisterRange; 2],
     pub(crate) gfx_asc_power_gate: u32,
     pub(crate) gfx_asc_interrupts: [u32; 4],
+    pub(crate) gfx_power_management: G17AdtPowerManagementProperty,
     pub(crate) gfx1_asc_regs: [G17AdtRegisterRange; 2],
     pub(crate) gfx1_asc_power_gate: u32,
     pub(crate) gfx1_asc_interrupts: [u32; 4],
+    pub(crate) gfx1_power_management: G17AdtPowerManagementProperty,
     pub(crate) shared_iommu_mapper: bool,
     pub(crate) meta_sw_interrupt: G17MetaSwInterruptEvidence,
     pub(crate) perf_state_count: u32,
     pub(crate) gpu_num_perf_states: u32,
     pub(crate) perf_state_record_count: u32,
     pub(crate) perf_state_records_all_zero: bool,
+    pub(crate) perf_states_sram_present: bool,
 }
 
 pub(crate) const D93AP_T8140_G17P_ADT_TOPOLOGY: T8140G17PAdtTopology = T8140G17PAdtTopology {
@@ -512,6 +522,7 @@ pub(crate) const D93AP_T8140_G17P_ADT_TOPOLOGY: T8140G17PAdtTopology = T8140G17P
     ],
     gfx_asc_power_gate: 237,
     gfx_asc_interrupts: [994, 993, 996, 995],
+    gfx_power_management: G17AdtPowerManagementProperty::UserPowerManaged,
     gfx1_asc_regs: [
         G17AdtRegisterRange {
             phys_base: 0x2_72e0_0000,
@@ -524,6 +535,7 @@ pub(crate) const D93AP_T8140_G17P_ADT_TOPOLOGY: T8140G17PAdtTopology = T8140G17P
     ],
     gfx1_asc_power_gate: 321,
     gfx1_asc_interrupts: [998, 997, 1000, 999],
+    gfx1_power_management: G17AdtPowerManagementProperty::PowerManaged,
     shared_iommu_mapper: true,
     meta_sw_interrupt: G17MetaSwInterruptEvidence {
         first_u64: 0x3_0101_4048,
@@ -534,6 +546,7 @@ pub(crate) const D93AP_T8140_G17P_ADT_TOPOLOGY: T8140G17PAdtTopology = T8140G17P
     gpu_num_perf_states: 2,
     perf_state_record_count: 16,
     perf_state_records_all_zero: true,
+    perf_states_sram_present: false,
 };
 
 /// Do not begin A18 Pro live bring-up against an inferred or partial topology.
@@ -2057,11 +2070,20 @@ mod tests {
         assert_eq!(exact.sgx_power_gates, [235, 236]);
         assert_eq!(exact.gfx_asc_power_gate, 237);
         assert_eq!(exact.gfx1_asc_power_gate, 321);
+        assert_eq!(
+            exact.gfx_power_management,
+            G17AdtPowerManagementProperty::UserPowerManaged
+        );
+        assert_eq!(
+            exact.gfx1_power_management,
+            G17AdtPowerManagementProperty::PowerManaged
+        );
         assert!(exact.shared_iommu_mapper);
         assert_eq!(exact.perf_state_count, 0);
         assert_eq!(exact.gpu_num_perf_states, 2);
         assert_eq!(exact.perf_state_record_count, 16);
         assert!(exact.perf_state_records_all_zero);
+        assert!(!exact.perf_states_sram_present);
 
         let mut wrong_gfx1_transport = exact;
         wrong_gfx1_transport.gfx1_asc_regs[0].phys_base = exact.gfx_asc_regs[0].phys_base;
@@ -2071,6 +2093,12 @@ mod tests {
         invented_legacy_opp_table.perf_state_count = 2;
         assert!(!validate_t8140_g17p_adt_topology(
             &invented_legacy_opp_table
+        ));
+
+        let mut invented_sram_table = exact;
+        invented_sram_table.perf_states_sram_present = true;
+        assert!(!validate_t8140_g17p_adt_topology(
+            &invented_sram_table
         ));
     }
 
