@@ -477,14 +477,19 @@ pub(crate) enum G17AdtPowerManagementProperty {
 pub(crate) struct T8140G17PAdtTopology {
     pub(crate) sgx_regs: [G17AdtRegisterRange; 2],
     pub(crate) sgx_power_gates: [u32; 2],
+    pub(crate) sgx_power_gate_parents: [Option<u32>; 2],
+    pub(crate) gfx_power_domain: u32,
+    pub(crate) gfx_power_domain_parents: [u32; 2],
     pub(crate) clock_id: u32,
     pub(crate) sgx_interrupts: [u32; 8],
     pub(crate) gfx_asc_regs: [G17AdtRegisterRange; 2],
     pub(crate) gfx_asc_power_gate: u32,
+    pub(crate) gfx_asc_power_gate_parent: u32,
     pub(crate) gfx_asc_interrupts: [u32; 4],
     pub(crate) gfx_power_management: G17AdtPowerManagementProperty,
     pub(crate) gfx1_asc_regs: [G17AdtRegisterRange; 2],
     pub(crate) gfx1_asc_power_gate: u32,
+    pub(crate) gfx1_asc_power_gate_parent: u32,
     pub(crate) gfx1_asc_interrupts: [u32; 4],
     pub(crate) gfx1_power_management: G17AdtPowerManagementProperty,
     pub(crate) shared_iommu_mapper: bool,
@@ -508,6 +513,9 @@ pub(crate) const D93AP_T8140_G17P_ADT_TOPOLOGY: T8140G17PAdtTopology = T8140G17P
         },
     ],
     sgx_power_gates: [235, 236],
+    sgx_power_gate_parents: [Some(40), None],
+    gfx_power_domain: 40,
+    gfx_power_domain_parents: [29, 31],
     clock_id: 351,
     sgx_interrupts: [975, 976, 977, 978, 1001, 1003, 990, 992],
     gfx_asc_regs: [
@@ -521,6 +529,7 @@ pub(crate) const D93AP_T8140_G17P_ADT_TOPOLOGY: T8140G17PAdtTopology = T8140G17P
         },
     ],
     gfx_asc_power_gate: 237,
+    gfx_asc_power_gate_parent: 40,
     gfx_asc_interrupts: [994, 993, 996, 995],
     gfx_power_management: G17AdtPowerManagementProperty::UserPowerManaged,
     gfx1_asc_regs: [
@@ -534,6 +543,7 @@ pub(crate) const D93AP_T8140_G17P_ADT_TOPOLOGY: T8140G17PAdtTopology = T8140G17P
         },
     ],
     gfx1_asc_power_gate: 321,
+    gfx1_asc_power_gate_parent: 40,
     gfx1_asc_interrupts: [998, 997, 1000, 999],
     gfx1_power_management: G17AdtPowerManagementProperty::PowerManaged,
     shared_iommu_mapper: true,
@@ -2068,8 +2078,13 @@ mod tests {
 
         assert!(validate_t8140_g17p_adt_topology(&exact));
         assert_eq!(exact.sgx_power_gates, [235, 236]);
+        assert_eq!(exact.sgx_power_gate_parents, [Some(40), None]);
+        assert_eq!(exact.gfx_power_domain, 40);
+        assert_eq!(exact.gfx_power_domain_parents, [29, 31]);
         assert_eq!(exact.gfx_asc_power_gate, 237);
+        assert_eq!(exact.gfx_asc_power_gate_parent, 40);
         assert_eq!(exact.gfx1_asc_power_gate, 321);
+        assert_eq!(exact.gfx1_asc_power_gate_parent, 40);
         assert_eq!(
             exact.gfx_power_management,
             G17AdtPowerManagementProperty::UserPowerManaged
@@ -2088,6 +2103,10 @@ mod tests {
         let mut wrong_gfx1_transport = exact;
         wrong_gfx1_transport.gfx1_asc_regs[0].phys_base = exact.gfx_asc_regs[0].phys_base;
         assert!(!validate_t8140_g17p_adt_topology(&wrong_gfx1_transport));
+
+        let mut detached_gfx1_gate = exact;
+        detached_gfx1_gate.gfx1_asc_power_gate_parent = 0;
+        assert!(!validate_t8140_g17p_adt_topology(&detached_gfx1_gate));
 
         let mut invented_legacy_opp_table = exact;
         invented_legacy_opp_table.perf_state_count = 2;
