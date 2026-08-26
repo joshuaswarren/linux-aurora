@@ -21,10 +21,14 @@ pub(crate) enum G17AscEvidenceTarget {
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct G17AscTextEvidence {
     pub(crate) rtbuddy_load_firmware: u64,
+    pub(crate) rtbuddy_force_power_off: u64,
     pub(crate) a7iop_start_cpu_with_options: u64,
     pub(crate) a7iop_stop_cpu: u64,
     pub(crate) a7iop_reset_state: u64,
+    pub(crate) a7iop_enable_power: u64,
+    pub(crate) ascwrap_initialize: u64,
     pub(crate) ascwrap_set_iorvbar: u64,
+    pub(crate) ascwrap_is_idle: u64,
     pub(crate) ascwrap_run_cpu: u64,
 }
 
@@ -32,26 +36,38 @@ pub(crate) const fn g17_asc_text_evidence(target: G17AscEvidenceTarget) -> G17As
     match target {
         G17AscEvidenceTarget::G17P => G17AscTextEvidence {
             rtbuddy_load_firmware: 0xffff_fe00_0b1f_b288,
+            rtbuddy_force_power_off: 0xffff_fe00_0b1f_13bc,
             a7iop_start_cpu_with_options: 0xffff_fe00_08ab_c6d0,
             a7iop_stop_cpu: 0xffff_fe00_08ab_ca30,
             a7iop_reset_state: 0xffff_fe00_08ab_dde0,
+            a7iop_enable_power: 0xffff_fe00_08ab_c518,
+            ascwrap_initialize: 0xffff_fe00_08ab_9f7c,
             ascwrap_set_iorvbar: 0xffff_fe00_08ab_a1f8,
+            ascwrap_is_idle: 0xffff_fe00_08ab_a414,
             ascwrap_run_cpu: 0xffff_fe00_08ab_a4b4,
         },
         G17AscEvidenceTarget::G17G => G17AscTextEvidence {
             rtbuddy_load_firmware: 0xffff_fe00_0b5f_df08,
+            rtbuddy_force_power_off: 0xffff_fe00_0b5f_403c,
             a7iop_start_cpu_with_options: 0xffff_fe00_08be_fd20,
             a7iop_stop_cpu: 0xffff_fe00_08bf_0080,
             a7iop_reset_state: 0xffff_fe00_08bf_1430,
+            a7iop_enable_power: 0xffff_fe00_08be_fb68,
+            ascwrap_initialize: 0xffff_fe00_08be_c1cc,
             ascwrap_set_iorvbar: 0xffff_fe00_08be_c448,
+            ascwrap_is_idle: 0xffff_fe00_08be_c664,
             ascwrap_run_cpu: 0xffff_fe00_08be_c704,
         },
         G17AscEvidenceTarget::G17S => G17AscTextEvidence {
             rtbuddy_load_firmware: 0xffff_fe00_0b2e_cab8,
+            rtbuddy_force_power_off: 0xffff_fe00_0b2e_2bec,
             a7iop_start_cpu_with_options: 0xffff_fe00_08bb_6a50,
             a7iop_stop_cpu: 0xffff_fe00_08bb_6db0,
             a7iop_reset_state: 0xffff_fe00_08bb_8160,
+            a7iop_enable_power: 0xffff_fe00_08bb_6898,
+            ascwrap_initialize: 0xffff_fe00_08bb_2efc,
             ascwrap_set_iorvbar: 0xffff_fe00_08bb_3178,
+            ascwrap_is_idle: 0xffff_fe00_08bb_3394,
             ascwrap_run_cpu: 0xffff_fe00_08bb_3434,
         },
     }
@@ -68,6 +84,111 @@ pub(crate) const ASC_CPU_RUN_BIT: u32 = 0x10;
 /// Apple does not name its meaning in the recovered method, so neither do we.
 pub(crate) const ASC_CPU_STOP_SECOND_CLEAR_BIT: u32 = 0x20;
 pub(crate) const ASC_IORVBAR_VALID_BIT: u64 = 1;
+pub(crate) const ASC_CPU_CTRL_FILTERED_PROPERTY: &str = "cpu-ctrl-filtered";
+pub(crate) const ASC_IDLE_CTRL_CHECK_PROPERTY: &str = "idle-ctrl-check";
+
+/// Both ASC providers in every pinned G17 DeviceTree omit these properties.
+/// `AppleA7IOP::start` initializes the object flag at +0x132 to one and clears
+/// it only when `cpu-ctrl-filtered` exists. `AppleASCWrapV6::initialize`
+/// separately copies `idle-ctrl-check` to +0x1a8.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17AscProviderProperties {
+    pub(crate) cpu_ctrl_filtered: bool,
+    pub(crate) idle_ctrl_check: bool,
+}
+
+pub(crate) const G17_ASC_PROVIDER_PROPERTIES: [G17AscProviderProperties; 2] =
+    [G17AscProviderProperties {
+        cpu_ctrl_filtered: false,
+        idle_ctrl_check: false,
+    }; 2];
+
+pub(crate) const fn wrapper_mmio_enabled(properties: G17AscProviderProperties) -> bool {
+    !properties.cpu_ctrl_filtered
+}
+
+pub(crate) const ASC_IDLE_PREREQUISITE_OFFSET: u32 = 0x40;
+pub(crate) const ASC_IDLE_STATUS_OFFSET: u32 = 0x8000;
+pub(crate) const ASC_IDLE_STATUS_MASK: u32 = 0x3;
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum AscIdleOp {
+    ReadPrerequisite { offset: u32 },
+    ReadStatus { offset: u32, idle_mask: u32 },
+    None,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct AscIdlePlan {
+    pub(crate) len: u8,
+    pub(crate) ops: [AscIdleOp; 2],
+}
+
+/// Exact `_isIdle` read plan. If `idle-ctrl-check` exists, a zero read at
+/// +0x40 returns busy without touching +0x8000. Otherwise idle is exactly
+/// `(status & 3) != 0`.
+pub(crate) const fn asc_idle_plan(properties: G17AscProviderProperties) -> AscIdlePlan {
+    if properties.idle_ctrl_check {
+        AscIdlePlan {
+            len: 2,
+            ops: [
+                AscIdleOp::ReadPrerequisite {
+                    offset: ASC_IDLE_PREREQUISITE_OFFSET,
+                },
+                AscIdleOp::ReadStatus {
+                    offset: ASC_IDLE_STATUS_OFFSET,
+                    idle_mask: ASC_IDLE_STATUS_MASK,
+                },
+            ],
+        }
+    } else {
+        AscIdlePlan {
+            len: 1,
+            ops: [
+                AscIdleOp::ReadStatus {
+                    offset: ASC_IDLE_STATUS_OFFSET,
+                    idle_mask: ASC_IDLE_STATUS_MASK,
+                },
+                AscIdleOp::None,
+            ],
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum AscIdleResult {
+    Busy,
+    Idle,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum AscIdleError {
+    MissingPrerequisiteRead,
+    MissingStatusRead,
+    UnexpectedPrerequisiteRead,
+}
+
+pub(crate) const fn classify_asc_idle(
+    properties: G17AscProviderProperties,
+    prerequisite: Option<u32>,
+    status: Option<u32>,
+) -> Result<AscIdleResult, AscIdleError> {
+    if properties.idle_ctrl_check {
+        match prerequisite {
+            None => return Err(AscIdleError::MissingPrerequisiteRead),
+            Some(0) => return Ok(AscIdleResult::Busy),
+            Some(_) => {}
+        }
+    } else if prerequisite.is_some() {
+        return Err(AscIdleError::UnexpectedPrerequisiteRead);
+    }
+
+    match status {
+        Some(raw) if raw & ASC_IDLE_STATUS_MASK != 0 => Ok(AscIdleResult::Idle),
+        Some(_) => Ok(AscIdleResult::Busy),
+        None => Err(AscIdleError::MissingStatusRead),
+    }
+}
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum AscMmioOp {
@@ -161,6 +282,153 @@ pub(crate) const fn validate_iorvbar_write(
     }
 }
 
+/// `AppleASCWrapV6::initialize` obtains provider device-memory index one,
+/// stores the `IOMemoryMap`, obtains its virtual address, and `_setIORVBAR`
+/// performs the 64-bit write through that mapping. This proves the Apple
+/// lifecycle owner, not that DRM may map the resource beside apple-mailbox.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct AscIorvbarOwnerContract {
+    pub(crate) provider_resource_index: u8,
+    pub(crate) map_options: u32,
+    pub(crate) obtains_virtual_address: bool,
+    pub(crate) write_width_bytes: u8,
+}
+
+pub(crate) const G17_IORVBAR_OWNER_CONTRACT: AscIorvbarOwnerContract = AscIorvbarOwnerContract {
+    provider_resource_index: 1,
+    map_options: 0,
+    obtains_virtual_address: true,
+    write_width_bytes: 8,
+};
+
+/// Facts visible in `AppleASCWrapV6::_mapFirmware`. Bit one bypasses mapping;
+/// iBoot firmware is handed to `AppleA7IOP::dartMapiBootFirmware`, while the
+/// non-iBoot path requires an already-valid IORVBAR. No cache operation is
+/// performed by this wrapper method. The descriptor completion/visibility
+/// operation in RTBuddy is not yet named strongly enough to execute in Linux.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17FirmwareVisibilityContract {
+    pub(crate) map_bypass_option_mask: u32,
+    pub(crate) iboot_uses_dart_mapper: bool,
+    pub(crate) non_iboot_requires_valid_iorvbar: bool,
+    pub(crate) ascwrap_performs_cache_maintenance: bool,
+    pub(crate) rtbuddy_publication_cache_operation_proven: bool,
+}
+
+pub(crate) const G17_FIRMWARE_VISIBILITY_CONTRACT: G17FirmwareVisibilityContract =
+    G17FirmwareVisibilityContract {
+        map_bypass_option_mask: 1 << 1,
+        iboot_uses_dart_mapper: true,
+        non_iboot_requires_valid_iorvbar: true,
+        ascwrap_performs_cache_maintenance: false,
+        rtbuddy_publication_cache_operation_proven: false,
+    };
+
+/// Per-kernelcache PMGR anchors. The common `AppleA7IOP::_enablePower` and
+/// `ApplePMGR::enableCluster` instruction words are identical on P/G/S. The
+/// platform `writeReg32` implementations are deliberately not treated as
+/// interchangeable.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PmgrTextEvidence {
+    pub(crate) enable_device: u64,
+    pub(crate) enable_device_gated: u64,
+    pub(crate) sync_device_status_change: u64,
+    pub(crate) was_device_disabled: u64,
+    pub(crate) enable_cluster: u64,
+    pub(crate) read_reg32: u64,
+    pub(crate) wait_reg32: u64,
+    pub(crate) platform_write_reg32: u64,
+}
+
+pub(crate) const fn g17_pmgr_text_evidence(target: G17AscEvidenceTarget) -> G17PmgrTextEvidence {
+    match target {
+        G17AscEvidenceTarget::G17P => G17PmgrTextEvidence {
+            enable_device: 0xffff_fe00_0972_4980,
+            enable_device_gated: 0xffff_fe00_0972_4b18,
+            sync_device_status_change: 0xffff_fe00_0972_575c,
+            was_device_disabled: 0xffff_fe00_0972_6288,
+            enable_cluster: 0xffff_fe00_0971_a3e4,
+            read_reg32: 0xffff_fe00_0971_473c,
+            wait_reg32: 0xffff_fe00_0971_497c,
+            platform_write_reg32: 0xffff_fe00_09b3_c80c,
+        },
+        G17AscEvidenceTarget::G17G => G17PmgrTextEvidence {
+            enable_device: 0xffff_fe00_09b2_a920,
+            enable_device_gated: 0xffff_fe00_09b2_aab8,
+            sync_device_status_change: 0xffff_fe00_09b2_b6fc,
+            was_device_disabled: 0xffff_fe00_09b2_c228,
+            enable_cluster: 0xffff_fe00_09b2_0384,
+            read_reg32: 0xffff_fe00_09b1_a6dc,
+            wait_reg32: 0xffff_fe00_09b1_a91c,
+            platform_write_reg32: 0xffff_fe00_09f7_c230,
+        },
+        G17AscEvidenceTarget::G17S => G17PmgrTextEvidence {
+            enable_device: 0xffff_fe00_097b_9c90,
+            enable_device_gated: 0xffff_fe00_097b_9e28,
+            sync_device_status_change: 0xffff_fe00_097b_aa6c,
+            was_device_disabled: 0xffff_fe00_097b_b598,
+            enable_cluster: 0xffff_fe00_097a_f6f4,
+            read_reg32: 0xffff_fe00_097a_9a4c,
+            wait_reg32: 0xffff_fe00_097a_9c8c,
+            platform_write_reg32: 0xffff_fe00_09bf_238c,
+        },
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum G17AscPowerOnStep {
+    ProviderEnableDeviceClockIndexZero,
+    PmgrEnableDevice,
+    ResolveFlag16ClusterDevice,
+    SyncDeviceStatusChange,
+    ResolvePhysicalCluster,
+    ReadClusterRegister,
+    WriteClusterRegisterThroughPlatformBackend,
+    WaitClusterRegister,
+    ReadClusterPowerState,
+    ProviderEnableDevicePowerStatusQueryIndexZero,
+}
+
+/// Cold enable route for the scoped flag-16 ASC PMGR devices when no cluster
+/// object is already active. Warm/refcounted and disable routes are distinct
+/// branches and are intentionally not inferred from this sequence.
+pub(crate) const G17_ASC_POWER_ON_ORDER: [G17AscPowerOnStep; 10] = [
+    G17AscPowerOnStep::ProviderEnableDeviceClockIndexZero,
+    G17AscPowerOnStep::PmgrEnableDevice,
+    G17AscPowerOnStep::ResolveFlag16ClusterDevice,
+    G17AscPowerOnStep::SyncDeviceStatusChange,
+    G17AscPowerOnStep::ResolvePhysicalCluster,
+    G17AscPowerOnStep::ReadClusterRegister,
+    G17AscPowerOnStep::WriteClusterRegisterThroughPlatformBackend,
+    G17AscPowerOnStep::WaitClusterRegister,
+    G17AscPowerOnStep::ReadClusterPowerState,
+    G17AscPowerOnStep::ProviderEnableDevicePowerStatusQueryIndexZero,
+];
+
+pub(crate) const G17_CLUSTER_WAIT_MASK: u32 = 0x10;
+pub(crate) const G17_CLUSTER_WAIT_VALUE: u32 = 0;
+
+pub(crate) fn validate_g17_asc_power_on_order(observed: &[G17AscPowerOnStep]) -> bool {
+    observed == G17_ASC_POWER_ON_ORDER
+}
+
+/// The cluster table supplies these operands at runtime. DeviceTree gate IDs
+/// alone cannot derive them, so an executor must reject an incomplete set.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PmgrClusterOperands {
+    pub(crate) cluster_index: Option<u8>,
+    pub(crate) register_map: Option<u8>,
+    pub(crate) register_offset: Option<u32>,
+    pub(crate) timeout: Option<u32>,
+}
+
+pub(crate) const fn g17_pmgr_cluster_operands_complete(operands: G17PmgrClusterOperands) -> bool {
+    operands.cluster_index.is_some()
+        && operands.register_map.is_some()
+        && operands.register_offset.is_some()
+        && operands.timeout.is_some()
+}
+
 /// Named start operations recovered by resolving the AppleA7IOP virtual
 /// slots against the ASCWrap-v6 vtable.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -211,7 +479,7 @@ pub(crate) enum A7IopStopStep {
     RequireRunning,
     IfMailboxSetupDisableOutbox,
     IfMailboxSetupDisableMailboxInterrupts,
-    IfWrapperMmioBoundedDisablePowerAttempts,
+    IfWrapperMmioBoundedIdleProbe,
     RunCpuFalse,
     UnmapFirmware,
     IfMapperFlagClearMapperActive,
@@ -219,14 +487,14 @@ pub(crate) enum A7IopStopStep {
     ClearRunningFlag,
 }
 
-/// Owner-invoked `stopCPU(bool, bool)` teardown order.  When wrapper MMIO is
-/// enabled, `_disablePower` is attempted at most eleven times (the initial
-/// call plus up to ten delayed retries) before the stop sequence continues.
+/// Owner-invoked `stopCPU(bool, bool)` teardown order. When wrapper MMIO is
+/// enabled, `_isIdle` is called once and then up to ten more times after 1 ms
+/// delays. A still-busy result emits a diagnostic but teardown continues.
 pub(crate) const G17_A7IOP_STOP_ORDER: [A7IopStopStep; 9] = [
     A7IopStopStep::RequireRunning,
     A7IopStopStep::IfMailboxSetupDisableOutbox,
     A7IopStopStep::IfMailboxSetupDisableMailboxInterrupts,
-    A7IopStopStep::IfWrapperMmioBoundedDisablePowerAttempts,
+    A7IopStopStep::IfWrapperMmioBoundedIdleProbe,
     A7IopStopStep::RunCpuFalse,
     A7IopStopStep::UnmapFirmware,
     A7IopStopStep::IfMapperFlagClearMapperActive,
@@ -234,11 +502,30 @@ pub(crate) const G17_A7IOP_STOP_ORDER: [A7IopStopStep; 9] = [
     A7IopStopStep::ClearRunningFlag,
 ];
 
-pub(crate) const A7IOP_STOP_DISABLE_POWER_MAX_CALLS: u8 = 11;
+pub(crate) const A7IOP_STOP_IDLE_PROBE_MAX_CALLS: u8 = 11;
+pub(crate) const A7IOP_STOP_IDLE_RETRY_DELAY_US: u32 = 1_000;
 
 pub(crate) fn validate_a7iop_stop_order(observed: &[A7IopStopStep]) -> bool {
     observed == G17_A7IOP_STOP_ORDER
 }
+
+/// RTBuddy owns the normal Apple teardown edge. Its `forcePowerOff(bool)`
+/// fetches the IOSlaveCPU provider at +0xb0 and, unless an RTBuddy override
+/// suppresses the call, invokes vtable slot +0x8c0 (`stopCPU(bool)`) with
+/// `true`. This call shape is present in all pinned P/G/S RTBuddy images.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct RtBuddyStopOwnerContract {
+    pub(crate) provider_object_offset: u16,
+    pub(crate) stop_cpu_bool_vtable_offset: u16,
+    pub(crate) stop_argument: bool,
+}
+
+pub(crate) const G17_RTBUDDY_STOP_OWNER_CONTRACT: RtBuddyStopOwnerContract =
+    RtBuddyStopOwnerContract {
+        provider_object_offset: 0xb0,
+        stop_cpu_bool_vtable_offset: 0x8c0,
+        stop_argument: true,
+    };
 
 /// `AppleA7IOP::resetState()` is software bookkeeping only.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -476,17 +763,23 @@ impl G17AscBringup {
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct G17AscLiveGaps {
     pub(crate) pmgr_set_power_state_gate_order_owned: bool,
+    pub(crate) pmgr_cluster_runtime_operands_proven: bool,
     pub(crate) asc_control_aperture_owned: bool,
     pub(crate) iorvbar_aperture_and_dma_visibility_owned: bool,
+    pub(crate) firmware_publication_cache_operation_proven: bool,
     pub(crate) wrapper_mmio_enable_source_proven: bool,
+    pub(crate) teardown_owner_identified: bool,
     pub(crate) stop_cpu_teardown_owner_wired: bool,
 }
 
 pub(crate) const G17_ASC_LIVE_GAPS: G17AscLiveGaps = G17AscLiveGaps {
     pmgr_set_power_state_gate_order_owned: false,
+    pmgr_cluster_runtime_operands_proven: false,
     asc_control_aperture_owned: false,
     iorvbar_aperture_and_dma_visibility_owned: false,
-    wrapper_mmio_enable_source_proven: false,
+    firmware_publication_cache_operation_proven: false,
+    wrapper_mmio_enable_source_proven: true,
+    teardown_owner_identified: true,
     stop_cpu_teardown_owner_wired: false,
 };
 
@@ -505,6 +798,88 @@ mod tests {
         assert_ne!(p, s);
         assert_ne!(g, s);
         assert!(G17_ASC_BRIDGE_TARGET_PARITY_PROVEN);
+        assert_eq!(p.ascwrap_is_idle, 0xffff_fe00_08ab_a414);
+        assert_eq!(g.a7iop_enable_power, 0xffff_fe00_08be_fb68);
+        assert_eq!(s.rtbuddy_force_power_off, 0xffff_fe00_0b2e_2bec);
+    }
+
+    #[test]
+    fn device_properties_control_wrapper_mmio_and_idle_plan_exactly() {
+        assert_eq!(ASC_CPU_CTRL_FILTERED_PROPERTY, "cpu-ctrl-filtered");
+        assert_eq!(ASC_IDLE_CTRL_CHECK_PROPERTY, "idle-ctrl-check");
+        for properties in G17_ASC_PROVIDER_PROPERTIES {
+            assert!(wrapper_mmio_enabled(properties));
+            assert_eq!(asc_idle_plan(properties).len, 1);
+            assert_eq!(
+                asc_idle_plan(properties).ops[0],
+                AscIdleOp::ReadStatus {
+                    offset: 0x8000,
+                    idle_mask: 3,
+                }
+            );
+        }
+
+        let filtered = G17AscProviderProperties {
+            cpu_ctrl_filtered: true,
+            idle_ctrl_check: false,
+        };
+        assert!(!wrapper_mmio_enabled(filtered));
+
+        let guarded = G17AscProviderProperties {
+            cpu_ctrl_filtered: false,
+            idle_ctrl_check: true,
+        };
+        assert_eq!(asc_idle_plan(guarded).len, 2);
+        assert_eq!(
+            asc_idle_plan(guarded).ops[0],
+            AscIdleOp::ReadPrerequisite { offset: 0x40 }
+        );
+    }
+
+    #[test]
+    fn idle_classifier_is_fail_closed_and_preserves_short_circuit() {
+        let direct = G17_ASC_PROVIDER_PROPERTIES[0];
+        assert_eq!(
+            classify_asc_idle(direct, None, Some(0)),
+            Ok(AscIdleResult::Busy)
+        );
+        assert_eq!(
+            classify_asc_idle(direct, None, Some(1)),
+            Ok(AscIdleResult::Idle)
+        );
+        assert_eq!(
+            classify_asc_idle(direct, None, Some(2)),
+            Ok(AscIdleResult::Idle)
+        );
+        assert_eq!(
+            classify_asc_idle(direct, None, Some(4)),
+            Ok(AscIdleResult::Busy)
+        );
+        assert_eq!(
+            classify_asc_idle(direct, Some(1), Some(1)),
+            Err(AscIdleError::UnexpectedPrerequisiteRead)
+        );
+        assert_eq!(
+            classify_asc_idle(direct, None, None),
+            Err(AscIdleError::MissingStatusRead)
+        );
+
+        let guarded = G17AscProviderProperties {
+            cpu_ctrl_filtered: false,
+            idle_ctrl_check: true,
+        };
+        assert_eq!(
+            classify_asc_idle(guarded, None, Some(1)),
+            Err(AscIdleError::MissingPrerequisiteRead)
+        );
+        assert_eq!(
+            classify_asc_idle(guarded, Some(0), None),
+            Ok(AscIdleResult::Busy)
+        );
+        assert_eq!(
+            classify_asc_idle(guarded, Some(1), Some(3)),
+            Ok(AscIdleResult::Idle)
+        );
     }
 
     #[test]
@@ -518,6 +893,54 @@ mod tests {
             validate_iorvbar_write(0x2800_0000, 0x2800_1001),
             Err(IorvbarError::WrongEncodedValue)
         );
+        assert_eq!(G17_IORVBAR_OWNER_CONTRACT.provider_resource_index, 1);
+        assert_eq!(G17_IORVBAR_OWNER_CONTRACT.map_options, 0);
+        assert!(G17_IORVBAR_OWNER_CONTRACT.obtains_virtual_address);
+        assert_eq!(G17_IORVBAR_OWNER_CONTRACT.write_width_bytes, 8);
+    }
+
+    #[test]
+    fn firmware_visibility_does_not_invent_a_cache_publication_step() {
+        let visibility = G17_FIRMWARE_VISIBILITY_CONTRACT;
+        assert_eq!(visibility.map_bypass_option_mask, 2);
+        assert!(visibility.iboot_uses_dart_mapper);
+        assert!(visibility.non_iboot_requires_valid_iorvbar);
+        assert!(!visibility.ascwrap_performs_cache_maintenance);
+        assert!(!visibility.rtbuddy_publication_cache_operation_proven);
+    }
+
+    #[test]
+    fn pmgr_power_order_is_exact_but_runtime_cluster_operands_stay_closed() {
+        assert!(validate_g17_asc_power_on_order(&G17_ASC_POWER_ON_ORDER));
+        let mut reordered = G17_ASC_POWER_ON_ORDER;
+        reordered.swap(5, 6);
+        assert!(!validate_g17_asc_power_on_order(&reordered));
+        assert_eq!(G17_CLUSTER_WAIT_MASK, 0x10);
+        assert_eq!(G17_CLUSTER_WAIT_VALUE, 0);
+
+        let incomplete = G17PmgrClusterOperands {
+            cluster_index: Some(0),
+            register_map: None,
+            register_offset: Some(0x20),
+            timeout: Some(100),
+        };
+        assert!(!g17_pmgr_cluster_operands_complete(incomplete));
+        assert!(g17_pmgr_cluster_operands_complete(G17PmgrClusterOperands {
+            cluster_index: Some(0),
+            register_map: Some(1),
+            register_offset: Some(0x20),
+            timeout: Some(100),
+        }));
+
+        let p = g17_pmgr_text_evidence(G17AscEvidenceTarget::G17P);
+        let g = g17_pmgr_text_evidence(G17AscEvidenceTarget::G17G);
+        let s = g17_pmgr_text_evidence(G17AscEvidenceTarget::G17S);
+        assert_ne!(p, g);
+        assert_ne!(p, s);
+        assert_ne!(g, s);
+        assert_eq!(p.platform_write_reg32, 0xffff_fe00_09b3_c80c);
+        assert_eq!(g.platform_write_reg32, 0xffff_fe00_09f7_c230);
+        assert_eq!(s.platform_write_reg32, 0xffff_fe00_09bf_238c);
     }
 
     #[test]
@@ -547,7 +970,14 @@ mod tests {
         let mut wrong_stop = G17_A7IOP_STOP_ORDER;
         wrong_stop.swap(4, 5);
         assert!(!validate_a7iop_stop_order(&wrong_stop));
-        assert_eq!(A7IOP_STOP_DISABLE_POWER_MAX_CALLS, 11);
+        assert_eq!(A7IOP_STOP_IDLE_PROBE_MAX_CALLS, 11);
+        assert_eq!(A7IOP_STOP_IDLE_RETRY_DELAY_US, 1_000);
+        assert_eq!(G17_RTBUDDY_STOP_OWNER_CONTRACT.provider_object_offset, 0xb0);
+        assert_eq!(
+            G17_RTBUDDY_STOP_OWNER_CONTRACT.stop_cpu_bool_vtable_offset,
+            0x8c0
+        );
+        assert!(G17_RTBUDDY_STOP_OWNER_CONTRACT.stop_argument);
     }
 
     #[test]
@@ -650,9 +1080,12 @@ mod tests {
     fn every_live_ownership_gate_remains_closed() {
         let gaps = G17_ASC_LIVE_GAPS;
         assert!(!gaps.pmgr_set_power_state_gate_order_owned);
+        assert!(!gaps.pmgr_cluster_runtime_operands_proven);
         assert!(!gaps.asc_control_aperture_owned);
         assert!(!gaps.iorvbar_aperture_and_dma_visibility_owned);
-        assert!(!gaps.wrapper_mmio_enable_source_proven);
+        assert!(!gaps.firmware_publication_cache_operation_proven);
+        assert!(gaps.wrapper_mmio_enable_source_proven);
+        assert!(gaps.teardown_owner_identified);
         assert!(!gaps.stop_cpu_teardown_owner_wired);
         assert!(!EXECUTABLE_G17_ASC_BRINGUP_AVAILABLE);
     }
