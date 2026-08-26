@@ -22,6 +22,8 @@ pub(crate) enum G17AscEvidenceTarget {
 pub(crate) struct G17AscTextEvidence {
     pub(crate) rtbuddy_load_firmware: u64,
     pub(crate) rtbuddy_force_power_off: u64,
+    pub(crate) rtbuddy_copy_to_target: u64,
+    pub(crate) rtbuddy_write_back_patch_bay: u64,
     pub(crate) a7iop_start_cpu_with_options: u64,
     pub(crate) a7iop_stop_cpu: u64,
     pub(crate) a7iop_reset_state: u64,
@@ -37,6 +39,8 @@ pub(crate) const fn g17_asc_text_evidence(target: G17AscEvidenceTarget) -> G17As
         G17AscEvidenceTarget::G17P => G17AscTextEvidence {
             rtbuddy_load_firmware: 0xffff_fe00_0b1f_b288,
             rtbuddy_force_power_off: 0xffff_fe00_0b1f_13bc,
+            rtbuddy_copy_to_target: 0xffff_fe00_0b1f_f028,
+            rtbuddy_write_back_patch_bay: 0xffff_fe00_0b1f_fa00,
             a7iop_start_cpu_with_options: 0xffff_fe00_08ab_c6d0,
             a7iop_stop_cpu: 0xffff_fe00_08ab_ca30,
             a7iop_reset_state: 0xffff_fe00_08ab_dde0,
@@ -49,6 +53,8 @@ pub(crate) const fn g17_asc_text_evidence(target: G17AscEvidenceTarget) -> G17As
         G17AscEvidenceTarget::G17G => G17AscTextEvidence {
             rtbuddy_load_firmware: 0xffff_fe00_0b5f_df08,
             rtbuddy_force_power_off: 0xffff_fe00_0b5f_403c,
+            rtbuddy_copy_to_target: 0xffff_fe00_0b60_1ca8,
+            rtbuddy_write_back_patch_bay: 0xffff_fe00_0b60_2680,
             a7iop_start_cpu_with_options: 0xffff_fe00_08be_fd20,
             a7iop_stop_cpu: 0xffff_fe00_08bf_0080,
             a7iop_reset_state: 0xffff_fe00_08bf_1430,
@@ -61,6 +67,8 @@ pub(crate) const fn g17_asc_text_evidence(target: G17AscEvidenceTarget) -> G17As
         G17AscEvidenceTarget::G17S => G17AscTextEvidence {
             rtbuddy_load_firmware: 0xffff_fe00_0b2e_cab8,
             rtbuddy_force_power_off: 0xffff_fe00_0b2e_2bec,
+            rtbuddy_copy_to_target: 0xffff_fe00_0b2f_0858,
+            rtbuddy_write_back_patch_bay: 0xffff_fe00_0b2f_1230,
             a7iop_start_cpu_with_options: 0xffff_fe00_08bb_6a50,
             a7iop_stop_cpu: 0xffff_fe00_08bb_6db0,
             a7iop_reset_state: 0xffff_fe00_08bb_8160,
@@ -301,11 +309,10 @@ pub(crate) const G17_IORVBAR_OWNER_CONTRACT: AscIorvbarOwnerContract = AscIorvba
     write_width_bytes: 8,
 };
 
-/// Facts visible in `AppleASCWrapV6::_mapFirmware`. Bit one bypasses mapping;
-/// iBoot firmware is handed to `AppleA7IOP::dartMapiBootFirmware`, while the
-/// non-iBoot path requires an already-valid IORVBAR. No cache operation is
-/// performed by this wrapper method. The descriptor completion/visibility
-/// operation in RTBuddy is not yet named strongly enough to execute in Linux.
+/// Facts visible in `AppleASCWrapV6::_mapFirmware` and the common RTBuddy
+/// publication path. Bit one bypasses mapping; iBoot firmware is handed to
+/// `AppleA7IOP::dartMapiBootFirmware`, while the non-iBoot path requires an
+/// already-valid IORVBAR. The wrapper itself performs no cache operation.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct G17FirmwareVisibilityContract {
     pub(crate) map_bypass_option_mask: u32,
@@ -321,8 +328,119 @@ pub(crate) const G17_FIRMWARE_VISIBILITY_CONTRACT: G17FirmwareVisibilityContract
         iboot_uses_dart_mapper: true,
         non_iboot_requires_valid_iorvbar: true,
         ascwrap_performs_cache_maintenance: false,
-        rtbuddy_publication_cache_operation_proven: false,
+        rtbuddy_publication_cache_operation_proven: true,
     };
+
+/// XNU's exact operation identifier passed by RTBuddy after both CPU copies.
+/// `kIOMemoryIncoherentIOStore` stores dirty processor-cache data to memory and
+/// synchronizes it through all cache levels. This is a store, not the stronger
+/// store-and-invalidate operation `kIOMemoryIncoherentIOFlush` (value one).
+pub(crate) const IOMEMORY_INCOHERENT_IO_STORE: u32 = 2;
+pub(crate) const IOMEMORY_DESCRIPTOR_PERFORM_OPERATION_VTABLE_OFFSET: u16 = 0x148;
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum RtBuddyPublicationLength {
+    FirmwareDescriptorLength,
+    PatchBayMappingLength,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum RtBuddyPublicationOp {
+    FullImageCpuCopy,
+    DescriptorStore {
+        option: u32,
+        offset: u64,
+        length: RtBuddyPublicationLength,
+    },
+    FullImageMapRelease,
+    PatchBayCpuCopy,
+    PatchBayMapRelease,
+}
+
+/// Cache-publication operations projected from `copyToTarget()` and
+/// `writeBackPatchBay()`. Other firmware patch callbacks occur between the
+/// two triples and are intentionally outside this projection. Within each
+/// triple, the store is immediately after the CPU copy and before map release.
+pub(crate) const G17_RTBUDDY_PUBLICATION_ORDER: [RtBuddyPublicationOp; 6] = [
+    RtBuddyPublicationOp::FullImageCpuCopy,
+    RtBuddyPublicationOp::DescriptorStore {
+        option: IOMEMORY_INCOHERENT_IO_STORE,
+        offset: 0,
+        length: RtBuddyPublicationLength::FirmwareDescriptorLength,
+    },
+    RtBuddyPublicationOp::FullImageMapRelease,
+    RtBuddyPublicationOp::PatchBayCpuCopy,
+    RtBuddyPublicationOp::DescriptorStore {
+        option: IOMEMORY_INCOHERENT_IO_STORE,
+        offset: 0,
+        length: RtBuddyPublicationLength::PatchBayMappingLength,
+    },
+    RtBuddyPublicationOp::PatchBayMapRelease,
+];
+
+/// The two bounded publication windows are instruction-identical in the
+/// pinned G17P, G17G, and G17S kernelcaches after using function-relative
+/// windows; this is stronger than assuming the common RTBuddy source stayed
+/// equivalent across targets.
+pub(crate) const G17_RTBUDDY_PUBLICATION_TARGET_PARITY_PROVEN: bool = true;
+pub(crate) const G17_RTBUDDY_FULL_IMAGE_PUBLICATION_WINDOW_LEN: usize = 0x88;
+pub(crate) const G17_RTBUDDY_FULL_IMAGE_PUBLICATION_WINDOW_SHA256: &str =
+    "42b961f82d5677694401daed755734168d91574e53ef1d1b9c5e709de569c60b";
+pub(crate) const G17_RTBUDDY_PATCH_BAY_PUBLICATION_WINDOW_LEN: usize = 0xbc;
+pub(crate) const G17_RTBUDDY_PATCH_BAY_PUBLICATION_WINDOW_SHA256: &str =
+    "4fcbf48f0ea6a4054874d60292ac6cb6c600e7886fb369dcd59fa2c6d93ce8de";
+
+pub(crate) fn validate_rtbuddy_publication_order(observed: &[RtBuddyPublicationOp]) -> bool {
+    observed == G17_RTBUDDY_PUBLICATION_ORDER
+}
+
+/// Linux ownership boundary for ASCWrap-v6. `apple-mailbox` is the platform
+/// driver already bound to the ASC provider node and exclusively claims
+/// resource zero. It must therefore become the sole low-level lifecycle owner:
+/// resource zero contains CPU control and mailbox state, resource one is the
+/// independent IORVBAR aperture, and the same owner must bracket both with
+/// power/idle/stop. DRM owns the firmware DMA buffer and requests the lifecycle
+/// transition, but must never map either resource beside the mailbox driver.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum LinuxAscOwner {
+    AppleMailboxProvider,
+    DrmAsahi,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17LinuxAscOwnerContract {
+    pub(crate) wrapper_resource0: LinuxAscOwner,
+    pub(crate) iorvbar_resource1: LinuxAscOwner,
+    pub(crate) power_enable: LinuxAscOwner,
+    pub(crate) idle_probe: LinuxAscOwner,
+    pub(crate) cpu_control: LinuxAscOwner,
+    pub(crate) stop_cpu_teardown: LinuxAscOwner,
+    pub(crate) firmware_dma_publication: LinuxAscOwner,
+    pub(crate) lifecycle_client: LinuxAscOwner,
+}
+
+pub(crate) const G17_LINUX_ASC_OWNER_CONTRACT: G17LinuxAscOwnerContract =
+    G17LinuxAscOwnerContract {
+        wrapper_resource0: LinuxAscOwner::AppleMailboxProvider,
+        iorvbar_resource1: LinuxAscOwner::AppleMailboxProvider,
+        power_enable: LinuxAscOwner::AppleMailboxProvider,
+        idle_probe: LinuxAscOwner::AppleMailboxProvider,
+        cpu_control: LinuxAscOwner::AppleMailboxProvider,
+        stop_cpu_teardown: LinuxAscOwner::AppleMailboxProvider,
+        firmware_dma_publication: LinuxAscOwner::DrmAsahi,
+        lifecycle_client: LinuxAscOwner::DrmAsahi,
+    };
+
+pub(crate) fn validate_linux_asc_owner_contract(observed: G17LinuxAscOwnerContract) -> bool {
+    observed.wrapper_resource0 == LinuxAscOwner::AppleMailboxProvider
+        && observed.iorvbar_resource1 == LinuxAscOwner::AppleMailboxProvider
+        && observed.power_enable == LinuxAscOwner::AppleMailboxProvider
+        && observed.idle_probe == LinuxAscOwner::AppleMailboxProvider
+        && observed.cpu_control == LinuxAscOwner::AppleMailboxProvider
+        && observed.stop_cpu_teardown == LinuxAscOwner::AppleMailboxProvider
+        && observed.firmware_dma_publication == LinuxAscOwner::DrmAsahi
+        && observed.lifecycle_client == LinuxAscOwner::DrmAsahi
+}
 
 /// Per-kernelcache PMGR anchors. The common `AppleA7IOP::_enablePower` and
 /// `ApplePMGR::enableCluster` instruction words are identical on P/G/S. The
@@ -612,6 +730,7 @@ pub(crate) const fn classify_host_wait_deadline(diagnostic_override: u64) -> Hos
 pub(crate) enum AscBringupPhase {
     Off,
     PowerStateRequested,
+    FirmwarePublished,
     PowerLateAccepted,
     IorvbarProgrammed,
     RunningMarked,
@@ -623,6 +742,7 @@ pub(crate) enum AscBringupPhase {
 pub(crate) enum AscBringupError {
     WrongOrder,
     WrongPowerState,
+    FirmwarePublicationTraceMismatch,
     EnablePowerLateFailed(u32),
     Iorvbar(IorvbarError),
     RunCpuTraceMismatch,
@@ -683,13 +803,30 @@ impl G17AscBringup {
         if self.phase == AscBringupPhase::Failed {
             return Err(AscBringupError::AlreadyFailed);
         }
-        if self.phase != AscBringupPhase::PowerStateRequested {
+        if self.phase != AscBringupPhase::FirmwarePublished {
             return self.fail(AscBringupError::WrongOrder);
         }
         if result != 0 {
             return self.fail(AscBringupError::EnablePowerLateFailed(result));
         }
         self.phase = AscBringupPhase::PowerLateAccepted;
+        Ok(())
+    }
+
+    pub(crate) fn observe_firmware_publication(
+        &mut self,
+        observed: &[RtBuddyPublicationOp],
+    ) -> Result<(), AscBringupError> {
+        if self.phase == AscBringupPhase::Failed {
+            return Err(AscBringupError::AlreadyFailed);
+        }
+        if self.phase != AscBringupPhase::PowerStateRequested {
+            return self.fail(AscBringupError::WrongOrder);
+        }
+        if !validate_rtbuddy_publication_order(observed) {
+            return self.fail(AscBringupError::FirmwarePublicationTraceMismatch);
+        }
+        self.phase = AscBringupPhase::FirmwarePublished;
         Ok(())
     }
 
@@ -777,7 +914,7 @@ pub(crate) const G17_ASC_LIVE_GAPS: G17AscLiveGaps = G17AscLiveGaps {
     pmgr_cluster_runtime_operands_proven: false,
     asc_control_aperture_owned: false,
     iorvbar_aperture_and_dma_visibility_owned: false,
-    firmware_publication_cache_operation_proven: false,
+    firmware_publication_cache_operation_proven: true,
     wrapper_mmio_enable_source_proven: true,
     teardown_owner_identified: true,
     stop_cpu_teardown_owner_wired: false,
@@ -799,8 +936,19 @@ mod tests {
         assert_ne!(g, s);
         assert!(G17_ASC_BRIDGE_TARGET_PARITY_PROVEN);
         assert_eq!(p.ascwrap_is_idle, 0xffff_fe00_08ab_a414);
+        assert_eq!(p.rtbuddy_copy_to_target, 0xffff_fe00_0b1f_f028);
+        assert_eq!(p.rtbuddy_write_back_patch_bay, 0xffff_fe00_0b1f_fa00);
         assert_eq!(g.a7iop_enable_power, 0xffff_fe00_08be_fb68);
+        assert_eq!(g.rtbuddy_copy_to_target, 0xffff_fe00_0b60_1ca8);
+        assert_eq!(g.rtbuddy_write_back_patch_bay, 0xffff_fe00_0b60_2680);
         assert_eq!(s.rtbuddy_force_power_off, 0xffff_fe00_0b2e_2bec);
+        assert_eq!(s.rtbuddy_copy_to_target, 0xffff_fe00_0b2f_0858);
+        assert_eq!(s.rtbuddy_write_back_patch_bay, 0xffff_fe00_0b2f_1230);
+        assert!(G17_RTBUDDY_PUBLICATION_TARGET_PARITY_PROVEN);
+        assert_eq!(G17_RTBUDDY_FULL_IMAGE_PUBLICATION_WINDOW_LEN, 0x88);
+        assert_eq!(G17_RTBUDDY_PATCH_BAY_PUBLICATION_WINDOW_LEN, 0xbc);
+        assert_eq!(G17_RTBUDDY_FULL_IMAGE_PUBLICATION_WINDOW_SHA256.len(), 64);
+        assert_eq!(G17_RTBUDDY_PATCH_BAY_PUBLICATION_WINDOW_SHA256.len(), 64);
     }
 
     #[test]
@@ -900,13 +1048,45 @@ mod tests {
     }
 
     #[test]
-    fn firmware_visibility_does_not_invent_a_cache_publication_step() {
+    fn firmware_visibility_pins_both_rtbuddy_store_publications() {
         let visibility = G17_FIRMWARE_VISIBILITY_CONTRACT;
         assert_eq!(visibility.map_bypass_option_mask, 2);
         assert!(visibility.iboot_uses_dart_mapper);
         assert!(visibility.non_iboot_requires_valid_iorvbar);
         assert!(!visibility.ascwrap_performs_cache_maintenance);
-        assert!(!visibility.rtbuddy_publication_cache_operation_proven);
+        assert!(visibility.rtbuddy_publication_cache_operation_proven);
+        assert_eq!(IOMEMORY_INCOHERENT_IO_STORE, 2);
+        assert_eq!(IOMEMORY_DESCRIPTOR_PERFORM_OPERATION_VTABLE_OFFSET, 0x148);
+        assert!(validate_rtbuddy_publication_order(
+            &G17_RTBUDDY_PUBLICATION_ORDER
+        ));
+
+        let mut wrong_option = G17_RTBUDDY_PUBLICATION_ORDER;
+        wrong_option[1] = RtBuddyPublicationOp::DescriptorStore {
+            option: 1,
+            offset: 0,
+            length: RtBuddyPublicationLength::FirmwareDescriptorLength,
+        };
+        assert!(!validate_rtbuddy_publication_order(&wrong_option));
+
+        let mut reordered = G17_RTBUDDY_PUBLICATION_ORDER;
+        reordered.swap(1, 2);
+        assert!(!validate_rtbuddy_publication_order(&reordered));
+    }
+
+    #[test]
+    fn one_provider_owns_both_asc_resources_and_stop_teardown() {
+        assert!(validate_linux_asc_owner_contract(
+            G17_LINUX_ASC_OWNER_CONTRACT
+        ));
+
+        let mut split_iorvbar = G17_LINUX_ASC_OWNER_CONTRACT;
+        split_iorvbar.iorvbar_resource1 = LinuxAscOwner::DrmAsahi;
+        assert!(!validate_linux_asc_owner_contract(split_iorvbar));
+
+        let mut split_stop = G17_LINUX_ASC_OWNER_CONTRACT;
+        split_stop.stop_cpu_teardown = LinuxAscOwner::DrmAsahi;
+        assert!(!validate_linux_asc_owner_contract(split_stop));
     }
 
     #[test]
@@ -1017,6 +1197,8 @@ mod tests {
     fn advanced_bringup() -> G17AscBringup {
         let mut boot = G17AscBringup::new();
         boot.observe_rtbuddy_power_state(3).unwrap();
+        boot.observe_firmware_publication(&G17_RTBUDDY_PUBLICATION_ORDER)
+            .unwrap();
         boot.record_enable_power_late(0).unwrap();
         boot.observe_iorvbar_write(0x2800_0000, 0x2800_0001)
             .unwrap();
@@ -1041,12 +1223,31 @@ mod tests {
             wrong.observe_rtbuddy_power_state(3),
             Err(AscBringupError::AlreadyFailed)
         );
+
+        let mut unpublished = G17AscBringup::new();
+        unpublished.observe_rtbuddy_power_state(3).unwrap();
+        assert_eq!(
+            unpublished.record_enable_power_late(0),
+            Err(AscBringupError::WrongOrder)
+        );
+
+        let mut bad_publication = G17AscBringup::new();
+        bad_publication.observe_rtbuddy_power_state(3).unwrap();
+        let mut reordered = G17_RTBUDDY_PUBLICATION_ORDER;
+        reordered.swap(1, 2);
+        assert_eq!(
+            bad_publication.observe_firmware_publication(&reordered),
+            Err(AscBringupError::FirmwarePublicationTraceMismatch)
+        );
     }
 
     #[test]
     fn partial_start_and_timeout_require_owner_teardown_not_reset_state() {
         let mut failed_power = G17AscBringup::new();
         failed_power.observe_rtbuddy_power_state(3).unwrap();
+        failed_power
+            .observe_firmware_publication(&G17_RTBUDDY_PUBLICATION_ORDER)
+            .unwrap();
         assert_eq!(
             failed_power.record_enable_power_late(0xe000_02bc),
             Err(AscBringupError::EnablePowerLateFailed(0xe000_02bc))
@@ -1077,13 +1278,13 @@ mod tests {
     }
 
     #[test]
-    fn every_live_ownership_gate_remains_closed() {
+    fn cache_identity_is_proven_but_live_ownership_gates_remain_closed() {
         let gaps = G17_ASC_LIVE_GAPS;
         assert!(!gaps.pmgr_set_power_state_gate_order_owned);
         assert!(!gaps.pmgr_cluster_runtime_operands_proven);
         assert!(!gaps.asc_control_aperture_owned);
         assert!(!gaps.iorvbar_aperture_and_dma_visibility_owned);
-        assert!(!gaps.firmware_publication_cache_operation_proven);
+        assert!(gaps.firmware_publication_cache_operation_proven);
         assert!(gaps.wrapper_mmio_enable_source_proven);
         assert!(gaps.teardown_owner_identified);
         assert!(!gaps.stop_cpu_teardown_owner_wired);
