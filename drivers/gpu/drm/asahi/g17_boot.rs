@@ -1349,6 +1349,21 @@ mod tests {
             }
         );
 
+        // D93AP uses two physical ASC transports. The pinned G17P host starts
+        // GFX, then GFX1, requires both calls to succeed, and only then waits
+        // on the combined-started byte. Its object layout matches G17S.
+        let g17p = g17_host_boot_ops(G17HostBootEvidenceTarget::G17P);
+        assert!(validate_g17_host_boot_ops(
+            G17HostBootEvidenceTarget::G17P,
+            &g17p
+        ));
+        assert_eq!(g17p, g17s);
+        assert_eq!(g17p[5], G17xHostBootOp::RequireBothRoleStarts);
+        assert!(matches!(
+            g17p[6],
+            G17xHostBootOp::WaitForEitherRoleStarted { .. }
+        ));
+
         let g17g = g17_host_boot_ops(G17HostBootEvidenceTarget::G17G);
         assert!(validate_g17_host_boot_ops(
             G17HostBootEvidenceTarget::G17G,
