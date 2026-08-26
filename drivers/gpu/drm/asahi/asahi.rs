@@ -22,6 +22,7 @@ mod g17_asc_bringup;
 mod g17_boot;
 mod g17_firmware;
 mod g17_initdata;
+mod g17_live_boot;
 mod g17_power_preflight;
 mod g17_rtkit;
 mod g17_submission;

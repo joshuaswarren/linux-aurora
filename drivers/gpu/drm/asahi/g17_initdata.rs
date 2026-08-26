@@ -46,6 +46,14 @@ pub(crate) const PARSE_ACCEPTED_GRAPH_AVAILABLE: bool = true;
 /// `g17_boot::missing::GFX1_POWER_SEQUENCE`, and a wrong value is a functional
 /// (not a parse-acceptance) failure that only a live M5 boot can expose.
 pub(crate) const ALL_HW_GLOBALS_VALUES_GROUNDED: bool = false;
+/// The perf-state *clock* column of `hw_globals` is sourced from the device
+/// tree's `operating-points-v2` OPP table at boot (see
+/// `g17_live_boot::read_perf_state_clocks_mhz`) rather than a synthetic
+/// constant. This is honest partial progress toward
+/// [`ALL_HW_GLOBALS_VALUES_GROUNDED`]: the voltage/power columns and the
+/// feature words across the rest of the 0x2828-byte struct still require
+/// firmware RE and remain zero-filled, so the umbrella flag stays false.
+pub(crate) const PERF_STATE_CLOCKS_DT_SOURCED: bool = true;
 
 pub(crate) const ROOT_SIZE: usize = 0x0c8;
 pub(crate) const RUNTIME_POINTERS_SIZE: usize = 0x4c0;
