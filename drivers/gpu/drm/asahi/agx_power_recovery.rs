@@ -453,6 +453,94 @@ pub(crate) struct G17MetaSwInterruptEvidence {
     pub(crate) trailing_u32: u32,
 }
 
+/// One address/size pair from the Apple DeviceTree `reg` property.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17AdtRegisterRange {
+    pub(crate) phys_base: u64,
+    pub(crate) size: u32,
+}
+
+/// Exact public D93AP/T8140 topology required before A18 Pro live bring-up.
+///
+/// This is parsed from `DeviceTree.d93ap.im4p` in iPhone17,1 23G83
+/// (raw payload SHA-256 c7613024b817687fb46cecefb8086a77bfa5a3a98153218452ba5ae2309cbb15).
+/// The zero-count/all-zero performance table is intentional: it is not a
+/// legacy GPU OPP ladder and must not be passed to that initialization path.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct T8140G17PAdtTopology {
+    pub(crate) sgx_regs: [G17AdtRegisterRange; 2],
+    pub(crate) sgx_power_gates: [u32; 2],
+    pub(crate) clock_id: u32,
+    pub(crate) sgx_interrupts: [u32; 8],
+    pub(crate) gfx_asc_regs: [G17AdtRegisterRange; 2],
+    pub(crate) gfx_asc_power_gate: u32,
+    pub(crate) gfx_asc_interrupts: [u32; 4],
+    pub(crate) gfx1_asc_regs: [G17AdtRegisterRange; 2],
+    pub(crate) gfx1_asc_power_gate: u32,
+    pub(crate) gfx1_asc_interrupts: [u32; 4],
+    pub(crate) shared_iommu_mapper: bool,
+    pub(crate) meta_sw_interrupt: G17MetaSwInterruptEvidence,
+    pub(crate) perf_state_count: u32,
+    pub(crate) gpu_num_perf_states: u32,
+    pub(crate) perf_state_record_count: u32,
+    pub(crate) perf_state_records_all_zero: bool,
+}
+
+pub(crate) const D93AP_T8140_G17P_ADT_TOPOLOGY: T8140G17PAdtTopology = T8140G17PAdtTopology {
+    sgx_regs: [
+        G17AdtRegisterRange {
+            phys_base: 0x2_7000_0000,
+            size: 0x0400_0000,
+        },
+        G17AdtRegisterRange {
+            phys_base: 0x2_70d0_0000,
+            size: 0x0012_c000,
+        },
+    ],
+    sgx_power_gates: [235, 236],
+    clock_id: 351,
+    sgx_interrupts: [975, 976, 977, 978, 1001, 1003, 990, 992],
+    gfx_asc_regs: [
+        G17AdtRegisterRange {
+            phys_base: 0x2_7260_0000,
+            size: 0x0008_8000,
+        },
+        G17AdtRegisterRange {
+            phys_base: 0x2_7205_0000,
+            size: 8,
+        },
+    ],
+    gfx_asc_power_gate: 237,
+    gfx_asc_interrupts: [994, 993, 996, 995],
+    gfx1_asc_regs: [
+        G17AdtRegisterRange {
+            phys_base: 0x2_72e0_0000,
+            size: 0x0008_8000,
+        },
+        G17AdtRegisterRange {
+            phys_base: 0x2_7285_0000,
+            size: 8,
+        },
+    ],
+    gfx1_asc_power_gate: 321,
+    gfx1_asc_interrupts: [998, 997, 1000, 999],
+    shared_iommu_mapper: true,
+    meta_sw_interrupt: G17MetaSwInterruptEvidence {
+        first_u64: 0x3_0101_4048,
+        second_u64: 0x3_0101_4248,
+        trailing_u32: 0x4000,
+    },
+    perf_state_count: 0,
+    gpu_num_perf_states: 2,
+    perf_state_record_count: 16,
+    perf_state_records_all_zero: true,
+};
+
+/// Do not begin A18 Pro live bring-up against an inferred or partial topology.
+pub(crate) fn validate_t8140_g17p_adt_topology(observed: &T8140G17PAdtTopology) -> bool {
+    observed == &D93AP_T8140_G17P_ADT_TOPOLOGY
+}
+
 /// Source from which the pinned host constructs one physical PIO binding.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum G17HostPioBindingSource {
@@ -494,13 +582,9 @@ pub(crate) const fn g17_host_pio_physical_evidence(
 ) -> G17HostPioPhysicalEvidence {
     match target {
         G17HostPioPhysicalEvidenceTarget::G17P => G17HostPioPhysicalEvidence {
-            sgx_phys_base: 0x2_7000_0000,
+            sgx_phys_base: D93AP_T8140_G17P_ADT_TOPOLOGY.sgx_regs[0].phys_base,
             host_io_page_size: 0x4000,
-            meta_sw_interrupt: G17MetaSwInterruptEvidence {
-                first_u64: 0x3_0101_4048,
-                second_u64: 0x3_0101_4248,
-                trailing_u32: 0x4000,
-            },
+            meta_sw_interrupt: D93AP_T8140_G17P_ADT_TOPOLOGY.meta_sw_interrupt,
             target_configure: None,
         },
         G17HostPioPhysicalEvidenceTarget::G17G => G17HostPioPhysicalEvidence {
@@ -1963,6 +2047,31 @@ mod tests {
         );
         assert!(!G17_HOST_PIO_LINUX_MMIO_OWNERSHIP_PROVEN);
         assert!(!EXECUTABLE_GFX1_POWER_SEQUENCE_AVAILABLE);
+    }
+
+    #[test]
+    fn t8140_g17p_adt_topology_is_exact_and_fail_closed() {
+        let exact = D93AP_T8140_G17P_ADT_TOPOLOGY;
+
+        assert!(validate_t8140_g17p_adt_topology(&exact));
+        assert_eq!(exact.sgx_power_gates, [235, 236]);
+        assert_eq!(exact.gfx_asc_power_gate, 237);
+        assert_eq!(exact.gfx1_asc_power_gate, 321);
+        assert!(exact.shared_iommu_mapper);
+        assert_eq!(exact.perf_state_count, 0);
+        assert_eq!(exact.gpu_num_perf_states, 2);
+        assert_eq!(exact.perf_state_record_count, 16);
+        assert!(exact.perf_state_records_all_zero);
+
+        let mut wrong_gfx1_transport = exact;
+        wrong_gfx1_transport.gfx1_asc_regs[0].phys_base = exact.gfx_asc_regs[0].phys_base;
+        assert!(!validate_t8140_g17p_adt_topology(&wrong_gfx1_transport));
+
+        let mut invented_legacy_opp_table = exact;
+        invented_legacy_opp_table.perf_state_count = 2;
+        assert!(!validate_t8140_g17p_adt_topology(
+            &invented_legacy_opp_table
+        ));
     }
 
     #[test]
