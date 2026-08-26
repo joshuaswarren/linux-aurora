@@ -47,6 +47,18 @@
 #define APPLE_ASC_MBOX_I2A_RECV0 0x830
 #define APPLE_ASC_MBOX_I2A_RECV1 0x838
 
+/* ASCWrap v6 embeds the unchanged ASC mailbox block at this offset. */
+#define APPLE_ASCWRAP_V6_MBOX_OFFSET 0x8000
+
+static_assert(APPLE_ASCWRAP_V6_MBOX_OFFSET + APPLE_ASC_MBOX_A2I_CONTROL ==
+	      0x8110);
+static_assert(APPLE_ASCWRAP_V6_MBOX_OFFSET + APPLE_ASC_MBOX_I2A_CONTROL ==
+	      0x8114);
+static_assert(APPLE_ASCWRAP_V6_MBOX_OFFSET + APPLE_ASC_MBOX_A2I_SEND0 ==
+	      0x8800);
+static_assert(APPLE_ASCWRAP_V6_MBOX_OFFSET + APPLE_ASC_MBOX_I2A_RECV0 ==
+	      0x8830);
+
 #define APPLE_T8015_MBOX_A2I_CONTROL	0x108
 #define APPLE_T8015_MBOX_I2A_CONTROL	0x10c
 
@@ -81,6 +93,8 @@
 #define APPLE_MBOX_TX_TIMEOUT 500
 
 struct apple_mbox_hw {
+	unsigned int reg_offset;
+
 	unsigned int control_full;
 	unsigned int control_empty;
 
@@ -337,6 +351,7 @@ static int apple_mbox_probe(struct platform_device *pdev)
 	char *irqname;
 	struct apple_mbox *mbox;
 	struct device *dev = &pdev->dev;
+	struct resource *res;
 
 	mbox = devm_kzalloc(dev, sizeof(*mbox), GFP_KERNEL);
 	if (!mbox)
@@ -347,9 +362,17 @@ static int apple_mbox_probe(struct platform_device *pdev)
 	if (!mbox->hw)
 		return -EINVAL;
 
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	if (!res || resource_size(res) < mbox->hw->reg_offset +
+					mbox->hw->i2a_recv1 + sizeof(u64))
+		return dev_err_probe(dev, -EINVAL,
+				     "mailbox register window is too small\n");
+
 	mbox->regs = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(mbox->regs))
 		return PTR_ERR(mbox->regs);
+	/* Resource 1, when present, is ASC lifecycle state, not mailbox MMIO. */
+	mbox->regs = (u8 __iomem *)mbox->regs + mbox->hw->reg_offset;
 
 	mbox->irq_recv_not_empty =
 		platform_get_irq_byname(pdev, "recv-not-empty");
@@ -422,6 +445,23 @@ static const struct apple_mbox_hw apple_mbox_asc_hw = {
 	.has_irq_controls = false,
 };
 
+static const struct apple_mbox_hw apple_mbox_ascwrap_v6_hw = {
+	.reg_offset = APPLE_ASCWRAP_V6_MBOX_OFFSET,
+
+	.control_full = APPLE_ASC_MBOX_CONTROL_FULL,
+	.control_empty = APPLE_ASC_MBOX_CONTROL_EMPTY,
+
+	.a2i_control = APPLE_ASC_MBOX_A2I_CONTROL,
+	.a2i_send0 = APPLE_ASC_MBOX_A2I_SEND0,
+	.a2i_send1 = APPLE_ASC_MBOX_A2I_SEND1,
+
+	.i2a_control = APPLE_ASC_MBOX_I2A_CONTROL,
+	.i2a_recv0 = APPLE_ASC_MBOX_I2A_RECV0,
+	.i2a_recv1 = APPLE_ASC_MBOX_I2A_RECV1,
+
+	.has_irq_controls = false,
+};
+
 static const struct apple_mbox_hw apple_mbox_m3_hw = {
 	.control_full = APPLE_M3_MBOX_CONTROL_FULL,
 	.control_empty = APPLE_M3_MBOX_CONTROL_EMPTY,
@@ -442,6 +482,7 @@ static const struct apple_mbox_hw apple_mbox_m3_hw = {
 };
 
 static const struct of_device_id apple_mbox_of_match[] = {
+	{ .compatible = "apple,t8140-ascwrap-v6", .data = &apple_mbox_ascwrap_v6_hw },
 	{ .compatible = "apple,asc-mailbox-v4", .data = &apple_mbox_asc_hw },
 	{ .compatible = "apple,t8015-asc-mailbox", .data = &apple_mbox_t8015_hw },
 	{ .compatible = "apple,m3-mailbox-v2", .data = &apple_mbox_m3_hw },
