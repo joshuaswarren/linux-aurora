@@ -12,13 +12,15 @@
 //! channel/work-queue ring producer indices, the SKSM kick word/record, and the
 //! host queue-timestamp plus `addKicks` MMIO producer. It also models the exact
 //! host-side reset images for `_AGFIChannelState` and
-//! `AGXUncachedFWChannelMem`. The provenance ledger explicitly separates
-//! byte-grounded G17 fields from inherited producer records whose G17 consumer
-//! offsets still need first-hand confirmation. The native G17 channel-command
-//! dispatcher is also modeled for the exact A18 Pro/G17P identity: it reads a
-//! little-endian u32 tag at command offset zero, keeps unresolved and nested
-//! SKU meanings out of the top-level enum, and separates the host's `Nop=17`
-//! name from the firmware's fatal rejection of that value.
+//! `AGXUncachedFWChannelMem`, the A18 Pro SKSM hardware-bridge programming
+//! equation, and its four completion-queue descriptors. The provenance ledger
+//! explicitly separates byte-grounded G17 fields from inherited producer
+//! records whose G17 consumer offsets still need first-hand confirmation. The
+//! native G17 channel-command dispatcher is also modeled for the exact A18
+//! Pro/G17P identity: it reads a little-endian u32 tag at command offset zero,
+//! keeps unresolved and nested SKU meanings out of the top-level enum, and
+//! separates the host's `Nop=17` name from the firmware's fatal rejection of
+//! that value.
 //!
 //! Grounding is first-hand from the on-disk M5 role macho `GFX.a010.macho`
 //! (`g17s a0, SKSM Enabled`), all three pinned A18 Pro `g17p` firmware variants
@@ -120,6 +122,16 @@ pub(crate) enum SubmissionError {
     KickEntryOffsetOverflow,
     /// The runtime MMIO aperture selector or base offset overflowed u32.
     KickMmioOffsetOverflow,
+    /// The A18 Pro SKSM queue data-master field is limited to TA/3D/CL.
+    KickQueueDataMasterOutOfRange,
+    /// The A18 Pro SKSM completion-queue selector is outside the host range.
+    KickQueueCompletionSelectorOutOfRange,
+    /// The A18 Pro SKSM entry address cannot be represented by the host mask.
+    KickQueueEntryAddressUnencodable,
+    /// The A18 Pro completion descriptor ordinal is outside its four slots.
+    CompletionQueueOrdinalOutOfRange,
+    /// A present A18 Pro completion queue cannot have zero entries.
+    CompletionQueueCapacityZero,
     /// A ring with zero entries cannot advance a producer index.
     RingSizeZero,
     /// A producer index must identify an entry inside its ring.
@@ -950,7 +962,186 @@ pub(crate) const fn prepare_sksm_add_kicks_mmio(
 }
 
 // ---------------------------------------------------------------------------
-// 7. A18 Pro / G17P top-level channel-command dispatch.
+// 7. A18 Pro / G17P SKSM hardware bridge and completion descriptors.
+//
+//    Grounded from the pinned G17P host. `AGXKSMKickQueueG16::configureHardware`
+//    at 0xfffffe0008a56580-0xfffffe0008a5682c reads the runtime MMIO geometry
+//    at accelerator +0x10730/+0x10734/+0x10738, writes a 64-bit queue tag and
+//    64-bit queue payload, then publishes the QID bit at MMIO +0x21068. The
+//    same geometry is used by `addKicks` (§6). This closes the host-side
+//    programming equation, but not the silicon aperture mapping or live store
+//    ordering, so this module still performs no MMIO and the executable gate
+//    remains closed.
+//
+//    `AGXAcceleratorG16::populateKSMCompletionQueue` at
+//    0xfffffe0008a53034-0xfffffe0008a532b8 emits four 0x20-byte descriptors.
+//    Each present queue has 0x40-byte entries and a fixed ordinal 0..3. The
+//    matched firmware consumes those queues, but the physical platform-IRQ
+//    source selected by Apple's `interrupts`/`interrupts-valid` properties is
+//    not present in the pinned binary, so the completion IRQ live gap remains.
+// ---------------------------------------------------------------------------
+
+/// Offsets of the three runtime words loaded by the G17P host before every
+/// SKSM configuration or `addKicks` publication.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PSksmRuntimeMmioGeometryLayout {
+    pub(crate) tag_offset_base: u32,
+    pub(crate) payload_offset_base: u32,
+    pub(crate) aperture_index: u32,
+}
+
+pub(crate) const G17P_SKSM_RUNTIME_MMIO_GEOMETRY_LAYOUT: G17PSksmRuntimeMmioGeometryLayout =
+    G17PSksmRuntimeMmioGeometryLayout {
+        tag_offset_base: 0x10730,
+        payload_offset_base: 0x10734,
+        aperture_index: 0x10738,
+    };
+
+/// QID-valid mask base written after the two queue-configuration stores.
+pub(crate) const G17P_SKSM_QUEUE_ENABLE_MASK_BASE: u32 = 0x21068;
+/// Queue-entry address bits preserved by the host payload encoder.
+pub(crate) const G17P_SKSM_QUEUE_ENTRY_ADDRESS_MASK: u64 = 0x0000_07ff_ffff_ffe0;
+/// Fixed portion of the first G17P queue-configuration store.
+const G17P_SKSM_QUEUE_CONFIG_TAG: u64 = 0x0000_0400_0002_1008;
+const G17P_SKSM_QUEUE_COMPLETION_SELECTOR_MAX: u32 = 4;
+
+/// Pure description of the three ordered host-side publications that make one
+/// A18 Pro SKSM queue visible to the hardware bridge.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct PreparedG17PSksmQueueConfig {
+    /// First store: 64-bit QID tag.
+    pub(crate) tag_offset: u32,
+    pub(crate) tag: u64,
+    /// Second store: 64-bit queue address/data-master/completion selector.
+    pub(crate) payload_offset: u32,
+    pub(crate) payload: u64,
+    /// Final read/modify/write: enable this QID in one of two mask words.
+    pub(crate) enable_mask_offset: u32,
+    pub(crate) enable_mask: u64,
+}
+
+/// Prepare the exact G17P host queue-configuration stores without touching
+/// MMIO. Only the paired A18 Pro identity is admitted.
+pub(crate) const fn prepare_g17p_sksm_queue_config(
+    target: G17ChannelAbiTarget,
+    queue_id: u8,
+    data_master: u32,
+    completion_selector: u32,
+    entry_gpu_va: u64,
+    geometry: SksmAddKicksMmioGeometry,
+) -> Result<PreparedG17PSksmQueueConfig, SubmissionError> {
+    match target {
+        G17ChannelAbiTarget::A18ProG17P => {}
+        G17ChannelAbiTarget::M5G17G | G17ChannelAbiTarget::M5ProMaxG17X => {
+            return Err(SubmissionError::ChannelAbiUnconfirmed)
+        }
+    }
+    if queue_id > KICK_QID_MASK {
+        return Err(SubmissionError::QueueIdOutOfRange);
+    }
+    if data_master >= 3 {
+        return Err(SubmissionError::KickQueueDataMasterOutOfRange);
+    }
+    if completion_selector > G17P_SKSM_QUEUE_COMPLETION_SELECTOR_MAX {
+        return Err(SubmissionError::KickQueueCompletionSelectorOutOfRange);
+    }
+    if entry_gpu_va & !G17P_SKSM_QUEUE_ENTRY_ADDRESS_MASK != 0 {
+        return Err(SubmissionError::KickQueueEntryAddressUnencodable);
+    }
+
+    let bank_offset = match geometry
+        .aperture_index
+        .checked_mul(SKSM_ADD_KICKS_APERTURE_SCALE)
+    {
+        Some(offset) => offset,
+        None => return Err(SubmissionError::KickMmioOffsetOverflow),
+    };
+    let tag_offset = match geometry.tag_offset_base.checked_add(bank_offset) {
+        Some(offset) => offset,
+        None => return Err(SubmissionError::KickMmioOffsetOverflow),
+    };
+    let payload_offset = match geometry.count_offset_base.checked_add(bank_offset) {
+        Some(offset) => offset,
+        None => return Err(SubmissionError::KickMmioOffsetOverflow),
+    };
+
+    // Host sequence: 3 * (4 - selector) + 0x3fe, shifted into bit 54.
+    let completion_field = (3 * (4 - completion_selector) + 0x3fe) as u64;
+    let payload =
+        (((data_master as u64) + 1) << 60) | entry_gpu_va | completion_field.wrapping_shl(54);
+    let mask_word = (queue_id as u32 >> 6) * 8;
+
+    Ok(PreparedG17PSksmQueueConfig {
+        tag_offset,
+        tag: G17P_SKSM_QUEUE_CONFIG_TAG | ((queue_id as u64) << 43),
+        payload_offset,
+        payload,
+        enable_mask_offset: G17P_SKSM_QUEUE_ENABLE_MASK_BASE + mask_word,
+        enable_mask: 1u64 << (queue_id & 63),
+    })
+}
+
+pub(crate) const G17P_KSM_COMPLETION_QUEUE_COUNT: u8 = 4;
+pub(crate) const G17P_KSM_COMPLETION_DESCRIPTOR_SIZE: usize = 0x20;
+pub(crate) const G17P_KSM_COMPLETION_ENTRY_SIZE: u32 = 0x40;
+
+/// Exact field offsets in one host-produced G17P completion descriptor.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PKsmCompletionDescriptorLayout {
+    pub(crate) gpu_va: usize,
+    pub(crate) cpu_va: usize,
+    pub(crate) capacity: usize,
+    pub(crate) entry_size: usize,
+    pub(crate) ordinal: usize,
+    pub(crate) processed: usize,
+}
+
+pub(crate) const G17P_KSM_COMPLETION_DESCRIPTOR_LAYOUT: G17PKsmCompletionDescriptorLayout =
+    G17PKsmCompletionDescriptorLayout {
+        gpu_va: 0x00,
+        cpu_va: 0x08,
+        capacity: 0x10,
+        entry_size: 0x14,
+        ordinal: 0x18,
+        processed: 0x1c,
+    };
+
+/// Encode one present completion queue exactly as the G17P host populates it.
+pub(crate) fn encode_g17p_ksm_completion_descriptor(
+    target: G17ChannelAbiTarget,
+    ordinal: u8,
+    gpu_va: u64,
+    cpu_va: u64,
+    capacity: u32,
+) -> Result<[u8; G17P_KSM_COMPLETION_DESCRIPTOR_SIZE], SubmissionError> {
+    if target != G17ChannelAbiTarget::A18ProG17P {
+        return Err(SubmissionError::ChannelAbiUnconfirmed);
+    }
+    if ordinal >= G17P_KSM_COMPLETION_QUEUE_COUNT {
+        return Err(SubmissionError::CompletionQueueOrdinalOutOfRange);
+    }
+    if capacity == 0 {
+        return Err(SubmissionError::CompletionQueueCapacityZero);
+    }
+
+    let mut raw = [0u8; G17P_KSM_COMPLETION_DESCRIPTOR_SIZE];
+    let layout = G17P_KSM_COMPLETION_DESCRIPTOR_LAYOUT;
+    put_u64_le(&mut raw, layout.gpu_va, gpu_va);
+    put_u64_le(&mut raw, layout.cpu_va, cpu_va);
+    put_u32_le(&mut raw, layout.capacity, capacity);
+    put_u32_le(&mut raw, layout.entry_size, G17P_KSM_COMPLETION_ENTRY_SIZE);
+    put_u32_le(&mut raw, layout.ordinal, ordinal as u32);
+    put_u32_le(&mut raw, layout.processed, 0);
+    Ok(raw)
+}
+
+/// The host-side completion descriptor and SKSM bridge equations are grounded;
+/// this does not assert that Linux knows the physical IRQ source or has
+/// observed an interrupt round trip.
+pub(crate) const G17P_COMPLETION_HOST_ABI_GROUNDED: bool = true;
+
+// ---------------------------------------------------------------------------
+// 8. A18 Pro / G17P top-level channel-command dispatch.
 //
 //    This ABI is deliberately identity-scoped, just like §2c. The pinned G17P
 //    host grounds the top-level names below through its command-request and
@@ -1157,7 +1348,7 @@ pub(crate) const fn g17p_channel_command_prefilter_allows(
 }
 
 // ---------------------------------------------------------------------------
-// 8. Provenance ledger + live gaps.
+// 9. Provenance ledger + live gaps.
 // ---------------------------------------------------------------------------
 
 /// How each submission-ABI component was grounded, so reuse-vs-fork is explicit.
@@ -1186,6 +1377,8 @@ pub(crate) struct SubmissionAbiLedger {
     pub(crate) kick_word: AbiProvenance,
     pub(crate) kick_queue_producer: AbiProvenance,
     pub(crate) host_add_kicks_mmio: AbiProvenance,
+    pub(crate) g17p_queue_config: AbiProvenance,
+    pub(crate) g17p_completion_descriptors: AbiProvenance,
     pub(crate) kick_record: AbiProvenance,
 }
 
@@ -1194,7 +1387,8 @@ pub(crate) struct SubmissionAbiLedger {
 /// generic channel/ring producer records remain inherited and fail-closed.
 /// A separate G17P-only channel-state entry records the matched A18 Pro host
 /// producer and firmware consumer (§2c); it does not admit either M5 family.
-/// The command dispatch is a grounded, G17P-only AGX3 fork (§7): the M5
+/// The queue bridge/completion descriptors and command dispatch are grounded,
+/// G17P-only AGX3 forks (§7-§8): the M5
 /// identities remain fail-closed, unresolved values do not inherit AGX2 or
 /// nested SKU meanings, and the host's `Nop = 17` is not firmware-admitted.
 pub(crate) const SUBMISSION_ABI_LEDGER: SubmissionAbiLedger = SubmissionAbiLedger {
@@ -1209,6 +1403,8 @@ pub(crate) const SUBMISSION_ABI_LEDGER: SubmissionAbiLedger = SubmissionAbiLedge
     kick_word: AbiProvenance::ForkedAgx3Grounded,
     kick_queue_producer: AbiProvenance::ForkedAgx3Grounded,
     host_add_kicks_mmio: AbiProvenance::ForkedAgx3Grounded,
+    g17p_queue_config: AbiProvenance::ForkedAgx3Grounded,
+    g17p_completion_descriptors: AbiProvenance::ForkedAgx3Grounded,
     kick_record: AbiProvenance::ForkedAgx3Grounded,
 };
 
@@ -1224,7 +1420,7 @@ pub(crate) const HOST_SKSM_ADD_KICKS_PATH_SELECTED: bool = true;
 pub(crate) const CHANNEL_DESCRIPTOR_STRIDE_CONFIRMED: bool = true;
 
 /// The offline-unprovable pieces that keep the transport non-executable. Each
-/// needs a live M5.
+/// needs a live target device.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct SubmissionLiveGaps {
     /// Host `addKicks` publication and firmware scratch consumption are both
@@ -1233,6 +1429,9 @@ pub(crate) struct SubmissionLiveGaps {
     pub(crate) sksm_hardware_kick_fifo_mmio_scratch_proven: bool,
     /// The kick -> execute -> completion IRQ handshake is a live event.
     pub(crate) doorbell_round_trip_proven: bool,
+    /// Apple's host builds platform interrupt event sources from runtime
+    /// `interrupts`/`interrupts-valid` properties. The pinned binary does not
+    /// contain the physical source selected for G17P completion delivery.
     pub(crate) completion_irq_route_proven: bool,
 }
 
@@ -1800,6 +1999,198 @@ mod tests {
     }
 
     #[test]
+    fn g17p_sksm_queue_configuration_matches_the_host_store_sequence() {
+        assert_eq!(
+            G17P_SKSM_RUNTIME_MMIO_GEOMETRY_LAYOUT,
+            G17PSksmRuntimeMmioGeometryLayout {
+                tag_offset_base: 0x10730,
+                payload_offset_base: 0x10734,
+                aperture_index: 0x10738,
+            }
+        );
+        assert_eq!(G17P_SKSM_QUEUE_ENABLE_MASK_BASE, 0x21068);
+        assert_eq!(G17P_SKSM_QUEUE_ENTRY_ADDRESS_MASK, 0x0000_07ff_ffff_ffe0);
+
+        let config = prepare_g17p_sksm_queue_config(
+            G17ChannelAbiTarget::A18ProG17P,
+            0x40,
+            1,
+            0,
+            0x12340,
+            SksmAddKicksMmioGeometry {
+                tag_offset_base: 0x100,
+                count_offset_base: 0x104,
+                aperture_index: 2,
+            },
+        )
+        .unwrap();
+
+        // configureHardware: base + aperture*9, tag, payload, then QID mask.
+        assert_eq!(config.tag_offset, 0x112);
+        assert_eq!(config.tag, 0x0002_0400_0002_1008);
+        assert_eq!(config.payload_offset, 0x116);
+        // This hard-coded value catches both the 32-bit selector arithmetic
+        // and the host's ADD of `(data_master + 1) << 60` before the OR.
+        assert_eq!(config.payload, 0x2280_0000_0001_2340);
+        assert_eq!(config.enable_mask_offset, 0x21070);
+        assert_eq!(config.enable_mask, 1);
+    }
+
+    #[test]
+    fn g17p_sksm_queue_configuration_is_identity_and_range_scoped() {
+        let geometry = SksmAddKicksMmioGeometry {
+            tag_offset_base: 0,
+            count_offset_base: 4,
+            aperture_index: 0,
+        };
+
+        for target in [
+            G17ChannelAbiTarget::M5G17G,
+            G17ChannelAbiTarget::M5ProMaxG17X,
+        ] {
+            assert_eq!(
+                prepare_g17p_sksm_queue_config(target, 0, 0, 0, 0x20, geometry),
+                Err(SubmissionError::ChannelAbiUnconfirmed)
+            );
+        }
+        assert_eq!(
+            prepare_g17p_sksm_queue_config(
+                G17ChannelAbiTarget::A18ProG17P,
+                0x80,
+                0,
+                0,
+                0x20,
+                geometry,
+            ),
+            Err(SubmissionError::QueueIdOutOfRange)
+        );
+        assert_eq!(
+            prepare_g17p_sksm_queue_config(
+                G17ChannelAbiTarget::A18ProG17P,
+                0,
+                3,
+                0,
+                0x20,
+                geometry,
+            ),
+            Err(SubmissionError::KickQueueDataMasterOutOfRange)
+        );
+        assert_eq!(
+            prepare_g17p_sksm_queue_config(
+                G17ChannelAbiTarget::A18ProG17P,
+                0,
+                0,
+                5,
+                0x20,
+                geometry,
+            ),
+            Err(SubmissionError::KickQueueCompletionSelectorOutOfRange)
+        );
+        for address in [0x21, 0x0000_0800_0000_0000] {
+            assert_eq!(
+                prepare_g17p_sksm_queue_config(
+                    G17ChannelAbiTarget::A18ProG17P,
+                    0,
+                    0,
+                    0,
+                    address,
+                    geometry,
+                ),
+                Err(SubmissionError::KickQueueEntryAddressUnencodable)
+            );
+        }
+        assert_eq!(
+            prepare_g17p_sksm_queue_config(
+                G17ChannelAbiTarget::A18ProG17P,
+                0,
+                0,
+                0,
+                0x20,
+                SksmAddKicksMmioGeometry {
+                    tag_offset_base: u32::MAX,
+                    count_offset_base: 0,
+                    aperture_index: 1,
+                },
+            ),
+            Err(SubmissionError::KickMmioOffsetOverflow)
+        );
+    }
+
+    #[test]
+    fn g17p_completion_descriptors_match_all_four_host_slots() {
+        assert_eq!(G17P_KSM_COMPLETION_QUEUE_COUNT, 4);
+        assert_eq!(G17P_KSM_COMPLETION_DESCRIPTOR_SIZE, 0x20);
+        assert_eq!(G17P_KSM_COMPLETION_ENTRY_SIZE, 0x40);
+        assert_eq!(
+            G17P_KSM_COMPLETION_DESCRIPTOR_LAYOUT,
+            G17PKsmCompletionDescriptorLayout {
+                gpu_va: 0x00,
+                cpu_va: 0x08,
+                capacity: 0x10,
+                entry_size: 0x14,
+                ordinal: 0x18,
+                processed: 0x1c,
+            }
+        );
+
+        for ordinal in 0..G17P_KSM_COMPLETION_QUEUE_COUNT {
+            let gpu_va = 0x1234_0000 + ordinal as u64 * 0x1000;
+            let cpu_va = 0xabcd_0000 + ordinal as u64 * 0x2000;
+            let capacity = 0x80 + ordinal as u32;
+            let raw = encode_g17p_ksm_completion_descriptor(
+                G17ChannelAbiTarget::A18ProG17P,
+                ordinal,
+                gpu_va,
+                cpu_va,
+                capacity,
+            )
+            .unwrap();
+
+            assert_eq!(&raw[0x00..0x08], &gpu_va.to_le_bytes());
+            assert_eq!(&raw[0x08..0x10], &cpu_va.to_le_bytes());
+            assert_eq!(&raw[0x10..0x14], &capacity.to_le_bytes());
+            assert_eq!(&raw[0x14..0x18], &0x40u32.to_le_bytes());
+            assert_eq!(&raw[0x18..0x1c], &(ordinal as u32).to_le_bytes());
+            assert_eq!(&raw[0x1c..0x20], &[0; 4]);
+        }
+        assert!(G17P_COMPLETION_HOST_ABI_GROUNDED);
+    }
+
+    #[test]
+    fn g17p_completion_descriptors_fail_closed() {
+        assert_eq!(
+            encode_g17p_ksm_completion_descriptor(
+                G17ChannelAbiTarget::M5G17G,
+                0,
+                0x1000,
+                0x2000,
+                1,
+            ),
+            Err(SubmissionError::ChannelAbiUnconfirmed)
+        );
+        assert_eq!(
+            encode_g17p_ksm_completion_descriptor(
+                G17ChannelAbiTarget::A18ProG17P,
+                4,
+                0x1000,
+                0x2000,
+                1,
+            ),
+            Err(SubmissionError::CompletionQueueOrdinalOutOfRange)
+        );
+        assert_eq!(
+            encode_g17p_ksm_completion_descriptor(
+                G17ChannelAbiTarget::A18ProG17P,
+                0,
+                0x1000,
+                0x2000,
+                0,
+            ),
+            Err(SubmissionError::CompletionQueueCapacityZero)
+        );
+    }
+
+    #[test]
     fn kick_record_table_uses_the_firmware_geometry() {
         // add x2,x22,#0x10 ; add x2,x2,QID,lsl#5 -> base 0x10, stride 0x20.
         assert_eq!(KICK_RECORD_TABLE_BASE, 0x10);
@@ -2058,6 +2449,14 @@ mod tests {
         );
         assert_eq!(
             SUBMISSION_ABI_LEDGER.host_add_kicks_mmio,
+            AbiProvenance::ForkedAgx3Grounded
+        );
+        assert_eq!(
+            SUBMISSION_ABI_LEDGER.g17p_queue_config,
+            AbiProvenance::ForkedAgx3Grounded
+        );
+        assert_eq!(
+            SUBMISSION_ABI_LEDGER.g17p_completion_descriptors,
             AbiProvenance::ForkedAgx3Grounded
         );
         assert!(HOST_SKSM_ADD_KICKS_PATH_SELECTED);
