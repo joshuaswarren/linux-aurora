@@ -1020,9 +1020,6 @@ void avd_run_preamble(struct avd_ctx *ctx, struct avd_run *run)
 		      ctx->decoded_fmt.fmt.pix_mp.plane_fmt[0].bytesperline *
 			      ctx->decoded_fmt.fmt.pix_mp.height;
 
-	run->comp_out = run->y_out + ctx->comp.start_offset;
-	ctx->decomp = true;
-
 	dst = vb2_to_avd_decoded_buf(&run->bufs.dst->vb2_buf);
 	memcpy(&dst->comp, &ctx->comp, sizeof(ctx->comp));
 

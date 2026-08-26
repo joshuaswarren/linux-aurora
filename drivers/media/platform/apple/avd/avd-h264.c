@@ -41,7 +41,8 @@ struct avd_h264_run {
 	const struct v4l2_ctrl_h264_pred_weights *pred_weights;
 
 	struct run_addr {
-		dma_addr_t mv_color;
+		dma_addr_t rvra;
+		dma_addr_t sps;
 	} addresses;
 
 	s32 cur_poc;
@@ -292,7 +293,7 @@ static void stream_hdr(struct avd_ctx *ctx, struct avd_h264_run *run)
 
 	pusha(run->base.y_out, "hdr_210_y_addr_lsb8", 0);
 	push(bytesperline, "hdr_218_width_align");
-	pusha(run->addresses.uv, "hdr_214_uv_addr_lsb8", 0);
+	pusha(run->base.uv_out, "hdr_214_uv_addr_lsb8", 0);
 	push(bytesperline, "hdr_21c_width_align");
 
 	push(0, "cm3_mark_end_section");
@@ -420,7 +421,7 @@ static void stream_slice(struct avd_ctx *ctx, struct avd_h264_run *run)
 		off++;
 	}
 
-	dma_addr_t slc_a84 = run->addresses.sl + off;
+	dma_addr_t slc_a84 = run->base.coded_in + off;
 
 	push(AVD_OP_CODED_DATA |
 		     AVD_OP_CODED_DATA_BIT_OFF(
@@ -685,36 +686,7 @@ static void avd_h264_run_preamble(struct avd_ctx *ctx, struct avd_h264_run *run)
 
 	dst_len = run->base.bufs.dst->vb2_buf.planes[0].length;
 
-	mv_color_len = mv_color_size(fmt_width(ctx), fmt_height(ctx));
-
-	run->addresses.mv_color = run->base.y_out + (dst_len - mv_color_len);
-}
-
-/*
- * Check that every reference in the slice's ref lists points at a DPB entry
- * that is VALID. stream_refs() only pushes a reference header (and its RVRA
- * addresses) for VALID entries and the slice command indexes those by DPB
- * index, so a reference to any other entry makes the VP dereference an
- * uninitialised reference slot: that ends in a DART translation fault, a
- * frame that never completes and a watchdog reset of the VP, which also
- * disturbs the other contexts. It happens whenever a client starts decoding
- * on a non-IDR frame (joining a live RTSP stream mid-GOP): ffmpeg's
- * v4l2request hwaccel leaves the index of a missing reference at 0 and the
- * DPB is empty. Refuse such slices before anything is pushed; the client gets
- * the capture buffer back with V4L2_BUF_FLAG_ERROR, as for corrupt input.
- */
-static bool avd_h264_refs_valid(const struct avd_h264_run *run)
-{
-	const struct v4l2_ctrl_h264_slice_params *sl = run->slice_params;
-	const struct v4l2_h264_dpb_entry *dpb = run->decode_params->dpb;
-	const struct v4l2_h264_reference *lists[2] = {
-		sl->ref_pic_list0, sl->ref_pic_list1
-	};
-	u32 num[2] = {
-		sl->num_ref_idx_l0_active_minus1 + 1,
-		sl->num_ref_idx_l1_active_minus1 + 1
-	};
-	int nlists;
+	sps_len = sps_size(fmt_width(ctx), fmt_height(ctx));
 
 	if (sl->slice_type == V4L2_H264_SLICE_TYPE_P)
 		nlists = 1;
@@ -723,19 +695,7 @@ static bool avd_h264_refs_valid(const struct avd_h264_run *run)
 	else
 		return true;
 
-	for (int l = 0; l < nlists; l++) {
-		if (num[l] > V4L2_H264_REF_LIST_LEN)
-			return false;
-		for (u32 i = 0; i < num[l]; i++) {
-			u8 idx = lists[l][i].index;
-
-			if (idx >= V4L2_H264_NUM_DPB_ENTRIES ||
-			    !(dpb[idx].flags & V4L2_H264_DPB_ENTRY_FLAG_VALID))
-				return false;
-		}
-	}
-
-	return true;
+	run->addresses.sps = run->base.y_out + (dst_len - sps_len);
 }
 
 static int avd_h264_run(struct avd_ctx *ctx)

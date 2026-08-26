@@ -213,9 +213,6 @@ struct avd_av1_run {
 	struct avd_run base;
 
 	struct {
-		dma_addr_t y;
-		dma_addr_t uv;
-		dma_addr_t sl;
 		dma_addr_t rvra;
 		dma_addr_t probs_out;
 		dma_addr_t priv_tlb;
@@ -1012,11 +1009,11 @@ static void set_tiles(struct avd_ctx *ctx, struct avd_av1_run *run)
 
 			push(AVD_OP_CODED_DATA |
 				     AVD_OP_CODED_DATA_ADDR(
-					     (run->addresses.sl +
+					     (run->base.coded_in +
 					      tile_group->tile_offset) >>
 					     32),
 			     "tile_start");
-			push((u32)((run->addresses.sl +
+			push((u32)((run->base.coded_in +
 				    tile_group->tile_offset) &
 				   0xffffffff),
 			     "tile_addr");
@@ -1163,14 +1160,6 @@ static int avd_av1_run_preamble(struct avd_ctx *ctx, struct avd_av1_run *run)
 	dst_len = run->base.bufs.dst->vb2_buf.planes[0].length;
 	tlb_len = avd_priv_tlb_size(run->frame->frame_width_minus_1 + 1,
 				    run->frame->frame_height_minus_1 + 1);
-
-	run->addresses.color =
-		run->base.y_out + AVD_AV1_COLOR_OFFSET(dst_len, tlb_len);
-
-	run->addresses.uv =
-		run->addresses.y +
-		ctx->decoded_fmt.fmt.pix_mp.plane_fmt[0].bytesperline *
-			ALIGN(ctx->decoded_fmt.fmt.pix_mp.height, 16);
 
 	run->addresses.rvra =
 		run->addresses.y + AVD_AV1_RVRA_OFFSET(dst_len, ctx->rvra.size);

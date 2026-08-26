@@ -74,7 +74,8 @@ struct avd_hevc_run {
 	int num_slices;
 
 	struct run_addr {
-		dma_addr_t mv_color;
+		dma_addr_t rvra;
+		dma_addr_t sps;
 	} addresses;
 
 	struct avd_hevc_tile_info tile_info;
@@ -663,7 +664,8 @@ static void set_slice(struct avd_ctx *ctx, struct avd_hevc_run *run,
 		      u32 offset, u32 flags)
 {
 	struct avd_dev *avd = ctx->dev;
-	dma_addr_t slc_addr = run->addresses.sl + offset + sl->data_byte_offset;
+	dma_addr_t slc_addr =
+		run->base.coded_in + offset + sl->data_byte_offset;
 	push(AVD_OP_CODED_DATA | flags | AVD_OP_CODED_DATA_ADDR(slc_addr >> 32),
 	     "cm3_cmd_set_coded_slice");
 	push((u32)(slc_addr & 0xffffffff), "slc_bd8_slice_addr");
@@ -1366,10 +1368,12 @@ static int avd_hevc_run_preamble(struct avd_ctx *ctx, struct avd_hevc_run *run)
 
 	dst_len = run->base.bufs.dst->vb2_buf.planes[0].length;
 
-	mv_color_len = mv_color_size(fmt_width(ctx), fmt_height(ctx));
+	sps_len = sps_size(fmt_width(ctx), fmt_height(ctx));
 
-	run->addresses.mv_color =
-		run->base.y_out + round_down(dst_len - mv_color_len, AVD_ALIGN);
+	run->addresses.rvra =
+		run->addresses.y + (dst_len - sps_len - ctx->rvra.size);
+
+	run->addresses.sps = run->base.y_out + (dst_len - sps_len);
 	return 0;
 }
 

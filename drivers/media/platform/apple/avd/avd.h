@@ -62,7 +62,6 @@ struct avd_run {
 	dma_addr_t coded_in;
 	dma_addr_t y_out;
 	dma_addr_t uv_out;
-	dma_addr_t comp_out;
 };
 
 struct avd_ctrl_desc {
