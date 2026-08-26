@@ -397,7 +397,10 @@ fn refuse_g17_probe(
     identity: &identity::GpuIdentity,
     firmware: Option<&g17_firmware::G17FirmwareIdentityAdmission>,
 ) -> Error {
-    let power_preflight = match g17_power_preflight::G17PowerPreflight::new(identity) {
+    // G17P remains fail-closed until the Linux platform decoder can supply an
+    // exact observed D93AP/T8140 topology. Never substitute the expected
+    // constant here: that would turn topology admission back into dead data.
+    let power_preflight = match g17_power_preflight::G17PowerPreflight::new(identity, None) {
         Ok(preflight) => preflight,
         Err(e) => {
             dev_err!(
