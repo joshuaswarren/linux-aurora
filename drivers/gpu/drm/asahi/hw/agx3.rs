@@ -81,8 +81,13 @@ pub(crate) const T6031: SocConfig = agx3(0x6031, GpuGen::G15, GpuVariant::C, 0x7
 /// Apple M3 Ultra (G15D, two dies).
 pub(crate) const T6032: SocConfig = agx3(0x6032, GpuGen::G15, GpuVariant::D, 0x7, 4, 2);
 
-// G16 (M4 family). Family byte 0xa is shared with G17P/G17A; the variant
-// byte discriminates. Decode read at AGXG16G 0xfffffe0008b5abd8 et seq.
+// G16 (M4 family) and A18 Pro. Family byte 0xa is shared with G17P/G17A;
+// the variant byte discriminates. Decode read at AGXG16G
+// 0xfffffe0008b5abd8 et seq. The T8140/G17P identity and D93AP topology are
+// independently pinned in agx_power_recovery.rs; this entry permits only the
+// existing read-only diagnostic probe and never a firmware handoff.
+/// Apple A18 Pro (G17P).
+pub(crate) const T8140: SocConfig = agx3(0x8140, GpuGen::G17, GpuVariant::P, 0xa, 0, 1);
 /// Apple M4 (G16G).
 pub(crate) const T8132: SocConfig = agx3(0x8132, GpuGen::G16, GpuVariant::G, 0xa, 2, 1);
 /// Apple M4 Pro (G16S).
@@ -111,8 +116,8 @@ mod tests {
     };
     use super::*;
 
-    const ALL: [&SocConfig; 10] = [
-        &T8122, &T6030, &T6031, &T6032, &T8132, &T6040, &T6041, &T8142, &T6050, &T6051,
+    const ALL: [&SocConfig; 11] = [
+        &T8122, &T6030, &T6031, &T6032, &T8140, &T8132, &T6040, &T6041, &T8142, &T6050, &T6051,
     ];
 
     #[test]
@@ -174,13 +179,28 @@ mod tests {
             for b in ALL.iter().skip(i + 1) {
                 assert_ne!(a.chip_id, b.chip_id);
             }
-            // 0x8xxx chips are single-cluster consumer parts (G variant);
+            // Mac 0x8xxx chips are single-cluster consumer parts (G variant),
+            // except mobile T8140 whose independently decoded tier is P.
             // 0x6xxx chips are the S/C/D tiers.
-            if a.chip_id & 0xf000 == 0x8000 {
+            if a.chip_id == 0x8140 {
+                assert_eq!(a.gpu_variant, GpuVariant::P);
+            } else if a.chip_id & 0xf000 == 0x8000 {
                 assert_eq!(a.gpu_variant, GpuVariant::G);
             } else {
                 assert_ne!(a.gpu_variant, GpuVariant::G);
             }
         }
+    }
+
+    #[test]
+    fn t8140_is_the_exact_a18_pro_g17p_diagnostic_identity() {
+        assert_eq!(T8140.chip_id, 0x8140);
+        assert_eq!(T8140.hw_family, 0xa);
+        assert_eq!(T8140.hw_variant, 0);
+        assert_eq!(T8140.num_dies, 1);
+        let identity =
+            decode_gpu_identity(T8140.hw_family, T8140.hw_variant, T8140.num_dies as u8).unwrap();
+        assert_eq!(identity.gpu_gen, GpuGen::G17);
+        assert_eq!(identity.gpu_variant, GpuVariant::P);
     }
 }

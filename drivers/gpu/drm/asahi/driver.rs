@@ -192,6 +192,17 @@ kernel::of_device_table!(
             of::DeviceId::new(c_str!("apple,agx-t6041")),
             ProbeConfig::Agx3Diagnostic(&hw::agx3::T6041)
         ),
+        // A18 Pro / D93AP. Reserve both the Linux-style handoff compatible and
+        // the raw ADT-compatible form as diagnostic-only until the complete
+        // G17P firmware lifecycle is proven on the physical J700 target.
+        (
+            of::DeviceId::new(c_str!("apple,agx-t8140")),
+            ProbeConfig::Agx3Diagnostic(&hw::agx3::T8140)
+        ),
+        (
+            of::DeviceId::new(c_str!("gpu,t8140")),
+            ProbeConfig::Agx3Diagnostic(&hw::agx3::T8140)
+        ),
         (
             of::DeviceId::new(c_str!("apple,agx-t8142")),
             ProbeConfig::Agx3Diagnostic(&hw::agx3::T8142)
