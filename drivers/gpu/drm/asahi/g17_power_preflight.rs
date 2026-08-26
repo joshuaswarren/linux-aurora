@@ -722,13 +722,18 @@ mod tests {
         for identity in [id(0x0a, 0), id(0x0b, 2), id(0x0b, 3)] {
             let mut preflight = new_preflight(&identity).unwrap();
             let initial = preflight.execution_gate().unwrap_err();
-            assert_eq!(initial.bits(), REQUIRED_LIVE_EVIDENCE);
+            assert_eq!(
+                initial.bits(),
+                REQUIRED_LIVE_EVIDENCE & !missing_live::ASC_WRAPPER_MMIO_ENABLE
+            );
             assert!(initial.contains(missing_live::COLD_BOOT_OBSERVATION));
             complete_cold_boot(&mut preflight);
             let complete = preflight.execution_gate().unwrap_err();
             assert_eq!(
                 complete.bits(),
-                REQUIRED_LIVE_EVIDENCE & !missing_live::COLD_BOOT_OBSERVATION
+                REQUIRED_LIVE_EVIDENCE
+                    & !missing_live::COLD_BOOT_OBSERVATION
+                    & !missing_live::ASC_WRAPPER_MMIO_ENABLE
             );
             assert!(!complete.contains(missing_live::COLD_BOOT_OBSERVATION));
             for bit in [
@@ -743,11 +748,11 @@ mod tests {
                 missing_live::PMGR_ASC_GATE_ORDER,
                 missing_live::ASC_CONTROL_APERTURE_OWNERSHIP,
                 missing_live::IORVBAR_DMA_VISIBILITY,
-                missing_live::ASC_WRAPPER_MMIO_ENABLE,
                 missing_live::ASC_TEARDOWN_OWNER,
             ] {
                 assert!(complete.contains(bit));
             }
+            assert!(!complete.contains(missing_live::ASC_WRAPPER_MMIO_ENABLE));
         }
         assert!(!g17_boot::EXECUTABLE_G17X_FIRMWARE_START_HANDSHAKE_AVAILABLE);
         assert!(!agx_power_recovery::EXECUTABLE_GFX1_POWER_SEQUENCE_AVAILABLE);
