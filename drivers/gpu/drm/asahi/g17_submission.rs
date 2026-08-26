@@ -20,9 +20,11 @@
 //! SKSM-forbidden PM-rebuild command rather than AGX2's init-buffer command.
 //!
 //! Grounding is first-hand from the on-disk M5 role macho `GFX.a010.macho`
-//! (`g17s a0, SKSM Enabled`) and the pinned G17P/G17G/G17X host-kext
-//! `KSMKickQueue::addKicks` implementations. Firmware addresses are VAs
-//! (0xfffffc0000000000 + fileoff - 0x4000). See
+//! (`g17s a0, SKSM Enabled`), all three pinned A18 Pro `g17p` firmware variants
+//! (`a000`, `b000`, and `b100`), and the pinned G17P/G17G/G17X host kexts. The
+//! native G17P channel-state ABI is admitted only for the A18 Pro identity;
+//! the M5-family identities stay fail-closed.
+//! Firmware addresses are VAs (0xfffffc0000000000 + fileoff - 0x4000). See
 //! `research/gpu/GPU_AGX3_G17_SUBMISSION_2026-08-25.md`.
 //!
 //! Two-signal discipline, mirroring `g17_rtkit`/`g17_boot`:
@@ -121,8 +123,12 @@ pub(crate) enum SubmissionError {
     RingSizeZero,
     /// A producer index must identify an entry inside its ring.
     RingIndexOutOfRange,
+    /// Advancing the producer would make it collide with the consumer.
+    RingFull,
     /// G17 exposes four priority groups in its runtime channel table.
     ChannelPriorityOutOfRange,
+    /// This native channel layout is not grounded for the selected identity.
+    ChannelAbiUnconfirmed,
 }
 
 /// Encode a work-submission doorbell exactly as `gpu.rs::run_job` does:
@@ -165,16 +171,16 @@ pub(crate) const fn pending_pipe_bit(pipe: PipeType) -> u32 {
 }
 
 // ---------------------------------------------------------------------------
-// 2. Channel ring state — the driver->FW message ring carrying RunWorkQueueMsg.
-//    AGX2 `channel.rs::raw::ChannelState`: read_ptr@0x00, write_ptr@0x20.
+// 2. Legacy AGX2 channel state. These constants are retained only to make the
+//    inherited producer explicit; they are not a native-G17 admission.
 // ---------------------------------------------------------------------------
 
-/// FW-owned consumer index the firmware publishes back to the driver.
-pub(crate) const CHANNEL_STATE_READ_PTR_OFFSET: u32 = 0x00;
-/// Driver-owned producer index the firmware reads to find new messages.
-pub(crate) const CHANNEL_STATE_WRITE_PTR_OFFSET: u32 = 0x20;
-/// Total `ChannelState` size.
-pub(crate) const CHANNEL_STATE_SIZE: u32 = 0x40;
+/// AGX2 FW-owned consumer index.
+pub(crate) const AGX2_CHANNEL_STATE_READ_PTR_OFFSET: u32 = 0x00;
+/// AGX2 driver-owned producer index.
+pub(crate) const AGX2_CHANNEL_STATE_WRITE_PTR_OFFSET: u32 = 0x20;
+/// Total AGX2 `ChannelState` size.
+pub(crate) const AGX2_CHANNEL_STATE_SIZE: u32 = 0x40;
 
 // ---------------------------------------------------------------------------
 // 2a. G17 runtime channel descriptors -- native AGX3 layout.
@@ -317,7 +323,7 @@ pub(crate) struct G17UncachedChannelResetLayout {
     pub(crate) zero_30: usize,
     pub(crate) zero_40: usize,
     pub(crate) sentinel_50: usize,
-    pub(crate) byte_extent_60: usize,
+    pub(crate) ring_entry_count_60: usize,
 }
 
 pub(crate) const G17_UNCACHED_CHANNEL_RESET_LAYOUT: G17UncachedChannelResetLayout =
@@ -328,7 +334,7 @@ pub(crate) const G17_UNCACHED_CHANNEL_RESET_LAYOUT: G17UncachedChannelResetLayou
         zero_30: 0x30,
         zero_40: 0x40,
         sentinel_50: 0x50,
-        byte_extent_60: 0x60,
+        ring_entry_count_60: 0x60,
     };
 
 fn put_u32_le(raw: &mut [u8], offset: usize, value: u32) {
@@ -367,7 +373,7 @@ pub(crate) fn encode_g17_host_channel_state_reset(
 /// caller-provided image therefore stays intact outside the proven stores.
 pub(crate) fn apply_g17_uncached_channel_reset(
     raw: &mut [u8; G17_UNCACHED_CHANNEL_RESET_WRITE_EXTENT],
-    byte_extent: u32,
+    ring_entry_count: u32,
 ) {
     let layout = G17_UNCACHED_CHANNEL_RESET_LAYOUT;
 
@@ -377,25 +383,225 @@ pub(crate) fn apply_g17_uncached_channel_reset(
     put_u32_le(raw, layout.zero_30, 0);
     put_u32_le(raw, layout.zero_40, 0);
     put_u32_le(raw, layout.sentinel_50, u32::MAX);
-    put_u32_le(raw, layout.byte_extent_60, byte_extent);
+    put_u32_le(raw, layout.ring_entry_count_60, ring_entry_count);
 }
 
 // ---------------------------------------------------------------------------
-// 3. Work-queue command ring (the actual SKSM producer ring).
-//    AGX2 `fw/workqueue.rs::raw::RingState`, 0x10-strided fields.
+// 2c. A18 Pro / G17P native channel state.
+//
+//     This is deliberately identity-scoped. The producer is the pinned G17P
+//     host `AGXChannel::writeChannelCommandPointer` at
+//     0xfffffe00089f5a88-0xfffffe00089f5b58. The matching firmware consumers
+//     are `armfw_g17p.a000` 0xfffffc0000012388-0xfffffc00000124f4 and the
+//     resume path 0xfffffc0000012514-0xfffffc0000012690. The matching b000
+//     and b100 channel blocks are byte-identical to each other and implement
+//     the same accesses at 0xfffffc00000122f4-0xfffffc0000012460 and
+//     0xfffffc00000124a4-0xfffffc0000012664.
+//
+//     `_AGFIChannelState` is the cached indirection record: +0x00 points to
+//     the uncached state, +0x08 points to the u64 command-pointer ring, and
+//     +0x1c holds the cached coherency cursor. `AGXUncachedFWChannelMem` holds
+//     u32 cursors at +0x00/+0x30/+0x40/+0x50 and a u32 ring entry count at
+//     +0x60. This is not AGX2's read@0/write@0x20 `ChannelState`.
 // ---------------------------------------------------------------------------
 
-/// FW-published "done" index; the producer guards `doneptr != next_wptr`.
-pub(crate) const RING_STATE_GPU_DONEPTR_OFFSET: u32 = 0x00;
-/// FW consumer index as it pops commands.
-pub(crate) const RING_STATE_GPU_RPTR_OFFSET: u32 = 0x30;
-/// Driver producer index; bumped after writing a command GPU-VA to the ring.
-pub(crate) const RING_STATE_CPU_WPTR_OFFSET: u32 = 0x40;
-/// Ring depth in entries.
-pub(crate) const RING_STATE_RB_SIZE_OFFSET: u32 = 0x50;
+/// Silicon/host identity used to admit a native G17 channel-state ABI.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum G17ChannelAbiTarget {
+    /// A18 Pro: G17P host and `g17p` firmware.
+    A18ProG17P,
+    /// M5: G17G host. No native channel consumer is admitted by this pass.
+    M5G17G,
+    /// M5 Pro/Max: G17X host with `g17s` firmware. Kept separate from G17P.
+    M5ProMaxG17X,
+}
 
-/// Each ring entry is a u64 GPU virtual address of a command struct.
-pub(crate) const RING_ENTRY_BYTES: u32 = 8;
+/// Cached `_AGFIChannelState` fields consumed by the A18 Pro firmware.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PCachedChannelStateLayout {
+    pub(crate) uncached_state_gpu_va: u32,
+    pub(crate) command_pointer_ring_gpu_va: u32,
+    pub(crate) coherency_cursor: u32,
+    pub(crate) record_size: u32,
+}
+
+/// Uncached channel fields shared by the A18 Pro host and firmware.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PUncachedChannelStateLayout {
+    /// Firmware dispatch/consumer cursor.
+    pub(crate) consumer: u32,
+    /// Cursor published after the command-pointer range is made coherent.
+    pub(crate) coherency_shadow: u32,
+    /// Host producer cursor, published after a `dmb ish`.
+    pub(crate) producer: u32,
+    /// Recovery target selected instead of the accelerator-entry snapshot.
+    pub(crate) recovery_target: u32,
+    /// Runtime ring depth in 8-byte command-pointer entries.
+    pub(crate) ring_entry_count: u32,
+    pub(crate) cursor_width: u32,
+    pub(crate) write_extent: u32,
+}
+
+/// Complete admitted A18 Pro channel layout.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PChannelAbiLayout {
+    pub(crate) cached: G17PCachedChannelStateLayout,
+    pub(crate) uncached: G17PUncachedChannelStateLayout,
+    pub(crate) command_pointer_entry_bytes: u32,
+    pub(crate) accelerator_target_width: u32,
+}
+
+pub(crate) const G17P_CHANNEL_ABI: G17PChannelAbiLayout = G17PChannelAbiLayout {
+    cached: G17PCachedChannelStateLayout {
+        uncached_state_gpu_va: 0x00,
+        command_pointer_ring_gpu_va: 0x08,
+        coherency_cursor: 0x1c,
+        record_size: 0x80,
+    },
+    uncached: G17PUncachedChannelStateLayout {
+        consumer: 0x00,
+        coherency_shadow: 0x30,
+        producer: 0x40,
+        recovery_target: 0x50,
+        ring_entry_count: 0x60,
+        cursor_width: 4,
+        write_extent: 0x64,
+    },
+    command_pointer_entry_bytes: 8,
+    accelerator_target_width: 2,
+};
+
+/// The host executes `dmb ish` after storing the u64 command pointer and
+/// before publishing the next u32 producer cursor.
+pub(crate) const G17P_CHANNEL_PRODUCER_REQUIRES_DMB_ISH: bool = true;
+
+/// Return the native channel ABI only for the exact identity whose producer
+/// and consumer were both inspected. M5-family targets remain fail-closed.
+pub(crate) const fn g17_channel_abi(
+    target: G17ChannelAbiTarget,
+) -> Result<G17PChannelAbiLayout, SubmissionError> {
+    match target {
+        G17ChannelAbiTarget::A18ProG17P => Ok(G17P_CHANNEL_ABI),
+        G17ChannelAbiTarget::M5G17G | G17ChannelAbiTarget::M5ProMaxG17X => {
+            Err(SubmissionError::ChannelAbiUnconfirmed)
+        }
+    }
+}
+
+/// A host write plan for one G17P command-pointer ring publication.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PChannelWritePlan {
+    /// Byte offset of the u64 slot written before the barrier.
+    pub(crate) entry_byte_offset: u64,
+    /// u32 producer value published after the barrier.
+    pub(crate) next_producer: u32,
+}
+
+/// Validate and calculate the write performed by the G17P host producer.
+///
+/// This pure helper does not execute the required barrier; callers must store
+/// the u64 command GPU VA, execute `dmb ish`, then store `next_producer` to
+/// uncached offset +0x40.
+pub(crate) const fn prepare_g17p_channel_write(
+    target: G17ChannelAbiTarget,
+    producer: u32,
+    consumer: u32,
+    ring_entry_count: u32,
+) -> Result<G17PChannelWritePlan, SubmissionError> {
+    match g17_channel_abi(target) {
+        Ok(_) => {}
+        Err(error) => return Err(error),
+    }
+
+    if consumer >= ring_entry_count {
+        return Err(if ring_entry_count == 0 {
+            SubmissionError::RingSizeZero
+        } else {
+            SubmissionError::RingIndexOutOfRange
+        });
+    }
+
+    let next_producer = match ring_next(producer, ring_entry_count) {
+        Ok(next) => next,
+        Err(error) => return Err(error),
+    };
+    if next_producer == consumer {
+        return Err(SubmissionError::RingFull);
+    }
+
+    Ok(G17PChannelWritePlan {
+        entry_byte_offset: producer as u64 * G17P_CHANNEL_ABI.command_pointer_entry_bytes as u64,
+        next_producer,
+    })
+}
+
+/// Layout-only forms used to make accidental field drift a compile-time
+/// error. The intervening words remain unnamed because their semantics are
+/// outside the admitted producer/consumer subset.
+#[allow(dead_code)]
+#[repr(C)]
+struct G17PCachedChannelStateLayoutAssert {
+    uncached_state_gpu_va: u64,
+    command_pointer_ring_gpu_va: u64,
+    _unknown_10: u64,
+    _unknown_18: u32,
+    coherency_cursor: u32,
+    _unknown_20: [u8; 0x60],
+}
+
+#[allow(dead_code)]
+#[repr(C)]
+struct G17PUncachedChannelStateLayoutAssert {
+    consumer: u32,
+    _unknown_04: [u8; 0x0c],
+    _unknown_10: u32,
+    _unknown_14: [u8; 0x0c],
+    _unknown_20: u32,
+    _unknown_24: [u8; 0x0c],
+    coherency_shadow: u32,
+    _unknown_34: [u8; 0x0c],
+    producer: u32,
+    _unknown_44: [u8; 0x0c],
+    recovery_target: u32,
+    _unknown_54: [u8; 0x0c],
+    ring_entry_count: u32,
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<G17PCachedChannelStateLayoutAssert>() == 0x80);
+    assert!(
+        core::mem::offset_of!(G17PCachedChannelStateLayoutAssert, uncached_state_gpu_va) == 0x00
+    );
+    assert!(
+        core::mem::offset_of!(
+            G17PCachedChannelStateLayoutAssert,
+            command_pointer_ring_gpu_va
+        ) == 0x08
+    );
+    assert!(core::mem::offset_of!(G17PCachedChannelStateLayoutAssert, coherency_cursor) == 0x1c);
+
+    assert!(core::mem::size_of::<G17PUncachedChannelStateLayoutAssert>() == 0x64);
+    assert!(core::mem::offset_of!(G17PUncachedChannelStateLayoutAssert, consumer) == 0x00);
+    assert!(core::mem::offset_of!(G17PUncachedChannelStateLayoutAssert, coherency_shadow) == 0x30);
+    assert!(core::mem::offset_of!(G17PUncachedChannelStateLayoutAssert, producer) == 0x40);
+    assert!(core::mem::offset_of!(G17PUncachedChannelStateLayoutAssert, recovery_target) == 0x50);
+    assert!(core::mem::offset_of!(G17PUncachedChannelStateLayoutAssert, ring_entry_count) == 0x60);
+};
+
+// ---------------------------------------------------------------------------
+// 3. Legacy AGX2 work-queue RingState. The A18 Pro ARM firmware directly
+//    confirms only done@0; the SKSM hardware consumer keeps the remaining
+//    rptr/wptr/size offsets unconfirmed, so this record is not admitted as a
+//    native G17P layout.
+// ---------------------------------------------------------------------------
+
+pub(crate) const AGX2_RING_STATE_GPU_DONEPTR_OFFSET: u32 = 0x00;
+pub(crate) const AGX2_RING_STATE_GPU_RPTR_OFFSET: u32 = 0x30;
+pub(crate) const AGX2_RING_STATE_CPU_WPTR_OFFSET: u32 = 0x40;
+pub(crate) const AGX2_RING_STATE_RB_SIZE_OFFSET: u32 = 0x50;
+
+/// AGX2 work-queue entries are u64 command GPU virtual addresses.
+pub(crate) const AGX2_RING_ENTRY_BYTES: u32 = 8;
 
 /// The shipping producer's maximum outstanding event slots
 /// (`workqueue.rs::MAX_JOB_SLOTS`). This is not the command-ring depth: the
@@ -823,6 +1029,7 @@ pub(crate) enum AbiProvenance {
 pub(crate) struct SubmissionAbiLedger {
     pub(crate) tx_doorbell: AbiProvenance,
     pub(crate) channel_state: AbiProvenance,
+    pub(crate) g17p_channel_state: AbiProvenance,
     pub(crate) ring_state: AbiProvenance,
     pub(crate) channel_descriptor: AbiProvenance,
     pub(crate) host_channel_state_reset: AbiProvenance,
@@ -836,14 +1043,15 @@ pub(crate) struct SubmissionAbiLedger {
 
 /// The doorbell is byte-grounded (§1); the SKSM kick word/record and host
 /// queue-timestamp producer are AGX3 forks grounded first-hand (§2-§5). The
-/// channel/ring producer *records* are the AGX2 layouts the driver writes; the
-/// G17 firmware consumer offsets were not read first-hand this pass. The G17
-/// channel descriptor is a grounded AGX3 fork (§2a), while the state records
-/// remain unconfirmed and fail-closed. The command dispatch is a grounded AGX3
-/// fork (§7): in particular, inherited AGX2 `InitBuffer = 6` is rejected.
+/// generic channel/ring producer records remain inherited and fail-closed.
+/// A separate G17P-only channel-state entry records the matched A18 Pro host
+/// producer and firmware consumer (§2c); it does not admit either M5 family.
+/// The command dispatch is a grounded AGX3 fork (§7): in particular, inherited
+/// AGX2 `InitBuffer = 6` is rejected.
 pub(crate) const SUBMISSION_ABI_LEDGER: SubmissionAbiLedger = SubmissionAbiLedger {
     tx_doorbell: AbiProvenance::IdenticalToAgx2,
     channel_state: AbiProvenance::Agx2InheritedUnconfirmed,
+    g17p_channel_state: AbiProvenance::ForkedAgx3Grounded,
     ring_state: AbiProvenance::Agx2InheritedUnconfirmed,
     channel_descriptor: AbiProvenance::ForkedAgx3Grounded,
     host_channel_state_reset: AbiProvenance::ForkedAgx3Grounded,
@@ -963,19 +1171,90 @@ mod tests {
     }
 
     #[test]
-    fn channel_and_ring_state_offsets_match_agx2() {
+    fn inherited_channel_and_ring_state_offsets_are_labeled_agx2() {
         // channel.rs raw::ChannelState: read_ptr@0x00, write_ptr@0x20.
-        assert_eq!(CHANNEL_STATE_READ_PTR_OFFSET, 0x00);
-        assert_eq!(CHANNEL_STATE_WRITE_PTR_OFFSET, 0x20);
-        assert_eq!(CHANNEL_STATE_SIZE, 0x40);
+        assert_eq!(AGX2_CHANNEL_STATE_READ_PTR_OFFSET, 0x00);
+        assert_eq!(AGX2_CHANNEL_STATE_WRITE_PTR_OFFSET, 0x20);
+        assert_eq!(AGX2_CHANNEL_STATE_SIZE, 0x40);
         // fw/workqueue.rs raw::RingState: doneptr@0x00, rptr@0x30, wptr@0x40,
         // size@0x50 (0x10-strided).
-        assert_eq!(RING_STATE_GPU_DONEPTR_OFFSET, 0x00);
-        assert_eq!(RING_STATE_GPU_RPTR_OFFSET, 0x30);
-        assert_eq!(RING_STATE_CPU_WPTR_OFFSET, 0x40);
-        assert_eq!(RING_STATE_RB_SIZE_OFFSET, 0x50);
-        assert_eq!(RING_ENTRY_BYTES, 8);
+        assert_eq!(AGX2_RING_STATE_GPU_DONEPTR_OFFSET, 0x00);
+        assert_eq!(AGX2_RING_STATE_GPU_RPTR_OFFSET, 0x30);
+        assert_eq!(AGX2_RING_STATE_CPU_WPTR_OFFSET, 0x40);
+        assert_eq!(AGX2_RING_STATE_RB_SIZE_OFFSET, 0x50);
+        assert_eq!(AGX2_RING_ENTRY_BYTES, 8);
         assert_eq!(HOST_MAX_OUTSTANDING_JOB_SLOTS, 127);
+    }
+
+    #[test]
+    fn g17p_native_channel_layout_is_identity_scoped() {
+        assert_eq!(
+            g17_channel_abi(G17ChannelAbiTarget::A18ProG17P),
+            Ok(G17P_CHANNEL_ABI)
+        );
+        assert_eq!(
+            g17_channel_abi(G17ChannelAbiTarget::M5G17G),
+            Err(SubmissionError::ChannelAbiUnconfirmed)
+        );
+        assert_eq!(
+            g17_channel_abi(G17ChannelAbiTarget::M5ProMaxG17X),
+            Err(SubmissionError::ChannelAbiUnconfirmed)
+        );
+
+        assert_eq!(
+            G17P_CHANNEL_ABI.cached,
+            G17PCachedChannelStateLayout {
+                uncached_state_gpu_va: 0x00,
+                command_pointer_ring_gpu_va: 0x08,
+                coherency_cursor: 0x1c,
+                record_size: 0x80,
+            }
+        );
+        assert_eq!(
+            G17P_CHANNEL_ABI.uncached,
+            G17PUncachedChannelStateLayout {
+                consumer: 0x00,
+                coherency_shadow: 0x30,
+                producer: 0x40,
+                recovery_target: 0x50,
+                ring_entry_count: 0x60,
+                cursor_width: 4,
+                write_extent: 0x64,
+            }
+        );
+        assert_eq!(G17P_CHANNEL_ABI.command_pointer_entry_bytes, 8);
+        assert_eq!(G17P_CHANNEL_ABI.accelerator_target_width, 2);
+        assert!(G17P_CHANNEL_PRODUCER_REQUIRES_DMB_ISH);
+    }
+
+    #[test]
+    fn g17p_channel_write_plan_matches_host_ordering_and_wrap() {
+        assert_eq!(
+            prepare_g17p_channel_write(G17ChannelAbiTarget::A18ProG17P, 2, 0, 4),
+            Ok(G17PChannelWritePlan {
+                entry_byte_offset: 0x10,
+                next_producer: 3,
+            })
+        );
+        assert_eq!(
+            prepare_g17p_channel_write(G17ChannelAbiTarget::A18ProG17P, 3, 2, 4),
+            Ok(G17PChannelWritePlan {
+                entry_byte_offset: 0x18,
+                next_producer: 0,
+            })
+        );
+        assert_eq!(
+            prepare_g17p_channel_write(G17ChannelAbiTarget::A18ProG17P, 1, 2, 4),
+            Err(SubmissionError::RingFull)
+        );
+        assert_eq!(
+            prepare_g17p_channel_write(G17ChannelAbiTarget::A18ProG17P, 0, 0, 0),
+            Err(SubmissionError::RingSizeZero)
+        );
+        assert_eq!(
+            prepare_g17p_channel_write(G17ChannelAbiTarget::M5ProMaxG17X, 0, 2, 4),
+            Err(SubmissionError::ChannelAbiUnconfirmed)
+        );
     }
 
     #[test]
@@ -1089,8 +1368,8 @@ mod tests {
     #[test]
     fn g17_uncached_channel_reset_preserves_unwritten_bytes() {
         let mut raw = [0xa5; G17_UNCACHED_CHANNEL_RESET_WRITE_EXTENT];
-        let byte_extent = 0x800;
-        apply_g17_uncached_channel_reset(&mut raw, byte_extent);
+        let ring_entry_count = 0x800;
+        apply_g17_uncached_channel_reset(&mut raw, ring_entry_count);
         let layout = G17_UNCACHED_CHANNEL_RESET_LAYOUT;
 
         for offset in [
@@ -1107,8 +1386,8 @@ mod tests {
             &u32::MAX.to_le_bytes()
         );
         assert_eq!(
-            &raw[layout.byte_extent_60..layout.byte_extent_60 + 4],
-            &byte_extent.to_le_bytes()
+            &raw[layout.ring_entry_count_60..layout.ring_entry_count_60 + 4],
+            &ring_entry_count.to_le_bytes()
         );
 
         for (index, byte) in raw.iter().enumerate() {
@@ -1494,6 +1773,10 @@ mod tests {
         assert_eq!(
             SUBMISSION_ABI_LEDGER.channel_state,
             AbiProvenance::Agx2InheritedUnconfirmed
+        );
+        assert_eq!(
+            SUBMISSION_ABI_LEDGER.g17p_channel_state,
+            AbiProvenance::ForkedAgx3Grounded
         );
         assert_eq!(
             SUBMISSION_ABI_LEDGER.ring_state,
