@@ -75,15 +75,30 @@ void fill_comp(struct avd_comp *comp, enum avd_image_fmt image_fmt, u32 width,
 	u32 y_meta, y, uv_meta, uv;
 	int bit_depth;
 
-	switch (image_fmt) {
-	case AVD_IMG_FMT_420_10BIT:
-	case AVD_IMG_FMT_422_10BIT:
-		bit_depth = 10;
-		break;
-	default:
-		bit_depth = 8;
-		break;
+int alloc_slots(struct avd_dev *avd, struct avd_ctx *ctx, enum avd_codec codec) {
+	u32 free;
+	u32 offset = 0;
+	for (int i = 0; i < codec; i++)
+		offset += avd->variant->vp_slots[i];
+
+	free = find_next_zero_bit(&avd->vp_slots,
+			offset + avd->variant->vp_slots[codec],
+			offset);
+
+	if (free >= offset + avd->variant->vp_slots[codec])
+		return -ENOMEM;
+
+	set_bit(free, &avd->vp_slots);
+	ctx->vp_slot = free;
+
+	ctx->fifo_idx = find_first_zero_bit(&avd->inst_fifo_slots,
+					    avd->variant->fifo_slots);
+
+	if (WARN_ON(ctx->fifo_idx >= avd->variant->fifo_slots)) {
+		clear_bit(free, &avd->vp_slots);
+		return -ENOMEM;
 	}
+	set_bit(ctx->fifo_idx, &avd->inst_fifo_slots);
 
 	/* y has 32x32 tiles and 32 bytes of metadata per tile */
 	calc_tile_meta(width, height, bit_depth, 32, 32, &y, &y_meta);
@@ -104,11 +119,10 @@ void fill_comp(struct avd_comp *comp, enum avd_image_fmt image_fmt, u32 width,
 
 int avd_buf_alloc(struct avd_dev *avd, struct avd_buf *buf, size_t size)
 {
-	/* Keep size equal to the payload length used by the H.264 slice path. */
-	avd_buf_free(avd, buf);
-
-	if (size <= 0)
-		return -ENOMEM;
+	if (!buf->cpu && size < buf->size)
+		return 0;
+	else if (buf->cpu)
+		avd_buf_free(avd, buf);
 
 	buf->size = size;
 	buf->cpu =
