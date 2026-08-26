@@ -976,9 +976,10 @@ pub(crate) const fn prepare_sksm_add_kicks_mmio(
 //    `AGXAcceleratorG16::populateKSMCompletionQueue` at
 //    0xfffffe0008a53034-0xfffffe0008a532b8 emits four 0x20-byte descriptors.
 //    Each present queue has 0x40-byte entries and a fixed ordinal 0..3. The
-//    matched firmware consumes those queues, but the physical platform-IRQ
-//    source selected by Apple's `interrupts`/`interrupts-valid` properties is
-//    not present in the pinned binary, so the completion IRQ live gap remains.
+//    matched firmware consumes those queues. D93AP IRQ 1001 and RTBuddy AKF
+//    message type 2 converge on source 4 and drain the event rings that carry
+//    completion stamps. The completion gap remains live-gated until an actual
+//    SKSM kick proves that complete round trip on D93AP hardware.
 // ---------------------------------------------------------------------------
 
 /// Offsets of the three runtime words loaded by the G17P host before every
@@ -1424,14 +1425,17 @@ pub(crate) const CHANNEL_DESCRIPTOR_STRIDE_CONFIRMED: bool = true;
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct SubmissionLiveGaps {
     /// Host `addKicks` publication and firmware scratch consumption are both
-    /// grounded, but their silicon bridge, live aperture values, and ordering
-    /// against the firmware consumer still need an on-device witness.
+    /// grounded. D93AP exposes only the two SGX ranges; the pinned host loads
+    /// runtime geometry words at +0x10730/+0x10734/+0x10738 without exposing
+    /// their values. The silicon bridge and ordering still need a live witness.
     pub(crate) sksm_hardware_kick_fifo_mmio_scratch_proven: bool,
     /// The kick -> execute -> completion IRQ handshake is a live event.
     pub(crate) doorbell_round_trip_proven: bool,
     /// Apple's host builds platform interrupt event sources from runtime
-    /// `interrupts`/`interrupts-valid` properties. The pinned binary does not
-    /// contain the physical source selected for G17P completion delivery.
+    /// `interrupts`/`interrupts-valid` properties. D93AP physical IRQ 1001 and
+    /// RTBuddy AKF type 2 both converge exactly on source 4 and drain the main
+    /// firmware event rings, but an on-device SKSM completion round trip has
+    /// not proven that this ingress is sufficient for Linux completion.
     pub(crate) completion_irq_route_proven: bool,
 }
 

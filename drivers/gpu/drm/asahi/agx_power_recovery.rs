@@ -482,6 +482,7 @@ pub(crate) struct T8140G17PAdtTopology {
     pub(crate) gfx_power_domain_parents: [u32; 2],
     pub(crate) clock_id: u32,
     pub(crate) sgx_interrupts: [u32; 8],
+    pub(crate) sgx_interrupts_valid: u32,
     pub(crate) gfx_asc_regs: [G17AdtRegisterRange; 2],
     pub(crate) gfx_asc_power_gate: u32,
     pub(crate) gfx_asc_power_gate_parent: u32,
@@ -520,6 +521,62 @@ pub(crate) enum T8140G17PAscRole {
     Gfx,
     Gfx1,
 }
+
+/// Named PMGR device selected by one D93AP GPU power-gate ID.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum T8140G17PPmgrDeviceName {
+    GfxSgx,
+    GfxBusy,
+    GfxAsc,
+    GfxAsc1,
+}
+
+/// Exact PMGR membership for one D93AP GPU power-gate ID.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct T8140G17PPmgrGate {
+    pub(crate) device_id: u32,
+    pub(crate) name: T8140G17PPmgrDeviceName,
+    pub(crate) flags: u32,
+    pub(crate) index: u32,
+    pub(crate) alias: Option<u32>,
+}
+
+/// D93AP's SGX and two ASC nubs select these named `pmgr1,t8140` devices.
+/// This proves membership only; it does not prove a Linux enable sequence or
+/// whether RTBuddy firmware retains ownership of any gate.
+pub(crate) const D93AP_T8140_G17P_PMGR_GATES: [T8140G17PPmgrGate; 4] = [
+    T8140G17PPmgrGate {
+        device_id: 235,
+        name: T8140G17PPmgrDeviceName::GfxSgx,
+        flags: 16,
+        index: 0,
+        alias: Some(40),
+    },
+    T8140G17PPmgrGate {
+        device_id: 236,
+        name: T8140G17PPmgrDeviceName::GfxBusy,
+        flags: 16,
+        index: 0,
+        alias: None,
+    },
+    T8140G17PPmgrGate {
+        device_id: 237,
+        name: T8140G17PPmgrDeviceName::GfxAsc,
+        flags: 16,
+        index: 0,
+        alias: Some(40),
+    },
+    T8140G17PPmgrGate {
+        device_id: 321,
+        name: T8140G17PPmgrDeviceName::GfxAsc1,
+        flags: 16,
+        index: 0,
+        alias: Some(40),
+    },
+];
+
+pub(crate) const T8140_G17P_PMGR_GATE_TOPOLOGY_PROVEN: bool = true;
+pub(crate) const T8140_G17P_LIVE_POWER_SEQUENCE_PROVEN: bool = false;
 
 /// ASCWrap v6 retains the ASC mailbox-v4 register ABI at wrapper + 0x8000.
 pub(crate) const T8140_ASCWRAP_V6_MAILBOX_OFFSET: u32 = 0x8000;
@@ -570,6 +627,7 @@ pub(crate) const D93AP_T8140_G17P_ADT_TOPOLOGY: T8140G17PAdtTopology = T8140G17P
     gfx_power_domain_parents: [29, 31],
     clock_id: 351,
     sgx_interrupts: [975, 976, 977, 978, 1001, 1003, 990, 992],
+    sgx_interrupts_valid: 0xdf,
     gfx_asc_regs: [
         G17AdtRegisterRange {
             phys_base: 0x2_7260_0000,
@@ -614,6 +672,120 @@ pub(crate) const D93AP_T8140_G17P_ADT_TOPOLOGY: T8140G17PAdtTopology = T8140G17P
 /// Do not begin A18 Pro live bring-up against an inferred or partial topology.
 pub(crate) fn validate_t8140_g17p_adt_topology(observed: &T8140G17PAdtTopology) -> bool {
     observed == &D93AP_T8140_G17P_ADT_TOPOLOGY
+}
+
+/// Exact host-side action selected by one valid D93AP SGX event-source index.
+///
+/// These names describe only the dispatch proven in the pinned G17P host. The
+/// drained event ring carries completion stamps, but no live run yet proves
+/// that one Linux SKSM kick produces this ingress on real D93AP hardware.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum T8140G17PSgxHostAction {
+    FirmwareEventZero,
+    GpcHostInterrupts,
+    DrainFirmwareRings,
+    McwInterrupt,
+    AcceleratorVirtualC60,
+}
+
+/// Physical D93AP interrupt selected by one host event-source index.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct T8140G17PSgxHostIrqRoute {
+    pub(crate) source_index: u8,
+    pub(crate) aic_irq: u32,
+    pub(crate) action: T8140G17PSgxHostAction,
+}
+
+/// The complete valid SGX event-source map from the signed 23G83 D93AP tree
+/// and `AGXFirmware::handleEvent` in pinned com.apple.AGXG17P.
+pub(crate) const D93AP_T8140_G17P_SGX_HOST_IRQ_ROUTES: [T8140G17PSgxHostIrqRoute; 7] = [
+    T8140G17PSgxHostIrqRoute {
+        source_index: 0,
+        aic_irq: 975,
+        action: T8140G17PSgxHostAction::FirmwareEventZero,
+    },
+    T8140G17PSgxHostIrqRoute {
+        source_index: 1,
+        aic_irq: 976,
+        action: T8140G17PSgxHostAction::GpcHostInterrupts,
+    },
+    T8140G17PSgxHostIrqRoute {
+        source_index: 2,
+        aic_irq: 977,
+        action: T8140G17PSgxHostAction::GpcHostInterrupts,
+    },
+    T8140G17PSgxHostIrqRoute {
+        source_index: 3,
+        aic_irq: 978,
+        action: T8140G17PSgxHostAction::GpcHostInterrupts,
+    },
+    T8140G17PSgxHostIrqRoute {
+        source_index: 4,
+        aic_irq: 1001,
+        action: T8140G17PSgxHostAction::DrainFirmwareRings,
+    },
+    T8140G17PSgxHostIrqRoute {
+        source_index: 6,
+        aic_irq: 990,
+        action: T8140G17PSgxHostAction::McwInterrupt,
+    },
+    T8140G17PSgxHostIrqRoute {
+        source_index: 7,
+        aic_irq: 992,
+        action: T8140G17PSgxHostAction::AcceleratorVirtualC60,
+    },
+];
+
+/// Both proven ingress mechanisms for the pinned host's main firmware event
+/// rings converge on SGX source 4.
+///
+/// A physical IRQ invokes the filter event source directly. RTBuddy AKF
+/// message type 2 calls `IOFilterInterruptEventSource::signalInterrupt()` on
+/// the source selected from the interrupt-count configuration; D93AP has eight
+/// interrupt words, selecting source 4. Both paths reach
+/// `AGXFirmware::handleEvent(4)`, clear outstanding firmware interrupts, and
+/// drain both role-local firmware event rings.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct T8140G17PFirmwareEventIngress {
+    pub(crate) physical_aic_irq: u32,
+    pub(crate) source_index: u8,
+    pub(crate) rtbuddy_akf_message_type: u8,
+}
+
+pub(crate) const D93AP_T8140_G17P_FIRMWARE_EVENT_INGRESS: T8140G17PFirmwareEventIngress =
+    T8140G17PFirmwareEventIngress {
+        physical_aic_irq: 1001,
+        source_index: 4,
+        rtbuddy_akf_message_type: 2,
+    };
+
+/// The platform event-source and firmware-ring ingress mapping is exact; the
+/// live SKSM completion handshake still must remain fail-closed.
+pub(crate) const T8140_G17P_SGX_EVENT_SOURCE_MAP_PROVEN: bool = true;
+pub(crate) const T8140_G17P_FIRMWARE_EVENT_INGRESS_PROVEN: bool = true;
+pub(crate) const T8140_G17P_SKSM_COMPLETION_IRQ_PROVEN: bool = false;
+
+/// Resolve only a valid interrupt from an exact D93AP topology.
+///
+/// Raw slot 5 contains IRQ 1003 but bit 5 is clear in `interrupts-valid`, so
+/// it is deliberately rejected rather than exposed as a Linux resource.
+pub(crate) fn decode_t8140_g17p_sgx_host_irq_route(
+    observed: &T8140G17PAdtTopology,
+    source_index: u8,
+) -> Option<T8140G17PSgxHostIrqRoute> {
+    if !validate_t8140_g17p_adt_topology(observed) || source_index >= 8 {
+        return None;
+    }
+
+    let valid = (observed.sgx_interrupts_valid & (1u32 << u32::from(source_index))) != 0;
+    if !valid {
+        return None;
+    }
+
+    D93AP_T8140_G17P_SGX_HOST_IRQ_ROUTES
+        .iter()
+        .copied()
+        .find(|route| route.source_index == source_index)
 }
 
 /// Decode the two independently owned mailbox providers from D93AP topology.
@@ -2189,6 +2361,69 @@ mod tests {
         assert_eq!(exact.gfx1_asc_power_gate, 321);
         assert_eq!(exact.gfx1_asc_power_gate_parent, 40);
         assert_eq!(
+            D93AP_T8140_G17P_PMGR_GATES,
+            [
+                T8140G17PPmgrGate {
+                    device_id: 235,
+                    name: T8140G17PPmgrDeviceName::GfxSgx,
+                    flags: 16,
+                    index: 0,
+                    alias: Some(40),
+                },
+                T8140G17PPmgrGate {
+                    device_id: 236,
+                    name: T8140G17PPmgrDeviceName::GfxBusy,
+                    flags: 16,
+                    index: 0,
+                    alias: None,
+                },
+                T8140G17PPmgrGate {
+                    device_id: 237,
+                    name: T8140G17PPmgrDeviceName::GfxAsc,
+                    flags: 16,
+                    index: 0,
+                    alias: Some(40),
+                },
+                T8140G17PPmgrGate {
+                    device_id: 321,
+                    name: T8140G17PPmgrDeviceName::GfxAsc1,
+                    flags: 16,
+                    index: 0,
+                    alias: Some(40),
+                },
+            ]
+        );
+        assert!(T8140_G17P_PMGR_GATE_TOPOLOGY_PROVEN);
+        assert!(!T8140_G17P_LIVE_POWER_SEQUENCE_PROVEN);
+        assert_eq!(exact.sgx_interrupts_valid, 0xdf);
+        assert!(T8140_G17P_SGX_EVENT_SOURCE_MAP_PROVEN);
+        assert!(T8140_G17P_FIRMWARE_EVENT_INGRESS_PROVEN);
+        assert!(!T8140_G17P_SKSM_COMPLETION_IRQ_PROVEN);
+        for expected in D93AP_T8140_G17P_SGX_HOST_IRQ_ROUTES {
+            assert_eq!(
+                decode_t8140_g17p_sgx_host_irq_route(&exact, expected.source_index),
+                Some(expected)
+            );
+        }
+        assert_eq!(decode_t8140_g17p_sgx_host_irq_route(&exact, 5), None);
+        assert_eq!(decode_t8140_g17p_sgx_host_irq_route(&exact, 8), None);
+        assert_eq!(
+            D93AP_T8140_G17P_FIRMWARE_EVENT_INGRESS,
+            T8140G17PFirmwareEventIngress {
+                physical_aic_irq: 1001,
+                source_index: 4,
+                rtbuddy_akf_message_type: 2,
+            }
+        );
+        assert_eq!(
+            decode_t8140_g17p_sgx_host_irq_route(&exact, 4),
+            Some(T8140G17PSgxHostIrqRoute {
+                source_index: 4,
+                aic_irq: 1001,
+                action: T8140G17PSgxHostAction::DrainFirmwareRings,
+            })
+        );
+        assert_eq!(
             exact.gfx_power_management,
             G17AdtPowerManagementProperty::UserPowerManaged
         );
@@ -2211,6 +2446,14 @@ mod tests {
         let mut wrong_active_irq = exact;
         wrong_active_irq.gfx1_asc_interrupts[2] = exact.gfx_asc_interrupts[2];
         assert_eq!(decode_t8140_g17p_asc_providers(&wrong_active_irq), None);
+
+        let mut invented_valid_slot = exact;
+        invented_valid_slot.sgx_interrupts_valid |= 1 << 5;
+        assert!(!validate_t8140_g17p_adt_topology(&invented_valid_slot));
+        assert_eq!(
+            decode_t8140_g17p_sgx_host_irq_route(&invented_valid_slot, 5),
+            None
+        );
 
         let mut detached_gfx1_gate = exact;
         detached_gfx1_gate.gfx1_asc_power_gate_parent = 0;
