@@ -732,7 +732,7 @@ pub(crate) struct G17xFirmwareStartGaps {
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const G17X_FIRMWARE_START_GAPS: G17xFirmwareStartGaps = G17xFirmwareStartGaps {
     load_firmware_mmio_and_power_order_proven: false,
-    load_firmware_cache_maintenance_proven: false,
+    load_firmware_cache_maintenance_proven: true,
     power_callback_to_endpoint_causality_proven: false,
     interrupt_and_ack_route_proven: false,
     both_cold_boot_flags_to_submission_causality_proven: false,
@@ -1527,7 +1527,7 @@ mod tests {
             G17X_FIRMWARE_START_GAPS,
             G17xFirmwareStartGaps {
                 load_firmware_mmio_and_power_order_proven: false,
-                load_firmware_cache_maintenance_proven: false,
+                load_firmware_cache_maintenance_proven: true,
                 power_callback_to_endpoint_causality_proven: false,
                 interrupt_and_ack_route_proven: false,
                 both_cold_boot_flags_to_submission_causality_proven: false,

@@ -724,7 +724,9 @@ mod tests {
             let initial = preflight.execution_gate().unwrap_err();
             assert_eq!(
                 initial.bits(),
-                REQUIRED_LIVE_EVIDENCE & !missing_live::ASC_WRAPPER_MMIO_ENABLE
+                REQUIRED_LIVE_EVIDENCE
+                    & !missing_live::FIRMWARE_LOAD_CACHE_MAINTENANCE
+                    & !missing_live::ASC_WRAPPER_MMIO_ENABLE
             );
             assert!(initial.contains(missing_live::COLD_BOOT_OBSERVATION));
             complete_cold_boot(&mut preflight);
@@ -732,13 +734,13 @@ mod tests {
             assert_eq!(
                 complete.bits(),
                 REQUIRED_LIVE_EVIDENCE
+                    & !missing_live::FIRMWARE_LOAD_CACHE_MAINTENANCE
                     & !missing_live::COLD_BOOT_OBSERVATION
                     & !missing_live::ASC_WRAPPER_MMIO_ENABLE
             );
             assert!(!complete.contains(missing_live::COLD_BOOT_OBSERVATION));
             for bit in [
                 missing_live::FIRMWARE_LOAD_POWER_ORDER,
-                missing_live::FIRMWARE_LOAD_CACHE_MAINTENANCE,
                 missing_live::POWER_CALLBACK_ENDPOINT_CAUSALITY,
                 missing_live::INTERRUPT_ACK_ROUTE,
                 missing_live::COLD_BOOT_TO_SUBMISSION_CAUSALITY,
@@ -752,6 +754,7 @@ mod tests {
             ] {
                 assert!(complete.contains(bit));
             }
+            assert!(!complete.contains(missing_live::FIRMWARE_LOAD_CACHE_MAINTENANCE));
             assert!(!complete.contains(missing_live::ASC_WRAPPER_MMIO_ENABLE));
         }
         assert!(!g17_boot::EXECUTABLE_G17X_FIRMWARE_START_HANDSHAKE_AVAILABLE);
