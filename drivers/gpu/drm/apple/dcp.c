@@ -2427,41 +2427,15 @@ static int dcp_platform_probe(struct platform_device *pdev)
 			return PTR_ERR(dcp->dp2hdmi_pwren);
 
 		/*
-		 * Acquire the display crossbar even when there is no
-		 * "mux-index".  On J700 the crossbar that routes dispext0 to
-		 * the ATC0 DP lanes must be selected when a DP-Alt sink
-		 * arrives, not at probe: selecting it here would force the ATC
-		 * PHY to DP-only while the rear connector still carries the
-		 * debug cable.  dcp_typec_mux_set() does the select instead.
+		 * Firmware or an inherited board DTS may leave the legacy mux-index
+		 * property on external DCP nodes. Multi-route USB-C DCPs select their
+		 * crossbar through the per-port routes registered above and do not
+		 * have a single "dp-xbar" mux. Treat mux-index only as the legacy
+		 * single-route binding; otherwise one stale property prevents every
+		 * Type-C controller from probing while they wait for the DCP routes.
 		 */
-		if (of_property_present(dev->of_node, "mux-controls") &&
-		    !of_property_present(dev->of_node, "mux-index")) {
-			dcp->xbar = devm_mux_control_get(dev, "dp-xbar");
-			if (IS_ERR(dcp->xbar)) {
-				dev_err(dev, "Failed to get dp-xbar: %ld\n",
-					PTR_ERR(dcp->xbar));
-				return PTR_ERR(dcp->xbar);
-			}
-			/*
-			 * Also route it now, before the DCP runs its own
-			 * external-core detection.  With the crossbar left
-			 * "disconnected" at init the firmware latches that core
-			 * as noconnect and never looks again: routing it later,
-			 * on the DP-Alt event, produced no firmware reaction at
-			 * all.  This is a display-side mux, so selecting it does
-			 * not disturb USB or the debug cable on the connector.
-			 */
-			ret = mux_control_select(dcp->xbar, DCP_DPXBAR_SELECTOR);
-			if (ret) {
-				dev_warn(dev, "J700_DPXBAR: probe select failed: %d\n",
-					 ret);
-			} else {
-				dcp->xbar_selected = true;
-				dev_info(dev, "J700_DPXBAR: selected at probe\n");
-			}
-		}
-
-		ret = of_property_read_u32(dev->of_node, "mux-index", &mux_index);
+		ret = dcp->nr_typec_routes ? -ENODATA :
+			of_property_read_u32(dev->of_node, "mux-index", &mux_index);
 		if (!ret) {
 			dcp->xbar = devm_mux_control_get(dev, "dp-xbar");
 			if (IS_ERR(dcp->xbar)) {
