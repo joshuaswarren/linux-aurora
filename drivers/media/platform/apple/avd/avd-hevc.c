@@ -18,7 +18,7 @@
 #include "avd.h"
 #include "avd-inst.h"
 
-#define PPS_NUM		8
+#define PPS_NUM		9
 
 #define NEW_TILE_ID	BIT(0)
 #define NEW_SLICE	BIT(1)
@@ -84,14 +84,7 @@ struct avd_hevc_ctx {
 	struct v4l2_ctrl_hevc_scaling_matrix scaling_matrix_cache;
 
 	struct avd_h264_bufs {
-		struct avd_buf mv_above_info;
-		struct avd_buf az_above;
-		struct avd_buf ip_above;
-		struct avd_buf lf_above;
-		struct avd_buf lf_above_info;
-		struct avd_buf lf_left;
-		struct avd_buf lf_left_info;
-		struct avd_buf sw_left;
+		struct avd_buf pps_tile[9];
 		struct avd_buf inst;
 		struct avd_buf pipe_state;
 	} bufs;
@@ -382,7 +375,7 @@ static void set_header(struct avd_ctx *ctx, struct avd_hevc_run *run)
 	} else {
 		pusha(0, "", 3);
 		pusha(0, "", 4);
-		pusha(hevc_ctx->bufs.pps_tile[4].addr,
+		pusha(hevc_ctx->bufs.pps_tile[8].addr,
 		      "hdr_dc_pps_tile_addr_lsb8", 8);
 		pusha(0, "", 9);
 	}
@@ -880,7 +873,7 @@ static int stream_slices(struct avd_ctx *ctx, struct avd_hevc_run *run)
 	struct avd_hevc_ctx *hevc_ctx = ctx->priv;
 	const struct v4l2_ctrl_hevc_slice_params *sl;
 	struct avd_hevc_tile_info *tile_info = &run->tile_info;
-	bool tiles_enabled, first_slice, first_segment;
+	bool tiles_enabled, is_last, first_slice, first_segment;
 	bool hflip, vflip;
 	int slice_segment_offset, entry_point_idx = 0, pos = 0, offset = 0;
 	int row, col, i, s, to;
@@ -919,7 +912,7 @@ static int stream_slices(struct avd_ctx *ctx, struct avd_hevc_run *run)
 				"to few entry points! has: %d, needs > %d",
 				run->num_entry_point_offsets,
 				sl->num_entry_point_offsets + entry_point_idx);
-			goto done;
+			return;
 		}
 		for (i = 0; i < to; i++) {
 			first_segment = i == 0;
@@ -945,12 +938,14 @@ static int stream_slices(struct avd_ctx *ctx, struct avd_hevc_run *run)
 				new_offset = size + sl->data_byte_offset;
 			}
 
-			tile_id = tile_ids
-				[ctb_addr_rs_to_ts[sl->slice_segment_addr]];
+			tile_id = tile_info->tile_ids
+					  [tile_info->ctb_addr_rs_to_ts
+						   [sl->slice_segment_addr]];
 			last_tile_id =
 				first_slice ?
 					-1 :
-					tile_ids[ctb_addr_rs_to_ts
+					tile_info->tile_ids
+						[tile_info->ctb_addr_rs_to_ts
 							 [run->sl[s - 1]
 								  .slice_segment_addr]];
 
@@ -1006,20 +1001,21 @@ static int stream_slices(struct avd_ctx *ctx, struct avd_hevc_run *run)
 			last_tile_block = submit_slice_segment(
 				ctx, run, sl, row, col, tile_info->col_bd,
 				tile_info->row_bd, pic_in_ctbs_width,
-				pic_in_ctbs_height, first_slice, hflip, vflip,
-				slice_flag, last_tile_block);
+				pic_in_ctbs_height, is_last, first_slice, hflip,
+				vflip, slice_flag, last_tile_block);
 
 			if (slice_flag & NEW_TILE_ID)
 				pos++;
 
 			slice_segment_offset += new_offset;
+
+			if (avd_wait_submission_queue(ctx))
+				return;
 		}
 		offset += sl->bit_size / 8;
 	}
 
 	hevc_ctx->submit_num = pos;
-
-	return 0;
 }
 
 static void update_dec_buf_info(struct avd_decoded_buffer *buf,
@@ -1165,6 +1161,181 @@ static int avd_hevc_alloc_scratch(struct avd_ctx *ctx, struct avd_hevc_run *run)
 	bit_depth += 8;
 
 	w = sps->pic_width_in_luma_samples;
+
+	log2_min_cb_size = sps->log2_min_luma_coding_block_size_minus3 + 3;
+	max_cu_width = 1 << (sps->log2_diff_max_min_luma_coding_block_size +
+			     log2_min_cb_size);
+
+	for (i = 0; i < cols; i++)
+		max_col = tile_info->col_width[i] > max_col ?
+				  tile_info->col_width[i] :
+				  max_col;
+
+	for (i = 0; i < rows; i++)
+		max_row = tile_info->row_height[i] > max_row ?
+				  tile_info->row_height[i] :
+				  max_row;
+
+	ret = avd_buf_alloc(avd, &hevc_ctx->bufs.pps_tile[0],
+			    ((max_col * max_cu_width) / 4) * bit_depth);
+	if (ret)
+		return ret;
+
+	ret = avd_buf_alloc(avd, &hevc_ctx->bufs.pps_tile[1],
+			    ((max_col * max_cu_width) / 16) * 20);
+	if (ret)
+		return ret;
+
+	ret = avd_buf_alloc(avd, &hevc_ctx->bufs.pps_tile[2],
+			    DIV_ROUND_UP(w, 16) * bit_depth * (10 + 6) +
+				    (cols - 1) * 256);
+	if (ret)
+		return ret;
+
+	ret = avd_buf_alloc(avd, &hevc_ctx->bufs.pps_tile[3],
+			    DIV_ROUND_UP(w + 7, 16) * 36 + cols * 128);
+	if (ret)
+		return ret;
+
+	if (pps->flags & V4L2_HEVC_PPS_FLAG_TILES_ENABLED) {
+		ret = avd_buf_alloc(avd, &hevc_ctx->bufs.pps_tile[4],
+				    ((max_row * max_cu_width) / 4) * 36 +
+					    144 /* why? */);
+		if (ret)
+			return ret;
+		ret = avd_buf_alloc(avd, &hevc_ctx->bufs.pps_tile[5],
+				    ((max_row * max_cu_width) / 4) * 9);
+		if (ret)
+			return ret;
+
+		ret = avd_buf_alloc(avd, &hevc_ctx->bufs.pps_tile[6],
+				    /* not sure if its cols or rows */
+				    DIV_ROUND_UP(w, 64) * 144 +
+					    (cols - 1) * 128);
+		if (ret)
+			return ret;
+
+		/* 5 or 3 is info? */
+		ret = avd_buf_alloc(avd, &hevc_ctx->bufs.pps_tile[7],
+				    ((max_row * max_cu_width) / 4) * 216);
+		if (ret)
+			return ret;
+	} else {
+		ret = avd_buf_alloc(avd, &hevc_ctx->bufs.pps_tile[8],
+				    DIV_ROUND_UP(w + 7, 16) * 4 * bit_depth);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+static int avd_hevc_compute_tiles(struct avd_ctx *ctx, struct avd_hevc_run *run)
+{
+	const struct v4l2_ctrl_hevc_sps *sps = run->sps;
+	const struct v4l2_ctrl_hevc_pps *pps = run->pps;
+	bool tiles_enabled;
+	struct avd_hevc_tile_info *tile_info = &run->tile_info;
+	u16 log2_min_cb_size, width, height;
+	s32 max_cu_width, pic_in_ctbs_width, pic_in_ctbs_height,
+		pic_in_ctbs_size;
+
+	width = sps->pic_width_in_luma_samples;
+	height = sps->pic_height_in_luma_samples;
+
+	log2_min_cb_size = sps->log2_min_luma_coding_block_size_minus3 + 3;
+
+	max_cu_width = 1 << (sps->log2_diff_max_min_luma_coding_block_size +
+			     log2_min_cb_size);
+	pic_in_ctbs_width = (width + max_cu_width - 1) / max_cu_width;
+	pic_in_ctbs_height = (height + max_cu_width - 1) / max_cu_width;
+	pic_in_ctbs_size = pic_in_ctbs_height * pic_in_ctbs_width;
+
+	tiles_enabled = !!(pps->flags & V4L2_HEVC_PPS_FLAG_TILES_ENABLED);
+
+	tile_info->ctb_addr_rs_to_ts = kzalloc(
+		sizeof(*tile_info->ctb_addr_rs_to_ts) * pic_in_ctbs_size,
+		GFP_KERNEL);
+	if (!tile_info->ctb_addr_rs_to_ts)
+		return -ENOMEM;
+
+	tile_info->tile_ids = kzalloc(
+		sizeof(*tile_info->tile_ids) * pic_in_ctbs_size, GFP_KERNEL);
+	if (!tile_info->tile_ids)
+		return -ENOMEM;
+
+	if (tiles_enabled) {
+		if (pps->flags & V4L2_HEVC_PPS_FLAG_UNIFORM_SPACING) {
+			compute_tiles_uniform(run, log2_min_cb_size, width,
+					      height, pic_in_ctbs_width,
+					      pic_in_ctbs_height,
+					      tile_info->col_width,
+					      tile_info->row_height);
+		} else {
+			compute_tiles_non_uniform(run, log2_min_cb_size, width,
+						  height, pic_in_ctbs_width,
+						  pic_in_ctbs_height,
+						  tile_info->col_width,
+						  tile_info->row_height);
+		}
+
+		compute_bd(run, tile_info->col_bd, tile_info->row_bd,
+			   tile_info->col_width, tile_info->row_height);
+
+		/*
+		 * 6.5.1 CTB raster and tile scanning conversion process
+		 * (6-7) and (6-9)
+		 *
+		 * we really only need to know if tileidx != last tileidx
+		 * so doing all this is stupid
+		 */
+		compute_rs_to_ts(run, pic_in_ctbs_size, pic_in_ctbs_width,
+				 tile_info->col_bd, tile_info->row_bd,
+				 tile_info->col_width, tile_info->row_height,
+				 tile_info->ctb_addr_rs_to_ts);
+		compute_tile_ids(run, pic_in_ctbs_width, tile_info->col_bd,
+				 tile_info->row_bd,
+				 tile_info->ctb_addr_rs_to_ts,
+				 tile_info->tile_ids);
+	} else {
+		tile_info->col_width[0] =
+			(width + max_cu_width - 1) / max_cu_width;
+		tile_info->row_height[0] =
+			(height + max_cu_width - 1) / max_cu_width;
+	}
+
+	return 0;
+}
+
+static void avd_hevc_dealloc_scratch(struct avd_ctx *ctx)
+{
+	struct avd_hevc_ctx *hevc_ctx = ctx->priv;
+	struct avd_dev *avd = ctx->dev;
+
+	for (int i = 0; i < PPS_NUM; i++)
+		avd_buf_free(avd, &hevc_ctx->bufs.pps_tile[i]);
+}
+
+static void avd_hevc_stop(struct avd_ctx *ctx)
+{
+	struct avd_hevc_ctx *hevc_ctx = ctx->priv;
+	struct avd_dev *avd = ctx->dev;
+	const struct v4l2_ctrl_hevc_sps *sps = run->sps;
+	const struct v4l2_ctrl_hevc_pps *pps = run->pps;
+	struct avd_hevc_tile_info *tile_info = &run->tile_info;
+	int i, ret, w, bit_depth, max_col = 0, max_row = 0, cols, rows;
+	int log2_min_cb_size, max_cu_width;
+	cols = pps->num_tile_columns_minus1 + 1;
+	rows = pps->num_tile_rows_minus1 + 1;
+
+	if (sps->bit_depth_chroma_minus8 > sps->bit_depth_luma_minus8)
+		bit_depth = sps->bit_depth_chroma_minus8;
+	else
+		bit_depth = sps->bit_depth_luma_minus8;
+
+	bit_depth += 8;
+
+	avd_hevc_dealloc_scratch(ctx);
 
 	log2_min_cb_size = sps->log2_min_luma_coding_block_size_minus3 + 3;
 	max_cu_width = 1 << (sps->log2_diff_max_min_luma_coding_block_size +
@@ -1383,19 +1554,24 @@ static int avd_hevc_run(struct avd_ctx *ctx)
 	dst = vb2_to_avd_decoded_buf(&run.base.bufs.dst->vb2_buf);
 	update_dec_buf_info(dst, &run.sl[0]);
 
+	ret = alloc_slots(avd, ctx, AVD_CODEC_HEVC);
+	if (ret) {
+		dev_err(avd->dev, "no free slots: %d", ret);
+		return ret;
+	}
+
 	ret = avd_hevc_compute_tiles(ctx, &run);
 	if (ret)
-		goto complete;
+		goto done;
 
 	ret = avd_hevc_alloc_scratch(ctx, &run);
 	if (ret)
-		goto complete;
+		goto done;
 
-	ret = avd_init_job(ctx, AVD_CODEC_HEVC,
-			   run.num_slices + run.num_entry_point_offsets + 1);
-	if (ret)
-		goto complete;
-
+	/* pr_info("VP%d: start\n", ctx->vp_slot); */
+	avd->variant->configure_stream(avd, hevc_ctx->bufs.inst.addr,
+				       ctx->fifo_idx, ctx->vp_slot);
+	/* avd_status(avd, ctx->vp_slot); */
 	set_header(ctx, &run);
 	ret = stream_slices(ctx, &run);
 	avd_run_postamble(ctx, &run.base);
@@ -1403,14 +1579,10 @@ static int avd_hevc_run(struct avd_ctx *ctx)
 		ret = avd_submit_job(ctx);
 	goto done;
 
-complete:
-	/* The request was applied; complete it on every way out. */
-	avd_run_postamble(ctx, &run.base);
+	ret = 0;
 done:
 	kfree(run.tile_info.ctb_addr_rs_to_ts);
 	kfree(run.tile_info.tile_ids);
-	kfree(run.sl);
-	kfree(run.entry_point_offsets);
 	return ret;
 }
 
