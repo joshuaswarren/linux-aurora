@@ -26,6 +26,7 @@ use crate::{
     g15_boot,
     g17_boot,
     g17_firmware,
+    g17_live_boot,
     g17_power_preflight,
     gem::AsahiObject,
     gpu,
@@ -325,6 +326,23 @@ fn refuse_agx3_probe(pdev: &platform::Device<Core>, soc: &'static hw::agx3::SocC
             "AGX3: SGX MMIO region unavailable: {:?}\n",
             e
         ),
+    }
+
+    // Opt-in live-boot executor (default OFF). When deliberately enabled on a
+    // real M5, attempt the grounded boot prologue instead of an unconditional
+    // refusal. The first slice always returns an error (the full boot is not
+    // yet wired), so probe still fails closed today.
+    if expected.gpu_gen == hw::GpuGen::G17 && g17_live_boot::G17_LIVE_BOOT_ENABLED {
+        match g17_live_boot::attempt(pdev, soc, &expected) {
+            Ok(()) => {
+                dev_info!(
+                    pdev.as_ref(),
+                    "G17 live-boot prologue completed; full boot not yet wired, refusing probe\n"
+                );
+                return ENODEV;
+            }
+            Err(e) => return e,
+        }
     }
 
     match expected.gpu_gen {
