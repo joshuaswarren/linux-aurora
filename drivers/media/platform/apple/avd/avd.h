@@ -62,6 +62,7 @@ struct avd_run {
 	dma_addr_t coded_in;
 	dma_addr_t y_out;
 	dma_addr_t uv_out;
+	dma_addr_t comp_out;
 };
 
 struct avd_ctrl_desc {
@@ -98,6 +99,7 @@ struct avd_hevc_decoded_buffer_info {
 	bool is_intra;
 };
 
+
 struct avd_comp {
 	u32 size;
 	/* offset to start of compressed data */
@@ -111,9 +113,6 @@ struct avd_decoded_buffer {
 	struct v4l2_m2m_buffer base;
 
 	struct avd_comp comp;
-	/* Pending CPU fill, retained with the buffer until dequeue. */
-	size_t grey_chroma_offset;
-	bool grey_chroma_10bit;
 
 	union {
 		struct avd_vp9_decoded_buffer_info vp9;
@@ -264,9 +263,9 @@ struct avd_ctx {
 	void *priv;
 
 	struct avd_comp comp;
-	int fifo_idx;
-	struct avd_job job;
-	struct avd_buf inst;
+
+	u8 fifo_idx;
+	u8 vp_slot;
 };
 
 int avd_init_job(struct avd_ctx *ctx, enum avd_codec codec, size_t segments);

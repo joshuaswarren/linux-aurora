@@ -17,18 +17,6 @@
 
 #define AVD_OP_HDR			FIELD_PREP(GENMASK(31, 20), 0x2db)
 #define AVD_OP_HDR_CONST		FIELD_PREP(GENMASK(10, 0), 0x2e0)
-
-/*
- * only for 10 bit.
- * output in packed p010 / nv15 kinda format
- * 10 bits per component. With groups of tree packed into 4 bytes (little
- * endian order)
- *  P  3  2  1
- * [2:10:10:10]
- *
- * additionally, av1 and vp9 need an extra scratch buffer if this is set
- */
-#define AVD_OP_HDR_FLAG_PACKED(v)	FIELD_PREP(BIT(10), !!(v))
 /* decompress pixel data */
 #define AVD_OP_HDR_FLAG_DECOMP(v)	FIELD_PREP(BIT(12), !!(v))
 #define AVD_OP_HDR_FLAG_INTRA(v)	FIELD_PREP(BIT(13), !!(v))
@@ -181,8 +169,8 @@ static inline void push_address(struct avd_ctx *ctx, dma_addr_t addr)
 		push(ctx, (u32)(addr >> 32));
 	}
 }
-static inline void push_comp(struct avd_ctx *ctx, dma_addr_t addr,
-			     u32 offsets[4])
+static inline void push_comp(struct avd_dev *avd, struct avd_ctx *ctx,
+		dma_addr_t addr, u32 offsets[4])
 {
 	if (ctx->dev->variant->quirks & AVD_QUIRK_LSR) {
 		for (int i = 0; i < 4; i++)

@@ -205,7 +205,7 @@
 #define AVD_CDFS_SIZE	(sizeof(struct avd_av1_cdfs))
 
 #define AVD_AV1_TLB_OFFSET(dst, tlb) \
-	(ALIGN_DOWN(dst, AVD_ALIGN) - ALIGN(tlb, AVD_ALIGN))
+	((dst) - ALIGN(tlb, AVD_ALIGN))
 #define AVD_AV1_CDFS_OFFSET(dst, tlb) \
 	(AVD_AV1_TLB_OFFSET(dst, tlb) - ALIGN(AVD_CDFS_SIZE, AVD_ALIGN))
 
@@ -213,7 +213,6 @@ struct avd_av1_run {
 	struct avd_run base;
 
 	struct {
-		dma_addr_t rvra;
 		dma_addr_t probs_out;
 		dma_addr_t priv_tlb;
 	} addresses;
@@ -360,8 +359,7 @@ static void set_refs(struct avd_ctx *ctx, struct avd_av1_run *run)
 					[frame->ref_frame_idx[i]]);
 		}
 		addr = vb2_dma_contig_plane_dma_addr(&ref->base.vb.vb2_buf, 0) +
-		       AVD_AV1_RVRA_OFFSET(ref->base.vb.planes[0].length,
-					   ref->rvra.size);
+		       ref->comp.start_offset;
 
 		if (!intrabc) {
 			int shift =
@@ -419,16 +417,7 @@ static void set_refs(struct avd_ctx *ctx, struct avd_av1_run *run)
 		push(AV1_REF_SCALE_X(x_scale) | AV1_REF_SCALE_Y(y_scale),
 		     "ref_scale");
 
-		x_scale = ((ref->av1.upscaled_width << AV1_REF_SCALE_SHIFT) +
-			   (width / 2)) /
-			  width;
-		y_scale = (((ref->av1.height + 1) << AV1_REF_SCALE_SHIFT) +
-			   (height / 2)) /
-			  height;
-		push(AV1_REF_SCALE_X(x_scale) | AV1_REF_SCALE_Y(y_scale),
-		     "ref_scale");
-
-		push_comp(ctx, addr, ref->comp.offsets);
+		push_comp(avd, ctx, addr, ref->comp.offsets);
 	}
 }
 
@@ -641,7 +630,7 @@ static void set_header(struct avd_ctx *ctx, struct avd_av1_run *run)
 		     AVD_OP_EXEC_FLAG_START_REV4(avd->variant->revision == 4) |
 		     AVD_OP_EXEC_FIFO_IDX(ctx->fifo_idx),
 	     "vp_start");
-	push(AVD_OP_HDR | AVD_OP_HDR_FLAG0 |
+	push(AVD_OP_HDR | AVD_OP_HDR_FLAG_DECOMP(ctx->decomp) |
 		     AVD_OP_HDR_FLAG_INTRA(intra_only && !intrabc) |
 		     AVD_OP_HDR_CONST | AVD_OP_HDR_FLAG_PIPE_STATE(1),
 	     "op_hdr");
@@ -945,7 +934,7 @@ static void set_header(struct avd_ctx *ctx, struct avd_av1_run *run)
 
 	push(0, "mark_section");
 
-	push_rvra(avd, ctx, run->addresses.rvra, ctx->rvra.offsets);
+	push_comp(avd, ctx, run->base.comp_out, ctx->comp.offsets);
 
 	push(0, "");
 	push(0, "");
@@ -963,10 +952,6 @@ static void set_header(struct avd_ctx *ctx, struct avd_av1_run *run)
 	pusha(av1_ctx->bufs.rf_left.addr, "rf_left", 3);
 
 	push(0, "mark_section");
-
-	push_comp(ctx, run->base.comp_out, ctx->comp.offsets);
-
-	pusha((u64)0, "packed_fmt_scratch", 0);
 
 	/* ignored if decomp is disabled */
 	bytesperline = ctx->decoded_fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
@@ -1160,9 +1145,6 @@ static int avd_av1_run_preamble(struct avd_ctx *ctx, struct avd_av1_run *run)
 	dst_len = run->base.bufs.dst->vb2_buf.planes[0].length;
 	tlb_len = avd_priv_tlb_size(run->frame->frame_width_minus_1 + 1,
 				    run->frame->frame_height_minus_1 + 1);
-
-	run->addresses.rvra =
-		run->addresses.y + AVD_AV1_RVRA_OFFSET(dst_len, ctx->rvra.size);
 
 	run->addresses.priv_tlb =
 		run->base.y_out + AVD_AV1_TLB_OFFSET(dst_len, tlb_len);

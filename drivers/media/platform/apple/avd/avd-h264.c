@@ -41,7 +41,6 @@ struct avd_h264_run {
 	const struct v4l2_ctrl_h264_pred_weights *pred_weights;
 
 	struct run_addr {
-		dma_addr_t rvra;
 		dma_addr_t sps;
 	} addresses;
 
@@ -101,8 +100,11 @@ static void stream_refs(struct avd_ctx *ctx, struct avd_h264_run *run)
 	const struct v4l2_ctrl_h264_decode_params *decode = run->decode_params;
 	const struct v4l2_h264_dpb_entry *dpb = decode->dpb;
 	struct avd_h264_ctx *h264_ctx = ctx->priv;
+	struct avd_dev *avd = ctx->dev;
 	struct avd_decoded_buffer *dst, *ref;
 	dma_addr_t addr;
+
+	dst = vb2_to_avd_decoded_buf(&run->base.bufs.dst->vb2_buf);
 
 	push(0, "");
 	pusha(h264_ctx->bufs.pps_tile[4].addr, "hdr_9c_pps_tile_addr_lsb8", 7);
@@ -119,13 +121,8 @@ static void stream_refs(struct avd_ctx *ctx, struct avd_h264_run *run)
 
 		ref = avd_get_ref_buf(ctx, &dst->base.vb, dpb[i].reference_ts);
 
-		dma_addr_t rvra_addr =
-			vb ? vb2_dma_contig_plane_dma_addr(vb, 0) +
-					(vb->planes[0].length -
-					 sps_size(fmt_width(ctx),
-						  fmt_height(ctx)) -
-					 ctx->rvra.size) :
-			     run->addresses.rvra; /* safe fallback */
+		addr = vb2_dma_contig_plane_dma_addr(&ref->base.vb.vb2_buf, 0) +
+		       ref->comp.start_offset;
 
 		push(AVD_REF_NUM(run->num_valid - 1) | AVD_REF_FLAG_CONST |
 			     AVD_REF_FLAG_LONG(
@@ -135,7 +132,7 @@ static void stream_refs(struct avd_ctx *ctx, struct avd_h264_run *run)
 					       dpb[i].top_field_order_cnt),
 		     "hdr_d0_ref_hdr");
 
-		push_comp(ctx, addr, ctx->comp.offsets);
+		push_comp(avd, ctx, addr, ctx->comp.offsets);
 	}
 }
 
@@ -211,7 +208,7 @@ static void stream_hdr(struct avd_ctx *ctx, struct avd_h264_run *run)
 		     AVD_OP_EXEC_FLAG_START_REV4(avd->variant->revision == 4),
 	     "inst_fifo_start");
 
-	push(AVD_OP_HDR | AVD_OP_HDR_FLAG0 |
+	push(AVD_OP_HDR | AVD_OP_HDR_FLAG_DECOMP(ctx->decomp) |
 		     AVD_OP_HDR_FLAG_INTRA(
 			     decode->flags &
 			     V4L2_H264_DECODE_PARAM_FLAG_IDR_PIC) |
@@ -285,7 +282,7 @@ static void stream_hdr(struct avd_ctx *ctx, struct avd_h264_run *run)
 	pusha(h264_ctx->bufs.pps_tile[3].addr, "hdr_9c_pps_tile_addr_lsb8", 3);
 	push(0, "");
 
-	push_comp(ctx, run->base.comp_out, ctx->comp.offsets);
+	push_comp(avd, ctx, run->base.comp_out, ctx->comp.offsets);
 
 	bytesperline = ctx->decoded_fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
 	if (avd->variant->quirks & AVD_QUIRK_LSR)
@@ -687,13 +684,6 @@ static void avd_h264_run_preamble(struct avd_ctx *ctx, struct avd_h264_run *run)
 	dst_len = run->base.bufs.dst->vb2_buf.planes[0].length;
 
 	sps_len = sps_size(fmt_width(ctx), fmt_height(ctx));
-
-	if (sl->slice_type == V4L2_H264_SLICE_TYPE_P)
-		nlists = 1;
-	else if (sl->slice_type == V4L2_H264_SLICE_TYPE_B)
-		nlists = 2;
-	else
-		return true;
 
 	run->addresses.sps = run->base.y_out + (dst_len - sps_len);
 }

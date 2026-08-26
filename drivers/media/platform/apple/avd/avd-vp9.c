@@ -135,10 +135,6 @@ struct avd_vp9_frame_info {
 struct avd_vp9_run {
 	struct avd_run base;
 
-	struct run_addr {
-		dma_addr_t rvra;
-	} addresses;
-
 	const struct v4l2_ctrl_vp9_frame *decode_params;
 	const struct v4l2_ctrl_vp9_compressed_hdr *prob_updates;
 };
@@ -187,8 +183,7 @@ static void set_refs(struct avd_ctx *ctx, struct avd_vp9_run *run)
 	for (int i = 0; i < V4L2_VP9_NUM_FRAME_CTX - 1; i++) {
 		addr = vb2_dma_contig_plane_dma_addr(
 			       &ref_buf[i]->base.vb.vb2_buf, 0) +
-		       (ref_buf[i]->base.vb.planes[0].length -
-			ref_buf[i]->rvra.size);
+		       ref_buf[i]->comp.start_offset;
 
 		/* TODO */
 		push(AVD_REF_FLAG_CONST, "hdr_9c_ref_100");
@@ -197,14 +192,7 @@ static void set_refs(struct avd_ctx *ctx, struct avd_vp9_run *run)
 		     "hdr_70_ref_height_width");
 		push(0x40004000, "hdr_7c_ref_align");
 
-		xscale = (ref_buf[i]->vp9.width << VP9_REF_SCALE_SHIFT) /
-			 dst->vp9.width;
-		yscale = (ref_buf[i]->vp9.height << VP9_REF_SCALE_SHIFT) /
-			 dst->vp9.height;
-		push(AVD_HDR_HEIGHT(xscale) | AVD_HDR_WIDTH(yscale),
-		     "ref_scale");
-
-		push_comp(ctx, addr, ref_buf[i]->comp.offsets);
+		push_comp(avd, ctx, addr, ref_buf[i]->comp.offsets);
 	}
 }
 
@@ -319,8 +307,8 @@ static void set_header(struct avd_ctx *ctx, struct avd_vp9_run *run)
 		     AVD_OP_EXEC_FIFO_IDX(ctx->fifo_idx),
 	     "inst_fifo_start");
 
-	push(AVD_OP_HDR | AVD_OP_HDR_FLAG0 | AVD_OP_HDR_FLAG_INTRA(intra_only) |
-		     AVD_OP_HDR_CONST |
+	push(AVD_OP_HDR | AVD_OP_HDR_FLAG_DECOMP(ctx->decomp) |
+		     AVD_OP_HDR_FLAG_INTRA(intra_only) | AVD_OP_HDR_CONST |
 		     AVD_OP_HDR_FLAG_PIPE_STATE(
 			     !(avd->variant->quirks & AVD_QUIRK_NO_PIPE_STATE)),
 	     "hdr_34_start_hdr");
@@ -414,7 +402,7 @@ static void set_header(struct avd_ctx *ctx, struct avd_vp9_run *run)
 
 	push(0, "");
 
-	push(0, "");
+	push_comp(avd, ctx, run->base.comp_out, ctx->comp.offsets);
 
 	pusha((u64)0, "packed_fmt_scratch", 0);
 
@@ -759,9 +747,6 @@ static int avd_vp9_run_preamble(struct avd_ctx *ctx, struct avd_vp9_run *run)
 	vp9_ctx->probability_tables = vp9_ctx->frame_context[fctx_idx];
 	v4l2_vp9_fw_update_probs(&vp9_ctx->probability_tables,
 				 run->prob_updates, dec_params);
-
-
-	run->addresses.rvra = run->addresses.y + (dst_len - ctx->rvra.size);
 
 	return 0;
 }
