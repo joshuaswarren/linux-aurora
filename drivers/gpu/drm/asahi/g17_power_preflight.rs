@@ -17,10 +17,13 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 #[cfg(not(test))]
-use crate::{agx_power_recovery, g17_boot, identity};
+use crate::{agx_power_recovery, g17_asc_bringup, g17_boot, identity};
 #[cfg(test)]
 #[path = "agx_power_recovery.rs"]
 mod agx_power_recovery;
+#[cfg(test)]
+#[path = "g17_asc_bringup.rs"]
+mod g17_asc_bringup;
 #[cfg(test)]
 #[path = "g17_boot.rs"]
 mod g17_boot;
@@ -67,6 +70,14 @@ impl G17PowerTarget {
             Self::G17P => agx_power_recovery::G17PmConfigEvidenceTarget::G17P,
             Self::G17G => agx_power_recovery::G17PmConfigEvidenceTarget::G17G,
             Self::G17S => agx_power_recovery::G17PmConfigEvidenceTarget::G17S,
+        }
+    }
+
+    const fn asc_target(self) -> g17_asc_bringup::G17AscEvidenceTarget {
+        match self {
+            Self::G17P => g17_asc_bringup::G17AscEvidenceTarget::G17P,
+            Self::G17G => g17_asc_bringup::G17AscEvidenceTarget::G17G,
+            Self::G17S => g17_asc_bringup::G17AscEvidenceTarget::G17S,
         }
     }
 }
@@ -130,6 +141,11 @@ pub(crate) mod missing_live {
     pub(crate) const GFX1_POWER_SEQUENCE: u16 = 1 << 6;
     pub(crate) const RECOVERY_HANDSHAKE: u16 = 1 << 7;
     pub(crate) const COLD_BOOT_OBSERVATION: u16 = 1 << 8;
+    pub(crate) const PMGR_ASC_GATE_ORDER: u16 = 1 << 9;
+    pub(crate) const ASC_CONTROL_APERTURE_OWNERSHIP: u16 = 1 << 10;
+    pub(crate) const IORVBAR_DMA_VISIBILITY: u16 = 1 << 11;
+    pub(crate) const ASC_WRAPPER_MMIO_ENABLE: u16 = 1 << 12;
+    pub(crate) const ASC_TEARDOWN_OWNER: u16 = 1 << 13;
 }
 
 const REQUIRED_LIVE_EVIDENCE: u16 = missing_live::FIRMWARE_LOAD_POWER_ORDER
@@ -140,7 +156,12 @@ const REQUIRED_LIVE_EVIDENCE: u16 = missing_live::FIRMWARE_LOAD_POWER_ORDER
     | missing_live::GFX1_PIO_LINUX_OWNERSHIP
     | missing_live::GFX1_POWER_SEQUENCE
     | missing_live::RECOVERY_HANDSHAKE
-    | missing_live::COLD_BOOT_OBSERVATION;
+    | missing_live::COLD_BOOT_OBSERVATION
+    | missing_live::PMGR_ASC_GATE_ORDER
+    | missing_live::ASC_CONTROL_APERTURE_OWNERSHIP
+    | missing_live::IORVBAR_DMA_VISIBILITY
+    | missing_live::ASC_WRAPPER_MMIO_ENABLE
+    | missing_live::ASC_TEARDOWN_OWNER;
 
 /// Opaque result of the production power execution gate.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -240,6 +261,22 @@ fn missing_static_live_evidence() -> u16 {
     if !agx_power_recovery::EXECUTABLE_G17_RECOVERY_HANDSHAKE_AVAILABLE {
         missing |= missing_live::RECOVERY_HANDSHAKE;
     }
+    let asc = g17_asc_bringup::G17_ASC_LIVE_GAPS;
+    if !asc.pmgr_set_power_state_gate_order_owned {
+        missing |= missing_live::PMGR_ASC_GATE_ORDER;
+    }
+    if !asc.asc_control_aperture_owned {
+        missing |= missing_live::ASC_CONTROL_APERTURE_OWNERSHIP;
+    }
+    if !asc.iorvbar_aperture_and_dma_visibility_owned {
+        missing |= missing_live::IORVBAR_DMA_VISIBILITY;
+    }
+    if !asc.wrapper_mmio_enable_source_proven {
+        missing |= missing_live::ASC_WRAPPER_MMIO_ENABLE;
+    }
+    if !asc.stop_cpu_teardown_owner_wired {
+        missing |= missing_live::ASC_TEARDOWN_OWNER;
+    }
 
     (REQUIRED_LIVE_EVIDENCE & !missing_live::COLD_BOOT_OBSERVATION) & missing
 }
@@ -306,6 +343,10 @@ impl G17PowerPreflight {
 
     pub(crate) const fn boot_text_evidence(&self) -> g17_boot::G17HostBootTextEvidence {
         g17_boot::g17_host_boot_text_evidence(self.target.boot_target())
+    }
+
+    pub(crate) const fn asc_text_evidence(&self) -> g17_asc_bringup::G17AscTextEvidence {
+        g17_asc_bringup::g17_asc_text_evidence(self.target.asc_target())
     }
 
     pub(crate) const fn opaque_pm_config(&self) -> &'static [u64; 6] {
@@ -523,8 +564,22 @@ mod tests {
             s.boot_text_evidence().boot_firmware_va,
             0xffff_fe00_08b3_9754
         );
+        assert_eq!(
+            p.asc_text_evidence().a7iop_start_cpu_with_options,
+            0xffff_fe00_08ab_c6d0
+        );
+        assert_eq!(
+            g.asc_text_evidence().a7iop_start_cpu_with_options,
+            0xffff_fe00_08be_fd20
+        );
+        assert_eq!(
+            s.asc_text_evidence().a7iop_start_cpu_with_options,
+            0xffff_fe00_08bb_6a50
+        );
         assert_ne!(p.boot_text_evidence(), g.boot_text_evidence());
         assert_ne!(g.boot_text_evidence(), s.boot_text_evidence());
+        assert_ne!(p.asc_text_evidence(), g.asc_text_evidence());
+        assert_ne!(g.asc_text_evidence(), s.asc_text_evidence());
     }
 
     #[test]
@@ -685,6 +740,11 @@ mod tests {
                 missing_live::GFX1_PIO_LINUX_OWNERSHIP,
                 missing_live::GFX1_POWER_SEQUENCE,
                 missing_live::RECOVERY_HANDSHAKE,
+                missing_live::PMGR_ASC_GATE_ORDER,
+                missing_live::ASC_CONTROL_APERTURE_OWNERSHIP,
+                missing_live::IORVBAR_DMA_VISIBILITY,
+                missing_live::ASC_WRAPPER_MMIO_ENABLE,
+                missing_live::ASC_TEARDOWN_OWNER,
             ] {
                 assert!(complete.contains(bit));
             }
@@ -692,5 +752,6 @@ mod tests {
         assert!(!g17_boot::EXECUTABLE_G17X_FIRMWARE_START_HANDSHAKE_AVAILABLE);
         assert!(!agx_power_recovery::EXECUTABLE_GFX1_POWER_SEQUENCE_AVAILABLE);
         assert!(!agx_power_recovery::EXECUTABLE_G17_RECOVERY_HANDSHAKE_AVAILABLE);
+        assert!(!g17_asc_bringup::EXECUTABLE_G17_ASC_BRINGUP_AVAILABLE);
     }
 }

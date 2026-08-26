@@ -18,6 +18,7 @@ mod float;
 mod fw;
 mod g15_boot;
 mod g15_initdata;
+mod g17_asc_bringup;
 mod g17_boot;
 mod g17_firmware;
 mod g17_initdata;
