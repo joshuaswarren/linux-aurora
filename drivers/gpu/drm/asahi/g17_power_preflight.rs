@@ -110,11 +110,13 @@ pub(crate) enum T8140AscLaunchStrategy {
 pub(crate) struct T8140G17PPlatformStrategy {
     pub(crate) performance_states: T8140PerformanceStateStrategy,
     pub(crate) asc_launch: T8140AscLaunchStrategy,
+    pub(crate) asc_providers: [agx_power_recovery::T8140G17PAscProvider; 2],
 }
 
 const T8140_G17P_PLATFORM_STRATEGY: T8140G17PPlatformStrategy = T8140G17PPlatformStrategy {
     performance_states: T8140PerformanceStateStrategy::NoLegacyOppSynthesis,
     asc_launch: T8140AscLaunchStrategy::DualAscGfxThenGfx1ThenCombinedWait,
+    asc_providers: agx_power_recovery::D93AP_T8140_G17P_ASC_PROVIDERS,
 };
 
 /// Live evidence which is still required before Linux may execute G17 power.
@@ -266,7 +268,8 @@ impl G17PowerPreflight {
         let target = validate_identity(identity)?;
         let t8140_strategy = match (target, observed_t8140_topology) {
             (G17PowerTarget::G17P, Some(observed))
-                if agx_power_recovery::validate_t8140_g17p_adt_topology(observed) =>
+                if agx_power_recovery::decode_t8140_g17p_asc_providers(observed)
+                    == Some(T8140_G17P_PLATFORM_STRATEGY.asc_providers) =>
             {
                 Some(T8140_G17P_PLATFORM_STRATEGY)
             }
@@ -490,6 +493,7 @@ mod tests {
             Some(T8140G17PPlatformStrategy {
                 performance_states: T8140PerformanceStateStrategy::NoLegacyOppSynthesis,
                 asc_launch: T8140AscLaunchStrategy::DualAscGfxThenGfx1ThenCombinedWait,
+                asc_providers: agx_power_recovery::D93AP_T8140_G17P_ASC_PROVIDERS,
             })
         );
 

@@ -501,6 +501,58 @@ pub(crate) struct T8140G17PAdtTopology {
     pub(crate) perf_states_sram_present: bool,
 }
 
+/// One role-local ASCWrap v6 provider decoded from exact D93AP topology.
+///
+/// `wrapper_regs` contains the mailbox block at
+/// [`T8140_ASCWRAP_V6_MAILBOX_OFFSET`]. `iorvbar_regs` is the independent
+/// eight-byte IORVBAR window and is deliberately not part of mailbox MMIO.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct T8140G17PAscProvider {
+    pub(crate) role: T8140G17PAscRole,
+    pub(crate) wrapper_regs: G17AdtRegisterRange,
+    pub(crate) iorvbar_regs: G17AdtRegisterRange,
+    pub(crate) send_empty_irq: u32,
+    pub(crate) recv_not_empty_irq: u32,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum T8140G17PAscRole {
+    Gfx,
+    Gfx1,
+}
+
+/// ASCWrap v6 retains the ASC mailbox-v4 register ABI at wrapper + 0x8000.
+pub(crate) const T8140_ASCWRAP_V6_MAILBOX_OFFSET: u32 = 0x8000;
+
+pub(crate) const D93AP_T8140_G17P_ASC_PROVIDERS: [T8140G17PAscProvider; 2] = [
+    T8140G17PAscProvider {
+        role: T8140G17PAscRole::Gfx,
+        wrapper_regs: G17AdtRegisterRange {
+            phys_base: 0x2_7260_0000,
+            size: 0x0008_8000,
+        },
+        iorvbar_regs: G17AdtRegisterRange {
+            phys_base: 0x2_7205_0000,
+            size: 8,
+        },
+        send_empty_irq: 993,
+        recv_not_empty_irq: 996,
+    },
+    T8140G17PAscProvider {
+        role: T8140G17PAscRole::Gfx1,
+        wrapper_regs: G17AdtRegisterRange {
+            phys_base: 0x2_72e0_0000,
+            size: 0x0008_8000,
+        },
+        iorvbar_regs: G17AdtRegisterRange {
+            phys_base: 0x2_7285_0000,
+            size: 8,
+        },
+        send_empty_irq: 997,
+        recv_not_empty_irq: 1000,
+    },
+];
+
 pub(crate) const D93AP_T8140_G17P_ADT_TOPOLOGY: T8140G17PAdtTopology = T8140G17PAdtTopology {
     sgx_regs: [
         G17AdtRegisterRange {
@@ -562,6 +614,37 @@ pub(crate) const D93AP_T8140_G17P_ADT_TOPOLOGY: T8140G17PAdtTopology = T8140G17P
 /// Do not begin A18 Pro live bring-up against an inferred or partial topology.
 pub(crate) fn validate_t8140_g17p_adt_topology(observed: &T8140G17PAdtTopology) -> bool {
     observed == &D93AP_T8140_G17P_ADT_TOPOLOGY
+}
+
+/// Decode the two independently owned mailbox providers from D93AP topology.
+///
+/// AppleA7IOP selects raw interrupt index 1 for send-empty and index 2 for
+/// receive-not-empty. The other two wrapper interrupts remain unexposed until
+/// a host consumer for them is proven. Any partial or inferred topology is
+/// rejected before resources are returned.
+pub(crate) fn decode_t8140_g17p_asc_providers(
+    observed: &T8140G17PAdtTopology,
+) -> Option<[T8140G17PAscProvider; 2]> {
+    if !validate_t8140_g17p_adt_topology(observed) {
+        return None;
+    }
+
+    Some([
+        T8140G17PAscProvider {
+            role: T8140G17PAscRole::Gfx,
+            wrapper_regs: observed.gfx_asc_regs[0],
+            iorvbar_regs: observed.gfx_asc_regs[1],
+            send_empty_irq: observed.gfx_asc_interrupts[1],
+            recv_not_empty_irq: observed.gfx_asc_interrupts[2],
+        },
+        T8140G17PAscProvider {
+            role: T8140G17PAscRole::Gfx1,
+            wrapper_regs: observed.gfx1_asc_regs[0],
+            iorvbar_regs: observed.gfx1_asc_regs[1],
+            send_empty_irq: observed.gfx1_asc_interrupts[1],
+            recv_not_empty_irq: observed.gfx1_asc_interrupts[2],
+        },
+    ])
 }
 
 /// Source from which the pinned host constructs one physical PIO binding.
@@ -2077,6 +2160,26 @@ mod tests {
         let exact = D93AP_T8140_G17P_ADT_TOPOLOGY;
 
         assert!(validate_t8140_g17p_adt_topology(&exact));
+        let providers = decode_t8140_g17p_asc_providers(&exact).unwrap();
+        assert_eq!(providers, D93AP_T8140_G17P_ASC_PROVIDERS);
+        assert_eq!(providers[0].role, T8140G17PAscRole::Gfx);
+        assert_eq!(providers[0].send_empty_irq, 993);
+        assert_eq!(providers[0].recv_not_empty_irq, 996);
+        assert_eq!(providers[1].role, T8140G17PAscRole::Gfx1);
+        assert_eq!(providers[1].send_empty_irq, 997);
+        assert_eq!(providers[1].recv_not_empty_irq, 1000);
+        assert_eq!(providers[0].wrapper_regs.size, 0x88000);
+        assert_eq!(providers[1].wrapper_regs.size, 0x88000);
+        assert_eq!(providers[0].iorvbar_regs.size, 8);
+        assert_eq!(providers[1].iorvbar_regs.size, 8);
+        assert_eq!(
+            providers[0].wrapper_regs.phys_base + u64::from(T8140_ASCWRAP_V6_MAILBOX_OFFSET),
+            0x2_7260_8000
+        );
+        assert_eq!(
+            providers[1].wrapper_regs.phys_base + u64::from(T8140_ASCWRAP_V6_MAILBOX_OFFSET),
+            0x2_72e0_8000
+        );
         assert_eq!(exact.sgx_power_gates, [235, 236]);
         assert_eq!(exact.sgx_power_gate_parents, [Some(40), None]);
         assert_eq!(exact.gfx_power_domain, 40);
@@ -2103,6 +2206,11 @@ mod tests {
         let mut wrong_gfx1_transport = exact;
         wrong_gfx1_transport.gfx1_asc_regs[0].phys_base = exact.gfx_asc_regs[0].phys_base;
         assert!(!validate_t8140_g17p_adt_topology(&wrong_gfx1_transport));
+        assert_eq!(decode_t8140_g17p_asc_providers(&wrong_gfx1_transport), None);
+
+        let mut wrong_active_irq = exact;
+        wrong_active_irq.gfx1_asc_interrupts[2] = exact.gfx_asc_interrupts[2];
+        assert_eq!(decode_t8140_g17p_asc_providers(&wrong_active_irq), None);
 
         let mut detached_gfx1_gate = exact;
         detached_gfx1_gate.gfx1_asc_power_gate_parent = 0;
