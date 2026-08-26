@@ -81,10 +81,41 @@ pub(crate) enum G17PowerPreflightError {
     UnexpectedFirmwareRoleTopology,
     UnexpectedSubmissionTransport,
     UnexpectedUatWidth,
+    MissingT8140Topology,
+    UnexpectedT8140Topology,
     BootSequence(g17_boot::BootError),
     ColdBootIncomplete,
     UnprovedPowerTransition(agx_power_recovery::PowerTransitionError),
 }
+
+/// A18 Pro performance-state handling selected only after exact D93AP
+/// topology admission.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum T8140PerformanceStateStrategy {
+    /// D93AP has `perf-state-count = 0`, sixteen zero records, and no
+    /// `perf-states-sram`; do not run the legacy OPP synthesis path.
+    NoLegacyOppSynthesis,
+}
+
+/// A18 Pro ASC launch handling selected only after exact D93AP admission.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum T8140AscLaunchStrategy {
+    /// Start the independent GFX ASC, then GFX1 ASC, require both starts, and
+    /// only then enter the combined-started wait.
+    DualAscGfxThenGfx1ThenCombinedWait,
+}
+
+/// Operational strategy carried by an admitted A18 Pro preflight.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct T8140G17PPlatformStrategy {
+    pub(crate) performance_states: T8140PerformanceStateStrategy,
+    pub(crate) asc_launch: T8140AscLaunchStrategy,
+}
+
+const T8140_G17P_PLATFORM_STRATEGY: T8140G17PPlatformStrategy = T8140G17PPlatformStrategy {
+    performance_states: T8140PerformanceStateStrategy::NoLegacyOppSynthesis,
+    asc_launch: T8140AscLaunchStrategy::DualAscGfxThenGfx1ThenCombinedWait,
+};
 
 /// Live evidence which is still required before Linux may execute G17 power.
 pub(crate) mod missing_live {
@@ -218,20 +249,52 @@ fn missing_static_live_evidence() -> u16 {
 #[derive(Debug)]
 pub(crate) struct G17PowerPreflight {
     target: G17PowerTarget,
+    t8140_strategy: Option<T8140G17PPlatformStrategy>,
     boot: g17_boot::DualRoleBoot,
 }
 
 impl G17PowerPreflight {
     /// Bind a preflight to one exact decoded target and all independent axes.
-    pub(crate) fn new(identity: &identity::GpuIdentity) -> Result<Self, G17PowerPreflightError> {
+    ///
+    /// G17P additionally requires the topology observed by the platform
+    /// decoder. Supplying the expected constant without observing the device
+    /// is not admission; production callers must pass their decoded value.
+    pub(crate) fn new(
+        identity: &identity::GpuIdentity,
+        observed_t8140_topology: Option<&agx_power_recovery::T8140G17PAdtTopology>,
+    ) -> Result<Self, G17PowerPreflightError> {
+        let target = validate_identity(identity)?;
+        let t8140_strategy = match (target, observed_t8140_topology) {
+            (G17PowerTarget::G17P, Some(observed))
+                if agx_power_recovery::validate_t8140_g17p_adt_topology(observed) =>
+            {
+                Some(T8140_G17P_PLATFORM_STRATEGY)
+            }
+            (G17PowerTarget::G17P, Some(_)) => {
+                return Err(G17PowerPreflightError::UnexpectedT8140Topology)
+            }
+            (G17PowerTarget::G17P, None) => {
+                return Err(G17PowerPreflightError::MissingT8140Topology)
+            }
+            (_, Some(_)) => return Err(G17PowerPreflightError::UnexpectedT8140Topology),
+            (_, None) => None,
+        };
+
         Ok(Self {
-            target: validate_identity(identity)?,
+            target,
+            t8140_strategy,
             boot: g17_boot::DualRoleBoot::new(),
         })
     }
 
     pub(crate) const fn target(&self) -> G17PowerTarget {
         self.target
+    }
+
+    /// Present only when exact D93AP topology admission selected the A18 Pro
+    /// no-legacy-OPP and dual-ASC launch paths.
+    pub(crate) const fn t8140_strategy(&self) -> Option<T8140G17PPlatformStrategy> {
+        self.t8140_strategy
     }
 
     pub(crate) const fn boot_layout(&self) -> g17_boot::G17HostBootLayout {
@@ -332,6 +395,17 @@ mod tests {
         decode_gpu_identity(family, variant, 1).expect("identity must decode")
     }
 
+    fn new_preflight(
+        identity: &GpuIdentity,
+    ) -> Result<G17PowerPreflight, G17PowerPreflightError> {
+        let topology = if identity.gpu_gen == GpuGen::G17 && identity.gpu_variant == GpuVariant::P {
+            Some(&agx_power_recovery::D93AP_T8140_G17P_ADT_TOPOLOGY)
+        } else {
+            None
+        };
+        G17PowerPreflight::new(identity, topology)
+    }
+
     fn complete_cold_boot(preflight: &mut G17PowerPreflight) {
         preflight.mark_role_root_ready(FirmwareRole::Gfx).unwrap();
         preflight.mark_role_root_ready(FirmwareRole::Gfx1).unwrap();
@@ -367,7 +441,7 @@ mod tests {
                 &G17_HAL300_PM_CONFIG_OPAQUE,
             ),
         ] {
-            let preflight = G17PowerPreflight::new(&identity).unwrap();
+            let preflight = new_preflight(&identity).unwrap();
             assert_eq!(preflight.target(), target);
             let actual = preflight.boot_layout();
             assert_eq!(
@@ -387,10 +461,52 @@ mod tests {
     }
 
     #[test]
+    fn g17p_requires_exact_t8140_topology_and_selects_operational_strategy() {
+        let identity = id(0x0a, 0);
+        let exact = agx_power_recovery::D93AP_T8140_G17P_ADT_TOPOLOGY;
+
+        assert_eq!(
+            G17PowerPreflight::new(&identity, None).unwrap_err(),
+            G17PowerPreflightError::MissingT8140Topology
+        );
+
+        let mut collapsed_dual_asc = exact;
+        collapsed_dual_asc.gfx1_asc_regs = exact.gfx_asc_regs;
+        assert_eq!(
+            G17PowerPreflight::new(&identity, Some(&collapsed_dual_asc)).unwrap_err(),
+            G17PowerPreflightError::UnexpectedT8140Topology
+        );
+
+        let mut invented_legacy_opp = exact;
+        invented_legacy_opp.perf_state_count = 2;
+        assert_eq!(
+            G17PowerPreflight::new(&identity, Some(&invented_legacy_opp)).unwrap_err(),
+            G17PowerPreflightError::UnexpectedT8140Topology
+        );
+
+        let preflight = G17PowerPreflight::new(&identity, Some(&exact)).unwrap();
+        assert_eq!(
+            preflight.t8140_strategy(),
+            Some(T8140G17PPlatformStrategy {
+                performance_states: T8140PerformanceStateStrategy::NoLegacyOppSynthesis,
+                asc_launch: T8140AscLaunchStrategy::DualAscGfxThenGfx1ThenCombinedWait,
+            })
+        );
+
+        for identity in [id(0x0b, 2), id(0x0b, 3)] {
+            assert_eq!(
+                G17PowerPreflight::new(&identity, Some(&exact)).unwrap_err(),
+                G17PowerPreflightError::UnexpectedT8140Topology
+            );
+            assert_eq!(new_preflight(&identity).unwrap().t8140_strategy(), None);
+        }
+    }
+
+    #[test]
     fn text_evidence_remains_target_specific() {
-        let p = G17PowerPreflight::new(&id(0x0a, 0)).unwrap();
-        let g = G17PowerPreflight::new(&id(0x0b, 2)).unwrap();
-        let s = G17PowerPreflight::new(&id(0x0b, 3)).unwrap();
+        let p = new_preflight(&id(0x0a, 0)).unwrap();
+        let g = new_preflight(&id(0x0b, 2)).unwrap();
+        let s = new_preflight(&id(0x0b, 3)).unwrap();
         assert_eq!(
             p.boot_text_evidence().boot_firmware_va,
             0xffff_fe00_08a4_4ce0
@@ -461,7 +577,7 @@ mod tests {
                 G17PowerPreflightError::UnexpectedUatWidth,
             ),
         ] {
-            assert_eq!(G17PowerPreflight::new(&changed).unwrap_err(), error);
+            assert_eq!(new_preflight(&changed).unwrap_err(), error);
         }
     }
 
@@ -469,19 +585,19 @@ mod tests {
     fn unpinned_g17_variants_never_alias_a_power_target() {
         for identity in [id(0x0a, 5), id(0x0b, 4)] {
             assert_eq!(
-                G17PowerPreflight::new(&identity).unwrap_err(),
+                new_preflight(&identity).unwrap_err(),
                 G17PowerPreflightError::UnsupportedVariant
             );
         }
         assert_eq!(
-            G17PowerPreflight::new(&id(0x07, 2)).unwrap_err(),
+            new_preflight(&id(0x07, 2)).unwrap_err(),
             G17PowerPreflightError::UnsupportedGeneration
         );
     }
 
     #[test]
     fn cold_boot_observer_enforces_root_and_kick_order() {
-        let mut preflight = G17PowerPreflight::new(&id(0x0b, 3)).unwrap();
+        let mut preflight = new_preflight(&id(0x0b, 3)).unwrap();
         preflight.mark_role_root_ready(FirmwareRole::Gfx).unwrap();
         assert_eq!(
             preflight.record_role_kick(FirmwareRole::Gfx, true),
@@ -494,7 +610,7 @@ mod tests {
         preflight.notify_role_cold_boot_complete(FirmwareRole::Gfx1);
         assert!(!preflight.cold_boot_observed());
 
-        let mut wrong_order = G17PowerPreflight::new(&id(0x0b, 2)).unwrap();
+        let mut wrong_order = new_preflight(&id(0x0b, 2)).unwrap();
         wrong_order.mark_role_root_ready(FirmwareRole::Gfx).unwrap();
         wrong_order
             .mark_role_root_ready(FirmwareRole::Gfx1)
@@ -511,7 +627,7 @@ mod tests {
     #[test]
     fn power_edges_require_complete_cold_boot_and_exact_bridge() {
         for identity in [id(0x0a, 0), id(0x0b, 2), id(0x0b, 3)] {
-            let mut preflight = G17PowerPreflight::new(&identity).unwrap();
+            let mut preflight = new_preflight(&identity).unwrap();
             assert_eq!(
                 preflight
                     .validate_power_transition_shape(GFX1_POWER_SLEEP, GFX1_POWER_INTERMEDIATE_21),
@@ -545,7 +661,7 @@ mod tests {
     #[test]
     fn complete_observation_never_opens_execution_or_submission() {
         for identity in [id(0x0a, 0), id(0x0b, 2), id(0x0b, 3)] {
-            let mut preflight = G17PowerPreflight::new(&identity).unwrap();
+            let mut preflight = new_preflight(&identity).unwrap();
             let initial = preflight.execution_gate().unwrap_err();
             assert_eq!(initial.bits(), REQUIRED_LIVE_EVIDENCE);
             assert!(initial.contains(missing_live::COLD_BOOT_OBSERVATION));
