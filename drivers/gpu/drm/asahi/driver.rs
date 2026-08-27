@@ -28,6 +28,7 @@ use crate::{
     g17_boot,
     g17_firmware,
     g17_live_boot,
+    g17_manager,
     g17_power_preflight,
     gem::AsahiObject,
     gpu,
@@ -368,7 +369,7 @@ fn refuse_agx3_probe(pdev: &platform::Device<Core>, soc: &'static hw::agx3::SocC
 
     match expected.gpu_gen {
         hw::GpuGen::G15 => refuse_g15_probe(pdev),
-        hw::GpuGen::G17 => refuse_g17_probe(pdev, &expected, loaded_g17_firmware.as_ref()),
+        hw::GpuGen::G17 => refuse_g17_probe(pdev, soc, &expected, loaded_g17_firmware.as_ref()),
         gen => {
             dev_err!(
                 pdev.as_ref(),
@@ -557,6 +558,7 @@ fn admit_t8140_live_topology(
 
 fn refuse_g17_probe(
     pdev: &platform::Device<Core>,
+    soc: &'static hw::agx3::SocConfig,
     identity: &identity::GpuIdentity,
     firmware: Option<&g17_firmware::G17FirmwareIdentityAdmission>,
 ) -> Error {
@@ -719,22 +721,40 @@ fn refuse_g17_probe(
         dev_err!(
             pdev.as_ref(),
             "{}{}",
-            "G17 preflight: submission producer subset is grounded (EP 0x21 doorbell byte-identical to AGX2, SKSM kick word and 0x20-strided kick-record table forked and cited), ",
-            "but the SKSM hardware kick-FIFO MMIO scratch, the doorbell round-trip, and the completion IRQ can only be confirmed on a live M5\n"
+            "G17 preflight: submission codecs include the grounded EP 0x21 doorbell, SKSM queue/configure words, fixed-slot scratch geometry, and kick-record table; ",
+            "Linux mapped-window publication, firmware consumption, the round trip, and completion IRQ causality remain unproved\n"
         );
     }
 
-    // The final structural wall specific to T8140: even with every gate above
-    // grounded, a device cannot be constructed without a full HwConfig, whose
-    // AGX2 firmware-ABI power/tuning field groups have no T8140 derivation.
-    // Report exactly which groups are missing rather than inventing them.
     if identity.gpu_variant == identity::GpuVariant::P {
-        if let Err(gap) = hw::agx3::t8140_hwconfig() {
-            dev_err!(
+        let target = g17_manager::TargetObservation {
+            chip_id: soc.chip_id,
+            declared_gen: soc.gpu_gen,
+            declared_variant: soc.gpu_variant,
+            hw_family: soc.hw_family,
+            hw_variant: soc.hw_variant,
+            num_dies: soc.num_dies,
+            uat_ias: soc.uat_ias,
+            uat_oas: soc.uat_oas,
+        };
+        let platform = g17_manager::T8140_G17P_PLATFORM_CONFIG;
+        match g17_manager::validate_target(target)
+            .and_then(|_| g17_manager::validate_platform(platform))
+            .and_then(|_| platform.sksm_scratch.fifo_offsets())
+        {
+            Ok(scratch) => dev_info!(
                 pdev.as_ref(),
-                "G17P: no T8140 HwConfig can be constructed (ungrounded field groups {:#x}); grounded subset is chip/clock/UAT-geometry/die only\n",
-                gap.bits()
-            );
+                "G17P manager inputs admitted without AGX2 HwConfig: {}-bit UAT, {:#x}-byte pages, dual-role resource geometry, SKSM scratch {:#x}/{:#x}; execution gates remain closed\n",
+                g17_manager::T8140_MANAGER_CONFIG.uat_ias,
+                g17_manager::T8140_MANAGER_CONFIG.uat_page_size,
+                scratch.write0,
+                scratch.write1
+            ),
+            Err(e) => dev_err!(
+                pdev.as_ref(),
+                "G17P manager inputs rejected before resource allocation: {:?}\n",
+                e
+            ),
         }
     }
 

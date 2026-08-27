@@ -135,11 +135,10 @@ const fn implemented_pre_handoff_evidence(
     {
         implemented |= missing::RECOVERY_HANDSHAKE;
     }
-    // The submission producer subset is byte-grounded (EP 0x21 doorbell
-    // byte-identical to AGX2; SKSM kick word + 0x20-strided kick-record table
-    // forked and cited), but the SKSM hardware kick-FIFO MMIO scratch, the
-    // doorbell round-trip, and the completion IRQ are live-only, so the
-    // transport is not executable offline (see `g17_submission`).
+    // The host equations are grounded, including the G17P fixed-slot scratch
+    // geometry and SKSM configuration/addKicks words. Linux has not published
+    // through that mapped register window or witnessed firmware consumption,
+    // the round trip, or completion IRQ causality, so execution stays closed.
     if g17_submission::GROUNDED_SUBMISSION_PRODUCER_AVAILABLE
         && g17_submission::EXECUTABLE_SUBMISSION_TRANSPORT_AVAILABLE
     {
