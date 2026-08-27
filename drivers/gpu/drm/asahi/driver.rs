@@ -612,14 +612,17 @@ fn refuse_g17_probe(
     );
 
     let gpu_variant = identity.gpu_variant;
-    let gate = if gpu_variant == identity::GpuVariant::S {
-        g17_boot::pre_handoff_gate_with_identity(
+    let gate = match gpu_variant {
+        identity::GpuVariant::S => g17_boot::pre_handoff_gate_with_identity(
             hw::GpuGen::G17 as u32,
             g17_boot::G17FirmwareVariant::G17S,
             firmware,
-        )
-    } else {
-        g17_boot::pre_handoff_gate(hw::GpuGen::G17 as u32)
+        ),
+        identity::GpuVariant::P => g17_boot::pre_handoff_gate_for_variant(
+            hw::GpuGen::G17 as u32,
+            g17_boot::G17FirmwareVariant::G17P,
+        ),
+        _ => g17_boot::pre_handoff_gate(hw::GpuGen::G17 as u32),
     };
     let Err(missing) = gate else {
         dev_err!(

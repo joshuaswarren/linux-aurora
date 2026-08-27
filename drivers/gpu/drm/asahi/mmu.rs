@@ -144,30 +144,51 @@ pub(crate) enum HandoffMode {
     /// arrives; a waiter hangs forever) and never expects a flush ACK.
     /// Only valid on T8140, where this was observed on live hardware.
     ///
-    /// Constructed by the (not-yet-wired) T8140 device path; kept ready so
-    /// `Uat::new_with_handoff_mode` already fails closed / behaves correctly
-    /// for it.
-    #[allow(dead_code)]
+    /// Constructed by the T8140 resource owner before either role receives an
+    /// init-data root.
     AbsentStandinT8140,
 }
 
 /// Return the evidence-backed UAT root geometry for this SoC.
-fn uat_geometry(cfg: &hw::HwConfig) -> Result<UatGeometry> {
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+struct UatConfig {
+    chip_id: u32,
+    ias: u8,
+    oas: u32,
+}
+
+impl UatConfig {
+    const fn from_hw(cfg: &hw::HwConfig) -> Self {
+        Self {
+            chip_id: cfg.chip_id,
+            ias: cfg.uat_ias,
+            oas: cfg.uat_oas,
+        }
+    }
+
+    const T8140: Self = Self {
+        chip_id: 0x8140,
+        ias: 42,
+        oas: 42,
+    };
+}
+
+fn uat_geometry(cfg: UatConfig) -> Result<UatGeometry> {
     // 39-bit (G13/G14) and 42-bit (G15+) roots are the two recovered
     // geometries; anything else is undefined.
-    UatGeometry::new(cfg.uat_ias).ok_or(ENODEV)
+    UatGeometry::new(cfg.ias).ok_or(ENODEV)
 }
 
 /// Lower/user VA range for this SoC's root geometry (one page up to the
 /// per-root translation top: `1 << 39` on AGX2, `1 << 42` on AGX3).
 pub(crate) fn iova_user_range(cfg: &hw::HwConfig) -> Result<Range<u64>> {
-    Ok(IOVA_USER_BASE..uat_geometry(cfg)?.user_va_top())
+    Ok(IOVA_USER_BASE..uat_geometry(UatConfig::from_hw(cfg))?.user_va_top())
 }
 
 /// The unknown-page VA for this SoC's root geometry (two pages below the
 /// user top, reproducing the AGX2-proven placement under either root width).
 pub(crate) fn iova_unk_page(cfg: &hw::HwConfig) -> Result<u64> {
-    Ok(uat_geometry(cfg)?.user_va_top() - 2 * UAT_PGSZ as u64)
+    Ok(uat_geometry(UatConfig::from_hw(cfg))?.user_va_top() - 2 * UAT_PGSZ as u64)
 }
 
 /// Usable lower/user VA range for this SoC (excludes the unknown page).
@@ -180,7 +201,7 @@ pub(crate) fn iova_user_usable_range(cfg: &hw::HwConfig) -> Result<Range<u64>> {
 /// `0xffffffa000000000..0xffffffb000000000` for 39-bit roots (the
 /// AGX2-proven placement) and the same window offset under the bit-42
 /// selector (`0xfffffc2000000000..0xfffffc3000000000`) for 42-bit roots.
-fn iova_kern_range(cfg: &hw::HwConfig) -> Result<Range<u64>> {
+fn iova_kern_range(cfg: UatConfig) -> Result<Range<u64>> {
     let geometry = uat_geometry(cfg)?;
     Ok(geometry.kernel_va_base()..geometry.kernel_va_top())
 }
@@ -953,7 +974,7 @@ impl UatInner {
 /// Top-level UAT manager object
 pub(crate) struct Uat {
     dev: driver::AsahiDevRef,
-    cfg: &'static hw::HwConfig,
+    cfg: UatConfig,
 
     inner: Arc<UatInner>,
     slots: slotalloc::SlotAllocator<SlotInner>,
@@ -1095,7 +1116,7 @@ impl Vm {
         dev: &driver::AsahiDevice,
         uat_inner: Arc<UatInner>,
         kernel_range: Range<u64>,
-        cfg: &'static hw::HwConfig,
+        cfg: UatConfig,
         ttb: Option<PhysicalAddr>,
         id: u64,
     ) -> Result<Vm> {
@@ -1104,9 +1125,9 @@ impl Vm {
         let iova_kern_range = iova_kern_range(cfg)?;
 
         let page_table = if let Some(ttb) = ttb {
-            UatPageTable::new_with_ttb(ttb, iova_kern_range.clone(), cfg.uat_ias, cfg.uat_oas)?
+            UatPageTable::new_with_ttb(ttb, iova_kern_range.clone(), cfg.ias, cfg.oas)?
         } else {
-            UatPageTable::new(cfg.uat_ias, cfg.uat_oas)?
+            UatPageTable::new(cfg.ias, cfg.oas)?
         };
 
         let (va_range, gpuvm_range) = if is_kernel {
@@ -1115,7 +1136,10 @@ impl Vm {
             // Geometry-derived: 39-bit parts reproduce the AGX2-proven
             // user/usable ranges byte-for-byte; 42-bit parts extend the
             // user half to the full per-root width.
-            (iova_user_range(cfg)?, iova_user_usable_range(cfg)?)
+            (
+                IOVA_USER_BASE..uat_geometry(cfg)?.user_va_top(),
+                IOVA_USER_BASE..(uat_geometry(cfg)?.user_va_top() - 2 * UAT_PGSZ as u64),
+            )
         };
 
         let mm = mm::Allocator::new(va_range.start, va_range.range(), ())?;
@@ -1544,6 +1568,11 @@ impl Uat {
         &self.kernel_lower_vm
     }
 
+    /// Return the kernel-half VA range owned by this UAT.
+    pub(crate) fn kernel_va_range(&self) -> Result<Range<u64>> {
+        iova_kern_range(self.cfg)
+    }
+
     #[cfg(CONFIG_DEV_COREDUMP)]
     pub(crate) fn dump_kernel_pages(&self) -> Result<KVVec<pgtable::DumpedPage>> {
         // Full upper-half range for this SoC's root geometry.
@@ -1668,7 +1697,26 @@ impl Uat {
         cfg: &'static hw::HwConfig,
         map_kernel_to_user: bool,
     ) -> Result<Self> {
-        Self::new_with_handoff_mode(dev, cfg, map_kernel_to_user, HandoffMode::FirmwareDekker)
+        Self::new_with_config(
+            dev,
+            UatConfig::from_hw(cfg),
+            map_kernel_to_user,
+            HandoffMode::FirmwareDekker,
+        )
+    }
+
+    /// Create the T8140 UAT owner with the hardware-verified absent-handoff
+    /// behavior. This constructor needs only the UAT geometry and chip ID; it
+    /// does not fabricate the unrelated AGX2 firmware tuning fields in
+    /// [`hw::HwConfig`].
+    #[inline(never)]
+    pub(crate) fn new_t8140(dev: &driver::AsahiDevice, map_kernel_to_user: bool) -> Result<Self> {
+        Self::new_with_config(
+            dev,
+            UatConfig::T8140,
+            map_kernel_to_user,
+            HandoffMode::AbsentStandinT8140,
+        )
     }
 
     /// Creates a new `Uat` instance with an explicit handoff mode.
@@ -1685,6 +1733,21 @@ impl Uat {
         map_kernel_to_user: bool,
         handoff_mode: HandoffMode,
     ) -> Result<Self> {
+        Self::new_with_config(
+            dev,
+            UatConfig::from_hw(cfg),
+            map_kernel_to_user,
+            handoff_mode,
+        )
+    }
+
+    #[inline(never)]
+    fn new_with_config(
+        dev: &driver::AsahiDevice,
+        cfg: UatConfig,
+        map_kernel_to_user: bool,
+        handoff_mode: HandoffMode,
+    ) -> Result<Self> {
         dev_info!(dev.as_ref(), "MMU: Initializing...\n");
 
         // Validate the geometry first: 39- and 42-bit roots are the two
@@ -1698,11 +1761,11 @@ impl Uat {
         let kernel_range = iova_kern_range(cfg)?;
         match handoff_mode {
             HandoffMode::FirmwareDekker => {
-                if cfg.uat_ias != 39 && !AGX3_FIRMWARE_HANDOFF_VALIDATED {
+                if cfg.ias != 39 && !AGX3_FIRMWARE_HANDOFF_VALIDATED {
                     dev_err!(
                         dev.as_ref(),
                         "MMU: {}-bit UAT geometry is implemented, but the AGX3 firmware Handoff ABI and kernel-VA map are unvalidated\n",
-                        cfg.uat_ias
+                        cfg.ias
                     );
                     return Err(ENODEV);
                 }
@@ -1710,12 +1773,12 @@ impl Uat {
             HandoffMode::AbsentStandinT8140 => {
                 // Hardware-verified on T8140 only. Never assume any other
                 // part ignores the handoff region.
-                if cfg.chip_id != 0x8140 || cfg.uat_ias != 42 {
+                if cfg.chip_id != 0x8140 || cfg.ias != 42 {
                     dev_err!(
                         dev.as_ref(),
                         "MMU: absent-handoff stand-in is T8140-only evidence (chip {:#x}, {}-bit)\n",
                         cfg.chip_id,
-                        cfg.uat_ias
+                        cfg.ias
                     );
                     return Err(ENODEV);
                 }
@@ -1735,7 +1798,14 @@ impl Uat {
         }
 
         dev_info!(dev.as_ref(), "MMU: Creating kernel page tables\n");
-        let kernel_lower_vm = Vm::new(dev, inner.clone(), iova_user_range(cfg)?, cfg, None, 1)?;
+        let kernel_lower_vm = Vm::new(
+            dev,
+            inner.clone(),
+            IOVA_USER_BASE..uat_geometry(cfg)?.user_va_top(),
+            cfg,
+            None,
+            1,
+        )?;
         let kernel_vm = Vm::new(dev, inner.clone(), kernel_range, cfg, Some(ttb1), 0)?;
 
         dev_info!(dev.as_ref(), "MMU: Kernel page tables created\n");
