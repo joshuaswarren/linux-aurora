@@ -14,7 +14,7 @@ description: |+
   Resolution Table which provides a mandatory layer of address
   translations for various masters.
 
-  Each DART instance is capable of handling up to 16 different streams
+  Depending on the generation, a DART instance can handle up to 256 streams
   with individual pagetables and page-level read/write protection flags.
 
   This DART IOMMU also raises interrupts in response to various
@@ -32,6 +32,7 @@ properties:
           - enum:
               - apple,t6020-dart
               - apple,t8122-dart
+              - apple,t8140-dart
           - const: apple,t8110-dart
 
   reg:
@@ -53,6 +54,15 @@ properties:
 
   power-domains:
     maxItems: 1
+
+  apple,dma-range:
+    $ref: /schemas/types.yaml#/definitions/uint64-array
+    minItems: 2
+    maxItems: 2
+    description:
+      DMA allocation aperture expressed as a base followed by its size. High
+      aperture bits may be a firmware-visible alias which the DART driver
+      removes before programming a narrower hardware page table.
 
 required:
   - compatible
