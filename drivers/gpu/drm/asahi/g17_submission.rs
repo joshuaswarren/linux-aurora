@@ -35,10 +35,18 @@
 //! and cited; [`EXECUTABLE_SUBMISSION_TRANSPORT_AVAILABLE`] states whether a
 //! submission can be driven to completion offline. It is `false`: the SKSM
 //! completion path is a hardware kick FIFO the firmware reads through indexed
-//! MMIO scratch registers. The host publication form is grounded, but its live
-//! aperture values, silicon bridge to the firmware scratch consumer, round
-//! trip, and completion IRQ can only be confirmed on-device. See
+//! MMIO scratch registers. The host publication form, runtime scratch geometry,
+//! and mapped-window offsets are grounded. A Linux publication, its firmware
+//! consumption, the round trip, and the completion IRQ remain unproved. See
 //! [`SUBMISSION_LIVE_GAPS`].
+
+#[cfg(not(test))]
+use crate::g17_manager::G17SksmScratchGeometry;
+#[cfg(test)]
+#[path = "g17_manager.rs"]
+mod g17_manager;
+#[cfg(test)]
+use g17_manager::G17SksmScratchGeometry;
 
 /// The submission producer subset is byte-grounded against the M5 firmware.
 /// See [`SUBMISSION_ABI_LEDGER`] for the inherited, still-unconfirmed pieces.
@@ -874,8 +882,8 @@ pub(crate) const fn prepare_kick_submission(
 //    The host does not write the firmware-side `timestamp | (qid << 40)` word
 //    directly.  The pinned G17P/G17G/G17X implementations publish a
 //    target-specific 64-bit queue tag followed by the 32-bit add count to two
-//    runtime-selected aperture offsets.  The runtime bank selector is
-//    multiplied by nine for every target.  This is a pure description of the
+//    runtime-selected scratch offsets. The host adds nine times the runtime
+//    stride to both bases for every target. This is a pure description of the
 //    two ordered stores; it performs no MMIO.
 // ---------------------------------------------------------------------------
 
@@ -888,15 +896,6 @@ pub(crate) enum SksmAddKicksTarget {
     G17G,
     /// M5 Pro/Max HAL300 X-family target (G17S/G17C host implementation).
     G17X,
-}
-
-/// Runtime aperture geometry loaded by Apple's host immediately before the
-/// two publication stores.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub(crate) struct SksmAddKicksMmioGeometry {
-    pub(crate) tag_offset_base: u32,
-    pub(crate) count_offset_base: u32,
-    pub(crate) aperture_index: u32,
 }
 
 /// Exact ordered values and offsets for one host `addKicks` publication.
@@ -924,39 +923,26 @@ const fn sksm_add_kicks_tag(target: SksmAddKicksTarget, queue_id: u8) -> u64 {
 const G17P_ADD_KICKS_TAG: u64 = 0x0000_0400_0002_1018;
 const G17G_ADD_KICKS_TAG: u64 = 0x0000_0800_0002_1018;
 const G17X_ADD_KICKS_TAG: u64 = 0x0020_0800_0002_1018;
-const SKSM_ADD_KICKS_APERTURE_SCALE: u32 = 9;
-
 /// Prepare the host's two ordered MMIO stores without touching the aperture.
 pub(crate) const fn prepare_sksm_add_kicks_mmio(
     target: SksmAddKicksTarget,
     queue_id: u8,
     add_count: u32,
-    geometry: SksmAddKicksMmioGeometry,
+    geometry: G17SksmScratchGeometry,
 ) -> Result<PreparedSksmAddKicksMmio, SubmissionError> {
     if queue_id > KICK_QID_MASK as u8 {
         return Err(SubmissionError::QueueIdOutOfRange);
     }
 
-    let bank_offset = match geometry
-        .aperture_index
-        .checked_mul(SKSM_ADD_KICKS_APERTURE_SCALE)
-    {
-        Some(offset) => offset,
-        None => return Err(SubmissionError::KickMmioOffsetOverflow),
-    };
-    let tag_offset = match geometry.tag_offset_base.checked_add(bank_offset) {
-        Some(offset) => offset,
-        None => return Err(SubmissionError::KickMmioOffsetOverflow),
-    };
-    let count_offset = match geometry.count_offset_base.checked_add(bank_offset) {
-        Some(offset) => offset,
-        None => return Err(SubmissionError::KickMmioOffsetOverflow),
+    let offsets = match geometry.fifo_offsets() {
+        Ok(offsets) => offsets,
+        Err(_) => return Err(SubmissionError::KickMmioOffsetOverflow),
     };
 
     Ok(PreparedSksmAddKicksMmio {
-        tag_offset,
+        tag_offset: offsets.write0,
         tag: sksm_add_kicks_tag(target, queue_id),
-        count_offset,
+        count_offset: offsets.write1,
         add_count,
     })
 }
@@ -966,12 +952,13 @@ pub(crate) const fn prepare_sksm_add_kicks_mmio(
 //
 //    Grounded from the pinned G17P host. `AGXKSMKickQueueG16::configureHardware`
 //    at 0xfffffe0008a56580-0xfffffe0008a5682c reads the runtime MMIO geometry
-//    at accelerator +0x10730/+0x10734/+0x10738, writes a 64-bit queue tag and
-//    64-bit queue payload, then publishes the QID bit at MMIO +0x21068. The
-//    same geometry is used by `addKicks` (§6). This closes the host-side
-//    programming equation, but not the silicon aperture mapping or live store
-//    ordering, so this module still performs no MMIO and the executable gate
-//    remains closed.
+//    from accelerator-object fields +0x10730/+0x10734/+0x10738, writes a
+//    64-bit queue tag and 64-bit queue payload, then publishes the QID bit at
+//    MMIO +0x21068. The object fields contain base0=0x4000, base1=0x4008 and
+//    stride=0x10; they are not MMIO locations. The same geometry is used by
+//    `addKicks` (§6). This closes the host-side programming equation, but not
+//    a Linux live publication or firmware consumption, so this module still
+//    performs no MMIO and the executable gate remains closed.
 //
 //    `AGXAcceleratorG16::populateKSMCompletionQueue` at
 //    0xfffffe0008a53034-0xfffffe0008a532b8 emits four 0x20-byte descriptors.
@@ -982,20 +969,19 @@ pub(crate) const fn prepare_sksm_add_kicks_mmio(
 //    SKSM kick proves that complete round trip on D93AP hardware.
 // ---------------------------------------------------------------------------
 
-/// Offsets of the three runtime words loaded by the G17P host before every
-/// SKSM configuration or `addKicks` publication.
+/// Accelerator-object fields holding the three runtime geometry values.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub(crate) struct G17PSksmRuntimeMmioGeometryLayout {
-    pub(crate) tag_offset_base: u32,
-    pub(crate) payload_offset_base: u32,
-    pub(crate) aperture_index: u32,
+pub(crate) struct G17PSksmRuntimeGeometryObjectLayout {
+    pub(crate) write0_base_field: u32,
+    pub(crate) write1_base_field: u32,
+    pub(crate) stride_field: u32,
 }
 
-pub(crate) const G17P_SKSM_RUNTIME_MMIO_GEOMETRY_LAYOUT: G17PSksmRuntimeMmioGeometryLayout =
-    G17PSksmRuntimeMmioGeometryLayout {
-        tag_offset_base: 0x10730,
-        payload_offset_base: 0x10734,
-        aperture_index: 0x10738,
+pub(crate) const G17P_SKSM_RUNTIME_GEOMETRY_OBJECT_LAYOUT: G17PSksmRuntimeGeometryObjectLayout =
+    G17PSksmRuntimeGeometryObjectLayout {
+        write0_base_field: 0x10730,
+        write1_base_field: 0x10734,
+        stride_field: 0x10738,
     };
 
 /// QID-valid mask base written after the two queue-configuration stores.
@@ -1029,7 +1015,7 @@ pub(crate) const fn prepare_g17p_sksm_queue_config(
     data_master: u32,
     completion_selector: u32,
     entry_gpu_va: u64,
-    geometry: SksmAddKicksMmioGeometry,
+    geometry: G17SksmScratchGeometry,
 ) -> Result<PreparedG17PSksmQueueConfig, SubmissionError> {
     match target {
         G17ChannelAbiTarget::A18ProG17P => {}
@@ -1050,20 +1036,9 @@ pub(crate) const fn prepare_g17p_sksm_queue_config(
         return Err(SubmissionError::KickQueueEntryAddressUnencodable);
     }
 
-    let bank_offset = match geometry
-        .aperture_index
-        .checked_mul(SKSM_ADD_KICKS_APERTURE_SCALE)
-    {
-        Some(offset) => offset,
-        None => return Err(SubmissionError::KickMmioOffsetOverflow),
-    };
-    let tag_offset = match geometry.tag_offset_base.checked_add(bank_offset) {
-        Some(offset) => offset,
-        None => return Err(SubmissionError::KickMmioOffsetOverflow),
-    };
-    let payload_offset = match geometry.count_offset_base.checked_add(bank_offset) {
-        Some(offset) => offset,
-        None => return Err(SubmissionError::KickMmioOffsetOverflow),
+    let offsets = match geometry.fifo_offsets() {
+        Ok(offsets) => offsets,
+        Err(_) => return Err(SubmissionError::KickMmioOffsetOverflow),
     };
 
     // Host sequence: 3 * (4 - selector) + 0x3fe, shifted into bit 54.
@@ -1073,9 +1048,9 @@ pub(crate) const fn prepare_g17p_sksm_queue_config(
     let mask_word = (queue_id as u32 >> 6) * 8;
 
     Ok(PreparedG17PSksmQueueConfig {
-        tag_offset,
+        tag_offset: offsets.write0,
         tag: G17P_SKSM_QUEUE_CONFIG_TAG | ((queue_id as u64) << 43),
-        payload_offset,
+        payload_offset: offsets.write1,
         payload,
         enable_mask_offset: G17P_SKSM_QUEUE_ENABLE_MASK_BASE + mask_word,
         enable_mask: 1u64 << (queue_id & 63),
@@ -1424,10 +1399,9 @@ pub(crate) const CHANNEL_DESCRIPTOR_STRIDE_CONFIRMED: bool = true;
 /// needs a live target device.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct SubmissionLiveGaps {
-    /// Host `addKicks` publication and firmware scratch consumption are both
-    /// grounded. D93AP exposes only the two SGX ranges; the pinned host loads
-    /// runtime geometry words at +0x10730/+0x10734/+0x10738 without exposing
-    /// their values. The silicon bridge and ordering still need a live witness.
+    /// The host equation and G17P geometry are grounded. Linux has not yet
+    /// published through the mapped register window or witnessed firmware
+    /// consumption of that publication.
     pub(crate) sksm_hardware_kick_fifo_mmio_scratch_proven: bool,
     /// The kick -> execute -> completion IRQ handshake is a live event.
     pub(crate) doorbell_round_trip_proven: bool,
@@ -1920,10 +1894,10 @@ mod tests {
 
     #[test]
     fn host_add_kicks_tags_match_all_three_pinned_producers() {
-        let geometry = SksmAddKicksMmioGeometry {
-            tag_offset_base: 0x100,
-            count_offset_base: 0x104,
-            aperture_index: 3,
+        let geometry = G17SksmScratchGeometry {
+            write0_base: 0x100,
+            write1_base: 0x104,
+            stride: 3,
         };
 
         for queue_id in 0u8..=0x7f {
@@ -1952,47 +1926,44 @@ mod tests {
     }
 
     #[test]
-    fn host_add_kicks_mmio_offsets_fail_closed_on_overflow() {
-        let valid = SksmAddKicksMmioGeometry {
-            tag_offset_base: 0,
-            count_offset_base: 0,
-            aperture_index: u32::MAX / SKSM_ADD_KICKS_APERTURE_SCALE,
+    fn host_add_kicks_mmio_offsets_report_overflow() {
+        let valid = G17SksmScratchGeometry {
+            write0_base: 0,
+            write1_base: 0,
+            stride: u32::MAX / 9,
         };
         let publication =
             prepare_sksm_add_kicks_mmio(SksmAddKicksTarget::G17G, 0, 1, valid).unwrap();
-        assert_eq!(
-            publication.tag_offset,
-            (u32::MAX / SKSM_ADD_KICKS_APERTURE_SCALE) * SKSM_ADD_KICKS_APERTURE_SCALE
-        );
+        assert_eq!(publication.tag_offset, (u32::MAX / 9) * 9);
 
         assert_eq!(
             prepare_sksm_add_kicks_mmio(
                 SksmAddKicksTarget::G17P,
                 0x80,
                 1,
-                SksmAddKicksMmioGeometry {
-                    tag_offset_base: 0,
-                    count_offset_base: 4,
-                    aperture_index: 0,
+                G17SksmScratchGeometry {
+                    write0_base: 0,
+                    write1_base: 4,
+                    stride: 0,
                 },
             ),
             Err(SubmissionError::QueueIdOutOfRange)
         );
         for geometry in [
-            SksmAddKicksMmioGeometry {
-                tag_offset_base: 0,
-                count_offset_base: 0,
-                aperture_index: u32::MAX / SKSM_ADD_KICKS_APERTURE_SCALE + 1,
+            G17SksmScratchGeometry {
+                write0_base: 0,
+                write1_base: 0,
+                stride: u32::MAX / 9 + 1,
             },
-            SksmAddKicksMmioGeometry {
-                tag_offset_base: u32::MAX,
-                count_offset_base: 0,
-                aperture_index: 1,
+            G17SksmScratchGeometry {
+                write0_base: u32::MAX,
+                write1_base: 0,
+                stride: 1,
             },
-            SksmAddKicksMmioGeometry {
-                tag_offset_base: 0,
-                count_offset_base: u32::MAX,
-                aperture_index: 1,
+            G17SksmScratchGeometry {
+                write0_base: 0,
+                write1_base: u32::MAX,
+                stride: 1,
             },
         ] {
             assert_eq!(
@@ -2005,11 +1976,11 @@ mod tests {
     #[test]
     fn g17p_sksm_queue_configuration_matches_the_host_store_sequence() {
         assert_eq!(
-            G17P_SKSM_RUNTIME_MMIO_GEOMETRY_LAYOUT,
-            G17PSksmRuntimeMmioGeometryLayout {
-                tag_offset_base: 0x10730,
-                payload_offset_base: 0x10734,
-                aperture_index: 0x10738,
+            G17P_SKSM_RUNTIME_GEOMETRY_OBJECT_LAYOUT,
+            G17PSksmRuntimeGeometryObjectLayout {
+                write0_base_field: 0x10730,
+                write1_base_field: 0x10734,
+                stride_field: 0x10738,
             }
         );
         assert_eq!(G17P_SKSM_QUEUE_ENABLE_MASK_BASE, 0x21068);
@@ -2021,18 +1992,14 @@ mod tests {
             1,
             0,
             0x12340,
-            SksmAddKicksMmioGeometry {
-                tag_offset_base: 0x100,
-                count_offset_base: 0x104,
-                aperture_index: 2,
-            },
+            g17_manager::T8140_G17P_PLATFORM_CONFIG.sksm_scratch,
         )
         .unwrap();
 
-        // configureHardware: base + aperture*9, tag, payload, then QID mask.
-        assert_eq!(config.tag_offset, 0x112);
+        // configureHardware: base + 9*stride, tag, payload, then QID mask.
+        assert_eq!(config.tag_offset, 0x4090);
         assert_eq!(config.tag, 0x0002_0400_0002_1008);
-        assert_eq!(config.payload_offset, 0x116);
+        assert_eq!(config.payload_offset, 0x4098);
         // This hard-coded value catches both the 32-bit selector arithmetic
         // and the host's ADD of `(data_master + 1) << 60` before the OR.
         assert_eq!(config.payload, 0x2280_0000_0001_2340);
@@ -2042,11 +2009,7 @@ mod tests {
 
     #[test]
     fn g17p_sksm_queue_configuration_is_identity_and_range_scoped() {
-        let geometry = SksmAddKicksMmioGeometry {
-            tag_offset_base: 0,
-            count_offset_base: 4,
-            aperture_index: 0,
-        };
+        let geometry = g17_manager::T8140_G17P_PLATFORM_CONFIG.sksm_scratch;
 
         for target in [
             G17ChannelAbiTarget::M5G17G,
@@ -2110,10 +2073,10 @@ mod tests {
                 0,
                 0,
                 0x20,
-                SksmAddKicksMmioGeometry {
-                    tag_offset_base: u32::MAX,
-                    count_offset_base: 0,
-                    aperture_index: 1,
+                G17SksmScratchGeometry {
+                    write0_base: u32::MAX,
+                    write1_base: 0,
+                    stride: 1,
                 },
             ),
             Err(SubmissionError::KickMmioOffsetOverflow)

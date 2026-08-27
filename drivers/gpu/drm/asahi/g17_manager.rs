@@ -80,37 +80,39 @@ pub(crate) const T8140_MANAGER_CONFIG: T8140ManagerConfig = T8140ManagerConfig {
 pub(crate) struct G17SksmScratchGeometry {
     pub(crate) write0_base: u32,
     pub(crate) write1_base: u32,
-    pub(crate) queue_stride: u32,
+    pub(crate) stride: u32,
 }
 
-/// The two offsets used for the G17P compute queue.
+/// The two offsets used by the fixed G17P scratch FIFO slot.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub(crate) struct G17SksmComputeScratchOffsets {
+pub(crate) struct G17SksmScratchOffsets {
     pub(crate) write0: u32,
     pub(crate) write1: u32,
 }
 
 impl G17SksmScratchGeometry {
-    /// Apply the exact host equation for compute queue index 9.
-    pub(crate) const fn compute_offsets(
+    /// Apply the exact host equation for fixed FIFO slot 9.
+    ///
+    /// The slot is independent of the SKSM queue ID carried in each write.
+    pub(crate) const fn fifo_offsets(
         self,
-    ) -> core::result::Result<G17SksmComputeScratchOffsets, ConstructionError> {
-        const COMPUTE_QUEUE_INDEX: u32 = 9;
+    ) -> core::result::Result<G17SksmScratchOffsets, ConstructionError> {
+        const FIFO_SLOT: u32 = 9;
 
-        let queue_offset = match self.queue_stride.checked_mul(COMPUTE_QUEUE_INDEX) {
+        let fifo_offset = match self.stride.checked_mul(FIFO_SLOT) {
             Some(offset) => offset,
             None => return Err(ConstructionError::SksmScratchOffsetOverflow),
         };
-        let write0 = match self.write0_base.checked_add(queue_offset) {
+        let write0 = match self.write0_base.checked_add(fifo_offset) {
             Some(offset) => offset,
             None => return Err(ConstructionError::SksmScratchOffsetOverflow),
         };
-        let write1 = match self.write1_base.checked_add(queue_offset) {
+        let write1 = match self.write1_base.checked_add(fifo_offset) {
             Some(offset) => offset,
             None => return Err(ConstructionError::SksmScratchOffsetOverflow),
         };
 
-        Ok(G17SksmComputeScratchOffsets { write0, write1 })
+        Ok(G17SksmScratchOffsets { write0, write1 })
     }
 }
 
@@ -132,7 +134,7 @@ pub(crate) const T8140_G17P_PLATFORM_CONFIG: G17PPlatformConfig = G17PPlatformCo
     sksm_scratch: G17SksmScratchGeometry {
         write0_base: 0x4000,
         write1_base: 0x4008,
-        queue_stride: 0x10,
+        stride: 0x10,
     },
 };
 
@@ -260,7 +262,7 @@ pub(crate) fn validate_platform(
     if platform != T8140_G17P_PLATFORM_CONFIG {
         return Err(ConstructionError::WrongSksmScratchGeometry);
     }
-    platform.sksm_scratch.compute_offsets()?;
+    platform.sksm_scratch.fifo_offsets()?;
     Ok(())
 }
 
@@ -509,10 +511,10 @@ mod tests {
         let platform = T8140_G17P_PLATFORM_CONFIG;
         assert_eq!(platform.sksm_scratch.write0_base, 0x4000);
         assert_eq!(platform.sksm_scratch.write1_base, 0x4008);
-        assert_eq!(platform.sksm_scratch.queue_stride, 0x10);
+        assert_eq!(platform.sksm_scratch.stride, 0x10);
         assert_eq!(
-            platform.sksm_scratch.compute_offsets(),
-            Ok(G17SksmComputeScratchOffsets {
+            platform.sksm_scratch.fifo_offsets(),
+            Ok(G17SksmScratchOffsets {
                 write0: 0x4090,
                 write1: 0x4098,
             })
@@ -532,7 +534,7 @@ mod tests {
                 ..T8140_G17P_PLATFORM_CONFIG.sksm_scratch
             },
             G17SksmScratchGeometry {
-                queue_stride: 0,
+                stride: 0,
                 ..T8140_G17P_PLATFORM_CONFIG.sksm_scratch
             },
         ] {
@@ -551,21 +553,21 @@ mod tests {
             G17SksmScratchGeometry {
                 write0_base: 0,
                 write1_base: 0,
-                queue_stride: u32::MAX,
+                stride: u32::MAX,
             },
             G17SksmScratchGeometry {
                 write0_base: u32::MAX,
                 write1_base: 0,
-                queue_stride: 1,
+                stride: 1,
             },
             G17SksmScratchGeometry {
                 write0_base: 0,
                 write1_base: u32::MAX,
-                queue_stride: 1,
+                stride: 1,
             },
         ] {
             assert_eq!(
-                geometry.compute_offsets(),
+                geometry.fifo_offsets(),
                 Err(ConstructionError::SksmScratchOffsetOverflow)
             );
         }
