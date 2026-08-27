@@ -15,8 +15,8 @@
 #define MT7932_SEC_BOOT_RELEASE		0x00040260
 #define MT7932_SEC_BOOT_MODE_ENTER	0x18451807
 #define MT7932_SEC_BOOT_MODE_EXIT	0x1845184f
-#define MT7932_FW_START_READY_MIN_US	40000
-#define MT7932_FW_START_READY_MAX_US	80000
+#define MT7932_FW_START_READY_PERIOD_MS	10
+#define MT7932_FW_START_READY_STOP_US	50000
 
 static int mt7932_sec_protect_fwdl(struct mt76_dev *dev, bool get)
 {
@@ -3153,9 +3153,11 @@ struct mt7932_fw_start_watch {
 	ktime_t gone_at;
 	unsigned int polls;
 	u32 last_id;
-	u32 ready_value;
-	s64 ready_sample_us;
-	bool ready_sampled;
+	u32 ready_first;
+	u32 ready_last;
+	s64 ready_first_us;
+	s64 ready_last_us;
+	unsigned int ready_samples;
 	bool gone;
 };
 
@@ -3180,23 +3182,29 @@ static void mt7932_fw_start_watch_fn(struct work_struct *work)
 	elapsed_us = ktime_us_delta(now, w->start);
 	/*
 	 * Run 191 completed Apple's final FW_START-to-runtime transition in less
-	 * than 16 ms, while every Linux endpoint remained alive for at least
-	 * 99 ms.  Take exactly one read in the bounded 40-80 ms safe window,
-	 * after a successful config-space identity read.  This distinguishes
+	 * than 16 ms.  Cycle 252 then measured a shorter 65 ms removal while its
+	 * ordinary workqueue observer was delayed past the useful window.  Sample
+	 * only the first 50 ms on the high-priority workqueue, always after a
+	 * successful config-space identity read.  This distinguishes
 	 * "N9 started but the response path failed" from "N9 never started"
-	 * without touching the failure-time BAR that previously caused SErrors.
+	 * while leaving at least the directly measured 15 ms pre-removal margin.
 	 */
-	if (!w->ready_sampled &&
-	    elapsed_us >= MT7932_FW_START_READY_MIN_US &&
-	    elapsed_us <= MT7932_FW_START_READY_MAX_US) {
-		w->ready_value = __mt76_rr(w->dev, MT_CONN_ON_MISC);
-		w->ready_sample_us = elapsed_us;
-		w->ready_sampled = true;
+	if (elapsed_us <= MT7932_FW_START_READY_STOP_US) {
+		u32 ready = __mt76_rr(w->dev, MT_CONN_ON_MISC);
+
+		if (!w->ready_samples) {
+			w->ready_first = ready;
+			w->ready_first_us = elapsed_us;
+		}
+		w->ready_last = ready;
+		w->ready_last_us = elapsed_us;
+		w->ready_samples++;
 	}
 
 	w->last_id = id;
 	w->polls++;
-	schedule_delayed_work(&w->work, 1);
+	queue_delayed_work(system_highpri_wq, &w->work,
+			   msecs_to_jiffies(MT7932_FW_START_READY_PERIOD_MS));
 }
 
 static bool mt7932_fw_start_watch_begin(struct mt76_dev *dev,
@@ -3208,10 +3216,12 @@ static bool mt7932_fw_start_watch_begin(struct mt76_dev *dev,
 	memset(w, 0, sizeof(*w));
 	w->pdev = to_pci_dev(dev->dev);
 	w->dev = dev;
-	w->ready_value = U32_MAX;
+	w->ready_first = U32_MAX;
+	w->ready_last = U32_MAX;
 	w->start = ktime_get();
 	INIT_DELAYED_WORK_ONSTACK(&w->work, mt7932_fw_start_watch_fn);
-	schedule_delayed_work(&w->work, 1);
+	queue_delayed_work(system_highpri_wq, &w->work,
+			   msecs_to_jiffies(MT7932_FW_START_READY_PERIOD_MS));
 
 	return true;
 }
@@ -3222,10 +3232,10 @@ static void mt7932_fw_start_watch_end(struct mt76_dev *dev,
 	cancel_delayed_work_sync(&w->work);
 	destroy_delayed_work_on_stack(&w->work);
 	dev_info(dev->dev,
-		 "J700_MT7932_FW_START_EARLY_READY: sampled=%u sample_us=%lld value=0x%08x n9_masked=0x%x window_us=%u-%u\n",
-		 w->ready_sampled, w->ready_sample_us, w->ready_value,
-		 w->ready_value & 0x3, MT7932_FW_START_READY_MIN_US,
-		 MT7932_FW_START_READY_MAX_US);
+		 "J700_MT7932_FW_START_EARLY_READY: samples=%u first_us=%lld first=0x%08x first_n9=0x%x last_us=%lld last=0x%08x last_n9=0x%x stop_us=%u\n",
+		 w->ready_samples, w->ready_first_us, w->ready_first,
+		 w->ready_first & 0x3, w->ready_last_us, w->ready_last,
+		 w->ready_last & 0x3, MT7932_FW_START_READY_STOP_US);
 
 	if (READ_ONCE(w->gone))
 		dev_err(dev->dev,
