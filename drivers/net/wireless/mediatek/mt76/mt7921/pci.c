@@ -8,6 +8,7 @@
 #include <linux/pci.h>
 #include <linux/of.h>
 #include <linux/delay.h>
+#include <linux/io.h>
 
 #include "mt7921.h"
 #include "../mt76_connac2_mac.h"
@@ -43,6 +44,11 @@ MODULE_PARM_DESC(disable_aspm, "disable PCI ASPM support");
 #define MT7932_MMIO_MAP_SETTING_VALUE	0x70001846
 #define MT7932_MMIO_MAP_SETTING_MASK	GENMASK(31, 16)
 #define MT7932_MMIO_MAP_SETTING_READY	0x70000000
+#define J700_PMGR_BASE			0x300700000ULL
+#define J700_PMGR_SIZE			0x4000
+#define J700_APCIE_DART_BASE		0x390000000ULL
+#define J700_APCIE_DIAG_SIZE		0x30000
+#define J700_APCIE_PORT_OFFSET		0x28000
 
 static int mt7932_mmio_map_setting(struct mt792x_dev *dev)
 {
@@ -444,6 +450,68 @@ static int mt7921_pci_probe(struct pci_dev *pdev,
 		ret = dma_set_mask(&pdev->dev, DMA_BIT_MASK(32));
 	if (ret)
 		goto err_free_pci_vec;
+	if (id->device == 0x7932 && of_machine_is_compatible("apple,j700")) {
+		void __iomem *apcie, *pmgr, *port;
+
+		/* Run 270 captured these exact power-state registers at Apple's
+		 * successful FW_START response.  Read the Linux pre-DMA state once;
+		 * never touch PMGR from this endpoint driver.
+		 */
+		pmgr = devm_ioremap(&pdev->dev, J700_PMGR_BASE, J700_PMGR_SIZE);
+		if (!pmgr) {
+			ret = -ENOMEM;
+			goto err_free_pci_vec;
+		}
+		dev_info(&pdev->dev,
+			 "J700_MT7932_PMGR_PRE_DMA: v000=0x%08x v258=0x%08x v2a0=0x%08x v310=0x%08x v3a0=0x%08x v3c0=0x%08x writes=0\n",
+			 readl_relaxed(pmgr + 0x000),
+			 readl_relaxed(pmgr + 0x258),
+			 readl_relaxed(pmgr + 0x2a0),
+			 readl_relaxed(pmgr + 0x310),
+			 readl_relaxed(pmgr + 0x3a0),
+			 readl_relaxed(pmgr + 0x3c0));
+
+		apcie = devm_ioremap(&pdev->dev, J700_APCIE_DART_BASE,
+				      J700_APCIE_DIAG_SIZE);
+		if (!apcie) {
+			ret = -ENOMEM;
+			goto err_free_pci_vec;
+		}
+		port = apcie + J700_APCIE_PORT_OFFSET;
+		dev_info(&pdev->dev,
+			 "J700_MT7932_ROOT_PRE_DMA: ltssm=0x%08x intstat=0x%08x intmask=0x%08x link=0x%08x ctrl=%08x/%08x/%08x/%08x/%08x/%08x/%08x/%08x rid=%08x/%08x writes=0\n",
+			 readl_relaxed(port + 0x080),
+			 readl_relaxed(port + 0x100),
+			 readl_relaxed(port + 0x104),
+			 readl_relaxed(port + 0x208),
+			 readl_relaxed(port + 0x800),
+			 readl_relaxed(port + 0x804),
+			 readl_relaxed(port + 0x808),
+			 readl_relaxed(port + 0x80c),
+			 readl_relaxed(port + 0x810),
+			 readl_relaxed(port + 0x814),
+			 readl_relaxed(port + 0x818),
+			 readl_relaxed(port + 0x81c),
+			 readl_relaxed(port + 0x3004),
+			 readl_relaxed(port + 0x3008));
+		dev_info(&pdev->dev,
+			 "J700_MT7932_DART_PRE_DMA: error=%08x/%08x/%08x/%08x enable=%08x tcr1=%08x tcr2=%08x tcr16=%08x tcr17=%08x tcr18=%08x ttbr1=%08x ttbr2=%08x ttbr16=%08x ttbr17=%08x ttbr18=%08x writes=0\n",
+			 readl_relaxed(apcie + 0x100),
+			 readl_relaxed(apcie + 0x104),
+			 readl_relaxed(apcie + 0x170),
+			 readl_relaxed(apcie + 0x174),
+			 readl_relaxed(apcie + 0xc00),
+			 readl_relaxed(apcie + 0x1004),
+			 readl_relaxed(apcie + 0x1008),
+			 readl_relaxed(apcie + 0x1040),
+			 readl_relaxed(apcie + 0x1044),
+			 readl_relaxed(apcie + 0x1048),
+			 readl_relaxed(apcie + 0x1404),
+			 readl_relaxed(apcie + 0x1408),
+			 readl_relaxed(apcie + 0x1440),
+			 readl_relaxed(apcie + 0x1444),
+			 readl_relaxed(apcie + 0x1448));
+	}
 
 	if (mt7921_disable_aspm)
 		mt76_pci_disable_aspm(pdev);
