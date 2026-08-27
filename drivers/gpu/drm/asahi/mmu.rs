@@ -181,6 +181,7 @@ fn uat_geometry(cfg: UatConfig) -> Result<UatGeometry> {
 
 /// Lower/user VA range for this SoC's root geometry (one page up to the
 /// per-root translation top: `1 << 39` on AGX2, `1 << 42` on AGX3).
+#[allow(dead_code)]
 pub(crate) fn iova_user_range(cfg: &hw::HwConfig) -> Result<Range<u64>> {
     Ok(IOVA_USER_BASE..uat_geometry(UatConfig::from_hw(cfg))?.user_va_top())
 }
@@ -1697,12 +1698,7 @@ impl Uat {
         cfg: &'static hw::HwConfig,
         map_kernel_to_user: bool,
     ) -> Result<Self> {
-        Self::new_with_config(
-            dev,
-            UatConfig::from_hw(cfg),
-            map_kernel_to_user,
-            HandoffMode::FirmwareDekker,
-        )
+        Self::new_with_handoff_mode(dev, cfg, map_kernel_to_user, HandoffMode::FirmwareDekker)
     }
 
     /// Create the T8140 UAT owner with the hardware-verified absent-handoff
