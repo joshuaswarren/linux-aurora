@@ -89,6 +89,25 @@ struct VersionConfig {
     versions: &'static [&'static [&'static str]],
 }
 
+// NOTE (AGX3 / G15-G17): do NOT add "G15"/"G16"/"G17" to the `G` enum here.
+//
+// This macro generates `::ver` variants of ONE set of struct shapes (the
+// AGX2 firmware ABI in `fw/`, `initdata.rs`, etc.). The `#[ver(G >= ...)]`
+// conditionals inside those structs only ever add or move *fields within the
+// same layout*. AGX3 G17 does not fit that model: its init-data is a
+// genuinely different object graph (per-role roots of 0xb8/0xc8 bytes, a
+// distinct version word, a 17-entry channel table, a bundle-view pointer
+// topology, an absent PPL handoff, and dual firmware roles), which is why it
+// lives in the dedicated, standalone `g17_initdata.rs` / `g17_rtkit.rs` /
+// `g17_submission.rs` / `g17_boot.rs` modules rather than as `#[ver]`
+// variants of the AGX2 structs. Adding the generations to this table would
+// silently generate wrong-shaped `InitData::ver` etc. for G17.
+//
+// Conclusion: `#[ver]` is extended only where a struct is genuinely shared.
+// The one structure the two families do share unchanged — the leaf UAT PTE
+// encoding — is already handled without this macro (the AGX3 encoder is
+// byte-identical to AGX2; see `mmu.rs`/`pgtable.rs`), so nothing new needs a
+// `#[ver]` gate. Keep AGX3 in its own modules.
 static AGX_VERSIONS: VersionConfig = VersionConfig {
     fields: &["G", "V"],
     enums: &[

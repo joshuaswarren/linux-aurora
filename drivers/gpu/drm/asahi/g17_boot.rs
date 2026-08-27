@@ -178,25 +178,38 @@ const fn apply_pre_handoff_gate(
     }
 }
 
-/// The two mandatory G17 firmware roles, in host kick order.
+/// The two mandatory G17 firmware roles.
+///
+/// The order in which they are kicked is a [`KickOrder`] parameter (default
+/// primary-first, matching the pinned macOS host and the working bare-metal
+/// T8140 host); see that type for why the order is not a constant.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum FirmwareRole {
-    /// Scheduler and recovery-ingress role, kicked first.
+    /// Scheduler and recovery-ingress role ("primary").
     Gfx = 0,
-    /// Power-management role, kicked second.
+    /// Power-management / control-only peer role ("secondary").
     Gfx1 = 1,
 }
 
-/// G17 variants with exact paired nested-firmware evidence.
+/// G17 variants the firmware-identity machinery can name.
 ///
-/// G17G/G17P and other variants are deliberately absent because the pinned
-/// corpus contains no equivalent role-paired nested images for them.
+/// G17S and G17C carry exact paired nested-firmware evidence from the pinned
+/// FTAB corpus. G17P (A18 Pro / T8140) is a named variant because it is a
+/// live bring-up target, but the pinned corpus contains **no** role-paired
+/// nested images for it: on T8140 the role images are iBoot-loaded carveouts
+/// (`gfx-data-base`/`gfx1-data-base`) and the firmware's own init-data
+/// version-word gate ("Host and FW Interface is mismatched", see
+/// [`crate::g17_initdata::INITDATA_VERSION_WORD`]) is the grounded identity
+/// check. [`g17_nested_firmware_identity`] therefore returns `None` for G17P,
+/// and every identity-admission path fails closed on it. G17G and other
+/// variants remain absent entirely.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[repr(u8)]
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum G17FirmwareVariant {
     G17S = b'S',
     G17C = b'C',
+    G17P = b'P',
 }
 
 /// Fail-closed variant decoding for diagnostic firmware selection.
@@ -213,6 +226,7 @@ pub(crate) const fn decode_g17_firmware_variant(
     match raw {
         b'S' => Ok(G17FirmwareVariant::G17S),
         b'C' => Ok(G17FirmwareVariant::G17C),
+        b'P' => Ok(G17FirmwareVariant::G17P),
         _ => Err(FirmwareIdentityError::UnknownVariant),
     }
 }
@@ -291,27 +305,35 @@ const G17C_GFX1_FIRMWARE_IDENTITY: G17NestedFirmwareIdentity = G17NestedFirmware
 ///
 /// This proves the contents of the pinned containers, not a live G17C target
 /// or Linux ownership of FTAB extraction, fixups, or firmware loading.
+/// Returns `None` for G17P: the pinned corpus has no role-paired nested
+/// images for it (see [`G17FirmwareVariant`]), so no byte identity exists to
+/// select and every caller must fail closed.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const fn g17_nested_firmware_identity(
     role: FirmwareRole,
     variant: G17FirmwareVariant,
-) -> &'static G17NestedFirmwareIdentity {
+) -> Option<&'static G17NestedFirmwareIdentity> {
     match (role, variant) {
-        (FirmwareRole::Gfx, G17FirmwareVariant::G17S) => &G17S_GFX_FIRMWARE_IDENTITY,
-        (FirmwareRole::Gfx, G17FirmwareVariant::G17C) => &G17C_GFX_FIRMWARE_IDENTITY,
-        (FirmwareRole::Gfx1, G17FirmwareVariant::G17S) => &G17S_GFX1_FIRMWARE_IDENTITY,
-        (FirmwareRole::Gfx1, G17FirmwareVariant::G17C) => &G17C_GFX1_FIRMWARE_IDENTITY,
+        (FirmwareRole::Gfx, G17FirmwareVariant::G17S) => Some(&G17S_GFX_FIRMWARE_IDENTITY),
+        (FirmwareRole::Gfx, G17FirmwareVariant::G17C) => Some(&G17C_GFX_FIRMWARE_IDENTITY),
+        (FirmwareRole::Gfx1, G17FirmwareVariant::G17S) => Some(&G17S_GFX1_FIRMWARE_IDENTITY),
+        (FirmwareRole::Gfx1, G17FirmwareVariant::G17C) => Some(&G17C_GFX1_FIRMWARE_IDENTITY),
+        (_, G17FirmwareVariant::G17P) => None,
     }
 }
 
 /// Validate tag, UUID, and hash together; no field is sufficient by itself.
+/// A variant with no pinned identity (G17P) validates nothing.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn validate_g17_nested_firmware_identity(
     role: FirmwareRole,
     variant: G17FirmwareVariant,
     observed: &G17NestedFirmwareIdentity,
 ) -> bool {
-    observed == g17_nested_firmware_identity(role, variant)
+    match g17_nested_firmware_identity(role, variant) {
+        Some(expected) => observed == expected,
+        None => false,
+    }
 }
 
 /// The G17P/G17G/G17S host/RTBuddy firmware-start model is exact but
@@ -739,7 +761,43 @@ pub(crate) const G17X_FIRMWARE_START_GAPS: G17xFirmwareStartGaps = G17xFirmwareS
 };
 
 const ROLE_COUNT: usize = 2;
-const KICK_ORDER: [FirmwareRole; ROLE_COUNT] = [FirmwareRole::Gfx, FirmwareRole::Gfx1];
+
+/// The order in which the two role start calls are issued.
+///
+/// The evidence for T8140/G17P is genuinely mixed and this is deliberately a
+/// parameter rather than a constant:
+///
+/// - The pinned macOS host (`AGXArmFirmware::bootFirmware()`, see
+///   [`g17_host_boot_ops`]) and the working bare-metal host that booted both
+///   T8140 instances issue the **primary (`GFX`) start first**, then `GFX1`.
+/// - The published T8140 firmware ABI spec
+///   (`docs/t8140-g17p-firmware-abi-spec.md`, "Startup Sequence" steps 7-9)
+///   instead documents booting the **secondary/control-only instance first**
+///   and sending its initdata before the primary.
+///
+/// Both cannot be the unique requirement; most likely the constraint is only
+/// on descriptor/acknowledgement interleaving rather than raw start order.
+/// Until a live A/B experiment settles it, primary-first is the default
+/// (matching the host that has actually driven this hardware) and the
+/// spec-documented order stays selectable.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum KickOrder {
+    /// `GFX` first, then `GFX1`. Matches the pinned macOS host and the
+    /// working bare-metal T8140 host. Default.
+    PrimaryFirst,
+    /// `GFX1` first, then `GFX`. Matches the published T8140 firmware ABI
+    /// spec's startup sequence. Not hardware-refuted; not the default.
+    SecondaryFirst,
+}
+
+impl KickOrder {
+    pub(crate) const fn role_at(self, index: usize) -> FirmwareRole {
+        match (self, index) {
+            (Self::PrimaryFirst, 0) | (Self::SecondaryFirst, 1) => FirmwareRole::Gfx,
+            _ => FirmwareRole::Gfx1,
+        }
+    }
+}
 
 impl FirmwareRole {
     const fn index(self) -> usize {
@@ -767,7 +825,7 @@ struct RoleState {
 pub(crate) enum BootError {
     /// Both role roots must be built and validated before the first kick.
     InitdataRootsIncomplete,
-    /// A role was kicked out of the exact `GFX`, then `GFX1` order.
+    /// A role was kicked out of the exact order selected by [`KickOrder`].
     WrongKickOrder,
     /// A role start call failed; the boot attempt is permanently failed.
     KickFailed,
@@ -787,14 +845,21 @@ pub(crate) enum BootError {
 pub(crate) struct DualRoleBoot {
     owner: SharedGpuUatOwner,
     roles: [RoleState; ROLE_COUNT],
+    kick_order: KickOrder,
     next_kick: usize,
     failed: bool,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 impl DualRoleBoot {
-    /// Create an empty boot attempt with one shared GPU/UAT owner.
+    /// Create an empty boot attempt with one shared GPU/UAT owner, using the
+    /// default primary-first kick order (see [`KickOrder`]).
     pub(crate) const fn new() -> Self {
+        Self::new_with_order(KickOrder::PrimaryFirst)
+    }
+
+    /// Create an empty boot attempt with an explicit kick order.
+    pub(crate) const fn new_with_order(kick_order: KickOrder) -> Self {
         Self {
             owner: SharedGpuUatOwner,
             roles: [
@@ -811,9 +876,15 @@ impl DualRoleBoot {
                     cold_boot_complete: false,
                 },
             ],
+            kick_order,
             next_kick: 0,
             failed: false,
         }
+    }
+
+    /// The kick order this boot attempt enforces.
+    pub(crate) const fn kick_order(&self) -> KickOrder {
+        self.kick_order
     }
 
     /// Return the single address-space owner used by either role.
@@ -837,8 +908,9 @@ impl DualRoleBoot {
 
     /// Record the return value of the next role start call.
     ///
-    /// Both roots must already exist, and calls must be recorded in exact
-    /// `GFX`, then `GFX1` order. Any failure permanently closes all gates.
+    /// Both roots must already exist, and calls must be recorded in the exact
+    /// order selected at construction ([`KickOrder`]; primary-first by
+    /// default). Any failure permanently closes all gates.
     pub(crate) fn record_kick(
         &mut self,
         role: FirmwareRole,
@@ -851,7 +923,7 @@ impl DualRoleBoot {
             self.failed = true;
             return Err(BootError::InitdataRootsIncomplete);
         }
-        if self.next_kick >= ROLE_COUNT || KICK_ORDER[self.next_kick] != role {
+        if self.next_kick >= ROLE_COUNT || self.kick_order.role_at(self.next_kick) != role {
             self.failed = true;
             return Err(BootError::WrongKickOrder);
         }
@@ -1097,6 +1169,44 @@ mod tests {
     }
 
     #[test]
+    fn kick_order_is_a_parameter_with_primary_first_default() {
+        // Default matches the working T8140 host: primary first.
+        assert_eq!(DualRoleBoot::new().kick_order(), KickOrder::PrimaryFirst);
+        assert_eq!(KickOrder::PrimaryFirst.role_at(0), FirmwareRole::Gfx);
+        assert_eq!(KickOrder::PrimaryFirst.role_at(1), FirmwareRole::Gfx1);
+        // The spec-documented alternative stays selectable.
+        assert_eq!(KickOrder::SecondaryFirst.role_at(0), FirmwareRole::Gfx1);
+        assert_eq!(KickOrder::SecondaryFirst.role_at(1), FirmwareRole::Gfx);
+
+        let mut boot = DualRoleBoot::new_with_order(KickOrder::SecondaryFirst);
+        boot.mark_initdata_root_ready(FirmwareRole::Gfx).unwrap();
+        boot.mark_initdata_root_ready(FirmwareRole::Gfx1).unwrap();
+        // Under secondary-first, kicking GFX first is the order violation.
+        assert_eq!(
+            boot.record_kick(FirmwareRole::Gfx, true),
+            Err(BootError::WrongKickOrder)
+        );
+
+        let mut boot = DualRoleBoot::new_with_order(KickOrder::SecondaryFirst);
+        boot.mark_initdata_root_ready(FirmwareRole::Gfx).unwrap();
+        boot.mark_initdata_root_ready(FirmwareRole::Gfx1).unwrap();
+        boot.record_kick(FirmwareRole::Gfx1, true).unwrap();
+        boot.record_kick(FirmwareRole::Gfx, true).unwrap();
+        assert!(boot.kick_gate_open());
+    }
+
+    #[test]
+    fn g17p_variant_decodes_but_pins_no_firmware_identity() {
+        assert_eq!(
+            decode_g17_firmware_variant(b'P'),
+            Ok(G17FirmwareVariant::G17P)
+        );
+        for role in [FirmwareRole::Gfx, FirmwareRole::Gfx1] {
+            assert!(g17_nested_firmware_identity(role, G17FirmwareVariant::G17P).is_none());
+        }
+    }
+
+    #[test]
     fn early_gate_is_either_role_not_both_roles() {
         for role in [FirmwareRole::Gfx, FirmwareRole::Gfx1] {
             let mut boot = roles_kicked();
@@ -1149,8 +1259,11 @@ mod tests {
     #[test]
     fn nested_firmware_identity_is_exact_per_role_and_variant() {
         for role in [FirmwareRole::Gfx, FirmwareRole::Gfx1] {
-            let g17s = g17_nested_firmware_identity(role, G17FirmwareVariant::G17S);
-            let g17c = g17_nested_firmware_identity(role, G17FirmwareVariant::G17C);
+            // G17P has no pinned nested images; selection must fail closed.
+            assert!(g17_nested_firmware_identity(role, G17FirmwareVariant::G17P).is_none());
+
+            let g17s = g17_nested_firmware_identity(role, G17FirmwareVariant::G17S).unwrap();
+            let g17c = g17_nested_firmware_identity(role, G17FirmwareVariant::G17C).unwrap();
             assert_eq!(g17s.entry_tag, *b"a010");
             assert_eq!(g17c.entry_tag, *b"a000");
             assert_eq!(g17s.size, g17c.size);
@@ -1186,6 +1299,12 @@ mod tests {
                 G17FirmwareVariant::G17C,
                 g17s,
             ));
+            // A variant with no pinned identity validates nothing.
+            assert!(!validate_g17_nested_firmware_identity(
+                role,
+                G17FirmwareVariant::G17P,
+                g17s,
+            ));
         }
 
         assert_eq!(
@@ -1196,7 +1315,11 @@ mod tests {
             decode_g17_firmware_variant(b'C'),
             Ok(G17FirmwareVariant::G17C)
         );
-        for raw in [b'G', b'P', b'A', 0, u8::MAX] {
+        assert_eq!(
+            decode_g17_firmware_variant(b'P'),
+            Ok(G17FirmwareVariant::G17P)
+        );
+        for raw in [b'G', b'A', 0, u8::MAX] {
             assert_eq!(
                 decode_g17_firmware_variant(raw),
                 Err(FirmwareIdentityError::UnknownVariant)
@@ -1232,7 +1355,7 @@ mod tests {
 
             let wrong_variant = match variant {
                 G17FirmwareVariant::G17S => G17FirmwareVariant::G17C,
-                G17FirmwareVariant::G17C => G17FirmwareVariant::G17S,
+                G17FirmwareVariant::G17C | G17FirmwareVariant::G17P => G17FirmwareVariant::G17S,
             };
             let mismatched =
                 pre_handoff_gate_with_identity(G17_GENERATION, wrong_variant, Some(&admission))

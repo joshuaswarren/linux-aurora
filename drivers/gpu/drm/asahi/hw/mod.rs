@@ -31,7 +31,7 @@ pub(crate) enum GpuRevision {
 }
 
 /// GPU core type enumeration. Note: Part of the firmware ABI.
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[repr(u32)]
 pub(crate) enum GpuCore {
     // Unknown = 0,
@@ -188,7 +188,11 @@ pub(crate) struct HwConfig {
     /// GPU variant type.
     pub(crate) gpu_variant: GpuVariant,
     /// GPU core type ID (as known by the firmware).
-    pub(crate) gpu_core: GpuCore,
+    ///
+    /// This is a firmware-ABI value (renumbered per firmware build). It is
+    /// `None` where no firmware GpuCore id has been recovered (AGX3 parts):
+    /// consumers must fail closed rather than substitute a number.
+    pub(crate) gpu_core: Option<GpuCore>,
 
     /// Base clock used used for timekeeping.
     pub(crate) base_clock_hz: u32,

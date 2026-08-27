@@ -223,16 +223,48 @@ pub(crate) fn attempt(
         );
     }
 
-    // Stage 4 — StartAsc. Release the coprocessor CPU so it can begin the
-    // firmware boot and, eventually, the UAT handoff. This is the grounded
-    // first live step (`g17_asc_bringup::asc_run_cpu_plan`) executed through
-    // the proven `start_cpu` primitive.
+    // T8140 AXI transition workaround: after the GPU blocks are powered and
+    // the SGX aperture is mapped, set bit 0 in both AXI transition words.
+    // This must happen before releasing the ASC CPUs.
+    let is_t8140 = soc.chip_id == 0x8140;
+    if is_t8140 {
+        regs::Resources::t8140_axi_transition_workaround(pdev)?;
+        dev_info!(
+            pdev.as_ref(),
+            "G17 live-boot: [t8140] AXI transition workaround applied\n"
+        );
+    }
+
+    // Stage 4 — StartAsc. Release the coprocessor CPU(s) so firmware can begin
+    // booting and, eventually, the UAT handoff. This is the grounded first
+    // live step (`g17_asc_bringup::asc_run_cpu_plan`) executed through the
+    // proven `start_cpu` primitive.
     //
-    // NOTE: A18 Pro / dual-role parts (GFX + GFX1) have two ASC transports;
-    // this releases the primary `asc` region only. The second role is a
-    // `RtkitHandshake`-stage concern once that stage is wired.
+    // A18 Pro / dual-role parts (GFX + GFX1) have two independent ASC
+    // coprocessors. The published spec starts the secondary/control-only peer
+    // first; the working bare-metal host starts the primary first. We follow
+    // the primary-first default here (matching that host); the order is a
+    // genuine ambiguity captured in `g17_boot::KickOrder`.
     regs::Resources::start_cpu(pdev)?;
-    dev_info!(pdev.as_ref(), "G17 live-boot: [4/8] ASC CPU released (CPU_RUN)\n");
+    dev_info!(
+        pdev.as_ref(),
+        "G17 live-boot: [4/8] primary ASC CPU released (CPU_RUN)\n"
+    );
+    if is_t8140 {
+        regs::Resources::start_secondary_cpu(pdev)?;
+        dev_info!(
+            pdev.as_ref(),
+            "G17 live-boot: [4/8] secondary (GFX1) ASC CPU released (CPU_RUN)\n"
+        );
+
+        // Write zero to the SGX pre-initdata gate before any initdata is
+        // staged (grounded startup-sequence step).
+        regs::Resources::t8140_pre_initdata_clear(pdev)?;
+        dev_info!(
+            pdev.as_ref(),
+            "G17 live-boot: [t8140] pre-initdata SGX gate cleared\n"
+        );
+    }
     fsleep(Delta::from_millis(ASC_SETTLE_MS));
 
     // Stage 5+ — RtkitHandshake / UatHandoff / Initdata / ChannelsDoorbell.
