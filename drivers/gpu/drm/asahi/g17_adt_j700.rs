@@ -161,8 +161,9 @@ pub(crate) const J700_POWER_SAMPLE_PERIOD: u32 = 16;
 pub(crate) const J700_TTBAT_PHYS_ADDR_BASE: u32 = 0x0407_ffee;
 
 /// The perf-state clock column in MHz, in the order the init-data
-/// `hw_globals` perf-state table expects
-/// ([`crate::g17_initdata::encode_grounded_subset`]).
+/// hardware-data perf-state tables expect (see [`crate::g17_initdata`]; the
+/// tables themselves are not yet encoded, see
+/// [`crate::g17_initdata::PERF_TABLE_VALUES_ENCODED`]).
 pub(crate) const fn perf_state_clocks_mhz() -> [u32; J700_PERF_STATE_COUNT as usize] {
     let mut out = [0u32; J700_PERF_STATE_COUNT as usize];
     let mut i = 0;
