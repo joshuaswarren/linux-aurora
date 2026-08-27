@@ -73,7 +73,11 @@ impl<T: MailCallback> Mailbox<T> {
         unsafe {
             (*mbox).cookie = ptr;
             (*mbox).rx = Some(mailbox_rx_callback::<T>);
-            to_result(bindings::apple_mbox_start(mbox))?;
+            if let Err(err) = to_result(bindings::apple_mbox_start(mbox)) {
+                (*mbox).rx = None;
+                (*mbox).cookie = core::ptr::null_mut();
+                return Err(err);
+            }
         }
         guard.dismiss();
         Ok(Mailbox {
@@ -92,8 +96,15 @@ impl<T: MailCallback> Drop for Mailbox<T> {
     fn drop(&mut self) {
         // SAFETY: mbox is a valid pointer
         unsafe { bindings::apple_mbox_stop(self.mbox) };
-        // SAFETY: `cookie` came from `into_foreign`
-        unsafe { T::Data::from_foreign((*self.mbox).cookie.cast()) };
+        // SAFETY: RX is synchronously disabled above, and `cookie` came from
+        // `into_foreign`. Clear the provider-visible callback before freeing
+        // its context so provider removal can never observe a dangling owner.
+        unsafe {
+            let cookie = (*self.mbox).cookie;
+            (*self.mbox).rx = None;
+            (*self.mbox).cookie = core::ptr::null_mut();
+            T::Data::from_foreign(cookie.cast());
+        }
     }
 }
 
