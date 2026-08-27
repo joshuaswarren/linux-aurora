@@ -127,6 +127,8 @@ int apple_mbox_ascwrap_v6_get_lifecycle(
 {
 	if (!mbox || !lifecycle)
 		return -EINVAL;
+	if (READ_ONCE(mbox->removing))
+		return -ENODEV;
 	if (!mbox->hw->is_ascwrap_v6)
 		return -EOPNOTSUPP;
 
@@ -139,6 +141,8 @@ int apple_mbox_ascwrap_v6_require_safe_cpu_lifecycle(struct apple_mbox *mbox)
 {
 	if (!mbox || !mbox->hw->is_ascwrap_v6)
 		return -EOPNOTSUPP;
+	if (READ_ONCE(mbox->removing))
+		return -ENODEV;
 
 	/*
 	 * This is intentionally checked before any CPU_CONTROL or IOP VBAR
@@ -163,6 +167,10 @@ int apple_mbox_send(struct apple_mbox *mbox, const struct apple_mbox_msg msg,
 	long t;
 
 	spin_lock_irqsave(&mbox->tx_lock, flags);
+	if (unlikely(READ_ONCE(mbox->removing))) {
+		spin_unlock_irqrestore(&mbox->tx_lock, flags);
+		return -ENODEV;
+	}
 	mbox_ctrl = readl_relaxed(mbox->regs + mbox->hw->a2i_control);
 
 	while (mbox_ctrl & mbox->hw->control_full) {
@@ -205,6 +213,10 @@ int apple_mbox_send(struct apple_mbox *mbox, const struct apple_mbox_msg msg,
 			return -ETIMEDOUT;
 
 		spin_lock_irqsave(&mbox->tx_lock, flags);
+		if (unlikely(READ_ONCE(mbox->removing))) {
+			spin_unlock_irqrestore(&mbox->tx_lock, flags);
+			return -ENODEV;
+		}
 		mbox_ctrl = readl_relaxed(mbox->regs + mbox->hw->a2i_control);
 	}
 
@@ -276,7 +288,8 @@ static irqreturn_t apple_mbox_recv_irq(int irq, void *data)
 	struct apple_mbox *mbox = data;
 
 	spin_lock(&mbox->rx_lock);
-	apple_mbox_poll_locked(mbox);
+	if (likely(!READ_ONCE(mbox->removing)))
+		apple_mbox_poll_locked(mbox);
 	spin_unlock(&mbox->rx_lock);
 
 	return IRQ_HANDLED;
@@ -288,7 +301,10 @@ int apple_mbox_poll(struct apple_mbox *mbox)
 	int ret;
 
 	spin_lock_irqsave(&mbox->rx_lock, flags);
-	ret = apple_mbox_poll_locked(mbox);
+	if (unlikely(READ_ONCE(mbox->removing)))
+		ret = -ENODEV;
+	else
+		ret = apple_mbox_poll_locked(mbox);
 	spin_unlock_irqrestore(&mbox->rx_lock, flags);
 
 	return ret;
@@ -297,14 +313,19 @@ EXPORT_SYMBOL(apple_mbox_poll);
 
 int apple_mbox_start(struct apple_mbox *mbox)
 {
-	int ret;
+	int ret = 0;
 
+	mutex_lock(&mbox->lifecycle_lock);
+	if (mbox->removing) {
+		ret = -ENODEV;
+		goto out_unlock;
+	}
 	if (mbox->active)
-		return 0;
+		goto out_unlock;
 
 	ret = pm_runtime_resume_and_get(mbox->dev);
 	if (ret)
-		return ret;
+		goto out_unlock;
 
 	/*
 	 * Only some variants of this mailbox HW provide interrupt control
@@ -322,11 +343,14 @@ int apple_mbox_start(struct apple_mbox *mbox)
 
 	enable_irq(mbox->irq_recv_not_empty);
 	mbox->active = true;
-	return 0;
+
+out_unlock:
+	mutex_unlock(&mbox->lifecycle_lock);
+	return ret;
 }
 EXPORT_SYMBOL(apple_mbox_start);
 
-void apple_mbox_stop(struct apple_mbox *mbox)
+static void apple_mbox_stop_locked(struct apple_mbox *mbox)
 {
 	if (!mbox->active)
 		return;
@@ -336,7 +360,72 @@ void apple_mbox_stop(struct apple_mbox *mbox)
 	pm_runtime_mark_last_busy(mbox->dev);
 	pm_runtime_put_autosuspend(mbox->dev);
 }
+
+void apple_mbox_stop(struct apple_mbox *mbox)
+{
+	mutex_lock(&mbox->lifecycle_lock);
+	apple_mbox_stop_locked(mbox);
+	mutex_unlock(&mbox->lifecycle_lock);
+}
 EXPORT_SYMBOL(apple_mbox_stop);
+
+/*
+ * Quiesce every provider-owned transport edge before devres can release the
+ * IRQs or MMIO mappings. Device links guarantee that mailbox consumers have
+ * already unbound; the callback clear and waiter wake are defensive if a
+ * future consumer violates that ownership rule. This deliberately performs
+ * no ASC CPU-control, IOP VBAR, firmware-DMA, mapper, or reset operation.
+ */
+static void apple_mbox_quiesce(void *data)
+{
+	struct apple_mbox *mbox = data;
+	unsigned long flags;
+	bool had_rx;
+	bool was_active;
+
+	mutex_lock(&mbox->lifecycle_lock);
+	if (mbox->removing) {
+		mutex_unlock(&mbox->lifecycle_lock);
+		return;
+	}
+
+	/* Serialize the removal fence with every MMIO send critical section. */
+	spin_lock_irqsave(&mbox->tx_lock, flags);
+	WRITE_ONCE(mbox->removing, true);
+	spin_unlock_irqrestore(&mbox->tx_lock, flags);
+
+	/*
+	 * Publish the inactive state under the lifecycle lock, then drop it
+	 * before disable_irq() waits for a callback. A callback is allowed to
+	 * finish a send or stop request without an rx_lock -> lifecycle_lock
+	 * inversion. The removal fence prevents any matching restart.
+	 */
+	was_active = mbox->active;
+	mbox->active = false;
+	mutex_unlock(&mbox->lifecycle_lock);
+	if (was_active) {
+		disable_irq(mbox->irq_recv_not_empty);
+		pm_runtime_mark_last_busy(mbox->dev);
+		pm_runtime_put_autosuspend(mbox->dev);
+	}
+
+	/* The TX IRQ is normally disabled; force and synchronize that state. */
+	disable_irq(mbox->irq_send_empty);
+	complete_all(&mbox->tx_empty);
+	synchronize_irq(mbox->irq_recv_not_empty);
+
+	spin_lock_irqsave(&mbox->rx_lock, flags);
+	had_rx = mbox->rx;
+	mbox->rx = NULL;
+	mbox->cookie = NULL;
+	spin_unlock_irqrestore(&mbox->rx_lock, flags);
+
+	if (WARN_ON_ONCE(had_rx))
+		dev_warn(mbox->dev,
+			 "consumer callback survived provider remove ordering\n");
+
+	pm_runtime_barrier(mbox->dev);
+}
 
 struct apple_mbox *apple_mbox_get(struct device *dev, int index)
 {
@@ -486,6 +575,7 @@ static int apple_mbox_probe(struct platform_device *pdev)
 
 	spin_lock_init(&mbox->rx_lock);
 	spin_lock_init(&mbox->tx_lock);
+	mutex_init(&mbox->lifecycle_lock);
 	init_completion(&mbox->tx_empty);
 
 	irqname = devm_kasprintf(dev, GFP_KERNEL, "%s-recv", dev_name(dev));
@@ -511,9 +601,21 @@ static int apple_mbox_probe(struct platform_device *pdev)
 	ret = devm_pm_runtime_enable(dev);
 	if (ret)
 		return ret;
+	ret = devm_add_action_or_reset(dev, apple_mbox_quiesce, mbox);
+	if (ret)
+		return ret;
 
 	platform_set_drvdata(pdev, mbox);
 	return 0;
+}
+
+static void apple_mbox_remove(struct platform_device *pdev)
+{
+	struct apple_mbox *mbox = platform_get_drvdata(pdev);
+
+	/* Block new phandle lookups before quiescing the provider. */
+	platform_set_drvdata(pdev, NULL);
+	apple_mbox_quiesce(mbox);
 }
 
 static const struct apple_mbox_hw apple_mbox_t8015_hw = {
@@ -598,6 +700,7 @@ static struct platform_driver apple_mbox_driver = {
 		.of_match_table = apple_mbox_of_match,
 	},
 	.probe = apple_mbox_probe,
+	.remove = apple_mbox_remove,
 };
 module_platform_driver(apple_mbox_driver);
 

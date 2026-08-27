@@ -10,6 +10,7 @@
 
 #include <linux/bits.h>
 #include <linux/device.h>
+#include <linux/mutex.h>
 #include <linux/types.h>
 
 /* encodes a single 96bit message sent over the single channel */
@@ -68,7 +69,10 @@ struct apple_mbox {
 	void __iomem *iop_vbar_regs;
 	const struct apple_mbox_hw *hw;
 	struct apple_mbox_ascwrap_v6_lifecycle ascwrap_v6;
+	/* Serializes transport start/stop against provider removal. */
+	struct mutex lifecycle_lock;
 	bool active;
+	bool removing;
 
 	int irq_recv_not_empty;
 	int irq_send_empty;

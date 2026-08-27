@@ -37,6 +37,9 @@ pub(crate) const fn admit_cpu_start(
 mod tests {
     use super::*;
 
+    /// Symbolic resources used only by the test executor below. There is no
+    /// provider handle, FFI call, MMIO address, or production entry point in
+    /// this model; it exists solely to pin transaction/unwind ordering.
     #[derive(Debug, Copy, Clone, PartialEq, Eq)]
     enum Resource {
         GfxTransport,
@@ -52,10 +55,79 @@ mod tests {
         Resource::Gfx1Cpu,
     ];
 
-    fn inject_failure_after(acquired: usize) -> (std::vec::Vec<Resource>, std::vec::Vec<Resource>) {
-        let acquired = ACQUIRE_ORDER[..acquired].to_vec();
-        let cleanup = acquired.iter().rev().copied().collect();
-        (acquired, cleanup)
+    #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+    enum Rollback {
+        StopGfx1Cpu,
+        StopGfxCpu,
+        QuiesceGfx1Provider,
+        QuiesceGfxProvider,
+    }
+
+    const FULL_ROLLBACK_ORDER: [Rollback; 4] = [
+        Rollback::StopGfx1Cpu,
+        Rollback::StopGfxCpu,
+        Rollback::QuiesceGfx1Provider,
+        Rollback::QuiesceGfxProvider,
+    ];
+
+    const fn rollback(resource: Resource) -> Rollback {
+        match resource {
+            Resource::GfxTransport => Rollback::QuiesceGfxProvider,
+            Resource::Gfx1Transport => Rollback::QuiesceGfx1Provider,
+            Resource::GfxCpu => Rollback::StopGfxCpu,
+            Resource::Gfx1Cpu => Rollback::StopGfx1Cpu,
+        }
+    }
+
+    #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+    enum TestEvent {
+        Acquire(Resource),
+        InjectFailureAfter(usize),
+        Rollback(Rollback),
+    }
+
+    struct TestOutcome {
+        completed_body: bool,
+        trace: std::vec::Vec<TestEvent>,
+        live: std::vec::Vec<Resource>,
+    }
+
+    /// Test-only transactional boundary. `fail_after` injects an error after
+    /// exactly that many symbolic acquisitions (including the body boundary
+    /// after all four). Every exit consumes the live stack in reverse order.
+    fn execute_test_only_transaction(fail_after: Option<usize>) -> TestOutcome {
+        assert!(fail_after.is_none_or(|point| point <= ACQUIRE_ORDER.len()));
+
+        let mut trace = std::vec::Vec::new();
+        let mut live = std::vec::Vec::new();
+        let mut completed_body = false;
+
+        for resource in ACQUIRE_ORDER {
+            if fail_after == Some(live.len()) {
+                trace.push(TestEvent::InjectFailureAfter(live.len()));
+                break;
+            }
+            trace.push(TestEvent::Acquire(resource));
+            live.push(resource);
+        }
+
+        if live.len() == ACQUIRE_ORDER.len() {
+            if fail_after == Some(live.len()) {
+                trace.push(TestEvent::InjectFailureAfter(live.len()));
+            } else {
+                completed_body = true;
+            }
+        }
+
+        while let Some(resource) = live.pop() {
+            trace.push(TestEvent::Rollback(rollback(resource)));
+        }
+
+        TestOutcome {
+            completed_body,
+            trace,
+            live,
+        }
     }
 
     #[test]
@@ -75,32 +147,63 @@ mod tests {
     }
 
     #[test]
-    fn every_injected_partial_failure_cleans_up_in_reverse_order() {
+    fn test_only_executor_unwinds_every_injected_boundary() {
         for acquired_count in 0..=ACQUIRE_ORDER.len() {
-            let (acquired, cleanup) = inject_failure_after(acquired_count);
-            assert_eq!(
-                cleanup,
-                acquired.iter().rev().copied().collect::<std::vec::Vec<_>>()
-            );
-        }
+            let outcome = execute_test_only_transaction(Some(acquired_count));
+            assert!(!outcome.completed_body);
+            assert!(outcome.live.is_empty());
 
-        let (_, full_cleanup) = inject_failure_after(ACQUIRE_ORDER.len());
+            let rollback_trace = outcome
+                .trace
+                .iter()
+                .filter_map(|event| match event {
+                    TestEvent::Rollback(step) => Some(*step),
+                    _ => None,
+                })
+                .collect::<std::vec::Vec<_>>();
+            let expected = ACQUIRE_ORDER[..acquired_count]
+                .iter()
+                .rev()
+                .copied()
+                .map(rollback)
+                .collect::<std::vec::Vec<_>>();
+            assert_eq!(rollback_trace, expected);
+        }
+    }
+
+    #[test]
+    fn full_test_only_transaction_uses_proven_role_and_provider_order() {
+        let outcome = execute_test_only_transaction(None);
+        assert!(outcome.completed_body);
+        assert!(outcome.live.is_empty());
         assert_eq!(
-            full_cleanup,
+            outcome.trace,
             [
-                Resource::Gfx1Cpu,
-                Resource::GfxCpu,
-                Resource::Gfx1Transport,
-                Resource::GfxTransport,
+                TestEvent::Acquire(Resource::GfxTransport),
+                TestEvent::Acquire(Resource::Gfx1Transport),
+                TestEvent::Acquire(Resource::GfxCpu),
+                TestEvent::Acquire(Resource::Gfx1Cpu),
+                TestEvent::Rollback(Rollback::StopGfx1Cpu),
+                TestEvent::Rollback(Rollback::StopGfxCpu),
+                TestEvent::Rollback(Rollback::QuiesceGfx1Provider),
+                TestEvent::Rollback(Rollback::QuiesceGfxProvider),
             ]
         );
+        let rollback_trace = outcome.trace[4..]
+            .iter()
+            .map(|event| match event {
+                TestEvent::Rollback(step) => *step,
+                _ => panic!("non-rollback event after transaction body"),
+            })
+            .collect::<std::vec::Vec<_>>();
+        assert_eq!(rollback_trace, FULL_ROLLBACK_ORDER);
     }
 
     #[test]
     fn current_boundary_acquires_nothing() {
-        let (acquired, cleanup) = inject_failure_after(0);
-        assert!(acquired.is_empty());
-        assert!(cleanup.is_empty());
+        let outcome = execute_test_only_transaction(Some(0));
+        assert_eq!(outcome.trace, [TestEvent::InjectFailureAfter(0)]);
+        assert!(outcome.live.is_empty());
         assert!(!TRANSACTIONAL_CPU_EXECUTOR_AVAILABLE);
     }
 }
