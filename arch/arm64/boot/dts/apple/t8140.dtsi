@@ -139,14 +139,6 @@
 		clock-output-names = "clkref";
 	};
 
-	/* /arm-io/clock-frequencies[0x18c - 0x100] on J700. */
-	clk_200m: clock-200m {
-		compatible = "fixed-clock";
-		#clock-cells = <0>;
-		clock-frequency = <200000000>;
-		clock-output-names = "clk_200m";
-	};
-
 	gpu_opp: opp-table-gpu {
 		compatible = "operating-points-v2";
 

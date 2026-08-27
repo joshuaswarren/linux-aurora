@@ -107,18 +107,11 @@ allOf:
     then:
       properties:
         reg:
-          minItems: 2
-          maxItems: 2
           items:
             - description:
-                Topology alias of the primary ASCWrap v6 window. The
-                apple,t8140-ascwrap-v6 mailbox provider is the sole mapping
-                and CPU-lifecycle owner; the GPU consumer must not map this
-                alias or write CPU control directly.
+                ASCWrap v6 register window of the primary (GFX role)
+                GPU coprocessor
             - description: GPU block MMIO registers
-        reg-names:
-          minItems: 2
-          maxItems: 2
         mboxes:
           items:
             - description:
@@ -137,10 +130,6 @@ allOf:
         - operating-points-v2
     else:
       properties:
-        reg:
-          maxItems: 2
-        reg-names:
-          maxItems: 2
         mboxes:
           maxItems: 1
         memory-region:
