@@ -197,7 +197,7 @@ impl MappedObject {
         primary: &InstanceAddresses,
         secondary: &InstanceAddresses,
     ) -> Result {
-        let mut vmap = self.object.vmap()?;
+        let vmap = self.object.vmap()?;
         let bytes = unsafe {
             // SAFETY: the VMap covers this object's complete, page-rounded
             // allocation and logical_size never exceeds the object size.
@@ -222,6 +222,7 @@ impl MappedObject {
 }
 
 #[cfg(not(test))]
+#[allow(dead_code)]
 struct G17MappedResources {
     roots: MappedObject,
     shared_cluster: MappedObject,
