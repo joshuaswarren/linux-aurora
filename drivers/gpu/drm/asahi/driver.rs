@@ -266,6 +266,26 @@ fn refuse_agx3_probe(pdev: &platform::Device<Core>, soc: &'static hw::agx3::SocC
         soc.uat_oas
     );
 
+    // T8140 topology admission is the first target-specific operation.  It
+    // reads only DT properties and must complete before reserved-memory
+    // mapping, SGX MMIO mapping/readback, DMA setup, or any live-boot action.
+    let t8140_topology =
+        if expected.gpu_gen == hw::GpuGen::G17 && expected.gpu_variant == identity::GpuVariant::P {
+            match admit_t8140_live_topology(pdev, &expected) {
+                Ok(admission) => Some(admission),
+                Err(e) => {
+                    dev_err!(
+                        pdev.as_ref(),
+                        "G17P: exact provider-owned T8140 topology rejected before effects: {:?}\n",
+                        e
+                    );
+                    return ENODEV;
+                }
+            }
+        } else {
+            None
+        };
+
     // The G17S loaded-firmware handoff is reserved memory, not GPU MMIO. It
     // must be mapped and hashed before touching the SGX register aperture so
     // firmware identity can never be inferred from a powered or partially
@@ -334,7 +354,7 @@ fn refuse_agx3_probe(pdev: &platform::Device<Core>, soc: &'static hw::agx3::SocC
     // refusal. The first slice always returns an error (the full boot is not
     // yet wired), so probe still fails closed today.
     if expected.gpu_gen == hw::GpuGen::G17 && g17_live_boot::G17_LIVE_BOOT_ENABLED {
-        match g17_live_boot::attempt(pdev, soc, &expected) {
+        match g17_live_boot::attempt(pdev, soc, &expected, t8140_topology.as_ref()) {
             Ok(()) => {
                 dev_info!(
                     pdev.as_ref(),
@@ -435,6 +455,21 @@ fn read_t8140_asc_observation(
     let node = pdev.as_ref().of_node()?;
     let mbox = node.parse_phandle(c_str!("mboxes"), index)?;
 
+    // Require the exact provider ABI rather than accepting a node with the
+    // same numeric resources under a different owner contract.
+    let compatible: KVec<u8> = mbox.get_property(c_str!("compatible")).ok()?;
+    if compatible.as_slice() != b"apple,t8140-ascwrap-v6\0" {
+        return None;
+    }
+    let reg_names: KVec<u8> = mbox.get_property(c_str!("reg-names")).ok()?;
+    if reg_names.as_slice() != b"wrapper\0iop-vbar\0" {
+        return None;
+    }
+    let interrupt_names: KVec<u8> = mbox.get_property(c_str!("interrupt-names")).ok()?;
+    if interrupt_names.as_slice() != b"send-empty\0recv-not-empty\0" {
+        return None;
+    }
+
     // reg = <wrapper_hi wrapper_lo wsize_hi wsize_lo iovbar_hi iovbar_lo isize_hi isize_lo>
     let reg: KVec<u32> = mbox.get_property(c_str!("reg")).ok()?;
     if reg.len() != 8 {
@@ -444,7 +479,14 @@ fn read_t8140_asc_observation(
 
     // interrupts = <type send flags type recv flags>, AIC number is cell 1/4.
     let interrupts: KVec<u32> = mbox.get_property(c_str!("interrupts")).ok()?;
-    if interrupts.len() != 6 {
+    const AIC_IRQ: u32 = 0;
+    const IRQ_TYPE_LEVEL_HIGH: u32 = 4;
+    if interrupts.len() != 6
+        || interrupts[0] != AIC_IRQ
+        || interrupts[2] != IRQ_TYPE_LEVEL_HIGH
+        || interrupts[3] != AIC_IRQ
+        || interrupts[5] != IRQ_TYPE_LEVEL_HIGH
+    {
         return None;
     }
 
@@ -474,10 +516,43 @@ fn read_t8140_asc_observation(
 fn read_t8140_linux_dt_topology(
     pdev: &platform::Device<Core>,
 ) -> Option<agx_power_recovery::T8140G17PLinuxDtTopology> {
+    let node = pdev.as_ref().of_node()?;
+    let gpu_reg_names: KVec<u8> = node.get_property(c_str!("reg-names")).ok()?;
+    let mboxes: KVec<u32> = node.get_property(c_str!("mboxes")).ok()?;
+    if gpu_reg_names.as_slice() != b"asc\0sgx\0"
+        || mboxes.len() != 2
+        || node.parse_phandle(c_str!("mboxes"), 2).is_some()
+    {
+        return None;
+    }
+
     Some(agx_power_recovery::T8140G17PLinuxDtTopology {
         gfx: read_t8140_asc_observation(pdev, 0)?,
         gfx1: read_t8140_asc_observation(pdev, 1)?,
     })
+}
+
+/// Proof that the live T8140 DT matched both pinned provider roles exactly.
+///
+/// Construction is private to the read-only admission above; live boot must
+/// receive this token before it can query either provider.
+pub(crate) struct T8140LiveTopologyAdmission {
+    _private: (),
+}
+
+fn admit_t8140_live_topology(
+    pdev: &platform::Device<Core>,
+    identity: &identity::GpuIdentity,
+) -> Result<T8140LiveTopologyAdmission> {
+    let observed = read_t8140_linux_dt_topology(pdev).ok_or(EINVAL)?;
+    let preflight =
+        g17_power_preflight::G17PowerPreflight::new_with_linux_dt(identity, Some(&observed))
+            .map_err(|_| EINVAL)?;
+    if preflight.t8140_strategy().is_none() {
+        return Err(EINVAL);
+    }
+
+    Ok(T8140LiveTopologyAdmission { _private: () })
 }
 
 fn refuse_g17_probe(
@@ -497,10 +572,8 @@ fn refuse_g17_probe(
                 "G17P: could not read the T8140 dual-ASC topology from the device tree mboxes\n"
             );
         }
-        match g17_power_preflight::G17PowerPreflight::new_with_linux_dt(
-            identity,
-            observed.as_ref(),
-        ) {
+        match g17_power_preflight::G17PowerPreflight::new_with_linux_dt(identity, observed.as_ref())
+        {
             Ok(preflight) => preflight,
             Err(e) => {
                 dev_err!(

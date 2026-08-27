@@ -49,6 +49,13 @@
 
 /* ASCWrap v6 embeds the unchanged ASC mailbox block at this offset. */
 #define APPLE_ASCWRAP_V6_MBOX_OFFSET 0x8000
+#define APPLE_ASCWRAP_V6_WRAPPER_SIZE 0x88000
+#define APPLE_ASCWRAP_V6_IOP_VBAR_SIZE 0x8
+
+#define APPLE_T8140_GFX_WRAPPER_BASE 0x482600000ULL
+#define APPLE_T8140_GFX_IOP_VBAR_BASE 0x482050000ULL
+#define APPLE_T8140_GFX1_WRAPPER_BASE 0x482e00000ULL
+#define APPLE_T8140_GFX1_IOP_VBAR_BASE 0x482850000ULL
 
 static_assert(APPLE_ASCWRAP_V6_MBOX_OFFSET + APPLE_ASC_MBOX_A2I_CONTROL ==
 	      0x8110);
@@ -94,6 +101,7 @@ static_assert(APPLE_ASCWRAP_V6_MBOX_OFFSET + APPLE_ASC_MBOX_I2A_RECV0 ==
 
 struct apple_mbox_hw {
 	unsigned int reg_offset;
+	bool is_ascwrap_v6;
 
 	unsigned int control_full;
 	unsigned int control_empty;
@@ -112,6 +120,39 @@ struct apple_mbox_hw {
 	unsigned int irq_bit_recv_not_empty;
 	unsigned int irq_bit_send_empty;
 };
+
+int apple_mbox_ascwrap_v6_get_lifecycle(
+	struct apple_mbox *mbox,
+	struct apple_mbox_ascwrap_v6_lifecycle *lifecycle)
+{
+	if (!mbox || !lifecycle)
+		return -EINVAL;
+	if (!mbox->hw->is_ascwrap_v6)
+		return -EOPNOTSUPP;
+
+	*lifecycle = mbox->ascwrap_v6;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_mbox_ascwrap_v6_get_lifecycle);
+
+int apple_mbox_ascwrap_v6_require_safe_cpu_lifecycle(struct apple_mbox *mbox)
+{
+	if (!mbox || !mbox->hw->is_ascwrap_v6)
+		return -EOPNOTSUPP;
+
+	/*
+	 * This is intentionally checked before any CPU_CONTROL or IOP VBAR
+	 * write.  Clearing CPU_RUN alone is not the complete AppleA7IOP stop
+	 * transaction, and no grounded hardware reset exists yet.  Keep the
+	 * provider as the sole future lifecycle owner without exposing a
+	 * one-way start primitive to consumers.
+	 */
+	if (mbox->ascwrap_v6.missing)
+		return -EOPNOTSUPP;
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_mbox_ascwrap_v6_require_safe_cpu_lifecycle);
 
 int apple_mbox_send(struct apple_mbox *mbox, const struct apple_mbox_msg msg,
 		    bool atomic)
@@ -349,9 +390,10 @@ static int apple_mbox_probe(struct platform_device *pdev)
 {
 	int ret;
 	char *irqname;
+	const char *firmware_role;
 	struct apple_mbox *mbox;
 	struct device *dev = &pdev->dev;
-	struct resource *res;
+	struct resource *res, *iop_vbar_res;
 
 	mbox = devm_kzalloc(dev, sizeof(*mbox), GFP_KERNEL);
 	if (!mbox)
@@ -362,17 +404,76 @@ static int apple_mbox_probe(struct platform_device *pdev)
 	if (!mbox->hw)
 		return -EINVAL;
 
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	if (!res || resource_size(res) < mbox->hw->reg_offset +
-					mbox->hw->i2a_recv1 + sizeof(u64))
-		return dev_err_probe(dev, -EINVAL,
-				     "mailbox register window is too small\n");
+	if (mbox->hw->is_ascwrap_v6) {
+		/*
+		 * Validate the entire provider identity before mapping either
+		 * resource.  These are fixed T8140 CPU-physical windows and role
+		 * assignments, not generic consumer-provided aliases.
+		 */
+		res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "wrapper");
+		iop_vbar_res = platform_get_resource_byname(pdev, IORESOURCE_MEM,
+							    "iop-vbar");
+		if (!res || !iop_vbar_res ||
+		    resource_size(res) != APPLE_ASCWRAP_V6_WRAPPER_SIZE ||
+		    resource_size(iop_vbar_res) != APPLE_ASCWRAP_V6_IOP_VBAR_SIZE)
+			return dev_err_probe(dev, -EINVAL,
+					     "invalid ASCWrap v6 provider resources\n");
 
-	mbox->regs = devm_platform_ioremap_resource(pdev, 0);
-	if (IS_ERR(mbox->regs))
-		return PTR_ERR(mbox->regs);
-	/* Resource 1, when present, is ASC lifecycle state, not mailbox MMIO. */
-	mbox->regs = (u8 __iomem *)mbox->regs + mbox->hw->reg_offset;
+		ret = of_property_read_string(dev->of_node, "apple,firmware-role",
+					      &firmware_role);
+		if (ret)
+			return dev_err_probe(dev, ret,
+					     "missing ASCWrap v6 firmware role\n");
+
+		if (!strcmp(firmware_role, "GFX")) {
+			mbox->ascwrap_v6.role = APPLE_MBOX_ASCWRAP_V6_ROLE_GFX;
+			if (res->start != APPLE_T8140_GFX_WRAPPER_BASE ||
+			    iop_vbar_res->start != APPLE_T8140_GFX_IOP_VBAR_BASE)
+				return dev_err_probe(dev, -EINVAL,
+						     "GFX ASCWrap v6 resources do not match T8140\n");
+		} else if (!strcmp(firmware_role, "GFX1")) {
+			mbox->ascwrap_v6.role = APPLE_MBOX_ASCWRAP_V6_ROLE_GFX1;
+			if (res->start != APPLE_T8140_GFX1_WRAPPER_BASE ||
+			    iop_vbar_res->start != APPLE_T8140_GFX1_IOP_VBAR_BASE)
+				return dev_err_probe(dev, -EINVAL,
+						     "GFX1 ASCWrap v6 resources do not match T8140\n");
+		} else {
+			return dev_err_probe(dev, -EINVAL,
+					     "invalid ASCWrap v6 firmware role\n");
+		}
+
+		mbox->ascwrap_v6.wrapper_start = res->start;
+		mbox->ascwrap_v6.wrapper_size = resource_size(res);
+		mbox->ascwrap_v6.iop_vbar_start = iop_vbar_res->start;
+		mbox->ascwrap_v6.iop_vbar_size = resource_size(iop_vbar_res);
+		mbox->ascwrap_v6.missing =
+			APPLE_MBOX_ASCWRAP_V6_MISSING_SAFE_STOP |
+			APPLE_MBOX_ASCWRAP_V6_MISSING_SAFE_RESET;
+
+		mbox->wrapper_regs =
+			devm_platform_ioremap_resource_byname(pdev, "wrapper");
+		if (IS_ERR(mbox->wrapper_regs))
+			return PTR_ERR(mbox->wrapper_regs);
+
+		mbox->iop_vbar_regs =
+			devm_platform_ioremap_resource_byname(pdev, "iop-vbar");
+		if (IS_ERR(mbox->iop_vbar_regs))
+			return PTR_ERR(mbox->iop_vbar_regs);
+
+		mbox->regs = (u8 __iomem *)mbox->wrapper_regs +
+			     mbox->hw->reg_offset;
+	} else {
+		res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+		if (!res || resource_size(res) < mbox->hw->reg_offset +
+						mbox->hw->i2a_recv1 + sizeof(u64))
+			return dev_err_probe(dev, -EINVAL,
+					     "mailbox register window is too small\n");
+
+		mbox->regs = devm_platform_ioremap_resource(pdev, 0);
+		if (IS_ERR(mbox->regs))
+			return PTR_ERR(mbox->regs);
+		mbox->regs = (u8 __iomem *)mbox->regs + mbox->hw->reg_offset;
+	}
 
 	mbox->irq_recv_not_empty =
 		platform_get_irq_byname(pdev, "recv-not-empty");
@@ -447,6 +548,7 @@ static const struct apple_mbox_hw apple_mbox_asc_hw = {
 
 static const struct apple_mbox_hw apple_mbox_ascwrap_v6_hw = {
 	.reg_offset = APPLE_ASCWRAP_V6_MBOX_OFFSET,
+	.is_ascwrap_v6 = true,
 
 	.control_full = APPLE_ASC_MBOX_CONTROL_FULL,
 	.control_empty = APPLE_ASC_MBOX_CONTROL_EMPTY,

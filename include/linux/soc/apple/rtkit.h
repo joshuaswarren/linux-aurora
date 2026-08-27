@@ -65,6 +65,26 @@ struct apple_rtkit_ops {
 
 struct apple_rtkit;
 
+#define APPLE_RTKIT_EPMAP_SNAPSHOT_WORDS 4
+
+/**
+ * struct apple_rtkit_epmap_snapshot - passive HELLO/EPMAP discovery result
+ * @raw_hello: exact endpoint-zero HELLO payload received from firmware
+ * @hello_min_version: decoded HELLO minimum protocol version
+ * @hello_max_version: decoded HELLO maximum protocol version
+ * @endpoints: raw 256-bit EPMAP advertised by firmware
+ *
+ * Discovery-only clients answer HELLO and EPMAP but never start an endpoint
+ * and never request an AP/IOP power-state transition.  In particular, EP 1
+ * being present in @endpoints does not start crashlog or allocate a buffer.
+ */
+struct apple_rtkit_epmap_snapshot {
+	u64 raw_hello;
+	u16 hello_min_version;
+	u16 hello_max_version;
+	u64 endpoints[APPLE_RTKIT_EPMAP_SNAPSHOT_WORDS];
+};
+
 /*
  * Initializes the internal state required to handle RTKit. This
  * should usually be called within _probe.
@@ -113,6 +133,15 @@ struct apple_rtkit *apple_rtkit_init_adopted(
 	const struct apple_rtkit_ops *ops);
 
 /*
+ * Initialize a passive management client.  The mailbox transport is armed,
+ * but the client admits only HELLO and EPMAP messages and performs no
+ * endpoint-start or power-state transactions.
+ */
+struct apple_rtkit *apple_rtkit_init_epmap_only(
+	struct device *dev, void *cookie, const char *mbox_name, int mbox_idx,
+	const struct apple_rtkit_ops *ops);
+
+/*
  * Free an instance of apple_rtkit.
  */
 void apple_rtkit_free(struct apple_rtkit *rtk);
@@ -128,6 +157,13 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk);
  * co-processor has been started.
  */
 int apple_rtkit_boot(struct apple_rtkit *rtk);
+
+/* Wait only for HELLO/EPMAP completion, without completing RTKit boot. */
+int apple_rtkit_discover_epmap(struct apple_rtkit *rtk);
+
+/* Copy an already-completed discovery-only snapshot. */
+int apple_rtkit_get_epmap_snapshot(
+	struct apple_rtkit *rtk, struct apple_rtkit_epmap_snapshot *snapshot);
 
 /*
  * Adopt a co-processor session that a previous boot stage left fully running.

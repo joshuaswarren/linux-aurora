@@ -6,6 +6,9 @@
 
 #include "rtkit-internal.h"
 
+static_assert(APPLE_RTKIT_EPMAP_SNAPSHOT_WORDS * 64 ==
+	      APPLE_RTKIT_MAX_ENDPOINTS);
+
 enum {
 	APPLE_RTKIT_PWR_STATE_OFF = 0x00, /* power off, cannot be restarted */
 	APPLE_RTKIT_PWR_STATE_SLEEP = 0x01, /* sleeping, can be restarted */
@@ -115,13 +118,36 @@ static int apple_rtkit_management_send(struct apple_rtkit *rtk, u8 type,
 	return ret;
 }
 
+static void apple_rtkit_epmap_only_abort(struct apple_rtkit *rtk, int error)
+{
+	if (!rtk->epmap_only || rtk->epmap_finished)
+		return;
+
+	rtk->boot_result = error;
+	rtk->epmap_finished = true;
+	complete_all(&rtk->epmap_completion);
+}
+
 static void apple_rtkit_management_rx_hello(struct apple_rtkit *rtk, u64 msg)
 {
 	u64 reply;
+	int ret;
 
 	int min_ver = FIELD_GET(APPLE_RTKIT_MGMT_HELLO_MINVER, msg);
 	int max_ver = FIELD_GET(APPLE_RTKIT_MGMT_HELLO_MAXVER, msg);
 	int want_ver = min(APPLE_RTKIT_MAX_SUPPORTED_VERSION, max_ver);
+
+	if (rtk->epmap_only) {
+		if (rtk->hello_seen || rtk->epmap_finished) {
+			apple_rtkit_epmap_only_abort(rtk, -EPROTO);
+			return;
+		}
+
+		rtk->raw_hello = msg;
+		rtk->hello_min_version = min_ver;
+		rtk->hello_max_version = max_ver;
+		rtk->hello_seen = true;
+	}
 
 	dev_dbg(rtk->dev, "RTKit: Min ver %d, max ver %d\n", min_ver, max_ver);
 
@@ -143,21 +169,37 @@ static void apple_rtkit_management_rx_hello(struct apple_rtkit *rtk, u64 msg)
 
 	reply = FIELD_PREP(APPLE_RTKIT_MGMT_HELLO_MINVER, want_ver);
 	reply |= FIELD_PREP(APPLE_RTKIT_MGMT_HELLO_MAXVER, want_ver);
-	apple_rtkit_management_send(rtk, APPLE_RTKIT_MGMT_HELLO_REPLY, reply);
+	ret = apple_rtkit_management_send(rtk, APPLE_RTKIT_MGMT_HELLO_REPLY,
+					 reply);
+	if (ret && rtk->epmap_only)
+		apple_rtkit_epmap_only_abort(rtk, ret);
 
 	return;
 
 abort_boot:
-	rtk->boot_result = -EINVAL;
-	complete_all(&rtk->epmap_completion);
+	if (rtk->epmap_only) {
+		apple_rtkit_epmap_only_abort(rtk, -EINVAL);
+	} else {
+		rtk->boot_result = -EINVAL;
+		complete_all(&rtk->epmap_completion);
+	}
 }
 
 static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 {
-	int i, ep;
+	int i, ep, ret;
 	u64 reply;
 	unsigned long bitmap = FIELD_GET(APPLE_RTKIT_MGMT_EPMAP_BITMAP, msg);
 	u32 base = FIELD_GET(APPLE_RTKIT_MGMT_EPMAP_BASE, msg);
+
+	if (rtk->epmap_only) {
+		if (!rtk->hello_seen || rtk->epmap_finished ||
+		    (rtk->epmap_bases_seen & BIT(base))) {
+			apple_rtkit_epmap_only_abort(rtk, -EPROTO);
+			return;
+		}
+		rtk->epmap_bases_seen |= BIT(base);
+	}
 
 	dev_dbg(rtk->dev,
 		"RTKit: received endpoint bitmap 0x%lx with base 0x%x\n",
@@ -167,6 +209,8 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 		ep = 32 * base + i;
 		dev_dbg(rtk->dev, "RTKit: Discovered endpoint 0x%02x\n", ep);
 		set_bit(ep, rtk->endpoints);
+		if (rtk->epmap_only)
+			set_bit(ep, rtk->discovery_endpoints);
 	}
 
 	reply = FIELD_PREP(APPLE_RTKIT_MGMT_EPMAP_BASE, base);
@@ -175,10 +219,22 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 	else
 		reply |= APPLE_RTKIT_MGMT_EPMAP_REPLY_MORE;
 
-	apple_rtkit_management_send(rtk, APPLE_RTKIT_MGMT_EPMAP_REPLY, reply);
+	ret = apple_rtkit_management_send(rtk, APPLE_RTKIT_MGMT_EPMAP_REPLY,
+					 reply);
+	if (ret && rtk->epmap_only) {
+		apple_rtkit_epmap_only_abort(rtk, ret);
+		return;
+	}
 
 	if (!(msg & APPLE_RTKIT_MGMT_EPMAP_LAST))
 		return;
+
+	if (rtk->epmap_only) {
+		rtk->boot_result = 0;
+		rtk->epmap_finished = true;
+		complete_all(&rtk->epmap_completion);
+		return;
+	}
 
 	for_each_set_bit(ep, rtk->endpoints, APPLE_RTKIT_APP_ENDPOINT_START) {
 		switch (ep) {
@@ -236,6 +292,15 @@ static void apple_rtkit_management_rx_ap_pwr_ack(struct apple_rtkit *rtk,
 static void apple_rtkit_management_rx(struct apple_rtkit *rtk, u64 msg)
 {
 	u8 type = FIELD_GET(APPLE_RTKIT_MGMT_TYPE, msg);
+
+	if (rtk->epmap_only && type != APPLE_RTKIT_MGMT_HELLO &&
+	    type != APPLE_RTKIT_MGMT_EPMAP) {
+		dev_err(rtk->dev,
+			"RTKit: discovery-only client received management type 0x%02x\n",
+			type);
+		apple_rtkit_epmap_only_abort(rtk, -EPROTO);
+		return;
+	}
 
 	switch (type) {
 	case APPLE_RTKIT_MGMT_HELLO:
@@ -531,6 +596,9 @@ static void apple_rtkit_rx_work(struct work_struct *work)
 		container_of(work, struct apple_rtkit_rx_work, work);
 	struct apple_rtkit *rtk = rtk_work->rtk;
 
+	if (READ_ONCE(rtk->shutting_down))
+		goto out_free;
+
 	switch (rtk_work->ep) {
 	case APPLE_RTKIT_EP_MGMT:
 		apple_rtkit_management_rx(rtk, rtk_work->msg);
@@ -560,9 +628,10 @@ static void apple_rtkit_rx_work(struct work_struct *work)
 	default:
 		dev_warn(rtk->dev,
 			 "RTKit: message to unknown endpoint %02x: %llx\n",
-			 rtk_work->ep, rtk_work->msg);
+				 rtk_work->ep, rtk_work->msg);
 	}
 
+out_free:
 	kfree(rtk_work);
 }
 
@@ -579,11 +648,26 @@ static void apple_rtkit_rx(struct apple_mbox *mbox, struct apple_mbox_msg msg,
 	 * afterwards.
 	 */
 	dma_rmb();
+	if (READ_ONCE(rtk->shutting_down))
+		return;
 
 	if (!test_bit(ep, rtk->endpoints))
 		dev_warn(rtk->dev,
 			 "RTKit: Message to undiscovered endpoint 0x%02x\n",
 			 ep);
+
+	/*
+	 * Passive discovery owns endpoint zero only.  Never queue a crashlog,
+	 * syslog, or application callback from this mode: doing so could allocate
+	 * shared memory or acknowledge a protocol that has not been admitted.
+	 */
+	if (rtk->epmap_only && ep != APPLE_RTKIT_EP_MGMT) {
+		dev_err(rtk->dev,
+			"RTKit: discovery-only client received endpoint 0x%02x traffic\n",
+			ep);
+		apple_rtkit_epmap_only_abort(rtk, -EPROTO);
+		return;
+	}
 
 	if (ep >= APPLE_RTKIT_APP_ENDPOINT_START &&
 	    rtk->ops->recv_message_early &&
@@ -613,6 +697,18 @@ int apple_rtkit_send_message(struct apple_rtkit *rtk, u8 ep, u64 message,
 		dev_warn(rtk->dev,
 			 "RTKit: Device is crashed, cannot send message\n");
 		return -EINVAL;
+	}
+
+	if (rtk->epmap_only) {
+		u8 type = FIELD_GET(APPLE_RTKIT_MGMT_TYPE, message);
+
+		if (ep != APPLE_RTKIT_EP_MGMT ||
+		    (type != APPLE_RTKIT_MGMT_HELLO_REPLY &&
+		     type != APPLE_RTKIT_MGMT_EPMAP_REPLY)) {
+			dev_warn(rtk->dev,
+				 "RTKit: discovery-only client refused endpoint/power side effect\n");
+			return -EPERM;
+		}
 	}
 
 	if (ep >= APPLE_RTKIT_APP_ENDPOINT_START &&
@@ -648,6 +744,9 @@ EXPORT_SYMBOL_GPL(apple_rtkit_has_endpoint);
 int apple_rtkit_start_ep(struct apple_rtkit *rtk, u8 endpoint)
 {
 	u64 msg;
+
+	if (rtk->epmap_only)
+		return -EPERM;
 
 	if (!test_bit(endpoint, rtk->endpoints))
 		return -EINVAL;
@@ -686,12 +785,12 @@ static void apple_rtkit_mark_running(struct apple_rtkit *rtk)
 
 static struct apple_rtkit *__apple_rtkit_init(
 	struct device *dev, void *cookie, const char *mbox_name, int mbox_idx,
-	const struct apple_rtkit_ops *ops, bool adopted)
+	const struct apple_rtkit_ops *ops, bool adopted, bool epmap_only)
 {
 	struct apple_rtkit *rtk;
 	int ret;
 
-	if (!ops)
+	if (!ops || (adopted && epmap_only))
 		return ERR_PTR(-EINVAL);
 
 	rtk = kzalloc_obj(*rtk);
@@ -701,12 +800,14 @@ static struct apple_rtkit *__apple_rtkit_init(
 	rtk->dev = dev;
 	rtk->cookie = cookie;
 	rtk->ops = ops;
+	rtk->epmap_only = epmap_only;
 
 	init_completion(&rtk->epmap_completion);
 	init_completion(&rtk->iop_pwr_ack_completion);
 	init_completion(&rtk->ap_pwr_ack_completion);
 
 	bitmap_zero(rtk->endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
+	bitmap_zero(rtk->discovery_endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
 	set_bit(APPLE_RTKIT_EP_MGMT, rtk->endpoints);
 
 	if (mbox_name)
@@ -718,9 +819,10 @@ static struct apple_rtkit *__apple_rtkit_init(
 		ret = PTR_ERR(rtk->mbox);
 		goto free_rtk;
 	}
-
-	rtk->mbox->rx = apple_rtkit_rx;
-	rtk->mbox->cookie = rtk;
+	if (rtk->mbox->rx) {
+		ret = -EBUSY;
+		goto free_rtk;
+	}
 
 	rtk->wq = alloc_ordered_workqueue("rtkit-%s", WQ_HIGHPRI | WQ_MEM_RECLAIM,
 					  dev_name(rtk->dev));
@@ -728,6 +830,9 @@ static struct apple_rtkit *__apple_rtkit_init(
 		ret = -ENOMEM;
 		goto free_rtk;
 	}
+
+	rtk->mbox->cookie = rtk;
+	rtk->mbox->rx = apple_rtkit_rx;
 	if (adopted)
 		apple_rtkit_mark_running(rtk);
 
@@ -738,6 +843,8 @@ static struct apple_rtkit *__apple_rtkit_init(
 	return rtk;
 
 destroy_wq:
+	rtk->mbox->rx = NULL;
+	rtk->mbox->cookie = NULL;
 	destroy_workqueue(rtk->wq);
 free_rtk:
 	kfree(rtk);
@@ -748,7 +855,8 @@ struct apple_rtkit *apple_rtkit_init(struct device *dev, void *cookie,
 					    const char *mbox_name, int mbox_idx,
 					    const struct apple_rtkit_ops *ops)
 {
-	return __apple_rtkit_init(dev, cookie, mbox_name, mbox_idx, ops, false);
+	return __apple_rtkit_init(dev, cookie, mbox_name, mbox_idx, ops, false,
+				  false);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_init);
 
@@ -756,9 +864,19 @@ struct apple_rtkit *apple_rtkit_init_adopted(
 	struct device *dev, void *cookie, const char *mbox_name, int mbox_idx,
 	const struct apple_rtkit_ops *ops)
 {
-	return __apple_rtkit_init(dev, cookie, mbox_name, mbox_idx, ops, true);
+	return __apple_rtkit_init(dev, cookie, mbox_name, mbox_idx, ops, true,
+				  false);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_init_adopted);
+
+struct apple_rtkit *apple_rtkit_init_epmap_only(
+	struct device *dev, void *cookie, const char *mbox_name, int mbox_idx,
+	const struct apple_rtkit_ops *ops)
+{
+	return __apple_rtkit_init(dev, cookie, mbox_name, mbox_idx, ops, false,
+				  true);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_init_epmap_only);
 
 static int apple_rtkit_wait_for_completion(struct completion *c)
 {
@@ -793,6 +911,7 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk)
 	rtk->adopted = false;
 
 	bitmap_zero(rtk->endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
+	bitmap_zero(rtk->discovery_endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
 	set_bit(APPLE_RTKIT_EP_MGMT, rtk->endpoints);
 
 	reinit_completion(&rtk->epmap_completion);
@@ -800,6 +919,13 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk)
 	reinit_completion(&rtk->ap_pwr_ack_completion);
 
 	rtk->crashed = false;
+	rtk->boot_result = 0;
+	rtk->raw_hello = 0;
+	rtk->hello_min_version = 0;
+	rtk->hello_max_version = 0;
+	rtk->epmap_bases_seen = 0;
+	rtk->hello_seen = false;
+	rtk->epmap_finished = false;
 	rtk->iop_power_state = APPLE_RTKIT_PWR_STATE_OFF;
 	rtk->ap_power_state = APPLE_RTKIT_PWR_STATE_OFF;
 
@@ -812,6 +938,9 @@ static int apple_rtkit_set_ap_power_state(struct apple_rtkit *rtk,
 {
 	u64 msg;
 	int ret;
+
+	if (rtk->epmap_only)
+		return -EPERM;
 
 	reinit_completion(&rtk->ap_pwr_ack_completion);
 
@@ -836,6 +965,9 @@ static int apple_rtkit_set_iop_power_state(struct apple_rtkit *rtk,
 	u64 msg;
 	int ret;
 
+	if (rtk->epmap_only)
+		return -EPERM;
+
 	reinit_completion(&rtk->iop_pwr_ack_completion);
 
 	msg = FIELD_PREP(APPLE_RTKIT_MGMT_PWR_STATE, state);
@@ -856,6 +988,9 @@ static int apple_rtkit_set_iop_power_state(struct apple_rtkit *rtk,
 int apple_rtkit_boot(struct apple_rtkit *rtk)
 {
 	int ret;
+
+	if (rtk->epmap_only)
+		return -EOPNOTSUPP;
 
 	if (apple_rtkit_is_running(rtk))
 		return 0;
@@ -878,8 +1013,47 @@ int apple_rtkit_boot(struct apple_rtkit *rtk)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_boot);
 
+int apple_rtkit_discover_epmap(struct apple_rtkit *rtk)
+{
+	int ret;
+
+	if (!rtk->epmap_only)
+		return -EOPNOTSUPP;
+
+	ret = apple_rtkit_wait_for_completion(&rtk->epmap_completion);
+	if (ret)
+		return ret;
+
+	return rtk->boot_result;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_discover_epmap);
+
+int apple_rtkit_get_epmap_snapshot(
+	struct apple_rtkit *rtk, struct apple_rtkit_epmap_snapshot *snapshot)
+{
+	if (!rtk->epmap_only)
+		return -EOPNOTSUPP;
+	if (!snapshot)
+		return -EINVAL;
+	if (!completion_done(&rtk->epmap_completion))
+		return -EAGAIN;
+	if (rtk->boot_result)
+		return rtk->boot_result;
+
+	snapshot->raw_hello = rtk->raw_hello;
+	snapshot->hello_min_version = rtk->hello_min_version;
+	snapshot->hello_max_version = rtk->hello_max_version;
+	bitmap_to_arr64(snapshot->endpoints, rtk->discovery_endpoints,
+			APPLE_RTKIT_MAX_ENDPOINTS);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_get_epmap_snapshot);
+
 int apple_rtkit_adopt_running(struct apple_rtkit *rtk)
 {
+	if (rtk->epmap_only)
+		return -EPERM;
 	if (rtk->crashed)
 		return -EINVAL;
 
@@ -972,6 +1146,9 @@ int apple_rtkit_wake(struct apple_rtkit *rtk)
 	u64 msg;
 	int ret;
 
+	if (rtk->epmap_only)
+		return -EPERM;
+
 	if (apple_rtkit_is_running(rtk))
 		return -EINVAL;
 
@@ -993,8 +1170,19 @@ EXPORT_SYMBOL_GPL(apple_rtkit_wake);
 
 void apple_rtkit_free(struct apple_rtkit *rtk)
 {
+	/*
+	 * Let already-running callbacks finish while the transport is still
+	 * powered, but make every callback observed after this point a no-op.
+	 * Work queued by an IRQ racing the first flush is drained by
+	 * destroy_workqueue() after apple_mbox_stop() has synchronously disabled
+	 * that IRQ.
+	 */
+	WRITE_ONCE(rtk->shutting_down, true);
+	flush_workqueue(rtk->wq);
 	apple_mbox_stop(rtk->mbox);
+	rtk->mbox->rx = NULL;
 	destroy_workqueue(rtk->wq);
+	rtk->mbox->cookie = NULL;
 
 	apple_rtkit_free_buffer(rtk, &rtk->ioreport_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->crashlog_buffer);
