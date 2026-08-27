@@ -15,6 +15,8 @@
 #define MT7932_SEC_BOOT_RELEASE		0x00040260
 #define MT7932_SEC_BOOT_MODE_ENTER	0x18451807
 #define MT7932_SEC_BOOT_MODE_EXIT	0x1845184f
+#define MT7932_FW_START_READY_MIN_US	40000
+#define MT7932_FW_START_READY_MAX_US	80000
 
 static int mt7932_sec_protect_fwdl(struct mt76_dev *dev, bool get)
 {
@@ -3146,10 +3148,14 @@ static int mt7932_mcu_require_host_ready(struct mt76_dev *dev)
 struct mt7932_fw_start_watch {
 	struct delayed_work work;
 	struct pci_dev *pdev;
+	struct mt76_dev *dev;
 	ktime_t start;
 	ktime_t gone_at;
 	unsigned int polls;
 	u32 last_id;
+	u32 ready_value;
+	s64 ready_sample_us;
+	bool ready_sampled;
 	bool gone;
 };
 
@@ -3158,6 +3164,8 @@ static void mt7932_fw_start_watch_fn(struct work_struct *work)
 	struct mt7932_fw_start_watch *w = container_of(to_delayed_work(work),
 						       struct mt7932_fw_start_watch,
 						       work);
+	ktime_t now;
+	s64 elapsed_us;
 	u32 id = 0xffffffff;
 
 	if (pci_read_config_dword(w->pdev, PCI_VENDOR_ID, &id) ||
@@ -3166,6 +3174,24 @@ static void mt7932_fw_start_watch_fn(struct work_struct *work)
 		w->gone_at = ktime_get();
 		WRITE_ONCE(w->gone, true);
 		return;
+	}
+
+	now = ktime_get();
+	elapsed_us = ktime_us_delta(now, w->start);
+	/*
+	 * Run 191 completed Apple's final FW_START-to-runtime transition in less
+	 * than 16 ms, while every Linux endpoint remained alive for at least
+	 * 99 ms.  Take exactly one read in the bounded 40-80 ms safe window,
+	 * after a successful config-space identity read.  This distinguishes
+	 * "N9 started but the response path failed" from "N9 never started"
+	 * without touching the failure-time BAR that previously caused SErrors.
+	 */
+	if (!w->ready_sampled &&
+	    elapsed_us >= MT7932_FW_START_READY_MIN_US &&
+	    elapsed_us <= MT7932_FW_START_READY_MAX_US) {
+		w->ready_value = __mt76_rr(w->dev, MT_CONN_ON_MISC);
+		w->ready_sample_us = elapsed_us;
+		w->ready_sampled = true;
 	}
 
 	w->last_id = id;
@@ -3181,6 +3207,8 @@ static bool mt7932_fw_start_watch_begin(struct mt76_dev *dev,
 
 	memset(w, 0, sizeof(*w));
 	w->pdev = to_pci_dev(dev->dev);
+	w->dev = dev;
+	w->ready_value = U32_MAX;
 	w->start = ktime_get();
 	INIT_DELAYED_WORK_ONSTACK(&w->work, mt7932_fw_start_watch_fn);
 	schedule_delayed_work(&w->work, 1);
@@ -3193,6 +3221,11 @@ static void mt7932_fw_start_watch_end(struct mt76_dev *dev,
 {
 	cancel_delayed_work_sync(&w->work);
 	destroy_delayed_work_on_stack(&w->work);
+	dev_info(dev->dev,
+		 "J700_MT7932_FW_START_EARLY_READY: sampled=%u sample_us=%lld value=0x%08x n9_masked=0x%x window_us=%u-%u\n",
+		 w->ready_sampled, w->ready_sample_us, w->ready_value,
+		 w->ready_value & 0x3, MT7932_FW_START_READY_MIN_US,
+		 MT7932_FW_START_READY_MAX_US);
 
 	if (READ_ONCE(w->gone))
 		dev_err(dev->dev,
