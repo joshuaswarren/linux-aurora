@@ -26,6 +26,7 @@ mod g17_initdata;
 mod g17_lifecycle;
 mod g17_live_boot;
 mod g17_power_preflight;
+mod g17_resources;
 mod g17_rtkit;
 mod g17_submission;
 mod gem;

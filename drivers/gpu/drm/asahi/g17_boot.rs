@@ -12,7 +12,9 @@
 //! [`agx_power_recovery`] module.
 
 #[cfg(not(test))]
-use crate::{agx_power_recovery, g17_firmware, g17_initdata, g17_rtkit, g17_submission};
+use crate::{
+    agx_power_recovery, g17_firmware, g17_initdata, g17_resources, g17_rtkit, g17_submission,
+};
 #[cfg(test)]
 #[path = "agx_power_recovery.rs"]
 mod agx_power_recovery;
@@ -22,6 +24,9 @@ mod g17_firmware;
 #[cfg(test)]
 #[path = "g17_initdata.rs"]
 mod g17_initdata;
+#[cfg(test)]
+#[path = "g17_resources.rs"]
+mod g17_resources;
 #[cfg(test)]
 #[path = "g17_rtkit.rs"]
 mod g17_rtkit;
@@ -101,11 +106,18 @@ const fn implemented_pre_handoff_evidence(
     if AGX3_TOPOLOGY_REGISTERS_IMPLEMENTED {
         implemented |= missing::TOPOLOGY_REGISTERS;
     }
-    // The per-role resource-ownership contract is byte-grounded, but the
-    // firmware performs no parse-time role check (see FW-3), so Linux cannot
-    // execute the live per-role allocation/mapping from offline evidence.
+    // The old M5 role model below remains diagnostic. T8140 has its own
+    // source-backed allocator and absent-handoff UAT constructor.
     if GROUNDED_ROLE_RESOURCE_OWNERSHIP_AVAILABLE && EXECUTABLE_ROLE_RESOURCES_AVAILABLE {
         implemented |= missing::ROLE_RESOURCES;
+    }
+    if let Some(G17FirmwareVariant::G17P) = expected_variant {
+        if g17_resources::EXECUTABLE_T8140_ROLE_RESOURCES_AVAILABLE {
+            implemented |= missing::ROLE_RESOURCES;
+        }
+        if g17_resources::EXECUTABLE_T8140_SHARED_UAT_AVAILABLE {
+            implemented |= missing::UAT_HANDOFF;
+        }
     }
     if g17_initdata::GROUNDED_LAYOUT_AVAILABLE && g17_initdata::PARSE_ACCEPTED_GRAPH_AVAILABLE {
         implemented |= missing::INITDATA_GRAPH;
@@ -143,6 +155,16 @@ const fn implemented_pre_handoff_evidence(
 /// an error to `ENODEV` before MMIO initialization or firmware CPU startup.
 pub(crate) const fn pre_handoff_gate(gpu_generation: u32) -> Result<(), MissingEvidence> {
     apply_pre_handoff_gate(gpu_generation, None, None)
+}
+
+/// Apply target-specific implementation evidence without claiming firmware
+/// identity. T8140 uses this path because iBoot loads its G17P role images.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const fn pre_handoff_gate_for_variant(
+    gpu_generation: u32,
+    expected_variant: G17FirmwareVariant,
+) -> Result<(), MissingEvidence> {
+    apply_pre_handoff_gate(gpu_generation, Some(expected_variant), None)
 }
 
 /// Apply the pre-handoff gate with an optional byte-validated role pair.
@@ -1768,6 +1790,27 @@ mod tests {
             gfx1_runtime_resource: 0x2000,
         })
         .is_ok());
+    }
+
+    #[test]
+    fn t8140_target_clears_only_shared_uat_and_role_resources() {
+        let default = pre_handoff_gate(17).unwrap_err();
+        let t8140 = pre_handoff_gate_for_variant(17, G17FirmwareVariant::G17P).unwrap_err();
+
+        assert!(default.contains(missing::ROLE_RESOURCES));
+        assert!(default.contains(missing::UAT_HANDOFF));
+        assert!(!t8140.contains(missing::ROLE_RESOURCES));
+        assert!(!t8140.contains(missing::UAT_HANDOFF));
+        assert_eq!(
+            t8140.bits(),
+            default.bits() & !(missing::ROLE_RESOURCES | missing::UAT_HANDOFF)
+        );
+        assert!(t8140.contains(missing::FIRMWARE_IDENTITY));
+        assert!(t8140.contains(missing::GFX1_POWER_SEQUENCE));
+        assert!(t8140.contains(missing::RECOVERY_HANDSHAKE));
+        assert!(t8140.contains(missing::SUBMISSION_TRANSPORT));
+        assert!(g17_resources::EXECUTABLE_T8140_SHARED_UAT_AVAILABLE);
+        assert!(g17_resources::EXECUTABLE_T8140_ROLE_RESOURCES_AVAILABLE);
     }
 
     #[test]
