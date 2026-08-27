@@ -34,8 +34,8 @@
 //!                  `magic_fw == PPL_MAGIC` with a bounded timeout. *Not yet
 //!                  wired: depends on full UAT setup.*
 //! 7. `Initdata`  — DMA-upload the grounded init-data graph
-//!                  ([`g17_initdata::encode_grounded_subset`]). *Not yet
-//!                  wired.*
+//!                  ([`g17_initdata::encode_root`] and the object
+//!                  encoders beside it). *Not yet wired.*
 //! 8. `ChannelsDoorbell` — publish channel rings and ring the EP 0x21 doorbell
 //!                  ([`g17_submission`]). *Not yet wired.*
 //!
@@ -177,7 +177,7 @@ pub(crate) fn attempt(
     // Source the grounded perf-state clock column from the device tree now, so
     // a hardware run confirms the OPP table is present before the ASC starts.
     // The init-data stage (not yet wired) will feed these to
-    // `g17_initdata::encode_grounded_subset`.
+    // `g17_initdata::encode_root` and the object encoders beside it.
     match read_perf_state_clocks_mhz(pdev) {
         Ok(clocks) => {
             let lo = clocks.first().copied().unwrap_or(0);
