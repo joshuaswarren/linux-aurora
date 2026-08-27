@@ -137,25 +137,7 @@ enum dcp_iomfb_method_profile {
 
 struct apple_dcp_hw_data {
 	u32 num_dptx_ports;
-	enum dcp_iomfb_method_profile iomfb_method_profile;
-	bool adopt_running_coprocessor;
-	/*
-	 * Attach to an existing RTKit session instead of restarting it.  This
-	 * uses explicit START_EP messages for the selected DCP services when
-	 * the bootloader already consumed endpoint discovery.
-	 */
-	bool adopt_live_session;
-	enum dcp_firmware_version firmware_compat;
-	/* T8140's legacy DT omits the native H17 PMC window. */
-	bool legacy_pmc_binding;
-};
-
-#define DCP_CALLBACK_TRACE_COUNT 16
-struct dcp_callback_trace {
-	char tag[4];
-	u32 in_len;
-	u32 out_len;
-	u8 input[16];
+	bool reject_running_coprocessor;
 };
 
 /* TODO: move IOMFB members to its own struct */

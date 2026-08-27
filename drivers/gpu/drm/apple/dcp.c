@@ -47,7 +47,6 @@
 
 #define APPLE_DCP_COPROC_CPU_CONTROL	 0x44
 #define APPLE_DCP_COPROC_CPU_STATUS	 0x48
-#define APPLE_DCP_RTKIT_HANDOFF_PROPERTY "apple,dcp-rtkit-quiesced"
 
 #define DCP_BOOT_TIMEOUT msecs_to_jiffies(1000)
 
@@ -1327,10 +1326,7 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 {
 	struct device_node *panel_np;
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
-	enum apple_dcp_coprocessor_start start_mode;
 	u32 cpu_ctrl, cpu_status;
-	u32 handoff_state;
-	bool loader_quiesced;
 	int ret;
 
 	/*
@@ -1374,22 +1370,22 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	if (IS_ERR(dcp->coproc_reg))
 		return PTR_ERR(dcp->coproc_reg);
 
-	cpu_ctrl = readl_relaxed(dcp->coproc_reg +
-				 APPLE_DCP_COPROC_CPU_CONTROL);
-	cpu_status = readl_relaxed(dcp->coproc_reg +
-				   APPLE_DCP_COPROC_CPU_STATUS);
-	loader_quiesced = of_chosen &&
-		!of_property_read_u32(of_chosen,
-				      APPLE_DCP_RTKIT_HANDOFF_PROPERTY,
-				      &handoff_state) &&
-		handoff_state == 1;
-	start_mode = apple_dcp_coprocessor_start_mode(
-		loader_quiesced, dcp->hw.adopt_running_coprocessor,
-		cpu_ctrl, cpu_status);
-	if (dcp->hw.adopt_live_session &&
-	    (loader_quiesced || !(cpu_ctrl & APPLE_DCP_COPROC_CPU_CONTROL_RUN)))
-		return dev_err_probe(dev, -EOPNOTSUPP,
-				     "This DCP requires a live inherited session\n");
+	/*
+	 * ASCWrap v6 can be handed to Linux with a live firmware-owned RTKit
+	 * session.  The cold-start path below has no protocol for adopting its
+	 * endpoint map or IOMFB shared memory, so touching PIODMA/DART state or
+	 * sending a new RTKit INIT would corrupt the inherited display session.
+	 */
+	if (dcp->hw.reject_running_coprocessor) {
+		cpu_ctrl = readl_relaxed(dcp->coproc_reg +
+					 APPLE_DCP_COPROC_CPU_CONTROL);
+		cpu_status = readl_relaxed(dcp->coproc_reg +
+					   APPLE_DCP_COPROC_CPU_STATUS);
+		if (apple_dcp_coprocessor_is_active(cpu_ctrl, cpu_status))
+			return dev_err_probe(dev, -EBUSY,
+				"refusing cold start of running firmware-owned DCP (control=%#x status=%#x)\n",
+				cpu_ctrl, cpu_status);
+	}
 
 	of_property_read_u32(dev->of_node, "apple,dcp-index",
 					   &dcp->index);
@@ -1873,25 +1869,7 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t8112 = {
 
 static const struct apple_dcp_hw_data apple_dcp_hw_t8140 = {
 	.num_dptx_ports = 0,
-	.adopt_running_coprocessor = true,
-	.firmware_compat = DCP_FIRMWARE_H17P,
-	.legacy_pmc_binding = true,
-	/*
-	 * Keep adopt_live_session disabled until apple-rtkit can recover the
-	 * loader's endpoint map.  An adopted instance without that map cannot
-	 * start DCP services.
-	 */
-};
-
-/* M5 bring-up uses the shared H17 parser with a live firmware generation.
- * The wire format remains subject to validation on the target.
- */
-static const struct apple_dcp_hw_data apple_dcp_hw_t8142 = {
-	.num_dptx_ports = 0,
-	.iomfb_method_profile = DCP_IOMFB_METHODS_H17G,
-	.adopt_running_coprocessor = true,
-	.adopt_live_session = true,
-	.firmware_compat = DCP_FIRMWARE_H17P,
+	.reject_running_coprocessor = true,
 };
 
 static const struct apple_dcp_hw_data apple_dcp_hw_dcp = {
@@ -1906,7 +1884,6 @@ static const struct of_device_id of_match[] = {
 	{ .compatible = "apple,t6020-dcp", .data = &apple_dcp_hw_t6020,  },
 	{ .compatible = "apple,t8112-dcp", .data = &apple_dcp_hw_t8112,  },
 	{ .compatible = "apple,t8140-dcp", .data = &apple_dcp_hw_t8140,  },
-	{ .compatible = "apple,t8142-dcp", .data = &apple_dcp_hw_t8142,  },
 	{ .compatible = "apple,dcp",       .data = &apple_dcp_hw_dcp,    },
 	{ .compatible = "apple,dcpext",    .data = &apple_dcp_hw_dcpext, },
 	{}
