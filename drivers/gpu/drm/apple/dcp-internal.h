@@ -111,6 +111,7 @@ struct dcp_panel {
 
 struct apple_dcp_hw_data {
 	u32 num_dptx_ports;
+	bool reject_running_coprocessor;
 };
 
 /* TODO: move IOMFB members to its own struct */
