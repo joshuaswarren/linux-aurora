@@ -50,13 +50,20 @@ pub(crate) const APPLE_RTKIT_CORE_ACCEPTS_G17: bool = INTERFACE_VERSION
     >= APPLE_RTKIT_CORE_MIN_VERSION
     && INTERFACE_VERSION <= APPLE_RTKIT_CORE_MAX_VERSION;
 
-/// The complete endpoint set in both recovered G17 firmware roles.
+/// The host-served endpoint set in both recovered G17 firmware roles.
 pub(crate) const EXPECTED_ENDPOINTS: [u8; 4] = [0x00, 0x01, 0x20, 0x21];
 
 pub(crate) const ENDPOINT_MANAGEMENT: u8 = 0x00;
 pub(crate) const ENDPOINT_CRASHLOG: u8 = 0x01;
 pub(crate) const ENDPOINT_GFX_MESSAGES: u8 = 0x20;
 pub(crate) const ENDPOINT_GFX_INTERRUPTS: u8 = 0x21;
+/// Firmware-to-firmware control endpoint observed on T8140 (both instances).
+///
+/// It may legitimately appear in an instance's endpoint map, but it carries
+/// peer traffic between the two firmware instances: the host must **never**
+/// start it, ack it, or serve messages on it. It is permitted-but-unserved in
+/// [`validate_endpoint_set`].
+pub(crate) const ENDPOINT_FIRMWARE_PEER: u8 = 0x23;
 
 const MANAGEMENT_TYPE_SHIFT: u32 = 52;
 const MANAGEMENT_TYPE_MASK: u8 = 0x0f;
@@ -113,19 +120,36 @@ pub(crate) const fn endpoint_is_present(endpoint: u8) -> bool {
         || endpoint == ENDPOINT_CRASHLOG
         || endpoint == ENDPOINT_GFX_MESSAGES
         || endpoint == ENDPOINT_GFX_INTERRUPTS
+        || endpoint == ENDPOINT_FIRMWARE_PEER
 }
 
-/// Require the discovered set to be exactly `{0x00, 0x01, 0x20, 0x21}`.
-///
-/// Ordering is irrelevant; duplicates and internal device records 0x22/0x23
-/// are rejected.
-pub(crate) fn validate_endpoint_set(endpoints: &[u8]) -> Result<(), WireError> {
-    if endpoints.len() != EXPECTED_ENDPOINTS.len() {
-        return Err(WireError::UnexpectedEndpointSet);
-    }
+/// Return whether the host may start/serve an endpoint. EP 0x23 exists but is
+/// firmware-to-firmware only.
+pub(crate) const fn endpoint_is_host_served(endpoint: u8) -> bool {
+    endpoint == ENDPOINT_MANAGEMENT
+        || endpoint == ENDPOINT_CRASHLOG
+        || endpoint == ENDPOINT_GFX_MESSAGES
+        || endpoint == ENDPOINT_GFX_INTERRUPTS
+}
 
+/// Require every host-served endpoint `{0x00, 0x01, 0x20, 0x21}` to be
+/// present exactly once.
+///
+/// Ordering is irrelevant; duplicates and unknown endpoints (e.g. 0x22) are
+/// rejected. The firmware-to-firmware endpoint 0x23 is *permitted* in the map
+/// (T8140 advertises it) but confers nothing: the host must never start or
+/// serve it ([`ENDPOINT_FIRMWARE_PEER`]).
+pub(crate) fn validate_endpoint_set(endpoints: &[u8]) -> Result<(), WireError> {
     let mut seen = 0u8;
+    let mut peer_seen = false;
     for endpoint in endpoints {
+        if *endpoint == ENDPOINT_FIRMWARE_PEER {
+            if peer_seen {
+                return Err(WireError::UnexpectedEndpointSet);
+            }
+            peer_seen = true;
+            continue;
+        }
         let Some(index) = EXPECTED_ENDPOINTS
             .iter()
             .position(|expected| expected == endpoint)
@@ -277,6 +301,35 @@ mod tests {
             validate_endpoint_set(&[0x00, 0x00, 0x20, 0x21]),
             Err(WireError::UnexpectedEndpointSet)
         );
+    }
+
+    #[test]
+    fn firmware_peer_endpoint_is_permitted_but_never_host_served() {
+        // T8140 advertises the firmware-to-firmware endpoint 0x23; a map
+        // that includes it is valid...
+        assert!(endpoint_is_present(ENDPOINT_FIRMWARE_PEER));
+        assert_eq!(
+            validate_endpoint_set(&[0x00, 0x01, 0x20, 0x21, 0x23]),
+            Ok(())
+        );
+        assert_eq!(
+            validate_endpoint_set(&[0x23, 0x21, 0x00, 0x20, 0x01]),
+            Ok(())
+        );
+        // ...but it substitutes for nothing and must appear at most once.
+        assert_eq!(
+            validate_endpoint_set(&[0x00, 0x01, 0x20, 0x23]),
+            Err(WireError::UnexpectedEndpointSet)
+        );
+        assert_eq!(
+            validate_endpoint_set(&[0x00, 0x01, 0x20, 0x21, 0x23, 0x23]),
+            Err(WireError::UnexpectedEndpointSet)
+        );
+        // The host must never start or serve it.
+        assert!(!endpoint_is_host_served(ENDPOINT_FIRMWARE_PEER));
+        for served in EXPECTED_ENDPOINTS {
+            assert!(endpoint_is_host_served(served));
+        }
     }
 
     #[test]

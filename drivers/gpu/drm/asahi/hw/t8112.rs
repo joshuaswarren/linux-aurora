@@ -10,7 +10,7 @@ pub(crate) const HWCONFIG: super::HwConfig = HwConfig {
     chip_id: 0x8112,
     gpu_gen: GpuGen::G14,
     gpu_variant: GpuVariant::G,
-    gpu_core: GpuCore::G14G,
+    gpu_core: Some(GpuCore::G14G),
 
     base_clock_hz: 24_000_000,
     uat_oas: 40,

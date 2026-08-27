@@ -62,14 +62,17 @@ struct Vm {
     ualloc_priv: Arc<Mutex<alloc::DefaultAllocator>>,
     vm: mmu::Vm,
     kernel_range: Range<u64>,
+    /// The usable user VA range for this device's UAT geometry
+    /// (`mmu::iova_user_usable_range`), captured at creation.
+    user_range: Range<u64>,
     _dummy_mapping: mmu::KernelMapping,
 }
 
 impl Drop for Vm {
     fn drop(&mut self) {
         // When the user Vm is dropped, unmap everything in the user range
-        let left_range = VM_USER_RANGE.start..self.kernel_range.start;
-        let right_range = self.kernel_range.end..VM_USER_RANGE.end;
+        let left_range = self.user_range.start..self.kernel_range.start;
+        let right_range = self.kernel_range.end..self.user_range.end;
 
         if !left_range.is_empty()
             && self
@@ -212,8 +215,8 @@ pub(crate) struct File {
 /// Convenience type alias for our DRM `File` type.
 pub(crate) type DrmFile = drm::File<File>;
 
-/// Available VM range for the user
-const VM_USER_RANGE: Range<u64> = mmu::IOVA_USER_USABLE_RANGE;
+// The user VM range is per-device geometry (39-bit on AGX2, 42-bit on AGX3);
+// use `mmu::iova_user_usable_range(gpu.get_cfg())` wherever it is needed.
 
 /// Minimum reserved AS for kernel mappings
 const VM_KERNEL_MIN_SIZE: u64 = 0x20000000;
@@ -315,8 +318,8 @@ impl File {
             num_cores_per_cluster: gpu.get_dyncfg().id.num_cores,
             core_masks: [0; uapi::DRM_ASAHI_MAX_CLUSTERS as usize],
 
-            vm_start: VM_USER_RANGE.start,
-            vm_end: VM_USER_RANGE.end,
+            vm_start: mmu::iova_user_usable_range(gpu.get_cfg())?.start,
+            vm_end: mmu::iova_user_usable_range(gpu.get_cfg())?.end,
             vm_kernel_min_size: VM_KERNEL_MIN_SIZE,
 
             max_commands_per_submission: MAX_COMMANDS_PER_SUBMISSION,
@@ -358,9 +361,10 @@ impl File {
         file: &DrmFile,
     ) -> Result<u32> {
         let kernel_range = data.kernel_start..data.kernel_end;
+        let user_range = mmu::iova_user_usable_range(device.gpu.get_cfg())?;
 
         // Validate requested kernel range
-        if !VM_USER_RANGE.is_superset(kernel_range.clone())
+        if !user_range.is_superset(kernel_range.clone())
             || kernel_range.range() < VM_KERNEL_MIN_SIZE
             || kernel_range.start & (mmu::UAT_PGMSK as u64) != 0
             || kernel_range.end & (mmu::UAT_PGMSK as u64) != 0
@@ -429,8 +433,12 @@ impl File {
         );
         let mut dummy_obj = gem::new_kernel_object(device, 0x4000)?;
         dummy_obj.vmap()?.memset(0);
-        let dummy_mapping =
-            dummy_obj.map_at(&vm, mmu::IOVA_UNK_PAGE, mmu::PROT_GPU_SHARED_RW, true)?;
+        let dummy_mapping = dummy_obj.map_at(
+            &vm,
+            mmu::iova_unk_page(device.gpu.get_cfg())?,
+            mmu::PROT_GPU_SHARED_RW,
+            true,
+        )?;
 
         mod_dev_dbg!(device, "[File {} VM {}]: VM created\n", file_id, id);
         resv.fill(KBox::new(
@@ -439,6 +447,7 @@ impl File {
                 ualloc_priv,
                 vm,
                 kernel_range,
+                user_range,
                 _dummy_mapping: dummy_mapping,
             },
             GFP_KERNEL,
@@ -630,15 +639,8 @@ impl File {
             return Err(EINVAL);
         }
 
-        if !VM_USER_RANGE.is_superset(range.clone()) {
-            cls_pr_debug!(
-                Errors,
-                "gem_bind: Invalid map range {:#x}..{:#x} (not contained in user range)\n",
-                start,
-                end
-            );
-            return Err(EINVAL); // Invalid map range
-        }
+        // The user range is per-device geometry, so this check moves below
+        // the VM lookup (which is where the range is stored).
 
         let prot = if data.flags & uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_READ != 0 {
             if data.flags & uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_WRITE != 0 {
@@ -664,8 +666,19 @@ impl File {
         // Clone it immediately so we aren't holding the XArray lock
         let vm = guarded_vm.vm.clone();
         let kernel_range = guarded_vm.kernel_range.clone();
+        let user_range = guarded_vm.user_range.clone();
         let _ = guarded_vm;
         core::mem::drop(guard);
+
+        if !user_range.is_superset(range.clone()) {
+            cls_pr_debug!(
+                Errors,
+                "gem_bind: Invalid map range {:#x}..{:#x} (not contained in user range)\n",
+                start,
+                end
+            );
+            return Err(EINVAL); // Invalid map range
+        }
 
         if kernel_range.overlaps(range) {
             cls_pr_debug!(
@@ -711,7 +724,18 @@ impl File {
         let end = data.addr.checked_add(data.range).ok_or(EINVAL)?;
         let range = start..end;
 
-        if !VM_USER_RANGE.is_superset(range.clone()) {
+        let vms_xa = file.inner().vms();
+        let guard = vms_xa.lock();
+        let guarded_vm = guard.get(vm_id).ok_or(ENOENT)?;
+
+        // Clone it immediately so we aren't holding the XArray lock
+        let vm = guarded_vm.vm.clone();
+        let kernel_range = guarded_vm.kernel_range.clone();
+        let user_range = guarded_vm.user_range.clone();
+        let _ = guarded_vm;
+        core::mem::drop(guard);
+
+        if !user_range.is_superset(range.clone()) {
             cls_pr_debug!(
                 Errors,
                 "gem_bind: Invalid unmap range {:#x}..{:#x} (not contained in user range)\n",
@@ -720,16 +744,6 @@ impl File {
             );
             return Err(EINVAL); // Invalid map range
         }
-
-        let vms_xa = file.inner().vms();
-        let guard = vms_xa.lock();
-        let guarded_vm = guard.get(vm_id).ok_or(ENOENT)?;
-
-        // Clone it immediately so we aren't holding the XArray lock
-        let vm = guarded_vm.vm.clone();
-        let kernel_range = guarded_vm.kernel_range.clone();
-        let _ = guarded_vm;
-        core::mem::drop(guard);
 
         if kernel_range.overlaps(range.clone()) {
             cls_pr_debug!(

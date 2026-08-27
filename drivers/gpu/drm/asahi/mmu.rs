@@ -97,11 +97,10 @@ const UAT_USER_CTX: usize = UAT_NUM_CTX - UAT_USER_CTX_START;
 
 /// Lower/user base VA
 pub(crate) const IOVA_USER_BASE: u64 = UAT_PGSZ as u64;
-/// Lower/user top VA. The exposed user ABI remains at 39 bits until the
-/// generation-specific 42-bit PTE/update policies are implemented.
+/// Lower/user top VA for the 39-bit (AGX2) roots. Geometry-aware paths must
+/// use [`iova_user_range`]/[`iova_user_usable_range`] instead; this const
+/// remains for the AGX2 initdata builder, which is 39-bit-only.
 pub(crate) const IOVA_USER_TOP: u64 = 1 << 39;
-/// Lower/user VA range
-pub(crate) const IOVA_USER_RANGE: Range<u64> = IOVA_USER_BASE..IOVA_USER_TOP;
 
 /// Whether the firmware-shared MMU state (Handoff/FlushInfo layout, TTBAT
 /// publication, kernel-half window placement) has been validated against an
@@ -121,15 +120,59 @@ pub(crate) const IOVA_USER_RANGE: Range<u64> = IOVA_USER_BASE..IOVA_USER_TOP;
 /// firmware writes `magic_fw == PPL_MAGIC`, so a correct layout can only ever
 /// be *confirmed* by a live boot ACK. This is therefore the one gate that
 /// stays fail-closed by design: it is exactly the "needs a live firmware ACK"
-/// boundary. [`Uat::new`] fails closed on it for 42-bit parts. Flip it only
-/// once a live G15+/G17 boot completes the PPL handshake.
+/// boundary. [`Uat::new`] fails closed on it for 42-bit parts *in Dekker
+/// mode*. Flip it only once a live G15+/G17 boot completes the PPL handshake.
+///
+/// T8140 (A18 Pro / G17P) is different and is handled by
+/// [`HandoffMode::AbsentStandinT8140`], not by this flag: live J700 runs that
+/// booted both firmware instances confirmed the firmware **never publishes
+/// its half of the PPL magic on this part** — a `magic_fw` waiter hangs
+/// forever. The correct behavior there is an absent-handoff stand-in (no
+/// magic wait, no Dekker peer, no flush handshake ACK expectation), which is
+/// what that mode implements.
 const AGX3_FIRMWARE_HANDOFF_VALIDATED: bool = false;
+
+/// How the firmware-shared UAT handoff region behaves for the target SoC.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum HandoffMode {
+    /// The AGX2-proven protocol: firmware publishes `magic_fw`, participates
+    /// in the Dekker lock, and ACKs flush requests (state 1 -> 2).
+    FirmwareDekker,
+    /// T8140-verified stand-in: the firmware never participates in the
+    /// handoff region. The AP publishes its own half and clears the flush
+    /// slots, but never waits for `magic_fw` (hardware fact: it never
+    /// arrives; a waiter hangs forever) and never expects a flush ACK.
+    /// Only valid on T8140, where this was observed on live hardware.
+    ///
+    /// Constructed by the (not-yet-wired) T8140 device path; kept ready so
+    /// `Uat::new_with_handoff_mode` already fails closed / behaves correctly
+    /// for it.
+    #[allow(dead_code)]
+    AbsentStandinT8140,
+}
 
 /// Return the evidence-backed UAT root geometry for this SoC.
 fn uat_geometry(cfg: &hw::HwConfig) -> Result<UatGeometry> {
     // 39-bit (G13/G14) and 42-bit (G15+) roots are the two recovered
     // geometries; anything else is undefined.
     UatGeometry::new(cfg.uat_ias).ok_or(ENODEV)
+}
+
+/// Lower/user VA range for this SoC's root geometry (one page up to the
+/// per-root translation top: `1 << 39` on AGX2, `1 << 42` on AGX3).
+pub(crate) fn iova_user_range(cfg: &hw::HwConfig) -> Result<Range<u64>> {
+    Ok(IOVA_USER_BASE..uat_geometry(cfg)?.user_va_top())
+}
+
+/// The unknown-page VA for this SoC's root geometry (two pages below the
+/// user top, reproducing the AGX2-proven placement under either root width).
+pub(crate) fn iova_unk_page(cfg: &hw::HwConfig) -> Result<u64> {
+    Ok(uat_geometry(cfg)?.user_va_top() - 2 * UAT_PGSZ as u64)
+}
+
+/// Usable lower/user VA range for this SoC (excludes the unknown page).
+pub(crate) fn iova_user_usable_range(cfg: &hw::HwConfig) -> Result<Range<u64>> {
+    Ok(IOVA_USER_BASE..iova_unk_page(cfg)?)
 }
 
 /// Driver-managed kernel VA range within the upper root for this SoC.
@@ -148,8 +191,6 @@ const TTBR_ASID_SHIFT: usize = 48;
 /// Address of a special dummy page?
 //const IOVA_UNK_PAGE: u64 = 0x6f_ffff8000;
 pub(crate) const IOVA_UNK_PAGE: u64 = IOVA_USER_TOP - 2 * UAT_PGSZ as u64;
-/// User VA range excluding the unk page
-pub(crate) const IOVA_USER_USABLE_RANGE: Range<u64> = IOVA_USER_BASE..IOVA_UNK_PAGE;
 
 /// A pre-allocated memory region for UAT management
 struct UatRegion {
@@ -954,34 +995,42 @@ impl Handoff {
         }
     }
 
-    /// Initialize the handoff region
-    fn init(&self) -> Result {
+    /// Initialize the handoff region.
+    ///
+    /// In [`HandoffMode::FirmwareDekker`] this blocks (bounded) until the
+    /// firmware publishes `magic_fw`. In
+    /// [`HandoffMode::AbsentStandinT8140`] it must not: on T8140 the
+    /// firmware never writes its half (hardware-verified), so the AP
+    /// publishes its own state and proceeds without a peer.
+    fn init(&self, mode: HandoffMode) -> Result {
         self.magic_ap.store(PPL_MAGIC, Ordering::Relaxed);
         self.cur_slot.store(0, Ordering::Relaxed);
         self.unk3.store(0, Ordering::Relaxed);
         fence(Ordering::SeqCst);
 
-        let start = Instant::<Monotonic>::now();
-        const TIMEOUT: Delta = Delta::from_millis(1000);
+        if mode == HandoffMode::FirmwareDekker {
+            let start = Instant::<Monotonic>::now();
+            const TIMEOUT: Delta = Delta::from_millis(1000);
 
-        self.lock();
-        while start.elapsed() < TIMEOUT {
-            if self.magic_fw.load(Ordering::Relaxed) == PPL_MAGIC {
-                break;
-            } else {
-                self.unlock();
-                fsleep(Delta::from_millis(10));
-                self.lock();
+            self.lock();
+            while start.elapsed() < TIMEOUT {
+                if self.magic_fw.load(Ordering::Relaxed) == PPL_MAGIC {
+                    break;
+                } else {
+                    self.unlock();
+                    fsleep(Delta::from_millis(10));
+                    self.lock();
+                }
             }
-        }
 
-        if self.magic_fw.load(Ordering::Relaxed) != PPL_MAGIC {
+            if self.magic_fw.load(Ordering::Relaxed) != PPL_MAGIC {
+                self.unlock();
+                pr_err!("Handoff: Failed to initialize (firmware not running?)\n");
+                return Err(EIO);
+            }
+
             self.unlock();
-            pr_err!("Handoff: Failed to initialize (firmware not running?)\n");
-            return Err(EIO);
         }
-
-        self.unlock();
 
         for i in 0..=UAT_NUM_CTX {
             self.flush[i].state.store(0, Ordering::Relaxed);
@@ -997,7 +1046,7 @@ impl Handoff {
 ///
 /// # Invariants
 /// The pointer is valid and there is no aliasing HandoffFlush instance.
-struct HandoffFlush(*const FlushInfo);
+struct HandoffFlush(*const FlushInfo, HandoffMode);
 
 // SAFETY: These pointers are safe to send across threads.
 unsafe impl Send for HandoffFlush {}
@@ -1022,8 +1071,19 @@ impl HandoffFlush {
         // SAFETY: Per the type invariant, this is safe
         let flush = unsafe { self.0.as_ref().unwrap() };
         let state = flush.state.load(Ordering::Relaxed);
-        if state != 2 {
-            pr_err!("Handoff: expected flush state 2, got {}\n", state);
+        // In Dekker mode the firmware ACKs a consumed flush by moving the
+        // state to 2. In the T8140 absent-handoff stand-in nothing consumes
+        // it, so the state legitimately remains where begin_flush left it.
+        let expected = match self.1 {
+            HandoffMode::FirmwareDekker => 2,
+            HandoffMode::AbsentStandinT8140 => 1,
+        };
+        if state != expected {
+            pr_err!(
+                "Handoff: expected flush state {}, got {}\n",
+                expected,
+                state
+            );
         }
         flush.state.store(0, Ordering::Relaxed);
     }
@@ -1052,7 +1112,10 @@ impl Vm {
         let (va_range, gpuvm_range) = if is_kernel {
             (iova_kern_range, kernel_range.clone())
         } else {
-            (IOVA_USER_RANGE, IOVA_USER_USABLE_RANGE)
+            // Geometry-derived: 39-bit parts reproduce the AGX2-proven
+            // user/usable ranges byte-for-byte; 42-bit parts extend the
+            // user half to the full per-root width.
+            (iova_user_range(cfg)?, iova_user_usable_range(cfg)?)
         };
 
         let mm = mm::Allocator::new(va_range.start, va_range.range(), ())?;
@@ -1568,7 +1631,7 @@ impl Uat {
 
     /// Creates the reference-counted inner data for a new `Uat` instance.
     #[inline(never)]
-    fn make_inner(dev: &driver::AsahiDevice) -> Result<Arc<UatInner>> {
+    fn make_inner(dev: &driver::AsahiDevice, handoff_mode: HandoffMode) -> Result<Arc<UatInner>> {
         let handoff_rgn = Self::map_region(dev.as_ref(), c_str!("handoff"), HANDOFF_SIZE, true)?;
         let ttbs_rgn = Self::map_region(dev.as_ref(), c_str!("ttbs"), SLOTS_SIZE, true)?;
 
@@ -1581,7 +1644,7 @@ impl Uat {
         Arc::pin_init(
             try_pin_init!(UatInner {
                 handoff_flush <- pin_init::pin_init_array_from_fn(|i| {
-                    new_mutex!(HandoffFlush(&handoff.flush[i]), "handoff_flush")
+                    new_mutex!(HandoffFlush(&handoff.flush[i], handoff_mode), "handoff_flush")
                 }),
                 shared <- new_mutex!(
                     UatShared {
@@ -1597,34 +1660,69 @@ impl Uat {
         )
     }
 
-    /// Creates a new `Uat` instance given the relevant hardware config.
+    /// Creates a new `Uat` instance given the relevant hardware config, using
+    /// the AGX2-proven firmware Dekker handoff protocol.
     #[inline(never)]
     pub(crate) fn new(
         dev: &driver::AsahiDevice,
         cfg: &'static hw::HwConfig,
         map_kernel_to_user: bool,
     ) -> Result<Self> {
+        Self::new_with_handoff_mode(dev, cfg, map_kernel_to_user, HandoffMode::FirmwareDekker)
+    }
+
+    /// Creates a new `Uat` instance with an explicit handoff mode.
+    ///
+    /// The mode is evidence-gated: `FirmwareDekker` on a 42-bit part remains
+    /// fail-closed behind [`AGX3_FIRMWARE_HANDOFF_VALIDATED`] (the PPL layout
+    /// needs a live firmware ACK that no AGX3 boot has produced), and
+    /// `AbsentStandinT8140` is accepted only on T8140 itself, where "the
+    /// firmware never publishes its handoff half" is a live-hardware fact.
+    #[inline(never)]
+    pub(crate) fn new_with_handoff_mode(
+        dev: &driver::AsahiDevice,
+        cfg: &'static hw::HwConfig,
+        map_kernel_to_user: bool,
+        handoff_mode: HandoffMode,
+    ) -> Result<Self> {
         dev_info!(dev.as_ref(), "MMU: Initializing...\n");
 
         // Validate the geometry first: 39- and 42-bit roots are the two
         // recovered layouts, and the page-table walk, kernel-half VA window,
         // and leaf PTE policy are implemented for both (the AGX3 leaf PTE
-        // encoder is byte-identical to AGX2). What is *not* validated for
-        // AGX3 is the firmware-shared state this constructor touches next:
-        // the Handoff/FlushInfo struct layout and the firmware's view of the
-        // kernel-half window are per-firmware-build ABI observed only on
-        // AGX2. Fail closed on exactly that boundary.
+        // encoder is byte-identical to AGX2). What must remain fail-closed
+        // per mode is the firmware-shared state this constructor touches
+        // next: the Handoff/FlushInfo protocol is per-firmware-build ABI
+        // observed on AGX2 (Dekker) and, separately, observed *absent* on
+        // T8140.
         let kernel_range = iova_kern_range(cfg)?;
-        if cfg.uat_ias != 39 && !AGX3_FIRMWARE_HANDOFF_VALIDATED {
-            dev_err!(
-                dev.as_ref(),
-                "MMU: {}-bit UAT geometry is implemented, but the AGX3 firmware Handoff ABI and kernel-VA map are unvalidated\n",
-                cfg.uat_ias
-            );
-            return Err(ENODEV);
+        match handoff_mode {
+            HandoffMode::FirmwareDekker => {
+                if cfg.uat_ias != 39 && !AGX3_FIRMWARE_HANDOFF_VALIDATED {
+                    dev_err!(
+                        dev.as_ref(),
+                        "MMU: {}-bit UAT geometry is implemented, but the AGX3 firmware Handoff ABI and kernel-VA map are unvalidated\n",
+                        cfg.uat_ias
+                    );
+                    return Err(ENODEV);
+                }
+            }
+            HandoffMode::AbsentStandinT8140 => {
+                // Hardware-verified on T8140 only. Never assume any other
+                // part ignores the handoff region.
+                if cfg.chip_id != 0x8140 || cfg.uat_ias != 42 {
+                    dev_err!(
+                        dev.as_ref(),
+                        "MMU: absent-handoff stand-in is T8140-only evidence (chip {:#x}, {}-bit)\n",
+                        cfg.chip_id,
+                        cfg.uat_ias
+                    );
+                    return Err(ENODEV);
+                }
+            }
         }
 
-        let inner = Self::make_inner(dev)?;
+        let inner = Self::make_inner(dev, handoff_mode)?;
 
         let of_node = dev.as_ref().of_node().ok_or(EINVAL)?;
         let res = of_node.reserved_mem_region_to_resource_byname(c_str!("pagetables"))?;
@@ -1637,7 +1735,7 @@ impl Uat {
         }
 
         dev_info!(dev.as_ref(), "MMU: Creating kernel page tables\n");
-        let kernel_lower_vm = Vm::new(dev, inner.clone(), IOVA_USER_RANGE, cfg, None, 1)?;
+        let kernel_lower_vm = Vm::new(dev, inner.clone(), iova_user_range(cfg)?, cfg, None, 1)?;
         let kernel_vm = Vm::new(dev, inner.clone(), kernel_range, cfg, Some(ttb1), 0)?;
 
         dev_info!(dev.as_ref(), "MMU: Kernel page tables created\n");
@@ -1665,7 +1763,7 @@ impl Uat {
         inner.map_kernel_to_user = map_kernel_to_user;
         inner.kernel_ttb1 = ttb1;
 
-        inner.handoff().init()?;
+        inner.handoff().init(handoff_mode)?;
 
         dev_info!(dev.as_ref(), "MMU: Initializing TTBs\n");
 

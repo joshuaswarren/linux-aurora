@@ -21,6 +21,7 @@ use kernel::{
 };
 
 use crate::{
+    agx_power_recovery,
     debug,
     file,
     g15_boot,
@@ -421,23 +422,106 @@ fn refuse_g15_probe(pdev: &platform::Device<Core>) -> Error {
     ENODEV
 }
 
+/// Read one T8140 ASCWrap v6 provider from a `mboxes` phandle node.
+///
+/// Reads the node's two `reg` windows (CPU physical, #address/#size-cells = 2
+/// each), the two named `send-empty`/`recv-not-empty` AIC interrupt numbers
+/// (3 cells per interrupt), and the `apple,firmware-role` string. Anything
+/// missing or malformed fails closed (returns `None`) rather than guessing.
+fn read_t8140_asc_observation(
+    pdev: &platform::Device<Core>,
+    index: usize,
+) -> Option<agx_power_recovery::T8140G17PLinuxDtAscObservation> {
+    let node = pdev.as_ref().of_node()?;
+    let mbox = node.parse_phandle(c_str!("mboxes"), index)?;
+
+    // reg = <wrapper_hi wrapper_lo wsize_hi wsize_lo iovbar_hi iovbar_lo isize_hi isize_lo>
+    let reg: KVec<u32> = mbox.get_property(c_str!("reg")).ok()?;
+    if reg.len() != 8 {
+        return None;
+    }
+    let cell64 = |hi: u32, lo: u32| ((hi as u64) << 32) | lo as u64;
+
+    // interrupts = <type send flags type recv flags>, AIC number is cell 1/4.
+    let interrupts: KVec<u32> = mbox.get_property(c_str!("interrupts")).ok()?;
+    if interrupts.len() != 6 {
+        return None;
+    }
+
+    // apple,firmware-role is "GFX" (primary) or "GFX1" (secondary).
+    let role: KVec<u8> = mbox.get_property(c_str!("apple,firmware-role")).ok()?;
+    let role_is_gfx1 = match role.as_slice() {
+        b"GFX\0" | b"GFX" => false,
+        b"GFX1\0" | b"GFX1" => true,
+        _ => return None,
+    };
+
+    Some(agx_power_recovery::T8140G17PLinuxDtAscObservation {
+        role_is_gfx1,
+        wrapper_cpu_base: cell64(reg[0], reg[1]),
+        wrapper_size: cell64(reg[2], reg[3]),
+        iorvbar_cpu_base: cell64(reg[4], reg[5]),
+        iorvbar_size: cell64(reg[6], reg[7]),
+        send_empty_irq: interrupts[1],
+        recv_not_empty_irq: interrupts[4],
+    })
+}
+
+/// Read the full observed T8140 dual-ASC topology from the platform device
+/// tree, exactly as a Linux platform decoder sees it. `None` when the two
+/// `mboxes` providers cannot be read; the caller then reports missing
+/// topology rather than admitting an inferred one.
+fn read_t8140_linux_dt_topology(
+    pdev: &platform::Device<Core>,
+) -> Option<agx_power_recovery::T8140G17PLinuxDtTopology> {
+    Some(agx_power_recovery::T8140G17PLinuxDtTopology {
+        gfx: read_t8140_asc_observation(pdev, 0)?,
+        gfx1: read_t8140_asc_observation(pdev, 1)?,
+    })
+}
+
 fn refuse_g17_probe(
     pdev: &platform::Device<Core>,
     identity: &identity::GpuIdentity,
     firmware: Option<&g17_firmware::G17FirmwareIdentityAdmission>,
 ) -> Error {
-    // G17P remains fail-closed until the Linux platform decoder can supply an
-    // exact observed D93AP/T8140 topology. Never substitute the expected
-    // constant here: that would turn topology admission back into dead data.
-    let power_preflight = match g17_power_preflight::G17PowerPreflight::new(identity, None) {
-        Ok(preflight) => preflight,
-        Err(e) => {
-            dev_err!(
+    // G17P binds its power preflight to the exact D93AP/T8140 topology the
+    // Linux device tree actually exposes (its two `mboxes` providers). Never
+    // substitute the expected constant: only a real observation that decodes
+    // to the pinned providers admits the A18 Pro strategy.
+    let power_preflight = if identity.gpu_variant == identity::GpuVariant::P {
+        let observed = read_t8140_linux_dt_topology(pdev);
+        if observed.is_none() {
+            dev_warn!(
                 pdev.as_ref(),
-                "G17: no exact target-bound cold-boot/power preflight: {:?}; refusing\n",
-                e
+                "G17P: could not read the T8140 dual-ASC topology from the device tree mboxes\n"
             );
-            return ENODEV;
+        }
+        match g17_power_preflight::G17PowerPreflight::new_with_linux_dt(
+            identity,
+            observed.as_ref(),
+        ) {
+            Ok(preflight) => preflight,
+            Err(e) => {
+                dev_err!(
+                    pdev.as_ref(),
+                    "G17P: exact T8140 topology not admitted from the device tree: {:?}; refusing\n",
+                    e
+                );
+                return ENODEV;
+            }
+        }
+    } else {
+        match g17_power_preflight::G17PowerPreflight::new(identity, None) {
+            Ok(preflight) => preflight,
+            Err(e) => {
+                dev_err!(
+                    pdev.as_ref(),
+                    "G17: no exact target-bound cold-boot/power preflight: {:?}; refusing\n",
+                    e
+                );
+                return ENODEV;
+            }
         }
     };
     let Err(power_missing) = power_preflight.execution_gate() else {
@@ -562,6 +646,20 @@ fn refuse_g17_probe(
             "G17 preflight: submission producer subset is grounded (EP 0x21 doorbell byte-identical to AGX2, SKSM kick word and 0x20-strided kick-record table forked and cited), ",
             "but the SKSM hardware kick-FIFO MMIO scratch, the doorbell round-trip, and the completion IRQ can only be confirmed on a live M5\n"
         );
+    }
+
+    // The final structural wall specific to T8140: even with every gate above
+    // grounded, a device cannot be constructed without a full HwConfig, whose
+    // AGX2 firmware-ABI power/tuning field groups have no T8140 derivation.
+    // Report exactly which groups are missing rather than inventing them.
+    if identity.gpu_variant == identity::GpuVariant::P {
+        if let Err(gap) = hw::agx3::t8140_hwconfig() {
+            dev_err!(
+                pdev.as_ref(),
+                "G17P: no T8140 HwConfig can be constructed (ungrounded field groups {:#x}); grounded subset is chip/clock/UAT-geometry/die only\n",
+                gap.bits()
+            );
+        }
     }
 
     ENODEV

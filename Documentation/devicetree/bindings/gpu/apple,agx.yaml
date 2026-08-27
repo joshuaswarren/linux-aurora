@@ -38,14 +38,20 @@ properties:
           - const: gpu,t8140
 
   reg:
+    minItems: 2
     items:
       - description: GPU coprocessor control registers
       - description: GPU block MMIO registers
+      - description:
+          Control registers of the secondary GPU coprocessor, on SoCs
+          driven by two independent GPU coprocessors (T8140)
 
   reg-names:
+    minItems: 2
     items:
       - const: asc
       - const: sgx
+      - const: asc1
 
   power-domains:
     maxItems: 1
@@ -101,11 +107,20 @@ allOf:
     then:
       properties:
         reg:
+          minItems: 3
           items:
             - description:
                 ASCWrap v6 register window of the primary (GFX role)
                 GPU coprocessor
             - description: GPU block MMIO registers
+            - description:
+                ASCWrap v6 register window of the secondary (GFX1 role)
+                GPU coprocessor. The driver releases both coprocessor
+                CPUs, so this window is required. It intentionally
+                aliases the gfx1 mailbox provider's wrapper window; the
+                GPU driver maps it non-exclusively.
+        reg-names:
+          minItems: 3
         mboxes:
           items:
             - description:
@@ -124,6 +139,10 @@ allOf:
         - operating-points-v2
     else:
       properties:
+        reg:
+          maxItems: 2
+        reg-names:
+          maxItems: 2
         mboxes:
           maxItems: 1
         memory-region:
@@ -160,8 +179,9 @@ examples:
         gpu@482600000 {
             compatible = "apple,agx-t8140", "gpu,t8140";
             reg = <0x4 0x82600000 0x0 0x88000>,
-                  <0x4 0x80000000 0x0 0x4000000>;
-            reg-names = "asc", "sgx";
+                  <0x4 0x80000000 0x0 0x4000000>,
+                  <0x4 0x82e00000 0x0 0x88000>;
+            reg-names = "asc", "sgx", "asc1";
             mboxes = <&gfx_asc>, <&gfx1_asc>;
             power-domains = <&ps_gfx>;
             memory-region = <&uat_ttbs>, <&uat_pagetables>, <&uat_handoff>;

@@ -30,6 +30,21 @@ pub(crate) const SGX_SIZE: usize = 0x1000000;
 const CPU_CONTROL: usize = 0x44;
 const CPU_RUN: u32 = 0x1 << 4; // BIT(4)
 
+// T8140 (A18 Pro / G17P) SGX registers, hardware-verified on the live J700
+// bring-up. These offsets exceed the AGX2 `SGX_SIZE` window (the T8140 SGX
+// block is 0x4000000), so their accessors map the full "sgx" resource
+// unsized and use runtime-checked accesses.
+//
+// AXI transition workaround: after powering gfx-asc, gfx1-asc, and sgx, set
+// bit 0 in both words. The observed post-write values on J700 are 0x00010001
+// and 0x000413b1 respectively; the upper bits are hardware status and are
+// only logged, not enforced.
+const T8140_AXI_TRANSITION_0: usize = 0x1000104;
+const T8140_AXI_TRANSITION_1: usize = 0x1000108;
+/// Must be written 0 before ANY initdata is sent to either firmware
+/// instance (T8140 startup sequence step "write zero to SGX+0xd06030").
+const T8140_PRE_INITDATA_CLEAR: usize = 0xd06030;
+
 const FAULT_INFO: usize = 0x17030;
 
 const ID_VERSION: usize = 0xd04000;
@@ -197,7 +212,7 @@ impl Resources {
     /* Not yet used
     fn sgx_write32<OFF: usize>(&self, val: u32) {
         if let Some(sgx) = self.sgx.try_access() {
-            sgx.write32_relaxed(val, OFF)
+            sgx.relaxed().write32(val, OFF)
         }
     }
     */
@@ -213,7 +228,7 @@ impl Resources {
     /* Not yet used
     fn sgx_write64<OFF: usize>(&self, val: u64) {
         if let Some(sgx) = self.sgx.try_access() {
-            sgx.write64_relaxed(val, OFF)
+            sgx.relaxed().write64(val, OFF)
         }
     }
     */
@@ -225,14 +240,82 @@ impl Resources {
         Ok(())
     }
 
-    /// Start the ASC coprocessor CPU.
-    pub(crate) fn start_cpu(pdev: &platform::Device<Core>) -> Result {
-        let asc_req = pdev.io_request_by_name(c_str!("asc")).ok_or(EINVAL)?;
+    /// Start one ASC coprocessor CPU by its `reg-names` entry.
+    fn start_cpu_by_name(pdev: &platform::Device<Core>, name: &CStr) -> Result {
+        let asc_req = pdev.io_request_by_name(name).ok_or_else(|| {
+            dev_err!(
+                pdev.as_ref(),
+                "ASC control region \"{}\" is not declared by this device\n",
+                name
+            );
+            EINVAL
+        })?;
         let asc_iomem = KBox::pin_init(asc_req.iomap_sized::<ASC_CTL_SIZE>(), GFP_KERNEL)?;
         let res = asc_iomem.access(pdev.as_ref())?.relaxed();
 
         let val = res.read32(CPU_CONTROL);
         res.write32(val | CPU_RUN, CPU_CONTROL);
+        Ok(())
+    }
+
+    /// Start the (primary) ASC coprocessor CPU.
+    pub(crate) fn start_cpu(pdev: &platform::Device<Core>) -> Result {
+        Self::start_cpu_by_name(pdev, c_str!("asc"))
+    }
+
+    /// Start the secondary (`gfx1-asc`) coprocessor CPU on dual-ASC parts.
+    ///
+    /// T8140 carries two independent GPU coprocessors; the secondary
+    /// ASCWrap window must be declared as the "asc1" reg entry of the GPU
+    /// node. Fails closed (with a precise message from
+    /// [`Self::start_cpu_by_name`]) when the device tree does not declare
+    /// it, since a T8140 boot with only one released ASC is not a grounded
+    /// configuration.
+    pub(crate) fn start_secondary_cpu(pdev: &platform::Device<Core>) -> Result {
+        Self::start_cpu_by_name(pdev, c_str!("asc1"))
+    }
+
+    /// Apply the T8140 AXI transition workaround.
+    ///
+    /// Hardware-verified order: power `gfx-asc`, `gfx1-asc`, and `sgx`
+    /// first, then set bit 0 of both AXI transition words. Observed
+    /// post-write values on J700 are `0x00010001`/`0x000413b1`; a different
+    /// readback is logged but not fatal (the upper bits are status).
+    pub(crate) fn t8140_axi_transition_workaround(pdev: &platform::Device<Core>) -> Result {
+        let sgx_req = pdev.io_request_by_name(c_str!("sgx")).ok_or(EINVAL)?;
+        let sgx_iomem = KBox::pin_init(sgx_req.iomap(), GFP_KERNEL)?;
+        let res = sgx_iomem.access(pdev.as_ref())?.relaxed();
+
+        for (offset, observed) in [
+            (T8140_AXI_TRANSITION_0, 0x0001_0001u32),
+            (T8140_AXI_TRANSITION_1, 0x0004_13b1u32),
+        ] {
+            let val = res.try_read32(offset)?;
+            res.try_write32(val | 1, offset)?;
+            let after = res.try_read32(offset)?;
+            if after != observed {
+                dev_warn!(
+                    pdev.as_ref(),
+                    "T8140 AXI transition word {:#x} reads {:#x} after set (J700 observed {:#x})\n",
+                    offset,
+                    after,
+                    observed
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// T8140: write zero to the pre-initdata gate register.
+    ///
+    /// The grounded startup sequence requires this write after the AXI
+    /// transition workaround and before ANY initdata is sent to either
+    /// firmware instance.
+    pub(crate) fn t8140_pre_initdata_clear(pdev: &platform::Device<Core>) -> Result {
+        let sgx_req = pdev.io_request_by_name(c_str!("sgx")).ok_or(EINVAL)?;
+        let sgx_iomem = KBox::pin_init(sgx_req.iomap(), GFP_KERNEL)?;
+        let res = sgx_iomem.access(pdev.as_ref())?.relaxed();
+        res.try_write32(0, T8140_PRE_INITDATA_CLEAR)?;
         Ok(())
     }
 
@@ -388,8 +471,12 @@ impl Resources {
         // The G14X fault-register bank and fault-word decode carry unchanged
         // to every AGX3 part (see the FAULT_INFO_G14X provenance comment).
         // `gpu_core` is a firmware-ABI value that only exists for the AGX2
-        // targets, so AGX3 membership is keyed off the design generation.
-        let g14x = cfg.gpu_core as u32 >= hw::GpuCore::G14S as u32
+        // targets (None on AGX3), so AGX3 membership is keyed off the design
+        // generation.
+        let g14x = cfg
+            .gpu_core
+            .map(|core| core as u32 >= hw::GpuCore::G14S as u32)
+            .unwrap_or(false)
             || cfg.gpu_gen as u32 >= hw::GpuGen::G15 as u32;
 
         let fault_info = if g14x {

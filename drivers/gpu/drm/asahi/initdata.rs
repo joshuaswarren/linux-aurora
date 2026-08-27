@@ -564,7 +564,9 @@ impl<'a> InitDataBuilder::ver<'a> {
                     num_frags: dyncfg.id.num_frags * dyncfg.id.num_clusters,
                     unk_554: 0x1,
                     uat_ttb_base: U64(dyncfg.uat_ttb_base),
-                    gpu_core_id: cfg.gpu_core as u32,
+                    // Firmware-ABI core id; absent (AGX3) configs must never
+                    // reach this builder, and fail closed here if they do.
+                    gpu_core_id: cfg.gpu_core.ok_or(ENODEV)? as u32,
                     gpu_rev_id: dyncfg.id.gpu_rev_id as u32,
                     num_cores: dyncfg.id.num_cores * dyncfg.id.num_clusters,
                     max_pstate: dyncfg.pwr.perf_states.len() as u32 - 1,
