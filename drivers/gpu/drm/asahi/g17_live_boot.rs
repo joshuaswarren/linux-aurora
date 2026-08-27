@@ -56,7 +56,7 @@ use kernel::{
     time::{delay::fsleep, Delta, Instant, Monotonic},
 };
 
-use crate::{hw, identity, regs};
+use crate::{g17_adt_j700, hw, identity, regs};
 
 /// Master opt-in. **Default `false`**: a normal AGX3 probe refuses before any
 /// MMIO, unchanged. Set to `true` and rebuild only on a real M5 that you are
@@ -191,12 +191,36 @@ pub(crate) fn attempt(
             );
         }
         Err(e) => {
+            // A J700 device tree may not carry an OPP table yet. The board's
+            // own values are recorded from its live ADT, so report the
+            // fallback the init-data stage will use rather than nothing.
+            let mhz = g17_adt_j700::perf_state_clocks_mhz();
             dev_warn!(
                 pdev.as_ref(),
-                "G17 live-boot: [dt] no GPU operating-points-v2 table ({:?}); the init-data stage will require it\n",
-                e
+                "G17 live-boot: [dt] no GPU operating-points-v2 table ({:?}); falling back to the J700AP ADT ladder ({} states, {}..{} MHz)\n",
+                e,
+                mhz.len(),
+                mhz[0],
+                mhz[mhz.len() - 1]
             );
         }
+    }
+
+    // Report the board's UAT handoff rendezvous. `mmu` records that the
+    // firmware image proves this region exists but does not expose its
+    // address; for J700AP the device tree does, and this is the address the
+    // (not-yet-wired) `UatHandoff` stage must poll for `magic_fw`.
+    if soc.chip_id == 0x8140 {
+        dev_info!(
+            pdev.as_ref(),
+            "G17 live-boot: [adt] J700AP handoff {:#x}/{:#x}, gfx-data {:#x}, gfx1-data {:#x}, gates {:#x}/{:#x}\n",
+            g17_adt_j700::J700_GFX_HANDOFF.base,
+            g17_adt_j700::J700_GFX_HANDOFF.size,
+            g17_adt_j700::J700_GFX_DATA.base,
+            g17_adt_j700::J700_GFX1_DATA.base,
+            g17_adt_j700::J700_POWER_GATES[0],
+            g17_adt_j700::J700_POWER_GATES[1]
+        );
     }
 
     // Stage 4 — StartAsc. Release the coprocessor CPU so it can begin the
