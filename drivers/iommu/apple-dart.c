@@ -255,6 +255,9 @@ struct apple_dart {
 
 	struct iommu_group *sid2group[DART_MAX_STREAMS];
 	struct iommu_device iommu;
+	DECLARE_BITMAP(static_bypass, DART_MAX_STREAMS);
+	DECLARE_BITMAP(static_enabled, DART_MAX_STREAMS);
+	bool has_static_enabled;
 
 	u32 save_tcr[DART_MAX_STREAMS];
 	u32 save_ttbr[DART_MAX_STREAMS][DART_MAX_TTBR];
@@ -292,6 +295,7 @@ struct apple_dart_atomic_stream_map {
  *
  * @pgtbl_ops: pagetable ops allocated by io-pgtable
  * @finalized: true if the domain has been completely initialized
+ * @dma_max: optional consumer-specific IOVA ceiling
  * @init_lock: protects domain initialization
  * @stream_maps: streams attached to this domain (valid for DMA/UNMANAGED only)
  * @domain: core iommu domain pointer
@@ -301,6 +305,7 @@ struct apple_dart_domain {
 
 	bool finalized;
 	u64 mask;
+	dma_addr_t dma_max;
 	struct mutex init_lock;
 	struct apple_dart_atomic_stream_map stream_maps[MAX_DARTS_PER_DEVICE];
 
@@ -619,10 +624,28 @@ apple_dart_t8110_hw_invalidate_tlb(struct apple_dart_stream_map *stream_map)
 		stream_map, DART_T8110_TLB_CMD_OP_FLUSH_SID);
 }
 
+static void apple_dart_hw_enable_global_streams(struct apple_dart *dart)
+{
+	for (int word = 0; word < BITS_TO_U32(dart->num_streams); word++) {
+		u32 mask = U32_MAX;
+
+		if (dart->has_static_enabled) {
+			mask = 0;
+			for (int bit = 0; bit < 32; bit++) {
+				int stream = word * 32 + bit;
+
+				if (stream < dart->num_streams &&
+				    test_bit(stream, dart->static_enabled))
+					mask |= BIT(bit);
+			}
+		}
+		writel(mask, dart->regs + dart->hw->enable_streams + 4 * word);
+	}
+}
+
 static int apple_dart_hw_reset(struct apple_dart *dart)
 {
 	struct apple_dart_stream_map stream_map;
-	int i;
 
 	stream_map.dart = dart;
 	bitmap_zero(stream_map.sidmap, DART_MAX_STREAMS);
@@ -630,9 +653,10 @@ static int apple_dart_hw_reset(struct apple_dart *dart)
 	apple_dart_hw_disable_dma(&stream_map);
 	apple_dart_hw_clear_all_ttbrs(&stream_map);
 
-	/* enable all streams globally since TCR is used to control isolation */
-	for (i = 0; i < BITS_TO_U32(dart->num_streams); i++)
-		writel(U32_MAX, dart->regs + dart->hw->enable_streams + 4 * i);
+	/* Most DARTs enable every stream globally and isolate through TCR.  Some
+	 * Apple devices publish a smaller live stream set that must survive reset.
+	 */
+	apple_dart_hw_enable_global_streams(dart);
 
 	/* Clear any pending errors before the interrupt is unmasked. */
 	if (dart->hw->type == DART_T8110 && dart->version >= 0x0202) {
@@ -776,9 +800,7 @@ apple_dart_setup_translation(struct apple_dart_domain *domain,
 	struct io_pgtable_cfg *pgtbl_cfg =
 		&io_pgtable_ops_to_pgtable(domain->pgtbl_ops)->cfg;
 
-	/* enable all streams globally since TCR is used to control isolation */
-	for (i = 0; i < BITS_TO_U32(dart->num_streams); i++)
-		writel(U32_MAX, dart->regs + dart->hw->enable_streams + 4 * i);
+	apple_dart_hw_enable_global_streams(dart);
 
 	for (i = 0; i < pgtbl_cfg->apple_dart_cfg.n_ttbrs; ++i) {
 		u64 ttbr = virt_to_phys(pgtbl_cfg->apple_dart_cfg.ttbr[i]);
@@ -815,7 +837,7 @@ static int apple_dart_finalize_domain(struct apple_dart_domain *dart_domain,
 {
 	struct apple_dart *dart = cfg->stream_maps[0].dart;
 	struct io_pgtable_cfg pgtbl_cfg;
-	dma_addr_t dma_max = dart->dma_max;
+	dma_addr_t dma_max = dart_domain->dma_max ?: dart->dma_max;
 	u32 ias = min_t(u32, dart->ias, fls64(dma_max));
 	int locked_sid = -1;
 	int ret = 0;
@@ -1175,6 +1197,7 @@ static void apple_dart_release_device(struct device *dev)
 static struct iommu_domain *apple_dart_domain_alloc_paging(struct device *dev)
 {
 	struct apple_dart_domain *dart_domain;
+	u32 iova_bits;
 
 	dart_domain = kzalloc_obj(*dart_domain);
 	if (!dart_domain)
@@ -1184,7 +1207,32 @@ static struct iommu_domain *apple_dart_domain_alloc_paging(struct device *dev)
 
 	if (dev) {
 		struct apple_dart_master_cfg *cfg = dev_iommu_priv_get(dev);
+		struct device_node *iova_node = dev->of_node;
 		int ret;
+
+		if (dev_is_pci(dev)) {
+			struct pci_host_bridge *bridge;
+			struct device_node *bridge_node;
+
+			bridge = pci_find_host_bridge(to_pci_dev(dev)->bus);
+			bridge_node = bridge && bridge->dev.parent ?
+				bridge->dev.parent->of_node : NULL;
+			if (bridge_node &&
+			    of_property_read_bool(bridge_node,
+						  "apple,endpoint-iova-address-bits"))
+				iova_node = bridge_node;
+		}
+		if (!of_property_read_u32(iova_node,
+					  dev_is_pci(dev) ?
+					  "apple,endpoint-iova-address-bits" :
+					  "apple,iova-address-bits",
+					  &iova_bits)) {
+			if (!iova_bits || iova_bits >= 64) {
+				kfree(dart_domain);
+				return ERR_PTR(-EINVAL);
+			}
+			dart_domain->dma_max = DMA_BIT_MASK(iova_bits);
+		}
 
 		ret = apple_dart_finalize_domain(dart_domain, cfg);
 		if (ret) {
@@ -1642,10 +1690,11 @@ static bool apple_dart_is_locked(struct apple_dart *dart)
 
 static int apple_dart_probe(struct platform_device *pdev)
 {
-	int ret;
-	u32 dart_params[4];
+	int bypass_count, enabled_count, ret;
+	u32 dart_params[4], sid;
 	struct resource *res;
 	struct apple_dart *dart;
+	struct apple_dart_stream_map bypass_map = {};
 	struct device *dev = &pdev->dev;
 	u64 dma_range[2];
 
@@ -1745,12 +1794,64 @@ static int apple_dart_probe(struct platform_device *pdev)
 		ret = -EINVAL;
 		goto err_clk_disable;
 	}
+	bypass_count = of_property_count_u32_elems(dev->of_node,
+						    "apple,bypass-streams");
+	if (bypass_count > 0) {
+		if (!dart->supports_bypass) {
+			ret = -EOPNOTSUPP;
+			goto err_clk_disable;
+		}
+		for (int i = 0; i < bypass_count; i++) {
+			ret = of_property_read_u32_index(dev->of_node,
+							 "apple,bypass-streams",
+							 i, &sid);
+			if (ret || sid >= dart->num_streams) {
+				ret = ret ?: -ERANGE;
+				goto err_clk_disable;
+			}
+			set_bit(sid, dart->static_bypass);
+		}
+	} else if (bypass_count != -EINVAL) {
+		ret = bypass_count;
+		goto err_clk_disable;
+	}
+	enabled_count = of_property_count_u32_elems(dev->of_node,
+						     "apple,enabled-streams");
+	if (enabled_count > 0) {
+		dart->has_static_enabled = true;
+		for (int i = 0; i < enabled_count; i++) {
+			ret = of_property_read_u32_index(dev->of_node,
+							 "apple,enabled-streams",
+							 i, &sid);
+			if (ret || sid >= dart->num_streams) {
+				ret = ret ?: -ERANGE;
+				goto err_clk_disable;
+			}
+			set_bit(sid, dart->static_enabled);
+		}
+	} else if (enabled_count != -EINVAL) {
+		ret = enabled_count;
+		goto err_clk_disable;
+	}
 
 	dart->locked = apple_dart_is_locked(dart);
 	if (!dart->locked) {
 		ret = apple_dart_hw_reset(dart);
 		if (ret)
 			goto err_clk_disable;
+		if (dart->has_static_enabled) {
+			apple_dart_hw_enable_global_streams(dart);
+			dev_info(dev, "static enabled streams: %*pb\n",
+				 dart->num_streams, dart->static_enabled);
+		}
+		if (!bitmap_empty(dart->static_bypass, dart->num_streams)) {
+			bypass_map.dart = dart;
+			bitmap_copy(bypass_map.sidmap, dart->static_bypass,
+				    dart->num_streams);
+			apple_dart_hw_enable_bypass(&bypass_map);
+			dev_info(dev, "static bypass streams: %*pb\n",
+				 dart->num_streams, dart->static_bypass);
+		}
 	}
 
 	ret = request_irq(dart->irq, apple_dart_irq, IRQF_SHARED,
