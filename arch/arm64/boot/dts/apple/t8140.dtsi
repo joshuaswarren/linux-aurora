@@ -18,6 +18,10 @@
 	#address-cells = <2>;
 	#size-cells = <2>;
 
+	aliases {
+		gpu = &gpu;
+	};
+
 	cpus {
 		#address-cells = <2>;
 		#size-cells = <0>;
@@ -133,6 +137,111 @@
 		#clock-cells = <0>;
 		clock-frequency = <24000000>;
 		clock-output-names = "clkref";
+	};
+
+	gpu_opp: opp-table-gpu {
+		compatible = "operating-points-v2";
+
+		/*
+		 * NOTE: This ladder is the live J700 (Mac17,5) ADT
+		 * perf-states table, kept in ADT order (the two interleaved
+		 * rails make it non-monotonic); the bootloader rewrites it
+		 * from each device's ADT.  opp-microwatt is deliberately
+		 * absent: no G17P power model is grounded yet, and m1n1
+		 * fails closed rather than inventing per-state power.
+		 */
+		opp00 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <125000>;
+		};
+		opp01 {
+			opp-hz = /bits/ 64 <338000000>;
+			opp-microvolt = <605000>;
+		};
+		opp02 {
+			opp-hz = /bits/ 64 <492000000>;
+			opp-microvolt = <630000>;
+		};
+		opp03 {
+			opp-hz = /bits/ 64 <618000000>;
+			opp-microvolt = <650000>;
+		};
+		opp04 {
+			opp-hz = /bits/ 64 <796000000>;
+			opp-microvolt = <695000>;
+		};
+		opp05 {
+			opp-hz = /bits/ 64 <928000000>;
+			opp-microvolt = <745000>;
+		};
+		opp06 {
+			opp-hz = /bits/ 64 <952000000>;
+			opp-microvolt = <800000>;
+		};
+		opp07 {
+			opp-hz = /bits/ 64 <1056000000>;
+			opp-microvolt = <800000>;
+		};
+		opp08 {
+			opp-hz = /bits/ 64 <1053000000>;
+			opp-microvolt = <845000>;
+		};
+		opp09 {
+			opp-hz = /bits/ 64 <1170000000>;
+			opp-microvolt = <845000>;
+		};
+		opp10 {
+			opp-hz = /bits/ 64 <1152000000>;
+			opp-microvolt = <885000>;
+		};
+		opp11 {
+			opp-hz = /bits/ 64 <1278000000>;
+			opp-microvolt = <885000>;
+		};
+		opp12 {
+			opp-hz = /bits/ 64 <1204000000>;
+			opp-microvolt = <905000>;
+		};
+		opp13 {
+			opp-hz = /bits/ 64 <1338000000>;
+			opp-microvolt = <905000>;
+		};
+		opp14 {
+			opp-hz = /bits/ 64 <1326000000>;
+			opp-microvolt = <975000>;
+		};
+		opp15 {
+			opp-hz = /bits/ 64 <1470000000>;
+			opp-microvolt = <975000>;
+		};
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		/*
+		 * To be filled by the loader from the ADT sgx node:
+		 * gpu-region -> uat-ttbs, gfx-shared-region -> uat-pagetables,
+		 * gfx-shared-l2-region -> uat-l2-pagetables,
+		 * gfx-handoff -> uat-handoff.
+		 */
+		uat_handoff: uat-handoff {
+			reg = <0 0 0 0>;
+		};
+
+		uat_l2_pagetables: uat-l2-pagetables {
+			reg = <0 0 0 0>;
+		};
+
+		uat_pagetables: uat-pagetables {
+			reg = <0 0 0 0>;
+		};
+
+		uat_ttbs: uat-ttbs {
+			reg = <0 0 0 0>;
+		};
 	};
 
 	soc: soc {
@@ -452,6 +561,56 @@
 			clocks = <&clkref>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 481 IRQ_TYPE_LEVEL_HIGH>;
+		};
+
+		/*
+		 * G17P GPU.  Addresses come from the live J700 ADT (arm-io
+		 * child + 0x210000000): "asc" is the primary (GFX role)
+		 * ASCWrap v6 window, "sgx" the GPU block MMIO.  The second
+		 * compatible is the literal ADT identifier for this node.
+		 * Unlike AGX2, T8140 has two independent GPU coprocessors;
+		 * their mailboxes are the gfx_asc/gfx1_asc providers below,
+		 * GFX first.
+		 */
+		gpu: gpu@482600000 {
+			compatible = "apple,agx-t8140", "gpu,t8140";
+			reg = <0x4 0x82600000 0x0 0x88000>,
+			      <0x4 0x80000000 0x0 0x4000000>;
+			reg-names = "asc", "sgx";
+			mboxes = <&gfx_asc>, <&gfx1_asc>;
+			power-domains = <&ps_gfx>;
+			memory-region = <&uat_ttbs>, <&uat_pagetables>,
+					<&uat_handoff>;
+			memory-region-names = "ttbs", "pagetables", "handoff";
+			operating-points-v2 = <&gpu_opp>;
+		};
+
+		gfx_asc: mailbox@482600000 {
+			compatible = "apple,t8140-ascwrap-v6";
+			reg = <0x4 0x82600000 0x0 0x88000>,
+			      <0x4 0x82050000 0x0 0x8>;
+			reg-names = "wrapper", "iop-vbar";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 993 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 996 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "recv-not-empty";
+			apple,firmware-role = "GFX";
+			power-domains = <&ps_gfx>;
+			#mbox-cells = <0>;
+		};
+
+		gfx1_asc: mailbox@482e00000 {
+			compatible = "apple,t8140-ascwrap-v6";
+			reg = <0x4 0x82e00000 0x0 0x88000>,
+			      <0x4 0x82850000 0x0 0x8>;
+			reg-names = "wrapper", "iop-vbar";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 997 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1000 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "recv-not-empty";
+			apple,firmware-role = "GFX1";
+			power-domains = <&ps_gfx>;
+			#mbox-cells = <0>;
 		};
 	};
 };
