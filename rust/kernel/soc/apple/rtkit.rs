@@ -23,6 +23,7 @@ use crate::{
 };
 
 use core::marker::PhantomData;
+use core::mem::MaybeUninit;
 use core::ptr;
 use macros::vtable;
 
@@ -99,6 +100,28 @@ pub struct RtKit<T: Operations> {
     rtk: *mut bindings::apple_rtkit,
     data: *mut core::ffi::c_void,
     _p: PhantomData<T>,
+}
+
+/// Exact result from a discovery-only HELLO/EPMAP exchange.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct EpmapSnapshot {
+    /// Unmodified endpoint-zero HELLO message received from firmware.
+    pub raw_hello: u64,
+    /// HELLO minimum protocol version.
+    pub hello_min_version: u16,
+    /// HELLO maximum protocol version.
+    pub hello_max_version: u16,
+    /// Raw 256-bit endpoint bitmap, little-endian by endpoint number.
+    pub endpoints: [u64; 4],
+}
+
+impl EpmapSnapshot {
+    /// Return whether firmware advertised an endpoint in its EPMAP.
+    pub fn has_endpoint(&self, endpoint: u8) -> bool {
+        let word = endpoint as usize / 64;
+        let bit = endpoint as usize % 64;
+        self.endpoints[word] & (1u64 << bit) != 0
+    }
 }
 
 unsafe extern "C" fn crashed_callback<T: Operations>(
@@ -213,6 +236,29 @@ impl<T: Operations> RtKit<T> {
         mbox_idx: usize,
         data: T::Data,
     ) -> Result<Self> {
+        Self::new_inner(dev, mbox_name, mbox_idx, data, false)
+    }
+
+    /// Create a passive management client that answers only HELLO/EPMAP.
+    ///
+    /// This mode never starts crashlog or another endpoint and never performs
+    /// an AP/IOP power-state transition.
+    pub fn new_epmap_only(
+        dev: &device::Device,
+        mbox_name: Option<&'static CStr>,
+        mbox_idx: usize,
+        data: T::Data,
+    ) -> Result<Self> {
+        Self::new_inner(dev, mbox_name, mbox_idx, data, true)
+    }
+
+    fn new_inner(
+        dev: &device::Device,
+        mbox_name: Option<&'static CStr>,
+        mbox_idx: usize,
+        data: T::Data,
+        epmap_only: bool,
+    ) -> Result<Self> {
         let ptr: *mut crate::ffi::c_void = data.into_foreign().cast();
         let guard = ScopeGuard::new(|| {
             // SAFETY: `ptr` came from a previous call to `into_foreign`.
@@ -220,17 +266,34 @@ impl<T: Operations> RtKit<T> {
         });
         // SAFETY: `dev` is valid by its type invarants and otherwise his just
         //          calls the C init function.
-        let rtk = unsafe {
-            from_err_ptr(bindings::apple_rtkit_init(
-                dev.as_raw(),
-                ptr,
-                match mbox_name {
-                    Some(s) => s.as_char_ptr(),
-                    None => ptr::null(),
-                },
-                mbox_idx.try_into()?,
-                &Self::VTABLE,
-            ))
+        let raw_name = match mbox_name {
+            Some(s) => s.as_char_ptr(),
+            None => ptr::null(),
+        };
+        let raw_index = mbox_idx.try_into()?;
+        let rtk = if epmap_only {
+            // SAFETY: arguments follow the C API contract and `ptr` remains
+            // owned by this wrapper until construction fails or Drop runs.
+            unsafe {
+                from_err_ptr(bindings::apple_rtkit_init_epmap_only(
+                    dev.as_raw(),
+                    ptr,
+                    raw_name,
+                    raw_index,
+                    &Self::VTABLE,
+                ))
+            }
+        } else {
+            // SAFETY: same invariants as the discovery-only constructor.
+            unsafe {
+                from_err_ptr(bindings::apple_rtkit_init(
+                    dev.as_raw(),
+                    ptr,
+                    raw_name,
+                    raw_index,
+                    &Self::VTABLE,
+                ))
+            }
         }?;
 
         guard.dismiss();
@@ -252,6 +315,26 @@ impl<T: Operations> RtKit<T> {
     pub fn boot(self: Pin<&mut Self>) -> Result {
         // SAFETY: `rtk` is valid per the type invariant.
         to_result(unsafe { bindings::apple_rtkit_boot(self.rtk) })
+    }
+
+    /// Wait for a passive HELLO/EPMAP exchange and return its exact snapshot.
+    pub fn discover_epmap(self: Pin<&mut Self>) -> Result<EpmapSnapshot> {
+        // SAFETY: `rtk` is valid per the type invariant and was constructed in
+        // discovery-only mode; the C API rejects any other mode.
+        to_result(unsafe { bindings::apple_rtkit_discover_epmap(self.rtk) })?;
+
+        let mut raw = MaybeUninit::<bindings::apple_rtkit_epmap_snapshot>::uninit();
+        // SAFETY: a successful discovery initialized the C snapshot.
+        to_result(unsafe { bindings::apple_rtkit_get_epmap_snapshot(self.rtk, raw.as_mut_ptr()) })?;
+        // SAFETY: the successful getter initialized every field.
+        let raw = unsafe { raw.assume_init() };
+
+        Ok(EpmapSnapshot {
+            raw_hello: raw.raw_hello,
+            hello_min_version: raw.hello_min_version,
+            hello_max_version: raw.hello_max_version,
+            endpoints: raw.endpoints,
+        })
     }
 
     /// Starts a non-system endpoint.

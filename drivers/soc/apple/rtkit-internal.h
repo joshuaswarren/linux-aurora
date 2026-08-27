@@ -35,13 +35,22 @@ struct apple_rtkit {
 
 	int boot_result;
 	int version;
+	u64 raw_hello;
+	u16 hello_min_version;
+	u16 hello_max_version;
+	u8 epmap_bases_seen;
 
 	unsigned int iop_power_state;
 	unsigned int ap_power_state;
 	bool crashed;
 	bool adopted;
+	bool epmap_only;
+	bool hello_seen;
+	bool epmap_finished;
+	bool shutting_down;
 
 	DECLARE_BITMAP(endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
+	DECLARE_BITMAP(discovery_endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
 
 	struct apple_rtkit_shmem ioreport_buffer;
 	struct apple_rtkit_shmem crashlog_buffer;

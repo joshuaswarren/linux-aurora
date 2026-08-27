@@ -263,18 +263,6 @@ impl Resources {
         Self::start_cpu_by_name(pdev, c_str!("asc"))
     }
 
-    /// Start the secondary (`gfx1-asc`) coprocessor CPU on dual-ASC parts.
-    ///
-    /// T8140 carries two independent GPU coprocessors; the secondary
-    /// ASCWrap window must be declared as the "asc1" reg entry of the GPU
-    /// node. Fails closed (with a precise message from
-    /// [`Self::start_cpu_by_name`]) when the device tree does not declare
-    /// it, since a T8140 boot with only one released ASC is not a grounded
-    /// configuration.
-    pub(crate) fn start_secondary_cpu(pdev: &platform::Device<Core>) -> Result {
-        Self::start_cpu_by_name(pdev, c_str!("asc1"))
-    }
-
     /// Apply the T8140 AXI transition workaround.
     ///
     /// Hardware-verified order: power `gfx-asc`, `gfx1-asc`, and `sgx`
