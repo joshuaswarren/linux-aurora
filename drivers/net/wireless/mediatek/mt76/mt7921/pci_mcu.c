@@ -49,6 +49,29 @@ mt7921_mcu_send_message(struct mt76_dev *mdev, struct sk_buff *skb,
 	if (cmd == MCU_CMD(FW_SCATTER))
 		txq = MT_MCUQ_FWDL;
 	q = mdev->q_mcu[txq];
+	/*
+	 * Apple 25G83 kalDevPortWrite() does not enlarge the 24-entry TX17
+	 * command ring.  When used + 1 reaches the ring depth it first calls
+	 * halWpdmaProcessCmdDmaDone(), which reclaims the completed prefix, and
+	 * only rejects the new command if the ring remains full afterwards.
+	 *
+	 * The generic raw mt76 path checks capacity before doing any cleanup.
+	 * That made the earlier exact-depth experiment stop at the first wrap,
+	 * while Run 191 proves Apple wraps the same 24 slots thousands of times.
+	 * Keep ordinary interrupt-driven cleanup, but reproduce Apple's bounded
+	 * pressure fallback before the generic capacity check.
+	 */
+	if (is_mt7932(mdev) && txq == MT_MCUQ_WM &&
+	    READ_ONCE(q->queued) + 1 >= q->ndesc - 1 &&
+	    mdev->queue_ops->tx_cleanup) {
+		u32 before = READ_ONCE(q->queued);
+
+		mdev->queue_ops->tx_cleanup(mdev, q, false);
+		dev_info(mdev->dev,
+			 "J700_MT7932_TX17_PRESSURE_RECLAIM: before=%u after=%u head=%u tail=%u depth=%u\n",
+			 before, READ_ONCE(q->queued), q->head, q->tail,
+			 q->ndesc);
+	}
 
 	ret = mt76_tx_queue_skb_raw(dev, q, skb, 0);
 
