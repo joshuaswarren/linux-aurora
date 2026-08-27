@@ -123,6 +123,19 @@ pub(crate) struct G17PPlatformConfig {
     pub(crate) sksm_scratch: G17SksmScratchGeometry,
 }
 
+/// G17P values written by `AGXAcceleratorG16::configureDevice`.
+///
+/// At `0xfffffe0008a55674..0xfffffe0008a55684`, the host copies the constant
+/// at `0xfffffe000714b348` (`00 40 00 00 08 40 00 00`) into accelerator
+/// fields `+0x10730/+0x10734`, then writes `0x10` to `+0x10738`.
+pub(crate) const T8140_G17P_PLATFORM_CONFIG: G17PPlatformConfig = G17PPlatformConfig {
+    sksm_scratch: G17SksmScratchGeometry {
+        write0_base: 0x4000,
+        write1_base: 0x4008,
+        queue_stride: 0x10,
+    },
+};
+
 /// SoC and register identity presented to the manager constructor.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct TargetObservation {
@@ -162,6 +175,7 @@ pub(crate) enum ConstructionError {
     WrongRoleTopology,
     WrongRootPlacement,
     WrongSharedClusterSize,
+    WrongSksmScratchGeometry,
     SksmScratchOffsetOverflow,
 }
 
@@ -236,6 +250,17 @@ pub(crate) fn validate_resources(
         return Err(ConstructionError::WrongSharedClusterSize);
     }
 
+    Ok(())
+}
+
+/// Admit only the exact geometry produced by the pinned G17P host.
+pub(crate) fn validate_platform(
+    platform: G17PPlatformConfig,
+) -> core::result::Result<(), ConstructionError> {
+    if platform != T8140_G17P_PLATFORM_CONFIG {
+        return Err(ConstructionError::WrongSksmScratchGeometry);
+    }
+    platform.sksm_scratch.compute_offsets()?;
     Ok(())
 }
 
@@ -376,10 +401,7 @@ impl G17PManagerConstruction {
         platform: G17PPlatformConfig,
     ) -> Result<Self> {
         validate_target(target_observation(soc)).map_err(|_| EINVAL)?;
-        platform
-            .sksm_scratch
-            .compute_offsets()
-            .map_err(|_| EINVAL)?;
+        validate_platform(platform).map_err(|_| EINVAL)?;
 
         let resources = g17_resources::G17ResourceOwner::new(dev)?;
         g17_resources::validate_handoff(resources.handoff()).map_err(|_| EINVAL)?;
@@ -484,20 +506,43 @@ mod tests {
 
     #[test]
     fn scratch_geometry_uses_values_not_accelerator_object_offsets() {
-        let platform = G17PPlatformConfig {
-            sksm_scratch: G17SksmScratchGeometry {
-                write0_base: 0,
-                write1_base: 4,
-                queue_stride: 1,
-            },
-        };
+        let platform = T8140_G17P_PLATFORM_CONFIG;
+        assert_eq!(platform.sksm_scratch.write0_base, 0x4000);
+        assert_eq!(platform.sksm_scratch.write1_base, 0x4008);
+        assert_eq!(platform.sksm_scratch.queue_stride, 0x10);
         assert_eq!(
             platform.sksm_scratch.compute_offsets(),
             Ok(G17SksmComputeScratchOffsets {
-                write0: 9,
-                write1: 13,
+                write0: 0x4090,
+                write1: 0x4098,
             })
         );
+        assert_eq!(validate_platform(platform), Ok(()));
+    }
+
+    #[test]
+    fn non_g17p_scratch_geometry_fails_before_resource_allocation() {
+        for geometry in [
+            G17SksmScratchGeometry {
+                write0_base: 0,
+                ..T8140_G17P_PLATFORM_CONFIG.sksm_scratch
+            },
+            G17SksmScratchGeometry {
+                write1_base: 0,
+                ..T8140_G17P_PLATFORM_CONFIG.sksm_scratch
+            },
+            G17SksmScratchGeometry {
+                queue_stride: 0,
+                ..T8140_G17P_PLATFORM_CONFIG.sksm_scratch
+            },
+        ] {
+            assert_eq!(
+                validate_platform(G17PPlatformConfig {
+                    sksm_scratch: geometry
+                }),
+                Err(ConstructionError::WrongSksmScratchGeometry)
+            );
+        }
     }
 
     #[test]
