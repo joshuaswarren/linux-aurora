@@ -70,6 +70,59 @@ pub(crate) const T8140_MANAGER_CONFIG: T8140ManagerConfig = T8140ManagerConfig {
     work_channel_count: g17_initdata::WORK_CHANNEL_COUNT,
 };
 
+/// Platform-derived SKSM scratch offsets within the mapped accelerator
+/// register window.
+///
+/// Apple's host loads these three values from accelerator object fields
+/// `+0x10730`, `+0x10734`, and `+0x10738`. Those are object offsets, not SGX
+/// MMIO offsets. This type carries the loaded values and no physical base.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17SksmScratchGeometry {
+    pub(crate) write0_base: u32,
+    pub(crate) write1_base: u32,
+    pub(crate) queue_stride: u32,
+}
+
+/// The two offsets used for the G17P compute queue.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17SksmComputeScratchOffsets {
+    pub(crate) write0: u32,
+    pub(crate) write1: u32,
+}
+
+impl G17SksmScratchGeometry {
+    /// Apply the exact host equation for compute queue index 9.
+    pub(crate) const fn compute_offsets(
+        self,
+    ) -> core::result::Result<G17SksmComputeScratchOffsets, ConstructionError> {
+        const COMPUTE_QUEUE_INDEX: u32 = 9;
+
+        let queue_offset = match self.queue_stride.checked_mul(COMPUTE_QUEUE_INDEX) {
+            Some(offset) => offset,
+            None => return Err(ConstructionError::SksmScratchOffsetOverflow),
+        };
+        let write0 = match self.write0_base.checked_add(queue_offset) {
+            Some(offset) => offset,
+            None => return Err(ConstructionError::SksmScratchOffsetOverflow),
+        };
+        let write1 = match self.write1_base.checked_add(queue_offset) {
+            Some(offset) => offset,
+            None => return Err(ConstructionError::SksmScratchOffsetOverflow),
+        };
+
+        Ok(G17SksmComputeScratchOffsets { write0, write1 })
+    }
+}
+
+/// Target configuration supplied by platform discovery.
+///
+/// There is no default T8140 scratch geometry. A caller must recover the
+/// three values through the platform configuration path before construction.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PPlatformConfig {
+    pub(crate) sksm_scratch: G17SksmScratchGeometry,
+}
+
 /// SoC and register identity presented to the manager constructor.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct TargetObservation {
@@ -109,6 +162,7 @@ pub(crate) enum ConstructionError {
     WrongRoleTopology,
     WrongRootPlacement,
     WrongSharedClusterSize,
+    SksmScratchOffsetOverflow,
 }
 
 /// Validate the exact T8140 identity without consulting an AGX2 `HwConfig`.
@@ -311,19 +365,31 @@ fn resource_observation(
 #[cfg(not(test))]
 pub(crate) struct G17PManagerConstruction {
     resources: g17_resources::G17ResourceOwner,
+    platform: G17PPlatformConfig,
 }
 
 #[cfg(not(test))]
 impl G17PManagerConstruction {
-    pub(crate) fn new(dev: &AsahiDevice, soc: &'static agx3::SocConfig) -> Result<Self> {
+    pub(crate) fn new(
+        dev: &AsahiDevice,
+        soc: &'static agx3::SocConfig,
+        platform: G17PPlatformConfig,
+    ) -> Result<Self> {
         validate_target(target_observation(soc)).map_err(|_| EINVAL)?;
+        platform
+            .sksm_scratch
+            .compute_offsets()
+            .map_err(|_| EINVAL)?;
 
         let resources = g17_resources::G17ResourceOwner::new(dev)?;
         g17_resources::validate_handoff(resources.handoff()).map_err(|_| EINVAL)?;
         validate_resources(resource_observation(resources.handoff(), resources.uat()))
             .map_err(|_| EINVAL)?;
 
-        Ok(Self { resources })
+        Ok(Self {
+            resources,
+            platform,
+        })
     }
 
     pub(crate) fn config(&self) -> &'static T8140ManagerConfig {
@@ -336,6 +402,10 @@ impl G17PManagerConstruction {
 
     pub(crate) fn uat(&self) -> &mmu::Uat {
         self.resources.uat()
+    }
+
+    pub(crate) fn sksm_scratch(&self) -> G17SksmScratchGeometry {
+        self.platform.sksm_scratch
     }
 
     pub(crate) fn execution_gaps(&self) -> ExecutionGaps {
@@ -410,6 +480,50 @@ mod tests {
     fn exact_target_and_shared_dual_role_resources_pass() {
         assert_eq!(validate_target(target()), Ok(()));
         assert_eq!(validate_resources(resources()), Ok(()));
+    }
+
+    #[test]
+    fn scratch_geometry_uses_values_not_accelerator_object_offsets() {
+        let platform = G17PPlatformConfig {
+            sksm_scratch: G17SksmScratchGeometry {
+                write0_base: 0,
+                write1_base: 4,
+                queue_stride: 1,
+            },
+        };
+        assert_eq!(
+            platform.sksm_scratch.compute_offsets(),
+            Ok(G17SksmComputeScratchOffsets {
+                write0: 9,
+                write1: 13,
+            })
+        );
+    }
+
+    #[test]
+    fn scratch_geometry_overflow_fails_before_resource_allocation() {
+        for geometry in [
+            G17SksmScratchGeometry {
+                write0_base: 0,
+                write1_base: 0,
+                queue_stride: u32::MAX,
+            },
+            G17SksmScratchGeometry {
+                write0_base: u32::MAX,
+                write1_base: 0,
+                queue_stride: 1,
+            },
+            G17SksmScratchGeometry {
+                write0_base: 0,
+                write1_base: u32::MAX,
+                queue_stride: 1,
+            },
+        ] {
+            assert_eq!(
+                geometry.compute_offsets(),
+                Err(ConstructionError::SksmScratchOffsetOverflow)
+            );
+        }
     }
 
     #[test]
