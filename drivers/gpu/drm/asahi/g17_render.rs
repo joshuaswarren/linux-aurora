@@ -537,6 +537,10 @@ fn put_u8(raw: &mut [u8], offset: usize, value: u8) {
     raw[offset] = value;
 }
 
+fn put_u16(raw: &mut [u8], offset: usize, value: u16) {
+    raw[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
 fn put_u32(raw: &mut [u8], offset: usize, value: u32) {
     raw[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
@@ -686,6 +690,30 @@ pub(crate) fn build_ta_descriptor(
     Ok(())
 }
 
+/// Build the TA descriptor used by the proven native cold opening.
+///
+/// The generic descriptor remains the older 9165484 profile. The first-work
+/// path changes these exact fields immediately before queue publication.
+pub(crate) fn build_cold_opening_ta_descriptor(
+    parameters: &G17pRenderParameters,
+    objects: RenderDescriptorObjects,
+    raw: &mut [u8],
+) -> Result<(), RenderBuildError> {
+    build_ta_descriptor(
+        parameters,
+        objects,
+        RenderDescriptorMetadata::source(RenderDescriptorKind::Tiling),
+        raw,
+    )?;
+    put_u16(raw, 0x38, 0x47);
+    put_u16(raw, 0x3a, 0x49);
+    put_u16(raw, 0x3c, 0x49);
+    put_u8(raw, 0x789, 0x08);
+    put_u8(raw, 0x93e, 0xd0);
+    put_u8(raw, 0x93f, 0x91);
+    Ok(())
+}
+
 fn put_embedded_registers(
     raw: &mut [u8],
     header_offset: usize,
@@ -783,6 +811,31 @@ pub(crate) fn build_fragment_descriptor(
     put_u8(raw, 0x2208, 1);
     put_u8(raw, 0x220c, 1);
     put_u8(raw, 0x222d, 1);
+    Ok(())
+}
+
+/// Build the fragment descriptor used by the proven native cold opening.
+pub(crate) fn build_cold_opening_fragment_descriptor(
+    parameters: &G17pRenderParameters,
+    objects: RenderDescriptorObjects,
+    raw: &mut [u8],
+) -> Result<(), RenderBuildError> {
+    build_fragment_descriptor(
+        parameters,
+        objects,
+        RenderDescriptorMetadata::source(RenderDescriptorKind::Fragment),
+        raw,
+    )?;
+    put_u32(raw, 0x50, 1);
+    put_u16(raw, 0x80, 0x56);
+    put_u16(raw, 0x82, 0x57);
+    put_u16(raw, 0x84, 0x57);
+    put_u16(raw, 0x88, 0x59);
+    put_u32(raw, 0x90, 1);
+    put_u32(raw, 0x215c, 0);
+    put_u8(raw, 0x21d8, 0x10);
+    put_u8(raw, 0x21d9, 0xa2);
+    put_u8(raw, 0x222d, 0);
     Ok(())
 }
 
@@ -1044,6 +1097,30 @@ mod tests {
         assert_eq!(get_u64(&fragment, 0x1e80), G17P_SOURCE_BG_PIPELINE);
         assert_eq!(get_u32(&fragment, 0x1f78), 0x8);
         assert_eq!(get_u64(&fragment, 0x1f7c), G17P_SOURCE_EOT_PIPELINE);
+    }
+
+    #[test]
+    fn cold_opening_descriptors_apply_only_the_native_first_work_overrides() {
+        let parameters = G17pRenderParameters::source_rsrc8();
+        let mut tiling = [0u8; TA_DESCRIPTOR_SIZE];
+        let mut fragment = [0u8; FRAGMENT_DESCRIPTOR_SIZE];
+        build_cold_opening_ta_descriptor(&parameters, objects(), &mut tiling).unwrap();
+        build_cold_opening_fragment_descriptor(&parameters, objects(), &mut fragment).unwrap();
+
+        assert_eq!(&tiling[0x38..0x3e], &[0x47, 0, 0x49, 0, 0x49, 0]);
+        assert_eq!(tiling[0x789], 0x08);
+        assert_eq!(&tiling[0x93e..0x940], &[0xd0, 0x91]);
+
+        assert_eq!(get_u32(&fragment, 0x50), 1);
+        assert_eq!(&fragment[0x80..0x86], &[0x56, 0, 0x57, 0, 0x57, 0]);
+        assert_eq!(&fragment[0x88..0x8a], &[0x59, 0]);
+        assert_eq!(get_u32(&fragment, 0x90), 1);
+        assert_eq!(get_u32(&fragment, 0x215c), 0);
+        assert_eq!(&fragment[0x21d8..0x21da], &[0x10, 0xa2]);
+        assert_eq!(fragment[0x222d], 0);
+
+        assert_eq!(fnv1a64(&[&tiling]), 0xb81a_1c11_1ede_fe5f);
+        assert_eq!(fnv1a64(&[&fragment]), 0xf846_54e9_74ac_6ad3);
     }
 
     fn publication_input(kind: RenderDescriptorKind) -> QueuePublicationInput {

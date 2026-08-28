@@ -16,7 +16,6 @@ use core::num::NonZeroUsize;
 use core::ops::Range;
 use core::sync::atomic::{
     fence,
-    AtomicBool,
     AtomicU32,
     AtomicU64,
     AtomicU8,
@@ -95,6 +94,9 @@ const UAT_NUM_CTX: usize = 64;
 const UAT_USER_CTX_START: usize = 1;
 /// Number of available user contexts
 const UAT_USER_CTX: usize = UAT_NUM_CTX - UAT_USER_CTX_START;
+const T8140_CONTEXT_BOOTSTRAP_SOURCE_HIGH: u8 = 0;
+const T8140_CONTEXT_BOOTSTRAP_EMPTY_HIGH: u8 = 1;
+const T8140_CONTEXT_USER_OWNED: u8 = 2;
 
 /// Lower/user base VA
 pub(crate) const IOVA_USER_BASE: u64 = UAT_PGSZ as u64;
@@ -642,8 +644,22 @@ pub(crate) struct Vm {
     inner: ARef<gpuvm::GpuVm<VmInner>>,
     dummy_obj: ARef<gem::Object>,
     binding: Arc<Mutex<VmBinding>>,
+    driver_mappings: Arc<Mutex<Option<VmDriverMappings>>>,
 }
 no_debug!(Vm);
+
+struct VmDriverMappings {
+    mappings: KVec<KernelMapping>,
+    reserved_ranges: KVec<Range<u64>>,
+}
+no_debug!(VmDriverMappings);
+
+fn any_range_overlaps<I>(target: Range<u64>, mut ranges: I) -> bool
+where
+    I: Iterator<Item = Range<u64>>,
+{
+    ranges.any(|range| range.overlaps(target.clone()))
+}
 
 /// Slot data for a [`Vm`] slot (nothing, we only care about the indices).
 pub(crate) struct SlotInner();
@@ -728,6 +744,30 @@ impl KernelMapping {
     /// Returns the IOVA base of this mapping
     pub(crate) fn iova_range(&self) -> Range<u64> {
         self.0.start()..(self.0.start() + self.0.mapped_size as u64)
+    }
+
+    /// Map the same GEM subrange into another VM. The caller owns the returned
+    /// alias and must retain it for every GPU access that uses its address.
+    pub(crate) fn map_alias_into_range(
+        &self,
+        vm: &Vm,
+        range: Range<u64>,
+        prot: Prot,
+    ) -> Result<KernelMapping> {
+        let gem = self.0._gem.as_ref().ok_or(EINVAL)?;
+        let end = self
+            .0
+            .offset
+            .checked_add(self.0.mapped_size)
+            .ok_or(EOVERFLOW)?;
+        vm.map_in_range(
+            &*gem,
+            self.0.offset..end,
+            UAT_PGSZ as u64,
+            range,
+            prot,
+            false,
+        )
     }
 
     /// Remap a cached mapping as uncached, then synchronously flush that range of VAs from the
@@ -984,7 +1024,7 @@ pub(crate) struct Uat {
     kernel_vm: Vm,
     kernel_lower_vm: Vm,
     t8140_empty_high_roots: Option<[Vm; 2]>,
-    t8140_empty_high_roots_installed: AtomicBool,
+    t8140_context_phase: AtomicU8,
 }
 
 impl Handoff {
@@ -1185,12 +1225,129 @@ impl Vm {
                 }),
             )?,
             binding,
+            driver_mappings: Arc::pin_init(new_mutex!(None, "VmDriverMappings"), GFP_KERNEL)?,
         })
     }
 
     /// Get the translation table base for this Vm
     fn ttb(&self) -> u64 {
         self.binding.lock().ttb
+    }
+
+    /// Retain hardware-required fixed aliases for this VM's complete
+    /// lifetime. Installing them before the VM reaches userspace also makes
+    /// the GPUVM allocator reserve the addresses against user mappings.
+    pub(crate) fn install_driver_mappings(
+        &self,
+        mappings: KVec<KernelMapping>,
+        reserved_ranges: KVec<Range<u64>>,
+    ) -> Result {
+        let mut retained = self.driver_mappings.lock();
+        if retained.is_some() {
+            return Err(EBUSY);
+        }
+        *retained = Some(VmDriverMappings {
+            mappings,
+            reserved_ranges,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn driver_range_overlaps(&self, range: Range<u64>) -> bool {
+        self.driver_mappings.lock().as_ref().is_some_and(|driver| {
+            any_range_overlaps(
+                range.clone(),
+                driver.mappings.iter().map(KernelMapping::iova_range),
+            ) || any_range_overlaps(range, driver.reserved_ranges.iter().cloned())
+        })
+    }
+
+    /// Remove userspace mappings while preserving VM-lifetime driver aliases.
+    pub(crate) fn unmap_user_ranges(
+        &self,
+        user_range: Range<u64>,
+        kernel_range: Range<u64>,
+    ) -> Result {
+        let retained = self.driver_mappings.lock();
+        let driver = retained.as_ref();
+        let mut cursor = user_range.start;
+
+        while cursor < user_range.end {
+            if kernel_range.contains(&cursor) {
+                cursor = kernel_range.end.min(user_range.end);
+                continue;
+            }
+
+            let mut next = user_range.end;
+            let mut covering_end = cursor;
+            if let Some(driver) = driver {
+                for mapping in driver.mappings.iter() {
+                    let range = mapping.iova_range();
+                    if range.contains(&cursor) {
+                        covering_end = covering_end.max(range.end);
+                    } else if cursor < range.start {
+                        next = next.min(range.start);
+                    }
+                }
+                for range in driver.reserved_ranges.iter() {
+                    if range.contains(&cursor) {
+                        covering_end = covering_end.max(range.end);
+                    } else if cursor < range.start {
+                        next = next.min(range.start);
+                    }
+                }
+            }
+            if covering_end != cursor {
+                cursor = covering_end.min(user_range.end);
+                continue;
+            }
+            if cursor < kernel_range.start {
+                next = next.min(kernel_range.start);
+            }
+            if next <= cursor {
+                return Err(EIO);
+            }
+            self.unmap_range(cursor, next - cursor)?;
+            cursor = next;
+        }
+        Ok(())
+    }
+
+    /// Check that a byte range is fully mapped with the requested GPU access.
+    pub(crate) fn covers_range(
+        &self,
+        address: u64,
+        size: u64,
+        need_read: bool,
+        need_write: bool,
+    ) -> bool {
+        if size == 0 {
+            return false;
+        }
+        let Some(end) = address.checked_add(size) else {
+            return false;
+        };
+        let page_mask = UAT_PGMSK as u64;
+        let start = address & !page_mask;
+        let aligned_end = if end & page_mask == 0 {
+            end
+        } else {
+            match (end | page_mask).checked_add(1) {
+                Some(end) => end,
+                None => return false,
+            }
+        };
+        let mut inner = match self.inner.exec_lock(None, false) {
+            Ok(inner) => inner,
+            Err(_) => return false,
+        };
+        if start < inner.va_range.start || aligned_end > inner.va_range.end {
+            return false;
+        }
+        inner
+            .page_table
+            .covers_range(start..aligned_end, need_read, need_write)
+            .unwrap_or(false)
     }
 
     /// Map a GEM object (using its `SGTable`) into this Vm at a free address in a given range.
@@ -1625,42 +1782,60 @@ impl Uat {
     /// Both low roots remain resident; the source firmware high root remains
     /// retained by `kernel_vm` but is no longer present in the TTBAT.
     pub(crate) fn install_t8140_partial_opening_empty_high_roots(&self) -> Result {
-        if self
-            .t8140_empty_high_roots_installed
-            .load(Ordering::Acquire)
-        {
-            return if self.t8140_partial_opening_contexts_ready(true) {
-                Ok(())
-            } else {
-                Err(EIO)
-            };
-        }
-        if !self.t8140_partial_opening_contexts_ready(false) {
-            return Err(EIO);
-        }
         let empty = self.t8140_empty_high_roots.as_ref().ok_or(EIO)?;
-        let high = [empty[0].ttb(), empty[1].ttb()];
+        let low = self.kernel_lower_vm.ttb();
+        let source_high = self.kernel_vm.ttb();
+        let empty_high = [empty[0].ttb(), empty[1].ttb()];
         let inner = self.inner.lock();
         inner.handoff().lock();
         let ttbs = inner.ttbs();
-        ttbs[0].ttb1.store(high[0] | TTBR_VALID, Ordering::Release);
-        ttbs[1].ttb1.store(
-            high[1] | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT),
-            Ordering::Release,
-        );
+        let phase = self.t8140_context_phase.load(Ordering::Acquire);
+        let low_ready = ttbs[0].ttb0.load(Ordering::Acquire) == (low | TTBR_VALID)
+            && ttbs[1].ttb0.load(Ordering::Acquire)
+                == (low | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT));
+        let changed = match phase {
+            T8140_CONTEXT_BOOTSTRAP_SOURCE_HIGH => {
+                let source_ready = low_ready
+                    && ttbs[0].ttb1.load(Ordering::Acquire) == (source_high | TTBR_VALID)
+                    && ttbs[1].ttb1.load(Ordering::Acquire)
+                        == (source_high | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT));
+                if !source_ready {
+                    Err(EIO)
+                } else {
+                    ttbs[0]
+                        .ttb1
+                        .store(empty_high[0] | TTBR_VALID, Ordering::Release);
+                    ttbs[1].ttb1.store(
+                        empty_high[1] | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT),
+                        Ordering::Release,
+                    );
+                    self.t8140_context_phase
+                        .store(T8140_CONTEXT_BOOTSTRAP_EMPTY_HIGH, Ordering::Release);
+                    Ok(true)
+                }
+            }
+            T8140_CONTEXT_BOOTSTRAP_EMPTY_HIGH => {
+                let empty_ready = low_ready
+                    && ttbs[0].ttb1.load(Ordering::Acquire) == (empty_high[0] | TTBR_VALID)
+                    && ttbs[1].ttb1.load(Ordering::Acquire)
+                        == (empty_high[1] | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT));
+                if empty_ready {
+                    Ok(false)
+                } else {
+                    Err(EIO)
+                }
+            }
+            _ => Err(EBUSY),
+        };
         inner.handoff().unlock();
         core::mem::drop(inner);
 
-        mem::tlbi_asid(0);
-        mem::tlbi_asid(1);
-        mem::sync();
-        self.t8140_empty_high_roots_installed
-            .store(true, Ordering::Release);
-        if self.t8140_partial_opening_contexts_ready(true) {
-            Ok(())
-        } else {
-            Err(EIO)
+        if changed? {
+            mem::tlbi_asid(0);
+            mem::tlbi_asid(1);
+            mem::sync();
         }
+        Ok(())
     }
 
     /// Binds a `Vm` to a slot, preferring the last used one.
@@ -1684,9 +1859,16 @@ impl Uat {
                 let idx = (slot.slot() as usize) + UAT_USER_CTX_START;
                 let ttb = binding.ttb | TTBR_VALID | (idx as u64) << TTBR_ASID_SHIFT;
 
+                if self.cfg == UatConfig::T8140 && idx != 1 {
+                    return Err(EBUSY);
+                }
+
                 let uat_inner = self.inner.lock();
 
-                let ttb1 = if uat_inner.map_kernel_to_user {
+                let ttb1 = if self.cfg == UatConfig::T8140 {
+                    let empty = self.t8140_empty_high_roots.as_ref().ok_or(EIO)?;
+                    empty[1].ttb() | TTBR_VALID | (idx as u64) << TTBR_ASID_SHIFT
+                } else if uat_inner.map_kernel_to_user {
                     uat_inner.kernel_ttb1 | TTBR_VALID | (idx as u64) << TTBR_ASID_SHIFT
                 } else {
                     0
@@ -1694,14 +1876,28 @@ impl Uat {
 
                 let ttbs = uat_inner.ttbs();
                 uat_inner.handoff().lock();
+                let t8140_phase = self.t8140_context_phase.load(Ordering::Acquire);
                 if uat_inner.handoff().current_slot() == Some(idx as u32) {
                     pr_err!(
                         "Vm::bind to slot {}, but it is currently in use by the ASC?\n",
                         idx
                     );
                 }
+                if self.cfg == UatConfig::T8140
+                    && idx == 1
+                    && t8140_phase == T8140_CONTEXT_BOOTSTRAP_SOURCE_HIGH
+                {
+                    let empty = self.t8140_empty_high_roots.as_ref().ok_or(EIO)?;
+                    ttbs[0]
+                        .ttb1
+                        .store(empty[0].ttb() | TTBR_VALID, Ordering::Release);
+                }
                 ttbs[idx].ttb0.store(ttb, Ordering::Release);
                 ttbs[idx].ttb1.store(ttb1, Ordering::Release);
+                if self.cfg == UatConfig::T8140 && idx == 1 {
+                    self.t8140_context_phase
+                        .store(T8140_CONTEXT_USER_OWNED, Ordering::Release);
+                }
                 uat_inner.handoff().unlock();
                 core::mem::drop(uat_inner);
 
@@ -1910,7 +2106,7 @@ impl Uat {
             kernel_vm,
             kernel_lower_vm,
             t8140_empty_high_roots,
-            t8140_empty_high_roots_installed: AtomicBool::new(false),
+            t8140_context_phase: AtomicU8::new(T8140_CONTEXT_BOOTSTRAP_SOURCE_HIGH),
             inner,
             slots: slotalloc::SlotAllocator::new(
                 UAT_USER_CTX as u32,
@@ -1969,5 +2165,27 @@ impl Drop for Uat {
         fence(Ordering::SeqCst);
         mem::tlbi_all();
         mem::sync();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn g17p_fixed_pages_and_cl_arena_overlap_the_driver_ledger() {
+        let protected = [
+            0x10_0019_0000..0x10_0019_4000,
+            0x70_0183_8000..0x70_0183_c000,
+            0x70_0184_0000..0x70_0184_4000,
+            0x70_0000_0000..0x71_0000_0000,
+        ];
+        for range in protected.clone() {
+            assert!(any_range_overlaps(range, protected.clone().into_iter()));
+        }
+        assert!(!any_range_overlaps(
+            0x20_0000_0000..0x20_0000_4000,
+            protected.into_iter(),
+        ));
     }
 }

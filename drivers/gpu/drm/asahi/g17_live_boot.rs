@@ -39,7 +39,7 @@ use kernel::{
 
 use crate::{
     driver::{AsahiDevice, T8140LiveTopologyAdmission},
-    g17_completion, g17_lifecycle, g17_manager, g17_rtkit, hw, identity, regs,
+    g17_completion, g17_lifecycle, g17_manager, g17_rtkit, g17_uapi, gem, hw, identity, mmu, regs,
 };
 use kernel::sync::aref::ARef;
 
@@ -187,10 +187,7 @@ impl g17_lifecycle::AscCpuLifecycle for AscwrapV6Provider {
 }
 
 /// State retained for the full lifetime of an exact T8140 platform device.
-///
-/// This is intentionally not a [`crate::gpu::GpuManager`] yet. It owns the
-/// complete hardware/runtime lifetime needed by that next step without
-/// exposing a render node or accepting userspace submissions.
+/// Hardware/runtime owner used by the T8140 DRM frontend.
 pub(crate) struct G17PLiveRuntime {
     drm: Option<ARef<AsahiDevice>>,
     registers: Option<regs::Resources>,
@@ -206,6 +203,70 @@ pub(crate) struct G17PLiveRuntime {
 }
 
 impl G17PLiveRuntime {
+    pub(crate) fn is_crashed(&self) -> bool {
+        self.gfx_state
+            .as_ref()
+            .is_some_and(|state| state.crashed.load(Ordering::Acquire))
+            || self
+                .gfx1_state
+                .as_ref()
+                .is_some_and(|state| state.crashed.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn new_user_vm(
+        &mut self,
+        id: u64,
+        kernel_range: core::ops::Range<u64>,
+    ) -> Result<mmu::Vm> {
+        self.manager
+            .as_mut()
+            .ok_or(ENODEV)?
+            .new_user_vm(id, kernel_range)
+    }
+
+    pub(crate) fn map_timestamp_buffer(
+        &self,
+        bo: gem::ObjectRef,
+        range: core::ops::Range<usize>,
+    ) -> Result<mmu::KernelMapping> {
+        self.manager
+            .as_ref()
+            .ok_or(ENODEV)?
+            .map_timestamp_buffer(bo, range)
+    }
+
+    /// Build, publish, notify, and synchronously retire one translated user
+    /// render through the Linux-owned G17P queue graph.
+    pub(crate) fn submit_translated_render(
+        &mut self,
+        vm: &mmu::Vm,
+        command: &g17_uapi::TranslatedRenderCommand,
+        timestamps: [u64; 4],
+        timestamp_aliases: KVec<mmu::KernelMapping>,
+    ) -> Result {
+        if self.is_crashed() {
+            return Err(EIO);
+        }
+        let drm = self.drm.as_ref().ok_or(ENODEV)?.clone();
+        let prepared = self
+            .manager
+            .as_mut()
+            .ok_or(ENODEV)?
+            .begin_translated_render(&drm, vm, command, timestamps, timestamp_aliases)?;
+        Pin::new(self.gfx_rtkit.as_mut().ok_or(ENODEV)?)
+            .send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, prepared.paired_doorbell)?;
+        let completion = self
+            .manager
+            .as_mut()
+            .ok_or(ENODEV)?
+            .wait_translated_render_completion()?;
+        if completion.complete {
+            Ok(())
+        } else {
+            Err(EIO)
+        }
+    }
+
     /// Build and retain the exact T8140 dual-role runtime.
     pub(crate) fn start(
         pdev: &platform::Device<Core>,
@@ -221,6 +282,7 @@ impl G17PLiveRuntime {
         {
             return Err(EINVAL);
         }
+        let num_clusters = registers.get_gpu_id()?.num_clusters;
 
         dev_info!(
             pdev.as_ref(),
@@ -260,6 +322,7 @@ impl G17PLiveRuntime {
             &drm,
             soc,
             g17_manager::T8140_G17P_PLATFORM_CONFIG,
+            num_clusters,
         )?;
 
         let cpus = g17_lifecycle::StartedCpuPair::start(gfx, gfx1)?;
@@ -377,7 +440,7 @@ impl G17PLiveRuntime {
         publish_late_tiling_state: F,
     ) -> Result
     where
-        F: FnOnce() -> Result,
+        F: FnOnce(),
     {
         if self.render_tracker.is_some() {
             return Err(EBUSY);
@@ -393,7 +456,7 @@ impl G17PLiveRuntime {
     }
 
     /// Consume queue progress together with the scheduler job-list state and
-    /// the two four-word timestamp sets required for execution completion.
+    /// the owned start/end timestamps required for execution completion.
     pub(crate) fn observe_partial_opening_render_completion(
         &mut self,
         tiling_current: g17_completion::QueueIndices,

@@ -464,13 +464,14 @@ pub(crate) struct PairedRenderCompletion {
 /// Scheduler state for one paired TA/fragment job.
 ///
 /// Firmware queue retirement alone does not show that either GPU stage ran.
-/// A finished pair has left the intrusive job list and has all four current-job
-/// timestamp words populated for each half.
+/// A finished pair has left the intrusive job list and has both owned
+/// start/end timestamp words populated for each half. Optional UAPI
+/// timestamp destinations are separate outputs and are not completion gates.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct RenderExecutionState {
     pub(crate) job_list_empty: bool,
-    pub(crate) tiling_timestamps: [u64; 4],
-    pub(crate) fragment_timestamps: [u64; 4],
+    pub(crate) tiling_timestamps: [u64; 2],
+    pub(crate) fragment_timestamps: [u64; 2],
 }
 
 impl RenderExecutionState {
@@ -765,8 +766,8 @@ mod tests {
         };
         let executed = RenderExecutionState {
             job_list_empty: true,
-            tiling_timestamps: [0x10, 0x20, 0x30, 0x40],
-            fragment_timestamps: [0x50, 0x60, 0x70, 0x80],
+            tiling_timestamps: [0x10, 0x20],
+            fragment_timestamps: [0x50, 0x60],
         };
         let pending = observe_paired_render_completion(
             opening,
@@ -806,8 +807,8 @@ mod tests {
         };
         let parked = RenderExecutionState {
             job_list_empty: false,
-            tiling_timestamps: [0; 4],
-            fragment_timestamps: [0; 4],
+            tiling_timestamps: [0; 2],
+            fragment_timestamps: [0; 2],
         };
         let state =
             observe_paired_render_completion(opening, retired, 3, opening, retired, 3, parked)
