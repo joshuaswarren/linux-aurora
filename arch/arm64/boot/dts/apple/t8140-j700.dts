@@ -16,11 +16,9 @@
 
 	aliases {
 		atcphy0 = &atcphy0;
-		dcp = &dcp;
 		dcp0 = &dcp;
 		disp0 = &display;
 		disp0_piodma = &disp0_piodma;
-		nvram = &nvram;
 		serial0 = &serial0;
 		keyboard = &keyboard;
 	};

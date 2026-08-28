@@ -421,6 +421,7 @@
 			reg = <0x4 0x12300000 0x0 0xc000>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 698 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_disp_cpu>;
 			#iommu-cells = <1>;
 			apple,dma-range = <0x100 0x0 0x10 0x0>;
 			status = "disabled";
@@ -431,14 +432,73 @@
 			reg = <0x4 0x12340000 0x0 0xc000>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 698 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_disp_cpu>;
 			#iommu-cells = <1>;
 			apple,dma-range = <0x100 0x0 0x10 0x0>;
 			status = "disabled";
 		};
 
+		/*
+		 * DISP_INT uses PMC BWR agent 0 and boost agent 1. The H17P
+		 * callback exports exactly eight bytes of BWR state and four bytes
+		 * of clock-request state from these two windows.
+		 */
+		pmgr_dcp: power-management@3082a0000 {
+			reg = <0x3 0x082a0000 0x0 0x8>,
+			      <0x3 0x082e8000 0x0 0x4>;
+			reg-names = "dcp-bw-scratch", "dcp-bw-doorbell";
+			#apple,bw-scratch-cells = <3>;
+			#apple,bw-doorbell-cells = <2>;
+		};
+
+		dcp_mbox: mailbox@412e08000 {
+			compatible = "apple,t8140-asc-mailbox", "apple,asc-mailbox-v4";
+			reg = <0x4 0x12e08000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 679 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 680 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 681 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 682 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "send-not-empty",
+					  "recv-empty", "recv-not-empty";
+			power-domains = <&ps_disp_cpu>;
+			resets = <&ps_disp_cpu>;
+			#mbox-cells = <0>;
+			status = "disabled";
+		};
+
+		dcp: dcp@412e00000 {
+			compatible = "apple,t8140-dcp", "apple,dcp";
+			mboxes = <&dcp_mbox>;
+			mbox-names = "mbox";
+			iommus = <&dcp_dart 23>;
+
+			reg-names = "coproc", "disp-0", "disp-1", "disp-2",
+				    "disp-3", "disp-4";
+			reg = <0x4 0x12e00000 0x0 0x4000>,
+			      <0x4 0x10000000 0x0 0xafc000>,
+			      <0x4 0x12240000 0x0 0x10000>,
+			      <0x4 0x123a8000 0x0 0x4000>,
+			      <0x4 0x123ac000 0x0 0x4000>,
+			      <0x4 0x12800000 0x0 0x800000>;
+			apple,bw-scratch = <&pmgr_dcp 0 5 0>;
+			apple,bw-doorbell = <&pmgr_dcp 1 6>;
+			power-domains = <&ps_disp_cpu>;
+			resets = <&ps_disp_cpu>;
+			#address-cells = <2>;
+			#size-cells = <2>;
+			status = "disabled";
+
+			disp0_piodma: piodma {
+				iommus = <&disp0_dart 16>;
+				phandle = <&disp0_piodma>;
+			};
+		};
+
 		display: display-subsystem {
 			compatible = "apple,display-subsystem";
 			iommus = <&disp0_dart 0>;
+			phandle = <&display>;
 			status = "disabled";
 		};
 
