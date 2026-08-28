@@ -51,6 +51,9 @@
 #define APPLE_ASCWRAP_V6_MBOX_OFFSET 0x8000
 #define APPLE_ASCWRAP_V6_WRAPPER_SIZE 0x88000
 #define APPLE_ASCWRAP_V6_IOP_VBAR_SIZE 0x8
+#define APPLE_ASCWRAP_V6_CPU_CONTROL 0x44
+#define APPLE_ASCWRAP_V6_CPU_RUN BIT(4)
+#define APPLE_ASCWRAP_V6_CPU_STOP_SECOND_CLEAR BIT(5)
 
 #define APPLE_T8140_GFX_WRAPPER_BASE 0x482600000ULL
 #define APPLE_T8140_GFX_IOP_VBAR_BASE 0x482050000ULL
@@ -144,19 +147,97 @@ int apple_mbox_ascwrap_v6_require_safe_cpu_lifecycle(struct apple_mbox *mbox)
 	if (READ_ONCE(mbox->removing))
 		return -ENODEV;
 
-	/*
-	 * This is intentionally checked before any CPU_CONTROL or IOP VBAR
-	 * write.  Clearing CPU_RUN alone is not the complete AppleA7IOP stop
-	 * transaction, and no grounded hardware reset exists yet.  Keep the
-	 * provider as the sole future lifecycle owner without exposing a
-	 * one-way start primitive to consumers.
-	 */
+	/* Future provider revisions may report additional lifecycle work. */
 	if (mbox->ascwrap_v6.missing)
 		return -EOPNOTSUPP;
 
 	return 0;
 }
 EXPORT_SYMBOL_GPL(apple_mbox_ascwrap_v6_require_safe_cpu_lifecycle);
+
+static void apple_mbox_ascwrap_v6_stop_cpu_locked(struct apple_mbox *mbox)
+{
+	void __iomem *cpu_control;
+	u32 val;
+
+	if (!mbox->ascwrap_v6_cpu_running)
+		return;
+
+	cpu_control = (u8 __iomem *)mbox->wrapper_regs +
+		      APPLE_ASCWRAP_V6_CPU_CONTROL;
+
+	/* AppleASCWrapV6::_runCPU(false): clear RUN, reread, clear bit 5. */
+	val = readl(cpu_control);
+	writel(val & ~APPLE_ASCWRAP_V6_CPU_RUN, cpu_control);
+	val = readl(cpu_control);
+	writel(val & ~APPLE_ASCWRAP_V6_CPU_STOP_SECOND_CLEAR, cpu_control);
+
+	mbox->ascwrap_v6_cpu_running = false;
+	pm_runtime_mark_last_busy(mbox->dev);
+	pm_runtime_put_autosuspend(mbox->dev);
+}
+
+int apple_mbox_ascwrap_v6_start_cpu(struct apple_mbox *mbox)
+{
+	void __iomem *cpu_control;
+	u32 val;
+	int ret = 0;
+
+	if (!mbox || !mbox->hw->is_ascwrap_v6 || !mbox->wrapper_regs)
+		return -EOPNOTSUPP;
+
+	mutex_lock(&mbox->lifecycle_lock);
+	if (mbox->removing) {
+		ret = -ENODEV;
+		goto out_unlock;
+	}
+	if (mbox->ascwrap_v6.missing) {
+		ret = -EOPNOTSUPP;
+		goto out_unlock;
+	}
+	if (mbox->ascwrap_v6_cpu_running) {
+		ret = -EBUSY;
+		goto out_unlock;
+	}
+
+	ret = pm_runtime_resume_and_get(mbox->dev);
+	if (ret)
+		goto out_unlock;
+
+	cpu_control = (u8 __iomem *)mbox->wrapper_regs +
+		      APPLE_ASCWRAP_V6_CPU_CONTROL;
+
+	/* AppleASCWrapV6::_runCPU(true): read, set RUN, write. */
+	val = readl(cpu_control);
+	writel(val | APPLE_ASCWRAP_V6_CPU_RUN, cpu_control);
+	mbox->ascwrap_v6_cpu_running = true;
+
+out_unlock:
+	mutex_unlock(&mbox->lifecycle_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_mbox_ascwrap_v6_start_cpu);
+
+int apple_mbox_ascwrap_v6_stop_cpu(struct apple_mbox *mbox)
+{
+	int ret = 0;
+
+	if (!mbox || !mbox->hw->is_ascwrap_v6 || !mbox->wrapper_regs)
+		return -EOPNOTSUPP;
+
+	mutex_lock(&mbox->lifecycle_lock);
+	if (mbox->removing) {
+		ret = -ENODEV;
+		goto out_unlock;
+	}
+
+	apple_mbox_ascwrap_v6_stop_cpu_locked(mbox);
+
+out_unlock:
+	mutex_unlock(&mbox->lifecycle_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_mbox_ascwrap_v6_stop_cpu);
 
 int apple_mbox_send(struct apple_mbox *mbox, const struct apple_mbox_msg msg,
 		    bool atomic)
@@ -370,11 +451,10 @@ void apple_mbox_stop(struct apple_mbox *mbox)
 EXPORT_SYMBOL(apple_mbox_stop);
 
 /*
- * Quiesce every provider-owned transport edge before devres can release the
- * IRQs or MMIO mappings. Device links guarantee that mailbox consumers have
- * already unbound; the callback clear and waiter wake are defensive if a
- * future consumer violates that ownership rule. This deliberately performs
- * no ASC CPU-control, IOP VBAR, firmware-DMA, mapper, or reset operation.
+ * Stop the provider-owned CPU, then quiesce every transport edge before
+ * devres releases IRQs or MMIO mappings. Device links order consumer removal
+ * first; the callback clear and waiter wake also cover future consumers that
+ * violate that ownership rule.
  */
 static void apple_mbox_quiesce(void *data)
 {
@@ -388,6 +468,7 @@ static void apple_mbox_quiesce(void *data)
 		mutex_unlock(&mbox->lifecycle_lock);
 		return;
 	}
+	apple_mbox_ascwrap_v6_stop_cpu_locked(mbox);
 
 	/* Serialize the removal fence with every MMIO send critical section. */
 	spin_lock_irqsave(&mbox->tx_lock, flags);
@@ -535,9 +616,8 @@ static int apple_mbox_probe(struct platform_device *pdev)
 		mbox->ascwrap_v6.wrapper_size = resource_size(res);
 		mbox->ascwrap_v6.iop_vbar_start = iop_vbar_res->start;
 		mbox->ascwrap_v6.iop_vbar_size = resource_size(iop_vbar_res);
-		mbox->ascwrap_v6.missing =
-			APPLE_MBOX_ASCWRAP_V6_MISSING_SAFE_STOP |
-			APPLE_MBOX_ASCWRAP_V6_MISSING_SAFE_RESET;
+		/* resetState() is software-only; the matching stop lives above. */
+		mbox->ascwrap_v6.missing = 0;
 
 		mbox->wrapper_regs =
 			devm_platform_ioremap_resource_byname(pdev, "wrapper");

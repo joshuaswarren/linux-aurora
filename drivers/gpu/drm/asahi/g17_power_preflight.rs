@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! Fail-closed G17 cold-boot and power preflight.
+//! G17 cold-boot and power preflight.
 //!
 //! This module joins three independently grounded contracts without issuing
 //! MMIO, mailbox traffic, DMA, or firmware writes:
@@ -614,7 +614,7 @@ mod tests {
         let identity = id(0x0a, 0);
         let exact = j700_linux_dt_topology();
 
-        // No observation: fail closed, never substitute the constant.
+        // No observation means missing topology. Never substitute the constant.
         assert_eq!(
             G17PowerPreflight::new_with_linux_dt(&identity, None).unwrap_err(),
             G17PowerPreflightError::MissingT8140Topology
@@ -846,6 +846,8 @@ mod tests {
                 REQUIRED_LIVE_EVIDENCE
                     & !missing_live::FIRMWARE_LOAD_CACHE_MAINTENANCE
                     & !missing_live::ASC_WRAPPER_MMIO_ENABLE
+                    & !missing_live::ASC_CONTROL_APERTURE_OWNERSHIP
+                    & !missing_live::ASC_TEARDOWN_OWNER
             );
             assert!(initial.contains(missing_live::COLD_BOOT_OBSERVATION));
             complete_cold_boot(&mut preflight);
@@ -856,6 +858,8 @@ mod tests {
                     & !missing_live::FIRMWARE_LOAD_CACHE_MAINTENANCE
                     & !missing_live::COLD_BOOT_OBSERVATION
                     & !missing_live::ASC_WRAPPER_MMIO_ENABLE
+                    & !missing_live::ASC_CONTROL_APERTURE_OWNERSHIP
+                    & !missing_live::ASC_TEARDOWN_OWNER
             );
             assert!(!complete.contains(missing_live::COLD_BOOT_OBSERVATION));
             for bit in [
@@ -867,14 +871,14 @@ mod tests {
                 missing_live::GFX1_POWER_SEQUENCE,
                 missing_live::RECOVERY_HANDSHAKE,
                 missing_live::PMGR_ASC_GATE_ORDER,
-                missing_live::ASC_CONTROL_APERTURE_OWNERSHIP,
                 missing_live::IORVBAR_DMA_VISIBILITY,
-                missing_live::ASC_TEARDOWN_OWNER,
             ] {
                 assert!(complete.contains(bit));
             }
             assert!(!complete.contains(missing_live::FIRMWARE_LOAD_CACHE_MAINTENANCE));
             assert!(!complete.contains(missing_live::ASC_WRAPPER_MMIO_ENABLE));
+            assert!(!complete.contains(missing_live::ASC_CONTROL_APERTURE_OWNERSHIP));
+            assert!(!complete.contains(missing_live::ASC_TEARDOWN_OWNER));
         }
         assert!(!g17_boot::EXECUTABLE_G17X_FIRMWARE_START_HANDSHAKE_AVAILABLE);
         assert!(!agx_power_recovery::EXECUTABLE_GFX1_POWER_SEQUENCE_AVAILABLE);

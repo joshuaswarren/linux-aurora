@@ -2,7 +2,7 @@
 
 //! Support for Apple ASC Mailbox.
 //!
-//! C header: [`include/linux/soc/apple/mailbox.h`](../../../../include/linux/gpio/driver.h)
+//! C header: [`include/linux/soc/apple/mailbox.h`](../../../../include/linux/soc/apple/mailbox.h)
 
 use crate::{
     bindings,
@@ -140,15 +140,15 @@ pub struct AscwrapV6Lifecycle {
     pub wrapper: (u64, u64),
     /// CPU physical base and size of the provider-owned IOP VBAR window.
     pub iop_vbar: (u64, u64),
-    /// Non-zero until a complete provider-owned stop/reset path exists.
+    /// Remaining provider lifecycle work. Zero for T8140.
     pub missing: u32,
 }
 
 /// Non-owning handle used to query an ASCWrap v6 mailbox provider.
 ///
 /// The provider, not the consumer, maps the wrapper and IOP VBAR resources.
-/// This handle deliberately exposes no MMIO pointer and no one-way CPU-start
-/// primitive.
+/// This handle exposes no MMIO pointer. CPU start and stop remain serialized
+/// inside the provider.
 pub struct AscwrapV6Provider {
     mbox: *mut bindings::apple_mbox,
 }
@@ -187,20 +187,27 @@ impl AscwrapV6Provider {
         })
     }
 
-    /// Require a lifecycle that can be unwound after every partial failure.
-    ///
-    /// This currently returns `EOPNOTSUPP` before any CPU or IOP VBAR write,
-    /// because the grounded provider-owned stop/reset implementation is not
-    /// complete.
+    /// Check that this provider has a complete matching CPU stop operation.
     pub fn require_safe_cpu_lifecycle(&self) -> Result {
-        // SAFETY: this is a capability check on a valid provider pointer.  It
-        // performs no MMIO writes while any lifecycle gate is missing.
+        // SAFETY: this is a capability check on a valid provider pointer.
         to_result(unsafe { bindings::apple_mbox_ascwrap_v6_require_safe_cpu_lifecycle(self.mbox) })
+    }
+
+    /// Start this provider's CPU with the ASCWrap v6 `_runCPU(true)` transform.
+    pub fn start_cpu(&self) -> Result {
+        // SAFETY: the provider owns and synchronizes its wrapper mapping.
+        to_result(unsafe { bindings::apple_mbox_ascwrap_v6_start_cpu(self.mbox) })
+    }
+
+    /// Stop this provider's CPU with the ASCWrap v6 `_runCPU(false)` transform.
+    pub fn stop_cpu(&self) -> Result {
+        // SAFETY: the provider owns and synchronizes its wrapper mapping.
+        to_result(unsafe { bindings::apple_mbox_ascwrap_v6_stop_cpu(self.mbox) })
     }
 }
 
 // SAFETY: provider state is internally synchronized by the C mailbox driver;
-// this wrapper exposes read-only queries and a fail-closed capability check.
+// this wrapper only exposes provider-serialized queries and CPU transitions.
 unsafe impl Send for AscwrapV6Provider {}
 // SAFETY: as above.
 unsafe impl Sync for AscwrapV6Provider {}

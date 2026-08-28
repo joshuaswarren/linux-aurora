@@ -8,7 +8,6 @@
 #ifndef _APPLE_MAILBOX_H_
 #define _APPLE_MAILBOX_H_
 
-#include <linux/bits.h>
 #include <linux/device.h>
 #include <linux/mutex.h>
 #include <linux/types.h>
@@ -32,13 +31,6 @@ enum apple_mbox_ascwrap_v6_role {
 	APPLE_MBOX_ASCWRAP_V6_ROLE_GFX1,
 };
 
-/*
- * Missing pieces of the provider-owned ASCWrap v6 CPU lifecycle.  Consumers
- * must treat any non-zero mask as a hard pre-CPU-start gate.
- */
-#define APPLE_MBOX_ASCWRAP_V6_MISSING_SAFE_STOP	BIT(0)
-#define APPLE_MBOX_ASCWRAP_V6_MISSING_SAFE_RESET	BIT(1)
-
 /**
  * struct apple_mbox_ascwrap_v6_lifecycle - provider-owned lifecycle facts
  * @role: firmware role owned by this provider
@@ -46,12 +38,12 @@ enum apple_mbox_ascwrap_v6_role {
  * @wrapper_size: size of the provider's ASCWrap window
  * @iop_vbar_start: CPU physical base of the provider's IOP VBAR window
  * @iop_vbar_size: size of the provider's IOP VBAR window
- * @missing: APPLE_MBOX_ASCWRAP_V6_MISSING_* execution gates
+ * @missing: remaining provider lifecycle work; zero for T8140
  *
- * This is deliberately a capability/query surface, not an invitation for a
- * mailbox consumer to map either resource.  The apple-mailbox provider owns
- * both mappings.  CPU start remains forbidden until the provider can also
- * perform the complete matching stop/reset sequence.
+ * The apple-mailbox provider owns both mappings.  Consumers request CPU
+ * transitions through the provider and never map either resource themselves.
+ * T8140 has a complete matching start and stop transform.  AppleA7IOP's
+ * resetState() only updates software state and performs no reset MMIO.
  */
 struct apple_mbox_ascwrap_v6_lifecycle {
 	enum apple_mbox_ascwrap_v6_role role;
@@ -72,6 +64,7 @@ struct apple_mbox {
 	/* Serializes transport start/stop against provider removal. */
 	struct mutex lifecycle_lock;
 	bool active;
+	bool ascwrap_v6_cpu_running;
 	bool removing;
 
 	int irq_recv_not_empty;
@@ -100,5 +93,7 @@ int apple_mbox_ascwrap_v6_get_lifecycle(
 	struct apple_mbox *mbox,
 	struct apple_mbox_ascwrap_v6_lifecycle *lifecycle);
 int apple_mbox_ascwrap_v6_require_safe_cpu_lifecycle(struct apple_mbox *mbox);
+int apple_mbox_ascwrap_v6_start_cpu(struct apple_mbox *mbox);
+int apple_mbox_ascwrap_v6_stop_cpu(struct apple_mbox *mbox);
 
 #endif
