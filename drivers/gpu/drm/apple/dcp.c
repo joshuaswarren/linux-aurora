@@ -336,10 +336,7 @@ int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state *state)
 {
 	struct platform_device *pdev = to_apple_crtc(crtc)->dcp;
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
-	struct drm_plane_state *new_state;
-	struct drm_plane *plane;
 	struct drm_crtc_state *crtc_state;
-	int plane_idx, plane_count = 0;
 	bool needs_modeset;
 
 	if (dcp->crashed)
@@ -350,19 +347,6 @@ int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state *state)
 	needs_modeset = drm_atomic_crtc_needs_modeset(crtc_state) || !dcp->valid_mode;
 	if (!needs_modeset && !dcp->connector->connected) {
 		dev_err(dcp->dev, "crtc_atomic_check: disconnected but no modeset\n");
-		return -EINVAL;
-	}
-
-	for_each_new_plane_in_state(state, plane, new_state, plane_idx) {
-		/* skip planes not for this crtc */
-		if (new_state->crtc != crtc)
-			continue;
-
-		plane_count += 1;
-	}
-
-	if (plane_count > DCP_MAX_PLANES) {
-		dev_err(dcp->dev, "crtc_atomic_check: Blend supports only 2 layers!\n");
 		return -EINVAL;
 	}
 
@@ -512,6 +496,14 @@ bool dcp_fw_compat_is_12_x(struct platform_device *pdev)
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 
 	return dcp->fw_compat == DCP_FIRMWARE_V_12_3;
+}
+
+const u32 *dcp_get_iomfb_surfaces(struct platform_device *pdev, u32 *count)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	*count = dcp->iomfb_surfaces.count;
+	return dcp->iomfb_surfaces.id;
 }
 
 int dcp_start(struct platform_device *pdev)
@@ -1229,7 +1221,10 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	enum dcp_firmware_version fw_compat;
 	struct device *dev = &pdev->dev;
 	struct apple_dcp *dcp;
+	int num_surfaces;
+	u32 surface_ids[DCP_MAX_PLANES];
 	u32 mux_index;
+	int ret;
 
 	fw_compat = dcp_check_firmware_version(dev);
 	if (fw_compat == DCP_FIRMWARE_UNKNOWN)
@@ -1250,6 +1245,28 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	dcp->fw_compat = fw_compat;
 	dcp->dev = dev;
 	dcp->hw = *(struct apple_dcp_hw_data *)of_device_get_match_data(dev);
+
+	if (!of_property_present(dev->of_node, "apple,iomfb-surfaces")) {
+		ret = apple_dcp_surface_order_init(&dcp->iomfb_surfaces, NULL, 0);
+	} else {
+		num_surfaces = of_property_count_u32_elems(dev->of_node,
+							  "apple,iomfb-surfaces");
+		if (num_surfaces <= 0 || num_surfaces > DCP_MAX_PLANES)
+			return dev_err_probe(dev,
+				num_surfaces < 0 ? num_surfaces : -EINVAL,
+				"invalid apple,iomfb-surfaces length %d\n",
+				num_surfaces);
+		ret = of_property_read_u32_array(dev->of_node,
+						 "apple,iomfb-surfaces",
+						 surface_ids, num_surfaces);
+		if (!ret)
+			ret = apple_dcp_surface_order_init(&dcp->iomfb_surfaces,
+							   surface_ids,
+							   num_surfaces);
+	}
+	if (ret)
+		return dev_err_probe(dev, ret,
+				     "invalid apple,iomfb-surfaces order\n");
 
 	platform_set_drvdata(pdev, dcp);
 

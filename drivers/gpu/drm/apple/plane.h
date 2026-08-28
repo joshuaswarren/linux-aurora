@@ -12,6 +12,13 @@
 
 #include "iomfb_plane.h"
 
+struct apple_plane {
+	struct drm_plane base;
+	u32 iomfb_surface;
+};
+
+#define to_apple_plane(x) container_of(x, struct apple_plane, base)
+
 struct apple_plane_state {
 	struct drm_plane_state base;
 	struct dcp_surface surf;
@@ -24,6 +31,7 @@ struct apple_plane_state {
 
 struct drm_plane *apple_plane_init(struct drm_device *dev,
 				   unsigned long possible_crtcs,
+				   u32 iomfb_surface,
 				   bool supports_l10r,
 				   enum drm_plane_type type);
 
