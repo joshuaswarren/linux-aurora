@@ -1040,6 +1040,10 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	start_mode = apple_dcp_coprocessor_start_mode(
 		loader_handoff, dcp->hw.adopt_running_coprocessor,
 		cpu_ctrl, cpu_status);
+	if (loader_stopped)
+		dev_info(dev,
+			 "DCP takeover: loader-stopped handoff detected (control=%#x status=%#x)\n",
+			 cpu_ctrl, cpu_status);
 
 	of_property_read_u32(dev->of_node, "apple,dcp-index",
 					   &dcp->index);
@@ -1130,8 +1134,7 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	if (apple_dcp_needs_reset(start_mode)) {
 		struct reset_control *reset;
 
-		dev_info(dev,
-			 "resetting loader-stopped DCP session before RTKit boot\n");
+		dev_info(dev, "DCP takeover: display CPU reset begin\n");
 		reset = devm_reset_control_get_exclusive(dev, NULL);
 		if (IS_ERR(reset))
 			return dev_err_probe(dev, PTR_ERR(reset),
@@ -1140,6 +1143,7 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 		if (ret)
 			return dev_err_probe(dev, ret,
 					     "Failed to reset DCP: %d\n", ret);
+		dev_info(dev, "DCP takeover: display CPU reset complete\n");
 	}
 
 	if (apple_dcp_needs_adoption(start_mode)) {
@@ -1166,6 +1170,8 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 			dev_info(dev, "restarting loader-quiesced DCP session\n");
 		else if (start_mode == APPLE_DCP_COPROCESSOR_IDLE_RESTART)
 			dev_info(dev, "restarting loader-idled DCP session\n");
+		else if (apple_dcp_needs_reset(start_mode))
+			dev_info(dev, "DCP takeover: fresh RTKit boot begin\n");
 		dcp->rtk = devm_apple_rtkit_init(dev, dcp, "mbox", 0,
 						   &rtkit_ops);
 		if (IS_ERR(dcp->rtk))
@@ -1182,6 +1188,8 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	if (ret)
 		return dev_err_probe(dev, ret,
 				     "Failed to boot RTKit: %d\n", ret);
+	if (apple_dcp_needs_reset(start_mode))
+		dev_info(dev, "DCP takeover: fresh RTKit boot complete\n");
 	return ret;
 }
 
