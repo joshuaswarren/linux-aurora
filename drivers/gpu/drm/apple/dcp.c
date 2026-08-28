@@ -19,7 +19,6 @@
 #include <linux/of_address.h>
 #include <linux/of_device.h>
 #include <linux/of_platform.h>
-#include <linux/reset.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/string.h>
@@ -1131,21 +1130,6 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	dcp->swapped_out_fbs =
 		(struct list_head)LIST_HEAD_INIT(dcp->swapped_out_fbs);
 
-	if (apple_dcp_needs_reset(start_mode)) {
-		struct reset_control *reset;
-
-		dev_info(dev, "DCP takeover: display CPU reset begin\n");
-		reset = devm_reset_control_get_exclusive(dev, NULL);
-		if (IS_ERR(reset))
-			return dev_err_probe(dev, PTR_ERR(reset),
-					     "Failed to acquire DCP reset\n");
-		ret = reset_control_reset(reset);
-		if (ret)
-			return dev_err_probe(dev, ret,
-					     "Failed to reset DCP: %d\n", ret);
-		dev_info(dev, "DCP takeover: display CPU reset complete\n");
-	}
-
 	if (apple_dcp_needs_adoption(start_mode)) {
 		dev_info(dev,
 			 "quiescing inherited DCP session (control=%#x status=%#x)\n",
@@ -1170,8 +1154,9 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 			dev_info(dev, "restarting loader-quiesced DCP session\n");
 		else if (start_mode == APPLE_DCP_COPROCESSOR_IDLE_RESTART)
 			dev_info(dev, "restarting loader-idled DCP session\n");
-		else if (apple_dcp_needs_reset(start_mode))
-			dev_info(dev, "DCP takeover: fresh RTKit boot begin\n");
+		else if (apple_dcp_needs_fresh_boot(start_mode))
+			dev_info(dev,
+				 "DCP takeover: starting stopped display CPU with a fresh RTKit session\n");
 		dcp->rtk = devm_apple_rtkit_init(dev, dcp, "mbox", 0,
 						   &rtkit_ops);
 		if (IS_ERR(dcp->rtk))
@@ -1181,14 +1166,20 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 
 	cpu_ctrl = readl_relaxed(dcp->coproc_reg +
 				 APPLE_DCP_COPROC_CPU_CONTROL);
-	writel_relaxed(cpu_ctrl | APPLE_DCP_COPROC_CPU_CONTROL_RUN,
+	cpu_ctrl |= APPLE_DCP_COPROC_CPU_CONTROL_RUN;
+	writel_relaxed(cpu_ctrl,
 		       dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
+	cpu_ctrl = readl_relaxed(dcp->coproc_reg +
+				 APPLE_DCP_COPROC_CPU_CONTROL);
+	if (apple_dcp_needs_fresh_boot(start_mode))
+		dev_info(dev, "DCP takeover: display CPU start control=%#x\n",
+			 cpu_ctrl);
 
 	ret = apple_rtkit_wake(dcp->rtk);
 	if (ret)
 		return dev_err_probe(dev, ret,
 				     "Failed to boot RTKit: %d\n", ret);
-	if (apple_dcp_needs_reset(start_mode))
+	if (apple_dcp_needs_fresh_boot(start_mode))
 		dev_info(dev, "DCP takeover: fresh RTKit boot complete\n");
 	return ret;
 }
