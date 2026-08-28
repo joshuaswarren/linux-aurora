@@ -11,6 +11,8 @@
 
 #[cfg(not(test))]
 use kernel::prelude::*;
+#[cfg(not(test))]
+use kernel::time::{delay::fsleep, Delta};
 
 #[cfg(not(test))]
 use core::sync::atomic::{fence, Ordering};
@@ -309,6 +311,10 @@ fn resource_observation(
 pub(crate) struct G17PManagerConstruction {
     resources: g17_resources::G17ResourceOwner,
     platform: G17PPlatformConfig,
+    num_clusters: u32,
+    render_storage: Option<g17_resources::G17PUserRenderStorage>,
+    render_tracker: Option<G17PPartialOpeningRenderTracker>,
+    render_bind: Option<mmu::VmBind>,
 }
 
 /// A queue which has completed the host's configuration pair and QID-enable
@@ -370,7 +376,11 @@ impl G17PManagerConstruction {
         dev: &AsahiDevice,
         soc: &'static agx3::SocConfig,
         platform: G17PPlatformConfig,
+        num_clusters: u32,
     ) -> Result<Self> {
+        if num_clusters == 0 {
+            return Err(EINVAL);
+        }
         validate_target(target_observation(soc)).map_err(|_| EINVAL)?;
         validate_platform(platform).map_err(|_| EINVAL)?;
 
@@ -382,6 +392,10 @@ impl G17PManagerConstruction {
         Ok(Self {
             resources,
             platform,
+            num_clusters,
+            render_storage: None,
+            render_tracker: None,
+            render_bind: None,
         })
     }
 
@@ -416,9 +430,9 @@ impl G17PManagerConstruction {
             || context.render_empty_high_root_slot != 1
             || context.transport_pair != 2
             || context.descriptor_pair != 0
-            || context.graph_context_id != 2
-            || context.optional_identity_context_id != 3
-            || context.descriptor_context_id != 2
+            || context.shared_queue_pair_namespace != 0
+            || context.optional_identity_context_id != 1
+            || context.descriptor_context_id != 1
             || context.scheduler_class != 2
             || context.work_doorbell_channel != 8
             || !context.context0_low_root_present_at_first_work
@@ -454,19 +468,23 @@ impl G17PManagerConstruction {
         g17_submission::PreparedG17PPartialOpeningWorkPair,
     )>
     where
-        F: FnOnce() -> Result,
+        F: FnOnce(),
     {
         self.validate_partial_opening_resources()?;
         if submission.fragment_queue_write_index != 3 || submission.tiling_queue_write_index != 3 {
             return Err(EINVAL);
         }
-        let prepared = self.resources.publish_partial_opening_pair(
+        let (prepared, render_bind) = self.resources.publish_partial_opening_pair(
+            None,
             submission.fragment_queue_gpu_va,
             submission.fragment_queue_write_index,
             submission.tiling_queue_gpu_va,
             submission.tiling_queue_write_index,
             publish_late_tiling_state,
         )?;
+        if render_bind.is_some() {
+            return Err(EINVAL);
+        }
         if prepared.paired_doorbell != g17_submission::G17P_PARTIAL_OPENING_PAIRED_DOORBELL
             || prepared.paired_doorbell != 0x0083_0000_0000_0008
         {
@@ -511,6 +529,125 @@ impl G17PManagerConstruction {
         tracker.tiling_previous = tiling_current;
         tracker.fragment_previous = fragment_current;
         Ok(completion)
+    }
+
+    pub(crate) fn new_user_vm(
+        &mut self,
+        id: u64,
+        kernel_range: core::ops::Range<u64>,
+    ) -> Result<mmu::Vm> {
+        let vm = self.resources.uat().new_vm(id, kernel_range)?;
+        self.resources.install_user_vm_aliases(&vm)?;
+        Ok(vm)
+    }
+
+    pub(crate) fn map_timestamp_buffer(
+        &self,
+        mut bo: crate::gem::ObjectRef,
+        range: core::ops::Range<usize>,
+    ) -> Result<mmu::KernelMapping> {
+        bo.map_range_into_range(
+            self.resources.uat().kernel_vm(),
+            range,
+            self.resources.uat().kernel_va_range()?,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_FW_SHARED_RW,
+            false,
+        )
+    }
+
+    pub(crate) fn begin_translated_render(
+        &mut self,
+        dev: &AsahiDevice,
+        vm: &mmu::Vm,
+        command: &g17_uapi::TranslatedRenderCommand,
+        user_timestamps: [u64; 4],
+        user_timestamp_aliases: KVec<mmu::KernelMapping>,
+    ) -> Result<g17_submission::PreparedG17PPartialOpeningWorkPair> {
+        if self.render_tracker.is_some() {
+            return Err(EBUSY);
+        }
+        self.render_bind = None;
+        self.render_storage = None;
+        let mut storage = self.resources.new_user_render_storage(
+            dev,
+            vm,
+            command,
+            self.num_clusters,
+            user_timestamps,
+            user_timestamp_aliases,
+        )?;
+        if !storage.is_reachable_from(vm) {
+            return Err(EFAULT);
+        }
+        storage.stage_fragment()?;
+        // Build and map every TA byte while both producers are hidden. The
+        // returned publication performs only infallible copies.
+        let late_tiling = storage.prepare_late_tiling_publication()?;
+        let (fragment_queue, tiling_queue) = storage.queue_gpu_vas();
+        let (prepared, render_bind) = self.resources.publish_partial_opening_pair(
+            Some(vm),
+            fragment_queue,
+            3,
+            tiling_queue,
+            3,
+            move || late_tiling.publish(),
+        )?;
+        let render_bind = render_bind.ok_or(EINVAL)?;
+        self.render_tracker = Some(G17PPartialOpeningRenderTracker {
+            tiling_previous: g17_completion::QueueIndices {
+                done: 0,
+                read: 0,
+                write: 3,
+            },
+            fragment_previous: g17_completion::QueueIndices {
+                done: 0,
+                read: 0,
+                write: 3,
+            },
+            tiling_prefix: 3,
+            fragment_prefix: 3,
+        });
+        self.render_bind = Some(render_bind);
+        self.render_storage = Some(storage);
+        Ok(prepared)
+    }
+
+    pub(crate) fn wait_translated_render_completion(
+        &mut self,
+    ) -> Result<g17_completion::PairedRenderCompletion> {
+        const POLLS: usize = 2000;
+        for _ in 0..POLLS {
+            fence(Ordering::Acquire);
+            let state = self.render_storage.as_mut().ok_or(ENODEV)?.snapshot()?;
+            let tracker = self.render_tracker.as_mut().ok_or(ENODEV)?;
+            let completion = g17_completion::observe_paired_render_completion(
+                tracker.tiling_previous,
+                state.tiling,
+                tracker.tiling_prefix,
+                tracker.fragment_previous,
+                state.fragment,
+                tracker.fragment_prefix,
+                g17_completion::RenderExecutionState {
+                    job_list_empty: state.job_list_empty,
+                    tiling_timestamps: state.tiling_timestamps,
+                    fragment_timestamps: state.fragment_timestamps,
+                },
+            )
+            .map_err(|_| EINVAL)?;
+            tracker.tiling_previous = state.tiling;
+            tracker.fragment_previous = state.fragment;
+            if completion.complete {
+                self.render_tracker = None;
+                self.render_storage = None;
+                self.render_bind = None;
+                return Ok(completion);
+            }
+            fsleep(Delta::from_millis(1));
+        }
+        // The graph remains pinned because firmware may still own it. Runtime
+        // teardown stops both provider CPUs before manager resources drop.
+        Err(ETIMEDOUT)
     }
 
     pub(crate) fn sksm_scratch(&self) -> G17SksmScratchGeometry {

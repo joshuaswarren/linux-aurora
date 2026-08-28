@@ -13,13 +13,22 @@ use kernel::prelude::*;
 #[cfg(not(test))]
 use crate::g17_initdata;
 #[cfg(not(test))]
-use crate::{driver::AsahiDevice, g17_compute, g17_submission, gem, mmu};
+use crate::{
+    driver::{AsahiDevRef, AsahiDevice},
+    g17_completion, g17_compute, g17_render, g17_submission, g17_uapi, gem, mmu,
+};
 #[cfg(test)]
 #[path = "g17_compute.rs"]
 mod g17_compute;
 #[cfg(test)]
 #[path = "g17_initdata.rs"]
 mod g17_initdata;
+#[cfg(test)]
+#[path = "g17_render.rs"]
+mod g17_render;
+#[cfg(test)]
+#[path = "g17_submission.rs"]
+mod g17_submission;
 
 #[cfg(not(test))]
 use core::ops::Range;
@@ -53,6 +62,267 @@ pub(crate) const G17P_COMPUTE_PREEMPT_SIZE: usize = 0x4000;
 pub(crate) const G17P_COMPUTE_OPERAND_STATE_SIZE: usize = 0x14000;
 pub(crate) const G17P_COMPUTE_SUPPORT_SIZE: usize = 0xc000;
 pub(crate) const G17P_COMPUTE_QUEUE_GRAPH_SIZE: usize = g17_compute::COMPUTE_QUEUE_GRAPH_SIZE;
+pub(crate) const G17P_RENDER_DESCRIPTOR_STORAGE_SIZE: usize = 0x8000;
+pub(crate) const G17P_RENDER_QUEUE_GRAPH_SIZE: usize = 0xc000;
+pub(crate) const G17P_RENDER_SUPPORT_SIZE: usize = 0x40000;
+const G17P_PAGE_SIZE: usize = 0x4000;
+const G17P_RENDER_SECONDARY_INDEX: usize = 0x00000;
+const G17P_RENDER_POOL_A_SLOTS: usize = 0x04000;
+const G17P_RENDER_POOL_B_SLOTS: usize = 0x08000;
+const G17P_RENDER_SHARED_SLOTS: usize = 0x0c000;
+const G17P_RENDER_FLAG: usize = 0x10000;
+const G17P_RENDER_POOL_A: usize = 0x14000;
+const G17P_RENDER_POOL_B: usize = 0x18000;
+const G17P_RENDER_PACKED_SHARED: usize = 0x1c000;
+const G17P_RENDER_ZERO_SHARED: usize = 0x20000;
+const G17P_RENDER_SHARED_CONTROL: usize = 0x24000;
+const G17P_RENDER_SHARED_CONTROL_INNER: usize = 0x28000;
+const G17P_RENDER_CHANNEL_CONTROL: usize = 0x2c000;
+const G17P_RENDER_TILING_CONTEXT_SCRATCH: usize = 0x30000;
+const G17P_RENDER_TILING_FIRMWARE_SCRATCH: usize = 0x34000;
+const G17P_RENDER_FRAGMENT_CONTEXT_SCRATCH: usize = 0x38000;
+const G17P_RENDER_FRAGMENT_FIRMWARE_SCRATCH: usize = 0x3c000;
+
+const G17P_CONTROL_DIRECTORY_VA: u64 = 0x70_0000_0000;
+const G17P_CONTROL_DIRECTORY_SIZE: usize = 0x10000;
+const G17P_CONTROL_OPERAND_TABLE_VA: u64 = 0x70_0020_8000;
+const G17P_CONTROL_OPERAND_BUFFER_BASE: u64 = 0x70_0022_0000;
+const G17P_CONTROL_OPERAND_BUFFER_COUNT: usize = 28;
+const G17P_CONTROL_OPERAND_BUFFER_SIZE: usize = 0x10_0000;
+const G17P_CONTROL_OPERAND_BUFFER_STRIDE: usize = 0x10_8000;
+const G17P_CONTROL_OPERAND_BACKING_SIZE: usize = (G17P_CONTROL_OPERAND_BUFFER_COUNT - 1)
+    * G17P_CONTROL_OPERAND_BUFFER_STRIDE
+    + G17P_CONTROL_OPERAND_BUFFER_SIZE;
+
+const G17P_RENDER_STATE_DEFLAKE: usize = 0x04000;
+const G17P_RENDER_STATE_TA_STATUS: usize = 0x08000;
+const G17P_RENDER_STATE_FRAGMENT_STATUS: usize = 0x0c000;
+const G17P_RENDER_STATE_DYNAMIC: usize = 0x10000;
+const G17P_RENDER_STATE_AUX_FB_SIZE: usize = 0x8000;
+const G17P_RENDER_AUX_FB_PAGE_COUNT: u64 = 0x10_0000;
+const G17P_RENDER_DBIAS_IS_INT: u32 = 1 << 18;
+const G17P_RENDER_QUEUE_RECORD_SIZE: usize = 0xc0;
+const G17P_RENDER_POINTER_BLOCK_SIZE: usize = 0x80;
+const G17P_USER_TILING_POINTERS: usize = 0x1000;
+const G17P_USER_TILING_OPTIONAL: usize = 0x3000;
+const G17P_USER_TILING_EVENT: usize = 0x3200;
+const G17P_USER_TILING_RING: usize = 0x4000;
+
+fn page_align(value: usize) -> Option<usize> {
+    value
+        .checked_add(G17P_PAGE_SIZE - 1)
+        .map(|value| value & !(G17P_PAGE_SIZE - 1))
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+struct G17PRenderStateLayout {
+    heapmeta: usize,
+    heapmeta_size: usize,
+    tpc: usize,
+    tpc_size: usize,
+    aux_fb: usize,
+    tilemap: usize,
+    tilemap_size: usize,
+    total_size: usize,
+}
+
+fn align_four(value: usize) -> Option<usize> {
+    value.checked_add(3).map(|value| value & !3)
+}
+
+fn g17p_render_state_layout(
+    parameters: &g17_render::G17pRenderParameters,
+    num_clusters: u32,
+) -> Option<G17PRenderStateLayout> {
+    if parameters.width == 0
+        || parameters.height == 0
+        || parameters.layers == 0
+        || num_clusters == 0
+    {
+        return None;
+    }
+    let utile_width = parameters.utile_width as usize;
+    let utile_height = parameters.utile_height as usize;
+    if utile_width == 0 || utile_height == 0 || 32 % utile_width != 0 || 32 % utile_height != 0 {
+        return None;
+    }
+    let utiles_per_tile = (32 / utile_width).checked_mul(32 / utile_height)?;
+    let tiles_x = (parameters.width as usize).checked_add(31)? / 32;
+    let tiles_y = (parameters.height as usize).checked_add(31)? / 32;
+    let tiles_per_mtile_x = align_four(tiles_x.checked_add(3)? / 4)?;
+    let tiles_per_mtile_y = align_four(tiles_y.checked_add(3)? / 4)?;
+    let tiles_per_mtile = tiles_per_mtile_x.checked_mul(tiles_per_mtile_y)?;
+    let layers = parameters.layers as usize;
+    let tilemap_size = align_four(
+        5usize
+            .checked_mul(tiles_per_mtile)?
+            .checked_mul(utiles_per_tile)?,
+    )?
+    .checked_div(4)?
+    .checked_mul(4)?
+    .checked_mul(16)?
+    .checked_mul(layers)?;
+    let tpc_size = 8usize
+        .checked_mul(utiles_per_tile)?
+        .checked_mul(tiles_per_mtile)?
+        .checked_div(4)?
+        .checked_mul(4)?
+        .checked_mul(16)?
+        .checked_mul(layers)?
+        .checked_mul(num_clusters as usize)?;
+    let heapmeta_size = 0x200usize.checked_add(if layers > 1 { 0x100 } else { 0 })?;
+
+    let heapmeta = G17P_RENDER_STATE_DYNAMIC;
+    let tpc = heapmeta.checked_add(page_align(heapmeta_size)?)?;
+    let aux_fb = tpc.checked_add(page_align(tpc_size)?)?;
+    let tilemap = aux_fb.checked_add(G17P_RENDER_STATE_AUX_FB_SIZE)?;
+    let total_size = tilemap.checked_add(page_align(tilemap_size)?)?;
+    Some(G17PRenderStateLayout {
+        heapmeta,
+        heapmeta_size,
+        tpc,
+        tpc_size,
+        aux_fb,
+        tilemap,
+        tilemap_size,
+        total_size,
+    })
+}
+
+fn positive_half_f32_bits(value: u32) -> Option<u32> {
+    if value == 0 {
+        return Some(0);
+    }
+    let highest = 31u32.checked_sub(value.leading_zeros())?;
+    let significand = value.checked_shl(23u32.checked_sub(highest)?)?;
+    Some(((highest + 126) << 23) | (significand & 0x7f_ffff))
+}
+
+fn g17p_aux_fb_flags(command_flags: u32) -> u64 {
+    0xc000 | u64::from(command_flags & G17P_RENDER_DBIAS_IS_INT != 0)
+}
+
+fn apply_g17p_viewport(width: u32, height: u32, page: &mut [u8]) -> Option<()> {
+    if page.len() != G17P_PAGE_SIZE || width == 0 || height == 0 {
+        return None;
+    }
+    let tiles_x = width.checked_add(31)? / 32;
+    let tiles_y = height.checked_add(31)? / 32;
+    put_u32(page, 0x900, 0x0000_0c00);
+    put_u32(page, 0x904, 0x8000_0000 | (tiles_x - 1));
+    put_u32(page, 0x908, tiles_y - 1);
+    let half_width = positive_half_f32_bits(width)?;
+    let half_height = positive_half_f32_bits(height)?;
+    put_u32(page, 0x910, half_width);
+    put_u32(page, 0x914, half_width);
+    put_u32(page, 0x918, half_height);
+    put_u32(page, 0x91c, half_height | 0x8000_0000);
+    put_u32(page, 0x924, 0x3f80_0000);
+    Some(())
+}
+
+fn put_u32(raw: &mut [u8], offset: usize, value: u32) {
+    raw[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+#[cfg(test)]
+fn put_u16(raw: &mut [u8], offset: usize, value: u16) {
+    raw[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_u64(raw: &mut [u8], offset: usize, value: u64) {
+    raw[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+#[cfg(test)]
+fn build_g17p_user_queue_record(
+    raw: &mut [u8],
+    offset: usize,
+    pointers: u64,
+    item_ring: u64,
+    job_list: u64,
+    context: u64,
+) {
+    let body = &mut raw[offset..offset + G17P_RENDER_QUEUE_RECORD_SIZE];
+    body.fill(0);
+    put_u64(body, 0x00, pointers);
+    put_u64(body, 0x08, item_ring);
+    put_u64(body, 0x10, job_list);
+    put_u32(body, 0x24, u32::MAX);
+    put_u32(body, 0x28, 2);
+    put_u32(body, 0x2c, 2);
+    body[0x36..0x38].fill(0xff);
+    put_u32(body, 0x38, 0);
+    put_u32(body, 0x40, 2);
+    put_u32(body, 0x44, u32::MAX);
+    put_u32(body, 0x48, 0x15);
+    put_u64(body, 0x94, 0);
+    put_u64(body, 0x9c, context);
+}
+
+#[cfg(test)]
+fn build_g17p_user_pointer_block(raw: &mut [u8], offset: usize) {
+    let body = &mut raw[offset..offset + G17P_RENDER_POINTER_BLOCK_SIZE];
+    body.fill(0);
+    put_u32(body, 0x50, u32::MAX);
+    put_u32(body, 0x60, 0x500);
+}
+
+#[cfg(test)]
+fn build_g17p_user_optional(
+    raw: &mut [u8],
+    offset: usize,
+    tiling: bool,
+    support: u64,
+    shared: u64,
+) {
+    let body = &mut raw[offset..offset + 0xc0];
+    body.fill(0);
+    put_u32(body, 0x00, 0x0f);
+    put_u64(body, 0x08, support);
+    put_u64(body, 0x10, support + 0x400);
+    put_u64(body, 0x36, support + 0x800);
+    put_u64(body, 0x4a, support + 0xc00);
+    put_u16(body, 0x1a, 1);
+    put_u16(body, 0x1e, 2);
+    put_u16(body, 0x26, 1);
+    put_u16(body, 0x2a, 0);
+    put_u16(body, 0x2e, 0);
+    put_u16(body, 0x32, 1);
+    put_u16(body, 0x3e, 0);
+    put_u16(body, 0x46, 0);
+    put_u16(body, 0x52, 1);
+    put_u16(body, 0x56, 0);
+    put_u16(body, 0x5a, 0x15);
+    put_u16(body, 0x5e, 2);
+    put_u16(body, 0x62, 1);
+    put_u16(body, 0x66, 1);
+    if tiling {
+        put_u64(body, 0x6e, shared);
+        put_u16(body, 0x76, 0);
+        put_u16(body, 0x7e, 0);
+        put_u16(body, 0x82, 1);
+    } else {
+        put_u16(body, 0x18, 1);
+        put_u16(body, 0x22, 1);
+        body[0x76..0x86].fill(0xff);
+    }
+}
+
+#[cfg(test)]
+fn g17p_cold_opening_metadata(
+    kind: g17_render::RenderDescriptorKind,
+) -> g17_render::RenderDescriptorMetadata {
+    g17_render::RenderDescriptorMetadata {
+        context_id: 1,
+        submission_ordinal: 0,
+        queue_pair: 0,
+        submit_sequence: match kind {
+            g17_render::RenderDescriptorKind::Tiling => 1,
+            g17_render::RenderDescriptorKind::Fragment => 0,
+        },
+    }
+}
 #[cfg(not(test))]
 const STATUS_A_ALLOC_SIZE: usize = 0xb4000;
 #[cfg(not(test))]
@@ -278,18 +548,6 @@ impl MappedObject {
         })
     }
 
-    fn write_at(&mut self, address: u64, body: &[u8]) -> Result {
-        let offset = address.checked_sub(self.iova()).ok_or(EINVAL)? as usize;
-        let end = offset.checked_add(body.len()).ok_or(EINVAL)?;
-        if end > self.logical_size {
-            return Err(EINVAL);
-        }
-        self.with_bytes_mut(|bytes| {
-            bytes[offset..end].copy_from_slice(body);
-            Ok(())
-        })
-    }
-
     fn map_alias_at(
         &mut self,
         vm: &mmu::Vm,
@@ -390,6 +648,18 @@ impl MappedObject {
 }
 
 #[cfg(not(test))]
+fn map_fresh_zero_object_at(
+    dev: &AsahiDevice,
+    vm: &mmu::Vm,
+    address: u64,
+    size: usize,
+) -> Result<mmu::KernelMapping> {
+    let mut object = gem::new_kernel_object(dev, size)?;
+    object.vmap()?.memset(0);
+    object.map_at(vm, address, mmu::PROT_GPU_FW_SHARED_RW, false)
+}
+
+#[cfg(not(test))]
 fn write_status_block_at(object: &mut MappedObject, offset: usize) -> Result {
     let end = offset
         .checked_add(g17_initdata::STATUS_BLOCK_SIZE)
@@ -460,6 +730,107 @@ pub(crate) struct G17PComputeDescriptorStorage {
     operand_state: MappedObject,
     support: MappedObject,
     queue_graph: MappedObject,
+}
+
+/// One Linux-owned paired render graph retained through synchronous
+/// completion. The queue records, pointer blocks, item-address rings, shared
+/// job list, descriptors, optional records, events, and timestamp words all
+/// live in these mappings.
+#[cfg(not(test))]
+pub(crate) struct G17PUserRenderStorage {
+    descriptors: MappedObject,
+    graph: MappedObject,
+    support: MappedObject,
+    render_state: MappedObject,
+    timestamps: MappedObject,
+    user_timestamp_aliases: KVec<mmu::KernelMapping>,
+}
+
+#[cfg(not(test))]
+#[derive(Debug, Copy, Clone)]
+pub(crate) struct G17PUserRenderQueueState {
+    pub(crate) tiling: g17_completion::QueueIndices,
+    pub(crate) fragment: g17_completion::QueueIndices,
+    pub(crate) job_list_empty: bool,
+    pub(crate) tiling_timestamps: [u64; 2],
+    pub(crate) fragment_timestamps: [u64; 2],
+}
+
+struct G17PLateTilingBytes {
+    item_group: [u8; 24],
+    optional: [u8; g17_submission::G17P_COLD_OPENING_OPTIONAL_SIZE],
+    event: [u8; g17_submission::G17P_COLD_OPENING_EVENT_SIZE],
+}
+
+impl G17PLateTilingBytes {
+    fn apply(&self, graph: &mut [u8], support: &mut [u8]) {
+        graph[G17P_USER_TILING_RING..G17P_USER_TILING_RING + self.item_group.len()]
+            .copy_from_slice(&self.item_group);
+        graph[G17P_USER_TILING_OPTIONAL..G17P_USER_TILING_OPTIONAL + self.optional.len()]
+            .copy_from_slice(&self.optional);
+        graph[G17P_USER_TILING_EVENT..G17P_USER_TILING_EVENT + self.event.len()]
+            .copy_from_slice(&self.event);
+        put_u32(graph, G17P_USER_TILING_POINTERS + 0x40, 3);
+        put_u32(support, G17P_RENDER_POOL_A_SLOTS + 4, 2);
+        put_u32(support, G17P_RENDER_SHARED_CONTROL_INNER, 2);
+    }
+}
+
+fn build_g17p_late_tiling_bytes(
+    descriptor: u64,
+    graph: u64,
+    optional_addresses: g17_submission::G17PColdOpeningOptionalAddresses,
+) -> core::result::Result<G17PLateTilingBytes, g17_submission::SubmissionError> {
+    let mut bytes = G17PLateTilingBytes {
+        item_group: [0; 24],
+        optional: [0; g17_submission::G17P_COLD_OPENING_OPTIONAL_SIZE],
+        event: [0; g17_submission::G17P_COLD_OPENING_EVENT_SIZE],
+    };
+    let optional = graph
+        .checked_add(G17P_USER_TILING_OPTIONAL as u64)
+        .ok_or(g17_submission::SubmissionError::PartialOpeningAddressOverflow)?;
+    let event = graph
+        .checked_add(G17P_USER_TILING_EVENT as u64)
+        .ok_or(g17_submission::SubmissionError::PartialOpeningAddressOverflow)?;
+    for (index, address) in [descriptor, optional, event].iter().enumerate() {
+        put_u64(&mut bytes.item_group, index * 8, *address);
+    }
+    g17_submission::apply_g17p_cold_opening_optional(
+        g17_submission::G17PColdOpeningStage::Tiling,
+        optional_addresses,
+        &mut bytes.optional,
+    )?;
+    g17_submission::apply_g17p_cold_opening_event(
+        g17_submission::G17PColdOpeningStage::Tiling,
+        &mut bytes.event,
+    )?;
+    Ok(bytes)
+}
+
+/// All fallible mapping and byte construction finishes before this object is
+/// created. `publish` performs only the six measured late TA memory copies.
+#[cfg(not(test))]
+pub(crate) struct G17PLateTilingPublication {
+    graph: *mut u8,
+    support: *mut u8,
+    bytes: G17PLateTilingBytes,
+}
+
+#[cfg(not(test))]
+impl G17PLateTilingPublication {
+    pub(crate) fn publish(self) {
+        let graph = unsafe {
+            // SAFETY: the retained graph object owns this previously acquired
+            // VMap for the complete synchronous publication transaction.
+            core::slice::from_raw_parts_mut(self.graph, G17P_RENDER_QUEUE_GRAPH_SIZE)
+        };
+        let support = unsafe {
+            // SAFETY: the retained support object owns this previously
+            // acquired VMap for the same transaction.
+            core::slice::from_raw_parts_mut(self.support, G17P_RENDER_SUPPORT_SIZE)
+        };
+        self.bytes.apply(graph, support);
+    }
 }
 
 #[cfg(not(test))]
@@ -605,6 +976,518 @@ impl G17PComputeDescriptorStorage {
             .ok_or(EINVAL)?;
         self.descriptors
             .with_bytes_mut(|raw| f(&mut raw[offset..end]))
+    }
+}
+
+#[cfg(not(test))]
+impl G17PUserRenderStorage {
+    const TILING_QUEUE: usize = 0x0000;
+    const FRAGMENT_QUEUE: usize = 0x00c0;
+    const TILING_POINTERS: usize = G17P_USER_TILING_POINTERS;
+    const FRAGMENT_POINTERS: usize = 0x1080;
+    const JOB_LIST: usize = 0x2000;
+    const FRAGMENT_OPTIONAL: usize = 0x30c0;
+    const TILING_EVENT: usize = G17P_USER_TILING_EVENT;
+    const FRAGMENT_EVENT: usize = 0x3600;
+    const TILING_RING: usize = G17P_USER_TILING_RING;
+    const FRAGMENT_RING: usize = 0x8000;
+
+    pub(crate) fn new(
+        dev: &AsahiDevice,
+        vm: &mmu::Vm,
+        command: &g17_uapi::TranslatedRenderCommand,
+        num_clusters: u32,
+        user_timestamps: [u64; 4],
+        user_timestamp_aliases: KVec<mmu::KernelMapping>,
+    ) -> Result<Self> {
+        let mut descriptors = MappedObject::new_in_range(
+            dev,
+            vm,
+            G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END,
+            G17P_RENDER_DESCRIPTOR_STORAGE_SIZE,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        let mut graph = MappedObject::new_in_range(
+            dev,
+            vm,
+            G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END,
+            G17P_RENDER_QUEUE_GRAPH_SIZE,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        let mut support = MappedObject::new_in_range(
+            dev,
+            vm,
+            G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END,
+            G17P_RENDER_SUPPORT_SIZE,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        let render_layout =
+            g17p_render_state_layout(&command.parameters, num_clusters).ok_or(EINVAL)?;
+        let mut render_state = MappedObject::new_in_range(
+            dev,
+            vm,
+            G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END,
+            render_layout.total_size,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        let timestamps = MappedObject::new_in_range(
+            dev,
+            vm,
+            G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END,
+            mmu::UAT_PGSZ,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        let support_va = support.iova();
+        let render_state_va = render_state.iova();
+        let timestamp_va = timestamps.iova();
+        let mut translated = *command;
+        translated.parameters.context_base = render_state_va;
+        translated.parameters.deflake_3 = render_state_va + G17P_RENDER_STATE_DEFLAKE as u64;
+        translated.parameters.deflake_2 = translated.parameters.deflake_3 + 0x20;
+        translated.parameters.deflake_1 = translated.parameters.deflake_3 + 0x2a0;
+        translated.parameters.ta_status = render_state_va + G17P_RENDER_STATE_TA_STATUS as u64;
+        translated.parameters.fragment_status =
+            render_state_va + G17P_RENDER_STATE_FRAGMENT_STATUS as u64;
+        translated.parameters.heapmeta = render_state_va + render_layout.heapmeta as u64;
+        translated.parameters.tpc = render_state_va + render_layout.tpc as u64;
+        translated.parameters.aux_fb = render_state_va + render_layout.aux_fb as u64;
+        translated.parameters.aux_fb_page_count = G17P_RENDER_AUX_FB_PAGE_COUNT;
+        translated.parameters.aux_fb_flags = g17p_aux_fb_flags(translated.flags);
+        translated.parameters.tilemap = render_state_va + render_layout.tilemap as u64;
+        translated.parameters.ta_timestamp_start = timestamp_va;
+        translated.parameters.ta_timestamp_end = timestamp_va + 8;
+        translated.parameters.ta_user_timestamp_start = user_timestamps[0];
+        translated.parameters.ta_user_timestamp_end = user_timestamps[1];
+        translated.parameters.fragment_timestamp_start = timestamp_va + 16;
+        translated.parameters.fragment_timestamp_end = timestamp_va + 24;
+        translated.parameters.fragment_user_timestamp_start = user_timestamps[2];
+        translated.parameters.fragment_user_timestamp_end = user_timestamps[3];
+
+        for (address, size, need_read, need_write) in [
+            (
+                translated.parameters.context_base,
+                mmu::UAT_PGSZ as u64,
+                true,
+                true,
+            ),
+            (
+                translated.parameters.tilemap,
+                render_layout.tilemap_size as u64,
+                true,
+                true,
+            ),
+            (
+                translated.parameters.heapmeta,
+                render_layout.heapmeta_size as u64,
+                true,
+                true,
+            ),
+            (
+                translated.parameters.tpc,
+                render_layout.tpc_size as u64,
+                true,
+                true,
+            ),
+            (
+                translated.parameters.deflake_3,
+                mmu::UAT_PGSZ as u64,
+                true,
+                false,
+            ),
+            (
+                translated.parameters.ta_status,
+                mmu::UAT_PGSZ as u64,
+                true,
+                true,
+            ),
+            (
+                translated.parameters.fragment_status,
+                mmu::UAT_PGSZ as u64,
+                true,
+                true,
+            ),
+            (
+                translated.parameters.aux_fb,
+                G17P_RENDER_STATE_AUX_FB_SIZE as u64,
+                true,
+                true,
+            ),
+            (timestamp_va, 32, true, true),
+        ] {
+            if !vm.covers_range(address, size, need_read, need_write) {
+                return Err(EFAULT);
+            }
+        }
+
+        render_state.with_bytes_mut(|raw| {
+            apply_g17p_viewport(
+                translated.parameters.width,
+                translated.parameters.height,
+                &mut raw[G17P_RENDER_STATE_DEFLAKE..G17P_RENDER_STATE_DEFLAKE + mmu::UAT_PGSZ],
+            )
+            .ok_or(EINVAL)?;
+            put_u32(raw, render_layout.aux_fb + 0x480, 0x6000_0000);
+            put_u32(raw, render_layout.aux_fb + 0x484, 0x35b);
+            Ok(())
+        })?;
+
+        let graph_va = graph.iova();
+        let graph_addresses = g17_submission::G17PColdOpeningGraphAddresses {
+            primary_index: g17_submission::G17P_PARTIAL_OPENING_PRIMARY_INDEX_GPU_VA,
+            secondary_index: support_va + G17P_RENDER_SECONDARY_INDEX as u64,
+            pool_a_slots: support_va + G17P_RENDER_POOL_A_SLOTS as u64,
+            pool_b_slots: support_va + G17P_RENDER_POOL_B_SLOTS as u64,
+            shared_slots: support_va + G17P_RENDER_SHARED_SLOTS as u64,
+            flag: support_va + G17P_RENDER_FLAG as u64,
+        };
+        let objects = g17_render::RenderDescriptorObjects {
+            record_a: support_va + G17P_RENDER_POOL_A as u64,
+            shared: support_va + G17P_RENDER_PACKED_SHARED as u64,
+            record_b: support_va + G17P_RENDER_POOL_B as u64,
+            zero: support_va + G17P_RENDER_ZERO_SHARED as u64,
+        };
+        let channel_control = support_va + G17P_RENDER_CHANNEL_CONTROL as u64;
+        support.with_bytes_mut(|raw| {
+            g17_submission::apply_g17p_cold_opening_leaf_page(
+                g17_submission::G17PColdOpeningLeaf::SecondaryIndex,
+                &mut raw[G17P_RENDER_SECONDARY_INDEX..G17P_RENDER_SECONDARY_INDEX + mmu::UAT_PGSZ],
+            )
+            .map_err(|_| EINVAL)?;
+            g17_submission::apply_g17p_cold_opening_leaf_page(
+                g17_submission::G17PColdOpeningLeaf::PoolASlots,
+                &mut raw[G17P_RENDER_POOL_A_SLOTS..G17P_RENDER_POOL_A_SLOTS + mmu::UAT_PGSZ],
+            )
+            .map_err(|_| EINVAL)?;
+            // Native exposes value one to early 3D and changes it to two in
+            // the late TA publication callback.
+            put_u32(raw, G17P_RENDER_POOL_A_SLOTS + 4, 1);
+            g17_submission::apply_g17p_cold_opening_leaf_page(
+                g17_submission::G17PColdOpeningLeaf::PoolBSlots,
+                &mut raw[G17P_RENDER_POOL_B_SLOTS..G17P_RENDER_POOL_B_SLOTS + mmu::UAT_PGSZ],
+            )
+            .map_err(|_| EINVAL)?;
+            g17_submission::apply_g17p_cold_opening_leaf_page(
+                g17_submission::G17PColdOpeningLeaf::SharedSlots,
+                &mut raw[G17P_RENDER_SHARED_SLOTS..G17P_RENDER_SHARED_SLOTS + mmu::UAT_PGSZ],
+            )
+            .map_err(|_| EINVAL)?;
+            g17_submission::apply_g17p_cold_opening_leaf_page(
+                g17_submission::G17PColdOpeningLeaf::Flag,
+                &mut raw[G17P_RENDER_FLAG..G17P_RENDER_FLAG + mmu::UAT_PGSZ],
+            )
+            .map_err(|_| EINVAL)?;
+            g17_submission::apply_g17p_cold_opening_record_pool_a(
+                graph_addresses,
+                &mut raw[G17P_RENDER_POOL_A
+                    ..G17P_RENDER_POOL_A + g17_submission::G17P_COLD_OPENING_RECORD_POOL_A_SIZE],
+            )
+            .map_err(|_| EINVAL)?;
+            g17_submission::apply_g17p_cold_opening_record_pool_b(
+                graph_addresses,
+                &mut raw[G17P_RENDER_POOL_B
+                    ..G17P_RENDER_POOL_B + g17_submission::G17P_COLD_OPENING_RECORD_POOL_B_SIZE],
+            )
+            .map_err(|_| EINVAL)?;
+            g17_submission::apply_g17p_cold_opening_shared_object(
+                graph_addresses,
+                &mut raw[G17P_RENDER_PACKED_SHARED
+                    ..G17P_RENDER_PACKED_SHARED
+                        + g17_submission::G17P_COLD_OPENING_SHARED_OBJECT_SIZE],
+            )
+            .map_err(|_| EINVAL)?;
+            g17_submission::apply_g17p_cold_opening_shared_control(
+                G17P_CONTROL_OPERAND_TABLE_VA,
+                support_va + G17P_RENDER_SHARED_CONTROL_INNER as u64,
+                &mut raw[G17P_RENDER_SHARED_CONTROL
+                    ..G17P_RENDER_SHARED_CONTROL
+                        + g17_submission::G17P_COLD_OPENING_SHARED_CONTROL_SIZE],
+            )
+            .map_err(|_| EINVAL)?;
+            put_u32(raw, G17P_RENDER_SHARED_CONTROL_INNER, 1);
+            g17_submission::apply_g17p_cold_opening_channel_control(
+                &mut raw[G17P_RENDER_CHANNEL_CONTROL
+                    ..G17P_RENDER_CHANNEL_CONTROL
+                        + g17_submission::G17P_COLD_OPENING_CHANNEL_CONTROL_SIZE],
+            )
+            .map_err(|_| EINVAL)?;
+            g17_submission::apply_g17p_cold_opening_queue_context(
+                g17_submission::G17PColdOpeningStage::Tiling,
+                descriptors.iova(),
+                graph_va + Self::TILING_QUEUE as u64,
+                &mut raw[G17P_RENDER_TILING_CONTEXT_SCRATCH
+                    ..G17P_RENDER_TILING_CONTEXT_SCRATCH + mmu::UAT_PGSZ],
+            )
+            .map_err(|_| EINVAL)?;
+            g17_submission::apply_g17p_cold_opening_queue_context(
+                g17_submission::G17PColdOpeningStage::Tiling,
+                descriptors.iova(),
+                graph_va + Self::TILING_QUEUE as u64,
+                &mut raw[G17P_RENDER_TILING_FIRMWARE_SCRATCH
+                    ..G17P_RENDER_TILING_FIRMWARE_SCRATCH + mmu::UAT_PGSZ],
+            )
+            .map_err(|_| EINVAL)?;
+            g17_submission::apply_g17p_cold_opening_queue_context(
+                g17_submission::G17PColdOpeningStage::Fragment,
+                descriptors.iova() + 0x4000,
+                graph_va + Self::FRAGMENT_QUEUE as u64,
+                &mut raw[G17P_RENDER_FRAGMENT_CONTEXT_SCRATCH
+                    ..G17P_RENDER_FRAGMENT_CONTEXT_SCRATCH + mmu::UAT_PGSZ],
+            )
+            .map_err(|_| EINVAL)?;
+            g17_submission::apply_g17p_cold_opening_queue_context(
+                g17_submission::G17PColdOpeningStage::Fragment,
+                descriptors.iova() + 0x4000,
+                graph_va + Self::FRAGMENT_QUEUE as u64,
+                &mut raw[G17P_RENDER_FRAGMENT_FIRMWARE_SCRATCH
+                    ..G17P_RENDER_FRAGMENT_FIRMWARE_SCRATCH + mmu::UAT_PGSZ],
+            )
+            .map_err(|_| EINVAL)
+        })?;
+        descriptors.with_bytes_mut(|raw| {
+            let (tiling, fragment) = raw.split_at_mut(0x4000);
+            g17_render::build_cold_opening_ta_descriptor(&translated.parameters, objects, tiling)
+                .map_err(|_| EINVAL)?;
+            g17_render::build_cold_opening_fragment_descriptor(
+                &translated.parameters,
+                objects,
+                fragment,
+            )
+            .map_err(|_| EINVAL)
+        })?;
+
+        graph.with_bytes_mut(|raw| {
+            let job_list = graph_va + Self::JOB_LIST as u64;
+            g17_submission::apply_g17p_cold_opening_queue_record(
+                g17_submission::G17PColdOpeningQueueAddresses {
+                    pointers: graph_va + Self::TILING_POINTERS as u64,
+                    item_ring: graph_va + Self::TILING_RING as u64,
+                    job_list,
+                    channel_control,
+                },
+                &mut raw[Self::TILING_QUEUE..Self::TILING_QUEUE + G17P_RENDER_QUEUE_RECORD_SIZE],
+            )
+            .map_err(|_| EINVAL)?;
+            g17_submission::apply_g17p_cold_opening_queue_record(
+                g17_submission::G17PColdOpeningQueueAddresses {
+                    pointers: graph_va + Self::FRAGMENT_POINTERS as u64,
+                    item_ring: graph_va + Self::FRAGMENT_RING as u64,
+                    job_list,
+                    channel_control,
+                },
+                &mut raw
+                    [Self::FRAGMENT_QUEUE..Self::FRAGMENT_QUEUE + G17P_RENDER_QUEUE_RECORD_SIZE],
+            )
+            .map_err(|_| EINVAL)?;
+            g17_submission::apply_g17p_cold_opening_pointer_block(
+                &mut raw
+                    [Self::TILING_POINTERS..Self::TILING_POINTERS + G17P_RENDER_POINTER_BLOCK_SIZE],
+            )
+            .map_err(|_| EINVAL)?;
+            g17_submission::apply_g17p_cold_opening_pointer_block(
+                &mut raw[Self::FRAGMENT_POINTERS
+                    ..Self::FRAGMENT_POINTERS + G17P_RENDER_POINTER_BLOCK_SIZE],
+            )
+            .map_err(|_| EINVAL)?;
+            put_u64(raw, Self::JOB_LIST + 0x08, job_list);
+            Ok(())
+        })?;
+
+        Ok(Self {
+            descriptors,
+            graph,
+            support,
+            render_state,
+            timestamps,
+            user_timestamp_aliases,
+        })
+    }
+
+    pub(crate) fn is_reachable_from(&self, vm: &mmu::Vm) -> bool {
+        [
+            &self.descriptors,
+            &self.graph,
+            &self.support,
+            &self.render_state,
+            &self.timestamps,
+        ]
+        .iter()
+        .all(|object| vm.covers_range(object.iova(), object.logical_size as u64, true, true))
+            && vm.covers_range(
+                G17P_CONTROL_DIRECTORY_VA,
+                G17P_CONTROL_DIRECTORY_SIZE as u64,
+                true,
+                true,
+            )
+            && vm.covers_range(
+                G17P_CONTROL_OPERAND_TABLE_VA,
+                mmu::UAT_PGSZ as u64,
+                true,
+                true,
+            )
+            && vm.covers_range(
+                G17P_CONTROL_OPERAND_BUFFER_BASE,
+                G17P_CONTROL_OPERAND_BACKING_SIZE as u64,
+                true,
+                true,
+            )
+            && vm.covers_range(
+                g17_submission::G17P_PARTIAL_OPENING_PRIMARY_INDEX_GPU_VA,
+                mmu::UAT_PGSZ as u64,
+                true,
+                true,
+            )
+            && g17_initdata::REGION_VIEW_LOW_ADDRS
+                .iter()
+                .all(|address| vm.covers_range(*address, mmu::UAT_PGSZ as u64, true, true))
+            && self
+                .user_timestamp_aliases
+                .iter()
+                .all(|mapping| vm.covers_range(mapping.iova(), mapping.size() as u64, false, true))
+    }
+
+    fn optional_addresses(&self, tiling: bool) -> g17_submission::G17PColdOpeningOptionalAddresses {
+        let support = self.support.iova();
+        let (context_scratch, firmware_scratch) = if tiling {
+            (
+                support + G17P_RENDER_TILING_CONTEXT_SCRATCH as u64,
+                support + G17P_RENDER_TILING_FIRMWARE_SCRATCH as u64,
+            )
+        } else {
+            (
+                support + G17P_RENDER_FRAGMENT_CONTEXT_SCRATCH as u64,
+                support + G17P_RENDER_FRAGMENT_FIRMWARE_SCRATCH as u64,
+            )
+        };
+        g17_submission::G17PColdOpeningOptionalAddresses {
+            context_scratch,
+            firmware_scratch,
+            shared_control: support + G17P_RENDER_SHARED_CONTROL as u64,
+            channel_control: support + G17P_RENDER_CHANNEL_CONTROL as u64,
+            tiling_shared_object: support + G17P_RENDER_PACKED_SHARED as u64,
+        }
+    }
+
+    pub(crate) fn stage_fragment(&mut self) -> Result {
+        let graph_va = self.graph.iova();
+        let items = [
+            self.descriptors.iova() + 0x4000,
+            graph_va + Self::FRAGMENT_OPTIONAL as u64,
+            graph_va + Self::FRAGMENT_EVENT as u64,
+        ];
+        let optional_addresses = self.optional_addresses(false);
+        self.graph.with_bytes_mut(|raw| {
+            for (index, address) in items.iter().enumerate() {
+                put_u64(raw, Self::FRAGMENT_RING + index * 8, *address);
+            }
+            g17_submission::apply_g17p_cold_opening_optional(
+                g17_submission::G17PColdOpeningStage::Fragment,
+                optional_addresses,
+                &mut raw[Self::FRAGMENT_OPTIONAL
+                    ..Self::FRAGMENT_OPTIONAL + g17_submission::G17P_COLD_OPENING_OPTIONAL_SIZE],
+            )
+            .map_err(|_| EINVAL)?;
+            g17_submission::apply_g17p_cold_opening_event(
+                g17_submission::G17PColdOpeningStage::Fragment,
+                &mut raw[Self::FRAGMENT_EVENT
+                    ..Self::FRAGMENT_EVENT + g17_submission::G17P_COLD_OPENING_EVENT_SIZE],
+            )
+            .map_err(|_| EINVAL)?;
+            put_u32(raw, Self::FRAGMENT_POINTERS + 0x40, 3);
+            Ok(())
+        })
+    }
+
+    pub(crate) fn prepare_late_tiling_publication(&mut self) -> Result<G17PLateTilingPublication> {
+        let graph_va = self.graph.iova();
+        let bytes = build_g17p_late_tiling_bytes(
+            self.descriptors.iova(),
+            graph_va,
+            self.optional_addresses(true),
+        )
+        .map_err(|_| EINVAL)?;
+
+        if Self::TILING_EVENT + bytes.event.len() > self.graph.logical_size
+            || G17P_RENDER_SHARED_CONTROL_INNER + 4 > self.support.logical_size
+        {
+            return Err(EINVAL);
+        }
+        let graph = self.graph.object.vmap()?.as_mut_ptr();
+        let support = self.support.object.vmap()?.as_mut_ptr();
+        Ok(G17PLateTilingPublication {
+            graph,
+            support,
+            bytes,
+        })
+    }
+
+    pub(crate) fn queue_gpu_vas(&self) -> (u64, u64) {
+        (
+            self.graph.iova() + Self::FRAGMENT_QUEUE as u64,
+            self.graph.iova() + Self::TILING_QUEUE as u64,
+        )
+    }
+
+    pub(crate) fn snapshot(&mut self) -> Result<G17PUserRenderQueueState> {
+        let mut state = G17PUserRenderQueueState {
+            tiling: g17_completion::QueueIndices {
+                done: 0,
+                read: 0,
+                write: 0,
+            },
+            fragment: g17_completion::QueueIndices {
+                done: 0,
+                read: 0,
+                write: 0,
+            },
+            job_list_empty: false,
+            tiling_timestamps: [0; 2],
+            fragment_timestamps: [0; 2],
+        };
+        let graph_va = self.graph.iova();
+        self.graph.with_bytes_mut(|raw| {
+            let read = |offset: usize| -> Result<u32> {
+                Ok(u32::from_le_bytes(
+                    raw[offset..offset + 4].try_into().map_err(|_| EINVAL)?,
+                ))
+            };
+            state.tiling = g17_completion::QueueIndices {
+                done: read(Self::TILING_POINTERS)?,
+                read: read(Self::TILING_POINTERS + 0x30)?,
+                write: read(Self::TILING_POINTERS + 0x40)?,
+            };
+            state.fragment = g17_completion::QueueIndices {
+                done: read(Self::FRAGMENT_POINTERS)?,
+                read: read(Self::FRAGMENT_POINTERS + 0x30)?,
+                write: read(Self::FRAGMENT_POINTERS + 0x40)?,
+            };
+            let first = u64::from_le_bytes(
+                raw[Self::JOB_LIST..Self::JOB_LIST + 8]
+                    .try_into()
+                    .map_err(|_| EINVAL)?,
+            );
+            let last = u64::from_le_bytes(
+                raw[Self::JOB_LIST + 8..Self::JOB_LIST + 16]
+                    .try_into()
+                    .map_err(|_| EINVAL)?,
+            );
+            state.job_list_empty = first == 0 && last == graph_va + Self::JOB_LIST as u64;
+            Ok(())
+        })?;
+        self.timestamps.with_bytes_mut(|raw| {
+            let tiling_start = u64::from_le_bytes(raw[0..8].try_into().map_err(|_| EINVAL)?);
+            let tiling_end = u64::from_le_bytes(raw[8..16].try_into().map_err(|_| EINVAL)?);
+            let fragment_start = u64::from_le_bytes(raw[16..24].try_into().map_err(|_| EINVAL)?);
+            let fragment_end = u64::from_le_bytes(raw[24..32].try_into().map_err(|_| EINVAL)?);
+            state.tiling_timestamps = [tiling_start, tiling_end];
+            state.fragment_timestamps = [fragment_start, fragment_end];
+            Ok(())
+        })?;
+        Ok(state)
     }
 }
 
@@ -760,7 +1643,6 @@ struct G17MappedResources {
     secondary_state: MappedObject,
     secondary_status_a: MappedObject,
     primary_b2_sentinel: MappedObject,
-    primary_b2_alias_0: MappedObject,
     primary_b2_alias_1: MappedObject,
     primary_b2_alias_0_low: mmu::KernelMapping,
     primary_b2_alias_1_low: mmu::KernelMapping,
@@ -782,6 +1664,7 @@ struct G17UatOwner {
 #[cfg(not(test))]
 #[allow(dead_code)]
 pub(crate) struct G17ResourceOwner {
+    dev: AsahiDevRef,
     handoff: G17ResourceHandoff,
     resources: G17MappedResources,
     address_space: G17UatOwner,
@@ -898,18 +1781,11 @@ impl G17ResourceOwner {
             G17P_CL_B2_OBJECT_SIZE,
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
-        let mut primary_b2_alias_0 = MappedObject::new(
+        let mut primary_b2_alias_1 = MappedObject::new_at(
             dev,
-            &address_space.uat,
+            address_space.uat.kernel_vm(),
+            g17_submission::G17P_PARTIAL_OPENING_SCHEDULER_GPU_VA + 0x8000,
             G17P_CL_B2_OBJECT_SIZE,
-            mmu::UAT_PGSZ as u64,
-            mmu::PROT_GPU_FW_SHARED_RW,
-        )?;
-        let mut primary_b2_alias_1 = MappedObject::new(
-            dev,
-            &address_space.uat,
-            G17P_CL_B2_OBJECT_SIZE,
-            mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
         primary_b2_alias_1.with_bytes_mut(|bytes| {
@@ -927,7 +1803,7 @@ impl G17ResourceOwner {
             }
             Ok(())
         })?;
-        let primary_b2_alias_0_low = primary_b2_alias_0.map_alias_at(
+        let primary_b2_alias_0_low = partial_scheduler.map_alias_at(
             address_space.uat.kernel_lower_vm(),
             g17_initdata::REGION_VIEW_LOW_ADDRS[0],
             mmu::PROT_GPU_FW_SHARED_RW,
@@ -939,7 +1815,7 @@ impl G17ResourceOwner {
         )?;
         let primary_region_views = g17_initdata::PrimaryRegionViews {
             sentinel_high: primary_b2_sentinel.iova(),
-            alias_high: [primary_b2_alias_0.iova(), primary_b2_alias_1.iova()],
+            alias_high: [partial_scheduler.iova(), primary_b2_alias_1.iova()],
         };
 
         let shared = SharedAddresses {
@@ -1039,6 +1915,7 @@ impl G17ResourceOwner {
         roots.write_roots(&shared, &primary_instance, &secondary_instance)?;
 
         Ok(Self {
+            dev: dev.into(),
             handoff,
             resources: G17MappedResources {
                 partial_scheduler,
@@ -1051,7 +1928,6 @@ impl G17ResourceOwner {
                 secondary_state,
                 secondary_status_a,
                 primary_b2_sentinel,
-                primary_b2_alias_0,
                 primary_b2_alias_1,
                 primary_b2_alias_0_low,
                 primary_b2_alias_1_low,
@@ -1071,6 +1947,80 @@ impl G17ResourceOwner {
 
     pub(crate) fn uat(&self) -> &mmu::Uat {
         &self.address_space.uat
+    }
+
+    pub(crate) fn new_user_render_storage(
+        &mut self,
+        dev: &AsahiDevice,
+        vm: &mmu::Vm,
+        command: &g17_uapi::TranslatedRenderCommand,
+        num_clusters: u32,
+        user_timestamps: [u64; 4],
+        user_timestamp_aliases: KVec<mmu::KernelMapping>,
+    ) -> Result<G17PUserRenderStorage> {
+        G17PUserRenderStorage::new(
+            dev,
+            vm,
+            command,
+            num_clusters,
+            user_timestamps,
+            user_timestamp_aliases,
+        )
+    }
+
+    /// Install every hardware-fixed low alias before the VM is exposed to
+    /// userspace and retain it for that VM's complete lifetime.
+    pub(crate) fn install_user_vm_aliases(&mut self, vm: &mmu::Vm) -> Result {
+        let mut mappings = KVec::new();
+        let mut reserved_ranges = KVec::new();
+        reserved_ranges.push(G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END, GFP_KERNEL)?;
+        mappings.push(
+            map_fresh_zero_object_at(
+                &self.dev,
+                vm,
+                G17P_CONTROL_DIRECTORY_VA,
+                G17P_CONTROL_DIRECTORY_SIZE,
+            )?,
+            GFP_KERNEL,
+        )?;
+        mappings.push(
+            map_fresh_zero_object_at(&self.dev, vm, G17P_CONTROL_OPERAND_TABLE_VA, mmu::UAT_PGSZ)?,
+            GFP_KERNEL,
+        )?;
+        mappings.push(
+            map_fresh_zero_object_at(
+                &self.dev,
+                vm,
+                G17P_CONTROL_OPERAND_BUFFER_BASE,
+                G17P_CONTROL_OPERAND_BACKING_SIZE,
+            )?,
+            GFP_KERNEL,
+        )?;
+        mappings.push(
+            self.resources.partial_primary_index.map_alias_at(
+                vm,
+                g17_submission::G17P_PARTIAL_OPENING_PRIMARY_INDEX_GPU_VA,
+                mmu::PROT_GPU_FW_SHARED_RW,
+            )?,
+            GFP_KERNEL,
+        )?;
+        mappings.push(
+            self.resources.partial_scheduler.map_alias_at(
+                vm,
+                g17_initdata::REGION_VIEW_LOW_ADDRS[0],
+                mmu::PROT_GPU_FW_SHARED_RW,
+            )?,
+            GFP_KERNEL,
+        )?;
+        mappings.push(
+            self.resources.primary_b2_alias_1.map_alias_at(
+                vm,
+                g17_initdata::REGION_VIEW_LOW_ADDRS[1],
+                mmu::PROT_GPU_FW_SHARED_RW,
+            )?,
+            GFP_KERNEL,
+        )?;
+        vm.install_driver_mappings(mappings, reserved_ranges)
     }
 
     pub(crate) fn partial_opening_binding(&self) -> G17PPartialOpeningResourceBinding {
@@ -1119,14 +2069,18 @@ impl G17ResourceOwner {
     /// three-entry groups named by the supplied queue heads.
     pub(crate) fn publish_partial_opening_pair<F>(
         &mut self,
+        render_vm: Option<&mmu::Vm>,
         fragment_queue_gpu_va: u64,
         fragment_queue_write_index: u32,
         tiling_queue_gpu_va: u64,
         tiling_queue_write_index: u32,
         publish_late_tiling_state: F,
-    ) -> Result<g17_submission::PreparedG17PPartialOpeningWorkPair>
+    ) -> Result<(
+        g17_submission::PreparedG17PPartialOpeningWorkPair,
+        Option<mmu::VmBind>,
+    )>
     where
-        F: FnOnce() -> Result,
+        F: FnOnce(),
     {
         if fragment_queue_gpu_va == 0 || tiling_queue_gpu_va == 0 {
             return Err(EINVAL);
@@ -1179,35 +2133,88 @@ impl G17ResourceOwner {
             .ring
             .checked_add(prepared.fragment.slot_byte_offset as u64)
             .ok_or(EINVAL)?;
-        self.resources
-            .shared_cluster
-            .write_at(fragment_slot, &prepared.fragment.slot)?;
-        self.address_space
-            .uat
-            .install_t8140_partial_opening_empty_high_roots()?;
-        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        self.resources.primary_state.write_at(
-            binding.fragment_channel.states[g17_initdata::CHANNEL_STATE_PRODUCER],
-            &prepared.fragment.next_producer.to_le_bytes(),
-        )?;
-
-        publish_late_tiling_state()?;
         let tiling_slot = binding
             .tiling_channel
             .ring
             .checked_add(prepared.tiling.slot_byte_offset as u64)
             .ok_or(EINVAL)?;
-        self.resources
-            .shared_cluster
-            .write_at(tiling_slot, &prepared.tiling.slot)?;
-        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        self.resources.primary_state.write_at(
-            binding.tiling_channel.states[g17_initdata::CHANNEL_STATE_PRODUCER],
-            &prepared.tiling.next_producer.to_le_bytes(),
+        let fragment_producer =
+            binding.fragment_channel.states[g17_initdata::CHANNEL_STATE_PRODUCER];
+        let tiling_producer = binding.tiling_channel.states[g17_initdata::CHANNEL_STATE_PRODUCER];
+        let mapped_offset = |object: &MappedObject, address: u64, size: usize| -> Result<usize> {
+            let offset: usize = address
+                .checked_sub(object.iova())
+                .ok_or(EINVAL)?
+                .try_into()?;
+            let end = offset.checked_add(size).ok_or(EINVAL)?;
+            if end > object.logical_size {
+                return Err(EINVAL);
+            }
+            Ok(offset)
+        };
+        let fragment_slot_offset = mapped_offset(
+            &self.resources.shared_cluster,
+            fragment_slot,
+            prepared.fragment.slot.len(),
         )?;
+        let tiling_slot_offset = mapped_offset(
+            &self.resources.shared_cluster,
+            tiling_slot,
+            prepared.tiling.slot.len(),
+        )?;
+        let fragment_producer_offset = mapped_offset(
+            &self.resources.primary_state,
+            fragment_producer,
+            core::mem::size_of::<u32>(),
+        )?;
+        let tiling_producer_offset = mapped_offset(
+            &self.resources.primary_state,
+            tiling_producer,
+            core::mem::size_of::<u32>(),
+        )?;
+
+        // Acquire every fallible CPU mapping and validate every destination
+        // before making the first producer visible.
+        let shared_vmap = self.resources.shared_cluster.object.vmap()?;
+        let state_vmap = self.resources.primary_state.object.vmap()?;
+        let shared = unsafe {
+            // SAFETY: the VMap covers this object's complete allocation.
+            core::slice::from_raw_parts_mut(
+                shared_vmap.as_mut_ptr(),
+                self.resources.shared_cluster.logical_size,
+            )
+        };
+        let state = unsafe {
+            // SAFETY: the VMap covers this object's complete allocation.
+            core::slice::from_raw_parts_mut(
+                state_vmap.as_mut_ptr(),
+                self.resources.primary_state.logical_size,
+            )
+        };
+
+        shared[fragment_slot_offset..fragment_slot_offset + prepared.fragment.slot.len()]
+            .copy_from_slice(&prepared.fragment.slot);
+        let render_bind = if let Some(vm) = render_vm {
+            Some(self.address_space.uat.bind(vm)?)
+        } else {
+            self.address_space
+                .uat
+                .install_t8140_partial_opening_empty_high_roots()?;
+            None
+        };
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        state[fragment_producer_offset..fragment_producer_offset + 4]
+            .copy_from_slice(&prepared.fragment.next_producer.to_le_bytes());
+
+        publish_late_tiling_state();
+        shared[tiling_slot_offset..tiling_slot_offset + prepared.tiling.slot.len()]
+            .copy_from_slice(&prepared.tiling.slot);
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        state[tiling_producer_offset..tiling_producer_offset + 4]
+            .copy_from_slice(&prepared.tiling.next_producer.to_le_bytes());
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 
-        Ok(prepared)
+        Ok((prepared, render_bind))
     }
 
     pub(crate) fn with_b2_pages_mut<R>(
@@ -1215,7 +2222,7 @@ impl G17ResourceOwner {
         f: impl FnOnce(&mut [u8], &mut [u8], &mut [u8]) -> Result<R>,
     ) -> Result<R> {
         let computed = self.resources.primary_b2_sentinel.object.vmap()?;
-        let region_1 = self.resources.primary_b2_alias_0.object.vmap()?;
+        let region_1 = self.resources.partial_scheduler.object.vmap()?;
         let region_2 = self.resources.primary_b2_alias_1.object.vmap()?;
         let computed = unsafe {
             // SAFETY: each VMap covers its complete 16 KiB object.
@@ -1238,6 +2245,14 @@ mod tests {
     use super::*;
 
     const KERN: u64 = 0xffff_fc20_0000_0000;
+
+    fn get_u32(raw: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes(raw[offset..offset + 4].try_into().unwrap())
+    }
+
+    fn get_u64(raw: &[u8], offset: usize) -> u64 {
+        u64::from_le_bytes(raw[offset..offset + 8].try_into().unwrap())
+    }
 
     #[test]
     fn g17p_cl_runtime_storage_has_native_ring_geometry() {
@@ -1262,6 +2277,302 @@ mod tests {
         );
         assert_eq!(g17_initdata::T8140_REGISTER_WINDOWS[17].slot, 41);
         assert_eq!(g17_initdata::T8140_REGISTER_FLAG_ONLY_SLOTS.len(), 17);
+    }
+
+    #[test]
+    fn scheduler_low_alias_keeps_its_head_across_b2_activation() {
+        let mut scheduler = g17_submission::build_g17p_partial_opening_scheduler_page();
+        let mut computed = [0u8; G17P_CL_B2_OBJECT_SIZE];
+        let mut region_2 = [0u8; G17P_CL_B2_OBJECT_SIZE];
+        assert_eq!(
+            g17_submission::apply_g17p_cl_b2_primary_state(
+                g17_submission::G17PClB2ActivationState::Pending,
+                &mut computed,
+                &mut scheduler,
+                &mut region_2,
+                0xffff_fc20_1234_0000,
+            ),
+            Ok(g17_submission::G17PClB2ActivationState::Published)
+        );
+        assert_eq!(
+            u64::from_le_bytes(scheduler[0..8].try_into().unwrap()),
+            g17_submission::G17P_PARTIAL_OPENING_SCHEDULER_WORD
+        );
+        assert_eq!(
+            u64::from_le_bytes(scheduler[0x10..0x18].try_into().unwrap()),
+            0x0000_0080_0007_7000
+        );
+        assert_eq!(
+            u64::from_le_bytes(scheduler[0x18..0x20].try_into().unwrap()),
+            0x0000_0017_0000_0017
+        );
+    }
+
+    #[test]
+    fn user_render_queue_records_match_the_scheduled_class_two_profile() {
+        fn expected(pointers: u64, ring: u64, job_list: u64, context: u64) -> [u8; 0xc0] {
+            let mut record = [0u8; 0xc0];
+            record[0x00..0x08].copy_from_slice(&pointers.to_le_bytes());
+            record[0x08..0x10].copy_from_slice(&ring.to_le_bytes());
+            record[0x10..0x18].copy_from_slice(&job_list.to_le_bytes());
+            record[0x24..0x28].copy_from_slice(&u32::MAX.to_le_bytes());
+            record[0x28..0x2c].copy_from_slice(&2u32.to_le_bytes());
+            record[0x2c..0x30].copy_from_slice(&2u32.to_le_bytes());
+            record[0x36..0x38].fill(0xff);
+            record[0x38..0x3c].copy_from_slice(&0u32.to_le_bytes());
+            record[0x40..0x44].copy_from_slice(&2u32.to_le_bytes());
+            record[0x44..0x48].copy_from_slice(&u32::MAX.to_le_bytes());
+            record[0x48..0x4c].copy_from_slice(&0x15u32.to_le_bytes());
+            record[0x94..0x9c].copy_from_slice(&0u64.to_le_bytes());
+            record[0x9c..0xa4].copy_from_slice(&context.to_le_bytes());
+            record
+        }
+
+        let job_list = 0x70_0000_2000;
+        let context = 0x70_0001_0c00;
+        let mut graph = [0xa5; 2 * G17P_RENDER_QUEUE_RECORD_SIZE];
+        build_g17p_user_queue_record(
+            &mut graph,
+            0,
+            0x70_0000_1000,
+            0x70_0000_4000,
+            job_list,
+            context,
+        );
+        build_g17p_user_queue_record(
+            &mut graph,
+            G17P_RENDER_QUEUE_RECORD_SIZE,
+            0x70_0000_1080,
+            0x70_0000_8000,
+            job_list,
+            context,
+        );
+        assert_eq!(
+            &graph[..G17P_RENDER_QUEUE_RECORD_SIZE],
+            &expected(0x70_0000_1000, 0x70_0000_4000, job_list, context,)
+        );
+        assert_eq!(
+            &graph[G17P_RENDER_QUEUE_RECORD_SIZE..],
+            &expected(0x70_0000_1080, 0x70_0000_8000, job_list, context,)
+        );
+    }
+
+    #[test]
+    fn user_render_pointer_blocks_carry_the_source_ring_capacity() {
+        let mut pointers = [0xa5; 2 * G17P_RENDER_POINTER_BLOCK_SIZE];
+        build_g17p_user_pointer_block(&mut pointers, 0);
+        build_g17p_user_pointer_block(&mut pointers, G17P_RENDER_POINTER_BLOCK_SIZE);
+        let mut expected = [0u8; G17P_RENDER_POINTER_BLOCK_SIZE];
+        expected[0x50..0x54].copy_from_slice(&u32::MAX.to_le_bytes());
+        expected[0x60..0x64].copy_from_slice(&0x500u32.to_le_bytes());
+        assert_eq!(&pointers[..G17P_RENDER_POINTER_BLOCK_SIZE], &expected);
+        assert_eq!(&pointers[G17P_RENDER_POINTER_BLOCK_SIZE..], &expected);
+    }
+
+    #[test]
+    fn user_render_optional_records_match_the_cold_opening_oracle() {
+        fn decode(hex: &str) -> [u8; 0xc0] {
+            fn nibble(byte: u8) -> u8 {
+                match byte {
+                    b'0'..=b'9' => byte - b'0',
+                    b'a'..=b'f' => byte - b'a' + 10,
+                    _ => panic!("invalid fixture"),
+                }
+            }
+            let bytes = hex.as_bytes();
+            assert_eq!(bytes.len(), 0x180);
+            let mut out = [0u8; 0xc0];
+            for (index, value) in out.iter_mut().enumerate() {
+                *value = (nibble(bytes[2 * index]) << 4) | nibble(bytes[2 * index + 1]);
+            }
+            out
+        }
+
+        let tiling_oracle = decode("0f00000000000000000012007000000000041200700000000000010000000200000000000000010000000000000000000000010000000008120070000000000000000000000000000000000c1200700000000100000000000000150000000200000001000000010000000000000000001300700000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
+        let fragment_oracle = decode("0f00000000000000000012007000000000041200700000000100010000000200000001000000010000000000000000000000010000000008120070000000000000000000000000000000000c120070000000010000000000000015000000020000000100000001000000000000000000000000000000ffffffffffffffffffffffffffffffff00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
+        let mut tiling = [0xa5; 0xc0];
+        let mut fragment = [0xa5; 0xc0];
+        build_g17p_user_optional(&mut tiling, 0, true, 0x70_0012_0000, 0x70_0013_0000);
+        build_g17p_user_optional(&mut fragment, 0, false, 0x70_0012_0000, 0x70_0013_0000);
+        assert_eq!(tiling, tiling_oracle);
+        assert_eq!(fragment, fragment_oracle);
+    }
+
+    #[test]
+    fn user_render_descriptors_use_the_cold_opening_namespace() {
+        fn u32_at(raw: &[u8], offset: usize) -> u32 {
+            u32::from_le_bytes(raw[offset..offset + 4].try_into().unwrap())
+        }
+        fn u64_at(raw: &[u8], offset: usize) -> u64 {
+            u64::from_le_bytes(raw[offset..offset + 8].try_into().unwrap())
+        }
+        let parameters = g17_render::G17pRenderParameters::source_rsrc8();
+        let objects = g17_render::RenderDescriptorObjects {
+            record_a: 0x70_0014_0000,
+            shared: 0x70_0015_0000,
+            record_b: 0x70_0016_0000,
+            zero: 0x70_0017_0000,
+        };
+        let mut tiling = [0u8; g17_render::TA_DESCRIPTOR_SIZE];
+        let mut fragment = [0u8; g17_render::FRAGMENT_DESCRIPTOR_SIZE];
+        assert_eq!(
+            g17_render::build_ta_descriptor(
+                &parameters,
+                objects,
+                g17p_cold_opening_metadata(g17_render::RenderDescriptorKind::Tiling),
+                &mut tiling,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            g17_render::build_fragment_descriptor(
+                &parameters,
+                objects,
+                g17p_cold_opening_metadata(g17_render::RenderDescriptorKind::Fragment),
+                &mut fragment,
+            ),
+            Ok(())
+        );
+
+        assert_eq!(u64_at(&tiling, 0x04), 1);
+        assert_eq!(u32_at(&tiling, 0x0c), 1);
+        assert_eq!(u32_at(&tiling, 0x18), 0);
+        assert_eq!(u32_at(&tiling, 0x48), 0);
+        assert_eq!(u32_at(&tiling, 0x304), 0);
+        for offset in [0x370, 0x37c, 0x388] {
+            assert_eq!(u32_at(&tiling, offset), 0x100);
+        }
+
+        assert_eq!(u64_at(&fragment, 0x04), 0);
+        assert_eq!(u32_at(&fragment, 0x0c), 1);
+        assert_eq!(u32_at(&fragment, 0x458), 0);
+        assert_eq!(u32_at(&fragment, 0x470), 0x100);
+        assert_eq!(u32_at(&fragment, 0x47c), 0x100);
+    }
+
+    #[test]
+    fn user_render_state_sizes_follow_the_legacy_scene_geometry() {
+        let parameters = g17_render::G17pRenderParameters::source_rsrc8();
+        let layout = g17p_render_state_layout(&parameters, 2).unwrap();
+        assert_eq!(layout.heapmeta, 0x10000);
+        assert_eq!(layout.heapmeta_size, 0x200);
+        assert_eq!(layout.tpc, 0x14000);
+        assert_eq!(layout.tpc_size, 0x1000);
+        assert_eq!(layout.aux_fb, 0x18000);
+        assert_eq!(layout.tilemap, 0x20000);
+        assert_eq!(layout.tilemap_size, 0x500);
+        assert_eq!(layout.total_size, 0x24000);
+        assert_eq!(G17P_RENDER_STATE_AUX_FB_SIZE, 0x8000);
+        assert_eq!(G17P_RENDER_AUX_FB_PAGE_COUNT, 0x10_0000);
+        assert_eq!(g17p_aux_fb_flags(0), 0xc000);
+        assert_eq!(g17p_aux_fb_flags(G17P_RENDER_DBIAS_IS_INT), 0xc001);
+
+        let mut viewport = [0u8; G17P_PAGE_SIZE];
+        assert_eq!(apply_g17p_viewport(64, 64, &mut viewport), Some(()));
+        assert_eq!(
+            u32::from_le_bytes(viewport[0x900..0x904].try_into().unwrap()),
+            0xc00
+        );
+        assert_eq!(
+            u32::from_le_bytes(viewport[0x904..0x908].try_into().unwrap()),
+            0x8000_0001
+        );
+        assert_eq!(
+            u32::from_le_bytes(viewport[0x908..0x90c].try_into().unwrap()),
+            1
+        );
+        assert_eq!(
+            u32::from_le_bytes(viewport[0x910..0x914].try_into().unwrap()),
+            0x4200_0000
+        );
+        assert_eq!(
+            u32::from_le_bytes(viewport[0x91c..0x920].try_into().unwrap()),
+            0xc200_0000
+        );
+    }
+
+    #[test]
+    fn user_render_late_tiling_changes_only_the_six_held_ranges() {
+        let graph_va = 0x70_0100_0000;
+        let descriptor = 0x70_0101_0000;
+        let addresses = g17_submission::G17PColdOpeningOptionalAddresses {
+            context_scratch: 0x70_0102_0000,
+            firmware_scratch: 0x70_0102_0000,
+            shared_control: 0x70_0102_4000,
+            channel_control: 0x70_0102_8000,
+            tiling_shared_object: 0x70_0102_c000,
+        };
+        let mut graph = vec![0u8; G17P_RENDER_QUEUE_GRAPH_SIZE];
+        let mut support = vec![0u8; G17P_RENDER_SUPPORT_SIZE];
+        put_u32(&mut support, G17P_RENDER_POOL_A_SLOTS + 4, 1);
+        put_u32(&mut support, G17P_RENDER_SHARED_CONTROL_INNER, 1);
+
+        // An address-construction error occurs before any publication and
+        // cannot change the early 3D-visible bytes.
+        assert!(build_g17p_late_tiling_bytes(descriptor, u64::MAX, addresses).is_err());
+        assert!(graph[G17P_USER_TILING_RING..G17P_USER_TILING_RING + 24]
+            .iter()
+            .all(|byte| *byte == 0));
+        assert_eq!(get_u32(&support, G17P_RENDER_POOL_A_SLOTS + 4), 1);
+        assert_eq!(get_u32(&support, G17P_RENDER_SHARED_CONTROL_INNER), 1);
+
+        let late = build_g17p_late_tiling_bytes(descriptor, graph_va, addresses).unwrap();
+        late.apply(&mut graph, &mut support);
+        assert_eq!(get_u64(&graph, G17P_USER_TILING_RING), descriptor);
+        assert_eq!(
+            get_u64(&graph, G17P_USER_TILING_RING + 8),
+            graph_va + G17P_USER_TILING_OPTIONAL as u64
+        );
+        assert_eq!(
+            get_u64(&graph, G17P_USER_TILING_RING + 16),
+            graph_va + G17P_USER_TILING_EVENT as u64
+        );
+        assert_eq!(get_u32(&graph, G17P_USER_TILING_POINTERS + 0x40), 3);
+        assert_eq!(get_u32(&graph, G17P_USER_TILING_EVENT + 0x08), 0x102);
+        assert_eq!(get_u32(&support, G17P_RENDER_POOL_A_SLOTS + 4), 2);
+        assert_eq!(get_u32(&support, G17P_RENDER_SHARED_CONTROL_INNER), 2);
+    }
+
+    #[test]
+    fn user_render_support_keeps_distinct_context_views_and_points_at_channel_record_zero() {
+        assert_eq!(G17P_RENDER_SUPPORT_SIZE, 0x40000);
+        assert_ne!(
+            G17P_RENDER_TILING_CONTEXT_SCRATCH,
+            G17P_RENDER_TILING_FIRMWARE_SCRATCH
+        );
+        assert_ne!(
+            G17P_RENDER_FRAGMENT_CONTEXT_SCRATCH,
+            G17P_RENDER_FRAGMENT_FIRMWARE_SCRATCH
+        );
+        let support_va = 0x70_0100_0000;
+        let channel_control = support_va + G17P_RENDER_CHANNEL_CONTROL as u64;
+        let mut support = vec![0u8; G17P_RENDER_SUPPORT_SIZE];
+        g17_submission::apply_g17p_cold_opening_channel_control(
+            &mut support[G17P_RENDER_CHANNEL_CONTROL
+                ..G17P_RENDER_CHANNEL_CONTROL
+                    + g17_submission::G17P_COLD_OPENING_CHANNEL_CONTROL_SIZE],
+        )
+        .unwrap();
+        let pointed = (channel_control - support_va) as usize;
+        assert_eq!(get_u64(&support, pointed), 0x0000_0100_0000_ffff);
+        assert_eq!(get_u64(&support, pointed + 0x20), 0x0002_0000_0000_0000);
+        assert_eq!(get_u64(&support, pointed + 0x30), 0x0000_0000_ff00_0000);
+    }
+
+    #[test]
+    fn user_vm_fixed_operand_ranges_are_disjoint_and_inside_the_reserved_arena() {
+        let directory = G17P_CONTROL_DIRECTORY_VA
+            ..G17P_CONTROL_DIRECTORY_VA + G17P_CONTROL_DIRECTORY_SIZE as u64;
+        let table =
+            G17P_CONTROL_OPERAND_TABLE_VA..G17P_CONTROL_OPERAND_TABLE_VA + G17P_PAGE_SIZE as u64;
+        let buffers = G17P_CONTROL_OPERAND_BUFFER_BASE
+            ..G17P_CONTROL_OPERAND_BUFFER_BASE + G17P_CONTROL_OPERAND_BACKING_SIZE as u64;
+        for range in [&directory, &table, &buffers] {
+            assert!(G17P_CL_LOW_VA_START <= range.start);
+            assert!(range.end <= G17P_CL_LOW_VA_END);
+        }
+        assert!(directory.end <= table.start);
+        assert!(table.end <= buffers.start);
     }
 
     fn valid_handoff() -> G17ResourceHandoff {

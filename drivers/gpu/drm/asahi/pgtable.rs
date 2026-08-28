@@ -81,6 +81,10 @@ const HIGH_BITS_PXN: u16 = 1 << 1;
 const HIGH_BITS_UXN: u16 = 1 << 2;
 const HIGH_BITS_GPU_ACCESS: u16 = 1 << 3;
 
+const fn complete_coverage(expected: u64, visited: u64, permitted: bool) -> bool {
+    permitted && visited == expected
+}
+
 #[cfg(CONFIG_DEV_COREDUMP)]
 pub(crate) const PTE_ADDR_BITS: u64 = (!UAT_PGMSK as u64) & (!UAT_HIGH_BITS);
 
@@ -171,7 +175,6 @@ impl Prot {
         }
     }
 
-    #[cfg(CONFIG_DEV_COREDUMP)]
     pub(crate) const fn from_pte(pte: u64) -> Self {
         Prot {
             high_bits: (pte >> UAT_HIGH_BITS_SHIFT) as u16,
@@ -220,6 +223,18 @@ impl Prot {
             | UAT_AF
     }
 
+    pub(crate) const fn allows_gpu(&self, need_read: bool, need_write: bool) -> bool {
+        let uxn = self.high_bits & HIGH_BITS_UXN != 0;
+        let pxn = self.high_bits & HIGH_BITS_PXN != 0;
+        let (readable, writable) = match self.ap {
+            AP_FW_GPU => (pxn, uxn),
+            AP_FW => (uxn && pxn, false),
+            AP_GPU => (!pxn, uxn != pxn),
+            _ => (false, false),
+        };
+        (!need_read || readable) && (!need_write || writable)
+    }
+
     pub(crate) const fn is_cached_noncoherent(&self) -> bool {
         self.ap != AP_GPU && self.memattr == MEMATTR_CACHED
     }
@@ -234,6 +249,22 @@ impl Default for Prot {
         PROT_FW_GPU_NA
     }
 }
+
+const _: () = {
+    assert!(PROT_GPU_RO.allows_gpu(true, false));
+    assert!(!PROT_GPU_RO.allows_gpu(false, true));
+    assert!(!PROT_GPU_WO.allows_gpu(true, false));
+    assert!(PROT_GPU_WO.allows_gpu(false, true));
+    assert!(PROT_GPU_RW.allows_gpu(true, false));
+    assert!(PROT_GPU_RW.allows_gpu(false, true));
+    assert!(PROT_GPU_RW.allows_gpu(true, true));
+    assert!(!PROT_FW_RW.allows_gpu(true, false));
+    assert!(!PROT_FW_RW.allows_gpu(false, true));
+    assert!(!Prot::from_pte(0).allows_gpu(true, false));
+    assert!(complete_coverage(3, 3, true));
+    assert!(!complete_coverage(3, 2, true));
+    assert!(!complete_coverage(3, 3, false));
+};
 
 #[cfg(CONFIG_DEV_COREDUMP)]
 pub(crate) struct DumpedPage {
@@ -476,6 +507,37 @@ impl UatPageTable {
         self.with_pages(iova_range, true, false, |_, _| Ok(()))
     }
 
+    /// Check that every page in an aligned range is mapped with the requested
+    /// GPU permissions. Missing intermediate page tables are detected by the
+    /// visited-page count because `with_pages` skips those holes.
+    pub(crate) fn covers_range(
+        &mut self,
+        iova_range: Range<u64>,
+        need_read: bool,
+        need_write: bool,
+    ) -> Result<bool> {
+        if iova_range.is_empty() || (iova_range.start | iova_range.end) & UAT_PGMSK as u64 != 0 {
+            return Ok(false);
+        }
+
+        let expected = (iova_range.end - iova_range.start) >> UAT_PGBIT;
+        let mut visited = 0u64;
+        let mut permitted = true;
+        self.with_pages(iova_range, false, false, |_, ptes| {
+            visited = visited.checked_add(ptes.len() as u64).ok_or(EOVERFLOW)?;
+            for pte in ptes {
+                let value = pte.load(Ordering::Acquire);
+                if value & PTE_TYPE_BITS != PTE_TYPE_LEAF_TABLE
+                    || !Prot::from_pte(value).allows_gpu(need_read, need_write)
+                {
+                    permitted = false;
+                }
+            }
+            Ok(())
+        })?;
+        Ok(complete_coverage(expected, visited, permitted))
+    }
+
     fn pte_bits(&self) -> u64 {
         if self.ttb_owned {
             // Owned page tables are userspace, so non-global
@@ -689,5 +751,36 @@ impl Drop for UatPageTable {
                 Page::from_phys(self.ttb);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gpu_permissions_match_ro_wo_and_rw_pte_encodings() {
+        assert!(PROT_GPU_RO.allows_gpu(true, false));
+        assert!(!PROT_GPU_RO.allows_gpu(false, true));
+        assert!(!PROT_GPU_RO.allows_gpu(true, true));
+
+        assert!(!PROT_GPU_WO.allows_gpu(true, false));
+        assert!(PROT_GPU_WO.allows_gpu(false, true));
+        assert!(!PROT_GPU_WO.allows_gpu(true, true));
+
+        assert!(PROT_GPU_RW.allows_gpu(true, false));
+        assert!(PROT_GPU_RW.allows_gpu(false, true));
+        assert!(PROT_GPU_RW.allows_gpu(true, true));
+
+        assert!(!PROT_FW_RW.allows_gpu(true, false));
+        assert!(!PROT_FW_RW.allows_gpu(false, true));
+        assert!(!Prot::from_pte(0).allows_gpu(true, false));
+    }
+
+    #[test]
+    fn skipped_page_table_hole_never_counts_as_coverage() {
+        assert!(complete_coverage(3, 3, true));
+        assert!(!complete_coverage(3, 2, true));
+        assert!(!complete_coverage(3, 3, false));
     }
 }
