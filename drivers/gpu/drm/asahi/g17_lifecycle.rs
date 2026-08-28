@@ -40,7 +40,8 @@ pub(crate) trait AscCpuLifecycle {
 pub(crate) struct StartedCpuPair<P: AscCpuLifecycle> {
     gfx: P,
     gfx1: P,
-    running: bool,
+    gfx_running: bool,
+    gfx1_running: bool,
 }
 
 impl<P: AscCpuLifecycle> StartedCpuPair<P> {
@@ -55,7 +56,8 @@ impl<P: AscCpuLifecycle> StartedCpuPair<P> {
         Ok(Self {
             gfx,
             gfx1,
-            running: true,
+            gfx_running: true,
+            gfx1_running: true,
         })
     }
 
@@ -65,19 +67,25 @@ impl<P: AscCpuLifecycle> StartedCpuPair<P> {
     /// access queue, descriptor, timestamp, or translation objects. Both stop
     /// calls run even if the first reports an error.
     pub(crate) fn stop(&mut self) -> Result<(), P::Error> {
-        if !self.running {
+        if !self.gfx_running && !self.gfx1_running {
             return Ok(());
         }
 
-        let gfx1_stop = self.gfx1.stop_cpu();
-        let gfx_stop = self.gfx.stop_cpu();
-        match (gfx1_stop, gfx_stop) {
-            (Err(err), _) | (Ok(()), Err(err)) => Err(err),
-            (Ok(()), Ok(())) => {
-                self.running = false;
-                Ok(())
+        let mut first_error = None;
+        if self.gfx1_running {
+            match self.gfx1.stop_cpu() {
+                Ok(()) => self.gfx1_running = false,
+                Err(err) => first_error = Some(err),
             }
         }
+        if self.gfx_running {
+            match self.gfx.stop_cpu() {
+                Ok(()) => self.gfx_running = false,
+                Err(err) if first_error.is_none() => first_error = Some(err),
+                Err(_) => {}
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 }
 
@@ -98,8 +106,10 @@ pub(crate) trait PersistentRuntimeRecovery {
     fn stop_cpu_pair(&mut self) -> Result<(), Self::Error>;
     fn drop_gfx1_rtkit(&mut self);
     fn drop_gfx_rtkit(&mut self);
-    fn release_queue_and_manager(&mut self);
-    fn build_fresh_session(&mut self) -> Result<(), Self::Error>;
+    /// Drop per-session queue and render state while retaining manager/UAT.
+    fn release_runtime_objects(&mut self);
+    /// Restore initdata and transports on the retained manager/UAT.
+    fn rebuild_session_in_place(&mut self) -> Result<(), Self::Error>;
     fn resume_submissions(&mut self);
 }
 
@@ -111,8 +121,8 @@ pub(crate) fn recover_persistent_runtime<T: PersistentRuntimeRecovery>(
     owner.stop_cpu_pair()?;
     owner.drop_gfx1_rtkit();
     owner.drop_gfx_rtkit();
-    owner.release_queue_and_manager();
-    owner.build_fresh_session()?;
+    owner.release_runtime_objects();
+    owner.rebuild_session_in_place()?;
     owner.resume_submissions();
     Ok(())
 }
@@ -192,8 +202,8 @@ mod tests {
         DropManager,
         PauseSubmissions,
         StopCpuPair,
-        ReleaseQueueAndManager,
-        BuildFreshSession,
+        ReleaseRuntimeObjects,
+        RebuildSessionInPlace,
         ResumeSubmissions,
     }
 
@@ -205,7 +215,7 @@ mod tests {
         StopGfx1,
         StopGfx,
         StopPair,
-        BuildFreshSession,
+        RebuildSession,
     }
 
     #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -216,7 +226,7 @@ mod tests {
         StopGfx1,
         StopGfx,
         StopPair,
-        BuildFreshSession,
+        RebuildSession,
     }
 
     struct State {
@@ -443,6 +453,38 @@ mod tests {
     }
 
     #[test]
+    fn partial_stop_retry_touches_only_the_role_that_did_not_stop() {
+        let state = State {
+            failure: Some(Failure::StopGfx1),
+            trace: RefCell::new(std::vec::Vec::new()),
+        };
+        let mut pair = StartedCpuPair::start(
+            MockCpu {
+                role: Role::Gfx,
+                state: &state,
+            },
+            MockCpu {
+                role: Role::Gfx1,
+                state: &state,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(pair.stop(), Err(TestError::StopGfx1));
+        drop(pair);
+        assert_eq!(
+            state.trace.into_inner(),
+            [
+                Event::Start(Role::Gfx),
+                Event::Start(Role::Gfx1),
+                Event::Stop(Role::Gfx1),
+                Event::Stop(Role::Gfx),
+                Event::Stop(Role::Gfx1),
+            ]
+        );
+    }
+
+    #[test]
     fn retained_pair_rolls_back_primary_when_secondary_start_fails() {
         let state = State {
             failure: Some(Failure::StartGfx1),
@@ -529,6 +571,7 @@ mod tests {
     struct MockRuntimeRecovery {
         failure: Option<Failure>,
         trace: std::vec::Vec<Event>,
+        manager_uat_id: u64,
     }
 
     impl PersistentRuntimeRecovery for MockRuntimeRecovery {
@@ -555,14 +598,14 @@ mod tests {
             self.trace.push(Event::DropGfxRtkit);
         }
 
-        fn release_queue_and_manager(&mut self) {
-            self.trace.push(Event::ReleaseQueueAndManager);
+        fn release_runtime_objects(&mut self) {
+            self.trace.push(Event::ReleaseRuntimeObjects);
         }
 
-        fn build_fresh_session(&mut self) -> Result<(), Self::Error> {
-            self.trace.push(Event::BuildFreshSession);
-            if self.failure == Some(Failure::BuildFreshSession) {
-                Err(TestError::BuildFreshSession)
+        fn rebuild_session_in_place(&mut self) -> Result<(), Self::Error> {
+            self.trace.push(Event::RebuildSessionInPlace);
+            if self.failure == Some(Failure::RebuildSession) {
+                Err(TestError::RebuildSession)
             } else {
                 Ok(())
             }
@@ -578,8 +621,11 @@ mod tests {
         let mut owner = MockRuntimeRecovery {
             failure: None,
             trace: std::vec::Vec::new(),
+            manager_uat_id: 0x9000_0000,
         };
+        let manager_uat_id = owner.manager_uat_id;
         assert_eq!(recover_persistent_runtime(&mut owner), Ok(()));
+        assert_eq!(owner.manager_uat_id, manager_uat_id);
         assert_eq!(
             owner.trace,
             [
@@ -587,8 +633,8 @@ mod tests {
                 Event::StopCpuPair,
                 Event::DropGfx1Rtkit,
                 Event::DropGfxRtkit,
-                Event::ReleaseQueueAndManager,
-                Event::BuildFreshSession,
+                Event::ReleaseRuntimeObjects,
+                Event::RebuildSessionInPlace,
                 Event::ResumeSubmissions,
             ]
         );
@@ -599,6 +645,7 @@ mod tests {
         let mut owner = MockRuntimeRecovery {
             failure: Some(Failure::StopPair),
             trace: std::vec::Vec::new(),
+            manager_uat_id: 0x9000_0000,
         };
         assert_eq!(
             recover_persistent_runtime(&mut owner),
@@ -610,12 +657,13 @@ mod tests {
     #[test]
     fn rebuild_error_leaves_submissions_paused_after_safe_release() {
         let mut owner = MockRuntimeRecovery {
-            failure: Some(Failure::BuildFreshSession),
+            failure: Some(Failure::RebuildSession),
             trace: std::vec::Vec::new(),
+            manager_uat_id: 0x9000_0000,
         };
         assert_eq!(
             recover_persistent_runtime(&mut owner),
-            Err(TestError::BuildFreshSession)
+            Err(TestError::RebuildSession)
         );
         assert_eq!(
             owner.trace,
@@ -624,8 +672,8 @@ mod tests {
                 Event::StopCpuPair,
                 Event::DropGfx1Rtkit,
                 Event::DropGfxRtkit,
-                Event::ReleaseQueueAndManager,
-                Event::BuildFreshSession,
+                Event::ReleaseRuntimeObjects,
+                Event::RebuildSessionInPlace,
             ]
         );
     }
