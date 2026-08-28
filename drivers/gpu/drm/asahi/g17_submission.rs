@@ -138,6 +138,8 @@ pub(crate) enum SubmissionError {
     KickB2PrimaryStateBufferTooSmall,
     /// The retained queue already published its one-time pre-B2 state.
     KickB2PrimaryStateAlreadyPublished,
+    /// A retained queue static object is smaller than its native extent.
+    KickRetainedStorageBufferTooSmall,
     /// A CL entry has one implicit dependency and at most 31 explicit ones.
     KickDependencyCountOutOfRange,
     /// A CL dependency names a queue outside the seven-bit entry field.
@@ -1376,6 +1378,57 @@ pub(crate) const fn g17p_cl_range_contains(
 /// A whole-page support initializer is valid only before queue registration.
 pub(crate) const fn g17p_cl_full_support_initialization_allowed(registered: bool) -> bool {
     !registered
+}
+
+/// Initialize the queue-owned pages exactly once, before SKSM registration.
+pub(crate) fn apply_g17p_cl_retained_static_state(
+    shared_support: &mut [u8],
+    support_state: &mut [u8],
+    scheduler_state: &mut [u8],
+    channel_control: &mut [u8],
+    operand_table_gpu_va: u64,
+    support_state_gpu_va: u64,
+    scheduler_state_gpu_va: u64,
+) -> Result<(), SubmissionError> {
+    if shared_support.len() < 0x4000
+        || support_state.len() < 0x4000
+        || scheduler_state.len() < 0x4000
+        || channel_control.len() < 0x40
+    {
+        return Err(SubmissionError::KickRetainedStorageBufferTooSmall);
+    }
+
+    shared_support.fill(0);
+    support_state.fill(0);
+    scheduler_state.fill(0);
+    channel_control.fill(0);
+
+    put_u64_le(shared_support, 0x00, 2);
+    put_u64_le(shared_support, 0x08, 1);
+    put_u64_le(shared_support, 0x10, 2);
+    put_u64_le(shared_support, 0x18, 0x0004_0000_0000_0070);
+    put_u64_le(shared_support, 0x20, 0x0000_1500_0000_0000);
+    put_u64_le(shared_support, 0x28, 0x0000_1500_0000_0000);
+    put_u64_le(shared_support, 0x30, operand_table_gpu_va);
+    put_u64_le(shared_support, 0x40, 4);
+    put_u32_le(shared_support, 0x48, 0xa8);
+    put_u64_le(shared_support, 0x4c, support_state_gpu_va);
+    put_u32_le(shared_support, 0x54, 0);
+    put_u32_le(shared_support, 0x5c, 1);
+    put_u32_le(shared_support, 0x60, 2);
+
+    let scheduler = G17P_CL_RETAINED_STORAGE_LAYOUT.scheduler.offset;
+    put_u64_le(shared_support, scheduler, scheduler_state_gpu_va + 8);
+    put_u32_le(shared_support, scheduler + 0x08, 1);
+    put_u32_le(shared_support, scheduler + 0x0c, 0);
+    put_u32_le(shared_support, scheduler + 0x10, 0x50);
+    put_u32_le(support_state, 0, 1);
+    put_u32_le(scheduler_state, 8, 1);
+
+    put_u64_le(channel_control, 0x00, 0x0000_0100_0000_ffff);
+    put_u64_le(channel_control, 0x20, 0x0002_0000_0000_0000);
+    put_u64_le(channel_control, 0x30, 0x0000_0000_ff00_0000);
+    Ok(())
 }
 
 /// Apply the exact host-owned pre-B2 values to three provider-owned pages.

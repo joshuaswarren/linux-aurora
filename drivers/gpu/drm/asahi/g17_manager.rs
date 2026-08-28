@@ -13,6 +13,9 @@
 use kernel::prelude::*;
 
 #[cfg(not(test))]
+use core::sync::atomic::{fence, Ordering};
+
+#[cfg(not(test))]
 use crate::{
     driver::AsahiDevice, g17_initdata, g17_resources, g17_submission, hw::agx3, identity, mmu, regs,
 };
@@ -314,6 +317,9 @@ pub(crate) struct G17PSksmQueue {
     queue_id: u8,
     scratch: G17SksmScratchGeometry,
     uat_owner: u64,
+    storage: g17_resources::G17PClRuntimeStorage,
+    producer: g17_submission::G17PClKickProducerState,
+    b2_activation: g17_submission::G17PClB2ActivationState,
 }
 
 #[cfg(not(test))]
@@ -356,10 +362,35 @@ impl G17PManagerConstruction {
     /// Configure one SKSM queue through resource 0 and return its registered
     /// state only after the QID-valid bit is published.
     pub(crate) fn configure_compute_sksm_queue(
-        &self,
+        &mut self,
+        dev: &AsahiDevice,
         registers: &regs::Resources,
-        routing: g17_submission::G17PComputeQueueRouting,
+        queue_id: u8,
+        completion_selector: u8,
     ) -> Result<G17PSksmQueue> {
+        let mut storage = g17_resources::G17PClRuntimeStorage::new(dev, self.uat())?;
+        let operand_table_gpu_va = storage.operand_table_gpu_va();
+        let support_state_gpu_va = storage.support_state_gpu_va();
+        let scheduler_state_gpu_va = storage.scheduler_state_gpu_va();
+        storage.with_static_pages_mut(
+            |shared_support, support_state, scheduler_state, channel_control| {
+                g17_submission::apply_g17p_cl_retained_static_state(
+                    shared_support,
+                    support_state,
+                    scheduler_state,
+                    channel_control,
+                    operand_table_gpu_va,
+                    support_state_gpu_va,
+                    scheduler_state_gpu_va,
+                )
+                .map_err(|_| EINVAL)
+            },
+        )?;
+        let routing = g17_submission::G17PComputeQueueRouting {
+            queue_id,
+            completion_selector: completion_selector as u32,
+            entry_gpu_va: storage.entry_gpu_va(),
+        };
         let config =
             g17_submission::prepare_g17p_compute_sksm_queue_config(routing, self.sksm_scratch())
                 .map_err(|_| EINVAL)?;
@@ -370,7 +401,83 @@ impl G17PManagerConstruction {
             queue_id: routing.queue_id,
             scratch: self.sksm_scratch(),
             uat_owner: self.uat().ttb_base(),
+            storage,
+            producer: g17_submission::G17PClKickProducerState {
+                queue_id,
+                num_stamps: 256,
+                entry_stride: 0x200,
+                completion_selector,
+                qos: g17_submission::G17PClQosConfig {
+                    queue_byte_32: 1,
+                    class_40: 8,
+                    word_48: 0xffff,
+                },
+                submitted: 0,
+                current_timestamp: 1,
+                base_timestamp: 1,
+                previous_valid: false,
+                previous_timestamp: 0,
+            },
+            b2_activation: g17_submission::G17PClB2ActivationState::Pending,
         })
+    }
+
+    /// Publish one complete CL entry, then perform the queue's ordered SKSM
+    /// notification. The first post-registration entry publishes the retained
+    /// B2 state; later entries keep those provider-owned pages unchanged.
+    pub(crate) fn submit_compute_entry(
+        &mut self,
+        registers: &regs::Resources,
+        queue: &mut G17PSksmQueue,
+        operands: g17_submission::G17PClKickEntryOperands<'_>,
+    ) -> Result<u64> {
+        if queue.scratch != self.sksm_scratch() || queue.uat_owner != self.uat().ttb_base() {
+            return Err(EINVAL);
+        }
+        let prepared = g17_submission::prepare_g17p_cl_kick_entry(queue.producer, operands)
+            .map_err(|_| EINVAL)?;
+        queue.storage.write_entry(
+            prepared.entry_offset as usize,
+            prepared.zero_length as usize,
+            &prepared.entry,
+        )?;
+
+        if queue.b2_activation == g17_submission::G17PClB2ActivationState::Pending {
+            let channel_control_gpu_va = queue.storage.channel_control_gpu_va();
+            queue.b2_activation =
+                self.resources
+                    .with_b2_pages_mut(|computed, region_1, region_2| {
+                        g17_submission::apply_g17p_cl_b2_primary_state(
+                            queue.b2_activation,
+                            computed,
+                            region_1,
+                            region_2,
+                            channel_control_gpu_va,
+                        )
+                        .map_err(|_| EINVAL)
+                    })?;
+        }
+
+        fence(Ordering::SeqCst);
+        queue.producer = prepared.producer_after;
+        let timestamp = prepared.current_timestamp;
+        self.add_sksm_kicks(registers, queue, 1)?;
+        fence(Ordering::SeqCst);
+        Ok(timestamp)
+    }
+
+    /// Completion ingress for the descriptor-provided completed-kick count.
+    pub(crate) fn complete_compute_entries(
+        &self,
+        queue: &mut G17PSksmQueue,
+        completed_count: u32,
+    ) -> Result {
+        if queue.scratch != self.sksm_scratch() || queue.uat_owner != self.uat().ttb_base() {
+            return Err(EINVAL);
+        }
+        queue.producer = g17_submission::complete_g17p_cl_kicks(queue.producer, completed_count)
+            .map_err(|_| EINVAL)?;
+        Ok(())
     }
 
     /// Publish newly appended kicks for a queue returned by
