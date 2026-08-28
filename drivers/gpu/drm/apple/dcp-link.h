@@ -30,6 +30,7 @@
 #define APPLE_DCP_LINK_MSG_SIZE			GENMASK_ULL(47, 32)
 #define APPLE_DCP_LINK_MSG_HASH			GENMASK_ULL(47, 16)
 #define APPLE_DCP_LINK_MSG_VERSION		GENMASK_ULL(63, 48)
+#define APPLE_DCP_LINK_REPLY_CONTROL_MASK	0xff3e
 
 struct apple_dcp_link_init_desc {
 	__le64 shared_dva;
@@ -47,6 +48,16 @@ struct apple_dcp_h17p_rt_bw_config {
 	__le64 scratch;
 	__le64 clock_request;
 } __packed;
+
+struct apple_dcp_link_rpc_view {
+	u32 call;
+	u32 input_size;
+	u32 output_size;
+	u32 offset;
+	u32 total_size;
+	const void *input;
+	void *output;
+};
 
 static_assert(sizeof(struct apple_dcp_link_init_desc) == 0x10);
 static_assert(sizeof(struct apple_dcp_link_rpc_header) == 0x0c);
@@ -165,6 +176,54 @@ static inline u8 apple_dcp_link_message_stream(u64 message)
 static inline bool apple_dcp_link_message_is_remote(u64 message)
 {
 	return message & APPLE_DCP_LINK_MSG_REMOTE;
+}
+
+static inline u64 apple_dcp_link_rpc_reply(u64 request)
+{
+	return (request & (APPLE_DCP_LINK_MSG_VERSION |
+			   APPLE_DCP_LINK_REPLY_CONTROL_MASK)) |
+	       APPLE_DCP_LINK_MSG_RPC_REPLY;
+}
+
+static inline int apple_dcp_link_rpc_decode(u64 message, void *buffer,
+					    u32 capacity,
+					    struct apple_dcp_link_rpc_view *view)
+{
+	struct apple_dcp_link_rpc_header *header;
+	u32 expected_size;
+	u32 offset;
+	u32 total_size;
+	int ret;
+
+	if (!buffer || !view)
+		return -EINVAL;
+	if ((message & GENMASK_ULL(1, 0)) != APPLE_DCP_LINK_MSG_RPC ||
+	    (message & GENMASK_ULL(7, 6)) == BIT_ULL(6))
+		return -EPROTO;
+
+	offset = FIELD_GET(APPLE_DCP_LINK_MSG_OFFSET, message);
+	total_size = FIELD_GET(APPLE_DCP_LINK_MSG_SIZE, message);
+	if (offset > capacity || total_size > capacity - offset ||
+	    total_size < sizeof(*header))
+		return -EMSGSIZE;
+
+	header = buffer + offset;
+	ret = apple_dcp_link_rpc_payload_size(le32_to_cpu(header->input_size),
+					      le32_to_cpu(header->output_size),
+					      &expected_size);
+	if (ret)
+		return ret;
+	if (expected_size != total_size)
+		return -EMSGSIZE;
+
+	view->call = le32_to_cpu(header->call);
+	view->input_size = le32_to_cpu(header->input_size);
+	view->output_size = le32_to_cpu(header->output_size);
+	view->offset = offset;
+	view->total_size = total_size;
+	view->input = header + 1;
+	view->output = (u8 *)(header + 1) + view->input_size;
+	return 0;
 }
 
 static inline int apple_dcp_link_stack_push(u32 top, u32 capacity,
