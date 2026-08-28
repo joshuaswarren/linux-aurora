@@ -404,6 +404,12 @@ pub(crate) struct G17PControlCounters {
 }
 
 impl G17PControlCounters {
+    pub(crate) fn opening_staged(self) -> bool {
+        self.primary == [0, 0, g17_initdata::CONTROL_OPENING_PRIMARY_PRODUCER]
+            && self.secondary
+                == [0, 0, g17_initdata::CONTROL_OPENING_SECONDARY_PRODUCER]
+    }
+
     pub(crate) fn opening_retired(self) -> bool {
         self.primary == [g17_initdata::CONTROL_OPENING_PRIMARY_PRODUCER; 3]
             && self.secondary == [g17_initdata::CONTROL_OPENING_SECONDARY_PRODUCER; 3]
@@ -3304,11 +3310,19 @@ mod tests {
 
     #[test]
     fn control_opening_requires_all_six_exact_counter_values() {
+        let staged = G17PControlCounters {
+            primary: [0, 0, 4],
+            secondary: [0, 0, 16],
+        };
+        assert!(staged.opening_staged());
+        assert!(!staged.opening_retired());
+
         let retired = G17PControlCounters {
             primary: [4, 4, 4],
             secondary: [16, 16, 16],
         };
         assert!(retired.opening_retired());
+        assert!(!retired.opening_staged());
 
         for primary_index in 0..3 {
             let mut current = retired;
