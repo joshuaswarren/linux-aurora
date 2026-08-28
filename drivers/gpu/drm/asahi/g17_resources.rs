@@ -62,6 +62,7 @@ pub(crate) const G17P_COMPUTE_DESCRIPTOR_SLOT_COUNT: usize = 256;
 pub(crate) const G17P_COMPUTE_DESCRIPTOR_STORAGE_SIZE: usize =
     G17P_COMPUTE_DESCRIPTOR_SLOT_SIZE * G17P_COMPUTE_DESCRIPTOR_SLOT_COUNT;
 pub(crate) const G17P_COMPUTE_PREEMPT_SIZE: usize = 0x4000;
+const G17P_COMPUTE_ADD3_RESOURCE_TABLE: usize = 0x14a0;
 pub(crate) const G17P_COMPUTE_OPERAND_STATE_SIZE: usize = 0x14000;
 pub(crate) const G17P_COMPUTE_SUPPORT_SIZE: usize = 0xc000;
 pub(crate) const G17P_COMPUTE_QUEUE_GRAPH_SIZE: usize = g17_compute::COMPUTE_QUEUE_GRAPH_SIZE;
@@ -269,6 +270,16 @@ fn put_u16(raw: &mut [u8], offset: usize, value: u16) {
 
 fn put_u64(raw: &mut [u8], offset: usize, value: u64) {
     raw[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+fn apply_g17p_add3_resource_table(raw: &mut [u8], buffers: [u64; 3]) -> Option<()> {
+    let end = G17P_COMPUTE_ADD3_RESOURCE_TABLE
+        .checked_add(buffers.len() * core::mem::size_of::<u64>())?;
+    let table = raw.get_mut(G17P_COMPUTE_ADD3_RESOURCE_TABLE..end)?;
+    for (slot, address) in buffers.into_iter().enumerate() {
+        put_u64(table, slot * core::mem::size_of::<u64>(), address);
+    }
+    Some(())
 }
 
 fn g17p_render_can_reset_job_list(
@@ -1082,6 +1093,14 @@ impl G17PComputeDescriptorStorage {
             self.descriptors_high.iova() + offset,
             self.descriptors.iova() + offset,
         )
+    }
+
+    /// Install the three-qword Tier-2 table consumed by the hardware-proven
+    /// direct add3 preamble. Register 0x1a510 names this retained object; the
+    /// shader reads input A, input B, and output at +0x14a0.
+    pub(crate) fn write_g17p_add3_resource_table(&mut self, buffers: [u64; 3]) -> Result {
+        self.preempt
+            .with_bytes_mut(|raw| apply_g17p_add3_resource_table(raw, buffers).ok_or(ERANGE))
     }
 
     pub(crate) fn map_user_execution_state(
@@ -3306,6 +3325,33 @@ mod tests {
         }
         assert!(directory.end <= table.start);
         assert!(table.end <= buffers.start);
+    }
+
+    #[test]
+    fn add3_resource_table_occupies_the_hardware_proven_preempt_offset() {
+        let buffers = [
+            0x100_0003_0000,
+            0x100_0003_8000,
+            0x100_0004_0000,
+        ];
+        let mut raw = vec![0u8; G17P_COMPUTE_PREEMPT_SIZE];
+        assert_eq!(apply_g17p_add3_resource_table(&mut raw, buffers), Some(()));
+        for (slot, address) in buffers.into_iter().enumerate() {
+            assert_eq!(
+                get_u64(
+                    &raw,
+                    G17P_COMPUTE_ADD3_RESOURCE_TABLE + slot * core::mem::size_of::<u64>(),
+                ),
+                address
+            );
+        }
+        assert_eq!(
+            apply_g17p_add3_resource_table(
+                &mut raw[..G17P_COMPUTE_ADD3_RESOURCE_TABLE + 23],
+                buffers,
+            ),
+            None
+        );
     }
 
     #[test]

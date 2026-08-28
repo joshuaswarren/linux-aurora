@@ -973,6 +973,10 @@ impl G17PManagerConstruction {
             return Err(EINVAL);
         }
 
+        if let Some(buffers) = command.g17p_add3_buffers {
+            queue.compute.write_g17p_add3_resource_table(buffers)?;
+        }
+
         let ordinal = queue.submission_ordinal;
         let next_ordinal = ordinal.checked_add(1).ok_or(EOVERFLOW)?;
         let queue_submission = ordinal.checked_add(1).ok_or(EINVAL)?;
