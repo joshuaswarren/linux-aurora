@@ -638,6 +638,15 @@
 		label = "venc0_me1";
 		power-domains = <&ps_venc0_me0>;
 	};
+
+	ps_disp_cpu: power-controller@10000 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x10000 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "disp_cpu";
+		power-domains = <&ps_disp_fe>;
+	};
 };
 
 &pmgr_mini {
