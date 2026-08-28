@@ -944,6 +944,16 @@ pub(crate) struct ComputeTimestampAddresses {
     pub(crate) end: u64,
 }
 
+/// A compute command owns exactly one start/end pair. Both words must be
+/// visible before the queue entry and its userspace fence can retire.
+pub(crate) const fn completed_compute_timestamps(start: u64, end: u64) -> Option<[u64; 2]> {
+    if start == 0 || end == 0 {
+        None
+    } else {
+        Some([start, end])
+    }
+}
+
 /// Build the complete selector-3 descriptor for a translated command.
 ///
 /// This is the boundary that consumes the command's CDM range, sampler state,
@@ -1379,6 +1389,9 @@ mod tests {
             u64::from_le_bytes(descriptor[0x8c..0x94].try_into().unwrap()),
             translated.usc_exec_base
         );
+        assert_eq!(completed_compute_timestamps(0, 9), None);
+        assert_eq!(completed_compute_timestamps(7, 0), None);
+        assert_eq!(completed_compute_timestamps(7, 9), Some([7, 9]));
     }
 
     #[test]

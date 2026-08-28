@@ -330,6 +330,7 @@ pub(crate) struct G17PSksmQueue {
     storage: g17_resources::G17PClRuntimeStorage,
     compute: g17_resources::G17PComputeDescriptorStorage,
     producer: g17_submission::G17PClKickProducerState,
+    submission_ordinal: u32,
     b2_activation: g17_submission::G17PClB2ActivationState,
 }
 
@@ -347,9 +348,7 @@ pub(crate) struct G17PComputeSubmissionContext<'a> {
     pub(crate) converted_command_timestamp: u64,
     pub(crate) barriers: &'a [g17_submission::G17PClBarrierDependency],
     pub(crate) mcache: Option<g17_submission::G17PClMcacheAperture>,
-    pub(crate) event_mask: [u64; 4],
     pub(crate) rce_kind: u8,
-    pub(crate) rce_bindings: [g17_submission::G17PClRceBinding; 4],
     pub(crate) auxiliary: u64,
 }
 
@@ -804,6 +803,7 @@ impl G17PManagerConstruction {
                 previous_valid: false,
                 previous_timestamp: 0,
             },
+            submission_ordinal: 0,
             b2_activation: g17_submission::G17PClB2ActivationState::Pending,
         })
     }
@@ -906,6 +906,11 @@ impl G17PManagerConstruction {
             .map_err(|_| EINVAL)?;
         let (descriptor_high, descriptor_low) =
             queue.compute.descriptor_gpu_vas(timestamp.stamp_index);
+        let command_state = g17_submission::prepare_g17p_compute_cl_command_state(
+            descriptor_low,
+            queue.submission_ordinal,
+        )
+        .map_err(|_| EINVAL)?;
         let payload = [descriptor_high, queue.compute.queue_record_gpu_va()];
         let operands = command.entry_operands(g17_uapi::ComputeEntryContext {
             descriptor_flag_4c: context.descriptor_flag_4c,
@@ -914,9 +919,9 @@ impl G17PManagerConstruction {
             barriers: context.barriers,
             mcache: context.mcache,
             payload,
-            event_mask: context.event_mask,
+            event_mask: command_state.event_mask,
             rce_kind: context.rce_kind,
-            rce_bindings: context.rce_bindings,
+            rce_bindings: command_state.rce_bindings,
             auxiliary: context.auxiliary,
         });
         let prepared = g17_submission::prepare_g17p_cl_kick_entry(queue.producer, operands)
@@ -925,7 +930,8 @@ impl G17PManagerConstruction {
             return Err(EINVAL);
         }
 
-        let ordinal = queue.producer.submitted;
+        let ordinal = queue.submission_ordinal;
+        let next_ordinal = ordinal.checked_add(1).ok_or(EOVERFLOW)?;
         let queue_submission = ordinal.checked_add(1).ok_or(EINVAL)?;
         let preempt_base = queue.compute.preempt_gpu_va();
         let robustness = queue.compute.robustness_gpu_va();
@@ -959,7 +965,7 @@ impl G17PManagerConstruction {
                     g17_compute::ComputeDescriptorMetadata {
                         submit_sequence: ordinal as u64,
                         context_id: context.context_id,
-                        grid_index: 2,
+                        grid_index: 6,
                         work_ordinal: ordinal,
                         queue_submission,
                         queue_ordinal: ordinal,
@@ -974,7 +980,9 @@ impl G17PManagerConstruction {
             })?;
 
         fence(Ordering::SeqCst);
-        self.publish_compute_entry(registers, queue, prepared)
+        let timestamp = self.publish_compute_entry(registers, queue, prepared)?;
+        queue.submission_ordinal = next_ordinal;
+        Ok(timestamp)
     }
 
     /// Completion ingress for the descriptor-provided completed-kick count.

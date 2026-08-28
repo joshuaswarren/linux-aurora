@@ -30,7 +30,7 @@ use kernel::{
     c_str,
     device,
     drm::{
-        gem::shmem,
+        gem::{shmem, BaseObject},
         gpuvm,
         mm, //
     },
@@ -749,6 +749,36 @@ impl KernelMapping {
     /// Returns the IOVA base of this mapping
     pub(crate) fn iova_range(&self) -> Range<u64> {
         self.0.start()..(self.0.start() + self.0.mapped_size as u64)
+    }
+
+    /// Borrow the mapped GEM subrange through a temporary CPU mapping.
+    ///
+    /// The caller must serialize CPU access with firmware or GPU writes. This
+    /// helper only owns the kernel VMap lifetime and applies the object offset
+    /// carried by this mapping.
+    pub(crate) fn with_cpu_bytes<R>(
+        &self,
+        f: impl FnOnce(&mut [u8]) -> Result<R>,
+    ) -> Result<R> {
+        let gem = self.0._gem.as_ref().ok_or(EINVAL)?;
+        let end = self
+            .0
+            .offset
+            .checked_add(self.0.mapped_size)
+            .ok_or(EOVERFLOW)?;
+        if end > gem.size() {
+            return Err(ERANGE);
+        }
+        let vmap = gem.vmap::<u8>()?;
+        let bytes = unsafe {
+            // SAFETY: the VMap covers the complete GEM allocation and the
+            // checked subrange is retained by this KernelMapping.
+            core::slice::from_raw_parts_mut(
+                vmap.as_mut_ptr().add(self.0.offset),
+                self.0.mapped_size,
+            )
+        };
+        f(bytes)
     }
 
     /// Map the same GEM subrange into another VM. The caller owns the returned

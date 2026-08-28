@@ -205,7 +205,7 @@ pub(crate) fn build_compute_queue_graph(
     raw[0x36..0x38].fill(0xff);
     put_u32(raw, 0x40, 2);
     put_u32(raw, 0x44, u32::MAX);
-    put_u32(raw, 0x48, 0x172);
+    put_u32(raw, 0x48, 0x1aa);
     put_u64(raw, 0x9c, channel_control);
     put_u32(raw, 0x100 + 0x50, u32::MAX);
     put_u32(raw, 0x100 + 0x60, 0x500);
@@ -512,6 +512,7 @@ mod tests {
                 item_ring: 0xffff_fc20_c100_4000,
             }
         );
-        assert_eq!(fnv1a64(&raw), 0x3fb9_466b_9a30_60b0);
+        assert_eq!(u32::from_le_bytes(raw[0x48..0x4c].try_into().unwrap()), 0x1aa);
+        assert_eq!(fnv1a64(&raw), 0x3490_ef31_add0_ac88);
     }
 }
