@@ -96,6 +96,11 @@
 	status = "okay";
 };
 
+/* The loader stops only the ASC CPU and leaves the display domain active. */
+&ps_disp_cpu {
+	apple,always-on;
+};
+
 &display {
 	status = "okay";
 };
