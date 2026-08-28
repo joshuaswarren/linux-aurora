@@ -31,6 +31,7 @@
 
 #define APPLE_DCP_LINK_INIT_FLAG_64M		0x04000000
 
+#define APPLE_DCP_LINK_MSG_FIRMWARE_INIT	0
 #define APPLE_DCP_LINK_MSG_READY		1
 #define APPLE_DCP_LINK_MSG_RPC			2
 #define APPLE_DCP_LINK_MSG_RPC_REPLY		0x42
@@ -47,6 +48,18 @@
 #define APPLE_DCP_LINK_CALL_D003		0x44303033
 #define APPLE_DCP_H17P_CLOCK_ID_154		0x154
 #define APPLE_DCP_H17P_CLOCK_ID_194		0x194
+
+enum apple_dcp_link_state {
+	APPLE_DCP_LINK_WAIT_FIRMWARE_INIT,
+	APPLE_DCP_LINK_WAIT_FIRMWARE_READY,
+	APPLE_DCP_LINK_READY,
+};
+
+enum apple_dcp_link_handshake_action {
+	APPLE_DCP_LINK_HANDSHAKE_NONE,
+	APPLE_DCP_LINK_HANDSHAKE_SEND_INIT,
+	APPLE_DCP_LINK_HANDSHAKE_START_IOMFB,
+};
 
 enum apple_dcp_h17p_callback {
 	APPLE_DCP_H17P_CB_DID_BOOT = 0x44303030,
@@ -426,11 +439,29 @@ static inline int apple_dcp_link_init_message(u64 rpc_dva, u64 *message)
 	return 0;
 }
 
-static inline u64 apple_dcp_link_ready_message(void)
+static inline enum apple_dcp_link_handshake_action
+apple_dcp_link_handshake_step(enum apple_dcp_link_state *state, u64 message)
 {
-	return FIELD_PREP(APPLE_DCP_LINK_MSG_VERSION,
-			  APPLE_DCP_LINK_PROTOCOL_VERSION) |
-	       APPLE_DCP_LINK_MSG_READY;
+	u8 type;
+
+	if (!state)
+		return APPLE_DCP_LINK_HANDSHAKE_NONE;
+
+	type = message & GENMASK_ULL(1, 0);
+	switch (type) {
+	case APPLE_DCP_LINK_MSG_FIRMWARE_INIT:
+		if (*state != APPLE_DCP_LINK_WAIT_FIRMWARE_INIT)
+			return APPLE_DCP_LINK_HANDSHAKE_NONE;
+		*state = APPLE_DCP_LINK_WAIT_FIRMWARE_READY;
+		return APPLE_DCP_LINK_HANDSHAKE_SEND_INIT;
+	case APPLE_DCP_LINK_MSG_READY:
+		if (*state != APPLE_DCP_LINK_WAIT_FIRMWARE_READY)
+			return APPLE_DCP_LINK_HANDSHAKE_NONE;
+		*state = APPLE_DCP_LINK_READY;
+		return APPLE_DCP_LINK_HANDSHAKE_START_IOMFB;
+	default:
+		return APPLE_DCP_LINK_HANDSHAKE_NONE;
+	}
 }
 
 static inline int apple_dcp_link_ready_reply(u64 message, u16 *version,

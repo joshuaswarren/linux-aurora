@@ -458,18 +458,51 @@ static void dcp_link_handle_callback(struct apple_dcp *dcp, u64 message)
 
 static void dcp_link_recv_msg(struct apple_dcp *dcp, u64 message)
 {
+	enum apple_dcp_link_handshake_action action;
+	enum apple_dcp_link_state old_state = dcp->link_state;
 	u8 type = message & GENMASK_ULL(1, 0);
+	u64 init_message;
+	int ret;
+
+	action = apple_dcp_link_handshake_step(&dcp->link_state, message);
+	if (action == APPLE_DCP_LINK_HANDSHAKE_SEND_INIT) {
+		ret = apple_dcp_link_init_message(dcp->shmem_iova, &init_message);
+		if (ret) {
+			dcp->link_state = old_state;
+			dev_err(dcp->dev,
+				"DCPLink RPC memory address cannot be encoded: %d\n",
+				ret);
+			return;
+		}
+
+		dma_wmb();
+		dev_info(dcp->dev,
+			 "DCPLink firmware init received; sending RPC memory INIT\n");
+		dcp_send_message(dcp, APPLE_DCP_LINK_ENDPOINT, init_message);
+		return;
+	}
 
 	if (type == APPLE_DCP_LINK_MSG_READY) {
+		if (action != APPLE_DCP_LINK_HANDSHAKE_START_IOMFB) {
+			if (old_state == APPLE_DCP_LINK_WAIT_FIRMWARE_INIT)
+				dev_warn(dcp->dev,
+					 "DCPLink ready arrived before firmware init\n");
+			else
+				dev_dbg(dcp->dev, "duplicate DCPLink ready\n");
+			return;
+		}
+
 		if (apple_dcp_link_ready_reply(message, &dcp->link_version,
 					       &dcp->link_firmware_hash))
 			return;
-		if (dcp->link_ready)
-			return;
-		dcp->link_ready = true;
 		dev_info(dcp->dev, "DCPLink ready: version %u hash %#x\n",
 			 dcp->link_version, dcp->link_firmware_hash);
 		iomfb_start_h17p(dcp);
+		return;
+	}
+
+	if (type == APPLE_DCP_LINK_MSG_FIRMWARE_INIT) {
+		dev_dbg(dcp->dev, "duplicate DCPLink firmware init\n");
 		return;
 	}
 
@@ -487,10 +520,8 @@ static void dcp_link_recv_msg(struct apple_dcp *dcp, u64 message)
 static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 {
 	struct apple_dcp_link_init_desc *desc;
-	u64 init_message;
 	int ret;
 
-	apple_rtkit_start_ep(dcp->rtk, APPLE_DCP_LINK_ENDPOINT);
 	dcp->shmem = dma_alloc_coherent(dcp->dev, APPLE_DCP_LINK_RPC_MEMORY_SIZE,
 					&dcp->shmem_iova, GFP_KERNEL);
 	if (!dcp->shmem)
@@ -499,16 +530,15 @@ static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 	memset(dcp->shmem, 0, APPLE_DCP_LINK_RPC_MEMORY_SIZE);
 	desc = dcp->shmem;
 	apple_dcp_link_init_desc_encode(desc, 0, false);
-	ret = apple_dcp_link_init_message(dcp->shmem_iova, &init_message);
+
+	dcp->link_state = APPLE_DCP_LINK_WAIT_FIRMWARE_INIT;
+	memset(dcp->link_top, 0, sizeof(dcp->link_top));
+
+	ret = apple_rtkit_start_ep(dcp->rtk, APPLE_DCP_LINK_ENDPOINT);
 	if (ret)
 		return ret;
 
-	dcp->link_ready = false;
-	memset(dcp->link_top, 0, sizeof(dcp->link_top));
-	dma_wmb();
-	dcp_send_message(dcp, APPLE_DCP_LINK_ENDPOINT, init_message);
-	dcp_send_message(dcp, APPLE_DCP_LINK_ENDPOINT,
-			 apple_dcp_link_ready_message());
+	dev_info(dcp->dev, "DCPLink endpoint started; waiting for firmware init\n");
 	return 0;
 }
 

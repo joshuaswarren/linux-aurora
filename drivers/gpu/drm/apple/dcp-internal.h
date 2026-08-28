@@ -165,7 +165,7 @@ struct apple_dcp {
 	u32 link_top[2][APPLE_DCP_LINK_STREAMS_PER_SIDE];
 	u16 link_version;
 	u32 link_firmware_hash;
-	bool link_ready;
+	enum apple_dcp_link_state link_state;
 
 	/* Display registers mappable to the DCP */
 	struct resource *disp_registers[MAX_DISP_REGISTERS];
