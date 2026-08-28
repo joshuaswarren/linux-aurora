@@ -1311,25 +1311,13 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 
 	for_each_oldnew_plane_in_state(state, plane, old_state, new_state, plane_idx) {
 		struct apple_plane_state *apple_state = to_apple_plane_state(new_state);
+		struct apple_plane *apple_plane = to_apple_plane(plane);
 
 		/* skip planes not for this crtc */
 		if (old_state->crtc != crtc && new_state->crtc != crtc)
 			continue;
 
-		/*
-		 * Plane order is nondeterministic for this iterator. DCP will
-		 * almost always crash at some point if the z order of planes
-		 * flip-flops around. Make sure we are always blending them
-		 * in the correct order.
-		 *
-		 * Despite having 4 surfaces, we can only blend two. Surface 0 is
-		 * also unusable on some machines, so ignore it.
-		 */
-
-		l = MAX_BLEND_SURFACES - new_state->normalized_zpos;
-
-		WARN_ON(l > MAX_BLEND_SURFACES);
-
+		l = apple_plane->iomfb_surface;
 		req->swap.swap_enabled |= BIT(l);
 
 		if (old_state->fb && new_state->fb != old_state->fb) {
