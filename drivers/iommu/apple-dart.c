@@ -14,6 +14,7 @@
 #include <linux/atomic.h>
 #include <linux/bitfield.h>
 #include <linux/clk.h>
+#include <linux/delay.h>
 #include <linux/dev_printk.h>
 #include <linux/dma-mapping.h>
 #include <linux/err.h>
@@ -31,6 +32,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/slab.h>
+#include <linux/soc/apple/tunable.h>
 #include <linux/swab.h>
 #include <linux/types.h>
 
@@ -43,6 +45,23 @@
 #define DART_MAX_STREAMS 256
 #define DART_MAX_TTBR 4
 #define MAX_DARTS_PER_DEVICE 3
+#define DART_PCIEC_PAGE_SHIFT 14
+#define DART_PCIEC_ADDR_WIDTH 42
+#define DART_PCIEC_STREAMS 64
+
+/*
+ * Temporary bring-up gate for the cable-powered DART behind PCIe-C.  The
+ * normal storage, display and USB4 DARTs never consult this parameter.
+ */
+static unsigned int apple_dart_debug_stage;
+module_param_named(debug_stage, apple_dart_debug_stage, uint, 0644);
+MODULE_PARM_DESC(debug_stage,
+		 "Stop tunneled PCIe-C DART setup after the selected debug phase");
+
+static unsigned int apple_dart_trace_delay_ms;
+module_param_named(tunnel_trace_delay_ms, apple_dart_trace_delay_ms, uint, 0644);
+MODULE_PARM_DESC(tunnel_trace_delay_ms,
+		 "Delay after PCIe-C DART trace boundaries (0 disables tracing)");
 
 /* Common registers */
 
@@ -285,15 +304,12 @@ struct apple_dart {
 	u32 supports_bypass : 1;
 	u32 four_level : 1;
 	u32 locked : 1;
-	u32 tlb_cmd_v2 : 1;
-	u32 force_available : 1;
-	u32 retained_bypass;
-	u32 owned_streams;
-	u32 static_dart_bypass;
-	u16 version;
+	u32 tunneled : 1;
+	struct apple_tunable *tunables;
 
 	dma_addr_t dma_min;
 	dma_addr_t dma_max;
+	dma_addr_t dma_offset;
 
 	struct iommu_group *sid2group[DART_MAX_STREAMS];
 	struct iommu_device iommu;
@@ -310,6 +326,66 @@ struct apple_dart {
 	u64 *locked_ttbr[DART_MAX_STREAMS][DART_MAX_TTBR];
 	u64 *locked_ttbr_saved[DART_MAX_STREAMS][DART_MAX_TTBR];
 };
+
+/*
+ * PCIe-C is a cable-powered aperture and can report a failed transaction as
+ * an asynchronous external abort unless each access is completed before the
+ * next instruction retires.  A live /dev/mem diagnostic using the same
+ * Device-nGnRnE attributes and the exact 64-SID reset sequence is stable when
+ * every access is followed by dsb sy + isb.  ioremap_np() supplies the memory
+ * type, but writel() only supplies the normal I/O ordering barrier on arm64.
+ * Match the proven access semantics for the tunneled DART while leaving all
+ * always-on DARTs on the normal fast path.
+ */
+static inline void apple_dart_writel(struct apple_dart *dart, u32 value,
+				    u32 offset)
+{
+	writel(value, dart->regs + offset);
+	if (unlikely(dart->tunneled)) {
+		mb();
+		isb();
+	}
+}
+
+static inline u32 apple_dart_readl(struct apple_dart *dart, u32 offset)
+{
+	u32 value = readl(dart->regs + offset);
+
+	if (unlikely(dart->tunneled)) {
+		mb();
+		isb();
+	}
+
+	return value;
+}
+
+static void apple_dart_apply_tunables(struct apple_dart *dart)
+{
+	size_t i;
+
+	for (i = 0; i < dart->tunables->sz; ++i) {
+		u32 old_value, value;
+
+		old_value = apple_dart_readl(dart,
+					      dart->tunables->values[i].offset);
+		value = old_value & ~dart->tunables->values[i].mask;
+		value |= dart->tunables->values[i].value;
+		if (value != old_value)
+			apple_dart_writel(dart, value,
+					   dart->tunables->values[i].offset);
+	}
+}
+
+static void apple_dart_tunnel_trace(struct apple_dart *dart,
+				    unsigned int step, const char *operation)
+{
+	if (!dart->tunneled || !READ_ONCE(apple_dart_trace_delay_ms))
+		return;
+
+	dev_info(dart->dev, "PCIe-C DART trace %u armed: %s\n",
+		 step, operation);
+	msleep(READ_ONCE(apple_dart_trace_delay_ms));
+}
 
 /*
  * Convenience struct to identify streams.
@@ -349,8 +425,7 @@ struct apple_dart_domain {
 
 	bool finalized;
 	u64 mask;
-	dma_addr_t dma_min;
-	dma_addr_t dma_max;
+	dma_addr_t dma_offset;
 	struct mutex init_lock;
 	struct apple_dart_atomic_stream_map stream_maps[MAX_DARTS_PER_DEVICE];
 
@@ -412,7 +487,7 @@ apple_dart_hw_enable_translation(struct apple_dart_stream_map *stream_map, int l
 	WARN_ON(levels != 3 && levels != 4);
 	WARN_ON(levels == 4 && !dart->four_level);
 	for_each_set_bit(sid, stream_map->sidmap, dart->num_streams)
-		writel(tcr, dart->regs + DART_TCR(dart, sid));
+		apple_dart_writel(dart, tcr, DART_TCR(dart, sid));
 }
 
 static void apple_dart_hw_disable_dma(struct apple_dart_stream_map *stream_map)
@@ -421,7 +496,8 @@ static void apple_dart_hw_disable_dma(struct apple_dart_stream_map *stream_map)
 	int sid;
 
 	for_each_set_bit(sid, stream_map->sidmap, dart->num_streams)
-		writel(dart->hw->tcr_disabled, dart->regs + DART_TCR(dart, sid));
+		apple_dart_writel(dart, dart->hw->tcr_disabled,
+				   DART_TCR(dart, sid));
 }
 
 static void
@@ -432,8 +508,8 @@ apple_dart_hw_enable_bypass(struct apple_dart_stream_map *stream_map)
 
 	WARN_ON(!stream_map->dart->supports_bypass);
 	for_each_set_bit(sid, stream_map->sidmap, dart->num_streams)
-		writel(dart->hw->tcr_bypass,
-		       dart->regs + DART_TCR(dart, sid));
+		apple_dart_writel(dart, dart->hw->tcr_bypass,
+				   DART_TCR(dart, sid));
 }
 
 static void apple_dart_hw_set_ttbr(struct apple_dart_stream_map *stream_map,
@@ -444,9 +520,11 @@ static void apple_dart_hw_set_ttbr(struct apple_dart_stream_map *stream_map,
 
 	WARN_ON(paddr & ((1 << dart->hw->ttbr_shift) - 1));
 	for_each_set_bit(sid, stream_map->sidmap, dart->num_streams)
-		writel(dart->hw->ttbr_valid |
-		       (paddr >> dart->hw->ttbr_shift) << dart->hw->ttbr_addr_field_shift,
-		       dart->regs + DART_TTBR(dart, sid, idx));
+		apple_dart_writel(dart,
+				   dart->hw->ttbr_valid |
+				   (paddr >> dart->hw->ttbr_shift) <<
+				   dart->hw->ttbr_addr_field_shift,
+				   DART_TTBR(dart, sid, idx));
 }
 
 static void apple_dart_hw_clear_ttbr(struct apple_dart_stream_map *stream_map,
@@ -456,7 +534,7 @@ static void apple_dart_hw_clear_ttbr(struct apple_dart_stream_map *stream_map,
 	int sid;
 
 	for_each_set_bit(sid, stream_map->sidmap, dart->num_streams)
-		writel(0, dart->regs + DART_TTBR(dart, sid, idx));
+		apple_dart_writel(dart, 0, DART_TTBR(dart, sid, idx));
 }
 
 static void
@@ -483,7 +561,7 @@ apple_dart_hw_map_locked_ttbr(struct apple_dart_stream_map *stream_map, u8 idx)
 		if (dart->locked_ttbr[sid][idx])
 			continue;
 
-		ttbr = readl(dart->regs + DART_TTBR(dart, sid, idx));
+		ttbr = apple_dart_readl(dart, DART_TTBR(dart, sid, idx));
 
 		if (!(ttbr & dart->hw->ttbr_valid)) {
 			dev_err(dart->dev, "Invalid ttbr[%u] for locked dart\n",
@@ -654,23 +732,25 @@ static int
 apple_dart_t8020_hw_stream_command(struct apple_dart_stream_map *stream_map,
 			     u32 command)
 {
+	struct apple_dart *dart = stream_map->dart;
 	unsigned long flags;
 	int ret, i;
 	u32 command_reg;
 
-	spin_lock_irqsave(&stream_map->dart->lock, flags);
+	spin_lock_irqsave(&dart->lock, flags);
 
-	for (i = 0; i < BITS_TO_U32(stream_map->dart->num_streams); i++)
-		writel(stream_map->sidmap[i],
-		       stream_map->dart->regs + DART_T8020_STREAM_SELECT + 4 * i);
-	writel(command, stream_map->dart->regs + DART_T8020_STREAM_COMMAND);
+	for (i = 0; i < BITS_TO_U32(dart->num_streams); i++)
+		apple_dart_writel(dart, stream_map->sidmap[i],
+				   DART_T8020_STREAM_SELECT + 4 * i);
+	apple_dart_writel(dart, command, DART_T8020_STREAM_COMMAND);
 
-	ret = readl_poll_timeout_atomic(
-		stream_map->dart->regs + DART_T8020_STREAM_COMMAND, command_reg,
+	ret = read_poll_timeout_atomic(
+		apple_dart_readl, command_reg,
 		!(command_reg & DART_T8020_STREAM_COMMAND_BUSY), 1,
-		DART_STREAM_COMMAND_BUSY_TIMEOUT);
+		DART_STREAM_COMMAND_BUSY_TIMEOUT, false, dart,
+		DART_T8020_STREAM_COMMAND);
 
-	spin_unlock_irqrestore(&stream_map->dart->lock, flags);
+	spin_unlock_irqrestore(&dart->lock, flags);
 
 	if (ret) {
 		dev_err(stream_map->dart->dev,
@@ -701,49 +781,13 @@ apple_dart_t8110_hw_tlb_command_range(struct apple_dart_stream_map *stream_map,
 	for_each_set_bit(sid, stream_map->sidmap, dart->num_streams) {
 		u32 val = FIELD_PREP(DART_T8110_TLB_CMD_OP, command) |
 			FIELD_PREP(DART_T8110_TLB_CMD_STREAM, sid);
-		u32 pre;
+		apple_dart_writel(dart, val, DART_T8110_TLB_CMD);
 
-		if (command == DART_T8110_TLB_CMD_OP_FLUSH_SID && dart->tlb_cmd_v2)
-			val |= DART_T8110_TLB_CMD_V2;
-
-		/*
-		 * Wait for the engine before stamping the command.  TLB_CMD is a
-		 * single shared command port: writing it while BUSY is set drops
-		 * the write, so the invalidate silently never happens and the
-		 * next access through the freshly mapped IOVA hits a stale
-		 * negative TLB entry.  On disp0 the DCP firmware takes that
-		 * reject as an AXI error and panics.  A dropped command also
-		 * leaves BUSY set, so the next caller's command is dropped too --
-		 * which is why these arrive in bursts of dozens rather than
-		 * singly.
-		 */
-		ret = readl_poll_timeout_atomic(
-			dart->regs + DART_T8110_TLB_CMD, pre,
-			!(pre & DART_T8110_TLB_CMD_BUSY), 1,
-			DART_STREAM_COMMAND_BUSY_TIMEOUT);
-		if (ret) {
-			last_val = pre;
-			busy_before = true;
-			bad_sid = sid;
-			break;
-		}
-
-		if (range) {
-			val |= DART_T8110_TLB_CMD_RANGE | DART_T8110_TLB_CMD_STT;
-			writel((first >> 14) << 2, dart->regs + DART_T8110_TLB_START);
-			writel((last >> 14) << 2, dart->regs + DART_T8110_TLB_END);
-		}
-
-		/* Page-table writes must land before the DART is told to flush. */
-		dma_wmb();
-		writel(val, dart->regs + DART_T8110_TLB_CMD);
-
-		start = ktime_get();
-		ret = readl_poll_timeout_atomic(
-			dart->regs + DART_T8110_TLB_CMD, val,
+		ret = read_poll_timeout_atomic(
+			apple_dart_readl, val,
 			!(val & DART_T8110_TLB_CMD_BUSY), 1,
-			DART_T8110_FLUSH_BUSY_TIMEOUT);
-		us = ktime_to_us(ktime_sub(ktime_get(), start));
+			DART_STREAM_COMMAND_BUSY_TIMEOUT, false, dart,
+			DART_T8110_TLB_CMD);
 
 		last_val = val;
 		if (us > slowest_us) {
@@ -930,49 +974,136 @@ static int apple_dart_hw_reset(struct apple_dart *dart)
 	stream_map.dart = dart;
 	bitmap_zero(stream_map.sidmap, DART_MAX_STREAMS);
 	bitmap_set(stream_map.sidmap, 0, dart->num_streams);
-	if (dart->owned_streams) {
-		bitmap_zero(stream_map.sidmap, DART_MAX_STREAMS);
-		stream_map.sidmap[0] = dart->owned_streams;
-		apple_dart_hw_disable_dma(&stream_map);
-		apple_dart_hw_clear_all_ttbrs(&stream_map);
-		apple_dart_hw_enable_global_streams(dart);
-		return dart->hw->invalidate_tlb(&stream_map);
-	}
+
+	apple_dart_tunnel_trace(dart, 20, "disable DMA for every stream");
 	apple_dart_hw_disable_dma(&stream_map);
+	apple_dart_tunnel_trace(dart, 21, "clear every stream TTBR");
 	apple_dart_hw_clear_all_ttbrs(&stream_map);
 	apple_dart_hw_apply_remaps(dart);
 
-	apple_dart_hw_enable_global_streams(dart);
+	/* enable all streams globally since TCR is used to control isolation */
+	apple_dart_tunnel_trace(dart, 22, "enable all streams globally");
+	for (i = 0; i < BITS_TO_U32(dart->num_streams); i++)
+		apple_dart_writel(dart, U32_MAX,
+				   dart->hw->enable_streams + 4 * i);
 
-	/* Clear pending records using the v2 SID bitmap before unmasking. */
-	if (dart->hw->type == DART_T8110 && dart->version >= 0x0202) {
-		apple_dart_drain_stale_exceptions(dart);
-		if (dart->version >= 0x0203)
-			writel(readl(dart->regs + DART_T8110_BLOCK_ERROR) &
-			       DART_T8110_BLOCK_ERROR_MASK,
-			       dart->regs + DART_T8110_BLOCK_ERROR);
-		ret = apple_dart_t8110_v2_unlock(dart);
-		if (ret)
-			return ret;
-	} else
-		writel(readl(dart->regs + dart->hw->error),
-		       dart->regs + dart->hw->error);
-	}
+	/* clear any pending errors before the interrupt is unmasked */
+	apple_dart_tunnel_trace(dart, 23, "read and clear DART error status");
+	apple_dart_writel(dart, apple_dart_readl(dart, dart->hw->error),
+			   dart->hw->error);
 
+	apple_dart_tunnel_trace(dart, 24, "clear T8110 error mask");
 	if (dart->hw->type == DART_T8110)
-		writel(0,  dart->regs + DART_T8110_ERROR_MASK);
+		apple_dart_writel(dart, 0, DART_T8110_ERROR_MASK);
 
+	apple_dart_tunnel_trace(dart, 25, "invalidate every stream TLB");
 	return dart->hw->invalidate_tlb(&stream_map);
 }
 
-/*
- * A full SID invalidate disturbs active T8140 display translations even when
- * only an unrelated buffer changes. Native SPTM uses DVA-range invalidation
- * with STT flushing for these streams. Keep the full command for lifecycle
- * synchronization; ordinary map/unmap only invalidate their changed range.
- */
-static int apple_dart_domain_flush_tlb_range(struct apple_dart_domain *domain,
-					    bool range, u64 first, u64 last)
+static int apple_dart_debug_reset(struct apple_dart *dart)
+{
+	struct apple_dart_stream_map stream_map;
+	u32 value;
+	int i, sid;
+
+	if (dart->hw->type != DART_T8110 || apple_dart_debug_stage < 30)
+		return 0;
+
+	stream_map.dart = dart;
+	bitmap_zero(stream_map.sidmap, DART_MAX_STREAMS);
+	set_bit(0, stream_map.sidmap);
+
+	apple_dart_writel(dart, U32_MAX, dart->hw->enable_streams);
+	dev_info(dart->dev,
+		 "PCIe-C DART reset stage 30: stream word 0 enabled\n");
+	if (apple_dart_debug_stage == 30)
+		return -EAGAIN;
+
+	for (i = 1; i < BITS_TO_U32(dart->num_streams); i++)
+		apple_dart_writel(dart, U32_MAX,
+				   dart->hw->enable_streams + 4 * i);
+	dev_info(dart->dev,
+		 "PCIe-C DART reset stage 31: all stream words enabled\n");
+	if (apple_dart_debug_stage == 31)
+		return -EAGAIN;
+
+	value = apple_dart_readl(dart, DART_TCR(dart, 0));
+	dev_info(dart->dev,
+		 "PCIe-C DART reset stage 32: SID0 TCR initial value=%#x\n",
+		 value);
+	if (apple_dart_debug_stage == 32)
+		return -EAGAIN;
+
+	apple_dart_writel(dart, dart->hw->tcr_disabled,
+			   DART_TCR(dart, 0));
+	dev_info(dart->dev,
+		 "PCIe-C DART reset stage 33: SID0 TCR disabled\n");
+	if (apple_dart_debug_stage == 33)
+		return -EAGAIN;
+
+	value = apple_dart_readl(dart, DART_TCR(dart, 0));
+	dev_info(dart->dev,
+		 "PCIe-C DART reset stage 34: SID0 TCR readback=%#x\n",
+		 value);
+	if (apple_dart_debug_stage == 34)
+		return -EAGAIN;
+
+	for (sid = 1; sid < dart->num_streams; sid++)
+		apple_dart_writel(dart, dart->hw->tcr_disabled,
+				   DART_TCR(dart, sid));
+	dev_info(dart->dev,
+		 "PCIe-C DART reset stage 35: all %u TCRs disabled\n",
+		 dart->num_streams);
+	if (apple_dart_debug_stage == 35)
+		return -EAGAIN;
+
+	apple_dart_writel(dart, 0, DART_TTBR(dart, 0, 0));
+	dev_info(dart->dev,
+		 "PCIe-C DART reset stage 36: SID0 TTBR0 cleared\n");
+	if (apple_dart_debug_stage == 36)
+		return -EAGAIN;
+
+	value = apple_dart_readl(dart, DART_TTBR(dart, 0, 0));
+	dev_info(dart->dev,
+		 "PCIe-C DART reset stage 37: SID0 TTBR0 readback=%#x\n",
+		 value);
+	if (apple_dart_debug_stage == 37)
+		return -EAGAIN;
+
+	for (sid = 1; sid < dart->num_streams; sid++)
+		for (i = 0; i < dart->hw->ttbr_count; i++)
+			apple_dart_writel(dart, 0,
+					   DART_TTBR(dart, sid, i));
+	dev_info(dart->dev,
+		 "PCIe-C DART reset stage 38: all TTBRs cleared\n");
+	if (apple_dart_debug_stage == 38)
+		return -EAGAIN;
+
+	value = apple_dart_readl(dart, dart->hw->error);
+	dev_info(dart->dev,
+		 "PCIe-C DART reset stage 39: error status=%#x\n", value);
+	if (apple_dart_debug_stage == 39)
+		return -EAGAIN;
+
+	apple_dart_writel(dart, value, dart->hw->error);
+	dev_info(dart->dev,
+		 "PCIe-C DART reset stage 40: error status cleared\n");
+	if (apple_dart_debug_stage == 40)
+		return -EAGAIN;
+
+	apple_dart_writel(dart, 0, DART_T8110_ERROR_MASK);
+	dev_info(dart->dev,
+		 "PCIe-C DART reset stage 41: error mask cleared\n");
+	if (apple_dart_debug_stage == 41)
+		return -EAGAIN;
+
+	i = dart->hw->invalidate_tlb(&stream_map);
+	dev_info(dart->dev,
+		 "PCIe-C DART reset stage 42: SID0 TLB flush returned %d\n", i);
+	return i ?: -EAGAIN;
+}
+
+static void apple_dart_domain_flush_tlb(struct apple_dart_domain *domain)
 {
 	int i, j, ret = 0;
 	struct apple_dart_atomic_stream_map *domain_stream_map;
@@ -1067,7 +1198,9 @@ static phys_addr_t apple_dart_iova_to_phys(struct iommu_domain *domain,
 	if (!ops)
 		return 0;
 
-	return ops->iova_to_phys(ops, iova & dart_domain->mask);
+	return ops->iova_to_phys(ops,
+				 (iova + dart_domain->dma_offset) &
+				 dart_domain->mask);
 }
 
 static int apple_dart_map_pages(struct iommu_domain *domain, unsigned long iova,
@@ -1082,24 +1215,9 @@ static int apple_dart_map_pages(struct iommu_domain *domain, unsigned long iova,
 	if (!ops)
 		return -ENODEV;
 
-	/*
-	 * A locked DART's page tables are shared with hardware we do not fully
-	 * drive.  The display pipe writes into buffers the DMA layer only ever
-	 * declares DMA_TO_DEVICE, and a read-only PTE there does not produce a
-	 * recoverable error: the DART raises a write-protect exception per
-	 * access, tens of thousands a second, until the CPUs starve.  Nothing
-	 * on these DARTs relies on write protection, so never install it.
-	 */
-	if (dart && dart->locked && !(prot & IOMMU_WRITE)) {
-		dev_info_ratelimited(
-			dart->dev,
-			"forcing writable mapping at %#llx (%zu x %#zx, prot %#x)\n",
-			(unsigned long long)(iova & dart_domain->mask),
-			pgcount, pgsize, prot);
-		prot |= IOMMU_WRITE;
-	}
-
-	return ops->map_pages(ops, iova & dart_domain->mask, paddr, pgsize,
+	return ops->map_pages(ops,
+			      (iova + dart_domain->dma_offset) &
+			      dart_domain->mask, paddr, pgsize,
 			      pgcount, prot, gfp, mapped);
 }
 
@@ -1112,11 +1230,10 @@ static size_t apple_dart_unmap_pages(struct iommu_domain *domain,
 	struct io_pgtable_ops *ops = dart_domain->pgtbl_ops;
 	size_t unmapped;
 
-	unmapped = ops->unmap_pages(ops, iova & dart_domain->mask, pgsize,
-				   pgcount, gather);
-	if (unmapped)
-		iommu_iotlb_gather_add_range(gather, iova, unmapped);
-	return unmapped;
+	return ops->unmap_pages(ops,
+				(iova + dart_domain->dma_offset) &
+				dart_domain->mask, pgsize, pgcount,
+				gather);
 }
 
 static void
@@ -1128,7 +1245,10 @@ apple_dart_setup_translation(struct apple_dart_domain *domain,
 	struct io_pgtable_cfg *pgtbl_cfg =
 		&io_pgtable_ops_to_pgtable(domain->pgtbl_ops)->cfg;
 
-	apple_dart_hw_enable_global_streams(dart);
+	/* enable all streams globally since TCR is used to control isolation */
+	for (i = 0; i < BITS_TO_U32(dart->num_streams); i++)
+		apple_dart_writel(dart, U32_MAX,
+				   dart->hw->enable_streams + 4 * i);
 
 	for (i = 0; i < pgtbl_cfg->apple_dart_cfg.n_ttbrs; ++i) {
 		u64 ttbr = virt_to_phys(pgtbl_cfg->apple_dart_cfg.ttbr[i]);
@@ -1165,10 +1285,9 @@ static int apple_dart_finalize_domain(struct apple_dart_domain *dart_domain,
 {
 	struct apple_dart *dart = cfg->stream_maps[0].dart;
 	struct io_pgtable_cfg pgtbl_cfg;
-	dma_addr_t dma_min = dart_domain->dma_min ?: dart->dma_min;
-	dma_addr_t dma_max = dart_domain->dma_max ?: dart->dma_max;
-	u32 ias = min_t(u32, dart->ias, fls64(dma_max));
-	int locked_sid = -1;
+	dma_addr_t dma_max = dart->dma_max;
+	u32 ias = min_t(u32, dart->ias,
+			fls64(dma_max + dart->dma_offset));
 	int ret = 0;
 	int i, j;
 
@@ -1203,18 +1322,14 @@ static int apple_dart_finalize_domain(struct apple_dart_domain *dart_domain,
 		sidmap = cfg->stream_maps[0].sidmap;
 		locked_sid = find_first_bit(sidmap, dart->num_streams);
 
-		if (WARN_ON(locked_sid >= dart->num_streams ||
-			    bitmap_weight(sidmap, dart->num_streams) != 1)) {
-			ret = -EINVAL;
-			goto done;
-		}
-		ttbr = readl(dart->regs + DART_TTBR(dart, locked_sid, 0));
+		WARN_ON((sid < 0) || bitmap_weight(sidmap, dart->num_streams) > 1);
+		ttbr = apple_dart_readl(dart, DART_TTBR(dart, sid, 0));
 
 		WARN_ON(!(ttbr & dart->hw->ttbr_valid));
 
 		/* If the DART is locked, we need to keep the translation level count. */
 		if (dart->hw->tcr_4level && dart->ias > 36) {
-			if (readl(dart->regs + DART_TCR(dart, locked_sid)) &
+			if (apple_dart_readl(dart, DART_TCR(dart, sid)) &
 			    dart->hw->tcr_4level) {
 				if (ias < 37) {
 					dev_info(dart->dev, "Expanded to ias=37 due to lock\n");
@@ -1280,6 +1395,7 @@ static int apple_dart_finalize_domain(struct apple_dart_domain *dart_domain,
 	dart_domain->domain.geometry.aperture_start = dma_min;
 	dart_domain->domain.geometry.aperture_end = dma_max;
 	dart_domain->domain.geometry.force_aperture = true;
+	dart_domain->dma_offset = dart->dma_offset;
 
 	dart_domain->finalized = true;
 	goto done;
@@ -1872,10 +1988,10 @@ static irqreturn_t apple_dart_t8020_irq(int irq, void *dev)
 {
 	struct apple_dart *dart = dev;
 	const char *fault_name = NULL;
-	u32 error = readl(dart->regs + DART_T8020_ERROR);
+	u32 error = apple_dart_readl(dart, DART_T8020_ERROR);
 	u32 error_code = FIELD_GET(DART_T8020_ERROR_CODE, error);
-	u32 addr_lo = readl(dart->regs + DART_T8020_ERROR_ADDR_LO);
-	u32 addr_hi = readl(dart->regs + DART_T8020_ERROR_ADDR_HI);
+	u32 addr_lo = apple_dart_readl(dart, DART_T8020_ERROR_ADDR_LO);
+	u32 addr_hi = apple_dart_readl(dart, DART_T8020_ERROR_ADDR_HI);
 	u64 addr = addr_lo | (((u64)addr_hi) << 32);
 	u8 stream_idx = FIELD_GET(DART_T8020_ERROR_STREAM, error);
 
@@ -1901,7 +2017,7 @@ static irqreturn_t apple_dart_t8020_irq(int irq, void *dev)
 		"translation fault: status:0x%x stream:%d code:0x%x (%s) at 0x%llx",
 		error, stream_idx, error_code, fault_name, addr);
 
-	writel(error, dart->regs + DART_T8020_ERROR);
+	apple_dart_writel(dart, error, DART_T8020_ERROR);
 	return IRQ_HANDLED;
 }
 
@@ -1909,10 +2025,10 @@ static irqreturn_t apple_dart_t8110_legacy_irq(int irq, void *dev)
 {
 	struct apple_dart *dart = dev;
 	const char *fault_name = NULL;
-	u32 error = readl(dart->regs + DART_T8110_ERROR);
+	u32 error = apple_dart_readl(dart, DART_T8110_ERROR);
 	u32 error_code = FIELD_GET(DART_T8110_ERROR_CODE, error);
-	u32 addr_lo = readl(dart->regs + DART_T8110_ERROR_ADDR_LO);
-	u32 addr_hi = readl(dart->regs + DART_T8110_ERROR_ADDR_HI);
+	u32 addr_lo = apple_dart_readl(dart, DART_T8110_ERROR_ADDR_LO);
+	u32 addr_hi = apple_dart_readl(dart, DART_T8110_ERROR_ADDR_HI);
 	u64 addr = addr_lo | (((u64)addr_hi) << 32);
 	u8 stream_idx = FIELD_GET(DART_T8110_ERROR_STREAM, error);
 
@@ -1940,9 +2056,10 @@ static irqreturn_t apple_dart_t8110_legacy_irq(int irq, void *dev)
 		"translation fault: status:0x%x stream:%d code:0x%x (%s) at 0x%llx",
 		error, stream_idx, error_code, fault_name, addr);
 
-	writel(error, dart->regs + DART_T8110_ERROR);
+	apple_dart_writel(dart, error, DART_T8110_ERROR);
 	for (int i = 0; i < BITS_TO_U32(dart->num_streams); i++)
-		writel(U32_MAX, dart->regs + DART_T8110_ERROR_STREAMS + 4 * i);
+		apple_dart_writel(dart, U32_MAX,
+				   DART_T8110_ERROR_STREAMS + 4 * i);
 
 	return IRQ_HANDLED;
 }
@@ -2101,7 +2218,43 @@ static irqreturn_t apple_dart_irq(int irq, void *dev)
 
 static bool apple_dart_is_locked(struct apple_dart *dart)
 {
-	return !!(readl(dart->regs + dart->hw->lock) & dart->hw->lock_bit);
+	return !!(apple_dart_readl(dart, dart->hw->lock) & dart->hw->lock_bit);
+}
+
+static void apple_dart_iounmap_np(void *data)
+{
+	iounmap((__force void __iomem *)data);
+}
+
+static void __iomem *
+apple_dart_platform_ioremap_np_resource(struct platform_device *pdev,
+					unsigned int index,
+					struct resource **res_out)
+{
+	struct device *dev = &pdev->dev;
+	struct resource *res;
+	void __iomem *regs;
+	int ret;
+
+	res = platform_get_resource(pdev, IORESOURCE_MEM, index);
+	if (!res)
+		return ERR_PTR(-EINVAL);
+
+	if (!devm_request_mem_region(dev, res->start, resource_size(res),
+				     dev_name(dev)))
+		return ERR_PTR(-EBUSY);
+
+	regs = ioremap_np(res->start, resource_size(res));
+	if (!regs)
+		return ERR_PTR(-ENOMEM);
+
+	ret = devm_add_action_or_reset(dev, apple_dart_iounmap_np,
+				       (__force void *)regs);
+	if (ret)
+		return ERR_PTR(ret);
+
+	*res_out = res;
+	return regs;
 }
 
 /* Legacy J700 handoff: preserve APF while enabling the declared radio streams. */
@@ -2147,6 +2300,18 @@ static int apple_dart_probe(struct platform_device *pdev)
 	struct apple_dart *dart;
 	struct device *dev = &pdev->dev;
 	u64 dma_range[2];
+	bool debug_stop = false;
+	bool tunneled = dev->of_node->parent &&
+			 of_node_name_prefix(dev->of_node->parent,
+					     "usb4-pcie-tunnel-");
+
+	if (tunneled) {
+		dev_info(dev, "PCIe-C DART probe entered\n");
+		if (apple_dart_debug_stage == 10) {
+			dev_info(dev, "PCIe-C DART debug stage 10: probe entry\n");
+			return -EAGAIN;
+		}
+	}
 
 	if (of_property_read_bool(dev->of_node,
 				  "apple,j700-defer-probe") &&
@@ -2162,20 +2327,42 @@ static int apple_dart_probe(struct platform_device *pdev)
 
 	dart->dev = dev;
 	dart->hw = of_device_get_match_data(dev);
-	dart->pmp_sid6_only = of_device_is_compatible(dev->of_node,
-						     "apple,t8152-pmp-dart");
-	dart->force_available =
-		dart->pmp_sid6_only ||
-		of_property_read_bool(dev->of_node, "apple,force-available");
+	dart->tunneled = tunneled;
 	spin_lock_init(&dart->lock);
+	platform_set_drvdata(pdev, dart);
 
-	dart->regs = devm_platform_get_and_ioremap_resource(pdev, 0, &res);
+	/*
+	 * PCIe-C is a cable-powered aperture whose writes must complete before
+	 * the following transaction.  The normal arm64 ioremap() mapping is
+	 * Device-nGnRE and allowed the first posted DART reset write to surface as
+	 * an asynchronous external abort at a later instruction.  The identical
+	 * reset sequence is stable through /dev/mem's Device-nGnRnE mapping, and
+	 * PCI configuration forwarding already requires the same non-posted
+	 * ordering.  Keep ordinary always-on DARTs on their existing mapping.
+	 */
+	if (tunneled)
+		dart->regs = apple_dart_platform_ioremap_np_resource(pdev, 0,
+							      &res);
+	else
+		dart->regs = devm_platform_get_and_ioremap_resource(pdev, 0,
+							     &res);
 	if (IS_ERR(dart->regs))
 		return PTR_ERR(dart->regs);
+	if (tunneled && apple_dart_debug_stage == 11) {
+		dev_info(dev, "PCIe-C DART debug stage 11: registers mapped\n");
+		return -EAGAIN;
+	}
 
 	if (resource_size(res) < 0x4000) {
 		dev_err(dev, "MMIO region too small (%pr)\n", res);
 		return -EINVAL;
+	}
+	if (tunneled) {
+		dart->tunables = devm_apple_tunable_parse(dev, dev->of_node,
+							  "apple,tunable", res);
+		if (IS_ERR(dart->tunables))
+			return dev_err_probe(dev, PTR_ERR(dart->tunables),
+					     "failed to parse PCIe-C DART tunables\n");
 	}
 
 	if (dart->pmp_sid6_only) {
@@ -2194,6 +2381,7 @@ static int apple_dart_probe(struct platform_device *pdev)
 		return ret;
 	dart->num_clks = ret;
 
+	apple_dart_tunnel_trace(dart, 10, "enable PCIe-C DART clocks");
 	ret = clk_bulk_prepare_enable(dart->num_clks, dart->clks);
 	if (ret)
 		return ret;
@@ -2205,9 +2393,51 @@ static int apple_dart_probe(struct platform_device *pdev)
 	ret = devm_pm_runtime_enable(dev);
 	if (ret)
 		goto err_clk_disable;
+	if (tunneled && apple_dart_debug_stage == 12) {
+		dev_info(dev,
+			 "PCIe-C DART debug stage 12: power and clocks enabled\n");
+		ret = -EAGAIN;
+		debug_stop = true;
+		goto err_clk_disable;
+	}
+	if (tunneled) {
+		dev_info(dev, "applying %zu firmware PCIe-C DART tunables\n",
+			 dart->tunables->sz);
+		apple_dart_tunnel_trace(dart, 11, "apply firmware DART tunables");
+		apple_dart_apply_tunables(dart);
+		dev_info(dev, "firmware PCIe-C DART tunables applied\n");
+		if (apple_dart_debug_stage == 13) {
+			dev_info(dev,
+				 "PCIe-C DART debug stage 13: firmware tunables applied\n");
+			ret = -EAGAIN;
+			debug_stop = true;
+			goto err_clk_disable;
+		}
+	}
 
-	dart_params[0] = readl(dart->regs + DART_PARAMS1);
-	dart_params[1] = readl(dart->regs + DART_PARAMS2);
+	/*
+	 * The cable-powered T8110 DART does not provide a safely probeable
+	 * parameter block at this point in PCIe tunnel activation.  The SError
+	 * raised by these reads is asynchronous, which made the following trace
+	 * boundary look guilty on different boots.  Apple instead publishes the
+	 * complete immutable topology in ADT: 16 KiB pages, 42-bit addresses and
+	 * 64 SIDs.  Use that description before making any DART MMIO access.
+	 */
+	if (tunneled) {
+		dart->pgsize = 1 << DART_PCIEC_PAGE_SHIFT;
+		dart->supports_bypass = true;
+		dart->ias = DART_PCIEC_ADDR_WIDTH;
+		dart->oas = DART_PCIEC_ADDR_WIDTH;
+		dart->num_streams = DART_PCIEC_STREAMS;
+		dart->four_level = true;
+		dev_info(dev,
+			 "PCIe-C DART using fixed topology: pagesize %#x, %u streams, AS %u -> %u\n",
+			 dart->pgsize, dart->num_streams, dart->ias, dart->oas);
+		goto params_done;
+	}
+
+	dart_params[0] = apple_dart_readl(dart, DART_PARAMS1);
+	dart_params[1] = apple_dart_readl(dart, DART_PARAMS2);
 	dart->pgsize = 1 << FIELD_GET(DART_PARAMS1_PAGE_SHIFT, dart_params[0]);
 	dart->supports_bypass = dart_params[1] & DART_PARAMS2_BYPASS_SUPPORT;
 
@@ -2220,11 +2450,12 @@ static int apple_dart_probe(struct platform_device *pdev)
 		break;
 
 	case DART_T8110:
-		dart_params[2] = readl(dart->regs + DART_T8110_PARAMS3);
-		dart_params[3] = readl(dart->regs + DART_T8110_PARAMS4);
+		dart_params[2] = apple_dart_readl(dart, DART_T8110_PARAMS3);
 		dart->ias = FIELD_GET(DART_T8110_PARAMS3_VA_WIDTH, dart_params[2]);
 		dart->oas = FIELD_GET(DART_T8110_PARAMS3_PA_WIDTH, dart_params[2]);
-		dart->num_streams = FIELD_GET(DART_T8110_PARAMS4_NUM_SIDS, dart_params[3]);
+		dart_params[3] = apple_dart_readl(dart, DART_T8110_PARAMS4);
+		dart->num_streams = FIELD_GET(DART_T8110_PARAMS4_NUM_SIDS,
+					      dart_params[3]);
 		dart->four_level = dart->ias > 36;
 		dart->version = dart_params[2] & GENMASK(15, 0);
 		dart->tlb_cmd_v2 = dart->version >= 0x0202;
@@ -2235,8 +2466,10 @@ static int apple_dart_probe(struct platform_device *pdev)
 		break;
 	}
 
+params_done:
 	dart->dma_min = 0;
 	dart->dma_max = DMA_BIT_MASK(dart->ias);
+	dart->dma_offset = 0;
 
 	ret = of_property_read_u64_array(dev->of_node, "apple,dma-range", dma_range, 2);
 	if (ret == -EINVAL) {
@@ -2254,6 +2487,46 @@ static int apple_dart_probe(struct platform_device *pdev)
 		}
 		dev_info(&pdev->dev, "Limiting DMA range to %pad..%pad\n",
 			 &dart->dma_min, &dart->dma_max);
+	}
+
+	ret = of_property_read_u64(dev->of_node, "apple,dma-offset",
+				   &dart->dma_offset);
+	if (ret == -EINVAL) {
+		dart->dma_offset = 0;
+		ret = 0;
+	} else if (ret) {
+		goto err_clk_disable;
+	} else if (dart->dma_offset > DMA_BIT_MASK(dart->ias) ||
+		   dart->dma_max > DMA_BIT_MASK(dart->ias) - dart->dma_offset) {
+		dev_err(dev, "Invalid DMA offset for ias=%u\n", dart->ias);
+		ret = -EINVAL;
+		goto err_clk_disable;
+	} else {
+		dev_info(dev,
+			 "aliasing DMA range %pad..%pad at DART offset %pad\n",
+			 &dart->dma_min, &dart->dma_max, &dart->dma_offset);
+	}
+
+	/*
+	 * Older FDTs described the T602x PCIe-C DART-visible 1 TiB window
+	 * directly. PCIe endpoints cannot issue those addresses: the host bridge
+	 * accepts the upper 2 GiB of its 32-bit bus window and adds the 1 TiB
+	 * alias before DART translation. Keep those FDTs bootable while returning
+	 * the low bus address to DMA clients.
+	 */
+	if (!dart->dma_offset && tunneled &&
+	    (of_machine_is_compatible("apple,t6020") ||
+	     of_machine_is_compatible("apple,t6021")) &&
+	    ((dart->dma_min == 0 &&
+	      dart->dma_max == DMA_BIT_MASK(dart->ias)) ||
+	     (dart->dma_min == BIT_ULL(40) &&
+	      dart->dma_max == BIT_ULL(40) + BIT_ULL(32) - 1))) {
+		dart->dma_min = BIT_ULL(31);
+		dart->dma_max = DMA_BIT_MASK(32);
+		dart->dma_offset = BIT_ULL(40);
+		dev_info(dev,
+			 "using T602x PCIe-C bus DMA window %pad..%pad at DART offset %pad\n",
+			 &dart->dma_min, &dart->dma_max, &dart->dma_offset);
 	}
 
 	if (dart->num_streams > DART_MAX_STREAMS) {
@@ -2330,62 +2603,37 @@ static int apple_dart_probe(struct platform_device *pdev)
 		goto err_clk_disable;
 	}
 
-	dart->locked = apple_dart_is_locked(dart);
-	of_property_read_u32(dev->of_node, "linux-enablement-mac,owned-streams",
-			     &dart->owned_streams);
-	of_property_read_u32(dev->of_node, "linux-enablement-mac,static-dart-bypass-test",
-			     &dart->static_dart_bypass);
-	of_property_read_u32(dev->of_node, "linux-enablement-mac,retained-bypass",
-			     &dart->retained_bypass);
-	if (dart->owned_streams || dart->retained_bypass || dart->static_dart_bypass) {
-		if (!of_machine_is_compatible("apple,j700") ||
-		    !of_device_is_compatible(dev->of_node, "apple,t8140-dart") ||
-		    dart->locked || (dart->owned_streams && dart->retained_bypass)) {
-			ret = -EINVAL;
-			goto err_clk_disable;
-		}
-		dart->force_available = 1;
-	}
-	if (dart->owned_streams) {
-		if (res->start != 0x390000000ULL || dart->owned_streams != BIT(1) ||
-		    dart->num_streams != 19 || dart->pgsize > PAGE_SIZE) {
-			ret = -EINVAL;
-			goto err_clk_disable;
-		}
-		dev_info(dev, "Legacy radio handoff: owning SID1 only\n");
-	} else if (dart->static_dart_bypass) {
-		ret = -EINVAL;
-		goto err_clk_disable;
-	}
-	if (dart->retained_bypass) {
-		if (res->start != 0x314800000ULL || dart->retained_bypass != 1 ||
-		    !dart->supports_bypass ||
-		    (readl(dart->regs + DART_TCR(dart, 0)) &
-		     (DART_T8110_TCR_BYPASS_DART | DART_T8110_TCR_TRANSLATE_ENABLE)) !=
-		    DART_T8110_TCR_BYPASS_DART ||
-		    (readl(dart->regs + DART_TTBR(dart, 0, 0)) & dart->hw->ttbr_valid)) {
-			ret = -EINVAL;
-			goto err_clk_disable;
-		}
-		dev_info(dev, "Preserving inherited SID0 bypass for live MTP\n");
-	}
-	ret = apple_dart_static_bypass_test(dart);
-	if (ret)
-		goto err_clk_disable;
-
 	/*
-	 * A locked DART is one the bootloader handed over still translating for
-	 * hardware we do not drive -- on J700 the display pipe scans out
-	 * through stream 0 of dart-disp0 the whole time Linux is booting.
-	 * Letting runtime PM suspend it drops the TTBRs underneath that
-	 * traffic, and the engine then faults "TTBR invalid" forever.  Hold the
-	 * reference for the DART's lifetime, as apple,force-available does.
+	 * The hot-plug PCIe-C DART is freshly made available for this tunnel and
+	 * Apple's ADT does not describe a retained/locked translation context.
+	 * Its T8110 PROTECT register is not readable from this activation state,
+	 * so do not turn that optional observation into a fatal external abort.
 	 */
-	if (dart->locked && !dart->force_available) {
-		dev_info(dev, "locked DART: holding it available for its lifetime\n");
-		dart->force_available = 1;
+	if (tunneled) {
+		dart->locked = false;
+		dev_info(dev, "PCIe-C DART treating fresh tunnel context as unlocked\n");
+	} else {
+		dart->locked = apple_dart_is_locked(dart);
 	}
-
+	if (tunneled && apple_dart_debug_stage == 17) {
+		dev_info(dev, "PCIe-C DART debug stage 17: lock=%u\n",
+			 dart->locked);
+		ret = -EAGAIN;
+		debug_stop = true;
+		goto err_clk_disable;
+	}
+	if (!dart->locked && tunneled && apple_dart_debug_stage >= 29) {
+		if (apple_dart_debug_stage == 29) {
+			dev_info(dev,
+				 "PCIe-C DART debug stage 29: reset boundary reached\n");
+			ret = -EAGAIN;
+			debug_stop = true;
+			goto err_clk_disable;
+		}
+		ret = apple_dart_debug_reset(dart);
+		debug_stop = ret == -EAGAIN;
+		goto err_clk_disable;
+	}
 	if (!dart->locked) {
 		ret = apple_dart_hw_reset(dart);
 		if (ret)
@@ -2393,24 +2641,47 @@ static int apple_dart_probe(struct platform_device *pdev)
 	} else {
 		apple_dart_drain_stale_exceptions(dart);
 	}
-
-	if (!dart->pmp_sid6_only) {
-		ret = request_irq(dart->irq, apple_dart_irq, IRQF_SHARED,
-				  "apple-dart fault handler", dart);
-		if (ret)
-			goto err_clk_disable;
+	if (tunneled && apple_dart_debug_stage == 18) {
+		dev_info(dev, "PCIe-C DART debug stage 18: reset complete\n");
+		ret = -EAGAIN;
+		debug_stop = true;
+		goto err_clk_disable;
 	}
 
-	platform_set_drvdata(pdev, dart);
+	apple_dart_tunnel_trace(dart, 30, "register DART fault IRQ");
+	ret = request_irq(dart->irq, apple_dart_irq, IRQF_SHARED,
+			  "apple-dart fault handler", dart);
+	if (ret)
+		goto err_clk_disable;
+	if (tunneled && apple_dart_debug_stage == 19) {
+		dev_info(dev, "PCIe-C DART debug stage 19: IRQ registered\n");
+		ret = -EAGAIN;
+		debug_stop = true;
+		goto err_free_irq;
+	}
 
+	apple_dart_tunnel_trace(dart, 31, "register DART sysfs device");
 	ret = iommu_device_sysfs_add(&dart->iommu, dev, NULL, "apple-dart.%s",
 				     dev_name(&pdev->dev));
 	if (ret)
 		goto err_free_irq;
+	if (tunneled && apple_dart_debug_stage == 20) {
+		dev_info(dev, "PCIe-C DART debug stage 20: sysfs registered\n");
+		ret = -EAGAIN;
+		debug_stop = true;
+		goto err_sysfs_remove;
+	}
 
+	apple_dart_tunnel_trace(dart, 32, "register DART with IOMMU core");
 	ret = iommu_device_register(&dart->iommu, &apple_dart_iommu_ops, dev);
 	if (ret)
 		goto err_sysfs_remove;
+	if (tunneled && apple_dart_debug_stage == 21) {
+		dev_info(dev, "PCIe-C DART debug stage 21: IOMMU registered\n");
+		ret = -EAGAIN;
+		debug_stop = true;
+		goto err_iommu_unregister;
+	}
 
 	if (dart->force_available)
 		dev_info(dev, "forcing DART available for its lifetime\n");
@@ -2424,13 +2695,19 @@ static int apple_dart_probe(struct platform_device *pdev)
 		dart->pgsize > PAGE_SIZE, dart->locked, dart->ias, dart->oas);
 	return 0;
 
+err_iommu_unregister:
+	iommu_device_unregister(&dart->iommu);
 err_sysfs_remove:
 	iommu_device_sysfs_remove(&dart->iommu);
 err_free_irq:
 	if (!dart->pmp_sid6_only)
 		free_irq(dart->irq, dart);
 err_clk_disable:
-	pm_runtime_put(dev);
+	/* A diagnostic exit must not schedule runtime suspend during teardown. */
+	if (debug_stop)
+		pm_runtime_put_noidle(dev);
+	else
+		pm_runtime_put(dev);
 	clk_bulk_disable_unprepare(dart->num_clks, dart->clks);
 
 	return ret;
@@ -2571,10 +2848,12 @@ static __maybe_unused int apple_dart_suspend(struct device *dev)
 		return 0;
 
 	for (sid = 0; sid < dart->num_streams; sid++) {
-		dart->save_tcr[sid] = readl(dart->regs + DART_TCR(dart, sid));
+		dart->save_tcr[sid] = apple_dart_readl(dart,
+						       DART_TCR(dart, sid));
 		for (idx = 0; idx < dart->hw->ttbr_count; idx++)
 			dart->save_ttbr[sid][idx] =
-				readl(dart->regs + DART_TTBR(dart, sid, idx));
+				apple_dart_readl(dart,
+						 DART_TTBR(dart, sid, idx));
 	}
 
 	return 0;
@@ -2601,9 +2880,10 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 
 	for (sid = 0; sid < dart->num_streams; sid++) {
 		for (idx = 0; idx < dart->hw->ttbr_count; idx++)
-			writel(dart->save_ttbr[sid][idx],
-			       dart->regs + DART_TTBR(dart, sid, idx));
-		writel(dart->save_tcr[sid], dart->regs + DART_TCR(dart, sid));
+			apple_dart_writel(dart, dart->save_ttbr[sid][idx],
+					   DART_TTBR(dart, sid, idx));
+		apple_dart_writel(dart, dart->save_tcr[sid],
+				   DART_TCR(dart, sid));
 	}
 
 	return 0;
