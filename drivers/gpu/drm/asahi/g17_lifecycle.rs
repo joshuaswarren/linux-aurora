@@ -107,7 +107,7 @@ pub(crate) trait PersistentRuntimeRecovery {
     fn drop_gfx1_rtkit(&mut self);
     fn drop_gfx_rtkit(&mut self);
     /// Drop per-session queue and render state while retaining manager/UAT.
-    fn release_runtime_objects(&mut self);
+    fn release_runtime_objects(&mut self) -> Result<(), Self::Error>;
     /// Restore initdata and transports on the retained manager/UAT.
     fn rebuild_session_in_place(&mut self) -> Result<(), Self::Error>;
     fn resume_submissions(&mut self);
@@ -121,7 +121,7 @@ pub(crate) fn recover_persistent_runtime<T: PersistentRuntimeRecovery>(
     owner.stop_cpu_pair()?;
     owner.drop_gfx1_rtkit();
     owner.drop_gfx_rtkit();
-    owner.release_runtime_objects();
+    owner.release_runtime_objects()?;
     owner.rebuild_session_in_place()?;
     owner.resume_submissions();
     Ok(())
@@ -216,6 +216,7 @@ mod tests {
         StopGfx,
         StopPair,
         RebuildSession,
+        ReleaseRuntime,
     }
 
     #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -227,6 +228,7 @@ mod tests {
         StopGfx,
         StopPair,
         RebuildSession,
+        ReleaseRuntime,
     }
 
     struct State {
@@ -598,8 +600,13 @@ mod tests {
             self.trace.push(Event::DropGfxRtkit);
         }
 
-        fn release_runtime_objects(&mut self) {
+        fn release_runtime_objects(&mut self) -> Result<(), Self::Error> {
             self.trace.push(Event::ReleaseRuntimeObjects);
+            if self.failure == Some(Failure::ReleaseRuntime) {
+                Err(TestError::ReleaseRuntime)
+            } else {
+                Ok(())
+            }
         }
 
         fn rebuild_session_in_place(&mut self) -> Result<(), Self::Error> {
@@ -674,6 +681,29 @@ mod tests {
                 Event::DropGfxRtkit,
                 Event::ReleaseRuntimeObjects,
                 Event::RebuildSessionInPlace,
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_object_release_error_does_not_start_a_new_session() {
+        let mut owner = MockRuntimeRecovery {
+            failure: Some(Failure::ReleaseRuntime),
+            trace: std::vec::Vec::new(),
+            manager_uat_id: 0x9000_0000,
+        };
+        assert_eq!(
+            recover_persistent_runtime(&mut owner),
+            Err(TestError::ReleaseRuntime)
+        );
+        assert_eq!(
+            owner.trace,
+            [
+                Event::PauseSubmissions,
+                Event::StopCpuPair,
+                Event::DropGfx1Rtkit,
+                Event::DropGfxRtkit,
+                Event::ReleaseRuntimeObjects,
             ]
         );
     }
