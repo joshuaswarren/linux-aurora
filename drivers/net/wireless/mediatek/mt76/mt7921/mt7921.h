@@ -20,11 +20,17 @@
 /* Live 25G83 Run 191 WFDMA programming: TX17=24, TX16=256. */
 #define MT7932_TX_MCU_RING_SIZE		24
 #define MT7932_TX_FWDL_RING_SIZE	256
+#define MT7932_TX_AUX_RING_SIZE		16
 #define MT7932_TX_RING_SIZE		512
 #define MT7932_RX_RING_SIZE		512
 #define MT7932_RX_MCU_RING_SIZE		32
 #define MT7932_RX_MCU_WA_RING_SIZE	32
 #define MT7932_RX_BUF_SIZE		0x930
+#define MT7932_RX_RING3_SIZE		32
+#define MT7932_RX_RING5_SIZE		224
+#define MT7932_RX_RING6_SIZE		128
+#define MT7932_RX_RING7_SIZE		512
+#define MT7932_RX_RING8_SIZE		64
 
 /* MT7902 Rx Ring0 is for both Rx Event and Tx Done Event */
 #define MT7902_RX_MCU_RING_SIZE		512
@@ -134,6 +140,14 @@ enum mt7921_rxq_id {
 /* MT7902 assigns its MCU-WM TXQ at index 15 */
 enum mt7902_txq_id {
 	MT7902_TXQ_MCU_WM = 15,
+};
+
+/* Run 191 programs this queue before firmware start, initializes CIDX to
+ * zero, and never advances it during the retained startup window.  It is not
+ * the FW_START response queue; keep it allocated but deliberately unrouted.
+ */
+enum mt7932_txq_id {
+	MT7932_TXQ_AUX = 18,
 };
 
 struct mt7921_dma_layout {
