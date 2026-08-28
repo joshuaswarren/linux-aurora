@@ -18,6 +18,9 @@ use crate::{driver::AsahiDevice, gem, mmu};
 #[path = "g17_initdata.rs"]
 mod g17_initdata;
 
+#[cfg(not(test))]
+use core::ops::Range;
+
 use g17_initdata::{InstanceAddresses, InstanceRole, SharedAddresses};
 
 /// The T8140 absent-handoff UAT constructor is available to production code.
@@ -29,6 +32,14 @@ pub(crate) const EXECUTABLE_T8140_ROLE_RESOURCES_AVAILABLE: bool = true;
 const ROOT_PAIR_ALLOC_SIZE: usize = 0xc000;
 const PRIMARY_STATUS_A_STATE_GRID_OFFSET: u64 = 0xee40;
 const SECONDARY_EXTRA_0_BEFORE_PRIMARY_STATUS_A: u64 = 0x6c0;
+pub(crate) const G17P_CL_ENTRY_STORAGE_SIZE: usize = 0x20000;
+pub(crate) const G17P_CL_SHARED_SUPPORT_SIZE: usize = 0x4000;
+pub(crate) const G17P_CL_B2_OBJECT_SIZE: usize = 0x4000;
+pub(crate) const G17P_CL_CHANNEL_CONTROL_SIZE: usize = 0x4000;
+pub(crate) const G17P_CL_SUPPORT_STATE_SIZE: usize = 0x4000;
+pub(crate) const G17P_CL_OPERAND_TABLE_SIZE: usize = 0x4000;
+pub(crate) const G17P_CL_LOW_VA_START: u64 = 0x70_0000_0000;
+pub(crate) const G17P_CL_LOW_VA_END: u64 = 0x71_0000_0000;
 #[cfg(not(test))]
 const STATUS_A_ALLOC_SIZE: usize = 0xb4000;
 #[cfg(not(test))]
@@ -164,22 +175,17 @@ struct MappedObject {
 
 #[cfg(not(test))]
 impl MappedObject {
-    fn new(
+    fn new_in_range(
         dev: &AsahiDevice,
-        uat: &mmu::Uat,
+        vm: &mmu::Vm,
+        range: Range<u64>,
         size: usize,
         alignment: u64,
         prot: mmu::Prot,
     ) -> Result<Self> {
         let mut object = gem::new_kernel_object(dev, size)?;
         object.vmap()?.memset(0);
-        let mapping = object.map_into_range(
-            uat.kernel_vm(),
-            uat.kernel_va_range()?,
-            alignment,
-            prot,
-            true,
-        )?;
+        let mapping = object.map_into_range(vm, range, alignment, prot, true)?;
         Ok(Self {
             mapping,
             object,
@@ -187,8 +193,44 @@ impl MappedObject {
         })
     }
 
+    fn new(
+        dev: &AsahiDevice,
+        uat: &mmu::Uat,
+        size: usize,
+        alignment: u64,
+        prot: mmu::Prot,
+    ) -> Result<Self> {
+        Self::new_in_range(
+            dev,
+            uat.kernel_vm(),
+            uat.kernel_va_range()?,
+            size,
+            alignment,
+            prot,
+        )
+    }
+
     fn iova(&self) -> u64 {
         self.mapping.iova()
+    }
+
+    fn with_bytes_mut<R>(&mut self, f: impl FnOnce(&mut [u8]) -> Result<R>) -> Result<R> {
+        let vmap = self.object.vmap()?;
+        let bytes = unsafe {
+            // SAFETY: the VMap covers this object's complete, page-rounded
+            // allocation and logical_size never exceeds the object size.
+            core::slice::from_raw_parts_mut(vmap.as_mut_ptr(), self.logical_size)
+        };
+        f(bytes)
+    }
+
+    fn map_alias_at(
+        &mut self,
+        vm: &mmu::Vm,
+        address: u64,
+        prot: mmu::Prot,
+    ) -> Result<mmu::KernelMapping> {
+        self.object.map_at(vm, address, prot, false)
     }
 
     fn write_roots(
@@ -219,6 +261,253 @@ impl MappedObject {
         )
         .map_err(|_| EINVAL)
     }
+
+    fn write_main_configs(
+        &mut self,
+        shared: &SharedAddresses,
+        primary: &RoleResourceBinding,
+        secondary: &RoleResourceBinding,
+        primary_views: &g17_initdata::PrimaryRegionViews,
+    ) -> Result {
+        let vmap = self.object.vmap()?;
+        let bytes = unsafe {
+            // SAFETY: the VMap covers this object's complete, page-rounded
+            // allocation and logical_size never exceeds the object size.
+            core::slice::from_raw_parts_mut(vmap.as_mut_ptr(), self.logical_size)
+        };
+        let primary_offset = g17_initdata::NATIVE_PRIMARY_MAIN_BUNDLE_OFFSET;
+        let secondary_offset = g17_initdata::NATIVE_SECONDARY_MAIN_BUNDLE_OFFSET;
+        let primary_channels = g17_initdata::derive_channel_table(
+            InstanceRole::Primary,
+            primary.state_grid,
+            primary.instance.status_a,
+            primary.instance.main_config,
+            shared.hw_data_bundle,
+        );
+        let secondary_channels = g17_initdata::derive_channel_table(
+            InstanceRole::Secondary,
+            secondary.state_grid,
+            secondary.instance.status_a,
+            secondary.instance.main_config,
+            shared.hw_data_bundle,
+        );
+        g17_initdata::encode_main_config(
+            InstanceRole::Primary,
+            shared,
+            &primary.instance,
+            &primary_channels,
+            Some(primary_views),
+            &mut bytes[primary_offset..primary_offset + g17_initdata::MAIN_CONFIG_SIZE],
+        )
+        .map_err(|_| EINVAL)?;
+        g17_initdata::encode_main_config(
+            InstanceRole::Secondary,
+            shared,
+            &secondary.instance,
+            &secondary_channels,
+            None,
+            &mut bytes[secondary_offset..secondary_offset + g17_initdata::MAIN_CONFIG_SIZE],
+        )
+        .map_err(|_| EINVAL)
+    }
+}
+
+#[cfg(not(test))]
+fn write_status_block_at(object: &mut MappedObject, offset: usize) -> Result {
+    let end = offset
+        .checked_add(g17_initdata::STATUS_BLOCK_SIZE)
+        .ok_or(EINVAL)?;
+    if end > object.logical_size {
+        return Err(EINVAL);
+    }
+    object.with_bytes_mut(|bytes| {
+        g17_initdata::encode_status_block(&mut bytes[offset..end]).map_err(|_| EINVAL)
+    })
+}
+
+#[cfg(not(test))]
+fn map_t8140_register_windows(uat: &mmu::Uat) -> Result<KVec<mmu::KernelMapping>> {
+    let mut mappings = KVec::new();
+    let page_mask = mmu::UAT_PGMSK as u64;
+    for window in g17_initdata::T8140_REGISTER_WINDOWS {
+        let phys_page = window.phys & !page_mask;
+        let device_page = window.device_va & !page_mask;
+        if window.phys & page_mask != window.device_va & page_mask {
+            return Err(EINVAL);
+        }
+        let end = window
+            .device_va
+            .checked_add(window.size as u64)
+            .ok_or(EINVAL)?;
+        let span = end
+            .checked_sub(device_page)
+            .and_then(|size| size.checked_add(page_mask))
+            .map(|size| size & !page_mask)
+            .ok_or(EINVAL)?;
+        mappings.push(
+            uat.kernel_vm().map_io(
+                device_page,
+                phys_page.try_into()?,
+                span.try_into()?,
+                mmu::PROT_FW_MMIO_RW,
+            )?,
+            GFP_KERNEL,
+        )?;
+    }
+    Ok(mappings)
+}
+
+/// Queue-owned mappings retained from SKSM registration through completion.
+#[cfg(not(test))]
+pub(crate) struct G17PClRuntimeStorage {
+    entries: MappedObject,
+    shared_support: MappedObject,
+    channel_control: MappedObject,
+    support_state: MappedObject,
+    scheduler_state: MappedObject,
+    operand_table: MappedObject,
+}
+
+#[cfg(not(test))]
+impl G17PClRuntimeStorage {
+    pub(crate) fn new(dev: &AsahiDevice, uat: &mmu::Uat) -> Result<Self> {
+        let entries = MappedObject::new_in_range(
+            dev,
+            uat.kernel_lower_vm(),
+            G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END,
+            G17P_CL_ENTRY_STORAGE_SIZE,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        let shared_support = MappedObject::new(
+            dev,
+            uat,
+            G17P_CL_SHARED_SUPPORT_SIZE,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        let channel_control = MappedObject::new(
+            dev,
+            uat,
+            G17P_CL_CHANNEL_CONTROL_SIZE,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        let support_state = MappedObject::new(
+            dev,
+            uat,
+            G17P_CL_SUPPORT_STATE_SIZE,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        let scheduler_state = MappedObject::new(
+            dev,
+            uat,
+            G17P_CL_SUPPORT_STATE_SIZE,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        let operand_table = MappedObject::new(
+            dev,
+            uat,
+            G17P_CL_OPERAND_TABLE_SIZE,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+
+        Ok(Self {
+            entries,
+            shared_support,
+            channel_control,
+            support_state,
+            scheduler_state,
+            operand_table,
+        })
+    }
+
+    pub(crate) fn entry_gpu_va(&self) -> u64 {
+        self.entries.iova()
+    }
+
+    pub(crate) fn shared_support_gpu_va(&self) -> u64 {
+        self.shared_support.iova()
+    }
+
+    pub(crate) fn channel_control_gpu_va(&self) -> u64 {
+        self.channel_control.iova()
+    }
+
+    pub(crate) fn support_state_gpu_va(&self) -> u64 {
+        self.support_state.iova()
+    }
+
+    pub(crate) fn scheduler_state_gpu_va(&self) -> u64 {
+        self.scheduler_state.iova()
+    }
+
+    pub(crate) fn operand_table_gpu_va(&self) -> u64 {
+        self.operand_table.iova()
+    }
+
+    pub(crate) fn with_static_pages_mut<R>(
+        &mut self,
+        f: impl FnOnce(&mut [u8], &mut [u8], &mut [u8], &mut [u8]) -> Result<R>,
+    ) -> Result<R> {
+        let shared_support = self.shared_support.object.vmap()?;
+        let support_state = self.support_state.object.vmap()?;
+        let scheduler_state = self.scheduler_state.object.vmap()?;
+        let channel_control = self.channel_control.object.vmap()?;
+        let shared_support = unsafe {
+            // SAFETY: every VMap covers its complete 16 KiB object.
+            core::slice::from_raw_parts_mut(
+                shared_support.as_mut_ptr(),
+                G17P_CL_SHARED_SUPPORT_SIZE,
+            )
+        };
+        let support_state = unsafe {
+            // SAFETY: every VMap covers its complete 16 KiB object.
+            core::slice::from_raw_parts_mut(
+                support_state.as_mut_ptr(),
+                G17P_CL_SUPPORT_STATE_SIZE,
+            )
+        };
+        let scheduler_state = unsafe {
+            // SAFETY: every VMap covers its complete 16 KiB object.
+            core::slice::from_raw_parts_mut(
+                scheduler_state.as_mut_ptr(),
+                G17P_CL_SUPPORT_STATE_SIZE,
+            )
+        };
+        let channel_control = unsafe {
+            // SAFETY: every VMap covers its complete 16 KiB object.
+            core::slice::from_raw_parts_mut(
+                channel_control.as_mut_ptr(),
+                G17P_CL_CHANNEL_CONTROL_SIZE,
+            )
+        };
+        f(
+            shared_support,
+            support_state,
+            scheduler_state,
+            channel_control,
+        )
+    }
+
+    pub(crate) fn write_entry(&mut self, offset: usize, zero_length: usize, body: &[u8]) -> Result {
+        let end = offset.checked_add(zero_length).ok_or(EINVAL)?;
+        if end > self.entries.logical_size || body.len() > zero_length {
+            return Err(EINVAL);
+        }
+        let vmap = self.entries.object.vmap()?;
+        let bytes = unsafe {
+            // SAFETY: the VMap covers the complete page-rounded object and
+            // logical_size is the requested mapped extent.
+            core::slice::from_raw_parts_mut(vmap.as_mut_ptr(), self.entries.logical_size)
+        };
+        bytes[offset..end].fill(0);
+        bytes[offset..offset + body.len()].copy_from_slice(body);
+        Ok(())
+    }
 }
 
 #[cfg(not(test))]
@@ -231,6 +520,14 @@ struct G17MappedResources {
     primary_state: MappedObject,
     secondary_state: MappedObject,
     secondary_status_a: MappedObject,
+    primary_b2_sentinel: MappedObject,
+    primary_b2_alias_0: MappedObject,
+    primary_b2_alias_1: MappedObject,
+    primary_b2_alias_0_low: mmu::KernelMapping,
+    primary_b2_alias_1_low: mmu::KernelMapping,
+    hw_region_0: MappedObject,
+    hw_region_1: MappedObject,
+    register_windows: KVec<mmu::KernelMapping>,
 }
 
 #[cfg(not(test))]
@@ -264,7 +561,7 @@ impl G17ResourceOwner {
             g17_initdata::SECONDARY_ROOT_DELTA,
             mmu::PROT_FW_SHARED_RO,
         )?;
-        let shared_cluster = MappedObject::new(
+        let mut shared_cluster = MappedObject::new(
             dev,
             &address_space.uat,
             g17_initdata::NATIVE_SHARED_CLUSTER_SIZE,
@@ -278,34 +575,84 @@ impl G17ResourceOwner {
             mmu::UAT_PGSZ as u64,
             mmu::PROT_FW_SHARED_RO,
         )?;
-        let region_c = MappedObject::new(
+        let mut region_c = MappedObject::new(
             dev,
             &address_space.uat,
             g17_initdata::REGION_C_SIZE,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_FW_SHARED_RW,
         )?;
-        let primary_state = MappedObject::new(
+        let mut primary_state = MappedObject::new(
             dev,
             &address_space.uat,
             PRIMARY_STATE_ALLOC_SIZE,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_FW_SHARED_RW,
         )?;
-        let secondary_state = MappedObject::new(
+        let mut secondary_state = MappedObject::new(
             dev,
             &address_space.uat,
             SECONDARY_STATE_ALLOC_SIZE,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_FW_SHARED_RW,
         )?;
-        let secondary_status_a = MappedObject::new(
+        let mut secondary_status_a = MappedObject::new(
             dev,
             &address_space.uat,
             STATUS_A_ALLOC_SIZE,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_FW_SHARED_RW,
         )?;
+        let hw_region_0 = MappedObject::new(
+            dev,
+            &address_space.uat,
+            mmu::UAT_PGSZ,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_FW_SHARED_RW,
+        )?;
+        let hw_region_1 = MappedObject::new(
+            dev,
+            &address_space.uat,
+            mmu::UAT_PGSZ,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_FW_SHARED_RW,
+        )?;
+        let register_windows = map_t8140_register_windows(&address_space.uat)?;
+        let primary_b2_sentinel = MappedObject::new(
+            dev,
+            &address_space.uat,
+            G17P_CL_B2_OBJECT_SIZE,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        let mut primary_b2_alias_0 = MappedObject::new(
+            dev,
+            &address_space.uat,
+            G17P_CL_B2_OBJECT_SIZE,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        let mut primary_b2_alias_1 = MappedObject::new(
+            dev,
+            &address_space.uat,
+            G17P_CL_B2_OBJECT_SIZE,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        let primary_b2_alias_0_low = primary_b2_alias_0.map_alias_at(
+            address_space.uat.kernel_lower_vm(),
+            g17_initdata::REGION_VIEW_LOW_ADDRS[0],
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        let primary_b2_alias_1_low = primary_b2_alias_1.map_alias_at(
+            address_space.uat.kernel_lower_vm(),
+            g17_initdata::REGION_VIEW_LOW_ADDRS[1],
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        let primary_region_views = g17_initdata::PrimaryRegionViews {
+            sentinel_high: primary_b2_sentinel.iova(),
+            alias_high: [primary_b2_alias_0.iova(), primary_b2_alias_1.iova()],
+        };
 
         let shared = SharedAddresses {
             region_a: region_a.iova(),
@@ -350,6 +697,37 @@ impl G17ResourceOwner {
             },
         };
         validate_handoff(&handoff).map_err(|_| EINVAL)?;
+        let region_record_addrs = [hw_region_0.iova(), hw_region_1.iova()];
+        shared_cluster.with_bytes_mut(|bytes| {
+            g17_initdata::encode_hw_data(
+                &g17_initdata::T8140_REGISTER_WINDOWS,
+                &g17_initdata::T8140_REGISTER_FLAG_ONLY_SLOTS,
+                region_record_addrs,
+                &mut bytes[..g17_initdata::HW_DATA_SIZE],
+            )
+            .map_err(|_| EINVAL)
+        })?;
+        region_c
+            .with_bytes_mut(|bytes| g17_initdata::encode_region_c(bytes).map_err(|_| EINVAL))?;
+        write_status_block_at(
+            &mut primary_state,
+            g17_initdata::PRIMARY_STATUS_B_STATE_GRID_OFFSET,
+        )?;
+        write_status_block_at(
+            &mut primary_state,
+            PRIMARY_STATUS_A_STATE_GRID_OFFSET as usize,
+        )?;
+        write_status_block_at(
+            &mut secondary_state,
+            g17_initdata::PRIMARY_STATUS_B_STATE_GRID_OFFSET,
+        )?;
+        write_status_block_at(&mut secondary_status_a, 0)?;
+        shared_cluster.write_main_configs(
+            &shared,
+            &handoff.primary,
+            &handoff.secondary,
+            &primary_region_views,
+        )?;
         roots.write_roots(&shared, &primary_instance, &secondary_instance)?;
 
         Ok(Self {
@@ -362,6 +740,14 @@ impl G17ResourceOwner {
                 primary_state,
                 secondary_state,
                 secondary_status_a,
+                primary_b2_sentinel,
+                primary_b2_alias_0,
+                primary_b2_alias_1,
+                primary_b2_alias_0_low,
+                primary_b2_alias_1_low,
+                hw_region_0,
+                hw_region_1,
+                register_windows,
             },
             address_space,
         })
@@ -374,6 +760,28 @@ impl G17ResourceOwner {
     pub(crate) fn uat(&self) -> &mmu::Uat {
         &self.address_space.uat
     }
+
+    pub(crate) fn with_b2_pages_mut<R>(
+        &mut self,
+        f: impl FnOnce(&mut [u8], &mut [u8], &mut [u8]) -> Result<R>,
+    ) -> Result<R> {
+        let computed = self.resources.primary_b2_sentinel.object.vmap()?;
+        let region_1 = self.resources.primary_b2_alias_0.object.vmap()?;
+        let region_2 = self.resources.primary_b2_alias_1.object.vmap()?;
+        let computed = unsafe {
+            // SAFETY: each VMap covers its complete 16 KiB object.
+            core::slice::from_raw_parts_mut(computed.as_mut_ptr(), G17P_CL_B2_OBJECT_SIZE)
+        };
+        let region_1 = unsafe {
+            // SAFETY: each VMap covers its complete 16 KiB object.
+            core::slice::from_raw_parts_mut(region_1.as_mut_ptr(), G17P_CL_B2_OBJECT_SIZE)
+        };
+        let region_2 = unsafe {
+            // SAFETY: each VMap covers its complete 16 KiB object.
+            core::slice::from_raw_parts_mut(region_2.as_mut_ptr(), G17P_CL_B2_OBJECT_SIZE)
+        };
+        f(computed, region_1, region_2)
+    }
 }
 
 #[cfg(test)]
@@ -381,6 +789,24 @@ mod tests {
     use super::*;
 
     const KERN: u64 = 0xffff_fc20_0000_0000;
+
+    #[test]
+    fn g17p_cl_runtime_storage_has_native_ring_geometry() {
+        assert_eq!(G17P_CL_ENTRY_STORAGE_SIZE, 256 * 0x200);
+        assert_eq!(G17P_CL_SHARED_SUPPORT_SIZE, 0x4000);
+        assert_eq!(G17P_CL_B2_OBJECT_SIZE, 0x4000);
+        assert_eq!(G17P_CL_CHANNEL_CONTROL_SIZE, 0x4000);
+        assert_eq!(G17P_CL_LOW_VA_START, 0x70_0000_0000);
+        assert_eq!(G17P_CL_LOW_VA_END, 0x71_0000_0000);
+        assert_eq!(g17_initdata::T8140_REGISTER_WINDOWS.len(), 18);
+        assert_eq!(g17_initdata::T8140_REGISTER_WINDOWS[0].slot, 0);
+        assert_eq!(
+            g17_initdata::T8140_REGISTER_WINDOWS[0].phys,
+            0x0030_1014_000
+        );
+        assert_eq!(g17_initdata::T8140_REGISTER_WINDOWS[17].slot, 41);
+        assert_eq!(g17_initdata::T8140_REGISTER_FLAG_ONLY_SLOTS.len(), 17);
+    }
 
     fn valid_handoff() -> G17ResourceHandoff {
         let bundle = KERN + 0x4000_0000;
