@@ -70,7 +70,18 @@
 &dcp {
 	clocks = <&clk_disp0_154>, <&clk_disp0_194>;
 	clock-names = "clock-154", "clock-194";
+	/* The iBoot and macOS captures both use IOMFB surface slot 0. */
+	apple,iomfb-surfaces = <0>;
 	status = "okay";
+
+	panel: panel {
+		compatible = "apple,panel-j700", "apple,panel";
+		/* 2408x1506 at the ADT's measured 219 dpi. */
+		width-mm = <279>;
+		height-mm = <175>;
+		/* ADT LmaxProduct is 525 in 16.16 fixed point. */
+		apple,max-brightness = <525>;
+	};
 };
 
 &dcp_dart {
@@ -87,6 +98,11 @@
 
 &display {
 	status = "okay";
+};
+
+&framebuffer0 {
+	panel = <&panel>;
+	post-init-providers = <&panel>;
 };
 
 /*
