@@ -39,7 +39,8 @@ use kernel::{
 
 use crate::{
     driver::{AsahiDevice, T8140LiveTopologyAdmission},
-    g17_completion, g17_lifecycle, g17_manager, g17_rtkit, g17_uapi, gem, hw, identity, mmu, regs,
+    g17_completion, g17_lifecycle, g17_manager, g17_rtkit, g17_uapi, gem, hw, identity,
+    mmu, module_parameters, regs,
 };
 use kernel::sync::aref::ARef;
 
@@ -63,7 +64,41 @@ const CONTROL_DONE_TYPE: u16 = 0x84;
 const CONTROL_DONE_CHANNEL: u64 = 0x11;
 const INITDATA_ACK_POLLS: usize = 200;
 const CONTROL_COUNTER_POLLS: usize = 100;
-const CONTROL_OPENING_ONLY_TEST: bool = true;
+
+/// Load-time boundary for short, independent hardware experiments.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum G17PTestStage {
+    Control = 0,
+    Qid4 = 1,
+    ComputeUapi = 2,
+}
+
+impl G17PTestStage {
+    fn from_parameter(value: u32) -> Result<Self> {
+        match value {
+            0 => Ok(Self::Control),
+            1 => Ok(Self::Qid4),
+            2 => Ok(Self::ComputeUapi),
+            _ => Err(EINVAL),
+        }
+    }
+
+    const fn configures_qid4(self) -> bool {
+        !matches!(self, Self::Control)
+    }
+
+    const fn enables_compute_uapi(self) -> bool {
+        matches!(self, Self::ComputeUapi)
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Control => "control",
+            Self::Qid4 => "QID4",
+            Self::ComputeUapi => "compute UAPI",
+        }
+    }
+}
 
 /// Per-role callback state retained until the corresponding RTKit client is
 /// dropped. The callback only publishes atomics; probe owns every mutation of
@@ -195,6 +230,7 @@ struct G17PBootedSession {
     gfx1_state: Arc<G17PRoleRtkitState>,
     gfx1_rtkit: rtkit::RtKit<G17PRtkitOps>,
     queue: Option<g17_manager::G17PSksmQueue>,
+    compute_uapi_enabled: bool,
 }
 
 fn boot_session(
@@ -202,6 +238,7 @@ fn boot_session(
     drm: &ARef<AsahiDevice>,
     registers: &regs::Resources,
     manager: &mut g17_manager::G17PManagerConstruction,
+    test_stage: G17PTestStage,
 ) -> Result<G17PBootedSession> {
     let gfx = AscwrapV6Provider::get(pdev.as_ref(), 0)?;
     let gfx_lifecycle = validate_provider(&gfx, GFX_PROVIDER)?;
@@ -317,10 +354,10 @@ fn boot_session(
     Pin::new(&mut gfx_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, control_done)?;
     dev_info!(pdev.as_ref(), "G17P control: primary done message sent\n");
 
-    if CONTROL_OPENING_ONLY_TEST {
+    if !test_stage.configures_qid4() {
         dev_info!(
             pdev.as_ref(),
-            "G17P session: control-opening test complete; QID4 and SKSM remain untouched\n"
+            "G17P session: control stage complete; QID4 remains untouched\n"
         );
         return Ok(G17PBootedSession {
             cpus,
@@ -329,14 +366,16 @@ fn boot_session(
             gfx1_state,
             gfx1_rtkit,
             queue: None,
+            compute_uapi_enabled: false,
         });
     }
 
-    let queue = manager.configure_compute_sksm_queue(drm, registers, 4, 2)?;
+    let queue = manager.configure_g17p_compute_queue(drm, registers)?;
 
     dev_info!(
         pdev.as_ref(),
-        "G17P session: dual RTKit, initdata, control, and SKSM QID 4 ready\n"
+        "G17P session: SKSM QID 4 / selector 2 ready; stage {}\n",
+        test_stage.name()
     );
     Ok(G17PBootedSession {
         cpus,
@@ -345,6 +384,7 @@ fn boot_session(
         gfx1_state,
         gfx1_rtkit,
         queue: Some(queue),
+        compute_uapi_enabled: test_stage.enables_compute_uapi(),
     })
 }
 
@@ -364,6 +404,7 @@ pub(crate) struct G17PLiveRuntime {
     compute_binding: Option<g17_manager::G17PComputeUserBinding>,
     completion_indices: g17_completion::QueueIndices,
     render_tracker: Option<g17_manager::G17PPartialOpeningRenderTracker>,
+    test_stage: G17PTestStage,
     accepting_submissions: bool,
 }
 
@@ -384,7 +425,7 @@ impl G17PLiveRuntime {
         kernel_range: core::ops::Range<u64>,
     ) -> Result<mmu::Vm> {
         if !self.accepting_submissions {
-            return Err(EIO);
+            return Err(ENOTSUPP);
         }
         self.manager
             .as_mut()
@@ -398,7 +439,7 @@ impl G17PLiveRuntime {
         range: core::ops::Range<usize>,
     ) -> Result<mmu::KernelMapping> {
         if !self.accepting_submissions {
-            return Err(EIO);
+            return Err(ENOTSUPP);
         }
         self.manager
             .as_ref()
@@ -415,7 +456,10 @@ impl G17PLiveRuntime {
         timestamps: [u64; 4],
         timestamp_aliases: KVec<mmu::KernelMapping>,
     ) -> Result {
-        if !self.accepting_submissions || self.is_crashed() {
+        if !self.accepting_submissions {
+            return Err(ENOTSUPP);
+        }
+        if self.is_crashed() {
             g17_lifecycle::recover_persistent_runtime(self)?;
         }
         let recycle = self
@@ -473,7 +517,10 @@ impl G17PLiveRuntime {
         command: &g17_uapi::TranslatedComputeCommand,
         owned_timestamps: mmu::KernelMapping,
     ) -> Result<[u64; 2]> {
-        if !self.accepting_submissions || self.is_crashed() || self.compute_binding.is_some() {
+        if !self.accepting_submissions {
+            return Err(ENOTSUPP);
+        }
+        if self.is_crashed() || self.compute_binding.is_some() {
             g17_lifecycle::recover_persistent_runtime(self)?;
         }
         if self
@@ -582,12 +629,15 @@ impl G17PLiveRuntime {
         {
             return Err(EINVAL);
         }
+        let test_stage =
+            G17PTestStage::from_parameter(*module_parameters::g17p_test_stage.value())?;
         let num_clusters = registers.get_gpu_id()?.num_clusters;
 
         dev_info!(
             pdev.as_ref(),
-            "G17P live-boot: {:?} admitted before effects; querying provider-owned lifecycle\n",
-            BootStage::ExactTopology
+            "G17P live-boot: {:?} admitted before effects; selected {} stage\n",
+            BootStage::ExactTopology,
+            test_stage.name()
         );
 
         let pdev_ref: ARef<platform::Device> = pdev.into();
@@ -597,8 +647,8 @@ impl G17PLiveRuntime {
             g17_manager::T8140_G17P_PLATFORM_CONFIG,
             num_clusters,
         )?;
-        let session = boot_session(&pdev_ref, &drm, &registers, &mut manager)?;
-        let accepting_submissions = session.queue.is_some();
+        let session = boot_session(&pdev_ref, &drm, &registers, &mut manager, test_stage)?;
+        let accepting_submissions = session.compute_uapi_enabled && session.queue.is_some();
 
         Ok(Self {
             pdev: Some(pdev_ref),
@@ -618,6 +668,7 @@ impl G17PLiveRuntime {
                 write: 0,
             },
             render_tracker: None,
+            test_stage,
             accepting_submissions,
         })
     }
@@ -758,7 +809,7 @@ impl g17_lifecycle::PersistentRuntimeRecovery for G17PLiveRuntime {
         let registers = self.registers.as_ref().ok_or(ENODEV)?;
         let manager = self.manager.as_mut().ok_or(ENODEV)?;
         manager.reset_session_after_processor_stop()?;
-        let session = boot_session(&pdev, &drm, registers, manager)?;
+        let session = boot_session(&pdev, &drm, registers, manager, self.test_stage)?;
         self.cpus = Some(session.cpus);
         self.gfx_state = Some(session.gfx_state);
         self.gfx_rtkit = Some(session.gfx_rtkit);
@@ -769,7 +820,8 @@ impl g17_lifecycle::PersistentRuntimeRecovery for G17PLiveRuntime {
     }
 
     fn resume_submissions(&mut self) {
-        self.accepting_submissions = self.queue.is_some();
+        self.accepting_submissions =
+            self.test_stage.enables_compute_uapi() && self.queue.is_some();
     }
 }
 
