@@ -193,6 +193,8 @@ pub(crate) enum SubmissionError {
     PartialOpeningChannelCounterOutOfRange,
     /// A first-render queue head does not fit the outer slot's 16-bit field.
     PartialOpeningQueueHeadOutOfRange,
+    /// A cold-opening support object does not match its exact encoded extent.
+    PartialOpeningGraphObjectSize,
     /// The host/firmware meaning of this in-range top-level tag is unresolved.
     CommandTagUnresolved,
     /// This value is not a grounded G17P top-level command tag.
@@ -411,6 +413,10 @@ fn put_u32_le(raw: &mut [u8], offset: usize, value: u32) {
     raw[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 
+fn put_u16_le(raw: &mut [u8], offset: usize, value: u16) {
+    raw[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
 fn put_u64_le(raw: &mut [u8], offset: usize, value: u64) {
     raw[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
@@ -610,7 +616,7 @@ pub(crate) const fn prepare_g17p_channel_write(
 //
 //     The measured J700 first-partial source contract executes graphics through
 //     the native partial graph. It publishes a one-record scheduler page and
-//     context-2 primary index, presents five primary status fields before
+//     an eight-group primary index, presents five primary status fields before
 //     control 0x84, then exposes 3D before TA and sends one EP 0x21/0x83 kick
 //     for transport pair 2 on channel 8. This is the classic channel path and
 //     remains separate from the kext's SKSM queue-entry plus `addKicks` path.
@@ -629,6 +635,69 @@ pub(crate) const G17P_PARTIAL_OPENING_OUTER_SLOT_SIZE: usize = 0x18;
 pub(crate) const G17P_PARTIAL_OPENING_OUTER_SLOT_COUNT: u32 = 0x100;
 pub(crate) const G17P_PARTIAL_OPENING_TILING_CHANNEL_TABLE_INDEX: u8 = 6;
 pub(crate) const G17P_PARTIAL_OPENING_FRAGMENT_CHANNEL_TABLE_INDEX: u8 = 7;
+pub(crate) const G17P_COLD_OPENING_RECORD_POOL_A_SIZE: usize = 35 * 0x100;
+pub(crate) const G17P_COLD_OPENING_RECORD_POOL_B_SIZE: usize = 79 * 0x80;
+pub(crate) const G17P_COLD_OPENING_SHARED_OBJECT_SIZE: usize = 0x88;
+pub(crate) const G17P_COLD_OPENING_SHARED_CONTROL_SIZE: usize = 0x70;
+pub(crate) const G17P_COLD_OPENING_SHARED_CONTROL_INNER_SIZE: usize = 4;
+pub(crate) const G17P_COLD_OPENING_CHANNEL_CONTROL_SIZE: usize = 0x40;
+pub(crate) const G17P_COLD_OPENING_OPTIONAL_SIZE: usize = 0xc0;
+pub(crate) const G17P_COLD_OPENING_EVENT_SIZE: usize = 0x40;
+pub(crate) const G17P_COLD_OPENING_QUEUE_CONTEXT_SIZE: usize = 0x4000;
+pub(crate) const G17P_COLD_OPENING_QUEUE_RECORD_SIZE: usize = 0xc0;
+pub(crate) const G17P_COLD_OPENING_POINTER_BLOCK_SIZE: usize = 0x80;
+pub(crate) const G17P_COLD_OPENING_OPERAND_DIRECTORY_GPU_VA: u64 = 0x70_0000_0000;
+pub(crate) const G17P_COLD_OPENING_OPERAND_DIRECTORY_SIZE: usize = 4 * 0x4000;
+pub(crate) const G17P_COLD_OPENING_OPERAND_TABLE_GPU_VA: u64 = 0x70_0020_8000;
+pub(crate) const G17P_COLD_OPENING_OPERAND_BUFFER_BASE: u64 = 0x70_0022_0000;
+pub(crate) const G17P_COLD_OPENING_OPERAND_BUFFER_COUNT: usize = 28;
+pub(crate) const G17P_COLD_OPENING_OPERAND_BUFFER_SIZE: u64 = 0x10_0000;
+pub(crate) const G17P_COLD_OPENING_OPERAND_BUFFER_STRIDE: u64 = 0x10_8000;
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum G17PColdOpeningLeaf {
+    PrimaryIndex,
+    SecondaryIndex,
+    PoolASlots,
+    PoolBSlots,
+    SharedSlots,
+    Flag,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum G17PColdOpeningStage {
+    Tiling,
+    Fragment,
+}
+
+/// Relocatable leaf addresses used by the cold-opening pool and shared graph.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PColdOpeningGraphAddresses {
+    pub(crate) primary_index: u64,
+    pub(crate) secondary_index: u64,
+    pub(crate) pool_a_slots: u64,
+    pub(crate) pool_b_slots: u64,
+    pub(crate) shared_slots: u64,
+    pub(crate) flag: u64,
+}
+
+/// Relocatable pointers carried by one cold-opening optional record.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PColdOpeningOptionalAddresses {
+    pub(crate) context_scratch: u64,
+    pub(crate) firmware_scratch: u64,
+    pub(crate) shared_control: u64,
+    pub(crate) channel_control: u64,
+    pub(crate) tiling_shared_object: u64,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PColdOpeningQueueAddresses {
+    pub(crate) pointers: u64,
+    pub(crate) item_ring: u64,
+    pub(crate) job_list: u64,
+    pub(crate) channel_control: u64,
+}
 
 /// Root, queue, and scheduler identities at the proven first-work boundary.
 /// The successful run used the two-entry macOS context table: slot/tag 0 and
@@ -649,6 +718,10 @@ pub(crate) struct G17PPartialOpeningContextContract {
     pub(crate) optional_identity_context_id: u8,
     pub(crate) descriptor_context_id: u8,
     pub(crate) scheduler_class: u8,
+    pub(crate) optional_grids: [u8; 2],
+    pub(crate) queue_identity: u8,
+    pub(crate) optional_submission_ordinal: u16,
+    pub(crate) event_counter: u32,
     pub(crate) work_doorbell_channel: u8,
     pub(crate) context0_low_root_present_at_first_work: bool,
     pub(crate) render_low_root_present_at_first_work: bool,
@@ -665,10 +738,14 @@ pub(crate) const G17P_PARTIAL_OPENING_CONTEXT: G17PPartialOpeningContextContract
         render_empty_high_root_slot: 1,
         transport_pair: 2,
         descriptor_pair: 0,
-        graph_context_id: 2,
-        optional_identity_context_id: 3,
-        descriptor_context_id: 2,
+        graph_context_id: 1,
+        optional_identity_context_id: 1,
+        descriptor_context_id: 1,
         scheduler_class: 2,
+        optional_grids: [0, 1],
+        queue_identity: 0x15,
+        optional_submission_ordinal: 0,
+        event_counter: 0x102,
         work_doorbell_channel: G17P_PARTIAL_OPENING_WORK_DOORBELL_CHANNEL,
         context0_low_root_present_at_first_work: true,
         render_low_root_present_at_first_work: true,
@@ -762,7 +839,7 @@ pub(crate) fn build_g17p_partial_opening_scheduler_page() -> [u8; G17P_PARTIAL_O
     page
 }
 
-/// Build the eight-group context-2 primary index used by the proven opening.
+/// Build the eight-group primary index used by the proven opening.
 pub(crate) fn apply_g17p_partial_opening_primary_index_page(
     page: &mut [u8],
 ) -> Result<(), SubmissionError> {
@@ -790,6 +867,421 @@ pub(crate) fn build_g17p_partial_opening_primary_index_page() -> [u8; G17P_PARTI
     let mut page = [0u8; G17P_PARTIAL_OPENING_PAGE_SIZE];
     let _ = apply_g17p_partial_opening_primary_index_page(&mut page);
     page
+}
+
+/// Write one of the six source-built leaf pages used by the cold opening.
+pub(crate) fn apply_g17p_cold_opening_leaf_page(
+    leaf: G17PColdOpeningLeaf,
+    page: &mut [u8],
+) -> Result<(), SubmissionError> {
+    if page.len() != G17P_PARTIAL_OPENING_PAGE_SIZE {
+        return Err(SubmissionError::PartialOpeningGraphObjectSize);
+    }
+    page.fill(0);
+    match leaf {
+        G17PColdOpeningLeaf::PrimaryIndex => {
+            apply_g17p_partial_opening_primary_index_page(page)?;
+        }
+        G17PColdOpeningLeaf::SecondaryIndex => {
+            let mut index = 0usize;
+            for (start, groups) in [(0x11u32, 6u32), (0x3cu32, 2u32)] {
+                for group in 0..groups {
+                    put_u64_le(page, index * 8, (start + group * 5) as u64);
+                    index += 1;
+                }
+            }
+        }
+        G17PColdOpeningLeaf::PoolASlots => put_u32_le(page, 0x04, 2),
+        G17PColdOpeningLeaf::PoolBSlots => {}
+        G17PColdOpeningLeaf::SharedSlots => {
+            put_u32_le(page, 0x00, 8);
+            put_u32_le(page, 0x04, 8);
+            put_u32_le(page, 0x60, 1);
+        }
+        G17PColdOpeningLeaf::Flag => put_u32_le(page, 0x00, 1),
+    }
+    Ok(())
+}
+
+/// Write the 35-record Pool-A array with relocatable slot pointers.
+pub(crate) fn apply_g17p_cold_opening_record_pool_a(
+    addresses: G17PColdOpeningGraphAddresses,
+    out: &mut [u8],
+) -> Result<(), SubmissionError> {
+    if out.len() != G17P_COLD_OPENING_RECORD_POOL_A_SIZE {
+        return Err(SubmissionError::PartialOpeningGraphObjectSize);
+    }
+    out.fill(0);
+    let slot_base = addresses
+        .pool_a_slots
+        .checked_add(4)
+        .ok_or(SubmissionError::PartialOpeningAddressOverflow)?;
+    for index in 0..35usize {
+        let slot = slot_base
+            .checked_add((index * 4) as u64)
+            .ok_or(SubmissionError::PartialOpeningAddressOverflow)?;
+        let base = index * 0x100;
+        put_u64_le(out, base, slot);
+        if index == 0 {
+            put_u32_le(out, base + 0x10, 0x50);
+        }
+    }
+    Ok(())
+}
+
+/// Write the 79-record Pool-B array in the cold pair-zero namespace.
+pub(crate) fn apply_g17p_cold_opening_record_pool_b(
+    addresses: G17PColdOpeningGraphAddresses,
+    out: &mut [u8],
+) -> Result<(), SubmissionError> {
+    if out.len() != G17P_COLD_OPENING_RECORD_POOL_B_SIZE {
+        return Err(SubmissionError::PartialOpeningGraphObjectSize);
+    }
+    out.fill(0);
+    let slot_base = addresses
+        .pool_b_slots
+        .checked_add(4)
+        .ok_or(SubmissionError::PartialOpeningAddressOverflow)?;
+    let shared = addresses
+        .shared_slots
+        .checked_add(0x40)
+        .ok_or(SubmissionError::PartialOpeningAddressOverflow)?;
+    for index in 0..79usize {
+        let base = index * 0x80;
+        put_u32_le(out, base, 0x80004 + index as u32 * 4);
+        put_u32_le(out, base + 0x04, 0x10);
+        put_u64_le(
+            out,
+            base + 0x08,
+            slot_base
+                .checked_add((index * 4) as u64)
+                .ok_or(SubmissionError::PartialOpeningAddressOverflow)?,
+        );
+        let phase = index % 36;
+        let cycle = if phase == 35 {
+            0x178000
+        } else {
+            0x178020 + phase as u32 * 0x20
+        };
+        put_u32_le(out, base + 0x28, cycle);
+        put_u64_le(out, base + 0x40, shared);
+        if index == 0 {
+            put_u32_le(out, base + 0x4c, 1);
+        }
+    }
+    Ok(())
+}
+
+/// Write the packed pair-zero, eight-group object named by both descriptors.
+pub(crate) fn apply_g17p_cold_opening_shared_object(
+    addresses: G17PColdOpeningGraphAddresses,
+    out: &mut [u8],
+) -> Result<(), SubmissionError> {
+    if out.len() != G17P_COLD_OPENING_SHARED_OBJECT_SIZE {
+        return Err(SubmissionError::PartialOpeningGraphObjectSize);
+    }
+    out.fill(0);
+    for (offset, address) in [
+        (0x20, addresses.primary_index),
+        (0x44, addresses.secondary_index),
+        (0x4c, addresses.shared_slots),
+        (0x64, addresses.flag),
+    ] {
+        put_u64_le(out, offset, address);
+    }
+    for (offset, value) in [
+        (0x28, 0x0019_0000),
+        (0x2c, 0x10),
+        (0x30, 0x0001_0000),
+        (0x34, 0x20),
+        (0x38, 0x0c18),
+        (0x3c, 8),
+        (0x54, 0x1f),
+        (0x58, 0x0002_0000),
+        (0x7c, 0x3060),
+        (0x80, 0x1020),
+        (0x84, 0x0018_0000),
+    ] {
+        put_u32_le(out, offset, value);
+    }
+    Ok(())
+}
+
+/// Write the 0x70-byte class-2 control object used before cold first work.
+pub(crate) fn apply_g17p_cold_opening_shared_control(
+    operand_table: u64,
+    inner_state: u64,
+    out: &mut [u8],
+) -> Result<(), SubmissionError> {
+    if out.len() != G17P_COLD_OPENING_SHARED_CONTROL_SIZE {
+        return Err(SubmissionError::PartialOpeningGraphObjectSize);
+    }
+    out.fill(0);
+    put_u32_le(out, 0x00, 1);
+    put_u32_le(out, 0x10, 2);
+    put_u64_le(out, 0x18, 0x0004_0000_0000_0070);
+    put_u64_le(out, 0x20, 0x0000_1900_0000_0000);
+    put_u64_le(out, 0x28, 0x0000_1900_0000_0000);
+    put_u64_le(out, 0x30, operand_table);
+    put_u32_le(out, 0x40, 4);
+    put_u32_le(out, 0x48, 0xe0);
+    put_u64_le(out, 0x4c, inner_state);
+    put_u32_le(out, 0x60, 3);
+    Ok(())
+}
+
+pub(crate) fn apply_g17p_cold_opening_shared_control_inner(
+    out: &mut [u8],
+) -> Result<(), SubmissionError> {
+    if out.len() != G17P_COLD_OPENING_SHARED_CONTROL_INNER_SIZE {
+        return Err(SubmissionError::PartialOpeningGraphObjectSize);
+    }
+    put_u32_le(out, 0, 2);
+    Ok(())
+}
+
+/// Write the fresh channel-control record used by both cold queues.
+pub(crate) fn apply_g17p_cold_opening_channel_control(
+    out: &mut [u8],
+) -> Result<(), SubmissionError> {
+    if out.len() != G17P_COLD_OPENING_CHANNEL_CONTROL_SIZE {
+        return Err(SubmissionError::PartialOpeningGraphObjectSize);
+    }
+    out.fill(0);
+    put_u64_le(out, 0x00, 0x0000_0100_0000_ffff);
+    put_u64_le(out, 0x20, 0x0002_0000_0000_0000);
+    put_u64_le(out, 0x30, 0x0000_0000_ff00_0000);
+    Ok(())
+}
+
+/// Write one exact grid-0/1 optional record from the cold partial opening.
+pub(crate) fn apply_g17p_cold_opening_optional(
+    stage: G17PColdOpeningStage,
+    addresses: G17PColdOpeningOptionalAddresses,
+    out: &mut [u8],
+) -> Result<(), SubmissionError> {
+    if out.len() != G17P_COLD_OPENING_OPTIONAL_SIZE {
+        return Err(SubmissionError::PartialOpeningGraphObjectSize);
+    }
+    out.fill(0);
+    put_u32_le(out, 0, 0x0f);
+    for (offset, address) in [
+        (0x08, addresses.context_scratch),
+        (0x10, addresses.firmware_scratch),
+        (0x36, addresses.shared_control),
+        (0x4a, addresses.channel_control),
+    ] {
+        put_u64_le(out, offset, address);
+    }
+    let fields: &[(usize, u16)] = match stage {
+        G17PColdOpeningStage::Tiling => &[
+            (0x18, 0),
+            (0x1a, 1),
+            (0x1e, 2),
+            (0x26, 1),
+            (0x32, 1),
+            (0x52, 1),
+            (0x5a, 0x15),
+            (0x5e, 2),
+            (0x62, 1),
+            (0x66, 1),
+            (0x82, 1),
+        ],
+        G17PColdOpeningStage::Fragment => &[
+            (0x18, 1),
+            (0x1a, 1),
+            (0x1e, 2),
+            (0x22, 1),
+            (0x26, 1),
+            (0x32, 1),
+            (0x52, 1),
+            (0x5a, 0x15),
+            (0x5e, 2),
+            (0x62, 1),
+            (0x66, 1),
+        ],
+    };
+    for (offset, value) in fields {
+        put_u16_le(out, *offset, *value);
+    }
+    match stage {
+        G17PColdOpeningStage::Tiling => put_u64_le(out, 0x6e, addresses.tiling_shared_object),
+        G17PColdOpeningStage::Fragment => out[0x76..0x86].fill(0xff),
+    }
+    Ok(())
+}
+
+/// Write one cold event record. Both halves use the measured counter 0x102.
+pub(crate) fn apply_g17p_cold_opening_event(
+    stage: G17PColdOpeningStage,
+    out: &mut [u8],
+) -> Result<(), SubmissionError> {
+    if out.len() != G17P_COLD_OPENING_EVENT_SIZE {
+        return Err(SubmissionError::PartialOpeningGraphObjectSize);
+    }
+    out.fill(0);
+    put_u32_le(out, 0x00, 0x0e);
+    put_u32_le(
+        out,
+        0x04,
+        0x0001_0000
+            | match stage {
+                G17PColdOpeningStage::Tiling => 0,
+                G17PColdOpeningStage::Fragment => 1,
+            },
+    );
+    put_u32_le(out, 0x08, 0x102);
+    if stage == G17PColdOpeningStage::Fragment {
+        put_u32_le(out, 0x10, 0x100);
+    }
+    Ok(())
+}
+
+/// Write the cold class-2 queue record with queue identity 0x15.
+pub(crate) fn apply_g17p_cold_opening_queue_record(
+    addresses: G17PColdOpeningQueueAddresses,
+    out: &mut [u8],
+) -> Result<(), SubmissionError> {
+    if out.len() != G17P_COLD_OPENING_QUEUE_RECORD_SIZE {
+        return Err(SubmissionError::PartialOpeningGraphObjectSize);
+    }
+    out.fill(0);
+    put_u64_le(out, 0x00, addresses.pointers);
+    put_u64_le(out, 0x08, addresses.item_ring);
+    put_u64_le(out, 0x10, addresses.job_list);
+    put_u32_le(out, 0x24, u32::MAX);
+    put_u32_le(out, 0x28, 2);
+    put_u32_le(out, 0x2c, 2);
+    out[0x36..0x38].fill(0xff);
+    put_u32_le(out, 0x38, 0);
+    put_u32_le(out, 0x40, 2);
+    put_u32_le(out, 0x44, u32::MAX);
+    put_u32_le(out, 0x48, 0x15);
+    put_u32_le(out, 0x94, 0);
+    put_u64_le(out, 0x9c, addresses.channel_control);
+    Ok(())
+}
+
+pub(crate) fn apply_g17p_cold_opening_pointer_block(out: &mut [u8]) -> Result<(), SubmissionError> {
+    if out.len() != G17P_COLD_OPENING_POINTER_BLOCK_SIZE {
+        return Err(SubmissionError::PartialOpeningGraphObjectSize);
+    }
+    out.fill(0);
+    put_u32_le(out, 0x50, u32::MAX);
+    put_u64_le(out, 0x60, 0x500);
+    Ok(())
+}
+
+/// Apply the measured first-publication bytes after descriptor construction.
+pub(crate) fn apply_g17p_cold_opening_descriptor_overrides(
+    stage: G17PColdOpeningStage,
+    descriptor: &mut [u8],
+) -> Result<(), SubmissionError> {
+    if descriptor.len() != G17P_PARTIAL_OPENING_PAGE_SIZE {
+        return Err(SubmissionError::PartialOpeningGraphObjectSize);
+    }
+    let fields: &[(usize, u8)] = match stage {
+        G17PColdOpeningStage::Tiling => &[
+            (0x38, 0x47),
+            (0x3a, 0x49),
+            (0x3c, 0x49),
+            (0x0789, 0x08),
+            (0x093e, 0xd0),
+            (0x093f, 0x91),
+        ],
+        G17PColdOpeningStage::Fragment => &[
+            (0x50, 0x01),
+            (0x80, 0x56),
+            (0x82, 0x57),
+            (0x84, 0x57),
+            (0x88, 0x59),
+            (0x90, 0x01),
+            (0x215c, 0x00),
+            (0x21d8, 0x10),
+            (0x21d9, 0xa2),
+            (0x222d, 0x00),
+        ],
+    };
+    for (offset, value) in fields {
+        descriptor[*offset] = *value;
+    }
+    put_u32_le(descriptor, 0x0c, 1);
+    Ok(())
+}
+
+/// Write the 28-entry fixed operand table consumed by control opcode 0x20.
+pub(crate) fn apply_g17p_cold_opening_operand_table(out: &mut [u8]) -> Result<(), SubmissionError> {
+    if out.len() != G17P_PARTIAL_OPENING_PAGE_SIZE {
+        return Err(SubmissionError::PartialOpeningGraphObjectSize);
+    }
+    out.fill(0);
+    for index in 0..G17P_COLD_OPENING_OPERAND_BUFFER_COUNT {
+        let address = G17P_COLD_OPENING_OPERAND_BUFFER_BASE
+            .checked_add(index as u64 * G17P_COLD_OPENING_OPERAND_BUFFER_STRIDE)
+            .ok_or(SubmissionError::PartialOpeningAddressOverflow)?;
+        put_u64_le(out, index * 0x40, address | (1u64 << 60));
+    }
+    Ok(())
+}
+
+/// Write the four-page accelerator-page directory for the 28 operand buffers.
+pub(crate) fn apply_g17p_cold_opening_operand_directory(
+    out: &mut [u8],
+) -> Result<(), SubmissionError> {
+    if out.len() != G17P_COLD_OPENING_OPERAND_DIRECTORY_SIZE {
+        return Err(SubmissionError::PartialOpeningGraphObjectSize);
+    }
+    out.fill(0);
+    let pages_per_buffer = G17P_COLD_OPENING_OPERAND_BUFFER_SIZE / 0x1000;
+    let mut qword = 0usize;
+    for buffer in 0..G17P_COLD_OPENING_OPERAND_BUFFER_COUNT {
+        let base = G17P_COLD_OPENING_OPERAND_BUFFER_BASE
+            .checked_add(buffer as u64 * G17P_COLD_OPENING_OPERAND_BUFFER_STRIDE)
+            .ok_or(SubmissionError::PartialOpeningAddressOverflow)?;
+        for page in 0..pages_per_buffer {
+            put_u64_le(out, qword * 8, base + page * 0x1000);
+            qword += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Write one distinct low-VM queue-context page for the cold TA/3D pair.
+pub(crate) fn apply_g17p_cold_opening_queue_context(
+    stage: G17PColdOpeningStage,
+    descriptor: u64,
+    queue: u64,
+    out: &mut [u8],
+) -> Result<(), SubmissionError> {
+    if out.len() != G17P_COLD_OPENING_QUEUE_CONTEXT_SIZE {
+        return Err(SubmissionError::PartialOpeningGraphObjectSize);
+    }
+    out.fill(0);
+    let words: &[(usize, u64)] = match stage {
+        G17PColdOpeningStage::Tiling => &[
+            (0x200, 0x1000_0000_0000_0004),
+            (0x220, 0xffff_0c00_0000_0001),
+            (0x350, 0x0002_3803_8000_0003),
+            (0x378, 0x003f_ffff_ffff_ffff),
+        ],
+        G17PColdOpeningStage::Fragment => &[
+            (0x200, 0x1000_0400_0000_0004),
+            (0x220, 0xffff_1800_0000_0003),
+            (0x228, 0x0000_0000_0000_0001),
+            (0x230, 0x0000_0100_0000_0000),
+            (0x350, 0x0002_b003_8000_4c05),
+            (0x358, 0x0000_8003_8000_4c3e),
+            (0x360, 0x0000_b803_8000_4c77),
+            (0x368, 0x0000_5003_8000_4cb0),
+            (0x378, 0x003f_ffff_ffff_ffff),
+        ],
+    };
+    for (offset, value) in words {
+        put_u64_le(out, *offset, *value);
+    }
+    put_u64_le(out, 0x210, descriptor);
+    put_u64_le(out, 0x218, queue);
+    Ok(())
 }
 
 /// Derive the five stable status-B writes presented before control 0x84.
@@ -2556,6 +3048,16 @@ mod tests {
         u32::from_le_bytes(raw[offset..offset + 4].try_into().unwrap())
     }
 
+    fn get_u16_le(raw: &[u8], offset: usize) -> u16 {
+        u16::from_le_bytes(raw[offset..offset + 2].try_into().unwrap())
+    }
+
+    fn source_fixture_fingerprint(raw: &[u8]) -> u64 {
+        raw.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+    }
+
     fn rce_binding_from_packed(word: u64) -> G17PClRceBinding {
         G17PClRceBinding {
             address: (word & G17P_CL_PACKED_ADDRESS_MASK) << 5,
@@ -2797,15 +3299,273 @@ mod tests {
                 render_empty_high_root_slot: 1,
                 transport_pair: 2,
                 descriptor_pair: 0,
-                graph_context_id: 2,
-                optional_identity_context_id: 3,
-                descriptor_context_id: 2,
+                graph_context_id: 1,
+                optional_identity_context_id: 1,
+                descriptor_context_id: 1,
                 scheduler_class: 2,
+                optional_grids: [0, 1],
+                queue_identity: 0x15,
+                optional_submission_ordinal: 0,
+                event_counter: 0x102,
                 work_doorbell_channel: 8,
                 context0_low_root_present_at_first_work: true,
                 render_low_root_present_at_first_work: true,
                 source_firmware_high_root_table_resident: false,
             }
+        );
+    }
+
+    #[test]
+    fn g17p_cold_opening_support_graph_matches_the_source_bytes() {
+        let addresses = G17PColdOpeningGraphAddresses {
+            primary_index: 0x70_0100_0000,
+            secondary_index: 0x70_0100_4000,
+            pool_a_slots: 0x70_0100_8000,
+            pool_b_slots: 0x70_0100_c000,
+            shared_slots: 0x70_0101_0000,
+            flag: 0x70_0101_4000,
+        };
+        let mut page = [0xa5; G17P_PARTIAL_OPENING_PAGE_SIZE];
+        apply_g17p_cold_opening_leaf_page(G17PColdOpeningLeaf::SecondaryIndex, &mut page).unwrap();
+        for (index, expected) in [0x11, 0x16, 0x1b, 0x20, 0x25, 0x2a, 0x3c, 0x41]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(get_u64_le(&page, index * 8), expected);
+        }
+        assert_eq!(source_fixture_fingerprint(&page), 0x5538_4e84_8d5a_840b);
+        assert!(page[0x40..].iter().all(|value| *value == 0));
+        apply_g17p_cold_opening_leaf_page(G17PColdOpeningLeaf::PoolASlots, &mut page).unwrap();
+        assert_eq!(get_u32_le(&page, 4), 2);
+        assert_eq!(source_fixture_fingerprint(&page), 0xcfc1_218a_7364_2c07);
+        apply_g17p_cold_opening_leaf_page(G17PColdOpeningLeaf::PoolBSlots, &mut page).unwrap();
+        assert_eq!(source_fixture_fingerprint(&page), 0x9c1b_da7f_8c87_2325);
+        apply_g17p_cold_opening_leaf_page(G17PColdOpeningLeaf::SharedSlots, &mut page).unwrap();
+        assert_eq!(get_u32_le(&page, 0), 8);
+        assert_eq!(get_u32_le(&page, 4), 8);
+        assert_eq!(get_u32_le(&page, 0x60), 1);
+        assert_eq!(source_fixture_fingerprint(&page), 0x53c2_7f11_bcfb_4124);
+        apply_g17p_cold_opening_leaf_page(G17PColdOpeningLeaf::Flag, &mut page).unwrap();
+        assert_eq!(get_u32_le(&page, 0), 1);
+        assert_eq!(source_fixture_fingerprint(&page), 0xba85_253c_a046_2324);
+
+        apply_g17p_cold_opening_leaf_page(G17PColdOpeningLeaf::PrimaryIndex, &mut page).unwrap();
+        assert_eq!(source_fixture_fingerprint(&page), 0x85e8_d166_b202_3e2d);
+
+        let mut pool_a = [0u8; G17P_COLD_OPENING_RECORD_POOL_A_SIZE];
+        apply_g17p_cold_opening_record_pool_a(addresses, &mut pool_a).unwrap();
+        assert_eq!(get_u64_le(&pool_a, 0), addresses.pool_a_slots + 4);
+        assert_eq!(get_u32_le(&pool_a, 0x10), 0x50);
+        assert_eq!(
+            get_u64_le(&pool_a, 34 * 0x100),
+            addresses.pool_a_slots + 4 + 34 * 4
+        );
+        assert_eq!(source_fixture_fingerprint(&pool_a), 0x0c16_5264_f344_46d2);
+
+        let mut pool_b = [0u8; G17P_COLD_OPENING_RECORD_POOL_B_SIZE];
+        apply_g17p_cold_opening_record_pool_b(addresses, &mut pool_b).unwrap();
+        assert_eq!(get_u32_le(&pool_b, 0), 0x80004);
+        assert_eq!(get_u32_le(&pool_b, 0x28), 0x178020);
+        assert_eq!(get_u32_le(&pool_b, 35 * 0x80 + 0x28), 0x178000);
+        assert_eq!(get_u32_le(&pool_b, 36 * 0x80 + 0x28), 0x178020);
+        assert_eq!(get_u64_le(&pool_b, 0x40), addresses.shared_slots + 0x40);
+        assert_eq!(get_u32_le(&pool_b, 0x4c), 1);
+        assert_eq!(source_fixture_fingerprint(&pool_b), 0xb98b_d0a4_1c25_9a6e);
+
+        let mut shared = [0u8; G17P_COLD_OPENING_SHARED_OBJECT_SIZE];
+        apply_g17p_cold_opening_shared_object(addresses, &mut shared).unwrap();
+        assert_eq!(get_u32_le(&shared, 0x0c), 0);
+        assert_eq!(get_u64_le(&shared, 0x20), addresses.primary_index);
+        assert_eq!(get_u32_le(&shared, 0x34), 0x20);
+        assert_eq!(get_u32_le(&shared, 0x3c), 8);
+        assert_eq!(get_u64_le(&shared, 0x44), addresses.secondary_index);
+        assert_eq!(get_u64_le(&shared, 0x4c), addresses.shared_slots);
+        assert_eq!(get_u32_le(&shared, 0x54), 0x1f);
+        assert_eq!(get_u64_le(&shared, 0x64), addresses.flag);
+        assert_eq!(source_fixture_fingerprint(&shared), 0x5d97_133c_cbf5_a77c);
+
+        let graph_range = 0x70_0100_0000..0x70_0101_8000;
+        for address in [
+            get_u64_le(&pool_a, 0),
+            get_u64_le(&pool_a, 34 * 0x100),
+            get_u64_le(&pool_b, 0x08),
+            get_u64_le(&pool_b, 78 * 0x80 + 0x08),
+            get_u64_le(&pool_b, 0x40),
+            get_u64_le(&shared, 0x20),
+            get_u64_le(&shared, 0x44),
+            get_u64_le(&shared, 0x4c),
+            get_u64_le(&shared, 0x64),
+        ] {
+            assert!(graph_range.contains(&address));
+        }
+
+        let mut control = [0u8; G17P_COLD_OPENING_SHARED_CONTROL_SIZE];
+        apply_g17p_cold_opening_shared_control(0x70_0020_8000, 0x70_0102_0000, &mut control)
+            .unwrap();
+        assert_eq!(get_u32_le(&control, 0), 1);
+        assert_eq!(get_u32_le(&control, 0x10), 2);
+        assert_eq!(get_u64_le(&control, 0x20), 0x0000_1900_0000_0000);
+        assert_eq!(get_u64_le(&control, 0x30), 0x70_0020_8000);
+        assert_eq!(get_u32_le(&control, 0x48), 0xe0);
+        assert_eq!(get_u64_le(&control, 0x4c), 0x70_0102_0000);
+        assert_eq!(get_u32_le(&control, 0x60), 3);
+        assert_eq!(source_fixture_fingerprint(&control), 0x9457_5ea8_9f02_1db4);
+        assert!(G17P_COLD_OPENING_OPERAND_TABLE_GPU_VA >= 0x70_0000_0000);
+        assert!(G17P_COLD_OPENING_OPERAND_TABLE_GPU_VA < 0x71_0000_0000);
+        assert!((0x70_0102_0000..0x70_0102_4000).contains(&get_u64_le(&control, 0x4c)));
+        let mut inner = [0u8; G17P_COLD_OPENING_SHARED_CONTROL_INNER_SIZE];
+        apply_g17p_cold_opening_shared_control_inner(&mut inner).unwrap();
+        assert_eq!(get_u32_le(&inner, 0), 2);
+        assert_eq!(source_fixture_fingerprint(&inner), 0x8d1a_ce90_4a39_8d17);
+
+        let mut channel = [0u8; G17P_COLD_OPENING_CHANNEL_CONTROL_SIZE];
+        apply_g17p_cold_opening_channel_control(&mut channel).unwrap();
+        assert_eq!(get_u64_le(&channel, 0), 0x0000_0100_0000_ffff);
+        assert_eq!(get_u64_le(&channel, 0x20), 0x0002_0000_0000_0000);
+        assert_eq!(get_u64_le(&channel, 0x30), 0x0000_0000_ff00_0000);
+        assert_eq!(source_fixture_fingerprint(&channel), 0x448e_89f5_b330_26cb);
+    }
+
+    #[test]
+    fn g17p_cold_opening_work_records_keep_identity_context_and_relocatable_pointers() {
+        let optional_addresses = G17PColdOpeningOptionalAddresses {
+            context_scratch: 0x70_0200_0000,
+            firmware_scratch: 0x70_0200_4000,
+            shared_control: 0x70_0200_8000,
+            channel_control: 0x70_0200_c000,
+            tiling_shared_object: 0x70_0201_0000,
+        };
+        let supplied = 0x70_0200_0000..0x70_0202_0000;
+        for stage in [G17PColdOpeningStage::Tiling, G17PColdOpeningStage::Fragment] {
+            let mut optional = [0u8; G17P_COLD_OPENING_OPTIONAL_SIZE];
+            apply_g17p_cold_opening_optional(stage, optional_addresses, &mut optional).unwrap();
+            assert_eq!(get_u32_le(&optional, 0), 0x0f);
+            for offset in [0x08, 0x10, 0x36, 0x4a] {
+                assert!(supplied.contains(&get_u64_le(&optional, offset)));
+            }
+            assert_eq!(get_u16_le(&optional, 0x1e), 2);
+            assert_eq!(get_u16_le(&optional, 0x32), 1);
+            assert_eq!(get_u16_le(&optional, 0x46), 0);
+            assert_eq!(get_u16_le(&optional, 0x56), 0);
+            assert_eq!(get_u16_le(&optional, 0x5a), 0x15);
+            assert_eq!(get_u16_le(&optional, 0x5e), 2);
+            assert_eq!(get_u16_le(&optional, 0x3e), 0);
+            assert_eq!(
+                source_fixture_fingerprint(&optional),
+                match stage {
+                    G17PColdOpeningStage::Tiling => 0x3511_6ec9_a9f3_7149,
+                    G17PColdOpeningStage::Fragment => 0x2a62_5e4c_5170_22ef,
+                }
+            );
+
+            let mut event = [0u8; G17P_COLD_OPENING_EVENT_SIZE];
+            apply_g17p_cold_opening_event(stage, &mut event).unwrap();
+            assert_eq!(get_u32_le(&event, 0x08), 0x102);
+            assert_eq!(
+                source_fixture_fingerprint(&event),
+                match stage {
+                    G17PColdOpeningStage::Tiling => 0x9eb4_fa84_39f9_667b,
+                    G17PColdOpeningStage::Fragment => 0x86a6_d8e2_4f16_eea1,
+                }
+            );
+
+            let descriptor = if stage == G17PColdOpeningStage::Tiling {
+                0x70_0201_4000
+            } else {
+                0x70_0201_8000
+            };
+            let queue = if stage == G17PColdOpeningStage::Tiling {
+                0x70_0201_c000
+            } else {
+                0x70_0201_e000
+            };
+            let mut context = [0u8; G17P_COLD_OPENING_QUEUE_CONTEXT_SIZE];
+            apply_g17p_cold_opening_queue_context(stage, descriptor, queue, &mut context).unwrap();
+            assert_eq!(get_u64_le(&context, 0x210), descriptor);
+            assert_eq!(get_u64_le(&context, 0x218), queue);
+            assert!(supplied.contains(&descriptor));
+            assert!(supplied.contains(&queue));
+            assert_eq!(
+                source_fixture_fingerprint(&context),
+                match stage {
+                    G17PColdOpeningStage::Tiling => 0x3379_a6bc_2412_1161,
+                    G17PColdOpeningStage::Fragment => 0x9d66_7001_5e08_aa8d,
+                }
+            );
+        }
+
+        let queue_addresses = G17PColdOpeningQueueAddresses {
+            pointers: 0x70_0200_0000,
+            item_ring: 0x70_0200_4000,
+            job_list: 0x70_0200_8000,
+            channel_control: 0x70_0200_c000,
+        };
+        let mut queue = [0u8; G17P_COLD_OPENING_QUEUE_RECORD_SIZE];
+        apply_g17p_cold_opening_queue_record(queue_addresses, &mut queue).unwrap();
+        for offset in [0x00, 0x08, 0x10, 0x9c] {
+            assert!(supplied.contains(&get_u64_le(&queue, offset)));
+        }
+        assert_eq!(get_u32_le(&queue, 0x48), 0x15);
+        assert_eq!(get_u32_le(&queue, 0x28), 2);
+        assert_eq!(get_u32_le(&queue, 0x40), 2);
+        assert_eq!(source_fixture_fingerprint(&queue), 0xd8d9_be7f_d49a_1f14);
+
+        let mut pointers = [0u8; G17P_COLD_OPENING_POINTER_BLOCK_SIZE];
+        apply_g17p_cold_opening_pointer_block(&mut pointers).unwrap();
+        assert_eq!(get_u32_le(&pointers, 0x50), u32::MAX);
+        assert_eq!(get_u64_le(&pointers, 0x60), 0x500);
+        assert_eq!(source_fixture_fingerprint(&pointers), 0x41b7_257d_6bc8_1cb2);
+
+        let mut descriptor = [0u8; G17P_PARTIAL_OPENING_PAGE_SIZE];
+        apply_g17p_cold_opening_descriptor_overrides(G17PColdOpeningStage::Tiling, &mut descriptor)
+            .unwrap();
+        assert_eq!(get_u32_le(&descriptor, 0x0c), 1);
+        assert_eq!(descriptor[0x0789], 0x08);
+        assert_eq!(&descriptor[0x093e..0x0940], &[0xd0, 0x91]);
+        assert_eq!(
+            source_fixture_fingerprint(&descriptor),
+            0x0a67_4d00_ea32_e630
+        );
+
+        descriptor.fill(0);
+        apply_g17p_cold_opening_descriptor_overrides(
+            G17PColdOpeningStage::Fragment,
+            &mut descriptor,
+        )
+        .unwrap();
+        assert_eq!(
+            source_fixture_fingerprint(&descriptor),
+            0xaac5_6b92_e70a_d459
+        );
+    }
+
+    #[test]
+    fn g17p_cold_opening_operand_graph_is_exact() {
+        let mut table = [0u8; G17P_PARTIAL_OPENING_PAGE_SIZE];
+        apply_g17p_cold_opening_operand_table(&mut table).unwrap();
+        assert_eq!(
+            get_u64_le(&table, 0),
+            (1u64 << 60) | G17P_COLD_OPENING_OPERAND_BUFFER_BASE
+        );
+        assert_eq!(
+            get_u64_le(&table, 27 * 0x40),
+            (1u64 << 60)
+                | (G17P_COLD_OPENING_OPERAND_BUFFER_BASE
+                    + 27 * G17P_COLD_OPENING_OPERAND_BUFFER_STRIDE)
+        );
+        assert!(table[28 * 0x40..].iter().all(|value| *value == 0));
+        assert_eq!(source_fixture_fingerprint(&table), 0x61a7_b063_3bea_e785);
+
+        let mut directory = [0u8; G17P_COLD_OPENING_OPERAND_DIRECTORY_SIZE];
+        apply_g17p_cold_opening_operand_directory(&mut directory).unwrap();
+        assert_eq!(get_u64_le(&directory, 0), 0x70_0022_0000);
+        assert_eq!(get_u64_le(&directory, 255 * 8), 0x70_0031_f000);
+        assert_eq!(get_u64_le(&directory, 256 * 8), 0x70_0032_8000);
+        assert_eq!(get_u64_le(&directory, (7168 - 1) * 8), 0x70_01ef_7000);
+        assert!(directory[7168 * 8..].iter().all(|value| *value == 0));
+        assert_eq!(
+            source_fixture_fingerprint(&directory),
+            0xd5c6_623f_4366_03a5
         );
     }
 
