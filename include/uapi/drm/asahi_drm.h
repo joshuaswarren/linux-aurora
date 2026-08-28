@@ -1167,7 +1167,12 @@ struct drm_asahi_cmd_render {
  * single compute command, although timestamps are at command granularity.
  */
 struct drm_asahi_cmd_compute {
-	/** @flags: MBZ */
+	/**
+	 * @flags: Combination of drm_asahi_compute_flags.
+	 *
+	 * The G17P add3 proof flag is a bring-up-only contract. It treats exactly
+	 * three compute attachments as input A, input B, and output respectively.
+	 */
 	__u32 flags;
 
 	/** @sampler_count: Number of samplers in the sampler heap. */
@@ -1194,6 +1199,17 @@ struct drm_asahi_cmd_compute {
 
 	/** @ts: Timestamps for the compute command */
 	struct drm_asahi_timestamps ts;
+};
+
+/**
+ * enum drm_asahi_compute_flags - Compute command flags
+ */
+enum drm_asahi_compute_flags {
+	/**
+	 * @DRM_ASAHI_COMPUTE_G17P_ADD3_PROOF: Populate the retained G17P
+	 * three-buffer table from this command's three compute attachments.
+	 */
+	DRM_ASAHI_COMPUTE_G17P_ADD3_PROOF = (1L << 0),
 };
 
 /**

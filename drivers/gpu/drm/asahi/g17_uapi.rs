@@ -38,6 +38,12 @@ pub(crate) const UAPI_MAX_ATTACHMENTS: usize = 16;
 pub(crate) const UAPI_MAX_HARDWARE_COMMANDS: u32 = 64;
 pub(crate) const UAPI_BARRIER_NONE: u16 = 0xffff;
 pub(crate) const USC_WINDOW_SIZE: u64 = 1 << 32;
+#[cfg(not(test))]
+pub(crate) const COMPUTE_G17P_ADD3_PROOF: u32 =
+    kernel::uapi::drm_asahi_compute_flags_DRM_ASAHI_COMPUTE_G17P_ADD3_PROOF as u32;
+#[cfg(test)]
+pub(crate) const COMPUTE_G17P_ADD3_PROOF: u32 = 1 << 0;
+const G17P_ADD3_BUFFER_BYTES: u64 = 64 * 4;
 
 const COMMAND_RENDER: u16 = 0;
 const COMMAND_COMPUTE: u16 = 1;
@@ -86,6 +92,7 @@ pub(crate) enum UapiTranslateError {
     SamplerCount,
     SamplerPair,
     HelperProgram,
+    Add3ProofAttachments,
     ProgramOffset,
     ZlsFields,
     StencilClearBits,
@@ -876,6 +883,7 @@ pub(crate) struct TranslatedComputeCommand {
     pub(crate) sampler_heap: u64,
     pub(crate) sampler_count: u32,
     pub(crate) attachments: UapiAttachmentList,
+    pub(crate) g17p_add3_buffers: Option<[u64; 3]>,
     pub(crate) timestamps: UapiTimestamps,
 }
 
@@ -886,7 +894,7 @@ pub(crate) fn translate_compute_command<A: GpuAddressSpace>(
     address_space: &A,
 ) -> Result<TranslatedComputeCommand, UapiTranslateError> {
     queue.validate()?;
-    if command.flags != 0 {
+    if command.flags & !COMPUTE_G17P_ADD3_PROOF != 0 {
         return Err(UapiTranslateError::Flags);
     }
     if command.control_stream_base & 3 != 0
@@ -911,7 +919,38 @@ pub(crate) fn translate_compute_command<A: GpuAddressSpace>(
     {
         return Err(UapiTranslateError::HelperProgram);
     }
-    validate_attachments(address_space, &attachments)?;
+    let g17p_add3_buffers = if command.flags & COMPUTE_G17P_ADD3_PROOF != 0 {
+        let entries = attachments.as_slice();
+        if entries.len() != 3
+            || entries
+                .iter()
+                .any(|entry| entry.size < G17P_ADD3_BUFFER_BYTES)
+        {
+            return Err(UapiTranslateError::Add3ProofAttachments);
+        }
+        require_range(
+            address_space,
+            entries[0].address,
+            G17P_ADD3_BUFFER_BYTES,
+            GpuAccess::Read,
+        )?;
+        require_range(
+            address_space,
+            entries[1].address,
+            G17P_ADD3_BUFFER_BYTES,
+            GpuAccess::Read,
+        )?;
+        require_range(
+            address_space,
+            entries[2].address,
+            G17P_ADD3_BUFFER_BYTES,
+            GpuAccess::Write,
+        )?;
+        Some([entries[0].address, entries[1].address, entries[2].address])
+    } else {
+        validate_attachments(address_space, &attachments)?;
+        None
+    };
     Ok(TranslatedComputeCommand {
         usc_exec_base: queue.base,
         control_stream_base: command.control_stream_base,
@@ -920,6 +959,7 @@ pub(crate) fn translate_compute_command<A: GpuAddressSpace>(
         sampler_heap: command.sampler_heap,
         sampler_count: command.sampler_count,
         attachments,
+        g17p_add3_buffers,
         timestamps: command.timestamps,
     })
 }
@@ -1288,6 +1328,7 @@ mod tests {
         assert_eq!(translated.control_stream_end, 0x1_0040);
         assert_eq!(translated.control_stream_terminator, 0x1_003c);
         assert_eq!(translated.usc_exec_base, 0x11_0000_0000);
+        assert_eq!(translated.g17p_add3_buffers, None);
         assert_eq!(
             translated.attachments.as_slice(),
             &[UapiAttachment {
@@ -1392,6 +1433,50 @@ mod tests {
         assert_eq!(completed_compute_timestamps(0, 9), None);
         assert_eq!(completed_compute_timestamps(7, 0), None);
         assert_eq!(completed_compute_timestamps(7, 9), Some([7, 9]));
+    }
+
+    #[test]
+    fn add3_proof_maps_exactly_three_buffers_into_the_retained_table() {
+        let mut parser = UapiCommandParser::new(&COMPUTE_FIXTURE);
+        let (mut payload, _) = match parser.next_hardware().unwrap().unwrap() {
+            ParsedHardwareCommand::Compute {
+                payload,
+                attachments,
+                ..
+            } => (payload, attachments),
+            _ => panic!("wrong command kind"),
+        };
+        payload.flags = COMPUTE_G17P_ADD3_PROOF;
+        let mut attachments = UapiAttachmentList::EMPTY;
+        attachments.entries[..3].copy_from_slice(&[
+            UapiAttachment {
+                address: 0x3_0000,
+                size: G17P_ADD3_BUFFER_BYTES,
+            },
+            UapiAttachment {
+                address: 0x3_8000,
+                size: G17P_ADD3_BUFFER_BYTES,
+            },
+            UapiAttachment {
+                address: 0x4_0000,
+                size: G17P_ADD3_BUFFER_BYTES,
+            },
+        ]);
+        attachments.count = 3;
+
+        let translated =
+            translate_compute_command(payload, attachments, window(), &TestAddressSpace).unwrap();
+        assert_eq!(
+            translated.g17p_add3_buffers,
+            Some([0x3_0000, 0x3_8000, 0x4_0000])
+        );
+
+        let mut short = attachments;
+        short.entries[2].size = G17P_ADD3_BUFFER_BYTES - 1;
+        assert_eq!(
+            translate_compute_command(payload, short, window(), &TestAddressSpace),
+            Err(UapiTranslateError::Add3ProofAttachments)
+        );
     }
 
     #[test]
