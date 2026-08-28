@@ -1838,6 +1838,43 @@ impl Uat {
         Ok(())
     }
 
+    /// Restore the cold T8140 context table after both firmware processors stop.
+    ///
+    /// The caller must first drop every active [`VmBind`]. Existing user VMs
+    /// and their page tables remain allocated; a later bind can install the
+    /// same VM into slot 1 again.
+    pub(crate) fn restore_t8140_bootstrap_roots_after_processor_stop(&self) -> Result {
+        if self.cfg != UatConfig::T8140 {
+            return Err(EINVAL);
+        }
+        let low = self.kernel_lower_vm.ttb();
+        let source_high = self.kernel_vm.ttb();
+        let inner = self.inner.lock();
+        inner.handoff().lock();
+        let ttbs = inner.ttbs();
+        ttbs[0].ttb0.store(low | TTBR_VALID, Ordering::Release);
+        ttbs[0]
+            .ttb1
+            .store(source_high | TTBR_VALID, Ordering::Release);
+        ttbs[1].ttb0.store(
+            low | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT),
+            Ordering::Release,
+        );
+        ttbs[1].ttb1.store(
+            source_high | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT),
+            Ordering::Release,
+        );
+        self.t8140_context_phase
+            .store(T8140_CONTEXT_BOOTSTRAP_SOURCE_HIGH, Ordering::Release);
+        inner.handoff().unlock();
+        core::mem::drop(inner);
+
+        mem::tlbi_asid(0);
+        mem::tlbi_asid(1);
+        mem::sync();
+        Ok(())
+    }
+
     /// Binds a `Vm` to a slot, preferring the last used one.
     pub(crate) fn bind(&self, vm: &Vm) -> Result<VmBind> {
         let mut binding = vm.binding.lock();

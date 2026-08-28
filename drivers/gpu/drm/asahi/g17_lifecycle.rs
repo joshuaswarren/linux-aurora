@@ -106,8 +106,10 @@ pub(crate) trait PersistentRuntimeRecovery {
     fn stop_cpu_pair(&mut self) -> Result<(), Self::Error>;
     fn drop_gfx1_rtkit(&mut self);
     fn drop_gfx_rtkit(&mut self);
+    /// Disable the hardware-visible SKSM queue while retaining its storage.
+    fn disable_sksm_queue(&mut self) -> Result<(), Self::Error>;
     /// Drop per-session queue and render state while retaining manager/UAT.
-    fn release_runtime_objects(&mut self) -> Result<(), Self::Error>;
+    fn release_runtime_objects(&mut self);
     /// Restore initdata and transports on the retained manager/UAT.
     fn rebuild_session_in_place(&mut self) -> Result<(), Self::Error>;
     fn resume_submissions(&mut self);
@@ -121,7 +123,8 @@ pub(crate) fn recover_persistent_runtime<T: PersistentRuntimeRecovery>(
     owner.stop_cpu_pair()?;
     owner.drop_gfx1_rtkit();
     owner.drop_gfx_rtkit();
-    owner.release_runtime_objects()?;
+    owner.disable_sksm_queue()?;
+    owner.release_runtime_objects();
     owner.rebuild_session_in_place()?;
     owner.resume_submissions();
     Ok(())
@@ -202,6 +205,7 @@ mod tests {
         DropManager,
         PauseSubmissions,
         StopCpuPair,
+        DisableSksmQueue,
         ReleaseRuntimeObjects,
         RebuildSessionInPlace,
         ResumeSubmissions,
@@ -216,7 +220,7 @@ mod tests {
         StopGfx,
         StopPair,
         RebuildSession,
-        ReleaseRuntime,
+        DisableSksm,
     }
 
     #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -228,7 +232,7 @@ mod tests {
         StopGfx,
         StopPair,
         RebuildSession,
-        ReleaseRuntime,
+        DisableSksm,
     }
 
     struct State {
@@ -600,13 +604,17 @@ mod tests {
             self.trace.push(Event::DropGfxRtkit);
         }
 
-        fn release_runtime_objects(&mut self) -> Result<(), Self::Error> {
-            self.trace.push(Event::ReleaseRuntimeObjects);
-            if self.failure == Some(Failure::ReleaseRuntime) {
-                Err(TestError::ReleaseRuntime)
+        fn disable_sksm_queue(&mut self) -> Result<(), Self::Error> {
+            self.trace.push(Event::DisableSksmQueue);
+            if self.failure == Some(Failure::DisableSksm) {
+                Err(TestError::DisableSksm)
             } else {
                 Ok(())
             }
+        }
+
+        fn release_runtime_objects(&mut self) {
+            self.trace.push(Event::ReleaseRuntimeObjects);
         }
 
         fn rebuild_session_in_place(&mut self) -> Result<(), Self::Error> {
@@ -640,6 +648,7 @@ mod tests {
                 Event::StopCpuPair,
                 Event::DropGfx1Rtkit,
                 Event::DropGfxRtkit,
+                Event::DisableSksmQueue,
                 Event::ReleaseRuntimeObjects,
                 Event::RebuildSessionInPlace,
                 Event::ResumeSubmissions,
@@ -679,6 +688,7 @@ mod tests {
                 Event::StopCpuPair,
                 Event::DropGfx1Rtkit,
                 Event::DropGfxRtkit,
+                Event::DisableSksmQueue,
                 Event::ReleaseRuntimeObjects,
                 Event::RebuildSessionInPlace,
             ]
@@ -686,15 +696,15 @@ mod tests {
     }
 
     #[test]
-    fn runtime_object_release_error_does_not_start_a_new_session() {
+    fn sksm_disable_error_keeps_queue_and_graph_storage_alive() {
         let mut owner = MockRuntimeRecovery {
-            failure: Some(Failure::ReleaseRuntime),
+            failure: Some(Failure::DisableSksm),
             trace: std::vec::Vec::new(),
             manager_uat_id: 0x9000_0000,
         };
         assert_eq!(
             recover_persistent_runtime(&mut owner),
-            Err(TestError::ReleaseRuntime)
+            Err(TestError::DisableSksm)
         );
         assert_eq!(
             owner.trace,
@@ -703,7 +713,7 @@ mod tests {
                 Event::StopCpuPair,
                 Event::DropGfx1Rtkit,
                 Event::DropGfxRtkit,
-                Event::ReleaseRuntimeObjects,
+                Event::DisableSksmQueue,
             ]
         );
     }
