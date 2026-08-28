@@ -400,8 +400,11 @@ static void dcp_link_handle_callback(struct apple_dcp *dcp, u64 message)
 
 	ret = apple_dcp_link_stream_layout(APPLE_DCP_LINK_SIDE_AP, stream, true,
 					   &layout);
-	if (ret)
+	if (ret) {
+		dcp_send_message(dcp, APPLE_DCP_LINK_ENDPOINT,
+				 apple_dcp_link_rpc_reply(message));
 		return;
+	}
 	dma_rmb();
 	ret = apple_dcp_link_rpc_decode(message,
 					dcp->shmem + layout.remote_offset,
@@ -409,6 +412,8 @@ static void dcp_link_handle_callback(struct apple_dcp *dcp, u64 message)
 	if (ret) {
 		dev_warn(dcp->dev, "DCPLink callback could not be decoded: %d\n",
 			 ret);
+		dcp_send_message(dcp, APPLE_DCP_LINK_ENDPOINT,
+				 apple_dcp_link_rpc_reply(message));
 		return;
 	}
 
@@ -429,6 +434,8 @@ static void dcp_link_handle_callback(struct apple_dcp *dcp, u64 message)
 	if (tag < 0 || tag >= IOMFB_MAX_CB) {
 		dev_warn(dcp->dev, "DCPLink callback tag %#x is invalid\n",
 			 view.call);
+		dcp_send_message(dcp, APPLE_DCP_LINK_ENDPOINT,
+				 apple_dcp_link_rpc_reply(message));
 		return;
 	}
 
