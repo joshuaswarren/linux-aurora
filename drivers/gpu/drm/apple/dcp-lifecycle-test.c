@@ -44,18 +44,40 @@ static void apple_dcp_zero_status_is_active_test(struct kunit *test)
 static void apple_dcp_j700_adoption_test(struct kunit *test)
 {
 	KUNIT_EXPECT_EQ(test,
-		apple_dcp_coprocessor_start_mode(false, true, 0x10, 0x6d),
+		apple_dcp_coprocessor_start_mode(APPLE_DCP_LOADER_HANDOFF_NONE,
+						 true, 0x10, 0x6d),
 		APPLE_DCP_COPROCESSOR_ADOPT_AND_RESTART);
 	KUNIT_EXPECT_EQ(test,
-		apple_dcp_coprocessor_start_mode(false, true, 0x10, 0x6c),
+		apple_dcp_coprocessor_start_mode(APPLE_DCP_LOADER_HANDOFF_NONE,
+						 true, 0x10, 0x6c),
 		APPLE_DCP_COPROCESSOR_ADOPT_AND_RESTART);
 }
 
 static void apple_dcp_j700_quiesced_handoff_test(struct kunit *test)
 {
 	KUNIT_EXPECT_EQ(test,
-		apple_dcp_coprocessor_start_mode(true, true, 0x10, 0x6d),
+		apple_dcp_coprocessor_start_mode(
+			APPLE_DCP_LOADER_HANDOFF_RTKIT_QUIESCED,
+			true, 0x10, 0x6d),
 		APPLE_DCP_COPROCESSOR_QUIESCED_RESTART);
+}
+
+static void apple_dcp_j700_idle_handoff_test(struct kunit *test)
+{
+	KUNIT_EXPECT_EQ(test,
+		apple_dcp_coprocessor_start_mode(
+			APPLE_DCP_LOADER_HANDOFF_RTKIT_IDLE,
+			true, 0x10, 0x6d),
+		APPLE_DCP_COPROCESSOR_IDLE_RESTART);
+}
+
+static void apple_dcp_j700_stopped_handoff_test(struct kunit *test)
+{
+	KUNIT_EXPECT_EQ(test,
+		apple_dcp_coprocessor_start_mode(
+			APPLE_DCP_LOADER_HANDOFF_ASC_STOPPED,
+			true, 0, 0x68),
+		APPLE_DCP_COPROCESSOR_ASC_STOPPED_RESTART);
 }
 
 static void apple_dcp_cold_start_selection_test(struct kunit *test)
@@ -63,10 +85,12 @@ static void apple_dcp_cold_start_selection_test(struct kunit *test)
 	u32 stopped = APPLE_DCP_COPROC_CPU_STATUS_STOPPED;
 
 	KUNIT_EXPECT_EQ(test,
-		apple_dcp_coprocessor_start_mode(false, true, 0, stopped),
+		apple_dcp_coprocessor_start_mode(APPLE_DCP_LOADER_HANDOFF_NONE,
+						 true, 0, stopped),
 		APPLE_DCP_COPROCESSOR_COLD_START);
 	KUNIT_EXPECT_EQ(test,
-		apple_dcp_coprocessor_start_mode(false, false, 0x10, 0x6d),
+		apple_dcp_coprocessor_start_mode(APPLE_DCP_LOADER_HANDOFF_NONE,
+						 false, 0x10, 0x6d),
 		APPLE_DCP_COPROCESSOR_COLD_START);
 }
 
@@ -78,6 +102,8 @@ static struct kunit_case apple_dcp_lifecycle_test_cases[] = {
 	KUNIT_CASE(apple_dcp_zero_status_is_active_test),
 	KUNIT_CASE(apple_dcp_j700_adoption_test),
 	KUNIT_CASE(apple_dcp_j700_quiesced_handoff_test),
+	KUNIT_CASE(apple_dcp_j700_idle_handoff_test),
+	KUNIT_CASE(apple_dcp_j700_stopped_handoff_test),
 	KUNIT_CASE(apple_dcp_cold_start_selection_test),
 	{}
 };

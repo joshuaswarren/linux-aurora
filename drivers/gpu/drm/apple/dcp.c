@@ -46,6 +46,8 @@
 #define APPLE_DCP_COPROC_CPU_CONTROL	 0x44
 #define APPLE_DCP_COPROC_CPU_STATUS	 0x48
 #define APPLE_DCP_RTKIT_HANDOFF_PROPERTY "apple,dcp-rtkit-quiesced"
+#define APPLE_DCP_RTKIT_IDLE_PROPERTY	 "apple,dcp-rtkit-idle"
+#define APPLE_DCP_ASC_STOPPED_PROPERTY	 "apple,dcp-asc-stopped"
 
 #define DCP_BOOT_TIMEOUT msecs_to_jiffies(1000)
 
@@ -994,9 +996,10 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	struct device_node *panel_np;
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 	enum apple_dcp_coprocessor_start start_mode;
+	enum apple_dcp_loader_handoff loader_handoff;
 	u32 cpu_ctrl, cpu_status;
-	u32 handoff_state;
-	bool loader_quiesced;
+	u32 quiesced_state = 0, idle_state = 0, stopped_state = 0;
+	bool loader_quiesced, loader_idle, loader_stopped;
 	int ret;
 
 	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(42));
@@ -1011,13 +1014,30 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 				 APPLE_DCP_COPROC_CPU_CONTROL);
 	cpu_status = readl_relaxed(dcp->coproc_reg +
 				   APPLE_DCP_COPROC_CPU_STATUS);
-	loader_quiesced = of_chosen &&
-		!of_property_read_u32(of_chosen,
-				      APPLE_DCP_RTKIT_HANDOFF_PROPERTY,
-				      &handoff_state) &&
-		handoff_state == 1;
+	if (of_chosen) {
+		of_property_read_u32(of_chosen,
+				     APPLE_DCP_RTKIT_HANDOFF_PROPERTY,
+				     &quiesced_state);
+		of_property_read_u32(of_chosen, APPLE_DCP_RTKIT_IDLE_PROPERTY,
+				     &idle_state);
+		of_property_read_u32(of_chosen, APPLE_DCP_ASC_STOPPED_PROPERTY,
+				     &stopped_state);
+	}
+	loader_quiesced = quiesced_state == 1;
+	loader_idle = idle_state == 1;
+	loader_stopped = stopped_state == 1;
+	if (loader_quiesced + loader_idle + loader_stopped > 1)
+		dev_warn(dev, "multiple DCP loader states; using the lowest-level state\n");
+	if (loader_stopped)
+		loader_handoff = APPLE_DCP_LOADER_HANDOFF_ASC_STOPPED;
+	else if (loader_idle)
+		loader_handoff = APPLE_DCP_LOADER_HANDOFF_RTKIT_IDLE;
+	else if (loader_quiesced)
+		loader_handoff = APPLE_DCP_LOADER_HANDOFF_RTKIT_QUIESCED;
+	else
+		loader_handoff = APPLE_DCP_LOADER_HANDOFF_NONE;
 	start_mode = apple_dcp_coprocessor_start_mode(
-		loader_quiesced, dcp->hw.adopt_running_coprocessor,
+		loader_handoff, dcp->hw.adopt_running_coprocessor,
 		cpu_ctrl, cpu_status);
 
 	of_property_read_u32(dev->of_node, "apple,dcp-index",
@@ -1128,6 +1148,11 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	} else {
 		if (start_mode == APPLE_DCP_COPROCESSOR_QUIESCED_RESTART)
 			dev_info(dev, "restarting loader-quiesced DCP session\n");
+		else if (start_mode == APPLE_DCP_COPROCESSOR_IDLE_RESTART)
+			dev_info(dev, "restarting loader-idled DCP session\n");
+		else if (start_mode == APPLE_DCP_COPROCESSOR_ASC_STOPPED_RESTART)
+			dev_info(dev,
+				 "starting fresh DCP session after loader stopped ASCWrap v6\n");
 		dcp->rtk = devm_apple_rtkit_init(dev, dcp, "mbox", 0,
 						   &rtkit_ops);
 		if (IS_ERR(dcp->rtk))
