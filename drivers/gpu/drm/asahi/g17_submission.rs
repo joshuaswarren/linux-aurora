@@ -38,8 +38,8 @@
 //! MMIO scratch registers. The host publication form, runtime scratch geometry,
 //! and resource-0 ordered writer are implemented. J700 has completed the
 //! channel-doorbell round trip with exact compute output across a retained CL2
-//! queue. Linux still needs the completion IRQ ingress. See
-//! [`SUBMISSION_LIVE_GAPS`].
+//! queue. The native graphics `addKicks` round trip and Linux completion IRQ
+//! ingress still need their on-device proofs. See [`SUBMISSION_LIVE_GAPS`].
 
 #[cfg(not(test))]
 use crate::g17_manager::G17SksmScratchGeometry;
@@ -1701,6 +1701,10 @@ pub(crate) const G17P_SKSM_QUEUE_ENTRY_ADDRESS_MASK: u64 = 0x0000_07ff_ffff_ffe0
 /// Fixed portion of the first G17P queue-configuration store.
 const G17P_SKSM_QUEUE_CONFIG_TAG: u64 = 0x0000_0400_0002_1008;
 const G17P_SKSM_QUEUE_COMPLETION_SELECTOR_MAX: u32 = 4;
+/// `_AGFIDataMasterType` selected by the G17P TA channel.
+pub(crate) const G17P_TA_DATA_MASTER: u32 = 0;
+/// `_AGFIDataMasterType` selected by the G17P 3D channel.
+pub(crate) const G17P_3D_DATA_MASTER: u32 = 1;
 /// `_AGFIDataMasterType` selected by `AGXCommandQueue::processComputeSetup`.
 pub(crate) const G17P_COMPUTE_DATA_MASTER: u32 = 2;
 
@@ -2180,8 +2184,12 @@ pub(crate) struct SubmissionLiveGaps {
     /// Linux has an ordered pair writer on resource 0, including fixed-slot
     /// geometry and serialization across queue owners.
     pub(crate) sksm_resource0_ordered_write_implemented: bool,
-    /// The kick -> execute -> completion IRQ handshake is a live event.
-    pub(crate) doorbell_round_trip_proven: bool,
+    /// EP 0x21 plus the retained CL2 channel queue has executed real work.
+    pub(crate) channel_doorbell_round_trip_proven: bool,
+    /// A native SKSM queue entry followed by the host `addKicks` MMIO pair has
+    /// executed real work. Graphics requires this producer even though the
+    /// classic channel doorbell has independently executed CL work.
+    pub(crate) sksm_add_kicks_round_trip_proven: bool,
     /// Apple's host builds platform interrupt event sources from runtime
     /// `interrupts`/`interrupts-valid` properties. D93AP physical IRQ 1001 and
     /// RTBuddy AKF type 2 both converge exactly on source 4 and drain the main
@@ -2194,7 +2202,8 @@ impl SubmissionLiveGaps {
     /// True only if every live gap is closed.
     pub(crate) const fn all_proven(&self) -> bool {
         self.sksm_resource0_ordered_write_implemented
-            && self.doorbell_round_trip_proven
+            && self.channel_doorbell_round_trip_proven
+            && self.sksm_add_kicks_round_trip_proven
             && self.completion_irq_route_proven
     }
 }
@@ -2202,10 +2211,12 @@ impl SubmissionLiveGaps {
 /// The host-side writer is implemented. The channel-doorbell execution result
 /// comes from `20260827-g17p-compact-contract-queue-live12`: exact 64-float
 /// add3 output, then two more submissions on the same CL2 queue at queue and
-/// channel counters 6/6/6 and 9/9/9. Linux completion IRQ handling remains.
+/// channel counters 6/6/6 and 9/9/9. That does not prove the separate native
+/// SKSM `addKicks` FIFO used by the shipping graphics channels.
 pub(crate) const SUBMISSION_LIVE_GAPS: SubmissionLiveGaps = SubmissionLiveGaps {
     sksm_resource0_ordered_write_implemented: true,
-    doorbell_round_trip_proven: true,
+    channel_doorbell_round_trip_proven: true,
+    sksm_add_kicks_round_trip_proven: false,
     completion_irq_route_proven: false,
 };
 
@@ -3561,6 +3572,8 @@ mod tests {
 
     #[test]
     fn g17p_compute_queue_matches_the_captured_native_cl2_tuple() {
+        assert_eq!(G17P_TA_DATA_MASTER, 0);
+        assert_eq!(G17P_3D_DATA_MASTER, 1);
         assert_eq!(G17P_COMPUTE_DATA_MASTER, 2);
 
         let config = prepare_g17p_compute_sksm_queue_config(
@@ -4060,14 +4073,16 @@ mod tests {
         assert!(!EXECUTABLE_SUBMISSION_TRANSPORT_AVAILABLE);
         assert!(!SUBMISSION_LIVE_GAPS.all_proven());
         assert!(SUBMISSION_LIVE_GAPS.sksm_resource0_ordered_write_implemented);
-        assert!(SUBMISSION_LIVE_GAPS.doorbell_round_trip_proven);
+        assert!(SUBMISSION_LIVE_GAPS.channel_doorbell_round_trip_proven);
+        assert!(!SUBMISSION_LIVE_GAPS.sksm_add_kicks_round_trip_proven);
         assert!(!SUBMISSION_LIVE_GAPS.completion_irq_route_proven);
 
         // A hypothetical all-proven set would flip the executable signal — the
         // gate is wired to the evidence, not hard-coded.
         let proven = SubmissionLiveGaps {
             sksm_resource0_ordered_write_implemented: true,
-            doorbell_round_trip_proven: true,
+            channel_doorbell_round_trip_proven: true,
+            sksm_add_kicks_round_trip_proven: true,
             completion_irq_route_proven: true,
         };
         assert!(proven.all_proven());
