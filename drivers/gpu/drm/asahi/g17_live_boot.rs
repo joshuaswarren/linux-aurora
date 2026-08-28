@@ -202,6 +202,7 @@ pub(crate) struct G17PLiveRuntime {
     gfx1_rtkit: Option<rtkit::RtKit<G17PRtkitOps>>,
     queue: Option<g17_manager::G17PSksmQueue>,
     completion_indices: g17_completion::QueueIndices,
+    render_tracker: Option<g17_manager::G17PPartialOpeningRenderTracker>,
 }
 
 impl G17PLiveRuntime {
@@ -331,6 +332,7 @@ impl G17PLiveRuntime {
         fsleep(Delta::from_millis(12));
         Pin::new(&mut gfx1_rtkit)
             .send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, control_start)?;
+        manager.prepare_partial_opening_control_done()?;
         let control_done = ((CONTROL_DONE_TYPE as u64) << 48) | CONTROL_DONE_CHANNEL;
         Pin::new(&mut gfx_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, control_done)?;
         fsleep(Delta::from_millis(10));
@@ -362,7 +364,54 @@ impl G17PLiveRuntime {
                 read: 0,
                 write: 0,
             },
+            render_tracker: None,
         })
+    }
+
+    /// Publish first graphics in the measured 3D/TA order and send its one
+    /// pair-two/channel-8 work notification through the retained primary
+    /// RTKit endpoint.
+    pub(crate) fn submit_partial_opening_render<F>(
+        &mut self,
+        submission: g17_manager::G17PPartialOpeningRenderSubmission,
+        publish_late_tiling_state: F,
+    ) -> Result
+    where
+        F: FnOnce() -> Result,
+    {
+        if self.render_tracker.is_some() {
+            return Err(EBUSY);
+        }
+        let manager = self.manager.as_mut().ok_or(ENODEV)?;
+        let gfx_rtkit = self.gfx_rtkit.as_mut().ok_or(ENODEV)?;
+        let (tracker, prepared) =
+            manager.submit_partial_opening_render(submission, publish_late_tiling_state)?;
+        Pin::new(gfx_rtkit)
+            .send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, prepared.paired_doorbell)?;
+        self.render_tracker = Some(tracker);
+        Ok(())
+    }
+
+    /// Consume queue progress together with the scheduler job-list state and
+    /// the two four-word timestamp sets required for execution completion.
+    pub(crate) fn observe_partial_opening_render_completion(
+        &mut self,
+        tiling_current: g17_completion::QueueIndices,
+        fragment_current: g17_completion::QueueIndices,
+        execution: g17_completion::RenderExecutionState,
+    ) -> Result<g17_completion::PairedRenderCompletion> {
+        let manager = self.manager.as_ref().ok_or(ENODEV)?;
+        let tracker = self.render_tracker.as_mut().ok_or(ENODEV)?;
+        let completion = manager.observe_partial_opening_render_completion(
+            tracker,
+            tiling_current,
+            fragment_current,
+            execution,
+        )?;
+        if completion.complete {
+            self.render_tracker = None;
+        }
+        Ok(completion)
     }
 
     /// Apply one selector-2 completion report to the retained compute queue.

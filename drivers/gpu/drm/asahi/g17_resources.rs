@@ -13,13 +13,13 @@ use kernel::prelude::*;
 #[cfg(not(test))]
 use crate::g17_initdata;
 #[cfg(not(test))]
-use crate::{driver::AsahiDevice, g17_compute, gem, mmu};
-#[cfg(test)]
-#[path = "g17_initdata.rs"]
-mod g17_initdata;
+use crate::{driver::AsahiDevice, g17_compute, g17_submission, gem, mmu};
 #[cfg(test)]
 #[path = "g17_compute.rs"]
 mod g17_compute;
+#[cfg(test)]
+#[path = "g17_initdata.rs"]
+mod g17_initdata;
 
 #[cfg(not(test))]
 use core::ops::Range;
@@ -76,6 +76,17 @@ pub(crate) struct G17ResourceHandoff {
     pub(crate) shared: SharedAddresses,
     pub(crate) primary: RoleResourceBinding,
     pub(crate) secondary: RoleResourceBinding,
+}
+
+/// Exact first-graphics objects retained by the T8140 resource owner.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PPartialOpeningResourceBinding {
+    pub(crate) kernel_va_base: u64,
+    pub(crate) scheduler_page: u64,
+    pub(crate) primary_index_page: u64,
+    pub(crate) fwctl: u64,
+    pub(crate) tiling_channel: g17_initdata::ChannelEntry,
+    pub(crate) fragment_channel: g17_initdata::ChannelEntry,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -252,6 +263,31 @@ impl MappedObject {
             core::slice::from_raw_parts_mut(vmap.as_mut_ptr(), self.logical_size)
         };
         f(bytes)
+    }
+
+    fn read_u32(&mut self, address: u64) -> Result<u32> {
+        let offset = address.checked_sub(self.iova()).ok_or(EINVAL)? as usize;
+        let end = offset.checked_add(4).ok_or(EINVAL)?;
+        if end > self.logical_size {
+            return Err(EINVAL);
+        }
+        self.with_bytes_mut(|bytes| {
+            Ok(u32::from_le_bytes(
+                bytes[offset..end].try_into().map_err(|_| EINVAL)?,
+            ))
+        })
+    }
+
+    fn write_at(&mut self, address: u64, body: &[u8]) -> Result {
+        let offset = address.checked_sub(self.iova()).ok_or(EINVAL)? as usize;
+        let end = offset.checked_add(body.len()).ok_or(EINVAL)?;
+        if end > self.logical_size {
+            return Err(EINVAL);
+        }
+        self.with_bytes_mut(|bytes| {
+            bytes[offset..end].copy_from_slice(body);
+            Ok(())
+        })
     }
 
     fn map_alias_at(
@@ -482,8 +518,7 @@ impl G17PComputeDescriptorStorage {
             raw[0x00..0x08].copy_from_slice(&scheduler_state.to_le_bytes());
             raw[0x100..0x108].copy_from_slice(&(scheduler_state + 4).to_le_bytes());
             raw[0x110..0x114].copy_from_slice(&0x50u32.to_le_bytes());
-            raw[mmu::UAT_PGSZ + 4..mmu::UAT_PGSZ + 8]
-                .copy_from_slice(&1u32.to_le_bytes());
+            raw[mmu::UAT_PGSZ + 4..mmu::UAT_PGSZ + 8].copy_from_slice(&1u32.to_le_bytes());
             Ok(())
         })?;
         let mut queue_graph = MappedObject::new(
@@ -495,13 +530,9 @@ impl G17PComputeDescriptorStorage {
         )?;
         let queue_graph_gpu_va = queue_graph.iova();
         queue_graph.with_bytes_mut(|raw| {
-            g17_compute::build_compute_queue_graph(
-                queue_graph_gpu_va,
-                channel_control_gpu_va,
-                raw,
-            )
-            .map(|_| ())
-            .map_err(|_| EINVAL)
+            g17_compute::build_compute_queue_graph(queue_graph_gpu_va, channel_control_gpu_va, raw)
+                .map(|_| ())
+                .map_err(|_| EINVAL)
         })?;
 
         Ok(Self {
@@ -575,7 +606,6 @@ impl G17PComputeDescriptorStorage {
         self.descriptors
             .with_bytes_mut(|raw| f(&mut raw[offset..end]))
     }
-
 }
 
 #[cfg(not(test))]
@@ -676,10 +706,7 @@ impl G17PClRuntimeStorage {
         };
         let support_state = unsafe {
             // SAFETY: every VMap covers its complete 16 KiB object.
-            core::slice::from_raw_parts_mut(
-                support_state.as_mut_ptr(),
-                G17P_CL_SUPPORT_STATE_SIZE,
-            )
+            core::slice::from_raw_parts_mut(support_state.as_mut_ptr(), G17P_CL_SUPPORT_STATE_SIZE)
         };
         let scheduler_state = unsafe {
             // SAFETY: every VMap covers its complete 16 KiB object.
@@ -723,6 +750,8 @@ impl G17PClRuntimeStorage {
 #[cfg(not(test))]
 #[allow(dead_code)]
 struct G17MappedResources {
+    partial_scheduler: MappedObject,
+    partial_primary_index: MappedObject,
     roots: MappedObject,
     shared_cluster: MappedObject,
     region_a: MappedObject,
@@ -756,6 +785,7 @@ pub(crate) struct G17ResourceOwner {
     handoff: G17ResourceHandoff,
     resources: G17MappedResources,
     address_space: G17UatOwner,
+    kernel_va_base: u64,
 }
 
 #[cfg(not(test))]
@@ -764,6 +794,38 @@ impl G17ResourceOwner {
     pub(crate) fn new(dev: &AsahiDevice) -> Result<Self> {
         let uat = KBox::new(mmu::Uat::new_t8140(dev, true)?, GFP_KERNEL)?;
         let address_space = G17UatOwner { uat };
+
+        let kernel_va_base = address_space.uat.kernel_va_range()?.start;
+        let fwctl_gpu_va = kernel_va_base
+            .checked_add(g17_submission::G17P_PARTIAL_OPENING_FWCTL_OFFSET)
+            .ok_or(EINVAL)?;
+        let mut partial_scheduler = MappedObject::new_at(
+            dev,
+            address_space.uat.kernel_vm(),
+            g17_submission::G17P_PARTIAL_OPENING_SCHEDULER_GPU_VA,
+            g17_submission::G17P_PARTIAL_OPENING_PAGE_SIZE,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        partial_scheduler.with_bytes_mut(|bytes| {
+            g17_submission::apply_g17p_partial_opening_scheduler_page(bytes).map_err(|_| EINVAL)
+        })?;
+        let mut partial_primary_index = MappedObject::new_at(
+            dev,
+            address_space.uat.kernel_lower_vm(),
+            g17_submission::G17P_PARTIAL_OPENING_PRIMARY_INDEX_GPU_VA,
+            g17_submission::G17P_PARTIAL_OPENING_PAGE_SIZE,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        partial_primary_index.with_bytes_mut(|bytes| {
+            g17_submission::apply_g17p_partial_opening_primary_index_page(bytes).map_err(|_| EINVAL)
+        })?;
+        let fwctl = MappedObject::new_at(
+            dev,
+            address_space.uat.kernel_vm(),
+            fwctl_gpu_va,
+            FWCTL_SIZE,
+            mmu::PROT_FW_SHARED_RW,
+        )?;
 
         let mut roots = MappedObject::new(
             dev,
@@ -828,13 +890,6 @@ impl G17ResourceOwner {
             mmu::UAT_PGSZ,
             mmu::PROT_FW_SHARED_RW,
         )?;
-        let fwctl = MappedObject::new(
-            dev,
-            &address_space.uat,
-            FWCTL_SIZE,
-            mmu::UAT_PGSZ as u64,
-            mmu::PROT_FW_SHARED_RW,
-        )?;
         let register_windows = map_t8140_register_windows(&address_space.uat)?;
         let primary_b2_sentinel = MappedObject::new_at(
             dev,
@@ -868,8 +923,7 @@ impl G17ResourceOwner {
             .into_iter()
             .enumerate()
             {
-                bytes[0x20 + index * 4..0x24 + index * 4]
-                    .copy_from_slice(&value.to_le_bytes());
+                bytes[0x20 + index * 4..0x24 + index * 4].copy_from_slice(&value.to_le_bytes());
             }
             Ok(())
         })?;
@@ -987,6 +1041,8 @@ impl G17ResourceOwner {
         Ok(Self {
             handoff,
             resources: G17MappedResources {
+                partial_scheduler,
+                partial_primary_index,
                 roots,
                 shared_cluster,
                 region_a,
@@ -1005,6 +1061,7 @@ impl G17ResourceOwner {
                 register_windows,
             },
             address_space,
+            kernel_va_base,
         })
     }
 
@@ -1014,6 +1071,143 @@ impl G17ResourceOwner {
 
     pub(crate) fn uat(&self) -> &mmu::Uat {
         &self.address_space.uat
+    }
+
+    pub(crate) fn partial_opening_binding(&self) -> G17PPartialOpeningResourceBinding {
+        let channels = g17_initdata::derive_channel_table(
+            InstanceRole::Primary,
+            self.handoff.primary.state_grid,
+            self.handoff.primary.instance.status_a,
+            self.handoff.primary.instance.main_config,
+            self.handoff.shared.hw_data_bundle,
+        );
+        G17PPartialOpeningResourceBinding {
+            kernel_va_base: self.kernel_va_base,
+            scheduler_page: self.resources.partial_scheduler.iova(),
+            primary_index_page: self.resources.partial_primary_index.iova(),
+            fwctl: self.resources.fwctl.iova(),
+            tiling_channel: channels
+                [g17_submission::G17P_PARTIAL_OPENING_TILING_CHANNEL_TABLE_INDEX as usize],
+            fragment_channel: channels
+                [g17_submission::G17P_PARTIAL_OPENING_FRAGMENT_CHANNEL_TABLE_INDEX as usize],
+        }
+    }
+
+    /// Present the measured five status-B fields at the runtime boundary just
+    /// before the primary control-done message.
+    pub(crate) fn apply_partial_opening_pre_control_status(&mut self) -> Result {
+        let writes =
+            g17_submission::prepare_g17p_partial_opening_pre_0x84_status(self.kernel_va_base)
+                .map_err(|_| EINVAL)?;
+        let status_b = g17_initdata::PRIMARY_STATUS_B_STATE_GRID_OFFSET;
+        self.resources.primary_state.with_bytes_mut(|bytes| {
+            for write in writes {
+                let offset = status_b.checked_add(write.offset as usize).ok_or(EINVAL)?;
+                let end = offset.checked_add(8).ok_or(EINVAL)?;
+                if end > bytes.len() {
+                    return Err(EINVAL);
+                }
+                bytes[offset..end].copy_from_slice(&write.value.to_le_bytes());
+            }
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        })
+    }
+
+    /// Publish the first fragment/tiling outer-ring pair in the measured
+    /// order. Queue records and their item rings must already contain the
+    /// three-entry groups named by the supplied queue heads.
+    pub(crate) fn publish_partial_opening_pair<F>(
+        &mut self,
+        fragment_queue_gpu_va: u64,
+        fragment_queue_write_index: u32,
+        tiling_queue_gpu_va: u64,
+        tiling_queue_write_index: u32,
+        publish_late_tiling_state: F,
+    ) -> Result<g17_submission::PreparedG17PPartialOpeningWorkPair>
+    where
+        F: FnOnce() -> Result,
+    {
+        if fragment_queue_gpu_va == 0 || tiling_queue_gpu_va == 0 {
+            return Err(EINVAL);
+        }
+        let binding = self.partial_opening_binding();
+        let fragment = g17_submission::G17PPartialOpeningOuterChannelState {
+            consumers: [
+                self.resources
+                    .primary_state
+                    .read_u32(binding.fragment_channel.states[0])?,
+                self.resources
+                    .primary_state
+                    .read_u32(binding.fragment_channel.states[1])?,
+            ],
+            producer: self
+                .resources
+                .primary_state
+                .read_u32(binding.fragment_channel.states[2])?,
+            queue_gpu_va: fragment_queue_gpu_va,
+            queue_write_index: fragment_queue_write_index,
+        };
+        let tiling = g17_submission::G17PPartialOpeningOuterChannelState {
+            consumers: [
+                self.resources
+                    .primary_state
+                    .read_u32(binding.tiling_channel.states[0])?,
+                self.resources
+                    .primary_state
+                    .read_u32(binding.tiling_channel.states[1])?,
+            ],
+            producer: self
+                .resources
+                .primary_state
+                .read_u32(binding.tiling_channel.states[2])?,
+            queue_gpu_va: tiling_queue_gpu_va,
+            queue_write_index: tiling_queue_write_index,
+        };
+        let prepared = g17_submission::prepare_g17p_partial_opening_work_pair(fragment, tiling)
+            .map_err(|_| EINVAL)?;
+        if prepared.fragment.channel_table_index
+            != g17_submission::G17P_PARTIAL_OPENING_FRAGMENT_CHANNEL_TABLE_INDEX
+            || prepared.tiling.channel_table_index
+                != g17_submission::G17P_PARTIAL_OPENING_TILING_CHANNEL_TABLE_INDEX
+        {
+            return Err(EINVAL);
+        }
+
+        let fragment_slot = binding
+            .fragment_channel
+            .ring
+            .checked_add(prepared.fragment.slot_byte_offset as u64)
+            .ok_or(EINVAL)?;
+        self.resources
+            .shared_cluster
+            .write_at(fragment_slot, &prepared.fragment.slot)?;
+        self.address_space
+            .uat
+            .install_t8140_partial_opening_empty_high_roots()?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        self.resources.primary_state.write_at(
+            binding.fragment_channel.states[g17_initdata::CHANNEL_STATE_PRODUCER],
+            &prepared.fragment.next_producer.to_le_bytes(),
+        )?;
+
+        publish_late_tiling_state()?;
+        let tiling_slot = binding
+            .tiling_channel
+            .ring
+            .checked_add(prepared.tiling.slot_byte_offset as u64)
+            .ok_or(EINVAL)?;
+        self.resources
+            .shared_cluster
+            .write_at(tiling_slot, &prepared.tiling.slot)?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        self.resources.primary_state.write_at(
+            binding.tiling_channel.states[g17_initdata::CHANNEL_STATE_PRODUCER],
+            &prepared.tiling.next_producer.to_le_bytes(),
+        )?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+
+        Ok(prepared)
     }
 
     pub(crate) fn with_b2_pages_mut<R>(
