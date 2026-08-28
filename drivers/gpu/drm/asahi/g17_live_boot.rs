@@ -14,18 +14,16 @@
 //! 2. This module resolves both mailbox providers and verifies their roles and
 //!    exact resources through the provider-owned lifecycle surface.
 //! 3. Both providers report a matching CPU start and stop implementation.
-//! 4. The pair executor starts GFX then GFX1 and stops GFX1 then GFX on every
-//!    exit, including partial acquisition and body errors.
-//!
-//! Generic RTKit separately exposes a discovery-only HELLO/EPMAP client. It
-//! does not auto-start EP 1 (crashlog), allocate buffers, or send AP/IOP power
-//! transitions. Wiring two such clients into the pair body remains the next
-//! stage.
+//! 4. An owned pair starts GFX then GFX1 and retains both provider handles
+//!    until the platform driver is removed.
+//! 5. The retained runtime drops the registered queue, GFX1/GFX transports,
+//!    provider CPUs, and manager resources in strict reverse order.
 
 #![allow(dead_code)]
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
+use kernel::macros::vtable;
 use kernel::{
     device::Core,
     iosys_map::IoSysMapRef,
@@ -38,19 +36,12 @@ use kernel::{
     sync::Arc,
     time::{delay::fsleep, Delta},
 };
-use kernel::macros::vtable;
 
 use crate::{
     driver::{AsahiDevice, T8140LiveTopologyAdmission},
-    g17_lifecycle, g17_manager, g17_rtkit, hw, identity, module_parameters, regs,
+    g17_lifecycle, g17_manager, g17_rtkit, hw, identity, regs,
 };
-
-/// The T8140 match now runs the reversible provider-owned bring-up slice.
-/// Probe still returns `ENODEV` after the slice because no G17P DRM queue
-/// backend is registered yet.
-pub(crate) fn enabled() -> bool {
-    *module_parameters::g17p_probe.value() != 0
-}
+use kernel::sync::aref::ARef;
 
 /// Ordered boundary stages.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -195,67 +186,81 @@ impl g17_lifecycle::AscCpuLifecycle for AscwrapV6Provider {
     }
 }
 
-/// Attempt the current G17P live-boot slice.
-pub(crate) fn attempt(
-    pdev: &platform::Device<Core>,
-    dev: &AsahiDevice,
-    registers: &regs::Resources,
-    soc: &'static hw::agx3::SocConfig,
-    id: &identity::GpuIdentity,
-    topology: Option<&T8140LiveTopologyAdmission>,
-) -> Result {
-    if !enabled() {
-        return Err(ENODEV);
-    }
-    if soc.chip_id != 0x8140
-        || id.gpu_gen != hw::GpuGen::G17
-        || id.gpu_variant != identity::GpuVariant::P
-        || topology.is_none()
-    {
-        return Err(EINVAL);
-    }
+/// State retained for the full lifetime of an exact T8140 platform device.
+///
+/// This is intentionally not a [`crate::gpu::GpuManager`] yet. It owns the
+/// complete hardware/runtime lifetime needed by that next step without
+/// exposing a render node or accepting userspace submissions.
+pub(crate) struct G17PLiveRuntime {
+    drm: Option<ARef<AsahiDevice>>,
+    registers: Option<regs::Resources>,
+    manager: Option<g17_manager::G17PManagerConstruction>,
+    cpus: Option<g17_lifecycle::StartedCpuPair<AscwrapV6Provider>>,
+    gfx_state: Option<Arc<G17PRoleRtkitState>>,
+    gfx_rtkit: Option<rtkit::RtKit<G17PRtkitOps>>,
+    gfx1_state: Option<Arc<G17PRoleRtkitState>>,
+    gfx1_rtkit: Option<rtkit::RtKit<G17PRtkitOps>>,
+    queue: Option<g17_manager::G17PSksmQueue>,
+}
 
-    dev_info!(
-        pdev.as_ref(),
-        "G17P live-boot: {:?} admitted before effects; querying provider-owned lifecycle\n",
-        BootStage::ExactTopology
-    );
+impl G17PLiveRuntime {
+    /// Build and retain the exact T8140 dual-role runtime.
+    pub(crate) fn start(
+        pdev: &platform::Device<Core>,
+        drm: ARef<AsahiDevice>,
+        registers: regs::Resources,
+        soc: &'static hw::agx3::SocConfig,
+        id: &identity::GpuIdentity,
+        _topology: T8140LiveTopologyAdmission,
+    ) -> Result<Self> {
+        if soc.chip_id != 0x8140
+            || id.gpu_gen != hw::GpuGen::G17
+            || id.gpu_variant != identity::GpuVariant::P
+        {
+            return Err(EINVAL);
+        }
 
-    let gfx = AscwrapV6Provider::get(pdev.as_ref(), 0)?;
-    let gfx_lifecycle = validate_provider(&gfx, GFX_PROVIDER)?;
-    let gfx1 = AscwrapV6Provider::get(pdev.as_ref(), 1)?;
-    let gfx1_lifecycle = validate_provider(&gfx1, GFX1_PROVIDER)?;
-
-    dev_info!(
-        pdev.as_ref(),
-        "G17P live-boot: {:?} admitted for GFX/GFX1; DRM mapped no ASC wrapper\n",
-        BootStage::ProviderOwnership
-    );
-
-    // Check both roles before either CPU starts.
-    let gfx_gate = gfx.require_safe_cpu_lifecycle();
-    let gfx1_gate = gfx1.require_safe_cpu_lifecycle();
-    let transaction_gate =
-        g17_lifecycle::admit_cpu_start(gfx_lifecycle.missing, gfx1_lifecycle.missing);
-    if gfx_gate.is_err() || gfx1_gate.is_err() || transaction_gate.is_err() {
-        dev_err!(
+        dev_info!(
             pdev.as_ref(),
-            "G17P live-boot: {:?} incomplete (GFX {:?}, GFX1 {:?}, transaction {:?})\n",
-            BootStage::ReversibleLifecycle,
-            gfx_gate.err(),
-            gfx1_gate.err(),
-            transaction_gate.err()
+            "G17P live-boot: {:?} admitted before effects; querying provider-owned lifecycle\n",
+            BootStage::ExactTopology
         );
-        return Err(ENOTSUPP);
-    }
 
-    let mut manager = g17_manager::G17PManagerConstruction::new(
-        dev,
-        soc,
-        g17_manager::T8140_G17P_PLATFORM_CONFIG,
-    )?;
+        let gfx = AscwrapV6Provider::get(pdev.as_ref(), 0)?;
+        let gfx_lifecycle = validate_provider(&gfx, GFX_PROVIDER)?;
+        let gfx1 = AscwrapV6Provider::get(pdev.as_ref(), 1)?;
+        let gfx1_lifecycle = validate_provider(&gfx1, GFX1_PROVIDER)?;
 
-    g17_lifecycle::execute_cpu_pair(&gfx, &gfx1, || {
+        dev_info!(
+            pdev.as_ref(),
+            "G17P live-boot: {:?} admitted for GFX/GFX1; DRM mapped no ASC wrapper\n",
+            BootStage::ProviderOwnership
+        );
+
+        // Check both roles before either CPU starts.
+        let gfx_gate = gfx.require_safe_cpu_lifecycle();
+        let gfx1_gate = gfx1.require_safe_cpu_lifecycle();
+        let transaction_gate =
+            g17_lifecycle::admit_cpu_start(gfx_lifecycle.missing, gfx1_lifecycle.missing);
+        if gfx_gate.is_err() || gfx1_gate.is_err() || transaction_gate.is_err() {
+            dev_err!(
+                pdev.as_ref(),
+                "G17P live-boot: {:?} incomplete (GFX {:?}, GFX1 {:?}, transaction {:?})\n",
+                BootStage::ReversibleLifecycle,
+                gfx_gate.err(),
+                gfx1_gate.err(),
+                transaction_gate.err()
+            );
+            return Err(ENOTSUPP);
+        }
+
+        let mut manager = g17_manager::G17PManagerConstruction::new(
+            &drm,
+            soc,
+            g17_manager::T8140_G17P_PLATFORM_CONFIG,
+        )?;
+
+        let cpus = g17_lifecycle::StartedCpuPair::start(gfx, gfx1)?;
         dev_info!(
             pdev.as_ref(),
             "G17P live-boot: {:?} acquired GFX then GFX1\n",
@@ -264,23 +269,13 @@ pub(crate) fn attempt(
 
         let gfx_state = Arc::new(G17PRoleRtkitState::new(), GFP_KERNEL)?;
         let gfx1_state = Arc::new(G17PRoleRtkitState::new(), GFP_KERNEL)?;
-        let mut gfx_rtkit = rtkit::RtKit::<G17PRtkitOps>::new(
-            dev.as_ref(),
-            None,
-            0,
-            gfx_state.clone(),
-        )?;
-        let mut gfx1_rtkit = rtkit::RtKit::<G17PRtkitOps>::new(
-            dev.as_ref(),
-            None,
-            1,
-            gfx1_state.clone(),
-        )?;
-        let mut gfx_rtkit = Pin::new(&mut gfx_rtkit);
-        let mut gfx1_rtkit = Pin::new(&mut gfx1_rtkit);
+        let mut gfx_rtkit =
+            rtkit::RtKit::<G17PRtkitOps>::new(drm.as_ref(), None, 0, gfx_state.clone())?;
+        let mut gfx1_rtkit =
+            rtkit::RtKit::<G17PRtkitOps>::new(drm.as_ref(), None, 1, gfx1_state.clone())?;
 
-        gfx_rtkit.as_mut().boot()?;
-        gfx1_rtkit.as_mut().boot()?;
+        Pin::new(&mut gfx_rtkit).boot()?;
+        Pin::new(&mut gfx1_rtkit).boot()?;
         dev_info!(
             pdev.as_ref(),
             "G17P live-boot: {:?} completed independently for GFX/GFX1\n",
@@ -291,12 +286,8 @@ pub(crate) fn attempt(
         registers.t8140_pre_initdata_clear()?;
 
         for rtkit in [&mut gfx_rtkit, &mut gfx1_rtkit] {
-            rtkit
-                .as_mut()
-                .start_endpoint(g17_rtkit::ENDPOINT_GFX_MESSAGES)?;
-            rtkit
-                .as_mut()
-                .start_endpoint(g17_rtkit::ENDPOINT_GFX_INTERRUPTS)?;
+            Pin::new(&mut *rtkit).start_endpoint(g17_rtkit::ENDPOINT_GFX_MESSAGES)?;
+            Pin::new(&mut *rtkit).start_endpoint(g17_rtkit::ENDPOINT_GFX_INTERRUPTS)?;
         }
 
         let handoff = manager.handoff();
@@ -304,12 +295,8 @@ pub(crate) fn attempt(
             .map_err(|_| EINVAL)?;
         let gfx1_init = g17_rtkit::encode_initdata_doorbell(handoff.secondary.instance.root)
             .map_err(|_| EINVAL)?;
-        gfx_rtkit
-            .as_mut()
-            .send_message(g17_rtkit::ENDPOINT_GFX_MESSAGES, gfx_init)?;
-        gfx1_rtkit
-            .as_mut()
-            .send_message(g17_rtkit::ENDPOINT_GFX_MESSAGES, gfx1_init)?;
+        Pin::new(&mut gfx_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_MESSAGES, gfx_init)?;
+        Pin::new(&mut gfx1_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_MESSAGES, gfx1_init)?;
         dev_info!(
             pdev.as_ref(),
             "G17P live-boot: {:?} sent roots {:#x}/{:#x}\n",
@@ -319,9 +306,7 @@ pub(crate) fn attempt(
         );
 
         for _ in 0..INITDATA_ACK_POLLS {
-            if gfx_state.acked.load(Ordering::Acquire)
-                && gfx1_state.acked.load(Ordering::Acquire)
-            {
+            if gfx_state.acked.load(Ordering::Acquire) && gfx1_state.acked.load(Ordering::Acquire) {
                 break;
             }
             if gfx_state.crashed.load(Ordering::Acquire)
@@ -331,9 +316,7 @@ pub(crate) fn attempt(
             }
             fsleep(Delta::from_millis(10));
         }
-        if !gfx_state.acked.load(Ordering::Acquire)
-            || !gfx1_state.acked.load(Ordering::Acquire)
-        {
+        if !gfx_state.acked.load(Ordering::Acquire) || !gfx1_state.acked.load(Ordering::Acquire) {
             return Err(ETIMEDOUT);
         }
         dev_info!(
@@ -343,17 +326,12 @@ pub(crate) fn attempt(
         );
 
         let control_start = (CONTROL_START_TYPE as u64) << 48;
-        gfx_rtkit
-            .as_mut()
-            .send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, control_start)?;
+        Pin::new(&mut gfx_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, control_start)?;
         fsleep(Delta::from_millis(12));
-        gfx1_rtkit
-            .as_mut()
+        Pin::new(&mut gfx1_rtkit)
             .send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, control_start)?;
         let control_done = ((CONTROL_DONE_TYPE as u64) << 48) | CONTROL_DONE_CHANNEL;
-        gfx_rtkit
-            .as_mut()
-            .send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, control_done)?;
+        Pin::new(&mut gfx_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, control_done)?;
         fsleep(Delta::from_millis(10));
         dev_info!(
             pdev.as_ref(),
@@ -361,12 +339,65 @@ pub(crate) fn attempt(
             BootStage::DeviceControlPublished
         );
 
-        let _queue = manager.configure_compute_sksm_queue(dev, registers, 4, 2)?;
+        let queue = manager.configure_compute_sksm_queue(&drm, &registers, 4, 2)?;
         dev_info!(
             pdev.as_ref(),
-            "G17P live-boot: {:?} QID 4 / completion selector 2\n",
+            "G17P live-boot: {:?} QID 4 / completion selector 2 retained until remove\n",
             BootStage::RegisterComputeQueue
         );
-        Ok(())
-    })
+
+        Ok(Self {
+            drm: Some(drm),
+            registers: Some(registers),
+            manager: Some(manager),
+            cpus: Some(cpus),
+            gfx_state: Some(gfx_state),
+            gfx_rtkit: Some(gfx_rtkit),
+            gfx1_state: Some(gfx1_state),
+            gfx1_rtkit: Some(gfx1_rtkit),
+            queue: Some(queue),
+        })
+    }
+}
+
+impl g17_lifecycle::PersistentRuntimeTeardown for G17PLiveRuntime {
+    fn unregister_queue(&mut self) {
+        if let (Some(manager), Some(registers), Some(queue)) = (
+            self.manager.as_ref(),
+            self.registers.as_ref(),
+            self.queue.as_mut(),
+        ) {
+            let _ = manager.unregister_compute_sksm_queue(registers, queue);
+        }
+    }
+
+    fn drop_queue(&mut self) {
+        drop(self.queue.take());
+    }
+
+    fn drop_gfx1_rtkit(&mut self) {
+        drop(self.gfx1_rtkit.take());
+        drop(self.gfx1_state.take());
+    }
+
+    fn drop_gfx_rtkit(&mut self) {
+        drop(self.gfx_rtkit.take());
+        drop(self.gfx_state.take());
+    }
+
+    fn drop_cpu_pair(&mut self) {
+        drop(self.cpus.take());
+    }
+
+    fn drop_manager(&mut self) {
+        drop(self.manager.take());
+    }
+}
+
+impl Drop for G17PLiveRuntime {
+    fn drop(&mut self) {
+        g17_lifecycle::teardown_persistent_runtime(self);
+        drop(self.drm.take());
+        drop(self.registers.take());
+    }
 }

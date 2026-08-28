@@ -51,9 +51,15 @@ pub(crate) struct AsahiData {
 unsafe impl Send for AsahiData {}
 unsafe impl Sync for AsahiData {}
 
+#[allow(dead_code)]
+enum AsahiRuntime {
+    Legacy(ARef<drm::Device<AsahiDriver>>),
+    G17P(g17_live_boot::G17PLiveRuntime),
+}
+
 pub(crate) struct AsahiDriver {
     #[expect(unused)]
-    drm: ARef<drm::Device<Self>>,
+    runtime: AsahiRuntime,
 }
 
 /// A matched device either has a complete legacy hardware configuration or is
@@ -226,6 +232,56 @@ kernel::of_device_table!(
     ]
 );
 
+/// Start the persistent runtime for an exact T8140/G17P match.
+fn probe_t8140_runtime(
+    pdev: &platform::Device<Core>,
+    soc: &'static hw::agx3::SocConfig,
+) -> Result<g17_live_boot::G17PLiveRuntime> {
+    let expected = identity::decode_gpu_identity(soc.hw_family, soc.hw_variant, soc.num_dies as u8)
+        .ok_or(EINVAL)?;
+    if soc.chip_id != 0x8140
+        || expected.gpu_gen != hw::GpuGen::G17
+        || expected.gpu_variant != identity::GpuVariant::P
+        || expected.uat_input_address_bits != soc.uat_ias
+    {
+        return Err(EINVAL);
+    }
+
+    // Topology is read and admitted before mappings, DMA setup, or provider
+    // start. The token is consumed by the retained runtime constructor.
+    let topology = admit_t8140_live_topology(pdev, &expected)?;
+    let registers = regs::Resources::new(pdev)?;
+    let observed = registers.get_gpu_id()?;
+    if observed.gpu_gen != soc.gpu_gen
+        || observed.gpu_variant != soc.gpu_variant
+        || observed.num_dies != soc.num_dies
+    {
+        dev_err!(
+            pdev.as_ref(),
+            "G17P: hardware identity {:?}{:?}/{} dies does not match exact T8140 {:?}{:?}/{} dies\n",
+            observed.gpu_gen,
+            observed.gpu_variant,
+            observed.num_dies,
+            soc.gpu_gen,
+            soc.gpu_variant,
+            soc.num_dies
+        );
+        return Err(ENODEV);
+    }
+
+    unsafe { pdev.dma_set_mask_and_coherent(DmaMask::try_new(soc.uat_oas)?)? };
+
+    // The retained manager allocates GEM shmem objects from this DRM device,
+    // but the device is not registered until the G17P GpuManager/Queue traits
+    // are implemented.
+    let uninit = unsafe {
+        pin_init::pin_init_from_closure::<AsahiData, kernel::error::Error>(|_slot| Ok(()))
+    };
+    let drm = drm::device::Device::new(pdev.as_ref(), uninit)?;
+
+    g17_live_boot::G17PLiveRuntime::start(pdev, drm, registers, soc, &expected, topology)
+}
+
 /// Identify an AGX3 target as far as read-only evidence allows, then refuse.
 ///
 /// This logs the statically decoded identity, performs the read-only SGX
@@ -267,27 +323,6 @@ fn refuse_agx3_probe(pdev: &platform::Device<Core>, soc: &'static hw::agx3::SocC
         soc.uat_oas
     );
 
-    // T8140 topology admission is the first target-specific operation.  It
-    // reads only DT properties and must complete before reserved-memory
-    // mapping, SGX MMIO mapping/readback, DMA setup, or any live-boot action.
-    let exact_t8140_target =
-        expected.gpu_gen == hw::GpuGen::G17 && expected.gpu_variant == identity::GpuVariant::P;
-    let t8140_topology = if exact_t8140_target {
-        match admit_t8140_live_topology(pdev, &expected) {
-            Ok(admission) => Some(admission),
-            Err(e) => {
-                dev_err!(
-                    pdev.as_ref(),
-                    "G17P: exact provider-owned T8140 topology was invalid before effects: {:?}\n",
-                    e
-                );
-                return ENODEV;
-            }
-        }
-    } else {
-        None
-    };
-
     // The G17S loaded-firmware handoff is reserved memory, not GPU MMIO. It
     // must be mapped and hashed before touching the SGX register aperture so
     // firmware identity can never be inferred from a powered or partially
@@ -317,9 +352,8 @@ fn refuse_agx3_probe(pdev: &platform::Device<Core>, soc: &'static hw::agx3::SocC
         None
     };
 
-    let resources = match regs::Resources::new(pdev) {
-        Ok(res) => {
-            match res.get_gpu_id() {
+    match regs::Resources::new(pdev) {
+        Ok(res) => match res.get_gpu_id() {
             Ok(id) => {
                 dev_info!(
                     pdev.as_ref(),
@@ -344,62 +378,13 @@ fn refuse_agx3_probe(pdev: &platform::Device<Core>, soc: &'static hw::agx3::SocC
                 }
             }
             Err(e) => dev_warn!(pdev.as_ref(), "AGX3: GPU ID decode failed: {:?}\n", e),
-            }
-            Some(res)
-        }
+        },
         Err(e) => {
             dev_warn!(
                 pdev.as_ref(),
                 "AGX3: SGX MMIO region unavailable: {:?}\n",
                 e
             );
-            None
-        }
-    };
-
-    // Opt-in live-boot executor (default OFF). When deliberately enabled on a
-    // real M5, attempt the grounded boot prologue instead of an unconditional
-    // refusal. The first slice always returns an error (the full boot is not
-    // yet wired), so probe still fails closed today.
-    if exact_t8140_target && g17_live_boot::enabled() {
-        let Some(registers) = resources.as_ref() else {
-            return ENODEV;
-        };
-        let dma_mask = match DmaMask::try_new(soc.uat_oas) {
-            Ok(mask) => mask,
-            Err(e) => return e,
-        };
-        if let Err(e) = unsafe { pdev.dma_set_mask_and_coherent(dma_mask) } {
-            return e;
-        }
-
-        // G17P resource construction uses GEM shmem objects, which need the
-        // real DRM device owner even though this bring-up slice deliberately
-        // stops before registering a userspace node.
-        let uninit = unsafe {
-            pin_init::pin_init_from_closure::<AsahiData, kernel::error::Error>(|_slot| Ok(()))
-        };
-        let drm = match drm::device::Device::new(pdev.as_ref(), uninit) {
-            Ok(dev) => dev,
-            Err(e) => return e,
-        };
-
-        match g17_live_boot::attempt(
-            pdev,
-            &drm,
-            registers,
-            soc,
-            &expected,
-            t8140_topology.as_ref(),
-        ) {
-            Ok(()) => {
-                dev_info!(
-                    pdev.as_ref(),
-                    "G17P live-boot reached dual initdata ACK and retained queue registration; userspace backend not yet wired, refusing probe\n"
-                );
-                return ENODEV;
-            }
-            Err(e) => return e,
         }
     }
 
@@ -813,6 +798,16 @@ impl platform::Driver for AsahiDriver {
 
         let cfg = match info.ok_or(ENODEV)? {
             ProbeConfig::Supported(cfg) => *cfg,
+            ProbeConfig::Agx3Diagnostic(soc) if soc.chip_id == 0x8140 => {
+                let runtime = probe_t8140_runtime(pdev, soc)?;
+                dev_info!(
+                    pdev.as_ref(),
+                    "G17P: persistent dual-ASC runtime bound; render node registration remains disabled\n"
+                );
+                return Ok(Self {
+                    runtime: AsahiRuntime::G17P(runtime),
+                });
+            }
             ProbeConfig::Agx3Diagnostic(soc) => return Err(refuse_agx3_probe(pdev, soc)),
         };
 
@@ -898,6 +893,8 @@ impl platform::Driver for AsahiDriver {
 
         drm::driver::Registration::new_foreign_owned(&drm, pdev.as_ref(), 0)?;
 
-        Ok(Self { drm })
+        Ok(Self {
+            runtime: AsahiRuntime::Legacy(drm),
+        })
     }
 }
