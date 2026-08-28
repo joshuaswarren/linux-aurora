@@ -210,9 +210,10 @@ impl g17_submission::G17SksmPairWriter for G17SksmSgxPairWriter<'_> {
 impl Resources {
     /// Map the required resources given our platform device.
     pub(crate) fn new(pdev: &platform::Device<Core>) -> Result<Resources> {
-        // J700 declares `sgx` as resource 0. The pinned host observes two
-        // device-memory ranges, maps index 0, and stores that mapping at
-        // accelerator+0x348 before every SKSM scratch access.
+        // The pinned host maps accelerator device-memory index 0 and stores
+        // it at accelerator+0x348 before every SKSM scratch access. That range
+        // is the J700 GPU block exposed to Linux by the named `sgx` resource
+        // (the second platform `reg` tuple, after `asc`).
         let sgx_req = pdev.io_request_by_name(c_str!("sgx")).ok_or(EINVAL)?;
         let sgx_iomem = KBox::pin_init(sgx_req.iomap_sized::<SGX_SIZE>(), GFP_KERNEL)?;
         let sksm_fifo = KBox::pin_init(new_mutex!((), "g17_sksm_fifo"), GFP_KERNEL)?;
