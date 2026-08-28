@@ -36,8 +36,9 @@
 //! submission can be driven to completion offline. It is `false`: the SKSM
 //! completion path is a hardware kick FIFO the firmware reads through indexed
 //! MMIO scratch registers. The host publication form, runtime scratch geometry,
-//! and resource-0 ordered writer are implemented. Firmware execution, the
-//! round trip, and the completion IRQ remain unproved. See
+//! and resource-0 ordered writer are implemented. J700 has completed the
+//! channel-doorbell round trip with exact compute output across a retained CL2
+//! queue. Linux still needs the completion IRQ ingress. See
 //! [`SUBMISSION_LIVE_GAPS`].
 
 #[cfg(not(test))]
@@ -2198,11 +2199,13 @@ impl SubmissionLiveGaps {
     }
 }
 
-/// The host-side writer is implemented; device round-trip evidence and Linux
-/// completion handling remain outstanding.
+/// The host-side writer is implemented. The channel-doorbell execution result
+/// comes from `20260827-g17p-compact-contract-queue-live12`: exact 64-float
+/// add3 output, then two more submissions on the same CL2 queue at queue and
+/// channel counters 6/6/6 and 9/9/9. Linux completion IRQ handling remains.
 pub(crate) const SUBMISSION_LIVE_GAPS: SubmissionLiveGaps = SubmissionLiveGaps {
     sksm_resource0_ordered_write_implemented: true,
-    doorbell_round_trip_proven: false,
+    doorbell_round_trip_proven: true,
     completion_irq_route_proven: false,
 };
 
@@ -4057,7 +4060,7 @@ mod tests {
         assert!(!EXECUTABLE_SUBMISSION_TRANSPORT_AVAILABLE);
         assert!(!SUBMISSION_LIVE_GAPS.all_proven());
         assert!(SUBMISSION_LIVE_GAPS.sksm_resource0_ordered_write_implemented);
-        assert!(!SUBMISSION_LIVE_GAPS.doorbell_round_trip_proven);
+        assert!(SUBMISSION_LIVE_GAPS.doorbell_round_trip_proven);
         assert!(!SUBMISSION_LIVE_GAPS.completion_irq_route_proven);
 
         // A hypothetical all-proven set would flip the executable signal — the
