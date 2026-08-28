@@ -14,6 +14,7 @@
 #include <linux/scatterlist.h>
 #include <linux/usb/typec_mux.h>
 
+#include "dcp-link.h"
 #include "dptxep.h"
 #include "iomfb.h"
 #include "iomfb_h17p.h"
@@ -32,6 +33,7 @@ enum dcp_firmware_version {
 	DCP_FIRMWARE_UNKNOWN,
 	DCP_FIRMWARE_V_12_3,
 	DCP_FIRMWARE_V_13_5,
+	DCP_FIRMWARE_H17P,
 };
 
 enum {
@@ -74,6 +76,8 @@ struct dcp_channel {
 	void *cookies[DCP_MAX_CALL_DEPTH];
 	void *output[DCP_MAX_CALL_DEPTH];
 	u16 end[DCP_MAX_CALL_DEPTH];
+	u64 link_message[DCP_MAX_CALL_DEPTH];
+	u32 link_size[DCP_MAX_CALL_DEPTH];
 
 	/* Current depth of the call stack. Less than DCP_MAX_CALL_DEPTH */
 	u8 depth;
@@ -146,6 +150,11 @@ struct apple_dcp {
 
 	/* DCP shared memory */
 	void *shmem;
+	dma_addr_t shmem_iova;
+	u32 link_top[2][APPLE_DCP_LINK_STREAMS_PER_SIDE];
+	u16 link_version;
+	u32 link_firmware_hash;
+	bool link_ready;
 
 	/* Display registers mappable to the DCP */
 	struct resource *disp_registers[MAX_DISP_REGISTERS];
