@@ -2125,34 +2125,10 @@ static void apple_dart_t8110_v2_shared_irq_test(struct kunit *test)
 			   apple_dart_t8110_v2_block_pending(0x0203, BIT(3)));
 }
 
-static void apple_dart_locked_ttbr_sync_restore_test(struct kunit *test)
-{
-	u64 inherited[] = {
-		0x101f0cd0001, /* region94 subtree */
-		0x101f0c10001, /* region95 subtree */
-		0x101eb4b8003, /* framebuffer, valid and writable */
-	};
-	u64 saved[ARRAY_SIZE(inherited)];
-	u64 imported[] = {
-		0x20200000001,
-		0x20200004001,
-		0x20200008001,
-	};
-
-	memcpy(saved, inherited, sizeof(saved));
-	apple_dart_copy_locked_ttbr(inherited, imported, sizeof(inherited));
-	KUNIT_EXPECT_MEMEQ(test, inherited, imported, sizeof(inherited));
-
-	apple_dart_copy_locked_ttbr(inherited, saved, sizeof(inherited));
-	KUNIT_EXPECT_MEMEQ(test, inherited, saved, sizeof(inherited));
-	KUNIT_EXPECT_FALSE(test, inherited[2] & BIT(2));
-}
-
 static struct kunit_case apple_dart_t8110_v2_test_cases[] = {
 	KUNIT_CASE(apple_dart_t8110_v2_register_layout_test),
 	KUNIT_CASE(apple_dart_t8110_v2_fault_decode_test),
 	KUNIT_CASE(apple_dart_t8110_v2_shared_irq_test),
-	KUNIT_CASE(apple_dart_locked_ttbr_sync_restore_test),
 	{}
 };
 

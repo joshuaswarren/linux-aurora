@@ -404,14 +404,15 @@
 		};
 
 		/*
-		 * Live J700 ADT topology. Both DARTs use a 1 TiB firmware-visible
-		 * DVA prefix over a 36-bit hardware IOVA alias and expose 29 SIDs.
+		 * Live J700 ADT topology. These DARTs use a 1 TiB firmware-visible
+		 * DVA prefix over a 36-bit hardware IOVA alias. DCP and display expose
+		 * 29 SIDs, while the display GRT DART exposes 16.
 		 * The SID-specific apertures used below are vm-size-23 for DCP and
 		 * vm-size-0 for display, both 64 GiB. The verified consumers are DCP
 		 * 23, DCP exclave 24, display 0, display PIODMA 16, scaler 3 and SCA
-		 * 4.
+		 * 4, and display GRT 8.
 		 *
-		 * Keep both DARTs disabled: current firmware leaves DCP running and
+		 * Keep all DARTs disabled: current firmware leaves DCP running and
 		 * owns its endpoint map, shared memory and these translations. An
 		 * unlocked apple-dart probe resets every stream, so enabling either
 		 * node must wait for an explicit DCP lifecycle handoff.
@@ -419,6 +420,17 @@
 		disp0_dart: iommu@412300000 {
 			compatible = "apple,t8140-dart", "apple,t8110-dart";
 			reg = <0x4 0x12300000 0x0 0xc000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 698 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_disp_cpu>;
+			#iommu-cells = <1>;
+			apple,dma-range = <0x100 0x0 0x10 0x0>;
+			status = "disabled";
+		};
+
+		dispgrt_dart: iommu@412320000 {
+			compatible = "apple,t8140-dart", "apple,t8110-dart";
+			reg = <0x4 0x12320000 0x0 0xc000>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 698 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_disp_cpu>;
