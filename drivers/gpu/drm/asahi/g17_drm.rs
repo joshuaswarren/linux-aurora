@@ -173,7 +173,7 @@ impl FenceOps for G17PSubmissionFence {
     }
 
     fn get_timeline_name<'a>(self: &'a FenceObject<Self>) -> &'a CStr {
-        c_str!("g17p-render")
+        c_str!("g17p-submit")
     }
 }
 
@@ -189,6 +189,16 @@ struct G17PQueue {
     usc_exec_base: u64,
     fence_contexts: FenceContexts,
     id: u64,
+}
+
+enum G17PPendingCommand {
+    Render(g17_uapi::TranslatedRenderCommand),
+    Compute(g17_uapi::TranslatedComputeCommand),
+}
+
+struct TimestampDestination {
+    mapping: Arc<mmu::KernelMapping>,
+    offset: usize,
 }
 
 impl G17PQueue {
@@ -278,6 +288,56 @@ impl G17PQueue {
         }
     }
 
+    fn timestamp_destination(
+        objects: core::pin::Pin<&xarray::XArray<KBox<file::Object>>>,
+        timestamp: g17_uapi::UapiTimestamp,
+    ) -> Result<Option<TimestampDestination>> {
+        if timestamp.handle == 0 {
+            return Ok(None);
+        }
+        let guard = objects.lock();
+        let object = guard
+            .get(timestamp.handle.try_into()?)
+            .ok_or(ENOENT)?
+            .clone();
+        core::mem::drop(guard);
+        match object {
+            file::Object::TimestampBuffer(mapping) => {
+                let offset: usize = timestamp.offset.try_into()?;
+                let end = offset.checked_add(8).ok_or(EINVAL)?;
+                if end > mapping.size() {
+                    return Err(ERANGE);
+                }
+                Ok(Some(TimestampDestination { mapping, offset }))
+            }
+        }
+    }
+
+    fn copy_timestamp(destination: Option<TimestampDestination>, value: u64) -> Result {
+        let Some(destination) = destination else {
+            return Ok(());
+        };
+        destination.mapping.with_cpu_bytes(|raw| {
+            let end = destination.offset.checked_add(8).ok_or(EINVAL)?;
+            let bytes = raw.get_mut(destination.offset..end).ok_or(ERANGE)?;
+            bytes.copy_from_slice(&value.to_le_bytes());
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+            Ok(())
+        })
+    }
+
+    fn owned_compute_timestamps(&self) -> Result<mmu::KernelMapping> {
+        let mut object = gem::new_kernel_object(&self.dev, mmu::UAT_PGSZ)?;
+        object.vmap()?.memset(0);
+        object.map_into_range(
+            &self.vm,
+            T8140_TIMESTAMP_ALIAS_RANGE.clone(),
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_FW_SHARED_RW,
+            false,
+        )
+    }
+
     fn install_output_fences(mut syncs: impl Iterator<Item = file::SyncItem>, fence: &Fence) {
         for mut sync in syncs.by_ref() {
             if let Some(chain) = sync.chain_fence.take() {
@@ -313,74 +373,99 @@ impl queue::Queue for G17PQueue {
         let mut parser = g17_uapi::UapiCommandParser::new(cmdbuf_raw);
         let mut pending = None;
         while let Some(command) = parser.next_hardware().map_err(|_| EINVAL)? {
-            let g17_uapi::ParsedHardwareCommand::Render {
-                payload,
-                vertex_attachments,
-                fragment_attachments,
-                ..
-            } = command
-            else {
-                return Err(ENOTSUPP);
-            };
             if pending.is_some() {
-                // The first userspace route owns one paired queue transaction.
-                // Reusable multi-command publication needs its own ring lifetime.
                 return Err(ENOTSUPP);
             }
-            let translated = g17_uapi::translate_render_command(
-                payload,
-                vertex_attachments,
-                fragment_attachments,
-                window,
-                &address_space,
-                g17_uapi::RenderInternalState {
-                    parameters: g17_render::G17pRenderParameters::source_rsrc8(),
-                },
-            )
-            .map_err(|_| EINVAL)?;
-            pending = Some(translated);
+            pending = Some(match command {
+                g17_uapi::ParsedHardwareCommand::Render {
+                    payload,
+                    vertex_attachments,
+                    fragment_attachments,
+                    ..
+                } => G17PPendingCommand::Render(
+                    g17_uapi::translate_render_command(
+                        payload,
+                        vertex_attachments,
+                        fragment_attachments,
+                        window,
+                        &address_space,
+                        g17_uapi::RenderInternalState {
+                            parameters: g17_render::G17pRenderParameters::source_rsrc8(),
+                        },
+                    )
+                    .map_err(|_| EINVAL)?,
+                ),
+                g17_uapi::ParsedHardwareCommand::Compute {
+                    payload,
+                    attachments,
+                    ..
+                } => G17PPendingCommand::Compute(
+                    g17_uapi::translate_compute_command(
+                        payload,
+                        attachments,
+                        window,
+                        &address_space,
+                    )
+                    .map_err(|_| EINVAL)?,
+                ),
+            });
         }
         parser.finish().map_err(|_| EINVAL)?;
-        let translated = pending.ok_or(EINVAL)?;
-
-        let mut timestamp_aliases = KVec::new();
-        let timestamps = [
-            Self::timestamp_address(
-                objects,
-                &self.vm,
-                translated.vertex_timestamps.start,
-                &mut timestamp_aliases,
-            )?,
-            Self::timestamp_address(
-                objects,
-                &self.vm,
-                translated.vertex_timestamps.end,
-                &mut timestamp_aliases,
-            )?,
-            Self::timestamp_address(
-                objects,
-                &self.vm,
-                translated.fragment_timestamps.start,
-                &mut timestamp_aliases,
-            )?,
-            Self::timestamp_address(
-                objects,
-                &self.vm,
-                translated.fragment_timestamps.end,
-                &mut timestamp_aliases,
-            )?,
-        ];
+        let pending = pending.ok_or(EINVAL)?;
 
         Self::wait_input_fences(&syncs[..in_sync_count])?;
         let output_fence: UserFence<G17PSubmissionFence> = self
             .fence_contexts
             .new_fence(0, G17PSubmissionFence)?
             .into();
-        // This call returns only after queue retirement, an empty job list,
-        // and owned start/end timestamps for both stages.
-        self.runtime
-            .lock()
-            .submit_translated_render(&self.vm, &translated, timestamps, timestamp_aliases)?;
+        match pending {
+            G17PPendingCommand::Render(translated) => {
+                let mut timestamp_aliases = KVec::new();
+                let timestamps = [
+                    Self::timestamp_address(
+                        objects,
+                        &self.vm,
+                        translated.vertex_timestamps.start,
+                        &mut timestamp_aliases,
+                    )?,
+                    Self::timestamp_address(
+                        objects,
+                        &self.vm,
+                        translated.vertex_timestamps.end,
+                        &mut timestamp_aliases,
+                    )?,
+                    Self::timestamp_address(
+                        objects,
+                        &self.vm,
+                        translated.fragment_timestamps.start,
+                        &mut timestamp_aliases,
+                    )?,
+                    Self::timestamp_address(
+                        objects,
+                        &self.vm,
+                        translated.fragment_timestamps.end,
+                        &mut timestamp_aliases,
+                    )?,
+                ];
+                self.runtime.lock().submit_translated_render(
+                    &self.vm,
+                    &translated,
+                    timestamps,
+                    timestamp_aliases,
+                )?;
+            }
+            G17PPendingCommand::Compute(translated) => {
+                let start = Self::timestamp_destination(objects, translated.timestamps.start)?;
+                let end = Self::timestamp_destination(objects, translated.timestamps.end)?;
+                let owned_timestamps = self.owned_compute_timestamps()?;
+                let completion = self
+                    .runtime
+                    .lock()
+                    .submit_translated_compute(&translated, owned_timestamps)?;
+                Self::copy_timestamp(start, completion[0])?;
+                Self::copy_timestamp(end, completion[1])?;
+            }
+        }
 
         output_fence.signal();
         let fence = Fence::from_fence(&output_fence);
@@ -388,10 +473,9 @@ impl queue::Queue for G17PQueue {
         Self::install_output_fences(outputs, &fence);
         dev_dbg!(
             self.dev.as_ref(),
-            "G17P queue {} completed synchronous submission {} ({} render commands)\n",
+            "G17P queue {} completed synchronous submission {} (one hardware command)\n",
             self.id,
-            submission_id,
-            1
+            submission_id
         );
         Ok(())
     }

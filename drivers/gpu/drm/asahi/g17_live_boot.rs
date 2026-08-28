@@ -21,7 +21,7 @@
 
 #![allow(dead_code)]
 
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{fence, AtomicBool, AtomicU32, Ordering};
 
 use kernel::macros::vtable;
 use kernel::{
@@ -387,6 +387,85 @@ impl G17PLiveRuntime {
             };
         }
         Ok(())
+    }
+
+    /// Publish one translated compute command and wait for the start and end
+    /// timestamps owned by its descriptor. The caller retains the mapping
+    /// until this method returns, so firmware cannot outlive its completion
+    /// words.
+    pub(crate) fn submit_translated_compute(
+        &mut self,
+        command: &g17_uapi::TranslatedComputeCommand,
+        owned_timestamps: mmu::KernelMapping,
+    ) -> Result<[u64; 2]> {
+        if !self.accepting_submissions || self.is_crashed() {
+            g17_lifecycle::recover_persistent_runtime(self)?;
+        }
+        if owned_timestamps.size() < 16 {
+            return Err(ERANGE);
+        }
+        let timestamp_start = owned_timestamps.iova();
+        let timestamp_end = timestamp_start.checked_add(8).ok_or(EOVERFLOW)?;
+        let submit_result = {
+            let registers = self.registers.as_ref().ok_or(ENODEV)?;
+            let manager = self.manager.as_mut().ok_or(ENODEV)?;
+            let queue = self.queue.as_mut().ok_or(ENODEV)?;
+            manager.submit_translated_compute(
+                registers,
+                queue,
+                command,
+                g17_manager::G17PComputeSubmissionContext {
+                    context_id: 3,
+                    dispatch_identity: 0x0200_026c_0300_028e,
+                    execution_gate: 1,
+                    timestamps: g17_uapi::ComputeTimestampAddresses {
+                        start: timestamp_start,
+                        end: timestamp_end,
+                    },
+                    descriptor_flag_4c: false,
+                    descriptor_flag_5c8: false,
+                    converted_command_timestamp: 1,
+                    barriers: &[],
+                    mcache: None,
+                    rce_kind: 0,
+                    auxiliary: 0x003f_ffff_ffff_ffff,
+                },
+            )
+        };
+        if let Err(error) = submit_result {
+            return match g17_lifecycle::recover_persistent_runtime(self) {
+                Ok(()) => Err(error),
+                Err(recovery_error) => Err(recovery_error),
+            };
+        }
+
+        let completion = owned_timestamps.with_cpu_bytes(|raw| {
+            const POLLS: usize = 2000;
+            for _ in 0..POLLS {
+                fence(Ordering::Acquire);
+                let start = u64::from_le_bytes(raw[0..8].try_into().map_err(|_| ERANGE)?);
+                let end = u64::from_le_bytes(raw[8..16].try_into().map_err(|_| ERANGE)?);
+                if let Some(completion) = g17_uapi::completed_compute_timestamps(start, end) {
+                    return Ok(completion);
+                }
+                fsleep(Delta::from_millis(1));
+            }
+            Err(ETIMEDOUT)
+        });
+        let completion = match completion {
+            Ok(completion) => completion,
+            Err(error) => {
+                return match g17_lifecycle::recover_persistent_runtime(self) {
+                    Ok(()) => Err(error),
+                    Err(recovery_error) => Err(recovery_error),
+                };
+            }
+        };
+        self.manager
+            .as_ref()
+            .ok_or(ENODEV)?
+            .complete_compute_entries(self.queue.as_mut().ok_or(ENODEV)?, 1)?;
+        Ok(completion)
     }
 
     /// Build and retain the exact T8140 dual-role runtime.

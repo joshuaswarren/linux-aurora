@@ -157,6 +157,10 @@ pub(crate) enum SubmissionError {
     KickRceTagOutOfRange,
     /// An RCE address is unaligned or exceeds its 38-bit entry field.
     KickRceAddressUnencodable,
+    /// A compute descriptor-relative RCE address overflowed u64.
+    ComputeRceAddressOverflow,
+    /// A compute event counter overflowed its 64-bit entry field.
+    ComputeEventCounterOverflow,
     /// The middle QoS field is wider than the five bits copied by the host.
     KickQosClassOutOfRange,
     /// The runtime MMIO aperture selector or base offset overflowed u32.
@@ -1866,6 +1870,52 @@ pub(crate) struct G17PClRceBinding {
     pub(crate) tag: u8,
 }
 
+/// Command-relative CL fields witnessed on consecutive output-positive
+/// compute entries. The descriptor slot stride remains a storage decision;
+/// both RCE addresses are derived from the current slot's low alias.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PComputeClCommandState {
+    pub(crate) event_mask: [u64; 4],
+    pub(crate) rce_bindings: [G17PClRceBinding; 4],
+}
+
+pub(crate) fn prepare_g17p_compute_cl_command_state(
+    descriptor_low: u64,
+    submission_ordinal: u32,
+) -> Result<G17PComputeClCommandState, SubmissionError> {
+    let next = submission_ordinal
+        .checked_add(1)
+        .ok_or(SubmissionError::ComputeEventCounterOverflow)?;
+    let event_previous = u64::from(submission_ordinal)
+        .checked_mul(2)
+        .ok_or(SubmissionError::ComputeEventCounterOverflow)?;
+    let event_current = u64::from(next)
+        .checked_mul(4)
+        .ok_or(SubmissionError::ComputeEventCounterOverflow)?;
+    let rce_a = descriptor_low
+        .checked_add(0x40)
+        .ok_or(SubmissionError::ComputeRceAddressOverflow)?;
+    let rce_b = descriptor_low
+        .checked_add(0x760)
+        .ok_or(SubmissionError::ComputeRceAddressOverflow)?;
+    let empty = G17PClRceBinding { address: 0, tag: 0 };
+    Ok(G17PComputeClCommandState {
+        event_mask: [0, event_previous, event_current, 0],
+        rce_bindings: [
+            G17PClRceBinding {
+                address: rce_a,
+                tag: 0x22,
+            },
+            G17PClRceBinding {
+                address: rce_b,
+                tag: 0x04,
+            },
+            empty,
+            empty,
+        ],
+    })
+}
+
 /// Physical-queue QoS fields packed above the 32-bit dependency mask at entry
 /// +0x20. These remain with the registered SKSM queue when later descriptors
 /// publish new per-command event masks.
@@ -3147,6 +3197,32 @@ mod tests {
             ],
             auxiliary: 0x003f_ffff_ffff_ffff,
         }
+    }
+
+    #[test]
+    fn compute_command_state_tracks_each_descriptor_slot() {
+        let first = prepare_g17p_compute_cl_command_state(0x70_0034_0000, 0).unwrap();
+        assert_eq!(first.event_mask, [0, 0, 4, 0]);
+        assert_eq!(
+            first.rce_bindings,
+            [
+                G17PClRceBinding {
+                    address: 0x70_0034_0040,
+                    tag: 0x22,
+                },
+                G17PClRceBinding {
+                    address: 0x70_0034_0760,
+                    tag: 0x04,
+                },
+                G17PClRceBinding { address: 0, tag: 0 },
+                G17PClRceBinding { address: 0, tag: 0 },
+            ]
+        );
+
+        let second = prepare_g17p_compute_cl_command_state(0x70_0034_4000, 1).unwrap();
+        assert_eq!(second.event_mask, [0, 2, 8, 0]);
+        assert_eq!(second.rce_bindings[0].address, 0x70_0034_4040);
+        assert_eq!(second.rce_bindings[1].address, 0x70_0034_4760);
     }
 
     #[test]
