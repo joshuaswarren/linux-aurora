@@ -99,6 +99,36 @@ const G17P_CONTROL_OPERAND_BACKING_SIZE: usize = (G17P_CONTROL_OPERAND_BUFFER_CO
     * G17P_CONTROL_OPERAND_BUFFER_STRIDE
     + G17P_CONTROL_OPERAND_BUFFER_SIZE;
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PComputeUserVaLayout {
+    pub(crate) descriptors: u64,
+    pub(crate) preempt: u64,
+    pub(crate) robustness: u64,
+    pub(crate) operand_state: u64,
+}
+
+impl G17PComputeUserVaLayout {
+    pub(crate) fn all_referenced_ranges_reachable(
+        self,
+        mut covers: impl FnMut(u64, u64) -> bool,
+    ) -> bool {
+        [
+            (
+                self.descriptors,
+                G17P_COMPUTE_DESCRIPTOR_STORAGE_SIZE as u64,
+            ),
+            (self.preempt, G17P_COMPUTE_PREEMPT_SIZE as u64),
+            (self.robustness, G17P_PAGE_SIZE as u64),
+            (
+                self.operand_state,
+                G17P_COMPUTE_OPERAND_STATE_SIZE as u64,
+            ),
+        ]
+        .into_iter()
+        .all(|(address, size)| covers(address, size))
+    }
+}
+
 const G17P_RENDER_STATE_DEFLAKE: usize = 0x04000;
 const G17P_RENDER_STATE_TA_STATUS: usize = 0x08000;
 const G17P_RENDER_STATE_FRAGMENT_STATUS: usize = 0x0c000;
@@ -749,6 +779,40 @@ pub(crate) struct G17PComputeDescriptorStorage {
     queue_graph: MappedObject,
 }
 
+/// User-context aliases retained while one SKSM compute entry can still
+/// execute. Firmware keeps the high descriptor and queue mappings; the GPU
+/// consumes these aliases together with the userspace CDM and USC mappings.
+#[cfg(not(test))]
+pub(crate) struct G17PComputeUserMappings {
+    descriptors: mmu::KernelMapping,
+    preempt: mmu::KernelMapping,
+    robustness: mmu::KernelMapping,
+    operand_state: mmu::KernelMapping,
+}
+
+#[cfg(not(test))]
+impl G17PComputeUserMappings {
+    pub(crate) fn layout(&self) -> G17PComputeUserVaLayout {
+        G17PComputeUserVaLayout {
+            descriptors: self.descriptors.iova(),
+            preempt: self.preempt.iova(),
+            robustness: self.robustness.iova(),
+            operand_state: self.operand_state.iova(),
+        }
+    }
+
+    pub(crate) fn descriptor_gpu_va(&self, slot: u8) -> u64 {
+        self.descriptors.iova()
+            + slot as u64 * G17P_COMPUTE_DESCRIPTOR_SLOT_SIZE as u64
+    }
+
+    pub(crate) fn all_reachable_from(&self, vm: &mmu::Vm) -> bool {
+        self.layout().all_referenced_ranges_reachable(|address, size| {
+            vm.covers_range(address, size, true, true)
+        })
+    }
+}
+
 /// One Linux-owned paired render graph retained through synchronous
 /// completion. The queue records, pointer blocks, item-address rings, shared
 /// job list, descriptors, optional records, events, and timestamp words all
@@ -957,16 +1021,44 @@ impl G17PComputeDescriptorStorage {
         )
     }
 
-    pub(crate) fn preempt_gpu_va(&self) -> u64 {
-        self.preempt.iova()
-    }
-
-    pub(crate) fn robustness_gpu_va(&self) -> u64 {
-        self.robustness.iova()
-    }
-
-    pub(crate) fn operand_state_gpu_va(&self) -> u64 {
-        self.operand_state.iova()
+    pub(crate) fn map_user_execution_state(
+        &mut self,
+        vm: &mmu::Vm,
+    ) -> Result<G17PComputeUserMappings> {
+        let descriptors = self.descriptors.map_alias_in_range(
+            vm,
+            G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        let preempt = self.preempt.map_alias_in_range(
+            vm,
+            G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        let robustness = self.robustness.map_alias_in_range(
+            vm,
+            G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        let operand_state = self.operand_state.map_alias_in_range(
+            vm,
+            G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        let mappings = G17PComputeUserMappings {
+            descriptors,
+            preempt,
+            robustness,
+            operand_state,
+        };
+        if !mappings.all_reachable_from(vm) {
+            return Err(EFAULT);
+        }
+        Ok(mappings)
     }
 
     pub(crate) fn scheduler_record_gpu_va(&self) -> u64 {
@@ -2700,6 +2792,44 @@ mod tests {
         );
         assert_eq!(g17_initdata::T8140_REGISTER_WINDOWS[17].slot, 41);
         assert_eq!(g17_initdata::T8140_REGISTER_FLAG_ONLY_SLOTS.len(), 17);
+    }
+
+    #[test]
+    fn compute_user_layout_requires_every_gpu_execution_range() {
+        let layout = G17PComputeUserVaLayout {
+            descriptors: 0x70_0040_0000,
+            preempt: 0x70_0080_0000,
+            robustness: 0x70_0080_4000,
+            operand_state: 0x70_0081_0000,
+        };
+        let expected = [
+            (layout.descriptors, G17P_COMPUTE_DESCRIPTOR_STORAGE_SIZE as u64),
+            (layout.preempt, G17P_COMPUTE_PREEMPT_SIZE as u64),
+            (layout.robustness, G17P_PAGE_SIZE as u64),
+            (
+                layout.operand_state,
+                G17P_COMPUTE_OPERAND_STATE_SIZE as u64,
+            ),
+        ];
+        let mut seen = [false; 4];
+        assert!(layout.all_referenced_ranges_reachable(|address, size| {
+            let index = expected
+                .iter()
+                .position(|range| *range == (address, size))
+                .unwrap();
+            seen[index] = true;
+            true
+        }));
+        assert_eq!(seen, [true; 4]);
+
+        for missing in 0..expected.len() {
+            assert!(!layout.all_referenced_ranges_reachable(|address, size| {
+                expected
+                    .iter()
+                    .position(|range| *range == (address, size))
+                    != Some(missing)
+            }));
+        }
     }
 
     #[test]
