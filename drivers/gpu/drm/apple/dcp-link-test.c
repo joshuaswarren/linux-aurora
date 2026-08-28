@@ -122,14 +122,17 @@ static void apple_dcp_link_rpc_message_test(struct kunit *test)
 			-ERANGE);
 
 	KUNIT_ASSERT_EQ(test,
-			apple_dcp_link_stream_message(message, 5, true, &encoded), 0);
-	KUNIT_EXPECT_EQ(test, encoded & GENMASK_ULL(15, 0), 0x1702ULL);
+			apple_dcp_link_stream_message(message, 3, true, &encoded), 0);
+	KUNIT_EXPECT_EQ(test, encoded & GENMASK_ULL(15, 0), 0x0f02ULL);
 	KUNIT_EXPECT_EQ(test,
-			FIELD_GET(APPLE_DCP_LINK_MSG_STREAM, encoded), 5ULL);
-	KUNIT_EXPECT_EQ(test, apple_dcp_link_message_stream(encoded), (u8)5);
+			FIELD_GET(APPLE_DCP_LINK_MSG_STREAM, encoded), 3ULL);
+	KUNIT_EXPECT_EQ(test, apple_dcp_link_message_stream(encoded), (u8)3);
 	KUNIT_EXPECT_TRUE(test, encoded & APPLE_DCP_LINK_MSG_REMOTE);
 	KUNIT_EXPECT_TRUE(test, apple_dcp_link_message_is_remote(encoded));
 	KUNIT_EXPECT_TRUE(test, encoded & APPLE_DCP_LINK_MSG_NESTED);
+	KUNIT_EXPECT_EQ(test,
+			apple_dcp_link_stream_message(message, 4, true, &encoded),
+			-ERANGE);
 }
 
 static void apple_dcp_link_stack_test(struct kunit *test)
@@ -195,9 +198,9 @@ static void apple_dcp_link_rpc_reply_test(struct kunit *test)
 			apple_dcp_link_rpc_message(0x1234, 0x5678, true, &request),
 			0);
 	KUNIT_ASSERT_EQ(test,
-			apple_dcp_link_stream_message(request, 5, true, &request), 0);
+			apple_dcp_link_stream_message(request, 3, true, &request), 0);
 	reply = apple_dcp_link_rpc_reply(request);
-	KUNIT_EXPECT_EQ(test, reply, 0x0000000000001742ULL);
+	KUNIT_EXPECT_EQ(test, reply, 0x0000000000000f42ULL);
 }
 
 static void apple_dcp_h17p_rt_bw_test(struct kunit *test)
