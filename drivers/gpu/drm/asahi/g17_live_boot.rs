@@ -14,8 +14,8 @@
 //! 2. This module resolves both mailbox providers and verifies their roles and
 //!    exact resources through the provider-owned lifecycle surface.
 //! 3. Both providers report a matching CPU start and stop implementation.
-//! 4. An owned pair starts GFX then GFX1 and retains both provider handles
-//!    until the platform driver is removed.
+//! 4. Both RTKit receivers are armed before CPU start. GFX completes its
+//!    handshake before GFX1 starts.
 //! 5. The retained runtime drops the registered queue, GFX1/GFX transports,
 //!    provider CPUs, and manager resources in strict reverse order.
 
@@ -214,19 +214,25 @@ fn boot_session(
     }
     dev_info!(pdev.as_ref(), "G17P session: providers ready\n");
 
-    let cpus = g17_lifecycle::StartedCpuPair::start(gfx, gfx1)?;
-    dev_info!(pdev.as_ref(), "G17P session: processors started\n");
     let gfx_state = Arc::new(G17PRoleRtkitState::new(), GFP_KERNEL)?;
     let gfx1_state = Arc::new(G17PRoleRtkitState::new(), GFP_KERNEL)?;
     let mut gfx_rtkit =
-        rtkit::RtKit::<G17PRtkitOps>::new(drm.as_ref(), None, 0, gfx_state.clone())?;
+        rtkit::RtKit::<G17PRtkitOps>::new_g17p(drm.as_ref(), None, 0, gfx_state.clone())?;
     let mut gfx1_rtkit =
-        rtkit::RtKit::<G17PRtkitOps>::new(drm.as_ref(), None, 1, gfx1_state.clone())?;
+        rtkit::RtKit::<G17PRtkitOps>::new_g17p(drm.as_ref(), None, 1, gfx1_state.clone())?;
+    dev_info!(pdev.as_ref(), "G17P session: both RTKit receivers armed\n");
 
-    Pin::new(&mut gfx_rtkit).boot()?;
-    Pin::new(&mut gfx1_rtkit).boot()?;
-    dev_info!(pdev.as_ref(), "G17P session: RTKit started\n");
     registers.t8140_axi_transition_workaround()?;
+    dev_info!(pdev.as_ref(), "G17P session: AXI transition configured\n");
+    let cpus = g17_lifecycle::StartedCpuPair::start_staged(gfx, gfx1, || {
+        dev_info!(pdev.as_ref(), "G17P session: GFX processor started\n");
+        Pin::new(&mut gfx_rtkit).boot()?;
+        dev_info!(pdev.as_ref(), "G17P session: GFX RTKit handshake complete\n");
+        Ok(())
+    })?;
+    dev_info!(pdev.as_ref(), "G17P session: GFX1 processor started\n");
+    Pin::new(&mut gfx1_rtkit).boot()?;
+    dev_info!(pdev.as_ref(), "G17P session: GFX1 RTKit handshake complete\n");
     registers.t8140_pre_initdata_clear()?;
     for rtkit in [&mut gfx_rtkit, &mut gfx1_rtkit] {
         Pin::new(&mut *rtkit).start_endpoint(g17_rtkit::ENDPOINT_GFX_MESSAGES)?;

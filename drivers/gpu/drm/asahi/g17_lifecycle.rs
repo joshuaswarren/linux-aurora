@@ -47,7 +47,19 @@ pub(crate) struct StartedCpuPair<P: AscCpuLifecycle> {
 impl<P: AscCpuLifecycle> StartedCpuPair<P> {
     /// Start both provider-owned CPUs and return their retained owner.
     pub(crate) fn start(gfx: P, gfx1: P) -> Result<Self, P::Error> {
+        Self::start_staged(gfx, gfx1, || Ok(()))
+    }
+
+    /// Start GFX, finish its caller-owned handshake, then start GFX1.
+    pub(crate) fn start_staged<F>(gfx: P, gfx1: P, gfx_ready: F) -> Result<Self, P::Error>
+    where
+        F: FnOnce() -> Result<(), P::Error>,
+    {
         gfx.start_cpu()?;
+        if let Err(err) = gfx_ready() {
+            let _ = gfx.stop_cpu();
+            return Err(err);
+        }
         if let Err(err) = gfx1.start_cpu() {
             let _ = gfx.stop_cpu();
             return Err(err);
@@ -433,6 +445,71 @@ mod tests {
                 Event::Start(Role::Gfx),
                 Event::Start(Role::Gfx1),
                 Event::Stop(Role::Gfx1),
+                Event::Stop(Role::Gfx),
+            ]
+        );
+    }
+
+    #[test]
+    fn staged_pair_finishes_primary_handshake_before_secondary_start() {
+        let state = State {
+            failure: None,
+            trace: RefCell::new(std::vec::Vec::new()),
+        };
+        let pair = StartedCpuPair::start_staged(
+            MockCpu {
+                role: Role::Gfx,
+                state: &state,
+            },
+            MockCpu {
+                role: Role::Gfx1,
+                state: &state,
+            },
+            || {
+                state.trace.borrow_mut().push(Event::Body);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            *state.trace.borrow(),
+            [
+                Event::Start(Role::Gfx),
+                Event::Body,
+                Event::Start(Role::Gfx1),
+            ]
+        );
+        drop(pair);
+    }
+
+    #[test]
+    fn staged_pair_stops_primary_when_its_handshake_fails() {
+        let state = State {
+            failure: None,
+            trace: RefCell::new(std::vec::Vec::new()),
+        };
+        let result = StartedCpuPair::start_staged(
+            MockCpu {
+                role: Role::Gfx,
+                state: &state,
+            },
+            MockCpu {
+                role: Role::Gfx1,
+                state: &state,
+            },
+            || {
+                state.trace.borrow_mut().push(Event::Body);
+                Err(TestError::Body)
+            },
+        );
+
+        assert!(matches!(result, Err(TestError::Body)));
+        assert_eq!(
+            *state.trace.borrow(),
+            [
+                Event::Start(Role::Gfx),
+                Event::Body,
                 Event::Stop(Role::Gfx),
             ]
         );
