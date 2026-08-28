@@ -45,6 +45,8 @@ struct apple_rtkit {
 	bool crashed;
 	bool adopted;
 	bool epmap_only;
+	bool firmware_owned_crashlog;
+	bool crashlog_endpoint_started;
 	bool hello_seen;
 	bool epmap_finished;
 	bool shutting_down;

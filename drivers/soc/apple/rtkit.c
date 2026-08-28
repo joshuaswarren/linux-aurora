@@ -213,6 +213,23 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 			set_bit(ep, rtk->discovery_endpoints);
 	}
 
+	/*
+	 * G17P sends its firmware-owned crash buffer request as soon as EP1 is
+	 * started.  Start EP1 before acknowledging the EPMAP fragment that
+	 * advertises it, matching the ordering required by this firmware.
+	 */
+	if (rtk->firmware_owned_crashlog &&
+	    test_bit(APPLE_RTKIT_EP_CRASHLOG, rtk->endpoints) &&
+	    !rtk->crashlog_endpoint_started) {
+		ret = apple_rtkit_start_ep(rtk, APPLE_RTKIT_EP_CRASHLOG);
+		if (ret) {
+			rtk->boot_result = ret;
+			complete_all(&rtk->epmap_completion);
+			return;
+		}
+		rtk->crashlog_endpoint_started = true;
+	}
+
 	reply = FIELD_PREP(APPLE_RTKIT_MGMT_EPMAP_BASE, base);
 	if (msg & APPLE_RTKIT_MGMT_EPMAP_LAST)
 		reply |= APPLE_RTKIT_MGMT_EPMAP_LAST;
@@ -249,6 +266,9 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 		case APPLE_RTKIT_EP_IOREPORT:
 		case APPLE_RTKIT_EP_OSLOG:
 		case APPLE_RTKIT_EP_TRACEKIT:
+			if (ep == APPLE_RTKIT_EP_CRASHLOG &&
+			    rtk->crashlog_endpoint_started)
+				break;
 			dev_dbg(rtk->dev,
 				"RTKit: Starting system endpoint 0x%02x\n", ep);
 			apple_rtkit_start_ep(rtk, ep);
@@ -345,6 +365,20 @@ static int apple_rtkit_common_rx_get_buffer(struct apple_rtkit *rtk,
 
 	dev_dbg(rtk->dev, "RTKit: buffer request for 0x%zx bytes at %pad\n",
 		buffer->size, &buffer->iova);
+
+	/*
+	 * G17P places its crash log in the GPU UAT and sends that DVA in the
+	 * request.  Linux cannot map it through the device DMA domain.  Retain the
+	 * DVA for diagnostics and echo the request exactly as firmware expects.
+	 */
+	if (rtk->firmware_owned_crashlog &&
+	    ep == APPLE_RTKIT_EP_CRASHLOG && buffer->iova) {
+		buffer->is_mapped = true;
+		err = apple_rtkit_send_message(rtk, ep, msg, NULL, false);
+		if (err)
+			goto error;
+		return 0;
+	}
 
 	if (buffer->iova && !rtk->ops->shmem_setup) {
 		err = -EINVAL;
@@ -443,6 +477,16 @@ static void apple_rtkit_crashlog_rx(struct apple_rtkit *rtk, u64 msg)
 	}
 
 	dev_err(rtk->dev, "RTKit: co-processor has crashed\n");
+	if (rtk->firmware_owned_crashlog && !rtk->crashlog_buffer.buffer &&
+	    !rtk->crashlog_buffer.iomem) {
+		dev_err(rtk->dev,
+			"RTKit: firmware crash log remains at DVA %pad (0x%zx bytes)\n",
+			&rtk->crashlog_buffer.iova, rtk->crashlog_buffer.size);
+		rtk->crashed = true;
+		if (rtk->ops->crashed)
+			rtk->ops->crashed(rtk->cookie, NULL, 0);
+		return;
+	}
 
 	/*
 	 * create a shadow copy here to make sure the co-processor isn't able
@@ -785,7 +829,8 @@ static void apple_rtkit_mark_running(struct apple_rtkit *rtk)
 
 static struct apple_rtkit *__apple_rtkit_init(
 	struct device *dev, void *cookie, const char *mbox_name, int mbox_idx,
-	const struct apple_rtkit_ops *ops, bool adopted, bool epmap_only)
+	const struct apple_rtkit_ops *ops, bool adopted, bool epmap_only,
+	bool firmware_owned_crashlog)
 {
 	struct apple_rtkit *rtk;
 	int ret;
@@ -801,6 +846,7 @@ static struct apple_rtkit *__apple_rtkit_init(
 	rtk->cookie = cookie;
 	rtk->ops = ops;
 	rtk->epmap_only = epmap_only;
+	rtk->firmware_owned_crashlog = firmware_owned_crashlog;
 
 	init_completion(&rtk->epmap_completion);
 	init_completion(&rtk->iop_pwr_ack_completion);
@@ -856,16 +902,25 @@ struct apple_rtkit *apple_rtkit_init(struct device *dev, void *cookie,
 					    const struct apple_rtkit_ops *ops)
 {
 	return __apple_rtkit_init(dev, cookie, mbox_name, mbox_idx, ops, false,
-				  false);
+				  false, false);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_init);
+
+struct apple_rtkit *apple_rtkit_init_g17p(
+	struct device *dev, void *cookie, const char *mbox_name, int mbox_idx,
+	const struct apple_rtkit_ops *ops)
+{
+	return __apple_rtkit_init(dev, cookie, mbox_name, mbox_idx, ops, false,
+				  false, true);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_init_g17p);
 
 struct apple_rtkit *apple_rtkit_init_adopted(
 	struct device *dev, void *cookie, const char *mbox_name, int mbox_idx,
 	const struct apple_rtkit_ops *ops)
 {
 	return __apple_rtkit_init(dev, cookie, mbox_name, mbox_idx, ops, true,
-				  false);
+				  false, false);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_init_adopted);
 
@@ -874,7 +929,7 @@ struct apple_rtkit *apple_rtkit_init_epmap_only(
 	const struct apple_rtkit_ops *ops)
 {
 	return __apple_rtkit_init(dev, cookie, mbox_name, mbox_idx, ops, false,
-				  true);
+				  true, false);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_init_epmap_only);
 
@@ -926,6 +981,7 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk)
 	rtk->epmap_bases_seen = 0;
 	rtk->hello_seen = false;
 	rtk->epmap_finished = false;
+	rtk->crashlog_endpoint_started = false;
 	rtk->iop_power_state = APPLE_RTKIT_PWR_STATE_OFF;
 	rtk->ap_power_state = APPLE_RTKIT_PWR_STATE_OFF;
 

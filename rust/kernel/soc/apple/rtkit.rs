@@ -236,7 +236,17 @@ impl<T: Operations> RtKit<T> {
         mbox_idx: usize,
         data: T::Data,
     ) -> Result<Self> {
-        Self::new_inner(dev, mbox_name, mbox_idx, data, false)
+        Self::new_inner(dev, mbox_name, mbox_idx, data, false, false)
+    }
+
+    /// Creates a G17P RTKit client with firmware-owned crash-DVA handling.
+    pub fn new_g17p(
+        dev: &device::Device,
+        mbox_name: Option<&'static CStr>,
+        mbox_idx: usize,
+        data: T::Data,
+    ) -> Result<Self> {
+        Self::new_inner(dev, mbox_name, mbox_idx, data, false, true)
     }
 
     /// Create a passive management client that answers only HELLO/EPMAP.
@@ -249,7 +259,7 @@ impl<T: Operations> RtKit<T> {
         mbox_idx: usize,
         data: T::Data,
     ) -> Result<Self> {
-        Self::new_inner(dev, mbox_name, mbox_idx, data, true)
+        Self::new_inner(dev, mbox_name, mbox_idx, data, true, false)
     }
 
     fn new_inner(
@@ -258,6 +268,7 @@ impl<T: Operations> RtKit<T> {
         mbox_idx: usize,
         data: T::Data,
         epmap_only: bool,
+        g17p: bool,
     ) -> Result<Self> {
         let ptr: *mut crate::ffi::c_void = data.into_foreign().cast();
         let guard = ScopeGuard::new(|| {
@@ -276,6 +287,18 @@ impl<T: Operations> RtKit<T> {
             // owned by this wrapper until construction fails or Drop runs.
             unsafe {
                 from_err_ptr(bindings::apple_rtkit_init_epmap_only(
+                    dev.as_raw(),
+                    ptr,
+                    raw_name,
+                    raw_index,
+                    &Self::VTABLE,
+                ))
+            }
+        } else if g17p {
+            // SAFETY: arguments follow the C API contract. This constructor
+            // changes only the crashlog handshake used by G17P firmware.
+            unsafe {
+                from_err_ptr(bindings::apple_rtkit_init_g17p(
                     dev.as_raw(),
                     ptr,
                     raw_name,
