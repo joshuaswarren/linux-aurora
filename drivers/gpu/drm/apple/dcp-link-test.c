@@ -182,6 +182,35 @@ static void apple_dcp_h17p_rt_bw_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, le64_to_cpu(config.clock_request), 0x3082e8000ULL);
 }
 
+static void apple_dcp_h17p_rt_bw_reply_test(struct kunit *test)
+{
+	struct apple_dcp_h17p_rt_bw_request request = {};
+	struct apple_dcp_h17p_rt_bw_reply reply = {};
+	struct apple_dcp_link_rpc_view view = {
+		.call = APPLE_DCP_LINK_CALL_D003,
+		.input_size = sizeof(request),
+		.output_size = sizeof(reply),
+		.input = &request,
+		.output = &reply,
+	};
+
+	KUNIT_ASSERT_EQ(test,
+			apple_dcp_h17p_rt_bw_encode_reply(&view, 0x3082a0000ULL,
+							     0x3082e8000ULL),
+			0);
+	KUNIT_EXPECT_EQ(test, le64_to_cpu(reply.config.scratch),
+			0x3082a0000ULL);
+	KUNIT_EXPECT_EQ(test, le64_to_cpu(reply.config.clock_request),
+			0x3082e8000ULL);
+	KUNIT_EXPECT_EQ(test, le32_to_cpu(reply.status), 0U);
+
+	request.config_null = cpu_to_le32(1);
+	KUNIT_EXPECT_EQ(test,
+			apple_dcp_h17p_rt_bw_encode_reply(&view, 0x3082a0000ULL,
+							     0x3082e8000ULL),
+			-EINVAL);
+}
+
 static struct kunit_case apple_dcp_link_test_cases[] = {
 	KUNIT_CASE(apple_dcp_link_init_desc_test),
 	KUNIT_CASE(apple_dcp_link_init_message_test),
@@ -193,6 +222,7 @@ static struct kunit_case apple_dcp_link_test_cases[] = {
 	KUNIT_CASE(apple_dcp_link_rpc_decode_test),
 	KUNIT_CASE(apple_dcp_link_rpc_reply_test),
 	KUNIT_CASE(apple_dcp_h17p_rt_bw_test),
+	KUNIT_CASE(apple_dcp_h17p_rt_bw_reply_test),
 	{}
 };
 

@@ -32,6 +32,8 @@
 #define APPLE_DCP_LINK_MSG_VERSION		GENMASK_ULL(63, 48)
 #define APPLE_DCP_LINK_REPLY_CONTROL_MASK	0xff3e
 
+#define APPLE_DCP_LINK_CALL_D003		0x44303033
+
 struct apple_dcp_link_init_desc {
 	__le64 shared_dva;
 	__le32 flags;
@@ -49,6 +51,15 @@ struct apple_dcp_h17p_rt_bw_config {
 	__le64 clock_request;
 } __packed;
 
+struct apple_dcp_h17p_rt_bw_request {
+	__le32 config_null;
+} __packed;
+
+struct apple_dcp_h17p_rt_bw_reply {
+	struct apple_dcp_h17p_rt_bw_config config;
+	__le32 status;
+} __packed;
+
 struct apple_dcp_link_rpc_view {
 	u32 call;
 	u32 input_size;
@@ -62,6 +73,8 @@ struct apple_dcp_link_rpc_view {
 static_assert(sizeof(struct apple_dcp_link_init_desc) == 0x10);
 static_assert(sizeof(struct apple_dcp_link_rpc_header) == 0x0c);
 static_assert(sizeof(struct apple_dcp_h17p_rt_bw_config) == 0x10);
+static_assert(sizeof(struct apple_dcp_h17p_rt_bw_request) == 0x04);
+static_assert(sizeof(struct apple_dcp_h17p_rt_bw_reply) == 0x14);
 
 static inline void
 apple_dcp_link_init_desc_encode(struct apple_dcp_link_init_desc *desc,
@@ -281,6 +294,29 @@ apple_dcp_h17p_rt_bw_encode(struct apple_dcp_h17p_rt_bw_config *config,
 {
 	config->scratch = cpu_to_le64(scratch);
 	config->clock_request = cpu_to_le64(clock_request);
+}
+
+static inline int
+apple_dcp_h17p_rt_bw_encode_reply(struct apple_dcp_link_rpc_view *view,
+				  u64 scratch, u64 clock_request)
+{
+	const struct apple_dcp_h17p_rt_bw_request *request;
+	struct apple_dcp_h17p_rt_bw_reply *reply;
+
+	if (!view || view->call != APPLE_DCP_LINK_CALL_D003)
+		return -EINVAL;
+	if (view->input_size < sizeof(*request) ||
+	    view->output_size < sizeof(*reply))
+		return -EMSGSIZE;
+
+	request = view->input;
+	if (le32_to_cpu(request->config_null) & 1)
+		return -EINVAL;
+
+	reply = view->output;
+	apple_dcp_h17p_rt_bw_encode(&reply->config, scratch, clock_request);
+	reply->status = cpu_to_le32(0);
+	return 0;
 }
 
 #endif /* __APPLE_DCP_LINK_H__ */
