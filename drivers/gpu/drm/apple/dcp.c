@@ -1126,10 +1126,15 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	dcp->swapped_out_fbs =
 		(struct list_head)LIST_HEAD_INIT(dcp->swapped_out_fbs);
 
-	if (start_mode == APPLE_DCP_COPROCESSOR_ADOPT_AND_RESTART) {
-		dev_info(dev,
-			 "quiescing inherited DCP session (control=%#x status=%#x)\n",
-			 cpu_ctrl, cpu_status);
+	if (apple_dcp_needs_adoption(start_mode)) {
+		if (start_mode == APPLE_DCP_COPROCESSOR_ASC_STOPPED_RESTART) {
+			dev_info(dev,
+				 "resuming loader-stopped DCP session for RTKit restart\n");
+		} else {
+			dev_info(dev,
+				 "quiescing inherited DCP session (control=%#x status=%#x)\n",
+				 cpu_ctrl, cpu_status);
+		}
 		dcp->adopting_session = true;
 		dcp->rtk = devm_apple_rtkit_init_adopted(dev, dcp, "mbox", 0,
 							  &rtkit_ops);
@@ -1137,6 +1142,14 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 			dcp->adopting_session = false;
 			return dev_err_probe(dev, PTR_ERR(dcp->rtk),
 					     "Failed to adopt RTKit\n");
+		}
+		if (start_mode == APPLE_DCP_COPROCESSOR_ASC_STOPPED_RESTART) {
+			writel_relaxed(cpu_ctrl |
+				       APPLE_DCP_COPROC_CPU_CONTROL_RUN,
+				       dcp->coproc_reg +
+				       APPLE_DCP_COPROC_CPU_CONTROL);
+			readl_relaxed(dcp->coproc_reg +
+				      APPLE_DCP_COPROC_CPU_CONTROL);
 		}
 
 		ret = apple_rtkit_quiesce(dcp->rtk);
@@ -1150,9 +1163,6 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 			dev_info(dev, "restarting loader-quiesced DCP session\n");
 		else if (start_mode == APPLE_DCP_COPROCESSOR_IDLE_RESTART)
 			dev_info(dev, "restarting loader-idled DCP session\n");
-		else if (start_mode == APPLE_DCP_COPROCESSOR_ASC_STOPPED_RESTART)
-			dev_info(dev,
-				 "starting fresh DCP session after loader stopped ASCWrap v6\n");
 		dcp->rtk = devm_apple_rtkit_init(dev, dcp, "mbox", 0,
 						   &rtkit_ops);
 		if (IS_ERR(dcp->rtk))
