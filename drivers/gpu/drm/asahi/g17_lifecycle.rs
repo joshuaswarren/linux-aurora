@@ -40,6 +40,7 @@ pub(crate) trait AscCpuLifecycle {
 pub(crate) struct StartedCpuPair<P: AscCpuLifecycle> {
     gfx: P,
     gfx1: P,
+    running: bool,
 }
 
 impl<P: AscCpuLifecycle> StartedCpuPair<P> {
@@ -51,15 +52,69 @@ impl<P: AscCpuLifecycle> StartedCpuPair<P> {
             return Err(err);
         }
 
-        Ok(Self { gfx, gfx1 })
+        Ok(Self {
+            gfx,
+            gfx1,
+            running: true,
+        })
+    }
+
+    /// Stop both processors and retain their provider handles.
+    ///
+    /// A successful return is the boundary after which firmware can no longer
+    /// access queue, descriptor, timestamp, or translation objects. Both stop
+    /// calls run even if the first reports an error.
+    pub(crate) fn stop(&mut self) -> Result<(), P::Error> {
+        if !self.running {
+            return Ok(());
+        }
+
+        let gfx1_stop = self.gfx1.stop_cpu();
+        let gfx_stop = self.gfx.stop_cpu();
+        match (gfx1_stop, gfx_stop) {
+            (Err(err), _) | (Ok(()), Err(err)) => Err(err),
+            (Ok(()), Ok(())) => {
+                self.running = false;
+                Ok(())
+            }
+        }
     }
 }
 
 impl<P: AscCpuLifecycle> Drop for StartedCpuPair<P> {
     fn drop(&mut self) {
-        let _ = self.gfx1.stop_cpu();
-        let _ = self.gfx.stop_cpu();
+        let _ = self.stop();
     }
+}
+
+/// Operations for replacing a timed-out persistent firmware session.
+///
+/// The old graph stays alive until both processors stop. A failed rebuild
+/// leaves submissions paused so the caller can retry the complete rebuild.
+pub(crate) trait PersistentRuntimeRecovery {
+    type Error;
+
+    fn pause_submissions(&mut self);
+    fn stop_cpu_pair(&mut self) -> Result<(), Self::Error>;
+    fn drop_gfx1_rtkit(&mut self);
+    fn drop_gfx_rtkit(&mut self);
+    fn release_queue_and_manager(&mut self);
+    fn build_fresh_session(&mut self) -> Result<(), Self::Error>;
+    fn resume_submissions(&mut self);
+}
+
+/// Stop both processors, release the old graph, and build fresh initdata.
+pub(crate) fn recover_persistent_runtime<T: PersistentRuntimeRecovery>(
+    owner: &mut T,
+) -> Result<(), T::Error> {
+    owner.pause_submissions();
+    owner.stop_cpu_pair()?;
+    owner.drop_gfx1_rtkit();
+    owner.drop_gfx_rtkit();
+    owner.release_queue_and_manager();
+    owner.build_fresh_session()?;
+    owner.resume_submissions();
+    Ok(())
 }
 
 /// Operations needed to dismantle a retained G17P runtime.
@@ -135,6 +190,11 @@ mod tests {
         DropGfxRtkit,
         DropCpuPair,
         DropManager,
+        PauseSubmissions,
+        StopCpuPair,
+        ReleaseQueueAndManager,
+        BuildFreshSession,
+        ResumeSubmissions,
     }
 
     #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -144,6 +204,8 @@ mod tests {
         Body,
         StopGfx1,
         StopGfx,
+        StopPair,
+        BuildFreshSession,
     }
 
     #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -153,6 +215,8 @@ mod tests {
         Body,
         StopGfx1,
         StopGfx,
+        StopPair,
+        BuildFreshSession,
     }
 
     struct State {
@@ -347,6 +411,38 @@ mod tests {
     }
 
     #[test]
+    fn explicitly_stopped_pair_does_not_stop_twice_on_drop() {
+        let state = State {
+            failure: None,
+            trace: RefCell::new(std::vec::Vec::new()),
+        };
+        let mut pair = StartedCpuPair::start(
+            MockCpu {
+                role: Role::Gfx,
+                state: &state,
+            },
+            MockCpu {
+                role: Role::Gfx1,
+                state: &state,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(pair.stop(), Ok(()));
+        assert_eq!(pair.stop(), Ok(()));
+        drop(pair);
+        assert_eq!(
+            state.trace.into_inner(),
+            [
+                Event::Start(Role::Gfx),
+                Event::Start(Role::Gfx1),
+                Event::Stop(Role::Gfx1),
+                Event::Stop(Role::Gfx),
+            ]
+        );
+    }
+
+    #[test]
     fn retained_pair_rolls_back_primary_when_secondary_start_fails() {
         let state = State {
             failure: Some(Failure::StartGfx1),
@@ -426,6 +522,110 @@ mod tests {
                 Event::DropGfxRtkit,
                 Event::DropCpuPair,
                 Event::DropManager,
+            ]
+        );
+    }
+
+    struct MockRuntimeRecovery {
+        failure: Option<Failure>,
+        trace: std::vec::Vec<Event>,
+    }
+
+    impl PersistentRuntimeRecovery for MockRuntimeRecovery {
+        type Error = TestError;
+
+        fn pause_submissions(&mut self) {
+            self.trace.push(Event::PauseSubmissions);
+        }
+
+        fn stop_cpu_pair(&mut self) -> Result<(), Self::Error> {
+            self.trace.push(Event::StopCpuPair);
+            if self.failure == Some(Failure::StopPair) {
+                Err(TestError::StopPair)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn drop_gfx1_rtkit(&mut self) {
+            self.trace.push(Event::DropGfx1Rtkit);
+        }
+
+        fn drop_gfx_rtkit(&mut self) {
+            self.trace.push(Event::DropGfxRtkit);
+        }
+
+        fn release_queue_and_manager(&mut self) {
+            self.trace.push(Event::ReleaseQueueAndManager);
+        }
+
+        fn build_fresh_session(&mut self) -> Result<(), Self::Error> {
+            self.trace.push(Event::BuildFreshSession);
+            if self.failure == Some(Failure::BuildFreshSession) {
+                Err(TestError::BuildFreshSession)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn resume_submissions(&mut self) {
+            self.trace.push(Event::ResumeSubmissions);
+        }
+    }
+
+    #[test]
+    fn timeout_recovery_stops_both_processors_before_releasing_the_graph() {
+        let mut owner = MockRuntimeRecovery {
+            failure: None,
+            trace: std::vec::Vec::new(),
+        };
+        assert_eq!(recover_persistent_runtime(&mut owner), Ok(()));
+        assert_eq!(
+            owner.trace,
+            [
+                Event::PauseSubmissions,
+                Event::StopCpuPair,
+                Event::DropGfx1Rtkit,
+                Event::DropGfxRtkit,
+                Event::ReleaseQueueAndManager,
+                Event::BuildFreshSession,
+                Event::ResumeSubmissions,
+            ]
+        );
+    }
+
+    #[test]
+    fn processor_stop_error_keeps_every_firmware_owned_object_alive() {
+        let mut owner = MockRuntimeRecovery {
+            failure: Some(Failure::StopPair),
+            trace: std::vec::Vec::new(),
+        };
+        assert_eq!(
+            recover_persistent_runtime(&mut owner),
+            Err(TestError::StopPair)
+        );
+        assert_eq!(owner.trace, [Event::PauseSubmissions, Event::StopCpuPair]);
+    }
+
+    #[test]
+    fn rebuild_error_leaves_submissions_paused_after_safe_release() {
+        let mut owner = MockRuntimeRecovery {
+            failure: Some(Failure::BuildFreshSession),
+            trace: std::vec::Vec::new(),
+        };
+        assert_eq!(
+            recover_persistent_runtime(&mut owner),
+            Err(TestError::BuildFreshSession)
+        );
+        assert_eq!(
+            owner.trace,
+            [
+                Event::PauseSubmissions,
+                Event::StopCpuPair,
+                Event::DropGfx1Rtkit,
+                Event::DropGfxRtkit,
+                Event::ReleaseQueueAndManager,
+                Event::BuildFreshSession,
             ]
         );
     }
