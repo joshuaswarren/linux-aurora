@@ -1326,6 +1326,7 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 {
 	struct device_node *panel_np;
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
+	enum apple_dcp_coprocessor_start start_mode;
 	u32 cpu_ctrl, cpu_status;
 	int ret;
 
@@ -1370,22 +1371,12 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	if (IS_ERR(dcp->coproc_reg))
 		return PTR_ERR(dcp->coproc_reg);
 
-	/*
-	 * ASCWrap v6 can be handed to Linux with a live firmware-owned RTKit
-	 * session.  The cold-start path below has no protocol for adopting its
-	 * endpoint map or IOMFB shared memory, so touching PIODMA/DART state or
-	 * sending a new RTKit INIT would corrupt the inherited display session.
-	 */
-	if (dcp->hw.reject_running_coprocessor) {
-		cpu_ctrl = readl_relaxed(dcp->coproc_reg +
-					 APPLE_DCP_COPROC_CPU_CONTROL);
-		cpu_status = readl_relaxed(dcp->coproc_reg +
-					   APPLE_DCP_COPROC_CPU_STATUS);
-		if (apple_dcp_coprocessor_is_active(cpu_ctrl, cpu_status))
-			return dev_err_probe(dev, -EBUSY,
-				"refusing cold start of running firmware-owned DCP (control=%#x status=%#x)\n",
-				cpu_ctrl, cpu_status);
-	}
+	cpu_ctrl = readl_relaxed(dcp->coproc_reg +
+				 APPLE_DCP_COPROC_CPU_CONTROL);
+	cpu_status = readl_relaxed(dcp->coproc_reg +
+				   APPLE_DCP_COPROC_CPU_STATUS);
+	start_mode = apple_dcp_coprocessor_start_mode(
+		dcp->hw.adopt_running_coprocessor, cpu_ctrl, cpu_status);
 
 	of_property_read_u32(dev->of_node, "apple,dcp-index",
 					   &dcp->index);
@@ -1477,11 +1468,7 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 		(struct list_head)LIST_HEAD_INIT(dcp->swapped_out_fbs);
 	spin_lock_init(&dcp->swapped_out_lock);
 
-	if (dcp->fw_compat == DCP_FIRMWARE_H17P && !dcp->hw.adopt_live_session)
-		dcp_enable_pmc_domain(dcp);
-
-	if (start_mode == APPLE_DCP_COPROCESSOR_ADOPT_AND_RESTART &&
-	    !dcp->hw.adopt_live_session) {
+	if (start_mode == APPLE_DCP_COPROCESSOR_ADOPT_AND_RESTART) {
 		dev_info(dev,
 			 "quiescing inherited DCP session (control=%#x status=%#x)\n",
 			 cpu_ctrl, cpu_status);
@@ -1501,100 +1488,19 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 					     "Failed to quiesce inherited RTKit: %d\n",
 					     ret);
 	} else {
-		if (start_mode == APPLE_DCP_COPROCESSOR_QUIESCED_RESTART)
-			dev_info(dev, "restarting loader-quiesced DCP session\n");
-		if (dcp->hw.adopt_live_session && !live_discovery) {
-			dcp->adopting_session = true;
-			dcp->rtk = devm_apple_rtkit_init_adopted(dev, dcp,
-								 "mbox", 0,
-								 &rtkit_ops);
-			dcp->adopting_session = false;
-		} else {
-			dcp->rtk = devm_apple_rtkit_init(dev, dcp, "mbox", 0,
-							 &rtkit_ops);
-		}
+		dcp->rtk = devm_apple_rtkit_init(dev, dcp, "mbox", 0,
+						   &rtkit_ops);
 		if (IS_ERR(dcp->rtk))
 			return dev_err_probe(dev, PTR_ERR(dcp->rtk),
 					     "Failed to initialize RTKit\n");
 	}
 
-	if (dcp->hw.adopt_live_session && live_discovery) {
-		/* No CPU-control, power-domain or DART writes on this path. The
-		 * native trace receives HELLO in response to this standard INIT.
-		 * A timeout is evidence to retain; do not fall back to a reset.
-		 */
-		dev_info(dev, "negotiating RTKit on the live DCP without a reset\n");
-		ret = apple_rtkit_wake(dcp->rtk);
-	} else if (dcp->hw.adopt_live_session) {
-		/*
-		 * The loader consumed discovery. Start selected services explicitly
-		 * through dcp_start_rtkit_endpoint(), preserving the running CPU and
-		 * its firmware memory mappings.
-		 */
-		dev_info(dev, "adopting the live DCP session without a restart\n");
-		ret = 0;
-	} else {
-		cpu_ctrl = readl_relaxed(dcp->coproc_reg +
-					 APPLE_DCP_COPROC_CPU_CONTROL);
-		writel_relaxed(cpu_ctrl | APPLE_DCP_COPROC_CPU_CONTROL_RUN,
-			       dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
+	cpu_ctrl = readl_relaxed(dcp->coproc_reg +
+				 APPLE_DCP_COPROC_CPU_CONTROL);
+	writel_relaxed(cpu_ctrl | APPLE_DCP_COPROC_CPU_CONTROL_RUN,
+		       dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
 
-		ret = apple_rtkit_wake(dcp->rtk);
-	}
-	if (ret && start_mode == APPLE_DCP_COPROCESSOR_QUIESCED_RESTART) {
-		/*
-		 * INIT went unanswered.  That happens when the session we found
-		 * is not the one the loader quiesced but one an earlier probe
-		 * of this driver already brought up: RTKit is ON, so it ignores
-		 * INIT and never sends HELLO.  Adopt that session, quiesce it
-		 * back to the state the loader would have left it in, and boot
-		 * it again.  Without this, a failed probe or a module reload
-		 * can only be recovered by rebooting the machine.
-		 */
-		dev_info(dev,
-			 "DCP did not answer INIT; adopting the running session to restart it\n");
-		devm_apple_rtkit_free(dev, dcp->rtk);
-		dcp->rtk = NULL;
-		dcp->adopting_session = true;
-		dcp->rtk = devm_apple_rtkit_init_adopted(dev, dcp, "mbox", 0,
-							 &rtkit_ops);
-		if (IS_ERR(dcp->rtk)) {
-			dcp->adopting_session = false;
-			return dev_err_probe(dev, PTR_ERR(dcp->rtk),
-					     "Failed to adopt running RTKit\n");
-		}
-
-		ret = apple_rtkit_quiesce(dcp->rtk);
-		dcp->adopting_session = false;
-		if (!ret)
-			ret = apple_rtkit_wake(dcp->rtk);
-
-		if (ret) {
-			/*
-			 * The firmware is not answering the mailbox at all.
-			 * Reset the ASC core itself and cold-boot it; that
-			 * needs no cooperation from the running firmware.
-			 */
-			dev_info(dev,
-				 "DCP will not quiesce (%d); resetting the ASC core\n",
-				 ret);
-			devm_apple_rtkit_free(dev, dcp->rtk);
-			dcp->rtk = NULL;
-			ret = dcp_asc_restart(dcp);
-			if (ret)
-				return dev_err_probe(dev, ret,
-						     "Failed to reset DCP ASC: %d\n",
-						     ret);
-
-			dcp->rtk = devm_apple_rtkit_init(dev, dcp, "mbox", 0,
-							 &rtkit_ops);
-			if (IS_ERR(dcp->rtk))
-				return dev_err_probe(dev, PTR_ERR(dcp->rtk),
-						     "Failed to re-init RTKit\n");
-
-			ret = apple_rtkit_wake(dcp->rtk);
-		}
-	}
+	ret = apple_rtkit_wake(dcp->rtk);
 	if (ret)
 		return dev_err_probe(dev, ret,
 				     "Failed to boot RTKit: %d\n", ret);
@@ -1871,7 +1777,7 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t8112 = {
 
 static const struct apple_dcp_hw_data apple_dcp_hw_t8140 = {
 	.num_dptx_ports = 0,
-	.reject_running_coprocessor = true,
+	.adopt_running_coprocessor = true,
 };
 
 static const struct apple_dcp_hw_data apple_dcp_hw_dcp = {

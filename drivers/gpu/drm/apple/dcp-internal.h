@@ -133,7 +133,7 @@ enum dcp_iomfb_method_profile {
 
 struct apple_dcp_hw_data {
 	u32 num_dptx_ports;
-	bool reject_running_coprocessor;
+	bool adopt_running_coprocessor;
 };
 
 /* TODO: move IOMFB members to its own struct */
@@ -166,7 +166,6 @@ struct apple_dcp {
 	bool crashed;
 	/* Ignore inherited application-endpoint traffic while quiescing RTKit. */
 	bool adopting_session;
-	struct apple_dcp_surface_order iomfb_surfaces;
 
 	/************* IOMFB **************************************************
 	 * everything below is mostly used inside IOMFB but it could make     *
