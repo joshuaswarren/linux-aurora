@@ -18,3 +18,4 @@ appledrm-$(CONFIG_TRACING) += trace.o
 
 obj-$(CONFIG_DRM_APPLE) += appledrm.o
 obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp-lifecycle-test.o
+obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp-link-test.o
