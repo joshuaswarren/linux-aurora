@@ -600,11 +600,11 @@ pub(crate) const fn prepare_g17p_channel_write(
 // ---------------------------------------------------------------------------
 // 2d. Proven G17P first-partial graphics publication.
 //
-//     The source-built J700 opening corresponding to m1n1 commit ffe58c7
-//     executes graphics through the native partial graph. It publishes a
-//     one-record scheduler page and context-2 primary index, presents five
-//     primary status fields before control 0x84, then exposes 3D before TA and
-//     sends one paired EP 0x21/0x83 kick. This is the classic channel path and
+//     The measured J700 first-partial source contract executes graphics through
+//     the native partial graph. It publishes a one-record scheduler page and
+//     context-2 primary index, presents five primary status fields before
+//     control 0x84, then exposes 3D before TA and sends one EP 0x21/0x83 kick
+//     for transport pair 2 on channel 8. This is the classic channel path and
 //     remains separate from the kext's SKSM queue-entry plus `addKicks` path.
 // ---------------------------------------------------------------------------
 
@@ -614,7 +614,9 @@ pub(crate) const G17P_PARTIAL_OPENING_SCHEDULER_WORD: u64 = 0x0000_0020_0001_900
 pub(crate) const G17P_PARTIAL_OPENING_PRIMARY_INDEX_GPU_VA: u64 = 0x0000_0010_0019_0000;
 pub(crate) const G17P_PARTIAL_OPENING_FWCTL_OFFSET: u64 = 0x001c_0000;
 pub(crate) const G17P_PARTIAL_OPENING_CONTROL_MESSAGE_SIZE: u64 = 0x40;
-pub(crate) const G17P_PARTIAL_OPENING_PAIRED_DOORBELL: u64 = MSG_TX_DOORBELL;
+pub(crate) const G17P_PARTIAL_OPENING_WORK_DOORBELL_CHANNEL: u8 = 8;
+pub(crate) const G17P_PARTIAL_OPENING_PAIRED_DOORBELL: u64 =
+    MSG_TX_DOORBELL | G17P_PARTIAL_OPENING_WORK_DOORBELL_CHANNEL as u64;
 
 /// Root, queue, and scheduler identities at the proven first-work boundary.
 /// Linux owns the backing pages; the physical addresses from the m1n1 run are
@@ -627,12 +629,13 @@ pub(crate) struct G17PPartialOpeningContextContract {
     pub(crate) render_context_id: u8,
     pub(crate) context0_empty_high_root_slot: u8,
     pub(crate) render_empty_high_root_slot: u8,
-    pub(crate) queue_pair: u8,
+    pub(crate) transport_pair: u8,
+    pub(crate) descriptor_pair: u8,
     pub(crate) graph_context_id: u8,
     pub(crate) optional_identity_context_id: u8,
     pub(crate) descriptor_context_id: u8,
     pub(crate) scheduler_class: u8,
-    pub(crate) channel_pair: u8,
+    pub(crate) work_doorbell_channel: u8,
     pub(crate) firmware_low_root_present_at_first_work: bool,
     pub(crate) source_firmware_high_root_table_resident: bool,
 }
@@ -645,12 +648,13 @@ pub(crate) const G17P_PARTIAL_OPENING_CONTEXT: G17PPartialOpeningContextContract
         render_context_id: 1,
         context0_empty_high_root_slot: 0,
         render_empty_high_root_slot: 1,
-        queue_pair: 2,
+        transport_pair: 2,
+        descriptor_pair: 0,
         graph_context_id: 2,
         optional_identity_context_id: 3,
         descriptor_context_id: 2,
         scheduler_class: 2,
-        channel_pair: 0,
+        work_doorbell_channel: G17P_PARTIAL_OPENING_WORK_DOORBELL_CHANNEL,
         firmware_low_root_present_at_first_work: false,
         source_firmware_high_root_table_resident: false,
     };
@@ -2657,12 +2661,13 @@ mod tests {
                 render_context_id: 1,
                 context0_empty_high_root_slot: 0,
                 render_empty_high_root_slot: 1,
-                queue_pair: 2,
+                transport_pair: 2,
+                descriptor_pair: 0,
                 graph_context_id: 2,
                 optional_identity_context_id: 3,
                 descriptor_context_id: 2,
                 scheduler_class: 2,
-                channel_pair: 0,
+                work_doorbell_channel: 8,
                 firmware_low_root_present_at_first_work: false,
                 source_firmware_high_root_table_resident: false,
             }
@@ -2748,10 +2753,11 @@ mod tests {
                 next_producer: 0,
             }
         );
-        assert_eq!(prepared.paired_doorbell, 0x0083_0000_0000_0000);
+        assert_eq!(G17P_PARTIAL_OPENING_WORK_DOORBELL_CHANNEL, 8);
+        assert_eq!(prepared.paired_doorbell, 0x0083_0000_0000_0008);
         assert_eq!(
             prepared.paired_doorbell,
-            encode_tx_doorbell(PipeType::Vertex, 0).unwrap()
+            encode_tx_doorbell(PipeType::Vertex, 2).unwrap()
         );
     }
 
