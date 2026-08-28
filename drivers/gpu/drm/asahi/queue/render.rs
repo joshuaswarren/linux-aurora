@@ -229,6 +229,8 @@ impl super::QueueInner::ver {
 
         let gpu = match (*self.dev)
             .gpu
+            .legacy_manager()
+            .ok_or(EIO)?
             .as_any()
             .downcast_ref::<gpu::GpuManager::ver>()
         {
