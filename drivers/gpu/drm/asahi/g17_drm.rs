@@ -461,7 +461,7 @@ impl queue::Queue for G17PQueue {
                 let completion = self
                     .runtime
                     .lock()
-                    .submit_translated_compute(&translated, owned_timestamps)?;
+                    .submit_translated_compute(&self.vm, &translated, owned_timestamps)?;
                 Self::copy_timestamp(start, completion[0])?;
                 Self::copy_timestamp(end, completion[1])?;
             }

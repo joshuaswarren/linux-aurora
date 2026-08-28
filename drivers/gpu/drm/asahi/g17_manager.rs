@@ -352,6 +352,14 @@ pub(crate) struct G17PComputeSubmissionContext<'a> {
     pub(crate) auxiliary: u64,
 }
 
+/// User-VM aliases and its active TTBAT binding. The live runtime retains this
+/// object until the entry completes or both processors stop during recovery.
+#[cfg(not(test))]
+pub(crate) struct G17PComputeUserBinding {
+    mappings: g17_resources::G17PComputeUserMappings,
+    _vm_bind: mmu::VmBind,
+}
+
 /// The two complete queue groups exposed by the exact first graphics publish.
 #[cfg(not(test))]
 pub(crate) struct G17PPartialOpeningRenderSubmission {
@@ -736,6 +744,28 @@ impl G17PManagerConstruction {
         Ok(queue.queue_id)
     }
 
+    pub(crate) fn bind_compute_user_vm(
+        &mut self,
+        queue: &mut G17PSksmQueue,
+        vm: &mmu::Vm,
+    ) -> Result<G17PComputeUserBinding> {
+        if !queue.registered
+            || queue.scratch != self.sksm_scratch()
+            || queue.uat_owner != self.uat().ttb_base()
+        {
+            return Err(EINVAL);
+        }
+        let mappings = queue.compute.map_user_execution_state(vm)?;
+        let vm_bind = self.resources.uat().bind(vm)?;
+        if vm_bind.slot() != 1 || !mappings.all_reachable_from(vm) {
+            return Err(EFAULT);
+        }
+        Ok(G17PComputeUserBinding {
+            mappings,
+            _vm_bind: vm_bind,
+        })
+    }
+
     /// Configure one SKSM queue through resource 0 and return its registered
     /// state only after the QID-valid bit is published.
     pub(crate) fn configure_compute_sksm_queue(
@@ -892,6 +922,7 @@ impl G17PManagerConstruction {
         &mut self,
         registers: &regs::Resources,
         queue: &mut G17PSksmQueue,
+        binding: &G17PComputeUserBinding,
         command: &g17_uapi::TranslatedComputeCommand,
         context: G17PComputeSubmissionContext<'_>,
     ) -> Result<u64> {
@@ -904,8 +935,10 @@ impl G17PManagerConstruction {
 
         let timestamp = g17_submission::decode_kick_timestamp(queue.producer.current_timestamp)
             .map_err(|_| EINVAL)?;
-        let (descriptor_high, descriptor_low) =
-            queue.compute.descriptor_gpu_vas(timestamp.stamp_index);
+        let (descriptor_high, _) = queue.compute.descriptor_gpu_vas(timestamp.stamp_index);
+        let descriptor_low = binding
+            .mappings
+            .descriptor_gpu_va(timestamp.stamp_index);
         let command_state = g17_submission::prepare_g17p_compute_cl_command_state(
             descriptor_low,
             queue.submission_ordinal,
@@ -933,9 +966,10 @@ impl G17PManagerConstruction {
         let ordinal = queue.submission_ordinal;
         let next_ordinal = ordinal.checked_add(1).ok_or(EOVERFLOW)?;
         let queue_submission = ordinal.checked_add(1).ok_or(EINVAL)?;
-        let preempt_base = queue.compute.preempt_gpu_va();
-        let robustness = queue.compute.robustness_gpu_va();
-        let operand_state_base = queue.compute.operand_state_gpu_va();
+        let user_layout = binding.mappings.layout();
+        let preempt_base = user_layout.preempt;
+        let robustness = user_layout.robustness;
+        let operand_state_base = user_layout.operand_state;
         let shared_control = queue.storage.shared_support_gpu_va();
         let objects = g17_compute::ComputeDescriptorObjects {
             scheduler_record: queue.compute.scheduler_record_gpu_va(),

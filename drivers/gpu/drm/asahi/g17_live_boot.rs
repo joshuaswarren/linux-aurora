@@ -288,6 +288,7 @@ pub(crate) struct G17PLiveRuntime {
     gfx1_state: Option<Arc<G17PRoleRtkitState>>,
     gfx1_rtkit: Option<rtkit::RtKit<G17PRtkitOps>>,
     queue: Option<g17_manager::G17PSksmQueue>,
+    compute_binding: Option<g17_manager::G17PComputeUserBinding>,
     completion_indices: g17_completion::QueueIndices,
     render_tracker: Option<g17_manager::G17PPartialOpeningRenderTracker>,
     accepting_submissions: bool,
@@ -395,10 +396,19 @@ impl G17PLiveRuntime {
     /// words.
     pub(crate) fn submit_translated_compute(
         &mut self,
+        vm: &mmu::Vm,
         command: &g17_uapi::TranslatedComputeCommand,
         owned_timestamps: mmu::KernelMapping,
     ) -> Result<[u64; 2]> {
-        if !self.accepting_submissions || self.is_crashed() {
+        if !self.accepting_submissions || self.is_crashed() || self.compute_binding.is_some() {
+            g17_lifecycle::recover_persistent_runtime(self)?;
+        }
+        if self
+            .manager
+            .as_ref()
+            .ok_or(ENODEV)?
+            .retained_render_needs_recycle(vm)
+        {
             g17_lifecycle::recover_persistent_runtime(self)?;
         }
         if owned_timestamps.size() < 16 {
@@ -406,13 +416,21 @@ impl G17PLiveRuntime {
         }
         let timestamp_start = owned_timestamps.iova();
         let timestamp_end = timestamp_start.checked_add(8).ok_or(EOVERFLOW)?;
+        let binding = {
+            let manager = self.manager.as_mut().ok_or(ENODEV)?;
+            let queue = self.queue.as_mut().ok_or(ENODEV)?;
+            manager.bind_compute_user_vm(queue, vm)?
+        };
+        self.compute_binding = Some(binding);
         let submit_result = {
             let registers = self.registers.as_ref().ok_or(ENODEV)?;
             let manager = self.manager.as_mut().ok_or(ENODEV)?;
             let queue = self.queue.as_mut().ok_or(ENODEV)?;
+            let binding = self.compute_binding.as_ref().ok_or(ENODEV)?;
             manager.submit_translated_compute(
                 registers,
                 queue,
+                binding,
                 command,
                 g17_manager::G17PComputeSubmissionContext {
                     context_id: 3,
@@ -461,10 +479,18 @@ impl G17PLiveRuntime {
                 };
             }
         };
-        self.manager
+        let retire_result = self
+            .manager
             .as_ref()
             .ok_or(ENODEV)?
-            .complete_compute_entries(self.queue.as_mut().ok_or(ENODEV)?, 1)?;
+            .complete_compute_entries(self.queue.as_mut().ok_or(ENODEV)?, 1);
+        if let Err(error) = retire_result {
+            return match g17_lifecycle::recover_persistent_runtime(self) {
+                Ok(()) => Err(error),
+                Err(recovery_error) => Err(recovery_error),
+            };
+        }
+        drop(self.compute_binding.take());
         Ok(completion)
     }
 
@@ -511,6 +537,7 @@ impl G17PLiveRuntime {
             gfx1_state: Some(session.gfx1_state),
             gfx1_rtkit: Some(session.gfx1_rtkit),
             queue: Some(session.queue),
+            compute_binding: None,
             completion_indices: g17_completion::QueueIndices {
                 done: 0,
                 read: 0,
@@ -637,6 +664,7 @@ impl g17_lifecycle::PersistentRuntimeRecovery for G17PLiveRuntime {
     }
 
     fn release_runtime_objects(&mut self) {
+        drop(self.compute_binding.take());
         drop(self.queue.take());
         if let Some(manager) = self.manager.as_mut() {
             manager.release_runtime_objects_after_processor_stop();
@@ -683,6 +711,7 @@ impl g17_lifecycle::PersistentRuntimeTeardown for G17PLiveRuntime {
     }
 
     fn drop_queue(&mut self) {
+        drop(self.compute_binding.take());
         drop(self.queue.take());
     }
 
