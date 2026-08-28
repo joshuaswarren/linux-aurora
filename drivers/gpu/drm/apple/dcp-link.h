@@ -28,6 +28,7 @@
 #define APPLE_DCP_LINK_MSG_STREAM		GENMASK_ULL(15, 10)
 #define APPLE_DCP_LINK_MSG_OFFSET		GENMASK_ULL(31, 16)
 #define APPLE_DCP_LINK_MSG_SIZE			GENMASK_ULL(47, 32)
+#define APPLE_DCP_LINK_MSG_HASH			GENMASK_ULL(47, 16)
 #define APPLE_DCP_LINK_MSG_VERSION		GENMASK_ULL(63, 48)
 
 struct apple_dcp_link_init_desc {
@@ -76,6 +77,19 @@ static inline u64 apple_dcp_link_ready_message(void)
 	return FIELD_PREP(APPLE_DCP_LINK_MSG_VERSION,
 			  APPLE_DCP_LINK_PROTOCOL_VERSION) |
 	       APPLE_DCP_LINK_MSG_READY;
+}
+
+static inline int apple_dcp_link_ready_reply(u64 message, u16 *version,
+					     u32 *firmware_hash)
+{
+	if (!version || !firmware_hash)
+		return -EINVAL;
+	if ((message & GENMASK_ULL(1, 0)) != APPLE_DCP_LINK_MSG_READY)
+		return -EPROTO;
+
+	*version = FIELD_GET(APPLE_DCP_LINK_MSG_VERSION, message);
+	*firmware_hash = FIELD_GET(APPLE_DCP_LINK_MSG_HASH, message);
+	return 0;
 }
 
 static inline int apple_dcp_link_rpc_payload_size(u32 input_size,
@@ -141,6 +155,16 @@ static inline int apple_dcp_link_stream_message(u64 message, u8 stream,
 
 	*encoded = message;
 	return 0;
+}
+
+static inline u8 apple_dcp_link_message_stream(u64 message)
+{
+	return FIELD_GET(APPLE_DCP_LINK_MSG_STREAM, message);
+}
+
+static inline bool apple_dcp_link_message_is_remote(u64 message)
+{
+	return message & APPLE_DCP_LINK_MSG_REMOTE;
 }
 
 static inline int apple_dcp_link_stack_push(u32 top, u32 capacity,
