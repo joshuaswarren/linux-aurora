@@ -53,6 +53,34 @@ static void apple_dcp_link_stream_layout_test(struct kunit *test)
 			-EINVAL);
 }
 
+static void apple_dcp_h17p_clock_rate_test(struct kunit *test)
+{
+	struct apple_dcp_h17p_clock_request request = {
+		.service = cpu_to_le32(7),
+		.clock_id = cpu_to_le32(APPLE_DCP_H17P_CLOCK_ID_154),
+	};
+	u64 rate;
+
+	KUNIT_ASSERT_EQ(test,
+			apple_dcp_h17p_clock_rate(&request, 300000000,
+						   450000000, &rate),
+			0);
+	KUNIT_EXPECT_EQ(test, rate, 300000000ULL);
+
+	request.clock_id = cpu_to_le32(APPLE_DCP_H17P_CLOCK_ID_194);
+	KUNIT_ASSERT_EQ(test,
+			apple_dcp_h17p_clock_rate(&request, 300000000,
+						   450000000, &rate),
+			0);
+	KUNIT_EXPECT_EQ(test, rate, 450000000ULL);
+
+	request.clock_id = cpu_to_le32(0);
+	KUNIT_EXPECT_EQ(test,
+			apple_dcp_h17p_clock_rate(&request, 300000000,
+						   450000000, &rate),
+			-ENOENT);
+}
+
 static void apple_dcp_h17p_method_test(struct kunit *test)
 {
 	struct apple_dcp_link_method method;
@@ -323,6 +351,7 @@ static void apple_dcp_h17p_rt_bw_reply_test(struct kunit *test)
 static struct kunit_case apple_dcp_link_test_cases[] = {
 	KUNIT_CASE(apple_dcp_link_init_desc_test),
 	KUNIT_CASE(apple_dcp_link_stream_layout_test),
+	KUNIT_CASE(apple_dcp_h17p_clock_rate_test),
 	KUNIT_CASE(apple_dcp_h17p_method_test),
 	KUNIT_CASE(apple_dcp_h17p_callback_method_test),
 	KUNIT_CASE(apple_dcp_link_init_message_test),

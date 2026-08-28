@@ -49,6 +49,26 @@
 		device_type = "memory";
 		reg = <0x100 0 0x2 0>; /* To be filled by loader */
 	};
+
+	/* Live /arm-io/clock-frequencies entries 0x154 and 0x194. */
+	clk_disp0_154: clock-disp0-154 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <300000000>;
+		clock-output-names = "clk_disp0_154";
+	};
+
+	clk_disp0_194: clock-disp0-194 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <450000000>;
+		clock-output-names = "clk_disp0_194";
+	};
+};
+
+&dcp {
+	clocks = <&clk_disp0_154>, <&clk_disp0_194>;
+	clock-names = "clock-154", "clock-194";
 };
 
 /*

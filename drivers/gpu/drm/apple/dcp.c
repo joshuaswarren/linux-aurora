@@ -1085,6 +1085,10 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	if (IS_ERR(dcp->clk))
 		return dev_err_probe(dev, PTR_ERR(dcp->clk),
 				     "Unable to find clock\n");
+	dcp->clk_194 = devm_clk_get_optional(dev, "clock-194");
+	if (IS_ERR(dcp->clk_194))
+		return dev_err_probe(dev, PTR_ERR(dcp->clk_194),
+				     "Unable to find clock 0x194\n");
 
 	bitmap_zero(dcp->memdesc_map, DCP_MAX_MAPPINGS);
 	// TDOD: mem_desc IDs start at 1, for simplicity just skip '0' entry
@@ -1171,6 +1175,9 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 
 	devm_clk_put(dev, dcp->clk);
 	dcp->clk = NULL;
+	if (dcp->clk_194)
+		devm_clk_put(dev, dcp->clk_194);
+	dcp->clk_194 = NULL;
 }
 
 static const struct component_ops dcp_comp_ops = {
