@@ -39,7 +39,7 @@ use kernel::{
 
 use crate::{
     driver::{AsahiDevice, T8140LiveTopologyAdmission},
-    g17_lifecycle, g17_manager, g17_rtkit, hw, identity, regs,
+    g17_completion, g17_lifecycle, g17_manager, g17_rtkit, hw, identity, regs,
 };
 use kernel::sync::aref::ARef;
 
@@ -201,6 +201,7 @@ pub(crate) struct G17PLiveRuntime {
     gfx1_state: Option<Arc<G17PRoleRtkitState>>,
     gfx1_rtkit: Option<rtkit::RtKit<G17PRtkitOps>>,
     queue: Option<g17_manager::G17PSksmQueue>,
+    completion_indices: g17_completion::QueueIndices,
 }
 
 impl G17PLiveRuntime {
@@ -356,7 +357,46 @@ impl G17PLiveRuntime {
             gfx1_state: Some(gfx1_state),
             gfx1_rtkit: Some(gfx1_rtkit),
             queue: Some(queue),
+            completion_indices: g17_completion::QueueIndices {
+                done: 0,
+                read: 0,
+                write: 0,
+            },
         })
+    }
+
+    /// Apply one selector-2 completion report to the retained compute queue.
+    ///
+    /// The IRQ/ring reader supplies the current cumulative queue counters and
+    /// the prefix published to firmware. This boundary decodes the exact
+    /// compute completion shape, rejects another QID, and subtracts only the
+    /// newly completed count from the retained producer state.
+    pub(crate) fn observe_compute_completion(
+        &mut self,
+        raw: &[u8],
+        current: g17_completion::QueueIndices,
+        published_prefix: u32,
+    ) -> Result<g17_completion::QueuePrefixState> {
+        let manager = self.manager.as_ref().ok_or(ENODEV)?;
+        let queue = self.queue.as_mut().ok_or(ENODEV)?;
+        let report = g17_completion::observe_compute_completion_report(
+            raw,
+            self.completion_indices,
+            current,
+            published_prefix,
+        )
+        .map_err(|_| EINVAL)?;
+        if report.entry.queue_id != manager.compute_queue_id(queue)? {
+            return Err(EINVAL);
+        }
+
+        let completed = current
+            .done
+            .checked_sub(self.completion_indices.done)
+            .ok_or(EINVAL)?;
+        manager.complete_compute_entries(queue, completed)?;
+        self.completion_indices = current;
+        Ok(report.queue)
     }
 }
 
