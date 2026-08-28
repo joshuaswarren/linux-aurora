@@ -16,6 +16,7 @@ use core::num::NonZeroUsize;
 use core::ops::Range;
 use core::sync::atomic::{
     fence,
+    AtomicBool,
     AtomicU32,
     AtomicU64,
     AtomicU8,
@@ -838,6 +839,20 @@ impl KernelMapping {
         }
         fence(Ordering::SeqCst);
 
+        // T8140 builds its UAT and object graph before AsahiData.gpu is
+        // initialized. A constructor error can therefore drop cached mappings
+        // while owner.dev has no DrmGpu yet. Those mappings were never
+        // published to firmware, so the PTE downgrade above is sufficient.
+        if !self.0.uat_inner.firmware_cache_flush_ready() {
+            mod_dev_dbg!(
+                owner.dev,
+                "MMU: firmware cache flush not armed for {:#x}:{:#x}\n",
+                self.iova(),
+                self.size()
+            );
+            return;
+        }
+
         // If we don't have (and have never had) a VM slot, just return
         let slot = match owner.slot() {
             None => return,
@@ -1030,6 +1045,7 @@ unsafe impl Send for UatShared {}
 /// Inner data for the top-level UAT instance.
 #[pin_data]
 struct UatInner {
+    firmware_cache_flush_ready: AtomicBool,
     #[pin]
     shared: Mutex<UatShared>,
     #[pin]
@@ -1037,6 +1053,10 @@ struct UatInner {
 }
 
 impl UatInner {
+    fn firmware_cache_flush_ready(&self) -> bool {
+        self.firmware_cache_flush_ready.load(Ordering::Acquire)
+    }
+
     /// Take the lock on the shared data and return the guard.
     fn lock(&self) -> Guard<'_, UatShared, MutexBackend> {
         self.shared.lock()
@@ -1798,6 +1818,18 @@ impl Uat {
         iova_kern_range(self.cfg)
     }
 
+    /// Arm firmware-backed mapping teardown after the DRM device data slot
+    /// contains its live DrmGpu owner. Legacy/Dekker UATs start armed.
+    pub(crate) fn mark_firmware_cache_flush_ready(&self) {
+        if !self
+            .inner
+            .firmware_cache_flush_ready
+            .swap(true, Ordering::AcqRel)
+        {
+            dev_info!(self.dev.as_ref(), "MMU: firmware cache flushes armed\n");
+        }
+    }
+
     #[cfg(CONFIG_DEV_COREDUMP)]
     pub(crate) fn dump_kernel_pages(&self) -> Result<KVVec<pgtable::DumpedPage>> {
         // Full upper-half range for this SoC's root geometry.
@@ -2044,6 +2076,9 @@ impl Uat {
 
         Arc::pin_init(
             try_pin_init!(UatInner {
+                firmware_cache_flush_ready: AtomicBool::new(
+                    handoff_mode == HandoffMode::FirmwareDekker
+                ),
                 handoff_flush <- pin_init::pin_init_array_from_fn(|i| {
                     new_mutex!(HandoffFlush(&handoff.flush[i], handoff_mode), "handoff_flush")
                 }),

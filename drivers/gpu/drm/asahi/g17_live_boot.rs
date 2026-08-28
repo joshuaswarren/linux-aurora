@@ -419,6 +419,14 @@ impl G17PLiveRuntime {
                 .is_some_and(|state| state.crashed.load(Ordering::Acquire))
     }
 
+    pub(crate) fn mark_firmware_cache_flush_ready(&self) -> Result {
+        self.manager
+            .as_ref()
+            .ok_or(ENODEV)?
+            .mark_firmware_cache_flush_ready();
+        Ok(())
+    }
+
     pub(crate) fn new_user_vm(
         &mut self,
         id: u64,
@@ -641,12 +649,22 @@ impl G17PLiveRuntime {
         );
 
         let pdev_ref: ARef<platform::Device> = pdev.into();
-        let mut manager = g17_manager::G17PManagerConstruction::new(
+        let mut manager = match g17_manager::G17PManagerConstruction::new(
             &drm,
             soc,
             g17_manager::T8140_G17P_PLATFORM_CONFIG,
             num_clusters,
-        )?;
+        ) {
+            Ok(manager) => manager,
+            Err(error) => {
+                dev_err!(
+                    pdev.as_ref(),
+                    "G17P live-boot: resource construction failed ({:?})\n",
+                    error
+                );
+                return Err(error);
+            }
+        };
         let session = boot_session(&pdev_ref, &drm, &registers, &mut manager, test_stage)?;
         let accepting_submissions = session.compute_uapi_enabled && session.queue.is_some();
 

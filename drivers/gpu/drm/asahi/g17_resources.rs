@@ -793,35 +793,64 @@ fn read_control_counters(object: &mut MappedObject, state_grid: u64) -> Result<[
     Ok(counters)
 }
 
-#[cfg(not(test))]
-fn map_t8140_register_windows(uat: &mmu::Uat) -> Result<KVec<mmu::KernelMapping>> {
-    let mut mappings = KVec::new();
-    let page_mask = mmu::UAT_PGMSK as u64;
-    for window in g17_initdata::T8140_REGISTER_WINDOWS {
-        let phys_page = window.phys & !page_mask;
-        let device_page = window.device_va & !page_mask;
-        if window.phys & page_mask != window.device_va & page_mask {
-            return Err(EINVAL);
-        }
-        let end = window
-            .device_va
-            .checked_add(window.size as u64)
-            .ok_or(EINVAL)?;
-        let span = end
-            .checked_sub(device_page)
-            .and_then(|size| size.checked_add(page_mask))
-            .map(|size| size & !page_mask)
-            .ok_or(EINVAL)?;
-        mappings.push(
-            uat.kernel_vm().map_io(
-                device_page,
-                phys_page.try_into()?,
-                span.try_into()?,
-                mmu::PROT_FW_MMIO_RW,
-            )?,
-            GFP_KERNEL,
-        )?;
+fn register_window_pages(window: &g17_initdata::RegisterWindow) -> Option<(u64, u64, u64)> {
+    let page_mask = G17P_PAGE_SIZE as u64 - 1;
+    let phys_page = window.phys & !page_mask;
+    let device_page = window.device_va & !page_mask;
+    if window.phys & page_mask != window.device_va & page_mask {
+        return None;
     }
+    let end = window.device_va.checked_add(window.size as u64)?;
+    let span = end
+        .checked_sub(device_page)?
+        .checked_add(page_mask)?
+        & !page_mask;
+    Some((phys_page, device_page, span))
+}
+
+#[cfg(not(test))]
+fn map_t8140_register_windows(
+    dev: &AsahiDevice,
+    uat: &mmu::Uat,
+) -> Result<KVec<mmu::KernelMapping>> {
+    let mut mappings = KVec::new();
+    for window in g17_initdata::T8140_REGISTER_WINDOWS {
+        let (phys_page, device_page, span) = register_window_pages(&window).ok_or(EINVAL)?;
+        let mapping = match uat.kernel_vm().map_io(
+            device_page,
+            phys_page.try_into()?,
+            span.try_into()?,
+            mmu::PROT_FW_MMIO_RW,
+        ) {
+            Ok(mapping) => mapping,
+            Err(error) => {
+                dev_err!(
+                    dev.as_ref(),
+                    "G17P resources: register window slot {} map failed ({:#x}:{:#x} -> {:#x}, {:?})\n",
+                    window.slot,
+                    phys_page,
+                    span,
+                    device_page,
+                    error
+                );
+                return Err(error);
+            }
+        };
+        if let Err(error) = mappings.push(mapping, GFP_KERNEL) {
+            dev_err!(
+                dev.as_ref(),
+                "G17P resources: retaining register window slot {} failed ({:?})\n",
+                window.slot,
+                error
+            );
+            return Err(error.into());
+        }
+    }
+    dev_info!(
+        dev.as_ref(),
+        "G17P resources: all {} register windows mapped\n",
+        g17_initdata::T8140_REGISTER_WINDOWS.len()
+    );
     Ok(mappings)
 }
 
@@ -2124,6 +2153,9 @@ impl G17ResourceOwner {
         let address_space = G17UatOwner { uat };
         dev_info!(dev.as_ref(), "G17P resources: building firmware layout\n");
 
+        // Reserve the firmware MMIO aperture before allocator-selected
+        // objects can occupy one of its fixed device-VA ranges.
+        let register_windows = map_t8140_register_windows(dev, &address_space.uat)?;
         let kernel_va_base = address_space.uat.kernel_va_range()?.start;
         let fwctl_gpu_va = kernel_va_base
             .checked_add(g17_submission::G17P_PARTIAL_OPENING_FWCTL_OFFSET)
@@ -2138,6 +2170,59 @@ impl G17ResourceOwner {
         partial_scheduler.with_bytes_mut(|bytes| {
             g17_submission::apply_g17p_partial_opening_scheduler_page(bytes).map_err(|_| EINVAL)
         })?;
+        let primary_b2_alias_1_gpu_va =
+            g17_submission::G17P_PARTIAL_OPENING_SCHEDULER_GPU_VA
+                .checked_add(0x8000)
+                .ok_or(EINVAL)?;
+        dev_info!(
+            dev.as_ref(),
+            "G17P resources: mapping B2 alias at {:#x}\n",
+            primary_b2_alias_1_gpu_va
+        );
+        let mut primary_b2_alias_1 = match MappedObject::new_at(
+            dev,
+            address_space.uat.kernel_vm(),
+            primary_b2_alias_1_gpu_va,
+            G17P_CL_B2_OBJECT_SIZE,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        ) {
+            Ok(mapping) => mapping,
+            Err(error) => {
+                dev_err!(
+                    dev.as_ref(),
+                    "G17P resources: B2 alias map at {:#x} failed ({:?})\n",
+                    primary_b2_alias_1_gpu_va,
+                    error
+                );
+                return Err(error);
+            }
+        };
+        primary_b2_alias_1.with_bytes_mut(|bytes| {
+            for (index, value) in [
+                0xe000_0000u32,
+                0x0800_0000,
+                0x0000_0000,
+                0x0000_2a00,
+                0x0000_1500,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                bytes[0x20 + index * 4..0x24 + index * 4].copy_from_slice(&value.to_le_bytes());
+            }
+            Ok(())
+        })?;
+        let primary_b2_alias_0_low = partial_scheduler.map_alias_at(
+            address_space.uat.kernel_lower_vm(),
+            g17_initdata::REGION_VIEW_LOW_ADDRS[0],
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        let primary_b2_alias_1_low = primary_b2_alias_1.map_alias_at(
+            address_space.uat.kernel_lower_vm(),
+            g17_initdata::REGION_VIEW_LOW_ADDRS[1],
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        dev_info!(dev.as_ref(), "G17P resources: B2 aliases mapped\n");
         let mut partial_primary_index = MappedObject::new_at(
             dev,
             address_space.uat.kernel_lower_vm(),
@@ -2267,39 +2352,6 @@ impl G17ResourceOwner {
             STATUS_A_ALLOC_SIZE,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_FW_SHARED_RW,
-        )?;
-        let register_windows = map_t8140_register_windows(&address_space.uat)?;
-        let mut primary_b2_alias_1 = MappedObject::new_at(
-            dev,
-            address_space.uat.kernel_vm(),
-            g17_submission::G17P_PARTIAL_OPENING_SCHEDULER_GPU_VA + 0x8000,
-            G17P_CL_B2_OBJECT_SIZE,
-            mmu::PROT_GPU_FW_SHARED_RW,
-        )?;
-        primary_b2_alias_1.with_bytes_mut(|bytes| {
-            for (index, value) in [
-                0xe000_0000u32,
-                0x0800_0000,
-                0x0000_0000,
-                0x0000_2a00,
-                0x0000_1500,
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                bytes[0x20 + index * 4..0x24 + index * 4].copy_from_slice(&value.to_le_bytes());
-            }
-            Ok(())
-        })?;
-        let primary_b2_alias_0_low = partial_scheduler.map_alias_at(
-            address_space.uat.kernel_lower_vm(),
-            g17_initdata::REGION_VIEW_LOW_ADDRS[0],
-            mmu::PROT_GPU_FW_SHARED_RW,
-        )?;
-        let primary_b2_alias_1_low = primary_b2_alias_1.map_alias_at(
-            address_space.uat.kernel_lower_vm(),
-            g17_initdata::REGION_VIEW_LOW_ADDRS[1],
-            mmu::PROT_GPU_FW_SHARED_RW,
         )?;
         let primary_region_views = g17_initdata::PrimaryRegionViews {
             sentinel_high: primary_b2_sentinel.iova(),
@@ -2440,6 +2492,10 @@ impl G17ResourceOwner {
 
     pub(crate) fn uat(&self) -> &mmu::Uat {
         &self.address_space.uat
+    }
+
+    pub(crate) fn mark_firmware_cache_flush_ready(&self) {
+        self.address_space.uat.mark_firmware_cache_flush_ready();
     }
 
     pub(crate) fn control_counters(&mut self) -> Result<G17PControlCounters> {
@@ -2963,6 +3019,39 @@ mod tests {
         );
         assert_eq!(g17_initdata::T8140_REGISTER_WINDOWS[17].slot, 41);
         assert_eq!(g17_initdata::T8140_REGISTER_FLAG_ONLY_SLOTS.len(), 17);
+    }
+
+    #[test]
+    fn t8140_register_windows_expand_to_distinct_uat_pages() {
+        let mapped: Vec<_> = g17_initdata::T8140_REGISTER_WINDOWS
+            .iter()
+            .map(|window| register_window_pages(window).unwrap())
+            .collect();
+
+        for (index, (_, device_page, span)) in mapped.iter().copied().enumerate() {
+            assert_eq!(device_page & (G17P_PAGE_SIZE as u64 - 1), 0);
+            assert_eq!(span & (G17P_PAGE_SIZE as u64 - 1), 0);
+            assert!(g17_initdata::HW_REGISTER_APERTURE.start <= device_page);
+            assert!(
+                device_page + span <= g17_initdata::HW_REGISTER_APERTURE.end,
+                "register window {index} leaves its aperture"
+            );
+            for (_, other_page, other_span) in mapped.iter().copied().skip(index + 1) {
+                assert!(
+                    device_page + span <= other_page || other_page + other_span <= device_page,
+                    "register window {index} overlaps another expanded mapping"
+                );
+            }
+        }
+
+        assert_eq!(
+            mapped[17],
+            (0x0048_0e1c_000, 0xffff_fc21_800e_8000, 0x8000)
+        );
+        let scheduler = g17_submission::G17P_PARTIAL_OPENING_SCHEDULER_GPU_VA;
+        let b2_alias = scheduler + 0x8000;
+        assert!(scheduler + G17P_CL_B2_OBJECT_SIZE as u64 <= b2_alias);
+        assert!(b2_alias + G17P_CL_B2_OBJECT_SIZE as u64 <= mapped[0].1);
     }
 
     #[test]
