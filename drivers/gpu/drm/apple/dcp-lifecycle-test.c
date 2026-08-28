@@ -77,11 +77,56 @@ static void apple_dcp_j700_stopped_handoff_test(struct kunit *test)
 		APPLE_DCP_LOADER_HANDOFF_ASC_STOPPED;
 	enum apple_dcp_coprocessor_start start_mode;
 
-	start_mode = apple_dcp_coprocessor_start_mode(handoff, true, 0, 0x68);
+	/* Live loader-stopped value from J700 after the RUN bit was cleared. */
+	start_mode = apple_dcp_coprocessor_start_mode(handoff, true, 0, 0x48);
 	KUNIT_EXPECT_EQ(test, start_mode,
 			APPLE_DCP_COPROCESSOR_ASC_STOPPED_RESTART);
 	KUNIT_EXPECT_FALSE(test, apple_dcp_needs_adoption(start_mode));
 	KUNIT_EXPECT_TRUE(test, apple_dcp_needs_fresh_boot(start_mode));
+}
+
+static void apple_dcp_pmgr_set_target_test(struct kunit *test)
+{
+	u32 original = 0xb5a5d7bf;
+	u32 off = apple_dcp_pmgr_with_target(original, APPLE_DCP_PMGR_PS_OFF);
+	u32 active = apple_dcp_pmgr_with_target(off, APPLE_DCP_PMGR_PS_ACTIVE);
+	u32 auto_active = apple_dcp_pmgr_with_auto_enable(active);
+
+	KUNIT_EXPECT_EQ(test, off & ~APPLE_DCP_PMGR_PS_SET_MASK,
+			original & ~APPLE_DCP_PMGR_PS_SET_MASK);
+	KUNIT_EXPECT_EQ(test, off & APPLE_DCP_PMGR_PS_SET_MASK, 0U);
+	KUNIT_EXPECT_EQ(test, active & ~APPLE_DCP_PMGR_PS_SET_MASK,
+			off & ~APPLE_DCP_PMGR_PS_SET_MASK);
+	KUNIT_EXPECT_EQ(test, active & APPLE_DCP_PMGR_PS_SET_MASK,
+			(u32)APPLE_DCP_PMGR_PS_ACTIVE);
+	KUNIT_EXPECT_EQ(test, auto_active & APPLE_DCP_PMGR_PS_SET_MASK,
+			(u32)(APPLE_DCP_PMGR_PS_AUTO_ENABLE |
+			      APPLE_DCP_PMGR_PS_ACTIVE));
+}
+
+static void apple_dcp_pmgr_actual_state_test(struct kunit *test)
+{
+	KUNIT_EXPECT_TRUE(test,
+		apple_dcp_pmgr_reached_target(0xa5a5c30f,
+					   APPLE_DCP_PMGR_PS_OFF));
+	KUNIT_EXPECT_TRUE(test,
+		apple_dcp_pmgr_reached_target(0xa5a5c3ff,
+					   APPLE_DCP_PMGR_PS_ACTIVE));
+	KUNIT_EXPECT_FALSE(test,
+		apple_dcp_pmgr_reached_target(0xa5a5c34f,
+					   APPLE_DCP_PMGR_PS_ACTIVE));
+}
+
+static void apple_dcp_coprocessor_stop_sequence_test(struct kunit *test)
+{
+	u32 original = 0xa5a5c3ff;
+	u32 first = apple_dcp_coprocessor_stop_first(original);
+	u32 second = apple_dcp_coprocessor_stop_second(first);
+
+	KUNIT_EXPECT_EQ(test, first, original & ~BIT(4));
+	KUNIT_EXPECT_EQ(test, second, original & ~(BIT(4) | BIT(5)));
+	KUNIT_EXPECT_EQ(test, second & ~(BIT(4) | BIT(5)),
+			original & ~(BIT(4) | BIT(5)));
 }
 
 static void apple_dcp_cold_start_does_not_adopt_test(struct kunit *test)
@@ -119,6 +164,9 @@ static struct kunit_case apple_dcp_lifecycle_test_cases[] = {
 	KUNIT_CASE(apple_dcp_j700_quiesced_handoff_test),
 	KUNIT_CASE(apple_dcp_j700_idle_handoff_test),
 	KUNIT_CASE(apple_dcp_j700_stopped_handoff_test),
+	KUNIT_CASE(apple_dcp_pmgr_set_target_test),
+	KUNIT_CASE(apple_dcp_pmgr_actual_state_test),
+	KUNIT_CASE(apple_dcp_coprocessor_stop_sequence_test),
 	KUNIT_CASE(apple_dcp_cold_start_does_not_adopt_test),
 	KUNIT_CASE(apple_dcp_cold_start_selection_test),
 	{}
