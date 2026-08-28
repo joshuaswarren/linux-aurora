@@ -141,6 +141,7 @@ struct apple_dcp {
 
 	/* clock rate request by dcp in */
 	struct clk *clk;
+	struct clk *clk_194;
 
 	/* DCP shared memory */
 	void *shmem;

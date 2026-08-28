@@ -43,6 +43,8 @@
 #define APPLE_DCP_LINK_REPLY_CONTROL_MASK	0xff3e
 
 #define APPLE_DCP_LINK_CALL_D003		0x44303033
+#define APPLE_DCP_H17P_CLOCK_ID_154		0x154
+#define APPLE_DCP_H17P_CLOCK_ID_194		0x194
 
 enum apple_dcp_h17p_callback {
 	APPLE_DCP_H17P_CB_DID_BOOT = 0x44303030,
@@ -130,6 +132,11 @@ struct apple_dcp_link_rpc_header {
 	__le32 output_size;
 } __packed;
 
+struct apple_dcp_h17p_clock_request {
+	__le32 service;
+	__le32 clock_id;
+} __packed;
+
 struct apple_dcp_h17p_rt_bw_config {
 	__le64 scratch;
 	__le64 clock_request;
@@ -156,6 +163,7 @@ struct apple_dcp_link_rpc_view {
 
 static_assert(sizeof(struct apple_dcp_link_init_desc) == 0x10);
 static_assert(sizeof(struct apple_dcp_link_rpc_header) == 0x0c);
+static_assert(sizeof(struct apple_dcp_h17p_clock_request) == 0x08);
 static_assert(sizeof(struct apple_dcp_h17p_rt_bw_config) == 0x10);
 static_assert(sizeof(struct apple_dcp_h17p_rt_bw_request) == 0x04);
 static_assert(sizeof(struct apple_dcp_h17p_rt_bw_reply) == 0x14);
@@ -164,6 +172,25 @@ static_assert(APPLE_DCP_LINK_STREAM_BUFFER_SIZE *
 	      APPLE_DCP_LINK_STREAM_HALF_SIZE);
 static_assert(APPLE_DCP_LINK_HEAP_OFFSET + APPLE_DCP_LINK_HEAP_SIZE ==
 	      APPLE_DCP_LINK_RPC_MEMORY_SIZE);
+
+static inline int
+apple_dcp_h17p_clock_rate(const struct apple_dcp_h17p_clock_request *request,
+			  u64 rate_154, u64 rate_194, u64 *rate)
+{
+	if (!request || !rate)
+		return -EINVAL;
+
+	switch (le32_to_cpu(request->clock_id)) {
+	case APPLE_DCP_H17P_CLOCK_ID_154:
+		*rate = rate_154;
+		return 0;
+	case APPLE_DCP_H17P_CLOCK_ID_194:
+		*rate = rate_194;
+		return 0;
+	default:
+		return -ENOENT;
+	}
+}
 
 static inline int
 apple_dcp_h17p_callback_method(u32 call, struct apple_dcp_link_method *method)
