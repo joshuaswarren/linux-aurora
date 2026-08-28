@@ -128,6 +128,14 @@ struct apple_rtkit *apple_rtkit_init(struct device *dev, void *cookie,
 					  const char *mbox_name, int mbox_idx,
 					  const struct apple_rtkit_ops *ops);
 
+/*
+ * Initialize RTKit for G17P.  Its crash buffer belongs to the GPU UAT, so the
+ * core retains the firmware DVA and echoes the request without DMA mapping it.
+ */
+struct apple_rtkit *apple_rtkit_init_g17p(
+	struct device *dev, void *cookie, const char *mbox_name, int mbox_idx,
+	const struct apple_rtkit_ops *ops);
+
 struct apple_rtkit *apple_rtkit_init_adopted(
 	struct device *dev, void *cookie, const char *mbox_name, int mbox_idx,
 	const struct apple_rtkit_ops *ops);
