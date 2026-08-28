@@ -84,10 +84,6 @@ struct dcp_channel {
 	u64 link_message[DCP_MAX_CALL_DEPTH];
 	u32 link_size[DCP_MAX_CALL_DEPTH];
 
-	/* Tag of each outstanding call, so a stall can name itself */
-	char tag[DCP_MAX_CALL_DEPTH][4];
-	unsigned long pushed_at[DCP_MAX_CALL_DEPTH];
-
 	/* Current depth of the call stack. Less than DCP_MAX_CALL_DEPTH */
 	u8 depth;
 	/* Already warned about busy channel */

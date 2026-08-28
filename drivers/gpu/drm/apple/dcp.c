@@ -1166,8 +1166,8 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 	char fw_str[DCP_FW_VERSION_STR_LEN];
 	int ret;
 
-	if (hw->firmware_compat != DCP_FIRMWARE_UNKNOWN)
-		return hw->firmware_compat;
+	if (of_device_is_compatible(dev->of_node, "apple,t8140-dcp"))
+		return DCP_FIRMWARE_H17P;
 
 	/* firmware version is just informative */
 	dcp_read_fw_version(dev, "apple,firmware-version", fw_str);
