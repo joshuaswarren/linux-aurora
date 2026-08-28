@@ -34,6 +34,12 @@
 #include "parser.h"
 #include "trace.h"
 
+#define APPLE_DCP_LINK_RPC_DVA_PROPERTY	"apple,dcp-link-rpc-dva"
+#define APPLE_DCP_LINK_RPC_PA_PROPERTY	"apple,dcp-link-rpc-pa"
+#define APPLE_DCP_LINK_RPC_SIZE_PROPERTY	"apple,dcp-link-rpc-size"
+#define APPLE_DCP_LINK_PHASE_PROPERTY	"apple,dcp-link-phase"
+#define APPLE_DCP_LINK_MESSAGE_PROPERTY	"apple,dcp-link-message"
+
 static int dcp_tx_offset(enum dcp_context_id id)
 {
 	switch (id) {
@@ -139,6 +145,17 @@ static void dcp_link_ack(struct apple_dcp *dcp,
 			 enum dcp_context_id context);
 static void dcp_link_recv_msg(struct apple_dcp *dcp, u64 message);
 static int dcp_link_start_rtkit(struct apple_dcp *dcp);
+
+/* Cold RPC memory is coherent. Inherited no-map RAM is mapped Normal-NC. */
+static void dcp_link_sync_for_cpu(void)
+{
+	dma_rmb();
+}
+
+static void dcp_link_sync_for_device(void)
+{
+	dma_wmb();
+}
 
 /* Get the start of a packet: after the end of the previous packet */
 static u16 dcp_packet_start(struct dcp_channel *ch, u8 depth)
@@ -286,6 +303,7 @@ static void dcp_link_push(struct apple_dcp *dcp, bool oob,
 	if (ret)
 		goto err_pop;
 
+	dcp_link_sync_for_cpu();
 	buffer = dcp->shmem + layout.local_offset;
 	header = buffer + offset;
 	apple_dcp_link_rpc_header_encode(header, dcp_link_call_tag(call),
@@ -309,7 +327,7 @@ static void dcp_link_push(struct apple_dcp *dcp, bool oob,
 	ch->link_size[depth] = payload_size;
 	*top = next_top;
 
-	dma_wmb();
+	dcp_link_sync_for_device();
 	dcp_send_message(dcp, APPLE_DCP_LINK_ENDPOINT, message);
 	return;
 
@@ -323,6 +341,7 @@ static void dcp_link_ack(struct apple_dcp *dcp,
 			 enum dcp_context_id context)
 {
 	struct dcp_channel *ch = dcp_get_channel(dcp, context);
+	u64 request;
 	u8 depth;
 	u64 reply;
 
@@ -332,9 +351,10 @@ static void dcp_link_ack(struct apple_dcp *dcp,
 	}
 
 	depth = dcp_pop_depth(&ch->depth);
-	reply = apple_dcp_link_rpc_reply(ch->link_message[depth]);
+	request = ch->link_message[depth];
+	dcp_link_sync_for_device();
+	reply = apple_dcp_link_rpc_reply(request);
 	ch->link_message[depth] = 0;
-	dma_wmb();
 	dcp_send_message(dcp, APPLE_DCP_LINK_ENDPOINT, reply);
 }
 
@@ -378,7 +398,7 @@ static void dcp_link_handle_reply(struct apple_dcp *dcp, u64 message)
 		dev_warn(dcp->dev, "DCPLink stream %u stack mismatch: %d\n",
 			 stream, ret);
 
-	dma_rmb();
+	dcp_link_sync_for_cpu();
 	cb = ch->callbacks[depth];
 	cookie = ch->cookies[depth];
 	ch->callbacks[depth] = NULL;
@@ -408,7 +428,7 @@ static void dcp_link_handle_callback(struct apple_dcp *dcp, u64 message)
 				 apple_dcp_link_rpc_reply(message));
 		return;
 	}
-	dma_rmb();
+	dcp_link_sync_for_cpu();
 	ret = apple_dcp_link_rpc_decode(message,
 					dcp->shmem + layout.remote_offset,
 					layout.capacity, &view);
@@ -478,7 +498,7 @@ static void dcp_link_recv_msg(struct apple_dcp *dcp, u64 message)
 			return;
 		}
 
-		dma_wmb();
+		dcp_link_sync_for_device();
 		dev_info(dcp->dev,
 			 "DCPLink firmware init received; sending RPC memory INIT\n");
 		dcp_send_message(dcp, APPLE_DCP_LINK_ENDPOINT, init_message);
@@ -486,6 +506,8 @@ static void dcp_link_recv_msg(struct apple_dcp *dcp, u64 message)
 	}
 
 	if (type == APPLE_DCP_LINK_MSG_READY) {
+		u16 remote_version;
+
 		if (action != APPLE_DCP_LINK_HANDSHAKE_START_IOMFB) {
 			if (old_state == APPLE_DCP_LINK_WAIT_FIRMWARE_INIT)
 				dev_warn(dcp->dev,
@@ -495,11 +517,20 @@ static void dcp_link_recv_msg(struct apple_dcp *dcp, u64 message)
 			return;
 		}
 
-		if (apple_dcp_link_ready_reply(message, &dcp->link_version,
+		if (apple_dcp_link_ready_reply(message, &remote_version,
 					       &dcp->link_firmware_hash))
 			return;
-		dev_info(dcp->dev, "DCPLink ready: version %u hash %#x\n",
-			 dcp->link_version, dcp->link_firmware_hash);
+		if (!remote_version) {
+			dcp->link_state = old_state;
+			dev_err(dcp->dev, "DCPLink ready has version zero\n");
+			return;
+		}
+		dcp->link_version =
+			apple_dcp_link_negotiate_version(remote_version);
+		dev_info(dcp->dev,
+			 "DCPLink ready: remote version %u negotiated %u hash %#x\n",
+			 remote_version, dcp->link_version,
+			 dcp->link_firmware_hash);
 		iomfb_start_h17p(dcp);
 		return;
 	}
@@ -527,26 +558,47 @@ static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 
 	if (dcp->adopted_session) {
 		struct iommu_domain *domain;
+		u64 captured_message;
 		phys_addr_t translated;
 		u64 rpc_dva, rpc_pa, rpc_size;
+		u64 shared_dva;
+		u32 phase;
+		u32 ready_hash;
+		u16 remote_version;
 		u64 offset;
 
 		if (!of_chosen ||
-		    of_property_read_u64(of_chosen, "apple,dcp-link-rpc-dva",
+		    of_property_read_u64(of_chosen,
+					 APPLE_DCP_LINK_RPC_DVA_PROPERTY,
 					 &rpc_dva) ||
-		    of_property_read_u64(of_chosen, "apple,dcp-link-rpc-pa",
+		    of_property_read_u64(of_chosen,
+					 APPLE_DCP_LINK_RPC_PA_PROPERTY,
 					 &rpc_pa) ||
-		    of_property_read_u64(of_chosen, "apple,dcp-link-rpc-size",
-					 &rpc_size))
+		    of_property_read_u64(of_chosen,
+					 APPLE_DCP_LINK_RPC_SIZE_PROPERTY,
+					 &rpc_size) ||
+		    of_property_read_u32(of_chosen,
+					 APPLE_DCP_LINK_PHASE_PROPERTY, &phase) ||
+		    of_property_read_u64(of_chosen,
+					 APPLE_DCP_LINK_MESSAGE_PROPERTY,
+					 &captured_message))
 			return dev_err_probe(dcp->dev, -ENOENT,
-					     "inherited DCPLink RPC mapping is missing\n");
+					     "inherited DCPLink handoff data is missing\n");
 
 		if (!rpc_dva || !rpc_pa ||
 		    rpc_size != APPLE_DCP_LINK_RPC_MEMORY_SIZE ||
 		    !IS_ALIGNED(rpc_dva, SZ_16K) ||
-		    !IS_ALIGNED(rpc_pa, SZ_16K))
+		    !IS_ALIGNED(rpc_pa, SZ_16K) ||
+		    rpc_dva & ~GENMASK_ULL(47, 0))
 			return dev_err_probe(dcp->dev, -EINVAL,
 					     "inherited DCPLink RPC mapping is invalid\n");
+		if (phase != APPLE_DCP_LINK_HANDOFF_FIRMWARE_INIT &&
+		    phase != APPLE_DCP_LINK_HANDOFF_READY)
+			return dev_err_probe(dcp->dev, -EAGAIN,
+				"Stage 2 captured no DCPLink init or ready phase\n");
+		if (!apple_dcp_link_handoff_message_valid(phase, captured_message))
+			return dev_err_probe(dcp->dev, -EPROTO,
+					     "captured DCPLink phase word is invalid\n");
 
 		domain = iommu_get_domain_for_dev(dcp->dev);
 		if (!domain)
@@ -561,32 +613,84 @@ static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 						     offset);
 		}
 
-		dcp->shmem = memremap(rpc_pa, rpc_size, MEMREMAP_WB);
+		dcp->shmem = (__force void *)ioremap_wc(rpc_pa, rpc_size);
 		if (!dcp->shmem)
 			return dev_err_probe(dcp->dev, -ENOMEM,
 					     "could not map inherited DCPLink RPC memory\n");
 
-		dma_rmb();
+		dcp->shmem_iova = rpc_dva;
+		dcp->shmem_inherited = true;
+		dcp_link_sync_for_cpu();
 		desc = dcp->shmem;
 		if (!apple_dcp_link_init_desc_valid(desc) ||
 		    !apple_dcp_link_stream_memory_idle(dcp->shmem, rpc_size)) {
-			memunmap(dcp->shmem);
-			dcp->shmem = NULL;
-			return dev_err_probe(dcp->dev, -EINVAL,
-					     "inherited DCPLink RPC memory is not idle version 4\n");
+			dev_err(dcp->dev,
+				"inherited DCPLink RPC memory is not pristine version 4\n");
+			ret = -EINVAL;
+			goto err_unmap_inherited;
+		}
+		shared_dva = le64_to_cpu(desc->shared_dva);
+		for (offset = 0;
+		     shared_dva &&
+		     offset < APPLE_DCP_LINK_SHARED_VAR_MEMORY_SIZE;
+		     offset += SZ_16K) {
+			if (!iommu_iova_to_phys(domain, shared_dva + offset)) {
+				dev_err(dcp->dev,
+					"inherited DCPLink shared-variable mapping differs at %#llx\n",
+					offset);
+				ret = -EINVAL;
+				goto err_unmap_inherited;
+			}
+		}
+		if (shared_dva)
+			dev_info(dcp->dev,
+				 "inherited DCPLink uses a validated 64MiB shared-variable DVA %#llx\n",
+				 shared_dva);
+
+		memset(dcp->link_top, 0, sizeof(dcp->link_top));
+
+		if (phase == APPLE_DCP_LINK_HANDOFF_READY) {
+			ret = apple_dcp_link_ready_reply(captured_message,
+							 &remote_version, &ready_hash);
+			if (ret || !remote_version) {
+				dev_err(dcp->dev,
+					"inherited DCPLink ready version is zero\n");
+				ret = ret ?: -EPROTO;
+				goto err_unmap_inherited;
+			}
+
+			dcp->link_version =
+				apple_dcp_link_negotiate_version(remote_version);
+			dcp->link_firmware_hash = ready_hash;
+			dcp->link_state = APPLE_DCP_LINK_READY;
+			dcp_link_sync_for_device();
+			dev_info(dcp->dev,
+				 "adopted DCPLink ready remote version %u negotiated %u hash %#x DVA %#llx PA %#llx\n",
+				 remote_version, dcp->link_version,
+				 dcp->link_firmware_hash, rpc_dva, rpc_pa);
+			iomfb_start_h17p(dcp);
+			return 0;
 		}
 
-		dcp->shmem_iova = rpc_dva;
-		dcp->shmem_inherited = true;
-		dcp->link_state = APPLE_DCP_LINK_READY;
-		dcp->link_version = APPLE_DCP_LINK_PROTOCOL_VERSION;
+		ret = apple_dcp_link_init_message(rpc_dva, &captured_message);
+		if (ret)
+			goto err_unmap_inherited;
+		dcp->link_state = APPLE_DCP_LINK_WAIT_FIRMWARE_READY;
+		dcp->link_version = 0;
 		dcp->link_firmware_hash = 0;
-		memset(dcp->link_top, 0, sizeof(dcp->link_top));
+		dcp_link_sync_for_device();
 		dev_info(dcp->dev,
-			 "adopted idle DCPLink version 4 RPC mapping DVA %#llx PA %#llx\n",
-			 rpc_dva, rpc_pa);
-		iomfb_start_h17p(dcp);
+			 "adopted DCPLink firmware-init phase; sending inherited RPC INIT\n");
+		dcp_send_message(dcp, APPLE_DCP_LINK_ENDPOINT, captured_message);
 		return 0;
+
+err_unmap_inherited:
+		dcp_link_sync_for_device();
+		iounmap((__force void __iomem *)dcp->shmem);
+		dcp->shmem = NULL;
+		dcp->shmem_iova = 0;
+		dcp->shmem_inherited = false;
+		return ret;
 	}
 
 	dcp->shmem = dma_alloc_coherent(dcp->dev, APPLE_DCP_LINK_RPC_MEMORY_SIZE,
@@ -978,7 +1082,7 @@ void iomfb_shutdown(struct apple_dcp *dcp)
 	}
 
 	if (dcp->shmem_inherited) {
-		memunmap(dcp->shmem);
+		iounmap((__force void __iomem *)dcp->shmem);
 		dcp->shmem = NULL;
 		dcp->shmem_iova = 0;
 		dcp->shmem_inherited = false;
