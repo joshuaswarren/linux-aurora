@@ -714,7 +714,7 @@ pub(crate) struct G17PPartialOpeningContextContract {
     pub(crate) render_empty_high_root_slot: u8,
     pub(crate) transport_pair: u8,
     pub(crate) descriptor_pair: u8,
-    pub(crate) graph_context_id: u8,
+    pub(crate) shared_queue_pair_namespace: u8,
     pub(crate) optional_identity_context_id: u8,
     pub(crate) descriptor_context_id: u8,
     pub(crate) scheduler_class: u8,
@@ -738,7 +738,7 @@ pub(crate) const G17P_PARTIAL_OPENING_CONTEXT: G17PPartialOpeningContextContract
         render_empty_high_root_slot: 1,
         transport_pair: 2,
         descriptor_pair: 0,
-        graph_context_id: 1,
+        shared_queue_pair_namespace: 0,
         optional_identity_context_id: 1,
         descriptor_context_id: 1,
         scheduler_class: 2,
@@ -1209,12 +1209,18 @@ pub(crate) fn apply_g17p_cold_opening_descriptor_overrides(
     Ok(())
 }
 
-/// Write the 28-entry fixed operand table consumed by control opcode 0x20.
+/// Keep the fixed operand table zero at the proven cold first-work boundary.
 pub(crate) fn apply_g17p_cold_opening_operand_table(out: &mut [u8]) -> Result<(), SubmissionError> {
     if out.len() != G17P_PARTIAL_OPENING_PAGE_SIZE {
         return Err(SubmissionError::PartialOpeningGraphObjectSize);
     }
     out.fill(0);
+    Ok(())
+}
+
+/// Write the optional 28-entry table used by a later populated control state.
+pub(crate) fn apply_g17p_populated_operand_table(out: &mut [u8]) -> Result<(), SubmissionError> {
+    apply_g17p_cold_opening_operand_table(out)?;
     for index in 0..G17P_COLD_OPENING_OPERAND_BUFFER_COUNT {
         let address = G17P_COLD_OPENING_OPERAND_BUFFER_BASE
             .checked_add(index as u64 * G17P_COLD_OPENING_OPERAND_BUFFER_STRIDE)
@@ -1224,7 +1230,7 @@ pub(crate) fn apply_g17p_cold_opening_operand_table(out: &mut [u8]) -> Result<()
     Ok(())
 }
 
-/// Write the four-page accelerator-page directory for the 28 operand buffers.
+/// Keep the four-page operand directory zero through cold first work.
 pub(crate) fn apply_g17p_cold_opening_operand_directory(
     out: &mut [u8],
 ) -> Result<(), SubmissionError> {
@@ -1232,6 +1238,14 @@ pub(crate) fn apply_g17p_cold_opening_operand_directory(
         return Err(SubmissionError::PartialOpeningGraphObjectSize);
     }
     out.fill(0);
+    Ok(())
+}
+
+/// Write the optional populated directory for the 28 operand buffers.
+pub(crate) fn apply_g17p_populated_operand_directory(
+    out: &mut [u8],
+) -> Result<(), SubmissionError> {
+    apply_g17p_cold_opening_operand_directory(out)?;
     let pages_per_buffer = G17P_COLD_OPENING_OPERAND_BUFFER_SIZE / 0x1000;
     let mut qword = 0usize;
     for buffer in 0..G17P_COLD_OPENING_OPERAND_BUFFER_COUNT {
@@ -3299,7 +3313,7 @@ mod tests {
                 render_empty_high_root_slot: 1,
                 transport_pair: 2,
                 descriptor_pair: 0,
-                graph_context_id: 1,
+                shared_queue_pair_namespace: 0,
                 optional_identity_context_id: 1,
                 descriptor_context_id: 1,
                 scheduler_class: 2,
@@ -3375,6 +3389,10 @@ mod tests {
         let mut shared = [0u8; G17P_COLD_OPENING_SHARED_OBJECT_SIZE];
         apply_g17p_cold_opening_shared_object(addresses, &mut shared).unwrap();
         assert_eq!(get_u32_le(&shared, 0x0c), 0);
+        assert_eq!(
+            get_u32_le(&shared, 0x0c),
+            u32::from(G17P_PARTIAL_OPENING_CONTEXT.shared_queue_pair_namespace)
+        );
         assert_eq!(get_u64_le(&shared, 0x20), addresses.primary_index);
         assert_eq!(get_u32_le(&shared, 0x34), 0x20);
         assert_eq!(get_u32_le(&shared, 0x3c), 8);
@@ -3543,6 +3561,10 @@ mod tests {
     fn g17p_cold_opening_operand_graph_is_exact() {
         let mut table = [0u8; G17P_PARTIAL_OPENING_PAGE_SIZE];
         apply_g17p_cold_opening_operand_table(&mut table).unwrap();
+        assert_eq!(source_fixture_fingerprint(&table), 0x9c1b_da7f_8c87_2325);
+        assert!(table.iter().all(|value| *value == 0));
+
+        apply_g17p_populated_operand_table(&mut table).unwrap();
         assert_eq!(
             get_u64_le(&table, 0),
             (1u64 << 60) | G17P_COLD_OPENING_OPERAND_BUFFER_BASE
@@ -3558,6 +3580,13 @@ mod tests {
 
         let mut directory = [0u8; G17P_COLD_OPENING_OPERAND_DIRECTORY_SIZE];
         apply_g17p_cold_opening_operand_directory(&mut directory).unwrap();
+        assert_eq!(
+            source_fixture_fingerprint(&directory),
+            0xeb05_052e_a5b6_2325
+        );
+        assert!(directory.iter().all(|value| *value == 0));
+
+        apply_g17p_populated_operand_directory(&mut directory).unwrap();
         assert_eq!(get_u64_le(&directory, 0), 0x70_0022_0000);
         assert_eq!(get_u64_le(&directory, 255 * 8), 0x70_0031_f000);
         assert_eq!(get_u64_le(&directory, 256 * 8), 0x70_0032_8000);
