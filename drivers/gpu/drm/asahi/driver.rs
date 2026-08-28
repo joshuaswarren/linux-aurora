@@ -305,6 +305,7 @@ fn probe_t8140_runtime(
     unsafe {
         data.__pinned_init(ptr as *mut AsahiData)?;
     }
+    runtime.lock().mark_firmware_cache_flush_ready()?;
     (*drm).gpu.init()?;
     drm::driver::Registration::new_foreign_owned(&drm, pdev.as_ref(), 0)?;
     Ok(runtime)

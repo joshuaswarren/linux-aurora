@@ -424,6 +424,10 @@ impl G17PManagerConstruction {
         self.resources.uat()
     }
 
+    pub(crate) fn mark_firmware_cache_flush_ready(&self) {
+        self.resources.mark_firmware_cache_flush_ready();
+    }
+
     fn validate_partial_opening_resources(&self) -> Result {
         let binding = self.resources.partial_opening_binding();
         let context = g17_submission::G17P_PARTIAL_OPENING_CONTEXT;
