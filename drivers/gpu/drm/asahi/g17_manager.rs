@@ -361,6 +361,14 @@ impl G17PManagerConstruction {
         self.platform.sksm_scratch
     }
 
+    /// Return the hardware QID of a queue owned by this manager.
+    pub(crate) fn compute_queue_id(&self, queue: &G17PSksmQueue) -> Result<u8> {
+        if queue.scratch != self.sksm_scratch() || queue.uat_owner != self.uat().ttb_base() {
+            return Err(EINVAL);
+        }
+        Ok(queue.queue_id)
+    }
+
     /// Configure one SKSM queue through resource 0 and return its registered
     /// state only after the QID-valid bit is published.
     pub(crate) fn configure_compute_sksm_queue(
