@@ -373,6 +373,14 @@
 	apple,always-on;
 };
 
+&smc_mbox {
+	status = "okay";
+};
+
+&smc {
+	status = "okay";
+};
+
 /*
  * Keep U-Boot from owning this transport on T8140.  Its driver explicitly
  * declines the device before touching RTKit; Linux must initialize MTP first.
@@ -395,11 +403,10 @@
 
 &mtp_hid {
 	apple,no-stm;
+	apple,afe-reset-gpios = <&smc_gpio 0x13 GPIO_ACTIVE_LOW>;
 
 	multi-touch {
 		firmware-name = "apple/tpmtfw-j700.bin";
-		apple,adopt-preinitialized-ipd-functions;
-		apple,ack-preinitialized-afe-pulse;
 	};
 
 	keyboard: keyboard {
