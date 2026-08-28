@@ -679,6 +679,11 @@ impl VmBind {
     pub(crate) fn slot(&self) -> u32 {
         self.1
     }
+
+    /// Whether this retained binding belongs to the supplied DRM VM.
+    pub(crate) fn matches(&self, vm: &Vm) -> bool {
+        core::ptr::eq(&*self.0.inner, &*vm.inner)
+    }
 }
 
 impl Drop for VmBind {

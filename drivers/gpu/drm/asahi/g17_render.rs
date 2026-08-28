@@ -839,6 +839,82 @@ pub(crate) fn build_cold_opening_fragment_descriptor(
     Ok(())
 }
 
+/// Apply the queue-local fields that change as the canonical three-item group
+/// is refreshed in place. `descriptor_gpu_va` is the low VM address firmware
+/// uses for the descriptor's self pointers.
+pub(crate) fn apply_g17p_retained_descriptor_fields(
+    kind: RenderDescriptorKind,
+    descriptor_gpu_va: u64,
+    submission_ordinal: u32,
+    cold_opening: bool,
+    raw: &mut [u8],
+) -> Result<(), RenderBuildError> {
+    let item_number = submission_ordinal
+        .checked_add(1)
+        .ok_or(RenderBuildError::ArithmeticOverflow)?;
+    if item_number > 0xff {
+        return Err(RenderBuildError::ArithmeticOverflow);
+    }
+    match kind {
+        RenderDescriptorKind::Tiling => {
+            if raw.len() < TA_DESCRIPTOR_SIZE {
+                return Err(RenderBuildError::BufferTooSmall);
+            }
+            put_u64(
+                raw,
+                0x0760,
+                descriptor_gpu_va
+                    .checked_add(0x60)
+                    .ok_or(RenderBuildError::ArithmeticOverflow)?,
+            );
+            put_u32(raw, 0x079c, 1);
+            put_u32(raw, 0x07a0, item_number << 8);
+            put_u32(raw, 0x07a8, item_number);
+            put_u32(raw, 0x07b0, item_number | (item_number << 8));
+            put_u32(raw, 0x08b4, (item_number << 24) | 0xffff);
+            put_u32(raw, 0x08c4, item_number << 16);
+            put_u32(raw, 0x08c8, item_number << 24);
+            put_u32(raw, 0x08d4, submission_ordinal << 16);
+            if cold_opening {
+                put_u8(raw, 0x0789, 0x08);
+                put_u8(raw, 0x093e, 0xd0);
+                put_u8(raw, 0x093f, 0x91);
+            }
+        }
+        RenderDescriptorKind::Fragment => {
+            if raw.len() < FRAGMENT_DESCRIPTOR_SIZE {
+                return Err(RenderBuildError::BufferTooSmall);
+            }
+            for (at, target) in [
+                (0x07a0, 0x00a0),
+                (0x0ec0, 0x07c0),
+                (0x15e0, 0x0ee0),
+                (0x1d00, 0x1600),
+            ] {
+                put_u64(
+                    raw,
+                    at,
+                    descriptor_gpu_va
+                        .checked_add(target)
+                        .ok_or(RenderBuildError::ArithmeticOverflow)?,
+                );
+            }
+            put_u32(raw, 0x2150, item_number << 8);
+            put_u32(raw, 0x2154, 1);
+            put_u32(raw, 0x215c, if cold_opening { 0 } else { item_number });
+            put_u32(raw, 0x2160, item_number);
+            put_u32(raw, 0x2164, item_number << 8);
+            put_u32(raw, 0x2170, submission_ordinal);
+            if cold_opening {
+                put_u8(raw, 0x21d8, 0x10);
+                put_u8(raw, 0x21d9, 0xa2);
+                put_u8(raw, 0x222d, 0);
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct AddressedBytes<const N: usize> {
     pub(crate) address: u64,
@@ -1121,6 +1197,66 @@ mod tests {
 
         assert_eq!(fnv1a64(&[&tiling]), 0xb81a_1c11_1ede_fe5f);
         assert_eq!(fnv1a64(&[&fragment]), 0xf846_54e9_74ac_6ad3);
+    }
+
+    #[test]
+    fn retained_descriptor_refresh_keeps_canonical_self_pointers_and_advances_item_two() {
+        let parameters = G17pRenderParameters::source_rsrc8();
+        let mut tiling = [0u8; TA_DESCRIPTOR_SIZE];
+        let mut fragment = [0u8; FRAGMENT_DESCRIPTOR_SIZE];
+        let tiling_va = 0x70_0001_8000;
+        let fragment_va = 0x70_0009_8000;
+        build_ta_descriptor(
+            &parameters,
+            objects(),
+            RenderDescriptorMetadata {
+                context_id: 1,
+                submission_ordinal: 1,
+                queue_pair: 0,
+                submit_sequence: 3,
+            },
+            &mut tiling,
+        )
+        .unwrap();
+        build_fragment_descriptor(
+            &parameters,
+            objects(),
+            RenderDescriptorMetadata {
+                context_id: 1,
+                submission_ordinal: 1,
+                queue_pair: 0,
+                submit_sequence: 2,
+            },
+            &mut fragment,
+        )
+        .unwrap();
+        apply_g17p_retained_descriptor_fields(
+            RenderDescriptorKind::Tiling,
+            tiling_va,
+            1,
+            false,
+            &mut tiling,
+        )
+        .unwrap();
+        apply_g17p_retained_descriptor_fields(
+            RenderDescriptorKind::Fragment,
+            fragment_va,
+            1,
+            false,
+            &mut fragment,
+        )
+        .unwrap();
+
+        assert_eq!(get_u64(&tiling, 0x760), tiling_va + 0x60);
+        assert_eq!(get_u32(&tiling, 0x7a0), 0x200);
+        assert_eq!(get_u32(&tiling, 0x7a8), 2);
+        assert_eq!(get_u32(&tiling, 0x8d4), 0x1_0000);
+        assert_eq!(get_u64(&fragment, 0x7a0), fragment_va + 0xa0);
+        assert_eq!(get_u64(&fragment, 0xec0), fragment_va + 0x7c0);
+        assert_eq!(get_u64(&fragment, 0x15e0), fragment_va + 0xee0);
+        assert_eq!(get_u64(&fragment, 0x1d00), fragment_va + 0x1600);
+        assert_eq!(get_u32(&fragment, 0x215c), 2);
+        assert_eq!(get_u32(&fragment, 0x2170), 1);
     }
 
     fn publication_input(kind: RenderDescriptorKind) -> QueuePublicationInput {

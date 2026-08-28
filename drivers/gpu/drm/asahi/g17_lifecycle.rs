@@ -130,6 +130,18 @@ pub(crate) fn recover_persistent_runtime<T: PersistentRuntimeRecovery>(
     Ok(())
 }
 
+/// Decide whether the next render must start a fresh firmware session.
+/// Ordinal 255 is representable; 256 is the first value outside the retained
+/// optional-record ABI. A VM change also needs a cold session because the
+/// retained graph belongs to its original VM.
+pub(crate) const fn retained_render_requires_recycle(
+    retained_graph: bool,
+    same_vm: bool,
+    next_ordinal: u32,
+) -> bool {
+    retained_graph && (!same_vm || next_ordinal > u8::MAX as u32)
+}
+
 /// Operations needed to dismantle a retained G17P runtime.
 ///
 /// Keeping the ordering in this testable helper makes the platform owner's
@@ -716,5 +728,25 @@ mod tests {
                 Event::DisableSksmQueue,
             ]
         );
+    }
+
+    #[test]
+    fn ordinal_255_rebuilds_the_session_before_the_following_submit() {
+        let mut next_ordinal = 255;
+        assert!(!retained_render_requires_recycle(true, true, next_ordinal));
+        next_ordinal += 1;
+        assert!(retained_render_requires_recycle(true, true, next_ordinal));
+
+        let mut owner = MockRuntimeRecovery {
+            failure: None,
+            trace: std::vec::Vec::new(),
+            manager_uat_id: 0x9000_0000,
+        };
+        let manager_uat_id = owner.manager_uat_id;
+        assert_eq!(recover_persistent_runtime(&mut owner), Ok(()));
+        next_ordinal = 0;
+        assert_eq!(owner.manager_uat_id, manager_uat_id);
+        assert!(!retained_render_requires_recycle(false, true, next_ordinal));
+        assert_eq!(owner.trace.last(), Some(&Event::ResumeSubmissions));
     }
 }

@@ -63,10 +63,6 @@ const CONTROL_DONE_TYPE: u16 = 0x84;
 const CONTROL_DONE_CHANNEL: u64 = 0x11;
 const INITDATA_ACK_POLLS: usize = 200;
 
-/// Temporary bring-up policy: every userspace render runs as cold first work.
-/// Remove this once reusable paired queue publication is implemented.
-const RECYCLE_SESSION_AFTER_EACH_RENDER: bool = true;
-
 /// Per-role callback state retained until the corresponding RTKit client is
 /// dropped. The callback only publishes atomics; probe owns every mutation of
 /// manager and queue state.
@@ -348,6 +344,14 @@ impl G17PLiveRuntime {
         if !self.accepting_submissions || self.is_crashed() {
             g17_lifecycle::recover_persistent_runtime(self)?;
         }
+        let recycle = self
+            .manager
+            .as_ref()
+            .ok_or(ENODEV)?
+            .retained_render_needs_recycle(vm);
+        if recycle {
+            g17_lifecycle::recover_persistent_runtime(self)?;
+        }
         let drm = self.drm.as_ref().ok_or(ENODEV)?.clone();
         let prepared = self
             .manager
@@ -381,9 +385,6 @@ impl G17PLiveRuntime {
                 Ok(()) => Err(EIO),
                 Err(recovery_error) => Err(recovery_error),
             };
-        }
-        if RECYCLE_SESSION_AFTER_EACH_RENDER {
-            g17_lifecycle::recover_persistent_runtime(self)?;
         }
         Ok(())
     }

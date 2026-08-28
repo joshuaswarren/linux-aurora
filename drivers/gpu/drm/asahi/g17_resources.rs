@@ -18,6 +18,9 @@ use crate::{
     g17_completion, g17_compute, g17_render, g17_submission, g17_uapi, gem, mmu,
 };
 #[cfg(test)]
+#[path = "g17_completion.rs"]
+mod g17_completion;
+#[cfg(test)]
 #[path = "g17_compute.rs"]
 mod g17_compute;
 #[cfg(test)]
@@ -63,6 +66,8 @@ pub(crate) const G17P_COMPUTE_OPERAND_STATE_SIZE: usize = 0x14000;
 pub(crate) const G17P_COMPUTE_SUPPORT_SIZE: usize = 0xc000;
 pub(crate) const G17P_COMPUTE_QUEUE_GRAPH_SIZE: usize = g17_compute::COMPUTE_QUEUE_GRAPH_SIZE;
 pub(crate) const G17P_RENDER_DESCRIPTOR_STORAGE_SIZE: usize = 0x8000;
+/// Number of retained ordinals representable by the optional-record ABI.
+pub(crate) const G17P_RETAINED_RENDER_ORDINALS: u32 = 0x100;
 pub(crate) const G17P_RENDER_QUEUE_GRAPH_SIZE: usize = 0xc000;
 pub(crate) const G17P_RENDER_SUPPORT_SIZE: usize = 0x40000;
 const G17P_PAGE_SIZE: usize = 0x4000;
@@ -232,6 +237,18 @@ fn put_u16(raw: &mut [u8], offset: usize, value: u16) {
 
 fn put_u64(raw: &mut [u8], offset: usize, value: u64) {
     raw[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+fn g17p_render_can_reset_job_list(
+    tiling: g17_completion::QueueIndices,
+    fragment: g17_completion::QueueIndices,
+    tiling_timestamps: [u64; 2],
+    fragment_timestamps: [u64; 2],
+) -> bool {
+    tiling.idle()
+        && fragment.idle()
+        && tiling_timestamps.iter().all(|value| *value != 0)
+        && fragment_timestamps.iter().all(|value| *value != 0)
 }
 
 #[cfg(test)]
@@ -760,6 +777,8 @@ struct G17PLateTilingBytes {
     item_group: [u8; 24],
     optional: [u8; g17_submission::G17P_COLD_OPENING_OPTIONAL_SIZE],
     event: [u8; g17_submission::G17P_COLD_OPENING_EVENT_SIZE],
+    pool_a_slot_offset: usize,
+    shared_inner_value: u32,
 }
 
 impl G17PLateTilingBytes {
@@ -771,8 +790,12 @@ impl G17PLateTilingBytes {
         graph[G17P_USER_TILING_EVENT..G17P_USER_TILING_EVENT + self.event.len()]
             .copy_from_slice(&self.event);
         put_u32(graph, G17P_USER_TILING_POINTERS + 0x40, 3);
-        put_u32(support, G17P_RENDER_POOL_A_SLOTS + 4, 2);
-        put_u32(support, G17P_RENDER_SHARED_CONTROL_INNER, 2);
+        put_u32(support, self.pool_a_slot_offset, 2);
+        put_u32(
+            support,
+            G17P_RENDER_SHARED_CONTROL_INNER,
+            self.shared_inner_value,
+        );
     }
 }
 
@@ -780,11 +803,18 @@ fn build_g17p_late_tiling_bytes(
     descriptor: u64,
     graph: u64,
     optional_addresses: g17_submission::G17PColdOpeningOptionalAddresses,
+    submission_ordinal: u32,
 ) -> core::result::Result<G17PLateTilingBytes, g17_submission::SubmissionError> {
+    let record_a = (submission_ordinal as usize * 2) % 35;
     let mut bytes = G17PLateTilingBytes {
         item_group: [0; 24],
         optional: [0; g17_submission::G17P_COLD_OPENING_OPTIONAL_SIZE],
         event: [0; g17_submission::G17P_COLD_OPENING_EVENT_SIZE],
+        pool_a_slot_offset: G17P_RENDER_POOL_A_SLOTS + 4 + record_a * 4,
+        shared_inner_value: submission_ordinal
+            .checked_add(1)
+            .and_then(|value| value.checked_mul(2))
+            .ok_or(g17_submission::SubmissionError::PartialOpeningQueueHeadOutOfRange)?,
     };
     let optional = graph
         .checked_add(G17P_USER_TILING_OPTIONAL as u64)
@@ -795,13 +825,15 @@ fn build_g17p_late_tiling_bytes(
     for (index, address) in [descriptor, optional, event].iter().enumerate() {
         put_u64(&mut bytes.item_group, index * 8, *address);
     }
-    g17_submission::apply_g17p_cold_opening_optional(
+    g17_submission::apply_g17p_retained_optional(
         g17_submission::G17PColdOpeningStage::Tiling,
         optional_addresses,
+        submission_ordinal,
         &mut bytes.optional,
     )?;
-    g17_submission::apply_g17p_cold_opening_event(
+    g17_submission::apply_g17p_retained_event(
         g17_submission::G17PColdOpeningStage::Tiling,
+        submission_ordinal,
         &mut bytes.event,
     )?;
     Ok(bytes)
@@ -1248,13 +1280,30 @@ impl G17PUserRenderStorage {
             )
             .map_err(|_| EINVAL)
         })?;
+        let descriptors_va = descriptors.iova();
         descriptors.with_bytes_mut(|raw| {
             let (tiling, fragment) = raw.split_at_mut(0x4000);
             g17_render::build_cold_opening_ta_descriptor(&translated.parameters, objects, tiling)
                 .map_err(|_| EINVAL)?;
+            g17_render::apply_g17p_retained_descriptor_fields(
+                g17_render::RenderDescriptorKind::Tiling,
+                descriptors_va,
+                0,
+                true,
+                tiling,
+            )
+            .map_err(|_| EINVAL)?;
             g17_render::build_cold_opening_fragment_descriptor(
                 &translated.parameters,
                 objects,
+                fragment,
+            )
+            .map_err(|_| EINVAL)?;
+            g17_render::apply_g17p_retained_descriptor_fields(
+                g17_render::RenderDescriptorKind::Fragment,
+                descriptors_va + 0x4000,
+                0,
+                true,
                 fragment,
             )
             .map_err(|_| EINVAL)
@@ -1305,6 +1354,198 @@ impl G17PUserRenderStorage {
             timestamps,
             user_timestamp_aliases,
         })
+    }
+
+    /// Refresh the canonical queue group's command-owned objects after the
+    /// previous group has reached semantic completion.
+    pub(crate) fn restage_command(
+        &mut self,
+        dev: &AsahiDevice,
+        vm: &mmu::Vm,
+        command: &g17_uapi::TranslatedRenderCommand,
+        num_clusters: u32,
+        user_timestamps: [u64; 4],
+        user_timestamp_aliases: KVec<mmu::KernelMapping>,
+        submission_ordinal: u32,
+    ) -> Result {
+        if submission_ordinal == 0 || submission_ordinal >= G17P_RETAINED_RENDER_ORDINALS {
+            return Err(EINVAL);
+        }
+        let mut next_descriptors = MappedObject::new_in_range(
+            dev,
+            vm,
+            G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END,
+            G17P_RENDER_DESCRIPTOR_STORAGE_SIZE,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        let render_layout =
+            g17p_render_state_layout(&command.parameters, num_clusters).ok_or(EINVAL)?;
+        let mut next_render_state = MappedObject::new_in_range(
+            dev,
+            vm,
+            G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END,
+            render_layout.total_size,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        let next_timestamps = MappedObject::new_in_range(
+            dev,
+            vm,
+            G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END,
+            mmu::UAT_PGSZ,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        let render_state_va = next_render_state.iova();
+        let timestamp_va = next_timestamps.iova();
+        let mut translated = *command;
+        translated.parameters.context_base = render_state_va;
+        translated.parameters.deflake_3 = render_state_va + G17P_RENDER_STATE_DEFLAKE as u64;
+        translated.parameters.deflake_2 = translated.parameters.deflake_3 + 0x20;
+        translated.parameters.deflake_1 = translated.parameters.deflake_3 + 0x2a0;
+        translated.parameters.ta_status = render_state_va + G17P_RENDER_STATE_TA_STATUS as u64;
+        translated.parameters.fragment_status =
+            render_state_va + G17P_RENDER_STATE_FRAGMENT_STATUS as u64;
+        translated.parameters.heapmeta = render_state_va + render_layout.heapmeta as u64;
+        translated.parameters.tpc = render_state_va + render_layout.tpc as u64;
+        translated.parameters.aux_fb = render_state_va + render_layout.aux_fb as u64;
+        translated.parameters.aux_fb_page_count = G17P_RENDER_AUX_FB_PAGE_COUNT;
+        translated.parameters.aux_fb_flags = g17p_aux_fb_flags(translated.flags);
+        translated.parameters.tilemap = render_state_va + render_layout.tilemap as u64;
+        translated.parameters.ta_timestamp_start = timestamp_va;
+        translated.parameters.ta_timestamp_end = timestamp_va + 8;
+        translated.parameters.ta_user_timestamp_start = user_timestamps[0];
+        translated.parameters.ta_user_timestamp_end = user_timestamps[1];
+        translated.parameters.fragment_timestamp_start = timestamp_va + 16;
+        translated.parameters.fragment_timestamp_end = timestamp_va + 24;
+        translated.parameters.fragment_user_timestamp_start = user_timestamps[2];
+        translated.parameters.fragment_user_timestamp_end = user_timestamps[3];
+
+        for (address, size, need_read, need_write) in [
+            (render_state_va, render_layout.total_size as u64, true, true),
+            (timestamp_va, 32, true, true),
+        ] {
+            if !vm.covers_range(address, size, need_read, need_write) {
+                return Err(EFAULT);
+            }
+        }
+        if !user_timestamp_aliases
+            .iter()
+            .all(|mapping| vm.covers_range(mapping.iova(), mapping.size() as u64, false, true))
+        {
+            return Err(EFAULT);
+        }
+        next_render_state.with_bytes_mut(|raw| {
+            apply_g17p_viewport(
+                translated.parameters.width,
+                translated.parameters.height,
+                &mut raw[G17P_RENDER_STATE_DEFLAKE..G17P_RENDER_STATE_DEFLAKE + mmu::UAT_PGSZ],
+            )
+            .ok_or(EINVAL)?;
+            put_u32(raw, render_layout.aux_fb + 0x480, 0x6000_0000);
+            put_u32(raw, render_layout.aux_fb + 0x484, 0x35b);
+            Ok(())
+        })?;
+
+        let record_a_index = (submission_ordinal as usize * 2) % 35;
+        let record_b_index = submission_ordinal as usize % 79;
+        let support_va = self.support.iova();
+        let objects = g17_render::RenderDescriptorObjects {
+            record_a: support_va + G17P_RENDER_POOL_A as u64 + (record_a_index * 0x100) as u64,
+            shared: support_va + G17P_RENDER_PACKED_SHARED as u64,
+            record_b: support_va + G17P_RENDER_POOL_B as u64 + (record_b_index * 0x80) as u64,
+            zero: support_va + G17P_RENDER_ZERO_SHARED as u64,
+        };
+        let canonical_descriptor_va = self.descriptors.iova();
+        next_descriptors.with_bytes_mut(|raw| {
+            let (tiling, fragment) = raw.split_at_mut(0x4000);
+            g17_render::build_ta_descriptor(
+                &translated.parameters,
+                objects,
+                g17_render::RenderDescriptorMetadata {
+                    context_id: 1,
+                    submission_ordinal,
+                    queue_pair: 0,
+                    submit_sequence: submission_ordinal as u64 * 2 + 1,
+                },
+                tiling,
+            )
+            .map_err(|_| EINVAL)?;
+            g17_render::apply_g17p_retained_descriptor_fields(
+                g17_render::RenderDescriptorKind::Tiling,
+                canonical_descriptor_va,
+                submission_ordinal,
+                false,
+                tiling,
+            )
+            .map_err(|_| EINVAL)?;
+            g17_render::build_fragment_descriptor(
+                &translated.parameters,
+                objects,
+                g17_render::RenderDescriptorMetadata {
+                    context_id: 1,
+                    submission_ordinal,
+                    queue_pair: 0,
+                    submit_sequence: submission_ordinal as u64 * 2,
+                },
+                fragment,
+            )
+            .map_err(|_| EINVAL)?;
+            g17_render::apply_g17p_retained_descriptor_fields(
+                g17_render::RenderDescriptorKind::Fragment,
+                canonical_descriptor_va + 0x4000,
+                submission_ordinal,
+                false,
+                fragment,
+            )
+            .map_err(|_| EINVAL)
+        })?;
+
+        let source = next_descriptors.object.vmap()?;
+        let destination = self.descriptors.object.vmap()?;
+        let support = self.support.object.vmap()?;
+        let source = unsafe {
+            core::slice::from_raw_parts(source.as_ptr(), G17P_RENDER_DESCRIPTOR_STORAGE_SIZE)
+        };
+        let destination = unsafe {
+            core::slice::from_raw_parts_mut(
+                destination.as_mut_ptr(),
+                G17P_RENDER_DESCRIPTOR_STORAGE_SIZE,
+            )
+        };
+        let support = unsafe {
+            core::slice::from_raw_parts_mut(support.as_mut_ptr(), G17P_RENDER_SUPPORT_SIZE)
+        };
+        destination.copy_from_slice(source);
+        let record_a = G17P_RENDER_POOL_A + record_a_index * 0x100;
+        put_u32(
+            support,
+            record_a + 0x08,
+            submission_ordinal + submission_ordinal / 2,
+        );
+        put_u32(support, record_a + 0x10, 0x50);
+        put_u32(
+            support,
+            G17P_RENDER_POOL_A_SLOTS + 4 + record_a_index * 4,
+            1,
+        );
+        put_u32(
+            support,
+            G17P_RENDER_SHARED_CONTROL_INNER,
+            submission_ordinal * 2 + 1,
+        );
+        put_u32(support, G17P_RENDER_FLAG, submission_ordinal + 1);
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+
+        let old_render_state = core::mem::replace(&mut self.render_state, next_render_state);
+        let old_timestamps = core::mem::replace(&mut self.timestamps, next_timestamps);
+        let old_aliases =
+            core::mem::replace(&mut self.user_timestamp_aliases, user_timestamp_aliases);
+        drop(old_aliases);
+        drop(old_timestamps);
+        drop(old_render_state);
+        Ok(())
     }
 
     pub(crate) fn is_reachable_from(&self, vm: &mmu::Vm) -> bool {
@@ -1372,7 +1613,7 @@ impl G17PUserRenderStorage {
         }
     }
 
-    pub(crate) fn stage_fragment(&mut self) -> Result {
+    pub(crate) fn stage_fragment(&mut self, submission_ordinal: u32) -> Result {
         let graph_va = self.graph.iova();
         let items = [
             self.descriptors.iova() + 0x4000,
@@ -1384,15 +1625,17 @@ impl G17PUserRenderStorage {
             for (index, address) in items.iter().enumerate() {
                 put_u64(raw, Self::FRAGMENT_RING + index * 8, *address);
             }
-            g17_submission::apply_g17p_cold_opening_optional(
+            g17_submission::apply_g17p_retained_optional(
                 g17_submission::G17PColdOpeningStage::Fragment,
                 optional_addresses,
+                submission_ordinal,
                 &mut raw[Self::FRAGMENT_OPTIONAL
                     ..Self::FRAGMENT_OPTIONAL + g17_submission::G17P_COLD_OPENING_OPTIONAL_SIZE],
             )
             .map_err(|_| EINVAL)?;
-            g17_submission::apply_g17p_cold_opening_event(
+            g17_submission::apply_g17p_retained_event(
                 g17_submission::G17PColdOpeningStage::Fragment,
+                submission_ordinal,
                 &mut raw[Self::FRAGMENT_EVENT
                     ..Self::FRAGMENT_EVENT + g17_submission::G17P_COLD_OPENING_EVENT_SIZE],
             )
@@ -1402,12 +1645,16 @@ impl G17PUserRenderStorage {
         })
     }
 
-    pub(crate) fn prepare_late_tiling_publication(&mut self) -> Result<G17PLateTilingPublication> {
+    pub(crate) fn prepare_late_tiling_publication(
+        &mut self,
+        submission_ordinal: u32,
+    ) -> Result<G17PLateTilingPublication> {
         let graph_va = self.graph.iova();
         let bytes = build_g17p_late_tiling_bytes(
             self.descriptors.iova(),
             graph_va,
             self.optional_addresses(true),
+            submission_ordinal,
         )
         .map_err(|_| EINVAL)?;
 
@@ -1488,6 +1735,26 @@ impl G17PUserRenderStorage {
             Ok(())
         })?;
         Ok(state)
+    }
+
+    /// Restore the shared intrusive-list head after both queues are idle and
+    /// both GPU stages have written their owned timestamps.
+    pub(crate) fn quiesce_completed_job_list(&mut self, state: G17PUserRenderQueueState) -> Result {
+        if !g17p_render_can_reset_job_list(
+            state.tiling,
+            state.fragment,
+            state.tiling_timestamps,
+            state.fragment_timestamps,
+        ) {
+            return Err(EBUSY);
+        }
+        let job_list = self.graph.iova() + Self::JOB_LIST as u64;
+        self.graph.with_bytes_mut(|raw| {
+            put_u64(raw, Self::JOB_LIST, 0);
+            put_u64(raw, Self::JOB_LIST + 0x08, job_list);
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        })
     }
 }
 
@@ -2219,6 +2486,7 @@ impl G17ResourceOwner {
     pub(crate) fn publish_partial_opening_pair<F>(
         &mut self,
         render_vm: Option<&mmu::Vm>,
+        context_already_bound: bool,
         fragment_queue_gpu_va: u64,
         fragment_queue_write_index: u32,
         tiling_queue_gpu_va: u64,
@@ -2231,7 +2499,10 @@ impl G17ResourceOwner {
     where
         F: FnOnce(),
     {
-        if fragment_queue_gpu_va == 0 || tiling_queue_gpu_va == 0 {
+        if fragment_queue_gpu_va == 0
+            || tiling_queue_gpu_va == 0
+            || (render_vm.is_some() && context_already_bound)
+        {
             return Err(EINVAL);
         }
         let binding = self.partial_opening_binding();
@@ -2345,6 +2616,8 @@ impl G17ResourceOwner {
             .copy_from_slice(&prepared.fragment.slot);
         let render_bind = if let Some(vm) = render_vm {
             Some(self.address_space.uat.bind(vm)?)
+        } else if context_already_bound {
+            None
         } else {
             self.address_space
                 .uat
@@ -2418,6 +2691,7 @@ mod tests {
         assert_eq!(G17P_COMPUTE_OPERAND_STATE_SIZE, 0x14000);
         assert_eq!(G17P_COMPUTE_SUPPORT_SIZE, 0xc000);
         assert_eq!(G17P_COMPUTE_QUEUE_GRAPH_SIZE, 0x8000);
+        assert_eq!(G17P_RETAINED_RENDER_ORDINALS, 0x100);
         assert_eq!(g17_initdata::T8140_REGISTER_WINDOWS.len(), 18);
         assert_eq!(g17_initdata::T8140_REGISTER_WINDOWS[0].slot, 0);
         assert_eq!(
@@ -2658,14 +2932,14 @@ mod tests {
 
         // An address-construction error occurs before any publication and
         // cannot change the early 3D-visible bytes.
-        assert!(build_g17p_late_tiling_bytes(descriptor, u64::MAX, addresses).is_err());
+        assert!(build_g17p_late_tiling_bytes(descriptor, u64::MAX, addresses, 0).is_err());
         assert!(graph[G17P_USER_TILING_RING..G17P_USER_TILING_RING + 24]
             .iter()
             .all(|byte| *byte == 0));
         assert_eq!(get_u32(&support, G17P_RENDER_POOL_A_SLOTS + 4), 1);
         assert_eq!(get_u32(&support, G17P_RENDER_SHARED_CONTROL_INNER), 1);
 
-        let late = build_g17p_late_tiling_bytes(descriptor, graph_va, addresses).unwrap();
+        let late = build_g17p_late_tiling_bytes(descriptor, graph_va, addresses, 0).unwrap();
         late.apply(&mut graph, &mut support);
         assert_eq!(get_u64(&graph, G17P_USER_TILING_RING), descriptor);
         assert_eq!(
@@ -2680,6 +2954,34 @@ mod tests {
         assert_eq!(get_u32(&graph, G17P_USER_TILING_EVENT + 0x08), 0x102);
         assert_eq!(get_u32(&support, G17P_RENDER_POOL_A_SLOTS + 4), 2);
         assert_eq!(get_u32(&support, G17P_RENDER_SHARED_CONTROL_INNER), 2);
+
+        let retained = build_g17p_late_tiling_bytes(descriptor, graph_va, addresses, 1).unwrap();
+        retained.apply(&mut graph, &mut support);
+        assert_eq!(get_u32(&graph, G17P_USER_TILING_EVENT + 0x08), 0x202);
+        assert_eq!(get_u32(&support, G17P_RENDER_POOL_A_SLOTS + 4 + 2 * 4), 2);
+        assert_eq!(get_u32(&support, G17P_RENDER_SHARED_CONTROL_INNER), 4);
+    }
+
+    #[test]
+    fn retained_job_list_reset_requires_idle_queues_and_all_owned_timestamps() {
+        let idle = g17_completion::QueueIndices {
+            done: 3,
+            read: 3,
+            write: 3,
+        };
+        let active = g17_completion::QueueIndices {
+            done: 2,
+            read: 3,
+            write: 3,
+        };
+        assert!(g17p_render_can_reset_job_list(idle, idle, [1, 2], [3, 4]));
+        assert!(!g17p_render_can_reset_job_list(
+            active,
+            idle,
+            [1, 2],
+            [3, 4]
+        ));
+        assert!(!g17p_render_can_reset_job_list(idle, idle, [1, 0], [3, 4]));
     }
 
     #[test]
