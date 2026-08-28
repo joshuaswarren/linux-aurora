@@ -13,20 +13,6 @@
 #define APPLE_DCP_COPROC_CPU_STATUS_RUNNING	BIT(0)
 #define APPLE_DCP_COPROC_CPU_STATUS_STOPPED	BIT(1)
 
-#define APPLE_DCP_PMGR_PS_ACTUAL	GENMASK(7, 4)
-#define APPLE_DCP_PMGR_PS_TARGET	GENMASK(3, 0)
-#define APPLE_DCP_PMGR_PS_AUTO_ENABLE	BIT(28)
-#define APPLE_DCP_PMGR_PS_RESET		BIT(12)
-#define APPLE_DCP_PMGR_PS_DEV_DISABLE	BIT(10)
-#define APPLE_DCP_PMGR_PS_FLAGS		GENMASK(9, 8)
-#define APPLE_DCP_PMGR_PS_SET_MASK	(APPLE_DCP_PMGR_PS_AUTO_ENABLE | \
-					 APPLE_DCP_PMGR_PS_RESET | \
-					 APPLE_DCP_PMGR_PS_DEV_DISABLE | \
-					 APPLE_DCP_PMGR_PS_FLAGS | \
-					 APPLE_DCP_PMGR_PS_TARGET)
-#define APPLE_DCP_PMGR_PS_ACTIVE	0xf
-#define APPLE_DCP_PMGR_PS_OFF		0x0
-
 enum apple_dcp_coprocessor_start {
 	APPLE_DCP_COPROCESSOR_COLD_START,
 	APPLE_DCP_COPROCESSOR_ADOPT_AND_RESTART,
@@ -81,22 +67,6 @@ static inline bool
 apple_dcp_needs_fresh_boot(enum apple_dcp_coprocessor_start start_mode)
 {
 	return start_mode == APPLE_DCP_COPROCESSOR_ASC_STOPPED_RESTART;
-}
-
-static inline u32 apple_dcp_pmgr_with_target(u32 reg, u32 target)
-{
-	return (reg & ~APPLE_DCP_PMGR_PS_SET_MASK) |
-		FIELD_PREP(APPLE_DCP_PMGR_PS_TARGET, target);
-}
-
-static inline u32 apple_dcp_pmgr_with_auto_enable(u32 reg)
-{
-	return reg | APPLE_DCP_PMGR_PS_AUTO_ENABLE;
-}
-
-static inline bool apple_dcp_pmgr_reached_target(u32 reg, u32 target)
-{
-	return FIELD_GET(APPLE_DCP_PMGR_PS_ACTUAL, reg) == target;
 }
 
 static inline u32 apple_dcp_coprocessor_stop_first(u32 control)

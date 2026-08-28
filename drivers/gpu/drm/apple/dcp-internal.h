@@ -11,7 +11,6 @@
 #include <linux/mux/consumer.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
-#include <linux/regmap.h>
 #include <linux/scatterlist.h>
 #include <linux/usb/typec_mux.h>
 
@@ -139,9 +138,6 @@ struct apple_dcp {
 	void __iomem *coproc_reg;
 	/* Locked firmware entry point supplied by iBoot. */
 	void __iomem *iop_vbar_reg;
-	/* PMGR register for the T8140 display CPU power domain. */
-	struct regmap *disp_cpu_pstate_regmap;
-	u32 disp_cpu_pstate_offset;
 	bool fresh_boot_cpu_started;
 	bool adopted_session;
 
