@@ -361,7 +361,7 @@ fn refuse_agx3_probe(pdev: &platform::Device<Core>, soc: &'static hw::agx3::SocC
     // real M5, attempt the grounded boot prologue instead of an unconditional
     // refusal. The first slice always returns an error (the full boot is not
     // yet wired), so probe still fails closed today.
-    if expected.gpu_gen == hw::GpuGen::G17 && g17_live_boot::G17_LIVE_BOOT_ENABLED {
+    if exact_t8140_target && g17_live_boot::enabled() {
         let Some(registers) = resources.as_ref() else {
             return ENODEV;
         };
