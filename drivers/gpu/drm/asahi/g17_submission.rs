@@ -3227,6 +3227,36 @@ mod tests {
     }
 
     #[test]
+    fn g17p_classic_work_slots_and_sksm_pointer_entries_are_distinct() {
+        assert_eq!(G17P_PARTIAL_OPENING_OUTER_SLOT_SIZE, 0x18);
+        assert_eq!(G17P_CHANNEL_ABI.command_pointer_entry_bytes, 0x08);
+
+        let sksm = prepare_g17p_channel_write(
+            G17ChannelAbiTarget::A18ProG17P,
+            1,
+            3,
+            4,
+        )
+        .unwrap();
+        assert_eq!(sksm.entry_byte_offset, 0x08);
+
+        let classic = prepare_g17p_partial_opening_outer_slot(
+            G17PPartialOpeningOuterChannelState {
+                consumers: [0, 0],
+                producer: 1,
+                queue_gpu_va: 0xffff_fc20_c000_00c0,
+                queue_write_index: 3,
+            },
+            G17P_PARTIAL_OPENING_FRAGMENT_CHANNEL_TABLE_INDEX,
+            1,
+            1,
+        )
+        .unwrap();
+        assert_eq!(classic.slot_byte_offset, 0x18);
+        assert_eq!(get_u64_le(&classic.slot, 0x08), 0xffff_fc20_c000_00c0);
+    }
+
+    #[test]
     fn g17p_channel_write_plan_matches_host_ordering_and_wrap() {
         assert_eq!(
             prepare_g17p_channel_write(G17ChannelAbiTarget::A18ProG17P, 2, 0, 4),
