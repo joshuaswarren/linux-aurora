@@ -591,6 +591,9 @@ static void _dcp_poweroff(struct apple_dcp *dcp)
 	case DCP_FIRMWARE_V_13_5:
 		iomfb_poweroff_v13_3(dcp);
 		break;
+	case DCP_FIRMWARE_H17P:
+		iomfb_poweroff_h17p(dcp);
+		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
 		break;
@@ -650,6 +653,9 @@ static void __maybe_unused dcp_sleep(struct apple_dcp *dcp)
 	case DCP_FIRMWARE_V_13_5:
 		iomfb_sleep_v13_3(dcp);
 		break;
+	case DCP_FIRMWARE_H17P:
+		iomfb_sleep_h17p(dcp);
+		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
 		break;
@@ -674,6 +680,9 @@ void dcp_poweron(struct platform_device *pdev)
 		break;
 	case DCP_FIRMWARE_V_13_5:
 		iomfb_poweron_v13_3(dcp);
+		break;
+	case DCP_FIRMWARE_H17P:
+		iomfb_poweron_h17p(dcp);
 		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
@@ -950,6 +959,9 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 	char compat_str[DCP_FW_VERSION_STR_LEN];
 	char fw_str[DCP_FW_VERSION_STR_LEN];
 	int ret;
+
+	if (of_device_is_compatible(dev->of_node, "apple,t8140-dcp"))
+		return DCP_FIRMWARE_H17P;
 
 	/* firmware version is just informative */
 	dcp_read_fw_version(dev, "apple,firmware-version", fw_str);
