@@ -7,6 +7,22 @@
 #include "iomfb_v13_3.h"
 #include "version_utils.h"
 
+struct dcp_h17p_hotplug_request {
+	__le64 connected;
+	u8 tiled_display[0x4c];
+	u8 tiled_display_null;
+	u8 padding[3];
+} __packed;
+
+struct dcp_h17p_swap_info_request {
+	u8 swap_info[0xe0];
+	u8 swap_info_null;
+	u8 padding[3];
+} __packed;
+
+static_assert(sizeof(struct dcp_h17p_hotplug_request) == 0x58);
+static_assert(sizeof(struct dcp_h17p_swap_info_request) == 0xe4);
+
 static const struct dcp_method_entry dcp_methods[dcpep_num_methods] = {
 	IOMFB_METHOD("A000", dcpep_late_init_signal),
 	IOMFB_METHOD("A024", dcpep_setup_video_limits),
@@ -53,8 +69,10 @@ static bool trampoline_rt_bandwidth_h17p(struct apple_dcp *dcp, int tag,
 		      dcp->disp_bw_scratch_offset;
 
 	trace_iomfb_callback(dcp, tag, __func__);
-	return apple_dcp_h17p_rt_bw_encode_reply(&view, scratch,
-						    clock_request) == 0;
+	if (apple_dcp_h17p_rt_bw_encode_reply(&view, scratch,
+						     clock_request))
+		dev_warn(dcp->dev, "D003 bandwidth request is malformed\n");
+	return true;
 }
 
 static bool trampoline_get_frequency_h17p(struct apple_dcp *dcp, int tag,
@@ -74,6 +92,28 @@ static bool trampoline_get_frequency_h17p(struct apple_dcp *dcp, int tag,
 	}
 
 	*(__le64 *)out = cpu_to_le64(rate);
+	return true;
+}
+
+static bool trampoline_hotplug_h17p(struct apple_dcp *dcp, int tag,
+				    void *out, void *in)
+{
+	const struct dcp_h17p_hotplug_request *request = in;
+
+	if (!(request->tiled_display_null & 1))
+		memcpy(out, request->tiled_display,
+		       sizeof(request->tiled_display));
+	return trampoline_hotplug(dcp, tag, out, in);
+}
+
+static bool trampoline_swap_info_h17p(struct apple_dcp *dcp, int tag,
+				      void *out, void *in)
+{
+	const struct dcp_h17p_swap_info_request *request = in;
+
+	trace_iomfb_callback(dcp, tag, __func__);
+	if (!(request->swap_info_null & 1))
+		memcpy(out, request->swap_info, sizeof(request->swap_info));
 	return true;
 }
 
@@ -128,12 +168,12 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[565] = trampoline_true, /* set_property_bool */
 	[567] = trampoline_true, /* set_property_str */
 	[572] = trampoline_zero, /* power_up_dart */
-	[575] = trampoline_hotplug,
+	[575] = trampoline_hotplug_h17p,
 	[576] = trampoline_nop, /* powerstate_notify */
 	[586] = trampoline_true, /* create_default_fb_surface */
 	[587] = trampoline_nop, /* clear_default_surface */
 	[588] = trampoline_nop, /* swap_notify */
-	[589] = trampoline_nop, /* swap_info_notify */
+	[589] = trampoline_swap_info_h17p,
 	[594] = trampoline_swap_complete,
 	[596] = trampoline_swap_complete_intent_gated,
 	[597] = trampoline_abort_swap_ap_gated,
