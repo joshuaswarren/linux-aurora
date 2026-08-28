@@ -24,18 +24,31 @@
 
 #![allow(dead_code)]
 
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
 use kernel::{
     device::Core,
+    iosys_map::IoSysMapRef,
     platform,
     prelude::*,
-    soc::apple::mailbox::{AscwrapV6Lifecycle, AscwrapV6Provider, AscwrapV6Role},
+    soc::apple::{
+        mailbox::{AscwrapV6Lifecycle, AscwrapV6Provider, AscwrapV6Role},
+        rtkit,
+    },
+    sync::Arc,
+    time::{delay::fsleep, Delta},
+};
+use kernel::macros::vtable;
+
+use crate::{
+    driver::{AsahiDevice, T8140LiveTopologyAdmission},
+    g17_lifecycle, g17_manager, g17_rtkit, hw, identity, regs,
 };
 
-use crate::{driver::T8140LiveTopologyAdmission, g17_lifecycle, hw, identity};
-
-/// Master opt-in. It remains false while the dual RTKit discovery body is not
-/// wired.
-pub(crate) const G17_LIVE_BOOT_ENABLED: bool = false;
+/// The T8140 match now runs the reversible provider-owned bring-up slice.
+/// Probe still returns `ENODEV` after the slice because no G17P DRM queue
+/// backend is registered yet.
+pub(crate) const G17_LIVE_BOOT_ENABLED: bool = true;
 
 /// Ordered boundary stages.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -44,7 +57,91 @@ pub(crate) enum BootStage {
     ProviderOwnership,
     ReversibleLifecycle,
     StartCpus,
-    DiscoverEpmap,
+    BootRtkit,
+    PublishInitdata,
+    InitdataAcknowledged,
+    RegisterComputeQueue,
+}
+
+const INITDATA_ACK_TYPE: u16 = 0x09;
+const INITDATA_ACK_POLLS: usize = 200;
+
+/// Per-role callback state retained until the corresponding RTKit client is
+/// dropped. The callback only publishes atomics; probe owns every mutation of
+/// manager and queue state.
+struct G17PRoleRtkitState {
+    acked: AtomicBool,
+    crashed: AtomicBool,
+    runtime_events: AtomicU32,
+}
+
+impl G17PRoleRtkitState {
+    fn new() -> Self {
+        Self {
+            acked: AtomicBool::new(false),
+            crashed: AtomicBool::new(false),
+            runtime_events: AtomicU32::new(0),
+        }
+    }
+}
+
+/// Active G17P boot does not ask Rust to back system-endpoint buffers. The
+/// generic RTKit core uses its coherent-DMA fallback when these callbacks are
+/// absent.
+struct G17PNoRtkitBuffer;
+
+impl rtkit::Buffer for G17PNoRtkitBuffer {
+    fn iova(&self) -> Result<usize> {
+        Err(ENOTSUPP)
+    }
+
+    fn buf(&mut self) -> Result<IoSysMapRef<'_, u8>> {
+        Err(ENOTSUPP)
+    }
+}
+
+struct G17PRtkitOps;
+
+#[vtable]
+impl rtkit::Operations for G17PRtkitOps {
+    type Data = Arc<G17PRoleRtkitState>;
+    type Buffer = G17PNoRtkitBuffer;
+
+    fn recv_message(
+        data: <Self::Data as kernel::types::ForeignOwnable>::Borrowed<'_>,
+        endpoint: u8,
+        message: u64,
+    ) {
+        if endpoint == g17_rtkit::ENDPOINT_GFX_MESSAGES
+            && (message >> 48) as u16 == INITDATA_ACK_TYPE
+        {
+            data.acked.store(true, Ordering::Release);
+        } else if endpoint == g17_rtkit::ENDPOINT_GFX_INTERRUPTS {
+            data.runtime_events.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn recv_message_early(
+        data: <Self::Data as kernel::types::ForeignOwnable>::Borrowed<'_>,
+        endpoint: u8,
+        message: u64,
+    ) -> bool {
+        if endpoint == g17_rtkit::ENDPOINT_GFX_MESSAGES
+            && (message >> 48) as u16 == INITDATA_ACK_TYPE
+        {
+            data.acked.store(true, Ordering::Release);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn crashed(
+        data: <Self::Data as kernel::types::ForeignOwnable>::Borrowed<'_>,
+        _crashlog: Option<&[u8]>,
+    ) {
+        data.crashed.store(true, Ordering::Release);
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -96,6 +193,8 @@ impl g17_lifecycle::AscCpuLifecycle for AscwrapV6Provider {
 /// Attempt the current G17P live-boot slice.
 pub(crate) fn attempt(
     pdev: &platform::Device<Core>,
+    dev: &AsahiDevice,
+    registers: &regs::Resources,
     soc: &'static hw::agx3::SocConfig,
     id: &identity::GpuIdentity,
     topology: Option<&T8140LiveTopologyAdmission>,
@@ -145,17 +244,105 @@ pub(crate) fn attempt(
         return Err(ENOTSUPP);
     }
 
+    let mut manager = g17_manager::G17PManagerConstruction::new(
+        dev,
+        soc,
+        g17_manager::T8140_G17P_PLATFORM_CONFIG,
+    )?;
+
     g17_lifecycle::execute_cpu_pair(&gfx, &gfx1, || {
         dev_info!(
             pdev.as_ref(),
             "G17P live-boot: {:?} acquired GFX then GFX1\n",
             BootStage::StartCpus
         );
-        dev_err!(
+
+        let gfx_state = Arc::new(G17PRoleRtkitState::new(), GFP_KERNEL)?;
+        let gfx1_state = Arc::new(G17PRoleRtkitState::new(), GFP_KERNEL)?;
+        let mut gfx_rtkit = rtkit::RtKit::<G17PRtkitOps>::new(
+            dev.as_ref(),
+            None,
+            0,
+            gfx_state.clone(),
+        )?;
+        let mut gfx1_rtkit = rtkit::RtKit::<G17PRtkitOps>::new(
+            dev.as_ref(),
+            None,
+            1,
+            gfx1_state.clone(),
+        )?;
+        let mut gfx_rtkit = Pin::new(&mut gfx_rtkit);
+        let mut gfx1_rtkit = Pin::new(&mut gfx1_rtkit);
+
+        gfx_rtkit.as_mut().boot()?;
+        gfx1_rtkit.as_mut().boot()?;
+        dev_info!(
             pdev.as_ref(),
-            "G17P live-boot: dual RTKit discovery is not wired at {:?}\n",
-            BootStage::DiscoverEpmap
+            "G17P live-boot: {:?} completed independently for GFX/GFX1\n",
+            BootStage::BootRtkit
         );
-        Err(ENOTSUPP)
+
+        registers.t8140_axi_transition_workaround()?;
+        registers.t8140_pre_initdata_clear()?;
+
+        for rtkit in [&mut gfx_rtkit, &mut gfx1_rtkit] {
+            rtkit
+                .as_mut()
+                .start_endpoint(g17_rtkit::ENDPOINT_GFX_MESSAGES)?;
+            rtkit
+                .as_mut()
+                .start_endpoint(g17_rtkit::ENDPOINT_GFX_INTERRUPTS)?;
+        }
+
+        let handoff = manager.handoff();
+        let gfx_init = g17_rtkit::encode_initdata_doorbell(handoff.primary.instance.root)
+            .map_err(|_| EINVAL)?;
+        let gfx1_init = g17_rtkit::encode_initdata_doorbell(handoff.secondary.instance.root)
+            .map_err(|_| EINVAL)?;
+        gfx_rtkit
+            .as_mut()
+            .send_message(g17_rtkit::ENDPOINT_GFX_MESSAGES, gfx_init)?;
+        gfx1_rtkit
+            .as_mut()
+            .send_message(g17_rtkit::ENDPOINT_GFX_MESSAGES, gfx1_init)?;
+        dev_info!(
+            pdev.as_ref(),
+            "G17P live-boot: {:?} sent roots {:#x}/{:#x}\n",
+            BootStage::PublishInitdata,
+            handoff.primary.instance.root,
+            handoff.secondary.instance.root
+        );
+
+        for _ in 0..INITDATA_ACK_POLLS {
+            if gfx_state.acked.load(Ordering::Acquire)
+                && gfx1_state.acked.load(Ordering::Acquire)
+            {
+                break;
+            }
+            if gfx_state.crashed.load(Ordering::Acquire)
+                || gfx1_state.crashed.load(Ordering::Acquire)
+            {
+                return Err(EIO);
+            }
+            fsleep(Delta::from_millis(10));
+        }
+        if !gfx_state.acked.load(Ordering::Acquire)
+            || !gfx1_state.acked.load(Ordering::Acquire)
+        {
+            return Err(ETIMEDOUT);
+        }
+        dev_info!(
+            pdev.as_ref(),
+            "G17P live-boot: {:?} for both firmware roles\n",
+            BootStage::InitdataAcknowledged
+        );
+
+        let _queue = manager.configure_compute_sksm_queue(dev, registers, 4, 2)?;
+        dev_info!(
+            pdev.as_ref(),
+            "G17P live-boot: {:?} QID 4 / completion selector 2\n",
+            BootStage::RegisterComputeQueue
+        );
+        Ok(())
     })
 }
