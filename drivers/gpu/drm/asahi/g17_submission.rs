@@ -19,7 +19,7 @@
 //! native G17 channel-command dispatcher is also modeled for the exact A18
 //! Pro/G17P identity: it reads a little-endian u32 tag at command offset zero,
 //! keeps unresolved and nested SKU meanings out of the top-level enum, and
-//! separates the host's `Nop=17` name from the firmware's fatal rejection of
+//! separates the host's `Nop=17` name from the firmware's fatal handling of
 //! that value.
 //!
 //! Grounding is first-hand from the on-disk M5 role macho `GFX.a010.macho`
@@ -95,7 +95,7 @@ const DOORBELL_INDEX_MASK: u64 = 0x7;
 pub(crate) const DOORBELL_KICKFW: u8 = 0x10;
 pub(crate) const DOORBELL_DEVCTRL: u8 = 0x11;
 
-/// The three GPU submission pipes. The firmware rejects `pipe_type == 3`
+/// The three GPU submission pipes. The firmware treats `pipe_type == 3` as invalid
 /// (`cmp w8, #0x3 ; b.eq 0x252f4` — no such pipe).
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[repr(u8)]
@@ -105,7 +105,7 @@ pub(crate) enum PipeType {
     Compute = 2,
 }
 
-/// Rejections from the submission codec.
+/// Errors from the submission codec.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum SubmissionError {
     /// A doorbell index outside the 3-bit [4:2] field.
@@ -158,8 +158,8 @@ pub(crate) enum SubmissionError {
     CommandTagUnresolved,
     /// This value is not a grounded G17P top-level command tag.
     CommandTagInvalid,
-    /// The host names this tag, but the matched firmware rejects it fatally.
-    CommandTagRejectedByFirmware,
+    /// The host names this tag, but the matched firmware handles it fatally.
+    CommandTagInvalidForFirmware,
 }
 
 /// Encode a work-submission doorbell exactly as `gpu.rs::run_job` does:
@@ -179,7 +179,7 @@ pub(crate) const fn doorbell_type(message: u64) -> u8 {
 }
 
 /// Decode a TX doorbell to `(pipe_type, index)`, applying the firmware's exact
-/// masks and its `pipe == 3` rejection.
+/// masks and its invalid `pipe == 3` outcome.
 pub(crate) const fn decode_tx_doorbell(message: u64) -> Result<(PipeType, u8), SubmissionError> {
     if doorbell_type(message) != DOORBELL_TYPE_TX {
         return Err(SubmissionError::NotATxDoorbell);
@@ -642,9 +642,9 @@ pub(crate) const HOST_MAX_OUTSTANDING_JOB_SLOTS: u32 = 127;
 
 /// Advance a producer/consumer index within a ring of `size` entries.
 ///
-/// Reject a zero-sized ring or stale producer state instead of panicking or
-/// producer index. A valid `index` is always below `u32::MAX`, so `index + 1`
-/// cannot overflow after these checks.
+/// Return an error for a zero-sized ring or a producer outside the ring. A
+/// valid `index` is always below `u32::MAX`, so `index + 1` cannot overflow
+/// after these checks.
 pub(crate) const fn ring_next(index: u32, size: u32) -> Result<u32, SubmissionError> {
     if size == 0 {
         return Err(SubmissionError::RingSizeZero);
@@ -761,7 +761,7 @@ pub(crate) const fn decode_kick_word(word: u64) -> Result<SksmKickWord, Submissi
 //    advanced modulo runtime `num_stamps`. Wrapping the slot to zero increments
 //    the 32-bit stamp in bits [39:8]. This coupling is load-bearing: choosing a
 //    different entry slot from the one encoded in the doorbell desynchronizes
-//    the queue and can reach the firmware's out-of-order rejection path.
+//    the queue and can reach the firmware's out-of-order fatal path.
 // ---------------------------------------------------------------------------
 
 /// Stamp sequence in bits [39:8] of a host SKSM timestamp.
@@ -822,7 +822,7 @@ pub(crate) const fn encode_kick_timestamp(timestamp: KickTimestamp) -> u64 {
 ///
 /// `num_stamps` and `entry_stride` are intentionally runtime inputs: Apple's
 /// host loads both from the per-queue geometry rather than hard-coding them.
-/// Invalid geometry is rejected before an entry address or doorbell is
+/// Invalid geometry returns an error before an entry address or doorbell is
 /// produced. No shared memory, counter, barrier, MMIO, or endpoint state is
 /// mutated here.
 pub(crate) const fn prepare_kick_submission(
@@ -1032,14 +1032,32 @@ pub(crate) const G17P_SKSM_RUNTIME_GEOMETRY_OBJECT_LAYOUT: G17PSksmRuntimeGeomet
 
 /// QID-valid mask base written after the two queue-configuration stores.
 pub(crate) const G17P_SKSM_QUEUE_ENABLE_MASK_BASE: u32 = 0x21068;
+/// QID-disable mask base written before changing a registered queue's routing.
+pub(crate) const G17P_SKSM_QUEUE_DISABLE_MASK_BASE: u32 = 0x21078;
 /// Queue-entry address bits preserved by the host payload encoder.
 pub(crate) const G17P_SKSM_QUEUE_ENTRY_ADDRESS_MASK: u64 = 0x0000_07ff_ffff_ffe0;
 /// Fixed portion of the first G17P queue-configuration store.
 const G17P_SKSM_QUEUE_CONFIG_TAG: u64 = 0x0000_0400_0002_1008;
 const G17P_SKSM_QUEUE_COMPLETION_SELECTOR_MAX: u32 = 4;
+/// `_AGFIDataMasterType` selected by `AGXCommandQueue::processComputeSetup`.
+pub(crate) const G17P_COMPUTE_DATA_MASTER: u32 = 2;
 
-/// Pure description of the three ordered host-side publications that make one
-/// A18 Pro SKSM queue visible to the hardware bridge.
+/// Runtime routing state that the compute-channel setup owns for one queue.
+///
+/// The pinned host selects the queue by the CL channel QID, prepares the
+/// queue's mapping resource, obtains a completion selector from the channel,
+/// and stores `selector | (2 << 32)` at queue `+0x1c`. Keeping the selector
+/// and queue address together prevents a caller from supplying a non-compute
+/// data-master value to the production compute path.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PComputeQueueRouting {
+    pub(crate) queue_id: u8,
+    pub(crate) completion_selector: u32,
+    pub(crate) entry_gpu_va: u64,
+}
+
+/// Pure description of the ordered host-side publications that make one A18
+/// Pro SKSM queue visible to the hardware bridge.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct PreparedG17PSksmQueueConfig {
     /// First store: 64-bit QID tag.
@@ -1048,9 +1066,10 @@ pub(crate) struct PreparedG17PSksmQueueConfig {
     /// Second store: 64-bit queue address/data-master/completion selector.
     pub(crate) payload_offset: u32,
     pub(crate) payload: u64,
-    /// Final read/modify/write: enable this QID in one of two mask words.
-    pub(crate) enable_mask_offset: u32,
-    pub(crate) enable_mask: u64,
+    /// Final stores: high 64 QIDs first, then low 64 QIDs.
+    pub(crate) enable_pair: G17SksmOrderedWritePair,
+    /// Stores used before changing an already-enabled queue's routing.
+    pub(crate) disable_pair: G17SksmOrderedWritePair,
 }
 
 impl PreparedG17PSksmQueueConfig {
@@ -1103,16 +1122,55 @@ pub(crate) const fn prepare_g17p_sksm_queue_config(
     let completion_field = (3 * (4 - completion_selector) + 0x3fe) as u64;
     let payload =
         (((data_master as u64) + 1) << 60) | entry_gpu_va | completion_field.wrapping_shl(54);
-    let mask_word = (queue_id as u32 >> 6) * 8;
+    let low_mask = if queue_id < 64 { 1u64 << queue_id } else { 0 };
+    let high_mask = if queue_id >= 64 {
+        1u64 << (queue_id - 64)
+    } else {
+        0
+    };
+    let enable_pair = G17SksmOrderedWritePair {
+        word0_offset: G17P_SKSM_QUEUE_ENABLE_MASK_BASE + 8,
+        word0: high_mask,
+        word1_offset: G17P_SKSM_QUEUE_ENABLE_MASK_BASE,
+        word1: low_mask,
+    };
+    let disable_pair = G17SksmOrderedWritePair {
+        word0_offset: G17P_SKSM_QUEUE_DISABLE_MASK_BASE + 8,
+        word0: high_mask,
+        word1_offset: G17P_SKSM_QUEUE_DISABLE_MASK_BASE,
+        word1: low_mask,
+    };
 
     Ok(PreparedG17PSksmQueueConfig {
         tag_offset: offsets.write0,
         tag: G17P_SKSM_QUEUE_CONFIG_TAG | ((queue_id as u64) << 43),
         payload_offset: offsets.write1,
         payload,
-        enable_mask_offset: G17P_SKSM_QUEUE_ENABLE_MASK_BASE + mask_word,
-        enable_mask: 1u64 << (queue_id & 63),
+        enable_pair,
+        disable_pair,
     })
+}
+
+/// Prepare the queue-configuration transaction produced by the G17P compute
+/// setup path.
+///
+/// `AGXCommandQueue::processComputeSetup` at
+/// `0xfffffe0008a077a4..0xfffffe0008a078d4` selects the queue from the CL
+/// channel QID, prepares its mapping resource, obtains the channel completion
+/// selector, and writes the packed selector/data-master pair. The captured
+/// native CL2 queue uses QID 4, selector 2, and entry VA `0x70004d8000`.
+pub(crate) const fn prepare_g17p_compute_sksm_queue_config(
+    routing: G17PComputeQueueRouting,
+    geometry: G17SksmScratchGeometry,
+) -> Result<PreparedG17PSksmQueueConfig, SubmissionError> {
+    prepare_g17p_sksm_queue_config(
+        G17ChannelAbiTarget::A18ProG17P,
+        routing.queue_id,
+        G17P_COMPUTE_DATA_MASTER,
+        routing.completion_selector,
+        routing.entry_gpu_va,
+        geometry,
+    )
 }
 
 pub(crate) const G17P_KSM_COMPLETION_QUEUE_COUNT: u8 = 4;
@@ -1186,11 +1244,11 @@ pub(crate) const G17P_COMPLETION_HOST_ABI_GROUNDED: bool = true;
 //    0xfffffc00000122a8.
 //
 //    All three firmware variants validate at least four bytes, load a u32 tag
-//    from command offset zero, and reject tags above 18. Their jump tables
+//    from command offset zero, and treat tags above 18 as invalid. Their jump tables
 //    process 0/1/2/3/4/5/7/9/12/14/15/16/18. Tag 6 reaches the dedicated
 //    `PMRebuild must not be received in SKSM` fatal, while 8/10/11/13/17
 //    reach the invalid-command fatal. The host nevertheless names 17 `Nop`;
-//    that producer identity is preserved, but the admission helper rejects it
+//    that producer identity is preserved, but the admission helper marks it invalid
 //    because the matched consumer cannot process it.
 //
 //    Tags 6/8/10/11 remain semantically unresolved instead of inheriting an
@@ -1211,7 +1269,7 @@ pub(crate) const G17P_TOP_LEVEL_COMMAND_TAG_WIDTH: u32 = 4;
 /// Host-grounded G17P top-level command types.
 ///
 /// This type intentionally excludes unresolved tags and every nested
-/// SKU-stream opcode. `Nop` records the host ABI but is rejected by
+/// SKU-stream opcode. `Nop` records the host ABI but is invalid for
 /// [`admit_g17p_top_level_command`] because all matched firmware variants send
 /// tag 17 to the invalid-command fatal path.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -1236,7 +1294,7 @@ pub(crate) enum G17PTopLevelCommandType {
 /// Highest tag admitted by the G17P jump-table bounds check.
 pub(crate) const G17P_CHANNEL_COMMAND_TYPE_MAX: u32 = 18;
 
-/// Tags named by the pinned host's top-level ABI, including rejected `Nop`.
+/// Tags named by the pinned host's top-level ABI, including invalid `Nop`.
 pub(crate) const G17P_TOP_LEVEL_COMMAND_KNOWN_MASK: u32 = 0x0007_d2bf;
 /// In-range top-level tags whose host/firmware semantics remain unresolved.
 pub(crate) const G17P_TOP_LEVEL_COMMAND_UNRESOLVED_MASK: u32 = 0x0000_0d40;
@@ -1349,7 +1407,7 @@ pub(crate) const fn classify_g17p_channel_command(
 
 /// Decode a top-level tag and require a normal matched-firmware dispatch case.
 ///
-/// In particular, host-grounded `Nop = 17` is rejected here because the
+/// In particular, host-grounded `Nop = 17` is invalid here because the
 /// firmware sends it to the invalid-command fatal path.
 pub(crate) const fn admit_g17p_top_level_command(
     target: G17ChannelAbiTarget,
@@ -1364,7 +1422,7 @@ pub(crate) const fn admit_g17p_top_level_command(
         Ok(
             G17PChannelCommandDisposition::PmRebuildForbiddenFatal
             | G17PChannelCommandDisposition::InvalidCommandFatal,
-        ) => Err(SubmissionError::CommandTagRejectedByFirmware),
+        ) => Err(SubmissionError::CommandTagInvalidForFirmware),
         Err(error) => Err(error),
     }
 }
@@ -1530,7 +1588,7 @@ mod tests {
     }
 
     #[test]
-    fn firmware_rejects_pipe_three() {
+    fn firmware_marks_pipe_three_invalid() {
         // The firmware `cmp w8,#0x3 ; b.eq done` path: pipe 3 is not a pipe.
         let msg = (0x83u64 << 48) | 0x3;
         assert_eq!(doorbell_type(msg), DOORBELL_TYPE_TX);
@@ -1919,7 +1977,7 @@ mod tests {
     }
 
     #[test]
-    fn kick_queue_preparation_rejects_unrepresentable_state_before_publication() {
+    fn kick_queue_preparation_reports_unrepresentable_state_before_publication() {
         assert_eq!(
             prepare_kick_submission(1 << 40, 0, 1, 0x180),
             Err(SubmissionError::KickTimestampOutOfRange)
@@ -2031,9 +2089,9 @@ mod tests {
     fn pair_writer_does_not_publish_word1_after_word0_error() {
         use std::cell::Cell;
 
-        struct RejectFirst(Cell<u32>);
+        struct FirstWriteError(Cell<u32>);
 
-        impl G17SksmPairWriter for RejectFirst {
+        impl G17SksmPairWriter for FirstWriteError {
             type Error = u32;
 
             fn write64(&self, _offset: u32, _value: u64) -> core::result::Result<(), Self::Error> {
@@ -2043,7 +2101,7 @@ mod tests {
             }
         }
 
-        let writer = RejectFirst(Cell::new(0));
+        let writer = FirstWriteError(Cell::new(0));
         let pair = G17SksmOrderedWritePair {
             word0_offset: 0x4090,
             word0: 1,
@@ -2141,8 +2199,62 @@ mod tests {
                 word1: 0x2280_0000_0001_2340,
             }
         );
-        assert_eq!(config.enable_mask_offset, 0x21070);
-        assert_eq!(config.enable_mask, 1);
+        assert_eq!(
+            config.enable_pair,
+            G17SksmOrderedWritePair {
+                word0_offset: 0x21070,
+                word0: 1,
+                word1_offset: 0x21068,
+                word1: 0,
+            }
+        );
+        assert_eq!(
+            config.disable_pair,
+            G17SksmOrderedWritePair {
+                word0_offset: 0x21080,
+                word0: 1,
+                word1_offset: 0x21078,
+                word1: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn g17p_compute_queue_matches_the_captured_native_cl2_tuple() {
+        assert_eq!(G17P_COMPUTE_DATA_MASTER, 2);
+
+        let config = prepare_g17p_compute_sksm_queue_config(
+            G17PComputeQueueRouting {
+                queue_id: 4,
+                completion_selector: 2,
+                entry_gpu_va: 0x0000_0070_004d_8000,
+            },
+            g17_manager::T8140_G17P_PLATFORM_CONFIG.sksm_scratch,
+        )
+        .unwrap();
+
+        assert_eq!(config.tag_offset, 0x4090);
+        assert_eq!(config.tag, 0x0000_2400_0002_1008);
+        assert_eq!(config.payload_offset, 0x4098);
+        assert_eq!(config.payload, 0x3100_0070_004d_8000);
+        assert_eq!(
+            config.enable_pair,
+            G17SksmOrderedWritePair {
+                word0_offset: 0x21070,
+                word0: 0,
+                word1_offset: 0x21068,
+                word1: 1 << 4,
+            }
+        );
+        assert_eq!(
+            config.disable_pair,
+            G17SksmOrderedWritePair {
+                word0_offset: 0x21080,
+                word0: 0,
+                word1_offset: 0x21078,
+                word1: 1 << 4,
+            }
+        );
     }
 
     #[test]
@@ -2262,7 +2374,7 @@ mod tests {
     }
 
     #[test]
-    fn g17p_completion_descriptors_reject_invalid_inputs() {
+    fn g17p_completion_descriptors_report_invalid_inputs() {
         assert_eq!(
             encode_g17p_ksm_completion_descriptor(
                 G17ChannelAbiTarget::M5G17G,
@@ -2425,7 +2537,7 @@ mod tests {
     }
 
     #[test]
-    fn g17p_top_level_command_decode_rejects_bad_tag_and_identity() {
+    fn g17p_top_level_command_decode_reports_bad_tag_and_identity() {
         for raw in [6u32, 8, 10, 11] {
             assert_eq!(
                 decode_g17p_top_level_command(G17ChannelAbiTarget::A18ProG17P, &raw.to_le_bytes()),
@@ -2494,7 +2606,7 @@ mod tests {
         );
         assert_eq!(
             admit_g17p_top_level_command(G17ChannelAbiTarget::A18ProG17P, &nop),
-            Err(SubmissionError::CommandTagRejectedByFirmware)
+            Err(SubmissionError::CommandTagInvalidForFirmware)
         );
 
         for command_type in [

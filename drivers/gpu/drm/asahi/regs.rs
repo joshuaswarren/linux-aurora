@@ -264,28 +264,24 @@ impl Resources {
 
     /// Configure one G17P SKSM queue and then mark its QID valid.
     ///
-    /// This publication surface performs no scratch reads. The QID-valid word
-    /// is a distinct read/write register and follows both ordered FIFO stores.
+    /// The host publishes both 64-bit mask words without reading either one:
+    /// high QIDs first, low QIDs second.
     pub(crate) fn g17p_sksm_configure_queue(
         &self,
         pair: g17_submission::G17SksmOrderedWritePair,
-        enable_mask_offset: u32,
-        enable_mask: u64,
+        enable_pair: g17_submission::G17SksmOrderedWritePair,
     ) -> Result {
-        let enable_offset = enable_mask_offset as usize;
-        let enable_fits = enable_offset % core::mem::size_of::<u64>() == 0
-            && enable_offset
-                .checked_add(core::mem::size_of::<u64>())
-                .is_some_and(|end| end <= SGX_SIZE);
-        if !Self::g17p_sksm_pair_fits(pair) || !enable_fits || enable_mask == 0 {
+        if !Self::g17p_sksm_pair_fits(pair)
+            || !Self::g17p_sksm_pair_fits(enable_pair)
+            || enable_pair.word0 | enable_pair.word1 == 0
+        {
             return Err(EINVAL);
         }
 
         let _guard = self.sksm_fifo.lock();
         let sgx = self.sgx.try_access().ok_or(ENODEV)?;
         Self::g17p_sksm_publish_locked(&sgx, pair)?;
-        let current = sgx.try_read64(enable_offset)?;
-        sgx.try_write64(current | enable_mask, enable_offset)
+        Self::g17p_sksm_publish_locked(&sgx, enable_pair)
     }
 
     fn sgx_read32<const OFF: usize>(&self) -> u32 {
