@@ -90,11 +90,13 @@ const G17P_RENDER_FRAGMENT_FIRMWARE_SCRATCH: usize = 0x3c000;
 
 const G17P_CONTROL_DIRECTORY_VA: u64 = 0x70_0000_0000;
 const G17P_CONTROL_DIRECTORY_SIZE: usize = 0x10000;
-const G17P_CONTROL_OPERAND_TABLE_VA: u64 = 0x70_0020_8000;
-const G17P_CONTROL_OPERAND_BUFFER_BASE: u64 = 0x70_0022_0000;
+const G17P_CONTROL_OPERAND_TABLE_VA: u64 = g17_initdata::CONTROL_OPERAND_TABLE_ADDRESS;
+const G17P_CONTROL_OPERAND_BUFFER_BASE: u64 = g17_initdata::CONTROL_OPERAND_BUFFER_BASE;
 const G17P_CONTROL_OPERAND_BUFFER_COUNT: usize = 28;
-const G17P_CONTROL_OPERAND_BUFFER_SIZE: usize = 0x10_0000;
-const G17P_CONTROL_OPERAND_BUFFER_STRIDE: usize = 0x10_8000;
+const G17P_CONTROL_OPERAND_BUFFER_SIZE: usize =
+    g17_initdata::CONTROL_OPERAND_BUFFER_SIZE as usize;
+const G17P_CONTROL_OPERAND_BUFFER_STRIDE: usize =
+    g17_initdata::CONTROL_OPERAND_BUFFER_STRIDE as usize;
 const G17P_CONTROL_OPERAND_BACKING_SIZE: usize = (G17P_CONTROL_OPERAND_BUFFER_COUNT - 1)
     * G17P_CONTROL_OPERAND_BUFFER_STRIDE
     + G17P_CONTROL_OPERAND_BUFFER_SIZE;
@@ -395,6 +397,19 @@ pub(crate) struct G17ResourceHandoff {
     pub(crate) secondary: RoleResourceBinding,
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PControlCounters {
+    pub(crate) primary: [u32; g17_initdata::CHANNEL_ENTRY_STATE_COUNT],
+    pub(crate) secondary: [u32; g17_initdata::CHANNEL_ENTRY_STATE_COUNT],
+}
+
+impl G17PControlCounters {
+    pub(crate) fn opening_retired(self) -> bool {
+        self.primary == [g17_initdata::CONTROL_OPENING_PRIMARY_PRODUCER; 3]
+            && self.secondary == [g17_initdata::CONTROL_OPENING_SECONDARY_PRODUCER; 3]
+    }
+}
+
 /// Exact first-graphics objects retained by the T8140 resource owner.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct G17PPartialOpeningResourceBinding {
@@ -690,6 +705,32 @@ impl MappedObject {
             None,
             &mut bytes[secondary_offset..secondary_offset + g17_initdata::MAIN_CONFIG_SIZE],
         )
+        .map_err(|_| EINVAL)?;
+
+        let primary_ring = primary_offset + 0x4c0;
+        let primary_ring_end = primary_ring
+            .checked_add(g17_initdata::control_opening_size(InstanceRole::Primary))
+            .ok_or(EINVAL)?;
+        g17_initdata::encode_control_opening(
+            InstanceRole::Primary,
+            bytes
+                .get_mut(primary_ring..primary_ring_end)
+                .ok_or(EINVAL)?,
+        )
+        .map_err(|_| EINVAL)?;
+
+        let secondary_ring = secondary_offset + 0x4c0;
+        let secondary_ring_end = secondary_ring
+            .checked_add(g17_initdata::control_opening_size(
+                InstanceRole::Secondary,
+            ))
+            .ok_or(EINVAL)?;
+        g17_initdata::encode_control_opening(
+            InstanceRole::Secondary,
+            bytes
+                .get_mut(secondary_ring..secondary_ring_end)
+                .ok_or(EINVAL)?,
+        )
         .map_err(|_| EINVAL)
     }
 }
@@ -717,6 +758,22 @@ fn write_status_block_at(object: &mut MappedObject, offset: usize) -> Result {
     object.with_bytes_mut(|bytes| {
         g17_initdata::encode_status_block(&mut bytes[offset..end]).map_err(|_| EINVAL)
     })
+}
+
+#[cfg(not(test))]
+fn read_control_counters(object: &mut MappedObject, state_grid: u64) -> Result<[u32; 3]> {
+    let base = state_grid
+        .checked_add(g17_initdata::WORK_STATE_GRID_OFFSETS
+            [g17_initdata::CONTROL_CHANNEL_INDEX] as u64)
+        .ok_or(EINVAL)?;
+    let mut counters = [0u32; 3];
+    for (index, counter) in counters.iter_mut().enumerate() {
+        let address = base
+            .checked_add(index as u64 * g17_initdata::CHANNEL_STATE_SPACING as u64)
+            .ok_or(EINVAL)?;
+        *counter = object.read_u32(address)?;
+    }
+    Ok(counters)
 }
 
 #[cfg(not(test))]
@@ -2008,6 +2065,10 @@ struct G17MappedResources {
     hw_region_0: MappedObject,
     hw_region_1: MappedObject,
     fwctl: MappedObject,
+    control_shared: MappedObject,
+    control_shared_inner: MappedObject,
+    control_operand_table: MappedObject,
+    control_operand_buffers: MappedObject,
     register_windows: KVec<mmu::KernelMapping>,
 }
 
@@ -2068,6 +2129,45 @@ impl G17ResourceOwner {
             fwctl_gpu_va,
             FWCTL_SIZE,
             mmu::PROT_FW_SHARED_RW,
+        )?;
+        let mut control_shared = MappedObject::new_at(
+            dev,
+            address_space.uat.kernel_vm(),
+            g17_initdata::CONTROL_SHARED_ADDRESS,
+            g17_initdata::CONTROL_SHARED_OBJECT_SIZE,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        control_shared.with_bytes_mut(|bytes| {
+            g17_initdata::encode_control_shared(bytes).map_err(|_| EINVAL)
+        })?;
+        let mut control_shared_inner = MappedObject::new_at(
+            dev,
+            address_space.uat.kernel_vm(),
+            g17_initdata::CONTROL_SHARED_INNER_ADDRESS,
+            mmu::UAT_PGSZ,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        control_shared_inner.with_bytes_mut(|bytes| {
+            bytes.fill(0);
+            bytes[..8].copy_from_slice(&1u64.to_le_bytes());
+            Ok(())
+        })?;
+        let mut control_operand_table = MappedObject::new_at(
+            dev,
+            address_space.uat.kernel_lower_vm(),
+            G17P_CONTROL_OPERAND_TABLE_VA,
+            g17_initdata::CONTROL_OPERAND_TABLE_SIZE,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        control_operand_table.with_bytes_mut(|bytes| {
+            g17_initdata::encode_control_operand_table(bytes).map_err(|_| EINVAL)
+        })?;
+        let control_operand_buffers = MappedObject::new_at(
+            dev,
+            address_space.uat.kernel_lower_vm(),
+            G17P_CONTROL_OPERAND_BUFFER_BASE,
+            G17P_CONTROL_OPERAND_BACKING_SIZE,
+            mmu::PROT_GPU_FW_SHARED_RW,
         )?;
 
         let mut roots = MappedObject::new(
@@ -2243,7 +2343,7 @@ impl G17ResourceOwner {
         write_status_block_at(&mut secondary_status_a, 0)?;
         primary_state.with_bytes_mut(|bytes| {
             bytes[0x320..0x324]
-                .copy_from_slice(&g17_initdata::CONTROL_OPENING_PRODUCER.to_le_bytes());
+                .copy_from_slice(&g17_initdata::CONTROL_OPENING_PRIMARY_PRODUCER.to_le_bytes());
             let status_b = g17_initdata::PRIMARY_STATUS_B_STATE_GRID_OFFSET;
             let end = status_b + g17_initdata::PRIMARY_STATUS_B_OBJECT_SIZE;
             g17_initdata::encode_primary_status_b(
@@ -2255,7 +2355,7 @@ impl G17ResourceOwner {
         })?;
         secondary_state.with_bytes_mut(|bytes| {
             bytes[0x320..0x324]
-                .copy_from_slice(&g17_initdata::CONTROL_OPENING_PRODUCER.to_le_bytes());
+                .copy_from_slice(&g17_initdata::CONTROL_OPENING_SECONDARY_PRODUCER.to_le_bytes());
             let extra = g17_initdata::PRIMARY_STATUS_B_STATE_GRID_OFFSET;
             g17_initdata::encode_secondary_root_extra_1(
                 &mut bytes[extra..extra + g17_initdata::STATUS_BLOCK_SIZE],
@@ -2298,6 +2398,10 @@ impl G17ResourceOwner {
                 hw_region_0,
                 hw_region_1,
                 fwctl,
+                control_shared,
+                control_shared_inner,
+                control_operand_table,
+                control_operand_buffers,
                 register_windows,
             },
             address_space,
@@ -2311,6 +2415,19 @@ impl G17ResourceOwner {
 
     pub(crate) fn uat(&self) -> &mmu::Uat {
         &self.address_space.uat
+    }
+
+    pub(crate) fn control_counters(&mut self) -> Result<G17PControlCounters> {
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        let primary = read_control_counters(
+            &mut self.resources.primary_state,
+            self.handoff.primary.state_grid,
+        )?;
+        let secondary = read_control_counters(
+            &mut self.resources.secondary_state,
+            self.handoff.secondary.state_grid,
+        )?;
+        Ok(G17PControlCounters { primary, secondary })
     }
 
     /// Rebuild firmware-owned session state after both processors stop.
@@ -2391,6 +2508,27 @@ impl G17ResourceOwner {
             bytes.fill(0);
             Ok(())
         })?;
+        self.resources.control_shared.with_bytes_mut(|bytes| {
+            g17_initdata::encode_control_shared(bytes).map_err(|_| EINVAL)
+        })?;
+        self.resources
+            .control_shared_inner
+            .with_bytes_mut(|bytes| {
+                bytes.fill(0);
+                bytes[..8].copy_from_slice(&1u64.to_le_bytes());
+                Ok(())
+            })?;
+        self.resources
+            .control_operand_table
+            .with_bytes_mut(|bytes| {
+                g17_initdata::encode_control_operand_table(bytes).map_err(|_| EINVAL)
+            })?;
+        self.resources
+            .control_operand_buffers
+            .with_bytes_mut(|bytes| {
+                bytes.fill(0);
+                Ok(())
+            })?;
 
         let shared = self.handoff.shared;
         let primary = self.handoff.primary;
@@ -2416,7 +2554,7 @@ impl G17ResourceOwner {
         let fwctl = self.resources.fwctl.iova();
         self.resources.primary_state.with_bytes_mut(|bytes| {
             bytes[0x320..0x324]
-                .copy_from_slice(&g17_initdata::CONTROL_OPENING_PRODUCER.to_le_bytes());
+                .copy_from_slice(&g17_initdata::CONTROL_OPENING_PRIMARY_PRODUCER.to_le_bytes());
             let status_b = g17_initdata::PRIMARY_STATUS_B_STATE_GRID_OFFSET;
             let end = status_b + g17_initdata::PRIMARY_STATUS_B_OBJECT_SIZE;
             g17_initdata::encode_primary_status_b(
@@ -2428,7 +2566,7 @@ impl G17ResourceOwner {
         })?;
         self.resources.secondary_state.with_bytes_mut(|bytes| {
             bytes[0x320..0x324]
-                .copy_from_slice(&g17_initdata::CONTROL_OPENING_PRODUCER.to_le_bytes());
+                .copy_from_slice(&g17_initdata::CONTROL_OPENING_SECONDARY_PRODUCER.to_le_bytes());
             let extra = g17_initdata::PRIMARY_STATUS_B_STATE_GRID_OFFSET;
             g17_initdata::encode_secondary_root_extra_1(
                 &mut bytes[extra..extra + g17_initdata::STATUS_BLOCK_SIZE],
@@ -2497,15 +2635,18 @@ impl G17ResourceOwner {
             GFP_KERNEL,
         )?;
         mappings.push(
-            map_fresh_zero_object_at(&self.dev, vm, G17P_CONTROL_OPERAND_TABLE_VA, mmu::UAT_PGSZ)?,
+            self.resources.control_operand_table.map_alias_at(
+                vm,
+                G17P_CONTROL_OPERAND_TABLE_VA,
+                mmu::PROT_GPU_FW_SHARED_RW,
+            )?,
             GFP_KERNEL,
         )?;
         mappings.push(
-            map_fresh_zero_object_at(
-                &self.dev,
+            self.resources.control_operand_buffers.map_alias_at(
                 vm,
                 G17P_CONTROL_OPERAND_BUFFER_BASE,
-                G17P_CONTROL_OPERAND_BACKING_SIZE,
+                mmu::PROT_GPU_FW_SHARED_RW,
             )?,
             GFP_KERNEL,
         )?;
@@ -3159,6 +3300,26 @@ mod tests {
         }
         assert!(directory.end <= table.start);
         assert!(table.end <= buffers.start);
+    }
+
+    #[test]
+    fn control_opening_requires_all_six_exact_counter_values() {
+        let retired = G17PControlCounters {
+            primary: [4, 4, 4],
+            secondary: [16, 16, 16],
+        };
+        assert!(retired.opening_retired());
+
+        for primary_index in 0..3 {
+            let mut current = retired;
+            current.primary[primary_index] -= 1;
+            assert!(!current.opening_retired());
+        }
+        for secondary_index in 0..3 {
+            let mut current = retired;
+            current.secondary[secondary_index] -= 1;
+            assert!(!current.opening_retired());
+        }
     }
 
     fn valid_handoff() -> G17ResourceHandoff {

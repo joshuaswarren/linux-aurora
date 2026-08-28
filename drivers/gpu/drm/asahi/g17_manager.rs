@@ -416,6 +416,10 @@ impl G17PManagerConstruction {
         self.resources.handoff()
     }
 
+    pub(crate) fn control_counters(&mut self) -> Result<g17_resources::G17PControlCounters> {
+        self.resources.control_counters()
+    }
+
     pub(crate) fn uat(&self) -> &mmu::Uat {
         self.resources.uat()
     }

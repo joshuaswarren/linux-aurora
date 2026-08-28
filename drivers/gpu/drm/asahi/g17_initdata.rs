@@ -192,12 +192,11 @@ pub(crate) const SECONDARY_EXTRA_VIEW_OFFSET: usize = 0xe40;
 /// exactly this offset on both instances. Writing the opening opcode here *is*
 /// staging the opening device-control record (records are 0x40 bytes; fields
 /// past the opcode are zero). The control channel's producer counter must then
-/// be set to [`CONTROL_OPENING_PRODUCER`] before the descriptor is handed
-/// over.
+/// be set to the role-specific value returned by
+/// [`control_opening_producer`] before the descriptor is handed over.
 const MAIN_CONTROL_RING: usize = 0x4c0;
 pub(crate) const CONTROL_OPENING_OPCODE_PRIMARY: u32 = 0x16;
 pub(crate) const CONTROL_OPENING_OPCODE_SECONDARY: u32 = 0x2a;
-pub(crate) const CONTROL_OPENING_PRODUCER: u32 = 1;
 pub(crate) const CONTROL_RECORD_SIZE: usize = 0x40;
 pub(crate) const CONTROL_OPENING_PRIMARY_RECORDS: usize = 4;
 pub(crate) const CONTROL_OPENING_SECONDARY_RECORDS: usize = 16;
@@ -2541,10 +2540,10 @@ mod tests {
         assert_eq!(REGION_C_REQUIRED_OFFSET, 0xe50);
         assert_eq!(STATUS_BLOCK_POST_ACK_OFFSETS, [0x10, 0x14]);
         assert_eq!(PRIMARY_STATUS_B_OBJECT_SIZE, 0xeb00);
-        // Device-control record framing (records are 0x40 bytes; the opening
-        // producer is 1).
+        // Device-control record framing and both complete opening prefixes.
         assert_eq!(CONTROL_RECORD_SIZE, 0x40);
-        assert_eq!(CONTROL_OPENING_PRODUCER, 1);
+        assert_eq!(CONTROL_OPENING_PRIMARY_PRODUCER, 4);
+        assert_eq!(CONTROL_OPENING_SECONDARY_PRODUCER, 16);
         // Channel state-block stride within the compact grid.
         assert_eq!(CHANNEL_STATE_STRIDE, 0x40);
         // Performance-table geometry and measured values.
