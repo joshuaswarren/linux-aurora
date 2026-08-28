@@ -14,6 +14,7 @@
 enum apple_dcp_coprocessor_start {
 	APPLE_DCP_COPROCESSOR_COLD_START,
 	APPLE_DCP_COPROCESSOR_ADOPT_AND_RESTART,
+	APPLE_DCP_COPROCESSOR_QUIESCED_RESTART,
 };
 
 static inline bool apple_dcp_coprocessor_is_active(u32 cpu_control, u32 cpu_status)
@@ -27,9 +28,12 @@ static inline bool apple_dcp_coprocessor_is_active(u32 cpu_control, u32 cpu_stat
 }
 
 static inline enum apple_dcp_coprocessor_start
-apple_dcp_coprocessor_start_mode(bool can_adopt, u32 cpu_control,
-				 u32 cpu_status)
+apple_dcp_coprocessor_start_mode(bool loader_quiesced, bool can_adopt,
+				 u32 cpu_control, u32 cpu_status)
 {
+	if (loader_quiesced)
+		return APPLE_DCP_COPROCESSOR_QUIESCED_RESTART;
+
 	if (can_adopt &&
 	    apple_dcp_coprocessor_is_active(cpu_control, cpu_status))
 		return APPLE_DCP_COPROCESSOR_ADOPT_AND_RESTART;
