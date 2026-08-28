@@ -62,7 +62,8 @@ const CONTROL_START_TYPE: u16 = 0x89;
 const CONTROL_DONE_TYPE: u16 = 0x84;
 const CONTROL_DONE_CHANNEL: u64 = 0x11;
 const INITDATA_ACK_POLLS: usize = 200;
-const INITDATA_ACK_ONLY_TEST: bool = true;
+const CONTROL_COUNTER_POLLS: usize = 100;
+const CONTROL_OPENING_ONLY_TEST: bool = true;
 
 /// Per-role callback state retained until the corresponding RTKit client is
 /// dropped. The callback only publishes atomics; probe owns every mutation of
@@ -266,10 +267,60 @@ fn boot_session(
         "G17P session: GFX and GFX1 initdata ACKs received\n"
     );
 
-    if INITDATA_ACK_ONLY_TEST {
+    let staged = manager.control_counters()?;
+    if !staged.opening_staged() {
+        dev_err!(
+            pdev.as_ref(),
+            "G17P control: staged counters are {:?}/{:?}, expected [0, 0, 4]/[0, 0, 16]\n",
+            staged.primary,
+            staged.secondary
+        );
+        return Err(EIO);
+    }
+    dev_info!(
+        pdev.as_ref(),
+        "G17P control: 4 primary and 16 secondary records staged\n"
+    );
+
+    let control_start = (CONTROL_START_TYPE as u64) << 48;
+    Pin::new(&mut gfx_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, control_start)?;
+    fsleep(Delta::from_millis(12));
+    Pin::new(&mut gfx1_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, control_start)?;
+    dev_info!(pdev.as_ref(), "G17P control: both start messages sent\n");
+
+    let mut counters = staged;
+    for _ in 0..CONTROL_COUNTER_POLLS {
+        counters = manager.control_counters()?;
+        if counters.opening_retired() {
+            break;
+        }
+        if gfx_state.crashed.load(Ordering::Acquire) || gfx1_state.crashed.load(Ordering::Acquire) {
+            return Err(EIO);
+        }
+        fsleep(Delta::from_millis(1));
+    }
+    if !counters.opening_retired() {
+        dev_err!(
+            pdev.as_ref(),
+            "G17P control: counters stopped at {:?}/{:?}, expected [4, 4, 4]/[16, 16, 16]\n",
+            counters.primary,
+            counters.secondary
+        );
+        return Err(ETIMEDOUT);
+    }
+    dev_info!(
+        pdev.as_ref(),
+        "G17P control: counters retired at [4, 4, 4]/[16, 16, 16]\n"
+    );
+
+    let control_done = ((CONTROL_DONE_TYPE as u64) << 48) | CONTROL_DONE_CHANNEL;
+    Pin::new(&mut gfx_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, control_done)?;
+    dev_info!(pdev.as_ref(), "G17P control: primary done message sent\n");
+
+    if CONTROL_OPENING_ONLY_TEST {
         dev_info!(
             pdev.as_ref(),
-            "G17P session: ACK-only test complete; control and SKSM remain untouched\n"
+            "G17P session: control-opening test complete; QID4 and SKSM remain untouched\n"
         );
         return Ok(G17PBootedSession {
             cpus,
@@ -281,14 +332,6 @@ fn boot_session(
         });
     }
 
-    let control_start = (CONTROL_START_TYPE as u64) << 48;
-    Pin::new(&mut gfx_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, control_start)?;
-    fsleep(Delta::from_millis(12));
-    Pin::new(&mut gfx1_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, control_start)?;
-    manager.prepare_partial_opening_control_done()?;
-    let control_done = ((CONTROL_DONE_TYPE as u64) << 48) | CONTROL_DONE_CHANNEL;
-    Pin::new(&mut gfx_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, control_done)?;
-    fsleep(Delta::from_millis(10));
     let queue = manager.configure_compute_sksm_queue(drm, registers, 4, 2)?;
 
     dev_info!(
