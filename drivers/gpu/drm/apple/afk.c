@@ -104,7 +104,7 @@ int afk_start(struct apple_dcp_afkep *ep)
 	int ret;
 
 	reinit_completion(&ep->started);
-	apple_rtkit_start_ep(ep->dcp->rtk, ep->endpoint);
+	dcp_start_rtkit_endpoint(ep->dcp, ep->endpoint);
 	afk_send(ep, FIELD_PREP(RBEP_TYPE, RBEP_INIT));
 
 	ret = wait_for_completion_timeout(&ep->started, msecs_to_jiffies(1000));

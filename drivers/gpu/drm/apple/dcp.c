@@ -54,6 +54,12 @@
 #define DCP_BOOT_TIMEOUT msecs_to_jiffies(1000)
 #define APPLE_DCP_PMGR_PS_SET_TIMEOUT_US 1000
 
+#define APPLE_DCP_RTKIT_MGMT_TYPE GENMASK_ULL(59, 52)
+#define APPLE_DCP_RTKIT_MGMT_STARTEP 5
+#define APPLE_DCP_RTKIT_MGMT_STARTEP_EP GENMASK_ULL(39, 32)
+#define APPLE_DCP_RTKIT_MGMT_STARTEP_FLAG BIT_ULL(1)
+#define APPLE_DCP_RTKIT_EP_MGMT 0
+
 static bool show_notch;
 module_param(show_notch, bool, 0644);
 MODULE_PARM_DESC(show_notch, "Use the full display height and shows the notch");
@@ -335,6 +341,24 @@ void dcp_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message)
 	trace_dcp_send_msg(dcp, endpoint, message);
 	apple_rtkit_send_message(dcp->rtk, endpoint, message, NULL,
 				 true);
+}
+
+int dcp_start_rtkit_endpoint(struct apple_dcp *dcp, u8 endpoint)
+{
+	u64 message;
+
+	if (!dcp->adopted_session)
+		return apple_rtkit_start_ep(dcp->rtk, endpoint);
+
+	/* The inherited EPMAP was acknowledged by Stage 2. Restart the known
+	 * DCP endpoint without asking the live firmware to repeat discovery.
+	 */
+	message = FIELD_PREP(APPLE_DCP_RTKIT_MGMT_TYPE,
+			     APPLE_DCP_RTKIT_MGMT_STARTEP) |
+		  FIELD_PREP(APPLE_DCP_RTKIT_MGMT_STARTEP_EP, endpoint) |
+		  APPLE_DCP_RTKIT_MGMT_STARTEP_FLAG;
+	return apple_rtkit_send_message(dcp->rtk, APPLE_DCP_RTKIT_EP_MGMT,
+					message, NULL, false);
 }
 
 int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state *state)
@@ -1147,6 +1171,7 @@ static void apple_dcp_stop_fresh_boot_cpu(struct apple_dcp *dcp)
 	       dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
 	control = readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
 	dcp->fresh_boot_cpu_started = false;
+	dcp->adopted_session = false;
 
 	dev_info(dcp->dev, "DCP takeover: display CPU stopped control=%#x\n",
 		 control);
@@ -1340,7 +1365,7 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 
 	if (apple_dcp_needs_adoption(start_mode)) {
 		dev_info(dev,
-			 "quiescing inherited DCP session (control=%#x status=%#x)\n",
+			 "adopting live inherited DCP session (control=%#x status=%#x)\n",
 			 cpu_ctrl, cpu_status);
 		dcp->adopting_session = true;
 		dcp->rtk = devm_apple_rtkit_init_adopted(dev, dcp, "mbox", 0,
@@ -1353,14 +1378,8 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 			goto err_destroy_piodma;
 		}
 
-		ret = apple_rtkit_quiesce(dcp->rtk);
 		dcp->adopting_session = false;
-		if (ret) {
-			ret = dev_err_probe(dev, ret,
-					    "Failed to quiesce inherited RTKit: %d\n",
-					    ret);
-			goto err_free_rtkit;
-		}
+		dcp->adopted_session = true;
 	} else {
 		if (start_mode == APPLE_DCP_COPROCESSOR_QUIESCED_RESTART)
 			dev_info(dev, "restarting loader-quiesced DCP session\n");
@@ -1377,6 +1396,11 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 			dcp->rtk = NULL;
 			goto err_destroy_piodma;
 		}
+	}
+
+	if (dcp->adopted_session) {
+		dev_info(dev, "live inherited RTKit session adopted\n");
+		return 0;
 	}
 
 	/* RTKit initialization starts the mailbox and enables the outbox first. */
@@ -1412,7 +1436,6 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 
 err_stop_cpu:
 	apple_dcp_stop_fresh_boot_cpu(dcp);
-err_free_rtkit:
 	devm_apple_rtkit_free(dev, dcp->rtk);
 	dcp->rtk = NULL;
 err_destroy_piodma:

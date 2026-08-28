@@ -9,10 +9,13 @@
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/iommu.h>
+#include <linux/io.h>
 #include <linux/kref.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/of_device.h>
 #include <linux/ratelimit.h>
+#include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/rtkit.h>
 
@@ -522,6 +525,70 @@ static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 	struct apple_dcp_link_init_desc *desc;
 	int ret;
 
+	if (dcp->adopted_session) {
+		struct iommu_domain *domain;
+		phys_addr_t translated;
+		u64 rpc_dva, rpc_pa, rpc_size;
+		u64 offset;
+
+		if (!of_chosen ||
+		    of_property_read_u64(of_chosen, "apple,dcp-link-rpc-dva",
+					 &rpc_dva) ||
+		    of_property_read_u64(of_chosen, "apple,dcp-link-rpc-pa",
+					 &rpc_pa) ||
+		    of_property_read_u64(of_chosen, "apple,dcp-link-rpc-size",
+					 &rpc_size))
+			return dev_err_probe(dcp->dev, -ENOENT,
+					     "inherited DCPLink RPC mapping is missing\n");
+
+		if (!rpc_dva || !rpc_pa ||
+		    rpc_size != APPLE_DCP_LINK_RPC_MEMORY_SIZE ||
+		    !IS_ALIGNED(rpc_dva, SZ_16K) ||
+		    !IS_ALIGNED(rpc_pa, SZ_16K))
+			return dev_err_probe(dcp->dev, -EINVAL,
+					     "inherited DCPLink RPC mapping is invalid\n");
+
+		domain = iommu_get_domain_for_dev(dcp->dev);
+		if (!domain)
+			return dev_err_probe(dcp->dev, -ENODEV,
+					     "DCP IOMMU domain is unavailable\n");
+
+		for (offset = 0; offset < rpc_size; offset += SZ_16K) {
+			translated = iommu_iova_to_phys(domain, rpc_dva + offset);
+			if (translated != rpc_pa + offset)
+				return dev_err_probe(dcp->dev, -EINVAL,
+						     "inherited DCPLink RPC translation differs at %#llx\n",
+						     offset);
+		}
+
+		dcp->shmem = memremap(rpc_pa, rpc_size, MEMREMAP_WB);
+		if (!dcp->shmem)
+			return dev_err_probe(dcp->dev, -ENOMEM,
+					     "could not map inherited DCPLink RPC memory\n");
+
+		dma_rmb();
+		desc = dcp->shmem;
+		if (!apple_dcp_link_init_desc_valid(desc) ||
+		    !apple_dcp_link_stream_memory_idle(dcp->shmem, rpc_size)) {
+			memunmap(dcp->shmem);
+			dcp->shmem = NULL;
+			return dev_err_probe(dcp->dev, -EINVAL,
+					     "inherited DCPLink RPC memory is not idle version 4\n");
+		}
+
+		dcp->shmem_iova = rpc_dva;
+		dcp->shmem_inherited = true;
+		dcp->link_state = APPLE_DCP_LINK_READY;
+		dcp->link_version = APPLE_DCP_LINK_PROTOCOL_VERSION;
+		dcp->link_firmware_hash = 0;
+		memset(dcp->link_top, 0, sizeof(dcp->link_top));
+		dev_info(dcp->dev,
+			 "adopted idle DCPLink version 4 RPC mapping DVA %#llx PA %#llx\n",
+			 rpc_dva, rpc_pa);
+		iomfb_start_h17p(dcp);
+		return 0;
+	}
+
 	dcp->shmem = dma_alloc_coherent(dcp->dev, APPLE_DCP_LINK_RPC_MEMORY_SIZE,
 					&dcp->shmem_iova, GFP_KERNEL);
 	if (!dcp->shmem)
@@ -534,7 +601,7 @@ static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 	dcp->link_state = APPLE_DCP_LINK_WAIT_FIRMWARE_INIT;
 	memset(dcp->link_top, 0, sizeof(dcp->link_top));
 
-	ret = apple_rtkit_start_ep(dcp->rtk, APPLE_DCP_LINK_ENDPOINT);
+	ret = dcp_start_rtkit_endpoint(dcp, APPLE_DCP_LINK_ENDPOINT);
 	if (ret)
 		return ret;
 
@@ -879,7 +946,7 @@ int iomfb_start_rtkit(struct apple_dcp *dcp)
 	if (dcp->fw_compat == DCP_FIRMWARE_H17P)
 		return dcp_link_start_rtkit(dcp);
 
-	apple_rtkit_start_ep(dcp->rtk, IOMFB_ENDPOINT);
+	dcp_start_rtkit_endpoint(dcp, IOMFB_ENDPOINT);
 
 	dcp->shmem = dma_alloc_coherent(dcp->dev, DCP_SHMEM_SIZE, &shmem_iova,
 					GFP_KERNEL);
@@ -908,5 +975,12 @@ void iomfb_shutdown(struct apple_dcp *dcp)
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
 		break;
+	}
+
+	if (dcp->shmem_inherited) {
+		memunmap(dcp->shmem);
+		dcp->shmem = NULL;
+		dcp->shmem_iova = 0;
+		dcp->shmem_inherited = false;
 	}
 }
