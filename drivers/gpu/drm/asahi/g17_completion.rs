@@ -11,8 +11,12 @@
 //! fields stay structural here. The SKSM decoder follows the A18 Pro firmware
 //! bit extraction and the compute channel's completion selector 2. Queue
 //! ownership follows the m1n1 hardware result: read reaching a published
-//! prefix means accepted, done reaching it means complete, and physical reuse
-//! requires done/read/write equality.
+//! prefix means accepted, done reaching it means firmware retired the queue
+//! entries, and physical reuse requires done/read/write equality. Render
+//! completion also checks the scheduler's job list and current-job timestamps.
+//! J700 run `20260828-g17p-opening-job-record-live27` retired both queue
+//! prefixes at 3/3/3 while the list still held `c0828100..c0828198` and all
+//! eight execution timestamps stayed zero.
 
 pub(crate) const REPORT_ENTRY_SIZE: usize = 0x40;
 pub(crate) const REPORT_CHANNEL_EVENT: u8 = 13;
@@ -450,9 +454,31 @@ pub(crate) fn observe_compute_completion_report(
 pub(crate) struct PairedRenderCompletion {
     pub(crate) tiling: QueuePrefixState,
     pub(crate) fragment: QueuePrefixState,
+    pub(crate) execution: RenderExecutionState,
     pub(crate) accepted: bool,
+    pub(crate) retired: bool,
     pub(crate) complete: bool,
     pub(crate) idle: bool,
+}
+
+/// Scheduler state for one paired TA/fragment job.
+///
+/// Firmware queue retirement alone does not show that either GPU stage ran.
+/// A finished pair has left the intrusive job list and has all four current-job
+/// timestamp words populated for each half.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct RenderExecutionState {
+    pub(crate) job_list_empty: bool,
+    pub(crate) tiling_timestamps: [u64; 4],
+    pub(crate) fragment_timestamps: [u64; 4],
+}
+
+impl RenderExecutionState {
+    pub(crate) fn observed(self) -> bool {
+        self.job_list_empty
+            && self.tiling_timestamps.iter().all(|value| *value != 0)
+            && self.fragment_timestamps.iter().all(|value| *value != 0)
+    }
 }
 
 pub(crate) fn observe_paired_render_completion(
@@ -462,15 +488,20 @@ pub(crate) fn observe_paired_render_completion(
     fragment_previous: QueueIndices,
     fragment_current: QueueIndices,
     fragment_prefix: u32,
+    execution: RenderExecutionState,
 ) -> Result<PairedRenderCompletion, CompletionDecodeError> {
     let tiling = observe_queue_prefix(tiling_previous, tiling_current, tiling_prefix)?;
     let fragment = observe_queue_prefix(fragment_previous, fragment_current, fragment_prefix)?;
+    let retired = tiling.complete && fragment.complete;
+    let complete = retired && execution.observed();
     Ok(PairedRenderCompletion {
         accepted: tiling.accepted && fragment.accepted,
-        complete: tiling.complete && fragment.complete,
-        idle: tiling.idle && fragment.idle,
+        retired,
+        complete,
+        idle: tiling.idle && fragment.idle && execution.job_list_empty,
         tiling,
         fragment,
+        execution,
     })
 }
 
@@ -716,7 +747,7 @@ mod tests {
     }
 
     #[test]
-    fn paired_render_completes_only_after_both_prefixes() {
+    fn paired_render_separates_queue_retirement_from_gpu_execution() {
         let opening = QueueIndices {
             done: 0,
             read: 0,
@@ -732,18 +763,61 @@ mod tests {
             read: 3,
             write: 3,
         };
-        let pending =
-            observe_paired_render_completion(opening, complete, 3, opening, fragment_pending, 3)
-                .unwrap();
+        let executed = RenderExecutionState {
+            job_list_empty: true,
+            tiling_timestamps: [0x10, 0x20, 0x30, 0x40],
+            fragment_timestamps: [0x50, 0x60, 0x70, 0x80],
+        };
+        let pending = observe_paired_render_completion(
+            opening,
+            complete,
+            3,
+            opening,
+            fragment_pending,
+            3,
+            executed,
+        )
+        .unwrap();
         assert!(pending.accepted);
+        assert!(!pending.retired);
         assert!(!pending.complete);
         assert!(!pending.idle);
 
         let finished =
-            observe_paired_render_completion(opening, complete, 3, opening, complete, 3).unwrap();
+            observe_paired_render_completion(opening, complete, 3, opening, complete, 3, executed)
+                .unwrap();
         assert!(finished.accepted);
+        assert!(finished.retired);
         assert!(finished.complete);
         assert!(finished.idle);
+    }
+
+    #[test]
+    fn live27_parked_job_is_retired_but_not_complete() {
+        let opening = QueueIndices {
+            done: 0,
+            read: 0,
+            write: 3,
+        };
+        let retired = QueueIndices {
+            done: 3,
+            read: 3,
+            write: 3,
+        };
+        let parked = RenderExecutionState {
+            job_list_empty: false,
+            tiling_timestamps: [0; 4],
+            fragment_timestamps: [0; 4],
+        };
+        let state =
+            observe_paired_render_completion(opening, retired, 3, opening, retired, 3, parked)
+                .unwrap();
+
+        assert!(state.accepted);
+        assert!(state.retired);
+        assert!(!state.complete);
+        assert!(!state.idle);
+        assert!(!state.execution.observed());
     }
 
     #[test]
