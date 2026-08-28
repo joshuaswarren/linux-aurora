@@ -558,6 +558,7 @@ static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 
 	if (dcp->adopted_session) {
 		struct iommu_domain *domain;
+		enum apple_dcp_link_adopt_action action;
 		u64 captured_message;
 		phys_addr_t translated;
 		u64 rpc_dva, rpc_pa, rpc_size;
@@ -566,6 +567,9 @@ static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 		u32 ready_hash;
 		u16 remote_version;
 		u64 offset;
+		bool descriptor_zero;
+		bool descriptor_valid;
+		bool streams_idle;
 
 		if (!of_chosen ||
 		    of_property_read_u64(of_chosen,
@@ -592,14 +596,6 @@ static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 		    rpc_dva & ~GENMASK_ULL(47, 0))
 			return dev_err_probe(dcp->dev, -EINVAL,
 					     "inherited DCPLink RPC mapping is invalid\n");
-		if (phase != APPLE_DCP_LINK_HANDOFF_FIRMWARE_INIT &&
-		    phase != APPLE_DCP_LINK_HANDOFF_READY)
-			return dev_err_probe(dcp->dev, -EAGAIN,
-				"Stage 2 captured no DCPLink init or ready phase\n");
-		if (!apple_dcp_link_handoff_message_valid(phase, captured_message))
-			return dev_err_probe(dcp->dev, -EPROTO,
-					     "captured DCPLink phase word is invalid\n");
-
 		domain = iommu_get_domain_for_dev(dcp->dev);
 		if (!domain)
 			return dev_err_probe(dcp->dev, -ENODEV,
@@ -622,13 +618,25 @@ static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 		dcp->shmem_inherited = true;
 		dcp_link_sync_for_cpu();
 		desc = dcp->shmem;
-		if (!apple_dcp_link_init_desc_valid(desc) ||
-		    !apple_dcp_link_stream_memory_idle(dcp->shmem, rpc_size)) {
+		descriptor_zero = apple_dcp_link_init_desc_zero(desc);
+		descriptor_valid = apple_dcp_link_init_desc_valid(desc);
+		streams_idle = apple_dcp_link_stream_memory_idle(dcp->shmem,
+							 rpc_size);
+		action = apple_dcp_link_adopt_decide(phase, captured_message,
+						     descriptor_zero,
+						     descriptor_valid,
+						     streams_idle);
+		if (action == APPLE_DCP_LINK_ADOPT_INVALID) {
 			dev_err(dcp->dev,
-				"inherited DCPLink RPC memory is not pristine version 4\n");
+				"inherited DCPLink state is invalid: phase %u message %#llx zero %u valid %u idle %u\n",
+				phase, captured_message, descriptor_zero,
+				descriptor_valid, streams_idle);
 			ret = -EINVAL;
 			goto err_unmap_inherited;
 		}
+		if (descriptor_zero)
+			apple_dcp_link_init_desc_encode(desc, 0, false);
+
 		shared_dva = le64_to_cpu(desc->shared_dva);
 		for (offset = 0;
 		     shared_dva &&
@@ -649,7 +657,30 @@ static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 
 		memset(dcp->link_top, 0, sizeof(dcp->link_top));
 
-		if (phase == APPLE_DCP_LINK_HANDOFF_READY) {
+		if (action == APPLE_DCP_LINK_ADOPT_START_ENDPOINT) {
+			if (dcp->link_endpoint_started) {
+				ret = -EALREADY;
+				goto err_unmap_inherited;
+			}
+			dcp->link_state = APPLE_DCP_LINK_WAIT_FIRMWARE_INIT;
+			dcp->link_version = 0;
+			dcp->link_firmware_hash = 0;
+			dcp_link_sync_for_device();
+			dcp->link_endpoint_started = true;
+			ret = dcp_start_rtkit_endpoint(dcp,
+						       APPLE_DCP_LINK_ENDPOINT);
+			if (ret) {
+				dcp->link_endpoint_started = false;
+				goto err_unmap_inherited;
+			}
+			dev_info(dcp->dev,
+				 "adopted unused DCPLink RPC mapping DVA %#llx PA %#llx; endpoint started\n",
+				 rpc_dva, rpc_pa);
+			return 0;
+		}
+
+		dcp->link_endpoint_started = true;
+		if (action == APPLE_DCP_LINK_ADOPT_START_IOMFB) {
 			ret = apple_dcp_link_ready_reply(captured_message,
 							 &remote_version, &ready_hash);
 			if (ret || !remote_version) {
@@ -672,6 +703,10 @@ static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 			return 0;
 		}
 
+		if (action != APPLE_DCP_LINK_ADOPT_SEND_INIT) {
+			ret = -EINVAL;
+			goto err_unmap_inherited;
+		}
 		ret = apple_dcp_link_init_message(rpc_dva, &captured_message);
 		if (ret)
 			goto err_unmap_inherited;
@@ -705,9 +740,12 @@ err_unmap_inherited:
 	dcp->link_state = APPLE_DCP_LINK_WAIT_FIRMWARE_INIT;
 	memset(dcp->link_top, 0, sizeof(dcp->link_top));
 
+	dcp->link_endpoint_started = true;
 	ret = dcp_start_rtkit_endpoint(dcp, APPLE_DCP_LINK_ENDPOINT);
-	if (ret)
+	if (ret) {
+		dcp->link_endpoint_started = false;
 		return ret;
+	}
 
 	dev_info(dcp->dev, "DCPLink endpoint started; waiting for firmware init\n");
 	return 0;
