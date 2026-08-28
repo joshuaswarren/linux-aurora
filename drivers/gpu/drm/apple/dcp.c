@@ -1172,13 +1172,24 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	cpu_ctrl = readl_relaxed(dcp->coproc_reg +
 				 APPLE_DCP_COPROC_CPU_CONTROL);
 	if (apple_dcp_needs_fresh_boot(start_mode))
-		dev_info(dev, "DCP takeover: display CPU start control=%#x\n",
-			 cpu_ctrl);
+		dev_info(dev,
+			 "DCP takeover: display CPU start control=%#x status=%#x\n",
+			 cpu_ctrl,
+			 readl_relaxed(dcp->coproc_reg +
+				       APPLE_DCP_COPROC_CPU_STATUS));
 
 	ret = apple_rtkit_wake(dcp->rtk);
-	if (ret)
+	if (ret) {
+		if (apple_dcp_needs_fresh_boot(start_mode))
+			dev_err(dev,
+				"DCP takeover: RTKit boot stopped at control=%#x status=%#x\n",
+				readl_relaxed(dcp->coproc_reg +
+					      APPLE_DCP_COPROC_CPU_CONTROL),
+				readl_relaxed(dcp->coproc_reg +
+					      APPLE_DCP_COPROC_CPU_STATUS));
 		return dev_err_probe(dev, ret,
 				     "Failed to boot RTKit: %d\n", ret);
+	}
 	if (apple_dcp_needs_fresh_boot(start_mode))
 		dev_info(dev, "DCP takeover: fresh RTKit boot complete\n");
 	return ret;
