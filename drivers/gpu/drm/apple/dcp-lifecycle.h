@@ -15,6 +15,15 @@ enum apple_dcp_coprocessor_start {
 	APPLE_DCP_COPROCESSOR_COLD_START,
 	APPLE_DCP_COPROCESSOR_ADOPT_AND_RESTART,
 	APPLE_DCP_COPROCESSOR_QUIESCED_RESTART,
+	APPLE_DCP_COPROCESSOR_IDLE_RESTART,
+	APPLE_DCP_COPROCESSOR_ASC_STOPPED_RESTART,
+};
+
+enum apple_dcp_loader_handoff {
+	APPLE_DCP_LOADER_HANDOFF_NONE,
+	APPLE_DCP_LOADER_HANDOFF_RTKIT_QUIESCED,
+	APPLE_DCP_LOADER_HANDOFF_RTKIT_IDLE,
+	APPLE_DCP_LOADER_HANDOFF_ASC_STOPPED,
 };
 
 static inline bool apple_dcp_coprocessor_is_active(u32 cpu_control, u32 cpu_status)
@@ -28,10 +37,15 @@ static inline bool apple_dcp_coprocessor_is_active(u32 cpu_control, u32 cpu_stat
 }
 
 static inline enum apple_dcp_coprocessor_start
-apple_dcp_coprocessor_start_mode(bool loader_quiesced, bool can_adopt,
+apple_dcp_coprocessor_start_mode(enum apple_dcp_loader_handoff handoff,
+				 bool can_adopt,
 				 u32 cpu_control, u32 cpu_status)
 {
-	if (loader_quiesced)
+	if (handoff == APPLE_DCP_LOADER_HANDOFF_ASC_STOPPED)
+		return APPLE_DCP_COPROCESSOR_ASC_STOPPED_RESTART;
+	if (handoff == APPLE_DCP_LOADER_HANDOFF_RTKIT_IDLE)
+		return APPLE_DCP_COPROCESSOR_IDLE_RESTART;
+	if (handoff == APPLE_DCP_LOADER_HANDOFF_RTKIT_QUIESCED)
 		return APPLE_DCP_COPROCESSOR_QUIESCED_RESTART;
 
 	if (can_adopt &&
