@@ -9,12 +9,48 @@ static void apple_dcp_link_init_desc_test(struct kunit *test)
 {
 	struct apple_dcp_link_init_desc desc;
 
+	KUNIT_EXPECT_EQ(test, APPLE_DCP_LINK_ENDPOINT, 0x37);
 	apple_dcp_link_init_desc_encode(&desc, 0x123456789abcULL, true);
 	KUNIT_EXPECT_EQ(test, le64_to_cpu(desc.shared_dva), 0x123456789abcULL);
 	KUNIT_EXPECT_EQ(test, le32_to_cpu(desc.flags),
 			APPLE_DCP_LINK_INIT_FLAG_64M);
 	KUNIT_EXPECT_EQ(test, le32_to_cpu(desc.version),
 			APPLE_DCP_LINK_PROTOCOL_VERSION);
+}
+
+static void apple_dcp_link_stream_layout_test(struct kunit *test)
+{
+	struct apple_dcp_link_stream_layout layout;
+
+	KUNIT_ASSERT_EQ(test,
+			apple_dcp_link_stream_layout(APPLE_DCP_LINK_SIDE_AP, 3,
+						     false, &layout),
+			0);
+	KUNIT_EXPECT_EQ(test, layout.local_offset, 0x18000U);
+	KUNIT_EXPECT_EQ(test, layout.remote_offset, 0x78000U);
+	KUNIT_EXPECT_EQ(test, layout.capacity, 0x8000U);
+
+	KUNIT_ASSERT_EQ(test,
+			apple_dcp_link_stream_layout(APPLE_DCP_LINK_SIDE_AP, 3,
+						     true, &layout),
+			0);
+	KUNIT_EXPECT_EQ(test, layout.local_offset, 0x38000U);
+	KUNIT_EXPECT_EQ(test, layout.remote_offset, 0x58000U);
+
+	KUNIT_ASSERT_EQ(test,
+			apple_dcp_link_stream_layout(APPLE_DCP_LINK_SIDE_DCP, 0,
+						     false, &layout),
+			0);
+	KUNIT_EXPECT_EQ(test, layout.local_offset, 0x40000U);
+	KUNIT_EXPECT_EQ(test, layout.remote_offset, 0x20000U);
+
+	KUNIT_EXPECT_EQ(test,
+			apple_dcp_link_stream_layout(APPLE_DCP_LINK_SIDE_AP, 4,
+						     false, &layout),
+			-EINVAL);
+	KUNIT_EXPECT_EQ(test,
+			apple_dcp_link_stream_layout(2, 0, false, &layout),
+			-EINVAL);
 }
 
 static void apple_dcp_h17p_method_test(struct kunit *test)
@@ -243,6 +279,7 @@ static void apple_dcp_h17p_rt_bw_reply_test(struct kunit *test)
 
 static struct kunit_case apple_dcp_link_test_cases[] = {
 	KUNIT_CASE(apple_dcp_link_init_desc_test),
+	KUNIT_CASE(apple_dcp_link_stream_layout_test),
 	KUNIT_CASE(apple_dcp_h17p_method_test),
 	KUNIT_CASE(apple_dcp_link_init_message_test),
 	KUNIT_CASE(apple_dcp_link_ready_message_test),
