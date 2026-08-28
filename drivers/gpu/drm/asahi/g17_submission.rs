@@ -26,7 +26,7 @@
 //! (`g17s a0, SKSM Enabled`), all three pinned A18 Pro `g17p` firmware variants
 //! (`a000`, `b000`, and `b100`), and the pinned G17P/G17G/G17X host kexts. The
 //! native G17P channel-state ABI is admitted only for the A18 Pro identity;
-//! the M5-family identities stay fail-closed.
+//! the M5-family identities remain unsupported.
 //! Firmware addresses are VAs (0xfffffc0000000000 + fileoff - 0x4000). See
 //! `research/gpu/GPU_AGX3_G17_SUBMISSION_2026-08-25.md`.
 //!
@@ -36,8 +36,8 @@
 //! submission can be driven to completion offline. It is `false`: the SKSM
 //! completion path is a hardware kick FIFO the firmware reads through indexed
 //! MMIO scratch registers. The host publication form, runtime scratch geometry,
-//! and mapped-window offsets are grounded. A Linux publication, its firmware
-//! consumption, the round trip, and the completion IRQ remain unproved. See
+//! and resource-0 ordered writer are implemented. Firmware execution, the
+//! round trip, and the completion IRQ remain unproved. See
 //! [`SUBMISSION_LIVE_GAPS`].
 
 #[cfg(not(test))]
@@ -53,8 +53,8 @@ use g17_manager::G17SksmScratchGeometry;
 pub(crate) const GROUNDED_SUBMISSION_PRODUCER_AVAILABLE: bool = true;
 
 /// Whether a submission can be driven to completion. `false`: see
-/// [`SUBMISSION_LIVE_GAPS`]. This is what keeps `SUBMISSION_TRANSPORT`
-/// fail-closed in `g17_boot::pre_handoff_gate`.
+/// [`SUBMISSION_LIVE_GAPS`]. This keeps `SUBMISSION_TRANSPORT` out of
+/// `g17_boot::pre_handoff_gate` admission until completion is implemented.
 pub(crate) const EXECUTABLE_SUBMISSION_TRANSPORT_AVAILABLE: bool =
     SUBMISSION_LIVE_GAPS.all_proven();
 
@@ -105,7 +105,7 @@ pub(crate) enum PipeType {
     Compute = 2,
 }
 
-/// Fail-closed refusals from the submission codec.
+/// Rejections from the submission codec.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum SubmissionError {
     /// A doorbell index outside the 3-bit [4:2] field.
@@ -289,7 +289,7 @@ pub(crate) const fn g17_channel_descriptor_offset(
 //
 //     These are independent host-reset records. They do not prove that the
 //     inherited AGX2 ChannelState/RingState names in sections 2/3 describe the
-//     G17 firmware consumer, so those ledger entries remain fail-closed.
+//     G17 firmware consumer, so those ledger entries remain unsupported.
 // ---------------------------------------------------------------------------
 
 /// Full byte extent cleared by the G17 host for `_AGFIChannelState`.
@@ -507,7 +507,7 @@ pub(crate) const G17P_CHANNEL_ABI: G17PChannelAbiLayout = G17PChannelAbiLayout {
 pub(crate) const G17P_CHANNEL_PRODUCER_REQUIRES_DMB_ISH: bool = true;
 
 /// Return the native channel ABI only for the exact identity whose producer
-/// and consumer were both inspected. M5-family targets remain fail-closed.
+/// and consumer were both inspected. M5-family targets remain unsupported.
 pub(crate) const fn g17_channel_abi(
     target: G17ChannelAbiTarget,
 ) -> Result<G17PChannelAbiLayout, SubmissionError> {
@@ -642,7 +642,7 @@ pub(crate) const HOST_MAX_OUTSTANDING_JOB_SLOTS: u32 = 127;
 
 /// Advance a producer/consumer index within a ring of `size` entries.
 ///
-/// Fail closed instead of panicking on a zero-sized ring or accepting a stale
+/// Reject a zero-sized ring or stale producer state instead of panicking or
 /// producer index. A valid `index` is always below `u32::MAX`, so `index + 1`
 /// cannot overflow after these checks.
 pub(crate) const fn ring_next(index: u32, size: u32) -> Result<u32, SubmissionError> {
@@ -881,11 +881,44 @@ pub(crate) const fn prepare_kick_submission(
 //
 //    The host does not write the firmware-side `timestamp | (qid << 40)` word
 //    directly.  The pinned G17P/G17G/G17X implementations publish a
-//    target-specific 64-bit queue tag followed by the 32-bit add count to two
+//    target-specific 64-bit queue tag followed by the zero-extended add count
+//    as a second 64-bit store to two
 //    runtime-selected scratch offsets. The host adds nine times the runtime
-//    stride to both bases for every target. This is a pure description of the
-//    two ordered stores; it performs no MMIO.
+//    stride to both bases for every target. Publication never reads either
+//    location and preserves the exact word-0 then word-1 order. The separate
+//    host diagnostic path may read word 1; word 0 must never be read.
+//    G17P `addKicks` performs `str x20` then `str x19` at
+//    0xfffffe0008a57b5c/0xfffffe0008a57b60; the earlier `mov w19,w1`
+//    zero-extends the add count.
 // ---------------------------------------------------------------------------
+
+/// One ordered transaction for the two SKSM scratch FIFO ports.
+///
+/// `word0` must be stored first and `word1` second. There is deliberately no
+/// read operation in this publication interface.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17SksmOrderedWritePair {
+    pub(crate) word0_offset: u32,
+    pub(crate) word0: u64,
+    pub(crate) word1_offset: u32,
+    pub(crate) word1: u64,
+}
+
+/// Minimal backend for an ordered pair of 64-bit FIFO stores.
+pub(crate) trait G17SksmPairWriter {
+    type Error;
+
+    fn write64(&self, offset: u32, value: u64) -> core::result::Result<(), Self::Error>;
+}
+
+/// Publish one pair in the only order accepted by the pinned host sequence.
+pub(crate) fn publish_g17p_sksm_write_pair<P: G17SksmPairWriter>(
+    port: &P,
+    pair: G17SksmOrderedWritePair,
+) -> core::result::Result<(), P::Error> {
+    port.write64(pair.word0_offset, pair.word0)?;
+    port.write64(pair.word1_offset, pair.word1)
+}
 
 /// Host producer family with an independently recovered `addKicks` tag.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -904,9 +937,21 @@ pub(crate) struct PreparedSksmAddKicksMmio {
     /// First store: 64-bit target tag to `tag_offset`.
     pub(crate) tag_offset: u32,
     pub(crate) tag: u64,
-    /// Second store: 32-bit number of newly published kicks.
+    /// Second store: zero-extended number of newly published kicks.
     pub(crate) count_offset: u32,
     pub(crate) add_count: u32,
+}
+
+impl PreparedSksmAddKicksMmio {
+    /// Convert the decoded host values to the exact two 64-bit FIFO stores.
+    pub(crate) const fn write_pair(self) -> G17SksmOrderedWritePair {
+        G17SksmOrderedWritePair {
+            word0_offset: self.tag_offset,
+            word0: self.tag,
+            word1_offset: self.count_offset,
+            word1: self.add_count as u64,
+        }
+    }
 }
 
 const fn sksm_add_kicks_tag(target: SksmAddKicksTarget, queue_id: u8) -> u64 {
@@ -956,16 +1001,17 @@ pub(crate) const fn prepare_sksm_add_kicks_mmio(
 //    64-bit queue tag and 64-bit queue payload, then publishes the QID bit at
 //    MMIO +0x21068. The object fields contain base0=0x4000, base1=0x4008 and
 //    stride=0x10; they are not MMIO locations. The same geometry is used by
-//    `addKicks` (§6). This closes the host-side programming equation, but not
-//    a Linux live publication or firmware consumption, so this module still
-//    performs no MMIO and the executable gate remains closed.
+//    `addKicks` (§6). Linux resource 0 (`sgx`) owns this window. Its two
+//    scratch locations receive ordered stores; queue enable is a separate
+//    read/modify/write register after the pair. The production publication
+//    surface intentionally exposes no scratch read operation.
 //
 //    `AGXAcceleratorG16::populateKSMCompletionQueue` at
 //    0xfffffe0008a53034-0xfffffe0008a532b8 emits four 0x20-byte descriptors.
 //    Each present queue has 0x40-byte entries and a fixed ordinal 0..3. The
 //    matched firmware consumes those queues. D93AP IRQ 1001 and RTBuddy AKF
 //    message type 2 converge on source 4 and drain the event rings that carry
-//    completion stamps. The completion gap remains live-gated until an actual
+//    completion stamps. The completion path remains pending until an actual
 //    SKSM kick proves that complete round trip on D93AP hardware.
 // ---------------------------------------------------------------------------
 
@@ -1005,6 +1051,18 @@ pub(crate) struct PreparedG17PSksmQueueConfig {
     /// Final read/modify/write: enable this QID in one of two mask words.
     pub(crate) enable_mask_offset: u32,
     pub(crate) enable_mask: u64,
+}
+
+impl PreparedG17PSksmQueueConfig {
+    /// Convert the queue configuration to its two ordered write-only stores.
+    pub(crate) const fn write_pair(self) -> G17SksmOrderedWritePair {
+        G17SksmOrderedWritePair {
+            word0_offset: self.tag_offset,
+            word0: self.tag,
+            word1_offset: self.payload_offset,
+            word1: self.payload,
+        }
+    }
 }
 
 /// Prepare the exact G17P host queue-configuration stores without touching
@@ -1138,7 +1196,7 @@ pub(crate) const G17P_COMPLETION_HOST_ABI_GROUNDED: bool = true;
 //    Tags 6/8/10/11 remain semantically unresolved instead of inheriting an
 //    AGX2 or nested SKU-stream meaning. SKU-stream opcodes are a distinct
 //    nested domain and intentionally have no representation in the top-level
-//    enum. M5-family identities remain fail-closed pending their own paired
+//    enum. M5-family identities remain unsupported pending their own paired
 //    producer/consumer pass.
 //
 //    The optional pre-dispatch filter uses literal mask 0x1d03f for tags <=
@@ -1335,7 +1393,7 @@ pub(crate) enum AbiProvenance {
     /// AGX3-specific, grounded first-hand from matched host/firmware artifacts.
     ForkedAgx3Grounded,
     /// AGX2 layout the driver produces; the G17 firmware's *own* consumer
-    /// offsets were not read first-hand this pass. Kept fail-closed.
+    /// offsets were not read first-hand this pass. Kept unsupported.
     Agx2InheritedUnconfirmed,
 }
 
@@ -1360,12 +1418,12 @@ pub(crate) struct SubmissionAbiLedger {
 
 /// The doorbell is byte-grounded (§1); the SKSM kick word/record and host
 /// queue-timestamp producer are AGX3 forks grounded first-hand (§2-§5). The
-/// generic channel/ring producer records remain inherited and fail-closed.
+/// generic channel/ring producer records remain inherited and unsupported.
 /// A separate G17P-only channel-state entry records the matched A18 Pro host
 /// producer and firmware consumer (§2c); it does not admit either M5 family.
 /// The queue bridge/completion descriptors and command dispatch are grounded,
 /// G17P-only AGX3 forks (§7-§8): the M5
-/// identities remain fail-closed, unresolved values do not inherit AGX2 or
+/// identities remain unsupported; unresolved values do not inherit AGX2 or
 /// nested SKU meanings, and the host's `Nop = 17` is not firmware-admitted.
 pub(crate) const SUBMISSION_ABI_LEDGER: SubmissionAbiLedger = SubmissionAbiLedger {
     tx_doorbell: AbiProvenance::IdenticalToAgx2,
@@ -1399,10 +1457,9 @@ pub(crate) const CHANNEL_DESCRIPTOR_STRIDE_CONFIRMED: bool = true;
 /// needs a live target device.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct SubmissionLiveGaps {
-    /// The host equation and G17P geometry are grounded. Linux has not yet
-    /// published through the mapped register window or witnessed firmware
-    /// consumption of that publication.
-    pub(crate) sksm_hardware_kick_fifo_mmio_scratch_proven: bool,
+    /// Linux has an ordered pair writer on resource 0, including fixed-slot
+    /// geometry and serialization across queue owners.
+    pub(crate) sksm_resource0_ordered_write_implemented: bool,
     /// The kick -> execute -> completion IRQ handshake is a live event.
     pub(crate) doorbell_round_trip_proven: bool,
     /// Apple's host builds platform interrupt event sources from runtime
@@ -1416,15 +1473,16 @@ pub(crate) struct SubmissionLiveGaps {
 impl SubmissionLiveGaps {
     /// True only if every live gap is closed.
     pub(crate) const fn all_proven(&self) -> bool {
-        self.sksm_hardware_kick_fifo_mmio_scratch_proven
+        self.sksm_resource0_ordered_write_implemented
             && self.doorbell_round_trip_proven
             && self.completion_irq_route_proven
     }
 }
 
-/// All live gaps are open (fail-closed).
+/// The host-side writer is implemented; device round-trip evidence and Linux
+/// completion handling remain outstanding.
 pub(crate) const SUBMISSION_LIVE_GAPS: SubmissionLiveGaps = SubmissionLiveGaps {
-    sksm_hardware_kick_fifo_mmio_scratch_proven: false,
+    sksm_resource0_ordered_write_implemented: true,
     doorbell_round_trip_proven: false,
     completion_irq_route_proven: false,
 };
@@ -1907,6 +1965,15 @@ mod tests {
             assert_eq!(p.tag_offset, 0x11b);
             assert_eq!(p.count_offset, 0x11f);
             assert_eq!(p.add_count, 5);
+            assert_eq!(
+                p.write_pair(),
+                G17SksmOrderedWritePair {
+                    word0_offset: 0x11b,
+                    word0: 0x0000_0400_0002_1018 | ((queue_id as u64) << 43),
+                    word1_offset: 0x11f,
+                    word1: 5,
+                }
+            );
 
             let g = prepare_sksm_add_kicks_mmio(
                 SksmAddKicksTarget::G17G,
@@ -1923,6 +1990,68 @@ mod tests {
             assert_eq!(x.tag, 0x0020_0800_0002_1018 | ((queue_id as u64) << 44));
             assert_eq!(x.add_count, u32::MAX);
         }
+    }
+
+    #[test]
+    fn pair_writer_publishes_two_64_bit_words_in_order() {
+        use std::cell::RefCell;
+
+        struct Recorder(RefCell<Vec<(u32, u64)>>);
+
+        impl G17SksmPairWriter for Recorder {
+            type Error = ();
+
+            fn write64(&self, offset: u32, value: u64) -> core::result::Result<(), Self::Error> {
+                self.0.borrow_mut().push((offset, value));
+                Ok(())
+            }
+        }
+
+        let pair = prepare_sksm_add_kicks_mmio(
+            SksmAddKicksTarget::G17P,
+            0x2a,
+            0x89ab_cdef,
+            g17_manager::T8140_G17P_PLATFORM_CONFIG.sksm_scratch,
+        )
+        .unwrap()
+        .write_pair();
+        let recorder = Recorder(RefCell::new(Vec::new()));
+
+        assert_eq!(publish_g17p_sksm_write_pair(&recorder, pair), Ok(()));
+        assert_eq!(
+            recorder.0.into_inner(),
+            vec![
+                (0x4090, 0x0001_5400_0002_1018),
+                (0x4098, 0x0000_0000_89ab_cdef),
+            ]
+        );
+    }
+
+    #[test]
+    fn pair_writer_does_not_publish_word1_after_word0_error() {
+        use std::cell::Cell;
+
+        struct RejectFirst(Cell<u32>);
+
+        impl G17SksmPairWriter for RejectFirst {
+            type Error = u32;
+
+            fn write64(&self, _offset: u32, _value: u64) -> core::result::Result<(), Self::Error> {
+                let calls = self.0.get() + 1;
+                self.0.set(calls);
+                Err(calls)
+            }
+        }
+
+        let writer = RejectFirst(Cell::new(0));
+        let pair = G17SksmOrderedWritePair {
+            word0_offset: 0x4090,
+            word0: 1,
+            word1_offset: 0x4098,
+            word1: 2,
+        };
+        assert_eq!(publish_g17p_sksm_write_pair(&writer, pair), Err(1));
+        assert_eq!(writer.0.get(), 1);
     }
 
     #[test]
@@ -2003,6 +2132,15 @@ mod tests {
         // This hard-coded value catches both the 32-bit selector arithmetic
         // and the host's ADD of `(data_master + 1) << 60` before the OR.
         assert_eq!(config.payload, 0x2280_0000_0001_2340);
+        assert_eq!(
+            config.write_pair(),
+            G17SksmOrderedWritePair {
+                word0_offset: 0x4090,
+                word0: 0x0002_0400_0002_1008,
+                word1_offset: 0x4098,
+                word1: 0x2280_0000_0001_2340,
+            }
+        );
         assert_eq!(config.enable_mask_offset, 0x21070);
         assert_eq!(config.enable_mask, 1);
     }
@@ -2124,7 +2262,7 @@ mod tests {
     }
 
     #[test]
-    fn g17p_completion_descriptors_fail_closed() {
+    fn g17p_completion_descriptors_reject_invalid_inputs() {
         assert_eq!(
             encode_g17p_ksm_completion_descriptor(
                 G17ChannelAbiTarget::M5G17G,
@@ -2287,7 +2425,7 @@ mod tests {
     }
 
     #[test]
-    fn g17p_top_level_command_decode_fails_closed_by_tag_and_identity() {
+    fn g17p_top_level_command_decode_rejects_bad_tag_and_identity() {
         for raw in [6u32, 8, 10, 11] {
             assert_eq!(
                 decode_g17p_top_level_command(G17ChannelAbiTarget::A18ProG17P, &raw.to_le_bytes()),
@@ -2431,7 +2569,7 @@ mod tests {
             SUBMISSION_ABI_LEDGER.kick_record,
             AbiProvenance::ForkedAgx3Grounded
         );
-        // The channel/ring state records stay inherited and fail-closed. The
+        // The channel/ring state records stay inherited and unsupported. The
         // widened native descriptor geometry is grounded first-hand.
         assert_eq!(
             SUBMISSION_ABI_LEDGER.channel_state,
@@ -2465,18 +2603,18 @@ mod tests {
     }
 
     #[test]
-    fn transport_stays_fail_closed_with_named_live_gaps() {
+    fn transport_reports_the_two_remaining_live_gaps() {
         assert!(GROUNDED_SUBMISSION_PRODUCER_AVAILABLE);
         assert!(!EXECUTABLE_SUBMISSION_TRANSPORT_AVAILABLE);
         assert!(!SUBMISSION_LIVE_GAPS.all_proven());
-        assert!(!SUBMISSION_LIVE_GAPS.sksm_hardware_kick_fifo_mmio_scratch_proven);
+        assert!(SUBMISSION_LIVE_GAPS.sksm_resource0_ordered_write_implemented);
         assert!(!SUBMISSION_LIVE_GAPS.doorbell_round_trip_proven);
         assert!(!SUBMISSION_LIVE_GAPS.completion_irq_route_proven);
 
         // A hypothetical all-proven set would flip the executable signal — the
         // gate is wired to the evidence, not hard-coded.
         let proven = SubmissionLiveGaps {
-            sksm_hardware_kick_fifo_mmio_scratch_proven: true,
+            sksm_resource0_ordered_write_implemented: true,
             doorbell_round_trip_proven: true,
             completion_irq_route_proven: true,
         };

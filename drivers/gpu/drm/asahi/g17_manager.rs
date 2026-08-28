@@ -6,15 +6,15 @@
 //!
 //! This path needs only target identity, init-data geometry, and the retained
 //! dual-role resource owner. It does not depend on the AGX2 `HwConfig` and it
-//! cannot publish roots, start firmware, or submit work.
+//! performs no publication during construction. Explicit queue methods own the
+//! resource-0 SKSM configuration and kick-store sequence.
 
 #[cfg(not(test))]
 use kernel::prelude::*;
 
 #[cfg(not(test))]
 use crate::{
-    agx_power_recovery, driver::AsahiDevice, g17_initdata, g17_lifecycle, g17_resources,
-    g17_submission, hw::agx3, identity, mmu,
+    driver::AsahiDevice, g17_initdata, g17_resources, g17_submission, hw::agx3, identity, mmu, regs,
 };
 #[cfg(test)]
 #[path = "g17_initdata.rs"]
@@ -266,94 +266,6 @@ pub(crate) fn validate_platform(
     Ok(())
 }
 
-/// Live-execution facts which remain separate from manager construction.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub(crate) struct ExecutionAvailability {
-    pub(crate) initdata_layout: bool,
-    pub(crate) initdata_graph: bool,
-    pub(crate) all_hw_globals: bool,
-    pub(crate) perf_tables: bool,
-    pub(crate) bundle_content: bool,
-    pub(crate) primary_status_b: bool,
-    pub(crate) power_sequence: bool,
-    pub(crate) lifecycle_executor: bool,
-    pub(crate) submission_transport: bool,
-}
-
-pub(crate) mod execution_gap {
-    pub(crate) const INITDATA_LAYOUT: u16 = 1 << 0;
-    pub(crate) const INITDATA_GRAPH: u16 = 1 << 1;
-    pub(crate) const HW_GLOBALS: u16 = 1 << 2;
-    pub(crate) const PERF_TABLES: u16 = 1 << 3;
-    pub(crate) const BUNDLE_CONTENT: u16 = 1 << 4;
-    pub(crate) const PRIMARY_STATUS_B: u16 = 1 << 5;
-    pub(crate) const POWER_SEQUENCE: u16 = 1 << 6;
-    pub(crate) const LIFECYCLE_EXECUTOR: u16 = 1 << 7;
-    pub(crate) const SUBMISSION_TRANSPORT: u16 = 1 << 8;
-}
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub(crate) struct ExecutionGaps(u16);
-
-impl ExecutionGaps {
-    pub(crate) const fn bits(self) -> u16 {
-        self.0
-    }
-
-    pub(crate) const fn contains(self, gap: u16) -> bool {
-        self.0 & gap != 0
-    }
-}
-
-/// Return every unavailable execution group. An empty result is the only pass.
-pub(crate) const fn execution_gaps(available: ExecutionAvailability) -> ExecutionGaps {
-    let mut gaps = 0;
-    if !available.initdata_layout {
-        gaps |= execution_gap::INITDATA_LAYOUT;
-    }
-    if !available.initdata_graph {
-        gaps |= execution_gap::INITDATA_GRAPH;
-    }
-    if !available.all_hw_globals {
-        gaps |= execution_gap::HW_GLOBALS;
-    }
-    if !available.perf_tables {
-        gaps |= execution_gap::PERF_TABLES;
-    }
-    if !available.bundle_content {
-        gaps |= execution_gap::BUNDLE_CONTENT;
-    }
-    if !available.primary_status_b {
-        gaps |= execution_gap::PRIMARY_STATUS_B;
-    }
-    if !available.power_sequence {
-        gaps |= execution_gap::POWER_SEQUENCE;
-    }
-    if !available.lifecycle_executor {
-        gaps |= execution_gap::LIFECYCLE_EXECUTOR;
-    }
-    if !available.submission_transport {
-        gaps |= execution_gap::SUBMISSION_TRANSPORT;
-    }
-
-    ExecutionGaps(gaps)
-}
-
-#[cfg(not(test))]
-const fn current_execution_availability() -> ExecutionAvailability {
-    ExecutionAvailability {
-        initdata_layout: g17_initdata::GROUNDED_LAYOUT_AVAILABLE,
-        initdata_graph: g17_initdata::PARSE_ACCEPTED_GRAPH_AVAILABLE,
-        all_hw_globals: g17_initdata::ALL_HW_GLOBALS_VALUES_GROUNDED,
-        perf_tables: g17_initdata::PERF_TABLE_VALUES_ENCODED,
-        bundle_content: g17_initdata::BUNDLE_VIEW_CONTENT_CARRIED,
-        primary_status_b: g17_initdata::PRIMARY_STATUS_B_FULL_OBJECT_CARRIED,
-        power_sequence: agx_power_recovery::EXECUTABLE_GFX1_POWER_SEQUENCE_AVAILABLE,
-        lifecycle_executor: g17_lifecycle::TRANSACTIONAL_CPU_EXECUTOR_AVAILABLE,
-        submission_transport: g17_submission::EXECUTABLE_SUBMISSION_TRANSPORT_AVAILABLE,
-    }
-}
-
 #[cfg(not(test))]
 fn target_observation(soc: &'static agx3::SocConfig) -> TargetObservation {
     TargetObservation {
@@ -395,6 +307,15 @@ pub(crate) struct G17PManagerConstruction {
     platform: G17PPlatformConfig,
 }
 
+/// A queue which has completed the host's configuration pair and QID-enable
+/// publication. Private fields prevent constructing an unregistered queue.
+#[cfg(not(test))]
+pub(crate) struct G17PSksmQueue {
+    queue_id: u8,
+    scratch: G17SksmScratchGeometry,
+    uat_owner: u64,
+}
+
 #[cfg(not(test))]
 impl G17PManagerConstruction {
     pub(crate) fn new(
@@ -432,15 +353,60 @@ impl G17PManagerConstruction {
         self.platform.sksm_scratch
     }
 
-    pub(crate) fn execution_gaps(&self) -> ExecutionGaps {
-        execution_gaps(current_execution_availability())
+    /// Configure one SKSM queue through resource 0 and return its registered
+    /// state only after the QID-valid bit is published.
+    pub(crate) fn configure_sksm_queue(
+        &self,
+        registers: &regs::Resources,
+        queue_id: u8,
+        data_master: u32,
+        completion_selector: u32,
+        entry_gpu_va: u64,
+    ) -> Result<G17PSksmQueue> {
+        let config = g17_submission::prepare_g17p_sksm_queue_config(
+            g17_submission::G17ChannelAbiTarget::A18ProG17P,
+            queue_id,
+            data_master,
+            completion_selector,
+            entry_gpu_va,
+            self.sksm_scratch(),
+        )
+        .map_err(|_| EINVAL)?;
+
+        registers.g17p_sksm_configure_queue(
+            config.write_pair(),
+            config.enable_mask_offset,
+            config.enable_mask,
+        )?;
+
+        Ok(G17PSksmQueue {
+            queue_id,
+            scratch: self.sksm_scratch(),
+            uat_owner: self.uat().ttb_base(),
+        })
     }
 
-    pub(crate) fn require_executable(&self) -> Result {
-        if self.execution_gaps().bits() != 0 {
-            return Err(ENOTSUPP);
+    /// Publish newly appended kicks for a queue returned by
+    /// [`Self::configure_sksm_queue`].
+    pub(crate) fn add_sksm_kicks(
+        &self,
+        registers: &regs::Resources,
+        queue: &mut G17PSksmQueue,
+        add_count: u32,
+    ) -> Result {
+        if queue.scratch != self.sksm_scratch() || queue.uat_owner != self.uat().ttb_base() {
+            return Err(EINVAL);
         }
-        Ok(())
+
+        let pair = g17_submission::prepare_sksm_add_kicks_mmio(
+            g17_submission::SksmAddKicksTarget::G17P,
+            queue.queue_id,
+            add_count,
+            queue.scratch,
+        )
+        .map_err(|_| EINVAL)?
+        .write_pair();
+        registers.g17p_sksm_publish_write_pair(pair)
     }
 }
 
@@ -574,7 +540,7 @@ mod tests {
     }
 
     #[test]
-    fn non_t8140_identity_and_uat_geometry_fail_closed() {
+    fn non_t8140_identity_and_uat_geometry_are_rejected() {
         let mut observed = target();
         observed.chip_id = 0x8142;
         assert_eq!(validate_target(observed), Err(ConstructionError::WrongChip));
@@ -609,7 +575,7 @@ mod tests {
     }
 
     #[test]
-    fn split_null_or_wrong_role_uat_fails_closed() {
+    fn split_null_or_wrong_role_uat_is_rejected() {
         let mut observed = resources();
         observed.primary_uat_owner = 0;
         assert_eq!(
@@ -633,7 +599,7 @@ mod tests {
     }
 
     #[test]
-    fn root_or_shared_cluster_mismatch_fails_closed() {
+    fn root_or_shared_cluster_mismatch_is_rejected() {
         let mut observed = resources();
         observed.secondary_root += 0x4000;
         assert_eq!(
@@ -646,54 +612,6 @@ mod tests {
         assert_eq!(
             validate_resources(observed),
             Err(ConstructionError::WrongSharedClusterSize)
-        );
-    }
-
-    #[test]
-    fn execution_remains_closed_on_power_tuning_and_submission() {
-        let gaps = execution_gaps(ExecutionAvailability {
-            initdata_layout: true,
-            initdata_graph: true,
-            all_hw_globals: false,
-            perf_tables: false,
-            bundle_content: false,
-            primary_status_b: false,
-            power_sequence: false,
-            lifecycle_executor: false,
-            submission_transport: false,
-        });
-
-        assert!(!gaps.contains(execution_gap::INITDATA_LAYOUT));
-        assert!(!gaps.contains(execution_gap::INITDATA_GRAPH));
-        assert!(gaps.contains(execution_gap::HW_GLOBALS));
-        assert!(gaps.contains(execution_gap::PERF_TABLES));
-        assert!(gaps.contains(execution_gap::BUNDLE_CONTENT));
-        assert!(gaps.contains(execution_gap::PRIMARY_STATUS_B));
-        assert!(gaps.contains(execution_gap::POWER_SEQUENCE));
-        assert!(gaps.contains(execution_gap::LIFECYCLE_EXECUTOR));
-        assert!(gaps.contains(execution_gap::SUBMISSION_TRANSPORT));
-    }
-
-    #[test]
-    fn execution_gate_opens_only_when_every_group_is_available() {
-        let all = ExecutionAvailability {
-            initdata_layout: true,
-            initdata_graph: true,
-            all_hw_globals: true,
-            perf_tables: true,
-            bundle_content: true,
-            primary_status_b: true,
-            power_sequence: true,
-            lifecycle_executor: true,
-            submission_transport: true,
-        };
-        assert_eq!(execution_gaps(all).bits(), 0);
-
-        let mut missing = all;
-        missing.submission_transport = false;
-        assert_eq!(
-            execution_gaps(missing).bits(),
-            execution_gap::SUBMISSION_TRANSPORT
         );
     }
 }

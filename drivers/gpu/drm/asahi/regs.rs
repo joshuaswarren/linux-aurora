@@ -7,7 +7,7 @@
 //! the few operations that require that, mainly reading the MMU fault status, reading GPU ID
 //! information, and starting the GPU firmware coprocessor.
 
-use crate::{hw, identity};
+use crate::{g17_submission, hw, identity};
 use kernel::{
     c_str,
     device::Core,
@@ -16,9 +16,10 @@ use kernel::{
         mem::IoMem, //
         Io,
     },
+    new_mutex,
     platform,
     prelude::*,
-    sync::aref::ARef, //
+    sync::{aref::ARef, Mutex}, //
 };
 
 /// Size of the ASC control MMIO region.
@@ -186,19 +187,104 @@ pub(crate) struct FaultInfo {
 pub(crate) struct Resources {
     dev: ARef<platform::Device>,
     sgx: Pin<KBox<Devres<IoMem<SGX_SIZE>>>>,
+    /// Serializes the shared fixed-slot SKSM FIFO across every queue.
+    sksm_fifo: Pin<KBox<Mutex<()>>>,
+}
+
+/// Write-only publication view of resource 0 for the SKSM FIFO pair.
+///
+/// In particular, the word-0 port at `sgx+0x4090` must never be loaded. The
+/// host has a separate diagnostic load from word 1 which is not exposed here.
+struct G17SksmSgxPairWriter<'a>(&'a IoMem<SGX_SIZE>);
+
+impl g17_submission::G17SksmPairWriter for G17SksmSgxPairWriter<'_> {
+    type Error = Error;
+
+    fn write64(&self, offset: u32, value: u64) -> Result {
+        // Regular writeq ordering is required: word 0 must reach the device
+        // before word 1. Publication never reads either scratch location.
+        self.0.try_write64(value, offset as usize)
+    }
 }
 
 impl Resources {
     /// Map the required resources given our platform device.
     pub(crate) fn new(pdev: &platform::Device<Core>) -> Result<Resources> {
+        // J700 declares `sgx` as resource 0. The pinned host observes two
+        // device-memory ranges, maps index 0, and stores that mapping at
+        // accelerator+0x348 before every SKSM scratch access.
         let sgx_req = pdev.io_request_by_name(c_str!("sgx")).ok_or(EINVAL)?;
         let sgx_iomem = KBox::pin_init(sgx_req.iomap_sized::<SGX_SIZE>(), GFP_KERNEL)?;
+        let sksm_fifo = KBox::pin_init(new_mutex!((), "g17_sksm_fifo"), GFP_KERNEL)?;
 
         Ok(Resources {
             // SAFETY: This device does DMA via the UAT IOMMU.
             dev: pdev.into(),
             sgx: sgx_iomem,
+            sksm_fifo,
         })
+    }
+
+    fn g17p_sksm_pair_fits(pair: g17_submission::G17SksmOrderedWritePair) -> bool {
+        let fits_u64 = |offset: u32| {
+            let offset = offset as usize;
+            offset % core::mem::size_of::<u64>() == 0
+                && offset
+                    .checked_add(core::mem::size_of::<u64>())
+                    .is_some_and(|end| end <= SGX_SIZE)
+        };
+
+        fits_u64(pair.word0_offset) && fits_u64(pair.word1_offset)
+    }
+
+    fn g17p_sksm_publish_locked(
+        sgx: &IoMem<SGX_SIZE>,
+        pair: g17_submission::G17SksmOrderedWritePair,
+    ) -> Result {
+        g17_submission::publish_g17p_sksm_write_pair(&G17SksmSgxPairWriter(sgx), pair)
+    }
+
+    /// Publish word 0 then word 1 through J700 resource 0 (`sgx`).
+    ///
+    /// The pair is checked completely before either write. The fixed-slot
+    /// lock prevents publications from two queues interleaving.
+    pub(crate) fn g17p_sksm_publish_write_pair(
+        &self,
+        pair: g17_submission::G17SksmOrderedWritePair,
+    ) -> Result {
+        if !Self::g17p_sksm_pair_fits(pair) {
+            return Err(EINVAL);
+        }
+
+        let _guard = self.sksm_fifo.lock();
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        Self::g17p_sksm_publish_locked(&sgx, pair)
+    }
+
+    /// Configure one G17P SKSM queue and then mark its QID valid.
+    ///
+    /// This publication surface performs no scratch reads. The QID-valid word
+    /// is a distinct read/write register and follows both ordered FIFO stores.
+    pub(crate) fn g17p_sksm_configure_queue(
+        &self,
+        pair: g17_submission::G17SksmOrderedWritePair,
+        enable_mask_offset: u32,
+        enable_mask: u64,
+    ) -> Result {
+        let enable_offset = enable_mask_offset as usize;
+        let enable_fits = enable_offset % core::mem::size_of::<u64>() == 0
+            && enable_offset
+                .checked_add(core::mem::size_of::<u64>())
+                .is_some_and(|end| end <= SGX_SIZE);
+        if !Self::g17p_sksm_pair_fits(pair) || !enable_fits || enable_mask == 0 {
+            return Err(EINVAL);
+        }
+
+        let _guard = self.sksm_fifo.lock();
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        Self::g17p_sksm_publish_locked(&sgx, pair)?;
+        let current = sgx.try_read64(enable_offset)?;
+        sgx.try_write64(current | enable_mask, enable_offset)
     }
 
     fn sgx_read32<const OFF: usize>(&self) -> u32 {
