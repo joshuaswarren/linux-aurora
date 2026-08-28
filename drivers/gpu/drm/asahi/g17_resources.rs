@@ -1949,6 +1949,155 @@ impl G17ResourceOwner {
         &self.address_space.uat
     }
 
+    /// Rebuild firmware-owned session state after both processors stop.
+    ///
+    /// Every mapping and the UAT owner stay in place so existing DRM VMs keep
+    /// their page-table identity and fixed driver aliases.
+    pub(crate) fn reset_session_after_processor_stop(&mut self) -> Result {
+        self.address_space
+            .uat
+            .restore_t8140_bootstrap_roots_after_processor_stop()?;
+
+        self.resources.partial_scheduler.with_bytes_mut(|bytes| {
+            g17_submission::apply_g17p_partial_opening_scheduler_page(bytes).map_err(|_| EINVAL)
+        })?;
+        self.resources
+            .partial_primary_index
+            .with_bytes_mut(|bytes| {
+                g17_submission::apply_g17p_partial_opening_primary_index_page(bytes)
+                    .map_err(|_| EINVAL)
+            })?;
+        self.resources.roots.with_bytes_mut(|bytes| {
+            bytes.fill(0);
+            Ok(())
+        })?;
+        self.resources.shared_cluster.with_bytes_mut(|bytes| {
+            bytes.fill(0);
+            Ok(())
+        })?;
+        self.resources.region_a.with_bytes_mut(|bytes| {
+            bytes.fill(0);
+            Ok(())
+        })?;
+        self.resources.region_c.with_bytes_mut(|bytes| {
+            bytes.fill(0);
+            g17_initdata::encode_region_c(bytes).map_err(|_| EINVAL)
+        })?;
+        self.resources.primary_state.with_bytes_mut(|bytes| {
+            bytes.fill(0);
+            Ok(())
+        })?;
+        self.resources.secondary_state.with_bytes_mut(|bytes| {
+            bytes.fill(0);
+            Ok(())
+        })?;
+        self.resources.secondary_status_a.with_bytes_mut(|bytes| {
+            bytes.fill(0);
+            Ok(())
+        })?;
+        self.resources.primary_b2_sentinel.with_bytes_mut(|bytes| {
+            bytes.fill(0);
+            Ok(())
+        })?;
+        self.resources.primary_b2_alias_1.with_bytes_mut(|bytes| {
+            bytes.fill(0);
+            for (index, value) in [
+                0xe000_0000u32,
+                0x0800_0000,
+                0x0000_0000,
+                0x0000_2a00,
+                0x0000_1500,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                bytes[0x20 + index * 4..0x24 + index * 4].copy_from_slice(&value.to_le_bytes());
+            }
+            Ok(())
+        })?;
+        self.resources.hw_region_0.with_bytes_mut(|bytes| {
+            bytes.fill(0);
+            Ok(())
+        })?;
+        self.resources.hw_region_1.with_bytes_mut(|bytes| {
+            bytes.fill(0);
+            Ok(())
+        })?;
+        self.resources.fwctl.with_bytes_mut(|bytes| {
+            bytes.fill(0);
+            Ok(())
+        })?;
+
+        let shared = self.handoff.shared;
+        let primary = self.handoff.primary;
+        let secondary = self.handoff.secondary;
+        let region_record_addrs = [
+            self.resources.hw_region_0.iova(),
+            self.resources.hw_region_1.iova(),
+        ];
+        self.resources.shared_cluster.with_bytes_mut(|bytes| {
+            g17_initdata::encode_hw_data(
+                &g17_initdata::T8140_REGISTER_WINDOWS,
+                &g17_initdata::T8140_REGISTER_FLAG_ONLY_SLOTS,
+                region_record_addrs,
+                &mut bytes[..g17_initdata::HW_DATA_SIZE],
+            )
+            .map_err(|_| EINVAL)
+        })?;
+        write_status_block_at(
+            &mut self.resources.primary_state,
+            PRIMARY_STATUS_A_STATE_GRID_OFFSET as usize,
+        )?;
+        write_status_block_at(&mut self.resources.secondary_status_a, 0)?;
+        let fwctl = self.resources.fwctl.iova();
+        self.resources.primary_state.with_bytes_mut(|bytes| {
+            bytes[0x320..0x324]
+                .copy_from_slice(&g17_initdata::CONTROL_OPENING_PRODUCER.to_le_bytes());
+            let status_b = g17_initdata::PRIMARY_STATUS_B_STATE_GRID_OFFSET;
+            let end = status_b + g17_initdata::PRIMARY_STATUS_B_OBJECT_SIZE;
+            g17_initdata::encode_primary_status_b(
+                fwctl,
+                fwctl + g17_initdata::CONTROL_RECORD_SIZE as u64,
+                &mut bytes[status_b..end],
+            )
+            .map_err(|_| EINVAL)
+        })?;
+        self.resources.secondary_state.with_bytes_mut(|bytes| {
+            bytes[0x320..0x324]
+                .copy_from_slice(&g17_initdata::CONTROL_OPENING_PRODUCER.to_le_bytes());
+            let extra = g17_initdata::PRIMARY_STATUS_B_STATE_GRID_OFFSET;
+            g17_initdata::encode_secondary_root_extra_1(
+                &mut bytes[extra..extra + g17_initdata::STATUS_BLOCK_SIZE],
+            )
+            .map_err(|_| EINVAL)
+        })?;
+        self.resources.shared_cluster.with_bytes_mut(|bytes| {
+            g17_initdata::encode_bundle_static(
+                secondary.state_grid + SECONDARY_HWDATA_STATE_OFFSET,
+                bytes,
+            )
+            .map_err(|_| EINVAL)
+        })?;
+        let primary_views = g17_initdata::PrimaryRegionViews {
+            sentinel_high: self.resources.primary_b2_sentinel.iova(),
+            alias_high: [
+                self.resources.partial_scheduler.iova(),
+                self.resources.primary_b2_alias_1.iova(),
+            ],
+        };
+        self.resources.shared_cluster.write_main_configs(
+            &shared,
+            &primary,
+            &secondary,
+            &primary_views,
+        )?;
+        self.resources
+            .roots
+            .write_roots(&shared, &primary.instance, &secondary.instance)?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
     pub(crate) fn new_user_render_storage(
         &mut self,
         dev: &AsahiDevice,

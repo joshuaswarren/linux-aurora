@@ -556,6 +556,24 @@ impl G17PManagerConstruction {
         )
     }
 
+    /// Release one stopped firmware session without replacing its UAT owner.
+    pub(crate) fn release_runtime_objects_after_processor_stop(&mut self) {
+        self.render_bind = None;
+        self.render_tracker = None;
+        self.render_storage = None;
+    }
+
+    /// Restore cold initdata in the existing mappings after both CPUs stop.
+    pub(crate) fn reset_session_after_processor_stop(&mut self) -> Result {
+        if self.render_bind.is_some()
+            || self.render_tracker.is_some()
+            || self.render_storage.is_some()
+        {
+            return Err(EBUSY);
+        }
+        self.resources.reset_session_after_processor_stop()
+    }
+
     pub(crate) fn begin_translated_render(
         &mut self,
         dev: &AsahiDevice,
