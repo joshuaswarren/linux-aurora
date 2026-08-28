@@ -60,7 +60,7 @@ const REQUIRED_PRE_HANDOFF_EVIDENCE: u16 = missing::FIRMWARE_IDENTITY
     | missing::RECOVERY_HANDSHAKE
     | missing::SUBMISSION_TRANSPORT;
 
-/// Exact fail-closed result returned to the probe boundary.
+/// Exact rejection result returned to the probe boundary.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct MissingEvidence(u16);
 
@@ -233,7 +233,7 @@ pub(crate) enum G17FirmwareVariant {
     G17P = b'P',
 }
 
-/// Fail-closed variant decoding for diagnostic firmware selection.
+/// Strict variant decoding for diagnostic firmware selection.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum FirmwareIdentityError {
@@ -328,7 +328,7 @@ const G17C_GFX1_FIRMWARE_IDENTITY: G17NestedFirmwareIdentity = G17NestedFirmware
 /// or Linux ownership of FTAB extraction, fixups, or firmware loading.
 /// Returns `None` for G17P: the pinned corpus has no role-paired nested
 /// images for it (see [`G17FirmwareVariant`]), so no byte identity exists to
-/// select and every caller must fail closed.
+/// select and every caller must reject the image.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const fn g17_nested_firmware_identity(
     role: FirmwareRole,
@@ -841,7 +841,7 @@ struct RoleState {
     cold_boot_complete: bool,
 }
 
-/// Fail-closed errors in the host-observed boot sequence.
+/// Errors in the host-observed boot sequence.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum BootError {
     /// Both role roots must be built and validated before the first kick.
@@ -1025,7 +1025,7 @@ impl DualRoleBoot {
 // (FW-3), the driver's own validator is the sole boundary that keeps a role
 // from being handed the wrong resource set. The ownership *contract* is
 // groundable and encodable offline; the actual per-role allocation and UAT
-// mapping is live DMA. The gate therefore stays fail-closed:
+// mapping is live DMA. The admission bit therefore remains unset:
 // `EXECUTABLE_ROLE_RESOURCES_AVAILABLE = false`.
 // -------------------------------------------------------------------------
 
@@ -1054,7 +1054,7 @@ pub(crate) const GROUNDED_ROLE_RESOURCE_OWNERSHIP_AVAILABLE: bool = true;
 /// and only fails as a functional fault a live M5 boot exposes.
 pub(crate) const EXECUTABLE_ROLE_RESOURCES_AVAILABLE: bool = false;
 
-/// Fail-closed per-role resource-ownership description.
+/// Strict per-role resource-ownership description.
 ///
 /// Both roles share exactly one GPU/UAT owner ([`SharedGpuUatOwner`]); only
 /// GFX1 owns the runtime resource at runtime_pointers+0x481 (FW-4).
@@ -1067,7 +1067,7 @@ pub(crate) struct RoleResourceOwnership {
     pub(crate) gfx1_runtime_resource: u64,
 }
 
-/// Fail-closed role-resource validation errors.
+/// Role-resource validation errors.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum RoleResourceError {
@@ -1079,7 +1079,7 @@ pub(crate) enum RoleResourceError {
     SharedOwnerAliasViolation,
 }
 
-/// Validate one role's resource ownership, fail-closed.
+/// Validate one role's resource ownership.
 ///
 /// Because the firmware never self-validates the role (FW-3), this is the only
 /// place a role/resource mismatch is caught before handoff. It refuses a null
@@ -1104,7 +1104,7 @@ pub(crate) fn validate_role_resource_ownership(
 }
 
 /// Validate that the two roles in a boot resolve to one GPU/UAT owner and hold
-/// mutually consistent, role-correct resources, fail-closed.
+/// mutually consistent, role-correct resources.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn validate_dual_role_resources(
     boot: &DualRoleBoot,
@@ -1267,7 +1267,7 @@ mod tests {
     }
 
     #[test]
-    fn root_mutation_after_kick_fails_closed() {
+    fn root_mutation_after_kick_is_rejected() {
         let mut boot = roots_ready();
         boot.record_kick(FirmwareRole::Gfx, true).unwrap();
         assert_eq!(
@@ -1280,7 +1280,7 @@ mod tests {
     #[test]
     fn nested_firmware_identity_is_exact_per_role_and_variant() {
         for role in [FirmwareRole::Gfx, FirmwareRole::Gfx1] {
-            // G17P has no pinned nested images; selection must fail closed.
+            // G17P has no pinned nested images; selection must reject it.
             assert!(g17_nested_firmware_identity(role, G17FirmwareVariant::G17P).is_none());
 
             let g17s = g17_nested_firmware_identity(role, G17FirmwareVariant::G17S).unwrap();
@@ -1690,7 +1690,7 @@ mod tests {
         // firmware and wired: the topology/fault register bank, the init-data
         // object graph the firmware parser accepts, and the GPU RTKit wire
         // transport (with EP0 owned by the version-12-capable apple-rtkit
-        // core). Everything else stays fail-closed pending more offline RE or a
+        // core). Everything else remains unsupported pending more offline RE or a
         // live firmware ACK.
         let grounded =
             missing::TOPOLOGY_REGISTERS | missing::INITDATA_GRAPH | missing::RTKIT_TRANSPORT;
@@ -1749,13 +1749,13 @@ mod tests {
         assert!(!agx_power_recovery::EXECUTABLE_GFX1_POWER_SEQUENCE_AVAILABLE);
         assert!(!agx_power_recovery::EXECUTABLE_G17_RECOVERY_HANDSHAKE_AVAILABLE);
         // ROLE_RESOURCES: the ownership contract is grounded, but there is no
-        // firmware parse-time role check to satisfy, so it stays fail-closed.
+        // firmware parse-time role check to satisfy, so it remains unset.
         assert!(GROUNDED_ROLE_RESOURCE_OWNERSHIP_AVAILABLE);
         assert!(!EXECUTABLE_ROLE_RESOURCES_AVAILABLE);
     }
 
     #[test]
-    fn role_resource_ownership_fails_closed_on_cross_role_and_null() {
+    fn role_resource_ownership_rejects_cross_role_and_null() {
         // Byte-grounded asymmetry: only GFX1 references the +0x481 resource.
         assert_eq!(G17_GFX1_RUNTIME_RESOURCE_REFS_IN_GFX, 0);
         assert_eq!(G17_GFX1_RUNTIME_RESOURCE_REFS_IN_GFX1, 78);
@@ -1827,7 +1827,7 @@ mod tests {
         ];
         assert!(validate_dual_role_resources(&boot, &good).is_ok());
 
-        // Swapped roles fail closed.
+        // Swapped roles are rejected.
         let swapped = [good[1], good[0]];
         assert_eq!(
             validate_dual_role_resources(&boot, &swapped),
@@ -1840,7 +1840,7 @@ mod tests {
     }
 
     #[test]
-    fn submission_transport_is_grounded_but_stays_fail_closed() {
+    fn submission_transport_waits_for_completion_round_trip() {
         // The producer subset is real (doorbell byte-identical to AGX2, SKSM
         // kick word + record forked and cited), but not executable offline.
         assert!(g17_submission::GROUNDED_SUBMISSION_PRODUCER_AVAILABLE);

@@ -382,7 +382,7 @@ fn refuse_agx3_probe(pdev: &platform::Device<Core>, soc: &'static hw::agx3::SocC
 }
 
 /// Report the grounded-vs-UNKNOWN state of the single-role G15 (M3) boot, then
-/// fail closed. G15 is the easiest AGX3 target — one `GFX` role, classic
+/// reject the probe. G15 is the easiest AGX3 target — one `GFX` role, classic
 /// device-control-ring submission — but the firmware image is not on disk and
 /// the init-data/RTKit graph is not boot-complete offline.
 fn refuse_g15_probe(pdev: &platform::Device<Core>) -> Error {
@@ -655,7 +655,7 @@ fn refuse_g17_probe(
         }
         dev_info!(
             pdev.as_ref(),
-            "G17: loaded GFX/GFX1 evidence cleared only the firmware-identity bit; all execution gates remain closed\n"
+            "G17: loaded GFX/GFX1 evidence cleared the firmware-identity bit; remaining operations are reported below\n"
         );
     }
     dev_err!(
@@ -722,7 +722,7 @@ fn refuse_g17_probe(
             pdev.as_ref(),
             "{}{}",
             "G17 preflight: submission codecs include the grounded EP 0x21 doorbell, SKSM queue/configure words, fixed-slot scratch geometry, and kick-record table; ",
-            "Linux mapped-window publication, firmware consumption, the round trip, and completion IRQ causality remain unproved\n"
+            "Linux resource-0 ordered publication is implemented; firmware execution, the round trip, and completion IRQ causality remain unproved\n"
         );
     }
 
@@ -744,7 +744,7 @@ fn refuse_g17_probe(
         {
             Ok(scratch) => dev_info!(
                 pdev.as_ref(),
-                "G17P manager inputs admitted without AGX2 HwConfig: {}-bit UAT, {:#x}-byte pages, dual-role resource geometry, SKSM scratch {:#x}/{:#x}; execution gates remain closed\n",
+                "G17P manager inputs admitted without AGX2 HwConfig: {}-bit UAT, {:#x}-byte pages, dual-role resource geometry, SKSM scratch {:#x}/{:#x}; resource-0 ordered publisher available\n",
                 g17_manager::T8140_MANAGER_CONFIG.uat_ias,
                 g17_manager::T8140_MANAGER_CONFIG.uat_page_size,
                 scratch.write0,
