@@ -24,7 +24,7 @@ static void apple_dcp_link_inherited_memory_test(struct kunit *test)
 	u8 *memory;
 	bool idle;
 
-	memory = kunit_kzalloc(test, APPLE_DCP_LINK_STREAM_MEMORY_SIZE,
+	memory = kunit_kzalloc(test, APPLE_DCP_LINK_RPC_MEMORY_SIZE,
 			       GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, memory);
 	desc = (struct apple_dcp_link_init_desc *)memory;
@@ -35,12 +35,12 @@ static void apple_dcp_link_inherited_memory_test(struct kunit *test)
 						 sizeof(*desc));
 	KUNIT_EXPECT_TRUE(test, idle);
 	idle = apple_dcp_link_stream_memory_idle(memory,
-						 APPLE_DCP_LINK_STREAM_MEMORY_SIZE);
+						 APPLE_DCP_LINK_RPC_MEMORY_SIZE);
 	KUNIT_EXPECT_TRUE(test, idle);
 
 	memory[0x4000] = 1;
 	idle = apple_dcp_link_stream_memory_idle(memory,
-						 APPLE_DCP_LINK_STREAM_MEMORY_SIZE);
+						 APPLE_DCP_LINK_RPC_MEMORY_SIZE);
 	KUNIT_EXPECT_FALSE(test, idle);
 	memory[0x4000] = 0;
 
@@ -52,6 +52,44 @@ static void apple_dcp_link_inherited_memory_test(struct kunit *test)
 	desc->flags = cpu_to_le32(0);
 	desc->shared_dva = cpu_to_le64(0x10002000001ULL);
 	KUNIT_EXPECT_FALSE(test, apple_dcp_link_init_desc_valid(desc));
+
+	desc->shared_dva = 0;
+	desc->flags = cpu_to_le32(APPLE_DCP_LINK_INIT_FLAG_64M);
+	KUNIT_EXPECT_FALSE(test, apple_dcp_link_init_desc_valid(desc));
+	desc->shared_dva = cpu_to_le64(0x10002000000ULL);
+	desc->flags = 0;
+	KUNIT_EXPECT_FALSE(test, apple_dcp_link_init_desc_valid(desc));
+	desc->flags = cpu_to_le32(APPLE_DCP_LINK_INIT_FLAG_64M);
+	memory[APPLE_DCP_LINK_RPC_MEMORY_SIZE - 1] = 1;
+	idle = apple_dcp_link_stream_memory_idle(memory,
+						 APPLE_DCP_LINK_RPC_MEMORY_SIZE);
+	KUNIT_EXPECT_FALSE(test, idle);
+}
+
+static void apple_dcp_link_handoff_phase_test(struct kunit *test)
+{
+	enum apple_dcp_link_handoff_phase phase;
+	u64 ready = FIELD_PREP(APPLE_DCP_LINK_MSG_VERSION, 7) |
+		    FIELD_PREP(APPLE_DCP_LINK_MSG_HASH, 0xa1b2c3d4) |
+		    APPLE_DCP_LINK_MSG_READY;
+	bool valid;
+
+	phase = APPLE_DCP_LINK_HANDOFF_FIRMWARE_INIT;
+	valid = apple_dcp_link_handoff_message_valid(phase, 0);
+	KUNIT_EXPECT_TRUE(test, valid);
+	valid = apple_dcp_link_handoff_message_valid(phase, BIT_ULL(6));
+	KUNIT_EXPECT_FALSE(test, valid);
+	phase = APPLE_DCP_LINK_HANDOFF_READY;
+	valid = apple_dcp_link_handoff_message_valid(phase, ready);
+	KUNIT_EXPECT_TRUE(test, valid);
+	valid = apple_dcp_link_handoff_message_valid(phase, 0);
+	KUNIT_EXPECT_FALSE(test, valid);
+	phase = APPLE_DCP_LINK_HANDOFF_NONE;
+	valid = apple_dcp_link_handoff_message_valid(phase, ready);
+	KUNIT_EXPECT_FALSE(test, valid);
+	KUNIT_EXPECT_EQ(test, apple_dcp_link_negotiate_version(1), (u16)1);
+	KUNIT_EXPECT_EQ(test, apple_dcp_link_negotiate_version(4), (u16)4);
+	KUNIT_EXPECT_EQ(test, apple_dcp_link_negotiate_version(7), (u16)4);
 }
 
 static void apple_dcp_link_stream_layout_test(struct kunit *test)
@@ -442,6 +480,7 @@ static void apple_dcp_h17p_rt_bw_reply_test(struct kunit *test)
 static struct kunit_case apple_dcp_link_test_cases[] = {
 	KUNIT_CASE(apple_dcp_link_init_desc_test),
 	KUNIT_CASE(apple_dcp_link_inherited_memory_test),
+	KUNIT_CASE(apple_dcp_link_handoff_phase_test),
 	KUNIT_CASE(apple_dcp_link_stream_layout_test),
 	KUNIT_CASE(apple_dcp_h17p_clock_rate_test),
 	KUNIT_CASE(apple_dcp_h17p_method_test),

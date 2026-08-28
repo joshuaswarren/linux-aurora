@@ -21,7 +21,6 @@
 #define APPLE_DCP_LINK_LOCAL_STREAMS_OFFSET	0x078
 #define APPLE_DCP_LINK_REMOTE_STREAMS_OFFSET	0x218
 #define APPLE_DCP_LINK_RPC_MEMORY_SIZE		0x0c0000
-#define APPLE_DCP_LINK_STREAM_MEMORY_SIZE	0x080000
 #define APPLE_DCP_LINK_RPC_PAGE_SIZE		0x004000
 #define APPLE_DCP_LINK_SIDE_MEMORY_SIZE		0x040000
 #define APPLE_DCP_LINK_STREAM_HALF_SIZE		0x020000
@@ -56,6 +55,32 @@ enum apple_dcp_link_state {
 	APPLE_DCP_LINK_WAIT_FIRMWARE_READY,
 	APPLE_DCP_LINK_READY,
 };
+
+enum apple_dcp_link_handoff_phase {
+	APPLE_DCP_LINK_HANDOFF_NONE,
+	APPLE_DCP_LINK_HANDOFF_FIRMWARE_INIT,
+	APPLE_DCP_LINK_HANDOFF_READY,
+};
+
+static inline bool
+apple_dcp_link_handoff_message_valid(enum apple_dcp_link_handoff_phase phase, u64 message)
+{
+	u8 type = message & GENMASK_ULL(1, 0);
+
+	if (phase == APPLE_DCP_LINK_HANDOFF_FIRMWARE_INIT)
+		return type == APPLE_DCP_LINK_MSG_FIRMWARE_INIT &&
+		       !(message & GENMASK_ULL(7, 6));
+	if (phase == APPLE_DCP_LINK_HANDOFF_READY)
+		return type == APPLE_DCP_LINK_MSG_READY;
+
+	return false;
+}
+
+static inline u16 apple_dcp_link_negotiate_version(u16 remote_version)
+{
+	return remote_version < APPLE_DCP_LINK_PROTOCOL_VERSION ?
+		remote_version : APPLE_DCP_LINK_PROTOCOL_VERSION;
+}
 
 enum apple_dcp_link_handshake_action {
 	APPLE_DCP_LINK_HANDSHAKE_NONE,
@@ -442,10 +467,14 @@ apple_dcp_link_init_desc_valid(const struct apple_dcp_link_init_desc *desc)
 	shared_dva = le64_to_cpu(desc->shared_dva);
 	flags = le32_to_cpu(desc->flags);
 
-	return le32_to_cpu(desc->version) == APPLE_DCP_LINK_PROTOCOL_VERSION &&
-	       (flags == 0 || flags == APPLE_DCP_LINK_INIT_FLAG_64M) &&
-	       (!shared_dva ||
-		!(shared_dva & (APPLE_DCP_LINK_RPC_PAGE_SIZE - 1)));
+	if (le32_to_cpu(desc->version) != APPLE_DCP_LINK_PROTOCOL_VERSION)
+		return false;
+	if (!shared_dva)
+		return flags == 0;
+
+	return flags == APPLE_DCP_LINK_INIT_FLAG_64M &&
+	       !(shared_dva & (APPLE_DCP_LINK_RPC_PAGE_SIZE - 1)) &&
+	       !(shared_dva & ~GENMASK_ULL(47, 0));
 }
 
 static inline bool
@@ -454,11 +483,11 @@ apple_dcp_link_stream_memory_idle(const void *memory, size_t size)
 	const u8 *bytes = memory;
 	size_t offset;
 
-	if (!memory || size < APPLE_DCP_LINK_STREAM_MEMORY_SIZE)
+	if (!memory || size < APPLE_DCP_LINK_RPC_MEMORY_SIZE)
 		return false;
 
 	for (offset = sizeof(struct apple_dcp_link_init_desc);
-	     offset < APPLE_DCP_LINK_STREAM_MEMORY_SIZE; offset++) {
+	     offset < APPLE_DCP_LINK_RPC_MEMORY_SIZE; offset++) {
 		if (bytes[offset])
 			return false;
 	}
