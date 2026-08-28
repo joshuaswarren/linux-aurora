@@ -75,5 +75,9 @@ kernel::module_platform_driver! {
             // permissions: 0o644,
             description: "Fully isolate GPU contexts (limits performance)",
         },
+        g17p_probe: u32 {
+            default: 0,
+            description: "Run the reversible T8140 dual-ACK/QID4 probe slice",
+        },
     },
 }

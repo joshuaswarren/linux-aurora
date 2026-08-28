@@ -32,6 +32,8 @@ pub(crate) const EXECUTABLE_T8140_ROLE_RESOURCES_AVAILABLE: bool = true;
 const ROOT_PAIR_ALLOC_SIZE: usize = 0xc000;
 const PRIMARY_STATUS_A_STATE_GRID_OFFSET: u64 = 0xee40;
 const SECONDARY_EXTRA_0_BEFORE_PRIMARY_STATUS_A: u64 = 0x6c0;
+const SECONDARY_HWDATA_STATE_OFFSET: u64 = 0x3c0;
+const FWCTL_SIZE: usize = 0x4000;
 pub(crate) const G17P_CL_ENTRY_STORAGE_SIZE: usize = 0x20000;
 pub(crate) const G17P_CL_SHARED_SUPPORT_SIZE: usize = 0x4000;
 pub(crate) const G17P_CL_B2_OBJECT_SIZE: usize = 0x4000;
@@ -208,6 +210,23 @@ impl MappedObject {
             alignment,
             prot,
         )
+    }
+
+    fn new_at(
+        dev: &AsahiDevice,
+        vm: &mmu::Vm,
+        address: u64,
+        size: usize,
+        prot: mmu::Prot,
+    ) -> Result<Self> {
+        let mut object = gem::new_kernel_object(dev, size)?;
+        object.vmap()?.memset(0);
+        let mapping = object.map_at(vm, address, prot, false)?;
+        Ok(Self {
+            mapping,
+            object,
+            logical_size: size,
+        })
     }
 
     fn iova(&self) -> u64 {
@@ -527,6 +546,7 @@ struct G17MappedResources {
     primary_b2_alias_1_low: mmu::KernelMapping,
     hw_region_0: MappedObject,
     hw_region_1: MappedObject,
+    fwctl: MappedObject,
     register_windows: KVec<mmu::KernelMapping>,
 }
 
@@ -603,26 +623,33 @@ impl G17ResourceOwner {
             mmu::UAT_PGSZ as u64,
             mmu::PROT_FW_SHARED_RW,
         )?;
-        let hw_region_0 = MappedObject::new(
+        let hw_region_0 = MappedObject::new_at(
             dev,
-            &address_space.uat,
+            address_space.uat.kernel_vm(),
+            shared_cluster.iova() + g17_initdata::NATIVE_HW_REGION_BUNDLE_OFFSETS[0] as u64,
             mmu::UAT_PGSZ,
-            mmu::UAT_PGSZ as u64,
             mmu::PROT_FW_SHARED_RW,
         )?;
-        let hw_region_1 = MappedObject::new(
+        let hw_region_1 = MappedObject::new_at(
+            dev,
+            address_space.uat.kernel_vm(),
+            shared_cluster.iova() + g17_initdata::NATIVE_HW_REGION_BUNDLE_OFFSETS[1] as u64,
+            mmu::UAT_PGSZ,
+            mmu::PROT_FW_SHARED_RW,
+        )?;
+        let fwctl = MappedObject::new(
             dev,
             &address_space.uat,
-            mmu::UAT_PGSZ,
+            FWCTL_SIZE,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_FW_SHARED_RW,
         )?;
         let register_windows = map_t8140_register_windows(&address_space.uat)?;
-        let primary_b2_sentinel = MappedObject::new(
+        let primary_b2_sentinel = MappedObject::new_at(
             dev,
-            &address_space.uat,
+            address_space.uat.kernel_vm(),
+            shared_cluster.iova() + 0x40000,
             G17P_CL_B2_OBJECT_SIZE,
-            mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
         let mut primary_b2_alias_0 = MappedObject::new(
@@ -639,6 +666,22 @@ impl G17ResourceOwner {
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
+        primary_b2_alias_1.with_bytes_mut(|bytes| {
+            for (index, value) in [
+                0xe000_0000u32,
+                0x0800_0000,
+                0x0000_0000,
+                0x0000_2a00,
+                0x0000_1500,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                bytes[0x20 + index * 4..0x24 + index * 4]
+                    .copy_from_slice(&value.to_le_bytes());
+            }
+            Ok(())
+        })?;
         let primary_b2_alias_0_low = primary_b2_alias_0.map_alias_at(
             address_space.uat.kernel_lower_vm(),
             g17_initdata::REGION_VIEW_LOW_ADDRS[0],
@@ -711,17 +754,37 @@ impl G17ResourceOwner {
             .with_bytes_mut(|bytes| g17_initdata::encode_region_c(bytes).map_err(|_| EINVAL))?;
         write_status_block_at(
             &mut primary_state,
-            g17_initdata::PRIMARY_STATUS_B_STATE_GRID_OFFSET,
-        )?;
-        write_status_block_at(
-            &mut primary_state,
             PRIMARY_STATUS_A_STATE_GRID_OFFSET as usize,
         )?;
-        write_status_block_at(
-            &mut secondary_state,
-            g17_initdata::PRIMARY_STATUS_B_STATE_GRID_OFFSET,
-        )?;
         write_status_block_at(&mut secondary_status_a, 0)?;
+        primary_state.with_bytes_mut(|bytes| {
+            bytes[0x320..0x324]
+                .copy_from_slice(&g17_initdata::CONTROL_OPENING_PRODUCER.to_le_bytes());
+            let status_b = g17_initdata::PRIMARY_STATUS_B_STATE_GRID_OFFSET;
+            let end = status_b + g17_initdata::PRIMARY_STATUS_B_OBJECT_SIZE;
+            g17_initdata::encode_primary_status_b(
+                fwctl.iova(),
+                fwctl.iova() + g17_initdata::CONTROL_RECORD_SIZE as u64,
+                &mut bytes[status_b..end],
+            )
+            .map_err(|_| EINVAL)
+        })?;
+        secondary_state.with_bytes_mut(|bytes| {
+            bytes[0x320..0x324]
+                .copy_from_slice(&g17_initdata::CONTROL_OPENING_PRODUCER.to_le_bytes());
+            let extra = g17_initdata::PRIMARY_STATUS_B_STATE_GRID_OFFSET;
+            g17_initdata::encode_secondary_root_extra_1(
+                &mut bytes[extra..extra + g17_initdata::STATUS_BLOCK_SIZE],
+            )
+            .map_err(|_| EINVAL)
+        })?;
+        shared_cluster.with_bytes_mut(|bytes| {
+            g17_initdata::encode_bundle_static(
+                secondary_state.iova() + SECONDARY_HWDATA_STATE_OFFSET,
+                bytes,
+            )
+            .map_err(|_| EINVAL)
+        })?;
         shared_cluster.write_main_configs(
             &shared,
             &handoff.primary,
@@ -747,6 +810,7 @@ impl G17ResourceOwner {
                 primary_b2_alias_1_low,
                 hw_region_0,
                 hw_region_1,
+                fwctl,
                 register_windows,
             },
             address_space,

@@ -42,13 +42,15 @@ use kernel::macros::vtable;
 
 use crate::{
     driver::{AsahiDevice, T8140LiveTopologyAdmission},
-    g17_lifecycle, g17_manager, g17_rtkit, hw, identity, regs,
+    g17_lifecycle, g17_manager, g17_rtkit, hw, identity, module_parameters, regs,
 };
 
 /// The T8140 match now runs the reversible provider-owned bring-up slice.
 /// Probe still returns `ENODEV` after the slice because no G17P DRM queue
 /// backend is registered yet.
-pub(crate) const G17_LIVE_BOOT_ENABLED: bool = true;
+pub(crate) fn enabled() -> bool {
+    *module_parameters::g17p_probe.value() != 0
+}
 
 /// Ordered boundary stages.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -60,10 +62,14 @@ pub(crate) enum BootStage {
     BootRtkit,
     PublishInitdata,
     InitdataAcknowledged,
+    DeviceControlPublished,
     RegisterComputeQueue,
 }
 
 const INITDATA_ACK_TYPE: u16 = 0x09;
+const CONTROL_START_TYPE: u16 = 0x89;
+const CONTROL_DONE_TYPE: u16 = 0x84;
+const CONTROL_DONE_CHANNEL: u64 = 0x11;
 const INITDATA_ACK_POLLS: usize = 200;
 
 /// Per-role callback state retained until the corresponding RTKit client is
@@ -126,13 +132,12 @@ impl rtkit::Operations for G17PRtkitOps {
         endpoint: u8,
         message: u64,
     ) -> bool {
-        if endpoint == g17_rtkit::ENDPOINT_GFX_MESSAGES
-            && (message >> 48) as u16 == INITDATA_ACK_TYPE
-        {
-            data.acked.store(true, Ordering::Release);
-            true
-        } else {
-            false
+        match (endpoint, (message >> 48) as u16) {
+            (g17_rtkit::ENDPOINT_GFX_MESSAGES, INITDATA_ACK_TYPE) => {
+                data.acked.store(true, Ordering::Release);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -199,7 +204,7 @@ pub(crate) fn attempt(
     id: &identity::GpuIdentity,
     topology: Option<&T8140LiveTopologyAdmission>,
 ) -> Result {
-    if !G17_LIVE_BOOT_ENABLED {
+    if !enabled() {
         return Err(ENODEV);
     }
     if soc.chip_id != 0x8140
@@ -335,6 +340,25 @@ pub(crate) fn attempt(
             pdev.as_ref(),
             "G17P live-boot: {:?} for both firmware roles\n",
             BootStage::InitdataAcknowledged
+        );
+
+        let control_start = (CONTROL_START_TYPE as u64) << 48;
+        gfx_rtkit
+            .as_mut()
+            .send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, control_start)?;
+        fsleep(Delta::from_millis(12));
+        gfx1_rtkit
+            .as_mut()
+            .send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, control_start)?;
+        let control_done = ((CONTROL_DONE_TYPE as u64) << 48) | CONTROL_DONE_CHANNEL;
+        gfx_rtkit
+            .as_mut()
+            .send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, control_done)?;
+        fsleep(Delta::from_millis(10));
+        dev_info!(
+            pdev.as_ref(),
+            "G17P live-boot: {:?} in GFX/GFX1 order with primary 0x84/0x11 cadence\n",
+            BootStage::DeviceControlPublished
         );
 
         let _queue = manager.configure_compute_sksm_queue(dev, registers, 4, 2)?;
