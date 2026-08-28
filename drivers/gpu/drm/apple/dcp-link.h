@@ -11,8 +11,11 @@
 #include <linux/types.h>
 
 #define APPLE_DCP_LINK_PROTOCOL_VERSION		4
+#define APPLE_DCP_LINK_ENDPOINT			0x24
 #define APPLE_DCP_LINK_STREAM_COUNT		8
 #define APPLE_DCP_LINK_STREAM_STATE_SIZE	0x68
+#define APPLE_DCP_LINK_RPC_MEMORY_SIZE		0x0c0000
+#define APPLE_DCP_LINK_SHARED_VAR_MEMORY_SIZE	0x4000000
 
 #define APPLE_DCP_LINK_INIT_FLAG_64M		0x04000000
 
@@ -20,7 +23,9 @@
 #define APPLE_DCP_LINK_MSG_RPC			2
 #define APPLE_DCP_LINK_MSG_RPC_REPLY		0x42
 #define APPLE_DCP_LINK_MSG_INIT			0x40
+#define APPLE_DCP_LINK_MSG_REMOTE		BIT_ULL(8)
 #define APPLE_DCP_LINK_MSG_NESTED		BIT_ULL(9)
+#define APPLE_DCP_LINK_MSG_STREAM		GENMASK_ULL(15, 10)
 #define APPLE_DCP_LINK_MSG_OFFSET		GENMASK_ULL(31, 16)
 #define APPLE_DCP_LINK_MSG_SIZE			GENMASK_ULL(47, 32)
 #define APPLE_DCP_LINK_MSG_VERSION		GENMASK_ULL(63, 48)
@@ -118,6 +123,63 @@ static inline int apple_dcp_link_rpc_message(u32 offset, u32 size, bool nested,
 	if (nested)
 		*message |= APPLE_DCP_LINK_MSG_NESTED;
 
+	return 0;
+}
+
+static inline int apple_dcp_link_stream_message(u64 message, u8 stream,
+						bool remote, u64 *encoded)
+{
+	if (!encoded)
+		return -EINVAL;
+	if (stream >= 64)
+		return -ERANGE;
+
+	message &= ~(APPLE_DCP_LINK_MSG_REMOTE | APPLE_DCP_LINK_MSG_STREAM);
+	message |= FIELD_PREP(APPLE_DCP_LINK_MSG_STREAM, stream);
+	if (remote)
+		message |= APPLE_DCP_LINK_MSG_REMOTE;
+
+	*encoded = message;
+	return 0;
+}
+
+static inline int apple_dcp_link_stack_push(u32 top, u32 capacity,
+					    u32 payload_size, u32 alignment,
+					    u32 *offset, u32 *next_top)
+{
+	u32 aligned_size;
+	int ret;
+
+	if (!offset || !next_top || top > capacity)
+		return -EINVAL;
+
+	ret = apple_dcp_link_align_payload(payload_size, alignment, &aligned_size);
+	if (ret)
+		return ret;
+	if (aligned_size > capacity - top)
+		return -ENOSPC;
+
+	*offset = top;
+	*next_top = top + aligned_size;
+	return 0;
+}
+
+static inline int apple_dcp_link_stack_pop(u32 top, u32 payload_size,
+					   u32 alignment, u32 *next_top)
+{
+	u32 aligned_size;
+	int ret;
+
+	if (!next_top)
+		return -EINVAL;
+
+	ret = apple_dcp_link_align_payload(payload_size, alignment, &aligned_size);
+	if (ret)
+		return ret;
+	if (aligned_size > top)
+		return -ERANGE;
+
+	*next_top = top - aligned_size;
 	return 0;
 }
 
