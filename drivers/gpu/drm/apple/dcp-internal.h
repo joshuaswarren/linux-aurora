@@ -16,6 +16,7 @@
 
 #include "dptxep.h"
 #include "iomfb.h"
+#include "iomfb_h17p.h"
 #include "iomfb_v12_3.h"
 #include "iomfb_v13_3.h"
 #include "epic/dpavservep.h"
@@ -178,6 +179,7 @@ struct apple_dcp {
 	union {
 		struct dcp_swap_submit_req_v12_3 v12_3;
 		struct dcp_swap_submit_req_v13_3 v13_3;
+		struct dcp_swap_submit_req_h17p h17p;
 	} swap;
 
 	/* swap id of the last completed swap */
