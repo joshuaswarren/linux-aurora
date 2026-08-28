@@ -31,7 +31,7 @@ use g17_submission::{
 };
 
 pub(crate) const UAPI_COMMAND_HEADER_SIZE: usize = 8;
-pub(crate) const UAPI_RENDER_SIZE: usize = 240;
+pub(crate) const UAPI_RENDER_SIZE: usize = 256;
 pub(crate) const UAPI_COMPUTE_SIZE: usize = 64;
 pub(crate) const UAPI_ATTACHMENT_SIZE: usize = 24;
 pub(crate) const UAPI_MAX_ATTACHMENTS: usize = 16;
@@ -48,10 +48,12 @@ const SET_COMPUTE_ATTACHMENTS: u16 = 4;
 const RENDER_VERTEX_SCRATCH: u32 = 1 << 0;
 const RENDER_PROCESS_EMPTY_TILES: u32 = 1 << 1;
 const RENDER_NO_VERTEX_CLUSTERING: u32 = 1 << 2;
+const RENDER_RSRC_SPEC_HI: u32 = 1 << 4;
 const RENDER_DBIAS_IS_INT: u32 = 1 << 18;
 const RENDER_FLAGS: u32 = RENDER_VERTEX_SCRATCH
     | RENDER_PROCESS_EMPTY_TILES
     | RENDER_NO_VERTEX_CLUSTERING
+    | RENDER_RSRC_SPEC_HI
     | RENDER_DBIAS_IS_INT;
 
 const SAMPLER_SIZE: u64 = 8;
@@ -214,7 +216,7 @@ fn helper(raw: &[u8], offset: usize) -> UapiHelperProgram {
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct UapiProgram {
     pub(crate) usc: u32,
-    pub(crate) resource_spec: u32,
+    pub(crate) resource_spec: u64,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -242,10 +244,11 @@ fn timestamps(raw: &[u8], offset: usize) -> UapiTimestamps {
     }
 }
 
-fn program(raw: &[u8], offset: usize) -> UapiProgram {
+fn program(raw: &[u8], offset: usize, high_offset: usize) -> UapiProgram {
     UapiProgram {
         usc: get_u32(raw, offset),
-        resource_spec: get_u32(raw, offset + 4),
+        resource_spec: get_u32(raw, offset + 4) as u64
+            | (get_u32(raw, high_offset) as u64) << 32,
     }
 }
 
@@ -330,10 +333,10 @@ impl UapiRenderCommand {
             sample_size: raw[0x9f],
             merge_upper_x: get_u32(&raw, 0xa0),
             merge_upper_y: get_u32(&raw, 0xa4),
-            background: program(&raw, 0xa8),
-            end_of_tile: program(&raw, 0xb0),
-            partial_background: program(&raw, 0xb8),
-            partial_end_of_tile: program(&raw, 0xc0),
+            background: program(&raw, 0xa8, 0xf8),
+            end_of_tile: program(&raw, 0xb0, 0xf0),
+            partial_background: program(&raw, 0xb8, 0xfc),
+            partial_end_of_tile: program(&raw, 0xc0, 0xf4),
             depth_clear: get_u32(&raw, 0xc8),
             stencil_clear: get_u32(&raw, 0xcc),
             vertex_timestamps: timestamps(&raw, 0xd0),
@@ -686,6 +689,17 @@ pub(crate) fn translate_render_command<A: GpuAddressSpace>(
     {
         return Err(UapiTranslateError::Flags);
     }
+    let has_resource_spec_high = [
+        command.background.resource_spec,
+        command.end_of_tile.resource_spec,
+        command.partial_background.resource_spec,
+        command.partial_end_of_tile.resource_spec,
+    ]
+    .iter()
+    .any(|value| value >> 32 != 0);
+    if has_resource_spec_high && command.flags & RENDER_RSRC_SPEC_HI == 0 {
+        return Err(UapiTranslateError::Flags);
+    }
     if !(1..=16_384).contains(&command.width) || !(1..=16_384).contains(&command.height) {
         return Err(UapiTranslateError::Dimensions);
     }
@@ -815,13 +829,13 @@ pub(crate) fn translate_render_command<A: GpuAddressSpace>(
     parameters.merge_upper_y_bits = command.merge_upper_y;
     parameters.depth_clear_value_bits = command.depth_clear;
     parameters.stencil_clear_value = command.stencil_clear;
-    parameters.load_pipeline_bind = BG_RESOURCE_PREFIX | command.background.resource_spec as u64;
+    parameters.load_pipeline_bind = BG_RESOURCE_PREFIX | command.background.resource_spec;
     parameters.load_pipeline = background;
-    parameters.store_pipeline_bind = command.end_of_tile.resource_spec as u64;
+    parameters.store_pipeline_bind = command.end_of_tile.resource_spec;
     parameters.store_pipeline = end_of_tile;
-    parameters.partial_load_pipeline_bind = command.partial_background.resource_spec as u64;
+    parameters.partial_load_pipeline_bind = command.partial_background.resource_spec;
     parameters.partial_load_pipeline = partial_background;
-    parameters.partial_store_pipeline_bind = command.partial_end_of_tile.resource_spec as u64;
+    parameters.partial_store_pipeline_bind = command.partial_end_of_tile.resource_spec;
     parameters.partial_store_pipeline = partial_end_of_tile;
 
     Ok(TranslatedRenderCommand {
@@ -1148,6 +1162,96 @@ mod tests {
         .unwrap();
         assert_eq!(fnv1a64(&tiling), 0x8581_5830_2d5b_e227);
         assert_eq!(fnv1a64(&fragment_raw), 0x6688_e9f8_d061_d776);
+    }
+
+    #[test]
+    fn render_resource_spec_high_dwords_reach_g17_register_programs() {
+        const RENDER_HEADER: usize = 64;
+        const PAYLOAD: usize = RENDER_HEADER + UAPI_COMMAND_HEADER_SIZE;
+        let mut extended = [0u8; RENDER_FIXTURE.len() + 16];
+        extended[..RENDER_FIXTURE.len()].copy_from_slice(&RENDER_FIXTURE);
+        extended[RENDER_HEADER + 2..RENDER_HEADER + 4]
+            .copy_from_slice(&(UAPI_RENDER_SIZE as u16).to_le_bytes());
+        extended[PAYLOAD..PAYLOAD + 4]
+            .copy_from_slice(&(RENDER_PROCESS_EMPTY_TILES | RENDER_RSRC_SPEC_HI).to_le_bytes());
+
+        for (offset, value) in [(0xac, 0x42), (0xb4, 0x40), (0xbc, 0x43), (0xc4, 0x41)] {
+            extended[PAYLOAD + offset..PAYLOAD + offset + 4]
+                .copy_from_slice(&(value as u32).to_le_bytes());
+        }
+        for (offset, value) in [
+            (0xf0, 0x0007_8000),
+            (0xf4, 0x0007_8001),
+            (0xf8, 0x0007_8002),
+            (0xfc, 0x0007_8003),
+        ] {
+            extended[PAYLOAD + offset..PAYLOAD + offset + 4]
+                .copy_from_slice(&(value as u32).to_le_bytes());
+        }
+
+        let mut parser = UapiCommandParser::new(&extended);
+        let (payload, vertex, fragment) = match parser.next_hardware().unwrap().unwrap() {
+            ParsedHardwareCommand::Render {
+                payload,
+                vertex_attachments,
+                fragment_attachments,
+                ..
+            } => (payload, vertex_attachments, fragment_attachments),
+            _ => panic!("wrong command kind"),
+        };
+        assert_eq!(parser.finish(), Ok(1));
+        let translated = translate_render_command(
+            payload,
+            vertex,
+            fragment,
+            window(),
+            &TestAddressSpace,
+            RenderInternalState {
+                parameters: G17pRenderParameters::source_rsrc8(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            translated.parameters.store_pipeline_bind,
+            0x0007_8000_0000_0040
+        );
+        assert_eq!(
+            translated.parameters.partial_store_pipeline_bind,
+            0x0007_8001_0000_0041
+        );
+        assert_eq!(
+            translated.parameters.load_pipeline_bind,
+            0x0007_8002_0000_0042
+        );
+        assert_eq!(
+            translated.parameters.partial_load_pipeline_bind,
+            0x0007_8003_0000_0043
+        );
+        let registers = g17_render::build_fragment_registers(&translated.parameters).unwrap();
+        assert_eq!(
+            registers
+                .iter()
+                .find(|register| register.number == 0x15369)
+                .unwrap()
+                .value,
+            0x0007_8002_0000_0042
+        );
+
+        let mut no_flag = payload;
+        no_flag.flags &= !RENDER_RSRC_SPEC_HI;
+        assert_eq!(
+            translate_render_command(
+                no_flag,
+                vertex,
+                fragment,
+                window(),
+                &TestAddressSpace,
+                RenderInternalState {
+                    parameters: G17pRenderParameters::source_rsrc8(),
+                },
+            ),
+            Err(UapiTranslateError::Flags)
+        );
     }
 
     #[test]
