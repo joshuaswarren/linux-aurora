@@ -32,6 +32,61 @@ pub(crate) trait AscCpuLifecycle {
     fn stop_cpu(&self) -> Result<(), Self::Error>;
 }
 
+/// Owned pair of provider handles whose CPUs are running.
+///
+/// Construction starts GFX before GFX1. Dropping the owner always attempts to
+/// stop GFX1 before GFX, so a platform driver can retain the pair for its
+/// entire bound lifetime without duplicating partial-start rollback logic.
+pub(crate) struct StartedCpuPair<P: AscCpuLifecycle> {
+    gfx: P,
+    gfx1: P,
+}
+
+impl<P: AscCpuLifecycle> StartedCpuPair<P> {
+    /// Start both provider-owned CPUs and return their retained owner.
+    pub(crate) fn start(gfx: P, gfx1: P) -> Result<Self, P::Error> {
+        gfx.start_cpu()?;
+        if let Err(err) = gfx1.start_cpu() {
+            let _ = gfx.stop_cpu();
+            return Err(err);
+        }
+
+        Ok(Self { gfx, gfx1 })
+    }
+}
+
+impl<P: AscCpuLifecycle> Drop for StartedCpuPair<P> {
+    fn drop(&mut self) {
+        let _ = self.gfx1.stop_cpu();
+        let _ = self.gfx.stop_cpu();
+    }
+}
+
+/// Operations needed to dismantle a retained G17P runtime.
+///
+/// Keeping the ordering in this testable helper makes the platform owner's
+/// `Drop` path explicit: hardware registration disappears before its storage,
+/// transports disappear before their CPUs stop, and manager resources are
+/// released last.
+pub(crate) trait PersistentRuntimeTeardown {
+    fn unregister_queue(&mut self);
+    fn drop_queue(&mut self);
+    fn drop_gfx1_rtkit(&mut self);
+    fn drop_gfx_rtkit(&mut self);
+    fn drop_cpu_pair(&mut self);
+    fn drop_manager(&mut self);
+}
+
+/// Tear down retained runtime state in the reverse of acquisition order.
+pub(crate) fn teardown_persistent_runtime<T: PersistentRuntimeTeardown>(owner: &mut T) {
+    owner.unregister_queue();
+    owner.drop_queue();
+    owner.drop_gfx1_rtkit();
+    owner.drop_gfx_rtkit();
+    owner.drop_cpu_pair();
+    owner.drop_manager();
+}
+
 /// Start GFX then GFX1, run `body`, and stop GFX1 then GFX.
 ///
 /// Every path after GFX starts attempts its matching stop. A GFX1 start error
@@ -74,6 +129,12 @@ mod tests {
         Start(Role),
         Body,
         Stop(Role),
+        UnregisterQueue,
+        DropQueue,
+        DropGfx1Rtkit,
+        DropGfxRtkit,
+        DropCpuPair,
+        DropManager,
     }
 
     #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -247,6 +308,124 @@ mod tests {
                 Event::Body,
                 Event::Stop(Role::Gfx1),
                 Event::Stop(Role::Gfx),
+            ]
+        );
+    }
+
+    #[test]
+    fn retained_pair_stays_started_until_owner_drop() {
+        let state = State {
+            failure: None,
+            trace: RefCell::new(std::vec::Vec::new()),
+        };
+        let pair = StartedCpuPair::start(
+            MockCpu {
+                role: Role::Gfx,
+                state: &state,
+            },
+            MockCpu {
+                role: Role::Gfx1,
+                state: &state,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            *state.trace.borrow(),
+            [Event::Start(Role::Gfx), Event::Start(Role::Gfx1)]
+        );
+        drop(pair);
+        assert_eq!(
+            state.trace.into_inner(),
+            [
+                Event::Start(Role::Gfx),
+                Event::Start(Role::Gfx1),
+                Event::Stop(Role::Gfx1),
+                Event::Stop(Role::Gfx),
+            ]
+        );
+    }
+
+    #[test]
+    fn retained_pair_rolls_back_primary_when_secondary_start_fails() {
+        let state = State {
+            failure: Some(Failure::StartGfx1),
+            trace: RefCell::new(std::vec::Vec::new()),
+        };
+        let result = StartedCpuPair::start(
+            MockCpu {
+                role: Role::Gfx,
+                state: &state,
+            },
+            MockCpu {
+                role: Role::Gfx1,
+                state: &state,
+            },
+        );
+
+        match result {
+            Err(TestError::StartGfx1) => {}
+            Err(other) => panic!("unexpected start error: {other:?}"),
+            Ok(pair) => {
+                drop(pair);
+                panic!("secondary start unexpectedly succeeded");
+            }
+        }
+        assert_eq!(
+            *state.trace.borrow(),
+            [
+                Event::Start(Role::Gfx),
+                Event::Start(Role::Gfx1),
+                Event::Stop(Role::Gfx),
+            ]
+        );
+    }
+
+    struct MockRuntimeTeardown {
+        trace: std::vec::Vec<Event>,
+    }
+
+    impl PersistentRuntimeTeardown for MockRuntimeTeardown {
+        fn unregister_queue(&mut self) {
+            self.trace.push(Event::UnregisterQueue);
+        }
+
+        fn drop_queue(&mut self) {
+            self.trace.push(Event::DropQueue);
+        }
+
+        fn drop_gfx1_rtkit(&mut self) {
+            self.trace.push(Event::DropGfx1Rtkit);
+        }
+
+        fn drop_gfx_rtkit(&mut self) {
+            self.trace.push(Event::DropGfxRtkit);
+        }
+
+        fn drop_cpu_pair(&mut self) {
+            self.trace.push(Event::DropCpuPair);
+        }
+
+        fn drop_manager(&mut self) {
+            self.trace.push(Event::DropManager);
+        }
+    }
+
+    #[test]
+    fn persistent_runtime_teardown_is_strictly_reverse_ordered() {
+        let mut owner = MockRuntimeTeardown {
+            trace: std::vec::Vec::new(),
+        };
+        teardown_persistent_runtime(&mut owner);
+        assert_eq!(
+            owner.trace,
+            [
+                Event::UnregisterQueue,
+                Event::DropQueue,
+                Event::DropGfx1Rtkit,
+                Event::DropGfxRtkit,
+                Event::DropCpuPair,
+                Event::DropManager,
             ]
         );
     }

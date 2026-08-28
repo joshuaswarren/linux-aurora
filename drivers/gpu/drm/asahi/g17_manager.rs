@@ -317,6 +317,8 @@ pub(crate) struct G17PSksmQueue {
     queue_id: u8,
     scratch: G17SksmScratchGeometry,
     uat_owner: u64,
+    disable_pair: g17_submission::G17SksmOrderedWritePair,
+    registered: bool,
     storage: g17_resources::G17PClRuntimeStorage,
     producer: g17_submission::G17PClKickProducerState,
     b2_activation: g17_submission::G17PClB2ActivationState,
@@ -401,6 +403,8 @@ impl G17PManagerConstruction {
             queue_id: routing.queue_id,
             scratch: self.sksm_scratch(),
             uat_owner: self.uat().ttb_base(),
+            disable_pair: config.disable_pair,
+            registered: true,
             storage,
             producer: g17_submission::G17PClKickProducerState {
                 queue_id,
@@ -422,6 +426,25 @@ impl G17PManagerConstruction {
         })
     }
 
+    /// Remove a retained queue from the hardware bridge before releasing its
+    /// backing storage. Repeated teardown is harmless.
+    pub(crate) fn unregister_compute_sksm_queue(
+        &self,
+        registers: &regs::Resources,
+        queue: &mut G17PSksmQueue,
+    ) -> Result {
+        if queue.scratch != self.sksm_scratch() || queue.uat_owner != self.uat().ttb_base() {
+            return Err(EINVAL);
+        }
+        if !queue.registered {
+            return Ok(());
+        }
+
+        registers.g17p_sksm_publish_write_pair(queue.disable_pair)?;
+        queue.registered = false;
+        Ok(())
+    }
+
     /// Publish one complete CL entry, then perform the queue's ordered SKSM
     /// notification. The first post-registration entry publishes the retained
     /// B2 state; later entries keep those provider-owned pages unchanged.
@@ -431,7 +454,10 @@ impl G17PManagerConstruction {
         queue: &mut G17PSksmQueue,
         operands: g17_submission::G17PClKickEntryOperands<'_>,
     ) -> Result<u64> {
-        if queue.scratch != self.sksm_scratch() || queue.uat_owner != self.uat().ttb_base() {
+        if !queue.registered
+            || queue.scratch != self.sksm_scratch()
+            || queue.uat_owner != self.uat().ttb_base()
+        {
             return Err(EINVAL);
         }
         let prepared = g17_submission::prepare_g17p_cl_kick_entry(queue.producer, operands)
@@ -472,7 +498,10 @@ impl G17PManagerConstruction {
         queue: &mut G17PSksmQueue,
         completed_count: u32,
     ) -> Result {
-        if queue.scratch != self.sksm_scratch() || queue.uat_owner != self.uat().ttb_base() {
+        if !queue.registered
+            || queue.scratch != self.sksm_scratch()
+            || queue.uat_owner != self.uat().ttb_base()
+        {
             return Err(EINVAL);
         }
         queue.producer = g17_submission::complete_g17p_cl_kicks(queue.producer, completed_count)
@@ -488,7 +517,10 @@ impl G17PManagerConstruction {
         queue: &mut G17PSksmQueue,
         add_count: u32,
     ) -> Result {
-        if queue.scratch != self.sksm_scratch() || queue.uat_owner != self.uat().ttb_base() {
+        if !queue.registered
+            || queue.scratch != self.sksm_scratch()
+            || queue.uat_owner != self.uat().ttb_base()
+        {
             return Err(EINVAL);
         }
 
