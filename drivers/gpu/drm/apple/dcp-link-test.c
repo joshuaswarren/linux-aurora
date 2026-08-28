@@ -80,6 +80,42 @@ static void apple_dcp_h17p_method_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, apple_dcp_h17p_method(0, &method), -ENOENT);
 }
 
+static void apple_dcp_h17p_callback_method_test(struct kunit *test)
+{
+	struct apple_dcp_link_method method;
+
+	KUNIT_ASSERT_EQ(test,
+			apple_dcp_h17p_callback_method(
+				APPLE_DCP_H17P_CB_RT_BANDWIDTH, &method),
+			0);
+	KUNIT_EXPECT_EQ(test, method.input_size, 4U);
+	KUNIT_EXPECT_EQ(test, method.output_size, 20U);
+
+	KUNIT_ASSERT_EQ(test,
+			apple_dcp_h17p_callback_method(
+				APPLE_DCP_H17P_CB_HOTPLUG, &method),
+			0);
+	KUNIT_EXPECT_EQ(test, method.input_size, 88U);
+	KUNIT_EXPECT_EQ(test, method.output_size, 76U);
+
+	KUNIT_ASSERT_EQ(test,
+			apple_dcp_h17p_callback_method(
+				APPLE_DCP_H17P_CB_SWAP_INFO, &method),
+			0);
+	KUNIT_EXPECT_EQ(test, method.input_size, 228U);
+	KUNIT_EXPECT_EQ(test, method.output_size, 224U);
+
+	KUNIT_ASSERT_EQ(test,
+			apple_dcp_h17p_callback_method(
+				APPLE_DCP_H17P_CB_SWAP_COMPLETE, &method),
+			0);
+	KUNIT_EXPECT_EQ(test, method.input_size, 1840U);
+	KUNIT_EXPECT_EQ(test, method.output_size, 0U);
+
+	KUNIT_EXPECT_EQ(test, apple_dcp_h17p_callback_method(0, &method),
+			-ENOENT);
+}
+
 static void apple_dcp_link_init_message_test(struct kunit *test)
 {
 	u64 message;
@@ -288,6 +324,7 @@ static struct kunit_case apple_dcp_link_test_cases[] = {
 	KUNIT_CASE(apple_dcp_link_init_desc_test),
 	KUNIT_CASE(apple_dcp_link_stream_layout_test),
 	KUNIT_CASE(apple_dcp_h17p_method_test),
+	KUNIT_CASE(apple_dcp_h17p_callback_method_test),
 	KUNIT_CASE(apple_dcp_link_init_message_test),
 	KUNIT_CASE(apple_dcp_link_ready_message_test),
 	KUNIT_CASE(apple_dcp_link_rpc_header_test),

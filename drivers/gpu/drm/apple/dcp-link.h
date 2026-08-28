@@ -44,6 +44,43 @@
 
 #define APPLE_DCP_LINK_CALL_D003		0x44303033
 
+enum apple_dcp_h17p_callback {
+	APPLE_DCP_H17P_CB_DID_BOOT = 0x44303030,
+	APPLE_DCP_H17P_CB_DID_POWER_ON = 0x44303031,
+	APPLE_DCP_H17P_CB_WILL_POWER_OFF = 0x44303032,
+	APPLE_DCP_H17P_CB_RT_BANDWIDTH = APPLE_DCP_LINK_CALL_D003,
+	APPLE_DCP_H17P_CB_FRAME_SYNC = 0x44303036,
+	APPLE_DCP_H17P_CB_MATCH_PMU = 0x44313030,
+	APPLE_DCP_H17P_CB_START_HARDWARE_BOOT = 0x44313230,
+	APPLE_DCP_H17P_CB_ALLOCATE_BANDWIDTH = 0x44313239,
+	APPLE_DCP_H17P_CB_MAP_BUF = 0x44323031,
+	APPLE_DCP_H17P_CB_UNMAP_BUF = 0x44323032,
+	APPLE_DCP_H17P_CB_MATCH_PMU_2 = 0x44323036,
+	APPLE_DCP_H17P_CB_MATCH_BACKLIGHT = 0x44323037,
+	APPLE_DCP_H17P_CB_GET_TIME = 0x44323039,
+	APPLE_DCP_H17P_CB_PROP_PUBLISH = 0x44333030,
+	APPLE_DCP_H17P_CB_GET_UINT_PROP = 0x44343031,
+	APPLE_DCP_H17P_CB_GET_FREQUENCY = 0x44343038,
+	APPLE_DCP_H17P_CB_MAP_REG = 0x44343131,
+	APPLE_DCP_H17P_CB_SET_PROPERTY_INT = 0x44343134,
+	APPLE_DCP_H17P_CB_SET_PROPERTY_BOOL = 0x44343135,
+	APPLE_DCP_H17P_CB_ALLOCATE_BUFFER = 0x44343531,
+	APPLE_DCP_H17P_CB_MAP_PHYSICAL = 0x44343532,
+	APPLE_DCP_H17P_CB_RELEASE_MEM_DESC = 0x44343534,
+	APPLE_DCP_H17P_CB_POWER_UP_DART = 0x44353732,
+	APPLE_DCP_H17P_CB_HOTPLUG = 0x44353735,
+	APPLE_DCP_H17P_CB_POWERSTATE_NOTIFY = 0x44353736,
+	APPLE_DCP_H17P_CB_CREATE_DEFAULT_FB = 0x44353836,
+	APPLE_DCP_H17P_CB_CLEAR_DEFAULT_FB = 0x44353837,
+	APPLE_DCP_H17P_CB_SWAP_NOTIFY = 0x44353838,
+	APPLE_DCP_H17P_CB_SWAP_INFO = 0x44353839,
+	APPLE_DCP_H17P_CB_SWAP_COMPLETE = 0x44353934,
+	APPLE_DCP_H17P_CB_BATCHED_SWAP_COMPLETE = 0x44353935,
+	APPLE_DCP_H17P_CB_SWAP_COMPLETE_INTENT = 0x44353936,
+	APPLE_DCP_H17P_CB_ABORT_SWAP = 0x44353937,
+	APPLE_DCP_H17P_CB_ENABLE_BACKLIGHT = 0x44353938,
+};
+
 enum apple_dcp_h17p_call {
 	APPLE_DCP_H17P_CALL_UP_SET_CREATE_DFB = 0x41333839,
 	APPLE_DCP_H17P_CALL_START_SIGNAL = 0x41343031,
@@ -127,6 +164,119 @@ static_assert(APPLE_DCP_LINK_STREAM_BUFFER_SIZE *
 	      APPLE_DCP_LINK_STREAM_HALF_SIZE);
 static_assert(APPLE_DCP_LINK_HEAP_OFFSET + APPLE_DCP_LINK_HEAP_SIZE ==
 	      APPLE_DCP_LINK_RPC_MEMORY_SIZE);
+
+static inline int
+apple_dcp_h17p_callback_method(u32 call, struct apple_dcp_link_method *method)
+{
+	struct apple_dcp_link_method found = { .call = call };
+
+	if (!method)
+		return -EINVAL;
+
+	switch (call) {
+	case APPLE_DCP_H17P_CB_WILL_POWER_OFF:
+	case APPLE_DCP_H17P_CB_MATCH_PMU:
+	case APPLE_DCP_H17P_CB_CLEAR_DEFAULT_FB:
+		break;
+	case APPLE_DCP_H17P_CB_DID_BOOT:
+	case APPLE_DCP_H17P_CB_DID_POWER_ON:
+	case APPLE_DCP_H17P_CB_START_HARDWARE_BOOT:
+	case APPLE_DCP_H17P_CB_MATCH_PMU_2:
+	case APPLE_DCP_H17P_CB_MATCH_BACKLIGHT:
+		found.output_size = 4;
+		break;
+	case APPLE_DCP_H17P_CB_RT_BANDWIDTH:
+		found.input_size = 4;
+		found.output_size = 20;
+		break;
+	case APPLE_DCP_H17P_CB_FRAME_SYNC:
+		found.input_size = 84;
+		found.output_size = 80;
+		break;
+	case APPLE_DCP_H17P_CB_ALLOCATE_BANDWIDTH:
+		found.input_size = 28;
+		found.output_size = 20;
+		break;
+	case APPLE_DCP_H17P_CB_MAP_BUF:
+		found.input_size = 12;
+		found.output_size = 16;
+		break;
+	case APPLE_DCP_H17P_CB_UNMAP_BUF:
+	case APPLE_DCP_H17P_CB_SWAP_NOTIFY:
+		found.input_size = 24;
+		break;
+	case APPLE_DCP_H17P_CB_GET_TIME:
+		found.output_size = 8;
+		break;
+	case APPLE_DCP_H17P_CB_POWERSTATE_NOTIFY:
+	case APPLE_DCP_H17P_CB_ABORT_SWAP:
+	case APPLE_DCP_H17P_CB_ENABLE_BACKLIGHT:
+		found.input_size = 4;
+		break;
+	case APPLE_DCP_H17P_CB_PROP_PUBLISH:
+		found.input_size = 16;
+		break;
+	case APPLE_DCP_H17P_CB_SWAP_COMPLETE:
+		found.input_size = 1840;
+		break;
+	case APPLE_DCP_H17P_CB_SWAP_COMPLETE_INTENT:
+		found.input_size = 20;
+		break;
+	case APPLE_DCP_H17P_CB_GET_UINT_PROP:
+		found.input_size = 80;
+		found.output_size = 12;
+		break;
+	case APPLE_DCP_H17P_CB_GET_FREQUENCY:
+		found.input_size = 8;
+		found.output_size = 8;
+		break;
+	case APPLE_DCP_H17P_CB_MAP_REG:
+		found.input_size = 16;
+		found.output_size = 28;
+		break;
+	case APPLE_DCP_H17P_CB_SET_PROPERTY_INT:
+		found.input_size = 80;
+		found.output_size = 4;
+		break;
+	case APPLE_DCP_H17P_CB_SET_PROPERTY_BOOL:
+		found.input_size = 76;
+		found.output_size = 4;
+		break;
+	case APPLE_DCP_H17P_CB_ALLOCATE_BUFFER:
+		found.input_size = 20;
+		found.output_size = 20;
+		break;
+	case APPLE_DCP_H17P_CB_MAP_PHYSICAL:
+		found.input_size = 8;
+		found.output_size = 4;
+		break;
+	case APPLE_DCP_H17P_CB_RELEASE_MEM_DESC:
+	case APPLE_DCP_H17P_CB_POWER_UP_DART:
+		found.input_size = 4;
+		found.output_size = 4;
+		break;
+	case APPLE_DCP_H17P_CB_HOTPLUG:
+		found.input_size = 88;
+		found.output_size = 76;
+		break;
+	case APPLE_DCP_H17P_CB_CREATE_DEFAULT_FB:
+		found.input_size = 8;
+		found.output_size = 4;
+		break;
+	case APPLE_DCP_H17P_CB_SWAP_INFO:
+		found.input_size = 228;
+		found.output_size = 224;
+		break;
+	case APPLE_DCP_H17P_CB_BATCHED_SWAP_COMPLETE:
+		found.output_size = 1024;
+		break;
+	default:
+		return -ENOENT;
+	}
+
+	*method = found;
+	return 0;
+}
 
 static inline int
 apple_dcp_link_stream_layout(enum apple_dcp_link_side side, u8 stream,
