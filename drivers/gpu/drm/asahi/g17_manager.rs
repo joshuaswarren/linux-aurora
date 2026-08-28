@@ -355,39 +355,26 @@ impl G17PManagerConstruction {
 
     /// Configure one SKSM queue through resource 0 and return its registered
     /// state only after the QID-valid bit is published.
-    pub(crate) fn configure_sksm_queue(
+    pub(crate) fn configure_compute_sksm_queue(
         &self,
         registers: &regs::Resources,
-        queue_id: u8,
-        data_master: u32,
-        completion_selector: u32,
-        entry_gpu_va: u64,
+        routing: g17_submission::G17PComputeQueueRouting,
     ) -> Result<G17PSksmQueue> {
-        let config = g17_submission::prepare_g17p_sksm_queue_config(
-            g17_submission::G17ChannelAbiTarget::A18ProG17P,
-            queue_id,
-            data_master,
-            completion_selector,
-            entry_gpu_va,
-            self.sksm_scratch(),
-        )
-        .map_err(|_| EINVAL)?;
+        let config =
+            g17_submission::prepare_g17p_compute_sksm_queue_config(routing, self.sksm_scratch())
+                .map_err(|_| EINVAL)?;
 
-        registers.g17p_sksm_configure_queue(
-            config.write_pair(),
-            config.enable_mask_offset,
-            config.enable_mask,
-        )?;
+        registers.g17p_sksm_configure_queue(config.write_pair(), config.enable_pair)?;
 
         Ok(G17PSksmQueue {
-            queue_id,
+            queue_id: routing.queue_id,
             scratch: self.sksm_scratch(),
             uat_owner: self.uat().ttb_base(),
         })
     }
 
     /// Publish newly appended kicks for a queue returned by
-    /// [`Self::configure_sksm_queue`].
+    /// [`Self::configure_compute_sksm_queue`].
     pub(crate) fn add_sksm_kicks(
         &self,
         registers: &regs::Resources,
@@ -540,7 +527,7 @@ mod tests {
     }
 
     #[test]
-    fn non_t8140_identity_and_uat_geometry_are_rejected() {
+    fn non_t8140_identity_and_uat_geometry_are_invalid() {
         let mut observed = target();
         observed.chip_id = 0x8142;
         assert_eq!(validate_target(observed), Err(ConstructionError::WrongChip));
@@ -575,7 +562,7 @@ mod tests {
     }
 
     #[test]
-    fn split_null_or_wrong_role_uat_is_rejected() {
+    fn split_null_or_wrong_role_uat_is_invalid() {
         let mut observed = resources();
         observed.primary_uat_owner = 0;
         assert_eq!(
@@ -599,7 +586,7 @@ mod tests {
     }
 
     #[test]
-    fn root_or_shared_cluster_mismatch_is_rejected() {
+    fn root_or_shared_cluster_mismatch_is_invalid() {
         let mut observed = resources();
         observed.secondary_root += 0x4000;
         assert_eq!(

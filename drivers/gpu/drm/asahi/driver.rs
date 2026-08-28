@@ -270,22 +270,23 @@ fn refuse_agx3_probe(pdev: &platform::Device<Core>, soc: &'static hw::agx3::SocC
     // T8140 topology admission is the first target-specific operation.  It
     // reads only DT properties and must complete before reserved-memory
     // mapping, SGX MMIO mapping/readback, DMA setup, or any live-boot action.
-    let t8140_topology =
-        if expected.gpu_gen == hw::GpuGen::G17 && expected.gpu_variant == identity::GpuVariant::P {
-            match admit_t8140_live_topology(pdev, &expected) {
-                Ok(admission) => Some(admission),
-                Err(e) => {
-                    dev_err!(
-                        pdev.as_ref(),
-                        "G17P: exact provider-owned T8140 topology rejected before effects: {:?}\n",
-                        e
-                    );
-                    return ENODEV;
-                }
+    let exact_t8140_target =
+        expected.gpu_gen == hw::GpuGen::G17 && expected.gpu_variant == identity::GpuVariant::P;
+    let t8140_topology = if exact_t8140_target {
+        match admit_t8140_live_topology(pdev, &expected) {
+            Ok(admission) => Some(admission),
+            Err(e) => {
+                dev_err!(
+                    pdev.as_ref(),
+                    "G17P: exact provider-owned T8140 topology was invalid before effects: {:?}\n",
+                    e
+                );
+                return ENODEV;
             }
-        } else {
-            None
-        };
+        }
+    } else {
+        None
+    };
 
     // The G17S loaded-firmware handoff is reserved memory, not GPU MMIO. It
     // must be mapped and hashed before touching the SGX register aperture so
@@ -306,7 +307,7 @@ fn refuse_agx3_probe(pdev: &platform::Device<Core>, soc: &'static hw::agx3::SocC
             Err(e) => {
                 dev_err!(
                     pdev.as_ref(),
-                    "G17S: loaded-segment firmware identity rejected; refusing before SGX MMIO: {:?}\n",
+                    "G17S: loaded-segment firmware identity was invalid; stopping before SGX MMIO: {:?}\n",
                     e
                 );
                 return ENODEV;
@@ -382,7 +383,7 @@ fn refuse_agx3_probe(pdev: &platform::Device<Core>, soc: &'static hw::agx3::SocC
 }
 
 /// Report the grounded-vs-UNKNOWN state of the single-role G15 (M3) boot, then
-/// reject the probe. G15 is the easiest AGX3 target — one `GFX` role, classic
+/// stop the probe. G15 is the easiest AGX3 target — one `GFX` role, classic
 /// device-control-ring submission — but the firmware image is not on disk and
 /// the init-data/RTKit graph is not boot-complete offline.
 fn refuse_g15_probe(pdev: &platform::Device<Core>) -> Error {
@@ -752,7 +753,7 @@ fn refuse_g17_probe(
             ),
             Err(e) => dev_err!(
                 pdev.as_ref(),
-                "G17P manager inputs rejected before resource allocation: {:?}\n",
+                "G17P manager inputs were invalid before resource allocation: {:?}\n",
                 e
             ),
         }

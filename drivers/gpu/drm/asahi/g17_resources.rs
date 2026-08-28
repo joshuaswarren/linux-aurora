@@ -433,7 +433,7 @@ mod tests {
     }
 
     #[test]
-    fn split_or_null_uat_owner_fails_closed() {
+    fn split_or_null_uat_owner_is_invalid() {
         let mut handoff = valid_handoff();
         handoff.secondary.uat_owner += 0x4000;
         assert_eq!(
@@ -447,7 +447,7 @@ mod tests {
     }
 
     #[test]
-    fn cross_role_or_aliased_resources_fail_closed() {
+    fn cross_role_or_aliased_resources_are_invalid() {
         let mut handoff = valid_handoff();
         handoff.primary.role = InstanceRole::Secondary;
         assert_eq!(validate_handoff(&handoff), Err(ResourceError::WrongRole));
@@ -462,7 +462,7 @@ mod tests {
     }
 
     #[test]
-    fn role_specific_status_and_extra_relations_fail_closed() {
+    fn role_specific_status_and_extra_relations_are_invalid() {
         let mut handoff = valid_handoff();
         handoff.secondary.instance.status_b = KERN + 0x4000;
         assert_eq!(validate_handoff(&handoff), Err(ResourceError::RoleLayout));

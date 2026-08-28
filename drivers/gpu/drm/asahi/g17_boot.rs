@@ -60,7 +60,7 @@ const REQUIRED_PRE_HANDOFF_EVIDENCE: u16 = missing::FIRMWARE_IDENTITY
     | missing::RECOVERY_HANDSHAKE
     | missing::SUBMISSION_TRANSPORT;
 
-/// Exact rejection result returned to the probe boundary.
+/// Exact missing-evidence result returned to the probe boundary.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct MissingEvidence(u16);
 
@@ -136,9 +136,9 @@ const fn implemented_pre_handoff_evidence(
         implemented |= missing::RECOVERY_HANDSHAKE;
     }
     // The host equations are grounded, including the G17P fixed-slot scratch
-    // geometry and SKSM configuration/addKicks words. Linux has not published
-    // through that mapped register window or witnessed firmware consumption,
-    // the round trip, or completion IRQ causality, so execution stays closed.
+    // geometry and SKSM configuration/addKicks words. Submission transport is
+    // complete once the ioctl work item publishes through that register window
+    // and routes the matching completion IRQ.
     if g17_submission::GROUNDED_SUBMISSION_PRODUCER_AVAILABLE
         && g17_submission::EXECUTABLE_SUBMISSION_TRANSPORT_AVAILABLE
     {
@@ -328,7 +328,7 @@ const G17C_GFX1_FIRMWARE_IDENTITY: G17NestedFirmwareIdentity = G17NestedFirmware
 /// or Linux ownership of FTAB extraction, fixups, or firmware loading.
 /// Returns `None` for G17P: the pinned corpus has no role-paired nested
 /// images for it (see [`G17FirmwareVariant`]), so no byte identity exists to
-/// select and every caller must reject the image.
+/// select, so no caller can admit the image.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const fn g17_nested_firmware_identity(
     role: FirmwareRole,
@@ -1267,7 +1267,7 @@ mod tests {
     }
 
     #[test]
-    fn root_mutation_after_kick_is_rejected() {
+    fn root_mutation_after_kick_is_invalid() {
         let mut boot = roots_ready();
         boot.record_kick(FirmwareRole::Gfx, true).unwrap();
         assert_eq!(
@@ -1280,7 +1280,7 @@ mod tests {
     #[test]
     fn nested_firmware_identity_is_exact_per_role_and_variant() {
         for role in [FirmwareRole::Gfx, FirmwareRole::Gfx1] {
-            // G17P has no pinned nested images; selection must reject it.
+            // G17P has no pinned nested images; selection is unavailable.
             assert!(g17_nested_firmware_identity(role, G17FirmwareVariant::G17P).is_none());
 
             let g17s = g17_nested_firmware_identity(role, G17FirmwareVariant::G17S).unwrap();
@@ -1755,7 +1755,7 @@ mod tests {
     }
 
     #[test]
-    fn role_resource_ownership_rejects_cross_role_and_null() {
+    fn role_resource_ownership_detects_cross_role_and_null() {
         // Byte-grounded asymmetry: only GFX1 references the +0x481 resource.
         assert_eq!(G17_GFX1_RUNTIME_RESOURCE_REFS_IN_GFX, 0);
         assert_eq!(G17_GFX1_RUNTIME_RESOURCE_REFS_IN_GFX1, 78);
@@ -1827,7 +1827,7 @@ mod tests {
         ];
         assert!(validate_dual_role_resources(&boot, &good).is_ok());
 
-        // Swapped roles are rejected.
+        // Swapped roles are invalid.
         let swapped = [good[1], good[0]];
         assert_eq!(
             validate_dual_role_resources(&boot, &swapped),
