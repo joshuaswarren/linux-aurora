@@ -38,8 +38,10 @@
 //! MMIO scratch registers. The host publication form, runtime scratch geometry,
 //! and resource-0 ordered writer are implemented. J700 has completed the
 //! channel-doorbell round trip with exact compute output across a retained CL2
-//! queue. The native graphics `addKicks` round trip and Linux completion IRQ
-//! ingress still need their on-device proofs. See [`SUBMISSION_LIVE_GAPS`].
+//! queue, and the measured first-partial path has executed graphics through
+//! the classic channel transport. Linux still needs that contract wired into
+//! its runtime and completion IRQ ingress. The native kext `addKicks` path is
+//! tracked independently. See [`SUBMISSION_LIVE_GAPS`].
 
 #[cfg(not(test))]
 use crate::g17_manager::G17SksmScratchGeometry;
@@ -185,6 +187,12 @@ pub(crate) enum SubmissionError {
     CommandHeaderTooShort,
     /// A first-render status pointer overflowed while deriving the FWCtl VAs.
     PartialOpeningAddressOverflow,
+    /// A first-render scheduler or index mapping is not exactly one 16 KiB page.
+    PartialOpeningPageSize,
+    /// A first-render outer-channel counter has bits outside the 8-bit ring index.
+    PartialOpeningChannelCounterOutOfRange,
+    /// A first-render queue head does not fit the outer slot's 16-bit field.
+    PartialOpeningQueueHeadOutOfRange,
     /// The host/firmware meaning of this in-range top-level tag is unresolved.
     CommandTagUnresolved,
     /// This value is not a grounded G17P top-level command tag.
@@ -617,6 +625,10 @@ pub(crate) const G17P_PARTIAL_OPENING_CONTROL_MESSAGE_SIZE: u64 = 0x40;
 pub(crate) const G17P_PARTIAL_OPENING_WORK_DOORBELL_CHANNEL: u8 = 8;
 pub(crate) const G17P_PARTIAL_OPENING_PAIRED_DOORBELL: u64 =
     MSG_TX_DOORBELL | G17P_PARTIAL_OPENING_WORK_DOORBELL_CHANNEL as u64;
+pub(crate) const G17P_PARTIAL_OPENING_OUTER_SLOT_SIZE: usize = 0x18;
+pub(crate) const G17P_PARTIAL_OPENING_OUTER_SLOT_COUNT: u32 = 0x100;
+pub(crate) const G17P_PARTIAL_OPENING_TILING_CHANNEL_TABLE_INDEX: u8 = 6;
+pub(crate) const G17P_PARTIAL_OPENING_FRAGMENT_CHANNEL_TABLE_INDEX: u8 = 7;
 
 /// Root, queue, and scheduler identities at the proven first-work boundary.
 /// Linux owns the backing pages; the physical addresses from the m1n1 run are
@@ -666,19 +678,30 @@ pub(crate) struct G17PPartialOpeningStatusWrite {
     pub(crate) value: u64,
 }
 
-/// State required to prepare one half of the paired classic channel publish.
+/// State required to prepare one half of the paired outer-channel publish.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub(crate) struct G17PPartialOpeningChannelState {
+pub(crate) struct G17PPartialOpeningOuterChannelState {
+    pub(crate) consumers: [u32; 2],
     pub(crate) producer: u32,
-    pub(crate) consumer: u32,
-    pub(crate) ring_entry_count: u32,
+    pub(crate) queue_gpu_va: u64,
+    pub(crate) queue_write_index: u32,
+}
+
+/// One complete 0x18-byte outer slot followed by its producer publication.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PPartialOpeningOuterSlotPlan {
+    pub(crate) channel_table_index: u8,
+    pub(crate) slot_index: u8,
+    pub(crate) slot_byte_offset: u32,
+    pub(crate) slot: [u8; G17P_PARTIAL_OPENING_OUTER_SLOT_SIZE],
+    pub(crate) next_producer: u32,
 }
 
 /// The two producer writes and the single mailbox kick for first graphics.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct PreparedG17PPartialOpeningWorkPair {
-    pub(crate) fragment: G17PChannelWritePlan,
-    pub(crate) tiling: G17PChannelWritePlan,
+    pub(crate) fragment: G17PPartialOpeningOuterSlotPlan,
+    pub(crate) tiling: G17PPartialOpeningOuterSlotPlan,
     pub(crate) paired_doorbell: u64,
 }
 
@@ -714,26 +737,52 @@ pub(crate) const G17P_PARTIAL_OPENING_PUBLICATION_ORDER: [G17PPartialOpeningPubl
 
 /// Build the computed one-record scheduler page that decided graphics entry in
 /// the successful post-control graft.
+pub(crate) fn apply_g17p_partial_opening_scheduler_page(
+    page: &mut [u8],
+) -> Result<(), SubmissionError> {
+    if page.len() != G17P_PARTIAL_OPENING_PAGE_SIZE {
+        return Err(SubmissionError::PartialOpeningPageSize);
+    }
+    page.fill(0);
+    put_u64_le(page, 0, G17P_PARTIAL_OPENING_SCHEDULER_WORD);
+    Ok(())
+}
+
+/// Array-returning form retained for host tests. Kernel mappings should use
+/// [`apply_g17p_partial_opening_scheduler_page`] to avoid a 16 KiB temporary.
 pub(crate) fn build_g17p_partial_opening_scheduler_page() -> [u8; G17P_PARTIAL_OPENING_PAGE_SIZE] {
     let mut page = [0u8; G17P_PARTIAL_OPENING_PAGE_SIZE];
-    put_u64_le(&mut page, 0, G17P_PARTIAL_OPENING_SCHEDULER_WORD);
+    let _ = apply_g17p_partial_opening_scheduler_page(&mut page);
     page
 }
 
 /// Build the eight-group context-2 primary index used by the proven opening.
-pub(crate) fn build_g17p_partial_opening_primary_index_page() -> [u8; G17P_PARTIAL_OPENING_PAGE_SIZE]
-{
-    let mut page = [0u8; G17P_PARTIAL_OPENING_PAGE_SIZE];
+pub(crate) fn apply_g17p_partial_opening_primary_index_page(
+    page: &mut [u8],
+) -> Result<(), SubmissionError> {
+    if page.len() != G17P_PARTIAL_OPENING_PAGE_SIZE {
+        return Err(SubmissionError::PartialOpeningPageSize);
+    }
+    page.fill(0);
     let mut index = 0usize;
     for (start, groups) in [(0x11u32, 6u32), (0x3cu32, 2u32)] {
         for group in 0..groups {
             let base = start + group * 5;
             for member in 0..4u32 {
-                put_u32_le(&mut page, index * 4, base + member);
+                put_u32_le(page, index * 4, base + member);
                 index += 1;
             }
         }
     }
+    Ok(())
+}
+
+/// Array-returning form retained for host tests. Kernel mappings should use
+/// [`apply_g17p_partial_opening_primary_index_page`] directly.
+pub(crate) fn build_g17p_partial_opening_primary_index_page() -> [u8; G17P_PARTIAL_OPENING_PAGE_SIZE]
+{
+    let mut page = [0u8; G17P_PARTIAL_OPENING_PAGE_SIZE];
+    let _ = apply_g17p_partial_opening_primary_index_page(&mut page);
     page
 }
 
@@ -773,27 +822,69 @@ pub(crate) const fn prepare_g17p_partial_opening_pre_0x84_status(
     ])
 }
 
-/// Couple the fragment-first/tiling-second channel writes to their one paired
-/// 0x83 notification. The caller performs the barriers in
-/// [`G17P_PARTIAL_OPENING_PUBLICATION_ORDER`].
-pub(crate) const fn prepare_g17p_partial_opening_work_pair(
-    fragment: G17PPartialOpeningChannelState,
-    tiling: G17PPartialOpeningChannelState,
+fn prepare_g17p_partial_opening_outer_slot(
+    state: G17PPartialOpeningOuterChannelState,
+    channel_table_index: u8,
+    queue_grid_index: u8,
+    kind: u32,
+) -> Result<G17PPartialOpeningOuterSlotPlan, SubmissionError> {
+    if state.producer >= G17P_PARTIAL_OPENING_OUTER_SLOT_COUNT
+        || state
+            .consumers
+            .iter()
+            .any(|consumer| *consumer >= G17P_PARTIAL_OPENING_OUTER_SLOT_COUNT)
+    {
+        return Err(SubmissionError::PartialOpeningChannelCounterOutOfRange);
+    }
+    if state.queue_write_index > u16::MAX as u32 {
+        return Err(SubmissionError::PartialOpeningQueueHeadOutOfRange);
+    }
+
+    let next_producer = (state.producer + 1) & 0xff;
+    if state.consumers.contains(&next_producer) {
+        return Err(SubmissionError::RingFull);
+    }
+
+    let mut slot = [0u8; G17P_PARTIAL_OPENING_OUTER_SLOT_SIZE];
+    put_u64_le(&mut slot, 0x08, state.queue_gpu_va);
+    put_u32_le(&mut slot, 0x10, kind);
+    put_u32_le(
+        &mut slot,
+        0x14,
+        state.queue_write_index | ((queue_grid_index as u32) << 16) | (1 << 24),
+    );
+
+    Ok(G17PPartialOpeningOuterSlotPlan {
+        channel_table_index,
+        slot_index: state.producer as u8,
+        slot_byte_offset: state.producer * G17P_PARTIAL_OPENING_OUTER_SLOT_SIZE as u32,
+        slot,
+        next_producer,
+    })
+}
+
+/// Couple the fragment-first/tiling-second outer slots to their one channel-8
+/// 0x83 notification. These are the initdata work rings at table indices 7 and
+/// 6, not the kext's separate 8-byte command-pointer rings. The caller performs
+/// the barriers in [`G17P_PARTIAL_OPENING_PUBLICATION_ORDER`].
+pub(crate) fn prepare_g17p_partial_opening_work_pair(
+    fragment: G17PPartialOpeningOuterChannelState,
+    tiling: G17PPartialOpeningOuterChannelState,
 ) -> Result<PreparedG17PPartialOpeningWorkPair, SubmissionError> {
-    let fragment = match prepare_g17p_channel_write(
-        G17ChannelAbiTarget::A18ProG17P,
-        fragment.producer,
-        fragment.consumer,
-        fragment.ring_entry_count,
+    let fragment = match prepare_g17p_partial_opening_outer_slot(
+        fragment,
+        G17P_PARTIAL_OPENING_FRAGMENT_CHANNEL_TABLE_INDEX,
+        1,
+        1,
     ) {
         Ok(value) => value,
         Err(error) => return Err(error),
     };
-    let tiling = match prepare_g17p_channel_write(
-        G17ChannelAbiTarget::A18ProG17P,
-        tiling.producer,
-        tiling.consumer,
-        tiling.ring_entry_count,
+    let tiling = match prepare_g17p_partial_opening_outer_slot(
+        tiling,
+        G17P_PARTIAL_OPENING_TILING_CHANNEL_TABLE_INDEX,
+        0,
+        0,
     ) {
         Ok(value) => value,
         Err(error) => return Err(error),
@@ -2396,9 +2487,14 @@ pub(crate) struct SubmissionLiveGaps {
     pub(crate) sksm_resource0_ordered_write_implemented: bool,
     /// EP 0x21 plus the retained CL2 channel queue has executed real work.
     pub(crate) channel_doorbell_round_trip_proven: bool,
+    /// Linux allocates and publishes every object in the measured first-partial
+    /// graphics contract through its runtime path.
+    pub(crate) partial_graphics_runtime_implemented: bool,
+    /// The measured first-partial channel path executed paired graphics work.
+    pub(crate) partial_graphics_round_trip_proven: bool,
     /// A native SKSM queue entry followed by the host `addKicks` MMIO pair has
-    /// executed real work. Graphics requires this producer even though the
-    /// classic channel doorbell has independently executed CL work.
+    /// executed real work. The shipping kext uses this path, but the classic
+    /// first-partial graphics path is independently executable.
     pub(crate) sksm_add_kicks_round_trip_proven: bool,
     /// Apple's host builds platform interrupt event sources from runtime
     /// `interrupts`/`interrupts-valid` properties. D93AP physical IRQ 1001 and
@@ -2409,12 +2505,22 @@ pub(crate) struct SubmissionLiveGaps {
 }
 
 impl SubmissionLiveGaps {
-    /// True only if every live gap is closed.
-    pub(crate) const fn all_proven(&self) -> bool {
+    pub(crate) const fn classic_graphics_proven(&self) -> bool {
+        self.channel_doorbell_round_trip_proven
+            && self.partial_graphics_runtime_implemented
+            && self.partial_graphics_round_trip_proven
+            && self.completion_irq_route_proven
+    }
+
+    pub(crate) const fn native_sksm_proven(&self) -> bool {
         self.sksm_resource0_ordered_write_implemented
-            && self.channel_doorbell_round_trip_proven
             && self.sksm_add_kicks_round_trip_proven
             && self.completion_irq_route_proven
+    }
+
+    /// True when either independently modeled transport can complete work.
+    pub(crate) const fn all_proven(&self) -> bool {
+        self.classic_graphics_proven() || self.native_sksm_proven()
     }
 }
 
@@ -2426,6 +2532,8 @@ impl SubmissionLiveGaps {
 pub(crate) const SUBMISSION_LIVE_GAPS: SubmissionLiveGaps = SubmissionLiveGaps {
     sksm_resource0_ordered_write_implemented: true,
     channel_doorbell_round_trip_proven: true,
+    partial_graphics_runtime_implemented: false,
+    partial_graphics_round_trip_proven: true,
     sksm_add_kicks_round_trip_proven: false,
     completion_irq_route_proven: false,
 };
@@ -2638,6 +2746,12 @@ mod tests {
         let scheduler = build_g17p_partial_opening_scheduler_page();
         assert_eq!(get_u64_le(&scheduler, 0), 0x0000_0020_0001_9000);
         assert!(scheduler[8..].iter().all(|value| *value == 0));
+        let mut scheduler_slice = [0xa5; G17P_PARTIAL_OPENING_PAGE_SIZE];
+        assert_eq!(
+            apply_g17p_partial_opening_scheduler_page(&mut scheduler_slice),
+            Ok(())
+        );
+        assert_eq!(scheduler_slice, scheduler);
 
         let primary = build_g17p_partial_opening_primary_index_page();
         let expected = [
@@ -2651,6 +2765,20 @@ mod tests {
         assert!(primary[expected.len() * 4..]
             .iter()
             .all(|value| *value == 0));
+        let mut primary_slice = [0xa5; G17P_PARTIAL_OPENING_PAGE_SIZE];
+        assert_eq!(
+            apply_g17p_partial_opening_primary_index_page(&mut primary_slice),
+            Ok(())
+        );
+        assert_eq!(primary_slice, primary);
+        assert_eq!(
+            apply_g17p_partial_opening_scheduler_page(&mut []),
+            Err(SubmissionError::PartialOpeningPageSize)
+        );
+        assert_eq!(
+            apply_g17p_partial_opening_primary_index_page(&mut [0; 1]),
+            Err(SubmissionError::PartialOpeningPageSize)
+        );
 
         assert_eq!(
             G17P_PARTIAL_OPENING_CONTEXT,
@@ -2727,37 +2855,88 @@ mod tests {
             ]
         );
         let prepared = prepare_g17p_partial_opening_work_pair(
-            G17PPartialOpeningChannelState {
-                producer: 2,
-                consumer: 0,
-                ring_entry_count: 4,
+            G17PPartialOpeningOuterChannelState {
+                consumers: [0, 0],
+                producer: 0,
+                queue_gpu_va: 0xffff_fc20_c000_00c0,
+                queue_write_index: 3,
             },
-            G17PPartialOpeningChannelState {
-                producer: 3,
-                consumer: 2,
-                ring_entry_count: 4,
+            G17PPartialOpeningOuterChannelState {
+                consumers: [0, 0],
+                producer: 0,
+                queue_gpu_va: 0xffff_fc20_c000_0000,
+                queue_write_index: 3,
             },
         )
         .unwrap();
         assert_eq!(
             prepared.fragment,
-            G17PChannelWritePlan {
-                entry_byte_offset: 0x10,
-                next_producer: 3,
+            G17PPartialOpeningOuterSlotPlan {
+                channel_table_index: 7,
+                slot_index: 0,
+                slot_byte_offset: 0,
+                slot: [
+                    0, 0, 0, 0, 0, 0, 0, 0, 0xc0, 0x00, 0x00, 0xc0, 0x20, 0xfc, 0xff, 0xff, 1, 0,
+                    0, 0, 3, 0, 1, 1,
+                ],
+                next_producer: 1,
             }
         );
         assert_eq!(
             prepared.tiling,
-            G17PChannelWritePlan {
-                entry_byte_offset: 0x18,
-                next_producer: 0,
+            G17PPartialOpeningOuterSlotPlan {
+                channel_table_index: 6,
+                slot_index: 0,
+                slot_byte_offset: 0,
+                slot: [
+                    0, 0, 0, 0, 0, 0, 0, 0, 0x00, 0x00, 0x00, 0xc0, 0x20, 0xfc, 0xff, 0xff, 0, 0,
+                    0, 0, 3, 0, 0, 1,
+                ],
+                next_producer: 1,
             }
         );
+        assert_eq!(G17P_PARTIAL_OPENING_OUTER_SLOT_SIZE, 0x18);
+        assert_eq!(G17P_PARTIAL_OPENING_OUTER_SLOT_COUNT, 0x100);
+        assert_eq!(G17P_PARTIAL_OPENING_TILING_CHANNEL_TABLE_INDEX, 6);
+        assert_eq!(G17P_PARTIAL_OPENING_FRAGMENT_CHANNEL_TABLE_INDEX, 7);
         assert_eq!(G17P_PARTIAL_OPENING_WORK_DOORBELL_CHANNEL, 8);
         assert_eq!(prepared.paired_doorbell, 0x0083_0000_0000_0008);
         assert_eq!(
             prepared.paired_doorbell,
             encode_tx_doorbell(PipeType::Vertex, 2).unwrap()
+        );
+
+        let full = G17PPartialOpeningOuterChannelState {
+            consumers: [0, 7],
+            producer: 6,
+            queue_gpu_va: 0,
+            queue_write_index: 3,
+        };
+        assert_eq!(
+            prepare_g17p_partial_opening_work_pair(full, full),
+            Err(SubmissionError::RingFull)
+        );
+        assert_eq!(
+            prepare_g17p_partial_opening_work_pair(
+                G17PPartialOpeningOuterChannelState {
+                    producer: 0x100,
+                    ..full
+                },
+                full,
+            ),
+            Err(SubmissionError::PartialOpeningChannelCounterOutOfRange)
+        );
+        assert_eq!(
+            prepare_g17p_partial_opening_work_pair(
+                G17PPartialOpeningOuterChannelState {
+                    consumers: [0, 0],
+                    producer: 0,
+                    queue_write_index: 0x1_0000,
+                    ..full
+                },
+                full,
+            ),
+            Err(SubmissionError::PartialOpeningQueueHeadOutOfRange)
         );
     }
 
@@ -4417,23 +4596,42 @@ mod tests {
     }
 
     #[test]
-    fn transport_reports_the_two_remaining_live_gaps() {
+    fn transport_tracks_classic_graphics_and_native_sksm_independently() {
         assert!(GROUNDED_SUBMISSION_PRODUCER_AVAILABLE);
         assert!(!EXECUTABLE_SUBMISSION_TRANSPORT_AVAILABLE);
         assert!(!SUBMISSION_LIVE_GAPS.all_proven());
+        assert!(!SUBMISSION_LIVE_GAPS.classic_graphics_proven());
+        assert!(!SUBMISSION_LIVE_GAPS.native_sksm_proven());
         assert!(SUBMISSION_LIVE_GAPS.sksm_resource0_ordered_write_implemented);
         assert!(SUBMISSION_LIVE_GAPS.channel_doorbell_round_trip_proven);
+        assert!(!SUBMISSION_LIVE_GAPS.partial_graphics_runtime_implemented);
+        assert!(SUBMISSION_LIVE_GAPS.partial_graphics_round_trip_proven);
         assert!(!SUBMISSION_LIVE_GAPS.sksm_add_kicks_round_trip_proven);
         assert!(!SUBMISSION_LIVE_GAPS.completion_irq_route_proven);
 
-        // A hypothetical all-proven set would flip the executable signal — the
-        // gate is wired to the evidence, not hard-coded.
-        let proven = SubmissionLiveGaps {
+        let classic = SubmissionLiveGaps {
             sksm_resource0_ordered_write_implemented: true,
             channel_doorbell_round_trip_proven: true,
+            partial_graphics_runtime_implemented: true,
+            partial_graphics_round_trip_proven: true,
+            sksm_add_kicks_round_trip_proven: false,
+            completion_irq_route_proven: true,
+        };
+        assert!(classic.classic_graphics_proven());
+        assert!(!classic.native_sksm_proven());
+        assert!(classic.all_proven());
+        assert!(!classic.sksm_add_kicks_round_trip_proven);
+
+        let native = SubmissionLiveGaps {
+            sksm_resource0_ordered_write_implemented: true,
+            channel_doorbell_round_trip_proven: false,
+            partial_graphics_runtime_implemented: false,
+            partial_graphics_round_trip_proven: false,
             sksm_add_kicks_round_trip_proven: true,
             completion_irq_route_proven: true,
         };
-        assert!(proven.all_proven());
+        assert!(!native.classic_graphics_proven());
+        assert!(native.native_sksm_proven());
+        assert!(native.all_proven());
     }
 }
