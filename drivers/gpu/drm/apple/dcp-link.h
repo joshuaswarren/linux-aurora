@@ -11,7 +11,7 @@
 #include <linux/types.h>
 
 #define APPLE_DCP_LINK_PROTOCOL_VERSION		4
-#define APPLE_DCP_LINK_ENDPOINT			0x24
+#define APPLE_DCP_LINK_ENDPOINT			0x37
 #define APPLE_DCP_LINK_STREAM_COUNT		8
 #define APPLE_DCP_LINK_STREAMS_PER_SIDE		4
 #define APPLE_DCP_LINK_STREAM_STATE_SIZE	0x68
@@ -19,6 +19,11 @@
 #define APPLE_DCP_LINK_LOCAL_STREAMS_OFFSET	0x078
 #define APPLE_DCP_LINK_REMOTE_STREAMS_OFFSET	0x218
 #define APPLE_DCP_LINK_RPC_MEMORY_SIZE		0x0c0000
+#define APPLE_DCP_LINK_SIDE_MEMORY_SIZE		0x040000
+#define APPLE_DCP_LINK_STREAM_HALF_SIZE		0x020000
+#define APPLE_DCP_LINK_STREAM_BUFFER_SIZE	0x008000
+#define APPLE_DCP_LINK_HEAP_OFFSET		0x080000
+#define APPLE_DCP_LINK_HEAP_SIZE		0x040000
 #define APPLE_DCP_LINK_SHARED_VAR_MEMORY_SIZE	0x4000000
 
 #define APPLE_DCP_LINK_INIT_FLAG_64M		0x04000000
@@ -64,6 +69,17 @@ struct apple_dcp_link_method {
 	u32 output_size;
 };
 
+enum apple_dcp_link_side {
+	APPLE_DCP_LINK_SIDE_AP = 0,
+	APPLE_DCP_LINK_SIDE_DCP = 1,
+};
+
+struct apple_dcp_link_stream_layout {
+	u32 local_offset;
+	u32 remote_offset;
+	u32 capacity;
+};
+
 struct apple_dcp_link_init_desc {
 	__le64 shared_dva;
 	__le32 flags;
@@ -105,6 +121,44 @@ static_assert(sizeof(struct apple_dcp_link_rpc_header) == 0x0c);
 static_assert(sizeof(struct apple_dcp_h17p_rt_bw_config) == 0x10);
 static_assert(sizeof(struct apple_dcp_h17p_rt_bw_request) == 0x04);
 static_assert(sizeof(struct apple_dcp_h17p_rt_bw_reply) == 0x14);
+static_assert(APPLE_DCP_LINK_STREAM_BUFFER_SIZE *
+	      APPLE_DCP_LINK_STREAMS_PER_SIDE ==
+	      APPLE_DCP_LINK_STREAM_HALF_SIZE);
+static_assert(APPLE_DCP_LINK_HEAP_OFFSET + APPLE_DCP_LINK_HEAP_SIZE ==
+	      APPLE_DCP_LINK_RPC_MEMORY_SIZE);
+
+static inline int
+apple_dcp_link_stream_layout(enum apple_dcp_link_side side, u8 stream,
+			     bool remote,
+			     struct apple_dcp_link_stream_layout *layout)
+{
+	u32 local_side;
+	u32 remote_side;
+	u32 stream_offset;
+
+	if (!layout || side > APPLE_DCP_LINK_SIDE_DCP ||
+	    stream >= APPLE_DCP_LINK_STREAMS_PER_SIDE)
+		return -EINVAL;
+
+	local_side = side * APPLE_DCP_LINK_SIDE_MEMORY_SIZE;
+	remote_side = (side ^ 1) * APPLE_DCP_LINK_SIDE_MEMORY_SIZE;
+	stream_offset = stream * APPLE_DCP_LINK_STREAM_BUFFER_SIZE;
+
+	if (remote) {
+		layout->local_offset = local_side +
+				       APPLE_DCP_LINK_STREAM_HALF_SIZE +
+				       stream_offset;
+		layout->remote_offset = remote_side + stream_offset;
+	} else {
+		layout->local_offset = local_side + stream_offset;
+		layout->remote_offset = remote_side +
+					APPLE_DCP_LINK_STREAM_HALF_SIZE +
+					stream_offset;
+	}
+	layout->capacity = APPLE_DCP_LINK_STREAM_BUFFER_SIZE;
+
+	return 0;
+}
 
 static inline int apple_dcp_h17p_method(u32 call,
 					struct apple_dcp_link_method *method)
@@ -165,21 +219,21 @@ static inline int apple_dcp_h17p_method(u32 call,
 
 static inline void
 apple_dcp_link_init_desc_encode(struct apple_dcp_link_init_desc *desc,
-				u64 shared_dva, bool use_64m_window)
+				u64 shared_var_dva, bool use_64m_window)
 {
-	desc->shared_dva = cpu_to_le64(shared_dva);
+	desc->shared_dva = cpu_to_le64(shared_var_dva);
 	desc->flags = cpu_to_le32(use_64m_window ? APPLE_DCP_LINK_INIT_FLAG_64M : 0);
 	desc->version = cpu_to_le32(APPLE_DCP_LINK_PROTOCOL_VERSION);
 }
 
-static inline int apple_dcp_link_init_message(u64 shared_dva, u64 *message)
+static inline int apple_dcp_link_init_message(u64 rpc_dva, u64 *message)
 {
 	if (!message)
 		return -EINVAL;
-	if (shared_dva & ~GENMASK_ULL(47, 0))
+	if (rpc_dva & ~GENMASK_ULL(47, 0))
 		return -ERANGE;
 
-	*message = (shared_dva << 16) | APPLE_DCP_LINK_MSG_INIT;
+	*message = (rpc_dva << 16) | APPLE_DCP_LINK_MSG_INIT;
 	return 0;
 }
 
