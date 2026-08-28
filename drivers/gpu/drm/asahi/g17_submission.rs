@@ -1031,9 +1031,9 @@ pub(crate) struct G17PClKickProducerState {
 /// Descriptor and call-site operands consumed by `encodeCLKickEntry`.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct G17PClKickEntryOperands<'a> {
-    /// Descriptor +0x4c bit 0; false sets entry-header bit 1.
+    /// Descriptor +0x4c bit 0; true sets entry-header bit 1.
     pub(crate) descriptor_flag_4c: bool,
-    /// Descriptor +0x5c8 bit 0; false sets entry-header bit 61.
+    /// Descriptor +0x5c8 bit 0; true sets entry-header bit 61.
     pub(crate) descriptor_flag_5c8: bool,
     /// Result of `convertEventMachineTSToHWTS` for a queue with no predecessor.
     pub(crate) converted_command_timestamp: u64,
@@ -1194,14 +1194,14 @@ pub(crate) fn prepare_g17p_cl_kick_entry(
     let mut header = queue.current_timestamp << 2;
     header |= (queue.queue_id as u64) << 42;
     header |= (queue.completion_selector as u64) << 59;
-    if !operands.descriptor_flag_4c {
+    if operands.descriptor_flag_4c {
         header |= 1 << 1;
     }
     if let Some(aperture) = operands.mcache {
         header |= 1 << 58;
         put_u64_le(&mut entry, layout.mcache, encode_g17p_cl_mcache(aperture)?);
     }
-    if !operands.descriptor_flag_5c8 {
+    if operands.descriptor_flag_5c8 {
         header |= 1 << 61;
     }
     put_u64_le(&mut entry, layout.header, header);
@@ -1963,8 +1963,8 @@ mod tests {
     ) -> G17PClKickEntryOperands<'static> {
         let empty = G17PClRceBinding { address: 0, tag: 0 };
         G17PClKickEntryOperands {
-            descriptor_flag_4c: true,
-            descriptor_flag_5c8: true,
+            descriptor_flag_4c: false,
+            descriptor_flag_5c8: false,
             converted_command_timestamp,
             barriers: &[],
             mcache: None,
@@ -2516,7 +2516,7 @@ mod tests {
                 DESCRIPTOR,
                 QUEUE,
                 1,
-                [0, 2, 4, 0],
+                [0, 0, 4, 0],
                 [0x0001_1003_8001_a002, 0x0000_2003_8001_a03b],
             ),
         )
@@ -2528,7 +2528,6 @@ mod tests {
             (0x18, QUEUE),
             (0x20, 0xffff_0801_0000_0001),
             (0x28, 0x0000_0400_0000_0000),
-            (0x130, 2),
             (0x138, 4),
             (0x150, 0x0001_1003_8001_a002),
             (0x158, 0x0000_2003_8001_a03b),
@@ -2556,7 +2555,7 @@ mod tests {
                 DESCRIPTOR + DESCRIPTOR_STRIDE,
                 QUEUE,
                 0,
-                [0, 2, 8, 0],
+                [0, 0, 8, 0],
                 [0x0001_1003_8001_a084, 0x0000_2003_8001_a0bd],
             ),
         )
@@ -2568,7 +2567,6 @@ mod tests {
             (0x18, QUEUE),
             (0x20, 0xffff_0801_0000_0001),
             (0x28, 0x0000_0400_0000_0001),
-            (0x130, 2),
             (0x138, 8),
             (0x150, 0x0001_1003_8001_a084),
             (0x158, 0x0000_2003_8001_a0bd),
@@ -2603,6 +2601,54 @@ mod tests {
             get_u64_le(&item1.entry, 0x178),
             get_u64_le(&item0.entry, 0x178)
         );
+    }
+
+    #[test]
+    fn g17p_cl_descriptor_flags_map_directly_to_header_bits() {
+        let empty = G17PClRceBinding { address: 0, tag: 0 };
+        let producer = G17PClKickProducerState {
+            queue_id: 4,
+            num_stamps: 16,
+            entry_stride: 0x200,
+            completion_selector: 2,
+            qos: G17PClQosConfig {
+                queue_byte_32: 1,
+                class_40: 8,
+                word_48: 0xffff,
+            },
+            submitted: 0,
+            current_timestamp: 1,
+            base_timestamp: 1,
+            previous_valid: false,
+            previous_timestamp: 0,
+        };
+        let flag_mask = (1u64 << 1) | (1u64 << 61);
+
+        for (flag_4c, flag_5c8, expected) in [
+            (false, false, 0),
+            (true, false, 1u64 << 1),
+            (false, true, 1u64 << 61),
+            (true, true, flag_mask),
+        ] {
+            let prepared = prepare_g17p_cl_kick_entry(
+                producer,
+                G17PClKickEntryOperands {
+                    descriptor_flag_4c: flag_4c,
+                    descriptor_flag_5c8: flag_5c8,
+                    converted_command_timestamp: 1,
+                    barriers: &[],
+                    mcache: None,
+                    payload: [0; 2],
+                    event_mask: [0; 4],
+                    rce_kind: 0,
+                    rce_bindings: [empty; 4],
+                    auxiliary: 0,
+                },
+            )
+            .unwrap();
+
+            assert_eq!(get_u64_le(&prepared.entry, 0) & flag_mask, expected);
+        }
     }
 
     #[test]
@@ -2649,8 +2695,8 @@ mod tests {
         let prepared = prepare_g17p_cl_kick_entry(
             queue,
             G17PClKickEntryOperands {
-                descriptor_flag_4c: false,
-                descriptor_flag_5c8: false,
+                descriptor_flag_4c: true,
+                descriptor_flag_5c8: true,
                 converted_command_timestamp: 0,
                 barriers: &barriers,
                 mcache: Some(G17PClMcacheAperture {
