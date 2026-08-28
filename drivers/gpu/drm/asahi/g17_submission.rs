@@ -136,6 +136,8 @@ pub(crate) enum SubmissionError {
     KickCompletionUnderflow,
     /// A provider-owned pre-B2 state object is smaller than one 16 KiB page.
     KickB2PrimaryStateBufferTooSmall,
+    /// The retained queue already published its one-time pre-B2 state.
+    KickB2PrimaryStateAlreadyPublished,
     /// A CL entry has one implicit dependency and at most 31 explicit ones.
     KickDependencyCountOutOfRange,
     /// A CL dependency names a queue outside the seven-bit entry field.
@@ -1379,12 +1381,22 @@ pub(crate) const fn g17p_cl_full_support_initialization_allowed(registered: bool
 /// Apply the exact host-owned pre-B2 values to three provider-owned pages.
 /// Bytes outside the listed fields remain unchanged. `channel_control_gpu_va`
 /// comes from the retained Linux mapping, not the captured macOS address.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum G17PClB2ActivationState {
+    Pending,
+    Published,
+}
+
 pub(crate) fn apply_g17p_cl_b2_primary_state(
+    activation: G17PClB2ActivationState,
     computed: &mut [u8],
     region_1: &mut [u8],
     region_2: &mut [u8],
     channel_control_gpu_va: u64,
-) -> Result<(), SubmissionError> {
+) -> Result<G17PClB2ActivationState, SubmissionError> {
+    if activation == G17PClB2ActivationState::Published {
+        return Err(SubmissionError::KickB2PrimaryStateAlreadyPublished);
+    }
     let layout = G17P_CL_B2_PRIMARY_STATE_LAYOUT;
     if computed.len() < layout.object_size
         || region_1.len() < layout.object_size
@@ -1414,7 +1426,7 @@ pub(crate) fn apply_g17p_cl_b2_primary_state(
     put_u64_le(region_2, 0x00, 0x0800_0000_e000_0000);
     put_u64_le(region_2, 0x08, 0x0000_3d40_0000_3400);
     put_u64_le(region_2, 0x10, 0x0000_0000_0000_1d00);
-    Ok(())
+    Ok(G17PClB2ActivationState::Published)
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -1440,8 +1452,8 @@ pub(crate) const G17P_CL_RETAINED_REGISTRATION_ORDER: [G17PClRetainedPublication
     G17PClRetainedPublicationStep::RegisterPhysicalQueue,
 ];
 
-/// Per-command order proven by the hardware-positive retained B2 submission.
-pub(crate) const G17P_CL_RETAINED_SUBMISSION_ORDER: [G17PClRetainedPublicationStep; 9] = [
+/// One-time activation order proven by retained command B2.
+pub(crate) const G17P_CL_RETAINED_ACTIVATION_ORDER: [G17PClRetainedPublicationStep; 9] = [
     G17PClRetainedPublicationStep::PublishCommandOwnedState,
     G17PClRetainedPublicationStep::CleanCommandOwnedState,
     G17PClRetainedPublicationStep::WriteB2PrimaryState,
@@ -1452,6 +1464,25 @@ pub(crate) const G17P_CL_RETAINED_SUBMISSION_ORDER: [G17PClRetainedPublicationSt
     G17PClRetainedPublicationStep::PublishInnerQueueProducer,
     G17PClRetainedPublicationStep::SystemBarrierAfterInnerProducer,
 ];
+
+/// Steady-state order proven by command B3 on the same physical queue.
+pub(crate) const G17P_CL_RETAINED_SUBMISSION_ORDER: [G17PClRetainedPublicationStep; 6] = [
+    G17PClRetainedPublicationStep::PublishCommandOwnedState,
+    G17PClRetainedPublicationStep::CleanCommandOwnedState,
+    G17PClRetainedPublicationStep::PublishInnerQueuePayload,
+    G17PClRetainedPublicationStep::SystemBarrierBeforeInnerProducer,
+    G17PClRetainedPublicationStep::PublishInnerQueueProducer,
+    G17PClRetainedPublicationStep::SystemBarrierAfterInnerProducer,
+];
+
+pub(crate) const fn g17p_cl_retained_submission_order(
+    activation: G17PClB2ActivationState,
+) -> &'static [G17PClRetainedPublicationStep] {
+    match activation {
+        G17PClB2ActivationState::Pending => &G17P_CL_RETAINED_ACTIVATION_ORDER,
+        G17PClB2ActivationState::Published => &G17P_CL_RETAINED_SUBMISSION_ORDER,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // 6. Host addKicks MMIO publication (AGX3-specific).
@@ -2919,7 +2950,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            G17P_CL_RETAINED_SUBMISSION_ORDER,
+            G17P_CL_RETAINED_ACTIVATION_ORDER,
             [
                 G17PClRetainedPublicationStep::PublishCommandOwnedState,
                 G17PClRetainedPublicationStep::CleanCommandOwnedState,
@@ -2931,6 +2962,25 @@ mod tests {
                 G17PClRetainedPublicationStep::PublishInnerQueueProducer,
                 G17PClRetainedPublicationStep::SystemBarrierAfterInnerProducer,
             ]
+        );
+        assert_eq!(
+            G17P_CL_RETAINED_SUBMISSION_ORDER,
+            [
+                G17PClRetainedPublicationStep::PublishCommandOwnedState,
+                G17PClRetainedPublicationStep::CleanCommandOwnedState,
+                G17PClRetainedPublicationStep::PublishInnerQueuePayload,
+                G17PClRetainedPublicationStep::SystemBarrierBeforeInnerProducer,
+                G17PClRetainedPublicationStep::PublishInnerQueueProducer,
+                G17PClRetainedPublicationStep::SystemBarrierAfterInnerProducer,
+            ]
+        );
+        assert_eq!(
+            g17p_cl_retained_submission_order(G17PClB2ActivationState::Pending),
+            G17P_CL_RETAINED_ACTIVATION_ORDER
+        );
+        assert_eq!(
+            g17p_cl_retained_submission_order(G17PClB2ActivationState::Published),
+            G17P_CL_RETAINED_SUBMISSION_ORDER
         );
     }
 
@@ -2952,13 +3002,15 @@ mod tests {
         let mut computed = [FILL; 0x4000];
         let mut region_1 = [FILL; 0x4000];
         let mut region_2 = [FILL; 0x4000];
-        apply_g17p_cl_b2_primary_state(
+        let activation = apply_g17p_cl_b2_primary_state(
+            G17PClB2ActivationState::Pending,
             &mut computed,
             &mut region_1,
             &mut region_2,
             CHANNEL_CONTROL,
         )
         .unwrap();
+        assert_eq!(activation, G17PClB2ActivationState::Published);
 
         let mut expected_computed = [FILL; 0x4000];
         expected_computed[0x000] = 0xff;
@@ -2991,10 +3043,24 @@ mod tests {
         assert_eq!(computed, expected_computed);
         assert_eq!(region_1, expected_region_1);
         assert_eq!(region_2, expected_region_2);
+        assert_eq!(
+            apply_g17p_cl_b2_primary_state(
+                activation,
+                &mut computed,
+                &mut region_1,
+                &mut region_2,
+                CHANNEL_CONTROL,
+            ),
+            Err(SubmissionError::KickB2PrimaryStateAlreadyPublished)
+        );
+        assert_eq!(computed, expected_computed);
+        assert_eq!(region_1, expected_region_1);
+        assert_eq!(region_2, expected_region_2);
 
         let mut short = [0u8; 1];
         assert_eq!(
             apply_g17p_cl_b2_primary_state(
+                G17PClB2ActivationState::Pending,
                 &mut short,
                 &mut region_1,
                 &mut region_2,
