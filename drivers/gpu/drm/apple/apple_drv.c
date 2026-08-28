@@ -462,9 +462,11 @@ static int apple_drm_init(struct device *dev)
 
 	dev_set_drvdata(dev, apple);
 
+	dev_info(dev, "DCP takeover: component bind begin\n");
 	ret = component_bind_all(dev, apple);
 	if (ret)
 		return ret;
+	dev_info(dev, "DCP takeover: component bind complete\n");
 
 	ret = drmm_mode_config_init(&apple->drm);
 	if (ret)
@@ -493,6 +495,7 @@ static int apple_drm_init(struct device *dev)
 	ret = apple_drm_init_dcp(dev);
 	if (ret)
 		goto err_unbind;
+	dev_info(dev, "DCP takeover: services ready for modeset\n");
 
 	drm_mode_config_reset(&apple->drm);
 
@@ -507,6 +510,7 @@ static int apple_drm_init(struct device *dev)
 	ret = drm_dev_register(&apple->drm, 0);
 	if (ret)
 		goto err_unbind;
+	dev_info(dev, "DCP takeover: DRM modeset ready\n");
 
 	drm_client_setup_with_fourcc(&apple->drm, DRM_FORMAT_XRGB8888);
 
