@@ -62,6 +62,7 @@ const CONTROL_START_TYPE: u16 = 0x89;
 const CONTROL_DONE_TYPE: u16 = 0x84;
 const CONTROL_DONE_CHANNEL: u64 = 0x11;
 const INITDATA_ACK_POLLS: usize = 200;
+const INITDATA_ACK_ONLY_TEST: bool = true;
 
 /// Per-role callback state retained until the corresponding RTKit client is
 /// dropped. The callback only publishes atomics; probe owns every mutation of
@@ -192,7 +193,7 @@ struct G17PBootedSession {
     gfx_rtkit: rtkit::RtKit<G17PRtkitOps>,
     gfx1_state: Arc<G17PRoleRtkitState>,
     gfx1_rtkit: rtkit::RtKit<G17PRtkitOps>,
-    queue: g17_manager::G17PSksmQueue,
+    queue: Option<g17_manager::G17PSksmQueue>,
 }
 
 fn boot_session(
@@ -246,6 +247,7 @@ fn boot_session(
         g17_rtkit::encode_initdata_doorbell(handoff.secondary.instance.root).map_err(|_| EINVAL)?;
     Pin::new(&mut gfx_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_MESSAGES, gfx_init)?;
     Pin::new(&mut gfx1_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_MESSAGES, gfx1_init)?;
+    dev_info!(pdev.as_ref(), "G17P session: both initdata doorbells sent\n");
 
     for _ in 0..INITDATA_ACK_POLLS {
         if gfx_state.acked.load(Ordering::Acquire) && gfx1_state.acked.load(Ordering::Acquire) {
@@ -259,7 +261,25 @@ fn boot_session(
     if !gfx_state.acked.load(Ordering::Acquire) || !gfx1_state.acked.load(Ordering::Acquire) {
         return Err(ETIMEDOUT);
     }
-    dev_info!(pdev.as_ref(), "G17P session: initdata acknowledged\n");
+    dev_info!(
+        pdev.as_ref(),
+        "G17P session: GFX and GFX1 initdata ACKs received\n"
+    );
+
+    if INITDATA_ACK_ONLY_TEST {
+        dev_info!(
+            pdev.as_ref(),
+            "G17P session: ACK-only test complete; control and SKSM remain untouched\n"
+        );
+        return Ok(G17PBootedSession {
+            cpus,
+            gfx_state,
+            gfx_rtkit,
+            gfx1_state,
+            gfx1_rtkit,
+            queue: None,
+        });
+    }
 
     let control_start = (CONTROL_START_TYPE as u64) << 48;
     Pin::new(&mut gfx_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, control_start)?;
@@ -281,7 +301,7 @@ fn boot_session(
         gfx_rtkit,
         gfx1_state,
         gfx1_rtkit,
-        queue,
+        queue: Some(queue),
     })
 }
 
@@ -535,6 +555,7 @@ impl G17PLiveRuntime {
             num_clusters,
         )?;
         let session = boot_session(&pdev_ref, &drm, &registers, &mut manager)?;
+        let accepting_submissions = session.queue.is_some();
 
         Ok(Self {
             pdev: Some(pdev_ref),
@@ -546,7 +567,7 @@ impl G17PLiveRuntime {
             gfx_rtkit: Some(session.gfx_rtkit),
             gfx1_state: Some(session.gfx1_state),
             gfx1_rtkit: Some(session.gfx1_rtkit),
-            queue: Some(session.queue),
+            queue: session.queue,
             compute_binding: None,
             completion_indices: g17_completion::QueueIndices {
                 done: 0,
@@ -554,7 +575,7 @@ impl G17PLiveRuntime {
                 write: 0,
             },
             render_tracker: None,
-            accepting_submissions: true,
+            accepting_submissions,
         })
     }
 
@@ -700,12 +721,12 @@ impl g17_lifecycle::PersistentRuntimeRecovery for G17PLiveRuntime {
         self.gfx_rtkit = Some(session.gfx_rtkit);
         self.gfx1_state = Some(session.gfx1_state);
         self.gfx1_rtkit = Some(session.gfx1_rtkit);
-        self.queue = Some(session.queue);
+        self.queue = session.queue;
         Ok(())
     }
 
     fn resume_submissions(&mut self) {
-        self.accepting_submissions = true;
+        self.accepting_submissions = self.queue.is_some();
     }
 }
 
