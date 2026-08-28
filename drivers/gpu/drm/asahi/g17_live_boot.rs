@@ -212,8 +212,10 @@ fn boot_session(
     if gfx_gate.is_err() || gfx1_gate.is_err() || transaction_gate.is_err() {
         return Err(ENOTSUPP);
     }
+    dev_info!(pdev.as_ref(), "G17P session: providers ready\n");
 
     let cpus = g17_lifecycle::StartedCpuPair::start(gfx, gfx1)?;
+    dev_info!(pdev.as_ref(), "G17P session: processors started\n");
     let gfx_state = Arc::new(G17PRoleRtkitState::new(), GFP_KERNEL)?;
     let gfx1_state = Arc::new(G17PRoleRtkitState::new(), GFP_KERNEL)?;
     let mut gfx_rtkit =
@@ -223,6 +225,7 @@ fn boot_session(
 
     Pin::new(&mut gfx_rtkit).boot()?;
     Pin::new(&mut gfx1_rtkit).boot()?;
+    dev_info!(pdev.as_ref(), "G17P session: RTKit started\n");
     registers.t8140_axi_transition_workaround()?;
     registers.t8140_pre_initdata_clear()?;
     for rtkit in [&mut gfx_rtkit, &mut gfx1_rtkit] {
@@ -250,6 +253,7 @@ fn boot_session(
     if !gfx_state.acked.load(Ordering::Acquire) || !gfx1_state.acked.load(Ordering::Acquire) {
         return Err(ETIMEDOUT);
     }
+    dev_info!(pdev.as_ref(), "G17P session: initdata acknowledged\n");
 
     let control_start = (CONTROL_START_TYPE as u64) << 48;
     Pin::new(&mut gfx_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, control_start)?;
