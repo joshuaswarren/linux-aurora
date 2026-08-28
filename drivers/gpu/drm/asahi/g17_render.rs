@@ -42,6 +42,7 @@ const QUEUE_WRITE_OFFSET: u64 = 0x40;
 pub(crate) enum RenderBuildError {
     ZeroDimensions,
     LayerCountOutOfRange,
+    UtileDimensions,
     AddressBeforeContext,
     BufferTooSmall,
     ArithmeticOverflow,
@@ -102,6 +103,8 @@ pub(crate) struct G17pRenderParameters {
     pub(crate) merge_upper_x_bits: u32,
     pub(crate) merge_upper_y_bits: u32,
     pub(crate) layers: u16,
+    pub(crate) utile_width: u8,
+    pub(crate) utile_height: u8,
     pub(crate) utile_config: u64,
     pub(crate) multisample_control: u64,
     pub(crate) ppp_control: u64,
@@ -168,6 +171,8 @@ impl G17pRenderParameters {
             merge_upper_x_bits: 0x3cdd_b3d9,
             merge_upper_y_bits: 0x3cdd_b3d9,
             layers: 1,
+            utile_width: 32,
+            utile_height: 32,
             utile_config: 0xa000,
             multisample_control: 0x88,
             ppp_control: 0x202,
@@ -224,6 +229,13 @@ fn geometry(parameters: &G17pRenderParameters) -> Result<Geometry, RenderBuildEr
     let height = parameters.height as u64;
     let tiles_x = (width + TILE_WIDTH - 1) / TILE_WIDTH;
     let tiles_y = (height + TILE_HEIGHT - 1) / TILE_HEIGHT;
+    let (utile_width, utile_height) = (parameters.utile_width, parameters.utile_height);
+    if !matches!((utile_width, utile_height), (32, 32) | (32, 16) | (16, 16)) {
+        return Err(RenderBuildError::UtileDimensions);
+    }
+    let utiles_per_tile_x = TILE_WIDTH / utile_width as u64;
+    let utiles_per_tile_y = TILE_HEIGHT / utile_height as u64;
+    let utiles_per_tile = utiles_per_tile_x * utiles_per_tile_y;
     let mtile_x1 = align((tiles_x + MACRO_TILES_X - 1) / MACRO_TILES_X, 4);
     let mtile_y1 = align((tiles_y + MACRO_TILES_Y - 1) / MACRO_TILES_Y, 4);
     let mtile_x2 = 2 * mtile_x1;
@@ -231,7 +243,6 @@ fn geometry(parameters: &G17pRenderParameters) -> Result<Geometry, RenderBuildEr
     let mtile_y2 = 2 * mtile_y1;
     let mtile_y3 = 3 * mtile_y1;
     let mtile_stride = mtile_x1 * mtile_y1;
-    let utiles_per_tile = 1;
     let size1 = (REGION_ENTRY_SIZE * mtile_stride * utiles_per_tile + 3) / 4;
 
     Ok(Geometry {
@@ -244,7 +255,7 @@ fn geometry(parameters: &G17pRenderParameters) -> Result<Geometry, RenderBuildEr
         y_blocks: mtile_y3 | (mtile_y2 << 9) | (mtile_y1 << 18),
         screen: ((tiles_y - 1) << 12) | (tiles_x - 1),
         pixels: (width - 1) | ((height - 1) << 16),
-        macro_size: mtile_y1 | (mtile_x1 << 16),
+        macro_size: mtile_y1 * utiles_per_tile_y | ((mtile_x1 * utiles_per_tile_x) << 16),
     })
 }
 
