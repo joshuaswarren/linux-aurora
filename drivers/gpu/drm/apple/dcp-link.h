@@ -34,6 +34,32 @@
 
 #define APPLE_DCP_LINK_CALL_D003		0x44303033
 
+enum apple_dcp_h17p_call {
+	APPLE_DCP_H17P_CALL_UP_SET_CREATE_DFB = 0x41333839,
+	APPLE_DCP_H17P_CALL_START_SIGNAL = 0x41343031,
+	APPLE_DCP_H17P_CALL_SWAP_START = 0x41343036,
+	APPLE_DCP_H17P_CALL_SWAP_SUBMIT = 0x41343037,
+	APPLE_DCP_H17P_CALL_SET_DISPLAY_DEVICE = 0x41343131,
+	APPLE_DCP_H17P_CALL_IS_MAIN_DISPLAY = 0x41343132,
+	APPLE_DCP_H17P_CALL_SET_DIGITAL_OUT_MODE = 0x41343133,
+	APPLE_DCP_H17P_CALL_SET_MATRIX = 0x41343233,
+	APPLE_DCP_H17P_CALL_SET_PARAMETER = 0x41343439,
+	APPLE_DCP_H17P_CALL_CREATE_DEFAULT_FB = 0x41343533,
+	APPLE_DCP_H17P_CALL_VIDEO_POWER_SAVINGS = 0x41343537,
+	APPLE_DCP_H17P_CALL_FIRST_CLIENT_OPEN = 0x41343635,
+	APPLE_DCP_H17P_CALL_LAST_CLIENT_CLOSE = 0x41343636,
+	APPLE_DCP_H17P_CALL_DISPLAY_REFRESH = 0x41343734,
+	APPLE_DCP_H17P_CALL_FLUSH_SUPPORTS_POWER = 0x41343737,
+	APPLE_DCP_H17P_CALL_ABORT_SWAPS = 0x41343738,
+	APPLE_DCP_H17P_CALL_SET_POWER_STATE = 0x41343833,
+};
+
+struct apple_dcp_link_method {
+	u32 call;
+	u32 input_size;
+	u32 output_size;
+};
+
 struct apple_dcp_link_init_desc {
 	__le64 shared_dva;
 	__le32 flags;
@@ -75,6 +101,63 @@ static_assert(sizeof(struct apple_dcp_link_rpc_header) == 0x0c);
 static_assert(sizeof(struct apple_dcp_h17p_rt_bw_config) == 0x10);
 static_assert(sizeof(struct apple_dcp_h17p_rt_bw_request) == 0x04);
 static_assert(sizeof(struct apple_dcp_h17p_rt_bw_reply) == 0x14);
+
+static inline int apple_dcp_h17p_method(u32 call,
+					struct apple_dcp_link_method *method)
+{
+	struct apple_dcp_link_method found = { .call = call };
+
+	if (!method)
+		return -EINVAL;
+
+	switch (call) {
+	case APPLE_DCP_H17P_CALL_UP_SET_CREATE_DFB:
+	case APPLE_DCP_H17P_CALL_FIRST_CLIENT_OPEN:
+		break;
+	case APPLE_DCP_H17P_CALL_START_SIGNAL:
+	case APPLE_DCP_H17P_CALL_IS_MAIN_DISPLAY:
+	case APPLE_DCP_H17P_CALL_CREATE_DEFAULT_FB:
+	case APPLE_DCP_H17P_CALL_DISPLAY_REFRESH:
+		found.output_size = 4;
+		break;
+	case APPLE_DCP_H17P_CALL_SWAP_START:
+	case APPLE_DCP_H17P_CALL_SET_POWER_STATE:
+		found.input_size = 16;
+		found.output_size = 8;
+		break;
+	case APPLE_DCP_H17P_CALL_SWAP_SUBMIT:
+		found.input_size = 0x1d30;
+		found.output_size = 12;
+		break;
+	case APPLE_DCP_H17P_CALL_SET_DISPLAY_DEVICE:
+	case APPLE_DCP_H17P_CALL_VIDEO_POWER_SAVINGS:
+	case APPLE_DCP_H17P_CALL_LAST_CLIENT_CLOSE:
+		found.input_size = 4;
+		found.output_size = 4;
+		break;
+	case APPLE_DCP_H17P_CALL_SET_DIGITAL_OUT_MODE:
+	case APPLE_DCP_H17P_CALL_ABORT_SWAPS:
+		found.input_size = 8;
+		found.output_size = 4;
+		break;
+	case APPLE_DCP_H17P_CALL_SET_MATRIX:
+		found.input_size = 80;
+		found.output_size = 4;
+		break;
+	case APPLE_DCP_H17P_CALL_SET_PARAMETER:
+		found.input_size = 40;
+		found.output_size = 4;
+		break;
+	case APPLE_DCP_H17P_CALL_FLUSH_SUPPORTS_POWER:
+		found.input_size = 4;
+		break;
+	default:
+		return -ENOENT;
+	}
+
+	*method = found;
+	return 0;
+}
 
 static inline void
 apple_dcp_link_init_desc_encode(struct apple_dcp_link_init_desc *desc,
