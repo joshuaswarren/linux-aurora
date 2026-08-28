@@ -116,7 +116,7 @@ struct dcp_panel {
 
 struct apple_dcp_hw_data {
 	u32 num_dptx_ports;
-	bool reject_running_coprocessor;
+	bool adopt_running_coprocessor;
 };
 
 /* TODO: move IOMFB members to its own struct */
@@ -138,6 +138,8 @@ struct apple_dcp {
 
 	/* DCP has crashed */
 	bool crashed;
+	/* Ignore inherited application-endpoint traffic while quiescing RTKit. */
+	bool adopting_session;
 
 	/************* IOMFB **************************************************
 	 * everything below is mostly used inside IOMFB but it could make     *
