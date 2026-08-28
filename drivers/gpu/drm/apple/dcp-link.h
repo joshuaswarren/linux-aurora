@@ -5,8 +5,10 @@
 #define __APPLE_DCP_LINK_H__
 
 #include <linux/bitfield.h>
+#include <linux/bits.h>
 #include <linux/byteorder/generic.h>
 #include <linux/errno.h>
+#include <linux/log2.h>
 #include <linux/overflow.h>
 #include <linux/types.h>
 
