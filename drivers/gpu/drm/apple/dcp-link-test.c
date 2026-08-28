@@ -125,6 +125,54 @@ static void apple_dcp_link_stack_test(struct kunit *test)
 			-ENOSPC);
 }
 
+static void apple_dcp_link_rpc_decode_test(struct kunit *test)
+{
+	struct apple_dcp_link_rpc_header *header;
+	struct apple_dcp_link_rpc_view view;
+	u8 buffer[0x100] = {};
+	u64 message;
+
+	header = (void *)(buffer + 0x20);
+	apple_dcp_link_rpc_header_encode(header, 0x44303033, 4, 8);
+	KUNIT_ASSERT_EQ(test,
+			apple_dcp_link_rpc_message(0x20, sizeof(*header) + 12,
+						   false, &message),
+			0);
+	KUNIT_ASSERT_EQ(test,
+			apple_dcp_link_rpc_decode(message, buffer, sizeof(buffer),
+						  &view),
+			0);
+	KUNIT_EXPECT_EQ(test, view.call, 0x44303033U);
+	KUNIT_EXPECT_EQ(test, view.input_size, 4U);
+	KUNIT_EXPECT_EQ(test, view.output_size, 8U);
+	KUNIT_EXPECT_PTR_EQ(test, view.input, buffer + 0x20 + sizeof(*header));
+	KUNIT_EXPECT_PTR_EQ(test, view.output,
+			    buffer + 0x20 + sizeof(*header) + 4);
+
+	header->output_size = cpu_to_le32(9);
+	KUNIT_EXPECT_EQ(test,
+			apple_dcp_link_rpc_decode(message, buffer, sizeof(buffer),
+						  &view),
+			-EMSGSIZE);
+	KUNIT_EXPECT_EQ(test,
+			apple_dcp_link_rpc_decode(APPLE_DCP_LINK_MSG_RPC_REPLY, buffer,
+						  sizeof(buffer), &view),
+			-EPROTO);
+}
+
+static void apple_dcp_link_rpc_reply_test(struct kunit *test)
+{
+	u64 request, reply;
+
+	KUNIT_ASSERT_EQ(test,
+			apple_dcp_link_rpc_message(0x1234, 0x5678, true, &request),
+			0);
+	KUNIT_ASSERT_EQ(test,
+			apple_dcp_link_stream_message(request, 5, true, &request), 0);
+	reply = apple_dcp_link_rpc_reply(request);
+	KUNIT_EXPECT_EQ(test, reply, 0x0000000000001742ULL);
+}
+
 static void apple_dcp_h17p_rt_bw_test(struct kunit *test)
 {
 	struct apple_dcp_h17p_rt_bw_config config;
@@ -142,6 +190,8 @@ static struct kunit_case apple_dcp_link_test_cases[] = {
 	KUNIT_CASE(apple_dcp_link_rpc_size_test),
 	KUNIT_CASE(apple_dcp_link_rpc_message_test),
 	KUNIT_CASE(apple_dcp_link_stack_test),
+	KUNIT_CASE(apple_dcp_link_rpc_decode_test),
+	KUNIT_CASE(apple_dcp_link_rpc_reply_test),
 	KUNIT_CASE(apple_dcp_h17p_rt_bw_test),
 	{}
 };
