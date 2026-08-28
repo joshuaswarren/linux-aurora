@@ -132,6 +132,8 @@ pub(crate) enum SubmissionError {
     KickEntryOffsetOverflow,
     /// The queue already has `num_stamps` entries awaiting completion.
     KickQueueSubmittedFull,
+    /// A completion observed no submitted entries or exceeded their count.
+    KickCompletionUnderflow,
     /// A CL entry has one implicit dependency and at most 31 explicit ones.
     KickDependencyCountOutOfRange,
     /// A CL dependency names a queue outside the seven-bit entry field.
@@ -1273,6 +1275,24 @@ pub(crate) fn prepare_g17p_cl_kick_entry(
         previous_timestamp_after: prepared.timestamp,
         producer_after,
     })
+}
+
+/// Apply the completed-kick count used by `AGXCLCommandDescriptor::complete`.
+/// The live callback performs an acquire-release atomic subtraction at queue
+/// +0x44. This pure form keeps every other producer field unchanged.
+pub(crate) fn complete_g17p_cl_kicks(
+    mut producer: G17PClKickProducerState,
+    completed_count: u32,
+) -> Result<G17PClKickProducerState, SubmissionError> {
+    if completed_count == 0 {
+        return Ok(producer);
+    }
+    if producer.submitted == 0 || completed_count > producer.submitted {
+        return Err(SubmissionError::KickCompletionUnderflow);
+    }
+
+    producer.submitted -= completed_count;
+    Ok(producer)
 }
 
 // ---------------------------------------------------------------------------
@@ -2657,6 +2677,47 @@ mod tests {
 
             assert_eq!(get_u64_le(&prepared.entry, 0) & flag_mask, expected);
         }
+    }
+
+    #[test]
+    fn g17p_cl_completion_updates_only_the_submitted_count() {
+        let producer = G17PClKickProducerState {
+            queue_id: 4,
+            num_stamps: 256,
+            entry_stride: 0x200,
+            completion_selector: 2,
+            qos: G17PClQosConfig {
+                queue_byte_32: 1,
+                class_40: 8,
+                word_48: 0xffff,
+            },
+            submitted: 2,
+            current_timestamp: 3,
+            base_timestamp: 1,
+            previous_valid: true,
+            previous_timestamp: 2,
+        };
+
+        assert_eq!(complete_g17p_cl_kicks(producer, 0), Ok(producer));
+        let after_one = complete_g17p_cl_kicks(producer, 1).unwrap();
+        assert_eq!(
+            after_one,
+            G17PClKickProducerState {
+                submitted: 1,
+                ..producer
+            }
+        );
+        let empty = complete_g17p_cl_kicks(producer, 2).unwrap();
+        assert_eq!(empty.submitted, 0);
+        assert_eq!(complete_g17p_cl_kicks(empty, 0), Ok(empty));
+        assert_eq!(
+            complete_g17p_cl_kicks(empty, 1),
+            Err(SubmissionError::KickCompletionUnderflow)
+        );
+        assert_eq!(
+            complete_g17p_cl_kicks(producer, 3),
+            Err(SubmissionError::KickCompletionUnderflow)
+        );
     }
 
     #[test]
