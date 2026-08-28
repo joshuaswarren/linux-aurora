@@ -59,22 +59,28 @@ properties:
     $ref: /schemas/types.yaml#/definitions/uint64-array
     minItems: 2
     maxItems: 2
-    description:
-      DMA allocation aperture expressed as a base followed by its size. High
-      aperture bits may be a firmware-visible alias which the DART driver
-      removes before programming a narrower hardware page table.
+    description: >
+      Inclusive device-visible DMA aperture, encoded as a start address and
+      size. The IOMMU DMA allocator restricts mappings to this range.
 
-  apple,remap-streams:
+  apple,dma-offset:
+    $ref: /schemas/types.yaml#/definitions/uint64
+    description: >
+      Offset added to device-visible DMA addresses when indexing the DART page
+      tables. This models host bridges which alias a low PCI bus aperture into
+      a high DART translation window.
+
+  apple,tunable:
     $ref: /schemas/types.yaml#/definitions/uint32-matrix
     items:
       items:
-        - description: source stream id
-        - description: target stream id
-    description:
-      t8110 DARTs can fold a stream onto another one so that it is translated,
-      filtered and TLB-tracked exactly as the target (the ADT "remap" list).
-      Each pair remaps the source stream onto the target stream; the source
-      keeps no translation table of its own.
+        - description: Register offset
+        - description: Mask to be applied to the register value
+        - description: Bits to be set after applying the mask
+    description: >
+      List of (register offset, mask, value) tuples copied from Apple's Device
+      Tree by the bootloader and required to initialize dynamically powered
+      DART instances.
 
 required:
   - compatible
