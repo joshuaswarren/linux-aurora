@@ -19,8 +19,8 @@ use core::sync::atomic::{fence, Ordering};
 
 #[cfg(not(test))]
 use crate::{
-    driver::AsahiDevice, g17_completion, g17_compute, g17_initdata, g17_resources, g17_submission,
-    g17_uapi, hw::agx3, identity, mmu, regs,
+    driver::AsahiDevice, g17_completion, g17_compute, g17_initdata, g17_lifecycle, g17_resources,
+    g17_submission, g17_uapi, hw::agx3, identity, mmu, regs,
 };
 #[cfg(test)]
 #[path = "g17_initdata.rs"]
@@ -315,6 +315,7 @@ pub(crate) struct G17PManagerConstruction {
     render_storage: Option<g17_resources::G17PUserRenderStorage>,
     render_tracker: Option<G17PPartialOpeningRenderTracker>,
     render_bind: Option<mmu::VmBind>,
+    render_submission_ordinal: u32,
 }
 
 /// A queue which has completed the host's configuration pair and QID-enable
@@ -396,6 +397,7 @@ impl G17PManagerConstruction {
             render_storage: None,
             render_tracker: None,
             render_bind: None,
+            render_submission_ordinal: 0,
         })
     }
 
@@ -476,6 +478,7 @@ impl G17PManagerConstruction {
         }
         let (prepared, render_bind) = self.resources.publish_partial_opening_pair(
             None,
+            false,
             submission.fragment_queue_gpu_va,
             submission.fragment_queue_write_index,
             submission.tiling_queue_gpu_va,
@@ -561,6 +564,7 @@ impl G17PManagerConstruction {
         self.render_bind = None;
         self.render_tracker = None;
         self.render_storage = None;
+        self.render_submission_ordinal = 0;
     }
 
     /// Restore cold initdata in the existing mappings after both CPUs stop.
@@ -574,6 +578,19 @@ impl G17PManagerConstruction {
         self.resources.reset_session_after_processor_stop()
     }
 
+    pub(crate) fn retained_render_needs_recycle(&self, vm: &mmu::Vm) -> bool {
+        let retained = self.render_storage.is_some();
+        let same_vm = self
+            .render_bind
+            .as_ref()
+            .is_some_and(|binding| binding.matches(vm));
+        g17_lifecycle::retained_render_requires_recycle(
+            retained,
+            same_vm,
+            self.render_submission_ordinal,
+        )
+    }
+
     pub(crate) fn begin_translated_render(
         &mut self,
         dev: &AsahiDevice,
@@ -585,49 +602,75 @@ impl G17PManagerConstruction {
         if self.render_tracker.is_some() {
             return Err(EBUSY);
         }
-        self.render_bind = None;
-        self.render_storage = None;
-        let mut storage = self.resources.new_user_render_storage(
-            dev,
-            vm,
-            command,
-            self.num_clusters,
-            user_timestamps,
-            user_timestamp_aliases,
-        )?;
-        if !storage.is_reachable_from(vm) {
-            return Err(EFAULT);
+        let retained = self.render_storage.is_some();
+        if retained
+            && !self
+                .render_bind
+                .as_ref()
+                .is_some_and(|binding| binding.matches(vm))
+        {
+            return Err(EBUSY);
         }
-        storage.stage_fragment()?;
-        // Build and map every TA byte while both producers are hidden. The
-        // returned publication performs only infallible copies.
-        let late_tiling = storage.prepare_late_tiling_publication()?;
-        let (fragment_queue, tiling_queue) = storage.queue_gpu_vas();
+        if retained {
+            self.render_storage
+                .as_mut()
+                .ok_or(ENODEV)?
+                .restage_command(
+                    dev,
+                    vm,
+                    command,
+                    self.num_clusters,
+                    user_timestamps,
+                    user_timestamp_aliases,
+                    self.render_submission_ordinal,
+                )?;
+        } else {
+            if self.render_submission_ordinal != 0 || self.render_bind.is_some() {
+                return Err(EIO);
+            }
+            self.render_storage = Some(self.resources.new_user_render_storage(
+                dev,
+                vm,
+                command,
+                self.num_clusters,
+                user_timestamps,
+                user_timestamp_aliases,
+            )?);
+        }
+        let (fragment_queue, tiling_queue, previous, late_tiling) = {
+            let storage = self.render_storage.as_mut().ok_or(ENODEV)?;
+            if !storage.is_reachable_from(vm) {
+                return Err(EFAULT);
+            }
+            storage.stage_fragment(self.render_submission_ordinal)?;
+            let previous = storage.snapshot()?;
+            let late_tiling =
+                storage.prepare_late_tiling_publication(self.render_submission_ordinal)?;
+            let (fragment_queue, tiling_queue) = storage.queue_gpu_vas();
+            (fragment_queue, tiling_queue, previous, late_tiling)
+        };
         let (prepared, render_bind) = self.resources.publish_partial_opening_pair(
-            Some(vm),
+            if retained { None } else { Some(vm) },
+            retained,
             fragment_queue,
             3,
             tiling_queue,
             3,
             move || late_tiling.publish(),
         )?;
-        let render_bind = render_bind.ok_or(EINVAL)?;
+        if retained {
+            if render_bind.is_some() {
+                return Err(EINVAL);
+            }
+        } else {
+            self.render_bind = Some(render_bind.ok_or(EINVAL)?);
+        }
         self.render_tracker = Some(G17PPartialOpeningRenderTracker {
-            tiling_previous: g17_completion::QueueIndices {
-                done: 0,
-                read: 0,
-                write: 3,
-            },
-            fragment_previous: g17_completion::QueueIndices {
-                done: 0,
-                read: 0,
-                write: 3,
-            },
+            tiling_previous: previous.tiling,
+            fragment_previous: previous.fragment,
             tiling_prefix: 3,
             fragment_prefix: 3,
         });
-        self.render_bind = Some(render_bind);
-        self.render_storage = Some(storage);
         Ok(prepared)
     }
 
@@ -638,6 +681,18 @@ impl G17PManagerConstruction {
         for _ in 0..POLLS {
             fence(Ordering::Acquire);
             let state = self.render_storage.as_mut().ok_or(ENODEV)?.snapshot()?;
+            if !state.job_list_empty
+                && state.tiling.idle()
+                && state.fragment.idle()
+                && state.tiling_timestamps.iter().all(|value| *value != 0)
+                && state.fragment_timestamps.iter().all(|value| *value != 0)
+            {
+                self.render_storage
+                    .as_mut()
+                    .ok_or(ENODEV)?
+                    .quiesce_completed_job_list(state)?;
+                continue;
+            }
             let tracker = self.render_tracker.as_mut().ok_or(ENODEV)?;
             let completion = g17_completion::observe_paired_render_completion(
                 tracker.tiling_previous,
@@ -657,8 +712,10 @@ impl G17PManagerConstruction {
             tracker.fragment_previous = state.fragment;
             if completion.complete {
                 self.render_tracker = None;
-                self.render_storage = None;
-                self.render_bind = None;
+                self.render_submission_ordinal = self
+                    .render_submission_ordinal
+                    .checked_add(1)
+                    .ok_or(EOVERFLOW)?;
                 return Ok(completion);
             }
             fsleep(Delta::from_millis(1));

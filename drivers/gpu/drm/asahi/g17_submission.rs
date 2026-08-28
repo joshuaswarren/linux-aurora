@@ -1137,6 +1137,49 @@ pub(crate) fn apply_g17p_cold_opening_event(
     Ok(())
 }
 
+/// Refresh the canonical optional record for a later logical submission.
+/// The queue-context record itself remains in locator slot zero.
+pub(crate) fn apply_g17p_retained_optional(
+    stage: G17PColdOpeningStage,
+    addresses: G17PColdOpeningOptionalAddresses,
+    submission_ordinal: u32,
+    out: &mut [u8],
+) -> Result<(), SubmissionError> {
+    if submission_ordinal > 0xff {
+        return Err(SubmissionError::PartialOpeningQueueHeadOutOfRange);
+    }
+    apply_g17p_cold_opening_optional(stage, addresses, out)?;
+    if submission_ordinal != 0 {
+        for offset in [0x1a, 0x52, 0x62] {
+            put_u16_le(out, offset, 0);
+        }
+    }
+    put_u16_le(out, 0x2a, submission_ordinal as u16);
+    put_u16_le(out, 0x2e, (submission_ordinal as u16) << 8);
+    put_u16_le(out, 0x3e, submission_ordinal as u16);
+    if stage == G17PColdOpeningStage::Tiling {
+        put_u16_le(out, 0x76, submission_ordinal as u16);
+    }
+    Ok(())
+}
+
+/// Refresh the canonical event record while retaining its physical address.
+pub(crate) fn apply_g17p_retained_event(
+    stage: G17PColdOpeningStage,
+    submission_ordinal: u32,
+    out: &mut [u8],
+) -> Result<(), SubmissionError> {
+    let group_number = submission_ordinal
+        .checked_add(1)
+        .ok_or(SubmissionError::PartialOpeningQueueHeadOutOfRange)?;
+    if group_number > 0x00ff_ffff {
+        return Err(SubmissionError::PartialOpeningQueueHeadOutOfRange);
+    }
+    apply_g17p_cold_opening_event(stage, out)?;
+    put_u32_le(out, 0x08, (group_number << 8) | 2);
+    Ok(())
+}
+
 /// Write the cold class-2 queue record with queue identity 0x15.
 pub(crate) fn apply_g17p_cold_opening_queue_record(
     addresses: G17PColdOpeningQueueAddresses,
@@ -3908,6 +3951,61 @@ mod tests {
                 assert_eq!(*byte, 0xa5, "unproven byte changed at {index:#x}");
             }
         }
+    }
+
+    #[test]
+    fn g17p_retained_canonical_records_advance_logically_without_moving() {
+        let addresses = G17PColdOpeningOptionalAddresses {
+            context_scratch: 0x70_0200_0000,
+            firmware_scratch: 0x70_0200_4000,
+            shared_control: 0x70_0200_8000,
+            channel_control: 0x70_0200_c000,
+            tiling_shared_object: 0x70_0201_0000,
+        };
+        for stage in [G17PColdOpeningStage::Tiling, G17PColdOpeningStage::Fragment] {
+            let mut optional = [0u8; G17P_COLD_OPENING_OPTIONAL_SIZE];
+            apply_g17p_retained_optional(stage, addresses, 1, &mut optional).unwrap();
+            assert_eq!(get_u16_le(&optional, 0x1a), 0);
+            assert_eq!(get_u16_le(&optional, 0x2a), 1);
+            assert_eq!(get_u16_le(&optional, 0x2e), 0x100);
+            assert_eq!(get_u16_le(&optional, 0x3e), 1);
+            assert_eq!(get_u16_le(&optional, 0x52), 0);
+            assert_eq!(get_u16_le(&optional, 0x62), 0);
+            assert_eq!(
+                get_u16_le(&optional, 0x76),
+                if stage == G17PColdOpeningStage::Tiling {
+                    1
+                } else {
+                    u16::MAX
+                }
+            );
+
+            let mut event = [0u8; G17P_COLD_OPENING_EVENT_SIZE];
+            apply_g17p_retained_event(stage, 1, &mut event).unwrap();
+            assert_eq!(get_u32_le(&event, 0x08), 0x202);
+        }
+
+        let pair = prepare_g17p_partial_opening_work_pair(
+            G17PPartialOpeningOuterChannelState {
+                consumers: [1, 1],
+                producer: 1,
+                queue_gpu_va: 0x70_0300_00c0,
+                queue_write_index: 3,
+            },
+            G17PPartialOpeningOuterChannelState {
+                consumers: [1, 1],
+                producer: 1,
+                queue_gpu_va: 0x70_0300_0000,
+                queue_write_index: 3,
+            },
+        )
+        .unwrap();
+        assert_eq!(pair.fragment.slot_index, 1);
+        assert_eq!(pair.tiling.slot_index, 1);
+        assert_eq!(pair.fragment.next_producer, 2);
+        assert_eq!(pair.tiling.next_producer, 2);
+        assert_eq!(get_u32_le(&pair.fragment.slot, 0x14), 0x0101_0003);
+        assert_eq!(get_u32_le(&pair.tiling.slot, 0x14), 0x0100_0003);
     }
 
     #[test]
