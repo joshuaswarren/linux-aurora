@@ -62,7 +62,7 @@ static void apple_dcp_link_rpc_size_test(struct kunit *test)
 
 static void apple_dcp_link_rpc_message_test(struct kunit *test)
 {
-	u64 message;
+	u64 encoded, message;
 
 	KUNIT_ASSERT_EQ(test,
 			apple_dcp_link_rpc_message(0x1234, 0x5678, false, &message),
@@ -76,6 +76,34 @@ static void apple_dcp_link_rpc_message_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test,
 			apple_dcp_link_rpc_message(0x10000, 0, false, &message),
 			-ERANGE);
+
+	KUNIT_ASSERT_EQ(test,
+			apple_dcp_link_stream_message(message, 5, true, &encoded), 0);
+	KUNIT_EXPECT_EQ(test, encoded & GENMASK_ULL(15, 0), 0x1702ULL);
+	KUNIT_EXPECT_EQ(test,
+			FIELD_GET(APPLE_DCP_LINK_MSG_STREAM, encoded), 5ULL);
+	KUNIT_EXPECT_TRUE(test, encoded & APPLE_DCP_LINK_MSG_REMOTE);
+	KUNIT_EXPECT_TRUE(test, encoded & APPLE_DCP_LINK_MSG_NESTED);
+}
+
+static void apple_dcp_link_stack_test(struct kunit *test)
+{
+	u32 next, offset;
+
+	KUNIT_ASSERT_EQ(test,
+			apple_dcp_link_stack_push(0x80, 0x1000, 0x41, 0x40,
+						   &offset, &next),
+			0);
+	KUNIT_EXPECT_EQ(test, offset, 0x80U);
+	KUNIT_EXPECT_EQ(test, next, 0x100U);
+
+	KUNIT_ASSERT_EQ(test, apple_dcp_link_stack_pop(next, 0x41, 0x40, &next),
+			0);
+	KUNIT_EXPECT_EQ(test, next, 0x80U);
+	KUNIT_EXPECT_EQ(test,
+			apple_dcp_link_stack_push(0xff0, 0x1000, 0x20, 0x40,
+						   &offset, &next),
+			-ENOSPC);
 }
 
 static void apple_dcp_h17p_rt_bw_test(struct kunit *test)
@@ -94,6 +122,7 @@ static struct kunit_case apple_dcp_link_test_cases[] = {
 	KUNIT_CASE(apple_dcp_link_rpc_header_test),
 	KUNIT_CASE(apple_dcp_link_rpc_size_test),
 	KUNIT_CASE(apple_dcp_link_rpc_message_test),
+	KUNIT_CASE(apple_dcp_link_stack_test),
 	KUNIT_CASE(apple_dcp_h17p_rt_bw_test),
 	{}
 };
