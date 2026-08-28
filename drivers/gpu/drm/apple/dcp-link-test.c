@@ -18,6 +18,42 @@ static void apple_dcp_link_init_desc_test(struct kunit *test)
 			APPLE_DCP_LINK_PROTOCOL_VERSION);
 }
 
+static void apple_dcp_link_inherited_memory_test(struct kunit *test)
+{
+	struct apple_dcp_link_init_desc *desc;
+	u8 *memory;
+	bool idle;
+
+	memory = kunit_kzalloc(test, APPLE_DCP_LINK_STREAM_MEMORY_SIZE,
+			       GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, memory);
+	desc = (struct apple_dcp_link_init_desc *)memory;
+	apple_dcp_link_init_desc_encode(desc, 0x10002000000ULL, true);
+
+	KUNIT_EXPECT_TRUE(test, apple_dcp_link_init_desc_valid(desc));
+	idle = apple_dcp_link_stream_memory_idle(memory,
+						 sizeof(*desc));
+	KUNIT_EXPECT_TRUE(test, idle);
+	idle = apple_dcp_link_stream_memory_idle(memory,
+						 APPLE_DCP_LINK_STREAM_MEMORY_SIZE);
+	KUNIT_EXPECT_TRUE(test, idle);
+
+	memory[0x4000] = 1;
+	idle = apple_dcp_link_stream_memory_idle(memory,
+						 APPLE_DCP_LINK_STREAM_MEMORY_SIZE);
+	KUNIT_EXPECT_FALSE(test, idle);
+	memory[0x4000] = 0;
+
+	desc->version = cpu_to_le32(3);
+	KUNIT_EXPECT_FALSE(test, apple_dcp_link_init_desc_valid(desc));
+	desc->version = cpu_to_le32(APPLE_DCP_LINK_PROTOCOL_VERSION);
+	desc->flags = cpu_to_le32(1);
+	KUNIT_EXPECT_FALSE(test, apple_dcp_link_init_desc_valid(desc));
+	desc->flags = cpu_to_le32(0);
+	desc->shared_dva = cpu_to_le64(0x10002000001ULL);
+	KUNIT_EXPECT_FALSE(test, apple_dcp_link_init_desc_valid(desc));
+}
+
 static void apple_dcp_link_stream_layout_test(struct kunit *test)
 {
 	struct apple_dcp_link_stream_layout layout;
@@ -405,6 +441,7 @@ static void apple_dcp_h17p_rt_bw_reply_test(struct kunit *test)
 
 static struct kunit_case apple_dcp_link_test_cases[] = {
 	KUNIT_CASE(apple_dcp_link_init_desc_test),
+	KUNIT_CASE(apple_dcp_link_inherited_memory_test),
 	KUNIT_CASE(apple_dcp_link_stream_layout_test),
 	KUNIT_CASE(apple_dcp_h17p_clock_rate_test),
 	KUNIT_CASE(apple_dcp_h17p_method_test),

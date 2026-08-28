@@ -21,6 +21,8 @@
 #define APPLE_DCP_LINK_LOCAL_STREAMS_OFFSET	0x078
 #define APPLE_DCP_LINK_REMOTE_STREAMS_OFFSET	0x218
 #define APPLE_DCP_LINK_RPC_MEMORY_SIZE		0x0c0000
+#define APPLE_DCP_LINK_STREAM_MEMORY_SIZE	0x080000
+#define APPLE_DCP_LINK_RPC_PAGE_SIZE		0x004000
 #define APPLE_DCP_LINK_SIDE_MEMORY_SIZE		0x040000
 #define APPLE_DCP_LINK_STREAM_HALF_SIZE		0x020000
 #define APPLE_DCP_LINK_STREAM_BUFFER_SIZE	0x008000
@@ -426,6 +428,42 @@ apple_dcp_link_init_desc_encode(struct apple_dcp_link_init_desc *desc,
 	desc->shared_dva = cpu_to_le64(shared_var_dva);
 	desc->flags = cpu_to_le32(use_64m_window ? APPLE_DCP_LINK_INIT_FLAG_64M : 0);
 	desc->version = cpu_to_le32(APPLE_DCP_LINK_PROTOCOL_VERSION);
+}
+
+static inline bool
+apple_dcp_link_init_desc_valid(const struct apple_dcp_link_init_desc *desc)
+{
+	u64 shared_dva;
+	u32 flags;
+
+	if (!desc)
+		return false;
+
+	shared_dva = le64_to_cpu(desc->shared_dva);
+	flags = le32_to_cpu(desc->flags);
+
+	return le32_to_cpu(desc->version) == APPLE_DCP_LINK_PROTOCOL_VERSION &&
+	       (flags == 0 || flags == APPLE_DCP_LINK_INIT_FLAG_64M) &&
+	       (!shared_dva ||
+		!(shared_dva & (APPLE_DCP_LINK_RPC_PAGE_SIZE - 1)));
+}
+
+static inline bool
+apple_dcp_link_stream_memory_idle(const void *memory, size_t size)
+{
+	const u8 *bytes = memory;
+	size_t offset;
+
+	if (!memory || size < APPLE_DCP_LINK_STREAM_MEMORY_SIZE)
+		return false;
+
+	for (offset = sizeof(struct apple_dcp_link_init_desc);
+	     offset < APPLE_DCP_LINK_STREAM_MEMORY_SIZE; offset++) {
+		if (bytes[offset])
+			return false;
+	}
+
+	return true;
 }
 
 static inline int apple_dcp_link_init_message(u64 rpc_dva, u64 *message)

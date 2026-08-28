@@ -54,6 +54,7 @@ bool dcp_crtc_mode_fixup(struct drm_crtc *crtc,
 			 struct drm_display_mode *adjusted_mode);
 void dcp_set_dimensions(struct apple_dcp *dcp);
 void dcp_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message);
+int dcp_start_rtkit_endpoint(struct apple_dcp *dcp, u8 endpoint);
 
 int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port);
 int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port);

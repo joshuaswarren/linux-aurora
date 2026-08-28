@@ -143,6 +143,7 @@ struct apple_dcp {
 	struct regmap *disp_cpu_pstate_regmap;
 	u32 disp_cpu_pstate_offset;
 	bool fresh_boot_cpu_started;
+	bool adopted_session;
 
 	/* DCP has crashed */
 	bool crashed;
@@ -162,6 +163,7 @@ struct apple_dcp {
 	/* DCP shared memory */
 	void *shmem;
 	dma_addr_t shmem_iova;
+	bool shmem_inherited;
 	u32 link_top[2][APPLE_DCP_LINK_STREAMS_PER_SIDE];
 	u16 link_version;
 	u32 link_firmware_hash;
