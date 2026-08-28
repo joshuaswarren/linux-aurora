@@ -7,25 +7,20 @@
 //! `CPU_RUN` directly. A previous stage did exactly that and then freed RTKit
 //! transports while both CPUs could still be running.
 //!
-//! The replacement is deliberately smaller and safe:
+//! The current path keeps each hardware owner explicit:
 //!
 //! 1. [`crate::driver`] admits the exact live DT topology before any target
 //!    effect and passes an unforgeable [`T8140LiveTopologyAdmission`] token.
 //! 2. This module resolves both mailbox providers and verifies their roles and
 //!    exact resources through the provider-owned lifecycle surface.
-//! 3. Both providers must report a complete, reversible CPU lifecycle before
-//!    any DMA setup, SGX write, transport arm, IOP VBAR write, or `CPU_RUN`.
-//! 4. Today that gate is closed because safe stop/reset is not implemented.
-//!    The attempt therefore fails before CPU start. There is no partial CPU
-//!    state to clean up.
+//! 3. Both providers report a matching CPU start and stop implementation.
+//! 4. The pair executor starts GFX then GFX1 and stops GFX1 then GFX on every
+//!    exit, including partial acquisition and body errors.
 //!
 //! Generic RTKit separately exposes a discovery-only HELLO/EPMAP client. It
 //! does not auto-start EP 1 (crashlog), allocate buffers, or send AP/IOP power
-//! transitions. Once provider-owned stop/reset exists, the next stage may arm
-//! two such clients, start both CPUs transactionally, validate exact raw
-//! `0x0c/0x0c` plus `{0,1,0x20,0x21,0x23}`, and unwind GFX1 before GFX on every
-//! error. None of that is claimed executable while the lifecycle gate is
-//! closed.
+//! transitions. Wiring two such clients into the pair body remains the next
+//! stage.
 
 #![allow(dead_code)]
 
@@ -38,11 +33,11 @@ use kernel::{
 
 use crate::{driver::T8140LiveTopologyAdmission, g17_lifecycle, hw, identity};
 
-/// Master opt-in. It remains false; even a local true build stops before
-/// either CPU while the provider reports missing stop/reset capabilities.
+/// Master opt-in. It remains false while the dual RTKit discovery body is not
+/// wired.
 pub(crate) const G17_LIVE_BOOT_ENABLED: bool = false;
 
-/// Ordered boundary stages. `StartCpus` cannot be reached today.
+/// Ordered boundary stages.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum BootStage {
     ExactTopology,
@@ -86,11 +81,19 @@ fn validate_provider(
     Ok(lifecycle)
 }
 
-/// Attempt the first safe G17P live-boot slice.
-///
-/// This function currently performs provider queries only. It returns
-/// `EOPNOTSUPP` before any CPU start because the provider's reversible
-/// lifecycle gate is intentionally closed.
+impl g17_lifecycle::AscCpuLifecycle for AscwrapV6Provider {
+    type Error = Error;
+
+    fn start_cpu(&self) -> Result {
+        AscwrapV6Provider::start_cpu(self)
+    }
+
+    fn stop_cpu(&self) -> Result {
+        AscwrapV6Provider::stop_cpu(self)
+    }
+}
+
+/// Attempt the current G17P live-boot slice.
 pub(crate) fn attempt(
     pdev: &platform::Device<Core>,
     soc: &'static hw::agx3::SocConfig,
@@ -125,10 +128,7 @@ pub(crate) fn attempt(
         BootStage::ProviderOwnership
     );
 
-    // Check both roles before any CPU start. There are no live resources to
-    // unwind if either check fails. Once this gate can succeed, the executor
-    // must acquire transports primary then secondary and explicitly unwind
-    // secondary then primary on every subsequent error.
+    // Check both roles before either CPU starts.
     let gfx_gate = gfx.require_safe_cpu_lifecycle();
     let gfx1_gate = gfx1.require_safe_cpu_lifecycle();
     let transaction_gate =
@@ -136,8 +136,7 @@ pub(crate) fn attempt(
     if gfx_gate.is_err() || gfx1_gate.is_err() || transaction_gate.is_err() {
         dev_err!(
             pdev.as_ref(),
-            "G17P live-boot: {:?} blocked (GFX {:?}, GFX1 {:?}, transaction {:?}); \
-             refusing before IOP VBAR, CPU_RUN, DMA, SGX writes, or RTKit transport\n",
+            "G17P live-boot: {:?} incomplete (GFX {:?}, GFX1 {:?}, transaction {:?})\n",
             BootStage::ReversibleLifecycle,
             gfx_gate.err(),
             gfx1_gate.err(),
@@ -146,14 +145,17 @@ pub(crate) fn attempt(
         return Err(ENOTSUPP);
     }
 
-    // The provider must grow an actual start+reverse-stop transaction before
-    // this boundary may move. A capability check opening by itself is not
-    // authority to fall back to DRM MMIO.
-    dev_err!(
-        pdev.as_ref(),
-        "G17P live-boot: provider lifecycle gate opened without a transactional executor; \
-         refusing at {:?}\n",
-        BootStage::StartCpus
-    );
-    Err(ENOTSUPP)
+    g17_lifecycle::execute_cpu_pair(&gfx, &gfx1, || {
+        dev_info!(
+            pdev.as_ref(),
+            "G17P live-boot: {:?} acquired GFX then GFX1\n",
+            BootStage::StartCpus
+        );
+        dev_err!(
+            pdev.as_ref(),
+            "G17P live-boot: dual RTKit discovery is not wired at {:?}\n",
+            BootStage::DiscoverEpmap
+        );
+        Err(ENOTSUPP)
+    })
 }

@@ -1,14 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! Device-derived G17 ASC power/boot/teardown contract.
+//! Device-derived G17 ASC power, boot, and teardown contract.
 //!
-//! This is a pure validator.  It does not map an ASC aperture, request a
-//! power domain, write IORVBAR, release a CPU, or claim that Linux owns any
-//! of those operations.  The ordering and register transforms below come
-//! from the pinned 25G83 G17P/G17G/G17S AppleA7IOP, ASCWrap-v6, RTBuddy, and
-//! AGX host images.  Grounded teardown operations are modeled independently
-//! from Linux ownership; missing handoffs and cold-state readbacks remain
-//! closed and therefore cannot accidentally open the live executor.
+//! This file is a pure validator. The ordering and register transforms come
+//! from the pinned 25G83 G17P, G17G, and G17S AppleA7IOP, ASCWrap v6, RTBuddy,
+//! and AGX host images. The mailbox provider now owns the exact CPU start and
+//! stop transforms. Remaining power, IOP VBAR, and cold-state work stays
+//! explicit below.
 
 #![cfg_attr(not(test), allow(dead_code))]
 
@@ -871,7 +869,8 @@ pub(crate) fn validate_g17_asc_power_on_order(observed: &[G17AscPowerOnStep]) ->
 }
 
 /// The cluster table supplies these operands at runtime. DeviceTree gate IDs
-/// alone cannot derive them, so an executor must reject an incomplete set.
+/// alone cannot derive them, so an executor must return an error for an
+/// incomplete set.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct G17PmgrClusterOperands {
     pub(crate) cluster_index: Option<u8>,
@@ -1123,7 +1122,7 @@ pub(crate) enum AscRollbackRequirement {
     OwnerStopCpuRequired,
 }
 
-/// Essential, fail-closed ASC launch observer.  It records already-observed
+/// Essential ASC launch observer. It records already-observed
 /// actions and permanently fails on an ordering or value mismatch.
 #[derive(Debug, Copy, Clone)]
 pub(crate) struct G17AscBringup {
@@ -1285,7 +1284,7 @@ pub(crate) struct G17AscLiveGaps {
 pub(crate) const G17_ASC_LIVE_GAPS: G17AscLiveGaps = G17AscLiveGaps {
     pmgr_set_power_state_gate_order_owned: false,
     pmgr_cluster_runtime_operands_proven: false,
-    asc_control_aperture_owned: false,
+    asc_control_aperture_owned: true,
     iorvbar_aperture_and_dma_visibility_owned: false,
     firmware_publication_cache_operation_proven: true,
     wrapper_mmio_enable_source_proven: true,
@@ -1298,8 +1297,9 @@ pub(crate) const G17_ASC_LIVE_GAPS: G17AscLiveGaps = G17AscLiveGaps {
     firmware_dma_owner_handoff_wired: false,
     power_off_linux_owner_wired: false,
     cold_state_readback_complete: false,
+    // AppleA7IOP::resetState() performs no MMIO and is not part of CPU stop.
     hardware_reset_function_available: false,
-    stop_cpu_teardown_owner_wired: false,
+    stop_cpu_teardown_owner_wired: true,
 };
 
 pub(crate) const EXECUTABLE_G17_ASC_BRINGUP_AVAILABLE: bool = false;
@@ -1397,7 +1397,7 @@ mod tests {
     }
 
     #[test]
-    fn idle_classifier_is_fail_closed_and_preserves_short_circuit() {
+    fn idle_classifier_requires_status_and_preserves_short_circuit() {
         let direct = G17_ASC_PROVIDER_PROPERTIES[0];
         assert_eq!(
             classify_asc_idle(direct, None, Some(0)),
@@ -1443,7 +1443,7 @@ mod tests {
     }
 
     #[test]
-    fn iorvbar_is_address_or_valid_bit_and_rejects_tagged_input() {
+    fn iorvbar_is_address_or_valid_bit_and_reports_tagged_input_invalid() {
         assert_eq!(encode_iorvbar(0x2800_0000).unwrap(), 0x2800_0001);
         assert_eq!(
             encode_iorvbar(0x2800_0001),
@@ -1539,16 +1539,45 @@ mod tests {
     fn run_and_stop_cpu_mmio_transforms_are_not_symmetric_guesses() {
         let run = asc_run_cpu_plan(true, true);
         let stop = asc_run_cpu_plan(false, true);
+        assert_eq!(
+            g17_asc_text_evidence(G17AscEvidenceTarget::G17P).ascwrap_run_cpu,
+            0xffff_fe00_08ab_a4b4
+        );
         assert_eq!(run.len, 2);
+        assert_eq!(
+            run.ops,
+            [
+                AscMmioOp::ReadControl { offset: 0x44 },
+                AscMmioOp::WriteControlSet {
+                    offset: 0x44,
+                    bits: 0x10,
+                },
+                AscMmioOp::None,
+                AscMmioOp::None,
+            ]
+        );
         assert_eq!(stop.len, 4);
         assert_eq!(
-            stop.ops[3],
-            AscMmioOp::WriteControlClear {
-                offset: 0x44,
-                bits: 0x20,
-            }
+            stop.ops,
+            [
+                AscMmioOp::ReadControl { offset: 0x44 },
+                AscMmioOp::WriteControlClear {
+                    offset: 0x44,
+                    bits: 0x10,
+                },
+                AscMmioOp::ReadControl { offset: 0x44 },
+                AscMmioOp::WriteControlClear {
+                    offset: 0x44,
+                    bits: 0x20,
+                },
+            ]
         );
         assert_eq!(asc_run_cpu_plan(true, false).len, 0);
+        assert_eq!(
+            g17_asc_text_evidence(G17AscEvidenceTarget::G17P).a7iop_reset_state,
+            0xffff_fe00_08ab_dde0
+        );
+        assert!(!G17_A7IOP_SOFTWARE_RESET_STATE.performs_mmio);
     }
 
     #[test]
@@ -1567,7 +1596,7 @@ mod tests {
     }
 
     #[test]
-    fn start_and_stop_order_validators_reject_reordering() {
+    fn start_and_stop_order_validators_detect_reordering() {
         assert!(validate_a7iop_start_order(&G17_A7IOP_START_ORDER));
         let mut wrong_start = G17_A7IOP_START_ORDER;
         wrong_start.swap(4, 5);
@@ -1878,11 +1907,11 @@ mod tests {
     }
 
     #[test]
-    fn cache_identity_is_proven_but_live_ownership_gates_remain_closed() {
+    fn provider_cpu_ownership_is_wired_and_remaining_work_stays_explicit() {
         let gaps = G17_ASC_LIVE_GAPS;
         assert!(!gaps.pmgr_set_power_state_gate_order_owned);
         assert!(!gaps.pmgr_cluster_runtime_operands_proven);
-        assert!(!gaps.asc_control_aperture_owned);
+        assert!(gaps.asc_control_aperture_owned);
         assert!(!gaps.iorvbar_aperture_and_dma_visibility_owned);
         assert!(gaps.firmware_publication_cache_operation_proven);
         assert!(gaps.wrapper_mmio_enable_source_proven);
@@ -1896,7 +1925,7 @@ mod tests {
         assert!(!gaps.power_off_linux_owner_wired);
         assert!(!gaps.cold_state_readback_complete);
         assert!(!gaps.hardware_reset_function_available);
-        assert!(!gaps.stop_cpu_teardown_owner_wired);
+        assert!(gaps.stop_cpu_teardown_owner_wired);
         assert!(!EXECUTABLE_G17_ASC_BRINGUP_AVAILABLE);
     }
 }
