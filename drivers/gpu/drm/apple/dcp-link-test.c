@@ -134,6 +134,13 @@ static void apple_dcp_link_rpc_size_test(struct kunit *test)
 			apple_dcp_link_rpc_payload_size(U32_MAX, 1, &size),
 			-EOVERFLOW);
 
+	KUNIT_ASSERT_EQ(test,
+			apple_dcp_link_align_payload(0x41,
+						     APPLE_DCP_LINK_RPC_ALIGNMENT,
+						     &size),
+			0);
+	KUNIT_EXPECT_EQ(test, size, 0x44U);
+
 	KUNIT_ASSERT_EQ(test, apple_dcp_link_align_payload(0x41, 0x40, &size), 0);
 	KUNIT_EXPECT_EQ(test, size, 0x80U);
 	KUNIT_EXPECT_EQ(test, apple_dcp_link_align_payload(0x40, 0, &size),
