@@ -15,6 +15,7 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
+#include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/of_device.h>
 #include <linux/of_platform.h>
@@ -44,6 +45,7 @@
 
 #define APPLE_DCP_COPROC_CPU_CONTROL	 0x44
 #define APPLE_DCP_COPROC_CPU_STATUS	 0x48
+#define APPLE_DCP_RTKIT_HANDOFF_PROPERTY "apple,dcp-rtkit-quiesced"
 
 #define DCP_BOOT_TIMEOUT msecs_to_jiffies(1000)
 
@@ -1001,6 +1003,8 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 	enum apple_dcp_coprocessor_start start_mode;
 	u32 cpu_ctrl, cpu_status;
+	u32 handoff_state;
+	bool loader_quiesced;
 	int ret;
 
 	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(42));
@@ -1015,8 +1019,14 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 				 APPLE_DCP_COPROC_CPU_CONTROL);
 	cpu_status = readl_relaxed(dcp->coproc_reg +
 				   APPLE_DCP_COPROC_CPU_STATUS);
+	loader_quiesced = of_chosen &&
+		!of_property_read_u32(of_chosen,
+				      APPLE_DCP_RTKIT_HANDOFF_PROPERTY,
+				      &handoff_state) &&
+		handoff_state == 1;
 	start_mode = apple_dcp_coprocessor_start_mode(
-		dcp->hw.adopt_running_coprocessor, cpu_ctrl, cpu_status);
+		loader_quiesced, dcp->hw.adopt_running_coprocessor,
+		cpu_ctrl, cpu_status);
 
 	of_property_read_u32(dev->of_node, "apple,dcp-index",
 					   &dcp->index);
@@ -1124,6 +1134,8 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 					     "Failed to quiesce inherited RTKit: %d\n",
 					     ret);
 	} else {
+		if (start_mode == APPLE_DCP_COPROCESSOR_QUIESCED_RESTART)
+			dev_info(dev, "restarting loader-quiesced DCP session\n");
 		dcp->rtk = devm_apple_rtkit_init(dev, dcp, "mbox", 0,
 						   &rtkit_ops);
 		if (IS_ERR(dcp->rtk))
