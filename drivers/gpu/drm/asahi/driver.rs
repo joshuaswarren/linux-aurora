@@ -422,7 +422,7 @@ fn refuse_agx3_probe(pdev: &platform::Device<Core>, soc: &'static hw::agx3::SocC
         gen => {
             dev_err!(
                 pdev.as_ref(),
-                "AGX3: no firmware handoff for {:?}: the HwConfig firmware-tuning blocks, init-data layout, and Handoff ABI are not grounded for this generation; refusing before DMA setup or ASC start\n",
+                "AGX3 setup unavailable for {:?}: firmware tuning, initdata, and handoff are incomplete; no DMA or processor state changed\n",
                 gen
             );
             ENODEV
@@ -449,7 +449,7 @@ fn refuse_g15_probe(pdev: &platform::Device<Core>) -> Error {
     );
     dev_err!(
         pdev.as_ref(),
-        "G15 preflight missing evidence {:#x}; refusing before DMA setup, MMIO mapping, UAT ownership, or GFX ASC start\n",
+        "G15 setup incomplete: evidence mask {:#x}; no DMA, MMIO, UAT, or processor state changed\n",
         missing.bits()
     );
     if missing.contains(g15_boot::missing::FIRMWARE_IMAGE) {
@@ -629,7 +629,7 @@ fn refuse_g17_probe(
             Err(e) => {
                 dev_err!(
                     pdev.as_ref(),
-                    "G17P: exact T8140 topology not admitted from the device tree: {:?}; refusing\n",
+                    "G17P topology mismatch: {:?}\n",
                     e
                 );
                 return ENODEV;
@@ -641,7 +641,7 @@ fn refuse_g17_probe(
             Err(e) => {
                 dev_err!(
                     pdev.as_ref(),
-                    "G17: no exact target-bound cold-boot/power preflight: {:?}; refusing\n",
+                    "G17 target setup unavailable: {:?}\n",
                     e
                 );
                 return ENODEV;
@@ -698,7 +698,7 @@ fn refuse_g17_probe(
         if missing.bits() != default_missing.bits() & !g17_boot::missing::FIRMWARE_IDENTITY {
             dev_err!(
                 pdev.as_ref(),
-                "G17: loaded-firmware admission changed a non-identity gate; refusing\n"
+                "G17 firmware admission changed an unrelated setup gate\n"
             );
             return EINVAL;
         }
@@ -709,7 +709,7 @@ fn refuse_g17_probe(
     }
     dev_err!(
         pdev.as_ref(),
-        "G17 preflight missing evidence {:#x}; refusing before DMA setup, any MMIO write, UAT ownership, or GFX/GFX1 ASC start\n",
+        "G17 setup incomplete: evidence mask {:#x}; no DMA, MMIO, UAT, or processor state changed\n",
         missing.bits()
     );
     if missing.contains(g17_boot::missing::FIRMWARE_IDENTITY) {
@@ -847,7 +847,7 @@ impl platform::Driver for AsahiDriver {
         if let Err(missing) = g17_boot::pre_handoff_gate(cfg.gpu_gen as u32) {
             dev_err!(
                 pdev.as_ref(),
-                "G17 dual-role pre-handoff is incomplete (missing evidence mask {:#x}); refusing to start GFX/GFX1\n",
+                "G17 dual-role setup incomplete: evidence mask {:#x}; processors were not started\n",
                 missing.bits()
             );
             return Err(ENODEV);
