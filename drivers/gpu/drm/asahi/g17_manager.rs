@@ -770,15 +770,16 @@ impl G17PManagerConstruction {
         })
     }
 
-    /// Configure one SKSM queue through resource 0 and return its registered
-    /// state only after the QID-valid bit is published.
-    pub(crate) fn configure_compute_sksm_queue(
+    /// Configure the hardware-proven G17P compute queue through resource 0 and
+    /// return its retained state only after the QID-valid bit is published.
+    pub(crate) fn configure_g17p_compute_queue(
         &mut self,
         dev: &AsahiDevice,
         registers: &regs::Resources,
-        queue_id: u8,
-        completion_selector: u8,
     ) -> Result<G17PSksmQueue> {
+        const QUEUE_ID: u8 = 4;
+        const COMPLETION_SELECTOR: u8 = 2;
+
         let mut storage = g17_resources::G17PClRuntimeStorage::new(dev, self.uat())?;
         let compute = g17_resources::G17PComputeDescriptorStorage::new(
             dev,
@@ -803,14 +804,19 @@ impl G17PManagerConstruction {
             },
         )?;
         let routing = g17_submission::G17PComputeQueueRouting {
-            queue_id,
-            completion_selector: completion_selector as u32,
+            queue_id: QUEUE_ID,
+            completion_selector: COMPLETION_SELECTOR as u32,
             entry_gpu_va: storage.entry_gpu_va(),
         };
         let config =
             g17_submission::prepare_g17p_compute_sksm_queue_config(routing, self.sksm_scratch())
                 .map_err(|_| EINVAL)?;
 
+        // Every firmware-visible page and its DVA must be globally published
+        // before the config payload makes the queue reachable from SKSM. The
+        // MMIO helper then stores config word 0, config word 1, and finally the
+        // two QID-valid mask words under one fixed-slot FIFO lock.
+        fence(Ordering::SeqCst);
         registers.g17p_sksm_configure_queue(config.write_pair(), config.enable_pair)?;
 
         Ok(G17PSksmQueue {
@@ -822,10 +828,10 @@ impl G17PManagerConstruction {
             storage,
             compute,
             producer: g17_submission::G17PClKickProducerState {
-                queue_id,
+                queue_id: QUEUE_ID,
                 num_stamps: 256,
                 entry_stride: 0x200,
-                completion_selector,
+                completion_selector: COMPLETION_SELECTOR,
                 qos: g17_submission::G17PClQosConfig {
                     queue_byte_32: 1,
                     class_40: 8,
@@ -1041,7 +1047,7 @@ impl G17PManagerConstruction {
     }
 
     /// Publish newly appended kicks for a queue returned by
-    /// [`Self::configure_compute_sksm_queue`].
+    /// [`Self::configure_g17p_compute_queue`].
     pub(crate) fn add_sksm_kicks(
         &self,
         registers: &regs::Resources,

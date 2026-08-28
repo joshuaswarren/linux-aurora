@@ -81,5 +81,10 @@ kernel::module_platform_driver! {
             // permissions: 0o644,
             description: "Fully isolate GPU contexts (limits performance)",
         },
+        g17p_test_stage: u32 {
+            default: 1,
+            // permissions: 0,
+            description: "G17P bring-up stage (0: control, 1: QID4, 2: compute UAPI)",
+        },
     },
 }
