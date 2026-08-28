@@ -8,7 +8,6 @@
 #include <linux/pci.h>
 #include <linux/of.h>
 #include <linux/delay.h>
-#include <linux/io.h>
 
 #include "mt7921.h"
 #include "../mt76_connac2_mac.h"
@@ -40,15 +39,25 @@ static bool mt7921_disable_aspm;
 module_param_named(disable_aspm, mt7921_disable_aspm, bool, 0644);
 MODULE_PARM_DESC(disable_aspm, "disable PCI ASPM support");
 
+static bool mt7932_apple_l1ss;
+module_param_named(apple_l1ss, mt7932_apple_l1ss, bool, 0644);
+MODULE_PARM_DESC(apple_l1ss, "apply the diagnostic J700 Run191 L1SS image");
+
+static bool mt7932_apple_ltr_ccc;
+module_param_named(apple_ltr_ccc, mt7932_apple_ltr_ccc, bool, 0644);
+MODULE_PARM_DESC(apple_ltr_ccc,
+		 "apply J700 endpoint LTR/CCC policy without enabling L1 substates");
+
+static bool mt7932_skip_prestart_settle;
+module_param_named(skip_prestart_settle, mt7932_skip_prestart_settle,
+		   bool, 0644);
+MODULE_PARM_DESC(skip_prestart_settle,
+		 "skip the diagnostic MT7932 pre-FW_START idle interval");
+
 #define MT7932_MMIO_MAP_SETTING		0x7c00e250
 #define MT7932_MMIO_MAP_SETTING_VALUE	0x70001846
 #define MT7932_MMIO_MAP_SETTING_MASK	GENMASK(31, 16)
 #define MT7932_MMIO_MAP_SETTING_READY	0x70000000
-#define J700_PMGR_BASE			0x300700000ULL
-#define J700_PMGR_SIZE			0x4000
-#define J700_APCIE_DART_BASE		0x390000000ULL
-#define J700_APCIE_DIAG_SIZE		0x30000
-#define J700_APCIE_PORT_OFFSET		0x28000
 
 static int mt7932_mmio_map_setting(struct mt792x_dev *dev)
 {
@@ -267,6 +276,38 @@ static int mt7932_dma_sched_init(struct mt792x_dev *dev)
 	return 0;
 }
 
+static int mt7932_init_idle_tx_rings(struct mt792x_dev *dev)
+{
+	int i;
+
+	/* Run 191 programs TX0..TX14 at 512 entries each before publishing the
+	 * firmware-download rings.  mt76 normally aliases every data AC onto
+	 * TX0, leaving TX1..TX14 absent.  Allocate those queues as inert hardware
+	 * state: no Linux packet is routed to them and CIDX remains zero.
+	 */
+	for (i = 1; i <= 14; i++) {
+		struct mt76_queue *q;
+
+		q = mt76_init_queue(&dev->mt76, 0, i, MT7932_TX_RING_SIZE,
+				    MT_TX_RING_BASE, NULL, 0);
+		if (IS_ERR(q))
+			return PTR_ERR(q);
+		dev->mt7932_idle_tx[i - 1] = q;
+	}
+
+	dev_info(dev->mt76.dev,
+		 "J700_MT7932_IDLE_TX_INVENTORY_PASS: rings=1-14 entries=512 cidx=0 routed=0\n");
+
+	return 0;
+}
+
+static int mt7932_alloc_rx_ring(struct mt792x_dev *dev,
+				enum mt76_rxq_id qid, u8 hw_idx, u16 ndesc)
+{
+	return mt76_queue_alloc(dev, &dev->mt76.q_rx[qid], hw_idx, ndesc,
+				MT7932_RX_BUF_SIZE, MT_RX_EVENT_RING_BASE);
+}
+
 static int mt7921_dma_init(struct mt792x_dev *dev)
 {
 	struct mt7921_dma_layout layout = {
@@ -298,13 +339,19 @@ static int mt7921_dma_init(struct mt792x_dev *dev)
 		layout.has_mcu_wa           = false;
 	}
 	if (is_mt7932(&dev->mt76)) {
+		layout.data_tx_ring_size = MT7932_TX_RING_SIZE;
 		layout.mcu_tx_ring_size = MT7932_TX_MCU_RING_SIZE;
 		layout.fwdl_tx_ring_size = MT7932_TX_FWDL_RING_SIZE;
+		layout.data_rx_ring_size = MT7932_RX_RING_SIZE;
 		layout.mcu_rxdone_ring_size = MT7932_RX_MCU_RING_SIZE;
+		layout.mcu_wa_rxdone_ring_size = MT7932_RX_MCU_WA_RING_SIZE;
+		layout.rx_buf_size = MT7932_RX_BUF_SIZE;
 		dev_info(dev->mt76.dev,
-			 "J700_MT7932_DMA_LAYOUT: tx17=%u tx16=%u rx0=%u\n",
-			 layout.mcu_tx_ring_size, layout.fwdl_tx_ring_size,
-			 layout.mcu_rxdone_ring_size);
+			 "J700_MT7932_DMA_LAYOUT: tx0=%u tx17=%u tx16=%u tx18=%u rx0=%u rx2=%u rx4=%u rx_buf=0x%x\n",
+			 layout.data_tx_ring_size, layout.mcu_tx_ring_size,
+			 layout.fwdl_tx_ring_size, MT7932_TX_AUX_RING_SIZE,
+			 layout.mcu_rxdone_ring_size, layout.data_rx_ring_size,
+			 layout.mcu_wa_rxdone_ring_size, layout.rx_buf_size);
 	}
 
 	mt76_dma_attach(&dev->mt76);
@@ -329,18 +376,44 @@ static int mt7921_dma_init(struct mt792x_dev *dev)
 	if (ret)
 		return ret;
 	mt76_wr(dev, MT_WFDMA0_TX_RING0_EXT_CTRL, 0x4);
-
-	/* command to WM */
-	ret = mt76_init_mcu_queue(&dev->mt76, MT_MCUQ_WM, layout.mcu_wm_txq,
-				  layout.mcu_tx_ring_size, MT_TX_RING_BASE);
-	if (ret)
-		return ret;
+	if (is_mt7932(&dev->mt76)) {
+		ret = mt7932_init_idle_tx_rings(dev);
+		if (ret)
+			return ret;
+	}
 
 	/* firmware download */
 	ret = mt76_init_mcu_queue(&dev->mt76, MT_MCUQ_FWDL, MT7921_TXQ_FWDL,
 				  layout.fwdl_tx_ring_size, MT_TX_RING_BASE);
 	if (ret)
 		return ret;
+
+	/* command to WM */
+	ret = mt76_init_mcu_queue(&dev->mt76, MT_MCUQ_WM, layout.mcu_wm_txq,
+				  layout.mcu_tx_ring_size, MT_TX_RING_BASE);
+	if (ret)
+		return ret;
+	if (is_mt7932(&dev->mt76)) {
+		struct mt76_queue *aux;
+
+		/* Apple allocates a 16-entry TX18 queue before FW_START.  Run 191
+		 * records only its initial CIDX=0 and teardown reset-to-zero; static
+		 * RE routes every init response through RX0.  Reproduce existence and
+		 * geometry without routing any Linux command to this queue.
+		 */
+		ret = mt76_init_mcu_queue(&dev->mt76, MT_MCUQ_WA,
+					  MT7932_TXQ_AUX,
+					  MT7932_TX_AUX_RING_SIZE,
+					  MT_TX_RING_BASE);
+		if (ret)
+			return ret;
+		aux = dev->mt76.q_mcu[MT_MCUQ_WA];
+		dev_info(dev->mt76.dev,
+			 "J700_MT7932_TX18_IDLE_RING_PASS: hw=%u entries=%d cidx=%u didx=%u routed=0 producer_advances=0\n",
+			 aux->hw_idx, aux->ndesc,
+			 readl(&aux->regs->cpu_idx),
+			 readl(&aux->regs->dma_idx));
+	}
 
 	/* event from WM before firmware download */
 	ret = mt76_queue_alloc(dev, &dev->mt76.q_rx[MT_RXQ_MCU],
@@ -350,22 +423,59 @@ static int mt7921_dma_init(struct mt792x_dev *dev)
 	if (ret)
 		return ret;
 
-	if (layout.has_mcu_wa) {
-		/* Change mcu queue after firmware download */
-		ret = mt76_queue_alloc(dev, &dev->mt76.q_rx[MT_RXQ_MCU_WA],
-				       MT7921_RXQ_MCU_WM,
-				       layout.mcu_wa_rxdone_ring_size,
-				       layout.rx_buf_size, MT_WFDMA0(0x540));
-		if (ret)
-			return ret;
-	}
-
 	/* rx data */
 	ret = mt76_queue_alloc(dev, &dev->mt76.q_rx[MT_RXQ_MAIN],
 			       MT7921_RXQ_BAND0, layout.data_rx_ring_size,
 			       layout.rx_buf_size, MT_RX_DATA_RING_BASE);
 	if (ret)
 		return ret;
+
+	if (is_mt7932(&dev->mt76)) {
+		ret = mt7932_alloc_rx_ring(dev, MT_RXQ_BAND1, 3,
+					   MT7932_RX_RING3_SIZE);
+		if (ret)
+			return ret;
+	}
+
+	if (layout.has_mcu_wa) {
+		/* Change mcu queue after firmware download */
+		if (is_mt7932(&dev->mt76))
+			ret = mt7932_alloc_rx_ring(dev, MT_RXQ_MCU_WA, 4,
+						   layout.mcu_wa_rxdone_ring_size);
+		else
+			ret = mt76_queue_alloc(dev,
+					       &dev->mt76.q_rx[MT_RXQ_MCU_WA],
+					       MT7921_RXQ_MCU_WM,
+					       layout.mcu_wa_rxdone_ring_size,
+					       layout.rx_buf_size,
+					       MT_WFDMA0(0x540));
+		if (ret)
+			return ret;
+	}
+
+	if (is_mt7932(&dev->mt76)) {
+		static const struct {
+			enum mt76_rxq_id qid;
+			u8 hw_idx;
+			u16 ndesc;
+		} idle_rx[] = {
+			{ MT_RXQ_BAND1_WA, 5, MT7932_RX_RING5_SIZE },
+			{ MT_RXQ_MAIN_WA,  6, MT7932_RX_RING6_SIZE },
+			{ MT_RXQ_BAND2,    7, MT7932_RX_RING7_SIZE },
+			{ MT_RXQ_BAND2_WA, 8, MT7932_RX_RING8_SIZE },
+		};
+		int i;
+
+		for (i = 0; i < ARRAY_SIZE(idle_rx); i++) {
+			ret = mt7932_alloc_rx_ring(dev, idle_rx[i].qid,
+						   idle_rx[i].hw_idx,
+						   idle_rx[i].ndesc);
+			if (ret)
+				return ret;
+		}
+		dev_info(dev->mt76.dev,
+			 "J700_MT7932_IDLE_RX_INVENTORY_PASS: rx3=32 rx5=224 rx6=128 rx7=512 rx8=64\n");
+	}
 
 	ret = mt76_init_queues(dev, mt792x_poll_rx);
 	if (ret < 0)
@@ -445,98 +555,103 @@ static int mt7921_pci_probe(struct pci_dev *pdev,
 		return ret;
 
 	if (id->device == 0x7932)
-		ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(31));
+		/* Runs 220/225 place every pre-FW_START ring and MCU share
+		 * buffer below 128 MiB. Re-test that placement on the current
+		 * no-PIODMA/direct-config stack; the historical 27-bit run
+		 * predates those fixes and is not a current-stack verdict.
+		 */
+		ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(27));
 	else
 		ret = dma_set_mask(&pdev->dev, DMA_BIT_MASK(32));
 	if (ret)
 		goto err_free_pci_vec;
-	if (id->device == 0x7932 && of_machine_is_compatible("apple,j700")) {
-		void __iomem *apcie, *pmgr, *port;
 
-		/* Run 270 captured these exact power-state registers at Apple's
-		 * successful FW_START response.  Read the Linux pre-DMA state once;
-		 * never touch PMGR from this endpoint driver.
-		 */
-		pmgr = devm_ioremap(&pdev->dev, J700_PMGR_BASE, J700_PMGR_SIZE);
-		if (!pmgr) {
-			ret = -ENOMEM;
-			goto err_free_pci_vec;
-		}
-		dev_info(&pdev->dev,
-			 "J700_MT7932_PMGR_PRE_DMA: v000=0x%08x v258=0x%08x v2a0=0x%08x v310=0x%08x v3a0=0x%08x v3c0=0x%08x writes=0\n",
-			 readl_relaxed(pmgr + 0x000),
-			 readl_relaxed(pmgr + 0x258),
-			 readl_relaxed(pmgr + 0x2a0),
-			 readl_relaxed(pmgr + 0x310),
-			 readl_relaxed(pmgr + 0x3a0),
-			 readl_relaxed(pmgr + 0x3c0));
-
-		apcie = devm_ioremap(&pdev->dev, J700_APCIE_DART_BASE,
-				      J700_APCIE_DIAG_SIZE);
-		if (!apcie) {
-			ret = -ENOMEM;
-			goto err_free_pci_vec;
-		}
-		port = apcie + J700_APCIE_PORT_OFFSET;
-		dev_info(&pdev->dev,
-			 "J700_MT7932_ROOT_PRE_DMA: ltssm=0x%08x intstat=0x%08x intmask=0x%08x link=0x%08x ctrl=%08x/%08x/%08x/%08x/%08x/%08x/%08x/%08x rid=%08x/%08x writes=0\n",
-			 readl_relaxed(port + 0x080),
-			 readl_relaxed(port + 0x100),
-			 readl_relaxed(port + 0x104),
-			 readl_relaxed(port + 0x208),
-			 readl_relaxed(port + 0x800),
-			 readl_relaxed(port + 0x804),
-			 readl_relaxed(port + 0x808),
-			 readl_relaxed(port + 0x80c),
-			 readl_relaxed(port + 0x810),
-			 readl_relaxed(port + 0x814),
-			 readl_relaxed(port + 0x818),
-			 readl_relaxed(port + 0x81c),
-			 readl_relaxed(port + 0x3004),
-			 readl_relaxed(port + 0x3008));
-		dev_info(&pdev->dev,
-			 "J700_MT7932_DART_PRE_DMA: error=%08x/%08x/%08x/%08x enable=%08x tcr1=%08x tcr2=%08x tcr16=%08x tcr17=%08x tcr18=%08x ttbr1=%08x ttbr2=%08x ttbr16=%08x ttbr17=%08x ttbr18=%08x writes=0\n",
-			 readl_relaxed(apcie + 0x100),
-			 readl_relaxed(apcie + 0x104),
-			 readl_relaxed(apcie + 0x170),
-			 readl_relaxed(apcie + 0x174),
-			 readl_relaxed(apcie + 0xc00),
-			 readl_relaxed(apcie + 0x1004),
-			 readl_relaxed(apcie + 0x1008),
-			 readl_relaxed(apcie + 0x1040),
-			 readl_relaxed(apcie + 0x1044),
-			 readl_relaxed(apcie + 0x1048),
-			 readl_relaxed(apcie + 0x1404),
-			 readl_relaxed(apcie + 0x1408),
-			 readl_relaxed(apcie + 0x1440),
-			 readl_relaxed(apcie + 0x1444),
-			 readl_relaxed(apcie + 0x1448));
-	}
-
-	if (mt7921_disable_aspm)
+	if (mt7921_disable_aspm && id->device != 0x7932)
 		mt76_pci_disable_aspm(pdev);
 
-	if (id->device == 0x7932) {
+	if (id->device == 0x7932 && mt7932_apple_l1ss) {
 		struct pci_dev *parent;
-		int aspm_ret, aer;
+		u32 ep_l1ss_ctl1 = 0, ep_l1ss_ctl2 = 0;
+		u32 root_l1ss_ctl1 = 0, root_l1ss_ctl2 = 0;
+		u32 ep_ltr_value = 0;
+		u16 ep_lnkctl = 0, root_lnkctl = 0;
+		int ep_l1ss, root_l1ss, ep_ltr, aer;
 
-		/* mt76_pci_disable_aspm() only clears PCI_EXP_LNKCTL_ASPMC, so
-		 * the L1 PM Substates capability keeps L1.1/L1.2 - including
-		 * the PCI-PM variants - enabled.  On J700 the endpoint leaves
-		 * the link 26-35ms after the last completed MCU response in
-		 * every recorded run, which is what an unrecoverable L1.2
-		 * entry looks like from the Apple root port.
+		/* J700's pci-l1pm-control properties and Run 191 give the exact
+		 * coordinated L1SS images.  Apple writes Control 2 before Control
+		 * 1, then enables ASPM L1.  Cycle 258 proved this keeps the root
+		 * Gen2 x1 / DLL-active through 165 ms; combine it with Cycle 337's
+		 * exact interrupt ABI to span the 142 ms Apple FW_START response.
 		 */
-		aspm_ret = pci_disable_link_state(pdev, PCIE_LINK_STATE_ALL);
+		parent = pdev->bus->self;
+		if (!parent) {
+			ret = -ENODEV;
+			goto err_free_pci_vec;
+		}
+		ep_l1ss = pci_find_ext_capability(pdev, PCI_EXT_CAP_ID_L1SS);
+		root_l1ss = pci_find_ext_capability(parent, PCI_EXT_CAP_ID_L1SS);
+		ep_ltr = pci_find_ext_capability(pdev, PCI_EXT_CAP_ID_LTR);
+		if (!ep_l1ss || !root_l1ss || !ep_ltr) {
+			dev_err(&pdev->dev,
+				"J700_MT7932_L1SS_APPLE_FAIL: ep_cap=%#x root_cap=%#x ltr_cap=%#x\n",
+				ep_l1ss, root_l1ss, ep_ltr);
+			ret = -ENODEV;
+			goto err_free_pci_vec;
+		}
+
+		pci_write_config_dword(pdev, ep_ltr + PCI_LTR_MAX_SNOOP_LAT,
+				       0x10081008);
+		pci_write_config_dword(parent, root_l1ss + PCI_L1SS_CTL2, 0x28);
+		pci_write_config_dword(pdev, ep_l1ss + PCI_L1SS_CTL2, 0x48);
+		pci_write_config_dword(parent, root_l1ss + PCI_L1SS_CTL1,
+				       0x4055040f);
+		pci_write_config_dword(pdev, ep_l1ss + PCI_L1SS_CTL1,
+				       0x4055000f);
+		pcie_capability_clear_and_set_word(parent, PCI_EXP_LNKCTL,
+					   PCI_EXP_LNKCTL_ASPMC,
+					   PCI_EXP_LNKCTL_ASPM_L1);
+		pcie_capability_clear_and_set_word(pdev, PCI_EXP_LNKCTL,
+					   PCI_EXP_LNKCTL_ASPMC |
+					   PCI_EXP_LNKCTL_CCC |
+					   PCI_EXP_LNKCTL_CLKREQ_EN,
+					   PCI_EXP_LNKCTL_ASPM_L1);
+
+		pci_read_config_dword(pdev, ep_ltr + PCI_LTR_MAX_SNOOP_LAT,
+				      &ep_ltr_value);
+		pci_read_config_dword(pdev, ep_l1ss + PCI_L1SS_CTL1,
+				      &ep_l1ss_ctl1);
+		pci_read_config_dword(pdev, ep_l1ss + PCI_L1SS_CTL2,
+				      &ep_l1ss_ctl2);
+		pci_read_config_dword(parent, root_l1ss + PCI_L1SS_CTL1,
+				      &root_l1ss_ctl1);
+		pci_read_config_dword(parent, root_l1ss + PCI_L1SS_CTL2,
+				      &root_l1ss_ctl2);
+		pcie_capability_read_word(pdev, PCI_EXP_LNKCTL, &ep_lnkctl);
+		pcie_capability_read_word(parent, PCI_EXP_LNKCTL, &root_lnkctl);
 		dev_info(&pdev->dev,
-			 "J700_MT7932_ASPM_L1SS_DISABLE: ret=%d\n", aspm_ret);
+			 "J700_MT7932_L1SS_APPLE_PASS: ep_lnkctl=0x%04x root_lnkctl=0x%04x ltr=%#x ep=%#x/%#x root=%#x/%#x\n",
+			 ep_lnkctl, root_lnkctl, ep_ltr_value,
+			 ep_l1ss_ctl1, ep_l1ss_ctl2,
+			 root_l1ss_ctl1, root_l1ss_ctl2);
+		if (ep_ltr_value != 0x10081008 ||
+		    ep_l1ss_ctl1 != 0x4055000f || ep_l1ss_ctl2 != 0x48 ||
+		    root_l1ss_ctl1 != 0x4055040f || root_l1ss_ctl2 != 0x28 ||
+		    (ep_lnkctl & (PCI_EXP_LNKCTL_ASPMC |
+				  PCI_EXP_LNKCTL_CCC |
+				  PCI_EXP_LNKCTL_CLKREQ_EN)) !=
+				 PCI_EXP_LNKCTL_ASPM_L1 ||
+		    (root_lnkctl & PCI_EXP_LNKCTL_ASPMC) != PCI_EXP_LNKCTL_ASPM_L1) {
+			dev_err(&pdev->dev,
+				"J700_MT7932_L1SS_APPLE_FAIL: readback mismatch\n");
+			ret = -ENODEV;
+			goto err_free_pci_vec;
+		}
 
 		/* AER status bits are sticky, so the values read after the link
 		 * drops cannot be separated from link-training artifacts.
 		 * Record them here and clear both registers (write-1-to-clear)
 		 * so anything set at failure time accumulated during this run.
 		 */
-		parent = pdev->bus->self;
 		aer = parent ? pci_find_ext_capability(parent,
 						       PCI_EXT_CAP_ID_ERR) : 0;
 		if (aer) {
@@ -559,6 +674,44 @@ static int mt7921_pci_probe(struct pci_dev *pdev,
 			dev_info(&pdev->dev,
 				 "J700_MT7932_AER_BASELINE: no AER capability on parent\n");
 		}
+	} else if (id->device == 0x7932 && mt7932_apple_ltr_ccc) {
+		u32 ltr_value = 0;
+		u16 lnkctl = 0;
+		int ltr;
+
+		ltr = pci_find_ext_capability(pdev, PCI_EXT_CAP_ID_LTR);
+		if (!ltr) {
+			dev_err(&pdev->dev,
+				"J700_MT7932_LTR_CCC_FAIL: ltr capability absent\n");
+			ret = -ENODEV;
+			goto err_free_pci_vec;
+		}
+		pci_write_config_dword(pdev, ltr + PCI_LTR_MAX_SNOOP_LAT,
+				       0x10081008);
+		pcie_capability_clear_and_set_word(pdev, PCI_EXP_LNKCTL,
+					   PCI_EXP_LNKCTL_ASPMC |
+					   PCI_EXP_LNKCTL_CCC |
+					   PCI_EXP_LNKCTL_CLKREQ_EN,
+					   PCI_EXP_LNKCTL_ASPM_L1);
+		pci_read_config_dword(pdev, ltr + PCI_LTR_MAX_SNOOP_LAT,
+				      &ltr_value);
+		pcie_capability_read_word(pdev, PCI_EXP_LNKCTL, &lnkctl);
+		if (ltr_value != 0x10081008 ||
+		    (lnkctl & (PCI_EXP_LNKCTL_ASPMC | PCI_EXP_LNKCTL_CCC |
+			       PCI_EXP_LNKCTL_CLKREQ_EN)) !=
+				      PCI_EXP_LNKCTL_ASPM_L1) {
+			dev_err(&pdev->dev,
+				"J700_MT7932_LTR_CCC_FAIL: ltr=0x%08x lnkctl=0x%04x\n",
+				ltr_value, lnkctl);
+			ret = -ENODEV;
+			goto err_free_pci_vec;
+		}
+		dev_info(&pdev->dev,
+			 "J700_MT7932_LTR_CCC_PASS: ltr=0x%08x lnkctl=0x%04x l1ss=baseline-disabled\n",
+			 ltr_value, lnkctl);
+	} else if (id->device == 0x7932) {
+		dev_info(&pdev->dev,
+			 "J700_MT7932_L1SS_DIAGNOSTIC_OFF: source=cycle337-baseline\n");
 	}
 
 	ops = mt792x_get_mac80211_ops(&pdev->dev, &mt7921_ops,
@@ -577,6 +730,9 @@ static int mt7921_pci_probe(struct pci_dev *pdev,
 	pci_set_drvdata(pdev, mdev);
 
 	dev = container_of(mdev, struct mt792x_dev, mt76);
+	if (id->device == 0x7932)
+		WRITE_ONCE(mdev->mcu.mt7932_skip_prestart_settle,
+			   mt7932_skip_prestart_settle);
 
 	regs =  pcim_iomap_region(pdev, 0, pci_name(pdev));
 	if (IS_ERR(regs)) {
@@ -623,7 +779,7 @@ static int mt7921_pci_probe(struct pci_dev *pdev,
 	dev->mt76.bus = bus_ops;
 	if (id->device == 0x7932)
 		dev_info(mdev->dev,
-			 "J700_MT7932_PROBE_ENTER: pci=14c3:7932 bar0=ready dma_mask=31 diagnostic=1\n");
+			 "J700_MT7932_PROBE_ENTER: pci=14c3:7932 bar0=ready dma_mask=27 diagnostic=1 source=macos-run225\n");
 
 	if (!mt7921_disable_aspm && mt76_pci_aspm_supported(pdev))
 		dev->aspm_supported = true;

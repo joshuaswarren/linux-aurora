@@ -17,6 +17,7 @@
 #include <linux/timer.h>
 #include <linux/unaligned.h>
 #include <linux/wait.h>
+#include <linux/workqueue.h>
 
 #include <net/bluetooth/bluetooth.h>
 #include <net/bluetooth/hci_core.h>
@@ -182,6 +183,7 @@ struct btmtk_pcie_dev {
 	spinlock_t ring_lock;
 	wait_queue_head_t ipc_wait;
 	struct timer_list ipc_timer;
+	struct work_struct firmware_work;
 	struct hci_dev *hdev;
 	u8 ipc_state;
 	u8 remote_status;
@@ -196,6 +198,15 @@ struct btmtk_pcie_dev {
 	bool radio_config_loaded;
 	bool stopping;
 };
+
+/* Gate 4 normally waits synchronously for the Bluetooth image response.  On
+ * J700 macOS starts both halves of the shared Sunrise package concurrently;
+ * this diagnostic mode schedules gate 4 before the WLAN driver binds so the
+ * package can reach its joint post-boot state instead of serializing two
+ * mutually dependent firmware starts.
+ */
+static bool shared;
+module_param(shared, bool, 0444);
 
 static bool probe_remap;
 module_param(probe_remap, bool, 0444);
@@ -586,6 +597,24 @@ out_clear_master:
 out_free_image:
 	btmtk_pcie_free_firmware_image(bdev);
 	return err;
+}
+
+static void btmtk_pcie_firmware_work(struct work_struct *work)
+{
+	struct btmtk_pcie_dev *bdev =
+		container_of(work, struct btmtk_pcie_dev, firmware_work);
+	int err;
+
+	if (READ_ONCE(bdev->stopping))
+		return;
+	err = btmtk_pcie_activate_firmware(bdev);
+	if (err)
+		dev_err(&bdev->pdev->dev,
+			"J700_MT793B_SHARED_PACKAGE_FAIL: stage=firmware-activation ret=%d\n",
+			err);
+	else
+		dev_info(&bdev->pdev->dev,
+			 "J700_MT793B_SHARED_PACKAGE_PASS: firmware_active=1 concurrent_wlan=1\n");
 }
 
 static void btmtk_pcie_set_host_control(struct btmtk_pcie_dev *bdev,
@@ -1489,6 +1518,7 @@ static int btmtk_pcie_probe(struct pci_dev *pdev,
 	spin_lock_init(&bdev->ring_lock);
 	init_waitqueue_head(&bdev->ipc_wait);
 	timer_setup(&bdev->ipc_timer, btmtk_pcie_ipc_timer, 0);
+	INIT_WORK(&bdev->firmware_work, btmtk_pcie_firmware_work);
 	pci_set_drvdata(pdev, bdev);
 
 	pci_read_config_word(pdev, PCI_COMMAND, &command);
@@ -1531,6 +1561,11 @@ static int btmtk_pcie_probe(struct pci_dev *pdev,
 	if (load_radio_config && !enable_hci) {
 		dev_err(&pdev->dev,
 			"J700_MT793B_PCIE_GATE_FAIL: stage=radio-config-prerequisite require_hci=1\n");
+		return -EINVAL;
+	}
+	if (shared && gate != 4) {
+		dev_err(&pdev->dev,
+			"J700_MT793B_PCIE_GATE_FAIL: stage=shared-prerequisite require_gate=4\n");
 		return -EINVAL;
 	}
 
@@ -1600,12 +1635,18 @@ static int btmtk_pcie_probe(struct pci_dev *pdev,
 		}
 	}
 	if (activate_firmware) {
-		err = btmtk_pcie_activate_firmware(bdev);
-		if (err) {
-			dev_err(&pdev->dev,
-				"J700_MT793B_PCIE_GATE_FAIL: stage=firmware-activation ret=%d\n",
-				err);
-			return err;
+		if (shared) {
+			schedule_work(&bdev->firmware_work);
+			dev_info(&pdev->dev,
+				 "J700_MT793B_SHARED_PACKAGE_BEGIN: gate=4 async=1 wlan_can_bind=1\n");
+		} else {
+			err = btmtk_pcie_activate_firmware(bdev);
+			if (err) {
+				dev_err(&pdev->dev,
+					"J700_MT793B_PCIE_GATE_FAIL: stage=firmware-activation ret=%d\n",
+					err);
+				return err;
+			}
 		}
 	}
 	if (start_ipc) {
@@ -1646,6 +1687,7 @@ static void btmtk_pcie_remove(struct pci_dev *pdev)
 	struct btmtk_pcie_dev *bdev = pci_get_drvdata(pdev);
 
 	if (bdev) {
+		cancel_work_sync(&bdev->firmware_work);
 		btmtk_pcie_quiesce(bdev);
 		btmtk_pcie_unregister_hci(bdev);
 		bdev->firmware_active = false;
@@ -1675,7 +1717,18 @@ static struct pci_driver btmtk_pcie_driver = {
 	.remove = btmtk_pcie_remove,
 	.shutdown = btmtk_pcie_shutdown,
 };
-module_pci_driver(btmtk_pcie_driver);
+
+static int __init btmtk_pcie_init(void)
+{
+	return pci_register_driver(&btmtk_pcie_driver);
+}
+subsys_initcall(btmtk_pcie_init);
+
+static void __exit btmtk_pcie_exit(void)
+{
+	pci_unregister_driver(&btmtk_pcie_driver);
+}
+module_exit(btmtk_pcie_exit);
 
 MODULE_AUTHOR("Aurora Silicon");
 MODULE_DESCRIPTION("MediaTek MT79xx Bluetooth PCIe transport");

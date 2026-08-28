@@ -657,6 +657,10 @@ struct mt76_mcu {
 	struct mutex mutex;
 	u32 msg_seq;
 	int timeout;
+	bool mt7932_ram_download_active;
+	bool mt7932_skip_prestart_settle;
+	u8 mt7932_ram_download_responses;
+	u8 mt7932_ram_download_first_seq;
 
 	struct sk_buff_head res_q;
 	wait_queue_head_t wait;

@@ -168,18 +168,40 @@ static void mt792x_dma_prefetch(struct mt792x_dev *dev)
 		mt76_wr(dev, MT_WFDMA0_TX_RING15_EXT_CTRL, PREFETCH(0x02c0, 0x4));
 		mt76_wr(dev, MT_WFDMA0_TX_RING16_EXT_CTRL, PREFETCH(0x0300, 0x4));
 	} else if (is_mt7932(&dev->mt76)) {
-		/* Exact Apple MT7932 manual-prefetch layout.  Apple reserves
-		 * prefetch SRAM for its full RX/TX ring inventory even though
-		 * Linux allocates only the rings below.
+		static const struct {
+			u8 ring;
+			u16 base;
+			u8 depth;
+		} rx[] = {
+			{ 0, 0x000, 0x4 }, { 2, 0x040, 0x8 },
+			{ 3, 0x0c0, 0x4 }, { 4, 0x100, 0x4 },
+			{ 5, 0x140, 0x4 }, { 6, 0x180, 0x4 },
+			{ 7, 0x1c0, 0x4 }, { 8, 0x200, 0x4 },
+		}, tx[] = {
+			{ 0,  0x240, 0x4 }, { 1,  0x280, 0x4 },
+			{ 2,  0x2c0, 0x4 }, { 3,  0x300, 0x4 },
+			{ 4,  0x340, 0xc }, { 5,  0x400, 0x4 },
+			{ 6,  0x440, 0x4 }, { 7,  0x480, 0x4 },
+			{ 8,  0x4c0, 0xc }, { 9,  0x580, 0x4 },
+			{ 10, 0x5c0, 0x4 }, { 11, 0x600, 0x4 },
+			{ 12, 0x640, 0xc }, { 13, 0x700, 0x4 },
+			{ 14, 0x740, 0x4 }, { 16, 0x780, 0x4 },
+			{ 17, 0x7c0, 0x4 }, { 18, 0x800, 0x4 },
+		};
+		int i;
+
+		/* Exact complete Run-191 manual-prefetch publication.  The hardware
+		 * contract requires every live ring's MAX_CNT to be installed before
+		 * DMA enable, including rings that remain idle during firmware load.
 		 */
-		mt76_wr(dev, MT_WFDMA0_RX_RING0_EXT_CTRL, PREFETCH(0x000, 0x4));
-		mt76_wr(dev, MT_WFDMA0_RX_RING2_EXT_CTRL, PREFETCH(0x040, 0x8));
-		mt76_wr(dev, MT_WFDMA0_RX_RING4_EXT_CTRL, PREFETCH(0x100, 0x4));
-		mt76_wr(dev, MT_WFDMA0_TX_RING0_EXT_CTRL, PREFETCH(0x240, 0x4));
-		mt76_wr(dev, MT_WFDMA0_TX_RING16_EXT_CTRL, PREFETCH(0x780, 0x4));
-		mt76_wr(dev, MT_WFDMA0_TX_RING17_EXT_CTRL, PREFETCH(0x7c0, 0x4));
+		for (i = 0; i < ARRAY_SIZE(rx); i++)
+			mt76_wr(dev, MT_WFDMA0_RX_RING_EXT_CTRL(rx[i].ring),
+				 PREFETCH(rx[i].base, rx[i].depth));
+		for (i = 0; i < ARRAY_SIZE(tx); i++)
+			mt76_wr(dev, MT_WFDMA0_TX_RING_EXT_CTRL(tx[i].ring),
+				 PREFETCH(tx[i].base, tx[i].depth));
 		dev_info(dev->mt76.dev,
-			 "J700_MT7932_PREFETCH_LAYOUT: rx0=00000004 rx2=00400008 rx4=01000004 tx0=02400004 tx16=07800004 tx17=07c00004\n");
+			 "J700_MT7932_PREFETCH_LAYOUT: full-run191 rx=0,2-8 tx=0-14,16-18 final_tx18=08000004\n");
 	} else {
 		/* rx ring */
 		mt76_wr(dev, MT_WFDMA0_RX_RING0_EXT_CTRL, PREFETCH(0x0, 0x4));
@@ -225,6 +247,13 @@ int mt792x_dma_enable(struct mt792x_dev *dev)
 		   MT_WFDMA0_GLO_CFG_RX_WB_DDONE |
 		   MT_WFDMA0_GLO_CFG_CSR_DISP_BASE_PTR_CHAIN_EN |
 		   MT_WFDMA0_GLO_CFG_OMIT_RX_INFO_PFET2;
+	if (is_mt7932(&dev->mt76))
+		/* Run 191 writes 0x50209045 exactly.  iBoot leaves bit 20 set,
+		 * but Apple's normal WFDMA setup clears the force-loopback RX queue
+		 * selector before enabling DMA.  Preserving it yields 0x50309045
+		 * and can divert the first post-FW_START receive event.
+		 */
+		cfg_mask |= MT_WFDMA0_GLO_CFG_CSR_LBK_RX_Q_SEL_EN;
 	cfg_set = MT_WFDMA0_GLO_CFG_TX_WB_DDONE |
 		  MT_WFDMA0_GLO_CFG_FIFO_LITTLE_ENDIAN |
 		  MT_WFDMA0_GLO_CFG_CLK_GAT_DIS |
@@ -269,7 +298,7 @@ int mt792x_dma_enable(struct mt792x_dev *dev)
 			 mt76_rr(dev, MT7932_WFDMA_EXT_CSR_3038),
 			 mt76_rr(dev, MT_WFDMA0_PRI_DLY_INT_CFG0));
 		dev_info(dev->mt76.dev,
-			 "J700_MT7932_WFDMA_GLO_CFG_PASS: value=0x%08x apple_mask=0x50209045\n",
+			 "J700_MT7932_WFDMA_GLO_CFG_PASS: value=0x%08x apple_exact=0x50209045 loopback_rx_sel=0\n",
 			 mt76_rr(dev, MT_WFDMA0_GLO_CFG));
 	}
 
@@ -281,13 +310,29 @@ int mt792x_dma_enable(struct mt792x_dev *dev)
 	mt76_set(dev, MT_WFDMA_DUMMY_CR, MT_WFDMA_NEED_REINIT);
 
 	/* enable interrupts for TX/RX rings */
-	mt76_connac_irq_enable(&dev->mt76,
-			       dev->irq_map->tx.all_complete_mask |
-			       dev->irq_map->rx.data_complete_mask |
-			       dev->irq_map->rx.wm2_complete_mask |
-			       dev->irq_map->rx.wm_complete_mask |
-			       MT_INT_MCU_CMD);
-	mt76_set(dev, MT_MCU2HOST_SW_INT_ENA, MT_MCU_CMD_WAKE_RX_PCIE);
+	if (is_mt7932(&dev->mt76)) {
+		/* Run 191 writes these exact masks after WFDMA enable and restores
+		 * them after every init response, including the FW_START response.
+		 * Keep the complete mask in mt76's software irqmask as well as in
+		 * hardware so the tasklet does not narrow it after the first IRQ.
+		 */
+		mt76_connac_irq_enable(&dev->mt76, MT7932_HOST_INT_MASK);
+		mt76_wr(dev, MT_MCU2HOST_SW_INT_ENA,
+			 MT7932_MCU2HOST_SW_INT_MASK);
+		dev_info(dev->mt76.dev,
+			 "J700_MT7932_INTERRUPT_SOFTWARE_ARMED: host_now=0x%08x mcu2host=0x%08x source=run191 deferred=1\n",
+			 mt76_rr(dev, dev->irq_map->host_irq_enable),
+			 mt76_rr(dev, MT_MCU2HOST_SW_INT_ENA));
+	} else {
+		mt76_connac_irq_enable(&dev->mt76,
+				       dev->irq_map->tx.all_complete_mask |
+				       dev->irq_map->rx.data_complete_mask |
+				       dev->irq_map->rx.wm2_complete_mask |
+				       dev->irq_map->rx.wm_complete_mask |
+				       MT_INT_MCU_CMD);
+		mt76_set(dev, MT_MCU2HOST_SW_INT_ENA,
+			 MT_MCU_CMD_WAKE_RX_PCIE);
+	}
 
 	return 0;
 }
@@ -305,6 +350,11 @@ mt792x_dma_reset(struct mt792x_dev *dev, bool force)
 	/* reset hw queues */
 	for (i = 0; i < __MT_TXQ_MAX; i++)
 		mt76_queue_reset(dev, dev->mphy.q_tx[i], true);
+	if (is_mt7932(&dev->mt76))
+		for (i = 0; i < ARRAY_SIZE(dev->mt7932_idle_tx); i++)
+			if (dev->mt7932_idle_tx[i])
+				dev->mt76.queue_ops->reset_q(&dev->mt76,
+							dev->mt7932_idle_tx[i], true);
 
 	for (i = 0; i < __MT_MCUQ_MAX; i++)
 		mt76_queue_reset(dev, dev->mt76.q_mcu[i], true);
@@ -324,6 +374,12 @@ int mt792x_wpdma_reset(struct mt792x_dev *dev, bool force)
 	/* clean up hw queues */
 	for (i = 0; i < ARRAY_SIZE(dev->mt76.phy.q_tx); i++)
 		mt76_queue_tx_cleanup(dev, dev->mphy.q_tx[i], true);
+	if (is_mt7932(&dev->mt76))
+		for (i = 0; i < ARRAY_SIZE(dev->mt7932_idle_tx); i++)
+			if (dev->mt7932_idle_tx[i])
+				dev->mt76.queue_ops->tx_cleanup(&dev->mt76,
+							  dev->mt7932_idle_tx[i],
+							  true);
 
 	for (i = 0; i < ARRAY_SIZE(dev->mt76.q_mcu); i++)
 		mt76_queue_tx_cleanup(dev, dev->mt76.q_mcu[i], true);

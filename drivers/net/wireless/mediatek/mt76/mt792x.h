@@ -326,6 +326,8 @@ struct mt792x_dev {
 	dma_addr_t mt7932_ipc_dma;
 	void *mt7932_aux_buf;
 	dma_addr_t mt7932_aux_dma;
+	/* Run 191 publishes otherwise-idle WFDMA TX1..TX14 before FW_START. */
+	struct mt76_queue *mt7932_idle_tx[14];
 
 	struct ieee80211_chanctx_conf *new_ctx;
 

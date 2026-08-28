@@ -588,6 +588,7 @@ void mt7921_queue_rx_skb(struct mt76_dev *mdev, enum mt76_rxq_id q,
 			 struct sk_buff *skb, u32 *info)
 {
 	struct mt792x_dev *dev = container_of(mdev, struct mt792x_dev, mt76);
+	struct mt76_connac2_mcu_rxd *mcu_rxd;
 	__le32 *rxd = (__le32 *)skb->data;
 	__le32 *end = (__le32 *)&skb->data[skb->len];
 	enum rx_pkt_type type;
@@ -609,6 +610,27 @@ void mt7921_queue_rx_skb(struct mt76_dev *mdev, enum mt76_rxq_id q,
 		napi_consume_skb(skb, 1);
 		break;
 	case PKT_TYPE_RX_EVENT:
+		/* Run225 restores these masks after each of the five download-config
+		 * responses and before it advances RX ring 0. Track the serialized
+		 * RAM download-config request itself instead of guessing an absolute
+		 * sequence range; the preceding OTP transcript may shift it.
+		 * Keep this in the event path so the following DMA refill observes
+		 * the same ordering, without replaying it for every MCU event.
+		 */
+		mcu_rxd = (void *)skb->data;
+		if (is_mt7932(mdev) && q == MT_RXQ_MCU &&
+		    READ_ONCE(mdev->mcu.mt7932_ram_download_active) &&
+		    skb->len >= sizeof(*mcu_rxd) && mcu_rxd->eid == 1 &&
+		    mcu_rxd->option == 0 &&
+		    mcu_rxd->ext_eid == 1) {
+			__mt76_wr(mdev, MT7932_HOST_INT_ENA, 0);
+			__mt76_wr(mdev, MT_WFDMA0_HOST_INT_STA,
+				  MT7932_HOST_INT_ACK);
+			mt76_set_irq_mask(mdev, MT7932_HOST_INT_ENA, 0,
+					  MT7932_HOST_INT_MASK);
+			__mt76_wr(mdev, MT_MCU2HOST_SW_INT_ENA,
+				  MT7932_MCU2HOST_SW_INT_MASK);
+		}
 		mt7921_mcu_rx_event(dev, skb);
 		break;
 	case PKT_TYPE_TXS:

@@ -17,6 +17,13 @@
 #define MT7932_SEC_BOOT_MODE_EXIT	0x1845184f
 #define MT7932_FW_START_READY_PERIOD_MS	10
 #define MT7932_FW_START_READY_STOP_US	50000
+#define MT7932_FW_PCIE_BUSDEV		0x74030144
+#define MT7932_FW_PCIE_COMMAND		0x74031004
+#define MT7932_FW_ENTRY_MARKER		0x7c053a5c
+#define MT7932_PCI_MCU_STATE		0x48c
+#define MT7932_PCI_MCU_STATE_MASK	GENMASK(19, 16)
+#define MT7932_FW_SETTLE_MIN_US		20000
+#define MT7932_FW_SETTLE_MAX_US		21000
 
 static int mt7932_sec_protect_fwdl(struct mt76_dev *dev, bool get)
 {
@@ -29,6 +36,8 @@ static int mt7932_sec_protect_fwdl(struct mt76_dev *dev, bool get)
 				      BIT(0), BIT(0), 5000))
 			ret = -ETIMEDOUT;
 		status = __mt76_rr(dev, MT7932_SEC_BOOT_STATUS);
+		if (status == U32_MAX)
+			ret = -ENODEV;
 	} else {
 		__mt76_wr(dev, MT7932_SEC_BOOT_RELEASE, 1);
 	}
@@ -92,6 +101,53 @@ out:
 	return ret;
 }
 EXPORT_SYMBOL_GPL(mt76_connac_mcu_read_otp);
+
+int mt76_connac_mcu_read_init_reg(struct mt76_dev *dev, u32 addr, u32 *value)
+{
+	struct {
+		u8 query;
+		u8 reserved[3];
+		__le32 addr;
+		__le32 data;
+	} __packed req = {
+		.query = 0,
+		.addr = cpu_to_le32(addr),
+	};
+	struct {
+		__le32 addr;
+		__le32 data;
+	} __packed *event;
+	struct sk_buff *skb;
+	int ret;
+
+	ret = mt76_mcu_send_and_get_msg(dev, MCU_CMD(INIT_ACCESS_REG),
+					&req, sizeof(req), true, &skb);
+	if (ret)
+		return ret;
+	if (skb->len < sizeof(*event)) {
+		ret = -EPROTO;
+		goto out;
+	}
+
+	event = (void *)skb->data;
+	if (le32_to_cpu(event->addr) != addr) {
+		dev_err(dev->dev,
+			"J700_MT7932_INIT_REG_READ_FAIL: addr=0x%08x expected=0x%08x len=%u\n",
+			le32_to_cpu(event->addr), addr, skb->len);
+		ret = -EPROTO;
+		goto out;
+	}
+
+	*value = le32_to_cpu(event->data);
+	dev_info(dev->dev,
+		 "J700_MT7932_INIT_REG_READ_PASS: addr=0x%08x value=0x%08x\n",
+		 addr, *value);
+out:
+	dev_kfree_skb(skb);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(mt76_connac_mcu_read_init_reg);
 
 int mt76_connac_mcu_patch_sem_ctrl(struct mt76_dev *dev, bool get)
 {
@@ -3096,14 +3152,49 @@ static int mt7932_mcu_drain_fwdl(struct mt76_dev *dev)
 
 static int mt7932_mcu_require_host_ready(struct mt76_dev *dev)
 {
+	static const u16 cfg_offsets[] = {
+		0x088, 0x090, 0x0a8, 0x0fc, 0x10c,
+		0x118, 0x11c, 0x1d0, 0x200, 0x204,
+	};
 	struct pci_dev *pdev;
+	ktime_t settle_start;
+	u32 fw_busdev, fw_command, cfg48c, pc;
+	u32 cfg[ARRAY_SIZE(cfg_offsets)];
+	s64 settle_us;
 	u16 command = 0xffff;
+	unsigned int i;
 	int ret;
 
 	if (!dev_is_pci(dev->dev))
 		return -ENODEV;
 
 	pdev = to_pci_dev(dev->dev);
+	/* Run 191's unpaused trace leaves 31.628 ms between the fifth
+	 * download-config response and CID-2.  Linux already spends about
+	 * 12.17 ms draining TX16 and preparing the secure/IRQ state, so add
+	 * the measured missing 20 ms here.  Cycle 367 proved that issuing CID-2
+	 * while WM PC was still in 0x0090xxxx patch code only reached state 2.
+	 */
+	if (READ_ONCE(dev->mcu.mt7932_skip_prestart_settle)) {
+		settle_us = 0;
+	} else {
+		settle_start = ktime_get();
+		usleep_range(MT7932_FW_SETTLE_MIN_US,
+			     MT7932_FW_SETTLE_MAX_US);
+		settle_us = ktime_us_delta(ktime_get(), settle_start);
+	}
+	ret = pci_read_config_dword(pdev, MT7932_PCI_MCU_STATE, &cfg48c);
+	if (ret || cfg48c == U32_MAX)
+		return ret ?: -ENODEV;
+	pc = __mt76_rr(dev, MT7932_WM_MCU_PC_DBG);
+	if (pc == U32_MAX)
+		return -ENODEV;
+	for (i = 0; i < ARRAY_SIZE(cfg_offsets); i++) {
+		ret = pci_read_config_dword(pdev, cfg_offsets[i], &cfg[i]);
+		if (ret || cfg[i] == U32_MAX)
+			return ret ?: -ENODEV;
+	}
+
 	ret = pci_read_config_word(pdev, PCI_COMMAND, &command);
 	if (ret || command == 0xffff ||
 	    (command & (PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER)) !=
@@ -3114,6 +3205,24 @@ static int mt7932_mcu_require_host_ready(struct mt76_dev *dev)
 			!!(command & PCI_COMMAND_MASTER));
 		return ret ?: -ENODEV;
 	}
+
+	/* The NDS32 image's hal_hif host-ready path at 0x0091ab46 reads these
+	 * device-internal PCIe shadows, derives bus/device from 0x74030144 and
+	 * tests BME at bit 2 of 0x74031004.  Host ECAM command 0x0406 alone does
+	 * not prove that the running firmware observes the same state.
+	 */
+	fw_busdev = __mt76_rr(dev, MT7932_FW_PCIE_BUSDEV);
+	fw_command = __mt76_rr(dev, MT7932_FW_PCIE_COMMAND);
+	if (fw_busdev == U32_MAX || fw_command == U32_MAX)
+		return -ENODEV;
+	dev_info(dev->dev,
+		 "J700_MT7932_FW_HOST_READY_VIEW: busdev=0x%08x bus=%u device=%u command=0x%08x bme=%u host_command=0x%04x cfg48c=0x%08x mcu_state=%u wm_pc=0x%08x settle_us=%lld devctl=0x%08x lnkctl=0x%08x devctl2=0x%08x pmcsr=0x%08x ltr=0x%08x l1ss1=0x%08x l1ss2=0x%08x ptm=0x%08x aer=0x%08x aer_status=0x%08x source=run226-config-snapshot nds32=0x0091ab46\n",
+		 fw_busdev, (fw_busdev >> 8) & 0xff,
+		 (fw_busdev & 0xf8) >> 3, fw_command,
+		 !!(fw_command & BIT(2)), command, cfg48c,
+		 (u32)FIELD_GET(MT7932_PCI_MCU_STATE_MASK, cfg48c), pc,
+		 settle_us, cfg[0], cfg[1], cfg[2], cfg[3], cfg[4],
+		 cfg[5], cfg[6], cfg[7], cfg[8], cfg[9]);
 
 	return 0;
 }
@@ -3229,13 +3338,20 @@ static bool mt7932_fw_start_watch_begin(struct mt76_dev *dev,
 static void mt7932_fw_start_watch_end(struct mt76_dev *dev,
 				      struct mt7932_fw_start_watch *w)
 {
+	u32 entry_marker = U32_MAX;
+
 	cancel_delayed_work_sync(&w->work);
 	destroy_delayed_work_on_stack(&w->work);
+	if (!READ_ONCE(w->gone))
+		entry_marker = __mt76_rr(dev, MT7932_FW_ENTRY_MARKER);
 	dev_info(dev->dev,
 		 "J700_MT7932_FW_START_EARLY_READY: samples=%u first_us=%lld first=0x%08x first_n9=0x%x last_us=%lld last=0x%08x last_n9=0x%x stop_us=%u\n",
 		 w->ready_samples, w->ready_first_us, w->ready_first,
 		 w->ready_first & 0x3, w->ready_last_us, w->ready_last,
 		 w->ready_last & 0x3, MT7932_FW_START_READY_STOP_US);
+	dev_info(dev->dev,
+		 "J700_MT7932_FW_ENTRY_MARKER: addr=0x%08x value=0x%08x endpoint_present=%u\n",
+		 MT7932_FW_ENTRY_MARKER, entry_marker, !READ_ONCE(w->gone));
 
 	if (READ_ONCE(w->gone))
 		dev_err(dev->dev,
@@ -3262,6 +3378,9 @@ mt76_connac_mcu_send_ram_firmware(struct mt76_dev *dev,
 
 	if (is_mt7932(dev)) {
 		max_len = 2048;
+		WRITE_ONCE(dev->mcu.mt7932_ram_download_active, false);
+		WRITE_ONCE(dev->mcu.mt7932_ram_download_responses, 0);
+		WRITE_ONCE(dev->mcu.mt7932_ram_download_first_seq, 0);
 		dev_info(dev->dev,
 			 "J700_MT7932_SCATTER_LIMIT: phase=ram bytes=%d\n",
 			 max_len);
@@ -3285,7 +3404,11 @@ mt76_connac_mcu_send_ram_firmware(struct mt76_dev *dev,
 		if (region->feature_set & FW_FEATURE_OVERRIDE_ADDR)
 			override = addr;
 
+		if (is_mt7932(dev))
+			WRITE_ONCE(dev->mcu.mt7932_ram_download_active, true);
 		err = mt76_connac_mcu_init_download(dev, addr, len, mode);
+		if (is_mt7932(dev))
+			WRITE_ONCE(dev->mcu.mt7932_ram_download_active, false);
 		if (err) {
 			dev_err(dev->dev, "Download request failed\n");
 			return err;
@@ -3313,13 +3436,26 @@ next:
 		option |= FW_START_WORKING_PDA_CR4;
 
 	if (is_mt7932(dev)) {
+		u32 pc_sel, pc_before;
+
 		ret = mt7932_mcu_require_host_ready(dev);
 		if (ret)
 			return ret;
 
+		pc_sel = __mt76_rr(dev, MT7932_WM_MCU_PC_LOG_SEL);
+		pc_sel &= ~MT7932_WM_MCU_PC_LOG_MASK;
+		pc_sel |= MT7932_WM_MCU_PC_LOG_CURRENT;
+		__mt76_wr(dev, MT7932_WM_MCU_PC_LOG_SEL, pc_sel);
+		pc_sel = __mt76_rr(dev, MT7932_WM_MCU_PC_LOG_SEL);
+		pc_before = __mt76_rr(dev, MT7932_WM_MCU_PC_DBG);
+		dev_info(dev->dev,
+			 "J700_MT7932_WM_PC_ARMED: selector=0x%08x current_pc=0x%08x source=mt7933-host-csr\n",
+			 pc_sel, pc_before);
+
 		ret = mt7932_sec_protect_fwdl(dev, true);
 		if (ret)
 			return ret;
+
 	}
 
 	watching = mt7932_fw_start_watch_begin(dev, &watch);
@@ -3541,6 +3677,17 @@ int mt76_connac2_load_patch(struct mt76_dev *dev, const char *fw_name)
 out:
 	if (secure_held)
 		mt7932_sec_protect_fwdl(dev, false);
+	if (is_mt7932(dev) && !ret) {
+		/* AppleSunriseWLAN 25G83 does not send a release command after
+		 * PATCH_FINISH on its successful MT7932 path.  Secure-FWDL release
+		 * is the direct MMIO operation above, and PATCH_FINISH has already
+		 * completed the ROM patch transaction.
+		 */
+		dev_info(dev->dev,
+			 "J700_MT7932_PATCH_SEMAPHORE_RELEASE_SKIP: source=apple-25G83\n");
+		release_firmware(fw);
+		return 0;
+	}
 	sem = mt76_connac_mcu_patch_sem_ctrl(dev, false);
 	switch (sem) {
 	case PATCH_REL_SEM_SUCCESS:

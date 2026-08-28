@@ -2031,6 +2031,7 @@ int mt76_connac_mcu_start_patch(struct mt76_dev *dev);
 int mt76_connac_mcu_patch_sem_ctrl(struct mt76_dev *dev, bool get);
 int mt76_connac_mcu_start_firmware(struct mt76_dev *dev, u32 addr, u32 option);
 int mt76_connac_mcu_read_otp(struct mt76_dev *dev, u32 addr, u8 *value);
+int mt76_connac_mcu_read_init_reg(struct mt76_dev *dev, u32 addr, u32 *value);
 
 void mt76_connac_mcu_build_rnr_scan_param(struct mt76_dev *mdev,
 					  struct cfg80211_scan_request *sreq);

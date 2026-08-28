@@ -17,31 +17,37 @@ static bool mt7921_disable_clc;
 module_param_named(disable_clc, mt7921_disable_clc, bool, 0644);
 MODULE_PARM_DESC(disable_clc, "disable CLC support");
 
-/* MediaTek's own gen4-mt79xx driver decodes the INIT_EVENT_CMD_RESULT status
- * byte for the firmware-start path in wlanInitEventStatusCodeToStr()
- * (chips/common/fw_dl.c, GPL-2.0 OR BSD-3-Clause).  The codes are:
+/* AppleSunriseWLAN 25G83 has two tables in wlanInitEventStatusCodeToStr().
+ * MT7922 uses the public gen4-mt79xx 0..6 ABI.  Every other chip, including
+ * J700's MT7932, uses this distinct 1..13 ABI.  wlanConfigWifiFuncStatus()
+ * explicitly accepts status 1 for MT7932 and reads the result from byte 8 of
+ * the compact INIT_WIFI_EVENT; byte 9 is reserved, not a response CID.
  *
- *	0 success   1 invalid param   2 invalid crc   3 decrypt fail
- *	4 unknown cmd   5 timeout   6 sec boot check fail
- *
- * Note the scope.  MT7932 does NOT follow this table for the download-config
- * and patch-finish results - hardware measures status 1 as success there, which
- * is the Apple semantics the sweep accept rule already encodes.  Only apply the
- * names to FW_START, where 0 is success in both stacks.
- *
- * The MT7932 endpoint has never yet answered FW_START at all, so this decode
- * has never fired.  It exists so that if a rejection ever does arrive it is
- * read rather than guessed - "sec boot check fail" in particular would say the
- * ROM authenticated the loaded image and refused it.
+ * The exact names matter here.  Cycles 346-348 returned status 4 after their
+ * RAM entry bytes were changed, which is MT7932 "invalid crc", not the MT7922
+ * table's "unknown cmd".  Authentic firmware has not yet returned a result,
+ * but a later response must be decoded and accepted with the Apple ABI.
  */
 static const char *mt7932_fw_start_status_str(u8 status)
 {
 	static const char * const names[] = {
-		"success", "invalid param", "invalid crc", "decrypt fail",
-		"unknown cmd", "timeout", "sec boot check fail",
+		[1] = "success",
+		[2] = "unknown",
+		[3] = "invalid param",
+		[4] = "invalid crc",
+		[5] = "timeout",
+		[6] = "sec boot check fail",
+		[7] = "region check fail",
+		[8] = "cmd size check fail",
+		[9] = "RAM entry check fail",
+		[10] = "Section check fail",
+		[11] = "FW download flow check fail",
+		[12] = "FW download cmd logic check fail",
+		[13] = "automatic",
 	};
 
-	return status < ARRAY_SIZE(names) ? names[status] : "unknown";
+	return status < ARRAY_SIZE(names) && names[status] ?
+	       names[status] : "unknown status";
 }
 
 int mt7921_mcu_parse_response(struct mt76_dev *mdev, int cmd,
@@ -80,10 +86,20 @@ int mt7921_mcu_parse_response(struct mt76_dev *mdev, int cmd,
 				 "J700_MT7932_PATCH_FINISH_ACCEPT: status=1 apple_semantics=success\n");
 			ret = 0;
 		}
+	} else if (is_mt7932(mdev) && cmd == MCU_CMD(INIT_ACCESS_REG)) {
+		if (rxd->eid != MCU_EVENT_ACCESS_REG)
+			return -EPROTO;
+		/* The 24-byte MT7932 RX descriptor is followed by the 8-byte
+		 * INIT_WIFI_EVENT header.  The generic 36-byte Connac RXD view
+		 * overlaps the first address word, so expose it like the compact
+		 * patch/result events above.
+		 */
+		skb_pull(skb, sizeof(*rxd) - 4);
 	} else if (is_mt7932(mdev) &&
 		   (cmd == MCU_CMD(TARGET_ADDRESS_LEN_REQ) ||
 		    cmd == MCU_CMD(FW_START_REQ))) {
-		u8 response_cid;
+		u8 result_reserved;
+		u8 response_count = 0;
 
 		/* MT7932 init events have a 32-byte RXD/event header followed by
 		 * INIT_EVENT_CMD_RESULT.  The final four bytes represented as ext_eid
@@ -93,24 +109,46 @@ int mt7921_mcu_parse_response(struct mt76_dev *mdev, int cmd,
 		if (skb->len < 4)
 			return -EPROTO;
 		ret = skb->data[0];
-		response_cid = skb->data[1];
-		if (cmd != MCU_CMD(TARGET_ADDRESS_LEN_REQ) || rxd->seq == 76)
+		result_reserved = skb->data[1];
+		if (cmd != MCU_CMD(TARGET_ADDRESS_LEN_REQ))
 			dev_info(mdev->dev,
-				 "J700_MT7932_INIT_CMD_RESULT: eid=%u seq=%u cid=0x%02x expected=0x%02x status=%d\n",
-				 rxd->eid, rxd->seq, response_cid, mcu_cmd, ret);
-		if (cmd == MCU_CMD(FW_START_REQ) && rxd->eid == 1 && ret)
+				 "J700_MT7932_INIT_CMD_RESULT: eid=%u seq=%u reserved=0x%02x cmd=0x%02x status=%d\n",
+				 rxd->eid, rxd->seq, result_reserved, mcu_cmd, ret);
+		if (cmd == MCU_CMD(FW_START_REQ) && rxd->eid == 1 && ret != 1)
 			dev_err(mdev->dev,
-				"J700_MT7932_FW_START_REJECTED: status=%d (%s) cid=0x%02x\n",
+				"J700_MT7932_FW_START_REJECTED: status=%d (%s) reserved=0x%02x\n",
 				ret, mt7932_fw_start_status_str(ret),
-				response_cid);
+				result_reserved);
 
 		if (cmd == MCU_CMD(TARGET_ADDRESS_LEN_REQ) && rxd->eid == 1 &&
-		    ret == 1 && response_cid == 0) {
-			if (rxd->seq == 76)
+		    ret == 1) {
+			if (READ_ONCE(mdev->mcu.mt7932_ram_download_active)) {
+				response_count =
+					READ_ONCE(mdev->mcu.mt7932_ram_download_responses) + 1;
+				if (response_count == 1)
+					WRITE_ONCE(mdev->mcu.mt7932_ram_download_first_seq,
+						   rxd->seq);
+				WRITE_ONCE(mdev->mcu.mt7932_ram_download_responses,
+					   response_count);
+			}
+			if (response_count == 5) {
 				dev_info(mdev->dev,
-					 "J700_MT7932_DOWNLOAD_CONFIG_SWEEP_ACCEPT: first_seq=72 last_seq=76 count=5 status=1 cid=0\n");
+					 "J700_MT7932_INIT_CMD_RESULT: eid=%u seq=%u reserved=0x%02x cmd=0x%02x status=%d\n",
+					 rxd->eid, rxd->seq, result_reserved,
+					 mcu_cmd, ret);
+				dev_info(mdev->dev,
+					 "J700_MT7932_DOWNLOAD_CONFIG_SWEEP_ACCEPT: first_seq=%u last_seq=%u count=%u status=1 reserved=0x%02x\n",
+					 READ_ONCE(mdev->mcu.mt7932_ram_download_first_seq),
+					 rxd->seq, response_count, result_reserved);
+			}
 			ret = 0;
-		} else if (rxd->eid != 1 || response_cid != mcu_cmd) {
+		} else if (cmd == MCU_CMD(FW_START_REQ) && rxd->eid == 1 &&
+			   ret == 1) {
+			dev_info(mdev->dev,
+				 "J700_MT7932_FW_START_ACCEPT: status=1 reserved=0x%02x source=apple-25G83\n",
+				 result_reserved);
+			ret = 0;
+		} else if (rxd->eid != 1) {
 			ret = -EPROTO;
 		}
 	} else if (cmd == MCU_EXT_CMD(THERMAL_CTRL)) {
