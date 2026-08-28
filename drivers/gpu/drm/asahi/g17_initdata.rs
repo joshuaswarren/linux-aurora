@@ -199,6 +199,140 @@ pub(crate) const CONTROL_OPENING_OPCODE_PRIMARY: u32 = 0x16;
 pub(crate) const CONTROL_OPENING_OPCODE_SECONDARY: u32 = 0x2a;
 pub(crate) const CONTROL_OPENING_PRODUCER: u32 = 1;
 pub(crate) const CONTROL_RECORD_SIZE: usize = 0x40;
+pub(crate) const CONTROL_OPENING_PRIMARY_RECORDS: usize = 4;
+pub(crate) const CONTROL_OPENING_SECONDARY_RECORDS: usize = 16;
+pub(crate) const CONTROL_OPENING_PRIMARY_PRODUCER: u32 = 4;
+pub(crate) const CONTROL_OPENING_SECONDARY_PRODUCER: u32 = 16;
+pub(crate) const CONTROL_OPENING_PRIMARY_REGISTER_OPCODE: u32 = 0x20;
+pub(crate) const CONTROL_OPENING_SECONDARY_CONTINUE_OPCODE: u32 = 0x22;
+
+pub(crate) const CONTROL_SHARED_ADDRESS: u64 = 0xffff_fc20_c083_0000;
+pub(crate) const CONTROL_SHARED_INNER_ADDRESS: u64 = 0xffff_fc20_0160_8000;
+pub(crate) const CONTROL_SHARED_OBJECT_SIZE: usize = 0x4000;
+pub(crate) const CONTROL_SHARED_CURSOR_OFFSET: usize = 0x48;
+pub(crate) const CONTROL_SHARED_CURSOR_BEFORE: u32 = 0x88;
+pub(crate) const CONTROL_OPERAND_TABLE_ADDRESS: u64 = 0x70_0020_8000;
+pub(crate) const CONTROL_OPERAND_TABLE_SIZE: usize = 0x4000;
+pub(crate) const CONTROL_OPERAND_SLOT_OFFSET: u64 = 0x440;
+pub(crate) const CONTROL_OPERAND_BUFFER_BASE: u64 = 0x70_0022_0000;
+pub(crate) const CONTROL_OPERAND_BUFFER_STRIDE: u64 = 0x10_8000;
+pub(crate) const CONTROL_OPERAND_BUFFER_SIZE: u64 = 0x10_0000;
+pub(crate) const CONTROL_OPERAND_ENTRY_COUNT: usize = 22;
+pub(crate) const CONTROL_OPERAND_ENTRY_STRIDE: usize = 0x40;
+pub(crate) const CONTROL_OPERAND_ENTRY_FLAG: u64 = 1 << 60;
+
+pub(crate) const fn control_opening_producer(role: InstanceRole) -> u32 {
+    match role {
+        InstanceRole::Primary => CONTROL_OPENING_PRIMARY_PRODUCER,
+        InstanceRole::Secondary => CONTROL_OPENING_SECONDARY_PRODUCER,
+    }
+}
+
+pub(crate) const fn control_opening_size(role: InstanceRole) -> usize {
+    match role {
+        InstanceRole::Primary => CONTROL_OPENING_PRIMARY_RECORDS * CONTROL_RECORD_SIZE,
+        InstanceRole::Secondary => CONTROL_OPENING_SECONDARY_RECORDS * CONTROL_RECORD_SIZE,
+    }
+}
+
+/// Encode the complete control ring prefix consumed during the 25G83 opening.
+pub(crate) fn encode_control_opening(
+    role: InstanceRole,
+    out: &mut [u8],
+) -> Result<(), InitdataError> {
+    if out.len() != control_opening_size(role) {
+        return Err(InitdataError::BufferSize);
+    }
+    out.fill(0);
+
+    match role {
+        InstanceRole::Primary => {
+            for slot in 0..3 {
+                put_u32(
+                    out,
+                    slot * CONTROL_RECORD_SIZE,
+                    CONTROL_OPENING_OPCODE_PRIMARY,
+                );
+            }
+            let base = 3 * CONTROL_RECORD_SIZE;
+            put_u32(out, base, CONTROL_OPENING_PRIMARY_REGISTER_OPCODE);
+            put_u32(out, base + 0x04, 1);
+            put_u32(out, base + 0x08, 0x3f);
+            put_u64(out, base + 0x14, CONTROL_SHARED_ADDRESS);
+            put_u64(out, base + 0x1c, CONTROL_OPERAND_TABLE_ADDRESS);
+            put_u64(
+                out,
+                base + 0x24,
+                CONTROL_OPERAND_TABLE_ADDRESS + CONTROL_OPERAND_SLOT_OFFSET,
+            );
+            put_u32(out, base + 0x2c, 0x28);
+            put_u32(out, base + 0x34, 1);
+        }
+        InstanceRole::Secondary => {
+            for slot in 0..3 {
+                put_u32(
+                    out,
+                    slot * CONTROL_RECORD_SIZE,
+                    CONTROL_OPENING_OPCODE_SECONDARY,
+                );
+            }
+            for slot in 3..CONTROL_OPENING_SECONDARY_RECORDS {
+                put_u32(
+                    out,
+                    slot * CONTROL_RECORD_SIZE,
+                    CONTROL_OPENING_SECONDARY_CONTINUE_OPCODE,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Encode the shared object named by the primary opcode-0x20 record.
+pub(crate) fn encode_control_shared(out: &mut [u8]) -> Result<(), InitdataError> {
+    if out.len() != CONTROL_SHARED_OBJECT_SIZE {
+        return Err(InitdataError::BufferSize);
+    }
+    out.fill(0);
+    for (offset, value) in [
+        (0x00, 0x0000_0000_0000_0001),
+        (0x10, 0x0000_0000_0000_0001),
+        (0x18, 0x0004_0000_0000_0070),
+        (0x20, 0x0000_1100_0000_0000),
+        (0x28, 0x0000_1100_0000_0000),
+        (0x30, CONTROL_OPERAND_TABLE_ADDRESS),
+        (0x40, 0x0000_0000_0000_0004),
+        (0x60, 0x0000_0000_0000_0002),
+    ] {
+        put_u64(out, offset, value);
+    }
+    put_u32(
+        out,
+        CONTROL_SHARED_CURSOR_OFFSET,
+        CONTROL_SHARED_CURSOR_BEFORE,
+    );
+    put_u64(out, 0x4c, CONTROL_SHARED_INNER_ADDRESS);
+    Ok(())
+}
+
+/// Encode the 22 flagged buffer pointers present before the first control start.
+pub(crate) fn encode_control_operand_table(out: &mut [u8]) -> Result<(), InitdataError> {
+    if out.len() != CONTROL_OPERAND_TABLE_SIZE {
+        return Err(InitdataError::BufferSize);
+    }
+    out.fill(0);
+    for index in 0..CONTROL_OPERAND_ENTRY_COUNT {
+        let address = CONTROL_OPERAND_BUFFER_BASE
+            .checked_add(index as u64 * CONTROL_OPERAND_BUFFER_STRIDE)
+            .ok_or(InitdataError::AddressOutOfRange)?;
+        put_u64(
+            out,
+            index * CONTROL_OPERAND_ENTRY_STRIDE,
+            address | CONTROL_OPERAND_ENTRY_FLAG,
+        );
+    }
+    Ok(())
+}
 
 /// Bundle offsets of the five views named at main `+0x254`. They are views of
 /// the common bundle, not independent objects: view 0 overlaps the tail of
@@ -2001,6 +2135,93 @@ mod tests {
             + SECONDARY_EXTRA_VIEW_OFFSET as u64;
         assert_eq!(get_u64(&main, 0x471), extra);
         assert_eq!(get_u32(&main, 0x3e0), 0);
+    }
+
+    #[test]
+    fn primary_control_opening_is_three_init_records_then_registration() {
+        let mut opening = vec![0; control_opening_size(InstanceRole::Primary)];
+        encode_control_opening(InstanceRole::Primary, &mut opening).unwrap();
+
+        assert_eq!(control_opening_producer(InstanceRole::Primary), 4);
+        for slot in 0..3 {
+            let base = slot * CONTROL_RECORD_SIZE;
+            assert_eq!(get_u32(&opening, base), CONTROL_OPENING_OPCODE_PRIMARY);
+            assert!(opening[base + 4..base + CONTROL_RECORD_SIZE]
+                .iter()
+                .all(|byte| *byte == 0));
+        }
+        let base = 3 * CONTROL_RECORD_SIZE;
+        assert_eq!(
+            get_u32(&opening, base),
+            CONTROL_OPENING_PRIMARY_REGISTER_OPCODE
+        );
+        assert_eq!(get_u32(&opening, base + 0x04), 1);
+        assert_eq!(get_u32(&opening, base + 0x08), 0x3f);
+        assert_eq!(get_u64(&opening, base + 0x14), CONTROL_SHARED_ADDRESS);
+        assert_eq!(
+            get_u64(&opening, base + 0x1c),
+            CONTROL_OPERAND_TABLE_ADDRESS
+        );
+        assert_eq!(
+            get_u64(&opening, base + 0x24),
+            CONTROL_OPERAND_TABLE_ADDRESS + CONTROL_OPERAND_SLOT_OFFSET
+        );
+        assert_eq!(get_u32(&opening, base + 0x2c), 0x28);
+        assert_eq!(get_u32(&opening, base + 0x34), 1);
+    }
+
+    #[test]
+    fn secondary_control_opening_is_three_init_then_thirteen_continue_records() {
+        let mut opening = vec![0; control_opening_size(InstanceRole::Secondary)];
+        encode_control_opening(InstanceRole::Secondary, &mut opening).unwrap();
+
+        assert_eq!(control_opening_producer(InstanceRole::Secondary), 16);
+        for slot in 0..CONTROL_OPENING_SECONDARY_RECORDS {
+            let base = slot * CONTROL_RECORD_SIZE;
+            let expected = if slot < 3 {
+                CONTROL_OPENING_OPCODE_SECONDARY
+            } else {
+                CONTROL_OPENING_SECONDARY_CONTINUE_OPCODE
+            };
+            assert_eq!(get_u32(&opening, base), expected);
+            assert!(opening[base + 4..base + CONTROL_RECORD_SIZE]
+                .iter()
+                .all(|byte| *byte == 0));
+        }
+    }
+
+    #[test]
+    fn shared_control_object_names_the_fixed_operand_and_inner_pages() {
+        let mut shared = vec![0; CONTROL_SHARED_OBJECT_SIZE];
+        encode_control_shared(&mut shared).unwrap();
+
+        assert_eq!(get_u64(&shared, 0x00), 1);
+        assert_eq!(get_u64(&shared, 0x18), 0x0004_0000_0000_0070);
+        assert_eq!(get_u64(&shared, 0x30), CONTROL_OPERAND_TABLE_ADDRESS);
+        assert_eq!(
+            get_u32(&shared, CONTROL_SHARED_CURSOR_OFFSET),
+            CONTROL_SHARED_CURSOR_BEFORE
+        );
+        assert_eq!(get_u64(&shared, 0x4c), CONTROL_SHARED_INNER_ADDRESS);
+        assert_eq!(get_u64(&shared, 0x60), 2);
+    }
+
+    #[test]
+    fn operand_table_has_exactly_twenty_two_flagged_entries() {
+        let mut table = vec![0xff; CONTROL_OPERAND_TABLE_SIZE];
+        encode_control_operand_table(&mut table).unwrap();
+
+        for index in 0..CONTROL_OPERAND_ENTRY_COUNT {
+            assert_eq!(
+                get_u64(&table, index * CONTROL_OPERAND_ENTRY_STRIDE),
+                CONTROL_OPERAND_ENTRY_FLAG
+                    | (CONTROL_OPERAND_BUFFER_BASE
+                        + index as u64 * CONTROL_OPERAND_BUFFER_STRIDE)
+            );
+        }
+        assert!(table[CONTROL_OPERAND_ENTRY_COUNT * CONTROL_OPERAND_ENTRY_STRIDE..]
+            .iter()
+            .all(|byte| *byte == 0));
     }
 
     #[test]
