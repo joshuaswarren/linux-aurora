@@ -85,38 +85,6 @@ static void apple_dcp_j700_stopped_handoff_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, apple_dcp_needs_fresh_boot(start_mode));
 }
 
-static void apple_dcp_pmgr_set_target_test(struct kunit *test)
-{
-	u32 original = 0xb5a5d7bf;
-	u32 off = apple_dcp_pmgr_with_target(original, APPLE_DCP_PMGR_PS_OFF);
-	u32 active = apple_dcp_pmgr_with_target(off, APPLE_DCP_PMGR_PS_ACTIVE);
-	u32 auto_active = apple_dcp_pmgr_with_auto_enable(active);
-
-	KUNIT_EXPECT_EQ(test, off & ~APPLE_DCP_PMGR_PS_SET_MASK,
-			original & ~APPLE_DCP_PMGR_PS_SET_MASK);
-	KUNIT_EXPECT_EQ(test, off & APPLE_DCP_PMGR_PS_SET_MASK, 0U);
-	KUNIT_EXPECT_EQ(test, active & ~APPLE_DCP_PMGR_PS_SET_MASK,
-			off & ~APPLE_DCP_PMGR_PS_SET_MASK);
-	KUNIT_EXPECT_EQ(test, active & APPLE_DCP_PMGR_PS_SET_MASK,
-			(u32)APPLE_DCP_PMGR_PS_ACTIVE);
-	KUNIT_EXPECT_EQ(test, auto_active & APPLE_DCP_PMGR_PS_SET_MASK,
-			(u32)(APPLE_DCP_PMGR_PS_AUTO_ENABLE |
-			      APPLE_DCP_PMGR_PS_ACTIVE));
-}
-
-static void apple_dcp_pmgr_actual_state_test(struct kunit *test)
-{
-	KUNIT_EXPECT_TRUE(test,
-		apple_dcp_pmgr_reached_target(0xa5a5c30f,
-					   APPLE_DCP_PMGR_PS_OFF));
-	KUNIT_EXPECT_TRUE(test,
-		apple_dcp_pmgr_reached_target(0xa5a5c3ff,
-					   APPLE_DCP_PMGR_PS_ACTIVE));
-	KUNIT_EXPECT_FALSE(test,
-		apple_dcp_pmgr_reached_target(0xa5a5c34f,
-					   APPLE_DCP_PMGR_PS_ACTIVE));
-}
-
 static void apple_dcp_coprocessor_stop_sequence_test(struct kunit *test)
 {
 	u32 original = 0xa5a5c3ff;
@@ -164,8 +132,6 @@ static struct kunit_case apple_dcp_lifecycle_test_cases[] = {
 	KUNIT_CASE(apple_dcp_j700_quiesced_handoff_test),
 	KUNIT_CASE(apple_dcp_j700_idle_handoff_test),
 	KUNIT_CASE(apple_dcp_j700_stopped_handoff_test),
-	KUNIT_CASE(apple_dcp_pmgr_set_target_test),
-	KUNIT_CASE(apple_dcp_pmgr_actual_state_test),
 	KUNIT_CASE(apple_dcp_coprocessor_stop_sequence_test),
 	KUNIT_CASE(apple_dcp_cold_start_does_not_adopt_test),
 	KUNIT_CASE(apple_dcp_cold_start_selection_test),

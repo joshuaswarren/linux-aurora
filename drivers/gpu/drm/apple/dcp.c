@@ -13,14 +13,12 @@
 #include <linux/jiffies.h>
 #include <linux/kconfig.h>
 #include <linux/kernel.h>
-#include <linux/mfd/syscon.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/of_device.h>
 #include <linux/of_platform.h>
-#include <linux/regmap.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/string.h>
@@ -52,7 +50,6 @@
 #define APPLE_DCP_ASC_STOPPED_PROPERTY	 "apple,dcp-asc-stopped"
 
 #define DCP_BOOT_TIMEOUT msecs_to_jiffies(1000)
-#define APPLE_DCP_PMGR_PS_SET_TIMEOUT_US 1000
 
 #define APPLE_DCP_RTKIT_MGMT_TYPE GENMASK_ULL(59, 52)
 #define APPLE_DCP_RTKIT_MGMT_STARTEP 5
@@ -1035,126 +1032,6 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 	return DCP_FIRMWARE_UNKNOWN;
 }
 
-static int apple_dcp_get_disp_cpu_pstate(struct apple_dcp *dcp)
-{
-	struct device_node *parent_np;
-	struct device_node *pstate_np;
-	struct regmap *regmap;
-	int ret;
-
-	if (dcp->disp_cpu_pstate_regmap)
-		return 0;
-
-	pstate_np = of_parse_phandle(dcp->dev->of_node, "power-domains", 0);
-	if (!pstate_np)
-		return -ENODEV;
-
-	ret = of_property_read_u32(pstate_np, "reg",
-				   &dcp->disp_cpu_pstate_offset);
-	parent_np = of_get_parent(pstate_np);
-	of_node_put(pstate_np);
-	if (ret)
-		goto out_put_parent;
-	if (!parent_np) {
-		ret = -ENODEV;
-		goto out_put_parent;
-	}
-
-	regmap = syscon_node_to_regmap(parent_np);
-	if (IS_ERR(regmap)) {
-		ret = PTR_ERR(regmap);
-		goto out_put_parent;
-	}
-
-	dcp->disp_cpu_pstate_regmap = regmap;
-
-out_put_parent:
-	of_node_put(parent_np);
-	return ret;
-}
-
-static int apple_dcp_set_disp_cpu_target(struct apple_dcp *dcp, u32 target,
-					 bool auto_enable)
-{
-	u32 reg;
-	int ret;
-
-	ret = regmap_read(dcp->disp_cpu_pstate_regmap,
-			  dcp->disp_cpu_pstate_offset, &reg);
-	if (ret)
-		return ret;
-
-	reg = apple_dcp_pmgr_with_target(reg, target);
-	ret = regmap_update_bits(dcp->disp_cpu_pstate_regmap,
-				 dcp->disp_cpu_pstate_offset,
-				 APPLE_DCP_PMGR_PS_SET_MASK,
-				 reg & APPLE_DCP_PMGR_PS_SET_MASK);
-	if (ret)
-		return ret;
-
-	ret = regmap_read_poll_timeout(dcp->disp_cpu_pstate_regmap,
-				       dcp->disp_cpu_pstate_offset, reg,
-				       apple_dcp_pmgr_reached_target(reg,
-								 target),
-				       1, APPLE_DCP_PMGR_PS_SET_TIMEOUT_US);
-	if (ret)
-		dev_err(dcp->dev,
-			"display CPU target %#x timed out at PMGR state %#x\n",
-			target, reg);
-	else if (auto_enable) {
-		reg = apple_dcp_pmgr_with_auto_enable(reg);
-		ret = regmap_update_bits(dcp->disp_cpu_pstate_regmap,
-					 dcp->disp_cpu_pstate_offset,
-					 APPLE_DCP_PMGR_PS_AUTO_ENABLE,
-					 reg & APPLE_DCP_PMGR_PS_AUTO_ENABLE);
-	}
-
-	return ret;
-}
-
-static int apple_dcp_power_cycle_disp_cpu(struct apple_dcp *dcp)
-{
-	u32 before, after;
-	int restore_ret;
-	int ret;
-
-	ret = apple_dcp_get_disp_cpu_pstate(dcp);
-	if (ret)
-		return dev_err_probe(dcp->dev, ret,
-				     "could not access display CPU power state\n");
-
-	ret = regmap_read(dcp->disp_cpu_pstate_regmap,
-			  dcp->disp_cpu_pstate_offset, &before);
-	if (ret)
-		return ret;
-
-	ret = apple_dcp_set_disp_cpu_target(dcp, APPLE_DCP_PMGR_PS_OFF,
-					    false);
-	if (ret) {
-		restore_ret = apple_dcp_set_disp_cpu_target(
-			dcp, APPLE_DCP_PMGR_PS_ACTIVE, true);
-		if (restore_ret)
-			dev_err(dcp->dev,
-				"could not restore display CPU target: %d\n",
-				restore_ret);
-		return ret;
-	}
-
-	ret = apple_dcp_set_disp_cpu_target(dcp, APPLE_DCP_PMGR_PS_ACTIVE,
-					    true);
-	if (ret)
-		return ret;
-
-	ret = regmap_read(dcp->disp_cpu_pstate_regmap,
-			  dcp->disp_cpu_pstate_offset, &after);
-	if (!ret)
-		dev_info(dcp->dev,
-			 "DCP takeover: display CPU power cycle %#x -> %#x\n",
-			 before, after);
-
-	return ret;
-}
-
 static void apple_dcp_stop_fresh_boot_cpu(struct apple_dcp *dcp)
 {
 	u32 control;
@@ -1185,7 +1062,7 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	enum apple_dcp_loader_handoff loader_handoff;
 	struct iommu_domain *coproc_iommu_dom;
 	phys_addr_t iop_vbar_phys;
-	u64 iop_vbar, iop_vbar_after;
+	u64 iop_vbar;
 	u32 cpu_ctrl, cpu_status;
 	u32 quiesced_state = 0, idle_state = 0, stopped_state = 0;
 	bool loader_quiesced, loader_idle, loader_stopped;
@@ -1312,22 +1189,6 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 			return dev_err_probe(dev, -EIO,
 					     "DCP firmware entry point is not mapped\n");
 
-		ret = apple_dcp_power_cycle_disp_cpu(dcp);
-		if (ret)
-			return dev_err_probe(dev, ret,
-					     "display CPU power cycle failed\n");
-
-		iop_vbar_after = readq_relaxed(dcp->iop_vbar_reg);
-		iop_vbar_phys = coproc_iommu_dom ?
-			iommu_iova_to_phys(coproc_iommu_dom,
-					      iop_vbar_after & ~1ULL) : 0;
-		dev_info(dev,
-			 "DCP takeover: IORVBAR after power cycle=%#llx maps-to=%pa\n",
-			 iop_vbar_after, &iop_vbar_phys);
-		if (iop_vbar_after != iop_vbar || !(iop_vbar_after & 1) ||
-		    !iop_vbar_phys)
-			return dev_err_probe(dev, -EIO,
-					     "DCP firmware entry point changed during power cycle\n");
 	}
 
 	ret = dcp_create_piodma_iommu_dev(dcp);
