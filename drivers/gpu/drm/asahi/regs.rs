@@ -186,7 +186,7 @@ pub(crate) struct FaultInfo {
 /// Device resources for this GPU instance.
 pub(crate) struct Resources {
     dev: ARef<platform::Device>,
-    sgx: Pin<KBox<Devres<IoMem<SGX_SIZE>>>>,
+    sgx: Pin<KBox<Devres<IoMem<0>>>>,
     /// Serializes the shared fixed-slot SKSM FIFO across every queue.
     sksm_fifo: Pin<KBox<Mutex<()>>>,
 }
@@ -195,7 +195,7 @@ pub(crate) struct Resources {
 ///
 /// In particular, the word-0 port at `sgx+0x4090` must never be loaded. The
 /// host has a separate diagnostic load from word 1 which is not exposed here.
-struct G17SksmSgxPairWriter<'a>(&'a IoMem<SGX_SIZE>);
+struct G17SksmSgxPairWriter<'a>(&'a IoMem<0>);
 
 impl g17_submission::G17SksmPairWriter for G17SksmSgxPairWriter<'_> {
     type Error = Error;
@@ -215,7 +215,7 @@ impl Resources {
         // is the J700 GPU block exposed to Linux by the named `sgx` resource
         // (the second platform `reg` tuple, after `asc`).
         let sgx_req = pdev.io_request_by_name(c_str!("sgx")).ok_or(EINVAL)?;
-        let sgx_iomem = KBox::pin_init(sgx_req.iomap_sized::<SGX_SIZE>(), GFP_KERNEL)?;
+        let sgx_iomem = KBox::pin_init(sgx_req.iomap(), GFP_KERNEL)?;
         let sksm_fifo = KBox::pin_init(new_mutex!((), "g17_sksm_fifo"), GFP_KERNEL)?;
 
         Ok(Resources {
@@ -239,7 +239,7 @@ impl Resources {
     }
 
     fn g17p_sksm_publish_locked(
-        sgx: &IoMem<SGX_SIZE>,
+        sgx: &IoMem<0>,
         pair: g17_submission::G17SksmOrderedWritePair,
     ) -> Result {
         g17_submission::publish_g17p_sksm_write_pair(&G17SksmSgxPairWriter(sgx), pair)
@@ -286,7 +286,7 @@ impl Resources {
 
     fn sgx_read32<const OFF: usize>(&self) -> u32 {
         if let Some(sgx) = self.sgx.try_access() {
-            sgx.relaxed().read32(OFF)
+            sgx.relaxed().try_read32(OFF).unwrap_or(0)
         } else {
             0
         }
@@ -302,7 +302,7 @@ impl Resources {
 
     fn sgx_read64<const OFF: usize>(&self) -> u64 {
         if let Some(sgx) = self.sgx.try_access() {
-            sgx.relaxed().read64(OFF)
+            sgx.relaxed().try_read64(OFF).unwrap_or(0)
         } else {
             0
         }
@@ -352,10 +352,9 @@ impl Resources {
     /// first, then set bit 0 of both AXI transition words. Observed
     /// post-write values on J700 are `0x00010001`/`0x000413b1`; a different
     /// readback is logged but not fatal (the upper bits are status).
-    pub(crate) fn t8140_axi_transition_workaround(pdev: &platform::Device<Core>) -> Result {
-        let sgx_req = pdev.io_request_by_name(c_str!("sgx")).ok_or(EINVAL)?;
-        let sgx_iomem = KBox::pin_init(sgx_req.iomap(), GFP_KERNEL)?;
-        let res = sgx_iomem.access(pdev.as_ref())?.relaxed();
+    pub(crate) fn t8140_axi_transition_workaround(&self) -> Result {
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let res = sgx.relaxed();
 
         for (offset, observed) in [
             (T8140_AXI_TRANSITION_0, 0x0001_0001u32),
@@ -366,7 +365,7 @@ impl Resources {
             let after = res.try_read32(offset)?;
             if after != observed {
                 dev_warn!(
-                    pdev.as_ref(),
+                    self.dev.as_ref(),
                     "T8140 AXI transition word {:#x} reads {:#x} after set (J700 observed {:#x})\n",
                     offset,
                     after,
@@ -382,10 +381,9 @@ impl Resources {
     /// The grounded startup sequence requires this write after the AXI
     /// transition workaround and before ANY initdata is sent to either
     /// firmware instance.
-    pub(crate) fn t8140_pre_initdata_clear(pdev: &platform::Device<Core>) -> Result {
-        let sgx_req = pdev.io_request_by_name(c_str!("sgx")).ok_or(EINVAL)?;
-        let sgx_iomem = KBox::pin_init(sgx_req.iomap(), GFP_KERNEL)?;
-        let res = sgx_iomem.access(pdev.as_ref())?.relaxed();
+    pub(crate) fn t8140_pre_initdata_clear(&self) -> Result {
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let res = sgx.relaxed();
         res.try_write32(0, T8140_PRE_INITDATA_CLEAR)?;
         Ok(())
     }

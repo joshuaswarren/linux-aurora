@@ -317,8 +317,9 @@ fn refuse_agx3_probe(pdev: &platform::Device<Core>, soc: &'static hw::agx3::SocC
         None
     };
 
-    match regs::Resources::new(pdev) {
-        Ok(res) => match res.get_gpu_id() {
+    let resources = match regs::Resources::new(pdev) {
+        Ok(res) => {
+            match res.get_gpu_id() {
             Ok(id) => {
                 dev_info!(
                     pdev.as_ref(),
@@ -343,24 +344,58 @@ fn refuse_agx3_probe(pdev: &platform::Device<Core>, soc: &'static hw::agx3::SocC
                 }
             }
             Err(e) => dev_warn!(pdev.as_ref(), "AGX3: GPU ID decode failed: {:?}\n", e),
-        },
-        Err(e) => dev_warn!(
-            pdev.as_ref(),
-            "AGX3: SGX MMIO region unavailable: {:?}\n",
-            e
-        ),
-    }
+            }
+            Some(res)
+        }
+        Err(e) => {
+            dev_warn!(
+                pdev.as_ref(),
+                "AGX3: SGX MMIO region unavailable: {:?}\n",
+                e
+            );
+            None
+        }
+    };
 
     // Opt-in live-boot executor (default OFF). When deliberately enabled on a
     // real M5, attempt the grounded boot prologue instead of an unconditional
     // refusal. The first slice always returns an error (the full boot is not
     // yet wired), so probe still fails closed today.
     if expected.gpu_gen == hw::GpuGen::G17 && g17_live_boot::G17_LIVE_BOOT_ENABLED {
-        match g17_live_boot::attempt(pdev, soc, &expected, t8140_topology.as_ref()) {
+        let Some(registers) = resources.as_ref() else {
+            return ENODEV;
+        };
+        let dma_mask = match DmaMask::try_new(soc.uat_oas) {
+            Ok(mask) => mask,
+            Err(e) => return e,
+        };
+        if let Err(e) = unsafe { pdev.dma_set_mask_and_coherent(dma_mask) } {
+            return e;
+        }
+
+        // G17P resource construction uses GEM shmem objects, which need the
+        // real DRM device owner even though this bring-up slice deliberately
+        // stops before registering a userspace node.
+        let uninit = unsafe {
+            pin_init::pin_init_from_closure::<AsahiData, kernel::error::Error>(|_slot| Ok(()))
+        };
+        let drm = match drm::device::Device::new(pdev.as_ref(), uninit) {
+            Ok(dev) => dev,
+            Err(e) => return e,
+        };
+
+        match g17_live_boot::attempt(
+            pdev,
+            &drm,
+            registers,
+            soc,
+            &expected,
+            t8140_topology.as_ref(),
+        ) {
             Ok(()) => {
                 dev_info!(
                     pdev.as_ref(),
-                    "G17 live-boot prologue completed; full boot not yet wired, refusing probe\n"
+                    "G17P live-boot reached dual initdata ACK and retained queue registration; userspace backend not yet wired, refusing probe\n"
                 );
                 return ENODEV;
             }
