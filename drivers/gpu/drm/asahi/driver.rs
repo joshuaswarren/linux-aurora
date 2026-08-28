@@ -11,6 +11,7 @@ use kernel::{
     },
     drm,
     drm::ioctl,
+    new_mutex,
     of,
     platform,
     prelude::*,
@@ -23,9 +24,11 @@ use kernel::{
 use crate::{
     agx_power_recovery,
     debug,
+    drm_gpu,
     file,
     g15_boot,
     g17_boot,
+    g17_drm,
     g17_firmware,
     g17_live_boot,
     g17_manager,
@@ -43,9 +46,9 @@ use kernel::macros::vtable;
 #[pin_data]
 pub(crate) struct AsahiData {
     #[pin]
-    pub(crate) gpu: Arc<dyn gpu::GpuManager>,
+    pub(crate) gpu: Arc<dyn drm_gpu::DrmGpu>,
     pub(crate) pdev: ARef<platform::Device>,
-    pub(crate) resources: regs::Resources,
+    pub(crate) resources: Option<regs::Resources>,
 }
 
 unsafe impl Send for AsahiData {}
@@ -54,7 +57,7 @@ unsafe impl Sync for AsahiData {}
 #[allow(dead_code)]
 enum AsahiRuntime {
     Legacy(ARef<drm::Device<AsahiDriver>>),
-    G17P(g17_live_boot::G17PLiveRuntime),
+    G17P(g17_drm::SharedG17PRuntime),
 }
 
 pub(crate) struct AsahiDriver {
@@ -236,7 +239,7 @@ kernel::of_device_table!(
 fn probe_t8140_runtime(
     pdev: &platform::Device<Core>,
     soc: &'static hw::agx3::SocConfig,
-) -> Result<g17_live_boot::G17PLiveRuntime> {
+) -> Result<g17_drm::SharedG17PRuntime> {
     let expected = identity::decode_gpu_identity(soc.hw_family, soc.hw_variant, soc.num_dies as u8)
         .ok_or(EINVAL)?;
     if soc.chip_id != 0x8140
@@ -271,23 +274,48 @@ fn probe_t8140_runtime(
 
     unsafe { pdev.dma_set_mask_and_coherent(DmaMask::try_new(soc.uat_oas)?)? };
 
-    // The retained manager allocates GEM shmem objects from this DRM device,
-    // but the device is not registered until the G17P GpuManager/Queue traits
-    // are implemented.
+    // The retained manager allocates its GEM objects from this DRM device.
+    // Registration follows runtime and adapter initialization below.
     let uninit = unsafe {
         pin_init::pin_init_from_closure::<AsahiData, kernel::error::Error>(|_slot| Ok(()))
     };
-    let drm = drm::device::Device::new(pdev.as_ref(), uninit)?;
+    let drm: ARef<AsahiDevice> = drm::device::Device::new(pdev.as_ref(), uninit)?;
 
-    g17_live_boot::G17PLiveRuntime::start(pdev, drm, registers, soc, &expected, topology)
+    let runtime = g17_live_boot::G17PLiveRuntime::start(
+        pdev,
+        drm.clone(),
+        registers,
+        soc,
+        &expected,
+        topology,
+    )?;
+    let runtime = Arc::pin_init(new_mutex!(runtime), GFP_KERNEL)?;
+    let gpu: Arc<dyn drm_gpu::DrmGpu> = Arc::new(
+        g17_drm::G17PDrmGpu::new(&drm, runtime.clone(), soc, observed),
+        GFP_KERNEL,
+    )?;
+    let data = try_pin_init!(AsahiData {
+        gpu,
+        pdev: pdev.into(),
+        resources: None,
+    });
+    let ptr: *const AsahiData = &raw const **drm;
+    // SAFETY: `drm` was created with an uninitialized data slot above; this
+    // is its only initialization before registration exposes file operations.
+    unsafe {
+        data.__pinned_init(ptr as *mut AsahiData)?;
+    }
+    (*drm).gpu.init()?;
+    drm::driver::Registration::new_foreign_owned(&drm, pdev.as_ref(), 0)?;
+    Ok(runtime)
 }
 
 /// Identify an AGX3 target as far as read-only evidence allows, then refuse.
 ///
 /// This logs the statically decoded identity, performs the read-only SGX
 /// identification (ID block + core-enable masks; no DMA mask, no ASC start,
-/// no MMIO write), cross-checks the two, and then fails closed at the
-/// generation-specific firmware boundary.
+/// no MMIO write), cross-checks the two, and stops at the generation-specific
+/// firmware boundary.
 fn refuse_agx3_probe(pdev: &platform::Device<Core>, soc: &'static hw::agx3::SocConfig) -> Error {
     let Some(expected) =
         identity::decode_gpu_identity(soc.hw_family, soc.hw_variant, soc.num_dies as u8)
@@ -802,7 +830,7 @@ impl platform::Driver for AsahiDriver {
                 let runtime = probe_t8140_runtime(pdev, soc)?;
                 dev_info!(
                     pdev.as_ref(),
-                    "G17P: persistent dual-ASC runtime bound; render node registration remains disabled\n"
+                    "G17P: persistent dual-ASC runtime bound and DRM render node registered\n"
                 );
                 return Ok(Self {
                     runtime: AsahiRuntime::G17P(runtime),
@@ -850,7 +878,7 @@ impl platform::Driver for AsahiDriver {
         };
         let drm: ARef<AsahiDevice> = drm::device::Device::new(pdev.as_ref(), uninit)?;
 
-        let gpu = match (cfg.gpu_gen, cfg.gpu_variant, compat.as_slice()) {
+        let legacy_gpu = match (cfg.gpu_gen, cfg.gpu_variant, compat.as_slice()) {
             (hw::GpuGen::G13, _, &[12, 3, 0]) => {
                 gpu::GpuManagerG13V12_3::new(&drm.clone(), &res, cfg)? as Arc<dyn gpu::GpuManager>
             }
@@ -877,11 +905,13 @@ impl platform::Driver for AsahiDriver {
                 return Err(ENODEV);
             }
         };
+        let gpu: Arc<dyn drm_gpu::DrmGpu> =
+            Arc::new(drm_gpu::LegacyDrmGpu::new(legacy_gpu), GFP_KERNEL)?;
 
         let data = try_pin_init!(AsahiData {
             gpu,
             pdev: pdev.into(),
-            resources: res,
+            resources: Some(res),
         });
 
         let ptr: *const AsahiData = &raw const **drm;
