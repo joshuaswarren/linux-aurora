@@ -1663,6 +1663,8 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 	 * unbind, including optional clocks whose managed value can be NULL.
 	 */
 	dcp->clk = NULL;
+	if (dcp->clk_194)
+		devm_clk_put(dev, dcp->clk_194);
 	dcp->clk_194 = NULL;
 }
 
