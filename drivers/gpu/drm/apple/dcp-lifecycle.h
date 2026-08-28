@@ -62,7 +62,7 @@ apple_dcp_needs_adoption(enum apple_dcp_coprocessor_start start_mode)
 }
 
 static inline bool
-apple_dcp_needs_reset(enum apple_dcp_coprocessor_start start_mode)
+apple_dcp_needs_fresh_boot(enum apple_dcp_coprocessor_start start_mode)
 {
 	return start_mode == APPLE_DCP_COPROCESSOR_ASC_STOPPED_RESTART;
 }

@@ -81,17 +81,18 @@ static void apple_dcp_j700_stopped_handoff_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, start_mode,
 			APPLE_DCP_COPROCESSOR_ASC_STOPPED_RESTART);
 	KUNIT_EXPECT_FALSE(test, apple_dcp_needs_adoption(start_mode));
-	KUNIT_EXPECT_TRUE(test, apple_dcp_needs_reset(start_mode));
+	KUNIT_EXPECT_TRUE(test, apple_dcp_needs_fresh_boot(start_mode));
 }
 
 static void apple_dcp_cold_start_does_not_adopt_test(struct kunit *test)
 {
-	bool adopt, reset;
+	bool adopt, fresh_boot;
 
 	adopt = apple_dcp_needs_adoption(APPLE_DCP_COPROCESSOR_COLD_START);
-	reset = apple_dcp_needs_reset(APPLE_DCP_COPROCESSOR_COLD_START);
+	fresh_boot = apple_dcp_needs_fresh_boot(
+		APPLE_DCP_COPROCESSOR_COLD_START);
 	KUNIT_EXPECT_FALSE(test, adopt);
-	KUNIT_EXPECT_FALSE(test, reset);
+	KUNIT_EXPECT_FALSE(test, fresh_boot);
 }
 
 static void apple_dcp_cold_start_selection_test(struct kunit *test)
