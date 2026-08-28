@@ -631,12 +631,14 @@ pub(crate) const G17P_PARTIAL_OPENING_TILING_CHANNEL_TABLE_INDEX: u8 = 6;
 pub(crate) const G17P_PARTIAL_OPENING_FRAGMENT_CHANNEL_TABLE_INDEX: u8 = 7;
 
 /// Root, queue, and scheduler identities at the proven first-work boundary.
-/// Linux owns the backing pages; the physical addresses from the m1n1 run are
-/// intentionally not part of this contract.
+/// The successful run used the two-entry macOS context table: slot/tag 0 and
+/// slot/tag 1 both retain their low roots while their high roots are replaced
+/// with distinct empty pages. Linux owns those pages, so their measured
+/// physical addresses are intentionally not part of this contract.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct G17PPartialOpeningContextContract {
-    pub(crate) firmware_low_root_slot: u8,
-    pub(crate) firmware_context_id: u8,
+    pub(crate) context0_root_slot: u8,
+    pub(crate) context0_context_id: u8,
     pub(crate) render_root_slot: u8,
     pub(crate) render_context_id: u8,
     pub(crate) context0_empty_high_root_slot: u8,
@@ -648,15 +650,16 @@ pub(crate) struct G17PPartialOpeningContextContract {
     pub(crate) descriptor_context_id: u8,
     pub(crate) scheduler_class: u8,
     pub(crate) work_doorbell_channel: u8,
-    pub(crate) firmware_low_root_present_at_first_work: bool,
+    pub(crate) context0_low_root_present_at_first_work: bool,
+    pub(crate) render_low_root_present_at_first_work: bool,
     pub(crate) source_firmware_high_root_table_resident: bool,
 }
 
 pub(crate) const G17P_PARTIAL_OPENING_CONTEXT: G17PPartialOpeningContextContract =
     G17PPartialOpeningContextContract {
-        firmware_low_root_slot: 1,
-        firmware_context_id: 64,
-        render_root_slot: 2,
+        context0_root_slot: 0,
+        context0_context_id: 0,
+        render_root_slot: 1,
         render_context_id: 1,
         context0_empty_high_root_slot: 0,
         render_empty_high_root_slot: 1,
@@ -667,7 +670,8 @@ pub(crate) const G17P_PARTIAL_OPENING_CONTEXT: G17PPartialOpeningContextContract
         descriptor_context_id: 2,
         scheduler_class: 2,
         work_doorbell_channel: G17P_PARTIAL_OPENING_WORK_DOORBELL_CHANNEL,
-        firmware_low_root_present_at_first_work: false,
+        context0_low_root_present_at_first_work: true,
+        render_low_root_present_at_first_work: true,
         source_firmware_high_root_table_resident: false,
     };
 
@@ -714,7 +718,6 @@ pub(crate) enum G17PPartialOpeningPublicationStep {
     ControlDone0x84,
     FragmentState,
     EmptyHighRoots,
-    RemoveFirmwareLowRoot,
     FragmentProducer,
     LateTilingState,
     SystemBarrierBeforeTilingProducer,
@@ -723,14 +726,13 @@ pub(crate) enum G17PPartialOpeningPublicationStep {
     PairedWorkDoorbell0x83,
 }
 
-pub(crate) const G17P_PARTIAL_OPENING_PUBLICATION_ORDER: [G17PPartialOpeningPublicationStep; 13] = [
+pub(crate) const G17P_PARTIAL_OPENING_PUBLICATION_ORDER: [G17PPartialOpeningPublicationStep; 12] = [
     G17PPartialOpeningPublicationStep::PrimarySchedulerPage,
     G17PPartialOpeningPublicationStep::PrimaryIndexPage,
     G17PPartialOpeningPublicationStep::PreControlStatus,
     G17PPartialOpeningPublicationStep::ControlDone0x84,
     G17PPartialOpeningPublicationStep::FragmentState,
     G17PPartialOpeningPublicationStep::EmptyHighRoots,
-    G17PPartialOpeningPublicationStep::RemoveFirmwareLowRoot,
     G17PPartialOpeningPublicationStep::FragmentProducer,
     G17PPartialOpeningPublicationStep::LateTilingState,
     G17PPartialOpeningPublicationStep::SystemBarrierBeforeTilingProducer,
@@ -2787,9 +2789,9 @@ mod tests {
         assert_eq!(
             G17P_PARTIAL_OPENING_CONTEXT,
             G17PPartialOpeningContextContract {
-                firmware_low_root_slot: 1,
-                firmware_context_id: 64,
-                render_root_slot: 2,
+                context0_root_slot: 0,
+                context0_context_id: 0,
+                render_root_slot: 1,
                 render_context_id: 1,
                 context0_empty_high_root_slot: 0,
                 render_empty_high_root_slot: 1,
@@ -2800,7 +2802,8 @@ mod tests {
                 descriptor_context_id: 2,
                 scheduler_class: 2,
                 work_doorbell_channel: 8,
-                firmware_low_root_present_at_first_work: false,
+                context0_low_root_present_at_first_work: true,
+                render_low_root_present_at_first_work: true,
                 source_firmware_high_root_table_resident: false,
             }
         );
@@ -2851,7 +2854,6 @@ mod tests {
                 G17PPartialOpeningPublicationStep::ControlDone0x84,
                 G17PPartialOpeningPublicationStep::FragmentState,
                 G17PPartialOpeningPublicationStep::EmptyHighRoots,
-                G17PPartialOpeningPublicationStep::RemoveFirmwareLowRoot,
                 G17PPartialOpeningPublicationStep::FragmentProducer,
                 G17PPartialOpeningPublicationStep::LateTilingState,
                 G17PPartialOpeningPublicationStep::SystemBarrierBeforeTilingProducer,
