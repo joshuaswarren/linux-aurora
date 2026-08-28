@@ -358,6 +358,24 @@ static int tb_pci_set_ext_encapsulation(struct tb_tunnel *tunnel, bool enable)
 	return 0;
 }
 
+static int tb_pci_pre_activate(struct tb_tunnel *tunnel)
+{
+	const struct tb_nhi_ops *ops = tunnel->tb->nhi->ops;
+
+	if (ops && ops->pci_tunnel_pre_activate)
+		return ops->pci_tunnel_pre_activate(tunnel->tb->nhi);
+	return 0;
+}
+
+static int tb_pci_post_activate(struct tb_tunnel *tunnel)
+{
+	const struct tb_nhi_ops *ops = tunnel->tb->nhi->ops;
+
+	if (ops && ops->pci_tunnel_post_activate)
+		return ops->pci_tunnel_post_activate(tunnel->tb->nhi);
+	return 0;
+}
+
 static int tb_pci_activate(struct tb_tunnel *tunnel, bool activate)
 {
 	int res;
@@ -375,17 +393,18 @@ static int tb_pci_activate(struct tb_tunnel *tunnel, bool activate)
 	if (res)
 		return res;
 
-
 	if (activate) {
 		res = tb_pci_port_enable(tunnel->src_port, activate);
 		if (res)
 			return res;
+
+		return tb_pci_post_activate(tunnel);
 	} else {
 		/* Downstream router could be unplugged */
 		tb_pci_port_enable(tunnel->dst_port, activate);
 	}
 
-	return activate ? 0 : tb_pci_set_ext_encapsulation(tunnel, activate);
+	return tb_pci_set_ext_encapsulation(tunnel, activate);
 }
 
 static int tb_pci_init_credits(struct tb_path_hop *hop)
@@ -463,6 +482,7 @@ struct tb_tunnel *tb_tunnel_discover_pci(struct tb *tb, struct tb_port *down,
 		return NULL;
 
 	tunnel->activate = tb_pci_activate;
+	tunnel->pre_activate = tb_pci_pre_activate;
 	tunnel->src_port = down;
 
 	/*
@@ -542,6 +562,7 @@ struct tb_tunnel *tb_tunnel_alloc_pci(struct tb *tb, struct tb_port *up,
 
 	tunnel->pre_activate = tb_pci_pre_activate;
 	tunnel->activate = tb_pci_activate;
+	tunnel->pre_activate = tb_pci_pre_activate;
 	tunnel->src_port = down;
 	tunnel->dst_port = up;
 
