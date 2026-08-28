@@ -1408,13 +1408,16 @@ impl Vm {
         core::mem::drop(vm_bo_guard);
 
         let uat_inner = inner.uat_inner.clone();
-        let node = inner.mm.insert_node_in_range(
+        // Reserve the VA before attaching objects whose destructors take the
+        // GEM reservation lock.  The allocator drops its payload internally
+        // on an insertion error, while exec_lock still owns that lock.
+        let node_result = inner.mm.insert_node_in_range(
             KernelMappingInner {
                 owner: self.inner.clone(),
                 uat_inner,
                 prot,
-                bo: Some(vm_bo),
-                _gem: Some(gem.into()),
+                bo: None,
+                _gem: None,
                 offset: object_range.start,
                 mapped_size: size,
             },
@@ -1424,7 +1427,19 @@ impl Vm {
             range.start,
             range.end,
             mm::InsertMode::Best,
-        )?;
+        );
+        let mut node = match node_result {
+            Ok(node) => node,
+            Err(err) => {
+                core::mem::drop(inner);
+                return Err(err);
+            }
+        };
+        {
+            let node_inner = node.as_mut().inner_mut();
+            node_inner.bo = Some(vm_bo);
+            node_inner._gem = Some(gem.into());
+        }
 
         let ret = inner.map_node(&node, prot);
         // Drop the exec_lock first, so that if map_node failed the
@@ -1456,20 +1471,34 @@ impl Vm {
         core::mem::drop(vm_bo_guard);
 
         let uat_inner = inner.uat_inner.clone();
-        let node = inner.mm.reserve_node(
+        // See map_in_range(): keep dma_resv-owning references out of the
+        // allocator payload until the fixed-address reservation succeeds.
+        let node_result = inner.mm.reserve_node(
             KernelMappingInner {
                 owner: self.inner.clone(),
                 uat_inner,
                 prot,
-                bo: Some(vm_bo),
-                _gem: Some(gem.clone()),
+                bo: None,
+                _gem: None,
                 offset: 0,
                 mapped_size: size,
             },
             addr,
             (size + if guard { UAT_PGSZ } else { 0 }) as u64, // Add guard page
             0,
-        )?;
+        );
+        let mut node = match node_result {
+            Ok(node) => node,
+            Err(err) => {
+                core::mem::drop(inner);
+                return Err(err);
+            }
+        };
+        {
+            let node_inner = node.as_mut().inner_mut();
+            node_inner.bo = Some(vm_bo);
+            node_inner._gem = Some(gem.clone());
+        }
 
         let ret = inner.map_node(&node, prot);
         // Drop the exec_lock first, so that if map_node failed the
