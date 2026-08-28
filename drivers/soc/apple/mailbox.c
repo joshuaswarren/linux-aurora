@@ -105,6 +105,7 @@ static_assert(APPLE_ASCWRAP_V6_MBOX_OFFSET + APPLE_ASC_MBOX_I2A_RECV0 ==
 struct apple_mbox_hw {
 	unsigned int reg_offset;
 	bool is_ascwrap_v6;
+	bool ap_initializes_mailboxes;
 
 	unsigned int control_full;
 	unsigned int control_empty;
@@ -394,6 +395,7 @@ EXPORT_SYMBOL(apple_mbox_poll);
 
 int apple_mbox_start(struct apple_mbox *mbox)
 {
+	u32 control;
 	int ret = 0;
 
 	mutex_lock(&mbox->lifecycle_lock);
@@ -407,6 +409,16 @@ int apple_mbox_start(struct apple_mbox *mbox)
 	ret = pm_runtime_resume_and_get(mbox->dev);
 	if (ret)
 		goto out_unlock;
+
+	if (mbox->hw->ap_initializes_mailboxes) {
+		/* AppleA7IOP::startCPUWithOptions() enables the IOP outbox. */
+		control = readl_relaxed(mbox->regs + mbox->hw->i2a_control);
+		writel_relaxed(control | BIT(0),
+			       mbox->regs + mbox->hw->i2a_control);
+		control = readl_relaxed(mbox->regs + mbox->hw->i2a_control);
+		dev_info(mbox->dev,
+			 "T8140 IOP outbox enabled control=%#x\n", control);
+	}
 
 	/*
 	 * Only some variants of this mailbox HW provide interrupt control
@@ -728,6 +740,23 @@ static const struct apple_mbox_hw apple_mbox_asc_hw = {
 	.has_irq_controls = false,
 };
 
+static const struct apple_mbox_hw apple_mbox_t8140_asc_hw = {
+	.ap_initializes_mailboxes = true,
+
+	.control_full = APPLE_ASC_MBOX_CONTROL_FULL,
+	.control_empty = APPLE_ASC_MBOX_CONTROL_EMPTY,
+
+	.a2i_control = APPLE_ASC_MBOX_A2I_CONTROL,
+	.a2i_send0 = APPLE_ASC_MBOX_A2I_SEND0,
+	.a2i_send1 = APPLE_ASC_MBOX_A2I_SEND1,
+
+	.i2a_control = APPLE_ASC_MBOX_I2A_CONTROL,
+	.i2a_recv0 = APPLE_ASC_MBOX_I2A_RECV0,
+	.i2a_recv1 = APPLE_ASC_MBOX_I2A_RECV1,
+
+	.has_irq_controls = false,
+};
+
 static const struct apple_mbox_hw apple_mbox_ascwrap_v6_hw = {
 	.reg_offset = APPLE_ASCWRAP_V6_MBOX_OFFSET,
 	.is_ascwrap_v6 = true,
@@ -767,6 +796,7 @@ static const struct apple_mbox_hw apple_mbox_m3_hw = {
 
 static const struct of_device_id apple_mbox_of_match[] = {
 	{ .compatible = "apple,t8140-ascwrap-v6", .data = &apple_mbox_ascwrap_v6_hw },
+	{ .compatible = "apple,t8140-asc-mailbox", .data = &apple_mbox_t8140_asc_hw },
 	{ .compatible = "apple,asc-mailbox-v4", .data = &apple_mbox_asc_hw },
 	{ .compatible = "apple,t8015-asc-mailbox", .data = &apple_mbox_t8015_hw },
 	{ .compatible = "apple,m3-mailbox-v2", .data = &apple_mbox_m3_hw },
