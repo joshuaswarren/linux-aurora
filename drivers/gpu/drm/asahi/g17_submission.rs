@@ -1054,6 +1054,8 @@ pub(crate) struct G17PClKickEntryOperands<'a> {
 /// the entry barrier. No shared memory or MMIO is touched by this function.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PreparedG17PClKickEntry {
+    /// Bytes the live publisher must clear before copying `entry`.
+    pub(crate) zero_length: u32,
     pub(crate) entry: [u8; G17P_CL_KICK_ENTRY_SIZE],
     pub(crate) entry_index: u8,
     pub(crate) entry_offset: u32,
@@ -1069,6 +1071,7 @@ pub(crate) struct PreparedG17PClKickEntry {
 /// Ordering at the side-effect boundary of the host encoder.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum G17PClKickPublicationStep {
+    ZeroEntryStride,
     EntryBody,
     InnerShareableBarrier,
     NextTimestamp,
@@ -1077,7 +1080,8 @@ pub(crate) enum G17PClKickPublicationStep {
     PreviousTimestamp,
 }
 
-pub(crate) const G17P_CL_KICK_PUBLICATION_ORDER: [G17PClKickPublicationStep; 6] = [
+pub(crate) const G17P_CL_KICK_PUBLICATION_ORDER: [G17PClKickPublicationStep; 7] = [
+    G17PClKickPublicationStep::ZeroEntryStride,
     G17PClKickPublicationStep::EntryBody,
     G17PClKickPublicationStep::InnerShareableBarrier,
     G17PClKickPublicationStep::NextTimestamp,
@@ -1258,6 +1262,7 @@ pub(crate) fn prepare_g17p_cl_kick_entry(
     producer_after.previous_timestamp = prepared.timestamp;
 
     Ok(PreparedG17PClKickEntry {
+        zero_length: queue.entry_stride,
         entry,
         entry_index: prepared.entry_index,
         entry_offset: prepared.entry_offset,
@@ -2479,6 +2484,7 @@ mod tests {
         assert_eq!(
             G17P_CL_KICK_PUBLICATION_ORDER,
             [
+                G17PClKickPublicationStep::ZeroEntryStride,
                 G17PClKickPublicationStep::EntryBody,
                 G17PClKickPublicationStep::InnerShareableBarrier,
                 G17PClKickPublicationStep::NextTimestamp,
@@ -2536,6 +2542,7 @@ mod tests {
             put_u64_le(&mut expected0, offset, value);
         }
         assert_eq!(item0.entry, expected0);
+        assert_eq!(item0.zero_length, 0x200);
         assert_eq!(item0.entry_index, 1);
         assert_eq!(item0.entry_offset, 0x200);
         assert_eq!(item0.current_timestamp, 1);
@@ -2575,6 +2582,7 @@ mod tests {
             put_u64_le(&mut expected1, offset, value);
         }
         assert_eq!(item1.entry, expected1);
+        assert_eq!(item1.zero_length, 0x200);
         assert_eq!(item1.entry_index, 2);
         assert_eq!(item1.entry_offset, 0x400);
         assert_eq!(item1.current_timestamp, 2);
