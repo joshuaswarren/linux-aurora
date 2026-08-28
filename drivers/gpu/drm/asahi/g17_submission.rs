@@ -134,6 +134,8 @@ pub(crate) enum SubmissionError {
     KickQueueSubmittedFull,
     /// A completion observed no submitted entries or exceeded their count.
     KickCompletionUnderflow,
+    /// A provider-owned pre-B2 state object is smaller than one 16 KiB page.
+    KickB2PrimaryStateBufferTooSmall,
     /// A CL entry has one implicit dependency and at most 31 explicit ones.
     KickDependencyCountOutOfRange,
     /// A CL dependency names a queue outside the seven-bit entry field.
@@ -1294,6 +1296,162 @@ pub(crate) fn complete_g17p_cl_kicks(
     producer.submitted -= completed_count;
     Ok(producer)
 }
+
+/// One range inside provider-owned queue storage.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PClStorageRange {
+    pub(crate) offset: usize,
+    pub(crate) size: usize,
+}
+
+/// The scheduler record at +0x200 aliases the registered queue's 16 KiB
+/// shared-support page. A second full-page support write would erase it.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PClRetainedStorageLayout {
+    pub(crate) shared_support: G17PClStorageRange,
+    pub(crate) scheduler: G17PClStorageRange,
+}
+
+pub(crate) const G17P_CL_RETAINED_STORAGE_LAYOUT: G17PClRetainedStorageLayout =
+    G17PClRetainedStorageLayout {
+        shared_support: G17PClStorageRange {
+            offset: 0,
+            size: 0x4000,
+        },
+        scheduler: G17PClStorageRange {
+            offset: 0x200,
+            size: 0x100,
+        },
+    };
+
+/// Required provider-owned storage for the measured pre-B2 state writes.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PClB2PrimaryStateLayout {
+    pub(crate) object_size: usize,
+    pub(crate) computed_write_extent: usize,
+    pub(crate) region_1_write_extent: usize,
+    pub(crate) region_2_write_extent: usize,
+}
+
+pub(crate) const G17P_CL_B2_PRIMARY_STATE_LAYOUT: G17PClB2PrimaryStateLayout =
+    G17PClB2PrimaryStateLayout {
+        object_size: 0x4000,
+        computed_write_extent: 0xe30,
+        region_1_write_extent: 0x20,
+        region_2_write_extent: 0x18,
+    };
+
+pub(crate) const fn g17p_cl_ranges_overlap(
+    left: G17PClStorageRange,
+    right: G17PClStorageRange,
+) -> bool {
+    let left_end = match left.offset.checked_add(left.size) {
+        Some(end) => end,
+        None => return false,
+    };
+    let right_end = match right.offset.checked_add(right.size) {
+        Some(end) => end,
+        None => return false,
+    };
+    left.offset < right_end && right.offset < left_end
+}
+
+pub(crate) const fn g17p_cl_range_contains(
+    outer: G17PClStorageRange,
+    inner: G17PClStorageRange,
+) -> bool {
+    let outer_end = match outer.offset.checked_add(outer.size) {
+        Some(end) => end,
+        None => return false,
+    };
+    let inner_end = match inner.offset.checked_add(inner.size) {
+        Some(end) => end,
+        None => return false,
+    };
+    outer.offset <= inner.offset && inner_end <= outer_end
+}
+
+/// A whole-page support initializer is valid only before queue registration.
+pub(crate) const fn g17p_cl_full_support_initialization_allowed(registered: bool) -> bool {
+    !registered
+}
+
+/// Apply the exact host-owned pre-B2 values to three provider-owned pages.
+/// Bytes outside the listed fields remain unchanged. `channel_control_gpu_va`
+/// comes from the retained Linux mapping, not the captured macOS address.
+pub(crate) fn apply_g17p_cl_b2_primary_state(
+    computed: &mut [u8],
+    region_1: &mut [u8],
+    region_2: &mut [u8],
+    channel_control_gpu_va: u64,
+) -> Result<(), SubmissionError> {
+    let layout = G17P_CL_B2_PRIMARY_STATE_LAYOUT;
+    if computed.len() < layout.object_size
+        || region_1.len() < layout.object_size
+        || region_2.len() < layout.object_size
+    {
+        return Err(SubmissionError::KickB2PrimaryStateBufferTooSmall);
+    }
+
+    computed[0x000] = 0xff;
+    computed[0x008] = 0xff;
+    computed[0x010..0x012].copy_from_slice(&0x0f01u16.to_le_bytes());
+    computed[0x018..0x01a].copy_from_slice(&0x0f01u16.to_le_bytes());
+    put_u32_le(computed, 0x408, 2);
+    put_u32_le(computed, 0x40c, 2);
+    put_u32_le(computed, 0x604, 4);
+    put_u64_le(computed, 0x808, channel_control_gpu_va);
+    put_u32_le(computed, 0xc04, 0x1000);
+    put_u64_le(computed, 0xe00, 7);
+    put_u64_le(computed, 0xe08, 0x0000_0001_0e22_618a);
+    put_u64_le(computed, 0xe20, 4);
+    put_u64_le(computed, 0xe28, 4);
+
+    put_u64_le(region_1, 0x10, 0x0000_0080_0007_7000);
+    put_u32_le(region_1, 0x18, 0x17);
+    put_u32_le(region_1, 0x1c, 0x17);
+
+    put_u64_le(region_2, 0x00, 0x0800_0000_e000_0000);
+    put_u64_le(region_2, 0x08, 0x0000_3d40_0000_3400);
+    put_u64_le(region_2, 0x10, 0x0000_0000_0000_1d00);
+    Ok(())
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum G17PClRetainedPublicationStep {
+    InitializeSharedSupport,
+    WriteSchedulerRecord,
+    RegisterPhysicalQueue,
+    PublishCommandOwnedState,
+    CleanCommandOwnedState,
+    WriteB2PrimaryState,
+    CleanB2PrimaryState,
+    SystemBarrierBeforeInnerPayload,
+    PublishInnerQueuePayload,
+    SystemBarrierBeforeInnerProducer,
+    PublishInnerQueueProducer,
+    SystemBarrierAfterInnerProducer,
+}
+
+/// One-time order that makes the scheduler alias valid before registration.
+pub(crate) const G17P_CL_RETAINED_REGISTRATION_ORDER: [G17PClRetainedPublicationStep; 3] = [
+    G17PClRetainedPublicationStep::InitializeSharedSupport,
+    G17PClRetainedPublicationStep::WriteSchedulerRecord,
+    G17PClRetainedPublicationStep::RegisterPhysicalQueue,
+];
+
+/// Per-command order proven by the hardware-positive retained B2 submission.
+pub(crate) const G17P_CL_RETAINED_SUBMISSION_ORDER: [G17PClRetainedPublicationStep; 9] = [
+    G17PClRetainedPublicationStep::PublishCommandOwnedState,
+    G17PClRetainedPublicationStep::CleanCommandOwnedState,
+    G17PClRetainedPublicationStep::WriteB2PrimaryState,
+    G17PClRetainedPublicationStep::CleanB2PrimaryState,
+    G17PClRetainedPublicationStep::SystemBarrierBeforeInnerPayload,
+    G17PClRetainedPublicationStep::PublishInnerQueuePayload,
+    G17PClRetainedPublicationStep::SystemBarrierBeforeInnerProducer,
+    G17PClRetainedPublicationStep::PublishInnerQueueProducer,
+    G17PClRetainedPublicationStep::SystemBarrierAfterInnerProducer,
+];
 
 // ---------------------------------------------------------------------------
 // 6. Host addKicks MMIO publication (AGX3-specific).
@@ -2516,7 +2674,7 @@ mod tests {
     }
 
     #[test]
-    fn g17p_cl_native_add3_items_match_the_m1n1_builder_byte_for_byte() {
+    fn g17p_cl_hardware_positive_retained_items_are_exact() {
         const QUEUE: u64 = 0xffff_fc20_c000_0300;
         const DESCRIPTOR: u64 = 0xffff_fc20_c035_8000;
         const DESCRIPTOR_STRIDE: u64 = 0x1040;
@@ -2582,7 +2740,7 @@ mod tests {
                 DESCRIPTOR + DESCRIPTOR_STRIDE,
                 QUEUE,
                 0,
-                [0, 0, 8, 0],
+                [0, 2, 8, 0],
                 [0x0001_1003_8001_a084, 0x0000_2003_8001_a0bd],
             ),
         )
@@ -2594,6 +2752,7 @@ mod tests {
             (0x18, QUEUE),
             (0x20, 0xffff_0801_0000_0001),
             (0x28, 0x0000_0400_0000_0001),
+            (0x130, 2),
             (0x138, 8),
             (0x150, 0x0001_1003_8001_a084),
             (0x158, 0x0000_2003_8001_a0bd),
@@ -2717,6 +2876,131 @@ mod tests {
         assert_eq!(
             complete_g17p_cl_kicks(producer, 3),
             Err(SubmissionError::KickCompletionUnderflow)
+        );
+    }
+
+    #[test]
+    fn g17p_cl_retained_storage_overlap_and_order_are_exact() {
+        let layout = G17P_CL_RETAINED_STORAGE_LAYOUT;
+        assert_eq!(
+            layout,
+            G17PClRetainedStorageLayout {
+                shared_support: G17PClStorageRange {
+                    offset: 0,
+                    size: 0x4000,
+                },
+                scheduler: G17PClStorageRange {
+                    offset: 0x200,
+                    size: 0x100,
+                },
+            }
+        );
+        assert_eq!(
+            layout.scheduler.offset - layout.shared_support.offset,
+            0x200
+        );
+        assert!(g17p_cl_range_contains(
+            layout.shared_support,
+            layout.scheduler
+        ));
+        assert!(g17p_cl_ranges_overlap(
+            layout.shared_support,
+            layout.scheduler
+        ));
+        assert!(g17p_cl_full_support_initialization_allowed(false));
+        assert!(!g17p_cl_full_support_initialization_allowed(true));
+
+        assert_eq!(
+            G17P_CL_RETAINED_REGISTRATION_ORDER,
+            [
+                G17PClRetainedPublicationStep::InitializeSharedSupport,
+                G17PClRetainedPublicationStep::WriteSchedulerRecord,
+                G17PClRetainedPublicationStep::RegisterPhysicalQueue,
+            ]
+        );
+        assert_eq!(
+            G17P_CL_RETAINED_SUBMISSION_ORDER,
+            [
+                G17PClRetainedPublicationStep::PublishCommandOwnedState,
+                G17PClRetainedPublicationStep::CleanCommandOwnedState,
+                G17PClRetainedPublicationStep::WriteB2PrimaryState,
+                G17PClRetainedPublicationStep::CleanB2PrimaryState,
+                G17PClRetainedPublicationStep::SystemBarrierBeforeInnerPayload,
+                G17PClRetainedPublicationStep::PublishInnerQueuePayload,
+                G17PClRetainedPublicationStep::SystemBarrierBeforeInnerProducer,
+                G17PClRetainedPublicationStep::PublishInnerQueueProducer,
+                G17PClRetainedPublicationStep::SystemBarrierAfterInnerProducer,
+            ]
+        );
+    }
+
+    #[test]
+    fn g17p_cl_b2_primary_state_builder_is_byte_exact() {
+        const FILL: u8 = 0xa5;
+        const CHANNEL_CONTROL: u64 = 0xffff_fc20_1234_8000;
+        let layout = G17P_CL_B2_PRIMARY_STATE_LAYOUT;
+        assert_eq!(
+            layout,
+            G17PClB2PrimaryStateLayout {
+                object_size: 0x4000,
+                computed_write_extent: 0xe30,
+                region_1_write_extent: 0x20,
+                region_2_write_extent: 0x18,
+            }
+        );
+
+        let mut computed = [FILL; 0x4000];
+        let mut region_1 = [FILL; 0x4000];
+        let mut region_2 = [FILL; 0x4000];
+        apply_g17p_cl_b2_primary_state(
+            &mut computed,
+            &mut region_1,
+            &mut region_2,
+            CHANNEL_CONTROL,
+        )
+        .unwrap();
+
+        let mut expected_computed = [FILL; 0x4000];
+        expected_computed[0x000] = 0xff;
+        expected_computed[0x008] = 0xff;
+        expected_computed[0x010..0x012].copy_from_slice(&0x0f01u16.to_le_bytes());
+        expected_computed[0x018..0x01a].copy_from_slice(&0x0f01u16.to_le_bytes());
+        for (offset, value) in [(0x408, 2), (0x40c, 2), (0x604, 4), (0xc04, 0x1000)] {
+            put_u32_le(&mut expected_computed, offset, value);
+        }
+        for (offset, value) in [
+            (0x808, CHANNEL_CONTROL),
+            (0xe00, 7),
+            (0xe08, 0x0000_0001_0e22_618a),
+            (0xe20, 4),
+            (0xe28, 4),
+        ] {
+            put_u64_le(&mut expected_computed, offset, value);
+        }
+
+        let mut expected_region_1 = [FILL; 0x4000];
+        put_u64_le(&mut expected_region_1, 0x10, 0x0000_0080_0007_7000);
+        put_u32_le(&mut expected_region_1, 0x18, 0x17);
+        put_u32_le(&mut expected_region_1, 0x1c, 0x17);
+
+        let mut expected_region_2 = [FILL; 0x4000];
+        put_u64_le(&mut expected_region_2, 0x00, 0x0800_0000_e000_0000);
+        put_u64_le(&mut expected_region_2, 0x08, 0x0000_3d40_0000_3400);
+        put_u64_le(&mut expected_region_2, 0x10, 0x0000_0000_0000_1d00);
+
+        assert_eq!(computed, expected_computed);
+        assert_eq!(region_1, expected_region_1);
+        assert_eq!(region_2, expected_region_2);
+
+        let mut short = [0u8; 1];
+        assert_eq!(
+            apply_g17p_cl_b2_primary_state(
+                &mut short,
+                &mut region_1,
+                &mut region_2,
+                CHANNEL_CONTROL,
+            ),
+            Err(SubmissionError::KickB2PrimaryStateBufferTooSmall)
         );
     }
 
