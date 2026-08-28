@@ -22,6 +22,7 @@ mod g17_adt_j700;
 mod g17_asc_bringup;
 mod g17_boot;
 mod g17_completion;
+mod g17_compute;
 mod g17_firmware;
 mod g17_initdata;
 mod g17_lifecycle;

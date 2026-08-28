@@ -17,7 +17,8 @@ use core::sync::atomic::{fence, Ordering};
 
 #[cfg(not(test))]
 use crate::{
-    driver::AsahiDevice, g17_initdata, g17_resources, g17_submission, hw::agx3, identity, mmu, regs,
+    driver::AsahiDevice, g17_compute, g17_initdata, g17_resources, g17_submission, g17_uapi,
+    hw::agx3, identity, mmu, regs,
 };
 #[cfg(test)]
 #[path = "g17_initdata.rs"]
@@ -320,8 +321,29 @@ pub(crate) struct G17PSksmQueue {
     disable_pair: g17_submission::G17SksmOrderedWritePair,
     registered: bool,
     storage: g17_resources::G17PClRuntimeStorage,
+    compute: g17_resources::G17PComputeDescriptorStorage,
     producer: g17_submission::G17PClKickProducerState,
     b2_activation: g17_submission::G17PClB2ActivationState,
+}
+
+/// Command-owned fields used to build one compute descriptor and CL entry.
+/// The queue supplies descriptor storage, sequencing, preemption storage, and
+/// the retained support graph.
+#[cfg(not(test))]
+pub(crate) struct G17PComputeSubmissionContext<'a> {
+    pub(crate) context_id: u32,
+    pub(crate) dispatch_identity: u64,
+    pub(crate) execution_gate: u64,
+    pub(crate) timestamps: g17_uapi::ComputeTimestampAddresses,
+    pub(crate) descriptor_flag_4c: bool,
+    pub(crate) descriptor_flag_5c8: bool,
+    pub(crate) converted_command_timestamp: u64,
+    pub(crate) barriers: &'a [g17_submission::G17PClBarrierDependency],
+    pub(crate) mcache: Option<g17_submission::G17PClMcacheAperture>,
+    pub(crate) event_mask: [u64; 4],
+    pub(crate) rce_kind: u8,
+    pub(crate) rce_bindings: [g17_submission::G17PClRceBinding; 4],
+    pub(crate) auxiliary: u64,
 }
 
 #[cfg(not(test))]
@@ -379,6 +401,11 @@ impl G17PManagerConstruction {
         completion_selector: u8,
     ) -> Result<G17PSksmQueue> {
         let mut storage = g17_resources::G17PClRuntimeStorage::new(dev, self.uat())?;
+        let compute = g17_resources::G17PComputeDescriptorStorage::new(
+            dev,
+            self.uat(),
+            storage.channel_control_gpu_va(),
+        )?;
         let operand_table_gpu_va = storage.operand_table_gpu_va();
         let support_state_gpu_va = storage.support_state_gpu_va();
         let scheduler_state_gpu_va = storage.scheduler_state_gpu_va();
@@ -414,6 +441,7 @@ impl G17PManagerConstruction {
             disable_pair: config.disable_pair,
             registered: true,
             storage,
+            compute,
             producer: g17_submission::G17PClKickProducerState {
                 queue_id,
                 num_stamps: 256,
@@ -470,6 +498,15 @@ impl G17PManagerConstruction {
         }
         let prepared = g17_submission::prepare_g17p_cl_kick_entry(queue.producer, operands)
             .map_err(|_| EINVAL)?;
+        self.publish_compute_entry(registers, queue, prepared)
+    }
+
+    fn publish_compute_entry(
+        &mut self,
+        registers: &regs::Resources,
+        queue: &mut G17PSksmQueue,
+        prepared: g17_submission::PreparedG17PClKickEntry,
+    ) -> Result<u64> {
         queue.storage.write_entry(
             prepared.entry_offset as usize,
             prepared.zero_length as usize,
@@ -498,6 +535,100 @@ impl G17PManagerConstruction {
         self.add_sksm_kicks(registers, queue, 1)?;
         fence(Ordering::SeqCst);
         Ok(timestamp)
+    }
+
+    /// Build and publish one complete userspace compute command.
+    ///
+    /// Descriptor and CL-entry slots share the same 256-entry lifetime. The
+    /// descriptor is written first, then its upper address and the retained
+    /// queue record are placed in the CL payload before the ordered SKSM kick.
+    pub(crate) fn submit_translated_compute(
+        &mut self,
+        registers: &regs::Resources,
+        queue: &mut G17PSksmQueue,
+        command: &g17_uapi::TranslatedComputeCommand,
+        context: G17PComputeSubmissionContext<'_>,
+    ) -> Result<u64> {
+        if !queue.registered
+            || queue.scratch != self.sksm_scratch()
+            || queue.uat_owner != self.uat().ttb_base()
+        {
+            return Err(EINVAL);
+        }
+
+        let timestamp = g17_submission::decode_kick_timestamp(queue.producer.current_timestamp)
+            .map_err(|_| EINVAL)?;
+        let (descriptor_high, descriptor_low) =
+            queue.compute.descriptor_gpu_vas(timestamp.stamp_index);
+        let payload = [descriptor_high, queue.compute.queue_record_gpu_va()];
+        let operands = command.entry_operands(g17_uapi::ComputeEntryContext {
+            descriptor_flag_4c: context.descriptor_flag_4c,
+            descriptor_flag_5c8: context.descriptor_flag_5c8,
+            converted_command_timestamp: context.converted_command_timestamp,
+            barriers: context.barriers,
+            mcache: context.mcache,
+            payload,
+            event_mask: context.event_mask,
+            rce_kind: context.rce_kind,
+            rce_bindings: context.rce_bindings,
+            auxiliary: context.auxiliary,
+        });
+        let prepared = g17_submission::prepare_g17p_cl_kick_entry(queue.producer, operands)
+            .map_err(|_| EINVAL)?;
+        if prepared.entry_index != timestamp.stamp_index {
+            return Err(EINVAL);
+        }
+
+        let ordinal = queue.producer.submitted;
+        let queue_submission = ordinal.checked_add(1).ok_or(EINVAL)?;
+        let preempt_base = queue.compute.preempt_gpu_va();
+        let robustness = queue.compute.robustness_gpu_va();
+        let operand_state_base = queue.compute.operand_state_gpu_va();
+        let shared_control = queue.storage.shared_support_gpu_va();
+        let objects = g17_compute::ComputeDescriptorObjects {
+            scheduler_record: queue.compute.scheduler_record_gpu_va(),
+            descriptor_low_alias: descriptor_low,
+            dispatch_a: queue.compute.dispatch_a_gpu_va(),
+            dispatch_b: queue.compute.dispatch_b_gpu_va(),
+            status_a: queue.compute.status_a_gpu_va(),
+            status_b: queue.compute.status_b_gpu_va(),
+            shared_control,
+            zero_page: queue.compute.zero_page_gpu_va(),
+        };
+        queue
+            .compute
+            .with_descriptor_mut(prepared.entry_index, |raw| {
+                g17_uapi::build_compute_descriptor(
+                    command,
+                    g17_uapi::ComputeInternalState {
+                        preempt_base,
+                        dispatch_identity: context.dispatch_identity,
+                        context_id: context.context_id,
+                        work_ordinal: ordinal,
+                        robustness,
+                        operand_state_base,
+                        execution_gate: context.execution_gate,
+                    },
+                    objects,
+                    g17_compute::ComputeDescriptorMetadata {
+                        submit_sequence: ordinal as u64,
+                        context_id: context.context_id,
+                        grid_index: 2,
+                        work_ordinal: ordinal,
+                        queue_submission,
+                        queue_ordinal: ordinal,
+                        submission_index: queue_submission,
+                        support_control: 0xe0a0_0001,
+                        support_flags: 0,
+                    },
+                    context.timestamps,
+                    raw,
+                )
+                .map_err(|_| EINVAL)
+            })?;
+
+        fence(Ordering::SeqCst);
+        self.publish_compute_entry(registers, queue, prepared)
     }
 
     /// Completion ingress for the descriptor-provided completed-kick count.

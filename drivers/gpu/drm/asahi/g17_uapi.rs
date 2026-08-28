@@ -11,7 +11,10 @@
 //! object, publishes no queue state, and performs no firmware or MMIO action.
 
 #[cfg(not(test))]
-use crate::{g17_render, g17_submission};
+use crate::{g17_compute, g17_render, g17_submission};
+#[cfg(test)]
+#[path = "g17_compute.rs"]
+mod g17_compute;
 #[cfg(test)]
 #[path = "g17_render.rs"]
 mod g17_render;
@@ -85,11 +88,18 @@ pub(crate) enum UapiTranslateError {
     ZlsFields,
     StencilClearBits,
     RenderBuild(RenderBuildError),
+    ComputeBuild(g17_compute::ComputeBuildError),
 }
 
 impl From<RenderBuildError> for UapiTranslateError {
     fn from(value: RenderBuildError) -> Self {
         Self::RenderBuild(value)
+    }
+}
+
+impl From<g17_compute::ComputeBuildError> for UapiTranslateError {
+    fn from(value: g17_compute::ComputeBuildError) -> Self {
+        Self::ComputeBuild(value)
     }
 }
 
@@ -845,6 +855,7 @@ pub(crate) fn build_render_descriptors(
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct TranslatedComputeCommand {
+    pub(crate) usc_exec_base: u64,
     pub(crate) control_stream_base: u64,
     pub(crate) control_stream_end: u64,
     pub(crate) control_stream_terminator: u64,
@@ -888,6 +899,7 @@ pub(crate) fn translate_compute_command<A: GpuAddressSpace>(
     }
     validate_attachments(address_space, &attachments)?;
     Ok(TranslatedComputeCommand {
+        usc_exec_base: queue.base,
         control_stream_base: command.control_stream_base,
         control_stream_end: command.control_stream_end,
         control_stream_terminator: command.control_stream_end - 4,
@@ -896,6 +908,71 @@ pub(crate) fn translate_compute_command<A: GpuAddressSpace>(
         attachments,
         timestamps: command.timestamps,
     })
+}
+
+/// Queue-owned inputs that are independent of one userspace compute command.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct ComputeInternalState {
+    pub(crate) preempt_base: u64,
+    pub(crate) dispatch_identity: u64,
+    pub(crate) context_id: u32,
+    pub(crate) work_ordinal: u32,
+    pub(crate) robustness: u64,
+    pub(crate) operand_state_base: u64,
+    pub(crate) execution_gate: u64,
+}
+
+/// GPU addresses resolved from the UAPI timestamp handles while the object
+/// table is locked.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct ComputeTimestampAddresses {
+    pub(crate) start: u64,
+    pub(crate) end: u64,
+}
+
+/// Build the complete selector-3 descriptor for a translated command.
+///
+/// This is the boundary that consumes the command's CDM range, sampler state,
+/// USC window, and timestamp destinations. The translated attachment list
+/// remains in `command` for the queue's reservation and lifetime tracking.
+pub(crate) fn build_compute_descriptor(
+    command: &TranslatedComputeCommand,
+    internal: ComputeInternalState,
+    objects: g17_compute::ComputeDescriptorObjects,
+    metadata: g17_compute::ComputeDescriptorMetadata,
+    timestamps: ComputeTimestampAddresses,
+    raw: &mut [u8],
+) -> Result<(), UapiTranslateError> {
+    let registers = g17_compute::build_compute_registers(
+        g17_compute::ComputeRegisterParameters {
+            preempt_base: internal.preempt_base,
+            cdm_base: command.control_stream_base,
+            usc_exec_base: command.usc_exec_base,
+            helper_binary: 0,
+            helper_data: 0,
+            helper_config: 0,
+            dispatch_identity: internal.dispatch_identity,
+            context_id: internal.context_id,
+            work_ordinal: internal.work_ordinal,
+            robustness: internal.robustness,
+            operand_state_base: internal.operand_state_base,
+            execution_gate: internal.execution_gate,
+        },
+    )?;
+    g17_compute::build_compute_descriptor(
+        &registers,
+        objects,
+        metadata,
+        g17_compute::ComputeDescriptorCommand {
+            cdm_terminator: command.control_stream_terminator,
+            sampler_array: command.sampler_heap,
+            sampler_count: command.sampler_count,
+            user_timestamp_start: timestamps.start,
+            user_timestamp_end: timestamps.end,
+        },
+        raw,
+    )?;
+    Ok(())
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -1096,6 +1173,7 @@ mod tests {
         assert_eq!(translated.control_stream_base, 0x1_0000);
         assert_eq!(translated.control_stream_end, 0x1_0040);
         assert_eq!(translated.control_stream_terminator, 0x1_003c);
+        assert_eq!(translated.usc_exec_base, 0x11_0000_0000);
         assert_eq!(
             translated.attachments.as_slice(),
             &[UapiAttachment {
@@ -1144,6 +1222,59 @@ mod tests {
         )
         .unwrap();
         assert_eq!(fnv1a64(&entry.entry), 0xbcc4_342d_108e_f9d0);
+
+        let mut descriptor = [0u8; g17_compute::COMPUTE_DESCRIPTOR_SIZE];
+        build_compute_descriptor(
+            &translated,
+            ComputeInternalState {
+                preempt_base: 0x100_0404_0000,
+                dispatch_identity: 0x1234_5678_0000_0001,
+                context_id: 3,
+                work_ordinal: 7,
+                robustness: 0x100_0430_0000,
+                operand_state_base: 0x70_0022_8000,
+                execution_gate: 2,
+            },
+            g17_compute::ComputeDescriptorObjects {
+                scheduler_record: 0xffff_fc20_c099_8100,
+                descriptor_low_alias: 0x70_0034_0000,
+                dispatch_a: 0xffff_fc20_001c_8028,
+                dispatch_b: 0xffff_fc20_c07c_0028,
+                status_a: 0xffff_fc20_0002_4c68,
+                status_b: 0xffff_fc20_0002_4c70,
+                shared_control: 0xffff_fc20_c095_0000,
+                zero_page: 0xffff_fc20_0171_0000,
+            },
+            g17_compute::ComputeDescriptorMetadata {
+                submit_sequence: 5,
+                context_id: 3,
+                grid_index: 2,
+                work_ordinal: 7,
+                queue_submission: 8,
+                queue_ordinal: 7,
+                submission_index: 9,
+                support_control: 0xe0a0_0001,
+                support_flags: 0,
+            },
+            ComputeTimestampAddresses {
+                start: 0x200_0000_4000,
+                end: 0x200_0000_4008,
+            },
+            &mut descriptor,
+        )
+        .unwrap();
+        assert_eq!(
+            u64::from_le_bytes(descriptor[0x0ee0..0x0ee8].try_into().unwrap()),
+            translated.control_stream_terminator
+        );
+        assert_eq!(
+            u64::from_le_bytes(descriptor[0x0f8c..0x0f94].try_into().unwrap()),
+            0x200_0000_4000
+        );
+        assert_eq!(
+            u64::from_le_bytes(descriptor[0x8c..0x94].try_into().unwrap()),
+            translated.usc_exec_base
+        );
     }
 
     #[test]

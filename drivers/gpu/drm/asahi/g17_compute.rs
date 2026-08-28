@@ -1,0 +1,517 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
+
+#![cfg_attr(not(test), allow(dead_code))]
+
+//! T8140/G17P compute descriptor construction.
+//!
+//! The descriptor is the one-page selector-3 object executed by the CL path.
+//! Every field here comes from the hardware-tested m1n1 compute builder. The
+//! caller supplies queue-owned object addresses and command-owned UAPI values;
+//! this module only validates and encodes them.
+
+pub(crate) const COMPUTE_DESCRIPTOR_SIZE: usize = 0x4000;
+pub(crate) const COMPUTE_REGISTER_COUNT: usize = 40;
+pub(crate) const COMPUTE_REGISTER_CAPACITY: usize = 128;
+pub(crate) const COMPUTE_REGISTER_SIZE: usize = 0x0c;
+pub(crate) const COMPUTE_QUEUE_GRAPH_SIZE: usize = 0x8000;
+const _: () = assert!(COMPUTE_REGISTER_COUNT <= COMPUTE_REGISTER_CAPACITY);
+
+const COMPUTE_SELECTOR: u32 = 3;
+const COMPUTE_REGISTER_START: usize = 0x40;
+const COMPUTE_SECONDARY_REGISTER_START: usize = 0x760;
+const COMPUTE_PRIMARY_COUNT: usize = 0x748;
+const COMPUTE_ENCODER_PARAMS: usize = 0xf14;
+const COMPUTE_SAMPLER_ARRAY: usize = COMPUTE_ENCODER_PARAMS + 0x18;
+const COMPUTE_SAMPLER_COUNT: usize = COMPUTE_ENCODER_PARAMS + 0x20;
+const COMPUTE_SAMPLER_MAX: usize = COMPUTE_ENCODER_PARAMS + 0x24;
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum ComputeBuildError {
+    BufferTooSmall,
+    AddressOverflow,
+    CdmTerminatorBeforeStream,
+    SubmissionIndexZero,
+    QueueSubmissionZero,
+    SamplerCountOutOfRange,
+    SamplerPair,
+    SamplerAlignment,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct ComputeRegister {
+    pub(crate) number: u32,
+    pub(crate) value: u64,
+}
+
+impl ComputeRegister {
+    const fn new(number: u32, value: u64) -> Self {
+        Self { number, value }
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct ComputeRegisterParameters {
+    pub(crate) preempt_base: u64,
+    pub(crate) cdm_base: u64,
+    pub(crate) usc_exec_base: u64,
+    pub(crate) helper_binary: u64,
+    pub(crate) helper_data: u64,
+    pub(crate) helper_config: u64,
+    pub(crate) dispatch_identity: u64,
+    pub(crate) context_id: u32,
+    pub(crate) work_ordinal: u32,
+    pub(crate) robustness: u64,
+    pub(crate) operand_state_base: u64,
+    pub(crate) execution_gate: u64,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct ComputeDescriptorObjects {
+    pub(crate) scheduler_record: u64,
+    pub(crate) descriptor_low_alias: u64,
+    pub(crate) dispatch_a: u64,
+    pub(crate) dispatch_b: u64,
+    pub(crate) status_a: u64,
+    pub(crate) status_b: u64,
+    pub(crate) shared_control: u64,
+    pub(crate) zero_page: u64,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct ComputeDescriptorMetadata {
+    pub(crate) submit_sequence: u64,
+    pub(crate) context_id: u32,
+    pub(crate) grid_index: u32,
+    pub(crate) work_ordinal: u32,
+    pub(crate) queue_submission: u32,
+    pub(crate) queue_ordinal: u32,
+    pub(crate) submission_index: u32,
+    pub(crate) support_control: u32,
+    pub(crate) support_flags: u32,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct ComputeDescriptorCommand {
+    pub(crate) cdm_terminator: u64,
+    pub(crate) sampler_array: u64,
+    pub(crate) sampler_count: u32,
+    pub(crate) user_timestamp_start: u64,
+    pub(crate) user_timestamp_end: u64,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct ComputeQueueGraphAddresses {
+    pub(crate) queue_record: u64,
+    pub(crate) pointers: u64,
+    pub(crate) job_list: u64,
+    pub(crate) item_ring: u64,
+}
+
+fn add(address: u64, offset: u64) -> Result<u64, ComputeBuildError> {
+    address
+        .checked_add(offset)
+        .ok_or(ComputeBuildError::AddressOverflow)
+}
+
+/// Build the complete 40-write compute register program.
+pub(crate) fn build_compute_registers(
+    p: ComputeRegisterParameters,
+) -> Result<[ComputeRegister; COMPUTE_REGISTER_COUNT], ComputeBuildError> {
+    let context_word = ((p.context_id as u64) << 8) | p.work_ordinal as u64;
+
+    Ok([
+        ComputeRegister::new(0x1a510, p.preempt_base),
+        ComputeRegister::new(0x1a420, p.cdm_base),
+        ComputeRegister::new(0x1a4d0, add(p.preempt_base, 0x1480)?),
+        ComputeRegister::new(0x1a4d8, add(p.preempt_base, 0x1488)?),
+        ComputeRegister::new(0x1a4e0, add(p.preempt_base, 0x1490)?),
+        ComputeRegister::new(0x1a4e8, add(p.preempt_base, 0x1498)?),
+        ComputeRegister::new(0x10071, p.usc_exec_base),
+        ComputeRegister::new(0x11841, p.helper_binary),
+        ComputeRegister::new(0x11849, p.helper_data),
+        ComputeRegister::new(0x11f81, p.helper_config),
+        ComputeRegister::new(0x1a440, 0x0000_0001_5402_4201),
+        ComputeRegister::new(0x1a458, 0x0000_0000_10c0_8860),
+        ComputeRegister::new(0x101d9, 0x1c),
+        ComputeRegister::new(0x1a089, 0),
+        ComputeRegister::new(0x1a091, 0),
+        ComputeRegister::new(0x1a059, 0),
+        ComputeRegister::new(0x1a061, 0),
+        ComputeRegister::new(0x1a0b9, 0),
+        ComputeRegister::new(0x1a0c1, 0),
+        ComputeRegister::new(0x101d1, 0),
+        ComputeRegister::new(0x0d479, 0),
+        ComputeRegister::new(0x1a0e9, 8),
+        ComputeRegister::new(0x107a1, 0xff_0000),
+        ComputeRegister::new(0x0a599, 0x0000_0132_0040_0020),
+        ComputeRegister::new(0x0d411, 0x0000_0002_0000_0001),
+        ComputeRegister::new(0x1a540, p.dispatch_identity),
+        ComputeRegister::new(0x014a9, p.dispatch_identity),
+        ComputeRegister::new(0x0a351, p.dispatch_identity),
+        ComputeRegister::new(0x10201, context_word),
+        ComputeRegister::new(0x10428, context_word),
+        ComputeRegister::new(0x14028, p.execution_gate),
+        ComputeRegister::new(0x14070, p.robustness | 1),
+        ComputeRegister::new(0x10229, add(p.operand_state_base, 0x12800)?),
+        ComputeRegister::new(0x140a8, add(p.operand_state_base, 0x13000)?),
+        ComputeRegister::new(0x10099, add(p.operand_state_base, 0x9405)?),
+        ComputeRegister::new(0x10091, add(p.operand_state_base, 0x12400)?),
+        ComputeRegister::new(0x0a5c1, add(p.operand_state_base, 0x0005)?),
+        ComputeRegister::new(0x0a5c9, add(p.operand_state_base, 0x9000)?),
+        ComputeRegister::new(0x1a440, 0x0000_0001_5402_4209),
+        ComputeRegister::new(0x0a599, 0x0000_0060_0040_0020),
+    ])
+}
+
+fn put_u8(raw: &mut [u8], offset: usize, value: u8) {
+    raw[offset] = value;
+}
+
+fn put_u16(raw: &mut [u8], offset: usize, value: u16) {
+    raw[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_u32(raw: &mut [u8], offset: usize, value: u32) {
+    raw[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_u64(raw: &mut [u8], offset: usize, value: u64) {
+    raw[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+/// Build the retained queue record named by every compute CL entry.
+pub(crate) fn build_compute_queue_graph(
+    base: u64,
+    channel_control: u64,
+    raw: &mut [u8],
+) -> Result<ComputeQueueGraphAddresses, ComputeBuildError> {
+    if raw.len() < COMPUTE_QUEUE_GRAPH_SIZE {
+        return Err(ComputeBuildError::BufferTooSmall);
+    }
+    let addresses = ComputeQueueGraphAddresses {
+        queue_record: base,
+        pointers: add(base, 0x100)?,
+        job_list: add(base, 0x200)?,
+        item_ring: add(base, 0x4000)?,
+    };
+    let raw = &mut raw[..COMPUTE_QUEUE_GRAPH_SIZE];
+    raw.fill(0);
+    put_u64(raw, 0x00, addresses.pointers);
+    put_u64(raw, 0x08, addresses.item_ring);
+    put_u64(raw, 0x10, addresses.job_list);
+    put_u32(raw, 0x24, u32::MAX);
+    put_u32(raw, 0x28, 2);
+    put_u32(raw, 0x2c, 2);
+    raw[0x36..0x38].fill(0xff);
+    put_u32(raw, 0x40, 2);
+    put_u32(raw, 0x44, u32::MAX);
+    put_u32(raw, 0x48, 0x172);
+    put_u64(raw, 0x9c, channel_control);
+    put_u32(raw, 0x100 + 0x50, u32::MAX);
+    put_u32(raw, 0x100 + 0x60, 0x500);
+    put_u64(raw, 0x200 + 0x08, addresses.job_list);
+    Ok(addresses)
+}
+
+fn encode_registers(raw: &mut [u8], offset: usize, registers: &[ComputeRegister]) {
+    for (index, register) in registers.iter().enumerate() {
+        let entry = offset + index * COMPUTE_REGISTER_SIZE;
+        put_u32(raw, entry, register.number);
+        put_u64(raw, entry + 4, register.value);
+    }
+}
+
+fn register_value(registers: &[ComputeRegister], number: u32, occurrence: usize) -> u64 {
+    registers
+        .iter()
+        .filter(|register| register.number == number)
+        .nth(occurrence)
+        .expect("fixed G17P register program lost a required register")
+        .value
+}
+
+/// Encode a selector-3 descriptor without dropping sampler, timestamp, or CDM
+/// command state.
+pub(crate) fn build_compute_descriptor(
+    registers: &[ComputeRegister; COMPUTE_REGISTER_COUNT],
+    objects: ComputeDescriptorObjects,
+    metadata: ComputeDescriptorMetadata,
+    command: ComputeDescriptorCommand,
+    raw: &mut [u8],
+) -> Result<(), ComputeBuildError> {
+    if raw.len() < COMPUTE_DESCRIPTOR_SIZE {
+        return Err(ComputeBuildError::BufferTooSmall);
+    }
+    if command.cdm_terminator < register_value(registers, 0x1a420, 0) {
+        return Err(ComputeBuildError::CdmTerminatorBeforeStream);
+    }
+    if metadata.submission_index == 0 {
+        return Err(ComputeBuildError::SubmissionIndexZero);
+    }
+    if metadata.queue_submission == 0 {
+        return Err(ComputeBuildError::QueueSubmissionZero);
+    }
+    if command.sampler_count == u32::MAX {
+        return Err(ComputeBuildError::SamplerCountOutOfRange);
+    }
+    if (command.sampler_array == 0) != (command.sampler_count == 0) {
+        return Err(ComputeBuildError::SamplerPair);
+    }
+    if command.sampler_array & 7 != 0 {
+        return Err(ComputeBuildError::SamplerAlignment);
+    }
+
+    let raw = &mut raw[..COMPUTE_DESCRIPTOR_SIZE];
+    raw.fill(0);
+    put_u32(raw, 0x00, COMPUTE_SELECTOR);
+    put_u64(raw, 0x04, metadata.submit_sequence);
+    put_u32(raw, 0x0c, metadata.context_id);
+    put_u64(raw, 0x10, objects.scheduler_record);
+    for (index, value) in [0x22u16, 0x23, 0x23, 0x24].into_iter().enumerate() {
+        put_u16(raw, 0x18 + index * 2, value);
+    }
+
+    encode_registers(raw, COMPUTE_REGISTER_START, registers);
+    put_u64(
+        raw,
+        0x740,
+        add(objects.descriptor_low_alias, COMPUTE_REGISTER_START as u64)?,
+    );
+    put_u32(
+        raw,
+        COMPUTE_PRIMARY_COUNT,
+        ((COMPUTE_REGISTER_COUNT * COMPUTE_REGISTER_SIZE) as u32) << 16
+            | COMPUTE_REGISTER_COUNT as u32,
+    );
+
+    let secondary = [
+        ComputeRegister::new(0x10099, register_value(registers, 0x0a5c1, 0)),
+        ComputeRegister::new(0x10091, register_value(registers, 0x0a5c9, 0)),
+        ComputeRegister::new(0x0a5c1, register_value(registers, 0x10099, 0)),
+        ComputeRegister::new(0x0a5c9, register_value(registers, 0x10091, 0)),
+    ];
+    encode_registers(raw, COMPUTE_SECONDARY_REGISTER_START, &secondary);
+    put_u64(
+        raw,
+        0x0e60,
+        add(
+            objects.descriptor_low_alias,
+            COMPUTE_SECONDARY_REGISTER_START as u64,
+        )?,
+    );
+    put_u32(raw, 0x0e68, 0x0030_0004);
+    put_u32(raw, 0x0f28, u32::MAX);
+
+    put_u64(raw, 0x0ed8, register_value(registers, 0x1a510, 0));
+    put_u64(raw, 0x0ee0, command.cdm_terminator);
+    put_u64(raw, 0x0f08, register_value(registers, 0x1a440, 0));
+    put_u32(
+        raw,
+        0x0f20,
+        (register_value(registers, 0x1a540, 0) >> 32) as u32,
+    );
+    put_u64(raw, COMPUTE_SAMPLER_ARRAY, command.sampler_array);
+    put_u32(raw, COMPUTE_SAMPLER_COUNT, command.sampler_count);
+    put_u32(
+        raw,
+        COMPUTE_SAMPLER_MAX,
+        if command.sampler_count == 0 {
+            0
+        } else {
+            command.sampler_count + 1
+        },
+    );
+    put_u64(raw, 0x0f40, objects.dispatch_a);
+    put_u64(raw, 0x0f48, objects.dispatch_b);
+    put_u32(raw, 0x0f50, metadata.queue_submission << 8);
+    put_u32(raw, 0x0f54, metadata.grid_index);
+    put_u32(raw, 0x0f58, metadata.queue_ordinal);
+    put_u32(raw, 0x0f60, metadata.submission_index);
+    put_u64(
+        raw,
+        0x0f68,
+        register_value(registers, 0x1a540, 0) & 0xffff_ffff,
+    );
+    put_u32(raw, 0x0f70, metadata.work_ordinal);
+    put_u64(raw, 0x0f7c, objects.status_a);
+    put_u64(raw, 0x0f84, objects.status_b);
+    put_u64(raw, 0x0f8c, command.user_timestamp_start);
+    put_u64(raw, 0x0f94, command.user_timestamp_end);
+
+    put_u16(raw, 0x0fb0, 0x001a);
+    put_u64(raw, 0x0fb2, objects.shared_control);
+    put_u32(raw, 0x0fba, metadata.support_control);
+    put_u32(raw, 0x0fbe, metadata.support_flags);
+    put_u8(raw, 0x0fc5, 0x9f);
+    put_u32(raw, 0x0fc8, (metadata.work_ordinal & 3) << 30);
+    put_u64(raw, 0x0fcb, objects.zero_page);
+    put_u8(raw, 0x0fd3, 1);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fnv1a64(raw: &[u8]) -> u64 {
+        let mut value = 0xcbf2_9ce4_8422_2325u64;
+        for byte in raw {
+            value ^= *byte as u64;
+            value = value.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        value
+    }
+
+    fn register_parameters() -> ComputeRegisterParameters {
+        ComputeRegisterParameters {
+            preempt_base: 0x100_0404_0000,
+            cdm_base: 0x100_0410_0000,
+            usc_exec_base: 0x1_0000_0000,
+            helper_binary: 0,
+            helper_data: 0,
+            helper_config: 0,
+            dispatch_identity: 0x1234_5678_0000_0001,
+            context_id: 3,
+            work_ordinal: 7,
+            robustness: 0x100_0430_0000,
+            operand_state_base: 0x70_0022_8000,
+            execution_gate: 2,
+        }
+    }
+
+    #[test]
+    fn register_program_matches_the_hardware_tested_m1n1_builder() {
+        let registers = build_compute_registers(register_parameters()).unwrap();
+        let mut raw = [0u8; COMPUTE_REGISTER_COUNT * COMPUTE_REGISTER_SIZE];
+        encode_registers(&mut raw, 0, &registers);
+        assert_eq!(fnv1a64(&raw), 0xc2e9_a727_fcf7_d740);
+        assert_eq!(registers[0], ComputeRegister::new(0x1a510, 0x100_0404_0000));
+        assert_eq!(registers[39], ComputeRegister::new(0x0a599, 0x6000_4000_20));
+    }
+
+    #[test]
+    fn descriptor_preserves_cdm_sampler_timestamp_and_queue_state() {
+        let registers = build_compute_registers(register_parameters()).unwrap();
+        let mut raw = [0u8; COMPUTE_DESCRIPTOR_SIZE];
+        build_compute_descriptor(
+            &registers,
+            ComputeDescriptorObjects {
+                scheduler_record: 0xffff_fc20_c099_8100,
+                descriptor_low_alias: 0x70_0034_0000,
+                dispatch_a: 0xffff_fc20_001c_8028,
+                dispatch_b: 0xffff_fc20_c07c_0028,
+                status_a: 0xffff_fc20_0002_4c68,
+                status_b: 0xffff_fc20_0002_4c70,
+                shared_control: 0xffff_fc20_c095_0000,
+                zero_page: 0xffff_fc20_0171_0000,
+            },
+            ComputeDescriptorMetadata {
+                submit_sequence: 5,
+                context_id: 3,
+                grid_index: 2,
+                work_ordinal: 7,
+                queue_submission: 8,
+                queue_ordinal: 7,
+                submission_index: 9,
+                support_control: 0xe0a0_0001,
+                support_flags: 0,
+            },
+            ComputeDescriptorCommand {
+                cdm_terminator: 0x100_0410_002c,
+                sampler_array: 0x100_0800_0000,
+                sampler_count: 4,
+                user_timestamp_start: 0x200_0000_4000,
+                user_timestamp_end: 0x200_0000_4008,
+            },
+            &mut raw,
+        )
+        .unwrap();
+
+        assert_eq!(fnv1a64(&raw), 0x9a59_8076_3ca3_6a2a);
+        assert_eq!(u64::from_le_bytes(raw[0x0ee0..0x0ee8].try_into().unwrap()), 0x100_0410_002c);
+        assert_eq!(u64::from_le_bytes(raw[COMPUTE_SAMPLER_ARRAY..COMPUTE_SAMPLER_ARRAY + 8].try_into().unwrap()), 0x100_0800_0000);
+        assert_eq!(u32::from_le_bytes(raw[COMPUTE_SAMPLER_COUNT..COMPUTE_SAMPLER_COUNT + 4].try_into().unwrap()), 4);
+        assert_eq!(u64::from_le_bytes(raw[0x0f8c..0x0f94].try_into().unwrap()), 0x200_0000_4000);
+        assert_eq!(u32::from_le_bytes(raw[0x0f50..0x0f54].try_into().unwrap()), 8 << 8);
+    }
+
+    #[test]
+    fn invalid_command_relations_are_caught_before_encoding() {
+        let registers = build_compute_registers(register_parameters()).unwrap();
+        let objects = ComputeDescriptorObjects {
+            scheduler_record: 1,
+            descriptor_low_alias: 0x70_0000_0000,
+            dispatch_a: 2,
+            dispatch_b: 3,
+            status_a: 4,
+            status_b: 5,
+            shared_control: 6,
+            zero_page: 7,
+        };
+        let metadata = ComputeDescriptorMetadata {
+            submit_sequence: 1,
+            context_id: 3,
+            grid_index: 2,
+            work_ordinal: 0,
+            queue_submission: 1,
+            queue_ordinal: 0,
+            submission_index: 1,
+            support_control: 0xe0a0_0001,
+            support_flags: 0,
+        };
+        let mut raw = [0u8; COMPUTE_DESCRIPTOR_SIZE];
+        assert_eq!(
+            build_compute_descriptor(
+                &registers,
+                objects,
+                metadata,
+                ComputeDescriptorCommand {
+                    cdm_terminator: register_parameters().cdm_base - 4,
+                    sampler_array: 0,
+                    sampler_count: 0,
+                    user_timestamp_start: 0,
+                    user_timestamp_end: 0,
+                },
+                &mut raw,
+            ),
+            Err(ComputeBuildError::CdmTerminatorBeforeStream)
+        );
+        assert_eq!(
+            build_compute_descriptor(
+                &registers,
+                objects,
+                metadata,
+                ComputeDescriptorCommand {
+                    cdm_terminator: register_parameters().cdm_base,
+                    sampler_array: 0,
+                    sampler_count: 1,
+                    user_timestamp_start: 0,
+                    user_timestamp_end: 0,
+                },
+                &mut raw,
+            ),
+            Err(ComputeBuildError::SamplerPair)
+        );
+    }
+
+    #[test]
+    fn queue_graph_matches_the_hardware_tested_m1n1_builder() {
+        let mut raw = [0u8; COMPUTE_QUEUE_GRAPH_SIZE];
+        let addresses = build_compute_queue_graph(
+            0xffff_fc20_c100_0000,
+            0xffff_fc20_c200_0000,
+            &mut raw,
+        )
+        .unwrap();
+        assert_eq!(
+            addresses,
+            ComputeQueueGraphAddresses {
+                queue_record: 0xffff_fc20_c100_0000,
+                pointers: 0xffff_fc20_c100_0100,
+                job_list: 0xffff_fc20_c100_0200,
+                item_ring: 0xffff_fc20_c100_4000,
+            }
+        );
+        assert_eq!(fnv1a64(&raw), 0x3fb9_466b_9a30_60b0);
+    }
+}
