@@ -17,7 +17,7 @@ static inline bool apple_dcp_coprocessor_is_active(u32 cpu_control, u32 cpu_stat
 	    cpu_status & APPLE_DCP_COPROC_CPU_STATUS_RUNNING)
 		return true;
 
-	/* Fail closed unless the status register explicitly reports STOPPED. */
+	/* A zero status is not evidence that the coprocessor stopped. */
 	return !(cpu_status & APPLE_DCP_COPROC_CPU_STATUS_STOPPED);
 }
 
