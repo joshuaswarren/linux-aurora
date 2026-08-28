@@ -17,6 +17,33 @@ static void apple_dcp_link_init_desc_test(struct kunit *test)
 			APPLE_DCP_LINK_PROTOCOL_VERSION);
 }
 
+static void apple_dcp_h17p_method_test(struct kunit *test)
+{
+	struct apple_dcp_link_method method;
+
+	KUNIT_ASSERT_EQ(test,
+			apple_dcp_h17p_method(APPLE_DCP_H17P_CALL_START_SIGNAL,
+						 &method),
+			0);
+	KUNIT_EXPECT_EQ(test, method.input_size, 0U);
+	KUNIT_EXPECT_EQ(test, method.output_size, 4U);
+
+	KUNIT_ASSERT_EQ(test,
+			apple_dcp_h17p_method(APPLE_DCP_H17P_CALL_SWAP_SUBMIT,
+						 &method),
+			0);
+	KUNIT_EXPECT_EQ(test, method.input_size, 0x1d30U);
+	KUNIT_EXPECT_EQ(test, method.output_size, 12U);
+
+	KUNIT_ASSERT_EQ(test,
+			apple_dcp_h17p_method(APPLE_DCP_H17P_CALL_UP_SET_CREATE_DFB,
+						 &method),
+			0);
+	KUNIT_EXPECT_EQ(test, method.input_size, 0U);
+	KUNIT_EXPECT_EQ(test, method.output_size, 0U);
+	KUNIT_EXPECT_EQ(test, apple_dcp_h17p_method(0, &method), -ENOENT);
+}
+
 static void apple_dcp_link_init_message_test(struct kunit *test)
 {
 	u64 message;
@@ -213,6 +240,7 @@ static void apple_dcp_h17p_rt_bw_reply_test(struct kunit *test)
 
 static struct kunit_case apple_dcp_link_test_cases[] = {
 	KUNIT_CASE(apple_dcp_link_init_desc_test),
+	KUNIT_CASE(apple_dcp_h17p_method_test),
 	KUNIT_CASE(apple_dcp_link_init_message_test),
 	KUNIT_CASE(apple_dcp_link_ready_message_test),
 	KUNIT_CASE(apple_dcp_link_rpc_header_test),
