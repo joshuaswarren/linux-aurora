@@ -34,7 +34,6 @@ config DRM_APPLE_KUNIT_TEST
 	depends on DRM_APPLE && KUNIT
 	default KUNIT_ALL_TESTS
 	help
-	  Build focused unit tests for Apple display driver admission and data
-	  handling helpers. The tests cover fail-closed lifecycle decisions for
-	  firmware-owned display coprocessors. They do not access display
-	  hardware. If in doubt, say "N".
+	  Build focused unit tests for Apple display lifecycle helpers and DCPLink
+	  message encoders. The tests do not access display hardware. If in doubt,
+	  say "N".
