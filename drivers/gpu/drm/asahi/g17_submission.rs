@@ -183,6 +183,8 @@ pub(crate) enum SubmissionError {
     CommandAbiUnconfirmed,
     /// A top-level channel command must expose its complete four-byte tag.
     CommandHeaderTooShort,
+    /// A first-render status pointer overflowed while deriving the FWCtl VAs.
+    PartialOpeningAddressOverflow,
     /// The host/firmware meaning of this in-range top-level tag is unresolved.
     CommandTagUnresolved,
     /// This value is not a grounded G17P top-level command tag.
@@ -592,6 +594,210 @@ pub(crate) const fn prepare_g17p_channel_write(
     Ok(G17PChannelWritePlan {
         entry_byte_offset: producer as u64 * G17P_CHANNEL_ABI.command_pointer_entry_bytes as u64,
         next_producer,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 2d. Proven G17P first-partial graphics publication.
+//
+//     The source-built J700 opening corresponding to m1n1 commit ffe58c7
+//     executes graphics through the native partial graph. It publishes a
+//     one-record scheduler page and context-2 primary index, presents five
+//     primary status fields before control 0x84, then exposes 3D before TA and
+//     sends one paired EP 0x21/0x83 kick. This is the classic channel path and
+//     remains separate from the kext's SKSM queue-entry plus `addKicks` path.
+// ---------------------------------------------------------------------------
+
+pub(crate) const G17P_PARTIAL_OPENING_PAGE_SIZE: usize = 0x4000;
+pub(crate) const G17P_PARTIAL_OPENING_SCHEDULER_GPU_VA: u64 = 0xffff_fc20_015e_0000;
+pub(crate) const G17P_PARTIAL_OPENING_SCHEDULER_WORD: u64 = 0x0000_0020_0001_9000;
+pub(crate) const G17P_PARTIAL_OPENING_PRIMARY_INDEX_GPU_VA: u64 = 0x0000_0010_0019_0000;
+pub(crate) const G17P_PARTIAL_OPENING_FWCTL_OFFSET: u64 = 0x001c_0000;
+pub(crate) const G17P_PARTIAL_OPENING_CONTROL_MESSAGE_SIZE: u64 = 0x40;
+pub(crate) const G17P_PARTIAL_OPENING_PAIRED_DOORBELL: u64 = MSG_TX_DOORBELL;
+
+/// Root, queue, and scheduler identities at the proven first-work boundary.
+/// Linux owns the backing pages; the physical addresses from the m1n1 run are
+/// intentionally not part of this contract.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PPartialOpeningContextContract {
+    pub(crate) firmware_low_root_slot: u8,
+    pub(crate) firmware_context_id: u8,
+    pub(crate) render_root_slot: u8,
+    pub(crate) render_context_id: u8,
+    pub(crate) context0_empty_high_root_slot: u8,
+    pub(crate) render_empty_high_root_slot: u8,
+    pub(crate) queue_pair: u8,
+    pub(crate) graph_context_id: u8,
+    pub(crate) optional_identity_context_id: u8,
+    pub(crate) descriptor_context_id: u8,
+    pub(crate) scheduler_class: u8,
+    pub(crate) channel_pair: u8,
+    pub(crate) firmware_low_root_present_at_first_work: bool,
+    pub(crate) source_firmware_high_root_table_resident: bool,
+}
+
+pub(crate) const G17P_PARTIAL_OPENING_CONTEXT: G17PPartialOpeningContextContract =
+    G17PPartialOpeningContextContract {
+        firmware_low_root_slot: 1,
+        firmware_context_id: 64,
+        render_root_slot: 2,
+        render_context_id: 1,
+        context0_empty_high_root_slot: 0,
+        render_empty_high_root_slot: 1,
+        queue_pair: 2,
+        graph_context_id: 2,
+        optional_identity_context_id: 3,
+        descriptor_context_id: 2,
+        scheduler_class: 2,
+        channel_pair: 0,
+        firmware_low_root_present_at_first_work: false,
+        source_firmware_high_root_table_resident: false,
+    };
+
+/// One exact 64-bit write into the primary status-B object before control 0x84.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PPartialOpeningStatusWrite {
+    pub(crate) offset: u32,
+    pub(crate) value: u64,
+}
+
+/// State required to prepare one half of the paired classic channel publish.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PPartialOpeningChannelState {
+    pub(crate) producer: u32,
+    pub(crate) consumer: u32,
+    pub(crate) ring_entry_count: u32,
+}
+
+/// The two producer writes and the single mailbox kick for first graphics.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct PreparedG17PPartialOpeningWorkPair {
+    pub(crate) fragment: G17PChannelWritePlan,
+    pub(crate) tiling: G17PChannelWritePlan,
+    pub(crate) paired_doorbell: u64,
+}
+
+/// Side-effect order measured at the successful first-partial boundary.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum G17PPartialOpeningPublicationStep {
+    PrimarySchedulerPage,
+    PrimaryIndexPage,
+    PreControlStatus,
+    ControlDone0x84,
+    FragmentState,
+    FragmentProducer,
+    LateTilingState,
+    SystemBarrierBeforeTilingProducer,
+    TilingProducer,
+    SystemBarrierBeforePairedDoorbell,
+    PairedWorkDoorbell0x83,
+}
+
+pub(crate) const G17P_PARTIAL_OPENING_PUBLICATION_ORDER: [G17PPartialOpeningPublicationStep; 11] = [
+    G17PPartialOpeningPublicationStep::PrimarySchedulerPage,
+    G17PPartialOpeningPublicationStep::PrimaryIndexPage,
+    G17PPartialOpeningPublicationStep::PreControlStatus,
+    G17PPartialOpeningPublicationStep::ControlDone0x84,
+    G17PPartialOpeningPublicationStep::FragmentState,
+    G17PPartialOpeningPublicationStep::FragmentProducer,
+    G17PPartialOpeningPublicationStep::LateTilingState,
+    G17PPartialOpeningPublicationStep::SystemBarrierBeforeTilingProducer,
+    G17PPartialOpeningPublicationStep::TilingProducer,
+    G17PPartialOpeningPublicationStep::SystemBarrierBeforePairedDoorbell,
+    G17PPartialOpeningPublicationStep::PairedWorkDoorbell0x83,
+];
+
+/// Build the computed one-record scheduler page that decided graphics entry in
+/// the successful post-control graft.
+pub(crate) fn build_g17p_partial_opening_scheduler_page() -> [u8; G17P_PARTIAL_OPENING_PAGE_SIZE] {
+    let mut page = [0u8; G17P_PARTIAL_OPENING_PAGE_SIZE];
+    put_u64_le(&mut page, 0, G17P_PARTIAL_OPENING_SCHEDULER_WORD);
+    page
+}
+
+/// Build the eight-group context-2 primary index used by the proven opening.
+pub(crate) fn build_g17p_partial_opening_primary_index_page() -> [u8; G17P_PARTIAL_OPENING_PAGE_SIZE]
+{
+    let mut page = [0u8; G17P_PARTIAL_OPENING_PAGE_SIZE];
+    let mut index = 0usize;
+    for (start, groups) in [(0x11u32, 6u32), (0x3cu32, 2u32)] {
+        for group in 0..groups {
+            let base = start + group * 5;
+            for member in 0..4u32 {
+                put_u32_le(&mut page, index * 4, base + member);
+                index += 1;
+            }
+        }
+    }
+    page
+}
+
+/// Derive the five stable status-B writes presented before control 0x84.
+pub(crate) const fn prepare_g17p_partial_opening_pre_0x84_status(
+    kernel_va_base: u64,
+) -> Result<[G17PPartialOpeningStatusWrite; 5], SubmissionError> {
+    let fwctl_va = match kernel_va_base.checked_add(G17P_PARTIAL_OPENING_FWCTL_OFFSET) {
+        Some(value) => value,
+        None => return Err(SubmissionError::PartialOpeningAddressOverflow),
+    };
+    let fwctl_next = match fwctl_va.checked_add(G17P_PARTIAL_OPENING_CONTROL_MESSAGE_SIZE) {
+        Some(value) => value,
+        None => return Err(SubmissionError::PartialOpeningAddressOverflow),
+    };
+    Ok([
+        G17PPartialOpeningStatusWrite {
+            offset: 0x4018,
+            value: 0x0005_0601_0000_0000,
+        },
+        G17PPartialOpeningStatusWrite {
+            offset: 0x4020,
+            value: 61,
+        },
+        G17PPartialOpeningStatusWrite {
+            offset: 0x40b0,
+            value: 5,
+        },
+        G17PPartialOpeningStatusWrite {
+            offset: 0x48e0,
+            value: fwctl_va,
+        },
+        G17PPartialOpeningStatusWrite {
+            offset: 0x48e8,
+            value: fwctl_next,
+        },
+    ])
+}
+
+/// Couple the fragment-first/tiling-second channel writes to their one paired
+/// 0x83 notification. The caller performs the barriers in
+/// [`G17P_PARTIAL_OPENING_PUBLICATION_ORDER`].
+pub(crate) const fn prepare_g17p_partial_opening_work_pair(
+    fragment: G17PPartialOpeningChannelState,
+    tiling: G17PPartialOpeningChannelState,
+) -> Result<PreparedG17PPartialOpeningWorkPair, SubmissionError> {
+    let fragment = match prepare_g17p_channel_write(
+        G17ChannelAbiTarget::A18ProG17P,
+        fragment.producer,
+        fragment.consumer,
+        fragment.ring_entry_count,
+    ) {
+        Ok(value) => value,
+        Err(error) => return Err(error),
+    };
+    let tiling = match prepare_g17p_channel_write(
+        G17ChannelAbiTarget::A18ProG17P,
+        tiling.producer,
+        tiling.consumer,
+        tiling.ring_entry_count,
+    ) {
+        Ok(value) => value,
+        Err(error) => return Err(error),
+    };
+    Ok(PreparedG17PPartialOpeningWorkPair {
+        fragment,
+        tiling,
+        paired_doorbell: G17P_PARTIAL_OPENING_PAIRED_DOORBELL,
     })
 }
 
@@ -2228,6 +2434,10 @@ mod tests {
         u64::from_le_bytes(raw[offset..offset + 8].try_into().unwrap())
     }
 
+    fn get_u32_le(raw: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes(raw[offset..offset + 4].try_into().unwrap())
+    }
+
     fn rce_binding_from_packed(word: u64) -> G17PClRceBinding {
         G17PClRceBinding {
             address: (word & G17P_CL_PACKED_ADDRESS_MASK) << 5,
@@ -2409,6 +2619,139 @@ mod tests {
         assert_eq!(
             prepare_g17p_channel_write(G17ChannelAbiTarget::M5ProMaxG17X, 0, 2, 4),
             Err(SubmissionError::ChannelAbiUnconfirmed)
+        );
+    }
+
+    #[test]
+    fn g17p_partial_opening_pages_and_context_match_the_successful_graph() {
+        assert_eq!(G17P_PARTIAL_OPENING_PAGE_SIZE, 0x4000);
+        assert_eq!(G17P_PARTIAL_OPENING_SCHEDULER_GPU_VA, 0xffff_fc20_015e_0000);
+        assert_eq!(
+            G17P_PARTIAL_OPENING_PRIMARY_INDEX_GPU_VA,
+            0x0000_0010_0019_0000
+        );
+
+        let scheduler = build_g17p_partial_opening_scheduler_page();
+        assert_eq!(get_u64_le(&scheduler, 0), 0x0000_0020_0001_9000);
+        assert!(scheduler[8..].iter().all(|value| *value == 0));
+
+        let primary = build_g17p_partial_opening_primary_index_page();
+        let expected = [
+            0x11, 0x12, 0x13, 0x14, 0x16, 0x17, 0x18, 0x19, 0x1b, 0x1c, 0x1d, 0x1e, 0x20, 0x21,
+            0x22, 0x23, 0x25, 0x26, 0x27, 0x28, 0x2a, 0x2b, 0x2c, 0x2d, 0x3c, 0x3d, 0x3e, 0x3f,
+            0x41, 0x42, 0x43, 0x44,
+        ];
+        for (index, value) in expected.into_iter().enumerate() {
+            assert_eq!(get_u32_le(&primary, index * 4), value);
+        }
+        assert!(primary[expected.len() * 4..]
+            .iter()
+            .all(|value| *value == 0));
+
+        assert_eq!(
+            G17P_PARTIAL_OPENING_CONTEXT,
+            G17PPartialOpeningContextContract {
+                firmware_low_root_slot: 1,
+                firmware_context_id: 64,
+                render_root_slot: 2,
+                render_context_id: 1,
+                context0_empty_high_root_slot: 0,
+                render_empty_high_root_slot: 1,
+                queue_pair: 2,
+                graph_context_id: 2,
+                optional_identity_context_id: 3,
+                descriptor_context_id: 2,
+                scheduler_class: 2,
+                channel_pair: 0,
+                firmware_low_root_present_at_first_work: false,
+                source_firmware_high_root_table_resident: false,
+            }
+        );
+    }
+
+    #[test]
+    fn g17p_partial_opening_status_is_exact_and_checked() {
+        const KERNEL_VA_BASE: u64 = 0xffff_fc20_0000_0000;
+        assert_eq!(
+            prepare_g17p_partial_opening_pre_0x84_status(KERNEL_VA_BASE),
+            Ok([
+                G17PPartialOpeningStatusWrite {
+                    offset: 0x4018,
+                    value: 0x0005_0601_0000_0000,
+                },
+                G17PPartialOpeningStatusWrite {
+                    offset: 0x4020,
+                    value: 61,
+                },
+                G17PPartialOpeningStatusWrite {
+                    offset: 0x40b0,
+                    value: 5,
+                },
+                G17PPartialOpeningStatusWrite {
+                    offset: 0x48e0,
+                    value: KERNEL_VA_BASE + 0x001c_0000,
+                },
+                G17PPartialOpeningStatusWrite {
+                    offset: 0x48e8,
+                    value: KERNEL_VA_BASE + 0x001c_0040,
+                },
+            ])
+        );
+        assert_eq!(
+            prepare_g17p_partial_opening_pre_0x84_status(u64::MAX),
+            Err(SubmissionError::PartialOpeningAddressOverflow)
+        );
+    }
+
+    #[test]
+    fn g17p_partial_opening_publishes_3d_then_ta_with_one_pair_kick() {
+        assert_eq!(
+            G17P_PARTIAL_OPENING_PUBLICATION_ORDER,
+            [
+                G17PPartialOpeningPublicationStep::PrimarySchedulerPage,
+                G17PPartialOpeningPublicationStep::PrimaryIndexPage,
+                G17PPartialOpeningPublicationStep::PreControlStatus,
+                G17PPartialOpeningPublicationStep::ControlDone0x84,
+                G17PPartialOpeningPublicationStep::FragmentState,
+                G17PPartialOpeningPublicationStep::FragmentProducer,
+                G17PPartialOpeningPublicationStep::LateTilingState,
+                G17PPartialOpeningPublicationStep::SystemBarrierBeforeTilingProducer,
+                G17PPartialOpeningPublicationStep::TilingProducer,
+                G17PPartialOpeningPublicationStep::SystemBarrierBeforePairedDoorbell,
+                G17PPartialOpeningPublicationStep::PairedWorkDoorbell0x83,
+            ]
+        );
+        let prepared = prepare_g17p_partial_opening_work_pair(
+            G17PPartialOpeningChannelState {
+                producer: 2,
+                consumer: 0,
+                ring_entry_count: 4,
+            },
+            G17PPartialOpeningChannelState {
+                producer: 3,
+                consumer: 2,
+                ring_entry_count: 4,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            prepared.fragment,
+            G17PChannelWritePlan {
+                entry_byte_offset: 0x10,
+                next_producer: 3,
+            }
+        );
+        assert_eq!(
+            prepared.tiling,
+            G17PChannelWritePlan {
+                entry_byte_offset: 0x18,
+                next_producer: 0,
+            }
+        );
+        assert_eq!(prepared.paired_doorbell, 0x0083_0000_0000_0000);
+        assert_eq!(
+            prepared.paired_doorbell,
+            encode_tx_doorbell(PipeType::Vertex, 0).unwrap()
         );
     }
 
