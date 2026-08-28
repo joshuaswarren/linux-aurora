@@ -248,6 +248,12 @@ static void dcp_recv_msg(void *cookie, u8 endpoint, u64 message)
 		afk_receive_message(dcp->systemep, message);
 		return;
 	case DISP0_ENDPOINT:
+		if (!dcp->ibootep) {
+			dev_warn_ratelimited(dcp->dev,
+				"dropping inherited iBoot endpoint message %#llx\n",
+				message);
+			return;
+		}
 		afk_receive_message(dcp->ibootep, message);
 		return;
 	case DPAVSERV_ENDPOINT:

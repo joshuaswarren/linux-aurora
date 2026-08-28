@@ -62,6 +62,13 @@ enum apple_dcp_link_handoff_phase {
 	APPLE_DCP_LINK_HANDOFF_READY,
 };
 
+enum apple_dcp_link_adopt_action {
+	APPLE_DCP_LINK_ADOPT_INVALID,
+	APPLE_DCP_LINK_ADOPT_START_ENDPOINT,
+	APPLE_DCP_LINK_ADOPT_SEND_INIT,
+	APPLE_DCP_LINK_ADOPT_START_IOMFB,
+};
+
 static inline bool
 apple_dcp_link_handoff_message_valid(enum apple_dcp_link_handoff_phase phase, u64 message)
 {
@@ -74,6 +81,34 @@ apple_dcp_link_handoff_message_valid(enum apple_dcp_link_handoff_phase phase, u6
 		return type == APPLE_DCP_LINK_MSG_READY;
 
 	return false;
+}
+
+static inline enum apple_dcp_link_adopt_action
+apple_dcp_link_adopt_decide(enum apple_dcp_link_handoff_phase phase,
+			    u64 message, bool descriptor_zero,
+			    bool descriptor_valid, bool streams_idle)
+{
+	if (!streams_idle)
+		return APPLE_DCP_LINK_ADOPT_INVALID;
+
+	switch (phase) {
+	case APPLE_DCP_LINK_HANDOFF_NONE:
+		return message == 0 && descriptor_zero ?
+			APPLE_DCP_LINK_ADOPT_START_ENDPOINT :
+			APPLE_DCP_LINK_ADOPT_INVALID;
+	case APPLE_DCP_LINK_HANDOFF_FIRMWARE_INIT:
+		return (descriptor_zero || descriptor_valid) &&
+		       apple_dcp_link_handoff_message_valid(phase, message) ?
+			APPLE_DCP_LINK_ADOPT_SEND_INIT :
+			APPLE_DCP_LINK_ADOPT_INVALID;
+	case APPLE_DCP_LINK_HANDOFF_READY:
+		return descriptor_valid &&
+		       apple_dcp_link_handoff_message_valid(phase, message) ?
+			APPLE_DCP_LINK_ADOPT_START_IOMFB :
+			APPLE_DCP_LINK_ADOPT_INVALID;
+	default:
+		return APPLE_DCP_LINK_ADOPT_INVALID;
+	}
 }
 
 static inline u16 apple_dcp_link_negotiate_version(u16 remote_version)
@@ -475,6 +510,13 @@ apple_dcp_link_init_desc_valid(const struct apple_dcp_link_init_desc *desc)
 	return flags == APPLE_DCP_LINK_INIT_FLAG_64M &&
 	       !(shared_dva & (APPLE_DCP_LINK_RPC_PAGE_SIZE - 1)) &&
 	       !(shared_dva & ~GENMASK_ULL(47, 0));
+}
+
+static inline bool
+apple_dcp_link_init_desc_zero(const struct apple_dcp_link_init_desc *desc)
+{
+	return desc && !le64_to_cpu(desc->shared_dva) &&
+	       !le32_to_cpu(desc->flags) && !le32_to_cpu(desc->version);
 }
 
 static inline bool
