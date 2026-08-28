@@ -105,6 +105,28 @@ static void apple_dcp_h17p_method_test(struct kunit *test)
 			0);
 	KUNIT_EXPECT_EQ(test, method.input_size, 0U);
 	KUNIT_EXPECT_EQ(test, method.output_size, 0U);
+
+	KUNIT_ASSERT_EQ(test,
+			apple_dcp_h17p_method(APPLE_DCP_H17P_CALL_LATE_INIT,
+						 &method),
+			0);
+	KUNIT_EXPECT_EQ(test, method.input_size, 4U);
+	KUNIT_EXPECT_EQ(test, method.output_size, 4U);
+
+	KUNIT_ASSERT_EQ(test,
+			apple_dcp_h17p_method(
+				APPLE_DCP_H17P_CALL_SETUP_VIDEO_LIMITS, &method),
+			0);
+	KUNIT_EXPECT_EQ(test, method.input_size, 0U);
+	KUNIT_EXPECT_EQ(test, method.output_size, 0U);
+
+	KUNIT_ASSERT_EQ(test,
+			apple_dcp_h17p_method(
+				APPLE_DCP_H17P_CALL_VI_SET_TEMPERATURE_HINT,
+				&method),
+			0);
+	KUNIT_EXPECT_EQ(test, method.input_size, 0U);
+	KUNIT_EXPECT_EQ(test, method.output_size, 4U);
 	KUNIT_EXPECT_EQ(test, apple_dcp_h17p_method(0, &method), -ENOENT);
 }
 
