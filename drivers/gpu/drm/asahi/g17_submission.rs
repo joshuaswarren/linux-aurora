@@ -713,6 +713,8 @@ pub(crate) enum G17PPartialOpeningPublicationStep {
     PreControlStatus,
     ControlDone0x84,
     FragmentState,
+    EmptyHighRoots,
+    RemoveFirmwareLowRoot,
     FragmentProducer,
     LateTilingState,
     SystemBarrierBeforeTilingProducer,
@@ -721,12 +723,14 @@ pub(crate) enum G17PPartialOpeningPublicationStep {
     PairedWorkDoorbell0x83,
 }
 
-pub(crate) const G17P_PARTIAL_OPENING_PUBLICATION_ORDER: [G17PPartialOpeningPublicationStep; 11] = [
+pub(crate) const G17P_PARTIAL_OPENING_PUBLICATION_ORDER: [G17PPartialOpeningPublicationStep; 13] = [
     G17PPartialOpeningPublicationStep::PrimarySchedulerPage,
     G17PPartialOpeningPublicationStep::PrimaryIndexPage,
     G17PPartialOpeningPublicationStep::PreControlStatus,
     G17PPartialOpeningPublicationStep::ControlDone0x84,
     G17PPartialOpeningPublicationStep::FragmentState,
+    G17PPartialOpeningPublicationStep::EmptyHighRoots,
+    G17PPartialOpeningPublicationStep::RemoveFirmwareLowRoot,
     G17PPartialOpeningPublicationStep::FragmentProducer,
     G17PPartialOpeningPublicationStep::LateTilingState,
     G17PPartialOpeningPublicationStep::SystemBarrierBeforeTilingProducer,
@@ -2846,6 +2850,8 @@ mod tests {
                 G17PPartialOpeningPublicationStep::PreControlStatus,
                 G17PPartialOpeningPublicationStep::ControlDone0x84,
                 G17PPartialOpeningPublicationStep::FragmentState,
+                G17PPartialOpeningPublicationStep::EmptyHighRoots,
+                G17PPartialOpeningPublicationStep::RemoveFirmwareLowRoot,
                 G17PPartialOpeningPublicationStep::FragmentProducer,
                 G17PPartialOpeningPublicationStep::LateTilingState,
                 G17PPartialOpeningPublicationStep::SystemBarrierBeforeTilingProducer,
