@@ -641,8 +641,17 @@
 			interrupts = <AIC_IRQ 1039 IRQ_TYPE_LEVEL_HIGH>;
 			mboxes = <&ans_mbox>;
 			apple,sart = <&sart>;
-			power-domains = <&ps_ans>, <&ps_apcie_sys_st>;
-			power-domain-names = "ans", "apcie0";
+			/*
+			 * ps_apcie_phy_sw is otherwise referenced by nothing, so
+			 * the PCIe PHY domain has no owner and powers down: ANS's
+			 * link then falls to L1_IDLE and its first read asserts
+			 * "apcie0[0]: Link timeout ... ltssm=0x14(L1_IDLE)".
+			 * Holding it here keeps the link in L0; genpd powers its
+			 * parents (apcie_sys_st and apcie_sys_gp) with it.
+			 */
+			power-domains = <&ps_ans>, <&ps_apcie_sys_st>,
+					<&ps_apcie_phy_sw>;
+			power-domain-names = "ans", "apcie0", "apcie_phy";
 			resets = <&ps_ans>;
 		};
 
