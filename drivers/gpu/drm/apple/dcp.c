@@ -776,7 +776,19 @@ static int dcp_create_piodma_iommu_dev(struct apple_dcp *dcp)
 	return 0;
 err_destroy_pdev:
 	of_platform_device_destroy(&dcp->piodma->dev, NULL);
+	dcp->piodma = NULL;
+	dcp->iommu_dom = NULL;
 	return ret;
+}
+
+static void dcp_destroy_piodma_iommu_dev(struct apple_dcp *dcp)
+{
+	if (!dcp->piodma)
+		return;
+
+	dcp->iommu_dom = NULL;
+	of_platform_device_destroy(&dcp->piodma->dev, NULL);
+	dcp->piodma = NULL;
 }
 
 static int dcp_get_bw_scratch_reg(struct apple_dcp *dcp, u32 expected)
@@ -879,16 +891,21 @@ err_of_node_put:
 static int dcp_get_disp_regs(struct apple_dcp *dcp)
 {
 	struct platform_device *pdev = to_platform_device(dcp->dev);
-	int count = pdev->num_resources - 1;
+	char name[sizeof("disp-0")];
+	int count = 0;
 	int i, ret;
 
-	if (count <= 0 || count > MAX_DISP_REGISTERS)
-		return -EINVAL;
-
-	for (i = 0; i < count; ++i) {
+	for (i = 0; i < MAX_DISP_REGISTERS; ++i) {
+		snprintf(name, sizeof(name), "disp-%d", i);
 		dcp->disp_registers[i] =
-			platform_get_resource(pdev, IORESOURCE_MEM, 1 + i);
+			platform_get_resource_byname(pdev, IORESOURCE_MEM, name);
+		if (!dcp->disp_registers[i])
+			break;
+		count++;
 	}
+
+	if (!count)
+		return -EINVAL;
 
 	/* load pmgr bandwidth scratch resource and offset */
 	ret = dcp_get_bw_scratch_reg(dcp, count);
@@ -997,9 +1014,13 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 	enum apple_dcp_coprocessor_start start_mode;
 	enum apple_dcp_loader_handoff loader_handoff;
+	struct iommu_domain *coproc_iommu_dom;
+	phys_addr_t iop_vbar_phys;
+	u64 iop_vbar;
 	u32 cpu_ctrl, cpu_status;
 	u32 quiesced_state = 0, idle_state = 0, stopped_state = 0;
 	bool loader_quiesced, loader_idle, loader_stopped;
+	bool is_t8140;
 	int ret;
 
 	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(42));
@@ -1009,6 +1030,13 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	dcp->coproc_reg = devm_platform_ioremap_resource_byname(to_platform_device(dev), "coproc");
 	if (IS_ERR(dcp->coproc_reg))
 		return PTR_ERR(dcp->coproc_reg);
+	is_t8140 = of_device_is_compatible(dev->of_node, "apple,t8140-dcp");
+	if (is_t8140) {
+		dcp->iop_vbar_reg = devm_platform_ioremap_resource_byname(
+			to_platform_device(dev), "iop-vbar");
+		if (IS_ERR(dcp->iop_vbar_reg))
+			return PTR_ERR(dcp->iop_vbar_reg);
+	}
 
 	cpu_ctrl = readl_relaxed(dcp->coproc_reg +
 				 APPLE_DCP_COPROC_CPU_CONTROL);
@@ -1101,6 +1129,19 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	else
 		dcp->connector_type = DRM_MODE_CONNECTOR_Unknown;
 
+	if (is_t8140 && apple_dcp_needs_fresh_boot(start_mode)) {
+		iop_vbar = readq_relaxed(dcp->iop_vbar_reg);
+		coproc_iommu_dom = iommu_get_domain_for_dev(dev);
+		iop_vbar_phys = coproc_iommu_dom ?
+			iommu_iova_to_phys(coproc_iommu_dom, iop_vbar & ~1ULL) : 0;
+		dev_info(dev,
+			 "DCP takeover: IORVBAR=%#llx locked=%u maps-to=%pa\n",
+			 iop_vbar, !!(iop_vbar & 1), &iop_vbar_phys);
+		if (!(iop_vbar & 1) || !iop_vbar_phys)
+			return dev_err_probe(dev, -EIO,
+					     "DCP firmware entry point is not mapped\n");
+	}
+
 	ret = dcp_create_piodma_iommu_dev(dcp);
 	if (ret || !dcp->iommu_dom)
 		return dev_err_probe(dev, ret,
@@ -1109,17 +1150,21 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	ret = dcp_get_disp_regs(dcp);
 	if (ret) {
 		dev_err(dev, "failed to find display registers\n");
-		return ret;
+		goto err_destroy_piodma;
 	}
 
 	dcp->clk = devm_clk_get(dev, NULL);
-	if (IS_ERR(dcp->clk))
-		return dev_err_probe(dev, PTR_ERR(dcp->clk),
-				     "Unable to find clock\n");
+	if (IS_ERR(dcp->clk)) {
+		ret = dev_err_probe(dev, PTR_ERR(dcp->clk),
+				    "Unable to find clock\n");
+		goto err_destroy_piodma;
+	}
 	dcp->clk_194 = devm_clk_get_optional(dev, "clock-194");
-	if (IS_ERR(dcp->clk_194))
-		return dev_err_probe(dev, PTR_ERR(dcp->clk_194),
-				     "Unable to find clock 0x194\n");
+	if (IS_ERR(dcp->clk_194)) {
+		ret = dev_err_probe(dev, PTR_ERR(dcp->clk_194),
+				    "Unable to find clock 0x194\n");
+		goto err_destroy_piodma;
+	}
 
 	bitmap_zero(dcp->memdesc_map, DCP_MAX_MAPPINGS);
 	// TDOD: mem_desc IDs start at 1, for simplicity just skip '0' entry
@@ -1139,16 +1184,20 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 							  &rtkit_ops);
 		if (IS_ERR(dcp->rtk)) {
 			dcp->adopting_session = false;
-			return dev_err_probe(dev, PTR_ERR(dcp->rtk),
-					     "Failed to adopt RTKit\n");
+			ret = dev_err_probe(dev, PTR_ERR(dcp->rtk),
+					    "Failed to adopt RTKit\n");
+			dcp->rtk = NULL;
+			goto err_destroy_piodma;
 		}
 
 		ret = apple_rtkit_quiesce(dcp->rtk);
 		dcp->adopting_session = false;
-		if (ret)
-			return dev_err_probe(dev, ret,
-					     "Failed to quiesce inherited RTKit: %d\n",
-					     ret);
+		if (ret) {
+			ret = dev_err_probe(dev, ret,
+					    "Failed to quiesce inherited RTKit: %d\n",
+					    ret);
+			goto err_free_rtkit;
+		}
 	} else {
 		if (start_mode == APPLE_DCP_COPROCESSOR_QUIESCED_RESTART)
 			dev_info(dev, "restarting loader-quiesced DCP session\n");
@@ -1159,9 +1208,12 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 				 "DCP takeover: starting stopped display CPU with a fresh RTKit session\n");
 		dcp->rtk = devm_apple_rtkit_init(dev, dcp, "mbox", 0,
 						   &rtkit_ops);
-		if (IS_ERR(dcp->rtk))
-			return dev_err_probe(dev, PTR_ERR(dcp->rtk),
-					     "Failed to initialize RTKit\n");
+		if (IS_ERR(dcp->rtk)) {
+			ret = dev_err_probe(dev, PTR_ERR(dcp->rtk),
+					    "Failed to initialize RTKit\n");
+			dcp->rtk = NULL;
+			goto err_destroy_piodma;
+		}
 	}
 
 	cpu_ctrl = readl_relaxed(dcp->coproc_reg +
@@ -1187,11 +1239,19 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 					      APPLE_DCP_COPROC_CPU_CONTROL),
 				readl_relaxed(dcp->coproc_reg +
 					      APPLE_DCP_COPROC_CPU_STATUS));
-		return dev_err_probe(dev, ret,
-				     "Failed to boot RTKit: %d\n", ret);
+		ret = dev_err_probe(dev, ret,
+				    "Failed to boot RTKit: %d\n", ret);
+		goto err_free_rtkit;
 	}
 	if (apple_dcp_needs_fresh_boot(start_mode))
 		dev_info(dev, "DCP takeover: fresh RTKit boot complete\n");
+	return ret;
+
+err_free_rtkit:
+	devm_apple_rtkit_free(dev, dcp->rtk);
+	dcp->rtk = NULL;
+err_destroy_piodma:
+	dcp_destroy_piodma_iommu_dev(dcp);
 	return ret;
 }
 
@@ -1240,11 +1300,7 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 	if (dcp->shmem)
 		iomfb_shutdown(dcp);
 
-	if (dcp->piodma) {
-		dcp->iommu_dom = NULL;
-		of_platform_device_destroy(&dcp->piodma->dev, NULL);
-		dcp->piodma = NULL;
-	}
+	dcp_destroy_piodma_iommu_dev(dcp);
 
 	if (dcp->connector_type == DRM_MODE_CONNECTOR_eDP) {
 		cancel_work_sync(&dcp->bl_register_wq);

@@ -136,6 +136,8 @@ struct apple_dcp {
 
 	/* Coprocessor control register */
 	void __iomem *coproc_reg;
+	/* Locked firmware entry point supplied by iBoot. */
+	void __iomem *iop_vbar_reg;
 
 	/* DCP has crashed */
 	bool crashed;
