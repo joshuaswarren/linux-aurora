@@ -2223,15 +2223,34 @@ impl G17ResourceOwner {
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
         dev_info!(dev.as_ref(), "G17P resources: B2 aliases mapped\n");
-        let mut partial_primary_index = MappedObject::new_at(
+        dev_info!(
+            dev.as_ref(),
+            "G17P resources: mapping primary-index owner at {:#x}, render alias {:#x}\n",
+            g17_submission::G17P_PARTIAL_OPENING_PRIMARY_INDEX_FIRMWARE_GPU_VA,
+            g17_submission::G17P_PARTIAL_OPENING_PRIMARY_INDEX_GPU_VA
+        );
+        let mut partial_primary_index = match MappedObject::new_at(
             dev,
-            address_space.uat.kernel_lower_vm(),
-            g17_submission::G17P_PARTIAL_OPENING_PRIMARY_INDEX_GPU_VA,
-            g17_submission::G17P_PARTIAL_OPENING_PAGE_SIZE,
+            address_space.uat.kernel_vm(),
+            g17_submission::G17P_PARTIAL_OPENING_PRIMARY_INDEX_FIRMWARE_GPU_VA,
+            g17_submission::G17P_PARTIAL_OPENING_PRIMARY_INDEX_SIZE,
             mmu::PROT_GPU_FW_SHARED_RW,
-        )?;
+        ) {
+            Ok(mapping) => mapping,
+            Err(error) => {
+                dev_err!(
+                    dev.as_ref(),
+                    "G17P resources: primary-index owner map failed ({:?})\n",
+                    error
+                );
+                return Err(error);
+            }
+        };
         partial_primary_index.with_bytes_mut(|bytes| {
-            g17_submission::apply_g17p_partial_opening_primary_index_page(bytes).map_err(|_| EINVAL)
+            g17_submission::apply_g17p_partial_opening_primary_index_page(
+                &mut bytes[..g17_submission::G17P_PARTIAL_OPENING_PAGE_SIZE],
+            )
+            .map_err(|_| EINVAL)
         })?;
         let fwctl = MappedObject::new_at(
             dev,
@@ -2526,8 +2545,11 @@ impl G17ResourceOwner {
         self.resources
             .partial_primary_index
             .with_bytes_mut(|bytes| {
-                g17_submission::apply_g17p_partial_opening_primary_index_page(bytes)
-                    .map_err(|_| EINVAL)
+                bytes.fill(0);
+                g17_submission::apply_g17p_partial_opening_primary_index_page(
+                    &mut bytes[..g17_submission::G17P_PARTIAL_OPENING_PAGE_SIZE],
+                )
+                .map_err(|_| EINVAL)
             })?;
         self.resources.roots.with_bytes_mut(|bytes| {
             bytes.fill(0);
@@ -2769,7 +2791,7 @@ impl G17ResourceOwner {
         G17PPartialOpeningResourceBinding {
             kernel_va_base: self.kernel_va_base,
             scheduler_page: self.resources.partial_scheduler.iova(),
-            primary_index_page: self.resources.partial_primary_index.iova(),
+            primary_index_page: g17_submission::G17P_PARTIAL_OPENING_PRIMARY_INDEX_GPU_VA,
             fwctl: self.resources.fwctl.iova(),
             tiling_channel: channels
                 [g17_submission::G17P_PARTIAL_OPENING_TILING_CHANNEL_TABLE_INDEX as usize],
@@ -3052,6 +3074,24 @@ mod tests {
         let b2_alias = scheduler + 0x8000;
         assert!(scheduler + G17P_CL_B2_OBJECT_SIZE as u64 <= b2_alias);
         assert!(b2_alias + G17P_CL_B2_OBJECT_SIZE as u64 <= mapped[0].1);
+    }
+
+    #[test]
+    fn primary_index_owner_and_render_alias_match_the_captured_roots() {
+        let owner = g17_submission::G17P_PARTIAL_OPENING_PRIMARY_INDEX_FIRMWARE_GPU_VA;
+        let alias = g17_submission::G17P_PARTIAL_OPENING_PRIMARY_INDEX_GPU_VA;
+        let size = g17_submission::G17P_PARTIAL_OPENING_PRIMARY_INDEX_SIZE as u64;
+
+        assert_eq!(owner, 0xffff_fc20_c084_8000);
+        assert_eq!(alias, 0x10_0019_0000);
+        assert_eq!(size, 4 * G17P_PAGE_SIZE as u64);
+        assert!(alias + size < G17P_CL_LOW_VA_START);
+        assert!(
+            g17_initdata::CONTROL_SHARED_ADDRESS
+                + g17_initdata::CONTROL_SHARED_OBJECT_SIZE as u64
+                <= owner
+        );
+        assert!(owner + size < g17_initdata::HW_REGISTER_APERTURE.start);
     }
 
     #[test]

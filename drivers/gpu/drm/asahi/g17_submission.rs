@@ -629,7 +629,14 @@ pub(crate) const fn prepare_g17p_channel_write(
 pub(crate) const G17P_PARTIAL_OPENING_PAGE_SIZE: usize = 0x4000;
 pub(crate) const G17P_PARTIAL_OPENING_SCHEDULER_GPU_VA: u64 = 0xffff_fc20_015e_0000;
 pub(crate) const G17P_PARTIAL_OPENING_SCHEDULER_WORD: u64 = 0x0000_0020_0001_9000;
+/// Firmware-high owner of the four-page primary-index run in the clean
+/// first-partial capture. The render TTB0 aliases this at
+/// [`G17P_PARTIAL_OPENING_PRIMARY_INDEX_GPU_VA`].
+pub(crate) const G17P_PARTIAL_OPENING_PRIMARY_INDEX_FIRMWARE_GPU_VA: u64 =
+    0xffff_fc20_c084_8000;
 pub(crate) const G17P_PARTIAL_OPENING_PRIMARY_INDEX_GPU_VA: u64 = 0x0000_0010_0019_0000;
+pub(crate) const G17P_PARTIAL_OPENING_PRIMARY_INDEX_SIZE: usize =
+    4 * G17P_PARTIAL_OPENING_PAGE_SIZE;
 pub(crate) const G17P_PARTIAL_OPENING_FWCTL_OFFSET: u64 = 0x001c_0000;
 pub(crate) const G17P_PARTIAL_OPENING_CONTROL_MESSAGE_SIZE: u64 = 0x40;
 pub(crate) const G17P_PARTIAL_OPENING_WORK_DOORBELL_CHANNEL: u8 = 8;
@@ -3410,9 +3417,14 @@ mod tests {
         assert_eq!(G17P_PARTIAL_OPENING_PAGE_SIZE, 0x4000);
         assert_eq!(G17P_PARTIAL_OPENING_SCHEDULER_GPU_VA, 0xffff_fc20_015e_0000);
         assert_eq!(
+            G17P_PARTIAL_OPENING_PRIMARY_INDEX_FIRMWARE_GPU_VA,
+            0xffff_fc20_c084_8000
+        );
+        assert_eq!(
             G17P_PARTIAL_OPENING_PRIMARY_INDEX_GPU_VA,
             0x0000_0010_0019_0000
         );
+        assert_eq!(G17P_PARTIAL_OPENING_PRIMARY_INDEX_SIZE, 0x10000);
 
         let scheduler = build_g17p_partial_opening_scheduler_page();
         assert_eq!(get_u64_le(&scheduler, 0), 0x0000_0020_0001_9000);
