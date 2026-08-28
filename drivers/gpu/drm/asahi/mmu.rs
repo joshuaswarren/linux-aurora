@@ -16,6 +16,7 @@ use core::num::NonZeroUsize;
 use core::ops::Range;
 use core::sync::atomic::{
     fence,
+    AtomicBool,
     AtomicU32,
     AtomicU64,
     AtomicU8,
@@ -982,6 +983,8 @@ pub(crate) struct Uat {
 
     kernel_vm: Vm,
     kernel_lower_vm: Vm,
+    t8140_empty_high_roots: Option<[Vm; 2]>,
+    t8140_empty_high_roots_installed: AtomicBool,
 }
 
 impl Handoff {
@@ -1589,6 +1592,77 @@ impl Uat {
         inner.ttbs_rgn.base
     }
 
+    /// Confirm the exact first-render context table: slot 0/tag 0 and slot
+    /// 1/tag 1 share the retained low root. Their high roots start as the
+    /// source firmware root and are replaced by two distinct empty roots at
+    /// first work.
+    pub(crate) fn t8140_partial_opening_contexts_ready(&self, empty_high: bool) -> bool {
+        if self.cfg != UatConfig::T8140 {
+            return false;
+        }
+        let empty = match self.t8140_empty_high_roots.as_ref() {
+            Some(roots) => [roots[0].ttb(), roots[1].ttb()],
+            None => return false,
+        };
+        let low = self.kernel_lower_vm.ttb();
+        let source_high = self.kernel_vm.ttb();
+        let high = if empty_high {
+            empty
+        } else {
+            [source_high, source_high]
+        };
+        let inner = self.inner.lock();
+        let ttbs = inner.ttbs();
+        ttbs[0].ttb0.load(Ordering::Acquire) == (low | TTBR_VALID)
+            && ttbs[0].ttb1.load(Ordering::Acquire) == (high[0] | TTBR_VALID)
+            && ttbs[1].ttb0.load(Ordering::Acquire)
+                == (low | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT))
+            && ttbs[1].ttb1.load(Ordering::Acquire)
+                == (high[1] | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT))
+    }
+
+    /// Replace only the two high roots at the measured first-work boundary.
+    /// Both low roots remain resident; the source firmware high root remains
+    /// retained by `kernel_vm` but is no longer present in the TTBAT.
+    pub(crate) fn install_t8140_partial_opening_empty_high_roots(&self) -> Result {
+        if self
+            .t8140_empty_high_roots_installed
+            .load(Ordering::Acquire)
+        {
+            return if self.t8140_partial_opening_contexts_ready(true) {
+                Ok(())
+            } else {
+                Err(EIO)
+            };
+        }
+        if !self.t8140_partial_opening_contexts_ready(false) {
+            return Err(EIO);
+        }
+        let empty = self.t8140_empty_high_roots.as_ref().ok_or(EIO)?;
+        let high = [empty[0].ttb(), empty[1].ttb()];
+        let inner = self.inner.lock();
+        inner.handoff().lock();
+        let ttbs = inner.ttbs();
+        ttbs[0].ttb1.store(high[0] | TTBR_VALID, Ordering::Release);
+        ttbs[1].ttb1.store(
+            high[1] | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT),
+            Ordering::Release,
+        );
+        inner.handoff().unlock();
+        core::mem::drop(inner);
+
+        mem::tlbi_asid(0);
+        mem::tlbi_asid(1);
+        mem::sync();
+        self.t8140_empty_high_roots_installed
+            .store(true, Ordering::Release);
+        if self.t8140_partial_opening_contexts_ready(true) {
+            Ok(())
+        } else {
+            Err(EIO)
+        }
+    }
+
     /// Binds a `Vm` to a slot, preferring the last used one.
     pub(crate) fn bind(&self, vm: &Vm) -> Result<VmBind> {
         let mut binding = vm.binding.lock();
@@ -1807,12 +1881,36 @@ impl Uat {
         dev_info!(dev.as_ref(), "MMU: Kernel page tables created\n");
 
         let ttb0 = kernel_lower_vm.ttb();
+        let t8140_empty_high_roots = if cfg == UatConfig::T8140 {
+            Some([
+                Vm::new(
+                    dev,
+                    inner.clone(),
+                    IOVA_USER_BASE..uat_geometry(cfg)?.user_va_top(),
+                    cfg,
+                    None,
+                    0x8140_1000,
+                )?,
+                Vm::new(
+                    dev,
+                    inner.clone(),
+                    IOVA_USER_BASE..uat_geometry(cfg)?.user_va_top(),
+                    cfg,
+                    None,
+                    0x8140_1001,
+                )?,
+            ])
+        } else {
+            None
+        };
 
         let uat = Self {
             dev: dev.into(),
             cfg,
             kernel_vm,
             kernel_lower_vm,
+            t8140_empty_high_roots,
+            t8140_empty_high_roots_installed: AtomicBool::new(false),
             inner,
             slots: slotalloc::SlotAllocator::new(
                 UAT_USER_CTX as u32,
@@ -1843,6 +1941,16 @@ impl Uat {
         for ctx in &ttbs[1..] {
             ctx.ttb0.store(0, Ordering::Relaxed);
             ctx.ttb1.store(0, Ordering::Relaxed);
+        }
+        if cfg == UatConfig::T8140 {
+            ttbs[1].ttb0.store(
+                ttb0 | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT),
+                Ordering::SeqCst,
+            );
+            ttbs[1].ttb1.store(
+                ttb1 | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT),
+                Ordering::SeqCst,
+            );
         }
 
         inner.handoff().unlock();

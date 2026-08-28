@@ -17,8 +17,8 @@ use core::sync::atomic::{fence, Ordering};
 
 #[cfg(not(test))]
 use crate::{
-    driver::AsahiDevice, g17_compute, g17_initdata, g17_resources, g17_submission, g17_uapi,
-    hw::agx3, identity, mmu, regs,
+    driver::AsahiDevice, g17_completion, g17_compute, g17_initdata, g17_resources, g17_submission,
+    g17_uapi, hw::agx3, identity, mmu, regs,
 };
 #[cfg(test)]
 #[path = "g17_initdata.rs"]
@@ -346,6 +346,24 @@ pub(crate) struct G17PComputeSubmissionContext<'a> {
     pub(crate) auxiliary: u64,
 }
 
+/// The two complete queue groups exposed by the exact first graphics publish.
+#[cfg(not(test))]
+pub(crate) struct G17PPartialOpeningRenderSubmission {
+    pub(crate) fragment_queue_gpu_va: u64,
+    pub(crate) fragment_queue_write_index: u32,
+    pub(crate) tiling_queue_gpu_va: u64,
+    pub(crate) tiling_queue_write_index: u32,
+}
+
+/// Completion cursors retained across observations of one graphics pair.
+#[cfg(not(test))]
+pub(crate) struct G17PPartialOpeningRenderTracker {
+    tiling_previous: g17_completion::QueueIndices,
+    fragment_previous: g17_completion::QueueIndices,
+    tiling_prefix: u32,
+    fragment_prefix: u32,
+}
+
 #[cfg(not(test))]
 impl G17PManagerConstruction {
     pub(crate) fn new(
@@ -377,6 +395,122 @@ impl G17PManagerConstruction {
 
     pub(crate) fn uat(&self) -> &mmu::Uat {
         self.resources.uat()
+    }
+
+    fn validate_partial_opening_resources(&self) -> Result {
+        let binding = self.resources.partial_opening_binding();
+        let context = g17_submission::G17P_PARTIAL_OPENING_CONTEXT;
+        if binding.scheduler_page != g17_submission::G17P_PARTIAL_OPENING_SCHEDULER_GPU_VA
+            || binding.primary_index_page
+                != g17_submission::G17P_PARTIAL_OPENING_PRIMARY_INDEX_GPU_VA
+            || binding.fwctl
+                != binding
+                    .kernel_va_base
+                    .checked_add(g17_submission::G17P_PARTIAL_OPENING_FWCTL_OFFSET)
+                    .ok_or(EINVAL)?
+            || context.context0_root_slot != 0
+            || context.context0_context_id != 0
+            || context.render_root_slot != 1
+            || context.render_context_id != 1
+            || context.context0_empty_high_root_slot != 0
+            || context.render_empty_high_root_slot != 1
+            || context.transport_pair != 2
+            || context.descriptor_pair != 0
+            || context.graph_context_id != 2
+            || context.optional_identity_context_id != 3
+            || context.descriptor_context_id != 2
+            || context.scheduler_class != 2
+            || context.work_doorbell_channel != 8
+            || !context.context0_low_root_present_at_first_work
+            || !context.render_low_root_present_at_first_work
+            || context.source_firmware_high_root_table_resident
+            || !self
+                .resources
+                .uat()
+                .t8140_partial_opening_contexts_ready(false)
+        {
+            return Err(EINVAL);
+        }
+        Ok(())
+    }
+
+    /// Apply first-work status immediately before the caller sends primary
+    /// control-done 0x84.
+    pub(crate) fn prepare_partial_opening_control_done(&mut self) -> Result {
+        self.validate_partial_opening_resources()?;
+        self.resources.apply_partial_opening_pre_control_status()
+    }
+
+    /// Publish the exact first 3D/TA outer-ring pair. The callback installs
+    /// the late TA descriptor, item-ring, and queue-head state between the 3D
+    /// producer and the TA outer slot. The retained live runtime sends the
+    /// returned channel-8 doorbell exactly once.
+    pub(crate) fn submit_partial_opening_render<F>(
+        &mut self,
+        submission: G17PPartialOpeningRenderSubmission,
+        publish_late_tiling_state: F,
+    ) -> Result<(
+        G17PPartialOpeningRenderTracker,
+        g17_submission::PreparedG17PPartialOpeningWorkPair,
+    )>
+    where
+        F: FnOnce() -> Result,
+    {
+        self.validate_partial_opening_resources()?;
+        if submission.fragment_queue_write_index != 3 || submission.tiling_queue_write_index != 3 {
+            return Err(EINVAL);
+        }
+        let prepared = self.resources.publish_partial_opening_pair(
+            submission.fragment_queue_gpu_va,
+            submission.fragment_queue_write_index,
+            submission.tiling_queue_gpu_va,
+            submission.tiling_queue_write_index,
+            publish_late_tiling_state,
+        )?;
+        if prepared.paired_doorbell != g17_submission::G17P_PARTIAL_OPENING_PAIRED_DOORBELL
+            || prepared.paired_doorbell != 0x0083_0000_0000_0008
+        {
+            return Err(EINVAL);
+        }
+        let tracker = G17PPartialOpeningRenderTracker {
+            tiling_previous: g17_completion::QueueIndices {
+                done: 0,
+                read: 0,
+                write: submission.tiling_queue_write_index,
+            },
+            fragment_previous: g17_completion::QueueIndices {
+                done: 0,
+                read: 0,
+                write: submission.fragment_queue_write_index,
+            },
+            tiling_prefix: submission.tiling_queue_write_index,
+            fragment_prefix: submission.fragment_queue_write_index,
+        };
+        Ok((tracker, prepared))
+    }
+
+    /// Classify paired render progress from queue indices plus the scheduler
+    /// job list and both descriptor timestamp quartets.
+    pub(crate) fn observe_partial_opening_render_completion(
+        &self,
+        tracker: &mut G17PPartialOpeningRenderTracker,
+        tiling_current: g17_completion::QueueIndices,
+        fragment_current: g17_completion::QueueIndices,
+        execution: g17_completion::RenderExecutionState,
+    ) -> Result<g17_completion::PairedRenderCompletion> {
+        let completion = g17_completion::observe_paired_render_completion(
+            tracker.tiling_previous,
+            tiling_current,
+            tracker.tiling_prefix,
+            tracker.fragment_previous,
+            fragment_current,
+            tracker.fragment_prefix,
+            execution,
+        )
+        .map_err(|_| EINVAL)?;
+        tracker.tiling_previous = tiling_current;
+        tracker.fragment_previous = fragment_current;
+        Ok(completion)
     }
 
     pub(crate) fn sksm_scratch(&self) -> G17SksmScratchGeometry {
