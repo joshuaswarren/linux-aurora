@@ -58,8 +58,13 @@ apple_dcp_coprocessor_start_mode(enum apple_dcp_loader_handoff handoff,
 static inline bool
 apple_dcp_needs_adoption(enum apple_dcp_coprocessor_start start_mode)
 {
-	return start_mode == APPLE_DCP_COPROCESSOR_ADOPT_AND_RESTART ||
-	       start_mode == APPLE_DCP_COPROCESSOR_ASC_STOPPED_RESTART;
+	return start_mode == APPLE_DCP_COPROCESSOR_ADOPT_AND_RESTART;
+}
+
+static inline bool
+apple_dcp_needs_reset(enum apple_dcp_coprocessor_start start_mode)
+{
+	return start_mode == APPLE_DCP_COPROCESSOR_ASC_STOPPED_RESTART;
 }
 
 #endif /* __APPLE_DCP_LIFECYCLE_H__ */

@@ -19,6 +19,7 @@
 #include <linux/of_address.h>
 #include <linux/of_device.h>
 #include <linux/of_platform.h>
+#include <linux/reset.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/string.h>
@@ -1126,15 +1127,25 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	dcp->swapped_out_fbs =
 		(struct list_head)LIST_HEAD_INIT(dcp->swapped_out_fbs);
 
+	if (apple_dcp_needs_reset(start_mode)) {
+		struct reset_control *reset;
+
+		dev_info(dev,
+			 "resetting loader-stopped DCP session before RTKit boot\n");
+		reset = devm_reset_control_get_exclusive(dev, NULL);
+		if (IS_ERR(reset))
+			return dev_err_probe(dev, PTR_ERR(reset),
+					     "Failed to acquire DCP reset\n");
+		ret = reset_control_reset(reset);
+		if (ret)
+			return dev_err_probe(dev, ret,
+					     "Failed to reset DCP: %d\n", ret);
+	}
+
 	if (apple_dcp_needs_adoption(start_mode)) {
-		if (start_mode == APPLE_DCP_COPROCESSOR_ASC_STOPPED_RESTART) {
-			dev_info(dev,
-				 "resuming loader-stopped DCP session for RTKit restart\n");
-		} else {
-			dev_info(dev,
-				 "quiescing inherited DCP session (control=%#x status=%#x)\n",
-				 cpu_ctrl, cpu_status);
-		}
+		dev_info(dev,
+			 "quiescing inherited DCP session (control=%#x status=%#x)\n",
+			 cpu_ctrl, cpu_status);
 		dcp->adopting_session = true;
 		dcp->rtk = devm_apple_rtkit_init_adopted(dev, dcp, "mbox", 0,
 							  &rtkit_ops);
@@ -1142,14 +1153,6 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 			dcp->adopting_session = false;
 			return dev_err_probe(dev, PTR_ERR(dcp->rtk),
 					     "Failed to adopt RTKit\n");
-		}
-		if (start_mode == APPLE_DCP_COPROCESSOR_ASC_STOPPED_RESTART) {
-			writel_relaxed(cpu_ctrl |
-				       APPLE_DCP_COPROC_CPU_CONTROL_RUN,
-				       dcp->coproc_reg +
-				       APPLE_DCP_COPROC_CPU_CONTROL);
-			readl_relaxed(dcp->coproc_reg +
-				      APPLE_DCP_COPROC_CPU_CONTROL);
 		}
 
 		ret = apple_rtkit_quiesce(dcp->rtk);
