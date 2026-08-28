@@ -2036,6 +2036,7 @@ impl G17ResourceOwner {
     pub(crate) fn new(dev: &AsahiDevice) -> Result<Self> {
         let uat = KBox::new(mmu::Uat::new_t8140(dev, true)?, GFP_KERNEL)?;
         let address_space = G17UatOwner { uat };
+        dev_info!(dev.as_ref(), "G17P resources: building firmware layout\n");
 
         let kernel_va_base = address_space.uat.kernel_va_range()?.start;
         let fwctl_gpu_va = kernel_va_base
@@ -2083,6 +2084,30 @@ impl G17ResourceOwner {
             mmu::UAT_PGSZ as u64,
             mmu::PROT_FW_PRIV_RW,
         )?;
+        // The native bundle has three out-of-line pages at fixed offsets from
+        // its base. Claim them before placing the remaining dynamic objects,
+        // otherwise a large state object can occupy one of these addresses.
+        let primary_b2_sentinel = MappedObject::new_at(
+            dev,
+            address_space.uat.kernel_vm(),
+            shared_cluster.iova() + 0x40000,
+            G17P_CL_B2_OBJECT_SIZE,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        let hw_region_0 = MappedObject::new_at(
+            dev,
+            address_space.uat.kernel_vm(),
+            shared_cluster.iova() + g17_initdata::NATIVE_HW_REGION_BUNDLE_OFFSETS[0] as u64,
+            mmu::UAT_PGSZ,
+            mmu::PROT_FW_SHARED_RW,
+        )?;
+        let hw_region_1 = MappedObject::new_at(
+            dev,
+            address_space.uat.kernel_vm(),
+            shared_cluster.iova() + g17_initdata::NATIVE_HW_REGION_BUNDLE_OFFSETS[1] as u64,
+            mmu::UAT_PGSZ,
+            mmu::PROT_FW_SHARED_RW,
+        )?;
         let region_a = MappedObject::new(
             dev,
             &address_space.uat,
@@ -2118,28 +2143,7 @@ impl G17ResourceOwner {
             mmu::UAT_PGSZ as u64,
             mmu::PROT_FW_SHARED_RW,
         )?;
-        let hw_region_0 = MappedObject::new_at(
-            dev,
-            address_space.uat.kernel_vm(),
-            shared_cluster.iova() + g17_initdata::NATIVE_HW_REGION_BUNDLE_OFFSETS[0] as u64,
-            mmu::UAT_PGSZ,
-            mmu::PROT_FW_SHARED_RW,
-        )?;
-        let hw_region_1 = MappedObject::new_at(
-            dev,
-            address_space.uat.kernel_vm(),
-            shared_cluster.iova() + g17_initdata::NATIVE_HW_REGION_BUNDLE_OFFSETS[1] as u64,
-            mmu::UAT_PGSZ,
-            mmu::PROT_FW_SHARED_RW,
-        )?;
         let register_windows = map_t8140_register_windows(&address_space.uat)?;
-        let primary_b2_sentinel = MappedObject::new_at(
-            dev,
-            address_space.uat.kernel_vm(),
-            shared_cluster.iova() + 0x40000,
-            G17P_CL_B2_OBJECT_SIZE,
-            mmu::PROT_GPU_FW_SHARED_RW,
-        )?;
         let mut primary_b2_alias_1 = MappedObject::new_at(
             dev,
             address_space.uat.kernel_vm(),
@@ -2272,6 +2276,7 @@ impl G17ResourceOwner {
             &primary_region_views,
         )?;
         roots.write_roots(&shared, &primary_instance, &secondary_instance)?;
+        dev_info!(dev.as_ref(), "G17P resources: firmware layout ready\n");
 
         Ok(Self {
             dev: dev.into(),
