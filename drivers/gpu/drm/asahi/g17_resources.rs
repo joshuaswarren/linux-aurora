@@ -13,10 +13,13 @@ use kernel::prelude::*;
 #[cfg(not(test))]
 use crate::g17_initdata;
 #[cfg(not(test))]
-use crate::{driver::AsahiDevice, gem, mmu};
+use crate::{driver::AsahiDevice, g17_compute, gem, mmu};
 #[cfg(test)]
 #[path = "g17_initdata.rs"]
 mod g17_initdata;
+#[cfg(test)]
+#[path = "g17_compute.rs"]
+mod g17_compute;
 
 #[cfg(not(test))]
 use core::ops::Range;
@@ -42,6 +45,14 @@ pub(crate) const G17P_CL_SUPPORT_STATE_SIZE: usize = 0x4000;
 pub(crate) const G17P_CL_OPERAND_TABLE_SIZE: usize = 0x4000;
 pub(crate) const G17P_CL_LOW_VA_START: u64 = 0x70_0000_0000;
 pub(crate) const G17P_CL_LOW_VA_END: u64 = 0x71_0000_0000;
+pub(crate) const G17P_COMPUTE_DESCRIPTOR_SLOT_SIZE: usize = 0x4000;
+pub(crate) const G17P_COMPUTE_DESCRIPTOR_SLOT_COUNT: usize = 256;
+pub(crate) const G17P_COMPUTE_DESCRIPTOR_STORAGE_SIZE: usize =
+    G17P_COMPUTE_DESCRIPTOR_SLOT_SIZE * G17P_COMPUTE_DESCRIPTOR_SLOT_COUNT;
+pub(crate) const G17P_COMPUTE_PREEMPT_SIZE: usize = 0x4000;
+pub(crate) const G17P_COMPUTE_OPERAND_STATE_SIZE: usize = 0x14000;
+pub(crate) const G17P_COMPUTE_SUPPORT_SIZE: usize = 0xc000;
+pub(crate) const G17P_COMPUTE_QUEUE_GRAPH_SIZE: usize = g17_compute::COMPUTE_QUEUE_GRAPH_SIZE;
 #[cfg(not(test))]
 const STATUS_A_ALLOC_SIZE: usize = 0xb4000;
 #[cfg(not(test))]
@@ -252,6 +263,17 @@ impl MappedObject {
         self.object.map_at(vm, address, prot, false)
     }
 
+    fn map_alias_in_range(
+        &mut self,
+        vm: &mmu::Vm,
+        range: Range<u64>,
+        alignment: u64,
+        prot: mmu::Prot,
+    ) -> Result<mmu::KernelMapping> {
+        self.object
+            .map_into_range(vm, range, alignment, prot, false)
+    }
+
     fn write_roots(
         &mut self,
         shared: &SharedAddresses,
@@ -385,6 +407,175 @@ pub(crate) struct G17PClRuntimeStorage {
     support_state: MappedObject,
     scheduler_state: MappedObject,
     operand_table: MappedObject,
+}
+
+/// Queue-owned objects referenced by selector-3 compute descriptors.
+///
+/// Descriptor slots keep both views required by the command ABI: firmware
+/// consumes the upper address carried in the CL entry, while descriptor-local
+/// register-array pointers use the lower alias. All 256 slots remain mapped
+/// until the physical queue is unregistered.
+#[cfg(not(test))]
+pub(crate) struct G17PComputeDescriptorStorage {
+    descriptors: MappedObject,
+    descriptors_high: mmu::KernelMapping,
+    preempt: MappedObject,
+    robustness: MappedObject,
+    operand_state: MappedObject,
+    support: MappedObject,
+    queue_graph: MappedObject,
+}
+
+#[cfg(not(test))]
+impl G17PComputeDescriptorStorage {
+    pub(crate) fn new(
+        dev: &AsahiDevice,
+        uat: &mmu::Uat,
+        channel_control_gpu_va: u64,
+    ) -> Result<Self> {
+        let mut descriptors = MappedObject::new_in_range(
+            dev,
+            uat.kernel_lower_vm(),
+            G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END,
+            G17P_COMPUTE_DESCRIPTOR_STORAGE_SIZE,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        let descriptors_high = descriptors.map_alias_in_range(
+            uat.kernel_vm(),
+            uat.kernel_va_range()?,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        let preempt = MappedObject::new(
+            dev,
+            uat,
+            G17P_COMPUTE_PREEMPT_SIZE,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        let robustness = MappedObject::new(
+            dev,
+            uat,
+            mmu::UAT_PGSZ,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        let operand_state = MappedObject::new_in_range(
+            dev,
+            uat.kernel_lower_vm(),
+            G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END,
+            G17P_COMPUTE_OPERAND_STATE_SIZE,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        let mut support = MappedObject::new(
+            dev,
+            uat,
+            G17P_COMPUTE_SUPPORT_SIZE,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        let support_gpu_va = support.iova();
+        support.with_bytes_mut(|raw| {
+            let scheduler_state = support_gpu_va + mmu::UAT_PGSZ as u64;
+            raw[0x00..0x08].copy_from_slice(&scheduler_state.to_le_bytes());
+            raw[0x100..0x108].copy_from_slice(&(scheduler_state + 4).to_le_bytes());
+            raw[0x110..0x114].copy_from_slice(&0x50u32.to_le_bytes());
+            raw[mmu::UAT_PGSZ + 4..mmu::UAT_PGSZ + 8]
+                .copy_from_slice(&1u32.to_le_bytes());
+            Ok(())
+        })?;
+        let mut queue_graph = MappedObject::new(
+            dev,
+            uat,
+            G17P_COMPUTE_QUEUE_GRAPH_SIZE,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        let queue_graph_gpu_va = queue_graph.iova();
+        queue_graph.with_bytes_mut(|raw| {
+            g17_compute::build_compute_queue_graph(
+                queue_graph_gpu_va,
+                channel_control_gpu_va,
+                raw,
+            )
+            .map(|_| ())
+            .map_err(|_| EINVAL)
+        })?;
+
+        Ok(Self {
+            descriptors,
+            descriptors_high,
+            preempt,
+            robustness,
+            operand_state,
+            support,
+            queue_graph,
+        })
+    }
+
+    pub(crate) fn descriptor_gpu_vas(&self, slot: u8) -> (u64, u64) {
+        let offset = slot as u64 * G17P_COMPUTE_DESCRIPTOR_SLOT_SIZE as u64;
+        (
+            self.descriptors_high.iova() + offset,
+            self.descriptors.iova() + offset,
+        )
+    }
+
+    pub(crate) fn preempt_gpu_va(&self) -> u64 {
+        self.preempt.iova()
+    }
+
+    pub(crate) fn robustness_gpu_va(&self) -> u64 {
+        self.robustness.iova()
+    }
+
+    pub(crate) fn operand_state_gpu_va(&self) -> u64 {
+        self.operand_state.iova()
+    }
+
+    pub(crate) fn scheduler_record_gpu_va(&self) -> u64 {
+        self.support.iova() + 0x100
+    }
+
+    pub(crate) fn dispatch_a_gpu_va(&self) -> u64 {
+        self.support.iova() + 0x300
+    }
+
+    pub(crate) fn dispatch_b_gpu_va(&self) -> u64 {
+        self.support.iova() + 0x308
+    }
+
+    pub(crate) fn status_a_gpu_va(&self) -> u64 {
+        self.support.iova() + 0x310
+    }
+
+    pub(crate) fn status_b_gpu_va(&self) -> u64 {
+        self.support.iova() + 0x318
+    }
+
+    pub(crate) fn zero_page_gpu_va(&self) -> u64 {
+        self.support.iova() + 2 * mmu::UAT_PGSZ as u64
+    }
+
+    pub(crate) fn queue_record_gpu_va(&self) -> u64 {
+        self.queue_graph.iova()
+    }
+
+    pub(crate) fn with_descriptor_mut<R>(
+        &mut self,
+        slot: u8,
+        f: impl FnOnce(&mut [u8]) -> Result<R>,
+    ) -> Result<R> {
+        let offset = slot as usize * G17P_COMPUTE_DESCRIPTOR_SLOT_SIZE;
+        let end = offset
+            .checked_add(G17P_COMPUTE_DESCRIPTOR_SLOT_SIZE)
+            .ok_or(EINVAL)?;
+        self.descriptors
+            .with_bytes_mut(|raw| f(&mut raw[offset..end]))
+    }
+
 }
 
 #[cfg(not(test))]
@@ -862,6 +1053,13 @@ mod tests {
         assert_eq!(G17P_CL_CHANNEL_CONTROL_SIZE, 0x4000);
         assert_eq!(G17P_CL_LOW_VA_START, 0x70_0000_0000);
         assert_eq!(G17P_CL_LOW_VA_END, 0x71_0000_0000);
+        assert_eq!(G17P_COMPUTE_DESCRIPTOR_SLOT_SIZE, 0x4000);
+        assert_eq!(G17P_COMPUTE_DESCRIPTOR_SLOT_COUNT, 256);
+        assert_eq!(G17P_COMPUTE_DESCRIPTOR_STORAGE_SIZE, 0x400000);
+        assert_eq!(G17P_COMPUTE_PREEMPT_SIZE, 0x4000);
+        assert_eq!(G17P_COMPUTE_OPERAND_STATE_SIZE, 0x14000);
+        assert_eq!(G17P_COMPUTE_SUPPORT_SIZE, 0xc000);
+        assert_eq!(G17P_COMPUTE_QUEUE_GRAPH_SIZE, 0x8000);
         assert_eq!(g17_initdata::T8140_REGISTER_WINDOWS.len(), 18);
         assert_eq!(g17_initdata::T8140_REGISTER_WINDOWS[0].slot, 0);
         assert_eq!(
