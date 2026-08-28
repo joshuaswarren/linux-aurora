@@ -34,6 +34,10 @@
 #include <linux/swab.h>
 #include <linux/types.h>
 
+#if IS_ENABLED(CONFIG_APPLE_DART_KUNIT_TEST)
+#include <kunit/test.h>
+#endif
+
 #include "dma-iommu.h"
 
 #define DART_MAX_STREAMS 256
@@ -126,6 +130,19 @@
 #define DART_T8110_ERROR_ADDR_HI 0x174
 
 #define DART_T8110_ERROR_STREAMS 0x1c0
+
+/* DART v2.2 and later expose one exception record per SID. */
+#define DART_T8110_EXCEPTION(sid) (0x4000 + 4 * (sid))
+#define DART_T8110_EXCEPTION_CODE GENMASK(3, 0)
+#define DART_T8110_EXCEPTION_LEVEL GENMASK(13, 12)
+
+/* DART v2.3 adds a block-level exception summary. */
+#define DART_T8110_BLOCK_ERROR 0x704
+#define DART_T8110_BLOCK_ERROR_MASK 0x777
+
+#define DART_T8110_EXCEPTION_INFO(sid) (0x8000 + 0x40 * (sid))
+#define DART_T8110_EXCEPTION_ADDR_LO(sid) (DART_T8110_EXCEPTION_INFO(sid) + 0x8)
+#define DART_T8110_EXCEPTION_ADDR_HI(sid) (DART_T8110_EXCEPTION_INFO(sid) + 0xc)
 
 #define DART_T8110_PROTECT 0x200
 #define DART_T8110_UNPROTECT 0x204
@@ -231,6 +248,7 @@ struct apple_dart {
 	u32 locked : 1;
 	u32 tlb_cmd_v2 : 1;
 	u32 force_available : 1;
+	u16 version;
 
 	dma_addr_t dma_min;
 	dma_addr_t dma_max;
@@ -572,8 +590,28 @@ static int apple_dart_hw_reset(struct apple_dart *dart)
 	for (i = 0; i < BITS_TO_U32(dart->num_streams); i++)
 		writel(U32_MAX, dart->regs + dart->hw->enable_streams + 4 * i);
 
-	/* clear any pending errors before the interrupt is unmasked */
-	writel(readl(dart->regs + dart->hw->error), dart->regs + dart->hw->error);
+	/* Clear any pending errors before the interrupt is unmasked. */
+	if (dart->hw->type == DART_T8110 && dart->version >= 0x0202) {
+		unsigned int sid;
+
+		/*
+		 * AppleT8110DART reads the exception record before its detail
+		 * registers and never writes the record back. Preserve that order.
+		 */
+		for (sid = 0; sid < dart->num_streams; sid++) {
+			if (!readl(dart->regs + DART_T8110_EXCEPTION(sid)))
+				continue;
+
+			readl(dart->regs + DART_T8110_EXCEPTION_ADDR_LO(sid));
+			readl(dart->regs + DART_T8110_EXCEPTION_ADDR_HI(sid));
+		}
+
+		if (dart->version >= 0x0203)
+			readl(dart->regs + DART_T8110_BLOCK_ERROR);
+	} else {
+		writel(readl(dart->regs + dart->hw->error),
+		       dart->regs + dart->hw->error);
+	}
 
 	if (dart->hw->type == DART_T8110)
 		writel(0,  dart->regs + DART_T8110_ERROR_MASK);
@@ -1267,7 +1305,7 @@ static irqreturn_t apple_dart_t8020_irq(int irq, void *dev)
 	return IRQ_HANDLED;
 }
 
-static irqreturn_t apple_dart_t8110_irq(int irq, void *dev)
+static irqreturn_t apple_dart_t8110_legacy_irq(int irq, void *dev)
 {
 	struct apple_dart *dart = dev;
 	const char *fault_name = NULL;
@@ -1307,6 +1345,114 @@ static irqreturn_t apple_dart_t8110_irq(int irq, void *dev)
 		writel(U32_MAX, dart->regs + DART_T8110_ERROR_STREAMS + 4 * i);
 
 	return IRQ_HANDLED;
+}
+
+static const char *apple_dart_t8110_v2_fault_name(u32 exception)
+{
+	switch (FIELD_GET(DART_T8110_EXCEPTION_CODE, exception)) {
+	case 0:
+		switch (FIELD_GET(DART_T8110_EXCEPTION_LEVEL, exception)) {
+		case 0:
+			return "TTBR invalid";
+		case 1:
+			return "CTE invalid";
+		case 2:
+			return "STE invalid";
+		case 3:
+			return "PTE invalid";
+		}
+		break;
+	case 1:
+		return "write protect";
+	case 2:
+		return "read protect";
+	case 3:
+		return "drop protect";
+	case 4:
+		return "AXI decode";
+	case 5:
+		return "AXI error";
+	case 6:
+		return "fill region";
+	case 7:
+		return "region protect";
+	case 8:
+		return "CTRR write protect";
+	case 9:
+		return "APF reject";
+	case 10:
+		return "BPF reject";
+	case 11:
+		return "STT mismatch";
+	case 12:
+		return "STT flush";
+	case 13:
+		return "external";
+	case 14:
+		return "illegal SID";
+	}
+
+	return "unknown";
+}
+
+static bool apple_dart_t8110_v2_block_pending(u16 version, u32 block_error)
+{
+	return version >= 0x0203 &&
+	       (block_error & DART_T8110_BLOCK_ERROR_MASK);
+}
+
+static irqreturn_t apple_dart_t8110_v2_irq(int irq, void *dev)
+{
+	struct apple_dart *dart = dev;
+	irqreturn_t ret = IRQ_NONE;
+	unsigned int sid;
+	u32 block_error = 0;
+
+	/*
+	 * AppleT8110DART reads each exception once, saves it, then reads the
+	 * matching detail registers. It never writes the exception back. Keep
+	 * the same ordering here.
+	 */
+	for (sid = 0; sid < dart->num_streams; sid++) {
+		u32 exception = readl(dart->regs + DART_T8110_EXCEPTION(sid));
+		u32 addr_lo, addr_hi;
+		u64 addr;
+
+		if (!exception)
+			continue;
+
+		addr_lo = readl(dart->regs + DART_T8110_EXCEPTION_ADDR_LO(sid));
+		addr_hi = readl(dart->regs + DART_T8110_EXCEPTION_ADDR_HI(sid));
+		addr = addr_lo | (u64)addr_hi << 32;
+
+		dev_err_ratelimited(dart->dev,
+				    "translation fault: SID:%u exception:0x%08x (%s) at 0x%llx\n",
+				    sid, exception,
+				    apple_dart_t8110_v2_fault_name(exception), addr);
+		ret = IRQ_HANDLED;
+	}
+
+	if (dart->version >= 0x0203) {
+		block_error = readl(dart->regs + DART_T8110_BLOCK_ERROR);
+		if (apple_dart_t8110_v2_block_pending(dart->version, block_error)) {
+			dev_err_ratelimited(dart->dev,
+					    "block exception: status:0x%08x\n",
+					    block_error);
+			ret = IRQ_HANDLED;
+		}
+	}
+
+	return ret;
+}
+
+static irqreturn_t apple_dart_t8110_irq(int irq, void *dev)
+{
+	struct apple_dart *dart = dev;
+
+	if (dart->version >= 0x0202)
+		return apple_dart_t8110_v2_irq(irq, dev);
+
+	return apple_dart_t8110_legacy_irq(irq, dev);
 }
 
 static irqreturn_t apple_dart_irq(int irq, void *dev)
@@ -1394,7 +1540,8 @@ static int apple_dart_probe(struct platform_device *pdev)
 		dart->oas = FIELD_GET(DART_T8110_PARAMS3_PA_WIDTH, dart_params[2]);
 		dart->num_streams = FIELD_GET(DART_T8110_PARAMS4_NUM_SIDS, dart_params[3]);
 		dart->four_level = dart->ias > 36;
-		dart->tlb_cmd_v2 = (dart_params[2] & GENMASK(15, 0)) >= 0x0202;
+		dart->version = dart_params[2] & GENMASK(15, 0);
+		dart->tlb_cmd_v2 = dart->version >= 0x0202;
 		if (dart->tlb_cmd_v2)
 			dev_info(dev, "DART v%lu.%lu uses v2 TLB commands\n",
 				 FIELD_GET(DART_T8110_PARAMS3_VER_MAJ, dart_params[2]),
@@ -1652,6 +1799,67 @@ static const struct of_device_id apple_dart_of_match[] = {
 	{},
 };
 MODULE_DEVICE_TABLE(of, apple_dart_of_match);
+
+#if IS_ENABLED(CONFIG_APPLE_DART_KUNIT_TEST)
+static void apple_dart_t8110_v2_register_layout_test(struct kunit *test)
+{
+	KUNIT_EXPECT_EQ(test, DART_T8110_EXCEPTION(0), 0x4000);
+	KUNIT_EXPECT_EQ(test, DART_T8110_EXCEPTION(28), 0x4070);
+	KUNIT_EXPECT_EQ(test, DART_T8110_EXCEPTION_ADDR_LO(0), 0x8008);
+	KUNIT_EXPECT_EQ(test, DART_T8110_EXCEPTION_ADDR_HI(28), 0x870c);
+}
+
+static void apple_dart_t8110_v2_fault_decode_test(struct kunit *test)
+{
+	static const char * const level_names[] = {
+		"TTBR invalid", "CTE invalid", "STE invalid", "PTE invalid",
+	};
+	static const char * const code_names[] = {
+		NULL, "write protect", "read protect", "drop protect",
+		"AXI decode", "AXI error", "fill region", "region protect",
+		"CTRR write protect", "APF reject", "BPF reject",
+		"STT mismatch", "STT flush", "external", "illegal SID",
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(level_names); i++)
+		KUNIT_EXPECT_STREQ(test,
+				   apple_dart_t8110_v2_fault_name(i << 12),
+				   level_names[i]);
+
+	for (i = 1; i < ARRAY_SIZE(code_names); i++)
+		KUNIT_EXPECT_STREQ(test, apple_dart_t8110_v2_fault_name(i),
+				   code_names[i]);
+
+	KUNIT_EXPECT_STREQ(test, apple_dart_t8110_v2_fault_name(15), "unknown");
+}
+
+static void apple_dart_t8110_v2_shared_irq_test(struct kunit *test)
+{
+	KUNIT_EXPECT_FALSE(test,
+			   apple_dart_t8110_v2_block_pending(0x0202, 0x777));
+	KUNIT_EXPECT_TRUE(test,
+			  apple_dart_t8110_v2_block_pending(0x0203, BIT(0)));
+	KUNIT_EXPECT_TRUE(test,
+			  apple_dart_t8110_v2_block_pending(0x0203, BIT(10)));
+	KUNIT_EXPECT_FALSE(test,
+			   apple_dart_t8110_v2_block_pending(0x0203, BIT(3)));
+}
+
+static struct kunit_case apple_dart_t8110_v2_test_cases[] = {
+	KUNIT_CASE(apple_dart_t8110_v2_register_layout_test),
+	KUNIT_CASE(apple_dart_t8110_v2_fault_decode_test),
+	KUNIT_CASE(apple_dart_t8110_v2_shared_irq_test),
+	{}
+};
+
+static struct kunit_suite apple_dart_t8110_v2_test_suite = {
+	.name = "apple-dart-t8110-v2",
+	.test_cases = apple_dart_t8110_v2_test_cases,
+};
+
+kunit_test_suite(apple_dart_t8110_v2_test_suite);
+#endif
 
 static struct platform_driver apple_dart_driver = {
 	.driver	= {
