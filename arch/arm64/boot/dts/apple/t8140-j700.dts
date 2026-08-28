@@ -16,6 +16,7 @@
 
 	aliases {
 		atcphy0 = &atcphy0;
+		dcp = &dcp;
 		dcp0 = &dcp;
 		disp0 = &display;
 		disp0_piodma = &disp0_piodma;
@@ -69,6 +70,23 @@
 &dcp {
 	clocks = <&clk_disp0_154>, <&clk_disp0_194>;
 	clock-names = "clock-154", "clock-194";
+	status = "okay";
+};
+
+&dcp_dart {
+	status = "okay";
+};
+
+&dcp_mbox {
+	status = "okay";
+};
+
+&disp0_dart {
+	status = "okay";
+};
+
+&display {
+	status = "okay";
 };
 
 /*
