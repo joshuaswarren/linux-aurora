@@ -229,23 +229,53 @@ fn publish_g17p_crashlog(
 fn capture_g17p_firmware_crash_dva(state: &G17PRoleRtkitState) -> Result {
     let buffer = state.processor.firmware_crash_buffer();
     let captured_size = bounded_crashlog_size(buffer.size);
-    // AGXASC reads endpoint-1 buffers through UAT context 0 after masking
-    // the RTKit envelope DVA to 40 bits. The active render VM is context 1
-    // and cannot own this firmware-preallocated buffer.
-    let root = state.firmware_contexts.context0_root().ok_or(EFAULT)?;
-    let crashlog = root.copy_firmware_range(
-        g17p_rtkit_uat_address(buffer.dva),
-        captured_size,
-    )?;
-    dev_info!(
-        state.dev.as_ref(),
-        "G17P {} crashlog copied through live context-0 root {:#x} VA {:#x} ({} bytes)\n",
-        state.processor.name(),
-        root.ttb(),
-        g17p_rtkit_uat_address(buffer.dva),
-        crashlog.len()
-    );
-    publish_g17p_crashlog(state, buffer.size, &crashlog)
+    let low40 = g17p_rtkit_uat_address(buffer.dva);
+    let candidates = [
+        (0usize, low40),
+        (0usize, buffer.dva),
+        (1usize, low40),
+        (1usize, buffer.dva),
+    ];
+    let mut last_error = EFAULT;
+
+    for (slot, address) in candidates {
+        let Some(root) = state.firmware_contexts.context_root(slot) else {
+            dev_info!(
+                state.dev.as_ref(),
+                "G17P {} crashlog probe context {} has no live lower root\n",
+                state.processor.name(),
+                slot
+            );
+            continue;
+        };
+        match root.copy_firmware_range(address, captured_size) {
+            Ok(crashlog) => {
+                dev_info!(
+                    state.dev.as_ref(),
+                    "G17P {} crashlog copied through context {} root {:#x} VA {:#x} ({} bytes)\n",
+                    state.processor.name(),
+                    slot,
+                    root.ttb(),
+                    address,
+                    crashlog.len()
+                );
+                return publish_g17p_crashlog(state, buffer.size, &crashlog);
+            }
+            Err(error) => {
+                dev_info!(
+                    state.dev.as_ref(),
+                    "G17P {} crashlog probe context {} root {:#x} VA {:#x} missed ({:?})\n",
+                    state.processor.name(),
+                    slot,
+                    root.ttb(),
+                    address,
+                    error
+                );
+                last_error = error;
+            }
+        }
+    }
+    Err(last_error)
 }
 
 /// Active G17P boot does not ask Rust to back system-endpoint buffers. The

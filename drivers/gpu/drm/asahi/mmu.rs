@@ -226,10 +226,17 @@ impl Clone for FirmwareContextTableReader {
 }
 
 impl FirmwareContextTableReader {
-    pub(crate) fn context0_root(&self) -> Option<FirmwarePageTableRoot> {
+    pub(crate) fn context_root(&self, slot: usize) -> Option<FirmwarePageTableRoot> {
+        if slot >= UAT_NUM_CTX {
+            return None;
+        }
         let shared = self.inner.lock();
-        decode_firmware_ttb_root(shared.ttbs()[0].ttb0.load(Ordering::Acquire), self.cfg)
+        decode_firmware_ttb_root(shared.ttbs()[slot].ttb0.load(Ordering::Acquire), self.cfg)
             .map(|ttb| FirmwarePageTableRoot { ttb, cfg: self.cfg })
+    }
+
+    pub(crate) fn context0_root(&self) -> Option<FirmwarePageTableRoot> {
+        self.context_root(0)
     }
 }
 
