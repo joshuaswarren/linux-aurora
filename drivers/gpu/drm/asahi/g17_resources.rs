@@ -438,13 +438,7 @@ pub(crate) struct G17PControlCounters {
 }
 
 impl G17PControlCounters {
-    pub(crate) fn opening_staged(self) -> bool {
-        self.primary == [0, 0, g17_initdata::CONTROL_OPENING_PRIMARY_PRODUCER]
-            && self.secondary
-                == [0, 0, g17_initdata::CONTROL_OPENING_SECONDARY_PRODUCER]
-    }
-
-    pub(crate) fn opening_retired(self) -> bool {
+    pub(crate) fn opening_presented(self) -> bool {
         self.primary == [g17_initdata::CONTROL_OPENING_PRIMARY_PRODUCER; 3]
             && self.secondary == [g17_initdata::CONTROL_OPENING_SECONDARY_PRODUCER; 3]
     }
@@ -2729,7 +2723,7 @@ impl G17ResourceOwner {
             FWCTL_SIZE,
             mmu::PROT_FW_SHARED_RW,
         )?;
-        let mut control_shared = map_fixed_object(
+        let mut control_shared = map_fixed_wc_object(
             dev,
             address_space.uat.kernel_vm(),
             "control-shared",
@@ -2740,7 +2734,7 @@ impl G17ResourceOwner {
         control_shared.with_bytes_mut(|bytes| {
             g17_initdata::encode_control_shared(bytes).map_err(|_| EINVAL)
         })?;
-        let mut control_shared_inner = map_fixed_object(
+        let mut control_shared_inner = map_fixed_wc_object(
             dev,
             address_space.uat.kernel_vm(),
             "control-shared-inner",
@@ -2750,7 +2744,7 @@ impl G17ResourceOwner {
         )?;
         control_shared_inner.with_bytes_mut(|bytes| {
             bytes.fill(0);
-            bytes[..8].copy_from_slice(&1u64.to_le_bytes());
+            bytes[..4].copy_from_slice(&2u32.to_le_bytes());
             Ok(())
         })?;
         let mut control_operand_table = match RenderBackingObject::new(
@@ -3214,15 +3208,15 @@ impl G17ResourceOwner {
             &primary_region_views,
         )?;
         roots.write_roots(&shared, &primary_instance, &secondary_instance)?;
-        // Publish both opening producers after the rings and descriptor graph.
-        // Firmware owns the two consumer cursors until CONTROL_START.
+        // The working first-render checkpoint presents both opening prefixes
+        // as already consumed before initdata is handed to firmware.
         write_control_counters(
             &mut primary_state,
-            [0, 0, g17_initdata::CONTROL_OPENING_PRIMARY_PRODUCER],
+            [g17_initdata::CONTROL_OPENING_PRIMARY_PRODUCER; 3],
         )?;
         write_control_counters(
             &mut secondary_state,
-            [0, 0, g17_initdata::CONTROL_OPENING_SECONDARY_PRODUCER],
+            [g17_initdata::CONTROL_OPENING_SECONDARY_PRODUCER; 3],
         )?;
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         dev_info!(dev.as_ref(), "G17P resources: firmware layout ready\n");
@@ -3293,7 +3287,7 @@ impl G17ResourceOwner {
     /// Restore the source-built class-1 closure before publishing live
     /// compute-control records.
     pub(crate) fn prepare_compute_runtime_class1(&mut self) -> Result {
-        if !self.control_counters()?.opening_retired() {
+        if !self.control_counters()?.opening_presented() {
             return Err(EINVAL);
         }
         self.resources.compute_runtime_support.with_bytes_mut(|bytes| {
@@ -3523,7 +3517,7 @@ impl G17ResourceOwner {
             .control_shared_inner
             .with_bytes_mut(|bytes| {
                 bytes.fill(0);
-                bytes[..8].copy_from_slice(&1u64.to_le_bytes());
+                bytes[..4].copy_from_slice(&2u32.to_le_bytes());
                 Ok(())
             })?;
         self.resources
@@ -3645,11 +3639,11 @@ impl G17ResourceOwner {
             .write_roots(&shared, &primary.instance, &secondary.instance)?;
         write_control_counters(
             &mut self.resources.primary_state,
-            [0, 0, g17_initdata::CONTROL_OPENING_PRIMARY_PRODUCER],
+            [g17_initdata::CONTROL_OPENING_PRIMARY_PRODUCER; 3],
         )?;
         write_control_counters(
             &mut self.resources.secondary_state,
-            [0, 0, g17_initdata::CONTROL_OPENING_SECONDARY_PRODUCER],
+            [g17_initdata::CONTROL_OPENING_SECONDARY_PRODUCER; 3],
         )?;
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         Ok(())
@@ -4732,38 +4726,29 @@ mod tests {
 
     #[test]
     fn control_opening_requires_all_six_exact_counter_values() {
-        let staged = G17PControlCounters {
-            primary: [0, 0, 4],
-            secondary: [0, 0, 16],
+        let presented = G17PControlCounters {
+            primary: [2, 2, 2],
+            secondary: [1, 1, 1],
         };
-        assert!(staged.opening_staged());
-        assert!(!staged.opening_retired());
-
-        let retired = G17PControlCounters {
-            primary: [4, 4, 4],
-            secondary: [16, 16, 16],
-        };
-        assert!(retired.opening_retired());
-        assert!(!retired.opening_staged());
+        assert!(presented.opening_presented());
 
         for primary_index in 0..3 {
-            let mut current = retired;
+            let mut current = presented;
             current.primary[primary_index] -= 1;
-            assert!(!current.opening_retired());
+            assert!(!current.opening_presented());
         }
         for secondary_index in 0..3 {
-            let mut current = retired;
+            let mut current = presented;
             current.secondary[secondary_index] -= 1;
-            assert!(!current.opening_retired());
+            assert!(!current.opening_presented());
         }
 
         let runtime = G17PControlCounters {
-            primary: [69, 69, 69],
-            secondary: [16, 16, 16],
+            primary: [67, 67, 67],
+            secondary: [1, 1, 1],
         };
         assert!(runtime.compute_runtime_ready());
-        assert!(!runtime.opening_staged());
-        assert!(!runtime.opening_retired());
+        assert!(!runtime.opening_presented());
     }
 
     fn valid_handoff() -> G17ResourceHandoff {

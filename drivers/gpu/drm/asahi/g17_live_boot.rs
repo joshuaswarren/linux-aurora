@@ -413,19 +413,19 @@ fn finish_boot_session(
     gfx1_state: Arc<G17PRoleRtkitState>,
     gfx1_rtkit: rtkit::RtKit<G17PRtkitOps>,
 ) -> Result<G17PBootedSession> {
-    let staged = manager.control_counters()?;
-    if !staged.opening_staged() {
+    let presented = manager.control_counters()?;
+    if !presented.opening_presented() {
         dev_err!(
             pdev.as_ref(),
-            "G17P control: staged counters are {:?}/{:?}, expected [0, 0, 4]/[0, 0, 16]\n",
-            staged.primary,
-            staged.secondary
+            "G17P control: presented counters are {:?}/{:?}, expected [2, 2, 2]/[1, 1, 1]\n",
+            presented.primary,
+            presented.secondary
         );
         return Err(EIO);
     }
     dev_info!(
         pdev.as_ref(),
-        "G17P control: 4 primary and 16 secondary records staged\n"
+        "G17P control: source-presented 2-primary/1-secondary checkpoint ready\n"
     );
 
     let control_start = (CONTROL_START_TYPE as u64) << 48;
@@ -435,29 +435,19 @@ fn finish_boot_session(
     Pin::new(&mut gfx1_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, control_start)?;
     dev_info!(pdev.as_ref(), "G17P control: both start messages sent\n");
 
-    let mut counters = staged;
-    for _ in 0..CONTROL_COUNTER_POLLS {
-        counters = manager.control_counters()?;
-        if counters.opening_retired() {
-            break;
-        }
-        if gfx_state.crashed.load(Ordering::Acquire) || gfx1_state.crashed.load(Ordering::Acquire) {
-            return Err(EIO);
-        }
-        fsleep(Delta::from_millis(1));
-    }
-    if !counters.opening_retired() {
+    let counters = manager.control_counters()?;
+    if !counters.opening_presented() {
         dev_err!(
             pdev.as_ref(),
-            "G17P control: counters stopped at {:?}/{:?}, expected [4, 4, 4]/[16, 16, 16]\n",
+            "G17P control: counters changed after start to {:?}/{:?}, expected [2, 2, 2]/[1, 1, 1]\n",
             counters.primary,
             counters.secondary
         );
-        return Err(ETIMEDOUT);
+        return Err(EIO);
     }
     dev_info!(
         pdev.as_ref(),
-        "G17P control: counters retired at [4, 4, 4]/[16, 16, 16]\n"
+        "G17P control: presented counters remain [2, 2, 2]/[1, 1, 1]\n"
     );
 
     let control_done = ((CONTROL_DONE_TYPE as u64) << 48) | CONTROL_DONE_CHANNEL;
@@ -575,7 +565,7 @@ fn finish_boot_session(
         {
             dev_err!(
                 pdev.as_ref(),
-                "G17P compute control: record {} stopped at {:?}/{:?}, expected [{}, {}, {}]/[16, 16, 16]\n",
+                "G17P compute control: record {} stopped at {:?}/{:?}, expected [{}, {}, {}]/[1, 1, 1]\n",
                 index,
                 counters.primary,
                 counters.secondary,
@@ -588,12 +578,12 @@ fn finish_boot_session(
         if index == 53 {
             dev_info!(
                 pdev.as_ref(),
-                "G17P compute control: ticks 0..53 retired at 58\n"
+                "G17P compute control: ticks 0..53 retired at 56\n"
             );
         } else if index == 56 {
             dev_info!(
                 pdev.as_ref(),
-                "G17P compute control: class-1 sequence 54 retired at 61\n"
+                "G17P compute control: class-1 sequence 54 retired at 59\n"
             );
         }
     }
@@ -604,7 +594,7 @@ fn finish_boot_session(
     manager.rewrite_compute_dispatch_record()?;
     dev_info!(
         pdev.as_ref(),
-        "G17P compute control: live tail retired at [69, 69, 69]/[16, 16, 16]\n"
+        "G17P compute control: live tail retired at [67, 67, 67]/[1, 1, 1]\n"
     );
 
     let queue = manager.configure_g17p_compute_queue(drm, registers)?;
