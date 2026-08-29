@@ -53,7 +53,7 @@ bool dcp_crtc_mode_fixup(struct drm_crtc *crtc,
 			 const struct drm_display_mode *mode,
 			 struct drm_display_mode *adjusted_mode);
 void dcp_set_dimensions(struct apple_dcp *dcp);
-void dcp_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message);
+int dcp_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message);
 int dcp_send_message_sync(struct apple_dcp *dcp, u8 endpoint, u64 message);
 int dcp_try_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message,
 			 u32 *control);

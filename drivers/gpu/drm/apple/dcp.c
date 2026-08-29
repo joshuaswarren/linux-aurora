@@ -469,6 +469,7 @@ static int dcp_rtk_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
 		 */
 		if (bfr == &dcp->rtk->crashlog_buffer) {
 			u64 ack;
+			int ret;
 
 			if (bfr->size < SZ_1M)
 				ack = BIT_ULL(54) | BIT_ULL(52) |
@@ -478,10 +479,10 @@ static int dcp_rtk_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
 				ack = BIT_ULL(54) | BIT_ULL(53) |
 				      FIELD_PREP(GENMASK_ULL(51, 44),
 						 DIV_ROUND_UP(bfr->size, SZ_1M));
-			dcp_send_message(dcp, DCP_RTKIT_EP_CRASHLOG, ack);
+			ret = dcp_send_message(dcp, DCP_RTKIT_EP_CRASHLOG, ack);
 			dev_info(dcp->dev,
-				 "acked firmware crashlog buffer request %#llx\n",
-				 ack);
+				 "DCP25G83_EP1_ACK_RESULT ack %#llx result %d\n",
+				 ack, ret);
 		}
 	} else {
 		bfr->buffer = dma_alloc_coherent(dcp->dev, bfr->size,
@@ -513,11 +514,11 @@ static struct apple_rtkit_ops rtkit_ops = {
 	.shmem_destroy = dcp_rtk_shmem_destroy,
 };
 
-void dcp_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message)
+int dcp_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message)
 {
 	trace_dcp_send_msg(dcp, endpoint, message);
-	apple_rtkit_send_message(dcp->rtk, endpoint, message, NULL,
-				 true);
+	return apple_rtkit_send_message(dcp->rtk, endpoint, message, NULL,
+					true);
 }
 
 int dcp_send_message_sync(struct apple_dcp *dcp, u8 endpoint, u64 message)
