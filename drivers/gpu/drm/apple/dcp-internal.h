@@ -198,7 +198,6 @@ struct apple_dcp {
 	bool link_endpoint_started;
 	struct work_struct link_service_match_work;
 	unsigned long link_service_match_state;
-	u8 link_service_tail_d563_count;
 
 	/* Display registers mappable to the DCP */
 	struct resource *disp_registers[MAX_DISP_REGISTERS];

@@ -391,12 +391,22 @@ static int dcp_link_push_context(struct apple_dcp *dcp,
 			 old_top, next_top, depth, call_tag, in_len, out_len);
 	}
 	ret = dcp_send_message_sync(dcp, APPLE_DCP_LINK_ENDPOINT, message);
-	if (call_tag == APPLE_DCP_H17P_CALL_PMU_SERVICE_MATCHED ||
+	if (call_tag == APPLE_DCP_H17P_CALL_VI_SET_TEMPERATURE_HINT ||
+	    call_tag == APPLE_DCP_H17P_CALL_PMU_SERVICE_MATCHED ||
 	    call_tag == APPLE_DCP_H17P_CALL_BACKLIGHT_SERVICE_MATCHED)
 		dev_info(dcp->dev,
-			 "DCPLink %.4s TX %#llx base %#x offset %#x size %#x depth %u mailbox result %d\n",
-			 call->tag, message, layout.local_offset, offset,
-			 payload_size, depth, ret);
+			 "DCPLink %.4s TX endpoint %#x word %#llx channel %s stream %u remote %u new %u local base %#x remote base %#x offset %#x size %#x top %#x->%#x depth %u mailbox result %d\n",
+			 call->tag, APPLE_DCP_LINK_ENDPOINT, message,
+			 stream == 1 ? (remote ? "oobcb" : "oobcmd") :
+				       (remote ? "cb" : "cmd"),
+			 stream, remote, new_stream, layout.local_offset,
+			 layout.remote_offset, offset, payload_size, old_top,
+			 next_top, depth, ret);
+	if (call_tag == APPLE_DCP_H17P_CALL_VI_SET_TEMPERATURE_HINT ||
+	    call_tag == APPLE_DCP_H17P_CALL_PMU_SERVICE_MATCHED ||
+	    call_tag == APPLE_DCP_H17P_CALL_BACKLIGHT_SERVICE_MATCHED)
+		dev_info(dcp->dev, "DCPLink %.4s request stack %*phN\n",
+			 call->tag, min_t(u32, payload_size, 32), header);
 	if (ret) {
 		dev_err(dcp->dev,
 			"DCPLink %.4s mailbox send failed: %d\n", call->tag, ret);
@@ -453,12 +463,10 @@ enum dcp_link_service_match_bit {
 	DCP_LINK_SERVICE_MATCH_PMU,
 	DCP_LINK_SERVICE_MATCH_BACKLIGHT,
 	DCP_LINK_SERVICE_MATCH_INFLIGHT,
-	DCP_LINK_SERVICE_MATCH_TAIL_ARMED,
-	DCP_LINK_SERVICE_MATCH_READY,
+	DCP_LINK_SERVICE_MATCH_CALLER_IDLE,
 };
 
 #define DCP_LINK_SERVICE_NOTIFY_RETRIES 512
-#define DCP_LINK_SERVICE_TAIL_D563_COUNT 5
 
 static bool dcp_link_service_notifier_pending(struct apple_dcp *dcp)
 {
@@ -474,7 +482,7 @@ static bool dcp_link_service_match_runnable(struct apple_dcp *dcp)
 		     &dcp->link_service_match_state))
 		return true;
 
-	return test_bit(DCP_LINK_SERVICE_MATCH_READY,
+	return test_bit(DCP_LINK_SERVICE_MATCH_CALLER_IDLE,
 			&dcp->link_service_match_state) &&
 	       dcp_link_service_notifier_pending(dcp);
 }
@@ -590,13 +598,13 @@ static void dcp_link_service_match_work(struct work_struct *work)
 			       &dcp->link_service_match_state)) {
 		call = &dcp_link_temperature_hint;
 		complete = dcp_link_temperature_hint_complete;
-	} else if (test_bit(DCP_LINK_SERVICE_MATCH_READY,
+	} else if (test_bit(DCP_LINK_SERVICE_MATCH_CALLER_IDLE,
 			    &dcp->link_service_match_state) &&
 		   test_and_clear_bit(DCP_LINK_SERVICE_MATCH_PMU,
 				      &dcp->link_service_match_state)) {
 		call = &dcp_link_pmu_service_matched;
 		complete = dcp_link_service_match_complete;
-	} else if (test_bit(DCP_LINK_SERVICE_MATCH_READY,
+	} else if (test_bit(DCP_LINK_SERVICE_MATCH_CALLER_IDLE,
 			    &dcp->link_service_match_state) &&
 		   test_and_clear_bit(DCP_LINK_SERVICE_MATCH_BACKLIGHT,
 				      &dcp->link_service_match_state)) {
@@ -639,42 +647,9 @@ static void dcp_link_queue_service_match(struct apple_dcp *dcp, int tag)
 		return;
 
 	if (tag == 100 ||
-	    test_bit(DCP_LINK_SERVICE_MATCH_READY,
+	    test_bit(DCP_LINK_SERVICE_MATCH_CALLER_IDLE,
 		     &dcp->link_service_match_state))
 		schedule_work(&dcp->link_service_match_work);
-}
-
-static void dcp_link_service_match_callback_done(struct apple_dcp *dcp,
-						 int tag)
-{
-	if (tag == 300 && dcp_link_service_notifier_pending(dcp) &&
-	    !test_bit(DCP_LINK_SERVICE_MATCH_READY,
-		      &dcp->link_service_match_state)) {
-		dcp->link_service_tail_d563_count = 0;
-		set_bit(DCP_LINK_SERVICE_MATCH_TAIL_ARMED,
-			&dcp->link_service_match_state);
-		dev_info(dcp->dev,
-			 "DCPLink startup property tail armed after D300\n");
-		return;
-	}
-
-	if (tag != 563 ||
-	    !test_bit(DCP_LINK_SERVICE_MATCH_TAIL_ARMED,
-		      &dcp->link_service_match_state))
-		return;
-
-	dcp->link_service_tail_d563_count++;
-	if (dcp->link_service_tail_d563_count !=
-	    DCP_LINK_SERVICE_TAIL_D563_COUNT)
-		return;
-
-	clear_bit(DCP_LINK_SERVICE_MATCH_TAIL_ARMED,
-		  &dcp->link_service_match_state);
-	set_bit(DCP_LINK_SERVICE_MATCH_READY,
-		&dcp->link_service_match_state);
-	dev_info(dcp->dev,
-		 "DCPLink startup property tail complete; queueing A131/A132\n");
-	schedule_work(&dcp->link_service_match_work);
 }
 
 bool dcp_link_defer_service_match(struct apple_dcp *dcp, int tag, void *out,
@@ -806,6 +781,15 @@ static void dcp_link_handle_reply(struct apple_dcp *dcp, u64 message)
 	ch->cookies[depth] = NULL;
 	ch->link_message[depth] = 0;
 	ch->link_size[depth] = 0;
+	if (request_call == APPLE_DCP_H17P_CALL_START_SIGNAL) {
+		set_bit(DCP_LINK_SERVICE_MATCH_CALLER_IDLE,
+			&dcp->link_service_match_state);
+		dev_info(dcp->dev,
+			 "DCPLink A401 reply released caller gate: endpoint %#x request %#llx reply %#llx stream %u remote %u\n",
+			 APPLE_DCP_LINK_ENDPOINT, request, message, stream, remote);
+		if (dcp_link_service_notifier_pending(dcp))
+			schedule_work(&dcp->link_service_match_work);
+	}
 	if (cb && request_call == APPLE_DCP_H17P_CALL_START_SIGNAL)
 		dev_info(dcp->dev,
 			 "DCPLink A401 invoking completion %ps output %4phN\n",
@@ -948,12 +932,10 @@ static void dcp_link_handle_callback(struct apple_dcp *dcp, u64 message)
 				 sequence, tag, reply, ack_ret);
 		if (!ack_ret && (tag == 206 || tag == 207)) {
 			dev_info(dcp->dev,
-				 "DCPLink D%03d ACKed; service notifier pending until startup property tail\n",
+				 "DCPLink D%03d ACKed; service notifier queued behind A401 caller gate\n",
 				 tag);
 			dcp_link_queue_service_match(dcp, tag);
 		}
-		if (!ack_ret)
-			dcp_link_service_match_callback_done(dcp, tag);
 	}
 }
 
@@ -1056,7 +1038,6 @@ static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 
 	INIT_WORK(&dcp->link_service_match_work, dcp_link_service_match_work);
 	dcp->link_service_match_state = 0;
-	dcp->link_service_tail_d563_count = 0;
 
 	if (dcp->adopted_session) {
 		struct iommu_domain *domain;
