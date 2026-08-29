@@ -334,12 +334,20 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 	strscpy(name, payload, sizeof(name));
 
 	/*
-	 * in DCP firmware 13.2 DCP reports interface-name as name which starts
-	 * with "dispext%d" using -1 s ID for "dcp". In the 12.3 firmware
-	 * EPICProviderClass was used. If the init call has props parse them and
-	 * use EPICProviderClass to match the service.
+	 * AFKEPV2 PublishReport keeps the fixed 32-byte name followed by an
+	 * inline binary OSSerialize dictionary. AppleFirmwareKit optionally
+	 * reads "name" or "interface-name" from that dictionary and otherwise
+	 * uses the fixed name; it does not require the legacy EPIC triplet.
 	 */
-	if (props_size > 36) {
+	if (ep->dcp->fw_compat == DCP_FIRMWARE_H17P) {
+		service_name = name;
+	} else if (props_size > 36) {
+		/*
+		 * In DCP firmware 13.2 DCP reports interface-name as name which
+		 * starts with "dispext%d" using -1 as the ID for "dcp". In the
+		 * 12.3 firmware EPICProviderClass was used. Parse the properties
+		 * and use EPICProviderClass to match the service.
+		 */
 		int ret = parse(props, props_size, &ctx);
 		if (ret) {
 			dev_err(ep->dcp->dev,
