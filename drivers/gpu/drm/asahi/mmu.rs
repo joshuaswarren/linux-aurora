@@ -171,6 +171,43 @@ pub(crate) struct T8140PrimaryRootSnapshot {
     entries: [u64; T8140_FIRMWARE_SHARED_ROOT_ENTRIES],
 }
 
+/// Read-only descriptor for the context-0 lower root left by the boot
+/// firmware. G17P advertises its preallocated RTKit crash buffers through
+/// this tree before Linux replaces the live TTBAT entry with its own root.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct FirmwarePageTableRoot {
+    ttb: PhysicalAddr,
+    cfg: UatConfig,
+}
+
+impl FirmwarePageTableRoot {
+    #[cfg(CONFIG_DEV_COREDUMP)]
+    pub(crate) fn copy_firmware_range(&self, address: u64, size: usize) -> Result<KVVec<u8>> {
+        if size == 0 {
+            return Err(EINVAL);
+        }
+        let geometry = uat_geometry(self.cfg)?;
+        let mut data = KVVec::from_elem(0, size, GFP_KERNEL)?;
+        let mut table = UatPageTable::new_borrowed_reader(
+            self.ttb,
+            0..geometry.user_va_top(),
+            self.cfg.ias,
+            self.cfg.oas,
+        )?;
+        table.copy_mapped_range(address, &mut data)?;
+        Ok(data)
+    }
+}
+
+fn decode_firmware_ttb_root(raw: u64, cfg: UatConfig) -> Option<PhysicalAddr> {
+    if raw & TTBR_VALID == 0 {
+        return None;
+    }
+    let physical_mask = (1u64 << cfg.oas) - 1;
+    let root = raw & physical_mask & !(UAT_PGMSK as u64);
+    (root != 0).then_some(root)
+}
+
 fn clear_stale_host_root_entries(root: &mut [u64]) {
     if root.len() > T8140_FIRMWARE_SHARED_ROOT_ENTRIES {
         root[T8140_FIRMWARE_SHARED_ROOT_ENTRIES..].fill(0);
@@ -1117,6 +1154,7 @@ pub(crate) struct Uat {
 
     kernel_vm: Vm,
     kernel_lower_vm: Vm,
+    t8140_firmware_context0_root: Option<FirmwarePageTableRoot>,
     t8140_secondary_ttb1: Option<u64>,
     t8140_empty_high_roots: Option<[Vm; 2]>,
     t8140_context_phase: AtomicU8,
@@ -1445,18 +1483,6 @@ impl Vm {
             .page_table
             .covers_range(start..aligned_end, need_read, need_write)
             .unwrap_or(false)
-    }
-
-    /// Copy a bounded firmware-owned range from this VM into ordinary memory.
-    #[cfg(CONFIG_DEV_COREDUMP)]
-    pub(crate) fn copy_firmware_range(&self, address: u64, size: usize) -> Result<KVVec<u8>> {
-        if size == 0 {
-            return Err(EINVAL);
-        }
-        let mut data = KVVec::from_elem(0, size, GFP_KERNEL)?;
-        let mut inner = self.inner.exec_lock(None, false)?;
-        inner.page_table.copy_mapped_range(address, &mut data)?;
-        Ok(data)
     }
 
     /// Map a GEM object (using its `SGTable`) into this Vm at a free address in a given range.
@@ -1865,6 +1891,12 @@ impl Uat {
     /// Returns a reference to the local kernel (lower half) `Vm`
     pub(crate) fn kernel_lower_vm(&self) -> &Vm {
         &self.kernel_lower_vm
+    }
+
+    /// Return the boot-firmware context-0 lower root retained before Linux
+    /// installs its own TTB0. This reader never owns or mutates that tree.
+    pub(crate) fn firmware_context0_root(&self) -> Option<FirmwarePageTableRoot> {
+        self.t8140_firmware_context0_root
     }
 
     /// Return the kernel-half VA range owned by this UAT.
@@ -2450,6 +2482,27 @@ impl Uat {
 
         let inner = Self::make_inner(dev, handoff_mode)?;
 
+        let t8140_firmware_context0_root = if cfg == UatConfig::T8140 {
+            let shared = inner.lock();
+            decode_firmware_ttb_root(shared.ttbs()[0].ttb0.load(Ordering::Acquire), cfg).map(
+                |ttb| FirmwarePageTableRoot { ttb, cfg },
+            )
+        } else {
+            None
+        };
+        if let Some(root) = t8140_firmware_context0_root {
+            dev_info!(
+                dev.as_ref(),
+                "MMU: preserved boot context-0 root {:#x} for firmware crashlog reads\n",
+                root.ttb
+            );
+        } else if cfg == UatConfig::T8140 {
+            dev_info!(
+                dev.as_ref(),
+                "MMU: boot context-0 root was not populated before Linux takeover\n"
+            );
+        }
+
         let of_node = dev.as_ref().of_node().ok_or(EINVAL)?;
         let res = of_node.reserved_mem_region_to_resource_byname(c_str!("pagetables"))?;
         let ttb1 = res.start();
@@ -2510,6 +2563,7 @@ impl Uat {
             cfg,
             kernel_vm,
             kernel_lower_vm,
+            t8140_firmware_context0_root,
             t8140_secondary_ttb1: if cfg == UatConfig::T8140 {
                 Some(ttb1 + T8140_SECONDARY_SHARED_ROOT_DELTA)
             } else {
@@ -2623,5 +2677,15 @@ mod tests {
             oas: 42,
         };
         assert_eq!(lower_vm_start(legacy, true), IOVA_USER_BASE);
+    }
+
+    #[test]
+    fn firmware_ttb_root_decoder_strips_asid_and_control_bits() {
+        let cfg = UatConfig::T8140;
+        let root = 0x101_abc0_0000;
+        let raw = root | TTBR_VALID | (0x2au64 << TTBR_ASID_SHIFT);
+        assert_eq!(decode_firmware_ttb_root(raw, cfg), Some(root));
+        assert_eq!(decode_firmware_ttb_root(raw & !TTBR_VALID, cfg), None);
+        assert_eq!(decode_firmware_ttb_root(TTBR_VALID, cfg), None);
     }
 }
