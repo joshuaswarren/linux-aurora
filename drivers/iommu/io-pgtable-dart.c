@@ -552,6 +552,81 @@ int io_pgtable_apple_dart_import(struct io_pgtable_ops *ops,
 }
 EXPORT_SYMBOL_GPL(io_pgtable_apple_dart_import);
 
+int io_pgtable_apple_dart_reconcile(struct io_pgtable_ops *ops,
+				    unsigned long iova, phys_addr_t paddr,
+				    size_t size, int prot,
+				    struct io_pgtable_apple_dart_reconcile *result)
+{
+	struct dart_io_pgtable *data = io_pgtable_ops_to_data(ops);
+	size_t pgsize = data->iop.cfg.pgsize_bitmap;
+	unsigned int changed = 0;
+	dart_iopte first_before = 0, first_after = 0;
+	unsigned long last_iova;
+	phys_addr_t last_paddr;
+	size_t offset;
+
+	if (!result || data->iop.fmt != APPLE_DART2 || !size ||
+	    !IS_ALIGNED(iova, pgsize) || !IS_ALIGNED(paddr, pgsize) ||
+	    !IS_ALIGNED(size, pgsize) ||
+	    !(prot & (IOMMU_READ | IOMMU_WRITE)))
+		return -EINVAL;
+	if (check_add_overflow(iova, size - 1, &last_iova) ||
+	    check_add_overflow(paddr, size - 1, &last_paddr))
+		return -EOVERFLOW;
+
+	/* Verify the complete inherited extent before changing any permissions. */
+	for (offset = 0; offset < size; offset += pgsize) {
+		unsigned long page_iova = iova + offset;
+		phys_addr_t page_paddr = paddr + offset;
+		dart_iopte *ptep = dart_get_last(data, page_iova);
+		dart_iopte before;
+
+		if (!ptep)
+			return -ENOENT;
+		ptep += dart_get_last_index(data, page_iova);
+		before = READ_ONCE(*ptep);
+		if (!(before & APPLE_DART_PTE_VALID))
+			return -ENOENT;
+		if (iopte_to_paddr(before, data) != page_paddr)
+			return -EFAULT;
+
+		if (!offset)
+			first_before = before;
+	}
+
+	for (offset = 0; offset < size; offset += pgsize) {
+		unsigned long page_iova = iova + offset;
+		dart_iopte *ptep = dart_get_last(data, page_iova);
+		dart_iopte before, after;
+
+		ptep += dart_get_last_index(data, page_iova);
+		before = READ_ONCE(*ptep);
+		after = before;
+
+		if (prot & IOMMU_READ)
+			after &= ~APPLE_DART2_PTE_PROT_NO_READ;
+		if (prot & IOMMU_WRITE)
+			after &= ~APPLE_DART2_PTE_PROT_NO_WRITE;
+
+		if (!offset)
+			first_after = after;
+		if (after != before) {
+			WRITE_ONCE(*ptep, after);
+			changed++;
+		}
+	}
+
+	if (changed)
+		dma_wmb();
+	*result = (struct io_pgtable_apple_dart_reconcile) {
+		.first_pte_before = first_before,
+		.first_pte_after = first_after,
+		.changed = changed,
+	};
+	return 0;
+}
+EXPORT_SYMBOL_GPL(io_pgtable_apple_dart_reconcile);
+
 #if IS_ENABLED(CONFIG_APPLE_DART_KUNIT_TEST)
 static void apple_dart_free_pgtable(struct io_pgtable *iop);
 
@@ -584,8 +659,10 @@ static void apple_dart_locked_import_preserves_boot_mappings_test(struct kunit *
 	struct io_pgtable *iop;
 	struct dart_io_pgtable *data;
 	dart_iopte *src_root, *src_low, *src_high, *saved_root, *ptep;
-	dart_iopte root_low, root_high, fault_leaf;
+	dart_iopte root_low, root_high, fault_leaf, reconciled_leaf;
+	struct io_pgtable_apple_dart_reconcile reconcile;
 	phys_addr_t translated, expected_fault_pa;
+	unsigned long fault_page_iova;
 	int low_idx, high_idx, fault_idx, ret;
 
 	iop = apple_dart_alloc_pgtable(&cfg, NULL);
@@ -603,6 +680,7 @@ static void apple_dart_locked_import_preserves_boot_mappings_test(struct kunit *
 	low_idx = dart_get_index(data, region94_iova, data->levels - 1);
 	high_idx = dart_get_index(data, fault_iova, data->levels - 1);
 	fault_idx = dart_get_last_index(data, fault_iova);
+	fault_page_iova = fault_iova & ~(SZ_16K - 1);
 	expected_fault_pa = fault_page_pa | (fault_iova & (SZ_16K - 1));
 	KUNIT_ASSERT_NE(test, low_idx, high_idx);
 
@@ -621,7 +699,8 @@ static void apple_dart_locked_import_preserves_boot_mappings_test(struct kunit *
 		apple_dart_test_leaf(data, region95_pa, rw);
 	src_low[dart_get_last_index(data, framebuffer_iova)] =
 		apple_dart_test_leaf(data, framebuffer_pa, rw);
-	fault_leaf = apple_dart_test_leaf(data, fault_page_pa, rw);
+	/* iBoot may leave the live framebuffer readable but not writable. */
+	fault_leaf = apple_dart_test_leaf(data, fault_page_pa, IOMMU_READ);
 	src_high[fault_idx] = fault_leaf;
 
 	ret = io_pgtable_apple_dart_import(&iop->ops, 0, __pa(src_root));
@@ -637,8 +716,30 @@ static void apple_dart_locked_import_preserves_boot_mappings_test(struct kunit *
 
 	ptep = dart_get_last(data, fault_iova) + fault_idx;
 	KUNIT_EXPECT_EQ(test, READ_ONCE(*ptep), fault_leaf);
-	KUNIT_EXPECT_FALSE(test, *ptep & APPLE_DART2_PTE_PROT_NO_WRITE);
+	KUNIT_EXPECT_TRUE(test, *ptep & APPLE_DART2_PTE_PROT_NO_WRITE);
 	KUNIT_EXPECT_FALSE(test, *ptep & APPLE_DART2_PTE_PROT_NO_READ);
+
+	/* A translated reservation may widen access, but never change its PA. */
+	ret = io_pgtable_apple_dart_reconcile(&iop->ops, fault_page_iova,
+					      fault_page_pa + SZ_16K, SZ_16K,
+					      rw, &reconcile);
+	KUNIT_EXPECT_EQ(test, ret, -EFAULT);
+	KUNIT_EXPECT_EQ(test, READ_ONCE(*ptep), fault_leaf);
+
+	ret = io_pgtable_apple_dart_reconcile(&iop->ops, fault_page_iova,
+					      fault_page_pa, SZ_16K, rw,
+					      &reconcile);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	reconciled_leaf = fault_leaf & ~APPLE_DART2_PTE_PROT_NO_WRITE;
+	KUNIT_EXPECT_EQ(test, reconcile.first_pte_before, fault_leaf);
+	KUNIT_EXPECT_EQ(test, reconcile.first_pte_after, reconciled_leaf);
+	KUNIT_EXPECT_EQ(test, reconcile.changed, 1);
+	KUNIT_EXPECT_EQ(test, READ_ONCE(*ptep), reconciled_leaf);
+	KUNIT_EXPECT_EQ(test,
+			READ_ONCE(*ptep) & ~APPLE_DART2_PTE_PROT_NO_WRITE,
+			fault_leaf & ~APPLE_DART2_PTE_PROT_NO_WRITE);
+	KUNIT_EXPECT_EQ(test, iop->ops.iova_to_phys(&iop->ops, fault_iova),
+			expected_fault_pa);
 
 	/* Model locked attach/sync, then restore before freeing the clone. */
 	memcpy(src_root, data->pgd[0], SZ_16K);
