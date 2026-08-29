@@ -323,6 +323,30 @@ fn apply_g17p_cold_opening_context_views(
     )
 }
 
+fn g17p_cold_opening_optional_addresses(
+    support: u64,
+    tiling: bool,
+) -> g17_submission::G17PColdOpeningOptionalAddresses {
+    let (context_scratch, firmware_scratch) = if tiling {
+        (
+            support + G17P_RENDER_TILING_CONTEXT_SCRATCH as u64,
+            support + G17P_RENDER_TILING_FIRMWARE_SCRATCH as u64,
+        )
+    } else {
+        (
+            support + G17P_RENDER_FRAGMENT_CONTEXT_SCRATCH as u64,
+            support + G17P_RENDER_FRAGMENT_FIRMWARE_SCRATCH as u64,
+        )
+    };
+    g17_submission::G17PColdOpeningOptionalAddresses {
+        context_scratch,
+        firmware_scratch,
+        shared_control: g17_initdata::CONTROL_SHARED_ADDRESS,
+        channel_control: support + G17P_RENDER_CHANNEL_CONTROL as u64,
+        tiling_shared_object: support + G17P_RENDER_PACKED_SHARED as u64,
+    }
+}
+
 fn apply_g17p_add3_resource_table(raw: &mut [u8], buffers: [u64; 3]) -> Option<()> {
     let end = G17P_COMPUTE_ADD3_RESOURCE_TABLE
         .checked_add(buffers.len() * core::mem::size_of::<u64>())?;
@@ -2262,25 +2286,7 @@ impl G17PUserRenderStorage {
     }
 
     fn optional_addresses(&self, tiling: bool) -> g17_submission::G17PColdOpeningOptionalAddresses {
-        let support = self.support.iova();
-        let (context_scratch, firmware_scratch) = if tiling {
-            (
-                support + G17P_RENDER_TILING_CONTEXT_SCRATCH as u64,
-                support + G17P_RENDER_TILING_FIRMWARE_SCRATCH as u64,
-            )
-        } else {
-            (
-                support + G17P_RENDER_FRAGMENT_CONTEXT_SCRATCH as u64,
-                support + G17P_RENDER_FRAGMENT_FIRMWARE_SCRATCH as u64,
-            )
-        };
-        g17_submission::G17PColdOpeningOptionalAddresses {
-            context_scratch,
-            firmware_scratch,
-            shared_control: support + G17P_RENDER_SHARED_CONTROL as u64,
-            channel_control: support + G17P_RENDER_CHANNEL_CONTROL as u64,
-            tiling_shared_object: support + G17P_RENDER_PACKED_SHARED as u64,
-        }
+        g17p_cold_opening_optional_addresses(self.support.iova(), tiling)
     }
 
     pub(crate) fn stage_fragment(&mut self, submission_ordinal: u32) -> Result {
@@ -4613,6 +4619,16 @@ mod tests {
         let queue_va = 0x70_0109_0000;
         let channel_control = support_va + G17P_RENDER_CHANNEL_CONTROL as u64;
         let mut support = vec![0u8; G17P_RENDER_SUPPORT_SIZE];
+        let tiling_optional = g17p_cold_opening_optional_addresses(support_va, true);
+        let fragment_optional = g17p_cold_opening_optional_addresses(support_va, false);
+        assert_eq!(
+            tiling_optional.shared_control,
+            g17_initdata::CONTROL_SHARED_ADDRESS
+        );
+        assert_eq!(
+            fragment_optional.shared_control,
+            g17_initdata::CONTROL_SHARED_ADDRESS
+        );
         apply_g17p_cold_opening_context_views(
             g17_submission::G17PColdOpeningStage::Tiling,
             descriptor_va,
