@@ -503,7 +503,7 @@ static void dcp_link_service_match_work(struct work_struct *work)
 	}
 }
 
-static void dcp_link_queue_service_match(struct apple_dcp *dcp, int tag)
+static void dcp_link_record_service_match(struct apple_dcp *dcp, int tag)
 {
 	if (tag == 206)
 		set_bit(DCP_LINK_SERVICE_MATCH_PMU,
@@ -511,10 +511,15 @@ static void dcp_link_queue_service_match(struct apple_dcp *dcp, int tag)
 	else if (tag == 207)
 		set_bit(DCP_LINK_SERVICE_MATCH_BACKLIGHT,
 			&dcp->link_service_match_state);
-	else
-		return;
+}
 
-	schedule_work(&dcp->link_service_match_work);
+static bool dcp_link_service_match_boundary(int tag, const void *input,
+					    u32 input_size)
+{
+	static const char final_property[] = "DispPerfState";
+
+	return tag == 563 && input_size >= sizeof(final_property) &&
+	       !memcmp(input, final_property, sizeof(final_property));
 }
 
 static int dcp_link_ack(struct apple_dcp *dcp,
@@ -651,6 +656,7 @@ static void dcp_link_handle_callback(struct apple_dcp *dcp, u64 message)
 	bool handled;
 	bool log_callback = dcp->link_rx_log_count < 256;
 	bool remote = apple_dcp_link_message_is_remote(message);
+	bool service_boundary;
 	void *buffer;
 	char wire_tag[4];
 	u8 stream = apple_dcp_link_message_stream(message);
@@ -721,6 +727,7 @@ static void dcp_link_handle_callback(struct apple_dcp *dcp, u64 message)
 				 apple_dcp_link_rpc_reply(message));
 		return;
 	}
+	service_boundary = dcp_link_service_match_boundary(tag, view.input, view.input_size);
 
 	if (view.output_size)
 		memset(view.output, 0, view.output_size);
@@ -773,7 +780,12 @@ static void dcp_link_handle_callback(struct apple_dcp *dcp, u64 message)
 				 "DCPLink callback %u D%03d ACK %#llx send result %d\n",
 				 sequence, tag, reply, ack_ret);
 		if (!ack_ret && (tag == 206 || tag == 207))
-			dcp_link_queue_service_match(dcp, tag);
+			dcp_link_record_service_match(dcp, tag);
+		if (!ack_ret && service_boundary) {
+			dev_info(dcp->dev,
+				 "DCPLink startup callbacks complete; queueing service notifications\n");
+			schedule_work(&dcp->link_service_match_work);
+		}
 	}
 }
 
