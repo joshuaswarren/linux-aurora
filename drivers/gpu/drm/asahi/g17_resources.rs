@@ -1877,7 +1877,7 @@ impl G17PUserRenderStorage {
 
         let graph_va = graph.iova();
         let graph_addresses = g17_submission::G17PColdOpeningGraphAddresses {
-            primary_index: g17_submission::G17P_PARTIAL_OPENING_PRIMARY_INDEX_GPU_VA,
+            primary_index: g17_submission::G17P_PARTIAL_OPENING_PRIMARY_INDEX_FIRMWARE_GPU_VA,
             secondary_index: support_va + G17P_RENDER_SECONDARY_INDEX as u64,
             pool_a_slots: support_va + G17P_RENDER_POOL_A_SLOTS as u64,
             pool_b_slots: support_va + G17P_RENDER_POOL_B_SLOTS as u64,
@@ -1981,6 +1981,7 @@ impl G17PUserRenderStorage {
             g17_render::apply_g17p_retained_descriptor_fields(
                 g17_render::RenderDescriptorKind::Tiling,
                 descriptors_va,
+                g17_initdata::CONTROL_SHARED_ADDRESS,
                 0,
                 true,
                 tiling,
@@ -1995,6 +1996,7 @@ impl G17PUserRenderStorage {
             g17_render::apply_g17p_retained_descriptor_fields(
                 g17_render::RenderDescriptorKind::Fragment,
                 descriptors_va + 0x4000,
+                g17_initdata::CONTROL_SHARED_ADDRESS,
                 0,
                 true,
                 fragment,
@@ -2168,6 +2170,7 @@ impl G17PUserRenderStorage {
             g17_render::apply_g17p_retained_descriptor_fields(
                 g17_render::RenderDescriptorKind::Tiling,
                 canonical_descriptor_va,
+                g17_initdata::CONTROL_SHARED_ADDRESS,
                 submission_ordinal,
                 false,
                 tiling,
@@ -2188,6 +2191,7 @@ impl G17PUserRenderStorage {
             g17_render::apply_g17p_retained_descriptor_fields(
                 g17_render::RenderDescriptorKind::Fragment,
                 canonical_descriptor_va + 0x4000,
+                g17_initdata::CONTROL_SHARED_ADDRESS,
                 submission_ordinal,
                 false,
                 fragment,
@@ -4263,6 +4267,21 @@ mod tests {
                 <= owner
         );
         assert!(owner + size < g17_initdata::HW_REGISTER_APERTURE.start);
+
+        let mut shared = [0u8; g17_submission::G17P_COLD_OPENING_SHARED_OBJECT_SIZE];
+        g17_submission::apply_g17p_cold_opening_shared_object(
+            g17_submission::G17PColdOpeningGraphAddresses {
+                primary_index: owner,
+                secondary_index: 0x70_0100_0000,
+                pool_a_slots: 0x70_0100_4000,
+                pool_b_slots: 0x70_0100_8000,
+                shared_slots: 0x70_0100_c000,
+                flag: 0x70_0101_0000,
+            },
+            &mut shared,
+        )
+        .unwrap();
+        assert_eq!(get_u64(&shared, 0x20), owner);
     }
 
     #[test]

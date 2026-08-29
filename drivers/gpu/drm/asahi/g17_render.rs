@@ -845,6 +845,7 @@ pub(crate) fn build_cold_opening_fragment_descriptor(
 pub(crate) fn apply_g17p_retained_descriptor_fields(
     kind: RenderDescriptorKind,
     descriptor_gpu_va: u64,
+    runtime_control: u64,
     submission_ordinal: u32,
     cold_opening: bool,
     raw: &mut [u8],
@@ -875,6 +876,7 @@ pub(crate) fn apply_g17p_retained_descriptor_fields(
             put_u32(raw, 0x08c4, item_number << 16);
             put_u32(raw, 0x08c8, item_number << 24);
             put_u32(raw, 0x08d4, submission_ordinal << 16);
+            put_u64(raw, 0x0934, runtime_control);
             if cold_opening {
                 put_u8(raw, 0x0789, 0x08);
                 put_u8(raw, 0x093e, 0xd0);
@@ -905,6 +907,7 @@ pub(crate) fn apply_g17p_retained_descriptor_fields(
             put_u32(raw, 0x2160, item_number);
             put_u32(raw, 0x2164, item_number << 8);
             put_u32(raw, 0x2170, submission_ordinal);
+            put_u64(raw, 0x21ce, runtime_control);
             if cold_opening {
                 put_u8(raw, 0x21d8, 0x10);
                 put_u8(raw, 0x21d9, 0xa2);
@@ -1233,6 +1236,7 @@ mod tests {
         apply_g17p_retained_descriptor_fields(
             RenderDescriptorKind::Tiling,
             tiling_va,
+            0xffff_fc20_c082_8000,
             1,
             false,
             &mut tiling,
@@ -1241,6 +1245,7 @@ mod tests {
         apply_g17p_retained_descriptor_fields(
             RenderDescriptorKind::Fragment,
             fragment_va,
+            0xffff_fc20_c082_8000,
             1,
             false,
             &mut fragment,
@@ -1251,12 +1256,14 @@ mod tests {
         assert_eq!(get_u32(&tiling, 0x7a0), 0x200);
         assert_eq!(get_u32(&tiling, 0x7a8), 2);
         assert_eq!(get_u32(&tiling, 0x8d4), 0x1_0000);
+        assert_eq!(get_u64(&tiling, 0x934), 0xffff_fc20_c082_8000);
         assert_eq!(get_u64(&fragment, 0x7a0), fragment_va + 0xa0);
         assert_eq!(get_u64(&fragment, 0xec0), fragment_va + 0x7c0);
         assert_eq!(get_u64(&fragment, 0x15e0), fragment_va + 0xee0);
         assert_eq!(get_u64(&fragment, 0x1d00), fragment_va + 0x1600);
         assert_eq!(get_u32(&fragment, 0x215c), 2);
         assert_eq!(get_u32(&fragment, 0x2170), 1);
+        assert_eq!(get_u64(&fragment, 0x21ce), 0xffff_fc20_c082_8000);
     }
 
     fn publication_input(kind: RenderDescriptorKind) -> QueuePublicationInput {
