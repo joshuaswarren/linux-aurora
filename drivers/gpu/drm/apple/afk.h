@@ -174,6 +174,7 @@ struct apple_dcp_afkep {
 
 	spinlock_t lock;
 	u16 qe_seq;
+	u8 rx_log_count;
 
 	const struct apple_epic_service_ops *ops;
 	struct apple_epic_service services[AFK_MAX_CHANNEL];
