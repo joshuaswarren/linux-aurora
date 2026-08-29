@@ -16,13 +16,15 @@ operands recorded in `encoder-parity.md`.
 - `sksm-entry-relocation-mask.bin`: one bits mark address bits normalized by
   fixture comparisons; SHA-256
   `c87e4b5e32d986a29f7901989993d3fbeada763e1e7a741f969f58aa3e926d82`.
-- `channel-event-primary.bin`: KEXT-written 0x15-byte primary event prefix;
+- `channel-event-primary.bin`: KEXT-written 0x15-byte conditional tag-14
+  fallback prefix, used only when the direct feature is disabled;
   SHA-256 `01c5248a31ed8a479b049417fa03abfcd56a975770d245baaa491fffd1266aa3`.
-- `channel-event-optional.bin`: conditional 0x12-byte optional event prefix;
+- `channel-event-optional.bin`: conditional 0x12-byte tag-16 prefix, used only
+  when the host descriptor carries its optional event pointer;
   SHA-256 `8667778da9e2d0c7c1f82fa249f2ecf14f1c911d006f4f9830e6a3018ffe48f2`.
 
-The simple first add3 path publishes only the primary event. The optional
-fixture is retained to lock its conditional encoding without enabling it.
+Direct-feature G17P publishes neither transport command for simple first add3.
+Both fixtures remain to lock their conditional encoders without enabling them.
 
 Evidence classification: entry packing and runtime geometry are
 `KEXT_PROVEN`; first/second add3 operands are `EXPERIMENT_PROVEN`. Native queue
