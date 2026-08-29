@@ -19,8 +19,8 @@ use core::sync::atomic::{fence, Ordering};
 
 #[cfg(not(test))]
 use crate::{
-    driver::AsahiDevice, g17_completion, g17_compute, g17_initdata, g17_lifecycle, g17_resources,
-    g17_submission, g17_uapi, hw::agx3, identity, mmu, regs,
+    driver::AsahiDevice, g17_completion, g17_compute, g17_initdata, g17_lifecycle, g17_render,
+    g17_resources, g17_submission, g17_uapi, hw::agx3, identity, mmu, regs,
 };
 #[cfg(test)]
 #[path = "g17_initdata.rs"]
@@ -436,6 +436,65 @@ impl G17PManagerConstruction {
 
     pub(crate) fn control_counters(&mut self) -> Result<g17_resources::G17PControlCounters> {
         self.resources.control_counters()
+    }
+
+    /// Stage the same queue-pair-zero TA/3D bootstrap used by the
+    /// output-positive source path. The VDM stream is a driver-owned terminate
+    /// command, so this establishes scheduler lifecycle without user BOs.
+    pub(crate) fn begin_compute_bootstrap_render(
+        &mut self,
+        dev: &AsahiDevice,
+    ) -> Result<g17_submission::PreparedG17PPartialOpeningWorkPair> {
+        let vm = self.resources.uat().kernel_lower_vm().clone();
+        let mut parameters = g17_render::G17pRenderParameters::source_rsrc8();
+        parameters.encoder = g17_resources::G17P_BOOTSTRAP_VDM_VA;
+        parameters.process_empty_tiles = false;
+        parameters.tile_config &= !0x1_0000;
+        let timestamp = g17_uapi::UapiTimestamp {
+            handle: 0,
+            offset: 0,
+        };
+        let command = g17_uapi::TranslatedRenderCommand {
+            flags: 0,
+            vdm_base: parameters.encoder,
+            parameters,
+            vertex_attachments: g17_uapi::UapiAttachmentList::EMPTY,
+            fragment_attachments: g17_uapi::UapiAttachmentList::EMPTY,
+            vertex_timestamps: g17_uapi::UapiTimestamps {
+                start: timestamp,
+                end: timestamp,
+            },
+            fragment_timestamps: g17_uapi::UapiTimestamps {
+                start: timestamp,
+                end: timestamp,
+            },
+        };
+        self.begin_translated_render(dev, &vm, &command, [0; 4], KVec::new())
+    }
+
+    /// Match the source bootstrap fence: both three-item inner queues and
+    /// both outer channel consumers must retire before the graph can drop.
+    pub(crate) fn wait_compute_bootstrap_render_retirement(&mut self) -> Result {
+        const POLLS: usize = 500;
+        for _ in 0..POLLS {
+            fence(Ordering::Acquire);
+            let state = self.render_storage.as_mut().ok_or(ENODEV)?.snapshot()?;
+            let inner_retired = state.tiling.done == 3
+                && state.tiling.read == 3
+                && state.tiling.write == 3
+                && state.fragment.done == 3
+                && state.fragment.read == 3
+                && state.fragment.write == 3;
+            if inner_retired && self.resources.partial_opening_outer_retired()? {
+                self.render_tracker = None;
+                self.render_bind = None;
+                self.render_storage = None;
+                self.render_submission_ordinal = 0;
+                return Ok(());
+            }
+            fsleep(Delta::from_millis(1));
+        }
+        Err(ETIMEDOUT)
     }
 
     pub(crate) fn prepare_compute_runtime_class1(&mut self) -> Result {
