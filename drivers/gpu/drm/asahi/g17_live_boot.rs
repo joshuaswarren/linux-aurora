@@ -866,7 +866,7 @@ fn finish_boot_session(
     );
     dev_info!(
         pdev.as_ref(),
-        "G17P UAT: candidate single-user-slot-v1 pins T8140 work to context 1\n"
+        "G17P compute: candidate slot1-runtime-tick-v1 armed\n"
     );
     Ok(G17PBootedSession {
         cpus,
