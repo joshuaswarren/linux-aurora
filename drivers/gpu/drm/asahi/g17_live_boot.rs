@@ -790,7 +790,7 @@ fn finish_boot_session(
     );
 
     // Restore and publish 3D first, then restore and publish TA. End with the
-    // barrier required before the one paired channel-8 bell.
+    // barrier required before the one paired channel-0 bell.
     let bootstrap = manager.publish_staged_compute_bootstrap_render()?;
     dev_info!(
         pdev.as_ref(),
@@ -802,7 +802,7 @@ fn finish_boot_session(
     )?;
     dev_info!(
         pdev.as_ref(),
-        "G17P compute control: channel-8 startup work sent\n"
+        "G17P compute control: channel-0 startup work sent\n"
     );
     if let Err(error) = manager.wait_compute_bootstrap_render_retirement() {
         let (fault_info, fault_address_word) = registers.g17p_fault_registers();
@@ -1584,7 +1584,7 @@ impl G17PLiveRuntime {
     }
 
     /// Publish first graphics in the measured 3D/TA order and send its one
-    /// pair-two/channel-8 work notification through the retained primary
+    /// pair-zero/channel-0 work notification through the retained primary
     /// RTKit endpoint.
     pub(crate) fn submit_partial_opening_render<F>(
         &mut self,

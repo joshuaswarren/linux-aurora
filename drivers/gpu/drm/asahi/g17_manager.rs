@@ -685,13 +685,13 @@ impl G17PManagerConstruction {
             && context.render_context_id == 1
             && context.context0_empty_high_root_slot == 0
             && context.render_empty_high_root_slot == 1
-            && context.transport_pair == 2
+            && context.transport_pair == 0
             && context.descriptor_pair == 0
             && context.shared_queue_pair_namespace == 0
             && context.optional_identity_context_id == 1
             && context.descriptor_context_id == 1
             && context.scheduler_class == 2
-            && context.work_doorbell_channel == 8
+            && context.work_doorbell_channel == 0
             && context.context0_low_root_present_at_first_work
             && context.render_low_root_present_at_first_work
             && !context.source_firmware_high_root_table_resident;
@@ -746,7 +746,7 @@ impl G17PManagerConstruction {
     /// Publish the exact first 3D/TA outer-ring pair. The callback installs
     /// the late TA descriptor, item-ring, and queue-head state between the 3D
     /// producer and the TA outer slot. The retained live runtime sends the
-    /// returned channel-8 doorbell exactly once.
+    /// returned channel-0 doorbell exactly once.
     pub(crate) fn submit_partial_opening_render<F>(
         &mut self,
         submission: G17PPartialOpeningRenderSubmission,
@@ -775,7 +775,7 @@ impl G17PManagerConstruction {
             return Err(EINVAL);
         }
         if prepared.paired_doorbell != g17_submission::G17P_PARTIAL_OPENING_PAIRED_DOORBELL
-            || prepared.paired_doorbell != 0x0083_0000_0000_0008
+            || prepared.paired_doorbell != 0x0083_0000_0000_0000
         {
             return Err(EINVAL);
         }

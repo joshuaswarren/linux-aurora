@@ -622,7 +622,7 @@ pub(crate) const fn prepare_g17p_channel_write(
 //     the native partial graph. It publishes a one-record scheduler page and
 //     an eight-group primary index, presents five primary status fields before
 //     control 0x84, then exposes 3D before TA and sends one EP 0x21/0x83 kick
-//     for transport pair 2 on channel 8. This is the classic channel path and
+//     for transport pair 0 on channel 0. This is the classic channel path and
 //     remains separate from the kext's SKSM queue-entry plus `addKicks` path.
 // ---------------------------------------------------------------------------
 
@@ -639,13 +639,13 @@ pub(crate) const G17P_PARTIAL_OPENING_PRIMARY_INDEX_SIZE: usize =
     4 * G17P_PARTIAL_OPENING_PAGE_SIZE;
 pub(crate) const G17P_PARTIAL_OPENING_FWCTL_OFFSET: u64 = 0x001c_0000;
 pub(crate) const G17P_PARTIAL_OPENING_CONTROL_MESSAGE_SIZE: u64 = 0x40;
-pub(crate) const G17P_PARTIAL_OPENING_WORK_DOORBELL_CHANNEL: u8 = 8;
+pub(crate) const G17P_PARTIAL_OPENING_WORK_DOORBELL_CHANNEL: u8 = 0;
 pub(crate) const G17P_PARTIAL_OPENING_PAIRED_DOORBELL: u64 =
     MSG_TX_DOORBELL | G17P_PARTIAL_OPENING_WORK_DOORBELL_CHANNEL as u64;
 pub(crate) const G17P_PARTIAL_OPENING_OUTER_SLOT_SIZE: usize = 0x18;
 pub(crate) const G17P_PARTIAL_OPENING_OUTER_SLOT_COUNT: u32 = 0x100;
-pub(crate) const G17P_PARTIAL_OPENING_TILING_CHANNEL_TABLE_INDEX: u8 = 6;
-pub(crate) const G17P_PARTIAL_OPENING_FRAGMENT_CHANNEL_TABLE_INDEX: u8 = 7;
+pub(crate) const G17P_PARTIAL_OPENING_TILING_CHANNEL_TABLE_INDEX: u8 = 0;
+pub(crate) const G17P_PARTIAL_OPENING_FRAGMENT_CHANNEL_TABLE_INDEX: u8 = 1;
 pub(crate) const G17P_COMPUTE_CHANNEL_TABLE_INDEX: u8 = 8;
 pub(crate) const G17P_COMPUTE_CHANNEL_GRID_INDEX: u8 = 4;
 pub(crate) const G17P_COMPUTE_WORK_DOORBELL_CHANNEL: u8 = 0x0a;
@@ -752,7 +752,7 @@ pub(crate) const G17P_PARTIAL_OPENING_CONTEXT: G17PPartialOpeningContextContract
         render_context_id: 1,
         context0_empty_high_root_slot: 0,
         render_empty_high_root_slot: 1,
-        transport_pair: 2,
+        transport_pair: 0,
         descriptor_pair: 0,
         shared_queue_pair_namespace: 0,
         optional_identity_context_id: 1,
@@ -1456,9 +1456,9 @@ pub(crate) fn prepare_g17p_compute_channel_work(
     })
 }
 
-/// Couple the fragment-first/tiling-second outer slots to their one channel-8
-/// 0x83 notification. These are the initdata work rings at table indices 7 and
-/// 6, not the kext's separate 8-byte command-pointer rings. The caller performs
+/// Couple the fragment-first/tiling-second outer slots to their one channel-0
+/// 0x83 notification. These are the initdata work rings at table indices 1 and
+/// 0, not the kext's separate 8-byte command-pointer rings. The caller performs
 /// the barriers in [`G17P_PARTIAL_OPENING_PUBLICATION_ORDER`].
 pub(crate) fn prepare_g17p_partial_opening_work_pair(
     fragment: G17PPartialOpeningOuterChannelState,
@@ -3499,7 +3499,7 @@ mod tests {
                 render_context_id: 1,
                 context0_empty_high_root_slot: 0,
                 render_empty_high_root_slot: 1,
-                transport_pair: 2,
+                transport_pair: 0,
                 descriptor_pair: 0,
                 shared_queue_pair_namespace: 0,
                 optional_identity_context_id: 1,
@@ -3509,7 +3509,7 @@ mod tests {
                 queue_identity: 0x15,
                 optional_submission_ordinal: 0,
                 event_counter: 0x102,
-                work_doorbell_channel: 8,
+                work_doorbell_channel: 0,
                 context0_low_root_present_at_first_work: true,
                 render_low_root_present_at_first_work: true,
                 source_firmware_high_root_table_resident: false,
@@ -3857,7 +3857,7 @@ mod tests {
         assert_eq!(
             prepared.fragment,
             G17PPartialOpeningOuterSlotPlan {
-                channel_table_index: 7,
+                channel_table_index: 1,
                 slot_index: 0,
                 slot_byte_offset: 0,
                 slot: [
@@ -3870,7 +3870,7 @@ mod tests {
         assert_eq!(
             prepared.tiling,
             G17PPartialOpeningOuterSlotPlan {
-                channel_table_index: 6,
+                channel_table_index: 0,
                 slot_index: 0,
                 slot_byte_offset: 0,
                 slot: [
@@ -3882,13 +3882,13 @@ mod tests {
         );
         assert_eq!(G17P_PARTIAL_OPENING_OUTER_SLOT_SIZE, 0x18);
         assert_eq!(G17P_PARTIAL_OPENING_OUTER_SLOT_COUNT, 0x100);
-        assert_eq!(G17P_PARTIAL_OPENING_TILING_CHANNEL_TABLE_INDEX, 6);
-        assert_eq!(G17P_PARTIAL_OPENING_FRAGMENT_CHANNEL_TABLE_INDEX, 7);
-        assert_eq!(G17P_PARTIAL_OPENING_WORK_DOORBELL_CHANNEL, 8);
-        assert_eq!(prepared.paired_doorbell, 0x0083_0000_0000_0008);
+        assert_eq!(G17P_PARTIAL_OPENING_TILING_CHANNEL_TABLE_INDEX, 0);
+        assert_eq!(G17P_PARTIAL_OPENING_FRAGMENT_CHANNEL_TABLE_INDEX, 1);
+        assert_eq!(G17P_PARTIAL_OPENING_WORK_DOORBELL_CHANNEL, 0);
+        assert_eq!(prepared.paired_doorbell, 0x0083_0000_0000_0000);
         assert_eq!(
             prepared.paired_doorbell,
-            encode_tx_doorbell(PipeType::Vertex, 2).unwrap()
+            encode_tx_doorbell(PipeType::Vertex, 0).unwrap()
         );
 
         let compute = prepare_g17p_compute_channel_work(
