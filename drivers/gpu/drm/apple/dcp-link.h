@@ -686,18 +686,18 @@ static inline int apple_dcp_link_stream_message(u64 message, u8 stream,
 }
 
 static inline int apple_dcp_link_ap_call_message(u32 offset, u32 size,
-						  u8 stream, bool remote,
-						  bool new_stream,
+						  u8 stream, bool nested,
 						  u64 *message)
 {
 	u64 rpc;
 	int ret;
 
-	ret = apple_dcp_link_rpc_message(offset, size, new_stream, &rpc);
+	ret = apple_dcp_link_rpc_message(offset, size, nested, &rpc);
 	if (ret)
 		return ret;
 
-	return apple_dcp_link_stream_message(rpc, stream, remote, message);
+	/* AP calls stay on the local stream; bit 9 alone marks recursion. */
+	return apple_dcp_link_stream_message(rpc, stream, false, message);
 }
 
 static inline u8 apple_dcp_link_message_stream(u64 message)

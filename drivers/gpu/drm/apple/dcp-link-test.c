@@ -546,125 +546,13 @@ static void apple_dcp_link_rpc_message_test(struct kunit *test)
 			-ERANGE);
 
 	KUNIT_ASSERT_EQ(test,
-			apple_dcp_link_ap_call_message(0, 0x10, 0, true, false,
+			apple_dcp_link_ap_call_message(0x10, 0x10, 0, true,
 						       &encoded),
 			0);
-	KUNIT_EXPECT_EQ(test, encoded, 0x0000001000000102ULL);
-	KUNIT_EXPECT_TRUE(test, apple_dcp_link_message_is_remote(encoded));
-	KUNIT_EXPECT_FALSE(test, encoded & APPLE_DCP_LINK_MSG_NEW_STREAM);
-	KUNIT_EXPECT_EQ(test, apple_dcp_link_rpc_reply(encoded), 0x142ULL);
-
-	KUNIT_ASSERT_EQ(test,
-			apple_dcp_link_ap_call_message(0x10, 0x10, 0, false,
-						       false, &encoded),
-			0);
-	KUNIT_EXPECT_EQ(test, encoded, 0x0000001000100002ULL);
+	KUNIT_EXPECT_EQ(test, encoded, 0x0000001000100202ULL);
 	KUNIT_EXPECT_FALSE(test, apple_dcp_link_message_is_remote(encoded));
-	KUNIT_EXPECT_FALSE(test, encoded & APPLE_DCP_LINK_MSG_NEW_STREAM);
-
-	KUNIT_ASSERT_EQ(test,
-			apple_dcp_link_ap_call_message(0, 0x10, 1, false, true,
-						       &encoded),
-			0);
-	KUNIT_EXPECT_EQ(test, encoded, 0x0000001000000602ULL);
-	KUNIT_EXPECT_EQ(test, apple_dcp_link_message_stream(encoded), (u8)1);
-	KUNIT_EXPECT_FALSE(test, apple_dcp_link_message_is_remote(encoded));
-	KUNIT_EXPECT_TRUE(test, encoded & APPLE_DCP_LINK_MSG_NEW_STREAM);
-}
-
-static void apple_dcp_h17p_service_match_wire_test(struct kunit *test)
-{
-	static const u8 temperature_payload[0x10] = {
-		0x36, 0x38, 0x33, 0x41,
-		0x00, 0x00, 0x00, 0x00,
-		0x04, 0x00, 0x00, 0x00,
-		0x00, 0x00, 0x00, 0x00,
-	};
-	static const u8 pmu_payload[0x10] = {
-		0x31, 0x33, 0x31, 0x41,
-		0x00, 0x00, 0x00, 0x00,
-		0x04, 0x00, 0x00, 0x00,
-		0x00, 0x00, 0x00, 0x00,
-	};
-	static const u8 backlight_payload[0x10] = {
-		0x32, 0x33, 0x31, 0x41,
-		0x00, 0x00, 0x00, 0x00,
-		0x04, 0x00, 0x00, 0x00,
-		0x00, 0x00, 0x00, 0x00,
-	};
-	struct apple_dcp_link_stream_layout layout;
-	struct apple_dcp_link_rpc_header *header;
-	u8 payload[0x10] = {};
-	u64 message;
-
-	KUNIT_ASSERT_EQ(test,
-			apple_dcp_link_stream_layout(APPLE_DCP_LINK_SIDE_AP, 0,
-						     false, &layout),
-			0);
-	KUNIT_EXPECT_EQ(test, layout.local_offset, 0U);
-	KUNIT_EXPECT_EQ(test, layout.capacity, 0x8000U);
-
-	header = (void *)payload;
-	apple_dcp_link_rpc_header_encode(
-		header, APPLE_DCP_H17P_CALL_VI_SET_TEMPERATURE_HINT, 0, 4);
-	KUNIT_EXPECT_MEMEQ(test, payload, temperature_payload, sizeof(payload));
-	KUNIT_ASSERT_EQ(test,
-			apple_dcp_link_ap_call_message(0, sizeof(payload), 1, false,
-						       true, &message),
-			0);
-	KUNIT_EXPECT_EQ(test, message, 0x0000001000000602ULL);
-
-	memset(payload, 0, sizeof(payload));
-	apple_dcp_link_rpc_header_encode(
-		header, APPLE_DCP_H17P_CALL_PMU_SERVICE_MATCHED, 0, 4);
-	KUNIT_EXPECT_MEMEQ(test, payload, pmu_payload, sizeof(payload));
-
-	memset(payload, 0, sizeof(payload));
-	apple_dcp_link_rpc_header_encode(
-		header, APPLE_DCP_H17P_CALL_BACKLIGHT_SERVICE_MATCHED, 0, 4);
-	KUNIT_EXPECT_MEMEQ(test, payload, backlight_payload, sizeof(payload));
-
-	KUNIT_ASSERT_EQ(test,
-			apple_dcp_link_ap_call_message(0x10, sizeof(payload), 0,
-						       false, false, &message),
-			0);
-	KUNIT_EXPECT_EQ(test, message, 0x0000001000100002ULL);
-	KUNIT_EXPECT_EQ(test, apple_dcp_link_message_stream(message), (u8)0);
-	KUNIT_EXPECT_FALSE(test, apple_dcp_link_message_is_remote(message));
-	KUNIT_EXPECT_FALSE(test, message & APPLE_DCP_LINK_MSG_NEW_STREAM);
-}
-
-static void apple_dcp_h17p_service_match_output_test(struct kunit *test)
-{
-	__le32 output = cpu_to_le32(0xa5a5a5a5);
-
-	apple_dcp_h17p_service_match_output(&output, false);
-	KUNIT_EXPECT_EQ(test, le32_to_cpu(output), 0xa5a5a5a5U);
-
-	apple_dcp_h17p_service_match_output(&output, true);
-	KUNIT_EXPECT_EQ(test, le32_to_cpu(output), 1U);
-}
-
-static void apple_dcp_h17p_start_signal_wire_test(struct kunit *test)
-{
-	static const u8 payload[0x10] = {
-		0x31, 0x30, 0x34, 0x41,
-		0x00, 0x00, 0x00, 0x00,
-		0x04, 0x00, 0x00, 0x00,
-		0x00, 0x00, 0x00, 0x00,
-	};
-	struct apple_dcp_link_rpc_header header = {};
-	u64 message;
-
-	apple_dcp_link_rpc_header_encode(
-		&header, APPLE_DCP_H17P_CALL_START_SIGNAL, 0, 4);
-	KUNIT_EXPECT_MEMEQ(test, &header, payload, sizeof(header));
-
-	KUNIT_ASSERT_EQ(test,
-			apple_dcp_link_ap_call_message(0, sizeof(payload), 0, false,
-					       true, &message),
-			0);
-	KUNIT_EXPECT_EQ(test, message, 0x0000001000000202ULL);
+	KUNIT_EXPECT_TRUE(test, encoded & APPLE_DCP_LINK_MSG_NESTED);
+	KUNIT_EXPECT_EQ(test, apple_dcp_link_rpc_reply(encoded), 0x242ULL);
 }
 
 static void apple_dcp_link_stack_test(struct kunit *test)

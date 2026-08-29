@@ -297,11 +297,6 @@ static u8 dcp_link_context_stream(enum dcp_context_id context)
 	       context == DCP_CONTEXT_OOBCMD ? 1 : 0;
 }
 
-static bool dcp_link_context_is_remote(enum dcp_context_id context)
-{
-	return context == DCP_CONTEXT_CB || context == DCP_CONTEXT_OOBCB;
-}
-
 static u32 dcp_link_call_tag(const struct dcp_method_entry *call)
 {
 	return ((u32)(u8)call->tag[0] << 24) |
@@ -317,12 +312,13 @@ static int dcp_link_push_context(struct apple_dcp *dcp,
 				 u32 out_len, void *data, dcp_callback_t cb,
 				 void *cookie)
 {
+	enum dcp_context_id context = oob ? DCP_CONTEXT_OOBCMD : DCP_CONTEXT_CMD;
 	struct dcp_channel *ch = dcp_get_channel(dcp, context);
 	struct apple_dcp_link_stream_layout layout;
 	struct apple_dcp_link_rpc_header *header;
-	bool remote = dcp_link_context_is_remote(context);
+	bool nested;
 	u8 stream = dcp_link_context_stream(context);
-	u32 *top = &dcp->link_top[remote][stream];
+	u32 *top = &dcp->link_top[false][stream];
 	u32 next_top;
 	u32 old_top;
 	u32 offset;
@@ -337,6 +333,7 @@ static int dcp_link_push_context(struct apple_dcp *dcp,
 		return -EINVAL;
 
 	depth = dcp_push_depth(&ch->depth);
+	nested = depth > 0;
 	old_top = *top;
 	call_tag = dcp_link_call_tag(call);
 	ret = apple_dcp_link_rpc_payload_size(in_len, out_len,
@@ -344,7 +341,7 @@ static int dcp_link_push_context(struct apple_dcp *dcp,
 	if (ret)
 		goto err_pop;
 	ret = apple_dcp_link_stream_layout(APPLE_DCP_LINK_SIDE_AP, stream,
-					   remote, &layout);
+					   false, &layout);
 	if (ret)
 		goto err_pop;
 	ret = apple_dcp_link_stack_push(*top, layout.capacity, payload_size,
@@ -363,9 +360,8 @@ static int dcp_link_push_context(struct apple_dcp *dcp,
 	if (out_len)
 		memset((u8 *)(header + 1) + in_len, 0, out_len);
 
-	/* The callback workloop is bound to an existing remote stream. */
 	ret = apple_dcp_link_ap_call_message(offset, payload_size, stream,
-					     remote, new_stream, &message);
+					     nested, &message);
 	if (ret)
 		goto err_pop;
 
@@ -377,6 +373,12 @@ static int dcp_link_push_context(struct apple_dcp *dcp,
 	*top = next_top;
 
 	dcp_link_sync_for_device();
+	if (nested)
+		dev_info(dcp->dev,
+			 "DCPLink nested %.4s TX %#llx base %#x offset %#x size %#x top %#x->%#x depth %u header %#x/%u/%u\n",
+			 call->tag, message, layout.local_offset, offset,
+			 payload_size, old_top, next_top, depth, call_tag,
+			 in_len, out_len);
 	if (call_tag == APPLE_DCP_H17P_CALL_START_SIGNAL) {
 		afk_log_tx_state(dcp->systemep, "before DCPLink A401");
 		dev_info(dcp->dev,
