@@ -312,6 +312,7 @@ static u32 dcp_link_call_tag(const struct dcp_method_entry *call)
 
 static int dcp_link_push_context(struct apple_dcp *dcp,
 				 enum dcp_context_id context,
+				 bool new_stream,
 				 const struct dcp_method_entry *call, u32 in_len,
 				 u32 out_len, void *data, dcp_callback_t cb,
 				 void *cookie)
@@ -364,7 +365,7 @@ static int dcp_link_push_context(struct apple_dcp *dcp,
 
 	/* The callback workloop is bound to an existing remote stream. */
 	ret = apple_dcp_link_ap_call_message(offset, payload_size, stream,
-					     remote, false, &message);
+					     remote, new_stream, &message);
 	if (ret)
 		goto err_pop;
 
@@ -428,14 +429,15 @@ static void dcp_link_push(struct apple_dcp *dcp, bool oob,
 			  u32 out_len, void *data, dcp_callback_t cb,
 			  void *cookie)
 {
-	dcp_link_push_context(dcp, dcp_call_context(dcp, oob), call, in_len,
-			      out_len, data, cb, cookie);
+	dcp_link_push_context(dcp, dcp_call_context(dcp, oob), false, call,
+			      in_len, out_len, data, cb, cookie);
 }
 
 enum dcp_link_service_match_bit {
 	DCP_LINK_SERVICE_MATCH_PMU,
 	DCP_LINK_SERVICE_MATCH_BACKLIGHT,
 	DCP_LINK_SERVICE_MATCH_INFLIGHT,
+	DCP_LINK_SERVICE_MATCH_STREAM_OPEN,
 };
 
 static const struct dcp_method_entry dcp_link_pmu_service_matched = {
@@ -469,6 +471,7 @@ static void dcp_link_service_match_work(struct work_struct *work)
 	struct apple_dcp *dcp =
 		container_of(work, struct apple_dcp, link_service_match_work);
 	const struct dcp_method_entry *call;
+	bool new_stream;
 	int ret;
 
 	if (test_and_set_bit(DCP_LINK_SERVICE_MATCH_INFLIGHT,
@@ -487,12 +490,17 @@ static void dcp_link_service_match_work(struct work_struct *work)
 		return;
 	}
 
-	/* Native IOService notifiers make these calls after D206/D207 return. */
-	ret = dcp_link_push_context(dcp, DCP_CONTEXT_CMD, call, 0,
+	/* A notifier thread gets a fresh local stream while A401 owns stream 0. */
+	new_stream = !test_and_set_bit(DCP_LINK_SERVICE_MATCH_STREAM_OPEN,
+				       &dcp->link_service_match_state);
+	ret = dcp_link_push_context(dcp, DCP_CONTEXT_OOBCMD, new_stream, call, 0,
 				    sizeof(__le32), NULL,
 				    dcp_link_service_match_complete,
 				    (void *)call);
 	if (ret) {
+		if (new_stream)
+			clear_bit(DCP_LINK_SERVICE_MATCH_STREAM_OPEN,
+				  &dcp->link_service_match_state);
 		clear_bit(DCP_LINK_SERVICE_MATCH_INFLIGHT,
 			  &dcp->link_service_match_state);
 		if (test_bit(DCP_LINK_SERVICE_MATCH_PMU,
@@ -511,15 +519,8 @@ static void dcp_link_record_service_match(struct apple_dcp *dcp, int tag)
 	else if (tag == 207)
 		set_bit(DCP_LINK_SERVICE_MATCH_BACKLIGHT,
 			&dcp->link_service_match_state);
-}
 
-static bool dcp_link_service_match_boundary(int tag, const void *input,
-					    u32 input_size)
-{
-	static const char final_property[] = "DispPerfState";
-
-	return tag == 563 && input_size >= sizeof(final_property) &&
-	       !memcmp(input, final_property, sizeof(final_property));
+	schedule_work(&dcp->link_service_match_work);
 }
 
 static int dcp_link_ack(struct apple_dcp *dcp,
@@ -656,7 +657,6 @@ static void dcp_link_handle_callback(struct apple_dcp *dcp, u64 message)
 	bool handled;
 	bool log_callback = dcp->link_rx_log_count < 256;
 	bool remote = apple_dcp_link_message_is_remote(message);
-	bool service_boundary;
 	void *buffer;
 	char wire_tag[4];
 	u8 stream = apple_dcp_link_message_stream(message);
@@ -727,7 +727,6 @@ static void dcp_link_handle_callback(struct apple_dcp *dcp, u64 message)
 				 apple_dcp_link_rpc_reply(message));
 		return;
 	}
-	service_boundary = dcp_link_service_match_boundary(tag, view.input, view.input_size);
 
 	if (view.output_size)
 		memset(view.output, 0, view.output_size);
@@ -781,11 +780,6 @@ static void dcp_link_handle_callback(struct apple_dcp *dcp, u64 message)
 				 sequence, tag, reply, ack_ret);
 		if (!ack_ret && (tag == 206 || tag == 207))
 			dcp_link_record_service_match(dcp, tag);
-		if (!ack_ret && service_boundary) {
-			dev_info(dcp->dev,
-				 "DCPLink startup callbacks complete; queueing service notifications\n");
-			schedule_work(&dcp->link_service_match_work);
-		}
 	}
 }
 
