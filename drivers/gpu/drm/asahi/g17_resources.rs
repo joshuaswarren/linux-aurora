@@ -114,6 +114,8 @@ const G17P_CONTROL_OPERAND_BUFFER_SIZE: usize =
     g17_initdata::CONTROL_OPERAND_BUFFER_SIZE as usize;
 const G17P_CONTROL_OPERAND_BUFFER_STRIDE: usize =
     g17_initdata::CONTROL_OPERAND_BUFFER_STRIDE as usize;
+const G17P_BOOTSTRAP_SHARED_CONTROL_VA: u64 = 0xffff_fc20_c082_8000;
+const G17P_BOOTSTRAP_SHARED_CONTROL_INNER_VA: u64 = 0xffff_fc20_0160_0000;
 
 fn g17p_control_operand_buffer_va(index: usize) -> Option<u64> {
     if index >= G17P_CONTROL_OPERAND_BUFFER_COUNT {
@@ -385,7 +387,7 @@ fn g17p_cold_opening_optional_addresses(
     g17_submission::G17PColdOpeningOptionalAddresses {
         context_scratch,
         firmware_scratch,
-        shared_control: g17_initdata::CONTROL_SHARED_ADDRESS,
+        shared_control: G17P_BOOTSTRAP_SHARED_CONTROL_VA,
         channel_control: support + G17P_RENDER_CHANNEL_CONTROL as u64,
         tiling_shared_object: support + G17P_RENDER_PACKED_SHARED as u64,
     }
@@ -2077,7 +2079,7 @@ impl G17PUserRenderStorage {
             g17_render::apply_g17p_retained_descriptor_fields(
                 g17_render::RenderDescriptorKind::Tiling,
                 descriptors_va,
-                g17_initdata::CONTROL_SHARED_ADDRESS,
+                G17P_BOOTSTRAP_SHARED_CONTROL_VA,
                 0,
                 true,
                 tiling,
@@ -2092,7 +2094,7 @@ impl G17PUserRenderStorage {
             g17_render::apply_g17p_retained_descriptor_fields(
                 g17_render::RenderDescriptorKind::Fragment,
                 descriptors_va + 0x4000,
-                g17_initdata::CONTROL_SHARED_ADDRESS,
+                G17P_BOOTSTRAP_SHARED_CONTROL_VA,
                 0,
                 true,
                 fragment,
@@ -2705,6 +2707,8 @@ struct G17MappedResources {
     fwctl: MappedObject,
     control_shared: MappedObject,
     control_shared_inner: MappedObject,
+    bootstrap_control_shared: MappedObject,
+    bootstrap_control_shared_inner: MappedObject,
     control_operand_table: RenderBackingObject,
     control_operand_buffers: KVec<RenderBackingObject>,
     compute_runtime_support: MappedObject,
@@ -2892,6 +2896,38 @@ impl G17ResourceOwner {
             bytes.fill(0);
             bytes[..8].copy_from_slice(&1u64.to_le_bytes());
             Ok(())
+        })?;
+        let mut bootstrap_control_shared = map_fixed_wc_object(
+            dev,
+            address_space.uat.kernel_vm(),
+            "bootstrap control-shared",
+            G17P_BOOTSTRAP_SHARED_CONTROL_VA,
+            g17_initdata::CONTROL_SHARED_OBJECT_SIZE,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        bootstrap_control_shared.with_bytes_mut(|bytes| {
+            bytes.fill(0);
+            g17_submission::apply_g17p_cold_opening_shared_control(
+                G17P_CONTROL_OPERAND_TABLE_VA,
+                G17P_BOOTSTRAP_SHARED_CONTROL_INNER_VA,
+                &mut bytes[..g17_submission::G17P_COLD_OPENING_SHARED_CONTROL_SIZE],
+            )
+            .map_err(|_| EINVAL)
+        })?;
+        let mut bootstrap_control_shared_inner = map_fixed_wc_object(
+            dev,
+            address_space.uat.kernel_vm(),
+            "bootstrap control-shared-inner",
+            G17P_BOOTSTRAP_SHARED_CONTROL_INNER_VA,
+            mmu::UAT_PGSZ,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        bootstrap_control_shared_inner.with_bytes_mut(|bytes| {
+            bytes.fill(0);
+            g17_submission::apply_g17p_cold_opening_shared_control_inner(
+                &mut bytes[..g17_submission::G17P_COLD_OPENING_SHARED_CONTROL_INNER_SIZE],
+            )
+            .map_err(|_| EINVAL)
         })?;
         let mut control_operand_table = match RenderBackingObject::new(
             dev,
@@ -3196,6 +3232,11 @@ impl G17ResourceOwner {
             ("fwctl", &fwctl),
             ("control shared", &control_shared),
             ("control shared inner", &control_shared_inner),
+            ("bootstrap control shared", &bootstrap_control_shared),
+            (
+                "bootstrap control shared inner",
+                &bootstrap_control_shared_inner,
+            ),
             ("compute runtime support", &compute_runtime_support),
             ("compute runtime state", &compute_runtime_state),
             ("roots", &roots),
@@ -3369,6 +3410,8 @@ impl G17ResourceOwner {
                 fwctl,
                 control_shared,
                 control_shared_inner,
+                bootstrap_control_shared,
+                bootstrap_control_shared_inner,
                 control_operand_table,
                 control_operand_buffers,
                 compute_runtime_support,
@@ -3686,6 +3729,27 @@ impl G17ResourceOwner {
                 bytes.fill(0);
                 bytes[..8].copy_from_slice(&1u64.to_le_bytes());
                 Ok(())
+            })?;
+        self.resources
+            .bootstrap_control_shared
+            .with_bytes_mut(|bytes| {
+                bytes.fill(0);
+                g17_submission::apply_g17p_cold_opening_shared_control(
+                    G17P_CONTROL_OPERAND_TABLE_VA,
+                    G17P_BOOTSTRAP_SHARED_CONTROL_INNER_VA,
+                    &mut bytes[..g17_submission::G17P_COLD_OPENING_SHARED_CONTROL_SIZE],
+                )
+                .map_err(|_| EINVAL)
+            })?;
+        self.resources
+            .bootstrap_control_shared_inner
+            .with_bytes_mut(|bytes| {
+                bytes.fill(0);
+                g17_submission::apply_g17p_cold_opening_shared_control_inner(
+                    &mut bytes
+                        [..g17_submission::G17P_COLD_OPENING_SHARED_CONTROL_INNER_SIZE],
+                )
+                .map_err(|_| EINVAL)
             })?;
         self.resources
             .control_operand_table
@@ -4712,6 +4776,18 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_render_keeps_its_compact_control_object() {
+        let addresses = g17p_cold_opening_optional_addresses(0x70_0100_0000, true);
+        assert_eq!(addresses.shared_control, G17P_BOOTSTRAP_SHARED_CONTROL_VA);
+        assert_ne!(addresses.shared_control, g17_initdata::CONTROL_SHARED_ADDRESS);
+        assert_eq!(G17P_BOOTSTRAP_SHARED_CONTROL_VA, 0xffff_fc20_c082_8000);
+        assert_eq!(
+            G17P_BOOTSTRAP_SHARED_CONTROL_INNER_VA,
+            0xffff_fc20_0160_0000
+        );
+    }
+
+    #[test]
     fn user_render_late_tiling_changes_only_the_six_held_ranges() {
         let graph_va = 0x70_0100_0000;
         let descriptor = 0x70_0101_0000;
@@ -4801,11 +4877,11 @@ mod tests {
         let fragment_optional = g17p_cold_opening_optional_addresses(support_va, false);
         assert_eq!(
             tiling_optional.shared_control,
-            g17_initdata::CONTROL_SHARED_ADDRESS
+            G17P_BOOTSTRAP_SHARED_CONTROL_VA
         );
         assert_eq!(
             fragment_optional.shared_control,
-            g17_initdata::CONTROL_SHARED_ADDRESS
+            G17P_BOOTSTRAP_SHARED_CONTROL_VA
         );
         apply_g17p_cold_opening_context_views(
             g17_submission::G17PColdOpeningStage::Tiling,
