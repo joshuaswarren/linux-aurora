@@ -858,6 +858,8 @@ int dcp_wait_ready(struct platform_device *pdev, u64 timeout)
 
 	if (dcp->active)
 		dcp_enable_dp2hdmi_hpd(dcp);
+	else
+		iomfb_link_timeout_snapshot(dcp);
 
 	return dcp->active ? 0 : -ETIMEDOUT;
 }
