@@ -21,30 +21,9 @@ pub(crate) const COMPUTE_EVENT_SIZE: usize = 0x400;
 pub(crate) const COMPUTE_CHANNEL_WRITE_INDEX: u32 = 3;
 pub(crate) const COMPUTE_QUEUE_POINTERS: usize = 0x100;
 const COMPUTE_QUEUE_CONTEXT_ITEM: usize = 0x200;
-/// Same offset, exported so a repeat can refresh the item the first bind wrote.
-pub(crate) const COMPUTE_QUEUE_CONTEXT_ITEM_OFFSET: usize = COMPUTE_QUEUE_CONTEXT_ITEM;
 pub(crate) const COMPUTE_ITEM_RING: usize = 0x4000;
-pub(crate) const COMPUTE_ITEM_RING_SIZE: usize = 0x500 * 8;
-pub(crate) const COMPUTE_OPTIONAL: usize = 0x6800;
-pub(crate) const COMPUTE_EVENT: usize = 0x6c00;
-/// Storage for the tag-14 `KsmKickQueueAddKicks` channel command.
-///
-/// Native allocates this record from a firmware-owned pool
-/// (`AGXFirmware::requestChannelCommandKSMKickQueueAddKicks`,
-/// mac17p `0xfffffe0008a2d664`). Linux keeps one retained slot per queue graph,
-/// placed after the tag-16 window exactly as tags 15 and 16 are placed after the
-/// command-pointer ring. A000 `0xfffffc0000011710` cache-invalidates `0x18`
-/// bytes of the record before reading it, so the reserved window is zeroed as a
-/// whole even though the host writes only `0x15` bytes.
-/// Records one steady-state submission publishes into the item ring:
-/// the tag-3 command pointer, tag 15, tag 14, tag 16.
-pub(crate) const COMPUTE_REPEAT_RING_RECORD_COUNT: usize = 4;
-pub(crate) const COMPUTE_ADD_KICKS: usize = 0x7000;
-pub(crate) const COMPUTE_ADD_KICKS_SIZE: usize = 0x40;
-const _: () = assert!(COMPUTE_ITEM_RING + COMPUTE_ITEM_RING_SIZE <= COMPUTE_OPTIONAL);
-const _: () = assert!(COMPUTE_OPTIONAL + COMPUTE_OPTIONAL_SIZE <= COMPUTE_EVENT);
-const _: () = assert!(COMPUTE_EVENT + COMPUTE_EVENT_SIZE <= COMPUTE_ADD_KICKS);
-const _: () = assert!(COMPUTE_ADD_KICKS + COMPUTE_ADD_KICKS_SIZE <= COMPUTE_QUEUE_GRAPH_SIZE);
+pub(crate) const COMPUTE_OPTIONAL: usize = 0x5000;
+pub(crate) const COMPUTE_EVENT: usize = 0x5400;
 const _: () = assert!(COMPUTE_REGISTER_COUNT <= COMPUTE_REGISTER_CAPACITY);
 
 const COMPUTE_SELECTOR: u32 = 3;
@@ -63,74 +42,9 @@ pub(crate) enum ComputeBuildError {
     CdmTerminatorBeforeStream,
     SubmissionIndexZero,
     QueueSubmissionZero,
-    InvalidSksmEntryAliases,
     SamplerCountOutOfRange,
     SamplerPair,
     SamplerAlignment,
-}
-
-/// Low and high GPU aliases of one retained SKSM entry backing.
-///
-/// Native tag-15 ConfigUpdate reads these from the same KSM queue object at
-/// `+0x80/+0x88`. Keeping them typed prevents the classic CL2 queue-context
-/// allocation from being substituted for either address.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub(crate) struct ComputeSksmEntryAliases {
-    low: u64,
-    high: u64,
-    extent: usize,
-}
-
-impl ComputeSksmEntryAliases {
-    pub(crate) const fn new(
-        low: u64,
-        high: u64,
-        extent: usize,
-        alignment: u64,
-    ) -> Result<Self, ComputeBuildError> {
-        if low == 0
-            || high == 0
-            || low == high
-            || extent == 0
-            || alignment == 0
-            || alignment & (alignment - 1) != 0
-            || low & (alignment - 1) != 0
-            || high & (alignment - 1) != 0
-            || low.checked_add(extent as u64).is_none()
-            || high.checked_add(extent as u64).is_none()
-        {
-            return Err(ComputeBuildError::InvalidSksmEntryAliases);
-        }
-        Ok(Self { low, high, extent })
-    }
-
-    pub(crate) const fn low(self) -> u64 {
-        self.low
-    }
-
-    pub(crate) const fn high(self) -> u64 {
-        self.high
-    }
-
-    pub(crate) const fn extent(self) -> usize {
-        self.extent
-    }
-
-    /// Return corresponding addresses within both aliases of the one backing.
-    pub(crate) const fn range_at(
-        self,
-        offset: usize,
-        size: usize,
-    ) -> Result<[u64; 2], ComputeBuildError> {
-        let end = match offset.checked_add(size) {
-            Some(end) => end,
-            None => return Err(ComputeBuildError::InvalidSksmEntryAliases),
-        };
-        if end > self.extent {
-            return Err(ComputeBuildError::InvalidSksmEntryAliases);
-        }
-        Ok([self.low + offset as u64, self.high + offset as u64])
-    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -312,172 +226,9 @@ pub(crate) fn build_compute_queue_graph(
     put_u32(raw, 0x48, 0x1aa);
     put_u64(raw, 0x9c, channel_control);
     put_u32(raw, 0x100 + 0x50, u32::MAX);
-    put_u32(raw, 0x100 + 0x60, compute_item_ring_entries());
+    put_u32(raw, 0x100 + 0x60, 0x500);
     put_u64(raw, 0x200 + 0x08, addresses.job_list);
     Ok(addresses)
-}
-
-/// Usable entries in the queue's item ring, as programmed into the graph's
-/// pointer block at `+0x160` and read back by both the host publisher and the
-/// firmware.
-///
-/// Normally the full `0x500`. `g17p_ring_limit` shrinks it so the ring WRAP can
-/// be reached in a handful of submissions instead of 320: at four records per
-/// submission, a 32-entry ring wraps on the eighth. Wrap behaviour is identical
-/// at any size, so this turns a 400-iteration run -- which also overflows the
-/// kernel log and destroys its own evidence -- into a 20-iteration one.
-pub(crate) fn compute_item_ring_entries() -> u32 {
-    const FULL: u32 = 0x500;
-    let requested = *crate::module_parameters::g17p_ring_limit.value();
-    if requested == 0 {
-        return FULL;
-    }
-    // Must stay a multiple of the per-submission record count so a batch never
-    // straddles the wrap differently than it would at full size, and must leave
-    // room for at least two submissions plus the always-empty slot.
-    let clamped = requested.clamp(
-        2 * COMPUTE_REPEAT_RING_RECORD_COUNT as u32 + 4,
-        FULL,
-    );
-    clamped - (clamped % COMPUTE_REPEAT_RING_RECORD_COUNT as u32)
-}
-
-/// Encode the tag-15 `KSMKickQueueConfigUpdate` record inside a retained
-/// queue graph.
-///
-/// Split out of the first-bind builder because macOS republishes this record
-/// on EVERY submission -- both live captures (QID 0x11 and QID 0x16) are of
-/// already-installed queues and both still carry a tag-15 ConfigUpdate. The
-/// only field that differs between a first bind and a repeat is the
-/// queue-install flag at `+0x1a`. Nothing outside the optional-record window
-/// is touched, so a repeat submission can call this without resetting the
-/// item-ring producer or rewriting the queue header the way the first-bind
-/// builder does.
-pub(crate) fn encode_compute_config_update(
-    graph: &mut [u8],
-    sksm_entries: ComputeSksmEntryAliases,
-    shared_control: u64,
-    channel_control: u64,
-    queue_id: u8,
-    install_queue: bool,
-    context_id: Option<u16>,
-) -> Result<(), ComputeBuildError> {
-    // Record +0x32 is the hardware context this queue's work is declared to run
-    // in. It has always been the literal 2, from when every compute client ran
-    // in the fixed pair `T8140_COMPUTE_CTXS = [2, 3]`.
-    //
-    // Those two contexts are a SINGLE GLOBAL alias pair:
-    // `install_t8140_compute_context_alias` publishes the current client's VM
-    // root into both and records one `t8140_alias_owner`. With one compute
-    // client that is correct. With a second, the alias is re-pointed and the
-    // loser's kicks -- still declaring 2 -- no longer name their own root,
-    // while their real root lives in the app context the execution context
-    // allocated (5..62). The kick already declares that real context at
-    // `sgx+0x10428`; only this record still says 2.
-    //
-    // Probe-gated and default-off: 0 sends the historical constant, byte
-    // identical to the previous driver; 1 sends the client's real context when
-    // one is known. See `g17p_compute_config_context`.
-    let declared_context = match context_id {
-        Some(context) if *crate::module_parameters::g17p_compute_config_context.value() != 0 => {
-            context
-        }
-        _ => 2u16,
-    };
-    let flushid_fix = *crate::module_parameters::g17p_flushid_fix.value() != 0;
-    let (flushid_object, flushid_slot, flushid_index) = if flushid_fix {
-        (0u64, 0xffffu16, 0xffffu16)
-    } else {
-        (shared_control, 0x3fu16, 0u16)
-    };
-    let optional_raw = graph
-        .get_mut(COMPUTE_OPTIONAL..COMPUTE_OPTIONAL + COMPUTE_OPTIONAL_SIZE)
-        .ok_or(ComputeBuildError::BufferTooSmall)?;
-    optional_raw.fill(0);
-    put_u32(optional_raw, 0x00, 0x0f);
-    put_u64(optional_raw, 0x08, sksm_entries.low());
-    put_u64(optional_raw, 0x10, sksm_entries.high());
-    for (offset, value) in [
-        (0x18, u16::from(queue_id)),
-        // +0x1a is the QUEUE-INSTALL flag, and it must be non-zero on a first
-        // bind. Firmware RE (2026-08-31): the only writer of the per-queue slot
-        // `0x127628 + qid*0x28` is at 0x119b8, and that store -- together with
-        // slot[+0x00]=1, the per-data-master active bitmap, the sgx+0x21008
-        // queue-base write and the 0x40 KTrace receipt -- is reachable only when
-        // this field is non-zero. Sending 0 left slot[+0x08] NULL, and the tag-16
-        // handler then faulted dereferencing it (firmware exception pc=0x1190c
-        // far=0x340 esr=0x96000004, a level-0 translation fault), which is why
-        // pause bit 7 taken at 0x118c0 was never cleared at 0x11948.
-        //
-        // The two captured macOS records show 0 here because both were taken on
-        // already-installed queues, not on a first bind. Absence of the 0x40
-        // KTrace code is the receipt that the install branch was not taken.
-        // Queue-install flag: 1 only on a queue's FIRST bind. Native clears it
-        // afterwards -- leaving it set forces a disable/reprogram/enable cycle
-        // on the KSMFE queue for every submission, which is why a second submit
-        // published fine and then never completed.
-        (0x1a, if install_queue { 1 } else { 0 }),
-        (0x1e, 2),
-        (0x22, 2),
-        (0x32, declared_context),
-        (0x3e, flushid_slot),
-        (0x46, flushid_index),
-        (0x52, 1),
-        (0x56, 1),
-        (0x5a, 0x170),
-        (0x5e, 2),
-        (0x62, 1),
-        (0x66, 1),
-    ] {
-        put_u16(optional_raw, offset, value);
-    }
-    put_u64(optional_raw, 0x36, flushid_object);
-    put_u64(optional_raw, 0x4a, channel_control);
-    optional_raw[0x76..0x86].fill(0xff);
-    Ok(())
-}
-
-/// Encode one queue-context item.
-///
-/// The array is a sibling of the SKSM entry array, not a single record:
-/// `COMPUTE_QUEUE_CONTEXT_EXTENT` is `8 * 0x4000 = 0x20000`, the item stride is
-/// `0x200`, so it holds `0x100` items -- exactly the queue geometry's
-/// `stamp_count`, and exactly the size and stride of the entry backing
-/// (`0x100 * 0x200 = 0x20000`). The first bind writes item 1 and consumes stamp
-/// index 1, which is consistent with the item being indexed by stamp.
-///
-/// That reading is INFERRED from the geometry, not proven, which is why the
-/// repeat path selects between "rewrite item 1" and "write item[stamp]" by
-/// parameter instead of assuming.
-pub(crate) fn encode_compute_queue_context_item(
-    queue_context: &mut [u8],
-    item_index: usize,
-    descriptor: u64,
-    queue_base: u64,
-    queue_id: u8,
-) -> Result<(), ComputeBuildError> {
-    let offset = item_index
-        .checked_mul(COMPUTE_QUEUE_CONTEXT_ITEM)
-        .ok_or(ComputeBuildError::AddressOverflow)?;
-    let end = offset
-        .checked_add(COMPUTE_QUEUE_CONTEXT_ITEM)
-        .ok_or(ComputeBuildError::AddressOverflow)?;
-    if end > queue_context.len() {
-        return Err(ComputeBuildError::BufferTooSmall);
-    }
-    let context = &mut queue_context[offset..end];
-    context.fill(0);
-    put_u64(context, 0x00, 0x1000_1000_0000_0004);
-    put_u64(context, 0x10, descriptor);
-    put_u64(context, 0x18, queue_base);
-    put_u64(context, 0x20, 0xffff_0801_0000_0001);
-    put_u64(context, 0x28, u64::from(queue_id) << 40);
-    put_u64(context, 0x130, 0);
-    put_u64(context, 0x138, 4);
-    put_u64(context, 0x150, 0x0001_1003_8001_a002);
-    put_u64(context, 0x158, 0x0000_2003_8001_a03b);
-    put_u64(context, 0x178, 0x003f_ffff_ffff_ffff);
-    Ok(())
 }
 
 /// Stage the first hardware-proven direct-compute group in a retained queue.
@@ -489,14 +240,12 @@ pub(crate) fn encode_compute_queue_context_item(
 pub(crate) fn build_initial_compute_channel_group(
     base: u64,
     descriptor: u64,
-    sksm_entries: ComputeSksmEntryAliases,
+    context_low: u64,
+    context_high: u64,
     shared_control: u64,
     channel_control: u64,
-    queue_id: u8,
     graph: &mut [u8],
     queue_context: &mut [u8],
-    install_queue: bool,
-    context_id: Option<u16>,
 ) -> Result<ComputeChannelGroupAddresses, ComputeBuildError> {
     if graph.len() < COMPUTE_QUEUE_GRAPH_SIZE
         || queue_context.len() < COMPUTE_QUEUE_CONTEXT_SIZE
@@ -519,40 +268,52 @@ pub(crate) fn build_initial_compute_channel_group(
         COMPUTE_CHANNEL_WRITE_INDEX,
     );
 
-    // Tag-15 FlushID triple. Ours (shared_control / 0x3f / 1) is inferred, and
-    // because +0x36 is non-zero the firmware runs its FlushID bind path, which
-    // indexes `0x5b778 + rec[0x46]*0xe8` unbounded. The kext writes 0 / -1 / -1
-    // for a non-first bind, which makes the firmware skip the block, and
-    // PROVENANCE.md records that T8140 leaves the AGXSKSMFlushID bit clear.
-    // The non-fix tuple's third element lands at +0x46. Native writes 0 there:
-    // both compute-queue tag-15 records captured live on macOS 26.6.2 (QID 0x11
-    // and QID 0x16) have +0x46 = 0, so it is a constant. The +0x3e slot is NOT a
-    // constant -- native carries a live per-queue counter there (0x719 / 0x770,
-    // copied from AGXKSMKickQueueG16 +0x28), so 0x3f stays until that counter's
-    // provenance is known. Do not substitute the kext's 0/-1/-1 non-first-bind
-    // constants; those have hard-killed the machine twice.
-    encode_compute_config_update(
-        graph,
-        sksm_entries,
-        shared_control,
-        channel_control,
-        queue_id,
-        install_queue,
-        context_id,
-    )?;
+    let optional_raw = &mut graph[COMPUTE_OPTIONAL..COMPUTE_OPTIONAL + COMPUTE_OPTIONAL_SIZE];
+    optional_raw.fill(0);
+    put_u32(optional_raw, 0x00, 0x0f);
+    put_u64(optional_raw, 0x08, context_low);
+    put_u64(optional_raw, 0x10, context_high);
+    for (offset, value) in [
+        (0x18, 4u16),
+        (0x1a, 1),
+        (0x1e, 2),
+        (0x22, 2),
+        (0x32, 2),
+        (0x3e, 0x3f),
+        (0x46, 1),
+        (0x52, 1),
+        (0x56, 1),
+        (0x5a, 0x170),
+        (0x5e, 2),
+        (0x62, 1),
+        (0x66, 1),
+    ] {
+        put_u16(optional_raw, offset, value);
+    }
+    put_u64(optional_raw, 0x36, shared_control);
+    put_u64(optional_raw, 0x4a, channel_control);
+    optional_raw[0x76..0x86].fill(0xff);
 
     let event_raw = &mut graph[COMPUTE_EVENT..COMPUTE_EVENT + COMPUTE_EVENT_SIZE];
     event_raw.fill(0);
     put_u32(event_raw, 0x00, 0x0e);
-    put_u32(event_raw, 0x04, (1u32 << 16) | u32::from(queue_id));
+    put_u32(event_raw, 0x04, 0x0001_0004);
     put_u32(event_raw, 0x08, 0x0102);
     put_u32(event_raw, 0x10, 0x0200);
 
     queue_context[..COMPUTE_QUEUE_CONTEXT_SIZE].fill(0);
-    // Item index 1, which is also the stamp index the first bind consumes
-    // (the geometry seeds `current_timestamp` at 1). See
-    // `encode_compute_queue_context_item` for why that coincidence matters.
-    encode_compute_queue_context_item(queue_context, 1, descriptor, base, queue_id)?;
+    let context = &mut queue_context
+        [COMPUTE_QUEUE_CONTEXT_ITEM..COMPUTE_QUEUE_CONTEXT_ITEM + 0x200];
+    put_u64(context, 0x00, 0x1000_1000_0000_0004);
+    put_u64(context, 0x10, descriptor);
+    put_u64(context, 0x18, base);
+    put_u64(context, 0x20, 0xffff_0801_0000_0001);
+    put_u64(context, 0x28, 4u64 << 40);
+    put_u64(context, 0x130, 0);
+    put_u64(context, 0x138, 4);
+    put_u64(context, 0x150, 0x0001_1003_8001_a002);
+    put_u64(context, 0x158, 0x0000_2003_8001_a03b);
+    put_u64(context, 0x178, 0x003f_ffff_ffff_ffff);
 
     Ok(ComputeChannelGroupAddresses {
         queue: base,
@@ -875,69 +636,24 @@ mod tests {
         let addresses = build_initial_compute_channel_group(
             base,
             descriptor,
-            ComputeSksmEntryAliases::new(
-                0x70_0040_0000,
-                0xffff_fc20_c300_0000,
-                0x8000,
-                0x100,
-            )
-            .unwrap(),
+            0x70_0040_0000,
+            0xffff_fc20_c300_0000,
             0xffff_fc20_c400_0000,
             0xffff_fc20_c500_0000,
-            4,
             &mut graph,
             &mut context,
-            true,
-            None,
         )
         .unwrap();
         assert_eq!(
             addresses,
             ComputeChannelGroupAddresses {
                 queue: base,
-                optional: base + 0x6800,
-                event: base + 0x6c00,
+                optional: base + 0x5000,
+                event: base + 0x5400,
                 write_index: 3,
             }
         );
-        assert_eq!(fnv1a64(&graph), 0xc8d6_b367_6415_8da7);
+        assert_eq!(fnv1a64(&graph), 0x7eb0_0e86_2d6b_2c57);
         assert_eq!(fnv1a64(&context), 0x5ba5_b355_8c90_0783);
-    }
-
-    #[test]
-    fn sksm_entry_aliases_preserve_one_backing_offset() {
-        const EXTENT: usize = 0x8000;
-        let aliases = ComputeSksmEntryAliases::new(
-            0x70_004d_8000,
-            0xffff_fc20_0027_8000,
-            EXTENT,
-            0x100,
-        )
-        .unwrap();
-        assert_eq!(
-            aliases.range_at(0x200, 0x200),
-            Ok([0x70_004d_8200, 0xffff_fc20_0027_8200])
-        );
-        assert_eq!(
-            aliases.range_at(EXTENT - 0x200, 0x200),
-            Ok([0x70_004d_fe00, 0xffff_fc20_0027_fe00])
-        );
-        assert_eq!(
-            aliases.range_at(EXTENT, 1),
-            Err(ComputeBuildError::InvalidSksmEntryAliases)
-        );
-        assert_eq!(
-            ComputeSksmEntryAliases::new(0x70_004d_8000, 0x70_004d_8000, EXTENT, 0x100),
-            Err(ComputeBuildError::InvalidSksmEntryAliases)
-        );
-        assert_eq!(
-            ComputeSksmEntryAliases::new(
-                0x70_004d_8001,
-                0xffff_fc20_0027_8000,
-                EXTENT,
-                0x100,
-            ),
-            Err(ComputeBuildError::InvalidSksmEntryAliases)
-        );
     }
 }

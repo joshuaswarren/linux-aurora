@@ -86,6 +86,12 @@ impl UatGeometry {
         !self.root_mask()
     }
 
+    /// Top of the lower/user (TTBR0) address space: the per-root translation
+    /// size. `1 << 39` on AGX2, `1 << 42` on AGX3.
+    pub(crate) const fn user_va_top(self) -> u64 {
+        self.root_size()
+    }
+
     /// Base of the driver-managed kernel VA window inside the upper root.
     pub(crate) const fn kernel_va_base(self) -> u64 {
         self.upper_canonical_base() + KERNEL_VA_WINDOW_BASE_OFFSET
@@ -141,6 +147,14 @@ mod tests {
         assert_eq!(new.ttbr_selector(), 0x400_0000_0000);
         assert_eq!(old.upper_canonical_base(), 0xffff_ff80_0000_0000);
         assert_eq!(new.upper_canonical_base(), 0xffff_fc00_0000_0000);
+    }
+
+    #[test]
+    fn user_va_top_tracks_the_per_root_width() {
+        // 39-bit roots reproduce the AGX2-proven user top byte-for-byte;
+        // 42-bit roots extend it to the full per-root translation size.
+        assert_eq!(UatGeometry::new(39).unwrap().user_va_top(), 1 << 39);
+        assert_eq!(UatGeometry::new(42).unwrap().user_va_top(), 1 << 42);
     }
 
     #[test]

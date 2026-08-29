@@ -161,6 +161,11 @@ struct apple_dcp {
 
 	/* Coprocessor control register */
 	void __iomem *coproc_reg;
+	/* Locked firmware entry point supplied by iBoot. */
+	void __iomem *iop_vbar_reg;
+	bool fresh_boot_cpu_started;
+	bool adopted_session;
+	bool adopted_session_module_pinned;
 
 	/* DCP has crashed */
 	bool crashed;
@@ -180,10 +185,21 @@ struct apple_dcp {
 	/* DCP shared memory */
 	void *shmem;
 	dma_addr_t shmem_iova;
+	bool shmem_inherited;
 	u32 link_top[2][APPLE_DCP_LINK_STREAMS_PER_SIDE];
 	u16 link_version;
 	u32 link_firmware_hash;
-	bool link_ready;
+	u64 link_init_message;
+	u16 link_rx_log_count;
+	u16 link_reply_log_count;
+	/* Serializes firmware type0 with the inherited-session timed INIT. */
+	struct mutex link_init_lock;
+	enum apple_dcp_link_state link_state;
+	bool link_endpoint_started;
+	struct work_struct link_service_match_work;
+	unsigned long link_service_match_state;
+	__le32 *link_service_match_output;
+	int link_service_match_callback_tag;
 
 	/* Display registers mappable to the DCP */
 	struct resource *disp_registers[MAX_DISP_REGISTERS];
@@ -325,6 +341,7 @@ struct apple_dcp {
 };
 
 void dcp_drm_crtc_page_flip(struct apple_dcp *dcp, ktime_t now);
+void iomfb_link_timeout_snapshot(struct apple_dcp *dcp);
 
 int dcp_backlight_register(struct apple_dcp *dcp);
 int dcp_backlight_update(struct apple_dcp *dcp);

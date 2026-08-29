@@ -2120,6 +2120,8 @@ static void res_is_main_display(struct apple_dcp *dcp, void *out, void *cookie)
 	dev_info(dcp->dev, "DCP is_main_display: %d\n", result);
 
 	dcp->main_display = result != 0;
+	dev_info(dcp->dev, "DCP services ready: main display %d, modes %u\n",
+		 dcp->main_display, dcp->nr_modes);
 
 
 	connector = dcp->connector;

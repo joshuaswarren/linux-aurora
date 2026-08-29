@@ -89,33 +89,6 @@ const fn complete_coverage(expected: u64, visited: u64, permitted: bool) -> bool
     permitted && visited == expected
 }
 
-/// One maximal run of leaf-mapped pages found by
-/// [`UatPageTable::collect_mapped_ranges`].
-///
-/// `pte` is the run's first leaf entry, kept so a caller can tell a
-/// GPU-readable mapping apart from a firmware-only one without walking again.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
-pub(crate) struct MappedRange {
-    pub(crate) start: u64,
-    pub(crate) end: u64,
-    pub(crate) pte: u64,
-}
-
-fn push_mapped_range(
-    out: &mut [MappedRange],
-    count: &mut usize,
-    truncated: &mut bool,
-    run: MappedRange,
-) {
-    match out.get_mut(*count) {
-        Some(slot) => {
-            *slot = run;
-            *count += 1;
-        }
-        None => *truncated = true,
-    }
-}
-
 #[cfg(CONFIG_DEV_COREDUMP)]
 pub(crate) const PTE_ADDR_BITS: u64 = (!UAT_PGMSK as u64) & (!UAT_HIGH_BITS);
 
@@ -538,44 +511,6 @@ impl UatPageTable {
         self.with_pages(iova_range, true, false, |_, _| Ok(()))
     }
 
-    /// Reserve every intermediate table required by a new leaf mapping and
-    /// prove that the complete destination span is empty before any leaf is
-    /// installed.  GPUVM and the driver's fixed-mapping allocator are
-    /// intentionally separate address managers, so neither allocator alone
-    /// can detect ownership held by the other one.  The page table is the
-    /// authoritative final arbiter.
-    pub(crate) fn prepare_map(&mut self, iova_range: Range<u64>) -> Result {
-        if iova_range.is_empty()
-            || (iova_range.start | iova_range.end) & UAT_PGMSK as u64 != 0
-        {
-            return Err(EINVAL);
-        }
-
-        let mut occupied = None;
-        self.with_pages(iova_range.clone(), false, false, |iova, ptes| {
-            for (index, pte) in ptes.iter().enumerate() {
-                let value = pte.load(Ordering::Acquire);
-                if value != 0 && occupied.is_none() {
-                    occupied = Some((iova + (index * UAT_PGSZ) as u64, value));
-                }
-            }
-            Ok(())
-        })?;
-        if let Some((iova, pte)) = occupied {
-            pr_err!(
-                "UATPageTable::prepare_map: Page at IOVA {:#x} is already owned (PTE: {:#x})\n",
-                iova,
-                pte
-            );
-            return Err(EBUSY);
-        }
-
-        // Do all fallible page-table allocation before installing any leaf.
-        // A failed allocation can leave empty intermediate tables behind, but
-        // it can never leave a partially visible object mapping.
-        self.alloc_pages(iova_range)
-    }
-
     /// Check that every page in an aligned range is mapped with the requested
     /// GPU permissions. Missing intermediate page tables are detected by the
     /// visited-page count because `with_pages` skips those holes.
@@ -605,62 +540,6 @@ impl UatPageTable {
             Ok(())
         })?;
         Ok(complete_coverage(expected, visited, permitted))
-    }
-
-    /// Collect the maximal runs of leaf-mapped pages inside `iova_range`.
-    ///
-    /// This reads page-table memory only -- ordinary DRAM, never GPU MMIO --
-    /// so it is safe to call with the GPU cores power-gated, which is the
-    /// state a faulted submission leaves them in.  Holes are skipped at
-    /// whole-table granularity by `with_pages`, so walking the full user
-    /// window costs one pass over the tables that actually exist.
-    ///
-    /// Returns the number of runs written to `out` and whether `out` was too
-    /// small to hold them all.
-    pub(crate) fn collect_mapped_ranges(
-        &mut self,
-        iova_range: Range<u64>,
-        out: &mut [MappedRange],
-    ) -> Result<(usize, bool)> {
-        if (iova_range.start | iova_range.end) & UAT_PGMSK as u64 != 0 {
-            return Err(EINVAL);
-        }
-
-        let page = UAT_PGSZ as u64;
-        let mut count = 0usize;
-        let mut truncated = false;
-        let mut current: Option<MappedRange> = None;
-
-        self.with_pages(iova_range, false, false, |iova, ptes| {
-            for (idx, ppte) in ptes.iter().enumerate() {
-                let pte = ppte.load(Ordering::Acquire);
-                let addr = iova + (idx as u64) * page;
-                if pte & PTE_TYPE_BITS == PTE_TYPE_LEAF_TABLE {
-                    if let Some(run) = current.as_mut() {
-                        if run.end == addr {
-                            run.end = addr + page;
-                            continue;
-                        }
-                    }
-                    if let Some(run) = current.take() {
-                        push_mapped_range(out, &mut count, &mut truncated, run);
-                    }
-                    current = Some(MappedRange {
-                        start: addr,
-                        end: addr + page,
-                        pte,
-                    });
-                } else if let Some(run) = current.take() {
-                    push_mapped_range(out, &mut count, &mut truncated, run);
-                }
-            }
-            Ok(())
-        })?;
-
-        if let Some(run) = current.take() {
-            push_mapped_range(out, &mut count, &mut truncated, run);
-        }
-        Ok((count, truncated))
     }
 
     fn pte_bits(&self) -> u64 {
@@ -935,32 +814,6 @@ impl UatPageTable {
         ias: u8,
         oas: u32,
     ) -> Result {
-        Self::copy_from_phys_root_inner(ttb, address, out, ias, oas, false)
-    }
-
-    /// Copy a live firmware-owned DVA after invalidating every page-table and
-    /// payload cacheline before it is read. This is the dynamic-pointer form
-    /// of [`Self::copy_live_firmware_physical_range`].
-    #[cfg(CONFIG_DEV_COREDUMP)]
-    pub(crate) fn copy_live_from_phys_root(
-        ttb: PhysicalAddr,
-        address: u64,
-        out: &mut [u8],
-        ias: u8,
-        oas: u32,
-    ) -> Result {
-        Self::copy_from_phys_root_inner(ttb, address, out, ias, oas, true)
-    }
-
-    #[cfg(CONFIG_DEV_COREDUMP)]
-    fn copy_from_phys_root_inner(
-        ttb: PhysicalAddr,
-        address: u64,
-        out: &mut [u8],
-        ias: u8,
-        oas: u32,
-        live: bool,
-    ) -> Result {
         if out.is_empty() || (ttb | address | out.len() as u64) & 7 != 0 {
             return Err(EINVAL);
         }
@@ -982,9 +835,6 @@ impl UatPageTable {
                 let shift = UAT_PGBIT + (level + 1) * UAT_LVBIT;
                 let index = ((iova_page >> shift) & UAT_LVMSK) as usize;
                 let table = PhysPageMapping::new(table_phys)?;
-                if live {
-                    table.invalidate_live_range(index * PTE_SIZE, PTE_SIZE)?;
-                }
                 let pte = table.read_u64(index * PTE_SIZE)?;
                 if pte & PTE_TYPE_BITS != PTE_TYPE_LEAF_TABLE {
                     pr_err!(
@@ -1001,9 +851,6 @@ impl UatPageTable {
 
             let leaf_index = ((iova_page >> UAT_PGBIT) & UAT_LVMSK) as usize;
             let leaf_table = PhysPageMapping::new(table_phys)?;
-            if live {
-                leaf_table.invalidate_live_range(leaf_index * PTE_SIZE, PTE_SIZE)?;
-            }
             let leaf = leaf_table.read_u64(leaf_index * PTE_SIZE)?;
             if leaf & PTE_TYPE_BITS != PTE_TYPE_LEAF_TABLE {
                 pr_err!(
@@ -1022,9 +869,6 @@ impl UatPageTable {
             let payload = PhysPageMapping::new(payload_phys)?;
             let offset = (iova & page_mask) as usize;
             let length = (UAT_PGSZ - offset).min(out.len() - copied);
-            if live {
-                payload.invalidate_live_range(offset, length)?;
-            }
             payload.copy_atomic(offset, &mut out[copied..copied + length])?;
             copied = copied.checked_add(length).ok_or(EOVERFLOW)?;
         }
@@ -1057,159 +901,11 @@ impl UatPageTable {
         }
         Ok(data)
     }
-
-    /// Write a bounded range back into a firmware carveout identified by
-    /// physical address, cleaning the AP cache behind every page.
-    ///
-    /// This is the one path in the driver that writes firmware-owned memory.
-    /// It exists so a restarted ASC can be given back the `__DATA` segment
-    /// iBoot placed for it, which the previous firmware instance has been
-    /// running out of: an ASC coming out of a real block reset re-enters at
-    /// `IORVBAR` with whatever its predecessor left in its own globals.
-    #[cfg(CONFIG_DEV_COREDUMP)]
-    pub(crate) fn restore_firmware_physical_range(
-        physical: PhysicalAddr,
-        data: &[u8],
-    ) -> Result {
-        if data.is_empty() || (physical | data.len() as u64) & 7 != 0 {
-            return Err(EINVAL);
-        }
-        physical.checked_add(data.len() as u64).ok_or(EOVERFLOW)?;
-        let page_mask = UAT_PGMSK as u64;
-        let mut written = 0usize;
-        while written < data.len() {
-            let address = physical.checked_add(written as u64).ok_or(EOVERFLOW)?;
-            let page = PhysPageMapping::new(address & !page_mask)?;
-            let offset = (address & page_mask) as usize;
-            let length = (UAT_PGSZ - offset).min(data.len() - written);
-            page.write_atomic(offset, &data[written..written + length])?;
-            written = written.checked_add(length).ok_or(EOVERFLOW)?;
-        }
-        Ok(())
-    }
-
-    /// Copy a live firmware-data range after invalidating the AP cache alias.
-    ///
-    /// Unlike crashlog storage, scheduler state can change between two host
-    /// samples. A write-back `memremap()` can therefore return an AP cacheline
-    /// retained from the preceding sample. Invalidate each covered cacheline
-    /// before loading it, matching the physical-read cache maintenance used by
-    /// the output-positive m1n1 host. This path never writes firmware memory.
-    #[cfg(CONFIG_DEV_COREDUMP)]
-    pub(crate) fn copy_live_firmware_physical_range(
-        physical: PhysicalAddr,
-        size: usize,
-    ) -> Result<KVVec<u8>> {
-        if size == 0 || (physical | size as u64) & 7 != 0 {
-            return Err(EINVAL);
-        }
-        physical.checked_add(size as u64).ok_or(EOVERFLOW)?;
-        let page_mask = UAT_PGMSK as u64;
-        let mut data = KVVec::from_elem(0, size, GFP_KERNEL)?;
-        let mut copied = 0usize;
-        while copied < size {
-            let address = physical.checked_add(copied as u64).ok_or(EOVERFLOW)?;
-            let page = PhysPageMapping::new(address & !page_mask)?;
-            let offset = (address & page_mask) as usize;
-            let length = (UAT_PGSZ - offset).min(size - copied);
-            page.invalidate_live_range(offset, length)?;
-            page.copy_atomic(offset, &mut data[copied..copied + length])?;
-            copied = copied.checked_add(length).ok_or(EOVERFLOW)?;
-        }
-        Ok(data)
-    }
 }
 
 #[cfg(CONFIG_DEV_COREDUMP)]
 struct PhysPageMapping {
     ptr: NonNull<c_void>,
-}
-
-/// A bounded read-only probe for one qword in live firmware-owned physical
-/// memory.
-///
-/// Construction maps the containing page once. [`Self::observe_mask`] then
-/// invalidates only the sampled AP cacheline before each load, so a short
-/// firmware transition can be observed without remapping, writing, or holding
-/// any firmware lock.
-#[cfg(CONFIG_DEV_COREDUMP)]
-pub(crate) struct LiveFirmwareU64Probe {
-    page: PhysPageMapping,
-    offset: usize,
-}
-
-/// Result of one bounded live-mask observation.
-#[cfg(CONFIG_DEV_COREDUMP)]
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub(crate) struct LiveFirmwareMaskObservation {
-    pub(crate) first: u64,
-    pub(crate) last: u64,
-    pub(crate) observed_or: u64,
-    pub(crate) mask_seen: bool,
-    pub(crate) polls: usize,
-}
-
-#[cfg(CONFIG_DEV_COREDUMP)]
-impl LiveFirmwareU64Probe {
-    const MAX_POLLS: usize = 256;
-
-    pub(crate) fn new(physical: PhysicalAddr) -> Result<Self> {
-        if physical & 7 != 0 {
-            return Err(EINVAL);
-        }
-        let page_mask = UAT_PGMSK as u64;
-        let page = PhysPageMapping::new(physical & !page_mask)?;
-        let offset = (physical & page_mask) as usize;
-        if offset.checked_add(size_of::<u64>()).ok_or(EOVERFLOW)? > UAT_PGSZ {
-            return Err(EINVAL);
-        }
-        Ok(Self { page, offset })
-    }
-
-    /// Observe one mask for at most `polls` cache-invalidated qword loads.
-    /// DIAGNOSTIC. Set bits in the probed qword; returns (before, after).
-    pub(crate) fn set_bits(&self, bits: u64) -> Result<(u64, u64)> {
-        self.page.set_bits_u64(self.offset, bits)
-    }
-
-    pub(crate) fn observe_mask(
-        &self,
-        mask: u64,
-        polls: usize,
-    ) -> Result<LiveFirmwareMaskObservation> {
-        if mask == 0 || polls == 0 || polls > Self::MAX_POLLS {
-            return Err(EINVAL);
-        }
-
-        let mut first = 0;
-        let mut last = 0;
-        let mut observed_or = 0;
-        let mut mask_seen = false;
-        let mut completed = 0;
-        for index in 0..polls {
-            self.page.invalidate_live_range(self.offset, size_of::<u64>())?;
-            let value = self.page.read_u64(self.offset)?;
-            if index == 0 {
-                first = value;
-            }
-            last = value;
-            observed_or |= value;
-            completed = index + 1;
-            if value & mask != 0 {
-                mask_seen = true;
-                break;
-            }
-            core::hint::spin_loop();
-        }
-
-        Ok(LiveFirmwareMaskObservation {
-            first,
-            last,
-            observed_or,
-            mask_seen,
-            polls: completed,
-        })
-    }
 }
 
 #[cfg(CONFIG_DEV_COREDUMP)]
@@ -1235,50 +931,6 @@ impl PhysPageMapping {
         Ok(Self { ptr })
     }
 
-    fn invalidate_live_range(&self, offset: usize, size: usize) -> Result {
-        let end = offset.checked_add(size).ok_or(EOVERFLOW)?;
-        if size == 0 || end > UAT_PGSZ {
-            return Err(EINVAL);
-        }
-        let ctr_el0: u64;
-        unsafe {
-            // SAFETY: CTR_EL0 is readable at EL1 and reports DminLine as
-            // log2(words). The resulting line size controls only bounded cache
-            // maintenance on this read-only mapping.
-            core::arch::asm!(
-                "mrs {ctr}, ctr_el0",
-                ctr = out(reg) ctr_el0,
-                options(nomem, nostack, preserves_flags),
-            );
-        }
-        let line_size = 4usize
-            .checked_shl(((ctr_el0 >> 16) & 0xf) as u32)
-            .ok_or(EOVERFLOW)?;
-        if !line_size.is_power_of_two() {
-            return Err(EINVAL);
-        }
-        let start_address = self.ptr.as_ptr() as usize + offset;
-        let end_address = self.ptr.as_ptr() as usize + end;
-        let mut address = start_address & !(line_size - 1);
-        unsafe {
-            // SAFETY: the page remains mapped for the whole loop. `dc ivac`
-            // invalidates AP cachelines only; this diagnostic never writes the
-            // firmware-owned page. The barriers order invalidation before the
-            // atomic loads in `copy_atomic()`.
-            core::arch::asm!("dsb osh", options(nostack, preserves_flags));
-            while address < end_address {
-                core::arch::asm!(
-                    "dc ivac, {address}",
-                    address = in(reg) address,
-                    options(nostack, preserves_flags),
-                );
-                address = address.checked_add(line_size).ok_or(EOVERFLOW)?;
-            }
-            core::arch::asm!("dsb osh", options(nostack, preserves_flags));
-        }
-        Ok(())
-    }
-
     fn read_u64(&self, offset: usize) -> Result<u64> {
         let end = offset.checked_add(8).ok_or(EOVERFLOW)?;
         if offset & 7 != 0 || end > UAT_PGSZ {
@@ -1289,98 +941,6 @@ impl PhysPageMapping {
             self.ptr.as_ptr().cast::<u8>().add(offset).cast::<AtomicU64>()
         };
         Ok(unsafe { &*pointer }.load(Ordering::Acquire))
-    }
-
-    /// DIAGNOSTIC. Set bits in one firmware-DRAM qword.
-    ///
-    /// The b1 image gates KTrace emission on class bytes at 0x17780c/0x17780d:
-    /// bit 0 is the only one this driver has ever had set, which is why the
-    /// halt-decision records (0x909 with the scan's own inputs, 0x113 at the
-    /// thread-4 wake, 0x105, 0x110) have never appeared in a capture. Arming
-    /// them is a read-modify-write of a debug-enable byte the firmware only
-    /// reads; it steers no scheduling decision.
-    fn set_bits_u64(&self, offset: usize, bits: u64) -> Result<(u64, u64)> {
-        let end = offset.checked_add(8).ok_or(EOVERFLOW)?;
-        if offset & 7 != 0 || end > UAT_PGSZ {
-            return Err(EINVAL);
-        }
-        let pointer = unsafe {
-            // SAFETY: offset is qword-aligned and bounded to the mapped page,
-            // exactly as read_u64 checks above.
-            self.ptr.as_ptr().cast::<u8>().add(offset).cast::<AtomicU64>()
-        };
-        let cell = unsafe { &*pointer };
-        let before = cell.load(Ordering::Acquire);
-        cell.store(before | bits, Ordering::Release);
-        let after = cell.load(Ordering::Acquire);
-        Ok((before, after))
-    }
-
-    /// Clean AP cachelines covering a range this mapping has just written.
-    ///
-    /// The mapping is write-back, so a store can sit in an AP cacheline the
-    /// coprocessor's fetch path will not see. `invalidate_live_range()` above
-    /// is the read-side mirror of this; keep the two symmetric.
-    fn clean_written_range(&self, offset: usize, size: usize) -> Result {
-        let end = offset.checked_add(size).ok_or(EOVERFLOW)?;
-        if size == 0 || end > UAT_PGSZ {
-            return Err(EINVAL);
-        }
-        let ctr_el0: u64;
-        unsafe {
-            // SAFETY: CTR_EL0 is readable at EL1 and reports DminLine as
-            // log2(words); the value bounds cache maintenance only.
-            core::arch::asm!(
-                "mrs {ctr}, ctr_el0",
-                ctr = out(reg) ctr_el0,
-                options(nomem, nostack, preserves_flags),
-            );
-        }
-        let line_size = 4usize
-            .checked_shl(((ctr_el0 >> 16) & 0xf) as u32)
-            .ok_or(EOVERFLOW)?;
-        if !line_size.is_power_of_two() {
-            return Err(EINVAL);
-        }
-        let start_address = self.ptr.as_ptr() as usize + offset;
-        let end_address = self.ptr.as_ptr() as usize + end;
-        let mut address = start_address & !(line_size - 1);
-        unsafe {
-            // SAFETY: the page stays mapped for the whole loop. `dc cvac`
-            // cleans AP cachelines to the point of coherency; the barriers
-            // order the preceding stores before the clean and the clean before
-            // anything the coprocessor is subsequently told to do.
-            core::arch::asm!("dsb osh", options(nostack, preserves_flags));
-            while address < end_address {
-                core::arch::asm!(
-                    "dc cvac, {address}",
-                    address = in(reg) address,
-                    options(nostack, preserves_flags),
-                );
-                address = address.checked_add(line_size).ok_or(EOVERFLOW)?;
-            }
-            core::arch::asm!("dsb osh", options(nostack, preserves_flags));
-        }
-        Ok(())
-    }
-
-    fn write_atomic(&self, offset: usize, data: &[u8]) -> Result {
-        let end = offset.checked_add(data.len()).ok_or(EOVERFLOW)?;
-        if (offset | data.len()) & 7 != 0 || end > UAT_PGSZ {
-            return Err(EINVAL);
-        }
-        for (index, source) in data.chunks_exact(size_of::<u64>()).enumerate() {
-            let at = offset + index * size_of::<u64>();
-            let pointer = unsafe {
-                // SAFETY: `at` is qword-aligned and bounded to the mapped page
-                // by the check above.
-                self.ptr.as_ptr().cast::<u8>().add(at).cast::<AtomicU64>()
-            };
-            let mut qword = [0u8; size_of::<u64>()];
-            qword.copy_from_slice(source);
-            unsafe { &*pointer }.store(u64::from_le_bytes(qword), Ordering::Release);
-        }
-        self.clean_written_range(offset, data.len())
     }
 
     fn copy_atomic(&self, offset: usize, out: &mut [u8]) -> Result {

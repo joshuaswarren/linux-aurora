@@ -819,6 +819,89 @@ pub(crate) fn decode_t8140_g17p_asc_providers(
     ])
 }
 
+// -------------------------------------------------------------------------
+// T8140 topology as a *Linux* device tree observes it.
+//
+// The pinned D93AP topology above records ADT `reg` values, which are
+// arm-io child-bus addresses. The J700 Linux device tree (and the live J700
+// bring-up) shows the same devices at CPU physical addresses shifted by the
+// arm-io `ranges` translation: SGX child 0x2_7000_0000 <-> CPU 0x4_8000_0000,
+// GFX ASC child 0x2_7260_0000 <-> CPU 0x4_8260_0000. A Linux platform
+// decoder therefore observes CPU addresses and must translate them back
+// before they can be compared against the pinned child-bus constants.
+// -------------------------------------------------------------------------
+
+/// The J700/T8140 arm-io `ranges` translation from ADT child-bus addresses to
+/// CPU physical addresses (CPU = child + offset). Verified on the live J700
+/// (Mac17,5) against both the SGX and both ASC wrapper windows.
+pub(crate) const T8140_ARM_IO_CPU_TRANSLATION_OFFSET: u64 = 0x2_1000_0000;
+
+/// One ASCWrap v6 provider as observed from a Linux device tree: the
+/// mailbox node's two `reg` windows (CPU physical) and its two named
+/// interrupts. `role_is_gfx1` comes from the node's `apple,firmware-role`.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct T8140G17PLinuxDtAscObservation {
+    pub(crate) role_is_gfx1: bool,
+    pub(crate) wrapper_cpu_base: u64,
+    pub(crate) wrapper_size: u64,
+    pub(crate) iorvbar_cpu_base: u64,
+    pub(crate) iorvbar_size: u64,
+    pub(crate) send_empty_irq: u32,
+    pub(crate) recv_not_empty_irq: u32,
+}
+
+/// The dual-provider observation a Linux platform decoder can actually make
+/// from the T8140 GPU node's `mboxes` at probe time.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct T8140G17PLinuxDtTopology {
+    pub(crate) gfx: T8140G17PLinuxDtAscObservation,
+    pub(crate) gfx1: T8140G17PLinuxDtAscObservation,
+}
+
+fn linux_dt_asc_provider(
+    role: T8140G17PAscRole,
+    observed: &T8140G17PLinuxDtAscObservation,
+) -> Option<T8140G17PAscProvider> {
+    let expected_gfx1 = matches!(role, T8140G17PAscRole::Gfx1);
+    if observed.role_is_gfx1 != expected_gfx1 {
+        return None;
+    }
+
+    Some(T8140G17PAscProvider {
+        role,
+        wrapper_regs: G17AdtRegisterRange {
+            phys_base: observed
+                .wrapper_cpu_base
+                .checked_sub(T8140_ARM_IO_CPU_TRANSLATION_OFFSET)?,
+            size: observed.wrapper_size.try_into().ok()?,
+        },
+        iorvbar_regs: G17AdtRegisterRange {
+            phys_base: observed
+                .iorvbar_cpu_base
+                .checked_sub(T8140_ARM_IO_CPU_TRANSLATION_OFFSET)?,
+            size: observed.iorvbar_size.try_into().ok()?,
+        },
+        send_empty_irq: observed.send_empty_irq,
+        recv_not_empty_irq: observed.recv_not_empty_irq,
+    })
+}
+
+/// Decode the two mailbox providers from a Linux DT observation.
+///
+/// This only reshapes and bus-translates what the device tree actually says;
+/// it deliberately performs no comparison against the pinned D93AP constants.
+/// Admission stays with the caller (`g17_power_preflight`), which compares
+/// the decoded providers against the pinned expectation, so an inferred or
+/// partial observation can never substitute for the exact one.
+pub(crate) fn decode_t8140_g17p_asc_providers_from_linux_dt(
+    observed: &T8140G17PLinuxDtTopology,
+) -> Option<[T8140G17PAscProvider; 2]> {
+    Some([
+        linux_dt_asc_provider(T8140G17PAscRole::Gfx, &observed.gfx)?,
+        linux_dt_asc_provider(T8140G17PAscRole::Gfx1, &observed.gfx1)?,
+    ])
+}
+
 /// Source from which the pinned host constructs one physical PIO binding.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum G17HostPioBindingSource {
@@ -1762,6 +1845,68 @@ pub(crate) const fn validate_recovery_type(raw: u64) -> Result<(), RecoveryTypeE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The J700 GPU node observation exactly as its Linux device tree makes
+    /// it (CPU physical addresses, per-mailbox named IRQs, role strings).
+    fn j700_linux_dt_topology() -> T8140G17PLinuxDtTopology {
+        T8140G17PLinuxDtTopology {
+            gfx: T8140G17PLinuxDtAscObservation {
+                role_is_gfx1: false,
+                wrapper_cpu_base: 0x4_8260_0000,
+                wrapper_size: 0x0008_8000,
+                iorvbar_cpu_base: 0x4_8205_0000,
+                iorvbar_size: 8,
+                send_empty_irq: 993,
+                recv_not_empty_irq: 996,
+            },
+            gfx1: T8140G17PLinuxDtAscObservation {
+                role_is_gfx1: true,
+                wrapper_cpu_base: 0x4_82e0_0000,
+                wrapper_size: 0x0008_8000,
+                iorvbar_cpu_base: 0x4_8285_0000,
+                iorvbar_size: 8,
+                send_empty_irq: 997,
+                recv_not_empty_irq: 1000,
+            },
+        }
+    }
+
+    #[test]
+    fn linux_dt_observation_translates_to_the_pinned_asc_providers() {
+        // The J700 Linux DT records the same providers as the pinned D93AP
+        // ADT constants, shifted by the arm-io CPU translation.
+        assert_eq!(
+            decode_t8140_g17p_asc_providers_from_linux_dt(&j700_linux_dt_topology()),
+            Some(D93AP_T8140_G17P_ASC_PROVIDERS)
+        );
+    }
+
+    #[test]
+    fn linux_dt_observation_fails_closed_on_role_or_address_mismatch() {
+        // Swapped role labels never decode.
+        let mut swapped = j700_linux_dt_topology();
+        swapped.gfx.role_is_gfx1 = true;
+        assert_eq!(
+            decode_t8140_g17p_asc_providers_from_linux_dt(&swapped),
+            None
+        );
+
+        // An address below the bus translation window cannot be translated.
+        let mut untranslatable = j700_linux_dt_topology();
+        untranslatable.gfx1.wrapper_cpu_base = 0x1000;
+        assert_eq!(
+            decode_t8140_g17p_asc_providers_from_linux_dt(&untranslatable),
+            None
+        );
+
+        // A perturbed-but-decodable observation decodes to providers that do
+        // NOT match the pinned expectation: admission (the caller's
+        // comparison) is what rejects it.
+        let mut perturbed = j700_linux_dt_topology();
+        perturbed.gfx.wrapper_cpu_base += 0x4000;
+        let decoded = decode_t8140_g17p_asc_providers_from_linux_dt(&perturbed).unwrap();
+        assert_ne!(decoded, D93AP_T8140_G17P_ASC_PROVIDERS);
+    }
 
     #[test]
     fn sleep_and_nap_require_the_numeric_0x21_bridge() {

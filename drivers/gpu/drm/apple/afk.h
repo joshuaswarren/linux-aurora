@@ -71,17 +71,10 @@ struct apple_epic_service_ops {
 	void (*teardown)(struct apple_epic_service *service);
 };
 
-/*
- * The ring header is three control blocks -- bufsz, rptr, wptr -- each padded
- * out to the firmware's control-block size.  That block is 0x40 bytes up to
- * v13.5 but 0x80 on H17P, making the header 0xc0 or 0x180.  The size is
- * self-describing: the INITRB message gives the total ring size and the first
- * word of block 0 gives the payload size, so the stride is (size - bufsz) / 3
- * and no firmware-version test is needed.  Address the fields by stride rather
- * than through a fixed struct.
- */
-#define AFK_RB_BLOCK_MIN	0x40
-#define AFK_RB_BLOCKS		3
+struct afk_ringbuffer_header {
+	__le32 bufsz;
+	u32 unk;
+};
 
 struct afk_qe {
 #define QE_MAGIC 0x20504f49 // ' POI'
@@ -170,11 +163,12 @@ enum epic_subtype {
 
 struct afk_ringbuffer {
 	bool ready;
-	void *hdr;
-	u32 block;			/* control-block stride, 0x40 or 0x80 */
-	u32 rptr;
+	struct afk_ringbuffer_header *hdr;
+	__le32 *rptr;
+	__le32 *wptr;
 	void *buf;
 	size_t bufsz;
+	u32 block_size;
 };
 
 static inline __le32 *afk_rb_field(struct afk_ringbuffer *bfr, unsigned int idx)
@@ -208,6 +202,7 @@ struct apple_dcp_afkep {
 
 	spinlock_t lock;
 	u16 qe_seq;
+	u8 rx_log_count;
 
 	const struct apple_epic_service_ops *ops;
 	struct apple_epic_service services[AFK_MAX_CHANNEL];
@@ -223,6 +218,7 @@ struct apple_dcp_afkep *afk_init(struct apple_dcp *dcp, u32 endpoint,
 int afk_start(struct apple_dcp_afkep *ep);
 void afk_shutdown(struct apple_dcp_afkep *ep);
 int afk_receive_message(struct apple_dcp_afkep *ep, u64 message);
+void afk_log_tx_state(struct apple_dcp_afkep *ep, const char *phase);
 int afk_send_epic(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 		  enum epic_type etype, enum epic_category ecat, u8 stype,
 		  const void *payload, size_t payload_len);

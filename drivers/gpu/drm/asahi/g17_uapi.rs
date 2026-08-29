@@ -36,9 +36,6 @@ pub(crate) const UAPI_COMPUTE_SIZE: usize = 64;
 pub(crate) const UAPI_ATTACHMENT_SIZE: usize = 24;
 pub(crate) const UAPI_MAX_ATTACHMENTS: usize = 16;
 pub(crate) const UAPI_MAX_HARDWARE_COMMANDS: u32 = 64;
-// Match the image/framebuffer limit advertised by Honeykrisp. Storage is
-// sized from each submission; this is a format limit, not a demo window cap.
-pub(crate) const M5_MAX_RENDER_DIMENSION: u32 = 16384;
 pub(crate) const UAPI_BARRIER_NONE: u16 = 0xffff;
 pub(crate) const USC_WINDOW_SIZE: u64 = 1 << 32;
 #[cfg(not(test))]
@@ -68,6 +65,7 @@ const RENDER_FLAGS: u32 = RENDER_VERTEX_SCRATCH
 const SAMPLER_SIZE: u64 = 8;
 const MAX_SAMPLERS: u32 = 1024;
 const PAGE_SIZE: u64 = 0x4000;
+const BG_RESOURCE_PREFIX: u64 = 0x0007_8000_0000_0000;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum UapiTranslateError {
@@ -85,8 +83,7 @@ pub(crate) enum UapiTranslateError {
     QueueUscRange,
     AddressRange,
     AddressAlignment,
-    FlagsUnknownBits,
-    FlagsUnsupported,
+    Flags,
     Dimensions,
     Layers,
     UtileDimensions,
@@ -112,46 +109,6 @@ impl From<RenderBuildError> for UapiTranslateError {
 impl From<g17_compute::ComputeBuildError> for UapiTranslateError {
     fn from(value: g17_compute::ComputeBuildError) -> Self {
         Self::ComputeBuild(value)
-    }
-}
-
-impl UapiTranslateError {
-    /// Stable short name for one rejection, so a failing submit reports which
-    /// check refused it instead of a bare EINVAL. Kept as `&'static str` (no
-    /// `Debug` formatting) to stay cheap on the ioctl path.
-    pub(crate) fn name(&self) -> &'static str {
-        match self {
-            Self::HeaderTruncated => "header-truncated",
-            Self::PayloadTruncated => "payload-truncated",
-            Self::PayloadTail => "payload-tail",
-            Self::CommandType => "command-type",
-            Self::AttachmentPayloadSize => "attachment-payload-size",
-            Self::AttachmentCount => "attachment-count",
-            Self::AttachmentFields => "attachment-fields",
-            Self::AttachmentBarrier => "attachment-barrier",
-            Self::HardwareCommandCount => "hardware-command-count",
-            Self::BarrierFuture => "barrier-future",
-            Self::QueueUscAlignment => "queue-usc-alignment",
-            Self::QueueUscRange => "queue-usc-range",
-            Self::AddressRange => "address-range",
-            Self::AddressAlignment => "address-alignment",
-            Self::FlagsUnknownBits => "flags-unknown-bits",
-            Self::FlagsUnsupported => "flags-unsupported",
-            Self::Dimensions => "dimensions",
-            Self::Layers => "layers",
-            Self::UtileDimensions => "utile-dimensions",
-            Self::Samples => "samples",
-            Self::TilebufferSize => "tilebuffer-size",
-            Self::SamplerCount => "sampler-count",
-            Self::SamplerPair => "sampler-pair",
-            Self::HelperProgram => "helper-program",
-            Self::Add3ProofAttachments => "add3-proof-attachments",
-            Self::ProgramOffset => "program-offset",
-            Self::ZlsFields => "zls-fields",
-            Self::StencilClearBits => "stencil-clear-bits",
-            Self::RenderBuild(_) => "render-build",
-            Self::ComputeBuild(_) => "compute-build",
-        }
     }
 }
 
@@ -614,12 +571,9 @@ impl QueueUscWindow {
             .checked_add((tagged_offset & !7) as u64)
             .ok_or(UapiTranslateError::ProgramOffset)?;
         require_range(address_space, allocation, 4, GpuAccess::Read)?;
-        // Honeykrisp carries resource metadata in the low three UAPI bits,
-        // but G17P's native 3D command strips those bits before programming
-        // every BG/EOT/partial USC address. Preserving bit 2 launched four
-        // bytes into the instruction stream and contradicted all complete
-        // Metal register-list captures.
-        Ok(allocation)
+        self.base
+            .checked_add(tagged_offset as u64)
+            .ok_or(UapiTranslateError::ProgramOffset)
     }
 }
 
@@ -729,120 +683,6 @@ fn validate_zls<A: GpuAddressSpace>(
     Ok(())
 }
 
-/// Bounded M5 D32 clear/store envelope, alongside the original color-only
-/// profile. Native 25G76 supplies ff00ff dimensions and 80044 with compression;
-/// bits2/6 select compression, while bit19 stores the depth plane. Geometry,
-/// stencil absence, and application programs are checked by the M5 caller.
-pub(crate) fn validate_m5_reference_depth<A: GpuAddressSpace>(
-    command: &UapiRenderCommand,
-    address_space: &A,
-) -> Result<(), UapiTranslateError> {
-    let depth = command.depth;
-    if depth.base == 0 {
-        // No depth plane. The surface may still carry an inert stencil one,
-        // which contributes nothing but its compression pair and the shared
-        // pixel dimensions; a render that transfers it is refused with the
-        // rest of the stencil profile.
-        let stencil_only = command.stencil.base != 0
-            && command.zls_control
-                == if command.stencil.compression_base != 0 { 0x110 } else { 0 }
-            && command.depth_dimensions
-                == ((u32::from(command.width) - 1)
-                    | ((u32::from(command.height) - 1) << 16));
-        return if depth.compression_base == 0 && depth.stride == 0
-            && depth.compression_stride == 0
-            && (stencil_only
-                || (command.zls_control == 0 && command.depth_dimensions == 0)) {
-            Ok(())
-        } else {
-            Err(UapiTranslateError::ZlsFields)
-        };
-    }
-    let compressed = depth.compression_base != 0;
-    // The control word's load and store bits are the only part a render
-    // chooses: bit15 loads the depth plane and bit19 stores it, and a render
-    // that neither tests nor writes depth sets neither, which is how a
-    // conformance surface with an unused depth buffer arrives. Everything
-    // else -- the compression pair in bits 2 and 6, the GPU tiling, the 32F
-    // format -- is the witnessed profile and stays exact. depth_flags reaches
-    // register 0x15319 unchanged either way, so the admitted envelope is the
-    // set of load/store combinations over that fixed remainder.
-    let compression_bits = if compressed { 0x44 } else { 0 };
-    // Bits 25-26 select the depth format: 0 is 32-bit float, 2 is 16-bit
-    // unorm. The narrow plane was captured on 25G76 alongside the wide one
-    // and moves nothing else in the register program except the clear value
-    // and one ISP flag, both of which the caller derives. Its compression
-    // metadata has no witness, so a compressed 16-bit plane stays out.
-    let z16 = command.zls_control & (3 << 25) == (2 << 25);
-    if z16 && compressed {
-        return Err(UapiTranslateError::ZlsFields);
-    }
-    let format_bits = if z16 { 2 << 25 } else { 0 };
-    // A stencil plane may be attached without being transferred: a surface
-    // with a depth-stencil buffer carries one for every render, whether or
-    // not the render uses it. Its compression pair in bits 4 and 8 describes
-    // the attached layout and is the only stencil state admitted here --
-    // loading or storing the plane (bits 14 and 18) needs its own witnesses,
-    // as does the stencil unit in the graphics record.
-    let stencil_compression_bits =
-        if command.stencil.compression_base != 0 { 0x110 } else { 0 };
-    let control_transfers = command.zls_control & 0x88000;
-    let expected_control =
-        compression_bits | stencil_compression_bits | format_bits | control_transfers;
-    let width = u32::from(command.width);
-    let height = u32::from(command.height);
-    if !(1..=M5_MAX_RENDER_DIMENSION).contains(&width)
-        || !(1..=M5_MAX_RENDER_DIMENSION).contains(&height)
-        || command.layers != 1 || (compressed && (width < 16 || height < 16)) {
-        return Err(UapiTranslateError::ZlsFields);
-    }
-    // AIL tiles are 16 KiB whatever the format: 64x64 at four bytes a pixel,
-    // 128x64 at two. While both axes fit one tile the level is a whole
-    // number of them; if either axis is smaller, the level uses a
-    // power-of-two miptail aligned to a 128-byte cacheline. Single-layer M5
-    // surfaces are not page-padded.
-    let (tile_width, bytes_per_pixel) = if z16 { (128u32, 2u64) } else { (64u32, 4u64) };
-    let data_bytes = if width >= tile_width && height >= 64 {
-        u64::from(width.div_ceil(tile_width)) * u64::from(height.div_ceil(64)) * 0x4000
-    } else {
-        (u64::from(width.next_power_of_two())
-            * u64::from(height.next_power_of_two()) * bytes_per_pixel)
-            .div_ceil(128) * 128
-    };
-    let metadata_bytes = (u64::from(width.next_power_of_two().div_ceil(16))
-        * u64::from(height.next_power_of_two().div_ceil(16)) * 8).div_ceil(128) * 128;
-    let dimensions = (width - 1) | ((height - 1) << 16);
-    if command.depth_dimensions != dimensions
-        || command.zls_control != expected_control
-        // The clear value is whatever the application asked for; it reaches
-        // register 0x15301 verbatim and is only consumed when the render
-        // actually clears the plane.
-        || (command.depth_clear & 0x7fffffff) > 0x7f800000
-        // Image suballocations and small miptails use cacheline alignment;
-        // the backing VM pages remain independently validated below.
-        || depth.base & 0x7f != 0 || depth.compression_base & 0x7f != 0
-        // Both strides are array strides, and the M5 caller zeroes them
-        // because native single-layer ZLS does not encode one. Every render
-        // admitted here is single-layer -- layers != 1 is refused above -- so
-        // the value that arrives is whatever the userspace packer computed
-        // and the hardware never sees it: for a surface smaller than a page
-        // Mesa's (pages - 1) << 14 | 1 underflows to 0xffffc001. Comparing it
-        // would refuse a valid render over a field that is discarded. The
-        // backing store is still validated in full below, from the
-        // dimensions rather than from either stride.
-        || (!compressed && depth.compression_stride != 0) {
-        return Err(UapiTranslateError::ZlsFields);
-    }
-    // Validate the entire resized surface and metadata before the
-    // M5 caller removes the unused single-layer array stride fields.
-    require_range(address_space, depth.base, data_bytes, GpuAccess::ReadWrite)?;
-    if compressed {
-        require_range(address_space, depth.compression_base, metadata_bytes,
-            GpuAccess::ReadWrite)?;
-    }
-    Ok(())
-}
-
 pub(crate) fn translate_render_command<A: GpuAddressSpace>(
     command: UapiRenderCommand,
     vertex_attachments: UapiAttachmentList,
@@ -851,39 +691,22 @@ pub(crate) fn translate_render_command<A: GpuAddressSpace>(
     address_space: &A,
     internal: RenderInternalState,
 ) -> Result<TranslatedRenderCommand, UapiTranslateError> {
-    if command.flags & !RENDER_FLAGS != 0 {
-        return Err(UapiTranslateError::FlagsUnknownBits);
+    if command.flags & !RENDER_FLAGS != 0
+        || command.flags & (RENDER_VERTEX_SCRATCH | RENDER_NO_VERTEX_CLUSTERING) != 0
+    {
+        return Err(UapiTranslateError::Flags);
     }
-    // Genuinely unimplemented on G17P rather than merely unvalidated:
-    // `G17pRenderParameters` carries no helper-program fields at all, so
-    // VERTEX_SCRATCH has nowhere to put the scratch binding, and there is no
-    // cluster-count control for NO_VERTEX_CLUSTERING. A clean EINVAL beats
-    // rendering with the request silently dropped.
-    if command.flags & (RENDER_VERTEX_SCRATCH | RENDER_NO_VERTEX_CLUSTERING) != 0 {
-        return Err(UapiTranslateError::FlagsUnsupported);
+    let has_resource_spec_high = [
+        command.background.resource_spec,
+        command.end_of_tile.resource_spec,
+        command.partial_background.resource_spec,
+        command.partial_end_of_tile.resource_spec,
+    ]
+    .iter()
+    .any(|value| value >> 32 != 0);
+    if has_resource_spec_high && command.flags & RENDER_RSRC_SPEC_HI == 0 {
+        return Err(UapiTranslateError::Flags);
     }
-    // RSRC_SPEC_HI is *declarative*, and honouring it must not mean rejecting.
-    // The UAPI defines it as "the appended resource-specifier high dwords are
-    // present", and states its purpose: "This flag lets old kernels report an
-    // unsupported render payload instead of silently truncating 64-bit G17
-    // values." It exists for kernels that do NOT understand the dwords.
-    //
-    // This kernel does understand them -- `program()` ORs the high dword in
-    // unconditionally, with no reference to the flag -- so the flag cannot
-    // change what we do with a payload that sets it. The old check therefore
-    // refused payloads it would otherwise have handled identically, protecting
-    // nothing; it is the same bring-up leftover as the stencil-clear mask.
-    //
-    // Honour the documented meaning instead: when the flag is clear the high
-    // dwords are "not present", so mask them off rather than refuse the
-    // submission. A userspace built against the 240-byte upstream struct (whose
-    // payload `padded_payload` zero-fills) and one that clears the flag now
-    // behave identically, which is what "not present" has to mean.
-    let resource_spec_mask = if command.flags & RENDER_RSRC_SPEC_HI != 0 {
-        u64::MAX
-    } else {
-        u32::MAX as u64
-    };
     if !(1..=16_384).contains(&command.width) || !(1..=16_384).contains(&command.height) {
         return Err(UapiTranslateError::Dimensions);
     }
@@ -959,19 +782,9 @@ pub(crate) fn translate_render_command<A: GpuAddressSpace>(
     {
         return Err(UapiTranslateError::HelperProgram);
     }
-    // `isp_bgobjvals` is the *whole* ISP_BGOBJVALS register value, not just
-    // the stencil clear: the UAPI documents "the bottom 8-bits contain the
-    // stencil buffer clear value", and every Mesa backend unconditionally
-    // seeds the upper bits with 0x300 before OR-ing the clear in
-    // (hk_cmd_draw.c `render->cr.isp_bgobjvals = 0x300;`,
-    // agx_pipe.c `c->isp_bgobjvals = 0x300;`, d12_queue.c `0x300 | stencil`).
-    // The legacy queue path passes the field straight through to the firmware
-    // (queue/render.rs `let load_bgobjvals = cmdbuf.isp_bgobjvals as u64`), so
-    // rejecting anything above 0xff refused every real render pass while the
-    // in-tree render selftest -- which leaves the field zero -- was accepted.
-    // Accept the register value; `build_*_descriptor` re-asserts the 0x300
-    // bits with `stencil_clear_value | 0x300`, which is idempotent for the
-    // value userspace sends and still supplies 0x300 when it sends zero.
+    if command.stencil_clear & !0xff != 0 {
+        return Err(UapiTranslateError::StencilClearBits);
+    }
 
     let background = queue.full_program(address_space, command.background.usc)?;
     let end_of_tile = queue.full_program(address_space, command.end_of_tile.usc)?;
@@ -1023,26 +836,13 @@ pub(crate) fn translate_render_command<A: GpuAddressSpace>(
     parameters.merge_upper_y_bits = command.merge_upper_y;
     parameters.depth_clear_value_bits = command.depth_clear;
     parameters.stencil_clear_value = command.stencil_clear;
-    parameters.load_pipeline_bind = g17p_bg_resource_spec(
-        command.background.resource_spec,
-        resource_spec_mask,
-        internal.parameters.bg_resource_prefix,
-    );
+    parameters.load_pipeline_bind = BG_RESOURCE_PREFIX | command.background.resource_spec;
     parameters.load_pipeline = background;
-    parameters.store_pipeline_bind = command.end_of_tile.resource_spec & resource_spec_mask;
+    parameters.store_pipeline_bind = command.end_of_tile.resource_spec;
     parameters.store_pipeline = end_of_tile;
-    // These high 17 bits are BG shader pass control, not an address class.
-    // Native derives main and partial masks from their respective shader
-    // outputs; they need not match. The default diagnostic prefix is zero,
-    // preserving both full RT0 output masks and no-output masks from userspace.
-    parameters.partial_load_pipeline_bind = g17p_bg_resource_spec(
-        command.partial_background.resource_spec,
-        resource_spec_mask,
-        internal.parameters.bg_resource_prefix,
-    );
+    parameters.partial_load_pipeline_bind = command.partial_background.resource_spec;
     parameters.partial_load_pipeline = partial_background;
-    parameters.partial_store_pipeline_bind =
-        command.partial_end_of_tile.resource_spec & resource_spec_mask;
+    parameters.partial_store_pipeline_bind = command.partial_end_of_tile.resource_spec;
     parameters.partial_store_pipeline = partial_end_of_tile;
 
     Ok(TranslatedRenderCommand {
@@ -1054,10 +854,6 @@ pub(crate) fn translate_render_command<A: GpuAddressSpace>(
         vertex_timestamps: command.vertex_timestamps,
         fragment_timestamps: command.fragment_timestamps,
     })
-}
-
-fn g17p_bg_resource_spec(resource_spec: u64, present_mask: u64, diagnostic_prefix: u64) -> u64 {
-    diagnostic_prefix | (resource_spec & present_mask)
 }
 
 pub(crate) fn build_render_descriptors(
@@ -1099,7 +895,7 @@ pub(crate) fn translate_compute_command<A: GpuAddressSpace>(
 ) -> Result<TranslatedComputeCommand, UapiTranslateError> {
     queue.validate()?;
     if command.flags & !COMPUTE_G17P_ADD3_PROOF != 0 {
-        return Err(UapiTranslateError::FlagsUnknownBits);
+        return Err(UapiTranslateError::Flags);
     }
     if command.control_stream_base & 3 != 0
         || command.control_stream_end & 3 != 0
@@ -1342,135 +1138,6 @@ mod tests {
     }
 
     #[test]
-    fn m5_d32_envelope_rejects_wrong_layout_and_incomplete_backing() {
-        let mut parser = UapiCommandParser::new(&RENDER_FIXTURE);
-        let ParsedHardwareCommand::Render { mut payload, .. } =
-            parser.next_hardware().unwrap().unwrap() else { panic!("not render") };
-        payload.width = 256;
-        payload.height = 256;
-        assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace), Ok(()));
-        payload.depth_dimensions = 0x00ff00ff;
-        assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace),
-            Err(UapiTranslateError::ZlsFields));
-        payload.depth.base = 0x10000;
-        payload.depth.stride = 0x3c001;
-        payload.zls_control = 0x80000;
-        payload.depth_clear = 0x3f800000;
-        assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace), Ok(()));
-        payload.depth.compression_base = 0x60000;
-        payload.zls_control = 0x80044;
-        assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace), Ok(()));
-        let valid = payload;
-        // The real gears command formerly used G17P's 15-bit dimensions.
-        payload.depth_dimensions = 0x007f80ff;
-        assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace),
-            Err(UapiTranslateError::ZlsFields));
-        payload = valid;
-        payload.depth.compression_base = 0;
-        assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace),
-            Err(UapiTranslateError::ZlsFields));
-        payload = valid;
-        payload.depth.base = 0x1fc000; // First byte mapped, remainder absent.
-        assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace),
-            Err(UapiTranslateError::AddressRange));
-        payload = valid;
-        payload.depth.compression_base = 0x200000;
-        assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace),
-            Err(UapiTranslateError::AddressRange));
-        payload = valid;
-        // Every combination of the load and store bits is a render the
-        // application may ask for, including neither: a bound depth buffer
-        // that this render does not test is not written back.
-        for transfers in [0u64, 0x8000, 0x80000, 0x88000] {
-            payload.zls_control = 0x44 | transfers;
-            assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace),
-                Ok(()));
-        }
-        // Nothing outside those two bits may move: stencil transfers, the
-        // twiddled tilings, the 16-bit format and the resolve bits all still
-        // need their own witnesses.
-        for stray in [0x2u64, 0x4000, 0x40000, 1 << 25, 1 << 56] {
-            payload.zls_control = 0x80044 | stray;
-            assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace),
-                Err(UapiTranslateError::ZlsFields));
-        }
-        payload = valid;
-        payload.layers = 2;
-        assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace),
-            Err(UapiTranslateError::ZlsFields));
-        payload = valid;
-        // The clear value is the application's float and reaches register
-        // 0x15301 unchanged; only a NaN payload is refused.
-        for clear in [0u32, 0x3f000000, 0xbf800000, 0x7f800000] {
-            payload.depth_clear = clear;
-            assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace),
-                Ok(()));
-        }
-        payload.depth_clear = 0x7fc00000;
-        assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace),
-            Err(UapiTranslateError::ZlsFields));
-        // An attached stencil plane contributes only its compression pair.
-        payload = valid;
-        payload.stencil.base = 0x10000;
-        assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace), Ok(()));
-        payload.stencil.compression_base = 0x60000;
-        assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace),
-            Err(UapiTranslateError::ZlsFields));
-        payload.zls_control = 0x80154;
-        assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace), Ok(()));
-        // Loading or storing it is outside the profile.
-        for transfer in [0x4000u64, 0x40000] {
-            payload.zls_control = 0x80154 | transfer;
-            assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace),
-                Err(UapiTranslateError::ZlsFields));
-        }
-    }
-
-    #[test]
-    fn m5_resized_depth_validates_tile_padding_and_complete_backing() {
-        let mut parser = UapiCommandParser::new(&RENDER_FIXTURE);
-        let ParsedHardwareCommand::Render { mut payload, .. } =
-            parser.next_hardware().unwrap().unwrap() else { panic!("not render") };
-        payload.width = 319;
-        payload.height = 191;
-        payload.depth_dimensions = 318 | (190 << 16);
-        payload.depth.base = 0x10000;
-        payload.depth.stride = 0x38001; // 5x3 pages, not width*height*4.
-        payload.depth.compression_base = 0x60000;
-        payload.depth.compression_stride = 0x7c000; // 512x256 / (16x16) *8.
-        payload.zls_control = 0x80044;
-        payload.depth_clear = 0x3f800000;
-        assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace), Ok(()));
-        let valid = payload;
-        // The array strides are discarded for a single-layer render, so any
-        // value in them is admitted -- including the underflow a surface
-        // smaller than one page produces. The backing store below is what
-        // actually bounds the render.
-        for stride in [0u32, 0x3c001, 0xffffc001] {
-            payload.depth.stride = stride;
-            assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace),
-                Ok(()));
-        }
-        payload = valid;
-        payload.depth.compression_stride = 0x3c000; // Old metadata stride.
-        assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace), Ok(()));
-        payload = valid;
-        payload.depth.compression_base = 0; // Metadata stride without metadata.
-        assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace),
-            Err(UapiTranslateError::ZlsFields));
-        payload = valid;
-        payload.depth.base = 0x1c8000; // Only 14 pages remain, but 15 are needed.
-        assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace),
-            Err(UapiTranslateError::AddressRange));
-        payload = valid;
-        payload.width = 1024;
-        payload.height = 1024;
-        payload.depth_dimensions = 1023 | (1023 << 16);
-        assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace),
-            Err(UapiTranslateError::AddressRange)); // Four MiB exceeds this test VM.
-    }
-
-    #[test]
     fn render_fixture_translates_to_full_g17p_programs_and_descriptors() {
         assert_eq!(fnv1a64(&RENDER_FIXTURE), 0xf056_ea1d_ef06_32c5);
         let mut parser = UapiCommandParser::new(&RENDER_FIXTURE);
@@ -1493,9 +1160,6 @@ mod tests {
 
         let mut internal = G17pRenderParameters::source_rsrc8();
         internal.context_base = 0;
-        // This frozen descriptor fixture predates userspace high-dword masks;
-        // retain its explicit legacy diagnostic mask, not a default injection.
-        internal.bg_resource_prefix = 0x0007_8000_0000_0000;
         let translated = translate_render_command(
             payload,
             vertex,
@@ -1507,15 +1171,15 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(translated.parameters.load_pipeline, 0x11_0001_0000);
-        assert_eq!(translated.parameters.store_pipeline, 0x11_0002_0000);
+        assert_eq!(translated.parameters.load_pipeline, 0x11_0001_0004);
+        assert_eq!(translated.parameters.store_pipeline, 0x11_0002_0004);
         assert_eq!(
             translated.parameters.load_pipeline_bind,
             0x0007_8000_0000_0040
         );
         assert_eq!(translated.parameters.store_pipeline_bind, 0x8);
-        assert_eq!(translated.parameters.partial_load_pipeline, 0x11_0001_0000);
-        assert_eq!(translated.parameters.partial_store_pipeline, 0x11_0002_0000);
+        assert_eq!(translated.parameters.partial_load_pipeline, 0x11_0001_0004);
+        assert_eq!(translated.parameters.partial_store_pipeline, 0x11_0002_0004);
         assert_eq!(translated.parameters.utile_config, 0xa000);
         assert_eq!(translated.parameters.tib_blocks, 2);
         assert_eq!(translated.parameters.tile_config, 0x1_0280);
@@ -1551,19 +1215,6 @@ mod tests {
     }
 
     #[test]
-    fn background_pass_masks_preserve_userspace_and_explicit_diagnostics() {
-        let default_prefix = G17pRenderParameters::source_rsrc8().bg_resource_prefix;
-        assert_eq!(default_prefix, 0);
-        assert_eq!(g17p_bg_resource_spec(0xffff_8000_0000_0040, u64::MAX, default_prefix),
-                   0xffff_8000_0000_0040);
-        assert_eq!(g17p_bg_resource_spec(0x40, u64::MAX, default_prefix), 0x40);
-        assert_eq!(g17p_bg_resource_spec(0xffff_8000_0000_0040, u32::MAX as u64, default_prefix),
-                   0x40);
-        assert_eq!(g17p_bg_resource_spec(0x40, u64::MAX, 0xffff_8000_0000_0000),
-                   0xffff_8000_0000_0040);
-    }
-
-    #[test]
     fn render_resource_spec_high_dwords_reach_g17_register_programs() {
         const RENDER_HEADER: usize = 64;
         const PAYLOAD: usize = RENDER_HEADER + UAPI_COMMAND_HEADER_SIZE;
@@ -1581,8 +1232,8 @@ mod tests {
         for (offset, value) in [
             (0xf0, 0x0007_8000),
             (0xf4, 0x0007_8001),
-            (0xf8, 0xffff_8002),
-            (0xfc, 0),
+            (0xf8, 0x0007_8002),
+            (0xfc, 0x0007_8003),
         ] {
             extended[PAYLOAD + offset..PAYLOAD + offset + 4]
                 .copy_from_slice(&(value as u32).to_le_bytes());
@@ -1620,11 +1271,11 @@ mod tests {
         );
         assert_eq!(
             translated.parameters.load_pipeline_bind,
-            0xffff_8002_0000_0042
+            0x0007_8002_0000_0042
         );
         assert_eq!(
             translated.parameters.partial_load_pipeline_bind,
-            0x43
+            0x0007_8003_0000_0043
         );
         let registers = g17_render::build_fragment_registers(&translated.parameters).unwrap();
         assert_eq!(
@@ -1633,43 +1284,23 @@ mod tests {
                 .find(|register| register.number == 0x15369)
                 .unwrap()
                 .value,
-            0xffff_8002_0000_0042
+            0x0007_8002_0000_0042
         );
 
-        // Clearing RSRC_SPEC_HI means "the high dwords are not present", so
-        // they are masked off -- not grounds to refuse the submission.
         let mut no_flag = payload;
         no_flag.flags &= !RENDER_RSRC_SPEC_HI;
-        let masked = translate_render_command(
-            no_flag,
-            vertex,
-            fragment,
-            window(),
-            &TestAddressSpace,
-            RenderInternalState {
-                parameters: G17pRenderParameters::source_rsrc8(),
-            },
-        )
-        .unwrap();
-        assert_eq!(masked.parameters.load_pipeline_bind, 0x42);
         assert_eq!(
-            masked.parameters.partial_load_pipeline_bind,
-            0x43
-        );
-
-        // An explicitly selected diagnostic OR-mask still applies; it is no
-        // longer silently imposed on ordinary no-output background programs.
-        let mut diagnostic = G17pRenderParameters::source_rsrc8();
-        diagnostic.bg_resource_prefix = 0xffff_8000_0000_0000;
-        let overridden = translate_render_command(
-            no_flag, vertex, fragment, window(), &TestAddressSpace,
-            RenderInternalState { parameters: diagnostic },
-        )
-        .unwrap();
-        assert_eq!(overridden.parameters.load_pipeline_bind, 0xffff_8000_0000_0042);
-        assert_eq!(
-            overridden.parameters.partial_load_pipeline_bind,
-            0xffff_8000_0000_0043
+            translate_render_command(
+                no_flag,
+                vertex,
+                fragment,
+                window(),
+                &TestAddressSpace,
+                RenderInternalState {
+                    parameters: G17pRenderParameters::source_rsrc8(),
+                },
+            ),
+            Err(UapiTranslateError::Flags)
         );
     }
 
@@ -1738,7 +1369,6 @@ mod tests {
                 },
                 submitted: 0,
                 current_timestamp: 0,
-                last_add_kicks_timestamp: 0,
                 base_timestamp: 0,
                 previous_valid: false,
                 previous_timestamp: 0,

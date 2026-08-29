@@ -7,28 +7,14 @@
 //! The byte layout comes from m1n1
 //! `916548424c00c72176326e3811badedce5714a99`. The source profile carries the
 //! hardware-tested TA and fragment register recipes, the compiler-derived EOT
-//! resource binding `0x8`, full-width load binding, and native-aligned BG/EOT
-//! program pointers. Descriptor construction also writes the duplicated structural
+//! resource binding `0x8`, full-width load binding, and tagged BG/EOT program
+//! pointers. Descriptor construction also writes the duplicated structural
 //! pipeline fields. Queue construction returns ordered memory writes only;
 //! allocation, cache maintenance, barriers, doorbells, MMIO, and completion
 //! stay with the retained runtime.
 
 const TA_REGISTER_COUNT: usize = 73;
 const FRAGMENT_REGISTER_COUNT: usize = 89;
-
-/// Both embedded register lists match the kext EXACTLY -- same writes, same
-/// unique registers, same order -- verified against 2048-byte captures of the
-/// native TA and 3D command records (macos-trace recs2048-gfx.txt):
-///
-///   TA  73 writes, 71 unique, list ends at +0x3cc
-///   3D  89 writes, 86 unique, list ends at +0x4cc
-///
-/// A 1024-byte capture cuts the 3D list at exactly +0x400 and hides its last
-/// 17 writes, which briefly looked like 14 registers "Metal never writes" --
-/// they were entries 72..85. Assert the counts so a future truncated capture
-/// cannot produce that conclusion again.
-const _: () = assert!(TA_REGISTER_COUNT == 73);
-const _: () = assert!(FRAGMENT_REGISTER_COUNT == 89);
 const PARTIAL_STORE_REGISTER_COUNT: usize = 16;
 const PARTIAL_RESUME_REGISTER_COUNT: usize = 23;
 const PARTIAL_LOAD_REGISTER_COUNT: usize = 10;
@@ -36,40 +22,10 @@ const REGISTER_BYTES: usize = 12;
 
 pub(crate) const TA_DESCRIPTOR_SIZE: usize = 0x9c0;
 pub(crate) const FRAGMENT_DESCRIPTOR_SIZE: usize = 0x2240;
-/// Native render-setup field copied through command descriptor +0xc00 to the
-/// final 3D command tail at +0x2110. This is independent of SGX's GPC
-/// performance-state map register.
-const G17P_FRAGMENT_TAIL_SETUP_WORD: u32 = u32::MAX;
-/// J700 shared-runtime flag snapshot copied by native 3D submit into type-1
-/// command lanes +0x2124/+0x2128.
-///
-/// The kext resolves the accelerator's shared event-stamp/HWDSID internal
-/// resource at +0x1a130, obtains its CPU mapping, reads byte bit 0 at mapping
-/// +0x2ad/+0x2ae, and widens them before per-draw register generation. The
-/// working Neo Metal snapshot contains 1/1.
-const G17P_NEO_FRAGMENT_SHARED_RUNTIME_FLAG_SNAPSHOT: [u32; 2] = [1, 1];
 pub(crate) const G17P_EOT_RESOURCE_SPEC: u64 = 0x8;
 pub(crate) const G17P_LOAD_RESOURCE_SPEC: u64 = 0x0007_8000_0000_0040;
-pub(crate) const G17P_SOURCE_BG_PIPELINE: u64 = 0x0000_0100_0199_0240;
-pub(crate) const G17P_SOURCE_EOT_PIPELINE: u64 = 0x0000_0100_0199_0640;
-/// Native `mcacheApertureBufferSetup` writes its packed write ranges here in
-/// the 3D firmware command record. The KSM entry points at this table.
-pub(crate) const G17P_FRAGMENT_MCACHE_OFFSET: usize = 0x6a0;
-/// The tiler's MCache aperture table. `mcacheApertureBufferSetup` is called for
-/// the TA with `ksmBufferInfo = recTA+0x60` and writes its entries at
-/// `ksmBufferInfo + 0x600 + i*0x10`, i.e. `recTA + 0x660` -- the exact analogue
-/// of the 3D's `rec3D + 0x6a0`.
-pub(crate) const G17P_TILING_MCACHE_OFFSET: usize = 0x660;
-pub(crate) const G17P_MCACHE_MAPPING_SIZE: usize = 0x10;
-/// Temporary diagnostic mirror of the four Register Command Encoder programs.
-/// Native keeps the complete programs in the 3D command itself: the first is
-/// at command +0xa0 and the remaining phases follow at a 0x720-byte stride.
-/// Each phase's +0x700 trailer points back at that same embedded phase and its
-/// +0x708 word carries the entry count.  KSM must bind those complete embedded
-/// structures, not this entries-only mirror.
-pub(crate) const G17P_FRAGMENT_RCE_STORAGE_SIZE: usize = 0x4000;
-pub(crate) const G17P_FRAGMENT_RCE_PROGRAM_OFFSET: u64 = 0xa0;
-pub(crate) const G17P_FRAGMENT_RCE_PROGRAM_STRIDE: u64 = 0x720;
+pub(crate) const G17P_SOURCE_BG_PIPELINE: u64 = 0x0000_0100_0199_0244;
+pub(crate) const G17P_SOURCE_EOT_PIPELINE: u64 = 0x0000_0100_0199_0644;
 
 const TILE_WIDTH: u64 = 32;
 const TILE_HEIGHT: u64 = 32;
@@ -81,11 +37,6 @@ const EVENT_SUBTYPE_BASE: u32 = 0x0001_0000;
 const EVENT_RECORD_SIZE: usize = 0x40;
 const RING_SLOT_SIZE: usize = 0x18;
 const QUEUE_WRITE_OFFSET: u64 = 0x40;
-/// Base added by G17P's compact VDM control-stream register (0x1c880).
-/// The register retains the legacy 40-bit {TTBR selector, 39-bit offset}
-/// shape, so lower-root user addresses are encoded relative to this base.
-const G17P_USER_BASE: u64 = 0x10_0000_0000;
-const G17P_VDM_USER_WINDOW_SIZE: u64 = 1 << 39;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum RenderBuildError {
@@ -93,90 +44,10 @@ pub(crate) enum RenderBuildError {
     LayerCountOutOfRange,
     UtileDimensions,
     AddressBeforeContext,
-    UserAddressOutOfRange,
-    VdmAddressOutOfRange,
     BufferTooSmall,
     ArithmeticOverflow,
     QueueGridOutOfRange,
     RingSlotOutOfRange,
-    McacheAddressOutOfRange,
-    McacheRangeEmpty,
-    McacheSelectorOutOfRange,
-}
-
-impl RenderBuildError {
-    /// Stable short name for one descriptor-build refusal. Callers flatten this
-    /// enum to `EINVAL`, which erased the distinction between a geometry
-    /// rejection and an address that sits below the render context base.
-    pub(crate) fn name(&self) -> &'static str {
-        match self {
-            Self::ZeroDimensions => "zero-dimensions",
-            Self::LayerCountOutOfRange => "layer-count-out-of-range",
-            Self::UtileDimensions => "utile-dimensions",
-            Self::AddressBeforeContext => "address-before-context",
-            Self::UserAddressOutOfRange => "user-address-out-of-range",
-            Self::VdmAddressOutOfRange => "vdm-address-out-of-range",
-            Self::BufferTooSmall => "buffer-too-small",
-            Self::ArithmeticOverflow => "arithmetic-overflow",
-            Self::QueueGridOutOfRange => "queue-grid-out-of-range",
-            Self::RingSlotOutOfRange => "ring-slot-out-of-range",
-            Self::McacheAddressOutOfRange => "mcache-address-out-of-range",
-            Self::McacheRangeEmpty => "mcache-range-empty",
-            Self::McacheSelectorOutOfRange => "mcache-selector-out-of-range",
-        }
-    }
-}
-
-/// One resource-derived G17P MCache write-range mapping.
-///
-/// This is the exact input shape consumed by
-/// `AGXAcceleratorG16::halMCacheApertureSetup`: address and size are in
-/// 128-byte cache lines; `hwsid` is the allocated hardware DSID; `selector`
-/// names the command's GART/UAT context; and `range_shift` is the native
-/// write-range class (clamped to four by the kext).
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub(crate) struct G17PMcacheMapping {
-    pub(crate) address: u64,
-    pub(crate) size_units: u32,
-    pub(crate) hwsid: u8,
-    pub(crate) selector: u8,
-    pub(crate) range_shift: u16,
-}
-
-/// Encode the two qwords written by the G17P kext at 3D descriptor
-/// `+0x6a0 + index * 0x10`.
-pub(crate) fn encode_g17p_mcache_mapping(
-    mapping: G17PMcacheMapping,
-) -> Result<[u8; G17P_MCACHE_MAPPING_SIZE], RenderBuildError> {
-    if mapping.address & 0x7f != 0 || mapping.address >> 48 != 0 {
-        return Err(RenderBuildError::McacheAddressOutOfRange);
-    }
-    if mapping.size_units == 0 {
-        return Err(RenderBuildError::McacheRangeEmpty);
-    }
-    if mapping.selector > 0x3f {
-        return Err(RenderBuildError::McacheSelectorOutOfRange);
-    }
-
-    let start = mapping.address >> 7;
-    let end = start
-        .checked_add(mapping.size_units as u64)
-        .ok_or(RenderBuildError::ArithmeticOverflow)?;
-    // qword 1 reserves bits 41..46 for the range policy.
-    if start >> 41 != 0 || end >> 41 != 0 {
-        return Err(RenderBuildError::McacheAddressOutOfRange);
-    }
-
-    let q0 = start
-        | ((mapping.selector as u64) << 41)
-        | ((mapping.hwsid as u64) << 47)
-        | (1u64 << 55);
-    let range_shift = core::cmp::min(mapping.range_shift, 4) as u32;
-    let q1 = end | (1u64 << 41) | (1u64 << (42 + range_shift));
-    let mut out = [0u8; G17P_MCACHE_MAPPING_SIZE];
-    out[..8].copy_from_slice(&q0.to_le_bytes());
-    out[8..].copy_from_slice(&q1.to_le_bytes());
-    Ok(out)
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -232,9 +103,6 @@ pub(crate) struct G17pRenderParameters {
     pub(crate) merge_upper_x_bits: u32,
     pub(crate) merge_upper_y_bits: u32,
     pub(crate) layers: u16,
-    /// Sample count: 1, 2 or 4. Defaults to 1, so every existing parameter
-    /// vector keeps its exact register program.
-    pub(crate) samples: u8,
     pub(crate) utile_width: u8,
     pub(crate) utile_height: u8,
     pub(crate) utile_config: u64,
@@ -246,11 +114,8 @@ pub(crate) struct G17pRenderParameters {
     pub(crate) aux_fb_page_count: u64,
     pub(crate) cycle: u64,
     pub(crate) record_index: u64,
-    /// TA event correlation written to 0x1ca10/0x014a1/0x0a349.
-    /// Native sources this independently from the fragment correlation.
     pub(crate) lifecycle: u64,
-    /// Fragment event correlation written to 0x160e0/0x01499/0x0a341.
-    pub(crate) fragment_lifecycle: u64,
+    pub(crate) work_stamp: u64,
     pub(crate) sampler_array: u64,
     pub(crate) sampler_count: u32,
     pub(crate) process_empty_tiles: bool,
@@ -262,106 +127,9 @@ pub(crate) struct G17pRenderParameters {
     pub(crate) fragment_timestamp_end: u64,
     pub(crate) fragment_user_timestamp_start: u64,
     pub(crate) fragment_user_timestamp_end: u64,
-    /// Write the VDM control-stream register (0x1c880) as a full GPU virtual
-    /// address instead of the native user-process compact form.
-    ///
-    /// SCOPE CORRECTED against the macOS oracle. This flag once covered every
-    /// register `ta_offset` feeds, justified from the legacy G14X path where
-    /// all of them are whole pointers. A real Metal render pass on THIS chip
-    /// says otherwise: the captured TA command record writes tilemap, TPC and
-    /// heapmeta as small context-relative offsets (see `ta_offset`). The legacy
-    /// encoding does not transfer to G17P, so those six registers are always
-    /// relative now and this flag applies to the VDM stream alone. Native first
-    /// lowers the task VA to a task-relative offset, maps the same backing at
-    /// 0x1000000000 + offset in the GART window, and writes that offset here.
-    /// Linux userspace supplies the full GART-alias VA; this kernel subtracts
-    /// the architectural 0x1000000000 base. Hardware adds it back for compact
-    /// pointers whose bit 39 is clear.
-    pub(crate) absolute_pointers: bool,
-    ///
-    /// Legacy diagnostic OR-mask for the BG resource-specifier high 17 bits.
-    /// Native calls this field PassControlMaskType and derives it from shader
-    /// outputs, including extension of the highest active pass bit; it is not
-    /// an address class or a universal constant. Main and partial shaders can
-    /// legitimately differ. Default zero preserves the userspace mask;
-    /// a nonzero value is an explicit diagnostic override only.
-    pub(crate) bg_resource_prefix: u64,
-    /// Use the single-capture witnessed values for the two TA descriptor bytes
-    /// `+0x93f` and `+0x94d` instead of the values this driver has always sent.
-    ///
-    /// DIAGNOSTIC, default false. `recs4096-gfx.txt` shows native TA descriptor
-    /// 0 with `+0x93f = 0x87` and `+0x94d = 0x03` where we write `0x91` and
-    /// `0x01`. That is the complete divergence set for literal writes on the TA
-    /// side: 9 literals inside `0x9c0`, 7 matching.
-    ///
-    /// It is NOT sufficient grounds to change the constants, because one
-    /// sighting cannot distinguish "our constant is wrong" from "this offset is
-    /// not a constant". The control is `+0x789`, which reads `0x10` in
-    /// `recs2048-gfx.txt` and `0x08` in `recs4096-gfx.txt`. Testing `0x10` on
-    /// 2026-09-01 produced a hardware result identical to the `0x08` baseline:
-    /// fault-free TA timeout, zero start timestamps, and the same recovery
-    /// entries. No safe derivation is known for this variable field, `0x93f`,
-    /// or `0x94d`. `recs2048`'s TA block stops at `0x800` and
-    /// `recs4096`'s descriptor 1 reaches only `0x640`.
-    ///
-    /// So this flag asks the hardware the answerable question -- do these bytes
-    /// have any effect -- rather than the unanswerable one.
-    pub(crate) native_pm_bytes: bool,
-    /// Hardware-buffer ID allocated for this TA command. Native allocates it
-    /// from the accelerator's 0x7f-entry `AGXHardwareBufferIDManager`, stores
-    /// it in the host-side `AGXTACommandDescriptor` at +0x1248/+0x928, and the
-    /// register generator emits that value as register 0x1c830. Those two host
-    /// offsets are not fields in this final 0x9c0-byte firmware command.
-    pub(crate) ta_hardware_buffer_id: u32,
-    /// HardwareBufferID of the retained USC private-memory FList shared by TA
-    /// and 3D. Native allocates this from the USC manager (accelerator
-    /// +0x133c8), independently of the TA parameter-buffer manager above, and
-    /// emits the same ID in TA register 0x14308 and fragment register 0x14048.
-    pub(crate) usc_flist_hardware_buffer_id: u32,
-    /// Diagnostic capture-value bitmask retained for fields whose proper
-    /// inputs are not modeled yet. In particular, the 0xa5a* values are
-    /// assembled from workload-derived USC pool limits. Their captured values
-    /// are not architectural literals and must not become defaults.
-    pub(crate) native_ta_registers: u32,
-    /// Retained GPU-ID diagnostic snapshot, not the fragment parameter-buffer
-    /// owner. The old 0x1c838 use confused host descriptor +0x928 with a
-    /// different object's transient raw-command +0x928 field.
-    pub(crate) gpc_perf_state_map: u32,
-    /// Low nibble of SGX 0xe01480, copied by native 3D submit to tail +0x210c.
-    pub(crate) gpc_perf_state_map_low: u32,
-    /// Bit 0 of SGX 0xe0141c, copied by native 3D submit to tail +0x2104.
-    pub(crate) gpc_perf_state_control: u32,
-    /// GPU address of the selected native 0x80 Scene-state entry, or 0 for
-    /// none. The command-record binding is carried by `RenderDescriptorObjects`
-    /// in both TA and 3D; this copy is retained for diagnostics.
-    pub(crate) parameter_buffer: u64,
 }
 
 impl G17pRenderParameters {
-    /// Apply the witnessed multisample register triple for a sample count.
-    ///
-    /// Captured constants, not derived: from Apple's own renders on this part
-    /// (logs/m5-msaa-native-hv-20260915-101837) at one, two and four samples,
-    /// with a same-mode control in a second oracle process establishing the
-    /// noise floor. `multisample_control` is the sample POSITION table --
-    /// 0x88 is the centre (8,8), 0x44cc is (4,4),(12,12), and 0xeaa26e26
-    /// unpacks to (14,10),(10,2),(6,14),(2,6), the rotated-grid 4x pattern in
-    /// 1/16 pixel units. `utile_config`'s low nibble is log2(samples);
-    /// `tib_blocks` is samples << 16, zero at one sample.
-    pub(crate) fn set_samples(&mut self, samples: u8) -> bool {
-        let (multisample_control, utile_config, tib_blocks) = match samples {
-            1 => (0x88, 0xa000, 0),
-            2 => (0x44cc, 0xa001, 0x2_0000),
-            4 => (0xeaa2_6e26, 0x6002, 0x4_0000),
-            _ => return false,
-        };
-        self.samples = samples;
-        self.multisample_control = multisample_control;
-        self.utile_config = utile_config;
-        self.tib_blocks = tib_blocks;
-        true
-    }
-
     pub(crate) const fn source_rsrc8() -> Self {
         Self {
             width: 64,
@@ -403,7 +171,6 @@ impl G17pRenderParameters {
             merge_upper_x_bits: 0x3cdd_b3d9,
             merge_upper_y_bits: 0x3cdd_b3d9,
             layers: 1,
-            samples: 1,
             utile_width: 32,
             utile_height: 32,
             utile_config: 0xa000,
@@ -416,7 +183,7 @@ impl G17pRenderParameters {
             cycle: 0x17_8020,
             record_index: 0x8_0005,
             lifecycle: 0,
-            fragment_lifecycle: 0,
+            work_stamp: 0x100,
             sampler_array: 0,
             sampler_count: 0,
             process_empty_tiles: true,
@@ -428,16 +195,6 @@ impl G17pRenderParameters {
             fragment_timestamp_end: 0xffff_fc20_0002_4c70,
             fragment_user_timestamp_start: 0,
             fragment_user_timestamp_end: 0,
-            absolute_pointers: false,
-            bg_resource_prefix: 0,
-            native_pm_bytes: false,
-            ta_hardware_buffer_id: 0,
-            usc_flist_hardware_buffer_id: 0,
-            native_ta_registers: 0,
-            gpc_perf_state_map: 0,
-            gpc_perf_state_map_low: 0,
-            gpc_perf_state_control: 0,
-            parameter_buffer: 0,
         }
     }
 }
@@ -478,15 +235,6 @@ fn geometry(parameters: &G17pRenderParameters) -> Result<Geometry, RenderBuildEr
     }
     let utiles_per_tile_x = TILE_WIDTH / utile_width as u64;
     let utiles_per_tile_y = TILE_HEIGHT / utile_height as u64;
-    // Four samples split the utile in Y. Measured against Apple's own
-    // four-sample render: size1 0x14 -> 0x28, size3 0x20 -> 0x40 and
-    // macro_size 0x40004 -> 0x40008, where only the y term moves. All three
-    // follow from doubling this one term; two samples do not split.
-    let utiles_per_tile_y = if parameters.samples == 4 {
-        utiles_per_tile_y * 2
-    } else {
-        utiles_per_tile_y
-    };
     let utiles_per_tile = utiles_per_tile_x * utiles_per_tile_y;
     let mtile_x1 = align((tiles_x + MACRO_TILES_X - 1) / MACRO_TILES_X, 4);
     let mtile_y1 = align((tiles_y + MACRO_TILES_Y - 1) / MACRO_TILES_Y, 4);
@@ -511,94 +259,23 @@ fn geometry(parameters: &G17pRenderParameters) -> Result<Geometry, RenderBuildEr
     })
 }
 
-/// Context-relative offset. ALWAYS relative -- a real Metal render pass on this
-/// chip writes small offsets into these registers, not addresses.
-///
-/// Oracle: the TA command record captured from `mtlg.m` (macos-trace
-/// `recs-gfx.txt`, dumped by `recs.d` at `requestChannelCommandTA`) carries an
-/// embedded register list that decodes field-for-field against this function's
-/// output -- same registers, same order, 12-byte entries of u32 number plus u64
-/// value -- with these values:
-///
-///   0x01748 = 1                    (matches)
-///   0x10141 = 0x200                (matches)
-///   0x1c039 = 0x0119ba00           tilemap   <- OFFSET, not a VA
-///   0x1c9c8 = 0x0119ba00           tilemap
-///   0x1c0a1 = 0x01290000           tpc       <- OFFSET
-///   0x1c031 = 0x800000000119ca00   heapmeta | bit63 (matches the form)
-///   0x1c9c0 = 0x800000000119ca00   heapmeta
-///   0x1c051 = 0x003a0012006b0003   (matches the constant exactly)
-///
-/// Writing full virtual addresses here -- which is what the legacy G14X path
-/// does, and what an earlier version of this driver was changed to do -- points
-/// the tiler's tilemap, TPC and heapmeta at values the firmware cannot use.
-fn ta_resource_offset(
-    parameters: &G17pRenderParameters,
-    address: u64,
-) -> Result<u64, RenderBuildError> {
+fn ta_offset(parameters: &G17pRenderParameters, address: u64) -> Result<u64, RenderBuildError> {
     address
         .checked_sub(parameters.context_base)
         .ok_or(RenderBuildError::AddressBeforeContext)
 }
 
-/// Compact user/GART address consumed by the TA register and descriptor
-/// fields. Native maps these objects in the architectural 0x1000000000 window
-/// and publishes the offset, not the full address. Descriptor +0x7d6 is only
-/// 32 bits wide, so reject aliases that cannot be represented consistently.
-fn ta_user_offset(address: u64) -> Result<u64, RenderBuildError> {
-    let offset = address
-        .checked_sub(G17P_USER_BASE)
-        .ok_or(RenderBuildError::UserAddressOutOfRange)?;
-
-    if offset > u32::MAX as u64 {
-        return Err(RenderBuildError::UserAddressOutOfRange);
-    }
-
-    Ok(offset)
-}
-
-fn vdm_user_offset(address: u64) -> Result<u64, RenderBuildError> {
-    let offset = address
-        .checked_sub(G17P_USER_BASE)
-        .ok_or(RenderBuildError::VdmAddressOutOfRange)?;
-
-    if offset >= G17P_VDM_USER_WINDOW_SIZE {
-        return Err(RenderBuildError::VdmAddressOutOfRange);
-    }
-
-    Ok(offset)
-}
-
 pub(crate) fn build_ta_registers(
     p: &G17pRenderParameters,
 ) -> Result<[RegisterWrite; TA_REGISTER_COUNT], RenderBuildError> {
-    build_ta_registers_for_work_key(p, render_work_key(1, 0))
-}
-
-fn build_ta_registers_for_work_key(
-    p: &G17pRenderParameters,
-    work_key: u64,
-) -> Result<[RegisterWrite; TA_REGISTER_COUNT], RenderBuildError> {
     let g = geometry(p)?;
-    let tilemap = ta_resource_offset(p, p.tilemap)?;
-    let heapmeta = ta_resource_offset(p, p.heapmeta)?;
-    let tpc = ta_resource_offset(p, p.tpc)?;
-    let deflake_1 = ta_user_offset(p.deflake_1)?;
-    let deflake_2 = ta_user_offset(p.deflake_2)?;
-    let deflake_3 = ta_user_offset(p.deflake_3)?;
-    // The VDM control stream is the one pointer the 192-byte capture window
-    // does not reach (register 0x1c880 sits past the end of the dump), and it
-    // is the one that is not relative to the driver-private `context_base`.
-    // macOS first lowers the task VA to a task-relative offset, then maps the
-    // backing at 0x1000000000 + offset in the GART window. Linux userspace gives
-    // us that full alias VA, so this hardware encoder subtracts the GART base.
-    // Bit 39 selects the upper UAT root; refuse an offset that would silently
-    // change roots. Keep the full-address escape hatch diagnostic-only.
-    let encoder = if p.absolute_pointers {
-        p.encoder
-    } else {
-        vdm_user_offset(p.encoder)?
-    };
+    let tilemap = ta_offset(p, p.tilemap)?;
+    let heapmeta = ta_offset(p, p.heapmeta)?;
+    let tpc = ta_offset(p, p.tpc)?;
+    let deflake_1 = ta_offset(p, p.deflake_1)?;
+    let deflake_2 = ta_offset(p, p.deflake_2)?;
+    let deflake_3 = ta_offset(p, p.deflake_3)?;
+    let encoder = ta_offset(p, p.encoder)?;
     let layer_mode = if p.layers > 1 {
         0xe000 | (p.layers as u64 - 1)
     } else {
@@ -607,8 +284,6 @@ fn build_ta_registers_for_work_key(
 
     Ok([
         RegisterWrite::new(0x01748, 1),
-        // Native N=1 uses 0x200 and N=2 uses 0x0. The one-layer source profile
-        // selects the N=1 value, matching descriptor byte +0x789 above.
         RegisterWrite::new(0x10141, 0x200),
         RegisterWrite::new(0x1c039, tilemap),
         RegisterWrite::new(0x1c9c8, tilemap),
@@ -638,12 +313,7 @@ fn build_ta_registers_for_work_key(
         RegisterWrite::new(0x1c8f8, 0x8860),
         RegisterWrite::new(0x1c0b1, g.size1),
         RegisterWrite::new(0x1c850, g.size1),
-        // Silicon holds 0x10131 at 0x88 at ONE, TWO and FOUR samples while
-        // 0x10139 carries the real sample position table (all five captures in
-        // logs/m5-msaa-native-hv-20260915-101837). Driving this from
-        // multisample_control would write the position table here, which
-        // Apple never does.
-        RegisterWrite::new(0x10131, 0x88),
+        RegisterWrite::new(0x10131, p.multisample_control),
         RegisterWrite::new(0x10121, p.ppp_control),
         RegisterWrite::new(0x10129, g.pixels),
         RegisterWrite::new(0x101b9, g.screen),
@@ -669,37 +339,19 @@ fn build_ta_registers_for_work_key(
         RegisterWrite::new(0x0d471, 0),
         RegisterWrite::new(0x1a0f1, 8),
         RegisterWrite::new(0x10799, 0xff_0000),
-        // Native sources this from AGXHardwareBufferIDManager. It is neither a
-        // PBDesc ring index nor a capture-stable literal.
-        RegisterWrite::new(0x1c830, p.ta_hardware_buffer_id as u64),
+        RegisterWrite::new(0x1c830, 0),
         RegisterWrite::new(0x1ca30, p.cycle),
         RegisterWrite::new(0x16c39, p.cycle),
         RegisterWrite::new(0x1c910, p.record_index),
-        // Native derives the high word from the TA AGXUMADataRec PTC/DUPM
-        // maximum at host descriptor +0x1488, copied through command +0x1158.
-        // halUpdatePTCMaxCount computes max(0x60, min(pool_input / active_kicks,
-        // 0x200)); Linux does not yet carry that pool input. Follow the kext's
-        // exact zero-source fallback 0x60_0040_0020. Bit 1 retains one working
-        // Metal trace's workload-derived 0xfe value as a diagnostic only.
-        RegisterWrite::new(
-            0x0a5a1,
-            if p.native_ta_registers & 2 != 0 {
-                0x0000_00fe_0040_0020
-            } else {
-                0x0000_0060_0040_0020
-            },
-        ),
+        RegisterWrite::new(0x0a5a1, 0x0000_00fe_0040_0020),
         RegisterWrite::new(0x0d419, 0x0000_0002_0000_0001),
         RegisterWrite::new(0x1ca10, p.lifecycle),
         RegisterWrite::new(0x014a1, p.lifecycle),
         RegisterWrite::new(0x0a349, p.lifecycle),
-        RegisterWrite::new(0x10209, work_key),
-        RegisterWrite::new(0x1c9f0, work_key),
-        RegisterWrite::new(0x14320, work_key),
-        // AGXTACommandDescriptor::prepare receives the shared USC FList ID
-        // through descriptor +0x1410. Optional GART/feature payloads are absent
-        // in Linux, so the retained owner's ID is the complete value.
-        RegisterWrite::new(0x14308, p.usc_flist_hardware_buffer_id as u64),
+        RegisterWrite::new(0x10209, p.work_stamp),
+        RegisterWrite::new(0x1c9f0, p.work_stamp),
+        RegisterWrite::new(0x14320, p.work_stamp),
+        RegisterWrite::new(0x14308, 0),
         RegisterWrite::new(0x14318, p.ta_status | 1),
         RegisterWrite::new(0x01740, 1),
         RegisterWrite::new(0x1c880, deflake_1),
@@ -707,54 +359,8 @@ fn build_ta_registers_for_work_key(
     ])
 }
 
-/// DIAGNOSTIC. Write native's value into TA-descriptor fields where ours differs
-/// structurally at MATCHED 256x256 geometry (recs3.txt TA record, stride 0x9c0).
-/// The tiler bins ~60 bytes of a 1.28 MB TVB with every input verified correct,
-/// so these are what is left that we demonstrably send differently.
-fn apply_g17p_ta_oracle(raw: &mut [u8]) {
-    let mask = *crate::module_parameters::g17p_ta_oracle.value();
-    if mask == 0 {
-        return;
-    }
-    if mask & 0x01 != 0 {
-        put_u64(raw, 0x370, 0x500);
-        put_u64(raw, 0x388, 0x500);
-        put_u64(raw, 0x8d0, 0x500);
-    }
-    if mask & 0x02 != 0 {
-        put_u64(raw, 0x018, 3);
-    }
-    if mask & 0x04 != 0 {
-        put_u32(raw, 0x33c, 0xa9);
-    }
-    if mask & 0x08 != 0 {
-        put_u64(raw, 0x7d8, 0x6);
-        put_u32(raw, 0x798, 0xa);
-    }
-}
-
 pub(crate) fn build_fragment_registers(
     p: &G17pRenderParameters,
-) -> Result<[RegisterWrite; FRAGMENT_REGISTER_COUNT], RenderBuildError> {
-    build_fragment_registers_for_work_key(p, render_work_key(1, 1))
-}
-
-/// As `build_fragment_registers`, plus the live entry count. The count is
-/// always `FRAGMENT_REGISTER_COUNT`; the pair form is kept because the
-/// descriptor's count word at +0x7a8 must agree with the slice actually
-/// written, and having one source for both makes them impossible to desync.
-pub(crate) fn build_fragment_registers_counted(
-    p: &G17pRenderParameters,
-) -> Result<([RegisterWrite; FRAGMENT_REGISTER_COUNT], usize), RenderBuildError> {
-    Ok((
-        build_fragment_registers_for_work_key(p, render_work_key(1, 1))?,
-        FRAGMENT_REGISTER_COUNT,
-    ))
-}
-
-fn build_fragment_registers_for_work_key(
-    p: &G17pRenderParameters,
-    work_key: u64,
 ) -> Result<[RegisterWrite; FRAGMENT_REGISTER_COUNT], RenderBuildError> {
     let g = geometry(p)?;
     let tile_state = 0x3717f
@@ -839,40 +445,16 @@ fn build_fragment_registers_for_work_key(
         RegisterWrite::new(0x101c1, 0),
         RegisterWrite::new(0x0d469, 0),
         RegisterWrite::new(0x1a0f9, 8),
-        // Fragment analog of TA 0x0a5a1. Native derives its high word from the
-        // 3D AGXUMADataRec PTC/DUPM maximum at host descriptor +0xc00, copied
-        // through command +0x818. Linux has no owned pool-size input yet, so
-        // use the exact 0x60 zero-source fallback. Bit 3 retains one captured,
-        // workload-derived 0xd5 value only as a diagnostic.
-        RegisterWrite::new(
-            0x0a5a9,
-            if p.native_ta_registers & 8 != 0 {
-                0x0000_00d5_0040_0020
-            } else {
-                0x0000_0060_0040_0020
-            },
-        ),
+        RegisterWrite::new(0x0a5a9, 0x0000_0146_0040_0020),
         RegisterWrite::new(0x0d429, 0x0000_0002_0000_0001),
-        RegisterWrite::new(0x160e0, p.fragment_lifecycle),
-        RegisterWrite::new(0x01499, p.fragment_lifecycle),
-        RegisterWrite::new(0x0a341, p.fragment_lifecycle),
-        // The fragment must use the same parameter-buffer owner as TA 1c830.
-        // Native TA::prepare stores its allocated HWPB ID at host +928; the
-        // same derived host descriptor is submitted through both channels.
-        // generate3DRegisterList reads that HOST field at 8a5c7cc. Its wrapper
-        // at 8a515d8 tail-calls with x1=raw command, x2=host descriptor: the
-        // unused channel argument in the mangled common-function name is NOT
-        // present in the optimized calling convention. Raw command +928 has
-        // a different producer and must not be used to infer this register.
-        RegisterWrite::new(0x1c838, p.ta_hardware_buffer_id as u64),
+        RegisterWrite::new(0x160e0, p.lifecycle),
+        RegisterWrite::new(0x01499, p.lifecycle),
+        RegisterWrite::new(0x0a341, p.lifecycle),
+        RegisterWrite::new(0x1c838, 0),
         RegisterWrite::new(0x1ca28, p.cycle),
-        RegisterWrite::new(0x10211, work_key),
-        RegisterWrite::new(0x10420, work_key),
-        // AGX3DCommandDescriptor::prepare receives this ID from the USC pool's
-        // HardwareBufferIDManager and generate3DRegisterList ORs it with an
-        // optional GART payload and feature bit. Linux currently has neither
-        // optional source, so publish the retained USC FList owner's exact ID.
-        RegisterWrite::new(0x14048, p.usc_flist_hardware_buffer_id as u64),
+        RegisterWrite::new(0x10211, p.work_stamp),
+        RegisterWrite::new(0x10420, p.work_stamp),
+        RegisterWrite::new(0x14048, 0),
         RegisterWrite::new(0x14080, p.fragment_status | 1),
         RegisterWrite::new(0x01731, 1),
         RegisterWrite::new(0x16020, 1),
@@ -881,37 +463,7 @@ fn build_fragment_registers_for_work_key(
     ])
 }
 
-/// Size of one userspace global-ID group reserved by
-/// `IOGPUDeviceUserClient::s_get_next_gid_group` on macOS.
-pub(crate) const G17P_RENDER_GID_GROUP_STRIDE: u32 = 0x0100_0000;
-
-/// Compose the predecessor/current IDs used by one native render pair.
-///
-/// macOS reserves a 0x01000000-ID range and gives its old global-counter value
-/// to Metal. Metal returns that predecessor in render setup; the kernel then
-/// allocates consecutive current IDs from the advanced global counter, 3D
-/// first and TA second. The RCE programs and command tails both carry the
-/// resulting `{predecessor,current}` pair. These are object IDs, not queue
-/// submission ordinals.
-pub(crate) const fn g17p_render_lifecycle_pair(
-    predecessor: u32,
-    fragment_current: u32,
-) -> Option<(u64, u64)> {
-    if predecessor == 0 || fragment_current == 0 {
-        return None;
-    }
-    let tiling_current = match fragment_current.checked_add(1) {
-        Some(value) if value != 0 => value,
-        _ => return None,
-    };
-    let predecessor = (predecessor as u64) << 32;
-    Some((
-        predecessor | fragment_current as u64,
-        predecessor | tiling_current as u64,
-    ))
-}
-
-pub(crate) fn partial_store_registers(
+fn partial_store_registers(
     p: &G17pRenderParameters,
 ) -> [RegisterWrite; PARTIAL_STORE_REGISTER_COUNT] {
     [
@@ -934,7 +486,7 @@ pub(crate) fn partial_store_registers(
     ]
 }
 
-pub(crate) fn partial_resume_registers(
+fn partial_resume_registers(
     p: &G17pRenderParameters,
 ) -> [RegisterWrite; PARTIAL_RESUME_REGISTER_COUNT] {
     [
@@ -964,7 +516,7 @@ pub(crate) fn partial_resume_registers(
     ]
 }
 
-pub(crate) fn partial_load_registers(
+fn partial_load_registers(
     p: &G17pRenderParameters,
 ) -> [RegisterWrite; PARTIAL_LOAD_REGISTER_COUNT] {
     [
@@ -1019,49 +571,11 @@ pub(crate) struct RenderDescriptorObjects {
     pub(crate) zero: u64,
 }
 
-impl RenderDescriptorObjects {
-    /// Select one 0x100-byte Pool-A record while leaving every other object
-    /// pointer unchanged.
-    pub(crate) fn with_pool_a_record_index(
-        mut self,
-        record_index: usize,
-    ) -> Result<Self, RenderBuildError> {
-        let offset = record_index
-            .checked_mul(0x100)
-            .ok_or(RenderBuildError::ArithmeticOverflow)?;
-        self.record_a = self
-            .record_a
-            .checked_add(offset as u64)
-            .ok_or(RenderBuildError::ArithmeticOverflow)?;
-        Ok(self)
-    }
-
-    /// Replace the stage-local shared object without changing the other three
-    /// descriptor pointers. Final native publishes keep TA +0x20 and Fragment
-    /// +0x28 identical; callers must therefore apply any HWPB substitution to
-    /// the shared object used by both descriptors, not to Fragment alone.
-    pub(crate) const fn with_shared(mut self, shared: u64) -> Self {
-        self.shared = shared;
-        self
-    }
-}
-
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct RenderDescriptorMetadata {
     pub(crate) context_id: u32,
     pub(crate) submission_ordinal: u32,
-    /// Monotonic state tag allocated by the command buffer's 36-entry state
-    /// ring. This is neither the selected ring index nor any QID/HWID. Native
-    /// retains the full word in the selected state object and places only its
-    /// low six bits in the stage work key.
-    pub(crate) command_buffer_state_word: u32,
-    /// TA HardwareBufferID copied to firmware descriptor +0x18.
-    ///
-    /// Every working native descriptor corpus couples this field to register
-    /// 0x1c830 exactly (for example 2/2, 4/4, and 5/5). The same allocator
-    /// result is also PBState +0x0c and the descriptor-ring index consumed by
-    /// `halLoadPBDesc`.
-    pub(crate) ta_hardware_buffer_id: u32,
+    pub(crate) queue_pair: u32,
     pub(crate) submit_sequence: u64,
 }
 
@@ -1070,25 +584,13 @@ impl RenderDescriptorMetadata {
         Self {
             context_id: 1,
             submission_ordinal: 0,
-            command_buffer_state_word: match kind {
-                RenderDescriptorKind::Tiling => 0,
-                RenderDescriptorKind::Fragment => 1,
-            },
-            ta_hardware_buffer_id: 0,
+            queue_pair: 0,
             submit_sequence: match kind {
                 RenderDescriptorKind::Tiling => 1,
                 RenderDescriptorKind::Fragment => 0,
             },
         }
     }
-}
-
-/// Native's TA/3D register-list producer couples the command-buffer state tag
-/// to the descriptor's allocated application-GART context. The physical QID,
-/// QoS HardwareBufferID, descriptor-array slot and 36-entry state-ring index
-/// are independent namespaces and must not be substituted here.
-const fn render_work_key(context_id: u32, command_buffer_state_word: u32) -> u64 {
-    ((context_id as u64) << 8) | ((command_buffer_state_word & 0x3f) as u64)
 }
 
 fn descriptor_work_ordinal(ordinal: u32) -> u32 {
@@ -1127,12 +629,21 @@ fn write_common_descriptor(
     encode_registers(raw, register_offset, registers);
 
     let work = descriptor_work_ordinal(metadata.submission_ordinal);
+    let stamp = metadata.context_id.max(1) * 0x100 + work;
     match kind {
         RenderDescriptorKind::Tiling => {
-            put_u32(raw, 0x18, metadata.ta_hardware_buffer_id);
+            put_u32(raw, 0x18, metadata.queue_pair);
+            put_u32(raw, 0x304, metadata.queue_pair);
             put_u32(raw, 0x48, work);
+            for field in [0x370, 0x37c, 0x388] {
+                put_u32(raw, field, stamp);
+            }
         }
-        RenderDescriptorKind::Fragment => {}
+        RenderDescriptorKind::Fragment => {
+            put_u32(raw, 0x458, metadata.queue_pair);
+            put_u32(raw, 0x470, stamp);
+            put_u32(raw, 0x47c, stamp);
+        }
     }
 }
 
@@ -1145,48 +656,23 @@ pub(crate) fn build_ta_descriptor(
     if raw.len() < TA_DESCRIPTOR_SIZE {
         return Err(RenderBuildError::BufferTooSmall);
     }
-    let registers = build_ta_registers_for_work_key(
-        parameters,
-        render_work_key(metadata.context_id, metadata.command_buffer_state_word),
-    )?;
-    build_ta_descriptor_base(parameters, objects, metadata, &registers, raw)?;
-    apply_g17p_ta_oracle(raw);
-    Ok(())
-}
-
-pub(crate) fn build_ta_descriptor_base(
-    parameters: &G17pRenderParameters,
-    objects: RenderDescriptorObjects,
-    metadata: RenderDescriptorMetadata,
-    registers: &[RegisterWrite],
-    raw: &mut [u8],
-) -> Result<(), RenderBuildError> {
-    if raw.len() < TA_DESCRIPTOR_SIZE {
-        return Err(RenderBuildError::BufferTooSmall);
-    }
-    if registers.is_empty() || registers.len() > (0x660 - 0x60) / REGISTER_BYTES {
-        return Err(RenderBuildError::BufferTooSmall);
-    }
     raw[..TA_DESCRIPTOR_SIZE].fill(0);
+    let registers = build_ta_registers(parameters)?;
     write_common_descriptor(
         RenderDescriptorKind::Tiling,
         objects,
         metadata,
-        registers,
+        &registers,
         raw,
     );
 
-    let deflake = ta_user_offset(parameters.deflake_1)?;
+    let deflake = ta_offset(parameters, parameters.deflake_1)?;
     let sampler_max = if parameters.sampler_count == 0 {
         0
     } else {
         parameters.sampler_count + 1
     };
-    put_u32(
-        raw,
-        0x0768,
-        (((registers.len() * REGISTER_BYTES) as u32) << 16) | registers.len() as u32,
-    );
+    put_u32(raw, 0x0768, 0x036c_0049);
     put_u64(raw, 0x0780, parameters.tpc);
     put_u8(raw, 0x0789, 0x78);
     put_u32(raw, 0x07d6, deflake as u32);
@@ -1194,22 +680,13 @@ pub(crate) fn build_ta_descriptor_base(
     put_u64(raw, 0x087a, parameters.sampler_array);
     put_u32(raw, 0x0882, parameters.sampler_count);
     put_u32(raw, 0x0886, sampler_max);
-    // Present in 436/438 valid G17P TA records, including both exact 32x32
-    // geometry matches. This belongs to the TA output/activation tail; leaving
-    // it zero is a structural mismatch before the linked 3D job is generated.
-    put_u32(raw, 0x0892, 1);
     put_u8(raw, 0x0932, 0x44);
     put_u8(raw, 0x093c, 1);
-    put_u8(raw, 0x094d, if parameters.native_pm_bytes { 3 } else { 1 });
+    put_u8(raw, 0x094d, 1);
     put_u64(raw, 0x08fe, parameters.ta_timestamp_start);
     put_u64(raw, 0x0906, parameters.ta_timestamp_end);
     put_u64(raw, 0x090e, parameters.ta_user_timestamp_start);
     put_u64(raw, 0x0916, parameters.ta_user_timestamp_end);
-    // AGXTAChannelSKSM::submitBuffer mirrors the same dependency/current pair
-    // consumed by the TA RCE program into the firmware command. These fields
-    // are deliberately unaligned in the native 0x9c0-byte command layout.
-    put_u32(raw, 0x086e, (parameters.lifecycle >> 32) as u32);
-    put_u64(raw, 0x08ce, parameters.lifecycle as u32 as u64);
     Ok(())
 }
 
@@ -1220,34 +697,20 @@ pub(crate) fn build_ta_descriptor_base(
 pub(crate) fn build_cold_opening_ta_descriptor(
     parameters: &G17pRenderParameters,
     objects: RenderDescriptorObjects,
-    context_id: u32,
-    command_buffer_state_word: u32,
-    ta_hardware_buffer_id: u32,
     raw: &mut [u8],
 ) -> Result<(), RenderBuildError> {
-    let mut metadata = RenderDescriptorMetadata::source(RenderDescriptorKind::Tiling);
-    metadata.context_id = context_id;
-    metadata.command_buffer_state_word = command_buffer_state_word;
-    metadata.ta_hardware_buffer_id = ta_hardware_buffer_id;
-    build_ta_descriptor(parameters, objects, metadata, raw)?;
+    build_ta_descriptor(
+        parameters,
+        objects,
+        RenderDescriptorMetadata::source(RenderDescriptorKind::Tiling),
+        raw,
+    )?;
     put_u16(raw, 0x38, 0x47);
     put_u16(raw, 0x3a, 0x49);
     put_u16(raw, 0x3c, 0x49);
-    // +0x788 carries the GTP-only RT-buffer size. The valid 32x32 records use
-    // one 0x800-byte buffer and therefore encode qword 0x800 (byte +0x789 =
-    // 0x08). Cold qid0's 0x7800 belongs to a different 15-buffer pool and must
-    // not be copied into this one-buffer Linux pool.
     put_u8(raw, 0x789, 0x08);
     put_u8(raw, 0x93e, 0xd0);
-    put_u8(
-        raw,
-        0x93f,
-        if parameters.native_pm_bytes {
-            0x87
-        } else {
-            0x91
-        },
-    );
+    put_u8(raw, 0x93f, 0x91);
     Ok(())
 }
 
@@ -1266,13 +729,6 @@ fn put_embedded_registers(
     encode_registers(raw, program_offset, registers);
 }
 
-pub(crate) struct G17pFragmentRegisters<'a> {
-    pub(crate) main: &'a [RegisterWrite],
-    pub(crate) store: &'a [RegisterWrite],
-    pub(crate) resume: &'a [RegisterWrite],
-    pub(crate) load: &'a [RegisterWrite],
-}
-
 pub(crate) fn build_fragment_descriptor(
     parameters: &G17pRenderParameters,
     objects: RenderDescriptorObjects,
@@ -1282,55 +738,14 @@ pub(crate) fn build_fragment_descriptor(
     if raw.len() < FRAGMENT_DESCRIPTOR_SIZE {
         return Err(RenderBuildError::BufferTooSmall);
     }
-    let registers = build_fragment_registers_for_work_key(
-        parameters,
-        render_work_key(metadata.context_id, metadata.command_buffer_state_word),
-    )?;
-    let store = partial_store_registers(parameters);
-    let resume = partial_resume_registers(parameters);
-    let load = partial_load_registers(parameters);
-    build_fragment_descriptor_base(
-        parameters,
-        objects,
-        metadata,
-        G17pFragmentRegisters {
-            main: &registers,
-            store: &store,
-            resume: &resume,
-            load: &load,
-        },
-        raw,
-    )?;
-    apply_g17p_fragment_oracle(raw);
-    Ok(())
-}
-
-pub(crate) fn build_fragment_descriptor_base(
-    parameters: &G17pRenderParameters,
-    objects: RenderDescriptorObjects,
-    metadata: RenderDescriptorMetadata,
-    programs: G17pFragmentRegisters<'_>,
-    raw: &mut [u8],
-) -> Result<(), RenderBuildError> {
-    if raw.len() < FRAGMENT_DESCRIPTOR_SIZE {
-        return Err(RenderBuildError::BufferTooSmall);
-    }
-    if programs.main.is_empty()
-        || programs.main.len() > (0x6a0 - 0xa0) / REGISTER_BYTES
-        || programs.store.len() > (0xec0 - 0x7c0) / REGISTER_BYTES
-        || programs.resume.len() > (0x15e0 - 0xee0) / REGISTER_BYTES
-        || programs.load.len() > (0x1d00 - 0x1600) / REGISTER_BYTES
-    {
-        return Err(RenderBuildError::BufferTooSmall);
-    }
     raw[..FRAGMENT_DESCRIPTOR_SIZE].fill(0);
     let geometry = geometry(parameters)?;
-    let register_count = programs.main.len();
+    let registers = build_fragment_registers(parameters)?;
     write_common_descriptor(
         RenderDescriptorKind::Fragment,
         objects,
         metadata,
-        programs.main,
+        &registers,
         raw,
     );
 
@@ -1344,11 +759,12 @@ pub(crate) fn build_fragment_descriptor_base(
     put_u32(
         raw,
         0x07a8,
-        (((register_count * REGISTER_BYTES) as u32) << 16) | register_count as u32,
+        (((FRAGMENT_REGISTER_COUNT * REGISTER_BYTES) as u32) << 16)
+            | FRAGMENT_REGISTER_COUNT as u32,
     );
-    put_embedded_registers(raw, 0x0ec8, 0x07c0, programs.store);
-    put_embedded_registers(raw, 0x15e8, 0x0ee0, programs.resume);
-    put_embedded_registers(raw, 0x1d08, 0x1600, programs.load);
+    put_embedded_registers(raw, 0x0ec8, 0x07c0, &partial_store_registers(parameters));
+    put_embedded_registers(raw, 0x15e8, 0x0ee0, &partial_resume_registers(parameters));
+    put_embedded_registers(raw, 0x1d08, 0x1600, &partial_load_registers(parameters));
 
     put_u64(raw, 0x1d20, parameters.depth_bias_array);
     put_u64(raw, 0x1d30, parameters.scissor_array);
@@ -1370,43 +786,21 @@ pub(crate) fn build_fragment_descriptor_base(
     put_u64(raw, 0x1f9c, parameters.partial_store_pipeline);
     put_u32(raw, 0x1fa8, parameters.depth_clear_value_bits);
     put_u64(raw, 0x1fac, (parameters.tib_blocks << 33) | 0x300);
-    // Native copies isMemorylessRender through the UMD render record +0x240,
-    // parsed record +0x1b8, and host descriptor +0x8bf into this byte. It is
-    // not a TIB-size predicate: native's memoryless policy also selects the
-    // shortened SPM phase programs. The admitted render UAPI represents
-    // memory-backed resources and has no memoryless-render policy or matching
-    // SPM-program construction. Keep that policy clear even for >8 TIB
-    // blocks; supporting memoryless renders requires modeling both together.
-    // Empty-tile processing remains independent in register 0x10039 bit 16.
-    put_u8(raw, 0x2100, 0);
-    // Exact G17P tail copied by AGX3DChannelSKSM::submitBuffer. +0x2104 is the
-    // accelerator control snapshot and +0x210c its low map nibble. +0x2110 is
-    // a separate render-setup field: prepare copies descriptor +0xc00 to setup
-    // +0x818, processRenderSetup carries it to +0x89c, and submitBuffer emits
-    // it here. Working Metal commands carry the invariant all-ones value.
-    put_u32(raw, 0x2104, parameters.gpc_perf_state_control);
-    // AGX3DChannelSKSM::submitBuffer mirrors the same dependency/current pair
-    // consumed by the fragment RCE program into the firmware command.
-    put_u32(raw, 0x2108, (parameters.fragment_lifecycle >> 32) as u32);
-    put_u32(raw, 0x210c, parameters.gpc_perf_state_map_low);
-    put_u32(raw, 0x2110, G17P_FRAGMENT_TAIL_SETUP_WORD);
-    // Native submitBuffer zeros +0x2114..+0x2123. Sampler state reaches the
-    // GPU through its real register/program path, not these command-tail
-    // lanes. The first two following flag lanes reproduce the working Neo
-    // shared-runtime snapshot; the final two come from per-command descriptor
-    // bytes and retain their constructor-zero values until those inputs are
-    // modeled.
+    put_u8(raw, 0x2100, (!parameters.process_empty_tiles) as u8);
+    put_u32(raw, 0x2110, u32::MAX);
+    put_u64(raw, 0x2114, parameters.sampler_array);
+    put_u32(raw, 0x211c, parameters.sampler_count);
     put_u32(
         raw,
-        0x2124,
-        G17P_NEO_FRAGMENT_SHARED_RUNTIME_FLAG_SNAPSHOT[0],
+        0x2120,
+        if parameters.sampler_count == 0 {
+            0
+        } else {
+            parameters.sampler_count + 1
+        },
     );
-    put_u32(
-        raw,
-        0x2128,
-        G17P_NEO_FRAGMENT_SHARED_RUNTIME_FLAG_SNAPSHOT[1],
-    );
-    put_u64(raw, 0x2168, parameters.fragment_lifecycle as u32 as u64);
+    put_u8(raw, 0x2124, parameters.process_empty_tiles as u8);
+    put_u8(raw, 0x2128, 1);
     put_u64(raw, 0x2198, parameters.fragment_timestamp_start);
     put_u64(raw, 0x21a0, parameters.fragment_timestamp_end);
     put_u64(raw, 0x21a8, parameters.fragment_user_timestamp_start);
@@ -1420,94 +814,28 @@ pub(crate) fn build_fragment_descriptor_base(
     Ok(())
 }
 
-fn apply_g17p_fragment_oracle(raw: &mut [u8]) {
-    // Neo diagnostic overrides stay outside the shared encoder so M5
-    // register programs and geometry never inherit these substitutions.
-    let oracle = *crate::module_parameters::g17p_frag_oracle.value();
-    if oracle & 0x01 != 0 {
-        put_u64(raw, 0x158, 0x7007);
-    }
-    if oracle & 0x02 != 0 {
-        put_u64(raw, 0x488, 1);
-    }
-    if oracle & 0x04 != 0 {
-        // native 0x8000005300000000 against our 0x0000005300000000
-        let mut cur = [0u8; 8];
-        cur.copy_from_slice(&raw[0x21c8..0x21d0]);
-        put_u64(raw, 0x21c8, u64::from_le_bytes(cur) | (1u64 << 63));
-    }
-    if oracle & 0x08 != 0 {
-        put_u64(raw, 0x78, 0x40);
-    }
-    if oracle & 0x10 != 0 {
-        put_u64(raw, 0x458, 3);
-        put_u64(raw, 0x470, 0x500);
-    }
-    if oracle & 0x20 != 0 {
-        put_u64(raw, 0x1f48, 0x0000_0100_0000_0100);
-    }
-    if oracle & 0x40 != 0 {
-        // fields native leaves ZERO and we populate
-        put_u64(raw, 0x1d0, 0);
-        put_u64(raw, 0x1f0, 0);
-        put_u64(raw, 0x1f8, 0);
-    }
-    if oracle & 0x80 != 0 {
-        put_u32(raw, 0x1d8 + 4, 0x3f80_0000);
-    }
-}
-
 /// Build the fragment descriptor used by the proven native cold opening.
 pub(crate) fn build_cold_opening_fragment_descriptor(
     parameters: &G17pRenderParameters,
     objects: RenderDescriptorObjects,
-    context_id: u32,
-    command_buffer_state_word: u32,
     raw: &mut [u8],
 ) -> Result<(), RenderBuildError> {
-    let mut metadata = RenderDescriptorMetadata::source(RenderDescriptorKind::Fragment);
-    metadata.context_id = context_id;
-    metadata.command_buffer_state_word = command_buffer_state_word;
-    build_fragment_descriptor(parameters, objects, metadata, raw)?;
+    build_fragment_descriptor(
+        parameters,
+        objects,
+        RenderDescriptorMetadata::source(RenderDescriptorKind::Fragment),
+        raw,
+    )?;
     put_u32(raw, 0x50, 1);
     put_u16(raw, 0x80, 0x56);
     put_u16(raw, 0x82, 0x57);
     put_u16(raw, 0x84, 0x57);
     put_u16(raw, 0x88, 0x59);
     put_u32(raw, 0x90, 1);
-    // A newly published native 3D queue carries 1 here; retained submissions
-    // clear it. This lifecycle is independent of the outer-slot first-submit
-    // byte and appears identically on cold QIDs 1 and 8 in both valid traces.
-    put_u32(raw, 0x215c, 1);
-    Ok(())
-}
-
-/// Stage the TA's link to the physical fragment command, not its ring slot.
-///
-/// Native TA submit copies host +0x1528 as a low-40-bit qword at +0x7a8 and
-/// its bits 47:40 as two independent bytes at +0x7b0/+0x7b1 (8a99220..34).
-/// Host +0xe60 supplies the full packed qword at +0x8c6 (8a99414..1c).
-/// Its producer converts the TA channel timestamp, whereas +0x1528 converts
-/// the fragment channel timestamp (8aa9e30..aaa05c). Both carry the 3D channel
-/// payload. Preserve those distinct sources even when queue seeds coincide.
-/// Refresh from the actual retained producer immediately before publication;
-/// the payload counter wraps independently of the physical timestamp.
-pub(crate) fn apply_g17p_ta_linked_completion_scratch(
-    tiling_timestamp: u64,
-    fragment_timestamp: u64,
-    payload: u8,
-    raw: &mut [u8],
-) -> Result<(), RenderBuildError> {
-    if tiling_timestamp > 0xff_ffff_ffff || fragment_timestamp > 0xff_ffff_ffff {
-        return Err(RenderBuildError::ArithmeticOverflow);
-    }
-    if raw.len() < TA_DESCRIPTOR_SIZE {
-        return Err(RenderBuildError::BufferTooSmall);
-    }
-    put_u64(raw, 0x07a8, fragment_timestamp);
-    put_u8(raw, 0x07b0, payload);
-    put_u8(raw, 0x07b1, payload);
-    put_u64(raw, 0x08c6, tiling_timestamp | ((payload as u64) << 40));
+    put_u32(raw, 0x215c, 0);
+    put_u8(raw, 0x21d8, 0x10);
+    put_u8(raw, 0x21d9, 0xa2);
+    put_u8(raw, 0x222d, 0);
     Ok(())
 }
 
@@ -1518,19 +846,14 @@ pub(crate) fn apply_g17p_retained_descriptor_fields(
     kind: RenderDescriptorKind,
     descriptor_gpu_va: u64,
     runtime_control: u64,
-    queue_id: u8,
-    linked_fragment_queue_id: u8,
     submission_ordinal: u32,
     cold_opening: bool,
-    native_pm_bytes: bool,
     raw: &mut [u8],
 ) -> Result<(), RenderBuildError> {
     let item_number = submission_ordinal
         .checked_add(1)
         .ok_or(RenderBuildError::ArithmeticOverflow)?;
-    // Tag-14 and the current dependency/event interface carry a 24-bit stamp.
-    // This is a representability limit, not an eight-bit ring-slot lifetime.
-    if item_number > 0x00ff_ffff {
+    if item_number > 0xff {
         return Err(RenderBuildError::ArithmeticOverflow);
     }
     match kind {
@@ -1545,54 +868,19 @@ pub(crate) fn apply_g17p_retained_descriptor_fields(
                     .checked_add(0x60)
                     .ok_or(RenderBuildError::ArithmeticOverflow)?,
             );
-            // Native TA links directly to the physical 3D kick queue which
-            // will consume this submission. This is queue allocator state,
-            // not the type-1 fragment descriptor's distinct QID-0 RCE field.
-            put_u32(raw, 0x079c, u32::from(linked_fragment_queue_id));
+            put_u32(raw, 0x079c, 1);
             put_u32(raw, 0x07a0, item_number << 8);
-            apply_g17p_ta_linked_completion_scratch(
-                u64::from(item_number), u64::from(item_number), item_number as u8, raw,
-            )?;
-            // Native writes a u32 at +0x8b6 (8a993f4). +0x8b4/+0x8b5
-            // belong to the preceding stamp pointer, not this event value.
-            put_u32(raw, 0x08b6, item_number << 8);
-            // B1 indexes the registered scheduler-resource table with this
-            // value while admitting the completed TA, then passes the full
-            // word to FUN_15424(linked_3d_qid, ta_qid). It is the TA queue's
-            // own physical QID, not a captured literal: two independent Metal
-            // commands carry 7 here while +0x79c links QID 8, and 9 here while
-            // +0x79c links QID 10. Leaving it zero made Linux consult the
-            // unrelated QID-0 scheduler state at the TA-to-3D handoff.
-            put_u32(
-                raw,
-                0x08ba,
-                if *crate::module_parameters::g17p_render_ta_qid_field.value() != 0 {
-                    u32::from(queue_id)
-                } else {
-                    0
-                },
-            );
-            // This is a priority-zero channel policy, not a QID identity bit.
-            // Native's priority-zero TA keeps the stamp-info force flag set:
-            // FUN_ab64 ORs it into Pool-A +0x20 and FUN_168d0 publishes the
-            // TA stamp/handoff even while its paired fragment keeps the batch
-            // incomplete. Restricting it to QID 0 let a second independently
-            // allocated priority-zero pair execute TA on QID 2 but never
-            // release the fragment parent on QID 3. Higher-priority native
-            // queues carry their own batching policy and remain unaffected.
-            if crate::g17_submission::G17P_NATIVE_RENDER_DOORBELL_PRIORITY == 0 {
-                put_u32(raw, 0x08c2, 1);
-            }
-            // Native's host +0x1288 source is a u32 at +0x8d6 (8a990b8),
-            // immediately after the qword lifecycle field beginning +0x8ce.
-            put_u32(raw, 0x08d6, submission_ordinal);
+            put_u32(raw, 0x07a8, item_number);
+            put_u32(raw, 0x07b0, item_number | (item_number << 8));
+            put_u32(raw, 0x08b4, (item_number << 24) | 0xffff);
+            put_u32(raw, 0x08c4, item_number << 16);
+            put_u32(raw, 0x08c8, item_number << 24);
+            put_u32(raw, 0x08d4, submission_ordinal << 16);
             put_u64(raw, 0x0934, runtime_control);
             if cold_opening {
-                // Retain the one-buffer GTP size installed by the cold
-                // descriptor builder.
                 put_u8(raw, 0x0789, 0x08);
                 put_u8(raw, 0x093e, 0xd0);
-                put_u8(raw, 0x093f, if native_pm_bytes { 0x87 } else { 0x91 });
+                put_u8(raw, 0x093f, 0x91);
             }
         }
         RenderDescriptorKind::Fragment => {
@@ -1614,73 +902,19 @@ pub(crate) fn apply_g17p_retained_descriptor_fields(
                 );
             }
             put_u32(raw, 0x2150, item_number << 8);
-            // Valid native queues prove +0x2154 is the physical 3D QID: it is
-            // 1/3/8 for qids 1/3/8, respectively. The old literal only happened
-            // to match the first captured qid.
-            put_u32(raw, 0x2154, u32::from(queue_id));
-            // Valid cold QIDs 1 and 8 both carry 1; every later submission on
-            // the retained physical queue carries 0. The prior IO-fence guard
-            // was an unsupported semantic guess which inverted this native
-            // lifecycle exactly where first-work setup needs it.
-            put_u32(raw, 0x215c, u32::from(submission_ordinal == 0));
-            // +0x2160 is the packed 3D-channel SKSM completion scratch value:
-            // the physical queue timestamp in bits [39:0] and the channel's
-            // payload byte in bits [47:40]. G17PUserRenderStorage stages it
-            // from the retained fragment producer immediately before publish.
+            put_u32(raw, 0x2154, 1);
+            put_u32(raw, 0x215c, if cold_opening { 0 } else { item_number });
+            put_u32(raw, 0x2160, item_number);
+            put_u32(raw, 0x2164, item_number << 8);
             put_u32(raw, 0x2170, submission_ordinal);
             put_u64(raw, 0x21ce, runtime_control);
-            // +0x222c is the four-qword AGXCommandHWDSIDData mask tail.
-            // Initial priority-0 3D_0 commands retain the generic 0x100 mask
-            // at this lane; zero belongs to the separate 3D_2/qid8 profile.
+            if cold_opening {
+                put_u8(raw, 0x21d8, 0x10);
+                put_u8(raw, 0x21d9, 0xa2);
+                put_u8(raw, 0x222d, 0);
+            }
         }
     }
-    Ok(())
-}
-
-/// Copy the four embedded 3D register-entry arrays into a diagnostic mirror.
-///
-/// The hardware-visible arrays remain descriptor-local.  Native's addresses at
-/// descriptor +0x7a0/+0xec0/+0x15e0/+0x1d00 are the self pointers in each
-/// embedded array's +0x700 trailer, not pointers to a second allocation.  This
-/// mirror intentionally contains entries only and must never be bound to KSM.
-pub(crate) fn stage_g17p_fragment_rce_programs(
-    fragment: &mut [u8],
-    rce_gpu_va: u64,
-    rce: &mut [u8],
-) -> Result<(), RenderBuildError> {
-    if fragment.len() < FRAGMENT_DESCRIPTOR_SIZE
-        || rce.len() < G17P_FRAGMENT_RCE_STORAGE_SIZE
-    {
-        return Err(RenderBuildError::BufferTooSmall);
-    }
-
-    let programs = [
-        (0x07a0usize, 0x00a0usize, FRAGMENT_REGISTER_COUNT),
-        (0x0ec0usize, 0x07c0usize, PARTIAL_STORE_REGISTER_COUNT),
-        (0x15e0usize, 0x0ee0usize, PARTIAL_RESUME_REGISTER_COUNT),
-        (0x1d00usize, 0x1600usize, PARTIAL_LOAD_REGISTER_COUNT),
-    ];
-
-    rce[..G17P_FRAGMENT_RCE_STORAGE_SIZE].fill(0);
-    for (index, (_pointer_offset, source_offset, register_count)) in
-        programs.into_iter().enumerate()
-    {
-        let bytes = register_count
-            .checked_mul(REGISTER_BYTES)
-            .ok_or(RenderBuildError::ArithmeticOverflow)?;
-        let target_offset = index
-            .checked_mul(G17P_FRAGMENT_RCE_PROGRAM_STRIDE as usize)
-            .ok_or(RenderBuildError::ArithmeticOverflow)?;
-        let source_end = source_offset
-            .checked_add(bytes)
-            .ok_or(RenderBuildError::ArithmeticOverflow)?;
-        let target_end = target_offset
-            .checked_add(bytes)
-            .ok_or(RenderBuildError::ArithmeticOverflow)?;
-        rce[target_offset..target_end]
-            .copy_from_slice(&fragment[source_offset..source_end]);
-    }
-    let _ = rce_gpu_va;
     Ok(())
 }
 
@@ -1846,38 +1080,6 @@ pub(crate) fn build_paired_queue_publication(
 mod tests {
     use super::*;
 
-    #[test]
-    fn mcache_mapping_matches_native_g17p_3d_records() {
-        assert_eq!(
-            encode_g17p_mcache_mapping(G17PMcacheMapping {
-                address: 0xeeee_0000,
-                size_units: 0x4d000,
-                hwsid: 0x18,
-                selector: 3,
-                range_shift: 2,
-            })
-            .unwrap(),
-            [
-                0x00, 0xdc, 0xdd, 0x01, 0x00, 0x06, 0x8c, 0x00, 0x00, 0xac, 0xe2, 0x01,
-                0x00, 0x12, 0x00, 0x00,
-            ]
-        );
-        assert_eq!(
-            encode_g17p_mcache_mapping(G17PMcacheMapping {
-                address: 0x100_0e83_8000,
-                size_units: 0x26a80,
-                hwsid: 0x18,
-                selector: 3,
-                range_shift: 1,
-            })
-            .unwrap(),
-            [
-                0x00, 0x07, 0x1d, 0x00, 0x02, 0x06, 0x8c, 0x00, 0x80, 0x71, 0x1f, 0x00,
-                0x02, 0x0a, 0x00, 0x00,
-            ]
-        );
-    }
-
     fn fnv1a64(parts: &[&[u8]]) -> u64 {
         let mut value = 0xcbf2_9ce4_8422_2325u64;
         for part in parts {
@@ -1913,128 +1115,12 @@ mod tests {
     }
 
     #[test]
-    fn source_profile_pins_rsrc8_and_native_aligned_programs() {
+    fn source_profile_pins_rsrc8_and_tagged_programs() {
         let parameters = G17pRenderParameters::source_rsrc8();
         assert_eq!(parameters.store_pipeline_bind, 0x8);
         assert_eq!(parameters.load_pipeline_bind, 0x0007_8000_0000_0040);
-        assert_eq!(parameters.store_pipeline, 0x0000_0100_0199_0640);
-        assert_eq!(parameters.load_pipeline, 0x0000_0100_0199_0240);
-    }
-
-    #[test]
-    fn render_lifecycles_use_native_gid_predecessor_and_consecutive_currents() {
-        // AtomicU32(1): reserve-group returns predecessor 1 and advances the
-        // counter to 0x01000001. Native OSAddAtomic64 returns the old value,
-        // hence 3D current 0x01000001 and TA current 0x01000002.
-        assert_eq!(
-            g17p_render_lifecycle_pair(1, 0x0100_0001),
-            Some((0x0000_0001_0100_0001, 0x0000_0001_0100_0002))
-        );
-        // Exact first render pair from the working Metal capture.
-        assert_eq!(
-            g17p_render_lifecycle_pair(0x0700_c271, 0x0800_c294),
-            Some((0x0700_c271_0800_c294, 0x0700_c271_0800_c295))
-        );
-        assert_eq!(g17p_render_lifecycle_pair(0, 1), None);
-        assert_eq!(g17p_render_lifecycle_pair(1, u32::MAX), None);
-
-        let mut parameters = G17pRenderParameters::source_rsrc8();
-        parameters.lifecycle = 0x1111_2222_3333_4444;
-        parameters.fragment_lifecycle = 0x5555_6666_7777_8888;
-        let ta = build_ta_registers(&parameters).unwrap();
-        let fragment = build_fragment_registers(&parameters).unwrap();
-        assert!(ta.iter().filter(|write| write.value == parameters.lifecycle).count() >= 3);
-        assert_eq!(
-            fragment
-                .iter()
-                .filter(|write| write.value == parameters.fragment_lifecycle)
-                .count(),
-            3
-        );
-        let mut ta_descriptor = [0u8; TA_DESCRIPTOR_SIZE];
-        build_ta_descriptor(
-            &parameters,
-            objects(),
-            RenderDescriptorMetadata::source(RenderDescriptorKind::Tiling),
-            &mut ta_descriptor,
-        )
-        .unwrap();
-        assert_eq!(get_u32(&ta_descriptor, 0x086e), 0x1111_2222);
-        assert_eq!(get_u64(&ta_descriptor, 0x08ce), 0x3333_4444);
-
-        let mut descriptor = [0u8; FRAGMENT_DESCRIPTOR_SIZE];
-        build_fragment_descriptor(
-            &parameters,
-            objects(),
-            RenderDescriptorMetadata::source(RenderDescriptorKind::Fragment),
-            &mut descriptor,
-        )
-        .unwrap();
-        assert_eq!(get_u32(&descriptor, 0x2108), 0x5555_6666);
-        assert_eq!(get_u64(&descriptor, 0x2168), 0x7777_8888);
-    }
-
-    #[test]
-    fn vdm_user_offset_matches_g17p_compact_window() {
-        assert_eq!(vdm_user_offset(0x10_0186_0420).unwrap(), 0x0186_0420);
-        assert_eq!(
-            vdm_user_offset(0x4f_fff5_4400).unwrap(),
-            0x3f_fff5_4400
-        );
-        assert_eq!(
-            vdm_user_offset(0xbf_fff5_4400),
-            Err(RenderBuildError::VdmAddressOutOfRange)
-        );
-    }
-
-    #[test]
-    fn native_ta_addresses_use_split_resource_and_user_domains() {
-        let mut parameters = G17pRenderParameters::source_rsrc8();
-        parameters.context_base = 0x70_0000_0000;
-        parameters.tilemap = 0x70_011e_0a00;
-        parameters.heapmeta = 0x70_011e_2a00;
-        parameters.tpc = 0x70_0129_0000;
-        parameters.deflake_3 = 0x10_0009_ca60;
-        parameters.deflake_2 = 0x10_0009_ca80;
-        parameters.deflake_1 = 0x10_0009_cd00;
-
-        let registers = build_ta_registers(&parameters).unwrap();
-        let value = |number| {
-            registers
-                .iter()
-                .find(|write| write.number == number)
-                .unwrap()
-                .value
-        };
-        assert_eq!(value(0x1c039), 0x011e_0a00);
-        assert_eq!(value(0x1c031), 0x8000_0000_011e_2a00);
-        assert_eq!(value(0x1c0a1), 0x0129_0000);
-        assert_eq!(value(0x10111), 0x0009_cd00);
-        assert_eq!(value(0x10119), 0x0009_ca80);
-        assert_eq!(value(0x1c950), 0x0004_0000_0009_ca60);
-
-        let mut descriptor = [0u8; TA_DESCRIPTOR_SIZE];
-        build_ta_descriptor(
-            &parameters,
-            objects(),
-            RenderDescriptorMetadata {
-                context_id: 1,
-                submission_ordinal: 0,
-                command_buffer_state_word: 0,
-                ta_hardware_buffer_id: 0,
-                submit_sequence: 1,
-            },
-            &mut descriptor,
-        )
-        .unwrap();
-        assert_eq!(get_u32(&descriptor, 0x07d6), 0x0009_cd00);
-        assert_eq!(get_u64(&descriptor, 0x0780), parameters.tpc);
-
-        parameters.deflake_1 = 0x11_0000_0000;
-        assert_eq!(
-            build_ta_registers(&parameters),
-            Err(RenderBuildError::UserAddressOutOfRange)
-        );
+        assert_eq!(parameters.store_pipeline, 0x0000_0100_0199_0644);
+        assert_eq!(parameters.load_pipeline, 0x0000_0100_0199_0244);
     }
 
     #[test]
@@ -2093,352 +1179,32 @@ mod tests {
     }
 
     #[test]
-    fn pool_a_record_one_changes_only_the_two_stage_pointer_fields() {
-        let parameters = G17pRenderParameters::source_rsrc8();
-        let baseline_objects = objects();
-        let record_one_objects = baseline_objects.with_pool_a_record_index(1).unwrap();
-        let mut baseline_ta = [0u8; TA_DESCRIPTOR_SIZE];
-        let mut record_one_ta = [0u8; TA_DESCRIPTOR_SIZE];
-        let mut baseline_3d = [0u8; FRAGMENT_DESCRIPTOR_SIZE];
-        let mut record_one_3d = [0u8; FRAGMENT_DESCRIPTOR_SIZE];
-        build_ta_descriptor(
-            &parameters,
-            baseline_objects,
-            RenderDescriptorMetadata::source(RenderDescriptorKind::Tiling),
-            &mut baseline_ta,
-        )
-        .unwrap();
-        build_ta_descriptor(
-            &parameters,
-            record_one_objects,
-            RenderDescriptorMetadata::source(RenderDescriptorKind::Tiling),
-            &mut record_one_ta,
-        )
-        .unwrap();
-        build_fragment_descriptor(
-            &parameters,
-            baseline_objects,
-            RenderDescriptorMetadata::source(RenderDescriptorKind::Fragment),
-            &mut baseline_3d,
-        )
-        .unwrap();
-        build_fragment_descriptor(
-            &parameters,
-            record_one_objects,
-            RenderDescriptorMetadata::source(RenderDescriptorKind::Fragment),
-            &mut record_one_3d,
-        )
-        .unwrap();
-
-        assert_eq!(record_one_objects.record_a, baseline_objects.record_a + 0x100);
-        assert_eq!(get_u64(&baseline_ta, 0x10), baseline_objects.record_a);
-        assert_eq!(get_u64(&record_one_ta, 0x10), record_one_objects.record_a);
-        assert_eq!(get_u64(&baseline_3d, 0x20), baseline_objects.record_a);
-        assert_eq!(get_u64(&record_one_3d, 0x20), record_one_objects.record_a);
-        for (offset, (before, after)) in baseline_ta.iter().zip(record_one_ta.iter()).enumerate() {
-            if !(0x10..0x18).contains(&offset) {
-                assert_eq!(before, after, "unexpected TA descriptor change at {offset:#x}");
-            }
-        }
-        for (offset, (before, after)) in baseline_3d.iter().zip(record_one_3d.iter()).enumerate() {
-            if !(0x20..0x28).contains(&offset) {
-                assert_eq!(before, after, "unexpected 3D descriptor change at {offset:#x}");
-            }
-        }
-    }
-
-    #[test]
-    fn pool_a_record_index_checks_overflow() {
-        let objects = RenderDescriptorObjects {
-            record_a: u64::MAX - 0xff,
-            ..objects()
-        };
-        assert_eq!(
-            objects.with_pool_a_record_index(1),
-            Err(RenderBuildError::ArithmeticOverflow)
-        );
-    }
-
-    #[test]
-    fn fragment_hwpb_split_changes_only_fragment_plus_0x28() {
-        let parameters = G17pRenderParameters::source_rsrc8();
-        let baseline_objects = objects();
-        let hwpb = 0xffff_fc20_c099_8000;
-        let fragment_objects = baseline_objects.with_shared(hwpb);
-        let mut baseline_ta = [0u8; TA_DESCRIPTOR_SIZE];
-        let mut split_ta = [0u8; TA_DESCRIPTOR_SIZE];
-        let mut baseline_3d = [0u8; FRAGMENT_DESCRIPTOR_SIZE];
-        let mut split_3d = [0u8; FRAGMENT_DESCRIPTOR_SIZE];
-
-        build_ta_descriptor(
-            &parameters,
-            baseline_objects,
-            RenderDescriptorMetadata::source(RenderDescriptorKind::Tiling),
-            &mut baseline_ta,
-        )
-        .unwrap();
-        build_ta_descriptor(
-            &parameters,
-            baseline_objects,
-            RenderDescriptorMetadata::source(RenderDescriptorKind::Tiling),
-            &mut split_ta,
-        )
-        .unwrap();
-        build_fragment_descriptor(
-            &parameters,
-            baseline_objects,
-            RenderDescriptorMetadata::source(RenderDescriptorKind::Fragment),
-            &mut baseline_3d,
-        )
-        .unwrap();
-        build_fragment_descriptor(
-            &parameters,
-            fragment_objects,
-            RenderDescriptorMetadata::source(RenderDescriptorKind::Fragment),
-            &mut split_3d,
-        )
-        .unwrap();
-
-        assert_eq!(baseline_ta, split_ta);
-        assert_eq!(get_u64(&baseline_3d, 0x20), baseline_objects.record_a);
-        assert_eq!(get_u64(&split_3d, 0x20), baseline_objects.record_a);
-        assert_eq!(get_u64(&baseline_3d, 0x28), baseline_objects.shared);
-        assert_eq!(get_u64(&split_3d, 0x28), hwpb);
-        assert_eq!(get_u64(&baseline_3d, 0x30), baseline_objects.record_b);
-        assert_eq!(get_u64(&split_3d, 0x30), baseline_objects.record_b);
-        assert_eq!(get_u64(&baseline_3d, 0x38), baseline_objects.zero);
-        assert_eq!(get_u64(&split_3d, 0x38), baseline_objects.zero);
-        for (offset, (before, after)) in baseline_3d.iter().zip(split_3d.iter()).enumerate() {
-            if !(0x28..0x30).contains(&offset) {
-                assert_eq!(
-                    before, after,
-                    "unexpected 3D descriptor change at {offset:#x}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn memory_backed_render_policy_is_independent_of_tib_size() {
-        for tib_blocks in [4, 8, 9, 12, 16] {
-            for process_empty_tiles in [false, true] {
-                let mut parameters = G17pRenderParameters::source_rsrc8();
-                parameters.tib_blocks = tib_blocks;
-                parameters.process_empty_tiles = process_empty_tiles;
-                parameters.tile_config = 0x280
-                    | if process_empty_tiles { 0x1_0000 } else { 0 };
-                let mut fragment = [0xa5u8; FRAGMENT_DESCRIPTOR_SIZE];
-                build_cold_opening_fragment_descriptor(
-                    &parameters, objects(), 1, 1, &mut fragment,
-                )
-                .unwrap();
-                assert_eq!(fragment[0x2100], 0);
-                assert_eq!(get_u64(&fragment, 0x1f38), tib_blocks);
-                assert_eq!(get_u64(&fragment, 0x1f58), parameters.tile_config);
-                // Keep real memory-backed partial phase programs, not the
-                // native memoryless count-two reset-only phase variant.
-                for (at, count) in [(0xec8, 16), (0x15e8, 23), (0x1d08, 10)] {
-                    assert_eq!(get_u32(&fragment, at) & 0xffff, count);
-                }
-                apply_g17p_retained_descriptor_fields(
-                    RenderDescriptorKind::Fragment, 0x7000098000, 0,
-                    1, 1, 1, false, false, &mut fragment,
-                )
-                .unwrap();
-                assert_eq!(fragment[0x2100], 0);
-            }
-        }
-    }
-
-    #[test]
     fn cold_opening_descriptors_apply_only_the_native_first_work_overrides() {
         let parameters = G17pRenderParameters::source_rsrc8();
         let mut tiling = [0u8; TA_DESCRIPTOR_SIZE];
         let mut fragment = [0u8; FRAGMENT_DESCRIPTOR_SIZE];
-        build_cold_opening_ta_descriptor(&parameters, objects(), 1, 0, 0, &mut tiling).unwrap();
-        build_cold_opening_fragment_descriptor(&parameters, objects(), 1, 1, &mut fragment)
-            .unwrap();
+        build_cold_opening_ta_descriptor(&parameters, objects(), &mut tiling).unwrap();
+        build_cold_opening_fragment_descriptor(&parameters, objects(), &mut fragment).unwrap();
 
         assert_eq!(&tiling[0x38..0x3e], &[0x47, 0, 0x49, 0, 0x49, 0]);
         assert_eq!(tiling[0x789], 0x08);
-        assert_eq!(get_u32(&tiling, 0x892), 1);
         assert_eq!(&tiling[0x93e..0x940], &[0xd0, 0x91]);
 
         assert_eq!(get_u32(&fragment, 0x50), 1);
         assert_eq!(&fragment[0x80..0x86], &[0x56, 0, 0x57, 0, 0x57, 0]);
         assert_eq!(&fragment[0x88..0x8a], &[0x59, 0]);
         assert_eq!(get_u32(&fragment, 0x90), 1);
-        assert_eq!(get_u32(&fragment, 0x2154), 1);
-        assert_eq!(get_u32(&fragment, 0x215c), 1);
-        assert_eq!(fragment[0x2100], 0);
-        assert_eq!(&fragment[0x2114..0x2134], &[0; 0x20]);
-        assert_eq!(get_u64(&fragment, 0x21d7), 0);
-        assert_eq!(fragment[0x222d], 1);
+        assert_eq!(get_u32(&fragment, 0x215c), 0);
+        assert_eq!(&fragment[0x21d8..0x21da], &[0x10, 0xa2]);
+        assert_eq!(fragment[0x222d], 0);
 
+        assert_eq!(fnv1a64(&[&tiling]), 0xb81a_1c11_1ede_fe5f);
+        assert_eq!(fnv1a64(&[&fragment]), 0xf846_54e9_74ac_6ad3);
     }
 
     #[test]
-    fn cold_opening_ta_couples_the_hardware_buffer_id_without_clobbering_registers() {
-        let mut parameters = G17pRenderParameters::source_rsrc8();
-        parameters.ta_hardware_buffer_id = 5;
-        let mut tiling = [0u8; TA_DESCRIPTOR_SIZE];
-        build_cold_opening_ta_descriptor(
-            &parameters,
-            objects(),
-            1,
-            0,
-            parameters.ta_hardware_buffer_id,
-            &mut tiling,
-        )
-        .unwrap();
-
-        assert_eq!(get_u32(&tiling, 0x18), 5);
-        // +0x300 is register 0x1c830 and +0x304 is its value word.
-        assert_eq!(get_u32(&tiling, 0x300), 0x1c830);
-        assert_eq!(get_u64(&tiling, 0x304), 5);
-    }
-
-    #[test]
-    fn shared_usc_flist_id_drives_both_stage_registers_independently_of_pm_id() {
-        let mut parameters = G17pRenderParameters::source_rsrc8();
-        parameters.ta_hardware_buffer_id = 7;
-        parameters.usc_flist_hardware_buffer_id = 5;
-        // Every diagnostic bit set must not recouple the retired bit-16
-        // capture literals to these source-owned registers.
-        parameters.native_ta_registers = u32::MAX;
-
-        let tiling = build_ta_registers(&parameters).unwrap();
-        let fragment = build_fragment_registers(&parameters).unwrap();
-        assert_eq!(
-            tiling.iter().find(|write| write.number == 0x1c830).unwrap().value,
-            7
-        );
-        assert_eq!(
-            tiling.iter().find(|write| write.number == 0x14308).unwrap().value,
-            5
-        );
-        assert_eq!(
-            fragment.iter().find(|write| write.number == 0x14048).unwrap().value,
-            5
-        );
-        assert_eq!(
-            fragment.iter().find(|write| write.number == 0x1c838).unwrap().value,
-            7
-        );
-    }
-
-    #[test]
-    fn descriptor_context_and_state_word_drive_every_native_work_key() {
-        let mut parameters = G17pRenderParameters::source_rsrc8();
-        parameters.ta_hardware_buffer_id = 5;
-        parameters.gpc_perf_state_map = 7;
-        let mut tiling = [0u8; TA_DESCRIPTOR_SIZE];
-        let mut fragment = [0u8; FRAGMENT_DESCRIPTOR_SIZE];
-        let tiling_metadata = RenderDescriptorMetadata {
-            context_id: 9,
-            submission_ordinal: 4,
-            command_buffer_state_word: 0x40,
-            ta_hardware_buffer_id: parameters.ta_hardware_buffer_id,
-            submit_sequence: 7,
-        };
-        let fragment_metadata = RenderDescriptorMetadata {
-            command_buffer_state_word: 0x41,
-            ..tiling_metadata
-        };
-
-        build_ta_descriptor(&parameters, objects(), tiling_metadata, &mut tiling).unwrap();
-        build_fragment_descriptor(&parameters, objects(), fragment_metadata, &mut fragment)
-            .unwrap();
-
-        for (raw, offset, register, value) in [
-            (&tiling[..], 0x300, 0x1c830, 5u64),
-            (&tiling[..], 0x36c, 0x10209, 0x900),
-            (&tiling[..], 0x378, 0x1c9f0, 0x900),
-            (&tiling[..], 0x384, 0x14320, 0x900),
-            (&fragment[..], 0x454, 0x1c838, 5u64),
-            (&fragment[..], 0x46c, 0x10211, 0x901),
-            (&fragment[..], 0x478, 0x10420, 0x901),
-        ] {
-            assert_eq!(get_u32(raw, offset), register);
-            assert_eq!(get_u64(raw, offset + 4), value);
-        }
-        assert_eq!(get_u32(&tiling, 0x0c), 9);
-        assert_eq!(get_u32(&fragment, 0x0c), 9);
-    }
-
-    #[test]
-    fn fragment_parameter_buffer_owner_is_independent_of_perf_map_and_tail() {
-        let mut parameters = G17pRenderParameters::source_rsrc8();
-        parameters.native_ta_registers = u32::MAX;
-
-        for (control, low, map, id) in [(0, 7, 3, 0), (1, 3, 7, 5), (1, 0, 1, 3)] {
-            parameters.ta_hardware_buffer_id = id;
-            parameters.gpc_perf_state_control = control;
-            parameters.gpc_perf_state_map_low = low;
-            parameters.gpc_perf_state_map = map;
-            let fragment = build_fragment_registers(&parameters).unwrap();
-            let write = fragment
-                .iter()
-                .find(|write| write.number == 0x1c838)
-                .unwrap();
-            assert_eq!(write.value, id as u64);
-
-            let mut descriptor = [0u8; FRAGMENT_DESCRIPTOR_SIZE];
-            build_fragment_descriptor(
-                &parameters,
-                objects(),
-                RenderDescriptorMetadata::source(RenderDescriptorKind::Fragment),
-                &mut descriptor,
-            )
-            .unwrap();
-            assert_eq!(get_u32(&descriptor, 0x2104), control);
-            assert_eq!(get_u32(&descriptor, 0x210c), low);
-            assert_eq!(get_u32(&descriptor, 0x2110), u32::MAX);
-            assert_eq!(get_u32(&descriptor, 0x2124), 1);
-            assert_eq!(get_u32(&descriptor, 0x2128), 1);
-            assert_eq!(get_u32(&descriptor, 0x212c), 0);
-            assert_eq!(get_u32(&descriptor, 0x2130), 0);
-        }
-    }
-
-    #[test]
-    fn priority_zero_ta_force_stamp_is_independent_of_physical_qid() {
-        for (queue_id, ordinal, cold, expected) in [
-            (0, 0, true, 1),
-            (0, 1, false, 1),
-            (0, 2, false, 1),
-            (2, 0, true, 1),
-            (2, 1, false, 1),
-            (5, 0, true, 1),
-            (5, 1, false, 1),
-        ] {
-            let mut tiling = [0u8; TA_DESCRIPTOR_SIZE];
-            apply_g17p_retained_descriptor_fields(
-                RenderDescriptorKind::Tiling,
-                0x70_0001_8000,
-                0xffff_fc20_c082_8000,
-                queue_id,
-                queue_id + 1,
-                ordinal,
-                cold,
-                true,
-                &mut tiling,
-            )
-            .unwrap();
-            assert_eq!(get_u32(&tiling, 0x8c2), expected);
-            assert_eq!(get_u32(&tiling, 0x8be), 0);
-            assert_eq!(
-                get_u64(&tiling, 0x8c6),
-                ((ordinal + 1) as u64) << 40 | (ordinal + 1) as u64
-            );
-        }
-    }
-
-    #[test]
-    fn retained_descriptor_refresh_stages_native_external_rce_and_advances_item_two() {
-        let mut parameters = G17pRenderParameters::source_rsrc8();
-        parameters.lifecycle = 0x1122_3344_5566_7788;
-        parameters.fragment_lifecycle = 0x99aa_bbcc_ddee_ff00;
+    fn retained_descriptor_refresh_keeps_canonical_self_pointers_and_advances_item_two() {
+        let parameters = G17pRenderParameters::source_rsrc8();
         let mut tiling = [0u8; TA_DESCRIPTOR_SIZE];
         let mut fragment = [0u8; FRAGMENT_DESCRIPTOR_SIZE];
         let tiling_va = 0x70_0001_8000;
@@ -2449,8 +1215,7 @@ mod tests {
             RenderDescriptorMetadata {
                 context_id: 1,
                 submission_ordinal: 1,
-                command_buffer_state_word: 2,
-                ta_hardware_buffer_id: 0,
+                queue_pair: 0,
                 submit_sequence: 3,
             },
             &mut tiling,
@@ -2462,8 +1227,7 @@ mod tests {
             RenderDescriptorMetadata {
                 context_id: 1,
                 submission_ordinal: 1,
-                command_buffer_state_word: 3,
-                ta_hardware_buffer_id: 0,
+                queue_pair: 0,
                 submit_sequence: 2,
             },
             &mut fragment,
@@ -2473,10 +1237,7 @@ mod tests {
             RenderDescriptorKind::Tiling,
             tiling_va,
             0xffff_fc20_c082_8000,
-            5,
-            6,
             1,
-            false,
             false,
             &mut tiling,
         )
@@ -2485,21 +1246,13 @@ mod tests {
             RenderDescriptorKind::Fragment,
             fragment_va,
             0xffff_fc20_c082_8000,
-            6,
-            6,
             1,
-            false,
             false,
             &mut fragment,
         )
         .unwrap();
-        let rce_va = 0x70_0028_cf20;
-        let mut rce = [0u8; G17P_FRAGMENT_RCE_STORAGE_SIZE];
-        stage_g17p_fragment_rce_programs(&mut fragment, rce_va, &mut rce).unwrap();
 
         assert_eq!(get_u64(&tiling, 0x760), tiling_va + 0x60);
-        assert_eq!(get_u32(&tiling, 0x79c), 6);
-        assert_eq!(get_u32(&tiling, 0x8ba), 5);
         assert_eq!(get_u32(&tiling, 0x7a0), 0x200);
         assert_eq!(get_u32(&tiling, 0x7a8), 2);
         assert_eq!(get_u32(&tiling, 0x8d4), 0x1_0000);
@@ -2508,20 +1261,7 @@ mod tests {
         assert_eq!(get_u64(&fragment, 0xec0), fragment_va + 0x7c0);
         assert_eq!(get_u64(&fragment, 0x15e0), fragment_va + 0xee0);
         assert_eq!(get_u64(&fragment, 0x1d00), fragment_va + 0x1600);
-        assert_eq!(
-            &rce[..FRAGMENT_REGISTER_COUNT * REGISTER_BYTES],
-            &fragment[0xa0..0xa0 + FRAGMENT_REGISTER_COUNT * REGISTER_BYTES],
-        );
-        assert_eq!(get_u32(&tiling, 0x086e), 0x1122_3344);
-        assert_eq!(get_u64(&tiling, 0x08ce), 0x5566_7788);
-        assert_eq!(get_u32(&fragment, 0x2108), 0x99aa_bbcc);
-        assert_eq!(get_u64(&fragment, 0x2168), 0xddee_ff00);
-        assert_eq!(
-            &rce[0x720..0x720 + PARTIAL_STORE_REGISTER_COUNT * REGISTER_BYTES],
-            &fragment[0x7c0..0x7c0 + PARTIAL_STORE_REGISTER_COUNT * REGISTER_BYTES],
-        );
-        assert_eq!(get_u32(&fragment, 0x2154), 6);
-        assert_eq!(get_u32(&fragment, 0x215c), 0);
+        assert_eq!(get_u32(&fragment, 0x215c), 2);
         assert_eq!(get_u32(&fragment, 0x2170), 1);
         assert_eq!(get_u64(&fragment, 0x21ce), 0xffff_fc20_c082_8000);
     }

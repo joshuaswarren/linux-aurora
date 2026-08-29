@@ -110,6 +110,9 @@ void dcp_push(struct apple_dcp *dcp, bool oob, const struct dcp_method_entry *ca
 		     u32 in_len, u32 out_len, void *data, dcp_callback_t cb,
 		     void *cookie);
 
+bool dcp_link_defer_service_match(struct apple_dcp *dcp, int tag, void *out,
+				  void *in);
+
 /* Parse a callback tag "D123" into the ID 123. Returns -EINVAL on failure. */
 int dcp_parse_tag(char tag[4]);
 

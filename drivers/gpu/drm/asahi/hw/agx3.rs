@@ -109,6 +109,116 @@ pub(crate) const T6051: SocConfig = agx3(0x6051, GpuGen::G17, GpuVariant::C, 0xb
 // no distinct core identity in the readChipInfo decode; what silicon they
 // name is unknown, so they deliberately have no entry here.
 
+// -------------------------------------------------------------------------
+// T8140 HwConfig grounding ledger.
+//
+// The legacy `super::HwConfig` carries ~40 fields. Only the identity and
+// geometry axes below are grounded for T8140 (from `SocConfig`, the live
+// J700 registers, and the G17P init-data model). The rest are AGX2
+// firmware-ABI power/tuning constants with no T8140 derivation, so no full
+// `HwConfig` can be constructed without inventing them. This ledger names
+// exactly which field groups are missing and lets the probe path fail
+// closed with a precise reason instead of fabricating a config.
+// -------------------------------------------------------------------------
+
+/// The grounded subset of a T8140 `HwConfig`, assembled from evidence. The
+/// firmware `GpuCore` id is renumbered per firmware build and not recovered
+/// for T8140, so it is deliberately `None` and every consumer fails closed.
+///
+/// Evidence ledger: its fields are read by the (not-yet-wired) full T8140
+/// `HwConfig` builder, so they are allowed to be unread for now.
+#[cfg(not(test))]
+#[allow(dead_code)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct T8140GroundedHwConfig {
+    pub(crate) chip_id: u32,
+    /// Base timekeeping clock: the 24 MHz `clkref`, verified in the J700 DT.
+    pub(crate) base_clock_hz: u32,
+    /// 42-bit UAT output address space.
+    pub(crate) uat_oas: u32,
+    /// 42-bit UAT input address space per root.
+    pub(crate) uat_ias: u8,
+    /// Single die (live `0xd04010` read = `0x00110106`).
+    pub(crate) num_dies: u32,
+    /// Firmware `GpuCore` id, always `None` for T8140 (see above).
+    pub(crate) gpu_core: Option<super::GpuCore>,
+}
+
+/// The exact grounded T8140 HwConfig subset.
+#[cfg(not(test))]
+pub(crate) const T8140_GROUNDED_HWCONFIG: T8140GroundedHwConfig = T8140GroundedHwConfig {
+    chip_id: 0x8140,
+    base_clock_hz: 24_000_000,
+    uat_oas: 42,
+    uat_ias: 42,
+    num_dies: 1,
+    gpu_core: None,
+};
+
+/// The `HwConfig` field groups that are ungrounded for T8140.
+pub(crate) mod hwconfig_gap {
+    /// Firmware `GpuCore` id (per-firmware-build ABI; not recovered).
+    pub(crate) const GPU_CORE_ID: u16 = 1 << 0;
+    /// Preemption buffer sizes (`preempt{1,2,3}_size`, `compute_preempt1`).
+    pub(crate) const PREEMPT_SIZES: u16 = 1 << 1;
+    /// `HwConfigA`/`HwConfigB` unknown tuning words.
+    pub(crate) const HWCONFIG_A_B: u16 = 1 << 2;
+    /// Shared power curve tables (`shared1/2/3`, `unk_coef_a/b`, `sram_k`).
+    pub(crate) const POWER_CURVES: u16 = 1 << 3;
+    /// Thermal sensor masks (`fast_sensor_mask*`, `fast_die0_sensor_present`).
+    pub(crate) const SENSOR_MASKS: u16 = 1 << 4;
+    /// Firmware MMIO mapping table (`io_mappings`) and SRAM window.
+    pub(crate) const IO_MAPPINGS: u16 = 1 << 5;
+    /// Clustering metadata block sizes (`HwClusteringConfig`).
+    pub(crate) const CLUSTERING: u16 = 1 << 6;
+    /// Global misc fields (`idle_off_standby_timer_default`, `unk_hws2_*`,
+    /// `global_unk_54`, `global_tab`, `has_csafr`, render tiling control).
+    pub(crate) const GLOBAL_MISC: u16 = 1 << 7;
+}
+
+/// Every `HwConfig` field group that T8140 does not yet ground.
+pub(crate) const T8140_HWCONFIG_MISSING: u16 = hwconfig_gap::GPU_CORE_ID
+    | hwconfig_gap::PREEMPT_SIZES
+    | hwconfig_gap::HWCONFIG_A_B
+    | hwconfig_gap::POWER_CURVES
+    | hwconfig_gap::SENSOR_MASKS
+    | hwconfig_gap::IO_MAPPINGS
+    | hwconfig_gap::CLUSTERING
+    | hwconfig_gap::GLOBAL_MISC;
+
+/// Opaque fail-closed result of a T8140 HwConfig construction attempt.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct HwConfigGap(u16);
+
+impl HwConfigGap {
+    pub(crate) const fn bits(self) -> u16 {
+        self.0
+    }
+
+    /// Whether a specific field group is among the missing ones. Used by the
+    /// gap tests and the future per-group grounding path.
+    #[allow(dead_code)]
+    pub(crate) const fn contains(self, group: u16) -> bool {
+        self.0 & group != 0
+    }
+}
+
+/// Attempt to construct a full T8140 `HwConfig`.
+///
+/// This assembles the grounded subset ([`T8140_GROUNDED_HWCONFIG`]) and then
+/// **fails closed**: the ~32 remaining AGX2 firmware-ABI power/tuning fields
+/// have no T8140 derivation, so returning a complete `HwConfig` would require
+/// inventing them. The returned gap names exactly which field groups are
+/// missing, so the probe path can report a precise wall rather than a bare
+/// error. When those groups are eventually grounded, this becomes the place
+/// that returns `Ok(&'static HwConfig)`.
+#[cfg(not(test))]
+pub(crate) fn t8140_hwconfig() -> Result<&'static super::HwConfig, HwConfigGap> {
+    // Grounded fields exist ([`T8140_GROUNDED_HWCONFIG`]); the rest do not.
+    let _grounded = &T8140_GROUNDED_HWCONFIG;
+    Err(HwConfigGap(T8140_HWCONFIG_MISSING))
+}
+
 #[cfg(test)]
 mod tests {
     use super::identity::{
@@ -202,5 +312,26 @@ mod tests {
             decode_gpu_identity(T8140.hw_family, T8140.hw_variant, T8140.num_dies as u8).unwrap();
         assert_eq!(identity.gpu_gen, GpuGen::G17);
         assert_eq!(identity.gpu_variant, GpuVariant::P);
+    }
+
+    #[test]
+    fn t8140_hwconfig_gap_enumerates_every_ungrounded_field_group() {
+        // The gap must name every ungrounded field group and nothing else.
+        let gap = HwConfigGap(T8140_HWCONFIG_MISSING);
+        for group in [
+            hwconfig_gap::GPU_CORE_ID,
+            hwconfig_gap::PREEMPT_SIZES,
+            hwconfig_gap::HWCONFIG_A_B,
+            hwconfig_gap::POWER_CURVES,
+            hwconfig_gap::SENSOR_MASKS,
+            hwconfig_gap::IO_MAPPINGS,
+            hwconfig_gap::CLUSTERING,
+            hwconfig_gap::GLOBAL_MISC,
+        ] {
+            assert!(gap.contains(group));
+        }
+        // Eight distinct single-bit groups.
+        assert_eq!(T8140_HWCONFIG_MISSING.count_ones(), 8);
+        assert_eq!(gap.bits(), T8140_HWCONFIG_MISSING);
     }
 }

@@ -45,64 +45,32 @@ pub(crate) struct StartedCpuPair<P: AscCpuLifecycle> {
 }
 
 impl<P: AscCpuLifecycle> StartedCpuPair<P> {
-    /// Retain both provider handles before either processor is started.
-    ///
-    /// Boot paths which also own RTKit and firmware-visible memory use this
-    /// constructor with [`Self::start_staged_in_place`].  That lets their
-    /// outer transaction keep every related owner alive when a rollback stop
-    /// cannot be proven, instead of losing the providers inside a constructor
-    /// error.
-    pub(crate) fn new(gfx: P, gfx1: P) -> Self {
-        Self {
-            gfx,
-            gfx1,
-            gfx_running: false,
-            gfx1_running: false,
-        }
-    }
-
-    /// Start both CPUs while retaining the partially-started pair on error.
-    ///
-    /// The caller must invoke [`Self::stop`] on an error before releasing any
-    /// RTKit, queue, or translation owner.  A failed stop can then be handled
-    /// by retaining the complete outer boot transaction.
-    pub(crate) fn start_staged_in_place<F>(&mut self, gfx_ready: F) -> Result<(), P::Error>
-    where
-        F: FnOnce() -> Result<(), P::Error>,
-    {
-        debug_assert!(!self.gfx_running && !self.gfx1_running);
-        self.gfx.start_cpu()?;
-        self.gfx_running = true;
-        gfx_ready()?;
-        self.gfx1.start_cpu()?;
-        self.gfx1_running = true;
-        Ok(())
-    }
-
     /// Start both provider-owned CPUs and return their retained owner.
     pub(crate) fn start(gfx: P, gfx1: P) -> Result<Self, P::Error> {
         Self::start_staged(gfx, gfx1, || Ok(()))
     }
 
-    /// Start GFX and complete its RTKit-ready callback before starting GFX1.
-    ///
-    /// This is the qualified Linux policy for its synchronous RTKit boot
-    /// callback. Native `AGXArmFirmware::bootFirmware` requests role 0 before
-    /// role 1, but its observed RUN writes vary: valid 25G83 capture 092506
-    /// starts GFX first, while 194053 starts GFX1 first. Those native requests
-    /// therefore do not establish a universal primary-handshake-first rule.
-    /// Retain the Linux order tested through 1,000 renders in one cold session, with
-    /// rollback stopping only the processors whose starts have succeeded.
+    /// Start GFX, finish its caller-owned handshake, then start GFX1.
     pub(crate) fn start_staged<F>(gfx: P, gfx1: P, gfx_ready: F) -> Result<Self, P::Error>
     where
         F: FnOnce() -> Result<(), P::Error>,
     {
-        let mut pair = Self::new(gfx, gfx1);
-        if let Err(err) = pair.start_staged_in_place(gfx_ready) {
-            let _ = pair.stop();
+        gfx.start_cpu()?;
+        if let Err(err) = gfx_ready() {
+            let _ = gfx.stop_cpu();
             return Err(err);
         }
-        Ok(pair)
+        if let Err(err) = gfx1.start_cpu() {
+            let _ = gfx.stop_cpu();
+            return Err(err);
+        }
+
+        Ok(Self {
+            gfx,
+            gfx1,
+            gfx_running: true,
+            gfx1_running: true,
+        })
     }
 
     /// Stop both processors and retain their provider handles.
@@ -131,39 +99,6 @@ impl<P: AscCpuLifecycle> StartedCpuPair<P> {
         }
         first_error.map_or(Ok(()), Err)
     }
-
-    /// Borrow the retained primary provider while both lifecycle owners stay
-    /// inside this pair.
-    pub(crate) fn gfx(&self) -> &P {
-        &self.gfx
-    }
-
-    /// Borrow the retained secondary provider under the same rules.
-    pub(crate) fn gfx1(&self) -> &P {
-        &self.gfx1
-    }
-}
-
-/// An in-progress firmware boot whose complete owner graph can be retained.
-pub(crate) trait FailedBootSession {
-    /// Stop every processor which the transaction successfully started.
-    fn stop_cpu_pair(&mut self) -> bool;
-    /// Deliberately retain every firmware-visible owner after an unproven stop.
-    fn retain_firmware_owners(self);
-}
-
-/// Roll back one failed firmware boot without exposing freed memory to an ASC.
-///
-/// A successful stop permits normal destruction.  If either stop fails, the
-/// transaction consumes itself through `retain_firmware_owners` so none of its
-/// RTKit, provider, or callback state can be freed under live firmware.
-pub(crate) fn rollback_failed_boot_session<T: FailedBootSession>(mut owner: T) -> bool {
-    if owner.stop_cpu_pair() {
-        true
-    } else {
-        owner.retain_firmware_owners();
-        false
-    }
 }
 
 impl<P: AscCpuLifecycle> Drop for StartedCpuPair<P> {
@@ -181,9 +116,6 @@ pub(crate) trait PersistentRuntimeRecovery {
 
     fn pause_submissions(&mut self);
     fn stop_cpu_pair(&mut self) -> Result<(), Self::Error>;
-    /// Wake every accepted job with an error while retaining all firmware-
-    /// visible ownership. Used only when processor stop cannot be proven.
-    fn fail_outstanding_jobs_while_owned(&mut self);
     fn drop_gfx1_rtkit(&mut self);
     fn drop_gfx_rtkit(&mut self);
     /// Disable the hardware-visible SKSM queue while retaining its storage.
@@ -200,50 +132,26 @@ pub(crate) fn recover_persistent_runtime<T: PersistentRuntimeRecovery>(
     owner: &mut T,
 ) -> Result<(), T::Error> {
     owner.pause_submissions();
-    if let Err(error) = owner.stop_cpu_pair() {
-        // A failed stop is not permission to release mappings, but it also
-        // must not leave userspace waiting forever. Implementations signal
-        // error fences while retaining the complete hardware owner graph.
-        owner.fail_outstanding_jobs_while_owned();
-        return Err(error);
-    }
+    owner.stop_cpu_pair()?;
     owner.drop_gfx1_rtkit();
     owner.drop_gfx_rtkit();
-    // Both processors are stopped, so pending fences and their owner graphs
-    // can be settled even when the best-effort SKSM unregister step fails.
-    // Returning before this release stranded every accepted fence and made a
-    // retry hit the same stale queue forever.
-    let disable_result = owner.disable_sksm_queue();
+    owner.disable_sksm_queue()?;
     owner.release_runtime_objects();
-    disable_result?;
     owner.rebuild_session_in_place()?;
     owner.resume_submissions();
     Ok(())
 }
 
-/// A runtime stays unavailable until a started recovery fully resumes it.
-///
-/// A failed replacement boot can have no role-state objects left to carry a
-/// crash bit, so the explicit in-progress state is independently sufficient.
-pub(crate) const fn persistent_session_needs_recovery(
-    recovery_pending: bool,
-    gfx_crashed: bool,
-    gfx1_crashed: bool,
-) -> bool {
-    recovery_pending || gfx_crashed || gfx1_crashed
-}
-
 /// Decide whether the next render must start a fresh firmware session.
-/// Physical 256-slot SKSM/outer rings wrap without a session restart. The
-/// current event writer admits 24-bit stamps; retain that real width bound.
-/// A retained-graph owner change still requires a cold session if the normal
-/// graph-handoff path has not replaced it first.
+/// Ordinal 255 is representable; 256 is the first value outside the retained
+/// optional-record ABI. A VM change also needs a cold session because the
+/// retained graph belongs to its original VM.
 pub(crate) const fn retained_render_requires_recycle(
     retained_graph: bool,
-    same_owner: bool,
+    same_vm: bool,
     next_ordinal: u32,
 ) -> bool {
-    retained_graph && (!same_owner || next_ordinal >= 0x00ff_ffff)
+    retained_graph && (!same_vm || next_ordinal > u8::MAX as u32)
 }
 
 /// Operations needed to dismantle a retained G17P runtime.
@@ -279,23 +187,6 @@ pub(crate) fn teardown_persistent_runtime<T: PersistentRuntimeTeardown>(owner: &
     owner.drop_manager();
 }
 
-/// Operations which must complete before the platform-owned runtime is
-/// dropped.  RTKit callbacks and queued workers both retain a DRM-device
-/// reference, so ingress must close before either work item is cancelled.
-/// Otherwise a callback can requeue the item after cancellation and keep the
-/// module pinned after unbind.
-pub(crate) trait DriverUnbindQuiesce {
-    fn disarm_ingress(&self);
-    fn cancel_event_work(&self);
-    fn cancel_recovery_work(&self);
-}
-
-pub(crate) fn quiesce_driver_unbind<T: DriverUnbindQuiesce>(owner: &T) {
-    owner.disarm_ingress();
-    owner.cancel_event_work();
-    owner.cancel_recovery_work();
-}
-
 /// Start GFX then GFX1, run `body`, and stop GFX1 then GFX.
 ///
 /// Every path after GFX starts attempts its matching stop. A GFX1 start error
@@ -328,52 +219,6 @@ mod tests {
     use std::cell::RefCell;
 
     #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-    enum UnbindEvent {
-        Disarm,
-        CancelEvent,
-        CancelRecovery,
-    }
-
-    struct MockUnbind {
-        armed: core::cell::Cell<bool>,
-        trace: RefCell<std::vec::Vec<UnbindEvent>>,
-    }
-
-    impl DriverUnbindQuiesce for MockUnbind {
-        fn disarm_ingress(&self) {
-            self.armed.set(false);
-            self.trace.borrow_mut().push(UnbindEvent::Disarm);
-        }
-
-        fn cancel_event_work(&self) {
-            assert!(!self.armed.get());
-            self.trace.borrow_mut().push(UnbindEvent::CancelEvent);
-        }
-
-        fn cancel_recovery_work(&self) {
-            assert!(!self.armed.get());
-            self.trace.borrow_mut().push(UnbindEvent::CancelRecovery);
-        }
-    }
-
-    #[test]
-    fn unbind_closes_ingress_before_cancelling_device_references() {
-        let owner = MockUnbind {
-            armed: core::cell::Cell::new(true),
-            trace: RefCell::new(std::vec::Vec::new()),
-        };
-        quiesce_driver_unbind(&owner);
-        assert_eq!(
-            *owner.trace.borrow(),
-            [
-                UnbindEvent::Disarm,
-                UnbindEvent::CancelEvent,
-                UnbindEvent::CancelRecovery,
-            ]
-        );
-    }
-
-    #[derive(Debug, Copy, Clone, PartialEq, Eq)]
     enum Role {
         Gfx,
         Gfx1,
@@ -391,11 +236,8 @@ mod tests {
         DropCpuPair,
         DropManager,
         RetainRuntime,
-        RetainBoot,
-        DropBoot,
         PauseSubmissions,
         StopCpuPair,
-        FailOutstandingJobs,
         DisableSksmQueue,
         ReleaseRuntimeObjects,
         RebuildSessionInPlace,
@@ -683,45 +525,6 @@ mod tests {
     }
 
     #[test]
-    fn staged_in_place_failure_keeps_primary_owned_for_outer_rollback() {
-        let state = State {
-            failure: None,
-            trace: RefCell::new(std::vec::Vec::new()),
-        };
-        let mut pair = StartedCpuPair::new(
-            MockCpu {
-                role: Role::Gfx,
-                state: &state,
-            },
-            MockCpu {
-                role: Role::Gfx1,
-                state: &state,
-            },
-        );
-
-        assert_eq!(
-            pair.start_staged_in_place(|| {
-                state.trace.borrow_mut().push(Event::Body);
-                Err(TestError::Body)
-            }),
-            Err(TestError::Body)
-        );
-        assert_eq!(
-            *state.trace.borrow(),
-            [Event::Start(Role::Gfx), Event::Body]
-        );
-        assert_eq!(pair.stop(), Ok(()));
-        assert_eq!(
-            *state.trace.borrow(),
-            [
-                Event::Start(Role::Gfx),
-                Event::Body,
-                Event::Stop(Role::Gfx),
-            ]
-        );
-    }
-
-    #[test]
     fn explicitly_stopped_pair_does_not_stop_twice_on_drop() {
         let state = State {
             failure: None,
@@ -891,67 +694,6 @@ mod tests {
         assert_eq!(owner.trace, [Event::StopCpuPair, Event::RetainRuntime]);
     }
 
-    struct MockFailedBoot<'a> {
-        trace: &'a RefCell<std::vec::Vec<Event>>,
-        stop_ok: bool,
-    }
-
-    impl Drop for MockFailedBoot<'_> {
-        fn drop(&mut self) {
-            self.trace.borrow_mut().push(Event::DropBoot);
-        }
-    }
-
-    impl FailedBootSession for MockFailedBoot<'_> {
-        fn stop_cpu_pair(&mut self) -> bool {
-            self.trace.borrow_mut().push(Event::StopCpuPair);
-            self.stop_ok
-        }
-
-        fn retain_firmware_owners(self) {
-            self.trace.borrow_mut().push(Event::RetainBoot);
-            core::mem::forget(self);
-        }
-    }
-
-    #[test]
-    fn failed_boot_drops_owners_only_after_a_proven_stop() {
-        let trace = RefCell::new(std::vec::Vec::new());
-        assert!(rollback_failed_boot_session(MockFailedBoot {
-            trace: &trace,
-            stop_ok: true,
-        }));
-        assert_eq!(
-            *trace.borrow(),
-            [Event::StopCpuPair, Event::DropBoot]
-        );
-    }
-
-    #[test]
-    fn failed_boot_retains_every_owner_when_stop_is_unproven() {
-        let trace = RefCell::new(std::vec::Vec::new());
-        assert!(!rollback_failed_boot_session(MockFailedBoot {
-            trace: &trace,
-            stop_ok: false,
-        }));
-        assert_eq!(
-            *trace.borrow(),
-            [Event::StopCpuPair, Event::RetainBoot]
-        );
-    }
-
-    #[test]
-    fn failed_rebuild_without_role_state_still_requires_recovery() {
-        assert!(persistent_session_needs_recovery(true, false, false));
-    }
-
-    #[test]
-    fn only_a_fully_resumed_healthy_session_is_available() {
-        assert!(!persistent_session_needs_recovery(false, false, false));
-        assert!(persistent_session_needs_recovery(false, true, false));
-        assert!(persistent_session_needs_recovery(false, false, true));
-    }
-
     struct MockRuntimeRecovery {
         failure: Option<Failure>,
         trace: std::vec::Vec<Event>,
@@ -972,10 +714,6 @@ mod tests {
             } else {
                 Ok(())
             }
-        }
-
-        fn fail_outstanding_jobs_while_owned(&mut self) {
-            self.trace.push(Event::FailOutstandingJobs);
         }
 
         fn drop_gfx1_rtkit(&mut self) {
@@ -1049,14 +787,7 @@ mod tests {
             recover_persistent_runtime(&mut owner),
             Err(TestError::StopPair)
         );
-        assert_eq!(
-            owner.trace,
-            [
-                Event::PauseSubmissions,
-                Event::StopCpuPair,
-                Event::FailOutstandingJobs,
-            ]
-        );
+        assert_eq!(owner.trace, [Event::PauseSubmissions, Event::StopCpuPair]);
     }
 
     #[test]
@@ -1085,7 +816,7 @@ mod tests {
     }
 
     #[test]
-    fn sksm_disable_error_still_settles_stopped_runtime_objects() {
+    fn sksm_disable_error_keeps_queue_and_graph_storage_alive() {
         let mut owner = MockRuntimeRecovery {
             failure: Some(Failure::DisableSksm),
             trace: std::vec::Vec::new(),
@@ -1103,149 +834,13 @@ mod tests {
                 Event::DropGfx1Rtkit,
                 Event::DropGfxRtkit,
                 Event::DisableSksmQueue,
-                Event::ReleaseRuntimeObjects,
             ]
         );
     }
 
-    #[derive(Debug, Copy, Clone)]
-    struct RecoveryFenceOwner {
-        signals: u32,
-        retained: bool,
-    }
-
-    struct RepeatedFenceRecovery {
-        jobs: [RecoveryFenceOwner; 2],
-        stop_failures: u32,
-        disable_failures: u32,
-        processors_stopped: bool,
-        release_calls: u32,
-        rebuild_calls: u32,
-        resumed: bool,
-    }
-
-    impl RepeatedFenceRecovery {
-        fn new(stop_failures: u32, disable_failures: u32) -> Self {
-            Self {
-                jobs: [RecoveryFenceOwner {
-                    signals: 0,
-                    retained: true,
-                }; 2],
-                stop_failures,
-                disable_failures,
-                processors_stopped: false,
-                release_calls: 0,
-                rebuild_calls: 0,
-                resumed: false,
-            }
-        }
-
-        fn signal_once(job: &mut RecoveryFenceOwner) {
-            if job.signals == 0 {
-                job.signals = 1;
-            }
-        }
-    }
-
-    impl PersistentRuntimeRecovery for RepeatedFenceRecovery {
-        type Error = TestError;
-
-        fn pause_submissions(&mut self) {
-            self.resumed = false;
-        }
-
-        fn stop_cpu_pair(&mut self) -> Result<(), Self::Error> {
-            if self.stop_failures != 0 {
-                self.stop_failures -= 1;
-                return Err(TestError::StopPair);
-            }
-            self.processors_stopped = true;
-            Ok(())
-        }
-
-        fn fail_outstanding_jobs_while_owned(&mut self) {
-            for job in &mut self.jobs {
-                assert!(job.retained);
-                Self::signal_once(job);
-            }
-        }
-
-        fn drop_gfx1_rtkit(&mut self) {}
-        fn drop_gfx_rtkit(&mut self) {}
-
-        fn disable_sksm_queue(&mut self) -> Result<(), Self::Error> {
-            assert!(self.processors_stopped);
-            if self.disable_failures != 0 {
-                self.disable_failures -= 1;
-                Err(TestError::DisableSksm)
-            } else {
-                Ok(())
-            }
-        }
-
-        fn release_runtime_objects(&mut self) {
-            assert!(self.processors_stopped);
-            self.release_calls += 1;
-            for job in &mut self.jobs {
-                Self::signal_once(job);
-                job.retained = false;
-            }
-        }
-
-        fn rebuild_session_in_place(&mut self) -> Result<(), Self::Error> {
-            assert!(self.processors_stopped);
-            self.rebuild_calls += 1;
-            self.processors_stopped = false;
-            Ok(())
-        }
-
-        fn resume_submissions(&mut self) {
-            self.resumed = true;
-        }
-    }
-
     #[test]
-    fn failed_stop_signals_two_clients_once_but_retains_their_hardware_owners() {
-        let mut owner = RepeatedFenceRecovery::new(1, 0);
-        assert_eq!(recover_persistent_runtime(&mut owner), Err(TestError::StopPair));
-        assert!(owner.jobs.iter().all(|job| job.signals == 1 && job.retained));
-        assert_eq!(owner.release_calls, 0);
-
-        // A later successful stop releases both owners without signalling
-        // either fence a second time, then rebuilds and resumes normally.
-        assert_eq!(recover_persistent_runtime(&mut owner), Ok(()));
-        assert!(owner.jobs.iter().all(|job| job.signals == 1 && !job.retained));
-        assert_eq!(owner.release_calls, 1);
-        assert_eq!(owner.rebuild_calls, 1);
-        assert!(owner.resumed);
-    }
-
-    #[test]
-    fn disable_failure_releases_two_clients_and_a_retry_rebuilds() {
-        let mut owner = RepeatedFenceRecovery::new(0, 1);
-        assert_eq!(
-            recover_persistent_runtime(&mut owner),
-            Err(TestError::DisableSksm)
-        );
-        assert!(owner.jobs.iter().all(|job| job.signals == 1 && !job.retained));
-        assert_eq!(owner.release_calls, 1);
-        assert_eq!(owner.rebuild_calls, 0);
-        assert!(!owner.resumed);
-
-        assert_eq!(recover_persistent_runtime(&mut owner), Ok(()));
-        assert!(owner.jobs.iter().all(|job| job.signals == 1 && !job.retained));
-        assert_eq!(owner.release_calls, 2);
-        assert_eq!(owner.rebuild_calls, 1);
-        assert!(owner.resumed);
-    }
-
-    #[test]
-    fn physical_ring_wraps_do_not_rebuild_the_retained_session() {
-        for ordinal in [255, 256, 257, 426, 427, 999, 1000, 0x00ff_fffe] {
-            assert!(!retained_render_requires_recycle(true, true, ordinal));
-            assert!(retained_render_requires_recycle(true, false, ordinal));
-        }
-        let mut next_ordinal = 0x00ff_fffe;
+    fn ordinal_255_rebuilds_the_session_before_the_following_submit() {
+        let mut next_ordinal = 255;
         assert!(!retained_render_requires_recycle(true, true, next_ordinal));
         next_ordinal += 1;
         assert!(retained_render_requires_recycle(true, true, next_ordinal));

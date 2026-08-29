@@ -29,7 +29,10 @@ use crate::{
     file,
     g15_boot,
     g17_boot,
+    g17_drm,
     g17_firmware,
+    g17_live_boot,
+    g17_manager,
     g17_power_preflight,
     gem::AsahiObject,
     gpu,
@@ -47,133 +50,20 @@ pub(crate) struct AsahiData {
     pub(crate) gpu: Arc<dyn drm_gpu::DrmGpu>,
     pub(crate) pdev: ARef<platform::Device>,
     pub(crate) resources: Option<regs::Resources>,
-    pub(crate) g17_runtime: Option<g17_drm::G17PRuntimeRef>,
-    #[pin]
-    g17_event_work: Work<AsahiDevice, 1>,
-    #[pin]
-    g17_recovery_work: Work<AsahiDevice, 2>,
 }
 
 unsafe impl Send for AsahiData {}
 unsafe impl Sync for AsahiData {}
 
-impl_has_work! {
-    impl HasWork<AsahiDevice, 1> for AsahiData { self.g17_event_work }
-    impl HasWork<AsahiDevice, 2> for AsahiData { self.g17_recovery_work }
-}
-
-impl WorkItem<1> for AsahiData {
-    type Pointer = ARef<AsahiDevice>;
-
-    fn run(dev: ARef<AsahiDevice>) {
-        let Some(runtime) = dev.g17_runtime else {
-            return;
-        };
-        if let Err(error) = runtime.service_primary_firmware_events() {
-            dev_err!(
-                dev.as_ref(),
-                "G17P event worker: serialized drain/recovery failed ({:?})\n",
-                error
-            );
-            return;
-        }
-        if runtime.primary_recovery_pending() {
-            queue_g17p_recovery_worker(dev);
-        } else if runtime.primary_firmware_event_pending() {
-            queue_g17p_firmware_event_worker(dev);
-        }
-    }
-}
-
-impl WorkItem<2> for AsahiData {
-    type Pointer = ARef<AsahiDevice>;
-
-    fn run(dev: ARef<AsahiDevice>) {
-        let Some(runtime) = dev.g17_runtime else {
-            return;
-        };
-        if let Err(error) = runtime.service_primary_recovery() {
-            dev_err!(
-                dev.as_ref(),
-                "G17P recovery worker: serialized recovery failed ({:?})\n",
-                error
-            );
-            return;
-        }
-        if runtime.primary_firmware_event_pending() {
-            queue_g17p_firmware_event_worker(dev);
-        } else if runtime.primary_recovery_pending() {
-            queue_g17p_recovery_worker(dev);
-        }
-    }
-}
-
-pub(crate) fn queue_g17p_firmware_event_worker(dev: ARef<AsahiDevice>) {
-    let _ = workqueue::system_highpri().enqueue::<ARef<AsahiDevice>, 1>(dev);
-}
-
-pub(crate) fn queue_g17p_recovery_worker(dev: ARef<AsahiDevice>) {
-    let _ = workqueue::system_highpri().enqueue::<ARef<AsahiDevice>, 2>(dev);
-}
-
-struct G17PDriverUnbind<'a> {
-    runtime: &'a g17_drm::SharedG17PRuntime,
-    drm: ARef<AsahiDevice>,
-}
-
-impl g17_lifecycle::DriverUnbindQuiesce for G17PDriverUnbind<'_> {
-    fn disarm_ingress(&self) {
-        self.runtime.lock().disarm_firmware_event_worker();
-    }
-
-    fn cancel_event_work(&self) {
-        cancel_g17p_work::<1>(&self.drm);
-    }
-
-    fn cancel_recovery_work(&self) {
-        cancel_g17p_work::<2>(&self.drm);
-    }
-}
-
-fn cancel_g17p_work<const ID: u64>(dev: &AsahiDevice)
-where
-    AsahiDevice: HasWork<AsahiDevice, ID>,
-{
-    let dev_ptr = (dev as *const AsahiDevice).cast_mut();
-    // SAFETY: `dev` remains strongly referenced by the unbind owner for this
-    // whole call. The HasWork implementation returns its embedded work item,
-    // and cancel_work_sync waits until no callback owns that item.
-    let work = unsafe {
-        <AsahiDevice as HasWork<AsahiDevice, ID>>::raw_get_work(dev_ptr)
-    };
-    // SAFETY: `work` is the initialized embedded work item selected by ID.
-    let work = unsafe { Work::raw_get(work) };
-    // SAFETY: no callback can be newly queued after ingress was disarmed, and
-    // the strong `drm` reference keeps the containing object alive.
-    unsafe { bindings::cancel_work_sync(work) };
-}
-
 #[allow(dead_code)]
 enum AsahiRuntime {
     Legacy(ARef<drm::Device<AsahiDriver>>),
     G17P(g17_drm::SharedG17PRuntime),
-    M5(g17_live_boot::m5::M5Runtime),
-    M5Drm(crate::m5_drm::SharedM5Runtime),
 }
 
 pub(crate) struct AsahiDriver {
     #[expect(unused)]
     runtime: AsahiRuntime,
-}
-
-/// A matched device either has a complete legacy hardware configuration or is
-/// an exact AGX3 identification target whose firmware boundary remains closed.
-pub(crate) enum ProbeConfig {
-    Supported(&'static hw::HwConfig),
-    /// AGX3 (G15/G16/G17) target: chip identification and the read-only
-    /// topology decode run at probe time, then the probe fails closed before
-    /// DMA setup, ASC start, or any MMIO write.
-    Agx3Diagnostic(&'static hw::agx3::SocConfig),
 }
 
 /// A matched device either has a complete legacy hardware configuration or is
@@ -346,12 +236,89 @@ kernel::of_device_table!(
     ]
 );
 
+/// Start the persistent runtime for an exact T8140/G17P match.
+fn probe_t8140_runtime(
+    pdev: &platform::Device<Core>,
+    soc: &'static hw::agx3::SocConfig,
+) -> Result<g17_drm::SharedG17PRuntime> {
+    let expected = identity::decode_gpu_identity(soc.hw_family, soc.hw_variant, soc.num_dies as u8)
+        .ok_or(EINVAL)?;
+    if soc.chip_id != 0x8140
+        || expected.gpu_gen != hw::GpuGen::G17
+        || expected.gpu_variant != identity::GpuVariant::P
+        || expected.uat_input_address_bits != soc.uat_ias
+    {
+        return Err(EINVAL);
+    }
+
+    // Topology is read and admitted before mappings, DMA setup, or provider
+    // start. The token is consumed by the retained runtime constructor.
+    let topology = admit_t8140_live_topology(pdev, &expected)?;
+    let registers = regs::Resources::new(pdev)?;
+    let observed = registers.get_gpu_id()?;
+    if observed.gpu_gen != soc.gpu_gen
+        || observed.gpu_variant != soc.gpu_variant
+        || observed.num_dies != soc.num_dies
+    {
+        dev_err!(
+            pdev.as_ref(),
+            "G17P: hardware identity {:?}{:?}/{} dies does not match exact T8140 {:?}{:?}/{} dies\n",
+            observed.gpu_gen,
+            observed.gpu_variant,
+            observed.num_dies,
+            soc.gpu_gen,
+            soc.gpu_variant,
+            soc.num_dies
+        );
+        return Err(ENODEV);
+    }
+
+    unsafe { pdev.dma_set_mask_and_coherent(DmaMask::try_new(soc.uat_oas)?)? };
+
+    // The retained manager allocates its GEM objects from this DRM device.
+    // Registration follows runtime and adapter initialization below.
+    let uninit = unsafe {
+        pin_init::pin_init_from_closure::<AsahiData, kernel::error::Error>(|_slot| Ok(()))
+    };
+    let drm: ARef<AsahiDevice> = drm::device::Device::new(pdev.as_ref(), uninit)?;
+
+    let runtime = g17_live_boot::G17PLiveRuntime::start(
+        pdev,
+        drm.clone(),
+        registers,
+        soc,
+        &expected,
+        topology,
+    )?;
+    let runtime = Arc::pin_init(new_mutex!(runtime), GFP_KERNEL)?;
+    let runtime_ref = g17_drm::G17PRuntimeRef::new(&runtime);
+    let gpu: Arc<dyn drm_gpu::DrmGpu> = Arc::new(
+        g17_drm::G17PDrmGpu::new(runtime_ref, soc, observed),
+        GFP_KERNEL,
+    )?;
+    let data = try_pin_init!(AsahiData {
+        gpu,
+        pdev: pdev.into(),
+        resources: None,
+    });
+    let ptr: *const AsahiData = &raw const **drm;
+    // SAFETY: `drm` was created with an uninitialized data slot above; this
+    // is its only initialization before registration exposes file operations.
+    unsafe {
+        data.__pinned_init(ptr as *mut AsahiData)?;
+    }
+    runtime.lock().mark_firmware_cache_flush_ready()?;
+    (*drm).gpu.init()?;
+    drm::driver::Registration::new_foreign_owned(&drm, pdev.as_ref(), 0)?;
+    Ok(runtime)
+}
+
 /// Identify an AGX3 target as far as read-only evidence allows, then refuse.
 ///
 /// This logs the statically decoded identity, performs the read-only SGX
 /// identification (ID block + core-enable masks; no DMA mask, no ASC start,
-/// no MMIO write), cross-checks the two, and then fails closed at the
-/// generation-specific firmware boundary.
+/// no MMIO write), cross-checks the two, and stops at the generation-specific
+/// firmware boundary.
 fn refuse_agx3_probe(pdev: &platform::Device<Core>, soc: &'static hw::agx3::SocConfig) -> Error {
     let Some(expected) =
         identity::decode_gpu_identity(soc.hw_family, soc.hw_variant, soc.num_dies as u8)
@@ -406,7 +373,7 @@ fn refuse_agx3_probe(pdev: &platform::Device<Core>, soc: &'static hw::agx3::SocC
             Err(e) => {
                 dev_err!(
                     pdev.as_ref(),
-                    "G17S: loaded-segment firmware identity rejected; refusing before SGX MMIO: {:?}\n",
+                    "G17S: loaded-segment firmware identity was invalid; stopping before SGX MMIO: {:?}\n",
                     e
                 );
                 return ENODEV;
@@ -443,20 +410,22 @@ fn refuse_agx3_probe(pdev: &platform::Device<Core>, soc: &'static hw::agx3::SocC
             }
             Err(e) => dev_warn!(pdev.as_ref(), "AGX3: GPU ID decode failed: {:?}\n", e),
         },
-        Err(e) => dev_warn!(
-            pdev.as_ref(),
-            "AGX3: SGX MMIO region unavailable: {:?}\n",
-            e
-        ),
+        Err(e) => {
+            dev_warn!(
+                pdev.as_ref(),
+                "AGX3: SGX MMIO region unavailable: {:?}\n",
+                e
+            );
+        }
     }
 
     match expected.gpu_gen {
         hw::GpuGen::G15 => refuse_g15_probe(pdev),
-        hw::GpuGen::G17 => refuse_g17_probe(pdev, &expected, loaded_g17_firmware.as_ref()),
+        hw::GpuGen::G17 => refuse_g17_probe(pdev, soc, &expected, loaded_g17_firmware.as_ref()),
         gen => {
             dev_err!(
                 pdev.as_ref(),
-                "AGX3: no firmware handoff for {:?}: the HwConfig firmware-tuning blocks, init-data layout, and Handoff ABI are not grounded for this generation; refusing before DMA setup or ASC start\n",
+                "AGX3 setup unavailable for {:?}: firmware tuning, initdata, and handoff are incomplete; no DMA or processor state changed\n",
                 gen
             );
             ENODEV
@@ -465,7 +434,7 @@ fn refuse_agx3_probe(pdev: &platform::Device<Core>, soc: &'static hw::agx3::SocC
 }
 
 /// Report the grounded-vs-UNKNOWN state of the single-role G15 (M3) boot, then
-/// fail closed. G15 is the easiest AGX3 target — one `GFX` role, classic
+/// stop the probe. G15 is the easiest AGX3 target — one `GFX` role, classic
 /// device-control-ring submission — but the firmware image is not on disk and
 /// the init-data/RTKit graph is not boot-complete offline.
 fn refuse_g15_probe(pdev: &platform::Device<Core>) -> Error {
@@ -483,7 +452,7 @@ fn refuse_g15_probe(pdev: &platform::Device<Core>) -> Error {
     );
     dev_err!(
         pdev.as_ref(),
-        "G15 preflight missing evidence {:#x}; refusing before DMA setup, MMIO mapping, UAT ownership, or GFX ASC start\n",
+        "G15 setup incomplete: evidence mask {:#x}; no DMA, MMIO, UAT, or processor state changed\n",
         missing.bits()
     );
     if missing.contains(g15_boot::missing::FIRMWARE_IMAGE) {
@@ -526,23 +495,160 @@ fn refuse_g15_probe(pdev: &platform::Device<Core>) -> Error {
     ENODEV
 }
 
+/// Read one T8140 ASCWrap v6 provider from a `mboxes` phandle node.
+///
+/// Reads the node's two `reg` windows (CPU physical, #address/#size-cells = 2
+/// each), the two named `send-empty`/`recv-not-empty` AIC interrupt numbers
+/// (3 cells per interrupt), and the `apple,firmware-role` string. Anything
+/// missing or malformed fails closed (returns `None`) rather than guessing.
+fn read_t8140_asc_observation(
+    pdev: &platform::Device<Core>,
+    index: usize,
+) -> Option<agx_power_recovery::T8140G17PLinuxDtAscObservation> {
+    let node = pdev.as_ref().of_node()?;
+    let mbox = node.parse_phandle(c_str!("mboxes"), index)?;
+
+    // Require the exact provider ABI rather than accepting a node with the
+    // same numeric resources under a different owner contract.
+    let compatible: KVec<u8> = mbox.get_property(c_str!("compatible")).ok()?;
+    if compatible.as_slice() != b"apple,t8140-ascwrap-v6\0" {
+        return None;
+    }
+    let reg_names: KVec<u8> = mbox.get_property(c_str!("reg-names")).ok()?;
+    if reg_names.as_slice() != b"wrapper\0iop-vbar\0" {
+        return None;
+    }
+    let interrupt_names: KVec<u8> = mbox.get_property(c_str!("interrupt-names")).ok()?;
+    if interrupt_names.as_slice() != b"send-empty\0recv-not-empty\0" {
+        return None;
+    }
+
+    // reg = <wrapper_hi wrapper_lo wsize_hi wsize_lo iovbar_hi iovbar_lo isize_hi isize_lo>
+    let reg: KVec<u32> = mbox.get_property(c_str!("reg")).ok()?;
+    if reg.len() != 8 {
+        return None;
+    }
+    let cell64 = |hi: u32, lo: u32| ((hi as u64) << 32) | lo as u64;
+
+    // interrupts = <type send flags type recv flags>, AIC number is cell 1/4.
+    let interrupts: KVec<u32> = mbox.get_property(c_str!("interrupts")).ok()?;
+    const AIC_IRQ: u32 = 0;
+    const IRQ_TYPE_LEVEL_HIGH: u32 = 4;
+    if interrupts.len() != 6
+        || interrupts[0] != AIC_IRQ
+        || interrupts[2] != IRQ_TYPE_LEVEL_HIGH
+        || interrupts[3] != AIC_IRQ
+        || interrupts[5] != IRQ_TYPE_LEVEL_HIGH
+    {
+        return None;
+    }
+
+    // apple,firmware-role is "GFX" (primary) or "GFX1" (secondary).
+    let role: KVec<u8> = mbox.get_property(c_str!("apple,firmware-role")).ok()?;
+    let role_is_gfx1 = match role.as_slice() {
+        b"GFX\0" | b"GFX" => false,
+        b"GFX1\0" | b"GFX1" => true,
+        _ => return None,
+    };
+
+    Some(agx_power_recovery::T8140G17PLinuxDtAscObservation {
+        role_is_gfx1,
+        wrapper_cpu_base: cell64(reg[0], reg[1]),
+        wrapper_size: cell64(reg[2], reg[3]),
+        iorvbar_cpu_base: cell64(reg[4], reg[5]),
+        iorvbar_size: cell64(reg[6], reg[7]),
+        send_empty_irq: interrupts[1],
+        recv_not_empty_irq: interrupts[4],
+    })
+}
+
+/// Read the full observed T8140 dual-ASC topology from the platform device
+/// tree, exactly as a Linux platform decoder sees it. `None` when the two
+/// `mboxes` providers cannot be read; the caller then reports missing
+/// topology rather than admitting an inferred one.
+fn read_t8140_linux_dt_topology(
+    pdev: &platform::Device<Core>,
+) -> Option<agx_power_recovery::T8140G17PLinuxDtTopology> {
+    let node = pdev.as_ref().of_node()?;
+    let gpu_reg_names: KVec<u8> = node.get_property(c_str!("reg-names")).ok()?;
+    let mboxes: KVec<u32> = node.get_property(c_str!("mboxes")).ok()?;
+    if gpu_reg_names.as_slice() != b"asc\0sgx\0"
+        || mboxes.len() != 2
+        || node.parse_phandle(c_str!("mboxes"), 2).is_some()
+    {
+        return None;
+    }
+
+    Some(agx_power_recovery::T8140G17PLinuxDtTopology {
+        gfx: read_t8140_asc_observation(pdev, 0)?,
+        gfx1: read_t8140_asc_observation(pdev, 1)?,
+    })
+}
+
+/// Proof that the live T8140 DT matched both pinned provider roles exactly.
+///
+/// Construction is private to the read-only admission above; live boot must
+/// receive this token before it can query either provider.
+pub(crate) struct T8140LiveTopologyAdmission {
+    _private: (),
+}
+
+fn admit_t8140_live_topology(
+    pdev: &platform::Device<Core>,
+    identity: &identity::GpuIdentity,
+) -> Result<T8140LiveTopologyAdmission> {
+    let observed = read_t8140_linux_dt_topology(pdev).ok_or(EINVAL)?;
+    let preflight =
+        g17_power_preflight::G17PowerPreflight::new_with_linux_dt(identity, Some(&observed))
+            .map_err(|_| EINVAL)?;
+    if preflight.t8140_strategy().is_none() {
+        return Err(EINVAL);
+    }
+
+    Ok(T8140LiveTopologyAdmission { _private: () })
+}
+
 fn refuse_g17_probe(
     pdev: &platform::Device<Core>,
+    soc: &'static hw::agx3::SocConfig,
     identity: &identity::GpuIdentity,
     firmware: Option<&g17_firmware::G17FirmwareIdentityAdmission>,
 ) -> Error {
-    // G17P remains fail-closed until the Linux platform decoder can supply an
-    // exact observed D93AP/T8140 topology. Never substitute the expected
-    // constant here: that would turn topology admission back into dead data.
-    let power_preflight = match g17_power_preflight::G17PowerPreflight::new(identity, None) {
-        Ok(preflight) => preflight,
-        Err(e) => {
-            dev_err!(
+    // G17P binds its power preflight to the exact D93AP/T8140 topology the
+    // Linux device tree actually exposes (its two `mboxes` providers). Never
+    // substitute the expected constant: only a real observation that decodes
+    // to the pinned providers admits the A18 Pro strategy.
+    let power_preflight = if identity.gpu_variant == identity::GpuVariant::P {
+        let observed = read_t8140_linux_dt_topology(pdev);
+        if observed.is_none() {
+            dev_warn!(
                 pdev.as_ref(),
-                "G17: no exact target-bound cold-boot/power preflight: {:?}; refusing\n",
-                e
+                "G17P: could not read the T8140 dual-ASC topology from the device tree mboxes\n"
             );
-            return ENODEV;
+        }
+        match g17_power_preflight::G17PowerPreflight::new_with_linux_dt(identity, observed.as_ref())
+        {
+            Ok(preflight) => preflight,
+            Err(e) => {
+                dev_err!(
+                    pdev.as_ref(),
+                    "G17P topology mismatch: {:?}\n",
+                    e
+                );
+                return ENODEV;
+            }
+        }
+    } else {
+        match g17_power_preflight::G17PowerPreflight::new(identity, None) {
+            Ok(preflight) => preflight,
+            Err(e) => {
+                dev_err!(
+                    pdev.as_ref(),
+                    "G17 target setup unavailable: {:?}\n",
+                    e
+                );
+                return ENODEV;
+            }
         }
     };
     let Err(power_missing) = power_preflight.execution_gate() else {
@@ -560,14 +666,17 @@ fn refuse_g17_probe(
     );
 
     let gpu_variant = identity.gpu_variant;
-    let gate = if gpu_variant == identity::GpuVariant::S {
-        g17_boot::pre_handoff_gate_with_identity(
+    let gate = match gpu_variant {
+        identity::GpuVariant::S => g17_boot::pre_handoff_gate_with_identity(
             hw::GpuGen::G17 as u32,
             g17_boot::G17FirmwareVariant::G17S,
             firmware,
-        )
-    } else {
-        g17_boot::pre_handoff_gate(hw::GpuGen::G17 as u32)
+        ),
+        identity::GpuVariant::P => g17_boot::pre_handoff_gate_for_variant(
+            hw::GpuGen::G17 as u32,
+            g17_boot::G17FirmwareVariant::G17P,
+        ),
+        _ => g17_boot::pre_handoff_gate(hw::GpuGen::G17 as u32),
     };
     let Err(missing) = gate else {
         dev_err!(
@@ -592,18 +701,18 @@ fn refuse_g17_probe(
         if missing.bits() != default_missing.bits() & !g17_boot::missing::FIRMWARE_IDENTITY {
             dev_err!(
                 pdev.as_ref(),
-                "G17: loaded-firmware admission changed a non-identity gate; refusing\n"
+                "G17 firmware admission changed an unrelated setup gate\n"
             );
             return EINVAL;
         }
         dev_info!(
             pdev.as_ref(),
-            "G17: loaded GFX/GFX1 evidence cleared only the firmware-identity bit; all execution gates remain closed\n"
+            "G17: loaded GFX/GFX1 evidence cleared the firmware-identity bit; remaining operations are reported below\n"
         );
     }
     dev_err!(
         pdev.as_ref(),
-        "G17 preflight missing evidence {:#x}; refusing before DMA setup, any MMIO write, UAT ownership, or GFX/GFX1 ASC start\n",
+        "G17 setup incomplete: evidence mask {:#x}; no DMA, MMIO, UAT, or processor state changed\n",
         missing.bits()
     );
     if missing.contains(g17_boot::missing::FIRMWARE_IDENTITY) {
@@ -664,9 +773,41 @@ fn refuse_g17_probe(
         dev_err!(
             pdev.as_ref(),
             "{}{}",
-            "G17 preflight: submission producer subset is grounded (EP 0x21 doorbell byte-identical to AGX2, SKSM kick word and 0x20-strided kick-record table forked and cited), ",
-            "but the SKSM hardware kick-FIFO MMIO scratch, the doorbell round-trip, and the completion IRQ can only be confirmed on a live M5\n"
+            "G17 preflight: submission codecs include the grounded EP 0x21 doorbell, SKSM queue/configure words, fixed-slot scratch geometry, and kick-record table; ",
+            "Linux resource-0 ordered publication is implemented; firmware execution, the round trip, and completion IRQ causality remain unproved\n"
         );
+    }
+
+    if identity.gpu_variant == identity::GpuVariant::P {
+        let target = g17_manager::TargetObservation {
+            chip_id: soc.chip_id,
+            declared_gen: soc.gpu_gen,
+            declared_variant: soc.gpu_variant,
+            hw_family: soc.hw_family,
+            hw_variant: soc.hw_variant,
+            num_dies: soc.num_dies,
+            uat_ias: soc.uat_ias,
+            uat_oas: soc.uat_oas,
+        };
+        let platform = g17_manager::T8140_G17P_PLATFORM_CONFIG;
+        match g17_manager::validate_target(target)
+            .and_then(|_| g17_manager::validate_platform(platform))
+            .and_then(|_| platform.sksm_scratch.fifo_offsets())
+        {
+            Ok(scratch) => dev_info!(
+                pdev.as_ref(),
+                "G17P manager inputs admitted without AGX2 HwConfig: {}-bit UAT, {:#x}-byte pages, dual-role resource geometry, SKSM scratch {:#x}/{:#x}; resource-0 ordered publisher available\n",
+                g17_manager::T8140_MANAGER_CONFIG.uat_ias,
+                g17_manager::T8140_MANAGER_CONFIG.uat_page_size,
+                scratch.write0,
+                scratch.write1
+            ),
+            Err(e) => dev_err!(
+                pdev.as_ref(),
+                "G17P manager inputs were invalid before resource allocation: {:?}\n",
+                e
+            ),
+        }
     }
 
     ENODEV
@@ -688,6 +829,16 @@ impl platform::Driver for AsahiDriver {
 
         let cfg = match info.ok_or(ENODEV)? {
             ProbeConfig::Supported(cfg) => *cfg,
+            ProbeConfig::Agx3Diagnostic(soc) if soc.chip_id == 0x8140 => {
+                let runtime = probe_t8140_runtime(pdev, soc)?;
+                dev_info!(
+                    pdev.as_ref(),
+                    "G17P: persistent dual-ASC runtime bound and DRM render node registered\n"
+                );
+                return Ok(Self {
+                    runtime: AsahiRuntime::G17P(runtime),
+                });
+            }
             ProbeConfig::Agx3Diagnostic(soc) => return Err(refuse_agx3_probe(pdev, soc)),
         };
 
@@ -699,7 +850,7 @@ impl platform::Driver for AsahiDriver {
         if let Err(missing) = g17_boot::pre_handoff_gate(cfg.gpu_gen as u32) {
             dev_err!(
                 pdev.as_ref(),
-                "G17 dual-role pre-handoff is incomplete (missing evidence mask {:#x}); refusing to start GFX/GFX1\n",
+                "G17 dual-role setup incomplete: evidence mask {:#x}; processors were not started\n",
                 missing.bits()
             );
             return Err(ENODEV);
@@ -764,9 +915,6 @@ impl platform::Driver for AsahiDriver {
             gpu,
             pdev: pdev.into(),
             resources: Some(res),
-            g17_runtime: None,
-            g17_event_work <- new_work!("AsahiData::g17_event_work"),
-            g17_recovery_work <- new_work!("AsahiData::g17_recovery_work"),
         });
 
         let ptr: *const AsahiData = &raw const **drm;
@@ -781,20 +929,5 @@ impl platform::Driver for AsahiDriver {
         Ok(Self {
             runtime: AsahiRuntime::Legacy(drm),
         })
-    }
-
-    fn unbind(_pdev: &platform::Device<Core>, this: Pin<&Self>) {
-        if let AsahiRuntime::M5Drm(runtime) = &this.runtime {
-            let _ = runtime.lock().shutdown();
-            return;
-        }
-        let AsahiRuntime::G17P(runtime) = &this.runtime else {
-            return;
-        };
-        let drm = match runtime.lock().drm_ref() {
-            Ok(drm) => drm,
-            Err(_) => return,
-        };
-        g17_lifecycle::quiesce_driver_unbind(&G17PDriverUnbind { runtime, drm });
     }
 }

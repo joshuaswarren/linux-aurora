@@ -21,6 +21,7 @@
 #define APPLE_DCP_LINK_LOCAL_STREAMS_OFFSET	0x078
 #define APPLE_DCP_LINK_REMOTE_STREAMS_OFFSET	0x218
 #define APPLE_DCP_LINK_RPC_MEMORY_SIZE		0x0c0000
+#define APPLE_DCP_LINK_RPC_PAGE_SIZE		0x004000
 #define APPLE_DCP_LINK_SIDE_MEMORY_SIZE		0x040000
 #define APPLE_DCP_LINK_STREAM_HALF_SIZE		0x020000
 #define APPLE_DCP_LINK_STREAM_BUFFER_SIZE	0x008000
@@ -31,12 +32,13 @@
 
 #define APPLE_DCP_LINK_INIT_FLAG_64M		0x04000000
 
+#define APPLE_DCP_LINK_MSG_FIRMWARE_INIT	0
 #define APPLE_DCP_LINK_MSG_READY		1
 #define APPLE_DCP_LINK_MSG_RPC			2
 #define APPLE_DCP_LINK_MSG_RPC_REPLY		0x42
 #define APPLE_DCP_LINK_MSG_INIT			0x40
 #define APPLE_DCP_LINK_MSG_REMOTE		BIT_ULL(8)
-#define APPLE_DCP_LINK_MSG_NESTED		BIT_ULL(9)
+#define APPLE_DCP_LINK_MSG_NEW_STREAM		BIT_ULL(9)
 #define APPLE_DCP_LINK_MSG_STREAM		GENMASK_ULL(15, 10)
 #define APPLE_DCP_LINK_MSG_OFFSET		GENMASK_ULL(31, 16)
 #define APPLE_DCP_LINK_MSG_SIZE			GENMASK_ULL(47, 32)
@@ -48,6 +50,79 @@
 #define APPLE_DCP_H17P_CLOCK_ID_154		0x154
 #define APPLE_DCP_H17P_CLOCK_ID_194		0x194
 
+enum apple_dcp_link_state {
+	APPLE_DCP_LINK_WAIT_FIRMWARE_INIT,
+	APPLE_DCP_LINK_WAIT_READY,
+	APPLE_DCP_LINK_READY,
+};
+
+enum apple_dcp_link_handoff_phase {
+	APPLE_DCP_LINK_HANDOFF_NONE,
+	APPLE_DCP_LINK_HANDOFF_FIRMWARE_INIT,
+	APPLE_DCP_LINK_HANDOFF_READY,
+};
+
+enum apple_dcp_link_adopt_action {
+	APPLE_DCP_LINK_ADOPT_INVALID,
+	APPLE_DCP_LINK_ADOPT_START_ENDPOINT,
+	APPLE_DCP_LINK_ADOPT_SEND_INIT,
+	APPLE_DCP_LINK_ADOPT_START_IOMFB,
+};
+
+static inline bool
+apple_dcp_link_handoff_message_valid(enum apple_dcp_link_handoff_phase phase, u64 message)
+{
+	u8 type = message & GENMASK_ULL(1, 0);
+
+	if (phase == APPLE_DCP_LINK_HANDOFF_FIRMWARE_INIT)
+		return type == APPLE_DCP_LINK_MSG_FIRMWARE_INIT &&
+		       !(message & GENMASK_ULL(7, 6));
+	if (phase == APPLE_DCP_LINK_HANDOFF_READY)
+		return type == APPLE_DCP_LINK_MSG_READY;
+
+	return false;
+}
+
+static inline enum apple_dcp_link_adopt_action
+apple_dcp_link_adopt_decide(enum apple_dcp_link_handoff_phase phase,
+			    u64 message, bool descriptor_zero,
+			    bool descriptor_valid, bool streams_idle)
+{
+	if (!streams_idle)
+		return APPLE_DCP_LINK_ADOPT_INVALID;
+
+	switch (phase) {
+	case APPLE_DCP_LINK_HANDOFF_NONE:
+		return message == 0 && descriptor_zero ?
+			APPLE_DCP_LINK_ADOPT_START_ENDPOINT :
+			APPLE_DCP_LINK_ADOPT_INVALID;
+	case APPLE_DCP_LINK_HANDOFF_FIRMWARE_INIT:
+		return (descriptor_zero || descriptor_valid) &&
+		       apple_dcp_link_handoff_message_valid(phase, message) ?
+			APPLE_DCP_LINK_ADOPT_SEND_INIT :
+			APPLE_DCP_LINK_ADOPT_INVALID;
+	case APPLE_DCP_LINK_HANDOFF_READY:
+		return descriptor_valid &&
+		       apple_dcp_link_handoff_message_valid(phase, message) ?
+			APPLE_DCP_LINK_ADOPT_START_IOMFB :
+			APPLE_DCP_LINK_ADOPT_INVALID;
+	default:
+		return APPLE_DCP_LINK_ADOPT_INVALID;
+	}
+}
+
+static inline u16 apple_dcp_link_negotiate_version(u16 remote_version)
+{
+	return remote_version < APPLE_DCP_LINK_PROTOCOL_VERSION ?
+		remote_version : APPLE_DCP_LINK_PROTOCOL_VERSION;
+}
+
+enum apple_dcp_link_handshake_action {
+	APPLE_DCP_LINK_HANDSHAKE_NONE,
+	APPLE_DCP_LINK_HANDSHAKE_SEND_INIT,
+	APPLE_DCP_LINK_HANDSHAKE_START_IOMFB,
+};
+
 enum apple_dcp_h17p_callback {
 	APPLE_DCP_H17P_CB_DID_BOOT = 0x44303030,
 	APPLE_DCP_H17P_CB_DID_POWER_ON = 0x44303031,
@@ -55,6 +130,7 @@ enum apple_dcp_h17p_callback {
 	APPLE_DCP_H17P_CB_RT_BANDWIDTH = APPLE_DCP_LINK_CALL_D003,
 	APPLE_DCP_H17P_CB_FRAME_SYNC = 0x44303036,
 	APPLE_DCP_H17P_CB_MATCH_PMU = 0x44313030,
+	APPLE_DCP_H17P_CB_CREATE_NVRAM = 0x44313133,
 	APPLE_DCP_H17P_CB_START_HARDWARE_BOOT = 0x44313230,
 	APPLE_DCP_H17P_CB_ALLOCATE_BANDWIDTH = 0x44313239,
 	APPLE_DCP_H17P_CB_MAP_BUF = 0x44323031,
@@ -88,8 +164,10 @@ enum apple_dcp_h17p_callback {
 enum apple_dcp_h17p_call {
 	APPLE_DCP_H17P_CALL_LATE_INIT = 0x41303030,
 	APPLE_DCP_H17P_CALL_SETUP_VIDEO_LIMITS = 0x41303234,
+	APPLE_DCP_H17P_CALL_PMU_SERVICE_MATCHED = 0x41313331,
+	APPLE_DCP_H17P_CALL_BACKLIGHT_SERVICE_MATCHED = 0x41313332,
 	APPLE_DCP_H17P_CALL_UP_SET_CREATE_DFB = 0x41333839,
-	APPLE_DCP_H17P_CALL_VI_SET_TEMPERATURE_HINT = 0x41333930,
+	APPLE_DCP_H17P_CALL_VI_SET_TEMPERATURE_HINT = 0x41333836,
 	APPLE_DCP_H17P_CALL_START_SIGNAL = 0x41343031,
 	APPLE_DCP_H17P_CALL_SWAP_START = 0x41343036,
 	APPLE_DCP_H17P_CALL_SWAP_SUBMIT = 0x41343037,
@@ -97,15 +175,15 @@ enum apple_dcp_h17p_call {
 	APPLE_DCP_H17P_CALL_IS_MAIN_DISPLAY = 0x41343132,
 	APPLE_DCP_H17P_CALL_SET_DIGITAL_OUT_MODE = 0x41343133,
 	APPLE_DCP_H17P_CALL_SET_MATRIX = 0x41343233,
-	APPLE_DCP_H17P_CALL_SET_PARAMETER = 0x41343439,
-	APPLE_DCP_H17P_CALL_CREATE_DEFAULT_FB = 0x41343533,
-	APPLE_DCP_H17P_CALL_VIDEO_POWER_SAVINGS = 0x41343537,
-	APPLE_DCP_H17P_CALL_FIRST_CLIENT_OPEN = 0x41343635,
-	APPLE_DCP_H17P_CALL_LAST_CLIENT_CLOSE = 0x41343636,
-	APPLE_DCP_H17P_CALL_DISPLAY_REFRESH = 0x41343734,
-	APPLE_DCP_H17P_CALL_FLUSH_SUPPORTS_POWER = 0x41343737,
-	APPLE_DCP_H17P_CALL_ABORT_SWAPS = 0x41343738,
-	APPLE_DCP_H17P_CALL_SET_POWER_STATE = 0x41343833,
+	APPLE_DCP_H17P_CALL_SET_PARAMETER = 0x41343432,
+	APPLE_DCP_H17P_CALL_CREATE_DEFAULT_FB = 0x41343436,
+	APPLE_DCP_H17P_CALL_VIDEO_POWER_SAVINGS = 0x41343530,
+	APPLE_DCP_H17P_CALL_FIRST_CLIENT_OPEN = 0x41343537,
+	APPLE_DCP_H17P_CALL_LAST_CLIENT_CLOSE = 0x41343538,
+	APPLE_DCP_H17P_CALL_DISPLAY_REFRESH = 0x41343635,
+	APPLE_DCP_H17P_CALL_FLUSH_SUPPORTS_POWER = 0x41343638,
+	APPLE_DCP_H17P_CALL_ABORT_SWAPS = 0x41343639,
+	APPLE_DCP_H17P_CALL_SET_POWER_STATE = 0x41343733,
 };
 
 struct apple_dcp_link_method {
@@ -197,6 +275,13 @@ apple_dcp_h17p_clock_rate(const struct apple_dcp_h17p_clock_request *request,
 	}
 }
 
+static inline void
+apple_dcp_h17p_service_match_output(__le32 *output, bool nested_complete)
+{
+	if (nested_complete)
+		*output = cpu_to_le32(1);
+}
+
 static inline int
 apple_dcp_h17p_callback_method(u32 call, struct apple_dcp_link_method *method)
 {
@@ -215,6 +300,7 @@ apple_dcp_h17p_callback_method(u32 call, struct apple_dcp_link_method *method)
 	case APPLE_DCP_H17P_CB_START_HARDWARE_BOOT:
 	case APPLE_DCP_H17P_CB_MATCH_PMU_2:
 	case APPLE_DCP_H17P_CB_MATCH_BACKLIGHT:
+	case APPLE_DCP_H17P_CB_CREATE_NVRAM:
 		found.output_size = 4;
 		break;
 	case APPLE_DCP_H17P_CB_RT_BANDWIDTH:
@@ -361,6 +447,8 @@ static inline int apple_dcp_h17p_method(u32 call,
 		found.output_size = 4;
 		break;
 	case APPLE_DCP_H17P_CALL_START_SIGNAL:
+	case APPLE_DCP_H17P_CALL_PMU_SERVICE_MATCHED:
+	case APPLE_DCP_H17P_CALL_BACKLIGHT_SERVICE_MATCHED:
 	case APPLE_DCP_H17P_CALL_VI_SET_TEMPERATURE_HINT:
 	case APPLE_DCP_H17P_CALL_IS_MAIN_DISPLAY:
 	case APPLE_DCP_H17P_CALL_CREATE_DEFAULT_FB:
@@ -415,6 +503,53 @@ apple_dcp_link_init_desc_encode(struct apple_dcp_link_init_desc *desc,
 	desc->version = cpu_to_le32(APPLE_DCP_LINK_PROTOCOL_VERSION);
 }
 
+static inline bool
+apple_dcp_link_init_desc_valid(const struct apple_dcp_link_init_desc *desc)
+{
+	u64 shared_dva;
+	u32 flags;
+
+	if (!desc)
+		return false;
+
+	shared_dva = le64_to_cpu(desc->shared_dva);
+	flags = le32_to_cpu(desc->flags);
+
+	if (le32_to_cpu(desc->version) != APPLE_DCP_LINK_PROTOCOL_VERSION)
+		return false;
+	if (!shared_dva)
+		return flags == 0;
+
+	return flags == APPLE_DCP_LINK_INIT_FLAG_64M &&
+	       !(shared_dva & (APPLE_DCP_LINK_RPC_PAGE_SIZE - 1)) &&
+	       !(shared_dva & ~GENMASK_ULL(47, 0));
+}
+
+static inline bool
+apple_dcp_link_init_desc_zero(const struct apple_dcp_link_init_desc *desc)
+{
+	return desc && !le64_to_cpu(desc->shared_dva) &&
+	       !le32_to_cpu(desc->flags) && !le32_to_cpu(desc->version);
+}
+
+static inline bool
+apple_dcp_link_stream_memory_idle(const void *memory, size_t size)
+{
+	const u8 *bytes = memory;
+	size_t offset;
+
+	if (!memory || size < APPLE_DCP_LINK_RPC_MEMORY_SIZE)
+		return false;
+
+	for (offset = sizeof(struct apple_dcp_link_init_desc);
+	     offset < APPLE_DCP_LINK_RPC_MEMORY_SIZE; offset++) {
+		if (bytes[offset])
+			return false;
+	}
+
+	return true;
+}
+
 static inline int apple_dcp_link_init_message(u64 rpc_dva, u64 *message)
 {
 	if (!message)
@@ -426,11 +561,49 @@ static inline int apple_dcp_link_init_message(u64 rpc_dva, u64 *message)
 	return 0;
 }
 
-static inline u64 apple_dcp_link_ready_message(void)
+static inline int apple_dcp_link_firmware_dva(u64 mapped_dva,
+					      u64 aperture_start,
+					      u64 aperture_end,
+					      u64 *firmware_dva)
 {
-	return FIELD_PREP(APPLE_DCP_LINK_MSG_VERSION,
-			  APPLE_DCP_LINK_PROTOCOL_VERSION) |
-	       APPLE_DCP_LINK_MSG_READY;
+	if (!firmware_dva || aperture_start > aperture_end)
+		return -EINVAL;
+
+	if (mapped_dva < aperture_start &&
+	    check_add_overflow(mapped_dva, aperture_start, &mapped_dva))
+		return -ERANGE;
+
+	if (mapped_dva < aperture_start || mapped_dva > aperture_end ||
+	    mapped_dva & ~GENMASK_ULL(47, 0))
+		return -ERANGE;
+
+	*firmware_dva = mapped_dva;
+	return 0;
+}
+
+static inline enum apple_dcp_link_handshake_action
+apple_dcp_link_handshake_step(enum apple_dcp_link_state *state, u64 message)
+{
+	u8 type;
+
+	if (!state)
+		return APPLE_DCP_LINK_HANDSHAKE_NONE;
+
+	type = message & GENMASK_ULL(1, 0);
+	switch (type) {
+	case APPLE_DCP_LINK_MSG_FIRMWARE_INIT:
+		if ((message & GENMASK_ULL(7, 6)) ||
+		    *state != APPLE_DCP_LINK_WAIT_FIRMWARE_INIT)
+			return APPLE_DCP_LINK_HANDSHAKE_NONE;
+		return APPLE_DCP_LINK_HANDSHAKE_SEND_INIT;
+	case APPLE_DCP_LINK_MSG_READY:
+		if (*state != APPLE_DCP_LINK_WAIT_READY)
+			return APPLE_DCP_LINK_HANDSHAKE_NONE;
+		*state = APPLE_DCP_LINK_READY;
+		return APPLE_DCP_LINK_HANDSHAKE_START_IOMFB;
+	default:
+		return APPLE_DCP_LINK_HANDSHAKE_NONE;
+	}
 }
 
 static inline int apple_dcp_link_ready_reply(u64 message, u16 *version,
@@ -477,7 +650,8 @@ static inline int apple_dcp_link_align_payload(u32 size, u32 alignment,
 	return 0;
 }
 
-static inline int apple_dcp_link_rpc_message(u32 offset, u32 size, bool nested,
+static inline int apple_dcp_link_rpc_message(u32 offset, u32 size,
+					     bool new_stream,
 					     u64 *message)
 {
 	if (!message)
@@ -488,8 +662,8 @@ static inline int apple_dcp_link_rpc_message(u32 offset, u32 size, bool nested,
 	*message = APPLE_DCP_LINK_MSG_RPC |
 		   FIELD_PREP(APPLE_DCP_LINK_MSG_OFFSET, offset) |
 		   FIELD_PREP(APPLE_DCP_LINK_MSG_SIZE, size);
-	if (nested)
-		*message |= APPLE_DCP_LINK_MSG_NESTED;
+	if (new_stream)
+		*message |= APPLE_DCP_LINK_MSG_NEW_STREAM;
 
 	return 0;
 }
@@ -509,6 +683,21 @@ static inline int apple_dcp_link_stream_message(u64 message, u8 stream,
 
 	*encoded = message;
 	return 0;
+}
+
+static inline int apple_dcp_link_ap_call_message(u32 offset, u32 size,
+						  u8 stream, bool remote,
+						  bool new_stream,
+						  u64 *message)
+{
+	u64 rpc;
+	int ret;
+
+	ret = apple_dcp_link_rpc_message(offset, size, new_stream, &rpc);
+	if (ret)
+		return ret;
+
+	return apple_dcp_link_stream_message(rpc, stream, remote, message);
 }
 
 static inline u8 apple_dcp_link_message_stream(u64 message)
