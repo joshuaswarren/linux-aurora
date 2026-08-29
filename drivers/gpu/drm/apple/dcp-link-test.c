@@ -18,6 +18,35 @@ static void apple_dcp_link_init_desc_test(struct kunit *test)
 			APPLE_DCP_LINK_PROTOCOL_VERSION);
 }
 
+static void apple_dcp_link_firmware_dva_test(struct kunit *test)
+{
+	const u64 aperture_start = 0x10000000000ULL;
+	const u64 aperture_end = 0x10fffffffffULL;
+	u64 firmware_dva = 0;
+	u64 message = 0;
+	int ret;
+
+	ret = apple_dcp_link_firmware_dva(0x1de0000, aperture_start,
+					  aperture_end, &firmware_dva);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	KUNIT_EXPECT_EQ(test, firmware_dva, 0x10001de0000ULL);
+	KUNIT_ASSERT_EQ(test,
+			apple_dcp_link_init_message(firmware_dva, &message), 0);
+	KUNIT_EXPECT_EQ(test, message, 0x10001de00000040ULL);
+
+	ret = apple_dcp_link_firmware_dva(0x10001de0000ULL, aperture_start,
+					  aperture_end, &firmware_dva);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	KUNIT_EXPECT_EQ(test, firmware_dva, 0x10001de0000ULL);
+
+	ret = apple_dcp_link_firmware_dva(0x1100000000ULL, aperture_start,
+					  aperture_end, &firmware_dva);
+	KUNIT_EXPECT_EQ(test, ret, -ERANGE);
+	ret = apple_dcp_link_firmware_dva(0, aperture_end, aperture_start,
+					  &firmware_dva);
+	KUNIT_EXPECT_EQ(test, ret, -EINVAL);
+}
+
 static void apple_dcp_link_inherited_memory_test(struct kunit *test)
 {
 	struct apple_dcp_link_init_desc *desc;
@@ -519,6 +548,7 @@ static void apple_dcp_h17p_rt_bw_reply_test(struct kunit *test)
 
 static struct kunit_case apple_dcp_link_test_cases[] = {
 	KUNIT_CASE(apple_dcp_link_init_desc_test),
+	KUNIT_CASE(apple_dcp_link_firmware_dva_test),
 	KUNIT_CASE(apple_dcp_link_inherited_memory_test),
 	KUNIT_CASE(apple_dcp_link_handoff_phase_test),
 	KUNIT_CASE(apple_dcp_link_adopt_decision_test),

@@ -550,6 +550,9 @@ static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 		u32 ready_hash;
 		u16 remote_version;
 		u64 offset;
+		u64 firmware_rpc_dva;
+		u64 aperture_start;
+		u64 aperture_end;
 		bool descriptor_zero;
 		bool descriptor_valid;
 		bool streams_idle;
@@ -583,6 +586,16 @@ static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 		if (!domain)
 			return dev_err_probe(dcp->dev, -ENODEV,
 					     "DCP IOMMU domain is unavailable\n");
+		if (!domain->geometry.force_aperture)
+			return dev_err_probe(dcp->dev, -EINVAL,
+					     "DCP IOMMU aperture is unavailable\n");
+		aperture_start = domain->geometry.aperture_start;
+		aperture_end = domain->geometry.aperture_end;
+		ret = apple_dcp_link_firmware_dva(rpc_dva, aperture_start,
+						  aperture_end, &firmware_rpc_dva);
+		if (ret)
+			return dev_err_probe(dcp->dev, ret,
+					     "DCPLink RPC DVA is outside the firmware aperture\n");
 
 		for (offset = 0; offset < rpc_size; offset += SZ_16K) {
 			translated = iommu_iova_to_phys(domain, rpc_dva + offset);
@@ -645,7 +658,7 @@ static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 				ret = -EALREADY;
 				goto err_unmap_inherited;
 			}
-			ret = apple_dcp_link_init_message(rpc_dva,
+			ret = apple_dcp_link_init_message(firmware_rpc_dva,
 							  &captured_message);
 			if (ret)
 				goto err_unmap_inherited;
@@ -661,8 +674,8 @@ static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 			}
 			dcp_link_sync_for_device();
 			dev_info(dcp->dev,
-				 "adopted unused DCPLink RPC mapping DVA %#llx PA %#llx; sending host INIT\n",
-				 rpc_dva, rpc_pa);
+				 "adopted unused DCPLink RPC mapping local DVA %#llx firmware DVA %#llx PA %#llx; sending host INIT\n",
+				 rpc_dva, firmware_rpc_dva, rpc_pa);
 			dcp_send_message(dcp, APPLE_DCP_LINK_ENDPOINT,
 					 captured_message);
 			return 0;
@@ -696,7 +709,8 @@ static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 			ret = -EINVAL;
 			goto err_unmap_inherited;
 		}
-		ret = apple_dcp_link_init_message(rpc_dva, &captured_message);
+		ret = apple_dcp_link_init_message(firmware_rpc_dva,
+						  &captured_message);
 		if (ret)
 			goto err_unmap_inherited;
 		dcp->link_state = APPLE_DCP_LINK_WAIT_READY;
@@ -704,7 +718,8 @@ static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 		dcp->link_firmware_hash = 0;
 		dcp_link_sync_for_device();
 		dev_info(dcp->dev,
-			 "adopted DCPLink firmware-init phase; sending inherited RPC INIT\n");
+			 "adopted DCPLink firmware-init phase local DVA %#llx firmware DVA %#llx; sending inherited RPC INIT\n",
+			 rpc_dva, firmware_rpc_dva);
 		dcp_send_message(dcp, APPLE_DCP_LINK_ENDPOINT, captured_message);
 		return 0;
 

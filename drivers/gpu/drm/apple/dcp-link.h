@@ -546,6 +546,26 @@ static inline int apple_dcp_link_init_message(u64 rpc_dva, u64 *message)
 	return 0;
 }
 
+static inline int apple_dcp_link_firmware_dva(u64 mapped_dva,
+					      u64 aperture_start,
+					      u64 aperture_end,
+					      u64 *firmware_dva)
+{
+	if (!firmware_dva || aperture_start > aperture_end)
+		return -EINVAL;
+
+	if (mapped_dva < aperture_start &&
+	    check_add_overflow(mapped_dva, aperture_start, &mapped_dva))
+		return -ERANGE;
+
+	if (mapped_dva < aperture_start || mapped_dva > aperture_end ||
+	    mapped_dva & ~GENMASK_ULL(47, 0))
+		return -ERANGE;
+
+	*firmware_dva = mapped_dva;
+	return 0;
+}
+
 static inline enum apple_dcp_link_handshake_action
 apple_dcp_link_handshake_step(enum apple_dcp_link_state *state, u64 message)
 {
