@@ -154,16 +154,34 @@ pub(crate) enum HandoffMode {
     AbsentStandinT8140,
 }
 
-fn initialize_borrowed_kernel_root_image(
-    cfg: UatConfig,
-    mode: HandoffMode,
-    root: &mut [u8],
-) -> bool {
-    if cfg != UatConfig::T8140 || mode != HandoffMode::AbsentStandinT8140 {
-        return false;
+const T8140_SECONDARY_SHARED_ROOT_DELTA: u64 = 0x40000;
+const T8140_FIRMWARE_PRIVATE_ROOT_ENTRIES: usize = 2;
+const T8140_FIRMWARE_SHARED_ROOT_ENTRIES: usize = 3;
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct T8140PrimaryRootSnapshot {
+    entries: [u64; T8140_FIRMWARE_SHARED_ROOT_ENTRIES],
+}
+
+fn clear_stale_host_root_entries(root: &mut [u64]) {
+    if root.len() > T8140_FIRMWARE_SHARED_ROOT_ENTRIES {
+        root[T8140_FIRMWARE_SHARED_ROOT_ENTRIES..].fill(0);
     }
-    root.fill(0);
-    true
+}
+
+fn mirror_host_root_entries(primary: &[u64], secondary: &mut [u64]) -> usize {
+    let mut mirrored = 0;
+    for (source, destination) in primary
+        .iter()
+        .zip(secondary.iter_mut())
+        .skip(T8140_FIRMWARE_PRIVATE_ROOT_ENTRIES)
+    {
+        if *source != 0 && *destination != *source {
+            *destination = *source;
+            mirrored += 1;
+        }
+    }
+    mirrored
 }
 
 /// Return the evidence-backed UAT root geometry for this SoC.
@@ -1091,6 +1109,7 @@ pub(crate) struct Uat {
 
     kernel_vm: Vm,
     kernel_lower_vm: Vm,
+    t8140_secondary_ttb1: Option<u64>,
     t8140_empty_high_roots: Option<[Vm; 2]>,
     t8140_context_phase: AtomicU8,
 }
@@ -1843,6 +1862,142 @@ impl Uat {
         iova_kern_range(self.cfg)
     }
 
+    /// Prepare the firmware-published T8140 upper roots for host mappings.
+    ///
+    /// G17P publishes three primary entries during RTKit boot: two private
+    /// code/data entries and the shared L2 entry used by the kernel VA window.
+    /// Host mappings must be added beneath that live entry, not beneath a root
+    /// image constructed before the processor starts.
+    pub(crate) fn prepare_t8140_firmware_high_roots(
+        &self,
+    ) -> Result<T8140PrimaryRootSnapshot> {
+        if self.cfg != UatConfig::T8140 {
+            return Err(EINVAL);
+        }
+        let primary_phys = self.kernel_vm.ttb();
+        let secondary_phys = self.t8140_secondary_ttb1.ok_or(EIO)?;
+        let primary = unsafe { Page::borrow_phys(&primary_phys) }.ok_or(EIO)?;
+        let secondary = unsafe { Page::borrow_phys(&secondary_phys) }.ok_or(EIO)?;
+        let mut primary_entries = [0u64; T8140_FIRMWARE_SHARED_ROOT_ENTRIES];
+        let mut secondary_entries = [0u64; T8140_FIRMWARE_SHARED_ROOT_ENTRIES];
+
+        primary.with_pointer_into_page(0, UAT_PGSZ, |pointer| {
+            let entries = unsafe {
+                core::slice::from_raw_parts_mut(
+                    pointer as *mut u64,
+                    UAT_PGSZ / core::mem::size_of::<u64>(),
+                )
+            };
+            primary_entries.copy_from_slice(&entries[..T8140_FIRMWARE_SHARED_ROOT_ENTRIES]);
+            clear_stale_host_root_entries(entries);
+            Ok(())
+        })?;
+        secondary.with_pointer_into_page(0, UAT_PGSZ, |pointer| {
+            let entries = unsafe {
+                core::slice::from_raw_parts(
+                    pointer as *const u64,
+                    UAT_PGSZ / core::mem::size_of::<u64>(),
+                )
+            };
+            secondary_entries.copy_from_slice(&entries[..T8140_FIRMWARE_SHARED_ROOT_ENTRIES]);
+            Ok(())
+        })?;
+        fence(Ordering::SeqCst);
+        mem::tlbi_all();
+        mem::sync();
+        dev_info!(
+            self.dev.as_ref(),
+            "MMU: GFX high root {:#x} entries [{:#x}, {:#x}, {:#x}]; GFX1 root {:#x} entries [{:#x}, {:#x}, {:#x}]\n",
+            primary_phys,
+            primary_entries[0],
+            primary_entries[1],
+            primary_entries[2],
+            secondary_phys,
+            secondary_entries[0],
+            secondary_entries[1],
+            secondary_entries[2]
+        );
+        Ok(T8140PrimaryRootSnapshot {
+            entries: primary_entries,
+        })
+    }
+
+    /// Confirm construction retained the three firmware-published entries.
+    pub(crate) fn confirm_t8140_primary_high_root(
+        &self,
+        snapshot: T8140PrimaryRootSnapshot,
+    ) -> Result {
+        if self.cfg != UatConfig::T8140 {
+            return Err(EINVAL);
+        }
+        let primary_phys = self.kernel_vm.ttb();
+        let primary = unsafe { Page::borrow_phys(&primary_phys) }.ok_or(EIO)?;
+        let mut current = [0u64; T8140_FIRMWARE_SHARED_ROOT_ENTRIES];
+        primary.with_pointer_into_page(0, UAT_PGSZ, |pointer| {
+            let entries = unsafe {
+                core::slice::from_raw_parts(
+                    pointer as *const u64,
+                    UAT_PGSZ / core::mem::size_of::<u64>(),
+                )
+            };
+            current.copy_from_slice(&entries[..T8140_FIRMWARE_SHARED_ROOT_ENTRIES]);
+            Ok(())
+        })?;
+        if current != snapshot.entries {
+            dev_err!(
+                self.dev.as_ref(),
+                "MMU: GFX high-root firmware entries changed during graph construction: before {:?}, after {:?}\n",
+                snapshot.entries,
+                current
+            );
+            return Err(EIO);
+        }
+        dev_info!(
+            self.dev.as_ref(),
+            "MMU: GFX high-root firmware entries preserved across graph construction\n"
+        );
+        Ok(())
+    }
+
+    /// Mirror host-visible upper-root entries into GFX1's private top table.
+    /// Entries 0 and 1 remain owned by that firmware instance.
+    pub(crate) fn mirror_t8140_secondary_high_root(&self) -> Result<usize> {
+        if self.cfg != UatConfig::T8140 {
+            return Err(EINVAL);
+        }
+        let primary_phys = self.kernel_vm.ttb();
+        let secondary_phys = self.t8140_secondary_ttb1.ok_or(EIO)?;
+        let primary = unsafe { Page::borrow_phys(&primary_phys) }.ok_or(EIO)?;
+        let secondary = unsafe { Page::borrow_phys(&secondary_phys) }.ok_or(EIO)?;
+        let mirrored = primary.with_pointer_into_page(0, UAT_PGSZ, |primary_pointer| {
+            secondary.with_pointer_into_page(0, UAT_PGSZ, |secondary_pointer| {
+                let primary_entries = unsafe {
+                    core::slice::from_raw_parts(
+                        primary_pointer as *const u64,
+                        UAT_PGSZ / core::mem::size_of::<u64>(),
+                    )
+                };
+                let secondary_entries = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        secondary_pointer as *mut u64,
+                        UAT_PGSZ / core::mem::size_of::<u64>(),
+                    )
+                };
+                Ok(mirror_host_root_entries(primary_entries, secondary_entries))
+            })
+        })?;
+        fence(Ordering::SeqCst);
+        mem::tlbi_all();
+        mem::sync();
+        dev_info!(
+            self.dev.as_ref(),
+            "MMU: mirrored {} host high-root entries into GFX1 at {:#x}\n",
+            mirrored,
+            secondary_phys
+        );
+        Ok(mirrored)
+    }
+
     /// Arm firmware-backed mapping teardown after the DRM device data slot
     /// contains its live DrmGpu owner. Legacy/Dekker UATs start armed.
     pub(crate) fn mark_firmware_cache_flush_ready(&self) {
@@ -2219,36 +2374,14 @@ impl Uat {
         let ttb1 = res.start();
         let ttb1size: usize = res.size().try_into()?;
 
-        if ttb1size < PAGETABLES_SIZE {
+        let required_pagetables_size = if cfg == UatConfig::T8140 {
+            T8140_SECONDARY_SHARED_ROOT_DELTA as usize + UAT_PGSZ
+        } else {
+            PAGETABLES_SIZE
+        };
+        if ttb1size < required_pagetables_size {
             dev_err!(dev.as_ref(), "MMU: Pagetables region is too small\n");
             return Err(ENOMEM);
-        }
-
-        if cfg == UatConfig::T8140 && handoff_mode == HandoffMode::AbsentStandinT8140 {
-            // SAFETY: `ttb1` is the complete bootloader-reserved root page,
-            // it has a valid struct page (also required by new_with_ttb), and
-            // neither GFX processor has started, so there is no concurrent
-            // page-table reader or writer.
-            let root = unsafe { Page::borrow_phys(&ttb1) }.ok_or(EIO)?;
-            root.with_pointer_into_page(0, UAT_PGSZ, |pointer| {
-                let bytes = unsafe {
-                    // SAFETY: with_pointer_into_page validated the complete
-                    // root-page extent for the lifetime of this closure.
-                    core::slice::from_raw_parts_mut(pointer, UAT_PGSZ)
-                };
-                if !initialize_borrowed_kernel_root_image(cfg, handoff_mode, bytes) {
-                    return Err(EIO);
-                }
-                Ok(())
-            })?;
-            fence(Ordering::SeqCst);
-            mem::tlbi_all();
-            mem::sync();
-            dev_info!(
-                dev.as_ref(),
-                "MMU: cleared T8140 absent-handoff kernel-high root at {:#x}\n",
-                ttb1
-            );
         }
 
         dev_info!(dev.as_ref(), "MMU: Creating kernel page tables\n");
@@ -2293,6 +2426,11 @@ impl Uat {
             cfg,
             kernel_vm,
             kernel_lower_vm,
+            t8140_secondary_ttb1: if cfg == UatConfig::T8140 {
+                Some(ttb1 + T8140_SECONDARY_SHARED_ROOT_DELTA)
+            } else {
+                None
+            },
             t8140_empty_high_roots,
             t8140_context_phase: AtomicU8::new(T8140_CONTEXT_BOOTSTRAP_SOURCE_HIGH),
             inner,
@@ -2378,34 +2516,16 @@ mod tests {
     }
 
     #[test]
-    fn borrowed_kernel_root_is_cleared_only_for_t8140_absent_handoff() {
-        const SENTINEL: u64 = 0x0000_08b0_0000_0008;
-        let mut absent_t8140 = SENTINEL.to_le_bytes().repeat(8);
-        assert!(initialize_borrowed_kernel_root_image(
-            UatConfig::T8140,
-            HandoffMode::AbsentStandinT8140,
-            &mut absent_t8140,
-        ));
-        assert!(absent_t8140.iter().all(|byte| *byte == 0));
+    fn g17p_root_lifecycle_preserves_firmware_entries_and_mirrors_host_entries() {
+        let mut primary = [0u64; 8];
+        primary[..5].copy_from_slice(&[0x101, 0x201, 0x303, 0x403, 0x503]);
+        clear_stale_host_root_entries(&mut primary);
+        assert_eq!(primary, [0x101, 0x201, 0x303, 0, 0, 0, 0, 0]);
 
-        let mut dekker_t8140 = SENTINEL.to_le_bytes().repeat(8);
-        assert!(!initialize_borrowed_kernel_root_image(
-            UatConfig::T8140,
-            HandoffMode::FirmwareDekker,
-            &mut dekker_t8140,
-        ));
-        assert_eq!(dekker_t8140, SENTINEL.to_le_bytes().repeat(8));
-
-        let mut absent_agx2 = SENTINEL.to_le_bytes().repeat(8);
-        assert!(!initialize_borrowed_kernel_root_image(
-            UatConfig {
-                chip_id: 0x8103,
-                ias: 39,
-                oas: 40,
-            },
-            HandoffMode::AbsentStandinT8140,
-            &mut absent_agx2,
-        ));
-        assert_eq!(absent_agx2, SENTINEL.to_le_bytes().repeat(8));
+        primary[3] = 0x433;
+        primary[5] = 0x533;
+        let mut secondary = [0x111, 0x211, 0x999, 0, 0, 0x888, 0, 0];
+        assert_eq!(mirror_host_root_entries(&primary, &mut secondary), 3);
+        assert_eq!(secondary, [0x111, 0x211, 0x303, 0x433, 0, 0x533, 0, 0]);
     }
 }

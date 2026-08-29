@@ -2232,6 +2232,10 @@ pub(crate) struct G17ResourceOwner {
 impl G17ResourceOwner {
     pub(crate) fn new(dev: &AsahiDevice) -> Result<Self> {
         let uat = KBox::new(mmu::Uat::new_t8140(dev, true)?, GFP_KERNEL)?;
+        Self::new_with_uat(dev, uat)
+    }
+
+    pub(crate) fn new_with_uat(dev: &AsahiDevice, uat: KBox<mmu::Uat>) -> Result<Self> {
         let address_space = G17UatOwner { uat };
         dev_info!(dev.as_ref(), "G17P resources: building firmware layout\n");
 
