@@ -851,8 +851,8 @@ impl G17PLiveRuntime {
                 binding,
                 command,
                 g17_manager::G17PComputeSubmissionContext {
-                    context_id: 3,
-                    dispatch_identity: 0x0200_026c_0300_028e,
+                    context_id: 2,
+                    dispatch_identity: 0x0100_01d7_0200_01dc,
                     execution_gate: 1,
                     timestamps: g17_uapi::ComputeTimestampAddresses {
                         start: timestamp_start,
@@ -868,11 +868,28 @@ impl G17PLiveRuntime {
                 },
             )
         };
-        if let Err(error) = submit_result {
-            return match g17_lifecycle::recover_persistent_runtime(self) {
-                Ok(()) => Err(error),
-                Err(recovery_error) => Err(recovery_error),
-            };
+        let doorbell = match submit_result {
+            Ok(doorbell) => doorbell,
+            Err(error) => {
+                return match g17_lifecycle::recover_persistent_runtime(self) {
+                    Ok(()) => Err(error),
+                    Err(recovery_error) => Err(recovery_error),
+                };
+            }
+        };
+        if let Some(doorbell) = doorbell {
+            dev_info!(
+                self.dev.as_ref(),
+                "G17P compute: CL_2 group published; ringing work channel 10\n"
+            );
+            if let Err(error) = Pin::new(self.gfx_rtkit.as_mut().ok_or(ENODEV)?)
+                .send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, doorbell)
+            {
+                return match g17_lifecycle::recover_persistent_runtime(self) {
+                    Ok(()) => Err(error),
+                    Err(recovery_error) => Err(recovery_error),
+                };
+            }
         }
 
         let completion = owned_timestamps.with_cpu_bytes(|raw| {

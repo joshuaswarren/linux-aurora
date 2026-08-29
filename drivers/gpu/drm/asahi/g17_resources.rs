@@ -122,6 +122,7 @@ pub(crate) struct G17PComputeUserVaLayout {
     pub(crate) preempt: u64,
     pub(crate) robustness: u64,
     pub(crate) operand_state: u64,
+    pub(crate) queue_context: u64,
 }
 
 impl G17PComputeUserVaLayout {
@@ -139,6 +140,10 @@ impl G17PComputeUserVaLayout {
             (
                 self.operand_state,
                 G17P_COMPUTE_OPERAND_STATE_SIZE as u64,
+            ),
+            (
+                self.queue_context,
+                g17_compute::COMPUTE_QUEUE_CONTEXT_EXTENT as u64,
             ),
         ]
         .into_iter()
@@ -961,6 +966,8 @@ pub(crate) struct G17PComputeDescriptorStorage {
     operand_state: MappedObject,
     support: MappedObject,
     queue_graph: MappedObject,
+    queue_context_low: MappedObject,
+    queue_context_high: MappedObject,
 }
 
 /// User-context aliases retained while one SKSM compute entry can still
@@ -972,6 +979,7 @@ pub(crate) struct G17PComputeUserMappings {
     preempt: mmu::KernelMapping,
     robustness: mmu::KernelMapping,
     operand_state: mmu::KernelMapping,
+    queue_context: mmu::KernelMapping,
 }
 
 #[cfg(not(test))]
@@ -982,6 +990,7 @@ impl G17PComputeUserMappings {
             preempt: self.preempt.iova(),
             robustness: self.robustness.iova(),
             operand_state: self.operand_state.iova(),
+            queue_context: self.queue_context.iova(),
         }
     }
 
@@ -1185,6 +1194,21 @@ impl G17PComputeDescriptorStorage {
                 .map(|_| ())
                 .map_err(|_| EINVAL)
         })?;
+        let queue_context_low = MappedObject::new_in_range(
+            dev,
+            uat.kernel_lower_vm(),
+            G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END,
+            g17_compute::COMPUTE_QUEUE_CONTEXT_EXTENT,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        let queue_context_high = MappedObject::new(
+            dev,
+            uat,
+            g17_compute::COMPUTE_QUEUE_CONTEXT_EXTENT,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
 
         Ok(Self {
             descriptors,
@@ -1194,6 +1218,8 @@ impl G17PComputeDescriptorStorage {
             operand_state,
             support,
             queue_graph,
+            queue_context_low,
+            queue_context_high,
         })
     }
 
@@ -1241,11 +1267,18 @@ impl G17PComputeDescriptorStorage {
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
+        let queue_context = self.queue_context_low.map_alias_in_range(
+            vm,
+            G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
         let mappings = G17PComputeUserMappings {
             descriptors,
             preempt,
             robustness,
             operand_state,
+            queue_context,
         };
         if !mappings.all_reachable_from(vm) {
             return Err(EFAULT);
@@ -1279,6 +1312,41 @@ impl G17PComputeDescriptorStorage {
 
     pub(crate) fn queue_record_gpu_va(&self) -> u64 {
         self.queue_graph.iova()
+    }
+
+    pub(crate) fn stage_initial_channel_group(
+        &mut self,
+        descriptor: u64,
+        context_low: u64,
+        shared_control: u64,
+        channel_control: u64,
+    ) -> Result<g17_compute::ComputeChannelGroupAddresses> {
+        let queue = self.queue_graph.iova();
+        let context_high = self.queue_context_high.iova();
+        let graph_vmap = self.queue_graph.object.vmap()?;
+        let context_vmap = self.queue_context_high.object.vmap()?;
+        let graph = unsafe {
+            // SAFETY: each retained VMap covers the complete object.
+            core::slice::from_raw_parts_mut(graph_vmap.as_mut_ptr(), self.queue_graph.logical_size)
+        };
+        let queue_context = unsafe {
+            // SAFETY: each retained VMap covers the complete object.
+            core::slice::from_raw_parts_mut(
+                context_vmap.as_mut_ptr(),
+                self.queue_context_high.logical_size,
+            )
+        };
+        g17_compute::build_initial_compute_channel_group(
+            queue,
+            descriptor,
+            context_low,
+            context_high,
+            shared_control,
+            channel_control,
+            graph,
+            queue_context,
+        )
+        .map_err(|_| EINVAL)
     }
 
     pub(crate) fn with_descriptor_mut<R>(
@@ -3002,6 +3070,83 @@ impl G17ResourceOwner {
         }
     }
 
+    /// Publish one prepared queue on the primary CL_2 work channel. The queue
+    /// item ring and write pointer are already visible when this is called;
+    /// the outer slot is therefore stored before the channel producer.
+    pub(crate) fn publish_compute_channel(
+        &mut self,
+        queue_gpu_va: u64,
+        queue_write_index: u32,
+    ) -> Result<g17_submission::PreparedG17PComputeChannelWork> {
+        let channels = g17_initdata::derive_channel_table(
+            InstanceRole::Primary,
+            self.handoff.primary.state_grid,
+            self.handoff.primary.instance.status_a,
+            self.handoff.primary.instance.main_config,
+            self.handoff.shared.hw_data_bundle,
+        );
+        let channel = channels[g17_submission::G17P_COMPUTE_CHANNEL_TABLE_INDEX as usize];
+        let state = g17_submission::G17PPartialOpeningOuterChannelState {
+            consumers: [
+                self.resources.primary_state.read_u32(channel.states[0])?,
+                self.resources.primary_state.read_u32(channel.states[1])?,
+            ],
+            producer: self.resources.primary_state.read_u32(
+                channel.states[g17_initdata::CHANNEL_STATE_PRODUCER],
+            )?,
+            queue_gpu_va,
+            queue_write_index,
+        };
+        let prepared =
+            g17_submission::prepare_g17p_compute_channel_work(state).map_err(|_| EINVAL)?;
+        let slot_gpu_va = channel
+            .ring
+            .checked_add(prepared.outer.slot_byte_offset as u64)
+            .ok_or(EINVAL)?;
+        let slot_offset: usize = slot_gpu_va
+            .checked_sub(self.resources.shared_cluster.iova())
+            .ok_or(EINVAL)?
+            .try_into()?;
+        let producer_gpu_va = channel.states[g17_initdata::CHANNEL_STATE_PRODUCER];
+        let producer_offset: usize = producer_gpu_va
+            .checked_sub(self.resources.primary_state.iova())
+            .ok_or(EINVAL)?
+            .try_into()?;
+        if slot_offset
+            .checked_add(prepared.outer.slot.len())
+            .ok_or(EINVAL)?
+            > self.resources.shared_cluster.logical_size
+            || producer_offset.checked_add(4).ok_or(EINVAL)?
+                > self.resources.primary_state.logical_size
+        {
+            return Err(EINVAL);
+        }
+
+        let ring_vmap = self.resources.shared_cluster.object.vmap()?;
+        let state_vmap = self.resources.primary_state.object.vmap()?;
+        let ring = unsafe {
+            // SAFETY: the retained VMap covers the complete shared cluster.
+            core::slice::from_raw_parts_mut(
+                ring_vmap.as_mut_ptr(),
+                self.resources.shared_cluster.logical_size,
+            )
+        };
+        let state = unsafe {
+            // SAFETY: the retained VMap covers the complete primary state.
+            core::slice::from_raw_parts_mut(
+                state_vmap.as_mut_ptr(),
+                self.resources.primary_state.logical_size,
+            )
+        };
+        ring[slot_offset..slot_offset + prepared.outer.slot.len()]
+            .copy_from_slice(&prepared.outer.slot);
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        state[producer_offset..producer_offset + 4]
+            .copy_from_slice(&prepared.outer.next_producer.to_le_bytes());
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        Ok(prepared)
+    }
+
     /// Present the measured five status-B fields at the runtime boundary just
     /// before the primary control-done message.
     pub(crate) fn apply_partial_opening_pre_control_status(&mut self) -> Result {
@@ -3316,6 +3461,7 @@ mod tests {
             preempt: 0x70_0080_0000,
             robustness: 0x70_0080_4000,
             operand_state: 0x70_0081_0000,
+            queue_context: 0x70_0084_0000,
         };
         let expected = [
             (layout.descriptors, G17P_COMPUTE_DESCRIPTOR_STORAGE_SIZE as u64),
@@ -3325,8 +3471,12 @@ mod tests {
                 layout.operand_state,
                 G17P_COMPUTE_OPERAND_STATE_SIZE as u64,
             ),
+            (
+                layout.queue_context,
+                g17_compute::COMPUTE_QUEUE_CONTEXT_EXTENT as u64,
+            ),
         ];
-        let mut seen = [false; 4];
+        let mut seen = [false; 5];
         assert!(layout.all_referenced_ranges_reachable(|address, size| {
             let index = expected
                 .iter()

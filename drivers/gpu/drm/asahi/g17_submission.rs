@@ -646,6 +646,11 @@ pub(crate) const G17P_PARTIAL_OPENING_OUTER_SLOT_SIZE: usize = 0x18;
 pub(crate) const G17P_PARTIAL_OPENING_OUTER_SLOT_COUNT: u32 = 0x100;
 pub(crate) const G17P_PARTIAL_OPENING_TILING_CHANNEL_TABLE_INDEX: u8 = 6;
 pub(crate) const G17P_PARTIAL_OPENING_FRAGMENT_CHANNEL_TABLE_INDEX: u8 = 7;
+pub(crate) const G17P_COMPUTE_CHANNEL_TABLE_INDEX: u8 = 8;
+pub(crate) const G17P_COMPUTE_CHANNEL_GRID_INDEX: u8 = 4;
+pub(crate) const G17P_COMPUTE_WORK_DOORBELL_CHANNEL: u8 = 0x0a;
+pub(crate) const G17P_COMPUTE_WORK_DOORBELL: u64 =
+    MSG_TX_DOORBELL | G17P_COMPUTE_WORK_DOORBELL_CHANNEL as u64;
 pub(crate) const G17P_COLD_OPENING_RECORD_POOL_A_SIZE: usize = 35 * 0x100;
 pub(crate) const G17P_COLD_OPENING_RECORD_POOL_B_SIZE: usize = 79 * 0x80;
 pub(crate) const G17P_COLD_OPENING_SHARED_OBJECT_SIZE: usize = 0x88;
@@ -795,6 +800,13 @@ pub(crate) struct PreparedG17PPartialOpeningWorkPair {
     pub(crate) fragment: G17PPartialOpeningOuterSlotPlan,
     pub(crate) tiling: G17PPartialOpeningOuterSlotPlan,
     pub(crate) paired_doorbell: u64,
+}
+
+/// One proven CL_2 outer-ring publication and its matching RTKit doorbell.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct PreparedG17PComputeChannelWork {
+    pub(crate) outer: G17PPartialOpeningOuterSlotPlan,
+    pub(crate) doorbell: u64,
 }
 
 /// Side-effect order measured at the successful first-partial boundary.
@@ -1426,6 +1438,21 @@ fn prepare_g17p_partial_opening_outer_slot(
         slot_byte_offset: state.producer * G17P_PARTIAL_OPENING_OUTER_SLOT_SIZE as u32,
         slot,
         next_producer,
+    })
+}
+
+pub(crate) fn prepare_g17p_compute_channel_work(
+    state: G17PPartialOpeningOuterChannelState,
+) -> Result<PreparedG17PComputeChannelWork, SubmissionError> {
+    let outer = prepare_g17p_partial_opening_outer_slot(
+        state,
+        G17P_COMPUTE_CHANNEL_TABLE_INDEX,
+        G17P_COMPUTE_CHANNEL_GRID_INDEX,
+        PipeType::Compute as u32,
+    )?;
+    Ok(PreparedG17PComputeChannelWork {
+        outer,
+        doorbell: G17P_COMPUTE_WORK_DOORBELL,
     })
 }
 

@@ -14,6 +14,16 @@ pub(crate) const COMPUTE_REGISTER_COUNT: usize = 40;
 pub(crate) const COMPUTE_REGISTER_CAPACITY: usize = 128;
 pub(crate) const COMPUTE_REGISTER_SIZE: usize = 0x0c;
 pub(crate) const COMPUTE_QUEUE_GRAPH_SIZE: usize = 0x8000;
+pub(crate) const COMPUTE_QUEUE_CONTEXT_SIZE: usize = 0x4000;
+pub(crate) const COMPUTE_QUEUE_CONTEXT_EXTENT: usize = 8 * COMPUTE_QUEUE_CONTEXT_SIZE;
+pub(crate) const COMPUTE_OPTIONAL_SIZE: usize = 0xc0;
+pub(crate) const COMPUTE_EVENT_SIZE: usize = 0x400;
+pub(crate) const COMPUTE_CHANNEL_WRITE_INDEX: u32 = 3;
+const COMPUTE_QUEUE_POINTERS: usize = 0x100;
+const COMPUTE_QUEUE_CONTEXT_ITEM: usize = 0x200;
+const COMPUTE_ITEM_RING: usize = 0x4000;
+const COMPUTE_OPTIONAL: usize = 0x5000;
+const COMPUTE_EVENT: usize = 0x5400;
 const _: () = assert!(COMPUTE_REGISTER_COUNT <= COMPUTE_REGISTER_CAPACITY);
 
 const COMPUTE_SELECTOR: u32 = 3;
@@ -105,6 +115,14 @@ pub(crate) struct ComputeQueueGraphAddresses {
     pub(crate) pointers: u64,
     pub(crate) job_list: u64,
     pub(crate) item_ring: u64,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct ComputeChannelGroupAddresses {
+    pub(crate) queue: u64,
+    pub(crate) optional: u64,
+    pub(crate) event: u64,
+    pub(crate) write_index: u32,
 }
 
 fn add(address: u64, offset: u64) -> Result<u64, ComputeBuildError> {
@@ -211,6 +229,98 @@ pub(crate) fn build_compute_queue_graph(
     put_u32(raw, 0x100 + 0x60, 0x500);
     put_u64(raw, 0x200 + 0x08, addresses.job_list);
     Ok(addresses)
+}
+
+/// Stage the first hardware-proven direct-compute group in a retained queue.
+///
+/// This is the CL_2 channel graph used by the output-positive m1n1 add3 test:
+/// selector-3 descriptor, selector-0x0f optional record, selector-0x0e event,
+/// followed by queue write index 3. The caller publishes the outer channel
+/// slot and its producer only after this function returns.
+pub(crate) fn build_initial_compute_channel_group(
+    base: u64,
+    descriptor: u64,
+    context_low: u64,
+    context_high: u64,
+    shared_control: u64,
+    channel_control: u64,
+    graph: &mut [u8],
+    queue_context: &mut [u8],
+) -> Result<ComputeChannelGroupAddresses, ComputeBuildError> {
+    if graph.len() < COMPUTE_QUEUE_GRAPH_SIZE
+        || queue_context.len() < COMPUTE_QUEUE_CONTEXT_SIZE
+    {
+        return Err(ComputeBuildError::BufferTooSmall);
+    }
+
+    let optional = add(base, COMPUTE_OPTIONAL as u64)?;
+    let event = add(base, COMPUTE_EVENT as u64)?;
+
+    // The initial channel queue has UUID 0x170. The retained SKSM fixture
+    // uses 0x1aa, so set this only when the proven channel path is staged.
+    put_u32(graph, 0x48, 0x170);
+    for (index, address) in [descriptor, optional, event].into_iter().enumerate() {
+        put_u64(graph, COMPUTE_ITEM_RING + index * 8, address);
+    }
+    put_u32(
+        graph,
+        COMPUTE_QUEUE_POINTERS + 0x40,
+        COMPUTE_CHANNEL_WRITE_INDEX,
+    );
+
+    let optional_raw = &mut graph[COMPUTE_OPTIONAL..COMPUTE_OPTIONAL + COMPUTE_OPTIONAL_SIZE];
+    optional_raw.fill(0);
+    put_u32(optional_raw, 0x00, 0x0f);
+    put_u64(optional_raw, 0x08, context_low);
+    put_u64(optional_raw, 0x10, context_high);
+    for (offset, value) in [
+        (0x18, 4u16),
+        (0x1a, 1),
+        (0x1e, 2),
+        (0x22, 2),
+        (0x32, 2),
+        (0x3e, 0x3f),
+        (0x46, 1),
+        (0x52, 1),
+        (0x56, 1),
+        (0x5a, 0x170),
+        (0x5e, 2),
+        (0x62, 1),
+        (0x66, 1),
+    ] {
+        put_u16(optional_raw, offset, value);
+    }
+    put_u64(optional_raw, 0x36, shared_control);
+    put_u64(optional_raw, 0x4a, channel_control);
+    optional_raw[0x76..0x86].fill(0xff);
+
+    let event_raw = &mut graph[COMPUTE_EVENT..COMPUTE_EVENT + COMPUTE_EVENT_SIZE];
+    event_raw.fill(0);
+    put_u32(event_raw, 0x00, 0x0e);
+    put_u32(event_raw, 0x04, 0x0001_0004);
+    put_u32(event_raw, 0x08, 0x0102);
+    put_u32(event_raw, 0x10, 0x0200);
+
+    queue_context[..COMPUTE_QUEUE_CONTEXT_SIZE].fill(0);
+    let context = &mut queue_context
+        [COMPUTE_QUEUE_CONTEXT_ITEM..COMPUTE_QUEUE_CONTEXT_ITEM + 0x200];
+    put_u64(context, 0x00, 0x1000_1000_0000_0004);
+    put_u64(context, 0x10, descriptor);
+    put_u64(context, 0x18, base);
+    put_u64(context, 0x20, 0xffff_0801_0000_0001);
+    put_u64(context, 0x28, 4u64 << 40);
+    put_u64(context, 0x130, 0);
+    put_u64(context, 0x138, 4);
+    put_u64(context, 0x150, 0x0001_1003_8001_a002);
+    put_u64(context, 0x158, 0x0000_2003_8001_a03b);
+    put_u64(context, 0x178, 0x003f_ffff_ffff_ffff);
+
+    Ok(ComputeChannelGroupAddresses {
+        queue: base,
+        optional,
+        event,
+        write_index: COMPUTE_CHANNEL_WRITE_INDEX,
+    })
 }
 
 fn encode_registers(raw: &mut [u8], offset: usize, registers: &[ComputeRegister]) {
@@ -514,5 +624,36 @@ mod tests {
         );
         assert_eq!(u32::from_le_bytes(raw[0x48..0x4c].try_into().unwrap()), 0x1aa);
         assert_eq!(fnv1a64(&raw), 0x3490_ef31_add0_ac88);
+    }
+
+    #[test]
+    fn initial_channel_group_matches_the_output_positive_add3_builder() {
+        let base = 0xffff_fc20_c100_0000;
+        let descriptor = 0xffff_fc20_c200_0000;
+        let mut graph = [0u8; COMPUTE_QUEUE_GRAPH_SIZE];
+        build_compute_queue_graph(base, 0xffff_fc20_c500_0000, &mut graph).unwrap();
+        let mut context = vec![0u8; COMPUTE_QUEUE_CONTEXT_EXTENT];
+        let addresses = build_initial_compute_channel_group(
+            base,
+            descriptor,
+            0x70_0040_0000,
+            0xffff_fc20_c300_0000,
+            0xffff_fc20_c400_0000,
+            0xffff_fc20_c500_0000,
+            &mut graph,
+            &mut context,
+        )
+        .unwrap();
+        assert_eq!(
+            addresses,
+            ComputeChannelGroupAddresses {
+                queue: base,
+                optional: base + 0x5000,
+                event: base + 0x5400,
+                write_index: 3,
+            }
+        );
+        assert_eq!(fnv1a64(&graph), 0x7eb0_0e86_2d6b_2c57);
+        assert_eq!(fnv1a64(&context), 0x5ba5_b355_8c90_0783);
     }
 }

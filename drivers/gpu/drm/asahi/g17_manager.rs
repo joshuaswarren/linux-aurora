@@ -914,6 +914,17 @@ impl G17PManagerConstruction {
             &prepared.entry,
         )?;
 
+        self.publish_compute_b2_once(queue)?;
+
+        fence(Ordering::SeqCst);
+        queue.producer = prepared.producer_after;
+        let timestamp = prepared.current_timestamp;
+        self.add_sksm_kicks(registers, queue, 1)?;
+        fence(Ordering::SeqCst);
+        Ok(timestamp)
+    }
+
+    fn publish_compute_b2_once(&mut self, queue: &mut G17PSksmQueue) -> Result {
         if queue.b2_activation == g17_submission::G17PClB2ActivationState::Pending {
             let channel_control_gpu_va = queue.storage.channel_control_gpu_va();
             queue.b2_activation =
@@ -929,13 +940,81 @@ impl G17PManagerConstruction {
                         .map_err(|_| EINVAL)
                     })?;
         }
+        Ok(())
+    }
 
+    fn submit_translated_add3_channel(
+        &mut self,
+        queue: &mut G17PSksmQueue,
+        binding: &G17PComputeUserBinding,
+        command: &g17_uapi::TranslatedComputeCommand,
+        context: G17PComputeSubmissionContext<'_>,
+        buffers: [u64; 3],
+    ) -> Result<u64> {
+        if queue.submission_ordinal != 0 {
+            return Err(EINVAL);
+        }
+
+        let descriptor_slot = 0;
+        let (descriptor_high, _) = queue.compute.descriptor_gpu_vas(descriptor_slot);
+        let descriptor_low = binding.mappings.descriptor_gpu_va(descriptor_slot);
+        queue.compute.write_g17p_add3_resource_table(buffers)?;
+
+        let user_layout = binding.mappings.layout();
+        let shared_control = queue.storage.shared_support_gpu_va();
+        let objects = g17_compute::ComputeDescriptorObjects {
+            scheduler_record: queue.compute.scheduler_record_gpu_va(),
+            descriptor_low_alias: descriptor_low,
+            dispatch_a: queue.compute.dispatch_a_gpu_va(),
+            dispatch_b: queue.compute.dispatch_b_gpu_va(),
+            status_a: queue.compute.status_a_gpu_va(),
+            status_b: queue.compute.status_b_gpu_va(),
+            shared_control,
+            zero_page: queue.compute.zero_page_gpu_va(),
+        };
+        queue.compute.with_descriptor_mut(descriptor_slot, |raw| {
+            g17_uapi::build_compute_descriptor(
+                command,
+                g17_uapi::ComputeInternalState {
+                    preempt_base: user_layout.preempt,
+                    dispatch_identity: context.dispatch_identity,
+                    context_id: context.context_id,
+                    work_ordinal: 0,
+                    robustness: user_layout.robustness,
+                    operand_state_base: user_layout.operand_state,
+                    execution_gate: context.execution_gate,
+                },
+                objects,
+                g17_compute::ComputeDescriptorMetadata {
+                    submit_sequence: 0,
+                    context_id: context.context_id,
+                    grid_index: g17_submission::G17P_COMPUTE_CHANNEL_GRID_INDEX as u32,
+                    work_ordinal: 0,
+                    queue_submission: 1,
+                    queue_ordinal: 0,
+                    submission_index: 1,
+                    support_control: 0xe0a0_0001,
+                    support_flags: 0,
+                },
+                context.timestamps,
+                raw,
+            )
+            .map_err(|_| EINVAL)
+        })?;
+
+        let group = queue.compute.stage_initial_channel_group(
+            descriptor_high,
+            user_layout.queue_context,
+            shared_control,
+            queue.storage.channel_control_gpu_va(),
+        )?;
+        self.publish_compute_b2_once(queue)?;
         fence(Ordering::SeqCst);
-        queue.producer = prepared.producer_after;
-        let timestamp = prepared.current_timestamp;
-        self.add_sksm_kicks(registers, queue, 1)?;
-        fence(Ordering::SeqCst);
-        Ok(timestamp)
+        let prepared = self
+            .resources
+            .publish_compute_channel(group.queue, group.write_index)?;
+        queue.submission_ordinal = 1;
+        Ok(prepared.doorbell)
     }
 
     /// Build and publish one complete userspace compute command.
@@ -950,12 +1029,18 @@ impl G17PManagerConstruction {
         binding: &G17PComputeUserBinding,
         command: &g17_uapi::TranslatedComputeCommand,
         context: G17PComputeSubmissionContext<'_>,
-    ) -> Result<u64> {
+    ) -> Result<Option<u64>> {
         if !queue.registered
             || queue.scratch != self.sksm_scratch()
             || queue.uat_owner != self.uat().ttb_base()
         {
             return Err(EINVAL);
+        }
+
+        if let Some(buffers) = command.g17p_add3_buffers {
+            return self
+                .submit_translated_add3_channel(queue, binding, command, context, buffers)
+                .map(Some);
         }
 
         let timestamp = g17_submission::decode_kick_timestamp(queue.producer.current_timestamp)
@@ -986,10 +1071,6 @@ impl G17PManagerConstruction {
             .map_err(|_| EINVAL)?;
         if prepared.entry_index != timestamp.stamp_index {
             return Err(EINVAL);
-        }
-
-        if let Some(buffers) = command.g17p_add3_buffers {
-            queue.compute.write_g17p_add3_resource_table(buffers)?;
         }
 
         let ordinal = queue.submission_ordinal;
@@ -1045,7 +1126,8 @@ impl G17PManagerConstruction {
         fence(Ordering::SeqCst);
         let timestamp = self.publish_compute_entry(registers, queue, prepared)?;
         queue.submission_ordinal = next_ordinal;
-        Ok(timestamp)
+        let _ = timestamp;
+        Ok(None)
     }
 
     /// Completion ingress for the descriptor-provided completed-kick count.
