@@ -634,6 +634,58 @@ fn map_fixed_object(
 
 #[cfg(not(test))]
 impl MappedObject {
+    fn new_wc_in_range(
+        dev: &AsahiDevice,
+        vm: &mmu::Vm,
+        range: Range<u64>,
+        size: usize,
+        alignment: u64,
+        prot: mmu::Prot,
+    ) -> Result<Self> {
+        let mut object = gem::new_kernel_object_wc(dev, size)?;
+        object.vmap()?.memset(0);
+        let mapping = object.map_into_range(vm, range, alignment, prot, true)?;
+        Ok(Self {
+            mapping,
+            object,
+            logical_size: size,
+        })
+    }
+
+    fn new_wc(
+        dev: &AsahiDevice,
+        uat: &mmu::Uat,
+        size: usize,
+        alignment: u64,
+        prot: mmu::Prot,
+    ) -> Result<Self> {
+        Self::new_wc_in_range(
+            dev,
+            uat.kernel_vm(),
+            uat.kernel_va_range()?,
+            size,
+            alignment,
+            prot,
+        )
+    }
+
+    fn new_wc_at(
+        dev: &AsahiDevice,
+        vm: &mmu::Vm,
+        address: u64,
+        size: usize,
+        prot: mmu::Prot,
+    ) -> Result<Self> {
+        let mut object = gem::new_kernel_object_wc(dev, size)?;
+        object.vmap()?.memset(0);
+        let mapping = object.map_at(vm, address, prot, false)?;
+        Ok(Self {
+            mapping,
+            object,
+            logical_size: size,
+        })
+    }
+
     fn new_in_range(
         dev: &AsahiDevice,
         vm: &mmu::Vm,
@@ -1129,7 +1181,11 @@ impl G17PComputeDescriptorStorage {
         uat: &mmu::Uat,
         channel_control_gpu_va: u64,
     ) -> Result<Self> {
-        let mut descriptors = MappedObject::new_in_range(
+        // These are the descriptor, queue, and support ranges cleaned by the
+        // hardware-proven m1n1 producer before it publishes CL2. Linux writes
+        // them through a persistent CPU alias, so use WC aliases rather than
+        // leaving dirty write-back lines behind the subsequent dmb ish.
+        let mut descriptors = MappedObject::new_wc_in_range(
             dev,
             uat.kernel_lower_vm(),
             G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END,
@@ -1143,21 +1199,21 @@ impl G17PComputeDescriptorStorage {
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
-        let preempt = MappedObject::new(
+        let preempt = MappedObject::new_wc(
             dev,
             uat,
             G17P_COMPUTE_PREEMPT_SIZE,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
-        let robustness = MappedObject::new(
+        let robustness = MappedObject::new_wc(
             dev,
             uat,
             mmu::UAT_PGSZ,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
-        let operand_state = MappedObject::new_in_range(
+        let operand_state = MappedObject::new_wc_in_range(
             dev,
             uat.kernel_lower_vm(),
             G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END,
@@ -1165,7 +1221,7 @@ impl G17PComputeDescriptorStorage {
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
-        let mut support = MappedObject::new(
+        let mut support = MappedObject::new_wc(
             dev,
             uat,
             G17P_COMPUTE_SUPPORT_SIZE,
@@ -1181,7 +1237,7 @@ impl G17PComputeDescriptorStorage {
             raw[mmu::UAT_PGSZ + 4..mmu::UAT_PGSZ + 8].copy_from_slice(&1u32.to_le_bytes());
             Ok(())
         })?;
-        let mut queue_graph = MappedObject::new(
+        let mut queue_graph = MappedObject::new_wc(
             dev,
             uat,
             G17P_COMPUTE_QUEUE_GRAPH_SIZE,
@@ -2114,7 +2170,11 @@ impl G17PUserRenderStorage {
 #[cfg(not(test))]
 impl G17PClRuntimeStorage {
     pub(crate) fn new(dev: &AsahiDevice, uat: &mmu::Uat) -> Result<Self> {
-        let entries = MappedObject::new_in_range(
+        // AGXKSMKickQueue publishes this array through an uncached channel
+        // allocation, followed by dmb ish and the addKicks MMIO pair. Keep the
+        // CPU alias WC so that the freshly encoded entry is at the point of
+        // coherency when the hardware consumes the doorbell.
+        let entries = MappedObject::new_wc_in_range(
             dev,
             uat.kernel_lower_vm(),
             G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END,
@@ -2122,35 +2182,35 @@ impl G17PClRuntimeStorage {
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
-        let shared_support = MappedObject::new(
+        let shared_support = MappedObject::new_wc(
             dev,
             uat,
             G17P_CL_SHARED_SUPPORT_SIZE,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
-        let channel_control = MappedObject::new(
+        let channel_control = MappedObject::new_wc(
             dev,
             uat,
             G17P_CL_CHANNEL_CONTROL_SIZE,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
-        let support_state = MappedObject::new(
+        let support_state = MappedObject::new_wc(
             dev,
             uat,
             G17P_CL_SUPPORT_STATE_SIZE,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
-        let scheduler_state = MappedObject::new(
+        let scheduler_state = MappedObject::new_wc(
             dev,
             uat,
             G17P_CL_SUPPORT_STATE_SIZE,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
-        let operand_table = MappedObject::new(
+        let operand_table = MappedObject::new_wc(
             dev,
             uat,
             G17P_CL_OPERAND_TABLE_SIZE,
@@ -2314,7 +2374,7 @@ impl G17ResourceOwner {
         let fwctl_gpu_va = kernel_va_base
             .checked_add(g17_submission::G17P_PARTIAL_OPENING_FWCTL_OFFSET)
             .ok_or(EINVAL)?;
-        let mut partial_scheduler = MappedObject::new_at(
+        let mut partial_scheduler = MappedObject::new_wc_at(
             dev,
             address_space.uat.kernel_vm(),
             g17_submission::G17P_PARTIAL_OPENING_SCHEDULER_GPU_VA,
@@ -2333,7 +2393,7 @@ impl G17ResourceOwner {
             "G17P resources: mapping B2 alias at {:#x}\n",
             primary_b2_alias_1_gpu_va
         );
-        let mut primary_b2_alias_1 = match MappedObject::new_at(
+        let mut primary_b2_alias_1 = match MappedObject::new_wc_at(
             dev,
             address_space.uat.kernel_vm(),
             primary_b2_alias_1_gpu_va,
@@ -2503,7 +2563,10 @@ impl G17ResourceOwner {
                 return Err(error);
             }
         };
-        let mut shared_cluster = match MappedObject::new(
+        // The classic CL producer appends its outer slot in this bundle and
+        // advances the paired channel producer in primary_state. Both are
+        // live host-to-firmware publication surfaces, not boot-only blobs.
+        let mut shared_cluster = match MappedObject::new_wc(
             dev,
             &address_space.uat,
             g17_initdata::NATIVE_SHARED_CLUSTER_SIZE,
@@ -2523,10 +2586,9 @@ impl G17ResourceOwner {
         // The native bundle has three out-of-line pages at fixed offsets from
         // its base. Claim them before placing the remaining dynamic objects,
         // otherwise a large state object can occupy one of these addresses.
-        let primary_b2_sentinel = map_fixed_object(
+        let primary_b2_sentinel = MappedObject::new_wc_at(
             dev,
             address_space.uat.kernel_vm(),
-            "primary-B2 sentinel",
             shared_cluster.iova() + 0x40000,
             G17P_CL_B2_OBJECT_SIZE,
             mmu::PROT_GPU_FW_SHARED_RW,
@@ -2561,7 +2623,7 @@ impl G17ResourceOwner {
             mmu::UAT_PGSZ as u64,
             mmu::PROT_FW_SHARED_RW,
         )?;
-        let mut primary_state = MappedObject::new(
+        let mut primary_state = MappedObject::new_wc(
             dev,
             &address_space.uat,
             PRIMARY_STATE_ALLOC_SIZE,
