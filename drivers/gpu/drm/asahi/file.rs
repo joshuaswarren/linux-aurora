@@ -427,10 +427,10 @@ impl File {
             gpu_revision: facts.gpu_revision,
             chip_id: facts.chip_id,
 
-            num_dies: facts.num_dies,
-            num_clusters_total: facts.num_clusters_total,
-            num_cores_per_cluster: facts.num_cores_per_cluster,
-            core_masks: facts.core_masks.map(|mask| mask.into()),
+            num_dies: gpu.get_dyncfg().id.num_dies,
+            num_clusters_total: gpu.get_dyncfg().id.num_clusters,
+            num_cores_per_cluster: gpu.get_dyncfg().id.num_cores,
+            core_masks: [0; uapi::DRM_ASAHI_MAX_CLUSTERS as usize],
 
             vm_start: gpu.user_range()?.start,
             vm_end: gpu.user_range()?.end,
@@ -442,8 +442,8 @@ impl File {
 
             command_timestamp_frequency_hz: 1_000_000_000, // User timestamps always in nanoseconds
 
-            usc_generation: facts.usc_generation,
-            gpu_hal_generation: facts.gpu_hal_generation,
+            usc_generation: gpu.get_dyncfg().id.usc_generation,
+            gpu_hal_generation: gpu.get_dyncfg().id.gpu_hal_generation as u32,
         };
 
         if gpu.supports_vm_status() {

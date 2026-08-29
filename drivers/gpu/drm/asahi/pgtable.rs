@@ -327,27 +327,6 @@ impl UatPageTable {
         })
     }
 
-    /// Resolve one mapped IOVA through this page table without touching the
-    /// mapped memory. This is used to prove that separately named aliases
-    /// refer to the same backing page before firmware can consume them.
-    pub(crate) fn translate_iova(&mut self, iova: u64) -> Result<PhysicalAddr> {
-        let page_mask = UAT_PGMSK as u64;
-        let page = iova & !page_mask;
-        let end = page.checked_add(UAT_PGSZ as u64).ok_or(EOVERFLOW)?;
-        let offset = iova & page_mask;
-        let oas_mask = self.oas_mask;
-        let mut translated = None;
-        self.with_pages(page..end, false, false, |_, ptes| {
-            let pte = ptes.first().ok_or(EFAULT)?.load(Ordering::Acquire);
-            if pte & PTE_TYPE_BITS != PTE_TYPE_LEAF_TABLE {
-                return Err(EFAULT);
-            }
-            translated = Some((pte & oas_mask & !page_mask).checked_add(offset).ok_or(EOVERFLOW)?);
-            Ok(())
-        })?;
-        translated.ok_or(EFAULT)
-    }
-
     pub(crate) fn new_with_ttb(
         ttb: PhysicalAddr,
         va_range: Range<u64>,

@@ -7,7 +7,7 @@
 //! the few operations that require that, mainly reading the MMU fault status, reading GPU ID
 //! information, and starting the GPU firmware coprocessor.
 
-use crate::{g17_submission, hw, identity, module_parameters};
+use crate::{hw, identity};
 use kernel::{
     c_str,
     device::Core,
@@ -169,9 +169,11 @@ const CORE_MASKS_G14X: usize = 0xe01500;
 // @ 0xfffffe0008af1f64). The fault address register holds VA >> 6.
 const FAULT_INFO_G14X: usize = 0xd8c0;
 const FAULT_ADDR_G14X: usize = 0xd8c8;
-/// 64-bit requestor selector for the G14X+ fault-info/address window.
-/// Acknowledge is a separate store of 1 to 0xd8e8.
-const FAULT_REQUESTOR_G14X: usize = 0xd800;
+/// Fault acknowledge/clear register (write-only). Recovered from the same
+/// helpers as the fault registers above; the ack value encoding is not yet
+/// modelled, so the driver does not write it.
+#[allow(dead_code)]
+const FAULT_ACK_G14X: usize = 0xd800;
 
 /// Enum representing the unit that caused an MMU fault.
 #[allow(non_camel_case_types)]
@@ -2343,38 +2345,6 @@ impl Resources {
                 ENODEV
             })?;
 
-        // This is intentionally sampled only in the existing GPU-ID probe
-        // window. Those ID/core-mask reads already require the SGX control
-        // aperture to be safely accessible; reading this register later from
-        // render submission would race GPU core power-gating and can raise an
-        // asynchronous SError on G17P. Cache the decoded nibble in GpuIdConfig
-        // and carry it through ordinary host memory from here on.
-        let (gpc_perf_state_map, gpc_perf_state_map_low, gpc_perf_state_control) = if identity
-            .gpu_gen
-            == hw::GpuGen::G17
-            && identity.gpu_variant == identity::GpuVariant::P
-        {
-            let sgx = self.sgx.try_access().ok_or(ENODEV)?;
-            let registers = sgx.relaxed();
-            let control_raw = registers.try_read32(T8140_GPC_PERF_STATE_CONTROL)?;
-            let map_raw = registers.try_read32(T8140_GPC_PERF_STATE_MAP)?;
-            let map = t8140_gpc_perf_state_map(map_raw);
-            let map_low = t8140_gpc_perf_state_map_low(map_raw);
-            let control = t8140_gpc_perf_state_control(control_raw);
-            dev_info!(
-                self.dev.as_ref(),
-                "G17P GPC performance-state map: control_raw={:#010x} map_raw={:#010x} control={} low={:#x} high={:#x}\n",
-                control_raw,
-                map_raw,
-                control,
-                map_low,
-                map,
-            );
-            (map, map_low, control)
-        } else {
-            (0, 0, 0)
-        };
-
         let mut core_mask_regs = KVec::new();
 
         let num_clusters = match family {
@@ -2514,12 +2484,8 @@ impl Resources {
         // The G14X fault-register bank and fault-word decode carry unchanged
         // to every AGX3 part (see the FAULT_INFO_G14X provenance comment).
         // `gpu_core` is a firmware-ABI value that only exists for the AGX2
-        // targets (None on AGX3), so AGX3 membership is keyed off the design
-        // generation.
-        let g14x = cfg
-            .gpu_core
-            .map(|core| core as u32 >= hw::GpuCore::G14S as u32)
-            .unwrap_or(false)
+        // targets, so AGX3 membership is keyed off the design generation.
+        let g14x = cfg.gpu_core as u32 >= hw::GpuCore::G14S as u32
             || cfg.gpu_gen as u32 >= hw::GpuGen::G15 as u32;
 
         let fault_info = if g14x {
