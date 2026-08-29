@@ -103,6 +103,30 @@ static bool trampoline_get_frequency_h17p(struct apple_dcp *dcp, int tag,
 	return true;
 }
 
+static struct dcp_get_uint_prop_resp
+dcpep_cb_get_uint_prop_h17p(struct apple_dcp *dcp, struct dcp_get_uint_prop_req *request)
+{
+	struct dcp_get_uint_prop_resp reply;
+
+	if (memcmp(request->obj, "SUMP", sizeof(request->obj)) ||
+	    strncmp(request->key, "Temperature", sizeof(request->key)))
+		return dcpep_cb_get_uint_prop(dcp, request);
+
+	reply = (struct dcp_get_uint_prop_resp) {
+		.value = 3029,
+		.ret = true,
+	};
+	dev_info(dcp->dev,
+		 "DCP25G83_SUMP_TEMPERATURE_REPLY value %llu ret %u\n",
+		 reply.value, reply.ret);
+
+	return reply;
+}
+
+TRAMPOLINE_INOUT(trampoline_get_uint_prop_h17p,
+		 dcpep_cb_get_uint_prop_h17p,
+		 struct dcp_get_uint_prop_req, struct dcp_get_uint_prop_resp);
+
 static bool trampoline_hotplug_h17p(struct apple_dcp *dcp, int tag,
 				    void *out, void *in)
 {
@@ -194,7 +218,7 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[208] = trampoline_nop, /* update_backlight_factor_prop */
 	[209] = trampoline_get_time,
 	[300] = trampoline_pr_publish,
-	[401] = trampoline_get_uint_prop,
+	[401] = trampoline_get_uint_prop_h17p,
 	[404] = trampoline_nop, /* set_uint_prop */
 	[406] = trampoline_set_fx_prop,
 	[408] = trampoline_get_frequency_h17p,
@@ -230,6 +254,7 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 void iomfb_start_h17p(struct apple_dcp *dcp)
 {
 	dcp->cb_handlers = cb_handlers;
+	dev_info(dcp->dev, "DCP25G83_SUMP_TEMPERATURE_3029 armed\n");
 	dcp_start_signal(dcp, false, dcp_started, NULL);
 }
 
