@@ -67,6 +67,21 @@
 #define APPLE_T8140_MBOX_A2I_SEND0 0x800
 #define APPLE_T8140_MBOX_A2I_SEND1 0x808
 
+#define DCP_RTKIT_FOURCC(a, b, c, d) \
+	(((u32)(a) << 24) | ((u32)(b) << 16) | ((u32)(c) << 8) | (u32)(d))
+#define DCP_RTKIT_CRASHLOG_HEADER DCP_RTKIT_FOURCC('C', 'L', 'H', 'E')
+#define DCP_RTKIT_CRASHLOG_STR DCP_RTKIT_FOURCC('C', 's', 't', 'r')
+#define DCP_RTKIT_CRASHLOG_VERSION DCP_RTKIT_FOURCC('C', 'v', 'e', 'r')
+
+struct dcp_rtkit_crashlog_header {
+	__le32 fourcc;
+	__le32 version;
+	__le32 size;
+	__le32 flags;
+	u8 reserved[16];
+};
+static_assert(sizeof(struct dcp_rtkit_crashlog_header) == 0x20);
+
 static bool show_notch;
 module_param(show_notch, bool, 0644);
 MODULE_PARM_DESC(show_notch, "Use the full display height and shows the notch");
@@ -467,6 +482,7 @@ static int dcp_rtk_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
 			 "RTKit preallocated %s GETBUF %#llx size %#zx DVA %pad PA %pa iomem %p; Normal-NC firmware mapping, no address reply required\n",
 			 owner, request, bfr->size, &bfr->iova, &phy_addr,
 			 bfr->iomem);
+		dcp_rtk_report_adopted_crashlog(dcp, bfr);
 	} else {
 		bfr->buffer = dma_alloc_coherent(dcp->dev, bfr->size,
 						 &bfr->iova, GFP_KERNEL);
