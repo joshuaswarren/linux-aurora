@@ -783,10 +783,12 @@ static void dcp_link_handle_callback(struct apple_dcp *dcp, u64 message)
 	if (!dcp->cb_handlers || !dcp->cb_handlers[tag]) {
 		if (log_callback)
 			dev_info(dcp->dev,
-				 "DCPLink callback %u RX %#llx D%03d base %#x offset %#x size %#x in/out %u/%u handler none ack %#llx\n",
+				 "DCPLink callback %u RX %#llx D%03d base %#x offset %#x size %#x in/out %u/%u input %*phN handler none ack %#llx\n",
 				 sequence, message, tag, layout.remote_offset,
 				 view.offset, view.total_size, view.input_size,
-				 view.output_size, reply);
+				 view.output_size,
+				 (int)min_t(u32, view.input_size, 72), view.input,
+				 reply);
 		dev_warn(dcp->dev, "DCPLink callback D%03d has no handler\n", tag);
 		dcp_link_ack(dcp, DCP_CONTEXT_CB);
 		return;
@@ -797,18 +799,22 @@ static void dcp_link_handle_callback(struct apple_dcp *dcp, u64 message)
 	if (log_callback) {
 		if (view.output_size)
 			dev_info(dcp->dev,
-				 "DCPLink callback %u RX %#llx D%03d base %#x offset %#x size %#x in/out %u/%u handler %ps result %u out %*phN ack %#llx\n",
+				 "DCPLink callback %u RX %#llx D%03d base %#x offset %#x size %#x in/out %u/%u input %*phN handler %ps result %u out %*phN ack %#llx\n",
 				 sequence, message, tag, layout.remote_offset,
 				 view.offset, view.total_size, view.input_size,
-				 view.output_size, handler, handled,
+				 view.output_size,
+				 (int)min_t(u32, view.input_size, 72), view.input,
+				 handler, handled,
 				 min_t(u32, view.output_size, 8), view.output,
 				 handled ? reply : 0);
 		else
 			dev_info(dcp->dev,
-				 "DCPLink callback %u RX %#llx D%03d base %#x offset %#x size %#x in/out %u/%u handler %ps result %u out - ack %#llx\n",
+				 "DCPLink callback %u RX %#llx D%03d base %#x offset %#x size %#x in/out %u/%u input %*phN handler %ps result %u out - ack %#llx\n",
 				 sequence, message, tag, layout.remote_offset,
 				 view.offset, view.total_size, view.input_size,
-				 view.output_size, handler, handled,
+				 view.output_size,
+				 (int)min_t(u32, view.input_size, 72), view.input,
+				 handler, handled,
 				 handled ? reply : 0);
 	}
 	if (handled)
