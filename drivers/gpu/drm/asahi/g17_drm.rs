@@ -28,10 +28,42 @@ const T8140_TIMESTAMP_ALIAS_RANGE: Range<u64> = 0x70_0000_0000..0x71_0000_0000;
 
 pub(crate) type SharedG17PRuntime = Arc<Mutex<g17_live_boot::G17PLiveRuntime>>;
 
+/// Non-owning handle to the platform-owned G17P runtime.
+///
+/// The platform driver keeps the sole strong reference. DRM registration is
+/// removed before that platform state is released, so adapter and queue
+/// callbacks cannot outlive this pointer.
+#[derive(Clone, Copy)]
+pub(crate) struct G17PRuntimeRef {
+    ptr: *const Mutex<g17_live_boot::G17PLiveRuntime>,
+}
+
+// SAFETY: the referenced mutex is shared by the platform-owned Arc, and all
+// access is serialized through that mutex.
+unsafe impl Send for G17PRuntimeRef {}
+// SAFETY: see the Send implementation above.
+unsafe impl Sync for G17PRuntimeRef {}
+
+impl G17PRuntimeRef {
+    pub(crate) fn new(runtime: &SharedG17PRuntime) -> Self {
+        Self {
+            ptr: Arc::as_ptr(runtime),
+        }
+    }
+
+    fn mutex(&self) -> &Mutex<g17_live_boot::G17PLiveRuntime> {
+        // SAFETY: AsahiDriver owns the runtime Arc for the complete registered
+        // DRM lifetime. DRM teardown prevents new callbacks before dropping
+        // that platform-owned Arc.
+        unsafe { &*self.ptr }
+    }
+}
+
+const _: () = assert!(!core::mem::needs_drop::<G17PRuntimeRef>());
+
 /// DRM-visible T8140 manager. Hardware lifetime stays in the retained runtime.
 pub(crate) struct G17PDrmGpu {
-    dev: AsahiDevRef,
-    runtime: SharedG17PRuntime,
+    runtime: G17PRuntimeRef,
     soc: &'static hw::agx3::SocConfig,
     observed: hw::GpuIdConfig,
     ids: gpu::SequenceIDs,
@@ -39,13 +71,11 @@ pub(crate) struct G17PDrmGpu {
 
 impl G17PDrmGpu {
     pub(crate) fn new(
-        dev: &AsahiDevice,
-        runtime: SharedG17PRuntime,
+        runtime: G17PRuntimeRef,
         soc: &'static hw::agx3::SocConfig,
         observed: hw::GpuIdConfig,
     ) -> Self {
         Self {
-            dev: dev.into(),
             runtime,
             soc,
             observed,
@@ -64,7 +94,7 @@ impl DrmGpu for G17PDrmGpu {
     }
 
     fn is_crashed(&self) -> bool {
-        self.runtime.lock().is_crashed()
+        self.runtime.mutex().lock().is_crashed()
     }
 
     fn update_globals(&self) {}
@@ -107,6 +137,7 @@ impl DrmGpu for G17PDrmGpu {
 
     fn new_vm(&self, kernel_range: Range<u64>) -> Result<mmu::Vm> {
         self.runtime
+            .mutex()
             .lock()
             .new_user_vm(self.ids.vm.next(), kernel_range)
     }
@@ -119,10 +150,11 @@ impl DrmGpu for G17PDrmGpu {
         priority: u32,
         usc_exec_base: u64,
     ) -> Result<KBox<dyn queue::Queue>> {
+        let dev = self.runtime.mutex().lock().drm_ref()?;
         Ok(KBox::new(
             G17PQueue::new(
-                &self.dev,
-                self.runtime.clone(),
+                &dev,
+                self.runtime,
                 vm,
                 self.ids.queue.next(),
                 priority,
@@ -137,7 +169,10 @@ impl DrmGpu for G17PDrmGpu {
         bo: gem::ObjectRef,
         range: Range<usize>,
     ) -> Result<mmu::KernelMapping> {
-        self.runtime.lock().map_timestamp_buffer(bo, range)
+        self.runtime
+            .mutex()
+            .lock()
+            .map_timestamp_buffer(bo, range)
     }
 }
 
@@ -183,7 +218,7 @@ static QUEUE_CLASS_KEY: core::pin::Pin<&'static kernel::sync::LockClassKey> = st
 /// One userspace queue bound to the retained G17P runtime.
 struct G17PQueue {
     dev: AsahiDevRef,
-    runtime: SharedG17PRuntime,
+    runtime: G17PRuntimeRef,
     vm: mmu::Vm,
     user_range: Range<u64>,
     usc_exec_base: u64,
@@ -204,7 +239,7 @@ struct TimestampDestination {
 impl G17PQueue {
     fn new(
         dev: &AsahiDevice,
-        runtime: SharedG17PRuntime,
+        runtime: G17PRuntimeRef,
         vm: mmu::Vm,
         id: u64,
         priority: u32,
@@ -449,7 +484,7 @@ impl queue::Queue for G17PQueue {
                         &mut timestamp_aliases,
                     )?,
                 ];
-                self.runtime.lock().submit_translated_render(
+                self.runtime.mutex().lock().submit_translated_render(
                     &self.vm,
                     &translated,
                     timestamps,
@@ -462,6 +497,7 @@ impl queue::Queue for G17PQueue {
                 let owned_timestamps = self.owned_compute_timestamps()?;
                 let completion = self
                     .runtime
+                    .mutex()
                     .lock()
                     .submit_translated_compute(&self.vm, &translated, owned_timestamps)?;
                 Self::copy_timestamp(start, completion[0])?;

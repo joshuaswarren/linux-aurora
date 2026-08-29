@@ -290,8 +290,9 @@ fn probe_t8140_runtime(
         topology,
     )?;
     let runtime = Arc::pin_init(new_mutex!(runtime), GFP_KERNEL)?;
+    let runtime_ref = g17_drm::G17PRuntimeRef::new(&runtime);
     let gpu: Arc<dyn drm_gpu::DrmGpu> = Arc::new(
-        g17_drm::G17PDrmGpu::new(&drm, runtime.clone(), soc, observed),
+        g17_drm::G17PDrmGpu::new(runtime_ref, soc, observed),
         GFP_KERNEL,
     )?;
     let data = try_pin_init!(AsahiData {
