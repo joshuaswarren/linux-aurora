@@ -10,6 +10,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/gpio/consumer.h>
 #include <linux/iommu.h>
+#include <linux/io.h>
 #include <linux/jiffies.h>
 #include <linux/kconfig.h>
 #include <linux/kernel.h>
@@ -20,6 +21,7 @@
 #include <linux/of_device.h>
 #include <linux/of_platform.h>
 #include <linux/slab.h>
+#include <linux/sizes.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/string.h>
 #include <linux/usb/typec_altmode.h>
@@ -290,6 +292,8 @@ static int dcp_rtk_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
 		struct iommu_domain *domain =
 			iommu_get_domain_for_dev(dcp->dev);
 		phys_addr_t phy_addr;
+		size_t offset;
+		u64 request;
 
 		if (!domain)
 			return -ENOMEM;
@@ -299,16 +303,29 @@ static int dcp_rtk_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
 		if (!phy_addr)
 			return -ENOMEM;
 
-		// TODO: verify phy_addr, cache attribute
-		bfr->buffer = memremap(phy_addr, bfr->size, MEMREMAP_WB);
-		if (!bfr->buffer)
+		for (offset = 0; offset < bfr->size; offset += SZ_16K) {
+			if (iommu_iova_to_phys(domain, bfr->iova + offset) !=
+			    phy_addr + offset)
+				return -EINVAL;
+		}
+
+		/*
+		 * RTBuddy invalidates firmware-owned buffers before CPU access on
+		 * non-coherent systems.  Keep this mapping Normal-NC so the generic
+		 * RTKit reader never observes a stale write-back cache line.
+		 */
+		bfr->iomem = ioremap_wc(phy_addr, bfr->size);
+		if (!bfr->iomem)
 			return -ENOMEM;
 
 		bfr->is_mapped = true;
+		request = FIELD_PREP(GENMASK_ULL(59, 52), 1) |
+			  FIELD_PREP(GENMASK_ULL(51, 44), bfr->size >> 12) |
+			  FIELD_PREP(GENMASK_ULL(43, 0), bfr->iova);
 		dev_info(dcp->dev,
-			 "shmem_setup: iova: %lx -> pa: %lx -> iomem: %lx\n",
-			 (uintptr_t)bfr->iova, (uintptr_t)phy_addr,
-			 (uintptr_t)bfr->buffer);
+			 "RTKit preallocated GETBUF %#llx size %#zx DVA %pad PA %pa iomem %p; Normal-NC, no host reply\n",
+			 request, bfr->size, &bfr->iova, &phy_addr,
+			 bfr->iomem);
 	} else {
 		bfr->buffer = dma_alloc_coherent(dcp->dev, bfr->size,
 						 &bfr->iova, GFP_KERNEL);
@@ -327,7 +344,7 @@ static void dcp_rtk_shmem_destroy(void *cookie, struct apple_rtkit_shmem *bfr)
 	struct apple_dcp *dcp = cookie;
 
 	if (bfr->is_mapped)
-		memunmap(bfr->buffer);
+		iounmap(bfr->iomem);
 	else
 		dma_free_coherent(dcp->dev, bfr->size, bfr->buffer, bfr->iova);
 }
