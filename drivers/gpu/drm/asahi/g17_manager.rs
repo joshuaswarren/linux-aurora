@@ -331,7 +331,7 @@ pub(crate) struct G17PSksmQueue {
     storage: g17_resources::G17PClRuntimeStorage,
     compute: g17_resources::G17PComputeDescriptorStorage,
     producer: g17_submission::G17PClKickProducerState,
-    cached_channel_identity: u64,
+    direct_lifecycle: g17_submission::G17PDirectClLifecycleState,
     submission_ordinal: u32,
     b2_activation: g17_submission::G17PClB2ActivationState,
 }
@@ -1187,7 +1187,11 @@ impl G17PManagerConstruction {
                 previous_valid: false,
                 previous_timestamp: 0,
             },
-            cached_channel_identity: 0,
+            direct_lifecycle: g17_submission::G17PDirectClLifecycleState {
+                queue_config_dirty: true,
+                cached_channel_identity: 0,
+                next_correlation_token: 1,
+            },
             submission_ordinal: 0,
             b2_activation: g17_submission::G17PClB2ActivationState::Pending,
         })
@@ -1307,10 +1311,9 @@ impl G17PManagerConstruction {
         if queue.submission_ordinal != 0 {
             return Err(EINVAL);
         }
-        // TODO(g17p-first-bind): tag 15/tag 16 now use the admitted native
-        // AGXChannel pointer ring, but the dedicated FlushID predicate remains
-        // unresolved. Fail before any live write until that contract gate is
-        // opened.
+        // This release gate is deliberately first: any future contract
+        // regression must fail before descriptor, ring, SKSM, MMIO, or mailbox
+        // state changes.
         g17_submission::require_g17p_first_bind_direct_hardware_release(
             g17_submission::G17P_FIRST_BIND_COMMAND_PLAN,
         )
@@ -1413,7 +1416,20 @@ impl G17PManagerConstruction {
                 user_layout.queue_context,
                 shared_control,
                 queue.storage.channel_control_gpu_va(),
-        )?;
+            )?;
+        let lifecycle = g17_submission::prepare_g17p_direct_cl_lifecycle(
+            queue.direct_lifecycle,
+            group.queue,
+            true,
+            backend,
+        )
+        .map_err(|_| EINVAL)?;
+        if !lifecycle.publish_config_update
+            || !lifecycle.publish_entry_signal
+            || lifecycle.correlation_token == 0
+        {
+            return Err(EINVAL);
+        }
         self.publish_compute_b2_once(queue)?;
         self.stage_compute_runtime_tick_once()?;
         queue
@@ -1436,33 +1452,23 @@ impl G17PManagerConstruction {
         queue.producer.last_add_kicks_timestamp = prepared_entry.current_timestamp;
         dev_info!(
             self.resources.dev().as_ref(),
-            "G17P compute: candidate sksm-entry-direct-v2 qid {} entry_offset {:#x} timestamp {:#x} descriptor_generation {}\n",
+            "G17P compute: candidate g17p-direct-first-v3 qid {} entry_offset {:#x} timestamp {:#x} descriptor_generation {} tag15_producer 2 tag16_producer 3 correlation_token {}\n",
             queue.queue_id,
             prepared_entry.entry_offset,
             prepared_entry.current_timestamp,
-            descriptor_generation
+            descriptor_generation,
+            lifecycle.correlation_token
         );
         fence(Ordering::SeqCst);
         let prepared = self
             .resources
             .publish_compute_channel(group.queue, group.write_index)?;
-        let notifications = g17_submission::prepare_g17p_direct_cl_notifications(
-            g17_submission::G17PDirectClNotificationState {
-                cached_channel_identity: queue.cached_channel_identity,
-                submitted_channel_identity: group.queue,
-                firmware_ready: true,
-                direct_feature: backend.direct_feature,
-                submission_suppressed: backend.submission_suppressed,
-                command_submission_enabled: backend.command_submission_enabled,
-            },
-        )
-        .map_err(|_| EINVAL)?;
-        if notifications.activation != Some(prepared.doorbell) {
+        if lifecycle.notifications.activation != Some(prepared.doorbell) {
             return Err(EINVAL);
         }
-        queue.cached_channel_identity = group.queue;
+        queue.direct_lifecycle = lifecycle.next;
         queue.submission_ordinal = 1;
-        Ok(notifications)
+        Ok(lifecycle.notifications)
     }
 
     /// Build and publish one complete userspace compute command.
