@@ -3158,6 +3158,10 @@ impl G17ResourceOwner {
             G17P_BOOTSTRAP_CONTEXT_PEER_SIZE,
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
+        dev_info!(
+            dev.as_ref(),
+            "G17P resources: bootstrap context peers reserved before dynamic graph\n"
+        );
         let mut control_operand_table = match RenderBackingObject::new(
             dev,
             g17_initdata::CONTROL_OPERAND_TABLE_SIZE,
