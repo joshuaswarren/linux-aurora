@@ -295,6 +295,34 @@ fn put_u64(raw: &mut [u8], offset: usize, value: u64) {
     raw[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
+/// Keep the render-context scratch view blank while populating the distinct
+/// firmware scratch view with the queue-context record.
+fn apply_g17p_cold_opening_context_views(
+    stage: g17_submission::G17PColdOpeningStage,
+    descriptor: u64,
+    queue: u64,
+    context_scratch: usize,
+    firmware_scratch: usize,
+    raw: &mut [u8],
+) -> core::result::Result<(), g17_submission::SubmissionError> {
+    let context_end = context_scratch
+        .checked_add(G17P_PAGE_SIZE)
+        .ok_or(g17_submission::SubmissionError::PartialOpeningAddressOverflow)?;
+    let firmware_end = firmware_scratch
+        .checked_add(G17P_PAGE_SIZE)
+        .ok_or(g17_submission::SubmissionError::PartialOpeningAddressOverflow)?;
+    raw.get_mut(context_scratch..context_end)
+        .ok_or(g17_submission::SubmissionError::PartialOpeningGraphObjectSize)?
+        .fill(0);
+    g17_submission::apply_g17p_cold_opening_queue_context(
+        stage,
+        descriptor,
+        queue,
+        raw.get_mut(firmware_scratch..firmware_end)
+            .ok_or(g17_submission::SubmissionError::PartialOpeningGraphObjectSize)?,
+    )
+}
+
 fn apply_g17p_add3_resource_table(raw: &mut [u8], buffers: [u64; 3]) -> Option<()> {
     let end = G17P_COMPUTE_ADD3_RESOURCE_TABLE
         .checked_add(buffers.len() * core::mem::size_of::<u64>())?;
@@ -1902,36 +1930,22 @@ impl G17PUserRenderStorage {
                         + g17_submission::G17P_COLD_OPENING_CHANNEL_CONTROL_SIZE],
             )
             .map_err(|_| EINVAL)?;
-            g17_submission::apply_g17p_cold_opening_queue_context(
+            apply_g17p_cold_opening_context_views(
                 g17_submission::G17PColdOpeningStage::Tiling,
                 descriptors.iova(),
                 graph_va + Self::TILING_QUEUE as u64,
-                &mut raw[G17P_RENDER_TILING_CONTEXT_SCRATCH
-                    ..G17P_RENDER_TILING_CONTEXT_SCRATCH + mmu::UAT_PGSZ],
+                G17P_RENDER_TILING_CONTEXT_SCRATCH,
+                G17P_RENDER_TILING_FIRMWARE_SCRATCH,
+                raw,
             )
             .map_err(|_| EINVAL)?;
-            g17_submission::apply_g17p_cold_opening_queue_context(
-                g17_submission::G17PColdOpeningStage::Tiling,
-                descriptors.iova(),
-                graph_va + Self::TILING_QUEUE as u64,
-                &mut raw[G17P_RENDER_TILING_FIRMWARE_SCRATCH
-                    ..G17P_RENDER_TILING_FIRMWARE_SCRATCH + mmu::UAT_PGSZ],
-            )
-            .map_err(|_| EINVAL)?;
-            g17_submission::apply_g17p_cold_opening_queue_context(
+            apply_g17p_cold_opening_context_views(
                 g17_submission::G17PColdOpeningStage::Fragment,
                 descriptors.iova() + 0x4000,
                 graph_va + Self::FRAGMENT_QUEUE as u64,
-                &mut raw[G17P_RENDER_FRAGMENT_CONTEXT_SCRATCH
-                    ..G17P_RENDER_FRAGMENT_CONTEXT_SCRATCH + mmu::UAT_PGSZ],
-            )
-            .map_err(|_| EINVAL)?;
-            g17_submission::apply_g17p_cold_opening_queue_context(
-                g17_submission::G17PColdOpeningStage::Fragment,
-                descriptors.iova() + 0x4000,
-                graph_va + Self::FRAGMENT_QUEUE as u64,
-                &mut raw[G17P_RENDER_FRAGMENT_FIRMWARE_SCRATCH
-                    ..G17P_RENDER_FRAGMENT_FIRMWARE_SCRATCH + mmu::UAT_PGSZ],
+                G17P_RENDER_FRAGMENT_CONTEXT_SCRATCH,
+                G17P_RENDER_FRAGMENT_FIRMWARE_SCRATCH,
+                raw,
             )
             .map_err(|_| EINVAL)
         }));
@@ -4595,8 +4609,58 @@ mod tests {
             G17P_RENDER_FRAGMENT_FIRMWARE_SCRATCH
         );
         let support_va = 0x70_0100_0000;
+        let descriptor_va = 0x70_0108_0000;
+        let queue_va = 0x70_0109_0000;
         let channel_control = support_va + G17P_RENDER_CHANNEL_CONTROL as u64;
         let mut support = vec![0u8; G17P_RENDER_SUPPORT_SIZE];
+        apply_g17p_cold_opening_context_views(
+            g17_submission::G17PColdOpeningStage::Tiling,
+            descriptor_va,
+            queue_va,
+            G17P_RENDER_TILING_CONTEXT_SCRATCH,
+            G17P_RENDER_TILING_FIRMWARE_SCRATCH,
+            &mut support,
+        )
+        .unwrap();
+        assert!(support[G17P_RENDER_TILING_CONTEXT_SCRATCH
+            ..G17P_RENDER_TILING_CONTEXT_SCRATCH + G17P_PAGE_SIZE]
+            .iter()
+            .all(|byte| *byte == 0));
+        assert_eq!(
+            get_u64(&support, G17P_RENDER_TILING_FIRMWARE_SCRATCH + 0x210),
+            descriptor_va
+        );
+        assert_eq!(
+            get_u64(&support, G17P_RENDER_TILING_FIRMWARE_SCRATCH + 0x218),
+            queue_va
+        );
+        apply_g17p_cold_opening_context_views(
+            g17_submission::G17PColdOpeningStage::Fragment,
+            descriptor_va + 0x4000,
+            queue_va + 0xc0,
+            G17P_RENDER_FRAGMENT_CONTEXT_SCRATCH,
+            G17P_RENDER_FRAGMENT_FIRMWARE_SCRATCH,
+            &mut support,
+        )
+        .unwrap();
+        assert!(support[G17P_RENDER_FRAGMENT_CONTEXT_SCRATCH
+            ..G17P_RENDER_FRAGMENT_CONTEXT_SCRATCH + G17P_PAGE_SIZE]
+            .iter()
+            .all(|byte| *byte == 0));
+        assert_eq!(
+            get_u64(
+                &support,
+                G17P_RENDER_FRAGMENT_FIRMWARE_SCRATCH + 0x210
+            ),
+            descriptor_va + 0x4000
+        );
+        assert_eq!(
+            get_u64(
+                &support,
+                G17P_RENDER_FRAGMENT_FIRMWARE_SCRATCH + 0x218
+            ),
+            queue_va + 0xc0
+        );
         g17_submission::apply_g17p_cold_opening_channel_control(
             &mut support[G17P_RENDER_CHANNEL_CONTROL
                 ..G17P_RENDER_CHANNEL_CONTROL
