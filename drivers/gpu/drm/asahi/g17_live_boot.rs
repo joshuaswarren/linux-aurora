@@ -127,6 +127,8 @@ const _: () = {
     let gfx = G17PProcessor::Gfx.firmware_crash_buffer();
     let gfx1 = G17PProcessor::Gfx1.firmware_crash_buffer();
     assert!(gfx.dva == 0x100_01e1_c000 && gfx1.dva == 0x100_01f5_0000);
+    assert!(gfx.dva == crate::g17_adt_j700::J700_GFX_DATA.base + 0xa_0000);
+    assert!(gfx1.dva == crate::g17_adt_j700::J700_GFX1_DATA.base + 0xa_0000);
     assert!(g17p_rtkit_uat_address(gfx.dva) == 0x01e1_c000);
     assert!(g17p_rtkit_uat_address(gfx1.dva) == 0x01f5_0000);
     assert!(gfx.size == 0x8000 && gfx1.size == 0x8000);
@@ -353,72 +355,19 @@ fn retain_g17p_crashlog_slice(
 fn capture_g17p_firmware_crash_dva(state: &G17PRoleRtkitState) -> Result {
     let buffer = state.processor.firmware_crash_buffer();
     let captured_size = bounded_crashlog_size(buffer.size);
-    let (direct, sentinel) = state
-        .firmware_contexts
-        .copy_t8140_crash_buffer(state.processor as usize, captured_size)?;
-    log_crash_buffer_observation(state, "direct-WC", &direct, sentinel);
-
-    let low40 = g17p_rtkit_uat_address(buffer.dva);
-    let candidates = [
-        (0usize, low40),
-        (0usize, buffer.dva),
-        (1usize, low40),
-        (1usize, buffer.dva),
-    ];
-    let mut last_error = EFAULT;
-
-    for (slot, address) in candidates {
-        let Some(root) = state.firmware_contexts.context_root(slot) else {
-            dev_info!(
-                state.dev.as_ref(),
-                "G17P {} crashlog probe context {} has no live lower root\n",
-                state.processor.name(),
-                slot
-            );
-            continue;
-        };
-        match root.copy_firmware_range(address, captured_size) {
-            Ok(raw) => {
-                dev_info!(
-                    state.dev.as_ref(),
-                    "G17P {} crashlog copied through context {} root {:#x} VA {:#x} ({} bytes)\n",
-                    state.processor.name(),
-                    slot,
-                    root.ttb(),
-                    address,
-                    raw.len()
-                );
-                log_crash_buffer_observation(state, "raw-WB", &raw, sentinel);
-                let aliases_equal = direct.as_slice() == raw.as_slice();
-                dev_info!(
-                    state.dev.as_ref(),
-                    "G17P {} crashlog direct/raw equal={}\n",
-                    state.processor.name(),
-                    aliases_equal
-                );
-                return retain_g17p_crashlog(state, buffer.size, direct);
-            }
-            Err(error) => {
-                dev_info!(
-                    state.dev.as_ref(),
-                    "G17P {} crashlog probe context {} root {:#x} VA {:#x} missed ({:?})\n",
-                    state.processor.name(),
-                    slot,
-                    root.ttb(),
-                    address,
-                    error
-                );
-                last_error = error;
-            }
-        }
-    }
+    let physical = crate::pgtable::UatPageTable::copy_firmware_physical_range(
+        buffer.dva,
+        captured_size,
+    )?;
+    log_crash_buffer_observation(state, "firmware-physical", &physical, 0);
     dev_info!(
         state.dev.as_ref(),
-        "G17P {} raw crashlog alias unavailable ({:?}); retaining direct WC copy\n",
+        "G17P {} crashlog copied from firmware data PA {:#x} ({} bytes)\n",
         state.processor.name(),
-        last_error
+        buffer.dva,
+        physical.len()
     );
-    retain_g17p_crashlog(state, buffer.size, direct)
+    retain_g17p_crashlog(state, buffer.size, physical)
 }
 
 /// Active G17P boot does not ask Rust to back system-endpoint buffers. The
@@ -702,7 +651,30 @@ fn finish_boot_session(
         pdev.as_ref(),
         "G17P compute control: channel-8 startup work sent\n"
     );
-    manager.wait_compute_bootstrap_render_retirement()?;
+    if let Err(error) = manager.wait_compute_bootstrap_render_retirement() {
+        let (fault_info, fault_address_word) = registers.g17p_fault_registers();
+        let fault_valid = fault_info & 1 != 0;
+        let fault_reason = (fault_info >> 1) & 0x7;
+        let fault_read = fault_info & (1 << 4) != 0;
+        let fault_level = (fault_info >> 7) & 0x3;
+        let fault_vm = (fault_info >> 17) & 0x3f;
+        let fault_unit = (fault_info >> 9) & 0xff;
+        let fault_address = fault_address_word << 6;
+        dev_err!(
+            pdev.as_ref(),
+            "G17P startup fault: valid={} reason={} read={} level={} vm={} unit={:#x} address={:#x} raw_info={:#x} raw_addr={:#x}\n",
+            fault_valid,
+            fault_reason,
+            fault_read,
+            fault_level,
+            fault_vm,
+            fault_unit,
+            fault_address,
+            fault_info,
+            fault_address_word
+        );
+        return Err(error);
+    }
     if gfx_state.crashed.load(Ordering::Acquire) || gfx1_state.crashed.load(Ordering::Acquire) {
         return Err(EIO);
     }

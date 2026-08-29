@@ -535,6 +535,14 @@ impl Resources {
         })
     }
 
+    /// Snapshot the latched G17P MMU fault words without acknowledging them.
+    pub(crate) fn g17p_fault_registers(&self) -> (u64, u64) {
+        (
+            self.sgx_read64::<FAULT_INFO_G14X>(),
+            self.sgx_read64::<FAULT_ADDR_G14X>(),
+        )
+    }
+
     /// Get the fault information from the MMU status register, if one occurred.
     pub(crate) fn get_fault_info(&self, cfg: &'static hw::HwConfig) -> Option<FaultInfo> {
         // The G14X fault-register bank and fault-word decode carry unchanged

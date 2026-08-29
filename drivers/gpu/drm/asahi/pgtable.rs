@@ -802,6 +802,33 @@ impl UatPageTable {
         }
         Ok(())
     }
+
+    /// Copy a bounded range from a firmware carveout identified by physical
+    /// address. G17P's endpoint-1 crash addresses are not client UAT DVAs:
+    /// they are `gfx-data + 0xa0000` and `gfx1-data + 0xa0000`, and the
+    /// output-positive m1n1 postmortem reads them as physical memory.
+    #[cfg(CONFIG_DEV_COREDUMP)]
+    pub(crate) fn copy_firmware_physical_range(
+        physical: PhysicalAddr,
+        size: usize,
+    ) -> Result<KVVec<u8>> {
+        if size == 0 || (physical | size as u64) & 7 != 0 {
+            return Err(EINVAL);
+        }
+        physical.checked_add(size as u64).ok_or(EOVERFLOW)?;
+        let page_mask = UAT_PGMSK as u64;
+        let mut data = KVVec::from_elem(0, size, GFP_KERNEL)?;
+        let mut copied = 0usize;
+        while copied < size {
+            let address = physical.checked_add(copied as u64).ok_or(EOVERFLOW)?;
+            let page = PhysPageMapping::new(address & !page_mask)?;
+            let offset = (address & page_mask) as usize;
+            let length = (UAT_PGSZ - offset).min(size - copied);
+            page.copy_atomic(offset, &mut data[copied..copied + length])?;
+            copied = copied.checked_add(length).ok_or(EOVERFLOW)?;
+        }
+        Ok(data)
+    }
 }
 
 #[cfg(CONFIG_DEV_COREDUMP)]
