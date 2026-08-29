@@ -2035,11 +2035,12 @@ impl Uat {
         inner.ttbs_rgn.base
     }
 
-    /// Confirm the exact first-render context table: slot 0/tag 0 and slot
-    /// 1/tag 1 share the retained low root. Their high roots start as the
-    /// source firmware root and are replaced by two distinct empty roots at
-    /// first work.
-    pub(crate) fn t8140_partial_opening_contexts_ready(&self, empty_high: bool) -> bool {
+    /// Confirm the cold first-render context table before a render VM binds.
+    ///
+    /// Slots 0 and 1 share the retained low root. Their high roots are either
+    /// the source firmware root before first work or the two distinct empty
+    /// roots after an earlier render VM has retired.
+    pub(crate) fn t8140_partial_opening_kernel_contexts_ready(&self) -> bool {
         if self.cfg != UatConfig::T8140 {
             return false;
         }
@@ -2049,10 +2050,11 @@ impl Uat {
         };
         let low = self.kernel_lower_vm.ttb();
         let source_high = self.kernel_vm.ttb();
-        let high = if empty_high {
-            empty
-        } else {
-            [source_high, source_high]
+        let phase = self.t8140_context_phase.load(Ordering::Acquire);
+        let high = match phase {
+            T8140_CONTEXT_BOOTSTRAP_SOURCE_HIGH => [source_high, source_high],
+            T8140_CONTEXT_BOOTSTRAP_EMPTY_HIGH => empty,
+            _ => return false,
         };
         let inner = self.inner.lock();
         let ttbs = inner.ttbs();
@@ -2062,6 +2064,38 @@ impl Uat {
                 == (low | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT))
             && ttbs[1].ttb1.load(Ordering::Acquire)
                 == (high[1] | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT))
+    }
+
+    /// Confirm the first-render table after the render VM owns context 1.
+    ///
+    /// The proven G17P contract keeps the retained context-0 low root in slot
+    /// 0, installs the render VM low root in slot 1, and gives each slot its
+    /// own empty high root. The retained [`VmBind`] proves which low root is
+    /// live and keeps that page table resident through firmware retirement.
+    pub(crate) fn t8140_partial_opening_render_context_ready(
+        &self,
+        render: &VmBind,
+    ) -> bool {
+        if self.cfg != UatConfig::T8140
+            || render.slot() != 1
+            || self.t8140_context_phase.load(Ordering::Acquire) != T8140_CONTEXT_USER_OWNED
+        {
+            return false;
+        }
+        let empty = match self.t8140_empty_high_roots.as_ref() {
+            Some(roots) => [roots[0].ttb(), roots[1].ttb()],
+            None => return false,
+        };
+        let retained_low = self.kernel_lower_vm.ttb();
+        let render_low = render.0.ttb();
+        let inner = self.inner.lock();
+        let ttbs = inner.ttbs();
+        ttbs[0].ttb0.load(Ordering::Acquire) == (retained_low | TTBR_VALID)
+            && ttbs[0].ttb1.load(Ordering::Acquire) == (empty[0] | TTBR_VALID)
+            && ttbs[1].ttb0.load(Ordering::Acquire)
+                == (render_low | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT))
+            && ttbs[1].ttb1.load(Ordering::Acquire)
+                == (empty[1] | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT))
     }
 
     /// Replace only the two high roots at the measured first-work boundary.

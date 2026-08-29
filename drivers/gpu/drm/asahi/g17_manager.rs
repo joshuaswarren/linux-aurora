@@ -597,10 +597,16 @@ impl G17PManagerConstruction {
             && context.context0_low_root_present_at_first_work
             && context.render_low_root_present_at_first_work
             && !context.source_firmware_high_root_table_resident;
-        let roots_ready = self
-            .resources
-            .uat()
-            .t8140_partial_opening_contexts_ready(false);
+        let roots_ready = match self.render_bind.as_ref() {
+            Some(binding) => self
+                .resources
+                .uat()
+                .t8140_partial_opening_render_context_ready(binding),
+            None => self
+                .resources
+                .uat()
+                .t8140_partial_opening_kernel_contexts_ready(),
+        };
         if !addresses_ready || !context_ready || !roots_ready {
             dev_err!(
                 self.resources.dev().as_ref(),
