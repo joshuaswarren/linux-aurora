@@ -100,6 +100,9 @@ pub(crate) const HW_DATA_BUNDLE_MIN_ALLOC: usize = 0x10000;
 /// configuration objects inside the same cluster, which then spans this much
 /// (see [`WORK_RING_BUNDLE_OFFSETS`], [`NATIVE_PRIMARY_MAIN_BUNDLE_OFFSET`]).
 pub(crate) const NATIVE_SHARED_CLUSTER_SIZE: usize = 0x28000;
+/// Firmware-high base of the complete hardware-data/main-config/work-ring
+/// cluster in every output-positive G17P capture.
+pub(crate) const NATIVE_SHARED_CLUSTER_GPU_VA: u64 = 0xffff_fc20_c078_8000;
 
 // --- Version tuple ------------------------------------------------------------
 

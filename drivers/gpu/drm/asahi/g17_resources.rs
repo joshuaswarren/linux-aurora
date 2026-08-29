@@ -3368,39 +3368,19 @@ impl G17ResourceOwner {
             "G17P resources: live compute-control closure mapped in context 1\n"
         );
 
-        let mut roots = match MappedObject::new(
-            dev,
-            &address_space.uat,
-            ROOT_PAIR_ALLOC_SIZE,
-            g17_initdata::SECONDARY_ROOT_DELTA,
-            mmu::PROT_FW_SHARED_RO,
-        ) {
-            Ok(object) => object,
-            Err(error) => {
-                dev_err!(dev.as_ref(), "G17P resources: roots allocation failed ({:?})\n", error);
-                return Err(error);
-            }
-        };
         // The classic CL producer appends its outer slot in this bundle and
         // advances the paired channel producer in primary_state. Both are
-        // live host-to-firmware publication surfaces, not boot-only blobs.
-        let mut shared_cluster = match MappedObject::new_wc(
+        // live host-to-firmware publication surfaces, not boot-only blobs. The
+        // output-positive producer requires the complete cluster at its native
+        // base, including CL_2 at base + 0x19dc0.
+        let mut shared_cluster = map_fixed_wc_object(
             dev,
-            &address_space.uat,
+            address_space.uat.kernel_vm(),
+            "native shared cluster",
+            g17_initdata::NATIVE_SHARED_CLUSTER_GPU_VA,
             g17_initdata::NATIVE_SHARED_CLUSTER_SIZE,
-            mmu::UAT_PGSZ as u64,
             mmu::PROT_FW_PRIV_RW,
-        ) {
-            Ok(object) => object,
-            Err(error) => {
-                dev_err!(
-                    dev.as_ref(),
-                    "G17P resources: shared-cluster allocation failed ({:?})\n",
-                    error
-                );
-                return Err(error);
-            }
-        };
+        )?;
         // The native bundle has three out-of-line pages at fixed offsets from
         // its base. Claim them before placing the remaining dynamic objects,
         // otherwise a large state object can occupy one of these addresses.
@@ -3427,6 +3407,22 @@ impl G17ResourceOwner {
             mmu::UAT_PGSZ,
             mmu::PROT_FW_SHARED_RW,
         )?;
+        // Claim the complete fixed bundle topology before placing dynamic
+        // initdata objects, so none can take a captured ring or out-of-line
+        // hardware-data address.
+        let mut roots = match MappedObject::new(
+            dev,
+            &address_space.uat,
+            ROOT_PAIR_ALLOC_SIZE,
+            g17_initdata::SECONDARY_ROOT_DELTA,
+            mmu::PROT_FW_SHARED_RO,
+        ) {
+            Ok(object) => object,
+            Err(error) => {
+                dev_err!(dev.as_ref(), "G17P resources: roots allocation failed ({:?})\n", error);
+                return Err(error);
+            }
+        };
         let region_a = MappedObject::new(
             dev,
             &address_space.uat,
