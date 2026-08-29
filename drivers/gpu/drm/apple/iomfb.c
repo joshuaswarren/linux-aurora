@@ -142,8 +142,8 @@ static void dcp_link_push(struct apple_dcp *dcp, bool oob,
 			  const struct dcp_method_entry *call, u32 in_len,
 			  u32 out_len, void *data, dcp_callback_t cb,
 			  void *cookie);
-static void dcp_link_ack(struct apple_dcp *dcp,
-			 enum dcp_context_id context);
+static int dcp_link_ack(struct apple_dcp *dcp,
+			enum dcp_context_id context);
 static void dcp_link_recv_msg(struct apple_dcp *dcp, u64 message);
 static int dcp_link_start_rtkit(struct apple_dcp *dcp);
 
@@ -383,17 +383,18 @@ err_pop:
 		call->tag, ret);
 }
 
-static void dcp_link_ack(struct apple_dcp *dcp,
-			 enum dcp_context_id context)
+static int dcp_link_ack(struct apple_dcp *dcp,
+			enum dcp_context_id context)
 {
 	struct dcp_channel *ch = dcp_get_channel(dcp, context);
 	u64 request;
 	u8 depth;
 	u64 reply;
+	int ret;
 
 	if (!ch || !ch->depth) {
 		dev_warn(dcp->dev, "DCPLink callback reply without an active call\n");
-		return;
+		return -EINVAL;
 	}
 
 	depth = dcp_pop_depth(&ch->depth);
@@ -401,7 +402,13 @@ static void dcp_link_ack(struct apple_dcp *dcp,
 	dcp_link_sync_for_device();
 	reply = apple_dcp_link_rpc_reply(request);
 	ch->link_message[depth] = 0;
-	dcp_send_message(dcp, APPLE_DCP_LINK_ENDPOINT, reply);
+	ret = dcp_send_message_sync(dcp, APPLE_DCP_LINK_ENDPOINT, reply);
+	if (ret)
+		dev_err(dcp->dev,
+			"DCPLink callback ACK %#llx mailbox send failed: %d\n",
+			reply, ret);
+
+	return ret;
 }
 
 static struct dcp_channel *dcp_link_reply_channel(struct apple_dcp *dcp,
@@ -518,6 +525,7 @@ static void dcp_link_handle_callback(struct apple_dcp *dcp, u64 message)
 	u32 total_size = FIELD_GET(APPLE_DCP_LINK_MSG_SIZE, message);
 	u64 reply = apple_dcp_link_rpc_reply(message);
 	u8 depth;
+	int ack_ret;
 	int tag;
 	int ret;
 
@@ -624,8 +632,13 @@ static void dcp_link_handle_callback(struct apple_dcp *dcp, u64 message)
 				 handler, handled,
 				 handled ? reply : 0);
 	}
-	if (handled)
-		dcp_link_ack(dcp, DCP_CONTEXT_CB);
+	if (handled) {
+		ack_ret = dcp_link_ack(dcp, DCP_CONTEXT_CB);
+		if (log_callback && sequence >= 165)
+			dev_info(dcp->dev,
+				 "DCPLink callback %u D%03d ACK %#llx send result %d\n",
+				 sequence, tag, reply, ack_ret);
+	}
 }
 
 static int dcp_link_publish_init(struct apple_dcp *dcp, bool firmware_rendezvous)
