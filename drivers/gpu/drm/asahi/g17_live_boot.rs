@@ -866,7 +866,7 @@ fn finish_boot_session(
     );
     dev_info!(
         pdev.as_ref(),
-        "G17P_EBUSY_TRACE candidate=bind-to-manager-v1 armed\n"
+        "G17P UAT: candidate single-user-slot-v1 pins T8140 work to context 1\n"
     );
     Ok(G17PBootedSession {
         cpus,
@@ -1263,18 +1263,9 @@ impl G17PLiveRuntime {
         let binding = {
             let manager = self.manager.as_mut().ok_or(ENODEV)?;
             let queue = self.queue.as_mut().ok_or(ENODEV)?;
-            manager.bind_compute_user_vm(queue, vm).inspect_err(|error| {
-                pr_err!(
-                    "G17P_EBUSY_TRACE edge=live_compute_bind error={:?}\n",
-                    error
-                );
-            })?
+            manager.bind_compute_user_vm(queue, vm)?
         };
         self.compute_binding = Some(binding);
-        dev_info!(
-            self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
-            "G17P_EBUSY_TRACE checkpoint=live_manager_submit_enter\n"
-        );
         let submit_result = {
             let registers = self.registers.as_ref().ok_or(ENODEV)?;
             let manager = self.manager.as_mut().ok_or(ENODEV)?;
@@ -1304,20 +1295,8 @@ impl G17PLiveRuntime {
             )
         };
         let doorbell = match submit_result {
-            Ok(doorbell) => {
-                dev_info!(
-                    self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
-                    "G17P_EBUSY_TRACE checkpoint=live_manager_submit_ok channel_path={}\n",
-                    doorbell.is_some()
-                );
-                doorbell
-            }
+            Ok(doorbell) => doorbell,
             Err(error) => {
-                dev_err!(
-                    self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
-                    "G17P_EBUSY_TRACE edge=live_manager_submit error={:?}\n",
-                    error
-                );
                 return match g17_lifecycle::recover_persistent_runtime(self) {
                     Ok(()) => Err(error),
                     Err(recovery_error) => Err(recovery_error),

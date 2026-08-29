@@ -2531,9 +2531,15 @@ impl Uat {
         if binding.binding.is_none() {
             assert_eq!(binding.active_users, 0);
 
-            let isolation = *module_parameters::robust_isolation.value() != 0;
+            // The T8140 first-partial contract has exactly two hardware
+            // contexts: retained kernel context 0 and one user context 1.
+            // Letting the generic LRU consider later allocator slots makes it
+            // select untouched slot 1 after the bootstrap VM releases slot 0,
+            // which would name nonexistent hardware context 2.
+            let single_user_slot = self.cfg == UatConfig::T8140
+                || *module_parameters::robust_isolation.value() != 0;
 
-            self.slots.set_limit(if isolation {
+            self.slots.set_limit(if single_user_slot {
                 NonZeroUsize::new(1)
             } else {
                 None
@@ -2546,14 +2552,6 @@ impl Uat {
                 let ttb = binding.ttb | TTBR_VALID | (idx as u64) << TTBR_ASID_SHIFT;
 
                 if self.cfg == UatConfig::T8140 && idx != 1 {
-                    dev_err!(
-                        self.dev.as_ref(),
-                        "G17P_EBUSY_TRACE leaf=uat_bind_slot_mismatch vm={} allocator_slot={} uat_slot={} phase={}\n",
-                        vm.id,
-                        slot.slot(),
-                        idx,
-                        self.t8140_context_phase.load(Ordering::Acquire)
-                    );
                     return Err(EBUSY);
                 }
 
@@ -2607,16 +2605,6 @@ impl Uat {
         binding.active_users += 1;
 
         let slot = binding.binding.as_ref().unwrap().slot() + UAT_USER_CTX_START as u32;
-        if self.cfg == UatConfig::T8140 {
-            dev_info!(
-                self.dev.as_ref(),
-                "G17P_EBUSY_TRACE checkpoint=uat_bind_ok vm={} uat_slot={} active_users={} phase={}\n",
-                vm.id,
-                slot,
-                binding.active_users,
-                self.t8140_context_phase.load(Ordering::Acquire)
-            );
-        }
         mod_pr_debug!("MMU: slot {} active users {}\n", slot, binding.active_users);
         Ok(VmBind(vm.clone(), slot))
     }
