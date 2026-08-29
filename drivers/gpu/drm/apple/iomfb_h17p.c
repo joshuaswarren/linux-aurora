@@ -155,38 +155,23 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[102] = trampoline_nop, /* set_number_property */
 	[103] = trampoline_nop, /* trigger_user_cal_loader */
 	[104] = trampoline_nop, /* set_boolean_property */
-	/*
-	 * 25G83 UnifiedPipeline2 numbering (from the mac17p kernelcache): the
-	 * create-service block is NOT the v13_3 +1-shifted layout. provider is
-	 * D107, product D108, PMU D109, iomfb D110, backlight D111, nvram D112.
-	 * Every create_*_service handler returns true (the native functions all
-	 * return 1). The firmware sends D108..D113 as boolean creates during
-	 * start(); answering D112 (nvram) false made start() never complete.
-	 */
-	[107] = trampoline_true, /* create_provider_service */
-	[108] = trampoline_true, /* create_product_service */
-	[109] = trampoline_true, /* create_PMU_service */
-	[110] = trampoline_true, /* create_iomfb_service */
-	[111] = trampoline_true, /* create_backlight_service */
-	[112] = trampoline_true, /* create_nvram_service */
-	[113] = trampoline_true, /* create-shaped boolean (native D113 region) */
-	[114] = trampoline_core_analytics_h17p,
-	[115] = trampoline_get_tiling_state,
-	[116] = trampoline_false, /* set_tiling_state */
-	[117] = trampoline_nop, /* set_idle_caching_state_ap */
-	[118] = trampoline_zero, /* upload_trace_start */
-	[119] = trampoline_zero, /* upload_trace_chunk */
-	[120] = trampoline_zero, /* upload_trace_end */
-	[121] = dcpep_cb_boot_1,
-	[122] = trampoline_false, /* is_dark_boot */
-	[123] = trampoline_false, /* is_waking_from_hibernate */
-	[124] = trampoline_zero, /* detect_fastsim */
-	[125] = trampoline_read_edt_data,
-	[126] = trampoline_read_edt_string_h17p,
-	[127] = trampoline_prop_start,
-	[128] = trampoline_prop_chunk,
-	[129] = trampoline_prop_end,
-	[130] = trampoline_allocate_bandwidth,
+	/* DCP >= 13.5 shifted the service-creation callbacks by one slot. */
+	[108] = trampoline_true, /* create_provider_service */
+	[109] = trampoline_true, /* create_product_service */
+	[110] = trampoline_true, /* create_pmu_service */
+	[111] = trampoline_true, /* create_iomfb_service */
+	[112] = trampoline_create_backlight_service,
+	[113] = trampoline_true, /* create_nvram_service */
+	[114] = trampoline_get_tiling_state,
+	[115] = trampoline_false, /* set_tiling_state */
+	[120] = dcpep_cb_boot_1,
+	[121] = trampoline_false, /* is_dark_boot */
+	[122] = trampoline_false, /* is_waking_from_hibernate */
+	[124] = trampoline_read_edt_data,
+	[126] = trampoline_prop_start,
+	[127] = trampoline_prop_chunk,
+	[128] = trampoline_prop_end,
+	[129] = trampoline_allocate_bandwidth,
 	[201] = trampoline_map_piodma,
 	[202] = trampoline_unmap_piodma,
 	[206] = dcp_link_defer_service_match, /* match_pmu_service_2 */
