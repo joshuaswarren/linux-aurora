@@ -1176,6 +1176,7 @@ int afk_send_epic(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 	dma_rmb();
 	rptr = le32_to_cpu(READ_ONCE(*ep->txbfr.rptr));
 	wptr = le32_to_cpu(READ_ONCE(*ep->txbfr.wptr));
+	old_wptr = wptr;
 	trace_afk_send_rwptr_pre(ep, rptr, wptr);
 	if (use_v2) {
 		if (channel > U16_MAX || payload_len > U32_MAX - sizeof(*v2_message)) {
@@ -1328,9 +1329,19 @@ int afk_send_epic(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 		wptr = 0;
 	trace_afk_send_rwptr_post(ep, rptr, wptr);
 
+	dma_wmb();
 	WRITE_ONCE(*ep->txbfr.wptr, cpu_to_le32(wptr));
-	afk_send(ep, FIELD_PREP(RBEP_TYPE, RBEP_SEND) |
-			     FIELD_PREP(SEND_WPTR, wptr));
+	dma_wmb();
+	doorbell = FIELD_PREP(RBEP_TYPE, RBEP_SEND) |
+		   FIELD_PREP(SEND_WPTR, wptr);
+	entry = hdr2 ? hdr2 : hdr;
+	if (use_v2 && ecat == EPIC_CAT_REPORT &&
+	    stype == AFK_V2_REPORT_OPEN)
+		dev_info(ep->dcp->dev,
+			 "AFK[ep:%02x]: OPEN TX channel %u consumer %#x producer %#x->%#x doorbell %#llx bytes %*phN\n",
+			 ep->endpoint, channel, rptr, old_wptr, wptr, doorbell,
+			 (int)min_t(size_t, total_size, 64), entry);
+	afk_send(ep, doorbell);
 	ret = 0;
 
 out:
