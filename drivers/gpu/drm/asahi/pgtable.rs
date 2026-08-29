@@ -9,6 +9,8 @@
 use core::fmt::Debug;
 use core::mem::size_of;
 use core::ops::Range;
+#[cfg(CONFIG_DEV_COREDUMP)]
+use core::ptr::NonNull;
 use core::sync::atomic::{
     AtomicU64,
     Ordering, //
@@ -22,6 +24,8 @@ use kernel::{
 };
 #[cfg(CONFIG_DEV_COREDUMP)]
 use kernel::{
+    bindings,
+    ffi::c_void,
     types::Owned,
     uapi::{
         PF_R,
@@ -276,7 +280,6 @@ pub(crate) struct DumpedPage {
 pub(crate) struct UatPageTable {
     ttb: PhysicalAddr,
     ttb_owned: bool,
-    teardown_children: bool,
     va_range: Range<u64>,
     geometry: UatGeometry,
     oas_mask: u64,
@@ -291,7 +294,6 @@ impl UatPageTable {
         Ok(UatPageTable {
             ttb,
             ttb_owned: true,
-            teardown_children: true,
             va_range: 0..geometry.root_size(),
             geometry,
             oas_mask: (1u64 << oas) - 1,
@@ -330,28 +332,10 @@ impl UatPageTable {
         Ok(UatPageTable {
             ttb,
             ttb_owned: false,
-            teardown_children: true,
             va_range,
             geometry,
             oas_mask: (1u64 << oas) - 1,
         })
-    }
-
-    /// Borrow an externally-owned page-table tree for read-only diagnostics.
-    ///
-    /// The tree and all of its child pages remain owned by the boot firmware.
-    /// Dropping this view therefore must not reclaim either the root or its
-    /// descendants.
-    #[cfg(CONFIG_DEV_COREDUMP)]
-    pub(crate) fn new_borrowed_reader(
-        ttb: PhysicalAddr,
-        va_range: Range<u64>,
-        ias: u8,
-        oas: u32,
-    ) -> Result<Self> {
-        let mut table = Self::new_with_ttb(ttb, va_range, ias, oas)?;
-        table.teardown_children = false;
-        Ok(table)
     }
 
     pub(crate) fn ttb(&self) -> PhysicalAddr {
@@ -744,100 +728,164 @@ impl UatPageTable {
         Ok(pages)
     }
 
-    /// Snapshot a firmware-owned DVA range through this page table.
+    /// Copy a firmware-owned DVA through a physical UAT root which is not
+    /// represented by Linux `struct page` ownership.
     ///
-    /// The destination is ordinary owned memory. Source pages are borrowed
-    /// only for the duration of each local mapping and read as atomic qwords,
-    /// matching the established crashdump snapshot policy.
+    /// This is intentionally a bounded read-only walker. It temporarily maps
+    /// one 16 KiB page-table or payload page at a time and never changes PTEs
+    /// or reclaims firmware-owned physical memory.
     #[cfg(CONFIG_DEV_COREDUMP)]
-    pub(crate) fn copy_mapped_range(&mut self, address: u64, out: &mut [u8]) -> Result {
-        if out.is_empty() || (address | out.len() as u64) & 7 != 0 {
+    pub(crate) fn copy_from_phys_root(
+        ttb: PhysicalAddr,
+        address: u64,
+        out: &mut [u8],
+        ias: u8,
+        oas: u32,
+    ) -> Result {
+        if out.is_empty() || (ttb | address | out.len() as u64) & 7 != 0 {
             return Err(EINVAL);
         }
+        let geometry = UatGeometry::new(ias).ok_or(EINVAL)?;
         let end = address.checked_add(out.len() as u64).ok_or(EOVERFLOW)?;
-        if address < self.va_range.start || end > self.va_range.end {
+        if end > geometry.root_size() {
             return Err(EFAULT);
         }
+        let oas_mask = (1u64 << oas) - 1;
         let page_mask = UAT_PGMSK as u64;
-        let aligned_start = address & !page_mask;
-        let aligned_end = end.checked_add(page_mask).ok_or(EOVERFLOW)? & !page_mask;
-        let oas_mask = self.oas_mask;
         let mut copied = 0usize;
 
-        self.with_pages(aligned_start..aligned_end, false, false, |iova, ptes| {
-            for (index, ppte) in ptes.iter().enumerate() {
-                let page_iova = iova + (index * UAT_PGSZ) as u64;
-                let copy_start = page_iova.max(address);
-                let copy_end = (page_iova + UAT_PGSZ as u64).min(end);
-                if copy_start >= copy_end {
-                    continue;
-                }
+        while copied < out.len() {
+            let iova = address.checked_add(copied as u64).ok_or(EOVERFLOW)?;
+            let iova_page = iova & !page_mask;
+            let mut table_phys = ttb;
 
-                let pte = ppte.load(Ordering::Acquire);
+            for level in (0..UAT_LEVELS - 1).rev() {
+                let shift = UAT_PGBIT + (level + 1) * UAT_LVBIT;
+                let index = ((iova_page >> shift) & UAT_LVMSK) as usize;
+                let table = PhysPageMapping::new(table_phys)?;
+                let pte = table.read_u64(index * PTE_SIZE)?;
                 if pte & PTE_TYPE_BITS != PTE_TYPE_LEAF_TABLE {
+                    pr_err!(
+                        "UAT crash walker: level {} IOVA {:#x} PTE {:#x} at {:#x}\n",
+                        level + 1,
+                        iova_page,
+                        pte,
+                        table_phys + (index * PTE_SIZE) as u64
+                    );
                     return Err(EFAULT);
                 }
-                let memattr = ((pte & UAT_MEMATTR_BITS) >> UAT_MEMATTR_SHIFT) as u8;
-                if memattr != MEMATTR_CACHED && memattr != MEMATTR_UNCACHED {
-                    return Err(EFAULT);
-                }
-                let phys = pte & oas_mask & (!UAT_PGMSK as u64);
-                // SAFETY: Firmware installed this PTE in the shared T8140
-                // lower root. borrow_phys verifies that its backing is System
-                // RAM with a live struct page before a local mapping is made.
-                let page = unsafe { Page::borrow_phys(&phys) }.ok_or(EFAULT)?;
-                let page_offset = (copy_start - page_iova) as usize;
-                let length = (copy_end - copy_start) as usize;
-                let output_offset = (copy_start - address) as usize;
-                if (page_offset | length | output_offset) & 7 != 0 {
-                    return Err(EINVAL);
-                }
-                page.with_pointer_into_page(page_offset, length, |pointer| {
-                    let source = unsafe {
-                        // SAFETY: with_pointer_into_page validated this range;
-                        // qword alignment was checked above.
-                        core::slice::from_raw_parts(
-                            pointer as *const AtomicU64,
-                            length / core::mem::size_of::<AtomicU64>(),
-                        )
-                    };
-                    for (word, destination) in source.iter().zip(
-                        out[output_offset..output_offset + length]
-                            .chunks_exact_mut(core::mem::size_of::<u64>()),
-                    ) {
-                        destination.copy_from_slice(&word.load(Ordering::Acquire).to_le_bytes());
-                    }
-                    Ok(())
-                })?;
-                copied = copied.checked_add(length).ok_or(EOVERFLOW)?;
+                table_phys = pte & oas_mask & !page_mask;
             }
-            Ok(())
-        })?;
 
-        if copied != out.len() {
-            return Err(EFAULT);
+            let leaf_index = ((iova_page >> UAT_PGBIT) & UAT_LVMSK) as usize;
+            let leaf_table = PhysPageMapping::new(table_phys)?;
+            let leaf = leaf_table.read_u64(leaf_index * PTE_SIZE)?;
+            if leaf & PTE_TYPE_BITS != PTE_TYPE_LEAF_TABLE {
+                pr_err!(
+                    "UAT crash walker: leaf IOVA {:#x} PTE {:#x} at {:#x}\n",
+                    iova_page,
+                    leaf,
+                    table_phys + (leaf_index * PTE_SIZE) as u64
+                );
+                return Err(EFAULT);
+            }
+            let memattr = ((leaf & UAT_MEMATTR_BITS) >> UAT_MEMATTR_SHIFT) as u8;
+            if memattr != MEMATTR_CACHED && memattr != MEMATTR_UNCACHED {
+                return Err(EFAULT);
+            }
+            let payload_phys = leaf & oas_mask & !page_mask;
+            let payload = PhysPageMapping::new(payload_phys)?;
+            let offset = (iova & page_mask) as usize;
+            let length = (UAT_PGSZ - offset).min(out.len() - copied);
+            payload.copy_atomic(offset, &mut out[copied..copied + length])?;
+            copied = copied.checked_add(length).ok_or(EOVERFLOW)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(CONFIG_DEV_COREDUMP)]
+struct PhysPageMapping {
+    ptr: NonNull<c_void>,
+}
+
+#[cfg(CONFIG_DEV_COREDUMP)]
+impl PhysPageMapping {
+    fn new(phys: PhysicalAddr) -> Result<Self> {
+        if phys & UAT_PGMSK as u64 != 0 {
+            return Err(EINVAL);
+        }
+        let ptr = unsafe {
+            // SAFETY: the caller supplies a page-aligned physical address
+            // obtained from a live firmware UAT PTE. The mapping is used only
+            // for bounded reads and is released by Drop.
+            bindings::memremap(
+                phys,
+                UAT_PGSZ,
+                bindings::MEMREMAP_WB as _,
+            )
+        };
+        let ptr = NonNull::new(ptr).ok_or_else(|| {
+            pr_err!("UAT crash walker: memremap failed for {:#x}\n", phys);
+            ENOMEM
+        })?;
+        Ok(Self { ptr })
+    }
+
+    fn read_u64(&self, offset: usize) -> Result<u64> {
+        let end = offset.checked_add(8).ok_or(EOVERFLOW)?;
+        if offset & 7 != 0 || end > UAT_PGSZ {
+            return Err(EINVAL);
+        }
+        let pointer = unsafe {
+            // SAFETY: offset is qword-aligned and bounded to the mapped page.
+            self.ptr.as_ptr().cast::<u8>().add(offset).cast::<AtomicU64>()
+        };
+        Ok(unsafe { &*pointer }.load(Ordering::Acquire))
+    }
+
+    fn copy_atomic(&self, offset: usize, out: &mut [u8]) -> Result {
+        let end = offset.checked_add(out.len()).ok_or(EOVERFLOW)?;
+        if (offset | out.len()) & 7 != 0 || end > UAT_PGSZ {
+            return Err(EINVAL);
+        }
+        for (index, destination) in out.chunks_exact_mut(size_of::<u64>()).enumerate() {
+            destination.copy_from_slice(
+                &self
+                    .read_u64(offset + index * size_of::<u64>())?
+                    .to_le_bytes(),
+            );
+        }
+        Ok(())
+    }
+}
+
+#[cfg(CONFIG_DEV_COREDUMP)]
+impl Drop for PhysPageMapping {
+    fn drop(&mut self) {
+        unsafe {
+            // SAFETY: ptr was returned by memremap and has not been unmapped.
+            bindings::memunmap(self.ptr.as_ptr());
+        }
     }
 }
 
 impl Drop for UatPageTable {
     fn drop(&mut self) {
         mod_pr_debug!("UATPageTable::drop range: {:#x?}\n", &self.va_range);
-        if self.teardown_children
-            && self
-                .with_pages(self.va_range.clone(), false, true, |iova, ptes| {
-                    for (idx, pte) in ptes.iter().enumerate() {
-                        if pte.load(Ordering::Relaxed) != 0 {
-                            pr_err!(
-                                "UATPageTable::drop: Leaked page at IOVA {:#x}\n",
-                                iova + (idx * UAT_PGSZ) as u64
-                            );
-                        }
+        if self
+            .with_pages(self.va_range.clone(), false, true, |iova, ptes| {
+                for (idx, pte) in ptes.iter().enumerate() {
+                    if pte.load(Ordering::Relaxed) != 0 {
+                        pr_err!(
+                            "UATPageTable::drop: Leaked page at IOVA {:#x}\n",
+                            iova + (idx * UAT_PGSZ) as u64
+                        );
                     }
-                    Ok(())
-                })
-                .is_err()
+                }
+                Ok(())
+            })
+            .is_err()
         {
             pr_err!("UATPageTable::drop failed to free page tables\n",);
         }

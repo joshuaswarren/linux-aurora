@@ -191,14 +191,18 @@ impl FirmwarePageTableRoot {
             return Err(EINVAL);
         }
         let geometry = uat_geometry(self.cfg)?;
+        let end = address.checked_add(size as u64).ok_or(EOVERFLOW)?;
+        if end > geometry.user_va_top() {
+            return Err(EFAULT);
+        }
         let mut data = KVVec::from_elem(0, size, GFP_KERNEL)?;
-        let mut table = UatPageTable::new_borrowed_reader(
+        UatPageTable::copy_from_phys_root(
             self.ttb,
-            0..geometry.user_va_top(),
+            address,
+            &mut data,
             self.cfg.ias,
             self.cfg.oas,
         )?;
-        table.copy_mapped_range(address, &mut data)?;
         Ok(data)
     }
 }
