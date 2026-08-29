@@ -386,9 +386,11 @@ static int dcp_link_push_context(struct apple_dcp *dcp,
 	if (call_tag == APPLE_DCP_H17P_CALL_START_SIGNAL) {
 		afk_log_tx_state(dcp->systemep, "before DCPLink A401");
 		dev_info(dcp->dev,
-			 "DCPLink A401 TX %#llx base %#x offset %#x size %#x top %#x->%#x depth %u header %#x/%u/%u\n",
-			 message, layout.local_offset, offset, payload_size,
-			 old_top, next_top, depth, call_tag, in_len, out_len);
+			 "DCPLink A401 TX endpoint %#x word %#llx channel cmd stream %u remote %u new %u local base %#x remote base %#x offset %#x size %#x top %#x->%#x depth %u header %#x/%u/%u\n",
+			 APPLE_DCP_LINK_ENDPOINT, message, stream, remote,
+			 new_stream, layout.local_offset, layout.remote_offset,
+			 offset, payload_size, old_top, next_top, depth, call_tag,
+			 in_len, out_len);
 	}
 	ret = dcp_send_message_sync(dcp, APPLE_DCP_LINK_ENDPOINT, message);
 	if (call_tag == APPLE_DCP_H17P_CALL_VI_SET_TEMPERATURE_HINT ||
@@ -439,8 +441,12 @@ static void dcp_link_push(struct apple_dcp *dcp, bool oob,
 			  u32 out_len, void *data, dcp_callback_t cb,
 			  void *cookie)
 {
-	dcp_link_push_context(dcp, dcp_call_context(dcp, oob), false, call,
-			      in_len, out_len, data, cb, cookie);
+	enum dcp_context_id context = dcp_call_context(dcp, oob);
+	bool new_stream = context == DCP_CONTEXT_CMD ||
+			  context == DCP_CONTEXT_OOBCMD;
+
+	dcp_link_push_context(dcp, context, new_stream, call, in_len, out_len,
+			      data, cb, cookie);
 }
 
 static const struct dcp_method_entry dcp_link_temperature_hint = {

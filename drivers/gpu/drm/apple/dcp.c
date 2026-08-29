@@ -464,8 +464,8 @@ static int dcp_rtk_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
 			  FIELD_PREP(GENMASK_ULL(51, 44), bfr->size >> 12) |
 			  FIELD_PREP(GENMASK_ULL(43, 0), bfr->iova);
 		dev_info(dcp->dev,
-			 "RTKit preallocated GETBUF %#llx size %#zx DVA %pad PA %pa iomem %p; Normal-NC, no host reply\n",
-			 request, bfr->size, &bfr->iova, &phy_addr,
+			 "RTKit preallocated %s GETBUF %#llx size %#zx DVA %pad PA %pa iomem %p; Normal-NC firmware mapping, no address reply required\n",
+			 owner, request, bfr->size, &bfr->iova, &phy_addr,
 			 bfr->iomem);
 	} else {
 		bfr->buffer = dma_alloc_coherent(dcp->dev, bfr->size,
