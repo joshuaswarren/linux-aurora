@@ -699,9 +699,6 @@ fn finish_boot_session(
             );
         }
         let target = manager.publish_compute_runtime_control_record(index)?;
-        Pin::new(&mut gfx_rtkit)
-            .send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, control_done)?;
-
         let mut counters = manager.control_counters()?;
         for _ in 0..CONTROL_COUNTER_POLLS {
             if counters.primary == [target; 3]
@@ -714,6 +711,19 @@ fn finish_boot_session(
                 || gfx1_state.crashed.load(Ordering::Acquire)
             {
                 return Err(EIO);
+            }
+
+            // The native live-control path re-announces 0x84/0x11 while the
+            // producer is pending. One notification at this transition can
+            // leave the state at [consumer, consumer, producer].
+            Pin::new(&mut gfx_rtkit)
+                .send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, control_done)?;
+            counters = manager.control_counters()?;
+            if counters.primary == [target; 3]
+                && counters.secondary
+                    == [g17_initdata::CONTROL_OPENING_SECONDARY_PRODUCER; 3]
+            {
+                break;
             }
             fsleep(Delta::from_millis(1));
             counters = manager.control_counters()?;
