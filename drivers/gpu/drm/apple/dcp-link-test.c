@@ -332,7 +332,7 @@ static void apple_dcp_h17p_method_test(struct kunit *test)
 				APPLE_DCP_H17P_CALL_PMU_SERVICE_MATCHED,
 				&method),
 			0);
-	KUNIT_EXPECT_EQ(test, method.call, 0x41313336U);
+	KUNIT_EXPECT_EQ(test, method.call, 0x41313331U);
 	KUNIT_EXPECT_EQ(test, method.input_size, 0U);
 	KUNIT_EXPECT_EQ(test, method.output_size, 4U);
 
@@ -341,7 +341,7 @@ static void apple_dcp_h17p_method_test(struct kunit *test)
 				APPLE_DCP_H17P_CALL_BACKLIGHT_SERVICE_MATCHED,
 				&method),
 			0);
-	KUNIT_EXPECT_EQ(test, method.call, 0x41313337U);
+	KUNIT_EXPECT_EQ(test, method.call, 0x41313332U);
 	KUNIT_EXPECT_EQ(test, method.input_size, 0U);
 	KUNIT_EXPECT_EQ(test, method.output_size, 4U);
 
