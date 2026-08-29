@@ -1294,8 +1294,8 @@ impl G17PLiveRuntime {
                 },
             )
         };
-        let doorbell = match submit_result {
-            Ok(doorbell) => doorbell,
+        let notifications = match submit_result {
+            Ok(notifications) => notifications,
             Err(error) => {
                 return match g17_lifecycle::recover_persistent_runtime(self) {
                     Ok(()) => Err(error),
@@ -1303,19 +1303,38 @@ impl G17PLiveRuntime {
                 };
             }
         };
-        let channel_path = doorbell.is_some();
-        if let Some(doorbell) = doorbell {
-            dev_info!(
-                self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
-                "G17P compute: CL_2 group published; ringing work channel 10\n"
-            );
-            if let Err(error) = Pin::new(self.gfx_rtkit.as_mut().ok_or(ENODEV)?)
-                .send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, doorbell)
-            {
-                return match g17_lifecycle::recover_persistent_runtime(self) {
-                    Ok(()) => Err(error),
-                    Err(recovery_error) => Err(recovery_error),
-                };
+        let channel_path = notifications.is_some();
+        if let Some(notifications) = notifications {
+            if let Some(activation) = notifications.activation {
+                dev_info!(
+                    self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                    "G17P compute: CL_2 published; sending priority-2 activation {:#x}\n",
+                    activation
+                );
+                if let Err(error) = Pin::new(self.gfx_rtkit.as_mut().ok_or(ENODEV)?)
+                    .send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, activation)
+                {
+                    return match g17_lifecycle::recover_persistent_runtime(self) {
+                        Ok(()) => Err(error),
+                        Err(recovery_error) => Err(recovery_error),
+                    };
+                }
+            }
+            if let Some(direct_kick) = notifications.direct_kick {
+                fence(Ordering::SeqCst);
+                dev_info!(
+                    self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                    "G17P compute: direct EP kick {:#x} after activation\n",
+                    direct_kick
+                );
+                if let Err(error) = Pin::new(self.gfx_rtkit.as_mut().ok_or(ENODEV)?)
+                    .send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, direct_kick)
+                {
+                    return match g17_lifecycle::recover_persistent_runtime(self) {
+                        Ok(()) => Err(error),
+                        Err(recovery_error) => Err(recovery_error),
+                    };
+                }
             }
         }
 

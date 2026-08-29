@@ -4877,6 +4877,46 @@ mod tests {
     }
 
     #[test]
+    fn g17p_first_bind_tag15_reuses_the_admitted_optional_builder() {
+        const TAG15: &[u8; 0x86] =
+            include_bytes!("fixtures/g17p_first_submit/tag15-config-update-first.bin");
+        const RELOCATION_MASK: &[u8; 0x86] = include_bytes!(
+            "fixtures/g17p_first_submit/tag15-config-update-relocation-mask.bin"
+        );
+        const QUEUE: u64 = 0xffff_fc20_c000_0300;
+        const DESCRIPTOR: u64 = 0xffff_fc20_c035_8000;
+        const CONTEXT_LOW: u64 = 0x70_004d_8000;
+        const CONTEXT_HIGH: u64 = 0xffff_fc20_0027_8000;
+        const SHARED_SUPPORT: u64 = 0xffff_fc20_c087_0000;
+        const CHANNEL_CONTROL: u64 = 0xffff_fc20_c07b_8040;
+
+        let mut graph = [0u8; g17_compute::COMPUTE_QUEUE_GRAPH_SIZE];
+        g17_compute::build_compute_queue_graph(QUEUE, CHANNEL_CONTROL, &mut graph).unwrap();
+        let mut context = vec![0u8; g17_compute::COMPUTE_QUEUE_CONTEXT_EXTENT];
+        g17_compute::build_initial_compute_channel_group(
+            QUEUE,
+            DESCRIPTOR,
+            CONTEXT_LOW,
+            CONTEXT_HIGH,
+            SHARED_SUPPORT,
+            CHANNEL_CONTROL,
+            &mut graph,
+            &mut context,
+        )
+        .unwrap();
+        let actual = &graph
+            [g17_compute::COMPUTE_OPTIONAL..g17_compute::COMPUTE_OPTIONAL + TAG15.len()];
+        assert_eq!(actual, *TAG15);
+        assert!(RELOCATION_MASK.iter().any(|byte| *byte != 0));
+        for index in 0..TAG15.len() {
+            assert_eq!(
+                actual[index] & !RELOCATION_MASK[index],
+                TAG15[index] & !RELOCATION_MASK[index]
+            );
+        }
+    }
+
+    #[test]
     fn t8140_register_windows_expand_to_distinct_uat_pages() {
         let mapped: Vec<_> = g17_initdata::T8140_REGISTER_WINDOWS
             .iter()
