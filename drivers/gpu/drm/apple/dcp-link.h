@@ -595,6 +595,7 @@ apple_dcp_link_handshake_step(enum apple_dcp_link_state *state, u64 message)
 		if ((message & GENMASK_ULL(7, 6)) ||
 		    *state != APPLE_DCP_LINK_WAIT_FIRMWARE_INIT)
 			return APPLE_DCP_LINK_HANDSHAKE_NONE;
+		*state = APPLE_DCP_LINK_WAIT_READY;
 		return APPLE_DCP_LINK_HANDSHAKE_SEND_INIT;
 	case APPLE_DCP_LINK_MSG_READY:
 		if (*state != APPLE_DCP_LINK_WAIT_READY)
