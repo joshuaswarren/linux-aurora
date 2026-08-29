@@ -248,6 +248,133 @@ fn crash_qword(raw: &[u8], index: usize) -> u64 {
 }
 
 #[cfg(CONFIG_DEV_COREDUMP)]
+fn crash_u32(raw: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(raw.get(offset..offset + 4)?.try_into().ok()?))
+}
+
+#[cfg(CONFIG_DEV_COREDUMP)]
+fn crash_u64(raw: &[u8], offset: usize) -> Option<u64> {
+    Some(u64::from_le_bytes(raw.get(offset..offset + 8)?.try_into().ok()?))
+}
+
+#[cfg(CONFIG_DEV_COREDUMP)]
+fn crash_fourcc(a: u8, b: u8, c: u8, d: u8) -> u32 {
+    ((a as u32) << 24) | ((b as u32) << 16) | ((c as u32) << 8) | d as u32
+}
+
+#[cfg(CONFIG_DEV_COREDUMP)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+struct G17PCrashRegisters {
+    pc: u64,
+    far: u64,
+    esr: u64,
+    sp: u64,
+    psr: u64,
+}
+
+#[cfg(CONFIG_DEV_COREDUMP)]
+fn g17p_crash_registers(raw: &[u8]) -> Option<G17PCrashRegisters> {
+    let total = usize::try_from(crash_u32(raw, 8)?).ok()?.min(raw.len());
+    let mut offset = 0x20usize;
+    for _ in 0..64 {
+        let kind = crash_u32(raw, offset)?;
+        let size = usize::try_from(crash_u32(raw, offset + 12)?).ok()?;
+        if kind == crash_fourcc(b'C', b'L', b'H', b'E') {
+            return None;
+        }
+        if size < 16 || offset.checked_add(size)? > total {
+            return None;
+        }
+        if kind == crash_fourcc(b'C', b'r', b'g', b'8') {
+            let body = offset + 16;
+            if size < 16 + 0x350 {
+                return None;
+            }
+            return Some(G17PCrashRegisters {
+                sp: crash_u64(raw, body + 0x100)?,
+                pc: crash_u64(raw, body + 0x108)?,
+                psr: crash_u64(raw, body + 0x110)?,
+                far: crash_u64(raw, body + 0x330)?,
+                esr: crash_u64(raw, body + 0x340)?,
+            });
+        }
+        offset += size;
+    }
+    None
+}
+
+#[cfg(CONFIG_DEV_COREDUMP)]
+fn log_g17p_crash_sections(state: &G17PRoleRtkitState, raw: &[u8]) {
+    let Some(header) = crash_u32(raw, 0) else {
+        return;
+    };
+    let Some(total) = crash_u32(raw, 8).and_then(|value| usize::try_from(value).ok()) else {
+        return;
+    };
+    if header != crash_fourcc(b'C', b'L', b'H', b'E') || total > raw.len() {
+        dev_err!(
+            state.dev.as_ref(),
+            "G17P {} crashlog header invalid: fourcc={:#x} size={:#x}/{:#x}\n",
+            state.processor.name(),
+            header,
+            total,
+            raw.len()
+        );
+        return;
+    }
+    if let Some(regs) = g17p_crash_registers(raw) {
+        dev_err!(
+            state.dev.as_ref(),
+            "G17P {} firmware exception: pc={:#x} far={:#x} esr={:#x} sp={:#x} psr={:#x}\n",
+            state.processor.name(),
+            regs.pc,
+            regs.far,
+            regs.esr,
+            regs.sp,
+            regs.psr
+        );
+    }
+
+    let mut offset = 0x20usize;
+    for _ in 0..64 {
+        let Some(kind) = crash_u32(raw, offset) else {
+            break;
+        };
+        let Some(size) = crash_u32(raw, offset + 12)
+            .and_then(|value| usize::try_from(value).ok())
+        else {
+            break;
+        };
+        if kind == crash_fourcc(b'C', b'L', b'H', b'E') {
+            break;
+        }
+        let Some(end) = offset.checked_add(size) else {
+            break;
+        };
+        if size < 16 || end > total {
+            break;
+        }
+        if kind == crash_fourcc(b'C', b's', b't', b'r') && size >= 20 {
+            let body = offset + 16;
+            let id = crash_u32(raw, body).unwrap_or(0);
+            let bytes = &raw[body + 4..end];
+            let length = bytes.iter().position(|byte| *byte == 0).unwrap_or(bytes.len());
+            let length = length.min(192);
+            if let Ok(message) = core::str::from_utf8(&bytes[..length]) {
+                dev_err!(
+                    state.dev.as_ref(),
+                    "G17P {} firmware message {}: {}\n",
+                    state.processor.name(),
+                    id,
+                    message
+                );
+            }
+        }
+        offset = end;
+    }
+}
+
+#[cfg(CONFIG_DEV_COREDUMP)]
 fn log_crash_buffer_observation(
     state: &G17PRoleRtkitState,
     source: &str,
@@ -289,7 +416,7 @@ fn log_crash_buffer_observation(
 #[cfg(CONFIG_DEV_COREDUMP)]
 fn publish_g17p_crashlogs(
     dev: &kernel::device::Device,
-    records: &[G17PCrashRecord; 2],
+    records: &[G17PCrashRecord],
 ) -> Result {
     let mut crashdump = crate::crashdump::CrashDumpBuilder::new(KVVec::new())?;
     for record in records {
@@ -318,26 +445,20 @@ fn retain_g17p_crashlog(
     original_size: usize,
     crashlog: KVVec<u8>,
 ) -> Result {
-    let mut capture = state.crash_capture.lock();
-    capture.records[state.processor as usize] = Some(G17PCrashRecord {
+    let record = G17PCrashRecord {
         processor: state.processor,
         original_size,
         crashlog,
-    });
-    if capture.records[0].is_none() || capture.records[1].is_none() {
-        dev_info!(
-            state.dev.as_ref(),
-            "G17P {} crashlog retained; waiting for the other processor\n",
-            state.processor.name()
-        );
-        return Ok(());
-    }
-    let records = [
-        capture.records[0].take().ok_or(EIO)?,
-        capture.records[1].take().ok_or(EIO)?,
-    ];
-    core::mem::drop(capture);
-    publish_g17p_crashlogs(state.dev.as_ref(), &records)
+    };
+    publish_g17p_crashlogs(state.dev.as_ref(), core::slice::from_ref(&record))?;
+    let mut capture = state.crash_capture.lock();
+    capture.records[state.processor as usize] = Some(record);
+    dev_info!(
+        state.dev.as_ref(),
+        "G17P {} crashlog published and retained\n",
+        state.processor.name()
+    );
+    Ok(())
 }
 
 #[cfg(CONFIG_DEV_COREDUMP)]
@@ -346,6 +467,7 @@ fn retain_g17p_crashlog_slice(
     original_size: usize,
     crashlog: &[u8],
 ) -> Result {
+    log_g17p_crash_sections(state, crashlog);
     let mut retained = KVVec::new();
     retained.extend_from_slice(crashlog, GFP_KERNEL)?;
     retain_g17p_crashlog(state, original_size, retained)
@@ -360,6 +482,7 @@ fn capture_g17p_firmware_crash_dva(state: &G17PRoleRtkitState) -> Result {
         captured_size,
     )?;
     log_crash_buffer_observation(state, "firmware-physical", &physical, 0);
+    log_g17p_crash_sections(state, &physical);
     dev_info!(
         state.dev.as_ref(),
         "G17P {} crashlog copied from firmware data PA {:#x} ({} bytes)\n",
@@ -658,12 +781,6 @@ fn finish_boot_session(
     dev_info!(
         pdev.as_ref(),
         "G17P compute control: primary done sent before startup work publication\n"
-    );
-
-    manager.publish_bootstrap_render_operand_table()?;
-    dev_info!(
-        pdev.as_ref(),
-        "G17P compute control: firmware binding complete; operand table published\n"
     );
 
     manager.split_compute_bootstrap_render_contexts()?;
