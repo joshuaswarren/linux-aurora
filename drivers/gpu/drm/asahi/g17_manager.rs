@@ -445,7 +445,8 @@ impl G17PManagerConstruction {
         &mut self,
         dev: &AsahiDevice,
     ) -> Result<g17_submission::PreparedG17PPartialOpeningWorkPair> {
-        let vm = self.resources.uat().kernel_lower_vm().clone();
+        let kernel_range = self.resources.uat().kernel_va_range()?;
+        let vm = self.new_user_vm(0x8140_b007, kernel_range)?;
         let mut parameters = g17_render::G17pRenderParameters::source_rsrc8();
         parameters.encoder = g17_resources::G17P_BOOTSTRAP_VDM_VA;
         parameters.process_empty_tiles = false;
@@ -490,6 +491,9 @@ impl G17PManagerConstruction {
                 self.render_bind = None;
                 self.render_storage = None;
                 self.render_submission_ordinal = 0;
+                self.resources
+                    .uat()
+                    .restore_t8140_kernel_context_after_bootstrap_render()?;
                 return Ok(());
             }
             fsleep(Delta::from_millis(1));
