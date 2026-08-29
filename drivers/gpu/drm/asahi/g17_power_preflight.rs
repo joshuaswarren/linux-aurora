@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! Fail-closed G17 cold-boot and power preflight.
+//! G17 cold-boot and power preflight.
 //!
 //! This module joins three independently grounded contracts without issuing
 //! MMIO, mailbox traffic, DMA, or firmware writes:
@@ -303,28 +303,67 @@ impl G17PowerPreflight {
         observed_t8140_topology: Option<&agx_power_recovery::T8140G17PAdtTopology>,
     ) -> Result<Self, G17PowerPreflightError> {
         let target = validate_identity(identity)?;
-        let t8140_strategy = match (target, observed_t8140_topology) {
-            (G17PowerTarget::G17P, Some(observed))
-                if agx_power_recovery::decode_t8140_g17p_asc_providers(observed)
-                    == Some(T8140_G17P_PLATFORM_STRATEGY.asc_providers) =>
-            {
-                Some(T8140_G17P_PLATFORM_STRATEGY)
-            }
-            (G17PowerTarget::G17P, Some(_)) => {
-                return Err(G17PowerPreflightError::UnexpectedT8140Topology)
-            }
-            (G17PowerTarget::G17P, None) => {
-                return Err(G17PowerPreflightError::MissingT8140Topology)
-            }
-            (_, Some(_)) => return Err(G17PowerPreflightError::UnexpectedT8140Topology),
-            (_, None) => None,
-        };
+        let decoded = observed_t8140_topology
+            .map(agx_power_recovery::decode_t8140_g17p_asc_providers);
+        let t8140_strategy = Self::admit_t8140_strategy(target, decoded)?;
 
         Ok(Self {
             target,
             t8140_strategy,
             boot: g17_boot::DualRoleBoot::new(),
         })
+    }
+
+    /// Bind a preflight from what a *Linux* platform decoder can observe.
+    ///
+    /// This is the production T8140 entry point: the Linux device tree does
+    /// not carry the full ADT node, but its GPU node's two `mboxes` expose
+    /// exactly the dual ASCWrap v6 provider topology. The observation is
+    /// bus-translated and then compared against the pinned D93AP providers;
+    /// only an exact match admits the A18 Pro platform strategy. Supplying
+    /// the expected constant without observing the device remains impossible
+    /// from this path — the caller passes raw `reg`/interrupt values it read
+    /// from the live tree.
+    pub(crate) fn new_with_linux_dt(
+        identity: &identity::GpuIdentity,
+        observed: Option<&agx_power_recovery::T8140G17PLinuxDtTopology>,
+    ) -> Result<Self, G17PowerPreflightError> {
+        let target = validate_identity(identity)?;
+        let decoded =
+            observed.map(agx_power_recovery::decode_t8140_g17p_asc_providers_from_linux_dt);
+        let t8140_strategy = Self::admit_t8140_strategy(target, decoded)?;
+
+        Ok(Self {
+            target,
+            t8140_strategy,
+            boot: g17_boot::DualRoleBoot::new(),
+        })
+    }
+
+    /// Admit the T8140/G17P platform strategy from decoded providers.
+    ///
+    /// `decoded` is `None` when no topology observation was supplied at all,
+    /// `Some(None)` when an observation was supplied but did not decode, and
+    /// `Some(Some(providers))` when it decoded. Only providers exactly equal
+    /// to the pinned D93AP expectation admit the strategy; every other
+    /// combination fails closed.
+    fn admit_t8140_strategy(
+        target: G17PowerTarget,
+        decoded: Option<Option<[agx_power_recovery::T8140G17PAscProvider; 2]>>,
+    ) -> Result<Option<T8140G17PPlatformStrategy>, G17PowerPreflightError> {
+        match (target, decoded) {
+            (G17PowerTarget::G17P, Some(Some(providers)))
+                if providers == T8140_G17P_PLATFORM_STRATEGY.asc_providers =>
+            {
+                Ok(Some(T8140_G17P_PLATFORM_STRATEGY))
+            }
+            (G17PowerTarget::G17P, Some(_)) => {
+                Err(G17PowerPreflightError::UnexpectedT8140Topology)
+            }
+            (G17PowerTarget::G17P, None) => Err(G17PowerPreflightError::MissingT8140Topology),
+            (_, Some(_)) => Err(G17PowerPreflightError::UnexpectedT8140Topology),
+            (_, None) => Ok(None),
+        }
     }
 
     pub(crate) const fn target(&self) -> G17PowerTarget {
@@ -547,6 +586,86 @@ mod tests {
         }
     }
 
+    fn j700_linux_dt_topology() -> agx_power_recovery::T8140G17PLinuxDtTopology {
+        agx_power_recovery::T8140G17PLinuxDtTopology {
+            gfx: agx_power_recovery::T8140G17PLinuxDtAscObservation {
+                role_is_gfx1: false,
+                wrapper_cpu_base: 0x4_8260_0000,
+                wrapper_size: 0x0008_8000,
+                iorvbar_cpu_base: 0x4_8205_0000,
+                iorvbar_size: 8,
+                send_empty_irq: 993,
+                recv_not_empty_irq: 996,
+            },
+            gfx1: agx_power_recovery::T8140G17PLinuxDtAscObservation {
+                role_is_gfx1: true,
+                wrapper_cpu_base: 0x4_82e0_0000,
+                wrapper_size: 0x0008_8000,
+                iorvbar_cpu_base: 0x4_8285_0000,
+                iorvbar_size: 8,
+                send_empty_irq: 997,
+                recv_not_empty_irq: 1000,
+            },
+        }
+    }
+
+    #[test]
+    fn linux_dt_observation_admits_g17p_exactly() {
+        let identity = id(0x0a, 0);
+        let exact = j700_linux_dt_topology();
+
+        // No observation means missing topology. Never substitute the constant.
+        assert_eq!(
+            G17PowerPreflight::new_with_linux_dt(&identity, None).unwrap_err(),
+            G17PowerPreflightError::MissingT8140Topology
+        );
+
+        // The exact J700 observation selects the same strategy as the exact
+        // D93AP ADT observation.
+        let preflight = G17PowerPreflight::new_with_linux_dt(&identity, Some(&exact)).unwrap();
+        assert_eq!(
+            preflight.t8140_strategy(),
+            new_preflight(&identity).unwrap().t8140_strategy()
+        );
+
+        // A perturbed observation is refused, not "close enough".
+        let mut wrong_irq = exact;
+        wrong_irq.gfx.send_empty_irq = 994;
+        assert_eq!(
+            G17PowerPreflight::new_with_linux_dt(&identity, Some(&wrong_irq)).unwrap_err(),
+            G17PowerPreflightError::UnexpectedT8140Topology
+        );
+
+        let mut collapsed = exact;
+        collapsed.gfx1.wrapper_cpu_base = exact.gfx.wrapper_cpu_base;
+        assert_eq!(
+            G17PowerPreflight::new_with_linux_dt(&identity, Some(&collapsed)).unwrap_err(),
+            G17PowerPreflightError::UnexpectedT8140Topology
+        );
+
+        // An observation that cannot even be bus-translated is refused.
+        let mut untranslatable = exact;
+        untranslatable.gfx.wrapper_cpu_base = 0x1000;
+        assert_eq!(
+            G17PowerPreflight::new_with_linux_dt(&identity, Some(&untranslatable)).unwrap_err(),
+            G17PowerPreflightError::UnexpectedT8140Topology
+        );
+
+        // Non-G17P targets never take a T8140 observation.
+        for other in [id(0x0b, 2), id(0x0b, 3)] {
+            assert_eq!(
+                G17PowerPreflight::new_with_linux_dt(&other, Some(&exact)).unwrap_err(),
+                G17PowerPreflightError::UnexpectedT8140Topology
+            );
+            assert_eq!(
+                G17PowerPreflight::new_with_linux_dt(&other, None)
+                    .unwrap()
+                    .t8140_strategy(),
+                None
+            );
+        }
+    }
+
     #[test]
     fn text_evidence_remains_target_specific() {
         let p = new_preflight(&id(0x0a, 0)).unwrap();
@@ -727,6 +846,8 @@ mod tests {
                 REQUIRED_LIVE_EVIDENCE
                     & !missing_live::FIRMWARE_LOAD_CACHE_MAINTENANCE
                     & !missing_live::ASC_WRAPPER_MMIO_ENABLE
+                    & !missing_live::ASC_CONTROL_APERTURE_OWNERSHIP
+                    & !missing_live::ASC_TEARDOWN_OWNER
             );
             assert!(initial.contains(missing_live::COLD_BOOT_OBSERVATION));
             complete_cold_boot(&mut preflight);
@@ -737,6 +858,8 @@ mod tests {
                     & !missing_live::FIRMWARE_LOAD_CACHE_MAINTENANCE
                     & !missing_live::COLD_BOOT_OBSERVATION
                     & !missing_live::ASC_WRAPPER_MMIO_ENABLE
+                    & !missing_live::ASC_CONTROL_APERTURE_OWNERSHIP
+                    & !missing_live::ASC_TEARDOWN_OWNER
             );
             assert!(!complete.contains(missing_live::COLD_BOOT_OBSERVATION));
             for bit in [
@@ -748,14 +871,14 @@ mod tests {
                 missing_live::GFX1_POWER_SEQUENCE,
                 missing_live::RECOVERY_HANDSHAKE,
                 missing_live::PMGR_ASC_GATE_ORDER,
-                missing_live::ASC_CONTROL_APERTURE_OWNERSHIP,
                 missing_live::IORVBAR_DMA_VISIBILITY,
-                missing_live::ASC_TEARDOWN_OWNER,
             ] {
                 assert!(complete.contains(bit));
             }
             assert!(!complete.contains(missing_live::FIRMWARE_LOAD_CACHE_MAINTENANCE));
             assert!(!complete.contains(missing_live::ASC_WRAPPER_MMIO_ENABLE));
+            assert!(!complete.contains(missing_live::ASC_CONTROL_APERTURE_OWNERSHIP));
+            assert!(!complete.contains(missing_live::ASC_TEARDOWN_OWNER));
         }
         assert!(!g17_boot::EXECUTABLE_G17X_FIRMWARE_START_HANDSHAKE_AVAILABLE);
         assert!(!agx_power_recovery::EXECUTABLE_GFX1_POWER_SEQUENCE_AVAILABLE);

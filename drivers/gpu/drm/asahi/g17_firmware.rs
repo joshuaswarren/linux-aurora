@@ -175,6 +175,11 @@ pub(crate) enum G17FirmwareError {
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum G17LoadedFirmwareError {
     UnsupportedVariant,
+    /// The variant is known (G17P) but the corpus pins no loaded-segment
+    /// identity for it: T8140 role images are iBoot-loaded carveouts and the
+    /// firmware's own init-data version-word gate is the grounded identity
+    /// check there, not an m1n1 loaded-pair handoff.
+    NoPinnedLoadedIdentity,
     MissingGfx,
     MissingGfx1,
     InvalidGfx,
@@ -298,8 +303,12 @@ fn get_u64(data: &[u8], offset: usize) -> Option<u64> {
     Some(u64::from_le_bytes(bytes))
 }
 
-fn expected_tag(variant: G17FirmwareVariant) -> [u8; 4] {
-    g17_nested_firmware_identity(FirmwareRole::Gfx, variant).entry_tag
+/// The FTAB entry tag for one variant, when the corpus pins one. G17P has no
+/// pinned FTAB pair, so it selects nothing.
+fn expected_tag(variant: G17FirmwareVariant) -> Result<[u8; 4], G17FirmwareError> {
+    g17_nested_firmware_identity(FirmwareRole::Gfx, variant)
+        .map(|identity| identity.entry_tag)
+        .ok_or(G17FirmwareError::UnknownVariant)
 }
 
 fn select_nested<'a>(
@@ -332,7 +341,7 @@ fn select_nested<'a>(
 
     let tags = [*b"a010", *b"a000"];
     let mut selected = None;
-    let wanted = expected_tag(variant);
+    let wanted = expected_tag(variant)?;
     for (index, tag) in tags.iter().enumerate() {
         let descriptor = FTAB_TABLE_OFFSET + index * FTAB_ENTRY_SIZE;
         let offset = FTAB_TABLE_END + index * layout.entry_length;
@@ -591,7 +600,13 @@ fn admit_g17_loaded_pair_against(
     expected_gfx1: &G17LoadedRoleIdentity,
 ) -> Result<G17FirmwareIdentityAdmission, G17LoadedFirmwareError> {
     // This path is intentionally narrower than the raw FTAB validator. The
-    // captured live handoff proves only the G17S/a010 role pair.
+    // captured live handoff proves only the G17S/a010 role pair. G17P is a
+    // *known* variant with no pinned loaded identity (T8140 firmware identity
+    // is the init-data version-word gate instead), so it gets its own
+    // fail-closed reason rather than "unsupported".
+    if raw_variant == G17FirmwareVariant::G17P as u8 {
+        return Err(G17LoadedFirmwareError::NoPinnedLoadedIdentity);
+    }
     if raw_variant != G17FirmwareVariant::G17S as u8 {
         return Err(G17LoadedFirmwareError::UnsupportedVariant);
     }
@@ -711,6 +726,15 @@ pub(crate) fn admit_g17_loaded_pair_from_handoff(
     )
     .as_bytes();
 
+    if raw_variant == G17FirmwareVariant::G17P as u8 {
+        // Known variant, but no loaded-pair identity exists to admit: T8140
+        // role images are iBoot-loaded carveouts and m1n1 publishes no
+        // g17-firmware-handoff node for them. The probe path for T8140 keys
+        // firmware identity off the init-data version-word gate instead.
+        return Err(G17LoadedHandoffError::Admission(
+            G17LoadedFirmwareError::NoPinnedLoadedIdentity,
+        ));
+    }
     if raw_variant != G17FirmwareVariant::G17S as u8 {
         return Err(G17LoadedHandoffError::Admission(
             G17LoadedFirmwareError::UnsupportedVariant,
@@ -856,7 +880,8 @@ fn validate_selected_nested(
     variant: G17FirmwareVariant,
     image: &[u8],
 ) -> Result<(), G17FirmwareError> {
-    let expected = g17_nested_firmware_identity(role, variant);
+    let expected =
+        g17_nested_firmware_identity(role, variant).ok_or(G17FirmwareError::UnknownVariant)?;
     if image.len() != expected.size as usize {
         return Err(G17FirmwareError::NestedSizeMismatch);
     }
@@ -1215,7 +1240,7 @@ mod tests {
             Err(G17LoadedFirmwareError::InvalidGfx)
         );
 
-        for variant in [b'C', b'G', b'P', b'A', 0, u8::MAX] {
+        for variant in [b'C', b'G', b'A', 0, u8::MAX] {
             assert_eq!(
                 admit_g17_loaded_pair_against(
                     variant,
@@ -1227,6 +1252,19 @@ mod tests {
                 Err(G17LoadedFirmwareError::UnsupportedVariant)
             );
         }
+
+        // G17P is a known variant with no pinned loaded identity: it must
+        // fail closed with its own reason, never admit.
+        assert_eq!(
+            admit_g17_loaded_pair_against(
+                b'P',
+                Some(&gfx.observation()),
+                Some(&gfx1.observation()),
+                &expected_gfx,
+                &expected_gfx1,
+            ),
+            Err(G17LoadedFirmwareError::NoPinnedLoadedIdentity)
+        );
     }
 
     #[test]

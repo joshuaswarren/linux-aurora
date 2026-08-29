@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! Device-derived G17 ASC power/boot/teardown contract.
+//! Device-derived G17 ASC power, boot, and teardown contract.
 //!
-//! This is a pure validator.  It does not map an ASC aperture, request a
-//! power domain, write IORVBAR, release a CPU, or claim that Linux owns any
-//! of those operations.  The ordering and register transforms below come
-//! from the pinned 25G83 G17P/G17G/G17S AppleA7IOP, ASCWrap-v6, RTBuddy, and
-//! AGX host images.  Unknown PMGR and resource-ownership steps remain closed.
+//! This file is a pure validator. The ordering and register transforms come
+//! from the pinned 25G83 G17P, G17G, and G17S AppleA7IOP, ASCWrap v6, RTBuddy,
+//! and AGX host images. The mailbox provider now owns the exact CPU start and
+//! stop transforms. Remaining power, IOP VBAR, and cold-state work stays
+//! explicit below.
 
 #![cfg_attr(not(test), allow(dead_code))]
 
@@ -86,14 +86,57 @@ pub(crate) const fn g17_asc_text_evidence(target: G17AscEvidenceTarget) -> G17As
 /// diagnostic string addresses after normalizing PC-relative references.
 pub(crate) const G17_ASC_BRIDGE_TARGET_PARITY_PROVEN: bool = true;
 
+/// G17P-only text anchors for the teardown details recovered after the common
+/// P/G/S bridge audit.  These are deliberately separate from
+/// [`G17AscTextEvidence`]: equivalent G17G/G17S bodies have not been admitted.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PAscTeardownTextEvidence {
+    pub(crate) a7iop_set_mapper_active: u64,
+    pub(crate) a7iop_disable_power: u64,
+    pub(crate) a7iop_turn_off_domain: u64,
+    pub(crate) a7iop_enable_mailbox_interrupts: u64,
+    pub(crate) ascwrap_unmap_firmware: u64,
+    pub(crate) ascwrap_enable_outbox: u64,
+    pub(crate) ascwrap_disable_all_interrupts: u64,
+    pub(crate) ascwrap_enable_inbox_interrupt: u64,
+    pub(crate) ascwrap_enable_outbox_interrupt: u64,
+    pub(crate) armio_device_enable_clock: u64,
+    pub(crate) armio_device_enable_power: u64,
+    pub(crate) h17p_platformio_enable_clock: u64,
+    pub(crate) h17p_platformio_enable_power: u64,
+}
+
+pub(crate) const G17P_ASC_TEARDOWN_TEXT_EVIDENCE: G17PAscTeardownTextEvidence =
+    G17PAscTeardownTextEvidence {
+        a7iop_set_mapper_active: 0xffff_fe00_08ab_d394,
+        a7iop_disable_power: 0xffff_fe00_08ab_c648,
+        a7iop_turn_off_domain: 0xffff_fe00_08ab_c69c,
+        a7iop_enable_mailbox_interrupts: 0xffff_fe00_08ab_d580,
+        ascwrap_unmap_firmware: 0xffff_fe00_08ab_a298,
+        ascwrap_enable_outbox: 0xffff_fe00_08ab_a944,
+        ascwrap_disable_all_interrupts: 0xffff_fe00_08ab_ab4c,
+        ascwrap_enable_inbox_interrupt: 0xffff_fe00_08ab_ab54,
+        ascwrap_enable_outbox_interrupt: 0xffff_fe00_08ab_ab5c,
+        armio_device_enable_clock: 0xffff_fe00_08b0_b0d8,
+        armio_device_enable_power: 0xffff_fe00_08b0_b1e8,
+        h17p_platformio_enable_clock: 0xffff_fe00_09a8_9080,
+        h17p_platformio_enable_power: 0xffff_fe00_09a8_9154,
+    };
+
 pub(crate) const ASC_CPU_CONTROL_OFFSET: u32 = 0x44;
 pub(crate) const ASC_CPU_RUN_BIT: u32 = 0x10;
 /// `_runCPU(false)` clears this second bit after clearing RUN and rereading.
 /// Apple does not name its meaning in the recovered method, so neither do we.
 pub(crate) const ASC_CPU_STOP_SECOND_CLEAR_BIT: u32 = 0x20;
+pub(crate) const ASC_CPU_STATUS_OFFSET: u32 = 0x48;
+pub(crate) const ASC_CPU_STATUS_RUNNING_BIT: u32 = 1 << 0;
+pub(crate) const ASC_CPU_STATUS_STOPPED_BIT: u32 = 1 << 1;
+pub(crate) const ASC_CPU_STATUS_IDLE_BIT: u32 = 1 << 5;
 pub(crate) const ASC_IORVBAR_VALID_BIT: u64 = 1;
 pub(crate) const ASC_CPU_CTRL_FILTERED_PROPERTY: &str = "cpu-ctrl-filtered";
 pub(crate) const ASC_IDLE_CTRL_CHECK_PROPERTY: &str = "idle-ctrl-check";
+pub(crate) const ASCWRAP_V6_OUTBOX_CONTROL_OFFSET: u32 = 0x8114;
+pub(crate) const ASCWRAP_V6_MAILBOX_ENABLE_BIT: u32 = 1;
 
 /// Both ASC providers in every pinned G17 DeviceTree omit these properties.
 /// `AppleA7IOP::start` initializes the object flag at +0x132 to one and clears
@@ -262,6 +305,41 @@ pub(crate) const fn asc_run_cpu_plan(run: bool, wrapper_mmio_enabled: bool) -> A
         }
     }
 }
+
+/// Exact ASCWrap-v6 `_enableOutbox(bool)` transform.  The method reads through
+/// the wrapper accessor at +0x8114, changes only bit zero, and writes the result
+/// to the provider-owned wrapper mapping.
+pub(crate) const fn asc_outbox_control_value(current: u32, enabled: bool) -> u32 {
+    (current & !ASCWRAP_V6_MAILBOX_ENABLE_BIT)
+        | if enabled {
+            ASCWRAP_V6_MAILBOX_ENABLE_BIT
+        } else {
+            0
+        }
+}
+
+/// `AppleA7IOP::enableMailboxInterrupts(bool)` skips all work when the object
+/// byte at +0x121 is set.  Otherwise it toggles two OS event sources, in this
+/// order, using the standard enable/disable vtable slots.  ASCWrap-v6's three
+/// hardware-specific interrupt hooks are no-op `bti; ret` bodies, so a Linux
+/// provider must quiesce its two IRQ sources rather than invent a wrapper mask.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct A7IopMailboxInterruptContract {
+    pub(crate) skip_event_sources_flag_offset: u16,
+    pub(crate) event_source_offsets: [u16; 2],
+    pub(crate) enable_vtable_offset: u16,
+    pub(crate) disable_vtable_offset: u16,
+    pub(crate) ascwrap_hardware_hooks_perform_mmio: bool,
+}
+
+pub(crate) const G17_A7IOP_MAILBOX_INTERRUPT_CONTRACT: A7IopMailboxInterruptContract =
+    A7IopMailboxInterruptContract {
+        skip_event_sources_flag_offset: 0x121,
+        event_source_offsets: [0x180, 0xf0],
+        enable_vtable_offset: 0x170,
+        disable_vtable_offset: 0x178,
+        ascwrap_hardware_hooks_perform_mmio: false,
+    };
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum IorvbarError {
@@ -442,6 +520,266 @@ pub(crate) fn validate_linux_asc_owner_contract(observed: G17LinuxAscOwnerContra
         && observed.lifecycle_client == LinuxAscOwner::DrmAsahi
 }
 
+/// Exact provider map object released by `AppleASCWrapV6::_unmapFirmware()`.
+/// The Apple owner invokes `IOMemoryMap::unmap(true)`, releases the object, and
+/// clears its retained pointer.  Linux's firmware DMA publication is instead
+/// DRM-owned, so this contract is evidence for the required handoff and not
+/// permission for apple-mailbox to unmap the client's buffer.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17AscFirmwareUnmapContract {
+    pub(crate) retained_map_offset: u16,
+    pub(crate) unmap_vtable_offset: u16,
+    pub(crate) unmap_argument: bool,
+    pub(crate) release_vtable_offset: u16,
+    pub(crate) clears_retained_pointer: bool,
+}
+
+pub(crate) const G17_ASC_FIRMWARE_UNMAP_CONTRACT: G17AscFirmwareUnmapContract =
+    G17AscFirmwareUnmapContract {
+        retained_map_offset: 0x1a0,
+        unmap_vtable_offset: 0x150,
+        unmap_argument: true,
+        release_vtable_offset: 0x28,
+        clears_retained_pointer: true,
+    };
+
+/// Exact `AppleA7IOP::_setMapperActive(bool)` callPlatformFunction ABI.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17AscMapperActiveContract {
+    pub(crate) mapper_object_offset: u16,
+    pub(crate) function_name: &'static str,
+    pub(crate) call_platform_function_vtable_offset: u16,
+    pub(crate) wait_for_function: bool,
+    pub(crate) active_parameter_index: u8,
+    pub(crate) trailing_null_parameters: u8,
+    pub(crate) opt_out_property: &'static str,
+}
+
+pub(crate) const G17_ASC_MAPPER_ACTIVE_CONTRACT: G17AscMapperActiveContract =
+    G17AscMapperActiveContract {
+        mapper_object_offset: 0x138,
+        function_name: "setActive",
+        call_platform_function_vtable_offset: 0x6f0,
+        wait_for_function: false,
+        active_parameter_index: 1,
+        trailing_null_parameters: 3,
+        opt_out_property: "no-activate-mapper",
+    };
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum G17PAscRole {
+    Gfx,
+    Gfx1,
+}
+
+/// Index-zero operands resolved by AppleARMIODevice from each shipping J700AP
+/// ASC provider. `clock-ids = <0x15f>` is shared metadata; the actual
+/// enableDeviceClock operand is the first `clock-gates` entry. Both gate IDs
+/// are virtual `no_ps` devices in Apple's PMGR table, so neither is a direct
+/// register operand.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PAscPowerOperands {
+    pub(crate) role: G17PAscRole,
+    pub(crate) index: u8,
+    pub(crate) clock_gate_id: u32,
+    pub(crate) power_gate_id: u32,
+    pub(crate) clock_id_metadata: u32,
+    pub(crate) pmgr_device_name: &'static str,
+    pub(crate) pmgr_device_has_power_state_register: bool,
+    pub(crate) pmgr_parent_device_id: u16,
+}
+
+pub(crate) const G17P_ASC_POWER_OPERANDS: [G17PAscPowerOperands; 2] = [
+    G17PAscPowerOperands {
+        role: G17PAscRole::Gfx,
+        index: 0,
+        clock_gate_id: 0xed,
+        power_gate_id: 0xed,
+        clock_id_metadata: 0x15f,
+        pmgr_device_name: "GFX-ASC",
+        pmgr_device_has_power_state_register: false,
+        pmgr_parent_device_id: 40,
+    },
+    G17PAscPowerOperands {
+        role: G17PAscRole::Gfx1,
+        index: 0,
+        clock_gate_id: 0x141,
+        power_gate_id: 0x141,
+        clock_id_metadata: 0x15f,
+        pmgr_device_name: "GFX-ASC1",
+        pmgr_device_has_power_state_register: false,
+        pmgr_parent_device_id: 40,
+    },
+];
+
+/// Immutable PMGR topology decoded from the pinned live 25F80 J700AP
+/// DeviceTree.
+/// Device IDs 237 and 321 carry the raw flag value `0x10` (`no_ps`), have no
+/// state register, and both resolve to the real GFX parent at PMGR offset
+/// `0x1f0`. Linux already names exactly that register `ps_gfx`; all three
+/// Linux devices (GPU, GFX ASC, GFX1 ASC) share the same genpd and therefore
+/// require reference-counted ownership instead of per-role MMIO writes.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PSharedGfxPowerTopology {
+    pub(crate) device_tree_im4p_sha256: &'static str,
+    pub(crate) role_device_ids: [u16; 2],
+    pub(crate) role_device_raw_flags: [u8; 2],
+    pub(crate) shared_parent_device_id: u16,
+    pub(crate) shared_parent_name: &'static str,
+    pub(crate) shared_parent_parents: [u16; 2],
+    pub(crate) pmgr_group: u8,
+    pub(crate) pmgr_group_base: u64,
+    pub(crate) parent_register_offset: u32,
+    pub(crate) parent_register_address: u64,
+    pub(crate) linux_genpd_label: &'static str,
+}
+
+pub(crate) const G17P_SHARED_GFX_POWER_TOPOLOGY: G17PSharedGfxPowerTopology =
+    G17PSharedGfxPowerTopology {
+        device_tree_im4p_sha256: "290a36da7dbf24d8ab45681bee4896352eee4f103c3a0d4b116bac6d6e74f41a",
+        role_device_ids: [237, 321],
+        role_device_raw_flags: [0x10, 0x10],
+        shared_parent_device_id: 40,
+        shared_parent_name: "GFX",
+        shared_parent_parents: [29, 31],
+        pmgr_group: 0,
+        pmgr_group_base: 0x3007_00000,
+        parent_register_offset: 0x1f0,
+        parent_register_address: 0x3007_001f0,
+        linux_genpd_label: "gfx",
+    };
+
+/// AppleARMIODevice's two public calls load the selected gate ID from their
+/// own arrays, then invoke the platform provider. These offsets and vtable
+/// slots prevent a future Linux adaptation from confusing the `clock-ids`
+/// metadata with the virtual PMGR device ID actually passed to the provider.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PAscPowerCallContract {
+    pub(crate) provider_object_offset: u16,
+    pub(crate) clock_count_offset: u16,
+    pub(crate) clock_gate_array_offset: u16,
+    pub(crate) power_count_offset: u16,
+    pub(crate) power_gate_array_offset: u16,
+    pub(crate) provider_enable_clock_vtable_offset: u16,
+    pub(crate) provider_enable_power_vtable_offset: u16,
+}
+
+pub(crate) const G17P_ASC_POWER_CALL_CONTRACT: G17PAscPowerCallContract =
+    G17PAscPowerCallContract {
+        provider_object_offset: 0x88,
+        clock_count_offset: 0xa0,
+        clock_gate_array_offset: 0xa8,
+        power_count_offset: 0xb0,
+        power_gate_array_offset: 0xb8,
+        provider_enable_clock_vtable_offset: 0x8a8,
+        provider_enable_power_vtable_offset: 0x8b0,
+    };
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum G17AscPowerOffStep {
+    ProviderEnableDeviceClockFalseIndexZero,
+    ProviderEnableDevicePowerFalseNullStatusIndexZero,
+}
+
+/// `_disablePower()` calls the provider clock edge first and the provider
+/// power edge second. Both select index zero; the power status pointer is null.
+pub(crate) const G17_ASC_POWER_OFF_ORDER: [G17AscPowerOffStep; 2] = [
+    G17AscPowerOffStep::ProviderEnableDeviceClockFalseIndexZero,
+    G17AscPowerOffStep::ProviderEnableDevicePowerFalseNullStatusIndexZero,
+];
+
+pub(crate) fn validate_g17_asc_power_off_order(observed: &[G17AscPowerOffStep]) -> bool {
+    observed == G17_ASC_POWER_OFF_ORDER
+}
+
+/// Linux adaptation of the Apple stop edge at the ownership boundary. The
+/// client-owned DMA revocation replaces ASCWrap's retained IOMemoryMap release
+/// at the same position: after CPU stop and before mapper/power teardown. The
+/// two Apple provider calls remain recorded above, but Linux must release its
+/// reference-counted `ps_gfx` attachment once and verify the real shared
+/// parent, never issue fabricated writes for virtual IDs 237 or 321.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum G17LinuxAscTeardownStep {
+    ProviderDisableOutbox,
+    ProviderDisableMailboxIrqSources,
+    ProviderBoundedIdleProbe,
+    ProviderRunCpuFalse,
+    ClientRevokeFirmwareDmaPublication,
+    ProviderSetMapperInactive,
+    ProviderReleaseSharedGfxRuntimeReference,
+    ProviderVerifySharedGfxParentPowerGatedIfLastConsumer,
+    ProviderClearRunningState,
+}
+
+/// Reverse of the currently admitted primary-then-secondary acquisition.
+/// A coordinated DRM client must stop both providers in this order before
+/// either provider can release the shared GFX power-domain reference.
+pub(crate) const G17P_LINUX_ROLE_TEARDOWN_ORDER: [G17PAscRole; 2] =
+    [G17PAscRole::Gfx1, G17PAscRole::Gfx];
+
+pub(crate) const G17_LINUX_ASC_TEARDOWN_ORDER: [G17LinuxAscTeardownStep; 9] = [
+    G17LinuxAscTeardownStep::ProviderDisableOutbox,
+    G17LinuxAscTeardownStep::ProviderDisableMailboxIrqSources,
+    G17LinuxAscTeardownStep::ProviderBoundedIdleProbe,
+    G17LinuxAscTeardownStep::ProviderRunCpuFalse,
+    G17LinuxAscTeardownStep::ClientRevokeFirmwareDmaPublication,
+    G17LinuxAscTeardownStep::ProviderSetMapperInactive,
+    G17LinuxAscTeardownStep::ProviderReleaseSharedGfxRuntimeReference,
+    G17LinuxAscTeardownStep::ProviderVerifySharedGfxParentPowerGatedIfLastConsumer,
+    G17LinuxAscTeardownStep::ProviderClearRunningState,
+];
+
+pub(crate) fn validate_g17_linux_asc_teardown_order(observed: &[G17LinuxAscTeardownStep]) -> bool {
+    observed == G17_LINUX_ASC_TEARDOWN_ORDER
+}
+
+pub(crate) const G17_PMGR_AUTO_ENABLE_BIT: u32 = 1 << 28;
+pub(crate) const G17_PMGR_PS_ACTUAL_MASK: u32 = 0xf0;
+pub(crate) const G17_PMGR_PS_TARGET_MASK: u32 = 0x0f;
+pub(crate) const G17_PMGR_PS_PWRGATE: u32 = 0;
+
+pub(crate) const fn g17_pmgr_parent_is_power_gated(register: u32) -> bool {
+    register & G17_PMGR_AUTO_ENABLE_BIT == 0
+        && register & G17_PMGR_PS_ACTUAL_MASK == G17_PMGR_PS_PWRGATE
+        && register & G17_PMGR_PS_TARGET_MASK == G17_PMGR_PS_PWRGATE
+}
+
+/// Observations needed before a role may be called hardware-cold. Register
+/// values alone are insufficient: the firmware mapping, mapper, runtime-PM
+/// ownership, and the shared GFX parent's exact state need positive readback.
+/// `None` therefore fails closed. There is deliberately no per-role clock or
+/// power register: IDs 237 and 321 are virtual children of the same parent.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17AscColdObservation {
+    pub(crate) cpu_control: u32,
+    pub(crate) cpu_status: u32,
+    pub(crate) outbox_control: u32,
+    pub(crate) irq_event_sources_disabled: [Option<bool>; 2],
+    pub(crate) firmware_dma_unpublished: Option<bool>,
+    pub(crate) mapper_inactive: Option<bool>,
+    pub(crate) provider_runtime_reference_released: Option<bool>,
+    pub(crate) all_shared_gfx_consumers_released: Option<bool>,
+    pub(crate) shared_gfx_parent_register: Option<u32>,
+}
+
+pub(crate) fn g17_asc_hardware_cold(observed: G17AscColdObservation) -> bool {
+    let status_mask =
+        ASC_CPU_STATUS_RUNNING_BIT | ASC_CPU_STATUS_STOPPED_BIT | ASC_CPU_STATUS_IDLE_BIT;
+    let stopped_idle = ASC_CPU_STATUS_STOPPED_BIT | ASC_CPU_STATUS_IDLE_BIT;
+
+    observed.cpu_control & ASC_CPU_RUN_BIT == 0
+        && observed.cpu_status & status_mask == stopped_idle
+        && observed.outbox_control & ASCWRAP_V6_MAILBOX_ENABLE_BIT == 0
+        && observed.irq_event_sources_disabled == [Some(true), Some(true)]
+        && observed.firmware_dma_unpublished == Some(true)
+        && observed.mapper_inactive == Some(true)
+        && observed.provider_runtime_reference_released == Some(true)
+        && observed.all_shared_gfx_consumers_released == Some(true)
+        && observed
+            .shared_gfx_parent_register
+            .is_some_and(g17_pmgr_parent_is_power_gated)
+}
+
 /// Per-kernelcache PMGR anchors. The common `AppleA7IOP::_enablePower` and
 /// `ApplePMGR::enableCluster` instruction words are identical on P/G/S. The
 /// platform `writeReg32` implementations are deliberately not treated as
@@ -531,7 +869,8 @@ pub(crate) fn validate_g17_asc_power_on_order(observed: &[G17AscPowerOnStep]) ->
 }
 
 /// The cluster table supplies these operands at runtime. DeviceTree gate IDs
-/// alone cannot derive them, so an executor must reject an incomplete set.
+/// alone cannot derive them, so an executor must return an error for an
+/// incomplete set.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct G17PmgrClusterOperands {
     pub(crate) cluster_index: Option<u8>,
@@ -664,6 +1003,30 @@ pub(crate) const G17_A7IOP_SOFTWARE_RESET_STATE: A7IopSoftwareResetState =
         performs_mmio: false,
     };
 
+/// AppleA7IOP constructs this optional provider function during start and
+/// stores it at +0x110.  Neither G17P ASC provider publishes the property, and
+/// no AppleA7IOP stop/reset path invokes the stored function. It is therefore
+/// explicit negative evidence, not a reset implementation.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PResetFunctionEvidence {
+    pub(crate) constructor_call_site: u64,
+    pub(crate) property_name: &'static str,
+    pub(crate) object_offset: u16,
+    pub(crate) role_property_present: [bool; 2],
+    pub(crate) stop_invokes_function: bool,
+    pub(crate) reset_state_invokes_function: bool,
+}
+
+pub(crate) const G17P_RESET_FUNCTION_EVIDENCE: G17PResetFunctionEvidence =
+    G17PResetFunctionEvidence {
+        constructor_call_site: 0xffff_fe00_08ab_ba64,
+        property_name: "function-device_reset",
+        object_offset: 0x110,
+        role_property_present: [false, false],
+        stop_invokes_function: false,
+        reset_state_invokes_function: false,
+    };
+
 pub(crate) const EXECUTABLE_G17_HARDWARE_RESET_AVAILABLE: bool = false;
 
 /// Host combined-started wait constants recovered from all three AGX hosts.
@@ -759,7 +1122,7 @@ pub(crate) enum AscRollbackRequirement {
     OwnerStopCpuRequired,
 }
 
-/// Essential, fail-closed ASC launch observer.  It records already-observed
+/// Essential ASC launch observer. It records already-observed
 /// actions and permanently fails on an ordering or value mismatch.
 #[derive(Debug, Copy, Clone)]
 pub(crate) struct G17AscBringup {
@@ -906,18 +1269,37 @@ pub(crate) struct G17AscLiveGaps {
     pub(crate) firmware_publication_cache_operation_proven: bool,
     pub(crate) wrapper_mmio_enable_source_proven: bool,
     pub(crate) teardown_owner_identified: bool,
+    pub(crate) outbox_disable_transform_proven: bool,
+    pub(crate) irq_event_source_disable_order_proven: bool,
+    pub(crate) mapper_inactive_call_abi_proven: bool,
+    pub(crate) power_off_call_operands_proven: bool,
+    pub(crate) shared_gfx_pmgr_topology_proven: bool,
+    pub(crate) firmware_dma_owner_handoff_wired: bool,
+    pub(crate) power_off_linux_owner_wired: bool,
+    pub(crate) cold_state_readback_complete: bool,
+    pub(crate) hardware_reset_function_available: bool,
     pub(crate) stop_cpu_teardown_owner_wired: bool,
 }
 
 pub(crate) const G17_ASC_LIVE_GAPS: G17AscLiveGaps = G17AscLiveGaps {
     pmgr_set_power_state_gate_order_owned: false,
     pmgr_cluster_runtime_operands_proven: false,
-    asc_control_aperture_owned: false,
+    asc_control_aperture_owned: true,
     iorvbar_aperture_and_dma_visibility_owned: false,
     firmware_publication_cache_operation_proven: true,
     wrapper_mmio_enable_source_proven: true,
     teardown_owner_identified: true,
-    stop_cpu_teardown_owner_wired: false,
+    outbox_disable_transform_proven: true,
+    irq_event_source_disable_order_proven: true,
+    mapper_inactive_call_abi_proven: true,
+    power_off_call_operands_proven: true,
+    shared_gfx_pmgr_topology_proven: true,
+    firmware_dma_owner_handoff_wired: false,
+    power_off_linux_owner_wired: false,
+    cold_state_readback_complete: false,
+    // AppleA7IOP::resetState() performs no MMIO and is not part of CPU stop.
+    hardware_reset_function_available: false,
+    stop_cpu_teardown_owner_wired: true,
 };
 
 pub(crate) const EXECUTABLE_G17_ASC_BRINGUP_AVAILABLE: bool = false;
@@ -949,6 +1331,36 @@ mod tests {
         assert_eq!(G17_RTBUDDY_PATCH_BAY_PUBLICATION_WINDOW_LEN, 0xbc);
         assert_eq!(G17_RTBUDDY_FULL_IMAGE_PUBLICATION_WINDOW_SHA256.len(), 64);
         assert_eq!(G17_RTBUDDY_PATCH_BAY_PUBLICATION_WINDOW_SHA256.len(), 64);
+    }
+
+    #[test]
+    fn g17p_teardown_text_anchors_are_explicitly_target_scoped() {
+        let evidence = G17P_ASC_TEARDOWN_TEXT_EVIDENCE;
+        assert_eq!(evidence.a7iop_set_mapper_active, 0xffff_fe00_08ab_d394);
+        assert_eq!(evidence.a7iop_disable_power, 0xffff_fe00_08ab_c648);
+        assert_eq!(evidence.a7iop_turn_off_domain, 0xffff_fe00_08ab_c69c);
+        assert_eq!(
+            evidence.a7iop_enable_mailbox_interrupts,
+            0xffff_fe00_08ab_d580
+        );
+        assert_eq!(evidence.ascwrap_unmap_firmware, 0xffff_fe00_08ab_a298);
+        assert_eq!(evidence.ascwrap_enable_outbox, 0xffff_fe00_08ab_a944);
+        assert_eq!(
+            evidence.ascwrap_disable_all_interrupts,
+            0xffff_fe00_08ab_ab4c
+        );
+        assert_eq!(
+            evidence.ascwrap_enable_inbox_interrupt,
+            0xffff_fe00_08ab_ab54
+        );
+        assert_eq!(
+            evidence.ascwrap_enable_outbox_interrupt,
+            0xffff_fe00_08ab_ab5c
+        );
+        assert_eq!(evidence.armio_device_enable_clock, 0xffff_fe00_08b0_b0d8);
+        assert_eq!(evidence.armio_device_enable_power, 0xffff_fe00_08b0_b1e8);
+        assert_eq!(evidence.h17p_platformio_enable_clock, 0xffff_fe00_09a8_9080);
+        assert_eq!(evidence.h17p_platformio_enable_power, 0xffff_fe00_09a8_9154);
     }
 
     #[test]
@@ -985,7 +1397,7 @@ mod tests {
     }
 
     #[test]
-    fn idle_classifier_is_fail_closed_and_preserves_short_circuit() {
+    fn idle_classifier_requires_status_and_preserves_short_circuit() {
         let direct = G17_ASC_PROVIDER_PROPERTIES[0];
         assert_eq!(
             classify_asc_idle(direct, None, Some(0)),
@@ -1031,7 +1443,7 @@ mod tests {
     }
 
     #[test]
-    fn iorvbar_is_address_or_valid_bit_and_rejects_tagged_input() {
+    fn iorvbar_is_address_or_valid_bit_and_reports_tagged_input_invalid() {
         assert_eq!(encode_iorvbar(0x2800_0000).unwrap(), 0x2800_0001);
         assert_eq!(
             encode_iorvbar(0x2800_0001),
@@ -1127,20 +1539,64 @@ mod tests {
     fn run_and_stop_cpu_mmio_transforms_are_not_symmetric_guesses() {
         let run = asc_run_cpu_plan(true, true);
         let stop = asc_run_cpu_plan(false, true);
+        assert_eq!(
+            g17_asc_text_evidence(G17AscEvidenceTarget::G17P).ascwrap_run_cpu,
+            0xffff_fe00_08ab_a4b4
+        );
         assert_eq!(run.len, 2);
+        assert_eq!(
+            run.ops,
+            [
+                AscMmioOp::ReadControl { offset: 0x44 },
+                AscMmioOp::WriteControlSet {
+                    offset: 0x44,
+                    bits: 0x10,
+                },
+                AscMmioOp::None,
+                AscMmioOp::None,
+            ]
+        );
         assert_eq!(stop.len, 4);
         assert_eq!(
-            stop.ops[3],
-            AscMmioOp::WriteControlClear {
-                offset: 0x44,
-                bits: 0x20,
-            }
+            stop.ops,
+            [
+                AscMmioOp::ReadControl { offset: 0x44 },
+                AscMmioOp::WriteControlClear {
+                    offset: 0x44,
+                    bits: 0x10,
+                },
+                AscMmioOp::ReadControl { offset: 0x44 },
+                AscMmioOp::WriteControlClear {
+                    offset: 0x44,
+                    bits: 0x20,
+                },
+            ]
         );
         assert_eq!(asc_run_cpu_plan(true, false).len, 0);
+        assert_eq!(
+            g17_asc_text_evidence(G17AscEvidenceTarget::G17P).a7iop_reset_state,
+            0xffff_fe00_08ab_dde0
+        );
+        assert!(!G17_A7IOP_SOFTWARE_RESET_STATE.performs_mmio);
     }
 
     #[test]
-    fn start_and_stop_order_validators_reject_reordering() {
+    fn outbox_disable_preserves_every_non_enable_bit_and_irq_hooks_stay_passive() {
+        assert_eq!(ASCWRAP_V6_OUTBOX_CONTROL_OFFSET, 0x8114);
+        assert_eq!(asc_outbox_control_value(0xffff_fffe, false), 0xffff_fffe);
+        assert_eq!(asc_outbox_control_value(0xffff_ffff, false), 0xffff_fffe);
+        assert_eq!(asc_outbox_control_value(0x2_7700, true), 0x2_7701);
+
+        let irq = G17_A7IOP_MAILBOX_INTERRUPT_CONTRACT;
+        assert_eq!(irq.skip_event_sources_flag_offset, 0x121);
+        assert_eq!(irq.event_source_offsets, [0x180, 0xf0]);
+        assert_eq!(irq.enable_vtable_offset, 0x170);
+        assert_eq!(irq.disable_vtable_offset, 0x178);
+        assert!(!irq.ascwrap_hardware_hooks_perform_mmio);
+    }
+
+    #[test]
+    fn start_and_stop_order_validators_detect_reordering() {
         assert!(validate_a7iop_start_order(&G17_A7IOP_START_ORDER));
         let mut wrong_start = G17_A7IOP_START_ORDER;
         wrong_start.swap(4, 5);
@@ -1161,13 +1617,186 @@ mod tests {
     }
 
     #[test]
+    fn teardown_contract_pins_owner_handoff_mapper_and_role_power_operands() {
+        let unmap = G17_ASC_FIRMWARE_UNMAP_CONTRACT;
+        assert_eq!(unmap.retained_map_offset, 0x1a0);
+        assert_eq!(unmap.unmap_vtable_offset, 0x150);
+        assert!(unmap.unmap_argument);
+        assert_eq!(unmap.release_vtable_offset, 0x28);
+        assert!(unmap.clears_retained_pointer);
+
+        let mapper = G17_ASC_MAPPER_ACTIVE_CONTRACT;
+        assert_eq!(mapper.mapper_object_offset, 0x138);
+        assert_eq!(mapper.function_name, "setActive");
+        assert_eq!(mapper.call_platform_function_vtable_offset, 0x6f0);
+        assert!(!mapper.wait_for_function);
+        assert_eq!(mapper.active_parameter_index, 1);
+        assert_eq!(mapper.trailing_null_parameters, 3);
+        assert_eq!(mapper.opt_out_property, "no-activate-mapper");
+
+        assert_eq!(
+            G17P_ASC_POWER_OPERANDS,
+            [
+                G17PAscPowerOperands {
+                    role: G17PAscRole::Gfx,
+                    index: 0,
+                    clock_gate_id: 0xed,
+                    power_gate_id: 0xed,
+                    clock_id_metadata: 0x15f,
+                    pmgr_device_name: "GFX-ASC",
+                    pmgr_device_has_power_state_register: false,
+                    pmgr_parent_device_id: 40,
+                },
+                G17PAscPowerOperands {
+                    role: G17PAscRole::Gfx1,
+                    index: 0,
+                    clock_gate_id: 0x141,
+                    power_gate_id: 0x141,
+                    clock_id_metadata: 0x15f,
+                    pmgr_device_name: "GFX-ASC1",
+                    pmgr_device_has_power_state_register: false,
+                    pmgr_parent_device_id: 40,
+                },
+            ]
+        );
+
+        let topology = G17P_SHARED_GFX_POWER_TOPOLOGY;
+        assert_eq!(
+            topology.device_tree_im4p_sha256,
+            "290a36da7dbf24d8ab45681bee4896352eee4f103c3a0d4b116bac6d6e74f41a"
+        );
+        assert_eq!(topology.role_device_ids, [237, 321]);
+        assert_eq!(topology.role_device_raw_flags, [0x10, 0x10]);
+        assert_eq!(topology.shared_parent_device_id, 40);
+        assert_eq!(topology.shared_parent_name, "GFX");
+        assert_eq!(topology.shared_parent_parents, [29, 31]);
+        assert_eq!(topology.pmgr_group, 0);
+        assert_eq!(topology.pmgr_group_base, 0x3007_00000);
+        assert_eq!(topology.parent_register_offset, 0x1f0);
+        assert_eq!(topology.parent_register_address, 0x3007_001f0);
+        assert_eq!(topology.linux_genpd_label, "gfx");
+
+        assert_eq!(
+            G17P_ASC_POWER_CALL_CONTRACT,
+            G17PAscPowerCallContract {
+                provider_object_offset: 0x88,
+                clock_count_offset: 0xa0,
+                clock_gate_array_offset: 0xa8,
+                power_count_offset: 0xb0,
+                power_gate_array_offset: 0xb8,
+                provider_enable_clock_vtable_offset: 0x8a8,
+                provider_enable_power_vtable_offset: 0x8b0,
+            }
+        );
+        assert!(validate_g17_asc_power_off_order(&G17_ASC_POWER_OFF_ORDER));
+        let mut wrong_power = G17_ASC_POWER_OFF_ORDER;
+        wrong_power.swap(0, 1);
+        assert!(!validate_g17_asc_power_off_order(&wrong_power));
+
+        assert!(validate_g17_linux_asc_teardown_order(
+            &G17_LINUX_ASC_TEARDOWN_ORDER
+        ));
+        assert_eq!(
+            G17P_LINUX_ROLE_TEARDOWN_ORDER,
+            [G17PAscRole::Gfx1, G17PAscRole::Gfx]
+        );
+        let mut wrong_handoff = G17_LINUX_ASC_TEARDOWN_ORDER;
+        wrong_handoff.swap(3, 4);
+        assert!(!validate_g17_linux_asc_teardown_order(&wrong_handoff));
+        let mut power_before_mapper = G17_LINUX_ASC_TEARDOWN_ORDER;
+        power_before_mapper.swap(5, 6);
+        assert!(!validate_g17_linux_asc_teardown_order(&power_before_mapper));
+    }
+
+    #[test]
     fn reset_state_is_explicitly_software_only() {
         assert_eq!(G17_A7IOP_SOFTWARE_RESET_STATE.state_offset, 0x148);
         assert_eq!(G17_A7IOP_SOFTWARE_RESET_STATE.state_value, 8);
         assert_eq!(G17_A7IOP_SOFTWARE_RESET_STATE.running_offset, 0x108);
         assert_eq!(G17_A7IOP_SOFTWARE_RESET_STATE.completion_offset, 0x160);
         assert!(!G17_A7IOP_SOFTWARE_RESET_STATE.performs_mmio);
+        assert_eq!(
+            G17P_RESET_FUNCTION_EVIDENCE.constructor_call_site,
+            0xffff_fe00_08ab_ba64
+        );
+        assert_eq!(
+            G17P_RESET_FUNCTION_EVIDENCE.property_name,
+            "function-device_reset"
+        );
+        assert_eq!(G17P_RESET_FUNCTION_EVIDENCE.object_offset, 0x110);
+        assert_eq!(
+            G17P_RESET_FUNCTION_EVIDENCE.role_property_present,
+            [false, false]
+        );
+        assert!(!G17P_RESET_FUNCTION_EVIDENCE.stop_invokes_function);
+        assert!(!G17P_RESET_FUNCTION_EVIDENCE.reset_state_invokes_function);
         assert!(!EXECUTABLE_G17_HARDWARE_RESET_AVAILABLE);
+    }
+
+    fn full_cold_observation() -> G17AscColdObservation {
+        G17AscColdObservation {
+            cpu_control: 0,
+            cpu_status: 0x6a,
+            outbox_control: 0x2_7700,
+            irq_event_sources_disabled: [Some(true), Some(true)],
+            firmware_dma_unpublished: Some(true),
+            mapper_inactive: Some(true),
+            provider_runtime_reference_released: Some(true),
+            all_shared_gfx_consumers_released: Some(true),
+            shared_gfx_parent_register: Some(0),
+        }
+    }
+
+    #[test]
+    fn hardware_cold_predicate_requires_register_state_and_every_owner_readback() {
+        assert_eq!(ASC_CPU_STATUS_OFFSET, 0x48);
+        assert!(g17_asc_hardware_cold(full_cold_observation()));
+
+        let mut running = full_cold_observation();
+        running.cpu_control = ASC_CPU_RUN_BIT;
+        assert!(!g17_asc_hardware_cold(running));
+
+        let mut status_running = full_cold_observation();
+        status_running.cpu_status = 0x6d;
+        assert!(!g17_asc_hardware_cold(status_running));
+
+        let mut stopped_status_without_mapper_readback = full_cold_observation();
+        stopped_status_without_mapper_readback.cpu_status = 0x6e;
+        stopped_status_without_mapper_readback.mapper_inactive = None;
+        assert!(!g17_asc_hardware_cold(
+            stopped_status_without_mapper_readback
+        ));
+
+        assert!(g17_pmgr_parent_is_power_gated(0));
+        assert!(!g17_pmgr_parent_is_power_gated(0x0f));
+        assert!(!g17_pmgr_parent_is_power_gated(0xf0));
+        assert!(!g17_pmgr_parent_is_power_gated(G17_PMGR_AUTO_ENABLE_BIT));
+
+        let mut outbox_live = full_cold_observation();
+        outbox_live.outbox_control |= ASCWRAP_V6_MAILBOX_ENABLE_BIT;
+        assert!(!g17_asc_hardware_cold(outbox_live));
+
+        let mut missing = full_cold_observation();
+        missing.firmware_dma_unpublished = None;
+        assert!(!g17_asc_hardware_cold(missing));
+        missing = full_cold_observation();
+        missing.mapper_inactive = None;
+        assert!(!g17_asc_hardware_cold(missing));
+        missing = full_cold_observation();
+        missing.provider_runtime_reference_released = None;
+        assert!(!g17_asc_hardware_cold(missing));
+        missing = full_cold_observation();
+        missing.all_shared_gfx_consumers_released = None;
+        assert!(!g17_asc_hardware_cold(missing));
+        missing = full_cold_observation();
+        missing.shared_gfx_parent_register = None;
+        assert!(!g17_asc_hardware_cold(missing));
+        missing = full_cold_observation();
+        missing.shared_gfx_parent_register = Some(0xf0);
+        assert!(!g17_asc_hardware_cold(missing));
+        missing = full_cold_observation();
+        missing.irq_event_sources_disabled[1] = None;
+        assert!(!g17_asc_hardware_cold(missing));
     }
 
     #[test]
@@ -1278,16 +1907,25 @@ mod tests {
     }
 
     #[test]
-    fn cache_identity_is_proven_but_live_ownership_gates_remain_closed() {
+    fn provider_cpu_ownership_is_wired_and_remaining_work_stays_explicit() {
         let gaps = G17_ASC_LIVE_GAPS;
         assert!(!gaps.pmgr_set_power_state_gate_order_owned);
         assert!(!gaps.pmgr_cluster_runtime_operands_proven);
-        assert!(!gaps.asc_control_aperture_owned);
+        assert!(gaps.asc_control_aperture_owned);
         assert!(!gaps.iorvbar_aperture_and_dma_visibility_owned);
         assert!(gaps.firmware_publication_cache_operation_proven);
         assert!(gaps.wrapper_mmio_enable_source_proven);
         assert!(gaps.teardown_owner_identified);
-        assert!(!gaps.stop_cpu_teardown_owner_wired);
+        assert!(gaps.outbox_disable_transform_proven);
+        assert!(gaps.irq_event_source_disable_order_proven);
+        assert!(gaps.mapper_inactive_call_abi_proven);
+        assert!(gaps.power_off_call_operands_proven);
+        assert!(gaps.shared_gfx_pmgr_topology_proven);
+        assert!(!gaps.firmware_dma_owner_handoff_wired);
+        assert!(!gaps.power_off_linux_owner_wired);
+        assert!(!gaps.cold_state_readback_complete);
+        assert!(!gaps.hardware_reset_function_available);
+        assert!(gaps.stop_cpu_teardown_owner_wired);
         assert!(!EXECUTABLE_G17_ASC_BRINGUP_AVAILABLE);
     }
 }

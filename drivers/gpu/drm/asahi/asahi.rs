@@ -12,19 +12,30 @@ mod channel;
 mod crashdump;
 mod debug;
 mod driver;
+mod drm_gpu;
 mod event;
 mod file;
 mod float;
 mod fw;
 mod g15_boot;
 mod g15_initdata;
+mod g17_adt_j700;
 mod g17_asc_bringup;
 mod g17_boot;
+mod g17_completion;
+mod g17_compute;
+mod g17_drm;
 mod g17_firmware;
 mod g17_initdata;
+mod g17_lifecycle;
+mod g17_live_boot;
+mod g17_manager;
 mod g17_power_preflight;
+mod g17_render;
+mod g17_resources;
 mod g17_rtkit;
 mod g17_submission;
+mod g17_uapi;
 mod gem;
 mod gpu;
 mod hw;
@@ -69,6 +80,11 @@ kernel::module_platform_driver! {
             default: 0,
             // permissions: 0o644,
             description: "Fully isolate GPU contexts (limits performance)",
+        },
+        g17p_test_stage: u32 {
+            default: 1,
+            // permissions: 0,
+            description: "G17P bring-up stage (0: control, 1: QID4, 2: compute UAPI)",
         },
     },
 }

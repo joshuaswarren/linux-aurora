@@ -9,6 +9,8 @@
 use core::fmt::Debug;
 use core::mem::size_of;
 use core::ops::Range;
+#[cfg(CONFIG_DEV_COREDUMP)]
+use core::ptr::NonNull;
 use core::sync::atomic::{
     AtomicU64,
     Ordering, //
@@ -22,6 +24,8 @@ use kernel::{
 };
 #[cfg(CONFIG_DEV_COREDUMP)]
 use kernel::{
+    bindings,
+    ffi::c_void,
     types::Owned,
     uapi::{
         PF_R,
@@ -80,6 +84,10 @@ const AP_GPU: u8 = 2;
 const HIGH_BITS_PXN: u16 = 1 << 1;
 const HIGH_BITS_UXN: u16 = 1 << 2;
 const HIGH_BITS_GPU_ACCESS: u16 = 1 << 3;
+
+const fn complete_coverage(expected: u64, visited: u64, permitted: bool) -> bool {
+    permitted && visited == expected
+}
 
 #[cfg(CONFIG_DEV_COREDUMP)]
 pub(crate) const PTE_ADDR_BITS: u64 = (!UAT_PGMSK as u64) & (!UAT_HIGH_BITS);
@@ -171,7 +179,6 @@ impl Prot {
         }
     }
 
-    #[cfg(CONFIG_DEV_COREDUMP)]
     pub(crate) const fn from_pte(pte: u64) -> Self {
         Prot {
             high_bits: (pte >> UAT_HIGH_BITS_SHIFT) as u16,
@@ -220,6 +227,18 @@ impl Prot {
             | UAT_AF
     }
 
+    pub(crate) const fn allows_gpu(&self, need_read: bool, need_write: bool) -> bool {
+        let uxn = self.high_bits & HIGH_BITS_UXN != 0;
+        let pxn = self.high_bits & HIGH_BITS_PXN != 0;
+        let (readable, writable) = match self.ap {
+            AP_FW_GPU => (pxn, uxn),
+            AP_FW => (uxn && pxn, false),
+            AP_GPU => (!pxn, uxn != pxn),
+            _ => (false, false),
+        };
+        (!need_read || readable) && (!need_write || writable)
+    }
+
     pub(crate) const fn is_cached_noncoherent(&self) -> bool {
         self.ap != AP_GPU && self.memattr == MEMATTR_CACHED
     }
@@ -234,6 +253,22 @@ impl Default for Prot {
         PROT_FW_GPU_NA
     }
 }
+
+const _: () = {
+    assert!(PROT_GPU_RO.allows_gpu(true, false));
+    assert!(!PROT_GPU_RO.allows_gpu(false, true));
+    assert!(!PROT_GPU_WO.allows_gpu(true, false));
+    assert!(PROT_GPU_WO.allows_gpu(false, true));
+    assert!(PROT_GPU_RW.allows_gpu(true, false));
+    assert!(PROT_GPU_RW.allows_gpu(false, true));
+    assert!(PROT_GPU_RW.allows_gpu(true, true));
+    assert!(!PROT_FW_RW.allows_gpu(true, false));
+    assert!(!PROT_FW_RW.allows_gpu(false, true));
+    assert!(!Prot::from_pte(0).allows_gpu(true, false));
+    assert!(complete_coverage(3, 3, true));
+    assert!(!complete_coverage(3, 2, true));
+    assert!(!complete_coverage(3, 3, false));
+};
 
 #[cfg(CONFIG_DEV_COREDUMP)]
 pub(crate) struct DumpedPage {
@@ -476,6 +511,37 @@ impl UatPageTable {
         self.with_pages(iova_range, true, false, |_, _| Ok(()))
     }
 
+    /// Check that every page in an aligned range is mapped with the requested
+    /// GPU permissions. Missing intermediate page tables are detected by the
+    /// visited-page count because `with_pages` skips those holes.
+    pub(crate) fn covers_range(
+        &mut self,
+        iova_range: Range<u64>,
+        need_read: bool,
+        need_write: bool,
+    ) -> Result<bool> {
+        if iova_range.is_empty() || (iova_range.start | iova_range.end) & UAT_PGMSK as u64 != 0 {
+            return Ok(false);
+        }
+
+        let expected = (iova_range.end - iova_range.start) >> UAT_PGBIT;
+        let mut visited = 0u64;
+        let mut permitted = true;
+        self.with_pages(iova_range, false, false, |_, ptes| {
+            visited = visited.checked_add(ptes.len() as u64).ok_or(EOVERFLOW)?;
+            for pte in ptes {
+                let value = pte.load(Ordering::Acquire);
+                if value & PTE_TYPE_BITS != PTE_TYPE_LEAF_TABLE
+                    || !Prot::from_pte(value).allows_gpu(need_read, need_write)
+                {
+                    permitted = false;
+                }
+            }
+            Ok(())
+        })?;
+        Ok(complete_coverage(expected, visited, permitted))
+    }
+
     fn pte_bits(&self) -> u64 {
         if self.ttb_owned {
             // Owned page tables are userspace, so non-global
@@ -661,6 +727,174 @@ impl UatPageTable {
         })?;
         Ok(pages)
     }
+
+    /// Copy a firmware-owned DVA through a physical UAT root which is not
+    /// represented by Linux `struct page` ownership.
+    ///
+    /// This is intentionally a bounded read-only walker. It temporarily maps
+    /// one 16 KiB page-table or payload page at a time and never changes PTEs
+    /// or reclaims firmware-owned physical memory.
+    #[cfg(CONFIG_DEV_COREDUMP)]
+    pub(crate) fn copy_from_phys_root(
+        ttb: PhysicalAddr,
+        address: u64,
+        out: &mut [u8],
+        ias: u8,
+        oas: u32,
+    ) -> Result {
+        if out.is_empty() || (ttb | address | out.len() as u64) & 7 != 0 {
+            return Err(EINVAL);
+        }
+        let geometry = UatGeometry::new(ias).ok_or(EINVAL)?;
+        let end = address.checked_add(out.len() as u64).ok_or(EOVERFLOW)?;
+        if end > geometry.root_size() {
+            return Err(EFAULT);
+        }
+        let oas_mask = (1u64 << oas) - 1;
+        let page_mask = UAT_PGMSK as u64;
+        let mut copied = 0usize;
+
+        while copied < out.len() {
+            let iova = address.checked_add(copied as u64).ok_or(EOVERFLOW)?;
+            let iova_page = iova & !page_mask;
+            let mut table_phys = ttb;
+
+            for level in (0..UAT_LEVELS - 1).rev() {
+                let shift = UAT_PGBIT + (level + 1) * UAT_LVBIT;
+                let index = ((iova_page >> shift) & UAT_LVMSK) as usize;
+                let table = PhysPageMapping::new(table_phys)?;
+                let pte = table.read_u64(index * PTE_SIZE)?;
+                if pte & PTE_TYPE_BITS != PTE_TYPE_LEAF_TABLE {
+                    pr_err!(
+                        "UAT crash walker: level {} IOVA {:#x} PTE {:#x} at {:#x}\n",
+                        level + 1,
+                        iova_page,
+                        pte,
+                        table_phys + (index * PTE_SIZE) as u64
+                    );
+                    return Err(EFAULT);
+                }
+                table_phys = pte & oas_mask & !page_mask;
+            }
+
+            let leaf_index = ((iova_page >> UAT_PGBIT) & UAT_LVMSK) as usize;
+            let leaf_table = PhysPageMapping::new(table_phys)?;
+            let leaf = leaf_table.read_u64(leaf_index * PTE_SIZE)?;
+            if leaf & PTE_TYPE_BITS != PTE_TYPE_LEAF_TABLE {
+                pr_err!(
+                    "UAT crash walker: leaf IOVA {:#x} PTE {:#x} at {:#x}\n",
+                    iova_page,
+                    leaf,
+                    table_phys + (leaf_index * PTE_SIZE) as u64
+                );
+                return Err(EFAULT);
+            }
+            let memattr = ((leaf & UAT_MEMATTR_BITS) >> UAT_MEMATTR_SHIFT) as u8;
+            if memattr != MEMATTR_CACHED && memattr != MEMATTR_UNCACHED {
+                return Err(EFAULT);
+            }
+            let payload_phys = leaf & oas_mask & !page_mask;
+            let payload = PhysPageMapping::new(payload_phys)?;
+            let offset = (iova & page_mask) as usize;
+            let length = (UAT_PGSZ - offset).min(out.len() - copied);
+            payload.copy_atomic(offset, &mut out[copied..copied + length])?;
+            copied = copied.checked_add(length).ok_or(EOVERFLOW)?;
+        }
+        Ok(())
+    }
+
+    /// Copy a bounded range from a firmware carveout identified by physical
+    /// address. G17P's endpoint-1 crash addresses are not client UAT DVAs:
+    /// they are `gfx-data + 0xa0000` and `gfx1-data + 0xa0000`, and the
+    /// output-positive m1n1 postmortem reads them as physical memory.
+    #[cfg(CONFIG_DEV_COREDUMP)]
+    pub(crate) fn copy_firmware_physical_range(
+        physical: PhysicalAddr,
+        size: usize,
+    ) -> Result<KVVec<u8>> {
+        if size == 0 || (physical | size as u64) & 7 != 0 {
+            return Err(EINVAL);
+        }
+        physical.checked_add(size as u64).ok_or(EOVERFLOW)?;
+        let page_mask = UAT_PGMSK as u64;
+        let mut data = KVVec::from_elem(0, size, GFP_KERNEL)?;
+        let mut copied = 0usize;
+        while copied < size {
+            let address = physical.checked_add(copied as u64).ok_or(EOVERFLOW)?;
+            let page = PhysPageMapping::new(address & !page_mask)?;
+            let offset = (address & page_mask) as usize;
+            let length = (UAT_PGSZ - offset).min(size - copied);
+            page.copy_atomic(offset, &mut data[copied..copied + length])?;
+            copied = copied.checked_add(length).ok_or(EOVERFLOW)?;
+        }
+        Ok(data)
+    }
+}
+
+#[cfg(CONFIG_DEV_COREDUMP)]
+struct PhysPageMapping {
+    ptr: NonNull<c_void>,
+}
+
+#[cfg(CONFIG_DEV_COREDUMP)]
+impl PhysPageMapping {
+    fn new(phys: PhysicalAddr) -> Result<Self> {
+        if phys & UAT_PGMSK as u64 != 0 {
+            return Err(EINVAL);
+        }
+        let ptr = unsafe {
+            // SAFETY: the caller supplies a page-aligned physical address
+            // obtained from a live firmware UAT PTE. The mapping is used only
+            // for bounded reads and is released by Drop.
+            bindings::memremap(
+                phys,
+                UAT_PGSZ,
+                bindings::MEMREMAP_WB as _,
+            )
+        };
+        let ptr = NonNull::new(ptr).ok_or_else(|| {
+            pr_err!("UAT crash walker: memremap failed for {:#x}\n", phys);
+            ENOMEM
+        })?;
+        Ok(Self { ptr })
+    }
+
+    fn read_u64(&self, offset: usize) -> Result<u64> {
+        let end = offset.checked_add(8).ok_or(EOVERFLOW)?;
+        if offset & 7 != 0 || end > UAT_PGSZ {
+            return Err(EINVAL);
+        }
+        let pointer = unsafe {
+            // SAFETY: offset is qword-aligned and bounded to the mapped page.
+            self.ptr.as_ptr().cast::<u8>().add(offset).cast::<AtomicU64>()
+        };
+        Ok(unsafe { &*pointer }.load(Ordering::Acquire))
+    }
+
+    fn copy_atomic(&self, offset: usize, out: &mut [u8]) -> Result {
+        let end = offset.checked_add(out.len()).ok_or(EOVERFLOW)?;
+        if (offset | out.len()) & 7 != 0 || end > UAT_PGSZ {
+            return Err(EINVAL);
+        }
+        for (index, destination) in out.chunks_exact_mut(size_of::<u64>()).enumerate() {
+            destination.copy_from_slice(
+                &self
+                    .read_u64(offset + index * size_of::<u64>())?
+                    .to_le_bytes(),
+            );
+        }
+        Ok(())
+    }
+}
+
+#[cfg(CONFIG_DEV_COREDUMP)]
+impl Drop for PhysPageMapping {
+    fn drop(&mut self) {
+        unsafe {
+            // SAFETY: ptr was returned by memremap and has not been unmapped.
+            bindings::memunmap(self.ptr.as_ptr());
+        }
+    }
 }
 
 impl Drop for UatPageTable {
@@ -689,5 +923,36 @@ impl Drop for UatPageTable {
                 Page::from_phys(self.ttb);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gpu_permissions_match_ro_wo_and_rw_pte_encodings() {
+        assert!(PROT_GPU_RO.allows_gpu(true, false));
+        assert!(!PROT_GPU_RO.allows_gpu(false, true));
+        assert!(!PROT_GPU_RO.allows_gpu(true, true));
+
+        assert!(!PROT_GPU_WO.allows_gpu(true, false));
+        assert!(PROT_GPU_WO.allows_gpu(false, true));
+        assert!(!PROT_GPU_WO.allows_gpu(true, true));
+
+        assert!(PROT_GPU_RW.allows_gpu(true, false));
+        assert!(PROT_GPU_RW.allows_gpu(false, true));
+        assert!(PROT_GPU_RW.allows_gpu(true, true));
+
+        assert!(!PROT_FW_RW.allows_gpu(true, false));
+        assert!(!PROT_FW_RW.allows_gpu(false, true));
+        assert!(!Prot::from_pte(0).allows_gpu(true, false));
+    }
+
+    #[test]
+    fn skipped_page_table_hole_never_counts_as_coverage() {
+        assert!(complete_coverage(3, 3, true));
+        assert!(!complete_coverage(3, 2, true));
+        assert!(!complete_coverage(3, 3, false));
     }
 }

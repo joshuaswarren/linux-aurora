@@ -16,6 +16,7 @@ use core::num::NonZeroUsize;
 use core::ops::Range;
 use core::sync::atomic::{
     fence,
+    AtomicBool,
     AtomicU32,
     AtomicU64,
     AtomicU8,
@@ -30,13 +31,14 @@ use kernel::{
     c_str,
     device,
     drm::{
-        gem::shmem,
+        gem::{shmem, BaseObject},
         gpuvm,
         mm, //
     },
     error::Result,
     io,
     new_mutex,
+    page::Page,
     prelude::*,
     static_lock_class,
     sync::{
@@ -94,14 +96,65 @@ const UAT_NUM_CTX: usize = 64;
 const UAT_USER_CTX_START: usize = 1;
 /// Number of available user contexts
 const UAT_USER_CTX: usize = UAT_NUM_CTX - UAT_USER_CTX_START;
+const T8140_CONTEXT_BOOTSTRAP_SOURCE_HIGH: u8 = 0;
+const T8140_CONTEXT_BOOTSTRAP_EMPTY_HIGH: u8 = 1;
+const T8140_CONTEXT_USER_OWNED: u8 = 2;
+const T8140_CONTEXT_OPENING_RENDER_SHARED: u8 = 3;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct T8140RootLayout {
+    low: [u64; 2],
+    high: [u64; 2],
+}
+
+fn t8140_tagged_root(root: u64, slot: usize) -> u64 {
+    root | TTBR_VALID | ((slot as u64) << TTBR_ASID_SHIFT)
+}
+
+fn t8140_opening_render_layout(render_low: u64, source_high: u64) -> T8140RootLayout {
+    T8140RootLayout {
+        low: [
+            t8140_tagged_root(render_low, 0),
+            t8140_tagged_root(render_low, 1),
+        ],
+        high: [
+            t8140_tagged_root(source_high, 0),
+            t8140_tagged_root(source_high, 1),
+        ],
+    }
+}
+
+fn t8140_split_render_layout(
+    retained_low: u64,
+    render_low: u64,
+    high: [u64; 2],
+) -> T8140RootLayout {
+    T8140RootLayout {
+        low: [
+            t8140_tagged_root(retained_low, 0),
+            t8140_tagged_root(render_low, 1),
+        ],
+        high: [
+            t8140_tagged_root(high[0], 0),
+            t8140_tagged_root(high[1], 1),
+        ],
+    }
+}
 
 /// Lower/user base VA
 pub(crate) const IOVA_USER_BASE: u64 = UAT_PGSZ as u64;
-/// Lower/user top VA. The exposed user ABI remains at 39 bits until the
-/// generation-specific 42-bit PTE/update policies are implemented.
+/// Lower/user top VA for the 39-bit (AGX2) roots. Geometry-aware paths must
+/// use [`iova_user_range`]/[`iova_user_usable_range`] instead; this const
+/// remains for the AGX2 initdata builder, which is 39-bit-only.
 pub(crate) const IOVA_USER_TOP: u64 = 1 << 39;
-/// Lower/user VA range
-pub(crate) const IOVA_USER_RANGE: Range<u64> = IOVA_USER_BASE..IOVA_USER_TOP;
+
+fn lower_vm_start(cfg: UatConfig, t8140_internal: bool) -> u64 {
+    if cfg == UatConfig::T8140 && t8140_internal {
+        0
+    } else {
+        IOVA_USER_BASE
+    }
+}
 
 /// Whether the firmware-shared MMU state (Handoff/FlushInfo layout, TTBAT
 /// publication, kernel-half window placement) has been validated against an
@@ -117,19 +170,234 @@ pub(crate) const IOVA_USER_RANGE: Range<u64> = IOVA_USER_BASE..IOVA_USER_TOP;
 /// the RTKit MMU/PPL runtime, not by the AGX message handlers. The on-disk M5
 /// `GFX.a010.macho` confirms the region exists on G17 (`"MMU uat_handoff !map"`
 /// / `"PPL handoff !vm export"` @ 0x2b570 / 0x2b518) but does not expose its
-/// exact field offsets, and -- critically -- [`Handoff::init`] blocks until the
+/// exact field offsets, and — critically — [`Handoff::init`] blocks until the
 /// firmware writes `magic_fw == PPL_MAGIC`, so a correct layout can only ever
 /// be *confirmed* by a live boot ACK. This is therefore the one gate that
 /// stays fail-closed by design: it is exactly the "needs a live firmware ACK"
-/// boundary. [`Uat::new`] fails closed on it for 42-bit parts. Flip it only
-/// once a live G15+/G17 boot completes the PPL handshake.
+/// boundary. [`Uat::new`] fails closed on it for 42-bit parts *in Dekker
+/// mode*. Flip it only once a live G15+/G17 boot completes the PPL handshake.
+///
+/// T8140 (A18 Pro / G17P) is different and is handled by
+/// [`HandoffMode::AbsentStandinT8140`], not by this flag: live J700 runs that
+/// booted both firmware instances confirmed the firmware **never publishes
+/// its half of the PPL magic on this part** — a `magic_fw` waiter hangs
+/// forever. The correct behavior there is an absent-handoff stand-in (no
+/// magic wait, no Dekker peer, no flush handshake ACK expectation), which is
+/// what that mode implements.
 const AGX3_FIRMWARE_HANDOFF_VALIDATED: bool = false;
 
+/// How the firmware-shared UAT handoff region behaves for the target SoC.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum HandoffMode {
+    /// The AGX2-proven protocol: firmware publishes `magic_fw`, participates
+    /// in the Dekker lock, and ACKs flush requests (state 1 -> 2).
+    FirmwareDekker,
+    /// T8140-verified stand-in: the firmware never participates in the
+    /// handoff region. The AP publishes its own half and clears the flush
+    /// slots, but never waits for `magic_fw` (hardware fact: it never
+    /// arrives; a waiter hangs forever) and never expects a flush ACK.
+    /// Only valid on T8140, where this was observed on live hardware.
+    ///
+    /// Constructed by the T8140 resource owner before either role receives an
+    /// init-data root.
+    AbsentStandinT8140,
+}
+
+const T8140_SECONDARY_SHARED_ROOT_DELTA: u64 = 0x40000;
+const T8140_FIRMWARE_PRIVATE_ROOT_ENTRIES: usize = 2;
+const T8140_FIRMWARE_SHARED_ROOT_ENTRIES: usize = 3;
+const T8140_FIRMWARE_CRASH_BUFFERS: [Range<u64>; 2] = [
+    0x01e1_c000..0x01e2_4000,
+    0x01f5_0000..0x01f5_8000,
+];
+const T8140_FIRMWARE_CRASH_SENTINELS: [u8; 2] = [0xa5, 0x5a];
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct T8140PrimaryRootSnapshot {
+    entries: [u64; T8140_FIRMWARE_SHARED_ROOT_ENTRIES],
+}
+
+/// Read-only descriptor for the context-0 lower root left by the boot
+/// firmware. G17P advertises its preallocated RTKit crash buffers through
+/// this tree before Linux replaces the live TTBAT entry with its own root.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct FirmwarePageTableRoot {
+    ttb: PhysicalAddr,
+    cfg: UatConfig,
+}
+
+impl FirmwarePageTableRoot {
+    pub(crate) const fn ttb(&self) -> PhysicalAddr {
+        self.ttb
+    }
+
+    #[cfg(CONFIG_DEV_COREDUMP)]
+    pub(crate) fn copy_firmware_range(&self, address: u64, size: usize) -> Result<KVVec<u8>> {
+        if size == 0 {
+            return Err(EINVAL);
+        }
+        let geometry = uat_geometry(self.cfg)?;
+        let end = address.checked_add(size as u64).ok_or(EOVERFLOW)?;
+        if end > geometry.user_va_top() {
+            return Err(EFAULT);
+        }
+        let mut data = KVVec::from_elem(0, size, GFP_KERNEL)?;
+        UatPageTable::copy_from_phys_root(
+            self.ttb,
+            address,
+            &mut data,
+            self.cfg.ias,
+            self.cfg.oas,
+        )?;
+        Ok(data)
+    }
+}
+
+/// Retained read-only access to the live TTBAT. RTKit can replace context 0's
+/// lower root after Linux has initialized the table, so crash handling must
+/// sample the entry after the firmware reports its crash rather than cache the
+/// boot-time value.
+pub(crate) struct FirmwareContextTableReader {
+    inner: Arc<UatInner>,
+    cfg: UatConfig,
+    t8140_crash_buffers: Option<[ARef<gem::Object>; 2]>,
+}
+
+impl Clone for FirmwareContextTableReader {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            cfg: self.cfg,
+            t8140_crash_buffers: self.t8140_crash_buffers.as_ref().map(|buffers| {
+                [buffers[0].clone(), buffers[1].clone()]
+            }),
+        }
+    }
+}
+
+impl FirmwareContextTableReader {
+    pub(crate) fn context_root(&self, slot: usize) -> Option<FirmwarePageTableRoot> {
+        if slot >= UAT_NUM_CTX {
+            return None;
+        }
+        let shared = self.inner.lock();
+        decode_firmware_ttb_root(shared.ttbs()[slot].ttb0.load(Ordering::Acquire), self.cfg)
+            .map(|ttb| FirmwarePageTableRoot { ttb, cfg: self.cfg })
+    }
+
+    pub(crate) fn context0_root(&self) -> Option<FirmwarePageTableRoot> {
+        self.context_root(0)
+    }
+
+    /// Copy one T8140 crash buffer through the retained WC CPU alias. This is
+    /// distinct from the raw physical walker used to diagnose the live UAT:
+    /// the latter maps pages WB and can hide device writes behind a conflicting
+    /// WC alias.
+    #[cfg(CONFIG_DEV_COREDUMP)]
+    pub(crate) fn copy_t8140_crash_buffer(
+        &self,
+        index: usize,
+        size: usize,
+    ) -> Result<(KVVec<u8>, u8)> {
+        let buffers = self.t8140_crash_buffers.as_ref().ok_or(ENOENT)?;
+        let object = buffers.get(index).ok_or(EINVAL)?;
+        if size == 0 || size > object.size() {
+            return Err(ERANGE);
+        }
+
+        // The crash notification is ordered after firmware's payload stores.
+        // Complete the device/CPU visibility boundary before reading the WC
+        // alias that was used to create the firmware mapping.
+        mem::sync();
+        fence(Ordering::Acquire);
+        let vmap = object.vmap::<u8>()?;
+        let bytes = unsafe {
+            // SAFETY: the VMap covers the complete retained GEM allocation and
+            // `size` was checked against that allocation above.
+            core::slice::from_raw_parts(vmap.as_ptr(), size)
+        };
+        let mut data = KVVec::new();
+        data.extend_from_slice(bytes, GFP_ATOMIC)?;
+        Ok((data, T8140_FIRMWARE_CRASH_SENTINELS[index]))
+    }
+}
+
+fn decode_firmware_ttb_root(raw: u64, cfg: UatConfig) -> Option<PhysicalAddr> {
+    if raw & TTBR_VALID == 0 {
+        return None;
+    }
+    let physical_mask = (1u64 << cfg.oas) - 1;
+    let root = raw & physical_mask & !(UAT_PGMSK as u64);
+    (root != 0).then_some(root)
+}
+
+fn clear_stale_host_root_entries(root: &mut [u64]) {
+    if root.len() > T8140_FIRMWARE_SHARED_ROOT_ENTRIES {
+        root[T8140_FIRMWARE_SHARED_ROOT_ENTRIES..].fill(0);
+    }
+}
+
+fn mirror_host_root_entries(primary: &[u64], secondary: &mut [u64]) -> usize {
+    let mut mirrored = 0;
+    for (source, destination) in primary
+        .iter()
+        .zip(secondary.iter_mut())
+        .skip(T8140_FIRMWARE_PRIVATE_ROOT_ENTRIES)
+    {
+        if *source != 0 && *destination != *source {
+            *destination = *source;
+            mirrored += 1;
+        }
+    }
+    mirrored
+}
+
 /// Return the evidence-backed UAT root geometry for this SoC.
-fn uat_geometry(cfg: &hw::HwConfig) -> Result<UatGeometry> {
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+struct UatConfig {
+    chip_id: u32,
+    ias: u8,
+    oas: u32,
+}
+
+impl UatConfig {
+    const fn from_hw(cfg: &hw::HwConfig) -> Self {
+        Self {
+            chip_id: cfg.chip_id,
+            ias: cfg.uat_ias,
+            oas: cfg.uat_oas,
+        }
+    }
+
+    const T8140: Self = Self {
+        chip_id: 0x8140,
+        ias: 42,
+        oas: 42,
+    };
+}
+
+fn uat_geometry(cfg: UatConfig) -> Result<UatGeometry> {
     // 39-bit (G13/G14) and 42-bit (G15+) roots are the two recovered
     // geometries; anything else is undefined.
-    UatGeometry::new(cfg.uat_ias).ok_or(ENODEV)
+    UatGeometry::new(cfg.ias).ok_or(ENODEV)
+}
+
+/// Lower/user VA range for this SoC's root geometry (one page up to the
+/// per-root translation top: `1 << 39` on AGX2, `1 << 42` on AGX3).
+#[allow(dead_code)]
+pub(crate) fn iova_user_range(cfg: &hw::HwConfig) -> Result<Range<u64>> {
+    Ok(IOVA_USER_BASE..uat_geometry(UatConfig::from_hw(cfg))?.user_va_top())
+}
+
+/// The unknown-page VA for this SoC's root geometry (two pages below the
+/// user top, reproducing the AGX2-proven placement under either root width).
+pub(crate) fn iova_unk_page(cfg: &hw::HwConfig) -> Result<u64> {
+    Ok(uat_geometry(UatConfig::from_hw(cfg))?.user_va_top() - 2 * UAT_PGSZ as u64)
+}
+
+/// Usable lower/user VA range for this SoC (excludes the unknown page).
+pub(crate) fn iova_user_usable_range(cfg: &hw::HwConfig) -> Result<Range<u64>> {
+    Ok(IOVA_USER_BASE..iova_unk_page(cfg)?)
 }
 
 /// Driver-managed kernel VA range within the upper root for this SoC.
@@ -137,7 +405,7 @@ fn uat_geometry(cfg: &hw::HwConfig) -> Result<UatGeometry> {
 /// `0xffffffa000000000..0xffffffb000000000` for 39-bit roots (the
 /// AGX2-proven placement) and the same window offset under the bit-42
 /// selector (`0xfffffc2000000000..0xfffffc3000000000`) for 42-bit roots.
-fn iova_kern_range(cfg: &hw::HwConfig) -> Result<Range<u64>> {
+fn iova_kern_range(cfg: UatConfig) -> Result<Range<u64>> {
     let geometry = uat_geometry(cfg)?;
     Ok(geometry.kernel_va_base()..geometry.kernel_va_top())
 }
@@ -148,8 +416,6 @@ const TTBR_ASID_SHIFT: usize = 48;
 /// Address of a special dummy page?
 //const IOVA_UNK_PAGE: u64 = 0x6f_ffff8000;
 pub(crate) const IOVA_UNK_PAGE: u64 = IOVA_USER_TOP - 2 * UAT_PGSZ as u64;
-/// User VA range excluding the unk page
-pub(crate) const IOVA_USER_USABLE_RANGE: Range<u64> = IOVA_USER_BASE..IOVA_UNK_PAGE;
 
 /// A pre-allocated memory region for UAT management
 struct UatRegion {
@@ -578,8 +844,22 @@ pub(crate) struct Vm {
     inner: ARef<gpuvm::GpuVm<VmInner>>,
     dummy_obj: ARef<gem::Object>,
     binding: Arc<Mutex<VmBinding>>,
+    driver_mappings: Arc<Mutex<Option<VmDriverMappings>>>,
 }
 no_debug!(Vm);
+
+struct VmDriverMappings {
+    mappings: KVec<KernelMapping>,
+    reserved_ranges: KVec<Range<u64>>,
+}
+no_debug!(VmDriverMappings);
+
+fn any_range_overlaps<I>(target: Range<u64>, mut ranges: I) -> bool
+where
+    I: Iterator<Item = Range<u64>>,
+{
+    ranges.any(|range| range.overlaps(target.clone()))
+}
 
 /// Slot data for a [`Vm`] slot (nothing, we only care about the indices).
 pub(crate) struct SlotInner();
@@ -598,6 +878,11 @@ impl VmBind {
     /// Returns the slot that this `Vm` is bound to.
     pub(crate) fn slot(&self) -> u32 {
         self.1
+    }
+
+    /// Whether this retained binding belongs to the supplied DRM VM.
+    pub(crate) fn matches(&self, vm: &Vm) -> bool {
+        core::ptr::eq(&*self.0.inner, &*vm.inner)
     }
 }
 
@@ -666,6 +951,60 @@ impl KernelMapping {
         self.0.start()..(self.0.start() + self.0.mapped_size as u64)
     }
 
+    /// Borrow the mapped GEM subrange through a temporary CPU mapping.
+    ///
+    /// The caller must serialize CPU access with firmware or GPU writes. This
+    /// helper only owns the kernel VMap lifetime and applies the object offset
+    /// carried by this mapping.
+    pub(crate) fn with_cpu_bytes<R>(
+        &self,
+        f: impl FnOnce(&mut [u8]) -> Result<R>,
+    ) -> Result<R> {
+        let gem = self.0._gem.as_ref().ok_or(EINVAL)?;
+        let end = self
+            .0
+            .offset
+            .checked_add(self.0.mapped_size)
+            .ok_or(EOVERFLOW)?;
+        if end > gem.size() {
+            return Err(ERANGE);
+        }
+        let vmap = gem.vmap::<u8>()?;
+        let bytes = unsafe {
+            // SAFETY: the VMap covers the complete GEM allocation and the
+            // checked subrange is retained by this KernelMapping.
+            core::slice::from_raw_parts_mut(
+                vmap.as_mut_ptr().add(self.0.offset),
+                self.0.mapped_size,
+            )
+        };
+        f(bytes)
+    }
+
+    /// Map the same GEM subrange into another VM. The caller owns the returned
+    /// alias and must retain it for every GPU access that uses its address.
+    pub(crate) fn map_alias_into_range(
+        &self,
+        vm: &Vm,
+        range: Range<u64>,
+        prot: Prot,
+    ) -> Result<KernelMapping> {
+        let gem = self.0._gem.as_ref().ok_or(EINVAL)?;
+        let end = self
+            .0
+            .offset
+            .checked_add(self.0.mapped_size)
+            .ok_or(EOVERFLOW)?;
+        vm.map_in_range(
+            &*gem,
+            self.0.offset..end,
+            UAT_PGSZ as u64,
+            range,
+            prot,
+            false,
+        )
+    }
+
     /// Remap a cached mapping as uncached, then synchronously flush that range of VAs from the
     /// coprocessor cache. This is required to safely unmap cached/private mappings.
     fn remap_uncached_and_flush(&mut self) {
@@ -698,6 +1037,20 @@ impl KernelMapping {
             );
         }
         fence(Ordering::SeqCst);
+
+        // T8140 builds its UAT and object graph before AsahiData.gpu is
+        // initialized. A constructor error can therefore drop cached mappings
+        // while owner.dev has no DrmGpu yet. Those mappings were never
+        // published to firmware, so the PTE downgrade above is sufficient.
+        if !self.0.uat_inner.firmware_cache_flush_ready() {
+            mod_dev_dbg!(
+                owner.dev,
+                "MMU: firmware cache flush not armed for {:#x}:{:#x}\n",
+                self.iova(),
+                self.size()
+            );
+            return;
+        }
 
         // If we don't have (and have never had) a VM slot, just return
         let slot = match owner.slot() {
@@ -891,6 +1244,7 @@ unsafe impl Send for UatShared {}
 /// Inner data for the top-level UAT instance.
 #[pin_data]
 struct UatInner {
+    firmware_cache_flush_ready: AtomicBool,
     #[pin]
     shared: Mutex<UatShared>,
     #[pin]
@@ -898,6 +1252,10 @@ struct UatInner {
 }
 
 impl UatInner {
+    fn firmware_cache_flush_ready(&self) -> bool {
+        self.firmware_cache_flush_ready.load(Ordering::Acquire)
+    }
+
     /// Take the lock on the shared data and return the guard.
     fn lock(&self) -> Guard<'_, UatShared, MutexBackend> {
         self.shared.lock()
@@ -912,13 +1270,18 @@ impl UatInner {
 /// Top-level UAT manager object
 pub(crate) struct Uat {
     dev: driver::AsahiDevRef,
-    cfg: &'static hw::HwConfig,
+    cfg: UatConfig,
 
     inner: Arc<UatInner>,
     slots: slotalloc::SlotAllocator<SlotInner>,
 
     kernel_vm: Vm,
     kernel_lower_vm: Vm,
+    _t8140_firmware_crash_buffers: Option<[KernelMapping; 2]>,
+    t8140_firmware_crash_gems: Option<[ARef<gem::Object>; 2]>,
+    t8140_secondary_ttb1: Option<u64>,
+    t8140_empty_high_roots: Option<[Vm; 2]>,
+    t8140_context_phase: AtomicU8,
 }
 
 impl Handoff {
@@ -954,34 +1317,42 @@ impl Handoff {
         }
     }
 
-    /// Initialize the handoff region
-    fn init(&self) -> Result {
+    /// Initialize the handoff region.
+    ///
+    /// In [`HandoffMode::FirmwareDekker`] this blocks (bounded) until the
+    /// firmware publishes `magic_fw`. In
+    /// [`HandoffMode::AbsentStandinT8140`] it must not: on T8140 the
+    /// firmware never writes its half (hardware-verified), so the AP
+    /// publishes its own state and proceeds without a peer.
+    fn init(&self, mode: HandoffMode) -> Result {
         self.magic_ap.store(PPL_MAGIC, Ordering::Relaxed);
         self.cur_slot.store(0, Ordering::Relaxed);
         self.unk3.store(0, Ordering::Relaxed);
         fence(Ordering::SeqCst);
 
-        let start = Instant::<Monotonic>::now();
-        const TIMEOUT: Delta = Delta::from_millis(1000);
+        if mode == HandoffMode::FirmwareDekker {
+            let start = Instant::<Monotonic>::now();
+            const TIMEOUT: Delta = Delta::from_millis(1000);
 
-        self.lock();
-        while start.elapsed() < TIMEOUT {
-            if self.magic_fw.load(Ordering::Relaxed) == PPL_MAGIC {
-                break;
-            } else {
-                self.unlock();
-                fsleep(Delta::from_millis(10));
-                self.lock();
+            self.lock();
+            while start.elapsed() < TIMEOUT {
+                if self.magic_fw.load(Ordering::Relaxed) == PPL_MAGIC {
+                    break;
+                } else {
+                    self.unlock();
+                    fsleep(Delta::from_millis(10));
+                    self.lock();
+                }
             }
-        }
 
-        if self.magic_fw.load(Ordering::Relaxed) != PPL_MAGIC {
+            if self.magic_fw.load(Ordering::Relaxed) != PPL_MAGIC {
+                self.unlock();
+                pr_err!("Handoff: Failed to initialize (firmware not running?)\n");
+                return Err(EIO);
+            }
+
             self.unlock();
-            pr_err!("Handoff: Failed to initialize (firmware not running?)\n");
-            return Err(EIO);
         }
-
-        self.unlock();
 
         for i in 0..=UAT_NUM_CTX {
             self.flush[i].state.store(0, Ordering::Relaxed);
@@ -997,7 +1368,7 @@ impl Handoff {
 ///
 /// # Invariants
 /// The pointer is valid and there is no aliasing HandoffFlush instance.
-struct HandoffFlush(*const FlushInfo);
+struct HandoffFlush(*const FlushInfo, HandoffMode);
 
 // SAFETY: These pointers are safe to send across threads.
 unsafe impl Send for HandoffFlush {}
@@ -1022,8 +1393,19 @@ impl HandoffFlush {
         // SAFETY: Per the type invariant, this is safe
         let flush = unsafe { self.0.as_ref().unwrap() };
         let state = flush.state.load(Ordering::Relaxed);
-        if state != 2 {
-            pr_err!("Handoff: expected flush state 2, got {}\n", state);
+        // In Dekker mode the firmware ACKs a consumed flush by moving the
+        // state to 2. In the T8140 absent-handoff stand-in nothing consumes
+        // it, so the state legitimately remains where begin_flush left it.
+        let expected = match self.1 {
+            HandoffMode::FirmwareDekker => 2,
+            HandoffMode::AbsentStandinT8140 => 1,
+        };
+        if state != expected {
+            pr_err!(
+                "Handoff: expected flush state {}, got {}\n",
+                expected,
+                state
+            );
         }
         flush.state.store(0, Ordering::Relaxed);
     }
@@ -1035,24 +1417,32 @@ impl Vm {
         dev: &driver::AsahiDevice,
         uat_inner: Arc<UatInner>,
         kernel_range: Range<u64>,
-        cfg: &'static hw::HwConfig,
+        cfg: UatConfig,
         ttb: Option<PhysicalAddr>,
         id: u64,
+        t8140_internal: bool,
     ) -> Result<Vm> {
         let dummy_obj = gem::new_kernel_object(dev, UAT_PGSZ)?;
         let is_kernel = ttb.is_some();
         let iova_kern_range = iova_kern_range(cfg)?;
 
         let page_table = if let Some(ttb) = ttb {
-            UatPageTable::new_with_ttb(ttb, iova_kern_range.clone(), cfg.uat_ias, cfg.uat_oas)?
+            UatPageTable::new_with_ttb(ttb, iova_kern_range.clone(), cfg.ias, cfg.oas)?
         } else {
-            UatPageTable::new(cfg.uat_ias, cfg.uat_oas)?
+            UatPageTable::new(cfg.ias, cfg.oas)?
         };
 
+        let lower_start = lower_vm_start(cfg, t8140_internal);
         let (va_range, gpuvm_range) = if is_kernel {
             (iova_kern_range, kernel_range.clone())
         } else {
-            (IOVA_USER_RANGE, IOVA_USER_USABLE_RANGE)
+            // Geometry-derived: 39-bit parts reproduce the AGX2-proven
+            // user/usable ranges byte-for-byte; 42-bit parts extend the
+            // user half to the full per-root width.
+            (
+                lower_start..uat_geometry(cfg)?.user_va_top(),
+                lower_start..(uat_geometry(cfg)?.user_va_top() - 2 * UAT_PGSZ as u64),
+            )
         };
 
         let mm = mm::Allocator::new(va_range.start, va_range.range(), ())?;
@@ -1094,12 +1484,129 @@ impl Vm {
                 }),
             )?,
             binding,
+            driver_mappings: Arc::pin_init(new_mutex!(None, "VmDriverMappings"), GFP_KERNEL)?,
         })
     }
 
     /// Get the translation table base for this Vm
     fn ttb(&self) -> u64 {
         self.binding.lock().ttb
+    }
+
+    /// Retain hardware-required fixed aliases for this VM's complete
+    /// lifetime. Installing them before the VM reaches userspace also makes
+    /// the GPUVM allocator reserve the addresses against user mappings.
+    pub(crate) fn install_driver_mappings(
+        &self,
+        mappings: KVec<KernelMapping>,
+        reserved_ranges: KVec<Range<u64>>,
+    ) -> Result {
+        let mut retained = self.driver_mappings.lock();
+        if retained.is_some() {
+            return Err(EBUSY);
+        }
+        *retained = Some(VmDriverMappings {
+            mappings,
+            reserved_ranges,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn driver_range_overlaps(&self, range: Range<u64>) -> bool {
+        self.driver_mappings.lock().as_ref().is_some_and(|driver| {
+            any_range_overlaps(
+                range.clone(),
+                driver.mappings.iter().map(KernelMapping::iova_range),
+            ) || any_range_overlaps(range, driver.reserved_ranges.iter().cloned())
+        })
+    }
+
+    /// Remove userspace mappings while preserving VM-lifetime driver aliases.
+    pub(crate) fn unmap_user_ranges(
+        &self,
+        user_range: Range<u64>,
+        kernel_range: Range<u64>,
+    ) -> Result {
+        let retained = self.driver_mappings.lock();
+        let driver = retained.as_ref();
+        let mut cursor = user_range.start;
+
+        while cursor < user_range.end {
+            if kernel_range.contains(&cursor) {
+                cursor = kernel_range.end.min(user_range.end);
+                continue;
+            }
+
+            let mut next = user_range.end;
+            let mut covering_end = cursor;
+            if let Some(driver) = driver {
+                for mapping in driver.mappings.iter() {
+                    let range = mapping.iova_range();
+                    if range.contains(&cursor) {
+                        covering_end = covering_end.max(range.end);
+                    } else if cursor < range.start {
+                        next = next.min(range.start);
+                    }
+                }
+                for range in driver.reserved_ranges.iter() {
+                    if range.contains(&cursor) {
+                        covering_end = covering_end.max(range.end);
+                    } else if cursor < range.start {
+                        next = next.min(range.start);
+                    }
+                }
+            }
+            if covering_end != cursor {
+                cursor = covering_end.min(user_range.end);
+                continue;
+            }
+            if cursor < kernel_range.start {
+                next = next.min(kernel_range.start);
+            }
+            if next <= cursor {
+                return Err(EIO);
+            }
+            self.unmap_range(cursor, next - cursor)?;
+            cursor = next;
+        }
+        Ok(())
+    }
+
+    /// Check that a byte range is fully mapped with the requested GPU access.
+    pub(crate) fn covers_range(
+        &self,
+        address: u64,
+        size: u64,
+        need_read: bool,
+        need_write: bool,
+    ) -> bool {
+        if size == 0 {
+            return false;
+        }
+        let Some(end) = address.checked_add(size) else {
+            return false;
+        };
+        let page_mask = UAT_PGMSK as u64;
+        let start = address & !page_mask;
+        let aligned_end = if end & page_mask == 0 {
+            end
+        } else {
+            match (end | page_mask).checked_add(1) {
+                Some(end) => end,
+                None => return false,
+            }
+        };
+        let mut inner = match self.inner.exec_lock(None, false) {
+            Ok(inner) => inner,
+            Err(_) => return false,
+        };
+        if start < inner.va_range.start || aligned_end > inner.va_range.end {
+            return false;
+        }
+        inner
+            .page_table
+            .covers_range(start..aligned_end, need_read, need_write)
+            .unwrap_or(false)
     }
 
     /// Map a GEM object (using its `SGTable`) into this Vm at a free address in a given range.
@@ -1125,13 +1632,16 @@ impl Vm {
         core::mem::drop(vm_bo_guard);
 
         let uat_inner = inner.uat_inner.clone();
-        let node = inner.mm.insert_node_in_range(
+        // Reserve the VA before attaching objects whose destructors take the
+        // GEM reservation lock.  The allocator drops its payload internally
+        // on an insertion error, while exec_lock still owns that lock.
+        let node_result = inner.mm.insert_node_in_range(
             KernelMappingInner {
                 owner: self.inner.clone(),
                 uat_inner,
                 prot,
-                bo: Some(vm_bo),
-                _gem: Some(gem.into()),
+                bo: None,
+                _gem: None,
                 offset: object_range.start,
                 mapped_size: size,
             },
@@ -1141,7 +1651,19 @@ impl Vm {
             range.start,
             range.end,
             mm::InsertMode::Best,
-        )?;
+        );
+        let mut node = match node_result {
+            Ok(node) => node,
+            Err(err) => {
+                core::mem::drop(inner);
+                return Err(err);
+            }
+        };
+        {
+            let node_inner = node.as_mut().inner_mut();
+            node_inner.bo = Some(vm_bo);
+            node_inner._gem = Some(gem.into());
+        }
 
         let ret = inner.map_node(&node, prot);
         // Drop the exec_lock first, so that if map_node failed the
@@ -1173,20 +1695,34 @@ impl Vm {
         core::mem::drop(vm_bo_guard);
 
         let uat_inner = inner.uat_inner.clone();
-        let node = inner.mm.reserve_node(
+        // See map_in_range(): keep dma_resv-owning references out of the
+        // allocator payload until the fixed-address reservation succeeds.
+        let node_result = inner.mm.reserve_node(
             KernelMappingInner {
                 owner: self.inner.clone(),
                 uat_inner,
                 prot,
-                bo: Some(vm_bo),
-                _gem: Some(gem.clone()),
+                bo: None,
+                _gem: None,
                 offset: 0,
                 mapped_size: size,
             },
             addr,
             (size + if guard { UAT_PGSZ } else { 0 }) as u64, // Add guard page
             0,
-        )?;
+        );
+        let mut node = match node_result {
+            Ok(node) => node,
+            Err(err) => {
+                core::mem::drop(inner);
+                return Err(err);
+            }
+        };
+        {
+            let node_inner = node.as_mut().inner_mut();
+            node_inner.bo = Some(vm_bo);
+            node_inner._gem = Some(gem.clone());
+        }
 
         let ret = inner.map_node(&node, prot);
         // Drop the exec_lock first, so that if map_node failed the
@@ -1481,6 +2017,170 @@ impl Uat {
         &self.kernel_lower_vm
     }
 
+    /// Retain a read-only view of the live TTBAT for firmware crash handling.
+    pub(crate) fn firmware_context_table_reader(&self) -> FirmwareContextTableReader {
+        FirmwareContextTableReader {
+            inner: self.inner.clone(),
+            cfg: self.cfg,
+            t8140_crash_buffers: self.t8140_firmware_crash_gems.as_ref().map(|buffers| {
+                [buffers[0].clone(), buffers[1].clone()]
+            }),
+        }
+    }
+
+    /// Return the kernel-half VA range owned by this UAT.
+    pub(crate) fn kernel_va_range(&self) -> Result<Range<u64>> {
+        iova_kern_range(self.cfg)
+    }
+
+    /// Prepare the firmware-published T8140 upper roots for host mappings.
+    ///
+    /// G17P publishes three primary entries during RTKit boot: two private
+    /// code/data entries and the shared L2 entry used by the kernel VA window.
+    /// Host mappings must be added beneath that live entry, not beneath a root
+    /// image constructed before the processor starts.
+    pub(crate) fn prepare_t8140_firmware_high_roots(
+        &self,
+    ) -> Result<T8140PrimaryRootSnapshot> {
+        if self.cfg != UatConfig::T8140 {
+            return Err(EINVAL);
+        }
+        let primary_phys = self.kernel_vm.ttb();
+        let secondary_phys = self.t8140_secondary_ttb1.ok_or(EIO)?;
+        let primary = unsafe { Page::borrow_phys(&primary_phys) }.ok_or(EIO)?;
+        let secondary = unsafe { Page::borrow_phys(&secondary_phys) }.ok_or(EIO)?;
+        let mut primary_entries = [0u64; T8140_FIRMWARE_SHARED_ROOT_ENTRIES];
+        let mut secondary_entries = [0u64; T8140_FIRMWARE_SHARED_ROOT_ENTRIES];
+
+        primary.with_pointer_into_page(0, UAT_PGSZ, |pointer| {
+            let entries = unsafe {
+                core::slice::from_raw_parts_mut(
+                    pointer as *mut u64,
+                    UAT_PGSZ / core::mem::size_of::<u64>(),
+                )
+            };
+            primary_entries.copy_from_slice(&entries[..T8140_FIRMWARE_SHARED_ROOT_ENTRIES]);
+            clear_stale_host_root_entries(entries);
+            Ok(())
+        })?;
+        secondary.with_pointer_into_page(0, UAT_PGSZ, |pointer| {
+            let entries = unsafe {
+                core::slice::from_raw_parts(
+                    pointer as *const u64,
+                    UAT_PGSZ / core::mem::size_of::<u64>(),
+                )
+            };
+            secondary_entries.copy_from_slice(&entries[..T8140_FIRMWARE_SHARED_ROOT_ENTRIES]);
+            Ok(())
+        })?;
+        fence(Ordering::SeqCst);
+        mem::tlbi_all();
+        mem::sync();
+        dev_info!(
+            self.dev.as_ref(),
+            "MMU: GFX high root {:#x} entries [{:#x}, {:#x}, {:#x}]; GFX1 root {:#x} entries [{:#x}, {:#x}, {:#x}]\n",
+            primary_phys,
+            primary_entries[0],
+            primary_entries[1],
+            primary_entries[2],
+            secondary_phys,
+            secondary_entries[0],
+            secondary_entries[1],
+            secondary_entries[2]
+        );
+        Ok(T8140PrimaryRootSnapshot {
+            entries: primary_entries,
+        })
+    }
+
+    /// Confirm construction retained the three firmware-published entries.
+    pub(crate) fn confirm_t8140_primary_high_root(
+        &self,
+        snapshot: T8140PrimaryRootSnapshot,
+    ) -> Result {
+        if self.cfg != UatConfig::T8140 {
+            return Err(EINVAL);
+        }
+        let primary_phys = self.kernel_vm.ttb();
+        let primary = unsafe { Page::borrow_phys(&primary_phys) }.ok_or(EIO)?;
+        let mut current = [0u64; T8140_FIRMWARE_SHARED_ROOT_ENTRIES];
+        primary.with_pointer_into_page(0, UAT_PGSZ, |pointer| {
+            let entries = unsafe {
+                core::slice::from_raw_parts(
+                    pointer as *const u64,
+                    UAT_PGSZ / core::mem::size_of::<u64>(),
+                )
+            };
+            current.copy_from_slice(&entries[..T8140_FIRMWARE_SHARED_ROOT_ENTRIES]);
+            Ok(())
+        })?;
+        if current != snapshot.entries {
+            dev_err!(
+                self.dev.as_ref(),
+                "MMU: GFX high-root firmware entries changed during graph construction: before {:?}, after {:?}\n",
+                snapshot.entries,
+                current
+            );
+            return Err(EIO);
+        }
+        dev_info!(
+            self.dev.as_ref(),
+            "MMU: GFX high-root firmware entries preserved across graph construction\n"
+        );
+        Ok(())
+    }
+
+    /// Mirror host-visible upper-root entries into GFX1's private top table.
+    /// Entries 0 and 1 remain owned by that firmware instance.
+    pub(crate) fn mirror_t8140_secondary_high_root(&self) -> Result<usize> {
+        if self.cfg != UatConfig::T8140 {
+            return Err(EINVAL);
+        }
+        let primary_phys = self.kernel_vm.ttb();
+        let secondary_phys = self.t8140_secondary_ttb1.ok_or(EIO)?;
+        let primary = unsafe { Page::borrow_phys(&primary_phys) }.ok_or(EIO)?;
+        let secondary = unsafe { Page::borrow_phys(&secondary_phys) }.ok_or(EIO)?;
+        let mirrored = primary.with_pointer_into_page(0, UAT_PGSZ, |primary_pointer| {
+            secondary.with_pointer_into_page(0, UAT_PGSZ, |secondary_pointer| {
+                let primary_entries = unsafe {
+                    core::slice::from_raw_parts(
+                        primary_pointer as *const u64,
+                        UAT_PGSZ / core::mem::size_of::<u64>(),
+                    )
+                };
+                let secondary_entries = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        secondary_pointer as *mut u64,
+                        UAT_PGSZ / core::mem::size_of::<u64>(),
+                    )
+                };
+                Ok(mirror_host_root_entries(primary_entries, secondary_entries))
+            })
+        })?;
+        fence(Ordering::SeqCst);
+        mem::tlbi_all();
+        mem::sync();
+        dev_info!(
+            self.dev.as_ref(),
+            "MMU: mirrored {} host high-root entries into GFX1 at {:#x}\n",
+            mirrored,
+            secondary_phys
+        );
+        Ok(mirrored)
+    }
+
+    /// Arm firmware-backed mapping teardown after the DRM device data slot
+    /// contains its live DrmGpu owner. Legacy/Dekker UATs start armed.
+    pub(crate) fn mark_firmware_cache_flush_ready(&self) {
+        if !self
+            .inner
+            .firmware_cache_flush_ready
+            .swap(true, Ordering::AcqRel)
+        {
+            dev_info!(self.dev.as_ref(), "MMU: firmware cache flushes armed\n");
+        }
+    }
+
     #[cfg(CONFIG_DEV_COREDUMP)]
     pub(crate) fn dump_kernel_pages(&self) -> Result<KVVec<pgtable::DumpedPage>> {
         // Full upper-half range for this SoC's root geometry.
@@ -1494,6 +2194,334 @@ impl Uat {
         let inner = self.inner.lock();
 
         inner.ttbs_rgn.base
+    }
+
+    /// Confirm the cold first-render context table before a render VM binds.
+    ///
+    /// Slots 0 and 1 share the retained low root. Their high roots are either
+    /// the source firmware root before first work or the two distinct empty
+    /// roots after an earlier render VM has retired.
+    pub(crate) fn t8140_partial_opening_kernel_contexts_ready(&self) -> bool {
+        if self.cfg != UatConfig::T8140 {
+            return false;
+        }
+        let empty = match self.t8140_empty_high_roots.as_ref() {
+            Some(roots) => [roots[0].ttb(), roots[1].ttb()],
+            None => return false,
+        };
+        let low = self.kernel_lower_vm.ttb();
+        let source_high = self.kernel_vm.ttb();
+        let phase = self.t8140_context_phase.load(Ordering::Acquire);
+        let high = match phase {
+            T8140_CONTEXT_BOOTSTRAP_SOURCE_HIGH => [source_high, source_high],
+            T8140_CONTEXT_BOOTSTRAP_EMPTY_HIGH => empty,
+            _ => return false,
+        };
+        let inner = self.inner.lock();
+        let ttbs = inner.ttbs();
+        ttbs[0].ttb0.load(Ordering::Acquire) == (low | TTBR_VALID)
+            && ttbs[0].ttb1.load(Ordering::Acquire) == (high[0] | TTBR_VALID)
+            && ttbs[1].ttb0.load(Ordering::Acquire)
+                == (low | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT))
+            && ttbs[1].ttb1.load(Ordering::Acquire)
+                == (high[1] | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT))
+    }
+
+    /// Confirm the post-opening first-work split. Unlike a steady-state user
+    /// bind, the driver-owned bootstrap graph still names firmware-high
+    /// objects, so both active slots retain the populated source high root.
+    pub(crate) fn t8140_first_work_render_context_ready(
+        &self,
+        render: &VmBind,
+    ) -> bool {
+        if self.cfg != UatConfig::T8140
+            || render.slot() != 1
+            || self.t8140_context_phase.load(Ordering::Acquire) != T8140_CONTEXT_USER_OWNED
+        {
+            return false;
+        }
+        let source_high = self.kernel_vm.ttb();
+        let expected = t8140_split_render_layout(
+            self.kernel_lower_vm.ttb(),
+            render.0.ttb(),
+            [source_high; 2],
+        );
+        let inner = self.inner.lock();
+        let ttbs = inner.ttbs();
+        ttbs[0].ttb0.load(Ordering::Acquire) == expected.low[0]
+            && ttbs[0].ttb1.load(Ordering::Acquire) == expected.high[0]
+            && ttbs[1].ttb0.load(Ordering::Acquire) == expected.low[1]
+            && ttbs[1].ttb1.load(Ordering::Acquire) == expected.high[1]
+    }
+
+    /// Confirm the root phase used while firmware consumes the 4/16 opening.
+    ///
+    /// The native sequence keeps the render VM's low root and the source
+    /// firmware high root in both active slots until opcode 0x20 has retired.
+    /// The later split is a separate transition at the control-done/work
+    /// boundary.
+    pub(crate) fn t8140_partial_opening_shared_render_context_ready(
+        &self,
+        render: &VmBind,
+    ) -> bool {
+        if self.cfg != UatConfig::T8140
+            || render.slot() != 1
+            || self.t8140_context_phase.load(Ordering::Acquire)
+                != T8140_CONTEXT_OPENING_RENDER_SHARED
+        {
+            return false;
+        }
+        let expected =
+            t8140_opening_render_layout(render.0.ttb(), self.kernel_vm.ttb());
+        let inner = self.inner.lock();
+        let ttbs = inner.ttbs();
+        ttbs[0].ttb0.load(Ordering::Acquire) == expected.low[0]
+            && ttbs[1].ttb0.load(Ordering::Acquire) == expected.low[1]
+            && ttbs[0].ttb1.load(Ordering::Acquire) == expected.high[0]
+            && ttbs[1].ttb1.load(Ordering::Acquire) == expected.high[1]
+    }
+
+    /// Present the render roots in both active slots for the 4/16 opening.
+    ///
+    /// `render` is first acquired through the normal VM binder so its slot
+    /// ownership and lifetime remain governed by [`VmBind`]. No firmware work
+    /// is visible between that bind and this root-table transition.
+    pub(crate) fn install_t8140_partial_opening_shared_render_roots(
+        &self,
+        render: &VmBind,
+    ) -> Result {
+        if self.cfg != UatConfig::T8140 || render.slot() != 1 {
+            return Err(EINVAL);
+        }
+        let empty = self.t8140_empty_high_roots.as_ref().ok_or(EIO)?;
+        let retained_low = self.kernel_lower_vm.ttb();
+        let render_low = render.0.ttb();
+        let empty_high = [empty[0].ttb(), empty[1].ttb()];
+        let current = t8140_split_render_layout(retained_low, render_low, empty_high);
+        let opening = t8140_opening_render_layout(render_low, self.kernel_vm.ttb());
+        let inner = self.inner.lock();
+        inner.handoff().lock();
+        let ttbs = inner.ttbs();
+        let ready = self.t8140_context_phase.load(Ordering::Acquire)
+            == T8140_CONTEXT_USER_OWNED
+            && ttbs[0].ttb0.load(Ordering::Acquire) == current.low[0]
+            && ttbs[1].ttb0.load(Ordering::Acquire) == current.low[1]
+            && ttbs[0].ttb1.load(Ordering::Acquire) == current.high[0]
+            && ttbs[1].ttb1.load(Ordering::Acquire) == current.high[1];
+        if !ready {
+            inner.handoff().unlock();
+            return Err(EIO);
+        }
+        ttbs[0].ttb0.store(opening.low[0], Ordering::Release);
+        ttbs[1].ttb0.store(opening.low[1], Ordering::Release);
+        ttbs[0].ttb1.store(opening.high[0], Ordering::Release);
+        ttbs[1].ttb1.store(opening.high[1], Ordering::Release);
+        self.t8140_context_phase.store(
+            T8140_CONTEXT_OPENING_RENDER_SHARED,
+            Ordering::Release,
+        );
+        inner.handoff().unlock();
+        core::mem::drop(inner);
+
+        mem::tlbi_asid(0);
+        mem::tlbi_asid(1);
+        mem::sync();
+        dev_info!(
+            self.dev.as_ref(),
+            "MMU: opening roots shared low={:#x?} high={:#x?}\n",
+            opening.low,
+            opening.high
+        );
+        Ok(())
+    }
+
+    /// Split the shared opening roots into retained context 0 and render VM 1.
+    /// Firmware has retired opcode 0x20 and the caller has sent control-done;
+    /// no work producer is visible until this transition completes.
+    pub(crate) fn split_t8140_partial_opening_render_roots(
+        &self,
+        render: &VmBind,
+    ) -> Result {
+        if self.cfg != UatConfig::T8140 || render.slot() != 1 {
+            return Err(EINVAL);
+        }
+        let opening =
+            t8140_opening_render_layout(render.0.ttb(), self.kernel_vm.ttb());
+        let source_high = self.kernel_vm.ttb();
+        let split = t8140_split_render_layout(
+            self.kernel_lower_vm.ttb(),
+            render.0.ttb(),
+            [source_high; 2],
+        );
+        let inner = self.inner.lock();
+        inner.handoff().lock();
+        let ttbs = inner.ttbs();
+        let ready = self.t8140_context_phase.load(Ordering::Acquire)
+            == T8140_CONTEXT_OPENING_RENDER_SHARED
+            && ttbs[0].ttb0.load(Ordering::Acquire) == opening.low[0]
+            && ttbs[1].ttb0.load(Ordering::Acquire) == opening.low[1]
+            && ttbs[0].ttb1.load(Ordering::Acquire) == opening.high[0]
+            && ttbs[1].ttb1.load(Ordering::Acquire) == opening.high[1];
+        if !ready {
+            inner.handoff().unlock();
+            return Err(EIO);
+        }
+        ttbs[0].ttb0.store(split.low[0], Ordering::Release);
+        ttbs[1].ttb0.store(split.low[1], Ordering::Release);
+        ttbs[0].ttb1.store(split.high[0], Ordering::Release);
+        ttbs[1].ttb1.store(split.high[1], Ordering::Release);
+        self.t8140_context_phase
+            .store(T8140_CONTEXT_USER_OWNED, Ordering::Release);
+        inner.handoff().unlock();
+        core::mem::drop(inner);
+
+        mem::tlbi_asid(0);
+        mem::tlbi_asid(1);
+        mem::sync();
+        dev_info!(
+            self.dev.as_ref(),
+            "MMU: first-work roots split low={:#x?} high={:#x?}\n",
+            split.low,
+            split.high
+        );
+        Ok(())
+    }
+
+    /// Replace only the two high roots at the measured first-work boundary.
+    /// Both low roots remain resident; the source firmware high root remains
+    /// retained by `kernel_vm` but is no longer present in the TTBAT.
+    pub(crate) fn install_t8140_partial_opening_empty_high_roots(&self) -> Result {
+        let empty = self.t8140_empty_high_roots.as_ref().ok_or(EIO)?;
+        let low = self.kernel_lower_vm.ttb();
+        let source_high = self.kernel_vm.ttb();
+        let empty_high = [empty[0].ttb(), empty[1].ttb()];
+        let inner = self.inner.lock();
+        inner.handoff().lock();
+        let ttbs = inner.ttbs();
+        let phase = self.t8140_context_phase.load(Ordering::Acquire);
+        let low_ready = ttbs[0].ttb0.load(Ordering::Acquire) == (low | TTBR_VALID)
+            && ttbs[1].ttb0.load(Ordering::Acquire)
+                == (low | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT));
+        let changed = match phase {
+            T8140_CONTEXT_BOOTSTRAP_SOURCE_HIGH => {
+                let source_ready = low_ready
+                    && ttbs[0].ttb1.load(Ordering::Acquire) == (source_high | TTBR_VALID)
+                    && ttbs[1].ttb1.load(Ordering::Acquire)
+                        == (source_high | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT));
+                if !source_ready {
+                    Err(EIO)
+                } else {
+                    ttbs[0]
+                        .ttb1
+                        .store(empty_high[0] | TTBR_VALID, Ordering::Release);
+                    ttbs[1].ttb1.store(
+                        empty_high[1] | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT),
+                        Ordering::Release,
+                    );
+                    self.t8140_context_phase
+                        .store(T8140_CONTEXT_BOOTSTRAP_EMPTY_HIGH, Ordering::Release);
+                    Ok(true)
+                }
+            }
+            T8140_CONTEXT_BOOTSTRAP_EMPTY_HIGH => {
+                let empty_ready = low_ready
+                    && ttbs[0].ttb1.load(Ordering::Acquire) == (empty_high[0] | TTBR_VALID)
+                    && ttbs[1].ttb1.load(Ordering::Acquire)
+                        == (empty_high[1] | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT));
+                if empty_ready {
+                    Ok(false)
+                } else {
+                    Err(EIO)
+                }
+            }
+            _ => Err(EBUSY),
+        };
+        inner.handoff().unlock();
+        core::mem::drop(inner);
+
+        if changed? {
+            mem::tlbi_asid(0);
+            mem::tlbi_asid(1);
+            mem::sync();
+        }
+        Ok(())
+    }
+
+    /// Restore the retained context-1 low root after a completed driver-owned
+    /// bootstrap render VM drops. Firmware has retired both queues before this
+    /// transition, and subsequent user binds may replace slot 1 normally.
+    pub(crate) fn restore_t8140_kernel_context_after_bootstrap_render(&self) -> Result {
+        if self.cfg != UatConfig::T8140 {
+            return Err(EINVAL);
+        }
+        let empty = self.t8140_empty_high_roots.as_ref().ok_or(EIO)?;
+        let low = self.kernel_lower_vm.ttb();
+        let inner = self.inner.lock();
+        inner.handoff().lock();
+        let ttbs = inner.ttbs();
+        if self.t8140_context_phase.load(Ordering::Acquire) != T8140_CONTEXT_USER_OWNED
+            || ttbs[0].ttb0.load(Ordering::Acquire) != (low | TTBR_VALID)
+        {
+            inner.handoff().unlock();
+            return Err(EIO);
+        }
+        ttbs[1].ttb0.store(
+            low | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT),
+            Ordering::Release,
+        );
+        ttbs[0]
+            .ttb1
+            .store(empty[0].ttb() | TTBR_VALID, Ordering::Release);
+        ttbs[1].ttb1.store(
+            empty[1].ttb() | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT),
+            Ordering::Release,
+        );
+        self.t8140_context_phase
+            .store(T8140_CONTEXT_BOOTSTRAP_EMPTY_HIGH, Ordering::Release);
+        inner.handoff().unlock();
+        core::mem::drop(inner);
+
+        mem::tlbi_asid(0);
+        mem::tlbi_asid(1);
+        mem::sync();
+        Ok(())
+    }
+
+    /// Restore the cold T8140 context table after both firmware processors stop.
+    ///
+    /// The caller must first drop every active [`VmBind`]. Existing user VMs
+    /// and their page tables remain allocated; a later bind can install the
+    /// same VM into slot 1 again.
+    pub(crate) fn restore_t8140_bootstrap_roots_after_processor_stop(&self) -> Result {
+        if self.cfg != UatConfig::T8140 {
+            return Err(EINVAL);
+        }
+        let low = self.kernel_lower_vm.ttb();
+        let source_high = self.kernel_vm.ttb();
+        let inner = self.inner.lock();
+        inner.handoff().lock();
+        let ttbs = inner.ttbs();
+        ttbs[0].ttb0.store(low | TTBR_VALID, Ordering::Release);
+        ttbs[0]
+            .ttb1
+            .store(source_high | TTBR_VALID, Ordering::Release);
+        ttbs[1].ttb0.store(
+            low | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT),
+            Ordering::Release,
+        );
+        ttbs[1].ttb1.store(
+            source_high | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT),
+            Ordering::Release,
+        );
+        self.t8140_context_phase
+            .store(T8140_CONTEXT_BOOTSTRAP_SOURCE_HIGH, Ordering::Release);
+        inner.handoff().unlock();
+        core::mem::drop(inner);
+
+        mem::tlbi_asid(0);
+        mem::tlbi_asid(1);
+        mem::sync();
+        Ok(())
     }
 
     /// Binds a `Vm` to a slot, preferring the last used one.
@@ -1517,9 +2545,16 @@ impl Uat {
                 let idx = (slot.slot() as usize) + UAT_USER_CTX_START;
                 let ttb = binding.ttb | TTBR_VALID | (idx as u64) << TTBR_ASID_SHIFT;
 
+                if self.cfg == UatConfig::T8140 && idx != 1 {
+                    return Err(EBUSY);
+                }
+
                 let uat_inner = self.inner.lock();
 
-                let ttb1 = if uat_inner.map_kernel_to_user {
+                let ttb1 = if self.cfg == UatConfig::T8140 {
+                    let empty = self.t8140_empty_high_roots.as_ref().ok_or(EIO)?;
+                    empty[1].ttb() | TTBR_VALID | (idx as u64) << TTBR_ASID_SHIFT
+                } else if uat_inner.map_kernel_to_user {
                     uat_inner.kernel_ttb1 | TTBR_VALID | (idx as u64) << TTBR_ASID_SHIFT
                 } else {
                     0
@@ -1527,14 +2562,28 @@ impl Uat {
 
                 let ttbs = uat_inner.ttbs();
                 uat_inner.handoff().lock();
+                let t8140_phase = self.t8140_context_phase.load(Ordering::Acquire);
                 if uat_inner.handoff().current_slot() == Some(idx as u32) {
                     pr_err!(
                         "Vm::bind to slot {}, but it is currently in use by the ASC?\n",
                         idx
                     );
                 }
+                if self.cfg == UatConfig::T8140
+                    && idx == 1
+                    && t8140_phase == T8140_CONTEXT_BOOTSTRAP_SOURCE_HIGH
+                {
+                    let empty = self.t8140_empty_high_roots.as_ref().ok_or(EIO)?;
+                    ttbs[0]
+                        .ttb1
+                        .store(empty[0].ttb() | TTBR_VALID, Ordering::Release);
+                }
                 ttbs[idx].ttb0.store(ttb, Ordering::Release);
                 ttbs[idx].ttb1.store(ttb1, Ordering::Release);
+                if self.cfg == UatConfig::T8140 && idx == 1 {
+                    self.t8140_context_phase
+                        .store(T8140_CONTEXT_USER_OWNED, Ordering::Release);
+                }
                 uat_inner.handoff().unlock();
                 core::mem::drop(uat_inner);
 
@@ -1563,12 +2612,13 @@ impl Uat {
             self.cfg,
             None,
             id,
+            false,
         )
     }
 
     /// Creates the reference-counted inner data for a new `Uat` instance.
     #[inline(never)]
-    fn make_inner(dev: &driver::AsahiDevice) -> Result<Arc<UatInner>> {
+    fn make_inner(dev: &driver::AsahiDevice, handoff_mode: HandoffMode) -> Result<Arc<UatInner>> {
         let handoff_rgn = Self::map_region(dev.as_ref(), c_str!("handoff"), HANDOFF_SIZE, true)?;
         let ttbs_rgn = Self::map_region(dev.as_ref(), c_str!("ttbs"), SLOTS_SIZE, true)?;
 
@@ -1580,8 +2630,11 @@ impl Uat {
 
         Arc::pin_init(
             try_pin_init!(UatInner {
+                firmware_cache_flush_ready: AtomicBool::new(
+                    handoff_mode == HandoffMode::FirmwareDekker
+                ),
                 handoff_flush <- pin_init::pin_init_array_from_fn(|i| {
-                    new_mutex!(HandoffFlush(&handoff.flush[i]), "handoff_flush")
+                    new_mutex!(HandoffFlush(&handoff.flush[i], handoff_mode), "handoff_flush")
                 }),
                 shared <- new_mutex!(
                     UatShared {
@@ -1597,58 +2650,288 @@ impl Uat {
         )
     }
 
-    /// Creates a new `Uat` instance given the relevant hardware config.
+    /// Creates a new `Uat` instance given the relevant hardware config, using
+    /// the AGX2-proven firmware Dekker handoff protocol.
     #[inline(never)]
     pub(crate) fn new(
         dev: &driver::AsahiDevice,
         cfg: &'static hw::HwConfig,
         map_kernel_to_user: bool,
     ) -> Result<Self> {
+        Self::new_with_handoff_mode(dev, cfg, map_kernel_to_user, HandoffMode::FirmwareDekker)
+    }
+
+    /// Create the T8140 UAT owner with the hardware-verified absent-handoff
+    /// behavior. This constructor needs only the UAT geometry and chip ID; it
+    /// does not fabricate the unrelated AGX2 firmware tuning fields in
+    /// [`hw::HwConfig`].
+    #[inline(never)]
+    pub(crate) fn new_t8140(dev: &driver::AsahiDevice, map_kernel_to_user: bool) -> Result<Self> {
+        let mut uat = Self::new_with_config(
+            dev,
+            UatConfig::T8140,
+            map_kernel_to_user,
+            HandoffMode::AbsentStandinT8140,
+        )?;
+        uat.install_t8140_firmware_crash_buffers(dev)?;
+        Ok(uat)
+    }
+
+    /// Back the two nonzero EP1 crash-buffer requests before either firmware
+    /// processor starts. m1n1 treats these DVAs as preallocated context-0
+    /// mappings and only echoes the request; Linux must provide the same
+    /// mapping rather than assuming firmware creates it.
+    fn install_t8140_firmware_crash_buffers(&mut self, dev: &driver::AsahiDevice) -> Result {
+        if self.cfg != UatConfig::T8140 || self._t8140_firmware_crash_buffers.is_some() {
+            dev_err!(
+                dev.as_ref(),
+                "MMU: firmware crash-buffer setup has invalid T8140 state\n"
+            );
+            return Err(EINVAL);
+        }
+        let map = |name: &str,
+                   range: &Range<u64>,
+                   sentinel: u8|
+         -> Result<(KernelMapping, ARef<gem::Object>)> {
+            let size_u64 = range.end.checked_sub(range.start).ok_or(EINVAL)?;
+            let size: usize = size_u64.try_into()?;
+            let mut object = match gem::new_kernel_object_wc(dev, size) {
+                Ok(object) => object,
+                Err(err) => {
+                    dev_err!(
+                        dev.as_ref(),
+                        "MMU: {} crash-buffer allocation at {:#x}:{:#x} failed ({:?})\n",
+                        name,
+                        range.start,
+                        size,
+                        err
+                    );
+                    return Err(err);
+                }
+            };
+            let mut vmap = match object.vmap() {
+                Ok(vmap) => vmap,
+                Err(err) => {
+                    dev_err!(
+                        dev.as_ref(),
+                        "MMU: {} crash-buffer CPU map at {:#x}:{:#x} failed ({:?})\n",
+                        name,
+                        range.start,
+                        size,
+                        err
+                    );
+                    return Err(err);
+                }
+            };
+            vmap.memset(sentinel as i32);
+            core::mem::drop(vmap);
+            let retained_gem = object.gem.clone();
+            let mapping = match object.map_at(
+                &self.kernel_lower_vm,
+                range.start,
+                PROT_FW_SHARED_RW,
+                false,
+            ) {
+                Ok(mapping) => mapping,
+                Err(err) => {
+                    dev_err!(
+                        dev.as_ref(),
+                        "MMU: {} crash-buffer context-0 map at {:#x}:{:#x} failed ({:?})\n",
+                        name,
+                        range.start,
+                        size,
+                        err
+                    );
+                    return Err(err);
+                }
+            };
+            if mapping.iova_range() != *range {
+                dev_err!(
+                    dev.as_ref(),
+                    "MMU: {} crash-buffer map returned {:#x?}, expected {:#x?}\n",
+                    name,
+                    mapping.iova_range(),
+                    range
+                );
+                return Err(EFAULT);
+            }
+            // `covers_range` checks GPU permissions. These buffers are
+            // deliberately firmware-only, so require complete leaf coverage
+            // without requesting GPU read/write access.
+            if !self
+                .kernel_lower_vm
+                .covers_range(range.start, size_u64, false, false)
+            {
+                dev_err!(
+                    dev.as_ref(),
+                    "MMU: {} crash-buffer context-0 leaves missing at {:#x}:{:#x}\n",
+                    name,
+                    range.start,
+                    size
+                );
+                return Err(EFAULT);
+            }
+            dev_info!(
+                dev.as_ref(),
+                "MMU: mapped {} firmware crash buffer in context 0 at {:#x}:{:#x}\n",
+                name,
+                range.start,
+                size
+            );
+            Ok((mapping, retained_gem))
+        };
+        let (gfx, gfx_gem) = map(
+            "GFX",
+            &T8140_FIRMWARE_CRASH_BUFFERS[0],
+            T8140_FIRMWARE_CRASH_SENTINELS[0],
+        )?;
+        let (gfx1, gfx1_gem) = map(
+            "GFX1",
+            &T8140_FIRMWARE_CRASH_BUFFERS[1],
+            T8140_FIRMWARE_CRASH_SENTINELS[1],
+        )?;
+        self._t8140_firmware_crash_buffers = Some([gfx, gfx1]);
+        self.t8140_firmware_crash_gems = Some([gfx_gem, gfx1_gem]);
+        Ok(())
+    }
+
+    /// Creates a new `Uat` instance with an explicit handoff mode.
+    ///
+    /// The mode is evidence-gated: `FirmwareDekker` on a 42-bit part remains
+    /// fail-closed behind [`AGX3_FIRMWARE_HANDOFF_VALIDATED`] (the PPL layout
+    /// needs a live firmware ACK that no AGX3 boot has produced), and
+    /// `AbsentStandinT8140` is accepted only on T8140 itself, where "the
+    /// firmware never publishes its handoff half" is a live-hardware fact.
+    #[inline(never)]
+    pub(crate) fn new_with_handoff_mode(
+        dev: &driver::AsahiDevice,
+        cfg: &'static hw::HwConfig,
+        map_kernel_to_user: bool,
+        handoff_mode: HandoffMode,
+    ) -> Result<Self> {
+        Self::new_with_config(
+            dev,
+            UatConfig::from_hw(cfg),
+            map_kernel_to_user,
+            handoff_mode,
+        )
+    }
+
+    #[inline(never)]
+    fn new_with_config(
+        dev: &driver::AsahiDevice,
+        cfg: UatConfig,
+        map_kernel_to_user: bool,
+        handoff_mode: HandoffMode,
+    ) -> Result<Self> {
         dev_info!(dev.as_ref(), "MMU: Initializing...\n");
 
         // Validate the geometry first: 39- and 42-bit roots are the two
         // recovered layouts, and the page-table walk, kernel-half VA window,
         // and leaf PTE policy are implemented for both (the AGX3 leaf PTE
-        // encoder is byte-identical to AGX2). What is *not* validated for
-        // AGX3 is the firmware-shared state this constructor touches next:
-        // the Handoff/FlushInfo struct layout and the firmware's view of the
-        // kernel-half window are per-firmware-build ABI observed only on
-        // AGX2. Fail closed on exactly that boundary.
+        // encoder is byte-identical to AGX2). What must remain fail-closed
+        // per mode is the firmware-shared state this constructor touches
+        // next: the Handoff/FlushInfo protocol is per-firmware-build ABI
+        // observed on AGX2 (Dekker) and, separately, observed *absent* on
+        // T8140.
         let kernel_range = iova_kern_range(cfg)?;
-        if cfg.uat_ias != 39 && !AGX3_FIRMWARE_HANDOFF_VALIDATED {
-            dev_err!(
-                dev.as_ref(),
-                "MMU: {}-bit UAT geometry is implemented, but the AGX3 firmware Handoff ABI and kernel-VA map are unvalidated\n",
-                cfg.uat_ias
-            );
-            return Err(ENODEV);
+        match handoff_mode {
+            HandoffMode::FirmwareDekker => {
+                if cfg.ias != 39 && !AGX3_FIRMWARE_HANDOFF_VALIDATED {
+                    dev_err!(
+                        dev.as_ref(),
+                        "MMU: {}-bit UAT geometry is implemented, but the AGX3 firmware Handoff ABI and kernel-VA map are unvalidated\n",
+                        cfg.ias
+                    );
+                    return Err(ENODEV);
+                }
+            }
+            HandoffMode::AbsentStandinT8140 => {
+                // Hardware-verified on T8140 only. Never assume any other
+                // part ignores the handoff region.
+                if cfg.chip_id != 0x8140 || cfg.ias != 42 {
+                    dev_err!(
+                        dev.as_ref(),
+                        "MMU: absent-handoff stand-in is T8140-only evidence (chip {:#x}, {}-bit)\n",
+                        cfg.chip_id,
+                        cfg.ias
+                    );
+                    return Err(ENODEV);
+                }
+            }
         }
 
-        let inner = Self::make_inner(dev)?;
+        let inner = Self::make_inner(dev, handoff_mode)?;
 
         let of_node = dev.as_ref().of_node().ok_or(EINVAL)?;
         let res = of_node.reserved_mem_region_to_resource_byname(c_str!("pagetables"))?;
         let ttb1 = res.start();
         let ttb1size: usize = res.size().try_into()?;
 
-        if ttb1size < PAGETABLES_SIZE {
+        let required_pagetables_size = if cfg == UatConfig::T8140 {
+            T8140_SECONDARY_SHARED_ROOT_DELTA as usize + UAT_PGSZ
+        } else {
+            PAGETABLES_SIZE
+        };
+        if ttb1size < required_pagetables_size {
             dev_err!(dev.as_ref(), "MMU: Pagetables region is too small\n");
             return Err(ENOMEM);
         }
 
         dev_info!(dev.as_ref(), "MMU: Creating kernel page tables\n");
-        let kernel_lower_vm = Vm::new(dev, inner.clone(), IOVA_USER_RANGE, cfg, None, 1)?;
-        let kernel_vm = Vm::new(dev, inner.clone(), kernel_range, cfg, Some(ttb1), 0)?;
+        let kernel_lower_vm = Vm::new(
+            dev,
+            inner.clone(),
+            lower_vm_start(cfg, true)..uat_geometry(cfg)?.user_va_top(),
+            cfg,
+            None,
+            1,
+            true,
+        )?;
+        let kernel_vm = Vm::new(dev, inner.clone(), kernel_range, cfg, Some(ttb1), 0, false)?;
 
         dev_info!(dev.as_ref(), "MMU: Kernel page tables created\n");
 
         let ttb0 = kernel_lower_vm.ttb();
+        let t8140_empty_high_roots = if cfg == UatConfig::T8140 {
+            Some([
+                Vm::new(
+                    dev,
+                    inner.clone(),
+                    IOVA_USER_BASE..uat_geometry(cfg)?.user_va_top(),
+                    cfg,
+                    None,
+                    0x8140_1000,
+                    false,
+                )?,
+                Vm::new(
+                    dev,
+                    inner.clone(),
+                    IOVA_USER_BASE..uat_geometry(cfg)?.user_va_top(),
+                    cfg,
+                    None,
+                    0x8140_1001,
+                    false,
+                )?,
+            ])
+        } else {
+            None
+        };
 
         let uat = Self {
             dev: dev.into(),
             cfg,
             kernel_vm,
             kernel_lower_vm,
+            _t8140_firmware_crash_buffers: None,
+            t8140_firmware_crash_gems: None,
+            t8140_secondary_ttb1: if cfg == UatConfig::T8140 {
+                Some(ttb1 + T8140_SECONDARY_SHARED_ROOT_DELTA)
+            } else {
+                None
+            },
+            t8140_empty_high_roots,
+            t8140_context_phase: AtomicU8::new(T8140_CONTEXT_BOOTSTRAP_SOURCE_HIGH),
             inner,
             slots: slotalloc::SlotAllocator::new(
                 UAT_USER_CTX as u32,
@@ -1665,7 +2948,7 @@ impl Uat {
         inner.map_kernel_to_user = map_kernel_to_user;
         inner.kernel_ttb1 = ttb1;
 
-        inner.handoff().init()?;
+        inner.handoff().init(handoff_mode)?;
 
         dev_info!(dev.as_ref(), "MMU: Initializing TTBs\n");
 
@@ -1679,6 +2962,16 @@ impl Uat {
         for ctx in &ttbs[1..] {
             ctx.ttb0.store(0, Ordering::Relaxed);
             ctx.ttb1.store(0, Ordering::Relaxed);
+        }
+        if cfg == UatConfig::T8140 {
+            ttbs[1].ttb0.store(
+                ttb0 | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT),
+                Ordering::SeqCst,
+            );
+            ttbs[1].ttb1.store(
+                ttb1 | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT),
+                Ordering::SeqCst,
+            );
         }
 
         inner.handoff().unlock();
@@ -1697,5 +2990,118 @@ impl Drop for Uat {
         fence(Ordering::SeqCst);
         mem::tlbi_all();
         mem::sync();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn g17p_fixed_pages_and_cl_arena_overlap_the_driver_ledger() {
+        let protected = [
+            0x10_0019_0000..0x10_0019_4000,
+            0x70_0183_8000..0x70_0183_c000,
+            0x70_0184_0000..0x70_0184_4000,
+            0x70_0000_0000..0x71_0000_0000,
+        ];
+        for range in protected.clone() {
+            assert!(any_range_overlaps(range, protected.clone().into_iter()));
+        }
+        assert!(!any_range_overlaps(
+            0x20_0000_0000..0x20_0000_4000,
+            protected.into_iter(),
+        ));
+    }
+
+    #[test]
+    fn g17p_root_lifecycle_preserves_firmware_entries_and_mirrors_host_entries() {
+        let mut primary = [0u64; 8];
+        primary[..5].copy_from_slice(&[0x101, 0x201, 0x303, 0x403, 0x503]);
+        clear_stale_host_root_entries(&mut primary);
+        assert_eq!(primary, [0x101, 0x201, 0x303, 0, 0, 0, 0, 0]);
+
+        primary[3] = 0x433;
+        primary[5] = 0x533;
+        let mut secondary = [0x111, 0x211, 0x999, 0, 0, 0x888, 0, 0];
+        assert_eq!(mirror_host_root_entries(&primary, &mut secondary), 3);
+        assert_eq!(secondary, [0x111, 0x211, 0x303, 0x433, 0, 0x533, 0, 0]);
+    }
+
+    #[test]
+    fn g17p_opening_uses_render_roots_in_both_slots_then_splits() {
+        let retained_low = 0x1000_1000_0000;
+        let render_low = 0x1000_2000_0000;
+        let source_high = 0x1000_3000_0000;
+
+        let opening = t8140_opening_render_layout(render_low, source_high);
+        assert_eq!(
+            opening.low,
+            [
+                render_low | TTBR_VALID,
+                render_low | TTBR_VALID | (1 << TTBR_ASID_SHIFT),
+            ]
+        );
+        assert_eq!(
+            opening.high,
+            [
+                source_high | TTBR_VALID,
+                source_high | TTBR_VALID | (1 << TTBR_ASID_SHIFT),
+            ]
+        );
+
+        let split = t8140_split_render_layout(retained_low, render_low, [source_high; 2]);
+        assert_eq!(split.low[0], retained_low | TTBR_VALID);
+        assert_eq!(
+            split.low[1],
+            render_low | TTBR_VALID | (1 << TTBR_ASID_SHIFT)
+        );
+        assert_eq!(split.high[0], source_high | TTBR_VALID);
+        assert_eq!(
+            split.high[1],
+            source_high | TTBR_VALID | (1 << TTBR_ASID_SHIFT)
+        );
+        assert_ne!(opening, split);
+    }
+
+    #[test]
+    fn only_t8140_internal_lower_vm_contains_the_null_leaf() {
+        assert_eq!(lower_vm_start(UatConfig::T8140, true), 0);
+        assert_eq!(lower_vm_start(UatConfig::T8140, false), IOVA_USER_BASE);
+        let legacy = UatConfig {
+            chip_id: 0x8103,
+            ias: 39,
+            oas: 42,
+        };
+        assert_eq!(lower_vm_start(legacy, true), IOVA_USER_BASE);
+    }
+
+    #[test]
+    fn firmware_ttb_root_decoder_strips_asid_and_control_bits() {
+        let cfg = UatConfig::T8140;
+        let root = 0x101_abc0_0000;
+        let raw = root | TTBR_VALID | (0x2au64 << TTBR_ASID_SHIFT);
+        assert_eq!(decode_firmware_ttb_root(raw, cfg), Some(root));
+        assert_eq!(decode_firmware_ttb_root(raw & !TTBR_VALID, cfg), None);
+        assert_eq!(decode_firmware_ttb_root(TTBR_VALID, cfg), None);
+    }
+
+    #[test]
+    fn t8140_crash_buffers_match_the_two_rtkit_requests() {
+        assert_eq!(T8140_FIRMWARE_CRASH_BUFFERS[0], 0x01e1_c000..0x01e2_4000);
+        assert_eq!(T8140_FIRMWARE_CRASH_BUFFERS[1], 0x01f5_0000..0x01f5_8000);
+        for range in T8140_FIRMWARE_CRASH_BUFFERS {
+            assert_eq!(range.len(), 0x8000);
+            assert_eq!((range.start | range.end) & UAT_PGMSK as u64, 0);
+        }
+        assert!(T8140_FIRMWARE_CRASH_BUFFERS[0].end <= T8140_FIRMWARE_CRASH_BUFFERS[1].start);
+        assert!(PROT_FW_SHARED_RW.allows_gpu(false, false));
+        assert!(!PROT_FW_SHARED_RW.allows_gpu(false, true));
+        assert_ne!(T8140_FIRMWARE_CRASH_SENTINELS[0], 0);
+        assert_ne!(T8140_FIRMWARE_CRASH_SENTINELS[1], 0);
+        assert_ne!(
+            T8140_FIRMWARE_CRASH_SENTINELS[0],
+            T8140_FIRMWARE_CRASH_SENTINELS[1]
+        );
     }
 }

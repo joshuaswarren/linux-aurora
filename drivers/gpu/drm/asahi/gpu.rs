@@ -1042,7 +1042,10 @@ impl GpuManager::ver {
 
     /// Fetch the GPU MMU fault information from the hardware registers.
     fn get_fault_info(&self) -> Option<regs::FaultInfo> {
-        let res = &(*self.dev).resources;
+        let res = (*self.dev)
+            .resources
+            .as_ref()
+            .expect("legacy manager requires register resources");
 
         let info = res.get_fault_info(self.cfg);
         if info.is_some() {

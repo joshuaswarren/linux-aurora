@@ -7,7 +7,7 @@
 //! the few operations that require that, mainly reading the MMU fault status, reading GPU ID
 //! information, and starting the GPU firmware coprocessor.
 
-use crate::{hw, identity};
+use crate::{g17_submission, hw, identity};
 use kernel::{
     c_str,
     device::Core,
@@ -16,9 +16,10 @@ use kernel::{
         mem::IoMem, //
         Io,
     },
+    new_mutex,
     platform,
     prelude::*,
-    sync::aref::ARef, //
+    sync::{aref::ARef, Mutex}, //
 };
 
 /// Size of the ASC control MMIO region.
@@ -29,6 +30,21 @@ pub(crate) const SGX_SIZE: usize = 0x1000000;
 
 const CPU_CONTROL: usize = 0x44;
 const CPU_RUN: u32 = 0x1 << 4; // BIT(4)
+
+// T8140 (A18 Pro / G17P) SGX registers, hardware-verified on the live J700
+// bring-up. These offsets exceed the AGX2 `SGX_SIZE` window (the T8140 SGX
+// block is 0x4000000), so their accessors map the full "sgx" resource
+// unsized and use runtime-checked accesses.
+//
+// AXI transition workaround: after powering gfx-asc, gfx1-asc, and sgx, set
+// bit 0 in both words. The observed post-write values on J700 are 0x00010001
+// and 0x000413b1 respectively; the upper bits are hardware status and are
+// only logged, not enforced.
+const T8140_AXI_TRANSITION_0: usize = 0x1000104;
+const T8140_AXI_TRANSITION_1: usize = 0x1000108;
+/// Must be written 0 before ANY initdata is sent to either firmware
+/// instance (T8140 startup sequence step "write zero to SGX+0xd06030").
+const T8140_PRE_INITDATA_CLEAR: usize = 0xd06030;
 
 const FAULT_INFO: usize = 0x17030;
 
@@ -170,25 +186,107 @@ pub(crate) struct FaultInfo {
 /// Device resources for this GPU instance.
 pub(crate) struct Resources {
     dev: ARef<platform::Device>,
-    sgx: Pin<KBox<Devres<IoMem<SGX_SIZE>>>>,
+    sgx: Pin<KBox<Devres<IoMem<0>>>>,
+    /// Serializes the shared fixed-slot SKSM FIFO across every queue.
+    sksm_fifo: Pin<KBox<Mutex<()>>>,
+}
+
+/// Write-only publication view of resource 0 for the SKSM FIFO pair.
+///
+/// In particular, the word-0 port at `sgx+0x4090` must never be loaded. The
+/// host has a separate diagnostic load from word 1 which is not exposed here.
+struct G17SksmSgxPairWriter<'a>(&'a IoMem<0>);
+
+impl g17_submission::G17SksmPairWriter for G17SksmSgxPairWriter<'_> {
+    type Error = Error;
+
+    fn write64(&self, offset: u32, value: u64) -> Result {
+        // Regular writeq ordering is required: word 0 must reach the device
+        // before word 1. Publication never reads either scratch location.
+        self.0.try_write64(value, offset as usize)
+    }
 }
 
 impl Resources {
     /// Map the required resources given our platform device.
     pub(crate) fn new(pdev: &platform::Device<Core>) -> Result<Resources> {
+        // The pinned host maps accelerator device-memory index 0 and stores
+        // it at accelerator+0x348 before every SKSM scratch access. That range
+        // is the J700 GPU block exposed to Linux by the named `sgx` resource
+        // (the second platform `reg` tuple, after `asc`).
         let sgx_req = pdev.io_request_by_name(c_str!("sgx")).ok_or(EINVAL)?;
-        let sgx_iomem = KBox::pin_init(sgx_req.iomap_sized::<SGX_SIZE>(), GFP_KERNEL)?;
+        let sgx_iomem = KBox::pin_init(sgx_req.iomap(), GFP_KERNEL)?;
+        let sksm_fifo = KBox::pin_init(new_mutex!((), "g17_sksm_fifo"), GFP_KERNEL)?;
 
         Ok(Resources {
             // SAFETY: This device does DMA via the UAT IOMMU.
             dev: pdev.into(),
             sgx: sgx_iomem,
+            sksm_fifo,
         })
+    }
+
+    fn g17p_sksm_pair_fits(pair: g17_submission::G17SksmOrderedWritePair) -> bool {
+        let fits_u64 = |offset: u32| {
+            let offset = offset as usize;
+            offset % core::mem::size_of::<u64>() == 0
+                && offset
+                    .checked_add(core::mem::size_of::<u64>())
+                    .is_some_and(|end| end <= SGX_SIZE)
+        };
+
+        fits_u64(pair.word0_offset) && fits_u64(pair.word1_offset)
+    }
+
+    fn g17p_sksm_publish_locked(
+        sgx: &IoMem<0>,
+        pair: g17_submission::G17SksmOrderedWritePair,
+    ) -> Result {
+        g17_submission::publish_g17p_sksm_write_pair(&G17SksmSgxPairWriter(sgx), pair)
+    }
+
+    /// Publish word 0 then word 1 through J700 resource 0 (`sgx`).
+    ///
+    /// The pair is checked completely before either write. The fixed-slot
+    /// lock prevents publications from two queues interleaving.
+    pub(crate) fn g17p_sksm_publish_write_pair(
+        &self,
+        pair: g17_submission::G17SksmOrderedWritePair,
+    ) -> Result {
+        if !Self::g17p_sksm_pair_fits(pair) {
+            return Err(EINVAL);
+        }
+
+        let _guard = self.sksm_fifo.lock();
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        Self::g17p_sksm_publish_locked(&sgx, pair)
+    }
+
+    /// Configure one G17P SKSM queue and then mark its QID valid.
+    ///
+    /// The host publishes both 64-bit mask words without reading either one:
+    /// high QIDs first, low QIDs second.
+    pub(crate) fn g17p_sksm_configure_queue(
+        &self,
+        pair: g17_submission::G17SksmOrderedWritePair,
+        enable_pair: g17_submission::G17SksmOrderedWritePair,
+    ) -> Result {
+        if !Self::g17p_sksm_pair_fits(pair)
+            || !Self::g17p_sksm_pair_fits(enable_pair)
+            || enable_pair.word0 | enable_pair.word1 == 0
+        {
+            return Err(EINVAL);
+        }
+
+        let _guard = self.sksm_fifo.lock();
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        Self::g17p_sksm_publish_locked(&sgx, pair)?;
+        Self::g17p_sksm_publish_locked(&sgx, enable_pair)
     }
 
     fn sgx_read32<const OFF: usize>(&self) -> u32 {
         if let Some(sgx) = self.sgx.try_access() {
-            sgx.relaxed().read32(OFF)
+            sgx.relaxed().try_read32(OFF).unwrap_or(0)
         } else {
             0
         }
@@ -197,14 +295,14 @@ impl Resources {
     /* Not yet used
     fn sgx_write32<OFF: usize>(&self, val: u32) {
         if let Some(sgx) = self.sgx.try_access() {
-            sgx.write32_relaxed(val, OFF)
+            sgx.relaxed().write32(val, OFF)
         }
     }
     */
 
     fn sgx_read64<const OFF: usize>(&self) -> u64 {
         if let Some(sgx) = self.sgx.try_access() {
-            sgx.relaxed().read64(OFF)
+            sgx.relaxed().try_read64(OFF).unwrap_or(0)
         } else {
             0
         }
@@ -213,7 +311,7 @@ impl Resources {
     /* Not yet used
     fn sgx_write64<OFF: usize>(&self, val: u64) {
         if let Some(sgx) = self.sgx.try_access() {
-            sgx.write64_relaxed(val, OFF)
+            sgx.relaxed().write64(val, OFF)
         }
     }
     */
@@ -225,14 +323,68 @@ impl Resources {
         Ok(())
     }
 
-    /// Start the ASC coprocessor CPU.
-    pub(crate) fn start_cpu(pdev: &platform::Device<Core>) -> Result {
-        let asc_req = pdev.io_request_by_name(c_str!("asc")).ok_or(EINVAL)?;
+    /// Start one ASC coprocessor CPU by its `reg-names` entry.
+    fn start_cpu_by_name(pdev: &platform::Device<Core>, name: &CStr) -> Result {
+        let asc_req = pdev.io_request_by_name(name).ok_or_else(|| {
+            dev_err!(
+                pdev.as_ref(),
+                "ASC control region \"{}\" is not declared by this device\n",
+                name
+            );
+            EINVAL
+        })?;
         let asc_iomem = KBox::pin_init(asc_req.iomap_sized::<ASC_CTL_SIZE>(), GFP_KERNEL)?;
         let res = asc_iomem.access(pdev.as_ref())?.relaxed();
 
         let val = res.read32(CPU_CONTROL);
         res.write32(val | CPU_RUN, CPU_CONTROL);
+        Ok(())
+    }
+
+    /// Start the (primary) ASC coprocessor CPU.
+    pub(crate) fn start_cpu(pdev: &platform::Device<Core>) -> Result {
+        Self::start_cpu_by_name(pdev, c_str!("asc"))
+    }
+
+    /// Apply the T8140 AXI transition workaround.
+    ///
+    /// Hardware-verified order: power `gfx-asc`, `gfx1-asc`, and `sgx`
+    /// first, then set bit 0 of both AXI transition words. Observed
+    /// post-write values on J700 are `0x00010001`/`0x000413b1`; a different
+    /// readback is logged but not fatal (the upper bits are status).
+    pub(crate) fn t8140_axi_transition_workaround(&self) -> Result {
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let res = sgx.relaxed();
+
+        for (offset, observed) in [
+            (T8140_AXI_TRANSITION_0, 0x0001_0001u32),
+            (T8140_AXI_TRANSITION_1, 0x0004_13b1u32),
+        ] {
+            let val = res.try_read32(offset)?;
+            res.try_write32(val | 1, offset)?;
+            let after = res.try_read32(offset)?;
+            if after != observed {
+                dev_warn!(
+                    self.dev.as_ref(),
+                    "T8140 AXI transition word {:#x} reads {:#x} after set (J700 observed {:#x})\n",
+                    offset,
+                    after,
+                    observed
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// T8140: write zero to the pre-initdata gate register.
+    ///
+    /// The grounded startup sequence requires this write after the AXI
+    /// transition workaround and before ANY initdata is sent to either
+    /// firmware instance.
+    pub(crate) fn t8140_pre_initdata_clear(&self) -> Result {
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let res = sgx.relaxed();
+        res.try_write32(0, T8140_PRE_INITDATA_CLEAR)?;
         Ok(())
     }
 
@@ -383,13 +535,25 @@ impl Resources {
         })
     }
 
+    /// Snapshot the latched G17P MMU fault words without acknowledging them.
+    pub(crate) fn g17p_fault_registers(&self) -> (u64, u64) {
+        (
+            self.sgx_read64::<FAULT_INFO_G14X>(),
+            self.sgx_read64::<FAULT_ADDR_G14X>(),
+        )
+    }
+
     /// Get the fault information from the MMU status register, if one occurred.
     pub(crate) fn get_fault_info(&self, cfg: &'static hw::HwConfig) -> Option<FaultInfo> {
         // The G14X fault-register bank and fault-word decode carry unchanged
         // to every AGX3 part (see the FAULT_INFO_G14X provenance comment).
         // `gpu_core` is a firmware-ABI value that only exists for the AGX2
-        // targets, so AGX3 membership is keyed off the design generation.
-        let g14x = cfg.gpu_core as u32 >= hw::GpuCore::G14S as u32
+        // targets (None on AGX3), so AGX3 membership is keyed off the design
+        // generation.
+        let g14x = cfg
+            .gpu_core
+            .map(|core| core as u32 >= hw::GpuCore::G14S as u32)
+            .unwrap_or(false)
             || cfg.gpu_gen as u32 >= hw::GpuGen::G15 as u32;
 
         let fault_info = if g14x {
