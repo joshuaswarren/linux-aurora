@@ -27,7 +27,7 @@ static const struct dcp_method_entry dcp_methods[dcpep_num_methods] = {
 	IOMFB_METHOD("A000", dcpep_late_init_signal),
 	IOMFB_METHOD("A024", dcpep_setup_video_limits),
 	IOMFB_METHOD("A389", dcpep_set_create_dfb),
-	IOMFB_METHOD("A390", iomfbep_a358_vi_set_temperature_hint),
+	IOMFB_METHOD("A386", iomfbep_a358_vi_set_temperature_hint),
 	IOMFB_METHOD("A401", dcpep_start_signal),
 	IOMFB_METHOD("A406", dcpep_swap_start),
 	IOMFB_METHOD("A407", dcpep_swap_submit),
@@ -121,7 +121,7 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[2] = trampoline_nop, /* will_power_off_signal */
 	[3] = trampoline_rt_bandwidth_h17p,
 	[6] = trampoline_set_frame_sync_props,
-	[100] = trampoline_nop, /* match_pmu_service */
+	[100] = dcp_link_defer_service_match, /* match_pmu_service */
 	[101] = trampoline_zero, /* get_display_default_stride */
 	[102] = trampoline_nop, /* set_number_property */
 	[103] = trampoline_nop, /* trigger_user_cal_loader */
