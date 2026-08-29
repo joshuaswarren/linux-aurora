@@ -38,6 +38,7 @@ use kernel::{
     error::Result,
     io,
     new_mutex,
+    page::Page,
     prelude::*,
     static_lock_class,
     sync::{
@@ -151,6 +152,18 @@ pub(crate) enum HandoffMode {
     /// Constructed by the T8140 resource owner before either role receives an
     /// init-data root.
     AbsentStandinT8140,
+}
+
+fn initialize_borrowed_kernel_root_image(
+    cfg: UatConfig,
+    mode: HandoffMode,
+    root: &mut [u8],
+) -> bool {
+    if cfg != UatConfig::T8140 || mode != HandoffMode::AbsentStandinT8140 {
+        return false;
+    }
+    root.fill(0);
+    true
 }
 
 /// Return the evidence-backed UAT root geometry for this SoC.
@@ -2199,6 +2212,33 @@ impl Uat {
             return Err(ENOMEM);
         }
 
+        if cfg == UatConfig::T8140 && handoff_mode == HandoffMode::AbsentStandinT8140 {
+            // SAFETY: `ttb1` is the complete bootloader-reserved root page,
+            // it has a valid struct page (also required by new_with_ttb), and
+            // neither GFX processor has started, so there is no concurrent
+            // page-table reader or writer.
+            let root = unsafe { Page::borrow_phys(&ttb1) }.ok_or(EIO)?;
+            root.with_pointer_into_page(0, UAT_PGSZ, |pointer| {
+                let bytes = unsafe {
+                    // SAFETY: with_pointer_into_page validated the complete
+                    // root-page extent for the lifetime of this closure.
+                    core::slice::from_raw_parts_mut(pointer, UAT_PGSZ)
+                };
+                if !initialize_borrowed_kernel_root_image(cfg, handoff_mode, bytes) {
+                    return Err(EIO);
+                }
+                Ok(())
+            })?;
+            fence(Ordering::SeqCst);
+            mem::tlbi_all();
+            mem::sync();
+            dev_info!(
+                dev.as_ref(),
+                "MMU: cleared T8140 absent-handoff kernel-high root at {:#x}\n",
+                ttb1
+            );
+        }
+
         dev_info!(dev.as_ref(), "MMU: Creating kernel page tables\n");
         let kernel_lower_vm = Vm::new(
             dev,
@@ -2323,5 +2363,37 @@ mod tests {
             0x20_0000_0000..0x20_0000_4000,
             protected.into_iter(),
         ));
+    }
+
+    #[test]
+    fn borrowed_kernel_root_is_cleared_only_for_t8140_absent_handoff() {
+        const SENTINEL: u64 = 0x0000_08b0_0000_0008;
+        let mut absent_t8140 = SENTINEL.to_le_bytes().repeat(8);
+        assert!(initialize_borrowed_kernel_root_image(
+            UatConfig::T8140,
+            HandoffMode::AbsentStandinT8140,
+            &mut absent_t8140,
+        ));
+        assert!(absent_t8140.iter().all(|byte| *byte == 0));
+
+        let mut dekker_t8140 = SENTINEL.to_le_bytes().repeat(8);
+        assert!(!initialize_borrowed_kernel_root_image(
+            UatConfig::T8140,
+            HandoffMode::FirmwareDekker,
+            &mut dekker_t8140,
+        ));
+        assert_eq!(dekker_t8140, SENTINEL.to_le_bytes().repeat(8));
+
+        let mut absent_agx2 = SENTINEL.to_le_bytes().repeat(8);
+        assert!(!initialize_borrowed_kernel_root_image(
+            UatConfig {
+                chip_id: 0x8103,
+                ias: 39,
+                oas: 40,
+            },
+            HandoffMode::AbsentStandinT8140,
+            &mut absent_agx2,
+        ));
+        assert_eq!(absent_agx2, SENTINEL.to_le_bytes().repeat(8));
     }
 }
