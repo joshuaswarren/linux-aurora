@@ -1102,10 +1102,21 @@ impl G17PManagerConstruction {
             return Err(EINVAL);
         }
         let mappings = queue.compute.map_user_execution_state(vm)?;
-        let vm_bind = self.resources.uat().bind(vm)?;
+        let vm_bind = self.resources.uat().bind(vm).inspect_err(|error| {
+            dev_err!(
+                self.resources.dev().as_ref(),
+                "G17P_EBUSY_TRACE edge=manager_bind_compute_user_vm error={:?}\n",
+                error
+            );
+        })?;
         if vm_bind.slot() != 1 || !mappings.all_reachable_from(vm) {
             return Err(EFAULT);
         }
+        dev_info!(
+            self.resources.dev().as_ref(),
+            "G17P_EBUSY_TRACE checkpoint=manager_bind_ok uat_slot={}\n",
+            vm_bind.slot()
+        );
         Ok(G17PComputeUserBinding {
             mappings,
             _vm_bind: vm_bind,
@@ -1291,6 +1302,11 @@ impl G17PManagerConstruction {
         context: G17PComputeSubmissionContext<'_>,
         buffers: [u64; 3],
     ) -> Result<u64> {
+        dev_info!(
+            self.resources.dev().as_ref(),
+            "G17P_EBUSY_TRACE checkpoint=manager_add3_enter ordinal={}\n",
+            queue.submission_ordinal
+        );
         if queue.submission_ordinal != 0 {
             return Err(EINVAL);
         }
@@ -1352,8 +1368,20 @@ impl G17PManagerConstruction {
         fence(Ordering::SeqCst);
         let prepared = self
             .resources
-            .publish_compute_channel(group.queue, group.write_index)?;
+            .publish_compute_channel(group.queue, group.write_index)
+            .inspect_err(|error| {
+                dev_err!(
+                    self.resources.dev().as_ref(),
+                    "G17P_EBUSY_TRACE edge=manager_publish_compute_channel error={:?}\n",
+                    error
+                );
+            })?;
         queue.submission_ordinal = 1;
+        dev_info!(
+            self.resources.dev().as_ref(),
+            "G17P_EBUSY_TRACE checkpoint=manager_add3_published doorbell={:#x}\n",
+            prepared.doorbell
+        );
         Ok(prepared.doorbell)
     }
 

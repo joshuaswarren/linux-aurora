@@ -1561,31 +1561,61 @@ impl G17PComputeDescriptorStorage {
             G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
-        )?;
+        )
+        .inspect_err(|error| {
+            pr_err!(
+                "G17P_EBUSY_TRACE leaf=compute_map_descriptors error={:?}\n",
+                error
+            );
+        })?;
         let preempt = self.preempt.map_alias_in_range(
             vm,
             G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
-        )?;
+        )
+        .inspect_err(|error| {
+            pr_err!(
+                "G17P_EBUSY_TRACE leaf=compute_map_preempt error={:?}\n",
+                error
+            );
+        })?;
         let robustness = self.robustness.map_alias_in_range(
             vm,
             G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
-        )?;
+        )
+        .inspect_err(|error| {
+            pr_err!(
+                "G17P_EBUSY_TRACE leaf=compute_map_robustness error={:?}\n",
+                error
+            );
+        })?;
         let operand_state = self.operand_state.map_alias_in_range(
             vm,
             G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
-        )?;
+        )
+        .inspect_err(|error| {
+            pr_err!(
+                "G17P_EBUSY_TRACE leaf=compute_map_operand_state error={:?}\n",
+                error
+            );
+        })?;
         let queue_context = self.queue_context_low.map_alias_in_range(
             vm,
             G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
-        )?;
+        )
+        .inspect_err(|error| {
+            pr_err!(
+                "G17P_EBUSY_TRACE leaf=compute_map_queue_context error={:?}\n",
+                error
+            );
+        })?;
         let mappings = G17PComputeUserMappings {
             descriptors,
             preempt,
@@ -1596,6 +1626,7 @@ impl G17PComputeDescriptorStorage {
         if !mappings.all_reachable_from(vm) {
             return Err(EFAULT);
         }
+        pr_info!("G17P_EBUSY_TRACE checkpoint=compute_map_ok\n");
         Ok(mappings)
     }
 
