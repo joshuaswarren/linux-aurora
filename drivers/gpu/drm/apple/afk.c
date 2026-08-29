@@ -924,12 +924,23 @@ static bool afk_recv(struct apple_dcp_afkep *ep)
 	channel = le32_to_cpu(hdr->channel);
 	type = le32_to_cpu(hdr->type);
 
-	rptr = roundup(rptr + sizeof(*hdr) + size,
-			ep->rxbfr.block_size);
-	if (WARN_ON(rptr > ep->rxbfr.bufsz))
-		rptr = 0;
-	if (rptr == ep->rxbfr.bufsz)
-		rptr = 0;
+	next_rptr = roundup(rptr + sizeof(*hdr) + size,
+			     ep->rxbfr.block_size);
+	if (WARN_ON(next_rptr > ep->rxbfr.bufsz))
+		next_rptr = 0;
+	if (next_rptr == ep->rxbfr.bufsz)
+		next_rptr = 0;
+	log_entry = ep->endpoint == SYSTEM_ENDPOINT && ep->rx_log_count < 16;
+	sequence = ep->rx_log_count;
+	if (log_entry) {
+		ep->rx_log_count++;
+		dev_info(ep->dcp->dev,
+			 "AFK[ep:%02x]: QE %u rptr %#x wptr %#x next %#x block %#x magic %#x size %#x channel %#x type %#x bytes %*phN\n",
+			 ep->endpoint, sequence, rptr, wptr, next_rptr,
+			 ep->rxbfr.block_size, magic, size, channel, type,
+			 min_t(u32, sizeof(*hdr) + size, 64), hdr);
+	}
+	rptr = next_rptr;
 
 	dma_mb();
 
