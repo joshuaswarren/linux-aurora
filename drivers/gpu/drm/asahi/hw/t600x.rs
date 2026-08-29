@@ -48,7 +48,7 @@ pub(crate) const HWCONFIG_T6002: super::HwConfig = HwConfig {
     gpu_gen: GpuGen::G13,
     // Apple's core-name table identifies both M1 Max and M1 Ultra as G13C.
     gpu_variant: GpuVariant::C,
-    gpu_core: Some(GpuCore::G13C),
+    gpu_core: GpuCore::G13C,
 
     base_clock_hz: 24_000_000,
     uat_oas: 42,

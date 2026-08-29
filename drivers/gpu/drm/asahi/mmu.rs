@@ -149,18 +149,11 @@ fn t8140_split_render_layout(
 
 /// Lower/user base VA
 pub(crate) const IOVA_USER_BASE: u64 = UAT_PGSZ as u64;
-/// Lower/user top VA for the 39-bit (AGX2) roots. Geometry-aware paths must
-/// use [`iova_user_range`]/[`iova_user_usable_range`] instead; this const
-/// remains for the AGX2 initdata builder, which is 39-bit-only.
+/// Lower/user top VA. The exposed user ABI remains at 39 bits until the
+/// generation-specific 42-bit PTE/update policies are implemented.
 pub(crate) const IOVA_USER_TOP: u64 = 1 << 39;
-
-fn lower_vm_start(cfg: UatConfig, t8140_internal: bool) -> u64 {
-    if cfg == UatConfig::T8140 && t8140_internal {
-        0
-    } else {
-        IOVA_USER_BASE
-    }
-}
+/// Lower/user VA range
+pub(crate) const IOVA_USER_RANGE: Range<u64> = IOVA_USER_BASE..IOVA_USER_TOP;
 
 /// Whether the firmware-shared MMU state (Handoff/FlushInfo layout, TTBAT
 /// publication, kernel-half window placement) has been validated against an
@@ -176,234 +169,19 @@ fn lower_vm_start(cfg: UatConfig, t8140_internal: bool) -> u64 {
 /// the RTKit MMU/PPL runtime, not by the AGX message handlers. The on-disk M5
 /// `GFX.a010.macho` confirms the region exists on G17 (`"MMU uat_handoff !map"`
 /// / `"PPL handoff !vm export"` @ 0x2b570 / 0x2b518) but does not expose its
-/// exact field offsets, and — critically — [`Handoff::init`] blocks until the
+/// exact field offsets, and -- critically -- [`Handoff::init`] blocks until the
 /// firmware writes `magic_fw == PPL_MAGIC`, so a correct layout can only ever
 /// be *confirmed* by a live boot ACK. This is therefore the one gate that
 /// stays fail-closed by design: it is exactly the "needs a live firmware ACK"
-/// boundary. [`Uat::new`] fails closed on it for 42-bit parts *in Dekker
-/// mode*. Flip it only once a live G15+/G17 boot completes the PPL handshake.
-///
-/// T8140 (A18 Pro / G17P) is different and is handled by
-/// [`HandoffMode::AbsentStandinT8140`], not by this flag: live J700 runs that
-/// booted both firmware instances confirmed the firmware **never publishes
-/// its half of the PPL magic on this part** — a `magic_fw` waiter hangs
-/// forever. The correct behavior there is an absent-handoff stand-in (no
-/// magic wait, no Dekker peer, no flush handshake ACK expectation), which is
-/// what that mode implements.
+/// boundary. [`Uat::new`] fails closed on it for 42-bit parts. Flip it only
+/// once a live G15+/G17 boot completes the PPL handshake.
 const AGX3_FIRMWARE_HANDOFF_VALIDATED: bool = false;
 
-/// How the firmware-shared UAT handoff region behaves for the target SoC.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub(crate) enum HandoffMode {
-    /// The AGX2-proven protocol: firmware publishes `magic_fw`, participates
-    /// in the Dekker lock, and ACKs flush requests (state 1 -> 2).
-    FirmwareDekker,
-    /// T8140-verified stand-in: the firmware never participates in the
-    /// handoff region. The AP publishes its own half and clears the flush
-    /// slots, but never waits for `magic_fw` (hardware fact: it never
-    /// arrives; a waiter hangs forever) and never expects a flush ACK.
-    /// Only valid on T8140, where this was observed on live hardware.
-    ///
-    /// Constructed by the T8140 resource owner before either role receives an
-    /// init-data root.
-    AbsentStandinT8140,
-}
-
-const T8140_SECONDARY_SHARED_ROOT_DELTA: u64 = 0x40000;
-const T8140_FIRMWARE_PRIVATE_ROOT_ENTRIES: usize = 2;
-const T8140_FIRMWARE_SHARED_ROOT_ENTRIES: usize = 3;
-const T8140_FIRMWARE_CRASH_BUFFERS: [Range<u64>; 2] = [
-    0x01e1_c000..0x01e2_4000,
-    0x01f5_0000..0x01f5_8000,
-];
-const T8140_FIRMWARE_CRASH_SENTINELS: [u8; 2] = [0xa5, 0x5a];
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub(crate) struct T8140PrimaryRootSnapshot {
-    entries: [u64; T8140_FIRMWARE_SHARED_ROOT_ENTRIES],
-}
-
-/// Read-only descriptor for the context-0 lower root left by the boot
-/// firmware. G17P advertises its preallocated RTKit crash buffers through
-/// this tree before Linux replaces the live TTBAT entry with its own root.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub(crate) struct FirmwarePageTableRoot {
-    ttb: PhysicalAddr,
-    cfg: UatConfig,
-}
-
-impl FirmwarePageTableRoot {
-    pub(crate) const fn ttb(&self) -> PhysicalAddr {
-        self.ttb
-    }
-
-    #[cfg(CONFIG_DEV_COREDUMP)]
-    pub(crate) fn copy_firmware_range(&self, address: u64, size: usize) -> Result<KVVec<u8>> {
-        if size == 0 {
-            return Err(EINVAL);
-        }
-        let geometry = uat_geometry(self.cfg)?;
-        let end = address.checked_add(size as u64).ok_or(EOVERFLOW)?;
-        if end > geometry.user_va_top() {
-            return Err(EFAULT);
-        }
-        let mut data = KVVec::from_elem(0, size, GFP_KERNEL)?;
-        UatPageTable::copy_from_phys_root(
-            self.ttb,
-            address,
-            &mut data,
-            self.cfg.ias,
-            self.cfg.oas,
-        )?;
-        Ok(data)
-    }
-}
-
-/// Retained read-only access to the live TTBAT. RTKit can replace context 0's
-/// lower root after Linux has initialized the table, so crash handling must
-/// sample the entry after the firmware reports its crash rather than cache the
-/// boot-time value.
-pub(crate) struct FirmwareContextTableReader {
-    inner: Arc<UatInner>,
-    cfg: UatConfig,
-    t8140_crash_buffers: Option<[ARef<gem::Object>; 2]>,
-}
-
-impl Clone for FirmwareContextTableReader {
-    fn clone(&self) -> Self {
-        Self {
-            inner: self.inner.clone(),
-            cfg: self.cfg,
-            t8140_crash_buffers: self.t8140_crash_buffers.as_ref().map(|buffers| {
-                [buffers[0].clone(), buffers[1].clone()]
-            }),
-        }
-    }
-}
-
-impl FirmwareContextTableReader {
-    pub(crate) fn context_root(&self, slot: usize) -> Option<FirmwarePageTableRoot> {
-        if slot >= UAT_NUM_CTX {
-            return None;
-        }
-        let shared = self.inner.lock();
-        decode_firmware_ttb_root(shared.ttbs()[slot].ttb0.load(Ordering::Acquire), self.cfg)
-            .map(|ttb| FirmwarePageTableRoot { ttb, cfg: self.cfg })
-    }
-
-    pub(crate) fn context0_root(&self) -> Option<FirmwarePageTableRoot> {
-        self.context_root(0)
-    }
-
-    /// Copy one T8140 crash buffer through the retained WC CPU alias. This is
-    /// distinct from the raw physical walker used to diagnose the live UAT:
-    /// the latter maps pages WB and can hide device writes behind a conflicting
-    /// WC alias.
-    #[cfg(CONFIG_DEV_COREDUMP)]
-    pub(crate) fn copy_t8140_crash_buffer(
-        &self,
-        index: usize,
-        size: usize,
-    ) -> Result<(KVVec<u8>, u8)> {
-        let buffers = self.t8140_crash_buffers.as_ref().ok_or(ENOENT)?;
-        let object = buffers.get(index).ok_or(EINVAL)?;
-        if size == 0 || size > object.size() {
-            return Err(ERANGE);
-        }
-
-        // The crash notification is ordered after firmware's payload stores.
-        // Complete the device/CPU visibility boundary before reading the WC
-        // alias that was used to create the firmware mapping.
-        mem::sync();
-        fence(Ordering::Acquire);
-        let vmap = object.vmap::<u8>()?;
-        let bytes = unsafe {
-            // SAFETY: the VMap covers the complete retained GEM allocation and
-            // `size` was checked against that allocation above.
-            core::slice::from_raw_parts(vmap.as_ptr(), size)
-        };
-        let mut data = KVVec::new();
-        data.extend_from_slice(bytes, GFP_ATOMIC)?;
-        Ok((data, T8140_FIRMWARE_CRASH_SENTINELS[index]))
-    }
-}
-
-fn decode_firmware_ttb_root(raw: u64, cfg: UatConfig) -> Option<PhysicalAddr> {
-    if raw & TTBR_VALID == 0 {
-        return None;
-    }
-    let physical_mask = (1u64 << cfg.oas) - 1;
-    let root = raw & physical_mask & !(UAT_PGMSK as u64);
-    (root != 0).then_some(root)
-}
-
-fn clear_stale_host_root_entries(root: &mut [u64]) {
-    if root.len() > T8140_FIRMWARE_SHARED_ROOT_ENTRIES {
-        root[T8140_FIRMWARE_SHARED_ROOT_ENTRIES..].fill(0);
-    }
-}
-
-fn mirror_host_root_entries(primary: &[u64], secondary: &mut [u64]) -> usize {
-    let mut mirrored = 0;
-    for (source, destination) in primary
-        .iter()
-        .zip(secondary.iter_mut())
-        .skip(T8140_FIRMWARE_PRIVATE_ROOT_ENTRIES)
-    {
-        if *source != 0 && *destination != *source {
-            *destination = *source;
-            mirrored += 1;
-        }
-    }
-    mirrored
-}
-
 /// Return the evidence-backed UAT root geometry for this SoC.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-struct UatConfig {
-    chip_id: u32,
-    ias: u8,
-    oas: u32,
-}
-
-impl UatConfig {
-    const fn from_hw(cfg: &hw::HwConfig) -> Self {
-        Self {
-            chip_id: cfg.chip_id,
-            ias: cfg.uat_ias,
-            oas: cfg.uat_oas,
-        }
-    }
-
-    const T8140: Self = Self {
-        chip_id: 0x8140,
-        ias: 42,
-        oas: 42,
-    };
-}
-
-fn uat_geometry(cfg: UatConfig) -> Result<UatGeometry> {
+fn uat_geometry(cfg: &hw::HwConfig) -> Result<UatGeometry> {
     // 39-bit (G13/G14) and 42-bit (G15+) roots are the two recovered
     // geometries; anything else is undefined.
-    UatGeometry::new(cfg.ias).ok_or(ENODEV)
-}
-
-/// Lower/user VA range for this SoC's root geometry (one page up to the
-/// per-root translation top: `1 << 39` on AGX2, `1 << 42` on AGX3).
-#[allow(dead_code)]
-pub(crate) fn iova_user_range(cfg: &hw::HwConfig) -> Result<Range<u64>> {
-    Ok(IOVA_USER_BASE..uat_geometry(UatConfig::from_hw(cfg))?.user_va_top())
-}
-
-/// The unknown-page VA for this SoC's root geometry (two pages below the
-/// user top, reproducing the AGX2-proven placement under either root width).
-pub(crate) fn iova_unk_page(cfg: &hw::HwConfig) -> Result<u64> {
-    Ok(uat_geometry(UatConfig::from_hw(cfg))?.user_va_top() - 2 * UAT_PGSZ as u64)
-}
-
-/// Usable lower/user VA range for this SoC (excludes the unknown page).
-pub(crate) fn iova_user_usable_range(cfg: &hw::HwConfig) -> Result<Range<u64>> {
-    Ok(IOVA_USER_BASE..iova_unk_page(cfg)?)
+    UatGeometry::new(cfg.uat_ias).ok_or(ENODEV)
 }
 
 /// Driver-managed kernel VA range within the upper root for this SoC.
@@ -411,7 +189,7 @@ pub(crate) fn iova_user_usable_range(cfg: &hw::HwConfig) -> Result<Range<u64>> {
 /// `0xffffffa000000000..0xffffffb000000000` for 39-bit roots (the
 /// AGX2-proven placement) and the same window offset under the bit-42
 /// selector (`0xfffffc2000000000..0xfffffc3000000000`) for 42-bit roots.
-fn iova_kern_range(cfg: UatConfig) -> Result<Range<u64>> {
+fn iova_kern_range(cfg: &hw::HwConfig) -> Result<Range<u64>> {
     let geometry = uat_geometry(cfg)?;
     Ok(geometry.kernel_va_base()..geometry.kernel_va_top())
 }
@@ -1756,9 +1534,9 @@ impl Vm {
         let iova_kern_range = iova_kern_range(cfg)?;
 
         let page_table = if let Some(ttb) = ttb {
-            UatPageTable::new_with_ttb(ttb, iova_kern_range.clone(), cfg.ias, cfg.oas)?
+            UatPageTable::new_with_ttb(ttb, iova_kern_range.clone(), cfg.uat_ias, cfg.uat_oas)?
         } else {
-            UatPageTable::new(cfg.ias, cfg.oas)?
+            UatPageTable::new(cfg.uat_ias, cfg.uat_oas)?
         };
 
         let lower_start = lower_vm_start(cfg, t8140_internal);
@@ -3627,39 +3405,22 @@ impl Uat {
         // Validate the geometry first: 39- and 42-bit roots are the two
         // recovered layouts, and the page-table walk, kernel-half VA window,
         // and leaf PTE policy are implemented for both (the AGX3 leaf PTE
-        // encoder is byte-identical to AGX2). What must remain fail-closed
-        // per mode is the firmware-shared state this constructor touches
-        // next: the Handoff/FlushInfo protocol is per-firmware-build ABI
-        // observed on AGX2 (Dekker) and, separately, observed *absent* on
-        // T8140.
+        // encoder is byte-identical to AGX2). What is *not* validated for
+        // AGX3 is the firmware-shared state this constructor touches next:
+        // the Handoff/FlushInfo struct layout and the firmware's view of the
+        // kernel-half window are per-firmware-build ABI observed only on
+        // AGX2. Fail closed on exactly that boundary.
         let kernel_range = iova_kern_range(cfg)?;
-        match handoff_mode {
-            HandoffMode::FirmwareDekker => {
-                if cfg.ias != 39 && !AGX3_FIRMWARE_HANDOFF_VALIDATED {
-                    dev_err!(
-                        dev.as_ref(),
-                        "MMU: {}-bit UAT geometry is implemented, but the AGX3 firmware Handoff ABI and kernel-VA map are unvalidated\n",
-                        cfg.ias
-                    );
-                    return Err(ENODEV);
-                }
-            }
-            HandoffMode::AbsentStandinT8140 => {
-                // Hardware-verified on T8140 only. Never assume any other
-                // part ignores the handoff region.
-                if cfg.chip_id != 0x8140 || cfg.ias != 42 {
-                    dev_err!(
-                        dev.as_ref(),
-                        "MMU: absent-handoff stand-in is T8140-only evidence (chip {:#x}, {}-bit)\n",
-                        cfg.chip_id,
-                        cfg.ias
-                    );
-                    return Err(ENODEV);
-                }
-            }
+        if cfg.uat_ias != 39 && !AGX3_FIRMWARE_HANDOFF_VALIDATED {
+            dev_err!(
+                dev.as_ref(),
+                "MMU: {}-bit UAT geometry is implemented, but the AGX3 firmware Handoff ABI and kernel-VA map are unvalidated\n",
+                cfg.uat_ias
+            );
+            return Err(ENODEV);
         }
 
-        let inner = Self::make_inner(dev, handoff_mode)?;
+        let inner = Self::make_inner(dev)?;
 
         let of_node = dev.as_ref().of_node().ok_or(EINVAL)?;
         let res = of_node.reserved_mem_region_to_resource_byname(c_str!("pagetables"))?;
@@ -3677,16 +3438,8 @@ impl Uat {
         }
 
         dev_info!(dev.as_ref(), "MMU: Creating kernel page tables\n");
-        let kernel_lower_vm = Vm::new(
-            dev,
-            inner.clone(),
-            lower_vm_start(cfg, true)..uat_geometry(cfg)?.user_va_top(),
-            cfg,
-            None,
-            1,
-            true,
-        )?;
-        let kernel_vm = Vm::new(dev, inner.clone(), kernel_range, cfg, Some(ttb1), 0, false)?;
+        let kernel_lower_vm = Vm::new(dev, inner.clone(), IOVA_USER_RANGE, cfg, None, 1)?;
+        let kernel_vm = Vm::new(dev, inner.clone(), kernel_range, cfg, Some(ttb1), 0)?;
 
         dev_info!(dev.as_ref(), "MMU: Kernel page tables created\n");
 

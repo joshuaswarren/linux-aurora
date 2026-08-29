@@ -12,9 +12,7 @@
 //! [`agx_power_recovery`] module.
 
 #[cfg(not(test))]
-use crate::{
-    agx_power_recovery, g17_firmware, g17_initdata, g17_resources, g17_rtkit, g17_submission,
-};
+use crate::{agx_power_recovery, g17_firmware, g17_initdata, g17_rtkit, g17_submission};
 #[cfg(test)]
 #[path = "agx_power_recovery.rs"]
 mod agx_power_recovery;
@@ -24,9 +22,6 @@ mod g17_firmware;
 #[cfg(test)]
 #[path = "g17_initdata.rs"]
 mod g17_initdata;
-#[cfg(test)]
-#[path = "g17_resources.rs"]
-mod g17_resources;
 #[cfg(test)]
 #[path = "g17_rtkit.rs"]
 mod g17_rtkit;
@@ -60,7 +55,7 @@ const REQUIRED_PRE_HANDOFF_EVIDENCE: u16 = missing::FIRMWARE_IDENTITY
     | missing::RECOVERY_HANDSHAKE
     | missing::SUBMISSION_TRANSPORT;
 
-/// Exact missing-evidence result returned to the probe boundary.
+/// Exact fail-closed result returned to the probe boundary.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct MissingEvidence(u16);
 
@@ -106,18 +101,11 @@ const fn implemented_pre_handoff_evidence(
     if AGX3_TOPOLOGY_REGISTERS_IMPLEMENTED {
         implemented |= missing::TOPOLOGY_REGISTERS;
     }
-    // The old M5 role model below remains diagnostic. T8140 has its own
-    // source-backed allocator and absent-handoff UAT constructor.
+    // The per-role resource-ownership contract is byte-grounded, but the
+    // firmware performs no parse-time role check (see FW-3), so Linux cannot
+    // execute the live per-role allocation/mapping from offline evidence.
     if GROUNDED_ROLE_RESOURCE_OWNERSHIP_AVAILABLE && EXECUTABLE_ROLE_RESOURCES_AVAILABLE {
         implemented |= missing::ROLE_RESOURCES;
-    }
-    if let Some(G17FirmwareVariant::G17P) = expected_variant {
-        if g17_resources::EXECUTABLE_T8140_ROLE_RESOURCES_AVAILABLE {
-            implemented |= missing::ROLE_RESOURCES;
-        }
-        if g17_resources::EXECUTABLE_T8140_SHARED_UAT_AVAILABLE {
-            implemented |= missing::UAT_HANDOFF;
-        }
     }
     if g17_initdata::GROUNDED_LAYOUT_AVAILABLE && g17_initdata::PARSE_ACCEPTED_GRAPH_AVAILABLE {
         implemented |= missing::INITDATA_GRAPH;
@@ -135,10 +123,11 @@ const fn implemented_pre_handoff_evidence(
     {
         implemented |= missing::RECOVERY_HANDSHAKE;
     }
-    // The host equations are grounded, including the G17P fixed-slot scratch
-    // geometry and SKSM configuration/addKicks words. Submission transport is
-    // complete once the ioctl work item publishes through that register window
-    // and routes the matching completion IRQ.
+    // The submission producer subset is byte-grounded (EP 0x21 doorbell
+    // byte-identical to AGX2; SKSM kick word + 0x20-strided kick-record table
+    // forked and cited), but the SKSM hardware kick-FIFO MMIO scratch, the
+    // doorbell round-trip, and the completion IRQ are live-only, so the
+    // transport is not executable offline (see `g17_submission`).
     if g17_submission::GROUNDED_SUBMISSION_PRODUCER_AVAILABLE
         && g17_submission::EXECUTABLE_SUBMISSION_TRANSPORT_AVAILABLE
     {
@@ -154,16 +143,6 @@ const fn implemented_pre_handoff_evidence(
 /// an error to `ENODEV` before MMIO initialization or firmware CPU startup.
 pub(crate) const fn pre_handoff_gate(gpu_generation: u32) -> Result<(), MissingEvidence> {
     apply_pre_handoff_gate(gpu_generation, None, None)
-}
-
-/// Apply target-specific implementation evidence without claiming firmware
-/// identity. T8140 uses this path because iBoot loads its G17P role images.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) const fn pre_handoff_gate_for_variant(
-    gpu_generation: u32,
-    expected_variant: G17FirmwareVariant,
-) -> Result<(), MissingEvidence> {
-    apply_pre_handoff_gate(gpu_generation, Some(expected_variant), None)
 }
 
 /// Apply the pre-handoff gate with an optional byte-validated role pair.
@@ -199,41 +178,28 @@ const fn apply_pre_handoff_gate(
     }
 }
 
-/// The two mandatory G17 firmware roles.
-///
-/// The order in which they are kicked is a [`KickOrder`] parameter (default
-/// primary-first, matching the pinned macOS host and the working bare-metal
-/// T8140 host); see that type for why the order is not a constant.
+/// The two mandatory G17 firmware roles, in host kick order.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum FirmwareRole {
-    /// Scheduler and recovery-ingress role ("primary").
+    /// Scheduler and recovery-ingress role, kicked first.
     Gfx = 0,
-    /// Power-management / control-only peer role ("secondary").
+    /// Power-management role, kicked second.
     Gfx1 = 1,
 }
 
-/// G17 variants the firmware-identity machinery can name.
+/// G17 variants with exact paired nested-firmware evidence.
 ///
-/// G17S and G17C carry exact paired nested-firmware evidence from the pinned
-/// FTAB corpus. G17P (A18 Pro / T8140) is a named variant because it is a
-/// live bring-up target, but the pinned corpus contains **no** role-paired
-/// nested images for it: on T8140 the role images are iBoot-loaded carveouts
-/// (`gfx-data-base`/`gfx1-data-base`) and the firmware's own init-data
-/// version-word gate ("Host and FW Interface is mismatched", see
-/// [`crate::g17_initdata::INITDATA_VERSION_WORD`]) is the grounded identity
-/// check. [`g17_nested_firmware_identity`] therefore returns `None` for G17P,
-/// and every identity-admission path fails closed on it. G17G and other
-/// variants remain absent entirely.
+/// G17G/G17P and other variants are deliberately absent because the pinned
+/// corpus contains no equivalent role-paired nested images for them.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[repr(u8)]
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum G17FirmwareVariant {
     G17S = b'S',
     G17C = b'C',
-    G17P = b'P',
 }
 
-/// Strict variant decoding for diagnostic firmware selection.
+/// Fail-closed variant decoding for diagnostic firmware selection.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum FirmwareIdentityError {
@@ -247,7 +213,6 @@ pub(crate) const fn decode_g17_firmware_variant(
     match raw {
         b'S' => Ok(G17FirmwareVariant::G17S),
         b'C' => Ok(G17FirmwareVariant::G17C),
-        b'P' => Ok(G17FirmwareVariant::G17P),
         _ => Err(FirmwareIdentityError::UnknownVariant),
     }
 }
@@ -326,35 +291,27 @@ const G17C_GFX1_FIRMWARE_IDENTITY: G17NestedFirmwareIdentity = G17NestedFirmware
 ///
 /// This proves the contents of the pinned containers, not a live G17C target
 /// or Linux ownership of FTAB extraction, fixups, or firmware loading.
-/// Returns `None` for G17P: the pinned corpus has no role-paired nested
-/// images for it (see [`G17FirmwareVariant`]), so no byte identity exists to
-/// select, so no caller can admit the image.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const fn g17_nested_firmware_identity(
     role: FirmwareRole,
     variant: G17FirmwareVariant,
-) -> Option<&'static G17NestedFirmwareIdentity> {
+) -> &'static G17NestedFirmwareIdentity {
     match (role, variant) {
-        (FirmwareRole::Gfx, G17FirmwareVariant::G17S) => Some(&G17S_GFX_FIRMWARE_IDENTITY),
-        (FirmwareRole::Gfx, G17FirmwareVariant::G17C) => Some(&G17C_GFX_FIRMWARE_IDENTITY),
-        (FirmwareRole::Gfx1, G17FirmwareVariant::G17S) => Some(&G17S_GFX1_FIRMWARE_IDENTITY),
-        (FirmwareRole::Gfx1, G17FirmwareVariant::G17C) => Some(&G17C_GFX1_FIRMWARE_IDENTITY),
-        (_, G17FirmwareVariant::G17P) => None,
+        (FirmwareRole::Gfx, G17FirmwareVariant::G17S) => &G17S_GFX_FIRMWARE_IDENTITY,
+        (FirmwareRole::Gfx, G17FirmwareVariant::G17C) => &G17C_GFX_FIRMWARE_IDENTITY,
+        (FirmwareRole::Gfx1, G17FirmwareVariant::G17S) => &G17S_GFX1_FIRMWARE_IDENTITY,
+        (FirmwareRole::Gfx1, G17FirmwareVariant::G17C) => &G17C_GFX1_FIRMWARE_IDENTITY,
     }
 }
 
 /// Validate tag, UUID, and hash together; no field is sufficient by itself.
-/// A variant with no pinned identity (G17P) validates nothing.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn validate_g17_nested_firmware_identity(
     role: FirmwareRole,
     variant: G17FirmwareVariant,
     observed: &G17NestedFirmwareIdentity,
 ) -> bool {
-    match g17_nested_firmware_identity(role, variant) {
-        Some(expected) => observed == expected,
-        None => false,
-    }
+    observed == g17_nested_firmware_identity(role, variant)
 }
 
 /// The G17P/G17G/G17S host/RTBuddy firmware-start model is exact but
@@ -782,43 +739,7 @@ pub(crate) const G17X_FIRMWARE_START_GAPS: G17xFirmwareStartGaps = G17xFirmwareS
 };
 
 const ROLE_COUNT: usize = 2;
-
-/// The order in which the two role start calls are issued.
-///
-/// The evidence for T8140/G17P is genuinely mixed and this is deliberately a
-/// parameter rather than a constant:
-///
-/// - The pinned macOS host (`AGXArmFirmware::bootFirmware()`, see
-///   [`g17_host_boot_ops`]) and the working bare-metal host that booted both
-///   T8140 instances issue the **primary (`GFX`) start first**, then `GFX1`.
-/// - The published T8140 firmware ABI spec
-///   (`docs/t8140-g17p-firmware-abi-spec.md`, "Startup Sequence" steps 7-9)
-///   instead documents booting the **secondary/control-only instance first**
-///   and sending its initdata before the primary.
-///
-/// Both cannot be the unique requirement; most likely the constraint is only
-/// on descriptor/acknowledgement interleaving rather than raw start order.
-/// Until a live A/B experiment settles it, primary-first is the default
-/// (matching the host that has actually driven this hardware) and the
-/// spec-documented order stays selectable.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub(crate) enum KickOrder {
-    /// `GFX` first, then `GFX1`. Matches the pinned macOS host and the
-    /// working bare-metal T8140 host. Default.
-    PrimaryFirst,
-    /// `GFX1` first, then `GFX`. Matches the published T8140 firmware ABI
-    /// spec's startup sequence. Not hardware-refuted; not the default.
-    SecondaryFirst,
-}
-
-impl KickOrder {
-    pub(crate) const fn role_at(self, index: usize) -> FirmwareRole {
-        match (self, index) {
-            (Self::PrimaryFirst, 0) | (Self::SecondaryFirst, 1) => FirmwareRole::Gfx,
-            _ => FirmwareRole::Gfx1,
-        }
-    }
-}
+const KICK_ORDER: [FirmwareRole; ROLE_COUNT] = [FirmwareRole::Gfx, FirmwareRole::Gfx1];
 
 impl FirmwareRole {
     const fn index(self) -> usize {
@@ -841,12 +762,12 @@ struct RoleState {
     cold_boot_complete: bool,
 }
 
-/// Errors in the host-observed boot sequence.
+/// Fail-closed errors in the host-observed boot sequence.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum BootError {
     /// Both role roots must be built and validated before the first kick.
     InitdataRootsIncomplete,
-    /// A role was kicked out of the exact order selected by [`KickOrder`].
+    /// A role was kicked out of the exact `GFX`, then `GFX1` order.
     WrongKickOrder,
     /// A role start call failed; the boot attempt is permanently failed.
     KickFailed,
@@ -866,21 +787,14 @@ pub(crate) enum BootError {
 pub(crate) struct DualRoleBoot {
     owner: SharedGpuUatOwner,
     roles: [RoleState; ROLE_COUNT],
-    kick_order: KickOrder,
     next_kick: usize,
     failed: bool,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 impl DualRoleBoot {
-    /// Create an empty boot attempt with one shared GPU/UAT owner, using the
-    /// default primary-first kick order (see [`KickOrder`]).
+    /// Create an empty boot attempt with one shared GPU/UAT owner.
     pub(crate) const fn new() -> Self {
-        Self::new_with_order(KickOrder::PrimaryFirst)
-    }
-
-    /// Create an empty boot attempt with an explicit kick order.
-    pub(crate) const fn new_with_order(kick_order: KickOrder) -> Self {
         Self {
             owner: SharedGpuUatOwner,
             roles: [
@@ -897,15 +811,9 @@ impl DualRoleBoot {
                     cold_boot_complete: false,
                 },
             ],
-            kick_order,
             next_kick: 0,
             failed: false,
         }
-    }
-
-    /// The kick order this boot attempt enforces.
-    pub(crate) const fn kick_order(&self) -> KickOrder {
-        self.kick_order
     }
 
     /// Return the single address-space owner used by either role.
@@ -929,9 +837,8 @@ impl DualRoleBoot {
 
     /// Record the return value of the next role start call.
     ///
-    /// Both roots must already exist, and calls must be recorded in the exact
-    /// order selected at construction ([`KickOrder`]; primary-first by
-    /// default). Any failure permanently closes all gates.
+    /// Both roots must already exist, and calls must be recorded in exact
+    /// `GFX`, then `GFX1` order. Any failure permanently closes all gates.
     pub(crate) fn record_kick(
         &mut self,
         role: FirmwareRole,
@@ -944,7 +851,7 @@ impl DualRoleBoot {
             self.failed = true;
             return Err(BootError::InitdataRootsIncomplete);
         }
-        if self.next_kick >= ROLE_COUNT || self.kick_order.role_at(self.next_kick) != role {
+        if self.next_kick >= ROLE_COUNT || KICK_ORDER[self.next_kick] != role {
             self.failed = true;
             return Err(BootError::WrongKickOrder);
         }
@@ -1025,7 +932,7 @@ impl DualRoleBoot {
 // (FW-3), the driver's own validator is the sole boundary that keeps a role
 // from being handed the wrong resource set. The ownership *contract* is
 // groundable and encodable offline; the actual per-role allocation and UAT
-// mapping is live DMA. The admission bit therefore remains unset:
+// mapping is live DMA. The gate therefore stays fail-closed:
 // `EXECUTABLE_ROLE_RESOURCES_AVAILABLE = false`.
 // -------------------------------------------------------------------------
 
@@ -1054,7 +961,7 @@ pub(crate) const GROUNDED_ROLE_RESOURCE_OWNERSHIP_AVAILABLE: bool = true;
 /// and only fails as a functional fault a live M5 boot exposes.
 pub(crate) const EXECUTABLE_ROLE_RESOURCES_AVAILABLE: bool = false;
 
-/// Strict per-role resource-ownership description.
+/// Fail-closed per-role resource-ownership description.
 ///
 /// Both roles share exactly one GPU/UAT owner ([`SharedGpuUatOwner`]); only
 /// GFX1 owns the runtime resource at runtime_pointers+0x481 (FW-4).
@@ -1067,7 +974,7 @@ pub(crate) struct RoleResourceOwnership {
     pub(crate) gfx1_runtime_resource: u64,
 }
 
-/// Role-resource validation errors.
+/// Fail-closed role-resource validation errors.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum RoleResourceError {
@@ -1079,7 +986,7 @@ pub(crate) enum RoleResourceError {
     SharedOwnerAliasViolation,
 }
 
-/// Validate one role's resource ownership.
+/// Validate one role's resource ownership, fail-closed.
 ///
 /// Because the firmware never self-validates the role (FW-3), this is the only
 /// place a role/resource mismatch is caught before handoff. It refuses a null
@@ -1104,7 +1011,7 @@ pub(crate) fn validate_role_resource_ownership(
 }
 
 /// Validate that the two roles in a boot resolve to one GPU/UAT owner and hold
-/// mutually consistent, role-correct resources.
+/// mutually consistent, role-correct resources, fail-closed.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn validate_dual_role_resources(
     boot: &DualRoleBoot,
@@ -1190,44 +1097,6 @@ mod tests {
     }
 
     #[test]
-    fn kick_order_is_a_parameter_with_primary_first_default() {
-        // Default matches the working T8140 host: primary first.
-        assert_eq!(DualRoleBoot::new().kick_order(), KickOrder::PrimaryFirst);
-        assert_eq!(KickOrder::PrimaryFirst.role_at(0), FirmwareRole::Gfx);
-        assert_eq!(KickOrder::PrimaryFirst.role_at(1), FirmwareRole::Gfx1);
-        // The spec-documented alternative stays selectable.
-        assert_eq!(KickOrder::SecondaryFirst.role_at(0), FirmwareRole::Gfx1);
-        assert_eq!(KickOrder::SecondaryFirst.role_at(1), FirmwareRole::Gfx);
-
-        let mut boot = DualRoleBoot::new_with_order(KickOrder::SecondaryFirst);
-        boot.mark_initdata_root_ready(FirmwareRole::Gfx).unwrap();
-        boot.mark_initdata_root_ready(FirmwareRole::Gfx1).unwrap();
-        // Under secondary-first, kicking GFX first is the order violation.
-        assert_eq!(
-            boot.record_kick(FirmwareRole::Gfx, true),
-            Err(BootError::WrongKickOrder)
-        );
-
-        let mut boot = DualRoleBoot::new_with_order(KickOrder::SecondaryFirst);
-        boot.mark_initdata_root_ready(FirmwareRole::Gfx).unwrap();
-        boot.mark_initdata_root_ready(FirmwareRole::Gfx1).unwrap();
-        boot.record_kick(FirmwareRole::Gfx1, true).unwrap();
-        boot.record_kick(FirmwareRole::Gfx, true).unwrap();
-        assert!(boot.kick_gate_open());
-    }
-
-    #[test]
-    fn g17p_variant_decodes_but_pins_no_firmware_identity() {
-        assert_eq!(
-            decode_g17_firmware_variant(b'P'),
-            Ok(G17FirmwareVariant::G17P)
-        );
-        for role in [FirmwareRole::Gfx, FirmwareRole::Gfx1] {
-            assert!(g17_nested_firmware_identity(role, G17FirmwareVariant::G17P).is_none());
-        }
-    }
-
-    #[test]
     fn early_gate_is_either_role_not_both_roles() {
         for role in [FirmwareRole::Gfx, FirmwareRole::Gfx1] {
             let mut boot = roles_kicked();
@@ -1267,7 +1136,7 @@ mod tests {
     }
 
     #[test]
-    fn root_mutation_after_kick_is_invalid() {
+    fn root_mutation_after_kick_fails_closed() {
         let mut boot = roots_ready();
         boot.record_kick(FirmwareRole::Gfx, true).unwrap();
         assert_eq!(
@@ -1280,11 +1149,8 @@ mod tests {
     #[test]
     fn nested_firmware_identity_is_exact_per_role_and_variant() {
         for role in [FirmwareRole::Gfx, FirmwareRole::Gfx1] {
-            // G17P has no pinned nested images; selection is unavailable.
-            assert!(g17_nested_firmware_identity(role, G17FirmwareVariant::G17P).is_none());
-
-            let g17s = g17_nested_firmware_identity(role, G17FirmwareVariant::G17S).unwrap();
-            let g17c = g17_nested_firmware_identity(role, G17FirmwareVariant::G17C).unwrap();
+            let g17s = g17_nested_firmware_identity(role, G17FirmwareVariant::G17S);
+            let g17c = g17_nested_firmware_identity(role, G17FirmwareVariant::G17C);
             assert_eq!(g17s.entry_tag, *b"a010");
             assert_eq!(g17c.entry_tag, *b"a000");
             assert_eq!(g17s.size, g17c.size);
@@ -1320,12 +1186,6 @@ mod tests {
                 G17FirmwareVariant::G17C,
                 g17s,
             ));
-            // A variant with no pinned identity validates nothing.
-            assert!(!validate_g17_nested_firmware_identity(
-                role,
-                G17FirmwareVariant::G17P,
-                g17s,
-            ));
         }
 
         assert_eq!(
@@ -1336,11 +1196,7 @@ mod tests {
             decode_g17_firmware_variant(b'C'),
             Ok(G17FirmwareVariant::G17C)
         );
-        assert_eq!(
-            decode_g17_firmware_variant(b'P'),
-            Ok(G17FirmwareVariant::G17P)
-        );
-        for raw in [b'G', b'A', 0, u8::MAX] {
+        for raw in [b'G', b'P', b'A', 0, u8::MAX] {
             assert_eq!(
                 decode_g17_firmware_variant(raw),
                 Err(FirmwareIdentityError::UnknownVariant)
@@ -1376,7 +1232,7 @@ mod tests {
 
             let wrong_variant = match variant {
                 G17FirmwareVariant::G17S => G17FirmwareVariant::G17C,
-                G17FirmwareVariant::G17C | G17FirmwareVariant::G17P => G17FirmwareVariant::G17S,
+                G17FirmwareVariant::G17C => G17FirmwareVariant::G17S,
             };
             let mismatched =
                 pre_handoff_gate_with_identity(G17_GENERATION, wrong_variant, Some(&admission))
@@ -1690,7 +1546,7 @@ mod tests {
         // firmware and wired: the topology/fault register bank, the init-data
         // object graph the firmware parser accepts, and the GPU RTKit wire
         // transport (with EP0 owned by the version-12-capable apple-rtkit
-        // core). Everything else remains unsupported pending more offline RE or a
+        // core). Everything else stays fail-closed pending more offline RE or a
         // live firmware ACK.
         let grounded =
             missing::TOPOLOGY_REGISTERS | missing::INITDATA_GRAPH | missing::RTKIT_TRANSPORT;
@@ -1749,13 +1605,13 @@ mod tests {
         assert!(!agx_power_recovery::EXECUTABLE_GFX1_POWER_SEQUENCE_AVAILABLE);
         assert!(!agx_power_recovery::EXECUTABLE_G17_RECOVERY_HANDSHAKE_AVAILABLE);
         // ROLE_RESOURCES: the ownership contract is grounded, but there is no
-        // firmware parse-time role check to satisfy, so it remains unset.
+        // firmware parse-time role check to satisfy, so it stays fail-closed.
         assert!(GROUNDED_ROLE_RESOURCE_OWNERSHIP_AVAILABLE);
         assert!(!EXECUTABLE_ROLE_RESOURCES_AVAILABLE);
     }
 
     #[test]
-    fn role_resource_ownership_detects_cross_role_and_null() {
+    fn role_resource_ownership_fails_closed_on_cross_role_and_null() {
         // Byte-grounded asymmetry: only GFX1 references the +0x481 resource.
         assert_eq!(G17_GFX1_RUNTIME_RESOURCE_REFS_IN_GFX, 0);
         assert_eq!(G17_GFX1_RUNTIME_RESOURCE_REFS_IN_GFX1, 78);
@@ -1792,27 +1648,6 @@ mod tests {
     }
 
     #[test]
-    fn t8140_target_clears_only_shared_uat_and_role_resources() {
-        let default = pre_handoff_gate(17).unwrap_err();
-        let t8140 = pre_handoff_gate_for_variant(17, G17FirmwareVariant::G17P).unwrap_err();
-
-        assert!(default.contains(missing::ROLE_RESOURCES));
-        assert!(default.contains(missing::UAT_HANDOFF));
-        assert!(!t8140.contains(missing::ROLE_RESOURCES));
-        assert!(!t8140.contains(missing::UAT_HANDOFF));
-        assert_eq!(
-            t8140.bits(),
-            default.bits() & !(missing::ROLE_RESOURCES | missing::UAT_HANDOFF)
-        );
-        assert!(t8140.contains(missing::FIRMWARE_IDENTITY));
-        assert!(t8140.contains(missing::GFX1_POWER_SEQUENCE));
-        assert!(t8140.contains(missing::RECOVERY_HANDSHAKE));
-        assert!(t8140.contains(missing::SUBMISSION_TRANSPORT));
-        assert!(g17_resources::EXECUTABLE_T8140_SHARED_UAT_AVAILABLE);
-        assert!(g17_resources::EXECUTABLE_T8140_ROLE_RESOURCES_AVAILABLE);
-    }
-
-    #[test]
     fn dual_role_resources_require_one_owner_and_role_correct_sets() {
         let boot = DualRoleBoot::new();
         let good = [
@@ -1827,7 +1662,7 @@ mod tests {
         ];
         assert!(validate_dual_role_resources(&boot, &good).is_ok());
 
-        // Swapped roles are invalid.
+        // Swapped roles fail closed.
         let swapped = [good[1], good[0]];
         assert_eq!(
             validate_dual_role_resources(&boot, &swapped),
@@ -1840,7 +1675,7 @@ mod tests {
     }
 
     #[test]
-    fn submission_transport_waits_for_completion_round_trip() {
+    fn submission_transport_is_grounded_but_stays_fail_closed() {
         // The producer subset is real (doorbell byte-identical to AGX2, SKSM
         // kick word + record forked and cited), but not executable offline.
         assert!(g17_submission::GROUNDED_SUBMISSION_PRODUCER_AVAILABLE);

@@ -7,7 +7,7 @@
 //! the few operations that require that, mainly reading the MMU fault status, reading GPU ID
 //! information, and starting the GPU firmware coprocessor.
 
-use crate::{g17_submission, hw, identity};
+use crate::{hw, identity};
 use kernel::{
     c_str,
     device::Core,
@@ -572,12 +572,8 @@ impl Resources {
         // The G14X fault-register bank and fault-word decode carry unchanged
         // to every AGX3 part (see the FAULT_INFO_G14X provenance comment).
         // `gpu_core` is a firmware-ABI value that only exists for the AGX2
-        // targets (None on AGX3), so AGX3 membership is keyed off the design
-        // generation.
-        let g14x = cfg
-            .gpu_core
-            .map(|core| core as u32 >= hw::GpuCore::G14S as u32)
-            .unwrap_or(false)
+        // targets, so AGX3 membership is keyed off the design generation.
+        let g14x = cfg.gpu_core as u32 >= hw::GpuCore::G14S as u32
             || cfg.gpu_gen as u32 >= hw::GpuGen::G15 as u32;
 
         let fault_info = if g14x {
