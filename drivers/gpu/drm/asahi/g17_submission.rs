@@ -1326,11 +1326,11 @@ pub(crate) fn apply_g17p_populated_operand_directory(
     Ok(())
 }
 
-/// Write one distinct low-VM queue-context page for the cold TA/3D pair.
+/// Write the queue-context page for the clean first-partial TA/3D pair.
 ///
-/// Pair zero uses the untagged first words emitted by the output-positive
-/// `compute_direct` path. The `0x10..` values belong to a different context
-/// family; using them here makes the scheduler follow a null context pointer.
+/// This is the new local grid-0/1 generation selected by
+/// `G17P_PARTIAL_OPENING_GRAPH=1`. Its namespace tag and fragment locators are
+/// distinct from the untagged full-opening pair-zero context.
 pub(crate) fn apply_g17p_cold_opening_queue_context(
     stage: G17PColdOpeningStage,
     descriptor: u64,
@@ -1343,21 +1343,20 @@ pub(crate) fn apply_g17p_cold_opening_queue_context(
     out.fill(0);
     let words: &[(usize, u64)] = match stage {
         G17PColdOpeningStage::Tiling => &[
-            (0x200, 0x0000_0000_0000_0004),
+            (0x200, 0x1000_0000_0000_0004),
             (0x220, 0xffff_0c00_0000_0001),
             (0x350, 0x0002_3803_8000_0003),
             (0x378, 0x003f_ffff_ffff_ffff),
         ],
         G17PColdOpeningStage::Fragment => &[
-            (0x200, 0x0400_0400_0000_0004),
-            (0x208, 0x0040_00e0_0013_0d40),
+            (0x200, 0x1000_0400_0000_0004),
             (0x220, 0xffff_1800_0000_0003),
             (0x228, 0x0000_0000_0000_0001),
             (0x230, 0x0000_0100_0000_0000),
             (0x350, 0x0002_b003_8000_4c05),
-            (0x358, 0x0000_1003_8000_4c3e),
-            (0x360, 0x0000_1003_8000_4c77),
-            (0x368, 0x0000_1003_8000_4cb0),
+            (0x358, 0x0000_8003_8000_4c3e),
+            (0x360, 0x0000_b803_8000_4c77),
+            (0x368, 0x0000_5003_8000_4cb0),
             (0x378, 0x003f_ffff_ffff_ffff),
         ],
     };
@@ -3697,23 +3696,23 @@ mod tests {
             assert_eq!(
                 get_u64_le(&context, 0x200),
                 match stage {
-                    G17PColdOpeningStage::Tiling => 0x0000_0000_0000_0004,
-                    G17PColdOpeningStage::Fragment => 0x0400_0400_0000_0004,
+                    G17PColdOpeningStage::Tiling => 0x1000_0000_0000_0004,
+                    G17PColdOpeningStage::Fragment => 0x1000_0400_0000_0004,
                 }
             );
             if stage == G17PColdOpeningStage::Fragment {
-                assert_eq!(get_u64_le(&context, 0x208), 0x0040_00e0_0013_0d40);
-                assert_eq!(get_u64_le(&context, 0x358), 0x0000_1003_8000_4c3e);
-                assert_eq!(get_u64_le(&context, 0x360), 0x0000_1003_8000_4c77);
-                assert_eq!(get_u64_le(&context, 0x368), 0x0000_1003_8000_4cb0);
+                assert_eq!(get_u64_le(&context, 0x208), 0);
+                assert_eq!(get_u64_le(&context, 0x358), 0x0000_8003_8000_4c3e);
+                assert_eq!(get_u64_le(&context, 0x360), 0x0000_b803_8000_4c77);
+                assert_eq!(get_u64_le(&context, 0x368), 0x0000_5003_8000_4cb0);
             }
             assert!(supplied.contains(&descriptor));
             assert!(supplied.contains(&queue));
             assert_eq!(
                 source_fixture_fingerprint(&context),
                 match stage {
-                    G17PColdOpeningStage::Tiling => 0x132b_b3dc_4e25_6b11,
-                    G17PColdOpeningStage::Fragment => 0x0173_d84c_e6b1_1789,
+                    G17PColdOpeningStage::Tiling => 0x3379_a6bc_2412_1161,
+                    G17PColdOpeningStage::Fragment => 0x9d66_7001_5e08_aa8d,
                 }
             );
         }

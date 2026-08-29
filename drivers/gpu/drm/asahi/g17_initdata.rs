@@ -224,12 +224,21 @@ pub(crate) const CONTROL_SHARED_INNER_ADDRESS: u64 = 0xffff_fc20_0160_8000;
 pub(crate) const CONTROL_SHARED_OBJECT_SIZE: usize = 0x4000;
 pub(crate) const CONTROL_SHARED_CURSOR_OFFSET: usize = 0x48;
 pub(crate) const CONTROL_SHARED_CURSOR_BEFORE: u32 = 0x88;
-/// The output-positive generic opening presents the cursor before binding but
-/// the separate inner state after binding (`--shared-control mixed`).
 pub(crate) const CONTROL_SHARED_INNER_PRESENTED: u64 = 2;
+/// Separate compact class-2 object consumed by the first-partial opening.
+/// Descriptor tails and later compute control continue to use
+/// [`CONTROL_SHARED_ADDRESS`].
+pub(crate) const PARTIAL_OPENING_CONTROL_SHARED_ADDRESS: u64 = 0xffff_fc20_c082_8000;
+pub(crate) const PARTIAL_OPENING_CONTROL_SHARED_INNER_ADDRESS: u64 =
+    0xffff_fc20_0160_0000;
+pub(crate) const PARTIAL_OPENING_CONTROL_SHARED_CURSOR_BEFORE: u32 = 0xc8;
+pub(crate) const PARTIAL_OPENING_CONTROL_SHARED_INNER_PRESENTED: u64 = 2;
 pub(crate) const CONTROL_OPERAND_TABLE_ADDRESS: u64 = 0x70_0020_8000;
 pub(crate) const CONTROL_OPERAND_TABLE_SIZE: usize = 0x4000;
 pub(crate) const CONTROL_OPERAND_SLOT_OFFSET: u64 = 0x440;
+pub(crate) const PARTIAL_OPENING_CONTROL_OPERAND_SLOT_OFFSET: u64 = 0x640;
+pub(crate) const PARTIAL_OPENING_CONTROL_REGISTER_COUNT: u32 = 0x18;
+pub(crate) const PARTIAL_OPENING_CONTROL_OPERAND_ENTRY_COUNT: usize = 28;
 pub(crate) const CONTROL_OPERAND_BUFFER_BASE: u64 = 0x70_0022_0000;
 pub(crate) const CONTROL_OPERAND_BUFFER_STRIDE: u64 = 0x10_8000;
 pub(crate) const CONTROL_OPERAND_BUFFER_SIZE: u64 = 0x10_0000;
@@ -328,10 +337,10 @@ pub(crate) fn encode_control_opening(
                 3,
                 1,
                 0,
-                CONTROL_SHARED_ADDRESS,
+                PARTIAL_OPENING_CONTROL_SHARED_ADDRESS,
                 CONTROL_OPERAND_TABLE_ADDRESS,
-                CONTROL_OPERAND_SLOT_OFFSET,
-                0x28,
+                PARTIAL_OPENING_CONTROL_OPERAND_SLOT_OFFSET,
+                PARTIAL_OPENING_CONTROL_REGISTER_COUNT,
                 0,
             );
         }
@@ -504,7 +513,8 @@ pub(crate) fn encode_compute_dispatch_record(
     Ok(())
 }
 
-/// Encode the shared object named by the primary opcode-0x20 record.
+/// Encode the generic shared object named by descriptor tails and later
+/// compute-control records.
 pub(crate) fn encode_control_shared(out: &mut [u8]) -> Result<(), InitdataError> {
     if out.len() != CONTROL_SHARED_OBJECT_SIZE {
         return Err(InitdataError::BufferSize);
@@ -527,7 +537,73 @@ pub(crate) fn encode_control_shared(out: &mut [u8]) -> Result<(), InitdataError>
     Ok(())
 }
 
-/// Encode the 22 flagged buffer pointers required by the full 4/16 opening.
+/// Encode the distinct first-partial support object before opcode 0x20.
+pub(crate) fn encode_partial_opening_control_shared(
+    out: &mut [u8],
+) -> Result<(), InitdataError> {
+    if out.len() != CONTROL_SHARED_OBJECT_SIZE {
+        return Err(InitdataError::BufferSize);
+    }
+    out.fill(0);
+    for (offset, value) in [
+        (0x00, 0x0000_0000_0000_0001),
+        (0x10, 0x0000_0000_0000_0002),
+        (0x18, 0x0004_0000_0000_0070),
+        (0x20, 0x0000_1900_0000_0000),
+        (0x28, 0x0000_1900_0000_0000),
+        (0x30, CONTROL_OPERAND_TABLE_ADDRESS),
+        (0x40, 0x0000_0000_0000_0004),
+        (0x60, 0x0000_0000_0000_0003),
+    ] {
+        put_u64(out, offset, value);
+    }
+    put_u32(
+        out,
+        CONTROL_SHARED_CURSOR_OFFSET,
+        PARTIAL_OPENING_CONTROL_SHARED_CURSOR_BEFORE,
+    );
+    put_u64(
+        out,
+        0x4c,
+        PARTIAL_OPENING_CONTROL_SHARED_INNER_ADDRESS,
+    );
+    Ok(())
+}
+
+/// Keep the first-partial operand page blank through its opening and first
+/// control-done notification. The host publishes the 28-entry form before
+/// making either first-work producer visible.
+pub(crate) fn encode_partial_opening_operand_table_pre_control(
+    out: &mut [u8],
+) -> Result<(), InitdataError> {
+    if out.len() != CONTROL_OPERAND_TABLE_SIZE {
+        return Err(InitdataError::BufferSize);
+    }
+    out.fill(0);
+    Ok(())
+}
+
+pub(crate) fn encode_partial_opening_operand_table_post_control(
+    out: &mut [u8],
+) -> Result<(), InitdataError> {
+    if out.len() != CONTROL_OPERAND_TABLE_SIZE {
+        return Err(InitdataError::BufferSize);
+    }
+    out.fill(0);
+    for index in 0..PARTIAL_OPENING_CONTROL_OPERAND_ENTRY_COUNT {
+        let address = CONTROL_OPERAND_BUFFER_BASE
+            .checked_add(index as u64 * CONTROL_OPERAND_BUFFER_STRIDE)
+            .ok_or(InitdataError::AddressOutOfRange)?;
+        put_u64(
+            out,
+            index * CONTROL_OPERAND_ENTRY_STRIDE,
+            address | CONTROL_OPERAND_ENTRY_FLAG,
+        );
+    }
+    Ok(())
+}
+
+/// Encode the 22 flagged buffer pointers used by the later compute tail.
 pub(crate) fn encode_control_operand_table(out: &mut [u8]) -> Result<(), InitdataError> {
     if out.len() != CONTROL_OPERAND_TABLE_SIZE {
         return Err(InitdataError::BufferSize);
@@ -2370,16 +2446,22 @@ mod tests {
         assert_eq!(get_u32(&opening, base + 0x04), 1);
         assert_eq!(get_u32(&opening, base + 0x08), 0x3f);
         assert_eq!(get_u32(&opening, base + 0x0c), 0);
-        assert_eq!(get_u64(&opening, base + 0x14), CONTROL_SHARED_ADDRESS);
+        assert_eq!(
+            get_u64(&opening, base + 0x14),
+            PARTIAL_OPENING_CONTROL_SHARED_ADDRESS
+        );
         assert_eq!(
             get_u64(&opening, base + 0x1c),
             CONTROL_OPERAND_TABLE_ADDRESS
         );
         assert_eq!(
             get_u64(&opening, base + 0x24),
-            CONTROL_OPERAND_TABLE_ADDRESS + CONTROL_OPERAND_SLOT_OFFSET
+            CONTROL_OPERAND_TABLE_ADDRESS + PARTIAL_OPENING_CONTROL_OPERAND_SLOT_OFFSET
         );
-        assert_eq!(get_u32(&opening, base + 0x2c), 0x28);
+        assert_eq!(
+            get_u32(&opening, base + 0x2c),
+            PARTIAL_OPENING_CONTROL_REGISTER_COUNT
+        );
         assert_eq!(get_u32(&opening, base + 0x30), 0);
         assert_eq!(get_u32(&opening, base + 0x34), 1);
     }
@@ -2507,7 +2589,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_control_object_names_the_fixed_operand_and_inner_pages() {
+    fn generic_control_support_keeps_descriptor_and_runtime_identity() {
         let mut shared = vec![0; CONTROL_SHARED_OBJECT_SIZE];
         encode_control_shared(&mut shared).unwrap();
 
@@ -2527,8 +2609,48 @@ mod tests {
     }
 
     #[test]
-    fn full_opening_operand_table_has_twenty_two_flagged_entries() {
+    fn first_partial_support_has_distinct_address_cursor_and_inner_page() {
+        let mut shared = vec![0; CONTROL_SHARED_OBJECT_SIZE];
+        encode_partial_opening_control_shared(&mut shared).unwrap();
+
+        assert_eq!(PARTIAL_OPENING_CONTROL_SHARED_ADDRESS, 0xffff_fc20_c082_8000);
+        assert_eq!(get_u64(&shared, 0x00), 1);
+        assert_eq!(get_u64(&shared, 0x10), 2);
+        assert_eq!(get_u64(&shared, 0x20), 0x0000_1900_0000_0000);
+        assert_eq!(get_u64(&shared, 0x28), 0x0000_1900_0000_0000);
+        assert_eq!(get_u64(&shared, 0x30), CONTROL_OPERAND_TABLE_ADDRESS);
+        assert_eq!(
+            get_u32(&shared, CONTROL_SHARED_CURSOR_OFFSET),
+            PARTIAL_OPENING_CONTROL_SHARED_CURSOR_BEFORE
+        );
+        assert_eq!(
+            get_u64(&shared, 0x4c),
+            PARTIAL_OPENING_CONTROL_SHARED_INNER_ADDRESS
+        );
+        assert_eq!(get_u64(&shared, 0x60), 3);
+        assert_eq!(PARTIAL_OPENING_CONTROL_SHARED_INNER_PRESENTED, 2);
+    }
+
+    #[test]
+    fn first_partial_operand_table_is_published_between_control_and_work() {
         let mut table = vec![0xff; CONTROL_OPERAND_TABLE_SIZE];
+        encode_partial_opening_operand_table_pre_control(&mut table).unwrap();
+        assert!(table.iter().all(|byte| *byte == 0));
+
+        encode_partial_opening_operand_table_post_control(&mut table).unwrap();
+        for index in 0..PARTIAL_OPENING_CONTROL_OPERAND_ENTRY_COUNT {
+            assert_eq!(
+                get_u64(&table, index * CONTROL_OPERAND_ENTRY_STRIDE),
+                CONTROL_OPERAND_ENTRY_FLAG
+                    | (CONTROL_OPERAND_BUFFER_BASE
+                        + index as u64 * CONTROL_OPERAND_BUFFER_STRIDE)
+            );
+        }
+        assert!(table[PARTIAL_OPENING_CONTROL_OPERAND_ENTRY_COUNT
+            * CONTROL_OPERAND_ENTRY_STRIDE..]
+            .iter()
+            .all(|byte| *byte == 0));
+
         encode_control_operand_table(&mut table).unwrap();
 
         for index in 0..CONTROL_OPERAND_ENTRY_COUNT {

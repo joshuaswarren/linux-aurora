@@ -379,7 +379,7 @@ fn g17p_cold_opening_optional_addresses(
     g17_submission::G17PColdOpeningOptionalAddresses {
         context_scratch,
         firmware_scratch,
-        shared_control: g17_initdata::CONTROL_SHARED_ADDRESS,
+        shared_control: g17_initdata::PARTIAL_OPENING_CONTROL_SHARED_ADDRESS,
         channel_control: support + G17P_RENDER_CHANNEL_CONTROL as u64,
         tiling_shared_object: support + G17P_RENDER_PACKED_SHARED as u64,
     }
@@ -2931,6 +2931,8 @@ struct G17MappedResources {
     fwctl: MappedObject,
     control_shared: MappedObject,
     control_shared_inner: MappedObject,
+    partial_opening_control_shared: MappedObject,
+    partial_opening_control_shared_inner: MappedObject,
     bootstrap_descriptor_zero_a: MappedObject,
     bootstrap_descriptor_zero_b: MappedObject,
     bootstrap_ta_context_peer: MappedObject,
@@ -3126,6 +3128,32 @@ impl G17ResourceOwner {
             bytes[..8].copy_from_slice(&g17_initdata::CONTROL_SHARED_INNER_PRESENTED.to_le_bytes());
             Ok(())
         })?;
+        let mut partial_opening_control_shared = map_fixed_wc_object(
+            dev,
+            address_space.uat.kernel_vm(),
+            "partial-opening-control-shared",
+            g17_initdata::PARTIAL_OPENING_CONTROL_SHARED_ADDRESS,
+            g17_initdata::CONTROL_SHARED_OBJECT_SIZE,
+            mmu::PROT_GPU_FW_PRIV_RW,
+        )?;
+        partial_opening_control_shared.with_bytes_mut(|bytes| {
+            g17_initdata::encode_partial_opening_control_shared(bytes).map_err(|_| EINVAL)
+        })?;
+        let mut partial_opening_control_shared_inner = map_fixed_wc_object(
+            dev,
+            address_space.uat.kernel_vm(),
+            "partial-opening-control-shared-inner",
+            g17_initdata::PARTIAL_OPENING_CONTROL_SHARED_INNER_ADDRESS,
+            mmu::UAT_PGSZ,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        partial_opening_control_shared_inner.with_bytes_mut(|bytes| {
+            bytes.fill(0);
+            bytes[..8].copy_from_slice(
+                &g17_initdata::PARTIAL_OPENING_CONTROL_SHARED_INNER_PRESENTED.to_le_bytes(),
+            );
+            Ok(())
+        })?;
         let bootstrap_descriptor_zero_a = map_fixed_wc_object(
             dev,
             address_space.uat.kernel_vm(),
@@ -3178,7 +3206,8 @@ impl G17ResourceOwner {
             }
         };
         if let Err(error) = control_operand_table.with_bytes_mut(|bytes| {
-            g17_initdata::encode_control_operand_table(bytes).map_err(|_| EINVAL)
+            g17_initdata::encode_partial_opening_operand_table_pre_control(bytes)
+                .map_err(|_| EINVAL)
         }) {
             dev_err!(
                 dev.as_ref(),
@@ -3418,6 +3447,14 @@ impl G17ResourceOwner {
             ("fwctl", &fwctl),
             ("control shared", &control_shared),
             ("control shared inner", &control_shared_inner),
+            (
+                "partial-opening control shared",
+                &partial_opening_control_shared,
+            ),
+            (
+                "partial-opening control shared inner",
+                &partial_opening_control_shared_inner,
+            ),
             ("bootstrap descriptor zero A", &bootstrap_descriptor_zero_a),
             ("bootstrap descriptor zero B", &bootstrap_descriptor_zero_b),
             ("bootstrap TA context peer", &bootstrap_ta_context_peer),
@@ -3563,6 +3600,8 @@ impl G17ResourceOwner {
                 fwctl,
                 control_shared,
                 control_shared_inner,
+                partial_opening_control_shared,
+                partial_opening_control_shared_inner,
                 bootstrap_descriptor_zero_a,
                 bootstrap_descriptor_zero_b,
                 bootstrap_ta_context_peer,
@@ -3615,21 +3654,21 @@ impl G17ResourceOwner {
         core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
         let shared_cursor_address = self
             .resources
-            .control_shared
+            .partial_opening_control_shared
             .iova()
             .checked_add(g17_initdata::CONTROL_SHARED_CURSOR_OFFSET as u64)
             .ok_or(EINVAL)?;
-        let inner_state_address = self.resources.control_shared_inner.iova();
+        let inner_state_address = self.resources.partial_opening_control_shared_inner.iova();
         let shared_cursor = self
             .resources
-            .control_shared
+            .partial_opening_control_shared
             .read_u32(shared_cursor_address)?;
         let inner_state = self
             .resources
-            .control_shared_inner
+            .partial_opening_control_shared_inner
             .read_u32(inner_state_address)?;
         let operand_slot = self.resources.control_operand_table.with_bytes_mut(|bytes| {
-            let start = g17_initdata::CONTROL_OPERAND_SLOT_OFFSET as usize;
+            let start = g17_initdata::PARTIAL_OPENING_CONTROL_OPERAND_SLOT_OFFSET as usize;
             let end = start.checked_add(8).ok_or(EINVAL)?;
             Ok(u64::from_le_bytes(
                 bytes
@@ -3652,6 +3691,11 @@ impl G17ResourceOwner {
         if !self.control_counters()?.opening_retired() {
             return Err(EINVAL);
         }
+        // The mature compute tail uses the 22-entry table. It replaces the
+        // first-partial 28-entry render table only after that group retires.
+        self.resources.control_operand_table.with_bytes_mut(|bytes| {
+            g17_initdata::encode_control_operand_table(bytes).map_err(|_| EINVAL)
+        })?;
         let mapping_state = self.resources.compute_runtime_state_mapping.is_some();
         let mapping_zero_0 = self
             .resources
@@ -3999,6 +4043,20 @@ impl G17ResourceOwner {
                 Ok(())
             })?;
         self.resources
+            .partial_opening_control_shared
+            .with_bytes_mut(|bytes| {
+                g17_initdata::encode_partial_opening_control_shared(bytes).map_err(|_| EINVAL)
+            })?;
+        self.resources
+            .partial_opening_control_shared_inner
+            .with_bytes_mut(|bytes| {
+                bytes.fill(0);
+                bytes[..8].copy_from_slice(
+                    &g17_initdata::PARTIAL_OPENING_CONTROL_SHARED_INNER_PRESENTED.to_le_bytes(),
+                );
+                Ok(())
+            })?;
+        self.resources
             .bootstrap_descriptor_zero_a
             .with_bytes_mut(|bytes| {
                 bytes.fill(0);
@@ -4025,7 +4083,8 @@ impl G17ResourceOwner {
         self.resources
             .control_operand_table
             .with_bytes_mut(|bytes| {
-                g17_initdata::encode_control_operand_table(bytes).map_err(|_| EINVAL)
+                g17_initdata::encode_partial_opening_operand_table_pre_control(bytes)
+                    .map_err(|_| EINVAL)
             })?;
         for buffer in self.resources.control_operand_buffers.iter_mut() {
             buffer.with_bytes_mut(|bytes| {
@@ -4468,6 +4527,20 @@ impl G17ResourceOwner {
                 }
                 bytes[offset..end].copy_from_slice(&write.value.to_le_bytes());
             }
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        })
+    }
+
+    /// Publish the 28-entry render operand table after primary control-done
+    /// and before either first-work producer becomes visible.
+    pub(crate) fn publish_partial_opening_operand_table(&mut self) -> Result {
+        if !self.control_counters()?.opening_retired() {
+            return Err(EINVAL);
+        }
+        self.resources.control_operand_table.with_bytes_mut(|bytes| {
+            g17_initdata::encode_partial_opening_operand_table_post_control(bytes)
+                .map_err(|_| EINVAL)?;
             core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
             Ok(())
         })
@@ -5182,11 +5255,11 @@ mod tests {
         let fragment_optional = g17p_cold_opening_optional_addresses(support_va, false);
         assert_eq!(
             tiling_optional.shared_control,
-            g17_initdata::CONTROL_SHARED_ADDRESS
+            g17_initdata::PARTIAL_OPENING_CONTROL_SHARED_ADDRESS
         );
         assert_eq!(
             fragment_optional.shared_control,
-            g17_initdata::CONTROL_SHARED_ADDRESS
+            g17_initdata::PARTIAL_OPENING_CONTROL_SHARED_ADDRESS
         );
         assert_eq!(
             tiling_optional.context_scratch,

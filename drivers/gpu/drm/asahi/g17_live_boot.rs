@@ -782,6 +782,11 @@ fn finish_boot_session(
         pdev.as_ref(),
         "G17P compute control: primary done sent before startup work publication\n"
     );
+    manager.publish_partial_opening_operand_table()?;
+    dev_info!(
+        pdev.as_ref(),
+        "G17P compute control: 28-entry partial operand table published\n"
+    );
 
     manager.split_compute_bootstrap_render_contexts()?;
     dev_info!(

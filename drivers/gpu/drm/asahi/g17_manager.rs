@@ -743,6 +743,12 @@ impl G17PManagerConstruction {
             })
     }
 
+    /// Publish the first-partial operand table in the control-done to
+    /// first-work interval.
+    pub(crate) fn publish_partial_opening_operand_table(&mut self) -> Result {
+        self.resources.publish_partial_opening_operand_table()
+    }
+
     /// Publish the exact first 3D/TA outer-ring pair. The callback installs
     /// the late TA descriptor, item-ring, and queue-head state between the 3D
     /// producer and the TA outer slot. The retained live runtime sends the
