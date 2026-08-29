@@ -41,29 +41,6 @@
 #define APPLE_DCP_LINK_PHASE_PROPERTY	"apple,dcp-link-phase"
 #define APPLE_DCP_LINK_MESSAGE_PROPERTY	"apple,dcp-link-message"
 
-/* Exact root-task VM/DVA layout in AppleDCP 1041.120.7~2715 (25G83). */
-#define DCP25G83_LINK_PAGE_DVA			0x04960000ULL
-#define DCP25G83_LINK_OBJECT_PAGE_OFFSET	0x00003d80
-#define DCP25G83_LINK_LOCAL_ID_OFFSET		0x00000070
-#define DCP25G83_LINK_LOCAL_STREAMS_OFFSET	0x00000078
-#define DCP25G83_LINK_REMOTE_STREAMS_OFFSET	0x00000218
-#define DCP25G83_LINK_STREAM_RESPONSE_OFFSET	0x00000048
-#define DCP25G83_D563_COOKIE_PREFIX		0xd500
-
-#define DCP25G83_LINK_LOCAL0_RESPONSE_PAGE_OFFSET \
-	(DCP25G83_LINK_OBJECT_PAGE_OFFSET + \
-	 DCP25G83_LINK_LOCAL_STREAMS_OFFSET + \
-	 DCP25G83_LINK_STREAM_RESPONSE_OFFSET)
-#define DCP25G83_LINK_REMOTE0_RESPONSE_PAGE_OFFSET \
-	(DCP25G83_LINK_OBJECT_PAGE_OFFSET + \
-	 DCP25G83_LINK_REMOTE_STREAMS_OFFSET + \
-	 DCP25G83_LINK_STREAM_RESPONSE_OFFSET)
-
-static_assert(DCP25G83_LINK_LOCAL0_RESPONSE_PAGE_OFFSET == 0x3e40);
-static_assert(DCP25G83_LINK_REMOTE0_RESPONSE_PAGE_OFFSET == 0x3fe0);
-static_assert(DCP25G83_LINK_REMOTE0_RESPONSE_PAGE_OFFSET + sizeof(u64) <=
-	      SZ_16K);
-
 static int dcp_tx_offset(enum dcp_context_id id)
 {
 	switch (id) {
@@ -194,73 +171,6 @@ static void dcp_link_sync_for_device(void)
 	wmb();
 }
 
-static void dcp25g83_link_assoc_diag_init(struct apple_dcp *dcp)
-{
-	struct iommu_domain *domain;
-	phys_addr_t page_pa;
-
-	if (dcp->fw_compat != DCP_FIRMWARE_H17P || !dcp->adopted_session)
-		return;
-
-	domain = iommu_get_domain_for_dev(dcp->dev);
-	if (!domain)
-		goto unavailable;
-	page_pa = iommu_iova_to_phys(domain, DCP25G83_LINK_PAGE_DVA);
-	if (!page_pa)
-		goto unavailable;
-
-	dcp->link_firmware_state = devm_ioremap_wc(dcp->dev, page_pa, SZ_16K);
-	if (!dcp->link_firmware_state)
-		goto unavailable;
-
-	dev_info(dcp->dev,
-		 "DCP25G83_D563_FW_ASSOC_DIAG mapped link page DVA %#llx PA %pa response candidates %#llx/%#llx\n",
-		 DCP25G83_LINK_PAGE_DVA, &page_pa,
-		 DCP25G83_LINK_PAGE_DVA +
-			 DCP25G83_LINK_LOCAL0_RESPONSE_PAGE_OFFSET,
-		 DCP25G83_LINK_PAGE_DVA +
-			 DCP25G83_LINK_REMOTE0_RESPONSE_PAGE_OFFSET);
-	return;
-
-unavailable:
-	dev_info(dcp->dev,
-		 "DCP25G83_D563_FW_ASSOC_DIAG firmware link page unavailable\n");
-}
-
-static void dcp25g83_link_assoc_diag_snapshot(struct apple_dcp *dcp)
-{
-	void __iomem *link;
-	u32 local_id;
-	u16 local_cookie;
-	u16 remote_cookie;
-	u64 local_response;
-	u64 remote_response;
-
-	if (!dcp->link_firmware_state || !dcp->link_d563_last_cookie)
-		return;
-
-	dcp_link_sync_for_cpu();
-	link = dcp->link_firmware_state + DCP25G83_LINK_OBJECT_PAGE_OFFSET;
-	local_id = readl_relaxed(link + DCP25G83_LINK_LOCAL_ID_OFFSET);
-	local_response = readq_relaxed(dcp->link_firmware_state +
-				       DCP25G83_LINK_LOCAL0_RESPONSE_PAGE_OFFSET);
-	remote_response = readq_relaxed(dcp->link_firmware_state +
-					DCP25G83_LINK_REMOTE0_RESPONSE_PAGE_OFFSET);
-	local_cookie = FIELD_GET(APPLE_DCP_LINK_MSG_VERSION, local_response);
-	remote_cookie = FIELD_GET(APPLE_DCP_LINK_MSG_VERSION, remote_response);
-	dev_info(dcp->dev,
-		 "DCP25G83_D563_FW_ASSOC_RESULT last_callback %u count %u expected_cookie %#x local_id %u local0_dva %#llx local0_response %#llx local0_cookie %#x remote0_dva %#llx remote0_response %#llx remote0_cookie %#x remote0_associated %u\n",
-		 dcp->link_d563_last_sequence, dcp->link_d563_diag_count,
-		 dcp->link_d563_last_cookie, local_id,
-		 DCP25G83_LINK_PAGE_DVA +
-			DCP25G83_LINK_LOCAL0_RESPONSE_PAGE_OFFSET,
-		 local_response, local_cookie,
-		 DCP25G83_LINK_PAGE_DVA +
-			DCP25G83_LINK_REMOTE0_RESPONSE_PAGE_OFFSET,
-		 remote_response, remote_cookie,
-		 remote_cookie == dcp->link_d563_last_cookie);
-}
-
 void iomfb_link_timeout_snapshot(struct apple_dcp *dcp)
 {
 	struct apple_dcp_link_rpc_header *callback;
@@ -293,7 +203,6 @@ void iomfb_link_timeout_snapshot(struct apple_dcp *dcp)
 		 le32_to_cpu(callback->output_size),
 		 callback_input + max_t(u32, le32_to_cpu(callback->input_size), 16) - 16,
 		 callback_output, READ_ONCE(dcp->ch_cb.depth));
-	dcp25g83_link_assoc_diag_snapshot(dcp);
 }
 
 static void dcp_link_log_init(struct apple_dcp *dcp,
@@ -739,8 +648,8 @@ bool dcp_link_defer_service_match(struct apple_dcp *dcp, int tag, void *out,
 	return false;
 }
 
-static int dcp_link_ack_cookie(struct apple_dcp *dcp,
-			       enum dcp_context_id context, u16 cookie)
+static int dcp_link_ack(struct apple_dcp *dcp,
+			enum dcp_context_id context)
 {
 	struct dcp_channel *ch = dcp_get_channel(dcp, context);
 	u64 request;
@@ -756,8 +665,7 @@ static int dcp_link_ack_cookie(struct apple_dcp *dcp,
 	depth = dcp_pop_depth(&ch->depth);
 	request = ch->link_message[depth];
 	dcp_link_sync_for_device();
-	reply = cookie ? apple_dcp_link_rpc_reply_cookie(request, cookie) :
-			 apple_dcp_link_rpc_reply(request);
+	reply = apple_dcp_link_rpc_reply(request);
 	ch->link_message[depth] = 0;
 	ret = dcp_send_message_sync(dcp, APPLE_DCP_LINK_ENDPOINT, reply);
 	if (ret)
@@ -766,12 +674,6 @@ static int dcp_link_ack_cookie(struct apple_dcp *dcp,
 			reply, ret);
 
 	return ret;
-}
-
-static int dcp_link_ack(struct apple_dcp *dcp,
-			enum dcp_context_id context)
-{
-	return dcp_link_ack_cookie(dcp, context, 0);
 }
 
 static struct dcp_channel *dcp_link_reply_channel(struct apple_dcp *dcp,
@@ -1003,22 +905,7 @@ static void dcp_link_handle_callback(struct apple_dcp *dcp, u64 message)
 				 handled ? reply : 0);
 	}
 	if (handled) {
-		u16 cookie = 0;
-
-		if (tag == 563 && dcp->ch_cmd.depth &&
-		    dcp->link_d563_diag_count < U8_MAX) {
-			dcp->link_d563_diag_count++;
-			cookie = DCP25G83_D563_COOKIE_PREFIX |
-				 dcp->link_d563_diag_count;
-			reply = apple_dcp_link_rpc_reply_cookie(message, cookie);
-			dcp->link_d563_last_cookie = cookie;
-			dcp->link_d563_last_sequence = sequence;
-			dev_info(dcp->dev,
-				 "DCP25G83_D563_ASSOC_TX count %u callback %u request %#llx ACK %#llx cookie %#x AP stream %u remote %u firmware selector 0\n",
-				 dcp->link_d563_diag_count, sequence, message,
-				 reply, cookie, stream, remote);
-		}
-		ack_ret = dcp_link_ack_cookie(dcp, DCP_CONTEXT_CB, cookie);
+		ack_ret = dcp_link_ack(dcp, DCP_CONTEXT_CB);
 		if (log_callback && sequence >= 165)
 			dev_info(dcp->dev,
 				 "DCPLink callback %u D%03d ACK %#llx send result %d\n",
@@ -1127,10 +1014,6 @@ static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 	dcp->link_service_match_state = 0;
 	dcp->link_service_match_output = NULL;
 	dcp->link_service_match_callback_tag = 0;
-	dcp->link_d563_diag_count = 0;
-	dcp->link_d563_last_cookie = 0;
-	dcp->link_d563_last_sequence = 0;
-	dcp25g83_link_assoc_diag_init(dcp);
 	dev_info(dcp->dev, "DCP25G83_ACK_DIAG armed\n");
 
 	if (dcp->adopted_session) {

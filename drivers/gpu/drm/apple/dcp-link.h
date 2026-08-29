@@ -717,15 +717,6 @@ static inline u64 apple_dcp_link_rpc_reply(u64 request)
 	       APPLE_DCP_LINK_MSG_RPC_REPLY;
 }
 
-static inline u64 apple_dcp_link_rpc_reply_cookie(u64 request, u16 cookie)
-{
-	u64 reply = apple_dcp_link_rpc_reply(request);
-
-	reply &= ~APPLE_DCP_LINK_MSG_VERSION;
-	reply |= FIELD_PREP(APPLE_DCP_LINK_MSG_VERSION, cookie);
-	return reply;
-}
-
 static inline int apple_dcp_link_rpc_decode(u64 message, void *buffer,
 					    u32 capacity,
 					    struct apple_dcp_link_rpc_view *view)

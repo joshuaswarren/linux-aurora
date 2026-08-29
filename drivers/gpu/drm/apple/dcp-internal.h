@@ -192,10 +192,6 @@ struct apple_dcp {
 	u64 link_init_message;
 	u16 link_rx_log_count;
 	u16 link_reply_log_count;
-	void __iomem *link_firmware_state;
-	u16 link_d563_diag_count;
-	u16 link_d563_last_cookie;
-	u16 link_d563_last_sequence;
 	/* Serializes firmware type0 with the inherited-session timed INIT. */
 	struct mutex link_init_lock;
 	enum apple_dcp_link_state link_state;
