@@ -278,13 +278,13 @@ static void apple_dcp_h17p_method_test(struct kunit *test)
 
 	service_call = APPLE_DCP_H17P_CALL_PMU_SERVICE_MATCHED;
 	KUNIT_ASSERT_EQ(test, apple_dcp_h17p_method(service_call, &method), 0);
-	KUNIT_EXPECT_EQ(test, method.call, 0x41313336U);
+	KUNIT_EXPECT_EQ(test, method.call, 0x41313331U);
 	KUNIT_EXPECT_EQ(test, method.input_size, 0U);
 	KUNIT_EXPECT_EQ(test, method.output_size, 4U);
 
 	service_call = APPLE_DCP_H17P_CALL_BACKLIGHT_SERVICE_MATCHED;
 	KUNIT_ASSERT_EQ(test, apple_dcp_h17p_method(service_call, &method), 0);
-	KUNIT_EXPECT_EQ(test, method.call, 0x41313337U);
+	KUNIT_EXPECT_EQ(test, method.call, 0x41313332U);
 	KUNIT_EXPECT_EQ(test, method.input_size, 0U);
 	KUNIT_EXPECT_EQ(test, method.output_size, 4U);
 
@@ -563,13 +563,13 @@ static void apple_dcp_h17p_service_match_wire_test(struct kunit *test)
 		0x00, 0x00, 0x00, 0x00,
 	};
 	static const u8 pmu_payload[0x10] = {
-		0x36, 0x33, 0x31, 0x41,
+		0x31, 0x33, 0x31, 0x41,
 		0x00, 0x00, 0x00, 0x00,
 		0x04, 0x00, 0x00, 0x00,
 		0x00, 0x00, 0x00, 0x00,
 	};
 	static const u8 backlight_payload[0x10] = {
-		0x37, 0x33, 0x31, 0x41,
+		0x32, 0x33, 0x31, 0x41,
 		0x00, 0x00, 0x00, 0x00,
 		0x04, 0x00, 0x00, 0x00,
 		0x00, 0x00, 0x00, 0x00,
