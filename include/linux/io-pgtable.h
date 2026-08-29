@@ -333,4 +333,15 @@ extern struct io_pgtable_init_fns io_pgtable_apple_dart_init_fns;
 int io_pgtable_apple_dart_import(struct io_pgtable_ops *ops,
 				 unsigned int ttbr, phys_addr_t paddr);
 
+struct io_pgtable_apple_dart_reconcile {
+	u64 first_pte_before;
+	u64 first_pte_after;
+	unsigned int changed;
+};
+
+int io_pgtable_apple_dart_reconcile(struct io_pgtable_ops *ops,
+				    unsigned long iova, phys_addr_t paddr,
+				    size_t size, int prot,
+				    struct io_pgtable_apple_dart_reconcile *result);
+
 #endif /* __IO_PGTABLE_H */
