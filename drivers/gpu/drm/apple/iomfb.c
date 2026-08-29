@@ -600,9 +600,15 @@ static void dcp_link_service_match_complete(struct apple_dcp *dcp, void *out,
 					    void *cookie)
 {
 	const struct dcp_method_entry *call = cookie;
+	int callback_tag = call == &dcp_link_pmu_service_matched ? 206 : 207;
+	int ret;
 
 	dev_info(dcp->dev, "DCPLink %.4s reply %#x\n", call->tag,
 		 le32_to_cpup((__le32 *)out));
+	ret = dcp_link_ack(dcp, DCP_CONTEXT_CB);
+	dev_info(dcp->dev,
+		 "DCPLink %.4s completed deferred D%03d ACK result %d\n",
+		 call->tag, callback_tag, ret);
 	dcp_link_service_match_done(dcp);
 }
 
@@ -649,7 +655,7 @@ static void dcp_link_service_match_work(struct work_struct *work)
 		return;
 	}
 
-	/* IOService matching notifiers run outside the firmware callback gate. */
+	/* Native service notifiers issue their nested call before callback ACK. */
 	ret = dcp_link_push_context(dcp, DCP_CONTEXT_OOBCMD, true, call, 0,
 				    sizeof(__le32), NULL,
 				    complete,
@@ -686,14 +692,11 @@ bool dcp_link_defer_service_match(struct apple_dcp *dcp, int tag, void *out,
 				  void *in)
 {
 	trace_iomfb_callback(dcp, tag, __func__);
-	if (tag == 100) {
-		dcp_link_queue_service_match(dcp, tag);
-		return false;
-	}
+	if (tag == 206 || tag == 207)
+		*(__le32 *)out = cpu_to_le32(1);
 
-	/* Native D206/D207 return true before their IOService notifier runs. */
-	*(__le32 *)out = cpu_to_le32(1);
-	return true;
+	dcp_link_queue_service_match(dcp, tag);
+	return false;
 }
 
 static int dcp_link_ack(struct apple_dcp *dcp,
@@ -958,12 +961,6 @@ static void dcp_link_handle_callback(struct apple_dcp *dcp, u64 message)
 			dev_info(dcp->dev,
 				 "DCPLink callback %u D%03d ACK %#llx send result %d\n",
 				 sequence, tag, reply, ack_ret);
-		if (!ack_ret && (tag == 206 || tag == 207)) {
-			dev_info(dcp->dev,
-				 "DCPLink D%03d ACKed; H17P service notifier queued\n",
-				 tag);
-			dcp_link_queue_service_match(dcp, tag);
-		}
 	}
 }
 
