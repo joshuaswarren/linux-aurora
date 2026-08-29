@@ -157,10 +157,14 @@ pub(crate) const fn retained_render_requires_recycle(
 /// Operations needed to dismantle a retained G17P runtime.
 ///
 /// Keeping the ordering in this testable helper makes the platform owner's
-/// `Drop` path explicit: hardware registration disappears before its storage,
-/// transports disappear before their CPUs stop, and manager resources are
-/// released last.
+/// `Drop` path explicit: both CPUs stop before any transport, queue, binding,
+/// or mapping can disappear. Manager/UAT resources are released last.
 pub(crate) trait PersistentRuntimeTeardown {
+    /// Stop both firmware processors. No firmware-visible owner may drop
+    /// unless this succeeds.
+    fn stop_cpu_pair(&mut self) -> bool;
+    /// Preserve every firmware-visible owner when CPU stop cannot be proven.
+    fn retain_after_stop_failure(&mut self);
     fn unregister_queue(&mut self);
     fn drop_queue(&mut self);
     fn drop_gfx1_rtkit(&mut self);
@@ -169,12 +173,16 @@ pub(crate) trait PersistentRuntimeTeardown {
     fn drop_manager(&mut self);
 }
 
-/// Tear down retained runtime state in the reverse of acquisition order.
+/// Tear down retained runtime state after proving firmware cannot dereference it.
 pub(crate) fn teardown_persistent_runtime<T: PersistentRuntimeTeardown>(owner: &mut T) {
+    if !owner.stop_cpu_pair() {
+        owner.retain_after_stop_failure();
+        return;
+    }
     owner.unregister_queue();
-    owner.drop_queue();
     owner.drop_gfx1_rtkit();
     owner.drop_gfx_rtkit();
+    owner.drop_queue();
     owner.drop_cpu_pair();
     owner.drop_manager();
 }
@@ -227,6 +235,7 @@ mod tests {
         DropGfxRtkit,
         DropCpuPair,
         DropManager,
+        RetainRuntime,
         PauseSubmissions,
         StopCpuPair,
         DisableSksmQueue,
@@ -616,9 +625,19 @@ mod tests {
 
     struct MockRuntimeTeardown {
         trace: std::vec::Vec<Event>,
+        stop_ok: bool,
     }
 
     impl PersistentRuntimeTeardown for MockRuntimeTeardown {
+        fn stop_cpu_pair(&mut self) -> bool {
+            self.trace.push(Event::StopCpuPair);
+            self.stop_ok
+        }
+
+        fn retain_after_stop_failure(&mut self) {
+            self.trace.push(Event::RetainRuntime);
+        }
+
         fn unregister_queue(&mut self) {
             self.trace.push(Event::UnregisterQueue);
         }
@@ -648,19 +667,31 @@ mod tests {
     fn persistent_runtime_teardown_is_strictly_reverse_ordered() {
         let mut owner = MockRuntimeTeardown {
             trace: std::vec::Vec::new(),
+            stop_ok: true,
         };
         teardown_persistent_runtime(&mut owner);
         assert_eq!(
             owner.trace,
             [
+                Event::StopCpuPair,
                 Event::UnregisterQueue,
-                Event::DropQueue,
                 Event::DropGfx1Rtkit,
                 Event::DropGfxRtkit,
+                Event::DropQueue,
                 Event::DropCpuPair,
                 Event::DropManager,
             ]
         );
+    }
+
+    #[test]
+    fn persistent_runtime_teardown_retains_every_owner_when_stop_fails() {
+        let mut owner = MockRuntimeTeardown {
+            trace: std::vec::Vec::new(),
+            stop_ok: false,
+        };
+        teardown_persistent_runtime(&mut owner);
+        assert_eq!(owner.trace, [Event::StopCpuPair, Event::RetainRuntime]);
     }
 
     struct MockRuntimeRecovery {

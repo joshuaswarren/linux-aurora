@@ -1362,6 +1362,46 @@ impl g17_lifecycle::PersistentRuntimeRecovery for G17PLiveRuntime {
 }
 
 impl g17_lifecycle::PersistentRuntimeTeardown for G17PLiveRuntime {
+    fn stop_cpu_pair(&mut self) -> bool {
+        let result = match self.cpus.as_mut() {
+            Some(cpus) => cpus.stop(),
+            None => Ok(()),
+        };
+        match result {
+            Ok(()) => true,
+            Err(error) => {
+                if let Some(pdev) = self.pdev.as_ref() {
+                    dev_err!(
+                        pdev.as_ref(),
+                        "G17P teardown: CPU stop failed ({:?}); retaining firmware-owned state\n",
+                        error
+                    );
+                } else {
+                    pr_err!(
+                        "G17P teardown: CPU stop failed ({:?}); retaining firmware-owned state\n",
+                        error
+                    );
+                }
+                false
+            }
+        }
+    }
+
+    fn retain_after_stop_failure(&mut self) {
+        self.accepting_submissions = false;
+        core::mem::forget(self.compute_binding.take());
+        core::mem::forget(self.queue.take());
+        core::mem::forget(self.gfx1_rtkit.take());
+        core::mem::forget(self.gfx1_state.take());
+        core::mem::forget(self.gfx_rtkit.take());
+        core::mem::forget(self.gfx_state.take());
+        core::mem::forget(self.cpus.take());
+        core::mem::forget(self.manager.take());
+        core::mem::forget(self.drm.take());
+        core::mem::forget(self.registers.take());
+        core::mem::forget(self.pdev.take());
+    }
+
     fn unregister_queue(&mut self) {
         if let (Some(manager), Some(registers), Some(queue)) = (
             self.manager.as_ref(),
