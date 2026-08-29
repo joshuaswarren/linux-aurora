@@ -2124,6 +2124,42 @@ impl Uat {
         Ok(())
     }
 
+    /// Restore the retained context-1 low root after a completed driver-owned
+    /// bootstrap render VM drops. Firmware has retired both queues before this
+    /// transition, and subsequent user binds may replace slot 1 normally.
+    pub(crate) fn restore_t8140_kernel_context_after_bootstrap_render(&self) -> Result {
+        if self.cfg != UatConfig::T8140 {
+            return Err(EINVAL);
+        }
+        let empty = self.t8140_empty_high_roots.as_ref().ok_or(EIO)?;
+        let low = self.kernel_lower_vm.ttb();
+        let inner = self.inner.lock();
+        inner.handoff().lock();
+        let ttbs = inner.ttbs();
+        if self.t8140_context_phase.load(Ordering::Acquire) != T8140_CONTEXT_USER_OWNED
+            || ttbs[0].ttb0.load(Ordering::Acquire) != (low | TTBR_VALID)
+        {
+            inner.handoff().unlock();
+            return Err(EIO);
+        }
+        ttbs[1].ttb0.store(
+            low | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT),
+            Ordering::Release,
+        );
+        ttbs[1].ttb1.store(
+            empty[1].ttb() | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT),
+            Ordering::Release,
+        );
+        self.t8140_context_phase
+            .store(T8140_CONTEXT_BOOTSTRAP_EMPTY_HIGH, Ordering::Release);
+        inner.handoff().unlock();
+        core::mem::drop(inner);
+
+        mem::tlbi_asid(1);
+        mem::sync();
+        Ok(())
+    }
+
     /// Restore the cold T8140 context table after both firmware processors stop.
     ///
     /// The caller must first drop every active [`VmBind`]. Existing user VMs

@@ -91,8 +91,9 @@ const G17P_RENDER_FRAGMENT_FIRMWARE_SCRATCH: usize = 0x3c000;
 
 const G17P_CONTROL_DIRECTORY_VA: u64 = 0x70_0000_0000;
 const G17P_CONTROL_DIRECTORY_SIZE: usize = 0x10000;
-pub(crate) const G17P_BOOTSTRAP_VDM_VA: u64 = 0x10_0001_8000;
-const G17P_BOOTSTRAP_VDM_SIZE: usize = 0x4000;
+pub(crate) const G17P_BOOTSTRAP_VDM_VA: u64 = G17P_CONTROL_OPERAND_BUFFER_BASE
+    + 27 * G17P_CONTROL_OPERAND_BUFFER_STRIDE as u64
+    + 0x100;
 const G17P_VDM_STREAM_TERMINATE: u32 = 6 << 29;
 const G17P_CONTROL_OPERAND_TABLE_VA: u64 = g17_initdata::CONTROL_OPERAND_TABLE_ADDRESS;
 const G17P_CONTROL_OPERAND_BUFFER_BASE: u64 = g17_initdata::CONTROL_OPERAND_BUFFER_BASE;
@@ -2568,7 +2569,6 @@ struct G17MappedResources {
     compute_runtime_zero_buffer_0: MappedObject,
     compute_runtime_zero_buffer_1: MappedObject,
     compute_runtime_class1_table: MappedObject,
-    bootstrap_vdm: MappedObject,
     compute_runtime_table_alias: mmu::KernelMapping,
     compute_runtime_buffer_aliases: KVec<mmu::KernelMapping>,
     register_windows: KVec<mmu::KernelMapping>,
@@ -2778,6 +2778,10 @@ impl G17ResourceOwner {
             G17P_CONTROL_OPERAND_BUFFER_COUNT,
             G17P_CONTROL_OPERAND_BUFFER_BASE
         );
+        control_operand_buffers[27].with_bytes_mut(|bytes| {
+            bytes[0x100..0x104].copy_from_slice(&G17P_VDM_STREAM_TERMINATE.to_le_bytes());
+            Ok(())
+        })?;
 
         let mut compute_runtime_support = map_fixed_wc_object(
             dev,
@@ -2819,29 +2823,36 @@ impl G17ResourceOwner {
             g17_initdata::COMPUTE_RUNTIME_CLASS1_TABLE_SIZE,
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
-        let mut bootstrap_vdm = map_fixed_wc_object(
-            dev,
-            address_space.uat.kernel_lower_vm(),
-            "bootstrap VDM terminate",
-            G17P_BOOTSTRAP_VDM_VA,
-            G17P_BOOTSTRAP_VDM_SIZE,
-            mmu::PROT_GPU_FW_SHARED_RW,
-        )?;
         let compute_runtime_table_alias = control_operand_table.map_at(
             address_space.uat.kernel_lower_vm(),
             g17_initdata::CONTROL_OPERAND_TABLE_ADDRESS,
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
-        let mut compute_runtime_buffer_aliases =
-            KVec::with_capacity(G17P_CONTROL_OPERAND_BUFFER_COUNT, GFP_KERNEL)?;
+        let mut compute_runtime_buffer_aliases = KVec::with_capacity(21, GFP_KERNEL)?;
         for (index, buffer) in control_operand_buffers.iter_mut().enumerate() {
+            if index > 18 && index != 22 && index != 27 {
+                continue;
+            }
             let address = g17p_control_operand_buffer_va(index).ok_or(EINVAL)?;
+            let mapping = match buffer.map_at(
+                address_space.uat.kernel_lower_vm(),
+                address,
+                mmu::PROT_GPU_FW_SHARED_RW,
+            ) {
+                Ok(mapping) => mapping,
+                Err(error) => {
+                    dev_err!(
+                        dev.as_ref(),
+                        "G17P resources: context-1 operand alias {} at {:#x} failed ({:?})\n",
+                        index,
+                        address,
+                        error
+                    );
+                    return Err(error);
+                }
+            };
             compute_runtime_buffer_aliases.push(
-                buffer.map_at(
-                    address_space.uat.kernel_lower_vm(),
-                    address,
-                    mmu::PROT_GPU_FW_SHARED_RW,
-                )?,
+                mapping,
                 GFP_KERNEL,
             )?;
         }
@@ -2855,11 +2866,6 @@ impl G17ResourceOwner {
         })?;
         compute_runtime_class1_table.with_bytes_mut(|bytes| {
             g17_initdata::encode_compute_runtime_class1_table(bytes).map_err(|_| EINVAL)
-        })?;
-        bootstrap_vdm.with_bytes_mut(|bytes| {
-            bytes.fill(0);
-            bytes[..4].copy_from_slice(&G17P_VDM_STREAM_TERMINATE.to_le_bytes());
-            Ok(())
         })?;
         let page_list = control_operand_buffers
             .iter_mut()
@@ -3062,7 +3068,6 @@ impl G17ResourceOwner {
             ("compute runtime zero buffer 0", &compute_runtime_zero_buffer_0),
             ("compute runtime zero buffer 1", &compute_runtime_zero_buffer_1),
             ("compute runtime class-1 table", &compute_runtime_class1_table),
-            ("bootstrap VDM terminate", &bootstrap_vdm),
         ] {
             if !address_space.uat.kernel_lower_vm().covers_range(
                 object.iova(),
@@ -3102,6 +3107,23 @@ impl G17ResourceOwner {
             );
             return Err(EIO);
         }
+        if !address_space.uat.kernel_lower_vm().covers_range(
+            G17P_BOOTSTRAP_VDM_VA,
+            core::mem::size_of::<u32>() as u64,
+            false,
+            false,
+        ) {
+            dev_err!(
+                dev.as_ref(),
+                "G17P resources: bootstrap VDM at {:#x} is not reachable in context 1\n",
+                G17P_BOOTSTRAP_VDM_VA
+            );
+            return Err(EIO);
+        }
+        dev_info!(
+            dev.as_ref(),
+            "G17P resources: bootstrap VDM retained at operand buffer 27 +0x100\n"
+        );
         if !all_ranges_covered(
             register_windows
                 .iter()
@@ -3208,7 +3230,6 @@ impl G17ResourceOwner {
                 compute_runtime_zero_buffer_0,
                 compute_runtime_zero_buffer_1,
                 compute_runtime_class1_table,
-                bootstrap_vdm,
                 compute_runtime_table_alias,
                 compute_runtime_buffer_aliases,
                 register_windows,
@@ -3515,9 +3536,8 @@ impl G17ResourceOwner {
             .with_bytes_mut(|bytes| {
                 g17_initdata::encode_compute_runtime_class1_table(bytes).map_err(|_| EINVAL)
             })?;
-        self.resources.bootstrap_vdm.with_bytes_mut(|bytes| {
-            bytes.fill(0);
-            bytes[..4].copy_from_slice(&G17P_VDM_STREAM_TERMINATE.to_le_bytes());
+        self.resources.control_operand_buffers[27].with_bytes_mut(|bytes| {
+            bytes[0x100..0x104].copy_from_slice(&G17P_VDM_STREAM_TERMINATE.to_le_bytes());
             Ok(())
         })?;
         let page_list = self
@@ -4579,6 +4599,14 @@ mod tests {
         for b2 in g17_initdata::REGION_VIEW_LOW_ADDRS {
             assert!(slot_21 <= b2 && b2 < slot_21_end);
         }
+        let bootstrap_buffer = g17p_control_operand_buffer_va(27).unwrap();
+        assert_eq!(G17P_BOOTSTRAP_VDM_VA, bootstrap_buffer + 0x100);
+        assert!(G17P_BOOTSTRAP_VDM_VA >= slot_21_end);
+        assert!(
+            G17P_BOOTSTRAP_VDM_VA
+                >= g17_initdata::COMPUTE_RUNTIME_CLASS1_TABLE_ADDRESS
+                    + g17_initdata::COMPUTE_RUNTIME_CLASS1_TABLE_SIZE as u64
+        );
     }
 
     #[test]
