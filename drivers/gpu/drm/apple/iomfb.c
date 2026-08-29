@@ -454,9 +454,24 @@ static void dcp_link_service_match_complete(struct apple_dcp *dcp, void *out,
 					    void *cookie)
 {
 	const struct dcp_method_entry *call = cookie;
+	struct dcp_channel *callback = &dcp->ch_cb;
+	u8 depth;
+	int ret;
 
 	dev_info(dcp->dev, "DCPLink %.4s reply %#x\n", call->tag,
 		 le32_to_cpup((__le32 *)out));
+	if (!callback->depth) {
+		dev_warn(dcp->dev,
+			 "DCPLink %.4s reply has no deferred service callback\n",
+			 call->tag);
+	} else {
+		depth = callback->depth - 1;
+		*(__le32 *)callback->output[depth] = cpu_to_le32(1);
+		ret = dcp_link_ack(dcp, DCP_CONTEXT_CB);
+		dev_info(dcp->dev,
+			 "DCPLink %.4s completed deferred service callback ACK result %d\n",
+			 call->tag, ret);
+	}
 	clear_bit(DCP_LINK_SERVICE_MATCH_INFLIGHT,
 		  &dcp->link_service_match_state);
 	if (test_bit(DCP_LINK_SERVICE_MATCH_PMU,
@@ -521,6 +536,16 @@ static void dcp_link_record_service_match(struct apple_dcp *dcp, int tag)
 			&dcp->link_service_match_state);
 
 	schedule_work(&dcp->link_service_match_work);
+}
+
+bool dcp_link_defer_service_match(struct apple_dcp *dcp, int tag, void *out,
+				  void *in)
+{
+	trace_iomfb_callback(dcp, tag, __func__);
+	dcp_link_record_service_match(dcp, tag);
+
+	/* The matching-notification RPC must complete before this callback ACKs. */
+	return false;
 }
 
 static int dcp_link_ack(struct apple_dcp *dcp,
@@ -778,8 +803,6 @@ static void dcp_link_handle_callback(struct apple_dcp *dcp, u64 message)
 			dev_info(dcp->dev,
 				 "DCPLink callback %u D%03d ACK %#llx send result %d\n",
 				 sequence, tag, reply, ack_ret);
-		if (!ack_ret && (tag == 206 || tag == 207))
-			dcp_link_record_service_match(dcp, tag);
 	}
 }
 
