@@ -154,7 +154,25 @@ static void dcp_link_sync_for_cpu(void)
 
 static void dcp_link_sync_for_device(void)
 {
-	dma_wmb();
+	/*
+	 * AppleDCPLinkService releases RTBuddy ownership after updating shared
+	 * memory. For the inherited Normal-NC mapping there are no AP cache lines
+	 * to clean, but the stores must reach the point of coherency before a
+	 * mailbox message can make the DCP consume them. dma_wmb() only orders the
+	 * stores; wmb() also completes them before the message is enqueued.
+	 */
+	wmb();
+}
+
+static void dcp_link_log_init(struct apple_dcp *dcp,
+			      const struct apple_dcp_link_init_desc *desc,
+			      u64 message)
+{
+	dev_info(dcp->dev,
+		 "DCPLink INIT %#llx descriptor shared %#llx flags %#x version %u\n",
+		 message, le64_to_cpu(READ_ONCE(desc->shared_dva)),
+		 le32_to_cpu(READ_ONCE(desc->flags)),
+		 le32_to_cpu(READ_ONCE(desc->version)));
 }
 
 /* Get the start of a packet: after the end of the previous packet */
@@ -672,6 +690,7 @@ static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 			/* The kext publishes the descriptor only after EP37 is up. */
 			apple_dcp_link_init_desc_encode(desc, 0, false);
 			dcp_link_sync_for_device();
+			dcp_link_log_init(dcp, desc, captured_message);
 			ret = dcp_send_message_sync(dcp,
 						    APPLE_DCP_LINK_ENDPOINT,
 						    captured_message);
@@ -725,6 +744,7 @@ static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 		dcp->link_version = 0;
 		dcp->link_firmware_hash = 0;
 		dcp_link_sync_for_device();
+		dcp_link_log_init(dcp, desc, captured_message);
 		ret = dcp_send_message_sync(dcp, APPLE_DCP_LINK_ENDPOINT, captured_message);
 		if (ret) {
 			dev_err(dcp->dev,
@@ -770,6 +790,7 @@ err_unmap_inherited:
 	/* Match AppleDCPLinkService: bring up EP37 before publishing INIT state. */
 	apple_dcp_link_init_desc_encode(desc, 0, false);
 	dcp_link_sync_for_device();
+	dcp_link_log_init(dcp, desc, init_message);
 	ret = dcp_send_message_sync(dcp, APPLE_DCP_LINK_ENDPOINT, init_message);
 	if (ret)
 		return dev_err_probe(dcp->dev, ret,
