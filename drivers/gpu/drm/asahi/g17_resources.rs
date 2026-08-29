@@ -4218,7 +4218,7 @@ impl G17ResourceOwner {
         let table_mapping = match self.resources.control_operand_table.map_at(
             vm,
             G17P_CONTROL_OPERAND_TABLE_VA,
-            mmu::PROT_GPU_FW_SHARED_RW,
+            mmu::PROT_GPU_SHARED_RW,
         ) {
             Ok(mapping) => mapping,
             Err(error) => {
@@ -4239,7 +4239,7 @@ impl G17ResourceOwner {
             .enumerate()
         {
             let address = g17p_control_operand_buffer_va(index).ok_or(EINVAL)?;
-            let mapping = match buffer.map_at(vm, address, mmu::PROT_GPU_FW_SHARED_RW) {
+            let mapping = match buffer.map_at(vm, address, mmu::PROT_GPU_SHARED_RW) {
                 Ok(mapping) => mapping,
                 Err(error) => {
                     dev_err!(
@@ -4254,6 +4254,12 @@ impl G17ResourceOwner {
             };
             mappings.push(mapping, GFP_KERNEL)?;
         }
+        dev_info!(
+            self.dev.as_ref(),
+            "G17P VM: operand graph mapped GPU-shared; entry18={:#x}\n",
+            g17p_control_operand_buffer_va(18).ok_or(EINVAL)?
+                | g17_initdata::CONTROL_OPERAND_ENTRY_FLAG
+        );
         mappings.push(
             match self.resources.partial_primary_index.map_alias_at(
                 vm,
