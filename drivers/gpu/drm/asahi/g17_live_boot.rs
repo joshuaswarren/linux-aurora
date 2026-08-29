@@ -68,6 +68,11 @@ const CONTROL_DONE_CHANNEL: u64 = 0x11;
 const INITDATA_ACK_POLLS: usize = 200;
 const CONTROL_COUNTER_POLLS: usize = 100;
 const G17P_CRASHLOG_MAX_BYTES: usize = 256 * 1024;
+const G17P_RTKIT_UAT_DVA_MASK: u64 = (1u64 << 40) - 1;
+
+const fn g17p_rtkit_uat_address(dva: u64) -> u64 {
+    dva & G17P_RTKIT_UAT_DVA_MASK
+}
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[repr(u32)]
@@ -123,6 +128,8 @@ const _: () = {
     let gfx = G17PProcessor::Gfx.firmware_crash_buffer();
     let gfx1 = G17PProcessor::Gfx1.firmware_crash_buffer();
     assert!(gfx.dva == 0x100_01e1_c000 && gfx1.dva == 0x100_01f5_0000);
+    assert!(g17p_rtkit_uat_address(gfx.dva) == 0x01e1_c000);
+    assert!(g17p_rtkit_uat_address(gfx1.dva) == 0x01f5_0000);
     assert!(gfx.size == 0x8000 && gfx1.size == 0x8000);
     assert!(gfx.dva & (mmu::UAT_PGSZ as u64 - 1) == 0);
     assert!(gfx1.dva & (mmu::UAT_PGSZ as u64 - 1) == 0);
@@ -205,6 +212,7 @@ fn publish_g17p_crashlog(
     let mut crashdump = crate::crashdump::CrashDumpBuilder::new(KVVec::new())?;
     crashdump.add_rtkit_crash_info(
         state.processor as u32,
+        state.processor.firmware_crash_buffer().dva,
         original_size,
         crashlog.len(),
     )?;
@@ -224,19 +232,13 @@ fn publish_g17p_crashlog(
 fn capture_g17p_firmware_crash_dva(state: &G17PRoleRtkitState) -> Result {
     let buffer = state.processor.firmware_crash_buffer();
     let captured_size = bounded_crashlog_size(buffer.size);
-    // T8140 has a 42-bit UAT. The endpoint-1 value is already the complete
-    // 41-bit DVA; truncating it to the older 36-bit width turns
-    // 0x10001e1c000 into the unrelated 0x1e1c000.
-    let active = state
-        .crash_vm
-        .lock()
-        .copy_firmware_range(buffer.dva, captured_size);
-    let crashlog = match active {
-        Ok(crashlog) => crashlog,
-        Err(_) => state
-            .retained_crash_vm
-            .copy_firmware_range(buffer.dva, captured_size)?,
-    };
+    // AGXASC reads endpoint-1 buffers through UAT context 0 after masking
+    // the RTKit envelope DVA to 40 bits. The active render VM is context 1
+    // and cannot own this firmware-preallocated buffer.
+    let crashlog = state.retained_crash_vm.copy_firmware_range(
+        g17p_rtkit_uat_address(buffer.dva),
+        captured_size,
+    )?;
     publish_g17p_crashlog(state, buffer.size, &crashlog)
 }
 

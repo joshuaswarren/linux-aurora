@@ -38,12 +38,14 @@ pub(crate) struct RTKitCrashInfo {
     version: u32,
     /// Zero for GFX and one for GFX1.
     processor: u32,
+    /// Full firmware-advertised RTKit DVA before address-space masking.
+    dva: u64,
     /// Firmware-advertised bytes and the bounded bytes copied into this dump.
     original_size: u64,
     captured_size: u64,
 }
 
-const _: () = assert!(size_of::<RTKitCrashInfo>() == 24);
+const _: () = assert!(size_of::<RTKitCrashInfo>() == 32);
 
 #[repr(C)]
 pub(crate) struct AGXDumpInfo {
@@ -158,12 +160,14 @@ impl CrashDumpBuilder {
     pub(crate) fn add_rtkit_crash_info(
         &mut self,
         processor: u32,
+        dva: u64,
         original_size: usize,
         captured_size: usize,
     ) -> Result {
         let info = RTKitCrashInfo {
-            version: 1,
+            version: 2,
             processor,
+            dva,
             original_size: original_size as u64,
             captured_size: captured_size as u64,
         };
