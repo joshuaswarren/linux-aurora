@@ -1417,6 +1417,9 @@ impl G17PManagerConstruction {
                 shared_control,
                 queue.storage.channel_control_gpu_va(),
             )?;
+        // Purely precompute the host-only sequence token and notification
+        // predicates. Retained state is not committed until after the SKSM
+        // producer transition, matching the native correlation chronology.
         let lifecycle = g17_submission::prepare_g17p_direct_cl_lifecycle(
             queue.direct_lifecycle,
             group.queue,
@@ -1445,6 +1448,7 @@ impl G17PManagerConstruction {
         let descriptor_generation =
             g17_submission::advance_g17p_compute_descriptor_generation(0, 0)
                 .map_err(|_| EINVAL)?;
+        queue.direct_lifecycle = lifecycle.next;
         queue
             .compute
             .publish_initial_entry_signal(&entry_signal)?;
@@ -1466,7 +1470,6 @@ impl G17PManagerConstruction {
         if lifecycle.notifications.activation != Some(prepared.doorbell) {
             return Err(EINVAL);
         }
-        queue.direct_lifecycle = lifecycle.next;
         queue.submission_ordinal = 1;
         Ok(lifecycle.notifications)
     }
