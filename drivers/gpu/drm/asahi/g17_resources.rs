@@ -99,9 +99,11 @@ const G17P_CONTROL_DIRECTORY_SIZE: usize = 0x20_0000;
 // leaf observed on GFX1 was base +0x17c000, inside this exact source-built run.
 const G17P_NATIVE_PRIVATE_CLUSTER_OFFSET: u64 = 0x0002_0000;
 const G17P_NATIVE_PRIVATE_CLUSTER_SIZE: usize = 0x0017_8000;
-pub(crate) const G17P_BOOTSTRAP_VDM_VA: u64 = G17P_CONTROL_OPERAND_BUFFER_BASE
-    + 27 * G17P_CONTROL_OPERAND_BUFFER_STRIDE as u64
-    + 0x100;
+/// Exact executable extent used by the positive first-partial render root.
+pub(crate) const G17P_BOOTSTRAP_VDM_VA: u64 = 0x10_0001_8000;
+const G17P_BOOTSTRAP_VDM_SIZE: usize = 0x8000;
+const G17P_BOOTSTRAP_CONTEXT_BASE: u64 = 0x10_0000_0000;
+const G17P_BOOTSTRAP_CONTEXT_SIZE: usize = 0x1_0000;
 const G17P_VDM_STREAM_TERMINATE: u32 = 6 << 29;
 const G17P_CONTROL_OPERAND_TABLE_VA: u64 = g17_initdata::CONTROL_OPERAND_TABLE_ADDRESS;
 const G17P_CONTROL_OPERAND_BUFFER_BASE: u64 = g17_initdata::CONTROL_OPERAND_BUFFER_BASE;
@@ -994,6 +996,26 @@ fn map_fresh_zero_object_at(
 }
 
 #[cfg(not(test))]
+fn map_bootstrap_vdm_at(dev: &AsahiDevice, vm: &mmu::Vm) -> Result<mmu::KernelMapping> {
+    let mut object = gem::new_kernel_object_wc(dev, G17P_BOOTSTRAP_VDM_SIZE)?;
+    let mut vmap = object.vmap()?;
+    vmap.memset(0);
+    let bytes = unsafe {
+        // SAFETY: the VMap covers the complete bootstrap VDM allocation.
+        core::slice::from_raw_parts_mut(vmap.as_mut_ptr(), G17P_BOOTSTRAP_VDM_SIZE)
+    };
+    bytes[..core::mem::size_of::<u32>()]
+        .copy_from_slice(&G17P_VDM_STREAM_TERMINATE.to_le_bytes());
+    core::mem::drop(vmap);
+    object.map_at(
+        vm,
+        G17P_BOOTSTRAP_VDM_VA,
+        mmu::PROT_GPU_FW_SHARED_RW,
+        false,
+    )
+}
+
+#[cfg(not(test))]
 fn write_status_block_at(object: &mut MappedObject, offset: usize) -> Result {
     let end = offset
         .checked_add(g17_initdata::STATUS_BLOCK_SIZE)
@@ -1793,7 +1815,15 @@ impl G17PUserRenderStorage {
         let render_state_va = render_state.iova();
         let timestamp_va = timestamps.iova();
         let mut translated = *command;
-        translated.parameters.context_base = render_state_va;
+        let bootstrap_vdm = translated.parameters.encoder == G17P_BOOTSTRAP_VDM_VA;
+        if bootstrap_vdm && translated.parameters.context_base != G17P_BOOTSTRAP_CONTEXT_BASE {
+            return Err(EINVAL);
+        }
+        translated.parameters.context_base = if bootstrap_vdm {
+            G17P_BOOTSTRAP_CONTEXT_BASE
+        } else {
+            render_state_va
+        };
         translated.parameters.deflake_3 = render_state_va + G17P_RENDER_STATE_DEFLAKE as u64;
         translated.parameters.deflake_2 = translated.parameters.deflake_3 + 0x20;
         translated.parameters.deflake_1 = translated.parameters.deflake_3 + 0x2a0;
@@ -1821,6 +1851,12 @@ impl G17PUserRenderStorage {
                 mmu::UAT_PGSZ as u64,
                 true,
                 true,
+            ),
+            (
+                translated.parameters.encoder,
+                core::mem::size_of::<u32>() as u64,
+                true,
+                false,
             ),
             (
                 translated.parameters.tilemap,
@@ -2850,11 +2886,6 @@ impl G17ResourceOwner {
             G17P_CONTROL_OPERAND_BUFFER_COUNT,
             G17P_CONTROL_OPERAND_BUFFER_BASE
         );
-        control_operand_buffers[27].with_bytes_mut(|bytes| {
-            bytes[0x100..0x104].copy_from_slice(&G17P_VDM_STREAM_TERMINATE.to_le_bytes());
-            Ok(())
-        })?;
-
         let mut compute_runtime_support = map_fixed_wc_object(
             dev,
             address_space.uat.kernel_vm(),
@@ -2900,9 +2931,9 @@ impl G17ResourceOwner {
             g17_initdata::CONTROL_OPERAND_TABLE_ADDRESS,
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
-        let mut compute_runtime_buffer_aliases = KVec::with_capacity(21, GFP_KERNEL)?;
+        let mut compute_runtime_buffer_aliases = KVec::with_capacity(20, GFP_KERNEL)?;
         for (index, buffer) in control_operand_buffers.iter_mut().enumerate() {
-            if index > 18 && index != 22 && index != 27 {
+            if index > 18 && index != 22 {
                 continue;
             }
             let address = g17p_control_operand_buffer_va(index).ok_or(EINVAL)?;
@@ -3180,23 +3211,6 @@ impl G17ResourceOwner {
             );
             return Err(EIO);
         }
-        if !address_space.uat.kernel_lower_vm().covers_range(
-            G17P_BOOTSTRAP_VDM_VA,
-            core::mem::size_of::<u32>() as u64,
-            false,
-            false,
-        ) {
-            dev_err!(
-                dev.as_ref(),
-                "G17P resources: bootstrap VDM at {:#x} is not reachable in context 1\n",
-                G17P_BOOTSTRAP_VDM_VA
-            );
-            return Err(EIO);
-        }
-        dev_info!(
-            dev.as_ref(),
-            "G17P resources: bootstrap VDM retained at operand buffer 27 +0x100\n"
-        );
         if !all_ranges_covered(
             register_windows
                 .iter()
@@ -3616,10 +3630,6 @@ impl G17ResourceOwner {
             .with_bytes_mut(|bytes| {
                 g17_initdata::encode_compute_runtime_class1_table(bytes).map_err(|_| EINVAL)
             })?;
-        self.resources.control_operand_buffers[27].with_bytes_mut(|bytes| {
-            bytes[0x100..0x104].copy_from_slice(&G17P_VDM_STREAM_TERMINATE.to_le_bytes());
-            Ok(())
-        })?;
         let page_list = self
             .resources
             .control_operand_buffers
@@ -3730,9 +3740,13 @@ impl G17ResourceOwner {
 
     /// Install every hardware-fixed low alias before the VM is exposed to
     /// userspace and retain it for that VM's complete lifetime.
-    pub(crate) fn install_user_vm_aliases(&mut self, vm: &mmu::Vm) -> Result {
+    pub(crate) fn install_user_vm_aliases(
+        &mut self,
+        vm: &mmu::Vm,
+        bootstrap_vdm: bool,
+    ) -> Result {
         let mut mappings = KVec::with_capacity(
-            G17P_CONTROL_OPERAND_BUFFER_COUNT + 3,
+            G17P_CONTROL_OPERAND_BUFFER_COUNT + if bootstrap_vdm { 5 } else { 3 },
             GFP_KERNEL,
         )?;
         let mut reserved_ranges = KVec::new();
@@ -3756,6 +3770,21 @@ impl G17ResourceOwner {
             },
             GFP_KERNEL,
         )?;
+        if bootstrap_vdm {
+            mappings.push(
+                map_fresh_zero_object_at(
+                    &self.dev,
+                    vm,
+                    G17P_BOOTSTRAP_CONTEXT_BASE,
+                    G17P_BOOTSTRAP_CONTEXT_SIZE,
+                )?,
+                GFP_KERNEL,
+            )?;
+            mappings.push(
+                map_bootstrap_vdm_at(&self.dev, vm)?,
+                GFP_KERNEL,
+            )?;
+        }
         let table_mapping = match self.resources.control_operand_table.map_at(
             vm,
             G17P_CONTROL_OPERAND_TABLE_VA,
@@ -4791,14 +4820,15 @@ mod tests {
         for b2 in g17_initdata::REGION_VIEW_LOW_ADDRS {
             assert!(slot_21 <= b2 && b2 < slot_21_end);
         }
-        let bootstrap_buffer = g17p_control_operand_buffer_va(27).unwrap();
-        assert_eq!(G17P_BOOTSTRAP_VDM_VA, bootstrap_buffer + 0x100);
-        assert!(G17P_BOOTSTRAP_VDM_VA >= slot_21_end);
+        assert_eq!(G17P_BOOTSTRAP_CONTEXT_BASE, 0x10_0000_0000);
+        assert_eq!(G17P_BOOTSTRAP_CONTEXT_SIZE, 0x1_0000);
+        assert_eq!(G17P_BOOTSTRAP_VDM_VA, 0x10_0001_8000);
+        assert_eq!(G17P_BOOTSTRAP_VDM_SIZE, 0x8000);
         assert!(
-            G17P_BOOTSTRAP_VDM_VA
-                >= g17_initdata::COMPUTE_RUNTIME_CLASS1_TABLE_ADDRESS
-                    + g17_initdata::COMPUTE_RUNTIME_CLASS1_TABLE_SIZE as u64
+            G17P_BOOTSTRAP_CONTEXT_BASE + G17P_BOOTSTRAP_CONTEXT_SIZE as u64
+                <= G17P_BOOTSTRAP_VDM_VA
         );
+        assert!(G17P_BOOTSTRAP_VDM_VA + G17P_BOOTSTRAP_VDM_SIZE as u64 <= directory.start);
     }
 
     #[test]
