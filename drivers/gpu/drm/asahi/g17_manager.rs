@@ -392,18 +392,22 @@ impl G17PManagerConstruction {
         soc: &'static agx3::SocConfig,
         platform: G17PPlatformConfig,
         num_clusters: u32,
-    ) -> Result<Self> {
+    ) -> Result<KBox<Self>> {
         let uat = KBox::new(mmu::Uat::new_t8140(dev, true)?, GFP_KERNEL)?;
         Self::new_with_uat(dev, soc, platform, num_clusters, uat)
     }
 
+    /// Kept out of line and heap-returned: the construction locals plus the
+    /// assembled manager otherwise land several times in the probe-path stack
+    /// frames, which overflowed the 32 KiB task stack on hardware.
+    #[inline(never)]
     pub(crate) fn new_with_uat(
         dev: &AsahiDevice,
         soc: &'static agx3::SocConfig,
         platform: G17PPlatformConfig,
         num_clusters: u32,
         uat: KBox<mmu::Uat>,
-    ) -> Result<Self> {
+    ) -> Result<KBox<Self>> {
         if num_clusters == 0 {
             return Err(EINVAL);
         }
@@ -415,15 +419,18 @@ impl G17PManagerConstruction {
         validate_resources(resource_observation(resources.handoff(), resources.uat()))
             .map_err(|_| EINVAL)?;
 
-        Ok(Self {
-            resources,
-            platform,
-            num_clusters,
-            render_storage: None,
-            render_tracker: None,
-            render_bind: None,
-            render_submission_ordinal: 0,
-        })
+        Ok(KBox::new(
+            Self {
+                resources,
+                platform,
+                num_clusters,
+                render_storage: None,
+                render_tracker: None,
+                render_bind: None,
+                render_submission_ordinal: 0,
+            },
+            GFP_KERNEL,
+        )?)
     }
 
     pub(crate) fn config(&self) -> &'static T8140ManagerConfig {

@@ -1049,6 +1049,7 @@ fn boot_session(
     )
 }
 
+#[inline(never)]
 fn boot_initial_session(
     pdev: &platform::Device,
     drm: &ARef<AsahiDevice>,
@@ -1056,7 +1057,7 @@ fn boot_initial_session(
     soc: &'static hw::agx3::SocConfig,
     num_clusters: u32,
     test_stage: G17PTestStage,
-) -> Result<(g17_manager::G17PManagerConstruction, G17PBootedSession)> {
+) -> Result<(KBox<g17_manager::G17PManagerConstruction>, G17PBootedSession)> {
     let gfx = AscwrapV6Provider::get(pdev.as_ref(), 0)?;
     let gfx_lifecycle = validate_provider(&gfx, GFX_PROVIDER)?;
     let gfx1 = AscwrapV6Provider::get(pdev.as_ref(), 1)?;
@@ -1177,7 +1178,7 @@ pub(crate) struct G17PLiveRuntime {
     pdev: Option<ARef<platform::Device>>,
     drm: Option<ARef<AsahiDevice>>,
     registers: Option<regs::Resources>,
-    manager: Option<g17_manager::G17PManagerConstruction>,
+    manager: Option<KBox<g17_manager::G17PManagerConstruction>>,
     cpus: Option<g17_lifecycle::StartedCpuPair<AscwrapV6Provider>>,
     gfx_state: Option<Arc<G17PRoleRtkitState>>,
     gfx_rtkit: Option<rtkit::RtKit<G17PRtkitOps>>,
