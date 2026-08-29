@@ -36,6 +36,8 @@ use kernel::{
     sync::Arc,
     time::{delay::fsleep, Delta},
 };
+#[cfg(CONFIG_DEV_COREDUMP)]
+use kernel::{devcoredump, time::msecs_to_jiffies};
 
 use crate::{
     driver::{AsahiDevice, T8140LiveTopologyAdmission},
@@ -64,6 +66,37 @@ const CONTROL_DONE_TYPE: u16 = 0x84;
 const CONTROL_DONE_CHANNEL: u64 = 0x11;
 const INITDATA_ACK_POLLS: usize = 200;
 const CONTROL_COUNTER_POLLS: usize = 100;
+const G17P_CRASHLOG_MAX_BYTES: usize = 256 * 1024;
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[repr(u32)]
+enum G17PProcessor {
+    Gfx = 0,
+    Gfx1 = 1,
+}
+
+impl G17PProcessor {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Gfx => "GFX",
+            Self::Gfx1 => "GFX1",
+        }
+    }
+}
+
+const fn bounded_crashlog_size(size: usize) -> usize {
+    if size < G17P_CRASHLOG_MAX_BYTES {
+        size
+    } else {
+        G17P_CRASHLOG_MAX_BYTES
+    }
+}
+
+const _: () = {
+    assert!(bounded_crashlog_size(0) == 0);
+    assert!(bounded_crashlog_size(4096) == 4096);
+    assert!(bounded_crashlog_size(G17P_CRASHLOG_MAX_BYTES + 1) == G17P_CRASHLOG_MAX_BYTES);
+};
 
 /// Load-time boundary for short, independent hardware experiments.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -104,19 +137,44 @@ impl G17PTestStage {
 /// dropped. The callback only publishes atomics; probe owns every mutation of
 /// manager and queue state.
 struct G17PRoleRtkitState {
+    dev: ARef<AsahiDevice>,
+    processor: G17PProcessor,
     acked: AtomicBool,
     crashed: AtomicBool,
     runtime_events: AtomicU32,
 }
 
 impl G17PRoleRtkitState {
-    fn new() -> Self {
+    fn new(dev: ARef<AsahiDevice>, processor: G17PProcessor) -> Self {
         Self {
+            dev,
+            processor,
             acked: AtomicBool::new(false),
             crashed: AtomicBool::new(false),
             runtime_events: AtomicU32::new(0),
         }
     }
+}
+
+#[cfg(CONFIG_DEV_COREDUMP)]
+fn publish_g17p_crashlog(state: &G17PRoleRtkitState, crashlog: &[u8]) -> Result {
+    let captured_size = bounded_crashlog_size(crashlog.len());
+    let mut crashdump = crate::crashdump::CrashDumpBuilder::new(KVVec::new())?;
+    crashdump.add_rtkit_crash_info(
+        state.processor as u32,
+        crashlog.len(),
+        captured_size,
+    )?;
+    crashdump.add_crashlog(&crashlog[..captured_size])?;
+    let crashdump = KBox::new(crashdump.finalize()?, GFP_KERNEL)?;
+    devcoredump::dev_coredump(
+        state.dev.as_ref(),
+        &crate::THIS_MODULE,
+        crashdump,
+        GFP_KERNEL,
+        msecs_to_jiffies(60 * 60 * 1000),
+    );
+    Ok(())
 }
 
 /// Active G17P boot does not ask Rust to back system-endpoint buffers. The
@@ -171,9 +229,22 @@ impl rtkit::Operations for G17PRtkitOps {
 
     fn crashed(
         data: <Self::Data as kernel::types::ForeignOwnable>::Borrowed<'_>,
-        _crashlog: Option<&[u8]>,
+        crashlog: Option<&[u8]>,
     ) {
         data.crashed.store(true, Ordering::Release);
+        #[cfg(CONFIG_DEV_COREDUMP)]
+        if let Some(crashlog) = crashlog {
+            if let Err(error) = publish_g17p_crashlog(&data, crashlog) {
+                dev_err!(
+                    data.dev.as_ref(),
+                    "G17P {} crashlog coredump failed ({:?})\n",
+                    data.processor.name(),
+                    error
+                );
+            }
+        }
+        #[cfg(not(CONFIG_DEV_COREDUMP))]
+        let _ = crashlog;
     }
 }
 
@@ -253,8 +324,14 @@ fn boot_session(
     }
     dev_info!(pdev.as_ref(), "G17P session: providers ready\n");
 
-    let gfx_state = Arc::new(G17PRoleRtkitState::new(), GFP_KERNEL)?;
-    let gfx1_state = Arc::new(G17PRoleRtkitState::new(), GFP_KERNEL)?;
+    let gfx_state = Arc::new(
+        G17PRoleRtkitState::new(drm.clone(), G17PProcessor::Gfx),
+        GFP_KERNEL,
+    )?;
+    let gfx1_state = Arc::new(
+        G17PRoleRtkitState::new(drm.clone(), G17PProcessor::Gfx1),
+        GFP_KERNEL,
+    )?;
     let mut gfx_rtkit =
         rtkit::RtKit::<G17PRtkitOps>::new_g17p(drm.as_ref(), None, 0, gfx_state.clone())?;
     let mut gfx1_rtkit =
