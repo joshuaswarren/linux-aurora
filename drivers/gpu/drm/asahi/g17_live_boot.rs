@@ -24,6 +24,7 @@
 use core::sync::atomic::{fence, AtomicBool, AtomicU32, Ordering};
 
 use kernel::macros::vtable;
+use kernel::new_mutex;
 use kernel::{
     device::Core,
     iosys_map::IoSysMapRef,
@@ -33,7 +34,7 @@ use kernel::{
         mailbox::{AscwrapV6Lifecycle, AscwrapV6Provider, AscwrapV6Role},
         rtkit,
     },
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{delay::fsleep, Delta},
 };
 #[cfg(CONFIG_DEV_COREDUMP)]
@@ -173,22 +174,26 @@ impl G17PTestStage {
 struct G17PRoleRtkitState {
     dev: ARef<AsahiDevice>,
     processor: G17PProcessor,
-    crash_vm: mmu::Vm,
+    crash_vm: Arc<Mutex<mmu::Vm>>,
     acked: AtomicBool,
     crashed: AtomicBool,
     runtime_events: AtomicU32,
 }
 
 impl G17PRoleRtkitState {
-    fn new(dev: ARef<AsahiDevice>, processor: G17PProcessor, crash_vm: mmu::Vm) -> Self {
-        Self {
+    fn new(dev: ARef<AsahiDevice>, processor: G17PProcessor, crash_vm: mmu::Vm) -> Result<Self> {
+        Ok(Self {
             dev,
             processor,
-            crash_vm,
+            crash_vm: Arc::pin_init(new_mutex!(crash_vm, "G17P crash VM"), GFP_KERNEL)?,
             acked: AtomicBool::new(false),
             crashed: AtomicBool::new(false),
             runtime_events: AtomicU32::new(0),
-        }
+        })
+    }
+
+    fn set_crash_vm(&self, vm: mmu::Vm) {
+        *self.crash_vm.lock() = vm;
     }
 }
 
@@ -225,6 +230,7 @@ fn capture_g17p_firmware_crash_dva(state: &G17PRoleRtkitState) -> Result {
     let uat_dva = buffer.dva & G17P_ASC_DVA_MASK;
     let crashlog = state
         .crash_vm
+        .lock()
         .copy_firmware_range(uat_dva, captured_size)?;
     publish_g17p_crashlog(state, buffer.size, &crashlog)
 }
@@ -421,7 +427,9 @@ fn finish_boot_session(
     // before CONTROL_START. A group first exposed after CONTROL_START enters
     // a different firmware path and does not establish the compute lifecycle.
     let bootstrap = if test_stage.configures_qid4() {
-        let prepared = manager.begin_compute_bootstrap_render(drm)?;
+        let (prepared, crash_vm) = manager.begin_compute_bootstrap_render(drm)?;
+        gfx_state.set_crash_vm(crash_vm.clone());
+        gfx1_state.set_crash_vm(crash_vm);
         dev_info!(
             pdev.as_ref(),
             "G17P compute control: startup TA/3D visible before control start\n"
@@ -501,6 +509,9 @@ fn finish_boot_session(
         "G17P compute control: channel-8 startup work sent\n"
     );
     manager.wait_compute_bootstrap_render_retirement()?;
+    let retained_crash_vm = manager.uat().kernel_lower_vm().clone();
+    gfx_state.set_crash_vm(retained_crash_vm.clone());
+    gfx1_state.set_crash_vm(retained_crash_vm);
     if gfx_state.crashed.load(Ordering::Acquire) || gfx1_state.crashed.load(Ordering::Acquire) {
         return Err(EIO);
     }
@@ -624,11 +635,11 @@ fn boot_session(
     // so a retained clone is sufficient to walk and snapshot either DVA.
     let crash_vm = manager.uat().kernel_lower_vm().clone();
     let gfx_state = Arc::new(
-        G17PRoleRtkitState::new(drm.clone(), G17PProcessor::Gfx, crash_vm.clone()),
+        G17PRoleRtkitState::new(drm.clone(), G17PProcessor::Gfx, crash_vm.clone())?,
         GFP_KERNEL,
     )?;
     let gfx1_state = Arc::new(
-        G17PRoleRtkitState::new(drm.clone(), G17PProcessor::Gfx1, crash_vm),
+        G17PRoleRtkitState::new(drm.clone(), G17PProcessor::Gfx1, crash_vm)?,
         GFP_KERNEL,
     )?;
     let mut gfx_rtkit =
@@ -710,11 +721,11 @@ fn boot_initial_session(
     let mut uat = Some(KBox::new(mmu::Uat::new_t8140(drm, true)?, GFP_KERNEL)?);
     let crash_vm = uat.as_ref().ok_or(EIO)?.kernel_lower_vm().clone();
     let gfx_state = Arc::new(
-        G17PRoleRtkitState::new(drm.clone(), G17PProcessor::Gfx, crash_vm.clone()),
+        G17PRoleRtkitState::new(drm.clone(), G17PProcessor::Gfx, crash_vm.clone())?,
         GFP_KERNEL,
     )?;
     let gfx1_state = Arc::new(
-        G17PRoleRtkitState::new(drm.clone(), G17PProcessor::Gfx1, crash_vm),
+        G17PRoleRtkitState::new(drm.clone(), G17PProcessor::Gfx1, crash_vm)?,
         GFP_KERNEL,
     )?;
     let mut gfx_rtkit =

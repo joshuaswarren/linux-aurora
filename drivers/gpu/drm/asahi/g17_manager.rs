@@ -444,7 +444,7 @@ impl G17PManagerConstruction {
     pub(crate) fn begin_compute_bootstrap_render(
         &mut self,
         dev: &AsahiDevice,
-    ) -> Result<g17_submission::PreparedG17PPartialOpeningWorkPair> {
+    ) -> Result<(g17_submission::PreparedG17PPartialOpeningWorkPair, mmu::Vm)> {
         let kernel_range = self.resources.uat().kernel_va_range()?;
         let vm = self.new_user_vm(0x8140_b007, kernel_range)?;
         let mut parameters = g17_render::G17pRenderParameters::source_rsrc8();
@@ -470,7 +470,9 @@ impl G17PManagerConstruction {
                 end: timestamp,
             },
         };
-        self.begin_translated_render(dev, &vm, &command, [0; 4], KVec::new())
+        let prepared =
+            self.begin_translated_render(dev, &vm, &command, [0; 4], KVec::new())?;
+        Ok((prepared, vm))
     }
 
     /// Match the source bootstrap fence: both three-item inner queues and
