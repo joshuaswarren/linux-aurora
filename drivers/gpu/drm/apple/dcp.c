@@ -1417,6 +1417,7 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	dcp->fw_compat = fw_compat;
 	dcp->dev = dev;
 	dcp->hw = *(struct apple_dcp_hw_data *)of_device_get_match_data(dev);
+	mutex_init(&dcp->link_init_lock);
 
 	if (!of_property_present(dev->of_node, "apple,iomfb-surfaces")) {
 		ret = apple_dcp_surface_order_init(&dcp->iomfb_surfaces, NULL, 0);
