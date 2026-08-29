@@ -1314,6 +1314,8 @@ impl G17PComputeUserMappings {
 #[cfg(not(test))]
 pub(crate) struct G17PUserRenderStorage {
     descriptors: MappedObject,
+    descriptor_ta_high: mmu::KernelMapping,
+    descriptor_3d_high: mmu::KernelMapping,
     descriptor_ta_low: mmu::KernelMapping,
     descriptor_3d_low: mmu::KernelMapping,
     ta_context_low: mmu::KernelMapping,
@@ -1879,32 +1881,48 @@ impl G17PUserRenderStorage {
 
         // Queue items name the firmware-high descriptors, while descriptor
         // self-pointers resolve through these one-page context-0 aliases.
-        // Context locators are deltas from the native per-stage descriptor
-        // bases. Keep the contiguous Linux pair at or above the later 3D base
-        // so both TA and 3D deltas are non-negative and representable.
-        let descriptor_range = uat.kernel_va_range()?;
-        let descriptor_floor = descriptor_range
-            .start
-            .max(g17_submission::G17P_COLD_OPENING_3D_DESCRIPTOR_BASE);
-        if descriptor_floor >= descriptor_range.end {
-            return Err(EINVAL);
-        }
-        let mut descriptors = bootstrap_stage!(
-            "descriptor allocation",
-            MappedObject::new_wc_in_range(
-                dev,
+        // The output-positive first-partial path names the descriptors at
+        // exactly the native arena bases (TA 0xfffffc20c0018000, 3D
+        // 0xfffffc20c00b0000), so alias the two pages there and keep the
+        // context locators at their native, delta-zero values.
+        let mut descriptors = bootstrap_stage!("descriptor allocation", MappedObject::new_wc(
+            dev,
+            uat,
+            G17P_RENDER_DESCRIPTOR_STORAGE_SIZE,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        ));
+        let descriptor_ta_high = bootstrap_stage!(
+            "TA descriptor high alias",
+            descriptors.object.map_range_into_range(
                 uat.kernel_vm(),
-                descriptor_floor..descriptor_range.end,
-                G17P_RENDER_DESCRIPTOR_STORAGE_SIZE,
+                0..mmu::UAT_PGSZ,
+                g17_submission::G17P_COLD_OPENING_TA_DESCRIPTOR_BASE
+                    ..g17_submission::G17P_COLD_OPENING_TA_DESCRIPTOR_BASE
+                        + mmu::UAT_PGSZ as u64,
                 mmu::UAT_PGSZ as u64,
                 mmu::PROT_GPU_FW_SHARED_RW,
+                false,
+            )
+        );
+        let descriptor_3d_high = bootstrap_stage!(
+            "3D descriptor high alias",
+            descriptors.object.map_range_into_range(
+                uat.kernel_vm(),
+                mmu::UAT_PGSZ..2 * mmu::UAT_PGSZ,
+                g17_submission::G17P_COLD_OPENING_3D_DESCRIPTOR_BASE
+                    ..g17_submission::G17P_COLD_OPENING_3D_DESCRIPTOR_BASE
+                        + mmu::UAT_PGSZ as u64,
+                mmu::UAT_PGSZ as u64,
+                mmu::PROT_GPU_FW_SHARED_RW,
+                false,
             )
         );
         dev_info!(
             dev.as_ref(),
-            "G17P render storage: descriptor high pair at {:#x}/{:#x}\n",
-            descriptors.iova(),
-            descriptors.iova() + mmu::UAT_PGSZ as u64
+            "G17P render storage: descriptor pages at native bases {:#x}/{:#x}\n",
+            descriptor_ta_high.iova(),
+            descriptor_3d_high.iova()
         );
         let descriptor_ta_low = bootstrap_stage!(
             "TA descriptor low alias",
@@ -2102,7 +2120,7 @@ impl G17PUserRenderStorage {
             raw.fill(0);
             g17_submission::apply_g17p_cold_opening_queue_context(
                 g17_submission::G17PColdOpeningStage::Tiling,
-                descriptors.iova(),
+                g17_submission::G17P_COLD_OPENING_TA_DESCRIPTOR_BASE,
                 graph_va + Self::TILING_QUEUE as u64,
                 &mut raw[..mmu::UAT_PGSZ],
             )
@@ -2112,7 +2130,7 @@ impl G17PUserRenderStorage {
             raw.fill(0);
             g17_submission::apply_g17p_cold_opening_queue_context(
                 g17_submission::G17PColdOpeningStage::Fragment,
-                descriptors.iova() + mmu::UAT_PGSZ as u64,
+                g17_submission::G17P_COLD_OPENING_3D_DESCRIPTOR_BASE,
                 graph_va + Self::FRAGMENT_QUEUE as u64,
                 &mut raw[..mmu::UAT_PGSZ],
             )
@@ -2288,6 +2306,8 @@ impl G17PUserRenderStorage {
 
         Ok(Self {
             descriptors,
+            descriptor_ta_high,
+            descriptor_3d_high,
             descriptor_ta_low,
             descriptor_3d_low,
             ta_context_low,
@@ -2318,17 +2338,9 @@ impl G17PUserRenderStorage {
         if submission_ordinal == 0 || submission_ordinal >= G17P_RETAINED_RENDER_ORDINALS {
             return Err(EINVAL);
         }
-        let descriptor_range = uat.kernel_va_range()?;
-        let descriptor_floor = descriptor_range
-            .start
-            .max(g17_submission::G17P_COLD_OPENING_3D_DESCRIPTOR_BASE);
-        if descriptor_floor >= descriptor_range.end {
-            return Err(EINVAL);
-        }
-        let mut next_descriptors = MappedObject::new_wc_in_range(
+        let mut next_descriptors = MappedObject::new_wc(
             dev,
-            uat.kernel_vm(),
-            descriptor_floor..descriptor_range.end,
+            uat,
             G17P_RENDER_DESCRIPTOR_STORAGE_SIZE,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
@@ -2547,6 +2559,24 @@ impl G17PUserRenderStorage {
             },
             |address, size| vm.covers_range(address, size, true, true),
         )
+            && self.descriptor_ta_high.iova()
+                == g17_submission::G17P_COLD_OPENING_TA_DESCRIPTOR_BASE
+            && self.descriptor_ta_high.size() == mmu::UAT_PGSZ
+            && uat.kernel_vm().covers_range(
+                self.descriptor_ta_high.iova(),
+                self.descriptor_ta_high.size() as u64,
+                true,
+                true,
+            )
+            && self.descriptor_3d_high.iova()
+                == g17_submission::G17P_COLD_OPENING_3D_DESCRIPTOR_BASE
+            && self.descriptor_3d_high.size() == mmu::UAT_PGSZ
+            && uat.kernel_vm().covers_range(
+                self.descriptor_3d_high.iova(),
+                self.descriptor_3d_high.size() as u64,
+                true,
+                true,
+            )
             && self.descriptor_ta_low.iova() == G17P_BOOTSTRAP_TA_DESCRIPTOR_LOW_VA
             && self.descriptor_ta_low.size() == mmu::UAT_PGSZ
             && uat.kernel_lower_vm().covers_range(
@@ -2652,7 +2682,7 @@ impl G17PUserRenderStorage {
     pub(crate) fn stage_fragment(&mut self, submission_ordinal: u32) -> Result {
         let graph_va = self.graph.iova();
         let items = [
-            self.descriptors.iova() + 0x4000,
+            g17_submission::G17P_COLD_OPENING_3D_DESCRIPTOR_BASE,
             graph_va + Self::FRAGMENT_OPTIONAL as u64,
             graph_va + Self::FRAGMENT_EVENT as u64,
         ];
@@ -2687,7 +2717,7 @@ impl G17PUserRenderStorage {
     ) -> Result<G17PLateTilingPublication> {
         let graph_va = self.graph.iova();
         let bytes = build_g17p_late_tiling_bytes(
-            self.descriptors.iova(),
+            g17_submission::G17P_COLD_OPENING_TA_DESCRIPTOR_BASE,
             graph_va,
             self.optional_addresses(true),
             submission_ordinal,
