@@ -441,10 +441,10 @@ impl G17PManagerConstruction {
     /// Stage the same queue-pair-zero TA/3D bootstrap used by the
     /// output-positive source path. The VDM stream is a driver-owned terminate
     /// command, so this establishes scheduler lifecycle without user BOs.
-    pub(crate) fn begin_compute_bootstrap_render(
+    pub(crate) fn stage_compute_bootstrap_render(
         &mut self,
         dev: &AsahiDevice,
-    ) -> Result<(g17_submission::PreparedG17PPartialOpeningWorkPair, mmu::Vm)> {
+    ) -> Result<mmu::Vm> {
         let kernel_range = self.resources.uat().kernel_va_range().inspect_err(|error| {
             dev_err!(
                 dev.as_ref(),
@@ -484,16 +484,80 @@ impl G17PManagerConstruction {
                 end: timestamp,
             },
         };
-        let prepared = self
-            .begin_translated_render(dev, &vm, &command, [0; 4], KVec::new())
-            .inspect_err(|error| {
-                dev_err!(
-                    dev.as_ref(),
-                    "G17P bootstrap: render graph setup failed ({:?})\n",
-                    error
-                );
-            })?;
-        Ok((prepared, vm))
+        if self.render_tracker.is_some()
+            || self.render_storage.is_some()
+            || self.render_bind.is_some()
+            || self.render_submission_ordinal != 0
+        {
+            return Err(EBUSY);
+        }
+        self.render_storage = Some(
+            self.resources
+                .new_user_render_storage(
+                    dev,
+                    &vm,
+                    &command,
+                    self.num_clusters,
+                    [0; 4],
+                    KVec::new(),
+                )
+                .inspect_err(|error| {
+                    dev_err!(
+                        dev.as_ref(),
+                        "G17P bootstrap: render graph setup failed ({:?})\n",
+                        error
+                    );
+                })?,
+        );
+        let storage = self.render_storage.as_mut().ok_or(ENODEV)?;
+        if !storage.is_reachable_from(&vm) {
+            return Err(EFAULT);
+        }
+        storage.stage_fragment(0)?;
+        let binding = self.resources.uat().bind(&vm)?;
+        if binding.slot() != 1 {
+            return Err(EFAULT);
+        }
+        self.render_bind = Some(binding);
+        Ok(vm)
+    }
+
+    /// Publish the staged bootstrap pair after primary control-done.
+    pub(crate) fn publish_staged_compute_bootstrap_render(
+        &mut self,
+    ) -> Result<g17_submission::PreparedG17PPartialOpeningWorkPair> {
+        if self.render_tracker.is_some()
+            || self.render_bind.is_none()
+            || self.render_submission_ordinal != 0
+        {
+            return Err(EBUSY);
+        }
+        let (fragment_queue, tiling_queue, previous, late_tiling) = {
+            let storage = self.render_storage.as_mut().ok_or(ENODEV)?;
+            let previous = storage.snapshot()?;
+            let late_tiling = storage.prepare_late_tiling_publication(0)?;
+            let (fragment_queue, tiling_queue) = storage.queue_gpu_vas();
+            (fragment_queue, tiling_queue, previous, late_tiling)
+        };
+        let (prepared, render_bind) = self.resources.publish_partial_opening_pair(
+            None,
+            true,
+            fragment_queue,
+            3,
+            tiling_queue,
+            3,
+            move || late_tiling.publish(),
+        )?;
+        if render_bind.is_some() {
+            return Err(EINVAL);
+        }
+        self.render_tracker = Some(G17PPartialOpeningRenderTracker {
+            tiling_previous: previous.tiling,
+            fragment_previous: previous.fragment,
+            tiling_prefix: 3,
+            fragment_prefix: 3,
+        });
+        Ok(prepared)
     }
 
     /// Match the source bootstrap fence: both three-item inner queues and
