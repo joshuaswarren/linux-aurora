@@ -312,12 +312,10 @@ static u32 dcp_link_call_tag(const struct dcp_method_entry *call)
 
 static int dcp_link_push_context(struct apple_dcp *dcp,
 				 enum dcp_context_id context,
-				 bool new_stream,
 				 const struct dcp_method_entry *call, u32 in_len,
 				 u32 out_len, void *data, dcp_callback_t cb,
 				 void *cookie)
 {
-	enum dcp_context_id context = dcp_call_context(dcp, oob);
 	struct dcp_channel *ch = dcp_get_channel(dcp, context);
 	struct apple_dcp_link_stream_layout layout;
 	struct apple_dcp_link_rpc_header *header;
@@ -392,10 +390,23 @@ static int dcp_link_push_context(struct apple_dcp *dcp,
 			 old_top, next_top, depth, call_tag, in_len, out_len);
 	}
 	ret = dcp_send_message_sync(dcp, APPLE_DCP_LINK_ENDPOINT, message);
+	if (call_tag == APPLE_DCP_H17P_CALL_PMU_SERVICE_MATCHED ||
+	    call_tag == APPLE_DCP_H17P_CALL_BACKLIGHT_SERVICE_MATCHED)
+		dev_info(dcp->dev,
+			 "DCPLink %.4s TX %#llx base %#x offset %#x size %#x depth %u mailbox result %d\n",
+			 call->tag, message, layout.local_offset, offset,
+			 payload_size, depth, ret);
 	if (ret) {
 		dev_err(dcp->dev,
 			"DCPLink %.4s mailbox send failed: %d\n", call->tag, ret);
-		return;
+		*top = old_top;
+		ch->callbacks[depth] = NULL;
+		ch->cookies[depth] = NULL;
+		ch->output[depth] = NULL;
+		ch->link_message[depth] = 0;
+		ch->link_size[depth] = 0;
+		dcp_pop_depth(&ch->depth);
+		return ret;
 	}
 	if (remote) {
 		dcp_link_sync_for_cpu();
@@ -403,13 +414,107 @@ static int dcp_link_push_context(struct apple_dcp *dcp,
 			 "DCPLink callback-stream %.4s mailbox send complete payload %*phN\n",
 			 call->tag, min_t(u32, payload_size, 32), header);
 	}
-	return;
+	return 0;
 
 err_pop:
 	dcp_pop_depth(&ch->depth);
 	dev_err(dcp->dev, "DCPLink call %.4s could not be queued: %d\n",
 		call->tag, ret);
 	return ret;
+}
+
+static void dcp_link_push(struct apple_dcp *dcp, bool oob,
+			  const struct dcp_method_entry *call, u32 in_len,
+			  u32 out_len, void *data, dcp_callback_t cb,
+			  void *cookie)
+{
+	dcp_link_push_context(dcp, dcp_call_context(dcp, oob), call, in_len,
+			      out_len, data, cb, cookie);
+}
+
+enum dcp_link_service_match_bit {
+	DCP_LINK_SERVICE_MATCH_PMU,
+	DCP_LINK_SERVICE_MATCH_BACKLIGHT,
+	DCP_LINK_SERVICE_MATCH_INFLIGHT,
+};
+
+static const struct dcp_method_entry dcp_link_pmu_service_matched = {
+	.name = "pmu_service_matched",
+	.tag = { 'A', '1', '3', '6' },
+};
+
+static const struct dcp_method_entry dcp_link_backlight_service_matched = {
+	.name = "backlight_service_matched",
+	.tag = { 'A', '1', '3', '7' },
+};
+
+static void dcp_link_service_match_complete(struct apple_dcp *dcp, void *out,
+					    void *cookie)
+{
+	const struct dcp_method_entry *call = cookie;
+
+	dev_info(dcp->dev, "DCPLink %.4s reply %#x\n", call->tag,
+		 le32_to_cpup((__le32 *)out));
+	clear_bit(DCP_LINK_SERVICE_MATCH_INFLIGHT,
+		  &dcp->link_service_match_state);
+	if (test_bit(DCP_LINK_SERVICE_MATCH_PMU,
+		     &dcp->link_service_match_state) ||
+	    test_bit(DCP_LINK_SERVICE_MATCH_BACKLIGHT,
+		     &dcp->link_service_match_state))
+		schedule_work(&dcp->link_service_match_work);
+}
+
+static void dcp_link_service_match_work(struct work_struct *work)
+{
+	struct apple_dcp *dcp =
+		container_of(work, struct apple_dcp, link_service_match_work);
+	const struct dcp_method_entry *call;
+	int ret;
+
+	if (test_and_set_bit(DCP_LINK_SERVICE_MATCH_INFLIGHT,
+			     &dcp->link_service_match_state))
+		return;
+
+	if (test_and_clear_bit(DCP_LINK_SERVICE_MATCH_PMU,
+			       &dcp->link_service_match_state)) {
+		call = &dcp_link_pmu_service_matched;
+	} else if (test_and_clear_bit(DCP_LINK_SERVICE_MATCH_BACKLIGHT,
+				    &dcp->link_service_match_state)) {
+		call = &dcp_link_backlight_service_matched;
+	} else {
+		clear_bit(DCP_LINK_SERVICE_MATCH_INFLIGHT,
+			  &dcp->link_service_match_state);
+		return;
+	}
+
+	/* Native IOService notifiers make these calls after D206/D207 return. */
+	ret = dcp_link_push_context(dcp, DCP_CONTEXT_CMD, call, 0,
+				    sizeof(__le32), NULL,
+				    dcp_link_service_match_complete,
+				    (void *)call);
+	if (ret) {
+		clear_bit(DCP_LINK_SERVICE_MATCH_INFLIGHT,
+			  &dcp->link_service_match_state);
+		if (test_bit(DCP_LINK_SERVICE_MATCH_PMU,
+			     &dcp->link_service_match_state) ||
+		    test_bit(DCP_LINK_SERVICE_MATCH_BACKLIGHT,
+			     &dcp->link_service_match_state))
+			schedule_work(&dcp->link_service_match_work);
+	}
+}
+
+static void dcp_link_queue_service_match(struct apple_dcp *dcp, int tag)
+{
+	if (tag == 206)
+		set_bit(DCP_LINK_SERVICE_MATCH_PMU,
+			&dcp->link_service_match_state);
+	else if (tag == 207)
+		set_bit(DCP_LINK_SERVICE_MATCH_BACKLIGHT,
+			&dcp->link_service_match_state);
+	else
+		return;
+
+	schedule_work(&dcp->link_service_match_work);
 }
 
 static int dcp_link_ack(struct apple_dcp *dcp,
@@ -667,6 +772,8 @@ static void dcp_link_handle_callback(struct apple_dcp *dcp, u64 message)
 			dev_info(dcp->dev,
 				 "DCPLink callback %u D%03d ACK %#llx send result %d\n",
 				 sequence, tag, reply, ack_ret);
+		if (!ack_ret && (tag == 206 || tag == 207))
+			dcp_link_queue_service_match(dcp, tag);
 	}
 }
 
@@ -769,8 +876,6 @@ static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 
 	INIT_WORK(&dcp->link_service_match_work, dcp_link_service_match_work);
 	dcp->link_service_match_state = 0;
-	dcp->link_service_match_output = NULL;
-	dcp->link_service_match_callback_tag = 0;
 
 	if (dcp->adopted_session) {
 		struct iommu_domain *domain;
