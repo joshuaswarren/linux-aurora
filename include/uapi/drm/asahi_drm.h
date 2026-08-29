@@ -191,6 +191,37 @@ struct drm_asahi_params_global {
 	 * seconds, rather than hardcoding a particular firmware's rate.
 	 */
 	__u64 command_timestamp_frequency_hz;
+
+	/**
+	 * @usc_generation: Unified shader core (USC) ISA generation.
+	 *
+	 * This is 2 for G13/G14 and 3 for G15/G16/G17. It does not
+	 * distinguish the binary encoding groups within AGX3.
+	 */
+	__u32 usc_generation;
+
+	/**
+	 * @gpu_hal_generation: Apple GPU HAL/command-stream generation.
+	 *
+	 * This is DRM_ASAHI_GPU_HAL_LEGACY for G13-G15,
+	 * DRM_ASAHI_GPU_HAL_200 for G16 and G17P/G17A, and
+	 * DRM_ASAHI_GPU_HAL_300 for G17G/G17S/G17C.
+	 */
+	__u32 gpu_hal_generation;
+};
+
+/**
+ * enum drm_asahi_gpu_hal_generation - GPU HAL/command-stream generation
+ */
+enum drm_asahi_gpu_hal_generation {
+	/** @DRM_ASAHI_GPU_HAL_LEGACY: GPU predates Apple's numbered HALs. */
+	DRM_ASAHI_GPU_HAL_LEGACY = 0,
+
+	/** @DRM_ASAHI_GPU_HAL_200: Apple HAL200 command stream. */
+	DRM_ASAHI_GPU_HAL_200 = 200,
+
+	/** @DRM_ASAHI_GPU_HAL_300: Apple HAL300 command stream. */
+	DRM_ASAHI_GPU_HAL_300 = 300,
 };
 
 /**
@@ -790,6 +821,13 @@ enum drm_asahi_render_flags {
 	DRM_ASAHI_RENDER_NO_VERTEX_CLUSTERING = (1U << 2),
 
 	/**
+	 * @DRM_ASAHI_RENDER_RSRC_SPEC_HI: The appended resource-specifier high
+	 * dwords are present. This flag lets old kernels report an unsupported
+	 * render payload instead of silently truncating 64-bit G17 values.
+	 */
+	DRM_ASAHI_RENDER_RSRC_SPEC_HI = (1U << 4),
+
+	/**
 	 * @DRM_ASAHI_RENDER_DBIAS_IS_INT: Use integer depth bias formula.
 	 *
 	 * Graphics specifications contain two alternate formulas for depth
@@ -1107,6 +1145,18 @@ struct drm_asahi_cmd_render {
 
 	/** @ts_frag: Timestamps for the fragment portion of the render */
 	struct drm_asahi_timestamps ts_frag;
+
+	/** @bg_eot_rsrc_spec_hi: High dword of @eot.rsrc_spec */
+	__u32 bg_eot_rsrc_spec_hi;
+
+	/** @bg_eot_partial_rsrc_spec_hi: High dword of @partial_eot.rsrc_spec */
+	__u32 bg_eot_partial_rsrc_spec_hi;
+
+	/** @bg_rsrc_spec_hi: High dword of @bg.rsrc_spec */
+	__u32 bg_rsrc_spec_hi;
+
+	/** @bg_partial_rsrc_spec_hi: High dword of @partial_bg.rsrc_spec */
+	__u32 bg_partial_rsrc_spec_hi;
 };
 
 /**
@@ -1117,7 +1167,12 @@ struct drm_asahi_cmd_render {
  * single compute command, although timestamps are at command granularity.
  */
 struct drm_asahi_cmd_compute {
-	/** @flags: MBZ */
+	/**
+	 * @flags: Combination of drm_asahi_compute_flags.
+	 *
+	 * The G17P add3 proof flag is a bring-up-only contract. It treats exactly
+	 * three compute attachments as input A, input B, and output respectively.
+	 */
 	__u32 flags;
 
 	/** @sampler_count: Number of samplers in the sampler heap. */
@@ -1144,6 +1199,17 @@ struct drm_asahi_cmd_compute {
 
 	/** @ts: Timestamps for the compute command */
 	struct drm_asahi_timestamps ts;
+};
+
+/**
+ * enum drm_asahi_compute_flags - Compute command flags
+ */
+enum drm_asahi_compute_flags {
+	/**
+	 * @DRM_ASAHI_COMPUTE_G17P_ADD3_PROOF: Populate the retained G17P
+	 * three-buffer table from this command's three compute attachments.
+	 */
+	DRM_ASAHI_COMPUTE_G17P_ADD3_PROOF = (1L << 0),
 };
 
 /**
