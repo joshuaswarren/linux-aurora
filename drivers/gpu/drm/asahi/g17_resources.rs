@@ -3042,6 +3042,10 @@ impl G17ResourceOwner {
         Self::new_with_uat(dev, uat)
     }
 
+    /// Kept out of line: dozens of mapping locals live across this body, and
+    /// inlining it into the boot closure overflowed the task stack on
+    /// hardware.
+    #[inline(never)]
     pub(crate) fn new_with_uat(dev: &AsahiDevice, uat: KBox<mmu::Uat>) -> Result<Self> {
         let address_space = G17UatOwner { uat };
         dev_info!(dev.as_ref(), "G17P resources: building firmware layout\n");
