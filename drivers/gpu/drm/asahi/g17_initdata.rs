@@ -524,22 +524,14 @@ pub(crate) fn encode_control_shared(out: &mut [u8]) -> Result<(), InitdataError>
     Ok(())
 }
 
-/// Encode the 22 flagged buffer pointers present before the first control start.
+/// Keep the opening operand page empty until firmware performs the 0x20
+/// binding. The retained startup graph must not expose the later 22-entry
+/// runtime inventory at this boundary.
 pub(crate) fn encode_control_operand_table(out: &mut [u8]) -> Result<(), InitdataError> {
     if out.len() != CONTROL_OPERAND_TABLE_SIZE {
         return Err(InitdataError::BufferSize);
     }
     out.fill(0);
-    for index in 0..CONTROL_OPERAND_ENTRY_COUNT {
-        let address = CONTROL_OPERAND_BUFFER_BASE
-            .checked_add(index as u64 * CONTROL_OPERAND_BUFFER_STRIDE)
-            .ok_or(InitdataError::AddressOutOfRange)?;
-        put_u64(
-            out,
-            index * CONTROL_OPERAND_ENTRY_STRIDE,
-            address | CONTROL_OPERAND_ENTRY_FLAG,
-        );
-    }
     Ok(())
 }
 
@@ -2523,21 +2515,11 @@ mod tests {
     }
 
     #[test]
-    fn operand_table_has_exactly_twenty_two_flagged_entries() {
+    fn opening_operand_table_stays_zero_until_firmware_binding() {
         let mut table = vec![0xff; CONTROL_OPERAND_TABLE_SIZE];
         encode_control_operand_table(&mut table).unwrap();
 
-        for index in 0..CONTROL_OPERAND_ENTRY_COUNT {
-            assert_eq!(
-                get_u64(&table, index * CONTROL_OPERAND_ENTRY_STRIDE),
-                CONTROL_OPERAND_ENTRY_FLAG
-                    | (CONTROL_OPERAND_BUFFER_BASE
-                        + index as u64 * CONTROL_OPERAND_BUFFER_STRIDE)
-            );
-        }
-        assert!(table[CONTROL_OPERAND_ENTRY_COUNT * CONTROL_OPERAND_ENTRY_STRIDE..]
-            .iter()
-            .all(|byte| *byte == 0));
+        assert!(table.iter().all(|byte| *byte == 0));
     }
 
     #[test]
