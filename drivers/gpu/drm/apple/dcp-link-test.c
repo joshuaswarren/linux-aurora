@@ -322,23 +322,14 @@ static void apple_dcp_link_ready_reply_test(struct kunit *test)
 
 static void apple_dcp_link_handshake_test(struct kunit *test)
 {
-	enum apple_dcp_link_state state = APPLE_DCP_LINK_WAIT_FIRMWARE_INIT;
+	enum apple_dcp_link_state state = APPLE_DCP_LINK_WAIT_READY;
 	u64 ready = APPLE_DCP_LINK_MSG_READY;
 	u64 firmware_init = APPLE_DCP_LINK_MSG_FIRMWARE_INIT;
 
-	KUNIT_EXPECT_EQ(test, apple_dcp_link_handshake_step(&state, ready),
-			APPLE_DCP_LINK_HANDSHAKE_NONE);
-	KUNIT_EXPECT_EQ(test, state, APPLE_DCP_LINK_WAIT_FIRMWARE_INIT);
-
-	KUNIT_EXPECT_EQ(test,
-			apple_dcp_link_handshake_step(&state, firmware_init),
-			APPLE_DCP_LINK_HANDSHAKE_SEND_INIT);
-	KUNIT_EXPECT_EQ(test, state, APPLE_DCP_LINK_WAIT_FIRMWARE_READY);
-
 	KUNIT_EXPECT_EQ(test,
 			apple_dcp_link_handshake_step(&state, firmware_init),
 			APPLE_DCP_LINK_HANDSHAKE_NONE);
-	KUNIT_EXPECT_EQ(test, state, APPLE_DCP_LINK_WAIT_FIRMWARE_READY);
+	KUNIT_EXPECT_EQ(test, state, APPLE_DCP_LINK_WAIT_READY);
 
 	KUNIT_EXPECT_EQ(test, apple_dcp_link_handshake_step(&state, ready),
 			APPLE_DCP_LINK_HANDSHAKE_START_IOMFB);

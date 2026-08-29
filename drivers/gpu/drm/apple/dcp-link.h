@@ -51,8 +51,7 @@
 #define APPLE_DCP_H17P_CLOCK_ID_194		0x194
 
 enum apple_dcp_link_state {
-	APPLE_DCP_LINK_WAIT_FIRMWARE_INIT,
-	APPLE_DCP_LINK_WAIT_FIRMWARE_READY,
+	APPLE_DCP_LINK_WAIT_READY,
 	APPLE_DCP_LINK_READY,
 };
 
@@ -119,7 +118,6 @@ static inline u16 apple_dcp_link_negotiate_version(u16 remote_version)
 
 enum apple_dcp_link_handshake_action {
 	APPLE_DCP_LINK_HANDSHAKE_NONE,
-	APPLE_DCP_LINK_HANDSHAKE_SEND_INIT,
 	APPLE_DCP_LINK_HANDSHAKE_START_IOMFB,
 };
 
@@ -559,12 +557,9 @@ apple_dcp_link_handshake_step(enum apple_dcp_link_state *state, u64 message)
 	type = message & GENMASK_ULL(1, 0);
 	switch (type) {
 	case APPLE_DCP_LINK_MSG_FIRMWARE_INIT:
-		if (*state != APPLE_DCP_LINK_WAIT_FIRMWARE_INIT)
-			return APPLE_DCP_LINK_HANDSHAKE_NONE;
-		*state = APPLE_DCP_LINK_WAIT_FIRMWARE_READY;
-		return APPLE_DCP_LINK_HANDSHAKE_SEND_INIT;
+		return APPLE_DCP_LINK_HANDSHAKE_NONE;
 	case APPLE_DCP_LINK_MSG_READY:
-		if (*state != APPLE_DCP_LINK_WAIT_FIRMWARE_READY)
+		if (*state != APPLE_DCP_LINK_WAIT_READY)
 			return APPLE_DCP_LINK_HANDSHAKE_NONE;
 		*state = APPLE_DCP_LINK_READY;
 		return APPLE_DCP_LINK_HANDSHAKE_START_IOMFB;
