@@ -38,7 +38,7 @@
 #define APPLE_DCP_LINK_MSG_RPC_REPLY		0x42
 #define APPLE_DCP_LINK_MSG_INIT			0x40
 #define APPLE_DCP_LINK_MSG_REMOTE		BIT_ULL(8)
-#define APPLE_DCP_LINK_MSG_NESTED		BIT_ULL(9)
+#define APPLE_DCP_LINK_MSG_NEW_STREAM		BIT_ULL(9)
 #define APPLE_DCP_LINK_MSG_STREAM		GENMASK_ULL(15, 10)
 #define APPLE_DCP_LINK_MSG_OFFSET		GENMASK_ULL(31, 16)
 #define APPLE_DCP_LINK_MSG_SIZE			GENMASK_ULL(47, 32)
@@ -643,7 +643,8 @@ static inline int apple_dcp_link_align_payload(u32 size, u32 alignment,
 	return 0;
 }
 
-static inline int apple_dcp_link_rpc_message(u32 offset, u32 size, bool nested,
+static inline int apple_dcp_link_rpc_message(u32 offset, u32 size,
+					     bool new_stream,
 					     u64 *message)
 {
 	if (!message)
@@ -654,8 +655,8 @@ static inline int apple_dcp_link_rpc_message(u32 offset, u32 size, bool nested,
 	*message = APPLE_DCP_LINK_MSG_RPC |
 		   FIELD_PREP(APPLE_DCP_LINK_MSG_OFFSET, offset) |
 		   FIELD_PREP(APPLE_DCP_LINK_MSG_SIZE, size);
-	if (nested)
-		*message |= APPLE_DCP_LINK_MSG_NESTED;
+	if (new_stream)
+		*message |= APPLE_DCP_LINK_MSG_NEW_STREAM;
 
 	return 0;
 }
@@ -678,18 +679,18 @@ static inline int apple_dcp_link_stream_message(u64 message, u8 stream,
 }
 
 static inline int apple_dcp_link_ap_call_message(u32 offset, u32 size,
-						  u8 stream, bool nested,
+						  u8 stream, bool remote,
+						  bool new_stream,
 						  u64 *message)
 {
 	u64 rpc;
 	int ret;
 
-	ret = apple_dcp_link_rpc_message(offset, size, nested, &rpc);
+	ret = apple_dcp_link_rpc_message(offset, size, new_stream, &rpc);
 	if (ret)
 		return ret;
 
-	/* AP calls stay on the local stream; bit 9 alone marks recursion. */
-	return apple_dcp_link_stream_message(rpc, stream, false, message);
+	return apple_dcp_link_stream_message(rpc, stream, remote, message);
 }
 
 static inline u8 apple_dcp_link_message_stream(u64 message)
