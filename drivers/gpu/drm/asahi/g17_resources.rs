@@ -99,6 +99,8 @@ const G17P_CONTROL_DIRECTORY_SIZE: usize = 0x20_0000;
 // leaf observed on GFX1 was base +0x17c000, inside this exact source-built run.
 const G17P_NATIVE_PRIVATE_CLUSTER_OFFSET: u64 = 0x0002_0000;
 const G17P_NATIVE_PRIVATE_CLUSTER_SIZE: usize = 0x0017_8000;
+#[cfg(test)]
+const G17P_NATIVE_SECONDARY_STATUS_A_OFFSET: u64 = 0x000e_3100;
 /// Exact executable extent used by the positive first-partial render root.
 pub(crate) const G17P_BOOTSTRAP_VDM_VA: u64 = 0x10_0001_8000;
 const G17P_BOOTSTRAP_VDM_SIZE: usize = 0x8000;
@@ -162,6 +164,38 @@ impl G17PComputeUserVaLayout {
         ]
         .into_iter()
         .all(|(address, size)| covers(address, size))
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+struct G17PRenderStorageVaLayout {
+    descriptors: u64,
+    graph: u64,
+    support: u64,
+    render_state: u64,
+    render_state_size: u64,
+    timestamps: u64,
+}
+
+impl G17PRenderStorageVaLayout {
+    fn all_referenced_ranges_reachable(
+        self,
+        mut firmware_covers: impl FnMut(u64, u64) -> bool,
+        mut client_covers: impl FnMut(u64, u64) -> bool,
+    ) -> bool {
+        [
+            (self.descriptors, G17P_RENDER_DESCRIPTOR_STORAGE_SIZE as u64),
+            (self.graph, G17P_RENDER_QUEUE_GRAPH_SIZE as u64),
+            (self.support, G17P_RENDER_SUPPORT_SIZE as u64),
+        ]
+        .into_iter()
+        .all(|(address, size)| firmware_covers(address, size))
+            && [
+                (self.render_state, self.render_state_size),
+                (self.timestamps, G17P_PAGE_SIZE as u64),
+            ]
+            .into_iter()
+            .all(|(address, size)| client_covers(address, size))
     }
 }
 
@@ -468,8 +502,10 @@ fn g17p_cold_opening_metadata(
         },
     }
 }
-#[cfg(not(test))]
-const STATUS_A_ALLOC_SIZE: usize = 0xb4000;
+// Native Status A starts at private-cluster +0xe3100 and stays backed until
+// the cluster end at +0x198000: 0xb4f00 bytes, or 0xb8000 page-rounded when
+// represented as a separate Linux object. GFX1 writes through +0xb4004.
+const STATUS_A_ALLOC_SIZE: usize = 0xb8000;
 #[cfg(not(test))]
 const PRIMARY_STATE_ALLOC_SIZE: usize = 0xc4000;
 #[cfg(not(test))]
@@ -1744,6 +1780,7 @@ impl G17PUserRenderStorage {
 
     pub(crate) fn new(
         dev: &AsahiDevice,
+        uat: &mmu::Uat,
         vm: &mmu::Vm,
         command: &g17_uapi::TranslatedRenderCommand,
         num_clusters: u32,
@@ -1767,26 +1804,28 @@ impl G17PUserRenderStorage {
             };
         }
 
-        let mut descriptors = bootstrap_stage!("descriptor allocation", MappedObject::new_wc_in_range(
+        // The ASC cache-maintains each inner item directly. The positive
+        // source graph therefore keeps descriptors, queues/rings, and support
+        // records in firmware-high VA; only command resources live in the
+        // client VM. A low descriptor pointer faults in the cache-maintenance
+        // path before the GPU sees the command.
+        let mut descriptors = bootstrap_stage!("descriptor allocation", MappedObject::new_wc(
             dev,
-            vm,
-            G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END,
+            uat,
             G17P_RENDER_DESCRIPTOR_STORAGE_SIZE,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
         ));
-        let mut graph = bootstrap_stage!("queue allocation", MappedObject::new_wc_in_range(
+        let mut graph = bootstrap_stage!("queue allocation", MappedObject::new_wc(
             dev,
-            vm,
-            G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END,
+            uat,
             G17P_RENDER_QUEUE_GRAPH_SIZE,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
         ));
-        let mut support = bootstrap_stage!("support allocation", MappedObject::new_wc_in_range(
+        let mut support = bootstrap_stage!("support allocation", MappedObject::new_wc(
             dev,
-            vm,
-            G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END,
+            uat,
             G17P_RENDER_SUPPORT_SIZE,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
@@ -2100,6 +2139,7 @@ impl G17PUserRenderStorage {
     pub(crate) fn restage_command(
         &mut self,
         dev: &AsahiDevice,
+        uat: &mmu::Uat,
         vm: &mmu::Vm,
         command: &g17_uapi::TranslatedRenderCommand,
         num_clusters: u32,
@@ -2110,10 +2150,9 @@ impl G17PUserRenderStorage {
         if submission_ordinal == 0 || submission_ordinal >= G17P_RETAINED_RENDER_ORDINALS {
             return Err(EINVAL);
         }
-        let mut next_descriptors = MappedObject::new_wc_in_range(
+        let mut next_descriptors = MappedObject::new_wc(
             dev,
-            vm,
-            G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END,
+            uat,
             G17P_RENDER_DESCRIPTOR_STORAGE_SIZE,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
@@ -2289,16 +2328,22 @@ impl G17PUserRenderStorage {
         Ok(())
     }
 
-    pub(crate) fn is_reachable_from(&self, vm: &mmu::Vm) -> bool {
-        [
-            &self.descriptors,
-            &self.graph,
-            &self.support,
-            &self.render_state,
-            &self.timestamps,
-        ]
-        .iter()
-        .all(|object| vm.covers_range(object.iova(), object.logical_size as u64, true, true))
+    pub(crate) fn is_reachable_from(&self, uat: &mmu::Uat, vm: &mmu::Vm) -> bool {
+        G17PRenderStorageVaLayout {
+            descriptors: self.descriptors.iova(),
+            graph: self.graph.iova(),
+            support: self.support.iova(),
+            render_state: self.render_state.iova(),
+            render_state_size: self.render_state.logical_size as u64,
+            timestamps: self.timestamps.iova(),
+        }
+        .all_referenced_ranges_reachable(
+            |address, size| {
+                uat.kernel_vm()
+                    .covers_range(address, size, true, true)
+            },
+            |address, size| vm.covers_range(address, size, true, true),
+        )
             && vm.covers_range(
                 G17P_CONTROL_DIRECTORY_VA,
                 G17P_CONTROL_DIRECTORY_SIZE as u64,
@@ -3730,6 +3775,7 @@ impl G17ResourceOwner {
     ) -> Result<G17PUserRenderStorage> {
         G17PUserRenderStorage::new(
             dev,
+            &self.address_space.uat,
             vm,
             command,
             num_clusters,
@@ -4970,6 +5016,51 @@ mod tests {
         assert_eq!(cluster.start, 0xffff_fc20_0002_0000);
         assert_eq!(cluster.end, 0xffff_fc20_0019_8000);
         assert!(cluster.contains(&0xffff_fc20_0017_c004));
+    }
+
+    #[test]
+    fn status_a_uses_the_page_rounded_native_extent() {
+        let cluster_end = G17P_NATIVE_PRIVATE_CLUSTER_OFFSET
+            + G17P_NATIVE_PRIVATE_CLUSTER_SIZE as u64;
+        let source_extent = cluster_end - G17P_NATIVE_SECONDARY_STATUS_A_OFFSET;
+        assert_eq!(source_extent, 0xb4f00);
+        assert_eq!(STATUS_A_ALLOC_SIZE, 0xb8000);
+        assert!(0xb4004 < STATUS_A_ALLOC_SIZE);
+        assert!(STATUS_A_ALLOC_SIZE as u64 >= source_extent);
+        assert_eq!(STATUS_A_ALLOC_SIZE % G17P_PAGE_SIZE, 0);
+    }
+
+    #[test]
+    fn render_firmware_items_and_client_resources_use_distinct_vms() {
+        let firmware = KERN..KERN + 0x20_0000;
+        let client = 0x70_0000_0000..0x71_0000_0000;
+        let layout = G17PRenderStorageVaLayout {
+            descriptors: KERN + 0x10000,
+            graph: KERN + 0x20000,
+            support: KERN + 0x30000,
+            render_state: 0x70_0020_0000,
+            render_state_size: 0x20000,
+            timestamps: 0x70_0030_0000,
+        };
+        let covers = |range: &core::ops::Range<u64>, address: u64, size: u64| {
+            address >= range.start
+                && address
+                    .checked_add(size)
+                    .is_some_and(|end| end <= range.end)
+        };
+        assert!(layout.all_referenced_ranges_reachable(
+            |address, size| covers(&firmware, address, size),
+            |address, size| covers(&client, address, size),
+        ));
+
+        let low_descriptor = G17PRenderStorageVaLayout {
+            descriptors: 0x70_0020_0000,
+            ..layout
+        };
+        assert!(!low_descriptor.all_referenced_ranges_reachable(
+            |address, size| covers(&firmware, address, size),
+            |address, size| covers(&client, address, size),
+        ));
     }
 
     #[test]

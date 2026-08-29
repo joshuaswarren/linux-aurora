@@ -510,7 +510,7 @@ impl G17PManagerConstruction {
                 })?,
         );
         let storage = self.render_storage.as_mut().ok_or(ENODEV)?;
-        if !storage.is_reachable_from(&vm) {
+        if !storage.is_reachable_from(self.resources.uat(), &vm) {
             return Err(EFAULT);
         }
         let binding = self.resources.uat().bind(&vm)?;
@@ -899,6 +899,7 @@ impl G17PManagerConstruction {
                 .ok_or(ENODEV)?
                 .restage_command(
                     dev,
+                    self.resources.uat(),
                     vm,
                     command,
                     self.num_clusters,
@@ -931,7 +932,7 @@ impl G17PManagerConstruction {
         }
         let (fragment_queue, tiling_queue, previous, late_tiling) = {
             let storage = self.render_storage.as_mut().ok_or(ENODEV)?;
-            if !storage.is_reachable_from(vm) {
+            if !storage.is_reachable_from(self.resources.uat(), vm) {
                 return Err(EFAULT);
             }
             storage
