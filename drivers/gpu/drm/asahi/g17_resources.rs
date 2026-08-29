@@ -1316,9 +1316,7 @@ pub(crate) struct G17PUserRenderStorage {
     descriptors: MappedObject,
     descriptor_ta_low: mmu::KernelMapping,
     descriptor_3d_low: mmu::KernelMapping,
-    ta_context_peer: MappedObject,
     ta_context_low: mmu::KernelMapping,
-    fragment_context_peer: MappedObject,
     fragment_context_low: mmu::KernelMapping,
     graph: MappedObject,
     support: MappedObject,
@@ -1808,9 +1806,11 @@ impl G17PUserRenderStorage {
     const TILING_RING: usize = G17P_USER_TILING_RING;
     const FRAGMENT_RING: usize = 0x8000;
 
-    pub(crate) fn new(
+    fn new(
         dev: &AsahiDevice,
         uat: &mmu::Uat,
+        ta_context_peer: &mut MappedObject,
+        fragment_context_peer: &mut MappedObject,
         vm: &mmu::Vm,
         command: &g17_uapi::TranslatedRenderCommand,
         num_clusters: u32,
@@ -1834,20 +1834,6 @@ impl G17PUserRenderStorage {
             };
         }
 
-        // Reserve the native fixed peer runs before allocating any dynamic
-        // firmware-high render objects. Their low addresses are also reused
-        // by the class-1 operand closure only after this storage drops.
-        let mut ta_context_peer = bootstrap_stage!(
-            "TA context peer",
-            map_fixed_wc_object(
-                dev,
-                uat.kernel_vm(),
-                "TA context peer",
-                G17P_BOOTSTRAP_TA_CONTEXT_HIGH_VA,
-                G17P_BOOTSTRAP_CONTEXT_PEER_SIZE,
-                mmu::PROT_GPU_FW_SHARED_RW,
-            )
-        );
         let ta_context_low = match ta_context_peer.map_alias_at(
             uat.kernel_lower_vm(),
             G17P_BOOTSTRAP_TA_CONTEXT_LOW_VA,
@@ -1869,17 +1855,6 @@ impl G17PUserRenderStorage {
                 return Err(error);
             }
         };
-        let mut fragment_context_peer = bootstrap_stage!(
-            "3D context peer",
-            map_fixed_wc_object(
-                dev,
-                uat.kernel_vm(),
-                "3D context peer",
-                G17P_BOOTSTRAP_3D_CONTEXT_HIGH_VA,
-                G17P_BOOTSTRAP_CONTEXT_PEER_SIZE,
-                mmu::PROT_GPU_FW_SHARED_RW,
-            )
-        );
         let fragment_context_low = match fragment_context_peer.map_alias_at(
             uat.kernel_lower_vm(),
             G17P_BOOTSTRAP_3D_CONTEXT_LOW_VA,
@@ -2104,6 +2079,7 @@ impl G17PUserRenderStorage {
 
         let graph_va = graph.iova();
         bootstrap_stage!("TA queue context", ta_context_peer.with_bytes_mut(|raw| {
+            raw.fill(0);
             g17_submission::apply_g17p_cold_opening_queue_context(
                 g17_submission::G17PColdOpeningStage::Tiling,
                 descriptors.iova(),
@@ -2113,6 +2089,7 @@ impl G17PUserRenderStorage {
             .map_err(|_| EINVAL)
         }));
         bootstrap_stage!("3D queue context", fragment_context_peer.with_bytes_mut(|raw| {
+            raw.fill(0);
             g17_submission::apply_g17p_cold_opening_queue_context(
                 g17_submission::G17PColdOpeningStage::Fragment,
                 descriptors.iova() + mmu::UAT_PGSZ as u64,
@@ -2293,9 +2270,7 @@ impl G17PUserRenderStorage {
             descriptors,
             descriptor_ta_low,
             descriptor_3d_low,
-            ta_context_peer,
             ta_context_low,
-            fragment_context_peer,
             fragment_context_low,
             graph,
             support,
@@ -2560,11 +2535,9 @@ impl G17PUserRenderStorage {
                 true,
                 false,
             )
-            && self.ta_context_peer.iova() == G17P_BOOTSTRAP_TA_CONTEXT_HIGH_VA
-            && self.ta_context_peer.logical_size == G17P_BOOTSTRAP_CONTEXT_PEER_SIZE
             && uat.kernel_vm().covers_range(
-                self.ta_context_peer.iova(),
-                self.ta_context_peer.logical_size as u64,
+                G17P_BOOTSTRAP_TA_CONTEXT_HIGH_VA,
+                G17P_BOOTSTRAP_CONTEXT_PEER_SIZE as u64,
                 true,
                 true,
             )
@@ -2576,11 +2549,9 @@ impl G17PUserRenderStorage {
                 true,
                 false,
             )
-            && self.fragment_context_peer.iova() == G17P_BOOTSTRAP_3D_CONTEXT_HIGH_VA
-            && self.fragment_context_peer.logical_size == G17P_BOOTSTRAP_CONTEXT_PEER_SIZE
             && uat.kernel_vm().covers_range(
-                self.fragment_context_peer.iova(),
-                self.fragment_context_peer.logical_size as u64,
+                G17P_BOOTSTRAP_3D_CONTEXT_HIGH_VA,
+                G17P_BOOTSTRAP_CONTEXT_PEER_SIZE as u64,
                 true,
                 true,
             )
@@ -2962,6 +2933,8 @@ struct G17MappedResources {
     control_shared_inner: MappedObject,
     bootstrap_descriptor_zero_a: MappedObject,
     bootstrap_descriptor_zero_b: MappedObject,
+    bootstrap_ta_context_peer: MappedObject,
+    bootstrap_3d_context_peer: MappedObject,
     control_operand_table: RenderBackingObject,
     control_operand_buffers: KVec<RenderBackingObject>,
     compute_runtime_support: MappedObject,
@@ -3168,6 +3141,22 @@ impl G17ResourceOwner {
             G17P_BOOTSTRAP_DESCRIPTOR_ZERO_B_VA,
             mmu::UAT_PGSZ,
             mmu::PROT_GPU_FW_PRIV_RW,
+        )?;
+        let bootstrap_ta_context_peer = map_fixed_wc_object(
+            dev,
+            address_space.uat.kernel_vm(),
+            "bootstrap TA context peer",
+            G17P_BOOTSTRAP_TA_CONTEXT_HIGH_VA,
+            G17P_BOOTSTRAP_CONTEXT_PEER_SIZE,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        let bootstrap_3d_context_peer = map_fixed_wc_object(
+            dev,
+            address_space.uat.kernel_vm(),
+            "bootstrap 3D context peer",
+            G17P_BOOTSTRAP_3D_CONTEXT_HIGH_VA,
+            G17P_BOOTSTRAP_CONTEXT_PEER_SIZE,
+            mmu::PROT_GPU_FW_SHARED_RW,
         )?;
         let mut control_operand_table = match RenderBackingObject::new(
             dev,
@@ -3427,6 +3416,8 @@ impl G17ResourceOwner {
             ("control shared inner", &control_shared_inner),
             ("bootstrap descriptor zero A", &bootstrap_descriptor_zero_a),
             ("bootstrap descriptor zero B", &bootstrap_descriptor_zero_b),
+            ("bootstrap TA context peer", &bootstrap_ta_context_peer),
+            ("bootstrap 3D context peer", &bootstrap_3d_context_peer),
             ("compute runtime support", &compute_runtime_support),
             ("roots", &roots),
             ("shared cluster", &shared_cluster),
@@ -3570,6 +3561,8 @@ impl G17ResourceOwner {
                 control_shared_inner,
                 bootstrap_descriptor_zero_a,
                 bootstrap_descriptor_zero_b,
+                bootstrap_ta_context_peer,
+                bootstrap_3d_context_peer,
                 control_operand_table,
                 control_operand_buffers,
                 compute_runtime_support,
@@ -4013,6 +4006,18 @@ impl G17ResourceOwner {
                 Ok(())
             })?;
         self.resources
+            .bootstrap_ta_context_peer
+            .with_bytes_mut(|bytes| {
+                bytes.fill(0);
+                Ok(())
+            })?;
+        self.resources
+            .bootstrap_3d_context_peer
+            .with_bytes_mut(|bytes| {
+                bytes.fill(0);
+                Ok(())
+            })?;
+        self.resources
             .control_operand_table
             .with_bytes_mut(|bytes| {
                 g17_initdata::encode_control_operand_table(bytes).map_err(|_| EINVAL)
@@ -4149,6 +4154,8 @@ impl G17ResourceOwner {
         G17PUserRenderStorage::new(
             dev,
             &self.address_space.uat,
+            &mut self.resources.bootstrap_ta_context_peer,
+            &mut self.resources.bootstrap_3d_context_peer,
             vm,
             command,
             num_clusters,
