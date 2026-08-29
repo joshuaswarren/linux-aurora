@@ -198,12 +198,23 @@ const MAIN_CONTROL_RING: usize = 0x4c0;
 pub(crate) const CONTROL_OPENING_OPCODE_PRIMARY: u32 = 0x16;
 pub(crate) const CONTROL_OPENING_OPCODE_SECONDARY: u32 = 0x2a;
 pub(crate) const CONTROL_RECORD_SIZE: usize = 0x40;
-pub(crate) const CONTROL_OPENING_PRIMARY_RECORDS: usize = 4;
+pub(crate) const CONTROL_OPENING_PRIMARY_RECORDS: usize = 67;
 pub(crate) const CONTROL_OPENING_SECONDARY_RECORDS: usize = 16;
-pub(crate) const CONTROL_OPENING_PRIMARY_PRODUCER: u32 = 4;
+pub(crate) const CONTROL_OPENING_PRIMARY_PRODUCER: u32 = 67;
 pub(crate) const CONTROL_OPENING_SECONDARY_PRODUCER: u32 = 16;
 pub(crate) const CONTROL_OPENING_PRIMARY_REGISTER_OPCODE: u32 = 0x20;
 pub(crate) const CONTROL_OPENING_SECONDARY_CONTINUE_OPCODE: u32 = 0x22;
+
+// These are historical pointers in the completed 67-record checkpoint. All
+// three primary control cursors are published at 67 before firmware starts,
+// so no live control record can dereference them. Runtime submissions retain
+// their own validated BOs and mappings instead of borrowing bootstrap state.
+const CONTROL_COMPUTE_SEQUENCE_0_OBJECT: u64 = 0xffff_fc20_c082_8000;
+const CONTROL_COMPUTE_SEQUENCE_0_OPERAND: u64 = 0x70_0020_8000;
+const CONTROL_COMPUTE_SEQUENCE_22_OBJECT: u64 = 0xffff_fc20_c086_8000;
+const CONTROL_COMPUTE_SEQUENCE_22_OPERAND: u64 = 0x70_013a_0000;
+const CONTROL_COMPUTE_SEQUENCE_23_OBJECT: u64 = 0xffff_fc20_c082_8000;
+const CONTROL_COMPUTE_SEQUENCE_23_OPERAND: u64 = 0x70_019e_0000;
 
 pub(crate) const CONTROL_SHARED_ADDRESS: u64 = 0xffff_fc20_c083_0000;
 pub(crate) const CONTROL_SHARED_INNER_ADDRESS: u64 = 0xffff_fc20_0160_8000;
@@ -211,7 +222,7 @@ pub(crate) const CONTROL_SHARED_OBJECT_SIZE: usize = 0x4000;
 pub(crate) const CONTROL_SHARED_CURSOR_OFFSET: usize = 0x48;
 pub(crate) const CONTROL_SHARED_CURSOR_BEFORE: u32 = 0x88;
 pub(crate) const CONTROL_OPERAND_TABLE_ADDRESS: u64 = 0x70_0020_8000;
-pub(crate) const CONTROL_OPERAND_TABLE_SIZE: usize = 0x4000;
+pub(crate) const CONTROL_OPERAND_TABLE_SIZE: usize = 0x10000;
 pub(crate) const CONTROL_OPERAND_SLOT_OFFSET: u64 = 0x440;
 pub(crate) const CONTROL_OPERAND_BUFFER_BASE: u64 = 0x70_0022_0000;
 pub(crate) const CONTROL_OPERAND_BUFFER_STRIDE: u64 = 0x10_8000;
@@ -234,6 +245,26 @@ pub(crate) const fn control_opening_size(role: InstanceRole) -> usize {
     }
 }
 
+fn encode_control_registration(
+    out: &mut [u8],
+    slot: usize,
+    sequence: u32,
+    object: u64,
+    operand: u64,
+    count: u32,
+) {
+    let base = slot * CONTROL_RECORD_SIZE;
+    put_u32(out, base, CONTROL_OPENING_PRIMARY_REGISTER_OPCODE);
+    put_u32(out, base + 0x04, 1);
+    put_u32(out, base + 0x08, 0x3f);
+    put_u32(out, base + 0x0c, sequence);
+    put_u64(out, base + 0x14, object);
+    put_u64(out, base + 0x1c, operand);
+    put_u64(out, base + 0x24, operand + CONTROL_OPERAND_SLOT_OFFSET);
+    put_u32(out, base + 0x2c, count);
+    put_u32(out, base + 0x34, 1);
+}
+
 /// Encode the complete control ring prefix consumed during the 25G83 opening.
 pub(crate) fn encode_control_opening(
     role: InstanceRole,
@@ -246,26 +277,60 @@ pub(crate) fn encode_control_opening(
 
     match role {
         InstanceRole::Primary => {
-            for slot in 0..3 {
-                put_u32(
-                    out,
-                    slot * CONTROL_RECORD_SIZE,
-                    CONTROL_OPENING_OPCODE_PRIMARY,
-                );
-            }
-            let base = 3 * CONTROL_RECORD_SIZE;
-            put_u32(out, base, CONTROL_OPENING_PRIMARY_REGISTER_OPCODE);
-            put_u32(out, base + 0x04, 1);
-            put_u32(out, base + 0x08, 0x3f);
-            put_u64(out, base + 0x14, CONTROL_SHARED_ADDRESS);
-            put_u64(out, base + 0x1c, CONTROL_OPERAND_TABLE_ADDRESS);
-            put_u64(
+            let mut slot = 0usize;
+            put_u32(
                 out,
-                base + 0x24,
-                CONTROL_OPERAND_TABLE_ADDRESS + CONTROL_OPERAND_SLOT_OFFSET,
+                slot * CONTROL_RECORD_SIZE,
+                CONTROL_OPENING_OPCODE_PRIMARY,
             );
-            put_u32(out, base + 0x2c, 0x28);
-            put_u32(out, base + 0x34, 1);
+            slot += 1;
+
+            encode_control_registration(
+                out,
+                slot,
+                0,
+                CONTROL_COMPUTE_SEQUENCE_0_OBJECT,
+                CONTROL_COMPUTE_SEQUENCE_0_OPERAND,
+                0x28,
+            );
+            slot += 1;
+            for sequence in 0..22 {
+                let base = slot * CONTROL_RECORD_SIZE;
+                put_u32(out, base, 0x2e);
+                put_u32(out, base + 0x04, sequence);
+                slot += 1;
+            }
+            encode_control_registration(
+                out,
+                slot,
+                22,
+                CONTROL_COMPUTE_SEQUENCE_22_OBJECT,
+                CONTROL_COMPUTE_SEQUENCE_22_OPERAND,
+                0x20,
+            );
+            slot += 1;
+            let base = slot * CONTROL_RECORD_SIZE;
+            put_u32(out, base, 0x2e);
+            put_u32(out, base + 0x04, 22);
+            slot += 1;
+            encode_control_registration(
+                out,
+                slot,
+                23,
+                CONTROL_COMPUTE_SEQUENCE_23_OBJECT,
+                CONTROL_COMPUTE_SEQUENCE_23_OPERAND,
+                0x20,
+            );
+            slot += 1;
+            for sequence in 23..63 {
+                let base = slot * CONTROL_RECORD_SIZE;
+                put_u32(out, base, 0x2e);
+                put_u32(out, base + 0x04, sequence);
+                slot += 1;
+            }
+            if slot != CONTROL_OPENING_PRIMARY_RECORDS {
+                return Err(InitdataError::BufferSize);
+            }
         }
         InstanceRole::Secondary => {
             for slot in 0..3 {
@@ -2137,36 +2202,72 @@ mod tests {
     }
 
     #[test]
-    fn primary_control_opening_is_three_init_records_then_registration() {
+    fn primary_control_opening_matches_completed_compute_checkpoint() {
         let mut opening = vec![0; control_opening_size(InstanceRole::Primary)];
         encode_control_opening(InstanceRole::Primary, &mut opening).unwrap();
 
-        assert_eq!(control_opening_producer(InstanceRole::Primary), 4);
-        for slot in 0..3 {
-            let base = slot * CONTROL_RECORD_SIZE;
-            assert_eq!(get_u32(&opening, base), CONTROL_OPENING_OPCODE_PRIMARY);
-            assert!(opening[base + 4..base + CONTROL_RECORD_SIZE]
-                .iter()
-                .all(|byte| *byte == 0));
+        fn fnv1a64(bytes: &[u8]) -> u64 {
+            bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+            })
         }
-        let base = 3 * CONTROL_RECORD_SIZE;
+
+        assert_eq!(control_opening_producer(InstanceRole::Primary), 67);
+        assert_eq!(opening.len(), 0x10c0);
+        assert_eq!(fnv1a64(&opening), 0x2d21_5073_9c86_2bc8);
+
+        let opening_record = 0;
         assert_eq!(
-            get_u32(&opening, base),
-            CONTROL_OPENING_PRIMARY_REGISTER_OPCODE
+            get_u32(&opening, opening_record),
+            CONTROL_OPENING_OPCODE_PRIMARY
         );
-        assert_eq!(get_u32(&opening, base + 0x04), 1);
-        assert_eq!(get_u32(&opening, base + 0x08), 0x3f);
-        assert_eq!(get_u64(&opening, base + 0x14), CONTROL_SHARED_ADDRESS);
-        assert_eq!(
-            get_u64(&opening, base + 0x1c),
-            CONTROL_OPERAND_TABLE_ADDRESS
-        );
-        assert_eq!(
-            get_u64(&opening, base + 0x24),
-            CONTROL_OPERAND_TABLE_ADDRESS + CONTROL_OPERAND_SLOT_OFFSET
-        );
-        assert_eq!(get_u32(&opening, base + 0x2c), 0x28);
-        assert_eq!(get_u32(&opening, base + 0x34), 1);
+        assert!(opening[4..CONTROL_RECORD_SIZE]
+            .iter()
+            .all(|byte| *byte == 0));
+
+        for (slot, sequence, object, operand, count) in [
+            (
+                1,
+                0,
+                CONTROL_COMPUTE_SEQUENCE_0_OBJECT,
+                CONTROL_COMPUTE_SEQUENCE_0_OPERAND,
+                0x28,
+            ),
+            (
+                24,
+                22,
+                CONTROL_COMPUTE_SEQUENCE_22_OBJECT,
+                CONTROL_COMPUTE_SEQUENCE_22_OPERAND,
+                0x20,
+            ),
+            (
+                26,
+                23,
+                CONTROL_COMPUTE_SEQUENCE_23_OBJECT,
+                CONTROL_COMPUTE_SEQUENCE_23_OPERAND,
+                0x20,
+            ),
+        ] {
+            let base = slot * CONTROL_RECORD_SIZE;
+            assert_eq!(
+                get_u32(&opening, base),
+                CONTROL_OPENING_PRIMARY_REGISTER_OPCODE
+            );
+            assert_eq!(get_u32(&opening, base + 0x04), 1);
+            assert_eq!(get_u32(&opening, base + 0x08), 0x3f);
+            assert_eq!(get_u32(&opening, base + 0x0c), sequence);
+            assert_eq!(get_u64(&opening, base + 0x14), object);
+            assert_eq!(get_u64(&opening, base + 0x1c), operand);
+            assert_eq!(get_u64(&opening, base + 0x24), operand + 0x440);
+            assert_eq!(get_u32(&opening, base + 0x2c), count);
+            assert_eq!(get_u32(&opening, base + 0x30), 0);
+            assert_eq!(get_u32(&opening, base + 0x34), 1);
+        }
+
+        let last = 66 * CONTROL_RECORD_SIZE;
+        assert_eq!(get_u32(&opening, last), 0x2e);
+        assert_eq!(get_u32(&opening, last + 0x04), 62);
+        assert_eq!(get_u32(&opening, last + 0x0c), 0);
     }
 
     #[test]
@@ -2542,7 +2643,7 @@ mod tests {
         assert_eq!(PRIMARY_STATUS_B_OBJECT_SIZE, 0xeb00);
         // Device-control record framing and both complete opening prefixes.
         assert_eq!(CONTROL_RECORD_SIZE, 0x40);
-        assert_eq!(CONTROL_OPENING_PRIMARY_PRODUCER, 4);
+        assert_eq!(CONTROL_OPENING_PRIMARY_PRODUCER, 67);
         assert_eq!(CONTROL_OPENING_SECONDARY_PRODUCER, 16);
         // Channel state-block stride within the compact grid.
         assert_eq!(CHANNEL_STATE_STRIDE, 0x40);

@@ -406,7 +406,7 @@ fn finish_boot_session(
     if !staged.opening_staged() {
         dev_err!(
             pdev.as_ref(),
-            "G17P control: staged counters are {:?}/{:?}, expected [0, 0, 4]/[0, 0, 16]\n",
+            "G17P control: staged counters are {:?}/{:?}, expected [67, 67, 67]/[0, 0, 16]\n",
             staged.primary,
             staged.secondary
         );
@@ -414,7 +414,7 @@ fn finish_boot_session(
     }
     dev_info!(
         pdev.as_ref(),
-        "G17P control: 4 primary and 16 secondary records staged\n"
+        "G17P control: primary checkpoint 67 complete; 16 secondary records staged\n"
     );
 
     let control_start = (CONTROL_START_TYPE as u64) << 48;
@@ -438,7 +438,7 @@ fn finish_boot_session(
     if !counters.opening_retired() {
         dev_err!(
             pdev.as_ref(),
-            "G17P control: counters stopped at {:?}/{:?}, expected [4, 4, 4]/[16, 16, 16]\n",
+            "G17P control: counters stopped at {:?}/{:?}, expected [67, 67, 67]/[16, 16, 16]\n",
             counters.primary,
             counters.secondary
         );
@@ -446,7 +446,7 @@ fn finish_boot_session(
     }
     dev_info!(
         pdev.as_ref(),
-        "G17P control: counters retired at [4, 4, 4]/[16, 16, 16]\n"
+        "G17P control: counters retired at [67, 67, 67]/[16, 16, 16]\n"
     );
 
     let control_done = ((CONTROL_DONE_TYPE as u64) << 48) | CONTROL_DONE_CHANNEL;
@@ -924,8 +924,15 @@ impl G17PLiveRuntime {
                     let pdev = self.pdev.as_ref().ok_or(ENODEV)?;
                     match (snapshot, user_timestamps) {
                         (Ok(snapshot), Ok(user_timestamps)) => {
+                            let control = snapshot.control;
                             let channel = snapshot.channel;
                             let graph = snapshot.graph;
+                            dev_err!(
+                                pdev.as_ref(),
+                                "G17P compute timeout: control primary={:?} secondary={:?}\n",
+                                control.primary,
+                                control.secondary
+                            );
                             dev_err!(
                                 pdev.as_ref(),
                                 "G17P compute timeout: CL_2 table={} ring={:#x} states={:#x?} cursors={:?} slot={} queue={:#x} kind={} flags={:#x} doorbell={:#x}\n",
