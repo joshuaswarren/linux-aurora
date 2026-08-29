@@ -346,6 +346,13 @@ void dcp_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message)
 				 true);
 }
 
+int dcp_send_message_sync(struct apple_dcp *dcp, u8 endpoint, u64 message)
+{
+	trace_dcp_send_msg(dcp, endpoint, message);
+	return apple_rtkit_send_message(dcp->rtk, endpoint, message, NULL,
+					false);
+}
+
 int dcp_start_rtkit_endpoint(struct apple_dcp *dcp, u8 endpoint)
 {
 	u64 message;
