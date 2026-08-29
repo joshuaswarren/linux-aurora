@@ -1181,6 +1181,7 @@ impl G17PManagerConstruction {
                 },
                 submitted: 0,
                 current_timestamp: 1,
+                last_add_kicks_timestamp: 1,
                 base_timestamp: 1,
                 previous_valid: false,
                 previous_timestamp: 0,
@@ -1248,6 +1249,7 @@ impl G17PManagerConstruction {
         queue.producer = prepared.producer_after;
         let timestamp = prepared.current_timestamp;
         self.add_sksm_kicks(registers, queue, 1)?;
+        queue.producer.last_add_kicks_timestamp = timestamp;
         fence(Ordering::SeqCst);
         Ok(timestamp)
     }
@@ -1351,7 +1353,43 @@ impl G17PManagerConstruction {
             .map_err(|_| EINVAL)
         })?;
 
-        let group = queue.compute.stage_initial_channel_group(
+        let command_state = g17_submission::prepare_g17p_compute_cl_command_state(
+            descriptor_low,
+            queue.submission_ordinal,
+        )
+        .map_err(|_| EINVAL)?;
+        let prepared_entry = g17_submission::prepare_g17p_cl_kick_entry(
+            queue.producer,
+            g17_submission::G17PClKickEntryOperands {
+                descriptor_flag_4c: false,
+                descriptor_flag_5c8: false,
+                converted_command_timestamp: 1,
+                barriers: &[],
+                mcache: None,
+                payload: [descriptor_high, queue.compute.queue_record_gpu_va()],
+                event_mask: command_state.event_mask,
+                rce_kind: 0,
+                rce_bindings: command_state.rce_bindings,
+                auxiliary: 0x003f_ffff_ffff_ffff,
+            },
+        )
+        .map_err(|_| EINVAL)?;
+        if prepared_entry.entry_index != 1
+            || prepared_entry.entry_offset != 0x200
+            || prepared_entry.current_timestamp != 1
+        {
+            return Err(EINVAL);
+        }
+        let primary_event = g17_submission::prepare_g17p_compute_primary_event(
+            0,
+            0,
+            queue.queue_id,
+            queue.producer.completion_selector,
+            prepared_entry.current_timestamp,
+        )
+        .map_err(|_| EINVAL)?;
+
+        let group = queue.compute.stage_initial_channel_group_before_event(
             descriptor_high,
             user_layout.queue_context,
             shared_control,
@@ -1359,13 +1397,25 @@ impl G17PManagerConstruction {
         )?;
         self.publish_compute_b2_once(queue)?;
         self.stage_compute_runtime_tick_once()?;
+        queue.storage.write_entry(
+            prepared_entry.entry_offset as usize,
+            prepared_entry.zero_length as usize,
+            &prepared_entry.entry,
+        )?;
         fence(Ordering::SeqCst);
+        queue.producer = prepared_entry.producer_after;
+        let event_generation = queue
+            .compute
+            .publish_initial_primary_event(primary_event)?;
         self.add_sksm_kicks(registers, queue, 1)?;
+        queue.producer.last_add_kicks_timestamp = prepared_entry.current_timestamp;
         dev_info!(
             self.resources.dev().as_ref(),
-            "G17P compute: candidate add3-sksm-before-cl2-v1 qid {} add_count 1 current_timestamp {:#x}\n",
+            "G17P compute: candidate sksm-entry-event-v1 qid {} entry_offset {:#x} timestamp {:#x} event_generation {}\n",
             queue.queue_id,
-            queue.producer.current_timestamp
+            prepared_entry.entry_offset,
+            prepared_entry.current_timestamp,
+            event_generation
         );
         fence(Ordering::SeqCst);
         let prepared = self

@@ -1369,6 +1369,7 @@ mod tests {
                 },
                 submitted: 0,
                 current_timestamp: 0,
+                last_add_kicks_timestamp: 0,
                 base_timestamp: 0,
                 previous_valid: false,
                 previous_timestamp: 0,

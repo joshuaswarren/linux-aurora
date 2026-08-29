@@ -66,6 +66,9 @@ const G17P_COMPUTE_ADD3_RESOURCE_TABLE: usize = 0x14a0;
 pub(crate) const G17P_COMPUTE_OPERAND_STATE_SIZE: usize = 0x14000;
 pub(crate) const G17P_COMPUTE_SUPPORT_SIZE: usize = 0xc000;
 pub(crate) const G17P_COMPUTE_QUEUE_GRAPH_SIZE: usize = g17_compute::COMPUTE_QUEUE_GRAPH_SIZE;
+const _: () = assert!(
+    g17_submission::G17P_COMPUTE_PRIMARY_EVENT_SIZE <= g17_compute::COMPUTE_EVENT_SIZE
+);
 pub(crate) const G17P_RENDER_DESCRIPTOR_STORAGE_SIZE: usize = 0x8000;
 /// Number of retained ordinals representable by the optional-record ABI.
 pub(crate) const G17P_RETAINED_RENDER_ORDINALS: u32 = 0x100;
@@ -1627,7 +1630,7 @@ impl G17PComputeDescriptorStorage {
         self.queue_graph.iova()
     }
 
-    pub(crate) fn stage_initial_channel_group(
+    pub(crate) fn stage_initial_channel_group_before_event(
         &mut self,
         descriptor: u64,
         context_low: u64,
@@ -1649,7 +1652,7 @@ impl G17PComputeDescriptorStorage {
                 self.queue_context_high.logical_size,
             )
         };
-        g17_compute::build_initial_compute_channel_group(
+        let group = g17_compute::build_initial_compute_channel_group(
             queue,
             descriptor,
             context_low,
@@ -1659,7 +1662,60 @@ impl G17PComputeDescriptorStorage {
             graph,
             queue_context,
         )
-        .map_err(|_| EINVAL)
+        .map_err(|_| EINVAL)?;
+
+        // The output-positive builder provides the final bytes, but native
+        // submitBuffer does not make its primary event reachable until after
+        // the SKSM entry barrier and producer transition. Return the graph to
+        // that pre-event state; the typed publisher below performs the three
+        // ordered event writes.
+        graph[g17_compute::COMPUTE_EVENT
+            ..g17_compute::COMPUTE_EVENT + g17_compute::COMPUTE_EVENT_SIZE]
+            .fill(0);
+        put_u64(graph, g17_compute::COMPUTE_ITEM_RING + 0x10, 0);
+        put_u32(graph, g17_compute::COMPUTE_QUEUE_POINTERS + 0x40, 2);
+        Ok(group)
+    }
+
+    /// Write the prepared primary event, publish its pointer, then advance
+    /// the inner producer. Each transition is separated by the native
+    /// inner-shareable ordering boundary before addKicks and CL2 publication.
+    pub(crate) fn publish_initial_primary_event(
+        &mut self,
+        event: g17_submission::PreparedG17PComputePrimaryEvent,
+    ) -> Result<u32> {
+        let event_gpu_va = self.queue_graph.iova() + g17_compute::COMPUTE_EVENT as u64;
+        self.queue_graph.with_bytes_mut(|graph| {
+            let producer_offset = g17_compute::COMPUTE_QUEUE_POINTERS + 0x40;
+            let producer = u32::from_le_bytes(
+                graph[producer_offset..producer_offset + 4]
+                    .try_into()
+                    .map_err(|_| ERANGE)?,
+            );
+            let event_pointer_offset = g17_compute::COMPUTE_ITEM_RING + 0x10;
+            let event_pointer = u64::from_le_bytes(
+                graph[event_pointer_offset..event_pointer_offset + 8]
+                    .try_into()
+                    .map_err(|_| ERANGE)?,
+            );
+            if producer != 2 || event_pointer != 0 {
+                return Err(EBUSY);
+            }
+
+            graph[g17_compute::COMPUTE_EVENT
+                ..g17_compute::COMPUTE_EVENT + event.bytes.len()]
+                .copy_from_slice(&event.bytes);
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            put_u64(graph, event_pointer_offset, event_gpu_va);
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            put_u32(
+                graph,
+                producer_offset,
+                g17_compute::COMPUTE_CHANNEL_WRITE_INDEX,
+            );
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            Ok(event.descriptor_generation)
+        })
     }
 
     pub(crate) fn snapshot_initial_channel_group(&mut self) -> Result<G17PComputeGraphSnapshot> {
