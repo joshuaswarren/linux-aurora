@@ -450,10 +450,12 @@ fn finish_boot_session(
     );
 
     let control_done = ((CONTROL_DONE_TYPE as u64) << 48) | CONTROL_DONE_CHANNEL;
-    Pin::new(&mut gfx_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, control_done)?;
-    dev_info!(pdev.as_ref(), "G17P control: primary done message sent\n");
-
     if !test_stage.configures_qid4() {
+        Pin::new(&mut gfx_rtkit).send_message(
+            g17_rtkit::ENDPOINT_GFX_INTERRUPTS,
+            control_done,
+        )?;
+        dev_info!(pdev.as_ref(), "G17P control: primary done message sent\n");
         dev_info!(
             pdev.as_ref(),
             "G17P session: control stage complete; QID4 remains untouched\n"
@@ -468,6 +470,33 @@ fn finish_boot_session(
             compute_uapi_enabled: false,
         });
     }
+
+    manager.prepare_partial_opening_control_done()?;
+    let bootstrap = manager.begin_compute_bootstrap_render(drm)?;
+    dev_info!(
+        pdev.as_ref(),
+        "G17P compute control: startup TA/3D group staged; sending primary done\n"
+    );
+    Pin::new(&mut gfx_rtkit)
+        .send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, control_done)?;
+    Pin::new(&mut gfx_rtkit).send_message(
+        g17_rtkit::ENDPOINT_GFX_INTERRUPTS,
+        bootstrap.paired_doorbell,
+    )?;
+    dev_info!(
+        pdev.as_ref(),
+        "G17P compute control: channel-8 startup work sent\n"
+    );
+    manager.wait_compute_bootstrap_render_retirement()?;
+    if gfx_state.crashed.load(Ordering::Acquire) || gfx1_state.crashed.load(Ordering::Acquire) {
+        return Err(EIO);
+    }
+    Pin::new(&mut gfx_rtkit)
+        .send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, control_done)?;
+    dev_info!(
+        pdev.as_ref(),
+        "G17P compute control: startup TA/3D retired at 3/3/3\n"
+    );
 
     manager.prepare_compute_runtime_class1()?;
     dev_info!(
