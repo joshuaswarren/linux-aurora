@@ -17,10 +17,16 @@
 #include <linux/bitfield.h>
 #include <linux/bitops.h>
 #include <linux/io-pgtable.h>
+#include <linux/io.h>
 #include <linux/kernel.h>
+#include <linux/module.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/types.h>
+
+#if IS_ENABLED(CONFIG_APPLE_DART_KUNIT_TEST)
+#include <kunit/test.h>
+#endif
 
 #include <asm/barrier.h>
 #include "iommu-pages.h"
@@ -465,6 +471,207 @@ static void apple_dart_free_pgtables(struct dart_io_pgtable *data, dart_iopte *p
 	}
 	iommu_free_pages(start);
 }
+
+static dart_iopte dart_paddr_mask(struct dart_io_pgtable *data)
+{
+	if (data->iop.fmt == APPLE_DART)
+		return APPLE_DART1_PADDR_MASK;
+
+	return APPLE_DART2_PADDR_MASK;
+}
+
+static int apple_dart_clone_pgtable(struct dart_io_pgtable *data,
+				    dart_iopte *dst, const dart_iopte *src,
+				    int level)
+{
+	size_t tblsz = DART_GRANULE(data);
+	unsigned int i;
+
+	if (level == 1) {
+		memcpy(dst, src, tblsz);
+		return 0;
+	}
+
+	for (i = 0; i < DART_PTES_PER_TABLE(data); i++) {
+		dart_iopte pte = READ_ONCE(src[i]);
+		dart_iopte *src_child, *dst_child;
+		phys_addr_t child_phys;
+		int ret;
+
+		if (!(pte & APPLE_DART_PTE_VALID))
+			continue;
+
+		child_phys = iopte_to_paddr(pte, data);
+		src_child = memremap(child_phys, tblsz, MEMREMAP_WB);
+		if (!src_child)
+			return -ENOMEM;
+
+		dst_child = iommu_alloc_pages_sz(GFP_KERNEL, tblsz);
+		if (!dst_child) {
+			memunmap(src_child);
+			return -ENOMEM;
+		}
+
+		ret = apple_dart_clone_pgtable(data, dst_child, src_child,
+					       level - 1);
+		memunmap(src_child);
+		if (ret) {
+			apple_dart_free_pgtables(data, dst_child, level - 1);
+			return ret;
+		}
+
+		dst[i] = (pte & ~dart_paddr_mask(data)) |
+			 paddr_to_iopte(__pa(dst_child), data);
+	}
+
+	/* Publish cloned child tables before the cloned parent is installed. */
+	wmb();
+	return 0;
+}
+
+int io_pgtable_apple_dart_import(struct io_pgtable_ops *ops,
+				 unsigned int ttbr, phys_addr_t paddr)
+{
+	struct dart_io_pgtable *data = io_pgtable_ops_to_data(ops);
+	dart_iopte *src;
+	int ret;
+
+	if (ttbr >= ARRAY_SIZE(data->pgd) || !data->pgd[ttbr])
+		return -EINVAL;
+	if (memchr_inv(data->pgd[ttbr], 0, DART_GRANULE(data)))
+		return -EBUSY;
+
+	src = memremap(paddr, DART_GRANULE(data), MEMREMAP_WB);
+	if (!src)
+		return -ENOMEM;
+
+	ret = apple_dart_clone_pgtable(data, data->pgd[ttbr], src,
+				       data->levels - 1);
+	memunmap(src);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(io_pgtable_apple_dart_import);
+
+#if IS_ENABLED(CONFIG_APPLE_DART_KUNIT_TEST)
+static void apple_dart_free_pgtable(struct io_pgtable *iop);
+
+static dart_iopte apple_dart_test_leaf(struct dart_io_pgtable *data,
+				       phys_addr_t paddr, int prot)
+{
+	return paddr_to_iopte(paddr, data) | dart_prot_to_pte(data, prot) |
+	       FIELD_PREP(APPLE_DART_PTE_SUBPAGE_START, 0) |
+	       FIELD_PREP(APPLE_DART_PTE_SUBPAGE_END, 0xfff) |
+	       APPLE_DART_PTE_VALID;
+}
+
+static void apple_dart_locked_import_preserves_boot_mappings_test(struct kunit *test)
+{
+	static const unsigned long region94_iova = 0x1ddc000;
+	static const unsigned long region95_iova = 0x1de0000;
+	static const unsigned long framebuffer_iova = 0x1ea0000;
+	static const unsigned long fault_iova = 0x2b6ad00;
+	static const phys_addr_t region94_pa = 0x101f0cd0000;
+	static const phys_addr_t region95_pa = 0x101f0c10000;
+	static const phys_addr_t framebuffer_pa = 0x101eb4b8000;
+	static const phys_addr_t fault_page_pa = 0x101ec180000;
+	static const int rw = IOMMU_READ | IOMMU_WRITE;
+	struct io_pgtable_cfg cfg = {
+		.pgsize_bitmap = SZ_16K,
+		.ias = 36,
+		.oas = 42,
+		.coherent_walk = true,
+	};
+	struct io_pgtable *iop;
+	struct dart_io_pgtable *data;
+	dart_iopte *src_root, *src_low, *src_high, *saved_root, *ptep;
+	dart_iopte root_low, root_high, fault_leaf;
+	phys_addr_t translated, expected_fault_pa;
+	int low_idx, high_idx, fault_idx, ret;
+
+	iop = apple_dart_alloc_pgtable(&cfg, NULL);
+	KUNIT_ASSERT_NOT_NULL(test, iop);
+	data = io_pgtable_to_data(iop);
+	KUNIT_ASSERT_EQ(test, data->levels, 3);
+
+	src_root = iommu_alloc_pages_sz(GFP_KERNEL, SZ_16K);
+	src_low = iommu_alloc_pages_sz(GFP_KERNEL, SZ_16K);
+	src_high = iommu_alloc_pages_sz(GFP_KERNEL, SZ_16K);
+	KUNIT_ASSERT_NOT_NULL(test, src_root);
+	KUNIT_ASSERT_NOT_NULL(test, src_low);
+	KUNIT_ASSERT_NOT_NULL(test, src_high);
+
+	low_idx = dart_get_index(data, region94_iova, data->levels - 1);
+	high_idx = dart_get_index(data, fault_iova, data->levels - 1);
+	fault_idx = dart_get_last_index(data, fault_iova);
+	expected_fault_pa = fault_page_pa | (fault_iova & (SZ_16K - 1));
+	KUNIT_ASSERT_NE(test, low_idx, high_idx);
+
+	root_low = paddr_to_iopte(__pa(src_low), data) |
+		   APPLE_DART_PTE_VALID;
+	root_high = paddr_to_iopte(__pa(src_high), data) |
+		    APPLE_DART_PTE_VALID;
+	src_root[low_idx] = root_low;
+	src_root[high_idx] = root_high;
+	saved_root = kmemdup(src_root, SZ_16K, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, saved_root);
+
+	src_low[dart_get_last_index(data, region94_iova)] =
+		apple_dart_test_leaf(data, region94_pa, rw);
+	src_low[dart_get_last_index(data, region95_iova)] =
+		apple_dart_test_leaf(data, region95_pa, rw);
+	src_low[dart_get_last_index(data, framebuffer_iova)] =
+		apple_dart_test_leaf(data, framebuffer_pa, rw);
+	fault_leaf = apple_dart_test_leaf(data, fault_page_pa, rw);
+	src_high[fault_idx] = fault_leaf;
+
+	ret = io_pgtable_apple_dart_import(&iop->ops, 0, __pa(src_root));
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	KUNIT_EXPECT_EQ(test, iop->ops.iova_to_phys(&iop->ops, region94_iova),
+			region94_pa);
+	KUNIT_EXPECT_EQ(test, iop->ops.iova_to_phys(&iop->ops, region95_iova),
+			region95_pa);
+	translated = iop->ops.iova_to_phys(&iop->ops, framebuffer_iova);
+	KUNIT_EXPECT_EQ(test, translated, framebuffer_pa);
+	KUNIT_EXPECT_EQ(test, iop->ops.iova_to_phys(&iop->ops, fault_iova),
+			expected_fault_pa);
+
+	ptep = dart_get_last(data, fault_iova) + fault_idx;
+	KUNIT_EXPECT_EQ(test, READ_ONCE(*ptep), fault_leaf);
+	KUNIT_EXPECT_FALSE(test, *ptep & APPLE_DART2_PTE_PROT_NO_WRITE);
+	KUNIT_EXPECT_FALSE(test, *ptep & APPLE_DART2_PTE_PROT_NO_READ);
+
+	/* Model locked attach/sync, then restore before freeing the clone. */
+	memcpy(src_root, data->pgd[0], SZ_16K);
+	KUNIT_EXPECT_NE(test, src_root[low_idx], root_low);
+	KUNIT_EXPECT_NE(test, src_root[high_idx], root_high);
+	translated = iop->ops.iova_to_phys(&iop->ops, fault_iova);
+	KUNIT_EXPECT_EQ(test, translated, expected_fault_pa);
+	KUNIT_EXPECT_FALSE(test, *ptep & APPLE_DART2_PTE_PROT_NO_WRITE);
+	memcpy(src_root, saved_root, SZ_16K);
+
+	apple_dart_free_pgtable(iop);
+	KUNIT_EXPECT_EQ(test, src_root[low_idx], root_low);
+	KUNIT_EXPECT_EQ(test, src_root[high_idx], root_high);
+	KUNIT_EXPECT_EQ(test, src_high[fault_idx], fault_leaf);
+
+	iommu_free_pages(src_high);
+	iommu_free_pages(src_low);
+	iommu_free_pages(src_root);
+	kfree(saved_root);
+}
+
+static struct kunit_case apple_dart_pgtable_test_cases[] = {
+	KUNIT_CASE(apple_dart_locked_import_preserves_boot_mappings_test),
+	{}
+};
+
+static struct kunit_suite apple_dart_pgtable_test_suite = {
+	.name = "apple-dart-pgtable",
+	.test_cases = apple_dart_pgtable_test_cases,
+};
+
+kunit_test_suite(apple_dart_pgtable_test_suite);
+#endif
 
 static void apple_dart_free_pgtable(struct io_pgtable *iop)
 {
