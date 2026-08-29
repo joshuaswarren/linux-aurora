@@ -3123,7 +3123,7 @@ impl G17ResourceOwner {
         )?;
         control_shared_inner.with_bytes_mut(|bytes| {
             bytes.fill(0);
-            bytes[..8].copy_from_slice(&1u64.to_le_bytes());
+            bytes[..8].copy_from_slice(&g17_initdata::CONTROL_SHARED_INNER_PRESENTED.to_le_bytes());
             Ok(())
         })?;
         let bootstrap_descriptor_zero_a = map_fixed_wc_object(
@@ -3994,7 +3994,8 @@ impl G17ResourceOwner {
             .control_shared_inner
             .with_bytes_mut(|bytes| {
                 bytes.fill(0);
-                bytes[..8].copy_from_slice(&1u64.to_le_bytes());
+                bytes[..8]
+                    .copy_from_slice(&g17_initdata::CONTROL_SHARED_INNER_PRESENTED.to_le_bytes());
                 Ok(())
             })?;
         self.resources
