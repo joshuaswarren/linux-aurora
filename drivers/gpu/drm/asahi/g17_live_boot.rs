@@ -866,7 +866,7 @@ fn finish_boot_session(
     );
     dev_info!(
         pdev.as_ref(),
-        "G17P compute: candidate slot1-runtime-tick-v1 armed\n"
+        "G17P compute: candidate native-cl2-bundle-v1 armed\n"
     );
     Ok(G17PBootedSession {
         cpus,
