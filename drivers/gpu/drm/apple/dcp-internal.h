@@ -163,6 +163,7 @@ struct apple_dcp {
 	u32 link_top[2][APPLE_DCP_LINK_STREAMS_PER_SIDE];
 	u16 link_version;
 	u32 link_firmware_hash;
+	u64 link_init_message;
 	enum apple_dcp_link_state link_state;
 	bool link_endpoint_started;
 
