@@ -1035,6 +1035,46 @@ pub(crate) struct G17PComputeUserMappings {
 }
 
 #[cfg(not(test))]
+#[derive(Debug, Copy, Clone)]
+pub(crate) struct G17PComputeGraphSnapshot {
+    pub(crate) queue: u64,
+    pub(crate) pointers: u64,
+    pub(crate) item_ring: u64,
+    pub(crate) context_high: u64,
+    pub(crate) cursors: [u32; 3],
+    pub(crate) gpu_read_cursors: [u32; 3],
+    pub(crate) uuid: u32,
+    pub(crate) queue_context: u64,
+    pub(crate) items: [u64; 3],
+    pub(crate) event: [u32; 5],
+    pub(crate) status: [u64; 2],
+    pub(crate) descriptor: u64,
+    pub(crate) descriptor_selector: u32,
+    pub(crate) descriptor_context: u32,
+    pub(crate) descriptor_grid: u32,
+    pub(crate) descriptor_timestamps: [u64; 2],
+    pub(crate) optional_contexts: [u64; 2],
+    pub(crate) optional_grid: u16,
+    pub(crate) optional_uuid: u16,
+    pub(crate) optional_shared: u64,
+    pub(crate) optional_channel: u64,
+    pub(crate) context_record: [u64; 3],
+}
+
+#[cfg(not(test))]
+#[derive(Debug, Copy, Clone)]
+pub(crate) struct G17PComputeChannelSnapshot {
+    pub(crate) table_index: u8,
+    pub(crate) ring: u64,
+    pub(crate) state_addresses: [u64; 3],
+    pub(crate) cursors: [u32; 3],
+    pub(crate) slot_index: u8,
+    pub(crate) slot_queue: u64,
+    pub(crate) slot_kind: u32,
+    pub(crate) slot_flags: u32,
+}
+
+#[cfg(not(test))]
 impl G17PComputeUserMappings {
     pub(crate) fn layout(&self) -> G17PComputeUserVaLayout {
         G17PComputeUserVaLayout {
@@ -1403,6 +1443,123 @@ impl G17PComputeDescriptorStorage {
             queue_context,
         )
         .map_err(|_| EINVAL)
+    }
+
+    pub(crate) fn snapshot_initial_channel_group(&mut self) -> Result<G17PComputeGraphSnapshot> {
+        let read_u16 = |raw: &[u8], offset: usize| -> Result<u16> {
+            Ok(u16::from_le_bytes(
+                raw.get(offset..offset + 2)
+                    .ok_or(ERANGE)?
+                    .try_into()
+                    .map_err(|_| ERANGE)?,
+            ))
+        };
+        let read_u32 = |raw: &[u8], offset: usize| -> Result<u32> {
+            Ok(u32::from_le_bytes(
+                raw.get(offset..offset + 4)
+                    .ok_or(ERANGE)?
+                    .try_into()
+                    .map_err(|_| ERANGE)?,
+            ))
+        };
+        let read_u64 = |raw: &[u8], offset: usize| -> Result<u64> {
+            Ok(u64::from_le_bytes(
+                raw.get(offset..offset + 8)
+                    .ok_or(ERANGE)?
+                    .try_into()
+                    .map_err(|_| ERANGE)?,
+            ))
+        };
+
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        let graph_vmap = self.queue_graph.object.vmap()?;
+        let graph = unsafe {
+            // SAFETY: the retained VMap covers the complete queue graph.
+            core::slice::from_raw_parts(
+                graph_vmap.as_mut_ptr(),
+                self.queue_graph.logical_size,
+            )
+        };
+        let descriptor_vmap = self.descriptors.object.vmap()?;
+        let descriptor = unsafe {
+            // SAFETY: the retained VMap covers the complete descriptor store.
+            core::slice::from_raw_parts(
+                descriptor_vmap.as_mut_ptr(),
+                self.descriptors.logical_size,
+            )
+        };
+        let support_vmap = self.support.object.vmap()?;
+        let support = unsafe {
+            // SAFETY: the retained VMap covers the complete support object.
+            core::slice::from_raw_parts(support_vmap.as_mut_ptr(), self.support.logical_size)
+        };
+        let context_vmap = self.queue_context_high.object.vmap()?;
+        let context = unsafe {
+            // SAFETY: the retained VMap covers the complete high context.
+            core::slice::from_raw_parts(
+                context_vmap.as_mut_ptr(),
+                self.queue_context_high.logical_size,
+            )
+        };
+
+        let pointers = g17_compute::COMPUTE_QUEUE_POINTERS;
+        let items = g17_compute::COMPUTE_ITEM_RING;
+        let optional = g17_compute::COMPUTE_OPTIONAL;
+        let event = g17_compute::COMPUTE_EVENT;
+        let snapshot = G17PComputeGraphSnapshot {
+            queue: self.queue_graph.iova(),
+            pointers: self.queue_graph.iova() + pointers as u64,
+            item_ring: self.queue_graph.iova() + items as u64,
+            context_high: self.queue_context_high.iova(),
+            cursors: [
+                read_u32(graph, pointers)?,
+                read_u32(graph, pointers + 0x30)?,
+                read_u32(graph, pointers + 0x40)?,
+            ],
+            gpu_read_cursors: [
+                read_u32(graph, 0x18)?,
+                read_u32(graph, 0x1c)?,
+                read_u32(graph, 0x20)?,
+            ],
+            uuid: read_u32(graph, 0x48)?,
+            queue_context: read_u64(graph, 0x9c)?,
+            items: [
+                read_u64(graph, items)?,
+                read_u64(graph, items + 8)?,
+                read_u64(graph, items + 16)?,
+            ],
+            event: [
+                read_u32(graph, event)?,
+                read_u32(graph, event + 4)?,
+                read_u32(graph, event + 8)?,
+                read_u32(graph, event + 0x0c)?,
+                read_u32(graph, event + 0x10)?,
+            ],
+            status: [read_u64(support, 0x310)?, read_u64(support, 0x318)?],
+            descriptor: self.descriptors_high.iova(),
+            descriptor_selector: read_u32(descriptor, 0)?,
+            descriptor_context: read_u32(descriptor, 0x0c)?,
+            descriptor_grid: read_u32(descriptor, 0x0f54)?,
+            descriptor_timestamps: [
+                read_u64(descriptor, 0x0f8c)?,
+                read_u64(descriptor, 0x0f94)?,
+            ],
+            optional_contexts: [
+                read_u64(graph, optional + 0x08)?,
+                read_u64(graph, optional + 0x10)?,
+            ],
+            optional_grid: read_u16(graph, optional + 0x18)?,
+            optional_uuid: read_u16(graph, optional + 0x5a)?,
+            optional_shared: read_u64(graph, optional + 0x36)?,
+            optional_channel: read_u64(graph, optional + 0x4a)?,
+            context_record: [
+                read_u64(context, 0x200)?,
+                read_u64(context, 0x210)?,
+                read_u64(context, 0x218)?,
+            ],
+        };
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        Ok(snapshot)
     }
 
     pub(crate) fn with_descriptor_mut<R>(
@@ -3207,6 +3364,72 @@ impl G17ResourceOwner {
             .copy_from_slice(&prepared.outer.next_producer.to_le_bytes());
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         Ok(prepared)
+    }
+
+    pub(crate) fn snapshot_compute_channel(&mut self) -> Result<G17PComputeChannelSnapshot> {
+        let channels = g17_initdata::derive_channel_table(
+            InstanceRole::Primary,
+            self.handoff.primary.state_grid,
+            self.handoff.primary.instance.status_a,
+            self.handoff.primary.instance.main_config,
+            self.handoff.shared.hw_data_bundle,
+        );
+        let table_index = g17_submission::G17P_COMPUTE_CHANNEL_TABLE_INDEX;
+        let channel = channels[table_index as usize];
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        let cursors = [
+            self.resources.primary_state.read_u32(channel.states[0])?,
+            self.resources.primary_state.read_u32(channel.states[1])?,
+            self.resources.primary_state.read_u32(channel.states[2])?,
+        ];
+        let slot_index = cursors[2].wrapping_sub(1) as u8;
+        let slot_gpu_va = channel
+            .ring
+            .checked_add(slot_index as u64 * 0x18)
+            .ok_or(EINVAL)?;
+        let slot_offset: usize = slot_gpu_va
+            .checked_sub(self.resources.shared_cluster.iova())
+            .ok_or(EINVAL)?
+            .try_into()?;
+        if slot_offset.checked_add(0x18).ok_or(EINVAL)?
+            > self.resources.shared_cluster.logical_size
+        {
+            return Err(ERANGE);
+        }
+        let ring_vmap = self.resources.shared_cluster.object.vmap()?;
+        let ring = unsafe {
+            // SAFETY: the checked slot lies inside the retained shared VMap.
+            core::slice::from_raw_parts(
+                ring_vmap.as_mut_ptr(),
+                self.resources.shared_cluster.logical_size,
+            )
+        };
+        let read_u32 = |offset: usize| -> Result<u32> {
+            Ok(u32::from_le_bytes(
+                ring[offset..offset + 4]
+                    .try_into()
+                    .map_err(|_| ERANGE)?,
+            ))
+        };
+        let read_u64 = |offset: usize| -> Result<u64> {
+            Ok(u64::from_le_bytes(
+                ring[offset..offset + 8]
+                    .try_into()
+                    .map_err(|_| ERANGE)?,
+            ))
+        };
+        let snapshot = G17PComputeChannelSnapshot {
+            table_index,
+            ring: channel.ring,
+            state_addresses: channel.states,
+            cursors,
+            slot_index,
+            slot_queue: read_u64(slot_offset + 0x08)?,
+            slot_kind: read_u32(slot_offset + 0x10)?,
+            slot_flags: read_u32(slot_offset + 0x14)?,
+        };
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        Ok(snapshot)
     }
 
     /// Present the measured five status-B fields at the runtime boundary just

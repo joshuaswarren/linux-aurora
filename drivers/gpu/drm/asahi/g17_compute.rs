@@ -19,11 +19,11 @@ pub(crate) const COMPUTE_QUEUE_CONTEXT_EXTENT: usize = 8 * COMPUTE_QUEUE_CONTEXT
 pub(crate) const COMPUTE_OPTIONAL_SIZE: usize = 0xc0;
 pub(crate) const COMPUTE_EVENT_SIZE: usize = 0x400;
 pub(crate) const COMPUTE_CHANNEL_WRITE_INDEX: u32 = 3;
-const COMPUTE_QUEUE_POINTERS: usize = 0x100;
+pub(crate) const COMPUTE_QUEUE_POINTERS: usize = 0x100;
 const COMPUTE_QUEUE_CONTEXT_ITEM: usize = 0x200;
-const COMPUTE_ITEM_RING: usize = 0x4000;
-const COMPUTE_OPTIONAL: usize = 0x5000;
-const COMPUTE_EVENT: usize = 0x5400;
+pub(crate) const COMPUTE_ITEM_RING: usize = 0x4000;
+pub(crate) const COMPUTE_OPTIONAL: usize = 0x5000;
+pub(crate) const COMPUTE_EVENT: usize = 0x5400;
 const _: () = assert!(COMPUTE_REGISTER_COUNT <= COMPUTE_REGISTER_CAPACITY);
 
 const COMPUTE_SELECTOR: u32 = 3;

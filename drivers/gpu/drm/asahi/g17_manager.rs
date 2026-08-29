@@ -360,6 +360,12 @@ pub(crate) struct G17PComputeUserBinding {
     _vm_bind: mmu::VmBind,
 }
 
+#[cfg(not(test))]
+pub(crate) struct G17PComputeTimeoutSnapshot {
+    pub(crate) graph: g17_resources::G17PComputeGraphSnapshot,
+    pub(crate) channel: g17_resources::G17PComputeChannelSnapshot,
+}
+
 /// The two complete queue groups exposed by the exact first graphics publish.
 #[cfg(not(test))]
 pub(crate) struct G17PPartialOpeningRenderSubmission {
@@ -1145,6 +1151,16 @@ impl G17PManagerConstruction {
         queue.producer = g17_submission::complete_g17p_cl_kicks(queue.producer, completed_count)
             .map_err(|_| EINVAL)?;
         Ok(())
+    }
+
+    pub(crate) fn snapshot_compute_timeout(
+        &mut self,
+        queue: &mut G17PSksmQueue,
+    ) -> Result<G17PComputeTimeoutSnapshot> {
+        Ok(G17PComputeTimeoutSnapshot {
+            graph: queue.compute.snapshot_initial_channel_group()?,
+            channel: self.resources.snapshot_compute_channel()?,
+        })
     }
 
     /// Publish newly appended kicks for a queue returned by
