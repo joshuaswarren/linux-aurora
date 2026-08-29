@@ -2546,6 +2546,14 @@ impl Uat {
                 let ttb = binding.ttb | TTBR_VALID | (idx as u64) << TTBR_ASID_SHIFT;
 
                 if self.cfg == UatConfig::T8140 && idx != 1 {
+                    dev_err!(
+                        self.dev.as_ref(),
+                        "G17P_EBUSY_TRACE leaf=uat_bind_slot_mismatch vm={} allocator_slot={} uat_slot={} phase={}\n",
+                        vm.id,
+                        slot.slot(),
+                        idx,
+                        self.t8140_context_phase.load(Ordering::Acquire)
+                    );
                     return Err(EBUSY);
                 }
 
@@ -2599,6 +2607,16 @@ impl Uat {
         binding.active_users += 1;
 
         let slot = binding.binding.as_ref().unwrap().slot() + UAT_USER_CTX_START as u32;
+        if self.cfg == UatConfig::T8140 {
+            dev_info!(
+                self.dev.as_ref(),
+                "G17P_EBUSY_TRACE checkpoint=uat_bind_ok vm={} uat_slot={} active_users={} phase={}\n",
+                vm.id,
+                slot,
+                binding.active_users,
+                self.t8140_context_phase.load(Ordering::Acquire)
+            );
+        }
         mod_pr_debug!("MMU: slot {} active users {}\n", slot, binding.active_users);
         Ok(VmBind(vm.clone(), slot))
     }
