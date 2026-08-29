@@ -843,95 +843,19 @@ fn finish_boot_session(
         "G17P compute control: startup TA/3D retired at 3/3/3\n"
     );
 
-    manager.prepare_compute_runtime_class1()?;
+    // The output-positive paths never drain a runtime control tail here.
+    // A runtime 0x2e tick is staged immediately before a work kick, without
+    // any doorbell, and firmware consumes it together with that kick
+    // ("pending for next work kick"). The proxy hardware experiments proved
+    // the co-processor parks after the startup group (CPU_STATUS reads
+    // idle) and 0x84 announcements alone never wake it, which is exactly
+    // the [4, 4, 5] stall this synchronous drain produced. The 65-record
+    // tail in the native capture is the accumulated history of ticks
+    // coupled to 64 workloads, not a boot-time prerequisite. Tick zero is
+    // staged by the manager at the first compute submission instead.
     dev_info!(
         pdev.as_ref(),
-        "G17P compute control: class-1 closure ready; publishing live tail\n"
-    );
-    for index in 0..g17_initdata::COMPUTE_RUNTIME_CONTROL_RECORDS {
-        if index == g17_initdata::COMPUTE_RUNTIME_CLASS2_RECORD_INDEX {
-            manager.prepare_compute_runtime_class2()?;
-            dev_info!(
-                pdev.as_ref(),
-                "G17P compute control: class-2 closure ready at sequence 56\n"
-            );
-        }
-        let target = manager.publish_compute_runtime_control_record(index)?;
-        let mut counters = manager.control_counters()?;
-        let mut announcements = 0usize;
-        for _ in 0..CONTROL_COUNTER_POLLS {
-            if counters.primary == [target; 3]
-                && counters.secondary
-                    == [g17_initdata::CONTROL_OPENING_SECONDARY_PRODUCER; 3]
-            {
-                break;
-            }
-            if gfx_state.crashed.load(Ordering::Acquire)
-                || gfx1_state.crashed.load(Ordering::Acquire)
-            {
-                return Err(EIO);
-            }
-
-            // The native live-control path re-announces 0x84/0x11 while the
-            // producer is pending. One notification at this transition can
-            // leave the state at [consumer, consumer, producer].
-            Pin::new(&mut gfx_rtkit)
-                .send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, control_done)?;
-            announcements += 1;
-            counters = manager.control_counters()?;
-            if counters.primary == [target; 3]
-                && counters.secondary
-                    == [g17_initdata::CONTROL_OPENING_SECONDARY_PRODUCER; 3]
-            {
-                break;
-            }
-            fsleep(Delta::from_millis(1));
-            counters = manager.control_counters()?;
-        }
-        if counters.primary != [target; 3]
-            || counters.secondary
-                != [g17_initdata::CONTROL_OPENING_SECONDARY_PRODUCER; 3]
-        {
-            dev_err!(
-                pdev.as_ref(),
-                "G17P compute control: record {} stopped at {:?}/{:?} after {} announcements, expected [{}, {}, {}]/[16, 16, 16]\n",
-                index,
-                counters.primary,
-                counters.secondary,
-                announcements,
-                target,
-                target,
-                target
-            );
-            return Err(ETIMEDOUT);
-        }
-        if index == 0 {
-            dev_info!(
-                pdev.as_ref(),
-                "G17P compute control: tick 0 retired after {} announcements\n",
-                announcements
-            );
-        }
-        if index == 53 {
-            dev_info!(
-                pdev.as_ref(),
-                "G17P compute control: ticks 0..53 retired at 58\n"
-            );
-        } else if index == 56 {
-            dev_info!(
-                pdev.as_ref(),
-                "G17P compute control: class-1 sequence 54 retired at 61\n"
-            );
-        }
-    }
-    let runtime_counters = manager.control_counters()?;
-    if !runtime_counters.compute_runtime_ready() {
-        return Err(EIO);
-    }
-    manager.rewrite_compute_dispatch_record()?;
-    dev_info!(
-        pdev.as_ref(),
-        "G17P compute control: live tail retired at [69, 69, 69]/[16, 16, 16]\n"
+        "G17P compute control: runtime tick deferred to first work kick\n"
     );
 
     let queue = manager.configure_g17p_compute_queue(drm, registers)?;
