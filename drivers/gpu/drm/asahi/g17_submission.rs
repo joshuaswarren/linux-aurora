@@ -269,8 +269,19 @@ pub(crate) const T8140_G17P_CL_BACKEND: G17PClBackendConfig = G17PClBackendConfi
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum G17PContractPredicateState {
     Pending,
-    ProvenAbsent,
     ProvenPresent,
+}
+
+/// Dedicated FlushID classification is not sufficient for release: an absent
+/// feature needs a proven represented fallback, while a present feature needs
+/// its numeric allocator, lifetime, and command operands implemented.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum G17PFlushIdImplementationState {
+    Pending,
+    ProvenAbsentFallbackUnverified,
+    ProvenAbsentFallbackRepresented,
+    ProvenPresentUnimplemented,
+    ProvenPresentImplemented,
 }
 
 /// Required first-bind commands and publication facts. The tag encoders and
@@ -281,7 +292,7 @@ pub(crate) struct G17PFirstBindCommandPlan {
     pub(crate) config_update_required: bool,
     pub(crate) entry_signal_required: bool,
     pub(crate) logical_flush_id_required: bool,
-    pub(crate) dedicated_flush_id: G17PContractPredicateState,
+    pub(crate) dedicated_flush_id: G17PFlushIdImplementationState,
     pub(crate) native_command_pointer_ring: G17PContractPredicateState,
 }
 
@@ -292,8 +303,8 @@ impl G17PFirstBindCommandPlan {
             && self.logical_flush_id_required
             && matches!(
                 self.dedicated_flush_id,
-                G17PContractPredicateState::ProvenAbsent
-                    | G17PContractPredicateState::ProvenPresent
+                G17PFlushIdImplementationState::ProvenAbsentFallbackRepresented
+                    | G17PFlushIdImplementationState::ProvenPresentImplemented
             )
             && matches!(
                 self.native_command_pointer_ring,
@@ -307,7 +318,7 @@ pub(crate) const G17P_FIRST_BIND_COMMAND_PLAN: G17PFirstBindCommandPlan =
         config_update_required: true,
         entry_signal_required: true,
         logical_flush_id_required: true,
-        dedicated_flush_id: G17PContractPredicateState::Pending,
+        dedicated_flush_id: G17PFlushIdImplementationState::Pending,
         native_command_pointer_ring: G17PContractPredicateState::ProvenPresent,
     };
 
@@ -3860,7 +3871,8 @@ mod tests {
         assert_eq!(mailbox_mutations, 0);
 
         let resolved = G17PFirstBindCommandPlan {
-            dedicated_flush_id: G17PContractPredicateState::ProvenAbsent,
+            dedicated_flush_id:
+                G17PFlushIdImplementationState::ProvenAbsentFallbackRepresented,
             native_command_pointer_ring: G17PContractPredicateState::ProvenPresent,
             ..G17P_FIRST_BIND_COMMAND_PLAN
         };
@@ -3869,6 +3881,21 @@ mod tests {
             require_g17p_first_bind_direct_hardware_release(resolved),
             Ok(())
         );
+        for unresolved_implementation in [
+            G17PFlushIdImplementationState::ProvenAbsentFallbackUnverified,
+            G17PFlushIdImplementationState::ProvenPresentUnimplemented,
+        ] {
+            assert!(!G17PFirstBindCommandPlan {
+                dedicated_flush_id: unresolved_implementation,
+                ..resolved
+            }
+            .hardware_release_ready());
+        }
+        assert!(G17PFirstBindCommandPlan {
+            dedicated_flush_id: G17PFlushIdImplementationState::ProvenPresentImplemented,
+            ..resolved
+        }
+        .hardware_release_ready());
         assert!(!g17p_first_bind_tag16_required(
             G17PClBackendConfig {
                 backend: G17ClSubmissionBackend::Hal300,
