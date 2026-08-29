@@ -1879,13 +1879,33 @@ impl G17PUserRenderStorage {
 
         // Queue items name the firmware-high descriptors, while descriptor
         // self-pointers resolve through these one-page context-0 aliases.
-        let mut descriptors = bootstrap_stage!("descriptor allocation", MappedObject::new_wc(
-            dev,
-            uat,
-            G17P_RENDER_DESCRIPTOR_STORAGE_SIZE,
-            mmu::UAT_PGSZ as u64,
-            mmu::PROT_GPU_FW_SHARED_RW,
-        ));
+        // Context locators are deltas from the native per-stage descriptor
+        // bases. Keep the contiguous Linux pair at or above the later 3D base
+        // so both TA and 3D deltas are non-negative and representable.
+        let descriptor_range = uat.kernel_va_range()?;
+        let descriptor_floor = descriptor_range
+            .start
+            .max(g17_submission::G17P_COLD_OPENING_3D_DESCRIPTOR_BASE);
+        if descriptor_floor >= descriptor_range.end {
+            return Err(EINVAL);
+        }
+        let mut descriptors = bootstrap_stage!(
+            "descriptor allocation",
+            MappedObject::new_wc_in_range(
+                dev,
+                uat.kernel_vm(),
+                descriptor_floor..descriptor_range.end,
+                G17P_RENDER_DESCRIPTOR_STORAGE_SIZE,
+                mmu::UAT_PGSZ as u64,
+                mmu::PROT_GPU_FW_SHARED_RW,
+            )
+        );
+        dev_info!(
+            dev.as_ref(),
+            "G17P render storage: descriptor high pair at {:#x}/{:#x}\n",
+            descriptors.iova(),
+            descriptors.iova() + mmu::UAT_PGSZ as u64
+        );
         let descriptor_ta_low = bootstrap_stage!(
             "TA descriptor low alias",
             descriptors.object.map_range_into_range(
@@ -2298,9 +2318,17 @@ impl G17PUserRenderStorage {
         if submission_ordinal == 0 || submission_ordinal >= G17P_RETAINED_RENDER_ORDINALS {
             return Err(EINVAL);
         }
-        let mut next_descriptors = MappedObject::new_wc(
+        let descriptor_range = uat.kernel_va_range()?;
+        let descriptor_floor = descriptor_range
+            .start
+            .max(g17_submission::G17P_COLD_OPENING_3D_DESCRIPTOR_BASE);
+        if descriptor_floor >= descriptor_range.end {
+            return Err(EINVAL);
+        }
+        let mut next_descriptors = MappedObject::new_wc_in_range(
             dev,
-            uat,
+            uat.kernel_vm(),
+            descriptor_floor..descriptor_range.end,
             G17P_RENDER_DESCRIPTOR_STORAGE_SIZE,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
