@@ -505,8 +505,6 @@ enum dcp_link_service_match_bit {
 	DCP_LINK_SERVICE_MATCH_INFLIGHT,
 };
 
-#define DCP_LINK_SERVICE_NOTIFY_RETRIES 512
-
 static bool dcp_link_service_notifier_pending(struct apple_dcp *dcp)
 {
 	return test_bit(DCP_LINK_SERVICE_MATCH_PMU,
@@ -532,79 +530,18 @@ static void dcp_link_service_match_done(struct apple_dcp *dcp)
 		schedule_work(&dcp->link_service_match_work);
 }
 
-static void dcp_link_renotify_service(struct apple_dcp *dcp,
-				      const struct dcp_method_entry *call)
-{
-	struct dcp_channel *ch = &dcp->ch_oobcmd;
-	u64 message;
-	u32 control = 0;
-	u32 first_busy_control = 0;
-	u8 depth;
-	int attempt;
-	int busy = 0;
-	int sent = 1;
-	int ret;
-
-	depth = READ_ONCE(ch->depth);
-	if (!depth)
-		return;
-	message = READ_ONCE(ch->link_message[depth - 1]);
-
-	for (attempt = 1; attempt <= DCP_LINK_SERVICE_NOTIFY_RETRIES;
-	     attempt++) {
-		usleep_range(900, 1100);
-		depth = READ_ONCE(ch->depth);
-		if (!depth || READ_ONCE(ch->link_message[depth - 1]) != message) {
-			dev_info(dcp->dev,
-				 "DCPLink %.4s consumed after %d doorbell notifications\n",
-				 call->tag, attempt);
-			return;
-		}
-
-		dcp_link_sync_for_device();
-		ret = dcp_try_send_message(dcp, APPLE_DCP_LINK_ENDPOINT,
-					   message, &control);
-		if (ret == -EAGAIN) {
-			if (!busy)
-				first_busy_control = control;
-			busy++;
-			continue;
-		}
-		if (ret) {
-			dev_err(dcp->dev,
-				"DCPLink %.4s re-notify %d failed: %d\n",
-				call->tag, attempt, ret);
-			return;
-		}
-		sent++;
-		if (sent == 2)
-			dev_info(dcp->dev,
-				 "DCPLink %.4s still pending; nonblocking re-notify every 1 ms\n",
-				 call->tag);
-	}
-
-	depth = READ_ONCE(ch->depth);
-	if (depth)
-		dev_warn(dcp->dev,
-			 "DCPLink %.4s pending after %d doorbells (%d full polls first %#x last %#x): depth %u top %#x request %#llx output %4phN\n",
-			 call->tag, sent, busy, first_busy_control, control, depth,
-			 READ_ONCE(dcp->link_top[false][1]),
-			 READ_ONCE(ch->link_message[depth - 1]),
-			 ch->output[depth - 1]);
-	else
-		dev_info(dcp->dev,
-			 "DCPLink %.4s consumed after retry window\n", call->tag);
-}
-
 static void dcp_link_service_match_complete(struct apple_dcp *dcp, void *out,
 					    void *cookie)
 {
 	const struct dcp_method_entry *call = cookie;
-	int callback_tag = call == &dcp_link_pmu_service_matched ? 206 : 207;
+	int callback_tag = dcp->link_service_match_callback_tag;
 	int ret;
 
 	dev_info(dcp->dev, "DCPLink %.4s reply %#x\n", call->tag,
 		 le32_to_cpup((__le32 *)out));
+	apple_dcp_h17p_service_match_output(dcp->link_service_match_output, true);
+	dcp->link_service_match_output = NULL;
+	dcp->link_service_match_callback_tag = 0;
 	ret = dcp_link_ack(dcp, DCP_CONTEXT_CB);
 	dev_info(dcp->dev,
 		 "DCPLink %.4s completed deferred D%03d ACK result %d\n",
@@ -631,6 +568,8 @@ static void dcp_link_service_match_work(struct work_struct *work)
 		container_of(work, struct apple_dcp, link_service_match_work);
 	const struct dcp_method_entry *call;
 	dcp_callback_t complete;
+	enum dcp_context_id context;
+	bool new_stream;
 	int ret;
 
 	if (test_and_set_bit(DCP_LINK_SERVICE_MATCH_INFLIGHT,
@@ -641,14 +580,20 @@ static void dcp_link_service_match_work(struct work_struct *work)
 			       &dcp->link_service_match_state)) {
 		call = &dcp_link_temperature_hint;
 		complete = dcp_link_temperature_hint_complete;
+		context = DCP_CONTEXT_OOBCMD;
+		new_stream = true;
 	} else if (test_and_clear_bit(DCP_LINK_SERVICE_MATCH_PMU,
 				      &dcp->link_service_match_state)) {
 		call = &dcp_link_pmu_service_matched;
 		complete = dcp_link_service_match_complete;
+		context = DCP_CONTEXT_CMD;
+		new_stream = false;
 	} else if (test_and_clear_bit(DCP_LINK_SERVICE_MATCH_BACKLIGHT,
 				      &dcp->link_service_match_state)) {
 		call = &dcp_link_backlight_service_matched;
 		complete = dcp_link_service_match_complete;
+		context = DCP_CONTEXT_CMD;
+		new_stream = false;
 	} else {
 		clear_bit(DCP_LINK_SERVICE_MATCH_INFLIGHT,
 			  &dcp->link_service_match_state);
@@ -656,7 +601,7 @@ static void dcp_link_service_match_work(struct work_struct *work)
 	}
 
 	/* Native service notifiers issue their nested call before callback ACK. */
-	ret = dcp_link_push_context(dcp, DCP_CONTEXT_OOBCMD, true, call, 0,
+	ret = dcp_link_push_context(dcp, context, new_stream, call, 0,
 				    sizeof(__le32), NULL,
 				    complete,
 				    (void *)call);
@@ -665,9 +610,6 @@ static void dcp_link_service_match_work(struct work_struct *work)
 			"DCPLink %.4s service notifier could not be queued: %d\n",
 			call->tag, ret);
 		dcp_link_service_match_done(dcp);
-	} else if (call == &dcp_link_pmu_service_matched ||
-		   call == &dcp_link_backlight_service_matched) {
-		dcp_link_renotify_service(dcp, call);
 	}
 }
 
@@ -692,8 +634,11 @@ bool dcp_link_defer_service_match(struct apple_dcp *dcp, int tag, void *out,
 				  void *in)
 {
 	trace_iomfb_callback(dcp, tag, __func__);
-	if (tag == 206 || tag == 207)
-		*(__le32 *)out = cpu_to_le32(1);
+	if (tag == 206 || tag == 207) {
+		dcp->link_service_match_output = out;
+		dcp->link_service_match_callback_tag = tag;
+		apple_dcp_h17p_service_match_output(out, false);
+	}
 
 	dcp_link_queue_service_match(dcp, tag);
 	return false;
@@ -1063,6 +1008,8 @@ static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 
 	INIT_WORK(&dcp->link_service_match_work, dcp_link_service_match_work);
 	dcp->link_service_match_state = 0;
+	dcp->link_service_match_output = NULL;
+	dcp->link_service_match_callback_tag = 0;
 
 	if (dcp->adopted_session) {
 		struct iommu_domain *domain;
