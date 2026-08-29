@@ -378,8 +378,6 @@ static const struct of_device_id apple_dcp_id_tbl[] = {
 	{},
 };
 
-#define APPLE_DCP_START_TIMEOUT_MS 12000
-
 static int apple_drm_init_dcp(struct device *dev)
 {
 	struct apple_drm_private *apple = dev_get_drvdata(dev);
@@ -422,9 +420,7 @@ static int apple_drm_init_dcp(struct device *dev)
 	/*
 	 * Starting DPTX might take some time.
 	 */
-	dev_info(dev, "DCP25G83_A401_WAIT_12000 armed\n");
-	timeout = get_jiffies_64() +
-		  msecs_to_jiffies(APPLE_DCP_START_TIMEOUT_MS);
+	timeout = get_jiffies_64() + msecs_to_jiffies(3000);
 
 	for (i = 0; i < num_dcp; ++i) {
 		u64 jiffies = get_jiffies_64();

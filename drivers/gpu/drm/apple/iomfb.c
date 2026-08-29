@@ -939,7 +939,7 @@ static int dcp_link_publish_init(struct apple_dcp *dcp, bool firmware_rendezvous
 			 "DCPLink type0 received; descriptor published and host INIT sent\n");
 	else
 		dev_info(dcp->dev,
-			 "DCPLink type0 absent after 100 ms; descriptor published and host INIT sent\n");
+			 "DCPLink descriptor published and host INIT sent without type0\n");
 
 out_unlock:
 	mutex_unlock(&dcp->link_init_lock);
@@ -1141,6 +1141,7 @@ static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 			dcp->link_version = 0;
 			dcp->link_firmware_hash = 0;
 			dcp->link_endpoint_started = true;
+			/* Native 25G83 does not wait for optional type-0 here. */
 			ret = dcp_start_rtkit_endpoint(dcp,
 						       APPLE_DCP_LINK_ENDPOINT);
 			if (ret) {
@@ -1148,9 +1149,10 @@ static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 				goto err_unmap_inherited;
 			}
 			dev_info(dcp->dev,
-				 "adopted unused DCPLink RPC mapping local DVA %#llx firmware DVA %#llx PA %#llx; waiting for firmware rendezvous\n",
+				 "DCP25G83_INIT_IMMEDIATE_AFTER_STARTEP armed\n");
+			dev_info(dcp->dev,
+				 "adopted unused DCPLink RPC mapping local DVA %#llx firmware DVA %#llx PA %#llx; publishing host INIT after STARTEP\n",
 				 rpc_dva, firmware_rpc_dva, rpc_pa);
-			msleep(100);
 			ret = dcp_link_publish_init(dcp, false);
 			if (ret)
 				goto err_unmap_inherited;
