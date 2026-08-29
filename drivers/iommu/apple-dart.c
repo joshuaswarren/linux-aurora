@@ -943,6 +943,62 @@ done:
 }
 
 static int
+apple_dart_reconcile_locked_translated(struct apple_dart_domain *dart_domain,
+				       struct device *dev)
+{
+	struct apple_dart_master_cfg *cfg = dev_iommu_priv_get(dev);
+	struct apple_dart *dart = cfg->stream_maps[0].dart;
+	struct iommu_resv_region *entry;
+	unsigned long pgsize = dart_domain->domain.pgsize_bitmap;
+	LIST_HEAD(regions);
+	int ret = 0;
+
+	if (!cfg->locked)
+		return 0;
+
+	iommu_get_resv_regions(dev, &regions);
+	list_for_each_entry(entry, &regions, list) {
+		struct io_pgtable_apple_dart_reconcile result;
+		phys_addr_t phys_start, phys_end;
+		dma_addr_t dva;
+		size_t size;
+
+		if (entry->type != IOMMU_RESV_TRANSLATED)
+			continue;
+		if (check_add_overflow(entry->start, entry->length, &phys_end)) {
+			ret = -EOVERFLOW;
+			break;
+		}
+
+		phys_start = ALIGN(entry->start, pgsize);
+		phys_end = ALIGN(phys_end, pgsize);
+		dva = ALIGN(entry->dva, pgsize);
+		if (phys_end <= phys_start)
+			continue;
+		size = phys_end - phys_start;
+
+		ret = io_pgtable_apple_dart_reconcile(
+			dart_domain->pgtbl_ops, dva & dart_domain->mask,
+			phys_start, size, entry->prot, &result);
+		if (ret) {
+			dev_err(dart->dev,
+				"locked translated mapping DVA %pad PA %pa size %#zx failed permission reconciliation: %d\n",
+				&dva, &phys_start, size, ret);
+			break;
+		}
+
+		dev_info(dart->dev,
+			 "locked translated mapping DVA %pad PA %pa size %#zx inherited first PTE %#018llx (no-read=%u no-write=%u), reconciled %#018llx, changed %u pages\n",
+			 &dva, &phys_start, size, result.first_pte_before,
+			 !!(result.first_pte_before & BIT_ULL(3)),
+			 !!(result.first_pte_before & BIT_ULL(2)),
+			 result.first_pte_after, result.changed);
+	}
+	iommu_put_resv_regions(dev, &regions);
+	return ret;
+}
+
+static int
 apple_dart_mod_streams(struct apple_dart_atomic_stream_map *domain_maps,
 		       struct apple_dart_stream_map *master_maps,
 		       bool add_streams)
@@ -990,6 +1046,10 @@ static int apple_dart_attach_dev_paging(struct iommu_domain *domain,
 		WARN_ON(pm_runtime_get_sync(stream_map->dart->dev) < 0);
 
 	ret = apple_dart_finalize_domain(dart_domain, cfg);
+	if (ret)
+		goto err;
+
+	ret = apple_dart_reconcile_locked_translated(dart_domain, dev);
 	if (ret)
 		goto err;
 
