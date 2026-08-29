@@ -482,14 +482,14 @@ fn finish_boot_session(
         });
     }
 
-    // The hardware-positive shim holds both outer producers until after
-    // CONTROL_START (`--publish-after-control --no-first-doorbell`).
-    let (bootstrap, crash_vm) = manager.begin_compute_bootstrap_render(drm)?;
+    // Build the render VM, bind context 1, and stage the inner graph while
+    // both outer producers remain zero. This is the measured pre-0x84 state.
+    let crash_vm = manager.stage_compute_bootstrap_render(drm)?;
     gfx_state.set_crash_vm(crash_vm.clone());
     gfx1_state.set_crash_vm(crash_vm);
     dev_info!(
         pdev.as_ref(),
-        "G17P compute control: startup render graph ready\n"
+        "G17P compute control: startup render graph staged with producers held\n"
     );
     manager
         .prepare_partial_opening_control_done()
@@ -500,12 +500,20 @@ fn finish_boot_session(
                 error
             );
         })?;
-    dev_info!(
-        pdev.as_ref(),
-        "G17P compute control: startup TA/3D group staged; sending primary done\n"
-    );
     Pin::new(&mut gfx_rtkit)
         .send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, control_done)?;
+    dev_info!(
+        pdev.as_ref(),
+        "G17P compute control: primary done sent before startup work publication\n"
+    );
+
+    // Publish 3D before TA and end with the barrier required before the one
+    // paired channel-8 bell.
+    let bootstrap = manager.publish_staged_compute_bootstrap_render()?;
+    dev_info!(
+        pdev.as_ref(),
+        "G17P compute control: startup TA/3D group staged after primary done\n"
+    );
     Pin::new(&mut gfx_rtkit).send_message(
         g17_rtkit::ENDPOINT_GFX_INTERRUPTS,
         bootstrap.paired_doorbell,
