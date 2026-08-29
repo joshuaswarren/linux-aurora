@@ -250,11 +250,22 @@ static void apple_dcp_h17p_clock_rate_test(struct kunit *test)
 static void apple_dcp_h17p_method_test(struct kunit *test)
 {
 	struct apple_dcp_link_method method;
+	u32 service_call;
 
 	KUNIT_ASSERT_EQ(test,
 			apple_dcp_h17p_method(APPLE_DCP_H17P_CALL_START_SIGNAL,
 						 &method),
 			0);
+	KUNIT_EXPECT_EQ(test, method.input_size, 0U);
+	KUNIT_EXPECT_EQ(test, method.output_size, 4U);
+
+	service_call = APPLE_DCP_H17P_CALL_PMU_SERVICE_MATCHED;
+	KUNIT_ASSERT_EQ(test, apple_dcp_h17p_method(service_call, &method), 0);
+	KUNIT_EXPECT_EQ(test, method.input_size, 0U);
+	KUNIT_EXPECT_EQ(test, method.output_size, 4U);
+
+	service_call = APPLE_DCP_H17P_CALL_BACKLIGHT_SERVICE_MATCHED;
+	KUNIT_ASSERT_EQ(test, apple_dcp_h17p_method(service_call, &method), 0);
 	KUNIT_EXPECT_EQ(test, method.input_size, 0U);
 	KUNIT_EXPECT_EQ(test, method.output_size, 4U);
 
@@ -494,6 +505,14 @@ static void apple_dcp_link_rpc_message_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, apple_dcp_link_message_is_remote(encoded));
 	KUNIT_EXPECT_FALSE(test, encoded & APPLE_DCP_LINK_MSG_NEW_STREAM);
 	KUNIT_EXPECT_EQ(test, apple_dcp_link_rpc_reply(encoded), 0x142ULL);
+
+	KUNIT_ASSERT_EQ(test,
+			apple_dcp_link_ap_call_message(0x10, 0x10, 0, false,
+						       false, &encoded),
+			0);
+	KUNIT_EXPECT_EQ(test, encoded, 0x0000001000100002ULL);
+	KUNIT_EXPECT_FALSE(test, apple_dcp_link_message_is_remote(encoded));
+	KUNIT_EXPECT_FALSE(test, encoded & APPLE_DCP_LINK_MSG_NEW_STREAM);
 }
 
 static void apple_dcp_link_stack_test(struct kunit *test)
