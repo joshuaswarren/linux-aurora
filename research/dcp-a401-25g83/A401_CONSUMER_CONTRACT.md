@@ -99,11 +99,12 @@ The firmware reply ingress is equally direct:
 3. `0x041b7830` maps the word's stream selector and side bit to one of eight
    stream objects. The DCPLink object is rooted at VM address `0x04963d80`.
    Local streams begin at object offset `0x78`; remote streams at `0x218`;
-   each stream object is `0x68` bytes. The callback stream used here is the
-   remote stream 0 object at `0x04963f98`.
+   each stream object is `0x68` bytes. The message selector and the object's
+   local ID are both zero for these callback acknowledgements, so the selector
+   equality branch chooses local stream 0 at `0x04963df8`.
 4. `0x041b76e0` enters that stream's gate.
 5. Action `0x041b7804` stores the full raw acknowledgement at stream offset
-   `0x48` (`0x04963fe0` for this stream), then signals the condition through
+   `0x48` (`0x04963e40` for this stream), then signals the condition through
    `0x0403228c`.
 
 No service cache, property result other than the D563 output itself, secure
@@ -147,22 +148,46 @@ only after the synchronous caller returns. The fifth has no successor.
 At timeout Linux remains at callback count 182, nested reply count 3, outer
 command depth 1, stack top `0x10`, and outer request `0x1000000202`.
 
-## Current discriminator
+## Failed AP memory observer
 
-The unresolved split is now only:
+Two diagnostic runs placed observation cookies in bits 48 through 63 of the
+five D563 acknowledgements and tried to read the firmware stream response from
+the AP:
 
-1. the fifth host ACK never reaches or associates with firmware remote stream
-   0; or
-2. ingress stores it in the stream response word, but the condition signal or
-   waiter wake does not complete.
+- `dcp-appledrm-25g83-d563-fw-assoc-9a78abd-20260829-194417.log`
+- `dcp-appledrm-25g83-d563-fw-assoc-both-2a08232-20260829-194747.log`
 
-Mailbox send result 0 proves admission to the AP-to-DCP FIFO, not firmware
-association. The driver diagnostic built from this contract uses an ignored
-high-16-bit observation cookie on only the five D563 ACKs. Static firmware
-control flow proves reply dispatch uses only the low 16 bits, the caller masks
-the response with `0xc3`, and the remote error read covers bits 16 through 47.
-The cookie therefore does not alter reply classification, stream selection,
-success, or error behavior. At timeout the AP reads the exact firmware stream
-response location `0x04963fe0` through its existing DART mapping. A fifth
-cookie there proves the firmware associated the fifth ACK; an earlier cookie
-proves it did not.
+Both reads returned zero. That result cannot describe reply association:
+callbacks 177 through 180 are positive controls, because each next D563 can be
+sent only after the preceding synchronous wait returns. Their cookies were
+absent too.
+
+The observer incorrectly treated root-task VM address `0x04963d80` as a DART
+IOVA. Translating IOVA `0x04960000` produced physical address
+`0x101edf78000`, outside the loader-published `dcp_data` range
+`0x101ea7d4000..0x101eb48ffff`. The executable layout gives the real backing:
+the link object is at bundle offset `0x009f1d80`; `dcp_data` starts at bundle
+offset `0x004e0000`; therefore the object is at `dcp_data + 0x511d80`, and its
+local-stream-0 response is at `dcp_data + 0x511e40`. In that boot this would
+have been physical address `0x101eace5e40`.
+
+Even that physical address is not a sound AP observer. The store at
+`0x041b781c` targets DCP-private write-back memory and the ingress path performs
+no data-cache clean to RAM before signaling its DCP-local condition. An AP
+mapping can therefore retain the old RAM value while the DCP CPU consumes the
+new cached value. Static bytes elsewhere in `dcp_data` can attest the physical
+mapping, but they cannot positively control visibility of this dirty runtime
+cache line.
+
+Bits 48 through 63 remain ignored by the dispatcher and synchronous caller,
+but there is no proven coherent path by which the AP can recover them. Bits 16
+through 47 cannot be used as an injected discriminator: `0x041b552c` reads
+that field and `0x041b5530` branches on nonzero to `0x041b56e0`, which reaches
+the firmware abort path at `0x04021f18`. It does not return a diagnostic error
+to the D563 or A401 caller.
+
+The invalid driver observer and its cookies were removed. Mailbox send result
+zero still proves only FIFO admission. There is currently no safe,
+positive-controlled AP observation that distinguishes a fifth reply which was
+not associated from one whose DCP-local condition did not wake. No further
+hardware candidate follows from this memory method.
