@@ -313,9 +313,10 @@ impl rtkit::Operations for G17PRtkitOps {
                 let buffer = data.processor.firmware_crash_buffer();
                 dev_err!(
                     data.dev.as_ref(),
-                    "G17P {} crashlog copy from DVA {:#x} size {:#x} failed ({:?})\n",
+                    "G17P {} crashlog copy from DVA {:#x} via context-0 VA {:#x} size {:#x} failed ({:?})\n",
                     data.processor.name(),
                     buffer.dva,
+                    g17p_rtkit_uat_address(buffer.dva),
                     buffer.size,
                     error
                 );
