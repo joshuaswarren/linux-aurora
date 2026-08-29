@@ -41,8 +41,8 @@ use kernel::{devcoredump, time::msecs_to_jiffies};
 
 use crate::{
     driver::{AsahiDevice, T8140LiveTopologyAdmission},
-    g17_completion, g17_lifecycle, g17_manager, g17_rtkit, g17_uapi, gem, hw, identity,
-    mmu, module_parameters, regs,
+    g17_completion, g17_lifecycle, g17_manager, g17_rtkit, g17_submission, g17_uapi, gem, hw,
+    identity, mmu, module_parameters, regs,
 };
 use kernel::sync::aref::ARef;
 
@@ -909,6 +909,88 @@ impl G17PLiveRuntime {
         let completion = match completion {
             Ok(completion) => completion,
             Err(error) => {
+                if channel_path {
+                    let user_timestamps = owned_timestamps.with_cpu_bytes(|raw| {
+                        Ok([
+                            u64::from_le_bytes(raw[0..8].try_into().map_err(|_| ERANGE)?),
+                            u64::from_le_bytes(raw[8..16].try_into().map_err(|_| ERANGE)?),
+                        ])
+                    });
+                    let snapshot = {
+                        let manager = self.manager.as_mut().ok_or(ENODEV)?;
+                        let queue = self.queue.as_mut().ok_or(ENODEV)?;
+                        manager.snapshot_compute_timeout(queue)
+                    };
+                    let pdev = self.pdev.as_ref().ok_or(ENODEV)?;
+                    match (snapshot, user_timestamps) {
+                        (Ok(snapshot), Ok(user_timestamps)) => {
+                            let channel = snapshot.channel;
+                            let graph = snapshot.graph;
+                            dev_err!(
+                                pdev.as_ref(),
+                                "G17P compute timeout: CL_2 table={} ring={:#x} states={:#x?} cursors={:?} slot={} queue={:#x} kind={} flags={:#x} doorbell={:#x}\n",
+                                channel.table_index,
+                                channel.ring,
+                                channel.state_addresses,
+                                channel.cursors,
+                                channel.slot_index,
+                                channel.slot_queue,
+                                channel.slot_kind,
+                                channel.slot_flags,
+                                g17_submission::G17P_COMPUTE_WORK_DOORBELL
+                            );
+                            dev_err!(
+                                pdev.as_ref(),
+                                "G17P compute timeout: inner queue={:#x} pointers={:#x} ring={:#x} done/read/write={:?} gpu-read={:?} uuid={:#x} context={:#x}\n",
+                                graph.queue,
+                                graph.pointers,
+                                graph.item_ring,
+                                graph.cursors,
+                                graph.gpu_read_cursors,
+                                graph.uuid,
+                                graph.queue_context
+                            );
+                            dev_err!(
+                                pdev.as_ref(),
+                                "G17P compute timeout: items={:#x?} event={:#x?} status={:#x?}\n",
+                                graph.items,
+                                graph.event,
+                                graph.status
+                            );
+                            dev_err!(
+                                pdev.as_ref(),
+                                "G17P compute timeout: descriptor={:#x} selector={:#x} context={} grid={} timestamp-pointers={:#x?} values={:#x?}\n",
+                                graph.descriptor,
+                                graph.descriptor_selector,
+                                graph.descriptor_context,
+                                graph.descriptor_grid,
+                                graph.descriptor_timestamps,
+                                user_timestamps
+                            );
+                            dev_err!(
+                                pdev.as_ref(),
+                                "G17P compute timeout: optional-contexts={:#x?} grid={} uuid={:#x} shared={:#x} channel={:#x}; high-context={:#x} record={:#x?}\n",
+                                graph.optional_contexts,
+                                graph.optional_grid,
+                                graph.optional_uuid,
+                                graph.optional_shared,
+                                graph.optional_channel,
+                                graph.context_high,
+                                graph.context_record
+                            );
+                        }
+                        (Err(snapshot_error), _) => dev_err!(
+                            pdev.as_ref(),
+                            "G17P compute timeout snapshot failed ({:?})\n",
+                            snapshot_error
+                        ),
+                        (_, Err(timestamp_error)) => dev_err!(
+                            pdev.as_ref(),
+                            "G17P compute timeout timestamp read failed ({:?})\n",
+                            timestamp_error
+                        ),
+                    }
+                }
                 return match g17_lifecycle::recover_persistent_runtime(self) {
                     Ok(()) => Err(error),
                     Err(recovery_error) => Err(recovery_error),
