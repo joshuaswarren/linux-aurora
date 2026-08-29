@@ -248,6 +248,17 @@ static void afk_init_rxtx(struct apple_dcp_afkep *ep, u64 message,
 			ep->endpoint, block_size, header_size);
 		return;
 	}
+	header_size = size - bufsz;
+	block_size = header_size / AFK_RING_BLOCK_COUNT;
+	if (block_size < AFK_RING_BLOCK_SIZE ||
+	    !IS_ALIGNED(block_size, AFK_RING_BLOCK_SIZE) ||
+	    (ep->dcp->fw_compat != DCP_FIRMWARE_H17P &&
+	     block_size != AFK_RING_BLOCK_SIZE)) {
+		dev_err(ep->dcp->dev,
+			"AFK[ep:%02x]: unsupported ring block size %#x (header %#x)\n",
+			ep->endpoint, block_size, header_size);
+		return;
+	}
 	bfr->block = block;
 
 	bfr->rptr = (__le32 *)((u8 *)bfr->hdr + block_size);
@@ -913,23 +924,12 @@ static bool afk_recv(struct apple_dcp_afkep *ep)
 	channel = le32_to_cpu(hdr->channel);
 	type = le32_to_cpu(hdr->type);
 
-	next_rptr = roundup(rptr + sizeof(*hdr) + size,
-			     ep->rxbfr.block_size);
-	if (WARN_ON(next_rptr > ep->rxbfr.bufsz))
-		next_rptr = 0;
-	if (next_rptr == ep->rxbfr.bufsz)
-		next_rptr = 0;
-	log_entry = ep->endpoint == SYSTEM_ENDPOINT && ep->rx_log_count < 16;
-	sequence = ep->rx_log_count;
-	if (log_entry) {
-		ep->rx_log_count++;
-		dev_info(ep->dcp->dev,
-			 "AFK[ep:%02x]: QE %u rptr %#x wptr %#x next %#x block %#x magic %#x size %#x channel %#x type %#x bytes %*phN\n",
-			 ep->endpoint, sequence, rptr, wptr, next_rptr,
-			 ep->rxbfr.block_size, magic, size, channel, type,
-			 min_t(u32, sizeof(*hdr) + size, 64), hdr);
-	}
-	rptr = next_rptr;
+	rptr = roundup(rptr + sizeof(*hdr) + size,
+			ep->rxbfr.block_size);
+	if (WARN_ON(rptr > ep->rxbfr.bufsz))
+		rptr = 0;
+	if (rptr == ep->rxbfr.bufsz)
+		rptr = 0;
 
 	dma_mb();
 
@@ -1059,7 +1059,6 @@ int afk_send_epic(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 	dma_rmb();
 	rptr = le32_to_cpu(READ_ONCE(*ep->txbfr.rptr));
 	wptr = le32_to_cpu(READ_ONCE(*ep->txbfr.wptr));
-	old_wptr = wptr;
 	trace_afk_send_rwptr_pre(ep, rptr, wptr);
 	if (use_v2) {
 		if (channel > U16_MAX || payload_len > U32_MAX - sizeof(*v2_message)) {
@@ -1212,19 +1211,9 @@ int afk_send_epic(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 		wptr = 0;
 	trace_afk_send_rwptr_post(ep, rptr, wptr);
 
-	dma_wmb();
 	WRITE_ONCE(*ep->txbfr.wptr, cpu_to_le32(wptr));
-	dma_wmb();
-	doorbell = FIELD_PREP(RBEP_TYPE, RBEP_SEND) |
-		   FIELD_PREP(SEND_WPTR, wptr);
-	entry = hdr2 ? hdr2 : hdr;
-	if (use_v2 && ecat == EPIC_CAT_REPORT &&
-	    stype == AFK_V2_REPORT_OPEN)
-		dev_info(ep->dcp->dev,
-			 "AFK[ep:%02x]: OPEN TX channel %u consumer %#x producer %#x->%#x doorbell %#llx bytes %*phN\n",
-			 ep->endpoint, channel, rptr, old_wptr, wptr, doorbell,
-			 (int)min_t(size_t, total_size, 64), entry);
-	afk_send(ep, doorbell);
+	afk_send(ep, FIELD_PREP(RBEP_TYPE, RBEP_SEND) |
+			     FIELD_PREP(SEND_WPTR, wptr));
 	ret = 0;
 
 out:
