@@ -63,6 +63,27 @@ static const uint8_t add3_shader[] = {
 	0x0e, 0x00, 0x00, 0x00,
 };
 
+static const uint8_t add3_constant_program[] = {
+	0x03, 0x00, 0x07, 0x00, 0x02, 0x00, 0x00, 0x00,
+	0x60, 0x00, 0x0e, 0x00, 0x00, 0x00, 0x06, 0x00,
+	0x06, 0x00, 0x06, 0x00, 0x06, 0x00, 0x06, 0x00,
+	0x06, 0x00, 0x06, 0x00, 0x06, 0x00, 0x06, 0x00,
+	0x06, 0x00, 0x06, 0x00, 0x06, 0x00, 0x06, 0x00,
+	0x06, 0x00, 0x06, 0x00, 0x06, 0x00, 0x06, 0x00,
+	0x06, 0x00, 0x06, 0x00, 0x06, 0x00, 0x06, 0x00,
+	0x06, 0x00, 0x06, 0x00, 0x06, 0x00, 0x06, 0x00,
+};
+
+static const uint8_t add3_main_program[] = {
+	0x1c, 0xa0, 0x10, 0x06, 0x67, 0x10, 0x54, 0x00,
+	0x00, 0x01, 0x20, 0x00, 0x51, 0x01, 0x00, 0x40,
+	0x46, 0x00, 0x67, 0x00, 0x44, 0x04, 0x01, 0x01,
+	0x20, 0x00, 0x51, 0x01, 0x00, 0x40, 0x46, 0x00,
+	0x09, 0x05, 0x1c, 0x01, 0x00, 0xc0, 0xe7, 0x00,
+	0x54, 0x00, 0x02, 0x01, 0x21, 0x00, 0x11, 0x00,
+	0x00, 0x90, 0x11, 0x00, 0x0e, 0x00, 0x00, 0x00,
+};
+
 /* Direct grid 64x1x1, threadgroup 32x1x1, then the stream terminator. */
 static const uint8_t add3_cdm[] = {
 	0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x01,
@@ -72,6 +93,71 @@ static const uint8_t add3_cdm[] = {
 	0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
 	0x60, 0x01, 0x00, 0x60, 0x00, 0x00, 0x00, 0x40,
 };
+
+static void put_le16(uint8_t *where, uint16_t value)
+{
+	where[0] = value;
+	where[1] = value >> 8;
+}
+
+static void put_le32(uint8_t *where, uint32_t value)
+{
+	where[0] = value;
+	where[1] = value >> 8;
+	where[2] = value >> 16;
+	where[3] = value >> 24;
+}
+
+static void fill_helper_table(uint8_t *image, size_t base)
+{
+	static const uint8_t opcodes[] = { 0x60, 0x50, 0x40, 0x30, 0x20, 0x10 };
+	static const uint8_t terminal[] = {
+		0xf7, 0x03, 0xaa, 0x00, 0x8f, 0x02, 0x54, 0x01,
+		0x06, 0x00, 0x06, 0x00, 0x06, 0x00, 0x06, 0x00,
+	};
+
+	for (size_t i = 0; i < sizeof(opcodes); ++i) {
+		uint8_t *record = image + base + i * 0x10;
+
+		memset(record, 0, 0x10);
+		record[0] = 0x0f;
+		record[1] = 0x00;
+		record[2] = 0x54;
+		record[3] = opcodes[i];
+		put_le16(record + 10, 0x0006);
+		put_le16(record + 12, 0x0006);
+		put_le16(record + 14, 0x0006);
+	}
+	memcpy(image + base + 0x60, terminal, sizeof(terminal));
+	memcpy(image + base + 0x70, terminal, sizeof(terminal));
+}
+
+static void build_add3_code_image(void *mapping)
+{
+	uint8_t *image = mapping;
+
+	memset(image, 0, GPU_PAGE_SIZE);
+	put_le32(image, 0x340);
+	for (size_t offset = 0x40; offset < 0x340; offset += 2)
+		put_le16(image + offset, 0x0006);
+	fill_helper_table(image, 0x100);
+	fill_helper_table(image, 0x200);
+	put_le32(image + 0x340, 0xc0);
+	memcpy(image + 0x380, add3_constant_program,
+	       sizeof(add3_constant_program));
+	memcpy(image + 0x3c0, add3_main_program, sizeof(add3_main_program));
+}
+
+static uint64_t code_image_fingerprint(const uint8_t *image)
+{
+	uint64_t hash = UINT64_C(0xcbf29ce484222325);
+
+	for (size_t i = 0; i < GPU_PAGE_SIZE; ++i) {
+		hash ^= image[i];
+		hash *= UINT64_C(0x100000001b3);
+	}
+	return hash;
+}
 
 struct mapped_bo {
 	uint32_t handle;
@@ -141,11 +227,34 @@ struct add3_cmdbuf {
 
 _Static_assert(sizeof(add3_shader) == 196, "add3 shader size changed");
 _Static_assert(sizeof(add3_cdm) == 48, "add3 CDM size changed");
+_Static_assert(sizeof(add3_constant_program) == 64,
+	       "add3 constant program size changed");
+_Static_assert(sizeof(add3_main_program) == 56,
+	       "add3 main program size changed");
 _Static_assert(sizeof(struct drm_asahi_cmd_compute) == 64,
 	       "compute UAPI size changed");
 
 int main(int argc, char **argv)
 {
+	if (argc == 2 && !strcmp(argv[1], "--selftest-code-image")) {
+		uint8_t *image = calloc(1, GPU_PAGE_SIZE);
+
+		if (!image)
+			fail("allocate code-image selftest buffer");
+		build_add3_code_image(image);
+		uint64_t fingerprint = code_image_fingerprint(image);
+
+		if (fingerprint != UINT64_C(0x72b014fffa72f6a9)) {
+			fprintf(stderr,
+				"asahi_g17p_add3: code image fingerprint %#" PRIx64
+				" expected 0x72b014fffa72f6a9\n", fingerprint);
+			free(image);
+			return EXIT_FAILURE;
+		}
+		free(image);
+		puts("asahi_g17p_add3: code image selftest PASS");
+		return EXIT_SUCCESS;
+	}
 	const char *node = argc > 1 ? argv[1] : "/dev/dri/renderD128";
 	struct drm_asahi_params_global params = {0};
 	struct drm_asahi_get_params get = {
@@ -160,7 +269,7 @@ int main(int argc, char **argv)
 		.priority = DRM_ASAHI_PRIORITY_MEDIUM,
 		.usc_exec_base = USC_BASE,
 	};
-	struct mapped_bo shader, cdm, input_a, input_b, output;
+	struct mapped_bo code, shader, cdm, input_a, input_b, output;
 	struct add3_cmdbuf commands = {0};
 	struct drm_asahi_submit submit = {0};
 	float *a, *b, *result;
@@ -187,11 +296,13 @@ int main(int argc, char **argv)
 	queue.vm_id = vm.vm_id;
 	do_ioctl(fd, DRM_IOCTL_ASAHI_QUEUE_CREATE, &queue, "QUEUE_CREATE");
 
+	code = create_and_bind(fd, vm.vm_id, USC_BASE, GPU_PAGE_SIZE);
 	shader = create_and_bind(fd, vm.vm_id, SHADER_VA, GPU_PAGE_SIZE);
 	cdm = create_and_bind(fd, vm.vm_id, CDM_VA, GPU_PAGE_SIZE);
 	input_a = create_and_bind(fd, vm.vm_id, INPUT_A_VA, GPU_PAGE_SIZE);
 	input_b = create_and_bind(fd, vm.vm_id, INPUT_B_VA, GPU_PAGE_SIZE);
 	output = create_and_bind(fd, vm.vm_id, OUTPUT_VA, GPU_PAGE_SIZE);
+	build_add3_code_image(code.map);
 	memcpy(shader.map, add3_shader, sizeof(add3_shader));
 	memcpy(cdm.map, add3_cdm, sizeof(add3_cdm));
 	a = input_a.map;
