@@ -1015,7 +1015,6 @@ static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 	dcp->link_service_match_output = NULL;
 	dcp->link_service_match_callback_tag = 0;
 	dev_info(dcp->dev, "DCP25G83_ACK_DIAG armed\n");
-	dev_info(dcp->dev, "DCP25G83_EP37_EARLY_REPLY_DIAG armed\n");
 
 	if (dcp->adopted_session) {
 		struct iommu_domain *domain;

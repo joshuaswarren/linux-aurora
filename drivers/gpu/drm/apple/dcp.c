@@ -26,7 +26,6 @@
 #include <linux/sizes.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/string.h>
-#include <linux/timekeeping.h>
 #include <linux/usb/typec_altmode.h>
 #include <linux/usb/typec_dp.h>
 #include <linux/usb/typec_mux.h>
@@ -59,9 +58,12 @@
 
 #define APPLE_DCP_RTKIT_MGMT_TYPE GENMASK_ULL(59, 52)
 #define APPLE_DCP_RTKIT_MGMT_STARTEP 5
+#define APPLE_DCP_RTKIT_MGMT_SET_AP_PWR_STATE 0xb
 #define APPLE_DCP_RTKIT_MGMT_STARTEP_EP GENMASK_ULL(39, 32)
 #define APPLE_DCP_RTKIT_MGMT_STARTEP_FLAG BIT_ULL(1)
+#define APPLE_DCP_RTKIT_MGMT_PWR_STATE GENMASK_ULL(15, 0)
 #define APPLE_DCP_RTKIT_EP_MGMT 0
+#define APPLE_DCP_RTKIT_PWR_STATE_ON 0x20
 
 #define APPLE_T8140_MBOX_CONTROL_FULL BIT(16)
 #define APPLE_T8140_MBOX_A2I_CONTROL 0x110
@@ -322,21 +324,6 @@ unbacked:
 	dev_info_ratelimited(dcp->dev, "ep %#04x: %#llx\n", endpoint, message);
 }
 
-static bool dcp_recv_msg_early(void *cookie, u8 endpoint, u64 message)
-{
-	struct apple_dcp *dcp = cookie;
-	u8 control = message & GENMASK_ULL(7, 0);
-
-	if (endpoint == APPLE_DCP_LINK_ENDPOINT &&
-	    (message & GENMASK_ULL(7, 6)) == BIT_ULL(6))
-		dev_info(dcp->dev,
-			 "DCP25G83_EP37_EARLY_REPLY ns %llu word %#llx control %#x\n",
-			 ktime_get_mono_fast_ns(), message, control);
-
-	/* Preserve normal ordered-workqueue delivery and handler semantics. */
-	return false;
-}
-
 static void dcp_rtk_crashed(void *cookie, const void *crashlog, size_t crashlog_size)
 {
 	struct apple_dcp *dcp = cookie;
@@ -554,7 +541,6 @@ static void dcp_rtk_shmem_destroy(void *cookie, struct apple_rtkit_shmem *bfr)
 static struct apple_rtkit_ops rtkit_ops = {
 	.crashed = dcp_rtk_crashed,
 	.recv_message = dcp_recv_msg,
-	.recv_message_early = dcp_recv_msg_early,
 	.shmem_setup = dcp_rtk_shmem_setup,
 	.shmem_destroy = dcp_rtk_shmem_destroy,
 };
@@ -627,6 +613,40 @@ int dcp_start_rtkit_endpoint(struct apple_dcp *dcp, u8 endpoint)
 		  APPLE_DCP_RTKIT_MGMT_STARTEP_FLAG;
 	return apple_rtkit_send_message(dcp->rtk, APPLE_DCP_RTKIT_EP_MGMT,
 					message, NULL, false);
+}
+
+static int dcp_adopt_signal_ap_on(struct apple_dcp *dcp)
+{
+	struct apple_rtkit *rtk = dcp->rtk;
+	u64 message;
+	unsigned long waited = 0;
+	int ret;
+
+	message = FIELD_PREP(APPLE_DCP_RTKIT_MGMT_TYPE,
+			     APPLE_DCP_RTKIT_MGMT_SET_AP_PWR_STATE) |
+		  FIELD_PREP(APPLE_DCP_RTKIT_MGMT_PWR_STATE,
+			     APPLE_DCP_RTKIT_PWR_STATE_ON);
+
+	dev_info(dcp->dev, "DCP25G83_ADOPT_AP_ON_SIGNAL armed\n");
+	reinit_completion(&rtk->ap_pwr_ack_completion);
+	ret = apple_rtkit_send_message(rtk, APPLE_DCP_RTKIT_EP_MGMT,
+				       message, NULL, false);
+	if (ret)
+		goto out_log;
+
+	waited = wait_for_completion_timeout(&rtk->ap_pwr_ack_completion,
+					     DCP_BOOT_TIMEOUT);
+	if (!waited)
+		ret = -ETIMEDOUT;
+	else if (READ_ONCE(rtk->ap_power_state) !=
+		 APPLE_DCP_RTKIT_PWR_STATE_ON)
+		ret = -EINVAL;
+
+out_log:
+	dev_info(dcp->dev,
+		 "DCP25G83_ADOPT_AP_ON_RESULT request %#llx acknowledged %u ack_state %#x result %d\n",
+		 message, !!waited, READ_ONCE(rtk->ap_power_state), ret);
+	return ret;
 }
 
 int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state *state)
@@ -1578,6 +1598,13 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 		}
 
 		dcp->adopting_session = false;
+		ret = dcp_adopt_signal_ap_on(dcp);
+		if (ret) {
+			dev_err(dev,
+				"native-equivalent adopted AP-on signal failed: %d\n",
+				ret);
+			goto err_free_rtkit;
+		}
 		dcp->adopted_session = true;
 	} else {
 		if (start_mode == APPLE_DCP_COPROCESSOR_QUIESCED_RESTART)
@@ -1638,6 +1665,7 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 
 err_stop_cpu:
 	apple_dcp_stop_fresh_boot_cpu(dcp);
+err_free_rtkit:
 	devm_apple_rtkit_free(dev, dcp->rtk);
 	dcp->rtk = NULL;
 err_destroy_piodma:
