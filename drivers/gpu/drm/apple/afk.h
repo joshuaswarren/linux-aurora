@@ -74,11 +74,6 @@ struct apple_epic_service_ops {
 struct afk_ringbuffer_header {
 	__le32 bufsz;
 	u32 unk;
-	u32 _pad1[14];
-	__le32 rptr;
-	u32 _pad2[15];
-	__le32 wptr;
-	u32 _pad3[15];
 };
 
 struct afk_qe {
@@ -153,9 +148,11 @@ enum epic_subtype {
 struct afk_ringbuffer {
 	bool ready;
 	struct afk_ringbuffer_header *hdr;
-	u32 rptr;
+	__le32 *rptr;
+	__le32 *wptr;
 	void *buf;
 	size_t bufsz;
+	u32 block_size;
 };
 
 struct apple_dcp_afkep {

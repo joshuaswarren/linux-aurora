@@ -37,6 +37,8 @@ enum rbep_msg_type {
 };
 
 #define BLOCK_SHIFT 6
+#define AFK_RING_BLOCK_COUNT 3
+#define AFK_RING_BLOCK_SIZE (1U << BLOCK_SHIFT)
 
 #define GETBUF_SIZE GENMASK(31, 16)
 #define GETBUF_TAG GENMASK(15, 0)
@@ -116,11 +118,14 @@ int afk_start(struct apple_dcp_afkep *ep)
 
 static void afk_getbuf(struct apple_dcp_afkep *ep, u64 message)
 {
-	u16 size = FIELD_GET(GETBUF_SIZE, message) << BLOCK_SHIFT;
+	u32 size = FIELD_GET(GETBUF_SIZE, message) << BLOCK_SHIFT;
 	u16 tag = FIELD_GET(GETBUF_TAG, message);
 	u64 reply;
 
 	trace_afk_getbuf(ep, size, tag);
+	dev_info(ep->dcp->dev,
+		 "AFK[ep:%02x]: GETBUF raw %#llx size %#x tag %#x existing size %#lx\n",
+		 ep->endpoint, message, size, tag, ep->bfr_size);
 
 	if (ep->bfr) {
 		dev_err(ep->dcp->dev,
@@ -147,10 +152,11 @@ static void afk_getbuf(struct apple_dcp_afkep *ep, u64 message)
 static void afk_init_rxtx(struct apple_dcp_afkep *ep, u64 message,
 			  struct afk_ringbuffer *bfr)
 {
-	u16 base = FIELD_GET(INITRB_OFFSET, message) << BLOCK_SHIFT;
-	u16 size = FIELD_GET(INITRB_SIZE, message) << BLOCK_SHIFT;
+	u32 base = FIELD_GET(INITRB_OFFSET, message) << BLOCK_SHIFT;
+	u32 size = FIELD_GET(INITRB_SIZE, message) << BLOCK_SHIFT;
 	u16 tag = FIELD_GET(INITRB_TAG, message);
-	u32 bufsz, end;
+	u16 type = FIELD_GET(RBEP_TYPE, message);
+	u32 block_size, bufsz, end, header_size;
 
 	if (tag != ep->bfr_tag) {
 		dev_err(ep->dcp->dev, "AFK[ep:%02x]: expected tag 0x%x but got 0x%x\n",
@@ -181,16 +187,38 @@ static void afk_init_rxtx(struct apple_dcp_afkep *ep, u64 message,
 
 	bfr->hdr = ep->bfr + base;
 	bufsz = le32_to_cpu(bfr->hdr->bufsz);
-	if (bufsz + sizeof(*bfr->hdr) != size) {
+	dev_info(ep->dcp->dev,
+		 "AFK[ep:%02x]: INITRB raw %#llx type %#x base %#x size %#x tag %#x allocation %#lx header bufsz %#x\n",
+		 ep->endpoint, message, type, base, size, tag, ep->bfr_size,
+		 bufsz);
+
+	if (bufsz >= size || (size - bufsz) % AFK_RING_BLOCK_COUNT) {
 		dev_err(ep->dcp->dev,
-			"AFK[ep:%02x]: ring buffer size 0x%x != expected 0x%lx\n",
-			ep->endpoint, bufsz, sizeof(*bfr->hdr));
+			"AFK[ep:%02x]: invalid ring geometry: bufsz %#x size %#x\n",
+			ep->endpoint, bufsz, size);
+		return;
+	}
+	header_size = size - bufsz;
+	block_size = header_size / AFK_RING_BLOCK_COUNT;
+	if (block_size < AFK_RING_BLOCK_SIZE ||
+	    !IS_ALIGNED(block_size, AFK_RING_BLOCK_SIZE) ||
+	    (ep->dcp->fw_compat != DCP_FIRMWARE_H17P &&
+	     block_size != AFK_RING_BLOCK_SIZE)) {
+		dev_err(ep->dcp->dev,
+			"AFK[ep:%02x]: unsupported ring block size %#x (header %#x)\n",
+			ep->endpoint, block_size, header_size);
 		return;
 	}
 
-	bfr->buf = bfr->hdr + 1;
+	bfr->rptr = (__le32 *)((u8 *)bfr->hdr + block_size);
+	bfr->wptr = (__le32 *)((u8 *)bfr->hdr + 2 * block_size);
+	bfr->buf = (u8 *)bfr->hdr + header_size;
 	bfr->bufsz = bufsz;
+	bfr->block_size = block_size;
 	bfr->ready = true;
+	dev_info(ep->dcp->dev,
+		 "AFK[ep:%02x]: ring ready block %#x header %#x data %#x\n",
+		 ep->endpoint, block_size, header_size, bufsz);
 
 	if (ep->rxbfr.ready && ep->txbfr.ready)
 		afk_send(ep, FIELD_PREP(RBEP_TYPE, RBEP_START));
@@ -596,8 +624,8 @@ static bool afk_recv(struct apple_dcp_afkep *ep)
 		return false;
 	}
 
-	rptr = le32_to_cpu(ep->rxbfr.hdr->rptr);
-	wptr = le32_to_cpu(ep->rxbfr.hdr->wptr);
+	rptr = le32_to_cpu(READ_ONCE(*ep->rxbfr.rptr));
+	wptr = le32_to_cpu(READ_ONCE(*ep->rxbfr.wptr));
 	trace_afk_recv_rwptr_pre(ep, rptr, wptr);
 
 	if (rptr == wptr)
@@ -642,7 +670,7 @@ static bool afk_recv(struct apple_dcp_afkep *ep)
 			return false;
 		}
 
-		ep->rxbfr.hdr->rptr = cpu_to_le32(rptr);
+		WRITE_ONCE(*ep->rxbfr.rptr, cpu_to_le32(rptr));
 	}
 
 	if (rptr + size + sizeof(*hdr) > ep->rxbfr.bufsz) {
@@ -655,7 +683,8 @@ static bool afk_recv(struct apple_dcp_afkep *ep)
 	channel = le32_to_cpu(hdr->channel);
 	type = le32_to_cpu(hdr->type);
 
-	rptr = ALIGN(rptr + sizeof(*hdr) + size, 1 << BLOCK_SHIFT);
+	rptr = roundup(rptr + sizeof(*hdr) + size,
+			ep->rxbfr.block_size);
 	if (WARN_ON(rptr > ep->rxbfr.bufsz))
 		rptr = 0;
 	if (rptr == ep->rxbfr.bufsz)
@@ -663,7 +692,7 @@ static bool afk_recv(struct apple_dcp_afkep *ep)
 
 	dma_mb();
 
-	ep->rxbfr.hdr->rptr = cpu_to_le32(rptr);
+	WRITE_ONCE(*ep->rxbfr.rptr, cpu_to_le32(rptr));
 	trace_afk_recv_rwptr_post(ep, rptr, wptr);
 
 	/*
@@ -755,8 +784,8 @@ int afk_send_epic(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 	spin_lock_irqsave(&ep->lock, flags);
 
 	dma_rmb();
-	rptr = le32_to_cpu(ep->txbfr.hdr->rptr);
-	wptr = le32_to_cpu(ep->txbfr.hdr->wptr);
+	rptr = le32_to_cpu(READ_ONCE(*ep->txbfr.rptr));
+	wptr = le32_to_cpu(READ_ONCE(*ep->txbfr.wptr));
 	trace_afk_send_rwptr_pre(ep, rptr, wptr);
 	total_epic_size = sizeof(*ehdr) + sizeof(*eshdr) + payload_len;
 	total_size = sizeof(*hdr) + total_epic_size;
@@ -869,12 +898,12 @@ int afk_send_epic(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 
 	memcpy(ep->txbfr.buf + wptr, payload, payload_len);
 	wptr += payload_len;
-	wptr = ALIGN(wptr, 1 << BLOCK_SHIFT);
+	wptr = roundup(wptr, ep->txbfr.block_size);
 	if (wptr == ep->txbfr.bufsz)
 		wptr = 0;
 	trace_afk_send_rwptr_post(ep, rptr, wptr);
 
-	ep->txbfr.hdr->wptr = cpu_to_le32(wptr);
+	WRITE_ONCE(*ep->txbfr.wptr, cpu_to_le32(wptr));
 	afk_send(ep, FIELD_PREP(RBEP_TYPE, RBEP_SEND) |
 			     FIELD_PREP(SEND_WPTR, wptr));
 	ret = 0;
