@@ -723,6 +723,82 @@ impl UatPageTable {
         })?;
         Ok(pages)
     }
+
+    /// Snapshot a firmware-owned DVA range through this page table.
+    ///
+    /// The destination is ordinary owned memory. Source pages are borrowed
+    /// only for the duration of each local mapping and read as atomic qwords,
+    /// matching the established crashdump snapshot policy.
+    #[cfg(CONFIG_DEV_COREDUMP)]
+    pub(crate) fn copy_mapped_range(&mut self, address: u64, out: &mut [u8]) -> Result {
+        if out.is_empty() || (address | out.len() as u64) & 7 != 0 {
+            return Err(EINVAL);
+        }
+        let end = address.checked_add(out.len() as u64).ok_or(EOVERFLOW)?;
+        if address < self.va_range.start || end > self.va_range.end {
+            return Err(EFAULT);
+        }
+        let page_mask = UAT_PGMSK as u64;
+        let aligned_start = address & !page_mask;
+        let aligned_end = end.checked_add(page_mask).ok_or(EOVERFLOW)? & !page_mask;
+        let oas_mask = self.oas_mask;
+        let mut copied = 0usize;
+
+        self.with_pages(aligned_start..aligned_end, false, false, |iova, ptes| {
+            for (index, ppte) in ptes.iter().enumerate() {
+                let page_iova = iova + (index * UAT_PGSZ) as u64;
+                let copy_start = page_iova.max(address);
+                let copy_end = (page_iova + UAT_PGSZ as u64).min(end);
+                if copy_start >= copy_end {
+                    continue;
+                }
+
+                let pte = ppte.load(Ordering::Acquire);
+                if pte & PTE_TYPE_BITS != PTE_TYPE_LEAF_TABLE {
+                    return Err(EFAULT);
+                }
+                let memattr = ((pte & UAT_MEMATTR_BITS) >> UAT_MEMATTR_SHIFT) as u8;
+                if memattr != MEMATTR_CACHED && memattr != MEMATTR_UNCACHED {
+                    return Err(EFAULT);
+                }
+                let phys = pte & oas_mask & (!UAT_PGMSK as u64);
+                // SAFETY: Firmware installed this PTE in the shared T8140
+                // lower root. borrow_phys verifies that its backing is System
+                // RAM with a live struct page before a local mapping is made.
+                let page = unsafe { Page::borrow_phys(&phys) }.ok_or(EFAULT)?;
+                let page_offset = (copy_start - page_iova) as usize;
+                let length = (copy_end - copy_start) as usize;
+                let output_offset = (copy_start - address) as usize;
+                if (page_offset | length | output_offset) & 7 != 0 {
+                    return Err(EINVAL);
+                }
+                page.with_pointer_into_page(page_offset, length, |pointer| {
+                    let source = unsafe {
+                        // SAFETY: with_pointer_into_page validated this range;
+                        // qword alignment was checked above.
+                        core::slice::from_raw_parts(
+                            pointer as *const AtomicU64,
+                            length / core::mem::size_of::<AtomicU64>(),
+                        )
+                    };
+                    for (word, destination) in source.iter().zip(
+                        out[output_offset..output_offset + length]
+                            .chunks_exact_mut(core::mem::size_of::<u64>()),
+                    ) {
+                        destination.copy_from_slice(&word.load(Ordering::Acquire).to_le_bytes());
+                    }
+                    Ok(())
+                })?;
+                copied = copied.checked_add(length).ok_or(EOVERFLOW)?;
+            }
+            Ok(())
+        })?;
+
+        if copied != out.len() {
+            return Err(EFAULT);
+        }
+        Ok(())
+    }
 }
 
 impl Drop for UatPageTable {

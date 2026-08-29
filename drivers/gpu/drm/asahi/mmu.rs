@@ -1418,6 +1418,18 @@ impl Vm {
             .unwrap_or(false)
     }
 
+    /// Copy a bounded firmware-owned range from this VM into ordinary memory.
+    #[cfg(CONFIG_DEV_COREDUMP)]
+    pub(crate) fn copy_firmware_range(&self, address: u64, size: usize) -> Result<KVVec<u8>> {
+        if size == 0 {
+            return Err(EINVAL);
+        }
+        let mut data = KVVec::from_elem(0, size, GFP_KERNEL)?;
+        let mut inner = self.inner.exec_lock(None, false)?;
+        inner.page_table.copy_mapped_range(address, &mut data)?;
+        Ok(data)
+    }
+
     /// Map a GEM object (using its `SGTable`) into this Vm at a free address in a given range.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn map_in_range(
