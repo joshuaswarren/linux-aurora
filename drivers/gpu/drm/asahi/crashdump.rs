@@ -30,6 +30,20 @@ const NOTE_AGX_DUMP_INFO: u32 = 1;
 
 const NOTE_NAME_RTKIT: &str = "RTKIT";
 const NOTE_RTKIT_CRASHLOG: u32 = 1;
+const NOTE_RTKIT_CRASH_INFO: u32 = 2;
+
+#[repr(C)]
+pub(crate) struct RTKitCrashInfo {
+    /// Envelope version.
+    version: u32,
+    /// Zero for GFX and one for GFX1.
+    processor: u32,
+    /// Firmware-advertised bytes and the bounded bytes copied into this dump.
+    original_size: u64,
+    captured_size: u64,
+}
+
+const _: () = assert!(size_of::<RTKitCrashInfo>() == 24);
 
 #[repr(C)]
 pub(crate) struct AGXDumpInfo {
@@ -80,6 +94,8 @@ unsafe impl AsBytes for uapi::Elf64_Phdr {}
 unsafe impl AsBytes for uapi::Elf64_Nhdr {}
 // SAFETY: This type has no padding
 unsafe impl AsBytes for AGXDumpInfo {}
+// SAFETY: This type has no padding
+unsafe impl AsBytes for RTKitCrashInfo {}
 
 const FIRMWARE_ENTRYPOINT: u64 = 0xFFFFFF8000000000u64;
 
@@ -136,6 +152,31 @@ impl CrashDumpBuilder {
             GFP_KERNEL,
         )?;
 
+        Ok(())
+    }
+
+    pub(crate) fn add_rtkit_crash_info(
+        &mut self,
+        processor: u32,
+        original_size: usize,
+        captured_size: usize,
+    ) -> Result {
+        let info = RTKitCrashInfo {
+            version: 1,
+            processor,
+            original_size: original_size as u64,
+            captured_size: captured_size as u64,
+        };
+        let mut data = KVVec::new();
+        data.extend_from_slice(info.as_bytes(), GFP_KERNEL)?;
+        self.notes.push(
+            ELFNote {
+                name: NOTE_NAME_RTKIT,
+                ty: NOTE_RTKIT_CRASH_INFO,
+                data,
+            },
+            GFP_KERNEL,
+        )?;
         Ok(())
     }
 
