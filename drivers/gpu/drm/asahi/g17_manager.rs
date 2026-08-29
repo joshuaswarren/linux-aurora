@@ -479,16 +479,25 @@ impl G17PManagerConstruction {
     /// both outer channel consumers must retire before the graph can drop.
     pub(crate) fn wait_compute_bootstrap_render_retirement(&mut self) -> Result {
         const POLLS: usize = 500;
+        let mut last = None;
         for _ in 0..POLLS {
             fence(Ordering::Acquire);
             let state = self.render_storage.as_mut().ok_or(ENODEV)?.snapshot()?;
-            let inner_retired = state.tiling.done == 3
-                && state.tiling.read == 3
-                && state.tiling.write == 3
-                && state.fragment.done == 3
-                && state.fragment.read == 3
-                && state.fragment.write == 3;
-            if inner_retired && self.resources.partial_opening_outer_retired()? {
+            let outer = self.resources.partial_opening_outer_counters()?;
+            // m1n1's fence owns the prefix once done/read cover the three
+            // items and the outer consumers reach producer one. The queue may
+            // already advertise a later write prefix (the positive run is
+            // 3/3/6), so equality with write=3 is not an ownership rule.
+            let inner_retired = state.tiling.done >= 3
+                && state.tiling.read >= 3
+                && state.tiling.write >= 3
+                && state.fragment.done >= 3
+                && state.fragment.read >= 3
+                && state.fragment.write >= 3;
+            let outer_retired = outer
+                .into_iter()
+                .all(|counters| counters[2] == 1 && counters[..2] == [counters[2]; 2]);
+            if inner_retired && outer_retired {
                 self.render_tracker = None;
                 self.render_bind = None;
                 self.render_storage = None;
@@ -498,7 +507,16 @@ impl G17PManagerConstruction {
                     .restore_t8140_kernel_context_after_bootstrap_render()?;
                 return Ok(());
             }
+            last = Some((state, outer));
             fsleep(Delta::from_millis(1));
+        }
+        if let Some((state, outer)) = last {
+            pr_err!(
+                "G17P bootstrap timeout: TA {:?}, 3D {:?}, outer 3D/TA {:?}\n",
+                state.tiling,
+                state.fragment,
+                outer
+            );
         }
         Err(ETIMEDOUT)
     }

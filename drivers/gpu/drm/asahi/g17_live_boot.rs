@@ -68,7 +68,6 @@ const CONTROL_DONE_CHANNEL: u64 = 0x11;
 const INITDATA_ACK_POLLS: usize = 200;
 const CONTROL_COUNTER_POLLS: usize = 100;
 const G17P_CRASHLOG_MAX_BYTES: usize = 256 * 1024;
-const G17P_ASC_DVA_MASK: u64 = (1u64 << 36) - 1;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[repr(u32)]
@@ -129,8 +128,6 @@ const _: () = {
     assert!(gfx1.dva & (mmu::UAT_PGSZ as u64 - 1) == 0);
     assert!(gfx.dva + gfx.size as u64 <= 1u64 << 42);
     assert!(gfx1.dva + gfx1.size as u64 <= 1u64 << 42);
-    assert!(gfx.dva & G17P_ASC_DVA_MASK == 0x01e1_c000);
-    assert!(gfx1.dva & G17P_ASC_DVA_MASK == 0x01f5_0000);
 };
 
 /// Load-time boundary for short, independent hardware experiments.
@@ -174,6 +171,7 @@ impl G17PTestStage {
 struct G17PRoleRtkitState {
     dev: ARef<AsahiDevice>,
     processor: G17PProcessor,
+    retained_crash_vm: mmu::Vm,
     crash_vm: Arc<Mutex<mmu::Vm>>,
     acked: AtomicBool,
     crashed: AtomicBool,
@@ -185,6 +183,7 @@ impl G17PRoleRtkitState {
         Ok(Self {
             dev,
             processor,
+            retained_crash_vm: crash_vm.clone(),
             crash_vm: Arc::pin_init(new_mutex!(crash_vm, "G17P crash VM"), GFP_KERNEL)?,
             acked: AtomicBool::new(false),
             crashed: AtomicBool::new(false),
@@ -225,13 +224,19 @@ fn publish_g17p_crashlog(
 fn capture_g17p_firmware_crash_dva(state: &G17PRoleRtkitState) -> Result {
     let buffer = state.processor.firmware_crash_buffer();
     let captured_size = bounded_crashlog_size(buffer.size);
-    // The endpoint-1 message carries the ASC DVA tag in bits 36 and above.
-    // m1n1's StandardASC strips the same tag before walking UAT context 1.
-    let uat_dva = buffer.dva & G17P_ASC_DVA_MASK;
-    let crashlog = state
+    // T8140 has a 42-bit UAT. The endpoint-1 value is already the complete
+    // 41-bit DVA; truncating it to the older 36-bit width turns
+    // 0x10001e1c000 into the unrelated 0x1e1c000.
+    let active = state
         .crash_vm
         .lock()
-        .copy_firmware_range(uat_dva, captured_size)?;
+        .copy_firmware_range(buffer.dva, captured_size);
+    let crashlog = match active {
+        Ok(crashlog) => crashlog,
+        Err(_) => state
+            .retained_crash_vm
+            .copy_firmware_range(buffer.dva, captured_size)?,
+    };
     publish_g17p_crashlog(state, buffer.size, &crashlog)
 }
 
@@ -423,22 +428,6 @@ fn finish_boot_session(
         "G17P control: 4 primary and 16 secondary records staged\n"
     );
 
-    // The output-positive source runner publishes its startup TA/3D pair
-    // before CONTROL_START. A group first exposed after CONTROL_START enters
-    // a different firmware path and does not establish the compute lifecycle.
-    let bootstrap = if test_stage.configures_qid4() {
-        let (prepared, crash_vm) = manager.begin_compute_bootstrap_render(drm)?;
-        gfx_state.set_crash_vm(crash_vm.clone());
-        gfx1_state.set_crash_vm(crash_vm);
-        dev_info!(
-            pdev.as_ref(),
-            "G17P compute control: startup TA/3D visible before control start\n"
-        );
-        Some(prepared)
-    } else {
-        None
-    };
-
     let control_start = (CONTROL_START_TYPE as u64) << 48;
     Pin::new(&mut gfx_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, control_start)?;
     fsleep(Delta::from_millis(12));
@@ -493,6 +482,11 @@ fn finish_boot_session(
         });
     }
 
+    // The hardware-positive shim holds both outer producers until after
+    // CONTROL_START (`--publish-after-control --no-first-doorbell`).
+    let (bootstrap, crash_vm) = manager.begin_compute_bootstrap_render(drm)?;
+    gfx_state.set_crash_vm(crash_vm.clone());
+    gfx1_state.set_crash_vm(crash_vm);
     manager.prepare_partial_opening_control_done()?;
     dev_info!(
         pdev.as_ref(),
@@ -502,7 +496,7 @@ fn finish_boot_session(
         .send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, control_done)?;
     Pin::new(&mut gfx_rtkit).send_message(
         g17_rtkit::ENDPOINT_GFX_INTERRUPTS,
-        bootstrap.ok_or(EIO)?.paired_doorbell,
+        bootstrap.paired_doorbell,
     )?;
     dev_info!(
         pdev.as_ref(),
