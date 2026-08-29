@@ -224,6 +224,9 @@ pub(crate) const CONTROL_SHARED_INNER_ADDRESS: u64 = 0xffff_fc20_0160_8000;
 pub(crate) const CONTROL_SHARED_OBJECT_SIZE: usize = 0x4000;
 pub(crate) const CONTROL_SHARED_CURSOR_OFFSET: usize = 0x48;
 pub(crate) const CONTROL_SHARED_CURSOR_BEFORE: u32 = 0x88;
+/// The output-positive generic opening presents the cursor before binding but
+/// the separate inner state after binding (`--shared-control mixed`).
+pub(crate) const CONTROL_SHARED_INNER_PRESENTED: u64 = 2;
 pub(crate) const CONTROL_OPERAND_TABLE_ADDRESS: u64 = 0x70_0020_8000;
 pub(crate) const CONTROL_OPERAND_TABLE_SIZE: usize = 0x4000;
 pub(crate) const CONTROL_OPERAND_SLOT_OFFSET: u64 = 0x440;
@@ -2520,6 +2523,7 @@ mod tests {
         );
         assert_eq!(get_u64(&shared, 0x4c), CONTROL_SHARED_INNER_ADDRESS);
         assert_eq!(get_u64(&shared, 0x60), 2);
+        assert_eq!(CONTROL_SHARED_INNER_PRESENTED, 2);
     }
 
     #[test]
