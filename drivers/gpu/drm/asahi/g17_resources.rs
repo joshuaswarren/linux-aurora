@@ -435,7 +435,7 @@ pub(crate) struct G17PControlCounters {
 
 impl G17PControlCounters {
     pub(crate) fn opening_staged(self) -> bool {
-        self.primary == [0, 0, g17_initdata::CONTROL_OPENING_PRIMARY_PRODUCER]
+        self.primary == [g17_initdata::CONTROL_OPENING_PRIMARY_PRODUCER; 3]
             && self.secondary
                 == [0, 0, g17_initdata::CONTROL_OPENING_SECONDARY_PRODUCER]
     }
@@ -929,6 +929,25 @@ fn read_control_counters(object: &mut MappedObject, state_grid: u64) -> Result<[
         *counter = object.read_u32(address)?;
     }
     Ok(counters)
+}
+
+#[cfg(not(test))]
+fn write_control_counters(object: &mut MappedObject, counters: [u32; 3]) -> Result {
+    object.with_bytes_mut(|bytes| {
+        let control = g17_initdata::WORK_STATE_GRID_OFFSETS
+            [g17_initdata::CONTROL_CHANNEL_INDEX];
+        for (index, counter) in counters.into_iter().enumerate() {
+            let offset = control
+                .checked_add(index * g17_initdata::CHANNEL_STATE_SPACING)
+                .ok_or(EINVAL)?;
+            let end = offset.checked_add(4).ok_or(EINVAL)?;
+            bytes
+                .get_mut(offset..end)
+                .ok_or(EINVAL)?
+                .copy_from_slice(&counter.to_le_bytes());
+        }
+        Ok(())
+    })
 }
 
 fn register_window_pages(window: &g17_initdata::RegisterWindow) -> Option<(u64, u64, u64)> {
@@ -2919,8 +2938,6 @@ impl G17ResourceOwner {
         )?;
         write_status_block_at(&mut secondary_status_a, 0)?;
         primary_state.with_bytes_mut(|bytes| {
-            bytes[0x320..0x324]
-                .copy_from_slice(&g17_initdata::CONTROL_OPENING_PRIMARY_PRODUCER.to_le_bytes());
             let status_b = g17_initdata::PRIMARY_STATUS_B_STATE_GRID_OFFSET;
             let end = status_b + g17_initdata::PRIMARY_STATUS_B_OBJECT_SIZE;
             g17_initdata::encode_primary_status_b(
@@ -2931,8 +2948,6 @@ impl G17ResourceOwner {
             .map_err(|_| EINVAL)
         })?;
         secondary_state.with_bytes_mut(|bytes| {
-            bytes[0x320..0x324]
-                .copy_from_slice(&g17_initdata::CONTROL_OPENING_SECONDARY_PRODUCER.to_le_bytes());
             let extra = g17_initdata::PRIMARY_STATUS_B_STATE_GRID_OFFSET;
             g17_initdata::encode_secondary_root_extra_1(
                 &mut bytes[extra..extra + g17_initdata::STATUS_BLOCK_SIZE],
@@ -2953,6 +2968,18 @@ impl G17ResourceOwner {
             &primary_region_views,
         )?;
         roots.write_roots(&shared, &primary_instance, &secondary_instance)?;
+        // Publish counters after both rings and the rest of the descriptor
+        // graph. Equal primary cursors mark the 67 historical records as
+        // completed; only the secondary producer has pending opening work.
+        write_control_counters(
+            &mut primary_state,
+            [g17_initdata::CONTROL_OPENING_PRIMARY_PRODUCER; 3],
+        )?;
+        write_control_counters(
+            &mut secondary_state,
+            [0, 0, g17_initdata::CONTROL_OPENING_SECONDARY_PRODUCER],
+        )?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         dev_info!(dev.as_ref(), "G17P resources: firmware layout ready\n");
 
         Ok(Self {
@@ -3137,8 +3164,6 @@ impl G17ResourceOwner {
         write_status_block_at(&mut self.resources.secondary_status_a, 0)?;
         let fwctl = self.resources.fwctl.iova();
         self.resources.primary_state.with_bytes_mut(|bytes| {
-            bytes[0x320..0x324]
-                .copy_from_slice(&g17_initdata::CONTROL_OPENING_PRIMARY_PRODUCER.to_le_bytes());
             let status_b = g17_initdata::PRIMARY_STATUS_B_STATE_GRID_OFFSET;
             let end = status_b + g17_initdata::PRIMARY_STATUS_B_OBJECT_SIZE;
             g17_initdata::encode_primary_status_b(
@@ -3149,8 +3174,6 @@ impl G17ResourceOwner {
             .map_err(|_| EINVAL)
         })?;
         self.resources.secondary_state.with_bytes_mut(|bytes| {
-            bytes[0x320..0x324]
-                .copy_from_slice(&g17_initdata::CONTROL_OPENING_SECONDARY_PRODUCER.to_le_bytes());
             let extra = g17_initdata::PRIMARY_STATUS_B_STATE_GRID_OFFSET;
             g17_initdata::encode_secondary_root_extra_1(
                 &mut bytes[extra..extra + g17_initdata::STATUS_BLOCK_SIZE],
@@ -3180,6 +3203,14 @@ impl G17ResourceOwner {
         self.resources
             .roots
             .write_roots(&shared, &primary.instance, &secondary.instance)?;
+        write_control_counters(
+            &mut self.resources.primary_state,
+            [g17_initdata::CONTROL_OPENING_PRIMARY_PRODUCER; 3],
+        )?;
+        write_control_counters(
+            &mut self.resources.secondary_state,
+            [0, 0, g17_initdata::CONTROL_OPENING_SECONDARY_PRODUCER],
+        )?;
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
@@ -3772,7 +3803,7 @@ mod tests {
             seen[index] = true;
             true
         }));
-        assert_eq!(seen, [true; 4]);
+        assert_eq!(seen, [true; 5]);
 
         for missing in 0..expected.len() {
             assert!(!layout.all_referenced_ranges_reachable(|address, size| {
@@ -4169,14 +4200,14 @@ mod tests {
     #[test]
     fn control_opening_requires_all_six_exact_counter_values() {
         let staged = G17PControlCounters {
-            primary: [0, 0, 4],
+            primary: [67, 67, 67],
             secondary: [0, 0, 16],
         };
         assert!(staged.opening_staged());
         assert!(!staged.opening_retired());
 
         let retired = G17PControlCounters {
-            primary: [4, 4, 4],
+            primary: [67, 67, 67],
             secondary: [16, 16, 16],
         };
         assert!(retired.opening_retired());

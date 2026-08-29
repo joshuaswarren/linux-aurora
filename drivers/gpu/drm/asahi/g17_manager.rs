@@ -364,6 +364,7 @@ pub(crate) struct G17PComputeUserBinding {
 pub(crate) struct G17PComputeTimeoutSnapshot {
     pub(crate) graph: g17_resources::G17PComputeGraphSnapshot,
     pub(crate) channel: g17_resources::G17PComputeChannelSnapshot,
+    pub(crate) control: g17_resources::G17PControlCounters,
 }
 
 /// The two complete queue groups exposed by the exact first graphics publish.
@@ -1160,6 +1161,7 @@ impl G17PManagerConstruction {
         Ok(G17PComputeTimeoutSnapshot {
             graph: queue.compute.snapshot_initial_channel_group()?,
             channel: self.resources.snapshot_compute_channel()?,
+            control: self.resources.control_counters()?,
         })
     }
 
