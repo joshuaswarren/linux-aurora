@@ -27,6 +27,7 @@
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_vblank.h>
 
+#include "afk.h"
 #include "dcp.h"
 #include "dcp-internal.h"
 #include "iomfb.h"
@@ -350,11 +351,13 @@ static void dcp_link_push(struct apple_dcp *dcp, bool oob,
 	*top = next_top;
 
 	dcp_link_sync_for_device();
-	if (call_tag == APPLE_DCP_H17P_CALL_START_SIGNAL)
+	if (call_tag == APPLE_DCP_H17P_CALL_START_SIGNAL) {
+		afk_log_tx_state(dcp->systemep, "before DCPLink A401");
 		dev_info(dcp->dev,
 			 "DCPLink A401 TX %#llx base %#x offset %#x size %#x top %#x->%#x depth %u header %#x/%u/%u\n",
 			 message, layout.local_offset, offset, payload_size,
 			 old_top, next_top, depth, call_tag, in_len, out_len);
+	}
 	dcp_send_message(dcp, APPLE_DCP_LINK_ENDPOINT, message);
 	return;
 
