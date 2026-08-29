@@ -1142,11 +1142,21 @@ static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 				dcp->link_endpoint_started = false;
 				goto err_unmap_inherited;
 			}
+			/* The kext publishes the descriptor only after EP37 is up. */
+			apple_dcp_link_init_desc_encode(desc, 0, false);
+			dcp_link_sync_for_device();
+			ret = dcp_send_message_sync(dcp,
+						    APPLE_DCP_LINK_ENDPOINT,
+						    captured_message);
+			if (ret) {
+				dev_err(dcp->dev,
+					"DCPLink INIT mailbox send failed: %d\n",
+					ret);
+				goto err_unmap_inherited;
+			}
 			dev_info(dcp->dev,
-				 "adopted unused DCPLink RPC mapping local DVA %#llx firmware DVA %#llx PA %#llx; sending host INIT\n",
+				 "adopted unused DCPLink RPC mapping local DVA %#llx firmware DVA %#llx PA %#llx; host INIT queued\n",
 				 rpc_dva, firmware_rpc_dva, rpc_pa);
-			dcp_send_message(dcp, APPLE_DCP_LINK_ENDPOINT,
-					 captured_message);
 			return 0;
 		}
 
@@ -1178,6 +1188,8 @@ static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 			ret = -EINVAL;
 			goto err_unmap_inherited;
 		}
+		if (descriptor_zero)
+			apple_dcp_link_init_desc_encode(desc, 0, false);
 		ret = apple_dcp_link_init_message(firmware_rpc_dva,
 						  &captured_message);
 		if (ret)
@@ -1187,7 +1199,6 @@ static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 		dcp->link_version = 0;
 		dcp->link_firmware_hash = 0;
 		dcp_link_sync_for_device();
-		dcp_link_log_init(dcp, desc, captured_message);
 		ret = dcp_send_message_sync(dcp, APPLE_DCP_LINK_ENDPOINT, captured_message);
 		if (ret) {
 			dev_err(dcp->dev,
@@ -1196,9 +1207,8 @@ static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 			goto err_unmap_inherited;
 		}
 		dev_info(dcp->dev,
-			 "adopted DCPLink firmware-init phase local DVA %#llx firmware DVA %#llx; sending inherited RPC INIT\n",
+			 "adopted DCPLink firmware-init phase local DVA %#llx firmware DVA %#llx; inherited RPC INIT queued\n",
 			 rpc_dva, firmware_rpc_dva);
-		dcp_send_message(dcp, APPLE_DCP_LINK_ENDPOINT, captured_message);
 		return 0;
 
 err_unmap_inherited:
@@ -1232,12 +1242,14 @@ err_unmap_inherited:
 		return ret;
 	}
 
-	dev_info(dcp->dev,
-		 "DCPLink endpoint started; waiting for firmware rendezvous\n");
-	msleep(100);
-	ret = dcp_link_publish_init(dcp, false);
+	/* Match AppleDCPLinkService: bring up EP37 before publishing INIT state. */
+	apple_dcp_link_init_desc_encode(desc, 0, false);
+	dcp_link_sync_for_device();
+	ret = dcp_send_message_sync(dcp, APPLE_DCP_LINK_ENDPOINT, init_message);
 	if (ret)
-		return ret;
+		return dev_err_probe(dcp->dev, ret,
+				     "DCPLink INIT mailbox send failed\n");
+	dev_info(dcp->dev, "DCPLink endpoint started; host INIT queued\n");
 	return 0;
 }
 

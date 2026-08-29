@@ -573,44 +573,6 @@ int dcp_send_message_sync(struct apple_dcp *dcp, u8 endpoint, u64 message)
 					false);
 }
 
-int dcp_try_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message,
-			 u32 *control_out)
-{
-	struct apple_mbox *mbox = dcp->rtk->mbox;
-	unsigned long flags;
-	u32 control;
-	int ret = 0;
-
-	if (!mbox || !mbox->active ||
-	    !of_device_is_compatible(mbox->dev->of_node,
-				     "apple,asc-mailbox-v4"))
-		return -EOPNOTSUPP;
-
-	/*
-	 * apple_mbox_send() admits entries until CONTROL_FULL is set, but waits up
-	 * to 500 ms once it is.  DCPLink's notifier must keep its roughly 1 ms
-	 * cadence alongside callback ACK traffic, so mirror that admission rule
-	 * without blocking the poll when the shared FIFO is full.
-	 */
-	dma_wmb();
-	spin_lock_irqsave(&mbox->tx_lock, flags);
-	control = readl_relaxed(mbox->regs + APPLE_T8140_MBOX_A2I_CONTROL);
-	if (control_out)
-		*control_out = control;
-	if (control & APPLE_T8140_MBOX_CONTROL_FULL) {
-		ret = -EAGAIN;
-		goto out_unlock;
-	}
-
-	trace_dcp_send_msg(dcp, endpoint, message);
-	writeq_relaxed(message, mbox->regs + APPLE_T8140_MBOX_A2I_SEND0);
-	writeq_relaxed(endpoint, mbox->regs + APPLE_T8140_MBOX_A2I_SEND1);
-
-out_unlock:
-	spin_unlock_irqrestore(&mbox->tx_lock, flags);
-	return ret;
-}
-
 int dcp_start_rtkit_endpoint(struct apple_dcp *dcp, u8 endpoint)
 {
 	u64 message;
