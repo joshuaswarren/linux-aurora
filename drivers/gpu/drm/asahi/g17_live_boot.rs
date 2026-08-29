@@ -37,7 +37,7 @@ use kernel::{
     time::{delay::fsleep, Delta},
 };
 #[cfg(CONFIG_DEV_COREDUMP)]
-use kernel::{devcoredump, time::msecs_to_jiffies};
+use kernel::{devcoredump, new_mutex, sync::Mutex, time::msecs_to_jiffies};
 
 use crate::{
     driver::{AsahiDevice, T8140LiveTopologyAdmission},
@@ -178,6 +178,8 @@ struct G17PRoleRtkitState {
     dev: ARef<AsahiDevice>,
     processor: G17PProcessor,
     firmware_contexts: mmu::FirmwareContextTableReader,
+    #[cfg(CONFIG_DEV_COREDUMP)]
+    crash_capture: Arc<Mutex<G17PCrashCaptureState>>,
     acked: AtomicBool,
     crashed: AtomicBool,
     runtime_events: AtomicU32,
@@ -188,11 +190,14 @@ impl G17PRoleRtkitState {
         dev: ARef<AsahiDevice>,
         processor: G17PProcessor,
         firmware_contexts: mmu::FirmwareContextTableReader,
+        #[cfg(CONFIG_DEV_COREDUMP)] crash_capture: Arc<Mutex<G17PCrashCaptureState>>,
     ) -> Self {
         Self {
             dev,
             processor,
             firmware_contexts,
+            #[cfg(CONFIG_DEV_COREDUMP)]
+            crash_capture,
             acked: AtomicBool::new(false),
             crashed: AtomicBool::new(false),
             runtime_events: AtomicU32::new(0),
@@ -201,22 +206,102 @@ impl G17PRoleRtkitState {
 }
 
 #[cfg(CONFIG_DEV_COREDUMP)]
-fn publish_g17p_crashlog(
-    state: &G17PRoleRtkitState,
+struct G17PCrashRecord {
+    processor: G17PProcessor,
     original_size: usize,
-    crashlog: &[u8],
+    crashlog: KVVec<u8>,
+}
+
+#[cfg(CONFIG_DEV_COREDUMP)]
+struct G17PCrashCaptureState {
+    records: [Option<G17PCrashRecord>; 2],
+}
+
+#[cfg(CONFIG_DEV_COREDUMP)]
+fn new_g17p_crash_capture() -> Result<Arc<Mutex<G17PCrashCaptureState>>> {
+    Arc::pin_init(
+        new_mutex!(
+            G17PCrashCaptureState {
+                records: [None, None],
+            },
+            "G17PCrashCaptureState"
+        ),
+        GFP_KERNEL,
+    )
+}
+
+#[cfg(CONFIG_DEV_COREDUMP)]
+fn crash_qword(raw: &[u8], index: usize) -> u64 {
+    let offset = index * 8;
+    u64::from_le_bytes([
+        raw[offset],
+        raw[offset + 1],
+        raw[offset + 2],
+        raw[offset + 3],
+        raw[offset + 4],
+        raw[offset + 5],
+        raw[offset + 6],
+        raw[offset + 7],
+    ])
+}
+
+#[cfg(CONFIG_DEV_COREDUMP)]
+fn log_crash_buffer_observation(
+    state: &G17PRoleRtkitState,
+    source: &str,
+    raw: &[u8],
+    sentinel: u8,
+) {
+    let sentinel_qword = u64::from_le_bytes([sentinel; 8]);
+    let mut first_changed = None;
+    let mut first_nonzero = None;
+    for index in 0..raw.len() / 8 {
+        let value = crash_qword(raw, index);
+        if first_changed.is_none() && value != sentinel_qword {
+            first_changed = Some((index * 8, value));
+        }
+        if first_nonzero.is_none() && value != 0 {
+            first_nonzero = Some((index * 8, value));
+        }
+        if first_changed.is_some() && first_nonzero.is_some() {
+            break;
+        }
+    }
+    let changed = first_changed.unwrap_or((raw.len(), sentinel_qword));
+    let nonzero = first_nonzero.unwrap_or((raw.len(), 0));
+    dev_info!(
+        state.dev.as_ref(),
+        "G17P {} crashlog {} sentinel {:#x}: changed={} off={:#x} value={:#x}; nonzero={} off={:#x} value={:#x}\n",
+        state.processor.name(),
+        source,
+        sentinel_qword,
+        first_changed.is_some(),
+        changed.0,
+        changed.1,
+        first_nonzero.is_some(),
+        nonzero.0,
+        nonzero.1
+    );
+}
+
+#[cfg(CONFIG_DEV_COREDUMP)]
+fn publish_g17p_crashlogs(
+    dev: &kernel::device::Device,
+    records: &[G17PCrashRecord; 2],
 ) -> Result {
     let mut crashdump = crate::crashdump::CrashDumpBuilder::new(KVVec::new())?;
-    crashdump.add_rtkit_crash_info(
-        state.processor as u32,
-        state.processor.firmware_crash_buffer().dva,
-        original_size,
-        crashlog.len(),
-    )?;
-    crashdump.add_crashlog(crashlog)?;
+    for record in records {
+        crashdump.add_rtkit_crash_info(
+            record.processor as u32,
+            record.processor.firmware_crash_buffer().dva,
+            record.original_size,
+            record.crashlog.len(),
+        )?;
+        crashdump.add_crashlog(&record.crashlog)?;
+    }
     let crashdump = KBox::new(crashdump.finalize()?, GFP_KERNEL)?;
     devcoredump::dev_coredump(
-        state.dev.as_ref(),
+        dev,
         &crate::THIS_MODULE,
         crashdump,
         GFP_KERNEL,
@@ -226,9 +311,53 @@ fn publish_g17p_crashlog(
 }
 
 #[cfg(CONFIG_DEV_COREDUMP)]
+fn retain_g17p_crashlog(
+    state: &G17PRoleRtkitState,
+    original_size: usize,
+    crashlog: KVVec<u8>,
+) -> Result {
+    let mut capture = state.crash_capture.lock();
+    capture.records[state.processor as usize] = Some(G17PCrashRecord {
+        processor: state.processor,
+        original_size,
+        crashlog,
+    });
+    if capture.records[0].is_none() || capture.records[1].is_none() {
+        dev_info!(
+            state.dev.as_ref(),
+            "G17P {} crashlog retained; waiting for the other processor\n",
+            state.processor.name()
+        );
+        return Ok(());
+    }
+    let records = [
+        capture.records[0].take().ok_or(EIO)?,
+        capture.records[1].take().ok_or(EIO)?,
+    ];
+    core::mem::drop(capture);
+    publish_g17p_crashlogs(state.dev.as_ref(), &records)
+}
+
+#[cfg(CONFIG_DEV_COREDUMP)]
+fn retain_g17p_crashlog_slice(
+    state: &G17PRoleRtkitState,
+    original_size: usize,
+    crashlog: &[u8],
+) -> Result {
+    let mut retained = KVVec::new();
+    retained.extend_from_slice(crashlog, GFP_KERNEL)?;
+    retain_g17p_crashlog(state, original_size, retained)
+}
+
+#[cfg(CONFIG_DEV_COREDUMP)]
 fn capture_g17p_firmware_crash_dva(state: &G17PRoleRtkitState) -> Result {
     let buffer = state.processor.firmware_crash_buffer();
     let captured_size = bounded_crashlog_size(buffer.size);
+    let (direct, sentinel) = state
+        .firmware_contexts
+        .copy_t8140_crash_buffer(state.processor as usize, captured_size)?;
+    log_crash_buffer_observation(state, "direct-WC", &direct, sentinel);
+
     let low40 = g17p_rtkit_uat_address(buffer.dva);
     let candidates = [
         (0usize, low40),
@@ -249,7 +378,7 @@ fn capture_g17p_firmware_crash_dva(state: &G17PRoleRtkitState) -> Result {
             continue;
         };
         match root.copy_firmware_range(address, captured_size) {
-            Ok(crashlog) => {
+            Ok(raw) => {
                 dev_info!(
                     state.dev.as_ref(),
                     "G17P {} crashlog copied through context {} root {:#x} VA {:#x} ({} bytes)\n",
@@ -257,9 +386,17 @@ fn capture_g17p_firmware_crash_dva(state: &G17PRoleRtkitState) -> Result {
                     slot,
                     root.ttb(),
                     address,
-                    crashlog.len()
+                    raw.len()
                 );
-                return publish_g17p_crashlog(state, buffer.size, &crashlog);
+                log_crash_buffer_observation(state, "raw-WB", &raw, sentinel);
+                let aliases_equal = direct.as_slice() == raw.as_slice();
+                dev_info!(
+                    state.dev.as_ref(),
+                    "G17P {} crashlog direct/raw equal={}\n",
+                    state.processor.name(),
+                    aliases_equal
+                );
+                return retain_g17p_crashlog(state, buffer.size, direct);
             }
             Err(error) => {
                 dev_info!(
@@ -275,7 +412,13 @@ fn capture_g17p_firmware_crash_dva(state: &G17PRoleRtkitState) -> Result {
             }
         }
     }
-    Err(last_error)
+    dev_info!(
+        state.dev.as_ref(),
+        "G17P {} raw crashlog alias unavailable ({:?}); retaining direct WC copy\n",
+        state.processor.name(),
+        last_error
+    );
+    retain_g17p_crashlog(state, buffer.size, direct)
 }
 
 /// Active G17P boot does not ask Rust to back system-endpoint buffers. The
@@ -339,7 +482,11 @@ impl rtkit::Operations for G17PRtkitOps {
         let capture = match crashlog {
             Some(crashlog) => {
                 let captured_size = bounded_crashlog_size(crashlog.len());
-                publish_g17p_crashlog(&data, crashlog.len(), &crashlog[..captured_size])
+                retain_g17p_crashlog_slice(
+                    &data,
+                    crashlog.len(),
+                    &crashlog[..captured_size],
+                )
             }
             None => capture_g17p_firmware_crash_dva(&data),
         };
@@ -675,12 +822,26 @@ fn boot_session(
     dev_info!(pdev.as_ref(), "G17P session: providers ready\n");
 
     let firmware_contexts = manager.uat().firmware_context_table_reader();
+    #[cfg(CONFIG_DEV_COREDUMP)]
+    let crash_capture = new_g17p_crash_capture()?;
     let gfx_state = Arc::new(
-        G17PRoleRtkitState::new(drm.clone(), G17PProcessor::Gfx, firmware_contexts.clone()),
+        G17PRoleRtkitState::new(
+            drm.clone(),
+            G17PProcessor::Gfx,
+            firmware_contexts.clone(),
+            #[cfg(CONFIG_DEV_COREDUMP)]
+            crash_capture.clone(),
+        ),
         GFP_KERNEL,
     )?;
     let gfx1_state = Arc::new(
-        G17PRoleRtkitState::new(drm.clone(), G17PProcessor::Gfx1, firmware_contexts),
+        G17PRoleRtkitState::new(
+            drm.clone(),
+            G17PProcessor::Gfx1,
+            firmware_contexts,
+            #[cfg(CONFIG_DEV_COREDUMP)]
+            crash_capture,
+        ),
         GFP_KERNEL,
     )?;
     let mut gfx_rtkit =
@@ -764,12 +925,26 @@ fn boot_initial_session(
         .as_ref()
         .ok_or(EIO)?
         .firmware_context_table_reader();
+    #[cfg(CONFIG_DEV_COREDUMP)]
+    let crash_capture = new_g17p_crash_capture()?;
     let gfx_state = Arc::new(
-        G17PRoleRtkitState::new(drm.clone(), G17PProcessor::Gfx, firmware_contexts.clone()),
+        G17PRoleRtkitState::new(
+            drm.clone(),
+            G17PProcessor::Gfx,
+            firmware_contexts.clone(),
+            #[cfg(CONFIG_DEV_COREDUMP)]
+            crash_capture.clone(),
+        ),
         GFP_KERNEL,
     )?;
     let gfx1_state = Arc::new(
-        G17PRoleRtkitState::new(drm.clone(), G17PProcessor::Gfx1, firmware_contexts),
+        G17PRoleRtkitState::new(
+            drm.clone(),
+            G17PProcessor::Gfx1,
+            firmware_contexts,
+            #[cfg(CONFIG_DEV_COREDUMP)]
+            crash_capture,
+        ),
         GFP_KERNEL,
     )?;
     let mut gfx_rtkit =
