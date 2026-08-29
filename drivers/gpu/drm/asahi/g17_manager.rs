@@ -438,6 +438,12 @@ impl G17PManagerConstruction {
         self.resources.control_counters()
     }
 
+    pub(crate) fn install_compute_control_checkpoint(
+        &mut self,
+    ) -> Result<g17_resources::G17PControlCounters> {
+        self.resources.install_compute_control_checkpoint()
+    }
+
     pub(crate) fn uat(&self) -> &mmu::Uat {
         self.resources.uat()
     }

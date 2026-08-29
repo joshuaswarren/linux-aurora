@@ -406,7 +406,7 @@ fn finish_boot_session(
     if !staged.opening_staged() {
         dev_err!(
             pdev.as_ref(),
-            "G17P control: staged counters are {:?}/{:?}, expected [67, 67, 67]/[0, 0, 16]\n",
+            "G17P control: staged counters are {:?}/{:?}, expected [0, 0, 4]/[0, 0, 16]\n",
             staged.primary,
             staged.secondary
         );
@@ -414,7 +414,7 @@ fn finish_boot_session(
     }
     dev_info!(
         pdev.as_ref(),
-        "G17P control: primary checkpoint 67 complete; 16 secondary records staged\n"
+        "G17P control: 4 primary and 16 secondary records staged\n"
     );
 
     let control_start = (CONTROL_START_TYPE as u64) << 48;
@@ -438,7 +438,7 @@ fn finish_boot_session(
     if !counters.opening_retired() {
         dev_err!(
             pdev.as_ref(),
-            "G17P control: counters stopped at {:?}/{:?}, expected [67, 67, 67]/[16, 16, 16]\n",
+            "G17P control: counters stopped at {:?}/{:?}, expected [4, 4, 4]/[16, 16, 16]\n",
             counters.primary,
             counters.secondary
         );
@@ -446,7 +446,7 @@ fn finish_boot_session(
     }
     dev_info!(
         pdev.as_ref(),
-        "G17P control: counters retired at [67, 67, 67]/[16, 16, 16]\n"
+        "G17P control: counters retired at [4, 4, 4]/[16, 16, 16]\n"
     );
 
     let control_done = ((CONTROL_DONE_TYPE as u64) << 48) | CONTROL_DONE_CHANNEL;
@@ -468,6 +468,14 @@ fn finish_boot_session(
             compute_uapi_enabled: false,
         });
     }
+
+    let checkpoint = manager.install_compute_control_checkpoint()?;
+    dev_info!(
+        pdev.as_ref(),
+        "G17P compute control: post-boot checkpoint 67/secondary16 installed {:?}/{:?}\n",
+        checkpoint.primary,
+        checkpoint.secondary
+    );
 
     let queue = manager.configure_g17p_compute_queue(drm, registers)?;
     dev_info!(
