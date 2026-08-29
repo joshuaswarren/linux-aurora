@@ -90,7 +90,15 @@ const G17P_RENDER_FRAGMENT_CONTEXT_SCRATCH: usize = 0x38000;
 const G17P_RENDER_FRAGMENT_FIRMWARE_SCRATCH: usize = 0x3c000;
 
 const G17P_CONTROL_DIRECTORY_VA: u64 = 0x70_0000_0000;
-const G17P_CONTROL_DIRECTORY_SIZE: usize = 0x10000;
+// The positive first-partial render root owns 128 16-KiB leaves here. The
+// first failed Linux group proved that a 64-KiB placeholder is insufficient:
+// GFX writes the fifth leaf at 0x7000010000 during channel-8 startup.
+const G17P_CONTROL_DIRECTORY_SIZE: usize = 0x20_0000;
+// Firmware also writes the native high private-state arena by fixed offset,
+// independently of the status pointers carried in initdata. The first missing
+// leaf observed on GFX1 was base +0x17c000, inside this exact source-built run.
+const G17P_NATIVE_PRIVATE_CLUSTER_OFFSET: u64 = 0x0002_0000;
+const G17P_NATIVE_PRIVATE_CLUSTER_SIZE: usize = 0x0017_8000;
 pub(crate) const G17P_BOOTSTRAP_VDM_VA: u64 = G17P_CONTROL_OPERAND_BUFFER_BASE
     + 27 * G17P_CONTROL_OPERAND_BUFFER_STRIDE as u64
     + 0x100;
@@ -2584,6 +2592,7 @@ impl G17PClRuntimeStorage {
 #[cfg(not(test))]
 #[allow(dead_code)]
 struct G17MappedResources {
+    native_private_cluster: MappedObject,
     partial_scheduler: MappedObject,
     partial_primary_index: MappedObject,
     roots: MappedObject,
@@ -2653,6 +2662,25 @@ impl G17ResourceOwner {
         // objects can occupy one of its fixed device-VA ranges.
         let register_windows = map_t8140_register_windows(dev, &address_space.uat)?;
         let kernel_va_base = address_space.uat.kernel_va_range()?.start;
+        let native_private_cluster_va = kernel_va_base
+            .checked_add(G17P_NATIVE_PRIVATE_CLUSTER_OFFSET)
+            .ok_or(EINVAL)?;
+        // Reserve this fixed arena before any allocator-selected high object.
+        // It is a firmware-written uncached run in the measured native root.
+        let native_private_cluster = map_fixed_wc_object(
+            dev,
+            address_space.uat.kernel_vm(),
+            "native private cluster",
+            native_private_cluster_va,
+            G17P_NATIVE_PRIVATE_CLUSTER_SIZE,
+            mmu::PROT_FW_SHARED_RW,
+        )?;
+        dev_info!(
+            dev.as_ref(),
+            "G17P resources: native private cluster mapped at {:#x}:{:#x}\n",
+            native_private_cluster_va,
+            G17P_NATIVE_PRIVATE_CLUSTER_SIZE
+        );
         let fwctl_gpu_va = kernel_va_base
             .checked_add(g17_submission::G17P_PARTIAL_OPENING_FWCTL_OFFSET)
             .ok_or(EINVAL)?;
@@ -3072,6 +3100,7 @@ impl G17ResourceOwner {
             },
         };
         let fixed_high_ranges = [
+            ("native private cluster", &native_private_cluster),
             ("partial scheduler", &partial_scheduler),
             ("B2 alias", &primary_b2_alias_1),
             ("primary index", &partial_primary_index),
@@ -3249,6 +3278,7 @@ impl G17ResourceOwner {
             dev: dev.into(),
             handoff,
             resources: G17MappedResources {
+                native_private_cluster,
                 partial_scheduler,
                 partial_primary_index,
                 roots,
@@ -3474,6 +3504,12 @@ impl G17ResourceOwner {
         self.resources.partial_scheduler.with_bytes_mut(|bytes| {
             g17_submission::apply_g17p_partial_opening_scheduler_page(bytes).map_err(|_| EINVAL)
         })?;
+        self.resources
+            .native_private_cluster
+            .with_bytes_mut(|bytes| {
+                bytes.fill(0);
+                Ok(())
+            })?;
         self.resources
             .partial_primary_index
             .with_bytes_mut(|bytes| {
@@ -4712,6 +4748,8 @@ mod tests {
     fn render_operand_ranges_match_the_captured_sparse_layout() {
         let directory = G17P_CONTROL_DIRECTORY_VA
             ..G17P_CONTROL_DIRECTORY_VA + G17P_CONTROL_DIRECTORY_SIZE as u64;
+        assert_eq!(G17P_CONTROL_DIRECTORY_SIZE, 0x20_0000);
+        assert_eq!(directory.end, 0x70_0020_0000);
         let table = G17P_CONTROL_OPERAND_TABLE_VA
             ..G17P_CONTROL_OPERAND_TABLE_VA
                 + g17_initdata::CONTROL_OPERAND_TABLE_SIZE as u64;
@@ -4891,6 +4929,17 @@ mod tests {
                 state_grid: secondary_state,
             },
         }
+    }
+
+    #[test]
+    fn native_private_cluster_covers_the_observed_gfx1_fault() {
+        let cluster = KERN + G17P_NATIVE_PRIVATE_CLUSTER_OFFSET
+            ..KERN
+                + G17P_NATIVE_PRIVATE_CLUSTER_OFFSET
+                + G17P_NATIVE_PRIVATE_CLUSTER_SIZE as u64;
+        assert_eq!(cluster.start, 0xffff_fc20_0002_0000);
+        assert_eq!(cluster.end, 0xffff_fc20_0019_8000);
+        assert!(cluster.contains(&0xffff_fc20_0017_c004));
     }
 
     #[test]
