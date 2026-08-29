@@ -260,6 +260,7 @@ struct apple_dart {
 	u32 save_ttbr[DART_MAX_STREAMS][DART_MAX_TTBR];
 
 	u64 *locked_ttbr[DART_MAX_STREAMS][DART_MAX_TTBR];
+	u64 *locked_ttbr_saved[DART_MAX_STREAMS][DART_MAX_TTBR];
 };
 
 /*
@@ -422,6 +423,10 @@ apple_dart_hw_map_locked_ttbr(struct apple_dart_stream_map *stream_map, u8 idx)
 		u32 ttbr;
 		phys_addr_t phys;
 		u64 *l1_tbl;
+		u64 *saved;
+
+		if (dart->locked_ttbr[sid][idx])
+			continue;
 
 		ttbr = readl(dart->regs + DART_TTBR(dart, sid, idx));
 
@@ -442,10 +447,48 @@ apple_dart_hw_map_locked_ttbr(struct apple_dart_stream_map *stream_map, u8 idx)
 		if (!l1_tbl)
 			return -ENOMEM;
 
+		saved = dart->locked_ttbr_saved[sid][idx];
+		if (!saved) {
+			saved = devm_kmalloc(dart->dev, dart->pgsize, GFP_KERNEL);
+			if (!saved) {
+				devm_memunmap(dart->dev, l1_tbl);
+				return -ENOMEM;
+			}
+			dart->locked_ttbr_saved[sid][idx] = saved;
+		}
+		memcpy(saved, l1_tbl, dart->pgsize);
 		dart->locked_ttbr[sid][idx] = l1_tbl;
 	}
 
 	return 0;
+}
+
+static void apple_dart_copy_locked_ttbr(u64 *dst, const u64 *src, size_t size)
+{
+	memcpy(dst, src, size);
+	dma_wmb();
+}
+
+static bool
+apple_dart_hw_restore_locked_ttbr(struct apple_dart_stream_map *stream_map,
+				  u8 idx)
+{
+	struct apple_dart *dart = stream_map->dart;
+	bool restored = false;
+	int sid;
+
+	for_each_set_bit(sid, stream_map->sidmap, dart->num_streams) {
+		u64 *l1_tbl = dart->locked_ttbr[sid][idx];
+		u64 *saved = dart->locked_ttbr_saved[sid][idx];
+
+		if (!l1_tbl || !saved)
+			continue;
+
+		apple_dart_copy_locked_ttbr(l1_tbl, saved, dart->pgsize);
+		restored = true;
+	}
+
+	return restored;
 }
 
 static int
@@ -456,14 +499,16 @@ apple_dart_hw_unmap_locked_ttbr(struct apple_dart_stream_map *stream_map,
 	int sid;
 
 	for_each_set_bit(sid, stream_map->sidmap, dart->num_streams) {
-		/* TODO: locked L1 table might need to be restored to boot state */
-		if (dart->locked_ttbr[sid][idx]) {
-			memset(dart->locked_ttbr[sid][idx], 0, dart->pgsize);
-			devm_memunmap(dart->dev, dart->locked_ttbr[sid][idx]);
+		u64 *l1_tbl = dart->locked_ttbr[sid][idx];
+		u64 *saved = dart->locked_ttbr_saved[sid][idx];
+
+		if (l1_tbl) {
+			if (saved)
+				apple_dart_copy_locked_ttbr(l1_tbl, saved, dart->pgsize);
+			devm_memunmap(dart->dev, l1_tbl);
 		}
 		dart->locked_ttbr[sid][idx] = NULL;
 	}
-
 	return 0;
 }
 
@@ -480,8 +525,7 @@ apple_dart_hw_sync_locked(struct io_pgtable_cfg *cfg,
 			u64 *ptep = cfg->apple_dart_cfg.ttbr[idx];
 			if (!ttbrep || !ptep)
 				continue;
-			for (int entry = 0; entry < dart->pgsize / sizeof(*ptep); entry++)
-				ttbrep[entry] = ptep[entry];
+			apple_dart_copy_locked_ttbr(ttbrep, ptep, dart->pgsize);
 		}
 	}
 
@@ -643,6 +687,29 @@ static void apple_dart_domain_flush_tlb(struct apple_dart_domain *domain)
 	}
 }
 
+static void apple_dart_domain_restore_locked(struct apple_dart_domain *domain)
+{
+	struct apple_dart_atomic_stream_map *domain_stream_map;
+	struct apple_dart_stream_map stream_map;
+	int i, j, idx;
+
+	for_each_stream_map(i, domain, domain_stream_map) {
+		stream_map.dart = domain_stream_map->dart;
+		if (!stream_map.dart->locked)
+			continue;
+
+		for (j = 0; j < BITS_TO_LONGS(stream_map.dart->num_streams); j++)
+			stream_map.sidmap[j] =
+				atomic_long_read(&domain_stream_map->sidmap[j]);
+
+		WARN_ON(pm_runtime_get_sync(stream_map.dart->dev) < 0);
+		for (idx = 0; idx < stream_map.dart->hw->ttbr_count; idx++)
+			apple_dart_hw_restore_locked_ttbr(&stream_map, idx);
+		stream_map.dart->hw->invalidate_tlb(&stream_map);
+		pm_runtime_put(stream_map.dart->dev);
+	}
+}
+
 static void apple_dart_flush_iotlb_all(struct iommu_domain *domain)
 {
 	apple_dart_domain_flush_tlb(to_dart_domain(domain));
@@ -750,6 +817,7 @@ static int apple_dart_finalize_domain(struct apple_dart_domain *dart_domain,
 	struct io_pgtable_cfg pgtbl_cfg;
 	dma_addr_t dma_max = dart->dma_max;
 	u32 ias = min_t(u32, dart->ias, fls64(dma_max));
+	int locked_sid = -1;
 	int ret = 0;
 	int i, j;
 
@@ -778,21 +846,25 @@ static int apple_dart_finalize_domain(struct apple_dart_domain *dart_domain,
 
 	if (dart->locked) {
 		unsigned long *sidmap;
-		int sid;
 		u32 ttbr;
 
 		/* Locked DARTs can only have a single stream bound */
 		sidmap = cfg->stream_maps[0].sidmap;
-		sid = find_first_bit(sidmap, dart->num_streams);
+		locked_sid = find_first_bit(sidmap, dart->num_streams);
 
-		WARN_ON((sid < 0) || bitmap_weight(sidmap, dart->num_streams) > 1);
-		ttbr = readl(dart->regs + DART_TTBR(dart, sid, 0));
+		if (WARN_ON(locked_sid >= dart->num_streams ||
+			    bitmap_weight(sidmap, dart->num_streams) != 1)) {
+			ret = -EINVAL;
+			goto done;
+		}
+		ttbr = readl(dart->regs + DART_TTBR(dart, locked_sid, 0));
 
 		WARN_ON(!(ttbr & dart->hw->ttbr_valid));
 
 		/* If the DART is locked, we need to keep the translation level count. */
 		if (dart->hw->tcr_4level && dart->ias > 36) {
-			if (readl(dart->regs + DART_TCR(dart, sid)) & dart->hw->tcr_4level) {
+			if (readl(dart->regs + DART_TCR(dart, locked_sid)) &
+			    dart->hw->tcr_4level) {
 				if (ias < 37) {
 					dev_info(dart->dev, "Expanded to ias=37 due to lock\n");
 					pgtbl_cfg.ias = 37;
@@ -819,6 +891,33 @@ static int apple_dart_finalize_domain(struct apple_dart_domain *dart_domain,
 		goto done;
 	}
 
+	if (dart->locked) {
+		for (i = 0; i < pgtbl_cfg.apple_dart_cfg.n_ttbrs; i++) {
+			phys_addr_t phys;
+			u32 ttbr;
+
+			ttbr = readl(dart->regs +
+				     DART_TTBR(dart, locked_sid, i));
+			if (!(ttbr & dart->hw->ttbr_valid)) {
+				ret = -EIO;
+				goto err_free_pgtable;
+			}
+
+			ttbr &= ~dart->hw->ttbr_valid;
+			if (dart->hw->ttbr_addr_field_shift)
+				ttbr >>= dart->hw->ttbr_addr_field_shift;
+			phys = (phys_addr_t)ttbr << dart->hw->ttbr_shift;
+
+			ret = io_pgtable_apple_dart_import(dart_domain->pgtbl_ops, i, phys);
+			if (ret) {
+				dev_err(dart->dev,
+					"Failed to import locked TTBR[%d] for SID %d: %d\n",
+					i, locked_sid, ret);
+				goto err_free_pgtable;
+			}
+		}
+	}
+
 	if (pgtbl_cfg.pgsize_bitmap == SZ_4K)
 		dart_domain->mask = DMA_BIT_MASK(min_t(u32, dart->ias, 32));
 	else if (pgtbl_cfg.apple_dart_cfg.n_levels == 3)
@@ -832,6 +931,11 @@ static int apple_dart_finalize_domain(struct apple_dart_domain *dart_domain,
 	dart_domain->domain.geometry.force_aperture = true;
 
 	dart_domain->finalized = true;
+	goto done;
+
+err_free_pgtable:
+	free_io_pgtable_ops(dart_domain->pgtbl_ops);
+	dart_domain->pgtbl_ops = NULL;
 
 done:
 	mutex_unlock(&dart_domain->init_lock);
@@ -996,9 +1100,13 @@ static void apple_dart_release_device(struct device *dev)
 	struct apple_dart_master_cfg *cfg = dev_iommu_priv_get(dev);
 
 	for_each_stream_map(j, cfg, stream_map) {
-		if (stream_map->dart->locked)
+		if (stream_map->dart->locked) {
+			WARN_ON(pm_runtime_get_sync(stream_map->dart->dev) < 0);
 			for (i = 0; i < stream_map->dart->hw->ttbr_count; ++i)
 				apple_dart_hw_unmap_locked_ttbr(stream_map, i);
+			stream_map->dart->hw->invalidate_tlb(stream_map);
+			pm_runtime_put(stream_map->dart->dev);
+		}
 	}
 
 	kfree(cfg);
@@ -1031,6 +1139,7 @@ static void apple_dart_domain_free(struct iommu_domain *domain)
 {
 	struct apple_dart_domain *dart_domain = to_dart_domain(domain);
 
+	apple_dart_domain_restore_locked(dart_domain);
 	free_io_pgtable_ops(dart_domain->pgtbl_ops);
 
 	kfree(dart_domain);
@@ -1846,10 +1955,34 @@ static void apple_dart_t8110_v2_shared_irq_test(struct kunit *test)
 			   apple_dart_t8110_v2_block_pending(0x0203, BIT(3)));
 }
 
+static void apple_dart_locked_ttbr_sync_restore_test(struct kunit *test)
+{
+	u64 inherited[] = {
+		0x101f0cd0001, /* region94 subtree */
+		0x101f0c10001, /* region95 subtree */
+		0x101eb4b8003, /* framebuffer, valid and writable */
+	};
+	u64 saved[ARRAY_SIZE(inherited)];
+	u64 imported[] = {
+		0x20200000001,
+		0x20200004001,
+		0x20200008001,
+	};
+
+	memcpy(saved, inherited, sizeof(saved));
+	apple_dart_copy_locked_ttbr(inherited, imported, sizeof(inherited));
+	KUNIT_EXPECT_MEMEQ(test, inherited, imported, sizeof(inherited));
+
+	apple_dart_copy_locked_ttbr(inherited, saved, sizeof(inherited));
+	KUNIT_EXPECT_MEMEQ(test, inherited, saved, sizeof(inherited));
+	KUNIT_EXPECT_FALSE(test, inherited[2] & BIT(2));
+}
+
 static struct kunit_case apple_dart_t8110_v2_test_cases[] = {
 	KUNIT_CASE(apple_dart_t8110_v2_register_layout_test),
 	KUNIT_CASE(apple_dart_t8110_v2_fault_decode_test),
 	KUNIT_CASE(apple_dart_t8110_v2_shared_irq_test),
+	KUNIT_CASE(apple_dart_locked_ttbr_sync_restore_test),
 	{}
 };
 

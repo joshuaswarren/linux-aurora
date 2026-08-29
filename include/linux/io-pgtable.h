@@ -330,4 +330,7 @@ extern struct io_pgtable_init_fns io_pgtable_amd_iommu_v1_init_fns;
 extern struct io_pgtable_init_fns io_pgtable_amd_iommu_v2_init_fns;
 extern struct io_pgtable_init_fns io_pgtable_apple_dart_init_fns;
 
+int io_pgtable_apple_dart_import(struct io_pgtable_ops *ops,
+				 unsigned int ttbr, phys_addr_t paddr);
+
 #endif /* __IO_PGTABLE_H */
