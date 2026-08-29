@@ -1674,48 +1674,67 @@ impl G17PUserRenderStorage {
         user_timestamps: [u64; 4],
         user_timestamp_aliases: KVec<mmu::KernelMapping>,
     ) -> Result<Self> {
-        let mut descriptors = MappedObject::new_wc_in_range(
+        macro_rules! bootstrap_stage {
+            ($name:literal, $expression:expr) => {
+                match $expression {
+                    Ok(value) => value,
+                    Err(error) => {
+                        dev_err!(
+                            dev.as_ref(),
+                            "G17P render storage: {} failed ({:?})\n",
+                            $name,
+                            error
+                        );
+                        return Err(error);
+                    }
+                }
+            };
+        }
+
+        let mut descriptors = bootstrap_stage!("descriptor allocation", MappedObject::new_wc_in_range(
             dev,
             vm,
             G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END,
             G17P_RENDER_DESCRIPTOR_STORAGE_SIZE,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
-        )?;
-        let mut graph = MappedObject::new_wc_in_range(
+        ));
+        let mut graph = bootstrap_stage!("queue allocation", MappedObject::new_wc_in_range(
             dev,
             vm,
             G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END,
             G17P_RENDER_QUEUE_GRAPH_SIZE,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
-        )?;
-        let mut support = MappedObject::new_wc_in_range(
+        ));
+        let mut support = bootstrap_stage!("support allocation", MappedObject::new_wc_in_range(
             dev,
             vm,
             G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END,
             G17P_RENDER_SUPPORT_SIZE,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
-        )?;
-        let render_layout =
-            g17p_render_state_layout(&command.parameters, num_clusters).ok_or(EINVAL)?;
-        let mut render_state = MappedObject::new_wc_in_range(
+        ));
+        let render_layout = bootstrap_stage!(
+            "state layout",
+            g17p_render_state_layout(&command.parameters, num_clusters).ok_or(EINVAL)
+        );
+        let mut render_state = bootstrap_stage!("state allocation", MappedObject::new_wc_in_range(
             dev,
             vm,
             G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END,
             render_layout.total_size,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
-        )?;
-        let timestamps = MappedObject::new_wc_in_range(
+        ));
+        let timestamps = bootstrap_stage!("timestamp allocation", MappedObject::new_wc_in_range(
             dev,
             vm,
             G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END,
             mmu::UAT_PGSZ,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
-        )?;
+        ));
         let support_va = support.iova();
         let render_state_va = render_state.iova();
         let timestamp_va = timestamps.iova();
@@ -1798,7 +1817,7 @@ impl G17PUserRenderStorage {
             }
         }
 
-        render_state.with_bytes_mut(|raw| {
+        bootstrap_stage!("state encoding", render_state.with_bytes_mut(|raw| {
             apply_g17p_viewport(
                 translated.parameters.width,
                 translated.parameters.height,
@@ -1808,7 +1827,7 @@ impl G17PUserRenderStorage {
             put_u32(raw, render_layout.aux_fb + 0x480, 0x6000_0000);
             put_u32(raw, render_layout.aux_fb + 0x484, 0x35b);
             Ok(())
-        })?;
+        }));
 
         let graph_va = graph.iova();
         let graph_addresses = g17_submission::G17PColdOpeningGraphAddresses {
@@ -1826,7 +1845,7 @@ impl G17PUserRenderStorage {
             zero: support_va + G17P_RENDER_ZERO_SHARED as u64,
         };
         let channel_control = support_va + G17P_RENDER_CHANNEL_CONTROL as u64;
-        support.with_bytes_mut(|raw| {
+        bootstrap_stage!("support encoding", support.with_bytes_mut(|raw| {
             g17_submission::apply_g17p_cold_opening_leaf_page(
                 g17_submission::G17PColdOpeningLeaf::SecondaryIndex,
                 &mut raw[G17P_RENDER_SECONDARY_INDEX..G17P_RENDER_SECONDARY_INDEX + mmu::UAT_PGSZ],
@@ -1921,9 +1940,9 @@ impl G17PUserRenderStorage {
                     ..G17P_RENDER_FRAGMENT_FIRMWARE_SCRATCH + mmu::UAT_PGSZ],
             )
             .map_err(|_| EINVAL)
-        })?;
+        }));
         let descriptors_va = descriptors.iova();
-        descriptors.with_bytes_mut(|raw| {
+        bootstrap_stage!("descriptor encoding", descriptors.with_bytes_mut(|raw| {
             let (tiling, fragment) = raw.split_at_mut(0x4000);
             g17_render::build_cold_opening_ta_descriptor(&translated.parameters, objects, tiling)
                 .map_err(|_| EINVAL)?;
@@ -1949,9 +1968,9 @@ impl G17PUserRenderStorage {
                 fragment,
             )
             .map_err(|_| EINVAL)
-        })?;
+        }));
 
-        graph.with_bytes_mut(|raw| {
+        bootstrap_stage!("queue encoding", graph.with_bytes_mut(|raw| {
             let job_list = graph_va + Self::JOB_LIST as u64;
             g17_submission::apply_g17p_cold_opening_queue_record(
                 g17_submission::G17PColdOpeningQueueAddresses {
@@ -1986,7 +2005,7 @@ impl G17PUserRenderStorage {
             .map_err(|_| EINVAL)?;
             put_u64(raw, Self::JOB_LIST + 0x08, job_list);
             Ok(())
-        })?;
+        }));
 
         Ok(Self {
             descriptors,
@@ -2599,6 +2618,10 @@ pub(crate) struct G17ResourceOwner {
 #[cfg(not(test))]
 #[allow(dead_code)]
 impl G17ResourceOwner {
+    pub(crate) fn dev(&self) -> &AsahiDevice {
+        &self.dev
+    }
+
     pub(crate) fn new(dev: &AsahiDevice) -> Result<Self> {
         let uat = KBox::new(mmu::Uat::new_t8140(dev, true)?, GFP_KERNEL)?;
         Self::new_with_uat(dev, uat)
@@ -3661,12 +3684,22 @@ impl G17ResourceOwner {
         let mut reserved_ranges = KVec::new();
         reserved_ranges.push(G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END, GFP_KERNEL)?;
         mappings.push(
-            map_fresh_zero_object_at(
+            match map_fresh_zero_object_at(
                 &self.dev,
                 vm,
                 G17P_CONTROL_DIRECTORY_VA,
                 G17P_CONTROL_DIRECTORY_SIZE,
-            )?,
+            ) {
+                Ok(mapping) => mapping,
+                Err(error) => {
+                    dev_err!(
+                        self.dev.as_ref(),
+                        "G17P VM: control-directory alias failed ({:?})\n",
+                        error
+                    );
+                    return Err(error);
+                }
+            },
             GFP_KERNEL,
         )?;
         let table_mapping = match self.resources.control_operand_table.map_at(
@@ -3709,14 +3742,31 @@ impl G17ResourceOwner {
             mappings.push(mapping, GFP_KERNEL)?;
         }
         mappings.push(
-            self.resources.partial_primary_index.map_alias_at(
+            match self.resources.partial_primary_index.map_alias_at(
                 vm,
                 g17_submission::G17P_PARTIAL_OPENING_PRIMARY_INDEX_GPU_VA,
                 mmu::PROT_GPU_FW_SHARED_RW,
-            )?,
+            ) {
+                Ok(mapping) => mapping,
+                Err(error) => {
+                    dev_err!(
+                        self.dev.as_ref(),
+                        "G17P VM: primary-index alias failed ({:?})\n",
+                        error
+                    );
+                    return Err(error);
+                }
+            },
             GFP_KERNEL,
         )?;
         vm.install_driver_mappings(mappings, reserved_ranges)
+            .inspect_err(|error| {
+                dev_err!(
+                    self.dev.as_ref(),
+                    "G17P VM: fixed-alias retention failed ({:?})\n",
+                    error
+                );
+            })
     }
 
     pub(crate) fn partial_opening_binding(&self) -> G17PPartialOpeningResourceBinding {
