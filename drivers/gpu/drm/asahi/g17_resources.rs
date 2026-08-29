@@ -741,6 +741,19 @@ fn map_fixed_object(
 }
 
 #[cfg(not(test))]
+fn mapped_page_mask(vm: &mmu::Vm, address: u64, size: usize) -> u64 {
+    let pages = size.div_ceil(mmu::UAT_PGSZ).min(64);
+    let mut occupied = 0u64;
+    for index in 0..pages {
+        let page = address + index as u64 * mmu::UAT_PGSZ as u64;
+        if vm.covers_range(page, mmu::UAT_PGSZ as u64, false, false) {
+            occupied |= 1 << index;
+        }
+    }
+    occupied
+}
+
+#[cfg(not(test))]
 fn map_fixed_wc_object(
     dev: &AsahiDevice,
     vm: &mmu::Vm,
@@ -752,13 +765,15 @@ fn map_fixed_wc_object(
     match MappedObject::new_wc_at(dev, vm, address, size, prot) {
         Ok(mapping) => Ok(mapping),
         Err(error) => {
+            let occupied = mapped_page_mask(vm, address, size);
             dev_err!(
                 dev.as_ref(),
-                "G17P resources: {} WC map at {:#x} size {:#x} failed ({:?})\n",
+                "G17P resources: {} WC map at {:#x} size {:#x} failed ({:?}), occupied pages={:#x}\n",
                 name,
                 address,
                 size,
-                error
+                error,
+                occupied
             );
             Err(error)
         }
@@ -1819,6 +1834,74 @@ impl G17PUserRenderStorage {
             };
         }
 
+        // Reserve the native fixed peer runs before allocating any dynamic
+        // firmware-high render objects. Their low addresses are also reused
+        // by the class-1 operand closure only after this storage drops.
+        let mut ta_context_peer = bootstrap_stage!(
+            "TA context peer",
+            map_fixed_wc_object(
+                dev,
+                uat.kernel_vm(),
+                "TA context peer",
+                G17P_BOOTSTRAP_TA_CONTEXT_HIGH_VA,
+                G17P_BOOTSTRAP_CONTEXT_PEER_SIZE,
+                mmu::PROT_GPU_FW_SHARED_RW,
+            )
+        );
+        let ta_context_low = match ta_context_peer.map_alias_at(
+            uat.kernel_lower_vm(),
+            G17P_BOOTSTRAP_TA_CONTEXT_LOW_VA,
+            mmu::PROT_GPU_SHARED_RO,
+        ) {
+            Ok(mapping) => mapping,
+            Err(error) => {
+                dev_err!(
+                    dev.as_ref(),
+                    "G17P render storage: TA context low alias at {:#x} failed ({:?}), occupied pages={:#x}\n",
+                    G17P_BOOTSTRAP_TA_CONTEXT_LOW_VA,
+                    error,
+                    mapped_page_mask(
+                        uat.kernel_lower_vm(),
+                        G17P_BOOTSTRAP_TA_CONTEXT_LOW_VA,
+                        G17P_BOOTSTRAP_CONTEXT_PEER_SIZE,
+                    )
+                );
+                return Err(error);
+            }
+        };
+        let mut fragment_context_peer = bootstrap_stage!(
+            "3D context peer",
+            map_fixed_wc_object(
+                dev,
+                uat.kernel_vm(),
+                "3D context peer",
+                G17P_BOOTSTRAP_3D_CONTEXT_HIGH_VA,
+                G17P_BOOTSTRAP_CONTEXT_PEER_SIZE,
+                mmu::PROT_GPU_FW_SHARED_RW,
+            )
+        );
+        let fragment_context_low = match fragment_context_peer.map_alias_at(
+            uat.kernel_lower_vm(),
+            G17P_BOOTSTRAP_3D_CONTEXT_LOW_VA,
+            mmu::PROT_GPU_SHARED_RO,
+        ) {
+            Ok(mapping) => mapping,
+            Err(error) => {
+                dev_err!(
+                    dev.as_ref(),
+                    "G17P render storage: 3D context low alias at {:#x} failed ({:?}), occupied pages={:#x}\n",
+                    G17P_BOOTSTRAP_3D_CONTEXT_LOW_VA,
+                    error,
+                    mapped_page_mask(
+                        uat.kernel_lower_vm(),
+                        G17P_BOOTSTRAP_3D_CONTEXT_LOW_VA,
+                        G17P_BOOTSTRAP_CONTEXT_PEER_SIZE,
+                    )
+                );
+                return Err(error);
+            }
+        };
+
         // Queue items name the firmware-high descriptors, while descriptor
         // self-pointers resolve through these one-page context-0 aliases.
         let mut descriptors = bootstrap_stage!("descriptor allocation", MappedObject::new_wc(
@@ -2020,24 +2103,6 @@ impl G17PUserRenderStorage {
         }));
 
         let graph_va = graph.iova();
-        let mut ta_context_peer = bootstrap_stage!(
-            "TA context peer",
-            MappedObject::new_wc_at(
-                dev,
-                uat.kernel_vm(),
-                G17P_BOOTSTRAP_TA_CONTEXT_HIGH_VA,
-                G17P_BOOTSTRAP_CONTEXT_PEER_SIZE,
-                mmu::PROT_GPU_FW_SHARED_RW,
-            )
-        );
-        let ta_context_low = bootstrap_stage!(
-            "TA context low alias",
-            ta_context_peer.map_alias_at(
-                uat.kernel_lower_vm(),
-                G17P_BOOTSTRAP_TA_CONTEXT_LOW_VA,
-                mmu::PROT_GPU_SHARED_RO,
-            )
-        );
         bootstrap_stage!("TA queue context", ta_context_peer.with_bytes_mut(|raw| {
             g17_submission::apply_g17p_cold_opening_queue_context(
                 g17_submission::G17PColdOpeningStage::Tiling,
@@ -2047,24 +2112,6 @@ impl G17PUserRenderStorage {
             )
             .map_err(|_| EINVAL)
         }));
-        let mut fragment_context_peer = bootstrap_stage!(
-            "3D context peer",
-            MappedObject::new_wc_at(
-                dev,
-                uat.kernel_vm(),
-                G17P_BOOTSTRAP_3D_CONTEXT_HIGH_VA,
-                G17P_BOOTSTRAP_CONTEXT_PEER_SIZE,
-                mmu::PROT_GPU_FW_SHARED_RW,
-            )
-        );
-        let fragment_context_low = bootstrap_stage!(
-            "3D context low alias",
-            fragment_context_peer.map_alias_at(
-                uat.kernel_lower_vm(),
-                G17P_BOOTSTRAP_3D_CONTEXT_LOW_VA,
-                mmu::PROT_GPU_SHARED_RO,
-            )
-        );
         bootstrap_stage!("3D queue context", fragment_context_peer.with_bytes_mut(|raw| {
             g17_submission::apply_g17p_cold_opening_queue_context(
                 g17_submission::G17PColdOpeningStage::Fragment,
@@ -2925,7 +2972,7 @@ struct G17MappedResources {
     compute_runtime_zero_buffer_0_mapping: Option<mmu::KernelMapping>,
     compute_runtime_zero_buffer_1_mapping: Option<mmu::KernelMapping>,
     compute_runtime_class1_table: MappedObject,
-    compute_runtime_table_alias: mmu::KernelMapping,
+    compute_runtime_table_alias: Option<mmu::KernelMapping>,
     compute_runtime_buffer_aliases: KVec<mmu::KernelMapping>,
     register_windows: KVec<mmu::KernelMapping>,
 }
@@ -3197,39 +3244,8 @@ impl G17ResourceOwner {
             g17_initdata::COMPUTE_RUNTIME_CLASS1_TABLE_SIZE,
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
-        let compute_runtime_table_alias = control_operand_table.map_at(
-            address_space.uat.kernel_lower_vm(),
-            g17_initdata::CONTROL_OPERAND_TABLE_ADDRESS,
-            mmu::PROT_GPU_FW_SHARED_RW,
-        )?;
-        let mut compute_runtime_buffer_aliases = KVec::with_capacity(20, GFP_KERNEL)?;
-        for (index, buffer) in control_operand_buffers.iter_mut().enumerate() {
-            if index > 18 && index != 22 {
-                continue;
-            }
-            let address = g17p_control_operand_buffer_va(index).ok_or(EINVAL)?;
-            let mapping = match buffer.map_at(
-                address_space.uat.kernel_lower_vm(),
-                address,
-                mmu::PROT_GPU_FW_SHARED_RW,
-            ) {
-                Ok(mapping) => mapping,
-                Err(error) => {
-                    dev_err!(
-                        dev.as_ref(),
-                        "G17P resources: context-1 operand alias {} at {:#x} failed ({:?})\n",
-                        index,
-                        address,
-                        error
-                    );
-                    return Err(error);
-                }
-            };
-            compute_runtime_buffer_aliases.push(
-                mapping,
-                GFP_KERNEL,
-            )?;
-        }
+        let compute_runtime_table_alias = None;
+        let compute_runtime_buffer_aliases = KVec::with_capacity(20, GFP_KERNEL)?;
         compute_runtime_support.with_bytes_mut(|bytes| {
             g17_initdata::encode_compute_runtime_class1_support(bytes).map_err(|_| EINVAL)
         })?;
@@ -3452,28 +3468,6 @@ impl G17ResourceOwner {
             );
             return Err(EIO);
         }
-        if !address_space.uat.kernel_lower_vm().covers_range(
-            g17_initdata::CONTROL_OPERAND_TABLE_ADDRESS,
-            g17_initdata::CONTROL_OPERAND_TABLE_SIZE as u64,
-            false,
-            false,
-        ) || !all_ranges_covered(
-            compute_runtime_buffer_aliases
-                .iter()
-                .map(|mapping| (mapping.iova(), mapping.size() as u64)),
-            |address, size| {
-                address_space
-                    .uat
-                    .kernel_lower_vm()
-                    .covers_range(address, size, false, false)
-            },
-        ) {
-            dev_err!(
-                dev.as_ref(),
-                "G17P resources: compute runtime context-1 aliases are incomplete\n"
-            );
-            return Err(EIO);
-        }
         if !all_ranges_covered(
             register_windows
                 .iter()
@@ -3670,8 +3664,16 @@ impl G17ResourceOwner {
             .resources
             .compute_runtime_zero_buffer_1_mapping
             .is_some();
-        match (mapping_state, mapping_zero_0, mapping_zero_1) {
-            (false, false, false) => {
+        let mapping_table = self.resources.compute_runtime_table_alias.is_some();
+        let mapping_buffers = self.resources.compute_runtime_buffer_aliases.len();
+        match (
+            mapping_state,
+            mapping_zero_0,
+            mapping_zero_1,
+            mapping_table,
+            mapping_buffers,
+        ) {
+            (false, false, false, false, 0) => {
                 let state = self.resources.compute_runtime_state.map_at(
                     self.address_space.uat.kernel_vm(),
                     g17_initdata::COMPUTE_RUNTIME_STATE_ADDRESS,
@@ -3687,11 +3689,38 @@ impl G17ResourceOwner {
                     g17_initdata::COMPUTE_RUNTIME_ZERO_BUFFER_1_ADDRESS,
                     mmu::PROT_GPU_FW_SHARED_RW,
                 )?;
+                let table = self.resources.control_operand_table.map_at(
+                    self.address_space.uat.kernel_lower_vm(),
+                    g17_initdata::CONTROL_OPERAND_TABLE_ADDRESS,
+                    mmu::PROT_GPU_FW_SHARED_RW,
+                )?;
+                let mut buffers = KVec::with_capacity(20, GFP_KERNEL)?;
+                for (index, buffer) in self
+                    .resources
+                    .control_operand_buffers
+                    .iter_mut()
+                    .enumerate()
+                {
+                    if index > 18 && index != 22 {
+                        continue;
+                    }
+                    let address = g17p_control_operand_buffer_va(index).ok_or(EINVAL)?;
+                    buffers.push(
+                        buffer.map_at(
+                            self.address_space.uat.kernel_lower_vm(),
+                            address,
+                            mmu::PROT_GPU_FW_SHARED_RW,
+                        )?,
+                        GFP_KERNEL,
+                    )?;
+                }
                 self.resources.compute_runtime_state_mapping = Some(state);
                 self.resources.compute_runtime_zero_buffer_0_mapping = Some(zero_0);
                 self.resources.compute_runtime_zero_buffer_1_mapping = Some(zero_1);
+                self.resources.compute_runtime_table_alias = Some(table);
+                self.resources.compute_runtime_buffer_aliases = buffers;
             }
-            (true, true, true) => {}
+            (true, true, true, true, 20) => {}
             _ => return Err(EIO),
         }
         if !self.address_space.uat.kernel_vm().covers_range(
@@ -3709,6 +3738,22 @@ impl G17ResourceOwner {
             G17P_CONTROL_OPERAND_BUFFER_SIZE as u64,
             true,
             true,
+        ) || !self.address_space.uat.kernel_lower_vm().covers_range(
+            g17_initdata::CONTROL_OPERAND_TABLE_ADDRESS,
+            g17_initdata::CONTROL_OPERAND_TABLE_SIZE as u64,
+            true,
+            true,
+        ) || !all_ranges_covered(
+            self.resources
+                .compute_runtime_buffer_aliases
+                .iter()
+                .map(|mapping| (mapping.iova(), mapping.size() as u64)),
+            |address, size| {
+                self.address_space
+                    .uat
+                    .kernel_lower_vm()
+                    .covers_range(address, size, true, true)
+            },
         ) {
             return Err(EIO);
         }
@@ -3870,6 +3915,8 @@ impl G17ResourceOwner {
         self.resources.compute_runtime_state_mapping = None;
         self.resources.compute_runtime_zero_buffer_0_mapping = None;
         self.resources.compute_runtime_zero_buffer_1_mapping = None;
+        self.resources.compute_runtime_table_alias = None;
+        self.resources.compute_runtime_buffer_aliases.clear();
         self.address_space
             .uat
             .restore_t8140_bootstrap_roots_after_processor_stop()?;
@@ -5211,7 +5258,7 @@ mod tests {
     }
 
     #[test]
-    fn compute_runtime_closure_uses_only_nonoverlapping_context1_ranges() {
+    fn compute_runtime_closure_uses_source_ranges_and_phase_reuses_peers() {
         for index in 0..18 {
             assert_eq!(
                 g17_initdata::COMPUTE_RUNTIME_BUFFER_ADDRESSES[index],
@@ -5241,6 +5288,19 @@ mod tests {
                 + g17_initdata::COMPUTE_RUNTIME_CLASS1_TABLE_SIZE as u64
                 <= g17p_control_operand_buffer_va(24).unwrap()
         );
+
+        // Operand buffer 2 deliberately reuses both generic bootstrap peer
+        // ranges. Its context-0 alias must therefore be installed only after
+        // the startup render storage and its two peer aliases are dropped.
+        let buffer_2 = g17p_control_operand_buffer_va(2).unwrap();
+        let buffer_2_end = buffer_2 + G17P_CONTROL_OPERAND_BUFFER_SIZE as u64;
+        for peer in [
+            G17P_BOOTSTRAP_TA_CONTEXT_LOW_VA,
+            G17P_BOOTSTRAP_3D_CONTEXT_LOW_VA,
+        ] {
+            assert!(buffer_2 <= peer);
+            assert!(peer + G17P_BOOTSTRAP_CONTEXT_PEER_SIZE as u64 <= buffer_2_end);
+        }
     }
 
     #[test]
