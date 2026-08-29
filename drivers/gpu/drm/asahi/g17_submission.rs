@@ -1350,13 +1350,14 @@ pub(crate) fn apply_g17p_cold_opening_queue_context(
         ],
         G17PColdOpeningStage::Fragment => &[
             (0x200, 0x0400_0400_0000_0004),
+            (0x208, 0x0040_00e0_0013_0d40),
             (0x220, 0xffff_1800_0000_0003),
             (0x228, 0x0000_0000_0000_0001),
             (0x230, 0x0000_0100_0000_0000),
             (0x350, 0x0002_b003_8000_4c05),
-            (0x358, 0x0000_8003_8000_4c3e),
-            (0x360, 0x0000_b803_8000_4c77),
-            (0x368, 0x0000_5003_8000_4cb0),
+            (0x358, 0x0000_1003_8000_4c3e),
+            (0x360, 0x0000_1003_8000_4c77),
+            (0x368, 0x0000_1003_8000_4cb0),
             (0x378, 0x003f_ffff_ffff_ffff),
         ],
     };
@@ -3700,13 +3701,19 @@ mod tests {
                     G17PColdOpeningStage::Fragment => 0x0400_0400_0000_0004,
                 }
             );
+            if stage == G17PColdOpeningStage::Fragment {
+                assert_eq!(get_u64_le(&context, 0x208), 0x0040_00e0_0013_0d40);
+                assert_eq!(get_u64_le(&context, 0x358), 0x0000_1003_8000_4c3e);
+                assert_eq!(get_u64_le(&context, 0x360), 0x0000_1003_8000_4c77);
+                assert_eq!(get_u64_le(&context, 0x368), 0x0000_1003_8000_4cb0);
+            }
             assert!(supplied.contains(&descriptor));
             assert!(supplied.contains(&queue));
             assert_eq!(
                 source_fixture_fingerprint(&context),
                 match stage {
                     G17PColdOpeningStage::Tiling => 0x132b_b3dc_4e25_6b11,
-                    G17PColdOpeningStage::Fragment => 0xe077_2820_c345_edd1,
+                    G17PColdOpeningStage::Fragment => 0x0173_d84c_e6b1_1789,
                 }
             );
         }
