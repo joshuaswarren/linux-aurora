@@ -1235,19 +1235,7 @@ impl G17PManagerConstruction {
         queue: &mut G17PSksmQueue,
         prepared: g17_submission::PreparedG17PClKickEntry,
     ) -> Result<u64> {
-        if !self.runtime_tick_staged {
-            // Stage the runtime 0x2e tick exactly the way the output-positive
-            // paths do: written and producer-published with no doorbell,
-            // pending for this work kick to consume. The parked co-processor
-            // never answers a bare 0x84 announcement for it.
-            let target = self.publish_compute_runtime_control_record(0)?;
-            self.runtime_tick_staged = true;
-            dev_info!(
-                self.resources.dev().as_ref(),
-                "G17P compute control: runtime tick 0 staged for this kick (target {})\n",
-                target
-            );
-        }
+        self.stage_compute_runtime_tick_once()?;
         queue.storage.write_entry(
             prepared.entry_offset as usize,
             prepared.zero_length as usize,
@@ -1262,6 +1250,26 @@ impl G17PManagerConstruction {
         self.add_sksm_kicks(registers, queue, 1)?;
         fence(Ordering::SeqCst);
         Ok(timestamp)
+    }
+
+    /// Publish the first runtime 0x2e record without a control doorbell. Both
+    /// the retained-entry and initial-channel paths leave it pending for their
+    /// next work kick, matching the output-positive proxy sequence.
+    fn stage_compute_runtime_tick_once(&mut self) -> Result {
+        if !self.runtime_tick_staged {
+            // Stage the runtime 0x2e tick exactly the way the output-positive
+            // paths do: written and producer-published with no doorbell,
+            // pending for this work kick to consume. The parked co-processor
+            // never answers a bare 0x84 announcement for it.
+            let target = self.publish_compute_runtime_control_record(0)?;
+            self.runtime_tick_staged = true;
+            dev_info!(
+                self.resources.dev().as_ref(),
+                "G17P compute control: runtime tick 0 staged for this kick (target {})\n",
+                target
+            );
+        }
+        Ok(())
     }
 
     fn publish_compute_b2_once(&mut self, queue: &mut G17PSksmQueue) -> Result {
@@ -1349,6 +1357,7 @@ impl G17PManagerConstruction {
             queue.storage.channel_control_gpu_va(),
         )?;
         self.publish_compute_b2_once(queue)?;
+        self.stage_compute_runtime_tick_once()?;
         fence(Ordering::SeqCst);
         let prepared = self
             .resources
