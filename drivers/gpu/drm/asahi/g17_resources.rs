@@ -535,6 +535,13 @@ pub(crate) struct G17PControlCounters {
     pub(crate) secondary: [u32; g17_initdata::CHANNEL_ENTRY_STATE_COUNT],
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PControlOpeningEffect {
+    pub(crate) shared_cursor: u32,
+    pub(crate) inner_state: u32,
+    pub(crate) operand_slot: u64,
+}
+
 impl G17PControlCounters {
     pub(crate) fn opening_staged(self) -> bool {
         self.primary == [0, 0, g17_initdata::CONTROL_OPENING_PRIMARY_PRODUCER]
@@ -3401,6 +3408,41 @@ impl G17ResourceOwner {
             self.handoff.secondary.state_grid,
         )?;
         Ok(G17PControlCounters { primary, secondary })
+    }
+
+    pub(crate) fn control_opening_effect(&mut self) -> Result<G17PControlOpeningEffect> {
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        let shared_cursor_address = self
+            .resources
+            .control_shared
+            .iova()
+            .checked_add(g17_initdata::CONTROL_SHARED_CURSOR_OFFSET as u64)
+            .ok_or(EINVAL)?;
+        let inner_state_address = self.resources.control_shared_inner.iova();
+        let shared_cursor = self
+            .resources
+            .control_shared
+            .read_u32(shared_cursor_address)?;
+        let inner_state = self
+            .resources
+            .control_shared_inner
+            .read_u32(inner_state_address)?;
+        let operand_slot = self.resources.control_operand_table.with_bytes_mut(|bytes| {
+            let start = g17_initdata::CONTROL_OPERAND_SLOT_OFFSET as usize;
+            let end = start.checked_add(8).ok_or(EINVAL)?;
+            Ok(u64::from_le_bytes(
+                bytes
+                    .get(start..end)
+                    .ok_or(EINVAL)?
+                    .try_into()
+                    .map_err(|_| EINVAL)?,
+            ))
+        })?;
+        Ok(G17PControlOpeningEffect {
+            shared_cursor,
+            inner_state,
+            operand_slot,
+        })
     }
 
     /// Restore the source-built class-1 closure before publishing live
