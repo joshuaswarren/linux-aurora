@@ -95,6 +95,9 @@ const G17P_CONTROL_DIRECTORY_SIZE: usize = 0x20_0000;
 // leaf observed on GFX1 was base +0x17c000, inside this exact source-built run.
 const G17P_NATIVE_PRIVATE_CLUSTER_OFFSET: u64 = 0x0002_0000;
 const G17P_NATIVE_PRIVATE_CLUSTER_SIZE: usize = 0x0017_8000;
+const G17P_NATIVE_COMPUTE_QUEUE_PAGE_VA: u64 = 0xffff_fc20_c000_0000;
+const G17P_NATIVE_COMPUTE_QUEUE_OFFSET: usize = 0x300;
+const G17P_NATIVE_COMPUTE_QUEUE_RECORD_SIZE: usize = 0xc0;
 #[cfg(test)]
 const G17P_NATIVE_SECONDARY_STATUS_A_OFFSET: u64 = 0x000e_3100;
 /// Exact executable extent used by the positive first-partial render root.
@@ -1220,6 +1223,7 @@ pub(crate) struct G17PClRuntimeStorage {
 /// until the physical queue is unregistered.
 #[cfg(not(test))]
 pub(crate) struct G17PComputeDescriptorStorage {
+    queue_record_page: MappedObject,
     descriptors: MappedObject,
     descriptors_high: mmu::KernelMapping,
     preempt: MappedObject,
@@ -1438,6 +1442,17 @@ impl G17PComputeDescriptorStorage {
         uat: &mmu::Uat,
         channel_control_gpu_va: u64,
     ) -> Result<Self> {
+        // The output-positive initial CL2 slot names queue-grid entry 4 at
+        // native page + 0x300. Reserve and retain the complete page before
+        // any queue-local dynamic allocation can take that address.
+        let queue_record_page = map_fixed_wc_object(
+            dev,
+            uat.kernel_vm(),
+            "native compute queue page",
+            G17P_NATIVE_COMPUTE_QUEUE_PAGE_VA,
+            mmu::UAT_PGSZ,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
         // These are the descriptor, queue, and support ranges cleaned by the
         // hardware-proven m1n1 producer before it publishes CL2. Linux writes
         // them through a persistent CPU alias, so use WC aliases rather than
@@ -1524,6 +1539,7 @@ impl G17PComputeDescriptorStorage {
         )?;
 
         Ok(Self {
+            queue_record_page,
             descriptors,
             descriptors_high,
             preempt,
@@ -1624,7 +1640,7 @@ impl G17PComputeDescriptorStorage {
     }
 
     pub(crate) fn queue_record_gpu_va(&self) -> u64 {
-        self.queue_graph.iova()
+        self.queue_record_page.iova() + G17P_NATIVE_COMPUTE_QUEUE_OFFSET as u64
     }
 
     pub(crate) fn stage_initial_channel_group(
@@ -1634,7 +1650,8 @@ impl G17PComputeDescriptorStorage {
         shared_control: u64,
         channel_control: u64,
     ) -> Result<g17_compute::ComputeChannelGroupAddresses> {
-        let queue = self.queue_graph.iova();
+        let graph_base = self.queue_graph.iova();
+        let queue = self.queue_record_gpu_va();
         let context_high = self.queue_context_high.iova();
         let graph_vmap = self.queue_graph.object.vmap()?;
         let context_vmap = self.queue_context_high.object.vmap()?;
@@ -1649,8 +1666,8 @@ impl G17PComputeDescriptorStorage {
                 self.queue_context_high.logical_size,
             )
         };
-        g17_compute::build_initial_compute_channel_group(
-            queue,
+        let group = g17_compute::build_initial_compute_channel_group(
+            graph_base,
             descriptor,
             context_low,
             context_high,
@@ -1659,7 +1676,29 @@ impl G17PComputeDescriptorStorage {
             graph,
             queue_context,
         )
-        .map_err(|_| EINVAL)
+        .map_err(|_| EINVAL)?;
+
+        // The builder keeps optional/event storage in the compact retained
+        // graph. Publish its completed queue record at the native queue-grid
+        // entry and make the high queue context name that same record.
+        queue_context[0x218..0x220].copy_from_slice(&queue.to_le_bytes());
+        let record_vmap = self.queue_record_page.object.vmap()?;
+        let record_page = unsafe {
+            // SAFETY: the retained VMap covers the complete native queue page.
+            core::slice::from_raw_parts_mut(
+                record_vmap.as_mut_ptr(),
+                self.queue_record_page.logical_size,
+            )
+        };
+        record_page[G17P_NATIVE_COMPUTE_QUEUE_OFFSET
+            ..G17P_NATIVE_COMPUTE_QUEUE_OFFSET + G17P_NATIVE_COMPUTE_QUEUE_RECORD_SIZE]
+            .copy_from_slice(&graph[..G17P_NATIVE_COMPUTE_QUEUE_RECORD_SIZE]);
+        Ok(g17_compute::ComputeChannelGroupAddresses {
+            queue,
+            optional: group.optional,
+            event: group.event,
+            write_index: group.write_index,
+        })
     }
 
     pub(crate) fn snapshot_initial_channel_group(&mut self) -> Result<G17PComputeGraphSnapshot> {
@@ -1689,7 +1728,8 @@ impl G17PComputeDescriptorStorage {
         };
 
         core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
-        let queue_gpu_va = self.queue_graph.iova();
+        let queue_gpu_va = self.queue_record_gpu_va();
+        let graph_gpu_va = self.queue_graph.iova();
         let context_high_gpu_va = self.queue_context_high.iova();
         let graph_vmap = self.queue_graph.object.vmap()?;
         let graph = unsafe {
@@ -1699,6 +1739,16 @@ impl G17PComputeDescriptorStorage {
                 self.queue_graph.logical_size,
             )
         };
+        let queue_vmap = self.queue_record_page.object.vmap()?;
+        let queue_page = unsafe {
+            // SAFETY: the retained VMap covers the complete native queue page.
+            core::slice::from_raw_parts(
+                queue_vmap.as_mut_ptr(),
+                self.queue_record_page.logical_size,
+            )
+        };
+        let queue_record = &queue_page[G17P_NATIVE_COMPUTE_QUEUE_OFFSET
+            ..G17P_NATIVE_COMPUTE_QUEUE_OFFSET + G17P_NATIVE_COMPUTE_QUEUE_RECORD_SIZE];
         let descriptor_vmap = self.descriptors.object.vmap()?;
         let descriptor = unsafe {
             // SAFETY: the retained VMap covers the complete descriptor store.
@@ -1727,8 +1777,8 @@ impl G17PComputeDescriptorStorage {
         let event = g17_compute::COMPUTE_EVENT;
         let snapshot = G17PComputeGraphSnapshot {
             queue: queue_gpu_va,
-            pointers: queue_gpu_va + pointers as u64,
-            item_ring: queue_gpu_va + items as u64,
+            pointers: graph_gpu_va + pointers as u64,
+            item_ring: graph_gpu_va + items as u64,
             context_high: context_high_gpu_va,
             cursors: [
                 read_u32(graph, pointers)?,
@@ -1736,12 +1786,12 @@ impl G17PComputeDescriptorStorage {
                 read_u32(graph, pointers + 0x40)?,
             ],
             gpu_read_cursors: [
-                read_u32(graph, 0x18)?,
-                read_u32(graph, 0x1c)?,
-                read_u32(graph, 0x20)?,
+                read_u32(queue_record, 0x18)?,
+                read_u32(queue_record, 0x1c)?,
+                read_u32(queue_record, 0x20)?,
             ],
-            uuid: read_u32(graph, 0x48)?,
-            queue_context: read_u64(graph, 0x9c)?,
+            uuid: read_u32(queue_record, 0x48)?,
+            queue_context: read_u64(queue_record, 0x9c)?,
             items: [
                 read_u64(graph, items)?,
                 read_u64(graph, items + 8)?,
@@ -2971,6 +3021,7 @@ impl G17PClRuntimeStorage {
 #[allow(dead_code)]
 struct G17MappedResources {
     native_private_cluster: MappedObject,
+    native_compute_queue_reservation: Option<MappedObject>,
     partial_computed: MappedObject,
     partial_scheduler: MappedObject,
     partial_primary_index: MappedObject,
@@ -3073,6 +3124,17 @@ impl G17ResourceOwner {
             native_private_cluster_va,
             G17P_NATIVE_PRIVATE_CLUSTER_SIZE
         );
+        // Keep the native compute queue-grid page out of the dynamic firmware
+        // allocator from first construction onward. Queue registration drops
+        // this zero page immediately before installing the live record page.
+        let native_compute_queue_reservation = Some(map_fixed_wc_object(
+            dev,
+            address_space.uat.kernel_vm(),
+            "native compute queue reservation",
+            G17P_NATIVE_COMPUTE_QUEUE_PAGE_VA,
+            mmu::UAT_PGSZ,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?);
         let fwctl_gpu_va = kernel_va_base
             .checked_add(g17_submission::G17P_PARTIAL_OPENING_FWCTL_OFFSET)
             .ok_or(EINVAL)?;
@@ -3649,6 +3711,7 @@ impl G17ResourceOwner {
             handoff,
             resources: G17MappedResources {
                 native_private_cluster,
+                native_compute_queue_reservation,
                 partial_computed,
                 partial_scheduler,
                 partial_primary_index,
@@ -3699,6 +3762,12 @@ impl G17ResourceOwner {
 
     pub(crate) fn uat(&self) -> &mmu::Uat {
         &self.address_space.uat
+    }
+
+    /// Release the zero reservation immediately before the queue owner maps
+    /// its live record page at the same native address.
+    pub(crate) fn release_native_compute_queue_reservation(&mut self) {
+        self.resources.native_compute_queue_reservation = None;
     }
 
     pub(crate) fn mark_firmware_cache_flush_ready(&self) {
