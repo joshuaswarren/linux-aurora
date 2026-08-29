@@ -114,8 +114,12 @@ const G17P_CONTROL_OPERAND_BUFFER_SIZE: usize =
     g17_initdata::CONTROL_OPERAND_BUFFER_SIZE as usize;
 const G17P_CONTROL_OPERAND_BUFFER_STRIDE: usize =
     g17_initdata::CONTROL_OPERAND_BUFFER_STRIDE as usize;
-const G17P_BOOTSTRAP_SHARED_CONTROL_VA: u64 = 0xffff_fc20_c082_8000;
-const G17P_BOOTSTRAP_SHARED_CONTROL_INNER_VA: u64 = 0xffff_fc20_0160_0000;
+const G17P_BOOTSTRAP_TA_DESCRIPTOR_LOW_VA: u64 = 0x70_0000_0000;
+const G17P_BOOTSTRAP_3D_DESCRIPTOR_LOW_VA: u64 = 0x70_0009_8000;
+const G17P_BOOTSTRAP_DESCRIPTOR_ZERO_A_VA: u64 = 0xffff_fc20_001c_8000;
+const G17P_BOOTSTRAP_DESCRIPTOR_ZERO_B_VA: u64 = 0xffff_fc20_c07c_0000;
+const G17P_BOOTSTRAP_TA_STATUS_VA: u64 = 0xffff_fc20_0161_0000;
+const G17P_BOOTSTRAP_3D_STATUS_VA: u64 = 0xffff_fc20_0163_0000;
 
 fn g17p_control_operand_buffer_va(index: usize) -> Option<u64> {
     if index >= G17P_CONTROL_OPERAND_BUFFER_COUNT {
@@ -341,6 +345,27 @@ fn put_u64(raw: &mut [u8], offset: usize, value: u64) {
     raw[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
+/// Fill the nonzero generic-pair tail pointers used by the full 4/16
+/// opening. The two descriptor self-pointers are installed separately by
+/// `apply_g17p_retained_descriptor_fields` because they live in context 0.
+fn apply_g17p_generic_descriptor_tail(
+    tiling: &mut [u8],
+    fragment: &mut [u8],
+) -> Option<()> {
+    tiling.get(0x08a6..0x08b6)?;
+    tiling.get(0x0945..0x094d)?;
+    fragment.get(0x2140..0x2150)?;
+    fragment.get(0x21df..0x21e7)?;
+
+    put_u64(tiling, 0x08a6, G17P_BOOTSTRAP_DESCRIPTOR_ZERO_A_VA);
+    put_u64(tiling, 0x08ae, G17P_BOOTSTRAP_DESCRIPTOR_ZERO_B_VA);
+    put_u64(tiling, 0x0945, G17P_BOOTSTRAP_TA_STATUS_VA);
+    put_u64(fragment, 0x2140, G17P_BOOTSTRAP_DESCRIPTOR_ZERO_A_VA + 4);
+    put_u64(fragment, 0x2148, G17P_BOOTSTRAP_DESCRIPTOR_ZERO_B_VA + 4);
+    put_u64(fragment, 0x21df, G17P_BOOTSTRAP_3D_STATUS_VA);
+    Some(())
+}
+
 /// Keep the render-context scratch view blank while populating the distinct
 /// firmware scratch view with the queue-context record.
 fn apply_g17p_cold_opening_context_views(
@@ -387,7 +412,7 @@ fn g17p_cold_opening_optional_addresses(
     g17_submission::G17PColdOpeningOptionalAddresses {
         context_scratch,
         firmware_scratch,
-        shared_control: G17P_BOOTSTRAP_SHARED_CONTROL_VA,
+        shared_control: g17_initdata::CONTROL_SHARED_ADDRESS,
         channel_control: support + G17P_RENDER_CHANNEL_CONTROL as u64,
         tiling_shared_object: support + G17P_RENDER_PACKED_SHARED as u64,
     }
@@ -1307,9 +1332,13 @@ impl G17PComputeUserMappings {
 #[cfg(not(test))]
 pub(crate) struct G17PUserRenderStorage {
     descriptors: MappedObject,
+    descriptor_ta_low: mmu::KernelMapping,
+    descriptor_3d_low: mmu::KernelMapping,
     graph: MappedObject,
     support: MappedObject,
     render_state: MappedObject,
+    render_ta_status: Option<mmu::KernelMapping>,
+    render_3d_status: Option<mmu::KernelMapping>,
     timestamps: MappedObject,
     user_timestamp_aliases: KVec<mmu::KernelMapping>,
 }
@@ -1819,11 +1848,8 @@ impl G17PUserRenderStorage {
             };
         }
 
-        // The ASC cache-maintains each inner item directly. The positive
-        // source graph therefore keeps descriptors, queues/rings, and support
-        // records in firmware-high VA; only command resources live in the
-        // client VM. A low descriptor pointer faults in the cache-maintenance
-        // path before the GPU sees the command.
+        // Queue items name the firmware-high descriptors, while descriptor
+        // self-pointers resolve through these one-page context-0 aliases.
         let mut descriptors = bootstrap_stage!("descriptor allocation", MappedObject::new_wc(
             dev,
             uat,
@@ -1831,6 +1857,30 @@ impl G17PUserRenderStorage {
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
         ));
+        let descriptor_ta_low = bootstrap_stage!(
+            "TA descriptor low alias",
+            descriptors.object.map_range_into_range(
+                uat.kernel_lower_vm(),
+                0..mmu::UAT_PGSZ,
+                G17P_BOOTSTRAP_TA_DESCRIPTOR_LOW_VA
+                    ..G17P_BOOTSTRAP_TA_DESCRIPTOR_LOW_VA + mmu::UAT_PGSZ as u64,
+                mmu::UAT_PGSZ as u64,
+                mmu::PROT_GPU_SHARED_RO,
+                false,
+            )
+        );
+        let descriptor_3d_low = bootstrap_stage!(
+            "3D descriptor low alias",
+            descriptors.object.map_range_into_range(
+                uat.kernel_lower_vm(),
+                mmu::UAT_PGSZ..2 * mmu::UAT_PGSZ,
+                G17P_BOOTSTRAP_3D_DESCRIPTOR_LOW_VA
+                    ..G17P_BOOTSTRAP_3D_DESCRIPTOR_LOW_VA + mmu::UAT_PGSZ as u64,
+                mmu::UAT_PGSZ as u64,
+                mmu::PROT_GPU_SHARED_RO,
+                false,
+            )
+        );
         let mut graph = bootstrap_stage!("queue allocation", MappedObject::new_wc(
             dev,
             uat,
@@ -1857,6 +1907,31 @@ impl G17PUserRenderStorage {
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
         ));
+        let render_ta_status = bootstrap_stage!(
+            "TA status high alias",
+            render_state.object.map_range_into_range(
+                uat.kernel_vm(),
+                G17P_RENDER_STATE_TA_STATUS..G17P_RENDER_STATE_TA_STATUS + mmu::UAT_PGSZ,
+                G17P_BOOTSTRAP_TA_STATUS_VA
+                    ..G17P_BOOTSTRAP_TA_STATUS_VA + mmu::UAT_PGSZ as u64,
+                mmu::UAT_PGSZ as u64,
+                mmu::PROT_GPU_FW_SHARED_RW,
+                false,
+            )
+        );
+        let render_3d_status = bootstrap_stage!(
+            "3D status high alias",
+            render_state.object.map_range_into_range(
+                uat.kernel_vm(),
+                G17P_RENDER_STATE_FRAGMENT_STATUS
+                    ..G17P_RENDER_STATE_FRAGMENT_STATUS + mmu::UAT_PGSZ,
+                G17P_BOOTSTRAP_3D_STATUS_VA
+                    ..G17P_BOOTSTRAP_3D_STATUS_VA + mmu::UAT_PGSZ as u64,
+                mmu::UAT_PGSZ as u64,
+                mmu::PROT_GPU_FW_SHARED_RW,
+                false,
+            )
+        );
         let timestamps = bootstrap_stage!("timestamp allocation", MappedObject::new_wc_in_range(
             dev,
             vm,
@@ -2071,15 +2146,14 @@ impl G17PUserRenderStorage {
             )
             .map_err(|_| EINVAL)
         }));
-        let descriptors_va = descriptors.iova();
         bootstrap_stage!("descriptor encoding", descriptors.with_bytes_mut(|raw| {
             let (tiling, fragment) = raw.split_at_mut(0x4000);
             g17_render::build_cold_opening_ta_descriptor(&translated.parameters, objects, tiling)
                 .map_err(|_| EINVAL)?;
             g17_render::apply_g17p_retained_descriptor_fields(
                 g17_render::RenderDescriptorKind::Tiling,
-                descriptors_va,
-                G17P_BOOTSTRAP_SHARED_CONTROL_VA,
+                G17P_BOOTSTRAP_TA_DESCRIPTOR_LOW_VA,
+                g17_initdata::CONTROL_SHARED_ADDRESS,
                 0,
                 true,
                 tiling,
@@ -2093,13 +2167,14 @@ impl G17PUserRenderStorage {
             .map_err(|_| EINVAL)?;
             g17_render::apply_g17p_retained_descriptor_fields(
                 g17_render::RenderDescriptorKind::Fragment,
-                descriptors_va + 0x4000,
-                G17P_BOOTSTRAP_SHARED_CONTROL_VA,
+                G17P_BOOTSTRAP_3D_DESCRIPTOR_LOW_VA,
+                g17_initdata::CONTROL_SHARED_ADDRESS,
                 0,
                 true,
                 fragment,
             )
-            .map_err(|_| EINVAL)
+            .map_err(|_| EINVAL)?;
+            apply_g17p_generic_descriptor_tail(tiling, fragment).ok_or(EINVAL)
         }));
 
         bootstrap_stage!("queue encoding", graph.with_bytes_mut(|raw| {
@@ -2141,9 +2216,13 @@ impl G17PUserRenderStorage {
 
         Ok(Self {
             descriptors,
+            descriptor_ta_low,
+            descriptor_3d_low,
             graph,
             support,
             render_state,
+            render_ta_status: Some(render_ta_status),
+            render_3d_status: Some(render_3d_status),
             timestamps,
             user_timestamp_aliases,
         })
@@ -2250,7 +2329,6 @@ impl G17PUserRenderStorage {
             record_b: support_va + G17P_RENDER_POOL_B as u64 + (record_b_index * 0x80) as u64,
             zero: support_va + G17P_RENDER_ZERO_SHARED as u64,
         };
-        let canonical_descriptor_va = self.descriptors.iova();
         next_descriptors.with_bytes_mut(|raw| {
             let (tiling, fragment) = raw.split_at_mut(0x4000);
             g17_render::build_ta_descriptor(
@@ -2267,7 +2345,7 @@ impl G17PUserRenderStorage {
             .map_err(|_| EINVAL)?;
             g17_render::apply_g17p_retained_descriptor_fields(
                 g17_render::RenderDescriptorKind::Tiling,
-                canonical_descriptor_va,
+                G17P_BOOTSTRAP_TA_DESCRIPTOR_LOW_VA,
                 g17_initdata::CONTROL_SHARED_ADDRESS,
                 submission_ordinal,
                 false,
@@ -2288,13 +2366,14 @@ impl G17PUserRenderStorage {
             .map_err(|_| EINVAL)?;
             g17_render::apply_g17p_retained_descriptor_fields(
                 g17_render::RenderDescriptorKind::Fragment,
-                canonical_descriptor_va + 0x4000,
+                G17P_BOOTSTRAP_3D_DESCRIPTOR_LOW_VA,
                 g17_initdata::CONTROL_SHARED_ADDRESS,
                 submission_ordinal,
                 false,
                 fragment,
             )
-            .map_err(|_| EINVAL)
+            .map_err(|_| EINVAL)?;
+            apply_g17p_generic_descriptor_tail(tiling, fragment).ok_or(EINVAL)
         })?;
 
         let source = next_descriptors.object.vmap()?;
@@ -2333,6 +2412,33 @@ impl G17PUserRenderStorage {
         put_u32(support, G17P_RENDER_FLAG, submission_ordinal + 1);
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 
+        // The fixed status addresses are phase-stable while their backing is
+        // replaced after an idle retained submission. Release the old aliases
+        // before installing the new render-state pages at the same addresses.
+        self.render_ta_status = None;
+        self.render_3d_status = None;
+        let next_ta_status = next_render_state.object.map_range_into_range(
+            uat.kernel_vm(),
+            G17P_RENDER_STATE_TA_STATUS..G17P_RENDER_STATE_TA_STATUS + mmu::UAT_PGSZ,
+            G17P_BOOTSTRAP_TA_STATUS_VA
+                ..G17P_BOOTSTRAP_TA_STATUS_VA + mmu::UAT_PGSZ as u64,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_FW_SHARED_RW,
+            false,
+        )?;
+        let next_3d_status = next_render_state.object.map_range_into_range(
+            uat.kernel_vm(),
+            G17P_RENDER_STATE_FRAGMENT_STATUS
+                ..G17P_RENDER_STATE_FRAGMENT_STATUS + mmu::UAT_PGSZ,
+            G17P_BOOTSTRAP_3D_STATUS_VA
+                ..G17P_BOOTSTRAP_3D_STATUS_VA + mmu::UAT_PGSZ as u64,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_FW_SHARED_RW,
+            false,
+        )?;
+        self.render_ta_status = Some(next_ta_status);
+        self.render_3d_status = Some(next_3d_status);
+
         let old_render_state = core::mem::replace(&mut self.render_state, next_render_state);
         let old_timestamps = core::mem::replace(&mut self.timestamps, next_timestamps);
         let old_aliases =
@@ -2359,6 +2465,42 @@ impl G17PUserRenderStorage {
             },
             |address, size| vm.covers_range(address, size, true, true),
         )
+            && self.descriptor_ta_low.iova() == G17P_BOOTSTRAP_TA_DESCRIPTOR_LOW_VA
+            && self.descriptor_ta_low.size() == mmu::UAT_PGSZ
+            && uat.kernel_lower_vm().covers_range(
+                self.descriptor_ta_low.iova(),
+                self.descriptor_ta_low.size() as u64,
+                true,
+                false,
+            )
+            && self.descriptor_3d_low.iova() == G17P_BOOTSTRAP_3D_DESCRIPTOR_LOW_VA
+            && self.descriptor_3d_low.size() == mmu::UAT_PGSZ
+            && uat.kernel_lower_vm().covers_range(
+                self.descriptor_3d_low.iova(),
+                self.descriptor_3d_low.size() as u64,
+                true,
+                false,
+            )
+            && self.render_ta_status.as_ref().is_some_and(|mapping| {
+                mapping.iova() == G17P_BOOTSTRAP_TA_STATUS_VA
+                    && mapping.size() == mmu::UAT_PGSZ
+                    && uat.kernel_vm().covers_range(
+                        G17P_BOOTSTRAP_TA_STATUS_VA,
+                        mmu::UAT_PGSZ as u64,
+                        true,
+                        true,
+                    )
+            })
+            && self.render_3d_status.as_ref().is_some_and(|mapping| {
+                mapping.iova() == G17P_BOOTSTRAP_3D_STATUS_VA
+                    && mapping.size() == mmu::UAT_PGSZ
+                    && uat.kernel_vm().covers_range(
+                        G17P_BOOTSTRAP_3D_STATUS_VA,
+                        mmu::UAT_PGSZ as u64,
+                        true,
+                        true,
+                    )
+            })
             && vm.covers_range(
                 G17P_CONTROL_DIRECTORY_VA,
                 G17P_CONTROL_DIRECTORY_SIZE as u64,
@@ -2707,14 +2849,17 @@ struct G17MappedResources {
     fwctl: MappedObject,
     control_shared: MappedObject,
     control_shared_inner: MappedObject,
-    bootstrap_control_shared: MappedObject,
-    bootstrap_control_shared_inner: MappedObject,
+    bootstrap_descriptor_zero_a: MappedObject,
+    bootstrap_descriptor_zero_b: MappedObject,
     control_operand_table: RenderBackingObject,
     control_operand_buffers: KVec<RenderBackingObject>,
     compute_runtime_support: MappedObject,
-    compute_runtime_state: MappedObject,
-    compute_runtime_zero_buffer_0: MappedObject,
-    compute_runtime_zero_buffer_1: MappedObject,
+    compute_runtime_state: RenderBackingObject,
+    compute_runtime_state_mapping: Option<mmu::KernelMapping>,
+    compute_runtime_zero_buffer_0: RenderBackingObject,
+    compute_runtime_zero_buffer_1: RenderBackingObject,
+    compute_runtime_zero_buffer_0_mapping: Option<mmu::KernelMapping>,
+    compute_runtime_zero_buffer_1_mapping: Option<mmu::KernelMapping>,
     compute_runtime_class1_table: MappedObject,
     compute_runtime_table_alias: mmu::KernelMapping,
     compute_runtime_buffer_aliases: KVec<mmu::KernelMapping>,
@@ -2897,38 +3042,22 @@ impl G17ResourceOwner {
             bytes[..8].copy_from_slice(&1u64.to_le_bytes());
             Ok(())
         })?;
-        let mut bootstrap_control_shared = map_fixed_wc_object(
+        let bootstrap_descriptor_zero_a = map_fixed_wc_object(
             dev,
             address_space.uat.kernel_vm(),
-            "bootstrap control-shared",
-            G17P_BOOTSTRAP_SHARED_CONTROL_VA,
-            g17_initdata::CONTROL_SHARED_OBJECT_SIZE,
-            mmu::PROT_GPU_FW_SHARED_RW,
-        )?;
-        bootstrap_control_shared.with_bytes_mut(|bytes| {
-            bytes.fill(0);
-            g17_submission::apply_g17p_cold_opening_shared_control(
-                G17P_CONTROL_OPERAND_TABLE_VA,
-                G17P_BOOTSTRAP_SHARED_CONTROL_INNER_VA,
-                &mut bytes[..g17_submission::G17P_COLD_OPENING_SHARED_CONTROL_SIZE],
-            )
-            .map_err(|_| EINVAL)
-        })?;
-        let mut bootstrap_control_shared_inner = map_fixed_wc_object(
-            dev,
-            address_space.uat.kernel_vm(),
-            "bootstrap control-shared-inner",
-            G17P_BOOTSTRAP_SHARED_CONTROL_INNER_VA,
+            "bootstrap descriptor zero A",
+            G17P_BOOTSTRAP_DESCRIPTOR_ZERO_A_VA,
             mmu::UAT_PGSZ,
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
-        bootstrap_control_shared_inner.with_bytes_mut(|bytes| {
-            bytes.fill(0);
-            g17_submission::apply_g17p_cold_opening_shared_control_inner(
-                &mut bytes[..g17_submission::G17P_COLD_OPENING_SHARED_CONTROL_INNER_SIZE],
-            )
-            .map_err(|_| EINVAL)
-        })?;
+        let bootstrap_descriptor_zero_b = map_fixed_wc_object(
+            dev,
+            address_space.uat.kernel_vm(),
+            "bootstrap descriptor zero B",
+            G17P_BOOTSTRAP_DESCRIPTOR_ZERO_B_VA,
+            mmu::UAT_PGSZ,
+            mmu::PROT_GPU_FW_PRIV_RW,
+        )?;
         let mut control_operand_table = match RenderBackingObject::new(
             dev,
             g17_initdata::CONTROL_OPERAND_TABLE_SIZE,
@@ -2988,30 +3117,14 @@ impl G17ResourceOwner {
             g17_initdata::COMPUTE_RUNTIME_SUPPORT_SIZE,
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
-        let mut compute_runtime_state = map_fixed_wc_object(
-            dev,
-            address_space.uat.kernel_vm(),
-            "compute runtime state",
-            g17_initdata::COMPUTE_RUNTIME_STATE_ADDRESS,
-            mmu::UAT_PGSZ,
-            mmu::PROT_GPU_FW_SHARED_RW,
-        )?;
-        let compute_runtime_zero_buffer_0 = map_fixed_wc_object(
-            dev,
-            address_space.uat.kernel_lower_vm(),
-            "compute runtime zero buffer 0",
-            g17_initdata::COMPUTE_RUNTIME_ZERO_BUFFER_0_ADDRESS,
-            G17P_CONTROL_OPERAND_BUFFER_SIZE,
-            mmu::PROT_GPU_FW_SHARED_RW,
-        )?;
-        let compute_runtime_zero_buffer_1 = map_fixed_wc_object(
-            dev,
-            address_space.uat.kernel_lower_vm(),
-            "compute runtime zero buffer 1",
-            g17_initdata::COMPUTE_RUNTIME_ZERO_BUFFER_1_ADDRESS,
-            G17P_CONTROL_OPERAND_BUFFER_SIZE,
-            mmu::PROT_GPU_FW_SHARED_RW,
-        )?;
+        let mut compute_runtime_state = RenderBackingObject::new(dev, mmu::UAT_PGSZ)?;
+        let compute_runtime_state_mapping = None;
+        let compute_runtime_zero_buffer_0 =
+            RenderBackingObject::new(dev, G17P_CONTROL_OPERAND_BUFFER_SIZE)?;
+        let compute_runtime_zero_buffer_1 =
+            RenderBackingObject::new(dev, G17P_CONTROL_OPERAND_BUFFER_SIZE)?;
+        let compute_runtime_zero_buffer_0_mapping = None;
+        let compute_runtime_zero_buffer_1_mapping = None;
         let mut compute_runtime_class1_table = map_fixed_wc_object(
             dev,
             address_space.uat.kernel_lower_vm(),
@@ -3232,13 +3345,9 @@ impl G17ResourceOwner {
             ("fwctl", &fwctl),
             ("control shared", &control_shared),
             ("control shared inner", &control_shared_inner),
-            ("bootstrap control shared", &bootstrap_control_shared),
-            (
-                "bootstrap control shared inner",
-                &bootstrap_control_shared_inner,
-            ),
+            ("bootstrap descriptor zero A", &bootstrap_descriptor_zero_a),
+            ("bootstrap descriptor zero B", &bootstrap_descriptor_zero_b),
             ("compute runtime support", &compute_runtime_support),
-            ("compute runtime state", &compute_runtime_state),
             ("roots", &roots),
             ("shared cluster", &shared_cluster),
             ("B2 sentinel", &primary_b2_sentinel),
@@ -3267,26 +3376,17 @@ impl G17ResourceOwner {
                 return Err(EIO);
             }
         }
-        for (name, object) in [
-            ("compute runtime zero buffer 0", &compute_runtime_zero_buffer_0),
-            ("compute runtime zero buffer 1", &compute_runtime_zero_buffer_1),
-            ("compute runtime class-1 table", &compute_runtime_class1_table),
-        ] {
-            if !address_space.uat.kernel_lower_vm().covers_range(
-                object.iova(),
-                object.logical_size as u64,
-                false,
-                false,
-            ) {
-                dev_err!(
-                    dev.as_ref(),
-                    "G17P resources: {} context-1 mapping at {:#x} size {:#x} is incomplete\n",
-                    name,
-                    object.iova(),
-                    object.logical_size
-                );
-                return Err(EIO);
-            }
+        if !address_space.uat.kernel_lower_vm().covers_range(
+            compute_runtime_class1_table.iova(),
+            compute_runtime_class1_table.logical_size as u64,
+            false,
+            false,
+        ) {
+            dev_err!(
+                dev.as_ref(),
+                "G17P resources: compute runtime class-1 table mapping is incomplete\n"
+            );
+            return Err(EIO);
         }
         if !address_space.uat.kernel_lower_vm().covers_range(
             g17_initdata::CONTROL_OPERAND_TABLE_ADDRESS,
@@ -3410,14 +3510,17 @@ impl G17ResourceOwner {
                 fwctl,
                 control_shared,
                 control_shared_inner,
-                bootstrap_control_shared,
-                bootstrap_control_shared_inner,
+                bootstrap_descriptor_zero_a,
+                bootstrap_descriptor_zero_b,
                 control_operand_table,
                 control_operand_buffers,
                 compute_runtime_support,
                 compute_runtime_state,
+                compute_runtime_state_mapping,
                 compute_runtime_zero_buffer_0,
                 compute_runtime_zero_buffer_1,
+                compute_runtime_zero_buffer_0_mapping,
+                compute_runtime_zero_buffer_1_mapping,
                 compute_runtime_class1_table,
                 compute_runtime_table_alias,
                 compute_runtime_buffer_aliases,
@@ -3493,6 +3596,57 @@ impl G17ResourceOwner {
     pub(crate) fn prepare_compute_runtime_class1(&mut self) -> Result {
         if !self.control_counters()?.opening_retired() {
             return Err(EINVAL);
+        }
+        let mapping_state = self.resources.compute_runtime_state_mapping.is_some();
+        let mapping_zero_0 = self
+            .resources
+            .compute_runtime_zero_buffer_0_mapping
+            .is_some();
+        let mapping_zero_1 = self
+            .resources
+            .compute_runtime_zero_buffer_1_mapping
+            .is_some();
+        match (mapping_state, mapping_zero_0, mapping_zero_1) {
+            (false, false, false) => {
+                let state = self.resources.compute_runtime_state.map_at(
+                    self.address_space.uat.kernel_vm(),
+                    g17_initdata::COMPUTE_RUNTIME_STATE_ADDRESS,
+                    mmu::PROT_GPU_FW_SHARED_RW,
+                )?;
+                let zero_0 = self.resources.compute_runtime_zero_buffer_0.map_at(
+                    self.address_space.uat.kernel_lower_vm(),
+                    g17_initdata::COMPUTE_RUNTIME_ZERO_BUFFER_0_ADDRESS,
+                    mmu::PROT_GPU_FW_SHARED_RW,
+                )?;
+                let zero_1 = self.resources.compute_runtime_zero_buffer_1.map_at(
+                    self.address_space.uat.kernel_lower_vm(),
+                    g17_initdata::COMPUTE_RUNTIME_ZERO_BUFFER_1_ADDRESS,
+                    mmu::PROT_GPU_FW_SHARED_RW,
+                )?;
+                self.resources.compute_runtime_state_mapping = Some(state);
+                self.resources.compute_runtime_zero_buffer_0_mapping = Some(zero_0);
+                self.resources.compute_runtime_zero_buffer_1_mapping = Some(zero_1);
+            }
+            (true, true, true) => {}
+            _ => return Err(EIO),
+        }
+        if !self.address_space.uat.kernel_vm().covers_range(
+            g17_initdata::COMPUTE_RUNTIME_STATE_ADDRESS,
+            mmu::UAT_PGSZ as u64,
+            true,
+            true,
+        ) || !self.address_space.uat.kernel_lower_vm().covers_range(
+            g17_initdata::COMPUTE_RUNTIME_ZERO_BUFFER_0_ADDRESS,
+            G17P_CONTROL_OPERAND_BUFFER_SIZE as u64,
+            true,
+            true,
+        ) || !self.address_space.uat.kernel_lower_vm().covers_range(
+            g17_initdata::COMPUTE_RUNTIME_ZERO_BUFFER_1_ADDRESS,
+            G17P_CONTROL_OPERAND_BUFFER_SIZE as u64,
+            true,
+            true,
+        ) {
+            return Err(EIO);
         }
         self.resources.compute_runtime_support.with_bytes_mut(|bytes| {
             g17_initdata::encode_compute_runtime_class1_support(bytes).map_err(|_| EINVAL)
@@ -3647,6 +3801,11 @@ impl G17ResourceOwner {
     /// Every mapping and the UAT owner stay in place so existing DRM VMs keep
     /// their page-table identity and fixed driver aliases.
     pub(crate) fn reset_session_after_processor_stop(&mut self) -> Result {
+        // The generic render status/descriptor aliases reuse these fixed VAs
+        // on the next bootstrap. Both processors are already stopped here.
+        self.resources.compute_runtime_state_mapping = None;
+        self.resources.compute_runtime_zero_buffer_0_mapping = None;
+        self.resources.compute_runtime_zero_buffer_1_mapping = None;
         self.address_space
             .uat
             .restore_t8140_bootstrap_roots_after_processor_stop()?;
@@ -3731,25 +3890,16 @@ impl G17ResourceOwner {
                 Ok(())
             })?;
         self.resources
-            .bootstrap_control_shared
+            .bootstrap_descriptor_zero_a
             .with_bytes_mut(|bytes| {
                 bytes.fill(0);
-                g17_submission::apply_g17p_cold_opening_shared_control(
-                    G17P_CONTROL_OPERAND_TABLE_VA,
-                    G17P_BOOTSTRAP_SHARED_CONTROL_INNER_VA,
-                    &mut bytes[..g17_submission::G17P_COLD_OPENING_SHARED_CONTROL_SIZE],
-                )
-                .map_err(|_| EINVAL)
+                Ok(())
             })?;
         self.resources
-            .bootstrap_control_shared_inner
+            .bootstrap_descriptor_zero_b
             .with_bytes_mut(|bytes| {
                 bytes.fill(0);
-                g17_submission::apply_g17p_cold_opening_shared_control_inner(
-                    &mut bytes
-                        [..g17_submission::G17P_COLD_OPENING_SHARED_CONTROL_INNER_SIZE],
-                )
-                .map_err(|_| EINVAL)
+                Ok(())
             })?;
         self.resources
             .control_operand_table
@@ -4735,6 +4885,54 @@ mod tests {
     }
 
     #[test]
+    fn generic_opening_descriptor_tail_uses_retained_aliases() {
+        let mut tiling = [0u8; g17_render::TA_DESCRIPTOR_SIZE];
+        let mut fragment = [0u8; g17_render::FRAGMENT_DESCRIPTOR_SIZE];
+        let overlapping_context_base = 0x10_0000_0000u64.to_le_bytes();
+        fragment[0x1f4e..0x1f56].copy_from_slice(&overlapping_context_base);
+
+        assert_eq!(
+            apply_g17p_generic_descriptor_tail(&mut tiling, &mut fragment),
+            Some(())
+        );
+        assert_eq!(get_u64(&tiling, 0x08a6), G17P_BOOTSTRAP_DESCRIPTOR_ZERO_A_VA);
+        assert_eq!(get_u64(&tiling, 0x08ae), G17P_BOOTSTRAP_DESCRIPTOR_ZERO_B_VA);
+        assert_eq!(get_u64(&tiling, 0x0945), G17P_BOOTSTRAP_TA_STATUS_VA);
+        assert_eq!(
+            get_u64(&fragment, 0x2140),
+            G17P_BOOTSTRAP_DESCRIPTOR_ZERO_A_VA + 4
+        );
+        assert_eq!(
+            get_u64(&fragment, 0x2148),
+            G17P_BOOTSTRAP_DESCRIPTOR_ZERO_B_VA + 4
+        );
+        assert_eq!(get_u64(&fragment, 0x21df), G17P_BOOTSTRAP_3D_STATUS_VA);
+        assert_eq!(
+            &fragment[0x1f4e..0x1f56],
+            &overlapping_context_base,
+            "the native overlapping context-base view is already encoded elsewhere"
+        );
+
+        assert_eq!(
+            G17P_BOOTSTRAP_TA_DESCRIPTOR_LOW_VA,
+            g17_initdata::COMPUTE_RUNTIME_ZERO_BUFFER_0_ADDRESS
+        );
+        assert!(
+            G17P_BOOTSTRAP_3D_DESCRIPTOR_LOW_VA
+                >= g17_initdata::COMPUTE_RUNTIME_ZERO_BUFFER_0_ADDRESS
+        );
+        assert!(
+            G17P_BOOTSTRAP_3D_DESCRIPTOR_LOW_VA + G17P_PAGE_SIZE as u64
+                <= g17_initdata::COMPUTE_RUNTIME_ZERO_BUFFER_0_ADDRESS
+                    + G17P_CONTROL_OPERAND_BUFFER_SIZE as u64
+        );
+        assert_eq!(
+            G17P_BOOTSTRAP_3D_STATUS_VA,
+            g17_initdata::COMPUTE_RUNTIME_STATE_ADDRESS
+        );
+    }
+
+    #[test]
     fn user_render_state_sizes_follow_the_legacy_scene_geometry() {
         let parameters = g17_render::G17pRenderParameters::source_rsrc8();
         let layout = g17p_render_state_layout(&parameters, 2).unwrap();
@@ -4772,18 +4970,6 @@ mod tests {
         assert_eq!(
             u32::from_le_bytes(viewport[0x91c..0x920].try_into().unwrap()),
             0xc200_0000
-        );
-    }
-
-    #[test]
-    fn bootstrap_render_keeps_its_compact_control_object() {
-        let addresses = g17p_cold_opening_optional_addresses(0x70_0100_0000, true);
-        assert_eq!(addresses.shared_control, G17P_BOOTSTRAP_SHARED_CONTROL_VA);
-        assert_ne!(addresses.shared_control, g17_initdata::CONTROL_SHARED_ADDRESS);
-        assert_eq!(G17P_BOOTSTRAP_SHARED_CONTROL_VA, 0xffff_fc20_c082_8000);
-        assert_eq!(
-            G17P_BOOTSTRAP_SHARED_CONTROL_INNER_VA,
-            0xffff_fc20_0160_0000
         );
     }
 
@@ -4877,11 +5063,11 @@ mod tests {
         let fragment_optional = g17p_cold_opening_optional_addresses(support_va, false);
         assert_eq!(
             tiling_optional.shared_control,
-            G17P_BOOTSTRAP_SHARED_CONTROL_VA
+            g17_initdata::CONTROL_SHARED_ADDRESS
         );
         assert_eq!(
             fragment_optional.shared_control,
-            G17P_BOOTSTRAP_SHARED_CONTROL_VA
+            g17_initdata::CONTROL_SHARED_ADDRESS
         );
         apply_g17p_cold_opening_context_views(
             g17_submission::G17PColdOpeningStage::Tiling,
