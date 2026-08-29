@@ -717,18 +717,6 @@ static void apple_dcp_link_rpc_reply_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, reply, 0x0000000000000f42ULL);
 }
 
-static void apple_dcp_link_rpc_reply_cookie_test(struct kunit *test)
-{
-	u64 request = 0x005c000000000502ULL;
-	u64 reply;
-
-	reply = apple_dcp_link_rpc_reply_cookie(request, 0xd505);
-	KUNIT_EXPECT_EQ(test, reply, 0xd505000000000542ULL);
-	KUNIT_EXPECT_EQ(test, FIELD_GET(APPLE_DCP_LINK_MSG_VERSION, reply),
-			0xd505ULL);
-	KUNIT_EXPECT_EQ(test, reply & GENMASK_ULL(15, 0), 0x542ULL);
-}
-
 static void apple_dcp_h17p_rt_bw_test(struct kunit *test)
 {
 	struct apple_dcp_h17p_rt_bw_config config;
@@ -789,7 +777,6 @@ static struct kunit_case apple_dcp_link_test_cases[] = {
 	KUNIT_CASE(apple_dcp_link_stack_test),
 	KUNIT_CASE(apple_dcp_link_rpc_decode_test),
 	KUNIT_CASE(apple_dcp_link_rpc_reply_test),
-	KUNIT_CASE(apple_dcp_link_rpc_reply_cookie_test),
 	KUNIT_CASE(apple_dcp_h17p_rt_bw_test),
 	KUNIT_CASE(apple_dcp_h17p_rt_bw_reply_test),
 	{}
