@@ -529,6 +529,12 @@ static void apple_dcp_link_rpc_message_test(struct kunit *test)
 
 static void apple_dcp_h17p_service_match_wire_test(struct kunit *test)
 {
+	static const u8 temperature_payload[0x10] = {
+		0x36, 0x38, 0x33, 0x41,
+		0x00, 0x00, 0x00, 0x00,
+		0x04, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00,
+	};
 	static const u8 pmu_payload[0x10] = {
 		0x31, 0x33, 0x31, 0x41,
 		0x00, 0x00, 0x00, 0x00,
@@ -554,6 +560,11 @@ static void apple_dcp_h17p_service_match_wire_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, layout.capacity, 0x8000U);
 
 	header = (void *)payload;
+	apple_dcp_link_rpc_header_encode(
+		header, APPLE_DCP_H17P_CALL_VI_SET_TEMPERATURE_HINT, 0, 4);
+	KUNIT_EXPECT_MEMEQ(test, payload, temperature_payload, sizeof(payload));
+
+	memset(payload, 0, sizeof(payload));
 	apple_dcp_link_rpc_header_encode(
 		header, APPLE_DCP_H17P_CALL_PMU_SERVICE_MATCHED, 0, 4);
 	KUNIT_EXPECT_MEMEQ(test, payload, pmu_payload, sizeof(payload));
