@@ -156,13 +156,16 @@ pub(crate) struct AsahiObjConfig {
     kernel: bool,
 }
 
-/// Create a new kernel-owned GEM object.
-pub(crate) fn new_kernel_object(dev: &AsahiDevice, size: usize) -> Result<ObjectRef> {
+fn new_kernel_object_with_cpu_mapping(
+    dev: &AsahiDevice,
+    size: usize,
+    map_wc: bool,
+) -> Result<ObjectRef> {
     let gem = shmem::Object::<AsahiObject>::new(
         dev,
         align(size, mmu::UAT_PGSZ),
         shmem::ObjectConfig::<AsahiObject> {
-            map_wc: false,
+            map_wc,
             parent_resv_obj: None,
         },
         AsahiObjConfig {
@@ -174,6 +177,21 @@ pub(crate) fn new_kernel_object(dev: &AsahiDevice, size: usize) -> Result<Object
 
     mod_pr_debug!("AsahiObject new kernel object id={}\n", gem.id);
     Ok(ObjectRef::new(gem))
+}
+
+/// Create a new kernel-owned GEM object with a write-back CPU mapping.
+pub(crate) fn new_kernel_object(dev: &AsahiDevice, size: usize) -> Result<ObjectRef> {
+    new_kernel_object_with_cpu_mapping(dev, size, false)
+}
+
+/// Create a new kernel-owned GEM object with a write-combined CPU mapping.
+///
+/// Firmware-visible producer rings use this form when the hardware consumes
+/// host stores immediately after an ordering barrier. It matches the
+/// uncached channel-memory allocation used by Apple's producer and avoids a
+/// dirty write-back alias surviving past the device doorbell.
+pub(crate) fn new_kernel_object_wc(dev: &AsahiDevice, size: usize) -> Result<ObjectRef> {
+    new_kernel_object_with_cpu_mapping(dev, size, true)
 }
 
 /// Create a new user-owned GEM object with the given flags.
