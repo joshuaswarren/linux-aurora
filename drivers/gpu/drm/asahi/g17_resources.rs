@@ -1472,6 +1472,8 @@ impl G17PComputeDescriptorStorage {
         };
 
         core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        let queue_gpu_va = self.queue_graph.iova();
+        let context_high_gpu_va = self.queue_context_high.iova();
         let graph_vmap = self.queue_graph.object.vmap()?;
         let graph = unsafe {
             // SAFETY: the retained VMap covers the complete queue graph.
@@ -1507,10 +1509,10 @@ impl G17PComputeDescriptorStorage {
         let optional = g17_compute::COMPUTE_OPTIONAL;
         let event = g17_compute::COMPUTE_EVENT;
         let snapshot = G17PComputeGraphSnapshot {
-            queue: self.queue_graph.iova(),
-            pointers: self.queue_graph.iova() + pointers as u64,
-            item_ring: self.queue_graph.iova() + items as u64,
-            context_high: self.queue_context_high.iova(),
+            queue: queue_gpu_va,
+            pointers: queue_gpu_va + pointers as u64,
+            item_ring: queue_gpu_va + items as u64,
+            context_high: context_high_gpu_va,
             cursors: [
                 read_u32(graph, pointers)?,
                 read_u32(graph, pointers + 0x30)?,
