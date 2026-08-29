@@ -50,6 +50,20 @@
 #define DCP25G83_LINK_STREAM_RESPONSE_OFFSET	0x00000048
 #define DCP25G83_D563_COOKIE_PREFIX		0xd500
 
+#define DCP25G83_LINK_LOCAL0_RESPONSE_PAGE_OFFSET \
+	(DCP25G83_LINK_OBJECT_PAGE_OFFSET + \
+	 DCP25G83_LINK_LOCAL_STREAMS_OFFSET + \
+	 DCP25G83_LINK_STREAM_RESPONSE_OFFSET)
+#define DCP25G83_LINK_REMOTE0_RESPONSE_PAGE_OFFSET \
+	(DCP25G83_LINK_OBJECT_PAGE_OFFSET + \
+	 DCP25G83_LINK_REMOTE_STREAMS_OFFSET + \
+	 DCP25G83_LINK_STREAM_RESPONSE_OFFSET)
+
+static_assert(DCP25G83_LINK_LOCAL0_RESPONSE_PAGE_OFFSET == 0x3e40);
+static_assert(DCP25G83_LINK_REMOTE0_RESPONSE_PAGE_OFFSET == 0x3fe0);
+static_assert(DCP25G83_LINK_REMOTE0_RESPONSE_PAGE_OFFSET + sizeof(u64) <=
+	      SZ_16K);
+
 static int dcp_tx_offset(enum dcp_context_id id)
 {
 	switch (id) {
@@ -202,12 +216,10 @@ static void dcp25g83_link_assoc_diag_init(struct apple_dcp *dcp)
 	dev_info(dcp->dev,
 		 "DCP25G83_D563_FW_ASSOC_DIAG mapped link page DVA %#llx PA %pa response candidates %#llx/%#llx\n",
 		 DCP25G83_LINK_PAGE_DVA, &page_pa,
-		 DCP25G83_LINK_PAGE_DVA + DCP25G83_LINK_OBJECT_PAGE_OFFSET +
-			 DCP25G83_LINK_LOCAL_STREAMS_OFFSET +
-			 DCP25G83_LINK_STREAM_RESPONSE_OFFSET,
-		 DCP25G83_LINK_PAGE_DVA + DCP25G83_LINK_OBJECT_PAGE_OFFSET +
-			 DCP25G83_LINK_REMOTE_STREAMS_OFFSET +
-			 DCP25G83_LINK_STREAM_RESPONSE_OFFSET);
+		 DCP25G83_LINK_PAGE_DVA +
+			 DCP25G83_LINK_LOCAL0_RESPONSE_PAGE_OFFSET,
+		 DCP25G83_LINK_PAGE_DVA +
+			 DCP25G83_LINK_REMOTE0_RESPONSE_PAGE_OFFSET);
 	return;
 
 unavailable:
@@ -218,11 +230,11 @@ unavailable:
 static void dcp25g83_link_assoc_diag_snapshot(struct apple_dcp *dcp)
 {
 	void __iomem *link;
-	u32 stream_offset;
 	u32 local_id;
-	u16 observed_cookie;
-	u64 response;
-	u64 response_dva;
+	u16 local_cookie;
+	u16 remote_cookie;
+	u64 local_response;
+	u64 remote_response;
 
 	if (!dcp->link_firmware_state || !dcp->link_d563_last_cookie)
 		return;
@@ -230,24 +242,23 @@ static void dcp25g83_link_assoc_diag_snapshot(struct apple_dcp *dcp)
 	dcp_link_sync_for_cpu();
 	link = dcp->link_firmware_state + DCP25G83_LINK_OBJECT_PAGE_OFFSET;
 	local_id = readl_relaxed(link + DCP25G83_LINK_LOCAL_ID_OFFSET);
-	/* The ACK side selector is zero. Firmware picks local streams on an
-	 * equal selector and remote streams otherwise (0x41b7830).
-	 */
-	stream_offset = local_id == 0 ?
-		DCP25G83_LINK_LOCAL_STREAMS_OFFSET :
-		DCP25G83_LINK_REMOTE_STREAMS_OFFSET;
-	response = readq_relaxed(link + stream_offset +
-				 DCP25G83_LINK_STREAM_RESPONSE_OFFSET);
-	observed_cookie = FIELD_GET(APPLE_DCP_LINK_MSG_VERSION, response);
-	response_dva = DCP25G83_LINK_PAGE_DVA +
-			DCP25G83_LINK_OBJECT_PAGE_OFFSET + stream_offset +
-			DCP25G83_LINK_STREAM_RESPONSE_OFFSET;
+	local_response = readq_relaxed(dcp->link_firmware_state +
+				       DCP25G83_LINK_LOCAL0_RESPONSE_PAGE_OFFSET);
+	remote_response = readq_relaxed(dcp->link_firmware_state +
+					DCP25G83_LINK_REMOTE0_RESPONSE_PAGE_OFFSET);
+	local_cookie = FIELD_GET(APPLE_DCP_LINK_MSG_VERSION, local_response);
+	remote_cookie = FIELD_GET(APPLE_DCP_LINK_MSG_VERSION, remote_response);
 	dev_info(dcp->dev,
-		 "DCP25G83_D563_FW_ASSOC_RESULT last_callback %u count %u expected_cookie %#x local_id %u response_dva %#llx response %#llx observed_cookie %#x associated %u\n",
+		 "DCP25G83_D563_FW_ASSOC_RESULT last_callback %u count %u expected_cookie %#x local_id %u local0_dva %#llx local0_response %#llx local0_cookie %#x remote0_dva %#llx remote0_response %#llx remote0_cookie %#x remote0_associated %u\n",
 		 dcp->link_d563_last_sequence, dcp->link_d563_diag_count,
-		 dcp->link_d563_last_cookie, local_id, response_dva, response,
-		 observed_cookie,
-		 observed_cookie == dcp->link_d563_last_cookie);
+		 dcp->link_d563_last_cookie, local_id,
+		 DCP25G83_LINK_PAGE_DVA +
+			DCP25G83_LINK_LOCAL0_RESPONSE_PAGE_OFFSET,
+		 local_response, local_cookie,
+		 DCP25G83_LINK_PAGE_DVA +
+			DCP25G83_LINK_REMOTE0_RESPONSE_PAGE_OFFSET,
+		 remote_response, remote_cookie,
+		 remote_cookie == dcp->link_d563_last_cookie);
 }
 
 void iomfb_link_timeout_snapshot(struct apple_dcp *dcp)
