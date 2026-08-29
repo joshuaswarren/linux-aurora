@@ -72,6 +72,7 @@
 #define DCP_RTKIT_FOURCC(a, b, c, d) \
 	(((u32)(a) << 24) | ((u32)(b) << 16) | ((u32)(c) << 8) | (u32)(d))
 #define DCP_RTKIT_CRASHLOG_HEADER DCP_RTKIT_FOURCC('C', 'L', 'H', 'E')
+#define DCP_RTKIT_EP_CRASHLOG 1
 #define DCP_RTKIT_CRASHLOG_STR DCP_RTKIT_FOURCC('C', 's', 't', 'r')
 #define DCP_RTKIT_CRASHLOG_VERSION DCP_RTKIT_FOURCC('C', 'v', 'e', 'r')
 
@@ -481,10 +482,38 @@ static int dcp_rtk_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
 			  FIELD_PREP(GENMASK_ULL(51, 44), bfr->size >> 12) |
 			  FIELD_PREP(GENMASK_ULL(43, 0), bfr->iova);
 		dev_info(dcp->dev,
-			 "RTKit preallocated %s GETBUF %#llx size %#zx DVA %pad PA %pa iomem %p; Normal-NC firmware mapping, no address reply required\n",
+			 "RTKit preallocated %s GETBUF %#llx size %#zx DVA %pad PA %pa iomem %p; Normal-NC firmware mapping\n",
 			 owner, request, bfr->size, &bfr->iova, &phy_addr,
 			 bfr->iomem);
 		dcp_rtk_report_adopted_crashlog(dcp, bfr);
+
+		/*
+		 * The firmware still expects an acknowledgement even when it
+		 * supplies its own DVA.  25G83
+		 * RTBuddyCrashlogEndpoint::_messageHandler replies on EP1 with
+		 * bit 54 set, a page-size selector (bit 52 for <1 MiB, bit 53
+		 * otherwise) and the buffer size in those units at bits [51:44];
+		 * no DVA is echoed.  On the adopted RTKit session
+		 * firmware_owned_crashlog is false, so neither the generic path
+		 * nor this setup replied, and start() (A401) waited forever after
+		 * the crashlog GETBUF.  Match the native reply.
+		 */
+		if (bfr == &dcp->rtk->crashlog_buffer) {
+			u64 ack;
+
+			if (bfr->size < SZ_1M)
+				ack = BIT_ULL(54) | BIT_ULL(52) |
+				      FIELD_PREP(GENMASK_ULL(51, 44),
+						 DIV_ROUND_UP(bfr->size, SZ_4K));
+			else
+				ack = BIT_ULL(54) | BIT_ULL(53) |
+				      FIELD_PREP(GENMASK_ULL(51, 44),
+						 DIV_ROUND_UP(bfr->size, SZ_1M));
+			dcp_send_message(dcp, DCP_RTKIT_EP_CRASHLOG, ack);
+			dev_info(dcp->dev,
+				 "acked firmware crashlog buffer request %#llx\n",
+				 ack);
+		}
 	} else {
 		bfr->buffer = dma_alloc_coherent(dcp->dev, bfr->size,
 						 &bfr->iova, GFP_KERNEL);

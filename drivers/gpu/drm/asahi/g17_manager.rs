@@ -316,6 +316,7 @@ pub(crate) struct G17PManagerConstruction {
     render_tracker: Option<G17PPartialOpeningRenderTracker>,
     render_bind: Option<mmu::VmBind>,
     render_submission_ordinal: u32,
+    runtime_tick_staged: bool,
 }
 
 /// A queue which has completed the host's configuration pair and QID-enable
@@ -428,6 +429,7 @@ impl G17PManagerConstruction {
                 render_tracker: None,
                 render_bind: None,
                 render_submission_ordinal: 0,
+                runtime_tick_staged: false,
             },
             GFP_KERNEL,
         )?)
@@ -1233,6 +1235,19 @@ impl G17PManagerConstruction {
         queue: &mut G17PSksmQueue,
         prepared: g17_submission::PreparedG17PClKickEntry,
     ) -> Result<u64> {
+        if !self.runtime_tick_staged {
+            // Stage the runtime 0x2e tick exactly the way the output-positive
+            // paths do: written and producer-published with no doorbell,
+            // pending for this work kick to consume. The parked co-processor
+            // never answers a bare 0x84 announcement for it.
+            let target = self.publish_compute_runtime_control_record(0)?;
+            self.runtime_tick_staged = true;
+            dev_info!(
+                self.resources.dev().as_ref(),
+                "G17P compute control: runtime tick 0 staged for this kick (target {})\n",
+                target
+            );
+        }
         queue.storage.write_entry(
             prepared.entry_offset as usize,
             prepared.zero_length as usize,
