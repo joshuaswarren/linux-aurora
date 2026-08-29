@@ -894,7 +894,7 @@ impl G17PLiveRuntime {
         }
 
         let completion = owned_timestamps.with_cpu_bytes(|raw| {
-            const POLLS: usize = 2000;
+            const POLLS: usize = 500;
             for _ in 0..POLLS {
                 fence(Ordering::Acquire);
                 let start = u64::from_le_bytes(raw[0..8].try_into().map_err(|_| ERANGE)?);
