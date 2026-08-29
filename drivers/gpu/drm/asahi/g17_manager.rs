@@ -453,7 +453,7 @@ impl G17PManagerConstruction {
             );
         })?;
         let vm = self
-            .new_user_vm(0x8140_b007, kernel_range)
+            .new_user_vm_inner(0x8140_b007, kernel_range, true)
             .inspect_err(|error| {
                 dev_err!(
                     dev.as_ref(),
@@ -794,6 +794,15 @@ impl G17PManagerConstruction {
         id: u64,
         kernel_range: core::ops::Range<u64>,
     ) -> Result<mmu::Vm> {
+        self.new_user_vm_inner(id, kernel_range, false)
+    }
+
+    fn new_user_vm_inner(
+        &mut self,
+        id: u64,
+        kernel_range: core::ops::Range<u64>,
+        bootstrap_vdm: bool,
+    ) -> Result<mmu::Vm> {
         let vm = self
             .resources
             .uat()
@@ -806,7 +815,7 @@ impl G17PManagerConstruction {
                 );
             })?;
         self.resources
-            .install_user_vm_aliases(&vm)
+            .install_user_vm_aliases(&vm, bootstrap_vdm)
             .inspect_err(|error| {
                 dev_err!(
                     self.resources.dev().as_ref(),
