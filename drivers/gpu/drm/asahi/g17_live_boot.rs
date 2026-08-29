@@ -487,7 +487,19 @@ fn finish_boot_session(
     let (bootstrap, crash_vm) = manager.begin_compute_bootstrap_render(drm)?;
     gfx_state.set_crash_vm(crash_vm.clone());
     gfx1_state.set_crash_vm(crash_vm);
-    manager.prepare_partial_opening_control_done()?;
+    dev_info!(
+        pdev.as_ref(),
+        "G17P compute control: startup render graph ready\n"
+    );
+    manager
+        .prepare_partial_opening_control_done()
+        .inspect_err(|error| {
+            dev_err!(
+                pdev.as_ref(),
+                "G17P compute control: pre-doorbell status failed ({:?})\n",
+                error
+            );
+        })?;
     dev_info!(
         pdev.as_ref(),
         "G17P compute control: startup TA/3D group staged; sending primary done\n"

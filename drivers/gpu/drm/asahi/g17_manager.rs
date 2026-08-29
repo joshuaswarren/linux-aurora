@@ -445,8 +445,22 @@ impl G17PManagerConstruction {
         &mut self,
         dev: &AsahiDevice,
     ) -> Result<(g17_submission::PreparedG17PPartialOpeningWorkPair, mmu::Vm)> {
-        let kernel_range = self.resources.uat().kernel_va_range()?;
-        let vm = self.new_user_vm(0x8140_b007, kernel_range)?;
+        let kernel_range = self.resources.uat().kernel_va_range().inspect_err(|error| {
+            dev_err!(
+                dev.as_ref(),
+                "G17P bootstrap: kernel VA range failed ({:?})\n",
+                error
+            );
+        })?;
+        let vm = self
+            .new_user_vm(0x8140_b007, kernel_range)
+            .inspect_err(|error| {
+                dev_err!(
+                    dev.as_ref(),
+                    "G17P bootstrap: render VM setup failed ({:?})\n",
+                    error
+                );
+            })?;
         let mut parameters = g17_render::G17pRenderParameters::source_rsrc8();
         parameters.encoder = g17_resources::G17P_BOOTSTRAP_VDM_VA;
         parameters.process_empty_tiles = false;
@@ -470,8 +484,15 @@ impl G17PManagerConstruction {
                 end: timestamp,
             },
         };
-        let prepared =
-            self.begin_translated_render(dev, &vm, &command, [0; 4], KVec::new())?;
+        let prepared = self
+            .begin_translated_render(dev, &vm, &command, [0; 4], KVec::new())
+            .inspect_err(|error| {
+                dev_err!(
+                    dev.as_ref(),
+                    "G17P bootstrap: render graph setup failed ({:?})\n",
+                    error
+                );
+            })?;
         Ok((prepared, vm))
     }
 
@@ -551,35 +572,47 @@ impl G17PManagerConstruction {
     fn validate_partial_opening_resources(&self) -> Result {
         let binding = self.resources.partial_opening_binding();
         let context = g17_submission::G17P_PARTIAL_OPENING_CONTEXT;
-        if binding.scheduler_page != g17_submission::G17P_PARTIAL_OPENING_SCHEDULER_GPU_VA
-            || binding.primary_index_page
-                != g17_submission::G17P_PARTIAL_OPENING_PRIMARY_INDEX_GPU_VA
-            || binding.fwctl
-                != binding
-                    .kernel_va_base
-                    .checked_add(g17_submission::G17P_PARTIAL_OPENING_FWCTL_OFFSET)
-                    .ok_or(EINVAL)?
-            || context.context0_root_slot != 0
-            || context.context0_context_id != 0
-            || context.render_root_slot != 1
-            || context.render_context_id != 1
-            || context.context0_empty_high_root_slot != 0
-            || context.render_empty_high_root_slot != 1
-            || context.transport_pair != 2
-            || context.descriptor_pair != 0
-            || context.shared_queue_pair_namespace != 0
-            || context.optional_identity_context_id != 1
-            || context.descriptor_context_id != 1
-            || context.scheduler_class != 2
-            || context.work_doorbell_channel != 8
-            || !context.context0_low_root_present_at_first_work
-            || !context.render_low_root_present_at_first_work
-            || context.source_firmware_high_root_table_resident
-            || !self
-                .resources
-                .uat()
-                .t8140_partial_opening_contexts_ready(false)
-        {
+        let expected_fwctl = binding
+            .kernel_va_base
+            .checked_add(g17_submission::G17P_PARTIAL_OPENING_FWCTL_OFFSET)
+            .ok_or(EINVAL)?;
+        let addresses_ready = binding.scheduler_page
+            == g17_submission::G17P_PARTIAL_OPENING_SCHEDULER_GPU_VA
+            && binding.primary_index_page
+                == g17_submission::G17P_PARTIAL_OPENING_PRIMARY_INDEX_GPU_VA
+            && binding.fwctl == expected_fwctl;
+        let context_ready = context.context0_root_slot == 0
+            && context.context0_context_id == 0
+            && context.render_root_slot == 1
+            && context.render_context_id == 1
+            && context.context0_empty_high_root_slot == 0
+            && context.render_empty_high_root_slot == 1
+            && context.transport_pair == 2
+            && context.descriptor_pair == 0
+            && context.shared_queue_pair_namespace == 0
+            && context.optional_identity_context_id == 1
+            && context.descriptor_context_id == 1
+            && context.scheduler_class == 2
+            && context.work_doorbell_channel == 8
+            && context.context0_low_root_present_at_first_work
+            && context.render_low_root_present_at_first_work
+            && !context.source_firmware_high_root_table_resident;
+        let roots_ready = self
+            .resources
+            .uat()
+            .t8140_partial_opening_contexts_ready(false);
+        if !addresses_ready || !context_ready || !roots_ready {
+            dev_err!(
+                self.resources.dev().as_ref(),
+                "G17P render: opening contract addresses={} context={} roots={} (scheduler {:#x}, index {:#x}, fwctl {:#x}/{:#x})\n",
+                addresses_ready,
+                context_ready,
+                roots_ready,
+                binding.scheduler_page,
+                binding.primary_index_page,
+                binding.fwctl,
+                expected_fwctl
+            );
             return Err(EINVAL);
         }
         Ok(())
@@ -588,8 +621,22 @@ impl G17PManagerConstruction {
     /// Apply first-work status immediately before the caller sends primary
     /// control-done 0x84.
     pub(crate) fn prepare_partial_opening_control_done(&mut self) -> Result {
-        self.validate_partial_opening_resources()?;
-        self.resources.apply_partial_opening_pre_control_status()
+        self.validate_partial_opening_resources().inspect_err(|error| {
+            dev_err!(
+                self.resources.dev().as_ref(),
+                "G17P render: opening validation failed ({:?})\n",
+                error
+            );
+        })?;
+        self.resources
+            .apply_partial_opening_pre_control_status()
+            .inspect_err(|error| {
+                dev_err!(
+                    self.resources.dev().as_ref(),
+                    "G17P render: status-B update failed ({:?})\n",
+                    error
+                );
+            })
     }
 
     /// Publish the exact first 3D/TA outer-ring pair. The callback installs
@@ -674,8 +721,26 @@ impl G17PManagerConstruction {
         id: u64,
         kernel_range: core::ops::Range<u64>,
     ) -> Result<mmu::Vm> {
-        let vm = self.resources.uat().new_vm(id, kernel_range)?;
-        self.resources.install_user_vm_aliases(&vm)?;
+        let vm = self
+            .resources
+            .uat()
+            .new_vm(id, kernel_range)
+            .inspect_err(|error| {
+                dev_err!(
+                    self.resources.dev().as_ref(),
+                    "G17P VM: context allocation failed ({:?})\n",
+                    error
+                );
+            })?;
+        self.resources
+            .install_user_vm_aliases(&vm)
+            .inspect_err(|error| {
+                dev_err!(
+                    self.resources.dev().as_ref(),
+                    "G17P VM: fixed aliases failed ({:?})\n",
+                    error
+                );
+            })?;
         Ok(vm)
     }
 
@@ -763,36 +828,60 @@ impl G17PManagerConstruction {
             if self.render_submission_ordinal != 0 || self.render_bind.is_some() {
                 return Err(EIO);
             }
-            self.render_storage = Some(self.resources.new_user_render_storage(
-                dev,
-                vm,
-                command,
-                self.num_clusters,
-                user_timestamps,
-                user_timestamp_aliases,
-            )?);
+            self.render_storage = Some(
+                self.resources
+                    .new_user_render_storage(
+                        dev,
+                        vm,
+                        command,
+                        self.num_clusters,
+                        user_timestamps,
+                        user_timestamp_aliases,
+                    )
+                    .inspect_err(|error| {
+                        dev_err!(
+                            dev.as_ref(),
+                            "G17P render: retained storage setup failed ({:?})\n",
+                            error
+                        );
+                    })?,
+            );
         }
         let (fragment_queue, tiling_queue, previous, late_tiling) = {
             let storage = self.render_storage.as_mut().ok_or(ENODEV)?;
             if !storage.is_reachable_from(vm) {
                 return Err(EFAULT);
             }
-            storage.stage_fragment(self.render_submission_ordinal)?;
-            let previous = storage.snapshot()?;
-            let late_tiling =
-                storage.prepare_late_tiling_publication(self.render_submission_ordinal)?;
+            storage
+                .stage_fragment(self.render_submission_ordinal)
+                .inspect_err(|error| {
+                    dev_err!(dev.as_ref(), "G17P render: fragment stage failed ({:?})\n", error);
+                })?;
+            let previous = storage.snapshot().inspect_err(|error| {
+                dev_err!(dev.as_ref(), "G17P render: initial snapshot failed ({:?})\n", error);
+            })?;
+            let late_tiling = storage
+                .prepare_late_tiling_publication(self.render_submission_ordinal)
+                .inspect_err(|error| {
+                    dev_err!(dev.as_ref(), "G17P render: tiling stage failed ({:?})\n", error);
+                })?;
             let (fragment_queue, tiling_queue) = storage.queue_gpu_vas();
             (fragment_queue, tiling_queue, previous, late_tiling)
         };
-        let (prepared, render_bind) = self.resources.publish_partial_opening_pair(
-            if retained { None } else { Some(vm) },
-            retained,
-            fragment_queue,
-            3,
-            tiling_queue,
-            3,
-            move || late_tiling.publish(),
-        )?;
+        let (prepared, render_bind) = self
+            .resources
+            .publish_partial_opening_pair(
+                if retained { None } else { Some(vm) },
+                retained,
+                fragment_queue,
+                3,
+                tiling_queue,
+                3,
+                move || late_tiling.publish(),
+            )
+            .inspect_err(|error| {
+                dev_err!(dev.as_ref(), "G17P render: outer publish failed ({:?})\n", error);
+            })?;
         if retained {
             if render_bind.is_some() {
                 return Err(EINVAL);
