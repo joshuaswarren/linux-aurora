@@ -37,12 +37,23 @@ operands recorded in `encoder-parity.md`.
 - `tag15-config-update-relocation-mask.bin`: address normalization mask for
   the tag-15 extent; SHA-256
   `e453d785542953408e8fc17657d91b536c60475fd472ee72e2f2dc2b439755d5`.
+- `channel-state-before-tag15.bin`: producer 1 with descriptor slot zero
+  already present; SHA-256
+  `e3ee359d1eab12c393dc53d908ea5546f8637d13811afc8627971694d9c2ed07`.
+- `channel-state-after-tag15.bin`: pointer store, barrier, producer 1 -> 2;
+  SHA-256 `2c4add86dfcda9191c99dc096a482e4672719d69231f044e44f7f1af2d5fb359`.
+- `channel-state-after-tag16.bin`: pointer store, barrier, producer 2 -> 3;
+  SHA-256 `9c09a40589df6e45ac9126a3cdc4cca25c9e88f77749efa50717b7bfe3e569da`.
 
 Direct-feature G17P skips tag 14. A first bind marks the queue configuration
 dirty, which makes descriptor preparation allocate tag 15 and then tag 16;
 submitBuffer publishes tag 15 before the SKSM entry and tag 16 after it. The
 tag-16 fixture locks that conditional encoder while the admitted tag-15 bytes
 and full direct-path predicate/order remain in the contract corpus.
+
+The retained channel pointer ring is `0x500` qwords at graph `+0x4000`, ending
+at `+0x6800`. Tag 15 and tag 16 storage is placed after it at aligned offsets
+`+0x6800` and `+0x6c00`; neither object overlaps a repeat-submit ring slot.
 
 Evidence classification: entry packing and runtime geometry are
 `KEXT_PROVEN`; first/second add3 operands are `EXPERIMENT_PROVEN`. Native queue

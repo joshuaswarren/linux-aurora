@@ -346,6 +346,51 @@ fn put_u64(raw: &mut [u8], offset: usize, value: u64) {
     raw[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
+/// Apply one native AGXChannel command-pointer transition to the retained
+/// compute graph. The command bytes are prepared separately; this performs
+/// only pointer store, inner-shareable ordering, and producer publication.
+fn apply_g17p_initial_command_pointer(
+    graph: &mut [u8],
+    expected_producer: u32,
+    command_gpu_va: u64,
+) -> Option<u32> {
+    let state = g17_compute::COMPUTE_QUEUE_POINTERS;
+    let producer_offset = state.checked_add(0x40)?;
+    let count_offset = state.checked_add(0x60)?;
+    let consumer = u32::from_le_bytes(graph.get(state..state + 4)?.try_into().ok()?);
+    let producer = u32::from_le_bytes(
+        graph
+            .get(producer_offset..producer_offset + 4)?
+            .try_into()
+            .ok()?,
+    );
+    let count = u32::from_le_bytes(
+        graph
+            .get(count_offset..count_offset + 4)?
+            .try_into()
+            .ok()?,
+    );
+    if producer != expected_producer || count != 0x500 {
+        return None;
+    }
+    let next = producer.checked_add(1)? % count;
+    if next == consumer {
+        return None;
+    }
+    let slot = g17_compute::COMPUTE_ITEM_RING
+        .checked_add(producer as usize * core::mem::size_of::<u64>())?;
+    let ring_end = g17_compute::COMPUTE_ITEM_RING.checked_add(g17_compute::COMPUTE_ITEM_RING_SIZE)?;
+    if slot.checked_add(8)? > ring_end
+        || u64::from_le_bytes(graph.get(slot..slot + 8)?.try_into().ok()?) != 0
+    {
+        return None;
+    }
+    put_u64(graph, slot, command_gpu_va);
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    put_u32(graph, producer_offset, next);
+    Some(next)
+}
+
 /// Fill the nonzero generic-pair tail pointers used by the full 4/16
 /// opening. The two descriptor self-pointers are installed separately by
 /// `apply_g17p_retained_descriptor_fields` because they live in context 0.
@@ -1661,16 +1706,49 @@ impl G17PComputeDescriptorStorage {
         )
         .map_err(|_| EINVAL)?;
 
-        // The source builder includes the tag-14 fallback used without the
-        // direct feature. Native direct G17P skips that command, so keep only
-        // the descriptor and selector-0x0f pointers in this inner group.
+        // The source builder provides all command bytes. Direct first bind
+        // begins with only the main descriptor reachable at slot zero; tag 15
+        // and tag 16 are published through distinct ordered transitions around
+        // the SKSM entry. Tag 14 remains omitted in direct mode.
         graph[g17_compute::COMPUTE_EVENT
             ..g17_compute::COMPUTE_EVENT + g17_compute::COMPUTE_EVENT_SIZE]
             .fill(0);
+        put_u64(graph, g17_compute::COMPUTE_ITEM_RING + 0x08, 0);
         put_u64(graph, g17_compute::COMPUTE_ITEM_RING + 0x10, 0);
-        put_u32(graph, g17_compute::COMPUTE_QUEUE_POINTERS + 0x40, 2);
-        group.write_index = 2;
+        put_u32(graph, g17_compute::COMPUTE_QUEUE_POINTERS + 0x40, 1);
+        group.write_index = 3;
         Ok(group)
+    }
+
+    /// Publish the prepared tag-15 ConfigUpdate pointer at channel slot one.
+    pub(crate) fn publish_initial_config_update_pointer(
+        &mut self,
+        group: g17_compute::ComputeChannelGroupAddresses,
+    ) -> Result {
+        self.queue_graph.with_bytes_mut(|graph| {
+            if apply_g17p_initial_command_pointer(graph, 1, group.optional) != Some(2) {
+                return Err(EBUSY);
+            }
+            Ok(())
+        })
+    }
+
+    /// Write and publish the first-bind tag-16 EntrySignal at channel slot two.
+    pub(crate) fn publish_initial_entry_signal(
+        &mut self,
+        entry_signal: &[u8; g17_submission::G17P_COMPUTE_OPTIONAL_EVENT_SIZE],
+    ) -> Result {
+        let entry_signal_gpu_va =
+            self.queue_graph.iova() + g17_compute::COMPUTE_EVENT as u64;
+        self.queue_graph.with_bytes_mut(|graph| {
+            graph[g17_compute::COMPUTE_EVENT
+                ..g17_compute::COMPUTE_EVENT + entry_signal.len()]
+                .copy_from_slice(entry_signal);
+            if apply_g17p_initial_command_pointer(graph, 2, entry_signal_gpu_va) != Some(3) {
+                return Err(EBUSY);
+            }
+            Ok(())
+        })
     }
 
     pub(crate) fn snapshot_initial_channel_group(&mut self) -> Result<G17PComputeGraphSnapshot> {
@@ -4883,6 +4961,12 @@ mod tests {
         const RELOCATION_MASK: &[u8; 0x86] = include_bytes!(
             "fixtures/g17p_first_submit/tag15-config-update-relocation-mask.bin"
         );
+        const BEFORE_TAG15: &[u8; 0x80] =
+            include_bytes!("fixtures/g17p_first_submit/channel-state-before-tag15.bin");
+        const AFTER_TAG15: &[u8; 0x80] =
+            include_bytes!("fixtures/g17p_first_submit/channel-state-after-tag15.bin");
+        const AFTER_TAG16: &[u8; 0x80] =
+            include_bytes!("fixtures/g17p_first_submit/channel-state-after-tag16.bin");
         const QUEUE: u64 = 0xffff_fc20_c000_0300;
         const DESCRIPTOR: u64 = 0xffff_fc20_c035_8000;
         const CONTEXT_LOW: u64 = 0x70_004d_8000;
@@ -4914,6 +4998,70 @@ mod tests {
                 TAG15[index] & !RELOCATION_MASK[index]
             );
         }
+
+        graph[g17_compute::COMPUTE_EVENT
+            ..g17_compute::COMPUTE_EVENT + g17_compute::COMPUTE_EVENT_SIZE]
+            .fill(0);
+        put_u64(&mut graph, g17_compute::COMPUTE_ITEM_RING + 0x08, 0);
+        put_u64(&mut graph, g17_compute::COMPUTE_ITEM_RING + 0x10, 0);
+        put_u32(&mut graph, g17_compute::COMPUTE_QUEUE_POINTERS + 0x40, 1);
+        assert_eq!(
+            &graph[g17_compute::COMPUTE_QUEUE_POINTERS
+                ..g17_compute::COMPUTE_QUEUE_POINTERS + 0x80],
+            *BEFORE_TAG15
+        );
+
+        assert_eq!(
+            apply_g17p_initial_command_pointer(
+                &mut graph,
+                1,
+                QUEUE + g17_compute::COMPUTE_OPTIONAL as u64,
+            ),
+            Some(2)
+        );
+        assert_eq!(
+            &graph[g17_compute::COMPUTE_QUEUE_POINTERS
+                ..g17_compute::COMPUTE_QUEUE_POINTERS + 0x80],
+            *AFTER_TAG15
+        );
+
+        let mut entry_signal = [0u8; g17_submission::G17P_COMPUTE_OPTIONAL_EVENT_SIZE];
+        g17_submission::encode_g17p_compute_optional_event(
+            g17_submission::G17PComputeOptionalEvent {
+                queue_id: 4,
+                old_timestamp: 1,
+            },
+            &mut entry_signal,
+        )
+        .unwrap();
+        graph[g17_compute::COMPUTE_EVENT
+            ..g17_compute::COMPUTE_EVENT + entry_signal.len()]
+            .copy_from_slice(&entry_signal);
+        assert_eq!(
+            apply_g17p_initial_command_pointer(
+                &mut graph,
+                2,
+                QUEUE + g17_compute::COMPUTE_EVENT as u64,
+            ),
+            Some(3)
+        );
+        assert_eq!(
+            &graph[g17_compute::COMPUTE_QUEUE_POINTERS
+                ..g17_compute::COMPUTE_QUEUE_POINTERS + 0x80],
+            *AFTER_TAG16
+        );
+        assert_eq!(
+            get_u64(&graph, g17_compute::COMPUTE_ITEM_RING + 0x08),
+            QUEUE + g17_compute::COMPUTE_OPTIONAL as u64
+        );
+        assert_eq!(
+            get_u64(&graph, g17_compute::COMPUTE_ITEM_RING + 0x10),
+            QUEUE + g17_compute::COMPUTE_EVENT as u64
+        );
+        assert!(
+            g17_compute::COMPUTE_ITEM_RING + g17_compute::COMPUTE_ITEM_RING_SIZE
+                <= g17_compute::COMPUTE_OPTIONAL
+        );
     }
 
     #[test]
