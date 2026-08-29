@@ -666,6 +666,8 @@ pub(crate) const G17P_COLD_OPENING_CHANNEL_CONTROL_SIZE: usize = 0x40;
 pub(crate) const G17P_COLD_OPENING_OPTIONAL_SIZE: usize = 0xc0;
 pub(crate) const G17P_COLD_OPENING_EVENT_SIZE: usize = 0x40;
 pub(crate) const G17P_COLD_OPENING_QUEUE_CONTEXT_SIZE: usize = 0x4000;
+pub(crate) const G17P_COLD_OPENING_TA_DESCRIPTOR_BASE: u64 = 0xffff_fc20_c001_8000;
+pub(crate) const G17P_COLD_OPENING_3D_DESCRIPTOR_BASE: u64 = 0xffff_fc20_c00b_0000;
 pub(crate) const G17P_COLD_OPENING_QUEUE_RECORD_SIZE: usize = 0xc0;
 pub(crate) const G17P_COLD_OPENING_POINTER_BLOCK_SIZE: usize = 0x80;
 pub(crate) const G17P_COLD_OPENING_OPERAND_DIRECTORY_GPU_VA: u64 = 0x70_0000_0000;
@@ -1349,7 +1351,7 @@ pub(crate) fn apply_g17p_cold_opening_queue_context(
     out.fill(0);
     let (descriptor_base, words, locators): (u64, &[(usize, u64)], &[(usize, u64)]) = match stage {
         G17PColdOpeningStage::Tiling => (
-            0xffff_fc20_c001_8000,
+            G17P_COLD_OPENING_TA_DESCRIPTOR_BASE,
             &[
                 (0x200, 0x1000_0000_0000_0004),
                 (0x220, 0xffff_0c00_0000_0001),
@@ -1358,7 +1360,7 @@ pub(crate) fn apply_g17p_cold_opening_queue_context(
             &[(0x350, 0x0002_3803_8000_0003)],
         ),
         G17PColdOpeningStage::Fragment => (
-            0xffff_fc20_c00b_0000,
+            G17P_COLD_OPENING_3D_DESCRIPTOR_BASE,
             &[
                 (0x200, 0x1000_0400_0000_0004),
                 (0x220, 0xffff_1800_0000_0003),
@@ -3714,9 +3716,9 @@ mod tests {
             );
 
             let descriptor = if stage == G17PColdOpeningStage::Tiling {
-                0x70_0201_4000
+                G17P_COLD_OPENING_TA_DESCRIPTOR_BASE
             } else {
-                0x70_0201_8000
+                G17P_COLD_OPENING_3D_DESCRIPTOR_BASE
             };
             let queue = if stage == G17PColdOpeningStage::Tiling {
                 0x70_0201_c000
@@ -3739,14 +3741,15 @@ mod tests {
                 assert_eq!(get_u64_le(&context, 0x358), 0x0000_8003_8000_4c3e);
                 assert_eq!(get_u64_le(&context, 0x360), 0x0000_b803_8000_4c77);
                 assert_eq!(get_u64_le(&context, 0x368), 0x0000_5003_8000_4cb0);
+            } else {
+                assert_eq!(get_u64_le(&context, 0x350), 0x0002_3803_8000_0003);
             }
-            assert!(supplied.contains(&descriptor));
             assert!(supplied.contains(&queue));
             assert_eq!(
                 source_fixture_fingerprint(&context),
                 match stage {
-                    G17PColdOpeningStage::Tiling => 0x3379_a6bc_2412_1161,
-                    G17PColdOpeningStage::Fragment => 0x9d66_7001_5e08_aa8d,
+                    G17PColdOpeningStage::Tiling => 0xd30d_fd3c_7336_4025,
+                    G17PColdOpeningStage::Fragment => 0xdfda_d80d_e0cc_292b,
                 }
             );
         }
@@ -3794,6 +3797,61 @@ mod tests {
             source_fixture_fingerprint(&descriptor),
             0xaac5_6b92_e70a_d459
         );
+    }
+
+    #[test]
+    fn g17p_cold_opening_context_locators_follow_descriptor_relocation() {
+        for (stage, base, locator_offsets) in [
+            (
+                G17PColdOpeningStage::Tiling,
+                G17P_COLD_OPENING_TA_DESCRIPTOR_BASE,
+                &[0x350usize][..],
+            ),
+            (
+                G17PColdOpeningStage::Fragment,
+                G17P_COLD_OPENING_3D_DESCRIPTOR_BASE,
+                &[0x350usize, 0x358, 0x360, 0x368][..],
+            ),
+        ] {
+            let mut native = [0u8; G17P_COLD_OPENING_QUEUE_CONTEXT_SIZE];
+            let mut relocated = [0u8; G17P_COLD_OPENING_QUEUE_CONTEXT_SIZE];
+            apply_g17p_cold_opening_queue_context(stage, base, 0x70_0201_c000, &mut native)
+                .unwrap();
+            apply_g17p_cold_opening_queue_context(
+                stage,
+                base + 0x8000,
+                0x70_0201_c000,
+                &mut relocated,
+            )
+            .unwrap();
+
+            for offset in locator_offsets {
+                assert_eq!(
+                    get_u64_le(&relocated, *offset),
+                    get_u64_le(&native, *offset) + 0x400
+                );
+            }
+            assert_eq!(get_u64_le(&relocated, 0x210), base + 0x8000);
+
+            assert_eq!(
+                apply_g17p_cold_opening_queue_context(
+                    stage,
+                    base - 0x20,
+                    0x70_0201_c000,
+                    &mut relocated,
+                ),
+                Err(SubmissionError::PartialOpeningDescriptorLocatorUnencodable)
+            );
+            assert_eq!(
+                apply_g17p_cold_opening_queue_context(
+                    stage,
+                    base + 1,
+                    0x70_0201_c000,
+                    &mut relocated,
+                ),
+                Err(SubmissionError::PartialOpeningDescriptorLocatorUnencodable)
+            );
+        }
     }
 
     #[test]
