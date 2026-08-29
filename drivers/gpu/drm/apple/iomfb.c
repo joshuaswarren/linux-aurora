@@ -490,12 +490,12 @@ static const struct dcp_method_entry dcp_link_temperature_hint = {
 
 static const struct dcp_method_entry dcp_link_pmu_service_matched = {
 	.name = "pmu_service_matched",
-	.tag = { 'A', '1', '3', '6' },
+	.tag = { 'A', '1', '3', '1' },
 };
 
 static const struct dcp_method_entry dcp_link_backlight_service_matched = {
 	.name = "backlight_service_matched",
-	.tag = { 'A', '1', '3', '7' },
+	.tag = { 'A', '1', '3', '2' },
 };
 
 enum dcp_link_service_match_bit {
@@ -503,7 +503,6 @@ enum dcp_link_service_match_bit {
 	DCP_LINK_SERVICE_MATCH_PMU,
 	DCP_LINK_SERVICE_MATCH_BACKLIGHT,
 	DCP_LINK_SERVICE_MATCH_INFLIGHT,
-	DCP_LINK_SERVICE_MATCH_CALLER_IDLE,
 };
 
 #define DCP_LINK_SERVICE_NOTIFY_RETRIES 512
@@ -522,9 +521,7 @@ static bool dcp_link_service_match_runnable(struct apple_dcp *dcp)
 		     &dcp->link_service_match_state))
 		return true;
 
-	return test_bit(DCP_LINK_SERVICE_MATCH_CALLER_IDLE,
-			&dcp->link_service_match_state) &&
-	       dcp_link_service_notifier_pending(dcp);
+	return dcp_link_service_notifier_pending(dcp);
 }
 
 static void dcp_link_service_match_done(struct apple_dcp *dcp)
@@ -638,15 +635,11 @@ static void dcp_link_service_match_work(struct work_struct *work)
 			       &dcp->link_service_match_state)) {
 		call = &dcp_link_temperature_hint;
 		complete = dcp_link_temperature_hint_complete;
-	} else if (test_bit(DCP_LINK_SERVICE_MATCH_CALLER_IDLE,
-			    &dcp->link_service_match_state) &&
-		   test_and_clear_bit(DCP_LINK_SERVICE_MATCH_PMU,
+	} else if (test_and_clear_bit(DCP_LINK_SERVICE_MATCH_PMU,
 				      &dcp->link_service_match_state)) {
 		call = &dcp_link_pmu_service_matched;
 		complete = dcp_link_service_match_complete;
-	} else if (test_bit(DCP_LINK_SERVICE_MATCH_CALLER_IDLE,
-			    &dcp->link_service_match_state) &&
-		   test_and_clear_bit(DCP_LINK_SERVICE_MATCH_BACKLIGHT,
+	} else if (test_and_clear_bit(DCP_LINK_SERVICE_MATCH_BACKLIGHT,
 				      &dcp->link_service_match_state)) {
 		call = &dcp_link_backlight_service_matched;
 		complete = dcp_link_service_match_complete;
@@ -686,10 +679,7 @@ static void dcp_link_queue_service_match(struct apple_dcp *dcp, int tag)
 	else
 		return;
 
-	if (tag == 100 ||
-	    test_bit(DCP_LINK_SERVICE_MATCH_CALLER_IDLE,
-		     &dcp->link_service_match_state))
-		schedule_work(&dcp->link_service_match_work);
+	schedule_work(&dcp->link_service_match_work);
 }
 
 bool dcp_link_defer_service_match(struct apple_dcp *dcp, int tag, void *out,
@@ -822,10 +812,8 @@ static void dcp_link_handle_reply(struct apple_dcp *dcp, u64 message)
 	ch->link_message[depth] = 0;
 	ch->link_size[depth] = 0;
 	if (request_call == APPLE_DCP_H17P_CALL_START_SIGNAL) {
-		set_bit(DCP_LINK_SERVICE_MATCH_CALLER_IDLE,
-			&dcp->link_service_match_state);
 		dev_info(dcp->dev,
-			 "DCPLink A401 reply released caller gate: endpoint %#x request %#llx reply %#llx stream %u remote %u\n",
+			 "DCPLink A401 reply: endpoint %#x request %#llx reply %#llx stream %u remote %u\n",
 			 APPLE_DCP_LINK_ENDPOINT, request, message, stream, remote);
 		if (dcp_link_service_notifier_pending(dcp))
 			schedule_work(&dcp->link_service_match_work);
@@ -972,7 +960,7 @@ static void dcp_link_handle_callback(struct apple_dcp *dcp, u64 message)
 				 sequence, tag, reply, ack_ret);
 		if (!ack_ret && (tag == 206 || tag == 207)) {
 			dev_info(dcp->dev,
-				 "DCPLink D%03d ACKed; H17P service notifier queued behind A401 caller gate\n",
+				 "DCPLink D%03d ACKed; H17P service notifier queued\n",
 				 tag);
 			dcp_link_queue_service_match(dcp, tag);
 		}

@@ -36,8 +36,8 @@ static const struct dcp_method_entry dcp_methods[dcpep_num_methods] = {
 	IOMFB_METHOD("A024", dcpep_setup_video_limits),
 	IOMFB_METHOD("A389", dcpep_set_create_dfb),
 	IOMFB_METHOD("A386", iomfbep_a358_vi_set_temperature_hint),
-	IOMFB_METHOD("A136", iomfbep_a131_pmu_service_matched),
-	IOMFB_METHOD("A137", iomfbep_a132_backlight_service_matched),
+	IOMFB_METHOD("A131", iomfbep_a131_pmu_service_matched),
+	IOMFB_METHOD("A132", iomfbep_a132_backlight_service_matched),
 	IOMFB_METHOD("A401", dcpep_start_signal),
 	IOMFB_METHOD("A406", dcpep_swap_start),
 	IOMFB_METHOD("A407", dcpep_swap_submit),
@@ -150,7 +150,7 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[2] = trampoline_nop, /* will_power_off_signal */
 	[3] = trampoline_rt_bandwidth_h17p,
 	[6] = trampoline_set_frame_sync_props,
-	[100] = trampoline_nop, /* match_pmu_service */
+	[100] = dcp_link_defer_service_match, /* match_pmu_service */
 	[101] = trampoline_zero, /* get_display_default_stride */
 	[102] = trampoline_nop, /* set_number_property */
 	[103] = trampoline_nop, /* trigger_user_cal_loader */
@@ -163,16 +163,23 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	/* fw26.6 creates the backlight service through its later service path. */
 	[112] = trampoline_false, /* create_backlight_service */
 	[113] = trampoline_true, /* create_nvram_service */
-	[114] = trampoline_get_tiling_state,
-	[115] = trampoline_false, /* set_tiling_state */
-	[120] = dcpep_cb_boot_1,
-	[121] = trampoline_false, /* is_dark_boot */
-	[122] = trampoline_false, /* is_waking_from_hibernate */
-	[124] = trampoline_read_edt_data,
-	[126] = trampoline_prop_start,
-	[127] = trampoline_prop_chunk,
-	[128] = trampoline_prop_end,
-	[129] = trampoline_allocate_bandwidth,
+	[114] = trampoline_core_analytics_h17p,
+	[115] = trampoline_get_tiling_state,
+	[116] = trampoline_false, /* set_tiling_state */
+	[117] = trampoline_nop, /* set_idle_caching_state_ap */
+	[118] = trampoline_zero, /* upload_trace_start */
+	[119] = trampoline_zero, /* upload_trace_chunk */
+	[120] = trampoline_zero, /* upload_trace_end */
+	[121] = dcpep_cb_boot_1,
+	[122] = trampoline_false, /* is_dark_boot */
+	[123] = trampoline_false, /* is_waking_from_hibernate */
+	[124] = trampoline_zero, /* detect_fastsim */
+	[125] = trampoline_read_edt_data,
+	[126] = trampoline_read_edt_string_h17p,
+	[127] = trampoline_prop_start,
+	[128] = trampoline_prop_chunk,
+	[129] = trampoline_prop_end,
+	[130] = trampoline_allocate_bandwidth,
 	[201] = trampoline_map_piodma,
 	[202] = trampoline_unmap_piodma,
 	[206] = dcp_link_defer_service_match, /* match_pmu_service_2 */
