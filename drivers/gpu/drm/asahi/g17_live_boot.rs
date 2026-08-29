@@ -24,7 +24,6 @@
 use core::sync::atomic::{fence, AtomicBool, AtomicU32, Ordering};
 
 use kernel::macros::vtable;
-use kernel::new_mutex;
 use kernel::{
     device::Core,
     iosys_map::IoSysMapRef,
@@ -34,7 +33,7 @@ use kernel::{
         mailbox::{AscwrapV6Lifecycle, AscwrapV6Provider, AscwrapV6Role},
         rtkit,
     },
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{delay::fsleep, Delta},
 };
 #[cfg(CONFIG_DEV_COREDUMP)]
@@ -178,28 +177,26 @@ impl G17PTestStage {
 struct G17PRoleRtkitState {
     dev: ARef<AsahiDevice>,
     processor: G17PProcessor,
-    retained_crash_vm: mmu::Vm,
-    crash_vm: Arc<Mutex<mmu::Vm>>,
+    firmware_crash_root: Option<mmu::FirmwarePageTableRoot>,
     acked: AtomicBool,
     crashed: AtomicBool,
     runtime_events: AtomicU32,
 }
 
 impl G17PRoleRtkitState {
-    fn new(dev: ARef<AsahiDevice>, processor: G17PProcessor, crash_vm: mmu::Vm) -> Result<Self> {
-        Ok(Self {
+    fn new(
+        dev: ARef<AsahiDevice>,
+        processor: G17PProcessor,
+        firmware_crash_root: Option<mmu::FirmwarePageTableRoot>,
+    ) -> Self {
+        Self {
             dev,
             processor,
-            retained_crash_vm: crash_vm.clone(),
-            crash_vm: Arc::pin_init(new_mutex!(crash_vm, "G17P crash VM"), GFP_KERNEL)?,
+            firmware_crash_root,
             acked: AtomicBool::new(false),
             crashed: AtomicBool::new(false),
             runtime_events: AtomicU32::new(0),
-        })
-    }
-
-    fn set_crash_vm(&self, vm: mmu::Vm) {
-        *self.crash_vm.lock() = vm;
+        }
     }
 }
 
@@ -235,10 +232,20 @@ fn capture_g17p_firmware_crash_dva(state: &G17PRoleRtkitState) -> Result {
     // AGXASC reads endpoint-1 buffers through UAT context 0 after masking
     // the RTKit envelope DVA to 40 bits. The active render VM is context 1
     // and cannot own this firmware-preallocated buffer.
-    let crashlog = state.retained_crash_vm.copy_firmware_range(
+    let crashlog = state
+        .firmware_crash_root
+        .ok_or(EFAULT)?
+        .copy_firmware_range(
+            g17p_rtkit_uat_address(buffer.dva),
+            captured_size,
+        )?;
+    dev_info!(
+        state.dev.as_ref(),
+        "G17P {} crashlog copied from boot context-0 VA {:#x} ({} bytes)\n",
+        state.processor.name(),
         g17p_rtkit_uat_address(buffer.dva),
-        captured_size,
-    )?;
+        crashlog.len()
+    );
     publish_g17p_crashlog(state, buffer.size, &crashlog)
 }
 
@@ -477,9 +484,7 @@ fn finish_boot_session(
 
     // Build the render VM and bind context 1 while both inner groups and both
     // outer producers remain zero. This is the measured pre-0x84 state.
-    let crash_vm = manager.stage_compute_bootstrap_render(drm)?;
-    gfx_state.set_crash_vm(crash_vm.clone());
-    gfx1_state.set_crash_vm(crash_vm);
+    manager.stage_compute_bootstrap_render(drm)?;
     dev_info!(
         pdev.as_ref(),
         "G17P compute control: startup render graph ready with inner groups held\n"
@@ -516,9 +521,6 @@ fn finish_boot_session(
         "G17P compute control: channel-8 startup work sent\n"
     );
     manager.wait_compute_bootstrap_render_retirement()?;
-    let retained_crash_vm = manager.uat().kernel_lower_vm().clone();
-    gfx_state.set_crash_vm(retained_crash_vm.clone());
-    gfx1_state.set_crash_vm(retained_crash_vm);
     if gfx_state.crashed.load(Ordering::Acquire) || gfx1_state.crashed.load(Ordering::Acquire) {
         return Err(EIO);
     }
@@ -637,16 +639,13 @@ fn boot_session(
     }
     dev_info!(pdev.as_ref(), "G17P session: providers ready\n");
 
-    // T8140 publishes the same retained lower root in context slots 0 and 1.
-    // Firmware adds its endpoint-1 crash pages to that root after RTKit start,
-    // so a retained clone is sufficient to walk and snapshot either DVA.
-    let crash_vm = manager.uat().kernel_lower_vm().clone();
+    let firmware_crash_root = manager.uat().firmware_context0_root();
     let gfx_state = Arc::new(
-        G17PRoleRtkitState::new(drm.clone(), G17PProcessor::Gfx, crash_vm.clone())?,
+        G17PRoleRtkitState::new(drm.clone(), G17PProcessor::Gfx, firmware_crash_root),
         GFP_KERNEL,
     )?;
     let gfx1_state = Arc::new(
-        G17PRoleRtkitState::new(drm.clone(), G17PProcessor::Gfx1, crash_vm)?,
+        G17PRoleRtkitState::new(drm.clone(), G17PProcessor::Gfx1, firmware_crash_root),
         GFP_KERNEL,
     )?;
     let mut gfx_rtkit =
@@ -726,13 +725,13 @@ fn boot_initial_session(
     dev_info!(pdev.as_ref(), "G17P session: providers ready\n");
 
     let mut uat = Some(KBox::new(mmu::Uat::new_t8140(drm, true)?, GFP_KERNEL)?);
-    let crash_vm = uat.as_ref().ok_or(EIO)?.kernel_lower_vm().clone();
+    let firmware_crash_root = uat.as_ref().ok_or(EIO)?.firmware_context0_root();
     let gfx_state = Arc::new(
-        G17PRoleRtkitState::new(drm.clone(), G17PProcessor::Gfx, crash_vm.clone())?,
+        G17PRoleRtkitState::new(drm.clone(), G17PProcessor::Gfx, firmware_crash_root),
         GFP_KERNEL,
     )?;
     let gfx1_state = Arc::new(
-        G17PRoleRtkitState::new(drm.clone(), G17PProcessor::Gfx1, crash_vm)?,
+        G17PRoleRtkitState::new(drm.clone(), G17PProcessor::Gfx1, firmware_crash_root),
         GFP_KERNEL,
     )?;
     let mut gfx_rtkit =

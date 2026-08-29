@@ -276,6 +276,7 @@ pub(crate) struct DumpedPage {
 pub(crate) struct UatPageTable {
     ttb: PhysicalAddr,
     ttb_owned: bool,
+    teardown_children: bool,
     va_range: Range<u64>,
     geometry: UatGeometry,
     oas_mask: u64,
@@ -290,6 +291,7 @@ impl UatPageTable {
         Ok(UatPageTable {
             ttb,
             ttb_owned: true,
+            teardown_children: true,
             va_range: 0..geometry.root_size(),
             geometry,
             oas_mask: (1u64 << oas) - 1,
@@ -328,10 +330,28 @@ impl UatPageTable {
         Ok(UatPageTable {
             ttb,
             ttb_owned: false,
+            teardown_children: true,
             va_range,
             geometry,
             oas_mask: (1u64 << oas) - 1,
         })
+    }
+
+    /// Borrow an externally-owned page-table tree for read-only diagnostics.
+    ///
+    /// The tree and all of its child pages remain owned by the boot firmware.
+    /// Dropping this view therefore must not reclaim either the root or its
+    /// descendants.
+    #[cfg(CONFIG_DEV_COREDUMP)]
+    pub(crate) fn new_borrowed_reader(
+        ttb: PhysicalAddr,
+        va_range: Range<u64>,
+        ias: u8,
+        oas: u32,
+    ) -> Result<Self> {
+        let mut table = Self::new_with_ttb(ttb, va_range, ias, oas)?;
+        table.teardown_children = false;
+        Ok(table)
     }
 
     pub(crate) fn ttb(&self) -> PhysicalAddr {
@@ -804,19 +824,20 @@ impl UatPageTable {
 impl Drop for UatPageTable {
     fn drop(&mut self) {
         mod_pr_debug!("UATPageTable::drop range: {:#x?}\n", &self.va_range);
-        if self
-            .with_pages(self.va_range.clone(), false, true, |iova, ptes| {
-                for (idx, pte) in ptes.iter().enumerate() {
-                    if pte.load(Ordering::Relaxed) != 0 {
-                        pr_err!(
-                            "UATPageTable::drop: Leaked page at IOVA {:#x}\n",
-                            iova + (idx * UAT_PGSZ) as u64
-                        );
+        if self.teardown_children
+            && self
+                .with_pages(self.va_range.clone(), false, true, |iova, ptes| {
+                    for (idx, pte) in ptes.iter().enumerate() {
+                        if pte.load(Ordering::Relaxed) != 0 {
+                            pr_err!(
+                                "UATPageTable::drop: Leaked page at IOVA {:#x}\n",
+                                iova + (idx * UAT_PGSZ) as u64
+                            );
+                        }
                     }
-                }
-                Ok(())
-            })
-            .is_err()
+                    Ok(())
+                })
+                .is_err()
         {
             pr_err!("UATPageTable::drop failed to free page tables\n",);
         }
