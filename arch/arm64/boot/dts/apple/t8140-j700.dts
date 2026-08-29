@@ -227,6 +227,19 @@
 	};
 };
 
+&smc_mbox {
+	status = "okay";
+};
+
+&smc {
+	status = "okay";
+
+	/* T8140 has no described SMC NVMEM provider; restart does not need it. */
+	reboot {
+		compatible = "apple,smc-reboot";
+	};
+};
+
 /*
  * Keep the fixed VL122 out of reset for the complete Linux lifetime.  Its I2C
  * plane NACKs while the USB core is running, so only configure and open the
