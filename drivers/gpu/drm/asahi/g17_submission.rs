@@ -348,7 +348,7 @@ pub(crate) const G17P_FIRST_BIND_COMMAND_PLAN: G17PFirstBindCommandPlan =
     };
 
 /// Compile-time release gate consumed by the live first-add3 boundary. Keep
-/// True only because the host-only correlation token, tag-15/tag-16 pointer
+/// true only because the host-only correlation token, tag-15/tag-16 pointer
 /// publisher, and FlushID fallback are all represented for this profile.
 pub(crate) const G17P_FIRST_BIND_DIRECT_HARDWARE_RELEASE_READY: bool =
     G17P_FIRST_BIND_COMMAND_PLAN.hardware_release_ready();
@@ -2449,13 +2449,13 @@ pub(crate) const G17P_CL_KICK_PUBLICATION_ORDER: [G17PClKickPublicationStep; 7] 
 pub(crate) enum G17PFirstSubmitPublicationStep {
     PublishB2,
     StageRuntimeTick,
-    RecordHostCorrelationToken,
     PublishConfigUpdatePointer,
     ZeroSksmStride,
     WriteSksmEntry,
     EntryBarrier,
     PublishSksmProducer,
     AdvanceDescriptorGeneration,
+    RecordHostCorrelationToken,
     PublishEntrySignalPointer,
     AddKicks,
     PublishCl2,
@@ -2467,13 +2467,13 @@ pub(crate) enum G17PFirstSubmitPublicationStep {
 pub(crate) const G17P_FIRST_SUBMIT_PUBLICATION_ORDER: [G17PFirstSubmitPublicationStep; 15] = [
     G17PFirstSubmitPublicationStep::PublishB2,
     G17PFirstSubmitPublicationStep::StageRuntimeTick,
-    G17PFirstSubmitPublicationStep::RecordHostCorrelationToken,
     G17PFirstSubmitPublicationStep::PublishConfigUpdatePointer,
     G17PFirstSubmitPublicationStep::ZeroSksmStride,
     G17PFirstSubmitPublicationStep::WriteSksmEntry,
     G17PFirstSubmitPublicationStep::EntryBarrier,
     G17PFirstSubmitPublicationStep::PublishSksmProducer,
     G17PFirstSubmitPublicationStep::AdvanceDescriptorGeneration,
+    G17PFirstSubmitPublicationStep::RecordHostCorrelationToken,
     G17PFirstSubmitPublicationStep::PublishEntrySignalPointer,
     G17PFirstSubmitPublicationStep::AddKicks,
     G17PFirstSubmitPublicationStep::PublishCl2,
@@ -5109,13 +5109,13 @@ mod tests {
             [
                 G17PFirstSubmitPublicationStep::PublishB2,
                 G17PFirstSubmitPublicationStep::StageRuntimeTick,
-                G17PFirstSubmitPublicationStep::RecordHostCorrelationToken,
                 G17PFirstSubmitPublicationStep::PublishConfigUpdatePointer,
                 G17PFirstSubmitPublicationStep::ZeroSksmStride,
                 G17PFirstSubmitPublicationStep::WriteSksmEntry,
                 G17PFirstSubmitPublicationStep::EntryBarrier,
                 G17PFirstSubmitPublicationStep::PublishSksmProducer,
                 G17PFirstSubmitPublicationStep::AdvanceDescriptorGeneration,
+                G17PFirstSubmitPublicationStep::RecordHostCorrelationToken,
                 G17PFirstSubmitPublicationStep::PublishEntrySignalPointer,
                 G17PFirstSubmitPublicationStep::AddKicks,
                 G17PFirstSubmitPublicationStep::PublishCl2,
