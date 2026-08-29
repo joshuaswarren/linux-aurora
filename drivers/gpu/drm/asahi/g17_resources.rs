@@ -435,13 +435,18 @@ pub(crate) struct G17PControlCounters {
 
 impl G17PControlCounters {
     pub(crate) fn opening_staged(self) -> bool {
-        self.primary == [g17_initdata::CONTROL_OPENING_PRIMARY_PRODUCER; 3]
+        self.primary == [0, 0, g17_initdata::CONTROL_OPENING_PRIMARY_PRODUCER]
             && self.secondary
                 == [0, 0, g17_initdata::CONTROL_OPENING_SECONDARY_PRODUCER]
     }
 
     pub(crate) fn opening_retired(self) -> bool {
         self.primary == [g17_initdata::CONTROL_OPENING_PRIMARY_PRODUCER; 3]
+            && self.secondary == [g17_initdata::CONTROL_OPENING_SECONDARY_PRODUCER; 3]
+    }
+
+    pub(crate) fn compute_checkpoint_installed(self) -> bool {
+        self.primary == [g17_initdata::COMPUTE_CONTROL_CHECKPOINT_COUNTER; 3]
             && self.secondary == [g17_initdata::CONTROL_OPENING_SECONDARY_PRODUCER; 3]
     }
 }
@@ -2968,12 +2973,11 @@ impl G17ResourceOwner {
             &primary_region_views,
         )?;
         roots.write_roots(&shared, &primary_instance, &secondary_instance)?;
-        // Publish counters after both rings and the rest of the descriptor
-        // graph. Equal primary cursors mark the 67 historical records as
-        // completed; only the secondary producer has pending opening work.
+        // Publish both opening producers after the rings and descriptor graph.
+        // Firmware owns the two consumer cursors until CONTROL_START.
         write_control_counters(
             &mut primary_state,
-            [g17_initdata::CONTROL_OPENING_PRIMARY_PRODUCER; 3],
+            [0, 0, g17_initdata::CONTROL_OPENING_PRIMARY_PRODUCER],
         )?;
         write_control_counters(
             &mut secondary_state,
@@ -3036,6 +3040,47 @@ impl G17ResourceOwner {
             self.handoff.secondary.state_grid,
         )?;
         Ok(G17PControlCounters { primary, secondary })
+    }
+
+    /// Replace the idle primary control ring with the completed compute
+    /// history after the ordinary dual-processor opening has retired.
+    pub(crate) fn install_compute_control_checkpoint(
+        &mut self,
+    ) -> Result<G17PControlCounters> {
+        let before = self.control_counters()?;
+        if !before.opening_retired() {
+            return Err(EINVAL);
+        }
+        let channels = g17_initdata::derive_channel_table(
+            InstanceRole::Primary,
+            self.handoff.primary.state_grid,
+            self.handoff.primary.instance.status_a,
+            self.handoff.primary.instance.main_config,
+            self.handoff.shared.hw_data_bundle,
+        );
+        let ring = channels[g17_initdata::CONTROL_CHANNEL_INDEX].ring;
+        let offset: usize = ring
+            .checked_sub(self.resources.shared_cluster.iova())
+            .ok_or(EINVAL)?
+            .try_into()?;
+        let end = offset
+            .checked_add(g17_initdata::COMPUTE_CONTROL_CHECKPOINT_SIZE)
+            .ok_or(EINVAL)?;
+        self.resources.shared_cluster.with_bytes_mut(|bytes| {
+            let checkpoint = bytes.get_mut(offset..end).ok_or(EINVAL)?;
+            g17_initdata::encode_compute_control_checkpoint(checkpoint).map_err(|_| EINVAL)
+        })?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        write_control_counters(
+            &mut self.resources.primary_state,
+            [g17_initdata::COMPUTE_CONTROL_CHECKPOINT_COUNTER; 3],
+        )?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        let after = self.control_counters()?;
+        if !after.compute_checkpoint_installed() {
+            return Err(EIO);
+        }
+        Ok(after)
     }
 
     /// Rebuild firmware-owned session state after both processors stop.
@@ -3205,7 +3250,7 @@ impl G17ResourceOwner {
             .write_roots(&shared, &primary.instance, &secondary.instance)?;
         write_control_counters(
             &mut self.resources.primary_state,
-            [g17_initdata::CONTROL_OPENING_PRIMARY_PRODUCER; 3],
+            [0, 0, g17_initdata::CONTROL_OPENING_PRIMARY_PRODUCER],
         )?;
         write_control_counters(
             &mut self.resources.secondary_state,
@@ -4200,14 +4245,14 @@ mod tests {
     #[test]
     fn control_opening_requires_all_six_exact_counter_values() {
         let staged = G17PControlCounters {
-            primary: [67, 67, 67],
+            primary: [0, 0, 4],
             secondary: [0, 0, 16],
         };
         assert!(staged.opening_staged());
         assert!(!staged.opening_retired());
 
         let retired = G17PControlCounters {
-            primary: [67, 67, 67],
+            primary: [4, 4, 4],
             secondary: [16, 16, 16],
         };
         assert!(retired.opening_retired());
@@ -4223,6 +4268,14 @@ mod tests {
             current.secondary[secondary_index] -= 1;
             assert!(!current.opening_retired());
         }
+
+        let checkpoint = G17PControlCounters {
+            primary: [67, 67, 67],
+            secondary: [16, 16, 16],
+        };
+        assert!(checkpoint.compute_checkpoint_installed());
+        assert!(!checkpoint.opening_staged());
+        assert!(!checkpoint.opening_retired());
     }
 
     fn valid_handoff() -> G17ResourceHandoff {
