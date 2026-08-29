@@ -165,6 +165,10 @@ pub(crate) enum HandoffMode {
 const T8140_SECONDARY_SHARED_ROOT_DELTA: u64 = 0x40000;
 const T8140_FIRMWARE_PRIVATE_ROOT_ENTRIES: usize = 2;
 const T8140_FIRMWARE_SHARED_ROOT_ENTRIES: usize = 3;
+const T8140_FIRMWARE_CRASH_BUFFERS: [Range<u64>; 2] = [
+    0x01e1_c000..0x01e2_4000,
+    0x01f5_0000..0x01f5_8000,
+];
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct T8140PrimaryRootSnapshot {
@@ -1195,6 +1199,7 @@ pub(crate) struct Uat {
 
     kernel_vm: Vm,
     kernel_lower_vm: Vm,
+    _t8140_firmware_crash_buffers: Option<[KernelMapping; 2]>,
     t8140_secondary_ttb1: Option<u64>,
     t8140_empty_high_roots: Option<[Vm; 2]>,
     t8140_context_phase: AtomicU8,
@@ -2448,12 +2453,52 @@ impl Uat {
     /// [`hw::HwConfig`].
     #[inline(never)]
     pub(crate) fn new_t8140(dev: &driver::AsahiDevice, map_kernel_to_user: bool) -> Result<Self> {
-        Self::new_with_config(
+        let mut uat = Self::new_with_config(
             dev,
             UatConfig::T8140,
             map_kernel_to_user,
             HandoffMode::AbsentStandinT8140,
-        )
+        )?;
+        uat.install_t8140_firmware_crash_buffers(dev)?;
+        Ok(uat)
+    }
+
+    /// Back the two nonzero EP1 crash-buffer requests before either firmware
+    /// processor starts. m1n1 treats these DVAs as preallocated context-0
+    /// mappings and only echoes the request; Linux must provide the same
+    /// mapping rather than assuming firmware creates it.
+    fn install_t8140_firmware_crash_buffers(&mut self, dev: &driver::AsahiDevice) -> Result {
+        if self.cfg != UatConfig::T8140 || self._t8140_firmware_crash_buffers.is_some() {
+            return Err(EINVAL);
+        }
+        let map = |range: &Range<u64>| -> Result<KernelMapping> {
+            let size_u64 = range.end.checked_sub(range.start).ok_or(EINVAL)?;
+            let size: usize = size_u64.try_into()?;
+            let mut object = gem::new_kernel_object_wc(dev, size)?;
+            object.vmap()?.memset(0);
+            let mapping = object.map_at(
+                &self.kernel_lower_vm,
+                range.start,
+                PROT_FW_SHARED_RW,
+                false,
+            )?;
+            if mapping.iova_range() != *range
+                || !self
+                    .kernel_lower_vm
+                    .covers_range(range.start, size_u64, false, true)
+            {
+                return Err(EFAULT);
+            }
+            Ok(mapping)
+        };
+        let gfx = map(&T8140_FIRMWARE_CRASH_BUFFERS[0])?;
+        let gfx1 = map(&T8140_FIRMWARE_CRASH_BUFFERS[1])?;
+        self._t8140_firmware_crash_buffers = Some([gfx, gfx1]);
+        dev_info!(
+            dev.as_ref(),
+            "MMU: mapped GFX/GFX1 firmware crash buffers in context 0\n"
+        );
+        Ok(())
     }
 
     /// Creates a new `Uat` instance with an explicit handoff mode.
@@ -2584,6 +2629,7 @@ impl Uat {
             cfg,
             kernel_vm,
             kernel_lower_vm,
+            _t8140_firmware_crash_buffers: None,
             t8140_secondary_ttb1: if cfg == UatConfig::T8140 {
                 Some(ttb1 + T8140_SECONDARY_SHARED_ROOT_DELTA)
             } else {
@@ -2707,5 +2753,16 @@ mod tests {
         assert_eq!(decode_firmware_ttb_root(raw, cfg), Some(root));
         assert_eq!(decode_firmware_ttb_root(raw & !TTBR_VALID, cfg), None);
         assert_eq!(decode_firmware_ttb_root(TTBR_VALID, cfg), None);
+    }
+
+    #[test]
+    fn t8140_crash_buffers_match_the_two_rtkit_requests() {
+        assert_eq!(T8140_FIRMWARE_CRASH_BUFFERS[0], 0x01e1_c000..0x01e2_4000);
+        assert_eq!(T8140_FIRMWARE_CRASH_BUFFERS[1], 0x01f5_0000..0x01f5_8000);
+        for range in T8140_FIRMWARE_CRASH_BUFFERS {
+            assert_eq!(range.len(), 0x8000);
+            assert_eq!((range.start | range.end) & UAT_PGMSK as u64, 0);
+        }
+        assert!(T8140_FIRMWARE_CRASH_BUFFERS[0].end <= T8140_FIRMWARE_CRASH_BUFFERS[1].start);
     }
 }
