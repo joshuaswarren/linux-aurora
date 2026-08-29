@@ -169,6 +169,7 @@ const T8140_FIRMWARE_CRASH_BUFFERS: [Range<u64>; 2] = [
     0x01e1_c000..0x01e2_4000,
     0x01f5_0000..0x01f5_8000,
 ];
+const T8140_FIRMWARE_CRASH_SENTINELS: [u8; 2] = [0xa5, 0x5a];
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct T8140PrimaryRootSnapshot {
@@ -218,6 +219,7 @@ impl FirmwarePageTableRoot {
 pub(crate) struct FirmwareContextTableReader {
     inner: Arc<UatInner>,
     cfg: UatConfig,
+    t8140_crash_buffers: Option<[ARef<gem::Object>; 2]>,
 }
 
 impl Clone for FirmwareContextTableReader {
@@ -225,6 +227,9 @@ impl Clone for FirmwareContextTableReader {
         Self {
             inner: self.inner.clone(),
             cfg: self.cfg,
+            t8140_crash_buffers: self.t8140_crash_buffers.as_ref().map(|buffers| {
+                [buffers[0].clone(), buffers[1].clone()]
+            }),
         }
     }
 }
@@ -241,6 +246,38 @@ impl FirmwareContextTableReader {
 
     pub(crate) fn context0_root(&self) -> Option<FirmwarePageTableRoot> {
         self.context_root(0)
+    }
+
+    /// Copy one T8140 crash buffer through the retained WC CPU alias. This is
+    /// distinct from the raw physical walker used to diagnose the live UAT:
+    /// the latter maps pages WB and can hide device writes behind a conflicting
+    /// WC alias.
+    #[cfg(CONFIG_DEV_COREDUMP)]
+    pub(crate) fn copy_t8140_crash_buffer(
+        &self,
+        index: usize,
+        size: usize,
+    ) -> Result<(KVVec<u8>, u8)> {
+        let buffers = self.t8140_crash_buffers.as_ref().ok_or(ENOENT)?;
+        let object = buffers.get(index).ok_or(EINVAL)?;
+        if size == 0 || size > object.size() {
+            return Err(ERANGE);
+        }
+
+        // The crash notification is ordered after firmware's payload stores.
+        // Complete the device/CPU visibility boundary before reading the WC
+        // alias that was used to create the firmware mapping.
+        mem::sync();
+        fence(Ordering::Acquire);
+        let vmap = object.vmap::<u8>()?;
+        let bytes = unsafe {
+            // SAFETY: the VMap covers the complete retained GEM allocation and
+            // `size` was checked against that allocation above.
+            core::slice::from_raw_parts(vmap.as_ptr(), size)
+        };
+        let mut data = KVVec::new();
+        data.extend_from_slice(bytes, GFP_ATOMIC)?;
+        Ok((data, T8140_FIRMWARE_CRASH_SENTINELS[index]))
     }
 }
 
@@ -1200,6 +1237,7 @@ pub(crate) struct Uat {
     kernel_vm: Vm,
     kernel_lower_vm: Vm,
     _t8140_firmware_crash_buffers: Option<[KernelMapping; 2]>,
+    t8140_firmware_crash_gems: Option<[ARef<gem::Object>; 2]>,
     t8140_secondary_ttb1: Option<u64>,
     t8140_empty_high_roots: Option<[Vm; 2]>,
     t8140_context_phase: AtomicU8,
@@ -1943,6 +1981,9 @@ impl Uat {
         FirmwareContextTableReader {
             inner: self.inner.clone(),
             cfg: self.cfg,
+            t8140_crash_buffers: self.t8140_firmware_crash_gems.as_ref().map(|buffers| {
+                [buffers[0].clone(), buffers[1].clone()]
+            }),
         }
     }
 
@@ -2475,7 +2516,10 @@ impl Uat {
             );
             return Err(EINVAL);
         }
-        let map = |name: &str, range: &Range<u64>| -> Result<KernelMapping> {
+        let map = |name: &str,
+                   range: &Range<u64>,
+                   sentinel: u8|
+         -> Result<(KernelMapping, ARef<gem::Object>)> {
             let size_u64 = range.end.checked_sub(range.start).ok_or(EINVAL)?;
             let size: usize = size_u64.try_into()?;
             let mut object = match gem::new_kernel_object_wc(dev, size) {
@@ -2506,8 +2550,9 @@ impl Uat {
                     return Err(err);
                 }
             };
-            vmap.memset(0);
+            vmap.memset(sentinel as i32);
             core::mem::drop(vmap);
+            let retained_gem = object.gem.clone();
             let mapping = match object.map_at(
                 &self.kernel_lower_vm,
                 range.start,
@@ -2560,11 +2605,20 @@ impl Uat {
                 range.start,
                 size
             );
-            Ok(mapping)
+            Ok((mapping, retained_gem))
         };
-        let gfx = map("GFX", &T8140_FIRMWARE_CRASH_BUFFERS[0])?;
-        let gfx1 = map("GFX1", &T8140_FIRMWARE_CRASH_BUFFERS[1])?;
+        let (gfx, gfx_gem) = map(
+            "GFX",
+            &T8140_FIRMWARE_CRASH_BUFFERS[0],
+            T8140_FIRMWARE_CRASH_SENTINELS[0],
+        )?;
+        let (gfx1, gfx1_gem) = map(
+            "GFX1",
+            &T8140_FIRMWARE_CRASH_BUFFERS[1],
+            T8140_FIRMWARE_CRASH_SENTINELS[1],
+        )?;
         self._t8140_firmware_crash_buffers = Some([gfx, gfx1]);
+        self.t8140_firmware_crash_gems = Some([gfx_gem, gfx1_gem]);
         Ok(())
     }
 
@@ -2697,6 +2751,7 @@ impl Uat {
             kernel_vm,
             kernel_lower_vm,
             _t8140_firmware_crash_buffers: None,
+            t8140_firmware_crash_gems: None,
             t8140_secondary_ttb1: if cfg == UatConfig::T8140 {
                 Some(ttb1 + T8140_SECONDARY_SHARED_ROOT_DELTA)
             } else {
@@ -2833,5 +2888,11 @@ mod tests {
         assert!(T8140_FIRMWARE_CRASH_BUFFERS[0].end <= T8140_FIRMWARE_CRASH_BUFFERS[1].start);
         assert!(PROT_FW_SHARED_RW.allows_gpu(false, false));
         assert!(!PROT_FW_SHARED_RW.allows_gpu(false, true));
+        assert_ne!(T8140_FIRMWARE_CRASH_SENTINELS[0], 0);
+        assert_ne!(T8140_FIRMWARE_CRASH_SENTINELS[1], 0);
+        assert_ne!(
+            T8140_FIRMWARE_CRASH_SENTINELS[0],
+            T8140_FIRMWARE_CRASH_SENTINELS[1]
+        );
     }
 }
