@@ -1250,7 +1250,7 @@ impl G17PComputeDescriptorStorage {
                 .map(|_| ())
                 .map_err(|_| EINVAL)
         })?;
-        let queue_context_low = MappedObject::new_in_range(
+        let queue_context_low = MappedObject::new_wc_in_range(
             dev,
             uat.kernel_lower_vm(),
             G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END,
@@ -1258,7 +1258,7 @@ impl G17PComputeDescriptorStorage {
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
-        let queue_context_high = MappedObject::new(
+        let queue_context_high = MappedObject::new_wc(
             dev,
             uat,
             g17_compute::COMPUTE_QUEUE_CONTEXT_EXTENT,
