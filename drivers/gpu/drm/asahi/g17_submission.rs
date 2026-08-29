@@ -1865,6 +1865,7 @@ pub(crate) struct G17PClKickQueueStateLayout {
     pub(crate) completion_selector: usize,
     pub(crate) submitted: usize,
     pub(crate) current_timestamp: usize,
+    pub(crate) last_add_kicks_timestamp: usize,
     pub(crate) entry_cpu_base: usize,
     pub(crate) entry_gpu_base: usize,
     pub(crate) base_timestamp: usize,
@@ -1880,6 +1881,7 @@ pub(crate) const G17P_CL_KICK_QUEUE_STATE_LAYOUT: G17PClKickQueueStateLayout =
         completion_selector: 0x1c,
         submitted: 0x44,
         current_timestamp: 0x48,
+        last_add_kicks_timestamp: 0x50,
         entry_cpu_base: 0x78,
         entry_gpu_base: 0x80,
         base_timestamp: 0x90,
@@ -1949,6 +1951,101 @@ pub(crate) struct G17PComputeClCommandState {
     pub(crate) rce_bindings: [G17PClRceBinding; 4],
 }
 
+/// Host-written prefix of the primary selector-0x0e event command.
+pub(crate) const G17P_COMPUTE_PRIMARY_EVENT_SIZE: usize = 0x15;
+/// Host-written prefix of the conditional selector-0x10 event command.
+pub(crate) const G17P_COMPUTE_OPTIONAL_EVENT_SIZE: usize = 0x12;
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PComputePrimaryEvent {
+    pub(crate) queue_id: u16,
+    pub(crate) descriptor_generation: u16,
+    pub(crate) data_master: u8,
+    pub(crate) old_timestamp: u64,
+}
+
+/// Descriptor accounting and bytes prepared before the primary event is
+/// made reachable from the channel pointer ring. The generation belongs to
+/// the host CL command descriptor, not to the selector-3 GPU descriptor.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct PreparedG17PComputePrimaryEvent {
+    pub(crate) descriptor_generation: u32,
+    pub(crate) bytes: [u8; G17P_COMPUTE_PRIMARY_EVENT_SIZE],
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PComputeOptionalEvent {
+    pub(crate) queue_id: u16,
+    pub(crate) old_timestamp: u64,
+}
+
+/// Encode the primary event command published after the SKSM entry producer.
+pub(crate) fn encode_g17p_compute_primary_event(
+    event: G17PComputePrimaryEvent,
+    out: &mut [u8],
+) -> Result<(), SubmissionError> {
+    if out.len() < G17P_COMPUTE_PRIMARY_EVENT_SIZE {
+        return Err(SubmissionError::KickRetainedStorageBufferTooSmall);
+    }
+    out[..G17P_COMPUTE_PRIMARY_EVENT_SIZE].fill(0);
+    put_u32_le(out, 0x00, 0x0e);
+    put_u16_le(out, 0x04, event.queue_id);
+    put_u16_le(out, 0x06, event.descriptor_generation);
+    out[0x08] = event.data_master;
+    put_u64_le(out, 0x09, event.old_timestamp);
+    put_u32_le(out, 0x11, 2);
+    Ok(())
+}
+
+/// Advance the host descriptor's submitted-entry count and prepare the exact
+/// primary event prefix which publishes that generation. Required NOPs are
+/// accounted before the one CL entry, matching the native submit ledger.
+pub(crate) fn prepare_g17p_compute_primary_event(
+    generation_before: u32,
+    nop_count: u32,
+    queue_id: u8,
+    data_master: u8,
+    old_timestamp: u64,
+) -> Result<PreparedG17PComputePrimaryEvent, SubmissionError> {
+    let descriptor_generation = generation_before
+        .checked_add(nop_count)
+        .and_then(|generation| generation.checked_add(1))
+        .ok_or(SubmissionError::ComputeEventCounterOverflow)?;
+    let event_generation = u16::try_from(descriptor_generation)
+        .map_err(|_| SubmissionError::ComputeEventCounterOverflow)?;
+    let mut bytes = [0u8; G17P_COMPUTE_PRIMARY_EVENT_SIZE];
+    encode_g17p_compute_primary_event(
+        G17PComputePrimaryEvent {
+            queue_id: u16::from(queue_id),
+            descriptor_generation: event_generation,
+            data_master,
+            old_timestamp,
+        },
+        &mut bytes,
+    )?;
+    Ok(PreparedG17PComputePrimaryEvent {
+        descriptor_generation,
+        bytes,
+    })
+}
+
+/// Encode the event used only when the host descriptor carries its optional
+/// event pointer. The simple first add3 profile does not publish this record.
+pub(crate) fn encode_g17p_compute_optional_event(
+    event: G17PComputeOptionalEvent,
+    out: &mut [u8],
+) -> Result<(), SubmissionError> {
+    if out.len() < G17P_COMPUTE_OPTIONAL_EVENT_SIZE {
+        return Err(SubmissionError::KickRetainedStorageBufferTooSmall);
+    }
+    out[..G17P_COMPUTE_OPTIONAL_EVENT_SIZE].fill(0);
+    put_u32_le(out, 0x00, 0x10);
+    put_u16_le(out, 0x04, event.queue_id);
+    put_u64_le(out, 0x06, event.old_timestamp);
+    put_u32_le(out, 0x0e, 0xfe);
+    Ok(())
+}
+
 pub(crate) fn prepare_g17p_compute_cl_command_state(
     descriptor_low: u64,
     submission_ordinal: u32,
@@ -2008,6 +2105,8 @@ pub(crate) struct G17PClKickProducerState {
     pub(crate) qos: G17PClQosConfig,
     pub(crate) submitted: u32,
     pub(crate) current_timestamp: u64,
+    /// Last timestamp reconciled through `submitCLChannel` addKicks.
+    pub(crate) last_add_kicks_timestamp: u64,
     pub(crate) base_timestamp: u64,
     pub(crate) previous_valid: bool,
     pub(crate) previous_timestamp: u64,
@@ -2073,6 +2172,44 @@ pub(crate) const G17P_CL_KICK_PUBLICATION_ORDER: [G17PClKickPublicationStep; 7] 
     G17PClKickPublicationStep::SubmittedAtomicAdd,
     G17PClKickPublicationStep::PreviousValid,
     G17PClKickPublicationStep::PreviousTimestamp,
+];
+
+/// One coherent Linux first-submit ledger. The first two steps retain the
+/// output-positive opening requirements; the remaining steps follow the
+/// recovered G17P SKSM/channel host order.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum G17PFirstSubmitPublicationStep {
+    PublishB2,
+    StageRuntimeTick,
+    ZeroSksmStride,
+    WriteSksmEntry,
+    EntryBarrier,
+    PublishSksmProducer,
+    AdvanceDescriptorGeneration,
+    WritePrimaryEvent,
+    WritePrimaryEventPointer,
+    PrimaryEventPointerBarrier,
+    PublishPrimaryEventProducer,
+    AddKicks,
+    PublishCl2,
+    SendEpDoorbell,
+}
+
+pub(crate) const G17P_FIRST_SUBMIT_PUBLICATION_ORDER: [G17PFirstSubmitPublicationStep; 14] = [
+    G17PFirstSubmitPublicationStep::PublishB2,
+    G17PFirstSubmitPublicationStep::StageRuntimeTick,
+    G17PFirstSubmitPublicationStep::ZeroSksmStride,
+    G17PFirstSubmitPublicationStep::WriteSksmEntry,
+    G17PFirstSubmitPublicationStep::EntryBarrier,
+    G17PFirstSubmitPublicationStep::PublishSksmProducer,
+    G17PFirstSubmitPublicationStep::AdvanceDescriptorGeneration,
+    G17PFirstSubmitPublicationStep::WritePrimaryEvent,
+    G17PFirstSubmitPublicationStep::WritePrimaryEventPointer,
+    G17PFirstSubmitPublicationStep::PrimaryEventPointerBarrier,
+    G17PFirstSubmitPublicationStep::PublishPrimaryEventProducer,
+    G17PFirstSubmitPublicationStep::AddKicks,
+    G17PFirstSubmitPublicationStep::PublishCl2,
+    G17PFirstSubmitPublicationStep::SendEpDoorbell,
 ];
 
 fn encode_g17p_cl_dependency(timestamp: u64, queue_id: u8) -> Result<u64, SubmissionError> {
@@ -4438,6 +4575,7 @@ mod tests {
                 completion_selector: 0x1c,
                 submitted: 0x44,
                 current_timestamp: 0x48,
+                last_add_kicks_timestamp: 0x50,
                 entry_cpu_base: 0x78,
                 entry_gpu_base: 0x80,
                 base_timestamp: 0x90,
@@ -4472,6 +4610,57 @@ mod tests {
                 G17PClKickPublicationStep::PreviousTimestamp,
             ]
         );
+        assert_eq!(
+            G17P_FIRST_SUBMIT_PUBLICATION_ORDER,
+            [
+                G17PFirstSubmitPublicationStep::PublishB2,
+                G17PFirstSubmitPublicationStep::StageRuntimeTick,
+                G17PFirstSubmitPublicationStep::ZeroSksmStride,
+                G17PFirstSubmitPublicationStep::WriteSksmEntry,
+                G17PFirstSubmitPublicationStep::EntryBarrier,
+                G17PFirstSubmitPublicationStep::PublishSksmProducer,
+                G17PFirstSubmitPublicationStep::AdvanceDescriptorGeneration,
+                G17PFirstSubmitPublicationStep::WritePrimaryEvent,
+                G17PFirstSubmitPublicationStep::WritePrimaryEventPointer,
+                G17PFirstSubmitPublicationStep::PrimaryEventPointerBarrier,
+                G17PFirstSubmitPublicationStep::PublishPrimaryEventProducer,
+                G17PFirstSubmitPublicationStep::AddKicks,
+                G17PFirstSubmitPublicationStep::PublishCl2,
+                G17PFirstSubmitPublicationStep::SendEpDoorbell,
+            ]
+        );
+    }
+
+    #[test]
+    fn g17p_primary_compute_event_couples_generation_and_old_timestamp() {
+        const PRIMARY: &[u8; G17P_COMPUTE_PRIMARY_EVENT_SIZE] =
+            include_bytes!("fixtures/g17p_first_submit/channel-event-primary.bin");
+        const OPTIONAL: &[u8; G17P_COMPUTE_OPTIONAL_EVENT_SIZE] =
+            include_bytes!("fixtures/g17p_first_submit/channel-event-optional.bin");
+
+        let primary = prepare_g17p_compute_primary_event(0, 0, 4, 2, 1).unwrap();
+        assert_eq!(primary.descriptor_generation, 1);
+        assert_eq!(primary.bytes, *PRIMARY);
+
+        let mut optional = [0u8; G17P_COMPUTE_OPTIONAL_EVENT_SIZE];
+        encode_g17p_compute_optional_event(
+            G17PComputeOptionalEvent {
+                queue_id: 4,
+                old_timestamp: 1,
+            },
+            &mut optional,
+        )
+        .unwrap();
+        assert_eq!(optional, *OPTIONAL);
+
+        assert_eq!(
+            prepare_g17p_compute_primary_event(u32::MAX, 0, 4, 2, 1),
+            Err(SubmissionError::ComputeEventCounterOverflow)
+        );
+        assert_eq!(
+            prepare_g17p_compute_primary_event(u16::MAX as u32, 0, 4, 2, 1),
+            Err(SubmissionError::ComputeEventCounterOverflow)
+        );
     }
 
     #[test]
@@ -4491,6 +4680,7 @@ mod tests {
             },
             submitted: 0,
             current_timestamp: 1,
+            last_add_kicks_timestamp: 1,
             base_timestamp: 1,
             previous_valid: false,
             previous_timestamp: 0,
@@ -4592,6 +4782,143 @@ mod tests {
     }
 
     #[test]
+    fn g17p_first_submit_matches_the_independent_full_stride_fixture() {
+        const BEFORE: &[u8; 0x200] =
+            include_bytes!("fixtures/g17p_first_submit/sksm-entry-before.bin");
+        const AFTER: &[u8; 0x200] =
+            include_bytes!("fixtures/g17p_first_submit/sksm-entry-after.bin");
+        const RELOCATION_MASK: &[u8; 0x200] =
+            include_bytes!("fixtures/g17p_first_submit/sksm-entry-relocation-mask.bin");
+        const DESCRIPTOR_HIGH: u64 = 0xffff_fc20_c035_8000;
+        const DESCRIPTOR_LOW: u64 = 0x70_0034_0000;
+        const QUEUE: u64 = 0xffff_fc20_c000_0300;
+
+        assert!(BEFORE.iter().all(|byte| *byte == 0));
+        assert_eq!(
+            RELOCATION_MASK
+                .iter()
+                .map(|byte| byte.count_ones())
+                .sum::<u32>(),
+            204
+        );
+
+        let command = prepare_g17p_compute_cl_command_state(DESCRIPTOR_LOW, 0).unwrap();
+        let empty = G17PClRceBinding { address: 0, tag: 0 };
+        assert_eq!(
+            command.rce_bindings,
+            [
+                G17PClRceBinding {
+                    address: DESCRIPTOR_LOW + 0x40,
+                    tag: 0x22,
+                },
+                G17PClRceBinding {
+                    address: DESCRIPTOR_LOW + 0x760,
+                    tag: 0x04,
+                },
+                empty,
+                empty,
+            ]
+        );
+        let before = G17PClKickProducerState {
+            queue_id: 4,
+            num_stamps: 0x100,
+            entry_stride: 0x200,
+            completion_selector: 2,
+            qos: G17PClQosConfig {
+                queue_byte_32: 1,
+                class_40: 8,
+                word_48: 0xffff,
+            },
+            submitted: 0,
+            current_timestamp: 1,
+            last_add_kicks_timestamp: 1,
+            base_timestamp: 1,
+            previous_valid: false,
+            previous_timestamp: 0,
+        };
+        let prepared = prepare_g17p_cl_kick_entry(
+            before,
+            G17PClKickEntryOperands {
+                descriptor_flag_4c: false,
+                descriptor_flag_5c8: false,
+                converted_command_timestamp: 1,
+                barriers: &[],
+                mcache: None,
+                payload: [DESCRIPTOR_HIGH, QUEUE],
+                event_mask: command.event_mask,
+                rce_kind: 0,
+                rce_bindings: command.rce_bindings,
+                auxiliary: 0x003f_ffff_ffff_ffff,
+            },
+        )
+        .unwrap();
+        let mut actual = [0u8; 0x200];
+        actual[..G17P_CL_KICK_ENTRY_SIZE].copy_from_slice(&prepared.entry);
+
+        for index in 0..actual.len() {
+            assert_eq!(
+                actual[index] & !RELOCATION_MASK[index],
+                AFTER[index] & !RELOCATION_MASK[index],
+                "normalized fixture mismatch at offset {:#x}",
+                index
+            );
+        }
+        // The fixture uses the same captured addresses as this test, so the
+        // relocation-bearing fields must also agree without normalization.
+        assert_eq!(actual, *AFTER);
+        assert_eq!(prepared.zero_length, 0x200);
+        assert_eq!(prepared.entry_index, 1);
+        assert_eq!(prepared.entry_offset, 0x200);
+        assert_eq!(prepared.current_timestamp, 1);
+        assert_eq!(prepared.next_timestamp, 2);
+        assert_eq!(prepared.submitted_before, 0);
+        assert_eq!(prepared.submitted_after, 1);
+        assert_eq!(
+            prepared.producer_after,
+            G17PClKickProducerState {
+                submitted: 1,
+                current_timestamp: 2,
+                previous_valid: true,
+                previous_timestamp: 1,
+                ..before
+            }
+        );
+
+        const SECOND_AFTER: &[u8; 0x200] =
+            include_bytes!("fixtures/g17p_first_submit/sksm-entry-second-after.bin");
+        let second_command =
+            prepare_g17p_compute_cl_command_state(DESCRIPTOR_LOW + 0x1040, 1).unwrap();
+        let second = prepare_g17p_cl_kick_entry(
+            prepared.producer_after,
+            G17PClKickEntryOperands {
+                descriptor_flag_4c: false,
+                descriptor_flag_5c8: false,
+                converted_command_timestamp: 0,
+                barriers: &[],
+                mcache: None,
+                payload: [DESCRIPTOR_HIGH + 0x1040, QUEUE],
+                event_mask: second_command.event_mask,
+                rce_kind: 0,
+                rce_bindings: second_command.rce_bindings,
+                auxiliary: 0x003f_ffff_ffff_ffff,
+            },
+        )
+        .unwrap();
+        let mut second_actual = [0u8; 0x200];
+        second_actual[..G17P_CL_KICK_ENTRY_SIZE].copy_from_slice(&second.entry);
+        assert_eq!(second_actual, *SECOND_AFTER);
+        assert_eq!(second.entry_index, 2);
+        assert_eq!(second.entry_offset, 0x400);
+        assert_eq!(second.current_timestamp, 2);
+        assert_eq!(second.next_timestamp, 3);
+        assert_eq!(second.submitted_before, 1);
+        assert_eq!(second.submitted_after, 2);
+        assert_eq!(second.producer_after.current_timestamp, 3);
+        assert_eq!(second.producer_after.previous_timestamp, 2);
+        assert_eq!(second.producer_after.last_add_kicks_timestamp, 1);
+    }
+
+    #[test]
     fn g17p_cl_descriptor_flags_map_directly_to_header_bits() {
         let empty = G17PClRceBinding { address: 0, tag: 0 };
         let producer = G17PClKickProducerState {
@@ -4606,6 +4933,7 @@ mod tests {
             },
             submitted: 0,
             current_timestamp: 1,
+            last_add_kicks_timestamp: 1,
             base_timestamp: 1,
             previous_valid: false,
             previous_timestamp: 0,
@@ -4653,6 +4981,7 @@ mod tests {
             },
             submitted: 2,
             current_timestamp: 3,
+            last_add_kicks_timestamp: 2,
             base_timestamp: 1,
             previous_valid: true,
             previous_timestamp: 2,
@@ -4877,6 +5206,7 @@ mod tests {
             },
             submitted: 2,
             current_timestamp: 2,
+            last_add_kicks_timestamp: 1,
             base_timestamp: 1,
             previous_valid: true,
             previous_timestamp: 7,
@@ -4950,6 +5280,7 @@ mod tests {
             },
             submitted: 0,
             current_timestamp: 1,
+            last_add_kicks_timestamp: 0,
             base_timestamp: 1,
             previous_valid: false,
             previous_timestamp: 0,
