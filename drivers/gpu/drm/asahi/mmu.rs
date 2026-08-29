@@ -2469,35 +2469,102 @@ impl Uat {
     /// mapping rather than assuming firmware creates it.
     fn install_t8140_firmware_crash_buffers(&mut self, dev: &driver::AsahiDevice) -> Result {
         if self.cfg != UatConfig::T8140 || self._t8140_firmware_crash_buffers.is_some() {
+            dev_err!(
+                dev.as_ref(),
+                "MMU: firmware crash-buffer setup has invalid T8140 state\n"
+            );
             return Err(EINVAL);
         }
-        let map = |range: &Range<u64>| -> Result<KernelMapping> {
+        let map = |name: &str, range: &Range<u64>| -> Result<KernelMapping> {
             let size_u64 = range.end.checked_sub(range.start).ok_or(EINVAL)?;
             let size: usize = size_u64.try_into()?;
-            let mut object = gem::new_kernel_object_wc(dev, size)?;
-            object.vmap()?.memset(0);
-            let mapping = object.map_at(
+            let mut object = match gem::new_kernel_object_wc(dev, size) {
+                Ok(object) => object,
+                Err(err) => {
+                    dev_err!(
+                        dev.as_ref(),
+                        "MMU: {} crash-buffer allocation at {:#x}:{:#x} failed ({:?})\n",
+                        name,
+                        range.start,
+                        size,
+                        err
+                    );
+                    return Err(err);
+                }
+            };
+            let mut vmap = match object.vmap() {
+                Ok(vmap) => vmap,
+                Err(err) => {
+                    dev_err!(
+                        dev.as_ref(),
+                        "MMU: {} crash-buffer CPU map at {:#x}:{:#x} failed ({:?})\n",
+                        name,
+                        range.start,
+                        size,
+                        err
+                    );
+                    return Err(err);
+                }
+            };
+            vmap.memset(0);
+            core::mem::drop(vmap);
+            let mapping = match object.map_at(
                 &self.kernel_lower_vm,
                 range.start,
                 PROT_FW_SHARED_RW,
                 false,
-            )?;
-            if mapping.iova_range() != *range
-                || !self
-                    .kernel_lower_vm
-                    .covers_range(range.start, size_u64, false, true)
-            {
+            ) {
+                Ok(mapping) => mapping,
+                Err(err) => {
+                    dev_err!(
+                        dev.as_ref(),
+                        "MMU: {} crash-buffer context-0 map at {:#x}:{:#x} failed ({:?})\n",
+                        name,
+                        range.start,
+                        size,
+                        err
+                    );
+                    return Err(err);
+                }
+            };
+            if mapping.iova_range() != *range {
+                dev_err!(
+                    dev.as_ref(),
+                    "MMU: {} crash-buffer map returned {:#x?}, expected {:#x?}\n",
+                    name,
+                    mapping.iova_range(),
+                    range
+                );
                 return Err(EFAULT);
             }
+            // `covers_range` checks GPU permissions. These buffers are
+            // deliberately firmware-only, so require complete leaf coverage
+            // without requesting GPU read/write access.
+            if !self
+                .kernel_lower_vm
+                .covers_range(range.start, size_u64, false, false)
+            {
+                dev_err!(
+                    dev.as_ref(),
+                    "MMU: {} crash-buffer context-0 leaves missing at {:#x}:{:#x}\n",
+                    name,
+                    range.start,
+                    size
+                );
+                return Err(EFAULT);
+            }
+            dev_info!(
+                dev.as_ref(),
+                "MMU: mapped {} firmware crash buffer in context 0 at {:#x}:{:#x}\n",
+                name,
+                range.start,
+                size
+            );
             Ok(mapping)
         };
-        let gfx = map(&T8140_FIRMWARE_CRASH_BUFFERS[0])?;
-        let gfx1 = map(&T8140_FIRMWARE_CRASH_BUFFERS[1])?;
+        let gfx = map("GFX", &T8140_FIRMWARE_CRASH_BUFFERS[0])?;
+        let gfx1 = map("GFX1", &T8140_FIRMWARE_CRASH_BUFFERS[1])?;
         self._t8140_firmware_crash_buffers = Some([gfx, gfx1]);
-        dev_info!(
-            dev.as_ref(),
-            "MMU: mapped GFX/GFX1 firmware crash buffers in context 0\n"
-        );
         Ok(())
     }
 
@@ -2764,5 +2831,7 @@ mod tests {
             assert_eq!((range.start | range.end) & UAT_PGMSK as u64, 0);
         }
         assert!(T8140_FIRMWARE_CRASH_BUFFERS[0].end <= T8140_FIRMWARE_CRASH_BUFFERS[1].start);
+        assert!(PROT_FW_SHARED_RW.allows_gpu(false, false));
+        assert!(!PROT_FW_SHARED_RW.allows_gpu(false, true));
     }
 }
