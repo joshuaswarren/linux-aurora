@@ -53,10 +53,37 @@ void mt76_mcu_rx_event(struct mt76_dev *dev, struct sk_buff *skb)
 }
 EXPORT_SYMBOL_GPL(mt76_mcu_rx_event);
 
+static bool mt7932_runtime_uni_noack(struct mt76_dev *dev, int cmd)
+{
+	if (mt76_chip(dev) != 0x7932)
+		return false;
+
+	/* AppleSunriseWLAN uses these connac2 UNI payloads, but MT7932's 25G83
+	 * firmware does not return the MT7921/MT7922 synchronous status event.
+	 * They are state-setting commands; scan/association events provide the
+	 * functional completion evidence instead.
+	 */
+	switch (cmd) {
+	case 0x00020001: /* DEV_INFO_UPDATE */
+	case 0x00020002: /* BSS_INFO_UPDATE */
+	case 0x00020003: /* STA_REC_UPDATE */
+		return true;
+	default:
+		return false;
+	}
+}
+
 int mt76_mcu_send_and_get_msg(struct mt76_dev *dev, int cmd, const void *data,
 			      int len, bool wait_resp, struct sk_buff **ret_skb)
 {
 	struct sk_buff *skb;
+
+	if (wait_resp && mt7932_runtime_uni_noack(dev, cmd)) {
+		dev_info(dev->dev,
+			 "J700_MT7932_RUNTIME_UNI_NOACK: cmd=0x%08x len=%d\n",
+			 cmd, len);
+		wait_resp = false;
+	}
 
 	if (dev->mcu_ops->mcu_send_msg)
 		return dev->mcu_ops->mcu_send_msg(dev, cmd, data, len, wait_resp);

@@ -232,6 +232,7 @@ struct mt792x_phy {
 	wait_queue_head_t roc_wait;
 	u8 roc_token_id;
 	bool roc_grant;
+	bool has_single_sku;
 };
 
 struct mt792x_irq_map {
@@ -300,6 +301,8 @@ struct mt792x_dev {
 	bool hif_idle:1;
 	bool hif_resumed:1;
 	bool regd_change:1;
+	/* Select the measured post-download MT7932 WFDMA enable sequence. */
+	bool mt7932_runtime_dma_epoch:1;
 	wait_queue_head_t wait;
 
 	struct work_struct init_work;

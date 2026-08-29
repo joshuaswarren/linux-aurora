@@ -8,6 +8,18 @@
 #include "dma.h"
 #include "trace.h"
 
+#define MT7932_INT_RX_DONE_RING3	BIT(3)
+#define MT7932_INT_RX_DONE_RING6	BIT(19)
+#define MT7932_INT_RX_DONE_RING5	BIT(23)
+#define MT7932_INT_RX_DONE_RING7	BIT(25)
+#define MT7932_INT_RX_DONE_RING8	BIT(31)
+#define MT7932_INT_RX_DONE_ALL	(BIT(0) | BIT(2) | \
+					 MT7932_INT_RX_DONE_RING3 | \
+					 MT7932_INT_RX_DONE_RING6 | BIT(22) | \
+					 MT7932_INT_RX_DONE_RING5 | \
+					 MT7932_INT_RX_DONE_RING7 | \
+					 MT7932_INT_RX_DONE_RING8)
+
 irqreturn_t mt792x_irq_handler(int irq, void *dev_instance)
 {
 	struct mt792x_dev *dev = dev_instance;
@@ -42,6 +54,13 @@ void mt792x_irq_tasklet(unsigned long data)
 	mask |= intr & (irq_map->rx.data_complete_mask |
 			irq_map->rx.wm_complete_mask |
 			irq_map->rx.wm2_complete_mask);
+	/* Apple polls every active queue from one synchronous RX handler.  Linux
+	 * has one NAPI per queue, so disable and schedule only the rings whose
+	 * bits asserted.  In particular, do not restore unrelated ring masks from
+	 * an empty NAPI completion.
+	 */
+	if (is_mt7932(&dev->mt76))
+		mask |= intr & MT7932_INT_RX_DONE_ALL;
 	if (intr & dev->irq_map->tx.mcu_complete_mask)
 		mask |= dev->irq_map->tx.mcu_complete_mask;
 
@@ -70,6 +89,36 @@ void mt792x_irq_tasklet(unsigned long data)
 
 	if (intr & irq_map->rx.data_complete_mask)
 		napi_schedule(&dev->mt76.napi[MT_RXQ_MAIN]);
+
+	/* Apple enables RX3 and RX5 in the exact MT7932 host mask.  The J700
+	 * queue inventory also publishes both rings, but the inherited mt7921
+	 * tasklet only dispatched RX0, RX2 and RX4.  That acknowledged RX3/RX5
+	 * interrupts without draining their descriptors, dropping band-1 scan
+	 * and auxiliary events before mac80211 could observe them.
+	 */
+	if (is_mt7932(&dev->mt76) &&
+	    intr & MT7932_INT_RX_DONE_RING3) {
+		dev_info_ratelimited(dev->mt76.dev,
+				 "J700_MT7932_RX_RING3_IRQ_PASS: intr=0x%08x\n",
+				 intr);
+		napi_schedule(&dev->mt76.napi[MT_RXQ_BAND1]);
+	}
+	if (is_mt7932(&dev->mt76) &&
+	    intr & MT7932_INT_RX_DONE_RING5) {
+		dev_info_ratelimited(dev->mt76.dev,
+				 "J700_MT7932_RX_RING5_IRQ_PASS: intr=0x%08x\n",
+				 intr);
+		napi_schedule(&dev->mt76.napi[MT_RXQ_BAND1_WA]);
+	}
+	if (is_mt7932(&dev->mt76) &&
+	    intr & MT7932_INT_RX_DONE_RING6)
+		napi_schedule(&dev->mt76.napi[MT_RXQ_MAIN_WA]);
+	if (is_mt7932(&dev->mt76) &&
+	    intr & MT7932_INT_RX_DONE_RING7)
+		napi_schedule(&dev->mt76.napi[MT_RXQ_BAND2]);
+	if (is_mt7932(&dev->mt76) &&
+	    intr & MT7932_INT_RX_DONE_RING8)
+		napi_schedule(&dev->mt76.napi[MT_RXQ_BAND2_WA]);
 }
 EXPORT_SYMBOL_GPL(mt792x_irq_tasklet);
 
@@ -82,6 +131,16 @@ void mt792x_rx_poll_complete(struct mt76_dev *mdev, enum mt76_rxq_id q)
 		mt76_connac_irq_enable(mdev, irq_map->rx.data_complete_mask);
 	else if (q == MT_RXQ_MCU_WA)
 		mt76_connac_irq_enable(mdev, irq_map->rx.wm2_complete_mask);
+	else if (is_mt7932(mdev) && q == MT_RXQ_BAND1)
+		mt76_connac_irq_enable(mdev, MT7932_INT_RX_DONE_RING3);
+	else if (is_mt7932(mdev) && q == MT_RXQ_BAND1_WA)
+		mt76_connac_irq_enable(mdev, MT7932_INT_RX_DONE_RING5);
+	else if (is_mt7932(mdev) && q == MT_RXQ_MAIN_WA)
+		mt76_connac_irq_enable(mdev, MT7932_INT_RX_DONE_RING6);
+	else if (is_mt7932(mdev) && q == MT_RXQ_BAND2)
+		mt76_connac_irq_enable(mdev, MT7932_INT_RX_DONE_RING7);
+	else if (is_mt7932(mdev) && q == MT_RXQ_BAND2_WA)
+		mt76_connac_irq_enable(mdev, MT7932_INT_RX_DONE_RING8);
 	else
 		mt76_connac_irq_enable(mdev, irq_map->rx.wm_complete_mask);
 }
@@ -226,6 +285,19 @@ int mt792x_dma_enable(struct mt792x_dev *dev)
 {
 	u32 cfg_mask, cfg_set;
 
+	if (is_mt7932(&dev->mt76) && dev->mt7932_runtime_dma_epoch) {
+		/* Run 191 repeats the disabled pre-runtime image after publishing all
+		 * ring BASE/CIDX/COUNT fields and before the extension-control table.
+		 */
+		mt76_wr(dev, MT_WFDMA0_GLO_CFG, 0x00103870);
+		if (mt76_rr(dev, MT_WFDMA0_GLO_CFG) != 0x00103870) {
+			dev_err(dev->mt76.dev,
+				"J700_MT7932_RUNTIME_PRERING_FAIL: phase=post-ring glo=0x%08x expected=0x00103870\n",
+				mt76_rr(dev, MT_WFDMA0_GLO_CFG));
+			return -EIO;
+		}
+	}
+
 	/* configure perfetch settings */
 	mt792x_dma_prefetch(dev);
 
@@ -233,6 +305,107 @@ int mt792x_dma_enable(struct mt792x_dev *dev)
 	mt76_wr(dev, MT_WFDMA0_RST_DTX_PTR, ~0);
 	if (is_mt7925(&dev->mt76))
 		mt76_wr(dev, MT_WFDMA0_RST_DRX_PTR, ~0);
+
+	if (is_mt7932(&dev->mt76) && dev->mt7932_runtime_dma_epoch) {
+		u32 ext0, page, pktmax;
+
+		/* Run 191 does not transiently restart the post-download engine with
+		 * the earlier 0x50209045 image.  It installs the complete runtime
+		 * image while TX/RX DMA are disabled, then changes only the enable
+		 * bits: 0x5030b870 -> 0x5030b875.  Publishing the download image and
+		 * interrupt mask first seeds Connac3's hidden payload/BKRS state even
+		 * though the final register readback later converges.
+		 */
+		/* HOST_INT_ENA is command-like on this block: Cycle552 wrote the
+		 * complete Run-191 mask and read it back immediately, then observed only
+		 * MCU_CMD (0x20000000) after RST_DTX without any host write.  The trace
+		 * specifies the writes, not persistent readback, so record rather than
+		 * reject the hardware-consumed value here.
+		 */
+		dev_info(dev->mt76.dev,
+			 "J700_MT7932_RUNTIME_IRQ_READBACK: phase=post-rstdtx host_int=0x%08x source=cycle552\n",
+			 mt76_rr(dev, MT7932_HOST_INT_ENA));
+
+		/* The successful Run 543 snapshot keeps DMASHDL PAGE=0x003d1000
+		 * (slot arbiter disabled) and PACKET_MAX=0x00000001 at the live TX17
+		 * boundary.  Linux initializes those exact values, but the firmware
+		 * transition restores generic 0x003f1000/0x00180010 defaults before
+		 * runtime WFDMA is rebuilt.  This is the reduced MT7932 equivalent of
+		 * MediaTek's post-reset mt7961DmashdlReInit(): restore only the two
+		 * fields that drifted; quota, refill, queue map and priorities already
+		 * match Apple and remain untouched.
+		 */
+		page = mt76_rr(dev, MT_DMASHDL_PAGE);
+		pktmax = mt76_rr(dev, MT_DMASHDL_PKT_MAX_SIZE);
+		mt76_rmw(dev, MT_DMASHDL_PAGE, GENMASK(17, 16), BIT(16));
+		mt76_rmw(dev, MT_DMASHDL_PKT_MAX_SIZE,
+			 MT_DMASHDL_PKT_MAX_SIZE_PLE |
+			 MT_DMASHDL_PKT_MAX_SIZE_PSE,
+			 FIELD_PREP(MT_DMASHDL_PKT_MAX_SIZE_PLE, 1));
+		if (mt76_rr(dev, MT_DMASHDL_PAGE) != 0x003d1000 ||
+		    mt76_rr(dev, MT_DMASHDL_PKT_MAX_SIZE) != 0x00000001) {
+			dev_err(dev->mt76.dev,
+				"J700_MT7932_RUNTIME_DMASHDL_REINIT_FAIL: page_before=0x%08x pkt_before=0x%08x page_after=0x%08x pkt_after=0x%08x\n",
+				page, pktmax, mt76_rr(dev, MT_DMASHDL_PAGE),
+				mt76_rr(dev, MT_DMASHDL_PKT_MAX_SIZE));
+			return -EIO;
+		}
+		dev_info(dev->mt76.dev,
+			 "J700_MT7932_RUNTIME_DMASHDL_REINIT_PASS: page_before=0x%08x pkt_before=0x%08x page_after=0x003d1000 pkt_after=0x00000001 source=run543-macos-paused-snapshot\n",
+			 page, pktmax);
+
+		/* Run 541 measures GLO_CFG_EXT0=0x28c004df and the complete Run-191
+		 * trace contains no EXT0 access, so Apple's selector remains asserted
+		 * across WFDMA disable, ring reset and RST_DTX.  Linux asserts it at the
+		 * runtime boundary before entering mt792x_wpdma_reset(); verify that it
+		 * survived the disable/reset path instead of reasserting it too late.
+		 */
+		ext0 = mt76_rr(dev, MT_WFDMA0_GLO_CFG_EXT0);
+		if (ext0 != 0x28c004df) {
+			dev_err(dev->mt76.dev,
+				"J700_MT7932_RUNTIME_DMASHDL_SELECTOR_FAIL: phase=post-rstdtx ext0=0x%08x expected=0x28c004df\n",
+				ext0);
+			return -EIO;
+		}
+		dev_info(dev->mt76.dev,
+			 "J700_MT7932_RUNTIME_DMASHDL_SELECTOR_PASS: ext0=0x28c004df selector=1 phase=pre-disable-through-rstdtx source=run191-no-ext0-write+run541-snapshot\n");
+		mt76_wr(dev, MT_WFDMA0_GLO_CFG, 0x5030b870);
+		if ((mt76_rr(dev, MT_WFDMA0_GLO_CFG) &
+		     ~(MT_WFDMA0_GLO_CFG_TX_DMA_BUSY |
+		       MT_WFDMA0_GLO_CFG_RX_DMA_BUSY)) != 0x5030b870) {
+			dev_err(dev->mt76.dev,
+				"J700_MT7932_RUNTIME_ENABLE_FAIL: disabled_glo=0x%08x expected=0x5030b870\n",
+				mt76_rr(dev, MT_WFDMA0_GLO_CFG));
+			return -EIO;
+		}
+		mt76_wr(dev, MT_WFDMA0_GLO_CFG, 0x5030b875);
+		mt76_wr(dev, MT_WFDMA0_INT_RX_PRI, 0x0000000c);
+		/* Cycle555 proves reset changes EXT_CSR+0x38 from the initial 0x13
+		 * to 0x7d.  Restore the static-RE value before runtime commands; omitting
+		 * this write fails closed before the Run-191 handshake completes.
+		 */
+		mt76_wr(dev, MT7932_WFDMA_EXT_CSR_3038, 0x00000013);
+		mt76_wr(dev, MT_WFDMA0_PRI_DLY_INT_CFG0, 0x8032800a);
+		if ((mt76_rr(dev, MT_WFDMA0_GLO_CFG) &
+		     ~(MT_WFDMA0_GLO_CFG_TX_DMA_BUSY |
+		       MT_WFDMA0_GLO_CFG_RX_DMA_BUSY)) != 0x5030b875 ||
+		    mt76_rr(dev, MT_WFDMA0_INT_RX_PRI) != 0x0000000c ||
+		    mt76_rr(dev, MT7932_WFDMA_EXT_CSR_3038) != 0x00000013 ||
+		    mt76_rr(dev, MT_WFDMA0_PRI_DLY_INT_CFG0) != 0x8032800a) {
+			dev_err(dev->mt76.dev,
+				"J700_MT7932_RUNTIME_ENABLE_FAIL: enabled_glo=0x%08x host_int=0x%08x rxpri=0x%08x ext3038=0x%08x dly=0x%08x\n",
+				mt76_rr(dev, MT_WFDMA0_GLO_CFG),
+				mt76_rr(dev, MT7932_HOST_INT_ENA),
+				mt76_rr(dev, MT_WFDMA0_INT_RX_PRI),
+				mt76_rr(dev, MT7932_WFDMA_EXT_CSR_3038),
+				mt76_rr(dev, MT_WFDMA0_PRI_DLY_INT_CFG0));
+			return -EIO;
+		}
+		dev_info(dev->mt76.dev,
+			 "J700_MT7932_RUNTIME_ENABLE_PASS: sequence=0x5030b870,0x5030b875 ext3038=0x7d-to-0x13 host_int=0x%08x transient_download_enable=0 source=run191-full-mmio+cycle555\n",
+			 mt76_rr(dev, MT7932_HOST_INT_ENA));
+		return 0;
+	}
 
 	/* Apple programs MT7932's delayed-interrupt register after WFDMA enable. */
 	if (!is_mt7932(&dev->mt76))
@@ -266,15 +439,18 @@ int mt792x_dma_enable(struct mt792x_dev *dev)
 			   MT_WFDMA0_GLO_CFG_RX_WB_DDONE;
 	mt76_rmw(dev, MT_WFDMA0_GLO_CFG, cfg_mask, cfg_set);
 
-	/* Cycle126 completed patch and RAM transfer with the generic round-robin
-	 * selector.  Keep that hardware-proven state until the reconstructed
-	 * DMASHDL path can advance an equivalent command.
+	/* Run 191 contains no GLO_CFG_EXT0 access from the beginning of the
+	 * captured Apple driver bring-up, while the working paused snapshots read
+	 * TX_DMASHDL_ENABLE set.  Cycle126 needed round-robin only before Linux had
+	 * reconstructed Apple's complete DMASHDL image.  That image is now installed
+	 * before this call, so keep the scheduler connected for the initial firmware
+	 * download as Apple does instead of changing routes at the runtime boundary.
 	 */
 	if (is_mt7932(&dev->mt76)) {
-		mt76_clear(dev, MT_WFDMA0_GLO_CFG_EXT0,
-			   MT_WFDMA0_CSR_TX_DMASHDL_ENABLE);
+		mt76_set(dev, MT_WFDMA0_GLO_CFG_EXT0,
+			 MT_WFDMA0_CSR_TX_DMASHDL_ENABLE);
 		dev_info(dev->mt76.dev,
-			 "J700_MT7932_CYCLE126_TRANSPORT: dmashdl_selector=0 mode=round-robin\n");
+			 "J700_MT7932_CYCLE551_TRANSPORT: dmashdl_selector=1 phase=initial-firmware-download source=run191-no-ext0-write+run541\n");
 	}
 
 	mt76_set(dev, MT_WFDMA0_GLO_CFG,
@@ -282,8 +458,8 @@ int mt792x_dma_enable(struct mt792x_dev *dev)
 	if (is_mt7932(&dev->mt76)) {
 		/* Exact enable-time writes from AppleSunriseWLAN 25G83
 		 * _mt7922WpdmaConfig after its common WFDMA control call.  They
-		 * are independent of the DMASHDL selector, which remains off for
-		 * the hardware-proven generic round-robin transport.
+		 * are independent of the DMASHDL selector, which remains connected
+		 * to the complete Apple-equivalent scheduler image above.
 		 */
 		mt76_wr(dev, MT_WFDMA0_INT_RX_PRI, 0x0000000c);
 		mt76_wr(dev, MT7932_WFDMA_EXT_CSR_3038, 0x00000013);
@@ -316,7 +492,8 @@ int mt792x_dma_enable(struct mt792x_dev *dev)
 		 * Keep the complete mask in mt76's software irqmask as well as in
 		 * hardware so the tasklet does not narrow it after the first IRQ.
 		 */
-		mt76_connac_irq_enable(&dev->mt76, MT7932_HOST_INT_MASK);
+		mt76_set_irq_mask(&dev->mt76, MT7932_HOST_INT_ENA, 0,
+				  MT7932_HOST_INT_MASK);
 		mt76_wr(dev, MT_MCU2HOST_SW_INT_ENA,
 			 MT7932_MCU2HOST_SW_INT_MASK);
 		dev_info(dev->mt76.dev,
@@ -346,6 +523,20 @@ mt792x_dma_reset(struct mt792x_dev *dev, bool force)
 	err = mt792x_dma_disable(dev, force);
 	if (err)
 		return err;
+	if (is_mt7932(&dev->mt76) && dev->mt7932_runtime_dma_epoch) {
+		/* mt792x_dma_disable() has already reproduced Run 191's read of
+		 * 0x1010b870 followed by its one RMW destination write, 0x00103870.
+		 * Verify the destination here without looking for the consumed source.
+		 */
+		if (mt76_rr(dev, MT_WFDMA0_GLO_CFG) != 0x00103870) {
+			dev_err(dev->mt76.dev,
+				"J700_MT7932_RUNTIME_PRERING_FAIL: phase=destination glo=0x%08x expected=0x00103870\n",
+				mt76_rr(dev, MT_WFDMA0_GLO_CFG));
+			return -EIO;
+		}
+		dev_info(dev->mt76.dev,
+			 "J700_MT7932_RUNTIME_PRERING_PASS: sequence=disable-rmw(read-0x1010b870,write-0x00103870),rings,write-0x00103870 dma_enabled=0 source=run191-seq14285-14368\n");
+	}
 
 	/* reset hw queues */
 	for (i = 0; i < __MT_TXQ_MAX; i++)
@@ -363,6 +554,37 @@ mt792x_dma_reset(struct mt792x_dev *dev, bool force)
 		mt76_queue_reset(dev, &dev->mt76.q_rx[i], true);
 
 	mt76_tx_status_check(&dev->mt76, true);
+
+	if (is_mt7932(&dev->mt76) && dev->mt7932_runtime_dma_epoch) {
+		/* Run 191 refills and republishes RX0/RX2..RX8 before manual
+		 * prefetch, RST_DTX and the 0x5030b870 -> 0x5030b875 enable.  Generic
+		 * mt792x performs rx_reset only after dma_enable(), leaving R2A with a
+		 * different reset epoch even though the later register values converge.
+		 * Fill each queue while WFDMA is disabled, then make the last three
+		 * device-visible writes Apple's BASE -> CIDX(count-1) -> COUNT order.
+		 */
+		mt76_for_each_q_rx(&dev->mt76, i) {
+			struct mt76_queue *q = &dev->mt76.q_rx[i];
+			u32 cidx;
+
+			mt76_queue_rx_reset(dev, i);
+			if (!q->ndesc)
+				continue;
+			cidx = Q_READ(q, cpu_idx);
+			if (cidx != q->ndesc - 1) {
+				dev_err(dev->mt76.dev,
+					"J700_MT7932_RUNTIME_RX_PRERING_FAIL: qid=%d hw=%u cidx=%u expected=%u\n",
+					i, q->hw_idx, cidx, q->ndesc - 1);
+				return -EIO;
+			}
+			Q_WRITE(q, desc_base, q->desc_dma);
+			Q_WRITE(q, cpu_idx, cidx);
+			Q_WRITE(q, ring_size, q->ndesc);
+			dev_info(dev->mt76.dev,
+				 "J700_MT7932_RUNTIME_RX_PRERING_PASS: qid=%d hw=%u base=%pad cidx=%u count=%u order=base,cidx,count source=run191-seq14343-14366\n",
+				 i, q->hw_idx, &q->desc_dma, cidx, q->ndesc);
+		}
+	}
 
 	return mt792x_dma_enable(dev);
 }
@@ -396,8 +618,9 @@ int mt792x_wpdma_reset(struct mt792x_dev *dev, bool force)
 	if (err)
 		return err;
 
-	mt76_for_each_q_rx(&dev->mt76, i)
-		mt76_queue_rx_reset(dev, i);
+	if (!(is_mt7932(&dev->mt76) && dev->mt7932_runtime_dma_epoch))
+		mt76_for_each_q_rx(&dev->mt76, i)
+			mt76_queue_rx_reset(dev, i);
 
 	return 0;
 }
@@ -431,6 +654,19 @@ EXPORT_SYMBOL_GPL(mt792x_wpdma_reinit_cond);
 
 int mt792x_dma_disable(struct mt792x_dev *dev, bool force)
 {
+	if (is_mt7932(&dev->mt76) && dev->mt7932_runtime_dma_epoch) {
+		u32 source = mt76_rr(dev, MT_WFDMA0_GLO_CFG);
+
+		if (source != 0x1010b870) {
+			dev_err(dev->mt76.dev,
+				"J700_MT7932_RUNTIME_PRERING_FAIL: phase=source glo=0x%08x expected=0x1010b870\n",
+				source);
+			return -EIO;
+		}
+		dev_info(dev->mt76.dev,
+			 "J700_MT7932_RUNTIME_PRERING_SOURCE_PASS: source=0x1010b870 operation=read-before-disable-rmw trace=run191-seq14285\n");
+	}
+
 	/* disable WFDMA0 */
 	mt76_clear(dev, MT_WFDMA0_GLO_CFG,
 		   MT_WFDMA0_GLO_CFG_TX_DMA_EN | MT_WFDMA0_GLO_CFG_RX_DMA_EN |
@@ -444,15 +680,42 @@ int mt792x_dma_disable(struct mt792x_dev *dev, bool force)
 				 MT_WFDMA0_GLO_CFG_RX_DMA_BUSY, 0, 100, 1))
 		return -ETIMEDOUT;
 
-	if (is_mt7927(&dev->mt76)) {
-		mt76_wr(dev, MT_WFDMA0_RST_DTX_PTR, ~0);
-		mt76_wr(dev, MT_WFDMA0_RST_DRX_PTR, ~0);
+	/* Apple preserves the runtime TX-DMASHDL route through its WFDMA-only
+	 * recovery.  Firmware download still enters here with the selector off.
+	 */
+	if (is_mt7932(&dev->mt76) && dev->mt7932_runtime_dma_epoch) {
+		if (!(mt76_rr(dev, MT_WFDMA0_GLO_CFG_EXT0) &
+		      MT_WFDMA0_CSR_TX_DMASHDL_ENABLE)) {
+			dev_err(dev->mt76.dev,
+				"J700_MT7932_RUNTIME_DMASHDL_SELECTOR_FAIL: phase=disable ext0=0x%08x expected-selector=1\n",
+				mt76_rr(dev, MT_WFDMA0_GLO_CFG_EXT0));
+			return -EIO;
+		}
+	} else {
+		mt76_clear(dev, MT_WFDMA0_GLO_CFG_EXT0,
+			   MT_WFDMA0_CSR_TX_DMASHDL_ENABLE);
 	}
-
-	/* disable dmashdl */
-	mt76_clear(dev, MT_WFDMA0_GLO_CFG_EXT0,
-		   MT_WFDMA0_CSR_TX_DMASHDL_ENABLE);
-	mt76_set(dev, MT_DMASHDL_SW_CONTROL, MT_DMASHDL_DMASHDL_BYPASS);
+	if (is_mt7932(&dev->mt76)) {
+		/* AppleSunriseWLAN's runtime WFDMA recovery controls and rebuilds
+		 * WFDMA without bypassing the DMASHDL instance initialized by
+		 * _mt7922DmashdlInit/_mt7961DmashdlInit.  The generic mt792x path
+		 * sets bypass here and never clears it during dma_enable(), leaving
+		 * the post-reset command epoch with a different scheduler state.
+		 */
+		if (mt76_rr(dev, MT_DMASHDL_SW_CONTROL) &
+		    MT_DMASHDL_DMASHDL_BYPASS) {
+			dev_err(dev->mt76.dev,
+				"J700_MT7932_DMASHDL_RUNTIME_PRESERVE_FAIL: sw_control=0x%08x\n",
+				mt76_rr(dev, MT_DMASHDL_SW_CONTROL));
+			return -EIO;
+		}
+		dev_info(dev->mt76.dev,
+			 "J700_MT7932_DMASHDL_RUNTIME_PRESERVE_PASS: sw_control=0x%08x bypass=0 source=apple-25G83-static-re\n",
+			 mt76_rr(dev, MT_DMASHDL_SW_CONTROL));
+	} else {
+		mt76_set(dev, MT_DMASHDL_SW_CONTROL,
+			 MT_DMASHDL_DMASHDL_BYPASS);
+	}
 
 	if (force) {
 		/* reset */

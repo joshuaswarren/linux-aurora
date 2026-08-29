@@ -243,8 +243,21 @@ int mt7921_mcu_sta_update(struct mt792x_dev *dev, struct ieee80211_sta *sta,
 int mt7921_mcu_set_chan_info(struct mt792x_phy *phy, int cmd);
 int mt7921_mcu_set_tx(struct mt792x_dev *dev, struct ieee80211_vif *vif);
 int mt7921_mcu_set_eeprom(struct mt792x_dev *dev);
+int mt7932_mcu_init_dbdc(struct mt792x_dev *dev);
+int mt7932_mcu_load_customer_cfg(struct mt792x_dev *dev);
+int mt7932_mcu_load_power_transcript(struct mt792x_dev *dev);
+
+enum mt7932_live_start_phase {
+	MT7932_LIVE_PHASE_PRE_CAL = 1,
+	MT7932_LIVE_PHASE_AU_UPDATE,
+};
+
+int mt7932_mcu_load_live_start_phase(struct mt792x_dev *dev, u8 phase);
+int mt7932_mcu_set_6g_scan(struct mt792x_dev *dev, bool enable);
 int mt7932_mcu_load_wcal(struct mt792x_dev *dev);
 int mt7932_mcu_load_one_time_cal(struct mt792x_dev *dev);
+int mt7932_mcu_drain_tx17(struct mt792x_dev *dev, const char *phase,
+			  bool reset_bounce);
 int mt7921_mcu_get_rx_rate(struct mt792x_phy *phy, struct ieee80211_vif *vif,
 			   struct ieee80211_sta *sta, struct rate_info *rate);
 int mt7921_mcu_fw_log_2_host(struct mt792x_dev *dev, u8 ctrl);

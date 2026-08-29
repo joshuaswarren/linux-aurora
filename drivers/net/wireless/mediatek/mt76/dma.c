@@ -13,7 +13,10 @@
  * smaller than the published descriptor ring even though the pre-runtime
  * stream currently contains only 77 acknowledged commands.
  */
-#define MT7932_MCU_WM_BOUNCE_ENTRIES	512
+/* J700's one-time calibration adds 560 commands after firmware boot. Keep the
+ * complete batch distinct until TX17 is drained; the calibrated sender then
+ * resets the cursor only after every descriptor reports DMA_DONE. */
+#define MT7932_MCU_WM_BOUNCE_ENTRIES	1024
 /* 25G83 needs 17 patch plus 583 RAM scatter payloads at 2 KiB. */
 #define MT7932_MCU_FWDL_BOUNCE_ENTRIES	640
 
@@ -263,6 +266,22 @@ void mt76_dma_queue_reset(struct mt76_dev *dev, struct mt76_queue *q,
 	}
 
 	mt76_dma_queue_magic_cnt_init(dev, q);
+	if (reset_idx && mt76_chip(dev) == 0x7932 &&
+	    !mt76_queue_is_emi(q)) {
+		/* Run 191 publishes every disabled MT7932 WFDMA ring in this exact
+		 * order: descriptor base, producer index, then entry count.  DIDX is
+		 * device-owned and is reset later by WPDMA_RST_DTX_PTR.  Generic mt76
+		 * instead wrote CIDX, DIDX, count and base, which can seed a different
+		 * hidden payload/prefetch q-status image while EXT0[15] backup/restore
+		 * is enabled.
+		 */
+		Q_WRITE(q, desc_base, q->desc_dma);
+		Q_WRITE(q, cpu_idx, 0);
+		Q_WRITE(q, ring_size, q->ndesc);
+		q->head = Q_READ(q, dma_idx);
+		q->tail = q->head;
+		return;
+	}
 	if (reset_idx) {
 		if (mt76_queue_is_emi(q))
 			*q->emi_cpu_idx = 0;
@@ -452,18 +471,38 @@ static void
 mt76_dma_tx_cleanup(struct mt76_dev *dev, struct mt76_queue *q, bool flush)
 {
 	struct mt76_queue_entry entry;
+	bool mt7932_cmd;
 	int last;
 
 	if (!q || !q->ndesc)
 		return;
 
 	spin_lock_bh(&q->cleanup_lock);
+	/* MT7932's 24-entry TX17 command ring can have DIDX equal the
+	 * software tail after wrapping while the completed prefix is still
+	 * visible through per-descriptor DDONE.  Apple ignores DIDX here and
+	 * halWpdmaProcessCmdDmaDone() walks DDONE until the first live entry.
+	 */
+	mt7932_cmd = !flush && mt76_chip(dev) == 0x7932 &&
+		     q->hw_idx == 17 && q->tx_bounce_buf;
 	if (flush)
 		last = -1;
 	else
 		last = mt76_dma_read_dma_idx(q, -1);
 
-	while (q->queued > 0 && q->tail != last) {
+	while (q->queued > 0) {
+		if (mt7932_cmd) {
+			__le32 ctrl = READ_ONCE(q->desc[q->tail].ctrl);
+
+			if (!(ctrl & cpu_to_le32(MT_DMA_CTL_DMA_DONE)))
+				break;
+			dma_rmb();
+			WRITE_ONCE(q->desc[q->tail].ctrl,
+				   ctrl & ~cpu_to_le32(MT_DMA_CTL_DMA_DONE));
+		} else if (q->tail == last) {
+			break;
+		}
+
 		mt76_dma_tx_cleanup_idx(dev, q, q->tail, &entry);
 		mt76_npu_txdesc_cleanup(q, q->tail);
 		mt76_queue_tx_complete(dev, q, &entry);
@@ -473,8 +512,8 @@ mt76_dma_tx_cleanup(struct mt76_dev *dev, struct mt76_queue *q, bool flush)
 				mt76_put_txwi(dev, entry.txwi);
 		}
 
-		if (!flush && q->tail == last)
-			last = mt76_dma_read_dma_idx(q, -1);
+		if (!flush && !mt7932_cmd && q->tail == last)
+			last = Q_READ(q, dma_idx);
 	}
 	spin_unlock_bh(&q->cleanup_lock);
 
@@ -671,8 +710,16 @@ mt76_dma_tx_queue_skb_raw(struct mt76_dev *dev, struct mt76_queue *q,
 	if (test_bit(MT76_MCU_RESET, &dev->phy.state))
 		goto error;
 
-	if (q->queued + 1 >= q->ndesc - 1)
+	if (mt76_chip(dev) == 0x7932 && q->hw_idx == 17) {
+		/* Apple accepts the 24-entry command ring while used + 1 is
+		 * strictly below 24, allowing 23 live descriptors.  Generic mt76
+		 * reserves a second slot and rejects at 22.
+		 */
+		if (q->queued + 1 >= q->ndesc)
+			goto error;
+	} else if (q->queued + 1 >= q->ndesc - 1) {
 		goto error;
+	}
 
 	if (q->tx_bounce_buf) {
 		if (skb->len > q->tx_bounce_stride)

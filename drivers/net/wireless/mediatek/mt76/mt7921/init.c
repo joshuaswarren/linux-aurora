@@ -11,12 +11,16 @@
 #include "mcu.h"
 #include "regd.h"
 
-static bool mt7932_load_wcal;
+/* Cycle395 private J700 image: target WCAL/OCA2 are now captured, SHA-pinned
+ * and embedded in the RAM-only initramfs. Keep the runtime parameters so a
+ * later generic build can still override policy, but make this image fit the
+ * proven U-Boot 256-byte bootargs ceiling without dropping PCIe/PM controls. */
+static bool mt7932_load_wcal = true;
 module_param_named(load_wcal, mt7932_load_wcal, bool, 0444);
 MODULE_PARM_DESC(load_wcal,
 		 "load J700 MT7932 FDR WCAL before MAC initialization");
 
-static bool mt7932_load_one_time_cal;
+static bool mt7932_load_one_time_cal = true;
 module_param_named(load_one_time_cal, mt7932_load_one_time_cal, bool, 0444);
 MODULE_PARM_DESC(load_one_time_cal,
 		 "load host-converted J700 MT7932 OCA/IFCAL before MAC initialization");
@@ -112,17 +116,19 @@ static int __mt7921_init_hardware(struct mt792x_dev *dev)
 		goto out;
 	}
 
-	ret = mt7921_mcu_set_eeprom(dev);
-	if (ret) {
-		if (is_mt7932(&dev->mt76))
-			dev_err(dev->mt76.dev,
-				"J700_MT7932_FIRMWARE_GATE_FAIL: stage=efuse-mode ret=%d\n",
-				ret);
-		goto out;
-	}
-	if (is_mt7932(&dev->mt76))
+	if (is_mt7932(&dev->mt76)) {
+		/* mt7921_run_firmware() already emitted exact ordinals 84..134,
+		 * including Apple's mode-3 EFUSE selection.  Do not add the generic
+		 * mode-0 query/ack packet here between pre-cal and WCAL ordinal 135.
+		 */
+		memcpy(dev->mt76.alpha2, "AU", sizeof(dev->mt76.alpha2));
 		dev_info(dev->mt76.dev,
-			 "J700_MT7932_EFUSE_MODE_PASS: source=on-chip external-buffer-hook=disabled-in-25G83\n");
+			 "J700_MT7932_COUNTRY_PIN: alpha2=AU host-policy=1 firmware-phases=XZ-pre-cal,AU-update source=25G83-live-capture\n");
+	} else {
+		ret = mt7921_mcu_set_eeprom(dev);
+		if (ret)
+			goto out;
+	}
 	if (is_mt7932(&dev->mt76) && mt7932_load_wcal) {
 		ret = mt7932_mcu_load_wcal(dev);
 		if (ret) {
@@ -201,7 +207,6 @@ static void mt7921_init_work(struct work_struct *work)
 	mt76_set_stream_caps(&dev->mphy, true);
 	mt7921_set_stream_he_caps(&dev->phy);
 	mt792x_config_mac_addr_list(dev);
-
 	ret = mt76_register_device(&dev->mt76, true, mt76_rates,
 				   ARRAY_SIZE(mt76_rates));
 	if (ret) {
@@ -212,7 +217,21 @@ static void mt7921_init_work(struct work_struct *work)
 		dev_info(dev->mt76.dev,
 			 "J700_MT7932_NETWORK_REGISTER_PASS: firmware=%s\n",
 			 dev->mt76.hw->wiphy->fw_version);
-
+	if (is_mt7932(&dev->mt76)) {
+		/* The later live AU update at 601..643 installs all 2.4/5/6 GHz
+		 * power bodies after net registration.  The pre-cal commands 87..134
+		 * were already sent before WCAL, exactly where the trace places them.
+		 */
+		ret = mt7932_mcu_load_live_start_phase(
+			dev, MT7932_LIVE_PHASE_AU_UPDATE);
+		if (ret)
+			return;
+		ret = mt7932_mcu_drain_tx17(dev, "live-au-post", false);
+		if (ret)
+			return;
+		dev_info(dev->mt76.dev,
+			 "J700_MT7932_LIVE_START_TRANSCRIPT_PASS: phases=pre-cal,au-update commands=94 prerequisites=9 country=AU power=2g,5g,6g source=25G83-macos-ssh-pass\n");
+	}
 	ret = mt7921_init_debugfs(dev);
 	if (ret) {
 		dev_err(dev->mt76.dev, "register debugfs failed\n");
@@ -317,7 +336,21 @@ int mt7921_register_device(struct mt792x_dev *dev)
 	dev->mphy.hw->wiphy->available_antennas_rx = dev->mphy.chainmask;
 	dev->mphy.hw->wiphy->available_antennas_tx = dev->mphy.chainmask;
 
-	queue_work(system_percpu_wq, &dev->init_work);
+	/* J700's MT7932 boot ROM has a bounded interval between the final RAM
+	 * download-config response and CID-2.  The normal per-CPU workqueue let
+	 * init-memory freeing and unrelated USB/HID probes deschedule the final
+	 * scatter burst for more than 100 ms; the same path completes in about
+	 * 7 ms when it is not starved.  Keep the hardware-proven synchronous
+	 * ordering while the inherited-controller handoff is being consolidated.
+	 * Other mt7921-family devices retain the normal deferred workqueue.
+	 */
+	if (is_mt7932(&dev->mt76)) {
+		dev_info(dev->mt76.dev,
+			 "J700_MT7932_SYNCHRONOUS_INIT: reason=bounded-rom-download-window\n");
+		mt7921_init_work(&dev->init_work);
+	} else {
+		queue_work(system_percpu_wq, &dev->init_work);
+	}
 
 	return 0;
 }

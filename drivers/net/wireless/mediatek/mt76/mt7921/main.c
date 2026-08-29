@@ -10,6 +10,9 @@
 #include "regd.h"
 #include "mcu.h"
 
+static bool mt7932_scan_fwlog_enabled;
+static bool mt7932_6g_scan_policy_enabled;
+
 static int
 mt7921_init_he_caps(struct mt792x_phy *phy, enum nl80211_band band,
 		    struct ieee80211_sband_iftype_data *data)
@@ -232,10 +235,34 @@ int __mt7921_start(struct mt792x_phy *phy)
 	err = mt76_connac_mcu_set_mac_enable(mphy->dev, 0, true, false);
 	if (err)
 		return err;
-
-	err = mt76_connac_mcu_set_channel_domain(mphy);
-	if (err)
-		return err;
+	/* MT7932 performs DBDC/domain once in the pre-network-registration path,
+	 * matching Apple.  Other chips retain the generic per-start update.
+	 */
+	if (!is_mt7932(mphy->dev)) {
+		err = mt76_connac_mcu_set_channel_domain(mphy);
+		if (err)
+			return err;
+	}
+	if (is_mt7932(mphy->dev)) {
+		/* Apple sends CID d7 once from wlanOnWhenProbeSuccess(), directly
+		 * after its one-shot domain command.  Repeating it on mac80211's
+		 * second start left CID d7 live at TX17 DIDX in Cycle 479.
+		 */
+		if (!mt7932_6g_scan_policy_enabled) {
+			err = mt7932_mcu_set_6g_scan(phy->dev, true);
+			if (err)
+				return err;
+			mt7932_6g_scan_policy_enabled = true;
+		}
+		if (!mt7932_scan_fwlog_enabled) {
+			err = mt7921_mcu_fw_log_2_host(phy->dev, 2);
+			if (err)
+				return err;
+			mt7932_scan_fwlog_enabled = true;
+			dev_info(mphy->dev->dev,
+				 "J700_MT7932_FW_LOG_MODE_PASS: cid=c5 payload=02/00/00/00 order=after-domain-cidd7-before-interface\n");
+		}
+	}
 
 	err = mt7921_mcu_set_chan_info(phy, MCU_EXT_CMD(SET_RX_PATH));
 	if (err)
@@ -319,6 +346,7 @@ mt7921_add_interface(struct ieee80211_hw *hw, struct ieee80211_vif *vif)
 	mvif->bss_conf.vif = mvif;
 	mvif->bss_conf.mt76.band_idx = 0;
 	mvif->bss_conf.mt76.wmm_idx = mvif->bss_conf.mt76.idx % MT76_CONNAC_MAX_WMM_SETS;
+	idx = MT792x_WTBL_RESERVED - mvif->bss_conf.mt76.idx;
 
 	ret = mt76_connac_mcu_uni_add_dev(&dev->mphy, &vif->bss_conf,
 					  &mvif->bss_conf.mt76,
@@ -328,8 +356,6 @@ mt7921_add_interface(struct ieee80211_hw *hw, struct ieee80211_vif *vif)
 
 	dev->mt76.vif_mask |= BIT_ULL(mvif->bss_conf.mt76.idx);
 	phy->omac_mask |= BIT_ULL(mvif->bss_conf.mt76.omac_idx);
-
-	idx = MT792x_WTBL_RESERVED - mvif->bss_conf.mt76.idx;
 
 	INIT_LIST_HEAD(&mvif->sta.deflink.wcid.poll_list);
 	mvif->sta.deflink.wcid.idx = idx;
@@ -1060,7 +1086,31 @@ mt7921_hw_scan(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 	int err;
 
 	mt792x_mutex_acquire(dev);
+	/* Normal MT7932 start arms mode 2 after channel-domain/CID d7 so interface
+	 * and scan records share Apple's lifecycle.  Keep this fallback for reset
+	 * paths that reach scan without a fresh __mt7921_start().
+	 */
+	if (is_mt7932(&dev->mt76) && !mt7932_scan_fwlog_enabled) {
+		err = mt7921_mcu_fw_log_2_host(dev, 2);
+		if (err)
+			goto out;
+		mt7932_scan_fwlog_enabled = true;
+		dev_info(dev->mt76.dev,
+			 "J700_MT7932_FW_LOG_MODE_PASS: cid=c5 payload=02/00/00/00 order=scan-fallback\n");
+	}
+	/* Apple serializes the pre-scan interface command burst on its workloop.
+	 * Linux can reach hw_scan while an older MT7932 command still owns TX17;
+	 * in Cycle 477 that left CID3 queued behind DIDX 17 forever.  Drain only
+	 * descriptors whose hardware DDONE bit is visible, with a bounded wait,
+	 * before submitting the otherwise byte-identical scan request.
+	 */
+	if (is_mt7932(&dev->mt76)) {
+		err = mt7932_mcu_drain_tx17(dev, "scan-pre", false);
+		if (err)
+			goto out;
+	}
 	err = mt76_connac_mcu_hw_scan(mphy, vif, req);
+out:
 	mt792x_mutex_release(dev);
 
 	return err;
