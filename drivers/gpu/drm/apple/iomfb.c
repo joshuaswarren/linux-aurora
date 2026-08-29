@@ -377,57 +377,13 @@ static int dcp_link_push_context(struct apple_dcp *dcp,
 	*top = next_top;
 
 	dcp_link_sync_for_device();
-	if (remote)
+	if (call_tag == APPLE_DCP_H17P_CALL_START_SIGNAL)
 		dev_info(dcp->dev,
-			 "DCPLink callback-stream %.4s TX %#llx base %#x offset %#x size %#x top %#x->%#x depth %u header %#x/%u/%u\n",
-			 call->tag, message, layout.local_offset, offset,
-			 payload_size, old_top, next_top, depth, call_tag,
-			 in_len, out_len);
-	if (call_tag == APPLE_DCP_H17P_CALL_START_SIGNAL) {
-		afk_log_tx_state(dcp->systemep, "before DCPLink A401");
-		dev_info(dcp->dev,
-			 "DCPLink A401 TX endpoint %#x word %#llx channel cmd stream %u remote %u new %u local base %#x remote base %#x offset %#x size %#x top %#x->%#x depth %u header %#x/%u/%u\n",
-			 APPLE_DCP_LINK_ENDPOINT, message, stream, remote,
-			 new_stream, layout.local_offset, layout.remote_offset,
-			 offset, payload_size, old_top, next_top, depth, call_tag,
-			 in_len, out_len);
-	}
-	ret = dcp_send_message_sync(dcp, APPLE_DCP_LINK_ENDPOINT, message);
-	if (call_tag == APPLE_DCP_H17P_CALL_VI_SET_TEMPERATURE_HINT ||
-	    call_tag == APPLE_DCP_H17P_CALL_PMU_SERVICE_MATCHED ||
-	    call_tag == APPLE_DCP_H17P_CALL_BACKLIGHT_SERVICE_MATCHED)
-		dev_info(dcp->dev,
-			 "DCPLink %.4s TX endpoint %#x word %#llx channel %s stream %u remote %u new %u local base %#x remote base %#x offset %#x size %#x top %#x->%#x depth %u mailbox result %d\n",
-			 call->tag, APPLE_DCP_LINK_ENDPOINT, message,
-			 stream == 1 ? (remote ? "oobcb" : "oobcmd") :
-				       (remote ? "cb" : "cmd"),
-			 stream, remote, new_stream, layout.local_offset,
-			 layout.remote_offset, offset, payload_size, old_top,
-			 next_top, depth, ret);
-	if (call_tag == APPLE_DCP_H17P_CALL_VI_SET_TEMPERATURE_HINT ||
-	    call_tag == APPLE_DCP_H17P_CALL_PMU_SERVICE_MATCHED ||
-	    call_tag == APPLE_DCP_H17P_CALL_BACKLIGHT_SERVICE_MATCHED)
-		dev_info(dcp->dev, "DCPLink %.4s request stack %*phN\n",
-			 call->tag, min_t(u32, payload_size, 32), header);
-	if (ret) {
-		dev_err(dcp->dev,
-			"DCPLink %.4s mailbox send failed: %d\n", call->tag, ret);
-		*top = old_top;
-		ch->callbacks[depth] = NULL;
-		ch->cookies[depth] = NULL;
-		ch->output[depth] = NULL;
-		ch->link_message[depth] = 0;
-		ch->link_size[depth] = 0;
-		dcp_pop_depth(&ch->depth);
-		return ret;
-	}
-	if (remote) {
-		dcp_link_sync_for_cpu();
-		dev_info(dcp->dev,
-			 "DCPLink callback-stream %.4s mailbox send complete payload %*phN\n",
-			 call->tag, min_t(u32, payload_size, 32), header);
-	}
-	return 0;
+			 "DCPLink A401 TX %#llx base %#x offset %#x size %#x top %#x->%#x depth %u header %#x/%u/%u\n",
+			 message, layout.local_offset, offset, payload_size,
+			 old_top, next_top, depth, call_tag, in_len, out_len);
+	dcp_send_message(dcp, APPLE_DCP_LINK_ENDPOINT, message);
+	return;
 
 err_pop:
 	dcp_pop_depth(&ch->depth);
@@ -725,13 +681,6 @@ static void dcp_link_handle_reply(struct apple_dcp *dcp, u64 message)
 	ch->cookies[depth] = NULL;
 	ch->link_message[depth] = 0;
 	ch->link_size[depth] = 0;
-	if (request_call == APPLE_DCP_H17P_CALL_START_SIGNAL) {
-		dev_info(dcp->dev,
-			 "DCPLink A401 reply: endpoint %#x request %#llx reply %#llx stream %u remote %u\n",
-			 APPLE_DCP_LINK_ENDPOINT, request, message, stream, remote);
-		if (dcp_link_service_notifier_pending(dcp))
-			schedule_work(&dcp->link_service_match_work);
-	}
 	if (cb && request_call == APPLE_DCP_H17P_CALL_START_SIGNAL)
 		dev_info(dcp->dev,
 			 "DCPLink A401 invoking completion %ps output %4phN\n",
@@ -747,12 +696,17 @@ static void dcp_link_handle_callback(struct apple_dcp *dcp, u64 message)
 	struct apple_dcp_link_rpc_header *header;
 	struct apple_dcp_link_rpc_view view;
 	struct dcp_channel *ch = &dcp->ch_cb;
+	iomfb_cb_handler handler;
+	bool handled;
+	bool log_callback = dcp->link_rx_log_count < 256;
 	bool remote = apple_dcp_link_message_is_remote(message);
 	void *buffer;
 	char wire_tag[4];
 	u8 stream = apple_dcp_link_message_stream(message);
+	u16 sequence = dcp->link_rx_log_count;
 	u32 offset = FIELD_GET(APPLE_DCP_LINK_MSG_OFFSET, message);
 	u32 total_size = FIELD_GET(APPLE_DCP_LINK_MSG_SIZE, message);
+	u64 reply = apple_dcp_link_rpc_reply(message);
 	u8 depth;
 	int ack_ret;
 	int tag;
@@ -767,23 +721,13 @@ static void dcp_link_handle_callback(struct apple_dcp *dcp, u64 message)
 	}
 	dcp_link_sync_for_cpu();
 	buffer = dcp->shmem + layout.remote_offset;
-	if (dcp->link_rx_log_count < 8) {
+	if (log_callback)
 		dcp->link_rx_log_count++;
-		if (offset <= layout.capacity - sizeof(*header)) {
-			header = buffer + offset;
-			dev_info(dcp->dev,
-				 "DCPLink RX %#llx stream %u remote %u buffer %#x offset %#x size %#x header %#x/%u/%u\n",
-				 message, stream, remote, layout.remote_offset,
-				 offset, total_size, le32_to_cpu(header->call),
-				 le32_to_cpu(header->input_size),
-				 le32_to_cpu(header->output_size));
-		} else {
-			dev_info(dcp->dev,
-				 "DCPLink RX %#llx stream %u remote %u buffer %#x offset %#x size %#x\n",
-				 message, stream, remote, layout.remote_offset,
-				 offset, total_size);
-		}
-	}
+	if (log_callback && offset > layout.capacity - sizeof(*header))
+		dev_info(dcp->dev,
+			 "DCPLink callback %u RX %#llx stream %u remote %u base %#x offset %#x size %#x header out of range\n",
+			 sequence, message, stream, remote, layout.remote_offset,
+			 offset, total_size);
 	ret = apple_dcp_link_rpc_decode(message, buffer,
 					layout.capacity, &view);
 	if (ret) {
@@ -837,12 +781,10 @@ static void dcp_link_handle_callback(struct apple_dcp *dcp, u64 message)
 	if (!dcp->cb_handlers || !dcp->cb_handlers[tag]) {
 		if (log_callback)
 			dev_info(dcp->dev,
-				 "DCPLink callback %u RX %#llx D%03d base %#x offset %#x size %#x in/out %u/%u input %*phN handler none ack %#llx\n",
+				 "DCPLink callback %u RX %#llx D%03d base %#x offset %#x size %#x in/out %u/%u handler none ack %#llx\n",
 				 sequence, message, tag, layout.remote_offset,
 				 view.offset, view.total_size, view.input_size,
-				 view.output_size,
-				 (int)min_t(u32, view.input_size, 72), view.input,
-				 reply);
+				 view.output_size, reply);
 		dev_warn(dcp->dev, "DCPLink callback D%03d has no handler\n", tag);
 		dcp_link_ack(dcp, DCP_CONTEXT_CB);
 		return;
@@ -853,64 +795,22 @@ static void dcp_link_handle_callback(struct apple_dcp *dcp, u64 message)
 	if (log_callback) {
 		if (view.output_size)
 			dev_info(dcp->dev,
-				 "DCPLink callback %u RX %#llx D%03d base %#x offset %#x size %#x in/out %u/%u input %*phN handler %ps result %u out %*phN ack %#llx\n",
+				 "DCPLink callback %u RX %#llx D%03d base %#x offset %#x size %#x in/out %u/%u handler %ps result %u out %*phN ack %#llx\n",
 				 sequence, message, tag, layout.remote_offset,
 				 view.offset, view.total_size, view.input_size,
-				 view.output_size,
-				 (int)min_t(u32, view.input_size, 72), view.input,
-				 handler, handled,
+				 view.output_size, handler, handled,
 				 min_t(u32, view.output_size, 8), view.output,
 				 handled ? reply : 0);
 		else
 			dev_info(dcp->dev,
-				 "DCPLink callback %u RX %#llx D%03d base %#x offset %#x size %#x in/out %u/%u input %*phN handler %ps result %u out - ack %#llx\n",
+				 "DCPLink callback %u RX %#llx D%03d base %#x offset %#x size %#x in/out %u/%u handler %ps result %u out - ack %#llx\n",
 				 sequence, message, tag, layout.remote_offset,
 				 view.offset, view.total_size, view.input_size,
-				 view.output_size,
-				 (int)min_t(u32, view.input_size, 72), view.input,
-				 handler, handled,
+				 view.output_size, handler, handled,
 				 handled ? reply : 0);
 	}
-	if (handled) {
-		ack_ret = dcp_link_ack(dcp, DCP_CONTEXT_CB);
-		if (log_callback && sequence >= 165)
-			dev_info(dcp->dev,
-				 "DCPLink callback %u D%03d ACK %#llx send result %d\n",
-				 sequence, tag, reply, ack_ret);
-	}
-}
-
-static int dcp_link_publish_init(struct apple_dcp *dcp, bool firmware_rendezvous)
-{
-	struct apple_dcp_link_init_desc *desc;
-	int ret = 0;
-
-	mutex_lock(&dcp->link_init_lock);
-	if (dcp->link_state != APPLE_DCP_LINK_WAIT_FIRMWARE_INIT)
-		goto out_unlock;
-
-	desc = dcp->shmem;
-	apple_dcp_link_init_desc_encode(desc, 0, false);
-	dcp_link_sync_for_device();
-	dcp_link_log_init(dcp, desc, dcp->link_init_message);
-	ret = dcp_send_message_sync(dcp, APPLE_DCP_LINK_ENDPOINT,
-				    dcp->link_init_message);
-	if (ret) {
-		dev_err(dcp->dev, "DCPLink INIT mailbox send failed: %d\n", ret);
-		goto out_unlock;
-	}
-
-	dcp->link_state = APPLE_DCP_LINK_WAIT_READY;
-	if (firmware_rendezvous)
-		dev_info(dcp->dev,
-			 "DCPLink type0 received; descriptor published and host INIT sent\n");
-	else
-		dev_info(dcp->dev,
-			 "DCPLink type0 absent after 100 ms; descriptor published and host INIT sent\n");
-
-out_unlock:
-	mutex_unlock(&dcp->link_init_lock);
-	return ret;
+	if (handled)
+		dcp_link_ack(dcp, DCP_CONTEXT_CB);
 }
 
 static int dcp_link_publish_init(struct apple_dcp *dcp, bool firmware_rendezvous)
