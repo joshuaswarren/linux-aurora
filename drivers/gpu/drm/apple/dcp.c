@@ -27,6 +27,7 @@
 #include <linux/usb/typec_altmode.h>
 #include <linux/usb/typec_dp.h>
 #include <linux/usb/typec_mux.h>
+#include <linux/unaligned.h>
 #include <linux/workqueue.h>
 
 #include <drm/drm_fb_dma_helper.h>
@@ -65,6 +66,21 @@
 #define APPLE_T8140_MBOX_A2I_CONTROL 0x110
 #define APPLE_T8140_MBOX_A2I_SEND0 0x800
 #define APPLE_T8140_MBOX_A2I_SEND1 0x808
+
+#define DCP_RTKIT_FOURCC(a, b, c, d) \
+	(((u32)(a) << 24) | ((u32)(b) << 16) | ((u32)(c) << 8) | (u32)(d))
+#define DCP_RTKIT_CRASHLOG_HEADER DCP_RTKIT_FOURCC('C', 'L', 'H', 'E')
+#define DCP_RTKIT_CRASHLOG_STR DCP_RTKIT_FOURCC('C', 's', 't', 'r')
+#define DCP_RTKIT_CRASHLOG_VERSION DCP_RTKIT_FOURCC('C', 'v', 'e', 'r')
+
+struct dcp_rtkit_crashlog_header {
+	__le32 fourcc;
+	__le32 version;
+	__le32 size;
+	__le32 flags;
+	u8 reserved[16];
+};
+static_assert(sizeof(struct dcp_rtkit_crashlog_header) == 0x20);
 
 static bool show_notch;
 module_param(show_notch, bool, 0644);
@@ -291,6 +307,100 @@ static void dcp_rtk_crashed(void *cookie, const void *crashlog, size_t crashlog_
 	complete(&dcp->start_done);
 }
 
+/*
+ * An adopted RTKit session has already initialized EP1, but RTKit's local
+ * crashlog_buffer state starts empty.  The first inherited EP1 type-1 message
+ * can therefore be a crash notification rather than the initial buffer
+ * advertisement.  Recognize it by the crashlog header after mapping the
+ * firmware-owned buffer; an empty buffer remains an ordinary advertisement.
+ */
+static bool dcp_rtk_report_adopted_crashlog(struct apple_dcp *dcp,
+					    struct apple_rtkit_shmem *bfr)
+{
+	struct dcp_rtkit_crashlog_header header;
+	size_t crash_size, offset;
+	u8 *data;
+
+	if (!dcp->adopted_session || bfr != &dcp->rtk->crashlog_buffer ||
+	    !bfr->iomem || bfr->size < sizeof(header))
+		return false;
+
+	dma_rmb();
+	memcpy_fromio(&header, bfr->iomem, sizeof(header));
+	if (le32_to_cpu(header.fourcc) != DCP_RTKIT_CRASHLOG_HEADER)
+		return false;
+
+	crash_size = le32_to_cpu(header.size);
+	if (crash_size < sizeof(header) || crash_size > bfr->size) {
+		dev_err(dcp->dev,
+			"inherited DCP crashlog has invalid size %#zx (buffer %#zx)\n",
+			crash_size, bfr->size);
+		goto crashed;
+	}
+
+	data = kmalloc(crash_size, GFP_KERNEL);
+	if (!data) {
+		dev_err(dcp->dev,
+			"could not allocate %#zx-byte inherited DCP crashlog copy\n",
+			crash_size);
+		goto crashed;
+	}
+
+	memcpy_fromio(data, bfr->iomem, crash_size);
+	dev_err(dcp->dev,
+		"inherited DCP crashlog version %u size %#zx flags %#x\n",
+		le32_to_cpu(header.version), crash_size,
+		le32_to_cpu(header.flags));
+
+	for (offset = sizeof(header); offset + 16 <= crash_size;) {
+		u32 fourcc = get_unaligned_le32(data + offset);
+		u32 section_size = get_unaligned_le32(data + offset + 12);
+		size_t payload_size;
+		const char *text;
+
+		if (fourcc == DCP_RTKIT_CRASHLOG_HEADER)
+			break;
+		if (section_size < 16 || section_size > crash_size - offset) {
+			dev_err(dcp->dev,
+				"inherited DCP crashlog section %#x has invalid size %#x at %#zx\n",
+				fourcc, section_size, offset);
+			break;
+		}
+
+		payload_size = section_size - 16;
+		if (fourcc == DCP_RTKIT_CRASHLOG_STR && payload_size > 4) {
+			u32 id = get_unaligned_le32(data + offset + 16);
+			size_t text_size;
+
+			text = data + offset + 20;
+			text_size = strnlen(text, payload_size - 4);
+			dev_err(dcp->dev, "DCP crash message %u: %.*s\n", id,
+				(int)min_t(size_t, text_size, SZ_4K), text);
+		} else if (fourcc == DCP_RTKIT_CRASHLOG_VERSION &&
+			   payload_size > 16) {
+			size_t text_size;
+
+			text = data + offset + 32;
+			text_size = strnlen(text, payload_size - 16);
+			dev_err(dcp->dev, "DCP firmware version: %.*s\n",
+				(int)min_t(size_t, text_size, SZ_4K), text);
+		} else {
+			dev_info(dcp->dev,
+				 "inherited DCP crashlog section %#x size %#x\n",
+				 fourcc, section_size);
+		}
+
+		offset += section_size;
+	}
+
+	kfree(data);
+
+crashed:
+	dcp->rtk->crashed = true;
+	dcp_rtk_crashed(dcp, NULL, 0);
+	return true;
+}
+
 static int dcp_rtk_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
 {
 	struct apple_dcp *dcp = cookie;
@@ -343,6 +453,7 @@ static int dcp_rtk_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
 			 "RTKit preallocated %s GETBUF %#llx size %#zx DVA %pad PA %pa iomem %p; Normal-NC firmware mapping, no address reply required\n",
 			 owner, request, bfr->size, &bfr->iova, &phy_addr,
 			 bfr->iomem);
+		dcp_rtk_report_adopted_crashlog(dcp, bfr);
 	} else {
 		bfr->buffer = dma_alloc_coherent(dcp->dev, bfr->size,
 						 &bfr->iova, GFP_KERNEL);
