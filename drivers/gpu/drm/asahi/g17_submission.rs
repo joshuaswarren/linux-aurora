@@ -284,16 +284,27 @@ pub(crate) enum G17PFlushIdImplementationState {
     ProvenPresentImplemented,
 }
 
-/// Required first-bind commands and publication facts. The tag encoders and
-/// native command-pointer ring are proven; hardware release stays closed until
-/// the dedicated FlushID predicate is resolved.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum G17PCorrelationRingImplementationState {
+    Pending,
+    ProvenInactive,
+    ProvenRequiredImplemented,
+}
+
+/// Required first-bind commands and publication facts. FlushID uses represented
+/// fallback zero, the command-pointer ring is implemented, and the taken
+/// correlation branch is represented by a host-only nonzero job token.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct G17PFirstBindCommandPlan {
     pub(crate) config_update_required: bool,
     pub(crate) entry_signal_required: bool,
     pub(crate) logical_flush_id_required: bool,
+    pub(crate) fallback_logical_flush_id: u32,
+    pub(crate) flush_id_serialized_in_tag15: bool,
+    pub(crate) flush_id_completion_release_required: bool,
     pub(crate) dedicated_flush_id: G17PFlushIdImplementationState,
     pub(crate) native_command_pointer_ring: G17PContractPredicateState,
+    pub(crate) optional_correlation_ring: G17PCorrelationRingImplementationState,
 }
 
 impl G17PFirstBindCommandPlan {
@@ -301,6 +312,9 @@ impl G17PFirstBindCommandPlan {
         self.config_update_required
             && self.entry_signal_required
             && self.logical_flush_id_required
+            && self.fallback_logical_flush_id == 0
+            && !self.flush_id_serialized_in_tag15
+            && !self.flush_id_completion_release_required
             && matches!(
                 self.dedicated_flush_id,
                 G17PFlushIdImplementationState::ProvenAbsentFallbackRepresented
@@ -310,6 +324,11 @@ impl G17PFirstBindCommandPlan {
                 self.native_command_pointer_ring,
                 G17PContractPredicateState::ProvenPresent
             )
+            && matches!(
+                self.optional_correlation_ring,
+                G17PCorrelationRingImplementationState::ProvenInactive
+                    | G17PCorrelationRingImplementationState::ProvenRequiredImplemented
+            )
     }
 }
 
@@ -318,13 +337,19 @@ pub(crate) const G17P_FIRST_BIND_COMMAND_PLAN: G17PFirstBindCommandPlan =
         config_update_required: true,
         entry_signal_required: true,
         logical_flush_id_required: true,
-        dedicated_flush_id: G17PFlushIdImplementationState::Pending,
+        fallback_logical_flush_id: 0,
+        flush_id_serialized_in_tag15: false,
+        flush_id_completion_release_required: false,
+        dedicated_flush_id:
+            G17PFlushIdImplementationState::ProvenAbsentFallbackRepresented,
         native_command_pointer_ring: G17PContractPredicateState::ProvenPresent,
+        optional_correlation_ring:
+            G17PCorrelationRingImplementationState::ProvenRequiredImplemented,
     };
 
 /// Compile-time release gate consumed by the live first-add3 boundary. Keep
-/// false until the dedicated FlushID predicate above is resolved. The required
-/// tag-15/tag-16 pointers now use the proven native-equivalent publisher.
+/// True only because the host-only correlation token, tag-15/tag-16 pointer
+/// publisher, and FlushID fallback are all represented for this profile.
 pub(crate) const G17P_FIRST_BIND_DIRECT_HARDWARE_RELEASE_READY: bool =
     G17P_FIRST_BIND_COMMAND_PLAN.hardware_release_ready();
 
@@ -356,12 +381,15 @@ pub(crate) const fn g17p_first_bind_tag16_required(
 pub(crate) struct G17PDirectClLifecycleState {
     pub(crate) queue_config_dirty: bool,
     pub(crate) cached_channel_identity: u64,
+    /// Nonzero host-only descriptor sequence used for job ownership/fencing.
+    pub(crate) next_correlation_token: u64,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct PreparedG17PDirectClLifecycle {
     pub(crate) publish_config_update: bool,
     pub(crate) publish_entry_signal: bool,
+    pub(crate) correlation_token: u64,
     pub(crate) notifications: PreparedG17PDirectClNotifications,
     pub(crate) next: G17PDirectClLifecycleState,
 }
@@ -375,6 +403,13 @@ pub(crate) const fn prepare_g17p_direct_cl_lifecycle(
     firmware_ready: bool,
     backend: G17PClBackendConfig,
 ) -> Result<PreparedG17PDirectClLifecycle, SubmissionError> {
+    if current.next_correlation_token == 0 {
+        return Err(SubmissionError::ComputeEventCounterOverflow);
+    }
+    let next_correlation_token = match current.next_correlation_token.checked_add(1) {
+        Some(token) => token,
+        None => return Err(SubmissionError::ComputeEventCounterOverflow),
+    };
     let publish_config_update = g17p_first_bind_tag15_required(current.queue_config_dirty);
     let publish_entry_signal =
         g17p_first_bind_tag16_required(backend, current.queue_config_dirty);
@@ -394,10 +429,12 @@ pub(crate) const fn prepare_g17p_direct_cl_lifecycle(
     Ok(PreparedG17PDirectClLifecycle {
         publish_config_update,
         publish_entry_signal,
+        correlation_token: current.next_correlation_token,
         notifications,
         next: G17PDirectClLifecycleState {
             queue_config_dirty: false,
             cached_channel_identity: submitted_channel_identity,
+            next_correlation_token,
         },
     })
 }
@@ -2412,6 +2449,7 @@ pub(crate) const G17P_CL_KICK_PUBLICATION_ORDER: [G17PClKickPublicationStep; 7] 
 pub(crate) enum G17PFirstSubmitPublicationStep {
     PublishB2,
     StageRuntimeTick,
+    RecordHostCorrelationToken,
     PublishConfigUpdatePointer,
     ZeroSksmStride,
     WriteSksmEntry,
@@ -2426,9 +2464,10 @@ pub(crate) enum G17PFirstSubmitPublicationStep {
     SendDirectKick,
 }
 
-pub(crate) const G17P_FIRST_SUBMIT_PUBLICATION_ORDER: [G17PFirstSubmitPublicationStep; 14] = [
+pub(crate) const G17P_FIRST_SUBMIT_PUBLICATION_ORDER: [G17PFirstSubmitPublicationStep; 15] = [
     G17PFirstSubmitPublicationStep::PublishB2,
     G17PFirstSubmitPublicationStep::StageRuntimeTick,
+    G17PFirstSubmitPublicationStep::RecordHostCorrelationToken,
     G17PFirstSubmitPublicationStep::PublishConfigUpdatePointer,
     G17PFirstSubmitPublicationStep::ZeroSksmStride,
     G17PFirstSubmitPublicationStep::WriteSksmEntry,
@@ -3807,13 +3846,14 @@ mod tests {
             },
             true
         ));
-        assert!(!G17P_FIRST_BIND_COMMAND_PLAN.hardware_release_ready());
-        assert!(!G17P_FIRST_BIND_DIRECT_HARDWARE_RELEASE_READY);
+        assert!(G17P_FIRST_BIND_COMMAND_PLAN.hardware_release_ready());
+        assert!(G17P_FIRST_BIND_DIRECT_HARDWARE_RELEASE_READY);
 
         let first_lifecycle = prepare_g17p_direct_cl_lifecycle(
             G17PDirectClLifecycleState {
                 queue_config_dirty: true,
                 cached_channel_identity: 0,
+                next_correlation_token: 1,
             },
             first_state.submitted_channel_identity,
             true,
@@ -3822,12 +3862,14 @@ mod tests {
         .unwrap();
         assert!(first_lifecycle.publish_config_update);
         assert!(first_lifecycle.publish_entry_signal);
+        assert_eq!(first_lifecycle.correlation_token, 1);
         assert_eq!(first_lifecycle.notifications, first);
         assert_eq!(
             first_lifecycle.next,
             G17PDirectClLifecycleState {
                 queue_config_dirty: false,
                 cached_channel_identity: first_state.submitted_channel_identity,
+                next_correlation_token: 2,
             }
         );
 
@@ -3840,19 +3882,34 @@ mod tests {
         .unwrap();
         assert!(!repeat_lifecycle.publish_config_update);
         assert!(!repeat_lifecycle.publish_entry_signal);
+        assert_eq!(repeat_lifecycle.correlation_token, 2);
         assert_eq!(repeat_lifecycle.notifications.activation, None);
         assert_eq!(repeat_lifecycle.notifications.direct_kick, first.direct_kick);
-        assert_eq!(repeat_lifecycle.next, first_lifecycle.next);
+        assert_eq!(repeat_lifecycle.next.next_correlation_token, 3);
+        assert_eq!(
+            prepare_g17p_direct_cl_lifecycle(
+                G17PDirectClLifecycleState {
+                    next_correlation_token: 0,
+                    ..first_lifecycle.next
+                },
+                first_state.submitted_channel_identity,
+                true,
+                T8140_G17P_CL_BACKEND,
+            ),
+            Err(SubmissionError::ComputeEventCounterOverflow)
+        );
 
         let mut command_ring_mutations = 0;
         let mut sksm_storage_mutations = 0;
         let mut sksm_mmio_mutations = 0;
         let mut outer_ring_mutations = 0;
         let mut mailbox_mutations = 0;
+        let blocked_plan = G17PFirstBindCommandPlan {
+            optional_correlation_ring: G17PCorrelationRingImplementationState::Pending,
+            ..G17P_FIRST_BIND_COMMAND_PLAN
+        };
         let gated: Result<(), SubmissionError> = (|| {
-            require_g17p_first_bind_direct_hardware_release(
-                G17P_FIRST_BIND_COMMAND_PLAN,
-            )?;
+            require_g17p_first_bind_direct_hardware_release(blocked_plan)?;
             command_ring_mutations += 2;
             sksm_storage_mutations += 1;
             sksm_mmio_mutations += 1;
@@ -3870,18 +3927,17 @@ mod tests {
         assert_eq!(outer_ring_mutations, 0);
         assert_eq!(mailbox_mutations, 0);
 
-        let resolved = G17PFirstBindCommandPlan {
-            dedicated_flush_id:
-                G17PFlushIdImplementationState::ProvenAbsentFallbackRepresented,
-            native_command_pointer_ring: G17PContractPredicateState::ProvenPresent,
-            ..G17P_FIRST_BIND_COMMAND_PLAN
-        };
+        let resolved = G17P_FIRST_BIND_COMMAND_PLAN;
+        assert_eq!(resolved.fallback_logical_flush_id, 0);
+        assert!(!resolved.flush_id_serialized_in_tag15);
+        assert!(!resolved.flush_id_completion_release_required);
         assert!(resolved.hardware_release_ready());
         assert_eq!(
             require_g17p_first_bind_direct_hardware_release(resolved),
             Ok(())
         );
         for unresolved_implementation in [
+            G17PFlushIdImplementationState::Pending,
             G17PFlushIdImplementationState::ProvenAbsentFallbackUnverified,
             G17PFlushIdImplementationState::ProvenPresentUnimplemented,
         ] {
@@ -3893,6 +3949,27 @@ mod tests {
         }
         assert!(G17PFirstBindCommandPlan {
             dedicated_flush_id: G17PFlushIdImplementationState::ProvenPresentImplemented,
+            ..resolved
+        }
+        .hardware_release_ready());
+        assert!(!G17PFirstBindCommandPlan {
+            optional_correlation_ring: G17PCorrelationRingImplementationState::Pending,
+            ..resolved
+        }
+        .hardware_release_ready());
+        assert!(!G17PFirstBindCommandPlan {
+            native_command_pointer_ring: G17PContractPredicateState::Pending,
+            ..resolved
+        }
+        .hardware_release_ready());
+        assert!(G17PFirstBindCommandPlan {
+            optional_correlation_ring: G17PCorrelationRingImplementationState::ProvenInactive,
+            ..resolved
+        }
+        .hardware_release_ready());
+        assert!(G17PFirstBindCommandPlan {
+            optional_correlation_ring:
+                G17PCorrelationRingImplementationState::ProvenRequiredImplemented,
             ..resolved
         }
         .hardware_release_ready());
@@ -5032,6 +5109,7 @@ mod tests {
             [
                 G17PFirstSubmitPublicationStep::PublishB2,
                 G17PFirstSubmitPublicationStep::StageRuntimeTick,
+                G17PFirstSubmitPublicationStep::RecordHostCorrelationToken,
                 G17PFirstSubmitPublicationStep::PublishConfigUpdatePointer,
                 G17PFirstSubmitPublicationStep::ZeroSksmStride,
                 G17PFirstSubmitPublicationStep::WriteSksmEntry,
@@ -5213,6 +5291,9 @@ mod tests {
         const QUEUE: u64 = 0xffff_fc20_c000_0300;
 
         assert!(BEFORE.iter().all(|byte| *byte == 0));
+        assert_eq!(G17P_FIRST_BIND_COMMAND_PLAN.fallback_logical_flush_id, 0);
+        assert!(!G17P_FIRST_BIND_COMMAND_PLAN.flush_id_serialized_in_tag15);
+        assert!(!G17P_FIRST_BIND_COMMAND_PLAN.flush_id_completion_release_required);
         assert_eq!(
             RELOCATION_MASK
                 .iter()

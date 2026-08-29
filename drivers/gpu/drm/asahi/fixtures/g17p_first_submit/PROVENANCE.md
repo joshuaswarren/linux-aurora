@@ -55,6 +55,13 @@ The retained channel pointer ring is `0x500` qwords at graph `+0x4000`, ending
 at `+0x6800`. Tag 15 and tag 16 storage is placed after it at aligned offsets
 `+0x6800` and `+0x6c00`; neither object overlaps a repeat-submit ring slot.
 
+T8140 G17P leaves the dedicated `AGXSKSMFlushID` feature bit clear. The first
+host descriptor therefore uses logical fallback ID `0`; that value is absent
+from tag 15 and needs no completion release. The taken descriptor-correlation
+branch is host-only (`IOMallocData`, no GPU alias); Linux represents its
+nonzero sequence through retained queue/job lifecycle state and publishes no
+extra firmware object.
+
 Evidence classification: entry packing and runtime geometry are
 `KEXT_PROVEN`; first/second add3 operands are `EXPERIMENT_PROVEN`. Native queue
 initialization sets `current_timestamp`, `last_add_kicks_timestamp`, and
