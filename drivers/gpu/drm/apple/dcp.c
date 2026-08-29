@@ -828,6 +828,22 @@ static void dcp_destroy_piodma_iommu_dev(struct apple_dcp *dcp)
 	dcp->piodma = NULL;
 }
 
+static bool dcp_preserve_live_adopted_mappings(struct apple_dcp *dcp)
+{
+	u32 cpu_control, cpu_status;
+
+	if (!dcp->adopted_session || !dcp->coproc_reg)
+		return false;
+
+	cpu_control = readl_relaxed(dcp->coproc_reg +
+				    APPLE_DCP_COPROC_CPU_CONTROL);
+	cpu_status = readl_relaxed(dcp->coproc_reg +
+				   APPLE_DCP_COPROC_CPU_STATUS);
+
+	return apple_dcp_preserve_adopted_mappings(dcp->adopted_session,
+						    cpu_control, cpu_status);
+}
+
 static int dcp_get_bw_scratch_reg(struct apple_dcp *dcp, u32 expected)
 {
 	struct of_phandle_args ph_args;
@@ -1273,6 +1289,14 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	}
 
 	if (dcp->adopted_session) {
+#ifdef MODULE
+		if (!dcp->adopted_session_module_pinned) {
+			__module_get(THIS_MODULE);
+			dcp->adopted_session_module_pinned = true;
+			dev_info(dev,
+				 "live inherited RTKit session pins appledrm until reset\n");
+		}
+#endif
 		dev_info(dev, "live inherited RTKit session adopted\n");
 		return 0;
 	}
@@ -1327,6 +1351,11 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 
 	if (!dcp)
 		return;
+	if (dcp_preserve_live_adopted_mappings(dcp)) {
+		dev_info(dev,
+			 "preserving live adopted DCP DMA mappings during component unbind\n");
+		return;
+	}
 
 	if (dcp->hdmi_hpd_irq)
 		disable_irq(dcp->hdmi_hpd_irq);
@@ -1535,6 +1564,14 @@ static void dcp_platform_remove(struct platform_device *pdev)
 
 static void dcp_platform_shutdown(struct platform_device *pdev)
 {
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	if (dcp && dcp_preserve_live_adopted_mappings(dcp)) {
+		dev_info(&pdev->dev,
+			 "preserving live adopted DCP DMA mappings through system reset\n");
+		return;
+	}
+
 	component_del(&pdev->dev, &dcp_comp_ops);
 }
 

@@ -175,6 +175,20 @@ static void apple_dcp_link_stream_layout_test(struct kunit *test)
 	struct apple_dcp_link_stream_layout layout;
 
 	KUNIT_ASSERT_EQ(test,
+			apple_dcp_link_stream_layout(APPLE_DCP_LINK_SIDE_AP, 0,
+						     false, &layout),
+			0);
+	KUNIT_EXPECT_EQ(test, layout.local_offset, 0U);
+	KUNIT_EXPECT_EQ(test, layout.remote_offset, 0x60000U);
+
+	KUNIT_ASSERT_EQ(test,
+			apple_dcp_link_stream_layout(APPLE_DCP_LINK_SIDE_AP, 0,
+						     true, &layout),
+			0);
+	KUNIT_EXPECT_EQ(test, layout.local_offset, 0x20000U);
+	KUNIT_EXPECT_EQ(test, layout.remote_offset, 0x40000U);
+
+	KUNIT_ASSERT_EQ(test,
 			apple_dcp_link_stream_layout(APPLE_DCP_LINK_SIDE_AP, 3,
 						     false, &layout),
 			0);

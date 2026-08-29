@@ -431,15 +431,20 @@ static void dcp_link_handle_callback(struct apple_dcp *dcp, u64 message)
 {
 	struct apple_dcp_link_stream_layout layout;
 	struct apple_dcp_link_method method;
+	struct apple_dcp_link_rpc_header *header;
 	struct apple_dcp_link_rpc_view view;
 	struct dcp_channel *ch = &dcp->ch_cb;
+	bool remote = apple_dcp_link_message_is_remote(message);
+	void *buffer;
 	char wire_tag[4];
 	u8 stream = apple_dcp_link_message_stream(message);
+	u32 offset = FIELD_GET(APPLE_DCP_LINK_MSG_OFFSET, message);
+	u32 total_size = FIELD_GET(APPLE_DCP_LINK_MSG_SIZE, message);
 	u8 depth;
 	int tag;
 	int ret;
 
-	ret = apple_dcp_link_stream_layout(APPLE_DCP_LINK_SIDE_AP, stream, true,
+	ret = apple_dcp_link_stream_layout(APPLE_DCP_LINK_SIDE_AP, stream, remote,
 					   &layout);
 	if (ret) {
 		dcp_send_message(dcp, APPLE_DCP_LINK_ENDPOINT,
@@ -447,8 +452,25 @@ static void dcp_link_handle_callback(struct apple_dcp *dcp, u64 message)
 		return;
 	}
 	dcp_link_sync_for_cpu();
-	ret = apple_dcp_link_rpc_decode(message,
-					dcp->shmem + layout.remote_offset,
+	buffer = dcp->shmem + layout.remote_offset;
+	if (dcp->link_rx_log_count < 8) {
+		dcp->link_rx_log_count++;
+		if (offset <= layout.capacity - sizeof(*header)) {
+			header = buffer + offset;
+			dev_info(dcp->dev,
+				 "DCPLink RX %#llx stream %u remote %u buffer %#x offset %#x size %#x header %#x/%u/%u\n",
+				 message, stream, remote, layout.remote_offset,
+				 offset, total_size, le32_to_cpu(header->call),
+				 le32_to_cpu(header->input_size),
+				 le32_to_cpu(header->output_size));
+		} else {
+			dev_info(dcp->dev,
+				 "DCPLink RX %#llx stream %u remote %u buffer %#x offset %#x size %#x\n",
+				 message, stream, remote, layout.remote_offset,
+				 offset, total_size);
+		}
+	}
+	ret = apple_dcp_link_rpc_decode(message, buffer,
 					layout.capacity, &view);
 	if (ret) {
 		dev_warn(dcp->dev, "DCPLink callback could not be decoded: %d\n",
