@@ -3,7 +3,9 @@
 
 //! Driver for the Apple AGX GPUs found in Apple Silicon SoCs.
 
+mod agx_power_recovery;
 mod alloc;
+mod apple_gpu_topology;
 mod buffer;
 mod channel;
 #[cfg(CONFIG_DEV_COREDUMP)]
@@ -14,9 +16,19 @@ mod event;
 mod file;
 mod float;
 mod fw;
+mod g15_boot;
+mod g15_initdata;
+mod g17_asc_bringup;
+mod g17_boot;
+mod g17_firmware;
+mod g17_initdata;
+mod g17_power_preflight;
+mod g17_rtkit;
+mod g17_submission;
 mod gem;
 mod gpu;
 mod hw;
+mod identity;
 mod initdata;
 mod mem;
 mod microseq;
@@ -26,6 +38,7 @@ mod pgtable;
 mod queue;
 mod regs;
 mod slotalloc;
+mod uat;
 mod util;
 #[cfg(CONFIG_DRM_ASAHI_MAPLE_TREE)]
 mod vm;

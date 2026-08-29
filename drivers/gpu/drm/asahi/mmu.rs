@@ -67,6 +67,7 @@ use crate::{
     mem,
     pgtable,
     slotalloc,
+    uat::UatGeometry,
     util::RangeExt, //
 };
 
@@ -79,8 +80,6 @@ pub(crate) use pgtable::{
     UAT_PGMSK,
     UAT_PGSZ, //
 };
-
-use pgtable::UAT_IAS;
 
 use pin_init;
 
@@ -98,23 +97,50 @@ const UAT_USER_CTX: usize = UAT_NUM_CTX - UAT_USER_CTX_START;
 
 /// Lower/user base VA
 pub(crate) const IOVA_USER_BASE: u64 = UAT_PGSZ as u64;
-/// Lower/user top VA
-pub(crate) const IOVA_USER_TOP: u64 = 1 << (UAT_IAS as u64);
+/// Lower/user top VA. The exposed user ABI remains at 39 bits until the
+/// generation-specific 42-bit PTE/update policies are implemented.
+pub(crate) const IOVA_USER_TOP: u64 = 1 << 39;
 /// Lower/user VA range
 pub(crate) const IOVA_USER_RANGE: Range<u64> = IOVA_USER_BASE..IOVA_USER_TOP;
 
-/// Upper/kernel base VA
-#[cfg(CONFIG_DEV_COREDUMP)]
-const IOVA_TTBR1_BASE: u64 = 0xffffff8000000000;
-/// Driver-managed kernel base VA
-const IOVA_KERN_BASE: u64 = 0xffffffa000000000;
-/// Driver-managed kernel top VA
-const IOVA_KERN_TOP: u64 = 0xffffffb000000000;
-/// Driver-managed kernel VA range
-const IOVA_KERN_RANGE: Range<u64> = IOVA_KERN_BASE..IOVA_KERN_TOP;
-/// Full kernel VA range
-#[cfg(CONFIG_DEV_COREDUMP)]
-const IOVA_KERN_FULL_RANGE: Range<u64> = IOVA_TTBR1_BASE..(!UAT_PGMSK as u64);
+/// Whether the firmware-shared MMU state (Handoff/FlushInfo layout, TTBAT
+/// publication, kernel-half window placement) has been validated against an
+/// AGX3 (G15/G16/G17) firmware build.
+///
+/// The 42-bit walk geometry, the kernel-half VA layout, and the leaf PTE
+/// policy below this boundary are implemented and host-tested (the AGX3 leaf
+/// PTE encoder is byte-identical to AGX2: AGXG17X `encodePTEFlags`
+/// @ 0xfffffe0008b9975c). The [`Handoff`] struct is not an ordinary firmware
+/// input struct that can be byte-grounded from a disassembler: it is a live
+/// AP<->firmware PPL coherence region driven by a Dekker mutual-exclusion
+/// handshake and a `magic_ap`/`magic_fw` exchange (`PPL_MAGIC`), managed by
+/// the RTKit MMU/PPL runtime, not by the AGX message handlers. The on-disk M5
+/// `GFX.a010.macho` confirms the region exists on G17 (`"MMU uat_handoff !map"`
+/// / `"PPL handoff !vm export"` @ 0x2b570 / 0x2b518) but does not expose its
+/// exact field offsets, and -- critically -- [`Handoff::init`] blocks until the
+/// firmware writes `magic_fw == PPL_MAGIC`, so a correct layout can only ever
+/// be *confirmed* by a live boot ACK. This is therefore the one gate that
+/// stays fail-closed by design: it is exactly the "needs a live firmware ACK"
+/// boundary. [`Uat::new`] fails closed on it for 42-bit parts. Flip it only
+/// once a live G15+/G17 boot completes the PPL handshake.
+const AGX3_FIRMWARE_HANDOFF_VALIDATED: bool = false;
+
+/// Return the evidence-backed UAT root geometry for this SoC.
+fn uat_geometry(cfg: &hw::HwConfig) -> Result<UatGeometry> {
+    // 39-bit (G13/G14) and 42-bit (G15+) roots are the two recovered
+    // geometries; anything else is undefined.
+    UatGeometry::new(cfg.uat_ias).ok_or(ENODEV)
+}
+
+/// Driver-managed kernel VA range within the upper root for this SoC.
+///
+/// `0xffffffa000000000..0xffffffb000000000` for 39-bit roots (the
+/// AGX2-proven placement) and the same window offset under the bit-42
+/// selector (`0xfffffc2000000000..0xfffffc3000000000`) for 42-bit roots.
+fn iova_kern_range(cfg: &hw::HwConfig) -> Result<Range<u64>> {
+    let geometry = uat_geometry(cfg)?;
+    Ok(geometry.kernel_va_base()..geometry.kernel_va_top())
+}
 
 const TTBR_VALID: u64 = 0x1; // BIT(0)
 const TTBR_ASID_SHIFT: usize = 48;
@@ -1015,15 +1041,16 @@ impl Vm {
     ) -> Result<Vm> {
         let dummy_obj = gem::new_kernel_object(dev, UAT_PGSZ)?;
         let is_kernel = ttb.is_some();
+        let iova_kern_range = iova_kern_range(cfg)?;
 
         let page_table = if let Some(ttb) = ttb {
-            UatPageTable::new_with_ttb(ttb, IOVA_KERN_RANGE, cfg.uat_oas)?
+            UatPageTable::new_with_ttb(ttb, iova_kern_range.clone(), cfg.uat_ias, cfg.uat_oas)?
         } else {
-            UatPageTable::new(cfg.uat_oas)?
+            UatPageTable::new(cfg.uat_ias, cfg.uat_oas)?
         };
 
         let (va_range, gpuvm_range) = if is_kernel {
-            (IOVA_KERN_RANGE, kernel_range.clone())
+            (iova_kern_range, kernel_range.clone())
         } else {
             (IOVA_USER_RANGE, IOVA_USER_USABLE_RANGE)
         };
@@ -1456,8 +1483,10 @@ impl Uat {
 
     #[cfg(CONFIG_DEV_COREDUMP)]
     pub(crate) fn dump_kernel_pages(&self) -> Result<KVVec<pgtable::DumpedPage>> {
+        // Full upper-half range for this SoC's root geometry.
+        let full_range = uat_geometry(self.cfg)?.upper_canonical_base()..(!UAT_PGMSK as u64);
         let mut inner = self.kernel_vm.inner.exec_lock(None, false)?;
-        inner.page_table.dump_pages(IOVA_KERN_FULL_RANGE)
+        inner.page_table.dump_pages(full_range)
     }
 
     /// Returns the base physical address of the TTBAT region.
@@ -1577,6 +1606,24 @@ impl Uat {
     ) -> Result<Self> {
         dev_info!(dev.as_ref(), "MMU: Initializing...\n");
 
+        // Validate the geometry first: 39- and 42-bit roots are the two
+        // recovered layouts, and the page-table walk, kernel-half VA window,
+        // and leaf PTE policy are implemented for both (the AGX3 leaf PTE
+        // encoder is byte-identical to AGX2). What is *not* validated for
+        // AGX3 is the firmware-shared state this constructor touches next:
+        // the Handoff/FlushInfo struct layout and the firmware's view of the
+        // kernel-half window are per-firmware-build ABI observed only on
+        // AGX2. Fail closed on exactly that boundary.
+        let kernel_range = iova_kern_range(cfg)?;
+        if cfg.uat_ias != 39 && !AGX3_FIRMWARE_HANDOFF_VALIDATED {
+            dev_err!(
+                dev.as_ref(),
+                "MMU: {}-bit UAT geometry is implemented, but the AGX3 firmware Handoff ABI and kernel-VA map are unvalidated\n",
+                cfg.uat_ias
+            );
+            return Err(ENODEV);
+        }
+
         let inner = Self::make_inner(dev)?;
 
         let of_node = dev.as_ref().of_node().ok_or(EINVAL)?;
@@ -1591,7 +1638,7 @@ impl Uat {
 
         dev_info!(dev.as_ref(), "MMU: Creating kernel page tables\n");
         let kernel_lower_vm = Vm::new(dev, inner.clone(), IOVA_USER_RANGE, cfg, None, 1)?;
-        let kernel_vm = Vm::new(dev, inner.clone(), IOVA_KERN_RANGE, cfg, Some(ttb1), 0)?;
+        let kernel_vm = Vm::new(dev, inner.clone(), kernel_range, cfg, Some(ttb1), 0)?;
 
         dev_info!(dev.as_ref(), "MMU: Kernel page tables created\n");
 
