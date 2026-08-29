@@ -1380,21 +1380,14 @@ impl G17PManagerConstruction {
         {
             return Err(EINVAL);
         }
-        let primary_event = g17_submission::prepare_g17p_compute_primary_event(
-            0,
-            0,
-            queue.queue_id,
-            queue.producer.completion_selector,
-            prepared_entry.current_timestamp,
-        )
-        .map_err(|_| EINVAL)?;
-
-        let group = queue.compute.stage_initial_channel_group_before_event(
-            descriptor_high,
-            user_layout.queue_context,
-            shared_control,
-            queue.storage.channel_control_gpu_va(),
-        )?;
+        let group = queue
+            .compute
+            .stage_initial_channel_group_without_fallback_event(
+                descriptor_high,
+                user_layout.queue_context,
+                shared_control,
+                queue.storage.channel_control_gpu_va(),
+            )?;
         self.publish_compute_b2_once(queue)?;
         self.stage_compute_runtime_tick_once()?;
         queue.storage.write_entry(
@@ -1404,18 +1397,18 @@ impl G17PManagerConstruction {
         )?;
         fence(Ordering::SeqCst);
         queue.producer = prepared_entry.producer_after;
-        let event_generation = queue
-            .compute
-            .publish_initial_primary_event(primary_event)?;
+        let descriptor_generation =
+            g17_submission::advance_g17p_compute_descriptor_generation(0, 0)
+                .map_err(|_| EINVAL)?;
         self.add_sksm_kicks(registers, queue, 1)?;
         queue.producer.last_add_kicks_timestamp = prepared_entry.current_timestamp;
         dev_info!(
             self.resources.dev().as_ref(),
-            "G17P compute: candidate sksm-entry-event-v1 qid {} entry_offset {:#x} timestamp {:#x} event_generation {}\n",
+            "G17P compute: candidate sksm-entry-direct-v2 qid {} entry_offset {:#x} timestamp {:#x} descriptor_generation {}\n",
             queue.queue_id,
             prepared_entry.entry_offset,
             prepared_entry.current_timestamp,
-            event_generation
+            descriptor_generation
         );
         fence(Ordering::SeqCst);
         let prepared = self

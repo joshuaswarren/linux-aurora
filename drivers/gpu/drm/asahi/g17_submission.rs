@@ -1951,9 +1951,9 @@ pub(crate) struct G17PComputeClCommandState {
     pub(crate) rce_bindings: [G17PClRceBinding; 4],
 }
 
-/// Host-written prefix of the primary selector-0x0e event command.
+/// Host-written prefix of the conditional tag-14 fallback command.
 pub(crate) const G17P_COMPUTE_PRIMARY_EVENT_SIZE: usize = 0x15;
-/// Host-written prefix of the conditional selector-0x10 event command.
+/// Host-written prefix of the descriptor-selected tag-16 command.
 pub(crate) const G17P_COMPUTE_OPTIONAL_EVENT_SIZE: usize = 0x12;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -1964,9 +1964,8 @@ pub(crate) struct G17PComputePrimaryEvent {
     pub(crate) old_timestamp: u64,
 }
 
-/// Descriptor accounting and bytes prepared before the primary event is
-/// made reachable from the channel pointer ring. The generation belongs to
-/// the host CL command descriptor, not to the selector-3 GPU descriptor.
+/// Descriptor accounting and bytes prepared only for the tag-14 fallback.
+/// Direct-feature G17P skips this transport command.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct PreparedG17PComputePrimaryEvent {
     pub(crate) descriptor_generation: u32,
@@ -1979,7 +1978,7 @@ pub(crate) struct G17PComputeOptionalEvent {
     pub(crate) old_timestamp: u64,
 }
 
-/// Encode the primary event command published after the SKSM entry producer.
+/// Encode the tag-14 fallback command used when the direct feature is absent.
 pub(crate) fn encode_g17p_compute_primary_event(
     event: G17PComputePrimaryEvent,
     out: &mut [u8],
@@ -1997,9 +1996,20 @@ pub(crate) fn encode_g17p_compute_primary_event(
     Ok(())
 }
 
-/// Advance the host descriptor's submitted-entry count and prepare the exact
-/// primary event prefix which publishes that generation. Required NOPs are
-/// accounted before the one CL entry, matching the native submit ledger.
+/// Advance the host descriptor's submitted-entry count for one CL entry.
+pub(crate) fn advance_g17p_compute_descriptor_generation(
+    generation_before: u32,
+    nop_count: u32,
+) -> Result<u32, SubmissionError> {
+    generation_before
+        .checked_add(nop_count)
+        .and_then(|generation| generation.checked_add(1))
+        .ok_or(SubmissionError::ComputeEventCounterOverflow)
+}
+
+/// Prepare the tag-14 fallback bytes. Required NOPs are accounted before the
+/// one CL entry; the direct-feature path advances the same generation but
+/// does not call this fallback encoder or publish its pointer.
 pub(crate) fn prepare_g17p_compute_primary_event(
     generation_before: u32,
     nop_count: u32,
@@ -2007,10 +2017,8 @@ pub(crate) fn prepare_g17p_compute_primary_event(
     data_master: u8,
     old_timestamp: u64,
 ) -> Result<PreparedG17PComputePrimaryEvent, SubmissionError> {
-    let descriptor_generation = generation_before
-        .checked_add(nop_count)
-        .and_then(|generation| generation.checked_add(1))
-        .ok_or(SubmissionError::ComputeEventCounterOverflow)?;
+    let descriptor_generation =
+        advance_g17p_compute_descriptor_generation(generation_before, nop_count)?;
     let event_generation = u16::try_from(descriptor_generation)
         .map_err(|_| SubmissionError::ComputeEventCounterOverflow)?;
     let mut bytes = [0u8; G17P_COMPUTE_PRIMARY_EVENT_SIZE];
@@ -2029,8 +2037,8 @@ pub(crate) fn prepare_g17p_compute_primary_event(
     })
 }
 
-/// Encode the event used only when the host descriptor carries its optional
-/// event pointer. The simple first add3 profile does not publish this record.
+/// Encode tag 16 only when the host descriptor carries its optional pointer.
+/// The simple direct first add3 profile does not publish this record.
 pub(crate) fn encode_g17p_compute_optional_event(
     event: G17PComputeOptionalEvent,
     out: &mut [u8],
@@ -2186,16 +2194,12 @@ pub(crate) enum G17PFirstSubmitPublicationStep {
     EntryBarrier,
     PublishSksmProducer,
     AdvanceDescriptorGeneration,
-    WritePrimaryEvent,
-    WritePrimaryEventPointer,
-    PrimaryEventPointerBarrier,
-    PublishPrimaryEventProducer,
     AddKicks,
     PublishCl2,
     SendEpDoorbell,
 }
 
-pub(crate) const G17P_FIRST_SUBMIT_PUBLICATION_ORDER: [G17PFirstSubmitPublicationStep; 14] = [
+pub(crate) const G17P_FIRST_SUBMIT_PUBLICATION_ORDER: [G17PFirstSubmitPublicationStep; 10] = [
     G17PFirstSubmitPublicationStep::PublishB2,
     G17PFirstSubmitPublicationStep::StageRuntimeTick,
     G17PFirstSubmitPublicationStep::ZeroSksmStride,
@@ -2203,10 +2207,6 @@ pub(crate) const G17P_FIRST_SUBMIT_PUBLICATION_ORDER: [G17PFirstSubmitPublicatio
     G17PFirstSubmitPublicationStep::EntryBarrier,
     G17PFirstSubmitPublicationStep::PublishSksmProducer,
     G17PFirstSubmitPublicationStep::AdvanceDescriptorGeneration,
-    G17PFirstSubmitPublicationStep::WritePrimaryEvent,
-    G17PFirstSubmitPublicationStep::WritePrimaryEventPointer,
-    G17PFirstSubmitPublicationStep::PrimaryEventPointerBarrier,
-    G17PFirstSubmitPublicationStep::PublishPrimaryEventProducer,
     G17PFirstSubmitPublicationStep::AddKicks,
     G17PFirstSubmitPublicationStep::PublishCl2,
     G17PFirstSubmitPublicationStep::SendEpDoorbell,
@@ -4620,10 +4620,6 @@ mod tests {
                 G17PFirstSubmitPublicationStep::EntryBarrier,
                 G17PFirstSubmitPublicationStep::PublishSksmProducer,
                 G17PFirstSubmitPublicationStep::AdvanceDescriptorGeneration,
-                G17PFirstSubmitPublicationStep::WritePrimaryEvent,
-                G17PFirstSubmitPublicationStep::WritePrimaryEventPointer,
-                G17PFirstSubmitPublicationStep::PrimaryEventPointerBarrier,
-                G17PFirstSubmitPublicationStep::PublishPrimaryEventProducer,
                 G17PFirstSubmitPublicationStep::AddKicks,
                 G17PFirstSubmitPublicationStep::PublishCl2,
                 G17PFirstSubmitPublicationStep::SendEpDoorbell,
@@ -4632,7 +4628,7 @@ mod tests {
     }
 
     #[test]
-    fn g17p_primary_compute_event_couples_generation_and_old_timestamp() {
+    fn g17p_conditional_transport_events_match_the_independent_fixtures() {
         const PRIMARY: &[u8; G17P_COMPUTE_PRIMARY_EVENT_SIZE] =
             include_bytes!("fixtures/g17p_first_submit/channel-event-primary.bin");
         const OPTIONAL: &[u8; G17P_COMPUTE_OPTIONAL_EVENT_SIZE] =
@@ -4641,6 +4637,8 @@ mod tests {
         let primary = prepare_g17p_compute_primary_event(0, 0, 4, 2, 1).unwrap();
         assert_eq!(primary.descriptor_generation, 1);
         assert_eq!(primary.bytes, *PRIMARY);
+        assert_eq!(advance_g17p_compute_descriptor_generation(0, 0), Ok(1));
+        assert_eq!(advance_g17p_compute_descriptor_generation(2, 3), Ok(6));
 
         let mut optional = [0u8; G17P_COMPUTE_OPTIONAL_EVENT_SIZE];
         encode_g17p_compute_optional_event(
