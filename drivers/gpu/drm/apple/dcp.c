@@ -294,6 +294,16 @@ static void dcp_rtk_crashed(void *cookie, const void *crashlog, size_t crashlog_
 static int dcp_rtk_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
 {
 	struct apple_dcp *dcp = cookie;
+	const char *owner = "unknown endpoint";
+
+	if (bfr == &dcp->rtk->crashlog_buffer)
+		owner = "crashlog EP1";
+	else if (bfr == &dcp->rtk->syslog_buffer)
+		owner = "syslog EP2";
+	else if (bfr == &dcp->rtk->ioreport_buffer)
+		owner = "ioreport EP4";
+	else if (bfr == &dcp->rtk->oslog_buffer)
+		owner = "oslog EP8";
 
 	if (bfr->iova) {
 		struct iommu_domain *domain =
@@ -330,8 +340,8 @@ static int dcp_rtk_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
 			  FIELD_PREP(GENMASK_ULL(51, 44), bfr->size >> 12) |
 			  FIELD_PREP(GENMASK_ULL(43, 0), bfr->iova);
 		dev_info(dcp->dev,
-			 "RTKit preallocated GETBUF %#llx size %#zx DVA %pad PA %pa iomem %p; Normal-NC, no host reply\n",
-			 request, bfr->size, &bfr->iova, &phy_addr,
+			 "RTKit preallocated %s GETBUF %#llx size %#zx DVA %pad PA %pa iomem %p; Normal-NC firmware mapping, no address reply required\n",
+			 owner, request, bfr->size, &bfr->iova, &phy_addr,
 			 bfr->iomem);
 	} else {
 		bfr->buffer = dma_alloc_coherent(dcp->dev, bfr->size,
