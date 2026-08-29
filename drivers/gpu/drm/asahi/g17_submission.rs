@@ -1327,6 +1327,10 @@ pub(crate) fn apply_g17p_populated_operand_directory(
 }
 
 /// Write one distinct low-VM queue-context page for the cold TA/3D pair.
+///
+/// Pair zero uses the untagged first words emitted by the output-positive
+/// `compute_direct` path. The `0x10..` values belong to a different context
+/// family; using them here makes the scheduler follow a null context pointer.
 pub(crate) fn apply_g17p_cold_opening_queue_context(
     stage: G17PColdOpeningStage,
     descriptor: u64,
@@ -1339,13 +1343,13 @@ pub(crate) fn apply_g17p_cold_opening_queue_context(
     out.fill(0);
     let words: &[(usize, u64)] = match stage {
         G17PColdOpeningStage::Tiling => &[
-            (0x200, 0x1000_0000_0000_0004),
+            (0x200, 0x0000_0000_0000_0004),
             (0x220, 0xffff_0c00_0000_0001),
             (0x350, 0x0002_3803_8000_0003),
             (0x378, 0x003f_ffff_ffff_ffff),
         ],
         G17PColdOpeningStage::Fragment => &[
-            (0x200, 0x1000_0400_0000_0004),
+            (0x200, 0x0400_0400_0000_0004),
             (0x220, 0xffff_1800_0000_0003),
             (0x228, 0x0000_0000_0000_0001),
             (0x230, 0x0000_0100_0000_0000),
@@ -3689,13 +3693,20 @@ mod tests {
             apply_g17p_cold_opening_queue_context(stage, descriptor, queue, &mut context).unwrap();
             assert_eq!(get_u64_le(&context, 0x210), descriptor);
             assert_eq!(get_u64_le(&context, 0x218), queue);
+            assert_eq!(
+                get_u64_le(&context, 0x200),
+                match stage {
+                    G17PColdOpeningStage::Tiling => 0x0000_0000_0000_0004,
+                    G17PColdOpeningStage::Fragment => 0x0400_0400_0000_0004,
+                }
+            );
             assert!(supplied.contains(&descriptor));
             assert!(supplied.contains(&queue));
             assert_eq!(
                 source_fixture_fingerprint(&context),
                 match stage {
-                    G17PColdOpeningStage::Tiling => 0x3379_a6bc_2412_1161,
-                    G17PColdOpeningStage::Fragment => 0x9d66_7001_5e08_aa8d,
+                    G17PColdOpeningStage::Tiling => 0x132b_b3dc_4e25_6b11,
+                    G17PColdOpeningStage::Fragment => 0xe077_2820_c345_edd1,
                 }
             );
         }
