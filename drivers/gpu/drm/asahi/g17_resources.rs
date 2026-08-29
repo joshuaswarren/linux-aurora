@@ -107,6 +107,15 @@ fn g17p_control_operand_buffer_va(index: usize) -> Option<u64> {
         .checked_add(index as u64 * G17P_CONTROL_OPERAND_BUFFER_STRIDE as u64)
 }
 
+fn all_ranges_covered(
+    ranges: impl IntoIterator<Item = (u64, u64)>,
+    mut covers: impl FnMut(u64, u64) -> bool,
+) -> bool {
+    ranges
+        .into_iter()
+        .all(|(address, size)| covers(address, size))
+}
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct G17PComputeUserVaLayout {
     pub(crate) descriptors: u64,
@@ -2548,6 +2557,56 @@ impl G17ResourceOwner {
                 state_grid: secondary_state.iova(),
             },
         };
+        let fixed_high_ranges = [
+            ("partial scheduler", &partial_scheduler),
+            ("B2 alias", &primary_b2_alias_1),
+            ("primary index", &partial_primary_index),
+            ("fwctl", &fwctl),
+            ("control shared", &control_shared),
+            ("control shared inner", &control_shared_inner),
+            ("roots", &roots),
+            ("shared cluster", &shared_cluster),
+            ("B2 sentinel", &primary_b2_sentinel),
+            ("hardware region 0", &hw_region_0),
+            ("hardware region 1", &hw_region_1),
+            ("region A", &region_a),
+            ("region C", &region_c),
+            ("primary state", &primary_state),
+            ("secondary state", &secondary_state),
+            ("secondary status A", &secondary_status_a),
+        ];
+        for (name, object) in fixed_high_ranges {
+            if !address_space.uat.kernel_vm().covers_range(
+                object.iova(),
+                object.logical_size as u64,
+                false,
+                false,
+            ) {
+                dev_err!(
+                    dev.as_ref(),
+                    "G17P resources: {} high mapping at {:#x} size {:#x} is incomplete\n",
+                    name,
+                    object.iova(),
+                    object.logical_size
+                );
+                return Err(EIO);
+            }
+        }
+        if !all_ranges_covered(
+            register_windows
+                .iter()
+                .map(|mapping| (mapping.iova(), mapping.size() as u64)),
+            |address, size| {
+                address_space
+                    .uat
+                    .kernel_vm()
+                    .covers_range(address, size, false, false)
+            },
+        ) {
+            dev_err!(dev.as_ref(), "G17P resources: register aperture mapping is incomplete\n");
+            return Err(EIO);
+        }
+        dev_info!(dev.as_ref(), "G17P resources: all kernel-high mappings cover\n");
         validate_handoff(&handoff).map_err(|_| EINVAL)?;
         let region_record_addrs = [hw_region_0.iova(), hw_region_1.iova()];
         shared_cluster.with_bytes_mut(|bytes| {
@@ -3231,6 +3290,19 @@ mod tests {
                 <= owner
         );
         assert!(owner + size < g17_initdata::HW_REGISTER_APERTURE.start);
+    }
+
+    #[test]
+    fn fixed_high_coverage_requires_every_range() {
+        let ranges = [
+            (0xffff_fc20_015e_0000, 0x4000),
+            (0xffff_fc20_c084_8000, 0x10000),
+            (0xffff_fc21_800e_8000, 0x8000),
+        ];
+        assert!(all_ranges_covered(ranges, |_, _| true));
+        assert!(!all_ranges_covered(ranges, |address, _| {
+            address != 0xffff_fc20_c084_8000
+        }));
     }
 
     #[test]
