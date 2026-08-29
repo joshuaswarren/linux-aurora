@@ -34,8 +34,6 @@ static_assert(sizeof(struct dcp_h17p_read_edt_string_reply) == 0x48);
 static const struct dcp_method_entry dcp_methods[dcpep_num_methods] = {
 	IOMFB_METHOD("A000", dcpep_late_init_signal),
 	IOMFB_METHOD("A024", dcpep_setup_video_limits),
-	IOMFB_METHOD("A131", iomfbep_a131_pmu_service_matched),
-	IOMFB_METHOD("A132", iomfbep_a132_backlight_service_matched),
 	IOMFB_METHOD("A389", dcpep_set_create_dfb),
 	IOMFB_METHOD("A386", iomfbep_a358_vi_set_temperature_hint),
 	IOMFB_METHOD("A131", iomfbep_a131_pmu_service_matched),
@@ -176,8 +174,8 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[129] = trampoline_allocate_bandwidth,
 	[201] = trampoline_map_piodma,
 	[202] = trampoline_unmap_piodma,
-	[206] = iomfbep_cb_match_pmu_service_2,
-	[207] = iomfbep_cb_match_backlight_service,
+	[206] = trampoline_true, /* match_pmu_service_2 */
+	[207] = trampoline_true, /* match_backlight_service */
 	[208] = trampoline_nop, /* update_backlight_factor_prop */
 	[209] = trampoline_get_time,
 	[300] = trampoline_pr_publish,

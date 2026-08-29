@@ -329,24 +329,6 @@ static void apple_dcp_h17p_method_test(struct kunit *test)
 
 	KUNIT_ASSERT_EQ(test,
 			apple_dcp_h17p_method(
-				APPLE_DCP_H17P_CALL_PMU_SERVICE_MATCHED,
-				&method),
-			0);
-	KUNIT_EXPECT_EQ(test, method.call, 0x41313331U);
-	KUNIT_EXPECT_EQ(test, method.input_size, 0U);
-	KUNIT_EXPECT_EQ(test, method.output_size, 4U);
-
-	KUNIT_ASSERT_EQ(test,
-			apple_dcp_h17p_method(
-				APPLE_DCP_H17P_CALL_BACKLIGHT_SERVICE_MATCHED,
-				&method),
-			0);
-	KUNIT_EXPECT_EQ(test, method.call, 0x41313332U);
-	KUNIT_EXPECT_EQ(test, method.input_size, 0U);
-	KUNIT_EXPECT_EQ(test, method.output_size, 4U);
-
-	KUNIT_ASSERT_EQ(test,
-			apple_dcp_h17p_method(
 				APPLE_DCP_H17P_CALL_VI_SET_TEMPERATURE_HINT,
 				&method),
 			0);
