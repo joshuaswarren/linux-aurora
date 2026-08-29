@@ -181,6 +181,10 @@ pub(crate) struct FirmwarePageTableRoot {
 }
 
 impl FirmwarePageTableRoot {
+    pub(crate) const fn ttb(&self) -> PhysicalAddr {
+        self.ttb
+    }
+
     #[cfg(CONFIG_DEV_COREDUMP)]
     pub(crate) fn copy_firmware_range(&self, address: u64, size: usize) -> Result<KVVec<u8>> {
         if size == 0 {
@@ -196,6 +200,32 @@ impl FirmwarePageTableRoot {
         )?;
         table.copy_mapped_range(address, &mut data)?;
         Ok(data)
+    }
+}
+
+/// Retained read-only access to the live TTBAT. RTKit can replace context 0's
+/// lower root after Linux has initialized the table, so crash handling must
+/// sample the entry after the firmware reports its crash rather than cache the
+/// boot-time value.
+pub(crate) struct FirmwareContextTableReader {
+    inner: Arc<UatInner>,
+    cfg: UatConfig,
+}
+
+impl Clone for FirmwareContextTableReader {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            cfg: self.cfg,
+        }
+    }
+}
+
+impl FirmwareContextTableReader {
+    pub(crate) fn context0_root(&self) -> Option<FirmwarePageTableRoot> {
+        let shared = self.inner.lock();
+        decode_firmware_ttb_root(shared.ttbs()[0].ttb0.load(Ordering::Acquire), self.cfg)
+            .map(|ttb| FirmwarePageTableRoot { ttb, cfg: self.cfg })
     }
 }
 
@@ -1154,7 +1184,6 @@ pub(crate) struct Uat {
 
     kernel_vm: Vm,
     kernel_lower_vm: Vm,
-    t8140_firmware_context0_root: Option<FirmwarePageTableRoot>,
     t8140_secondary_ttb1: Option<u64>,
     t8140_empty_high_roots: Option<[Vm; 2]>,
     t8140_context_phase: AtomicU8,
@@ -1893,10 +1922,12 @@ impl Uat {
         &self.kernel_lower_vm
     }
 
-    /// Return the boot-firmware context-0 lower root retained before Linux
-    /// installs its own TTB0. This reader never owns or mutates that tree.
-    pub(crate) fn firmware_context0_root(&self) -> Option<FirmwarePageTableRoot> {
-        self.t8140_firmware_context0_root
+    /// Retain a read-only view of the live TTBAT for firmware crash handling.
+    pub(crate) fn firmware_context_table_reader(&self) -> FirmwareContextTableReader {
+        FirmwareContextTableReader {
+            inner: self.inner.clone(),
+            cfg: self.cfg,
+        }
     }
 
     /// Return the kernel-half VA range owned by this UAT.
@@ -2482,27 +2513,6 @@ impl Uat {
 
         let inner = Self::make_inner(dev, handoff_mode)?;
 
-        let t8140_firmware_context0_root = if cfg == UatConfig::T8140 {
-            let shared = inner.lock();
-            decode_firmware_ttb_root(shared.ttbs()[0].ttb0.load(Ordering::Acquire), cfg).map(
-                |ttb| FirmwarePageTableRoot { ttb, cfg },
-            )
-        } else {
-            None
-        };
-        if let Some(root) = t8140_firmware_context0_root {
-            dev_info!(
-                dev.as_ref(),
-                "MMU: preserved boot context-0 root {:#x} for firmware crashlog reads\n",
-                root.ttb
-            );
-        } else if cfg == UatConfig::T8140 {
-            dev_info!(
-                dev.as_ref(),
-                "MMU: boot context-0 root was not populated before Linux takeover\n"
-            );
-        }
-
         let of_node = dev.as_ref().of_node().ok_or(EINVAL)?;
         let res = of_node.reserved_mem_region_to_resource_byname(c_str!("pagetables"))?;
         let ttb1 = res.start();
@@ -2563,7 +2573,6 @@ impl Uat {
             cfg,
             kernel_vm,
             kernel_lower_vm,
-            t8140_firmware_context0_root,
             t8140_secondary_ttb1: if cfg == UatConfig::T8140 {
                 Some(ttb1 + T8140_SECONDARY_SHARED_ROOT_DELTA)
             } else {

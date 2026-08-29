@@ -177,7 +177,7 @@ impl G17PTestStage {
 struct G17PRoleRtkitState {
     dev: ARef<AsahiDevice>,
     processor: G17PProcessor,
-    firmware_crash_root: Option<mmu::FirmwarePageTableRoot>,
+    firmware_contexts: mmu::FirmwareContextTableReader,
     acked: AtomicBool,
     crashed: AtomicBool,
     runtime_events: AtomicU32,
@@ -187,12 +187,12 @@ impl G17PRoleRtkitState {
     fn new(
         dev: ARef<AsahiDevice>,
         processor: G17PProcessor,
-        firmware_crash_root: Option<mmu::FirmwarePageTableRoot>,
+        firmware_contexts: mmu::FirmwareContextTableReader,
     ) -> Self {
         Self {
             dev,
             processor,
-            firmware_crash_root,
+            firmware_contexts,
             acked: AtomicBool::new(false),
             crashed: AtomicBool::new(false),
             runtime_events: AtomicU32::new(0),
@@ -232,17 +232,16 @@ fn capture_g17p_firmware_crash_dva(state: &G17PRoleRtkitState) -> Result {
     // AGXASC reads endpoint-1 buffers through UAT context 0 after masking
     // the RTKit envelope DVA to 40 bits. The active render VM is context 1
     // and cannot own this firmware-preallocated buffer.
-    let crashlog = state
-        .firmware_crash_root
-        .ok_or(EFAULT)?
-        .copy_firmware_range(
-            g17p_rtkit_uat_address(buffer.dva),
-            captured_size,
-        )?;
+    let root = state.firmware_contexts.context0_root().ok_or(EFAULT)?;
+    let crashlog = root.copy_firmware_range(
+        g17p_rtkit_uat_address(buffer.dva),
+        captured_size,
+    )?;
     dev_info!(
         state.dev.as_ref(),
-        "G17P {} crashlog copied from boot context-0 VA {:#x} ({} bytes)\n",
+        "G17P {} crashlog copied through live context-0 root {:#x} VA {:#x} ({} bytes)\n",
         state.processor.name(),
+        root.ttb(),
         g17p_rtkit_uat_address(buffer.dva),
         crashlog.len()
     );
@@ -318,11 +317,17 @@ impl rtkit::Operations for G17PRtkitOps {
         if let Err(error) = capture {
             if firmware_owned {
                 let buffer = data.processor.firmware_crash_buffer();
+                let live_root = data
+                    .firmware_contexts
+                    .context0_root()
+                    .map(|root| root.ttb())
+                    .unwrap_or(0);
                 dev_err!(
                     data.dev.as_ref(),
-                    "G17P {} crashlog copy from DVA {:#x} via context-0 VA {:#x} size {:#x} failed ({:?})\n",
+                    "G17P {} crashlog copy from DVA {:#x} via live context-0 root {:#x} VA {:#x} size {:#x} failed ({:?})\n",
                     data.processor.name(),
                     buffer.dva,
+                    live_root,
                     g17p_rtkit_uat_address(buffer.dva),
                     buffer.size,
                     error
@@ -639,13 +644,13 @@ fn boot_session(
     }
     dev_info!(pdev.as_ref(), "G17P session: providers ready\n");
 
-    let firmware_crash_root = manager.uat().firmware_context0_root();
+    let firmware_contexts = manager.uat().firmware_context_table_reader();
     let gfx_state = Arc::new(
-        G17PRoleRtkitState::new(drm.clone(), G17PProcessor::Gfx, firmware_crash_root),
+        G17PRoleRtkitState::new(drm.clone(), G17PProcessor::Gfx, firmware_contexts.clone()),
         GFP_KERNEL,
     )?;
     let gfx1_state = Arc::new(
-        G17PRoleRtkitState::new(drm.clone(), G17PProcessor::Gfx1, firmware_crash_root),
+        G17PRoleRtkitState::new(drm.clone(), G17PProcessor::Gfx1, firmware_contexts),
         GFP_KERNEL,
     )?;
     let mut gfx_rtkit =
@@ -725,13 +730,16 @@ fn boot_initial_session(
     dev_info!(pdev.as_ref(), "G17P session: providers ready\n");
 
     let mut uat = Some(KBox::new(mmu::Uat::new_t8140(drm, true)?, GFP_KERNEL)?);
-    let firmware_crash_root = uat.as_ref().ok_or(EIO)?.firmware_context0_root();
+    let firmware_contexts = uat
+        .as_ref()
+        .ok_or(EIO)?
+        .firmware_context_table_reader();
     let gfx_state = Arc::new(
-        G17PRoleRtkitState::new(drm.clone(), G17PProcessor::Gfx, firmware_crash_root),
+        G17PRoleRtkitState::new(drm.clone(), G17PProcessor::Gfx, firmware_contexts.clone()),
         GFP_KERNEL,
     )?;
     let gfx1_state = Arc::new(
-        G17PRoleRtkitState::new(drm.clone(), G17PProcessor::Gfx1, firmware_crash_root),
+        G17PRoleRtkitState::new(drm.clone(), G17PProcessor::Gfx1, firmware_contexts),
         GFP_KERNEL,
     )?;
     let mut gfx_rtkit =
