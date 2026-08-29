@@ -569,6 +569,17 @@ fn finish_boot_session(
         "G17P control: 4 primary and 16 secondary records staged\n"
     );
 
+    if test_stage.configures_qid4() {
+        // Native keeps the completed render graph reachable through both
+        // active root slots while firmware consumes the opening 0x20 record.
+        // Producers remain zero until control-done below.
+        manager.stage_compute_bootstrap_render(drm)?;
+        dev_info!(
+            pdev.as_ref(),
+            "G17P roots: bootstrap render graph bound to both slots before control start\n"
+        );
+    }
+
     let control_start = (CONTROL_START_TYPE as u64) << 48;
     Pin::new(&mut gfx_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, control_start)?;
     fsleep(Delta::from_millis(12));
@@ -633,13 +644,6 @@ fn finish_boot_session(
         });
     }
 
-    // Build the render VM and bind context 1 while both inner groups and both
-    // outer producers remain zero. This is the measured pre-0x84 state.
-    manager.stage_compute_bootstrap_render(drm)?;
-    dev_info!(
-        pdev.as_ref(),
-        "G17P compute control: startup render graph ready with inner groups held\n"
-    );
     manager
         .prepare_partial_opening_control_done()
         .inspect_err(|error| {
@@ -654,6 +658,12 @@ fn finish_boot_session(
     dev_info!(
         pdev.as_ref(),
         "G17P compute control: primary done sent before startup work publication\n"
+    );
+
+    manager.split_compute_bootstrap_render_contexts()?;
+    dev_info!(
+        pdev.as_ref(),
+        "G17P roots: opening retired; split to context0/render before work\n"
     );
 
     // Restore and publish 3D first, then restore and publish TA. End with the
