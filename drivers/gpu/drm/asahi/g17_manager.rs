@@ -547,10 +547,6 @@ impl G17PManagerConstruction {
         Ok(())
     }
 
-    pub(crate) fn publish_bootstrap_render_operand_table(&mut self) -> Result {
-        self.resources.publish_bootstrap_render_operand_table()
-    }
-
     /// Publish the staged bootstrap pair after primary control-done.
     pub(crate) fn publish_staged_compute_bootstrap_render(
         &mut self,
