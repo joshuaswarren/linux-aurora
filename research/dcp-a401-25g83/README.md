@@ -66,3 +66,6 @@ data starts at `0x4e7000`.
 
 The full consumer contract and live-log correlation are in
 [`A401_CONSUMER_CONTRACT.md`](A401_CONSUMER_CONTRACT.md).
+It also records why the attempted AP read of a DCP-private reply stream was
+not a valid association discriminator and why the reply error field is not a
+safe substitute.

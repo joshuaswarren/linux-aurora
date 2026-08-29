@@ -16,6 +16,12 @@ DEFAULT_IMAGE = HERE / "extracted" / "t8140dcp-25G83.bin"
 IMAGE_SHA256 = "392abf0c42733c5b35e877f72f2c0a3a610c1f89aa39c0ce8358092451d9a8af"
 IMAGE_SIZE = 15_417_344
 
+BUNDLE_DATA_FILE_OFFSET = 0x4E0000
+LINK_OBJECT_VA = 0x04963D80
+LINK_OBJECT_FILE_OFFSET = 0x9F1D80
+LINK_LOCAL0_RESPONSE_VA = 0x04963E40
+LINK_LOCAL0_RESPONSE_FILE_OFFSET = 0x9F1E40
+
 TEXT_VA = 0x04000000
 TEXT_FILE_OFFSET = 0x027000
 DATA_VA = 0x04459000
@@ -68,6 +74,20 @@ def verify(image: Image) -> None:
         True,
         "firmware build string",
     )
+    require(va_to_offset(LINK_OBJECT_VA), LINK_OBJECT_FILE_OFFSET,
+            "DCPLink object file offset")
+    require(
+        LINK_OBJECT_FILE_OFFSET - BUNDLE_DATA_FILE_OFFSET,
+        0x511D80,
+        "DCPLink object offset in dcp_data",
+    )
+    require(va_to_offset(LINK_LOCAL0_RESPONSE_VA), LINK_LOCAL0_RESPONSE_FILE_OFFSET,
+            "DCPLink local stream 0 response file offset")
+    require(
+        LINK_LOCAL0_RESPONSE_FILE_OFFSET - BUNDLE_DATA_FILE_OFFSET,
+        0x511E40,
+        "DCPLink local stream 0 response offset in dcp_data",
+    )
 
     require(image.slot_target(UNIFIED_PIPELINE_VTABLE, 0x38), 0x04264C38,
             "UnifiedPipeline slot 0x38 / start_ios_gated")
@@ -101,6 +121,13 @@ def verify(image: Image) -> None:
         0x041B543C: 0x0A150108,  # and w8, w8, #0xc3
         0x041B5440: 0x7101091F,  # cmp w8, #0x42
         0x041B781C: 0xF9002509,  # str x9, [x8, #0x48]
+        0x041B552C: 0xB844A268,  # ldur w8, [stream, #0x4a] / remote error
+        0x041B5530: 0x35000D88,  # cbnz w8, firmware abort branch
+        0x041B56E0: 0xD0001429,  # form abort-path target
+        0x041B56F0: 0x17FFFFFA,  # loop after abort call
+        0x04021F18: 0xD503237F,  # abort path entry
+        0x04021F50: 0x94003C88,  # abort reporting call
+        0x04021F58: 0x97FFFFCF,  # non-returning abort call
     }
     for va, expected in instructions.items():
         actual = struct.unpack("<I", image.bytes_at(va, 4))[0]
