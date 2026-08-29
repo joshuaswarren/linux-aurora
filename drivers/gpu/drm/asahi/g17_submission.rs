@@ -220,6 +220,66 @@ pub(crate) const fn encode_tx_doorbell(pipe: PipeType, index: u8) -> Result<u64,
     Ok(MSG_TX_DOORBELL | (pipe as u64) | ((index as u64) << DOORBELL_INDEX_SHIFT))
 }
 
+/// Host state which decides the two distinct EP 0x21 notifications around a
+/// direct G17P CL submit. Activation is first-or-changed-channel state; the
+/// direct kick has its own feature, suppression, and command-enable gates.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PDirectClNotificationState {
+    pub(crate) cached_channel_identity: u64,
+    pub(crate) submitted_channel_identity: u64,
+    pub(crate) firmware_ready: bool,
+    pub(crate) direct_feature: bool,
+    pub(crate) submission_suppressed: bool,
+    pub(crate) command_submission_enabled: bool,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct PreparedG17PDirectClNotifications {
+    pub(crate) activation: Option<u64>,
+    pub(crate) direct_kick: Option<u64>,
+}
+
+/// First/new compute-channel activation. Priority 2 encodes as `0x...0a`;
+/// this is independent of SKSM QID 4 and outer work-channel index 10.
+pub(crate) const fn encode_g17p_cl_activation(priority: u8) -> Result<u64, SubmissionError> {
+    encode_tx_doorbell(PipeType::Compute, priority)
+}
+
+/// Direct CL `kickFirmware(4, 3, false)`, byte-proven as EP 0x21 `0x...10`.
+pub(crate) const fn encode_g17p_direct_cl_kick() -> u64 {
+    MSG_TX_DOORBELL | DOORBELL_KICKFW as u64
+}
+
+/// Pure predicate/encoding boundary. A repeat submit omits activation when the
+/// cached identity already matches, but an enabled, direct, unsuppressed submit
+/// still emits the separate direct kick.
+pub(crate) const fn prepare_g17p_direct_cl_notifications(
+    state: G17PDirectClNotificationState,
+) -> Result<PreparedG17PDirectClNotifications, SubmissionError> {
+    let activation = if state.cached_channel_identity != state.submitted_channel_identity
+        && state.firmware_ready
+    {
+        match encode_g17p_cl_activation(2) {
+            Ok(message) => Some(message),
+            Err(error) => return Err(error),
+        }
+    } else {
+        None
+    };
+    let direct_kick = if state.direct_feature
+        && !state.submission_suppressed
+        && state.command_submission_enabled
+    {
+        Some(encode_g17p_direct_cl_kick())
+    } else {
+        None
+    };
+    Ok(PreparedG17PDirectClNotifications {
+        activation,
+        direct_kick,
+    })
+}
+
 /// Extract the firmware's 6-bit doorbell type from bits [53:48].
 pub(crate) const fn doorbell_type(message: u64) -> u8 {
     ((message >> DOORBELL_TYPE_SHIFT) & DOORBELL_TYPE_MASK) as u8
@@ -3486,6 +3546,67 @@ mod tests {
         assert_eq!(decode_tx_doorbell(kickfw), Ok((PipeType::Vertex, 4)));
         let devctrl = (0x83u64 << 48) | DOORBELL_DEVCTRL as u64;
         assert_eq!(decode_tx_doorbell(devctrl), Ok((PipeType::Fragment, 4)));
+    }
+
+    #[test]
+    fn g17p_direct_cl_notifications_match_first_and_repeat_fixtures() {
+        const ACTIVATION: &[u8; 8] =
+            include_bytes!("fixtures/g17p_first_submit/ep21-first-activation.bin");
+        const DIRECT_KICK: &[u8; 8] =
+            include_bytes!("fixtures/g17p_first_submit/ep21-direct-kick.bin");
+        const FIRST_SEQUENCE: &[u8; 16] =
+            include_bytes!("fixtures/g17p_first_submit/ep21-first-direct-sequence.bin");
+
+        let first_state = G17PDirectClNotificationState {
+            cached_channel_identity: 0,
+            submitted_channel_identity: 0xffff_fc20_c07a_1dc0,
+            firmware_ready: true,
+            direct_feature: true,
+            submission_suppressed: false,
+            command_submission_enabled: true,
+        };
+        let first = prepare_g17p_direct_cl_notifications(first_state).unwrap();
+        assert_eq!(first.activation.unwrap().to_le_bytes(), *ACTIVATION);
+        assert_eq!(first.direct_kick.unwrap().to_le_bytes(), *DIRECT_KICK);
+        let mut sequence = [0u8; 16];
+        sequence[..8].copy_from_slice(&first.activation.unwrap().to_le_bytes());
+        sequence[8..].copy_from_slice(&first.direct_kick.unwrap().to_le_bytes());
+        assert_eq!(sequence, *FIRST_SEQUENCE);
+
+        let repeat = prepare_g17p_direct_cl_notifications(G17PDirectClNotificationState {
+            cached_channel_identity: first_state.submitted_channel_identity,
+            ..first_state
+        })
+        .unwrap();
+        assert_eq!(repeat.activation, None);
+        assert_eq!(repeat.direct_kick.unwrap().to_le_bytes(), *DIRECT_KICK);
+
+        let not_ready = prepare_g17p_direct_cl_notifications(G17PDirectClNotificationState {
+            firmware_ready: false,
+            ..first_state
+        })
+        .unwrap();
+        assert_eq!(not_ready.activation, None);
+        assert_eq!(not_ready.direct_kick.unwrap().to_le_bytes(), *DIRECT_KICK);
+
+        for disabled in [
+            G17PDirectClNotificationState {
+                direct_feature: false,
+                ..first_state
+            },
+            G17PDirectClNotificationState {
+                submission_suppressed: true,
+                ..first_state
+            },
+            G17PDirectClNotificationState {
+                command_submission_enabled: false,
+                ..first_state
+            },
+        ] {
+            let prepared = prepare_g17p_direct_cl_notifications(disabled).unwrap();
+            assert_eq!(prepared.activation.unwrap().to_le_bytes(), *ACTIVATION);
+            assert_eq!(prepared.direct_kick, None);
+        }
     }
 
     #[test]
