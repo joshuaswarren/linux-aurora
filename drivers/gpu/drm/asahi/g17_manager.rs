@@ -1293,6 +1293,7 @@ impl G17PManagerConstruction {
 
     fn submit_translated_add3_channel(
         &mut self,
+        registers: &regs::Resources,
         queue: &mut G17PSksmQueue,
         binding: &G17PComputeUserBinding,
         command: &g17_uapi::TranslatedComputeCommand,
@@ -1359,6 +1360,14 @@ impl G17PManagerConstruction {
         self.publish_compute_b2_once(queue)?;
         self.stage_compute_runtime_tick_once()?;
         fence(Ordering::SeqCst);
+        self.add_sksm_kicks(registers, queue, 1)?;
+        dev_info!(
+            self.resources.dev().as_ref(),
+            "G17P compute: candidate add3-sksm-before-cl2-v1 qid {} add_count 1 current_timestamp {:#x}\n",
+            queue.queue_id,
+            queue.producer.current_timestamp
+        );
+        fence(Ordering::SeqCst);
         let prepared = self
             .resources
             .publish_compute_channel(group.queue, group.write_index)?;
@@ -1388,7 +1397,9 @@ impl G17PManagerConstruction {
 
         if let Some(buffers) = command.g17p_add3_buffers {
             return self
-                .submit_translated_add3_channel(queue, binding, command, context, buffers)
+                .submit_translated_add3_channel(
+                    registers, queue, binding, command, context, buffers,
+                )
                 .map(Some);
         }
 
