@@ -931,7 +931,10 @@ fn map_fresh_zero_object_at(
     address: u64,
     size: usize,
 ) -> Result<mmu::KernelMapping> {
-    let mut object = gem::new_kernel_object(dev, size)?;
+    // This page is part of the firmware-owned render operand graph. Keep the
+    // CPU alias WC so initial zeroes and later firmware stores share one
+    // coherent view.
+    let mut object = gem::new_kernel_object_wc(dev, size)?;
     object.vmap()?.memset(0);
     object.map_at(vm, address, mmu::PROT_GPU_FW_SHARED_RW, false)
 }
@@ -2966,14 +2969,14 @@ impl G17ResourceOwner {
             mmu::UAT_PGSZ as u64,
             mmu::PROT_FW_SHARED_RW,
         )?;
-        let mut secondary_state = MappedObject::new(
+        let mut secondary_state = MappedObject::new_wc(
             dev,
             &address_space.uat,
             SECONDARY_STATE_ALLOC_SIZE,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_FW_SHARED_RW,
         )?;
-        let mut secondary_status_a = MappedObject::new(
+        let mut secondary_status_a = MappedObject::new_wc(
             dev,
             &address_space.uat,
             STATUS_A_ALLOC_SIZE,
