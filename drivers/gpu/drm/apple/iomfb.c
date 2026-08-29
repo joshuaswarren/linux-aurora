@@ -391,7 +391,18 @@ static int dcp_link_push_context(struct apple_dcp *dcp,
 			 message, layout.local_offset, offset, payload_size,
 			 old_top, next_top, depth, call_tag, in_len, out_len);
 	}
-	dcp_send_message(dcp, APPLE_DCP_LINK_ENDPOINT, message);
+	ret = dcp_send_message_sync(dcp, APPLE_DCP_LINK_ENDPOINT, message);
+	if (ret) {
+		dev_err(dcp->dev,
+			"DCPLink %.4s mailbox send failed: %d\n", call->tag, ret);
+		return;
+	}
+	if (remote) {
+		dcp_link_sync_for_cpu();
+		dev_info(dcp->dev,
+			 "DCPLink callback-stream %.4s mailbox send complete payload %*phN\n",
+			 call->tag, min_t(u32, payload_size, 32), header);
+	}
 	return;
 
 err_pop:
