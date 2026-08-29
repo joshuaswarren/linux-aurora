@@ -3135,7 +3135,7 @@ impl G17ResourceOwner {
             "control-shared",
             g17_initdata::CONTROL_SHARED_ADDRESS,
             g17_initdata::CONTROL_SHARED_OBJECT_SIZE,
-            mmu::PROT_GPU_FW_SHARED_RW,
+            mmu::PROT_GPU_FW_PRIV_RW,
         )?;
         control_shared.with_bytes_mut(|bytes| {
             g17_initdata::encode_control_shared(bytes).map_err(|_| EINVAL)
