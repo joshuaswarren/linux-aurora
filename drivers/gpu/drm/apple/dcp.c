@@ -911,6 +911,8 @@ static int dcp_enable_dp2hdmi_hpd(struct apple_dcp *dcp)
 int dcp_wait_ready(struct platform_device *pdev, u64 timeout)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+	u64 start;
+	u64 elapsed_ms;
 	int ret;
 
 	if (dcp->crashed)
@@ -920,7 +922,12 @@ int dcp_wait_ready(struct platform_device *pdev, u64 timeout)
 	if (timeout <= 0)
 		return -ETIMEDOUT;
 
+	start = get_jiffies_64();
 	ret = wait_for_completion_timeout(&dcp->start_done, timeout);
+	elapsed_ms = jiffies64_to_msecs(get_jiffies_64() - start);
+	dev_info(dcp->dev,
+		 "DCP25G83_A401_WAIT_RESULT active %u elapsed_ms %llu\n",
+		 dcp->active, elapsed_ms);
 	if (ret < 0)
 		return ret;
 
