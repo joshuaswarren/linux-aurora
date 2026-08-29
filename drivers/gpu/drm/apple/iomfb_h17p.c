@@ -26,8 +26,8 @@ static_assert(sizeof(struct dcp_h17p_swap_info_request) == 0xe4);
 static const struct dcp_method_entry dcp_methods[dcpep_num_methods] = {
 	IOMFB_METHOD("A000", dcpep_late_init_signal),
 	IOMFB_METHOD("A024", dcpep_setup_video_limits),
-	IOMFB_METHOD("A136", iomfbep_a131_pmu_service_matched),
-	IOMFB_METHOD("A137", iomfbep_a132_backlight_service_matched),
+	IOMFB_METHOD("A131", iomfbep_a131_pmu_service_matched),
+	IOMFB_METHOD("A132", iomfbep_a132_backlight_service_matched),
 	IOMFB_METHOD("A389", dcpep_set_create_dfb),
 	IOMFB_METHOD("A390", iomfbep_a358_vi_set_temperature_hint),
 	IOMFB_METHOD("A401", dcpep_start_signal),
