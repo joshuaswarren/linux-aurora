@@ -1123,18 +1123,11 @@ impl G17PManagerConstruction {
         const COMPLETION_SELECTOR: u8 = 2;
 
         let mut storage = g17_resources::G17PClRuntimeStorage::new(dev, self.uat())?;
-        self.resources
-            .release_native_compute_queue_reservation();
         let compute = g17_resources::G17PComputeDescriptorStorage::new(
             dev,
             self.uat(),
             storage.channel_control_gpu_va(),
         )?;
-        dev_info!(
-            dev.as_ref(),
-            "G17P compute: candidate native-queue-record-v1 queue={:#x}\n",
-            compute.queue_record_gpu_va()
-        );
         let operand_table_gpu_va = storage.operand_table_gpu_va();
         let support_state_gpu_va = storage.support_state_gpu_va();
         let scheduler_state_gpu_va = storage.scheduler_state_gpu_va();
