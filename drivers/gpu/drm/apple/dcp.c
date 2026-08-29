@@ -45,6 +45,8 @@
 #include "parser.h"
 #include "trace.h"
 
+#include "../../../soc/apple/rtkit-internal.h"
+
 #define APPLE_DCP_COPROC_CPU_CONTROL	 0x44
 #define APPLE_DCP_COPROC_CPU_STATUS	 0x48
 #define APPLE_DCP_RTKIT_HANDOFF_PROPERTY "apple,dcp-rtkit-quiesced"
@@ -58,6 +60,11 @@
 #define APPLE_DCP_RTKIT_MGMT_STARTEP_EP GENMASK_ULL(39, 32)
 #define APPLE_DCP_RTKIT_MGMT_STARTEP_FLAG BIT_ULL(1)
 #define APPLE_DCP_RTKIT_EP_MGMT 0
+
+#define APPLE_T8140_MBOX_CONTROL_EMPTY BIT(17)
+#define APPLE_T8140_MBOX_A2I_CONTROL 0x110
+#define APPLE_T8140_MBOX_A2I_SEND0 0x800
+#define APPLE_T8140_MBOX_A2I_SEND1 0x808
 
 static bool show_notch;
 module_param(show_notch, bool, 0644);
@@ -368,6 +375,43 @@ int dcp_send_message_sync(struct apple_dcp *dcp, u8 endpoint, u64 message)
 	trace_dcp_send_msg(dcp, endpoint, message);
 	return apple_rtkit_send_message(dcp->rtk, endpoint, message, NULL,
 					false);
+}
+
+int dcp_try_send_message_if_empty(struct apple_dcp *dcp, u8 endpoint,
+				  u64 message)
+{
+	struct apple_mbox *mbox = dcp->rtk->mbox;
+	unsigned long flags;
+	u32 control;
+	int ret = 0;
+
+	if (!mbox || !mbox->active ||
+	    !of_device_is_compatible(mbox->dev->of_node,
+				     "apple,asc-mailbox-v4"))
+		return -EOPNOTSUPP;
+
+	/*
+	 * DCPLink's native notifier repeats a doorbell only after the previous
+	 * mailbox entry has left the FIFO.  apple_mbox_send() waits up to 500 ms
+	 * when the FIFO is occupied, which stalls the notification poll itself.
+	 * Keep this T8140 handoff path nonblocking and leave the next retry to the
+	 * caller instead of stacking duplicate entries.
+	 */
+	dma_wmb();
+	spin_lock_irqsave(&mbox->tx_lock, flags);
+	control = readl_relaxed(mbox->regs + APPLE_T8140_MBOX_A2I_CONTROL);
+	if (!(control & APPLE_T8140_MBOX_CONTROL_EMPTY)) {
+		ret = -EAGAIN;
+		goto out_unlock;
+	}
+
+	trace_dcp_send_msg(dcp, endpoint, message);
+	writeq_relaxed(message, mbox->regs + APPLE_T8140_MBOX_A2I_SEND0);
+	writeq_relaxed(endpoint, mbox->regs + APPLE_T8140_MBOX_A2I_SEND1);
+
+out_unlock:
+	spin_unlock_irqrestore(&mbox->tx_lock, flags);
+	return ret;
 }
 
 int dcp_start_rtkit_endpoint(struct apple_dcp *dcp, u8 endpoint)
