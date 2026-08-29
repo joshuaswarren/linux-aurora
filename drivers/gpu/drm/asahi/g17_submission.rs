@@ -3891,6 +3891,32 @@ mod tests {
             encode_tx_doorbell(PipeType::Vertex, 2).unwrap()
         );
 
+        let compute = prepare_g17p_compute_channel_work(
+            G17PPartialOpeningOuterChannelState {
+                consumers: [0, 0],
+                producer: 0,
+                queue_gpu_va: 0xffff_fc20_c100_0000,
+                queue_write_index: 3,
+            },
+        )
+        .unwrap();
+        assert_eq!(compute.outer.channel_table_index, 8);
+        assert_eq!(compute.outer.slot_index, 0);
+        assert_eq!(compute.outer.next_producer, 1);
+        assert_eq!(
+            u64::from_le_bytes(compute.outer.slot[8..16].try_into().unwrap()),
+            0xffff_fc20_c100_0000
+        );
+        assert_eq!(
+            u32::from_le_bytes(compute.outer.slot[0x10..0x14].try_into().unwrap()),
+            2
+        );
+        assert_eq!(
+            u32::from_le_bytes(compute.outer.slot[0x14..0x18].try_into().unwrap()),
+            0x0104_0003
+        );
+        assert_eq!(compute.doorbell, 0x0083_0000_0000_000a);
+
         let full = G17PPartialOpeningOuterChannelState {
             consumers: [0, 7],
             producer: 6,
