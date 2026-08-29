@@ -24,6 +24,7 @@
 #include <linux/sizes.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/string.h>
+#include <linux/timekeeping.h>
 #include <linux/usb/typec_altmode.h>
 #include <linux/usb/typec_dp.h>
 #include <linux/usb/typec_mux.h>
@@ -293,6 +294,21 @@ static void dcp_recv_msg(void *cookie, u8 endpoint, u64 message)
 	}
 }
 
+static bool dcp_recv_msg_early(void *cookie, u8 endpoint, u64 message)
+{
+	struct apple_dcp *dcp = cookie;
+	u8 control = message & GENMASK_ULL(7, 0);
+
+	if (endpoint == APPLE_DCP_LINK_ENDPOINT &&
+	    (message & GENMASK_ULL(7, 6)) == BIT_ULL(6))
+		dev_info(dcp->dev,
+			 "DCP25G83_EP37_EARLY_REPLY ns %llu word %#llx control %#x\n",
+			 ktime_get_mono_fast_ns(), message, control);
+
+	/* Preserve normal ordered-workqueue delivery and handler semantics. */
+	return false;
+}
+
 static void dcp_rtk_crashed(void *cookie, const void *crashlog, size_t crashlog_size)
 {
 	struct apple_dcp *dcp = cookie;
@@ -510,6 +526,7 @@ static void dcp_rtk_shmem_destroy(void *cookie, struct apple_rtkit_shmem *bfr)
 static struct apple_rtkit_ops rtkit_ops = {
 	.crashed = dcp_rtk_crashed,
 	.recv_message = dcp_recv_msg,
+	.recv_message_early = dcp_recv_msg_early,
 	.shmem_setup = dcp_rtk_shmem_setup,
 	.shmem_destroy = dcp_rtk_shmem_destroy,
 };
