@@ -660,6 +660,12 @@ fn finish_boot_session(
         "G17P compute control: primary done sent before startup work publication\n"
     );
 
+    manager.publish_bootstrap_render_operand_table()?;
+    dev_info!(
+        pdev.as_ref(),
+        "G17P compute control: firmware binding complete; operand table published\n"
+    );
+
     manager.split_compute_bootstrap_render_contexts()?;
     dev_info!(
         pdev.as_ref(),
