@@ -99,6 +99,47 @@ const UAT_USER_CTX: usize = UAT_NUM_CTX - UAT_USER_CTX_START;
 const T8140_CONTEXT_BOOTSTRAP_SOURCE_HIGH: u8 = 0;
 const T8140_CONTEXT_BOOTSTRAP_EMPTY_HIGH: u8 = 1;
 const T8140_CONTEXT_USER_OWNED: u8 = 2;
+const T8140_CONTEXT_OPENING_RENDER_SHARED: u8 = 3;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct T8140RootLayout {
+    low: [u64; 2],
+    high: [u64; 2],
+}
+
+fn t8140_tagged_root(root: u64, slot: usize) -> u64 {
+    root | TTBR_VALID | ((slot as u64) << TTBR_ASID_SHIFT)
+}
+
+fn t8140_opening_render_layout(render_low: u64, source_high: u64) -> T8140RootLayout {
+    T8140RootLayout {
+        low: [
+            t8140_tagged_root(render_low, 0),
+            t8140_tagged_root(render_low, 1),
+        ],
+        high: [
+            t8140_tagged_root(source_high, 0),
+            t8140_tagged_root(source_high, 1),
+        ],
+    }
+}
+
+fn t8140_split_render_layout(
+    retained_low: u64,
+    render_low: u64,
+    empty_high: [u64; 2],
+) -> T8140RootLayout {
+    T8140RootLayout {
+        low: [
+            t8140_tagged_root(retained_low, 0),
+            t8140_tagged_root(render_low, 1),
+        ],
+        high: [
+            t8140_tagged_root(empty_high[0], 0),
+            t8140_tagged_root(empty_high[1], 1),
+        ],
+    }
+}
 
 /// Lower/user base VA
 pub(crate) const IOVA_USER_BASE: u64 = UAT_PGSZ as u64;
@@ -2218,6 +2259,139 @@ impl Uat {
                 == (empty[1] | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT))
     }
 
+    /// Confirm the root phase used while firmware consumes the 4/16 opening.
+    ///
+    /// The native sequence keeps the render VM's low root and the source
+    /// firmware high root in both active slots until opcode 0x20 has retired.
+    /// The later split is a separate transition at the control-done/work
+    /// boundary.
+    pub(crate) fn t8140_partial_opening_shared_render_context_ready(
+        &self,
+        render: &VmBind,
+    ) -> bool {
+        if self.cfg != UatConfig::T8140
+            || render.slot() != 1
+            || self.t8140_context_phase.load(Ordering::Acquire)
+                != T8140_CONTEXT_OPENING_RENDER_SHARED
+        {
+            return false;
+        }
+        let expected =
+            t8140_opening_render_layout(render.0.ttb(), self.kernel_vm.ttb());
+        let inner = self.inner.lock();
+        let ttbs = inner.ttbs();
+        ttbs[0].ttb0.load(Ordering::Acquire) == expected.low[0]
+            && ttbs[1].ttb0.load(Ordering::Acquire) == expected.low[1]
+            && ttbs[0].ttb1.load(Ordering::Acquire) == expected.high[0]
+            && ttbs[1].ttb1.load(Ordering::Acquire) == expected.high[1]
+    }
+
+    /// Present the render roots in both active slots for the 4/16 opening.
+    ///
+    /// `render` is first acquired through the normal VM binder so its slot
+    /// ownership and lifetime remain governed by [`VmBind`]. No firmware work
+    /// is visible between that bind and this root-table transition.
+    pub(crate) fn install_t8140_partial_opening_shared_render_roots(
+        &self,
+        render: &VmBind,
+    ) -> Result {
+        if self.cfg != UatConfig::T8140 || render.slot() != 1 {
+            return Err(EINVAL);
+        }
+        let empty = self.t8140_empty_high_roots.as_ref().ok_or(EIO)?;
+        let retained_low = self.kernel_lower_vm.ttb();
+        let render_low = render.0.ttb();
+        let empty_high = [empty[0].ttb(), empty[1].ttb()];
+        let current = t8140_split_render_layout(retained_low, render_low, empty_high);
+        let opening = t8140_opening_render_layout(render_low, self.kernel_vm.ttb());
+        let inner = self.inner.lock();
+        inner.handoff().lock();
+        let ttbs = inner.ttbs();
+        let ready = self.t8140_context_phase.load(Ordering::Acquire)
+            == T8140_CONTEXT_USER_OWNED
+            && ttbs[0].ttb0.load(Ordering::Acquire) == current.low[0]
+            && ttbs[1].ttb0.load(Ordering::Acquire) == current.low[1]
+            && ttbs[0].ttb1.load(Ordering::Acquire) == current.high[0]
+            && ttbs[1].ttb1.load(Ordering::Acquire) == current.high[1];
+        if !ready {
+            inner.handoff().unlock();
+            return Err(EIO);
+        }
+        ttbs[0].ttb0.store(opening.low[0], Ordering::Release);
+        ttbs[1].ttb0.store(opening.low[1], Ordering::Release);
+        ttbs[0].ttb1.store(opening.high[0], Ordering::Release);
+        ttbs[1].ttb1.store(opening.high[1], Ordering::Release);
+        self.t8140_context_phase.store(
+            T8140_CONTEXT_OPENING_RENDER_SHARED,
+            Ordering::Release,
+        );
+        inner.handoff().unlock();
+        core::mem::drop(inner);
+
+        mem::tlbi_asid(0);
+        mem::tlbi_asid(1);
+        mem::sync();
+        dev_info!(
+            self.dev.as_ref(),
+            "MMU: opening roots shared low={:#x?} high={:#x?}\n",
+            opening.low,
+            opening.high
+        );
+        Ok(())
+    }
+
+    /// Split the shared opening roots into retained context 0 and render VM 1.
+    /// Firmware has retired opcode 0x20 and the caller has sent control-done;
+    /// no work producer is visible until this transition completes.
+    pub(crate) fn split_t8140_partial_opening_render_roots(
+        &self,
+        render: &VmBind,
+    ) -> Result {
+        if self.cfg != UatConfig::T8140 || render.slot() != 1 {
+            return Err(EINVAL);
+        }
+        let empty = self.t8140_empty_high_roots.as_ref().ok_or(EIO)?;
+        let opening =
+            t8140_opening_render_layout(render.0.ttb(), self.kernel_vm.ttb());
+        let split = t8140_split_render_layout(
+            self.kernel_lower_vm.ttb(),
+            render.0.ttb(),
+            [empty[0].ttb(), empty[1].ttb()],
+        );
+        let inner = self.inner.lock();
+        inner.handoff().lock();
+        let ttbs = inner.ttbs();
+        let ready = self.t8140_context_phase.load(Ordering::Acquire)
+            == T8140_CONTEXT_OPENING_RENDER_SHARED
+            && ttbs[0].ttb0.load(Ordering::Acquire) == opening.low[0]
+            && ttbs[1].ttb0.load(Ordering::Acquire) == opening.low[1]
+            && ttbs[0].ttb1.load(Ordering::Acquire) == opening.high[0]
+            && ttbs[1].ttb1.load(Ordering::Acquire) == opening.high[1];
+        if !ready {
+            inner.handoff().unlock();
+            return Err(EIO);
+        }
+        ttbs[0].ttb0.store(split.low[0], Ordering::Release);
+        ttbs[1].ttb0.store(split.low[1], Ordering::Release);
+        ttbs[0].ttb1.store(split.high[0], Ordering::Release);
+        ttbs[1].ttb1.store(split.high[1], Ordering::Release);
+        self.t8140_context_phase
+            .store(T8140_CONTEXT_USER_OWNED, Ordering::Release);
+        inner.handoff().unlock();
+        core::mem::drop(inner);
+
+        mem::tlbi_asid(0);
+        mem::tlbi_asid(1);
+        mem::sync();
+        dev_info!(
+            self.dev.as_ref(),
+            "MMU: first-work roots split low={:#x?} high={:#x?}\n",
+            split.low,
+            split.high
+        );
+        Ok(())
+    }
+
     /// Replace only the two high roots at the measured first-work boundary.
     /// Both low roots remain resident; the source firmware high root remains
     /// retained by `kernel_vm` but is no longer present in the TTBAT.
@@ -2853,6 +3027,43 @@ mod tests {
         let mut secondary = [0x111, 0x211, 0x999, 0, 0, 0x888, 0, 0];
         assert_eq!(mirror_host_root_entries(&primary, &mut secondary), 3);
         assert_eq!(secondary, [0x111, 0x211, 0x303, 0x433, 0, 0x533, 0, 0]);
+    }
+
+    #[test]
+    fn g17p_opening_uses_render_roots_in_both_slots_then_splits() {
+        let retained_low = 0x1000_1000_0000;
+        let render_low = 0x1000_2000_0000;
+        let source_high = 0x1000_3000_0000;
+        let empty_high = [0x1000_4000_0000, 0x1000_5000_0000];
+
+        let opening = t8140_opening_render_layout(render_low, source_high);
+        assert_eq!(
+            opening.low,
+            [
+                render_low | TTBR_VALID,
+                render_low | TTBR_VALID | (1 << TTBR_ASID_SHIFT),
+            ]
+        );
+        assert_eq!(
+            opening.high,
+            [
+                source_high | TTBR_VALID,
+                source_high | TTBR_VALID | (1 << TTBR_ASID_SHIFT),
+            ]
+        );
+
+        let split = t8140_split_render_layout(retained_low, render_low, empty_high);
+        assert_eq!(split.low[0], retained_low | TTBR_VALID);
+        assert_eq!(
+            split.low[1],
+            render_low | TTBR_VALID | (1 << TTBR_ASID_SHIFT)
+        );
+        assert_eq!(split.high[0], empty_high[0] | TTBR_VALID);
+        assert_eq!(
+            split.high[1],
+            empty_high[1] | TTBR_VALID | (1 << TTBR_ASID_SHIFT)
+        );
+        assert_ne!(opening, split);
     }
 
     #[test]

@@ -523,8 +523,28 @@ impl G17PManagerConstruction {
         if binding.slot() != 1 {
             return Err(EFAULT);
         }
+        self.resources
+            .uat()
+            .install_t8140_partial_opening_shared_render_roots(&binding)?;
         self.render_bind = Some(binding);
         Ok(vm)
+    }
+
+    /// Apply the measured post-opening context split after primary
+    /// control-done and before either first-work producer becomes visible.
+    pub(crate) fn split_compute_bootstrap_render_contexts(&self) -> Result {
+        let binding = self.render_bind.as_ref().ok_or(ENODEV)?;
+        self.resources
+            .uat()
+            .split_t8140_partial_opening_render_roots(binding)?;
+        if !self
+            .resources
+            .uat()
+            .t8140_partial_opening_render_context_ready(binding)
+        {
+            return Err(EFAULT);
+        }
+        Ok(())
     }
 
     /// Publish the staged bootstrap pair after primary control-done.
@@ -536,6 +556,11 @@ impl G17PManagerConstruction {
             || self.render_submission_ordinal != 0
         {
             return Err(EBUSY);
+        }
+        if !self.resources.uat().t8140_partial_opening_render_context_ready(
+            self.render_bind.as_ref().ok_or(ENODEV)?,
+        ) {
+            return Err(EFAULT);
         }
         let (fragment_queue, tiling_queue, previous, late_tiling) = {
             let storage = self.render_storage.as_mut().ok_or(ENODEV)?;
@@ -674,7 +699,7 @@ impl G17PManagerConstruction {
             Some(binding) => self
                 .resources
                 .uat()
-                .t8140_partial_opening_render_context_ready(binding),
+                .t8140_partial_opening_shared_render_context_ready(binding),
             None => self
                 .resources
                 .uat()
