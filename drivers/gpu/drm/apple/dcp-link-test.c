@@ -503,6 +503,15 @@ static void apple_dcp_link_rpc_message_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test,
 			apple_dcp_link_stream_message(message, 4, true, &encoded),
 			-ERANGE);
+
+	KUNIT_ASSERT_EQ(test,
+			apple_dcp_link_ap_call_message(0x10, 0x10, 0, true,
+						       &encoded),
+			0);
+	KUNIT_EXPECT_EQ(test, encoded, 0x0000001000100202ULL);
+	KUNIT_EXPECT_FALSE(test, apple_dcp_link_message_is_remote(encoded));
+	KUNIT_EXPECT_TRUE(test, encoded & APPLE_DCP_LINK_MSG_NESTED);
+	KUNIT_EXPECT_EQ(test, apple_dcp_link_rpc_reply(encoded), 0x242ULL);
 }
 
 static void apple_dcp_link_stack_test(struct kunit *test)
