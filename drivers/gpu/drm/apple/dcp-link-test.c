@@ -580,16 +580,21 @@ static void apple_dcp_h17p_service_match_wire_test(struct kunit *test)
 	u64 message;
 
 	KUNIT_ASSERT_EQ(test,
-			apple_dcp_link_stream_layout(APPLE_DCP_LINK_SIDE_AP, 1,
+			apple_dcp_link_stream_layout(APPLE_DCP_LINK_SIDE_AP, 0,
 						     false, &layout),
 			0);
-	KUNIT_EXPECT_EQ(test, layout.local_offset, 0x8000U);
+	KUNIT_EXPECT_EQ(test, layout.local_offset, 0U);
 	KUNIT_EXPECT_EQ(test, layout.capacity, 0x8000U);
 
 	header = (void *)payload;
 	apple_dcp_link_rpc_header_encode(
 		header, APPLE_DCP_H17P_CALL_VI_SET_TEMPERATURE_HINT, 0, 4);
 	KUNIT_EXPECT_MEMEQ(test, payload, temperature_payload, sizeof(payload));
+	KUNIT_ASSERT_EQ(test,
+			apple_dcp_link_ap_call_message(0, sizeof(payload), 1, false,
+						       true, &message),
+			0);
+	KUNIT_EXPECT_EQ(test, message, 0x0000001000000602ULL);
 
 	memset(payload, 0, sizeof(payload));
 	apple_dcp_link_rpc_header_encode(
@@ -602,10 +607,24 @@ static void apple_dcp_h17p_service_match_wire_test(struct kunit *test)
 	KUNIT_EXPECT_MEMEQ(test, payload, backlight_payload, sizeof(payload));
 
 	KUNIT_ASSERT_EQ(test,
-			apple_dcp_link_ap_call_message(0, sizeof(payload), 1, false,
-						       true, &message),
+			apple_dcp_link_ap_call_message(0x10, sizeof(payload), 0,
+						       false, false, &message),
 			0);
-	KUNIT_EXPECT_EQ(test, message, 0x0000001000000602ULL);
+	KUNIT_EXPECT_EQ(test, message, 0x0000001000100002ULL);
+	KUNIT_EXPECT_EQ(test, apple_dcp_link_message_stream(message), (u8)0);
+	KUNIT_EXPECT_FALSE(test, apple_dcp_link_message_is_remote(message));
+	KUNIT_EXPECT_FALSE(test, message & APPLE_DCP_LINK_MSG_NEW_STREAM);
+}
+
+static void apple_dcp_h17p_service_match_output_test(struct kunit *test)
+{
+	__le32 output = cpu_to_le32(0xa5a5a5a5);
+
+	apple_dcp_h17p_service_match_output(&output, false);
+	KUNIT_EXPECT_EQ(test, le32_to_cpu(output), 0xa5a5a5a5U);
+
+	apple_dcp_h17p_service_match_output(&output, true);
+	KUNIT_EXPECT_EQ(test, le32_to_cpu(output), 1U);
 }
 
 static void apple_dcp_h17p_start_signal_wire_test(struct kunit *test)
@@ -753,6 +772,7 @@ static struct kunit_case apple_dcp_link_test_cases[] = {
 	KUNIT_CASE(apple_dcp_link_rpc_size_test),
 	KUNIT_CASE(apple_dcp_link_rpc_message_test),
 	KUNIT_CASE(apple_dcp_h17p_service_match_wire_test),
+	KUNIT_CASE(apple_dcp_h17p_service_match_output_test),
 	KUNIT_CASE(apple_dcp_h17p_start_signal_wire_test),
 	KUNIT_CASE(apple_dcp_link_stack_test),
 	KUNIT_CASE(apple_dcp_link_rpc_decode_test),

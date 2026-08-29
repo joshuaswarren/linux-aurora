@@ -275,6 +275,13 @@ apple_dcp_h17p_clock_rate(const struct apple_dcp_h17p_clock_request *request,
 	}
 }
 
+static inline void
+apple_dcp_h17p_service_match_output(__le32 *output, bool nested_complete)
+{
+	if (nested_complete)
+		*output = cpu_to_le32(1);
+}
+
 static inline int
 apple_dcp_h17p_callback_method(u32 call, struct apple_dcp_link_method *method)
 {
