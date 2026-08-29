@@ -29,6 +29,14 @@ static inline bool apple_dcp_coprocessor_is_active(u32 cpu_control, u32 cpu_stat
 	return !(cpu_status & APPLE_DCP_COPROC_CPU_STATUS_STOPPED);
 }
 
+static inline bool
+apple_dcp_preserve_adopted_mappings(bool adopted, u32 cpu_control,
+				    u32 cpu_status)
+{
+	return adopted &&
+	       apple_dcp_coprocessor_is_active(cpu_control, cpu_status);
+}
+
 static inline enum apple_dcp_coprocessor_start
 apple_dcp_coprocessor_start_mode(bool loader_quiesced, bool can_adopt,
 				 u32 cpu_control, u32 cpu_status)
