@@ -2913,6 +2913,7 @@ impl G17PClRuntimeStorage {
 #[allow(dead_code)]
 struct G17MappedResources {
     native_private_cluster: MappedObject,
+    partial_computed: MappedObject,
     partial_scheduler: MappedObject,
     partial_primary_index: MappedObject,
     roots: MappedObject,
@@ -3013,6 +3014,13 @@ impl G17ResourceOwner {
         let fwctl_gpu_va = kernel_va_base
             .checked_add(g17_submission::G17P_PARTIAL_OPENING_FWCTL_OFFSET)
             .ok_or(EINVAL)?;
+        let partial_computed = MappedObject::new_wc_at(
+            dev,
+            address_space.uat.kernel_vm(),
+            g17_submission::G17P_PARTIAL_OPENING_COMPUTED_GPU_VA,
+            g17_submission::G17P_PARTIAL_OPENING_PAGE_SIZE,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
         let mut partial_scheduler = MappedObject::new_wc_at(
             dev,
             address_space.uat.kernel_vm(),
@@ -3441,6 +3449,7 @@ impl G17ResourceOwner {
         };
         let fixed_high_ranges = [
             ("native private cluster", &native_private_cluster),
+            ("partial computed", &partial_computed),
             ("partial scheduler", &partial_scheduler),
             ("B2 alias", &primary_b2_alias_1),
             ("primary index", &partial_primary_index),
@@ -3582,6 +3591,7 @@ impl G17ResourceOwner {
             handoff,
             resources: G17MappedResources {
                 native_private_cluster,
+                partial_computed,
                 partial_scheduler,
                 partial_primary_index,
                 roots,
@@ -3971,6 +3981,10 @@ impl G17ResourceOwner {
                 bytes.fill(0);
                 Ok(())
             })?;
+        self.resources.partial_computed.with_bytes_mut(|bytes| {
+            bytes.fill(0);
+            Ok(())
+        })?;
         self.resources
             .partial_primary_index
             .with_bytes_mut(|bytes| {
@@ -4734,7 +4748,7 @@ impl G17ResourceOwner {
         &mut self,
         f: impl FnOnce(&mut [u8], &mut [u8], &mut [u8]) -> Result<R>,
     ) -> Result<R> {
-        let computed = self.resources.primary_b2_sentinel.object.vmap()?;
+        let computed = self.resources.partial_computed.object.vmap()?;
         let region_1 = self.resources.partial_scheduler.object.vmap()?;
         let region_2 = self.resources.primary_b2_alias_1.object.vmap()?;
         let computed = unsafe {
@@ -4820,8 +4834,10 @@ mod tests {
             mapped[17],
             (0x0048_0e1c_000, 0xffff_fc21_800e_8000, 0x8000)
         );
+        let computed = g17_submission::G17P_PARTIAL_OPENING_COMPUTED_GPU_VA;
         let scheduler = g17_submission::G17P_PARTIAL_OPENING_SCHEDULER_GPU_VA;
         let b2_alias = scheduler + 0x8000;
+        assert!(computed + G17P_CL_B2_OBJECT_SIZE as u64 <= scheduler);
         assert!(scheduler + G17P_CL_B2_OBJECT_SIZE as u64 <= b2_alias);
         assert!(b2_alias + G17P_CL_B2_OBJECT_SIZE as u64 <= mapped[0].1);
     }

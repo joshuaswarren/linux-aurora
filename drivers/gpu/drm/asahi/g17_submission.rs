@@ -199,6 +199,8 @@ pub(crate) enum SubmissionError {
     PartialOpeningQueueHeadOutOfRange,
     /// A cold-opening support object does not match its exact encoded extent.
     PartialOpeningGraphObjectSize,
+    /// A first-partial descriptor cannot be represented by its context locators.
+    PartialOpeningDescriptorLocatorUnencodable,
     /// The host/firmware meaning of this in-range top-level tag is unresolved.
     CommandTagUnresolved,
     /// This value is not a grounded G17P top-level command tag.
@@ -627,6 +629,10 @@ pub(crate) const fn prepare_g17p_channel_write(
 // ---------------------------------------------------------------------------
 
 pub(crate) const G17P_PARTIAL_OPENING_PAGE_SIZE: usize = 0x4000;
+/// Firmware-high zero page consumed at +0xe00 after the two instances exchange
+/// their first peer messages. It is not named by an initdata descriptor, but
+/// its fixed mapping is part of the native first-partial topology.
+pub(crate) const G17P_PARTIAL_OPENING_COMPUTED_GPU_VA: u64 = 0xffff_fc20_015d_8000;
 pub(crate) const G17P_PARTIAL_OPENING_SCHEDULER_GPU_VA: u64 = 0xffff_fc20_015e_0000;
 pub(crate) const G17P_PARTIAL_OPENING_SCHEDULER_WORD: u64 = 0x0000_0020_0001_9000;
 /// Firmware-high owner of the four-page primary-index run in the clean
@@ -1341,27 +1347,51 @@ pub(crate) fn apply_g17p_cold_opening_queue_context(
         return Err(SubmissionError::PartialOpeningGraphObjectSize);
     }
     out.fill(0);
-    let words: &[(usize, u64)] = match stage {
-        G17PColdOpeningStage::Tiling => &[
-            (0x200, 0x1000_0000_0000_0004),
-            (0x220, 0xffff_0c00_0000_0001),
-            (0x350, 0x0002_3803_8000_0003),
-            (0x378, 0x003f_ffff_ffff_ffff),
-        ],
-        G17PColdOpeningStage::Fragment => &[
-            (0x200, 0x1000_0400_0000_0004),
-            (0x220, 0xffff_1800_0000_0003),
-            (0x228, 0x0000_0000_0000_0001),
-            (0x230, 0x0000_0100_0000_0000),
-            (0x350, 0x0002_b003_8000_4c05),
-            (0x358, 0x0000_8003_8000_4c3e),
-            (0x360, 0x0000_b803_8000_4c77),
-            (0x368, 0x0000_5003_8000_4cb0),
-            (0x378, 0x003f_ffff_ffff_ffff),
-        ],
+    let (descriptor_base, words, locators): (u64, &[(usize, u64)], &[(usize, u64)]) = match stage {
+        G17PColdOpeningStage::Tiling => (
+            0xffff_fc20_c001_8000,
+            &[
+                (0x200, 0x1000_0000_0000_0004),
+                (0x220, 0xffff_0c00_0000_0001),
+                (0x378, 0x003f_ffff_ffff_ffff),
+            ],
+            &[(0x350, 0x0002_3803_8000_0003)],
+        ),
+        G17PColdOpeningStage::Fragment => (
+            0xffff_fc20_c00b_0000,
+            &[
+                (0x200, 0x1000_0400_0000_0004),
+                (0x220, 0xffff_1800_0000_0003),
+                (0x228, 0x0000_0000_0000_0001),
+                (0x230, 0x0000_0100_0000_0000),
+                (0x378, 0x003f_ffff_ffff_ffff),
+            ],
+            &[
+                (0x350, 0x0002_b003_8000_4c05),
+                (0x358, 0x0000_8003_8000_4c3e),
+                (0x360, 0x0000_b803_8000_4c77),
+                (0x368, 0x0000_5003_8000_4cb0),
+            ],
+        ),
     };
+    let descriptor_delta = descriptor
+        .checked_sub(descriptor_base)
+        .ok_or(SubmissionError::PartialOpeningDescriptorLocatorUnencodable)?;
+    if descriptor_delta & 0x1f != 0 {
+        return Err(SubmissionError::PartialOpeningDescriptorLocatorUnencodable);
+    }
+    let locator_delta = descriptor_delta / 0x20;
     for (offset, value) in words {
         put_u64_le(out, *offset, *value);
+    }
+    for (offset, value) in locators {
+        put_u64_le(
+            out,
+            *offset,
+            value
+                .checked_add(locator_delta)
+                .ok_or(SubmissionError::PartialOpeningDescriptorLocatorUnencodable)?,
+        );
     }
     put_u64_le(out, 0x210, descriptor);
     put_u64_le(out, 0x218, queue);
@@ -3447,6 +3477,10 @@ mod tests {
     fn g17p_partial_opening_pages_and_context_match_the_successful_graph() {
         assert_eq!(G17P_PARTIAL_OPENING_PAGE_SIZE, 0x4000);
         assert_eq!(G17P_PARTIAL_OPENING_SCHEDULER_GPU_VA, 0xffff_fc20_015e_0000);
+        assert_eq!(
+            G17P_PARTIAL_OPENING_COMPUTED_GPU_VA,
+            0xffff_fc20_015d_8000
+        );
         assert_eq!(
             G17P_PARTIAL_OPENING_PRIMARY_INDEX_FIRMWARE_GPU_VA,
             0xffff_fc20_c084_8000
