@@ -84,10 +84,6 @@ const G17P_RENDER_ZERO_SHARED: usize = 0x20000;
 const G17P_RENDER_SHARED_CONTROL: usize = 0x24000;
 const G17P_RENDER_SHARED_CONTROL_INNER: usize = 0x28000;
 const G17P_RENDER_CHANNEL_CONTROL: usize = 0x2c000;
-const G17P_RENDER_TILING_CONTEXT_SCRATCH: usize = 0x30000;
-const G17P_RENDER_TILING_FIRMWARE_SCRATCH: usize = 0x34000;
-const G17P_RENDER_FRAGMENT_CONTEXT_SCRATCH: usize = 0x38000;
-const G17P_RENDER_FRAGMENT_FIRMWARE_SCRATCH: usize = 0x3c000;
 
 const G17P_CONTROL_DIRECTORY_VA: u64 = 0x70_0000_0000;
 // The positive first-partial render root owns 128 16-KiB leaves here. The
@@ -120,6 +116,11 @@ const G17P_BOOTSTRAP_DESCRIPTOR_ZERO_A_VA: u64 = 0xffff_fc20_001c_8000;
 const G17P_BOOTSTRAP_DESCRIPTOR_ZERO_B_VA: u64 = 0xffff_fc20_c07c_0000;
 const G17P_BOOTSTRAP_TA_STATUS_VA: u64 = 0xffff_fc20_0161_0000;
 const G17P_BOOTSTRAP_3D_STATUS_VA: u64 = 0xffff_fc20_0163_0000;
+const G17P_BOOTSTRAP_CONTEXT_PEER_SIZE: usize = 0x20_000;
+const G17P_BOOTSTRAP_TA_CONTEXT_LOW_VA: u64 = 0x70_0043_8000;
+const G17P_BOOTSTRAP_TA_CONTEXT_HIGH_VA: u64 = 0xffff_fc20_001d_8000;
+const G17P_BOOTSTRAP_3D_CONTEXT_LOW_VA: u64 = 0x70_0046_0000;
+const G17P_BOOTSTRAP_3D_CONTEXT_HIGH_VA: u64 = 0xffff_fc20_0020_0000;
 
 fn g17p_control_operand_buffer_va(index: usize) -> Option<u64> {
     if index >= G17P_CONTROL_OPERAND_BUFFER_COUNT {
@@ -366,48 +367,14 @@ fn apply_g17p_generic_descriptor_tail(
     Some(())
 }
 
-/// Keep the render-context scratch view blank while populating the distinct
-/// firmware scratch view with the queue-context record.
-fn apply_g17p_cold_opening_context_views(
-    stage: g17_submission::G17PColdOpeningStage,
-    descriptor: u64,
-    queue: u64,
-    context_scratch: usize,
-    firmware_scratch: usize,
-    raw: &mut [u8],
-) -> core::result::Result<(), g17_submission::SubmissionError> {
-    let context_end = context_scratch
-        .checked_add(G17P_PAGE_SIZE)
-        .ok_or(g17_submission::SubmissionError::PartialOpeningAddressOverflow)?;
-    let firmware_end = firmware_scratch
-        .checked_add(G17P_PAGE_SIZE)
-        .ok_or(g17_submission::SubmissionError::PartialOpeningAddressOverflow)?;
-    raw.get_mut(context_scratch..context_end)
-        .ok_or(g17_submission::SubmissionError::PartialOpeningGraphObjectSize)?
-        .fill(0);
-    g17_submission::apply_g17p_cold_opening_queue_context(
-        stage,
-        descriptor,
-        queue,
-        raw.get_mut(firmware_scratch..firmware_end)
-            .ok_or(g17_submission::SubmissionError::PartialOpeningGraphObjectSize)?,
-    )
-}
-
 fn g17p_cold_opening_optional_addresses(
     support: u64,
     tiling: bool,
 ) -> g17_submission::G17PColdOpeningOptionalAddresses {
     let (context_scratch, firmware_scratch) = if tiling {
-        (
-            support + G17P_RENDER_TILING_CONTEXT_SCRATCH as u64,
-            support + G17P_RENDER_TILING_FIRMWARE_SCRATCH as u64,
-        )
+        (G17P_BOOTSTRAP_TA_CONTEXT_LOW_VA, G17P_BOOTSTRAP_TA_CONTEXT_HIGH_VA)
     } else {
-        (
-            support + G17P_RENDER_FRAGMENT_CONTEXT_SCRATCH as u64,
-            support + G17P_RENDER_FRAGMENT_FIRMWARE_SCRATCH as u64,
-        )
+        (G17P_BOOTSTRAP_3D_CONTEXT_LOW_VA, G17P_BOOTSTRAP_3D_CONTEXT_HIGH_VA)
     };
     g17_submission::G17PColdOpeningOptionalAddresses {
         context_scratch,
@@ -1334,6 +1301,10 @@ pub(crate) struct G17PUserRenderStorage {
     descriptors: MappedObject,
     descriptor_ta_low: mmu::KernelMapping,
     descriptor_3d_low: mmu::KernelMapping,
+    ta_context_peer: MappedObject,
+    ta_context_low: mmu::KernelMapping,
+    fragment_context_peer: MappedObject,
+    fragment_context_low: mmu::KernelMapping,
     graph: MappedObject,
     support: MappedObject,
     render_state: MappedObject,
@@ -2049,6 +2020,60 @@ impl G17PUserRenderStorage {
         }));
 
         let graph_va = graph.iova();
+        let mut ta_context_peer = bootstrap_stage!(
+            "TA context peer",
+            MappedObject::new_wc_at(
+                dev,
+                uat.kernel_vm(),
+                G17P_BOOTSTRAP_TA_CONTEXT_HIGH_VA,
+                G17P_BOOTSTRAP_CONTEXT_PEER_SIZE,
+                mmu::PROT_GPU_FW_SHARED_RW,
+            )
+        );
+        let ta_context_low = bootstrap_stage!(
+            "TA context low alias",
+            ta_context_peer.map_alias_at(
+                uat.kernel_lower_vm(),
+                G17P_BOOTSTRAP_TA_CONTEXT_LOW_VA,
+                mmu::PROT_GPU_SHARED_RO,
+            )
+        );
+        bootstrap_stage!("TA queue context", ta_context_peer.with_bytes_mut(|raw| {
+            g17_submission::apply_g17p_cold_opening_queue_context(
+                g17_submission::G17PColdOpeningStage::Tiling,
+                descriptors.iova(),
+                graph_va + Self::TILING_QUEUE as u64,
+                &mut raw[..mmu::UAT_PGSZ],
+            )
+            .map_err(|_| EINVAL)
+        }));
+        let mut fragment_context_peer = bootstrap_stage!(
+            "3D context peer",
+            MappedObject::new_wc_at(
+                dev,
+                uat.kernel_vm(),
+                G17P_BOOTSTRAP_3D_CONTEXT_HIGH_VA,
+                G17P_BOOTSTRAP_CONTEXT_PEER_SIZE,
+                mmu::PROT_GPU_FW_SHARED_RW,
+            )
+        );
+        let fragment_context_low = bootstrap_stage!(
+            "3D context low alias",
+            fragment_context_peer.map_alias_at(
+                uat.kernel_lower_vm(),
+                G17P_BOOTSTRAP_3D_CONTEXT_LOW_VA,
+                mmu::PROT_GPU_SHARED_RO,
+            )
+        );
+        bootstrap_stage!("3D queue context", fragment_context_peer.with_bytes_mut(|raw| {
+            g17_submission::apply_g17p_cold_opening_queue_context(
+                g17_submission::G17PColdOpeningStage::Fragment,
+                descriptors.iova() + mmu::UAT_PGSZ as u64,
+                graph_va + Self::FRAGMENT_QUEUE as u64,
+                &mut raw[..mmu::UAT_PGSZ],
+            )
+            .map_err(|_| EINVAL)
+        }));
         let graph_addresses = g17_submission::G17PColdOpeningGraphAddresses {
             primary_index: g17_submission::G17P_PARTIAL_OPENING_PRIMARY_INDEX_FIRMWARE_GPU_VA,
             secondary_index: support_va + G17P_RENDER_SECONDARY_INDEX as u64,
@@ -2127,24 +2152,7 @@ impl G17PUserRenderStorage {
                         + g17_submission::G17P_COLD_OPENING_CHANNEL_CONTROL_SIZE],
             )
             .map_err(|_| EINVAL)?;
-            apply_g17p_cold_opening_context_views(
-                g17_submission::G17PColdOpeningStage::Tiling,
-                descriptors.iova(),
-                graph_va + Self::TILING_QUEUE as u64,
-                G17P_RENDER_TILING_CONTEXT_SCRATCH,
-                G17P_RENDER_TILING_FIRMWARE_SCRATCH,
-                raw,
-            )
-            .map_err(|_| EINVAL)?;
-            apply_g17p_cold_opening_context_views(
-                g17_submission::G17PColdOpeningStage::Fragment,
-                descriptors.iova() + 0x4000,
-                graph_va + Self::FRAGMENT_QUEUE as u64,
-                G17P_RENDER_FRAGMENT_CONTEXT_SCRATCH,
-                G17P_RENDER_FRAGMENT_FIRMWARE_SCRATCH,
-                raw,
-            )
-            .map_err(|_| EINVAL)
+            Ok(())
         }));
         bootstrap_stage!("descriptor encoding", descriptors.with_bytes_mut(|raw| {
             let (tiling, fragment) = raw.split_at_mut(0x4000);
@@ -2176,6 +2184,26 @@ impl G17PUserRenderStorage {
             .map_err(|_| EINVAL)?;
             apply_g17p_generic_descriptor_tail(tiling, fragment).ok_or(EINVAL)
         }));
+        dev_info!(
+            dev.as_ref(),
+            "G17P render storage: TA self={:#x} context={:#x}/{:#x} tails={:#x}/{:#x}/{:#x}\n",
+            G17P_BOOTSTRAP_TA_DESCRIPTOR_LOW_VA,
+            G17P_BOOTSTRAP_TA_CONTEXT_LOW_VA,
+            G17P_BOOTSTRAP_TA_CONTEXT_HIGH_VA,
+            G17P_BOOTSTRAP_DESCRIPTOR_ZERO_A_VA,
+            G17P_BOOTSTRAP_DESCRIPTOR_ZERO_B_VA,
+            G17P_BOOTSTRAP_TA_STATUS_VA
+        );
+        dev_info!(
+            dev.as_ref(),
+            "G17P render storage: 3D self={:#x} context={:#x}/{:#x} tails={:#x}/{:#x}/{:#x}\n",
+            G17P_BOOTSTRAP_3D_DESCRIPTOR_LOW_VA,
+            G17P_BOOTSTRAP_3D_CONTEXT_LOW_VA,
+            G17P_BOOTSTRAP_3D_CONTEXT_HIGH_VA,
+            G17P_BOOTSTRAP_DESCRIPTOR_ZERO_A_VA + 4,
+            G17P_BOOTSTRAP_DESCRIPTOR_ZERO_B_VA + 4,
+            G17P_BOOTSTRAP_3D_STATUS_VA
+        );
 
         bootstrap_stage!("queue encoding", graph.with_bytes_mut(|raw| {
             let job_list = graph_va + Self::JOB_LIST as u64;
@@ -2218,6 +2246,10 @@ impl G17PUserRenderStorage {
             descriptors,
             descriptor_ta_low,
             descriptor_3d_low,
+            ta_context_peer,
+            ta_context_low,
+            fragment_context_peer,
+            fragment_context_low,
             graph,
             support,
             render_state,
@@ -2478,6 +2510,38 @@ impl G17PUserRenderStorage {
             && uat.kernel_lower_vm().covers_range(
                 self.descriptor_3d_low.iova(),
                 self.descriptor_3d_low.size() as u64,
+                true,
+                false,
+            )
+            && self.ta_context_peer.iova() == G17P_BOOTSTRAP_TA_CONTEXT_HIGH_VA
+            && self.ta_context_peer.logical_size == G17P_BOOTSTRAP_CONTEXT_PEER_SIZE
+            && uat.kernel_vm().covers_range(
+                self.ta_context_peer.iova(),
+                self.ta_context_peer.logical_size as u64,
+                true,
+                true,
+            )
+            && self.ta_context_low.iova() == G17P_BOOTSTRAP_TA_CONTEXT_LOW_VA
+            && self.ta_context_low.size() == G17P_BOOTSTRAP_CONTEXT_PEER_SIZE
+            && uat.kernel_lower_vm().covers_range(
+                self.ta_context_low.iova(),
+                self.ta_context_low.size() as u64,
+                true,
+                false,
+            )
+            && self.fragment_context_peer.iova() == G17P_BOOTSTRAP_3D_CONTEXT_HIGH_VA
+            && self.fragment_context_peer.logical_size == G17P_BOOTSTRAP_CONTEXT_PEER_SIZE
+            && uat.kernel_vm().covers_range(
+                self.fragment_context_peer.iova(),
+                self.fragment_context_peer.logical_size as u64,
+                true,
+                true,
+            )
+            && self.fragment_context_low.iova() == G17P_BOOTSTRAP_3D_CONTEXT_LOW_VA
+            && self.fragment_context_low.size() == G17P_BOOTSTRAP_CONTEXT_PEER_SIZE
+            && uat.kernel_lower_vm().covers_range(
+                self.fragment_context_low.iova(),
+                self.fragment_context_low.size() as u64,
                 true,
                 false,
             )
@@ -5044,19 +5108,9 @@ mod tests {
     }
 
     #[test]
-    fn user_render_support_keeps_distinct_context_views_and_points_at_channel_record_zero() {
+    fn user_render_support_names_fixed_context_peers_and_channel_record_zero() {
         assert_eq!(G17P_RENDER_SUPPORT_SIZE, 0x40000);
-        assert_ne!(
-            G17P_RENDER_TILING_CONTEXT_SCRATCH,
-            G17P_RENDER_TILING_FIRMWARE_SCRATCH
-        );
-        assert_ne!(
-            G17P_RENDER_FRAGMENT_CONTEXT_SCRATCH,
-            G17P_RENDER_FRAGMENT_FIRMWARE_SCRATCH
-        );
         let support_va = 0x70_0100_0000;
-        let descriptor_va = 0x70_0108_0000;
-        let queue_va = 0x70_0109_0000;
         let channel_control = support_va + G17P_RENDER_CHANNEL_CONTROL as u64;
         let mut support = vec![0u8; G17P_RENDER_SUPPORT_SIZE];
         let tiling_optional = g17p_cold_opening_optional_addresses(support_va, true);
@@ -5069,54 +5123,23 @@ mod tests {
             fragment_optional.shared_control,
             g17_initdata::CONTROL_SHARED_ADDRESS
         );
-        apply_g17p_cold_opening_context_views(
-            g17_submission::G17PColdOpeningStage::Tiling,
-            descriptor_va,
-            queue_va,
-            G17P_RENDER_TILING_CONTEXT_SCRATCH,
-            G17P_RENDER_TILING_FIRMWARE_SCRATCH,
-            &mut support,
-        )
-        .unwrap();
-        assert!(support[G17P_RENDER_TILING_CONTEXT_SCRATCH
-            ..G17P_RENDER_TILING_CONTEXT_SCRATCH + G17P_PAGE_SIZE]
-            .iter()
-            .all(|byte| *byte == 0));
         assert_eq!(
-            get_u64(&support, G17P_RENDER_TILING_FIRMWARE_SCRATCH + 0x210),
-            descriptor_va
+            tiling_optional.context_scratch,
+            G17P_BOOTSTRAP_TA_CONTEXT_LOW_VA
         );
         assert_eq!(
-            get_u64(&support, G17P_RENDER_TILING_FIRMWARE_SCRATCH + 0x218),
-            queue_va
-        );
-        apply_g17p_cold_opening_context_views(
-            g17_submission::G17PColdOpeningStage::Fragment,
-            descriptor_va + 0x4000,
-            queue_va + 0xc0,
-            G17P_RENDER_FRAGMENT_CONTEXT_SCRATCH,
-            G17P_RENDER_FRAGMENT_FIRMWARE_SCRATCH,
-            &mut support,
-        )
-        .unwrap();
-        assert!(support[G17P_RENDER_FRAGMENT_CONTEXT_SCRATCH
-            ..G17P_RENDER_FRAGMENT_CONTEXT_SCRATCH + G17P_PAGE_SIZE]
-            .iter()
-            .all(|byte| *byte == 0));
-        assert_eq!(
-            get_u64(
-                &support,
-                G17P_RENDER_FRAGMENT_FIRMWARE_SCRATCH + 0x210
-            ),
-            descriptor_va + 0x4000
+            tiling_optional.firmware_scratch,
+            G17P_BOOTSTRAP_TA_CONTEXT_HIGH_VA
         );
         assert_eq!(
-            get_u64(
-                &support,
-                G17P_RENDER_FRAGMENT_FIRMWARE_SCRATCH + 0x218
-            ),
-            queue_va + 0xc0
+            fragment_optional.context_scratch,
+            G17P_BOOTSTRAP_3D_CONTEXT_LOW_VA
         );
+        assert_eq!(
+            fragment_optional.firmware_scratch,
+            G17P_BOOTSTRAP_3D_CONTEXT_HIGH_VA
+        );
+        assert_eq!(G17P_BOOTSTRAP_CONTEXT_PEER_SIZE, 8 * G17P_PAGE_SIZE);
         g17_submission::apply_g17p_cold_opening_channel_control(
             &mut support[G17P_RENDER_CHANNEL_CONTROL
                 ..G17P_RENDER_CHANNEL_CONTROL
