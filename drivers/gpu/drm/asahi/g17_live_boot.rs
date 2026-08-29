@@ -817,6 +817,10 @@ pub(crate) struct G17PLiveRuntime {
 }
 
 impl G17PLiveRuntime {
+    pub(crate) fn drm_ref(&self) -> Result<ARef<AsahiDevice>> {
+        self.drm.as_ref().cloned().ok_or(ENODEV)
+    }
+
     pub(crate) fn is_crashed(&self) -> bool {
         self.gfx_state
             .as_ref()
