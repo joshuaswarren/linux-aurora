@@ -438,6 +438,12 @@ impl G17PManagerConstruction {
         self.resources.control_counters()
     }
 
+    pub(crate) fn control_opening_effect(
+        &mut self,
+    ) -> Result<g17_resources::G17PControlOpeningEffect> {
+        self.resources.control_opening_effect()
+    }
+
     /// Stage the same queue-pair-zero TA/3D bootstrap used by the
     /// output-positive source path. The VDM stream is a driver-owned terminate
     /// command, so this establishes scheduler lifecycle without user BOs.

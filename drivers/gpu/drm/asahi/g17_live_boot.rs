@@ -602,6 +602,14 @@ fn finish_boot_session(
         pdev.as_ref(),
         "G17P control: counters retired at [4, 4, 4]/[16, 16, 16]\n"
     );
+    let opening_effect = manager.control_opening_effect()?;
+    dev_info!(
+        pdev.as_ref(),
+        "G17P control: opening effect cursor={:#x} inner={:#x} operand-slot={:#x}\n",
+        opening_effect.shared_cursor,
+        opening_effect.inner_state,
+        opening_effect.operand_slot
+    );
 
     let control_done = ((CONTROL_DONE_TYPE as u64) << 48) | CONTROL_DONE_CHANNEL;
     if !test_stage.configures_qid4() {
