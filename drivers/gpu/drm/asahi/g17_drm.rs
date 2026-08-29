@@ -327,7 +327,9 @@ impl G17PQueue {
     }
 
     fn owned_compute_timestamps(&self) -> Result<mmu::KernelMapping> {
-        let mut object = gem::new_kernel_object(&self.dev, mmu::UAT_PGSZ)?;
+        // Firmware writes both completion words. A WB CPU alias can keep the
+        // polling core on stale zeroes even after the GPU has completed.
+        let mut object = gem::new_kernel_object_wc(&self.dev, mmu::UAT_PGSZ)?;
         object.vmap()?.memset(0);
         object.map_into_range(
             &self.vm,

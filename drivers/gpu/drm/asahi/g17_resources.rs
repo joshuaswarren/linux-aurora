@@ -3902,19 +3902,27 @@ impl G17ResourceOwner {
 
     /// The source bootstrap fence owns the group only after both inner queues
     /// and both outer channel consumers cover the published prefix.
-    pub(crate) fn partial_opening_outer_retired(&mut self) -> Result<bool> {
+    pub(crate) fn partial_opening_outer_counters(&mut self) -> Result<[[u32; 3]; 2]> {
         let binding = self.partial_opening_binding();
-        for channel in [binding.fragment_channel, binding.tiling_channel] {
-            let consumers = [
+        let mut counters = [[0; 3]; 2];
+        for (output, channel) in counters
+            .iter_mut()
+            .zip([binding.fragment_channel, binding.tiling_channel])
+        {
+            *output = [
                 self.resources.primary_state.read_u32(channel.states[0])?,
                 self.resources.primary_state.read_u32(channel.states[1])?,
+                self.resources.primary_state.read_u32(channel.states[2])?,
             ];
-            let producer = self.resources.primary_state.read_u32(channel.states[2])?;
-            if producer != 1 || consumers != [producer; 2] {
-                return Ok(false);
-            }
         }
-        Ok(true)
+        Ok(counters)
+    }
+
+    pub(crate) fn partial_opening_outer_retired(&mut self) -> Result<bool> {
+        Ok(self
+            .partial_opening_outer_counters()?
+            .into_iter()
+            .all(|counters| counters[2] == 1 && counters[..2] == [counters[2]; 2]))
     }
 
     /// Publish the first fragment/tiling outer-ring pair in the measured
