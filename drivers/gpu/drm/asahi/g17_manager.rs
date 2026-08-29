@@ -513,7 +513,6 @@ impl G17PManagerConstruction {
         if !storage.is_reachable_from(&vm) {
             return Err(EFAULT);
         }
-        storage.stage_fragment(0)?;
         let binding = self.resources.uat().bind(&vm)?;
         if binding.slot() != 1 {
             return Err(EFAULT);
@@ -534,6 +533,10 @@ impl G17PManagerConstruction {
         }
         let (fragment_queue, tiling_queue, previous, late_tiling) = {
             let storage = self.render_storage.as_mut().ok_or(ENODEV)?;
+            // The successful first-partial path keeps both inner groups blank
+            // until primary control-done. Restore 3D now; TA remains held by
+            // the late publication callback below.
+            storage.stage_fragment(0)?;
             let previous = storage.snapshot()?;
             let late_tiling = storage.prepare_late_tiling_publication(0)?;
             let (fragment_queue, tiling_queue) = storage.queue_gpu_vas();

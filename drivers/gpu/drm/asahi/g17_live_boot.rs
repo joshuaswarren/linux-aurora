@@ -474,14 +474,14 @@ fn finish_boot_session(
         });
     }
 
-    // Build the render VM, bind context 1, and stage the inner graph while
-    // both outer producers remain zero. This is the measured pre-0x84 state.
+    // Build the render VM and bind context 1 while both inner groups and both
+    // outer producers remain zero. This is the measured pre-0x84 state.
     let crash_vm = manager.stage_compute_bootstrap_render(drm)?;
     gfx_state.set_crash_vm(crash_vm.clone());
     gfx1_state.set_crash_vm(crash_vm);
     dev_info!(
         pdev.as_ref(),
-        "G17P compute control: startup render graph staged with producers held\n"
+        "G17P compute control: startup render graph ready with inner groups held\n"
     );
     manager
         .prepare_partial_opening_control_done()
@@ -499,8 +499,8 @@ fn finish_boot_session(
         "G17P compute control: primary done sent before startup work publication\n"
     );
 
-    // Publish 3D before TA and end with the barrier required before the one
-    // paired channel-8 bell.
+    // Restore and publish 3D first, then restore and publish TA. End with the
+    // barrier required before the one paired channel-8 bell.
     let bootstrap = manager.publish_staged_compute_bootstrap_render()?;
     dev_info!(
         pdev.as_ref(),
