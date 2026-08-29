@@ -417,6 +417,20 @@ fn finish_boot_session(
         "G17P control: 4 primary and 16 secondary records staged\n"
     );
 
+    // The output-positive source runner publishes its startup TA/3D pair
+    // before CONTROL_START. A group first exposed after CONTROL_START enters
+    // a different firmware path and does not establish the compute lifecycle.
+    let bootstrap = if test_stage.configures_qid4() {
+        let prepared = manager.begin_compute_bootstrap_render(drm)?;
+        dev_info!(
+            pdev.as_ref(),
+            "G17P compute control: startup TA/3D visible before control start\n"
+        );
+        Some(prepared)
+    } else {
+        None
+    };
+
     let control_start = (CONTROL_START_TYPE as u64) << 48;
     Pin::new(&mut gfx_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, control_start)?;
     fsleep(Delta::from_millis(12));
@@ -472,7 +486,6 @@ fn finish_boot_session(
     }
 
     manager.prepare_partial_opening_control_done()?;
-    let bootstrap = manager.begin_compute_bootstrap_render(drm)?;
     dev_info!(
         pdev.as_ref(),
         "G17P compute control: startup TA/3D group staged; sending primary done\n"
@@ -481,7 +494,7 @@ fn finish_boot_session(
         .send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, control_done)?;
     Pin::new(&mut gfx_rtkit).send_message(
         g17_rtkit::ENDPOINT_GFX_INTERRUPTS,
-        bootstrap.paired_doorbell,
+        bootstrap.ok_or(EIO)?.paired_doorbell,
     )?;
     dev_info!(
         pdev.as_ref(),
