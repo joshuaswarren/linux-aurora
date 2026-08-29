@@ -329,6 +329,24 @@ static void apple_dcp_h17p_method_test(struct kunit *test)
 
 	KUNIT_ASSERT_EQ(test,
 			apple_dcp_h17p_method(
+				APPLE_DCP_H17P_CALL_PMU_SERVICE_MATCHED,
+				&method),
+			0);
+	KUNIT_EXPECT_EQ(test, method.call, 0x41313336U);
+	KUNIT_EXPECT_EQ(test, method.input_size, 0U);
+	KUNIT_EXPECT_EQ(test, method.output_size, 4U);
+
+	KUNIT_ASSERT_EQ(test,
+			apple_dcp_h17p_method(
+				APPLE_DCP_H17P_CALL_BACKLIGHT_SERVICE_MATCHED,
+				&method),
+			0);
+	KUNIT_EXPECT_EQ(test, method.call, 0x41313337U);
+	KUNIT_EXPECT_EQ(test, method.input_size, 0U);
+	KUNIT_EXPECT_EQ(test, method.output_size, 4U);
+
+	KUNIT_ASSERT_EQ(test,
+			apple_dcp_h17p_method(
 				APPLE_DCP_H17P_CALL_VI_SET_TEMPERATURE_HINT,
 				&method),
 			0);
@@ -373,6 +391,22 @@ static void apple_dcp_h17p_callback_method_test(struct kunit *test)
 			apple_dcp_h17p_callback_method(
 				APPLE_DCP_H17P_CB_CREATE_NVRAM, &method),
 			0);
+	KUNIT_EXPECT_EQ(test, method.input_size, 0U);
+	KUNIT_EXPECT_EQ(test, method.output_size, 4U);
+
+	KUNIT_ASSERT_EQ(test,
+			apple_dcp_h17p_callback_method(
+				APPLE_DCP_H17P_CB_MATCH_PMU_2, &method),
+			0);
+	KUNIT_EXPECT_EQ(test, method.call, 0x44323036U);
+	KUNIT_EXPECT_EQ(test, method.input_size, 0U);
+	KUNIT_EXPECT_EQ(test, method.output_size, 4U);
+
+	KUNIT_ASSERT_EQ(test,
+			apple_dcp_h17p_callback_method(
+				APPLE_DCP_H17P_CB_MATCH_BACKLIGHT, &method),
+			0);
+	KUNIT_EXPECT_EQ(test, method.call, 0x44323037U);
 	KUNIT_EXPECT_EQ(test, method.input_size, 0U);
 	KUNIT_EXPECT_EQ(test, method.output_size, 4U);
 
