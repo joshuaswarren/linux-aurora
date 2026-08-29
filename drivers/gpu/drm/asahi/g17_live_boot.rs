@@ -877,6 +877,7 @@ impl G17PLiveRuntime {
                 };
             }
         };
+        let channel_path = doorbell.is_some();
         if let Some(doorbell) = doorbell {
             dev_info!(
                 self.dev.as_ref(),
@@ -914,16 +915,18 @@ impl G17PLiveRuntime {
                 };
             }
         };
-        let retire_result = self
-            .manager
-            .as_ref()
-            .ok_or(ENODEV)?
-            .complete_compute_entries(self.queue.as_mut().ok_or(ENODEV)?, 1);
-        if let Err(error) = retire_result {
-            return match g17_lifecycle::recover_persistent_runtime(self) {
-                Ok(()) => Err(error),
-                Err(recovery_error) => Err(recovery_error),
-            };
+        if !channel_path {
+            let retire_result = self
+                .manager
+                .as_ref()
+                .ok_or(ENODEV)?
+                .complete_compute_entries(self.queue.as_mut().ok_or(ENODEV)?, 1);
+            if let Err(error) = retire_result {
+                return match g17_lifecycle::recover_persistent_runtime(self) {
+                    Ok(()) => Err(error),
+                    Err(recovery_error) => Err(recovery_error),
+                };
+            }
         }
         drop(self.compute_binding.take());
         Ok(completion)
