@@ -316,15 +316,13 @@ config APPLE_DART
 	  Say Y here if you are using an Apple SoC.
 
 config APPLE_DART_KUNIT_TEST
-	bool "KUnit tests for Apple DART v2 exception handling" if !KUNIT_ALL_TESTS
+	bool "KUnit tests for Apple DART" if !KUNIT_ALL_TESTS
 	depends on KUNIT
 	depends on APPLE_DART=y
 	default KUNIT_ALL_TESTS
 	help
-	  Tests the T8110 DART v2 exception register layout, fault decoding,
-	  and shared interrupt ownership rules. These tests do not access DART
-	  hardware. Enable them when changing the v2 exception path or its
-	  version-specific register contract.
+	  Tests the T8110 DART v2 exception contract and locked page-table
+	  handoff. These tests do not access DART hardware.
 
 config S390_IOMMU
 	def_bool y if S390 && PCI
