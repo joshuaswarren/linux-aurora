@@ -540,6 +540,10 @@ static void dcp_link_service_match_complete(struct apple_dcp *dcp, void *out,
 	dev_info(dcp->dev, "DCPLink %.4s reply %#x\n", call->tag,
 		 le32_to_cpup((__le32 *)out));
 	apple_dcp_h17p_service_match_output(dcp->link_service_match_output, true);
+	dev_info(dcp->dev,
+		 "DCP25G83_FINAL_D%03d_OUTPUT %#x before ACK\n",
+		 callback_tag,
+		 le32_to_cpup(dcp->link_service_match_output));
 	dcp->link_service_match_output = NULL;
 	dcp->link_service_match_callback_tag = 0;
 	ret = dcp_link_ack(dcp, DCP_CONTEXT_CB);
@@ -1010,6 +1014,7 @@ static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 	dcp->link_service_match_state = 0;
 	dcp->link_service_match_output = NULL;
 	dcp->link_service_match_callback_tag = 0;
+	dev_info(dcp->dev, "DCP25G83_ACK_DIAG armed\n");
 
 	if (dcp->adopted_session) {
 		struct iommu_domain *domain;
