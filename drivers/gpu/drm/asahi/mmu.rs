@@ -127,7 +127,7 @@ fn t8140_opening_render_layout(render_low: u64, source_high: u64) -> T8140RootLa
 fn t8140_split_render_layout(
     retained_low: u64,
     render_low: u64,
-    empty_high: [u64; 2],
+    high: [u64; 2],
 ) -> T8140RootLayout {
     T8140RootLayout {
         low: [
@@ -135,8 +135,8 @@ fn t8140_split_render_layout(
             t8140_tagged_root(render_low, 1),
         ],
         high: [
-            t8140_tagged_root(empty_high[0], 0),
-            t8140_tagged_root(empty_high[1], 1),
+            t8140_tagged_root(high[0], 0),
+            t8140_tagged_root(high[1], 1),
         ],
     }
 }
@@ -2227,13 +2227,10 @@ impl Uat {
                 == (high[1] | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT))
     }
 
-    /// Confirm the first-render table after the render VM owns context 1.
-    ///
-    /// The proven G17P contract keeps the retained context-0 low root in slot
-    /// 0, installs the render VM low root in slot 1, and gives each slot its
-    /// own empty high root. The retained [`VmBind`] proves which low root is
-    /// live and keeps that page table resident through firmware retirement.
-    pub(crate) fn t8140_partial_opening_render_context_ready(
+    /// Confirm the post-opening first-work split. Unlike a steady-state user
+    /// bind, the driver-owned bootstrap graph still names firmware-high
+    /// objects, so both active slots retain the populated source high root.
+    pub(crate) fn t8140_first_work_render_context_ready(
         &self,
         render: &VmBind,
     ) -> bool {
@@ -2243,20 +2240,18 @@ impl Uat {
         {
             return false;
         }
-        let empty = match self.t8140_empty_high_roots.as_ref() {
-            Some(roots) => [roots[0].ttb(), roots[1].ttb()],
-            None => return false,
-        };
-        let retained_low = self.kernel_lower_vm.ttb();
-        let render_low = render.0.ttb();
+        let source_high = self.kernel_vm.ttb();
+        let expected = t8140_split_render_layout(
+            self.kernel_lower_vm.ttb(),
+            render.0.ttb(),
+            [source_high; 2],
+        );
         let inner = self.inner.lock();
         let ttbs = inner.ttbs();
-        ttbs[0].ttb0.load(Ordering::Acquire) == (retained_low | TTBR_VALID)
-            && ttbs[0].ttb1.load(Ordering::Acquire) == (empty[0] | TTBR_VALID)
-            && ttbs[1].ttb0.load(Ordering::Acquire)
-                == (render_low | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT))
-            && ttbs[1].ttb1.load(Ordering::Acquire)
-                == (empty[1] | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT))
+        ttbs[0].ttb0.load(Ordering::Acquire) == expected.low[0]
+            && ttbs[0].ttb1.load(Ordering::Acquire) == expected.high[0]
+            && ttbs[1].ttb0.load(Ordering::Acquire) == expected.low[1]
+            && ttbs[1].ttb1.load(Ordering::Acquire) == expected.high[1]
     }
 
     /// Confirm the root phase used while firmware consumes the 4/16 opening.
@@ -2350,13 +2345,13 @@ impl Uat {
         if self.cfg != UatConfig::T8140 || render.slot() != 1 {
             return Err(EINVAL);
         }
-        let empty = self.t8140_empty_high_roots.as_ref().ok_or(EIO)?;
         let opening =
             t8140_opening_render_layout(render.0.ttb(), self.kernel_vm.ttb());
+        let source_high = self.kernel_vm.ttb();
         let split = t8140_split_render_layout(
             self.kernel_lower_vm.ttb(),
             render.0.ttb(),
-            [empty[0].ttb(), empty[1].ttb()],
+            [source_high; 2],
         );
         let inner = self.inner.lock();
         inner.handoff().lock();
@@ -2474,6 +2469,9 @@ impl Uat {
             low | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT),
             Ordering::Release,
         );
+        ttbs[0]
+            .ttb1
+            .store(empty[0].ttb() | TTBR_VALID, Ordering::Release);
         ttbs[1].ttb1.store(
             empty[1].ttb() | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT),
             Ordering::Release,
@@ -2483,6 +2481,7 @@ impl Uat {
         inner.handoff().unlock();
         core::mem::drop(inner);
 
+        mem::tlbi_asid(0);
         mem::tlbi_asid(1);
         mem::sync();
         Ok(())
@@ -3034,7 +3033,6 @@ mod tests {
         let retained_low = 0x1000_1000_0000;
         let render_low = 0x1000_2000_0000;
         let source_high = 0x1000_3000_0000;
-        let empty_high = [0x1000_4000_0000, 0x1000_5000_0000];
 
         let opening = t8140_opening_render_layout(render_low, source_high);
         assert_eq!(
@@ -3052,16 +3050,16 @@ mod tests {
             ]
         );
 
-        let split = t8140_split_render_layout(retained_low, render_low, empty_high);
+        let split = t8140_split_render_layout(retained_low, render_low, [source_high; 2]);
         assert_eq!(split.low[0], retained_low | TTBR_VALID);
         assert_eq!(
             split.low[1],
             render_low | TTBR_VALID | (1 << TTBR_ASID_SHIFT)
         );
-        assert_eq!(split.high[0], empty_high[0] | TTBR_VALID);
+        assert_eq!(split.high[0], source_high | TTBR_VALID);
         assert_eq!(
             split.high[1],
-            empty_high[1] | TTBR_VALID | (1 << TTBR_ASID_SHIFT)
+            source_high | TTBR_VALID | (1 << TTBR_ASID_SHIFT)
         );
         assert_ne!(opening, split);
     }

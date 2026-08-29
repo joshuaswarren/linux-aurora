@@ -540,11 +540,15 @@ impl G17PManagerConstruction {
         if !self
             .resources
             .uat()
-            .t8140_partial_opening_render_context_ready(binding)
+            .t8140_first_work_render_context_ready(binding)
         {
             return Err(EFAULT);
         }
         Ok(())
+    }
+
+    pub(crate) fn publish_bootstrap_render_operand_table(&mut self) -> Result {
+        self.resources.publish_bootstrap_render_operand_table()
     }
 
     /// Publish the staged bootstrap pair after primary control-done.
@@ -557,7 +561,7 @@ impl G17PManagerConstruction {
         {
             return Err(EBUSY);
         }
-        if !self.resources.uat().t8140_partial_opening_render_context_ready(
+        if !self.resources.uat().t8140_first_work_render_context_ready(
             self.render_bind.as_ref().ok_or(ENODEV)?,
         ) {
             return Err(EFAULT);

@@ -536,6 +536,14 @@ pub(crate) struct G17PControlOpeningEffect {
     pub(crate) operand_slot: u64,
 }
 
+impl G17PControlOpeningEffect {
+    fn binding_complete(self, expected_slot: u64) -> bool {
+        self.shared_cursor == g17_initdata::CONTROL_SHARED_CURSOR_AFTER
+            && self.inner_state == g17_initdata::CONTROL_SHARED_INNER_AFTER
+            && self.operand_slot == expected_slot
+    }
+}
+
 impl G17PControlCounters {
     pub(crate) fn opening_staged(self) -> bool {
         self.primary == [0, 0, g17_initdata::CONTROL_OPENING_PRIMARY_PRODUCER]
@@ -3123,7 +3131,8 @@ impl G17ResourceOwner {
         )?;
         control_shared_inner.with_bytes_mut(|bytes| {
             bytes.fill(0);
-            bytes[..8].copy_from_slice(&1u64.to_le_bytes());
+            bytes[..4]
+                .copy_from_slice(&g17_initdata::CONTROL_SHARED_INNER_BEFORE.to_le_bytes());
             Ok(())
         })?;
         let bootstrap_descriptor_zero_a = map_fixed_wc_object(
@@ -3178,7 +3187,10 @@ impl G17ResourceOwner {
             }
         };
         if let Err(error) = control_operand_table.with_bytes_mut(|bytes| {
-            g17_initdata::encode_control_operand_table(bytes).map_err(|_| EINVAL)
+            // The opening 0x20 owns slot 17 and must observe a blank table.
+            // The host publishes the complete table only after control-done.
+            bytes.fill(0);
+            Ok(())
         }) {
             dev_err!(
                 dev.as_ref(),
@@ -3646,6 +3658,30 @@ impl G17ResourceOwner {
         })
     }
 
+    /// Publish the host-owned operand closure after firmware has completed
+    /// the opening registration and primary control-done is visible.
+    pub(crate) fn publish_bootstrap_render_operand_table(&mut self) -> Result {
+        let effect = self.control_opening_effect()?;
+        let expected_slot = g17p_control_operand_buffer_va(17).ok_or(EINVAL)?
+            | g17_initdata::CONTROL_OPERAND_ENTRY_FLAG;
+        if !effect.binding_complete(expected_slot) {
+            dev_err!(
+                self.dev.as_ref(),
+                "G17P opening binding incomplete: cursor={:#x} inner={} slot={:#x}/{:#x}\n",
+                effect.shared_cursor,
+                effect.inner_state,
+                effect.operand_slot,
+                expected_slot
+            );
+            return Err(EIO);
+        }
+        self.resources.control_operand_table.with_bytes_mut(|bytes| {
+            g17_initdata::encode_control_operand_table(bytes).map_err(|_| EINVAL)
+        })?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
     /// Restore the source-built class-1 closure before publishing live
     /// compute-control records.
     pub(crate) fn prepare_compute_runtime_class1(&mut self) -> Result {
@@ -3994,7 +4030,8 @@ impl G17ResourceOwner {
             .control_shared_inner
             .with_bytes_mut(|bytes| {
                 bytes.fill(0);
-                bytes[..8].copy_from_slice(&1u64.to_le_bytes());
+                bytes[..4]
+                    .copy_from_slice(&g17_initdata::CONTROL_SHARED_INNER_BEFORE.to_le_bytes());
                 Ok(())
             })?;
         self.resources
@@ -4024,7 +4061,8 @@ impl G17ResourceOwner {
         self.resources
             .control_operand_table
             .with_bytes_mut(|bytes| {
-                g17_initdata::encode_control_operand_table(bytes).map_err(|_| EINVAL)
+                bytes.fill(0);
+                Ok(())
             })?;
         for buffer in self.resources.control_operand_buffers.iter_mut() {
             buffer.with_bytes_mut(|bytes| {
@@ -4256,9 +4294,7 @@ impl G17ResourceOwner {
         }
         dev_info!(
             self.dev.as_ref(),
-            "G17P VM: operand graph mapped GPU-shared; entry18={:#x}\n",
-            g17p_control_operand_buffer_va(18).ok_or(EINVAL)?
-                | g17_initdata::CONTROL_OPERAND_ENTRY_FLAG
+            "G17P VM: blank operand table mapped GPU-shared; host closure deferred\n"
         );
         mappings.push(
             match self.resources.partial_primary_index.map_alias_at(
@@ -5058,6 +5094,28 @@ mod tests {
             G17P_BOOTSTRAP_3D_STATUS_VA,
             g17_initdata::COMPUTE_RUNTIME_STATE_ADDRESS
         );
+    }
+
+    #[test]
+    fn opening_binding_requires_all_three_firmware_effects() {
+        let slot = g17p_control_operand_buffer_va(17).unwrap()
+            | g17_initdata::CONTROL_OPERAND_ENTRY_FLAG;
+        let complete = G17PControlOpeningEffect {
+            shared_cursor: g17_initdata::CONTROL_SHARED_CURSOR_AFTER,
+            inner_state: g17_initdata::CONTROL_SHARED_INNER_AFTER,
+            operand_slot: slot,
+        };
+        assert!(complete.binding_complete(slot));
+        assert!(!G17PControlOpeningEffect {
+            inner_state: g17_initdata::CONTROL_SHARED_INNER_BEFORE,
+            ..complete
+        }
+        .binding_complete(slot));
+        assert!(!G17PControlOpeningEffect {
+            operand_slot: 0,
+            ..complete
+        }
+        .binding_complete(slot));
     }
 
     #[test]
