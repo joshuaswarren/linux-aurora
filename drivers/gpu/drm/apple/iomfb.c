@@ -1143,12 +1143,10 @@ static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 				goto err_unmap_inherited;
 			}
 			dev_info(dcp->dev,
-				 "adopted unused DCPLink RPC mapping local DVA %#llx firmware DVA %#llx PA %#llx; waiting for firmware rendezvous\n",
+				 "adopted unused DCPLink RPC mapping local DVA %#llx firmware DVA %#llx PA %#llx; sending host INIT\n",
 				 rpc_dva, firmware_rpc_dva, rpc_pa);
-			msleep(100);
-			ret = dcp_link_publish_init(dcp, false);
-			if (ret)
-				goto err_unmap_inherited;
+			dcp_send_message(dcp, APPLE_DCP_LINK_ENDPOINT,
+					 captured_message);
 			return 0;
 		}
 
@@ -1180,8 +1178,6 @@ static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 			ret = -EINVAL;
 			goto err_unmap_inherited;
 		}
-		if (descriptor_zero)
-			apple_dcp_link_init_desc_encode(desc, 0, false);
 		ret = apple_dcp_link_init_message(firmware_rpc_dva,
 						  &captured_message);
 		if (ret)
@@ -1200,8 +1196,9 @@ static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 			goto err_unmap_inherited;
 		}
 		dev_info(dcp->dev,
-			 "adopted DCPLink firmware-init phase local DVA %#llx firmware DVA %#llx; inherited RPC INIT queued\n",
+			 "adopted DCPLink firmware-init phase local DVA %#llx firmware DVA %#llx; sending inherited RPC INIT\n",
 			 rpc_dva, firmware_rpc_dva);
+		dcp_send_message(dcp, APPLE_DCP_LINK_ENDPOINT, captured_message);
 		return 0;
 
 err_unmap_inherited:
