@@ -1738,28 +1738,6 @@ static int dcp_platform_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, ret,
 				     "invalid apple,iomfb-surfaces order\n");
 
-	if (!of_property_present(dev->of_node, "apple,iomfb-surfaces")) {
-		ret = apple_dcp_surface_order_init(&dcp->iomfb_surfaces, NULL, 0);
-	} else {
-		num_surfaces = of_property_count_u32_elems(dev->of_node,
-							  "apple,iomfb-surfaces");
-		if (num_surfaces <= 0 || num_surfaces > DCP_MAX_PLANES)
-			return dev_err_probe(dev,
-				num_surfaces < 0 ? num_surfaces : -EINVAL,
-				"invalid apple,iomfb-surfaces length %d\n",
-				num_surfaces);
-		ret = of_property_read_u32_array(dev->of_node,
-						 "apple,iomfb-surfaces",
-						 surface_ids, num_surfaces);
-		if (!ret)
-			ret = apple_dcp_surface_order_init(&dcp->iomfb_surfaces,
-							   surface_ids,
-							   num_surfaces);
-	}
-	if (ret)
-		return dev_err_probe(dev, ret,
-				     "invalid apple,iomfb-surfaces order\n");
-
 	platform_set_drvdata(pdev, dcp);
 
 	dcp->phy = devm_phy_optional_get(dev, "dp-phy");
