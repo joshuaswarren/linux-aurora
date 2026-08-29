@@ -62,26 +62,10 @@
 #define APPLE_DCP_RTKIT_MGMT_STARTEP_FLAG BIT_ULL(1)
 #define APPLE_DCP_RTKIT_EP_MGMT 0
 
-#define APPLE_T8140_MBOX_CONTROL_FULL BIT(16)
+#define APPLE_T8140_MBOX_CONTROL_EMPTY BIT(17)
 #define APPLE_T8140_MBOX_A2I_CONTROL 0x110
 #define APPLE_T8140_MBOX_A2I_SEND0 0x800
 #define APPLE_T8140_MBOX_A2I_SEND1 0x808
-
-#define DCP_RTKIT_FOURCC(a, b, c, d) \
-	(((u32)(a) << 24) | ((u32)(b) << 16) | ((u32)(c) << 8) | (u32)(d))
-#define DCP_RTKIT_CRASHLOG_HEADER DCP_RTKIT_FOURCC('C', 'L', 'H', 'E')
-#define DCP_RTKIT_EP_CRASHLOG 1
-#define DCP_RTKIT_CRASHLOG_STR DCP_RTKIT_FOURCC('C', 's', 't', 'r')
-#define DCP_RTKIT_CRASHLOG_VERSION DCP_RTKIT_FOURCC('C', 'v', 'e', 'r')
-
-struct dcp_rtkit_crashlog_header {
-	__le32 fourcc;
-	__le32 version;
-	__le32 size;
-	__le32 flags;
-	u8 reserved[16];
-};
-static_assert(sizeof(struct dcp_rtkit_crashlog_header) == 0x20);
 
 static bool show_notch;
 module_param(show_notch, bool, 0644);
@@ -542,6 +526,43 @@ int dcp_send_message_sync(struct apple_dcp *dcp, u8 endpoint, u64 message)
 	trace_dcp_send_msg(dcp, endpoint, message);
 	return apple_rtkit_send_message(dcp->rtk, endpoint, message, NULL,
 					false);
+}
+
+int dcp_try_send_message_if_empty(struct apple_dcp *dcp, u8 endpoint,
+				  u64 message)
+{
+	struct apple_mbox *mbox = dcp->rtk->mbox;
+	unsigned long flags;
+	u32 control;
+	int ret = 0;
+
+	if (!mbox || !mbox->active ||
+	    !of_device_is_compatible(mbox->dev->of_node,
+				     "apple,asc-mailbox-v4"))
+		return -EOPNOTSUPP;
+
+	/*
+	 * DCPLink's native notifier repeats a doorbell only after the previous
+	 * mailbox entry has left the FIFO.  apple_mbox_send() waits up to 500 ms
+	 * when the FIFO is occupied, which stalls the notification poll itself.
+	 * Keep this T8140 handoff path nonblocking and leave the next retry to the
+	 * caller instead of stacking duplicate entries.
+	 */
+	dma_wmb();
+	spin_lock_irqsave(&mbox->tx_lock, flags);
+	control = readl_relaxed(mbox->regs + APPLE_T8140_MBOX_A2I_CONTROL);
+	if (!(control & APPLE_T8140_MBOX_CONTROL_EMPTY)) {
+		ret = -EAGAIN;
+		goto out_unlock;
+	}
+
+	trace_dcp_send_msg(dcp, endpoint, message);
+	writeq_relaxed(message, mbox->regs + APPLE_T8140_MBOX_A2I_SEND0);
+	writeq_relaxed(endpoint, mbox->regs + APPLE_T8140_MBOX_A2I_SEND1);
+
+out_unlock:
+	spin_unlock_irqrestore(&mbox->tx_lock, flags);
+	return ret;
 }
 
 int dcp_start_rtkit_endpoint(struct apple_dcp *dcp, u8 endpoint)
