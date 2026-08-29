@@ -98,9 +98,14 @@ const G17P_CONTROL_OPERAND_BUFFER_SIZE: usize =
     g17_initdata::CONTROL_OPERAND_BUFFER_SIZE as usize;
 const G17P_CONTROL_OPERAND_BUFFER_STRIDE: usize =
     g17_initdata::CONTROL_OPERAND_BUFFER_STRIDE as usize;
-const G17P_CONTROL_OPERAND_BACKING_SIZE: usize = (G17P_CONTROL_OPERAND_BUFFER_COUNT - 1)
-    * G17P_CONTROL_OPERAND_BUFFER_STRIDE
-    + G17P_CONTROL_OPERAND_BUFFER_SIZE;
+
+fn g17p_control_operand_buffer_va(index: usize) -> Option<u64> {
+    if index >= G17P_CONTROL_OPERAND_BUFFER_COUNT {
+        return None;
+    }
+    G17P_CONTROL_OPERAND_BUFFER_BASE
+        .checked_add(index as u64 * G17P_CONTROL_OPERAND_BUFFER_STRIDE as u64)
+}
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct G17PComputeUserVaLayout {
@@ -544,6 +549,73 @@ struct MappedObject {
     mapping: mmu::KernelMapping,
     object: gem::ObjectRef,
     logical_size: usize,
+}
+
+/// Kernel-owned storage whose GPU mapping belongs only to a render VM.
+///
+/// The context-0 low root has unrelated B2 aliases inside the render operand
+/// arena, so these objects must not acquire a context-0 mapping merely to keep
+/// their backing alive.
+#[cfg(not(test))]
+struct RenderBackingObject {
+    object: gem::ObjectRef,
+    logical_size: usize,
+}
+
+#[cfg(not(test))]
+impl RenderBackingObject {
+    fn new(dev: &AsahiDevice, size: usize) -> Result<Self> {
+        let mut object = gem::new_kernel_object(dev, size)?;
+        object.vmap()?.memset(0);
+        Ok(Self {
+            object,
+            logical_size: size,
+        })
+    }
+
+    fn with_bytes_mut<R>(&mut self, f: impl FnOnce(&mut [u8]) -> Result<R>) -> Result<R> {
+        let vmap = self.object.vmap()?;
+        let bytes = unsafe {
+            // SAFETY: the VMap covers this object's complete, page-rounded
+            // allocation and logical_size never exceeds the object size.
+            core::slice::from_raw_parts_mut(vmap.as_mut_ptr(), self.logical_size)
+        };
+        f(bytes)
+    }
+
+    fn map_at(
+        &mut self,
+        vm: &mmu::Vm,
+        address: u64,
+        prot: mmu::Prot,
+    ) -> Result<mmu::KernelMapping> {
+        self.object.map_at(vm, address, prot, false)
+    }
+}
+
+#[cfg(not(test))]
+fn map_fixed_object(
+    dev: &AsahiDevice,
+    vm: &mmu::Vm,
+    name: &str,
+    address: u64,
+    size: usize,
+    prot: mmu::Prot,
+) -> Result<MappedObject> {
+    match MappedObject::new_at(dev, vm, address, size, prot) {
+        Ok(mapping) => Ok(mapping),
+        Err(error) => {
+            dev_err!(
+                dev.as_ref(),
+                "G17P resources: {} map at {:#x} size {:#x} failed ({:?})\n",
+                name,
+                address,
+                size,
+                error
+            );
+            Err(error)
+        }
+    }
 }
 
 #[cfg(not(test))]
@@ -1769,25 +1841,26 @@ impl G17PUserRenderStorage {
             )
             && vm.covers_range(
                 G17P_CONTROL_OPERAND_TABLE_VA,
-                mmu::UAT_PGSZ as u64,
+                g17_initdata::CONTROL_OPERAND_TABLE_SIZE as u64,
                 true,
                 true,
             )
-            && vm.covers_range(
-                G17P_CONTROL_OPERAND_BUFFER_BASE,
-                G17P_CONTROL_OPERAND_BACKING_SIZE as u64,
-                true,
-                true,
-            )
+            && (0..G17P_CONTROL_OPERAND_BUFFER_COUNT).all(|index| {
+                g17p_control_operand_buffer_va(index).is_some_and(|address| {
+                    vm.covers_range(
+                        address,
+                        G17P_CONTROL_OPERAND_BUFFER_SIZE as u64,
+                        true,
+                        true,
+                    )
+                })
+            })
             && vm.covers_range(
                 g17_submission::G17P_PARTIAL_OPENING_PRIMARY_INDEX_GPU_VA,
                 mmu::UAT_PGSZ as u64,
                 true,
                 true,
             )
-            && g17_initdata::REGION_VIEW_LOW_ADDRS
-                .iter()
-                .all(|address| vm.covers_range(*address, mmu::UAT_PGSZ as u64, true, true))
             && self
                 .user_timestamp_aliases
                 .iter()
@@ -2121,8 +2194,8 @@ struct G17MappedResources {
     fwctl: MappedObject,
     control_shared: MappedObject,
     control_shared_inner: MappedObject,
-    control_operand_table: MappedObject,
-    control_operand_buffers: MappedObject,
+    control_operand_table: RenderBackingObject,
+    control_operand_buffers: KVec<RenderBackingObject>,
     register_windows: KVec<mmu::KernelMapping>,
 }
 
@@ -2252,16 +2325,18 @@ impl G17ResourceOwner {
             )
             .map_err(|_| EINVAL)
         })?;
-        let fwctl = MappedObject::new_at(
+        let fwctl = map_fixed_object(
             dev,
             address_space.uat.kernel_vm(),
+            "fwctl",
             fwctl_gpu_va,
             FWCTL_SIZE,
             mmu::PROT_FW_SHARED_RW,
         )?;
-        let mut control_shared = MappedObject::new_at(
+        let mut control_shared = map_fixed_object(
             dev,
             address_space.uat.kernel_vm(),
+            "control-shared",
             g17_initdata::CONTROL_SHARED_ADDRESS,
             g17_initdata::CONTROL_SHARED_OBJECT_SIZE,
             mmu::PROT_GPU_FW_SHARED_RW,
@@ -2269,9 +2344,10 @@ impl G17ResourceOwner {
         control_shared.with_bytes_mut(|bytes| {
             g17_initdata::encode_control_shared(bytes).map_err(|_| EINVAL)
         })?;
-        let mut control_shared_inner = MappedObject::new_at(
+        let mut control_shared_inner = map_fixed_object(
             dev,
             address_space.uat.kernel_vm(),
+            "control-shared-inner",
             g17_initdata::CONTROL_SHARED_INNER_ADDRESS,
             mmu::UAT_PGSZ,
             mmu::PROT_GPU_FW_SHARED_RW,
@@ -2281,58 +2357,111 @@ impl G17ResourceOwner {
             bytes[..8].copy_from_slice(&1u64.to_le_bytes());
             Ok(())
         })?;
-        let mut control_operand_table = MappedObject::new_at(
+        let mut control_operand_table = match RenderBackingObject::new(
             dev,
-            address_space.uat.kernel_lower_vm(),
-            G17P_CONTROL_OPERAND_TABLE_VA,
             g17_initdata::CONTROL_OPERAND_TABLE_SIZE,
-            mmu::PROT_GPU_FW_SHARED_RW,
-        )?;
-        control_operand_table.with_bytes_mut(|bytes| {
+        ) {
+            Ok(object) => object,
+            Err(error) => {
+                dev_err!(
+                    dev.as_ref(),
+                    "G17P resources: operand-table backing for render VA {:#x} failed ({:?})\n",
+                    G17P_CONTROL_OPERAND_TABLE_VA,
+                    error
+                );
+                return Err(error);
+            }
+        };
+        if let Err(error) = control_operand_table.with_bytes_mut(|bytes| {
             g17_initdata::encode_control_operand_table(bytes).map_err(|_| EINVAL)
-        })?;
-        let control_operand_buffers = MappedObject::new_at(
-            dev,
-            address_space.uat.kernel_lower_vm(),
-            G17P_CONTROL_OPERAND_BUFFER_BASE,
-            G17P_CONTROL_OPERAND_BACKING_SIZE,
-            mmu::PROT_GPU_FW_SHARED_RW,
-        )?;
+        }) {
+            dev_err!(
+                dev.as_ref(),
+                "G17P resources: operand-table initialization failed ({:?})\n",
+                error
+            );
+            return Err(error);
+        }
+        let mut control_operand_buffers =
+            KVec::with_capacity(G17P_CONTROL_OPERAND_BUFFER_COUNT, GFP_KERNEL)?;
+        for index in 0..G17P_CONTROL_OPERAND_BUFFER_COUNT {
+            let address = g17p_control_operand_buffer_va(index).ok_or(EINVAL)?;
+            let object = match RenderBackingObject::new(dev, G17P_CONTROL_OPERAND_BUFFER_SIZE) {
+                Ok(object) => object,
+                Err(error) => {
+                    dev_err!(
+                        dev.as_ref(),
+                        "G17P resources: operand buffer {} backing for render VA {:#x} failed ({:?})\n",
+                        index,
+                        address,
+                        error
+                    );
+                    return Err(error);
+                }
+            };
+            control_operand_buffers.push(object, GFP_KERNEL)?;
+        }
+        dev_info!(
+            dev.as_ref(),
+            "G17P resources: render operand closure ready at {:#x}, {} buffers at {:#x}\n",
+            G17P_CONTROL_OPERAND_TABLE_VA,
+            G17P_CONTROL_OPERAND_BUFFER_COUNT,
+            G17P_CONTROL_OPERAND_BUFFER_BASE
+        );
 
-        let mut roots = MappedObject::new(
+        let mut roots = match MappedObject::new(
             dev,
             &address_space.uat,
             ROOT_PAIR_ALLOC_SIZE,
             g17_initdata::SECONDARY_ROOT_DELTA,
             mmu::PROT_FW_SHARED_RO,
-        )?;
-        let mut shared_cluster = MappedObject::new(
+        ) {
+            Ok(object) => object,
+            Err(error) => {
+                dev_err!(dev.as_ref(), "G17P resources: roots allocation failed ({:?})\n", error);
+                return Err(error);
+            }
+        };
+        let mut shared_cluster = match MappedObject::new(
             dev,
             &address_space.uat,
             g17_initdata::NATIVE_SHARED_CLUSTER_SIZE,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_FW_PRIV_RW,
-        )?;
+        ) {
+            Ok(object) => object,
+            Err(error) => {
+                dev_err!(
+                    dev.as_ref(),
+                    "G17P resources: shared-cluster allocation failed ({:?})\n",
+                    error
+                );
+                return Err(error);
+            }
+        };
         // The native bundle has three out-of-line pages at fixed offsets from
         // its base. Claim them before placing the remaining dynamic objects,
         // otherwise a large state object can occupy one of these addresses.
-        let primary_b2_sentinel = MappedObject::new_at(
+        let primary_b2_sentinel = map_fixed_object(
             dev,
             address_space.uat.kernel_vm(),
+            "primary-B2 sentinel",
             shared_cluster.iova() + 0x40000,
             G17P_CL_B2_OBJECT_SIZE,
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
-        let hw_region_0 = MappedObject::new_at(
+        let hw_region_0 = map_fixed_object(
             dev,
             address_space.uat.kernel_vm(),
+            "hardware region 0",
             shared_cluster.iova() + g17_initdata::NATIVE_HW_REGION_BUNDLE_OFFSETS[0] as u64,
             mmu::UAT_PGSZ,
             mmu::PROT_FW_SHARED_RW,
         )?;
-        let hw_region_1 = MappedObject::new_at(
+        let hw_region_1 = map_fixed_object(
             dev,
             address_space.uat.kernel_vm(),
+            "hardware region 1",
             shared_cluster.iova() + g17_initdata::NATIVE_HW_REGION_BUNDLE_OFFSETS[1] as u64,
             mmu::UAT_PGSZ,
             mmu::PROT_FW_SHARED_RW,
@@ -2626,12 +2755,12 @@ impl G17ResourceOwner {
             .with_bytes_mut(|bytes| {
                 g17_initdata::encode_control_operand_table(bytes).map_err(|_| EINVAL)
             })?;
-        self.resources
-            .control_operand_buffers
-            .with_bytes_mut(|bytes| {
+        for buffer in self.resources.control_operand_buffers.iter_mut() {
+            buffer.with_bytes_mut(|bytes| {
                 bytes.fill(0);
                 Ok(())
             })?;
+        }
 
         let shared = self.handoff.shared;
         let primary = self.handoff.primary;
@@ -2725,7 +2854,10 @@ impl G17ResourceOwner {
     /// Install every hardware-fixed low alias before the VM is exposed to
     /// userspace and retain it for that VM's complete lifetime.
     pub(crate) fn install_user_vm_aliases(&mut self, vm: &mmu::Vm) -> Result {
-        let mut mappings = KVec::new();
+        let mut mappings = KVec::with_capacity(
+            G17P_CONTROL_OPERAND_BUFFER_COUNT + 3,
+            GFP_KERNEL,
+        )?;
         let mut reserved_ranges = KVec::new();
         reserved_ranges.push(G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END, GFP_KERNEL)?;
         mappings.push(
@@ -2737,42 +2869,49 @@ impl G17ResourceOwner {
             )?,
             GFP_KERNEL,
         )?;
-        mappings.push(
-            self.resources.control_operand_table.map_alias_at(
-                vm,
-                G17P_CONTROL_OPERAND_TABLE_VA,
-                mmu::PROT_GPU_FW_SHARED_RW,
-            )?,
-            GFP_KERNEL,
-        )?;
-        mappings.push(
-            self.resources.control_operand_buffers.map_alias_at(
-                vm,
-                G17P_CONTROL_OPERAND_BUFFER_BASE,
-                mmu::PROT_GPU_FW_SHARED_RW,
-            )?,
-            GFP_KERNEL,
-        )?;
+        let table_mapping = match self.resources.control_operand_table.map_at(
+            vm,
+            G17P_CONTROL_OPERAND_TABLE_VA,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        ) {
+            Ok(mapping) => mapping,
+            Err(error) => {
+                dev_err!(
+                    self.dev.as_ref(),
+                    "G17P resources: render operand-table alias at {:#x} failed ({:?})\n",
+                    G17P_CONTROL_OPERAND_TABLE_VA,
+                    error
+                );
+                return Err(error);
+            }
+        };
+        mappings.push(table_mapping, GFP_KERNEL)?;
+        for (index, buffer) in self
+            .resources
+            .control_operand_buffers
+            .iter_mut()
+            .enumerate()
+        {
+            let address = g17p_control_operand_buffer_va(index).ok_or(EINVAL)?;
+            let mapping = match buffer.map_at(vm, address, mmu::PROT_GPU_FW_SHARED_RW) {
+                Ok(mapping) => mapping,
+                Err(error) => {
+                    dev_err!(
+                        self.dev.as_ref(),
+                        "G17P resources: render operand buffer {} alias at {:#x} failed ({:?})\n",
+                        index,
+                        address,
+                        error
+                    );
+                    return Err(error);
+                }
+            };
+            mappings.push(mapping, GFP_KERNEL)?;
+        }
         mappings.push(
             self.resources.partial_primary_index.map_alias_at(
                 vm,
                 g17_submission::G17P_PARTIAL_OPENING_PRIMARY_INDEX_GPU_VA,
-                mmu::PROT_GPU_FW_SHARED_RW,
-            )?,
-            GFP_KERNEL,
-        )?;
-        mappings.push(
-            self.resources.partial_scheduler.map_alias_at(
-                vm,
-                g17_initdata::REGION_VIEW_LOW_ADDRS[0],
-                mmu::PROT_GPU_FW_SHARED_RW,
-            )?,
-            GFP_KERNEL,
-        )?;
-        mappings.push(
-            self.resources.primary_b2_alias_1.map_alias_at(
-                vm,
-                g17_initdata::REGION_VIEW_LOW_ADDRS[1],
                 mmu::PROT_GPU_FW_SHARED_RW,
             )?,
             GFP_KERNEL,
@@ -3441,19 +3580,50 @@ mod tests {
     }
 
     #[test]
-    fn user_vm_fixed_operand_ranges_are_disjoint_and_inside_the_reserved_arena() {
+    fn render_operand_ranges_match_the_captured_sparse_layout() {
         let directory = G17P_CONTROL_DIRECTORY_VA
             ..G17P_CONTROL_DIRECTORY_VA + G17P_CONTROL_DIRECTORY_SIZE as u64;
-        let table =
-            G17P_CONTROL_OPERAND_TABLE_VA..G17P_CONTROL_OPERAND_TABLE_VA + G17P_PAGE_SIZE as u64;
-        let buffers = G17P_CONTROL_OPERAND_BUFFER_BASE
-            ..G17P_CONTROL_OPERAND_BUFFER_BASE + G17P_CONTROL_OPERAND_BACKING_SIZE as u64;
-        for range in [&directory, &table, &buffers] {
+        let table = G17P_CONTROL_OPERAND_TABLE_VA
+            ..G17P_CONTROL_OPERAND_TABLE_VA
+                + g17_initdata::CONTROL_OPERAND_TABLE_SIZE as u64;
+        for range in [&directory, &table] {
             assert!(G17P_CL_LOW_VA_START <= range.start);
             assert!(range.end <= G17P_CL_LOW_VA_END);
         }
         assert!(directory.end <= table.start);
-        assert!(table.end <= buffers.start);
+        assert!(table.end <= G17P_CONTROL_OPERAND_BUFFER_BASE);
+
+        let mut previous_end = None;
+        for index in 0..G17P_CONTROL_OPERAND_BUFFER_COUNT {
+            let start = g17p_control_operand_buffer_va(index).unwrap();
+            let end = start + G17P_CONTROL_OPERAND_BUFFER_SIZE as u64;
+            assert_eq!(
+                start,
+                G17P_CONTROL_OPERAND_BUFFER_BASE
+                    + index as u64 * G17P_CONTROL_OPERAND_BUFFER_STRIDE as u64
+            );
+            assert!(G17P_CL_LOW_VA_START <= start);
+            assert!(end <= G17P_CL_LOW_VA_END);
+            if let Some(previous_end) = previous_end {
+                assert_eq!(start - previous_end, 0x8000);
+            }
+            previous_end = Some(end);
+        }
+        assert_eq!(
+            g17p_control_operand_buffer_va(G17P_CONTROL_OPERAND_BUFFER_COUNT),
+            None
+        );
+        assert!(
+            g17_initdata::CONTROL_OPERAND_ENTRY_COUNT <= G17P_CONTROL_OPERAND_BUFFER_COUNT
+        );
+
+        // These are B2 aliases only in context 0. They fall inside render
+        // operand slot 21, so the layouts cannot share one low root.
+        let slot_21 = g17p_control_operand_buffer_va(21).unwrap();
+        let slot_21_end = slot_21 + G17P_CONTROL_OPERAND_BUFFER_SIZE as u64;
+        for b2 in g17_initdata::REGION_VIEW_LOW_ADDRS {
+            assert!(slot_21 <= b2 && b2 < slot_21_end);
+        }
     }
 
     #[test]
