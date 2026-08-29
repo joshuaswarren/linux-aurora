@@ -880,7 +880,7 @@ impl G17PLiveRuntime {
         let channel_path = doorbell.is_some();
         if let Some(doorbell) = doorbell {
             dev_info!(
-                self.pdev.as_ref(),
+                self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
                 "G17P compute: CL_2 group published; ringing work channel 10\n"
             );
             if let Err(error) = Pin::new(self.gfx_rtkit.as_mut().ok_or(ENODEV)?)
