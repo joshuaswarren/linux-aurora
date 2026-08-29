@@ -433,13 +433,6 @@ static void dcp_link_push(struct apple_dcp *dcp, bool oob,
 			      in_len, out_len, data, cb, cookie);
 }
 
-enum dcp_link_service_match_bit {
-	DCP_LINK_SERVICE_MATCH_TEMPERATURE,
-	DCP_LINK_SERVICE_MATCH_PMU,
-	DCP_LINK_SERVICE_MATCH_BACKLIGHT,
-	DCP_LINK_SERVICE_MATCH_INFLIGHT,
-};
-
 static const struct dcp_method_entry dcp_link_temperature_hint = {
 	.name = "vi_set_temperature_hint",
 	.tag = { 'A', '3', '8', '6' },
@@ -454,24 +447,6 @@ static const struct dcp_method_entry dcp_link_backlight_service_matched = {
 	.name = "backlight_service_matched",
 	.tag = { 'A', '1', '3', '2' },
 };
-
-static bool dcp_link_service_match_pending(struct apple_dcp *dcp)
-{
-	return test_bit(DCP_LINK_SERVICE_MATCH_TEMPERATURE,
-			&dcp->link_service_match_state) ||
-	       test_bit(DCP_LINK_SERVICE_MATCH_PMU,
-			&dcp->link_service_match_state) ||
-	       test_bit(DCP_LINK_SERVICE_MATCH_BACKLIGHT,
-			&dcp->link_service_match_state);
-}
-
-static void dcp_link_service_match_done(struct apple_dcp *dcp)
-{
-	clear_bit(DCP_LINK_SERVICE_MATCH_INFLIGHT,
-		  &dcp->link_service_match_state);
-	if (dcp_link_service_match_pending(dcp))
-		schedule_work(&dcp->link_service_match_work);
-}
 
 static void dcp_link_service_match_complete(struct apple_dcp *dcp, void *out,
 					    void *cookie)
@@ -495,7 +470,6 @@ static void dcp_link_service_match_complete(struct apple_dcp *dcp, void *out,
 			 "DCPLink %.4s completed deferred service callback ACK result %d\n",
 			 call->tag, ret);
 	}
-	dcp_link_service_match_done(dcp);
 }
 
 static void dcp_link_temperature_hint_complete(struct apple_dcp *dcp, void *out,
@@ -508,69 +482,38 @@ static void dcp_link_temperature_hint_complete(struct apple_dcp *dcp, void *out,
 	ret = dcp_link_ack(dcp, DCP_CONTEXT_CB);
 	dev_info(dcp->dev,
 		 "DCPLink A386 completed deferred D100 ACK result %d\n", ret);
-	dcp_link_service_match_done(dcp);
-}
-
-static void dcp_link_service_match_work(struct work_struct *work)
-{
-	struct apple_dcp *dcp =
-		container_of(work, struct apple_dcp, link_service_match_work);
-	const struct dcp_method_entry *call;
-	dcp_callback_t complete;
-	int ret;
-
-	if (test_and_set_bit(DCP_LINK_SERVICE_MATCH_INFLIGHT,
-			     &dcp->link_service_match_state))
-		return;
-
-	if (test_and_clear_bit(DCP_LINK_SERVICE_MATCH_TEMPERATURE,
-			       &dcp->link_service_match_state)) {
-		call = &dcp_link_temperature_hint;
-		complete = dcp_link_temperature_hint_complete;
-	} else if (test_and_clear_bit(DCP_LINK_SERVICE_MATCH_PMU,
-			       &dcp->link_service_match_state)) {
-		call = &dcp_link_pmu_service_matched;
-		complete = dcp_link_service_match_complete;
-	} else if (test_and_clear_bit(DCP_LINK_SERVICE_MATCH_BACKLIGHT,
-				    &dcp->link_service_match_state)) {
-		call = &dcp_link_backlight_service_matched;
-		complete = dcp_link_service_match_complete;
-	} else {
-		clear_bit(DCP_LINK_SERVICE_MATCH_INFLIGHT,
-			  &dcp->link_service_match_state);
-		return;
-	}
-
-	/* Native releases the notifier stream after every synchronous RPC. */
-	ret = dcp_link_push_context(dcp, DCP_CONTEXT_OOBCMD, true, call, 0,
-				    sizeof(__le32), NULL,
-				    complete,
-				    (void *)call);
-	if (ret) {
-		dcp_link_service_match_done(dcp);
-	}
-}
-
-static void dcp_link_record_service_match(struct apple_dcp *dcp, int tag)
-{
-	if (tag == 100)
-		set_bit(DCP_LINK_SERVICE_MATCH_TEMPERATURE,
-			&dcp->link_service_match_state);
-	else if (tag == 206)
-		set_bit(DCP_LINK_SERVICE_MATCH_PMU,
-			&dcp->link_service_match_state);
-	else if (tag == 207)
-		set_bit(DCP_LINK_SERVICE_MATCH_BACKLIGHT,
-			&dcp->link_service_match_state);
-
-	schedule_work(&dcp->link_service_match_work);
 }
 
 bool dcp_link_defer_service_match(struct apple_dcp *dcp, int tag, void *out,
 				  void *in)
 {
+	const struct dcp_method_entry *call;
+	dcp_callback_t complete;
+	int ret;
+
 	trace_iomfb_callback(dcp, tag, __func__);
-	dcp_link_record_service_match(dcp, tag);
+	if (tag == 100) {
+		call = &dcp_link_temperature_hint;
+		complete = dcp_link_temperature_hint_complete;
+	} else if (tag == 206) {
+		call = &dcp_link_pmu_service_matched;
+		complete = dcp_link_service_match_complete;
+	} else if (tag == 207) {
+		call = &dcp_link_backlight_service_matched;
+		complete = dcp_link_service_match_complete;
+	} else {
+		return true;
+	}
+
+	/* The native notifier reuses the remote stream bound to this callback. */
+	ret = dcp_link_push_context(dcp, DCP_CONTEXT_CB, false, call, 0,
+				    sizeof(__le32), NULL,
+				    complete,
+				    (void *)call);
+	if (ret)
+		dev_err(dcp->dev,
+			"DCPLink %.4s nested notifier could not be queued: %d\n",
+			call->tag, ret);
 
 	/* The matching-notification RPC must complete before this callback ACKs. */
 	return false;
@@ -930,9 +873,6 @@ static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 	struct apple_dcp_link_init_desc *desc;
 	u64 init_message;
 	int ret;
-
-	INIT_WORK(&dcp->link_service_match_work, dcp_link_service_match_work);
-	dcp->link_service_match_state = 0;
 
 	if (dcp->adopted_session) {
 		struct iommu_domain *domain;
@@ -1616,8 +1556,6 @@ void iomfb_shutdown(struct apple_dcp *dcp)
 	/* We're going down */
 	dcp->active = false;
 	dcp->valid_mode = false;
-	if (dcp->fw_compat == DCP_FIRMWARE_H17P)
-		cancel_work_sync(&dcp->link_service_match_work);
 
 	switch (dcp->fw_compat) {
 	case DCP_FIRMWARE_V_12_3:
