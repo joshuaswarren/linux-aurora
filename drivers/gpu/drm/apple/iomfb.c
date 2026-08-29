@@ -171,40 +171,6 @@ static void dcp_link_sync_for_device(void)
 	wmb();
 }
 
-void iomfb_link_timeout_snapshot(struct apple_dcp *dcp)
-{
-	struct apple_dcp_link_rpc_header *callback;
-	struct apple_dcp_link_rpc_header *request;
-	u8 *callback_input;
-	u8 *callback_output;
-	u8 depth;
-
-	if (dcp->fw_compat != DCP_FIRMWARE_H17P || !dcp->shmem)
-		return;
-
-	dcp_link_sync_for_cpu();
-	request = dcp->shmem;
-	callback = dcp->shmem + 0x60000;
-	callback_input = (u8 *)(callback + 1);
-	callback_output = callback_input + le32_to_cpu(callback->input_size);
-	depth = READ_ONCE(dcp->ch_cmd.depth);
-
-	dev_info(dcp->dev,
-		 "DCPLink A401 timeout snapshot: state %u callbacks %u replies %u cmd depth %u top %#x request %#llx local %16phN\n",
-		 dcp->link_state, dcp->link_rx_log_count,
-		 dcp->link_reply_log_count, depth,
-		 READ_ONCE(dcp->link_top[false][0]),
-		 depth ? READ_ONCE(dcp->ch_cmd.link_message[depth - 1]) : 0,
-		 request);
-	dev_info(dcp->dev,
-		 "DCPLink callback tail snapshot: header %#x/%u/%u input-tail %16phN output %4phN cb-depth %u\n",
-		 le32_to_cpu(callback->call),
-		 le32_to_cpu(callback->input_size),
-		 le32_to_cpu(callback->output_size),
-		 callback_input + max_t(u32, le32_to_cpu(callback->input_size), 16) - 16,
-		 callback_output, READ_ONCE(dcp->ch_cb.depth));
-}
-
 static void dcp_link_log_init(struct apple_dcp *dcp,
 			      const struct apple_dcp_link_init_desc *desc,
 			      u64 message)
@@ -1145,6 +1111,7 @@ static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 			/* The kext publishes the descriptor only after EP37 is up. */
 			apple_dcp_link_init_desc_encode(desc, 0, false);
 			dcp_link_sync_for_device();
+			dcp_link_log_init(dcp, desc, captured_message);
 			ret = dcp_send_message_sync(dcp,
 						    APPLE_DCP_LINK_ENDPOINT,
 						    captured_message);
@@ -1199,6 +1166,7 @@ static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 		dcp->link_version = 0;
 		dcp->link_firmware_hash = 0;
 		dcp_link_sync_for_device();
+		dcp_link_log_init(dcp, desc, captured_message);
 		ret = dcp_send_message_sync(dcp, APPLE_DCP_LINK_ENDPOINT, captured_message);
 		if (ret) {
 			dev_err(dcp->dev,
@@ -1245,6 +1213,7 @@ err_unmap_inherited:
 	/* Match AppleDCPLinkService: bring up EP37 before publishing INIT state. */
 	apple_dcp_link_init_desc_encode(desc, 0, false);
 	dcp_link_sync_for_device();
+	dcp_link_log_init(dcp, desc, init_message);
 	ret = dcp_send_message_sync(dcp, APPLE_DCP_LINK_ENDPOINT, init_message);
 	if (ret)
 		return dev_err_probe(dcp->dev, ret,
