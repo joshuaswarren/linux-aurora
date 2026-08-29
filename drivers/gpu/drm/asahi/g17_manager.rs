@@ -386,13 +386,24 @@ impl G17PManagerConstruction {
         platform: G17PPlatformConfig,
         num_clusters: u32,
     ) -> Result<Self> {
+        let uat = KBox::new(mmu::Uat::new_t8140(dev, true)?, GFP_KERNEL)?;
+        Self::new_with_uat(dev, soc, platform, num_clusters, uat)
+    }
+
+    pub(crate) fn new_with_uat(
+        dev: &AsahiDevice,
+        soc: &'static agx3::SocConfig,
+        platform: G17PPlatformConfig,
+        num_clusters: u32,
+        uat: KBox<mmu::Uat>,
+    ) -> Result<Self> {
         if num_clusters == 0 {
             return Err(EINVAL);
         }
         validate_target(target_observation(soc)).map_err(|_| EINVAL)?;
         validate_platform(platform).map_err(|_| EINVAL)?;
 
-        let resources = g17_resources::G17ResourceOwner::new(dev)?;
+        let resources = g17_resources::G17ResourceOwner::new_with_uat(dev, uat)?;
         g17_resources::validate_handoff(resources.handoff()).map_err(|_| EINVAL)?;
         validate_resources(resource_observation(resources.handoff(), resources.uat()))
             .map_err(|_| EINVAL)?;

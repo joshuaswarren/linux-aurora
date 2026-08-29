@@ -67,6 +67,7 @@ const CONTROL_DONE_CHANNEL: u64 = 0x11;
 const INITDATA_ACK_POLLS: usize = 200;
 const CONTROL_COUNTER_POLLS: usize = 100;
 const G17P_CRASHLOG_MAX_BYTES: usize = 256 * 1024;
+const G17P_ASC_DVA_MASK: u64 = (1u64 << 36) - 1;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[repr(u32)]
@@ -127,6 +128,8 @@ const _: () = {
     assert!(gfx1.dva & (mmu::UAT_PGSZ as u64 - 1) == 0);
     assert!(gfx.dva + gfx.size as u64 <= 1u64 << 42);
     assert!(gfx1.dva + gfx1.size as u64 <= 1u64 << 42);
+    assert!(gfx.dva & G17P_ASC_DVA_MASK == 0x01e1_c000);
+    assert!(gfx1.dva & G17P_ASC_DVA_MASK == 0x01f5_0000);
 };
 
 /// Load-time boundary for short, independent hardware experiments.
@@ -217,9 +220,12 @@ fn publish_g17p_crashlog(
 fn capture_g17p_firmware_crash_dva(state: &G17PRoleRtkitState) -> Result {
     let buffer = state.processor.firmware_crash_buffer();
     let captured_size = bounded_crashlog_size(buffer.size);
+    // The endpoint-1 message carries the ASC DVA tag in bits 36 and above.
+    // m1n1's StandardASC strips the same tag before walking UAT context 1.
+    let uat_dva = buffer.dva & G17P_ASC_DVA_MASK;
     let crashlog = state
         .crash_vm
-        .copy_firmware_range(buffer.dva, captured_size)?;
+        .copy_firmware_range(uat_dva, captured_size)?;
     publish_g17p_crashlog(state, buffer.size, &crashlog)
 }
 
@@ -370,87 +376,32 @@ struct G17PBootedSession {
     compute_uapi_enabled: bool,
 }
 
-fn boot_session(
+fn wait_initdata_ack(state: &G17PRoleRtkitState) -> Result {
+    for _ in 0..INITDATA_ACK_POLLS {
+        if state.acked.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if state.crashed.load(Ordering::Acquire) {
+            return Err(EIO);
+        }
+        fsleep(Delta::from_millis(10));
+    }
+    Err(ETIMEDOUT)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_boot_session(
     pdev: &platform::Device,
     drm: &ARef<AsahiDevice>,
     registers: &regs::Resources,
     manager: &mut g17_manager::G17PManagerConstruction,
     test_stage: G17PTestStage,
+    cpus: g17_lifecycle::StartedCpuPair<AscwrapV6Provider>,
+    gfx_state: Arc<G17PRoleRtkitState>,
+    mut gfx_rtkit: rtkit::RtKit<G17PRtkitOps>,
+    gfx1_state: Arc<G17PRoleRtkitState>,
+    gfx1_rtkit: rtkit::RtKit<G17PRtkitOps>,
 ) -> Result<G17PBootedSession> {
-    let gfx = AscwrapV6Provider::get(pdev.as_ref(), 0)?;
-    let gfx_lifecycle = validate_provider(&gfx, GFX_PROVIDER)?;
-    let gfx1 = AscwrapV6Provider::get(pdev.as_ref(), 1)?;
-    let gfx1_lifecycle = validate_provider(&gfx1, GFX1_PROVIDER)?;
-    let gfx_gate = gfx.require_safe_cpu_lifecycle();
-    let gfx1_gate = gfx1.require_safe_cpu_lifecycle();
-    let transaction_gate =
-        g17_lifecycle::admit_cpu_start(gfx_lifecycle.missing, gfx1_lifecycle.missing);
-    if gfx_gate.is_err() || gfx1_gate.is_err() || transaction_gate.is_err() {
-        return Err(ENOTSUPP);
-    }
-    dev_info!(pdev.as_ref(), "G17P session: providers ready\n");
-
-    // T8140 publishes the same retained lower root in context slots 0 and 1.
-    // Firmware adds its endpoint-1 crash pages to that root after RTKit start,
-    // so a retained clone is sufficient to walk and snapshot either DVA.
-    let crash_vm = manager.uat().kernel_lower_vm().clone();
-    let gfx_state = Arc::new(
-        G17PRoleRtkitState::new(drm.clone(), G17PProcessor::Gfx, crash_vm.clone()),
-        GFP_KERNEL,
-    )?;
-    let gfx1_state = Arc::new(
-        G17PRoleRtkitState::new(drm.clone(), G17PProcessor::Gfx1, crash_vm),
-        GFP_KERNEL,
-    )?;
-    let mut gfx_rtkit =
-        rtkit::RtKit::<G17PRtkitOps>::new_g17p(drm.as_ref(), None, 0, gfx_state.clone())?;
-    let mut gfx1_rtkit =
-        rtkit::RtKit::<G17PRtkitOps>::new_g17p(drm.as_ref(), None, 1, gfx1_state.clone())?;
-    dev_info!(pdev.as_ref(), "G17P session: both RTKit receivers armed\n");
-
-    registers.t8140_axi_transition_workaround()?;
-    dev_info!(pdev.as_ref(), "G17P session: AXI transition configured\n");
-    let cpus = g17_lifecycle::StartedCpuPair::start_staged(gfx, gfx1, || {
-        dev_info!(pdev.as_ref(), "G17P session: GFX processor started\n");
-        Pin::new(&mut gfx_rtkit).boot()?;
-        dev_info!(pdev.as_ref(), "G17P session: GFX RTKit handshake complete\n");
-        Ok(())
-    })?;
-    dev_info!(pdev.as_ref(), "G17P session: GFX1 processor started\n");
-    Pin::new(&mut gfx1_rtkit).boot()?;
-    dev_info!(pdev.as_ref(), "G17P session: GFX1 RTKit handshake complete\n");
-    registers.t8140_pre_initdata_clear()?;
-    for rtkit in [&mut gfx_rtkit, &mut gfx1_rtkit] {
-        Pin::new(&mut *rtkit).start_endpoint(g17_rtkit::ENDPOINT_GFX_MESSAGES)?;
-        Pin::new(&mut *rtkit).start_endpoint(g17_rtkit::ENDPOINT_GFX_INTERRUPTS)?;
-    }
-
-    let handoff = manager.handoff();
-    let gfx_init =
-        g17_rtkit::encode_initdata_doorbell(handoff.primary.instance.root).map_err(|_| EINVAL)?;
-    let gfx1_init =
-        g17_rtkit::encode_initdata_doorbell(handoff.secondary.instance.root).map_err(|_| EINVAL)?;
-    Pin::new(&mut gfx_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_MESSAGES, gfx_init)?;
-    Pin::new(&mut gfx1_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_MESSAGES, gfx1_init)?;
-    dev_info!(pdev.as_ref(), "G17P session: both initdata doorbells sent\n");
-
-    for _ in 0..INITDATA_ACK_POLLS {
-        if gfx_state.acked.load(Ordering::Acquire) && gfx1_state.acked.load(Ordering::Acquire) {
-            break;
-        }
-        if gfx_state.crashed.load(Ordering::Acquire) || gfx1_state.crashed.load(Ordering::Acquire) {
-            return Err(EIO);
-        }
-        fsleep(Delta::from_millis(10));
-    }
-    if !gfx_state.acked.load(Ordering::Acquire) || !gfx1_state.acked.load(Ordering::Acquire) {
-        return Err(ETIMEDOUT);
-    }
-    dev_info!(
-        pdev.as_ref(),
-        "G17P session: GFX and GFX1 initdata ACKs received\n"
-    );
-
     let staged = manager.control_counters()?;
     if !staged.opening_staged() {
         dev_err!(
@@ -469,6 +420,7 @@ fn boot_session(
     let control_start = (CONTROL_START_TYPE as u64) << 48;
     Pin::new(&mut gfx_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, control_start)?;
     fsleep(Delta::from_millis(12));
+    let mut gfx1_rtkit = gfx1_rtkit;
     Pin::new(&mut gfx1_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, control_start)?;
     dev_info!(pdev.as_ref(), "G17P control: both start messages sent\n");
 
@@ -518,7 +470,6 @@ fn boot_session(
     }
 
     let queue = manager.configure_g17p_compute_queue(drm, registers)?;
-
     dev_info!(
         pdev.as_ref(),
         "G17P session: SKSM QID 4 / selector 2 ready; stage {}\n",
@@ -533,6 +484,198 @@ fn boot_session(
         queue: Some(queue),
         compute_uapi_enabled: test_stage.enables_compute_uapi(),
     })
+}
+
+fn boot_session(
+    pdev: &platform::Device,
+    drm: &ARef<AsahiDevice>,
+    registers: &regs::Resources,
+    manager: &mut g17_manager::G17PManagerConstruction,
+    test_stage: G17PTestStage,
+) -> Result<G17PBootedSession> {
+    let gfx = AscwrapV6Provider::get(pdev.as_ref(), 0)?;
+    let gfx_lifecycle = validate_provider(&gfx, GFX_PROVIDER)?;
+    let gfx1 = AscwrapV6Provider::get(pdev.as_ref(), 1)?;
+    let gfx1_lifecycle = validate_provider(&gfx1, GFX1_PROVIDER)?;
+    let gfx_gate = gfx.require_safe_cpu_lifecycle();
+    let gfx1_gate = gfx1.require_safe_cpu_lifecycle();
+    let transaction_gate =
+        g17_lifecycle::admit_cpu_start(gfx_lifecycle.missing, gfx1_lifecycle.missing);
+    if gfx_gate.is_err() || gfx1_gate.is_err() || transaction_gate.is_err() {
+        return Err(ENOTSUPP);
+    }
+    dev_info!(pdev.as_ref(), "G17P session: providers ready\n");
+
+    // T8140 publishes the same retained lower root in context slots 0 and 1.
+    // Firmware adds its endpoint-1 crash pages to that root after RTKit start,
+    // so a retained clone is sufficient to walk and snapshot either DVA.
+    let crash_vm = manager.uat().kernel_lower_vm().clone();
+    let gfx_state = Arc::new(
+        G17PRoleRtkitState::new(drm.clone(), G17PProcessor::Gfx, crash_vm.clone()),
+        GFP_KERNEL,
+    )?;
+    let gfx1_state = Arc::new(
+        G17PRoleRtkitState::new(drm.clone(), G17PProcessor::Gfx1, crash_vm),
+        GFP_KERNEL,
+    )?;
+    let mut gfx_rtkit =
+        rtkit::RtKit::<G17PRtkitOps>::new_g17p(drm.as_ref(), None, 0, gfx_state.clone())?;
+    let mut gfx1_rtkit =
+        rtkit::RtKit::<G17PRtkitOps>::new_g17p(drm.as_ref(), None, 1, gfx1_state.clone())?;
+    dev_info!(pdev.as_ref(), "G17P session: both RTKit receivers armed\n");
+
+    registers.t8140_axi_transition_workaround()?;
+    dev_info!(pdev.as_ref(), "G17P session: AXI transition configured\n");
+    let handoff = manager.handoff();
+    let gfx_init =
+        g17_rtkit::encode_initdata_doorbell(handoff.primary.instance.root).map_err(|_| EINVAL)?;
+    let gfx1_init =
+        g17_rtkit::encode_initdata_doorbell(handoff.secondary.instance.root).map_err(|_| EINVAL)?;
+    let cpus = g17_lifecycle::StartedCpuPair::start_staged(gfx, gfx1, || {
+        dev_info!(pdev.as_ref(), "G17P session: GFX processor started\n");
+        Pin::new(&mut gfx_rtkit).boot()?;
+        dev_info!(pdev.as_ref(), "G17P session: GFX RTKit handshake complete\n");
+        let root_snapshot = manager.uat().prepare_t8140_firmware_high_roots()?;
+        manager
+            .uat()
+            .confirm_t8140_primary_high_root(root_snapshot)?;
+        registers.t8140_pre_initdata_clear()?;
+        Pin::new(&mut gfx_rtkit).start_endpoint(g17_rtkit::ENDPOINT_GFX_MESSAGES)?;
+        Pin::new(&mut gfx_rtkit).start_endpoint(g17_rtkit::ENDPOINT_GFX_INTERRUPTS)?;
+        Pin::new(&mut gfx_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_MESSAGES, gfx_init)?;
+        dev_info!(pdev.as_ref(), "G17P session: primary initdata sent\n");
+        wait_initdata_ack(&gfx_state)?;
+        dev_info!(pdev.as_ref(), "G17P session: primary initdata ACK received\n");
+        Ok(())
+    })?;
+    dev_info!(pdev.as_ref(), "G17P session: GFX1 processor started\n");
+    Pin::new(&mut gfx1_rtkit).boot()?;
+    dev_info!(pdev.as_ref(), "G17P session: GFX1 RTKit handshake complete\n");
+    manager.uat().mirror_t8140_secondary_high_root()?;
+    Pin::new(&mut gfx1_rtkit).start_endpoint(g17_rtkit::ENDPOINT_GFX_MESSAGES)?;
+    Pin::new(&mut gfx1_rtkit).start_endpoint(g17_rtkit::ENDPOINT_GFX_INTERRUPTS)?;
+    Pin::new(&mut gfx1_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_MESSAGES, gfx1_init)?;
+    dev_info!(pdev.as_ref(), "G17P session: secondary initdata sent\n");
+    wait_initdata_ack(&gfx1_state)?;
+    dev_info!(pdev.as_ref(), "G17P session: secondary initdata ACK received\n");
+
+    finish_boot_session(
+        pdev,
+        drm,
+        registers,
+        manager,
+        test_stage,
+        cpus,
+        gfx_state,
+        gfx_rtkit,
+        gfx1_state,
+        gfx1_rtkit,
+    )
+}
+
+fn boot_initial_session(
+    pdev: &platform::Device,
+    drm: &ARef<AsahiDevice>,
+    registers: &regs::Resources,
+    soc: &'static hw::agx3::SocConfig,
+    num_clusters: u32,
+    test_stage: G17PTestStage,
+) -> Result<(g17_manager::G17PManagerConstruction, G17PBootedSession)> {
+    let gfx = AscwrapV6Provider::get(pdev.as_ref(), 0)?;
+    let gfx_lifecycle = validate_provider(&gfx, GFX_PROVIDER)?;
+    let gfx1 = AscwrapV6Provider::get(pdev.as_ref(), 1)?;
+    let gfx1_lifecycle = validate_provider(&gfx1, GFX1_PROVIDER)?;
+    let gfx_gate = gfx.require_safe_cpu_lifecycle();
+    let gfx1_gate = gfx1.require_safe_cpu_lifecycle();
+    let transaction_gate =
+        g17_lifecycle::admit_cpu_start(gfx_lifecycle.missing, gfx1_lifecycle.missing);
+    if gfx_gate.is_err() || gfx1_gate.is_err() || transaction_gate.is_err() {
+        return Err(ENOTSUPP);
+    }
+    dev_info!(pdev.as_ref(), "G17P session: providers ready\n");
+
+    let mut uat = Some(KBox::new(mmu::Uat::new_t8140(drm, true)?, GFP_KERNEL)?);
+    let crash_vm = uat.as_ref().ok_or(EIO)?.kernel_lower_vm().clone();
+    let gfx_state = Arc::new(
+        G17PRoleRtkitState::new(drm.clone(), G17PProcessor::Gfx, crash_vm.clone()),
+        GFP_KERNEL,
+    )?;
+    let gfx1_state = Arc::new(
+        G17PRoleRtkitState::new(drm.clone(), G17PProcessor::Gfx1, crash_vm),
+        GFP_KERNEL,
+    )?;
+    let mut gfx_rtkit =
+        rtkit::RtKit::<G17PRtkitOps>::new_g17p(drm.as_ref(), None, 0, gfx_state.clone())?;
+    let mut gfx1_rtkit =
+        rtkit::RtKit::<G17PRtkitOps>::new_g17p(drm.as_ref(), None, 1, gfx1_state.clone())?;
+    dev_info!(pdev.as_ref(), "G17P session: both RTKit receivers armed\n");
+
+    registers.t8140_axi_transition_workaround()?;
+    dev_info!(pdev.as_ref(), "G17P session: AXI transition configured\n");
+    let mut manager = None;
+    let cpus = g17_lifecycle::StartedCpuPair::start_staged(gfx, gfx1, || {
+        dev_info!(pdev.as_ref(), "G17P session: GFX processor started\n");
+        Pin::new(&mut gfx_rtkit).boot()?;
+        dev_info!(pdev.as_ref(), "G17P session: GFX RTKit handshake complete\n");
+        let root_snapshot = uat
+            .as_ref()
+            .ok_or(EIO)?
+            .prepare_t8140_firmware_high_roots()?;
+
+        let built = g17_manager::G17PManagerConstruction::new_with_uat(
+            drm,
+            soc,
+            g17_manager::T8140_G17P_PLATFORM_CONFIG,
+            num_clusters,
+            uat.take().ok_or(EIO)?,
+        )?;
+        built
+            .uat()
+            .confirm_t8140_primary_high_root(root_snapshot)?;
+        let gfx_init = g17_rtkit::encode_initdata_doorbell(
+            built.handoff().primary.instance.root,
+        )
+        .map_err(|_| EINVAL)?;
+        registers.t8140_pre_initdata_clear()?;
+        Pin::new(&mut gfx_rtkit).start_endpoint(g17_rtkit::ENDPOINT_GFX_MESSAGES)?;
+        Pin::new(&mut gfx_rtkit).start_endpoint(g17_rtkit::ENDPOINT_GFX_INTERRUPTS)?;
+        Pin::new(&mut gfx_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_MESSAGES, gfx_init)?;
+        dev_info!(pdev.as_ref(), "G17P session: primary initdata sent\n");
+        wait_initdata_ack(&gfx_state)?;
+        dev_info!(pdev.as_ref(), "G17P session: primary initdata ACK received\n");
+        manager = Some(built);
+        Ok(())
+    })?;
+
+    let mut manager = manager.ok_or(EIO)?;
+    dev_info!(pdev.as_ref(), "G17P session: GFX1 processor started\n");
+    Pin::new(&mut gfx1_rtkit).boot()?;
+    dev_info!(pdev.as_ref(), "G17P session: GFX1 RTKit handshake complete\n");
+    manager.uat().mirror_t8140_secondary_high_root()?;
+    Pin::new(&mut gfx1_rtkit).start_endpoint(g17_rtkit::ENDPOINT_GFX_MESSAGES)?;
+    Pin::new(&mut gfx1_rtkit).start_endpoint(g17_rtkit::ENDPOINT_GFX_INTERRUPTS)?;
+    let gfx1_init = g17_rtkit::encode_initdata_doorbell(
+        manager.handoff().secondary.instance.root,
+    )
+    .map_err(|_| EINVAL)?;
+    Pin::new(&mut gfx1_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_MESSAGES, gfx1_init)?;
+    dev_info!(pdev.as_ref(), "G17P session: secondary initdata sent\n");
+    wait_initdata_ack(&gfx1_state)?;
+    dev_info!(pdev.as_ref(), "G17P session: secondary initdata ACK received\n");
+
+    let session = finish_boot_session(
+        pdev,
+        drm,
+        registers,
+        &mut manager,
+        test_stage,
+        cpus,
+        gfx_state,
+        gfx_rtkit,
+        gfx1_state,
+        gfx1_rtkit,
+    )?;
+    Ok((manager, session))
 }
 
 /// State retained for the full lifetime of an exact T8140 platform device.
@@ -796,23 +939,24 @@ impl G17PLiveRuntime {
         );
 
         let pdev_ref: ARef<platform::Device> = pdev.into();
-        let mut manager = match g17_manager::G17PManagerConstruction::new(
+        let (manager, session) = match boot_initial_session(
+            &pdev_ref,
             &drm,
+            &registers,
             soc,
-            g17_manager::T8140_G17P_PLATFORM_CONFIG,
             num_clusters,
+            test_stage,
         ) {
-            Ok(manager) => manager,
+            Ok(runtime) => runtime,
             Err(error) => {
                 dev_err!(
                     pdev.as_ref(),
-                    "G17P live-boot: resource construction failed ({:?})\n",
+                    "G17P live-boot: initial session failed ({:?})\n",
                     error
                 );
                 return Err(error);
             }
         };
-        let session = boot_session(&pdev_ref, &drm, &registers, &mut manager, test_stage)?;
         let accepting_submissions = session.compute_uapi_enabled && session.queue.is_some();
 
         Ok(Self {
