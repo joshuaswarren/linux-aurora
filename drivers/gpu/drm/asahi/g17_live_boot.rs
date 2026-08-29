@@ -75,11 +75,34 @@ enum G17PProcessor {
     Gfx1 = 1,
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+struct G17PFirmwareCrashBuffer {
+    dva: u64,
+    size: usize,
+}
+
 impl G17PProcessor {
     const fn name(self) -> &'static str {
         match self {
             Self::Gfx => "GFX",
             Self::Gfx1 => "GFX1",
+        }
+    }
+
+    const fn firmware_crash_buffer(self) -> G17PFirmwareCrashBuffer {
+        // Both endpoint-1 buffer requests are stable across the retained
+        // G17P captures. Message 0x0010810001e1c000 decodes to the primary
+        // DVA below and size 0x8000; GFX1 advertises the second DVA with the
+        // same size.
+        match self {
+            Self::Gfx => G17PFirmwareCrashBuffer {
+                dva: 0x100_01e1_c000,
+                size: 0x8000,
+            },
+            Self::Gfx1 => G17PFirmwareCrashBuffer {
+                dva: 0x100_01f5_0000,
+                size: 0x8000,
+            },
         }
     }
 }
@@ -96,6 +119,14 @@ const _: () = {
     assert!(bounded_crashlog_size(0) == 0);
     assert!(bounded_crashlog_size(4096) == 4096);
     assert!(bounded_crashlog_size(G17P_CRASHLOG_MAX_BYTES + 1) == G17P_CRASHLOG_MAX_BYTES);
+    let gfx = G17PProcessor::Gfx.firmware_crash_buffer();
+    let gfx1 = G17PProcessor::Gfx1.firmware_crash_buffer();
+    assert!(gfx.dva == 0x100_01e1_c000 && gfx1.dva == 0x100_01f5_0000);
+    assert!(gfx.size == 0x8000 && gfx1.size == 0x8000);
+    assert!(gfx.dva & (mmu::UAT_PGSZ as u64 - 1) == 0);
+    assert!(gfx1.dva & (mmu::UAT_PGSZ as u64 - 1) == 0);
+    assert!(gfx.dva + gfx.size as u64 <= 1u64 << 42);
+    assert!(gfx1.dva + gfx1.size as u64 <= 1u64 << 42);
 };
 
 /// Load-time boundary for short, independent hardware experiments.
@@ -139,16 +170,18 @@ impl G17PTestStage {
 struct G17PRoleRtkitState {
     dev: ARef<AsahiDevice>,
     processor: G17PProcessor,
+    crash_vm: mmu::Vm,
     acked: AtomicBool,
     crashed: AtomicBool,
     runtime_events: AtomicU32,
 }
 
 impl G17PRoleRtkitState {
-    fn new(dev: ARef<AsahiDevice>, processor: G17PProcessor) -> Self {
+    fn new(dev: ARef<AsahiDevice>, processor: G17PProcessor, crash_vm: mmu::Vm) -> Self {
         Self {
             dev,
             processor,
+            crash_vm,
             acked: AtomicBool::new(false),
             crashed: AtomicBool::new(false),
             runtime_events: AtomicU32::new(0),
@@ -157,15 +190,18 @@ impl G17PRoleRtkitState {
 }
 
 #[cfg(CONFIG_DEV_COREDUMP)]
-fn publish_g17p_crashlog(state: &G17PRoleRtkitState, crashlog: &[u8]) -> Result {
-    let captured_size = bounded_crashlog_size(crashlog.len());
+fn publish_g17p_crashlog(
+    state: &G17PRoleRtkitState,
+    original_size: usize,
+    crashlog: &[u8],
+) -> Result {
     let mut crashdump = crate::crashdump::CrashDumpBuilder::new(KVVec::new())?;
     crashdump.add_rtkit_crash_info(
         state.processor as u32,
+        original_size,
         crashlog.len(),
-        captured_size,
     )?;
-    crashdump.add_crashlog(&crashlog[..captured_size])?;
+    crashdump.add_crashlog(crashlog)?;
     let crashdump = KBox::new(crashdump.finalize()?, GFP_KERNEL)?;
     devcoredump::dev_coredump(
         state.dev.as_ref(),
@@ -175,6 +211,16 @@ fn publish_g17p_crashlog(state: &G17PRoleRtkitState, crashlog: &[u8]) -> Result 
         msecs_to_jiffies(60 * 60 * 1000),
     );
     Ok(())
+}
+
+#[cfg(CONFIG_DEV_COREDUMP)]
+fn capture_g17p_firmware_crash_dva(state: &G17PRoleRtkitState) -> Result {
+    let buffer = state.processor.firmware_crash_buffer();
+    let captured_size = bounded_crashlog_size(buffer.size);
+    let crashlog = state
+        .crash_vm
+        .copy_firmware_range(buffer.dva, captured_size)?;
+    publish_g17p_crashlog(state, buffer.size, &crashlog)
 }
 
 /// Active G17P boot does not ask Rust to back system-endpoint buffers. The
@@ -233,8 +279,28 @@ impl rtkit::Operations for G17PRtkitOps {
     ) {
         data.crashed.store(true, Ordering::Release);
         #[cfg(CONFIG_DEV_COREDUMP)]
-        if let Some(crashlog) = crashlog {
-            if let Err(error) = publish_g17p_crashlog(&data, crashlog) {
+        let firmware_owned = crashlog.is_none();
+        #[cfg(CONFIG_DEV_COREDUMP)]
+        let capture = match crashlog {
+            Some(crashlog) => {
+                let captured_size = bounded_crashlog_size(crashlog.len());
+                publish_g17p_crashlog(&data, crashlog.len(), &crashlog[..captured_size])
+            }
+            None => capture_g17p_firmware_crash_dva(&data),
+        };
+        #[cfg(CONFIG_DEV_COREDUMP)]
+        if let Err(error) = capture {
+            if firmware_owned {
+                let buffer = data.processor.firmware_crash_buffer();
+                dev_err!(
+                    data.dev.as_ref(),
+                    "G17P {} crashlog copy from DVA {:#x} size {:#x} failed ({:?})\n",
+                    data.processor.name(),
+                    buffer.dva,
+                    buffer.size,
+                    error
+                );
+            } else {
                 dev_err!(
                     data.dev.as_ref(),
                     "G17P {} crashlog coredump failed ({:?})\n",
@@ -324,12 +390,16 @@ fn boot_session(
     }
     dev_info!(pdev.as_ref(), "G17P session: providers ready\n");
 
+    // T8140 publishes the same retained lower root in context slots 0 and 1.
+    // Firmware adds its endpoint-1 crash pages to that root after RTKit start,
+    // so a retained clone is sufficient to walk and snapshot either DVA.
+    let crash_vm = manager.uat().kernel_lower_vm().clone();
     let gfx_state = Arc::new(
-        G17PRoleRtkitState::new(drm.clone(), G17PProcessor::Gfx),
+        G17PRoleRtkitState::new(drm.clone(), G17PProcessor::Gfx, crash_vm.clone()),
         GFP_KERNEL,
     )?;
     let gfx1_state = Arc::new(
-        G17PRoleRtkitState::new(drm.clone(), G17PProcessor::Gfx1),
+        G17PRoleRtkitState::new(drm.clone(), G17PProcessor::Gfx1, crash_vm),
         GFP_KERNEL,
     )?;
     let mut gfx_rtkit =
