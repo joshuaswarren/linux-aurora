@@ -239,6 +239,95 @@ pub(crate) struct PreparedG17PDirectClNotifications {
     pub(crate) direct_kick: Option<u64>,
 }
 
+/// Submission backend identity. This keeps the T8140 G17P HAL200 hybrid
+/// distinct from both classic channels and the unimplemented HAL300 family
+/// without changing mature generic paths.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum G17ClSubmissionBackend {
+    Classic,
+    G17PHal200Hybrid,
+    Hal300,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PClBackendConfig {
+    pub(crate) backend: G17ClSubmissionBackend,
+    pub(crate) direct_feature: bool,
+    pub(crate) submission_suppressed: bool,
+    pub(crate) command_submission_enabled: bool,
+}
+
+pub(crate) const T8140_G17P_CL_BACKEND: G17PClBackendConfig = G17PClBackendConfig {
+    backend: G17ClSubmissionBackend::G17PHal200Hybrid,
+    direct_feature: true,
+    submission_suppressed: false,
+    command_submission_enabled: true,
+};
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum G17PContractPredicateState {
+    Pending,
+    ProvenAbsent,
+    ProvenPresent,
+}
+
+/// Required first-bind commands and the two remaining publication facts. The
+/// tag encoders are byte-proven; hardware release stays closed until the
+/// native command-pointer ring and dedicated FlushID predicate are proven.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PFirstBindCommandPlan {
+    pub(crate) config_update_required: bool,
+    pub(crate) entry_signal_required: bool,
+    pub(crate) logical_flush_id_required: bool,
+    pub(crate) dedicated_flush_id: G17PContractPredicateState,
+    pub(crate) native_command_pointer_ring: G17PContractPredicateState,
+}
+
+impl G17PFirstBindCommandPlan {
+    pub(crate) const fn hardware_release_ready(self) -> bool {
+        self.config_update_required
+            && self.entry_signal_required
+            && self.logical_flush_id_required
+            && matches!(
+                self.dedicated_flush_id,
+                G17PContractPredicateState::ProvenAbsent
+                    | G17PContractPredicateState::ProvenPresent
+            )
+            && matches!(
+                self.native_command_pointer_ring,
+                G17PContractPredicateState::ProvenPresent
+            )
+    }
+}
+
+pub(crate) const G17P_FIRST_BIND_COMMAND_PLAN: G17PFirstBindCommandPlan =
+    G17PFirstBindCommandPlan {
+        config_update_required: true,
+        entry_signal_required: true,
+        logical_flush_id_required: true,
+        dedicated_flush_id: G17PContractPredicateState::Pending,
+        native_command_pointer_ring: G17PContractPredicateState::Pending,
+    };
+
+/// Compile-time release gate consumed by the live first-add3 boundary. Keep
+/// false until both pending contract predicates above are resolved and the
+/// required tag-15/tag-16 pointers have a native-equivalent publisher.
+pub(crate) const G17P_FIRST_BIND_DIRECT_HARDWARE_RELEASE_READY: bool =
+    G17P_FIRST_BIND_COMMAND_PLAN.hardware_release_ready();
+
+pub(crate) const fn g17p_first_bind_tag15_required(queue_config_dirty: bool) -> bool {
+    queue_config_dirty
+}
+
+pub(crate) const fn g17p_first_bind_tag16_required(
+    backend: G17PClBackendConfig,
+    queue_config_dirty: bool,
+) -> bool {
+    matches!(backend.backend, G17ClSubmissionBackend::G17PHal200Hybrid)
+        && backend.direct_feature
+        && queue_config_dirty
+}
+
 /// First/new compute-channel activation. Priority 2 encodes as `0x...0a`;
 /// this is independent of SKSM QID 4 and outer work-channel index 10.
 pub(crate) const fn encode_g17p_cl_activation(priority: u8) -> Result<u64, SubmissionError> {
@@ -3607,6 +3696,37 @@ mod tests {
             assert_eq!(prepared.activation.unwrap().to_le_bytes(), *ACTIVATION);
             assert_eq!(prepared.direct_kick, None);
         }
+
+        assert_eq!(
+            T8140_G17P_CL_BACKEND,
+            G17PClBackendConfig {
+                backend: G17ClSubmissionBackend::G17PHal200Hybrid,
+                direct_feature: true,
+                submission_suppressed: false,
+                command_submission_enabled: true,
+            }
+        );
+        assert!(g17p_first_bind_tag15_required(true));
+        assert!(g17p_first_bind_tag16_required(
+            T8140_G17P_CL_BACKEND,
+            true
+        ));
+        assert!(!g17p_first_bind_tag16_required(
+            G17PClBackendConfig {
+                backend: G17ClSubmissionBackend::Classic,
+                ..T8140_G17P_CL_BACKEND
+            },
+            true
+        ));
+        assert!(!g17p_first_bind_tag16_required(
+            G17PClBackendConfig {
+                direct_feature: false,
+                ..T8140_G17P_CL_BACKEND
+            },
+            true
+        ));
+        assert!(!G17P_FIRST_BIND_COMMAND_PLAN.hardware_release_ready());
+        assert!(!G17P_FIRST_BIND_DIRECT_HARDWARE_RELEASE_READY);
     }
 
     #[test]

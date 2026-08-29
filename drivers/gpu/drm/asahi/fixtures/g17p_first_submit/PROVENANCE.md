@@ -31,6 +31,12 @@ operands recorded in `encoder-parity.md`.
 - `ep21-first-direct-sequence.bin`: activation followed by the distinct direct
   kick; SHA-256
   `d3eb514a7f214b07e955a3330e340937d9f91db8383ecd18315c0a5674248fd8`.
+- `tag15-config-update-first.bin`: first-bind tag-15 ConfigUpdate meaningful
+  extent, independently matching the existing selector-0x0f builder; SHA-256
+  `8a1a6b62ee712abe235860077e29d08f232f8c3c2432f327e82b04800706e204`.
+- `tag15-config-update-relocation-mask.bin`: address normalization mask for
+  the tag-15 extent; SHA-256
+  `e453d785542953408e8fc17657d91b536c60475fd472ee72e2f2dc2b439755d5`.
 
 Direct-feature G17P skips tag 14. A first bind marks the queue configuration
 dirty, which makes descriptor preparation allocate tag 15 and then tag 16;

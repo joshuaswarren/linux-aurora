@@ -331,6 +331,7 @@ pub(crate) struct G17PSksmQueue {
     storage: g17_resources::G17PClRuntimeStorage,
     compute: g17_resources::G17PComputeDescriptorStorage,
     producer: g17_submission::G17PClKickProducerState,
+    cached_channel_identity: u64,
     submission_ordinal: u32,
     b2_activation: g17_submission::G17PClB2ActivationState,
 }
@@ -1186,6 +1187,7 @@ impl G17PManagerConstruction {
                 previous_valid: false,
                 previous_timestamp: 0,
             },
+            cached_channel_identity: 0,
             submission_ordinal: 0,
             b2_activation: g17_submission::G17PClB2ActivationState::Pending,
         })
@@ -1301,9 +1303,16 @@ impl G17PManagerConstruction {
         command: &g17_uapi::TranslatedComputeCommand,
         context: G17PComputeSubmissionContext<'_>,
         buffers: [u64; 3],
-    ) -> Result<u64> {
+    ) -> Result<g17_submission::PreparedG17PDirectClNotifications> {
         if queue.submission_ordinal != 0 {
             return Err(EINVAL);
+        }
+        // TODO(g17p-first-bind): tag 15 and tag 16 are required, but their
+        // native AGXChannel pointer-ring publisher and the dedicated FlushID
+        // predicate are not yet admitted. Fail before any live write until the
+        // compile-time contract gate is opened.
+        if !g17_submission::G17P_FIRST_BIND_DIRECT_HARDWARE_RELEASE_READY {
+            return Err(ENOTSUPP);
         }
 
         let descriptor_slot = 0;
@@ -1414,8 +1423,24 @@ impl G17PManagerConstruction {
         let prepared = self
             .resources
             .publish_compute_channel(group.queue, group.write_index)?;
+        let backend = g17_submission::T8140_G17P_CL_BACKEND;
+        let notifications = g17_submission::prepare_g17p_direct_cl_notifications(
+            g17_submission::G17PDirectClNotificationState {
+                cached_channel_identity: queue.cached_channel_identity,
+                submitted_channel_identity: group.queue,
+                firmware_ready: true,
+                direct_feature: backend.direct_feature,
+                submission_suppressed: backend.submission_suppressed,
+                command_submission_enabled: backend.command_submission_enabled,
+            },
+        )
+        .map_err(|_| EINVAL)?;
+        if notifications.activation != Some(prepared.doorbell) {
+            return Err(EINVAL);
+        }
+        queue.cached_channel_identity = group.queue;
         queue.submission_ordinal = 1;
-        Ok(prepared.doorbell)
+        Ok(notifications)
     }
 
     /// Build and publish one complete userspace compute command.
@@ -1430,7 +1455,7 @@ impl G17PManagerConstruction {
         binding: &G17PComputeUserBinding,
         command: &g17_uapi::TranslatedComputeCommand,
         context: G17PComputeSubmissionContext<'_>,
-    ) -> Result<Option<u64>> {
+    ) -> Result<Option<g17_submission::PreparedG17PDirectClNotifications>> {
         if !queue.registered
             || queue.scratch != self.sksm_scratch()
             || queue.uat_owner != self.uat().ttb_base()
