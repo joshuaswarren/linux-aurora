@@ -161,6 +161,8 @@ pub(crate) enum SubmissionError {
     ComputeRceAddressOverflow,
     /// A compute event counter overflowed its 64-bit entry field.
     ComputeEventCounterOverflow,
+    /// Required first-bind command publication facts are still unresolved.
+    FirstBindCommandPublicationIncomplete,
     /// The middle QoS field is wider than the five bits copied by the host.
     KickQosClassOutOfRange,
     /// The runtime MMIO aperture selector or base offset overflowed u32.
@@ -271,9 +273,9 @@ pub(crate) enum G17PContractPredicateState {
     ProvenPresent,
 }
 
-/// Required first-bind commands and the two remaining publication facts. The
-/// tag encoders are byte-proven; hardware release stays closed until the
-/// native command-pointer ring and dedicated FlushID predicate are proven.
+/// Required first-bind commands and publication facts. The tag encoders and
+/// native command-pointer ring are proven; hardware release stays closed until
+/// the dedicated FlushID predicate is resolved.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct G17PFirstBindCommandPlan {
     pub(crate) config_update_required: bool,
@@ -306,14 +308,24 @@ pub(crate) const G17P_FIRST_BIND_COMMAND_PLAN: G17PFirstBindCommandPlan =
         entry_signal_required: true,
         logical_flush_id_required: true,
         dedicated_flush_id: G17PContractPredicateState::Pending,
-        native_command_pointer_ring: G17PContractPredicateState::Pending,
+        native_command_pointer_ring: G17PContractPredicateState::ProvenPresent,
     };
 
 /// Compile-time release gate consumed by the live first-add3 boundary. Keep
-/// false until both pending contract predicates above are resolved and the
-/// required tag-15/tag-16 pointers have a native-equivalent publisher.
+/// false until the dedicated FlushID predicate above is resolved. The required
+/// tag-15/tag-16 pointers now use the proven native-equivalent publisher.
 pub(crate) const G17P_FIRST_BIND_DIRECT_HARDWARE_RELEASE_READY: bool =
     G17P_FIRST_BIND_COMMAND_PLAN.hardware_release_ready();
+
+pub(crate) const fn require_g17p_first_bind_direct_hardware_release(
+    plan: G17PFirstBindCommandPlan,
+) -> Result<(), SubmissionError> {
+    if plan.hardware_release_ready() {
+        Ok(())
+    } else {
+        Err(SubmissionError::FirstBindCommandPublicationIncomplete)
+    }
+}
 
 pub(crate) const fn g17p_first_bind_tag15_required(queue_config_dirty: bool) -> bool {
     queue_config_dirty
@@ -326,6 +338,57 @@ pub(crate) const fn g17p_first_bind_tag16_required(
     matches!(backend.backend, G17ClSubmissionBackend::G17PHal200Hybrid)
         && backend.direct_feature
         && queue_config_dirty
+}
+
+/// Host-only first/repeat state for the direct CL submission contract.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PDirectClLifecycleState {
+    pub(crate) queue_config_dirty: bool,
+    pub(crate) cached_channel_identity: u64,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct PreparedG17PDirectClLifecycle {
+    pub(crate) publish_config_update: bool,
+    pub(crate) publish_entry_signal: bool,
+    pub(crate) notifications: PreparedG17PDirectClNotifications,
+    pub(crate) next: G17PDirectClLifecycleState,
+}
+
+/// Derive first-bind and repeat transitions without selecting publication
+/// storage. First bind publishes tags 15/16; a clean repeat omits both and the
+/// unchanged channel identity omits activation, while direct kick remains.
+pub(crate) const fn prepare_g17p_direct_cl_lifecycle(
+    current: G17PDirectClLifecycleState,
+    submitted_channel_identity: u64,
+    firmware_ready: bool,
+    backend: G17PClBackendConfig,
+) -> Result<PreparedG17PDirectClLifecycle, SubmissionError> {
+    let publish_config_update = g17p_first_bind_tag15_required(current.queue_config_dirty);
+    let publish_entry_signal =
+        g17p_first_bind_tag16_required(backend, current.queue_config_dirty);
+    let notifications = match prepare_g17p_direct_cl_notifications(
+        G17PDirectClNotificationState {
+            cached_channel_identity: current.cached_channel_identity,
+            submitted_channel_identity,
+            firmware_ready,
+            direct_feature: backend.direct_feature,
+            submission_suppressed: backend.submission_suppressed,
+            command_submission_enabled: backend.command_submission_enabled,
+        },
+    ) {
+        Ok(notifications) => notifications,
+        Err(error) => return Err(error),
+    };
+    Ok(PreparedG17PDirectClLifecycle {
+        publish_config_update,
+        publish_entry_signal,
+        notifications,
+        next: G17PDirectClLifecycleState {
+            queue_config_dirty: false,
+            cached_channel_identity: submitted_channel_identity,
+        },
+    })
 }
 
 /// First/new compute-channel activation. Priority 2 encodes as `0x...0a`;
@@ -2338,27 +2401,35 @@ pub(crate) const G17P_CL_KICK_PUBLICATION_ORDER: [G17PClKickPublicationStep; 7] 
 pub(crate) enum G17PFirstSubmitPublicationStep {
     PublishB2,
     StageRuntimeTick,
+    PublishConfigUpdatePointer,
     ZeroSksmStride,
     WriteSksmEntry,
     EntryBarrier,
     PublishSksmProducer,
     AdvanceDescriptorGeneration,
+    PublishEntrySignalPointer,
     AddKicks,
     PublishCl2,
-    SendEpDoorbell,
+    SendActivation,
+    DirectKickBarrier,
+    SendDirectKick,
 }
 
-pub(crate) const G17P_FIRST_SUBMIT_PUBLICATION_ORDER: [G17PFirstSubmitPublicationStep; 10] = [
+pub(crate) const G17P_FIRST_SUBMIT_PUBLICATION_ORDER: [G17PFirstSubmitPublicationStep; 14] = [
     G17PFirstSubmitPublicationStep::PublishB2,
     G17PFirstSubmitPublicationStep::StageRuntimeTick,
+    G17PFirstSubmitPublicationStep::PublishConfigUpdatePointer,
     G17PFirstSubmitPublicationStep::ZeroSksmStride,
     G17PFirstSubmitPublicationStep::WriteSksmEntry,
     G17PFirstSubmitPublicationStep::EntryBarrier,
     G17PFirstSubmitPublicationStep::PublishSksmProducer,
     G17PFirstSubmitPublicationStep::AdvanceDescriptorGeneration,
+    G17PFirstSubmitPublicationStep::PublishEntrySignalPointer,
     G17PFirstSubmitPublicationStep::AddKicks,
     G17PFirstSubmitPublicationStep::PublishCl2,
-    G17PFirstSubmitPublicationStep::SendEpDoorbell,
+    G17PFirstSubmitPublicationStep::SendActivation,
+    G17PFirstSubmitPublicationStep::DirectKickBarrier,
+    G17PFirstSubmitPublicationStep::SendDirectKick,
 ];
 
 fn encode_g17p_cl_dependency(timestamp: u64, queue_id: u8) -> Result<u64, SubmissionError> {
@@ -3727,6 +3798,84 @@ mod tests {
         ));
         assert!(!G17P_FIRST_BIND_COMMAND_PLAN.hardware_release_ready());
         assert!(!G17P_FIRST_BIND_DIRECT_HARDWARE_RELEASE_READY);
+
+        let first_lifecycle = prepare_g17p_direct_cl_lifecycle(
+            G17PDirectClLifecycleState {
+                queue_config_dirty: true,
+                cached_channel_identity: 0,
+            },
+            first_state.submitted_channel_identity,
+            true,
+            T8140_G17P_CL_BACKEND,
+        )
+        .unwrap();
+        assert!(first_lifecycle.publish_config_update);
+        assert!(first_lifecycle.publish_entry_signal);
+        assert_eq!(first_lifecycle.notifications, first);
+        assert_eq!(
+            first_lifecycle.next,
+            G17PDirectClLifecycleState {
+                queue_config_dirty: false,
+                cached_channel_identity: first_state.submitted_channel_identity,
+            }
+        );
+
+        let repeat_lifecycle = prepare_g17p_direct_cl_lifecycle(
+            first_lifecycle.next,
+            first_state.submitted_channel_identity,
+            true,
+            T8140_G17P_CL_BACKEND,
+        )
+        .unwrap();
+        assert!(!repeat_lifecycle.publish_config_update);
+        assert!(!repeat_lifecycle.publish_entry_signal);
+        assert_eq!(repeat_lifecycle.notifications.activation, None);
+        assert_eq!(repeat_lifecycle.notifications.direct_kick, first.direct_kick);
+        assert_eq!(repeat_lifecycle.next, first_lifecycle.next);
+
+        let mut command_ring_mutations = 0;
+        let mut sksm_storage_mutations = 0;
+        let mut sksm_mmio_mutations = 0;
+        let mut outer_ring_mutations = 0;
+        let mut mailbox_mutations = 0;
+        let gated: Result<(), SubmissionError> = (|| {
+            require_g17p_first_bind_direct_hardware_release(
+                G17P_FIRST_BIND_COMMAND_PLAN,
+            )?;
+            command_ring_mutations += 2;
+            sksm_storage_mutations += 1;
+            sksm_mmio_mutations += 1;
+            outer_ring_mutations += 1;
+            mailbox_mutations += 2;
+            Ok(())
+        })();
+        assert_eq!(
+            gated,
+            Err(SubmissionError::FirstBindCommandPublicationIncomplete)
+        );
+        assert_eq!(command_ring_mutations, 0);
+        assert_eq!(sksm_storage_mutations, 0);
+        assert_eq!(sksm_mmio_mutations, 0);
+        assert_eq!(outer_ring_mutations, 0);
+        assert_eq!(mailbox_mutations, 0);
+
+        let resolved = G17PFirstBindCommandPlan {
+            dedicated_flush_id: G17PContractPredicateState::ProvenAbsent,
+            native_command_pointer_ring: G17PContractPredicateState::ProvenPresent,
+            ..G17P_FIRST_BIND_COMMAND_PLAN
+        };
+        assert!(resolved.hardware_release_ready());
+        assert_eq!(
+            require_g17p_first_bind_direct_hardware_release(resolved),
+            Ok(())
+        );
+        assert!(!g17p_first_bind_tag16_required(
+            G17PClBackendConfig {
+                backend: G17ClSubmissionBackend::Hal300,
+                ..T8140_G17P_CL_BACKEND
+            },
+            true
+        ));
     }
 
     #[test]
@@ -4856,14 +5005,18 @@ mod tests {
             [
                 G17PFirstSubmitPublicationStep::PublishB2,
                 G17PFirstSubmitPublicationStep::StageRuntimeTick,
+                G17PFirstSubmitPublicationStep::PublishConfigUpdatePointer,
                 G17PFirstSubmitPublicationStep::ZeroSksmStride,
                 G17PFirstSubmitPublicationStep::WriteSksmEntry,
                 G17PFirstSubmitPublicationStep::EntryBarrier,
                 G17PFirstSubmitPublicationStep::PublishSksmProducer,
                 G17PFirstSubmitPublicationStep::AdvanceDescriptorGeneration,
+                G17PFirstSubmitPublicationStep::PublishEntrySignalPointer,
                 G17PFirstSubmitPublicationStep::AddKicks,
                 G17PFirstSubmitPublicationStep::PublishCl2,
-                G17PFirstSubmitPublicationStep::SendEpDoorbell,
+                G17PFirstSubmitPublicationStep::SendActivation,
+                G17PFirstSubmitPublicationStep::DirectKickBarrier,
+                G17PFirstSubmitPublicationStep::SendDirectKick,
             ]
         );
     }

@@ -22,8 +22,12 @@ pub(crate) const COMPUTE_CHANNEL_WRITE_INDEX: u32 = 3;
 pub(crate) const COMPUTE_QUEUE_POINTERS: usize = 0x100;
 const COMPUTE_QUEUE_CONTEXT_ITEM: usize = 0x200;
 pub(crate) const COMPUTE_ITEM_RING: usize = 0x4000;
-pub(crate) const COMPUTE_OPTIONAL: usize = 0x5000;
-pub(crate) const COMPUTE_EVENT: usize = 0x5400;
+pub(crate) const COMPUTE_ITEM_RING_SIZE: usize = 0x500 * 8;
+pub(crate) const COMPUTE_OPTIONAL: usize = 0x6800;
+pub(crate) const COMPUTE_EVENT: usize = 0x6c00;
+const _: () = assert!(COMPUTE_ITEM_RING + COMPUTE_ITEM_RING_SIZE <= COMPUTE_OPTIONAL);
+const _: () = assert!(COMPUTE_OPTIONAL + COMPUTE_OPTIONAL_SIZE <= COMPUTE_EVENT);
+const _: () = assert!(COMPUTE_EVENT + COMPUTE_EVENT_SIZE <= COMPUTE_QUEUE_GRAPH_SIZE);
 const _: () = assert!(COMPUTE_REGISTER_COUNT <= COMPUTE_REGISTER_CAPACITY);
 
 const COMPUTE_SELECTOR: u32 = 3;
@@ -648,12 +652,12 @@ mod tests {
             addresses,
             ComputeChannelGroupAddresses {
                 queue: base,
-                optional: base + 0x5000,
-                event: base + 0x5400,
+                optional: base + 0x6800,
+                event: base + 0x6c00,
                 write_index: 3,
             }
         );
-        assert_eq!(fnv1a64(&graph), 0x7eb0_0e86_2d6b_2c57);
+        assert_eq!(fnv1a64(&graph), 0xc8d6_b367_6415_8da7);
         assert_eq!(fnv1a64(&context), 0x5ba5_b355_8c90_0783);
     }
 }

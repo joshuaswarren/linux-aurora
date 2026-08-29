@@ -1307,13 +1307,14 @@ impl G17PManagerConstruction {
         if queue.submission_ordinal != 0 {
             return Err(EINVAL);
         }
-        // TODO(g17p-first-bind): tag 15 and tag 16 are required, but their
-        // native AGXChannel pointer-ring publisher and the dedicated FlushID
-        // predicate are not yet admitted. Fail before any live write until the
-        // compile-time contract gate is opened.
-        if !g17_submission::G17P_FIRST_BIND_DIRECT_HARDWARE_RELEASE_READY {
-            return Err(ENOTSUPP);
-        }
+        // TODO(g17p-first-bind): tag 15/tag 16 now use the admitted native
+        // AGXChannel pointer ring, but the dedicated FlushID predicate remains
+        // unresolved. Fail before any live write until that contract gate is
+        // opened.
+        g17_submission::require_g17p_first_bind_direct_hardware_release(
+            g17_submission::G17P_FIRST_BIND_COMMAND_PLAN,
+        )
+        .map_err(|_| ENOTSUPP)?;
 
         let descriptor_slot = 0;
         let (descriptor_high, _) = queue.compute.descriptor_gpu_vas(descriptor_slot);
@@ -1389,6 +1390,22 @@ impl G17PManagerConstruction {
         {
             return Err(EINVAL);
         }
+        let backend = g17_submission::T8140_G17P_CL_BACKEND;
+        if !g17_submission::g17p_first_bind_tag15_required(true)
+            || !g17_submission::g17p_first_bind_tag16_required(backend, true)
+        {
+            return Err(EINVAL);
+        }
+        let mut entry_signal =
+            [0u8; g17_submission::G17P_COMPUTE_OPTIONAL_EVENT_SIZE];
+        g17_submission::encode_g17p_compute_optional_event(
+            g17_submission::G17PComputeOptionalEvent {
+                queue_id: u16::from(queue.queue_id),
+                old_timestamp: prepared_entry.current_timestamp,
+            },
+            &mut entry_signal,
+        )
+        .map_err(|_| EINVAL)?;
         let group = queue
             .compute
             .stage_initial_channel_group_without_fallback_event(
@@ -1396,9 +1413,12 @@ impl G17PManagerConstruction {
                 user_layout.queue_context,
                 shared_control,
                 queue.storage.channel_control_gpu_va(),
-            )?;
+        )?;
         self.publish_compute_b2_once(queue)?;
         self.stage_compute_runtime_tick_once()?;
+        queue
+            .compute
+            .publish_initial_config_update_pointer(group)?;
         queue.storage.write_entry(
             prepared_entry.entry_offset as usize,
             prepared_entry.zero_length as usize,
@@ -1409,6 +1429,9 @@ impl G17PManagerConstruction {
         let descriptor_generation =
             g17_submission::advance_g17p_compute_descriptor_generation(0, 0)
                 .map_err(|_| EINVAL)?;
+        queue
+            .compute
+            .publish_initial_entry_signal(&entry_signal)?;
         self.add_sksm_kicks(registers, queue, 1)?;
         queue.producer.last_add_kicks_timestamp = prepared_entry.current_timestamp;
         dev_info!(
@@ -1423,7 +1446,6 @@ impl G17PManagerConstruction {
         let prepared = self
             .resources
             .publish_compute_channel(group.queue, group.write_index)?;
-        let backend = g17_submission::T8140_G17P_CL_BACKEND;
         let notifications = g17_submission::prepare_g17p_direct_cl_notifications(
             g17_submission::G17PDirectClNotificationState {
                 cached_channel_identity: queue.cached_channel_identity,
