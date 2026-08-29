@@ -455,7 +455,7 @@ enum dcp_link_service_match_bit {
 	DCP_LINK_SERVICE_MATCH_INFLIGHT,
 };
 
-#define DCP_LINK_SERVICE_NOTIFY_RETRIES 256
+#define DCP_LINK_SERVICE_NOTIFY_RETRIES 512
 
 static bool dcp_link_service_match_pending(struct apple_dcp *dcp)
 {
@@ -480,6 +480,8 @@ static void dcp_link_renotify_service(struct apple_dcp *dcp,
 {
 	struct dcp_channel *ch = &dcp->ch_oobcmd;
 	u64 message;
+	u32 control = 0;
+	u32 first_busy_control = 0;
 	u8 depth;
 	int attempt;
 	int busy = 0;
@@ -503,10 +505,11 @@ static void dcp_link_renotify_service(struct apple_dcp *dcp,
 		}
 
 		dcp_link_sync_for_device();
-		ret = dcp_try_send_message_if_empty(dcp,
-						    APPLE_DCP_LINK_ENDPOINT,
-						    message);
+		ret = dcp_try_send_message(dcp, APPLE_DCP_LINK_ENDPOINT,
+					   message, &control);
 		if (ret == -EAGAIN) {
+			if (!busy)
+				first_busy_control = control;
 			busy++;
 			continue;
 		}
@@ -519,13 +522,21 @@ static void dcp_link_renotify_service(struct apple_dcp *dcp,
 		sent++;
 		if (sent == 2)
 			dev_info(dcp->dev,
-				 "DCPLink %.4s still pending; polling and re-notifying an empty mailbox every 1 ms\n",
+				 "DCPLink %.4s still pending; nonblocking re-notify every 1 ms\n",
 				 call->tag);
 	}
 
-	dev_warn(dcp->dev,
-		 "DCPLink %.4s remained pending after %d doorbells (%d occupied polls)\n",
-		 call->tag, sent, busy);
+	depth = READ_ONCE(ch->depth);
+	if (depth)
+		dev_warn(dcp->dev,
+			 "DCPLink %.4s pending after %d doorbells (%d full polls first %#x last %#x): depth %u top %#x request %#llx output %4phN\n",
+			 call->tag, sent, busy, first_busy_control, control, depth,
+			 READ_ONCE(dcp->link_top[false][1]),
+			 READ_ONCE(ch->link_message[depth - 1]),
+			 ch->output[depth - 1]);
+	else
+		dev_info(dcp->dev,
+			 "DCPLink %.4s consumed after retry window\n", call->tag);
 }
 
 static void dcp_link_service_match_complete(struct apple_dcp *dcp, void *out,

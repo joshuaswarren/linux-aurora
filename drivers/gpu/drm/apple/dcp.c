@@ -62,7 +62,7 @@
 #define APPLE_DCP_RTKIT_MGMT_STARTEP_FLAG BIT_ULL(1)
 #define APPLE_DCP_RTKIT_EP_MGMT 0
 
-#define APPLE_T8140_MBOX_CONTROL_EMPTY BIT(17)
+#define APPLE_T8140_MBOX_CONTROL_FULL BIT(16)
 #define APPLE_T8140_MBOX_A2I_CONTROL 0x110
 #define APPLE_T8140_MBOX_A2I_SEND0 0x800
 #define APPLE_T8140_MBOX_A2I_SEND1 0x808
@@ -528,8 +528,8 @@ int dcp_send_message_sync(struct apple_dcp *dcp, u8 endpoint, u64 message)
 					false);
 }
 
-int dcp_try_send_message_if_empty(struct apple_dcp *dcp, u8 endpoint,
-				  u64 message)
+int dcp_try_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message,
+			 u32 *control_out)
 {
 	struct apple_mbox *mbox = dcp->rtk->mbox;
 	unsigned long flags;
@@ -542,16 +542,17 @@ int dcp_try_send_message_if_empty(struct apple_dcp *dcp, u8 endpoint,
 		return -EOPNOTSUPP;
 
 	/*
-	 * DCPLink's native notifier repeats a doorbell only after the previous
-	 * mailbox entry has left the FIFO.  apple_mbox_send() waits up to 500 ms
-	 * when the FIFO is occupied, which stalls the notification poll itself.
-	 * Keep this T8140 handoff path nonblocking and leave the next retry to the
-	 * caller instead of stacking duplicate entries.
+	 * apple_mbox_send() admits entries until CONTROL_FULL is set, but waits up
+	 * to 500 ms once it is.  DCPLink's notifier must keep its roughly 1 ms
+	 * cadence alongside callback ACK traffic, so mirror that admission rule
+	 * without blocking the poll when the shared FIFO is full.
 	 */
 	dma_wmb();
 	spin_lock_irqsave(&mbox->tx_lock, flags);
 	control = readl_relaxed(mbox->regs + APPLE_T8140_MBOX_A2I_CONTROL);
-	if (!(control & APPLE_T8140_MBOX_CONTROL_EMPTY)) {
+	if (control_out)
+		*control_out = control;
+	if (control & APPLE_T8140_MBOX_CONTROL_FULL) {
 		ret = -EAGAIN;
 		goto out_unlock;
 	}
