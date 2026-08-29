@@ -84,6 +84,7 @@ enum afk_v2_message_kind {
 
 enum afk_v2_report_opcode {
 	AFK_V2_REPORT_PUBLISH = 0x11,
+	AFK_V2_REPORT_OPEN = 0x12,
 	AFK_V2_REPORT_CLOSE = 0x13,
 	AFK_V2_REPORT_TERMINATE = 0x14,
 };
@@ -873,6 +874,8 @@ static void afk_recv_handle_v2(struct apple_dcp_afkep *ep, u8 *data,
 	switch (message->kind) {
 	case AFK_V2_REPORT:
 		if (message->opcode == AFK_V2_REPORT_PUBLISH) {
+			int ret;
+
 			if (service) {
 				dev_warn(ep->dcp->dev,
 					 "AFK[ep:%02x]: duplicate AFKEPV2 publish on channel %u\n",
@@ -881,6 +884,26 @@ static void afk_recv_handle_v2(struct apple_dcp_afkep *ep, u8 *data,
 			}
 
 			afk_recv_handle_init(ep, channel, payload, payload_size);
+			service = afk_epic_find_service(ep, channel);
+			if (!service)
+				return;
+
+			/*
+			 * AFKEPV2 publishes an interface before the host consumes it.
+			 * Opening a matched interface is an empty report with opcode
+			 * 0x12 and the report flag set.
+			 */
+			ret = afk_send_epic(ep, channel, 0, EPIC_TYPE_NOTIFY,
+					    EPIC_CAT_REPORT, AFK_V2_REPORT_OPEN,
+					    NULL, 0);
+			if (ret)
+				dev_err(ep->dcp->dev,
+					"AFK[ep:%02x]: failed to open AFKEPV2 service on channel %u: %d\n",
+					ep->endpoint, channel, ret);
+			else
+				dev_info(ep->dcp->dev,
+					 "AFK[ep:%02x]: opened AFKEPV2 service on channel %u\n",
+					 ep->endpoint, channel);
 			return;
 		}
 
@@ -1268,8 +1291,11 @@ int afk_send_epic(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 			v2_message->kind = AFK_V2_COMMAND;
 		else if (ecat == EPIC_CAT_REPLY)
 			v2_message->kind = AFK_V2_RESPONSE;
-		else
+		else {
 			v2_message->kind = AFK_V2_REPORT;
+			if (stype == AFK_V2_REPORT_OPEN)
+				v2_message->flags = 1;
+		}
 		wptr += sizeof(*v2_message);
 	} else {
 		ehdr = ep->txbfr.buf + wptr;
@@ -1278,21 +1304,6 @@ int afk_send_epic(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 		ehdr->seq = cpu_to_le16(ep->qe_seq++);
 		ehdr->timestamp = cpu_to_le64(0);
 		wptr += sizeof(*ehdr);
-
-		eshdr = ep->txbfr.buf + wptr;
-		memset(eshdr, 0, sizeof(*eshdr));
-		eshdr->length = cpu_to_le32(payload_len);
-		eshdr->version = 4;
-		eshdr->category = ecat;
-		eshdr->type = cpu_to_le16(stype);
-		eshdr->timestamp = cpu_to_le64(0);
-		eshdr->tag = cpu_to_le16(tag);
-		if (ecat == EPIC_CAT_REPLY)
-			eshdr->inline_len = cpu_to_le32(payload_len - 4);
-		else
-			eshdr->inline_len = cpu_to_le32(0);
-		wptr += sizeof(*eshdr);
-	}
 
 		eshdr = ep->txbfr.buf + wptr;
 		memset(eshdr, 0, sizeof(*eshdr));
