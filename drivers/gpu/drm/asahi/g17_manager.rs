@@ -438,10 +438,23 @@ impl G17PManagerConstruction {
         self.resources.control_counters()
     }
 
-    pub(crate) fn install_compute_control_checkpoint(
+    pub(crate) fn prepare_compute_runtime_class1(&mut self) -> Result {
+        self.resources.prepare_compute_runtime_class1()
+    }
+
+    pub(crate) fn publish_compute_runtime_control_record(
         &mut self,
-    ) -> Result<g17_resources::G17PControlCounters> {
-        self.resources.install_compute_control_checkpoint()
+        index: usize,
+    ) -> Result<u32> {
+        self.resources.publish_compute_runtime_control_record(index)
+    }
+
+    pub(crate) fn prepare_compute_runtime_class2(&mut self) -> Result {
+        self.resources.prepare_compute_runtime_class2()
+    }
+
+    pub(crate) fn rewrite_compute_dispatch_record(&mut self) -> Result {
+        self.resources.rewrite_compute_dispatch_record()
     }
 
     pub(crate) fn uat(&self) -> &mmu::Uat {

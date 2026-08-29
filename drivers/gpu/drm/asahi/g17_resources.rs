@@ -445,8 +445,8 @@ impl G17PControlCounters {
             && self.secondary == [g17_initdata::CONTROL_OPENING_SECONDARY_PRODUCER; 3]
     }
 
-    pub(crate) fn compute_checkpoint_installed(self) -> bool {
-        self.primary == [g17_initdata::COMPUTE_CONTROL_CHECKPOINT_COUNTER; 3]
+    pub(crate) fn compute_runtime_ready(self) -> bool {
+        self.primary == [g17_initdata::COMPUTE_RUNTIME_CONTROL_FINAL_COUNTER; 3]
             && self.secondary == [g17_initdata::CONTROL_OPENING_SECONDARY_PRODUCER; 3]
     }
 }
@@ -584,7 +584,7 @@ struct RenderBackingObject {
 #[cfg(not(test))]
 impl RenderBackingObject {
     fn new(dev: &AsahiDevice, size: usize) -> Result<Self> {
-        let mut object = gem::new_kernel_object(dev, size)?;
+        let mut object = gem::new_kernel_object_wc(dev, size)?;
         object.vmap()?.memset(0);
         Ok(Self {
             object,
@@ -627,6 +627,31 @@ fn map_fixed_object(
             dev_err!(
                 dev.as_ref(),
                 "G17P resources: {} map at {:#x} size {:#x} failed ({:?})\n",
+                name,
+                address,
+                size,
+                error
+            );
+            Err(error)
+        }
+    }
+}
+
+#[cfg(not(test))]
+fn map_fixed_wc_object(
+    dev: &AsahiDevice,
+    vm: &mmu::Vm,
+    name: &str,
+    address: u64,
+    size: usize,
+    prot: mmu::Prot,
+) -> Result<MappedObject> {
+    match MappedObject::new_wc_at(dev, vm, address, size, prot) {
+        Ok(mapping) => Ok(mapping),
+        Err(error) => {
+            dev_err!(
+                dev.as_ref(),
+                "G17P resources: {} WC map at {:#x} size {:#x} failed ({:?})\n",
                 name,
                 address,
                 size,
@@ -951,6 +976,25 @@ fn write_control_counters(object: &mut MappedObject, counters: [u32; 3]) -> Resu
                 .ok_or(EINVAL)?
                 .copy_from_slice(&counter.to_le_bytes());
         }
+        Ok(())
+    })
+}
+
+#[cfg(not(test))]
+fn write_control_counter(object: &mut MappedObject, index: usize, counter: u32) -> Result {
+    if index >= g17_initdata::CHANNEL_ENTRY_STATE_COUNT {
+        return Err(EINVAL);
+    }
+    object.with_bytes_mut(|bytes| {
+        let offset = g17_initdata::WORK_STATE_GRID_OFFSETS
+            [g17_initdata::CONTROL_CHANNEL_INDEX]
+            .checked_add(index * g17_initdata::CHANNEL_STATE_SPACING)
+            .ok_or(EINVAL)?;
+        let end = offset.checked_add(4).ok_or(EINVAL)?;
+        bytes
+            .get_mut(offset..end)
+            .ok_or(EINVAL)?
+            .copy_from_slice(&counter.to_le_bytes());
         Ok(())
     })
 }
@@ -2516,6 +2560,13 @@ struct G17MappedResources {
     control_shared_inner: MappedObject,
     control_operand_table: RenderBackingObject,
     control_operand_buffers: KVec<RenderBackingObject>,
+    compute_runtime_support: MappedObject,
+    compute_runtime_state: MappedObject,
+    compute_runtime_zero_buffer_0: MappedObject,
+    compute_runtime_zero_buffer_1: MappedObject,
+    compute_runtime_class1_table: MappedObject,
+    compute_runtime_table_alias: mmu::KernelMapping,
+    compute_runtime_buffer_aliases: KVec<mmu::KernelMapping>,
     register_windows: KVec<mmu::KernelMapping>,
 }
 
@@ -2595,19 +2646,10 @@ impl G17ResourceOwner {
             }
         };
         primary_b2_alias_1.with_bytes_mut(|bytes| {
-            for (index, value) in [
-                0xe000_0000u32,
-                0x0800_0000,
-                0x0000_0000,
-                0x0000_2a00,
-                0x0000_1500,
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                bytes[0x20 + index * 4..0x24 + index * 4].copy_from_slice(&value.to_le_bytes());
-            }
-            Ok(())
+            g17_initdata::encode_compute_dispatch_record(
+                &mut bytes[0x20..0x20 + g17_initdata::COMPUTE_DISPATCH_RECORD_SIZE],
+            )
+            .map_err(|_| EINVAL)
         })?;
         let primary_b2_alias_0_low = partial_scheduler.map_alias_at(
             address_space.uat.kernel_lower_vm(),
@@ -2731,6 +2773,96 @@ impl G17ResourceOwner {
             G17P_CONTROL_OPERAND_TABLE_VA,
             G17P_CONTROL_OPERAND_BUFFER_COUNT,
             G17P_CONTROL_OPERAND_BUFFER_BASE
+        );
+
+        let mut compute_runtime_support = map_fixed_wc_object(
+            dev,
+            address_space.uat.kernel_vm(),
+            "compute runtime support",
+            g17_initdata::COMPUTE_RUNTIME_SUPPORT_ADDRESS,
+            g17_initdata::COMPUTE_RUNTIME_SUPPORT_SIZE,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        let mut compute_runtime_state = map_fixed_wc_object(
+            dev,
+            address_space.uat.kernel_vm(),
+            "compute runtime state",
+            g17_initdata::COMPUTE_RUNTIME_STATE_ADDRESS,
+            mmu::UAT_PGSZ,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        let compute_runtime_zero_buffer_0 = map_fixed_wc_object(
+            dev,
+            address_space.uat.kernel_lower_vm(),
+            "compute runtime zero buffer 0",
+            g17_initdata::COMPUTE_RUNTIME_ZERO_BUFFER_0_ADDRESS,
+            G17P_CONTROL_OPERAND_BUFFER_SIZE,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        let compute_runtime_zero_buffer_1 = map_fixed_wc_object(
+            dev,
+            address_space.uat.kernel_lower_vm(),
+            "compute runtime zero buffer 1",
+            g17_initdata::COMPUTE_RUNTIME_ZERO_BUFFER_1_ADDRESS,
+            G17P_CONTROL_OPERAND_BUFFER_SIZE,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        let mut compute_runtime_class1_table = map_fixed_wc_object(
+            dev,
+            address_space.uat.kernel_lower_vm(),
+            "compute runtime class-1 table",
+            g17_initdata::COMPUTE_RUNTIME_CLASS1_TABLE_ADDRESS,
+            g17_initdata::COMPUTE_RUNTIME_CLASS1_TABLE_SIZE,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        let compute_runtime_table_alias = control_operand_table.map_at(
+            address_space.uat.kernel_lower_vm(),
+            g17_initdata::CONTROL_OPERAND_TABLE_ADDRESS,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        let mut compute_runtime_buffer_aliases = KVec::with_capacity(20, GFP_KERNEL)?;
+        for (index, buffer) in control_operand_buffers.iter_mut().enumerate() {
+            if index > 18 && index != 22 {
+                continue;
+            }
+            let address = g17p_control_operand_buffer_va(index).ok_or(EINVAL)?;
+            compute_runtime_buffer_aliases.push(
+                buffer.map_at(
+                    address_space.uat.kernel_lower_vm(),
+                    address,
+                    mmu::PROT_GPU_FW_SHARED_RW,
+                )?,
+                GFP_KERNEL,
+            )?;
+        }
+        compute_runtime_support.with_bytes_mut(|bytes| {
+            g17_initdata::encode_compute_runtime_class1_support(bytes).map_err(|_| EINVAL)
+        })?;
+        compute_runtime_state.with_bytes_mut(|bytes| {
+            bytes.fill(0);
+            bytes[..4].copy_from_slice(&1u32.to_le_bytes());
+            Ok(())
+        })?;
+        compute_runtime_class1_table.with_bytes_mut(|bytes| {
+            g17_initdata::encode_compute_runtime_class1_table(bytes).map_err(|_| EINVAL)
+        })?;
+        let page_list = control_operand_buffers
+            .iter_mut()
+            .enumerate()
+            .find(|(index, _)| *index == 22)
+            .map(|(_, buffer)| buffer)
+            .ok_or(EINVAL)?;
+        page_list.with_bytes_mut(|bytes| {
+            bytes.fill(0);
+            g17_initdata::encode_compute_runtime_page_inventory(
+                &mut bytes[..g17_initdata::COMPUTE_RUNTIME_PAGE_LIST_SIZE],
+            )
+            .map_err(|_| EINVAL)
+        })?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        dev_info!(
+            dev.as_ref(),
+            "G17P resources: live compute-control closure mapped in context 1\n"
         );
 
         let mut roots = match MappedObject::new(
@@ -2881,6 +3013,8 @@ impl G17ResourceOwner {
             ("fwctl", &fwctl),
             ("control shared", &control_shared),
             ("control shared inner", &control_shared_inner),
+            ("compute runtime support", &compute_runtime_support),
+            ("compute runtime state", &compute_runtime_state),
             ("roots", &roots),
             ("shared cluster", &shared_cluster),
             ("B2 sentinel", &primary_b2_sentinel),
@@ -2908,6 +3042,49 @@ impl G17ResourceOwner {
                 );
                 return Err(EIO);
             }
+        }
+        for (name, object) in [
+            ("compute runtime zero buffer 0", &compute_runtime_zero_buffer_0),
+            ("compute runtime zero buffer 1", &compute_runtime_zero_buffer_1),
+            ("compute runtime class-1 table", &compute_runtime_class1_table),
+        ] {
+            if !address_space.uat.kernel_lower_vm().covers_range(
+                object.iova(),
+                object.logical_size as u64,
+                false,
+                false,
+            ) {
+                dev_err!(
+                    dev.as_ref(),
+                    "G17P resources: {} context-1 mapping at {:#x} size {:#x} is incomplete\n",
+                    name,
+                    object.iova(),
+                    object.logical_size
+                );
+                return Err(EIO);
+            }
+        }
+        if !address_space.uat.kernel_lower_vm().covers_range(
+            g17_initdata::CONTROL_OPERAND_TABLE_ADDRESS,
+            g17_initdata::CONTROL_OPERAND_TABLE_SIZE as u64,
+            false,
+            false,
+        ) || !all_ranges_covered(
+            compute_runtime_buffer_aliases
+                .iter()
+                .map(|mapping| (mapping.iova(), mapping.size() as u64)),
+            |address, size| {
+                address_space
+                    .uat
+                    .kernel_lower_vm()
+                    .covers_range(address, size, false, false)
+            },
+        ) {
+            dev_err!(
+                dev.as_ref(),
+                "G17P resources: compute runtime context-1 aliases are incomplete\n"
+            );
+            return Err(EIO);
         }
         if !all_ranges_covered(
             register_windows
@@ -3010,6 +3187,13 @@ impl G17ResourceOwner {
                 control_shared_inner,
                 control_operand_table,
                 control_operand_buffers,
+                compute_runtime_support,
+                compute_runtime_state,
+                compute_runtime_zero_buffer_0,
+                compute_runtime_zero_buffer_1,
+                compute_runtime_class1_table,
+                compute_runtime_table_alias,
+                compute_runtime_buffer_aliases,
                 register_windows,
             },
             address_space,
@@ -3042,15 +3226,89 @@ impl G17ResourceOwner {
         Ok(G17PControlCounters { primary, secondary })
     }
 
-    /// Replace the idle primary control ring with the completed compute
-    /// history after the ordinary dual-processor opening has retired.
-    pub(crate) fn install_compute_control_checkpoint(
-        &mut self,
-    ) -> Result<G17PControlCounters> {
-        let before = self.control_counters()?;
-        if !before.opening_retired() {
+    /// Restore the source-built class-1 closure before publishing live
+    /// compute-control records.
+    pub(crate) fn prepare_compute_runtime_class1(&mut self) -> Result {
+        if !self.control_counters()?.opening_retired() {
             return Err(EINVAL);
         }
+        self.resources.compute_runtime_support.with_bytes_mut(|bytes| {
+            g17_initdata::encode_compute_runtime_class1_support(bytes).map_err(|_| EINVAL)
+        })?;
+        self.resources.compute_runtime_state.with_bytes_mut(|bytes| {
+            bytes.fill(0);
+            bytes[..4].copy_from_slice(&1u32.to_le_bytes());
+            Ok(())
+        })?;
+        self.resources
+            .compute_runtime_zero_buffer_0
+            .with_bytes_mut(|bytes| {
+                bytes.fill(0);
+                Ok(())
+            })?;
+        self.resources
+            .compute_runtime_zero_buffer_1
+            .with_bytes_mut(|bytes| {
+                bytes.fill(0);
+                Ok(())
+            })?;
+        self.resources
+            .compute_runtime_class1_table
+            .with_bytes_mut(|bytes| {
+                g17_initdata::encode_compute_runtime_class1_table(bytes).map_err(|_| EINVAL)
+            })?;
+        for (index, buffer) in self
+            .resources
+            .control_operand_buffers
+            .iter_mut()
+            .enumerate()
+        {
+            if index <= 18 {
+                buffer.with_bytes_mut(|bytes| {
+                    bytes.fill(0);
+                    Ok(())
+                })?;
+            }
+        }
+        let page_list = self
+            .resources
+            .control_operand_buffers
+            .iter_mut()
+            .enumerate()
+            .find(|(index, _)| *index == 22)
+            .map(|(_, buffer)| buffer)
+            .ok_or(EINVAL)?;
+        page_list.with_bytes_mut(|bytes| {
+            bytes.fill(0);
+            g17_initdata::encode_compute_runtime_page_inventory(
+                &mut bytes[..g17_initdata::COMPUTE_RUNTIME_PAGE_LIST_SIZE],
+            )
+            .map_err(|_| EINVAL)
+        })?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Store one live primary control record and publish only its producer.
+    /// Mailbox ownership stays with the live-boot layer.
+    pub(crate) fn publish_compute_runtime_control_record(
+        &mut self,
+        index: usize,
+    ) -> Result<u32> {
+        let before = self.control_counters()?;
+        let index_u32 = u32::try_from(index).map_err(|_| EINVAL)?;
+        let producer = g17_initdata::CONTROL_OPENING_PRIMARY_PRODUCER
+            .checked_add(index_u32)
+            .ok_or(EINVAL)?;
+        if before.primary != [producer; 3]
+            || before.secondary
+                != [g17_initdata::CONTROL_OPENING_SECONDARY_PRODUCER; 3]
+        {
+            return Err(EINVAL);
+        }
+        let mut record = [0u8; g17_initdata::CONTROL_RECORD_SIZE];
+        g17_initdata::encode_compute_runtime_control_record(index, &mut record)
+            .map_err(|_| EINVAL)?;
         let channels = g17_initdata::derive_channel_table(
             InstanceRole::Primary,
             self.handoff.primary.state_grid,
@@ -3059,28 +3317,67 @@ impl G17ResourceOwner {
             self.handoff.shared.hw_data_bundle,
         );
         let ring = channels[g17_initdata::CONTROL_CHANNEL_INDEX].ring;
-        let offset: usize = ring
+        let record_address = ring
+            .checked_add(producer as u64 * g17_initdata::CONTROL_RECORD_SIZE as u64)
+            .ok_or(EINVAL)?;
+        let offset: usize = record_address
             .checked_sub(self.resources.shared_cluster.iova())
             .ok_or(EINVAL)?
             .try_into()?;
-        let end = offset
-            .checked_add(g17_initdata::COMPUTE_CONTROL_CHECKPOINT_SIZE)
-            .ok_or(EINVAL)?;
+        let end = offset.checked_add(record.len()).ok_or(EINVAL)?;
         self.resources.shared_cluster.with_bytes_mut(|bytes| {
-            let checkpoint = bytes.get_mut(offset..end).ok_or(EINVAL)?;
-            g17_initdata::encode_compute_control_checkpoint(checkpoint).map_err(|_| EINVAL)
+            bytes
+                .get_mut(offset..end)
+                .ok_or(EINVAL)?
+                .copy_from_slice(&record);
+            Ok(())
         })?;
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        write_control_counters(
+        let target = producer.checked_add(1).ok_or(EINVAL)?;
+        write_control_counter(
             &mut self.resources.primary_state,
-            [g17_initdata::COMPUTE_CONTROL_CHECKPOINT_COUNTER; 3],
+            g17_initdata::CHANNEL_STATE_PRODUCER,
+            target,
         )?;
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        let after = self.control_counters()?;
-        if !after.compute_checkpoint_installed() {
-            return Err(EIO);
+        Ok(target)
+    }
+
+    /// Rewrite the shared support object for the measured sequence-56
+    /// class-2 registration.
+    pub(crate) fn prepare_compute_runtime_class2(&mut self) -> Result {
+        let expected = g17_initdata::CONTROL_OPENING_PRIMARY_PRODUCER
+            + g17_initdata::COMPUTE_RUNTIME_CLASS2_RECORD_INDEX as u32;
+        let counters = self.control_counters()?;
+        if counters.primary != [expected; 3]
+            || counters.secondary
+                != [g17_initdata::CONTROL_OPENING_SECONDARY_PRODUCER; 3]
+        {
+            return Err(EINVAL);
         }
-        Ok(after)
+        self.resources.control_operand_table.with_bytes_mut(|bytes| {
+            bytes.fill(0);
+            Ok(())
+        })?;
+        self.resources.compute_runtime_support.with_bytes_mut(|bytes| {
+            g17_initdata::encode_compute_runtime_class2_support(bytes).map_err(|_| EINVAL)
+        })?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    pub(crate) fn rewrite_compute_dispatch_record(&mut self) -> Result {
+        if !self.control_counters()?.compute_runtime_ready() {
+            return Err(EINVAL);
+        }
+        self.resources.primary_b2_alias_1.with_bytes_mut(|bytes| {
+            g17_initdata::encode_compute_dispatch_record(
+                &mut bytes[0x20..0x20 + g17_initdata::COMPUTE_DISPATCH_RECORD_SIZE],
+            )
+            .map_err(|_| EINVAL)
+        })?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        Ok(())
     }
 
     /// Rebuild firmware-owned session state after both processors stop.
@@ -3138,19 +3435,10 @@ impl G17ResourceOwner {
         })?;
         self.resources.primary_b2_alias_1.with_bytes_mut(|bytes| {
             bytes.fill(0);
-            for (index, value) in [
-                0xe000_0000u32,
-                0x0800_0000,
-                0x0000_0000,
-                0x0000_2a00,
-                0x0000_1500,
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                bytes[0x20 + index * 4..0x24 + index * 4].copy_from_slice(&value.to_le_bytes());
-            }
-            Ok(())
+            g17_initdata::encode_compute_dispatch_record(
+                &mut bytes[0x20..0x20 + g17_initdata::COMPUTE_DISPATCH_RECORD_SIZE],
+            )
+            .map_err(|_| EINVAL)
         })?;
         self.resources.hw_region_0.with_bytes_mut(|bytes| {
             bytes.fill(0);
@@ -3185,6 +3473,45 @@ impl G17ResourceOwner {
                 Ok(())
             })?;
         }
+        self.resources.compute_runtime_support.with_bytes_mut(|bytes| {
+            g17_initdata::encode_compute_runtime_class1_support(bytes).map_err(|_| EINVAL)
+        })?;
+        self.resources.compute_runtime_state.with_bytes_mut(|bytes| {
+            bytes.fill(0);
+            bytes[..4].copy_from_slice(&1u32.to_le_bytes());
+            Ok(())
+        })?;
+        self.resources
+            .compute_runtime_zero_buffer_0
+            .with_bytes_mut(|bytes| {
+                bytes.fill(0);
+                Ok(())
+            })?;
+        self.resources
+            .compute_runtime_zero_buffer_1
+            .with_bytes_mut(|bytes| {
+                bytes.fill(0);
+                Ok(())
+            })?;
+        self.resources
+            .compute_runtime_class1_table
+            .with_bytes_mut(|bytes| {
+                g17_initdata::encode_compute_runtime_class1_table(bytes).map_err(|_| EINVAL)
+            })?;
+        let page_list = self
+            .resources
+            .control_operand_buffers
+            .iter_mut()
+            .enumerate()
+            .find(|(index, _)| *index == 22)
+            .map(|(_, buffer)| buffer)
+            .ok_or(EINVAL)?;
+        page_list.with_bytes_mut(|bytes| {
+            g17_initdata::encode_compute_runtime_page_inventory(
+                &mut bytes[..g17_initdata::COMPUTE_RUNTIME_PAGE_LIST_SIZE],
+            )
+            .map_err(|_| EINVAL)
+        })?;
 
         let shared = self.handoff.shared;
         let primary = self.handoff.primary;
@@ -4216,6 +4543,39 @@ mod tests {
     }
 
     #[test]
+    fn compute_runtime_closure_uses_only_nonoverlapping_context1_ranges() {
+        for index in 0..18 {
+            assert_eq!(
+                g17_initdata::COMPUTE_RUNTIME_BUFFER_ADDRESSES[index],
+                g17p_control_operand_buffer_va(index).unwrap()
+            );
+        }
+        assert_eq!(
+            g17_initdata::COMPUTE_RUNTIME_BUFFER_ADDRESSES[18..],
+            [
+                g17_initdata::COMPUTE_RUNTIME_ZERO_BUFFER_0_ADDRESS,
+                g17_initdata::COMPUTE_RUNTIME_ZERO_BUFFER_1_ADDRESS,
+                g17p_control_operand_buffer_va(18).unwrap(),
+            ]
+        );
+        assert_eq!(
+            g17_initdata::COMPUTE_RUNTIME_PAGE_LIST_ADDRESS,
+            g17p_control_operand_buffer_va(22).unwrap()
+        );
+        let buffer_23_end = g17p_control_operand_buffer_va(23).unwrap()
+            + G17P_CONTROL_OPERAND_BUFFER_SIZE as u64;
+        assert_eq!(
+            g17_initdata::COMPUTE_RUNTIME_CLASS1_TABLE_ADDRESS,
+            buffer_23_end
+        );
+        assert!(
+            g17_initdata::COMPUTE_RUNTIME_CLASS1_TABLE_ADDRESS
+                + g17_initdata::COMPUTE_RUNTIME_CLASS1_TABLE_SIZE as u64
+                <= g17p_control_operand_buffer_va(24).unwrap()
+        );
+    }
+
+    #[test]
     fn add3_resource_table_occupies_the_hardware_proven_preempt_offset() {
         let buffers = [
             0x100_0003_0000,
@@ -4269,13 +4629,13 @@ mod tests {
             assert!(!current.opening_retired());
         }
 
-        let checkpoint = G17PControlCounters {
-            primary: [67, 67, 67],
+        let runtime = G17PControlCounters {
+            primary: [69, 69, 69],
             secondary: [16, 16, 16],
         };
-        assert!(checkpoint.compute_checkpoint_installed());
-        assert!(!checkpoint.opening_staged());
-        assert!(!checkpoint.opening_retired());
+        assert!(runtime.compute_runtime_ready());
+        assert!(!runtime.opening_staged());
+        assert!(!runtime.opening_retired());
     }
 
     fn valid_handoff() -> G17ResourceHandoff {

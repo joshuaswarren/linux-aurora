@@ -107,6 +107,14 @@ pub(crate) const IOVA_USER_BASE: u64 = UAT_PGSZ as u64;
 /// remains for the AGX2 initdata builder, which is 39-bit-only.
 pub(crate) const IOVA_USER_TOP: u64 = 1 << 39;
 
+fn lower_vm_start(cfg: UatConfig, t8140_internal: bool) -> u64 {
+    if cfg == UatConfig::T8140 && t8140_internal {
+        0
+    } else {
+        IOVA_USER_BASE
+    }
+}
+
 /// Whether the firmware-shared MMU state (Handoff/FlushInfo layout, TTBAT
 /// publication, kernel-half window placement) has been validated against an
 /// AGX3 (G15/G16/G17) firmware build.
@@ -1250,6 +1258,7 @@ impl Vm {
         cfg: UatConfig,
         ttb: Option<PhysicalAddr>,
         id: u64,
+        t8140_internal: bool,
     ) -> Result<Vm> {
         let dummy_obj = gem::new_kernel_object(dev, UAT_PGSZ)?;
         let is_kernel = ttb.is_some();
@@ -1261,6 +1270,7 @@ impl Vm {
             UatPageTable::new(cfg.ias, cfg.oas)?
         };
 
+        let lower_start = lower_vm_start(cfg, t8140_internal);
         let (va_range, gpuvm_range) = if is_kernel {
             (iova_kern_range, kernel_range.clone())
         } else {
@@ -1268,8 +1278,8 @@ impl Vm {
             // user/usable ranges byte-for-byte; 42-bit parts extend the
             // user half to the full per-root width.
             (
-                IOVA_USER_BASE..uat_geometry(cfg)?.user_va_top(),
-                IOVA_USER_BASE..(uat_geometry(cfg)?.user_va_top() - 2 * UAT_PGSZ as u64),
+                lower_start..uat_geometry(cfg)?.user_va_top(),
+                lower_start..(uat_geometry(cfg)?.user_va_top() - 2 * UAT_PGSZ as u64),
             )
         };
 
@@ -2239,6 +2249,7 @@ impl Uat {
             self.cfg,
             None,
             id,
+            false,
         )
     }
 
@@ -2388,12 +2399,13 @@ impl Uat {
         let kernel_lower_vm = Vm::new(
             dev,
             inner.clone(),
-            IOVA_USER_BASE..uat_geometry(cfg)?.user_va_top(),
+            lower_vm_start(cfg, true)..uat_geometry(cfg)?.user_va_top(),
             cfg,
             None,
             1,
+            true,
         )?;
-        let kernel_vm = Vm::new(dev, inner.clone(), kernel_range, cfg, Some(ttb1), 0)?;
+        let kernel_vm = Vm::new(dev, inner.clone(), kernel_range, cfg, Some(ttb1), 0, false)?;
 
         dev_info!(dev.as_ref(), "MMU: Kernel page tables created\n");
 
@@ -2407,6 +2419,7 @@ impl Uat {
                     cfg,
                     None,
                     0x8140_1000,
+                    false,
                 )?,
                 Vm::new(
                     dev,
@@ -2415,6 +2428,7 @@ impl Uat {
                     cfg,
                     None,
                     0x8140_1001,
+                    false,
                 )?,
             ])
         } else {
@@ -2527,5 +2541,17 @@ mod tests {
         let mut secondary = [0x111, 0x211, 0x999, 0, 0, 0x888, 0, 0];
         assert_eq!(mirror_host_root_entries(&primary, &mut secondary), 3);
         assert_eq!(secondary, [0x111, 0x211, 0x303, 0x433, 0, 0x533, 0, 0]);
+    }
+
+    #[test]
+    fn only_t8140_internal_lower_vm_contains_the_null_leaf() {
+        assert_eq!(lower_vm_start(UatConfig::T8140, true), 0);
+        assert_eq!(lower_vm_start(UatConfig::T8140, false), IOVA_USER_BASE);
+        let legacy = UatConfig {
+            chip_id: 0x8103,
+            ias: 39,
+            oas: 42,
+        };
+        assert_eq!(lower_vm_start(legacy, true), IOVA_USER_BASE);
     }
 }

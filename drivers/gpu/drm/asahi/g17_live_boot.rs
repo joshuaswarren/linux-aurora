@@ -41,8 +41,8 @@ use kernel::{devcoredump, time::msecs_to_jiffies};
 
 use crate::{
     driver::{AsahiDevice, T8140LiveTopologyAdmission},
-    g17_completion, g17_lifecycle, g17_manager, g17_rtkit, g17_submission, g17_uapi, gem, hw,
-    identity, mmu, module_parameters, regs,
+    g17_completion, g17_initdata, g17_lifecycle, g17_manager, g17_rtkit, g17_submission,
+    g17_uapi, gem, hw, identity, mmu, module_parameters, regs,
 };
 use kernel::sync::aref::ARef;
 
@@ -469,12 +469,75 @@ fn finish_boot_session(
         });
     }
 
-    let checkpoint = manager.install_compute_control_checkpoint()?;
+    manager.prepare_compute_runtime_class1()?;
     dev_info!(
         pdev.as_ref(),
-        "G17P compute control: post-boot checkpoint 67/secondary16 installed {:?}/{:?}\n",
-        checkpoint.primary,
-        checkpoint.secondary
+        "G17P compute control: class-1 closure ready; publishing live tail\n"
+    );
+    for index in 0..g17_initdata::COMPUTE_RUNTIME_CONTROL_RECORDS {
+        if index == g17_initdata::COMPUTE_RUNTIME_CLASS2_RECORD_INDEX {
+            manager.prepare_compute_runtime_class2()?;
+            dev_info!(
+                pdev.as_ref(),
+                "G17P compute control: class-2 closure ready at sequence 56\n"
+            );
+        }
+        let target = manager.publish_compute_runtime_control_record(index)?;
+        Pin::new(&mut gfx_rtkit)
+            .send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, control_done)?;
+
+        let mut counters = manager.control_counters()?;
+        for _ in 0..CONTROL_COUNTER_POLLS {
+            if counters.primary == [target; 3]
+                && counters.secondary
+                    == [g17_initdata::CONTROL_OPENING_SECONDARY_PRODUCER; 3]
+            {
+                break;
+            }
+            if gfx_state.crashed.load(Ordering::Acquire)
+                || gfx1_state.crashed.load(Ordering::Acquire)
+            {
+                return Err(EIO);
+            }
+            fsleep(Delta::from_millis(1));
+            counters = manager.control_counters()?;
+        }
+        if counters.primary != [target; 3]
+            || counters.secondary
+                != [g17_initdata::CONTROL_OPENING_SECONDARY_PRODUCER; 3]
+        {
+            dev_err!(
+                pdev.as_ref(),
+                "G17P compute control: record {} stopped at {:?}/{:?}, expected [{}, {}, {}]/[16, 16, 16]\n",
+                index,
+                counters.primary,
+                counters.secondary,
+                target,
+                target,
+                target
+            );
+            return Err(ETIMEDOUT);
+        }
+        if index == 53 {
+            dev_info!(
+                pdev.as_ref(),
+                "G17P compute control: ticks 0..53 retired at 58\n"
+            );
+        } else if index == 56 {
+            dev_info!(
+                pdev.as_ref(),
+                "G17P compute control: class-1 sequence 54 retired at 61\n"
+            );
+        }
+    }
+    let runtime_counters = manager.control_counters()?;
+    if !runtime_counters.compute_runtime_ready() {
+        return Err(EIO);
+    }
+    manager.rewrite_compute_dispatch_record()?;
+    dev_info!(
+        pdev.as_ref(),
+        "G17P compute control: live tail retired at [69, 69, 69]/[16, 16, 16]\n"
     );
 
     let queue = manager.configure_g17p_compute_queue(drm, registers)?;

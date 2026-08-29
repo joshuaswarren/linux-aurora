@@ -204,22 +204,20 @@ pub(crate) const CONTROL_OPENING_PRIMARY_PRODUCER: u32 = 4;
 pub(crate) const CONTROL_OPENING_SECONDARY_PRODUCER: u32 = 16;
 pub(crate) const CONTROL_OPENING_PRIMARY_REGISTER_OPCODE: u32 = 0x20;
 pub(crate) const CONTROL_OPENING_SECONDARY_CONTINUE_OPCODE: u32 = 0x22;
-pub(crate) const COMPUTE_CONTROL_CHECKPOINT_RECORDS: usize = 67;
-pub(crate) const COMPUTE_CONTROL_CHECKPOINT_COUNTER: u32 = 67;
-pub(crate) const COMPUTE_CONTROL_CHECKPOINT_SIZE: usize =
-    COMPUTE_CONTROL_CHECKPOINT_RECORDS * CONTROL_RECORD_SIZE;
-
-// These are historical pointers in the completed 67-record checkpoint. The
-// checkpoint is installed only after the ordinary opening retires, with all
-// three primary cursors moved together to 67, so no live control record can
-// dereference them. Runtime submissions retain their own validated BOs and
-// mappings instead of borrowing bootstrap state.
-const CONTROL_COMPUTE_SEQUENCE_0_OBJECT: u64 = 0xffff_fc20_c082_8000;
-const CONTROL_COMPUTE_SEQUENCE_0_OPERAND: u64 = 0x70_0020_8000;
-const CONTROL_COMPUTE_SEQUENCE_22_OBJECT: u64 = 0xffff_fc20_c086_8000;
-const CONTROL_COMPUTE_SEQUENCE_22_OPERAND: u64 = 0x70_013a_0000;
-const CONTROL_COMPUTE_SEQUENCE_23_OBJECT: u64 = 0xffff_fc20_c082_8000;
-const CONTROL_COMPUTE_SEQUENCE_23_OPERAND: u64 = 0x70_019e_0000;
+pub(crate) const COMPUTE_RUNTIME_CONTROL_RECORDS: usize = 65;
+pub(crate) const COMPUTE_RUNTIME_CONTROL_FINAL_COUNTER: u32 = 69;
+pub(crate) const COMPUTE_RUNTIME_CLASS1_RECORD_INDEX: usize = 54;
+pub(crate) const COMPUTE_RUNTIME_CLASS2_RECORD_INDEX: usize = 57;
+pub(crate) const COMPUTE_RUNTIME_SUPPORT_ADDRESS: u64 = 0xffff_fc20_c086_8000;
+pub(crate) const COMPUTE_RUNTIME_STATE_ADDRESS: u64 = 0xffff_fc20_0163_0000;
+pub(crate) const COMPUTE_RUNTIME_CLASS1_TABLE_ADDRESS: u64 = 0x70_01ad_8000;
+pub(crate) const COMPUTE_RUNTIME_PAGE_LIST_ADDRESS: u64 = 0x70_018d_0000;
+pub(crate) const COMPUTE_RUNTIME_ZERO_BUFFER_0_ADDRESS: u64 = 0x70_0000_0000;
+pub(crate) const COMPUTE_RUNTIME_ZERO_BUFFER_1_ADDRESS: u64 = 0x70_0010_8000;
+pub(crate) const COMPUTE_RUNTIME_SUPPORT_SIZE: usize = 0x4000;
+pub(crate) const COMPUTE_RUNTIME_CLASS1_TABLE_SIZE: usize = 0x4000;
+pub(crate) const COMPUTE_RUNTIME_PAGE_LIST_SIZE: usize = 0xa800;
+pub(crate) const COMPUTE_DISPATCH_RECORD_SIZE: usize = 0x20;
 
 pub(crate) const CONTROL_SHARED_ADDRESS: u64 = 0xffff_fc20_c083_0000;
 pub(crate) const CONTROL_SHARED_INNER_ADDRESS: u64 = 0xffff_fc20_0160_8000;
@@ -235,6 +233,29 @@ pub(crate) const CONTROL_OPERAND_BUFFER_SIZE: u64 = 0x10_0000;
 pub(crate) const CONTROL_OPERAND_ENTRY_COUNT: usize = 22;
 pub(crate) const CONTROL_OPERAND_ENTRY_STRIDE: usize = 0x40;
 pub(crate) const CONTROL_OPERAND_ENTRY_FLAG: u64 = 1 << 60;
+pub(crate) const COMPUTE_RUNTIME_BUFFER_ADDRESSES: [u64; 21] = [
+    0x70_0022_0000,
+    0x70_0032_8000,
+    0x70_0043_0000,
+    0x70_0053_8000,
+    0x70_0064_0000,
+    0x70_0074_8000,
+    0x70_0085_0000,
+    0x70_0095_8000,
+    0x70_00a6_0000,
+    0x70_00b6_8000,
+    0x70_00c7_0000,
+    0x70_00d7_8000,
+    0x70_00e8_0000,
+    0x70_00f8_8000,
+    0x70_0109_0000,
+    0x70_0119_8000,
+    0x70_012a_0000,
+    0x70_013a_8000,
+    COMPUTE_RUNTIME_ZERO_BUFFER_0_ADDRESS,
+    COMPUTE_RUNTIME_ZERO_BUFFER_1_ADDRESS,
+    0x70_014b_0000,
+];
 
 pub(crate) const fn control_opening_producer(role: InstanceRole) -> u32 {
     match role {
@@ -253,21 +274,31 @@ pub(crate) const fn control_opening_size(role: InstanceRole) -> usize {
 fn encode_control_registration(
     out: &mut [u8],
     slot: usize,
+    control_class: u32,
     sequence: u32,
     object: u64,
     operand: u64,
+    slot_offset: u64,
     count: u32,
+    context_word: u32,
 ) {
     let base = slot * CONTROL_RECORD_SIZE;
     put_u32(out, base, CONTROL_OPENING_PRIMARY_REGISTER_OPCODE);
-    put_u32(out, base + 0x04, 1);
+    put_u32(out, base + 0x04, control_class);
     put_u32(out, base + 0x08, 0x3f);
     put_u32(out, base + 0x0c, sequence);
     put_u64(out, base + 0x14, object);
     put_u64(out, base + 0x1c, operand);
-    put_u64(out, base + 0x24, operand + CONTROL_OPERAND_SLOT_OFFSET);
+    put_u64(out, base + 0x24, operand + slot_offset);
     put_u32(out, base + 0x2c, count);
+    put_u32(out, base + 0x30, context_word);
     put_u32(out, base + 0x34, 1);
+}
+
+fn encode_control_tick(out: &mut [u8], slot: usize, sequence: u32) {
+    let base = slot * CONTROL_RECORD_SIZE;
+    put_u32(out, base, 0x2e);
+    put_u32(out, base + 0x04, sequence);
 }
 
 /// Encode the complete control ring prefix consumed during the 25G83 opening.
@@ -292,10 +323,13 @@ pub(crate) fn encode_control_opening(
             encode_control_registration(
                 out,
                 3,
+                1,
                 0,
                 CONTROL_SHARED_ADDRESS,
                 CONTROL_OPERAND_TABLE_ADDRESS,
+                CONTROL_OPERAND_SLOT_OFFSET,
                 0x28,
+                0,
             );
         }
         InstanceRole::Secondary => {
@@ -318,65 +352,151 @@ pub(crate) fn encode_control_opening(
     Ok(())
 }
 
-/// Encode the complete primary compute-control history observed before the
-/// output-positive add3. The caller may install this only after the ordinary
-/// 4/16 opening has retired, with all three primary cursors advanced to 67.
-pub(crate) fn encode_compute_control_checkpoint(
+/// Encode one record in the output-positive 65-record runtime control tail.
+/// Record zero is published at primary slot four after the ordinary opening.
+pub(crate) fn encode_compute_runtime_control_record(
+    index: usize,
     out: &mut [u8],
 ) -> Result<(), InitdataError> {
-    if out.len() != COMPUTE_CONTROL_CHECKPOINT_SIZE {
+    if out.len() != CONTROL_RECORD_SIZE || index >= COMPUTE_RUNTIME_CONTROL_RECORDS {
         return Err(InitdataError::BufferSize);
     }
     out.fill(0);
 
-    let mut slot = 0usize;
-    put_u32(out, slot * CONTROL_RECORD_SIZE, CONTROL_OPENING_OPCODE_PRIMARY);
-    slot += 1;
-    encode_control_registration(
-        out,
-        slot,
-        0,
-        CONTROL_COMPUTE_SEQUENCE_0_OBJECT,
-        CONTROL_COMPUTE_SEQUENCE_0_OPERAND,
-        0x28,
-    );
-    slot += 1;
-    for sequence in 0..22 {
-        let base = slot * CONTROL_RECORD_SIZE;
-        put_u32(out, base, 0x2e);
-        put_u32(out, base + 0x04, sequence);
-        slot += 1;
+    match index {
+        0..=53 => encode_control_tick(out, 0, index as u32),
+        COMPUTE_RUNTIME_CLASS1_RECORD_INDEX => encode_control_registration(
+            out,
+            0,
+            1,
+            54,
+            COMPUTE_RUNTIME_SUPPORT_ADDRESS,
+            COMPUTE_RUNTIME_CLASS1_TABLE_ADDRESS,
+            0x480,
+            0x18,
+            0,
+        ),
+        55..=56 => encode_control_tick(out, 0, index as u32 - 1),
+        COMPUTE_RUNTIME_CLASS2_RECORD_INDEX => encode_control_registration(
+            out,
+            0,
+            2,
+            56,
+            COMPUTE_RUNTIME_SUPPORT_ADDRESS,
+            CONTROL_OPERAND_TABLE_ADDRESS,
+            0x5c0,
+            0x28,
+            0,
+        ),
+        58..=64 => encode_control_tick(out, 0, index as u32 - 2),
+        _ => return Err(InitdataError::BufferSize),
     }
-    encode_control_registration(
-        out,
-        slot,
-        22,
-        CONTROL_COMPUTE_SEQUENCE_22_OBJECT,
-        CONTROL_COMPUTE_SEQUENCE_22_OPERAND,
-        0x20,
-    );
-    slot += 1;
-    let base = slot * CONTROL_RECORD_SIZE;
-    put_u32(out, base, 0x2e);
-    put_u32(out, base + 0x04, 22);
-    slot += 1;
-    encode_control_registration(
-        out,
-        slot,
-        23,
-        CONTROL_COMPUTE_SEQUENCE_23_OBJECT,
-        CONTROL_COMPUTE_SEQUENCE_23_OPERAND,
-        0x20,
-    );
-    slot += 1;
-    for sequence in 23..63 {
-        let base = slot * CONTROL_RECORD_SIZE;
-        put_u32(out, base, 0x2e);
-        put_u32(out, base + 0x04, sequence);
-        slot += 1;
-    }
-    if slot != COMPUTE_CONTROL_CHECKPOINT_RECORDS {
+    Ok(())
+}
+
+fn encode_compute_runtime_support(
+    out: &mut [u8],
+    control_class: u32,
+    low_buffer: u64,
+    operand_table: u64,
+    resource_class: u64,
+    cursor: u32,
+    final_kind: u32,
+) -> Result<(), InitdataError> {
+    if out.len() != COMPUTE_RUNTIME_SUPPORT_SIZE {
         return Err(InitdataError::BufferSize);
+    }
+    out.fill(0);
+    put_u32(out, 0x00, control_class);
+    put_u32(out, 0x10, control_class);
+    put_u32(out, 0x14, low_buffer as u32);
+    put_u64(out, 0x18, 0x0004_0000_0000_0070);
+    let resource = resource_class << 40;
+    put_u64(out, 0x20, resource);
+    put_u64(out, 0x28, resource);
+    put_u64(out, 0x30, operand_table);
+    put_u32(out, 0x40, 4);
+    put_u32(out, 0x48, cursor);
+    put_u64(out, 0x4c, COMPUTE_RUNTIME_STATE_ADDRESS);
+    put_u32(out, 0x60, final_kind);
+    Ok(())
+}
+
+pub(crate) fn encode_compute_runtime_class1_support(
+    out: &mut [u8],
+) -> Result<(), InitdataError> {
+    encode_compute_runtime_support(
+        out,
+        1,
+        COMPUTE_RUNTIME_PAGE_LIST_ADDRESS,
+        COMPUTE_RUNTIME_CLASS1_TABLE_ADDRESS,
+        0x12,
+        0x90,
+        2,
+    )
+}
+
+pub(crate) fn encode_compute_runtime_class2_support(
+    out: &mut [u8],
+) -> Result<(), InitdataError> {
+    encode_compute_runtime_support(out, 2, 0, CONTROL_OPERAND_TABLE_ADDRESS, 0x17, 0xb8, 3)
+}
+
+pub(crate) fn encode_compute_runtime_class1_table(
+    out: &mut [u8],
+) -> Result<(), InitdataError> {
+    if out.len() != COMPUTE_RUNTIME_CLASS1_TABLE_SIZE {
+        return Err(InitdataError::BufferSize);
+    }
+    out.fill(0);
+    for (index, address) in COMPUTE_RUNTIME_BUFFER_ADDRESSES.into_iter().enumerate() {
+        put_u64(
+            out,
+            index * CONTROL_OPERAND_ENTRY_STRIDE,
+            address | CONTROL_OPERAND_ENTRY_FLAG,
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn encode_compute_runtime_page_inventory(
+    out: &mut [u8],
+) -> Result<(), InitdataError> {
+    if out.len() != COMPUTE_RUNTIME_PAGE_LIST_SIZE {
+        return Err(InitdataError::BufferSize);
+    }
+    out.fill(0);
+    let mut index = 0usize;
+    for base in COMPUTE_RUNTIME_BUFFER_ADDRESSES {
+        for offset in (0..CONTROL_OPERAND_BUFFER_SIZE).step_by(0x1000) {
+            put_u64(out, index * 8, base + offset);
+            index += 1;
+        }
+    }
+    if index * 8 != COMPUTE_RUNTIME_PAGE_LIST_SIZE {
+        return Err(InitdataError::BufferSize);
+    }
+    Ok(())
+}
+
+pub(crate) fn encode_compute_dispatch_record(
+    out: &mut [u8],
+) -> Result<(), InitdataError> {
+    if out.len() != COMPUTE_DISPATCH_RECORD_SIZE {
+        return Err(InitdataError::BufferSize);
+    }
+    out.fill(0);
+    for (index, value) in [
+        0xe000_0000u32,
+        0x0800_0000,
+        0x0000_0000,
+        0x0000_2a00,
+        0x0000_1500,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        put_u32(out, index * 4, value);
     }
     Ok(())
 }
@@ -2265,71 +2385,105 @@ mod tests {
     }
 
     #[test]
-    fn post_boot_compute_checkpoint_matches_output_positive_history() {
-        let mut checkpoint = vec![0; COMPUTE_CONTROL_CHECKPOINT_SIZE];
-        encode_compute_control_checkpoint(&mut checkpoint).unwrap();
-
+    fn live_compute_control_tail_matches_the_output_positive_sequence() {
         fn fnv1a64(bytes: &[u8]) -> u64 {
             bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
                 (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
             })
         }
 
-        assert_eq!(checkpoint.len(), 0x10c0);
-        assert_eq!(fnv1a64(&checkpoint), 0x2d21_5073_9c86_2bc8);
+        let mut tail = vec![0u8; COMPUTE_RUNTIME_CONTROL_RECORDS * CONTROL_RECORD_SIZE];
+        for index in 0..COMPUTE_RUNTIME_CONTROL_RECORDS {
+            let start = index * CONTROL_RECORD_SIZE;
+            encode_compute_runtime_control_record(
+                index,
+                &mut tail[start..start + CONTROL_RECORD_SIZE],
+            )
+            .unwrap();
+        }
+        assert_eq!(tail.len(), 65 * 0x40);
+        assert_eq!(fnv1a64(&tail), 0x544f_a4b7_bc23_e65a);
+        assert_eq!(COMPUTE_RUNTIME_CONTROL_FINAL_COUNTER, 69);
 
-        let opening_record = 0;
-        assert_eq!(
-            get_u32(&checkpoint, opening_record),
-            CONTROL_OPENING_OPCODE_PRIMARY
-        );
-        assert!(checkpoint[4..CONTROL_RECORD_SIZE]
-            .iter()
-            .all(|byte| *byte == 0));
-
-        for (slot, sequence, object, operand, count) in [
+        for (index, sequence) in [(0, 0), (53, 53), (55, 54), (56, 55), (58, 56), (64, 62)] {
+            let base = index * CONTROL_RECORD_SIZE;
+            assert_eq!(get_u32(&tail, base), 0x2e);
+            assert_eq!(get_u32(&tail, base + 0x04), sequence);
+            assert_eq!(get_u32(&tail, base + 0x0c), 0);
+        }
+        for (index, class, sequence, operand, slot_offset, count) in [
             (
+                COMPUTE_RUNTIME_CLASS1_RECORD_INDEX,
                 1,
-                0,
-                CONTROL_COMPUTE_SEQUENCE_0_OBJECT,
-                CONTROL_COMPUTE_SEQUENCE_0_OPERAND,
+                54,
+                COMPUTE_RUNTIME_CLASS1_TABLE_ADDRESS,
+                0x480,
+                0x18,
+            ),
+            (
+                COMPUTE_RUNTIME_CLASS2_RECORD_INDEX,
+                2,
+                56,
+                CONTROL_OPERAND_TABLE_ADDRESS,
+                0x5c0,
                 0x28,
             ),
-            (
-                24,
-                22,
-                CONTROL_COMPUTE_SEQUENCE_22_OBJECT,
-                CONTROL_COMPUTE_SEQUENCE_22_OPERAND,
-                0x20,
-            ),
-            (
-                26,
-                23,
-                CONTROL_COMPUTE_SEQUENCE_23_OBJECT,
-                CONTROL_COMPUTE_SEQUENCE_23_OPERAND,
-                0x20,
-            ),
         ] {
-            let base = slot * CONTROL_RECORD_SIZE;
-            assert_eq!(
-                get_u32(&checkpoint, base),
-                CONTROL_OPENING_PRIMARY_REGISTER_OPCODE
-            );
-            assert_eq!(get_u32(&checkpoint, base + 0x04), 1);
-            assert_eq!(get_u32(&checkpoint, base + 0x08), 0x3f);
-            assert_eq!(get_u32(&checkpoint, base + 0x0c), sequence);
-            assert_eq!(get_u64(&checkpoint, base + 0x14), object);
-            assert_eq!(get_u64(&checkpoint, base + 0x1c), operand);
-            assert_eq!(get_u64(&checkpoint, base + 0x24), operand + 0x440);
-            assert_eq!(get_u32(&checkpoint, base + 0x2c), count);
-            assert_eq!(get_u32(&checkpoint, base + 0x30), 0);
-            assert_eq!(get_u32(&checkpoint, base + 0x34), 1);
+            let base = index * CONTROL_RECORD_SIZE;
+            assert_eq!(get_u32(&tail, base), 0x20);
+            assert_eq!(get_u32(&tail, base + 0x04), class);
+            assert_eq!(get_u32(&tail, base + 0x08), 0x3f);
+            assert_eq!(get_u32(&tail, base + 0x0c), sequence);
+            assert_eq!(get_u64(&tail, base + 0x14), COMPUTE_RUNTIME_SUPPORT_ADDRESS);
+            assert_eq!(get_u64(&tail, base + 0x1c), operand);
+            assert_eq!(get_u64(&tail, base + 0x24), operand + slot_offset);
+            assert_eq!(get_u32(&tail, base + 0x2c), count);
+            assert_eq!(get_u32(&tail, base + 0x30), 0);
+            assert_eq!(get_u32(&tail, base + 0x34), 1);
+        }
+    }
+
+    #[test]
+    fn live_compute_control_closure_matches_source_builders() {
+        fn fnv1a64(bytes: &[u8]) -> u64 {
+            bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+            })
         }
 
-        let last = 66 * CONTROL_RECORD_SIZE;
-        assert_eq!(get_u32(&checkpoint, last), 0x2e);
-        assert_eq!(get_u32(&checkpoint, last + 0x04), 62);
-        assert_eq!(get_u32(&checkpoint, last + 0x0c), 0);
+        let mut class1 = vec![0; COMPUTE_RUNTIME_SUPPORT_SIZE];
+        encode_compute_runtime_class1_support(&mut class1).unwrap();
+        assert_eq!(fnv1a64(&class1), 0xb40b_a63a_16c1_937d);
+        assert_eq!(get_u32(&class1, 0x00), 1);
+        assert_eq!(get_u32(&class1, 0x14), 0x018d_0000);
+        assert_eq!(get_u64(&class1, 0x30), COMPUTE_RUNTIME_CLASS1_TABLE_ADDRESS);
+        assert_eq!(get_u64(&class1, 0x4c), COMPUTE_RUNTIME_STATE_ADDRESS);
+
+        let mut class2 = vec![0; COMPUTE_RUNTIME_SUPPORT_SIZE];
+        encode_compute_runtime_class2_support(&mut class2).unwrap();
+        assert_eq!(fnv1a64(&class2), 0xdd12_cbe2_2d7c_3d50);
+        assert_eq!(get_u32(&class2, 0x00), 2);
+        assert_eq!(get_u64(&class2, 0x30), CONTROL_OPERAND_TABLE_ADDRESS);
+
+        let mut table = vec![0; COMPUTE_RUNTIME_CLASS1_TABLE_SIZE];
+        encode_compute_runtime_class1_table(&mut table).unwrap();
+        assert_eq!(fnv1a64(&table), 0xc820_66ed_9e50_6c41);
+        for (index, address) in COMPUTE_RUNTIME_BUFFER_ADDRESSES.into_iter().enumerate() {
+            assert_eq!(get_u64(&table, index * 0x40), address | (1 << 60));
+        }
+
+        let mut inventory = vec![0; COMPUTE_RUNTIME_PAGE_LIST_SIZE];
+        encode_compute_runtime_page_inventory(&mut inventory).unwrap();
+        assert_eq!(fnv1a64(&inventory), 0x9f78_e915_163a_cea5);
+        assert_eq!(get_u64(&inventory, 0), COMPUTE_RUNTIME_BUFFER_ADDRESSES[0]);
+        assert_eq!(
+            get_u64(&inventory, inventory.len() - 8),
+            COMPUTE_RUNTIME_BUFFER_ADDRESSES[20] + 0xff000
+        );
+
+        let mut dispatch = [0u8; COMPUTE_DISPATCH_RECORD_SIZE];
+        encode_compute_dispatch_record(&mut dispatch).unwrap();
+        assert_eq!(fnv1a64(&dispatch), 0x12a0_cf17_a88d_a788);
     }
 
     #[test]
@@ -2706,7 +2860,8 @@ mod tests {
         // Device-control record framing and both complete opening prefixes.
         assert_eq!(CONTROL_RECORD_SIZE, 0x40);
         assert_eq!(CONTROL_OPENING_PRIMARY_PRODUCER, 4);
-        assert_eq!(COMPUTE_CONTROL_CHECKPOINT_COUNTER, 67);
+        assert_eq!(COMPUTE_RUNTIME_CONTROL_RECORDS, 65);
+        assert_eq!(COMPUTE_RUNTIME_CONTROL_FINAL_COUNTER, 69);
         assert_eq!(CONTROL_OPENING_SECONDARY_PRODUCER, 16);
         // Channel state-block stride within the compact grid.
         assert_eq!(CHANNEL_STATE_STRIDE, 0x40);
