@@ -442,12 +442,12 @@ enum dcp_link_service_match_bit {
 
 static const struct dcp_method_entry dcp_link_pmu_service_matched = {
 	.name = "pmu_service_matched",
-	.tag = { 'A', '1', '3', '6' },
+	.tag = { 'A', '1', '3', '1' },
 };
 
 static const struct dcp_method_entry dcp_link_backlight_service_matched = {
 	.name = "backlight_service_matched",
-	.tag = { 'A', '1', '3', '7' },
+	.tag = { 'A', '1', '3', '2' },
 };
 
 static void dcp_link_service_match_complete(struct apple_dcp *dcp, void *out,
