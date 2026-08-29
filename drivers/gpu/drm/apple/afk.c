@@ -84,7 +84,6 @@ enum afk_v2_message_kind {
 
 enum afk_v2_report_opcode {
 	AFK_V2_REPORT_PUBLISH = 0x11,
-	AFK_V2_REPORT_OPEN = 0x12,
 	AFK_V2_REPORT_CLOSE = 0x13,
 	AFK_V2_REPORT_TERMINATE = 0x14,
 };
@@ -840,6 +839,90 @@ static void afk_recv_handle_v2(struct apple_dcp_afkep *ep, u8 *data,
 	}
 }
 
+static void afk_recv_handle_v2(struct apple_dcp_afkep *ep, u8 *data,
+			       size_t data_size)
+{
+	struct afk_v2_packet_hdr *packet = (void *)data;
+	struct afk_v2_message_hdr *message;
+	struct apple_epic_service *service;
+	size_t message_size, payload_size;
+	u16 channel;
+	u8 *payload;
+
+	if (data_size < sizeof(*packet) + sizeof(*message)) {
+		dev_err(ep->dcp->dev,
+			"AFK[ep:%02x]: AFKEPV2 packet too small: %#zx\n",
+			ep->endpoint, data_size);
+		return;
+	}
+
+	message_size = le32_to_cpu(packet->message_size);
+	if (message_size != data_size - sizeof(*packet)) {
+		dev_err(ep->dcp->dev,
+			"AFK[ep:%02x]: AFKEPV2 split packet unsupported: %#zx/%#zx\n",
+			ep->endpoint, data_size - sizeof(*packet), message_size);
+		return;
+	}
+
+	channel = le16_to_cpu(packet->interface_id);
+	message = (void *)(data + sizeof(*packet));
+	payload = (u8 *)(message + 1);
+	payload_size = message_size - sizeof(*message);
+	service = afk_epic_find_service(ep, channel);
+
+	switch (message->kind) {
+	case AFK_V2_REPORT:
+		if (message->opcode == AFK_V2_REPORT_PUBLISH) {
+			if (service) {
+				dev_warn(ep->dcp->dev,
+					 "AFK[ep:%02x]: duplicate AFKEPV2 publish on channel %u\n",
+					 ep->endpoint, channel);
+				return;
+			}
+
+			afk_recv_handle_init(ep, channel, payload, payload_size);
+			return;
+		}
+
+		if (!service) {
+			dev_warn(ep->dcp->dev,
+				 "AFK[ep:%02x]: AFKEPV2 report %#x on disabled channel %u\n",
+				 ep->endpoint, message->opcode, channel);
+			return;
+		}
+
+		if (message->opcode == AFK_V2_REPORT_CLOSE ||
+		    message->opcode == AFK_V2_REPORT_TERMINATE) {
+			afk_recv_handle_teardown(ep, channel);
+			return;
+		}
+
+		if (!service->torndown && service->ops->report)
+			service->ops->report(service, message->opcode, payload,
+					     payload_size);
+		return;
+
+	case AFK_V2_COMMAND:
+		dev_dbg(ep->dcp->dev,
+			"AFK[ep:%02x]: AFKEPV2 command %#x id %#llx on channel %u\n",
+			ep->endpoint, message->opcode,
+			le64_to_cpu(message->id), channel);
+		return;
+
+	case AFK_V2_RESPONSE:
+		dev_dbg(ep->dcp->dev,
+			"AFK[ep:%02x]: AFKEPV2 response %#x id %#llx on channel %u\n",
+			ep->endpoint, message->opcode,
+			le64_to_cpu(message->id), channel);
+		return;
+
+	default:
+		dev_warn(ep->dcp->dev,
+			 "AFK[ep:%02x]: unknown AFKEPV2 message kind %#x on channel %u\n",
+			 ep->endpoint, message->kind, channel);
+	}
+}
+
 static bool afk_recv(struct apple_dcp_afkep *ep)
 {
 	struct afk_qe *hdr;
@@ -1185,11 +1268,8 @@ int afk_send_epic(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 			v2_message->kind = AFK_V2_COMMAND;
 		else if (ecat == EPIC_CAT_REPLY)
 			v2_message->kind = AFK_V2_RESPONSE;
-		else {
+		else
 			v2_message->kind = AFK_V2_REPORT;
-			if (stype == AFK_V2_REPORT_OPEN)
-				v2_message->flags = 1;
-		}
 		wptr += sizeof(*v2_message);
 	} else {
 		ehdr = ep->txbfr.buf + wptr;
@@ -1198,6 +1278,21 @@ int afk_send_epic(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 		ehdr->seq = cpu_to_le16(ep->qe_seq++);
 		ehdr->timestamp = cpu_to_le64(0);
 		wptr += sizeof(*ehdr);
+
+		eshdr = ep->txbfr.buf + wptr;
+		memset(eshdr, 0, sizeof(*eshdr));
+		eshdr->length = cpu_to_le32(payload_len);
+		eshdr->version = 4;
+		eshdr->category = ecat;
+		eshdr->type = cpu_to_le16(stype);
+		eshdr->timestamp = cpu_to_le64(0);
+		eshdr->tag = cpu_to_le16(tag);
+		if (ecat == EPIC_CAT_REPLY)
+			eshdr->inline_len = cpu_to_le32(payload_len - 4);
+		else
+			eshdr->inline_len = cpu_to_le32(0);
+		wptr += sizeof(*eshdr);
+	}
 
 		eshdr = ep->txbfr.buf + wptr;
 		memset(eshdr, 0, sizeof(*eshdr));
