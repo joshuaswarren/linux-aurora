@@ -1650,38 +1650,53 @@ impl G17PLiveRuntime {
         Ok(completion)
     }
 
-    /// Apply one selector-2 completion report to the retained compute queue.
+    /// Apply one fully routed normal-CL completion to the retained queue.
     ///
-    /// The IRQ/ring reader supplies the current cumulative queue counters and
-    /// the prefix published to firmware. This boundary decodes the exact
-    /// compute completion shape, rejects another QID, and subtracts only the
-    /// newly completed count from the retained producer state.
+    /// The physical IRQ, ordinal-0 descriptor, MMIO acknowledgement, and
+    /// EP0x20 stamp-event route remain closed. This legacy boundary therefore
+    /// rejects the incomplete selector-2-only input before queue mutation.
     pub(crate) fn observe_compute_completion(
         &mut self,
         raw: &[u8],
         current: g17_completion::QueueIndices,
         published_prefix: u32,
     ) -> Result<g17_completion::QueuePrefixState> {
+        let _ = (raw, current, published_prefix);
+        if g17_completion::require_g17p_normal_cl_completion_route(
+            g17_completion::G17P_NORMAL_CL_COMPLETION_ROUTE,
+        )
+        .is_err()
+        {
+            dev_err!(
+                self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                "G17P completion: live ordinal0 IRQ/EP0x20 route unavailable; outstanding unchanged\n"
+            );
+            return Err(ENOTSUPP);
+        }
+        dev_err!(
+            self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+            "G17P completion: legacy selector2 input lacks ordinal0 stamp correlation; outstanding unchanged\n"
+        );
+        Err(ENOTSUPP)
+    }
+
+    /// Commit only a transaction which already passed ordinal-0 entry and
+    /// EP0x20 stamp correlation. The route gate remains closed until Linux
+    /// owns the physical IRQ, firmware-event ring, and completion ACK writer.
+    pub(crate) fn apply_prepared_normal_cl_completion(
+        &mut self,
+        prepared: g17_completion::PreparedG17PNormalClCompletion,
+    ) -> Result {
+        g17_completion::require_g17p_normal_cl_completion_route(
+            g17_completion::G17P_NORMAL_CL_COMPLETION_ROUTE,
+        )
+        .map_err(|_| ENOTSUPP)?;
         let manager = self.manager.as_ref().ok_or(ENODEV)?;
         let queue = self.queue.as_mut().ok_or(ENODEV)?;
-        let report = g17_completion::observe_compute_completion_report(
-            raw,
-            self.completion_indices,
-            current,
-            published_prefix,
-        )
-        .map_err(|_| EINVAL)?;
-        if report.entry.queue_id != manager.compute_queue_id(queue)? {
+        if prepared.entry.queue_id != manager.compute_queue_id(queue)? {
             return Err(EINVAL);
         }
-
-        let completed = current
-            .done
-            .checked_sub(self.completion_indices.done)
-            .ok_or(EINVAL)?;
-        manager.complete_compute_entries(queue, completed)?;
-        self.completion_indices = current;
-        Ok(report.queue)
+        manager.complete_compute_entries(queue, prepared.completed_generation)
     }
 }
 
