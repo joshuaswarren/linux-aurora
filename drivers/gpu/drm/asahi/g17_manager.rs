@@ -40,6 +40,11 @@ use identity::{FirmwareRoleTopology, GpuGen, GpuHalGeneration, GpuVariant, Submi
 // Its __DATA vmaddr/size are 0xfffffc000004c000/0x134000, exactly matching
 // the J700 gfx-data carveout size. These addresses are diagnostic only.
 const G17P_GFX_LINK_DATA_BASE: u64 = 0xffff_fc00_0004_c000;
+const G17P_GFX_LINK_DATA_END: u64 = 0xffff_fc00_0018_0000;
+const G17P_GFX_PHYSICAL_DATA_BASE: u64 = 0x0000_0100_01d7_c000;
+const G17P_GFX1_LINK_DATA_BASE: u64 = 0xffff_fc00_0004_c000;
+const G17P_GFX1_LINK_DATA_END: u64 = 0xffff_fc00_0017_8000;
+const G17P_GFX1_PHYSICAL_DATA_BASE: u64 = 0x0000_0100_01eb_0000;
 const G17P_SCHEDULER_ROOT_LINK_ADDRESS: u64 = 0xffff_fc00_0017_7190;
 const G17P_SCHEDULER_ROOT_PHYSICAL_ADDRESS: u64 = 0x0000_0100_01ea_7190;
 const G17P_SCHEDULER_ROOT_SNAPSHOT_SIZE: usize = 0x80;
@@ -54,6 +59,21 @@ const G17P_TYPE4_DRAIN_LINK_ADDRESS: u64 = 0xffff_fc00_0000_3a74;
 const G17P_TYPE4_PENDING_MASK: u64 = 0x0002_0000;
 const G17P_SCHEDULER_DEFERRED_REQUEUE_LINK_ADDRESS: u64 = 0xffff_fc00_0002_5ea4;
 const G17P_TYPE4_MAIN_CONTROL_POINTER_OFFSETS: [usize; 3] = [0x1a0, 0x1a8, 0x1b0];
+const G17P_MBI_GLOBAL_LINK_ADDRESS: u64 = 0xffff_fc00_0006_e840;
+const G17P_MBI_STATIC_ARRAY_LINK_ADDRESS: u64 = 0xffff_fc00_0006_e800;
+const G17P_MBI_GROUP_COUNT: u32 = 8;
+const G17P_MBI_TRACE_CAPACITY: u32 = 128;
+const G17P_MBI_TRACE_RECORD_SIZE: usize = 0x18;
+// Primary A000 0x19184..0x191a0 initializes the adjacent endpoint handles;
+// EP21 type 9 increments the lease at 0x22de4..0x22df8.
+const G17P_PRIMARY_PEER_LEASE_LINK_ADDRESS: u64 = 0xffff_fc00_0017_7798;
+const G17P_PRIMARY_PEER_LEASE_PHYSICAL_ADDRESS: u64 = 0x0000_0100_01ea_7798;
+// Exact J700 GFX1 A000 (SHA-256 0caf8165...17fd63) initializes handles at
+// 0x1bde0..0x1bdfc, increments this lease at 0x26738..0x26748, and decrements
+// it only on ACTIVE->SLEEP at 0x25e70..0x25e7c. ACTIVE->NAP bypasses the write.
+const G17P_GFX1_PEER_LEASE_LINK_ADDRESS: u64 = 0xffff_fc00_0016_d1c8;
+const G17P_GFX1_PEER_LEASE_PHYSICAL_ADDRESS: u64 = 0x0000_0100_01fd_11c8;
+const G17P_RTKIT_PRIVATE_ADDRESS_MASK: u64 = (1u64 << 42) - 1;
 
 #[cfg(not(test))]
 const _: () = {
@@ -69,6 +89,10 @@ const _: () = {
     assert!(G17P_SCHEDULER_ROOT_PHYSICAL_ADDRESS & 7 == 0);
     assert!(G17P_SCHEDULER_ROOT_SNAPSHOT_SIZE & 7 == 0);
     assert!(G17P_SCHEDULER_ROOT_STATE_OFFSET + 1 <= G17P_SCHEDULER_ROOT_SNAPSHOT_SIZE);
+    assert!(G17P_GFX_LINK_DATA_END - G17P_GFX_LINK_DATA_BASE == 0x13_4000);
+    assert!(G17P_GFX1_LINK_DATA_END - G17P_GFX1_LINK_DATA_BASE == 0x12_c000);
+    assert!(G17P_GFX_PHYSICAL_DATA_BASE == g17_adt_j700::J700_GFX_DATA.base);
+    assert!(G17P_GFX1_PHYSICAL_DATA_BASE == g17_adt_j700::J700_GFX1_DATA.base);
     assert!(
         G17P_RUNTIME_MAIN_GLOBAL_PHYSICAL_ADDRESS
             == g17_adt_j700::J700_GFX_DATA.base
@@ -77,6 +101,16 @@ const _: () = {
     assert!(
         G17P_RUNTIME_MAIN_GLOBAL_PHYSICAL_ADDRESS + core::mem::size_of::<u64>() as u64
             <= g17_adt_j700::J700_GFX_DATA.base + g17_adt_j700::J700_GFX_DATA.size
+    );
+    assert!(
+        G17P_PRIMARY_PEER_LEASE_PHYSICAL_ADDRESS
+            == G17P_GFX_PHYSICAL_DATA_BASE
+                + (G17P_PRIMARY_PEER_LEASE_LINK_ADDRESS - G17P_GFX_LINK_DATA_BASE)
+    );
+    assert!(
+        G17P_GFX1_PEER_LEASE_PHYSICAL_ADDRESS
+            == G17P_GFX1_PHYSICAL_DATA_BASE
+                + (G17P_GFX1_PEER_LEASE_LINK_ADDRESS - G17P_GFX1_LINK_DATA_BASE)
     );
 };
 
@@ -823,6 +857,204 @@ impl G17PManagerConstruction {
         dev_err!(
             self.resources.dev().as_ref(),
             "G17P scheduler-root checkpoint={} unavailable without CONFIG_DEV_COREDUMP\n",
+            checkpoint,
+        );
+
+        self.log_mbi_trace_lease_checkpoint(checkpoint);
+    }
+
+    /// Log the persistent MBI receive trace plus both firmware-peer send
+    /// leases. The exact J700 primary firmware appends the trace record before
+    /// endpoint lookup/callback, making its monotonic producer a durable
+    /// discriminator when the endpoint pending bit is too short-lived to
+    /// sample. Every pointer is validated before this read-only walk.
+    pub(crate) fn log_mbi_trace_lease_checkpoint(&self, checkpoint: &'static str) {
+        #[cfg(CONFIG_DEV_COREDUMP)]
+        {
+            let context0 = self
+                .resources
+                .uat()
+                .firmware_context_table_reader()
+                .context0_root();
+            let read_primary_link = |address: u64, size: usize| {
+                if size == 0 || (address | size as u64) & 7 != 0 {
+                    return Err(EINVAL);
+                }
+                let end = address.checked_add(size as u64).ok_or(EOVERFLOW)?;
+                if address >= G17P_GFX_LINK_DATA_BASE && end <= G17P_GFX_LINK_DATA_END {
+                    let physical = G17P_GFX_PHYSICAL_DATA_BASE
+                        .checked_add(address - G17P_GFX_LINK_DATA_BASE)
+                        .ok_or(EOVERFLOW)?;
+                    return pgtable::UatPageTable::copy_live_firmware_physical_range(
+                        physical, size,
+                    );
+                }
+                if address & !G17P_RTKIT_PRIVATE_ADDRESS_MASK
+                    != !G17P_RTKIT_PRIVATE_ADDRESS_MASK
+                {
+                    return Err(EFAULT);
+                }
+                context0
+                    .ok_or(EIO)?
+                    .copy_live_firmware_range(address & G17P_RTKIT_PRIVATE_ADDRESS_MASK, size)
+            };
+            let read_u32 = |bytes: &[u8], offset: usize| {
+                bytes
+                    .get(offset..offset + core::mem::size_of::<u32>())
+                    .and_then(|value| value.try_into().ok())
+                    .map(u32::from_le_bytes)
+                    .ok_or(EIO)
+            };
+            let read_u64 = |bytes: &[u8], offset: usize| {
+                bytes
+                    .get(offset..offset + core::mem::size_of::<u64>())
+                    .and_then(|value| value.try_into().ok())
+                    .map(u64::from_le_bytes)
+                    .ok_or(EIO)
+            };
+
+            let trace = (|| {
+                let global = read_primary_link(
+                    G17P_MBI_GLOBAL_LINK_ADDRESS,
+                    2 * core::mem::size_of::<u64>(),
+                )?;
+                let group_count = read_u32(&global, 0)?;
+                let array = read_u64(&global, 8)?;
+                if group_count != G17P_MBI_GROUP_COUNT
+                    || array != G17P_MBI_STATIC_ARRAY_LINK_ADDRESS
+                {
+                    return Err(EIO);
+                }
+                let groups = read_primary_link(array, core::mem::size_of::<u64>())?;
+                let group0 = read_u64(&groups, 0)?;
+                let trace_pointer_address = group0.checked_add(0x20).ok_or(EOVERFLOW)?;
+                let trace_pointer = read_primary_link(
+                    trace_pointer_address,
+                    core::mem::size_of::<u64>(),
+                )?;
+                let descriptor = read_u64(&trace_pointer, 0)?;
+                let descriptor_bytes = read_primary_link(descriptor, 0x10)?;
+                let capacity = read_u32(&descriptor_bytes, 0)?;
+                let producer = read_u32(&descriptor_bytes, 4)?;
+                let records = read_u64(&descriptor_bytes, 8)?;
+                if capacity != G17P_MBI_TRACE_CAPACITY || records == 0 {
+                    return Err(EIO);
+                }
+                if producer == 0 {
+                    return Ok((
+                        group0, descriptor, records, capacity, producer, None, None, None,
+                    ));
+                }
+                let index = (producer - 1) % capacity;
+                let record = records
+                    .checked_add(index as u64 * G17P_MBI_TRACE_RECORD_SIZE as u64)
+                    .ok_or(EOVERFLOW)?;
+                let record_bytes = read_primary_link(record, G17P_MBI_TRACE_RECORD_SIZE)?;
+                Ok((
+                    group0,
+                    descriptor,
+                    records,
+                    capacity,
+                    producer,
+                    Some(read_u64(&record_bytes, 0)?),
+                    Some(read_u64(&record_bytes, 8)?),
+                    Some(read_u64(&record_bytes, 0x10)?),
+                ))
+            })();
+            match trace {
+                Ok((group0, descriptor, records, capacity, producer, endpoint, raw, stamp)) => {
+                    let message_type = raw.map(|value| (value >> 48) & 0x3f);
+                    let direction = stamp.map(|value| value & 0x3);
+                    dev_info!(
+                        self.resources.dev().as_ref(),
+                        "G17P mbi-rx-trace-j700-a000 checkpoint={} cap={} producer={} group0={:#x} descriptor={:#x} records={:#x} last-endpoint={:#x?} last-type={:#x?} last-raw={:#x?} last-direction={:?} last-stamp={:#x?}\n",
+                        checkpoint,
+                        capacity,
+                        producer,
+                        group0,
+                        descriptor,
+                        records,
+                        endpoint,
+                        message_type,
+                        raw,
+                        direction,
+                        stamp,
+                    )
+                }
+                Err(error) => dev_err!(
+                    self.resources.dev().as_ref(),
+                    "G17P mbi-rx-trace-j700-a000 checkpoint={} sample failed ({:?})\n",
+                    checkpoint,
+                    error,
+                ),
+            }
+
+            match (
+                pgtable::UatPageTable::copy_live_firmware_physical_range(
+                    G17P_PRIMARY_PEER_LEASE_PHYSICAL_ADDRESS,
+                    0x10,
+                ),
+                pgtable::UatPageTable::copy_live_firmware_physical_range(
+                    G17P_GFX1_PEER_LEASE_PHYSICAL_ADDRESS,
+                    0x10,
+                ),
+            ) {
+                (Ok(primary), Ok(gfx1)) => match (
+                    read_u32(&primary, 0),
+                    read_u32(&primary, 4),
+                    read_u32(&primary, 8),
+                    read_u32(&gfx1, 0),
+                    read_u32(&gfx1, 4),
+                    read_u32(&gfx1, 8),
+                ) {
+                    (
+                        Ok(primary_lease),
+                        Ok(primary_ep22),
+                        Ok(primary_ep23),
+                        Ok(gfx1_lease),
+                        Ok(gfx1_ep22),
+                        Ok(gfx1_ep23),
+                    ) => dev_info!(
+                        self.resources.dev().as_ref(),
+                        "G17P peer-leases-j700-a000 checkpoint={} primary-pa={:#x} lease={} ep22={:#x} ep23={:#x} send-ready={} gfx1-pa={:#x} lease={} ep22={:#x} ep23={:#x} send-ready={}\n",
+                        checkpoint,
+                        G17P_PRIMARY_PEER_LEASE_PHYSICAL_ADDRESS,
+                        primary_lease,
+                        primary_ep22,
+                        primary_ep23,
+                        (primary_lease != 0) && (primary_ep23 & 0xffff == 0x23),
+                        G17P_GFX1_PEER_LEASE_PHYSICAL_ADDRESS,
+                        gfx1_lease,
+                        gfx1_ep22,
+                        gfx1_ep23,
+                        (gfx1_lease != 0)
+                            && (gfx1_ep22 & 0xffff == 0x22)
+                            && (gfx1_ep23 & 0xffff == 0x23),
+                    ),
+                    _ => dev_err!(
+                        self.resources.dev().as_ref(),
+                        "G17P peer-leases-j700-a000 checkpoint={} decode failed\n",
+                        checkpoint,
+                    ),
+                },
+                (Err(error), _) => dev_err!(
+                    self.resources.dev().as_ref(),
+                    "G17P peer-leases-j700-a000 checkpoint={} primary sample failed ({:?})\n",
+                    checkpoint,
+                    error,
+                ),
+                (_, Err(error)) => dev_err!(
+                    self.resources.dev().as_ref(),
+                    "G17P peer-leases-j700-a000 checkpoint={} GFX1 sample failed ({:?})\n",
+                    checkpoint,
+                    error,
+                ),
+            }
+        }
+        #[cfg(not(CONFIG_DEV_COREDUMP))]
+        dev_err!(
+            self.resources.dev().as_ref(),
+            "G17P MBI trace/lease checkpoint={} unavailable without CONFIG_DEV_COREDUMP\n",
             checkpoint,
         );
     }
@@ -2059,6 +2291,26 @@ mod tests {
             G17P_RUNTIME_MAIN_GLOBAL_PHYSICAL_ADDRESS,
         );
         assert_eq!(G17P_RUNTIME_MAIN_GLOBAL_PHYSICAL_ADDRESS, 0x0000_0100_01ea_7030);
+        assert_eq!(
+            GFX_DATA_BASE + (G17P_MBI_GLOBAL_LINK_ADDRESS - G17P_GFX_LINK_DATA_BASE),
+            0x0000_0100_01d9_e840,
+        );
+        assert_eq!(G17P_MBI_STATIC_ARRAY_LINK_ADDRESS, 0xffff_fc00_0006_e800);
+        assert_eq!(G17P_MBI_GROUP_COUNT, 8);
+        assert_eq!(G17P_MBI_TRACE_CAPACITY, 128);
+        assert_eq!(G17P_MBI_TRACE_RECORD_SIZE, 0x18);
+        assert_eq!(
+            GFX_DATA_BASE
+                + (G17P_PRIMARY_PEER_LEASE_LINK_ADDRESS - G17P_GFX_LINK_DATA_BASE),
+            G17P_PRIMARY_PEER_LEASE_PHYSICAL_ADDRESS,
+        );
+        assert_eq!(G17P_PRIMARY_PEER_LEASE_PHYSICAL_ADDRESS, 0x0000_0100_01ea_7798);
+        assert_eq!(
+            G17P_GFX1_PHYSICAL_DATA_BASE
+                + (G17P_GFX1_PEER_LEASE_LINK_ADDRESS - G17P_GFX1_LINK_DATA_BASE),
+            G17P_GFX1_PEER_LEASE_PHYSICAL_ADDRESS,
+        );
+        assert_eq!(G17P_GFX1_PEER_LEASE_PHYSICAL_ADDRESS, 0x0000_0100_01fd_11c8);
         assert!(
             G17P_SCHEDULER_ROOT_PHYSICAL_ADDRESS + G17P_SCHEDULER_ROOT_SNAPSHOT_SIZE as u64
                 <= GFX_DATA_BASE + GFX_DATA_SIZE

@@ -28,6 +28,11 @@ used by the read-only sampler. Link `0xfffffc000004c000` maps to physical
 | `type4-thunk.hex` | `0xfffffc000002635c` | `0x28` | `490a1f925ffe302d5bb7c9a0e8fee16900e0829b47b666a6cafa67d8a2f5e3c0` | Read root state `+0x68`, then runtime-main global `0xfffffc0000177030`, `main+0x1b0`, and producer before tail-calling `0xfffffc0000003a74` |
 | `type4-dispatch-record.hex` | `0xfffffc0000073800` | `0x18` | `c50c0e14575038471fddecacf4c6827070936eec6a27fc5cc851e677c986fb23` | Bind pending mask `0x20000` to authenticated target `0xfffffc000002635c` |
 | `control-drain-cursors.hex` | `0xfffffc0000003bac` | `0x18` | `fe1021a570e99d6bcda976626c90b111f4de040a2b79f6ffb7fb03d227056e0a` | Publish mirror through `main+0x1a8`, then compare actual through `main+0x1a0` |
+| `peer-handles-init.hex` | `0xfffffc0000019184` | `0x20` | `2e3042700bc241bf5ca80601f4f30ab2738c88553876d07c6d5832d0c81c974d` | Store endpoint handles 0x22/0x23 beside the primary firmware-peer lease |
+| `mbi-trace-init.hex` | `0xfffffc00000221ac` | `0xc` | `e24ea9af597a04a4a933e1569d0ebb1870bf474b1bb57c01f714b02480bda3f9` | Create group 0's 128-entry MBI trace before scheduler startup |
+| `type9-peer-lease.hex` | `0xfffffc0000022de4` | `0x14` | `06b1f93500479874c313189cf3a0f1563149b5b51c122ea9dd0e1181e2808e5b` | Atomically increment the primary peer-send lease on EP21 type 9 |
+| `mbi-rx-route.hex` | `0xfffffc000003237c` | `0x64` | `b8b80e44f235ebc946b7d00031bc6d9b1ef3ca1c7ded824521e97d65cfd12ad2` | Append the RX trace before endpoint lookup and callback dispatch |
+| `mbi-trace-write.hex` | `0xfffffc00000324f8` | `0x78` | `ff45c6531dac3b7c52080f2046960bc460c4a2307e6dbf3553163b5646c82afe` | Increment the monotonic producer and write the 0x18-byte endpoint/raw/stamp record |
 
 Extraction command:
 

@@ -28,6 +28,11 @@ WINDOWS = {
     "type4-thunk.hex": (0x2635C, 0x28),
     "type4-dispatch-record.hex": (0x73800, 0x18),
     "control-drain-cursors.hex": (0x3BAC, 0x18),
+    "peer-handles-init.hex": (0x19184, 0x20),
+    "mbi-trace-init.hex": (0x221AC, 0x0C),
+    "type9-peer-lease.hex": (0x22DE4, 0x14),
+    "mbi-rx-route.hex": (0x3237C, 0x64),
+    "mbi-trace-write.hex": (0x324F8, 0x78),
 }
 
 
