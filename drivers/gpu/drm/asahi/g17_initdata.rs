@@ -222,6 +222,36 @@ pub(crate) const COMPUTE_RUNTIME_CLASS1_TABLE_SIZE: usize = 0x4000;
 pub(crate) const COMPUTE_RUNTIME_PAGE_LIST_SIZE: usize = 0xa800;
 pub(crate) const COMPUTE_DISPATCH_RECORD_SIZE: usize = 0x20;
 
+/// Output-positive first-CL readiness suffix. These six records are staged at
+/// primary slots 4..9 and become visible through one final producer store.
+pub(crate) const COMPUTE_READINESS_RECORDS: usize = 6;
+pub(crate) const COMPUTE_READINESS_FINAL_COUNTER: u32 =
+    CONTROL_OPENING_PRIMARY_PRODUCER + COMPUTE_READINESS_RECORDS as u32;
+pub(crate) const COMPUTE_READINESS_CLASS1_SUPPORT_ADDRESS: u64 = 0xffff_fc20_c087_8000;
+pub(crate) const COMPUTE_READINESS_CLASS1_STATE_ADDRESS: u64 = 0xffff_fc20_0164_8000;
+pub(crate) const COMPUTE_READINESS_CLASS3_SUPPORT_ADDRESS: u64 = 0xffff_fc20_c085_0000;
+pub(crate) const COMPUTE_READINESS_CLASS3_STATE_ADDRESS: u64 = 0xffff_fc20_0165_0000;
+pub(crate) const COMPUTE_READINESS_PAGE_SIZE: usize = 0x4000;
+pub(crate) const COMPUTE_READINESS_ACTIVATION_RECORD_INDEX: usize = 2;
+pub(crate) const COMPUTE_READINESS_ACTIVATION_RECORD_OFFSET: usize =
+    COMPUTE_READINESS_ACTIVATION_RECORD_INDEX * CONTROL_RECORD_SIZE;
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum ComputeReadinessPublicationStep {
+    ControlRecord(u8),
+    InitializeContext2Activation,
+}
+
+pub(crate) const COMPUTE_READINESS_PUBLICATION_ORDER: [ComputeReadinessPublicationStep; 7] = [
+    ComputeReadinessPublicationStep::ControlRecord(0),
+    ComputeReadinessPublicationStep::ControlRecord(1),
+    ComputeReadinessPublicationStep::ControlRecord(2),
+    ComputeReadinessPublicationStep::InitializeContext2Activation,
+    ComputeReadinessPublicationStep::ControlRecord(3),
+    ComputeReadinessPublicationStep::ControlRecord(4),
+    ComputeReadinessPublicationStep::ControlRecord(5),
+];
+
 pub(crate) const CONTROL_SHARED_ADDRESS: u64 = 0xffff_fc20_c083_0000;
 pub(crate) const CONTROL_SHARED_INNER_ADDRESS: u64 = 0xffff_fc20_0160_8000;
 pub(crate) const CONTROL_SHARED_OBJECT_SIZE: usize = 0x4000;
@@ -314,6 +344,140 @@ fn encode_control_tick(out: &mut [u8], slot: usize, sequence: u32) {
     let base = slot * CONTROL_RECORD_SIZE;
     put_u32(out, base, 0x2e);
     put_u32(out, base + 0x04, sequence);
+}
+
+fn encode_control_tick_with_context(
+    out: &mut [u8],
+    slot: usize,
+    sequence: u32,
+    context_word: u32,
+) {
+    encode_control_tick(out, slot, sequence);
+    let base = slot * CONTROL_RECORD_SIZE;
+    put_u32(out, base + 0x0c, context_word);
+}
+
+/// Encode one of the six exact records immediately preceding the first CL.
+pub(crate) fn encode_compute_readiness_record(
+    index: usize,
+    out: &mut [u8],
+) -> Result<(), InitdataError> {
+    if out.len() != CONTROL_RECORD_SIZE || index >= COMPUTE_READINESS_RECORDS {
+        return Err(InitdataError::BufferSize);
+    }
+    out.fill(0);
+    match index {
+        0 => encode_control_registration(
+            out,
+            0,
+            1,
+            35,
+            COMPUTE_READINESS_CLASS1_SUPPORT_ADDRESS,
+            CONTROL_OPERAND_TABLE_ADDRESS,
+            0x440,
+            0x20,
+            1,
+        ),
+        1 => encode_control_tick_with_context(out, 0, 35, 1),
+        2 => encode_control_tick_with_context(out, 0, 36, 1),
+        3 => encode_control_registration(
+            out,
+            0,
+            3,
+            37,
+            COMPUTE_READINESS_CLASS3_SUPPORT_ADDRESS,
+            CONTROL_OPERAND_TABLE_ADDRESS,
+            0x5c0,
+            0x28,
+            2,
+        ),
+        4 => encode_control_tick_with_context(out, 0, 37, 2),
+        5 => encode_control_tick_with_context(out, 0, 38, 2),
+        _ => return Err(InitdataError::BufferSize),
+    }
+    Ok(())
+}
+
+fn encode_compute_readiness_support(
+    out: &mut [u8],
+    class: u32,
+    active: u32,
+    resource_class: u64,
+    cursor: u32,
+    state: u64,
+    final_kind: u32,
+) -> Result<(), InitdataError> {
+    if out.len() != COMPUTE_READINESS_PAGE_SIZE {
+        return Err(InitdataError::BufferSize);
+    }
+    out.fill(0);
+    put_u32(out, 0x00, class);
+    put_u32(out, 0x08, active);
+    put_u32(out, 0x10, class);
+    put_u32(out, 0x14, 0);
+    put_u64(out, 0x18, 0x0004_0000_0000_0070);
+    put_u64(out, 0x20, resource_class << 40);
+    put_u64(out, 0x28, resource_class << 40);
+    put_u64(out, 0x30, CONTROL_OPERAND_TABLE_ADDRESS);
+    put_u32(out, 0x40, 4);
+    put_u32(out, 0x48, cursor);
+    put_u64(out, 0x4c, state);
+    put_u32(out, 0x54, 0);
+    put_u32(out, 0x5c, 0);
+    put_u32(out, 0x60, final_kind);
+    Ok(())
+}
+
+pub(crate) fn encode_compute_readiness_class1_support(
+    out: &mut [u8],
+) -> Result<(), InitdataError> {
+    encode_compute_readiness_support(
+        out,
+        1,
+        1,
+        0x11,
+        0x88,
+        COMPUTE_READINESS_CLASS1_STATE_ADDRESS,
+        2,
+    )
+}
+
+pub(crate) fn encode_compute_readiness_class3_support(
+    out: &mut [u8],
+) -> Result<(), InitdataError> {
+    encode_compute_readiness_support(
+        out,
+        3,
+        2,
+        0x17,
+        0xb8,
+        COMPUTE_READINESS_CLASS3_STATE_ADDRESS,
+        3,
+    )
+}
+
+pub(crate) fn encode_compute_readiness_state(
+    out: &mut [u8],
+) -> Result<(), InitdataError> {
+    if out.len() != COMPUTE_READINESS_PAGE_SIZE {
+        return Err(InitdataError::BufferSize);
+    }
+    out.fill(0);
+    put_u32(out, 0, 1);
+    Ok(())
+}
+
+pub(crate) fn encode_compute_readiness_activation_record(
+    out: &mut [u8],
+) -> Result<(), InitdataError> {
+    if out.len() != CONTROL_RECORD_SIZE {
+        return Err(InitdataError::BufferSize);
+    }
+    out.fill(0);
+    put_u64(out, 0x00, 0x0000_0100_0000_ffff);
+    put_u64(out, 0x20, 0x0002_0000_0000_0000);
+    put_u64(out, 0x30, 0x0000_0000_ff00_0000);
+    Ok(())
 }
 
 /// Encode the complete control ring prefix consumed during the compute opening.
@@ -2526,6 +2690,136 @@ mod tests {
             assert_eq!(get_u32(&tail, base + 0x30), 0);
             assert_eq!(get_u32(&tail, base + 0x34), 1);
         }
+    }
+
+    #[test]
+    fn first_cl_readiness_suffix_has_exact_sequences_contexts_and_bytes() {
+        assert_eq!(
+            COMPUTE_READINESS_PUBLICATION_ORDER,
+            [
+                ComputeReadinessPublicationStep::ControlRecord(0),
+                ComputeReadinessPublicationStep::ControlRecord(1),
+                ComputeReadinessPublicationStep::ControlRecord(2),
+                ComputeReadinessPublicationStep::InitializeContext2Activation,
+                ComputeReadinessPublicationStep::ControlRecord(3),
+                ComputeReadinessPublicationStep::ControlRecord(4),
+                ComputeReadinessPublicationStep::ControlRecord(5),
+            ]
+        );
+        let mut records = [[0u8; CONTROL_RECORD_SIZE]; COMPUTE_READINESS_RECORDS];
+        for (index, record) in records.iter_mut().enumerate() {
+            encode_compute_readiness_record(index, record).unwrap();
+        }
+
+        for (index, class, sequence, support, slot, count, context) in [
+            (
+                0,
+                1,
+                35,
+                COMPUTE_READINESS_CLASS1_SUPPORT_ADDRESS,
+                0x440,
+                0x20,
+                1,
+            ),
+            (
+                3,
+                3,
+                37,
+                COMPUTE_READINESS_CLASS3_SUPPORT_ADDRESS,
+                0x5c0,
+                0x28,
+                2,
+            ),
+        ] {
+            let record = &records[index];
+            assert_eq!(get_u32(record, 0x00), 0x20);
+            assert_eq!(get_u32(record, 0x04), class);
+            assert_eq!(get_u32(record, 0x08), 0x3f);
+            assert_eq!(get_u32(record, 0x0c), sequence);
+            assert_eq!(get_u64(record, 0x14), support);
+            assert_eq!(get_u64(record, 0x1c), CONTROL_OPERAND_TABLE_ADDRESS);
+            assert_eq!(get_u64(record, 0x24), CONTROL_OPERAND_TABLE_ADDRESS + slot);
+            assert_eq!(get_u32(record, 0x2c), count);
+            assert_eq!(get_u32(record, 0x30), context);
+            assert_eq!(get_u32(record, 0x34), 1);
+        }
+
+        for (index, sequence, context) in [(1, 35, 1), (2, 36, 1), (4, 37, 2), (5, 38, 2)] {
+            let record = &records[index];
+            assert_eq!(get_u32(record, 0x00), 0x2e);
+            assert_eq!(get_u32(record, 0x04), sequence);
+            assert_eq!(get_u32(record, 0x0c), context);
+            assert!(record[0x10..].iter().all(|byte| *byte == 0));
+        }
+        assert_eq!(COMPUTE_READINESS_FINAL_COUNTER, 10);
+        assert!(encode_compute_readiness_record(COMPUTE_READINESS_RECORDS, &mut records[0])
+            .is_err());
+    }
+
+    #[test]
+    fn first_cl_readiness_support_state_and_activation_pages_are_exact() {
+        fn expected_support(
+            class: u32,
+            active: u32,
+            resource_class: u64,
+            cursor: u32,
+            state: u64,
+            final_kind: u32,
+        ) -> [u8; COMPUTE_READINESS_PAGE_SIZE] {
+            let mut expected = [0u8; COMPUTE_READINESS_PAGE_SIZE];
+            put_u32(&mut expected, 0x00, class);
+            put_u32(&mut expected, 0x08, active);
+            put_u32(&mut expected, 0x10, class);
+            put_u64(&mut expected, 0x18, 0x0004_0000_0000_0070);
+            put_u64(&mut expected, 0x20, resource_class << 40);
+            put_u64(&mut expected, 0x28, resource_class << 40);
+            put_u64(&mut expected, 0x30, CONTROL_OPERAND_TABLE_ADDRESS);
+            put_u32(&mut expected, 0x40, 4);
+            put_u32(&mut expected, 0x48, cursor);
+            put_u64(&mut expected, 0x4c, state);
+            put_u32(&mut expected, 0x60, final_kind);
+            expected
+        }
+
+        let mut class1 = [0u8; COMPUTE_READINESS_PAGE_SIZE];
+        let mut class3 = [0u8; COMPUTE_READINESS_PAGE_SIZE];
+        let mut state = [0xffu8; COMPUTE_READINESS_PAGE_SIZE];
+        encode_compute_readiness_class1_support(&mut class1).unwrap();
+        encode_compute_readiness_class3_support(&mut class3).unwrap();
+        encode_compute_readiness_state(&mut state).unwrap();
+        assert_eq!(
+            class1,
+            expected_support(
+                1,
+                1,
+                0x11,
+                0x88,
+                COMPUTE_READINESS_CLASS1_STATE_ADDRESS,
+                2,
+            )
+        );
+        assert_eq!(
+            class3,
+            expected_support(
+                3,
+                2,
+                0x17,
+                0xb8,
+                COMPUTE_READINESS_CLASS3_STATE_ADDRESS,
+                3,
+            )
+        );
+        assert_eq!(get_u32(&state, 0), 1);
+        assert!(state[4..].iter().all(|byte| *byte == 0));
+
+        let mut activation = [0xffu8; CONTROL_RECORD_SIZE];
+        encode_compute_readiness_activation_record(&mut activation).unwrap();
+        let mut expected = [0u8; CONTROL_RECORD_SIZE];
+        put_u64(&mut expected, 0x00, 0x0000_0100_0000_ffff);
+        put_u64(&mut expected, 0x20, 0x0002_0000_0000_0000);
+        put_u64(&mut expected, 0x30, 0x0000_0000_ff00_0000);
+        assert_eq!(activation, expected);
+        assert_eq!(COMPUTE_READINESS_ACTIVATION_RECORD_OFFSET, 0x80);
     }
 
     #[test]
