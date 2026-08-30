@@ -7,7 +7,10 @@ Firmware now crosses `DispPerfState` and emits another sixteen callbacks. The
 last visible pair is `D102 PanelLayout`, then `D102 SupportRelbufInfoCb`.
 Linux sends the final raw `0x42`, the ASC A2I FIFO is empty at timeout, but
 firmware emits neither the immediately following `D000` nor `D001` and never
-returns the outer `A401` reply.
+returns the outer `A401` reply. The exact endpoint dispatcher reveals a quiet
+signal-before-publish race: the EP37 filter signals `iomfb_ap_link` before the
+dispatcher publishes the raw acknowledgement into EP37's software queue, and
+that later queue push does not signal the workloop.
 
 The native AP-side `D102` implementation creates an OSNumber and publishes it
 through `IORegistryEntry::setProperty`; it sends no nested DCP message and its
@@ -15,9 +18,11 @@ return value is not represented on the wire. The exact firmware continuation
 has no PMC/PMP wait and no callback-table dispatch between the final `D102`
 and `D000`. The current proven boundary is therefore after physical dequeue
 of the final acknowledgement but before the synchronous DCPLink sender has
-resumed far enough to issue `D000`. Physical dequeue alone cannot distinguish
-the EP37 software association, gate action, condition signal, and waiter
-resumption stages.
+resumed far enough to issue `D000`. The single-variable discriminator sends a
+normal type-1 READY word immediately after the exact final
+`SupportRelbufInfoCb` acknowledgement. FIFO ordering puts it after the real
+reply; its second EP37 filter invocation re-signals the workloop only after the
+reply has been published. It changes no RPC bytes and adds no delay.
 
 ## A401 dispatcher
 
@@ -272,21 +277,38 @@ is armed.
 
 ## EP37 software scheduling boundary
 
-All five raw `0x42` replies take the same firmware path. The endpoint-37 filter
-at `0x041b6fd4` has no property index, callback count, payload, or fifth-call
-branch. It signals the same link event source; the AFK dispatcher then enqueues
-the word on the same endpoint software queue; action `0x041b70d0` drains that
-queue and chooses the same stream from the same control bits. There is no
-static ACK1-through-ACK4 versus ACK5 dispatch delta to patch.
+All raw `0x42` replies take the same firmware path. The endpoint-37 filter at
+`0x041b6fd4` has no property index, callback count, payload, or final-call
+branch. The difference is a scheduler race around the common path, not a wire
+decode delta.
+
+The generic incoming dispatcher at `0x04026bf0` calls the endpoint route/filter
+at `0x04026cc8`. For an EP37 reply, the filter triggers the link event source at
+`0x041b705c` and returns zero. Only after that return does the dispatcher push
+the raw word into the endpoint software queue at `0x04026cf8`. The queue push
+does not trigger the event source. Therefore the ordering is exactly:
+
+1. mark the link event source pending and wake its workloop;
+2. return from the EP37 filter;
+3. publish the raw reply to the EP37 software queue.
+
+The workloop action loop confirms the quiet window. It tests the pending byte
+at `0x04031c6c`, clears it before invoking the action at `0x04031c7c`, and calls
+the action at `0x04031c94`. Action `0x041b70d0` returns zero when its queue is
+empty. Only a nonzero action result explicitly rearms the source at
+`0x04031ccc..0x04031cd0`; a concurrent trigger can also set the byte again, but
+the later queue push cannot. If `iomfb_ap_link` runs in the interval between
+steps 1 and 3, it observes an empty queue and consumes the only notification;
+the raw reply then remains queued indefinitely.
 
 Firmware creates the default endpoint workloop named `rtk_ep_work` at
 `0x0402125c` with priority `0x39`. It creates the DCPLink consumer workloop
 named `iomfb_ap_link` at `0x042df470` with priority `0x10`. The scheduler
 records a runnable priority in a 64-bit bitmap and selects its highest set bit
-with `clz` at `0x040205c4..0x040205e0`. Those facts do not by themselves close
-the signal-before-enqueue question. The route callback at `0x04026bf0` runs
-through the lower MBI provider's registered callback, and its exact execution
-context is not pinned to `rtk_ep_work` by the current disassembly.
+with `clz` at `0x040205c4..0x040205e0`. The normal priority relationship
+usually keeps the incoming dispatcher running until publication, which
+explains the positive controls. It is not an ordering primitive: the signal
+and queue push are separate operations with no post-publish notification.
 
 The reply lookup under the link gate at `0x041b7830` aborts if it must create
 an idle stream for a reply. A normal synchronous callback cannot expose that
@@ -296,13 +318,22 @@ offset `0x60`. There is no normal branch that clears it while the caller is
 blocked. For an existing stream, `0x041b7804` stores the reply and signals the
 waiter unconditionally.
 
-Together with the FIFO result, this moves the physical boundary past A2I
-dequeue but not past EP37 software dispatch. A missing or newly allocated
-stream takes the non-returning abort at `0x041b7520`; it cannot look like a
-silent wait. If that abort happened, the immediately following crashlog buffer
-request would be consistent with the root task entering its crash path. The
-remaining static classifications are route dispatch, that abort, and a later
-abort in the five object releases at `0x042ac100..0x042ac19c`.
+Callback 196 and callback 197 have indistinguishable wire, stream, route, gate,
+and host-handler contracts. Callback 196's acknowledgement resumes firmware
+and produces callback 197 only 131 microseconds later. Neither D102 tail
+releases the outer stream, detaches the event source, nor changes workloop
+ownership. Callback 197 is special only because no later firmware callback
+provides an incidental second signal if its acknowledgement loses this race.
+
+The delay-free discriminator uses raw type-1 READY (`0x1`) as that second
+normal notification. It is sent through the same ordered A2I mailbox primitive
+immediately after the exact final D102 acknowledgement. When firmware dequeues
+READY, its EP37 filter signals the same event source after the acknowledgement
+has already been published. Type 1 follows the normal branch at `0x041b71c4`
+to `0x041b7670`; the DCP returns READY for its normal local-side state, and
+Linux ignores READY once the link is running. A successful discriminator
+reaches the following `D000` and `D001`; an unchanged timeout falsifies this
+race as the remaining liveness cause.
 
 ## Adopted endpoint bookkeeping result
 
@@ -640,16 +671,14 @@ object `0x04963df8`. The existing busy-stream branch is mandatory. A missing
 stream, a newly allocated stream, or reply lookup/gate setup failure reaches
 the non-returning abort at `0x041b7520..0x041b7528`.
 
-The hardware receive callback reaches `0x04026bf0`. For every received word it
-unconditionally enqueues the word by endpoint at `0x04026c7c`, resolves the
-registered endpoint object, and invokes its route callback at `0x04026cc8`.
-EP37 was registered with filter `0x041b6fd4`. A reply does not take the
-new-request allocation branch; the filter calls `0x040322d4` on the link event
-source at `0x041b705c`. That event source was created active. Its trigger stores
-pending byte one before waking the workloop, so the notification is latching,
-not an edge which can be lost while the consumer runs. Consumer action
-`0x041b70d0` pops EP37 words at `0x041b710c` and loops until the endpoint
-software queue is empty.
+The hardware receive callback reaches `0x04026bf0`. It records the lower
+mailbox entry at `0x04026c7c`, resolves the endpoint, and invokes the EP37
+filter at `0x04026cc8`. The filter triggers the event source before the
+endpoint queue push at `0x04026cf8`. Triggering is latching with respect to
+action execution, but not with respect to the later producer: the workloop
+clears pending before the action, and an empty action returns zero. Consumer
+action `0x041b70d0` pops EP37 words at `0x041b710c` and drains the queue only
+if publication wins the race.
 
 For an existing stream, `0x041b76e0` asks the stream gate at offset `0x58` to
 run action `0x041b7804`. The generic gate helper at `0x04032058`
@@ -677,16 +706,9 @@ response and busy fields are DCP-private write-back cache lines; the failed
 cookie observer already proves AP reads of their RAM backing are not coherent.
 The shared RPC buffer contains no response field for an output-less D102.
 
-There is consequently no behavior-neutral AP observer currently capable of
-separating these remaining states in one run:
-
-- ACK197 left the hardware FIFO but did not reach the EP37 route callback;
-- EP37 latched its workloop event but the consumer action did not run;
-- store-and-signal ran but the synchronous sender did not resume.
-
-Changing reply timing, sending a second reply, injecting remote-error bits, or
-reading the private stream cache line would not be an evidence-derived
-discriminator. No further hardware candidate follows from this boundary yet.
+The ordered READY notification is a positive discriminator for this exact
+producer ordering bug. It does not alter the acknowledgement, inject an error,
+double-send a reply, or depend on an incoherent DCP-private cache line.
 
 ## Queued post-A401 H17P callback table correction
 

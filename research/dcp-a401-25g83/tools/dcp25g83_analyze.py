@@ -152,11 +152,20 @@ def verify(image: Image) -> None:
         0x042B583C: 0x97FFE2BD,  # call post-property no-op
         0x042B58B4: 0x97FC088E,  # D000 synchronous call
         0x042B58CC: 0x97FC0888,  # D001 synchronous call
-        0x04026C7C: 0x9400003A,  # enqueue hardware RX word by endpoint
-        0x04026CC8: 0xD63F091F,  # invoke the endpoint route callback
+        0x04026C7C: 0x9400003A,  # record the lower-mailbox RX entry
+        0x04026CC8: 0xD63F091F,  # invoke route/filter before endpoint publish
+        0x04026CF8: 0x97FFFC82,  # publish raw word to endpoint software queue
         0x041B705C: 0x97F9EC9E,  # latch the EP37 link event
         0x040322E4: 0x39000409,  # event source pending byte = 1
+        0x04031C6C: 0x39400788,  # workloop tests source pending byte
+        0x04031C7C: 0x3900079F,  # workloop clears pending before action
+        0x04031C94: 0xD63F091F,  # invoke event-source action
+        0x04031CCC: 0x5280003B,  # nonzero action requests another pass
+        0x04031CD0: 0x3900079B,  # nonzero action rearms pending byte
+        0x04031CF0: 0x3707FADB,  # repeat the source scan when requested
         0x041B710C: 0x97F9BFFE,  # pop the next EP37 software-queue word
+        0x041B71C4: 0xAA1303E0,  # type-1 READY selects normal handler
+        0x041B71CC: 0x94000129,  # READY calls response/duplicate handler
         0x0403207C: 0xD63F0ABF,  # gate helper unconditionally calls action
         0x0403208C: 0x2A1303E0,  # gate helper returns the action result
         0x041B7720: 0x97F9EA4E,  # enter existing stream gate

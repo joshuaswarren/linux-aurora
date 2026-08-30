@@ -194,6 +194,19 @@ static int dcp25g83_d563_tail_index(const void *input, u32 input_size)
 	return -ENOENT;
 }
 
+static bool dcp25g83_support_relbuf_callback(struct apple_dcp *dcp, int tag,
+					     const struct apple_dcp_link_rpc_view *view)
+{
+	static const char property[] = "SupportRelbufInfoCb";
+
+	if (dcp->fw_compat != DCP_FIRMWARE_H17P || !dcp->adopted_session ||
+	    dcp->link_support_relbuf_retrigger_sent || tag != 102 ||
+	    view->input_size != 0x44 || view->output_size)
+		return false;
+
+	return !memcmp(view->input, property, sizeof(property));
+}
+
 static void dcp25g83_d563_a2i_begin(struct apple_dcp *dcp, int index)
 {
 	u32 control;
@@ -1040,12 +1053,31 @@ static void dcp_link_handle_callback(struct apple_dcp *dcp, u64 message)
 				 handled ? reply : 0);
 	}
 	if (handled) {
+		bool retrigger = dcp25g83_support_relbuf_callback(dcp, tag, &view);
+
 		ack_ret = dcp_link_ack(dcp, DCP_CONTEXT_CB);
 		dcp25g83_d563_a2i_end(dcp, d563_tail_index, ack_ret);
 		if (log_callback && sequence >= 165)
 			dev_info(dcp->dev,
 				 "DCPLink callback %u D%03d ACK %#llx send result %d\n",
 				 sequence, tag, reply, ack_ret);
+		if (retrigger) {
+			int ready_ret = -ECANCELED;
+
+			/*
+			 * 25G83 signals EP37 before publishing the received word.
+			 * Ordered READY re-signals after this final reply is published.
+			 */
+			dcp->link_support_relbuf_retrigger_sent = true;
+			if (!ack_ret)
+				ready_ret = dcp_send_message_sync(dcp,
+								  APPLE_DCP_LINK_ENDPOINT,
+								  APPLE_DCP_LINK_MSG_READY);
+			dev_info(dcp->dev,
+				 "DCP25G83_EP37_POST_PUBLISH_RETRIGGER callback %u ACK %#llx result %d READY %#x result %d\n",
+				 sequence, reply, ack_ret,
+				 APPLE_DCP_LINK_MSG_READY, ready_ret);
+		}
 	}
 }
 
