@@ -69,6 +69,31 @@ const CONTROL_COUNTER_POLLS: usize = 100;
 const G17P_CRASHLOG_MAX_BYTES: usize = 256 * 1024;
 const G17P_RTKIT_UAT_DVA_MASK: u64 = (1u64 << 40) - 1;
 
+fn log_g17p_scheduler_gate_registers(
+    dev: &kernel::device::Device,
+    registers: &regs::Resources,
+    checkpoint: &'static str,
+) {
+    match registers.g17p_scheduler_gate_registers() {
+        Ok(snapshot) => dev_info!(
+            dev,
+            "G17P scheduler-gate-mmio checkpoint={} fender-d06030={:#x} wake-armed={} irq-e01000-low={:#x} irq-enable-e01010={:#x} irq-status-e01014={:#x}\n",
+            checkpoint,
+            snapshot.fender_dynamic_gating,
+            snapshot.fender_wake_armed(),
+            snapshot.host_irq_summary,
+            snapshot.host_irq_enable,
+            snapshot.host_irq_status,
+        ),
+        Err(error) => dev_err!(
+            dev,
+            "G17P scheduler-gate-mmio checkpoint={} read failed ({:?})\n",
+            checkpoint,
+            error,
+        ),
+    }
+}
+
 const fn g17p_rtkit_uat_address(dva: u64) -> u64 {
     dva & G17P_RTKIT_UAT_DVA_MASK
 }
@@ -845,6 +870,11 @@ fn finish_boot_session(
     if gfx_state.crashed.load(Ordering::Acquire) || gfx1_state.crashed.load(Ordering::Acquire) {
         return Err(EIO);
     }
+    log_g17p_scheduler_gate_registers(
+        pdev.as_ref(),
+        registers,
+        "bootstrap-after-retirement",
+    );
     Pin::new(&mut gfx_rtkit)
         .send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, control_done)?;
     dev_info!(
@@ -1340,6 +1370,15 @@ impl G17PLiveRuntime {
         };
         if readiness_needs_control_done {
             let readiness_control_done = ((CONTROL_DONE_TYPE as u64) << 48) | CONTROL_DONE_CHANNEL;
+            self.manager
+                .as_ref()
+                .ok_or(ENODEV)?
+                .log_scheduler_root_checkpoint("G-readiness-pre-0x84");
+            log_g17p_scheduler_gate_registers(
+                self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                self.registers.as_ref().ok_or(ENODEV)?,
+                "readiness-pre-0x84",
+            );
             dev_info!(
                 self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
                 "G17P compute readiness: sending control announcement {:#x} before EP83 work\n",
@@ -1573,6 +1612,10 @@ impl G17PLiveRuntime {
             "G17P live-boot: {:?} admitted before effects; selected {} stage\n",
             BootStage::ExactTopology,
             test_stage.name()
+        );
+        dev_info!(
+            pdev.as_ref(),
+            "G17P diagnostic: scheduler-root-checkpoints-v1 armed\n"
         );
 
         let pdev_ref: ARef<platform::Device> = pdev.into();
