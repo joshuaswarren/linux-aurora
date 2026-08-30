@@ -41,6 +41,11 @@
 #define APPLE_DCP_LINK_PHASE_PROPERTY	"apple,dcp-link-phase"
 #define APPLE_DCP_LINK_MESSAGE_PROPERTY	"apple,dcp-link-message"
 
+#define DCP25G83_MGMT_ENDPOINT		0
+#define DCP25G83_MGMT_TYPE		GENMASK_ULL(59, 52)
+#define DCP25G83_MGMT_ECHO_REQUEST	3
+#define DCP25G83_MGMT_ECHO_COOKIE	0x44504331ULL
+
 static int dcp_tx_offset(enum dcp_context_id id)
 {
 	switch (id) {
@@ -194,13 +199,13 @@ static int dcp25g83_d563_tail_index(const void *input, u32 input_size)
 	return -ENOENT;
 }
 
-static bool dcp25g83_support_relbuf_callback(struct apple_dcp *dcp, int tag,
-					     const struct apple_dcp_link_rpc_view *view)
+static bool dcp25g83_mgmt_probe(struct apple_dcp *dcp, int tag,
+				const struct apple_dcp_link_rpc_view *view)
 {
 	static const char property[] = "SupportRelbufInfoCb";
 
 	if (dcp->fw_compat != DCP_FIRMWARE_H17P || !dcp->adopted_session ||
-	    dcp->link_support_relbuf_retrigger_sent || tag != 102 ||
+	    dcp->link_mgmt_route_probe_sent || tag != 102 ||
 	    view->input_size != 0x44 || view->output_size)
 		return false;
 
@@ -1053,7 +1058,7 @@ static void dcp_link_handle_callback(struct apple_dcp *dcp, u64 message)
 				 handled ? reply : 0);
 	}
 	if (handled) {
-		bool retrigger = dcp25g83_support_relbuf_callback(dcp, tag, &view);
+		bool route_probe = dcp25g83_mgmt_probe(dcp, tag, &view);
 
 		ack_ret = dcp_link_ack(dcp, DCP_CONTEXT_CB);
 		dcp25g83_d563_a2i_end(dcp, d563_tail_index, ack_ret);
@@ -1061,22 +1066,33 @@ static void dcp_link_handle_callback(struct apple_dcp *dcp, u64 message)
 			dev_info(dcp->dev,
 				 "DCPLink callback %u D%03d ACK %#llx send result %d\n",
 				 sequence, tag, reply, ack_ret);
-		if (retrigger) {
-			int ready_ret = -ECANCELED;
+		if (route_probe) {
+			u64 probe = FIELD_PREP(DCP25G83_MGMT_TYPE,
+					       DCP25G83_MGMT_ECHO_REQUEST) |
+				    DCP25G83_MGMT_ECHO_COOKIE;
+			u32 before = 0, after = 0;
+			int before_ret, after_ret;
+			int probe_ret = -ECANCELED;
 
 			/*
-			 * 25G83 signals EP37 before publishing the received word.
-			 * Ordered READY re-signals after this final reply is published.
+			 * Exact 25G83 EP0 type 3 is a stateless echo request. The
+			 * firmware returns type 4 with the low 32-bit cookie unchanged.
+			 * This partitions the lower RTKit route from the EP37 consumer
+			 * without changing D102 memory or sending another link message.
 			 */
-			dcp->link_support_relbuf_retrigger_sent = true;
+			dcp->link_mgmt_route_probe_sent = true;
+			before_ret = dcp_mbox_a2i_control(dcp, &before);
 			if (!ack_ret)
-				ready_ret = dcp_send_message_sync(dcp,
-								  APPLE_DCP_LINK_ENDPOINT,
-								  APPLE_DCP_LINK_MSG_READY);
+				probe_ret = dcp_send_message_sync(dcp,
+								  DCP25G83_MGMT_ENDPOINT,
+								  probe);
+			after_ret = dcp_mbox_a2i_control(dcp, &after);
 			dev_info(dcp->dev,
-				 "DCP25G83_EP37_POST_PUBLISH_RETRIGGER callback %u ACK %#llx result %d READY %#x result %d\n",
-				 sequence, reply, ack_ret,
-				 APPLE_DCP_LINK_MSG_READY, ready_ret);
+				 "DCP25G83_MGMT_ROUTE_ECHO_PROBE callback %u ACK %#llx result %d request %#llx result %d A2I before %#x result %d after %#x result %d expect %#llx\n",
+				 sequence, reply, ack_ret, probe, probe_ret,
+				 before, before_ret, after, after_ret,
+				 FIELD_PREP(DCP25G83_MGMT_TYPE, 4) |
+				 DCP25G83_MGMT_ECHO_COOKIE);
 		}
 	}
 }
