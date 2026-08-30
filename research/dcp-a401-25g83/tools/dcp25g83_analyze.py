@@ -133,6 +133,16 @@ def verify(image: Image) -> None:
         0x04021F18: 0xD503237F,  # abort path entry
         0x04021F50: 0x94003C88,  # abort reporting call
         0x04021F58: 0x97FFFFCF,  # non-returning abort call
+        0x04021254: 0x52810003,  # rtk_ep_work stack size 0x800
+        0x04021258: 0x52800724,  # rtk_ep_work priority 0x39
+        0x042DF464: 0x52820003,  # iomfb_ap_link stack size 0x1000
+        0x042DF468: 0x52800204,  # iomfb_ap_link priority 0x10
+        0x040205C4: 0xDAC0116B,  # scheduler CLZ of runnable-priority bitmap
+        0x040205CC: 0x4B0B018B,  # highest runnable priority = 63 - CLZ
+        0x041B7068: 0x71080A7F,  # filter returns true only for new request 0x202
+        0x041B510C: 0xB8060E7F,  # synchronous cleanup clears stream busy word
+        0x041B786C: 0xB940614C,  # reply lookup reads stream busy word
+        0x041B7870: 0x350001AC,  # existing busy stream skips allocation marker
     }
     for va, expected in instructions.items():
         actual = struct.unpack("<I", image.bytes_at(va, 4))[0]
