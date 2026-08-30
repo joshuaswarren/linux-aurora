@@ -924,18 +924,28 @@ pub(crate) const HW_ACCEPT_TRAILING_ONES: [usize; 3] = [0x25f4, 0x2600, 0x2608];
 /// differed between a pre-start and a running capture). It must start zero.
 pub(crate) const HW_FIRMWARE_STATE_OFFSET: usize = 0x2630;
 
-/// Two 0x40-byte hardware region records at `+0x2610`, each naming a 16 KiB
-/// region: `(lead, value, trail)` per record; kind `0x70` at `+0x08`, the
-/// unaligned region FW DVA at `+0x0c`, `0x800` at `+0x14`, `0x40` at `+0x18`.
-pub(crate) const HW_REGION_RECORDS_OFFSET: usize = 0x2610;
-pub(crate) const HW_REGION_RECORD_STRIDE: usize = 0x40;
-pub(crate) const HW_REGION_RECORDS: [(u32, u32, u32); 2] =
-    [(0x100, 0x0184_8000, 0), (0, 0x0187_0000, 2)];
-const HW_REGION_RECORD_KIND: u32 = 0x70;
-const HW_REGION_RECORD_SIZE_A: u32 = 0x800;
-const HW_REGION_RECORD_SIZE_B: u32 = 0x40;
-/// Native bundle offsets the two region records point at.
-pub(crate) const NATIVE_HW_REGION_BUNDLE_OFFSETS: [usize; 2] = [0x48000, 0x70000];
+/// Four inline G17P KSM completion descriptors at hardware-data `+0x2614`.
+/// Only ordinals 0 and 2 are present. Each names low/high mappings of one
+/// retained `0x800 * 0x40 == 0x20000` backing; ordinals 1 and 3 stay zero.
+pub(crate) const G17P_KSM_COMPLETION_TABLE_OFFSET: usize = 0x2614;
+pub(crate) const G17P_KSM_COMPLETION_DESCRIPTOR_STRIDE: usize = 0x20;
+pub(crate) const G17P_KSM_COMPLETION_PRESENT_ORDINALS: [u32; 2] = [0, 2];
+pub(crate) const G17P_KSM_COMPLETION_CAPACITY: u32 = 0x800;
+pub(crate) const G17P_KSM_COMPLETION_ENTRY_SIZE: u32 = 0x40;
+pub(crate) const G17P_KSM_COMPLETION_BACKING_SIZE: usize =
+    G17P_KSM_COMPLETION_CAPACITY as usize * G17P_KSM_COMPLETION_ENTRY_SIZE as usize;
+pub(crate) const G17P_KSM_COMPLETION_LOW_VAS: [u64; 2] =
+    [0x70_0184_8000, 0x70_0187_0000];
+pub(crate) const G17P_KSM_COMPLETION_HIGH_BUNDLE_OFFSETS: [usize; 2] = [0x48000, 0x70000];
+const G17P_KSM_COMPLETION_TABLE_PREFIX_OFFSET: usize = 0x2610;
+const G17P_KSM_COMPLETION_TABLE_PREFIX: u32 = 0x100;
+
+/// Two GPU mappings of one present completion-queue backing.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PKsmCompletionAliases {
+    pub(crate) low: u64,
+    pub(crate) high: u64,
+}
 
 // Performance-table geometry (values deliberately not encoded; see
 // [`PERF_TABLE_VALUES_ENCODED`]). Two groups with identical internal layout,
@@ -1635,13 +1645,12 @@ pub(crate) fn encode_main_config(
 /// bundle). Both instances reference this one object; handing the secondary a
 /// private copy makes it fault.
 ///
-/// `region_record_addrs` are the FW DVAs of the two 16 KiB regions named by
-/// the records at `+0x2610` (natively at bundle offsets
-/// [`NATIVE_HW_REGION_BUNDLE_OFFSETS`]).
+/// `completion_aliases` are the low/high GPU mappings of the two retained
+/// completion-queue backings named by descriptor ordinals 0 and 2.
 pub(crate) fn encode_hw_data(
     windows: &[RegisterWindow],
     flag_only_slots: &[(usize, u32)],
-    region_record_addrs: [u64; 2],
+    completion_aliases: [G17PKsmCompletionAliases; 2],
     out: &mut [u8],
 ) -> Result<(), InitdataError> {
     if out.len() != HW_DATA_SIZE {
@@ -1669,8 +1678,9 @@ pub(crate) fn encode_hw_data(
     for (slot, _flag) in flag_only_slots {
         claim(*slot)?;
     }
-    for address in region_record_addrs {
-        required_address(address)?;
+    for aliases in completion_aliases {
+        required_address(aliases.low)?;
+        required_address(aliases.high)?;
     }
 
     out.fill(0);
@@ -1757,20 +1767,23 @@ pub(crate) fn encode_hw_data(
         put_u32(out, offset, 1);
     }
 
-    for (index, ((lead, value, trail), address)) in HW_REGION_RECORDS
+    put_u32(
+        out,
+        G17P_KSM_COMPLETION_TABLE_PREFIX_OFFSET,
+        G17P_KSM_COMPLETION_TABLE_PREFIX,
+    );
+    for (aliases, ordinal) in completion_aliases
         .iter()
-        .zip(region_record_addrs)
-        .enumerate()
+        .zip(G17P_KSM_COMPLETION_PRESENT_ORDINALS)
     {
-        let base = HW_REGION_RECORDS_OFFSET + index * HW_REGION_RECORD_STRIDE;
-        put_u32(out, base, *lead);
-        put_u32(out, base + 0x04, *value);
-        put_u32(out, base + 0x08, HW_REGION_RECORD_KIND);
-        // Unaligned region FW DVA.
-        put_u64(out, base + 0x0c, address);
-        put_u32(out, base + 0x14, HW_REGION_RECORD_SIZE_A);
-        put_u32(out, base + 0x18, HW_REGION_RECORD_SIZE_B);
-        put_u32(out, base + 0x1c, *trail);
+        let base = G17P_KSM_COMPLETION_TABLE_OFFSET
+            + ordinal as usize * G17P_KSM_COMPLETION_DESCRIPTOR_STRIDE;
+        put_u64(out, base, aliases.low);
+        put_u64(out, base + 0x08, aliases.high);
+        put_u32(out, base + 0x10, G17P_KSM_COMPLETION_CAPACITY);
+        put_u32(out, base + 0x14, G17P_KSM_COMPLETION_ENTRY_SIZE);
+        put_u32(out, base + 0x18, ordinal);
+        // +0x1c is the firmware-owned processed cursor and starts at zero.
     }
 
     // Recorded platform constants. Descriptor *acceptance* survives without
@@ -3074,17 +3087,29 @@ mod tests {
         ]
     }
 
+    fn completion_aliases() -> [G17PKsmCompletionAliases; 2] {
+        [
+            G17PKsmCompletionAliases {
+                low: G17P_KSM_COMPLETION_LOW_VAS[0],
+                high: shared().hw_data_bundle
+                    + G17P_KSM_COMPLETION_HIGH_BUNDLE_OFFSETS[0] as u64,
+            },
+            G17PKsmCompletionAliases {
+                low: G17P_KSM_COMPLETION_LOW_VAS[1],
+                high: shared().hw_data_bundle
+                    + G17P_KSM_COMPLETION_HIGH_BUNDLE_OFFSETS[1] as u64,
+            },
+        ]
+    }
+
     #[test]
-    fn hw_data_size_acceptance_block_regions_and_firmware_state() {
+    fn hw_data_size_acceptance_completion_table_and_firmware_state() {
         assert_eq!(HW_DATA_SIZE, 0x3db4);
         let windows = register_windows();
         let flag_only = [(3usize, 2u32), (7, 2)];
-        let regions = [
-            shared().hw_data_bundle + NATIVE_HW_REGION_BUNDLE_OFFSETS[0] as u64,
-            shared().hw_data_bundle + NATIVE_HW_REGION_BUNDLE_OFFSETS[1] as u64,
-        ];
+        let aliases = completion_aliases();
         let mut hw = vec![0xa5; HW_DATA_SIZE];
-        encode_hw_data(&windows, &flag_only, regions, &mut hw).unwrap();
+        encode_hw_data(&windows, &flag_only, aliases, &mut hw).unwrap();
         assert_eq!(hw.len(), 0x3db4);
 
         // Chip id at +0xe90.
@@ -3122,17 +3147,23 @@ mod tests {
         // began dirty (0xa5).
         assert_eq!(hw[0x2630], 0);
 
-        // Two 0x40-byte hardware region records at +0x2610.
-        assert_eq!(get_u32(&hw, 0x2610), 0x100); // record 0 lead
-        assert_eq!(get_u32(&hw, 0x2610 + 0x04), 0x0184_8000); // value
-        assert_eq!(get_u32(&hw, 0x2610 + 0x08), 0x70); // kind
-        assert_eq!(get_u64(&hw, 0x2610 + 0x0c), regions[0]); // unaligned DVA
-        assert_eq!(get_u32(&hw, 0x2610 + 0x14), 0x800);
-        assert_eq!(get_u32(&hw, 0x2610 + 0x18), 0x40);
-        assert_eq!(get_u32(&hw, 0x2610 + 0x1c), 0); // record 0 trail
-        assert_eq!(get_u32(&hw, 0x2650 + 0x04), 0x0187_0000); // record 1 value
-        assert_eq!(get_u64(&hw, 0x2650 + 0x0c), regions[1]);
-        assert_eq!(get_u32(&hw, 0x2650 + 0x1c), 2); // record 1 trail
+        // Four inline descriptors begin at +0x2614; only ordinals 0/2 exist.
+        assert_eq!(get_u32(&hw, G17P_KSM_COMPLETION_TABLE_PREFIX_OFFSET), 0x100);
+        for ordinal in [1usize, 3] {
+            let base = G17P_KSM_COMPLETION_TABLE_OFFSET
+                + ordinal * G17P_KSM_COMPLETION_DESCRIPTOR_STRIDE;
+            assert_eq!(&hw[base..base + 0x20], &[0; 0x20]);
+        }
+        for (aliases, ordinal) in aliases.iter().zip(G17P_KSM_COMPLETION_PRESENT_ORDINALS) {
+            let base = G17P_KSM_COMPLETION_TABLE_OFFSET
+                + ordinal as usize * G17P_KSM_COMPLETION_DESCRIPTOR_STRIDE;
+            assert_eq!(get_u64(&hw, base), aliases.low);
+            assert_eq!(get_u64(&hw, base + 0x08), aliases.high);
+            assert_eq!(get_u32(&hw, base + 0x10), 0x800);
+            assert_eq!(get_u32(&hw, base + 0x14), 0x40);
+            assert_eq!(get_u32(&hw, base + 0x18), ordinal);
+            assert_eq!(get_u32(&hw, base + 0x1c), 0);
+        }
 
         // The recorded opaque runs landed (spot check the two 0xffffffff tails).
         assert_eq!(get_u32(&hw, 0x3d98), 0xffff_ffff);
@@ -3149,23 +3180,20 @@ mod tests {
 
     #[test]
     fn hw_data_rejects_out_of_aperture_and_duplicate_slots() {
-        let regions = [
-            shared().hw_data_bundle + NATIVE_HW_REGION_BUNDLE_OFFSETS[0] as u64,
-            shared().hw_data_bundle + NATIVE_HW_REGION_BUNDLE_OFFSETS[1] as u64,
-        ];
+        let aliases = completion_aliases();
         let mut hw = vec![0; HW_DATA_SIZE];
 
         // A device VA outside the fixed register aperture fails closed.
         let mut window = register_windows();
         window[0].device_va = 0x1000;
         assert_eq!(
-            encode_hw_data(&window, &[], regions, &mut hw),
+            encode_hw_data(&window, &[], aliases, &mut hw),
             Err(InitdataError::RegisterWindow)
         );
 
         // Two declarations for the same slot fail closed.
         assert_eq!(
-            encode_hw_data(&register_windows(), &[(0usize, 2u32)], regions, &mut hw),
+            encode_hw_data(&register_windows(), &[(0usize, 2u32)], aliases, &mut hw),
             Err(InitdataError::RegisterWindow)
         );
     }
