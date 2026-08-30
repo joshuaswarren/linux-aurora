@@ -1089,6 +1089,10 @@ fn finish_boot_session(
         pdev.as_ref(),
         "G17P diagnostic: j700-a000-mbi-trace-leases-v1 armed\n"
     );
+    dev_info!(
+        pdev.as_ref(),
+        "G17P diagnostic: j700-dual-initdata-publication-v1 armed\n"
+    );
     Ok(G17PBootedSession {
         cpus,
         gfx_state,
@@ -1160,27 +1164,31 @@ fn boot_session(
         dev_info!(pdev.as_ref(), "G17P session: GFX processor started\n");
         Pin::new(&mut gfx_rtkit).boot()?;
         dev_info!(pdev.as_ref(), "G17P session: GFX RTKit handshake complete\n");
-        let root_snapshot = manager.uat().prepare_t8140_firmware_high_roots()?;
-        manager
-            .uat()
-            .confirm_t8140_primary_high_root(root_snapshot)?;
-        registers.t8140_pre_initdata_clear()?;
-        Pin::new(&mut gfx_rtkit).start_endpoint(g17_rtkit::ENDPOINT_GFX_MESSAGES)?;
-        Pin::new(&mut gfx_rtkit).start_endpoint(g17_rtkit::ENDPOINT_GFX_INTERRUPTS)?;
-        Pin::new(&mut gfx_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_MESSAGES, gfx_init)?;
-        dev_info!(pdev.as_ref(), "G17P session: primary initdata sent\n");
-        wait_initdata_ack(&gfx_state)?;
-        dev_info!(pdev.as_ref(), "G17P session: primary initdata ACK received\n");
         Ok(())
     })?;
     dev_info!(pdev.as_ref(), "G17P session: GFX1 processor started\n");
     Pin::new(&mut gfx1_rtkit).boot()?;
     dev_info!(pdev.as_ref(), "G17P session: GFX1 RTKit handshake complete\n");
+
+    let root_snapshot = manager.uat().prepare_t8140_firmware_high_roots()?;
+    manager
+        .uat()
+        .confirm_t8140_primary_high_root(root_snapshot)?;
     manager.uat().mirror_t8140_secondary_high_root()?;
+    registers.t8140_pre_initdata_clear()?;
+
+    Pin::new(&mut gfx_rtkit).start_endpoint(g17_rtkit::ENDPOINT_GFX_MESSAGES)?;
+    Pin::new(&mut gfx_rtkit).start_endpoint(g17_rtkit::ENDPOINT_GFX_INTERRUPTS)?;
     Pin::new(&mut gfx1_rtkit).start_endpoint(g17_rtkit::ENDPOINT_GFX_MESSAGES)?;
     Pin::new(&mut gfx1_rtkit).start_endpoint(g17_rtkit::ENDPOINT_GFX_INTERRUPTS)?;
+    Pin::new(&mut gfx_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_MESSAGES, gfx_init)?;
     Pin::new(&mut gfx1_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_MESSAGES, gfx1_init)?;
-    dev_info!(pdev.as_ref(), "G17P session: secondary initdata sent\n");
+    dev_info!(
+        pdev.as_ref(),
+        "G17P session: primary and secondary initdata published\n"
+    );
+    wait_initdata_ack(&gfx_state)?;
+    dev_info!(pdev.as_ref(), "G17P session: primary initdata ACK received\n");
     wait_initdata_ack(&gfx1_state)?;
     dev_info!(pdev.as_ref(), "G17P session: secondary initdata ACK received\n");
 
@@ -1255,54 +1263,50 @@ fn boot_initial_session(
 
     registers.t8140_axi_transition_workaround()?;
     dev_info!(pdev.as_ref(), "G17P session: AXI transition configured\n");
-    let mut manager = None;
     let cpus = g17_lifecycle::StartedCpuPair::start_staged(gfx, gfx1, || {
         dev_info!(pdev.as_ref(), "G17P session: GFX processor started\n");
         Pin::new(&mut gfx_rtkit).boot()?;
         dev_info!(pdev.as_ref(), "G17P session: GFX RTKit handshake complete\n");
-        let root_snapshot = uat
-            .as_ref()
-            .ok_or(EIO)?
-            .prepare_t8140_firmware_high_roots()?;
-
-        let built = g17_manager::G17PManagerConstruction::new_with_uat(
-            drm,
-            soc,
-            g17_manager::T8140_G17P_PLATFORM_CONFIG,
-            num_clusters,
-            uat.take().ok_or(EIO)?,
-        )?;
-        built
-            .uat()
-            .confirm_t8140_primary_high_root(root_snapshot)?;
-        let gfx_init = g17_rtkit::encode_initdata_doorbell(
-            built.handoff().primary.instance.root,
-        )
-        .map_err(|_| EINVAL)?;
-        registers.t8140_pre_initdata_clear()?;
-        Pin::new(&mut gfx_rtkit).start_endpoint(g17_rtkit::ENDPOINT_GFX_MESSAGES)?;
-        Pin::new(&mut gfx_rtkit).start_endpoint(g17_rtkit::ENDPOINT_GFX_INTERRUPTS)?;
-        Pin::new(&mut gfx_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_MESSAGES, gfx_init)?;
-        dev_info!(pdev.as_ref(), "G17P session: primary initdata sent\n");
-        wait_initdata_ack(&gfx_state)?;
-        dev_info!(pdev.as_ref(), "G17P session: primary initdata ACK received\n");
-        manager = Some(built);
         Ok(())
     })?;
-
-    let mut manager = manager.ok_or(EIO)?;
     dev_info!(pdev.as_ref(), "G17P session: GFX1 processor started\n");
     Pin::new(&mut gfx1_rtkit).boot()?;
     dev_info!(pdev.as_ref(), "G17P session: GFX1 RTKit handshake complete\n");
+
+    let root_snapshot = uat
+        .as_ref()
+        .ok_or(EIO)?
+        .prepare_t8140_firmware_high_roots()?;
+    let mut manager = g17_manager::G17PManagerConstruction::new_with_uat(
+        drm,
+        soc,
+        g17_manager::T8140_G17P_PLATFORM_CONFIG,
+        num_clusters,
+        uat.take().ok_or(EIO)?,
+    )?;
+    manager
+        .uat()
+        .confirm_t8140_primary_high_root(root_snapshot)?;
     manager.uat().mirror_t8140_secondary_high_root()?;
+    registers.t8140_pre_initdata_clear()?;
+
+    let handoff = manager.handoff();
+    let gfx_init =
+        g17_rtkit::encode_initdata_doorbell(handoff.primary.instance.root).map_err(|_| EINVAL)?;
+    let gfx1_init = g17_rtkit::encode_initdata_doorbell(handoff.secondary.instance.root)
+        .map_err(|_| EINVAL)?;
+    Pin::new(&mut gfx_rtkit).start_endpoint(g17_rtkit::ENDPOINT_GFX_MESSAGES)?;
+    Pin::new(&mut gfx_rtkit).start_endpoint(g17_rtkit::ENDPOINT_GFX_INTERRUPTS)?;
     Pin::new(&mut gfx1_rtkit).start_endpoint(g17_rtkit::ENDPOINT_GFX_MESSAGES)?;
     Pin::new(&mut gfx1_rtkit).start_endpoint(g17_rtkit::ENDPOINT_GFX_INTERRUPTS)?;
-    let gfx1_init = g17_rtkit::encode_initdata_doorbell(
-        manager.handoff().secondary.instance.root,
-    )
-    .map_err(|_| EINVAL)?;
+    Pin::new(&mut gfx_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_MESSAGES, gfx_init)?;
     Pin::new(&mut gfx1_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_MESSAGES, gfx1_init)?;
-    dev_info!(pdev.as_ref(), "G17P session: secondary initdata sent\n");
+    dev_info!(
+        pdev.as_ref(),
+        "G17P session: primary and secondary initdata published\n"
+    );
+    wait_initdata_ack(&gfx_state)?;
+    dev_info!(pdev.as_ref(), "G17P session: primary initdata ACK received\n");
     wait_initdata_ack(&gfx1_state)?;
     dev_info!(pdev.as_ref(), "G17P session: secondary initdata ACK received\n");
 
