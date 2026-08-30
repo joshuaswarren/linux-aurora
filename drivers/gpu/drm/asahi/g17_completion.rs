@@ -9,7 +9,10 @@
 //! used by m1n1 for fault, flag, timeout, growth, and channel errors. Channel
 //! 14 has a distinct five-record sequence captured repeatedly on J700; its
 //! fields stay structural here. The SKSM decoder follows the A18 Pro firmware
-//! bit extraction and the compute channel's completion selector 2. Queue
+//! bit extraction. Normal direct CL drains descriptor ordinal 0 on D93AP IRQ
+//! bit 21 even though its queue configuration carries completion selector 2.
+//! The ordinary EP0x20 type-1 event ring then signals the correlated stamp.
+//! Queue
 //! ownership follows the m1n1 hardware result: read reaching a published
 //! prefix means accepted, done reaching it means firmware retired the queue
 //! entries, and physical reuse requires done/read/write equality. Render
@@ -23,6 +26,16 @@ pub(crate) const REPORT_CHANNEL_EVENT: u8 = 13;
 pub(crate) const REPORT_CHANNEL_TRACE: u8 = 14;
 pub(crate) const G17P_COMPUTE_COMPLETION_SELECTOR: u8 = 2;
 pub(crate) const KSM_COMPLETION_ENTRY_SIZE: usize = 0x40;
+pub(crate) const D93AP_G17P_COMPLETION_IRQ: u32 = 1001;
+pub(crate) const G17P_NORMAL_CL_COMPLETION_IRQ_BIT: u8 = 21;
+pub(crate) const G17P_NORMAL_CL_COMPLETION_ORDINAL: u8 = 0;
+pub(crate) const G17P_NORMAL_CL_COMPLETION_CAPACITY: u32 = 0x800;
+pub(crate) const G17P_KSM_COMPLETION_NOTIFY_BASE: u32 = 0x21168;
+pub(crate) const G17P_KSM_COMPLETION_ACK_BASE: u32 = 0x21188;
+pub(crate) const G17P_FIRMWARE_EVENT_ENDPOINT: u8 = 0x20;
+pub(crate) const G17P_FIRMWARE_EVENT_MESSAGE: u64 = 0x0042_0000_0000_0000;
+pub(crate) const G17P_FIRMWARE_EVENT_ENTRY_SIZE: usize = 0x48;
+pub(crate) const G17P_FIRMWARE_EVENT_CAPACITY: u32 = 0x100;
 
 const REPORT_CURSOR_MASK: u32 = 0xff;
 const KSM_TIMESTAMP_MASK: u64 = 0x00ff_ffff_ffff;
@@ -43,6 +56,18 @@ pub(crate) enum CompletionDecodeError {
     QueueCounterOrder,
     QueueCounterRegression,
     PublishedPrefixBeyondWrite,
+    CompletionIrqSource,
+    CompletionOrdinal,
+    CompletionNotificationCount,
+    CompletionQueueId,
+    CompletionTimestamp,
+    CompletionTimestampOrder,
+    FirmwareEventType,
+    FirmwareEventDiagnosticCount,
+    FirmwareEventStampIndex,
+    FirmwareEventStampMissing,
+    CompletionOutstanding,
+    CompletionRouteUnavailable,
 }
 
 fn get_u16(raw: &[u8], offset: usize) -> u16 {
@@ -368,6 +393,224 @@ impl KsmCompletionCursor {
             processed: (self.processed + 1) % self.capacity,
         })
     }
+}
+
+/// Exact D93AP normal-CL completion ingress and its still-closed Linux edges.
+/// Firmware tests source bit 21 at `0xfffffc00000235c0`, drains the runtime
+/// descriptor array at `+0x2614` in order 1,3,0 through
+/// `0xfffffc000000d224`, and publishes type-1 stamp events through
+/// `0xfffffc0000020e38`. These values are KEXT_PROVEN; the three false fields
+/// are Linux ownership facts and keep the live executor closed.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PNormalClCompletionRoute {
+    pub(crate) physical_irq: u32,
+    pub(crate) source_bit: u8,
+    pub(crate) descriptor_ordinal: u8,
+    pub(crate) firmware_event_endpoint: u8,
+    pub(crate) firmware_event_message: u64,
+    pub(crate) physical_irq_registered: bool,
+    pub(crate) firmware_event_ring_mapped: bool,
+    pub(crate) mmio_ack_writer_available: bool,
+}
+
+pub(crate) const G17P_NORMAL_CL_COMPLETION_ROUTE: G17PNormalClCompletionRoute =
+    G17PNormalClCompletionRoute {
+        physical_irq: D93AP_G17P_COMPLETION_IRQ,
+        source_bit: G17P_NORMAL_CL_COMPLETION_IRQ_BIT,
+        descriptor_ordinal: G17P_NORMAL_CL_COMPLETION_ORDINAL,
+        firmware_event_endpoint: G17P_FIRMWARE_EVENT_ENDPOINT,
+        firmware_event_message: G17P_FIRMWARE_EVENT_MESSAGE,
+        physical_irq_registered: false,
+        firmware_event_ring_mapped: false,
+        mmio_ack_writer_available: false,
+    };
+
+pub(crate) const fn require_g17p_normal_cl_completion_route(
+    route: G17PNormalClCompletionRoute,
+) -> Result<(), CompletionDecodeError> {
+    if route.physical_irq == D93AP_G17P_COMPLETION_IRQ
+        && route.source_bit == G17P_NORMAL_CL_COMPLETION_IRQ_BIT
+        && route.descriptor_ordinal == G17P_NORMAL_CL_COMPLETION_ORDINAL
+        && route.firmware_event_endpoint == G17P_FIRMWARE_EVENT_ENDPOINT
+        && route.firmware_event_message == G17P_FIRMWARE_EVENT_MESSAGE
+        && route.physical_irq_registered
+        && route.firmware_event_ring_mapped
+        && route.mmio_ack_writer_available
+    {
+        Ok(())
+    } else {
+        Err(CompletionDecodeError::CompletionRouteUnavailable)
+    }
+}
+
+/// One decoded notification for a present completion descriptor.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PKsmCompletionNotification {
+    pub(crate) ordinal: u8,
+    pub(crate) notification_offset: u32,
+    pub(crate) acknowledgement_offset: u32,
+    pub(crate) entry_count: u32,
+}
+
+pub(crate) const fn decode_g17p_normal_cl_notification(
+    irq_sources: u64,
+    ordinal: u8,
+    notification_word: u32,
+) -> Result<G17PKsmCompletionNotification, CompletionDecodeError> {
+    if irq_sources & (1u64 << G17P_NORMAL_CL_COMPLETION_IRQ_BIT) == 0 {
+        return Err(CompletionDecodeError::CompletionIrqSource);
+    }
+    if ordinal != G17P_NORMAL_CL_COMPLETION_ORDINAL {
+        return Err(CompletionDecodeError::CompletionOrdinal);
+    }
+    let entry_count = if notification_word < 0x1000 {
+        0
+    } else {
+        notification_word >> 16
+    };
+    Ok(G17PKsmCompletionNotification {
+        ordinal,
+        notification_offset: G17P_KSM_COMPLETION_NOTIFY_BASE + ordinal as u32 * 8,
+        acknowledgement_offset: G17P_KSM_COMPLETION_ACK_BASE + ordinal as u32 * 8,
+        entry_count,
+    })
+}
+
+/// Firmware event type 1, delivered through the ordinary EP0x20 event ring.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PFirmwareStampEvent {
+    pub(crate) masks: [u64; 2],
+    pub(crate) diagnostic_pair_count: u16,
+}
+
+impl G17PFirmwareStampEvent {
+    pub(crate) const fn signals(self, stamp_index: u8) -> bool {
+        if stamp_index >= 128 {
+            return false;
+        }
+        let word = stamp_index as usize / 64;
+        let bit = stamp_index as usize % 64;
+        self.masks[word] & (1u64 << bit) != 0
+    }
+}
+
+pub(crate) fn decode_g17p_firmware_stamp_event(
+    raw: &[u8],
+) -> Result<G17PFirmwareStampEvent, CompletionDecodeError> {
+    if raw.len() != G17P_FIRMWARE_EVENT_ENTRY_SIZE {
+        return Err(CompletionDecodeError::RecordSize);
+    }
+    if get_u32(raw, 0x00) != 1 {
+        return Err(CompletionDecodeError::FirmwareEventType);
+    }
+    let diagnostic_pair_count = get_u16(raw, 0x14);
+    if diagnostic_pair_count >= 6 {
+        return Err(CompletionDecodeError::FirmwareEventDiagnosticCount);
+    }
+    Ok(G17PFirmwareStampEvent {
+        masks: [get_u64(raw, 0x04), get_u64(raw, 0x0c)],
+        diagnostic_pair_count,
+    })
+}
+
+/// Firmware's per-QID timestamp ordering state.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PCompletionQidState {
+    pub(crate) valid: bool,
+    pub(crate) last_completed_timestamp: u64,
+    pub(crate) dependency_timestamp: u64,
+}
+
+pub(crate) const fn advance_g17p_completion_qid_state(
+    state: G17PCompletionQidState,
+    timestamp: u64,
+) -> Result<G17PCompletionQidState, CompletionDecodeError> {
+    if timestamp & !KSM_TIMESTAMP_MASK != 0 {
+        return Err(CompletionDecodeError::CompletionTimestamp);
+    }
+    if state.valid
+        && timestamp.wrapping_sub(state.last_completed_timestamp) & KSM_TIMESTAMP_MASK != 1
+    {
+        return Err(CompletionDecodeError::CompletionTimestampOrder);
+    }
+    Ok(G17PCompletionQidState {
+        valid: true,
+        last_completed_timestamp: timestamp,
+        dependency_timestamp: state.dependency_timestamp,
+    })
+}
+
+/// Host-owned state required to validate one first normal-CL completion.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PNormalClCompletionState {
+    pub(crate) cursor: KsmCompletionCursor,
+    pub(crate) qid_state: G17PCompletionQidState,
+    pub(crate) queue_id: u8,
+    pub(crate) expected_timestamp: u64,
+    pub(crate) expected_stamp_index: u8,
+    pub(crate) outstanding: u32,
+    pub(crate) descriptor_generation: u32,
+}
+
+/// A fully correlated transaction. Only this type carries an outstanding
+/// decrement to the manager boundary.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct PreparedG17PNormalClCompletion {
+    pub(crate) entry: G17pKsmCompletionEntry,
+    pub(crate) notification: G17PKsmCompletionNotification,
+    pub(crate) firmware_event: G17PFirmwareStampEvent,
+    pub(crate) cursor_after: KsmCompletionCursor,
+    pub(crate) qid_state_after: G17PCompletionQidState,
+    pub(crate) outstanding_after: u32,
+    pub(crate) completed_generation: u32,
+}
+
+pub(crate) fn prepare_g17p_first_normal_cl_completion(
+    state: G17PNormalClCompletionState,
+    irq_sources: u64,
+    notification_word: u32,
+    completion_entry: &[u8],
+    firmware_event: &[u8],
+) -> Result<PreparedG17PNormalClCompletion, CompletionDecodeError> {
+    let notification = decode_g17p_normal_cl_notification(
+        irq_sources,
+        G17P_NORMAL_CL_COMPLETION_ORDINAL,
+        notification_word,
+    )?;
+    if notification.entry_count != 1 {
+        return Err(CompletionDecodeError::CompletionNotificationCount);
+    }
+    if state.cursor.capacity != G17P_NORMAL_CL_COMPLETION_CAPACITY {
+        return Err(CompletionDecodeError::CompletionCapacity);
+    }
+    state.cursor.entry_offset()?;
+    let entry = decode_compute_completion_entry(completion_entry)?;
+    if entry.queue_id != state.queue_id {
+        return Err(CompletionDecodeError::CompletionQueueId);
+    }
+    if entry.timestamp != state.expected_timestamp {
+        return Err(CompletionDecodeError::CompletionTimestamp);
+    }
+    let qid_state_after = advance_g17p_completion_qid_state(state.qid_state, entry.timestamp)?;
+    if state.expected_stamp_index >= 128 {
+        return Err(CompletionDecodeError::FirmwareEventStampIndex);
+    }
+    let firmware_event = decode_g17p_firmware_stamp_event(firmware_event)?;
+    if !firmware_event.signals(state.expected_stamp_index) {
+        return Err(CompletionDecodeError::FirmwareEventStampMissing);
+    }
+    if state.descriptor_generation == 0 || state.descriptor_generation > state.outstanding {
+        return Err(CompletionDecodeError::CompletionOutstanding);
+    }
+    Ok(PreparedG17PNormalClCompletion {
+        entry,
+        notification,
+        firmware_event,
+        cursor_after: state.cursor.advance()?,
+        qid_state_after,
+        outstanding_after: state.outstanding - state.descriptor_generation,
+        completed_generation: state.descriptor_generation,
+    })
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -708,6 +951,137 @@ mod tests {
             }
             .advance(),
             Err(CompletionDecodeError::CompletionCapacity)
+        );
+    }
+
+    #[test]
+    fn normal_cl_completion_route_is_ordinal_zero_and_live_closed() {
+        let route = G17P_NORMAL_CL_COMPLETION_ROUTE;
+        assert_eq!(route.physical_irq, 1001);
+        assert_eq!(route.source_bit, 21);
+        assert_eq!(route.descriptor_ordinal, 0);
+        assert_eq!(route.firmware_event_endpoint, 0x20);
+        assert_eq!(route.firmware_event_message, 0x0042_0000_0000_0000);
+        assert_eq!(G17P_FIRMWARE_EVENT_ENTRY_SIZE, 0x48);
+        assert_eq!(G17P_FIRMWARE_EVENT_CAPACITY, 0x100);
+        assert_eq!(G17P_COMPUTE_COMPLETION_SELECTOR, 2);
+        assert_eq!(
+            require_g17p_normal_cl_completion_route(route),
+            Err(CompletionDecodeError::CompletionRouteUnavailable)
+        );
+        assert_eq!(
+            decode_g17p_normal_cl_notification(1 << 21, 2, 1 << 16),
+            Err(CompletionDecodeError::CompletionOrdinal)
+        );
+        assert_eq!(
+            decode_g17p_normal_cl_notification(0, 0, 1 << 16),
+            Err(CompletionDecodeError::CompletionIrqSource)
+        );
+        assert_eq!(
+            decode_g17p_normal_cl_notification(1 << 21, 0, 0x800).unwrap(),
+            G17PKsmCompletionNotification {
+                ordinal: 0,
+                notification_offset: 0x21168,
+                acknowledgement_offset: 0x21188,
+                entry_count: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn first_normal_cl_completion_requires_stamp_before_outstanding_subtraction() {
+        let completion = hex64(b"6008785634129a0044443333222211118888777766665555ccccbbbbaaaa9999ab89674523010000bc9a785634020000018000c020fcffff000020c020fcffff");
+        let mut event = [0u8; G17P_FIRMWARE_EVENT_ENTRY_SIZE];
+        event[0..4].copy_from_slice(&1u32.to_le_bytes());
+        event[4..12].copy_from_slice(&(1u64 << 7).to_le_bytes());
+        let state = G17PNormalClCompletionState {
+            cursor: KsmCompletionCursor {
+                capacity: 0x800,
+                processed: 0,
+            },
+            qid_state: G17PCompletionQidState {
+                valid: false,
+                last_completed_timestamp: 0,
+                dependency_timestamp: 0,
+            },
+            queue_id: 4,
+            expected_timestamp: 0x12_3456_789a,
+            expected_stamp_index: 7,
+            outstanding: 1,
+            descriptor_generation: 1,
+        };
+        let prepared = prepare_g17p_first_normal_cl_completion(
+            state,
+            1 << 21,
+            1 << 16,
+            &completion,
+            &event,
+        )
+        .unwrap();
+        assert_eq!(prepared.entry.completion_selector, 2);
+        assert_eq!(prepared.notification.ordinal, 0);
+        assert_eq!(prepared.notification.entry_count, 1);
+        assert_eq!(prepared.notification.acknowledgement_offset, 0x21188);
+        assert_eq!(prepared.cursor_after.processed, 1);
+        assert_eq!(prepared.qid_state_after.last_completed_timestamp, state.expected_timestamp);
+        assert_eq!(prepared.completed_generation, 1);
+        assert_eq!(prepared.outstanding_after, 0);
+
+        event[4..12].fill(0);
+        let mut outstanding_subtractions = 0;
+        let gated: Result<(), CompletionDecodeError> = (|| {
+            let prepared = prepare_g17p_first_normal_cl_completion(
+                state,
+                1 << 21,
+                1 << 16,
+                &completion,
+                &event,
+            )?;
+            outstanding_subtractions += prepared.completed_generation;
+            Ok(())
+        })();
+        assert_eq!(gated, Err(CompletionDecodeError::FirmwareEventStampMissing));
+        assert_eq!(outstanding_subtractions, 0);
+    }
+
+    #[test]
+    fn normal_cl_completion_rejects_bad_sequence_event_and_generation() {
+        assert_eq!(
+            advance_g17p_completion_qid_state(
+                G17PCompletionQidState {
+                    valid: true,
+                    last_completed_timestamp: 7,
+                    dependency_timestamp: 3,
+                },
+                9,
+            ),
+            Err(CompletionDecodeError::CompletionTimestampOrder)
+        );
+        assert_eq!(
+            advance_g17p_completion_qid_state(
+                G17PCompletionQidState {
+                    valid: true,
+                    last_completed_timestamp: KSM_TIMESTAMP_MASK,
+                    dependency_timestamp: 3,
+                },
+                0,
+            )
+            .unwrap()
+            .last_completed_timestamp,
+            0
+        );
+        let mut event = [0u8; G17P_FIRMWARE_EVENT_ENTRY_SIZE];
+        event[0..4].copy_from_slice(&1u32.to_le_bytes());
+        event[0x14..0x16].copy_from_slice(&6u16.to_le_bytes());
+        assert_eq!(
+            decode_g17p_firmware_stamp_event(&event),
+            Err(CompletionDecodeError::FirmwareEventDiagnosticCount)
+        );
+        event[0..4].copy_from_slice(&2u32.to_le_bytes());
+        event[0x14..0x16].fill(0);
+        assert_eq!(
+            decode_g17p_firmware_stamp_event(&event),
+            Err(CompletionDecodeError::FirmwareEventType)
         );
     }
 

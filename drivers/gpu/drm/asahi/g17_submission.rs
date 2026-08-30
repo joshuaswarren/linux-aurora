@@ -3796,6 +3796,10 @@ pub(crate) struct SubmissionLiveGaps {
     /// firmware event rings, but an on-device SKSM completion round trip has
     /// not proven that this ingress is sufficient for Linux completion.
     pub(crate) completion_irq_route_proven: bool,
+    /// Ordinal-0 notification, entry, QID/timestamp, and EP0x20 stamp
+    /// correlation is implemented as a pure transaction before outstanding
+    /// subtraction. Physical IRQ/event-ring/ACK ownership remains separate.
+    pub(crate) normal_cl_completion_consumer_implemented: bool,
 }
 
 impl SubmissionLiveGaps {
@@ -3809,6 +3813,7 @@ impl SubmissionLiveGaps {
     pub(crate) const fn native_sksm_proven(&self) -> bool {
         self.sksm_resource0_ordered_write_implemented
             && self.sksm_add_kicks_round_trip_proven
+            && self.normal_cl_completion_consumer_implemented
             && self.completion_irq_route_proven
     }
 
@@ -3830,6 +3835,7 @@ pub(crate) const SUBMISSION_LIVE_GAPS: SubmissionLiveGaps = SubmissionLiveGaps {
     partial_graphics_round_trip_proven: true,
     sksm_add_kicks_round_trip_proven: false,
     completion_irq_route_proven: false,
+    normal_cl_completion_consumer_implemented: true,
 };
 
 #[cfg(test)]
@@ -6965,6 +6971,7 @@ mod tests {
         assert!(SUBMISSION_LIVE_GAPS.partial_graphics_round_trip_proven);
         assert!(!SUBMISSION_LIVE_GAPS.sksm_add_kicks_round_trip_proven);
         assert!(!SUBMISSION_LIVE_GAPS.completion_irq_route_proven);
+        assert!(SUBMISSION_LIVE_GAPS.normal_cl_completion_consumer_implemented);
 
         let classic = SubmissionLiveGaps {
             sksm_resource0_ordered_write_implemented: true,
@@ -6973,6 +6980,7 @@ mod tests {
             partial_graphics_round_trip_proven: true,
             sksm_add_kicks_round_trip_proven: false,
             completion_irq_route_proven: true,
+            normal_cl_completion_consumer_implemented: true,
         };
         assert!(classic.classic_graphics_proven());
         assert!(!classic.native_sksm_proven());
@@ -6986,9 +6994,15 @@ mod tests {
             partial_graphics_round_trip_proven: false,
             sksm_add_kicks_round_trip_proven: true,
             completion_irq_route_proven: true,
+            normal_cl_completion_consumer_implemented: true,
         };
         assert!(!native.classic_graphics_proven());
         assert!(native.native_sksm_proven());
         assert!(native.all_proven());
+        assert!(!SubmissionLiveGaps {
+            normal_cl_completion_consumer_implemented: false,
+            ..native
+        }
+        .native_sksm_proven());
     }
 }
