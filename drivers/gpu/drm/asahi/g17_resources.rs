@@ -113,6 +113,10 @@ const G17P_CONTROL_OPERAND_BUFFER_SIZE: usize =
 const G17P_CONTROL_OPERAND_BUFFER_STRIDE: usize =
     g17_initdata::CONTROL_OPERAND_BUFFER_STRIDE as usize;
 pub(crate) const G17P_DATA_MASTER_CHANNEL_COUNT: usize = 12;
+const G17P_COMPUTE_READINESS_CLASS3_PRIMARY_INDEX_OFFSET: usize =
+    (g17_initdata::COMPUTE_READINESS_CLASS3_SUPPORT_ADDRESS
+        - g17_submission::G17P_PARTIAL_OPENING_PRIMARY_INDEX_FIRMWARE_GPU_VA)
+        as usize;
 const G17P_BOOTSTRAP_TA_DESCRIPTOR_LOW_VA: u64 = 0x70_0000_0000;
 const G17P_BOOTSTRAP_3D_DESCRIPTOR_LOW_VA: u64 = 0x70_0009_8000;
 const G17P_BOOTSTRAP_DESCRIPTOR_ZERO_A_VA: u64 = 0xffff_fc20_001c_8000;
@@ -3280,9 +3284,9 @@ struct G17MappedResources {
     compute_runtime_buffer_aliases: KVec<mmu::KernelMapping>,
     compute_readiness_class1_support: MappedObject,
     compute_readiness_class1_state: MappedObject,
-    compute_readiness_class3_support: MappedObject,
     compute_readiness_class3_state: MappedObject,
     compute_readiness_context1: Option<G17PComputeReadinessMappings>,
+    compute_readiness_class3_support_active: bool,
     register_windows: KVec<mmu::KernelMapping>,
 }
 
@@ -3613,6 +3617,12 @@ impl G17ResourceOwner {
         )?;
         let compute_runtime_table_alias = None;
         let compute_runtime_buffer_aliases = KVec::with_capacity(20, GFP_KERNEL)?;
+        // Native final-26.6 reuses pair-1 secondary-index, flag, and
+        // fragment-status objects at these three addresses. The retained
+        // Linux opening graph has no fixed owners for those pair-1 objects,
+        // so these are their sole mappings here. In contrast, class-3 support
+        // is inside the retained pair-0 primary-index owner and must not be
+        // allocated a second time.
         let mut compute_readiness_class1_support = map_fixed_wc_object(
             dev,
             address_space.uat.kernel_vm(),
@@ -3629,14 +3639,6 @@ impl G17ResourceOwner {
             g17_initdata::COMPUTE_READINESS_PAGE_SIZE,
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
-        let mut compute_readiness_class3_support = map_fixed_wc_object(
-            dev,
-            address_space.uat.kernel_vm(),
-            "compute readiness class-3 support",
-            g17_initdata::COMPUTE_READINESS_CLASS3_SUPPORT_ADDRESS,
-            g17_initdata::COMPUTE_READINESS_PAGE_SIZE,
-            mmu::PROT_GPU_FW_SHARED_RW,
-        )?;
         let mut compute_readiness_class3_state = map_fixed_wc_object(
             dev,
             address_space.uat.kernel_vm(),
@@ -3646,6 +3648,7 @@ impl G17ResourceOwner {
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
         let compute_readiness_context1 = None;
+        let compute_readiness_class3_support_active = false;
         compute_runtime_support.with_bytes_mut(|bytes| {
             g17_initdata::encode_compute_runtime_class1_support(bytes).map_err(|_| EINVAL)
         })?;
@@ -3662,9 +3665,6 @@ impl G17ResourceOwner {
         })?;
         compute_readiness_class1_state.with_bytes_mut(|bytes| {
             g17_initdata::encode_compute_readiness_state(bytes).map_err(|_| EINVAL)
-        })?;
-        compute_readiness_class3_support.with_bytes_mut(|bytes| {
-            g17_initdata::encode_compute_readiness_class3_support(bytes).map_err(|_| EINVAL)
         })?;
         compute_readiness_class3_state.with_bytes_mut(|bytes| {
             g17_initdata::encode_compute_readiness_state(bytes).map_err(|_| EINVAL)
@@ -3856,10 +3856,6 @@ impl G17ResourceOwner {
                 &compute_readiness_class1_state,
             ),
             (
-                "compute readiness class-3 support",
-                &compute_readiness_class3_support,
-            ),
-            (
                 "compute readiness context-2 state",
                 &compute_readiness_class3_state,
             ),
@@ -4024,9 +4020,9 @@ impl G17ResourceOwner {
                 compute_runtime_buffer_aliases,
                 compute_readiness_class1_support,
                 compute_readiness_class1_state,
-                compute_readiness_class3_support,
                 compute_readiness_class3_state,
                 compute_readiness_context1,
+                compute_readiness_class3_support_active,
                 register_windows,
             },
             address_space,
@@ -4095,14 +4091,26 @@ impl G17ResourceOwner {
     }
 
     fn validate_compute_readiness_objects(&self) -> Result {
+        let primary_index_start = self.resources.partial_primary_index.iova();
+        let primary_index_end = primary_index_start
+            .checked_add(self.resources.partial_primary_index.logical_size as u64)
+            .ok_or(EINVAL)?;
+        let class3_end = g17_initdata::COMPUTE_READINESS_CLASS3_SUPPORT_ADDRESS
+            .checked_add(g17_initdata::COMPUTE_READINESS_PAGE_SIZE as u64)
+            .ok_or(EINVAL)?;
         if self.resources.compute_readiness_class1_support.iova()
             != g17_initdata::COMPUTE_READINESS_CLASS1_SUPPORT_ADDRESS
             || self.resources.compute_readiness_class1_state.iova()
                 != g17_initdata::COMPUTE_READINESS_CLASS1_STATE_ADDRESS
-            || self.resources.compute_readiness_class3_support.iova()
-                != g17_initdata::COMPUTE_READINESS_CLASS3_SUPPORT_ADDRESS
             || self.resources.compute_readiness_class3_state.iova()
                 != g17_initdata::COMPUTE_READINESS_CLASS3_STATE_ADDRESS
+            || primary_index_start
+                != g17_submission::G17P_PARTIAL_OPENING_PRIMARY_INDEX_FIRMWARE_GPU_VA
+            || g17_initdata::COMPUTE_READINESS_CLASS3_SUPPORT_ADDRESS < primary_index_start
+            || class3_end > primary_index_end
+            || G17P_COMPUTE_READINESS_CLASS3_PRIMARY_INDEX_OFFSET
+                % g17_initdata::COMPUTE_READINESS_PAGE_SIZE
+                != 0
         {
             return Err(EINVAL);
         }
@@ -4110,6 +4118,10 @@ impl G17ResourceOwner {
     }
 
     /// Map the exact operand closure into context 1 before staging the suffix.
+    /// The production caller is reachable only after
+    /// `wait_compute_bootstrap_render_retirement()` has retired both inner
+    /// queues and outer slots, dropped the retained render graph, and restored
+    /// the kernel context. Preserve the primary-index contents until then.
     pub(crate) fn prepare_compute_readiness_context1(&mut self) -> Result {
         if !self.control_counters()?.opening_retired() {
             return Err(EINVAL);
@@ -4119,6 +4131,28 @@ impl G17ResourceOwner {
             g17_initdata::encode_partial_opening_operand_table_post_control(bytes)
                 .map_err(|_| EINVAL)
         })?;
+        if !self.resources.compute_readiness_class3_support_active {
+            let start = G17P_COMPUTE_READINESS_CLASS3_PRIMARY_INDEX_OFFSET;
+            let end = start
+                .checked_add(g17_initdata::COMPUTE_READINESS_PAGE_SIZE)
+                .ok_or(EINVAL)?;
+            self.resources
+                .partial_primary_index
+                .with_bytes_mut(|bytes| {
+                    g17_initdata::encode_compute_readiness_class3_support(
+                        bytes.get_mut(start..end).ok_or(EINVAL)?,
+                    )
+                    .map_err(|_| EINVAL)
+                })?;
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            self.resources.compute_readiness_class3_support_active = true;
+            dev_info!(
+                self.dev.as_ref(),
+                "G17P resources: retired primary-index page {:#x}+{:#x} now owns class-3 readiness support\n",
+                self.resources.partial_primary_index.iova(),
+                start,
+            );
+        }
         if self.resources.compute_readiness_context1.is_none() {
             let vm = self.address_space.uat.kernel_lower_vm();
             self.resources.compute_readiness_context1 = Some(map_compute_readiness_mappings(
@@ -4145,6 +4179,9 @@ impl G17ResourceOwner {
             return Err(EINVAL);
         }
         self.validate_compute_readiness_objects()?;
+        if !self.resources.compute_readiness_class3_support_active {
+            return Err(EINVAL);
+        }
         self.resources.control_operand_table.with_bytes_mut(|bytes| {
             g17_initdata::encode_partial_opening_operand_table_post_control(bytes)
                 .map_err(|_| EINVAL)
@@ -4345,6 +4382,9 @@ impl G17ResourceOwner {
         &mut self,
         activate_context2: impl FnOnce() -> Result,
     ) -> Result<u32> {
+        if !self.resources.compute_readiness_class3_support_active {
+            return Err(EINVAL);
+        }
         let before = self.control_counters()?;
         let producer = g17_initdata::CONTROL_OPENING_PRIMARY_PRODUCER;
         if before.primary != [producer; 3]
@@ -4513,6 +4553,7 @@ impl G17ResourceOwner {
         self.resources.compute_runtime_table_alias = None;
         self.resources.compute_runtime_buffer_aliases.clear();
         self.resources.compute_readiness_context1 = None;
+        self.resources.compute_readiness_class3_support_active = false;
         self.address_space
             .uat
             .restore_t8140_bootstrap_roots_after_processor_stop()?;
@@ -4686,12 +4727,6 @@ impl G17ResourceOwner {
             .compute_readiness_class1_state
             .with_bytes_mut(|bytes| {
                 g17_initdata::encode_compute_readiness_state(bytes).map_err(|_| EINVAL)
-            })?;
-        self.resources
-            .compute_readiness_class3_support
-            .with_bytes_mut(|bytes| {
-                g17_initdata::encode_compute_readiness_class3_support(bytes)
-                    .map_err(|_| EINVAL)
             })?;
         self.resources
             .compute_readiness_class3_state
@@ -5473,6 +5508,53 @@ mod tests {
         );
         assert_eq!(g17_initdata::T8140_REGISTER_WINDOWS[17].slot, 41);
         assert_eq!(g17_initdata::T8140_REGISTER_FLAG_ONLY_SLOTS.len(), 17);
+    }
+
+    #[test]
+    fn class3_readiness_reuses_only_the_retired_primary_index_page() {
+        let owner = g17_submission::G17P_PARTIAL_OPENING_PRIMARY_INDEX_FIRMWARE_GPU_VA;
+        let owner_size = g17_submission::G17P_PARTIAL_OPENING_PRIMARY_INDEX_SIZE;
+        let class3 = g17_initdata::COMPUTE_READINESS_CLASS3_SUPPORT_ADDRESS;
+        assert_eq!(G17P_COMPUTE_READINESS_CLASS3_PRIMARY_INDEX_OFFSET, 0x8000);
+        assert_eq!(class3, owner + 0x8000);
+        assert!(G17P_COMPUTE_READINESS_CLASS3_PRIMARY_INDEX_OFFSET
+            + g17_initdata::COMPUTE_READINESS_PAGE_SIZE
+            <= owner_size);
+
+        let mut storage = vec![0u8; owner_size];
+        g17_submission::apply_g17p_partial_opening_primary_index_page(
+            &mut storage[..g17_submission::G17P_PARTIAL_OPENING_PAGE_SIZE],
+        )
+        .unwrap();
+        let opening_page = storage[..g17_submission::G17P_PARTIAL_OPENING_PAGE_SIZE].to_vec();
+        let start = G17P_COMPUTE_READINESS_CLASS3_PRIMARY_INDEX_OFFSET;
+        let end = start + g17_initdata::COMPUTE_READINESS_PAGE_SIZE;
+        g17_initdata::encode_compute_readiness_class3_support(&mut storage[start..end]).unwrap();
+        let mut expected = vec![0u8; g17_initdata::COMPUTE_READINESS_PAGE_SIZE];
+        g17_initdata::encode_compute_readiness_class3_support(&mut expected).unwrap();
+        assert_eq!(&storage[start..end], expected);
+        assert_eq!(
+            &storage[..g17_submission::G17P_PARTIAL_OPENING_PAGE_SIZE],
+            opening_page,
+        );
+
+        let owner_end = owner + owner_size as u64;
+        for (address, size) in [
+            (
+                g17_initdata::COMPUTE_READINESS_CLASS1_SUPPORT_ADDRESS,
+                g17_initdata::COMPUTE_READINESS_PAGE_SIZE as u64,
+            ),
+            (
+                g17_initdata::COMPUTE_READINESS_CLASS1_STATE_ADDRESS,
+                g17_initdata::COMPUTE_READINESS_PAGE_SIZE as u64,
+            ),
+            (
+                g17_initdata::COMPUTE_READINESS_CLASS3_STATE_ADDRESS,
+                g17_initdata::COMPUTE_READINESS_PAGE_SIZE as u64,
+            ),
+        ] {
+            assert!(address >= owner_end || address + size <= owner);
+        }
     }
 
     #[test]
