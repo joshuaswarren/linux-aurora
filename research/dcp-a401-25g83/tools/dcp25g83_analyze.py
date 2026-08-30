@@ -155,6 +155,11 @@ def verify(image: Image) -> None:
         0x04026C7C: 0x9400003A,  # record the lower-mailbox RX entry
         0x04026CC8: 0xD63F091F,  # invoke route/filter before endpoint publish
         0x04026CF8: 0x97FFFC82,  # publish raw word to endpoint software queue
+        0x040342D0: 0xD374DF88,  # management consumer selects type bits 55:52
+        0x040343BC: 0xB9400A60,  # type-3 echo loads management endpoint number
+        0x040343C0: 0xD2E00801,  # construct type-4 response
+        0x040343C4: 0xB3407F81,  # preserve the request's low 32-bit cookie
+        0x040343CC: 0x97FFCADB,  # send the stateless type-4 echo response
         0x041B705C: 0x97F9EC9E,  # latch the EP37 link event
         0x040322E4: 0x39000409,  # event source pending byte = 1
         0x04031C6C: 0x39400788,  # workloop tests source pending byte
