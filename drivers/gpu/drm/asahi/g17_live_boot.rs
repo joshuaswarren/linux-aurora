@@ -31,6 +31,7 @@ use kernel::{
     bindings,
     device::Core,
     error::{from_err_ptr, to_result},
+    io::{Io, Mmio, MmioRaw},
     iosys_map::IoSysMapRef,
     platform,
     prelude::*,
@@ -146,6 +147,23 @@ impl G17PMailboxProvider {
         to_result(unsafe { bindings::apple_mbox_ascwrap_v6_stop_cpu(self.mbox) })
     }
 
+    fn a2i_control(&self) -> Result<u32> {
+        const A2I_CONTROL: usize = 0x110;
+        const CONTROL_WINDOW_SIZE: usize = A2I_CONTROL + core::mem::size_of::<u32>();
+
+        // SAFETY: the provider owns the live ASC mailbox mapping. The device
+        // link established by apple_mbox_get() keeps it valid, and this view
+        // is bounded to the standard read-only A2I control register.
+        let raw = MmioRaw::<CONTROL_WINDOW_SIZE>::new(
+            unsafe { (*self.mbox).regs as usize },
+            CONTROL_WINDOW_SIZE,
+        )?;
+        // SAFETY: `raw` covers the complete 32-bit control register read.
+        Ok(unsafe { Mmio::from_raw(&raw) }
+            .relaxed()
+            .read32(A2I_CONTROL))
+    }
+
 }
 
 // SAFETY: the provider mapping is device-link protected and the reader issues
@@ -153,6 +171,33 @@ impl G17PMailboxProvider {
 unsafe impl Send for G17PMailboxProvider {}
 // SAFETY: as above; concurrent snapshots do not change either FIFO.
 unsafe impl Sync for G17PMailboxProvider {}
+
+fn log_g17p_a2i_control(
+    dev: &kernel::device::Device,
+    mailbox: &G17PMailboxProvider,
+    checkpoint: &'static str,
+) {
+    match mailbox.a2i_control() {
+        Ok(control) => dev_info!(
+            dev,
+            "G17P A2I checkpoint={} raw={:#x} count={} empty={} full={} read={} write={} enabled={}\n",
+            checkpoint,
+            control,
+            (control >> 20) & 0xf,
+            (control >> 17) & 1,
+            (control >> 16) & 1,
+            (control >> 12) & 0xf,
+            (control >> 8) & 0xf,
+            control & 1,
+        ),
+        Err(error) => dev_err!(
+            dev,
+            "G17P A2I checkpoint={} read failed ({:?})\n",
+            checkpoint,
+            error,
+        ),
+    }
+}
 
 const fn g17p_rtkit_uat_address(dva: u64) -> u64 {
     dva & G17P_RTKIT_UAT_DVA_MASK
@@ -1410,6 +1455,11 @@ impl G17PLiveRuntime {
         let channel_path = notifications.is_some();
         if let Some(notifications) = notifications {
             if let Some(activation) = notifications.activation {
+                log_g17p_a2i_control(
+                    self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                    self.cpus.as_ref().ok_or(ENODEV)?.gfx(),
+                    "native-first-pre-0x0a",
+                );
                 dev_info!(
                     self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
                     "G17P compute: CL_2 published; sending priority-2 activation {:#x}\n",
@@ -1423,6 +1473,11 @@ impl G17PLiveRuntime {
                         Err(recovery_error) => Err(recovery_error),
                     };
                 }
+                log_g17p_a2i_control(
+                    self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                    self.cpus.as_ref().ok_or(ENODEV)?.gfx(),
+                    "native-first-post-0x0a-pre-0x10",
+                );
             }
             if let Some(direct_kick) = notifications.direct_kick {
                 fence(Ordering::SeqCst);
@@ -1439,6 +1494,11 @@ impl G17PLiveRuntime {
                         Err(recovery_error) => Err(recovery_error),
                     };
                 }
+                log_g17p_a2i_control(
+                    self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                    self.cpus.as_ref().ok_or(ENODEV)?.gfx(),
+                    "native-first-post-0x10",
+                );
             }
         }
 
@@ -1459,6 +1519,11 @@ impl G17PLiveRuntime {
             Ok(completion) => completion,
             Err(error) => {
                 if channel_path {
+                    log_g17p_a2i_control(
+                        self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                        self.cpus.as_ref().ok_or(ENODEV)?.gfx(),
+                        "native-first-timeout",
+                    );
                     let user_timestamps = owned_timestamps.with_cpu_bytes(|raw| {
                         Ok([
                             u64::from_le_bytes(raw[0..8].try_into().map_err(|_| ERANGE)?),
