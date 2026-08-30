@@ -165,8 +165,7 @@ pub(crate) enum SubmissionError {
     ComputeEventCounterOverflow,
     /// Required first-bind command publication facts are still unresolved.
     FirstBindCommandPublicationIncomplete,
-    /// G17P target-1 power needs an unmodeled running-state discriminator and
-    /// lower IOSlaveProcessor wake path.
+    /// G17P target-1 requires both retained CPU and booted RTKit owners.
     RunningClientPowerTransitionUnavailable,
     /// The middle QoS field is wider than the five bits copied by the host.
     KickQosClassOutOfRange,
@@ -368,19 +367,19 @@ pub(crate) const fn require_g17p_first_bind_direct_hardware_release(
     }
 }
 
-/// Native target-bound power transition required before TA/3D/CL submission.
+/// Native target-bound active state required before TA/3D/CL submission.
 ///
-/// Service 0x20 on the role-1 RTBuddy receives target 1. From native state 1
-/// this is a no-op; from state 2 it bypasses management power requests and
-/// performs the lower IOSlaveProcessor wake, completing after HELLO/rollcall.
+/// D93 role 1 is managed and non-standalone. Linux retains its started CPU,
+/// mailbox, and booted RTKit owners for the complete session, which is the
+/// native target-1 state. Submit performs no management power request.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct G17PRunningClientPowerContract {
     pub(crate) role_index: u8,
     pub(crate) service_id: u8,
     pub(crate) target: u8,
     pub(crate) management_request_used: bool,
-    pub(crate) state_discriminator_available: bool,
-    pub(crate) lower_wake_available: bool,
+    pub(crate) managed: bool,
+    pub(crate) standalone: bool,
 }
 
 pub(crate) const G17P_RUNNING_CLIENT_POWER_CONTRACT: G17PRunningClientPowerContract =
@@ -389,19 +388,23 @@ pub(crate) const G17P_RUNNING_CLIENT_POWER_CONTRACT: G17PRunningClientPowerContr
         service_id: 0x20,
         target: 1,
         management_request_used: false,
-        state_discriminator_available: false,
-        lower_wake_available: false,
+        managed: true,
+        standalone: false,
     };
 
 pub(crate) const fn require_g17p_running_client_power_transition(
     contract: G17PRunningClientPowerContract,
+    retained_cpu_owner: bool,
+    retained_rtkit_owner: bool,
 ) -> Result<(), SubmissionError> {
     if contract.role_index == 1
         && contract.service_id == 0x20
         && contract.target == 1
         && !contract.management_request_used
-        && contract.state_discriminator_available
-        && contract.lower_wake_available
+        && contract.managed
+        && !contract.standalone
+        && retained_cpu_owner
+        && retained_rtkit_owner
     {
         Ok(())
     } else {
@@ -3983,8 +3986,8 @@ mod tests {
         assert_eq!(contract.service_id, 0x20);
         assert_eq!(contract.target, 1);
         assert!(!contract.management_request_used);
-        assert!(!contract.state_discriminator_available);
-        assert!(!contract.lower_wake_available);
+        assert!(contract.managed);
+        assert!(!contract.standalone);
         assert_eq!(
             G17P_COMPUTE_POWER_LEASE_ORDER,
             [
@@ -4000,7 +4003,7 @@ mod tests {
         let mut sksm_mutations = 0;
         let mut mailbox_mutations = 0;
         let gated: Result<(), SubmissionError> = (|| {
-            require_g17p_running_client_power_transition(contract)?;
+            require_g17p_running_client_power_transition(contract, true, false)?;
             vm_bind_mutations += 1;
             readiness_mutations += 1;
             sksm_mutations += 1;
@@ -4015,6 +4018,10 @@ mod tests {
         assert_eq!(readiness_mutations, 0);
         assert_eq!(sksm_mutations, 0);
         assert_eq!(mailbox_mutations, 0);
+        assert_eq!(
+            require_g17p_running_client_power_transition(contract, true, true),
+            Ok(())
+        );
     }
 
     #[test]

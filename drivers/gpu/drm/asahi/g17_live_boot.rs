@@ -1239,17 +1239,6 @@ impl G17PLiveRuntime {
         if !self.accepting_submissions {
             return Err(ENOTSUPP);
         }
-        if g17_submission::require_g17p_running_client_power_transition(
-            g17_submission::G17P_RUNNING_CLIENT_POWER_CONTRACT,
-        )
-        .is_err()
-        {
-            dev_err!(
-                self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
-                "G17P compute power: target1 blocked before VM bind/readiness; RTBuddy state discriminator and lower wake unavailable\n"
-            );
-            return Err(ENOTSUPP);
-        }
         if self.is_crashed() || self.compute_binding.is_some() {
             g17_lifecycle::recover_persistent_runtime(self)?;
         }
@@ -1261,6 +1250,23 @@ impl G17PLiveRuntime {
         {
             g17_lifecycle::recover_persistent_runtime(self)?;
         }
+        if g17_submission::require_g17p_running_client_power_transition(
+            g17_submission::G17P_RUNNING_CLIENT_POWER_CONTRACT,
+            self.cpus.is_some(),
+            self.gfx1_rtkit.is_some(),
+        )
+        .is_err()
+        {
+            dev_err!(
+                self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                "G17P compute power: retained target1 CPU/RTKit owner missing before VM bind\n"
+            );
+            return Err(ENOTSUPP);
+        }
+        dev_info!(
+            self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+            "G17P compute power: retained GFX1 target1 owners active; no submit power wire\n"
+        );
         if owned_timestamps.size() < 16 {
             return Err(ERANGE);
         }
