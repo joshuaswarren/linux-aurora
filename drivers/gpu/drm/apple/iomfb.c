@@ -194,13 +194,13 @@ static int dcp25g83_d563_tail_index(const void *input, u32 input_size)
 	return -ENOENT;
 }
 
-static bool dcp25g83_oob_main_display_probe(struct apple_dcp *dcp, int tag,
-					    const struct apple_dcp_link_rpc_view *view)
+static bool dcp25g83_pre_ack_a412_barrier(struct apple_dcp *dcp, int tag,
+					  const struct apple_dcp_link_rpc_view *view)
 {
 	static const char property[] = "SupportRelbufInfoCb";
 
 	if (dcp->fw_compat != DCP_FIRMWARE_H17P || !dcp->adopted_session ||
-	    dcp->link_oob_main_display_probe_sent || tag != 102 ||
+	    dcp->link_pre_ack_main_display_barrier_sent || tag != 102 ||
 	    view->input_size != 0x44 || view->output_size)
 		return false;
 
@@ -573,7 +573,7 @@ static int dcp_link_push_context(struct apple_dcp *dcp,
 	if (call_tag == APPLE_DCP_H17P_CALL_IS_MAIN_DISPLAY && stream == 1 &&
 	    !remote)
 		dev_info(dcp->dev,
-			 "DCP25G83_EP37_OOB_A412_TX endpoint %#x word %#llx channel oobcmd stream 1 remote 0 new %u local base %#x offset %#x size %#x top %#x->%#x depth %u header %#x/%u/%u mailbox result %d expect reply %#x\n",
+			 "DCP25G83_EP37_PRE_ACK_A412_TX endpoint %#x word %#llx channel oobcmd stream 1 remote 0 new %u local base %#x offset %#x size %#x top %#x->%#x depth %u header %#x/%u/%u mailbox result %d expect reply %#x\n",
 			 APPLE_DCP_LINK_ENDPOINT, message, new_stream,
 			 layout.local_offset, offset, payload_size, old_top,
 			 next_top, depth, call_tag, in_len, out_len, ret, 0x642);
@@ -1060,8 +1060,17 @@ static void dcp_link_handle_callback(struct apple_dcp *dcp, u64 message)
 				 handled ? reply : 0);
 	}
 	if (handled) {
-		bool oob_probe = dcp25g83_oob_main_display_probe(dcp, tag,
-								 &view);
+		bool barrier = dcp25g83_pre_ack_a412_barrier(dcp, tag, &view);
+
+		if (barrier) {
+			dcp->link_pre_ack_main_display_barrier_sent = true;
+			dcp->link_pre_ack_main_display_barrier_pending = true;
+			dev_info(dcp->dev,
+				 "DCP25G83_EP37_PRE_ACK_A412_HOLD callback %u D%03d ACK %#llx until causal stream-1 reply\n",
+				 sequence, tag, reply);
+			apple_dcp_h17p_probe_is_main_display(dcp);
+			return;
+		}
 
 		ack_ret = dcp_link_ack(dcp, DCP_CONTEXT_CB);
 		dcp25g83_d563_a2i_end(dcp, d563_tail_index, ack_ret);
@@ -1069,14 +1078,6 @@ static void dcp_link_handle_callback(struct apple_dcp *dcp, u64 message)
 			dev_info(dcp->dev,
 				 "DCPLink callback %u D%03d ACK %#llx send result %d\n",
 				 sequence, tag, reply, ack_ret);
-		if (oob_probe) {
-			dcp->link_oob_main_display_probe_sent = true;
-			dev_info(dcp->dev,
-				 "DCP25G83_EP37_OOB_A412_AFTER_ACK callback %u ACK %#llx result %d\n",
-				 sequence, reply, ack_ret);
-			if (!ack_ret)
-				apple_dcp_h17p_probe_is_main_display(dcp);
-		}
 	}
 }
 
@@ -1430,7 +1431,15 @@ void dcp_ack(struct apple_dcp *dcp, enum dcp_context_id context)
 	struct dcp_channel *ch = dcp_get_channel(dcp, context);
 
 	if (dcp->fw_compat == DCP_FIRMWARE_H17P) {
-		dcp_link_ack(dcp, context);
+		int ret = dcp_link_ack(dcp, context);
+
+		if (context == DCP_CONTEXT_CB &&
+		    dcp->link_pre_ack_main_display_barrier_pending) {
+			dcp->link_pre_ack_main_display_barrier_pending = false;
+			dev_info(dcp->dev,
+				 "DCP25G83_EP37_PRE_ACK_A412_RELEASE held callback197 ACK result %d\n",
+				 ret);
+		}
 		return;
 	}
 
