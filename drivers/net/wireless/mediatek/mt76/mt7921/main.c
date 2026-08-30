@@ -1066,6 +1066,19 @@ void mt7921_scan_work(struct work_struct *work)
 			ieee80211_sched_scan_results(phy->mt76->hw);
 		} else if (is_mt7932(&phy->dev->mt76) &&
 			   rxd->eid == MCU_EVENT_SCAN_DONE) {
+			u8 event_seq = 0;
+			u8 active_seq = READ_ONCE(phy->mt76->scan_active_seq);
+
+			if (skb->len > offsetof(struct mt76_connac2_mcu_rxd, tlv))
+				event_seq = rxd->tlv[0];
+			if (skb->len <= offsetof(struct mt76_connac2_mcu_rxd, tlv) ||
+			    !active_seq || event_seq != active_seq) {
+				dev_info(phy->dev->mt76.dev,
+					 "J700_MT7932_SCAN_DONE_STALE: event_seq=%u active_seq=%u ignored=1\n",
+					 event_seq, active_seq);
+				dev_kfree_skb(skb);
+				continue;
+			}
 			mt792x_mutex_acquire(phy->dev);
 			next = mt76_connac_mcu_hw_scan_next(phy->mt76);
 			mt792x_mutex_release(phy->dev);
@@ -1073,6 +1086,7 @@ void mt7921_scan_work(struct work_struct *work)
 				dev_kfree_skb(skb);
 				continue;
 			}
+			WRITE_ONCE(phy->mt76->scan_active_seq, 0);
 			if (test_and_clear_bit(MT76_HW_SCANNING,
 					       &phy->mt76->state)) {
 				struct cfg80211_scan_info info = {

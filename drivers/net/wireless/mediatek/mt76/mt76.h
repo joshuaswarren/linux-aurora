@@ -935,6 +935,7 @@ struct mt76_phy {
 	 * one combined 39-channel request.
 	 */
 	struct sk_buff_head scan_pending;
+	u8 scan_active_seq;
 
 	struct {
 		struct sk_buff *head;

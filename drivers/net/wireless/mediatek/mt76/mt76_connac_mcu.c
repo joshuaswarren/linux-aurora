@@ -2613,9 +2613,11 @@ int mt76_connac_mcu_hw_scan_next(struct mt76_phy *phy)
 	channels = req->channels_num;
 	first_band = req->channels[0].band;
 	first_channel = req->channels[0].channel_num;
+	WRITE_ONCE(phy->scan_active_seq, seq);
 	err = mt76_mcu_skb_send_msg(phy->dev, skb,
 				       MCU_CE_CMD(START_HW_SCAN), false);
 	if (err) {
+		WRITE_ONCE(phy->scan_active_seq, 0);
 		skb_queue_purge(&phy->scan_pending);
 		return err;
 	}
@@ -2906,6 +2908,8 @@ generic_scan:
 	}
 
 submit:
+	if (mt7932)
+		WRITE_ONCE(phy->scan_active_seq, req->seq_num);
 	err = mt76_mcu_skb_send_msg(mdev, skb, MCU_CE_CMD(START_HW_SCAN),
 				    false);
 	if (mt7932) {
@@ -2916,8 +2920,11 @@ submit:
 			 err, q->head, q->tail, READ_ONCE(q->queued),
 			 readl(&q->regs->cpu_idx), readl(&q->regs->dma_idx));
 	}
-	if (err < 0)
+	if (err < 0) {
+		if (mt7932)
+			WRITE_ONCE(phy->scan_active_seq, 0);
 		clear_bit(MT76_HW_SCANNING, &phy->state);
+	}
 
 	return err;
 
@@ -2942,6 +2949,7 @@ int mt76_connac_mcu_cancel_hw_scan(struct mt76_phy *phy,
 	};
 
 	skb_queue_purge(&phy->scan_pending);
+	WRITE_ONCE(phy->scan_active_seq, 0);
 
 	if (test_and_clear_bit(MT76_HW_SCANNING, &phy->state)) {
 		struct cfg80211_scan_info info = {
