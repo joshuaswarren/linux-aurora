@@ -23,6 +23,8 @@ use crate::{
     g17_resources, g17_submission, g17_uapi, hw::agx3, identity, mmu, regs,
 };
 #[cfg(test)]
+use super as g17_submission;
+#[cfg(test)]
 #[path = "g17_initdata.rs"]
 mod g17_initdata;
 #[cfg(test)]
@@ -129,6 +131,7 @@ impl G17SksmScratchGeometry {
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct G17PPlatformConfig {
     pub(crate) sksm_scratch: G17SksmScratchGeometry,
+    pub(crate) sksm_queue_geometry: g17_submission::G17SksmQueueGeometry,
 }
 
 /// G17P values written by `AGXAcceleratorG16::configureDevice`.
@@ -142,6 +145,7 @@ pub(crate) const T8140_G17P_PLATFORM_CONFIG: G17PPlatformConfig = G17PPlatformCo
         write1_base: 0x4008,
         stride: 0x10,
     },
+    sksm_queue_geometry: g17_submission::T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY,
 };
 
 /// SoC and register identity presented to the manager constructor.
@@ -184,6 +188,7 @@ pub(crate) enum ConstructionError {
     WrongRootPlacement,
     WrongSharedClusterSize,
     WrongSksmScratchGeometry,
+    WrongSksmQueueGeometry,
     SksmScratchOffsetOverflow,
 }
 
@@ -265,10 +270,19 @@ pub(crate) fn validate_resources(
 pub(crate) fn validate_platform(
     platform: G17PPlatformConfig,
 ) -> core::result::Result<(), ConstructionError> {
-    if platform != T8140_G17P_PLATFORM_CONFIG {
+    if platform.sksm_scratch != T8140_G17P_PLATFORM_CONFIG.sksm_scratch {
         return Err(ConstructionError::WrongSksmScratchGeometry);
     }
+    if platform.sksm_queue_geometry
+        != T8140_G17P_PLATFORM_CONFIG.sksm_queue_geometry
+    {
+        return Err(ConstructionError::WrongSksmQueueGeometry);
+    }
     platform.sksm_scratch.fifo_offsets()?;
+    platform
+        .sksm_queue_geometry
+        .validate()
+        .map_err(|_| ConstructionError::WrongSksmQueueGeometry)?;
     Ok(())
 }
 
@@ -1083,6 +1097,10 @@ impl G17PManagerConstruction {
         self.platform.sksm_scratch
     }
 
+    pub(crate) fn sksm_queue_geometry(&self) -> g17_submission::G17SksmQueueGeometry {
+        self.platform.sksm_queue_geometry
+    }
+
     /// Return the hardware QID of a queue owned by this manager.
     pub(crate) fn compute_queue_id(&self, queue: &G17PSksmQueue) -> Result<u8> {
         if queue.scratch != self.sksm_scratch() || queue.uat_owner != self.uat().ttb_base() {
@@ -1123,7 +1141,9 @@ impl G17PManagerConstruction {
         const QUEUE_ID: u8 = 4;
         const COMPLETION_SELECTOR: u8 = 2;
 
-        let mut storage = g17_resources::G17PClRuntimeStorage::new(dev, self.uat())?;
+        let geometry = self.sksm_queue_geometry();
+        let mut storage =
+            g17_resources::G17PClRuntimeStorage::new(dev, self.uat(), geometry)?;
         let compute = g17_resources::G17PComputeDescriptorStorage::new(
             dev,
             self.uat(),
@@ -1150,6 +1170,7 @@ impl G17PManagerConstruction {
             queue_id: QUEUE_ID,
             completion_selector: COMPLETION_SELECTOR as u32,
             entry_gpu_va: storage.entry_gpu_va(),
+            geometry,
         };
         let config =
             g17_submission::prepare_g17p_compute_sksm_queue_config(routing, self.sksm_scratch())
@@ -1170,23 +1191,17 @@ impl G17PManagerConstruction {
             registered: true,
             storage,
             compute,
-            producer: g17_submission::G17PClKickProducerState {
-                queue_id: QUEUE_ID,
-                num_stamps: 256,
-                entry_stride: 0x200,
-                completion_selector: COMPLETION_SELECTOR,
-                qos: g17_submission::G17PClQosConfig {
-                    queue_byte_32: 1,
-                    class_40: 8,
-                    word_48: 0xffff,
-                },
-                submitted: 0,
-                current_timestamp: 1,
-                last_add_kicks_timestamp: 1,
-                base_timestamp: 1,
-                previous_valid: false,
-                previous_timestamp: 0,
-            },
+            producer: geometry
+                .initial_producer_state(
+                    QUEUE_ID,
+                    COMPLETION_SELECTOR,
+                    g17_submission::G17PClQosConfig {
+                        queue_byte_32: 1,
+                        class_40: 8,
+                        word_48: 0xffff,
+                    },
+                )
+                .map_err(|_| EINVAL)?,
             direct_lifecycle: g17_submission::G17PDirectClLifecycleState {
                 queue_config_dirty: true,
                 cached_channel_identity: 0,
@@ -1388,8 +1403,8 @@ impl G17PManagerConstruction {
         )
         .map_err(|_| EINVAL)?;
         if prepared_entry.entry_index != 1
-            || prepared_entry.entry_offset != 0x200
-            || prepared_entry.current_timestamp != 1
+            || prepared_entry.entry_offset != queue.producer.geometry.entry_stride()
+            || prepared_entry.current_timestamp != queue.producer.geometry.timestamp_seed()
         {
             return Err(EINVAL);
         }
@@ -1479,7 +1494,7 @@ impl G17PManagerConstruction {
 
     /// Build and publish one complete userspace compute command.
     ///
-    /// Descriptor and CL-entry slots share the same 256-entry lifetime. The
+    /// Descriptor and CL-entry slots share the configured stamp lifetime. The
     /// descriptor is written first, then its upper address and the retained
     /// queue record are placed in the CL payload before the ordered SKSM kick.
     pub(crate) fn submit_translated_compute(
@@ -1716,6 +1731,15 @@ mod tests {
         assert_eq!(platform.sksm_scratch.write1_base, 0x4008);
         assert_eq!(platform.sksm_scratch.stride, 0x10);
         assert_eq!(
+            platform.sksm_queue_geometry,
+            g17_submission::g17_sksm_queue_geometry(
+                g17_submission::G17ChannelAbiTarget::A18ProG17P,
+                g17_submission::G17ClSubmissionBackend::G17PHal200Hybrid,
+            )
+            .unwrap()
+        );
+        assert_eq!(platform.sksm_queue_geometry.validate(), Ok(()));
+        assert_eq!(
             platform.sksm_scratch.fifo_offsets(),
             Ok(G17SksmScratchOffsets {
                 write0: 0x4090,
@@ -1743,7 +1767,8 @@ mod tests {
         ] {
             assert_eq!(
                 validate_platform(G17PPlatformConfig {
-                    sksm_scratch: geometry
+                    sksm_scratch: geometry,
+                    ..T8140_G17P_PLATFORM_CONFIG
                 }),
                 Err(ConstructionError::WrongSksmScratchGeometry)
             );

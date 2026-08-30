@@ -16,8 +16,6 @@ pub(crate) const COMPUTE_REGISTER_SIZE: usize = 0x0c;
 pub(crate) const COMPUTE_QUEUE_GRAPH_SIZE: usize = 0x8000;
 pub(crate) const COMPUTE_QUEUE_CONTEXT_SIZE: usize = 0x4000;
 pub(crate) const COMPUTE_QUEUE_CONTEXT_EXTENT: usize = 8 * COMPUTE_QUEUE_CONTEXT_SIZE;
-/// Native G17P HAL200 SKSM entry backing: 256 entries at a 0x200 stride.
-pub(crate) const COMPUTE_SKSM_ENTRY_BACKING_SIZE: usize = 0x20000;
 pub(crate) const COMPUTE_OPTIONAL_SIZE: usize = 0xc0;
 pub(crate) const COMPUTE_EVENT_SIZE: usize = 0x400;
 pub(crate) const COMPUTE_CHANNEL_WRITE_INDEX: u32 = 3;
@@ -63,25 +61,30 @@ pub(crate) enum ComputeBuildError {
 pub(crate) struct ComputeSksmEntryAliases {
     low: u64,
     high: u64,
+    extent: usize,
 }
 
 impl ComputeSksmEntryAliases {
-    pub(crate) const fn new(low: u64, high: u64) -> Result<Self, ComputeBuildError> {
+    pub(crate) const fn new(
+        low: u64,
+        high: u64,
+        extent: usize,
+        alignment: u64,
+    ) -> Result<Self, ComputeBuildError> {
         if low == 0
             || high == 0
             || low == high
-            || low & (COMPUTE_QUEUE_CONTEXT_SIZE as u64 - 1) != 0
-            || high & (COMPUTE_QUEUE_CONTEXT_SIZE as u64 - 1) != 0
-            || low
-                .checked_add(COMPUTE_SKSM_ENTRY_BACKING_SIZE as u64)
-                .is_none()
-            || high
-                .checked_add(COMPUTE_SKSM_ENTRY_BACKING_SIZE as u64)
-                .is_none()
+            || extent == 0
+            || alignment == 0
+            || alignment & (alignment - 1) != 0
+            || low & (alignment - 1) != 0
+            || high & (alignment - 1) != 0
+            || low.checked_add(extent as u64).is_none()
+            || high.checked_add(extent as u64).is_none()
         {
             return Err(ComputeBuildError::InvalidSksmEntryAliases);
         }
-        Ok(Self { low, high })
+        Ok(Self { low, high, extent })
     }
 
     pub(crate) const fn low(self) -> u64 {
@@ -90,6 +93,10 @@ impl ComputeSksmEntryAliases {
 
     pub(crate) const fn high(self) -> u64 {
         self.high
+    }
+
+    pub(crate) const fn extent(self) -> usize {
+        self.extent
     }
 
     /// Return corresponding addresses within both aliases of the one backing.
@@ -102,7 +109,7 @@ impl ComputeSksmEntryAliases {
             Some(end) => end,
             None => return Err(ComputeBuildError::InvalidSksmEntryAliases),
         };
-        if end > COMPUTE_SKSM_ENTRY_BACKING_SIZE {
+        if end > self.extent {
             return Err(ComputeBuildError::InvalidSksmEntryAliases);
         }
         Ok([self.low + offset as u64, self.high + offset as u64])
@@ -697,7 +704,13 @@ mod tests {
         let addresses = build_initial_compute_channel_group(
             base,
             descriptor,
-            ComputeSksmEntryAliases::new(0x70_0040_0000, 0xffff_fc20_c300_0000).unwrap(),
+            ComputeSksmEntryAliases::new(
+                0x70_0040_0000,
+                0xffff_fc20_c300_0000,
+                0x8000,
+                0x100,
+            )
+            .unwrap(),
             0xffff_fc20_c400_0000,
             0xffff_fc20_c500_0000,
             &mut graph,
@@ -719,26 +732,37 @@ mod tests {
 
     #[test]
     fn sksm_entry_aliases_preserve_one_backing_offset() {
-        let aliases =
-            ComputeSksmEntryAliases::new(0x70_004d_8000, 0xffff_fc20_0027_8000).unwrap();
+        const EXTENT: usize = 0x8000;
+        let aliases = ComputeSksmEntryAliases::new(
+            0x70_004d_8000,
+            0xffff_fc20_0027_8000,
+            EXTENT,
+            0x100,
+        )
+        .unwrap();
         assert_eq!(
             aliases.range_at(0x200, 0x200),
             Ok([0x70_004d_8200, 0xffff_fc20_0027_8200])
         );
         assert_eq!(
-            aliases.range_at(COMPUTE_SKSM_ENTRY_BACKING_SIZE - 0x200, 0x200),
-            Ok([0x70_004f_7e00, 0xffff_fc20_0029_7e00])
+            aliases.range_at(EXTENT - 0x200, 0x200),
+            Ok([0x70_004d_fe00, 0xffff_fc20_0027_fe00])
         );
         assert_eq!(
-            aliases.range_at(COMPUTE_SKSM_ENTRY_BACKING_SIZE, 1),
+            aliases.range_at(EXTENT, 1),
             Err(ComputeBuildError::InvalidSksmEntryAliases)
         );
         assert_eq!(
-            ComputeSksmEntryAliases::new(0x70_004d_8000, 0x70_004d_8000),
+            ComputeSksmEntryAliases::new(0x70_004d_8000, 0x70_004d_8000, EXTENT, 0x100),
             Err(ComputeBuildError::InvalidSksmEntryAliases)
         );
         assert_eq!(
-            ComputeSksmEntryAliases::new(0x70_004d_8001, 0xffff_fc20_0027_8000),
+            ComputeSksmEntryAliases::new(
+                0x70_004d_8001,
+                0xffff_fc20_0027_8000,
+                EXTENT,
+                0x100,
+            ),
             Err(ComputeBuildError::InvalidSksmEntryAliases)
         );
     }

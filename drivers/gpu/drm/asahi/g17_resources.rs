@@ -50,7 +50,7 @@ const SECONDARY_EXTRA_0_BEFORE_PRIMARY_STATUS_A: u64 = 0x6c0;
 const SECONDARY_HWDATA_STATE_OFFSET: u64 = 0x3c0;
 const FWCTL_SIZE: usize = 0x4000;
 pub(crate) const G17P_CL_ENTRY_STORAGE_SIZE: usize =
-    g17_compute::COMPUTE_SKSM_ENTRY_BACKING_SIZE;
+    g17_submission::T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY.backing_size();
 pub(crate) const G17P_CL_SHARED_SUPPORT_SIZE: usize = 0x4000;
 pub(crate) const G17P_CL_B2_OBJECT_SIZE: usize = 0x4000;
 pub(crate) const G17P_CL_CHANNEL_CONTROL_SIZE: usize = 0x4000;
@@ -59,7 +59,8 @@ pub(crate) const G17P_CL_OPERAND_TABLE_SIZE: usize = 0x4000;
 pub(crate) const G17P_CL_LOW_VA_START: u64 = 0x70_0000_0000;
 pub(crate) const G17P_CL_LOW_VA_END: u64 = 0x71_0000_0000;
 pub(crate) const G17P_COMPUTE_DESCRIPTOR_SLOT_SIZE: usize = 0x4000;
-pub(crate) const G17P_COMPUTE_DESCRIPTOR_SLOT_COUNT: usize = 256;
+pub(crate) const G17P_COMPUTE_DESCRIPTOR_SLOT_COUNT: usize =
+    g17_submission::T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY.stamp_count() as usize;
 pub(crate) const G17P_COMPUTE_DESCRIPTOR_STORAGE_SIZE: usize =
     G17P_COMPUTE_DESCRIPTOR_SLOT_SIZE * G17P_COMPUTE_DESCRIPTOR_SLOT_COUNT;
 pub(crate) const G17P_COMPUTE_PREEMPT_SIZE: usize = 0x4000;
@@ -1254,6 +1255,7 @@ pub(crate) struct G17PClRuntimeStorage {
     /// Upper-root alias of the exact GEM subrange owned by `entries`.
     /// `KernelMapping` retains its own GEM reference for the full alias life.
     entries_high: mmu::KernelMapping,
+    geometry: g17_submission::G17SksmQueueGeometry,
     shared_support: MappedObject,
     channel_control: MappedObject,
     support_state: MappedObject,
@@ -2917,7 +2919,14 @@ impl G17PUserRenderStorage {
 
 #[cfg(not(test))]
 impl G17PClRuntimeStorage {
-    pub(crate) fn new(dev: &AsahiDevice, uat: &mmu::Uat) -> Result<Self> {
+    pub(crate) fn new(
+        dev: &AsahiDevice,
+        uat: &mmu::Uat,
+        geometry: g17_submission::G17SksmQueueGeometry,
+    ) -> Result<Self> {
+        geometry.validate().map_err(|_| EINVAL)?;
+        let backing_size = geometry.backing_size();
+        let mapping_alignment = geometry.mapping_alignment(mmu::UAT_PGSZ as u64);
         // AGXKSMKickQueue publishes this array through an uncached channel
         // allocation, followed by dmb ish and the addKicks MMIO pair. Keep the
         // CPU alias WC so that the freshly encoded entry is at the point of
@@ -2926,8 +2935,8 @@ impl G17PClRuntimeStorage {
             dev,
             uat.kernel_lower_vm(),
             G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END,
-            G17P_CL_ENTRY_STORAGE_SIZE,
-            mmu::UAT_PGSZ as u64,
+            backing_size,
+            mapping_alignment,
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
         // Native queue +0x80/+0x88 name the lower and upper mappings of one
@@ -2939,8 +2948,7 @@ impl G17PClRuntimeStorage {
             uat.kernel_va_range()?,
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
-        if entries.mapping.size() != G17P_CL_ENTRY_STORAGE_SIZE
-            || entries_high.size() != G17P_CL_ENTRY_STORAGE_SIZE
+        if entries.mapping.size() != backing_size || entries_high.size() != backing_size
         {
             return Err(EINVAL);
         }
@@ -2983,6 +2991,7 @@ impl G17PClRuntimeStorage {
         Ok(Self {
             entries,
             entries_high,
+            geometry,
             shared_support,
             channel_control,
             support_state,
@@ -3000,6 +3009,8 @@ impl G17PClRuntimeStorage {
         g17_compute::ComputeSksmEntryAliases::new(
             self.entries.iova(),
             self.entries_high.iova(),
+            self.geometry.backing_size(),
+            self.geometry.allocation_alignment(),
         )
         .map_err(|_| EINVAL)
     }
@@ -3067,7 +3078,13 @@ impl G17PClRuntimeStorage {
 
     pub(crate) fn write_entry(&mut self, offset: usize, zero_length: usize, body: &[u8]) -> Result {
         let end = offset.checked_add(zero_length).ok_or(EINVAL)?;
-        if end > self.entries.logical_size || body.len() > zero_length {
+        let stride = self.geometry.entry_stride() as usize;
+        if zero_length != stride
+            || offset % stride != 0
+            || end > self.geometry.backing_size()
+            || end > self.entries.logical_size
+            || body.len() > zero_length
+        {
             return Err(EINVAL);
         }
         let vmap = self.entries.object.vmap()?;
@@ -4956,7 +4973,15 @@ mod tests {
 
     #[test]
     fn g17p_cl_runtime_storage_has_native_ring_geometry() {
-        assert_eq!(G17P_CL_ENTRY_STORAGE_SIZE, 256 * 0x200);
+        let geometry = g17_submission::T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY;
+        assert_eq!(geometry.validate(), Ok(()));
+        assert_eq!(geometry.allocation_alignment(), 0x100);
+        assert_eq!(geometry.mapping_alignment(G17P_PAGE_SIZE as u64), 0x4000);
+        assert_eq!(geometry.entry_stride(), 0x200);
+        assert_eq!(geometry.stamp_count(), 256);
+        assert_eq!(geometry.timestamp_seed(), 1);
+        assert_eq!(geometry.backing_size(), 0x20000);
+        assert_eq!(G17P_CL_ENTRY_STORAGE_SIZE, geometry.backing_size());
         assert_eq!(G17P_CL_SHARED_SUPPORT_SIZE, 0x4000);
         assert_eq!(G17P_CL_B2_OBJECT_SIZE, 0x4000);
         assert_eq!(G17P_CL_CHANNEL_CONTROL_SIZE, 0x4000);
@@ -4999,12 +5024,19 @@ mod tests {
         const ENTRY_HIGH: u64 = 0xffff_fc20_0027_8000;
         const SHARED_SUPPORT: u64 = 0xffff_fc20_c087_0000;
         const CHANNEL_CONTROL: u64 = 0xffff_fc20_c07b_8040;
+        const GEOMETRY: g17_submission::G17SksmQueueGeometry =
+            g17_submission::T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY;
 
         let mut graph = [0u8; g17_compute::COMPUTE_QUEUE_GRAPH_SIZE];
         g17_compute::build_compute_queue_graph(QUEUE, CHANNEL_CONTROL, &mut graph).unwrap();
         let mut context = vec![0u8; g17_compute::COMPUTE_QUEUE_CONTEXT_EXTENT];
-        let sksm_entries =
-            g17_compute::ComputeSksmEntryAliases::new(ENTRY_LOW, ENTRY_HIGH).unwrap();
+        let sksm_entries = g17_compute::ComputeSksmEntryAliases::new(
+            ENTRY_LOW,
+            ENTRY_HIGH,
+            GEOMETRY.backing_size(),
+            GEOMETRY.allocation_alignment(),
+        )
+        .unwrap();
         g17_compute::build_initial_compute_channel_group(
             QUEUE,
             DESCRIPTOR,
@@ -5020,6 +5052,7 @@ mod tests {
         assert_eq!(actual, *TAG15);
         assert_eq!(get_u64(actual, 0x08), sksm_entries.low());
         assert_eq!(get_u64(actual, 0x10), sksm_entries.high());
+        assert_eq!(sksm_entries.extent(), GEOMETRY.backing_size());
         assert_eq!(
             sksm_entries.range_at(0x200, 0x200).unwrap(),
             [ENTRY_LOW + 0x200, ENTRY_HIGH + 0x200]
@@ -5037,6 +5070,8 @@ mod tests {
         let relocated = g17_compute::ComputeSksmEntryAliases::new(
             ENTRY_LOW + 0x4000,
             ENTRY_HIGH + 0x8000,
+            GEOMETRY.backing_size(),
+            GEOMETRY.allocation_alignment(),
         )
         .unwrap();
         let mut relocated_graph = [0u8; g17_compute::COMPUTE_QUEUE_GRAPH_SIZE];
