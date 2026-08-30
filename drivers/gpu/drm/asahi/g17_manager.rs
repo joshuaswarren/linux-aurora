@@ -1578,6 +1578,10 @@ impl G17PManagerConstruction {
         queue
             .compute
             .publish_initial_entry_signal(&entry_signal)?;
+        // AGXFirmware::submitCLChannel first reconciles the already-published
+        // inner group with SKSM, then makes the classic outer slot visible.
+        self.add_sksm_kicks(registers, queue, 1)?;
+        queue.producer.last_add_kicks_timestamp = prepared_entry.current_timestamp;
         fence(Ordering::SeqCst);
         let prepared = self
             .resources
@@ -1585,15 +1589,9 @@ impl G17PManagerConstruction {
         if lifecycle.notifications.activation != Some(prepared.doorbell) {
             return Err(EINVAL);
         }
-        // AGXFirmware::submitCLChannel reconciles the newly visible classic
-        // channel with SKSM only after addComputeToWorkqueue publishes CL2.
-        // If this write-only MMIO transaction fails, the caller must stop both
-        // processors before releasing or reusing the already-visible graph.
-        self.add_sksm_kicks(registers, queue, 1)?;
-        queue.producer.last_add_kicks_timestamp = prepared_entry.current_timestamp;
         dev_info!(
             self.resources.dev().as_ref(),
-            "G17P compute: native-direct-first-v1 qid {} entry_offset {:#x} entry_low {:#x} entry_high {:#x} timestamp {:#x} descriptor_generation {} tag15_producer 2 tag16_producer 3 cl2-before-addkicks=true correlation_token {}\n",
+            "G17P compute: native-direct-first-v2 qid {} entry_offset {:#x} entry_low {:#x} entry_high {:#x} timestamp {:#x} descriptor_generation {} tag15_producer 2 tag16_producer 3 addkicks-before-cl2=true correlation_token {}\n",
             queue.queue_id,
             prepared_entry.entry_offset,
             sksm_entry_aliases.low(),
