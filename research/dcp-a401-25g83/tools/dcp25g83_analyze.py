@@ -152,6 +152,15 @@ def verify(image: Image) -> None:
         0x042B583C: 0x97FFE2BD,  # call post-property no-op
         0x042B58B4: 0x97FC088E,  # D000 synchronous call
         0x042B58CC: 0x97FC0888,  # D001 synchronous call
+        0x04026C7C: 0x9400003A,  # enqueue hardware RX word by endpoint
+        0x04026CC8: 0xD63F091F,  # invoke the endpoint route callback
+        0x041B705C: 0x97F9EC9E,  # latch the EP37 link event
+        0x040322E4: 0x39000409,  # event source pending byte = 1
+        0x041B710C: 0x97F9BFFE,  # pop the next EP37 software-queue word
+        0x0403207C: 0xD63F0ABF,  # gate helper unconditionally calls action
+        0x0403208C: 0x2A1303E0,  # gate helper returns the action result
+        0x041B7720: 0x97F9EA4E,  # enter existing stream gate
+        0x041B7804: 0xD503237F,  # reply store-and-signal action entry
     }
     for va, expected in instructions.items():
         actual = struct.unpack("<I", image.bytes_at(va, 4))[0]

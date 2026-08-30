@@ -640,18 +640,34 @@ object `0x04963df8`. The existing busy-stream branch is mandatory. A missing
 stream, a newly allocated stream, or reply lookup/gate setup failure reaches
 the non-returning abort at `0x041b7520..0x041b7528`.
 
-For an existing stream, `0x041b76e0` asks the stream gate at offset `0x58` to
-run action `0x041b7804`. The action stores the raw response at offset `0x48`
-and immediately signals the stream event. The synchronous sender sleeps
-through the same gate at `0x041b542c`, checks the stored low 16 bits at
-`0x041b5438..0x041b5444`, and accepts `0x42`. Only later cleanup at
-`0x041b50f4` clears the stream busy word.
+The hardware receive callback reaches `0x04026bf0`. For every received word it
+unconditionally enqueues the word by endpoint at `0x04026c7c`, resolves the
+registered endpoint object, and invokes its route callback at `0x04026cc8`.
+EP37 was registered with filter `0x041b6fd4`. A reply does not take the
+new-request allocation branch; the filter calls `0x040322d4` on the link event
+source at `0x041b705c`. That event source was created active. Its trigger stores
+pending byte one before waking the workloop, so the notification is latching,
+not an edge which can be lost while the consumer runs. Consumer action
+`0x041b70d0` pops EP37 words at `0x041b710c` and loops until the endpoint
+software queue is empty.
 
-The gate invocation itself can return an error before the action runs. The
-worker tests that result at `0x041b7454`; unlike lookup/new-stream failure, a
-nonzero existing-stream gate result is logged and the endpoint loop continues
-without aborting. Static code does not provide an AP-visible error value for
-this branch. On success, store and signal are unconditional.
+For an existing stream, `0x041b76e0` asks the stream gate at offset `0x58` to
+run action `0x041b7804`. The generic gate helper at `0x04032058`
+unconditionally calls the supplied action at `0x0403207c` and returns that
+action's result at `0x0403208c`. Action `0x041b7804` always returns zero. The
+defensive nonzero test at `0x041b7454` is therefore unreachable for this
+action; it is not a third silent failure class. If reply dispatch reaches the
+existing-stream gate, it necessarily stores the raw response at offset `0x48`
+and immediately signals the stream event.
+
+The synchronous sender sleeps through the same stream gate at `0x041b542c`,
+checks the stored low 16 bits at `0x041b5438..0x041b5444`, and accepts `0x42`.
+Its stream workloop was created at priority `0x10`; its pointer is installed at
+stream offset `0x58`, and its owning thread identity at offset `0x38`.
+Reply dispatch runs on the distinct `iomfb_ap_link` workloop, also priority
+`0x10`. The sender's command sleep releases the stream gate before blocking,
+so the reply action can enter it. Only later cleanup at `0x041b50f4` clears the
+stream busy word.
 
 At timeout the A2I control value is `0x20001`: empty, with equal read/write
 pointers. No AP message follows callback 197 in the fixed inherited-crashlog
@@ -664,9 +680,9 @@ The shared RPC buffer contains no response field for an output-less D102.
 There is consequently no behavior-neutral AP observer currently capable of
 separating these remaining states in one run:
 
-- ACK197 dequeued into the EP37 software queue but not dispatched;
-- existing-stream gate invocation returned an error before action execution;
-- action stored/signaled but the synchronous sender did not resume.
+- ACK197 left the hardware FIFO but did not reach the EP37 route callback;
+- EP37 latched its workloop event but the consumer action did not run;
+- store-and-signal ran but the synchronous sender did not resume.
 
 Changing reply timing, sending a second reply, injecting remote-error bits, or
 reading the private stream cache line would not be an evidence-derived
