@@ -570,6 +570,28 @@ impl G17PManagerConstruction {
         self.resources.status_a_snapshot()
     }
 
+    /// Verify the untouched native pre-user root phase. The first real user
+    /// bind owns the transition from the retained context-0 roots to context
+    /// 1; no driver-owned startup render VM is needed to manufacture it.
+    pub(crate) fn validate_native_pre_user_roots(&self) -> Result {
+        if !self
+            .resources
+            .uat()
+            .t8140_partial_opening_kernel_contexts_ready()
+        {
+            dev_err!(
+                self.resources.dev().as_ref(),
+                "G17P roots: native pre-user context 0/1 table is invalid\n"
+            );
+            return Err(EIO);
+        }
+        dev_info!(
+            self.resources.dev().as_ref(),
+            "G17P roots: native pre-user context 0/1 table retained; user bind owns first split\n"
+        );
+        Ok(())
+    }
+
     pub(crate) fn control_opening_effect(
         &mut self,
     ) -> Result<g17_resources::G17PControlOpeningEffect> {
