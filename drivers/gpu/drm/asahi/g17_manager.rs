@@ -418,19 +418,26 @@ pub(crate) struct G17PManagerConstruction {
     render_tracker: Option<G17PPartialOpeningRenderTracker>,
     render_bind: Option<mmu::VmBind>,
     render_submission_ordinal: u32,
-    compute_readiness_context2_bound: bool,
-    compute_readiness_progress: g17_initdata::ComputeReadinessProgress,
 }
 
-/// A queue which has completed the host's configuration pair and QID-enable
-/// publication. Private fields prevent constructing an unregistered queue.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum G17PSksmQueueHardwareState {
+    PreparedMemory,
+    HardwareRegistered,
+}
+
+/// A retained compute queue whose backing graph is prepared during startup.
+/// Native processComputeSetup marks the queue dirty; the first direct
+/// submitBuffer configures QID 4 after tag 15, once startup is complete.
 #[cfg(not(test))]
 pub(crate) struct G17PSksmQueue {
     queue_id: u8,
     scratch: G17SksmScratchGeometry,
     uat_owner: u64,
+    configure_pair: g17_submission::G17SksmOrderedWritePair,
+    enable_pair: g17_submission::G17SksmOrderedWritePair,
     disable_pair: g17_submission::G17SksmOrderedWritePair,
-    registered: bool,
+    hardware_state: G17PSksmQueueHardwareState,
     storage: g17_resources::G17PClRuntimeStorage,
     compute: g17_resources::G17PComputeDescriptorStorage,
     producer: g17_submission::G17PClKickProducerState,
@@ -536,8 +543,6 @@ impl G17PManagerConstruction {
                 render_tracker: None,
                 render_bind: None,
                 render_submission_ordinal: 0,
-                compute_readiness_context2_bound: false,
-                compute_readiness_progress: g17_initdata::ComputeReadinessProgress::new(),
             },
             GFP_KERNEL,
         )?)
@@ -1022,8 +1027,6 @@ impl G17PManagerConstruction {
             return Err(EBUSY);
         }
         self.resources.reset_session_after_processor_stop()?;
-        self.compute_readiness_context2_bound = false;
-        self.compute_readiness_progress = g17_initdata::ComputeReadinessProgress::new();
         Ok(())
     }
 
@@ -1220,32 +1223,28 @@ impl G17PManagerConstruction {
         queue: &mut G17PSksmQueue,
         vm: &mmu::Vm,
     ) -> Result<G17PComputeUserBinding> {
-        if !queue.registered
-            || queue.scratch != self.sksm_scratch()
+        if queue.scratch != self.sksm_scratch()
             || queue.uat_owner != self.uat().ttb_base()
         {
             return Err(EINVAL);
         }
-        self.resources.prepare_compute_readiness_context1()?;
-        self.resources.validate_compute_readiness_context2(vm)?;
         let mappings = queue.compute.map_user_execution_state(vm)?;
         let vm_bind = self.resources.uat().bind(vm)?;
         if vm_bind.slot() != 1 || !mappings.all_reachable_from(vm) {
             return Err(EFAULT);
         }
-        self.compute_readiness_context2_bound = true;
         Ok(G17PComputeUserBinding {
             mappings,
             _vm_bind: vm_bind,
         })
     }
 
-    /// Configure the hardware-proven G17P compute queue through resource 0 and
-    /// return its retained state only after the QID-valid bit is published.
-    pub(crate) fn configure_g17p_compute_queue(
+    /// Allocate and encode the native compute queue without touching the SKSM
+    /// hardware bridge. The dirty first direct submitBuffer registers QID 4
+    /// after tag 15, once firmware startup is complete.
+    pub(crate) fn prepare_g17p_compute_queue(
         &mut self,
         dev: &AsahiDevice,
-        registers: &regs::Resources,
     ) -> Result<G17PSksmQueue> {
         const QUEUE_ID: u8 = 4;
         const COMPLETION_SELECTOR: u8 = 2;
@@ -1285,19 +1284,14 @@ impl G17PManagerConstruction {
             g17_submission::prepare_g17p_compute_sksm_queue_config(routing, self.sksm_scratch())
                 .map_err(|_| EINVAL)?;
 
-        // Every firmware-visible page and its DVA must be globally published
-        // before the config payload makes the queue reachable from SKSM. The
-        // MMIO helper then stores config word 0, config word 1, and finally the
-        // two QID-valid mask words under one fixed-slot FIFO lock.
-        fence(Ordering::SeqCst);
-        registers.g17p_sksm_configure_queue(config.write_pair(), config.enable_pair)?;
-
         Ok(G17PSksmQueue {
             queue_id: routing.queue_id,
             scratch: self.sksm_scratch(),
             uat_owner: self.uat().ttb_base(),
+            configure_pair: config.write_pair(),
+            enable_pair: config.enable_pair,
             disable_pair: config.disable_pair,
-            registered: true,
+            hardware_state: G17PSksmQueueHardwareState::PreparedMemory,
             storage,
             compute,
             producer: geometry
@@ -1321,6 +1315,27 @@ impl G17PManagerConstruction {
         })
     }
 
+    /// Perform the exact configureHardware four-store QID transaction once.
+    /// All queue memory and user mappings are visible before this makes QID 4
+    /// reachable from the SKSM hardware bridge.
+    pub(crate) fn register_prepared_compute_sksm_queue(
+        &self,
+        registers: &regs::Resources,
+        queue: &mut G17PSksmQueue,
+    ) -> Result {
+        if queue.scratch != self.sksm_scratch() || queue.uat_owner != self.uat().ttb_base() {
+            return Err(EINVAL);
+        }
+        match queue.hardware_state {
+            G17PSksmQueueHardwareState::HardwareRegistered => return Ok(()),
+            G17PSksmQueueHardwareState::PreparedMemory => {}
+        }
+        fence(Ordering::SeqCst);
+        registers.g17p_sksm_configure_queue(queue.configure_pair, queue.enable_pair)?;
+        queue.hardware_state = G17PSksmQueueHardwareState::HardwareRegistered;
+        Ok(())
+    }
+
     /// Remove a retained queue from the hardware bridge before releasing its
     /// backing storage. Repeated teardown is harmless.
     pub(crate) fn unregister_compute_sksm_queue(
@@ -1331,12 +1346,12 @@ impl G17PManagerConstruction {
         if queue.scratch != self.sksm_scratch() || queue.uat_owner != self.uat().ttb_base() {
             return Err(EINVAL);
         }
-        if !queue.registered {
+        if queue.hardware_state == G17PSksmQueueHardwareState::PreparedMemory {
             return Ok(());
         }
 
         registers.g17p_sksm_publish_write_pair(queue.disable_pair)?;
-        queue.registered = false;
+        queue.hardware_state = G17PSksmQueueHardwareState::PreparedMemory;
         Ok(())
     }
 
@@ -1349,7 +1364,7 @@ impl G17PManagerConstruction {
         queue: &mut G17PSksmQueue,
         operands: g17_submission::G17PClKickEntryOperands<'_>,
     ) -> Result<u64> {
-        if !queue.registered
+        if queue.hardware_state != G17PSksmQueueHardwareState::HardwareRegistered
             || queue.scratch != self.sksm_scratch()
             || queue.uat_owner != self.uat().ttb_base()
         {
@@ -1366,7 +1381,6 @@ impl G17PManagerConstruction {
         queue: &mut G17PSksmQueue,
         prepared: g17_submission::PreparedG17PClKickEntry,
     ) -> Result<u64> {
-        self.require_compute_readiness_retired()?;
         queue.storage.write_entry(
             prepared.entry_offset as usize,
             prepared.zero_length as usize,
@@ -1382,115 +1396,6 @@ impl G17PManagerConstruction {
         queue.producer.last_add_kicks_timestamp = timestamp;
         fence(Ordering::SeqCst);
         Ok(timestamp)
-    }
-
-    /// Prepare the retained B2 state before the first readiness record. This
-    /// keeps the direct first-submit ordering while leaving the user VM and
-    /// context-2 binding unchanged.
-    pub(crate) fn prepare_compute_readiness_prelude(
-        &mut self,
-        queue: &mut G17PSksmQueue,
-    ) -> Result {
-        if !self.compute_readiness_context2_bound
-            || self.compute_readiness_progress
-                != g17_initdata::ComputeReadinessProgress::new()
-        {
-            return Err(EINVAL);
-        }
-        self.publish_compute_b2_once(queue)
-    }
-
-    /// Publish one native readiness record. A second record cannot become
-    /// visible until the live-boot owner retires the pending target.
-    pub(crate) fn publish_next_compute_readiness_record(
-        &mut self,
-        queue: &mut G17PSksmQueue,
-    ) -> Result<g17_initdata::ComputeReadinessRecordBoundary> {
-        if !self.compute_readiness_context2_bound {
-            return Err(EBUSY);
-        }
-        let boundary = self
-            .compute_readiness_progress
-            .next_boundary()
-            .ok_or(EBUSY)?;
-        let index = boundary.index as usize;
-        if index == 3 {
-            let activation_address = queue.storage.initialize_context2_activation_record()?;
-            let expected = queue
-                .storage
-                .channel_control_gpu_va()
-                .checked_add(g17_initdata::COMPUTE_READINESS_ACTIVATION_RECORD_OFFSET as u64)
-                .ok_or(EINVAL)?;
-            if activation_address != expected {
-                return Err(EINVAL);
-            }
-            dev_info!(
-                self.resources.dev().as_ref(),
-                "G17P compute readiness per-record-v2: context2 activation={:#x} after target=7 retirement\n",
-                activation_address,
-            );
-        }
-        let target = self.resources.publish_compute_readiness_record(index)?;
-        if target != boundary.producer_after {
-            return Err(EIO);
-        }
-        self.compute_readiness_progress = self
-            .compute_readiness_progress
-            .begin_publication(boundary)
-            .ok_or(EIO)?;
-        Ok(boundary)
-    }
-
-    /// Wait for exactly one readiness producer target to reach both firmware
-    /// consumer cursors before the caller publishes the next record.
-    pub(crate) fn wait_compute_readiness_record_retirement(
-        &mut self,
-        target: u32,
-    ) -> Result<g17_resources::G17PControlCounters> {
-        const POLLS: usize = 100;
-        if self.compute_readiness_progress.pending_target() != Some(target) {
-            return Err(EINVAL);
-        }
-        let mut last = None;
-        for _ in 0..POLLS {
-            fence(Ordering::Acquire);
-            let counters = self.resources.control_counters()?;
-            if counters.compute_readiness_record_retired(target) {
-                self.compute_readiness_progress = self
-                    .compute_readiness_progress
-                    .retire(target)
-                    .ok_or(EIO)?;
-                dev_info!(
-                    self.resources.dev().as_ref(),
-                    "G17P compute readiness per-record-v2: retired target={} primary={:?} secondary={:?}\n",
-                    target,
-                    counters.primary,
-                    counters.secondary,
-                );
-                return Ok(counters);
-            }
-            last = Some(counters);
-            fsleep(Delta::from_millis(1));
-        }
-        if let Some(counters) = last {
-            dev_err!(
-                self.resources.dev().as_ref(),
-                "G17P compute readiness per-record-v2: retirement timeout target={} primary={:?} secondary={:?}\n",
-                target,
-                counters.primary,
-                counters.secondary,
-            );
-        }
-        Err(ETIMEDOUT)
-    }
-
-    fn require_compute_readiness_retired(&mut self) -> Result {
-        if !self.compute_readiness_progress.complete()
-            || !self.resources.control_counters()?.compute_readiness_retired()
-        {
-            return Err(EBUSY);
-        }
-        Ok(())
     }
 
     fn publish_compute_b2_once(&mut self, queue: &mut G17PSksmQueue) -> Result {
@@ -1651,6 +1556,14 @@ impl G17PManagerConstruction {
         queue
             .compute
             .publish_initial_config_update_pointer(group)?;
+        // Native submitBuffer publishes tag 15 before the dirty queue's
+        // configureHardware vcall. The four QID stores must therefore occur
+        // here: after ConfigUpdate is visible, before the SKSM entry body.
+        self.register_prepared_compute_sksm_queue(registers, queue)?;
+        dev_info!(
+            self.resources.dev().as_ref(),
+            "G17P submitBuffer/configureHardware: tag15 published, then QID 4 configured and enabled; writing first SKSM entry\n"
+        );
         queue.storage.write_entry(
             prepared_entry.entry_offset as usize,
             prepared_entry.zero_length as usize,
@@ -1702,22 +1615,24 @@ impl G17PManagerConstruction {
         command: &g17_uapi::TranslatedComputeCommand,
         context: G17PComputeSubmissionContext<'_>,
     ) -> Result<Option<g17_submission::PreparedG17PDirectClNotifications>> {
-        if !queue.registered
-            || queue.scratch != self.sksm_scratch()
+        if queue.scratch != self.sksm_scratch()
             || queue.uat_owner != self.uat().ttb_base()
         {
             return Err(EINVAL);
         }
-        // Readiness is a strict precondition. No descriptor, tag, SKSM, MMIO,
-        // CL2, or mailbox-visible work state may change before target 10 retires.
-        self.require_compute_readiness_retired()?;
-
         if let Some(buffers) = command.g17p_add3_buffers {
             return self
                 .submit_translated_add3_channel(
                     registers, queue, binding, command, context, buffers,
                 )
                 .map(Some);
+        }
+
+        // The bounded first-submit candidate implements the binary-verified
+        // direct first-bind path above. Do not make a generic first queue
+        // reachable before its own tag/configure chronology is implemented.
+        if queue.hardware_state != G17PSksmQueueHardwareState::HardwareRegistered {
+            return Err(ENOTSUPP);
         }
 
         let timestamp = g17_submission::decode_kick_timestamp(queue.producer.current_timestamp)
@@ -1813,7 +1728,7 @@ impl G17PManagerConstruction {
         queue: &mut G17PSksmQueue,
         completed_count: u32,
     ) -> Result {
-        if !queue.registered
+        if queue.hardware_state != G17PSksmQueueHardwareState::HardwareRegistered
             || queue.scratch != self.sksm_scratch()
             || queue.uat_owner != self.uat().ttb_base()
         {
@@ -1837,15 +1752,14 @@ impl G17PManagerConstruction {
         })
     }
 
-    /// Publish newly appended kicks for a queue returned by
-    /// [`Self::configure_g17p_compute_queue`].
+    /// Publish newly appended kicks for a hardware-registered queue.
     pub(crate) fn add_sksm_kicks(
         &self,
         registers: &regs::Resources,
         queue: &mut G17PSksmQueue,
         add_count: u32,
     ) -> Result {
-        if !queue.registered
+        if queue.hardware_state != G17PSksmQueueHardwareState::HardwareRegistered
             || queue.scratch != self.sksm_scratch()
             || queue.uat_owner != self.uat().ttb_base()
         {
