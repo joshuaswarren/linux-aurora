@@ -41,6 +41,8 @@
 #define APPLE_DCP_LINK_PHASE_PROPERTY	"apple,dcp-link-phase"
 #define APPLE_DCP_LINK_MESSAGE_PROPERTY	"apple,dcp-link-message"
 
+#define DCP25G83_TYPE0_CANARY_ECHO	0x10001de00000140ULL
+
 static int dcp_tx_offset(enum dcp_context_id id)
 {
 	switch (id) {
@@ -194,13 +196,13 @@ static int dcp25g83_d563_tail_index(const void *input, u32 input_size)
 	return -ENOENT;
 }
 
-static bool dcp25g83_pre_ack_a412_barrier(struct apple_dcp *dcp, int tag,
-					  const struct apple_dcp_link_rpc_view *view)
+static bool dcp25g83_type0_canary(struct apple_dcp *dcp, int tag,
+				  const struct apple_dcp_link_rpc_view *view)
 {
 	static const char property[] = "SupportRelbufInfoCb";
 
 	if (dcp->fw_compat != DCP_FIRMWARE_H17P || !dcp->adopted_session ||
-	    dcp->link_pre_ack_main_display_barrier_sent || tag != 102 ||
+	    dcp->link_pre_ack_type0_canary_sent || tag != 102 ||
 	    view->input_size != 0x44 || view->output_size)
 		return false;
 
@@ -570,13 +572,6 @@ static int dcp_link_push_context(struct apple_dcp *dcp,
 			 in_len, out_len);
 	}
 	ret = dcp_send_message_sync(dcp, APPLE_DCP_LINK_ENDPOINT, message);
-	if (call_tag == APPLE_DCP_H17P_CALL_IS_MAIN_DISPLAY && stream == 1 &&
-	    !remote)
-		dev_info(dcp->dev,
-			 "DCP25G83_EP37_PRE_ACK_A412_TX endpoint %#x word %#llx channel oobcmd stream 1 remote 0 new %u local base %#x offset %#x size %#x top %#x->%#x depth %u header %#x/%u/%u mailbox result %d expect reply %#x\n",
-			 APPLE_DCP_LINK_ENDPOINT, message, new_stream,
-			 layout.local_offset, offset, payload_size, old_top,
-			 next_top, depth, call_tag, in_len, out_len, ret, 0x642);
 	if (call_tag == APPLE_DCP_H17P_CALL_VI_SET_TEMPERATURE_HINT ||
 	    call_tag == APPLE_DCP_H17P_CALL_PMU_SERVICE_MATCHED ||
 	    call_tag == APPLE_DCP_H17P_CALL_BACKLIGHT_SERVICE_MATCHED)
@@ -1060,19 +1055,36 @@ static void dcp_link_handle_callback(struct apple_dcp *dcp, u64 message)
 				 handled ? reply : 0);
 	}
 	if (handled) {
-		bool barrier = dcp25g83_pre_ack_a412_barrier(dcp, tag, &view);
+		bool canary = dcp25g83_type0_canary(dcp, tag, &view);
+		u32 canary_before = 0, canary_after = 0, ack_after = 0;
+		int canary_before_ret = -ECANCELED;
+		int canary_after_ret = -ECANCELED;
+		int ack_after_ret = -ECANCELED;
+		int canary_ret = -ECANCELED;
 
-		if (barrier) {
-			dcp->link_pre_ack_main_display_barrier_sent = true;
-			dcp->link_pre_ack_main_display_barrier_pending = true;
+		if (canary) {
+			dcp->link_pre_ack_type0_canary_sent = true;
+			canary_before_ret = dcp_mbox_a2i_control(dcp,
+								 &canary_before);
+			canary_ret = dcp_send_message_sync(dcp,
+							   APPLE_DCP_LINK_ENDPOINT, 0);
+			canary_after_ret = dcp_mbox_a2i_control(dcp,
+								&canary_after);
 			dev_info(dcp->dev,
-				 "DCP25G83_EP37_PRE_ACK_A412_HOLD callback %u D%03d ACK %#llx until causal stream-1 reply\n",
-				 sequence, tag, reply);
-			apple_dcp_h17p_probe_is_main_display(dcp);
-			return;
+				 "DCP25G83_EP37_PRE_ACK_TYPE0_CANARY callback %u D%03d request 0 result %d A2I before %#x result %d after %#x result %d expect echo %#llx before ACK %#llx\n",
+				 sequence, tag, canary_ret, canary_before,
+				 canary_before_ret, canary_after, canary_after_ret,
+				 DCP25G83_TYPE0_CANARY_ECHO, reply);
 		}
 
 		ack_ret = dcp_link_ack(dcp, DCP_CONTEXT_CB);
+		if (canary) {
+			ack_after_ret = dcp_mbox_a2i_control(dcp, &ack_after);
+			dev_info(dcp->dev,
+				 "DCP25G83_EP37_PRE_ACK_TYPE0_CANARY_ACK callback %u ACK %#llx result %d A2I after %#x result %d\n",
+				 sequence, reply, ack_ret, ack_after,
+				 ack_after_ret);
+		}
 		dcp25g83_d563_a2i_end(dcp, d563_tail_index, ack_ret);
 		if (log_callback && sequence >= 165)
 			dev_info(dcp->dev,
@@ -1119,6 +1131,13 @@ static void dcp_link_recv_msg(struct apple_dcp *dcp, u64 message)
 	enum apple_dcp_link_handshake_action action;
 	enum apple_dcp_link_state old_state = dcp->link_state;
 	u8 type = message & GENMASK_ULL(1, 0);
+
+	if (dcp->adopted_session &&
+	    dcp->link_pre_ack_type0_canary_sent &&
+	    message == DCP25G83_TYPE0_CANARY_ECHO)
+		dev_info(dcp->dev,
+			 "DCP25G83_EP37_PRE_ACK_TYPE0_CANARY_ECHO RX %#llx exact\n",
+			 message);
 
 	action = apple_dcp_link_handshake_step(&dcp->link_state, message);
 	if (action == APPLE_DCP_LINK_HANDSHAKE_SEND_INIT) {
@@ -1431,15 +1450,7 @@ void dcp_ack(struct apple_dcp *dcp, enum dcp_context_id context)
 	struct dcp_channel *ch = dcp_get_channel(dcp, context);
 
 	if (dcp->fw_compat == DCP_FIRMWARE_H17P) {
-		int ret = dcp_link_ack(dcp, context);
-
-		if (context == DCP_CONTEXT_CB &&
-		    dcp->link_pre_ack_main_display_barrier_pending) {
-			dcp->link_pre_ack_main_display_barrier_pending = false;
-			dev_info(dcp->dev,
-				 "DCP25G83_EP37_PRE_ACK_A412_RELEASE held callback197 ACK result %d\n",
-				 ret);
-		}
+		dcp_link_ack(dcp, context);
 		return;
 	}
 

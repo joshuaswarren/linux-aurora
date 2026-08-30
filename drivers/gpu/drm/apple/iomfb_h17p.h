@@ -19,6 +19,4 @@ static_assert(sizeof(struct dcp_swap_submit_resp_h17p) == 0x0c);
 #undef DCP_FW_VER
 #undef DCP_FW
 
-void apple_dcp_h17p_probe_is_main_display(struct apple_dcp *dcp);
-
 #endif /* __APPLE_IOMFB_H17P_H__ */

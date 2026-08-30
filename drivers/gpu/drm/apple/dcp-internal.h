@@ -192,8 +192,7 @@ struct apple_dcp {
 	u64 link_init_message;
 	u16 link_rx_log_count;
 	u16 link_reply_log_count;
-	bool link_pre_ack_main_display_barrier_sent;
-	bool link_pre_ack_main_display_barrier_pending;
+	bool link_pre_ack_type0_canary_sent;
 	u32 link_d563_a2i_before[5];
 	u32 link_d563_a2i_after[5];
 	u8 link_d563_a2i_count;
