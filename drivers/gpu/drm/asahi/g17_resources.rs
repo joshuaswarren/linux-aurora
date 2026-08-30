@@ -649,6 +649,17 @@ pub(crate) struct G17PControlCounters {
     pub(crate) secondary: [u32; g17_initdata::CHANNEL_ENTRY_STATE_COUNT],
 }
 
+/// Raw primary main-config channel-12 pointer chain and the values reached by
+/// those pointers. Pinned J700 GFX A000 type-4 thunk `0x2635c` uses
+/// `main+0x1b0` as its producer source; drain `0x3a74` uses all three.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PControlPointerSnapshot {
+    pub(crate) main_config: u64,
+    pub(crate) raw_state_pointers: [u64; g17_initdata::CHANNEL_ENTRY_STATE_COUNT],
+    pub(crate) expected_state_pointers: [u64; g17_initdata::CHANNEL_ENTRY_STATE_COUNT],
+    pub(crate) state_values: [u32; g17_initdata::CHANNEL_ENTRY_STATE_COUNT],
+}
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct G17PControlOpeningEffect {
     pub(crate) shared_cursor: u32,
@@ -1049,6 +1060,19 @@ impl MappedObject {
         }
         self.with_bytes_mut(|bytes| {
             Ok(u32::from_le_bytes(
+                bytes[offset..end].try_into().map_err(|_| EINVAL)?,
+            ))
+        })
+    }
+
+    fn read_u64(&mut self, address: u64) -> Result<u64> {
+        let offset = address.checked_sub(self.iova()).ok_or(EINVAL)? as usize;
+        let end = offset.checked_add(8).ok_or(EINVAL)?;
+        if end > self.logical_size {
+            return Err(EINVAL);
+        }
+        self.with_bytes_mut(|bytes| {
+            Ok(u64::from_le_bytes(
                 bytes[offset..end].try_into().map_err(|_| EINVAL)?,
             ))
         })
@@ -4171,6 +4195,40 @@ impl G17ResourceOwner {
             self.handoff.secondary.state_grid,
         )?;
         Ok(G17PControlCounters { primary, secondary })
+    }
+
+    /// Read the exact primary channel-12 pointers serialized at main
+    /// `+0x1a0/+0x1a8/+0x1b0`, then follow them through the retained WC state
+    /// object. This is diagnostic only and performs no firmware write.
+    pub(crate) fn control_pointer_snapshot(&mut self) -> Result<G17PControlPointerSnapshot> {
+        let entry = g17_initdata::channel_table_entry_range(
+            g17_initdata::CONTROL_CHANNEL_INDEX,
+        )
+        .ok_or(EINVAL)?;
+        let main_config = self.handoff.primary.instance.main_config;
+        let expected = g17_initdata::derive_channel_table(
+            InstanceRole::Primary,
+            self.handoff.primary.state_grid,
+            self.handoff.primary.instance.status_a,
+            main_config,
+            self.handoff.shared.hw_data_bundle,
+        )[g17_initdata::CONTROL_CHANNEL_INDEX];
+        let mut raw_state_pointers = [0u64; g17_initdata::CHANNEL_ENTRY_STATE_COUNT];
+        let mut state_values = [0u32; g17_initdata::CHANNEL_ENTRY_STATE_COUNT];
+        for index in 0..g17_initdata::CHANNEL_ENTRY_STATE_COUNT {
+            let address = main_config
+                .checked_add(entry.start as u64)
+                .and_then(|address| address.checked_add(index as u64 * 8))
+                .ok_or(EINVAL)?;
+            raw_state_pointers[index] = self.resources.shared_cluster.read_u64(address)?;
+            state_values[index] = self.resources.primary_state.read_u32(raw_state_pointers[index])?;
+        }
+        Ok(G17PControlPointerSnapshot {
+            main_config,
+            raw_state_pointers,
+            expected_state_pointers: expected.states,
+            state_values,
+        })
     }
 
     pub(crate) fn control_opening_effect(&mut self) -> Result<G17PControlOpeningEffect> {
