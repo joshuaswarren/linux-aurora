@@ -30,12 +30,22 @@ pub(crate) const D93AP_G17P_COMPLETION_IRQ: u32 = 1001;
 pub(crate) const G17P_NORMAL_CL_COMPLETION_IRQ_BIT: u8 = 21;
 pub(crate) const G17P_NORMAL_CL_COMPLETION_ORDINAL: u8 = 0;
 pub(crate) const G17P_NORMAL_CL_COMPLETION_CAPACITY: u32 = 0x800;
+pub(crate) const G17P_NORMAL_CL_COMPLETION_DESCRIPTOR_TABLE_OFFSET: u32 = 0x2614;
+pub(crate) const G17P_NORMAL_CL_COMPLETION_DESCRIPTOR_STRIDE: u32 = 0x20;
+pub(crate) const G17P_NORMAL_CL_COMPLETION_PROCESSED_OFFSET: u32 = 0x1c;
 pub(crate) const G17P_KSM_COMPLETION_NOTIFY_BASE: u32 = 0x21168;
 pub(crate) const G17P_KSM_COMPLETION_ACK_BASE: u32 = 0x21188;
+pub(crate) const G17P_KSM_COMPLETION_MMIO_STRIDE: u32 = 8;
 pub(crate) const G17P_FIRMWARE_EVENT_ENDPOINT: u8 = 0x20;
 pub(crate) const G17P_FIRMWARE_EVENT_MESSAGE: u64 = 0x0042_0000_0000_0000;
+pub(crate) const G17P_FIRMWARE_EVENT_HOST_TYPE: u8 = 2;
+pub(crate) const G17P_FIRMWARE_EVENT_HOST_TYPE_MASK: u8 = 0x3f;
 pub(crate) const G17P_FIRMWARE_EVENT_ENTRY_SIZE: usize = 0x48;
 pub(crate) const G17P_FIRMWARE_EVENT_CAPACITY: u32 = 0x100;
+pub(crate) const G17P_FIRMWARE_EVENT_CONSUMER_OFFSET: u32 = 0;
+pub(crate) const G17P_FIRMWARE_EVENT_PRODUCER_OFFSET: u32 = 0x20;
+pub(crate) const D93AP_G17P_SGX_SOURCE_INDEX: u8 = 4;
+pub(crate) const D93AP_G17P_SGX_INTERRUPTS_VALID: u32 = 0xdf;
 
 const REPORT_CURSOR_MASK: u32 = 0xff;
 const KSM_TIMESTAMP_MASK: u64 = 0x00ff_ffff_ffff;
@@ -68,6 +78,10 @@ pub(crate) enum CompletionDecodeError {
     FirmwareEventStampMissing,
     CompletionOutstanding,
     CompletionRouteUnavailable,
+    FirmwareEventEndpoint,
+    FirmwareEventMessage,
+    FirmwareEventCursor,
+    FirmwareEventEmpty,
 }
 
 fn get_u16(raw: &[u8], offset: usize) -> u16 {
@@ -395,52 +409,187 @@ impl KsmCompletionCursor {
     }
 }
 
-/// Exact D93AP normal-CL completion ingress and its still-closed Linux edges.
-/// Firmware tests source bit 21 at `0xfffffc00000235c0`, drains the runtime
-/// descriptor array at `+0x2614` in order 1,3,0 through
-/// `0xfffffc000000d224`, and publishes type-1 stamp events through
-/// `0xfffffc0000020e38`. These values are KEXT_PROVEN; the three false fields
-/// are Linux ownership facts and keep the live executor closed.
+/// Owner of one normal-CL completion transport operation.
+///
+/// Source bit 21 and the `+0x21168/+0x21188` notification pair are consumed
+/// by GFX firmware. They are not a Linux interrupt-status/acknowledgement
+/// pair. Linux first participates when the firmware publishes an ordinary
+/// event-ring record and reports it through AIC source 4 or the equivalent
+/// RTKit notification.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum G17PCompletionOwner {
+    GfxFirmware,
+    LinuxPlatform,
+}
+
+/// Exact firmware-owned descriptor/MMIO drain for normal CL.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PFirmwareCompletionDrain {
+    pub(crate) source_bit: u8,
+    pub(crate) descriptor_table_offset: u32,
+    pub(crate) descriptor_stride: u32,
+    pub(crate) descriptor_ordinal: u8,
+    pub(crate) processed_offset: u32,
+    pub(crate) notification_offset: u32,
+    pub(crate) acknowledgement_offset: u32,
+    pub(crate) owner: G17PCompletionOwner,
+}
+
+pub(crate) const G17P_FIRMWARE_COMPLETION_DRAIN: G17PFirmwareCompletionDrain =
+    G17PFirmwareCompletionDrain {
+        source_bit: G17P_NORMAL_CL_COMPLETION_IRQ_BIT,
+        descriptor_table_offset: G17P_NORMAL_CL_COMPLETION_DESCRIPTOR_TABLE_OFFSET,
+        descriptor_stride: G17P_NORMAL_CL_COMPLETION_DESCRIPTOR_STRIDE,
+        descriptor_ordinal: G17P_NORMAL_CL_COMPLETION_ORDINAL,
+        processed_offset: G17P_NORMAL_CL_COMPLETION_PROCESSED_OFFSET,
+        notification_offset: G17P_KSM_COMPLETION_NOTIFY_BASE,
+        acknowledgement_offset: G17P_KSM_COMPLETION_ACK_BASE,
+        owner: G17PCompletionOwner::GfxFirmware,
+    };
+
+/// Exact D93AP host ingress facts and the current Linux ownership state.
+///
+/// The pinned ADT selects raw SGX source 4 (valid in mask `0xdf`) and AIC
+/// hardware interrupt 1001. The checked-in T8140 Linux GPU node exposes no
+/// SGX interrupt resource, so 1001 must not be passed directly to Linux's IRQ
+/// registration API: that API expects a DT-translated Linux virtual IRQ. The
+/// retained RTKit client does receive endpoint 0x20 and can demultiplex the
+/// exact type-2 notification, but no role-local event-ring pointer graph is
+/// mapped yet.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct G17PNormalClCompletionRoute {
-    pub(crate) physical_irq: u32,
-    pub(crate) source_bit: u8,
-    pub(crate) descriptor_ordinal: u8,
+    pub(crate) physical_aic_irq: u32,
+    pub(crate) sgx_source_index: u8,
+    pub(crate) sgx_interrupts_valid: u32,
     pub(crate) firmware_event_endpoint: u8,
     pub(crate) firmware_event_message: u64,
+    pub(crate) firmware_completion_owner: G17PCompletionOwner,
+    pub(crate) linux_gpu_dt_irq_resource: bool,
     pub(crate) physical_irq_registered: bool,
-    pub(crate) firmware_event_ring_mapped: bool,
-    pub(crate) mmio_ack_writer_available: bool,
+    pub(crate) rtkit_notification_demultiplexed: bool,
+    pub(crate) firmware_event_ring_source_mapped: bool,
+    pub(crate) firmware_event_shared_indices_mapped: bool,
+    pub(crate) firmware_event_entries_mapped: bool,
+    pub(crate) firmware_event_consumer_writer_available: bool,
 }
 
 pub(crate) const G17P_NORMAL_CL_COMPLETION_ROUTE: G17PNormalClCompletionRoute =
     G17PNormalClCompletionRoute {
-        physical_irq: D93AP_G17P_COMPLETION_IRQ,
-        source_bit: G17P_NORMAL_CL_COMPLETION_IRQ_BIT,
-        descriptor_ordinal: G17P_NORMAL_CL_COMPLETION_ORDINAL,
+        physical_aic_irq: D93AP_G17P_COMPLETION_IRQ,
+        sgx_source_index: D93AP_G17P_SGX_SOURCE_INDEX,
+        sgx_interrupts_valid: D93AP_G17P_SGX_INTERRUPTS_VALID,
         firmware_event_endpoint: G17P_FIRMWARE_EVENT_ENDPOINT,
         firmware_event_message: G17P_FIRMWARE_EVENT_MESSAGE,
+        firmware_completion_owner: G17PCompletionOwner::GfxFirmware,
+        linux_gpu_dt_irq_resource: false,
         physical_irq_registered: false,
-        firmware_event_ring_mapped: false,
-        mmio_ack_writer_available: false,
+        rtkit_notification_demultiplexed: true,
+        firmware_event_ring_source_mapped: false,
+        firmware_event_shared_indices_mapped: false,
+        firmware_event_entries_mapped: false,
+        firmware_event_consumer_writer_available: false,
     };
 
 pub(crate) const fn require_g17p_normal_cl_completion_route(
     route: G17PNormalClCompletionRoute,
 ) -> Result<(), CompletionDecodeError> {
-    if route.physical_irq == D93AP_G17P_COMPLETION_IRQ
-        && route.source_bit == G17P_NORMAL_CL_COMPLETION_IRQ_BIT
-        && route.descriptor_ordinal == G17P_NORMAL_CL_COMPLETION_ORDINAL
+    let physical_ingress = route.linux_gpu_dt_irq_resource && route.physical_irq_registered;
+    if route.physical_aic_irq == D93AP_G17P_COMPLETION_IRQ
+        && route.sgx_source_index == D93AP_G17P_SGX_SOURCE_INDEX
+        && route.sgx_interrupts_valid == D93AP_G17P_SGX_INTERRUPTS_VALID
         && route.firmware_event_endpoint == G17P_FIRMWARE_EVENT_ENDPOINT
         && route.firmware_event_message == G17P_FIRMWARE_EVENT_MESSAGE
-        && route.physical_irq_registered
-        && route.firmware_event_ring_mapped
-        && route.mmio_ack_writer_available
+        && matches!(
+            route.firmware_completion_owner,
+            G17PCompletionOwner::GfxFirmware
+        )
+        && (physical_ingress || route.rtkit_notification_demultiplexed)
+        && route.firmware_event_ring_source_mapped
+        && route.firmware_event_shared_indices_mapped
+        && route.firmware_event_entries_mapped
+        && route.firmware_event_consumer_writer_available
     {
         Ok(())
     } else {
         Err(CompletionDecodeError::CompletionRouteUnavailable)
     }
+}
+
+/// Recognize the exact firmware-event notification delivered to the retained
+/// RTKit endpoint. Bit 6 is a transport flag; the host-visible message type is
+/// the low six bits (`0x42 & 0x3f == 2`).
+pub(crate) const fn decode_g17p_firmware_event_notification(
+    endpoint: u8,
+    message: u64,
+) -> Result<(), CompletionDecodeError> {
+    if endpoint != G17P_FIRMWARE_EVENT_ENDPOINT {
+        return Err(CompletionDecodeError::FirmwareEventEndpoint);
+    }
+    if message != G17P_FIRMWARE_EVENT_MESSAGE
+        || ((message >> 48) as u8 & G17P_FIRMWARE_EVENT_HOST_TYPE_MASK)
+            != G17P_FIRMWARE_EVENT_HOST_TYPE
+    {
+        return Err(CompletionDecodeError::FirmwareEventMessage);
+    }
+    Ok(())
+}
+
+/// Shared indices for one ordinary firmware-event ring.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PFirmwareEventCursor {
+    pub(crate) consumer: u32,
+    pub(crate) producer: u32,
+}
+
+/// Pure read/publish plan for one host-consumed event record.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PFirmwareEventRead {
+    pub(crate) entry_offset: u32,
+    pub(crate) published_consumer: u32,
+    pub(crate) has_more_from_snapshot: bool,
+}
+
+/// Required host ordering for one role-local firmware-event record.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum G17PFirmwareEventReadStep {
+    SnapshotIndices,
+    ValidateIndices,
+    CopyEntry,
+    DecodeType,
+    AdvanceConsumer,
+    DmbIsh,
+    PublishConsumer,
+    CorrelateStamp,
+}
+
+pub(crate) const G17P_FIRMWARE_EVENT_READ_ORDER: [G17PFirmwareEventReadStep; 8] = [
+    G17PFirmwareEventReadStep::SnapshotIndices,
+    G17PFirmwareEventReadStep::ValidateIndices,
+    G17PFirmwareEventReadStep::CopyEntry,
+    G17PFirmwareEventReadStep::DecodeType,
+    G17PFirmwareEventReadStep::AdvanceConsumer,
+    G17PFirmwareEventReadStep::DmbIsh,
+    G17PFirmwareEventReadStep::PublishConsumer,
+    G17PFirmwareEventReadStep::CorrelateStamp,
+];
+
+pub(crate) const fn prepare_g17p_firmware_event_read(
+    cursor: G17PFirmwareEventCursor,
+) -> Result<G17PFirmwareEventRead, CompletionDecodeError> {
+    if cursor.consumer >= G17P_FIRMWARE_EVENT_CAPACITY
+        || cursor.producer >= G17P_FIRMWARE_EVENT_CAPACITY
+    {
+        return Err(CompletionDecodeError::FirmwareEventCursor);
+    }
+    if cursor.consumer == cursor.producer {
+        return Err(CompletionDecodeError::FirmwareEventEmpty);
+    }
+    let published_consumer = (cursor.consumer + 1) & (G17P_FIRMWARE_EVENT_CAPACITY - 1);
+    Ok(G17PFirmwareEventRead {
+        entry_offset: cursor.consumer * G17P_FIRMWARE_EVENT_ENTRY_SIZE as u32,
+        published_consumer,
+        has_more_from_snapshot: published_consumer != cursor.producer,
+    })
 }
 
 /// One decoded notification for a present completion descriptor.
@@ -470,8 +619,10 @@ pub(crate) const fn decode_g17p_normal_cl_notification(
     };
     Ok(G17PKsmCompletionNotification {
         ordinal,
-        notification_offset: G17P_KSM_COMPLETION_NOTIFY_BASE + ordinal as u32 * 8,
-        acknowledgement_offset: G17P_KSM_COMPLETION_ACK_BASE + ordinal as u32 * 8,
+        notification_offset: G17P_KSM_COMPLETION_NOTIFY_BASE
+            + ordinal as u32 * G17P_KSM_COMPLETION_MMIO_STRIDE,
+        acknowledgement_offset: G17P_KSM_COMPLETION_ACK_BASE
+            + ordinal as u32 * G17P_KSM_COMPLETION_MMIO_STRIDE,
         entry_count,
     })
 }
@@ -957,11 +1108,22 @@ mod tests {
     #[test]
     fn normal_cl_completion_route_is_ordinal_zero_and_live_closed() {
         let route = G17P_NORMAL_CL_COMPLETION_ROUTE;
-        assert_eq!(route.physical_irq, 1001);
-        assert_eq!(route.source_bit, 21);
-        assert_eq!(route.descriptor_ordinal, 0);
+        assert_eq!(route.physical_aic_irq, 1001);
+        assert_eq!(route.sgx_source_index, 4);
+        assert_eq!(route.sgx_interrupts_valid, 0xdf);
         assert_eq!(route.firmware_event_endpoint, 0x20);
         assert_eq!(route.firmware_event_message, 0x0042_0000_0000_0000);
+        assert_eq!(
+            route.firmware_completion_owner,
+            G17PCompletionOwner::GfxFirmware
+        );
+        assert!(!route.linux_gpu_dt_irq_resource);
+        assert!(!route.physical_irq_registered);
+        assert!(route.rtkit_notification_demultiplexed);
+        assert!(!route.firmware_event_ring_source_mapped);
+        assert!(!route.firmware_event_shared_indices_mapped);
+        assert!(!route.firmware_event_entries_mapped);
+        assert!(!route.firmware_event_consumer_writer_available);
         assert_eq!(G17P_FIRMWARE_EVENT_ENTRY_SIZE, 0x48);
         assert_eq!(G17P_FIRMWARE_EVENT_CAPACITY, 0x100);
         assert_eq!(G17P_COMPUTE_COMPLETION_SELECTOR, 2);
@@ -986,6 +1148,156 @@ mod tests {
                 entry_count: 0,
             }
         );
+    }
+
+    #[test]
+    fn normal_cl_firmware_drain_has_firmware_owned_status_and_ack() {
+        assert_eq!(
+            G17P_FIRMWARE_COMPLETION_DRAIN,
+            G17PFirmwareCompletionDrain {
+                source_bit: 21,
+                descriptor_table_offset: 0x2614,
+                descriptor_stride: 0x20,
+                descriptor_ordinal: 0,
+                processed_offset: 0x1c,
+                notification_offset: 0x21168,
+                acknowledgement_offset: 0x21188,
+                owner: G17PCompletionOwner::GfxFirmware,
+            }
+        );
+        assert_eq!(
+            G17P_FIRMWARE_COMPLETION_DRAIN.descriptor_table_offset
+                + G17P_FIRMWARE_COMPLETION_DRAIN.descriptor_stride
+                    * G17P_FIRMWARE_COMPLETION_DRAIN.descriptor_ordinal as u32
+                + G17P_FIRMWARE_COMPLETION_DRAIN.processed_offset,
+            0x2630
+        );
+    }
+
+    #[test]
+    fn exact_ep20_notification_is_demultiplexed_without_opening_live_route() {
+        assert_eq!(
+            decode_g17p_firmware_event_notification(0x20, 0x0042_0000_0000_0000),
+            Ok(())
+        );
+        assert_eq!(
+            decode_g17p_firmware_event_notification(0x21, 0x0042_0000_0000_0000),
+            Err(CompletionDecodeError::FirmwareEventEndpoint)
+        );
+        assert_eq!(
+            decode_g17p_firmware_event_notification(0x20, 0x0002_0000_0000_0000),
+            Err(CompletionDecodeError::FirmwareEventMessage)
+        );
+        assert_eq!(
+            (G17P_FIRMWARE_EVENT_MESSAGE >> 48) as u8 & G17P_FIRMWARE_EVENT_HOST_TYPE_MASK,
+            G17P_FIRMWARE_EVENT_HOST_TYPE
+        );
+        assert_eq!(
+            require_g17p_normal_cl_completion_route(G17P_NORMAL_CL_COMPLETION_ROUTE),
+            Err(CompletionDecodeError::CompletionRouteUnavailable)
+        );
+    }
+
+    #[test]
+    fn firmware_event_read_wraps_and_never_publishes_an_empty_ring() {
+        assert_eq!(
+            prepare_g17p_firmware_event_read(G17PFirmwareEventCursor {
+                consumer: 0,
+                producer: 2,
+            }),
+            Ok(G17PFirmwareEventRead {
+                entry_offset: 0,
+                published_consumer: 1,
+                has_more_from_snapshot: true,
+            })
+        );
+        assert_eq!(
+            prepare_g17p_firmware_event_read(G17PFirmwareEventCursor {
+                consumer: 0xff,
+                producer: 0,
+            }),
+            Ok(G17PFirmwareEventRead {
+                entry_offset: 0xff * 0x48,
+                published_consumer: 0,
+                has_more_from_snapshot: false,
+            })
+        );
+        assert_eq!(
+            prepare_g17p_firmware_event_read(G17PFirmwareEventCursor {
+                consumer: 7,
+                producer: 7,
+            }),
+            Err(CompletionDecodeError::FirmwareEventEmpty)
+        );
+        assert_eq!(
+            prepare_g17p_firmware_event_read(G17PFirmwareEventCursor {
+                consumer: 0x100,
+                producer: 0,
+            }),
+            Err(CompletionDecodeError::FirmwareEventCursor)
+        );
+        assert_eq!(G17P_FIRMWARE_EVENT_CONSUMER_OFFSET, 0);
+        assert_eq!(G17P_FIRMWARE_EVENT_PRODUCER_OFFSET, 0x20);
+        assert_eq!(
+            G17P_FIRMWARE_EVENT_READ_ORDER,
+            [
+                G17PFirmwareEventReadStep::SnapshotIndices,
+                G17PFirmwareEventReadStep::ValidateIndices,
+                G17PFirmwareEventReadStep::CopyEntry,
+                G17PFirmwareEventReadStep::DecodeType,
+                G17PFirmwareEventReadStep::AdvanceConsumer,
+                G17PFirmwareEventReadStep::DmbIsh,
+                G17PFirmwareEventReadStep::PublishConsumer,
+                G17PFirmwareEventReadStep::CorrelateStamp,
+            ]
+        );
+    }
+
+    #[test]
+    fn live_route_requires_one_ingress_and_the_complete_event_ring_mapping() {
+        let complete_rtkit = G17PNormalClCompletionRoute {
+            firmware_event_ring_source_mapped: true,
+            firmware_event_shared_indices_mapped: true,
+            firmware_event_entries_mapped: true,
+            firmware_event_consumer_writer_available: true,
+            ..G17P_NORMAL_CL_COMPLETION_ROUTE
+        };
+        assert_eq!(
+            require_g17p_normal_cl_completion_route(complete_rtkit),
+            Ok(())
+        );
+
+        for unavailable in [
+            G17PNormalClCompletionRoute {
+                rtkit_notification_demultiplexed: false,
+                ..complete_rtkit
+            },
+            G17PNormalClCompletionRoute {
+                firmware_event_ring_source_mapped: false,
+                ..complete_rtkit
+            },
+            G17PNormalClCompletionRoute {
+                firmware_event_shared_indices_mapped: false,
+                ..complete_rtkit
+            },
+            G17PNormalClCompletionRoute {
+                firmware_event_entries_mapped: false,
+                ..complete_rtkit
+            },
+            G17PNormalClCompletionRoute {
+                firmware_event_consumer_writer_available: false,
+                ..complete_rtkit
+            },
+            G17PNormalClCompletionRoute {
+                firmware_completion_owner: G17PCompletionOwner::LinuxPlatform,
+                ..complete_rtkit
+            },
+        ] {
+            assert_eq!(
+                require_g17p_normal_cl_completion_route(unavailable),
+                Err(CompletionDecodeError::CompletionRouteUnavailable)
+            );
+        }
     }
 
     #[test]

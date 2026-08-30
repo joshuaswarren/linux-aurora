@@ -185,6 +185,7 @@ struct G17PRoleRtkitState {
     acked: AtomicBool,
     crashed: AtomicBool,
     runtime_events: AtomicU32,
+    firmware_event_notifications: AtomicU32,
 }
 
 impl G17PRoleRtkitState {
@@ -203,6 +204,7 @@ impl G17PRoleRtkitState {
             acked: AtomicBool::new(false),
             crashed: AtomicBool::new(false),
             runtime_events: AtomicU32::new(0),
+            firmware_event_notifications: AtomicU32::new(0),
         }
     }
 }
@@ -524,6 +526,13 @@ impl rtkit::Operations for G17PRtkitOps {
             && (message >> 48) as u16 == INITDATA_ACK_TYPE
         {
             data.acked.store(true, Ordering::Release);
+        } else if g17_completion::decode_g17p_firmware_event_notification(endpoint, message).is_ok()
+        {
+            // This is ingress ownership only. The role-local 0x48 event ring
+            // is not mapped yet, so no consumer index or queue state is
+            // changed here.
+            data.firmware_event_notifications
+                .fetch_add(1, Ordering::Relaxed);
         } else if endpoint == g17_rtkit::ENDPOINT_GFX_INTERRUPTS {
             data.runtime_events.fetch_add(1, Ordering::Relaxed);
         }
