@@ -41,11 +41,6 @@
 #define APPLE_DCP_LINK_PHASE_PROPERTY	"apple,dcp-link-phase"
 #define APPLE_DCP_LINK_MESSAGE_PROPERTY	"apple,dcp-link-message"
 
-#define DCP25G83_MGMT_ENDPOINT		0
-#define DCP25G83_MGMT_TYPE		GENMASK_ULL(59, 52)
-#define DCP25G83_MGMT_ECHO_REQUEST	3
-#define DCP25G83_MGMT_ECHO_COOKIE	0x44504331ULL
-
 static int dcp_tx_offset(enum dcp_context_id id)
 {
 	switch (id) {
@@ -199,13 +194,13 @@ static int dcp25g83_d563_tail_index(const void *input, u32 input_size)
 	return -ENOENT;
 }
 
-static bool dcp25g83_mgmt_probe(struct apple_dcp *dcp, int tag,
-				const struct apple_dcp_link_rpc_view *view)
+static bool dcp25g83_oob_main_display_probe(struct apple_dcp *dcp, int tag,
+					    const struct apple_dcp_link_rpc_view *view)
 {
 	static const char property[] = "SupportRelbufInfoCb";
 
 	if (dcp->fw_compat != DCP_FIRMWARE_H17P || !dcp->adopted_session ||
-	    dcp->link_mgmt_route_probe_sent || tag != 102 ||
+	    dcp->link_oob_main_display_probe_sent || tag != 102 ||
 	    view->input_size != 0x44 || view->output_size)
 		return false;
 
@@ -575,6 +570,13 @@ static int dcp_link_push_context(struct apple_dcp *dcp,
 			 in_len, out_len);
 	}
 	ret = dcp_send_message_sync(dcp, APPLE_DCP_LINK_ENDPOINT, message);
+	if (call_tag == APPLE_DCP_H17P_CALL_IS_MAIN_DISPLAY && stream == 1 &&
+	    !remote)
+		dev_info(dcp->dev,
+			 "DCP25G83_EP37_OOB_A412_TX endpoint %#x word %#llx channel oobcmd stream 1 remote 0 new %u local base %#x offset %#x size %#x top %#x->%#x depth %u header %#x/%u/%u mailbox result %d expect reply %#x\n",
+			 APPLE_DCP_LINK_ENDPOINT, message, new_stream,
+			 layout.local_offset, offset, payload_size, old_top,
+			 next_top, depth, call_tag, in_len, out_len, ret, 0x642);
 	if (call_tag == APPLE_DCP_H17P_CALL_VI_SET_TEMPERATURE_HINT ||
 	    call_tag == APPLE_DCP_H17P_CALL_PMU_SERVICE_MATCHED ||
 	    call_tag == APPLE_DCP_H17P_CALL_BACKLIGHT_SERVICE_MATCHED)
@@ -1058,7 +1060,8 @@ static void dcp_link_handle_callback(struct apple_dcp *dcp, u64 message)
 				 handled ? reply : 0);
 	}
 	if (handled) {
-		bool route_probe = dcp25g83_mgmt_probe(dcp, tag, &view);
+		bool oob_probe = dcp25g83_oob_main_display_probe(dcp, tag,
+								 &view);
 
 		ack_ret = dcp_link_ack(dcp, DCP_CONTEXT_CB);
 		dcp25g83_d563_a2i_end(dcp, d563_tail_index, ack_ret);
@@ -1066,33 +1069,13 @@ static void dcp_link_handle_callback(struct apple_dcp *dcp, u64 message)
 			dev_info(dcp->dev,
 				 "DCPLink callback %u D%03d ACK %#llx send result %d\n",
 				 sequence, tag, reply, ack_ret);
-		if (route_probe) {
-			u64 probe = FIELD_PREP(DCP25G83_MGMT_TYPE,
-					       DCP25G83_MGMT_ECHO_REQUEST) |
-				    DCP25G83_MGMT_ECHO_COOKIE;
-			u32 before = 0, after = 0;
-			int before_ret, after_ret;
-			int probe_ret = -ECANCELED;
-
-			/*
-			 * Exact 25G83 EP0 type 3 is a stateless echo request. The
-			 * firmware returns type 4 with the low 32-bit cookie unchanged.
-			 * This partitions the lower RTKit route from the EP37 consumer
-			 * without changing D102 memory or sending another link message.
-			 */
-			dcp->link_mgmt_route_probe_sent = true;
-			before_ret = dcp_mbox_a2i_control(dcp, &before);
-			if (!ack_ret)
-				probe_ret = dcp_send_message_sync(dcp,
-								  DCP25G83_MGMT_ENDPOINT,
-								  probe);
-			after_ret = dcp_mbox_a2i_control(dcp, &after);
+		if (oob_probe) {
+			dcp->link_oob_main_display_probe_sent = true;
 			dev_info(dcp->dev,
-				 "DCP25G83_MGMT_ROUTE_ECHO_PROBE callback %u ACK %#llx result %d request %#llx result %d A2I before %#x result %d after %#x result %d expect %#llx\n",
-				 sequence, reply, ack_ret, probe, probe_ret,
-				 before, before_ret, after, after_ret,
-				 FIELD_PREP(DCP25G83_MGMT_TYPE, 4) |
-				 DCP25G83_MGMT_ECHO_COOKIE);
+				 "DCP25G83_EP37_OOB_A412_AFTER_ACK callback %u ACK %#llx result %d\n",
+				 sequence, reply, ack_ret);
+			if (!ack_ret)
+				apple_dcp_h17p_probe_is_main_display(dcp);
 		}
 	}
 }

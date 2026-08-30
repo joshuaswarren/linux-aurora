@@ -192,7 +192,7 @@ struct apple_dcp {
 	u64 link_init_message;
 	u16 link_rx_log_count;
 	u16 link_reply_log_count;
-	bool link_mgmt_route_probe_sent;
+	bool link_oob_main_display_probe_sent;
 	u32 link_d563_a2i_before[5];
 	u32 link_d563_a2i_after[5];
 	u8 link_d563_a2i_count;
