@@ -55,6 +55,7 @@ bool dcp_crtc_mode_fixup(struct drm_crtc *crtc,
 void dcp_set_dimensions(struct apple_dcp *dcp);
 int dcp_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message);
 int dcp_send_message_sync(struct apple_dcp *dcp, u8 endpoint, u64 message);
+void dcp_rtk_timeout_crashlog_snapshot(struct apple_dcp *dcp);
 int dcp_mbox_a2i_control(struct apple_dcp *dcp, u32 *control);
 int dcp_try_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message,
 			 u32 *control);

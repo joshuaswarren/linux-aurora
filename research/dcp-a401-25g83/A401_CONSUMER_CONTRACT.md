@@ -393,3 +393,21 @@ was admitted immediately but remained the sole unread A2I entry. This
 eliminates the exact EP1 payload and Linux's shared EP1/EP37 worker as causes.
 DCP had already stopped draining A2I after consuming ACK5. The mailbox-wrapper
 diagnostic was removed; only the exact native reply correction remains.
+
+## Timeout crashlog discriminator
+
+The adopted path does not send a new STARTEP for EP1. It marks the system
+endpoint as inherited from the previous owner and starts only the mailbox.
+The fixed firmware DVA in the EP1 word therefore names the previous owner's
+already-established crashlog buffer. Its arrival immediately after ACK5 is
+consistent with the non-returning root abort path, but the first Linux worker
+read occurs while the notification is still being handled and has not found a
+`CLHE` header in retained runs.
+
+The next diagnostic rereads that existing Normal-NC mapping only after the
+three-second A401 timeout. It sends no mailbox word and changes no callback or
+wait timing. `DCP25G83_A401_CRASHLOG_TIMEOUT ... reported 1` is a direct root
+crash result; the existing parser then prints the crash strings and firmware
+version. `reported 0` plus the raw 32-byte header means the crash record is
+absent or not AP-visible and leaves reply-association versus release-tail
+abort unresolved.
