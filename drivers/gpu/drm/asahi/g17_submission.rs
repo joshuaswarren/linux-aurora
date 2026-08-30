@@ -2595,12 +2595,14 @@ pub(crate) enum G17PFirstSubmitPublicationStep {
     PublishEntrySignalPointer,
     AddKicks,
     PublishCl2,
+    SendReadinessControlDone0x84,
+    WaitReadinessRetirement,
     SendActivation,
     DirectKickBarrier,
     SendDirectKick,
 }
 
-pub(crate) const G17P_FIRST_SUBMIT_PUBLICATION_ORDER: [G17PFirstSubmitPublicationStep; 15] = [
+pub(crate) const G17P_FIRST_SUBMIT_PUBLICATION_ORDER: [G17PFirstSubmitPublicationStep; 17] = [
     G17PFirstSubmitPublicationStep::PublishB2,
     G17PFirstSubmitPublicationStep::StageComputeReadinessSuffix,
     G17PFirstSubmitPublicationStep::PublishConfigUpdatePointer,
@@ -2613,6 +2615,8 @@ pub(crate) const G17P_FIRST_SUBMIT_PUBLICATION_ORDER: [G17PFirstSubmitPublicatio
     G17PFirstSubmitPublicationStep::PublishEntrySignalPointer,
     G17PFirstSubmitPublicationStep::AddKicks,
     G17PFirstSubmitPublicationStep::PublishCl2,
+    G17PFirstSubmitPublicationStep::SendReadinessControlDone0x84,
+    G17PFirstSubmitPublicationStep::WaitReadinessRetirement,
     G17PFirstSubmitPublicationStep::SendActivation,
     G17PFirstSubmitPublicationStep::DirectKickBarrier,
     G17PFirstSubmitPublicationStep::SendDirectKick,
@@ -5345,6 +5349,8 @@ mod tests {
                 G17PFirstSubmitPublicationStep::PublishEntrySignalPointer,
                 G17PFirstSubmitPublicationStep::AddKicks,
                 G17PFirstSubmitPublicationStep::PublishCl2,
+                G17PFirstSubmitPublicationStep::SendReadinessControlDone0x84,
+                G17PFirstSubmitPublicationStep::WaitReadinessRetirement,
                 G17PFirstSubmitPublicationStep::SendActivation,
                 G17PFirstSubmitPublicationStep::DirectKickBarrier,
                 G17PFirstSubmitPublicationStep::SendDirectKick,
