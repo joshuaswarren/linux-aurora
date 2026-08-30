@@ -48,10 +48,16 @@ const ROOT_PAIR_ALLOC_SIZE: usize = 0xc000;
 const PRIMARY_STATUS_A_STATE_GRID_OFFSET: u64 = 0xee40;
 const PRIMARY_STATUS_A_WORK_SCAN_OFFSET: u64 = 0x0c;
 const PRIMARY_STATUS_A_RUNTIME_OFFSET: u64 = 0x10;
+const PRIMARY_STATUS_A_POWER_CALLBACK_COUNT_OFFSET: u64 = 0x1c;
 const PRIMARY_STATUS_A_WORK_SCAN_STATE_GRID_OFFSET: u64 =
     PRIMARY_STATUS_A_STATE_GRID_OFFSET + PRIMARY_STATUS_A_WORK_SCAN_OFFSET;
 const PRIMARY_STATUS_A_RUNTIME_STATE_GRID_OFFSET: u64 =
     PRIMARY_STATUS_A_STATE_GRID_OFFSET + PRIMARY_STATUS_A_RUNTIME_OFFSET;
+// Exact J700 A000 hardware-init handshake inside primary Status-B. The worker
+// clears the EP21 callback before entering this protocol, increments +0x48f0,
+// drives +0x4900 through 1 -> 2 and 3 -> 0, then reinstalls the callback.
+const PRIMARY_STATUS_B_HARDWARE_INIT_EPOCH_OFFSET: u64 = 0x48f0;
+const PRIMARY_STATUS_B_HARDWARE_INIT_STATE_OFFSET: u64 = 0x4900;
 const SECONDARY_EXTRA_0_BEFORE_PRIMARY_STATUS_A: u64 = 0x6c0;
 const SECONDARY_HWDATA_STATE_OFFSET: u64 = 0x3c0;
 const FWCTL_SIZE: usize = 0x4000;
@@ -678,6 +684,60 @@ pub(crate) struct G17PStatusASnapshot {
     pub(crate) raw: u64,
     pub(crate) active: u32,
     pub(crate) scheduler_constructed: u32,
+}
+
+/// Cache-safe primary Status-B hardware-init handshake state.
+///
+/// Exact J700 GFX A000 writes state 1 and waits for 2, then writes 3 and waits
+/// for 0. The epoch increments between the first transition and its wait.
+/// Status-A `+0x1c` increments only after a completed power callback, so it
+/// distinguishes a retained lifecycle from an intervening transition.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PHardwareInitHandshakeSnapshot {
+    pub(crate) status_b: u64,
+    pub(crate) epoch_address: u64,
+    pub(crate) epoch: u64,
+    pub(crate) state_address: u64,
+    pub(crate) state: u32,
+    pub(crate) power_callback_count_address: u64,
+    pub(crate) power_callback_count: u32,
+}
+
+impl G17PHardwareInitHandshakeSnapshot {
+    const fn decode(
+        status_b: u64,
+        epoch_address: u64,
+        epoch: u64,
+        state_address: u64,
+        state: u32,
+        power_callback_count_address: u64,
+        power_callback_count: u32,
+    ) -> Self {
+        Self {
+            status_b,
+            epoch_address,
+            epoch,
+            state_address,
+            state,
+            power_callback_count_address,
+            power_callback_count,
+        }
+    }
+
+    pub(crate) const fn waiting_for_first_response(self) -> bool {
+        self.state == 1
+    }
+
+    pub(crate) const fn waiting_for_final_clear(self) -> bool {
+        self.state == 3
+    }
+
+    /// States 1, 2, and 3 all occur after the worker removes EP21 and before
+    /// it reinstalls the callback. State zero alone cannot prove either side
+    /// of that interval.
+    pub(crate) const fn callback_known_unregistered(self) -> bool {
+        self.state >= 1 && self.state <= 3
+    }
 }
 
 impl G17PStatusASnapshot {
@@ -4303,6 +4363,53 @@ impl G17ResourceOwner {
         ))
     }
 
+    /// Read the exact primary Status-B hardware-init state through the
+    /// existing WC object. Firmware maps this host-owned state grid uncached,
+    /// so no private firmware cacheline is sampled.
+    pub(crate) fn hardware_init_handshake_snapshot(
+        &mut self,
+    ) -> Result<G17PHardwareInitHandshakeSnapshot> {
+        let status_b = self.handoff.primary.instance.status_b;
+        let expected_status_b = self
+            .handoff
+            .primary
+            .state_grid
+            .checked_add(g17_initdata::PRIMARY_STATUS_B_STATE_GRID_OFFSET as u64)
+            .ok_or(EINVAL)?;
+        if status_b != expected_status_b {
+            return Err(EINVAL);
+        }
+        let epoch_address = status_b
+            .checked_add(PRIMARY_STATUS_B_HARDWARE_INIT_EPOCH_OFFSET)
+            .ok_or(EINVAL)?;
+        let state_address = status_b
+            .checked_add(PRIMARY_STATUS_B_HARDWARE_INIT_STATE_OFFSET)
+            .ok_or(EINVAL)?;
+        let power_callback_count_address = self
+            .handoff
+            .primary
+            .instance
+            .status_a
+            .checked_add(PRIMARY_STATUS_A_POWER_CALLBACK_COUNT_OFFSET)
+            .ok_or(EINVAL)?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        let epoch = self.resources.primary_state.read_u64(epoch_address)?;
+        let state = self.resources.primary_state.read_u32(state_address)?;
+        let power_callback_count = self
+            .resources
+            .primary_state
+            .read_u32(power_callback_count_address)?;
+        Ok(G17PHardwareInitHandshakeSnapshot::decode(
+            status_b,
+            epoch_address,
+            epoch,
+            state_address,
+            state,
+            power_callback_count_address,
+            power_callback_count,
+        ))
+    }
+
     pub(crate) fn control_opening_effect(&mut self) -> Result<G17PControlOpeningEffect> {
         core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
         let shared_cursor_address = self
@@ -6887,6 +6994,45 @@ mod tests {
         assert_eq!(snapshot.raw, 0xaabb_ccdd_1122_3344);
         assert_eq!(snapshot.active, 0x1122_3344);
         assert_eq!(snapshot.scheduler_constructed, 0xaabb_ccdd);
+    }
+
+    #[test]
+    fn hardware_init_handshake_uses_exact_coherent_status_offsets() {
+        assert_eq!(PRIMARY_STATUS_A_POWER_CALLBACK_COUNT_OFFSET, 0x1c);
+        assert_eq!(PRIMARY_STATUS_B_HARDWARE_INIT_EPOCH_OFFSET, 0x48f0);
+        assert_eq!(PRIMARY_STATUS_B_HARDWARE_INIT_STATE_OFFSET, 0x4900);
+
+        let status_a = KERN + 0xee40;
+        let status_b = KERN + 0x340;
+        let snapshot = G17PHardwareInitHandshakeSnapshot::decode(
+            status_b,
+            status_b + 0x48f0,
+            7,
+            status_b + 0x4900,
+            3,
+            status_a + 0x1c,
+            2,
+        );
+        assert_eq!(snapshot.status_b, status_b);
+        assert_eq!(snapshot.epoch_address, status_b + 0x48f0);
+        assert_eq!(snapshot.epoch, 7);
+        assert_eq!(snapshot.state_address, status_b + 0x4900);
+        assert_eq!(snapshot.state, 3);
+        assert_eq!(snapshot.power_callback_count_address, status_a + 0x1c);
+        assert_eq!(snapshot.power_callback_count, 2);
+        assert!(!snapshot.waiting_for_first_response());
+        assert!(snapshot.waiting_for_final_clear());
+        assert!(snapshot.callback_known_unregistered());
+        let between_waits = G17PHardwareInitHandshakeSnapshot::decode(
+            status_b,
+            status_b + 0x48f0,
+            7,
+            status_b + 0x4900,
+            2,
+            status_a + 0x1c,
+            2,
+        );
+        assert!(between_waits.callback_known_unregistered());
     }
 
     #[test]

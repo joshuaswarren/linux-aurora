@@ -261,6 +261,36 @@ fn log_g17p_status_a(
     }
 }
 
+fn log_g17p_hardware_init_handshake(
+    dev: &kernel::device::Device,
+    manager: &mut g17_manager::G17PManagerConstruction,
+    checkpoint: &'static str,
+) {
+    match manager.hardware_init_handshake_snapshot() {
+        Ok(snapshot) => dev_info!(
+            dev,
+            "G17P hardware-init handshake checkpoint={} status-b={:#x} epoch-address={:#x} epoch={} state-address={:#x} state={} callback-known-unregistered={} waiting-first-response={} waiting-final-clear={} power-callback-count-address={:#x} power-callback-count={}\n",
+            checkpoint,
+            snapshot.status_b,
+            snapshot.epoch_address,
+            snapshot.epoch,
+            snapshot.state_address,
+            snapshot.state,
+            snapshot.callback_known_unregistered(),
+            snapshot.waiting_for_first_response(),
+            snapshot.waiting_for_final_clear(),
+            snapshot.power_callback_count_address,
+            snapshot.power_callback_count,
+        ),
+        Err(error) => dev_err!(
+            dev,
+            "G17P hardware-init handshake checkpoint={} read failed ({:?})\n",
+            checkpoint,
+            error,
+        ),
+    }
+}
+
 fn log_g17p_scheduler_gate(
     dev: &kernel::device::Device,
     registers: &regs::Resources,
@@ -958,6 +988,11 @@ fn finish_boot_session(
         opening_effect.inner_state,
         opening_effect.operand_slot
     );
+    log_g17p_hardware_init_handshake(
+        pdev.as_ref(),
+        manager,
+        "native-opening-retired-baseline",
+    );
 
     if !g17_submission::G17P_NATIVE_PRE_USER_EP21_MESSAGES.is_empty() {
         return Err(EINVAL);
@@ -1460,6 +1495,11 @@ impl G17PLiveRuntime {
                     self.manager.as_mut().ok_or(ENODEV)?,
                     "native-first-pre-0x0a",
                 );
+                log_g17p_hardware_init_handshake(
+                    self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                    self.manager.as_mut().ok_or(ENODEV)?,
+                    "native-first-pre-0x0a",
+                );
                 log_g17p_a2i_control(
                     self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
                     self.cpus.as_ref().ok_or(ENODEV)?.gfx(),
@@ -1519,6 +1559,11 @@ impl G17PLiveRuntime {
                     self.manager.as_mut().ok_or(ENODEV)?,
                     "native-first-post-0x10",
                 );
+                log_g17p_hardware_init_handshake(
+                    self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                    self.manager.as_mut().ok_or(ENODEV)?,
+                    "native-first-post-0x10",
+                );
             }
         }
 
@@ -1565,6 +1610,11 @@ impl G17PLiveRuntime {
                         "native-first-timeout",
                     );
                     log_g17p_status_a(
+                        self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                        self.manager.as_mut().ok_or(ENODEV)?,
+                        "native-first-timeout",
+                    );
+                    log_g17p_hardware_init_handshake(
                         self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
                         self.manager.as_mut().ok_or(ENODEV)?,
                         "native-first-timeout",
