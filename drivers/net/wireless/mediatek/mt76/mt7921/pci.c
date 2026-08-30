@@ -10,6 +10,7 @@
 #include <linux/delay.h>
 
 #include "mt7921.h"
+#include "mt7932_mcu_lab.h"
 #include "../mt76_connac2_mac.h"
 #include "../dma.h"
 #include "mcu.h"
@@ -866,6 +867,7 @@ static int mt7921_pci_probe(struct pci_dev *pdev,
 err_free_irq:
 	devm_free_irq(&pdev->dev, pdev->irq, dev);
 err_free_dev:
+	mt7932_mcu_lab_destroy(dev);
 	mt76_free_device(&dev->mt76);
 err_free_pci_vec:
 	pci_free_irq_vectors(pdev);
@@ -877,6 +879,8 @@ static void mt7921_pci_remove(struct pci_dev *pdev)
 {
 	struct mt76_dev *mdev = pci_get_drvdata(pdev);
 	struct mt792x_dev *dev = container_of(mdev, struct mt792x_dev, mt76);
+
+	mt7932_mcu_lab_destroy(dev);
 
 	if (of_property_read_bool(dev->mt76.dev->of_node, "wakeup-source"))
 		device_init_wakeup(dev->mt76.dev, false);

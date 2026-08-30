@@ -2,12 +2,15 @@
 /* Copyright (C) 2020 MediaTek Inc. */
 
 #include <linux/fs.h>
+#include <linux/crc32.h>
 #include <linux/firmware.h>
+#include <linux/iommu.h>
 #include <linux/pci.h>
 #include <linux/unaligned.h>
 #include "mt7921.h"
 #include "regd.h"
 #include "mcu.h"
+#include "mt7932_mcu_lab.h"
 #include "../dma.h"
 #include "../mt76_connac2_mac.h"
 #include "../mt792x_trace.h"
@@ -360,6 +363,24 @@ mt7932_mcu_scan_idx_event(struct mt792x_dev *dev, const u8 *content, u16 len)
 		{ 0xd818, "channel-state-detail" },
 		{ 0xd7b8, "channel-set" },
 		{ 0xd794, "channel-anomaly" },
+		/* Exact 25G83 code/table integrity assertions.  NDS32 RE proved both
+		 * operands are link-time literals; these cannot diagnose runtime
+		 * restore state and are retained only to label unexpected corruption.
+		 */
+		{ 0x21110, "cmdbt-ring-bss-address-error" },
+		{ 0x210b4, "cmdbt-data-address-error" },
+		{ 0x21054, "cmdbt-dlm-address-error" },
+		/* Exact lifecycle receipts from the deployed 25G83 idxlog.  A valid
+		 * deep-sleep restore is entry/eligibility, wake predicate, then the
+		 * register-table restore plus DMASHDL reset completion.  Deployed
+		 * helpers 0x0095ccc2/0x0095cd88/0x0095cdf0 are restore, backup and
+		 * reset wrapper respectively.
+		 */
+		{ 0x3ddc, "wifi-may-enter-deep-sleep" },
+		{ 0x3e0c, "wake-up-from-deep-sleep" },
+		{ 0x211f4, "wfdma-restore-status-fail" },
+		{ 0x211b0, "wfdma-backup-status-fail" },
+		{ 0x21170, "dmashdl-reset-done" },
 		{ 0x3a58, "cnm-open-channel-request" },
 		{ 0x3728, "cnm-channel-request-consumed" },
 		{ 0x3840, "cnm-open-grant" },
@@ -570,6 +591,8 @@ void mt7921_mcu_rx_event(struct mt792x_dev *dev, struct sk_buff *skb)
 
 	if (skb_linearize(skb))
 		return;
+	if (mt7932_mcu_lab_rx(dev, skb))
+		return;
 
 	rxd = (struct mt76_connac2_mcu_rxd *)skb->data;
 
@@ -649,7 +672,7 @@ static int mt7921_load_clc(struct mt792x_dev *dev, const char *fw_name)
 	}
 	if (is_mt7932(&dev->mt76))
 		dev_info(dev->mt76.dev,
-			 "J700_MT7932_CLC_EEPROM_QUERY_SKIP: generic-extra-command=0 trace-ordinal-alignment=1\n");
+			 "J700_MT7932_CLC_EEPROM_QUERY_SKIP: mode=exact-startup generic-extra-command=0 trace-ordinal-alignment=1 first-divergence-fixed=84\n");
 
 	ret = request_firmware(&fw, fw_name, mdev->dev);
 	if (ret)
@@ -1246,7 +1269,7 @@ mt7932_validate_live_start_transcript(const struct firmware *fw)
 }
 
 static int mt7932_mcu_ack_dma_state(struct mt792x_dev *dev, u32 state,
-				     const char *name)
+				    const char *name)
 {
 	u32 value;
 
@@ -1254,7 +1277,14 @@ static int mt7932_mcu_ack_dma_state(struct mt792x_dev *dev, u32 state,
 	 * NORMAL_STATE recovery handshake implemented by upstream mt7915/mt7996.
 	 * MT792x defines the registers and state bits but has no generic caller.
 	 */
-	if (!mt76_poll_msec(dev, MT_MCU_CMD, state, state, 500)) {
+	/* This handshake is on the command-stream critical path.  The generic
+	 * millisecond helper sleeps for 10--20 ms after each missed sample; on
+	 * J700 that stretched the measured ordinal-87-to-88 boundary from
+	 * macOS's 8.68 ms to 40.55 ms even after console traffic was suppressed.
+	 * Poll at the existing mt76 10-us cadence while retaining the same
+	 * 500-ms absolute failure bound.
+	 */
+	if (!mt76_poll(dev, MT_MCU_CMD, state, state, 500000)) {
 		value = mt76_rr(dev, MT_MCU_CMD);
 		dev_err(dev->mt76.dev,
 			"J700_MT7932_RUNTIME_DMA_HANDSHAKE_FAIL: expected=%s bit=0x%08x observed=0x%08x\n",
@@ -1278,8 +1308,10 @@ static void mt7932_runtime_irq_publish(struct mt792x_dev *dev,
 	 * Linux IRQ line disabled while reproducing the hardware waveform so the
 	 * generic tasklet cannot consume the synchronously-polled MCU state bits.
 	 */
-	mt76_wr(dev, MT7932_HOST_INT_ENA, MT7932_RUNTIME_HOST_INT_MASK);
+	mt76_set_irq_mask(&dev->mt76, 0, U32_MAX,
+			  MT7932_RUNTIME_HOST_INT_MASK);
 	mt76_wr(dev, MT_WFDMA0_HOST_INT_STA, MT7932_RUNTIME_HOST_INT_MASK);
+	mt76_wr(dev, MT7932_HOST_INT_ENA, MT7932_RUNTIME_HOST_INT_MASK);
 	mt76_wr(dev, MT_MCU2HOST_SW_INT_ENA, MT7932_MCU2HOST_SW_INT_MASK);
 	dev_info(dev->mt76.dev,
 		 "J700_MT7932_RUNTIME_IRQ_WAVEFORM: phase=%s host=0x%08x status=0x%08x mcu2host=0x%08x source=run191-seq14275-14417\n",
@@ -1375,6 +1407,7 @@ static void mt7932_live_start_irq_service(struct mt792x_dev *dev,
 	struct mt76_dev *mdev = &dev->mt76;
 	struct mt76_queue *q = mdev->q_mcu[MT_MCUQ_WM];
 	u32 queued_before = q ? READ_ONCE(q->queued) : 0;
+	u32 rx_done = 0;
 	u8 i;
 
 	for (i = 0; i < count; i++) {
@@ -1390,6 +1423,7 @@ static void mt7932_live_start_irq_service(struct mt792x_dev *dev,
 			mdev->queue_ops->tx_cleanup(mdev, q, false);
 		mt76_wr(dev, MT_WFDMA0_HOST_INT_STA,
 			MT7932_RUNTIME_HOST_INT_MASK);
+		rx_done += mt76_dma_rx_poll_sync(mdev, 256);
 		mt76_set_irq_mask(mdev, MT7932_HOST_INT_ENA,
 				  0, MT7932_RUNTIME_HOST_INT_MASK);
 		mt76_wr(dev, MT_MCU2HOST_SW_INT_ENA,
@@ -1397,16 +1431,23 @@ static void mt7932_live_start_irq_service(struct mt792x_dev *dev,
 		if (i + 1 < count)
 			udelay(50);
 	}
-	dev_info(dev->mt76.dev,
-		 "J700_MT7932_PRE_REGISTER_IRQ_SERVICE: ordinal=%u cycles=%u-%u queued=%u->%u head=%u tail=%u host_mask=0x%08x mcu2host=0x%08x source=run191-mmio+ddone\n",
-		 ordinal, first, first + count - 1,
-		 queued_before, q ? READ_ONCE(q->queued) : 0,
-		 q ? q->head : 0, q ? q->tail : 0,
-		 MT7932_RUNTIME_HOST_INT_MASK,
-		 MT7932_MCU2HOST_SW_INT_MASK);
+	/* Run 191 submits ordinals 92..95 as a sub-millisecond burst.  Console
+	 * output here takes milliseconds on DockChannel and changes the transaction
+	 * it is meant to observe.  Preserve detailed receipts everywhere else and
+	 * emit one deferred burst receipt after ordinal 95 has completed.
+	 */
+	if (ordinal < 92 || ordinal > 95)
+		dev_info(dev->mt76.dev,
+			 "J700_MT7932_PRE_REGISTER_IRQ_SERVICE: ordinal=%u cycles=%u-%u queued=%u->%u head=%u tail=%u rx_done=%u host_mask=0x%08x mcu2host=0x%08x source=run191-sync-all-rx+ddone\n",
+			 ordinal, first, first + count - 1,
+			 queued_before, q ? READ_ONCE(q->queued) : 0,
+			 q ? q->head : 0, q ? q->tail : 0, rx_done,
+			 MT7932_RUNTIME_HOST_INT_MASK,
+			 MT7932_MCU2HOST_SW_INT_MASK);
 }
 
-int mt7932_mcu_load_live_start_phase(struct mt792x_dev *dev, u8 phase)
+static int __mt7932_mcu_load_live_start_phase(struct mt792x_dev *dev,
+					      u8 phase, bool epoch_only)
 {
 	static const char * const names[] = {
 		[MT7932_LIVE_PHASE_PRE_CAL] = "pre-cal",
@@ -1417,16 +1458,36 @@ int mt7932_mcu_load_live_start_phase(struct mt792x_dev *dev, u8 phase)
 	size_t offset;
 	u32 count, i, queued = 0;
 	bool runtime_irq_disabled = false;
+	bool runtime_tasklet_disabled = false;
+	bool runtime_console_quiet = false;
+	int runtime_console_level = 0;
 	int ret;
 
 	if (!is_mt7932(&dev->mt76) ||
 	    phase < MT7932_LIVE_PHASE_PRE_CAL ||
 	    phase > MT7932_LIVE_PHASE_AU_UPDATE)
 		return -EINVAL;
+	if (epoch_only) {
+		runtime_irq_disabled = true;
+		runtime_tasklet_disabled = true;
+		runtime_console_level = console_loglevel;
+		console_loglevel = 0;
+		runtime_console_quiet = true;
+	}
 	ret = request_firmware(&fw, MT7932_LIVE_START_TRANSCRIPT_NAME,
 			       dev->mt76.dev);
-	if (ret)
+	if (ret) {
+		if (runtime_console_quiet)
+			console_loglevel = runtime_console_level;
+		if (runtime_tasklet_disabled)
+			tasklet_enable(&dev->mt76.irq_tasklet);
+		if (runtime_irq_disabled)
+			enable_irq(to_pci_dev(dev->mt76.dev)->irq);
+		if (epoch_only)
+			mt76_mmio_j700_reg_write_disarm(&dev->mt76,
+						 "runtime-epoch-fw-fail");
 		return ret;
+	}
 	ret = mt7932_validate_live_start_transcript(fw);
 	if (ret) {
 		dev_err(dev->mt76.dev,
@@ -1455,6 +1516,8 @@ int mt7932_mcu_load_live_start_phase(struct mt792x_dev *dev, u8 phase)
 		offset += data_len;
 		if (record->phase != phase)
 			continue;
+		if (epoch_only && ordinal != 87)
+			continue;
 		switch (record->transport) {
 		case 0:
 			cmd = __MCU_CMD_FIELD_CE |
@@ -1482,19 +1545,33 @@ int mt7932_mcu_load_live_start_phase(struct mt792x_dev *dev, u8 phase)
 		 */
 		if (record->ext_cid_ack)
 			cmd |= __MCU_CMD_FIELD_ACK;
-		if (ordinal == 87) {
+		if (ordinal == 87 && !epoch_only) {
 			/* Firmware requests the measured WFDMA recovery immediately after
 			 * this mode-3 command.  Keep mt792x_irq_tasklet() from acknowledging
 			 * the MCU state bits before the synchronous Run-191 handshake below
 			 * observes and orders them.
 			 */
-			mt76_set_irq_mask(&dev->mt76, MT7932_HOST_INT_ENA,
-					  MT_INT_MCU_CMD, 0);
+			/* Run 191 reaches the first runtime CIDX in 8.68 ms.  Cycle587
+			 * took 58.43 ms because dozens of dev_info receipts were emitted
+			 * synchronously over DockChannel inside this firmware/CMDBT restore
+			 * window.  Retain the records in printk's ring while preventing
+			 * console transmission until the measured critical burst is over.
+			 */
+			runtime_console_level = console_loglevel;
+			console_loglevel = 0;
+			runtime_console_quiet = true;
+			ret = mt76_mmio_j700_reg_write_arm(&dev->mt76);
+			if (ret)
+				goto release_firmware;
 			disable_irq(to_pci_dev(dev->mt76.dev)->irq);
 			runtime_irq_disabled = true;
+			tasklet_disable(&dev->mt76.irq_tasklet);
+			runtime_tasklet_disabled = true;
 			dev_info(dev->mt76.dev,
-				 "J700_MT7932_RUNTIME_DMA_HANDSHAKE_ARMED: before=ordinal87 mcu_cmd_irq=software-masked irq-line=disabled\n");
+				 "J700_MT7932_RUNTIME_DMA_HANDSHAKE_ARMED: before=ordinal87 device-mask=unchanged irq-line=disabled tasklet=disabled source=run191-cidx-before-mask\n");
 		}
+		if (epoch_only)
+			goto runtime_epoch;
 		ret = mt76_mcu_send_msg(&dev->mt76, cmd, data, data_len, false);
 		if (ret) {
 			if (phase == MT7932_LIVE_PHASE_PRE_CAL && ret == -ENOMEM) {
@@ -1509,13 +1586,17 @@ int mt7932_mcu_load_live_start_phase(struct mt792x_dev *dev, u8 phase)
 			goto release_firmware;
 		}
 		queued++;
-		dev_info(dev->mt76.dev,
-			 "J700_MT7932_LIVE_COMMAND_QUEUED: phase=%s item=%u ordinal=%u transport=%u cid=0x%02x ext=0x%02x set=%u ack=%u bytes=%u response=%s next_gap_us=%u timing=run191-cidx\n",
-			 names[phase], queued, ordinal, record->transport,
-			 record->cid, record->ext_cid, record->set_query,
-			 record->ext_cid_ack, data_len,
-			 record->ext_cid_ack ? "requested-async" : "none",
-			 gap_us);
+		if (phase != MT7932_LIVE_PHASE_PRE_CAL ||
+		    ordinal < 92 || ordinal > 95)
+			dev_info(dev->mt76.dev,
+				 "J700_MT7932_LIVE_COMMAND_QUEUED: phase=%s item=%u ordinal=%u transport=%u cid=0x%02x ext=0x%02x set=%u ack=%u bytes=%u response=%s next_gap_us=%u timing=run191-cidx\n",
+				 names[phase], queued, ordinal, record->transport,
+				 record->cid, record->ext_cid,
+				 record->set_query, record->ext_cid_ack,
+				 data_len,
+				 record->ext_cid_ack ?
+					"requested-async" : "none",
+				 gap_us);
 		if (irq_cycles)
 			mt7932_live_start_irq_service(dev, ordinal, 1, 1);
 		mt7932_live_start_wait(ordinal);
@@ -1523,9 +1604,14 @@ int mt7932_mcu_load_live_start_phase(struct mt792x_dev *dev, u8 phase)
 			mt7932_live_start_irq_service(dev, ordinal, 2,
 						   irq_cycles - 1);
 		if (ordinal == 87) {
+runtime_epoch:
+			;
 			struct mt76_queue *q =
 				dev->mt76.q_mcu[MT_MCUQ_WM];
 			u32 cidx, didx, ext0, glo, page, pktmax;
+			u32 qmap[4], sched[2], restore_polls;
+			u64 fw_own_start_ns, fw_own_sync_ns;
+			u64 fw_own_mask_ns, fw_own_drv_ns;
 
 			/* The full Run-191 MMIO trace measures a WFDMA epoch boundary
 			 * between mode-3 ordinal 87 and query ordinal 88: Apple drains the
@@ -1557,7 +1643,6 @@ int mt7932_mcu_load_live_start_phase(struct mt792x_dev *dev, u8 phase)
 				 READ_ONCE(q->queued));
 			mt76_set_irq_mask(&dev->mt76, MT7932_HOST_INT_ENA,
 					  U32_MAX, 0);
-			mt76_wr(dev, MT_WFDMA0_HOST_INT_STA, 0);
 			ret = mt7932_mcu_ack_dma_state(dev, MT_MCU_CMD_STOP_DMA,
 						       "stop-dma");
 			if (ret)
@@ -1565,16 +1650,49 @@ int mt7932_mcu_load_live_start_phase(struct mt792x_dev *dev, u8 phase)
 			mt76_wr(dev, MT7932_MCU_INT_EVENT,
 				MT_MCU_INT_EVENT_DMA_STOPPED);
 			mt7932_runtime_irq_publish(dev, "after-stop-dma");
-			ret = mt792xe_mcu_fw_pmctrl(dev);
-			if (ret)
+			/* Reproduce Run191's SET_OWN -> host-mask-zero (1.692041 ms) and
+			 * SET_OWN -> CLR_OWN (2.259166 ms) boundaries.  Firmware uses this
+			 * interval to advance SER Step 1 and publish RESET_DONE; it is not an
+			 * arbitrary settle delay and it is not a deep-sleep transaction.
+			 */
+			fw_own_start_ns = ktime_get_ns();
+			mt76_wr(dev, MT_CONN_ON_LPCTL, PCIE_LPCR_HOST_SET_OWN);
+			if (!mt76_poll(dev, MT_CONN_ON_LPCTL,
+				       PCIE_LPCR_HOST_OWN_SYNC,
+				       PCIE_LPCR_HOST_OWN_SYNC, 500000)) {
+				dev_err(dev->mt76.dev,
+					"J700_MT7932_RUNTIME_FW_OWN_FAIL: lpctl=0x%08x\n",
+					mt76_rr(dev, MT_CONN_ON_LPCTL));
+				ret = -EIO;
 				goto release_firmware;
-			mt76_wr(dev, MT_WFDMA0_HOST_INT_STA, 0);
+			}
+			fw_own_sync_ns = ktime_get_ns();
+			while (ktime_get_ns() - fw_own_start_ns < 1692041)
+				cpu_relax();
+			fw_own_mask_ns = ktime_get_ns();
+			mt76_set_irq_mask(&dev->mt76, MT7932_HOST_INT_ENA,
+					  U32_MAX, 0);
+			while (ktime_get_ns() - fw_own_start_ns < 2259166)
+				cpu_relax();
+			fw_own_drv_ns = ktime_get_ns();
 			ret = __mt792xe_mcu_drv_pmctrl(dev);
 			if (ret)
 				goto release_firmware;
+			/* Earlier diagnostics selected 64 PC-history slots and repeatedly
+			 * remapped L1 windows here.  Cycle622's complete write diff proves
+			 * those 76 device-visible observer writes are absent from Run191.
+			 * Keep only the measured ownership/mask transitions in this epoch.
+			 */
+			if (runtime_console_quiet && !epoch_only) {
+				console_loglevel = runtime_console_level;
+				runtime_console_quiet = false;
+			}
 			dev_info(dev->mt76.dev,
-				 "J700_MT7932_RUNTIME_DMA_OWNERSHIP_PASS: sequence=firmware-own,driver-own lpctl=0x%08x source=run191-full-mmio\n",
-				 mt76_rr(dev, MT_CONN_ON_LPCTL));
+				 "J700_MT7932_RUNTIME_DMA_OWNERSHIP_PASS: sequence=firmware-own,mask-zero,driver-own lpctl=0x%08x set_to_sync_ns=%llu set_to_mask_ns=%llu set_to_drv_ns=%llu expected=1692041/2259166 observer_writes=0 source=run191-seq14281-14283+cycle622-write-diff\n",
+				 mt76_rr(dev, MT_CONN_ON_LPCTL),
+				 fw_own_sync_ns - fw_own_start_ns,
+				 fw_own_mask_ns - fw_own_start_ns,
+				 fw_own_drv_ns - fw_own_start_ns);
 			ret = mt7932_mcu_ack_dma_state(dev, MT_MCU_CMD_RESET_DONE,
 						       "reset-done");
 			if (ret)
@@ -1596,59 +1714,39 @@ int mt7932_mcu_load_live_start_phase(struct mt792x_dev *dev, u8 phase)
 			dev_info(dev->mt76.dev,
 				 "J700_MT7932_RUNTIME_DMASHDL_SELECTOR_ARMED: before=0x%08x after=0x28c004df action=preserve-no-write phase=before-wpdma-reset source=run191+run541\n",
 				 ext0);
-			/* AppleSunriseWLAN 25G83 halHwRecoveryFromError calls the
-			 * mt7961DmashdlReInit bus callback at bus_info+0x2a0 before
-			 * halWpdmaAllocRing and halWpdmaInitRing.  The latter performs the
-			 * WFDMA disable, TX/RX ring publication, manual prefetch, RST_DTX
-			 * and re-enable sequence.  Applying the same final values after
-			 * RST_DTX matches a paused register snapshot but seeds Connac3's
-			 * hidden q-status epoch in the wrong order.
-			 *
-			 * The callback does not merely repair fields whose readback drifted:
-			 * exact static RE shows it republishes packet/page policy, all queue
-			 * mappings and both user-priority words on every recovery.  Same-value
-			 * writes are therefore part of the scheduler epoch contract even when
-			 * a later paused snapshot converges.  Quota/refill remain outside ReInit
-			 * and are deliberately untouched.
+			/* RESET_DONE ends SER Step 2, which resets PDMA, DMASHDL and MAC.
+			 * Run 191 performs no host DMASHDL access before rebuilding WFDMA;
+			 * it proceeds through DMA_INIT, RECOVERY_DONE and NORMAL_STATE, then
+			 * submits command 88.  Keep the reset/default image untouched here.
+			 * Firmware's 0x0095cdf0 reset wrapper performs the policy restore as
+			 * part of the remaining recovery steps; validate its final image only
+			 * after NORMAL_STATE below.
 			 */
 			page = mt76_rr(dev, MT_DMASHDL_PAGE);
 			pktmax = mt76_rr(dev, MT_DMASHDL_PKT_MAX_SIZE);
-			mt76_rmw(dev, MT_DMASHDL_PAGE, GENMASK(17, 16), BIT(16));
-			mt76_rmw(dev, MT_DMASHDL_PKT_MAX_SIZE,
-				 MT_DMASHDL_PKT_MAX_SIZE_PLE |
-				 MT_DMASHDL_PKT_MAX_SIZE_PSE,
-				 FIELD_PREP(MT_DMASHDL_PKT_MAX_SIZE_PLE, 1));
-			mt76_wr(dev, MT_DMASHDL_Q_MAP(0), 0x76543210);
-			mt76_wr(dev, MT_DMASHDL_Q_MAP(1), 0xfedcba98);
-			mt76_wr(dev, MT_DMASHDL_Q_MAP(2), 0x11111000);
-			mt76_wr(dev, MT_DMASHDL_Q_MAP(3), 0x11111000);
-			mt76_wr(dev, MT_DMASHDL_SCHED_SET(0), 0x76543210);
-			mt76_wr(dev, MT_DMASHDL_SCHED_SET(1), 0xfedcba98);
-			if (mt76_rr(dev, MT_DMASHDL_PAGE) != 0x003d1000 ||
-			    mt76_rr(dev, MT_DMASHDL_PKT_MAX_SIZE) != 0x00000001 ||
-			    mt76_rr(dev, MT_DMASHDL_Q_MAP(0)) != 0x76543210 ||
-			    mt76_rr(dev, MT_DMASHDL_Q_MAP(1)) != 0xfedcba98 ||
-			    mt76_rr(dev, MT_DMASHDL_Q_MAP(2)) != 0x11111000 ||
-			    mt76_rr(dev, MT_DMASHDL_Q_MAP(3)) != 0x11111000 ||
-			    mt76_rr(dev, MT_DMASHDL_SCHED_SET(0)) != 0x76543210 ||
-			    mt76_rr(dev, MT_DMASHDL_SCHED_SET(1)) != 0xfedcba98) {
-				dev_err(dev->mt76.dev,
-					"J700_MT7932_RUNTIME_DMASHDL_REINIT_FAIL: phase=pre-wpdma-reset page_before=0x%08x pkt_before=0x%08x page_after=0x%08x pkt_after=0x%08x qmap=%08x/%08x/%08x/%08x pri=%08x/%08x\n",
-					page, pktmax,
-					mt76_rr(dev, MT_DMASHDL_PAGE),
-					mt76_rr(dev, MT_DMASHDL_PKT_MAX_SIZE),
-					mt76_rr(dev, MT_DMASHDL_Q_MAP(0)),
-					mt76_rr(dev, MT_DMASHDL_Q_MAP(1)),
-					mt76_rr(dev, MT_DMASHDL_Q_MAP(2)),
-					mt76_rr(dev, MT_DMASHDL_Q_MAP(3)),
-					mt76_rr(dev, MT_DMASHDL_SCHED_SET(0)),
-					mt76_rr(dev, MT_DMASHDL_SCHED_SET(1)));
-				ret = -EIO;
-				goto release_firmware;
+			qmap[0] = mt76_rr(dev, MT_DMASHDL_Q_MAP(0));
+			qmap[1] = mt76_rr(dev, MT_DMASHDL_Q_MAP(1));
+			qmap[2] = mt76_rr(dev, MT_DMASHDL_Q_MAP(2));
+			qmap[3] = mt76_rr(dev, MT_DMASHDL_Q_MAP(3));
+			sched[0] = mt76_rr(dev, MT_DMASHDL_SCHED_SET(0));
+			sched[1] = mt76_rr(dev, MT_DMASHDL_SCHED_SET(1));
+			dev_info(dev->mt76.dev,
+				 "J700_MT7932_RUNTIME_DMASHDL_SER_RESET_IMAGE: phase=after-reset-done-before-dma-init page=0x%08x pkt=0x%08x qmap=%08x/%08x/%08x/%08x pri=%08x/%08x host_writes=0 next=wpdma-reset,dma-init,recovery-done,normal-state source=run191-events14284-14417\n",
+				 page, pktmax, qmap[0], qmap[1], qmap[2], qmap[3],
+				 sched[0], sched[1]);
+			/* Cycle603 crossed RESET_DONE for the first time, then stopped inside
+			 * the previously unreachable WPDMA reset while the console was quiet.
+			 * Restore DockChannel at this proven SER boundary so the existing
+			 * memory-clean, RX-rebuild, ring-publish and DMA-enable receipts identify
+			 * the exact blocking stage.  Remove this diagnostic exposure once the
+			 * reset path itself is validated.
+			 */
+			if (runtime_console_quiet && !epoch_only) {
+				console_loglevel = runtime_console_level;
+				runtime_console_quiet = false;
 			}
 			dev_info(dev->mt76.dev,
-				 "J700_MT7932_RUNTIME_DMASHDL_REINIT_PASS: phase=pre-wpdma-reset page_before=0x%08x pkt_before=0x%08x page_after=0x003d1000 pkt_after=0x00000001 qmap=76543210/fedcba98/11111000/11111000 pri=76543210/fedcba98 writes=page,pktmax,qmap0-3,pri0-1 source=apple25G83-mt7961DmashdlReInit+run543\n",
-				 page, pktmax);
+				 "J700_MT7932_RUNTIME_SER_STEP2_PASS: next=wpdma-reset console=diagnostic-visible source=cycle603\n");
 			dev->mt7932_runtime_dma_epoch = true;
 			ret = mt792x_wpdma_reset(dev, false);
 			dev->mt7932_runtime_dma_epoch = false;
@@ -1721,7 +1819,8 @@ int mt7932_mcu_load_live_start_phase(struct mt792x_dev *dev, u8 phase)
 			mt76_wr(dev, MT7932_MCU_INT_EVENT,
 				MT_MCU_INT_EVENT_DMA_INIT);
 			mt7932_runtime_irq_publish(dev, "after-dma-init");
-			mt76_wr(dev, MT_WFDMA0_HOST_INT_STA, 0);
+			mt76_set_irq_mask(&dev->mt76, MT7932_HOST_INT_ENA,
+					  U32_MAX, 0);
 			ret = mt7932_mcu_ack_dma_state(dev,
 						       MT_MCU_CMD_RECOVERY_DONE,
 						       "recovery-done");
@@ -1730,14 +1829,51 @@ int mt7932_mcu_load_live_start_phase(struct mt792x_dev *dev, u8 phase)
 			mt76_wr(dev, MT7932_MCU_INT_EVENT,
 				MT_MCU_INT_EVENT_RESET_DONE);
 			mt7932_runtime_irq_publish(dev, "after-reset-done");
-			mt76_wr(dev, MT_WFDMA0_HOST_INT_STA, 0);
+			mt76_set_irq_mask(&dev->mt76, MT7932_HOST_INT_ENA,
+					  U32_MAX, 0);
 			ret = mt7932_mcu_ack_dma_state(dev, MT_MCU_CMD_NORMAL_STATE,
 						       "normal-state");
 			if (ret)
 				goto release_firmware;
 			mt7932_runtime_irq_publish(dev, "after-normal-state");
-			mt76_set_irq_mask(&dev->mt76, 0, 0,
-					  MT7932_RUNTIME_HOST_INT_MASK);
+			/* Successful Apple reaches command 88 only after NORMAL_STATE, with
+			 * the exact policy image restored and no host DMASHDL writes in the
+			 * reset epoch.  Give the firmware's internal restore a bounded 1 ms
+			 * read-only convergence window, then fail before command 88 if any
+			 * word is wrong.
+			 */
+			for (restore_polls = 0; restore_polls < 100; restore_polls++) {
+				page = mt76_rr(dev, MT_DMASHDL_PAGE);
+				pktmax = mt76_rr(dev, MT_DMASHDL_PKT_MAX_SIZE);
+				qmap[0] = mt76_rr(dev, MT_DMASHDL_Q_MAP(0));
+				qmap[1] = mt76_rr(dev, MT_DMASHDL_Q_MAP(1));
+				qmap[2] = mt76_rr(dev, MT_DMASHDL_Q_MAP(2));
+				qmap[3] = mt76_rr(dev, MT_DMASHDL_Q_MAP(3));
+				sched[0] = mt76_rr(dev, MT_DMASHDL_SCHED_SET(0));
+				sched[1] = mt76_rr(dev, MT_DMASHDL_SCHED_SET(1));
+				if (page == 0x003d1000 && pktmax == 0x00000001 &&
+				    qmap[0] == 0x76543210 &&
+				    qmap[1] == 0xfedcba98 &&
+				    qmap[2] == 0x11111000 &&
+				    qmap[3] == 0x11111000 &&
+				    sched[0] == 0x76543210 &&
+				    sched[1] == 0xfedcba98)
+					break;
+				udelay(10);
+			}
+			if (restore_polls == 100) {
+				dev_err(dev->mt76.dev,
+					"J700_MT7932_RUNTIME_DMASHDL_SER_RESTORE_FAIL: phase=after-normal-state page=0x%08x pkt=0x%08x qmap=%08x/%08x/%08x/%08x pri=%08x/%08x polls=%u wait_us=%u host_writes=0\n",
+					page, pktmax, qmap[0], qmap[1], qmap[2],
+					qmap[3], sched[0], sched[1], restore_polls,
+					restore_polls * 10);
+				ret = -EIO;
+				goto release_firmware;
+			}
+			dev_info(dev->mt76.dev,
+				 "J700_MT7932_RUNTIME_DMASHDL_SER_RESTORE_PASS: phase=after-normal-state page=0x%08x pkt=0x%08x qmap=76543210/fedcba98/11111000/11111000 pri=76543210/fedcba98 polls=%u wait_us=%u host_writes=0 source=run191-events14284-14418+firmware-0x0095cdf0\n",
+				 page, pktmax, restore_polls + 1,
+				 restore_polls * 10);
 			if (mt76_rr(dev, MT7932_HOST_INT_ENA) !=
 			    MT7932_RUNTIME_HOST_INT_MASK) {
 				dev_err(dev->mt76.dev,
@@ -1747,28 +1883,104 @@ int mt7932_mcu_load_live_start_phase(struct mt792x_dev *dev, u8 phase)
 				ret = -EIO;
 				goto release_firmware;
 			}
+			/* Run 582 captured the exact Apple DART2 PTEs at global TX17
+			 * ordinal 96: the coherent descriptor ring is read/write (flags
+			 * 0x1), while its 392-byte command payload is a streaming
+			 * DMA_TO_DEVICE/read-only mapping (flags 0x5).  Earlier payload
+			 * mappings also remain present at the boundary.  Firmware download
+			 * stays on the proven coherent pool; runtime commands use stable,
+			 * unique streaming slots retained through the whole transaction.
+			 */
+			if (!q->tx_stream_buf || !q->tx_stream_entries) {
+				dev_err(dev->mt76.dev,
+					"J700_MT7932_RUNTIME_TX_PAYLOAD_POLICY_FAIL: stream pool unavailable\n");
+				ret = -ENOMEM;
+				goto release_firmware;
+			}
+			WRITE_ONCE(q->tx_stream_next, 0);
+			WRITE_ONCE(q->tx_stream_active, true);
+			dev_info(dev->mt76.dev,
+				 "J700_MT7932_RUNTIME_TX_PAYLOAD_POLICY_PASS: epoch=post-reset mapping=stable-lazy-dma-map-single direction=to-device lifetime=device monotonic=1 dart2_expected=descriptor-0x1,payload-0x5 source=run582-global96-exact-pte+lifetime\n");
 			dev_info(dev->mt76.dev,
 				 "J700_MT7932_RUNTIME_IRQ_IMAGE_PASS: host_int=0x%08x mcu2host=0x%08x publish=stop,dma-init,reset-done,normal-state source=run191-full-mmio\n",
 				 mt76_rr(dev, MT7932_HOST_INT_ENA),
 				 mt76_rr(dev, MT_MCU2HOST_SW_INT_ENA));
-			enable_irq(to_pci_dev(dev->mt76.dev)->irq);
-			runtime_irq_disabled = false;
 			dev_info(dev->mt76.dev,
-				 "J700_MT7932_RUNTIME_DMA_EPOCH_PASS: boundary=ordinal87-to-88 handshake=stop,reset,dma-init,recovery,normal tx17=cidx0,didx0,head0,tail0 descriptors=cleared pre_ring=disable-rmw(read-0x1010b870,write-0x00103870),rings,write-0x00103870 ring_publish=base,cidx,count no_didx_write=1 enable=runtime-disabled-then-live no_download_transient=1 reset_dtx=all dmashdl_selector=1 bounce=monotonic-no-reuse wfsys_reset=0\n");
+				 "J700_MT7932_RUNTIME_DMA_EPOCH_PASS: boundary=ordinal87-to-88 handshake=stop,reset,dma-init,recovery,normal tx17=cidx0,didx0,head0,tail0 descriptors=cleared pre_ring=disable-rmw(read-0x1010b870,write-0x00103870),rings,write-0x00103870 ring_publish=base,cidx,count no_didx_write=1 enable=runtime-disabled-then-live irq=sync-through-pre-cal no_download_transient=1 reset_dtx=all dmashdl_selector=1 payload=firmware-monotonic,runtime-streaming-to-device-retained wfsys_reset=0\n");
+			if (epoch_only)
+				break;
+		}
+		if (phase == MT7932_LIVE_PHASE_PRE_CAL && ordinal == 95) {
+			struct mt76_queue *q =
+				dev->mt76.q_mcu[MT_MCUQ_WM];
+
+			if (runtime_console_quiet) {
+				console_loglevel = runtime_console_level;
+				runtime_console_quiet = false;
+			}
+
+			dev_info(dev->mt76.dev,
+				 "J700_MT7932_LIVE_CRITICAL_BURST_PASS: ordinals=92-95 gaps_us=151,114,904,94573 console_inside=0 cidx=%u didx=%u head=%u tail=%u queued=%u source=run191-unperturbed-cidx+run578-global90\n",
+				 q ? readl(&q->regs->cpu_idx) : 0,
+				 q ? readl(&q->regs->dma_idx) : 0,
+				 q ? q->head : 0, q ? q->tail : 0,
+				 q ? READ_ONCE(q->queued) : 0);
 		}
 	}
-	dev_info(dev->mt76.dev,
-		 "J700_MT7932_LIVE_PHASE_QUEUED: phase=%s commands=%u pacing=trace-46ms-special-87,95,134 drain=phase-boundary source=%s capture_sha256=23fbbe28... target_writes=0\n",
-		 names[phase], queued, MT7932_LIVE_START_TRANSCRIPT_NAME);
+	if (phase == MT7932_LIVE_PHASE_PRE_CAL && runtime_irq_disabled) {
+		/* The critical transaction is complete and DockChannel is restored.
+		 * Dump the bounded in-memory recorder now so it cannot perturb ordinals
+		 * 87..95, but can still be diffed against Run191 before probe teardown.
+		 */
+		if (epoch_only)
+			mt76_mmio_j700_reg_write_disarm(
+				&dev->mt76, "external-runtime-epoch-complete");
+		else
+			mt76_mmio_j700_reg_write_stop_dump(&dev->mt76,
+							   "pre-cal-complete");
+		if (runtime_tasklet_disabled) {
+			tasklet_enable(&dev->mt76.irq_tasklet);
+			runtime_tasklet_disabled = false;
+		}
+		enable_irq(to_pci_dev(dev->mt76.dev)->irq);
+		runtime_irq_disabled = false;
+		dev_info(dev->mt76.dev,
+			 "J700_MT7932_PRE_CAL_SYNC_IRQ_PASS: commands=%u tasklet=reenabled irq-line=reenabled source=run191-single-handler\n",
+			 queued);
+	}
+	if (!epoch_only)
+		dev_info(dev->mt76.dev,
+			 "J700_MT7932_LIVE_PHASE_QUEUED: phase=%s commands=%u pacing=trace-46ms-special-87,95,134 drain=phase-boundary source=%s capture_sha256=23fbbe28... target_writes=0\n",
+			 names[phase], queued, MT7932_LIVE_START_TRANSCRIPT_NAME);
 	ret = 0;
 
 release_firmware:
-	if (runtime_irq_disabled)
+	if (runtime_console_quiet)
+		console_loglevel = runtime_console_level;
+	if (runtime_tasklet_disabled)
+		tasklet_enable(&dev->mt76.irq_tasklet);
+	if (runtime_irq_disabled) {
+		mt76_mmio_j700_reg_write_disarm(&dev->mt76,
+						 "pre-cal-error");
 		enable_irq(to_pci_dev(dev->mt76.dev)->irq);
+	}
 	release_firmware(fw);
 	return ret;
 }
+
+int mt7932_mcu_load_live_start_phase(struct mt792x_dev *dev, u8 phase)
+{
+	return __mt7932_mcu_load_live_start_phase(dev, phase, false);
+}
 EXPORT_SYMBOL_GPL(mt7932_mcu_load_live_start_phase);
+
+int mt7932_mcu_runtime_epoch(struct mt792x_dev *dev)
+{
+	return __mt7932_mcu_load_live_start_phase(dev,
+						 MT7932_LIVE_PHASE_PRE_CAL,
+						 true);
+}
+EXPORT_SYMBOL_GPL(mt7932_mcu_runtime_epoch);
 
 static int
 mt7932_validate_power_packet(const struct mt7932_power_transcript_record *record,
@@ -2096,6 +2308,7 @@ int mt7921_run_firmware(struct mt792x_dev *dev)
 {
 	int err;
 	bool mt7932 = is_mt7932(&dev->mt76);
+	bool conformance = false;
 
 	err = mt792x_load_firmware(dev);
 	if (err)
@@ -2125,6 +2338,12 @@ int mt7921_run_firmware(struct mt792x_dev *dev)
 	if (mt7932 && dev->mphy.cap.has_6ghz)
 		dev_info(dev->mt76.dev,
 			 "J700_MT7932_6GHZ_CAP_PASS: power-path=apple-122-byte-au-sp transcript=pre-net\n");
+	conformance = mt7932 && mt7932_mcu_lab_conformance_active();
+	/* Commands 82 and 83 are already byte-matched typed operations and update
+	 * the normal driver lifecycle. Keep them in kernel before either exact
+	 * pre-cal implementation so the external checkpoint begins at ordinal 84
+	 * with Apple's sequence counter and state.
+	 */
 	if (mt7932) {
 		err = mt7932_mcu_runtime_config(dev);
 		if (err) {
@@ -2134,28 +2353,41 @@ int mt7921_run_firmware(struct mt792x_dev *dev)
 			return err;
 		}
 	}
-
-	err = mt7921_load_clc(dev, mt792x_ram_name(dev));
-	if (err) {
-		if (mt7932)
-			dev_err(dev->mt76.dev,
-				"J700_MT7932_FIRMWARE_GATE_FAIL: stage=clc ret=%d\n",
-				err);
-		return err;
-	}
-	if (mt7932)
+	/* Runtime query responses after firmware start use the MCU event path.
+	 * Publish that state before the optional ordinal-84 checkpoint.
+	 */
+	if (conformance) {
+		set_bit(MT76_STATE_MCU_RUNNING, &dev->mphy.state);
 		dev_info(dev->mt76.dev,
-			 "J700_MT7932_CLC_HOST_RULES_PASS: firmware-send=deferred-to-ordinals-84-86\n");
+			 "J700_MT7932_RUNTIME_EVENT_PATH_ARMED: before=semantic-program\n");
+		err = mt7932_mcu_lab_checkpoint(dev);
+		if (err)
+			return err;
+	}
+	if (!conformance) {
+		err = mt7921_load_clc(dev, mt792x_ram_name(dev));
+		if (err) {
+			if (mt7932)
+				dev_err(dev->mt76.dev,
+					"J700_MT7932_FIRMWARE_GATE_FAIL: stage=clc ret=%d\n",
+					err);
+			return err;
+		}
+	}
+	if (mt7932 && !conformance)
+		dev_info(dev->mt76.dev,
+			 "J700_MT7932_CLC_HOST_RULES_PASS: mode=exact-startup firmware-send=ordinals-84-86 generic-builder=0\n");
 	/* Runtime query responses after firmware start use the MCU event path.
 	 * Arm it before the measured MT7932 pre-cal transaction: Cycle498 proved
 	 * ordinals 84..87 retire, while query 88 receives no response when this
 	 * state is left unset until after the transaction.
 	 */
-	set_bit(MT76_STATE_MCU_RUNNING, &dev->mphy.state);
-	if (mt7932)
+	if (!conformance)
+		set_bit(MT76_STATE_MCU_RUNNING, &dev->mphy.state);
+	if (mt7932 && !conformance)
 		dev_info(dev->mt76.dev,
 			 "J700_MT7932_RUNTIME_EVENT_PATH_ARMED: before=pre-cal-query88\n");
-	if (mt7932) {
+	if (mt7932 && !conformance) {
 		/* Commands 84..134 are one uninterrupted measured transaction:
 		 * the MT7932-specific CLC records, mode-3 EFUSE selection, PPR/query
 		 * prerequisites and initial XZ regulatory/power setup.  It precedes
@@ -2170,6 +2402,9 @@ int mt7921_run_firmware(struct mt792x_dev *dev)
 			return err;
 		dev_info(dev->mt76.dev,
 			 "J700_MT7932_PRE_CAL_TRANSCRIPT_PASS: ordinals=84-134 commands=51 clc=3x32 efuse=fdr-mode3 country=XZ power=2g,5g next=wcal-135\n");
+	} else if (mt7932) {
+		dev_info(dev->mt76.dev,
+			 "J700_MT7932_PRE_CAL_EXTERNAL_PASS: ordinals=84-134 source=neo-wifid checkpoint=continued\n");
 	}
 	/* Apple selects MT7932 indexed FW-log mode 2 from
 	 * wlanOnWhenProbeSuccess(), after calibration and MAC initialization.
@@ -2712,6 +2947,8 @@ int mt7932_mcu_drain_tx17(struct mt792x_dev *dev, const char *phase,
 		usleep_range(100, 200);
 	}
 
+	mt76_mmio_j700_reg_write_stop_dump(mdev, phase);
+
 	if (q->tx_bounce_buf && q->tx_bounce_stride) {
 		struct mt76_queue_entry *entry = &q->entry[q->tail];
 		dma_addr_t dma = entry->dma_addr[0];
@@ -2741,6 +2978,44 @@ int mt7932_mcu_drain_tx17(struct mt792x_dev *dev, const char *phase,
 					"J700_MT7932_TX17_DRAIN_BLOCKER: phase=%s tail=%u didx=%u slot=%u dma_len=%u raw=%*ph\n",
 					phase, q->tail, readl(&q->regs->dma_idx),
 					slot, entry->dma_len[0], bytes, payload);
+		}
+	}
+	if (q->tx_stream_buf && q->tx_stream_dma && q->tx_stream_dma_len) {
+		struct mt76_queue_entry *entry = &q->entry[q->tail];
+		struct iommu_domain *domain =
+			iommu_get_domain_for_dev(mdev->dma_dev);
+		dma_addr_t dma = entry->dma_addr[0];
+		u32 slot;
+
+		for (slot = 0; slot < q->tx_stream_entries; slot++) {
+			const struct mt76_connac2_mcu_txd *txd;
+			const u8 *payload;
+			phys_addr_t first = 0, last = 0;
+			u16 bytes;
+			u32 crc;
+
+			if (q->tx_stream_dma[slot] != dma ||
+			    !q->tx_stream_dma_len[slot])
+				continue;
+			payload = q->tx_stream_buf[slot];
+			txd = (const void *)payload;
+			bytes = min_t(u16, entry->dma_len[0], 64);
+			crc = crc32_le(~0, payload, entry->dma_len[0]) ^ ~0;
+			if (domain) {
+				first = iommu_iova_to_phys(domain, dma);
+				last = iommu_iova_to_phys(
+					domain, dma + entry->dma_len[0] - 1);
+			}
+			dev_err(mdev->dev,
+				"J700_MT7932_TX17_STREAM_BLOCKER: phase=%s tail=%u didx=%u slot=%u dma=%pad dma_len=%u mapped_len=%u map_pa=%pa-%pa virt_pa=%pa crc32=%08x cid=0x%02x ext=0x%02x seq=%u set=%u ack=%u txd_len=%u raw=%*ph\n",
+				phase, q->tail, readl(&q->regs->dma_idx), slot,
+				&dma, entry->dma_len[0],
+				q->tx_stream_dma_len[slot], &first, &last,
+				&(phys_addr_t){ virt_to_phys(payload) }, crc,
+				txd->cid, txd->ext_cid, txd->seq,
+				txd->set_query, txd->ext_cid_ack,
+				le16_to_cpu(txd->len), bytes, payload);
+			break;
 		}
 	}
 	{

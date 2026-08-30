@@ -25,6 +25,11 @@ module_param_named(load_one_time_cal, mt7932_load_one_time_cal, bool, 0444);
 MODULE_PARM_DESC(load_one_time_cal,
 		 "load host-converted J700 MT7932 OCA/IFCAL before MAC initialization");
 
+bool mt7932_replay_au_policy;
+module_param_named(replay_au_policy, mt7932_replay_au_policy, bool, 0644);
+MODULE_PARM_DESC(replay_au_policy,
+		 "replay the later captured J700 AU policy transaction in the lab");
+
 static ssize_t mt7921_thermal_temp_show(struct device *dev,
 					struct device_attribute *attr,
 					char *buf)
@@ -126,8 +131,20 @@ static int __mt7921_init_hardware(struct mt792x_dev *dev)
 			 "J700_MT7932_COUNTRY_PIN: alpha2=AU host-policy=1 firmware-phases=XZ-pre-cal,AU-update source=25G83-live-capture\n");
 	} else {
 		ret = mt7921_mcu_set_eeprom(dev);
-		if (ret)
+		if (ret) {
+			if (is_mt7932(&dev->mt76))
+				dev_err(dev->mt76.dev,
+					"J700_MT7932_FIRMWARE_GATE_FAIL: stage=efuse-mode ret=%d\n",
+					ret);
 			goto out;
+		}
+		if (is_mt7932(&dev->mt76)) {
+			memcpy(dev->mt76.alpha2, "AU", sizeof(dev->mt76.alpha2));
+			dev_info(dev->mt76.dev,
+				 "J700_MT7932_EFUSE_MODE_PASS: mode=functional source=cycle469-on-chip external-buffer-hook=disabled-in-25G83\n");
+			dev_info(dev->mt76.dev,
+				 "J700_MT7932_COUNTRY_PIN: alpha2=AU host-policy=1 firmware-policy=generic-linux source=cycle469-scan-fsm-frontier\n");
+		}
 	}
 	if (is_mt7932(&dev->mt76) && mt7932_load_wcal) {
 		ret = mt7932_mcu_load_wcal(dev);
@@ -194,15 +211,13 @@ static int mt7921_init_hardware(struct mt792x_dev *dev)
 	return 0;
 }
 
-static void mt7921_init_work(struct work_struct *work)
+static int mt7921_init_work_run(struct mt792x_dev *dev)
 {
-	struct mt792x_dev *dev = container_of(work, struct mt792x_dev,
-					      init_work);
 	int ret;
 
 	ret = mt7921_init_hardware(dev);
 	if (ret)
-		return;
+		return ret;
 
 	mt76_set_stream_caps(&dev->mphy, true);
 	mt7921_set_stream_he_caps(&dev->phy);
@@ -211,43 +226,56 @@ static void mt7921_init_work(struct work_struct *work)
 				   ARRAY_SIZE(mt76_rates));
 	if (ret) {
 		dev_err(dev->mt76.dev, "register device failed\n");
-		return;
+		return ret;
 	}
 	if (is_mt7932(&dev->mt76))
 		dev_info(dev->mt76.dev,
 			 "J700_MT7932_NETWORK_REGISTER_PASS: firmware=%s\n",
 			 dev->mt76.hw->wiphy->fw_version);
-	if (is_mt7932(&dev->mt76)) {
-		/* The later live AU update at 601..643 installs all 2.4/5/6 GHz
-		 * power bodies after net registration.  The pre-cal commands 87..134
-		 * were already sent before WCAL, exactly where the trace places them.
+	if (is_mt7932(&dev->mt76) && mt7932_replay_au_policy) {
+		/* Cycle616 proves the later AU range still needs its full asynchronous
+		 * IRQ/RX gates. Keep it isolated from the now-mandatory 84..134 startup
+		 * transaction until the semantic-program executor owns those gates.
 		 */
 		ret = mt7932_mcu_load_live_start_phase(
 			dev, MT7932_LIVE_PHASE_AU_UPDATE);
 		if (ret)
-			return;
+			return ret;
 		ret = mt7932_mcu_drain_tx17(dev, "live-au-post", false);
 		if (ret)
-			return;
+			return ret;
 		dev_info(dev->mt76.dev,
-			 "J700_MT7932_LIVE_START_TRANSCRIPT_PASS: phases=pre-cal,au-update commands=94 prerequisites=9 country=AU power=2g,5g,6g source=25G83-macos-ssh-pass\n");
+			 "J700_MT7932_AU_POLICY_LAB_PASS: ordinals=601-643 commands=43 source=25G83-macos-ssh-pass\n");
+	} else if (is_mt7932(&dev->mt76)) {
+		dev_info(dev->mt76.dev,
+			 "J700_MT7932_AU_POLICY_REPLAY_DEFERRED: ordinals=601-643 reason=async-gates-pending startup=84-134-exact interface=160-199-pending source=cycle616+semantic-program\n");
 	}
 	ret = mt7921_init_debugfs(dev);
 	if (ret) {
 		dev_err(dev->mt76.dev, "register debugfs failed\n");
-		return;
+		return ret;
 	}
 
 	ret = mt7921_thermal_init(&dev->phy);
 	if (ret) {
 		dev_err(dev->mt76.dev, "thermal init failed\n");
-		return;
+		return ret;
 	}
 
 	/* we support chip reset now */
 	dev->hw_init_done = true;
 
 	mt76_connac_mcu_set_deep_sleep(&dev->mt76, dev->pm.ds_enable);
+
+	return 0;
+}
+
+static void mt7921_init_work(struct work_struct *work)
+{
+	struct mt792x_dev *dev = container_of(work, struct mt792x_dev,
+					      init_work);
+
+	mt7921_init_work_run(dev);
 }
 
 int mt7921_register_device(struct mt792x_dev *dev)
@@ -347,7 +375,9 @@ int mt7921_register_device(struct mt792x_dev *dev)
 	if (is_mt7932(&dev->mt76)) {
 		dev_info(dev->mt76.dev,
 			 "J700_MT7932_SYNCHRONOUS_INIT: reason=bounded-rom-download-window\n");
-		mt7921_init_work(&dev->init_work);
+		ret = mt7921_init_work_run(dev);
+		if (ret)
+			return ret;
 	} else {
 		queue_work(system_percpu_wq, &dev->init_work);
 	}

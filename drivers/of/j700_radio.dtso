@@ -60,6 +60,7 @@
 					  0xb 0x80000000 0x0 0x40000000>;
 				apple,valid-functions = <0x3>;
 				apple,endpoint-iova-address-bits = <32>;
+				dma-coherent;
 				apple,piodma = <&piodma_radio>;
 				power-domains = <0x7002>;
 

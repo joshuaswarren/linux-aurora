@@ -2015,6 +2015,251 @@ struct mt7932_connac_hw_scan_req {
 	u8 tail_reserved2[6];
 } __packed;
 
+#define MT7932_CMD_SCAN_POLICY_PREP	0x9e
+#define MT7932_CMD_SCAN_PROFILE		0x7b
+#define MT7932_PRE_SCAN_TRANSCRIPT_NAME \
+	"mediatek/j700-mt7932-pre-scan-transcript.bin"
+MODULE_FIRMWARE(MT7932_PRE_SCAN_TRANSCRIPT_NAME);
+#define MT7932_PRE_SCAN_RECORDS	31
+#define MT7932_PRE_SCAN_RECORD_SIZE	48
+
+struct mt7932_pre_scan_header {
+	u8 magic[8];
+	__le16 version;
+	__le16 record_size;
+	__le32 records;
+	u8 source_sha256[32];
+} __packed;
+
+struct mt7932_pre_scan_record {
+	u8 phase;
+	u8 transport;
+	u8 cid;
+	u8 ext_cid;
+	u8 set_query;
+	u8 ext_cid_ack;
+	__le16 reserved;
+	__le32 ordinal;
+	__le32 data_len;
+	u8 sha256[32];
+} __packed;
+
+static const u8 mt7932_pre_scan_source_sha256[32] = {
+	0x23, 0xfb, 0xbe, 0x28, 0xa3, 0x08, 0x05, 0xcb,
+	0xb6, 0x13, 0x53, 0x01, 0x35, 0x5b, 0x48, 0x49,
+	0xab, 0x98, 0xc5, 0xd9, 0x91, 0x4d, 0x48, 0xf0,
+	0xc9, 0xe4, 0x20, 0x39, 0x39, 0x75, 0xe0, 0x6e,
+};
+
+static int mt7932_scan_profile = 1;
+module_param_named(j700_scan_profile, mt7932_scan_profile, int, 0644);
+MODULE_PARM_DESC(j700_scan_profile,
+		 "J700 measured scan profile: 0=generic, 1=ordinal192, 2=ordinal195, 3=ordinal198");
+
+static bool mt7932_scan_policy_prepared;
+
+static bool mt7932_scan_policy_prefix = true;
+module_param_named(j700_scan_policy_prefix, mt7932_scan_policy_prefix,
+		   bool, 0644);
+MODULE_PARM_DESC(j700_scan_policy_prefix,
+		 "send captured J700 scan-policy CIDs 0x9e,0x9e,0x7b");
+
+static int mt7932_pre_scan_first;
+module_param_named(j700_pre_scan_first, mt7932_pre_scan_first, int, 0644);
+MODULE_PARM_DESC(j700_pre_scan_first,
+		 "first captured J700 pre-scan ordinal to replay (160..190, zero disables)");
+
+static int mt7932_pre_scan_last;
+module_param_named(j700_pre_scan_last, mt7932_pre_scan_last, int, 0644);
+MODULE_PARM_DESC(j700_pre_scan_last,
+		 "last captured J700 pre-scan ordinal to replay (160..190)");
+
+static bool mt7932_pre_scan_replayed;
+
+static int mt7932_connac_mcu_pre_scan_replay(struct mt76_dev *mdev)
+{
+	static const u8 magic[8] = { 'J', '7', 'S', 'C', 'N', 'T', 'R', '1' };
+	const struct mt7932_pre_scan_header *header;
+	const struct firmware *fw;
+	size_t offset;
+	int first = READ_ONCE(mt7932_pre_scan_first);
+	int last = READ_ONCE(mt7932_pre_scan_last);
+	u32 i, count, sent = 0;
+	int ret;
+
+	if (!first)
+		return 0;
+	if (mt7932_pre_scan_replayed)
+		return 0;
+	if (first < 160 || last < first || last > 190)
+		return -EINVAL;
+
+	ret = request_firmware(&fw, MT7932_PRE_SCAN_TRANSCRIPT_NAME,
+			       mdev->dev);
+	if (ret)
+		return ret;
+	if (fw->size < sizeof(*header)) {
+		ret = -EINVAL;
+		goto out;
+	}
+	header = (const void *)fw->data;
+	count = le32_to_cpu(header->records);
+	if (memcmp(header->magic, magic, sizeof(magic)) ||
+	    le16_to_cpu(header->version) != 1 ||
+	    le16_to_cpu(header->record_size) != MT7932_PRE_SCAN_RECORD_SIZE ||
+	    count != MT7932_PRE_SCAN_RECORDS ||
+	    memcmp(header->source_sha256, mt7932_pre_scan_source_sha256,
+		   sizeof(mt7932_pre_scan_source_sha256))) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	offset = sizeof(*header);
+	for (i = 0; i < count; i++) {
+		const struct mt7932_pre_scan_record *record;
+		const u8 *data;
+		u32 ordinal, data_len;
+		int cmd;
+
+		if (sizeof(*record) > fw->size - offset) {
+			ret = -EINVAL;
+			goto out;
+		}
+		record = (const void *)(fw->data + offset);
+		offset += sizeof(*record);
+		ordinal = le32_to_cpu(record->ordinal);
+		data_len = le32_to_cpu(record->data_len);
+		if (record->phase != 3 || ordinal != 160 + i ||
+		    data_len > 2048 || data_len > fw->size - offset ||
+		    le16_to_cpu(record->reserved) || record->transport > 2) {
+			ret = -EINVAL;
+			goto out;
+		}
+		data = fw->data + offset;
+		offset += data_len;
+		if (ordinal < first || ordinal > last)
+			continue;
+		/* The runtime range selector intentionally accepts only captured SET,
+		 * no-ACK records.  Query/response records need separate event ordering
+		 * and are rejected rather than silently desynchronizing the stream.
+		 */
+		if (!record->set_query || record->ext_cid_ack) {
+			ret = -EOPNOTSUPP;
+			goto out;
+		}
+		switch (record->transport) {
+		case 0:
+			cmd = __MCU_CMD_FIELD_CE |
+			      FIELD_PREP(__MCU_CMD_FIELD_ID, record->cid);
+			break;
+		case 1:
+			cmd = FIELD_PREP(__MCU_CMD_FIELD_ID, record->cid) |
+			      FIELD_PREP(__MCU_CMD_FIELD_EXT_ID,
+					 record->ext_cid);
+			break;
+		case 2:
+			cmd = __MCU_CMD_FIELD_UNI |
+			      FIELD_PREP(__MCU_CMD_FIELD_ID,
+					 record->ext_cid);
+			break;
+		default:
+			ret = -EINVAL;
+			goto out;
+		}
+		ret = mt76_mcu_send_msg(mdev, cmd, data, data_len, false);
+		if (ret)
+			goto out;
+		sent++;
+	}
+	if (offset != fw->size || sent != last - first + 1) {
+		ret = -EINVAL;
+		goto out;
+	}
+	mt7932_pre_scan_replayed = true;
+	dev_info(mdev->dev,
+		 "J700_MT7932_PRE_SCAN_REPLAY_PASS: ordinals=%d-%d commands=%u source=25G83-macos-ssh-tx17 target_writes=0\n",
+		 first, last, sent);
+	ret = 0;
+out:
+	release_firmware(fw);
+	return ret;
+}
+
+static int
+mt7932_connac_mcu_scan_prefix(struct mt76_phy *phy,
+			      struct ieee80211_vif *vif)
+{
+	struct mt76_vif_link *mvif = (struct mt76_vif_link *)vif->drv_priv;
+	struct mt76_dev *mdev = phy->dev;
+	static const u8 policy_prep[] = { 0x1a, 0x05, 0x10, 0x00 };
+	static const u8 profile[] = {
+		0x03, 0x00, 0x28, 0x01, 0x02, 0x00, 0x01, 0x00,
+		0x00, 0x00, 0xba, 0xbf, 0xba, 0xbf, 0xba, 0xbf,
+		0xba, 0xbf, 0xba, 0xba, 0x00, 0x00, 0x00, 0x00,
+		0x08, 0x63, 0x63, 0x63, 0x63, 0x1e, 0x1e, 0x00,
+		0x08, 0x63, 0x63, 0x08, 0x1e, 0x1e, 0x1e, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	};
+	struct {
+		u8 bss_idx;
+		u8 active;
+		u8 network_type;
+		u8 own_mac_idx;
+		u8 bss_mac_addr[ETH_ALEN];
+		u8 bmc_wlan_idx;
+		u8 mt7932_net_active;
+	} __packed activate = {
+		.bss_idx = mvif->idx,
+		.active = 1,
+		.network_type = vif->type == NL80211_IFTYPE_P2P_DEVICE ? 1 :
+				vif->type == NL80211_IFTYPE_AP ? 3 : 0,
+		.own_mac_idx = mvif->omac_idx,
+		.bmc_wlan_idx = 0,
+		.mt7932_net_active = 1,
+	};
+	int cmd, err;
+
+	BUILD_BUG_ON(sizeof(profile) != 64);
+	BUILD_BUG_ON(sizeof(activate) != 12);
+	memcpy(activate.bss_mac_addr, vif->addr, ETH_ALEN);
+
+	if (mt7932_scan_policy_prefix && !mt7932_scan_policy_prepared) {
+		cmd = __MCU_CMD_FIELD_CE |
+		      FIELD_PREP(__MCU_CMD_FIELD_ID,
+				 MT7932_CMD_SCAN_POLICY_PREP);
+		err = mt76_mcu_send_msg(mdev, cmd, policy_prep,
+					 sizeof(policy_prep), false);
+		if (err)
+			return err;
+		err = mt76_mcu_send_msg(mdev, cmd, policy_prep,
+					 sizeof(policy_prep), false);
+		if (err)
+			return err;
+
+		cmd = __MCU_CMD_FIELD_CE |
+		      FIELD_PREP(__MCU_CMD_FIELD_ID,
+				 MT7932_CMD_SCAN_PROFILE);
+		err = mt76_mcu_send_msg(mdev, cmd, profile,
+					 sizeof(profile), false);
+		if (err)
+			return err;
+		mt7932_scan_policy_prepared = true;
+	}
+
+	err = mt76_mcu_send_msg(mdev, MCU_CE_CMD(BSS_ACTIVATE_CTRL),
+				 &activate, sizeof(activate), false);
+	if (!err) {
+		dev_info(mdev->dev,
+			 "J700_MT7932_SCAN_PREFIX_PASS: policy_prepared=%u cids=9e,9e,7b-once,11-per-scan profile_sha256=26954cdd... bss=%u mac=%pM source=25G83-ordinals188-198\n",
+			 mt7932_scan_policy_prepared, activate.bss_idx,
+			 activate.bss_mac_addr);
+	}
+
+	return err;
+}
+
 enum mt7932_uni_scan_tag {
 	MT7932_UNI_SCAN_REQ = 1,
 	MT7932_UNI_SCAN_CANCEL = 2,
@@ -2125,8 +2370,16 @@ mt7932_connac_mcu_hw_scan_uni(struct mt76_phy *phy,
 		if (sreq->ssids[i].ssid_len)
 			n_ssids++;
 
-	n_channels = sreq->n_channels > 0 && sreq->n_channels <= 64 ?
-		     sreq->n_channels : 0;
+	/* Cycle611 proved the unified command starts real channel traversal, but
+	 * the 39-channel request had not completed before userspace's 20-second
+	 * retry aborted it.  Bound this discriminator to the 2.4 GHz subset so a
+	 * completion event distinguishes channel-plan/dwell policy from a channel
+	 * grant failure without changing radio power or association state.
+	 */
+	n_channels = 0;
+	for (i = 0; i < sreq->n_channels; i++)
+		if (sreq->channels[i]->band == NL80211_BAND_2GHZ)
+			n_channels++;
 	len = sizeof(*hdr) + sizeof(*req) + sizeof(*ssid) +
 	      n_ssids * sizeof(struct mt76_connac_mcu_scan_ssid) +
 	      sizeof(*bssid) + sizeof(*channel) +
@@ -2152,14 +2405,16 @@ mt7932_connac_mcu_hw_scan_uni(struct mt76_phy *phy,
 	req = skb_put_zero(skb, sizeof(*req));
 	req->tag = cpu_to_le16(MT7932_UNI_SCAN_REQ);
 	req->len = cpu_to_le16(sizeof(*req));
-	req->scan_type = sreq->n_ssids ? 1 : 0;
-	req->probe_req_num = sreq->n_ssids ? 2 : 0;
+	/* Apple 25G83's ordinary wildcard AIS scan is active type 1 while leaving
+	 * the host probe count and timeout at zero.  Keep the values measured in
+	 * the 0x4d4 converter input when projecting it into the unified TLVs.
+	 */
+	req->scan_type = 1;
+	req->probe_req_num = 0;
 	req->scan_func = BIT(1); /* Apple ENUM_SCN_DBDC_SCAN_DIS */
-	if (!sreq->n_ssids)
-		duration *= 2;
 	req->channel_min_dwell_time = cpu_to_le16(20);
 	req->channel_dwell_time = cpu_to_le16(duration);
-	req->timeout_value = cpu_to_le16(n_channels * duration);
+	req->timeout_value = 0;
 
 	ssid = skb_put_zero(skb, sizeof(*ssid) +
 			    n_ssids * sizeof(struct mt76_connac_mcu_scan_ssid));
@@ -2190,19 +2445,13 @@ mt7932_connac_mcu_hw_scan_uni(struct mt76_phy *phy,
 				   n_channels * sizeof(*channel->channels));
 	channel->channel_type = n_channels ? 4 : 0;
 	channel->channels_num = n_channels;
-	for (i = 0; i < n_channels; i++) {
-		switch (sreq->channels[i]->band) {
-		case NL80211_BAND_2GHZ:
-			channel->channels[i].band = 1;
-			break;
-		case NL80211_BAND_6GHZ:
-			channel->channels[i].band = 3;
-			break;
-		default:
-			channel->channels[i].band = 2;
-			break;
-		}
-		channel->channels[i].channel_num = sreq->channels[i]->hw_value;
+	for (i = 0, n_channels = 0; i < sreq->n_channels; i++) {
+		if (sreq->channels[i]->band != NL80211_BAND_2GHZ)
+			continue;
+		channel->channels[n_channels].band = 1;
+		channel->channels[n_channels].channel_num =
+			sreq->channels[i]->hw_value;
+		n_channels++;
 	}
 
 	ie = skb_put_zero(skb, sizeof(*ie) + sreq->ie_len);
@@ -2222,7 +2471,7 @@ mt7932_connac_mcu_hw_scan_uni(struct mt76_phy *phy,
 	}
 
 	dev_info(mdev->dev,
-		 "J700_MT7932_UNI_SCAN_REQ: bytes=0x%x seq=%u bss=%u type=%u ssids=%u channels=%u ie=%zu func=0x%02x\n",
+		 "J700_MT7932_UNI_SCAN_REQ: bytes=0x%x seq=%u bss=%u type=%u ssids=%u channels=%u ie=%zu func=0x%02x plan=2g-bounded-diagnostic\n",
 		 skb->len, hdr->seq_num, hdr->bss_idx, req->scan_type,
 		 ssid->ssids_num, channel->channels_num, sreq->ie_len,
 		 req->scan_func);
@@ -2249,6 +2498,15 @@ int mt76_connac_mcu_hw_scan(struct mt76_phy *phy, struct ieee80211_vif *vif,
 	struct sk_buff *skb;
 	int req_len = sizeof(*req);
 	bool mt7932 = mt76_chip(mdev) == 0x7932;
+
+	/* The sealed 25G83 TX17 capture is post-conversion device-visible traffic:
+	 * Apple places the complete 0x4d4-byte CMD_SCAN_REQ_V2 on TX17 as legacy
+	 * CID 0x03.  The public gen4 unified converter is an optional framework
+	 * path and does not describe this Apple build.  Cycles 611--614 followed
+	 * that wrong path; Cycle610's legacy request was the only one to reach the
+	 * firmware scan FSM.  Keep unified support above as reference while using
+	 * the measured wire ABI here.
+	 */
 
 	/* AppleSunriseWLAN 25G83 sends the MT7932 CMD_SCAN_REQ_V2 as 0x4d4
 	 * bytes.  The older mt76 connac2 layout ends after the 63-byte pad and
@@ -2291,7 +2549,82 @@ int mt76_connac_mcu_hw_scan(struct mt76_phy *phy, struct ieee80211_vif *vif,
 	req = (struct mt76_connac_hw_scan_req *)skb_put_zero(skb, req_len);
 	if (mt7932)
 		req7932 = (struct mt7932_connac_hw_scan_req *)req;
+	if (mt7932) {
+		static const u8 apple_scan_ie[] = {
+			0x7f, 0x0a, 0x01, 0x00, 0x08, 0x8c, 0x01,
+			0x40, 0x00, 0x00, 0x00, 0x00, 0x6b, 0x07,
+			0x0f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+		};
+		static const u8 random_mac[][ETH_ALEN] = {
+			[1] = { 0xfa, 0x3f, 0xe5, 0xb5, 0x93, 0xc8 },
+			[2] = { 0xb8, 0x96, 0xcd, 0x31, 0x27, 0x05 },
+			[3] = { 0x8a, 0xf2, 0x58, 0xd5, 0x43, 0xb8 },
+		};
+		int profile = READ_ONCE(mt7932_scan_profile);
 
+		/* Reproduce any of the three successful Apple scan requests without a
+		 * rebuild.  Profile zero falls through to the generic legacy builder;
+		 * profiles 1..3 are exact 25G83 ordinals 192, 195 and 198.
+		 */
+		if (!profile)
+			goto generic_scan;
+		if (profile < 1 || profile > 3) {
+			err = -EINVAL;
+			goto scan_error;
+		}
+		mvif->scan_seq_num = profile;
+		req->seq_num = profile;
+		req->bss_idx = mvif->idx;
+		req->scan_type = profile == 2 ? 0 : 1;
+		req->ssid_type = profile == 2 ? 0 : BIT(0);
+		req->scan_func = 0x13;
+		req->version = 1;
+		req->channel_dwell_time = cpu_to_le16(profile == 1 ? 110 : 40);
+		req->channel_type = 4;
+		if (profile == 2) {
+			req->channels_num = 3;
+			req->channels[0].band = 1;
+			req->channels[0].channel_num = 1;
+			req->channels[1].band = 1;
+			req->channels[1].channel_num = 6;
+			req->channels[2].band = 1;
+			req->channels[2].channel_num = 11;
+		} else {
+			req->channels_num = 1;
+			req->channels[0].band = 2;
+			req->channels[0].channel_num = 157;
+		}
+		req->ies_len = cpu_to_le16(sizeof(apple_scan_ie));
+		memcpy(req->ies, apple_scan_ie, sizeof(apple_scan_ie));
+		req->channel_min_dwell_time =
+			cpu_to_le16(profile == 1 ? 20 : 40);
+		memcpy(req7932->random_mac, random_mac[profile], ETH_ALEN);
+		req7932->scan_func_ext =
+			cpu_to_le32(profile == 2 ? 0x1800 : 0x1900);
+		req7932->op_channel_stay_time = cpu_to_le32(45);
+		req7932->passive_channel_dwell_time = cpu_to_le16(110);
+		req7932->home_away_time = cpu_to_le16(110);
+
+		err = mt7932_connac_mcu_pre_scan_replay(mdev);
+		if (err)
+			goto scan_error;
+		err = mt7932_connac_mcu_scan_prefix(phy, vif);
+		if (err)
+			goto scan_error;
+
+		dev_info(mdev->dev,
+			 "J700_MT7932_SCAN_REQ_V2: source=25G83-ordinal%u profile=%d bytes=0x%x seq=%u bss=%u type=%u ssids=0 probes=0 channels=%u first=%u/%u dwell=%u min=%u timeout=0 ie=21 func=0x13/0x%08x random_mac=%pM\n",
+			 189 + profile * 3, profile, req_len, req->seq_num,
+			 req->bss_idx, req->scan_type, req->channels_num,
+			 req->channels[0].band, req->channels[0].channel_num,
+			 le16_to_cpu(req->channel_dwell_time),
+			 le16_to_cpu(req->channel_min_dwell_time),
+			 le32_to_cpu(req7932->scan_func_ext),
+			 req7932->random_mac);
+		goto submit;
+	}
+
+generic_scan:
 	req->seq_num = mvif->scan_seq_num | mvif->band_idx << 7;
 	req->bss_idx = mvif->idx;
 	/* Apple 25G83's measured wildcard request uses scan type 1 with zero host
@@ -2413,6 +2746,7 @@ int mt76_connac_mcu_hw_scan(struct mt76_phy *phy, struct ieee80211_vif *vif,
 			 le16_to_cpu(req7932->home_away_time), req->scan_func,
 			 le32_to_cpu(req7932->scan_func_ext));
 
+submit:
 	err = mt76_mcu_skb_send_msg(mdev, skb, MCU_CE_CMD(START_HW_SCAN),
 				    false);
 	if (mt7932) {
@@ -2426,6 +2760,11 @@ int mt76_connac_mcu_hw_scan(struct mt76_phy *phy, struct ieee80211_vif *vif,
 	if (err < 0)
 		clear_bit(MT76_HW_SCANNING, &phy->state);
 
+	return err;
+
+scan_error:
+	dev_kfree_skb(skb);
+	clear_bit(MT76_HW_SCANNING, &phy->state);
 	return err;
 }
 EXPORT_SYMBOL_GPL(mt76_connac_mcu_hw_scan);
@@ -2863,15 +3202,15 @@ int mt76_connac_mcu_set_rate_txpower(struct mt76_phy *phy)
 {
 	int err;
 
-	/* J700 programs the complete Apple-format AU/SP power transcript once
-	 * after calibration and before network registration.  Generic connac2
+	/* J700's complete Apple-format AU/SP power transcript uses 122-byte
+	 * records.  Generic connac2
 	 * emits 162-byte records instead of 25G83's 122-byte ABI, and hardware
 	 * Cycles 473/480 proved those foreign packets stop TX17.  Never replay a
 	 * second power transaction from the generic per-interface/SAR callback.
 	 */
 	if (is_mt7932(phy->dev)) {
 		dev_info_once(phy->dev->dev,
-			      "J700_MT7932_RATE_POWER_GENERIC_SKIP: cid=0x5d reason=pre-net-apple-transcript-already-programmed records=122 generic_records=162\n");
+			      "J700_MT7932_RATE_POWER_GENERIC_SKIP: cid=0x5d reason=generic-abi-incompatible apple-policy=runtime-pending records=122 generic_records=162\n");
 		return 0;
 	}
 

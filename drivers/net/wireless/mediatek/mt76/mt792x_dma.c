@@ -508,6 +508,7 @@ static int
 mt792x_dma_reset(struct mt792x_dev *dev, bool force)
 {
 	u32 tx_desc_cleared = 0;
+	u32 tx_ring_seen = 0;
 	int i, err;
 
 	err = mt792x_dma_disable(dev, force);
@@ -528,17 +529,52 @@ mt792x_dma_reset(struct mt792x_dev *dev, bool force)
 			 "J700_MT7932_RUNTIME_PRERING_PASS: sequence=disable-rmw(read-0x1010b870,write-0x00103870),rings,write-0x00103870 dma_enabled=0 source=run191-seq14285-14368\n");
 	}
 
-	/* reset hw queues */
-	for (i = 0; i < __MT_TXQ_MAX; i++)
-		mt76_queue_reset(dev, dev->mphy.q_tx[i], true);
-	if (is_mt7932(&dev->mt76))
-		for (i = 0; i < ARRAY_SIZE(dev->mt7932_idle_tx); i++)
-			if (dev->mt7932_idle_tx[i])
-				dev->mt76.queue_ops->reset_q(&dev->mt76,
-							dev->mt7932_idle_tx[i], true);
+	/* Reset each physical MT7932 TX ring once. All four mac80211 ACs alias
+	 * hardware ring 0, and the retained idle-ring inventory aliases it once
+	 * more. Cycle622 recorded five BASE/CIDX/COUNT publications for ring 0;
+	 * successful Run191 publishes it exactly once. Repeated writes can seed a
+	 * different hidden prefetch/BKRS image even while WFDMA is disabled.
+	 */
+	if (is_mt7932(&dev->mt76) && dev->mt7932_runtime_dma_epoch) {
+		for (i = 0; i < __MT_TXQ_MAX; i++) {
+			struct mt76_queue *q = dev->mphy.q_tx[i];
 
-	for (i = 0; i < __MT_MCUQ_MAX; i++)
-		mt76_queue_reset(dev, dev->mt76.q_mcu[i], true);
+			if (!q || tx_ring_seen & BIT(q->hw_idx))
+				continue;
+			tx_ring_seen |= BIT(q->hw_idx);
+			mt76_queue_reset(dev, q, true);
+		}
+		for (i = 0; i < ARRAY_SIZE(dev->mt7932_idle_tx); i++) {
+			struct mt76_queue *q = dev->mt7932_idle_tx[i];
+
+			if (!q || tx_ring_seen & BIT(q->hw_idx))
+				continue;
+			tx_ring_seen |= BIT(q->hw_idx);
+			dev->mt76.queue_ops->reset_q(&dev->mt76, q, true);
+		}
+		for (i = 0; i < __MT_MCUQ_MAX; i++) {
+			struct mt76_queue *q = dev->mt76.q_mcu[i];
+
+			if (!q || tx_ring_seen & BIT(q->hw_idx))
+				continue;
+			tx_ring_seen |= BIT(q->hw_idx);
+			mt76_queue_reset(dev, q, true);
+		}
+		dev_info(dev->mt76.dev,
+			 "J700_MT7932_RUNTIME_UNIQUE_TX_RING_PASS: mask=0x%08x expected=0x00077fff ring0_writes=1 source=cycle622-write-diff+run191\n",
+			 tx_ring_seen);
+	} else {
+		for (i = 0; i < __MT_TXQ_MAX; i++)
+			mt76_queue_reset(dev, dev->mphy.q_tx[i], true);
+		if (is_mt7932(&dev->mt76))
+			for (i = 0; i < ARRAY_SIZE(dev->mt7932_idle_tx); i++)
+				if (dev->mt7932_idle_tx[i])
+					dev->mt76.queue_ops->reset_q(
+						&dev->mt76,
+						dev->mt7932_idle_tx[i], true);
+		for (i = 0; i < __MT_MCUQ_MAX; i++)
+			mt76_queue_reset(dev, dev->mt76.q_mcu[i], true);
+	}
 	if (is_mt7932(&dev->mt76) && dev->mt7932_runtime_dma_epoch) {
 		/* AppleSunriseWLAN 25G83 halHwRecoveryFromError calls
 		 * halWpdmaAllocRing(..., false) before halWpdmaInitRing.  Exact

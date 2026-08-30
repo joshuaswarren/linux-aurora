@@ -235,10 +235,19 @@ int __mt7921_start(struct mt792x_phy *phy)
 	err = mt76_connac_mcu_set_mac_enable(mphy->dev, 0, true, false);
 	if (err)
 		return err;
-	/* MT7932 performs DBDC/domain once in the pre-network-registration path,
-	 * matching Apple.  Other chips retain the generic per-start update.
+	/* Exact ordinals 84..134 are now the normal startup lifecycle.  The later
+	 * 160..199 interface program is not yet integrated, so retain the proven
+	 * transitional DBDC/domain setup until that complete phase replaces it.
 	 */
-	if (!is_mt7932(mphy->dev)) {
+	if (is_mt7932(mphy->dev)) {
+		err = mt7932_mcu_init_dbdc(phy->dev);
+		if (err)
+			return err;
+
+		err = mt76_connac_mcu_set_channel_domain(mphy);
+		if (err)
+			return err;
+	} else if (!is_mt7932(mphy->dev)) {
 		err = mt76_connac_mcu_set_channel_domain(mphy);
 		if (err)
 			return err;
@@ -255,12 +264,9 @@ int __mt7921_start(struct mt792x_phy *phy)
 			mt7932_6g_scan_policy_enabled = true;
 		}
 		if (!mt7932_scan_fwlog_enabled) {
-			err = mt7921_mcu_fw_log_2_host(phy->dev, 2);
-			if (err)
-				return err;
 			mt7932_scan_fwlog_enabled = true;
 			dev_info(mphy->dev->dev,
-				 "J700_MT7932_FW_LOG_MODE_PASS: cid=c5 payload=02/00/00/00 order=after-domain-cidd7-before-interface\n");
+				 "J700_MT7932_FW_LOG_MODE_INHERITED: cid=c5 source=exact-ordinal134 extra-command=0 interface=160-199-pending\n");
 		}
 	}
 
@@ -1086,17 +1092,14 @@ mt7921_hw_scan(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 	int err;
 
 	mt792x_mutex_acquire(dev);
-	/* Normal MT7932 start arms mode 2 after channel-domain/CID d7 so interface
-	 * and scan records share Apple's lifecycle.  Keep this fallback for reset
-	 * paths that reach scan without a fresh __mt7921_start().
+	/* Exact startup already emitted Apple's only pre-interface CID c5 at
+	 * ordinal 134. Never insert another c5 immediately before scan: the sealed
+	 * Apple 160..199 window has none.
 	 */
 	if (is_mt7932(&dev->mt76) && !mt7932_scan_fwlog_enabled) {
-		err = mt7921_mcu_fw_log_2_host(dev, 2);
-		if (err)
-			goto out;
 		mt7932_scan_fwlog_enabled = true;
 		dev_info(dev->mt76.dev,
-			 "J700_MT7932_FW_LOG_MODE_PASS: cid=c5 payload=02/00/00/00 order=scan-fallback\n");
+			 "J700_MT7932_FW_LOG_MODE_INHERITED: cid=c5 source=exact-ordinal134 extra-command=0 fallback=scan\n");
 	}
 	/* Apple serializes the pre-scan interface command burst on its workloop.
 	 * Linux can reach hw_scan while an older MT7932 command still owns TX17;

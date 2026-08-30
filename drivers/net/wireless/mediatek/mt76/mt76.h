@@ -70,6 +70,14 @@ struct mt76_reg_pair {
 	u32 value;
 };
 
+#define MT76_J700_REG_WRITE_MAX	4096
+
+struct mt76_j700_reg_write {
+	u64 delta_ns;
+	u32 reg;
+	u32 val;
+};
+
 enum mt76_bus_type {
 	MT76_BUS_MMIO,
 	MT76_BUS_USB,
@@ -245,6 +253,12 @@ struct mt76_queue {
 	u32 tx_bounce_stride;
 	u32 tx_bounce_entries;
 	u32 tx_bounce_next;
+	void **tx_stream_buf;
+	dma_addr_t *tx_stream_dma;
+	u32 *tx_stream_dma_len;
+	u32 tx_stream_stride;
+	u32 tx_stream_entries;
+	u32 tx_stream_next;
 
 	u16 first;
 	u16 head;
@@ -256,6 +270,9 @@ struct mt76_queue {
 	int buf_size;
 	bool stopped;
 	bool tx_bounce_logged;
+	bool tx_stream_active;
+	bool tx_stream_logged;
+	bool rx_full_ring;
 	bool blocked;
 
 	u8 buf_offset;
@@ -957,6 +974,12 @@ struct mt76_dev {
 	int (*init_wiphy)(struct mt76_dev *dev);
 	struct device *dev;
 	struct device *dma_dev;
+	spinlock_t j700_reg_write_lock;
+	struct mt76_j700_reg_write *j700_reg_writes;
+	u64 j700_reg_write_start_ns;
+	u32 j700_reg_write_count;
+	bool j700_reg_write_active;
+	bool j700_reg_write_overflow;
 
 	struct mt76_mcu mcu;
 
@@ -1239,6 +1262,12 @@ bool ____mt76_poll_msec(struct mt76_dev *dev, u32 offset, u32 mask, u32 val,
 #define mt76_poll_msec_tick(dev, ...) ____mt76_poll_msec(&((dev)->mt76), __VA_ARGS__)
 
 void mt76_mmio_init(struct mt76_dev *dev, void __iomem *regs);
+int mt76_mmio_j700_reg_write_arm(struct mt76_dev *dev);
+void mt76_mmio_j700_reg_write(struct mt76_dev *dev, u32 reg, u32 val);
+void mt76_mmio_j700_reg_write_stop_dump(struct mt76_dev *dev,
+					const char *reason);
+void mt76_mmio_j700_reg_write_disarm(struct mt76_dev *dev,
+				     const char *reason);
 void mt76_pci_disable_aspm(struct pci_dev *pdev);
 bool mt76_pci_aspm_supported(struct pci_dev *pdev);
 
