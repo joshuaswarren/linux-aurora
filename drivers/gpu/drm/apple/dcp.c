@@ -619,6 +619,7 @@ out_unlock:
 int dcp_start_rtkit_endpoint(struct apple_dcp *dcp, u8 endpoint)
 {
 	u64 message;
+	int ret;
 
 	if (!dcp->adopted_session)
 		return apple_rtkit_start_ep(dcp->rtk, endpoint);
@@ -630,8 +631,22 @@ int dcp_start_rtkit_endpoint(struct apple_dcp *dcp, u8 endpoint)
 			     APPLE_DCP_RTKIT_MGMT_STARTEP) |
 		  FIELD_PREP(APPLE_DCP_RTKIT_MGMT_STARTEP_EP, endpoint) |
 		  APPLE_DCP_RTKIT_MGMT_STARTEP_FLAG;
-	return apple_rtkit_send_message(dcp->rtk, APPLE_DCP_RTKIT_EP_MGMT,
-					message, NULL, false);
+	ret = apple_rtkit_send_message(dcp->rtk, APPLE_DCP_RTKIT_EP_MGMT,
+				       message, NULL, false);
+	if (!ret) {
+		/*
+		 * The adopted path bypasses apple_rtkit_start_ep() because the
+		 * inherited EPMAP is no longer available to populate application
+		 * endpoint bits.  A successful raw STARTEP has the same ownership
+		 * consequence: record it before firmware can reply on the endpoint.
+		 */
+		set_bit(endpoint, dcp->rtk->endpoints);
+		dev_info(dcp->dev,
+			 "DCP25G83_ADOPTED_STARTEP_REGISTERED endpoint %#x\n",
+			 endpoint);
+	}
+
+	return ret;
 }
 
 int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state *state)
