@@ -66,14 +66,15 @@ static void dcp_h17p_probe_is_main_display_complete(struct apple_dcp *dcp,
 						    void *out, void *cookie)
 {
 	dev_info(dcp->dev,
-		 "DCP25G83_EP37_OOB_A412_REPLY raw output %#x; diagnostic only\n",
+		 "DCP25G83_EP37_PRE_ACK_A412_REPLY raw output %#x; releasing held callback197 ACK\n",
 		 le32_to_cpup((__le32 *)out));
+	dcp_ack(dcp, DCP_CONTEXT_CB);
 }
 
 void apple_dcp_h17p_probe_is_main_display(struct apple_dcp *dcp)
 {
 	dev_info(dcp->dev,
-		 "DCP25G83_EP37_OOB_A412_PROBE issue A412 input/output 0/4 on stream 1; no display-state completion\n");
+		 "DCP25G83_EP37_PRE_ACK_A412_BARRIER issue A412 input/output 0/4 on stream 1 before held callback197 ACK; no display-state completion\n");
 	dcp_is_main_display(dcp, true,
 			    dcp_h17p_probe_is_main_display_complete, NULL);
 }
