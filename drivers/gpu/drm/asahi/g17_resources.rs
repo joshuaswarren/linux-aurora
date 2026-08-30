@@ -53,11 +53,24 @@ const PRIMARY_STATUS_A_WORK_SCAN_STATE_GRID_OFFSET: u64 =
     PRIMARY_STATUS_A_STATE_GRID_OFFSET + PRIMARY_STATUS_A_WORK_SCAN_OFFSET;
 const PRIMARY_STATUS_A_RUNTIME_STATE_GRID_OFFSET: u64 =
     PRIMARY_STATUS_A_STATE_GRID_OFFSET + PRIMARY_STATUS_A_RUNTIME_OFFSET;
-// Exact J700 A000 hardware-init handshake inside primary Status-B. The worker
-// clears the EP21 callback before entering this protocol, increments +0x48f0,
-// drives +0x4900 through 1 -> 2 and 3 -> 0, then reinstalls the callback.
-const PRIMARY_STATUS_B_HARDWARE_INIT_EPOCH_OFFSET: u64 = 0x48f0;
-const PRIMARY_STATUS_B_HARDWARE_INIT_STATE_OFFSET: u64 = 0x4900;
+// Exact J700 A000 firmware-recovery handshake inside primary Status-B. The
+// worker clears the EP21 callback before entering this protocol, increments
+// +0x48f0, drives +0x4900 through 1 -> 2 and 3 -> 0, then reinstalls it.
+const PRIMARY_STATUS_B_FIRMWARE_RECOVERY_EPOCH_OFFSET: u64 = 0x48f0;
+const PRIMARY_STATUS_B_FIRMWARE_RECOVERY_STATE_OFFSET: u64 = 0x4900;
+const PRIMARY_STATUS_B_RECOVERY_INFO_OFFSET: u64 = 0x40b8;
+const PRIMARY_STATUS_B_RECOVERY_INFO_ENTRY_COUNT: usize = 0x100;
+const PRIMARY_STATUS_B_RECOVERY_INFO_ENTRY_STRIDE: u64 = 8;
+const PRIMARY_STATUS_B_RECOVERY_INFO_EMITTED_COUNT_OFFSET: u64 = 0x48b8;
+const PRIMARY_STATUS_B_RECOVERY_ZERO_0_OFFSET: u64 = 0x48bc;
+const PRIMARY_STATUS_B_RECOVERY_SOURCE_COUNT_OFFSET: u64 = 0x48c0;
+const PRIMARY_STATUS_B_RECOVERY_ZERO_1_OFFSET: u64 = 0x48c4;
+const PRIMARY_STATUS_B_RECOVERY_COMMAND_WORD_OFFSET: u64 = 0x48c8;
+const PRIMARY_STATUS_B_RECOVERY_RAW_48CC_OFFSET: u64 = 0x48cc;
+const PRIMARY_STATUS_B_RECOVERY_RAW_48D0_OFFSET: u64 = 0x48d0;
+const PRIMARY_STATUS_B_RECOVERY_FAULT_STATUS_OFFSET: u64 = 0x48d8;
+const PRIMARY_STATUS_B_RECOVERY_OBJECT_ACTIVE_OFFSET: u64 = 0x4910;
+const PRIMARY_FIRMWARE_EVENT_CHANNEL_INDEX: usize = 13;
 const SECONDARY_EXTRA_0_BEFORE_PRIMARY_STATUS_A: u64 = 0x6c0;
 const SECONDARY_HWDATA_STATE_OFFSET: u64 = 0x3c0;
 const FWCTL_SIZE: usize = 0x4000;
@@ -686,14 +699,14 @@ pub(crate) struct G17PStatusASnapshot {
     pub(crate) scheduler_constructed: u32,
 }
 
-/// Cache-safe primary Status-B hardware-init handshake state.
+/// Cache-safe primary Status-B firmware-recovery handshake state.
 ///
 /// Exact J700 GFX A000 writes state 1 and waits for 2, then writes 3 and waits
 /// for 0. The epoch increments between the first transition and its wait.
 /// Status-A `+0x1c` increments only after a completed power callback, so it
 /// distinguishes a retained lifecycle from an intervening transition.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub(crate) struct G17PHardwareInitHandshakeSnapshot {
+pub(crate) struct G17PFirmwareRecoveryHandshakeSnapshot {
     pub(crate) status_b: u64,
     pub(crate) epoch_address: u64,
     pub(crate) epoch: u64,
@@ -703,7 +716,40 @@ pub(crate) struct G17PHardwareInitHandshakeSnapshot {
     pub(crate) power_callback_count: u32,
 }
 
-impl G17PHardwareInitHandshakeSnapshot {
+/// One record consumed from the primary role's native 0x48-byte firmware
+/// event ring. The indices are retained so the host publication can be
+/// checked against the same snapshot that selected the entry.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PPrimaryFirmwareEventRecord {
+    pub(crate) raw: [u8; g17_completion::G17P_FIRMWARE_EVENT_ENTRY_SIZE],
+    pub(crate) consumer_before: u32,
+    pub(crate) producer_snapshot: u32,
+    pub(crate) consumer_published: u32,
+}
+
+/// Coherent raw cause fields published by A000 before it notifies the host of
+/// a type-4 firmware recovery event.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PFirmwareRecoveryCauseSnapshot {
+    pub(crate) zero_0: u32,
+    pub(crate) detected_source_count: u32,
+    pub(crate) zero_1: u32,
+    pub(crate) command_word: u32,
+    pub(crate) raw_48cc: u32,
+    pub(crate) raw_48d0: u64,
+    pub(crate) fault_status: u64,
+    pub(crate) host_recovery: u32,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PFirmwareRecoveryInfoSnapshot {
+    pub(crate) emitted_entry_count: u32,
+    pub(crate) valid_entry_count: u32,
+    pub(crate) first_valid_index: Option<u32>,
+    pub(crate) first_valid_flags: u32,
+}
+
+impl G17PFirmwareRecoveryHandshakeSnapshot {
     const fn decode(
         status_b: u64,
         epoch_address: u64,
@@ -1168,6 +1214,18 @@ impl MappedObject {
             Ok(u64::from_le_bytes(
                 bytes[offset..end].try_into().map_err(|_| EINVAL)?,
             ))
+        })
+    }
+
+    fn write_u32(&mut self, address: u64, value: u32) -> Result {
+        let offset = address.checked_sub(self.iova()).ok_or(EINVAL)? as usize;
+        let end = offset.checked_add(4).ok_or(EINVAL)?;
+        if end > self.logical_size {
+            return Err(EINVAL);
+        }
+        self.with_bytes_mut(|bytes| {
+            bytes[offset..end].copy_from_slice(&value.to_le_bytes());
+            Ok(())
         })
     }
 
@@ -4363,12 +4421,12 @@ impl G17ResourceOwner {
         ))
     }
 
-    /// Read the exact primary Status-B hardware-init state through the
+    /// Read the exact primary Status-B firmware-recovery state through the
     /// existing WC object. Firmware maps this host-owned state grid uncached,
     /// so no private firmware cacheline is sampled.
-    pub(crate) fn hardware_init_handshake_snapshot(
+    pub(crate) fn firmware_recovery_handshake_snapshot(
         &mut self,
-    ) -> Result<G17PHardwareInitHandshakeSnapshot> {
+    ) -> Result<G17PFirmwareRecoveryHandshakeSnapshot> {
         let status_b = self.handoff.primary.instance.status_b;
         let expected_status_b = self
             .handoff
@@ -4380,10 +4438,10 @@ impl G17ResourceOwner {
             return Err(EINVAL);
         }
         let epoch_address = status_b
-            .checked_add(PRIMARY_STATUS_B_HARDWARE_INIT_EPOCH_OFFSET)
+            .checked_add(PRIMARY_STATUS_B_FIRMWARE_RECOVERY_EPOCH_OFFSET)
             .ok_or(EINVAL)?;
         let state_address = status_b
-            .checked_add(PRIMARY_STATUS_B_HARDWARE_INIT_STATE_OFFSET)
+            .checked_add(PRIMARY_STATUS_B_FIRMWARE_RECOVERY_STATE_OFFSET)
             .ok_or(EINVAL)?;
         let power_callback_count_address = self
             .handoff
@@ -4399,7 +4457,7 @@ impl G17ResourceOwner {
             .resources
             .primary_state
             .read_u32(power_callback_count_address)?;
-        Ok(G17PHardwareInitHandshakeSnapshot::decode(
+        Ok(G17PFirmwareRecoveryHandshakeSnapshot::decode(
             status_b,
             epoch_address,
             epoch,
@@ -4408,6 +4466,248 @@ impl G17ResourceOwner {
             power_callback_count_address,
             power_callback_count,
         ))
+    }
+
+    /// Consume one primary firmware-event record using the exact native ring
+    /// pointer pair serialized at main-config channel 13. J700 A000 treats
+    /// word 0 as the shared cursor object and word 1 as the 0x48-byte ring
+    /// base; producer is cursor `+0x20`. The consumer is published only after
+    /// the complete record has been copied.
+    pub(crate) fn drain_primary_firmware_event(
+        &mut self,
+    ) -> Result<Option<G17PPrimaryFirmwareEventRecord>> {
+        let entry = g17_initdata::channel_table_entry_range(
+            PRIMARY_FIRMWARE_EVENT_CHANNEL_INDEX,
+        )
+        .ok_or(EINVAL)?;
+        let main_config = self.handoff.primary.instance.main_config;
+        let expected = g17_initdata::derive_channel_table(
+            InstanceRole::Primary,
+            self.handoff.primary.state_grid,
+            self.handoff.primary.instance.status_a,
+            main_config,
+            self.handoff.shared.hw_data_bundle,
+        )[PRIMARY_FIRMWARE_EVENT_CHANNEL_INDEX];
+        let cursor_address = self.resources.shared_cluster.read_u64(
+            main_config
+                .checked_add(entry.start as u64)
+                .ok_or(EINVAL)?,
+        )?;
+        let ring_address = self.resources.shared_cluster.read_u64(
+            main_config
+                .checked_add(entry.start as u64)
+                .and_then(|address| address.checked_add(8))
+                .ok_or(EINVAL)?,
+        )?;
+        if cursor_address != expected.states[0] || ring_address != expected.states[1] {
+            dev_err!(
+                self.dev().as_ref(),
+                "G17P firmware-event ring: pointer mismatch cursor={:#x}/{:#x} ring={:#x}/{:#x}\n",
+                cursor_address,
+                expected.states[0],
+                ring_address,
+                expected.states[1]
+            );
+            return Err(EINVAL);
+        }
+
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        let consumer = self.resources.primary_state.read_u32(cursor_address)?;
+        let producer = self.resources.primary_state.read_u32(
+            cursor_address
+                .checked_add(g17_completion::G17P_FIRMWARE_EVENT_PRODUCER_OFFSET as u64)
+                .ok_or(EINVAL)?,
+        )?;
+        let read = match g17_completion::prepare_g17p_firmware_event_read(
+            g17_completion::G17PFirmwareEventCursor {
+                consumer,
+                producer,
+            },
+        ) {
+            Ok(read) => read,
+            Err(g17_completion::CompletionDecodeError::FirmwareEventEmpty) => return Ok(None),
+            Err(error) => {
+                dev_err!(
+                    self.dev().as_ref(),
+                    "G17P firmware-event ring: cursor consumer={} producer={} rejected ({:?})\n",
+                    consumer,
+                    producer,
+                    error
+                );
+                return Err(EIO);
+            }
+        };
+        let record_address = ring_address
+            .checked_add(read.entry_offset as u64)
+            .ok_or(EINVAL)?;
+        let record_offset = record_address
+            .checked_sub(self.resources.primary_state.iova())
+            .ok_or(EINVAL)? as usize;
+        let record_end = record_offset
+            .checked_add(g17_completion::G17P_FIRMWARE_EVENT_ENTRY_SIZE)
+            .ok_or(EINVAL)?;
+        let mut raw = [0u8; g17_completion::G17P_FIRMWARE_EVENT_ENTRY_SIZE];
+        self.resources.primary_state.with_bytes_mut(|bytes| {
+            raw.copy_from_slice(bytes.get(record_offset..record_end).ok_or(EINVAL)?);
+            Ok(())
+        })?;
+        let event_type = u32::from_le_bytes(raw[0..4].try_into().map_err(|_| EIO)?);
+        let validation = match event_type {
+            g17_completion::G17P_FIRMWARE_EVENT_RECOVERY_TYPE => {
+                g17_completion::decode_g17p_firmware_recovery_event(&raw).map(|_| ())
+            }
+            g17_completion::G17P_FIRMWARE_EVENT_UMA_GROW_TYPE => {
+                g17_completion::decode_g17p_firmware_uma_grow_event(&raw).map(|_| ())
+            }
+            _ => Err(g17_completion::CompletionDecodeError::FirmwareEventType),
+        };
+        if let Err(error) = validation {
+            let raw_qword = |offset: usize| {
+                u64::from_le_bytes(raw[offset..offset + 8].try_into().unwrap_or([0; 8]))
+            };
+            dev_err!(
+                self.dev().as_ref(),
+                "G17P firmware-event ring: record type={} cursor={} producer={} raw=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}] rejected ({:?}); consumer unchanged\n",
+                event_type,
+                consumer,
+                producer,
+                raw_qword(0x00),
+                raw_qword(0x08),
+                raw_qword(0x10),
+                raw_qword(0x18),
+                raw_qword(0x20),
+                raw_qword(0x28),
+                raw_qword(0x30),
+                raw_qword(0x38),
+                raw_qword(0x40),
+                error
+            );
+            return Err(EIO);
+        }
+
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        self.resources
+            .primary_state
+            .write_u32(cursor_address, read.published_consumer)?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        Ok(Some(G17PPrimaryFirmwareEventRecord {
+            raw,
+            consumer_before: consumer,
+            producer_snapshot: producer,
+            consumer_published: read.published_consumer,
+        }))
+    }
+
+    pub(crate) fn primary_firmware_recovery_cause_snapshot(
+        &mut self,
+    ) -> Result<G17PFirmwareRecoveryCauseSnapshot> {
+        let status_b = self.handoff.primary.instance.status_b;
+        let mut read_u32 = |offset: u64| {
+            self.resources
+                .primary_state
+                .read_u32(status_b.checked_add(offset).ok_or(EINVAL)?)
+        };
+        let zero_0 = read_u32(PRIMARY_STATUS_B_RECOVERY_ZERO_0_OFFSET)?;
+        let detected_source_count =
+            read_u32(PRIMARY_STATUS_B_RECOVERY_SOURCE_COUNT_OFFSET)?;
+        let zero_1 = read_u32(PRIMARY_STATUS_B_RECOVERY_ZERO_1_OFFSET)?;
+        let command_word = read_u32(PRIMARY_STATUS_B_RECOVERY_COMMAND_WORD_OFFSET)?;
+        let raw_48cc = read_u32(PRIMARY_STATUS_B_RECOVERY_RAW_48CC_OFFSET)?;
+        let host_recovery = read_u32(PRIMARY_STATUS_B_RECOVERY_OBJECT_ACTIVE_OFFSET)?;
+        let raw_48d0 = self.resources.primary_state.read_u64(
+            status_b
+                .checked_add(PRIMARY_STATUS_B_RECOVERY_RAW_48D0_OFFSET)
+                .ok_or(EINVAL)?,
+        )?;
+        let fault_status = self.resources.primary_state.read_u64(
+            status_b
+                .checked_add(PRIMARY_STATUS_B_RECOVERY_FAULT_STATUS_OFFSET)
+                .ok_or(EINVAL)?,
+        )?;
+        Ok(G17PFirmwareRecoveryCauseSnapshot {
+            zero_0,
+            detected_source_count,
+            zero_1,
+            command_word,
+            raw_48cc,
+            raw_48d0,
+            fault_status,
+            host_recovery,
+        })
+    }
+
+    /// Scan the exact 256-entry Status-B recovery-info table after firmware
+    /// publishes state 3. Native macOS checks every entry's VALID bit instead
+    /// of trusting the emitted-entry count at the end of the table.
+    pub(crate) fn primary_firmware_recovery_info_snapshot(
+        &mut self,
+    ) -> Result<G17PFirmwareRecoveryInfoSnapshot> {
+        let status_b = self.handoff.primary.instance.status_b;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        let mut valid_entry_count = 0u32;
+        let mut first_valid_index = None;
+        let mut first_valid_flags = 0u32;
+        for index in 0..PRIMARY_STATUS_B_RECOVERY_INFO_ENTRY_COUNT {
+            let flags = self.resources.primary_state.read_u32(
+                status_b
+                    .checked_add(PRIMARY_STATUS_B_RECOVERY_INFO_OFFSET)
+                    .and_then(|address| {
+                        address.checked_add(
+                            (index as u64)
+                                .checked_mul(PRIMARY_STATUS_B_RECOVERY_INFO_ENTRY_STRIDE)?,
+                        )
+                    })
+                    .ok_or(EINVAL)?,
+            )?;
+            if flags & 1 != 0 {
+                valid_entry_count = valid_entry_count.checked_add(1).ok_or(EOVERFLOW)?;
+                if first_valid_index.is_none() {
+                    first_valid_index = Some(index as u32);
+                    first_valid_flags = flags;
+                }
+            }
+        }
+        let emitted_entry_count = self.resources.primary_state.read_u32(
+            status_b
+                .checked_add(PRIMARY_STATUS_B_RECOVERY_INFO_EMITTED_COUNT_OFFSET)
+                .ok_or(EINVAL)?,
+        )?;
+        Ok(G17PFirmwareRecoveryInfoSnapshot {
+            emitted_entry_count,
+            valid_entry_count,
+            first_valid_index,
+            first_valid_flags,
+        })
+    }
+
+    /// Apply one native ArmFirmware recovery acknowledgement. Shipping macOS
+    /// checks the current phase, executes `dmb ish`, writes the next phase,
+    /// then executes a second `dmb ish`.
+    pub(crate) fn acknowledge_primary_firmware_recovery(
+        &mut self,
+        expected: u32,
+        next: u32,
+    ) -> Result {
+        if !matches!((expected, next), (1, 2) | (3, 0)) {
+            return Err(EINVAL);
+        }
+        let state_address = self
+            .handoff
+            .primary
+            .instance
+            .status_b
+            .checked_add(PRIMARY_STATUS_B_FIRMWARE_RECOVERY_STATE_OFFSET)
+            .ok_or(EINVAL)?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        if self.resources.primary_state.read_u32(state_address)? != expected {
+            return Err(EBUSY);
+        }
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        self.resources
+            .primary_state
+            .write_u32(state_address, next)?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        Ok(())
     }
 
     pub(crate) fn control_opening_effect(&mut self) -> Result<G17PControlOpeningEffect> {
@@ -6997,14 +7297,14 @@ mod tests {
     }
 
     #[test]
-    fn hardware_init_handshake_uses_exact_coherent_status_offsets() {
+    fn firmware_recovery_handshake_uses_exact_coherent_status_offsets() {
         assert_eq!(PRIMARY_STATUS_A_POWER_CALLBACK_COUNT_OFFSET, 0x1c);
-        assert_eq!(PRIMARY_STATUS_B_HARDWARE_INIT_EPOCH_OFFSET, 0x48f0);
-        assert_eq!(PRIMARY_STATUS_B_HARDWARE_INIT_STATE_OFFSET, 0x4900);
+        assert_eq!(PRIMARY_STATUS_B_FIRMWARE_RECOVERY_EPOCH_OFFSET, 0x48f0);
+        assert_eq!(PRIMARY_STATUS_B_FIRMWARE_RECOVERY_STATE_OFFSET, 0x4900);
 
         let status_a = KERN + 0xee40;
         let status_b = KERN + 0x340;
-        let snapshot = G17PHardwareInitHandshakeSnapshot::decode(
+        let snapshot = G17PFirmwareRecoveryHandshakeSnapshot::decode(
             status_b,
             status_b + 0x48f0,
             7,
@@ -7023,7 +7323,7 @@ mod tests {
         assert!(!snapshot.waiting_for_first_response());
         assert!(snapshot.waiting_for_final_clear());
         assert!(snapshot.callback_known_unregistered());
-        let between_waits = G17PHardwareInitHandshakeSnapshot::decode(
+        let between_waits = G17PFirmwareRecoveryHandshakeSnapshot::decode(
             status_b,
             status_b + 0x48f0,
             7,

@@ -44,8 +44,8 @@ use kernel::{devcoredump, new_mutex, sync::Mutex, time::msecs_to_jiffies};
 
 use crate::{
     driver::{AsahiDevice, T8140LiveTopologyAdmission},
-    g17_completion, g17_lifecycle, g17_manager, g17_rtkit, g17_submission, g17_uapi, gem, hw,
-    identity, mmu, module_parameters, regs,
+    g17_completion, g17_initdata, g17_lifecycle, g17_manager, g17_rtkit, g17_submission,
+    g17_uapi, gem, hw, identity, mmu, module_parameters, regs,
 };
 use kernel::sync::aref::ARef;
 
@@ -67,6 +67,7 @@ const INITDATA_ACK_TYPE: u16 = 0x09;
 const CONTROL_START_TYPE: u16 = 0x89;
 const INITDATA_ACK_POLLS: usize = 200;
 const CONTROL_COUNTER_POLLS: usize = 100;
+const FIRMWARE_RECOVERY_POLLS: usize = 500;
 const G17P_CRASHLOG_MAX_BYTES: usize = 256 * 1024;
 const G17P_RTKIT_UAT_DVA_MASK: u64 = (1u64 << 40) - 1;
 
@@ -261,15 +262,15 @@ fn log_g17p_status_a(
     }
 }
 
-fn log_g17p_hardware_init_handshake(
+fn log_g17p_firmware_recovery_handshake(
     dev: &kernel::device::Device,
     manager: &mut g17_manager::G17PManagerConstruction,
     checkpoint: &'static str,
 ) {
-    match manager.hardware_init_handshake_snapshot() {
+    match manager.firmware_recovery_handshake_snapshot() {
         Ok(snapshot) => dev_info!(
             dev,
-            "G17P hardware-init handshake checkpoint={} status-b={:#x} epoch-address={:#x} epoch={} state-address={:#x} state={} callback-known-unregistered={} waiting-first-response={} waiting-final-clear={} power-callback-count-address={:#x} power-callback-count={}\n",
+            "G17P firmware-recovery handshake checkpoint={} status-b={:#x} epoch-address={:#x} epoch={} state-address={:#x} state={} callback-known-unregistered={} waiting-first-response={} waiting-final-clear={} power-callback-count-address={:#x} power-callback-count={}\n",
             checkpoint,
             snapshot.status_b,
             snapshot.epoch_address,
@@ -284,11 +285,196 @@ fn log_g17p_hardware_init_handshake(
         ),
         Err(error) => dev_err!(
             dev,
-            "G17P hardware-init handshake checkpoint={} read failed ({:?})\n",
+            "G17P firmware-recovery handshake checkpoint={} read failed ({:?})\n",
             checkpoint,
             error,
         ),
     }
+}
+
+/// Drain a firmware-initiated recovery before Linux has registered or
+/// published any user queue. macOS consumes the type-4 event, accounts for the
+/// host recovery generation, then calls the ArmFirmware pre/post recovery methods. Those
+/// methods validate state 1/3 and publish 2/0 with barriers around each write.
+fn complete_primary_empty_recovery(
+    pdev: &platform::Device,
+    manager: &mut g17_manager::G17PManagerConstruction,
+    state: &G17PRoleRtkitState,
+) -> Result {
+    let notification_count = state
+        .firmware_event_notifications
+        .swap(0, Ordering::AcqRel);
+    let initial_handshake = manager.firmware_recovery_handshake_snapshot()?;
+    if initial_handshake.state != 0 || notification_count != 0 {
+        dev_info!(
+            pdev.as_ref(),
+            "G17P recovery check: notifications={} epoch={} state={}\n",
+            notification_count,
+            initial_handshake.epoch,
+            initial_handshake.state
+        );
+    }
+    let record = loop {
+        let Some(record) = manager.drain_primary_firmware_event()? else {
+            let handshake = manager.firmware_recovery_handshake_snapshot()?;
+            if handshake.state == 0 {
+                if notification_count != 0 {
+                    dev_info!(
+                        pdev.as_ref(),
+                        "G17P recovery: cleared {} stale event notifications with an empty ring\n",
+                        notification_count
+                    );
+                }
+                return Ok(());
+            }
+            dev_err!(
+                pdev.as_ref(),
+                "G17P recovery: notification count {} / state {} has no primary event record\n",
+                notification_count,
+                handshake.state
+            );
+            return Err(EIO);
+        };
+        let event_type = u32::from_le_bytes(record.raw[0..4].try_into().map_err(|_| EIO)?);
+        if event_type == g17_completion::G17P_FIRMWARE_EVENT_RECOVERY_TYPE {
+            break record;
+        }
+        if event_type != g17_completion::G17P_FIRMWARE_EVENT_UMA_GROW_TYPE {
+            return Err(EIO);
+        }
+        let uma = g17_completion::decode_g17p_firmware_uma_grow_event(&record.raw)
+            .map_err(|_| EIO)?;
+        let expected_operand_table = g17_initdata::CONTROL_OPERAND_TABLE_ADDRESS;
+        let expected_cookie = expected_operand_table.checked_add(0x640).ok_or(EOVERFLOW)?;
+        if uma.stamp_index != 1
+            || uma.pool_index != 0
+            || uma.shared_control != g17_initdata::PARTIAL_OPENING_CONTROL_SHARED_ADDRESS
+            || uma.operand_table != expected_operand_table
+            || uma.cookie != expected_cookie
+            || uma.result != 0x18
+        {
+            dev_err!(
+                pdev.as_ref(),
+                "G17P UMA grow: rejected orphan completion stamp={} pool={} shared={:#x} operand={:#x} cookie={:#x} result={:#x}\n",
+                uma.stamp_index,
+                uma.pool_index,
+                uma.shared_control,
+                uma.operand_table,
+                uma.cookie,
+                uma.result
+            );
+            return Err(EIO);
+        }
+        dev_info!(
+            pdev.as_ref(),
+            "G17P UMA grow: consumed unmatched bootstrap completion stamp={} pool={} cookie={:#x} result={:#x} cursor={}->{} producer={}\n",
+            uma.stamp_index,
+            uma.pool_index,
+            uma.cookie,
+            uma.result,
+            record.consumer_before,
+            record.consumer_published,
+            record.producer_snapshot
+        );
+    };
+    let recovery = g17_completion::decode_g17p_firmware_recovery_event(&record.raw)
+        .map_err(|_| EIO)?;
+    let handshake = manager.firmware_recovery_handshake_snapshot()?;
+    if recovery.stamp_index != -1
+        || recovery.generation.wrapping_add(1) != handshake.epoch
+        || handshake.state != 1
+    {
+        dev_err!(
+            pdev.as_ref(),
+            "G17P recovery: rejected type-4 event generation={} stamp={} epoch={} state={}\n",
+            recovery.generation,
+            recovery.stamp_index,
+            handshake.epoch,
+            handshake.state
+        );
+        return Err(EIO);
+    }
+    dev_info!(
+        pdev.as_ref(),
+        "G17P recovery: consumed event generation={} cursor={}->{} producer={} notifications={}\n",
+        recovery.generation,
+        record.consumer_before,
+        record.consumer_published,
+        record.producer_snapshot,
+        notification_count
+    );
+    let cause = manager.primary_firmware_recovery_cause_snapshot()?;
+    dev_info!(
+        pdev.as_ref(),
+        "G17P recovery cause: zero0={:#x} detected-source-count={} zero1={:#x} command-word={:#x} raw48cc={:#x} raw48d0={:#x} fault-status={:#x} host-recovery={}\n",
+        cause.zero_0,
+        cause.detected_source_count,
+        cause.zero_1,
+        cause.command_word,
+        cause.raw_48cc,
+        cause.raw_48d0,
+        cause.fault_status,
+        cause.host_recovery
+    );
+    if cause.host_recovery != 0 {
+        dev_err!(
+            pdev.as_ref(),
+            "G17P recovery: event-backed path has host-recovery flag {}\n",
+            cause.host_recovery
+        );
+        return Err(EIO);
+    }
+    let accepted_generation =
+        manager.accept_empty_primary_firmware_recovery(recovery.generation)?;
+    dev_info!(
+        pdev.as_ref(),
+        "G17P recovery: accepted host generation {} before empty scheduler recovery\n",
+        accepted_generation
+    );
+
+    manager.acknowledge_primary_firmware_recovery(1, 2)?;
+    let mut post_state = 2;
+    for _ in 0..FIRMWARE_RECOVERY_POLLS {
+        post_state = manager.firmware_recovery_handshake_snapshot()?.state;
+        if post_state == 3 {
+            break;
+        }
+        if state.crashed.load(Ordering::Acquire) {
+            return Err(EIO);
+        }
+        fsleep(Delta::from_millis(1));
+    }
+    if post_state != 3 {
+        dev_err!(
+            pdev.as_ref(),
+            "G17P recovery: firmware stopped at state {}, expected post-recovery state 3\n",
+            post_state
+        );
+        return Err(ETIMEDOUT);
+    }
+    let recovery_info = manager.primary_firmware_recovery_info_snapshot()?;
+    dev_info!(
+        pdev.as_ref(),
+        "G17P recovery info: emitted={} valid={} first-valid-index={:?} first-valid-flags={:#x}\n",
+        recovery_info.emitted_entry_count,
+        recovery_info.valid_entry_count,
+        recovery_info.first_valid_index,
+        recovery_info.first_valid_flags
+    );
+    if recovery_info.emitted_entry_count != 0 || recovery_info.valid_entry_count != 0 {
+        dev_err!(
+            pdev.as_ref(),
+            "G17P recovery: non-empty recovery-info table cannot use the prepublication path\n"
+        );
+        return Err(EBUSY);
+    }
+    manager.acknowledge_primary_firmware_recovery(3, 0)?;
+    dev_info!(
+        pdev.as_ref(),
+        "G17P recovery: native pre/post handshake completed at epoch {}\n",
+        handshake.epoch
+    );
+    Ok(())
 }
 
 fn log_g17p_scheduler_gate(
@@ -433,6 +619,7 @@ struct G17PRoleRtkitState {
     crashed: AtomicBool,
     runtime_events: AtomicU32,
     firmware_event_notifications: AtomicU32,
+    submission_phase: AtomicU32,
 }
 
 impl G17PRoleRtkitState {
@@ -452,6 +639,7 @@ impl G17PRoleRtkitState {
             crashed: AtomicBool::new(false),
             runtime_events: AtomicU32::new(0),
             firmware_event_notifications: AtomicU32::new(0),
+            submission_phase: AtomicU32::new(g17_manager::G17P_SUBMIT_PHASE_IDLE),
         }
     }
 }
@@ -775,11 +963,20 @@ impl rtkit::Operations for G17PRtkitOps {
             data.acked.store(true, Ordering::Release);
         } else if g17_completion::decode_g17p_firmware_event_notification(endpoint, message).is_ok()
         {
-            // This is ingress ownership only. The role-local 0x48 event ring
-            // is not mapped yet, so no consumer index or queue state is
-            // changed here.
-            data.firmware_event_notifications
-                .fetch_add(1, Ordering::Relaxed);
+            // This callback records ingress and the current publication phase.
+            // The serialized runtime owner drains and dispatches the 0x48-byte
+            // ring; the IRQ callback never mutates its consumer or queue state.
+            let count = data
+                .firmware_event_notifications
+                .fetch_add(1, Ordering::Relaxed)
+                .wrapping_add(1);
+            dev_info!(
+                data.dev.as_ref(),
+                "G17P firmware-event notification role={} count={} submit-phase={}\n",
+                data.processor.name(),
+                count,
+                data.submission_phase.load(Ordering::Acquire)
+            );
         } else if endpoint == g17_rtkit::ENDPOINT_GFX_INTERRUPTS {
             data.runtime_events.fetch_add(1, Ordering::Relaxed);
         }
@@ -988,10 +1185,16 @@ fn finish_boot_session(
         opening_effect.inner_state,
         opening_effect.operand_slot
     );
-    log_g17p_hardware_init_handshake(
+    log_g17p_firmware_recovery_handshake(
         pdev.as_ref(),
         manager,
         "native-opening-retired-baseline",
+    );
+    complete_primary_empty_recovery(pdev, manager, &gfx_state)?;
+    log_g17p_firmware_recovery_handshake(
+        pdev.as_ref(),
+        manager,
+        "native-opening-recovery-complete",
     );
 
     if !g17_submission::G17P_NATIVE_PRE_USER_EP21_MESSAGES.is_empty() {
@@ -1417,6 +1620,17 @@ impl G17PLiveRuntime {
         {
             g17_lifecycle::recover_persistent_runtime(self)?;
         }
+        self.manager
+            .as_ref()
+            .ok_or(ENODEV)?
+            .validate_prepublication_compute_queue(self.queue.as_ref().ok_or(ENODEV)?)?;
+        let pdev = self.pdev.as_ref().ok_or(ENODEV)?.clone();
+        let gfx_state = self.gfx_state.as_ref().ok_or(ENODEV)?.clone();
+        complete_primary_empty_recovery(
+            &pdev,
+            self.manager.as_mut().ok_or(ENODEV)?,
+            &gfx_state,
+        )?;
         if g17_submission::require_g17p_running_client_power_transition(
             g17_submission::G17P_RUNNING_CLIENT_POWER_CONTRACT,
             self.cpus.is_some(),
@@ -1450,9 +1664,14 @@ impl G17PLiveRuntime {
             let manager = self.manager.as_mut().ok_or(ENODEV)?;
             let queue = self.queue.as_mut().ok_or(ENODEV)?;
             let binding = self.compute_binding.as_ref().ok_or(ENODEV)?;
+            let gfx_state = self.gfx_state.as_ref().ok_or(ENODEV)?;
+            gfx_state
+                .submission_phase
+                .store(g17_manager::G17P_SUBMIT_PHASE_IDLE, Ordering::Release);
             manager.submit_translated_compute(
                 registers,
                 queue,
+                &gfx_state.submission_phase,
                 binding,
                 command,
                 g17_manager::G17PComputeSubmissionContext {
@@ -1495,7 +1714,7 @@ impl G17PLiveRuntime {
                     self.manager.as_mut().ok_or(ENODEV)?,
                     "native-first-pre-0x0a",
                 );
-                log_g17p_hardware_init_handshake(
+                log_g17p_firmware_recovery_handshake(
                     self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
                     self.manager.as_mut().ok_or(ENODEV)?,
                     "native-first-pre-0x0a",
@@ -1559,7 +1778,7 @@ impl G17PLiveRuntime {
                     self.manager.as_mut().ok_or(ENODEV)?,
                     "native-first-post-0x10",
                 );
-                log_g17p_hardware_init_handshake(
+                log_g17p_firmware_recovery_handshake(
                     self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
                     self.manager.as_mut().ok_or(ENODEV)?,
                     "native-first-post-0x10",
@@ -1614,7 +1833,7 @@ impl G17PLiveRuntime {
                         self.manager.as_mut().ok_or(ENODEV)?,
                         "native-first-timeout",
                     );
-                    log_g17p_hardware_init_handshake(
+                    log_g17p_firmware_recovery_handshake(
                         self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
                         self.manager.as_mut().ok_or(ENODEV)?,
                         "native-first-timeout",

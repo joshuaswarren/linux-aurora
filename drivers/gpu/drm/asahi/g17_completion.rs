@@ -44,6 +44,8 @@ pub(crate) const G17P_FIRMWARE_EVENT_ENTRY_SIZE: usize = 0x48;
 pub(crate) const G17P_FIRMWARE_EVENT_CAPACITY: u32 = 0x100;
 pub(crate) const G17P_FIRMWARE_EVENT_CONSUMER_OFFSET: u32 = 0;
 pub(crate) const G17P_FIRMWARE_EVENT_PRODUCER_OFFSET: u32 = 0x20;
+pub(crate) const G17P_FIRMWARE_EVENT_RECOVERY_TYPE: u32 = 4;
+pub(crate) const G17P_FIRMWARE_EVENT_UMA_GROW_TYPE: u32 = 13;
 pub(crate) const D93AP_G17P_SGX_SOURCE_INDEX: u8 = 4;
 pub(crate) const D93AP_G17P_SGX_INTERRUPTS_VALID: u32 = 0xdf;
 
@@ -76,6 +78,8 @@ pub(crate) enum CompletionDecodeError {
     FirmwareEventDiagnosticCount,
     FirmwareEventStampIndex,
     FirmwareEventStampMissing,
+    FirmwareEventUmaPoolIndex,
+    FirmwareEventUmaAddress,
     CompletionOutstanding,
     CompletionRouteUnavailable,
     FirmwareEventEndpoint,
@@ -661,6 +665,76 @@ pub(crate) fn decode_g17p_firmware_stamp_event(
     Ok(G17PFirmwareStampEvent {
         masks: [get_u64(raw, 0x04), get_u64(raw, 0x0c)],
         diagnostic_pair_count,
+    })
+}
+
+/// Firmware event type 4 (`kAGFIFirmwareEventTypeGPURestart`).
+///
+/// Exact J700 A000 publishes the current recovery generation unaligned at
+/// `+0x04` and the affected stamp index at `+0x0c`. A stamp index of `-1` is
+/// valid and denotes a recovery with no command stamp to attribute.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PFirmwareRecoveryEvent {
+    pub(crate) generation: u64,
+    pub(crate) stamp_index: i32,
+}
+
+pub(crate) fn decode_g17p_firmware_recovery_event(
+    raw: &[u8],
+) -> Result<G17PFirmwareRecoveryEvent, CompletionDecodeError> {
+    if raw.len() != G17P_FIRMWARE_EVENT_ENTRY_SIZE {
+        return Err(CompletionDecodeError::RecordSize);
+    }
+    if get_u32(raw, 0x00) != G17P_FIRMWARE_EVENT_RECOVERY_TYPE {
+        return Err(CompletionDecodeError::FirmwareEventType);
+    }
+    Ok(G17PFirmwareRecoveryEvent {
+        generation: get_u64(raw, 0x04),
+        stamp_index: get_i32(raw, 0x0c),
+    })
+}
+
+/// Firmware event type 13
+/// (`kAGFIFirmwareEventTypeUMAAsyncGrowRequestComplete`).
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PFirmwareUmaGrowEvent {
+    pub(crate) stamp_index: i32,
+    pub(crate) pool_index: u32,
+    pub(crate) shared_control: u64,
+    pub(crate) operand_table: u64,
+    pub(crate) cookie: u64,
+    pub(crate) result: u32,
+}
+
+pub(crate) fn decode_g17p_firmware_uma_grow_event(
+    raw: &[u8],
+) -> Result<G17PFirmwareUmaGrowEvent, CompletionDecodeError> {
+    if raw.len() != G17P_FIRMWARE_EVENT_ENTRY_SIZE {
+        return Err(CompletionDecodeError::RecordSize);
+    }
+    if get_u32(raw, 0x00) != G17P_FIRMWARE_EVENT_UMA_GROW_TYPE {
+        return Err(CompletionDecodeError::FirmwareEventType);
+    }
+    let stamp_index = get_i32(raw, 0x04);
+    if stamp_index < -1 {
+        return Err(CompletionDecodeError::FirmwareEventStampIndex);
+    }
+    let pool_index = get_u32(raw, 0x08);
+    if pool_index >= 0x100 {
+        return Err(CompletionDecodeError::FirmwareEventUmaPoolIndex);
+    }
+    let shared_control = get_u64(raw, 0x0c);
+    let operand_table = get_u64(raw, 0x14);
+    if shared_control == 0 || operand_table == 0 {
+        return Err(CompletionDecodeError::FirmwareEventUmaAddress);
+    }
+    Ok(G17PFirmwareUmaGrowEvent {
+        stamp_index,
+        pool_index,
+        shared_control,
+        operand_table,
+        cookie: get_u64(raw, 0x1c),
+        result: get_u32(raw, 0x24),
     })
 }
 
@@ -1250,6 +1324,50 @@ mod tests {
                 G17PFirmwareEventReadStep::PublishConsumer,
                 G17PFirmwareEventReadStep::CorrelateStamp,
             ]
+        );
+    }
+
+    #[test]
+    fn firmware_recovery_event_decodes_unaligned_generation_and_optional_stamp() {
+        let mut event = [0u8; G17P_FIRMWARE_EVENT_ENTRY_SIZE];
+        event[0..4].copy_from_slice(&G17P_FIRMWARE_EVENT_RECOVERY_TYPE.to_le_bytes());
+        event[4..12].copy_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
+        event[12..16].copy_from_slice(&(-1i32).to_le_bytes());
+        assert_eq!(
+            decode_g17p_firmware_recovery_event(&event),
+            Ok(G17PFirmwareRecoveryEvent {
+                generation: 0x1122_3344_5566_7788,
+                stamp_index: -1,
+            })
+        );
+
+        event[0..4].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(
+            decode_g17p_firmware_recovery_event(&event),
+            Err(CompletionDecodeError::FirmwareEventType)
+        );
+    }
+
+    #[test]
+    fn firmware_uma_grow_event_decodes_hardware_tuple() {
+        let mut event = [0u8; G17P_FIRMWARE_EVENT_ENTRY_SIZE];
+        event[0..4].copy_from_slice(&G17P_FIRMWARE_EVENT_UMA_GROW_TYPE.to_le_bytes());
+        event[4..8].copy_from_slice(&1i32.to_le_bytes());
+        event[8..12].copy_from_slice(&0u32.to_le_bytes());
+        event[12..20].copy_from_slice(&0xffff_fc20_c082_8000u64.to_le_bytes());
+        event[20..28].copy_from_slice(&0x70_0020_8000u64.to_le_bytes());
+        event[28..36].copy_from_slice(&0x70_0020_8640u64.to_le_bytes());
+        event[36..40].copy_from_slice(&0x18u32.to_le_bytes());
+        assert_eq!(
+            decode_g17p_firmware_uma_grow_event(&event),
+            Ok(G17PFirmwareUmaGrowEvent {
+                stamp_index: 1,
+                pool_index: 0,
+                shared_control: 0xffff_fc20_c082_8000,
+                operand_table: 0x70_0020_8000,
+                cookie: 0x70_0020_8640,
+                result: 0x18,
+            })
         );
     }
 
