@@ -499,6 +499,7 @@ static int dcp_rtk_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
 			u64 ack;
 			int ret;
 
+			iomfb_d563_a2i_ep1_snapshot(dcp);
 			if (bfr->size < SZ_1M)
 				ack = BIT_ULL(54) | BIT_ULL(52) |
 				      FIELD_PREP(GENMASK_ULL(51, 44),
@@ -554,6 +555,27 @@ int dcp_send_message_sync(struct apple_dcp *dcp, u8 endpoint, u64 message)
 	trace_dcp_send_msg(dcp, endpoint, message);
 	return apple_rtkit_send_message(dcp->rtk, endpoint, message, NULL,
 					false);
+}
+
+int dcp_mbox_a2i_control(struct apple_dcp *dcp, u32 *control)
+{
+	struct apple_mbox *mbox = dcp->rtk->mbox;
+	unsigned long flags;
+
+	if (!control)
+		return -EINVAL;
+	if (!mbox || !mbox->active || READ_ONCE(mbox->removing))
+		return -ENODEV;
+	if (!of_device_is_compatible(mbox->dev->of_node,
+				     "apple,asc-mailbox-v4"))
+		return -EOPNOTSUPP;
+
+	/* CONTROL is status-only. Reading SEND/RECV data is not required. */
+	spin_lock_irqsave(&mbox->tx_lock, flags);
+	*control = readl(mbox->regs + APPLE_T8140_MBOX_A2I_CONTROL);
+	spin_unlock_irqrestore(&mbox->tx_lock, flags);
+
+	return 0;
 }
 
 int dcp_try_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message,

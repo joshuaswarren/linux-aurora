@@ -191,3 +191,45 @@ zero still proves only FIFO admission. There is currently no safe,
 positive-controlled AP observation that distinguishes a fifth reply which was
 not associated from one whose DCP-local condition did not wake. No further
 hardware candidate follows from this memory method.
+
+## Safe A2I transport discriminator
+
+The reply ingress itself has no silent store-without-signal branch. The reply
+filter must return an existing busy stream. A missing stream, a newly allocated
+stream, or a failed gate action reaches the non-returning firmware abort at
+`0x041b7520..0x041b7528`. On the normal branch, `0x041b7450` enters the stream
+gate. Action `0x041b7804` stores the raw reply at `0x041b781c` and immediately,
+unconditionally calls the condition signal at `0x041b7820`.
+
+That makes the ASC A2I FIFO a useful safe boundary even though it cannot expose
+the DCP-private stream word. On T8140 its control register is at mailbox offset
+`0x110`. It reports FIFO occupancy in bits 23 through 20, read and write
+pointers in bits 15 through 12 and 11 through 8, and empty in bit 17. Reading
+the control register is status-only; only the receive-data registers pop FIFO
+entries.
+
+Linux handles application endpoint 37 and crashlog endpoint 1 on the same
+ordered RTKit workqueue. The diagnostic therefore samples as follows without
+altering a reply word:
+
+1. Read A2I control immediately before and after each of the five D563 ACKs.
+2. At the next D563 callback, use the same pointer transition to recover the
+   previous ACK as a positive control. The callback itself independently proves
+   that its predecessor associated and woke the synchronous firmware caller.
+3. Read A2I control at the EP1 buffer request before sending the EP1 ACK. This
+   work item runs after callback 181 and before EP1 adds another A2I entry, so it
+   is an unambiguous observation of ACK5's transport state.
+
+For example, empty state `0x27701`, queued state `0x107801`, and consumed state
+`0x28801` describe one send: write pointer 7 to 8, then read pointer 7 to 8 and
+occupancy 1 to 0. Strict FIFO ordering means unrelated later traffic cannot
+produce a false consumed result. It can only leave the FIFO nonempty and make a
+sample inconclusive. The driver accepts only an initially empty FIFO and an
+exact one-entry pointer transition.
+
+This classifies transport, not the private stream cache line. If ACK5 is still
+the one pending entry at the EP1 sample, it did not leave the AP-to-DCP FIFO. If
+it has been consumed, the remaining fault is downstream of hardware delivery,
+between RTKit EP37 dispatch and resumption of the synchronous caller. Because
+the store and signal are unconditional once the gate action runs, there is no
+evidence-derived wire change to make at that point.

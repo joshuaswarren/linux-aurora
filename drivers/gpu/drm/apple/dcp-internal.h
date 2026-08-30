@@ -192,6 +192,10 @@ struct apple_dcp {
 	u64 link_init_message;
 	u16 link_rx_log_count;
 	u16 link_reply_log_count;
+	u32 link_d563_a2i_before[5];
+	u32 link_d563_a2i_after[5];
+	u8 link_d563_a2i_count;
+	bool link_d563_a2i_ep1_observed;
 	/* Serializes firmware type0 with the inherited-session timed INIT. */
 	struct mutex link_init_lock;
 	enum apple_dcp_link_state link_state;
@@ -342,6 +346,7 @@ struct apple_dcp {
 
 void dcp_drm_crtc_page_flip(struct apple_dcp *dcp, ktime_t now);
 void iomfb_link_timeout_snapshot(struct apple_dcp *dcp);
+void iomfb_d563_a2i_ep1_snapshot(struct apple_dcp *dcp);
 
 int dcp_backlight_register(struct apple_dcp *dcp);
 int dcp_backlight_update(struct apple_dcp *dcp);

@@ -171,6 +171,123 @@ static void dcp_link_sync_for_device(void)
 	wmb();
 }
 
+static const char * const dcp25g83_d563_tail_properties[] = {
+	"MaxVideoSrcDownscalingWidth",
+	"VideoClock",
+	"PixelClock",
+	"DisplayClock",
+	"DispPerfState",
+};
+
+static int dcp25g83_d563_tail_index(const void *input, u32 input_size)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(dcp25g83_d563_tail_properties); i++) {
+		size_t length = strlen(dcp25g83_d563_tail_properties[i]) + 1;
+
+		if (input_size >= length &&
+		    !memcmp(input, dcp25g83_d563_tail_properties[i], length))
+			return i;
+	}
+
+	return -ENOENT;
+}
+
+static void dcp25g83_d563_a2i_begin(struct apple_dcp *dcp, int index)
+{
+	u32 control;
+	bool causal = false;
+	bool consumed = false;
+	int ret;
+
+	if (dcp->fw_compat != DCP_FIRMWARE_H17P || !dcp->adopted_session ||
+	    index < 0 ||
+	    index >= (int)ARRAY_SIZE(dcp25g83_d563_tail_properties))
+		return;
+
+	ret = dcp_mbox_a2i_control(dcp, &control);
+	if (ret) {
+		dev_info(dcp->dev,
+			 "DCP25G83_D563_A2I_CONTROL index %d entry unavailable %d\n",
+			 index + 1, ret);
+		return;
+	}
+
+	causal = index && dcp->link_d563_a2i_count == index;
+	if (causal)
+		consumed = apple_dcp_mbox_single_tx_consumed(
+			dcp->link_d563_a2i_before[index - 1],
+			dcp->link_d563_a2i_after[index - 1], control);
+	dcp->link_d563_a2i_before[index] = control;
+	dcp->link_d563_a2i_count = index + 1;
+	if (index)
+		dev_info(dcp->dev,
+			 "DCP25G83_D563_A2I_CONTROL index %d previous_index %d previous_before %#x previous_after %#x entry %#x previous_consumed %u causally_associated %u\n",
+			 index + 1, index,
+			 dcp->link_d563_a2i_before[index - 1],
+			 dcp->link_d563_a2i_after[index - 1], control,
+			 consumed, causal);
+}
+
+static void dcp25g83_d563_a2i_end(struct apple_dcp *dcp, int index,
+					 int ack_ret)
+{
+	u32 control;
+	int ret;
+
+	if (index < 0 ||
+	    index >= (int)ARRAY_SIZE(dcp25g83_d563_tail_properties) ||
+	    dcp->link_d563_a2i_count != index + 1)
+		return;
+
+	ret = dcp_mbox_a2i_control(dcp, &control);
+	if (ret) {
+		dev_info(dcp->dev,
+			 "DCP25G83_D563_A2I_TX index %d after unavailable %d ACK_result %d\n",
+			 index + 1, ret, ack_ret);
+		return;
+	}
+
+	dcp->link_d563_a2i_after[index] = control;
+	dev_info(dcp->dev,
+		 "DCP25G83_D563_A2I_TX index %d property %s before %#x after %#x ACK_result %d\n",
+		 index + 1, dcp25g83_d563_tail_properties[index],
+		 dcp->link_d563_a2i_before[index], control, ack_ret);
+}
+
+void iomfb_d563_a2i_ep1_snapshot(struct apple_dcp *dcp)
+{
+	u32 control;
+	bool consumed;
+	bool pending;
+	int ret;
+
+	if (dcp->link_d563_a2i_count !=
+	    (u8)ARRAY_SIZE(dcp25g83_d563_tail_properties) ||
+	    dcp->link_d563_a2i_ep1_observed)
+		return;
+
+	dcp->link_d563_a2i_ep1_observed = true;
+	ret = dcp_mbox_a2i_control(dcp, &control);
+	if (ret) {
+		dev_info(dcp->dev,
+			 "DCP25G83_D563_A2I_EP1_RESULT unavailable %d\n", ret);
+		return;
+	}
+
+	consumed = apple_dcp_mbox_single_tx_consumed(
+		dcp->link_d563_a2i_before[4], dcp->link_d563_a2i_after[4],
+		control);
+	pending = apple_dcp_mbox_single_tx_pending(
+		dcp->link_d563_a2i_before[4], dcp->link_d563_a2i_after[4],
+		control);
+	dev_info(dcp->dev,
+		 "DCP25G83_D563_A2I_EP1_RESULT ack5_before %#x ack5_after %#x ep1_before_ack %#x ack5_consumed %u ack5_pending %u\n",
+		 dcp->link_d563_a2i_before[4], dcp->link_d563_a2i_after[4],
+		 control, consumed, pending);
+}
+
 void iomfb_link_timeout_snapshot(struct apple_dcp *dcp)
 {
 	struct apple_dcp_link_rpc_header *callback;
@@ -203,6 +320,18 @@ void iomfb_link_timeout_snapshot(struct apple_dcp *dcp)
 		 le32_to_cpu(callback->output_size),
 		 callback_input + max_t(u32, le32_to_cpu(callback->input_size), 16) - 16,
 		 callback_output, READ_ONCE(dcp->ch_cb.depth));
+	if (dcp->link_d563_a2i_count ==
+	    (u8)ARRAY_SIZE(dcp25g83_d563_tail_properties)) {
+		u32 control;
+		int ret = dcp_mbox_a2i_control(dcp, &control);
+
+		if (!ret)
+			dev_info(dcp->dev,
+				 "DCP25G83_D563_A2I_TIMEOUT ack5_before %#x ack5_after %#x current %#x ep1_observed %u\n",
+				 dcp->link_d563_a2i_before[4],
+				 dcp->link_d563_a2i_after[4], control,
+				 dcp->link_d563_a2i_ep1_observed);
+	}
 }
 
 static void dcp_link_log_init(struct apple_dcp *dcp,
@@ -798,6 +927,7 @@ static void dcp_link_handle_callback(struct apple_dcp *dcp, u64 message)
 	u64 reply = apple_dcp_link_rpc_reply(message);
 	u8 depth;
 	int ack_ret;
+	int d563_tail_index = -ENOENT;
 	int tag;
 	int ret;
 
@@ -859,6 +989,10 @@ static void dcp_link_handle_callback(struct apple_dcp *dcp, u64 message)
 				 apple_dcp_link_rpc_reply(message));
 		return;
 	}
+	if (tag == 563)
+		d563_tail_index = dcp25g83_d563_tail_index(view.input,
+							   view.input_size);
+	dcp25g83_d563_a2i_begin(dcp, d563_tail_index);
 
 	if (view.output_size)
 		memset(view.output, 0, view.output_size);
@@ -906,6 +1040,7 @@ static void dcp_link_handle_callback(struct apple_dcp *dcp, u64 message)
 	}
 	if (handled) {
 		ack_ret = dcp_link_ack(dcp, DCP_CONTEXT_CB);
+		dcp25g83_d563_a2i_end(dcp, d563_tail_index, ack_ret);
 		if (log_callback && sequence >= 165)
 			dev_info(dcp->dev,
 				 "DCPLink callback %u D%03d ACK %#llx send result %d\n",
@@ -1014,6 +1149,12 @@ static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 	dcp->link_service_match_state = 0;
 	dcp->link_service_match_output = NULL;
 	dcp->link_service_match_callback_tag = 0;
+	dcp->link_d563_a2i_count = 0;
+	dcp->link_d563_a2i_ep1_observed = false;
+	memset(dcp->link_d563_a2i_before, 0,
+	       sizeof(dcp->link_d563_a2i_before));
+	memset(dcp->link_d563_a2i_after, 0,
+	       sizeof(dcp->link_d563_a2i_after));
 	dev_info(dcp->dev, "DCP25G83_ACK_DIAG armed\n");
 
 	if (dcp->adopted_session) {
