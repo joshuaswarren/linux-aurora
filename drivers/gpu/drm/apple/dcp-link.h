@@ -651,6 +651,11 @@ static inline int apple_dcp_link_init_message(u64 rpc_dva, u64 *message)
 	return 0;
 }
 
+static inline u64 apple_dcp_link_firmware_init_echo(u64 init_message)
+{
+	return init_message | APPLE_DCP_LINK_MSG_REMOTE;
+}
+
 static inline int apple_dcp_link_firmware_dva(u64 mapped_dva,
 					      u64 aperture_start,
 					      u64 aperture_end,

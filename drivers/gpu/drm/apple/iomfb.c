@@ -41,7 +41,15 @@
 #define APPLE_DCP_LINK_PHASE_PROPERTY	"apple,dcp-link-phase"
 #define APPLE_DCP_LINK_MESSAGE_PROPERTY	"apple,dcp-link-message"
 
-#define DCP25G83_TYPE0_CANARY_ECHO	0x10001de00000140ULL
+#define DCP25G83_LINK_START_BARRIER_TIMEOUT	msecs_to_jiffies(1000)
+
+enum dcp_link_start_barrier_state {
+	DCP_LINK_START_BARRIER_IDLE,
+	DCP_LINK_START_BARRIER_QUEUED,
+	DCP_LINK_START_BARRIER_WAITING,
+	DCP_LINK_START_BARRIER_PASSED,
+	DCP_LINK_START_BARRIER_FAILED,
+};
 
 static int dcp_tx_offset(enum dcp_context_id id)
 {
@@ -194,19 +202,6 @@ static int dcp25g83_d563_tail_index(const void *input, u32 input_size)
 	}
 
 	return -ENOENT;
-}
-
-static bool dcp25g83_type0_canary(struct apple_dcp *dcp, int tag,
-				  const struct apple_dcp_link_rpc_view *view)
-{
-	static const char property[] = "SupportRelbufInfoCb";
-
-	if (dcp->fw_compat != DCP_FIRMWARE_H17P || !dcp->adopted_session ||
-	    dcp->link_pre_ack_type0_canary_sent || tag != 102 ||
-	    view->input_size != 0x44 || view->output_size)
-		return false;
-
-	return !memcmp(view->input, property, sizeof(property));
 }
 
 static void dcp25g83_d563_a2i_begin(struct apple_dcp *dcp, int index)
@@ -1055,36 +1050,7 @@ static void dcp_link_handle_callback(struct apple_dcp *dcp, u64 message)
 				 handled ? reply : 0);
 	}
 	if (handled) {
-		bool canary = dcp25g83_type0_canary(dcp, tag, &view);
-		u32 canary_before = 0, canary_after = 0, ack_after = 0;
-		int canary_before_ret = -ECANCELED;
-		int canary_after_ret = -ECANCELED;
-		int ack_after_ret = -ECANCELED;
-		int canary_ret = -ECANCELED;
-
-		if (canary) {
-			dcp->link_pre_ack_type0_canary_sent = true;
-			canary_before_ret = dcp_mbox_a2i_control(dcp,
-								 &canary_before);
-			canary_ret = dcp_send_message_sync(dcp,
-							   APPLE_DCP_LINK_ENDPOINT, 0);
-			canary_after_ret = dcp_mbox_a2i_control(dcp,
-								&canary_after);
-			dev_info(dcp->dev,
-				 "DCP25G83_EP37_PRE_ACK_TYPE0_CANARY callback %u D%03d request 0 result %d A2I before %#x result %d after %#x result %d expect echo %#llx before ACK %#llx\n",
-				 sequence, tag, canary_ret, canary_before,
-				 canary_before_ret, canary_after, canary_after_ret,
-				 DCP25G83_TYPE0_CANARY_ECHO, reply);
-		}
-
 		ack_ret = dcp_link_ack(dcp, DCP_CONTEXT_CB);
-		if (canary) {
-			ack_after_ret = dcp_mbox_a2i_control(dcp, &ack_after);
-			dev_info(dcp->dev,
-				 "DCP25G83_EP37_PRE_ACK_TYPE0_CANARY_ACK callback %u ACK %#llx result %d A2I after %#x result %d\n",
-				 sequence, reply, ack_ret, ack_after,
-				 ack_after_ret);
-		}
 		dcp25g83_d563_a2i_end(dcp, d563_tail_index, ack_ret);
 		if (log_callback && sequence >= 165)
 			dev_info(dcp->dev,
@@ -1126,18 +1092,113 @@ out_unlock:
 	return ret;
 }
 
+static void dcp_link_start_work(struct work_struct *work)
+{
+	struct apple_dcp *dcp =
+		container_of(work, struct apple_dcp, link_start_work);
+
+	if (atomic_read(&dcp->link_start_barrier_state) !=
+	    DCP_LINK_START_BARRIER_PASSED)
+		return;
+
+	dev_info(dcp->dev,
+		 "DCP25G83_LINK_START_BARRIER A401 after exact type0 echo\n");
+	iomfb_start_h17p(dcp);
+}
+
+static void dcp_link_start_barrier_timeout_work(struct work_struct *work)
+{
+	struct delayed_work *delayed = to_delayed_work(work);
+	struct apple_dcp *dcp = container_of(delayed, struct apple_dcp,
+					     link_start_barrier_timeout_work);
+
+	if (atomic_cmpxchg(&dcp->link_start_barrier_state,
+			   DCP_LINK_START_BARRIER_WAITING,
+			   DCP_LINK_START_BARRIER_FAILED) !=
+	    DCP_LINK_START_BARRIER_WAITING)
+		return;
+
+	dev_err(dcp->dev,
+		"DCP25G83_LINK_START_BARRIER no exact type0 echo %#llx; A401 not sent\n",
+		dcp->link_start_barrier_echo);
+}
+
+static void dcp_link_start_barrier_work(struct work_struct *work)
+{
+	struct apple_dcp *dcp =
+		container_of(work, struct apple_dcp, link_start_barrier_work);
+	int ret;
+
+	if (atomic_cmpxchg(&dcp->link_start_barrier_state,
+			   DCP_LINK_START_BARRIER_QUEUED,
+			   DCP_LINK_START_BARRIER_WAITING) !=
+	    DCP_LINK_START_BARRIER_QUEUED)
+		return;
+
+	ret = dcp_send_message_sync(dcp, APPLE_DCP_LINK_ENDPOINT,
+				    APPLE_DCP_LINK_MSG_FIRMWARE_INIT);
+	if (ret) {
+		atomic_set(&dcp->link_start_barrier_state,
+			   DCP_LINK_START_BARRIER_FAILED);
+		dev_err(dcp->dev,
+			"DCP25G83_LINK_START_BARRIER type0 send failed %d; A401 not sent\n",
+			ret);
+		return;
+	}
+
+	dev_info(dcp->dev,
+		 "DCP25G83_LINK_START_BARRIER type0 sent after READY handler; expect %#llx before A401\n",
+		 dcp->link_start_barrier_echo);
+	schedule_delayed_work(&dcp->link_start_barrier_timeout_work,
+			      DCP25G83_LINK_START_BARRIER_TIMEOUT);
+}
+
+static int dcp_link_queue_start_barrier(struct apple_dcp *dcp)
+{
+	dcp->link_start_barrier_echo =
+		apple_dcp_link_firmware_init_echo(dcp->link_init_message);
+	if (atomic_cmpxchg(&dcp->link_start_barrier_state,
+			   DCP_LINK_START_BARRIER_IDLE,
+			   DCP_LINK_START_BARRIER_QUEUED) !=
+	    DCP_LINK_START_BARRIER_IDLE)
+		return -EALREADY;
+
+	if (!dcp_queue_rtkit_work(dcp, &dcp->link_start_barrier_work)) {
+		atomic_set(&dcp->link_start_barrier_state,
+			   DCP_LINK_START_BARRIER_FAILED);
+		return -EIO;
+	}
+
+	dev_info(dcp->dev,
+		 "DCP25G83_LINK_START_BARRIER queued behind READY receive work\n");
+	return 0;
+}
+
 static void dcp_link_recv_msg(struct apple_dcp *dcp, u64 message)
 {
 	enum apple_dcp_link_handshake_action action;
 	enum apple_dcp_link_state old_state = dcp->link_state;
 	u8 type = message & GENMASK_ULL(1, 0);
 
-	if (dcp->adopted_session &&
-	    dcp->link_pre_ack_type0_canary_sent &&
-	    message == DCP25G83_TYPE0_CANARY_ECHO)
-		dev_info(dcp->dev,
-			 "DCP25G83_EP37_PRE_ACK_TYPE0_CANARY_ECHO RX %#llx exact\n",
-			 message);
+	if (atomic_read(&dcp->link_start_barrier_state) ==
+		    DCP_LINK_START_BARRIER_WAITING &&
+	    message == dcp->link_start_barrier_echo) {
+		if (atomic_cmpxchg(&dcp->link_start_barrier_state,
+				   DCP_LINK_START_BARRIER_WAITING,
+				   DCP_LINK_START_BARRIER_PASSED) ==
+		    DCP_LINK_START_BARRIER_WAITING) {
+			cancel_delayed_work(&dcp->link_start_barrier_timeout_work);
+			dev_info(dcp->dev,
+				 "DCP25G83_LINK_START_BARRIER exact type0 echo %#llx; queue A401 after echo handler\n",
+				 message);
+			if (!dcp_queue_rtkit_work(dcp, &dcp->link_start_work)) {
+				atomic_set(&dcp->link_start_barrier_state,
+					   DCP_LINK_START_BARRIER_FAILED);
+				dev_err(dcp->dev,
+					"DCP25G83_LINK_START_BARRIER could not queue A401 work\n");
+			}
+		}
+	}
 
 	action = apple_dcp_link_handshake_step(&dcp->link_state, message);
 	if (action == APPLE_DCP_LINK_HANDSHAKE_SEND_INIT) {
@@ -1185,7 +1246,9 @@ static void dcp_link_recv_msg(struct apple_dcp *dcp, u64 message)
 		dev_info(dcp->dev,
 			 "DCP25G83_LINK_ABI transport %#x hash %#x schema %#x\n",
 			 remote_version, dcp->link_firmware_hash, dcp->link_abi);
-		iomfb_start_h17p(dcp);
+		if (dcp_link_queue_start_barrier(dcp))
+			dev_err(dcp->dev,
+				"DCP25G83_LINK_START_BARRIER could not queue after READY; A401 not sent\n");
 		return;
 	}
 
@@ -1212,6 +1275,13 @@ static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 	int ret;
 
 	INIT_WORK(&dcp->link_service_match_work, dcp_link_service_match_work);
+	INIT_WORK(&dcp->link_start_barrier_work,
+		  dcp_link_start_barrier_work);
+	INIT_WORK(&dcp->link_start_work, dcp_link_start_work);
+	INIT_DELAYED_WORK(&dcp->link_start_barrier_timeout_work,
+			  dcp_link_start_barrier_timeout_work);
+	atomic_set(&dcp->link_start_barrier_state,
+		   DCP_LINK_START_BARRIER_IDLE);
 	dcp->link_service_match_state = 0;
 	dcp->link_service_match_output = NULL;
 	dcp->link_service_match_callback_tag = 0;
@@ -1403,8 +1473,12 @@ static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 				 "DCP25G83_LINK_ABI transport %#x hash %#x schema %#x\n",
 				 remote_version, dcp->link_firmware_hash,
 				 dcp->link_abi);
-			iomfb_start_h17p(dcp);
-			return 0;
+			ret = dcp_link_queue_start_barrier(dcp);
+			if (ret)
+				dev_err(dcp->dev,
+					"DCP25G83_LINK_START_BARRIER could not queue from inherited READY: %d; A401 not sent\n",
+					ret);
+			return ret;
 		}
 
 		if (action != APPLE_DCP_LINK_ADOPT_SEND_INIT) {
@@ -1925,8 +1999,12 @@ void iomfb_shutdown(struct apple_dcp *dcp)
 	/* We're going down */
 	dcp->active = false;
 	dcp->valid_mode = false;
-	if (dcp->fw_compat == DCP_FIRMWARE_H17P)
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P) {
+		cancel_delayed_work_sync(&dcp->link_start_barrier_timeout_work);
+		cancel_work_sync(&dcp->link_start_barrier_work);
+		cancel_work_sync(&dcp->link_start_work);
 		cancel_work_sync(&dcp->link_service_match_work);
+	}
 
 	switch (dcp->fw_compat) {
 	case DCP_FIRMWARE_V_12_3:
