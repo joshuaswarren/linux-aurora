@@ -1456,6 +1456,11 @@ impl G17PManagerConstruction {
             G17PSksmQueueHardwareState::HardwareRegistered => return Ok(()),
             G17PSksmQueueHardwareState::PreparedMemory => {}
         }
+        queue.storage.prepare_live_mappings(self.uat())?;
+        dev_info!(
+            self.resources.dev().as_ref(),
+            "G17P submitBuffer/prepareMappings: low/high QID4 aliases published to live UAT\n"
+        );
         fence(Ordering::SeqCst);
         registers.g17p_sksm_configure_queue(queue.configure_pair, queue.enable_pair)?;
         queue.hardware_state = G17PSksmQueueHardwareState::HardwareRegistered;

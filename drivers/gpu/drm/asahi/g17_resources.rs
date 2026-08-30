@@ -15,7 +15,7 @@ use crate::g17_initdata;
 #[cfg(not(test))]
 use crate::{
     driver::{AsahiDevRef, AsahiDevice},
-    g17_completion, g17_compute, g17_render, g17_submission, g17_uapi, gem, mmu,
+    g17_completion, g17_compute, g17_render, g17_submission, g17_uapi, gem, mem, mmu,
 };
 #[cfg(test)]
 #[path = "g17_completion.rs"]
@@ -3322,6 +3322,38 @@ impl G17PClRuntimeStorage {
             self.geometry.allocation_alignment(),
         )
         .map_err(|_| EINVAL)
+    }
+
+    /// Make both queue-entry aliases visible to the already-running G17P UAT
+    /// before the write-only SKSM configuration transaction.
+    pub(crate) fn prepare_live_mappings(&self, uat: &mmu::Uat) -> Result {
+        let low = &self.entries.mapping;
+        let high = &self.entries_high;
+        if low.size() == 0
+            || low.size() != high.size()
+            || !uat.kernel_lower_vm().covers_range(
+                low.iova(),
+                low.size() as u64,
+                true,
+                true,
+            )
+            || !uat.kernel_vm().covers_range(
+                high.iova(),
+                high.size() as u64,
+                true,
+                true,
+            )
+        {
+            return Err(EFAULT);
+        }
+
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        for asid in [0u8, 1u8] {
+            mem::tlbi_range(asid, low.iova() as usize, low.size());
+            mem::tlbi_range(asid, high.iova() as usize, high.size());
+        }
+        mem::sync();
+        Ok(())
     }
 
     pub(crate) fn shared_support_gpu_va(&self) -> u64 {
