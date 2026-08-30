@@ -77,6 +77,7 @@
 #define DCP_RTKIT_CRASHLOG_VERSION DCP_RTKIT_FOURCC('C', 'v', 'e', 'r')
 #define DCP_RTKIT_CRASHLOG_REGS DCP_RTKIT_FOURCC('C', 'r', 'g', '8')
 #define DCP_RTKIT_CRASHLOG_REGS_CL4 DCP_RTKIT_FOURCC('C', 'r', 'l', '4')
+#define DCP_RTKIT_CRASHLOG_ASYNC DCP_RTKIT_FOURCC('C', 'a', 's', 'C')
 
 #define DCP_RTKIT_CRASHLOG_MULTI_VERSION 2
 #define DCP_RTKIT_CRASHLOG_VERSION_V3 3
@@ -105,6 +106,9 @@
 #define DCP_RTKIT_CRASHLOG_CL4_TPIDR_EL0 0x138
 #define DCP_RTKIT_CRASHLOG_CL4_ESR 0x358
 #define DCP_RTKIT_CRASHLOG_CL4_FAR 0x360
+
+#define DCP_RTKIT_CRASHLOG_ASYNC_SECTION_SIZE 0x48
+#define DCP_RTKIT_CRASHLOG_ASYNC_VERSION 0x101
 
 #define DCP_25G83_INHERITED_CRASHLOG_WORD 0x12610008784000ULL
 
@@ -636,6 +640,10 @@ static bool dcp_rtk_report_adopted_crashlog(struct apple_dcp *dcp,
 					"DCP25G83_A401_CRASHLOG_CRL4_INVALID flags %#x size %#x\n",
 					cl4_flags, cl4_size);
 			} else {
+				dev_info(dcp->dev,
+					 "DCP25G83_A401_CRASHLOG_CRL4_GPRS x0_7 %64phN x8_15 %64phN x16_23 %64phN x24_29 %48phN\n",
+					 cl4 + 0x18, cl4 + 0x58, cl4 + 0x98,
+					 cl4 + 0xd8);
 				dev_err(dcp->dev,
 					"DCP25G83_A401_CRASHLOG_CRL4 lr %#llx pc %#llx sp %#llx psr %#llx fpsr %#llx fpcr %#llx tpidr_el0 %#llx esr %#llx far %#llx\n",
 					get_unaligned_le64(cl4 + DCP_RTKIT_CRASHLOG_CL4_LR),
@@ -647,6 +655,29 @@ static bool dcp_rtk_report_adopted_crashlog(struct apple_dcp *dcp,
 					get_unaligned_le64(cl4 + DCP_RTKIT_CRASHLOG_CL4_TPIDR_EL0),
 					get_unaligned_le64(cl4 + DCP_RTKIT_CRASHLOG_CL4_ESR),
 					get_unaligned_le64(cl4 + DCP_RTKIT_CRASHLOG_CL4_FAR));
+			}
+		} else if (fourcc == DCP_RTKIT_CRASHLOG_ASYNC) {
+			u32 version = get_unaligned_le32(section + 8);
+			u8 *payload = section + 0x10;
+
+			if (version != DCP_RTKIT_CRASHLOG_ASYNC_VERSION ||
+			    section_size != DCP_RTKIT_CRASHLOG_ASYNC_SECTION_SIZE) {
+				dev_err(dcp->dev,
+					"DCP25G83_A401_CRASHLOG_CASC_INVALID version %#x size %#x\n",
+					version, section_size);
+			} else {
+				dev_info(dcp->dev,
+					 "DCP25G83_A401_CRASHLOG_CASC_RAW payload %56phN\n",
+					 payload);
+				dev_err(dcp->dev,
+					"DCP25G83_A401_CRASHLOG_CASC l2c_sts %#llx l2c_adr %#llx l2c_inf %#llx lsu_sts %#llx fed_sts %#llx mmu_sts %#llx extra_25g83 %#llx\n",
+					get_unaligned_le64(payload + 0x00),
+					get_unaligned_le64(payload + 0x08),
+					get_unaligned_le64(payload + 0x10),
+					get_unaligned_le64(payload + 0x18),
+					get_unaligned_le64(payload + 0x20),
+					get_unaligned_le64(payload + 0x28),
+					get_unaligned_le64(payload + 0x30));
 			}
 		} else {
 			dev_info(dcp->dev,

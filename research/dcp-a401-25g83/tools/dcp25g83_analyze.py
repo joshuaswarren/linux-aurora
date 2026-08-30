@@ -137,6 +137,8 @@ def verify(image: Image) -> None:
         0x04021258: 0x52800724,  # rtk_ep_work priority 0x39
         0x042DF464: 0x52820003,  # iomfb_ap_link stack size 0x1000
         0x042DF468: 0x52800204,  # iomfb_ap_link priority 0x10
+        0x04141324: 0xD503237F,  # getRequestedDriveSettings entry / PACIBSP
+        0x042A13D0: 0x2A1303E6,  # saved LR / mov w6, w19, not a callsite
         0x040205C4: 0xDAC0116B,  # scheduler CLZ of runnable-priority bitmap
         0x040205CC: 0x4B0B018B,  # highest runnable priority = 63 - CLZ
         0x041B7068: 0x71080A7F,  # filter returns true only for new request 0x202

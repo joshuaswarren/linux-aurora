@@ -42,6 +42,8 @@ shasum -a 256 \
   source/25G83__MacOS/Firmware/dcp/t8140dcp.im4p \
   extracted/t8140dcp-25G83.bin
 python3 tools/dcp25g83_analyze.py verify
+python3 tools/dcp25g83_analyze.py disasm 0x04141324 0x04141544
+python3 tools/dcp25g83_analyze.py disasm 0x042a13c0 0x042a13f0
 python3 tools/parse_rtbuddy_crashlog.py --self-test
 ```
 
@@ -72,7 +74,8 @@ not a valid association discriminator and why the reply error field is not a
 safe substitute.
 
 `parse_rtbuddy_crashlog.py` mirrors native RTBuddy's current-generation CLGH
-selection and summarizes Cstr plus Crg8/Crl4 register frames from a raw
+selection and summarizes Cstr, Crg8/Crl4 register frames, and the seven native
+CasC async-fabric qwords from a raw
 crashlog-buffer dump. The
 layout was recovered from the local Mac17p reference kernelcache
 `kernelcache.release.mac17p.decompressed`, size `119504896`, SHA-256

@@ -13,6 +13,7 @@ CLHE = 0x434C4845
 CSTR = 0x43737472
 CRG8 = 0x43726738
 CRL4 = 0x43726C34
+CASC = 0x43617343
 
 MULTI_HEADER_SIZE = 0x14
 MULTI_RECORD_SIZE = 0x18
@@ -41,6 +42,18 @@ CL4_FPCR = 0x130
 CL4_TPIDR_EL0 = 0x138
 CL4_ESR = 0x358
 CL4_FAR = 0x360
+
+CASC_SECTION_SIZE = 0x48
+CASC_VERSION = 0x101
+CASC_FIELDS = (
+    ("l2c_sts", 0x10),
+    ("l2c_adr", 0x18),
+    ("l2c_inf", 0x20),
+    ("lsu_sts", 0x28),
+    ("fed_sts", 0x30),
+    ("mmu_sts", 0x38),
+    ("extra_25g83", 0x40),
+)
 
 
 def u32(data: bytes | bytearray, offset: int) -> int:
@@ -160,6 +173,16 @@ def summarize(data: bytes) -> None:
                     f"esr={u64(data, section + CL4_ESR):#x} "
                     f"far={u64(data, section + CL4_FAR):#x}"
                 )
+        elif signature == CASC:
+            version = u32(data, section + 8)
+            if version != CASC_VERSION or size != CASC_SECTION_SIZE:
+                print(f"CasC invalid version={version:#x} size={size:#x}")
+            else:
+                values = " ".join(
+                    f"{name}={u64(data, section + field_offset):#x}"
+                    for name, field_offset in CASC_FIELDS
+                )
+                print(f"CasC {values}")
         offset += size
 
 
@@ -172,18 +195,22 @@ def self_test() -> None:
     struct.pack_into("<QQII", data, 0x2C, 0x5354414C45, 0, 0x400, 0)
     struct.pack_into("<IIIII", data, 0x80, CLGH, 0x202, 0x780, inner_id, 1)
     struct.pack_into("<QQII", data, 0x94, inner_id, 0, 0x40, 0)
-    struct.pack_into("<IIII16s", data, 0xC0, CLHE, 0x300, 0x3B8, 0, b"\0" * 16)
+    struct.pack_into("<IIII16s", data, 0xC0, CLHE, 0x300, 0x400, 0, b"\0" * 16)
     struct.pack_into("<IIII", data, 0xE0, CRL4, 0, 0x401, CL4_SECTION_SIZE)
     struct.pack_into("<II", data, 0xF0, 0, CL4_NOMINAL_SIZE)
     struct.pack_into("<Q", data, 0xE0 + CL4_PC, 0x41B7528)
-    data[0x458:0x478] = data[0xC0:0xE0]
+    struct.pack_into("<IIII", data, 0x458, CASC, 0, CASC_VERSION, CASC_SECTION_SIZE)
+    for index, (_, field_offset) in enumerate(CASC_FIELDS, start=1):
+        struct.pack_into("<Q", data, 0x458 + field_offset, index)
+    data[0x4A0:0x4C0] = data[0xC0:0xE0]
 
     offset, generations = select_current(data)
     assert offset == 0xC0
     assert generations == [outer_id, inner_id]
     assert u64(data, offset + LOG_HEADER_SIZE + CL4_PC) == 0x41B7528
+    assert u64(data, 0x458 + CASC_FIELDS[-1][1]) == 7
     summarize(data)
-    print("OK nested CLGH selection, CLHE footer, and Crl4 gates")
+    print("OK nested CLGH selection, CLHE footer, Crl4 gates, and CasC fields")
 
 
 def main() -> None:
