@@ -125,12 +125,14 @@ pub(crate) enum SubmissionError {
     KickTimestampOutOfRange,
     /// The runtime queue geometry must contain between 1 and 256 stamps.
     KickStampCountOutOfRange,
+    /// No SKSM queue geometry is proven for this target/backend pair.
+    KickQueueGeometryUnconfirmed,
+    /// The queue stride/count/alignment/extent/seed tuple is inconsistent.
+    KickQueueGeometryInvalid,
     /// The timestamp's low-byte slot does not exist in this queue geometry.
     KickStampIndexOutOfRange,
     /// A zero-byte entry stride would alias every queue entry.
     KickEntryStrideZero,
-    /// A G17P CL entry stride cannot hold the complete 0x180-byte host body.
-    KickEntryStrideTooSmall,
     /// Multiplying the slot by the runtime entry stride overflowed u32.
     KickEntryOffsetOverflow,
     /// The queue already has `num_stamps` entries awaiting completion.
@@ -2115,6 +2117,109 @@ pub(crate) const G17P_CL_DEPENDENCIES_MAX: usize = 32;
 pub(crate) const G17P_CL_EXPLICIT_DEPENDENCIES_MAX: usize = G17P_CL_DEPENDENCIES_MAX - 1;
 const G17P_CL_PACKED_ADDRESS_MASK: u64 = (1u64 << 38) - 1;
 
+/// Proven allocation and timestamp geometry for one target/backend pair.
+///
+/// Only A18 Pro's G17P HAL200 hybrid has an admitted tuple. Classic and
+/// HAL300 remain deliberately absent until their own host contracts are
+/// recovered.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17SksmQueueGeometry {
+    target: G17ChannelAbiTarget,
+    backend: G17ClSubmissionBackend,
+    allocation_alignment: u64,
+    entry_stride: u32,
+    stamp_count: u16,
+    timestamp_seed: u64,
+    backing_size: usize,
+}
+
+impl G17SksmQueueGeometry {
+    pub(crate) const fn validate(self) -> Result<(), SubmissionError> {
+        if !matches!(
+            (self.target, self.backend),
+            (
+                G17ChannelAbiTarget::A18ProG17P,
+                G17ClSubmissionBackend::G17PHal200Hybrid
+            )
+        ) {
+            return Err(SubmissionError::KickQueueGeometryUnconfirmed);
+        }
+        if self.allocation_alignment == 0
+            || self.allocation_alignment & (self.allocation_alignment - 1) != 0
+            || self.entry_stride < G17P_CL_KICK_ENTRY_SIZE as u32
+            || self.stamp_count == 0
+            || self.stamp_count > KICK_NUM_STAMPS_MAX
+            || self.timestamp_seed & !KICK_TS_MASK != 0
+            || (self.timestamp_seed & KICK_STAMP_INDEX_MASK) >= self.stamp_count as u64
+            || self.backing_size as u64
+                != self.entry_stride as u64 * self.stamp_count as u64
+            || self.backing_size as u64 % self.allocation_alignment != 0
+        {
+            return Err(SubmissionError::KickQueueGeometryInvalid);
+        }
+        Ok(())
+    }
+
+    pub(crate) const fn allocation_alignment(self) -> u64 {
+        self.allocation_alignment
+    }
+
+    pub(crate) const fn mapping_alignment(self, minimum: u64) -> u64 {
+        if self.allocation_alignment > minimum {
+            self.allocation_alignment
+        } else {
+            minimum
+        }
+    }
+
+    pub(crate) const fn entry_stride(self) -> u32 {
+        self.entry_stride
+    }
+
+    pub(crate) const fn stamp_count(self) -> u16 {
+        self.stamp_count
+    }
+
+    pub(crate) const fn timestamp_seed(self) -> u64 {
+        self.timestamp_seed
+    }
+
+    pub(crate) const fn backing_size(self) -> usize {
+        self.backing_size
+    }
+}
+
+pub(crate) const T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY: G17SksmQueueGeometry =
+    G17SksmQueueGeometry {
+        target: G17ChannelAbiTarget::A18ProG17P,
+        backend: G17ClSubmissionBackend::G17PHal200Hybrid,
+        allocation_alignment: 0x100,
+        entry_stride: 0x200,
+        stamp_count: 0x100,
+        timestamp_seed: 1,
+        backing_size: 0x20000,
+    };
+
+pub(crate) const fn g17_sksm_queue_geometry(
+    target: G17ChannelAbiTarget,
+    backend: G17ClSubmissionBackend,
+) -> Option<G17SksmQueueGeometry> {
+    match (target, backend) {
+        (G17ChannelAbiTarget::A18ProG17P, G17ClSubmissionBackend::G17PHal200Hybrid) => {
+            Some(T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY)
+        }
+        _ => None,
+    }
+}
+
+const _: () = assert!(T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY.entry_stride as usize
+    * T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY.stamp_count as usize
+    == T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY.backing_size);
+const _: () = assert!(T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY.entry_stride as usize
+    >= G17P_CL_KICK_ENTRY_SIZE);
+const _: () = assert!(T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY.allocation_alignment == 0x100);
+const _: () = assert!(T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY.timestamp_seed == 1);
+
 /// Host-object fields used while selecting, publishing, and retiring one CL
 /// kick entry. These are CPU-object offsets, not firmware queue-record offsets.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -2367,8 +2472,7 @@ pub(crate) struct G17PClQosConfig {
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct G17PClKickProducerState {
     pub(crate) queue_id: u8,
-    pub(crate) num_stamps: u16,
-    pub(crate) entry_stride: u32,
+    pub(crate) geometry: G17SksmQueueGeometry,
     pub(crate) completion_selector: u8,
     pub(crate) qos: G17PClQosConfig,
     pub(crate) submitted: u32,
@@ -2378,6 +2482,38 @@ pub(crate) struct G17PClKickProducerState {
     pub(crate) base_timestamp: u64,
     pub(crate) previous_valid: bool,
     pub(crate) previous_timestamp: u64,
+}
+
+impl G17SksmQueueGeometry {
+    pub(crate) const fn initial_producer_state(
+        self,
+        queue_id: u8,
+        completion_selector: u8,
+        qos: G17PClQosConfig,
+    ) -> Result<G17PClKickProducerState, SubmissionError> {
+        match self.validate() {
+            Ok(()) => {}
+            Err(error) => return Err(error),
+        }
+        if queue_id > KICK_QID_MASK {
+            return Err(SubmissionError::QueueIdOutOfRange);
+        }
+        if completion_selector > 3 {
+            return Err(SubmissionError::KickQueueCompletionSelectorOutOfRange);
+        }
+        Ok(G17PClKickProducerState {
+            queue_id,
+            geometry: self,
+            completion_selector,
+            qos,
+            submitted: 0,
+            current_timestamp: self.timestamp_seed,
+            last_add_kicks_timestamp: self.timestamp_seed,
+            base_timestamp: self.timestamp_seed,
+            previous_valid: false,
+            previous_timestamp: 0,
+        })
+    }
 }
 
 /// Descriptor and call-site operands consumed by `encodeCLKickEntry`.
@@ -2500,7 +2636,7 @@ fn encode_g17p_cl_barrier_dependency(
         return Err(SubmissionError::KickDependencyQueueIdOutOfRange);
     }
 
-    let stamp_count = queue.num_stamps as u64;
+    let stamp_count = queue.geometry.stamp_count() as u64;
     let event_timestamp = (((barrier.event_word as u64) >> 8)
         | barrier.shared_stamp.wrapping_shl(24))
     .wrapping_sub(1);
@@ -2552,12 +2688,7 @@ pub(crate) fn prepare_g17p_cl_kick_entry(
     queue: G17PClKickProducerState,
     operands: G17PClKickEntryOperands<'_>,
 ) -> Result<PreparedG17PClKickEntry, SubmissionError> {
-    if queue.entry_stride == 0 {
-        return Err(SubmissionError::KickEntryStrideZero);
-    }
-    if queue.entry_stride < G17P_CL_KICK_ENTRY_SIZE as u32 {
-        return Err(SubmissionError::KickEntryStrideTooSmall);
-    }
+    queue.geometry.validate()?;
     if queue.completion_selector > 3 {
         return Err(SubmissionError::KickQueueCompletionSelectorOutOfRange);
     }
@@ -2577,10 +2708,10 @@ pub(crate) fn prepare_g17p_cl_kick_entry(
     let prepared = prepare_kick_submission(
         queue.current_timestamp,
         queue.queue_id,
-        queue.num_stamps,
-        queue.entry_stride,
+        queue.geometry.stamp_count(),
+        queue.geometry.entry_stride(),
     )?;
-    if queue.submitted >= queue.num_stamps as u32 {
+    if queue.submitted >= queue.geometry.stamp_count() as u32 {
         return Err(SubmissionError::KickQueueSubmittedFull);
     }
 
@@ -2654,7 +2785,7 @@ pub(crate) fn prepare_g17p_cl_kick_entry(
     producer_after.previous_timestamp = prepared.timestamp;
 
     Ok(PreparedG17PClKickEntry {
-        zero_length: queue.entry_stride,
+        zero_length: queue.geometry.entry_stride(),
         entry,
         entry_index: prepared.entry_index,
         entry_offset: prepared.entry_offset,
@@ -3103,6 +3234,7 @@ pub(crate) struct G17PComputeQueueRouting {
     pub(crate) queue_id: u8,
     pub(crate) completion_selector: u32,
     pub(crate) entry_gpu_va: u64,
+    pub(crate) geometry: G17SksmQueueGeometry,
 }
 
 /// Pure description of the ordered host-side publications that make one A18
@@ -3212,6 +3344,13 @@ pub(crate) const fn prepare_g17p_compute_sksm_queue_config(
     routing: G17PComputeQueueRouting,
     geometry: G17SksmScratchGeometry,
 ) -> Result<PreparedG17PSksmQueueConfig, SubmissionError> {
+    match routing.geometry.validate() {
+        Ok(()) => {}
+        Err(error) => return Err(error),
+    }
+    if routing.entry_gpu_va & (routing.geometry.allocation_alignment() - 1) != 0 {
+        return Err(SubmissionError::KickQueueEntryAddressUnencodable);
+    }
     prepare_g17p_sksm_queue_config(
         G17ChannelAbiTarget::A18ProG17P,
         routing.queue_id,
@@ -4993,6 +5132,93 @@ mod tests {
     }
 
     #[test]
+    fn g17p_hal200_queue_geometry_is_exact_and_other_backends_stay_unconfirmed() {
+        let geometry = T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY;
+        assert_eq!(geometry.validate(), Ok(()));
+        assert_eq!(geometry.allocation_alignment(), 0x100);
+        assert_eq!(geometry.entry_stride(), 0x200);
+        assert_eq!(geometry.stamp_count(), 0x100);
+        assert_eq!(geometry.timestamp_seed(), 1);
+        assert_eq!(geometry.backing_size(), 0x20000);
+        assert_eq!(
+            geometry.entry_stride() as usize * geometry.stamp_count() as usize,
+            geometry.backing_size()
+        );
+        assert_eq!(
+            g17_sksm_queue_geometry(
+                G17ChannelAbiTarget::A18ProG17P,
+                G17ClSubmissionBackend::G17PHal200Hybrid,
+            ),
+            Some(geometry)
+        );
+        for backend in [
+            G17ClSubmissionBackend::Classic,
+            G17ClSubmissionBackend::Hal300,
+        ] {
+            assert_eq!(
+                g17_sksm_queue_geometry(G17ChannelAbiTarget::A18ProG17P, backend),
+                None
+            );
+        }
+        for target in [
+            G17ChannelAbiTarget::M5G17G,
+            G17ChannelAbiTarget::M5ProMaxG17X,
+        ] {
+            assert_eq!(
+                g17_sksm_queue_geometry(target, G17ClSubmissionBackend::G17PHal200Hybrid),
+                None
+            );
+        }
+
+        let producer = geometry
+            .initial_producer_state(
+                4,
+                2,
+                G17PClQosConfig {
+                    queue_byte_32: 1,
+                    class_40: 8,
+                    word_48: 0xffff,
+                },
+            )
+            .unwrap();
+        assert_eq!(producer.geometry, geometry);
+        assert_eq!(producer.submitted, 0);
+        assert_eq!(producer.current_timestamp, geometry.timestamp_seed());
+        assert_eq!(producer.last_add_kicks_timestamp, geometry.timestamp_seed());
+        assert_eq!(producer.base_timestamp, geometry.timestamp_seed());
+        assert!(!producer.previous_valid);
+    }
+
+    #[test]
+    fn g17p_hal200_queue_geometry_drives_last_slot_and_wrap() {
+        let geometry = T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY;
+        let timestamp = encode_kick_timestamp(KickTimestamp {
+            stamp: 0x1234_5678,
+            stamp_index: (geometry.stamp_count() - 1) as u8,
+        });
+        let prepared = prepare_kick_submission(
+            timestamp,
+            4,
+            geometry.stamp_count(),
+            geometry.entry_stride(),
+        )
+        .unwrap();
+
+        assert_eq!(prepared.entry_index, 0xff);
+        assert_eq!(
+            prepared.entry_offset as usize + geometry.entry_stride() as usize,
+            geometry.backing_size()
+        );
+        assert_eq!(
+            decode_kick_timestamp(prepared.next_timestamp),
+            Ok(KickTimestamp {
+                stamp: 0x1234_5679,
+                stamp_index: 0,
+            })
+        );
+    }
+
+    #[test]
     fn kick_queue_preparation_matches_all_runtime_stamp_geometries() {
         for num_stamps in 1u16..=KICK_NUM_STAMPS_MAX {
             for index in 0u16..num_stamps {
@@ -5167,8 +5393,7 @@ mod tests {
         const DESCRIPTOR_STRIDE: u64 = 0x1040;
         let item0_queue = G17PClKickProducerState {
             queue_id: 4,
-            num_stamps: 256,
-            entry_stride: 0x200,
+            geometry: T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY,
             completion_selector: 2,
             qos: G17PClQosConfig {
                 queue_byte_32: 1,
@@ -5321,8 +5546,7 @@ mod tests {
         );
         let before = G17PClKickProducerState {
             queue_id: 4,
-            num_stamps: 0x100,
-            entry_stride: 0x200,
+            geometry: T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY,
             completion_selector: 2,
             qos: G17PClQosConfig {
                 queue_byte_32: 1,
@@ -5423,8 +5647,7 @@ mod tests {
         let empty = G17PClRceBinding { address: 0, tag: 0 };
         let producer = G17PClKickProducerState {
             queue_id: 4,
-            num_stamps: 16,
-            entry_stride: 0x200,
+            geometry: T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY,
             completion_selector: 2,
             qos: G17PClQosConfig {
                 queue_byte_32: 1,
@@ -5471,8 +5694,7 @@ mod tests {
     fn g17p_cl_completion_updates_only_the_submitted_count() {
         let producer = G17PClKickProducerState {
             queue_id: 4,
-            num_stamps: 256,
-            entry_stride: 0x200,
+            geometry: T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY,
             completion_selector: 2,
             qos: G17PClQosConfig {
                 queue_byte_32: 1,
@@ -5696,8 +5918,7 @@ mod tests {
         ];
         let queue = G17PClKickProducerState {
             queue_id: 4,
-            num_stamps: 16,
-            entry_stride: 0x200,
+            geometry: T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY,
             completion_selector: 2,
             qos: G17PClQosConfig {
                 queue_byte_32: 0x12,
@@ -5770,8 +5991,7 @@ mod tests {
         let empty = G17PClRceBinding { address: 0, tag: 0 };
         let queue = G17PClKickProducerState {
             queue_id: 0,
-            num_stamps: 16,
-            entry_stride: 0x200,
+            geometry: T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY,
             completion_selector: 0,
             qos: G17PClQosConfig {
                 queue_byte_32: 0,
@@ -5801,37 +6021,46 @@ mod tests {
         assert_eq!(
             prepare_g17p_cl_kick_entry(
                 G17PClKickProducerState {
-                    entry_stride: 0,
+                    geometry: G17SksmQueueGeometry {
+                        entry_stride: 0,
+                        ..T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY
+                    },
                     ..queue
                 },
                 operands,
             ),
-            Err(SubmissionError::KickEntryStrideZero)
+            Err(SubmissionError::KickQueueGeometryInvalid)
         );
         assert_eq!(
             prepare_g17p_cl_kick_entry(
                 G17PClKickProducerState {
-                    entry_stride: 0x17f,
+                    geometry: G17SksmQueueGeometry {
+                        entry_stride: 0x17f,
+                        ..T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY
+                    },
                     ..queue
                 },
                 operands,
             ),
-            Err(SubmissionError::KickEntryStrideTooSmall)
+            Err(SubmissionError::KickQueueGeometryInvalid)
         );
         assert_eq!(
             prepare_g17p_cl_kick_entry(
                 G17PClKickProducerState {
-                    num_stamps: 0,
+                    geometry: G17SksmQueueGeometry {
+                        stamp_count: 0,
+                        ..T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY
+                    },
                     ..queue
                 },
                 operands,
             ),
-            Err(SubmissionError::KickStampCountOutOfRange)
+            Err(SubmissionError::KickQueueGeometryInvalid)
         );
         assert_eq!(
             prepare_g17p_cl_kick_entry(
                 G17PClKickProducerState {
-                    submitted: 16,
+                    submitted: T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY.stamp_count() as u32,
                     ..queue
                 },
                 operands,
@@ -6115,6 +6344,7 @@ mod tests {
                 queue_id: 4,
                 completion_selector: 2,
                 entry_gpu_va: 0x0000_0070_004d_8000,
+                geometry: T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY,
             },
             g17_manager::T8140_G17P_PLATFORM_CONFIG.sksm_scratch,
         )
