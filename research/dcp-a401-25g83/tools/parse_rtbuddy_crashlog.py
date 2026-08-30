@@ -12,6 +12,7 @@ CLGH = 0x434C4748
 CLHE = 0x434C4845
 CSTR = 0x43737472
 CRG8 = 0x43726738
+CRL4 = 0x43726C34
 
 MULTI_HEADER_SIZE = 0x14
 MULTI_RECORD_SIZE = 0x18
@@ -113,14 +114,15 @@ def summarize(data: bytes) -> None:
             message_id = u32(data, payload)
             text = data[payload + 4 : section + size].split(b"\0", 1)[0]
             print(f"Cstr id={message_id:#x}: {text.decode(errors='replace')}")
-        elif signature == CRG8 and payload_size >= REGS_SIZE:
+        elif signature in (CRG8, CRL4) and payload_size >= REGS_SIZE:
+            kind = "Crg8" if signature == CRG8 else "Crl4"
             regs_flags = u32(data, payload)
             regs_size = u32(data, payload + 4)
             if regs_size != REGS_BODY_SIZE or regs_flags & 0x10000:
-                print(f"Crg8 invalid flags={regs_flags:#x} size={regs_size:#x}")
+                print(f"{kind} invalid flags={regs_flags:#x} size={regs_size:#x}")
             else:
                 print(
-                    "Crg8 "
+                    f"{kind} "
                     f"pc={u64(data, payload + REGS_PC):#x} "
                     f"sp={u64(data, payload + REGS_SP):#x} "
                     f"psr={u64(data, payload + REGS_PSR):#x} "
@@ -139,18 +141,18 @@ def self_test() -> None:
     struct.pack_into("<QQII", data, 0x2C, 0x5354414C45, 0, 0x400, 0)
     struct.pack_into("<IIIII", data, 0x80, CLGH, 0x202, 0x780, inner_id, 1)
     struct.pack_into("<QQII", data, 0x94, inner_id, 0, 0x40, 0)
-    struct.pack_into("<IIII16s", data, 0xC0, CLHE, 0x300, 0x3A0, 0, b"\0" * 16)
-    struct.pack_into("<IIII", data, 0xE0, CRG8, 0, 0, 0x360)
+    struct.pack_into("<IIII16s", data, 0xC0, CLHE, 0x300, 0x3B8, 0, b"\0" * 16)
+    struct.pack_into("<IIII", data, 0xE0, CRL4, 0, 0, 0x378)
     struct.pack_into("<II", data, 0xF0, 0, REGS_BODY_SIZE)
     struct.pack_into("<Q", data, 0xF0 + REGS_PC, 0x41B7528)
-    data[0x440:0x460] = data[0xC0:0xE0]
+    data[0x458:0x478] = data[0xC0:0xE0]
 
     offset, generations = select_current(data)
     assert offset == 0xC0
     assert generations == [outer_id, inner_id]
     assert u64(data, offset + LOG_HEADER_SIZE + SECTION_HEADER_SIZE + REGS_PC) == 0x41B7528
     summarize(data)
-    print("OK nested CLGH selection, CLHE footer, and Crg8 gates")
+    print("OK nested CLGH selection, CLHE footer, and Crl4 gates")
 
 
 def main() -> None:

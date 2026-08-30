@@ -412,6 +412,12 @@ object before endpoint traffic, invalidate/decode its current crash record on
 this notification, and send no reply. Keep that state repair separate from the
 current crash-PC discriminator.
 
+The parity path now imports exact 25G83 word `0x12610008784000` before DCP
+endpoint traffic. It seeds size `0x26000`, DVA `0x10008784000`, validates the
+entire DART range, and maps it Normal-NC. Generic RTKit consequently enters its
+existing-buffer crash path on EP1 and sends no reply. This repairs post-crash
+host state only; it does not change the pre-crash fifth-D563 path.
+
 ## Timeout crashlog discriminator
 
 The adopted path does not send a new STARTEP for EP1. It marks the system
@@ -461,10 +467,32 @@ decode as size `0x26000`, current ID `0x434c3455`, count 2, and record-zero ID
 `0x434c3455`. They stop before record zero's payload offset at outer offset
 `0x24`, so that non-comparable run cannot identify a PC.
 
-The corrected timeout observer follows the native current-generation chain,
-then prints Crg8 PC/SP/PSR/FAR/ESR and Cstr messages. A valid pristine A401 run
-with `DCP25G83_A401_CRASHLOG_CRG8` will distinguish the EP37 invalid-stream
-abort from an object-release abort by its exact firmware PC and crash string.
+Fresh main-path result:
+
+`neo-bringup/logs/dcp-appledrm-25g83-clgh-current-c4a1258-20260829-212020.log`
+
+The fifth D563 acknowledgement was sent at `25.692938`; EP1 arrived at
+`25.693057`. The current record decoded as generation `0x434c344b`, depth 1,
+offset `0x21000`, CLHE version `0x302`, size `0x4e4`, flags `0x1f`, and Cstr
+`exception.c:59`. Its sections were Ctim `0x18`, Crl4 `0x378`, and CasC
+`0x48`. The inherited-buffer handler marked DCP crashed; Linux's old fallback
+reply was rejected with `-EINVAL` only after that. This confirms a real crash
+and rules out any EP1 request/reply handshake as its cause.
+
+The 25G83 firmware template at decompressed bundle file offset `0xeb60` gives
+Crl4 signature `0x43726c34`, version `0x401`, and section size `0x378`.
+Mac17p `RTBuddyRegisterFrameDecoder::registerDecoderCl4` routes it through the
+same ARMv8 register-frame decoder as Crg8. The section payload begins with
+flags at `+0x0` and required body size `0x348` at `+0x4`; the register body
+begins at `+0x8`. The exact payload-relative fields are SP `+0x100`, PC
+`+0x108`, PSR `+0x110`, FAR `+0x330`, physical FAR `+0x338`, and ESR
+`+0x340`. Flags bit 16 still marks the record non-decodable.
+
+The observer and offline parser now decode both Crg8 and Crl4 through those
+same gates. `exception.c:59` identifies the firmware kernel's generic exception
+recording site; it does not identify the faulting instruction. The next valid
+discriminator is `DCP25G83_A401_CRASHLOG_CRL4 pc ...`, which can locate the
+actual pre-notification failure against the exact 25G83 image.
 
 ## Queued post-A401 H17P callback table correction
 
