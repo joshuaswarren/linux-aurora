@@ -276,15 +276,14 @@ the word on the same endpoint software queue; action `0x041b70d0` drains that
 queue and chooses the same stream from the same control bits. There is no
 static ACK1-through-ACK4 versus ACK5 dispatch delta to patch.
 
-The signal-before-enqueue order does not create a runnable race on 25G83.
-Firmware creates the AFK producer workloop named `rtk_ep_work` at `0x0402125c`
-with priority `0x39`. It creates the DCPLink consumer workloop named
-`iomfb_ap_link` at `0x042df470` with priority `0x10`. The scheduler records a
-runnable priority in a 64-bit bitmap and selects its highest set bit with
-`clz` at `0x040205c4..0x040205e0`. The link consumer therefore cannot preempt
-the endpoint producer between the filter's event-source signal and the queue
-write. Once the producer yields, `0x041b70d0` can pop the already-enqueued
-word.
+Firmware creates the default endpoint workloop named `rtk_ep_work` at
+`0x0402125c` with priority `0x39`. It creates the DCPLink consumer workloop
+named `iomfb_ap_link` at `0x042df470` with priority `0x10`. The scheduler
+records a runnable priority in a 64-bit bitmap and selects its highest set bit
+with `clz` at `0x040205c4..0x040205e0`. Those facts do not by themselves close
+the signal-before-enqueue question. The route callback at `0x04026bf0` runs
+through the lower MBI provider's registered callback, and its exact execution
+context is not pinned to `rtk_ep_work` by the current disassembly.
 
 The reply lookup under the link gate at `0x041b7830` aborts if it must create
 an idle stream for a reply. A normal synchronous callback cannot expose that
@@ -294,13 +293,13 @@ offset `0x60`. There is no normal branch that clears it while the caller is
 blocked. For an existing stream, `0x041b7804` stores the reply and signals the
 waiter unconditionally.
 
-Together with the FIFO result, this moves the last normal-path boundary past
-EP37 dequeue and association. A missing or newly allocated stream takes the
-non-returning abort at `0x041b7520`; it cannot look like a silent wait. If that
-abort happened, the immediately following crashlog buffer request would be
-consistent with the root task entering its crash path. The remaining static
-work is to distinguish that abort from a later abort in the five object
-releases at `0x042ac100..0x042ac19c`.
+Together with the FIFO result, this moves the physical boundary past A2I
+dequeue but not past EP37 software dispatch. A missing or newly allocated
+stream takes the non-returning abort at `0x041b7520`; it cannot look like a
+silent wait. If that abort happened, the immediately following crashlog buffer
+request would be consistent with the root task entering its crash path. The
+remaining static classifications are route dispatch, that abort, and a later
+abort in the five object releases at `0x042ac100..0x042ac19c`.
 
 ## Adopted endpoint bookkeeping result
 
@@ -344,7 +343,7 @@ to 87.516 ms, but EP1 still followed ACK5 by 115 microseconds. This disproves
 both the warning perturbation and an approximately 100 ms timer as the cause.
 The endpoint bookkeeping fix remains correct.
 
-## Exact EP1 reply parity still pending
+## Exact EP1 reply and dispatch candidate
 
 The current Linux EP1 reply is not the reply selected by native RTBuddy for
 the observed request. Request `0x12610008784000` has bit 54 clear. In
@@ -361,8 +360,24 @@ whose bit 54 is set. Linux currently sends `0x52600000000000`, which takes
 that other form. For the observed 0x26000-byte request and its DVA, the exact
 native-shaped response is the original word `0x12610008784000`.
 
-This mismatch must be fixed, but it cannot explain the present physical
-dequeue failure: the 544562c timeout left the EP1 word unread in A2I. Firmware
-cannot inspect its payload before removing it from the hardware FIFO. Keep the
-EP1 correction queued until the scheduling or abort cause that stops A2I
-drain is established.
+This mismatch cannot explain ACK5's already-proven physical dequeue. It does
+combine with a host scheduling mismatch: native RTBuddy dispatches the
+crashlog endpoint independently of DCPLink, while Linux queues EP1 and EP37 on
+one ordered RTKit worker. Linux's built-in RTKit core only offers its atomic
+early callback to application endpoints at or above `0x20`.
+
+The appledrm-only candidate wraps the adopted DCP mailbox receive callback.
+It intercepts only the first H17P EP1 type-1 word with bit 54 clear, a nonzero
+size, and a nonzero DVA. It snapshots A2I, echoes the raw word synchronously,
+logs the receive timestamp and before/after controls, and suppresses that
+word's later ordered-worker copy. Every other endpoint and later EP1 word is
+delegated to the unchanged RTKit callback. This leaves buffer mapping and
+crash reporting deferred and does not require replacing the built-in RTKit
+core.
+
+The unique marker is `DCP25G83_EP1_EARLY_ECHO`. If A401 still times out,
+`DCP25G83_EP1_EARLY_TIMEOUT` compares the same before/after pointers with the
+terminal FIFO state and reports `consumed` and `pending`. D120 or the outer
+A401 reply after consumption supports cross-endpoint scheduling as the
+blocker. A response that remains pending, or is consumed without D120,
+eliminates that scheduling explanation.

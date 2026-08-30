@@ -332,6 +332,25 @@ void iomfb_link_timeout_snapshot(struct apple_dcp *dcp)
 				 dcp->link_d563_a2i_after[4], control,
 				 dcp->link_d563_a2i_ep1_observed);
 	}
+	if (smp_load_acquire(&dcp->inherited_ep1_a2i_valid)) {
+		u32 control;
+		bool consumed, pending;
+		int ret = dcp_mbox_a2i_control(dcp, &control);
+
+		if (!ret) {
+			consumed = apple_dcp_mbox_single_tx_consumed(
+				dcp->inherited_ep1_a2i_before,
+				dcp->inherited_ep1_a2i_after, control);
+			pending = apple_dcp_mbox_single_tx_pending(
+				dcp->inherited_ep1_a2i_before,
+				dcp->inherited_ep1_a2i_after, control);
+			dev_info(dcp->dev,
+				 "DCP25G83_EP1_EARLY_TIMEOUT before %#x after %#x current %#x consumed %u pending %u\n",
+				 dcp->inherited_ep1_a2i_before,
+				 dcp->inherited_ep1_a2i_after, control,
+				 consumed, pending);
+		}
+	}
 }
 
 static void dcp_link_log_init(struct apple_dcp *dcp,

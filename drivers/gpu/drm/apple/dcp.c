@@ -71,6 +71,11 @@
 	(((u32)(a) << 24) | ((u32)(b) << 16) | ((u32)(c) << 8) | (u32)(d))
 #define DCP_RTKIT_CRASHLOG_HEADER DCP_RTKIT_FOURCC('C', 'L', 'H', 'E')
 #define DCP_RTKIT_EP_CRASHLOG 1
+#define DCP_RTKIT_CRASHLOG_TYPE GENMASK_ULL(59, 52)
+#define DCP_RTKIT_CRASHLOG_GETBUF 1
+#define DCP_RTKIT_CRASHLOG_SELECTOR_BIT54 BIT_ULL(54)
+#define DCP_RTKIT_CRASHLOG_SIZE GENMASK_ULL(51, 44)
+#define DCP_RTKIT_CRASHLOG_DVA GENMASK_ULL(43, 0)
 #define DCP_RTKIT_CRASHLOG_STR DCP_RTKIT_FOURCC('C', 's', 't', 'r')
 #define DCP_RTKIT_CRASHLOG_VERSION DCP_RTKIT_FOURCC('C', 'v', 'e', 'r')
 
@@ -430,6 +435,85 @@ crashed:
 	return true;
 }
 
+/*
+ * Native RTBuddy services crashlog EP1 independently of DCPLink.  In an
+ * adopted session, answer the inherited bit-54-clear buffer request before
+ * placing it behind EP37 work.  This branch's response is the request word
+ * itself: selector, size, and firmware DVA are all preserved.
+ */
+static bool dcp_rtk_crashlog_early(void *cookie, u64 message)
+{
+	struct apple_dcp *dcp = cookie;
+	u64 rx_ns;
+	u32 before = 0, after = 0;
+	int before_ret, after_ret, send_ret;
+
+	if (!dcp->adopted_session || dcp->fw_compat != DCP_FIRMWARE_H17P ||
+	    FIELD_GET(DCP_RTKIT_CRASHLOG_TYPE, message) !=
+		    DCP_RTKIT_CRASHLOG_GETBUF ||
+	    (message & DCP_RTKIT_CRASHLOG_SELECTOR_BIT54) ||
+	    !FIELD_GET(DCP_RTKIT_CRASHLOG_SIZE, message) ||
+	    !FIELD_GET(DCP_RTKIT_CRASHLOG_DVA, message))
+		return false;
+
+	if (atomic_cmpxchg(&dcp->inherited_ep1_early_replied, 0, 1))
+		return false;
+
+	rx_ns = ktime_get_mono_fast_ns();
+	iomfb_d563_a2i_ep1_snapshot(dcp);
+	before_ret = dcp_mbox_a2i_control(dcp, &before);
+	send_ret = dcp_send_message(dcp, DCP_RTKIT_EP_CRASHLOG, message);
+	after_ret = dcp_mbox_a2i_control(dcp, &after);
+	dev_info(dcp->dev,
+		 "DCP25G83_EP1_EARLY_ECHO raw %#llx rx_ns %llu before %#x before_result %d after %#x after_result %d send_result %d\n",
+		 message, rx_ns, before, before_ret, after, after_ret, send_ret);
+
+	if (send_ret) {
+		atomic_set(&dcp->inherited_ep1_early_replied, 0);
+		return false;
+	}
+	if (!before_ret && !after_ret) {
+		dcp->inherited_ep1_a2i_before = before;
+		dcp->inherited_ep1_a2i_after = after;
+		smp_store_release(&dcp->inherited_ep1_a2i_valid, true);
+	}
+
+	return true;
+}
+
+static void dcp_rtk_mbox_rx(struct apple_mbox *mbox,
+			    struct apple_mbox_msg message, void *cookie)
+{
+	struct apple_rtkit *rtk = cookie;
+	struct apple_dcp *dcp = rtk->cookie;
+
+	if (message.msg1 == DCP_RTKIT_EP_CRASHLOG &&
+	    dcp_rtk_crashlog_early(dcp, message.msg0))
+		return;
+
+	dcp->rtkit_mbox_rx(mbox, message, cookie);
+}
+
+static int dcp_rtk_install_crashlog_early_rx(struct apple_dcp *dcp)
+{
+	struct apple_mbox *mbox = dcp->rtk->mbox;
+	unsigned long flags;
+
+	spin_lock_irqsave(&mbox->rx_lock, flags);
+	if (!mbox->rx || mbox->rx == dcp_rtk_mbox_rx) {
+		spin_unlock_irqrestore(&mbox->rx_lock, flags);
+		return -EINVAL;
+	}
+
+	dcp->rtkit_mbox_rx = mbox->rx;
+	mbox->rx = dcp_rtk_mbox_rx;
+	spin_unlock_irqrestore(&mbox->rx_lock, flags);
+	dev_info(dcp->dev,
+		 "DCP25G83_EP1_EARLY_ROUTE installed for inherited crashlog endpoint\n");
+
+	return 0;
+}
+
 static int dcp_rtk_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
 {
 	struct apple_dcp *dcp = cookie;
@@ -485,15 +569,9 @@ static int dcp_rtk_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
 		dcp_rtk_report_adopted_crashlog(dcp, bfr);
 
 		/*
-		 * The firmware still expects an acknowledgement even when it
-		 * supplies its own DVA.  25G83
-		 * RTBuddyCrashlogEndpoint::_messageHandler replies on EP1 with
-		 * bit 54 set, a page-size selector (bit 52 for <1 MiB, bit 53
-		 * otherwise) and the buffer size in those units at bits [51:44];
-		 * no DVA is echoed.  On the adopted RTKit session
-		 * firmware_owned_crashlog is false, so neither the generic path
-		 * nor this setup replied, and start() (A401) waited forever after
-		 * the crashlog GETBUF.  Match the native reply.
+		 * The firmware still expects an acknowledgement when it supplies
+		 * its own DVA.  Native's bit-54-clear branch preserves that DVA and
+		 * uses bit 52 for 4-KiB size units or bit 53 for 1-MiB units.
 		 */
 		if (bfr == &dcp->rtk->crashlog_buffer) {
 			u64 ack;
@@ -501,13 +579,15 @@ static int dcp_rtk_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
 
 			iomfb_d563_a2i_ep1_snapshot(dcp);
 			if (bfr->size < SZ_1M)
-				ack = BIT_ULL(54) | BIT_ULL(52) |
+				ack = BIT_ULL(52) |
 				      FIELD_PREP(GENMASK_ULL(51, 44),
-						 DIV_ROUND_UP(bfr->size, SZ_4K));
+						 DIV_ROUND_UP(bfr->size, SZ_4K)) |
+				      FIELD_PREP(GENMASK_ULL(43, 0), bfr->iova);
 			else
-				ack = BIT_ULL(54) | BIT_ULL(53) |
+				ack = BIT_ULL(53) |
 				      FIELD_PREP(GENMASK_ULL(51, 44),
-						 DIV_ROUND_UP(bfr->size, SZ_1M));
+						 DIV_ROUND_UP(bfr->size, SZ_1M)) |
+				      FIELD_PREP(GENMASK_ULL(43, 0), bfr->iova);
 			ret = dcp_send_message(dcp, DCP_RTKIT_EP_CRASHLOG, ack);
 			dev_info(dcp->dev,
 				 "DCP25G83_EP1_ACK_RESULT ack %#llx result %d\n",
@@ -1599,6 +1679,14 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 
 		dcp->adopting_session = false;
 		dcp->adopted_session = true;
+		atomic_set(&dcp->inherited_ep1_early_replied, 0);
+		dcp->inherited_ep1_a2i_valid = false;
+		ret = dcp_rtk_install_crashlog_early_rx(dcp);
+		if (ret) {
+			devm_apple_rtkit_free(dev, dcp->rtk);
+			dcp->rtk = NULL;
+			goto err_destroy_piodma;
+		}
 	} else {
 		if (start_mode == APPLE_DCP_COPROCESSOR_QUIESCED_RESTART)
 			dev_info(dev, "restarting loader-quiesced DCP session\n");
