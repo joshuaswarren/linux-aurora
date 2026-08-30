@@ -46,6 +46,9 @@ pub(crate) const EXECUTABLE_T8140_ROLE_RESOURCES_AVAILABLE: bool = true;
 #[cfg(not(test))]
 const ROOT_PAIR_ALLOC_SIZE: usize = 0xc000;
 const PRIMARY_STATUS_A_STATE_GRID_OFFSET: u64 = 0xee40;
+const PRIMARY_STATUS_A_RUNTIME_OFFSET: u64 = 0x10;
+const PRIMARY_STATUS_A_RUNTIME_STATE_GRID_OFFSET: u64 =
+    PRIMARY_STATUS_A_STATE_GRID_OFFSET + PRIMARY_STATUS_A_RUNTIME_OFFSET;
 const SECONDARY_EXTRA_0_BEFORE_PRIMARY_STATUS_A: u64 = 0x6c0;
 const SECONDARY_HWDATA_STATE_OFFSET: u64 = 0x3c0;
 const FWCTL_SIZE: usize = 0x4000;
@@ -658,6 +661,28 @@ pub(crate) struct G17PControlPointerSnapshot {
     pub(crate) raw_state_pointers: [u64; g17_initdata::CHANNEL_ENTRY_STATE_COUNT],
     pub(crate) expected_state_pointers: [u64; g17_initdata::CHANNEL_ENTRY_STATE_COUNT],
     pub(crate) state_values: [u32; g17_initdata::CHANNEL_ENTRY_STATE_COUNT],
+}
+
+/// Cache-safe Status-A state written through the primary WC/firmware-uncached
+/// state grid. Exact J700 A000 consumers read `active` at Status-A `+0x10`
+/// and `scheduler_constructed` in the adjacent high word.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PStatusASnapshot {
+    pub(crate) address: u64,
+    pub(crate) raw: u64,
+    pub(crate) active: u32,
+    pub(crate) scheduler_constructed: u32,
+}
+
+impl G17PStatusASnapshot {
+    const fn decode(address: u64, raw: u64) -> Self {
+        Self {
+            address,
+            raw,
+            active: raw as u32,
+            scheduler_constructed: (raw >> 32) as u32,
+        }
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -4231,6 +4256,32 @@ impl G17ResourceOwner {
         })
     }
 
+    /// Read primary Status-A `+0x10` through the existing WC object. Firmware
+    /// maps this host-owned state grid uncached, so this snapshot does not rely
+    /// on observing dirty private firmware cachelines.
+    pub(crate) fn status_a_snapshot(&mut self) -> Result<G17PStatusASnapshot> {
+        let address = self
+            .handoff
+            .primary
+            .state_grid
+            .checked_add(PRIMARY_STATUS_A_RUNTIME_STATE_GRID_OFFSET)
+            .ok_or(EINVAL)?;
+        if address
+            != self
+                .handoff
+                .primary
+                .instance
+                .status_a
+                .checked_add(PRIMARY_STATUS_A_RUNTIME_OFFSET)
+                .ok_or(EINVAL)?
+        {
+            return Err(EINVAL);
+        }
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        let raw = self.resources.primary_state.read_u64(address)?;
+        Ok(G17PStatusASnapshot::decode(address, raw))
+    }
+
     pub(crate) fn control_opening_effect(&mut self) -> Result<G17PControlOpeningEffect> {
         core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
         let shared_cursor_address = self
@@ -6792,6 +6843,19 @@ mod tests {
         assert!(0xb4004 < STATUS_A_ALLOC_SIZE);
         assert!(STATUS_A_ALLOC_SIZE as u64 >= source_extent);
         assert_eq!(STATUS_A_ALLOC_SIZE % G17P_PAGE_SIZE, 0);
+    }
+
+    #[test]
+    fn status_a_runtime_word_is_exact_and_decodes_both_u32_fields() {
+        assert_eq!(PRIMARY_STATUS_A_STATE_GRID_OFFSET, 0xee40);
+        assert_eq!(PRIMARY_STATUS_A_RUNTIME_OFFSET, 0x10);
+        assert_eq!(PRIMARY_STATUS_A_RUNTIME_STATE_GRID_OFFSET, 0xee50);
+        let address = KERN + PRIMARY_STATUS_A_RUNTIME_STATE_GRID_OFFSET;
+        let snapshot = G17PStatusASnapshot::decode(address, 0xaabb_ccdd_1122_3344);
+        assert_eq!(snapshot.address, address);
+        assert_eq!(snapshot.raw, 0xaabb_ccdd_1122_3344);
+        assert_eq!(snapshot.active, 0x1122_3344);
+        assert_eq!(snapshot.scheduler_constructed, 0xaabb_ccdd);
     }
 
     #[test]

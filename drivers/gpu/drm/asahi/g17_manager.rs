@@ -20,7 +20,7 @@ use core::sync::atomic::{fence, Ordering};
 #[cfg(not(test))]
 use crate::{
     driver::AsahiDevice, g17_adt_j700, g17_completion, g17_compute, g17_initdata, g17_lifecycle,
-    g17_render, g17_resources, g17_submission, g17_uapi, hw::agx3, identity, mmu, pgtable, regs,
+    g17_render, g17_resources, g17_submission, g17_uapi, hw::agx3, identity, mmu, regs,
 };
 #[cfg(test)]
 use super as g17_submission;
@@ -73,18 +73,6 @@ const G17P_PRIMARY_PEER_LEASE_PHYSICAL_ADDRESS: u64 = 0x0000_0100_01ea_7798;
 // it only on ACTIVE->SLEEP at 0x25e70..0x25e7c. ACTIVE->NAP bypasses the write.
 const G17P_GFX1_PEER_LEASE_LINK_ADDRESS: u64 = 0xffff_fc00_0016_d1c8;
 const G17P_GFX1_PEER_LEASE_PHYSICAL_ADDRESS: u64 = 0x0000_0100_01fd_11c8;
-// Exact GFX1 A000 root-main progress flags. Root main stores `entered` before
-// blocking in the EP20 initdata parser, `subsystems` after that parser returns,
-// and the byte-sized `ep21_live` after registering the EP21 callback. The peer
-// interface then publishes its EP22/23 handles in the same bounded snapshot.
-const G17P_GFX1_ROOT_MAIN_ENTERED_LINK_ADDRESS: u64 = 0xffff_fc00_0016_d178;
-const G17P_GFX1_ROOT_MAIN_ENTERED_PHYSICAL_ADDRESS: u64 = 0x0000_0100_01fd_1178;
-const G17P_GFX1_ROOT_MAIN_EP21_LIVE_OFFSET: usize = 0x08;
-const G17P_GFX1_ROOT_MAIN_LEASE_OFFSET: usize = 0x50;
-const G17P_GFX1_ROOT_MAIN_EP22_OFFSET: usize = 0x54;
-const G17P_GFX1_ROOT_MAIN_EP23_OFFSET: usize = 0x58;
-const G17P_GFX1_ROOT_MAIN_SUBSYSTEMS_OFFSET: usize = 0x70;
-const G17P_GFX1_ROOT_MAIN_SNAPSHOT_SIZE: usize = 0x78;
 const G17P_RTKIT_PRIVATE_ADDRESS_MASK: u64 = (1u64 << 42) - 1;
 
 #[cfg(not(test))]
@@ -123,26 +111,6 @@ const _: () = {
         G17P_GFX1_PEER_LEASE_PHYSICAL_ADDRESS
             == G17P_GFX1_PHYSICAL_DATA_BASE
                 + (G17P_GFX1_PEER_LEASE_LINK_ADDRESS - G17P_GFX1_LINK_DATA_BASE)
-    );
-    assert!(
-        G17P_GFX1_ROOT_MAIN_ENTERED_PHYSICAL_ADDRESS
-            == G17P_GFX1_PHYSICAL_DATA_BASE
-                + (G17P_GFX1_ROOT_MAIN_ENTERED_LINK_ADDRESS - G17P_GFX1_LINK_DATA_BASE)
-    );
-    assert!(
-        G17P_GFX1_ROOT_MAIN_ENTERED_PHYSICAL_ADDRESS
-                + G17P_GFX1_ROOT_MAIN_SNAPSHOT_SIZE as u64
-            <= g17_adt_j700::J700_GFX1_DATA.base + g17_adt_j700::J700_GFX1_DATA.size
-    );
-    assert!(
-        G17P_GFX1_ROOT_MAIN_SUBSYSTEMS_OFFSET + core::mem::size_of::<u32>()
-            <= G17P_GFX1_ROOT_MAIN_SNAPSHOT_SIZE
-    );
-    assert!(
-        (G17P_GFX1_ROOT_MAIN_ENTERED_PHYSICAL_ADDRESS
-            | G17P_GFX1_ROOT_MAIN_SNAPSHOT_SIZE as u64)
-            & 7
-            == 0
     );
 };
 
@@ -593,6 +561,10 @@ impl G17PManagerConstruction {
         self.resources.control_pointer_snapshot()
     }
 
+    pub(crate) fn status_a_snapshot(&mut self) -> Result<g17_resources::G17PStatusASnapshot> {
+        self.resources.status_a_snapshot()
+    }
+
     pub(crate) fn control_opening_effect(
         &mut self,
     ) -> Result<g17_resources::G17PControlOpeningEffect> {
@@ -772,7 +744,6 @@ impl G17PManagerConstruction {
                 .into_iter()
                 .all(|counters| counters[2] == 1 && counters[..2] == [counters[2]; 2]);
             if inner_retired && outer_retired {
-                self.log_scheduler_root_checkpoint("A-bootstrap-retired-pre-drop");
                 self.render_tracker = None;
                 self.render_bind = None;
                 self.render_storage = None;
@@ -780,7 +751,6 @@ impl G17PManagerConstruction {
                 self.resources
                     .uat()
                     .restore_t8140_kernel_context_after_bootstrap_render()?;
-                self.log_scheduler_root_checkpoint("B-bootstrap-post-root-restore");
                 return Ok(());
             }
             last = Some((state, outer));
@@ -818,337 +788,6 @@ impl G17PManagerConstruction {
 
     pub(crate) fn uat(&self) -> &mmu::Uat {
         self.resources.uat()
-    }
-
-    /// Log one cache-invalidated, read-only sample of the exact J700 GFX A000
-    /// scheduler root and runtime-main global. Sampling never writes firmware
-    /// state and failures do not alter submission.
-    pub(crate) fn log_scheduler_root_checkpoint(&self, checkpoint: &'static str) {
-        #[cfg(CONFIG_DEV_COREDUMP)]
-        match (
-            pgtable::UatPageTable::copy_live_firmware_physical_range(
-                G17P_SCHEDULER_ROOT_PHYSICAL_ADDRESS,
-                G17P_SCHEDULER_ROOT_SNAPSHOT_SIZE,
-            ),
-            pgtable::UatPageTable::copy_live_firmware_physical_range(
-                G17P_RUNTIME_MAIN_GLOBAL_PHYSICAL_ADDRESS,
-                core::mem::size_of::<u64>(),
-            ),
-        ) {
-            (Ok(bytes), Ok(main_global)) => {
-                let read_u64 = |offset: usize| {
-                    bytes
-                        .get(offset..offset + core::mem::size_of::<u64>())
-                        .and_then(|value| value.try_into().ok())
-                        .map(u64::from_le_bytes)
-                };
-                let pending = read_u64(G17P_SCHEDULER_ROOT_PENDING_OFFSET);
-                let deferred = read_u64(G17P_SCHEDULER_ROOT_DEFERRED_OFFSET);
-                let state = bytes.get(G17P_SCHEDULER_ROOT_STATE_OFFSET).copied();
-                let runtime_main = main_global
-                    .get(..core::mem::size_of::<u64>())
-                    .and_then(|value| value.try_into().ok())
-                    .map(u64::from_le_bytes);
-                match (pending, deferred, state, runtime_main) {
-                    (Some(pending), Some(deferred), Some(state), Some(runtime_main)) => {
-                        let drain_open = (state & 0x18) == 0;
-                        dev_info!(
-                            self.resources.dev().as_ref(),
-                            "G17P scheduler-root-j700-a000 checkpoint={} root-pa={:#x} pending={:#x} deferred={:#x} state={:#x} drain-open={} main-global-pa={:#x} runtime-main={:#x}\n",
-                            checkpoint,
-                            G17P_SCHEDULER_ROOT_PHYSICAL_ADDRESS,
-                            pending,
-                            deferred,
-                            state,
-                            drain_open,
-                            G17P_RUNTIME_MAIN_GLOBAL_PHYSICAL_ADDRESS,
-                            runtime_main,
-                        )
-                    }
-                    _ => dev_err!(
-                        self.resources.dev().as_ref(),
-                        "G17P scheduler-root checkpoint={} decode failed\n",
-                        checkpoint,
-                    ),
-                }
-            }
-            (Err(error), _) => dev_err!(
-                self.resources.dev().as_ref(),
-                "G17P scheduler-root-j700-a000 checkpoint={} root sample failed ({:?})\n",
-                checkpoint,
-                error,
-            ),
-            (_, Err(error)) => dev_err!(
-                self.resources.dev().as_ref(),
-                "G17P scheduler-root-j700-a000 checkpoint={} main-global sample failed ({:?})\n",
-                checkpoint,
-                error,
-            ),
-        }
-        #[cfg(not(CONFIG_DEV_COREDUMP))]
-        dev_err!(
-            self.resources.dev().as_ref(),
-            "G17P scheduler-root checkpoint={} unavailable without CONFIG_DEV_COREDUMP\n",
-            checkpoint,
-        );
-
-        self.log_mbi_trace_lease_checkpoint(checkpoint);
-    }
-
-    /// Log the persistent MBI receive trace, GFX1 root-main progress, and both
-    /// firmware-peer send leases. The exact J700 primary firmware appends the
-    /// trace record before endpoint lookup/callback, making its monotonic
-    /// producer a durable discriminator when the endpoint pending bit is too
-    /// short-lived to sample. Every pointer is validated before this read-only
-    /// walk.
-    pub(crate) fn log_mbi_trace_lease_checkpoint(&self, checkpoint: &'static str) {
-        #[cfg(CONFIG_DEV_COREDUMP)]
-        {
-            let context0 = self
-                .resources
-                .uat()
-                .firmware_context_table_reader()
-                .context0_root();
-            let read_primary_link = |address: u64, size: usize| {
-                if size == 0 || (address | size as u64) & 7 != 0 {
-                    return Err(EINVAL);
-                }
-                let end = address.checked_add(size as u64).ok_or(EOVERFLOW)?;
-                if address >= G17P_GFX_LINK_DATA_BASE && end <= G17P_GFX_LINK_DATA_END {
-                    let physical = G17P_GFX_PHYSICAL_DATA_BASE
-                        .checked_add(address - G17P_GFX_LINK_DATA_BASE)
-                        .ok_or(EOVERFLOW)?;
-                    return pgtable::UatPageTable::copy_live_firmware_physical_range(
-                        physical, size,
-                    );
-                }
-                if address & !G17P_RTKIT_PRIVATE_ADDRESS_MASK
-                    != !G17P_RTKIT_PRIVATE_ADDRESS_MASK
-                {
-                    return Err(EFAULT);
-                }
-                context0
-                    .ok_or(EIO)?
-                    .copy_live_firmware_range(address & G17P_RTKIT_PRIVATE_ADDRESS_MASK, size)
-            };
-            let read_u32 = |bytes: &[u8], offset: usize| {
-                bytes
-                    .get(offset..offset + core::mem::size_of::<u32>())
-                    .and_then(|value| value.try_into().ok())
-                    .map(u32::from_le_bytes)
-                    .ok_or(EIO)
-            };
-            let read_u64 = |bytes: &[u8], offset: usize| {
-                bytes
-                    .get(offset..offset + core::mem::size_of::<u64>())
-                    .and_then(|value| value.try_into().ok())
-                    .map(u64::from_le_bytes)
-                    .ok_or(EIO)
-            };
-            let read_u8 = |bytes: &[u8], offset: usize| bytes.get(offset).copied().ok_or(EIO);
-
-            let trace = (|| {
-                let global = read_primary_link(
-                    G17P_MBI_GLOBAL_LINK_ADDRESS,
-                    2 * core::mem::size_of::<u64>(),
-                )?;
-                let group_count = read_u32(&global, 0)?;
-                let array = read_u64(&global, 8)?;
-                if group_count != G17P_MBI_GROUP_COUNT
-                    || array != G17P_MBI_STATIC_ARRAY_LINK_ADDRESS
-                {
-                    return Err(EIO);
-                }
-                let groups = read_primary_link(array, core::mem::size_of::<u64>())?;
-                let group0 = read_u64(&groups, 0)?;
-                let trace_pointer_address = group0.checked_add(0x20).ok_or(EOVERFLOW)?;
-                let trace_pointer = read_primary_link(
-                    trace_pointer_address,
-                    core::mem::size_of::<u64>(),
-                )?;
-                let descriptor = read_u64(&trace_pointer, 0)?;
-                let descriptor_bytes = read_primary_link(descriptor, 0x10)?;
-                let capacity = read_u32(&descriptor_bytes, 0)?;
-                let producer = read_u32(&descriptor_bytes, 4)?;
-                let records = read_u64(&descriptor_bytes, 8)?;
-                if capacity != G17P_MBI_TRACE_CAPACITY || records == 0 {
-                    return Err(EIO);
-                }
-                if producer == 0 {
-                    return Ok((
-                        group0, descriptor, records, capacity, producer, None, None, None,
-                    ));
-                }
-                let index = (producer - 1) % capacity;
-                let record = records
-                    .checked_add(index as u64 * G17P_MBI_TRACE_RECORD_SIZE as u64)
-                    .ok_or(EOVERFLOW)?;
-                let record_bytes = read_primary_link(record, G17P_MBI_TRACE_RECORD_SIZE)?;
-                Ok((
-                    group0,
-                    descriptor,
-                    records,
-                    capacity,
-                    producer,
-                    Some(read_u64(&record_bytes, 0)?),
-                    Some(read_u64(&record_bytes, 8)?),
-                    Some(read_u64(&record_bytes, 0x10)?),
-                ))
-            })();
-            match trace {
-                Ok((group0, descriptor, records, capacity, producer, endpoint, raw, stamp)) => {
-                    let message_type = raw.map(|value| (value >> 48) & 0x3f);
-                    let direction = stamp.map(|value| value & 0x3);
-                    dev_info!(
-                        self.resources.dev().as_ref(),
-                        "G17P mbi-rx-trace-j700-a000 checkpoint={} cap={} producer={} group0={:#x} descriptor={:#x} records={:#x} last-endpoint={:#x?} last-type={:#x?} last-raw={:#x?} last-direction={:?} last-stamp={:#x?}\n",
-                        checkpoint,
-                        capacity,
-                        producer,
-                        group0,
-                        descriptor,
-                        records,
-                        endpoint,
-                        message_type,
-                        raw,
-                        direction,
-                        stamp,
-                    )
-                }
-                Err(error) => dev_err!(
-                    self.resources.dev().as_ref(),
-                    "G17P mbi-rx-trace-j700-a000 checkpoint={} sample failed ({:?})\n",
-                    checkpoint,
-                    error,
-                ),
-            }
-
-            match pgtable::UatPageTable::copy_live_firmware_physical_range(
-                G17P_GFX1_ROOT_MAIN_ENTERED_PHYSICAL_ADDRESS,
-                G17P_GFX1_ROOT_MAIN_SNAPSHOT_SIZE,
-            ) {
-                Ok(gfx1) => match (
-                    read_u32(&gfx1, 0),
-                    read_u8(&gfx1, G17P_GFX1_ROOT_MAIN_EP21_LIVE_OFFSET),
-                    read_u32(&gfx1, G17P_GFX1_ROOT_MAIN_SUBSYSTEMS_OFFSET),
-                    read_u32(&gfx1, G17P_GFX1_ROOT_MAIN_LEASE_OFFSET),
-                    read_u32(&gfx1, G17P_GFX1_ROOT_MAIN_EP22_OFFSET),
-                    read_u32(&gfx1, G17P_GFX1_ROOT_MAIN_EP23_OFFSET),
-                ) {
-                    (
-                        Ok(entered),
-                        Ok(ep21_live),
-                        Ok(subsystems),
-                        Ok(lease),
-                        Ok(ep22),
-                        Ok(ep23),
-                    ) => dev_info!(
-                        self.resources.dev().as_ref(),
-                        "G17P gfx1-root-main-j700-a000 checkpoint={} base-pa={:#x} entered={} subsystems={} ep21-live={} lease={} ep22={:#x} ep23={:#x}\n",
-                        checkpoint,
-                        G17P_GFX1_ROOT_MAIN_ENTERED_PHYSICAL_ADDRESS,
-                        entered,
-                        subsystems,
-                        ep21_live,
-                        lease,
-                        ep22,
-                        ep23,
-                    ),
-                    _ => dev_err!(
-                        self.resources.dev().as_ref(),
-                        "G17P gfx1-root-main-j700-a000 checkpoint={} decode failed\n",
-                        checkpoint,
-                    ),
-                },
-                Err(error) => dev_err!(
-                    self.resources.dev().as_ref(),
-                    "G17P gfx1-root-main-j700-a000 checkpoint={} sample failed ({:?})\n",
-                    checkpoint,
-                    error,
-                ),
-            }
-
-            match (
-                pgtable::UatPageTable::copy_live_firmware_physical_range(
-                    G17P_PRIMARY_PEER_LEASE_PHYSICAL_ADDRESS,
-                    0x10,
-                ),
-                pgtable::UatPageTable::copy_live_firmware_physical_range(
-                    G17P_GFX1_PEER_LEASE_PHYSICAL_ADDRESS,
-                    0x10,
-                ),
-            ) {
-                (Ok(primary), Ok(gfx1)) => match (
-                    read_u32(&primary, 0),
-                    read_u32(&primary, 4),
-                    read_u32(&primary, 8),
-                    read_u32(&gfx1, 0),
-                    read_u32(&gfx1, 4),
-                    read_u32(&gfx1, 8),
-                ) {
-                    (
-                        Ok(primary_lease),
-                        Ok(primary_ep22),
-                        Ok(primary_ep23),
-                        Ok(gfx1_lease),
-                        Ok(gfx1_ep22),
-                        Ok(gfx1_ep23),
-                    ) => dev_info!(
-                        self.resources.dev().as_ref(),
-                        "G17P peer-leases-j700-a000 checkpoint={} primary-pa={:#x} lease={} ep22={:#x} ep23={:#x} send-ready={} gfx1-pa={:#x} lease={} ep22={:#x} ep23={:#x} send-ready={}\n",
-                        checkpoint,
-                        G17P_PRIMARY_PEER_LEASE_PHYSICAL_ADDRESS,
-                        primary_lease,
-                        primary_ep22,
-                        primary_ep23,
-                        (primary_lease != 0) && (primary_ep23 & 0xffff == 0x23),
-                        G17P_GFX1_PEER_LEASE_PHYSICAL_ADDRESS,
-                        gfx1_lease,
-                        gfx1_ep22,
-                        gfx1_ep23,
-                        (gfx1_lease != 0)
-                            && (gfx1_ep22 & 0xffff == 0x22)
-                            && (gfx1_ep23 & 0xffff == 0x23),
-                    ),
-                    _ => dev_err!(
-                        self.resources.dev().as_ref(),
-                        "G17P peer-leases-j700-a000 checkpoint={} decode failed\n",
-                        checkpoint,
-                    ),
-                },
-                (Err(error), _) => dev_err!(
-                    self.resources.dev().as_ref(),
-                    "G17P peer-leases-j700-a000 checkpoint={} primary sample failed ({:?})\n",
-                    checkpoint,
-                    error,
-                ),
-                (_, Err(error)) => dev_err!(
-                    self.resources.dev().as_ref(),
-                    "G17P peer-leases-j700-a000 checkpoint={} GFX1 sample failed ({:?})\n",
-                    checkpoint,
-                    error,
-                ),
-            }
-        }
-        #[cfg(not(CONFIG_DEV_COREDUMP))]
-        dev_err!(
-            self.resources.dev().as_ref(),
-            "G17P MBI trace/root-main/lease checkpoint={} unavailable without CONFIG_DEV_COREDUMP\n",
-            checkpoint,
-        );
-    }
-
-    /// Prepare a one-page, read-only sampler for the exact J700 type-4 pending
-    /// bit. The caller creates this before the EP21 doorbell so the post-send
-    /// observation has no mapping setup in its critical window.
-    #[cfg(CONFIG_DEV_COREDUMP)]
-    pub(crate) fn prepare_type4_pending_probe(
-        &self,
-    ) -> Result<pgtable::LiveFirmwareU64Probe> {
-        pgtable::LiveFirmwareU64Probe::new(
-            G17P_SCHEDULER_ROOT_PHYSICAL_ADDRESS
-                + G17P_SCHEDULER_ROOT_PENDING_OFFSET as u64,
-        )
     }
 
     pub(crate) fn mark_firmware_cache_flush_ready(&self) {
@@ -1587,7 +1226,6 @@ impl G17PManagerConstruction {
         {
             return Err(EINVAL);
         }
-        self.log_scheduler_root_checkpoint("C-first-bind-pre-readiness");
         self.resources.prepare_compute_readiness_context1()?;
         self.resources.validate_compute_readiness_context2(vm)?;
         let mappings = queue.compute.map_user_execution_state(vm)?;
@@ -1596,7 +1234,6 @@ impl G17PManagerConstruction {
             return Err(EFAULT);
         }
         self.compute_readiness_context2_bound = true;
-        self.log_scheduler_root_checkpoint("D-first-bind-post-context2");
         Ok(G17PComputeUserBinding {
             mappings,
             _vm_bind: vm_bind,
@@ -1777,9 +1414,6 @@ impl G17PManagerConstruction {
             .next_boundary()
             .ok_or(EBUSY)?;
         let index = boundary.index as usize;
-        if index == 0 {
-            self.log_scheduler_root_checkpoint("E-readiness-record0-pre-publish");
-        }
         if index == 3 {
             let activation_address = queue.storage.initialize_context2_activation_record()?;
             let expected = queue
@@ -1804,9 +1438,6 @@ impl G17PManagerConstruction {
             .compute_readiness_progress
             .begin_publication(boundary)
             .ok_or(EIO)?;
-        if target == g17_initdata::COMPUTE_READINESS_FINAL_COUNTER {
-            self.log_scheduler_root_checkpoint("F-readiness-record5-post-producer10");
-        }
         Ok(boundary)
     }
 
@@ -1842,7 +1473,6 @@ impl G17PManagerConstruction {
             fsleep(Delta::from_millis(1));
         }
         if let Some(counters) = last {
-            self.log_scheduler_root_checkpoint("H-readiness-record-retirement-timeout");
             dev_err!(
                 self.resources.dev().as_ref(),
                 "G17P compute readiness per-record-v2: retirement timeout target={} primary={:?} secondary={:?}\n",
@@ -2548,41 +2178,6 @@ mod tests {
             G17P_TYPE4_MAIN_CONTROL_POINTER_OFFSETS,
             [0x1a0, 0x1a8, 0x1b0]
         );
-    }
-
-    #[test]
-    fn gfx1_root_main_snapshot_covers_the_exact_a000_progress_fields() {
-        assert_eq!(
-            G17P_GFX1_ROOT_MAIN_ENTERED_PHYSICAL_ADDRESS,
-            G17P_GFX1_PHYSICAL_DATA_BASE
-                + (G17P_GFX1_ROOT_MAIN_ENTERED_LINK_ADDRESS - G17P_GFX1_LINK_DATA_BASE)
-        );
-        assert_eq!(
-            G17P_GFX1_ROOT_MAIN_ENTERED_PHYSICAL_ADDRESS
-                + G17P_GFX1_ROOT_MAIN_EP21_LIVE_OFFSET as u64,
-            0x0000_0100_01fd_1180
-        );
-        assert_eq!(
-            G17P_GFX1_ROOT_MAIN_ENTERED_PHYSICAL_ADDRESS
-                + G17P_GFX1_ROOT_MAIN_LEASE_OFFSET as u64,
-            G17P_GFX1_PEER_LEASE_PHYSICAL_ADDRESS
-        );
-        assert_eq!(
-            G17P_GFX1_ROOT_MAIN_ENTERED_PHYSICAL_ADDRESS
-                + G17P_GFX1_ROOT_MAIN_EP22_OFFSET as u64,
-            0x0000_0100_01fd_11cc
-        );
-        assert_eq!(
-            G17P_GFX1_ROOT_MAIN_ENTERED_PHYSICAL_ADDRESS
-                + G17P_GFX1_ROOT_MAIN_EP23_OFFSET as u64,
-            0x0000_0100_01fd_11d0
-        );
-        assert_eq!(
-            G17P_GFX1_ROOT_MAIN_ENTERED_PHYSICAL_ADDRESS
-                + G17P_GFX1_ROOT_MAIN_SUBSYSTEMS_OFFSET as u64,
-            0x0000_0100_01fd_11e8
-        );
-        assert_eq!(G17P_GFX1_ROOT_MAIN_SNAPSHOT_SIZE, 0x78);
     }
 
     #[test]
