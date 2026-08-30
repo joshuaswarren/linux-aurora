@@ -199,6 +199,70 @@ fn log_g17p_a2i_control(
     }
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+struct G17PWorkScanObservation {
+    first: u32,
+    last: u32,
+    observed_or: u32,
+    transitions: u32,
+    samples: u32,
+    failures: u32,
+}
+
+impl G17PWorkScanObservation {
+    const fn new() -> Self {
+        Self {
+            first: 0,
+            last: 0,
+            observed_or: 0,
+            transitions: 0,
+            samples: 0,
+            failures: 0,
+        }
+    }
+
+    fn observe(&mut self, value: u32) {
+        if self.samples == 0 {
+            self.first = value;
+        } else if self.last != value {
+            self.transitions = self.transitions.saturating_add(1);
+        }
+        self.last = value;
+        self.observed_or |= value;
+        self.samples = self.samples.saturating_add(1);
+    }
+
+    fn observe_failure(&mut self) {
+        self.failures = self.failures.saturating_add(1);
+    }
+}
+
+fn log_g17p_status_a(
+    dev: &kernel::device::Device,
+    manager: &mut g17_manager::G17PManagerConstruction,
+    checkpoint: &'static str,
+) {
+    match manager.status_a_snapshot() {
+        Ok(snapshot) => dev_info!(
+            dev,
+            "G17P Status-A checkpoint={} scan-address={:#x} scan-active={} runtime-address={:#x} raw={:#x} active={} scheduler-constructed={}\n",
+            checkpoint,
+            snapshot.scan_address,
+            snapshot.scan_active,
+            snapshot.address,
+            snapshot.raw,
+            snapshot.active,
+            snapshot.scheduler_constructed,
+        ),
+        Err(error) => dev_err!(
+            dev,
+            "G17P Status-A checkpoint={} read failed ({:?})\n",
+            checkpoint,
+            error,
+        ),
+    }
+}
+
 const fn g17p_rtkit_uat_address(dva: u64) -> u64 {
     dva & G17P_RTKIT_UAT_DVA_MASK
 }
@@ -1455,6 +1519,11 @@ impl G17PLiveRuntime {
         let channel_path = notifications.is_some();
         if let Some(notifications) = notifications {
             if let Some(activation) = notifications.activation {
+                log_g17p_status_a(
+                    self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                    self.manager.as_mut().ok_or(ENODEV)?,
+                    "native-first-pre-0x0a",
+                );
                 log_g17p_a2i_control(
                     self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
                     self.cpus.as_ref().ok_or(ENODEV)?.gfx(),
@@ -1478,6 +1547,11 @@ impl G17PLiveRuntime {
                     self.cpus.as_ref().ok_or(ENODEV)?.gfx(),
                     "native-first-post-0x0a-pre-0x10",
                 );
+                log_g17p_status_a(
+                    self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                    self.manager.as_mut().ok_or(ENODEV)?,
+                    "native-first-post-0x0a-pre-0x10",
+                );
             }
             if let Some(direct_kick) = notifications.direct_kick {
                 fence(Ordering::SeqCst);
@@ -1499,12 +1573,27 @@ impl G17PLiveRuntime {
                     self.cpus.as_ref().ok_or(ENODEV)?.gfx(),
                     "native-first-post-0x10",
                 );
+                log_g17p_status_a(
+                    self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                    self.manager.as_mut().ok_or(ENODEV)?,
+                    "native-first-post-0x10",
+                );
             }
         }
 
+        let mut scan_observation = G17PWorkScanObservation::new();
         let completion = owned_timestamps.with_cpu_bytes(|raw| {
             const POLLS: usize = 500;
             for _ in 0..POLLS {
+                match self
+                    .manager
+                    .as_mut()
+                    .ok_or(ENODEV)
+                    .and_then(|manager| manager.status_a_snapshot())
+                {
+                    Ok(snapshot) => scan_observation.observe(snapshot.scan_active),
+                    Err(_) => scan_observation.observe_failure(),
+                }
                 fence(Ordering::Acquire);
                 let start = u64::from_le_bytes(raw[0..8].try_into().map_err(|_| ERANGE)?);
                 let end = u64::from_le_bytes(raw[8..16].try_into().map_err(|_| ERANGE)?);
@@ -1515,10 +1604,25 @@ impl G17PLiveRuntime {
             }
             Err(ETIMEDOUT)
         });
+        dev_info!(
+            self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+            "G17P Status-A scan observation first={} last={} or={} transitions={} samples={} failures={}\n",
+            scan_observation.first,
+            scan_observation.last,
+            scan_observation.observed_or,
+            scan_observation.transitions,
+            scan_observation.samples,
+            scan_observation.failures,
+        );
         let completion = match completion {
             Ok(completion) => completion,
             Err(error) => {
                 if channel_path {
+                    log_g17p_status_a(
+                        self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                        self.manager.as_mut().ok_or(ENODEV)?,
+                        "native-first-timeout",
+                    );
                     log_g17p_a2i_control(
                         self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
                         self.cpus.as_ref().ok_or(ENODEV)?.gfx(),
