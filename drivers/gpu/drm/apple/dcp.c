@@ -13,6 +13,7 @@
 #include <linux/gpio/consumer.h>
 #include <linux/iommu.h>
 #include <linux/io.h>
+#include <linux/iopoll.h>
 #include <linux/jiffies.h>
 #include <linux/kconfig.h>
 #include <linux/kernel.h>
@@ -67,6 +68,15 @@
 #define APPLE_T8140_MBOX_A2I_CONTROL 0x110
 #define APPLE_T8140_MBOX_A2I_SEND0 0x800
 #define APPLE_T8140_MBOX_A2I_SEND1 0x808
+
+#define APPLE_T8140_PMP_BASE 0x300500000ULL
+#define APPLE_T8140_PMP_SIZE 0xa0000
+#define APPLE_T8140_PMP_STATUS 0x10
+#define APPLE_T8140_PMP_TGT_READ 0x1880
+#define APPLE_T8140_PMP_TGT_WRITE 0x10c40
+#define APPLE_T8140_PMP_ACTUAL 0x18c0
+#define APPLE_T8140_PMP_REPORT_READY BIT_ULL(0)
+#define APPLE_T8140_PMP_DISP_REPORT BIT_ULL(7)
 
 #define DCP_RTKIT_FOURCC(a, b, c, d) \
 	(((u32)(a) << 24) | ((u32)(b) << 16) | ((u32)(c) << 8) | (u32)(d))
@@ -1176,10 +1186,61 @@ const u32 *dcp_get_iomfb_surfaces(struct platform_device *pdev, u32 *count)
 	return dcp->iomfb_surfaces.id;
 }
 
+static int dcp_t8140_require_disp_pmp_report(struct apple_dcp *dcp)
+{
+	void __iomem *pmp;
+	u64 status, target_before, target_after, actual;
+	int ret;
+
+	if (!of_device_is_compatible(dcp->dev->of_node, "apple,t8140-dcp"))
+		return 0;
+
+	/*
+	 * Shipping T8140 firmware describes DISP_SYS as PMP report ID 8
+	 * (bit 7).  The in-tree T8140 DT does not yet instantiate pmp-report,
+	 * so assert its always-on ps_disp_cpu prerequisite before A401.
+	 */
+	pmp = ioremap(APPLE_T8140_PMP_BASE, APPLE_T8140_PMP_SIZE);
+	if (!pmp)
+		return dev_err_probe(dcp->dev, -ENOMEM,
+				     "failed to map T8140 PMP report registers\n");
+
+	status = readq(pmp + APPLE_T8140_PMP_STATUS);
+	target_before = readq(pmp + APPLE_T8140_PMP_TGT_READ);
+	writeq(target_before | APPLE_T8140_PMP_DISP_REPORT,
+	       pmp + APPLE_T8140_PMP_TGT_WRITE);
+	target_after = readq(pmp + APPLE_T8140_PMP_TGT_READ);
+	actual = readq(pmp + APPLE_T8140_PMP_ACTUAL);
+
+	if (!(status & APPLE_T8140_PMP_REPORT_READY)) {
+		ret = -EAGAIN;
+	} else if (!(target_after & APPLE_T8140_PMP_DISP_REPORT)) {
+		ret = -EIO;
+	} else {
+		ret = readq_poll_timeout_atomic(pmp + APPLE_T8140_PMP_ACTUAL,
+						actual,
+						actual & APPLE_T8140_PMP_DISP_REPORT,
+						100, 50000);
+	}
+
+	dev_info(dcp->dev,
+		 "DCP25G83_PMP_DISP_REPORT status %#llx target_before %#llx target_after %#llx actual %#llx requested %u active %u result %d\n",
+		 status, target_before, target_after, actual,
+		 !!(target_after & APPLE_T8140_PMP_DISP_REPORT),
+		 !!(actual & APPLE_T8140_PMP_DISP_REPORT), ret);
+	iounmap(pmp);
+
+	return ret;
+}
+
 int dcp_start(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 	int ret;
+
+	ret = dcp_t8140_require_disp_pmp_report(dcp);
+	if (ret)
+		return ret;
 
 	init_completion(&dcp->start_done);
 
