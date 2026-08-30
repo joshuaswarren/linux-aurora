@@ -515,6 +515,11 @@ pub(crate) const fn encode_g17p_direct_cl_kick() -> u64 {
     MSG_TX_DOORBELL | DOORBELL_KICKFW as u64
 }
 
+/// Device-control announcement sent after each first-CL readiness producer.
+/// The canonical fixture is `11 00 00 00 00 00 84 00` in wire byte order.
+pub(crate) const G17P_READINESS_CONTROL_DONE_MESSAGE: u64 =
+    (0x84u64 << DOORBELL_TYPE_SHIFT) | DOORBELL_DEVCTRL as u64;
+
 /// Pure predicate/encoding boundary. A repeat submit omits activation when the
 /// cached identity already matches, but an enabled, direct, unsuppressed submit
 /// still emits the separate direct kick.
@@ -2648,7 +2653,10 @@ pub(crate) const G17P_CL_KICK_PUBLICATION_ORDER: [G17PClKickPublicationStep; 7] 
 pub(crate) enum G17PFirstSubmitPublicationStep {
     AcquireGfx1RunningPower,
     PublishB2,
-    StageComputeReadinessSuffix,
+    PublishReadinessRecord(u8),
+    SendReadinessControlDone0x84(u32),
+    WaitReadinessRetirement(u32),
+    InitializeContext2Activation,
     PublishConfigUpdatePointer,
     ZeroSksmStride,
     WriteSksmEntry,
@@ -2659,17 +2667,33 @@ pub(crate) enum G17PFirstSubmitPublicationStep {
     PublishEntrySignalPointer,
     AddKicks,
     PublishCl2,
-    SendReadinessControlDone0x84,
-    WaitReadinessRetirement,
     SendActivation,
     DirectKickBarrier,
     SendDirectKick,
 }
 
-pub(crate) const G17P_FIRST_SUBMIT_PUBLICATION_ORDER: [G17PFirstSubmitPublicationStep; 18] = [
+pub(crate) const G17P_FIRST_SUBMIT_PUBLICATION_ORDER: [G17PFirstSubmitPublicationStep; 34] = [
     G17PFirstSubmitPublicationStep::AcquireGfx1RunningPower,
     G17PFirstSubmitPublicationStep::PublishB2,
-    G17PFirstSubmitPublicationStep::StageComputeReadinessSuffix,
+    G17PFirstSubmitPublicationStep::PublishReadinessRecord(0),
+    G17PFirstSubmitPublicationStep::SendReadinessControlDone0x84(5),
+    G17PFirstSubmitPublicationStep::WaitReadinessRetirement(5),
+    G17PFirstSubmitPublicationStep::PublishReadinessRecord(1),
+    G17PFirstSubmitPublicationStep::SendReadinessControlDone0x84(6),
+    G17PFirstSubmitPublicationStep::WaitReadinessRetirement(6),
+    G17PFirstSubmitPublicationStep::PublishReadinessRecord(2),
+    G17PFirstSubmitPublicationStep::SendReadinessControlDone0x84(7),
+    G17PFirstSubmitPublicationStep::WaitReadinessRetirement(7),
+    G17PFirstSubmitPublicationStep::InitializeContext2Activation,
+    G17PFirstSubmitPublicationStep::PublishReadinessRecord(3),
+    G17PFirstSubmitPublicationStep::SendReadinessControlDone0x84(8),
+    G17PFirstSubmitPublicationStep::WaitReadinessRetirement(8),
+    G17PFirstSubmitPublicationStep::PublishReadinessRecord(4),
+    G17PFirstSubmitPublicationStep::SendReadinessControlDone0x84(9),
+    G17PFirstSubmitPublicationStep::WaitReadinessRetirement(9),
+    G17PFirstSubmitPublicationStep::PublishReadinessRecord(5),
+    G17PFirstSubmitPublicationStep::SendReadinessControlDone0x84(10),
+    G17PFirstSubmitPublicationStep::WaitReadinessRetirement(10),
     G17PFirstSubmitPublicationStep::PublishConfigUpdatePointer,
     G17PFirstSubmitPublicationStep::ZeroSksmStride,
     G17PFirstSubmitPublicationStep::WriteSksmEntry,
@@ -2680,8 +2704,6 @@ pub(crate) const G17P_FIRST_SUBMIT_PUBLICATION_ORDER: [G17PFirstSubmitPublicatio
     G17PFirstSubmitPublicationStep::PublishEntrySignalPointer,
     G17PFirstSubmitPublicationStep::AddKicks,
     G17PFirstSubmitPublicationStep::PublishCl2,
-    G17PFirstSubmitPublicationStep::SendReadinessControlDone0x84,
-    G17PFirstSubmitPublicationStep::WaitReadinessRetirement,
     G17PFirstSubmitPublicationStep::SendActivation,
     G17PFirstSubmitPublicationStep::DirectKickBarrier,
     G17PFirstSubmitPublicationStep::SendDirectKick,
@@ -5462,7 +5484,25 @@ mod tests {
             [
                 G17PFirstSubmitPublicationStep::AcquireGfx1RunningPower,
                 G17PFirstSubmitPublicationStep::PublishB2,
-                G17PFirstSubmitPublicationStep::StageComputeReadinessSuffix,
+                G17PFirstSubmitPublicationStep::PublishReadinessRecord(0),
+                G17PFirstSubmitPublicationStep::SendReadinessControlDone0x84(5),
+                G17PFirstSubmitPublicationStep::WaitReadinessRetirement(5),
+                G17PFirstSubmitPublicationStep::PublishReadinessRecord(1),
+                G17PFirstSubmitPublicationStep::SendReadinessControlDone0x84(6),
+                G17PFirstSubmitPublicationStep::WaitReadinessRetirement(6),
+                G17PFirstSubmitPublicationStep::PublishReadinessRecord(2),
+                G17PFirstSubmitPublicationStep::SendReadinessControlDone0x84(7),
+                G17PFirstSubmitPublicationStep::WaitReadinessRetirement(7),
+                G17PFirstSubmitPublicationStep::InitializeContext2Activation,
+                G17PFirstSubmitPublicationStep::PublishReadinessRecord(3),
+                G17PFirstSubmitPublicationStep::SendReadinessControlDone0x84(8),
+                G17PFirstSubmitPublicationStep::WaitReadinessRetirement(8),
+                G17PFirstSubmitPublicationStep::PublishReadinessRecord(4),
+                G17PFirstSubmitPublicationStep::SendReadinessControlDone0x84(9),
+                G17PFirstSubmitPublicationStep::WaitReadinessRetirement(9),
+                G17PFirstSubmitPublicationStep::PublishReadinessRecord(5),
+                G17PFirstSubmitPublicationStep::SendReadinessControlDone0x84(10),
+                G17PFirstSubmitPublicationStep::WaitReadinessRetirement(10),
                 G17PFirstSubmitPublicationStep::PublishConfigUpdatePointer,
                 G17PFirstSubmitPublicationStep::ZeroSksmStride,
                 G17PFirstSubmitPublicationStep::WriteSksmEntry,
@@ -5473,12 +5513,14 @@ mod tests {
                 G17PFirstSubmitPublicationStep::PublishEntrySignalPointer,
                 G17PFirstSubmitPublicationStep::AddKicks,
                 G17PFirstSubmitPublicationStep::PublishCl2,
-                G17PFirstSubmitPublicationStep::SendReadinessControlDone0x84,
-                G17PFirstSubmitPublicationStep::WaitReadinessRetirement,
                 G17PFirstSubmitPublicationStep::SendActivation,
                 G17PFirstSubmitPublicationStep::DirectKickBarrier,
                 G17PFirstSubmitPublicationStep::SendDirectKick,
             ]
+        );
+        assert_eq!(
+            G17P_READINESS_CONTROL_DONE_MESSAGE.to_le_bytes(),
+            [0x11, 0, 0, 0, 0, 0, 0x84, 0]
         );
     }
 

@@ -41,8 +41,8 @@ use kernel::{devcoredump, new_mutex, sync::Mutex, time::msecs_to_jiffies};
 
 use crate::{
     driver::{AsahiDevice, T8140LiveTopologyAdmission},
-    g17_completion, g17_lifecycle, g17_manager, g17_rtkit, g17_submission, g17_uapi, gem, hw,
-    identity, mmu, module_parameters, regs,
+    g17_completion, g17_initdata, g17_lifecycle, g17_manager, g17_rtkit, g17_submission,
+    g17_uapi, gem, hw, identity, mmu, module_parameters, regs,
 };
 use kernel::sync::aref::ARef;
 
@@ -882,11 +882,10 @@ fn finish_boot_session(
         "G17P compute control: startup TA/3D retired at 3/3/3\n"
     );
 
-    // The accumulated 65-record capture history is not replayed at boot. The
-    // manager stages only the output-positive six-record readiness suffix at
-    // first CL bind and publishes its final producer once. The submit boundary
-    // announces it with one control-done 0x84 and waits for all six records to
-    // retire before either EP83 work notification.
+    // The accumulated 65-record capture history is not replayed at boot. At
+    // first CL bind, the manager publishes the six output-positive readiness
+    // records one at a time. Each producer gets one control-done 0x84 and must
+    // retire before the next producer or either EP83 work notification.
     dev_info!(
         pdev.as_ref(),
         "G17P compute control: ctx1/ctx2 readiness suffix deferred to first CL submit\n"
@@ -900,7 +899,7 @@ fn finish_boot_session(
     );
     dev_info!(
         pdev.as_ref(),
-        "G17P compute: candidate native-cl2-readiness-0x84-v1 armed\n"
+        "G17P compute: candidate readiness-per-record-v2 armed\n"
     );
     Ok(G17PBootedSession {
         cpus,
@@ -1169,6 +1168,90 @@ impl G17PLiveRuntime {
                 .is_some_and(|state| state.crashed.load(Ordering::Acquire))
     }
 
+    /// Publish the six first-CL readiness records one at a time. Each producer
+    /// gets its own device-control announcement and must retire before the
+    /// next record, or before any command/SKSM/CL2 state becomes visible.
+    fn publish_compute_readiness_per_record(
+        &mut self,
+        command: &g17_uapi::TranslatedComputeCommand,
+    ) -> Result {
+        const PRE_ANNOUNCEMENT_PHASES: [&str; g17_initdata::COMPUTE_READINESS_RECORDS] = [
+            "readiness-record0-target5-pre-0x84",
+            "readiness-record1-target6-pre-0x84",
+            "readiness-record2-target7-pre-0x84",
+            "readiness-record3-target8-pre-0x84",
+            "readiness-record4-target9-pre-0x84",
+            "readiness-record5-target10-pre-0x84",
+        ];
+
+        if command.g17p_add3_buffers.is_some() {
+            g17_submission::require_g17p_first_bind_direct_hardware_release(
+                g17_submission::G17P_FIRST_BIND_COMMAND_PLAN,
+            )
+            .map_err(|_| ENOTSUPP)?;
+        }
+        {
+            let manager = self.manager.as_mut().ok_or(ENODEV)?;
+            let queue = self.queue.as_mut().ok_or(ENODEV)?;
+            manager.prepare_compute_readiness_prelude(queue)?;
+        }
+
+        for (index, phase) in PRE_ANNOUNCEMENT_PHASES.iter().enumerate() {
+            let boundary = {
+                let manager = self.manager.as_mut().ok_or(ENODEV)?;
+                let queue = self.queue.as_mut().ok_or(ENODEV)?;
+                manager.publish_next_compute_readiness_record(queue)?
+            };
+            if boundary.index as usize != index {
+                return Err(EIO);
+            }
+            let staged = self.manager.as_mut().ok_or(ENODEV)?.control_counters()?;
+            if !staged.compute_readiness_record_staged(boundary.producer_after) {
+                return Err(EIO);
+            }
+            self.manager
+                .as_ref()
+                .ok_or(ENODEV)?
+                .log_scheduler_root_checkpoint(phase);
+            log_g17p_scheduler_gate_registers(
+                self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                self.registers.as_ref().ok_or(ENODEV)?,
+                phase,
+            );
+            dev_info!(
+                self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                "G17P compute readiness per-record-v2: publish index={} opcode={:#x} sequence={} context={} producer={}->{} counters={:?}/{:?} announcement={:#x}\n",
+                boundary.index,
+                boundary.opcode,
+                boundary.sequence,
+                boundary.context,
+                boundary.producer_before,
+                boundary.producer_after,
+                staged.primary,
+                staged.secondary,
+                g17_submission::G17P_READINESS_CONTROL_DONE_MESSAGE,
+            );
+            Pin::new(self.gfx_rtkit.as_mut().ok_or(ENODEV)?).send_message(
+                g17_rtkit::ENDPOINT_GFX_INTERRUPTS,
+                g17_submission::G17P_READINESS_CONTROL_DONE_MESSAGE,
+            )?;
+            let retired = self
+                .manager
+                .as_mut()
+                .ok_or(ENODEV)?
+                .wait_compute_readiness_record_retirement(boundary.producer_after)?;
+            dev_info!(
+                self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                "G17P compute readiness per-record-v2: boundary index={} target={} retired counters={:?}/{:?}\n",
+                boundary.index,
+                boundary.producer_after,
+                retired.primary,
+                retired.secondary,
+            );
+        }
+        Ok(())
+    }
+
     pub(crate) fn mark_firmware_cache_flush_ready(&self) -> Result {
         self.manager
             .as_ref()
@@ -1317,6 +1400,12 @@ impl G17PLiveRuntime {
             manager.bind_compute_user_vm(queue, vm)?
         };
         self.compute_binding = Some(binding);
+        if let Err(error) = self.publish_compute_readiness_per_record(command) {
+            return match g17_lifecycle::recover_persistent_runtime(self) {
+                Ok(()) => Err(error),
+                Err(recovery_error) => Err(recovery_error),
+            };
+        }
         let submit_result = {
             let registers = self.registers.as_ref().ok_or(ENODEV)?;
             let manager = self.manager.as_mut().ok_or(ENODEV)?;
@@ -1354,56 +1443,6 @@ impl G17PLiveRuntime {
                 };
             }
         };
-        let readiness_needs_control_done = match self
-            .manager
-            .as_mut()
-            .ok_or(ENODEV)?
-            .compute_readiness_needs_control_done()
-        {
-            Ok(required) => required,
-            Err(error) => {
-                return match g17_lifecycle::recover_persistent_runtime(self) {
-                    Ok(()) => Err(error),
-                    Err(recovery_error) => Err(recovery_error),
-                };
-            }
-        };
-        if readiness_needs_control_done {
-            let readiness_control_done = ((CONTROL_DONE_TYPE as u64) << 48) | CONTROL_DONE_CHANNEL;
-            self.manager
-                .as_ref()
-                .ok_or(ENODEV)?
-                .log_scheduler_root_checkpoint("G-readiness-pre-0x84");
-            log_g17p_scheduler_gate_registers(
-                self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
-                self.registers.as_ref().ok_or(ENODEV)?,
-                "readiness-pre-0x84",
-            );
-            dev_info!(
-                self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
-                "G17P compute readiness: sending control announcement {:#x} before EP83 work\n",
-                readiness_control_done,
-            );
-            if let Err(error) = Pin::new(self.gfx_rtkit.as_mut().ok_or(ENODEV)?)
-                .send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, readiness_control_done)
-            {
-                return match g17_lifecycle::recover_persistent_runtime(self) {
-                    Ok(()) => Err(error),
-                    Err(recovery_error) => Err(recovery_error),
-                };
-            }
-        }
-        if let Err(error) = self
-            .manager
-            .as_mut()
-            .ok_or(ENODEV)?
-            .wait_compute_readiness_retirement()
-        {
-            return match g17_lifecycle::recover_persistent_runtime(self) {
-                Ok(()) => Err(error),
-                Err(recovery_error) => Err(recovery_error),
-            };
-        }
         let channel_path = notifications.is_some();
         if let Some(notifications) = notifications {
             if let Some(activation) = notifications.activation {

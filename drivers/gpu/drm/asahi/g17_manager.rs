@@ -367,7 +367,7 @@ pub(crate) struct G17PManagerConstruction {
     render_bind: Option<mmu::VmBind>,
     render_submission_ordinal: u32,
     compute_readiness_context2_bound: bool,
-    compute_readiness_staged: bool,
+    compute_readiness_progress: g17_initdata::ComputeReadinessProgress,
 }
 
 /// A queue which has completed the host's configuration pair and QID-enable
@@ -485,7 +485,7 @@ impl G17PManagerConstruction {
                 render_bind: None,
                 render_submission_ordinal: 0,
                 compute_readiness_context2_bound: false,
-                compute_readiness_staged: false,
+                compute_readiness_progress: g17_initdata::ComputeReadinessProgress::new(),
             },
             GFP_KERNEL,
         )?)
@@ -1018,7 +1018,7 @@ impl G17PManagerConstruction {
         }
         self.resources.reset_session_after_processor_stop()?;
         self.compute_readiness_context2_bound = false;
-        self.compute_readiness_staged = false;
+        self.compute_readiness_progress = g17_initdata::ComputeReadinessProgress::new();
         Ok(())
     }
 
@@ -1363,7 +1363,7 @@ impl G17PManagerConstruction {
         queue: &mut G17PSksmQueue,
         prepared: g17_submission::PreparedG17PClKickEntry,
     ) -> Result<u64> {
-        self.stage_compute_readiness_once(queue)?;
+        self.require_compute_readiness_retired()?;
         queue.storage.write_entry(
             prepared.entry_offset as usize,
             prepared.zero_length as usize,
@@ -1381,101 +1381,120 @@ impl G17PManagerConstruction {
         Ok(timestamp)
     }
 
-    /// Stage the exact six-record ctx1/ctx2 suffix as one producer batch. The
-    /// live-boot owner announces it once with control-done 0x84 and waits for
-    /// retirement before sending either EP83 work notification.
-    fn stage_compute_readiness_once(&mut self, queue: &mut G17PSksmQueue) -> Result {
-        if !self.compute_readiness_staged {
-            if !self.compute_readiness_context2_bound {
-                return Err(EINVAL);
-            }
-            self.log_scheduler_root_checkpoint("E-readiness-pre-producer10");
-            let mut activation_address = None;
-            let target = self.resources.stage_compute_readiness_suffix(|| {
-                activation_address = Some(queue.storage.initialize_context2_activation_record()?);
-                Ok(())
-            })?;
-            let activation_address = activation_address.ok_or(EINVAL)?;
-            if target != g17_initdata::COMPUTE_READINESS_FINAL_COUNTER
-                || activation_address
-                    != queue
-                        .storage
-                        .channel_control_gpu_va()
-                        .checked_add(
-                            g17_initdata::COMPUTE_READINESS_ACTIVATION_RECORD_OFFSET as u64,
-                        )
-                        .ok_or(EINVAL)?
-            {
-                return Err(EINVAL);
-            }
-            self.compute_readiness_staged = true;
-            self.log_scheduler_root_checkpoint("F-readiness-post-producer10");
-            dev_info!(
-                self.resources.dev().as_ref(),
-                "G17P compute readiness v1: ctx1 seq=35/35/36 activation={:#x} ctx2 seq=37/37/38 target={}\n",
-                activation_address,
-                target,
-            );
-        }
-        Ok(())
-    }
-
-    /// Return true exactly while the six-record suffix is staged but has not
-    /// yet retired. The live-boot owner uses this to send the one
-    /// primary control-done announcement before any EP83 work notification.
-    pub(crate) fn compute_readiness_needs_control_done(&mut self) -> Result<bool> {
-        if !self.compute_readiness_staged {
+    /// Prepare the retained B2 state before the first readiness record. This
+    /// keeps the direct first-submit ordering while leaving the user VM and
+    /// context-2 binding unchanged.
+    pub(crate) fn prepare_compute_readiness_prelude(
+        &mut self,
+        queue: &mut G17PSksmQueue,
+    ) -> Result {
+        if !self.compute_readiness_context2_bound
+            || self.compute_readiness_progress
+                != g17_initdata::ComputeReadinessProgress::new()
+        {
             return Err(EINVAL);
         }
-        let counters = self.resources.control_counters()?;
-        if counters.compute_readiness_staged() {
-            Ok(true)
-        } else if counters.compute_readiness_retired() {
-            Ok(false)
-        } else {
-            dev_err!(
-                self.resources.dev().as_ref(),
-                "G17P compute readiness: invalid pre-announcement counters primary={:?} secondary={:?}\n",
-                counters.primary,
-                counters.secondary,
-            );
-            Err(EIO)
-        }
+        self.publish_compute_b2_once(queue)
     }
 
-    /// Wait for the device-control drain to consume the complete six-record
-    /// suffix. No CL activation/direct kick may be sent until this succeeds.
-    pub(crate) fn wait_compute_readiness_retirement(&mut self) -> Result {
+    /// Publish one native readiness record. A second record cannot become
+    /// visible until the live-boot owner retires the pending target.
+    pub(crate) fn publish_next_compute_readiness_record(
+        &mut self,
+        queue: &mut G17PSksmQueue,
+    ) -> Result<g17_initdata::ComputeReadinessRecordBoundary> {
+        if !self.compute_readiness_context2_bound {
+            return Err(EBUSY);
+        }
+        let boundary = self
+            .compute_readiness_progress
+            .next_boundary()
+            .ok_or(EBUSY)?;
+        let index = boundary.index as usize;
+        if index == 0 {
+            self.log_scheduler_root_checkpoint("E-readiness-record0-pre-publish");
+        }
+        if index == 3 {
+            let activation_address = queue.storage.initialize_context2_activation_record()?;
+            let expected = queue
+                .storage
+                .channel_control_gpu_va()
+                .checked_add(g17_initdata::COMPUTE_READINESS_ACTIVATION_RECORD_OFFSET as u64)
+                .ok_or(EINVAL)?;
+            if activation_address != expected {
+                return Err(EINVAL);
+            }
+            dev_info!(
+                self.resources.dev().as_ref(),
+                "G17P compute readiness per-record-v2: context2 activation={:#x} after target=7 retirement\n",
+                activation_address,
+            );
+        }
+        let target = self.resources.publish_compute_readiness_record(index)?;
+        if target != boundary.producer_after {
+            return Err(EIO);
+        }
+        self.compute_readiness_progress = self
+            .compute_readiness_progress
+            .begin_publication(boundary)
+            .ok_or(EIO)?;
+        if target == g17_initdata::COMPUTE_READINESS_FINAL_COUNTER {
+            self.log_scheduler_root_checkpoint("F-readiness-record5-post-producer10");
+        }
+        Ok(boundary)
+    }
+
+    /// Wait for exactly one readiness producer target to reach both firmware
+    /// consumer cursors before the caller publishes the next record.
+    pub(crate) fn wait_compute_readiness_record_retirement(
+        &mut self,
+        target: u32,
+    ) -> Result<g17_resources::G17PControlCounters> {
         const POLLS: usize = 100;
-        if !self.compute_readiness_staged {
+        if self.compute_readiness_progress.pending_target() != Some(target) {
             return Err(EINVAL);
         }
         let mut last = None;
         for _ in 0..POLLS {
             fence(Ordering::Acquire);
             let counters = self.resources.control_counters()?;
-            if counters.compute_readiness_retired() {
+            if counters.compute_readiness_record_retired(target) {
+                self.compute_readiness_progress = self
+                    .compute_readiness_progress
+                    .retire(target)
+                    .ok_or(EIO)?;
                 dev_info!(
                     self.resources.dev().as_ref(),
-                    "G17P compute readiness: control consumers retired at {:?}/{:?}\n",
+                    "G17P compute readiness per-record-v2: retired target={} primary={:?} secondary={:?}\n",
+                    target,
                     counters.primary,
                     counters.secondary,
                 );
-                return Ok(());
+                return Ok(counters);
             }
             last = Some(counters);
             fsleep(Delta::from_millis(1));
         }
         if let Some(counters) = last {
-            self.log_scheduler_root_checkpoint("H-readiness-retirement-timeout");
+            self.log_scheduler_root_checkpoint("H-readiness-record-retirement-timeout");
             dev_err!(
                 self.resources.dev().as_ref(),
-                "G17P compute readiness: control retirement timeout primary={:?} secondary={:?}, expected [10, 10, 10]/[16, 16, 16]\n",
+                "G17P compute readiness per-record-v2: retirement timeout target={} primary={:?} secondary={:?}\n",
+                target,
                 counters.primary,
                 counters.secondary,
             );
         }
         Err(ETIMEDOUT)
+    }
+
+    fn require_compute_readiness_retired(&mut self) -> Result {
+        if !self.compute_readiness_progress.complete()
+            || !self.resources.control_counters()?.compute_readiness_retired()
+        {
+            return Err(EBUSY);
+        }
+        Ok(())
     }
 
     fn publish_compute_b2_once(&mut self, queue: &mut G17PSksmQueue) -> Result {
@@ -1633,7 +1652,6 @@ impl G17PManagerConstruction {
             return Err(EINVAL);
         }
         self.publish_compute_b2_once(queue)?;
-        self.stage_compute_readiness_once(queue)?;
         queue
             .compute
             .publish_initial_config_update_pointer(group)?;
@@ -1694,6 +1712,9 @@ impl G17PManagerConstruction {
         {
             return Err(EINVAL);
         }
+        // Readiness is a strict precondition. No descriptor, tag, SKSM, MMIO,
+        // CL2, or mailbox-visible work state may change before target 10 retires.
+        self.require_compute_readiness_retired()?;
 
         if let Some(buffers) = command.g17p_add3_buffers {
             return self

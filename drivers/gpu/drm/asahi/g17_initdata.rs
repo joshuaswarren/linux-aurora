@@ -222,8 +222,8 @@ pub(crate) const COMPUTE_RUNTIME_CLASS1_TABLE_SIZE: usize = 0x4000;
 pub(crate) const COMPUTE_RUNTIME_PAGE_LIST_SIZE: usize = 0xa800;
 pub(crate) const COMPUTE_DISPATCH_RECORD_SIZE: usize = 0x20;
 
-/// Output-positive first-CL readiness suffix. These six records are staged at
-/// primary slots 4..9 and become visible through one final producer store.
+/// Output-positive first-CL readiness suffix. These six records occupy primary
+/// slots 4..9. Native publishes and retires each slot before exposing the next.
 pub(crate) const COMPUTE_READINESS_RECORDS: usize = 6;
 /// Output-positive final compute graph maps and names exactly operand entries
 /// 0..20. The retained opening still owns 28 backing objects.
@@ -238,6 +238,139 @@ pub(crate) const COMPUTE_READINESS_PAGE_SIZE: usize = 0x4000;
 pub(crate) const COMPUTE_READINESS_ACTIVATION_RECORD_INDEX: usize = 2;
 pub(crate) const COMPUTE_READINESS_ACTIVATION_RECORD_OFFSET: usize =
     COMPUTE_READINESS_ACTIVATION_RECORD_INDEX * CONTROL_RECORD_SIZE;
+
+/// One native first-CL device-control publication boundary.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct ComputeReadinessRecordBoundary {
+    pub(crate) index: u8,
+    pub(crate) producer_before: u32,
+    pub(crate) producer_after: u32,
+    pub(crate) opcode: u32,
+    pub(crate) sequence: u32,
+    pub(crate) context: u32,
+}
+
+pub(crate) const COMPUTE_READINESS_BOUNDARIES:
+    [ComputeReadinessRecordBoundary; COMPUTE_READINESS_RECORDS] = [
+    ComputeReadinessRecordBoundary {
+        index: 0,
+        producer_before: CONTROL_OPENING_PRIMARY_PRODUCER,
+        producer_after: CONTROL_OPENING_PRIMARY_PRODUCER + 1,
+        opcode: 0x20,
+        sequence: 35,
+        context: 1,
+    },
+    ComputeReadinessRecordBoundary {
+        index: 1,
+        producer_before: CONTROL_OPENING_PRIMARY_PRODUCER + 1,
+        producer_after: CONTROL_OPENING_PRIMARY_PRODUCER + 2,
+        opcode: 0x2e,
+        sequence: 35,
+        context: 1,
+    },
+    ComputeReadinessRecordBoundary {
+        index: 2,
+        producer_before: CONTROL_OPENING_PRIMARY_PRODUCER + 2,
+        producer_after: CONTROL_OPENING_PRIMARY_PRODUCER + 3,
+        opcode: 0x2e,
+        sequence: 36,
+        context: 1,
+    },
+    ComputeReadinessRecordBoundary {
+        index: 3,
+        producer_before: CONTROL_OPENING_PRIMARY_PRODUCER + 3,
+        producer_after: CONTROL_OPENING_PRIMARY_PRODUCER + 4,
+        opcode: 0x20,
+        sequence: 37,
+        context: 2,
+    },
+    ComputeReadinessRecordBoundary {
+        index: 4,
+        producer_before: CONTROL_OPENING_PRIMARY_PRODUCER + 4,
+        producer_after: CONTROL_OPENING_PRIMARY_PRODUCER + 5,
+        opcode: 0x2e,
+        sequence: 37,
+        context: 2,
+    },
+    ComputeReadinessRecordBoundary {
+        index: 5,
+        producer_before: CONTROL_OPENING_PRIMARY_PRODUCER + 5,
+        producer_after: CONTROL_OPENING_PRIMARY_PRODUCER + 6,
+        opcode: 0x2e,
+        sequence: 38,
+        context: 2,
+    },
+];
+
+pub(crate) const fn compute_readiness_boundary(
+    index: usize,
+) -> Option<ComputeReadinessRecordBoundary> {
+    if index < COMPUTE_READINESS_RECORDS {
+        Some(COMPUTE_READINESS_BOUNDARIES[index])
+    } else {
+        None
+    }
+}
+
+/// Host progress for the native per-record publication handshake.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct ComputeReadinessProgress {
+    retired_records: u8,
+    pending_target: Option<u32>,
+}
+
+impl ComputeReadinessProgress {
+    pub(crate) const fn new() -> Self {
+        Self {
+            retired_records: 0,
+            pending_target: None,
+        }
+    }
+
+    pub(crate) const fn retired_records(self) -> usize {
+        self.retired_records as usize
+    }
+
+    pub(crate) const fn pending_target(self) -> Option<u32> {
+        self.pending_target
+    }
+
+    pub(crate) const fn next_boundary(self) -> Option<ComputeReadinessRecordBoundary> {
+        if self.pending_target.is_some() {
+            None
+        } else {
+            compute_readiness_boundary(self.retired_records as usize)
+        }
+    }
+
+    pub(crate) const fn begin_publication(
+        self,
+        boundary: ComputeReadinessRecordBoundary,
+    ) -> Option<Self> {
+        if self.pending_target.is_some() || boundary.index != self.retired_records {
+            return None;
+        }
+        Some(Self {
+            retired_records: self.retired_records,
+            pending_target: Some(boundary.producer_after),
+        })
+    }
+
+    pub(crate) const fn retire(self, target: u32) -> Option<Self> {
+        match self.pending_target {
+            Some(pending) if pending == target => Some(Self {
+                retired_records: self.retired_records + 1,
+                pending_target: None,
+            }),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn complete(self) -> bool {
+        self.retired_records as usize == COMPUTE_READINESS_RECORDS
+            && self.pending_target.is_none()
+    }
+}
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum ComputeReadinessPublicationStep {
@@ -2746,6 +2879,37 @@ mod tests {
         for (index, record) in records.iter_mut().enumerate() {
             encode_compute_readiness_record(index, record).unwrap();
         }
+
+        for (index, boundary) in COMPUTE_READINESS_BOUNDARIES.iter().enumerate() {
+            assert_eq!(boundary.index as usize, index);
+            assert_eq!(boundary.producer_before, 4 + index as u32);
+            assert_eq!(boundary.producer_after, 5 + index as u32);
+            assert_eq!(get_u32(&records[index], 0x00), boundary.opcode);
+            let (sequence_offset, context_offset) = if boundary.opcode == 0x20 {
+                (0x0c, 0x30)
+            } else {
+                (0x04, 0x0c)
+            };
+            assert_eq!(get_u32(&records[index], sequence_offset), boundary.sequence);
+            assert_eq!(get_u32(&records[index], context_offset), boundary.context);
+            assert_eq!(compute_readiness_boundary(index), Some(*boundary));
+        }
+        assert_eq!(compute_readiness_boundary(COMPUTE_READINESS_RECORDS), None);
+
+        let mut progress = ComputeReadinessProgress::new();
+        assert_eq!(progress.retire(5), None);
+        for boundary in COMPUTE_READINESS_BOUNDARIES {
+            assert_eq!(progress.next_boundary(), Some(boundary));
+            let pending = progress.begin_publication(boundary).unwrap();
+            assert_eq!(pending.pending_target(), Some(boundary.producer_after));
+            assert_eq!(pending.next_boundary(), None);
+            assert_eq!(pending.begin_publication(boundary), None);
+            assert_eq!(pending.retire(boundary.producer_before), None);
+            progress = pending.retire(boundary.producer_after).unwrap();
+            assert_eq!(progress.retired_records(), boundary.index as usize + 1);
+        }
+        assert!(progress.complete());
+        assert_eq!(progress.next_boundary(), None);
 
         for (index, class, sequence, support, slot, count, context) in [
             (

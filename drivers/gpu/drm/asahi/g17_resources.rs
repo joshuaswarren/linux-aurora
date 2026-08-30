@@ -673,13 +673,17 @@ impl G17PControlCounters {
             && self.secondary == [g17_initdata::CONTROL_OPENING_SECONDARY_PRODUCER; 3]
     }
 
-    pub(crate) fn compute_readiness_staged(self) -> bool {
-        self.primary
-            == [
-                g17_initdata::CONTROL_OPENING_PRIMARY_PRODUCER,
-                g17_initdata::CONTROL_OPENING_PRIMARY_PRODUCER,
-                g17_initdata::COMPUTE_READINESS_FINAL_COUNTER,
-            ]
+    pub(crate) fn compute_readiness_record_staged(self, target: u32) -> bool {
+        let Some(previous) = target.checked_sub(1) else {
+            return false;
+        };
+        self.primary == [previous, previous, target]
+            && self.secondary
+                == [g17_initdata::CONTROL_OPENING_SECONDARY_PRODUCER; 3]
+    }
+
+    pub(crate) fn compute_readiness_record_retired(self, target: u32) -> bool {
+        self.primary == [target; 3]
             && self.secondary
                 == [g17_initdata::CONTROL_OPENING_SECONDARY_PRODUCER; 3]
     }
@@ -4498,35 +4502,24 @@ impl G17ResourceOwner {
         Ok(())
     }
 
-    /// Stage the six-record readiness suffix around the context-2 host write,
-    /// then expose the complete batch through one final producer publication.
-    /// Mailbox ownership stays with the live-boot layer.
-    pub(crate) fn stage_compute_readiness_suffix(
-        &mut self,
-        activate_context2: impl FnOnce() -> Result,
-    ) -> Result<u32> {
+    /// Store one first-CL readiness record and publish only its producer.
+    /// The caller owns the matching control-done message and retirement wait.
+    pub(crate) fn publish_compute_readiness_record(&mut self, index: usize) -> Result<u32> {
         if !self.resources.compute_readiness_class3_support_active {
             return Err(EINVAL);
         }
+        let boundary = g17_initdata::compute_readiness_boundary(index).ok_or(EINVAL)?;
         let before = self.control_counters()?;
-        let producer = g17_initdata::CONTROL_OPENING_PRIMARY_PRODUCER;
-        if before.primary != [producer; 3]
+        if before.primary != [boundary.producer_before; 3]
             || before.secondary
                 != [g17_initdata::CONTROL_OPENING_SECONDARY_PRODUCER; 3]
         {
             return Err(EINVAL);
         }
 
-        let mut records =
-            [0u8; g17_initdata::COMPUTE_READINESS_RECORDS * g17_initdata::CONTROL_RECORD_SIZE];
-        for index in 0..g17_initdata::COMPUTE_READINESS_RECORDS {
-            let start = index * g17_initdata::CONTROL_RECORD_SIZE;
-            g17_initdata::encode_compute_readiness_record(
-                index,
-                &mut records[start..start + g17_initdata::CONTROL_RECORD_SIZE],
-            )
+        let mut record = [0u8; g17_initdata::CONTROL_RECORD_SIZE];
+        g17_initdata::encode_compute_readiness_record(index, &mut record)
             .map_err(|_| EINVAL)?;
-        }
         let channels = g17_initdata::derive_channel_table(
             InstanceRole::Primary,
             self.handoff.primary.state_grid,
@@ -4536,40 +4529,31 @@ impl G17ResourceOwner {
         );
         let ring = channels[g17_initdata::CONTROL_CHANNEL_INDEX].ring;
         let record_address = ring
-            .checked_add(producer as u64 * g17_initdata::CONTROL_RECORD_SIZE as u64)
+            .checked_add(
+                boundary.producer_before as u64 * g17_initdata::CONTROL_RECORD_SIZE as u64,
+            )
             .ok_or(EINVAL)?;
         let offset: usize = record_address
             .checked_sub(self.resources.shared_cluster.iova())
             .ok_or(EINVAL)?
             .try_into()?;
-        let end = offset.checked_add(records.len()).ok_or(EINVAL)?;
-        let first_len = 3 * g17_initdata::CONTROL_RECORD_SIZE;
+        let end = offset.checked_add(record.len()).ok_or(EINVAL)?;
         self.resources.shared_cluster.with_bytes_mut(|bytes| {
             let destination = bytes.get_mut(offset..end).ok_or(EINVAL)?;
             if !destination.iter().all(|byte| *byte == 0) {
                 return Err(EINVAL);
             }
-            destination[..first_len].copy_from_slice(&records[..first_len]);
-            Ok(())
-        })?;
-        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        activate_context2()?;
-        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        self.resources.shared_cluster.with_bytes_mut(|bytes| {
-            bytes
-                .get_mut(offset + first_len..end)
-                .ok_or(EINVAL)?
-                .copy_from_slice(&records[first_len..]);
+            destination.copy_from_slice(&record);
             Ok(())
         })?;
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         write_control_counter(
             &mut self.resources.primary_state,
             g17_initdata::CHANNEL_STATE_PRODUCER,
-            g17_initdata::COMPUTE_READINESS_FINAL_COUNTER,
+            boundary.producer_after,
         )?;
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        Ok(g17_initdata::COMPUTE_READINESS_FINAL_COUNTER)
+        Ok(boundary.producer_after)
     }
 
     /// Store one live primary control record and publish only its producer.
@@ -6657,18 +6641,33 @@ mod tests {
         assert!(!runtime.opening_staged());
         assert!(!runtime.opening_retired());
 
-        let readiness_staged = G17PControlCounters {
+        let first_readiness_staged = G17PControlCounters {
             primary: [4, 4, 10],
             secondary: [16, 16, 16],
         };
-        assert!(readiness_staged.compute_readiness_staged());
-        assert!(!readiness_staged.compute_readiness_retired());
+        assert!(!first_readiness_staged.compute_readiness_record_staged(5));
+        assert!(!first_readiness_staged.compute_readiness_record_retired(10));
+        for target in 5..=10 {
+            let staged = G17PControlCounters {
+                primary: [target - 1, target - 1, target],
+                secondary: [16, 16, 16],
+            };
+            assert!(staged.compute_readiness_record_staged(target));
+            assert!(!staged.compute_readiness_record_retired(target));
+
+            let retired = G17PControlCounters {
+                primary: [target; 3],
+                secondary: [16, 16, 16],
+            };
+            assert!(retired.compute_readiness_record_retired(target));
+            assert!(!retired.compute_readiness_record_staged(target));
+        }
         let readiness_retired = G17PControlCounters {
             primary: [10, 10, 10],
             secondary: [16, 16, 16],
         };
         assert!(readiness_retired.compute_readiness_retired());
-        assert!(!readiness_retired.compute_readiness_staged());
+        assert!(readiness_retired.compute_readiness_record_retired(10));
     }
 
     fn valid_handoff() -> G17ResourceHandoff {
