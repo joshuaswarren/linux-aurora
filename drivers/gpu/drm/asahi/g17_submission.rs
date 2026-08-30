@@ -165,6 +165,9 @@ pub(crate) enum SubmissionError {
     ComputeEventCounterOverflow,
     /// Required first-bind command publication facts are still unresolved.
     FirstBindCommandPublicationIncomplete,
+    /// G17P target-1 power needs an unmodeled running-state discriminator and
+    /// lower IOSlaveProcessor wake path.
+    RunningClientPowerTransitionUnavailable,
     /// The middle QoS field is wider than the five bits copied by the host.
     KickQosClassOutOfRange,
     /// The runtime MMIO aperture selector or base offset overflowed u32.
@@ -364,6 +367,63 @@ pub(crate) const fn require_g17p_first_bind_direct_hardware_release(
         Err(SubmissionError::FirstBindCommandPublicationIncomplete)
     }
 }
+
+/// Native target-bound power transition required before TA/3D/CL submission.
+///
+/// Service 0x20 on the role-1 RTBuddy receives target 1. From native state 1
+/// this is a no-op; from state 2 it bypasses management power requests and
+/// performs the lower IOSlaveProcessor wake, completing after HELLO/rollcall.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PRunningClientPowerContract {
+    pub(crate) role_index: u8,
+    pub(crate) service_id: u8,
+    pub(crate) target: u8,
+    pub(crate) management_request_used: bool,
+    pub(crate) state_discriminator_available: bool,
+    pub(crate) lower_wake_available: bool,
+}
+
+pub(crate) const G17P_RUNNING_CLIENT_POWER_CONTRACT: G17PRunningClientPowerContract =
+    G17PRunningClientPowerContract {
+        role_index: 1,
+        service_id: 0x20,
+        target: 1,
+        management_request_used: false,
+        state_discriminator_available: false,
+        lower_wake_available: false,
+    };
+
+pub(crate) const fn require_g17p_running_client_power_transition(
+    contract: G17PRunningClientPowerContract,
+) -> Result<(), SubmissionError> {
+    if contract.role_index == 1
+        && contract.service_id == 0x20
+        && contract.target == 1
+        && !contract.management_request_used
+        && contract.state_discriminator_available
+        && contract.lower_wake_available
+    {
+        Ok(())
+    } else {
+        Err(SubmissionError::RunningClientPowerTransitionUnavailable)
+    }
+}
+
+/// Required lifetime of the eventual target-1 active lease.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum G17PComputePowerLeaseStep {
+    AcquireBeforeReadiness,
+    HoldThroughClaim,
+    HoldThroughCompletion,
+    ReleaseAfterCompletion,
+}
+
+pub(crate) const G17P_COMPUTE_POWER_LEASE_ORDER: [G17PComputePowerLeaseStep; 4] = [
+    G17PComputePowerLeaseStep::AcquireBeforeReadiness,
+    G17PComputePowerLeaseStep::HoldThroughClaim,
+    G17PComputePowerLeaseStep::HoldThroughCompletion,
+    G17PComputePowerLeaseStep::ReleaseAfterCompletion,
+];
 
 pub(crate) const fn g17p_first_bind_tag15_required(queue_config_dirty: bool) -> bool {
     queue_config_dirty
@@ -2583,6 +2643,7 @@ pub(crate) const G17P_CL_KICK_PUBLICATION_ORDER: [G17PClKickPublicationStep; 7] 
 /// recovered G17P SKSM/channel host order.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum G17PFirstSubmitPublicationStep {
+    AcquireGfx1RunningPower,
     PublishB2,
     StageComputeReadinessSuffix,
     PublishConfigUpdatePointer,
@@ -2602,7 +2663,8 @@ pub(crate) enum G17PFirstSubmitPublicationStep {
     SendDirectKick,
 }
 
-pub(crate) const G17P_FIRST_SUBMIT_PUBLICATION_ORDER: [G17PFirstSubmitPublicationStep; 17] = [
+pub(crate) const G17P_FIRST_SUBMIT_PUBLICATION_ORDER: [G17PFirstSubmitPublicationStep; 18] = [
+    G17PFirstSubmitPublicationStep::AcquireGfx1RunningPower,
     G17PFirstSubmitPublicationStep::PublishB2,
     G17PFirstSubmitPublicationStep::StageComputeReadinessSuffix,
     G17PFirstSubmitPublicationStep::PublishConfigUpdatePointer,
@@ -3906,6 +3968,47 @@ mod tests {
         assert_eq!(decode_tx_doorbell(kickfw), Ok((PipeType::Vertex, 4)));
         let devctrl = (0x83u64 << 48) | DOORBELL_DEVCTRL as u64;
         assert_eq!(decode_tx_doorbell(devctrl), Ok((PipeType::Fragment, 4)));
+    }
+
+    #[test]
+    fn g17p_running_client_power_gate_precedes_every_submit_mutation() {
+        let contract = G17P_RUNNING_CLIENT_POWER_CONTRACT;
+        assert_eq!(contract.role_index, 1);
+        assert_eq!(contract.service_id, 0x20);
+        assert_eq!(contract.target, 1);
+        assert!(!contract.management_request_used);
+        assert!(!contract.state_discriminator_available);
+        assert!(!contract.lower_wake_available);
+        assert_eq!(
+            G17P_COMPUTE_POWER_LEASE_ORDER,
+            [
+                G17PComputePowerLeaseStep::AcquireBeforeReadiness,
+                G17PComputePowerLeaseStep::HoldThroughClaim,
+                G17PComputePowerLeaseStep::HoldThroughCompletion,
+                G17PComputePowerLeaseStep::ReleaseAfterCompletion,
+            ]
+        );
+
+        let mut vm_bind_mutations = 0;
+        let mut readiness_mutations = 0;
+        let mut sksm_mutations = 0;
+        let mut mailbox_mutations = 0;
+        let gated: Result<(), SubmissionError> = (|| {
+            require_g17p_running_client_power_transition(contract)?;
+            vm_bind_mutations += 1;
+            readiness_mutations += 1;
+            sksm_mutations += 1;
+            mailbox_mutations += 1;
+            Ok(())
+        })();
+        assert_eq!(
+            gated,
+            Err(SubmissionError::RunningClientPowerTransitionUnavailable)
+        );
+        assert_eq!(vm_bind_mutations, 0);
+        assert_eq!(readiness_mutations, 0);
+        assert_eq!(sksm_mutations, 0);
+        assert_eq!(mailbox_mutations, 0);
     }
 
     #[test]
@@ -5344,6 +5447,7 @@ mod tests {
         assert_eq!(
             G17P_FIRST_SUBMIT_PUBLICATION_ORDER,
             [
+                G17PFirstSubmitPublicationStep::AcquireGfx1RunningPower,
                 G17PFirstSubmitPublicationStep::PublishB2,
                 G17PFirstSubmitPublicationStep::StageComputeReadinessSuffix,
                 G17PFirstSubmitPublicationStep::PublishConfigUpdatePointer,
