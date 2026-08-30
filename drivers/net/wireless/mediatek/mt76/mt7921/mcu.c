@@ -1525,7 +1525,7 @@ int mt7932_mcu_load_live_start_phase(struct mt792x_dev *dev, u8 phase)
 		if (ordinal == 87) {
 			struct mt76_queue *q =
 				dev->mt76.q_mcu[MT_MCUQ_WM];
-			u32 cidx, didx, ext0, glo;
+			u32 cidx, didx, ext0, glo, page, pktmax;
 
 			/* The full Run-191 MMIO trace measures a WFDMA epoch boundary
 			 * between mode-3 ordinal 87 and query ordinal 88: Apple drains the
@@ -1596,6 +1596,59 @@ int mt7932_mcu_load_live_start_phase(struct mt792x_dev *dev, u8 phase)
 			dev_info(dev->mt76.dev,
 				 "J700_MT7932_RUNTIME_DMASHDL_SELECTOR_ARMED: before=0x%08x after=0x28c004df action=preserve-no-write phase=before-wpdma-reset source=run191+run541\n",
 				 ext0);
+			/* AppleSunriseWLAN 25G83 halHwRecoveryFromError calls the
+			 * mt7961DmashdlReInit bus callback at bus_info+0x2a0 before
+			 * halWpdmaAllocRing and halWpdmaInitRing.  The latter performs the
+			 * WFDMA disable, TX/RX ring publication, manual prefetch, RST_DTX
+			 * and re-enable sequence.  Applying the same final values after
+			 * RST_DTX matches a paused register snapshot but seeds Connac3's
+			 * hidden q-status epoch in the wrong order.
+			 *
+			 * The callback does not merely repair fields whose readback drifted:
+			 * exact static RE shows it republishes packet/page policy, all queue
+			 * mappings and both user-priority words on every recovery.  Same-value
+			 * writes are therefore part of the scheduler epoch contract even when
+			 * a later paused snapshot converges.  Quota/refill remain outside ReInit
+			 * and are deliberately untouched.
+			 */
+			page = mt76_rr(dev, MT_DMASHDL_PAGE);
+			pktmax = mt76_rr(dev, MT_DMASHDL_PKT_MAX_SIZE);
+			mt76_rmw(dev, MT_DMASHDL_PAGE, GENMASK(17, 16), BIT(16));
+			mt76_rmw(dev, MT_DMASHDL_PKT_MAX_SIZE,
+				 MT_DMASHDL_PKT_MAX_SIZE_PLE |
+				 MT_DMASHDL_PKT_MAX_SIZE_PSE,
+				 FIELD_PREP(MT_DMASHDL_PKT_MAX_SIZE_PLE, 1));
+			mt76_wr(dev, MT_DMASHDL_Q_MAP(0), 0x76543210);
+			mt76_wr(dev, MT_DMASHDL_Q_MAP(1), 0xfedcba98);
+			mt76_wr(dev, MT_DMASHDL_Q_MAP(2), 0x11111000);
+			mt76_wr(dev, MT_DMASHDL_Q_MAP(3), 0x11111000);
+			mt76_wr(dev, MT_DMASHDL_SCHED_SET(0), 0x76543210);
+			mt76_wr(dev, MT_DMASHDL_SCHED_SET(1), 0xfedcba98);
+			if (mt76_rr(dev, MT_DMASHDL_PAGE) != 0x003d1000 ||
+			    mt76_rr(dev, MT_DMASHDL_PKT_MAX_SIZE) != 0x00000001 ||
+			    mt76_rr(dev, MT_DMASHDL_Q_MAP(0)) != 0x76543210 ||
+			    mt76_rr(dev, MT_DMASHDL_Q_MAP(1)) != 0xfedcba98 ||
+			    mt76_rr(dev, MT_DMASHDL_Q_MAP(2)) != 0x11111000 ||
+			    mt76_rr(dev, MT_DMASHDL_Q_MAP(3)) != 0x11111000 ||
+			    mt76_rr(dev, MT_DMASHDL_SCHED_SET(0)) != 0x76543210 ||
+			    mt76_rr(dev, MT_DMASHDL_SCHED_SET(1)) != 0xfedcba98) {
+				dev_err(dev->mt76.dev,
+					"J700_MT7932_RUNTIME_DMASHDL_REINIT_FAIL: phase=pre-wpdma-reset page_before=0x%08x pkt_before=0x%08x page_after=0x%08x pkt_after=0x%08x qmap=%08x/%08x/%08x/%08x pri=%08x/%08x\n",
+					page, pktmax,
+					mt76_rr(dev, MT_DMASHDL_PAGE),
+					mt76_rr(dev, MT_DMASHDL_PKT_MAX_SIZE),
+					mt76_rr(dev, MT_DMASHDL_Q_MAP(0)),
+					mt76_rr(dev, MT_DMASHDL_Q_MAP(1)),
+					mt76_rr(dev, MT_DMASHDL_Q_MAP(2)),
+					mt76_rr(dev, MT_DMASHDL_Q_MAP(3)),
+					mt76_rr(dev, MT_DMASHDL_SCHED_SET(0)),
+					mt76_rr(dev, MT_DMASHDL_SCHED_SET(1)));
+				ret = -EIO;
+				goto release_firmware;
+			}
+			dev_info(dev->mt76.dev,
+				 "J700_MT7932_RUNTIME_DMASHDL_REINIT_PASS: phase=pre-wpdma-reset page_before=0x%08x pkt_before=0x%08x page_after=0x003d1000 pkt_after=0x00000001 qmap=76543210/fedcba98/11111000/11111000 pri=76543210/fedcba98 writes=page,pktmax,qmap0-3,pri0-1 source=apple25G83-mt7961DmashdlReInit+run543\n",
+				 page, pktmax);
 			dev->mt7932_runtime_dma_epoch = true;
 			ret = mt792x_wpdma_reset(dev, false);
 			dev->mt7932_runtime_dma_epoch = false;
@@ -1641,16 +1694,12 @@ int mt7932_mcu_load_live_start_phase(struct mt792x_dev *dev, u8 phase)
 				q->tail = 0;
 				spin_unlock_bh(&q->cleanup_lock);
 			}
-			/* Run 191 has two distinct WFDMA configurations.  Firmware download
-			 * uses 0x50209045/e2c8000d; the post-reset runtime epoch uses
-			 * 0x5030b875/eec8000d and publishes periodic interrupt policy
-			 * 0x01fd0032 before notifying firmware that DMA was reinitialized.
+			/* mt792x_dma_enable() has already emitted Run 191's only runtime
+			 * GLO_CFG writes, 0x5030b870 followed by 0x5030b875.  Do not repeat
+			 * a same-value RMW here: Apple proceeds directly to periodic
+			 * interrupt policy 0x01fd0032 before notifying firmware that DMA was
+			 * reinitialized.  Read back the installed image without mutating it.
 			 */
-			mt76_set(dev, MT_WFDMA0_GLO_CFG,
-				 FIELD_PREP(MT_WFDMA0_GLO_CFG_DMA_SIZE, 3) |
-				 MT_WFDMA0_GLO_CFG_FIFO_DIS_CHECK |
-				 MT_WFDMA0_GLO_CFG_RX_WB_DDONE |
-				 MT_WFDMA0_GLO_CFG_CSR_LBK_RX_Q_SEL_EN);
 			mt76_wr(dev, MT_WFDMA0_HOST_PER_DLY_INT_CFG, 0x01fd0032);
 			glo = mt76_rr(dev, MT_WFDMA0_GLO_CFG);
 			if ((glo & ~(MT_WFDMA0_GLO_CFG_TX_DMA_BUSY |

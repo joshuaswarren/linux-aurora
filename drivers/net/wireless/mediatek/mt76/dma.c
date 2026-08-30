@@ -1138,6 +1138,98 @@ mt76_dma_rx_reset(struct mt76_dev *dev, enum mt76_rxq_id qid)
 		mt76_dma_rx_fill(dev, q, false);
 }
 
+int mt76_dma_rx_rebuild_existing(struct mt76_dev *dev,
+				 enum mt76_rxq_id qid)
+{
+	struct mt76_queue *q = &dev->q_rx[qid];
+	struct mt76_queue_buf qbuf = {};
+	void *buf;
+	int i, missing = -1, offset, ret;
+
+	if (!q->ndesc)
+		return 0;
+	if (mt76_queue_is_wed_rro_ind(q) ||
+	    mt76_queue_is_wed_rro_rxdmad_c(q) || mt76_queue_is_npu(q) ||
+	    mt76_queue_is_wed_tx_free(q) || mt76_queue_is_npu_txfree(q))
+		return -EOPNOTSUPP;
+
+	/* AppleSunriseWLAN halWpdmaAllocRxRing(..., false) runs before
+	 * halWpdmaInitRing disables WFDMA.  It keeps every existing RX DMA mapping,
+	 * rebuilds all descriptors in place and supplies all ring entries.  Generic
+	 * mt76 instead keeps one empty entry, then rx_cleanup unmaps every buffer and
+	 * rx_fill allocates replacements after WFDMA is disabled.
+	 *
+	 * Preserve the existing mapped buffers and allocate only mt76's structural
+	 * empty slot.  No queue MMIO is permitted here; the caller publishes
+	 * BASE/CIDX/COUNT later, after WFDMA disable, exactly like Apple.
+	 */
+	spin_lock_bh(&q->lock);
+	if (q->queued != q->ndesc - 1 || q->head >= q->ndesc) {
+		ret = -EINVAL;
+		goto unlock;
+	}
+	for (i = 0; i < q->ndesc; i++) {
+		if (q->entry[i].buf)
+			continue;
+		if (missing >= 0) {
+			ret = -EINVAL;
+			goto unlock;
+		}
+		missing = i;
+	}
+	if (missing < 0 || missing != q->head) {
+		ret = -EINVAL;
+		goto unlock;
+	}
+
+	buf = mt76_get_page_pool_buf(q, &offset, q->buf_size);
+	if (!buf) {
+		ret = -ENOMEM;
+		goto unlock;
+	}
+	qbuf.addr = page_pool_get_dma_addr(virt_to_head_page(buf)) + offset +
+		    q->buf_offset;
+	qbuf.len = SKB_WITH_OVERHEAD(q->buf_size) - q->buf_offset;
+	if (mt76_dma_add_rx_buf(dev, q, &qbuf, buf) < 0) {
+		mt76_put_page_pool_buf(buf, false);
+		ret = -ENOMEM;
+		goto unlock;
+	}
+
+	for (i = 0; i < q->ndesc; i++) {
+		struct mt76_queue_entry *entry = &q->entry[i];
+		struct mt76_desc *desc = &q->desc[i];
+		u32 ctrl, buf1 = 0;
+
+		if (!entry->buf || !entry->dma_len[0]) {
+			ret = -EINVAL;
+			goto unlock;
+		}
+		ctrl = le32_to_cpu(READ_ONCE(desc->ctrl));
+		ctrl &= BIT(30) | GENMASK(15, 0);
+		ctrl |= FIELD_PREP(MT_DMA_CTL_SD_LEN0, entry->dma_len[0]);
+#ifdef CONFIG_ARCH_DMA_ADDR_T_64BIT
+		buf1 = FIELD_PREP(MT_DMA_CTL_SDP0_H,
+				  entry->dma_addr[0] >> 32);
+#endif
+		WRITE_ONCE(desc->buf0, cpu_to_le32(entry->dma_addr[0]));
+		WRITE_ONCE(desc->ctrl, cpu_to_le32(ctrl));
+		WRITE_ONCE(desc->buf1, cpu_to_le32(buf1));
+		WRITE_ONCE(desc->info, 0);
+	}
+	q->head = 0;
+	q->tail = 0;
+	q->queued = q->ndesc;
+	ret = 0;
+
+unlock:
+	spin_unlock_bh(&q->lock);
+	if (!ret)
+		dma_wmb();
+	return ret;
+}
+EXPORT_SYMBOL_GPL(mt76_dma_rx_rebuild_existing);
+
 static void
 mt76_add_fragment(struct mt76_dev *dev, struct mt76_queue *q, void *data,
 		  int len, bool more, u32 info, bool allow_direct)
