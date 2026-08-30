@@ -188,6 +188,7 @@ struct apple_dcp {
 	bool shmem_inherited;
 	u32 link_top[2][APPLE_DCP_LINK_STREAMS_PER_SIDE];
 	u16 link_version;
+	enum apple_dcp_link_abi link_abi;
 	u32 link_firmware_hash;
 	u64 link_init_message;
 	u16 link_rx_log_count;

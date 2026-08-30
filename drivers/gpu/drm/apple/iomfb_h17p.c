@@ -168,7 +168,7 @@ static bool trampoline_read_edt_string_h17p(struct apple_dcp *dcp, int tag,
 	return true;
 }
 
-static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
+static const iomfb_cb_handler cb_handlers_c3[IOMFB_MAX_CB] = {
 	[0] = trampoline_true, /* did_boot_signal */
 	[1] = trampoline_true, /* did_power_on_signal */
 	[2] = trampoline_nop, /* will_power_off_signal */
@@ -180,12 +180,9 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[103] = trampoline_nop, /* trigger_user_cal_loader */
 	[104] = trampoline_nop, /* set_boolean_property */
 	/*
-	 * 25G83 UnifiedPipeline2 numbering (from the mac17p kernelcache): the
-	 * create-service block is NOT the v13_3 +1-shifted layout. provider is
-	 * D107, product D108, PMU D109, iomfb D110, backlight D111, nvram D112.
-	 * Every create_*_service handler returns true (the native functions all
-	 * return 1). The firmware sends D108..D113 as boolean creates during
-	 * start(); answering D112 (nvram) false made start() never complete.
+	 * The c3 firmware sends D108..D113 as boolean creates during start().
+	 * These slots and shapes are preserved from the 25G83 wire capture;
+	 * answering D112 false made start() never complete.
 	 */
 	[107] = trampoline_true, /* create_provider_service */
 	[108] = trampoline_true, /* create_product_service */
@@ -253,7 +250,13 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 
 void iomfb_start_h17p(struct apple_dcp *dcp)
 {
-	dcp->cb_handlers = cb_handlers;
+	if (dcp->link_abi != APPLE_DCP_LINK_ABI_C3) {
+		dev_err(dcp->dev, "refusing unknown H17P DCPLink ABI %#x\n",
+			dcp->link_abi);
+		return;
+	}
+
+	dcp->cb_handlers = cb_handlers_c3;
 	dev_info(dcp->dev, "DCP25G83_SUMP_TEMPERATURE_3029 armed\n");
 	dcp_start_signal(dcp, false, dcp_started, NULL);
 }

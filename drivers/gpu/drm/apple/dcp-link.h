@@ -13,6 +13,8 @@
 #include <linux/types.h>
 
 #define APPLE_DCP_LINK_PROTOCOL_VERSION		4
+#define APPLE_DCP_LINK_C3_TRANSPORT_VERSION	0x40
+#define APPLE_DCP_LINK_C3_READY_HASH		0x45bc9ef4
 #define APPLE_DCP_LINK_ENDPOINT			0x37
 #define APPLE_DCP_LINK_STREAM_COUNT		8
 #define APPLE_DCP_LINK_STREAMS_PER_SIDE		4
@@ -62,6 +64,11 @@ enum apple_dcp_link_state {
 	APPLE_DCP_LINK_WAIT_FIRMWARE_INIT,
 	APPLE_DCP_LINK_WAIT_READY,
 	APPLE_DCP_LINK_READY,
+};
+
+enum apple_dcp_link_abi {
+	APPLE_DCP_LINK_ABI_UNKNOWN,
+	APPLE_DCP_LINK_ABI_C3 = 0xc3,
 };
 
 enum apple_dcp_link_handoff_phase {
@@ -700,6 +707,16 @@ static inline int apple_dcp_link_ready_reply(u64 message, u16 *version,
 	*version = FIELD_GET(APPLE_DCP_LINK_MSG_VERSION, message);
 	*firmware_hash = FIELD_GET(APPLE_DCP_LINK_MSG_HASH, message);
 	return 0;
+}
+
+static inline enum apple_dcp_link_abi
+apple_dcp_link_ready_abi(u16 transport_version, u32 ready_hash)
+{
+	if (transport_version == APPLE_DCP_LINK_C3_TRANSPORT_VERSION &&
+	    ready_hash == APPLE_DCP_LINK_C3_READY_HASH)
+		return APPLE_DCP_LINK_ABI_C3;
+
+	return APPLE_DCP_LINK_ABI_UNKNOWN;
 }
 
 static inline int apple_dcp_link_rpc_payload_size(u32 input_size,

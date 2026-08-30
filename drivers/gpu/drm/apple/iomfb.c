@@ -1146,6 +1146,7 @@ static void dcp_link_recv_msg(struct apple_dcp *dcp, u64 message)
 	}
 
 	if (type == APPLE_DCP_LINK_MSG_READY) {
+		enum apple_dcp_link_abi link_abi;
 		u16 remote_version;
 
 		if (action != APPLE_DCP_LINK_HANDSHAKE_START_IOMFB) {
@@ -1165,12 +1166,25 @@ static void dcp_link_recv_msg(struct apple_dcp *dcp, u64 message)
 			dev_err(dcp->dev, "DCPLink ready has version zero\n");
 			return;
 		}
+		link_abi = apple_dcp_link_ready_abi(remote_version,
+						 dcp->link_firmware_hash);
+		if (link_abi != APPLE_DCP_LINK_ABI_C3) {
+			dcp->link_state = old_state;
+			dev_err(dcp->dev,
+				"unsupported DCPLink ABI: transport %#x hash %#x\n",
+				remote_version, dcp->link_firmware_hash);
+			return;
+		}
 		dcp->link_version =
 			apple_dcp_link_negotiate_version(remote_version);
+		dcp->link_abi = link_abi;
 		dev_info(dcp->dev,
 			 "DCPLink ready: remote version %u negotiated %u hash %#x\n",
 			 remote_version, dcp->link_version,
 			 dcp->link_firmware_hash);
+		dev_info(dcp->dev,
+			 "DCP25G83_LINK_ABI transport %#x hash %#x schema %#x\n",
+			 remote_version, dcp->link_firmware_hash, dcp->link_abi);
 		iomfb_start_h17p(dcp);
 		return;
 	}
@@ -1332,6 +1346,7 @@ static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 			dcp->link_init_message = captured_message;
 			dcp->link_state = APPLE_DCP_LINK_WAIT_FIRMWARE_INIT;
 			dcp->link_version = 0;
+			dcp->link_abi = APPLE_DCP_LINK_ABI_UNKNOWN;
 			dcp->link_firmware_hash = 0;
 			dcp->link_endpoint_started = true;
 			/* Native 25G83 does not wait for optional type-0 here. */
@@ -1354,6 +1369,8 @@ static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 
 		dcp->link_endpoint_started = true;
 		if (action == APPLE_DCP_LINK_ADOPT_START_IOMFB) {
+			enum apple_dcp_link_abi link_abi;
+
 			ret = apple_dcp_link_ready_reply(captured_message,
 							 &remote_version, &ready_hash);
 			if (ret || !remote_version) {
@@ -1362,9 +1379,19 @@ static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 				ret = ret ?: -EPROTO;
 				goto err_unmap_inherited;
 			}
+			link_abi = apple_dcp_link_ready_abi(remote_version,
+							 ready_hash);
+			if (link_abi != APPLE_DCP_LINK_ABI_C3) {
+				dev_err(dcp->dev,
+					"unsupported inherited DCPLink ABI: transport %#x hash %#x\n",
+					remote_version, ready_hash);
+				ret = -EPROTONOSUPPORT;
+				goto err_unmap_inherited;
+			}
 
 			dcp->link_version =
 				apple_dcp_link_negotiate_version(remote_version);
+			dcp->link_abi = link_abi;
 			dcp->link_firmware_hash = ready_hash;
 			dcp->link_state = APPLE_DCP_LINK_READY;
 			dcp_link_sync_for_device();
@@ -1372,6 +1399,10 @@ static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 				 "adopted DCPLink ready remote version %u negotiated %u hash %#x DVA %#llx PA %#llx\n",
 				 remote_version, dcp->link_version,
 				 dcp->link_firmware_hash, rpc_dva, rpc_pa);
+			dev_info(dcp->dev,
+				 "DCP25G83_LINK_ABI transport %#x hash %#x schema %#x\n",
+				 remote_version, dcp->link_firmware_hash,
+				 dcp->link_abi);
 			iomfb_start_h17p(dcp);
 			return 0;
 		}
@@ -1389,6 +1420,7 @@ static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 		dcp->link_state = APPLE_DCP_LINK_WAIT_READY;
 		dcp->link_init_message = captured_message;
 		dcp->link_version = 0;
+		dcp->link_abi = APPLE_DCP_LINK_ABI_UNKNOWN;
 		dcp->link_firmware_hash = 0;
 		dcp_link_sync_for_device();
 		dcp_link_log_init(dcp, desc, captured_message);
