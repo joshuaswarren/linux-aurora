@@ -112,6 +112,7 @@ const G17P_CONTROL_OPERAND_BUFFER_SIZE: usize =
     g17_initdata::CONTROL_OPERAND_BUFFER_SIZE as usize;
 const G17P_CONTROL_OPERAND_BUFFER_STRIDE: usize =
     g17_initdata::CONTROL_OPERAND_BUFFER_STRIDE as usize;
+pub(crate) const G17P_DATA_MASTER_CHANNEL_COUNT: usize = 12;
 const G17P_BOOTSTRAP_TA_DESCRIPTOR_LOW_VA: u64 = 0x70_0000_0000;
 const G17P_BOOTSTRAP_3D_DESCRIPTOR_LOW_VA: u64 = 0x70_0009_8000;
 const G17P_BOOTSTRAP_DESCRIPTOR_ZERO_A_VA: u64 = 0xffff_fc20_001c_8000;
@@ -139,6 +140,38 @@ fn all_ranges_covered(
     ranges
         .into_iter()
         .all(|(address, size)| covers(address, size))
+}
+
+#[cfg(not(test))]
+fn map_compute_readiness_mappings(
+    table: &mut RenderBackingObject,
+    buffers: &mut KVec<RenderBackingObject>,
+    vm: &mmu::Vm,
+) -> Result<G17PComputeReadinessMappings> {
+    if buffers.len() != G17P_CONTROL_OPERAND_BUFFER_COUNT {
+        return Err(EINVAL);
+    }
+    let table = table.map_at(
+        vm,
+        G17P_CONTROL_OPERAND_TABLE_VA,
+        mmu::PROT_GPU_FW_SHARED_RW,
+    )?;
+    let mut mappings = KVec::with_capacity(G17P_CONTROL_OPERAND_BUFFER_COUNT, GFP_KERNEL)?;
+    for (index, buffer) in buffers.iter_mut().enumerate() {
+        let address = g17p_control_operand_buffer_va(index).ok_or(EINVAL)?;
+        mappings.push(
+            buffer.map_at(vm, address, mmu::PROT_GPU_FW_SHARED_RW)?,
+            GFP_KERNEL,
+        )?;
+    }
+    let result = G17PComputeReadinessMappings {
+        table,
+        buffers: mappings,
+    };
+    if !result.all_reachable_from(vm) {
+        return Err(EFAULT);
+    }
+    Ok(result)
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -598,6 +631,23 @@ impl G17PControlCounters {
     pub(crate) fn compute_runtime_ready(self) -> bool {
         self.primary == [g17_initdata::COMPUTE_RUNTIME_CONTROL_FINAL_COUNTER; 3]
             && self.secondary == [g17_initdata::CONTROL_OPENING_SECONDARY_PRODUCER; 3]
+    }
+
+    pub(crate) fn compute_readiness_staged(self) -> bool {
+        self.primary
+            == [
+                g17_initdata::CONTROL_OPENING_PRIMARY_PRODUCER,
+                g17_initdata::CONTROL_OPENING_PRIMARY_PRODUCER,
+                g17_initdata::COMPUTE_READINESS_FINAL_COUNTER,
+            ]
+            && self.secondary
+                == [g17_initdata::CONTROL_OPENING_SECONDARY_PRODUCER; 3]
+    }
+
+    pub(crate) fn compute_readiness_retired(self) -> bool {
+        self.primary == [g17_initdata::COMPUTE_READINESS_FINAL_COUNTER; 3]
+            && self.secondary
+                == [g17_initdata::CONTROL_OPENING_SECONDARY_PRODUCER; 3]
     }
 }
 
@@ -1295,6 +1345,12 @@ pub(crate) struct G17PComputeUserMappings {
 }
 
 #[cfg(not(test))]
+struct G17PComputeReadinessMappings {
+    table: mmu::KernelMapping,
+    buffers: KVec<mmu::KernelMapping>,
+}
+
+#[cfg(not(test))]
 #[derive(Debug, Copy, Clone)]
 pub(crate) struct G17PComputeGraphSnapshot {
     pub(crate) queue: u64,
@@ -1332,6 +1388,19 @@ pub(crate) struct G17PComputeChannelSnapshot {
     pub(crate) slot_queue: u64,
     pub(crate) slot_kind: u32,
     pub(crate) slot_flags: u32,
+    pub(crate) runtime_descriptor_pointers: [u64; 2],
+}
+
+#[cfg(not(test))]
+#[derive(Debug, Copy, Clone)]
+pub(crate) struct G17PChannelScanSnapshot {
+    pub(crate) table_index: u8,
+    pub(crate) ring: u64,
+    pub(crate) state_addresses: [u64; 3],
+    pub(crate) cursors: [u32; 3],
+    pub(crate) current_slot_index: u8,
+    pub(crate) current_slot_queue: u64,
+    pub(crate) current_slot_kind: u32,
 }
 
 #[cfg(not(test))]
@@ -1355,6 +1424,23 @@ impl G17PComputeUserMappings {
         self.layout().all_referenced_ranges_reachable(|address, size| {
             vm.covers_range(address, size, true, true)
         })
+    }
+}
+
+#[cfg(not(test))]
+impl G17PComputeReadinessMappings {
+    fn all_reachable_from(&self, vm: &mmu::Vm) -> bool {
+        vm.covers_range(
+            self.table.iova(),
+            self.table.size() as u64,
+            true,
+            true,
+        ) && all_ranges_covered(
+            self.buffers
+                .iter()
+                .map(|mapping| (mapping.iova(), mapping.size() as u64)),
+            |address, size| vm.covers_range(address, size, true, true),
+        )
     }
 }
 
@@ -3023,6 +3109,58 @@ impl G17PClRuntimeStorage {
         self.channel_control.iova()
     }
 
+    /// Initialize the distinct native context-2 activation record. Record 0
+    /// remains the relocated CL queue/optional role; record 2 starts fresh.
+    pub(crate) fn initialize_context2_activation_record(&mut self) -> Result<u64> {
+        let offset = g17_initdata::COMPUTE_READINESS_ACTIVATION_RECORD_OFFSET;
+        let activation_gpu_va = self
+            .channel_control
+            .iova()
+            .checked_add(offset as u64)
+            .ok_or(EINVAL)?;
+        let end = offset
+            .checked_add(g17_initdata::CONTROL_RECORD_SIZE)
+            .ok_or(EINVAL)?;
+        let vmap = self.channel_control.object.vmap()?;
+        let bytes = unsafe {
+            // SAFETY: the VMap covers the complete channel-control object.
+            core::slice::from_raw_parts_mut(vmap.as_mut_ptr(), self.channel_control.logical_size)
+        };
+        let qword = |at: usize| -> Result<u64> {
+            Ok(u64::from_le_bytes(
+                bytes
+                    .get(at..at + 8)
+                    .ok_or(EINVAL)?
+                    .try_into()
+                    .map_err(|_| EINVAL)?,
+            ))
+        };
+        if end > bytes.len()
+            || qword(0x00)? != 0x0000_0100_0000_ffff
+            || qword(0x20)? != 0x0002_0000_0000_0000
+            || qword(0x30)? != 0x0000_0000_ff00_0000
+            || !bytes[offset..end].iter().all(|byte| *byte == 0)
+        {
+            return Err(EINVAL);
+        }
+        g17_initdata::encode_compute_readiness_activation_record(&mut bytes[offset..end])
+            .map_err(|_| EINVAL)?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        Ok(activation_gpu_va)
+    }
+
+    pub(crate) fn snapshot_channel_control_prefix(&mut self) -> Result<[u8; 0x38]> {
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        let vmap = self.channel_control.object.vmap()?;
+        let bytes = unsafe {
+            // SAFETY: the VMap covers the complete channel-control object.
+            core::slice::from_raw_parts(vmap.as_mut_ptr(), self.channel_control.logical_size)
+        };
+        let mut prefix = [0u8; 0x38];
+        prefix.copy_from_slice(bytes.get(..0x38).ok_or(EINVAL)?);
+        Ok(prefix)
+    }
+
     pub(crate) fn support_state_gpu_va(&self) -> u64 {
         self.support_state.iova()
     }
@@ -3140,6 +3278,11 @@ struct G17MappedResources {
     compute_runtime_class1_table: MappedObject,
     compute_runtime_table_alias: Option<mmu::KernelMapping>,
     compute_runtime_buffer_aliases: KVec<mmu::KernelMapping>,
+    compute_readiness_class1_support: MappedObject,
+    compute_readiness_class1_state: MappedObject,
+    compute_readiness_class3_support: MappedObject,
+    compute_readiness_class3_state: MappedObject,
+    compute_readiness_context1: Option<G17PComputeReadinessMappings>,
     register_windows: KVec<mmu::KernelMapping>,
 }
 
@@ -3470,6 +3613,39 @@ impl G17ResourceOwner {
         )?;
         let compute_runtime_table_alias = None;
         let compute_runtime_buffer_aliases = KVec::with_capacity(20, GFP_KERNEL)?;
+        let mut compute_readiness_class1_support = map_fixed_wc_object(
+            dev,
+            address_space.uat.kernel_vm(),
+            "compute readiness class-1 support",
+            g17_initdata::COMPUTE_READINESS_CLASS1_SUPPORT_ADDRESS,
+            g17_initdata::COMPUTE_READINESS_PAGE_SIZE,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        let mut compute_readiness_class1_state = map_fixed_wc_object(
+            dev,
+            address_space.uat.kernel_vm(),
+            "compute readiness context-1 state",
+            g17_initdata::COMPUTE_READINESS_CLASS1_STATE_ADDRESS,
+            g17_initdata::COMPUTE_READINESS_PAGE_SIZE,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        let mut compute_readiness_class3_support = map_fixed_wc_object(
+            dev,
+            address_space.uat.kernel_vm(),
+            "compute readiness class-3 support",
+            g17_initdata::COMPUTE_READINESS_CLASS3_SUPPORT_ADDRESS,
+            g17_initdata::COMPUTE_READINESS_PAGE_SIZE,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        let mut compute_readiness_class3_state = map_fixed_wc_object(
+            dev,
+            address_space.uat.kernel_vm(),
+            "compute readiness context-2 state",
+            g17_initdata::COMPUTE_READINESS_CLASS3_STATE_ADDRESS,
+            g17_initdata::COMPUTE_READINESS_PAGE_SIZE,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        let compute_readiness_context1 = None;
         compute_runtime_support.with_bytes_mut(|bytes| {
             g17_initdata::encode_compute_runtime_class1_support(bytes).map_err(|_| EINVAL)
         })?;
@@ -3480,6 +3656,18 @@ impl G17ResourceOwner {
         })?;
         compute_runtime_class1_table.with_bytes_mut(|bytes| {
             g17_initdata::encode_compute_runtime_class1_table(bytes).map_err(|_| EINVAL)
+        })?;
+        compute_readiness_class1_support.with_bytes_mut(|bytes| {
+            g17_initdata::encode_compute_readiness_class1_support(bytes).map_err(|_| EINVAL)
+        })?;
+        compute_readiness_class1_state.with_bytes_mut(|bytes| {
+            g17_initdata::encode_compute_readiness_state(bytes).map_err(|_| EINVAL)
+        })?;
+        compute_readiness_class3_support.with_bytes_mut(|bytes| {
+            g17_initdata::encode_compute_readiness_class3_support(bytes).map_err(|_| EINVAL)
+        })?;
+        compute_readiness_class3_state.with_bytes_mut(|bytes| {
+            g17_initdata::encode_compute_readiness_state(bytes).map_err(|_| EINVAL)
         })?;
         let page_list = control_operand_buffers
             .iter_mut()
@@ -3659,6 +3847,22 @@ impl G17ResourceOwner {
             ("bootstrap TA context peer", &bootstrap_ta_context_peer),
             ("bootstrap 3D context peer", &bootstrap_3d_context_peer),
             ("compute runtime support", &compute_runtime_support),
+            (
+                "compute readiness class-1 support",
+                &compute_readiness_class1_support,
+            ),
+            (
+                "compute readiness context-1 state",
+                &compute_readiness_class1_state,
+            ),
+            (
+                "compute readiness class-3 support",
+                &compute_readiness_class3_support,
+            ),
+            (
+                "compute readiness context-2 state",
+                &compute_readiness_class3_state,
+            ),
             ("roots", &roots),
             ("shared cluster", &shared_cluster),
             ("B2 sentinel", &primary_b2_sentinel),
@@ -3818,6 +4022,11 @@ impl G17ResourceOwner {
                 compute_runtime_class1_table,
                 compute_runtime_table_alias,
                 compute_runtime_buffer_aliases,
+                compute_readiness_class1_support,
+                compute_readiness_class1_state,
+                compute_readiness_class3_support,
+                compute_readiness_class3_state,
+                compute_readiness_context1,
                 register_windows,
             },
             address_space,
@@ -3883,6 +4092,80 @@ impl G17ResourceOwner {
             inner_state,
             operand_slot,
         })
+    }
+
+    fn validate_compute_readiness_objects(&self) -> Result {
+        if self.resources.compute_readiness_class1_support.iova()
+            != g17_initdata::COMPUTE_READINESS_CLASS1_SUPPORT_ADDRESS
+            || self.resources.compute_readiness_class1_state.iova()
+                != g17_initdata::COMPUTE_READINESS_CLASS1_STATE_ADDRESS
+            || self.resources.compute_readiness_class3_support.iova()
+                != g17_initdata::COMPUTE_READINESS_CLASS3_SUPPORT_ADDRESS
+            || self.resources.compute_readiness_class3_state.iova()
+                != g17_initdata::COMPUTE_READINESS_CLASS3_STATE_ADDRESS
+        {
+            return Err(EINVAL);
+        }
+        Ok(())
+    }
+
+    /// Map the exact operand closure into context 1 before staging the suffix.
+    pub(crate) fn prepare_compute_readiness_context1(&mut self) -> Result {
+        if !self.control_counters()?.opening_retired() {
+            return Err(EINVAL);
+        }
+        self.validate_compute_readiness_objects()?;
+        self.resources.control_operand_table.with_bytes_mut(|bytes| {
+            g17_initdata::encode_partial_opening_operand_table_post_control(bytes)
+                .map_err(|_| EINVAL)
+        })?;
+        if self.resources.compute_readiness_context1.is_none() {
+            let vm = self.address_space.uat.kernel_lower_vm();
+            self.resources.compute_readiness_context1 = Some(map_compute_readiness_mappings(
+                &mut self.resources.control_operand_table,
+                &mut self.resources.control_operand_buffers,
+                vm,
+            )?);
+        }
+        let mappings = self
+            .resources
+            .compute_readiness_context1
+            .as_ref()
+            .ok_or(EINVAL)?;
+        if !mappings.all_reachable_from(self.address_space.uat.kernel_lower_vm()) {
+            return Err(EFAULT);
+        }
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Map the same output-positive operand closure into the first CL context.
+    pub(crate) fn validate_compute_readiness_context2(&mut self, vm: &mmu::Vm) -> Result {
+        if !self.control_counters()?.opening_retired() {
+            return Err(EINVAL);
+        }
+        self.validate_compute_readiness_objects()?;
+        self.resources.control_operand_table.with_bytes_mut(|bytes| {
+            g17_initdata::encode_partial_opening_operand_table_post_control(bytes)
+                .map_err(|_| EINVAL)
+        })?;
+        if !vm.covers_range(
+            G17P_CONTROL_OPERAND_TABLE_VA,
+            g17_initdata::CONTROL_OPERAND_TABLE_SIZE as u64,
+            true,
+            true,
+        ) || !all_ranges_covered(
+            (0..G17P_CONTROL_OPERAND_BUFFER_COUNT).map(|index| {
+                (
+                    g17p_control_operand_buffer_va(index).unwrap_or(0),
+                    G17P_CONTROL_OPERAND_BUFFER_SIZE as u64,
+                )
+            }),
+            |address, size| vm.covers_range(address, size, true, true),
+        ) {
+            return Err(EFAULT);
+        }
+        Ok(())
     }
 
     /// Restore the source-built class-1 closure before publishing live
@@ -4055,6 +4338,77 @@ impl G17ResourceOwner {
         Ok(())
     }
 
+    /// Stage the six-record readiness suffix around the context-2 host write,
+    /// then expose the complete batch through one final producer publication.
+    /// Mailbox ownership stays with the live-boot layer.
+    pub(crate) fn stage_compute_readiness_suffix(
+        &mut self,
+        activate_context2: impl FnOnce() -> Result,
+    ) -> Result<u32> {
+        let before = self.control_counters()?;
+        let producer = g17_initdata::CONTROL_OPENING_PRIMARY_PRODUCER;
+        if before.primary != [producer; 3]
+            || before.secondary
+                != [g17_initdata::CONTROL_OPENING_SECONDARY_PRODUCER; 3]
+        {
+            return Err(EINVAL);
+        }
+
+        let mut records =
+            [0u8; g17_initdata::COMPUTE_READINESS_RECORDS * g17_initdata::CONTROL_RECORD_SIZE];
+        for index in 0..g17_initdata::COMPUTE_READINESS_RECORDS {
+            let start = index * g17_initdata::CONTROL_RECORD_SIZE;
+            g17_initdata::encode_compute_readiness_record(
+                index,
+                &mut records[start..start + g17_initdata::CONTROL_RECORD_SIZE],
+            )
+            .map_err(|_| EINVAL)?;
+        }
+        let channels = g17_initdata::derive_channel_table(
+            InstanceRole::Primary,
+            self.handoff.primary.state_grid,
+            self.handoff.primary.instance.status_a,
+            self.handoff.primary.instance.main_config,
+            self.handoff.shared.hw_data_bundle,
+        );
+        let ring = channels[g17_initdata::CONTROL_CHANNEL_INDEX].ring;
+        let record_address = ring
+            .checked_add(producer as u64 * g17_initdata::CONTROL_RECORD_SIZE as u64)
+            .ok_or(EINVAL)?;
+        let offset: usize = record_address
+            .checked_sub(self.resources.shared_cluster.iova())
+            .ok_or(EINVAL)?
+            .try_into()?;
+        let end = offset.checked_add(records.len()).ok_or(EINVAL)?;
+        let first_len = 3 * g17_initdata::CONTROL_RECORD_SIZE;
+        self.resources.shared_cluster.with_bytes_mut(|bytes| {
+            let destination = bytes.get_mut(offset..end).ok_or(EINVAL)?;
+            if !destination.iter().all(|byte| *byte == 0) {
+                return Err(EINVAL);
+            }
+            destination[..first_len].copy_from_slice(&records[..first_len]);
+            Ok(())
+        })?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        activate_context2()?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        self.resources.shared_cluster.with_bytes_mut(|bytes| {
+            bytes
+                .get_mut(offset + first_len..end)
+                .ok_or(EINVAL)?
+                .copy_from_slice(&records[first_len..]);
+            Ok(())
+        })?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        write_control_counter(
+            &mut self.resources.primary_state,
+            g17_initdata::CHANNEL_STATE_PRODUCER,
+            g17_initdata::COMPUTE_READINESS_FINAL_COUNTER,
+        )?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        Ok(g17_initdata::COMPUTE_READINESS_FINAL_COUNTER)
+    }
+
     /// Store one live primary control record and publish only its producer.
     /// Mailbox ownership stays with the live-boot layer.
     pub(crate) fn publish_compute_runtime_control_record(
@@ -4158,6 +4512,7 @@ impl G17ResourceOwner {
         self.resources.compute_runtime_zero_buffer_1_mapping = None;
         self.resources.compute_runtime_table_alias = None;
         self.resources.compute_runtime_buffer_aliases.clear();
+        self.resources.compute_readiness_context1 = None;
         self.address_space
             .uat
             .restore_t8140_bootstrap_roots_after_processor_stop()?;
@@ -4320,6 +4675,28 @@ impl G17ResourceOwner {
             .compute_runtime_class1_table
             .with_bytes_mut(|bytes| {
                 g17_initdata::encode_compute_runtime_class1_table(bytes).map_err(|_| EINVAL)
+            })?;
+        self.resources
+            .compute_readiness_class1_support
+            .with_bytes_mut(|bytes| {
+                g17_initdata::encode_compute_readiness_class1_support(bytes)
+                    .map_err(|_| EINVAL)
+            })?;
+        self.resources
+            .compute_readiness_class1_state
+            .with_bytes_mut(|bytes| {
+                g17_initdata::encode_compute_readiness_state(bytes).map_err(|_| EINVAL)
+            })?;
+        self.resources
+            .compute_readiness_class3_support
+            .with_bytes_mut(|bytes| {
+                g17_initdata::encode_compute_readiness_class3_support(bytes)
+                    .map_err(|_| EINVAL)
+            })?;
+        self.resources
+            .compute_readiness_class3_state
+            .with_bytes_mut(|bytes| {
+                g17_initdata::encode_compute_readiness_state(bytes).map_err(|_| EINVAL)
             })?;
         let page_list = self
             .resources
@@ -4670,22 +5047,27 @@ impl G17ResourceOwner {
             .ring
             .checked_add(slot_index as u64 * 0x18)
             .ok_or(EINVAL)?;
+        let shared_cluster_iova = self.resources.shared_cluster.iova();
+        let shared_cluster_size = self.resources.shared_cluster.logical_size;
         let slot_offset: usize = slot_gpu_va
-            .checked_sub(self.resources.shared_cluster.iova())
+            .checked_sub(shared_cluster_iova)
             .ok_or(EINVAL)?
             .try_into()?;
-        if slot_offset.checked_add(0x18).ok_or(EINVAL)?
-            > self.resources.shared_cluster.logical_size
-        {
+        if slot_offset.checked_add(0x18).ok_or(EINVAL)? > shared_cluster_size {
             return Err(ERANGE);
         }
+        let main_config_offset: usize = self
+            .handoff
+            .primary
+            .instance
+            .main_config
+            .checked_sub(shared_cluster_iova)
+            .ok_or(EINVAL)?
+            .try_into()?;
         let ring_vmap = self.resources.shared_cluster.object.vmap()?;
         let ring = unsafe {
             // SAFETY: the checked slot lies inside the retained shared VMap.
-            core::slice::from_raw_parts(
-                ring_vmap.as_mut_ptr(),
-                self.resources.shared_cluster.logical_size,
-            )
+            core::slice::from_raw_parts(ring_vmap.as_mut_ptr(), shared_cluster_size)
         };
         let read_u32 = |offset: usize| -> Result<u32> {
             Ok(u32::from_le_bytes(
@@ -4710,9 +5092,81 @@ impl G17ResourceOwner {
             slot_queue: read_u64(slot_offset + 0x08)?,
             slot_kind: read_u32(slot_offset + 0x10)?,
             slot_flags: read_u32(slot_offset + 0x14)?,
+            runtime_descriptor_pointers: [
+                read_u64(main_config_offset + 0x120)?,
+                read_u64(main_config_offset + 0x130)?,
+            ],
         };
         core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
         Ok(snapshot)
+    }
+
+    pub(crate) fn snapshot_all_primary_work_channels(
+        &mut self,
+    ) -> Result<[G17PChannelScanSnapshot; G17P_DATA_MASTER_CHANNEL_COUNT]> {
+        const EMPTY: G17PChannelScanSnapshot = G17PChannelScanSnapshot {
+            table_index: 0,
+            ring: 0,
+            state_addresses: [0; 3],
+            cursors: [0; 3],
+            current_slot_index: 0,
+            current_slot_queue: 0,
+            current_slot_kind: 0,
+        };
+        let channels = g17_initdata::derive_channel_table(
+            InstanceRole::Primary,
+            self.handoff.primary.state_grid,
+            self.handoff.primary.instance.status_a,
+            self.handoff.primary.instance.main_config,
+            self.handoff.shared.hw_data_bundle,
+        );
+        let shared_cluster_iova = self.resources.shared_cluster.iova();
+        let shared_cluster_size = self.resources.shared_cluster.logical_size;
+        let ring_vmap = self.resources.shared_cluster.object.vmap()?;
+        let ring = unsafe {
+            // SAFETY: every derived primary work ring is inside this retained
+            // native shared-cluster mapping and each slot is bounds checked.
+            core::slice::from_raw_parts(ring_vmap.as_mut_ptr(), shared_cluster_size)
+        };
+        let mut snapshots = [EMPTY; G17P_DATA_MASTER_CHANNEL_COUNT];
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        for (index, channel) in channels
+            .into_iter()
+            .take(G17P_DATA_MASTER_CHANNEL_COUNT)
+            .enumerate()
+        {
+            let cursors = [
+                self.resources.primary_state.read_u32(channel.states[0])?,
+                self.resources.primary_state.read_u32(channel.states[1])?,
+                self.resources.primary_state.read_u32(channel.states[2])?,
+            ];
+            let current_slot_index = cursors[0] as u8;
+            let slot_gpu_va = channel
+                .ring
+                .checked_add(current_slot_index as u64 * 0x18)
+                .ok_or(EINVAL)?;
+            let offset: usize = slot_gpu_va
+                .checked_sub(shared_cluster_iova)
+                .ok_or(EINVAL)?
+                .try_into()?;
+            let end = offset.checked_add(0x18).ok_or(EINVAL)?;
+            let slot = ring.get(offset..end).ok_or(ERANGE)?;
+            snapshots[index] = G17PChannelScanSnapshot {
+                table_index: index as u8,
+                ring: channel.ring,
+                state_addresses: channel.states,
+                cursors,
+                current_slot_index,
+                current_slot_queue: u64::from_le_bytes(
+                    slot[0x08..0x10].try_into().map_err(|_| ERANGE)?,
+                ),
+                current_slot_kind: u32::from_le_bytes(
+                    slot[0x10..0x14].try_into().map_err(|_| ERANGE)?,
+                ),
+            };
+        }
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        Ok(snapshots)
     }
 
     /// Present the measured five status-B fields at the runtime boundary just
@@ -4987,6 +5441,22 @@ mod tests {
         assert_eq!(G17P_CL_CHANNEL_CONTROL_SIZE, 0x4000);
         assert_eq!(G17P_CL_LOW_VA_START, 0x70_0000_0000);
         assert_eq!(G17P_CL_LOW_VA_END, 0x71_0000_0000);
+        assert_eq!(
+            g17_initdata::COMPUTE_READINESS_CLASS1_SUPPORT_ADDRESS,
+            0xffff_fc20_c087_8000
+        );
+        assert_eq!(
+            g17_initdata::COMPUTE_READINESS_CLASS1_STATE_ADDRESS,
+            0xffff_fc20_0164_8000
+        );
+        assert_eq!(
+            g17_initdata::COMPUTE_READINESS_CLASS3_SUPPORT_ADDRESS,
+            0xffff_fc20_c085_0000
+        );
+        assert_eq!(
+            g17_initdata::COMPUTE_READINESS_CLASS3_STATE_ADDRESS,
+            0xffff_fc20_0165_0000
+        );
         assert_eq!(G17P_COMPUTE_DESCRIPTOR_SLOT_SIZE, 0x4000);
         assert_eq!(G17P_COMPUTE_DESCRIPTOR_SLOT_COUNT, 256);
         assert_eq!(G17P_COMPUTE_DESCRIPTOR_STORAGE_SIZE, 0x400000);
@@ -5003,6 +5473,40 @@ mod tests {
         );
         assert_eq!(g17_initdata::T8140_REGISTER_WINDOWS[17].slot, 41);
         assert_eq!(g17_initdata::T8140_REGISTER_FLAG_ONLY_SLOTS.len(), 17);
+    }
+
+    #[test]
+    fn compute_readiness_activation_record_is_distinct_from_the_cl_record() {
+        let mut shared = [0u8; G17P_CL_SHARED_SUPPORT_SIZE];
+        let mut support = [0u8; G17P_CL_SUPPORT_STATE_SIZE];
+        let mut scheduler = [0u8; G17P_CL_SUPPORT_STATE_SIZE];
+        let mut channel = [0u8; G17P_CL_CHANNEL_CONTROL_SIZE];
+        g17_submission::apply_g17p_cl_retained_static_state(
+            &mut shared,
+            &mut support,
+            &mut scheduler,
+            &mut channel,
+            0x70_0020_8000,
+            0xffff_fc20_0164_8000,
+            0xffff_fc20_0165_0000,
+        )
+        .unwrap();
+        let cl_before = channel[..g17_initdata::CONTROL_RECORD_SIZE].to_vec();
+        let activation = g17_initdata::COMPUTE_READINESS_ACTIVATION_RECORD_OFFSET;
+        assert!(channel[activation..activation + g17_initdata::CONTROL_RECORD_SIZE]
+            .iter()
+            .all(|byte| *byte == 0));
+        g17_initdata::encode_compute_readiness_activation_record(
+            &mut channel[activation..activation + g17_initdata::CONTROL_RECORD_SIZE],
+        )
+        .unwrap();
+        assert_eq!(&channel[..g17_initdata::CONTROL_RECORD_SIZE], cl_before);
+        assert!(channel[g17_initdata::CONTROL_RECORD_SIZE..activation]
+            .iter()
+            .all(|byte| *byte == 0));
+        assert_eq!(get_u64(&channel, activation), 0x0000_0100_0000_ffff);
+        assert_eq!(get_u64(&channel, activation + 0x20), 0x0002_0000_0000_0000);
+        assert_eq!(get_u64(&channel, activation + 0x30), 0x0000_0000_ff00_0000);
     }
 
     #[test]
@@ -5833,6 +6337,19 @@ mod tests {
         assert!(runtime.compute_runtime_ready());
         assert!(!runtime.opening_staged());
         assert!(!runtime.opening_retired());
+
+        let readiness_staged = G17PControlCounters {
+            primary: [4, 4, 10],
+            secondary: [16, 16, 16],
+        };
+        assert!(readiness_staged.compute_readiness_staged());
+        assert!(!readiness_staged.compute_readiness_retired());
+        let readiness_retired = G17PControlCounters {
+            primary: [10, 10, 10],
+            secondary: [16, 16, 16],
+        };
+        assert!(readiness_retired.compute_readiness_retired());
+        assert!(!readiness_retired.compute_readiness_staged());
     }
 
     fn valid_handoff() -> G17ResourceHandoff {

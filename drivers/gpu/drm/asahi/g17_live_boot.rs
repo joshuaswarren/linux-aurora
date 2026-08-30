@@ -41,8 +41,8 @@ use kernel::{devcoredump, new_mutex, sync::Mutex, time::msecs_to_jiffies};
 
 use crate::{
     driver::{AsahiDevice, T8140LiveTopologyAdmission},
-    g17_completion, g17_initdata, g17_lifecycle, g17_manager, g17_rtkit, g17_submission,
-    g17_uapi, gem, hw, identity, mmu, module_parameters, regs,
+    g17_completion, g17_lifecycle, g17_manager, g17_rtkit, g17_submission, g17_uapi, gem, hw,
+    identity, mmu, module_parameters, regs,
 };
 use kernel::sync::aref::ARef;
 
@@ -843,19 +843,13 @@ fn finish_boot_session(
         "G17P compute control: startup TA/3D retired at 3/3/3\n"
     );
 
-    // The output-positive paths never drain a runtime control tail here.
-    // A runtime 0x2e tick is staged immediately before a work kick, without
-    // any doorbell, and firmware consumes it together with that kick
-    // ("pending for next work kick"). The proxy hardware experiments proved
-    // the co-processor parks after the startup group (CPU_STATUS reads
-    // idle) and 0x84 announcements alone never wake it, which is exactly
-    // the [4, 4, 5] stall this synchronous drain produced. The 65-record
-    // tail in the native capture is the accumulated history of ticks
-    // coupled to 64 workloads, not a boot-time prerequisite. Tick zero is
-    // staged by the manager at the first compute submission instead.
+    // The accumulated 65-record capture history is not replayed at boot. The
+    // manager stages only the output-positive six-record readiness suffix at
+    // first CL bind and publishes its final producer once; the later EP21 work
+    // kick drains all six before firmware scans the CL priority rings.
     dev_info!(
         pdev.as_ref(),
-        "G17P compute control: runtime tick deferred to first work kick\n"
+        "G17P compute control: ctx1/ctx2 readiness suffix deferred to first CL kick\n"
     );
 
     let queue = manager.configure_g17p_compute_queue(drm, registers)?;
@@ -866,7 +860,7 @@ fn finish_boot_session(
     );
     dev_info!(
         pdev.as_ref(),
-        "G17P compute: candidate native-cl2-bundle-v1 armed\n"
+        "G17P compute: candidate native-cl2-readiness-v1 armed\n"
     );
     Ok(G17PBootedSession {
         cpus,
@@ -1371,6 +1365,8 @@ impl G17PLiveRuntime {
                         (Ok(snapshot), Ok(user_timestamps)) => {
                             let control = snapshot.control;
                             let channel = snapshot.channel;
+                            let channel_scan = snapshot.channel_scan;
+                            let channel_control_prefix = snapshot.channel_control_prefix;
                             let graph = snapshot.graph;
                             dev_err!(
                                 pdev.as_ref(),
@@ -1380,10 +1376,11 @@ impl G17PLiveRuntime {
                             );
                             dev_err!(
                                 pdev.as_ref(),
-                                "G17P compute timeout: CL_2 table={} ring={:#x} states={:#x?} cursors={:?} slot={} queue={:#x} kind={} flags={:#x} doorbell={:#x}\n",
+                                "G17P compute timeout: CL_2 table={} ring={:#x} state-ptrs(actual,mirror,producer)={:#x?} runtime-pointers(+120,+130)={:#x?} cursors(actual,mirror,producer)={:?} slot={} queue={:#x} kind={} flags={:#x} doorbell={:#x}\n",
                                 channel.table_index,
                                 channel.ring,
                                 channel.state_addresses,
+                                channel.runtime_descriptor_pointers,
                                 channel.cursors,
                                 channel.slot_index,
                                 channel.slot_queue,
@@ -1393,7 +1390,7 @@ impl G17PLiveRuntime {
                             );
                             dev_err!(
                                 pdev.as_ref(),
-                                "G17P compute timeout: inner queue={:#x} pointers={:#x} ring={:#x} done/read/write={:?} gpu-read={:?} uuid={:#x} context={:#x}\n",
+                                "G17P compute timeout: inner queue={:#x} pointers={:#x} ring={:#x} pointer[+0,+30,+40]={:?} queue[+18,+1c,+20]={:?} uuid={:#x} context={:#x}\n",
                                 graph.queue,
                                 graph.pointers,
                                 graph.item_ring,
@@ -1401,6 +1398,24 @@ impl G17PLiveRuntime {
                                 graph.gpu_read_cursors,
                                 graph.uuid,
                                 graph.queue_context
+                            );
+                            for scan in channel_scan {
+                                dev_err!(
+                                    pdev.as_ref(),
+                                    "G17P compute timeout: scan table={} ring={:#x} state-ptrs(actual,mirror,producer)={:#x?} cursors(actual,mirror,producer)={:?} current-slot={} queue={:#x} kind={}\n",
+                                    scan.table_index,
+                                    scan.ring,
+                                    scan.state_addresses,
+                                    scan.cursors,
+                                    scan.current_slot_index,
+                                    scan.current_slot_queue,
+                                    scan.current_slot_kind,
+                                );
+                            }
+                            dev_err!(
+                                pdev.as_ref(),
+                                "G17P compute timeout: channel-control[0..0x38]={:x?}\n",
+                                channel_control_prefix,
                             );
                             dev_err!(
                                 pdev.as_ref(),

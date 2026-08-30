@@ -338,7 +338,8 @@ pub(crate) struct G17PManagerConstruction {
     render_tracker: Option<G17PPartialOpeningRenderTracker>,
     render_bind: Option<mmu::VmBind>,
     render_submission_ordinal: u32,
-    runtime_tick_staged: bool,
+    compute_readiness_context2_bound: bool,
+    compute_readiness_staged: bool,
 }
 
 /// A queue which has completed the host's configuration pair and QID-enable
@@ -388,6 +389,9 @@ pub(crate) struct G17PComputeUserBinding {
 pub(crate) struct G17PComputeTimeoutSnapshot {
     pub(crate) graph: g17_resources::G17PComputeGraphSnapshot,
     pub(crate) channel: g17_resources::G17PComputeChannelSnapshot,
+    pub(crate) channel_scan:
+        [g17_resources::G17PChannelScanSnapshot; g17_resources::G17P_DATA_MASTER_CHANNEL_COUNT],
+    pub(crate) channel_control_prefix: [u8; 0x38],
     pub(crate) control: g17_resources::G17PControlCounters,
 }
 
@@ -452,7 +456,8 @@ impl G17PManagerConstruction {
                 render_tracker: None,
                 render_bind: None,
                 render_submission_ordinal: 0,
-                runtime_tick_staged: false,
+                compute_readiness_context2_bound: false,
+                compute_readiness_staged: false,
             },
             GFP_KERNEL,
         )?)
@@ -926,7 +931,10 @@ impl G17PManagerConstruction {
         {
             return Err(EBUSY);
         }
-        self.resources.reset_session_after_processor_stop()
+        self.resources.reset_session_after_processor_stop()?;
+        self.compute_readiness_context2_bound = false;
+        self.compute_readiness_staged = false;
+        Ok(())
     }
 
     pub(crate) fn retained_render_needs_recycle(&self, vm: &mmu::Vm) -> bool {
@@ -1128,11 +1136,14 @@ impl G17PManagerConstruction {
         {
             return Err(EINVAL);
         }
+        self.resources.prepare_compute_readiness_context1()?;
+        self.resources.validate_compute_readiness_context2(vm)?;
         let mappings = queue.compute.map_user_execution_state(vm)?;
         let vm_bind = self.resources.uat().bind(vm)?;
         if vm_bind.slot() != 1 || !mappings.all_reachable_from(vm) {
             return Err(EFAULT);
         }
+        self.compute_readiness_context2_bound = true;
         Ok(G17PComputeUserBinding {
             mappings,
             _vm_bind: vm_bind,
@@ -1265,7 +1276,7 @@ impl G17PManagerConstruction {
         queue: &mut G17PSksmQueue,
         prepared: g17_submission::PreparedG17PClKickEntry,
     ) -> Result<u64> {
-        self.stage_compute_runtime_tick_once()?;
+        self.stage_compute_readiness_once(queue)?;
         queue.storage.write_entry(
             prepared.entry_offset as usize,
             prepared.zero_length as usize,
@@ -1283,21 +1294,37 @@ impl G17PManagerConstruction {
         Ok(timestamp)
     }
 
-    /// Publish the first runtime 0x2e record without a control doorbell. Both
-    /// the retained-entry and initial-channel paths leave it pending for their
-    /// next work kick, matching the output-positive proxy sequence.
-    fn stage_compute_runtime_tick_once(&mut self) -> Result {
-        if !self.runtime_tick_staged {
-            // Stage the runtime 0x2e tick exactly the way the output-positive
-            // paths do: written and producer-published with no doorbell,
-            // pending for this work kick to consume. The parked co-processor
-            // never answers a bare 0x84 announcement for it.
-            let target = self.publish_compute_runtime_control_record(0)?;
-            self.runtime_tick_staged = true;
+    /// Stage the exact six-record ctx1/ctx2 suffix as one producer batch. The
+    /// caller's later EP21 work kick drains it before scanning CL2.
+    fn stage_compute_readiness_once(&mut self, queue: &mut G17PSksmQueue) -> Result {
+        if !self.compute_readiness_staged {
+            if !self.compute_readiness_context2_bound {
+                return Err(EINVAL);
+            }
+            let mut activation_address = None;
+            let target = self.resources.stage_compute_readiness_suffix(|| {
+                activation_address = Some(queue.storage.initialize_context2_activation_record()?);
+                Ok(())
+            })?;
+            let activation_address = activation_address.ok_or(EINVAL)?;
+            if target != g17_initdata::COMPUTE_READINESS_FINAL_COUNTER
+                || activation_address
+                    != queue
+                        .storage
+                        .channel_control_gpu_va()
+                        .checked_add(
+                            g17_initdata::COMPUTE_READINESS_ACTIVATION_RECORD_OFFSET as u64,
+                        )
+                        .ok_or(EINVAL)?
+            {
+                return Err(EINVAL);
+            }
+            self.compute_readiness_staged = true;
             dev_info!(
                 self.resources.dev().as_ref(),
-                "G17P compute control: runtime tick 0 staged for this kick (target {})\n",
-                target
+                "G17P compute readiness v1: ctx1 seq=35/35/36 activation={:#x} ctx2 seq=37/37/38 target={}\n",
+                activation_address,
+                target,
             );
         }
         Ok(())
@@ -1458,7 +1485,7 @@ impl G17PManagerConstruction {
             return Err(EINVAL);
         }
         self.publish_compute_b2_once(queue)?;
-        self.stage_compute_runtime_tick_once()?;
+        self.stage_compute_readiness_once(queue)?;
         queue
             .compute
             .publish_initial_config_update_pointer(group)?;
@@ -1639,6 +1666,8 @@ impl G17PManagerConstruction {
         Ok(G17PComputeTimeoutSnapshot {
             graph: queue.compute.snapshot_initial_channel_group()?,
             channel: self.resources.snapshot_compute_channel()?,
+            channel_scan: self.resources.snapshot_all_primary_work_channels()?,
+            channel_control_prefix: queue.storage.snapshot_channel_control_prefix()?,
             control: self.resources.control_counters()?,
         })
     }

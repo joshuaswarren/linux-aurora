@@ -2584,7 +2584,7 @@ pub(crate) const G17P_CL_KICK_PUBLICATION_ORDER: [G17PClKickPublicationStep; 7] 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum G17PFirstSubmitPublicationStep {
     PublishB2,
-    StageRuntimeTick,
+    StageComputeReadinessSuffix,
     PublishConfigUpdatePointer,
     ZeroSksmStride,
     WriteSksmEntry,
@@ -2602,7 +2602,7 @@ pub(crate) enum G17PFirstSubmitPublicationStep {
 
 pub(crate) const G17P_FIRST_SUBMIT_PUBLICATION_ORDER: [G17PFirstSubmitPublicationStep; 15] = [
     G17PFirstSubmitPublicationStep::PublishB2,
-    G17PFirstSubmitPublicationStep::StageRuntimeTick,
+    G17PFirstSubmitPublicationStep::StageComputeReadinessSuffix,
     G17PFirstSubmitPublicationStep::PublishConfigUpdatePointer,
     G17PFirstSubmitPublicationStep::ZeroSksmStride,
     G17PFirstSubmitPublicationStep::WriteSksmEntry,
@@ -5334,7 +5334,7 @@ mod tests {
             G17P_FIRST_SUBMIT_PUBLICATION_ORDER,
             [
                 G17PFirstSubmitPublicationStep::PublishB2,
-                G17PFirstSubmitPublicationStep::StageRuntimeTick,
+                G17PFirstSubmitPublicationStep::StageComputeReadinessSuffix,
                 G17PFirstSubmitPublicationStep::PublishConfigUpdatePointer,
                 G17PFirstSubmitPublicationStep::ZeroSksmStride,
                 G17PFirstSubmitPublicationStep::WriteSksmEntry,
