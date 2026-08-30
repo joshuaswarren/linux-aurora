@@ -236,7 +236,7 @@ fn log_g17p_mailbox_snapshot(
     dev: &kernel::device::Device,
     mailbox: &G17PMailboxProvider,
     checkpoint: &'static str,
-) {
+) -> Result<G17PMailboxSnapshot> {
     match mailbox.snapshot() {
         Ok(snapshot) => {
             let a2i = snapshot.a2i_control;
@@ -259,14 +259,18 @@ fn log_g17p_mailbox_snapshot(
                 G17PMailboxSnapshot::read_pointer(i2a),
                 G17PMailboxSnapshot::write_pointer(i2a),
                 G17PMailboxSnapshot::enabled(i2a),
-            )
+            );
+            Ok(snapshot)
         }
-        Err(error) => dev_err!(
-            dev,
-            "G17P mailbox-control checkpoint={} read failed ({:?})\n",
-            checkpoint,
-            error,
-        ),
+        Err(error) => {
+            dev_err!(
+                dev,
+                "G17P mailbox-control checkpoint={} read failed ({:?})\n",
+                checkpoint,
+                error,
+            );
+            Err(error)
+        }
     }
 }
 
@@ -1085,6 +1089,10 @@ fn finish_boot_session(
         pdev.as_ref(),
         "G17P diagnostic: j700-a000-ep21-ingress-v1 armed\n"
     );
+    dev_info!(
+        pdev.as_ref(),
+        "G17P diagnostic: j700-a000-type4-redoorbell-v1 armed\n"
+    );
     Ok(G17PBootedSession {
         cpus,
         gfx_state,
@@ -1441,7 +1449,7 @@ impl G17PLiveRuntime {
                 staged.secondary,
                 g17_submission::G17P_READINESS_CONTROL_DONE_MESSAGE,
             );
-            log_g17p_mailbox_snapshot(
+            let _ = log_g17p_mailbox_snapshot(
                 self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
                 self.cpus.as_ref().ok_or(ENODEV)?.gfx(),
                 phase,
@@ -1473,7 +1481,7 @@ impl G17PLiveRuntime {
                     error,
                 ),
             }
-            log_g17p_mailbox_snapshot(
+            let _ = log_g17p_mailbox_snapshot(
                 self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
                 self.cpus.as_ref().ok_or(ENODEV)?.gfx(),
                 "readiness-post-0x84",
@@ -1486,12 +1494,80 @@ impl G17PLiveRuntime {
             {
                 Ok(retired) => retired,
                 Err(error) => {
-                    log_g17p_mailbox_snapshot(
+                    let timeout_snapshot = log_g17p_mailbox_snapshot(
                         self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
                         self.cpus.as_ref().ok_or(ENODEV)?.gfx(),
-                        "readiness-timeout",
+                        "readiness-first-timeout",
+                    )?;
+                    let a2i = timeout_snapshot.a2i_control;
+                    let first_target = boundary.index == 0
+                        && boundary.producer_before == 4
+                        && boundary.producer_after == 5;
+                    let physically_dequeued = G17PMailboxSnapshot::empty(a2i)
+                        && !G17PMailboxSnapshot::full(a2i)
+                        && G17PMailboxSnapshot::count(a2i) == 0
+                        && G17PMailboxSnapshot::read_pointer(a2i)
+                            == G17PMailboxSnapshot::write_pointer(a2i);
+                    if !first_target || !physically_dequeued {
+                        dev_err!(
+                            self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                            "G17P type4 re-doorbell refused: index={} producer={}->{} a2i={:#x} dequeued={}\n",
+                            boundary.index,
+                            boundary.producer_before,
+                            boundary.producer_after,
+                            a2i,
+                            physically_dequeued,
+                        );
+                        return Err(error);
+                    }
+
+                    dev_info!(
+                        self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                        "G17P type4 re-doorbell: first target5 timed out after physical dequeue; resending {:#x} with record and producer unchanged\n",
+                        g17_submission::G17P_READINESS_CONTROL_DONE_MESSAGE,
                     );
-                    return Err(error);
+                    Pin::new(self.gfx_rtkit.as_mut().ok_or(ENODEV)?).send_message(
+                        g17_rtkit::ENDPOINT_GFX_INTERRUPTS,
+                        g17_submission::G17P_READINESS_CONTROL_DONE_MESSAGE,
+                    )?;
+                    #[cfg(CONFIG_DEV_COREDUMP)]
+                    match pending_probe.observe_mask(1 << 17, 256) {
+                        Ok(observation) => dev_info!(
+                            self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                            "G17P type4 re-doorbell pending first={:#x} last={:#x} or={:#x} mask-seen={} polls={}\n",
+                            observation.first,
+                            observation.last,
+                            observation.observed_or,
+                            observation.mask_seen,
+                            observation.polls,
+                        ),
+                        Err(probe_error) => dev_err!(
+                            self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                            "G17P type4 re-doorbell pending observation failed ({:?})\n",
+                            probe_error,
+                        ),
+                    }
+                    let _ = log_g17p_mailbox_snapshot(
+                        self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                        self.cpus.as_ref().ok_or(ENODEV)?.gfx(),
+                        "readiness-redoorbell-post-0x84",
+                    );
+                    match self
+                        .manager
+                        .as_mut()
+                        .ok_or(ENODEV)?
+                        .wait_compute_readiness_record_retirement(boundary.producer_after)
+                    {
+                        Ok(retired) => retired,
+                        Err(retry_error) => {
+                            let _ = log_g17p_mailbox_snapshot(
+                                self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                                self.cpus.as_ref().ok_or(ENODEV)?.gfx(),
+                                "readiness-redoorbell-timeout",
+                            );
+                            return Err(retry_error);
+                        }
+                    }
                 }
             };
             dev_info!(
