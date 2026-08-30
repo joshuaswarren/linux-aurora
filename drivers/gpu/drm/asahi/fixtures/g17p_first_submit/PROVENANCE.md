@@ -55,6 +55,11 @@ The retained channel pointer ring is `0x500` qwords at graph `+0x4000`, ending
 at `+0x6800`. Tag 15 and tag 16 storage is placed after it at aligned offsets
 `+0x6800` and `+0x6c00`; neither object overlaps a repeat-submit ring slot.
 
+Tag 15 `+0x08/+0x10` are the low and high GPU aliases of the same retained
+`0x20000` SKSM entry backing (native KSM queue `+0x80/+0x88`). They are not
+aliases of the classic CL2 queue-context record. The relocation mask covers
+both complete qwords independently while their backing offset remains equal.
+
 T8140 G17P leaves the dedicated `AGXSKSMFlushID` feature bit clear. The first
 host descriptor therefore uses logical fallback ID `0`; that value is absent
 from tag 15 and needs no completion release. The taken descriptor-correlation

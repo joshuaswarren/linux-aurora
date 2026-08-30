@@ -49,7 +49,8 @@ const PRIMARY_STATUS_A_STATE_GRID_OFFSET: u64 = 0xee40;
 const SECONDARY_EXTRA_0_BEFORE_PRIMARY_STATUS_A: u64 = 0x6c0;
 const SECONDARY_HWDATA_STATE_OFFSET: u64 = 0x3c0;
 const FWCTL_SIZE: usize = 0x4000;
-pub(crate) const G17P_CL_ENTRY_STORAGE_SIZE: usize = 0x20000;
+pub(crate) const G17P_CL_ENTRY_STORAGE_SIZE: usize =
+    g17_compute::COMPUTE_SKSM_ENTRY_BACKING_SIZE;
 pub(crate) const G17P_CL_SHARED_SUPPORT_SIZE: usize = 0x4000;
 pub(crate) const G17P_CL_B2_OBJECT_SIZE: usize = 0x4000;
 pub(crate) const G17P_CL_CHANNEL_CONTROL_SIZE: usize = 0x4000;
@@ -1250,6 +1251,9 @@ fn map_t8140_register_windows(
 #[cfg(not(test))]
 pub(crate) struct G17PClRuntimeStorage {
     entries: MappedObject,
+    /// Upper-root alias of the exact GEM subrange owned by `entries`.
+    /// `KernelMapping` retains its own GEM reference for the full alias life.
+    entries_high: mmu::KernelMapping,
     shared_support: MappedObject,
     channel_control: MappedObject,
     support_state: MappedObject,
@@ -1675,12 +1679,11 @@ impl G17PComputeDescriptorStorage {
     pub(crate) fn stage_initial_channel_group_without_fallback_event(
         &mut self,
         descriptor: u64,
-        context_low: u64,
+        sksm_entries: g17_compute::ComputeSksmEntryAliases,
         shared_control: u64,
         channel_control: u64,
     ) -> Result<g17_compute::ComputeChannelGroupAddresses> {
         let queue = self.queue_graph.iova();
-        let context_high = self.queue_context_high.iova();
         let graph_vmap = self.queue_graph.object.vmap()?;
         let context_vmap = self.queue_context_high.object.vmap()?;
         let graph = unsafe {
@@ -1697,8 +1700,7 @@ impl G17PComputeDescriptorStorage {
         let mut group = g17_compute::build_initial_compute_channel_group(
             queue,
             descriptor,
-            context_low,
-            context_high,
+            sksm_entries,
             shared_control,
             channel_control,
             graph,
@@ -2928,6 +2930,20 @@ impl G17PClRuntimeStorage {
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
+        // Native queue +0x80/+0x88 name the lower and upper mappings of one
+        // 0x20000 SKSM entry allocation. Alias the existing KernelMapping's
+        // exact GEM subrange so size, backing identity, and protections cannot
+        // diverge from the lower mapping.
+        let entries_high = entries.mapping.map_alias_into_range(
+            uat.kernel_vm(),
+            uat.kernel_va_range()?,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+        if entries.mapping.size() != G17P_CL_ENTRY_STORAGE_SIZE
+            || entries_high.size() != G17P_CL_ENTRY_STORAGE_SIZE
+        {
+            return Err(EINVAL);
+        }
         let shared_support = MappedObject::new_wc(
             dev,
             uat,
@@ -2966,6 +2982,7 @@ impl G17PClRuntimeStorage {
 
         Ok(Self {
             entries,
+            entries_high,
             shared_support,
             channel_control,
             support_state,
@@ -2976,6 +2993,15 @@ impl G17PClRuntimeStorage {
 
     pub(crate) fn entry_gpu_va(&self) -> u64 {
         self.entries.iova()
+    }
+
+    /// Return the two GPU aliases of the same retained SKSM entry backing.
+    pub(crate) fn entry_aliases(&self) -> Result<g17_compute::ComputeSksmEntryAliases> {
+        g17_compute::ComputeSksmEntryAliases::new(
+            self.entries.iova(),
+            self.entries_high.iova(),
+        )
+        .map_err(|_| EINVAL)
     }
 
     pub(crate) fn shared_support_gpu_va(&self) -> u64 {
@@ -4969,19 +4995,20 @@ mod tests {
             include_bytes!("fixtures/g17p_first_submit/channel-state-after-tag16.bin");
         const QUEUE: u64 = 0xffff_fc20_c000_0300;
         const DESCRIPTOR: u64 = 0xffff_fc20_c035_8000;
-        const CONTEXT_LOW: u64 = 0x70_004d_8000;
-        const CONTEXT_HIGH: u64 = 0xffff_fc20_0027_8000;
+        const ENTRY_LOW: u64 = 0x70_004d_8000;
+        const ENTRY_HIGH: u64 = 0xffff_fc20_0027_8000;
         const SHARED_SUPPORT: u64 = 0xffff_fc20_c087_0000;
         const CHANNEL_CONTROL: u64 = 0xffff_fc20_c07b_8040;
 
         let mut graph = [0u8; g17_compute::COMPUTE_QUEUE_GRAPH_SIZE];
         g17_compute::build_compute_queue_graph(QUEUE, CHANNEL_CONTROL, &mut graph).unwrap();
         let mut context = vec![0u8; g17_compute::COMPUTE_QUEUE_CONTEXT_EXTENT];
+        let sksm_entries =
+            g17_compute::ComputeSksmEntryAliases::new(ENTRY_LOW, ENTRY_HIGH).unwrap();
         g17_compute::build_initial_compute_channel_group(
             QUEUE,
             DESCRIPTOR,
-            CONTEXT_LOW,
-            CONTEXT_HIGH,
+            sksm_entries,
             SHARED_SUPPORT,
             CHANNEL_CONTROL,
             &mut graph,
@@ -4991,11 +5018,54 @@ mod tests {
         let actual = &graph
             [g17_compute::COMPUTE_OPTIONAL..g17_compute::COMPUTE_OPTIONAL + TAG15.len()];
         assert_eq!(actual, *TAG15);
+        assert_eq!(get_u64(actual, 0x08), sksm_entries.low());
+        assert_eq!(get_u64(actual, 0x10), sksm_entries.high());
+        assert_eq!(
+            sksm_entries.range_at(0x200, 0x200).unwrap(),
+            [ENTRY_LOW + 0x200, ENTRY_HIGH + 0x200]
+        );
         assert!(RELOCATION_MASK.iter().any(|byte| *byte != 0));
         for index in 0..TAG15.len() {
             assert_eq!(
                 actual[index] & !RELOCATION_MASK[index],
                 TAG15[index] & !RELOCATION_MASK[index]
+            );
+        }
+
+        // Moving the two mappings of the same backing changes only the two
+        // address qwords selected by the admitted relocation mask.
+        let relocated = g17_compute::ComputeSksmEntryAliases::new(
+            ENTRY_LOW + 0x4000,
+            ENTRY_HIGH + 0x8000,
+        )
+        .unwrap();
+        let mut relocated_graph = [0u8; g17_compute::COMPUTE_QUEUE_GRAPH_SIZE];
+        g17_compute::build_compute_queue_graph(
+            QUEUE,
+            CHANNEL_CONTROL,
+            &mut relocated_graph,
+        )
+        .unwrap();
+        let mut relocated_context = vec![0u8; g17_compute::COMPUTE_QUEUE_CONTEXT_EXTENT];
+        g17_compute::build_initial_compute_channel_group(
+            QUEUE,
+            DESCRIPTOR,
+            relocated,
+            SHARED_SUPPORT,
+            CHANNEL_CONTROL,
+            &mut relocated_graph,
+            &mut relocated_context,
+        )
+        .unwrap();
+        let relocated_actual = &relocated_graph
+            [g17_compute::COMPUTE_OPTIONAL..g17_compute::COMPUTE_OPTIONAL + TAG15.len()];
+        assert_eq!(get_u64(relocated_actual, 0x08), relocated.low());
+        assert_eq!(get_u64(relocated_actual, 0x10), relocated.high());
+        assert_eq!(relocated_context, context);
+        for index in 0..TAG15.len() {
+            assert_eq!(
+                relocated_actual[index] & !RELOCATION_MASK[index],
+                actual[index] & !RELOCATION_MASK[index]
             );
         }
 

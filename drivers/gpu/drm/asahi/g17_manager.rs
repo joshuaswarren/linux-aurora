@@ -1409,11 +1409,12 @@ impl G17PManagerConstruction {
             &mut entry_signal,
         )
         .map_err(|_| EINVAL)?;
+        let sksm_entry_aliases = queue.storage.entry_aliases()?;
         let group = queue
             .compute
             .stage_initial_channel_group_without_fallback_event(
                 descriptor_high,
-                user_layout.queue_context,
+                sksm_entry_aliases,
                 shared_control,
                 queue.storage.channel_control_gpu_va(),
             )?;
@@ -1456,9 +1457,11 @@ impl G17PManagerConstruction {
         queue.producer.last_add_kicks_timestamp = prepared_entry.current_timestamp;
         dev_info!(
             self.resources.dev().as_ref(),
-            "G17P compute: candidate g17p-direct-first-v3 qid {} entry_offset {:#x} timestamp {:#x} descriptor_generation {} tag15_producer 2 tag16_producer 3 correlation_token {}\n",
+            "G17P compute: candidate g17p-direct-first-v4 qid {} entry_offset {:#x} entry_low {:#x} entry_high {:#x} timestamp {:#x} descriptor_generation {} tag15_producer 2 tag16_producer 3 correlation_token {}\n",
             queue.queue_id,
             prepared_entry.entry_offset,
+            sksm_entry_aliases.low(),
+            sksm_entry_aliases.high(),
             prepared_entry.current_timestamp,
             descriptor_generation,
             lifecycle.correlation_token
