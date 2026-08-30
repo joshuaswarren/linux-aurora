@@ -343,16 +343,21 @@ to 87.516 ms, but EP1 still followed ACK5 by 115 microseconds. This disproves
 both the warning perturbation and an approximately 100 ms timer as the cause.
 The endpoint bookkeeping fix remains correct.
 
-## Exact EP1 reply and disproven early dispatch
+## Exact EP1 request classification and disproven early dispatch
 
-The current Linux EP1 reply is not the reply selected by native RTBuddy for
-the observed request. Request `0x12610008784000` has bit 54 clear. In
-`RTBuddyCrashlogEndpoint::_messageHandler`, the test at native kernelcache
-address `0xfffffe000b1fc1bc` therefore branches to
-`0xfffffe000b1fc2f0`. The response constructed at
-`0xfffffe000b1fc380..0xfffffe000b1fc3c0` contains the buffer DVA in bits 43
-through 0, the size in bits 51 through 44, and the selected page-size bit. It
-does not set bit 54.
+Request `0x12610008784000` has bit 54 clear, but that bit alone does not make
+it a buffer request. Native `RTBuddyCrashlogEndpoint::_messageHandler` first
+checks whether endpoint offset `0xa8` already holds a crashlog buffer. On a
+live inherited session it does. Because the word also has a nonzero DVA, the
+branch at native kernelcache address `0xfffffe000b1fc158` invalidates that
+existing buffer, records crash state 2 at endpoint offset `0x124`, and
+tail-calls `handleCrashlog(false)` at `0xfffffe000b1fc1b0`. It sends no reply.
+
+Linux starts with an empty local `crashlog_buffer`, so the generic handler
+instead enters the fresh-buffer branch at `0xfffffe000b1fc2f0`. If that branch
+is used, the response constructed at `0xfffffe000b1fc380..0xfffffe000b1fc3c0`
+contains the buffer DVA in bits 43 through 0, the size in bits 51 through 44,
+and the selected page-size bit. It does not set bit 54.
 
 The bit-54, no-DVA response at
 `0xfffffe000b1fc298..0xfffffe000b1fc2e0` belongs only to an incoming request
@@ -362,11 +367,12 @@ uses the native size selector, and leaves bit 54 clear. For the observed
 0x26000-byte request and its DVA, the exact response is the original word
 `0x12610008784000`.
 
-This mismatch cannot explain ACK5's already-proven physical dequeue. It does
-combine with a host scheduling mismatch: native RTBuddy dispatches the
-crashlog endpoint independently of DCPLink, while Linux queues EP1 and EP37 on
-one ordered RTKit worker. Linux's built-in RTKit core only offers its atomic
-early callback to application endpoints at or above `0x20`.
+The missing inherited endpoint object cannot explain ACK5's already-proven
+physical dequeue. It does combine with a host scheduling mismatch: native
+RTBuddy dispatches the crashlog endpoint independently of DCPLink, while Linux
+queues EP1 and EP37 on one ordered RTKit worker. Linux's built-in RTKit core
+only offers its atomic early callback to application endpoints at or above
+`0x20`.
 
 Commit `e0669808e8968` tested the scheduling difference without modifying
 DCPLink traffic. It wrapped only the adopted DCP mailbox receive callback,
@@ -390,24 +396,94 @@ classification      consumed 0, pending 1
 
 A401 still timed out at callback 182 with three nested replies. The response
 was admitted immediately but remained the sole unread A2I entry. This
-eliminates the exact EP1 payload and Linux's shared EP1/EP37 worker as causes.
-DCP had already stopped draining A2I after consuming ACK5. The mailbox-wrapper
-diagnostic was removed; only the exact native reply correction remains.
+eliminates the fresh-buffer reply payload and Linux's shared EP1/EP37 worker
+as causes. DCP had already stopped draining A2I after consuming ACK5. The
+mailbox-wrapper diagnostic was removed. The fallback fresh-buffer response is
+now wire-correct, but native's inherited-buffer path establishes that this
+specific word is a crash notification and needs no response.
 
 ## Timeout crashlog discriminator
 
 The adopted path does not send a new STARTEP for EP1. It marks the system
 endpoint as inherited from the previous owner and starts only the mailbox.
 The fixed firmware DVA in the EP1 word therefore names the previous owner's
-already-established crashlog buffer. Its arrival immediately after ACK5 is
-consistent with the non-returning root abort path, but the first Linux worker
-read occurs while the notification is still being handled and has not found a
-`CLHE` header in retained runs.
+already-established crashlog buffer. Native's message-handler branch proves
+that its arrival immediately after ACK5 is a crash notification, not a buffer
+request. The first Linux worker read can occur while the record is still being
+published and has not found a `CLHE` header in retained runs.
 
-The next diagnostic rereads that existing Normal-NC mapping only after the
+The timeout diagnostic rereads that existing Normal-NC mapping only after the
 three-second A401 timeout. It sends no mailbox word and changes no callback or
-wait timing. `DCP25G83_A401_CRASHLOG_TIMEOUT ... reported 1` is a direct root
-crash result; the existing parser then prints the crash strings and firmware
-version. `reported 0` plus the raw 32-byte header means the crash record is
-absent or not AP-visible and leaves reply-association versus release-tail
-abort unresolved.
+wait timing. The first run exposed the multi-generation header signature
+`0x434c4748` (CLGH) rather than the older direct CLHE layout.
+
+The native selector is
+`RTBuddyCrashlogDecoder::_multiCrashlogFindFirstCrash` at
+`0xfffffe000b20553c`. Its exact CLGH layout is:
+
+| Offset | Size | Meaning |
+| ---: | ---: | --- |
+| `0x00` | 4 | signature `0x434c4748` |
+| `0x04` | 4 | version; byte 1 must equal 2 |
+| `0x08` | 4 | total buffer size |
+| `0x0c` | 4 | current generation ID |
+| `0x10` | 4 | record count |
+| `0x14` | `count * 0x18` | generation records |
+
+Each record begins with a 64-bit generation ID and contains its 32-bit payload
+offset at `+0x10`. Native chooses the record whose ID equals the header's
+current ID. If that payload also begins with CLGH, it repeats the same lookup;
+otherwise `decodeLog` requires CLHE signature `0x434c4845` and version byte 1
+equal to 3. This makes the selected Crg8 and Cstr sections current-generation
+evidence rather than a scan which could find a stale record.
+
+Native rejects a selected CLHE while flags bit 8 is set. It also requires the
+final 32 bytes at `selected + total_size - 0x20` to exactly match the initial
+CLHE header and constrains all sections to the range between those headers.
+For Crg8, payload word `+0x4` must equal `0x348`; payload word `+0x0` bit 16
+marks the register record non-decodable. Only after those gates is PC read at
+payload `+0x108` (section `+0x118`). The timeout observer and offline parser
+both enforce these conditions.
+
+The observed recovery-boot bytes
+`48474c43020200000060020055344c430200000055344c430000000000000000`
+decode as size `0x26000`, current ID `0x434c3455`, count 2, and record-zero ID
+`0x434c3455`. They stop before record zero's payload offset at outer offset
+`0x24`, so that non-comparable run cannot identify a PC.
+
+The corrected timeout observer follows the native current-generation chain,
+then prints Crg8 PC/SP/PSR/FAR/ESR and Cstr messages. A valid pristine A401 run
+with `DCP25G83_A401_CRASHLOG_CRG8` will distinguish the EP37 invalid-stream
+abort from an object-release abort by its exact firmware PC and crash string.
+
+## Queued post-A401 H17P callback table correction
+
+This is downstream ABI evidence and must not be folded into the crash-PC
+diagnostic. The exact native H17P A4xx table from A442 onward is an older
+revision than Linux currently models:
+
+| Native tag | Contract | Current Linux tag |
+| --- | --- | --- |
+| A449 | set_parameter, input `0x28`, output `0x4` | A442 |
+| A453 | create_default_frame_buffer, input `0`, output `0x4` | A446 |
+| A457 | video power savings, input `0x4`, output `0x4` | A450 |
+| A465 | first_client_open, input `0`, output `0` | A457 |
+| A466 | last_client_close, input `0x4`, output `0x4` | A458 |
+| A474 | display refresh properties, input `0`, output `0x4` | A465 |
+| A477 | supports_power, input `0x4`, output `0` | A468 |
+| A478 | abort_swaps, input `0x8`, output `0x4` | A469 |
+| A483 | power_state, input `0x10`, output `0x8` | A473 |
+
+Native also inserts A446 `check_task_status` (`0x0c`/`0x4`) and A468
+`flush_debug_flags` (`0x4`/`0`). The corrected D120 nested sequence is A389,
+A453, A024, A477 returning true, A000, then A474. Apply and test this table as
+a separate post-A401 change only.
+
+The same downstream correction moves bandwidth allocation back to D129 and
+adds the native tail calls which current H17P lacks:
+
+- D130 `update_ext_pipe_count(bool, bool, u32)`: input `0x08`, output `0`;
+  bools at `+0`/`+1`, unaligned u32 at `+2`, and two padding bytes.
+- D131 `get_ext_pipe_count(u32 *, u32 *, u32 *)`: input `0x10`, output `0x0c`;
+  three u32 values at `+0`/`+4`/`+8`, null bytes at `+0c`/`+0d`/`+0e`, and
+  padding at `+0f`; output is three u32 values.
