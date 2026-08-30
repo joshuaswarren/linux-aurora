@@ -343,7 +343,7 @@ to 87.516 ms, but EP1 still followed ACK5 by 115 microseconds. This disproves
 both the warning perturbation and an approximately 100 ms timer as the cause.
 The endpoint bookkeeping fix remains correct.
 
-## Exact EP1 reply and dispatch candidate
+## Exact EP1 reply and disproven early dispatch
 
 The current Linux EP1 reply is not the reply selected by native RTBuddy for
 the observed request. Request `0x12610008784000` has bit 54 clear. In
@@ -356,9 +356,11 @@ does not set bit 54.
 
 The bit-54, no-DVA response at
 `0xfffffe000b1fc298..0xfffffe000b1fc2e0` belongs only to an incoming request
-whose bit 54 is set. Linux currently sends `0x52600000000000`, which takes
-that other form. For the observed 0x26000-byte request and its DVA, the exact
-native-shaped response is the original word `0x12610008784000`.
+whose bit 54 is set. Linux previously sent `0x52600000000000`, which takes
+that other form. The retained worker-path correction now includes the DVA,
+uses the native size selector, and leaves bit 54 clear. For the observed
+0x26000-byte request and its DVA, the exact response is the original word
+`0x12610008784000`.
 
 This mismatch cannot explain ACK5's already-proven physical dequeue. It does
 combine with a host scheduling mismatch: native RTBuddy dispatches the
@@ -366,18 +368,28 @@ crashlog endpoint independently of DCPLink, while Linux queues EP1 and EP37 on
 one ordered RTKit worker. Linux's built-in RTKit core only offers its atomic
 early callback to application endpoints at or above `0x20`.
 
-The appledrm-only candidate wraps the adopted DCP mailbox receive callback.
-It intercepts only the first H17P EP1 type-1 word with bit 54 clear, a nonzero
-size, and a nonzero DVA. It snapshots A2I, echoes the raw word synchronously,
-logs the receive timestamp and before/after controls, and suppresses that
-word's later ordered-worker copy. Every other endpoint and later EP1 word is
-delegated to the unchanged RTKit callback. This leaves buffer mapping and
-crash reporting deferred and does not require replacing the built-in RTKit
-core.
+Commit `e0669808e8968` tested the scheduling difference without modifying
+DCPLink traffic. It wrapped only the adopted DCP mailbox receive callback,
+intercepted the first matching EP1 word, and echoed the exact raw request from
+atomic receive context.
 
-The unique marker is `DCP25G83_EP1_EARLY_ECHO`. If A401 still times out,
-`DCP25G83_EP1_EARLY_TIMEOUT` compares the same before/after pointers with the
-terminal FIFO state and reports `consumed` and `pending`. D120 or the outer
-A401 reply after consumption supports cross-endpoint scheduling as the
-blocker. A response that remains pending, or is consumed without D120,
-eliminates that scheduling explanation.
+Fresh-session log:
+
+`neo-bringup/logs/dcp-appledrm-25g83-ep1-early-e066980-20260829-205545.log`
+
+The exact result was:
+
+```
+EP1 raw RX/echo     0x12610008784000
+RX timestamp        33376211990 ns
+A2I before/after    0x20001 -> 0x100101
+send result         0
+A2I at timeout      0x100101
+classification      consumed 0, pending 1
+```
+
+A401 still timed out at callback 182 with three nested replies. The response
+was admitted immediately but remained the sole unread A2I entry. This
+eliminates the exact EP1 payload and Linux's shared EP1/EP37 worker as causes.
+DCP had already stopped draining A2I after consuming ACK5. The mailbox-wrapper
+diagnostic was removed; only the exact native reply correction remains.
