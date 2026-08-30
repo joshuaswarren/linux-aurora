@@ -68,6 +68,7 @@ const CONTROL_START_TYPE: u16 = 0x89;
 const INITDATA_ACK_POLLS: usize = 200;
 const CONTROL_COUNTER_POLLS: usize = 100;
 const G17P_CRASHLOG_MAX_BYTES: usize = 256 * 1024;
+const G17P_STATUS_A_TIGHT_SCAN_SAMPLES: u32 = 32 * 1024;
 const G17P_RTKIT_UAT_DVA_MASK: u64 = (1u64 << 40) - 1;
 
 /// Module-local, read-only view of one existing ASCWrap mailbox provider.
@@ -1473,6 +1474,31 @@ impl G17PLiveRuntime {
                         Ok(()) => Err(error),
                         Err(recovery_error) => Err(recovery_error),
                     };
+                }
+                match self
+                    .manager
+                    .as_mut()
+                    .ok_or(ENODEV)
+                    .and_then(|manager| {
+                        manager.observe_status_a_work_scan_tight(
+                            G17P_STATUS_A_TIGHT_SCAN_SAMPLES,
+                        )
+                    }) {
+                    Ok(observation) => dev_info!(
+                        self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                        "G17P Status-A tight scan checkpoint=native-first-immediate-post-0x10 address={:#x} first={} last={} or={} transitions={} samples={}\n",
+                        observation.scan_address,
+                        observation.first,
+                        observation.last,
+                        observation.observed_or,
+                        observation.transitions,
+                        observation.samples,
+                    ),
+                    Err(error) => dev_err!(
+                        self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                        "G17P Status-A tight scan checkpoint=native-first-immediate-post-0x10 read failed ({:?})\n",
+                        error,
+                    ),
                 }
                 log_g17p_a2i_control(
                     self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),

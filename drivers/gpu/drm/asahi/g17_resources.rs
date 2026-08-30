@@ -693,6 +693,42 @@ impl G17PStatusASnapshot {
     }
 }
 
+/// Aggregate from a bounded run of consecutive volatile reads of the
+/// cache-coherent Status-A work-scan word.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PStatusATightScanObservation {
+    pub(crate) scan_address: u64,
+    pub(crate) first: u32,
+    pub(crate) last: u32,
+    pub(crate) observed_or: u32,
+    pub(crate) transitions: u32,
+    pub(crate) samples: u32,
+}
+
+impl G17PStatusATightScanObservation {
+    const fn new(scan_address: u64) -> Self {
+        Self {
+            scan_address,
+            first: 0,
+            last: 0,
+            observed_or: 0,
+            transitions: 0,
+            samples: 0,
+        }
+    }
+
+    fn observe(&mut self, value: u32) {
+        if self.samples == 0 {
+            self.first = value;
+        } else if self.last != value {
+            self.transitions = self.transitions.saturating_add(1);
+        }
+        self.last = value;
+        self.observed_or |= value;
+        self.samples = self.samples.saturating_add(1);
+    }
+}
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct G17PControlOpeningEffect {
     pub(crate) shared_cursor: u32,
@@ -1096,6 +1132,42 @@ impl MappedObject {
                 bytes[offset..end].try_into().map_err(|_| EINVAL)?,
             ))
         })
+    }
+
+    fn observe_u32_tight(
+        &mut self,
+        address: u64,
+        samples: u32,
+    ) -> Result<G17PStatusATightScanObservation> {
+        if samples == 0 {
+            return Err(EINVAL);
+        }
+        let offset = address.checked_sub(self.iova()).ok_or(EINVAL)? as usize;
+        let end = offset.checked_add(core::mem::size_of::<u32>()).ok_or(EINVAL)?;
+        if end > self.logical_size || offset % core::mem::align_of::<u32>() != 0 {
+            return Err(EINVAL);
+        }
+
+        let vmap = self.object.vmap()?;
+        let value = unsafe {
+            // SAFETY: the range and alignment checks above keep this pointer
+            // inside the live VMap. Volatile reads are required because the
+            // firmware may set and clear this WC/uncached shared word between
+            // consecutive observations.
+            vmap.as_mut_ptr().add(offset).cast::<u32>()
+        };
+        let mut observation = G17PStatusATightScanObservation::new(address);
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        for _ in 0..samples {
+            let sample = u32::from_le(unsafe {
+                // SAFETY: `value` remains valid for the lifetime of `vmap`
+                // and points at an aligned u32 wholly inside the object.
+                core::ptr::read_volatile(value)
+            });
+            observation.observe(sample);
+        }
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        Ok(observation)
     }
 
     fn read_u64(&mut self, address: u64) -> Result<u64> {
@@ -4303,6 +4375,36 @@ impl G17ResourceOwner {
         ))
     }
 
+    /// Observe a possible sub-millisecond Status-A `+0x0c` pulse without a
+    /// sleep, remap, firmware-private read, or firmware write. The address is
+    /// validated against both views of the native Status-A layout before the
+    /// bounded volatile loop starts.
+    pub(crate) fn observe_status_a_work_scan_tight(
+        &mut self,
+        samples: u32,
+    ) -> Result<G17PStatusATightScanObservation> {
+        let scan_address = self
+            .handoff
+            .primary
+            .state_grid
+            .checked_add(PRIMARY_STATUS_A_WORK_SCAN_STATE_GRID_OFFSET)
+            .ok_or(EINVAL)?;
+        if scan_address
+            != self
+                .handoff
+                .primary
+                .instance
+                .status_a
+                .checked_add(PRIMARY_STATUS_A_WORK_SCAN_OFFSET)
+                .ok_or(EINVAL)?
+        {
+            return Err(EINVAL);
+        }
+        self.resources
+            .primary_state
+            .observe_u32_tight(scan_address, samples)
+    }
+
     pub(crate) fn control_opening_effect(&mut self) -> Result<G17PControlOpeningEffect> {
         core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
         let shared_cursor_address = self
@@ -6887,6 +6989,21 @@ mod tests {
         assert_eq!(snapshot.raw, 0xaabb_ccdd_1122_3344);
         assert_eq!(snapshot.active, 0x1122_3344);
         assert_eq!(snapshot.scheduler_constructed, 0xaabb_ccdd);
+    }
+
+    #[test]
+    fn tight_status_a_scan_observation_preserves_short_pulses() {
+        let address = KERN + PRIMARY_STATUS_A_WORK_SCAN_STATE_GRID_OFFSET;
+        let mut observation = G17PStatusATightScanObservation::new(address);
+        for value in [0, 0, 1, 1, 0] {
+            observation.observe(value);
+        }
+        assert_eq!(observation.scan_address, address);
+        assert_eq!(observation.first, 0);
+        assert_eq!(observation.last, 0);
+        assert_eq!(observation.observed_or, 1);
+        assert_eq!(observation.transitions, 2);
+        assert_eq!(observation.samples, 5);
     }
 
     #[test]
