@@ -1027,10 +1027,7 @@ bool dcp_queue_rtkit_work(struct apple_dcp *dcp, struct work_struct *work)
 	if (!dcp || !dcp->rtk || !dcp->rtk->wq || !work)
 		return false;
 
-	/*
-	 * The RTKit queue is ordered.  Work queued by an RX callback cannot run
-	 * until the current receive work item has returned.
-	 */
+	/* The ordered queue runs this only after the current RX work returns. */
 	return queue_work(dcp->rtk->wq, work);
 }
 

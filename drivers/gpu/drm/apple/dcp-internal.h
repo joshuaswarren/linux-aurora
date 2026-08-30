@@ -5,7 +5,6 @@
 #define __APPLE_DCP_INTERNAL_H__
 
 #include <linux/backlight.h>
-#include <linux/atomic.h>
 #include <linux/device.h>
 #include <linux/ioport.h>
 #include <linux/mutex.h>
@@ -15,6 +14,7 @@
 #include <linux/platform_device.h>
 #include <linux/scatterlist.h>
 #include <linux/usb/typec_mux.h>
+#include <linux/workqueue.h>
 
 #include "dcp-link.h"
 #include "dptxep.h"
@@ -194,11 +194,7 @@ struct apple_dcp {
 	u64 link_init_message;
 	u16 link_rx_log_count;
 	u16 link_reply_log_count;
-	struct work_struct link_start_barrier_work;
-	struct work_struct link_start_work;
-	struct delayed_work link_start_barrier_timeout_work;
-	atomic_t link_start_barrier_state;
-	u64 link_start_barrier_echo;
+	struct workqueue_struct *link_callback_wq;
 	u32 link_d563_a2i_before[5];
 	u32 link_d563_a2i_after[5];
 	u8 link_d563_a2i_count;

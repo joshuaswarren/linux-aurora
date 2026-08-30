@@ -403,8 +403,6 @@ static void apple_dcp_link_init_message_test(struct kunit *test)
 	KUNIT_ASSERT_EQ(test,
 			apple_dcp_link_init_message(0x123456789abcULL, &message), 0);
 	KUNIT_EXPECT_EQ(test, message, 0x123456789abc0040ULL);
-	KUNIT_EXPECT_EQ(test, apple_dcp_link_firmware_init_echo(message),
-			0x123456789abc0140ULL);
 	KUNIT_EXPECT_EQ(test,
 			apple_dcp_link_init_message(BIT_ULL(48), &message), -ERANGE);
 }

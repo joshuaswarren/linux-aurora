@@ -41,16 +41,6 @@
 #define APPLE_DCP_LINK_PHASE_PROPERTY	"apple,dcp-link-phase"
 #define APPLE_DCP_LINK_MESSAGE_PROPERTY	"apple,dcp-link-message"
 
-#define DCP25G83_LINK_START_BARRIER_TIMEOUT	msecs_to_jiffies(1000)
-
-enum dcp_link_start_barrier_state {
-	DCP_LINK_START_BARRIER_IDLE,
-	DCP_LINK_START_BARRIER_QUEUED,
-	DCP_LINK_START_BARRIER_WAITING,
-	DCP_LINK_START_BARRIER_PASSED,
-	DCP_LINK_START_BARRIER_FAILED,
-};
-
 static int dcp_tx_offset(enum dcp_context_id id)
 {
 	switch (id) {
@@ -907,6 +897,8 @@ static void dcp_link_handle_reply(struct apple_dcp *dcp, u64 message)
 		dev_info(dcp->dev,
 			 "DCPLink A401 reply: endpoint %#x request %#llx reply %#llx stream %u remote %u\n",
 			 APPLE_DCP_LINK_ENDPOINT, request, message, stream, remote);
+		dev_info(dcp->dev,
+			 "DCP25G83_C3_CALLBACK_WORKQUEUE A401 reply handled on callback worker\n");
 		if (dcp_link_service_notifier_pending(dcp))
 			schedule_work(&dcp->link_service_match_work);
 	}
@@ -1092,86 +1084,95 @@ out_unlock:
 	return ret;
 }
 
-static void dcp_link_start_work(struct work_struct *work)
+struct dcp_link_rpc_work {
+	struct work_struct dispatch_work;
+	struct work_struct handler_work;
+	struct apple_dcp *dcp;
+	u64 message;
+	u16 sequence;
+	bool reply;
+};
+
+static void dcp_link_rpc_handler_work(struct work_struct *work)
 {
-	struct apple_dcp *dcp =
-		container_of(work, struct apple_dcp, link_start_work);
+	struct dcp_link_rpc_work *rpc_work =
+		container_of(work, struct dcp_link_rpc_work, handler_work);
+	struct apple_dcp *dcp = rpc_work->dcp;
 
-	if (atomic_read(&dcp->link_start_barrier_state) !=
-	    DCP_LINK_START_BARRIER_PASSED)
-		return;
+	if (!rpc_work->reply && rpc_work->sequence >= 196 &&
+	    rpc_work->sequence <= 197)
+		dev_info(dcp->dev,
+			 "DCP25G83_C3_CALLBACK_WORKQUEUE handle callback %u raw %#llx\n",
+			 rpc_work->sequence, rpc_work->message);
 
-	dev_info(dcp->dev,
-		 "DCP25G83_LINK_START_BARRIER A401 after exact type0 echo\n");
-	iomfb_start_h17p(dcp);
+	if (rpc_work->reply)
+		dcp_link_handle_reply(dcp, rpc_work->message);
+	else
+		dcp_link_handle_callback(dcp, rpc_work->message);
+
+	kfree(rpc_work);
 }
 
-static void dcp_link_start_barrier_timeout_work(struct work_struct *work)
+static void dcp_link_rpc_dispatch_work(struct work_struct *work)
 {
-	struct delayed_work *delayed = to_delayed_work(work);
-	struct apple_dcp *dcp = container_of(delayed, struct apple_dcp,
-					     link_start_barrier_timeout_work);
+	struct dcp_link_rpc_work *rpc_work =
+		container_of(work, struct dcp_link_rpc_work, dispatch_work);
+	struct apple_dcp *dcp = rpc_work->dcp;
 
-	if (atomic_cmpxchg(&dcp->link_start_barrier_state,
-			   DCP_LINK_START_BARRIER_WAITING,
-			   DCP_LINK_START_BARRIER_FAILED) !=
-	    DCP_LINK_START_BARRIER_WAITING)
-		return;
-
-	dev_err(dcp->dev,
-		"DCP25G83_LINK_START_BARRIER no exact type0 echo %#llx; A401 not sent\n",
-		dcp->link_start_barrier_echo);
-}
-
-static void dcp_link_start_barrier_work(struct work_struct *work)
-{
-	struct apple_dcp *dcp =
-		container_of(work, struct apple_dcp, link_start_barrier_work);
-	int ret;
-
-	if (atomic_cmpxchg(&dcp->link_start_barrier_state,
-			   DCP_LINK_START_BARRIER_QUEUED,
-			   DCP_LINK_START_BARRIER_WAITING) !=
-	    DCP_LINK_START_BARRIER_QUEUED)
-		return;
-
-	ret = dcp_send_message_sync(dcp, APPLE_DCP_LINK_ENDPOINT,
-				    APPLE_DCP_LINK_MSG_FIRMWARE_INIT);
-	if (ret) {
-		atomic_set(&dcp->link_start_barrier_state,
-			   DCP_LINK_START_BARRIER_FAILED);
+	if (!queue_work(dcp->link_callback_wq, &rpc_work->handler_work)) {
 		dev_err(dcp->dev,
-			"DCP25G83_LINK_START_BARRIER type0 send failed %d; A401 not sent\n",
-			ret);
-		return;
+			"DCP25G83_C3_CALLBACK_WORKQUEUE could not dispatch raw %#llx\n",
+			rpc_work->message);
+		kfree(rpc_work);
 	}
-
-	dev_info(dcp->dev,
-		 "DCP25G83_LINK_START_BARRIER type0 sent after READY handler; expect %#llx before A401\n",
-		 dcp->link_start_barrier_echo);
-	schedule_delayed_work(&dcp->link_start_barrier_timeout_work,
-			      DCP25G83_LINK_START_BARRIER_TIMEOUT);
 }
 
-static int dcp_link_queue_start_barrier(struct apple_dcp *dcp)
+static int dcp_link_queue_rpc_work(struct apple_dcp *dcp, u64 message)
 {
-	dcp->link_start_barrier_echo =
-		apple_dcp_link_firmware_init_echo(dcp->link_init_message);
-	if (atomic_cmpxchg(&dcp->link_start_barrier_state,
-			   DCP_LINK_START_BARRIER_IDLE,
-			   DCP_LINK_START_BARRIER_QUEUED) !=
-	    DCP_LINK_START_BARRIER_IDLE)
-		return -EALREADY;
+	struct dcp_link_rpc_work *rpc_work;
+	bool reply = (message & GENMASK_ULL(7, 6)) == BIT_ULL(6);
+	u16 sequence = reply ? READ_ONCE(dcp->link_reply_log_count) :
+			       READ_ONCE(dcp->link_rx_log_count);
 
-	if (!dcp_queue_rtkit_work(dcp, &dcp->link_start_barrier_work)) {
-		atomic_set(&dcp->link_start_barrier_state,
-			   DCP_LINK_START_BARRIER_FAILED);
-		return -EIO;
+	if (!dcp->link_callback_wq)
+		return -ENODEV;
+
+	rpc_work = kzalloc_obj(*rpc_work, GFP_KERNEL);
+	if (!rpc_work)
+		return -ENOMEM;
+
+	/*
+	 * A firmware callback is synchronous: its shared RPC record remains
+	 * stable until this worker sends the acknowledgment.
+	 */
+	rpc_work->dcp = dcp;
+	rpc_work->message = message;
+	rpc_work->sequence = sequence;
+	rpc_work->reply = reply;
+	INIT_WORK(&rpc_work->dispatch_work, dcp_link_rpc_dispatch_work);
+	INIT_WORK(&rpc_work->handler_work, dcp_link_rpc_handler_work);
+	if (!dcp_queue_rtkit_work(dcp, &rpc_work->dispatch_work)) {
+		kfree(rpc_work);
+		return -EALREADY;
 	}
 
-	dev_info(dcp->dev,
-		 "DCP25G83_LINK_START_BARRIER queued behind READY receive work\n");
+	if (!reply && sequence >= 196 && sequence <= 197)
+		dev_info(dcp->dev,
+			 "DCP25G83_C3_CALLBACK_WORKQUEUE enqueue callback %u raw %#llx behind RTKit RX\n",
+			 sequence, message);
+
 	return 0;
+}
+
+static void dcp_link_callback_wq_destroy(void *data)
+{
+	struct apple_dcp *dcp = data;
+
+	if (!dcp->link_callback_wq)
+		return;
+
+	destroy_workqueue(dcp->link_callback_wq);
+	dcp->link_callback_wq = NULL;
 }
 
 static void dcp_link_recv_msg(struct apple_dcp *dcp, u64 message)
@@ -1179,26 +1180,6 @@ static void dcp_link_recv_msg(struct apple_dcp *dcp, u64 message)
 	enum apple_dcp_link_handshake_action action;
 	enum apple_dcp_link_state old_state = dcp->link_state;
 	u8 type = message & GENMASK_ULL(1, 0);
-
-	if (atomic_read(&dcp->link_start_barrier_state) ==
-		    DCP_LINK_START_BARRIER_WAITING &&
-	    message == dcp->link_start_barrier_echo) {
-		if (atomic_cmpxchg(&dcp->link_start_barrier_state,
-				   DCP_LINK_START_BARRIER_WAITING,
-				   DCP_LINK_START_BARRIER_PASSED) ==
-		    DCP_LINK_START_BARRIER_WAITING) {
-			cancel_delayed_work(&dcp->link_start_barrier_timeout_work);
-			dev_info(dcp->dev,
-				 "DCP25G83_LINK_START_BARRIER exact type0 echo %#llx; queue A401 after echo handler\n",
-				 message);
-			if (!dcp_queue_rtkit_work(dcp, &dcp->link_start_work)) {
-				atomic_set(&dcp->link_start_barrier_state,
-					   DCP_LINK_START_BARRIER_FAILED);
-				dev_err(dcp->dev,
-					"DCP25G83_LINK_START_BARRIER could not queue A401 work\n");
-			}
-		}
-	}
 
 	action = apple_dcp_link_handshake_step(&dcp->link_state, message);
 	if (action == APPLE_DCP_LINK_HANDSHAKE_SEND_INIT) {
@@ -1246,9 +1227,7 @@ static void dcp_link_recv_msg(struct apple_dcp *dcp, u64 message)
 		dev_info(dcp->dev,
 			 "DCP25G83_LINK_ABI transport %#x hash %#x schema %#x\n",
 			 remote_version, dcp->link_firmware_hash, dcp->link_abi);
-		if (dcp_link_queue_start_barrier(dcp))
-			dev_err(dcp->dev,
-				"DCP25G83_LINK_START_BARRIER could not queue after READY; A401 not sent\n");
+		iomfb_start_h17p(dcp);
 		return;
 	}
 
@@ -1262,10 +1241,10 @@ static void dcp_link_recv_msg(struct apple_dcp *dcp, u64 message)
 		return;
 	}
 
-	if ((message & GENMASK_ULL(7, 6)) == BIT_ULL(6))
-		dcp_link_handle_reply(dcp, message);
-	else
-		dcp_link_handle_callback(dcp, message);
+	if (dcp_link_queue_rpc_work(dcp, message))
+		dev_err(dcp->dev,
+			"DCP25G83_C3_CALLBACK_WORKQUEUE could not queue raw %#llx\n",
+			message);
 }
 
 static int dcp_link_start_rtkit(struct apple_dcp *dcp)
@@ -1274,14 +1253,22 @@ static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 	u64 init_message;
 	int ret;
 
+	if (!dcp->link_callback_wq) {
+		dcp->link_callback_wq =
+			alloc_ordered_workqueue("dcp-link-callback-%s",
+						WQ_HIGHPRI | WQ_MEM_RECLAIM,
+						dev_name(dcp->dev));
+		if (!dcp->link_callback_wq)
+			return -ENOMEM;
+		ret = devm_add_action_or_reset(dcp->dev,
+					       dcp_link_callback_wq_destroy, dcp);
+		if (ret)
+			return ret;
+	}
+	dev_info(dcp->dev,
+		 "DCP25G83_C3_CALLBACK_WORKQUEUE armed; RPC callbacks and replies serialized off RTKit RX\n");
+
 	INIT_WORK(&dcp->link_service_match_work, dcp_link_service_match_work);
-	INIT_WORK(&dcp->link_start_barrier_work,
-		  dcp_link_start_barrier_work);
-	INIT_WORK(&dcp->link_start_work, dcp_link_start_work);
-	INIT_DELAYED_WORK(&dcp->link_start_barrier_timeout_work,
-			  dcp_link_start_barrier_timeout_work);
-	atomic_set(&dcp->link_start_barrier_state,
-		   DCP_LINK_START_BARRIER_IDLE);
 	dcp->link_service_match_state = 0;
 	dcp->link_service_match_output = NULL;
 	dcp->link_service_match_callback_tag = 0;
@@ -1473,12 +1460,8 @@ static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 				 "DCP25G83_LINK_ABI transport %#x hash %#x schema %#x\n",
 				 remote_version, dcp->link_firmware_hash,
 				 dcp->link_abi);
-			ret = dcp_link_queue_start_barrier(dcp);
-			if (ret)
-				dev_err(dcp->dev,
-					"DCP25G83_LINK_START_BARRIER could not queue from inherited READY: %d; A401 not sent\n",
-					ret);
-			return ret;
+			iomfb_start_h17p(dcp);
+			return 0;
 		}
 
 		if (action != APPLE_DCP_LINK_ADOPT_SEND_INIT) {
@@ -2000,10 +1983,11 @@ void iomfb_shutdown(struct apple_dcp *dcp)
 	dcp->active = false;
 	dcp->valid_mode = false;
 	if (dcp->fw_compat == DCP_FIRMWARE_H17P) {
-		cancel_delayed_work_sync(&dcp->link_start_barrier_timeout_work);
-		cancel_work_sync(&dcp->link_start_barrier_work);
-		cancel_work_sync(&dcp->link_start_work);
+		if (dcp->link_callback_wq)
+			flush_workqueue(dcp->link_callback_wq);
 		cancel_work_sync(&dcp->link_service_match_work);
+		if (dcp->link_callback_wq)
+			flush_workqueue(dcp->link_callback_wq);
 	}
 
 	switch (dcp->fw_compat) {
