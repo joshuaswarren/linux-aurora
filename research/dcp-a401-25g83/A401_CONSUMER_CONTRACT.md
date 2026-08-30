@@ -2,16 +2,19 @@
 
 ## Result
 
-The observed `A401` hang is inside the firmware's fifth synchronous `D563`
-callback. It is not in a later display property, service, side endpoint,
-`start_hardware_boot`, or post-start state gate.
+The last proven `A401` boundary is the firmware's fifth synchronous `D563`
+callback, `DispPerfState`. Linux writes output `1`; the corresponding raw
+`0x42` acknowledgement is admitted to and consumed from the ASC A2I FIFO. The
+firmware nevertheless never sends `D120` (`start_hardware_boot`) and never
+returns the outer `A401` reply.
 
-The fifth callback is `DispPerfState`. Linux writes output `1` and queues the
-same raw EP37 acknowledgement form as the four callbacks immediately before
-it. The firmware never sends `D121` (`start_hardware_boot`) and never returns
-the outer `A401` reply. Static control flow proves that the only gate between
-the fifth `D563` call and its return is the DCPLink stream response word and
-condition wake.
+The transport result rules out an AP mailbox drop. It does not by itself prove
+whether the consumed word reached the DCPLink stream action, woke its waiter,
+or returned far enough to release the five temporary OSNumber objects. Those
+operations all precede `D120` and none has another AP-visible callback. The
+strongest exact statement is therefore that execution does not cross the
+post-property UPPipe return, not that it necessarily remains in the fifth
+wait.
 
 ## A401 dispatcher
 
@@ -72,8 +75,10 @@ UPPipe slot `0x348`. Every H17P UPPipe vtable maps slot `0x348` to
 
 There is therefore no post-D563 wait, endpoint, property, or shared state in
 this virtual call. After it returns, `start_ios_gated` continues at
-`0x042654b8` and sends `D121` at `0x042654f4`. The observed log has no `D121`,
-which proves execution has not crossed the fifth `D563` call site.
+`0x042654b8` and sends `D120` at `0x042654f4`. The observed log has no `D120`,
+which proves execution has not crossed the containing UPPipe call at
+`0x042654b4`. Absence of `D120` alone does not distinguish the fifth stream
+wait from the five immediately following object releases.
 
 ## D563 RPC return gate
 
@@ -233,3 +238,59 @@ it has been consumed, the remaining fault is downstream of hardware delivery,
 between RTKit EP37 dispatch and resumption of the synchronous caller. Because
 the store and signal are unconditional once the gate action runs, there is no
 evidence-derived wire change to make at that point.
+
+## Hardware FIFO result
+
+Fresh-session log:
+
+`neo-bringup/logs/dcp-appledrm-25g83-d563-a2i-18c7a9e-20260829-200723.log`
+
+Callbacks 178 through 181 each recovered their predecessor with
+`previous_consumed 1 causally_associated 1`. The fifth acknowledgement then
+showed:
+
+```
+ack5_before 0x2ff01 ack5_after 0x10f001 ep1_before_ack 0x20001
+ack5_consumed 1 ack5_pending 0
+```
+
+`0x2ff01 -> 0x10f001 -> 0x20001` is an exact empty, one-entry queued,
+empty transition with read and write pointers both advancing from 15 to 0.
+ACK5 therefore left the physical FIFO before the EP1 reply was sent. At the
+three-second A401 timeout, control `0x100101` described exactly one pending
+entry with pointers 0 and 1. The only later AP send was the EP1 buffer reply,
+so that EP1 reply remained queued while DCP stopped draining A2I.
+
+The lost-wake theory does not provide a fix. The stream condition wait at
+`0x04032108` asserts the event in the current thread before releasing its gate
+and blocking. Reply ingress enters the same stream gate, stores the response at
+`0x041b781c`, and then signals. A normal reply cannot signal before the waiter
+is armed.
+
+## First definite host producer mismatch
+
+All five raw `0x42` replies take the same firmware path. The endpoint-37 filter
+at `0x041b6fd4` has no property index, callback count, payload, or fifth-call
+branch. It signals the same link event source; the AFK dispatcher then enqueues
+the word on the same endpoint software queue; action `0x041b70d0` drains that
+queue and chooses the same stream from the same control bits. There is no
+static ACK1-through-ACK4 versus ACK5 dispatch delta to patch.
+
+Linux does have a concrete producer-side state mismatch before those replies.
+For an adopted session, `dcp_start_rtkit_endpoint()` sends the inherited raw
+STARTEP message but did not set the corresponding bit in
+`apple_rtkit.endpoints`. Non-adopted `apple_rtkit_start_ep()` requires that bit,
+and native RTBuddy records an endpoint when it creates/enables it. The valid
+18c7 run consequently emitted ten synchronous `dev_warn` lines for EP20 and
+186 for EP37, including one before every A401 callback and nested reply.
+
+This is not only cosmetic. In 18c7, A401 began at `25.922042` and ACK5 was sent
+at `26.029092`, 107.05 ms later. The firmware's EP1 request was serviced at
+`26.029216`, immediately at that tail. Across fresh runs it appears about
+99--107 ms after A401. Each undiscovered-EP37 warning precedes callback
+dispatch by about 0.11 ms in the same ordered RTKit worker, accounting for
+roughly 20 ms of avoidable serialized latency. The endpoint bit is now recorded
+immediately after a successful adopted STARTEP. This preserves all wire words
+and makes Linux's software endpoint ownership match the STARTEP it already
+sent. Whether removing that perturbation also avoids the EP1/tail collision is
+a hardware discriminator, not yet a proven outcome.
