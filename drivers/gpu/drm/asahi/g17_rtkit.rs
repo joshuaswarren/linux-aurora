@@ -64,15 +64,6 @@ pub(crate) const ENDPOINT_GFX_INTERRUPTS: u8 = 0x21;
 /// [`validate_endpoint_set`].
 pub(crate) const ENDPOINT_FIRMWARE_PEER: u8 = 0x23;
 
-/// Endpoint start phases for the bounded J700 primary-service discriminator.
-/// EP20 must accept initdata before primary EP21 is activated; the secondary
-/// keeps the previously proven pre-initdata pair so this changes one role and
-/// one endpoint only.
-pub(crate) const PRIMARY_PRE_INITDATA_ENDPOINTS: [u8; 1] = [ENDPOINT_GFX_MESSAGES];
-pub(crate) const PRIMARY_POST_INITDATA_ACK_ENDPOINTS: [u8; 1] = [ENDPOINT_GFX_INTERRUPTS];
-pub(crate) const SECONDARY_PRE_INITDATA_ENDPOINTS: [u8; 2] =
-    [ENDPOINT_GFX_MESSAGES, ENDPOINT_GFX_INTERRUPTS];
-
 /// Exact T8140/G17P discovery map for each independent firmware role.
 pub(crate) const EXPECTED_G17P_DISCOVERY_ENDPOINTS: [u8; 5] = [
     ENDPOINT_MANAGEMENT,
@@ -386,26 +377,6 @@ mod tests {
             validate_endpoint_set(&[0x00, 0x00, 0x20, 0x21]),
             Err(WireError::UnexpectedEndpointSet)
         );
-    }
-
-    #[test]
-    fn primary_ep21_activation_is_isolated_after_initdata_ack() {
-        assert_eq!(PRIMARY_PRE_INITDATA_ENDPOINTS, [ENDPOINT_GFX_MESSAGES]);
-        assert_eq!(
-            PRIMARY_POST_INITDATA_ACK_ENDPOINTS,
-            [ENDPOINT_GFX_INTERRUPTS]
-        );
-        assert_eq!(
-            SECONDARY_PRE_INITDATA_ENDPOINTS,
-            [ENDPOINT_GFX_MESSAGES, ENDPOINT_GFX_INTERRUPTS]
-        );
-        for endpoint in PRIMARY_PRE_INITDATA_ENDPOINTS
-            .into_iter()
-            .chain(PRIMARY_POST_INITDATA_ACK_ENDPOINTS)
-            .chain(SECONDARY_PRE_INITDATA_ENDPOINTS)
-        {
-            assert!(endpoint_is_host_served(endpoint));
-        }
     }
 
     #[test]

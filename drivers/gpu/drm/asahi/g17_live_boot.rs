@@ -1077,12 +1077,10 @@ fn boot_session(
     manager.uat().mirror_t8140_secondary_high_root()?;
     registers.t8140_pre_initdata_clear()?;
 
-    for endpoint in g17_rtkit::PRIMARY_PRE_INITDATA_ENDPOINTS {
-        Pin::new(&mut gfx_rtkit).start_endpoint(endpoint)?;
-    }
-    for endpoint in g17_rtkit::SECONDARY_PRE_INITDATA_ENDPOINTS {
-        Pin::new(&mut gfx1_rtkit).start_endpoint(endpoint)?;
-    }
+    Pin::new(&mut gfx_rtkit).start_endpoint(g17_rtkit::ENDPOINT_GFX_MESSAGES)?;
+    Pin::new(&mut gfx_rtkit).start_endpoint(g17_rtkit::ENDPOINT_GFX_INTERRUPTS)?;
+    Pin::new(&mut gfx1_rtkit).start_endpoint(g17_rtkit::ENDPOINT_GFX_MESSAGES)?;
+    Pin::new(&mut gfx1_rtkit).start_endpoint(g17_rtkit::ENDPOINT_GFX_INTERRUPTS)?;
     Pin::new(&mut gfx_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_MESSAGES, gfx_init)?;
     Pin::new(&mut gfx1_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_MESSAGES, gfx1_init)?;
     dev_info!(
@@ -1091,13 +1089,6 @@ fn boot_session(
     );
     wait_initdata_ack(&gfx_state)?;
     dev_info!(pdev.as_ref(), "G17P session: primary initdata ACK received\n");
-    for endpoint in g17_rtkit::PRIMARY_POST_INITDATA_ACK_ENDPOINTS {
-        Pin::new(&mut gfx_rtkit).start_endpoint(endpoint)?;
-    }
-    dev_info!(
-        pdev.as_ref(),
-        "G17P session: primary EP21 activated after initdata ACK\n"
-    );
     wait_initdata_ack(&gfx1_state)?;
     dev_info!(pdev.as_ref(), "G17P session: secondary initdata ACK received\n");
 
@@ -1203,12 +1194,10 @@ fn boot_initial_session(
         g17_rtkit::encode_initdata_doorbell(handoff.primary.instance.root).map_err(|_| EINVAL)?;
     let gfx1_init = g17_rtkit::encode_initdata_doorbell(handoff.secondary.instance.root)
         .map_err(|_| EINVAL)?;
-    for endpoint in g17_rtkit::PRIMARY_PRE_INITDATA_ENDPOINTS {
-        Pin::new(&mut gfx_rtkit).start_endpoint(endpoint)?;
-    }
-    for endpoint in g17_rtkit::SECONDARY_PRE_INITDATA_ENDPOINTS {
-        Pin::new(&mut gfx1_rtkit).start_endpoint(endpoint)?;
-    }
+    Pin::new(&mut gfx_rtkit).start_endpoint(g17_rtkit::ENDPOINT_GFX_MESSAGES)?;
+    Pin::new(&mut gfx_rtkit).start_endpoint(g17_rtkit::ENDPOINT_GFX_INTERRUPTS)?;
+    Pin::new(&mut gfx1_rtkit).start_endpoint(g17_rtkit::ENDPOINT_GFX_MESSAGES)?;
+    Pin::new(&mut gfx1_rtkit).start_endpoint(g17_rtkit::ENDPOINT_GFX_INTERRUPTS)?;
     Pin::new(&mut gfx_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_MESSAGES, gfx_init)?;
     Pin::new(&mut gfx1_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_MESSAGES, gfx1_init)?;
     dev_info!(
@@ -1217,13 +1206,6 @@ fn boot_initial_session(
     );
     wait_initdata_ack(&gfx_state)?;
     dev_info!(pdev.as_ref(), "G17P session: primary initdata ACK received\n");
-    for endpoint in g17_rtkit::PRIMARY_POST_INITDATA_ACK_ENDPOINTS {
-        Pin::new(&mut gfx_rtkit).start_endpoint(endpoint)?;
-    }
-    dev_info!(
-        pdev.as_ref(),
-        "G17P session: primary EP21 activated after initdata ACK\n"
-    );
     wait_initdata_ack(&gfx1_state)?;
     dev_info!(pdev.as_ref(), "G17P session: secondary initdata ACK received\n");
 
