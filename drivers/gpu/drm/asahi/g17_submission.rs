@@ -572,8 +572,9 @@ pub(crate) const fn decode_tx_doorbell(message: u64) -> Result<(PipeType, u8), S
 }
 
 /// The firmware's pending-pipe bit for a submitted pipe: `1 << pipe_type`
-/// (`mov w9,#1 ; lsl w8,w9,w8` @ 0x2529c; atomic-OR'd into the global at
-/// 0xfffffc00001049e8).
+/// (`mov w9,#1 ; lsl w8,w9,w8` in the pinned J700 A000 type-3 handler). This
+/// path is distinct from the type-4 device-control bit 17 at scheduler root
+/// `0xfffffc0000177190`.
 pub(crate) const fn pending_pipe_bit(pipe: PipeType) -> u32 {
     1u32 << (pipe as u32)
 }

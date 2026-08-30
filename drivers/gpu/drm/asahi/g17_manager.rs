@@ -34,17 +34,26 @@ mod identity;
 use g17_initdata::InstanceRole;
 use identity::{FirmwareRoleTopology, GpuGen, GpuHalGeneration, GpuVariant, SubmissionTransport};
 
-// Pinned T8140 GFX.a010 scheduler/HRB root. Firmware __DATA starts at link
-// address 0xfffffc0000050000 and the iBoot data carveout maps that address at
-// J700_GFX_DATA.base. These addresses are diagnostic only and do not enter the
-// submission ABI.
-const G17P_GFX_LINK_DATA_BASE: u64 = 0xffff_fc00_0005_0000;
-const G17P_SCHEDULER_ROOT_LINK_ADDRESS: u64 = 0xffff_fc00_0010_49e8;
-const G17P_SCHEDULER_ROOT_PHYSICAL_ADDRESS: u64 = 0x0000_0100_01e3_09e8;
+// Pinned J700 T8140 GFX A000 scheduler root used by the exact EP type-4
+// thunk. The extracted image has SHA-256
+// 3e2821bb40d3abffe30488a06ede5f523cfa47544d6a0ad7654a08be6b5dc30f.
+// Its __DATA vmaddr/size are 0xfffffc000004c000/0x134000, exactly matching
+// the J700 gfx-data carveout size. These addresses are diagnostic only.
+const G17P_GFX_LINK_DATA_BASE: u64 = 0xffff_fc00_0004_c000;
+const G17P_SCHEDULER_ROOT_LINK_ADDRESS: u64 = 0xffff_fc00_0017_7190;
+const G17P_SCHEDULER_ROOT_PHYSICAL_ADDRESS: u64 = 0x0000_0100_01ea_7190;
 const G17P_SCHEDULER_ROOT_SNAPSHOT_SIZE: usize = 0x80;
 const G17P_SCHEDULER_ROOT_PENDING_OFFSET: usize = 0x00;
 const G17P_SCHEDULER_ROOT_DEFERRED_OFFSET: usize = 0x50;
 const G17P_SCHEDULER_ROOT_STATE_OFFSET: usize = 0x68;
+const G17P_RUNTIME_MAIN_GLOBAL_LINK_ADDRESS: u64 = 0xffff_fc00_0017_7030;
+const G17P_RUNTIME_MAIN_GLOBAL_PHYSICAL_ADDRESS: u64 = 0x0000_0100_01ea_7030;
+const G17P_TYPE4_EP_HANDLER_LINK_ADDRESS: u64 = 0xffff_fc00_0002_2e24;
+const G17P_TYPE4_THUNK_LINK_ADDRESS: u64 = 0xffff_fc00_0002_635c;
+const G17P_TYPE4_DRAIN_LINK_ADDRESS: u64 = 0xffff_fc00_0000_3a74;
+const G17P_TYPE4_PENDING_MASK: u64 = 0x0002_0000;
+const G17P_SCHEDULER_DEFERRED_REQUEUE_LINK_ADDRESS: u64 = 0xffff_fc00_0002_5ea4;
+const G17P_TYPE4_MAIN_CONTROL_POINTER_OFFSETS: [usize; 3] = [0x1a0, 0x1a8, 0x1b0];
 
 #[cfg(not(test))]
 const _: () = {
@@ -59,7 +68,16 @@ const _: () = {
     );
     assert!(G17P_SCHEDULER_ROOT_PHYSICAL_ADDRESS & 7 == 0);
     assert!(G17P_SCHEDULER_ROOT_SNAPSHOT_SIZE & 7 == 0);
-    assert!(G17P_SCHEDULER_ROOT_STATE_OFFSET + 4 <= G17P_SCHEDULER_ROOT_SNAPSHOT_SIZE);
+    assert!(G17P_SCHEDULER_ROOT_STATE_OFFSET + 1 <= G17P_SCHEDULER_ROOT_SNAPSHOT_SIZE);
+    assert!(
+        G17P_RUNTIME_MAIN_GLOBAL_PHYSICAL_ADDRESS
+            == g17_adt_j700::J700_GFX_DATA.base
+                + (G17P_RUNTIME_MAIN_GLOBAL_LINK_ADDRESS - G17P_GFX_LINK_DATA_BASE)
+    );
+    assert!(
+        G17P_RUNTIME_MAIN_GLOBAL_PHYSICAL_ADDRESS + core::mem::size_of::<u64>() as u64
+            <= g17_adt_j700::J700_GFX_DATA.base + g17_adt_j700::J700_GFX_DATA.size
+    );
 };
 
 /// Grounded manager inputs for T8140. Power and tuning values are excluded.
@@ -503,6 +521,12 @@ impl G17PManagerConstruction {
         self.resources.control_counters()
     }
 
+    pub(crate) fn control_pointer_snapshot(
+        &mut self,
+    ) -> Result<g17_resources::G17PControlPointerSnapshot> {
+        self.resources.control_pointer_snapshot()
+    }
+
     pub(crate) fn control_opening_effect(
         &mut self,
     ) -> Result<g17_resources::G17PControlOpeningEffect> {
@@ -730,15 +754,22 @@ impl G17PManagerConstruction {
         self.resources.uat()
     }
 
-    /// Log one cache-invalidated, read-only sample of the pinned GFX scheduler root.
-    /// Sampling failures never alter the live submission state.
+    /// Log one cache-invalidated, read-only sample of the exact J700 GFX A000
+    /// scheduler root and runtime-main global. Sampling never writes firmware
+    /// state and failures do not alter submission.
     pub(crate) fn log_scheduler_root_checkpoint(&self, checkpoint: &'static str) {
         #[cfg(CONFIG_DEV_COREDUMP)]
-        match pgtable::UatPageTable::copy_live_firmware_physical_range(
-            G17P_SCHEDULER_ROOT_PHYSICAL_ADDRESS,
-            G17P_SCHEDULER_ROOT_SNAPSHOT_SIZE,
+        match (
+            pgtable::UatPageTable::copy_live_firmware_physical_range(
+                G17P_SCHEDULER_ROOT_PHYSICAL_ADDRESS,
+                G17P_SCHEDULER_ROOT_SNAPSHOT_SIZE,
+            ),
+            pgtable::UatPageTable::copy_live_firmware_physical_range(
+                G17P_RUNTIME_MAIN_GLOBAL_PHYSICAL_ADDRESS,
+                core::mem::size_of::<u64>(),
+            ),
         ) {
-            Ok(bytes) => {
+            (Ok(bytes), Ok(main_global)) => {
                 let read_u64 = |offset: usize| {
                     bytes
                         .get(offset..offset + core::mem::size_of::<u64>())
@@ -747,20 +778,25 @@ impl G17PManagerConstruction {
                 };
                 let pending = read_u64(G17P_SCHEDULER_ROOT_PENDING_OFFSET);
                 let deferred = read_u64(G17P_SCHEDULER_ROOT_DEFERRED_OFFSET);
-                let state = read_u64(G17P_SCHEDULER_ROOT_STATE_OFFSET)
-                    .map(|value| value as u32);
-                match (pending, deferred, state) {
-                    (Some(pending), Some(deferred), Some(state)) => {
+                let state = bytes.get(G17P_SCHEDULER_ROOT_STATE_OFFSET).copied();
+                let runtime_main = main_global
+                    .get(..core::mem::size_of::<u64>())
+                    .and_then(|value| value.try_into().ok())
+                    .map(u64::from_le_bytes);
+                match (pending, deferred, state, runtime_main) {
+                    (Some(pending), Some(deferred), Some(state), Some(runtime_main)) => {
                         let drain_open = (state & 0x18) == 0;
                         dev_info!(
                             self.resources.dev().as_ref(),
-                            "G17P scheduler-root checkpoint={} pa={:#x} pending={:#x} deferred={:#x} state={:#x} drain-open={}\n",
+                            "G17P scheduler-root-j700-a000 checkpoint={} root-pa={:#x} pending={:#x} deferred={:#x} state={:#x} drain-open={} main-global-pa={:#x} runtime-main={:#x}\n",
                             checkpoint,
                             G17P_SCHEDULER_ROOT_PHYSICAL_ADDRESS,
                             pending,
                             deferred,
                             state,
                             drain_open,
+                            G17P_RUNTIME_MAIN_GLOBAL_PHYSICAL_ADDRESS,
+                            runtime_main,
                         )
                     }
                     _ => dev_err!(
@@ -770,9 +806,15 @@ impl G17PManagerConstruction {
                     ),
                 }
             }
-            Err(error) => dev_err!(
+            (Err(error), _) => dev_err!(
                 self.resources.dev().as_ref(),
-                "G17P scheduler-root checkpoint={} coherent sample failed ({:?})\n",
+                "G17P scheduler-root-j700-a000 checkpoint={} root sample failed ({:?})\n",
+                checkpoint,
+                error,
+            ),
+            (_, Err(error)) => dev_err!(
+                self.resources.dev().as_ref(),
+                "G17P scheduler-root-j700-a000 checkpoint={} main-global sample failed ({:?})\n",
                 checkpoint,
                 error,
             ),
@@ -1875,6 +1917,63 @@ mod tests {
     const ROOT: u64 = 0xffff_fc20_0100_0000;
     const UAT: u64 = 0x9000_0000;
 
+    fn decode_hex<const N: usize>(source: &[u8]) -> [u8; N] {
+        let source = source.strip_suffix(b"\n").unwrap_or(source);
+        assert_eq!(source.len(), N * 2);
+        let nibble = |value: u8| match value {
+            b'0'..=b'9' => value - b'0',
+            b'a'..=b'f' => value - b'a' + 10,
+            _ => panic!("invalid hex fixture"),
+        };
+        let mut out = [0u8; N];
+        let mut index = 0;
+        while index < N {
+            out[index] = nibble(source[index * 2]) << 4 | nibble(source[index * 2 + 1]);
+            index += 1;
+        }
+        out
+    }
+
+    fn instruction(bytes: &[u8], index: usize) -> u32 {
+        u32::from_le_bytes(bytes[index * 4..index * 4 + 4].try_into().unwrap())
+    }
+
+    fn sign_extend(value: u64, bits: u32) -> i64 {
+        ((value << (64 - bits)) as i64) >> (64 - bits)
+    }
+
+    fn adrp_target(pc: u64, value: u32) -> u64 {
+        assert_eq!(value & 0x9f00_0000, 0x9000_0000);
+        let immediate = (((value as u64 >> 5) & 0x7ffff) << 2)
+            | ((value as u64 >> 29) & 0x3);
+        (pc & !0xfff).wrapping_add((sign_extend(immediate, 21) << 12) as u64)
+    }
+
+    fn branch_target(pc: u64, value: u32) -> u64 {
+        assert_eq!(value & 0x7c00_0000, 0x1400_0000);
+        pc.wrapping_add((sign_extend((value & 0x03ff_ffff) as u64, 26) << 2) as u64)
+    }
+
+    fn conditional_branch_target(pc: u64, value: u32) -> u64 {
+        assert_eq!(value & 0xff00_0010, 0x5400_0000);
+        pc.wrapping_add((sign_extend(((value >> 5) & 0x7ffff) as u64, 19) << 2) as u64)
+    }
+
+    fn load_store_unsigned_offset(value: u32) -> usize {
+        let scale = value >> 30;
+        (((value >> 10) & 0xfff) as usize) << scale
+    }
+
+    fn add_immediate(value: u32) -> usize {
+        assert_eq!(value & 0x7f00_0000, 0x1100_0000);
+        (((value >> 10) & 0xfff) as usize) << (((value >> 22) & 1) * 12)
+    }
+
+    fn wide_immediate(value: u32) -> u64 {
+        let shift = ((value >> 21) & 0x3) * 16;
+        ((value as u64 >> 5) & 0xffff) << shift
+    }
+
     fn target() -> TargetObservation {
         TargetObservation {
             chip_id: 0x8140,
@@ -1929,21 +2028,181 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_root_link_address_maps_inside_the_gfx_carveout() {
+    fn type4_diagnostic_fields_match_the_pinned_a000_consumers() {
         const GFX_DATA_BASE: u64 = 0x0000_0100_01d7_c000;
         const GFX_DATA_SIZE: u64 = 0x13_4000;
         assert_eq!(
             GFX_DATA_BASE + (G17P_SCHEDULER_ROOT_LINK_ADDRESS - G17P_GFX_LINK_DATA_BASE),
             G17P_SCHEDULER_ROOT_PHYSICAL_ADDRESS,
         );
-        assert_eq!(G17P_SCHEDULER_ROOT_PHYSICAL_ADDRESS, 0x0000_0100_01e3_09e8);
+        assert_eq!(G17P_GFX_LINK_DATA_BASE, 0xffff_fc00_0004_c000);
+        assert_eq!(G17P_SCHEDULER_ROOT_PHYSICAL_ADDRESS, 0x0000_0100_01ea_7190);
         assert_eq!(
             G17P_SCHEDULER_ROOT_PHYSICAL_ADDRESS + G17P_SCHEDULER_ROOT_STATE_OFFSET as u64,
-            0x0000_0100_01e3_0a50,
+            0x0000_0100_01ea_71f8,
         );
+        assert_eq!(
+            GFX_DATA_BASE + (G17P_RUNTIME_MAIN_GLOBAL_LINK_ADDRESS - G17P_GFX_LINK_DATA_BASE),
+            G17P_RUNTIME_MAIN_GLOBAL_PHYSICAL_ADDRESS,
+        );
+        assert_eq!(G17P_RUNTIME_MAIN_GLOBAL_PHYSICAL_ADDRESS, 0x0000_0100_01ea_7030);
         assert!(
             G17P_SCHEDULER_ROOT_PHYSICAL_ADDRESS + G17P_SCHEDULER_ROOT_SNAPSHOT_SIZE as u64
                 <= GFX_DATA_BASE + GFX_DATA_SIZE
+        );
+        assert_eq!(G17P_TYPE4_EP_HANDLER_LINK_ADDRESS, 0xffff_fc00_0002_2e24);
+        assert_eq!(G17P_TYPE4_THUNK_LINK_ADDRESS, 0xffff_fc00_0002_635c);
+        assert_eq!(G17P_TYPE4_DRAIN_LINK_ADDRESS, 0xffff_fc00_0000_3a74);
+        assert_eq!(G17P_TYPE4_PENDING_MASK, 1 << 17);
+        assert_eq!(
+            G17P_SCHEDULER_DEFERRED_REQUEUE_LINK_ADDRESS,
+            0xffff_fc00_0002_5ea4
+        );
+        assert_eq!(
+            G17P_SCHEDULER_ROOT_LINK_ADDRESS + G17P_SCHEDULER_ROOT_PENDING_OFFSET as u64,
+            0xffff_fc00_0017_7190
+        );
+        assert_eq!(
+            G17P_SCHEDULER_ROOT_LINK_ADDRESS + G17P_SCHEDULER_ROOT_DEFERRED_OFFSET as u64,
+            0xffff_fc00_0017_71e0
+        );
+        assert_eq!(
+            G17P_SCHEDULER_ROOT_LINK_ADDRESS + G17P_SCHEDULER_ROOT_STATE_OFFSET as u64,
+            0xffff_fc00_0017_71f8
+        );
+        let control = g17_initdata::channel_table_entry_range(
+            g17_initdata::CONTROL_CHANNEL_INDEX,
+        )
+        .unwrap();
+        assert_eq!(control.start, G17P_TYPE4_MAIN_CONTROL_POINTER_OFFSETS[0]);
+        assert_eq!(
+            G17P_TYPE4_MAIN_CONTROL_POINTER_OFFSETS,
+            [control.start, control.start + 8, control.start + 0x10]
+        );
+    }
+
+    #[test]
+    fn pinned_j700_a000_instruction_fixtures_prove_the_type4_pointer_chain() {
+        const BOOT_MAIN: &[u8] =
+            include_bytes!("fixtures/g17p_j700_a000/boot-main-config-global.hex");
+        const SELECTOR: &[u8] = include_bytes!("fixtures/g17p_j700_a000/type4-selector.hex");
+        const PUBLISH: &[u8] = include_bytes!("fixtures/g17p_j700_a000/type4-publish.hex");
+        const COMMON: &[u8] =
+            include_bytes!("fixtures/g17p_j700_a000/type4-common-publish.hex");
+        const TAKE: &[u8] =
+            include_bytes!("fixtures/g17p_j700_a000/type4-pending-take.hex");
+        const DEFERRED: &[u8] =
+            include_bytes!("fixtures/g17p_j700_a000/scheduler-deferred.hex");
+        const THUNK: &[u8] = include_bytes!("fixtures/g17p_j700_a000/type4-thunk.hex");
+        const DISPATCH: &[u8] =
+            include_bytes!("fixtures/g17p_j700_a000/type4-dispatch-record.hex");
+        const CURSORS: &[u8] =
+            include_bytes!("fixtures/g17p_j700_a000/control-drain-cursors.hex");
+
+        let boot = decode_hex::<0x30>(BOOT_MAIN);
+        assert_eq!(
+            adrp_target(0xffff_fc00_0001_e9dc, instruction(&boot, 8)),
+            0xffff_fc00_0017_7000
+        );
+        assert_eq!(load_store_unsigned_offset(instruction(&boot, 9)), 0x30);
+
+        let selector = decode_hex::<0x1c>(SELECTOR);
+        let extract = instruction(&selector, 0);
+        assert_eq!((extract >> 5) & 0x1f, 1);
+        assert_eq!(extract & 0x1f, 8);
+        assert_eq!((extract >> 16) & 0x3f, 48);
+        assert_eq!(
+            ((extract >> 10) & 0x3f) - ((extract >> 16) & 0x3f) + 1,
+            6
+        );
+        let compare_type4 = instruction(&selector, 5);
+        assert_eq!((compare_type4 >> 5) & 0x1f, 8);
+        assert_eq!((compare_type4 >> 10) & 0xfff, 4);
+        assert_eq!(
+            conditional_branch_target(0xffff_fc00_0002_2db0, instruction(&selector, 6)),
+            G17P_TYPE4_EP_HANDLER_LINK_ADDRESS
+        );
+
+        let publish = decode_hex::<0x10>(PUBLISH);
+        assert_eq!(
+            adrp_target(G17P_TYPE4_EP_HANDLER_LINK_ADDRESS, instruction(&publish, 0)),
+            0xffff_fc00_0017_7000
+        );
+        assert_eq!(add_immediate(instruction(&publish, 1)), 0x190);
+        assert_eq!(wide_immediate(instruction(&publish, 2)), G17P_TYPE4_PENDING_MASK);
+        assert_eq!(
+            branch_target(
+                G17P_TYPE4_EP_HANDLER_LINK_ADDRESS + 0xc,
+                instruction(&publish, 3)
+            ),
+            0xffff_fc00_0002_2ebc
+        );
+
+        let common = decode_hex::<0xc>(COMMON);
+        assert_eq!(instruction(&common, 0), 0xf8e8_3008);
+        let take = decode_hex::<0x20>(TAKE);
+        assert_eq!(instruction(&take, 4), 0xf83c_1275);
+
+        let deferred = decode_hex::<0x14>(DEFERRED);
+        assert_eq!(
+            adrp_target(
+                G17P_SCHEDULER_DEFERRED_REQUEUE_LINK_ADDRESS,
+                instruction(&deferred, 0)
+            ),
+            0xffff_fc00_0017_7000
+        );
+        assert_eq!(load_store_unsigned_offset(instruction(&deferred, 1)), 0x1e0);
+        assert_eq!(load_store_unsigned_offset(instruction(&deferred, 3)), 0x1e0);
+        assert_eq!(
+            0xffff_fc00_0017_7000 + 0x1e0,
+            G17P_SCHEDULER_ROOT_LINK_ADDRESS + G17P_SCHEDULER_ROOT_DEFERRED_OFFSET as u64
+        );
+
+        let thunk = decode_hex::<0x28>(THUNK);
+        assert_eq!(
+            adrp_target(G17P_TYPE4_THUNK_LINK_ADDRESS, instruction(&thunk, 0)),
+            0xffff_fc00_0017_7000
+        );
+        assert_eq!(load_store_unsigned_offset(instruction(&thunk, 1)), 0x1f8);
+        assert_eq!(instruction(&thunk, 2), 0x721d_051f);
+        assert_eq!(
+            conditional_branch_target(
+                G17P_TYPE4_THUNK_LINK_ADDRESS + 0xc,
+                instruction(&thunk, 3)
+            ),
+            G17P_TYPE4_THUNK_LINK_ADDRESS + 0x24
+        );
+        assert_eq!(
+            adrp_target(G17P_TYPE4_THUNK_LINK_ADDRESS + 0x10, instruction(&thunk, 4)),
+            0xffff_fc00_0017_7000
+        );
+        assert_eq!(load_store_unsigned_offset(instruction(&thunk, 5)), 0x30);
+        assert_eq!(load_store_unsigned_offset(instruction(&thunk, 6)), 0x1b0);
+        assert_eq!(load_store_unsigned_offset(instruction(&thunk, 7)), 0);
+        assert_eq!(
+            branch_target(G17P_TYPE4_THUNK_LINK_ADDRESS + 0x20, instruction(&thunk, 8)),
+            G17P_TYPE4_DRAIN_LINK_ADDRESS
+        );
+
+        let dispatch = decode_hex::<0x18>(DISPATCH);
+        assert_eq!(
+            u64::from_le_bytes(dispatch[0..8].try_into().unwrap()),
+            G17P_TYPE4_PENDING_MASK
+        );
+        let signed_target = u64::from_le_bytes(dispatch[8..16].try_into().unwrap());
+        assert_eq!(signed_target >> 48, 0x8030);
+        assert_eq!(
+            signed_target & 0xffff_ffff,
+            G17P_TYPE4_THUNK_LINK_ADDRESS & 0xffff_ffff
+        );
+        assert_eq!(u64::from_le_bytes(dispatch[16..24].try_into().unwrap()), 0);
+
+        let cursors = decode_hex::<0x18>(CURSORS);
+        assert_eq!(load_store_unsigned_offset(instruction(&cursors, 1)), 0x1a8);
+        assert_eq!(load_store_unsigned_offset(instruction(&cursors, 3)), 0x1a0);
+        assert_eq!(
+            G17P_TYPE4_MAIN_CONTROL_POINTER_OFFSETS,
+            [0x1a0, 0x1a8, 0x1b0]
         );
     }
 

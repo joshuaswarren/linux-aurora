@@ -901,6 +901,10 @@ fn finish_boot_session(
         pdev.as_ref(),
         "G17P compute: candidate readiness-per-record-v2 armed\n"
     );
+    dev_info!(
+        pdev.as_ref(),
+        "G17P diagnostic: type4-j700-a000-pointer-chain-v2 armed\n"
+    );
     Ok(G17PBootedSession {
         cpus,
         gfx_state,
@@ -1208,6 +1212,32 @@ impl G17PLiveRuntime {
             let staged = self.manager.as_mut().ok_or(ENODEV)?.control_counters()?;
             if !staged.compute_readiness_record_staged(boundary.producer_after) {
                 return Err(EIO);
+            }
+            match self
+                .manager
+                .as_mut()
+                .ok_or(ENODEV)?
+                .control_pointer_snapshot()
+            {
+                Ok(pointer) => {
+                    let exact = pointer.raw_state_pointers == pointer.expected_state_pointers;
+                    dev_info!(
+                        self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                        "G17P type4 pointer-chain checkpoint={} main={:#x} raw(actual,mirror,producer)={:#x?} expected={:#x?} values={:?} exact={}\n",
+                        phase,
+                        pointer.main_config,
+                        pointer.raw_state_pointers,
+                        pointer.expected_state_pointers,
+                        pointer.state_values,
+                        exact,
+                    )
+                }
+                Err(error) => dev_err!(
+                    self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                    "G17P type4 pointer-chain checkpoint={} read failed ({:?})\n",
+                    phase,
+                    error,
+                ),
             }
             self.manager
                 .as_ref()
