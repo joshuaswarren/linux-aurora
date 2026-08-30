@@ -60,8 +60,7 @@ pub(crate) const G17P_CL_LOW_VA_START: u64 = 0x70_0000_0000;
 pub(crate) const G17P_CL_LOW_VA_END: u64 = 0x71_0000_0000;
 /// Dynamic queue, descriptor, and render state live above every native fixed
 /// low resource. The lower 32 MiB remain available for temporal bootstrap,
-/// readiness, and B2 aliases. Relocatable completion aliases also belong in
-/// this dynamic range when their live owner is implemented.
+/// readiness, B2 aliases, and the fixed completion-queue aliases.
 pub(crate) const G17P_CL_DYNAMIC_LOW_VA_START: u64 = 0x70_0200_0000;
 
 #[cfg(not(test))]
@@ -3300,8 +3299,10 @@ struct G17MappedResources {
     primary_b2_alias_1: MappedObject,
     primary_b2_alias_0_low: mmu::KernelMapping,
     primary_b2_alias_1_low: mmu::KernelMapping,
-    hw_region_0: MappedObject,
-    hw_region_1: MappedObject,
+    completion_ordinal_0: MappedObject,
+    completion_ordinal_0_low: mmu::KernelMapping,
+    completion_ordinal_2: MappedObject,
+    completion_ordinal_2_low: mmu::KernelMapping,
     fwctl: MappedObject,
     control_shared: MappedObject,
     control_shared_inner: MappedObject,
@@ -3754,22 +3755,61 @@ impl G17ResourceOwner {
             G17P_CL_B2_OBJECT_SIZE,
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
-        let hw_region_0 = map_fixed_object(
+        let mut completion_ordinal_0 = map_fixed_object(
             dev,
             address_space.uat.kernel_vm(),
-            "hardware region 0",
-            shared_cluster.iova() + g17_initdata::NATIVE_HW_REGION_BUNDLE_OFFSETS[0] as u64,
-            mmu::UAT_PGSZ,
+            "KSM completion ordinal 0 high",
+            shared_cluster.iova()
+                + g17_initdata::G17P_KSM_COMPLETION_HIGH_BUNDLE_OFFSETS[0] as u64,
+            g17_initdata::G17P_KSM_COMPLETION_BACKING_SIZE,
             mmu::PROT_FW_SHARED_RW,
         )?;
-        let hw_region_1 = map_fixed_object(
+        let completion_ordinal_0_low = completion_ordinal_0
+            .map_alias_at(
+                address_space.uat.kernel_lower_vm(),
+                g17_initdata::G17P_KSM_COMPLETION_LOW_VAS[0],
+                mmu::PROT_FW_SHARED_RW,
+            )
+            .map_err(|error| {
+                dev_err!(
+                    dev.as_ref(),
+                    "G17P resources: KSM completion ordinal 0 low alias failed ({:?})\n",
+                    error
+                );
+                error
+            })?;
+        let mut completion_ordinal_2 = map_fixed_object(
             dev,
             address_space.uat.kernel_vm(),
-            "hardware region 1",
-            shared_cluster.iova() + g17_initdata::NATIVE_HW_REGION_BUNDLE_OFFSETS[1] as u64,
-            mmu::UAT_PGSZ,
+            "KSM completion ordinal 2 high",
+            shared_cluster.iova()
+                + g17_initdata::G17P_KSM_COMPLETION_HIGH_BUNDLE_OFFSETS[1] as u64,
+            g17_initdata::G17P_KSM_COMPLETION_BACKING_SIZE,
             mmu::PROT_FW_SHARED_RW,
         )?;
+        let completion_ordinal_2_low = completion_ordinal_2
+            .map_alias_at(
+                address_space.uat.kernel_lower_vm(),
+                g17_initdata::G17P_KSM_COMPLETION_LOW_VAS[1],
+                mmu::PROT_FW_SHARED_RW,
+            )
+            .map_err(|error| {
+                dev_err!(
+                    dev.as_ref(),
+                    "G17P resources: KSM completion ordinal 2 low alias failed ({:?})\n",
+                    error
+                );
+                error
+            })?;
+        dev_info!(
+            dev.as_ref(),
+            "G17P resources: KSM completion aliases ready ord0=[{:#x},{:#x}] ord2=[{:#x},{:#x}] size={:#x}\n",
+            completion_ordinal_0_low.iova(),
+            completion_ordinal_0.iova(),
+            completion_ordinal_2_low.iova(),
+            completion_ordinal_2.iova(),
+            g17_initdata::G17P_KSM_COMPLETION_BACKING_SIZE
+        );
         // Claim the complete fixed bundle topology before placing dynamic
         // initdata objects, so none can take a captured ring or out-of-line
         // hardware-data address.
@@ -3905,8 +3945,8 @@ impl G17ResourceOwner {
             ("roots", &roots),
             ("shared cluster", &shared_cluster),
             ("B2 sentinel", &primary_b2_sentinel),
-            ("hardware region 0", &hw_region_0),
-            ("hardware region 1", &hw_region_1),
+            ("KSM completion ordinal 0 high", &completion_ordinal_0),
+            ("KSM completion ordinal 2 high", &completion_ordinal_2),
             ("region A", &region_a),
             ("region C", &region_c),
             ("primary state", &primary_state),
@@ -3926,6 +3966,26 @@ impl G17ResourceOwner {
                     name,
                     object.iova(),
                     object.logical_size
+                );
+                return Err(EIO);
+            }
+        }
+        for (name, mapping) in [
+            ("KSM completion ordinal 0 low", &completion_ordinal_0_low),
+            ("KSM completion ordinal 2 low", &completion_ordinal_2_low),
+        ] {
+            if mapping.size() != g17_initdata::G17P_KSM_COMPLETION_BACKING_SIZE
+                || !address_space.uat.kernel_lower_vm().covers_range(
+                    mapping.iova(),
+                    mapping.size() as u64,
+                    false,
+                    false,
+                )
+            {
+                dev_err!(
+                    dev.as_ref(),
+                    "G17P resources: {} low mapping is incomplete\n",
+                    name
                 );
                 return Err(EIO);
             }
@@ -3958,12 +4018,21 @@ impl G17ResourceOwner {
         }
         dev_info!(dev.as_ref(), "G17P resources: all kernel-high mappings cover\n");
         validate_handoff(&handoff).map_err(|_| EINVAL)?;
-        let region_record_addrs = [hw_region_0.iova(), hw_region_1.iova()];
+        let completion_aliases = [
+            g17_initdata::G17PKsmCompletionAliases {
+                low: completion_ordinal_0_low.iova(),
+                high: completion_ordinal_0.iova(),
+            },
+            g17_initdata::G17PKsmCompletionAliases {
+                low: completion_ordinal_2_low.iova(),
+                high: completion_ordinal_2.iova(),
+            },
+        ];
         shared_cluster.with_bytes_mut(|bytes| {
             g17_initdata::encode_hw_data(
                 &g17_initdata::T8140_REGISTER_WINDOWS,
                 &g17_initdata::T8140_REGISTER_FLAG_ONLY_SLOTS,
-                region_record_addrs,
+                completion_aliases,
                 &mut bytes[..g17_initdata::HW_DATA_SIZE],
             )
             .map_err(|_| EINVAL)
@@ -4038,8 +4107,10 @@ impl G17ResourceOwner {
                 primary_b2_alias_1,
                 primary_b2_alias_0_low,
                 primary_b2_alias_1_low,
-                hw_region_0,
-                hw_region_1,
+                completion_ordinal_0,
+                completion_ordinal_0_low,
+                completion_ordinal_2,
+                completion_ordinal_2_low,
                 fwctl,
                 control_shared,
                 control_shared_inner,
@@ -4671,11 +4742,11 @@ impl G17ResourceOwner {
             )
             .map_err(|_| EINVAL)
         })?;
-        self.resources.hw_region_0.with_bytes_mut(|bytes| {
+        self.resources.completion_ordinal_0.with_bytes_mut(|bytes| {
             bytes.fill(0);
             Ok(())
         })?;
-        self.resources.hw_region_1.with_bytes_mut(|bytes| {
+        self.resources.completion_ordinal_2.with_bytes_mut(|bytes| {
             bytes.fill(0);
             Ok(())
         })?;
@@ -4803,15 +4874,21 @@ impl G17ResourceOwner {
         let shared = self.handoff.shared;
         let primary = self.handoff.primary;
         let secondary = self.handoff.secondary;
-        let region_record_addrs = [
-            self.resources.hw_region_0.iova(),
-            self.resources.hw_region_1.iova(),
+        let completion_aliases = [
+            g17_initdata::G17PKsmCompletionAliases {
+                low: self.resources.completion_ordinal_0_low.iova(),
+                high: self.resources.completion_ordinal_0.iova(),
+            },
+            g17_initdata::G17PKsmCompletionAliases {
+                low: self.resources.completion_ordinal_2_low.iova(),
+                high: self.resources.completion_ordinal_2.iova(),
+            },
         ];
         self.resources.shared_cluster.with_bytes_mut(|bytes| {
             g17_initdata::encode_hw_data(
                 &g17_initdata::T8140_REGISTER_WINDOWS,
                 &g17_initdata::T8140_REGISTER_FLAG_ONLY_SLOTS,
-                region_record_addrs,
+                completion_aliases,
                 &mut bytes[..g17_initdata::HW_DATA_SIZE],
             )
             .map_err(|_| EINVAL)
@@ -5560,6 +5637,57 @@ mod tests {
         );
         assert_eq!(g17_initdata::T8140_REGISTER_WINDOWS[17].slot, 41);
         assert_eq!(g17_initdata::T8140_REGISTER_FLAG_ONLY_SLOTS.len(), 17);
+    }
+
+    #[test]
+    fn g17p_normal_cl_completion_storage_matches_inline_descriptor_abi() {
+        assert_eq!(g17_submission::G17P_NORMAL_CL_COMPLETION_ORDINAL, 0);
+        assert_eq!(g17_submission::G17P_KSM_COMPLETION_PRESENT_ORDINALS, [0, 2]);
+        assert_eq!(g17_initdata::G17P_KSM_COMPLETION_PRESENT_ORDINALS, [0, 2]);
+        assert_eq!(g17_initdata::G17P_KSM_COMPLETION_BACKING_SIZE, 0x20000);
+        assert_eq!(
+            g17_initdata::G17P_KSM_COMPLETION_BACKING_SIZE,
+            g17_submission::G17P_KSM_COMPLETION_BACKING_SIZE
+        );
+        let aliases = [
+            g17_initdata::G17PKsmCompletionAliases {
+                low: g17_initdata::G17P_KSM_COMPLETION_LOW_VAS[0],
+                high: g17_initdata::NATIVE_SHARED_CLUSTER_GPU_VA
+                    + g17_initdata::G17P_KSM_COMPLETION_HIGH_BUNDLE_OFFSETS[0] as u64,
+            },
+            g17_initdata::G17PKsmCompletionAliases {
+                low: g17_initdata::G17P_KSM_COMPLETION_LOW_VAS[1],
+                high: g17_initdata::NATIVE_SHARED_CLUSTER_GPU_VA
+                    + g17_initdata::G17P_KSM_COMPLETION_HIGH_BUNDLE_OFFSETS[1] as u64,
+            },
+        ];
+        let extent = g17_initdata::G17P_KSM_COMPLETION_BACKING_SIZE as u64;
+        assert!(aliases[0].low + extent <= aliases[1].low);
+        assert!(aliases[0].high + extent <= aliases[1].high);
+
+        let mut hw = vec![0xa5; g17_initdata::HW_DATA_SIZE];
+        g17_initdata::encode_hw_data(&[], &[], aliases, &mut hw).unwrap();
+        for ordinal in [1usize, 3] {
+            let base = g17_initdata::G17P_KSM_COMPLETION_TABLE_OFFSET
+                + ordinal * g17_initdata::G17P_KSM_COMPLETION_DESCRIPTOR_STRIDE;
+            assert_eq!(&hw[base..base + 0x20], &[0; 0x20]);
+        }
+        for (pair, ordinal) in aliases
+            .iter()
+            .zip(g17_submission::G17P_KSM_COMPLETION_PRESENT_ORDINALS)
+        {
+            let expected = g17_submission::encode_g17p_ksm_completion_descriptor(
+                g17_submission::G17ChannelAbiTarget::A18ProG17P,
+                ordinal,
+                pair.low,
+                pair.high,
+                g17_submission::G17P_KSM_COMPLETION_CAPACITY,
+            )
+            .unwrap();
+            let base = g17_initdata::G17P_KSM_COMPLETION_TABLE_OFFSET
+                + ordinal as usize * g17_initdata::G17P_KSM_COMPLETION_DESCRIPTOR_STRIDE;
+            assert_eq!(&hw[base..base + expected.len()], &expected);
+        }
     }
 
     #[test]

@@ -3368,6 +3368,13 @@ pub(crate) const fn prepare_g17p_compute_sksm_queue_config(
 pub(crate) const G17P_KSM_COMPLETION_QUEUE_COUNT: u8 = 4;
 pub(crate) const G17P_KSM_COMPLETION_DESCRIPTOR_SIZE: usize = 0x20;
 pub(crate) const G17P_KSM_COMPLETION_ENTRY_SIZE: u32 = 0x40;
+pub(crate) const G17P_KSM_COMPLETION_CAPACITY: u32 = 0x800;
+pub(crate) const G17P_KSM_COMPLETION_BACKING_SIZE: usize =
+    G17P_KSM_COMPLETION_CAPACITY as usize * G17P_KSM_COMPLETION_ENTRY_SIZE as usize;
+pub(crate) const G17P_KSM_COMPLETION_PRESENT_ORDINALS: [u8; 2] = [0, 2];
+/// Normal direct CL completion uses ordinal 0, independently of the compute
+/// SKSM queue's numeric completion selector 2.
+pub(crate) const G17P_NORMAL_CL_COMPLETION_ORDINAL: u8 = 0;
 
 /// Exact field offsets in one host-produced G17P completion descriptor.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -6461,6 +6468,10 @@ mod tests {
         assert_eq!(G17P_KSM_COMPLETION_QUEUE_COUNT, 4);
         assert_eq!(G17P_KSM_COMPLETION_DESCRIPTOR_SIZE, 0x20);
         assert_eq!(G17P_KSM_COMPLETION_ENTRY_SIZE, 0x40);
+        assert_eq!(G17P_KSM_COMPLETION_CAPACITY, 0x800);
+        assert_eq!(G17P_KSM_COMPLETION_BACKING_SIZE, 0x20000);
+        assert_eq!(G17P_KSM_COMPLETION_PRESENT_ORDINALS, [0, 2]);
+        assert_eq!(G17P_NORMAL_CL_COMPLETION_ORDINAL, 0);
         assert_eq!(
             G17P_KSM_COMPLETION_DESCRIPTOR_LAYOUT,
             G17PKsmCompletionDescriptorLayout {
