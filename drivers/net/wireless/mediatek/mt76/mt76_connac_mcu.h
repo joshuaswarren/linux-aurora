@@ -1354,9 +1354,13 @@ enum {
 	MCU_CE_CMD_BASIC_CONFIG = 0x02,
 	MCU_CE_CMD_START_HW_SCAN = 0x03,
 	MCU_CE_CMD_SET_PS_PROFILE = 0x05,
+	MCU_CE_CMD_SET_INFRASTRUCTURE = 0x09,
 	MCU_CE_CMD_SET_RX_FILTER = 0x0a,
 	MCU_CE_CMD_SET_CHAN_DOMAIN = 0x0f,
 	MCU_CE_CMD_BSS_ACTIVATE_CTRL = 0x11,
+	MCU_CE_CMD_SET_BSS_INFO = 0x12,
+	MCU_CE_CMD_UPDATE_STA_RECORD = 0x13,
+	MCU_CE_CMD_REMOVE_STA_RECORD = 0x14,
 	MCU_CE_CMD_SET_BSS_CONNECTED = 0x16,
 	MCU_CE_CMD_SET_BSS_ABORT = 0x17,
 	MCU_CE_CMD_CANCEL_HW_SCAN = 0x1b,
@@ -1372,6 +1376,7 @@ enum {
 	MCU_CE_CMD_GET_NIC_CAPAB = 0x8a,
 	MCU_CE_CMD_RSSI_MONITOR = 0xa1,
 	MCU_CE_CMD_SET_MU_EDCA_PARMS = 0xb0,
+	MCU_CE_CMD_SET_STA_MAC = 0xb8,
 	MCU_CE_CMD_REG_WRITE = 0xc0,
 	MCU_CE_CMD_REG_READ = 0xc0,
 	MCU_CE_CMD_CHIP_CONFIG = 0xca,
@@ -2043,6 +2048,7 @@ void mt76_connac_mcu_build_rnr_scan_param(struct mt76_dev *mdev,
 					  struct cfg80211_scan_request *sreq);
 int mt76_connac_mcu_hw_scan(struct mt76_phy *phy, struct ieee80211_vif *vif,
 			    struct ieee80211_scan_request *scan_req);
+int mt76_connac_mcu_hw_scan_next(struct mt76_phy *phy);
 int mt76_connac_mcu_cancel_hw_scan(struct mt76_phy *phy,
 				   struct ieee80211_vif *vif);
 int mt76_connac_mcu_sched_scan_req(struct mt76_phy *phy,

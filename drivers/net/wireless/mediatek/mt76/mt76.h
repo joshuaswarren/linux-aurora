@@ -930,6 +930,11 @@ struct mt76_phy {
 
 	struct delayed_work mac_work;
 	u8 mac_work_count;
+	/* Pending bounded firmware scan requests.  MT7932's Apple firmware
+	 * completes measured 2.4/5 GHz batches separately instead of accepting
+	 * one combined 39-channel request.
+	 */
+	struct sk_buff_head scan_pending;
 
 	struct {
 		struct sk_buff *head;

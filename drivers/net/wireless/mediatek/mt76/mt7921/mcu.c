@@ -363,6 +363,12 @@ mt7932_mcu_scan_idx_event(struct mt792x_dev *dev, const u8 *content, u16 len)
 		{ 0xd818, "channel-state-detail" },
 		{ 0xd7b8, "channel-set" },
 		{ 0xd794, "channel-anomaly" },
+		/* Exact indexed-log sites from the deployed 25G83 firmware.  These
+		 * distinguish an AP auth response consumed by firmware from a frame
+		 * that never entered the chip's authentication state machine.
+		 */
+		{ 0x19af4, "firmware-tx-auth" },
+		{ 0x1b47c, "firmware-rx-auth" },
 		/* Exact 25G83 code/table integrity assertions.  NDS32 RE proved both
 		 * operands are link-time literals; these cannot diagnose runtime
 		 * restore state and are retained only to label unexpected corruption.
@@ -1143,7 +1149,7 @@ static int
 mt7932_validate_live_start_transcript(const struct firmware *fw)
 {
 	static const u8 magic[8] = { 'J', '7', 'C', 'M', 'D', 'T', 'R', '1' };
-	static const u8 prefix_transport[] = { 1, 1, 1, 0, 1, 2 };
+	static const u8 prefix_transport[] = { 1, 1, 1, 0, 1, 1 };
 	static const u8 prefix_cid[] = { 0xed, 0xed, 0xed, 0xbf, 0xed, 0xea };
 	static const u8 prefix_ext_cid[] = {
 		0x81, 0x21, 0xa9, 0x00, 0xc1, 0x51,
@@ -1457,6 +1463,10 @@ static int __mt7932_mcu_load_live_start_phase(struct mt792x_dev *dev,
 	const struct firmware *fw;
 	size_t offset;
 	u32 count, i, queued = 0;
+	u32 pipeline_88_95[8][7] = {};
+	u32 ordinal92_desc[4] = {};
+	dma_addr_t ordinal92_dma = 0;
+	u32 ordinal92_dma_len = 0, ordinal92_slot = 0;
 	bool runtime_irq_disabled = false;
 	bool runtime_tasklet_disabled = false;
 	bool runtime_console_quiet = false;
@@ -1572,6 +1582,28 @@ static int __mt7932_mcu_load_live_start_phase(struct mt792x_dev *dev,
 		}
 		if (epoch_only)
 			goto runtime_epoch;
+		if (phase == MT7932_LIVE_PHASE_PRE_CAL &&
+		    ordinal >= 88 && ordinal <= 95) {
+			u32 *state = pipeline_88_95[ordinal - 88];
+
+			/* Synchronized 25G83 evidence identifies the first remaining
+			 * divergence in these direct, non-selector queue states.  Retain
+			 * eight bounded snapshots in memory and print only after ordinal 95
+			 * so DockChannel cannot perturb the critical burst.
+			 */
+			state[0] = mt76_rr(dev, MT_WFDMA0(0xb10));
+			state[1] = mt76_rr(dev, MT_WFDMA0(0xb14));
+			state[2] = mt76_rr(dev, MT_WFDMA0(0xb18));
+			state[3] = mt76_rr(dev, MT_WFDMA_EXT_CSR(0x510));
+			state[4] = mt76_rr(dev, MT_WFDMA_EXT_CSR(0x514));
+			state[5] = mt76_rr(dev, MT_WFDMA_EXT_CSR(0x52c));
+			state[6] = mt76_rr(dev, MT_WFDMA_EXT_CSR(0x530));
+		}
+		if (phase == MT7932_LIVE_PHASE_PRE_CAL && ordinal == 92) {
+			struct mt76_queue *q = dev->mt76.q_mcu[MT_MCUQ_WM];
+
+			ordinal92_slot = q ? READ_ONCE(q->head) : 0;
+		}
 		ret = mt76_mcu_send_msg(&dev->mt76, cmd, data, data_len, false);
 		if (ret) {
 			if (phase == MT7932_LIVE_PHASE_PRE_CAL && ret == -ENOMEM) {
@@ -1584,6 +1616,24 @@ static int __mt7932_mcu_load_live_start_phase(struct mt792x_dev *dev,
 					ordinal, ret, drain_ret);
 			}
 			goto release_firmware;
+		}
+		if (phase == MT7932_LIVE_PHASE_PRE_CAL && ordinal == 92) {
+			struct mt76_queue *q = dev->mt76.q_mcu[MT_MCUQ_WM];
+			struct mt76_queue_entry *entry;
+			struct mt76_desc *desc;
+
+			if (!q || ordinal92_slot >= q->ndesc) {
+				ret = -EIO;
+				goto release_firmware;
+			}
+			desc = &q->desc[ordinal92_slot];
+			entry = &q->entry[ordinal92_slot];
+			ordinal92_desc[0] = le32_to_cpu(READ_ONCE(desc->buf0));
+			ordinal92_desc[1] = le32_to_cpu(READ_ONCE(desc->ctrl));
+			ordinal92_desc[2] = le32_to_cpu(READ_ONCE(desc->buf1));
+			ordinal92_desc[3] = le32_to_cpu(READ_ONCE(desc->info));
+			ordinal92_dma = entry->dma_addr[0];
+			ordinal92_dma_len = entry->dma_len[0];
 		}
 		queued++;
 		if (phase != MT7932_LIVE_PHASE_PRE_CAL ||
@@ -1609,7 +1659,7 @@ runtime_epoch:
 			struct mt76_queue *q =
 				dev->mt76.q_mcu[MT_MCUQ_WM];
 			u32 cidx, didx, ext0, glo, page, pktmax;
-			u32 qmap[4], sched[2], restore_polls;
+			u32 qmap[4], sched[2];
 			u64 fw_own_start_ns, fw_own_sync_ns;
 			u64 fw_own_mask_ns, fw_own_drv_ns;
 
@@ -1714,13 +1764,13 @@ runtime_epoch:
 			dev_info(dev->mt76.dev,
 				 "J700_MT7932_RUNTIME_DMASHDL_SELECTOR_ARMED: before=0x%08x after=0x28c004df action=preserve-no-write phase=before-wpdma-reset source=run191+run541\n",
 				 ext0);
-			/* RESET_DONE ends SER Step 2, which resets PDMA, DMASHDL and MAC.
-			 * Run 191 performs no host DMASHDL access before rebuilding WFDMA;
-			 * it proceeds through DMA_INIT, RECOVERY_DONE and NORMAL_STATE, then
-			 * submits command 88.  Keep the reset/default image untouched here.
-			 * Firmware's 0x0095cdf0 reset wrapper performs the policy restore as
-			 * part of the remaining recovery steps; validate its final image only
-			 * after NORMAL_STATE below.
+			/* RESET_DONE ends SER Step 2 and leaves the measured reset/default
+			 * DMASHDL image.  The synchronized 25G83 hardware trace then records
+			 * eight host writes before DMA_INIT.  Their order is part of the
+			 * scheduler epoch contract: packet maximum, queue maps 0..3, priority
+			 * sets 0..1, then page control last.  Cycle631 used the same values
+			 * but wrote page first; Cycle632 omitted them and proved firmware does
+			 * not restore the image on its own.
 			 */
 			page = mt76_rr(dev, MT_DMASHDL_PAGE);
 			pktmax = mt76_rr(dev, MT_DMASHDL_PKT_MAX_SIZE);
@@ -1731,9 +1781,38 @@ runtime_epoch:
 			sched[0] = mt76_rr(dev, MT_DMASHDL_SCHED_SET(0));
 			sched[1] = mt76_rr(dev, MT_DMASHDL_SCHED_SET(1));
 			dev_info(dev->mt76.dev,
-				 "J700_MT7932_RUNTIME_DMASHDL_SER_RESET_IMAGE: phase=after-reset-done-before-dma-init page=0x%08x pkt=0x%08x qmap=%08x/%08x/%08x/%08x pri=%08x/%08x host_writes=0 next=wpdma-reset,dma-init,recovery-done,normal-state source=run191-events14284-14417\n",
+				 "J700_MT7932_RUNTIME_DMASHDL_SER_RESET_IMAGE: phase=after-reset-done-before-host-restore page=0x%08x pkt=0x%08x qmap=%08x/%08x/%08x/%08x pri=%08x/%08x next=exact-eight-host-writes source=macos-transition-20260831\n",
 				 page, pktmax, qmap[0], qmap[1], qmap[2], qmap[3],
 				 sched[0], sched[1]);
+			mt76_wr(dev, MT_DMASHDL_PKT_MAX_SIZE, 0x00000001);
+			mt76_wr(dev, MT_DMASHDL_Q_MAP(0), 0x76543210);
+			mt76_wr(dev, MT_DMASHDL_Q_MAP(1), 0xfedcba98);
+			mt76_wr(dev, MT_DMASHDL_Q_MAP(2), 0x11111000);
+			mt76_wr(dev, MT_DMASHDL_Q_MAP(3), 0x11111000);
+			mt76_wr(dev, MT_DMASHDL_SCHED_SET(0), 0x76543210);
+			mt76_wr(dev, MT_DMASHDL_SCHED_SET(1), 0xfedcba98);
+			mt76_wr(dev, MT_DMASHDL_PAGE, 0x003d1000);
+			page = mt76_rr(dev, MT_DMASHDL_PAGE);
+			pktmax = mt76_rr(dev, MT_DMASHDL_PKT_MAX_SIZE);
+			qmap[0] = mt76_rr(dev, MT_DMASHDL_Q_MAP(0));
+			qmap[1] = mt76_rr(dev, MT_DMASHDL_Q_MAP(1));
+			qmap[2] = mt76_rr(dev, MT_DMASHDL_Q_MAP(2));
+			qmap[3] = mt76_rr(dev, MT_DMASHDL_Q_MAP(3));
+			sched[0] = mt76_rr(dev, MT_DMASHDL_SCHED_SET(0));
+			sched[1] = mt76_rr(dev, MT_DMASHDL_SCHED_SET(1));
+			if (page != 0x003d1000 || pktmax != 0x00000001 ||
+			    qmap[0] != 0x76543210 || qmap[1] != 0xfedcba98 ||
+			    qmap[2] != 0x11111000 || qmap[3] != 0x11111000 ||
+			    sched[0] != 0x76543210 || sched[1] != 0xfedcba98) {
+				dev_err(dev->mt76.dev,
+					"J700_MT7932_RUNTIME_DMASHDL_HOST_RESTORE_FAIL: page=0x%08x pkt=0x%08x qmap=%08x/%08x/%08x/%08x pri=%08x/%08x\n",
+					page, pktmax, qmap[0], qmap[1], qmap[2],
+					qmap[3], sched[0], sched[1]);
+				ret = -EIO;
+				goto release_firmware;
+			}
+			dev_info(dev->mt76.dev,
+				 "J700_MT7932_RUNTIME_DMASHDL_HOST_RESTORE_PASS: order=1c,60,64,68,6c,70,74,0c values=00000001/76543210/fedcba98/11111000/11111000/76543210/fedcba98/003d1000 source=macos-transition-20260831\n");
 			/* Cycle603 crossed RESET_DONE for the first time, then stopped inside
 			 * the previously unreachable WPDMA reset while the console was quiet.
 			 * Restore DockChannel at this proven SER boundary so the existing
@@ -1836,44 +1915,30 @@ runtime_epoch:
 			if (ret)
 				goto release_firmware;
 			mt7932_runtime_irq_publish(dev, "after-normal-state");
-			/* Successful Apple reaches command 88 only after NORMAL_STATE, with
-			 * the exact policy image restored and no host DMASHDL writes in the
-			 * reset epoch.  Give the firmware's internal restore a bounded 1 ms
-			 * read-only convergence window, then fail before command 88 if any
-			 * word is wrong.
+			/* The host restore above is the measured transition.  NORMAL_STATE
+			 * must preserve it exactly before command 88.
 			 */
-			for (restore_polls = 0; restore_polls < 100; restore_polls++) {
-				page = mt76_rr(dev, MT_DMASHDL_PAGE);
-				pktmax = mt76_rr(dev, MT_DMASHDL_PKT_MAX_SIZE);
-				qmap[0] = mt76_rr(dev, MT_DMASHDL_Q_MAP(0));
-				qmap[1] = mt76_rr(dev, MT_DMASHDL_Q_MAP(1));
-				qmap[2] = mt76_rr(dev, MT_DMASHDL_Q_MAP(2));
-				qmap[3] = mt76_rr(dev, MT_DMASHDL_Q_MAP(3));
-				sched[0] = mt76_rr(dev, MT_DMASHDL_SCHED_SET(0));
-				sched[1] = mt76_rr(dev, MT_DMASHDL_SCHED_SET(1));
-				if (page == 0x003d1000 && pktmax == 0x00000001 &&
-				    qmap[0] == 0x76543210 &&
-				    qmap[1] == 0xfedcba98 &&
-				    qmap[2] == 0x11111000 &&
-				    qmap[3] == 0x11111000 &&
-				    sched[0] == 0x76543210 &&
-				    sched[1] == 0xfedcba98)
-					break;
-				udelay(10);
-			}
-			if (restore_polls == 100) {
+			page = mt76_rr(dev, MT_DMASHDL_PAGE);
+			pktmax = mt76_rr(dev, MT_DMASHDL_PKT_MAX_SIZE);
+			qmap[0] = mt76_rr(dev, MT_DMASHDL_Q_MAP(0));
+			qmap[1] = mt76_rr(dev, MT_DMASHDL_Q_MAP(1));
+			qmap[2] = mt76_rr(dev, MT_DMASHDL_Q_MAP(2));
+			qmap[3] = mt76_rr(dev, MT_DMASHDL_Q_MAP(3));
+			sched[0] = mt76_rr(dev, MT_DMASHDL_SCHED_SET(0));
+			sched[1] = mt76_rr(dev, MT_DMASHDL_SCHED_SET(1));
+			if (page != 0x003d1000 || pktmax != 0x00000001 ||
+			    qmap[0] != 0x76543210 || qmap[1] != 0xfedcba98 ||
+			    qmap[2] != 0x11111000 || qmap[3] != 0x11111000 ||
+			    sched[0] != 0x76543210 || sched[1] != 0xfedcba98) {
 				dev_err(dev->mt76.dev,
-					"J700_MT7932_RUNTIME_DMASHDL_SER_RESTORE_FAIL: phase=after-normal-state page=0x%08x pkt=0x%08x qmap=%08x/%08x/%08x/%08x pri=%08x/%08x polls=%u wait_us=%u host_writes=0\n",
+					"J700_MT7932_RUNTIME_DMASHDL_POST_NORMAL_FAIL: page=0x%08x pkt=0x%08x qmap=%08x/%08x/%08x/%08x pri=%08x/%08x\n",
 					page, pktmax, qmap[0], qmap[1], qmap[2],
-					qmap[3], sched[0], sched[1], restore_polls,
-					restore_polls * 10);
+					qmap[3], sched[0], sched[1]);
 				ret = -EIO;
 				goto release_firmware;
 			}
 			dev_info(dev->mt76.dev,
-				 "J700_MT7932_RUNTIME_DMASHDL_SER_RESTORE_PASS: phase=after-normal-state page=0x%08x pkt=0x%08x qmap=76543210/fedcba98/11111000/11111000 pri=76543210/fedcba98 polls=%u wait_us=%u host_writes=0 source=run191-events14284-14418+firmware-0x0095cdf0\n",
-				 page, pktmax, restore_polls + 1,
-				 restore_polls * 10);
+				 "J700_MT7932_RUNTIME_DMASHDL_POST_NORMAL_PASS: source=macos-transition-20260831 host-writes=8\n");
 			if (mt76_rr(dev, MT7932_HOST_INT_ENA) !=
 			    MT7932_RUNTIME_HOST_INT_MASK) {
 				dev_err(dev->mt76.dev,
@@ -1913,6 +1978,7 @@ runtime_epoch:
 		if (phase == MT7932_LIVE_PHASE_PRE_CAL && ordinal == 95) {
 			struct mt76_queue *q =
 				dev->mt76.q_mcu[MT_MCUQ_WM];
+			u32 state_idx;
 
 			if (runtime_console_quiet) {
 				console_loglevel = runtime_console_level;
@@ -1925,6 +1991,20 @@ runtime_epoch:
 				 q ? readl(&q->regs->dma_idx) : 0,
 				 q ? q->head : 0, q ? q->tail : 0,
 				 q ? READ_ONCE(q->queued) : 0);
+			for (state_idx = 0; state_idx < ARRAY_SIZE(pipeline_88_95);
+			     state_idx++) {
+				u32 *state = pipeline_88_95[state_idx];
+
+				dev_info(dev->mt76.dev,
+					 "J700_MT7932_PRE_COMMAND_PIPELINE: ordinal=%u bkrs=%08x/%08x/%08x r2a=%08x/%08x/%08x/%08x source=macos-transition-20260831-direct-state\n",
+					 88 + state_idx, state[0], state[1], state[2],
+					 state[3], state[4], state[5], state[6]);
+			}
+			dev_info(dev->mt76.dev,
+				 "J700_MT7932_ORDINAL92_DESCRIPTOR: slot=%u raw=%08x/%08x/%08x/%08x dma=%pad dma_len=%u lower14=0x%04x apple=ctrl40440000,len68,lower13zero source=macos-transition-20260831\n",
+				 ordinal92_slot, ordinal92_desc[0], ordinal92_desc[1],
+				 ordinal92_desc[2], ordinal92_desc[3], &ordinal92_dma,
+				 ordinal92_dma_len, (u32)(ordinal92_dma & 0x3fff));
 		}
 	}
 	if (phase == MT7932_LIVE_PHASE_PRE_CAL && runtime_irq_disabled) {
@@ -3542,6 +3622,464 @@ mt7921_mcu_set_bss_pm(struct mt792x_dev *dev, struct ieee80211_vif *vif,
 				 &req, sizeof(req), false);
 }
 
+struct mt7932_cmd_update_sta_record {
+	u8 sta_idx;
+	u8 sta_type;
+	u8 mac_addr[ETH_ALEN];
+	__le16 assoc_id;
+	__le16 listen_interval;
+	u8 bss_idx;
+	u8 desired_phy_type;
+	__le16 desired_non_ht_rate_set;
+	__le16 bss_basic_rate_set;
+	u8 qos;
+	u8 uapsd_supported;
+	u8 sta_state;
+	u8 mcs_set;
+	u8 sup_mcs32;
+	u8 version;
+	u8 rx_mcs_bitmask[10];
+	__le16 rx_highest_rate;
+	__le32 tx_rate_info;
+	__le16 ht_cap;
+	__le16 ht_ext_cap;
+	__le32 tx_bf_cap;
+	u8 ampdu_param;
+	u8 asel_cap;
+	u8 rcpi;
+	u8 need_resp;
+	u8 uapsd_ac;
+	u8 uapsd_sp;
+	u8 wlan_idx;
+	u8 bmc_wlan_idx;
+	__le32 vht_cap;
+	__le16 vht_rx_mcs;
+	__le16 vht_rx_highest;
+	__le16 vht_tx_mcs;
+	__le16 vht_tx_highest;
+	u8 rts_policy;
+	u8 vht_opmode;
+	u8 traffic_type;
+	u8 tx_gf;
+	u8 tx_sgi;
+	u8 tx_stbc;
+	__le16 hw_default_fixed_rate;
+	u8 tx_ampdu;
+	u8 rx_ampdu;
+	__le32 fixed_phy_rate;
+	__le16 max_link_speed;
+	__le16 min_link_speed;
+	__le32 flags;
+	union {
+		struct {
+			u8 tx;
+			u8 rx;
+			u8 reserved[2];
+		} ht_vht;
+		struct {
+			__le16 tx;
+			__le16 rx;
+		} he;
+	} ba_size;
+	__le16 pfmu_id;
+	u8 su_mu;
+	u8 etxbf_cap;
+	u8 sounding_phy;
+	u8 ndpa_rate;
+	u8 ndp_rate;
+	u8 rept_poll_rate;
+	u8 tx_mode;
+	u8 nc;
+	u8 nr;
+	u8 cbw;
+	u8 total_mem;
+	u8 mem_20m;
+	u8 mem_row[4];
+	u8 mem_col[4];
+	__le16 smart_ant;
+	u8 se_idx;
+	u8 ibf_timeout;
+	u8 ibf_dbw;
+	u8 ibf_ncol;
+	u8 ibf_nrow;
+	u8 update_after_disconnect;
+	u8 padding1[2];
+	u8 tx_amsdu;
+	u8 rx_amsdu;
+	u8 padding2[2];
+	__le32 tx_max_amsdu_len;
+	u8 he_mac_cap[6];
+	u8 he_phy_cap[11];
+	u8 padding3[2];
+	__le16 he_rx_mcs_80;
+	__le16 he_tx_mcs_80;
+	__le16 he_rx_mcs_160;
+	__le16 he_tx_mcs_160;
+	__le16 he_rx_mcs_80p80;
+	__le16 he_tx_mcs_80p80;
+	__le16 he_6ghz_cap;
+	u8 padding4[2];
+	u8 padding5[28];
+};
+
+struct mt7932_cmd_remove_sta_record {
+	u8 action;
+	u8 sta_idx;
+	u8 bss_idx;
+	u8 reserved;
+};
+
+struct mt7932_cmd_set_bss_rlm {
+	u8 bss_idx;
+	u8 rf_band;
+	u8 primary_channel;
+	u8 rf_sco;
+	u8 erp_protect;
+	u8 ht_protect;
+	u8 gf_operation;
+	u8 tx_rifs;
+	__le16 ht_op_info3;
+	__le16 ht_op_info2;
+	u8 ht_op_info1;
+	u8 short_preamble;
+	u8 short_slot;
+	u8 vht_width;
+	u8 vht_center1;
+	u8 vht_center2;
+	__le16 vht_basic_mcs;
+	u8 tx_nss;
+	u8 rx_nss;
+};
+
+struct mt7932_cmd_set_bss_info {
+	u8 bss_idx;
+	u8 connection_state;
+	u8 opmode;
+	u8 ssid_len;
+	u8 ssid[32];
+	u8 bssid[ETH_ALEN];
+	u8 qbss;
+	u8 version;
+	__le16 operational_rates;
+	__le16 basic_rates;
+	u8 sta_idx;
+	u8 padding0;
+	__le16 hw_default_fixed_rate;
+	u8 non_ht_basic_phy;
+	u8 auth_mode;
+	u8 encryption;
+	u8 phy_type;
+	u8 wapi_mode;
+	u8 ap_mode;
+	u8 bmc_wlan_idx;
+	u8 hidden_ssid;
+	u8 disconnect_threshold;
+	u8 padding1[3];
+	__le32 private_data;
+	struct mt7932_cmd_set_bss_rlm rlm;
+	u8 dbdc_band;
+	u8 wmm_set;
+	u8 dbdc_action;
+	u8 nss;
+	u8 padding2[2];
+	u8 he_op_params[3];
+	u8 bss_color;
+	__le16 he_basic_mcs;
+	u8 max_bssid_indicator;
+	u8 mbssid_idx;
+	u8 padding[12];
+};
+
+static u16 mt7932_mcu_legacy_rate_set(u32 rates, enum nl80211_band band)
+{
+	if (band == NL80211_BAND_2GHZ)
+		return (rates & 0xf) | ((rates >> 4) << 6);
+
+	return rates << 6;
+}
+
+static int
+mt7932_mcu_set_bss_info_legacy(struct mt792x_dev *dev,
+			       struct ieee80211_sta *sta,
+			       struct ieee80211_vif *vif,
+			       struct mt76_wcid *wcid,
+			       enum mt76_sta_info_state state)
+{
+	struct mt792x_vif *mvif = (struct mt792x_vif *)vif->drv_priv;
+	struct cfg80211_chan_def *chandef = &dev->mphy.chandef;
+	enum nl80211_band band = chandef->chan->band;
+	u8 primary = ieee80211_frequency_to_channel(chandef->chan->center_freq);
+	u8 center1 = ieee80211_frequency_to_channel(chandef->center_freq1);
+	u16 rates = mt7932_mcu_legacy_rate_set(
+		sta->deflink.supp_rates[band], band);
+	u16 basic_rates = mt7932_mcu_legacy_rate_set(
+		vif->bss_conf.basic_rates, band);
+	struct mt7932_cmd_set_bss_info req = {
+		.bss_idx = mvif->bss_conf.mt76.idx,
+		/* MediaTek's legacy enum is CONNECTED=0, DISCONNECTED=1. */
+		.connection_state = state == MT76_STA_INFO_STATE_ASSOC ? 0 : 1,
+		.opmode = 0,
+		.qbss = sta->wme,
+		.operational_rates = cpu_to_le16(rates),
+		.basic_rates = cpu_to_le16(basic_rates),
+		.sta_idx = wcid->idx,
+		.hw_default_fixed_rate =
+			cpu_to_le16(band == NL80211_BAND_2GHZ ? 0 : 0x4b),
+		.non_ht_basic_phy = band == NL80211_BAND_2GHZ ? 1 : 2,
+		.bmc_wlan_idx = 0xff,
+		.dbdc_band = 4,
+		.nss = max_t(u8, sta->deflink.rx_nss, 1),
+		.rlm = {
+			.bss_idx = mvif->bss_conf.mt76.idx,
+			.rf_band = band == NL80211_BAND_2GHZ ? 1 :
+				   band == NL80211_BAND_5GHZ ? 2 : 3,
+			.primary_channel = primary,
+			.rf_sco = primary < center1 ? 1 :
+				  primary > center1 ? 3 : 0,
+			.short_preamble = vif->bss_conf.use_short_preamble,
+			.short_slot = vif->bss_conf.use_short_slot,
+			.vht_center1 = center1,
+			.vht_center2 = chandef->center_freq2 ?
+				ieee80211_frequency_to_channel(
+					chandef->center_freq2) : 0,
+			.vht_basic_mcs = cpu_to_le16(basic_rates),
+			.tx_nss = max_t(u8, sta->deflink.rx_nss, 1),
+			.rx_nss = max_t(u8, sta->deflink.rx_nss, 1),
+		},
+	};
+
+	BUILD_BUG_ON(sizeof(struct mt7932_cmd_set_bss_rlm) != 22);
+	BUILD_BUG_ON(sizeof(struct mt7932_cmd_set_bss_info) != 116);
+	BUILD_BUG_ON(offsetof(struct mt7932_cmd_set_bss_info, private_data) != 64);
+	BUILD_BUG_ON(offsetof(struct mt7932_cmd_set_bss_info, rlm) != 68);
+	BUILD_BUG_ON(offsetof(struct mt7932_cmd_set_bss_info, dbdc_band) != 90);
+
+	if (vif->bss_conf.bssid)
+		memcpy(req.bssid, vif->bss_conf.bssid, ETH_ALEN);
+	if (sta->deflink.ht_cap.ht_supported)
+		req.phy_type |= BIT(4);
+	if (sta->deflink.vht_cap.vht_supported)
+		req.phy_type |= BIT(5);
+	if (sta->deflink.he_cap.has_he)
+		req.phy_type |= BIT(6);
+	if (band == NL80211_BAND_2GHZ)
+		req.phy_type |= BIT(0) | BIT(1);
+	else
+		req.phy_type |= BIT(3);
+
+	switch (chandef->width) {
+	case NL80211_CHAN_WIDTH_80:
+		req.rlm.vht_width = 1;
+		break;
+	case NL80211_CHAN_WIDTH_160:
+		req.rlm.vht_width = 2;
+		break;
+	case NL80211_CHAN_WIDTH_80P80:
+		req.rlm.vht_width = 3;
+		break;
+	default:
+		req.rlm.vht_width = 0;
+		break;
+	}
+
+	dev_info(dev->mt76.dev,
+		 "J700_MT7932_LEGACY_BSS_INFO: cid=0x12 bytes=116 bss=%u state=%u sta=%u band=%u channel=%u width=%u rates=0x%04x response=none source=apple25G83-nicUpdateBss+gen4\n",
+		 req.bss_idx, req.connection_state, req.sta_idx, req.rlm.rf_band,
+		 req.rlm.primary_channel, req.rlm.vht_width, rates);
+
+	return mt76_mcu_send_msg(&dev->mt76, MCU_CE_CMD(SET_BSS_INFO),
+				 &req, sizeof(req), false);
+}
+
+static int
+mt7932_mcu_sta_update_legacy(struct mt792x_dev *dev,
+			     struct ieee80211_sta *sta,
+			     struct ieee80211_vif *vif, bool enable,
+			     enum mt76_sta_info_state state, u8 rcpi)
+{
+	struct mt792x_vif *mvif = (struct mt792x_vif *)vif->drv_priv;
+	struct mt792x_sta *msta = sta ? (struct mt792x_sta *)sta->drv_priv : NULL;
+	struct mt76_wcid *wcid = msta ? &msta->deflink.wcid :
+					 &mvif->sta.deflink.wcid;
+	enum nl80211_band band = dev->mphy.chandef.chan->band;
+	u16 rates, basic_rates;
+
+	/* AppleSunriseWLAN 25G83 _cnmStaSendUpdateCmd allocates and zeroes an
+	 * exact 0xc8-byte CMD_UPDATE_STA_RECORD, fills the fields below and sends
+	 * direct legacy CID 0x13. The firmware's static legacy dispatch table
+	 * independently maps 0x13/0x14 to the station update/remove handlers.
+	 * The full 4,066-command macOS capture contains only 64-byte legacy TXDs;
+	 * the upstream unified STA_REC_UPDATE command is not part of this ABI.
+	 */
+	BUILD_BUG_ON(sizeof(struct mt7932_cmd_update_sta_record) != 0xc8);
+	BUILD_BUG_ON(offsetof(struct mt7932_cmd_update_sta_record, flags) != 0x58);
+	BUILD_BUG_ON(offsetof(struct mt7932_cmd_update_sta_record, tx_amsdu) != 0x80);
+	BUILD_BUG_ON(offsetof(struct mt7932_cmd_update_sta_record,
+			      update_after_disconnect) != 0x7d);
+	BUILD_BUG_ON(offsetof(struct mt7932_cmd_update_sta_record, he_mac_cap) != 0x88);
+	BUILD_BUG_ON(offsetof(struct mt7932_cmd_update_sta_record, he_rx_mcs_80) != 0x9c);
+
+	if (!enable) {
+		struct mt7932_cmd_remove_sta_record req = {
+			.action = 0,
+			.sta_idx = wcid->idx,
+			.bss_idx = mvif->bss_conf.mt76.idx,
+		};
+
+		return mt76_mcu_send_msg(&dev->mt76,
+					 MCU_CE_CMD(REMOVE_STA_RECORD),
+					 &req, sizeof(req), false);
+	}
+
+	/* A NULL station is mt7921's firmware-offload bookkeeping record, not a
+	 * peer. Apple represents the interface/BSS through legacy 0x11/0x12 and
+	 * never submits a synthetic unified STA record for it.
+	 */
+	if (!sta)
+		return 0;
+
+	{
+		int ret;
+		struct mt7932_cmd_update_sta_record req = {
+			.sta_idx = wcid->idx,
+			.sta_type = vif->type == NL80211_IFTYPE_STATION ? 0x41 : 0x21,
+			.assoc_id = cpu_to_le16(sta->aid),
+			.bss_idx = mvif->bss_conf.mt76.idx,
+			.qos = sta->wme,
+			.uapsd_supported = !!sta->uapsd_queues,
+			.sta_state = state,
+			.version = 1,
+			.rcpi = rcpi,
+			.need_resp = 0,
+			.uapsd_ac = sta->uapsd_queues |
+				    (sta->uapsd_queues << 4),
+			.uapsd_sp = sta->max_sp,
+			.wlan_idx = wcid->idx,
+			.bmc_wlan_idx = 0xff,
+			.rts_policy = 3,
+			.tx_ampdu = 1,
+			.rx_ampdu = 1,
+			.pfmu_id = cpu_to_le16(0xffff),
+			/* Apple 25G83 writes the J700 station-record
+			 * update-after-disconnect gate at byte 0x7d.  The public
+			 * ABI labels that byte as padding; it is not uciBfNrow
+			 * at 0x7c.
+			 */
+			.update_after_disconnect = 1,
+			.tx_amsdu = !!sta->deflink.agg.max_amsdu_len,
+			.rx_amsdu = !!sta->deflink.agg.max_amsdu_len,
+			.tx_max_amsdu_len =
+				cpu_to_le32(sta->deflink.agg.max_amsdu_len),
+		};
+
+		if (state == MT76_STA_INFO_STATE_NONE) {
+			struct {
+				u8 control[2];
+				u8 addr[ETH_ALEN];
+			} __packed sta_mac = {};
+
+			BUILD_BUG_ON(sizeof(sta_mac) != 8);
+			memcpy(sta_mac.addr, vif->bss_conf.addr, ETH_ALEN);
+			ret = mt76_mcu_send_msg(&dev->mt76,
+					       MCU_CE_CMD(SET_STA_MAC),
+					       &sta_mac, sizeof(sta_mac), false);
+			if (ret)
+				return ret;
+			dev_info(dev->mt76.dev,
+				 "J700_MT7932_STA_MAC: cid=0xb8 bytes=8 control=0/0 response=none source=apple25G83-wlanoidSetStaMac-ordinal200\n");
+
+			ret = mt76_mcu_send_msg(&dev->mt76,
+					       MCU_CE_CMD(SET_INFRASTRUCTURE),
+					       NULL, 0, false);
+			if (ret)
+				return ret;
+			dev_info(dev->mt76.dev,
+				 "J700_MT7932_INFRASTRUCTURE_MODE: cid=0x09 bytes=0 response=none source=apple25G83-first-association-ordinal201\n");
+		}
+
+		ret = mt7932_mcu_set_bss_info_legacy(dev, sta, vif, wcid,
+						    state);
+		if (ret)
+			return ret;
+
+		memcpy(req.mac_addr, sta->deflink.addr, ETH_ALEN);
+		if (sta->deflink.ht_cap.ht_supported)
+			req.desired_phy_type |= BIT(4);
+		if (sta->deflink.vht_cap.vht_supported)
+			req.desired_phy_type |= BIT(5);
+		if (sta->deflink.he_cap.has_he)
+			req.desired_phy_type |= BIT(6);
+		if (band == NL80211_BAND_2GHZ)
+			req.desired_phy_type |= BIT(0) | BIT(1);
+		else
+			req.desired_phy_type |= BIT(3);
+
+		rates = mt7932_mcu_legacy_rate_set(
+			sta->deflink.supp_rates[band], band);
+		basic_rates = mt7932_mcu_legacy_rate_set(
+			vif->bss_conf.basic_rates, band);
+		req.desired_non_ht_rate_set = cpu_to_le16(rates);
+		req.bss_basic_rate_set = cpu_to_le16(basic_rates);
+
+		if (sta->deflink.ht_cap.ht_supported) {
+			const struct ieee80211_sta_ht_cap *ht = &sta->deflink.ht_cap;
+
+			req.mcs_set = ht->mcs.rx_mask[0];
+			req.sup_mcs32 = ht->mcs.rx_mask[4] & BIT(0);
+			memcpy(req.rx_mcs_bitmask, ht->mcs.rx_mask,
+			       sizeof(req.rx_mcs_bitmask));
+			req.rx_highest_rate = ht->mcs.rx_highest;
+			req.ht_cap = cpu_to_le16(ht->cap);
+			req.ampdu_param =
+				FIELD_PREP(IEEE80211_HT_AMPDU_PARM_FACTOR,
+					   ht->ampdu_factor) |
+				FIELD_PREP(IEEE80211_HT_AMPDU_PARM_DENSITY,
+					   ht->ampdu_density);
+		}
+
+		if (sta->deflink.vht_cap.vht_supported) {
+			const struct ieee80211_sta_vht_cap *vht =
+				&sta->deflink.vht_cap;
+
+			req.vht_cap = cpu_to_le32(vht->cap);
+			req.vht_rx_mcs = vht->vht_mcs.rx_mcs_map;
+			req.vht_rx_highest = vht->vht_mcs.rx_highest;
+			req.vht_tx_mcs = vht->vht_mcs.tx_mcs_map;
+			req.vht_tx_highest = vht->vht_mcs.tx_highest;
+			req.vht_opmode = sta->deflink.bandwidth |
+				((sta->deflink.rx_nss - 1) <<
+				 IEEE80211_OPMODE_NOTIF_RX_NSS_SHIFT);
+		}
+
+		if (sta->deflink.he_cap.has_he) {
+			const struct ieee80211_sta_he_cap *he =
+				&sta->deflink.he_cap;
+
+			memcpy(req.he_mac_cap, he->he_cap_elem.mac_cap_info,
+			       sizeof(req.he_mac_cap));
+			memcpy(req.he_phy_cap, he->he_cap_elem.phy_cap_info,
+			       sizeof(req.he_phy_cap));
+			req.he_rx_mcs_80 = he->he_mcs_nss_supp.rx_mcs_80;
+			req.he_tx_mcs_80 = he->he_mcs_nss_supp.tx_mcs_80;
+			req.he_rx_mcs_160 = he->he_mcs_nss_supp.rx_mcs_160;
+			req.he_tx_mcs_160 = he->he_mcs_nss_supp.tx_mcs_160;
+			req.he_rx_mcs_80p80 = he->he_mcs_nss_supp.rx_mcs_80p80;
+			req.he_tx_mcs_80p80 = he->he_mcs_nss_supp.tx_mcs_80p80;
+			req.he_6ghz_cap = sta->deflink.he_6ghz_capa.capa;
+		}
+
+		dev_info(dev->mt76.dev,
+			 "J700_MT7932_LEGACY_STA_UPDATE: cid=0x13 bytes=200 sta=%u widx=%u state=%u bss=%u phy=0x%02x rates=0x%04x response=none source=apple25G83-cnmStaSendUpdateCmd+gen4\n",
+			 req.sta_idx, req.wlan_idx, req.sta_state, req.bss_idx,
+			 req.desired_phy_type, rates);
+
+		ret = mt76_mcu_send_msg(&dev->mt76,
+				       MCU_CE_CMD(UPDATE_STA_RECORD),
+				       &req, sizeof(req), false);
+		return ret;
+	}
+}
+
 int mt7921_mcu_sta_update(struct mt792x_dev *dev, struct ieee80211_sta *sta,
 			  struct ieee80211_vif *vif, bool enable,
 			  enum mt76_sta_info_state state)
@@ -3562,6 +4100,9 @@ int mt7921_mcu_sta_update(struct mt792x_dev *dev, struct ieee80211_sta *sta,
 	msta = sta ? (struct mt792x_sta *)sta->drv_priv : NULL;
 	info.wcid = msta ? &msta->deflink.wcid : &mvif->sta.deflink.wcid;
 	info.newly = msta ? state != MT76_STA_INFO_STATE_ASSOC : true;
+	if (is_mt7932(&dev->mt76))
+		return mt7932_mcu_sta_update_legacy(dev, sta, vif, enable,
+						      state, info.rcpi);
 
 	return mt76_connac_mcu_sta_cmd(&dev->mphy, &info);
 }

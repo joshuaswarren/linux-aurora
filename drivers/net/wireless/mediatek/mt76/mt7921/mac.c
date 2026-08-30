@@ -267,6 +267,11 @@ mt7921_mac_fill_rx(struct mt792x_dev *dev, struct sk_buff *skb)
 		fc = cpu_to_le16(FIELD_GET(MT_RXD6_FRAME_CONTROL, v0));
 		seq_ctrl = FIELD_GET(MT_RXD8_SEQ_CTRL, v2);
 		qos_ctl = FIELD_GET(MT_RXD8_QOS_CTL, v2);
+		if (is_mt7932(&dev->mt76) && ieee80211_is_auth(fc))
+			dev_info(dev->mt76.dev,
+				 "J700_MT7932_AUTH_RX_RAW: rxd=%08x/%08x/%08x/%08x/%08x frame_control=0x%04x wlan_idx=%u unicast=%u\n",
+				 rxd0, rxd1, rxd2, rxd3, rxd4,
+				 le16_to_cpu(fc), idx, unicast);
 
 		rxd += 4;
 		if ((u8 *)rxd - skb->data >= skb->len)
@@ -421,6 +426,12 @@ mt7921_mac_fill_rx(struct mt792x_dev *dev, struct sk_buff *skb)
 
 		hdr = mt76_skb_get_hdr(skb);
 		fc = hdr->frame_control;
+		if (is_mt7932(&dev->mt76) && ieee80211_is_auth(fc))
+			dev_info(dev->mt76.dev,
+				 "J700_MT7932_AUTH_RX_DELIVER: bytes=%u frame_control=0x%04x wlan_idx=%u status_wcid=%u flags=0x%x\n",
+				 skb->len, le16_to_cpu(fc), idx,
+				 status->wcid ? status->wcid->idx : 0xffff,
+				 status->flag);
 		if (ieee80211_is_data_qos(fc)) {
 			seq_ctrl = le16_to_cpu(hdr->seq_ctrl);
 			qos_ctl = *ieee80211_get_qos_ctl(hdr);
@@ -457,6 +468,14 @@ void mt7921_mac_add_txs(struct mt792x_dev *dev, void *data)
 
 	wcidx = le32_get_bits(txs_data[2], MT_TXS2_WCID);
 	pid = le32_get_bits(txs_data[3], MT_TXS3_PID);
+	if (is_mt7932(&dev->mt76) && wcidx == 1)
+		dev_info(dev->mt76.dev,
+			 "J700_MT7932_AUTH_TX_STATUS: wcid=%u pid=%u txs=%08x/%08x/%08x/%08x/%08x/%08x/%08x/%08x\n",
+			 wcidx, pid, le32_to_cpu(txs_data[0]),
+			 le32_to_cpu(txs_data[1]), le32_to_cpu(txs_data[2]),
+			 le32_to_cpu(txs_data[3]), le32_to_cpu(txs_data[4]),
+			 le32_to_cpu(txs_data[5]), le32_to_cpu(txs_data[6]),
+			 le32_to_cpu(txs_data[7]));
 
 	if (pid < MT_PACKET_ID_FIRST)
 		return;

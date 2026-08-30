@@ -1052,6 +1052,7 @@ void mt7921_scan_work(struct work_struct *work)
 	while (true) {
 		struct mt76_connac2_mcu_rxd *rxd;
 		struct sk_buff *skb;
+		int next = 0;
 
 		spin_lock_bh(&phy->dev->mt76.lock);
 		skb = __skb_dequeue(&phy->scan_event_list);
@@ -1063,16 +1064,25 @@ void mt7921_scan_work(struct work_struct *work)
 		rxd = (struct mt76_connac2_mcu_rxd *)skb->data;
 		if (rxd->eid == MCU_EVENT_SCHED_SCAN_DONE) {
 			ieee80211_sched_scan_results(phy->mt76->hw);
-		} else if (rxd->eid == MCU_EVENT_SCAN_DONE) {
-			struct mt76_connac_hw_scan_done *event = NULL;
+		} else if (is_mt7932(&phy->dev->mt76) &&
+			   rxd->eid == MCU_EVENT_SCAN_DONE) {
+			mt792x_mutex_acquire(phy->dev);
+			next = mt76_connac_mcu_hw_scan_next(phy->mt76);
+			mt792x_mutex_release(phy->dev);
+			if (next > 0) {
+				dev_kfree_skb(skb);
+				continue;
+			}
+			if (test_and_clear_bit(MT76_HW_SCANNING,
+					       &phy->mt76->state)) {
+				struct cfg80211_scan_info info = {
+					.aborted = next < 0,
+				};
 
-			skb_pull(skb, sizeof(*rxd));
-			event = (struct mt76_connac_hw_scan_done *)skb->data;
-			mt7921_regd_change(phy, event->alpha2);
-		}
-
-		if (test_and_clear_bit(MT76_HW_SCANNING,
-				       &phy->mt76->state)) {
+				ieee80211_scan_completed(phy->mt76->hw, &info);
+			}
+		} else if (test_and_clear_bit(MT76_HW_SCANNING,
+					      &phy->mt76->state)) {
 			struct cfg80211_scan_info info = {
 				.aborted = false,
 			};
