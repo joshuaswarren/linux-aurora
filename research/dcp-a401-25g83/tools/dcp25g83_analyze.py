@@ -145,6 +145,13 @@ def verify(image: Image) -> None:
         0x041B510C: 0xB8060E7F,  # synchronous cleanup clears stream busy word
         0x041B786C: 0xB940614C,  # reply lookup reads stream busy word
         0x041B7870: 0x350001AC,  # existing busy stream skips allocation marker
+        0x042AE5D8: 0x97FEE72B,  # PanelLayout D102 synchronous call
+        0x042AE5FC: 0x97FEE722,  # SupportRelbufInfoCb=true D102 call
+        0x042AE624: 0x97FEE718,  # SupportRelbufInfoCb=false D102 call
+        0x042B5834: 0x97FFE312,  # call property-publishing tail
+        0x042B583C: 0x97FFE2BD,  # call post-property no-op
+        0x042B58B4: 0x97FC088E,  # D000 synchronous call
+        0x042B58CC: 0x97FC0888,  # D001 synchronous call
     }
     for va, expected in instructions.items():
         actual = struct.unpack("<I", image.bytes_at(va, 4))[0]

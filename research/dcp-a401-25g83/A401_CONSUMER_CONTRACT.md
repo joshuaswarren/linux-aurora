@@ -2,19 +2,22 @@
 
 ## Result
 
-The last proven `A401` boundary is the firmware's fifth synchronous `D563`
-callback, `DispPerfState`. Linux writes output `1`; the corresponding raw
-`0x42` acknowledgement is admitted to and consumed from the ASC A2I FIFO. The
-firmware nevertheless never sends `D120` (`start_hardware_boot`) and never
+The T8140 PMC prerequisite removes the original fifth-`D563` fabric abort.
+Firmware now crosses `DispPerfState` and emits another sixteen callbacks. The
+last visible pair is `D102 PanelLayout`, then `D102 SupportRelbufInfoCb`.
+Linux sends the final raw `0x42`, the ASC A2I FIFO is empty at timeout, but
+firmware emits neither the immediately following `D000` nor `D001` and never
 returns the outer `A401` reply.
 
-The transport result rules out an AP mailbox drop. It does not by itself prove
-whether the consumed word reached the DCPLink stream action, woke its waiter,
-or returned far enough to release the five temporary OSNumber objects. Those
-operations all precede `D120` and none has another AP-visible callback. The
-strongest exact statement is therefore that execution does not cross the
-post-property UPPipe return, not that it necessarily remains in the fifth
-wait.
+The native AP-side `D102` implementation creates an OSNumber and publishes it
+through `IORegistryEntry::setProperty`; it sends no nested DCP message and its
+return value is not represented on the wire. The exact firmware continuation
+has no PMC/PMP wait and no callback-table dispatch between the final `D102`
+and `D000`. The current proven boundary is therefore after physical dequeue
+of the final acknowledgement but before the synchronous DCPLink sender has
+resumed far enough to issue `D000`. Physical dequeue alone cannot distinguish
+the EP37 software association, gate action, condition signal, and waiter
+resumption stages.
 
 ## A401 dispatcher
 
@@ -518,6 +521,156 @@ the Crl4 x0--x29 set without changing mailbox, RPC, or hardware behavior. This
 is the first discriminator that can name the async source/master and distinguish
 a missing PTUC mapping from a powered-off display block. No behavior change is
 justified until those values are known.
+
+## PMC prerequisite result
+
+Fresh CasC run:
+
+`neo-bringup/logs/dcp-appledrm-25g83-casc-async-87dda47-20260829-215244.log`
+
+The seven qwords were:
+
+```
+l2c_err_sts = 0x0000000000000080
+l2c_err_adr = 0x03000003028aa140
+l2c_err_inf = 0x0000001000000003
+lsu_err_sts = 0x23800003028aa140
+fed_err_sts = 0
+mmu_err_sts = 0
+extra       = 0
+```
+
+The exact producer is the continuation of callback 181, `D563 DispPerfState`.
+`RTKPMGR_pmc_boost_disp_perf_state` reaches leaf `0x0403e318`, which uses
+static display-PMC base `0x302800000` and reads word offset `0xaa140`. This is
+physical address `0x3028aa140`, exactly the CasC address. Zero MMU and FED
+status rule out the display DART and the earlier PTUC hypothesis. Linux had
+left the T8140 `ps_pmc` domain off while the inherited firmware still treated
+the PMC as available.
+
+Commit `9e9a1a4` applies only the native PMGR power-on sequence to the exact
+T8140 PMC descriptor before EP20/EP37 startup. The PMP report registers remain
+read-only. Valid fresh-session log:
+
+`neo-bringup/logs/dcp-appledrm-25g83-pmc-prereq-9e9a1a4-20260829-224514.log`
+
+```
+DCP25G83_PMC_PREREQUISITE before 0x0f000200
+    target_write 0x1f00000f after 0x1f0002ff
+    target 0x0f actual 0x0f auto 1 result 0
+```
+
+There is no CasC record or crash notification in this run. Callback count
+advances from 181 to 198, proving the PMC change fixes the external abort.
+PMP report status remains zero and its DISP target remains requested with
+actual zero, but that state does not stop the firmware at the old PMC read.
+
+## Post-PMC callback tail
+
+The new callbacks are chronological and synchronous:
+
+| Sequence | Tag | Contract / observed key | Linux output |
+| ---: | --- | --- | --- |
+| 182 | D125 | `initial-vbi-advance-lines`, `0x64`/`0x24` | first value `2` |
+| 183 | D561 | `M3TimingParameters` | true |
+| 184 | D552 | `IOMFBNumLayers` | true |
+| 185 | D552 | `IOMFBMaxSrcPixels` | true |
+| 186 | D101 | default stride | zero |
+| 187 | D552 | `DisplayPipePlaneBaseAlignment` | true |
+| 188 | D552 | `IOMFBScalingLimits` | true |
+| 189--192 | D565 | Y/X flip support, twice | true |
+| 193--195 | D565 | ALSS/ACSS/SPLC support | true |
+| 196 | D102 | `PanelLayout`, `0x44`/0 | no output |
+| 197 | D102 | `SupportRelbufInfoCb`, `0x44`/0 | no output |
+
+The observed D125 request uses the read-EDT-data ABI and firmware continues
+through fifteen later callbacks. It therefore cannot be the immediate final
+gate even though the separately recovered newer host table labels that ABI
+D124. Do not renumber this live path until the exact host/firmware revision
+pair is reconciled.
+
+Native `UnifiedPipeline_RemoteCalls::D102_callback__` validates `0x44` input
+bytes, finds the IOMobileFramebufferAP instance, and calls
+`UnifiedPipeline2::set_number_property`. That routine allocates an OSNumber,
+calls the IORegistry `setProperty` vtable slot, then releases it. D102 has no
+output and this path sends no nested DCP message. Omitting the registry side
+effect is a host-parity issue, but it cannot keep the firmware's synchronous
+sender waiting after the outer `0x42` arrives.
+
+## Exact continuation after the final D102
+
+Both final property calls are made by `0x042ae47c` through the same D102 thunk
+at `0x04268284`. `PanelLayout` calls it at `0x042ae5d8`.
+`SupportRelbufInfoCb` calls it at `0x042ae5fc` for value one or
+`0x042ae624` for value zero. After that call returns, the function only emits
+a log and returns to `0x042b5838`.
+
+The remaining instructions before the next callback contain no hidden power
+or property wait:
+
+1. `0x042b583c` calls `0x042ae330`. Its comparison uses the same string pointer
+   for both arguments, so the zero result takes the immediate return branch.
+2. If the optional object at UPPipe offset `0x2c18` exists, slot `0x138`
+   reaches `0x042835cc -> 0x04238e80`; the final UPPipe slot `0x110` target is
+   the bare `ret` at `0x0423c494`.
+3. Optional-object slot `0x140` reaches
+   `0x0428317c -> 0x04238e18 -> 0x042a8b40`. Its last virtual target is
+   `0x0423a8ec`, which returns zero; the chain only derives a boolean.
+4. `0x042b58b4` synchronously sends D000. `0x042b58cc` synchronously sends
+   D001.
+
+Neither D000 nor D001 appears in the valid log. Firmware therefore has not
+returned from the final D102 synchronous call. This eliminates the D102
+registry side effect, later callback-table entries, and PMC/PMP policy from
+the immediate continuation.
+
+## Callback 196/197 reply association boundary
+
+Callbacks 196 and 197 are an exact transport control pair. Each has raw request
+word `0x5000000002`, stream selector zero, side selector zero, shared RPC base
+`0x60000`, offset zero, total size `0x50`, input `0x44`, output zero, and raw
+acknowledgement `0x42`. The acknowledgement contains no callback tag, key, or
+sequence field. Firmware can emit callback 197 only after callback 196's
+synchronous D102 sender resumes, so callback 196 is a positive association and
+wake control for the same wire word and stream object.
+
+For either acknowledgement, EP37 action `0x041b70d0` takes the reply branch at
+`0x041b73ec`. Selector equality in `0x041b7830` chooses local stream zero,
+object `0x04963df8`. The existing busy-stream branch is mandatory. A missing
+stream, a newly allocated stream, or reply lookup/gate setup failure reaches
+the non-returning abort at `0x041b7520..0x041b7528`.
+
+For an existing stream, `0x041b76e0` asks the stream gate at offset `0x58` to
+run action `0x041b7804`. The action stores the raw response at offset `0x48`
+and immediately signals the stream event. The synchronous sender sleeps
+through the same gate at `0x041b542c`, checks the stored low 16 bits at
+`0x041b5438..0x041b5444`, and accepts `0x42`. Only later cleanup at
+`0x041b50f4` clears the stream busy word.
+
+The gate invocation itself can return an error before the action runs. The
+worker tests that result at `0x041b7454`; unlike lookup/new-stream failure, a
+nonzero existing-stream gate result is logged and the endpoint loop continues
+without aborting. Static code does not provide an AP-visible error value for
+this branch. On success, store and signal are unconditional.
+
+At timeout the A2I control value is `0x20001`: empty, with equal read/write
+pointers. No AP message follows callback 197 in the fixed inherited-crashlog
+path. Thus its acknowledgement left the physical FIFO. This does not prove
+that the software endpoint ran the existing-stream gate action. The stream
+response and busy fields are DCP-private write-back cache lines; the failed
+cookie observer already proves AP reads of their RAM backing are not coherent.
+The shared RPC buffer contains no response field for an output-less D102.
+
+There is consequently no behavior-neutral AP observer currently capable of
+separating these remaining states in one run:
+
+- ACK197 dequeued into the EP37 software queue but not dispatched;
+- existing-stream gate invocation returned an error before action execution;
+- action stored/signaled but the synchronous sender did not resume.
+
+Changing reply timing, sending a second reply, injecting remote-error bits, or
+reading the private stream cache line would not be an evidence-derived
+discriminator. No further hardware candidate follows from this boundary yet.
 
 ## Queued post-A401 H17P callback table correction
 
