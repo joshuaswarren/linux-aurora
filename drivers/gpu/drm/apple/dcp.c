@@ -60,15 +60,9 @@
 
 #define APPLE_DCP_RTKIT_MGMT_TYPE GENMASK_ULL(59, 52)
 #define APPLE_DCP_RTKIT_MGMT_STARTEP 5
-#define APPLE_DCP_RTKIT_MGMT_ECHO_REPLY 4
 #define APPLE_DCP_RTKIT_MGMT_STARTEP_EP GENMASK_ULL(39, 32)
 #define APPLE_DCP_RTKIT_MGMT_STARTEP_FLAG BIT_ULL(1)
 #define APPLE_DCP_RTKIT_EP_MGMT 0
-#define APPLE_DCP_RTKIT_MGMT_ECHO_COOKIE 0x44504331ULL
-#define APPLE_DCP_RTKIT_MGMT_ECHO_RESPONSE \
-	(FIELD_PREP(APPLE_DCP_RTKIT_MGMT_TYPE, \
-		    APPLE_DCP_RTKIT_MGMT_ECHO_REPLY) | \
-	 APPLE_DCP_RTKIT_MGMT_ECHO_COOKIE)
 
 #define APPLE_T8140_MBOX_CONTROL_FULL BIT(16)
 #define APPLE_T8140_MBOX_A2I_CONTROL 0x110
@@ -406,51 +400,6 @@ unbacked:
 
 static bool dcp_rtk_report_adopted_crashlog(struct apple_dcp *dcp,
 					    struct apple_rtkit_shmem *bfr);
-
-static void dcp_rtk_mbox_rx(struct apple_mbox *mbox,
-			    struct apple_mbox_msg message, void *cookie)
-{
-	struct apple_rtkit *rtk = cookie;
-	struct apple_dcp *dcp = rtk->cookie;
-
-	if (dcp->adopted_session && dcp->fw_compat == DCP_FIRMWARE_H17P &&
-	    !dcp->link_post_echo_ready_sent &&
-	    message.msg1 == APPLE_DCP_RTKIT_EP_MGMT &&
-	    message.msg0 == APPLE_DCP_RTKIT_MGMT_ECHO_RESPONSE) {
-		u32 before = 0, after = 0;
-		int before_ret, after_ret, ready_ret;
-
-		dcp->link_post_echo_ready_sent = true;
-		before_ret = dcp_mbox_a2i_control(dcp, &before);
-		ready_ret = dcp_send_message(dcp, APPLE_DCP_LINK_ENDPOINT,
-					     APPLE_DCP_LINK_MSG_READY);
-		after_ret = dcp_mbox_a2i_control(dcp, &after);
-		dev_info(dcp->dev,
-			 "DCP25G83_EP37_POST_ECHO_READY echo %#llx READY %#x result %d A2I before %#x result %d after %#x result %d\n",
-			 message.msg0, APPLE_DCP_LINK_MSG_READY, ready_ret,
-			 before, before_ret, after, after_ret);
-	}
-
-	dcp->rtkit_mbox_rx(mbox, message, cookie);
-}
-
-static int dcp_rtk_install_post_echo_ready_rx(struct apple_dcp *dcp)
-{
-	struct apple_mbox *mbox = dcp->rtk->mbox;
-	unsigned long flags;
-
-	spin_lock_irqsave(&mbox->rx_lock, flags);
-	if (!mbox->rx || mbox->rx == dcp_rtk_mbox_rx) {
-		spin_unlock_irqrestore(&mbox->rx_lock, flags);
-		return -EINVAL;
-	}
-
-	dcp->rtkit_mbox_rx = mbox->rx;
-	mbox->rx = dcp_rtk_mbox_rx;
-	spin_unlock_irqrestore(&mbox->rx_lock, flags);
-
-	return 0;
-}
 
 static void dcp_rtk_crashed(void *cookie, const void *crashlog, size_t crashlog_size)
 {
@@ -2104,13 +2053,6 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 
 		dcp->adopting_session = false;
 		dcp->adopted_session = true;
-		dcp->link_post_echo_ready_sent = false;
-		ret = dcp_rtk_install_post_echo_ready_rx(dcp);
-		if (ret) {
-			devm_apple_rtkit_free(dev, dcp->rtk);
-			dcp->rtk = NULL;
-			goto err_destroy_piodma;
-		}
 		ret = dcp_rtk_import_adopted_crashlog(dcp);
 		if (ret) {
 			dev_err(dev,

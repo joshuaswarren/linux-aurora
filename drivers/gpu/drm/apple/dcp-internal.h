@@ -13,7 +13,6 @@
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
 #include <linux/scatterlist.h>
-#include <linux/soc/apple/mailbox.h>
 #include <linux/usb/typec_mux.h>
 
 #include "dcp-link.h"
@@ -167,9 +166,6 @@ struct apple_dcp {
 	bool fresh_boot_cpu_started;
 	bool adopted_session;
 	bool adopted_session_module_pinned;
-	bool link_post_echo_ready_sent;
-	void (*rtkit_mbox_rx)(struct apple_mbox *mbox,
-			      struct apple_mbox_msg msg, void *cookie);
 
 	/* DCP has crashed */
 	bool crashed;
