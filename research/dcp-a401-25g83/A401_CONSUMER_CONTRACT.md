@@ -267,7 +267,7 @@ and blocking. Reply ingress enters the same stream gate, stores the response at
 `0x041b781c`, and then signals. A normal reply cannot signal before the waiter
 is armed.
 
-## First definite host producer mismatch
+## EP37 software scheduling boundary
 
 All five raw `0x42` replies take the same firmware path. The endpoint-37 filter
 at `0x041b6fd4` has no property index, callback count, payload, or fifth-call
@@ -275,6 +275,34 @@ branch. It signals the same link event source; the AFK dispatcher then enqueues
 the word on the same endpoint software queue; action `0x041b70d0` drains that
 queue and chooses the same stream from the same control bits. There is no
 static ACK1-through-ACK4 versus ACK5 dispatch delta to patch.
+
+The signal-before-enqueue order does not create a runnable race on 25G83.
+Firmware creates the AFK producer workloop named `rtk_ep_work` at `0x0402125c`
+with priority `0x39`. It creates the DCPLink consumer workloop named
+`iomfb_ap_link` at `0x042df470` with priority `0x10`. The scheduler records a
+runnable priority in a 64-bit bitmap and selects its highest set bit with
+`clz` at `0x040205c4..0x040205e0`. The link consumer therefore cannot preempt
+the endpoint producer between the filter's event-source signal and the queue
+write. Once the producer yields, `0x041b70d0` can pop the already-enqueued
+word.
+
+The reply lookup under the link gate at `0x041b7830` aborts if it must create
+an idle stream for a reply. A normal synchronous callback cannot expose that
+state: `0x041b5138` marks the stream busy before transmit, waits for the reply,
+and only its later cleanup action `0x041b50f4` clears the busy word at stream
+offset `0x60`. There is no normal branch that clears it while the caller is
+blocked. For an existing stream, `0x041b7804` stores the reply and signals the
+waiter unconditionally.
+
+Together with the FIFO result, this moves the last normal-path boundary past
+EP37 dequeue and association. A missing or newly allocated stream takes the
+non-returning abort at `0x041b7520`; it cannot look like a silent wait. If that
+abort happened, the immediately following crashlog buffer request would be
+consistent with the root task entering its crash path. The remaining static
+work is to distinguish that abort from a later abort in the five object
+releases at `0x042ac100..0x042ac19c`.
+
+## Adopted endpoint bookkeeping result
 
 Linux does have a concrete producer-side state mismatch before those replies.
 For an adopted session, `dcp_start_rtkit_endpoint()` sends the inherited raw
@@ -292,5 +320,49 @@ dispatch by about 0.11 ms in the same ordered RTKit worker, accounting for
 roughly 20 ms of avoidable serialized latency. The endpoint bit is now recorded
 immediately after a successful adopted STARTEP. This preserves all wire words
 and makes Linux's software endpoint ownership match the STARTEP it already
-sent. Whether removing that perturbation also avoids the EP1/tail collision is
-a hardware discriminator, not yet a proven outcome.
+sent.
+
+Fresh-session log:
+
+`neo-bringup/logs/dcp-appledrm-25g83-adopted-ep-544562c-20260829-202553.log`
+
+Both endpoint markers appeared and no undiscovered-endpoint warning remained.
+A401 still timed out after 182 callbacks. Its fifth D563 acknowledgement was
+consumed, and EP1 GETBUF followed immediately:
+
+```
+A401 TX                 47.702068
+callback 181 ACK        47.789584
+EP1 GETBUF              47.789699
+ack5 before/after       0x20001 -> 0x100101
+EP1 sample              0x21101
+timeout                 0x101201
+```
+
+Removing the warnings shortened the A401 callback sequence from about 107 ms
+to 87.516 ms, but EP1 still followed ACK5 by 115 microseconds. This disproves
+both the warning perturbation and an approximately 100 ms timer as the cause.
+The endpoint bookkeeping fix remains correct.
+
+## Exact EP1 reply parity still pending
+
+The current Linux EP1 reply is not the reply selected by native RTBuddy for
+the observed request. Request `0x12610008784000` has bit 54 clear. In
+`RTBuddyCrashlogEndpoint::_messageHandler`, the test at native kernelcache
+address `0xfffffe000b1fc1bc` therefore branches to
+`0xfffffe000b1fc2f0`. The response constructed at
+`0xfffffe000b1fc380..0xfffffe000b1fc3c0` contains the buffer DVA in bits 43
+through 0, the size in bits 51 through 44, and the selected page-size bit. It
+does not set bit 54.
+
+The bit-54, no-DVA response at
+`0xfffffe000b1fc298..0xfffffe000b1fc2e0` belongs only to an incoming request
+whose bit 54 is set. Linux currently sends `0x52600000000000`, which takes
+that other form. For the observed 0x26000-byte request and its DVA, the exact
+native-shaped response is the original word `0x12610008784000`.
+
+This mismatch must be fixed, but it cannot explain the present physical
+dequeue failure: the 544562c timeout left the EP1 word unread in A2I. Firmware
+cannot inspect its payload before removing it from the hardware FIFO. Keep the
+EP1 correction queued until the scheduling or abort cause that stops A2I
+drain is established.
