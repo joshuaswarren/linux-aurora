@@ -65,8 +65,6 @@ pub(crate) enum BootStage {
 
 const INITDATA_ACK_TYPE: u16 = 0x09;
 const CONTROL_START_TYPE: u16 = 0x89;
-const CONTROL_DONE_TYPE: u16 = 0x84;
-const CONTROL_DONE_CHANNEL: u64 = 0x11;
 const INITDATA_ACK_POLLS: usize = 200;
 const CONTROL_COUNTER_POLLS: usize = 100;
 const G17P_CRASHLOG_MAX_BYTES: usize = 256 * 1024;
@@ -871,7 +869,6 @@ fn wait_initdata_ack(state: &G17PRoleRtkitState) -> Result {
 fn finish_boot_session(
     pdev: &platform::Device,
     drm: &ARef<AsahiDevice>,
-    registers: &regs::Resources,
     manager: &mut g17_manager::G17PManagerConstruction,
     test_stage: G17PTestStage,
     cpus: g17_lifecycle::StartedCpuPair<G17PMailboxProvider>,
@@ -894,17 +891,6 @@ fn finish_boot_session(
         pdev.as_ref(),
         "G17P control: 4 primary and 16 secondary records staged\n"
     );
-
-    if test_stage.configures_qid4() {
-        // Native keeps the completed render graph reachable through both
-        // active root slots while firmware consumes the opening 0x20 record.
-        // Producers remain zero until control-done below.
-        manager.stage_compute_bootstrap_render(drm)?;
-        dev_info!(
-            pdev.as_ref(),
-            "G17P roots: bootstrap render graph bound to both slots before control start\n"
-        );
-    }
 
     let control_start = (CONTROL_START_TYPE as u64) << 48;
     Pin::new(&mut gfx_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, control_start)?;
@@ -948,16 +934,14 @@ fn finish_boot_session(
         opening_effect.operand_slot
     );
 
-    let control_done = ((CONTROL_DONE_TYPE as u64) << 48) | CONTROL_DONE_CHANNEL;
+    if !g17_submission::G17P_NATIVE_PRE_USER_EP21_MESSAGES.is_empty() {
+        return Err(EINVAL);
+    }
+    manager.validate_native_pre_user_roots()?;
     if !test_stage.configures_qid4() {
-        Pin::new(&mut gfx_rtkit).send_message(
-            g17_rtkit::ENDPOINT_GFX_INTERRUPTS,
-            control_done,
-        )?;
-        dev_info!(pdev.as_ref(), "G17P control: primary done message sent\n");
         dev_info!(
             pdev.as_ref(),
-            "G17P session: control stage complete; QID4 remains untouched\n"
+            "G17P session: native control stage complete; no pre-user EP21 work/control message; QID4 remains untouched\n"
         );
         return Ok(G17PBootedSession {
             cpus,
@@ -969,82 +953,6 @@ fn finish_boot_session(
             compute_uapi_enabled: false,
         });
     }
-
-    manager
-        .prepare_partial_opening_control_done()
-        .inspect_err(|error| {
-            dev_err!(
-                pdev.as_ref(),
-                "G17P compute control: pre-doorbell status failed ({:?})\n",
-                error
-            );
-        })?;
-    Pin::new(&mut gfx_rtkit)
-        .send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, control_done)?;
-    dev_info!(
-        pdev.as_ref(),
-        "G17P compute control: primary done sent before startup work publication\n"
-    );
-    manager.publish_partial_opening_operand_table()?;
-    dev_info!(
-        pdev.as_ref(),
-        "G17P compute control: 28-entry partial operand table published\n"
-    );
-
-    manager.split_compute_bootstrap_render_contexts()?;
-    dev_info!(
-        pdev.as_ref(),
-        "G17P roots: opening retired; split to context0/render before work\n"
-    );
-
-    // Restore and publish 3D first, then restore and publish TA. End with the
-    // barrier required before the one paired channel-0 bell.
-    let bootstrap = manager.publish_staged_compute_bootstrap_render()?;
-    dev_info!(
-        pdev.as_ref(),
-        "G17P compute control: startup TA/3D group staged after primary done\n"
-    );
-    Pin::new(&mut gfx_rtkit).send_message(
-        g17_rtkit::ENDPOINT_GFX_INTERRUPTS,
-        bootstrap.paired_doorbell,
-    )?;
-    dev_info!(
-        pdev.as_ref(),
-        "G17P compute control: channel-0 startup work sent\n"
-    );
-    if let Err(error) = manager.wait_compute_bootstrap_render_retirement() {
-        let (fault_info, fault_address_word) = registers.g17p_fault_registers();
-        let fault_valid = fault_info & 1 != 0;
-        let fault_reason = (fault_info >> 1) & 0x7;
-        let fault_read = fault_info & (1 << 4) != 0;
-        let fault_level = (fault_info >> 7) & 0x3;
-        let fault_vm = (fault_info >> 17) & 0x3f;
-        let fault_unit = (fault_info >> 9) & 0xff;
-        let fault_address = fault_address_word << 6;
-        dev_err!(
-            pdev.as_ref(),
-            "G17P startup fault: valid={} reason={} read={} level={} vm={} unit={:#x} address={:#x} raw_info={:#x} raw_addr={:#x}\n",
-            fault_valid,
-            fault_reason,
-            fault_read,
-            fault_level,
-            fault_vm,
-            fault_unit,
-            fault_address,
-            fault_info,
-            fault_address_word
-        );
-        return Err(error);
-    }
-    if gfx_state.crashed.load(Ordering::Acquire) || gfx1_state.crashed.load(Ordering::Acquire) {
-        return Err(EIO);
-    }
-    Pin::new(&mut gfx_rtkit)
-        .send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, control_done)?;
-    dev_info!(
-        pdev.as_ref(),
-        "G17P compute control: startup TA/3D retired at 3/3/3\n"
-    );
 
     let queue = manager.prepare_g17p_compute_queue(drm)?;
     dev_info!(
@@ -1058,7 +966,7 @@ fn finish_boot_session(
     );
     dev_info!(
         pdev.as_ref(),
-        "G17P compute: native-first-submit-v1 armed; no readiness/type4 prephase\n"
+        "G17P compute: native-first-submit-v2 armed; pre-user EP21 quiet, first real CL sends 0x0a then 0x10\n"
     );
     Ok(G17PBootedSession {
         cpus,
@@ -1162,7 +1070,6 @@ fn boot_session(
     finish_boot_session(
         pdev,
         drm,
-        registers,
         manager,
         test_stage,
         cpus,
@@ -1280,7 +1187,6 @@ fn boot_initial_session(
     let session = finish_boot_session(
         pdev,
         drm,
-        registers,
         &mut manager,
         test_stage,
         cpus,

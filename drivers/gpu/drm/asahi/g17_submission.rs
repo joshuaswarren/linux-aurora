@@ -515,6 +515,16 @@ pub(crate) const fn encode_g17p_direct_cl_kick() -> u64 {
     MSG_TX_DOORBELL | DOORBELL_KICKFW as u64
 }
 
+/// Exact J700 native EP21 lifecycle around firmware startup and the first real
+/// userspace CL. Startup publishes no work or record-less device-control
+/// announcement; the first changed priority-2 CL emits activation then the
+/// direct kick.
+pub(crate) const G17P_NATIVE_PRE_USER_EP21_MESSAGES: [u64; 0] = [];
+pub(crate) const G17P_NATIVE_FIRST_USER_EP21_MESSAGES: [u64; 2] = [
+    0x0083_0000_0000_000a,
+    0x0083_0000_0000_0010,
+];
+
 /// Pure predicate/encoding boundary. A repeat submit omits activation when the
 /// cached identity already matches, but an enabled, direct, unsuppressed submit
 /// still emits the separate direct kick.
@@ -4018,6 +4028,25 @@ mod tests {
             require_g17p_running_client_power_transition(contract, true, true),
             Ok(())
         );
+    }
+
+    #[test]
+    fn g17p_native_boot_is_ep21_quiet_until_first_real_user_cl() {
+        assert!(G17P_NATIVE_PRE_USER_EP21_MESSAGES.is_empty());
+        assert_eq!(
+            G17P_NATIVE_FIRST_USER_EP21_MESSAGES,
+            [
+                encode_g17p_cl_activation(2).unwrap(),
+                encode_g17p_direct_cl_kick(),
+            ]
+        );
+        assert_eq!(
+            G17P_NATIVE_FIRST_USER_EP21_MESSAGES.map(doorbell_type),
+            [3, 3]
+        );
+        assert!(!G17P_NATIVE_FIRST_USER_EP21_MESSAGES
+            .iter()
+            .any(|message| doorbell_type(*message) == 4));
     }
 
     #[test]
