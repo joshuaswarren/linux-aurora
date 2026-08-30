@@ -19,8 +19,8 @@ use core::sync::atomic::{fence, Ordering};
 
 #[cfg(not(test))]
 use crate::{
-    driver::AsahiDevice, g17_completion, g17_compute, g17_initdata, g17_lifecycle, g17_render,
-    g17_resources, g17_submission, g17_uapi, hw::agx3, identity, mmu, regs,
+    driver::AsahiDevice, g17_adt_j700, g17_completion, g17_compute, g17_initdata, g17_lifecycle,
+    g17_render, g17_resources, g17_submission, g17_uapi, hw::agx3, identity, mmu, pgtable, regs,
 };
 #[cfg(test)]
 use super as g17_submission;
@@ -33,6 +33,34 @@ mod identity;
 
 use g17_initdata::InstanceRole;
 use identity::{FirmwareRoleTopology, GpuGen, GpuHalGeneration, GpuVariant, SubmissionTransport};
+
+// Pinned T8140 GFX.a010 scheduler/HRB root. Firmware __DATA starts at link
+// address 0xfffffc0000050000 and the iBoot data carveout maps that address at
+// J700_GFX_DATA.base. These addresses are diagnostic only and do not enter the
+// submission ABI.
+const G17P_GFX_LINK_DATA_BASE: u64 = 0xffff_fc00_0005_0000;
+const G17P_SCHEDULER_ROOT_LINK_ADDRESS: u64 = 0xffff_fc00_0010_49e8;
+const G17P_SCHEDULER_ROOT_PHYSICAL_ADDRESS: u64 = 0x0000_0100_01e3_09e8;
+const G17P_SCHEDULER_ROOT_SNAPSHOT_SIZE: usize = 0x80;
+const G17P_SCHEDULER_ROOT_PENDING_OFFSET: usize = 0x00;
+const G17P_SCHEDULER_ROOT_DEFERRED_OFFSET: usize = 0x50;
+const G17P_SCHEDULER_ROOT_STATE_OFFSET: usize = 0x68;
+
+#[cfg(not(test))]
+const _: () = {
+    assert!(
+        G17P_SCHEDULER_ROOT_PHYSICAL_ADDRESS
+            == g17_adt_j700::J700_GFX_DATA.base
+                + (G17P_SCHEDULER_ROOT_LINK_ADDRESS - G17P_GFX_LINK_DATA_BASE)
+    );
+    assert!(
+        G17P_SCHEDULER_ROOT_PHYSICAL_ADDRESS + G17P_SCHEDULER_ROOT_SNAPSHOT_SIZE as u64
+            <= g17_adt_j700::J700_GFX_DATA.base + g17_adt_j700::J700_GFX_DATA.size
+    );
+    assert!(G17P_SCHEDULER_ROOT_PHYSICAL_ADDRESS & 7 == 0);
+    assert!(G17P_SCHEDULER_ROOT_SNAPSHOT_SIZE & 7 == 0);
+    assert!(G17P_SCHEDULER_ROOT_STATE_OFFSET + 4 <= G17P_SCHEDULER_ROOT_SNAPSHOT_SIZE);
+};
 
 /// Grounded manager inputs for T8140. Power and tuning values are excluded.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -654,6 +682,7 @@ impl G17PManagerConstruction {
                 .into_iter()
                 .all(|counters| counters[2] == 1 && counters[..2] == [counters[2]; 2]);
             if inner_retired && outer_retired {
+                self.log_scheduler_root_checkpoint("A-bootstrap-retired-pre-drop");
                 self.render_tracker = None;
                 self.render_bind = None;
                 self.render_storage = None;
@@ -661,6 +690,7 @@ impl G17PManagerConstruction {
                 self.resources
                     .uat()
                     .restore_t8140_kernel_context_after_bootstrap_render()?;
+                self.log_scheduler_root_checkpoint("B-bootstrap-post-root-restore");
                 return Ok(());
             }
             last = Some((state, outer));
@@ -698,6 +728,61 @@ impl G17PManagerConstruction {
 
     pub(crate) fn uat(&self) -> &mmu::Uat {
         self.resources.uat()
+    }
+
+    /// Log one cache-invalidated, read-only sample of the pinned GFX scheduler root.
+    /// Sampling failures never alter the live submission state.
+    pub(crate) fn log_scheduler_root_checkpoint(&self, checkpoint: &'static str) {
+        #[cfg(CONFIG_DEV_COREDUMP)]
+        match pgtable::UatPageTable::copy_live_firmware_physical_range(
+            G17P_SCHEDULER_ROOT_PHYSICAL_ADDRESS,
+            G17P_SCHEDULER_ROOT_SNAPSHOT_SIZE,
+        ) {
+            Ok(bytes) => {
+                let read_u64 = |offset: usize| {
+                    bytes
+                        .get(offset..offset + core::mem::size_of::<u64>())
+                        .and_then(|value| value.try_into().ok())
+                        .map(u64::from_le_bytes)
+                };
+                let pending = read_u64(G17P_SCHEDULER_ROOT_PENDING_OFFSET);
+                let deferred = read_u64(G17P_SCHEDULER_ROOT_DEFERRED_OFFSET);
+                let state = read_u64(G17P_SCHEDULER_ROOT_STATE_OFFSET)
+                    .map(|value| value as u32);
+                match (pending, deferred, state) {
+                    (Some(pending), Some(deferred), Some(state)) => {
+                        let drain_open = (state & 0x18) == 0;
+                        dev_info!(
+                            self.resources.dev().as_ref(),
+                            "G17P scheduler-root checkpoint={} pa={:#x} pending={:#x} deferred={:#x} state={:#x} drain-open={}\n",
+                            checkpoint,
+                            G17P_SCHEDULER_ROOT_PHYSICAL_ADDRESS,
+                            pending,
+                            deferred,
+                            state,
+                            drain_open,
+                        )
+                    }
+                    _ => dev_err!(
+                        self.resources.dev().as_ref(),
+                        "G17P scheduler-root checkpoint={} decode failed\n",
+                        checkpoint,
+                    ),
+                }
+            }
+            Err(error) => dev_err!(
+                self.resources.dev().as_ref(),
+                "G17P scheduler-root checkpoint={} coherent sample failed ({:?})\n",
+                checkpoint,
+                error,
+            ),
+        }
+        #[cfg(not(CONFIG_DEV_COREDUMP))]
+        dev_err!(
+            self.resources.dev().as_ref(),
+            "G17P scheduler-root checkpoint={} unavailable without CONFIG_DEV_COREDUMP\n",
+            checkpoint,
+        );
     }
 
     pub(crate) fn mark_firmware_cache_flush_ready(&self) {
@@ -1136,6 +1221,7 @@ impl G17PManagerConstruction {
         {
             return Err(EINVAL);
         }
+        self.log_scheduler_root_checkpoint("C-first-bind-pre-readiness");
         self.resources.prepare_compute_readiness_context1()?;
         self.resources.validate_compute_readiness_context2(vm)?;
         let mappings = queue.compute.map_user_execution_state(vm)?;
@@ -1144,6 +1230,7 @@ impl G17PManagerConstruction {
             return Err(EFAULT);
         }
         self.compute_readiness_context2_bound = true;
+        self.log_scheduler_root_checkpoint("D-first-bind-post-context2");
         Ok(G17PComputeUserBinding {
             mappings,
             _vm_bind: vm_bind,
@@ -1302,6 +1389,7 @@ impl G17PManagerConstruction {
             if !self.compute_readiness_context2_bound {
                 return Err(EINVAL);
             }
+            self.log_scheduler_root_checkpoint("E-readiness-pre-producer10");
             let mut activation_address = None;
             let target = self.resources.stage_compute_readiness_suffix(|| {
                 activation_address = Some(queue.storage.initialize_context2_activation_record()?);
@@ -1321,6 +1409,7 @@ impl G17PManagerConstruction {
                 return Err(EINVAL);
             }
             self.compute_readiness_staged = true;
+            self.log_scheduler_root_checkpoint("F-readiness-post-producer10");
             dev_info!(
                 self.resources.dev().as_ref(),
                 "G17P compute readiness v1: ctx1 seq=35/35/36 activation={:#x} ctx2 seq=37/37/38 target={}\n",
@@ -1378,6 +1467,7 @@ impl G17PManagerConstruction {
             fsleep(Delta::from_millis(1));
         }
         if let Some(counters) = last {
+            self.log_scheduler_root_checkpoint("H-readiness-retirement-timeout");
             dev_err!(
                 self.resources.dev().as_ref(),
                 "G17P compute readiness: control retirement timeout primary={:?} secondary={:?}, expected [10, 10, 10]/[16, 16, 16]\n",
@@ -1815,6 +1905,25 @@ mod tests {
             identity::T8140_G17P_SUBMISSION_BACKEND
         );
         assert_eq!(T8140_MANAGER_CONFIG.work_channel_count, 12);
+    }
+
+    #[test]
+    fn scheduler_root_link_address_maps_inside_the_gfx_carveout() {
+        const GFX_DATA_BASE: u64 = 0x0000_0100_01d7_c000;
+        const GFX_DATA_SIZE: u64 = 0x13_4000;
+        assert_eq!(
+            GFX_DATA_BASE + (G17P_SCHEDULER_ROOT_LINK_ADDRESS - G17P_GFX_LINK_DATA_BASE),
+            G17P_SCHEDULER_ROOT_PHYSICAL_ADDRESS,
+        );
+        assert_eq!(G17P_SCHEDULER_ROOT_PHYSICAL_ADDRESS, 0x0000_0100_01e3_09e8);
+        assert_eq!(
+            G17P_SCHEDULER_ROOT_PHYSICAL_ADDRESS + G17P_SCHEDULER_ROOT_STATE_OFFSET as u64,
+            0x0000_0100_01e3_0a50,
+        );
+        assert!(
+            G17P_SCHEDULER_ROOT_PHYSICAL_ADDRESS + G17P_SCHEDULER_ROOT_SNAPSHOT_SIZE as u64
+                <= GFX_DATA_BASE + GFX_DATA_SIZE
+        );
     }
 
     #[test]

@@ -829,6 +829,37 @@ impl UatPageTable {
         }
         Ok(data)
     }
+
+    /// Copy a live firmware-data range after invalidating the AP cache alias.
+    ///
+    /// Unlike crashlog storage, scheduler state can change between two host
+    /// samples. A write-back `memremap()` can therefore return an AP cacheline
+    /// retained from the preceding sample. Invalidate each covered cacheline
+    /// before loading it, matching the physical-read cache maintenance used by
+    /// the output-positive m1n1 host. This path never writes firmware memory.
+    #[cfg(CONFIG_DEV_COREDUMP)]
+    pub(crate) fn copy_live_firmware_physical_range(
+        physical: PhysicalAddr,
+        size: usize,
+    ) -> Result<KVVec<u8>> {
+        if size == 0 || (physical | size as u64) & 7 != 0 {
+            return Err(EINVAL);
+        }
+        physical.checked_add(size as u64).ok_or(EOVERFLOW)?;
+        let page_mask = UAT_PGMSK as u64;
+        let mut data = KVVec::from_elem(0, size, GFP_KERNEL)?;
+        let mut copied = 0usize;
+        while copied < size {
+            let address = physical.checked_add(copied as u64).ok_or(EOVERFLOW)?;
+            let page = PhysPageMapping::new(address & !page_mask)?;
+            let offset = (address & page_mask) as usize;
+            let length = (UAT_PGSZ - offset).min(size - copied);
+            page.invalidate_live_range(offset, length)?;
+            page.copy_atomic(offset, &mut data[copied..copied + length])?;
+            copied = copied.checked_add(length).ok_or(EOVERFLOW)?;
+        }
+        Ok(data)
+    }
 }
 
 #[cfg(CONFIG_DEV_COREDUMP)]
@@ -857,6 +888,50 @@ impl PhysPageMapping {
             ENOMEM
         })?;
         Ok(Self { ptr })
+    }
+
+    fn invalidate_live_range(&self, offset: usize, size: usize) -> Result {
+        let end = offset.checked_add(size).ok_or(EOVERFLOW)?;
+        if size == 0 || end > UAT_PGSZ {
+            return Err(EINVAL);
+        }
+        let ctr_el0: u64;
+        unsafe {
+            // SAFETY: CTR_EL0 is readable at EL1 and reports DminLine as
+            // log2(words). The resulting line size controls only bounded cache
+            // maintenance on this read-only mapping.
+            core::arch::asm!(
+                "mrs {ctr}, ctr_el0",
+                ctr = out(reg) ctr_el0,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+        let line_size = 4usize
+            .checked_shl(((ctr_el0 >> 16) & 0xf) as u32)
+            .ok_or(EOVERFLOW)?;
+        if !line_size.is_power_of_two() {
+            return Err(EINVAL);
+        }
+        let start_address = self.ptr.as_ptr() as usize + offset;
+        let end_address = self.ptr.as_ptr() as usize + end;
+        let mut address = start_address & !(line_size - 1);
+        unsafe {
+            // SAFETY: the page remains mapped for the whole loop. `dc ivac`
+            // invalidates AP cachelines only; this diagnostic never writes the
+            // firmware-owned page. The barriers order invalidation before the
+            // atomic loads in `copy_atomic()`.
+            core::arch::asm!("dsb osh", options(nostack, preserves_flags));
+            while address < end_address {
+                core::arch::asm!(
+                    "dc ivac, {address}",
+                    address = in(reg) address,
+                    options(nostack, preserves_flags),
+                );
+                address = address.checked_add(line_size).ok_or(EOVERFLOW)?;
+            }
+            core::arch::asm!("dsb osh", options(nostack, preserves_flags));
+        }
+        Ok(())
     }
 
     fn read_u64(&self, offset: usize) -> Result<u64> {

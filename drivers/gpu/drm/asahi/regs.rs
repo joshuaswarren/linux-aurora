@@ -45,6 +45,15 @@ const T8140_AXI_TRANSITION_1: usize = 0x1000108;
 /// Must be written 0 before ANY initdata is sent to either firmware
 /// instance (T8140 startup sequence step "write zero to SGX+0xd06030").
 const T8140_PRE_INITDATA_CLEAR: usize = 0xd06030;
+/// G17P Fender dynamic-gating control. The pinned host clears bits 1 and 2
+/// when it arms the firmware power callback; bit 2 set proves the callback is
+/// disabled at the scheduler boundary.
+const T8140_FENDER_DYNAMIC_GATING: usize = 0xd06030;
+/// Host interrupt summary and enable/status words sampled by the native
+/// scheduler-active boundary audit.
+const T8140_HOST_IRQ_SUMMARY: usize = 0xe01000;
+const T8140_HOST_IRQ_ENABLE: usize = 0xe01010;
+const T8140_HOST_IRQ_STATUS: usize = 0xe01014;
 
 const FAULT_INFO: usize = 0x17030;
 
@@ -190,6 +199,46 @@ pub(crate) struct Resources {
     /// Serializes the shared fixed-slot SKSM FIFO across every queue.
     sksm_fifo: Pin<KBox<Mutex<()>>>,
 }
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PSchedulerGateRegisters {
+    pub(crate) fender_dynamic_gating: u32,
+    pub(crate) host_irq_summary: u32,
+    pub(crate) host_irq_enable: u32,
+    pub(crate) host_irq_status: u32,
+}
+
+impl G17PSchedulerGateRegisters {
+    pub(crate) const fn fender_wake_armed(self) -> bool {
+        self.fender_dynamic_gating & 0x6 == 0
+    }
+}
+
+const _: () = {
+    const T8140_SGX_RESOURCE_SIZE: usize = 0x400_0000;
+    assert!(T8140_FENDER_DYNAMIC_GATING + 4 <= T8140_SGX_RESOURCE_SIZE);
+    assert!(T8140_HOST_IRQ_SUMMARY + 4 <= T8140_SGX_RESOURCE_SIZE);
+    assert!(T8140_HOST_IRQ_ENABLE + 4 <= T8140_SGX_RESOURCE_SIZE);
+    assert!(T8140_HOST_IRQ_STATUS + 4 <= T8140_SGX_RESOURCE_SIZE);
+    assert!(
+        G17PSchedulerGateRegisters {
+            fender_dynamic_gating: 0,
+            host_irq_summary: 0,
+            host_irq_enable: 0,
+            host_irq_status: 0,
+        }
+        .fender_wake_armed()
+    );
+    assert!(
+        !G17PSchedulerGateRegisters {
+            fender_dynamic_gating: 4,
+            host_irq_summary: 0,
+            host_irq_enable: 0,
+            host_irq_status: 0,
+        }
+        .fender_wake_armed()
+    );
+};
 
 /// Write-only publication view of resource 0 for the SKSM FIFO pair.
 ///
@@ -541,6 +590,19 @@ impl Resources {
             self.sgx_read64::<FAULT_INFO_G14X>(),
             self.sgx_read64::<FAULT_ADDR_G14X>(),
         )
+    }
+
+    /// Read the four side-effect-free SGX words that distinguish an armed
+    /// Fender wake path from a disabled one at the first-CL boundary.
+    pub(crate) fn g17p_scheduler_gate_registers(&self) -> Result<G17PSchedulerGateRegisters> {
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let registers = sgx.relaxed();
+        Ok(G17PSchedulerGateRegisters {
+            fender_dynamic_gating: registers.try_read32(T8140_FENDER_DYNAMIC_GATING)?,
+            host_irq_summary: registers.try_read32(T8140_HOST_IRQ_SUMMARY)? & 0xf,
+            host_irq_enable: registers.try_read32(T8140_HOST_IRQ_ENABLE)?,
+            host_irq_status: registers.try_read32(T8140_HOST_IRQ_STATUS)?,
+        })
     }
 
     /// Get the fault information from the MMU status register, if one occurred.
