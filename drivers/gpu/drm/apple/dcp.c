@@ -76,6 +76,7 @@
 #define DCP_RTKIT_CRASHLOG_STR DCP_RTKIT_FOURCC('C', 's', 't', 'r')
 #define DCP_RTKIT_CRASHLOG_VERSION DCP_RTKIT_FOURCC('C', 'v', 'e', 'r')
 #define DCP_RTKIT_CRASHLOG_REGS DCP_RTKIT_FOURCC('C', 'r', 'g', '8')
+#define DCP_RTKIT_CRASHLOG_REGS_CL4 DCP_RTKIT_FOURCC('C', 'r', 'l', '4')
 
 #define DCP_RTKIT_CRASHLOG_MULTI_VERSION 2
 #define DCP_RTKIT_CRASHLOG_VERSION_V3 3
@@ -90,6 +91,8 @@
 #define DCP_RTKIT_CRASHLOG_REGS_BODY_SIZE 0x348
 #define DCP_RTKIT_CRASHLOG_REGS_UNDECODABLE BIT(16)
 #define DCP_RTKIT_CRASHLOG_INCOMPLETE BIT(8)
+
+#define DCP_25G83_INHERITED_CRASHLOG_WORD 0x12610008784000ULL
 
 struct dcp_rtkit_crashlog_header {
 	__le32 fourcc;
@@ -357,9 +360,15 @@ unbacked:
 	dev_info_ratelimited(dcp->dev, "ep %#04x: %#llx\n", endpoint, message);
 }
 
+static bool dcp_rtk_report_adopted_crashlog(struct apple_dcp *dcp,
+					    struct apple_rtkit_shmem *bfr);
+
 static void dcp_rtk_crashed(void *cookie, const void *crashlog, size_t crashlog_size)
 {
 	struct apple_dcp *dcp = cookie;
+
+	if (crashlog && crashlog_size && dcp->adopted_session)
+		dcp_rtk_report_adopted_crashlog(dcp, &dcp->rtk->crashlog_buffer);
 
 	dcp->crashed = true;
 	dev_err(dcp->dev, "DCP has crashed\n");
@@ -444,13 +453,7 @@ static bool dcp_rtk_select_crashlog(u8 *data, size_t data_size,
 	return true;
 }
 
-/*
- * An adopted RTKit session has already initialized EP1, but RTKit's local
- * crashlog_buffer state starts empty.  The first inherited EP1 type-1 message
- * can therefore be a crash notification rather than the initial buffer
- * advertisement.  Recognize it by the crashlog header after mapping the
- * firmware-owned buffer; an empty buffer remains an ordinary advertisement.
- */
+/* Decode the current record from the imported inherited EP1 crash buffer. */
 static bool dcp_rtk_report_adopted_crashlog(struct apple_dcp *dcp,
 					    struct apple_rtkit_shmem *bfr)
 {
@@ -584,20 +587,29 @@ static bool dcp_rtk_report_adopted_crashlog(struct apple_dcp *dcp,
 			text_size = strnlen(text, payload_size - 16);
 			dev_err(dcp->dev, "DCP firmware version: %.*s\n",
 				(int)min_t(size_t, text_size, SZ_4K), text);
-		} else if (fourcc == DCP_RTKIT_CRASHLOG_REGS &&
+		} else if ((fourcc == DCP_RTKIT_CRASHLOG_REGS ||
+			    fourcc == DCP_RTKIT_CRASHLOG_REGS_CL4) &&
 			   payload_size >= DCP_RTKIT_CRASHLOG_REGS_SIZE) {
 			u8 *regs = section + 16;
+			const char *kind = fourcc == DCP_RTKIT_CRASHLOG_REGS ?
+					   "CRG8" : "CRL4";
 			u32 regs_flags = get_unaligned_le32(regs);
 			u32 regs_size = get_unaligned_le32(regs + 4);
+
+			if (fourcc == DCP_RTKIT_CRASHLOG_REGS_CL4)
+				dev_info(dcp->dev,
+					 "DCP25G83_A401_CRASHLOG_CRL4_RAW head %16phN frame %40phN fault %32phN\n",
+					 regs, regs + 0xf0, regs + 0x328);
 
 			if (regs_size != DCP_RTKIT_CRASHLOG_REGS_BODY_SIZE ||
 			    (regs_flags & DCP_RTKIT_CRASHLOG_REGS_UNDECODABLE)) {
 				dev_err(dcp->dev,
-					"DCP25G83_A401_CRASHLOG_CRG8_INVALID flags %#x size %#x\n",
-					regs_flags, regs_size);
+					"DCP25G83_A401_CRASHLOG_%s_INVALID flags %#x size %#x\n",
+					kind, regs_flags, regs_size);
 			} else {
 				dev_err(dcp->dev,
-					"DCP25G83_A401_CRASHLOG_CRG8 pc %#llx sp %#llx psr %#llx far %#llx esr %#llx\n",
+					"DCP25G83_A401_CRASHLOG_%s pc %#llx sp %#llx psr %#llx far %#llx esr %#llx\n",
+					kind,
 					get_unaligned_le64(regs + DCP_RTKIT_CRASHLOG_REGS_PC),
 					get_unaligned_le64(regs + DCP_RTKIT_CRASHLOG_REGS_SP),
 					get_unaligned_le64(regs + DCP_RTKIT_CRASHLOG_REGS_PSR),
@@ -650,6 +662,63 @@ void dcp_rtk_timeout_crashlog_snapshot(struct apple_dcp *dcp)
 	dev_info(dcp->dev,
 		 "DCP25G83_A401_CRASHLOG_TIMEOUT mapped 1 size %#zx header %32phN reported %u\n",
 		 bfr->size, &header, reported);
+}
+
+static int dcp_rtk_import_adopted_crashlog(struct apple_dcp *dcp)
+{
+	struct apple_rtkit_shmem *bfr = &dcp->rtk->crashlog_buffer;
+	struct iommu_domain *domain = iommu_get_domain_for_dev(dcp->dev);
+	const u64 word = DCP_25G83_INHERITED_CRASHLOG_WORD;
+	u32 fw_version[3];
+	phys_addr_t phy_addr;
+	size_t offset;
+	int ret = -EINVAL;
+
+	if (dcp->fw_compat != DCP_FIRMWARE_H17P)
+		return 0;
+	if (of_property_count_u32_elems(dcp->dev->of_node,
+					"apple,firmware-version") !=
+					ARRAY_SIZE(fw_version) ||
+	    of_property_read_u32_array(dcp->dev->of_node,
+				       "apple,firmware-version", fw_version,
+				       ARRAY_SIZE(fw_version)) ||
+	    fw_version[0] != 26 || fw_version[1] != 6 || fw_version[2] != 2)
+		return -ENODEV;
+	if (bfr->size || bfr->iova || bfr->buffer || bfr->iomem)
+		return -EBUSY;
+	if (!domain)
+		return -ENOMEM;
+
+	bfr->size = FIELD_GET(GENMASK_ULL(51, 44), word) * SZ_4K;
+	bfr->iova = FIELD_GET(GENMASK_ULL(43, 0), word);
+	phy_addr = iommu_iova_to_phys(domain, bfr->iova);
+	if (!phy_addr)
+		goto err_clear;
+
+	for (offset = 0; offset < bfr->size; offset += SZ_16K) {
+		if (iommu_iova_to_phys(domain, bfr->iova + offset) !=
+		    phy_addr + offset)
+			goto err_clear;
+	}
+
+	/* Match RTBuddy's non-coherent firmware-buffer invalidation contract. */
+	bfr->iomem = ioremap_wc(phy_addr, bfr->size);
+	if (!bfr->iomem) {
+		ret = -ENOMEM;
+		goto err_clear;
+	}
+	bfr->is_mapped = true;
+
+	dev_info(dcp->dev,
+		 "DCP25G83_INHERITED_CRASHLOG_IMPORTED firmware %u.%u.%u word %#llx size %#zx DVA %pad PA %pa iomem %p; notification requires no reply\n",
+		 fw_version[0], fw_version[1], fw_version[2], word, bfr->size,
+		 &bfr->iova, &phy_addr, bfr->iomem);
+	return 0;
+
+err_clear:
+	bfr->iova = 0;
+	bfr->size = 0;
+	return ret;
 }
 
 static int dcp_rtk_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
@@ -707,14 +776,14 @@ static int dcp_rtk_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
 		dcp_rtk_report_adopted_crashlog(dcp, bfr);
 
 		/*
-		 * Generic RTKit reaches this fresh-buffer fallback because adopted
-		 * Linux state does not yet retain native's existing EP1 buffer
-		 * object. Its bit-54-clear reply preserves the supplied DVA and uses
-		 * bit 52 for 4-KiB units or bit 53 for 1-MiB units. Native's inherited
-		 * object handles this same word as a crash notification without a
-		 * reply; restoring that object state is a separate parity change.
+		 * A genuinely fresh bit-54-clear request preserves the supplied DVA
+		 * and uses bit 52 for 4-KiB units or bit 53 for 1-MiB units. The
+		 * adopted path imports the existing EP1 buffer before traffic, so its
+		 * same-shaped word is handled as a crash notification and never
+		 * reaches this reply.
 		 */
-		if (bfr == &dcp->rtk->crashlog_buffer) {
+		if (bfr == &dcp->rtk->crashlog_buffer &&
+		    !dcp->adopted_session) {
 			u64 ack;
 			int ret;
 
@@ -1820,6 +1889,15 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 
 		dcp->adopting_session = false;
 		dcp->adopted_session = true;
+		ret = dcp_rtk_import_adopted_crashlog(dcp);
+		if (ret) {
+			dev_err(dev,
+				"failed to import inherited DCP crashlog state: %d\n",
+				ret);
+			devm_apple_rtkit_free(dev, dcp->rtk);
+			dcp->rtk = NULL;
+			goto err_destroy_piodma;
+		}
 	} else {
 		if (start_mode == APPLE_DCP_COPROCESSOR_QUIESCED_RESTART)
 			dev_info(dev, "restarting loader-quiesced DCP session\n");

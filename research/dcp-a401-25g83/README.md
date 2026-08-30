@@ -72,7 +72,8 @@ not a valid association discriminator and why the reply error field is not a
 safe substitute.
 
 `parse_rtbuddy_crashlog.py` mirrors native RTBuddy's current-generation CLGH
-selection and summarizes Cstr and Crg8 from a raw crashlog-buffer dump. The
+selection and summarizes Cstr plus Crg8/Crl4 register frames from a raw
+crashlog-buffer dump. The
 layout was recovered from the local Mac17p reference kernelcache
 `kernelcache.release.mac17p.decompressed`, size `119504896`, SHA-256
 `a5f69db1ddd3052f166ab71e86ee63dfe6549e0e93f06d99621cb90c29f346cc`.
