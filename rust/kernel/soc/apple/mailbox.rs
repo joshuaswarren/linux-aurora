@@ -11,6 +11,7 @@ use crate::{
         from_err_ptr,
         to_result, //
     },
+    io::{Io, Mmio, MmioRaw},
     prelude::*,
     str::CStrExt,
     types::{
@@ -144,6 +145,51 @@ pub struct AscwrapV6Lifecycle {
     pub missing: u32,
 }
 
+/// Read-only snapshot of the two ASC mailbox FIFO controls.
+///
+/// ASCWrap v6 embeds the standard ASC mailbox at wrapper offset `0x8000`.
+/// These are the AP-visible controls at mailbox offsets `0x110` (AP-to-IOP)
+/// and `0x114` (IOP-to-AP). Reading them does not dequeue a message.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct AscwrapV6MailboxSnapshot {
+    /// AP-to-IOP FIFO control (the firmware inbox).
+    pub a2i_control: u32,
+    /// IOP-to-AP FIFO control (the firmware outbox).
+    pub i2a_control: u32,
+}
+
+impl AscwrapV6MailboxSnapshot {
+    /// FIFO occupancy from control bits 23:20.
+    pub const fn count(control: u32) -> u8 {
+        ((control >> 20) & 0xf) as u8
+    }
+
+    /// FIFO read pointer from control bits 15:12.
+    pub const fn read_pointer(control: u32) -> u8 {
+        ((control >> 12) & 0xf) as u8
+    }
+
+    /// FIFO write pointer from control bits 11:8.
+    pub const fn write_pointer(control: u32) -> u8 {
+        ((control >> 8) & 0xf) as u8
+    }
+
+    /// Whether the FIFO is empty (control bit 17).
+    pub const fn empty(control: u32) -> bool {
+        control & (1 << 17) != 0
+    }
+
+    /// Whether the FIFO is full (control bit 16).
+    pub const fn full(control: u32) -> bool {
+        control & (1 << 16) != 0
+    }
+
+    /// Whether the FIFO is enabled (control bit 0).
+    pub const fn enabled(control: u32) -> bool {
+        control & 1 != 0
+    }
+}
+
 /// Non-owning handle used to query an ASCWrap v6 mailbox provider.
 ///
 /// The provider, not the consumer, maps the wrapper and IOP VBAR resources.
@@ -203,6 +249,40 @@ impl AscwrapV6Provider {
     pub fn stop_cpu(&self) -> Result {
         // SAFETY: the provider owns and synchronizes its wrapper mapping.
         to_result(unsafe { bindings::apple_mbox_ascwrap_v6_stop_cpu(self.mbox) })
+    }
+
+    /// Snapshot both FIFO control words without changing mailbox state.
+    ///
+    /// The provider owns the mapping. This method only borrows that existing
+    /// mapping and issues two relaxed 32-bit reads; it does not map an alias,
+    /// read a message register, acknowledge an IRQ, or advance either FIFO.
+    #[inline(always)]
+    pub fn mailbox_snapshot(&self) -> Result<AscwrapV6MailboxSnapshot> {
+        const A2I_CONTROL: usize = 0x110;
+        const I2A_CONTROL: usize = 0x114;
+        const CONTROL_WINDOW_SIZE: usize = I2A_CONTROL + core::mem::size_of::<u32>();
+
+        // Reject removal and non-v6 providers through the provider's public
+        // lifecycle gate before borrowing its established mapping.
+        self.lifecycle()?;
+
+        // SAFETY: apple_mbox_get() returned a live ASCWrap v6 provider. Its
+        // `regs` field is the provider-owned mapping at wrapper+0x8000 and the
+        // provider validated the complete 0x88000 wrapper resource at probe.
+        // The consumer's device link keeps that mapping alive here.
+        let raw = MmioRaw::<CONTROL_WINDOW_SIZE>::new(
+            unsafe { (*self.mbox).regs as usize },
+            CONTROL_WINDOW_SIZE,
+        )?;
+        // SAFETY: the mapping and range are established above. The returned
+        // reference does not outlive this function or the provider handle.
+        let regs = unsafe { Mmio::from_raw(&raw) };
+        let regs = regs.relaxed();
+
+        Ok(AscwrapV6MailboxSnapshot {
+            a2i_control: regs.read32(A2I_CONTROL),
+            i2a_control: regs.read32(I2A_CONTROL),
+        })
     }
 }
 

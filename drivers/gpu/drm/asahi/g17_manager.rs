@@ -827,6 +827,19 @@ impl G17PManagerConstruction {
         );
     }
 
+    /// Prepare a one-page, read-only sampler for the exact J700 type-4 pending
+    /// bit. The caller creates this before the EP21 doorbell so the post-send
+    /// observation has no mapping setup in its critical window.
+    #[cfg(CONFIG_DEV_COREDUMP)]
+    pub(crate) fn prepare_type4_pending_probe(
+        &self,
+    ) -> Result<pgtable::LiveFirmwareU64Probe> {
+        pgtable::LiveFirmwareU64Probe::new(
+            G17P_SCHEDULER_ROOT_PHYSICAL_ADDRESS
+                + G17P_SCHEDULER_ROOT_PENDING_OFFSET as u64,
+        )
+    }
+
     pub(crate) fn mark_firmware_cache_flush_ready(&self) {
         self.resources.mark_firmware_cache_flush_ready();
     }

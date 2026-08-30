@@ -867,6 +867,88 @@ struct PhysPageMapping {
     ptr: NonNull<c_void>,
 }
 
+/// A bounded read-only probe for one qword in live firmware-owned physical
+/// memory.
+///
+/// Construction maps the containing page once. [`Self::observe_mask`] then
+/// invalidates only the sampled AP cacheline before each load, so a short
+/// firmware transition can be observed without remapping, writing, or holding
+/// any firmware lock.
+#[cfg(CONFIG_DEV_COREDUMP)]
+pub(crate) struct LiveFirmwareU64Probe {
+    page: PhysPageMapping,
+    offset: usize,
+}
+
+/// Result of one bounded live-mask observation.
+#[cfg(CONFIG_DEV_COREDUMP)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct LiveFirmwareMaskObservation {
+    pub(crate) first: u64,
+    pub(crate) last: u64,
+    pub(crate) observed_or: u64,
+    pub(crate) mask_seen: bool,
+    pub(crate) polls: usize,
+}
+
+#[cfg(CONFIG_DEV_COREDUMP)]
+impl LiveFirmwareU64Probe {
+    const MAX_POLLS: usize = 256;
+
+    pub(crate) fn new(physical: PhysicalAddr) -> Result<Self> {
+        if physical & 7 != 0 {
+            return Err(EINVAL);
+        }
+        let page_mask = UAT_PGMSK as u64;
+        let page = PhysPageMapping::new(physical & !page_mask)?;
+        let offset = (physical & page_mask) as usize;
+        if offset.checked_add(size_of::<u64>()).ok_or(EOVERFLOW)? > UAT_PGSZ {
+            return Err(EINVAL);
+        }
+        Ok(Self { page, offset })
+    }
+
+    /// Observe one mask for at most `polls` cache-invalidated qword loads.
+    pub(crate) fn observe_mask(
+        &self,
+        mask: u64,
+        polls: usize,
+    ) -> Result<LiveFirmwareMaskObservation> {
+        if mask == 0 || polls == 0 || polls > Self::MAX_POLLS {
+            return Err(EINVAL);
+        }
+
+        let mut first = 0;
+        let mut last = 0;
+        let mut observed_or = 0;
+        let mut mask_seen = false;
+        let mut completed = 0;
+        for index in 0..polls {
+            self.page.invalidate_live_range(self.offset, size_of::<u64>())?;
+            let value = self.page.read_u64(self.offset)?;
+            if index == 0 {
+                first = value;
+            }
+            last = value;
+            observed_or |= value;
+            completed = index + 1;
+            if value & mask != 0 {
+                mask_seen = true;
+                break;
+            }
+            core::hint::spin_loop();
+        }
+
+        Ok(LiveFirmwareMaskObservation {
+            first,
+            last,
+            observed_or,
+            mask_seen,
+            polls: completed,
+        })
+    }
+}
+
 #[cfg(CONFIG_DEV_COREDUMP)]
 impl PhysPageMapping {
     fn new(phys: PhysicalAddr) -> Result<Self> {
