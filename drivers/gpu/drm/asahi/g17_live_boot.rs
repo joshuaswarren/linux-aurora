@@ -887,6 +887,7 @@ fn finish_boot_session(
     gfx1_state: Arc<G17PRoleRtkitState>,
     gfx1_rtkit: rtkit::RtKit<G17PRtkitOps>,
 ) -> Result<G17PBootedSession> {
+    manager.log_mbi_trace_lease_checkpoint("post-initdata-acks");
     let staged = manager.control_counters()?;
     if !staged.opening_staged() {
         dev_err!(
@@ -1051,6 +1052,7 @@ fn finish_boot_session(
         registers,
         "bootstrap-after-retirement",
     );
+    manager.log_mbi_trace_lease_checkpoint("bootstrap-after-retirement");
     Pin::new(&mut gfx_rtkit)
         .send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, control_done)?;
     dev_info!(
@@ -1092,6 +1094,10 @@ fn finish_boot_session(
     dev_info!(
         pdev.as_ref(),
         "G17P diagnostic: j700-dual-initdata-publication-v1 armed\n"
+    );
+    dev_info!(
+        pdev.as_ref(),
+        "G17P diagnostic: j700-gfx1-root-main-flags-v1 armed\n"
     );
     Ok(G17PBootedSession {
         cpus,
@@ -1382,6 +1388,10 @@ impl G17PLiveRuntime {
             )
             .map_err(|_| ENOTSUPP)?;
         }
+        self.manager
+            .as_ref()
+            .ok_or(ENODEV)?
+            .log_mbi_trace_lease_checkpoint("first-submit-pre-readiness");
         {
             let manager = self.manager.as_mut().ok_or(ENODEV)?;
             let queue = self.queue.as_mut().ok_or(ENODEV)?;
