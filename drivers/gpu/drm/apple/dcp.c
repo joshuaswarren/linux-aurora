@@ -69,13 +69,23 @@
 #define APPLE_T8140_MBOX_A2I_SEND0 0x800
 #define APPLE_T8140_MBOX_A2I_SEND1 0x808
 
+#define APPLE_T8140_PMGR_BASE 0x300700000ULL
+#define APPLE_T8140_PMGR_SIZE SZ_4K
+#define APPLE_T8140_PMGR_PMC 0x138
+#define APPLE_T8140_PMGR_AUTO_ENABLE BIT(28)
+#define APPLE_T8140_PMGR_PS_TARGET GENMASK(3, 0)
+#define APPLE_T8140_PMGR_PS_ACTUAL GENMASK(7, 4)
+#define APPLE_T8140_PMGR_WAS_CLKGATED BIT(9)
+#define APPLE_T8140_PMGR_WAS_PWRGATED BIT(8)
+#define APPLE_T8140_PMGR_DEV_DISABLE BIT(10)
+#define APPLE_T8140_PMGR_PS_RESET BIT(12)
+#define APPLE_T8140_PMGR_PS_ACTIVE 0xf
+
 #define APPLE_T8140_PMP_BASE 0x300500000ULL
 #define APPLE_T8140_PMP_SIZE 0xa0000
 #define APPLE_T8140_PMP_STATUS 0x10
 #define APPLE_T8140_PMP_TGT_READ 0x1880
-#define APPLE_T8140_PMP_TGT_WRITE 0x10c40
 #define APPLE_T8140_PMP_ACTUAL 0x18c0
-#define APPLE_T8140_PMP_REPORT_READY BIT_ULL(0)
 #define APPLE_T8140_PMP_DISP_REPORT BIT_ULL(7)
 
 #define DCP_RTKIT_FOURCC(a, b, c, d) \
@@ -1186,51 +1196,80 @@ const u32 *dcp_get_iomfb_surfaces(struct platform_device *pdev, u32 *count)
 	return dcp->iomfb_surfaces.id;
 }
 
-static int dcp_t8140_require_disp_pmp_report(struct apple_dcp *dcp)
+static int dcp_t8140_require_pmc(struct apple_dcp *dcp)
 {
-	void __iomem *pmp;
-	u64 status, target_before, target_after, actual;
+	void __iomem *pmgr;
+	u32 before, target_write, after;
 	int ret;
 
 	if (!of_device_is_compatible(dcp->dev->of_node, "apple,t8140-dcp"))
 		return 0;
 
 	/*
-	 * Shipping T8140 firmware describes DISP_SYS as PMP report ID 8
-	 * (bit 7).  The in-tree T8140 DT does not yet instantiate pmp-report,
-	 * so assert its always-on ps_disp_cpu prerequisite before A401.
+	 * The shipping J700 ADT marks PMC on from boot.  The in-tree T8140 DT
+	 * models the domain but does not keep it on, so mirror the PMGR
+	 * provider's power-on sequence before DCP firmware accesses PMC.
 	 */
-	pmp = ioremap(APPLE_T8140_PMP_BASE, APPLE_T8140_PMP_SIZE);
-	if (!pmp)
+	pmgr = ioremap(APPLE_T8140_PMGR_BASE, APPLE_T8140_PMGR_SIZE);
+	if (!pmgr)
 		return dev_err_probe(dcp->dev, -ENOMEM,
-				     "failed to map T8140 PMP report registers\n");
+				     "failed to map T8140 PMGR registers\n");
 
-	status = readq(pmp + APPLE_T8140_PMP_STATUS);
-	target_before = readq(pmp + APPLE_T8140_PMP_TGT_READ);
-	writeq(target_before | APPLE_T8140_PMP_DISP_REPORT,
-	       pmp + APPLE_T8140_PMP_TGT_WRITE);
-	target_after = readq(pmp + APPLE_T8140_PMP_TGT_READ);
-	actual = readq(pmp + APPLE_T8140_PMP_ACTUAL);
+	before = readl(pmgr + APPLE_T8140_PMGR_PMC);
+	target_write = before &
+		~(APPLE_T8140_PMGR_DEV_DISABLE |
+		  APPLE_T8140_PMGR_PS_RESET |
+		  APPLE_T8140_PMGR_AUTO_ENABLE |
+		  APPLE_T8140_PMGR_WAS_CLKGATED |
+		  APPLE_T8140_PMGR_WAS_PWRGATED |
+		  APPLE_T8140_PMGR_PS_TARGET);
+	target_write |= APPLE_T8140_PMGR_PS_ACTIVE;
+	writel(target_write, pmgr + APPLE_T8140_PMGR_PMC);
 
-	if (!(status & APPLE_T8140_PMP_REPORT_READY)) {
-		ret = -EAGAIN;
-	} else if (!(target_after & APPLE_T8140_PMP_DISP_REPORT)) {
-		ret = -EIO;
-	} else {
-		ret = readq_poll_timeout_atomic(pmp + APPLE_T8140_PMP_ACTUAL,
-						actual,
-						actual & APPLE_T8140_PMP_DISP_REPORT,
-						100, 50000);
+	ret = readl_poll_timeout_atomic(pmgr + APPLE_T8140_PMGR_PMC, after,
+					((after & APPLE_T8140_PMGR_PS_ACTUAL) >> 4) ==
+						APPLE_T8140_PMGR_PS_ACTIVE,
+					1, 100);
+	if (!ret) {
+		target_write |= APPLE_T8140_PMGR_AUTO_ENABLE;
+		writel(target_write, pmgr + APPLE_T8140_PMGR_PMC);
+		after = readl(pmgr + APPLE_T8140_PMGR_PMC);
 	}
 
 	dev_info(dcp->dev,
-		 "DCP25G83_PMP_DISP_REPORT status %#llx target_before %#llx target_after %#llx actual %#llx requested %u active %u result %d\n",
-		 status, target_before, target_after, actual,
-		 !!(target_after & APPLE_T8140_PMP_DISP_REPORT),
-		 !!(actual & APPLE_T8140_PMP_DISP_REPORT), ret);
-	iounmap(pmp);
+		 "DCP25G83_PMC_PREREQUISITE before %#x target_write %#x after %#x target %#x actual %#x auto %u result %d\n",
+		 before, target_write, after,
+		 (u32)(after & APPLE_T8140_PMGR_PS_TARGET),
+		 (u32)((after & APPLE_T8140_PMGR_PS_ACTUAL) >> 4),
+		 !!(after & APPLE_T8140_PMGR_AUTO_ENABLE), ret);
+	iounmap(pmgr);
 
 	return ret;
+}
+
+static void dcp_t8140_observe_disp_pmp_report(struct apple_dcp *dcp)
+{
+	void __iomem *pmp;
+	u64 status, target, actual;
+
+	if (!of_device_is_compatible(dcp->dev->of_node, "apple,t8140-dcp"))
+		return;
+
+	pmp = ioremap(APPLE_T8140_PMP_BASE, APPLE_T8140_PMP_SIZE);
+	if (!pmp) {
+		dev_warn(dcp->dev, "failed to observe T8140 PMP report registers\n");
+		return;
+	}
+
+	status = readq(pmp + APPLE_T8140_PMP_STATUS);
+	target = readq(pmp + APPLE_T8140_PMP_TGT_READ);
+	actual = readq(pmp + APPLE_T8140_PMP_ACTUAL);
+	dev_info(dcp->dev,
+		 "DCP25G83_PMP_DISP_REPORT_OBSERVE status %#llx target %#llx actual %#llx requested %u active %u\n",
+		 status, target, actual,
+		 !!(target & APPLE_T8140_PMP_DISP_REPORT),
+		 !!(actual & APPLE_T8140_PMP_DISP_REPORT));
+	iounmap(pmp);
 }
 
 int dcp_start(struct platform_device *pdev)
@@ -1238,9 +1277,10 @@ int dcp_start(struct platform_device *pdev)
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 	int ret;
 
-	ret = dcp_t8140_require_disp_pmp_report(dcp);
+	ret = dcp_t8140_require_pmc(dcp);
 	if (ret)
 		return ret;
+	dcp_t8140_observe_disp_pmp_report(dcp);
 
 	init_completion(&dcp->start_done);
 
