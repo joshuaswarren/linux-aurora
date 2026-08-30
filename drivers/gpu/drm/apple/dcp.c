@@ -707,9 +707,12 @@ static int dcp_rtk_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
 		dcp_rtk_report_adopted_crashlog(dcp, bfr);
 
 		/*
-		 * The firmware still expects an acknowledgement when it supplies
-		 * its own DVA.  Native's bit-54-clear branch preserves that DVA and
-		 * uses bit 52 for 4-KiB size units or bit 53 for 1-MiB units.
+		 * Generic RTKit reaches this fresh-buffer fallback because adopted
+		 * Linux state does not yet retain native's existing EP1 buffer
+		 * object. Its bit-54-clear reply preserves the supplied DVA and uses
+		 * bit 52 for 4-KiB units or bit 53 for 1-MiB units. Native's inherited
+		 * object handles this same word as a crash notification without a
+		 * reply; restoring that object state is a separate parity change.
 		 */
 		if (bfr == &dcp->rtk->crashlog_buffer) {
 			u64 ack;

@@ -402,6 +402,16 @@ mailbox-wrapper diagnostic was removed. The fallback fresh-buffer response is
 now wire-correct, but native's inherited-buffer path establishes that this
 specific word is a crash notification and needs no response.
 
+The single pending A2I word at timeout in the e066 run is therefore a Linux
+artifact, not firmware backpressure. Linux lost endpoint offset `0xa8` while
+adopting the live RTBuddy session, misclassified the crash notification as a
+fresh buffer request, and queued a response native never sends. This happens
+after the firmware has already entered its crash path and is not the A401
+cause. The queued parity fix is to import or retain the inherited EP1 buffer
+object before endpoint traffic, invalidate/decode its current crash record on
+this notification, and send no reply. Keep that state repair separate from the
+current crash-PC discriminator.
+
 ## Timeout crashlog discriminator
 
 The adopted path does not send a new STARTEP for EP1. It marks the system
