@@ -148,6 +148,7 @@ fn all_ranges_covered(
 
 #[cfg(not(test))]
 fn map_compute_readiness_mappings(
+    dev: &AsahiDevice,
     table: &mut RenderBackingObject,
     buffers: &mut KVec<RenderBackingObject>,
     vm: &mmu::Vm,
@@ -160,13 +161,29 @@ fn map_compute_readiness_mappings(
         G17P_CONTROL_OPERAND_TABLE_VA,
         mmu::PROT_GPU_FW_SHARED_RW,
     )?;
-    let mut mappings = KVec::with_capacity(G17P_CONTROL_OPERAND_BUFFER_COUNT, GFP_KERNEL)?;
-    for (index, buffer) in buffers.iter_mut().enumerate() {
+    let mut mappings = KVec::with_capacity(
+        g17_initdata::COMPUTE_READINESS_OPERAND_ENTRY_COUNT,
+        GFP_KERNEL,
+    )?;
+    for (index, buffer) in buffers
+        .iter_mut()
+        .take(g17_initdata::COMPUTE_READINESS_OPERAND_ENTRY_COUNT)
+        .enumerate()
+    {
         let address = g17p_control_operand_buffer_va(index).ok_or(EINVAL)?;
-        mappings.push(
-            buffer.map_at(vm, address, mmu::PROT_GPU_FW_SHARED_RW)?,
-            GFP_KERNEL,
-        )?;
+        let mapping = buffer
+            .map_at(vm, address, mmu::PROT_GPU_FW_SHARED_RW)
+            .inspect_err(|error| {
+                dev_err!(
+                    dev.as_ref(),
+                    "G17P compute readiness: operand buffer {} map at {:#x}:{:#x} failed ({:?})\n",
+                    index,
+                    address,
+                    G17P_CONTROL_OPERAND_BUFFER_SIZE,
+                    error,
+                );
+            })?;
+        mappings.push(mapping, GFP_KERNEL)?;
     }
     let result = G17PComputeReadinessMappings {
         table,
@@ -1434,17 +1451,21 @@ impl G17PComputeUserMappings {
 #[cfg(not(test))]
 impl G17PComputeReadinessMappings {
     fn all_reachable_from(&self, vm: &mmu::Vm) -> bool {
-        vm.covers_range(
-            self.table.iova(),
-            self.table.size() as u64,
-            true,
-            true,
-        ) && all_ranges_covered(
-            self.buffers
-                .iter()
-                .map(|mapping| (mapping.iova(), mapping.size() as u64)),
-            |address, size| vm.covers_range(address, size, true, true),
-        )
+        self.buffers.len() == g17_initdata::COMPUTE_READINESS_OPERAND_ENTRY_COUNT
+            && self.table.iova() == G17P_CONTROL_OPERAND_TABLE_VA
+            && vm.covers_range(
+                self.table.iova(),
+                self.table.size() as u64,
+                true,
+                true,
+            )
+            && self.buffers.iter().enumerate().all(|(index, mapping)| {
+                g17p_control_operand_buffer_va(index).is_some_and(|address| {
+                    mapping.iova() == address
+                        && mapping.size() == G17P_CONTROL_OPERAND_BUFFER_SIZE
+                        && vm.covers_range(address, mapping.size() as u64, true, true)
+                })
+            })
     }
 }
 
@@ -4128,7 +4149,7 @@ impl G17ResourceOwner {
         }
         self.validate_compute_readiness_objects()?;
         self.resources.control_operand_table.with_bytes_mut(|bytes| {
-            g17_initdata::encode_partial_opening_operand_table_post_control(bytes)
+            g17_initdata::encode_compute_readiness_operand_table(bytes)
                 .map_err(|_| EINVAL)
         })?;
         if !self.resources.compute_readiness_class3_support_active {
@@ -4156,6 +4177,7 @@ impl G17ResourceOwner {
         if self.resources.compute_readiness_context1.is_none() {
             let vm = self.address_space.uat.kernel_lower_vm();
             self.resources.compute_readiness_context1 = Some(map_compute_readiness_mappings(
+                &self.dev,
                 &mut self.resources.control_operand_table,
                 &mut self.resources.control_operand_buffers,
                 vm,
@@ -4183,7 +4205,7 @@ impl G17ResourceOwner {
             return Err(EINVAL);
         }
         self.resources.control_operand_table.with_bytes_mut(|bytes| {
-            g17_initdata::encode_partial_opening_operand_table_post_control(bytes)
+            g17_initdata::encode_compute_readiness_operand_table(bytes)
                 .map_err(|_| EINVAL)
         })?;
         if !vm.covers_range(
@@ -4192,7 +4214,7 @@ impl G17ResourceOwner {
             true,
             true,
         ) || !all_ranges_covered(
-            (0..G17P_CONTROL_OPERAND_BUFFER_COUNT).map(|index| {
+            (0..g17_initdata::COMPUTE_READINESS_OPERAND_ENTRY_COUNT).map(|index| {
                 (
                     g17p_control_operand_buffer_va(index).unwrap_or(0),
                     G17P_CONTROL_OPERAND_BUFFER_SIZE as u64,
@@ -6293,10 +6315,23 @@ mod tests {
         assert!(
             g17_initdata::CONTROL_OPERAND_ENTRY_COUNT <= G17P_CONTROL_OPERAND_BUFFER_COUNT
         );
+        assert_eq!(g17_initdata::COMPUTE_READINESS_OPERAND_ENTRY_COUNT, 21);
+        let readiness_last =
+            g17p_control_operand_buffer_va(g17_initdata::COMPUTE_READINESS_OPERAND_ENTRY_COUNT - 1)
+                .unwrap();
+        let first_opening_only =
+            g17p_control_operand_buffer_va(g17_initdata::COMPUTE_READINESS_OPERAND_ENTRY_COUNT)
+                .unwrap();
+        assert_eq!(readiness_last, 0x70_016c_0000);
+        assert_eq!(first_opening_only, 0x70_017c_8000);
+        assert!(
+            readiness_last + G17P_CONTROL_OPERAND_BUFFER_SIZE as u64 <= first_opening_only
+        );
 
         // These are B2 aliases only in context 0. They fall inside render
         // operand slot 21, so the layouts cannot share one low root.
         let slot_21 = g17p_control_operand_buffer_va(21).unwrap();
+        assert_eq!(slot_21, first_opening_only);
         let slot_21_end = slot_21 + G17P_CONTROL_OPERAND_BUFFER_SIZE as u64;
         for b2 in g17_initdata::REGION_VIEW_LOW_ADDRS {
             assert!(slot_21 <= b2 && b2 < slot_21_end);

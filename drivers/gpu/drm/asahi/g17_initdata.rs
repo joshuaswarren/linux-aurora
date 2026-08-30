@@ -225,6 +225,9 @@ pub(crate) const COMPUTE_DISPATCH_RECORD_SIZE: usize = 0x20;
 /// Output-positive first-CL readiness suffix. These six records are staged at
 /// primary slots 4..9 and become visible through one final producer store.
 pub(crate) const COMPUTE_READINESS_RECORDS: usize = 6;
+/// Output-positive final compute graph maps and names exactly operand entries
+/// 0..20. The retained opening still owns 28 backing objects.
+pub(crate) const COMPUTE_READINESS_OPERAND_ENTRY_COUNT: usize = 21;
 pub(crate) const COMPUTE_READINESS_FINAL_COUNTER: u32 =
     CONTROL_OPENING_PRIMARY_PRODUCER + COMPUTE_READINESS_RECORDS as u32;
 pub(crate) const COMPUTE_READINESS_CLASS1_SUPPORT_ADDRESS: u64 = 0xffff_fc20_c087_8000;
@@ -477,6 +480,26 @@ pub(crate) fn encode_compute_readiness_activation_record(
     put_u64(out, 0x00, 0x0000_0100_0000_ffff);
     put_u64(out, 0x20, 0x0002_0000_0000_0000);
     put_u64(out, 0x30, 0x0000_0000_ff00_0000);
+    Ok(())
+}
+
+pub(crate) fn encode_compute_readiness_operand_table(
+    out: &mut [u8],
+) -> Result<(), InitdataError> {
+    if out.len() != CONTROL_OPERAND_TABLE_SIZE {
+        return Err(InitdataError::BufferSize);
+    }
+    out.fill(0);
+    for index in 0..COMPUTE_READINESS_OPERAND_ENTRY_COUNT {
+        let address = CONTROL_OPERAND_BUFFER_BASE
+            .checked_add(index as u64 * CONTROL_OPERAND_BUFFER_STRIDE)
+            .ok_or(InitdataError::AddressOutOfRange)?;
+        put_u64(
+            out,
+            index * CONTROL_OPERAND_ENTRY_STRIDE,
+            address | CONTROL_OPERAND_ENTRY_FLAG,
+        );
+    }
     Ok(())
 }
 
@@ -2820,6 +2843,21 @@ mod tests {
         put_u64(&mut expected, 0x30, 0x0000_0000_ff00_0000);
         assert_eq!(activation, expected);
         assert_eq!(COMPUTE_READINESS_ACTIVATION_RECORD_OFFSET, 0x80);
+
+        let mut operand_table = [0xffu8; CONTROL_OPERAND_TABLE_SIZE];
+        encode_compute_readiness_operand_table(&mut operand_table).unwrap();
+        for index in 0..COMPUTE_READINESS_OPERAND_ENTRY_COUNT {
+            assert_eq!(
+                get_u64(&operand_table, index * CONTROL_OPERAND_ENTRY_STRIDE),
+                (CONTROL_OPERAND_BUFFER_BASE
+                    + index as u64 * CONTROL_OPERAND_BUFFER_STRIDE)
+                    | CONTROL_OPERAND_ENTRY_FLAG,
+            );
+        }
+        assert!(operand_table
+            [COMPUTE_READINESS_OPERAND_ENTRY_COUNT * CONTROL_OPERAND_ENTRY_STRIDE..]
+            .iter()
+            .all(|byte| *byte == 0));
     }
 
     #[test]
