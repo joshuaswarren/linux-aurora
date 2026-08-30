@@ -43,6 +43,28 @@ int mt7921e_tx_prepare_skb(struct mt76_dev *mdev, void *txwi_ptr,
 	pid = mt76_tx_status_skb_add(mdev, wcid, tx_info->skb);
 	mt76_connac2_mac_write_txwi(mdev, txwi_ptr, tx_info->skb, wcid, key,
 				    pid, qid, 0);
+	if (is_mt7932(mdev) &&
+	    ieee80211_is_auth(((struct ieee80211_hdr *)
+			      tx_info->skb->data)->frame_control)) {
+		__le32 *txd = txwi_ptr;
+		struct ieee80211_mgmt *mgmt =
+			(struct ieee80211_mgmt *)tx_info->skb->data;
+		bool da_is_bssid = ether_addr_equal(mgmt->da, mgmt->bssid);
+		bool sa_is_vif = info->control.vif &&
+			ether_addr_equal(mgmt->sa, info->control.vif->addr);
+
+		dev_info(mdev->dev,
+			 "J700_MT7932_AUTH_TX_PREPARE: qid=%u wcid=%u pid=%u bytes=%u nbuf=%u alg=%u transaction=%u status=%u da_is_bssid=%u sa_is_vif=%u txd=%08x/%08x/%08x/%08x/%08x/%08x/%08x/%08x\n",
+			 qid, wcid->idx, pid, tx_info->skb->len, tx_info->nbuf,
+			 le16_to_cpu(mgmt->u.auth.auth_alg),
+			 le16_to_cpu(mgmt->u.auth.auth_transaction),
+			 le16_to_cpu(mgmt->u.auth.status_code),
+			 da_is_bssid, sa_is_vif,
+			 le32_to_cpu(txd[0]), le32_to_cpu(txd[1]),
+			 le32_to_cpu(txd[2]), le32_to_cpu(txd[3]),
+			 le32_to_cpu(txd[4]), le32_to_cpu(txd[5]),
+			 le32_to_cpu(txd[6]), le32_to_cpu(txd[7]));
+	}
 
 	txp = (struct mt76_connac_hw_txp *)(txwi + MT_TXD_SIZE);
 	memset(txp, 0, sizeof(struct mt76_connac_hw_txp));
