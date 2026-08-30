@@ -958,16 +958,11 @@ static u8 dcpep_cb_prop_start(struct apple_dcp *dcp, u32 *length)
 		return false;
 	}
 
-	/*
-	 * This length comes straight off the wire.  A bogus value turns the
-	 * allocation below into a multi-gigabyte GFP_KERNEL request, and the
-	 * box vanishes into reclaim with no oops and no fault -- it just stops.
-	 * Property blobs here are a few KiB, so bound it and never let the
-	 * allocator retry.
-	 */
-	if (*length == 0 || *length > SZ_1M) {
-		dev_warn(dcp->dev, "rejecting %u byte property transfer\n",
-			 *length);
+	dcp->chunks.length = *length;
+	dcp->chunks.data = kzalloc(*length, GFP_KERNEL);
+
+	if (!dcp->chunks.data) {
+		dev_warn(dcp->dev, "failed to allocate chunks\n");
 		return false;
 	}
 
