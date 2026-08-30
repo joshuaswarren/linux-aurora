@@ -1295,7 +1295,8 @@ impl G17PManagerConstruction {
     }
 
     /// Stage the exact six-record ctx1/ctx2 suffix as one producer batch. The
-    /// caller's later EP21 work kick drains it before scanning CL2.
+    /// live-boot owner announces it once with control-done 0x84 and waits for
+    /// retirement before sending either EP83 work notification.
     fn stage_compute_readiness_once(&mut self, queue: &mut G17PSksmQueue) -> Result {
         if !self.compute_readiness_staged {
             if !self.compute_readiness_context2_bound {
@@ -1328,6 +1329,63 @@ impl G17PManagerConstruction {
             );
         }
         Ok(())
+    }
+
+    /// Return true exactly while the six-record suffix is staged but has not
+    /// yet retired. The live-boot owner uses this to send the one
+    /// primary control-done announcement before any EP83 work notification.
+    pub(crate) fn compute_readiness_needs_control_done(&mut self) -> Result<bool> {
+        if !self.compute_readiness_staged {
+            return Err(EINVAL);
+        }
+        let counters = self.resources.control_counters()?;
+        if counters.compute_readiness_staged() {
+            Ok(true)
+        } else if counters.compute_readiness_retired() {
+            Ok(false)
+        } else {
+            dev_err!(
+                self.resources.dev().as_ref(),
+                "G17P compute readiness: invalid pre-announcement counters primary={:?} secondary={:?}\n",
+                counters.primary,
+                counters.secondary,
+            );
+            Err(EIO)
+        }
+    }
+
+    /// Wait for the device-control drain to consume the complete six-record
+    /// suffix. No CL activation/direct kick may be sent until this succeeds.
+    pub(crate) fn wait_compute_readiness_retirement(&mut self) -> Result {
+        const POLLS: usize = 100;
+        if !self.compute_readiness_staged {
+            return Err(EINVAL);
+        }
+        let mut last = None;
+        for _ in 0..POLLS {
+            fence(Ordering::Acquire);
+            let counters = self.resources.control_counters()?;
+            if counters.compute_readiness_retired() {
+                dev_info!(
+                    self.resources.dev().as_ref(),
+                    "G17P compute readiness: control consumers retired at {:?}/{:?}\n",
+                    counters.primary,
+                    counters.secondary,
+                );
+                return Ok(());
+            }
+            last = Some(counters);
+            fsleep(Delta::from_millis(1));
+        }
+        if let Some(counters) = last {
+            dev_err!(
+                self.resources.dev().as_ref(),
+                "G17P compute readiness: control retirement timeout primary={:?} secondary={:?}, expected [10, 10, 10]/[16, 16, 16]\n",
+                counters.primary,
+                counters.secondary,
+            );
+        }
+        Err(ETIMEDOUT)
     }
 
     fn publish_compute_b2_once(&mut self, queue: &mut G17PSksmQueue) -> Result {

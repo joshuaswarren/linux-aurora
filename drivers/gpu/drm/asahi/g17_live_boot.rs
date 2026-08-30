@@ -845,11 +845,12 @@ fn finish_boot_session(
 
     // The accumulated 65-record capture history is not replayed at boot. The
     // manager stages only the output-positive six-record readiness suffix at
-    // first CL bind and publishes its final producer once; the later EP21 work
-    // kick drains all six before firmware scans the CL priority rings.
+    // first CL bind and publishes its final producer once. The submit boundary
+    // announces it with one control-done 0x84 and waits for all six records to
+    // retire before either EP83 work notification.
     dev_info!(
         pdev.as_ref(),
-        "G17P compute control: ctx1/ctx2 readiness suffix deferred to first CL kick\n"
+        "G17P compute control: ctx1/ctx2 readiness suffix deferred to first CL submit\n"
     );
 
     let queue = manager.configure_g17p_compute_queue(drm, registers)?;
@@ -860,7 +861,7 @@ fn finish_boot_session(
     );
     dev_info!(
         pdev.as_ref(),
-        "G17P compute: candidate native-cl2-readiness-v1 armed\n"
+        "G17P compute: candidate native-cl2-readiness-0x84-v1 armed\n"
     );
     Ok(G17PBootedSession {
         cpus,
@@ -1297,6 +1298,47 @@ impl G17PLiveRuntime {
                 };
             }
         };
+        let readiness_needs_control_done = match self
+            .manager
+            .as_mut()
+            .ok_or(ENODEV)?
+            .compute_readiness_needs_control_done()
+        {
+            Ok(required) => required,
+            Err(error) => {
+                return match g17_lifecycle::recover_persistent_runtime(self) {
+                    Ok(()) => Err(error),
+                    Err(recovery_error) => Err(recovery_error),
+                };
+            }
+        };
+        if readiness_needs_control_done {
+            let readiness_control_done = ((CONTROL_DONE_TYPE as u64) << 48) | CONTROL_DONE_CHANNEL;
+            dev_info!(
+                self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                "G17P compute readiness: sending control announcement {:#x} before EP83 work\n",
+                readiness_control_done,
+            );
+            if let Err(error) = Pin::new(self.gfx_rtkit.as_mut().ok_or(ENODEV)?)
+                .send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, readiness_control_done)
+            {
+                return match g17_lifecycle::recover_persistent_runtime(self) {
+                    Ok(()) => Err(error),
+                    Err(recovery_error) => Err(recovery_error),
+                };
+            }
+        }
+        if let Err(error) = self
+            .manager
+            .as_mut()
+            .ok_or(ENODEV)?
+            .wait_compute_readiness_retirement()
+        {
+            return match g17_lifecycle::recover_persistent_runtime(self) {
+                Ok(()) => Err(error),
+                Err(recovery_error) => Err(recovery_error),
+            };
+        }
         let channel_path = notifications.is_some();
         if let Some(notifications) = notifications {
             if let Some(activation) = notifications.activation {
