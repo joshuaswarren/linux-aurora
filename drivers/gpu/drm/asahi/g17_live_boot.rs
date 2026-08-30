@@ -31,7 +31,6 @@ use kernel::{
     bindings,
     device::Core,
     error::{from_err_ptr, to_result},
-    io::{Io, Mmio, MmioRaw},
     iosys_map::IoSysMapRef,
     platform,
     prelude::*,
@@ -44,8 +43,8 @@ use kernel::{devcoredump, new_mutex, sync::Mutex, time::msecs_to_jiffies};
 
 use crate::{
     driver::{AsahiDevice, T8140LiveTopologyAdmission},
-    g17_completion, g17_initdata, g17_lifecycle, g17_manager, g17_rtkit, g17_submission,
-    g17_uapi, gem, hw, identity, mmu, module_parameters, regs,
+    g17_completion, g17_lifecycle, g17_manager, g17_rtkit, g17_submission, g17_uapi, gem, hw,
+    identity, mmu, module_parameters, regs,
 };
 use kernel::sync::aref::ARef;
 
@@ -71,62 +70,6 @@ const INITDATA_ACK_POLLS: usize = 200;
 const CONTROL_COUNTER_POLLS: usize = 100;
 const G17P_CRASHLOG_MAX_BYTES: usize = 256 * 1024;
 const G17P_RTKIT_UAT_DVA_MASK: u64 = (1u64 << 40) - 1;
-
-fn log_g17p_status_a_snapshot(
-    dev: &kernel::device::Device,
-    manager: &mut g17_manager::G17PManagerConstruction,
-    checkpoint: &'static str,
-) {
-    match manager.status_a_snapshot() {
-        Ok(snapshot) => dev_info!(
-            dev,
-            "G17P status-a-j700-a000 checkpoint={} address={:#x} raw={:#x} active={} scheduler-constructed={}\n",
-            checkpoint,
-            snapshot.address,
-            snapshot.raw,
-            snapshot.active,
-            snapshot.scheduler_constructed,
-        ),
-        Err(error) => dev_err!(
-            dev,
-            "G17P status-a-j700-a000 checkpoint={} read failed ({:?})\n",
-            checkpoint,
-            error,
-        ),
-    }
-}
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-struct G17PMailboxSnapshot {
-    a2i_control: u32,
-    i2a_control: u32,
-}
-
-impl G17PMailboxSnapshot {
-    const fn count(control: u32) -> u8 {
-        ((control >> 20) & 0xf) as u8
-    }
-
-    const fn read_pointer(control: u32) -> u8 {
-        ((control >> 12) & 0xf) as u8
-    }
-
-    const fn write_pointer(control: u32) -> u8 {
-        ((control >> 8) & 0xf) as u8
-    }
-
-    const fn empty(control: u32) -> bool {
-        control & (1 << 17) != 0
-    }
-
-    const fn full(control: u32) -> bool {
-        control & (1 << 16) != 0
-    }
-
-    const fn enabled(control: u32) -> bool {
-        control & 1 != 0
-    }
-}
 
 /// Module-local, read-only view of one existing ASCWrap mailbox provider.
 ///
@@ -203,26 +146,6 @@ impl G17PMailboxProvider {
         to_result(unsafe { bindings::apple_mbox_ascwrap_v6_stop_cpu(self.mbox) })
     }
 
-    fn snapshot(&self) -> Result<G17PMailboxSnapshot> {
-        const A2I_CONTROL: usize = 0x110;
-        const I2A_CONTROL: usize = 0x114;
-        const CONTROL_WINDOW_SIZE: usize = I2A_CONTROL + core::mem::size_of::<u32>();
-
-        // SAFETY: the provider's mapping starts at the ASC mailbox block and
-        // its T8140 probe validated the enclosing 0x88000 ASCWrap resource.
-        // The consumer device link established by `get` keeps it live.
-        let raw = MmioRaw::<CONTROL_WINDOW_SIZE>::new(
-            unsafe { (*self.mbox).regs as usize },
-            CONTROL_WINDOW_SIZE,
-        )?;
-        // SAFETY: `raw` describes the live provider-owned mapping and the two
-        // reads below are bounded to the standard ASC control window.
-        let regs = unsafe { Mmio::from_raw(&raw) }.relaxed();
-        Ok(G17PMailboxSnapshot {
-            a2i_control: regs.read32(A2I_CONTROL),
-            i2a_control: regs.read32(I2A_CONTROL),
-        })
-    }
 }
 
 // SAFETY: the provider mapping is device-link protected and the reader issues
@@ -230,44 +153,6 @@ impl G17PMailboxProvider {
 unsafe impl Send for G17PMailboxProvider {}
 // SAFETY: as above; concurrent snapshots do not change either FIFO.
 unsafe impl Sync for G17PMailboxProvider {}
-
-fn log_g17p_mailbox_snapshot(
-    dev: &kernel::device::Device,
-    mailbox: &G17PMailboxProvider,
-    checkpoint: &'static str,
-) {
-    match mailbox.snapshot() {
-        Ok(snapshot) => {
-            let a2i = snapshot.a2i_control;
-            let i2a = snapshot.i2a_control;
-            dev_info!(
-                dev,
-                "G17P mailbox-control checkpoint={} a2i={:#x} count={} empty={} full={} read={} write={} enabled={} i2a={:#x} count={} empty={} full={} read={} write={} enabled={}\n",
-                checkpoint,
-                a2i,
-                G17PMailboxSnapshot::count(a2i),
-                G17PMailboxSnapshot::empty(a2i),
-                G17PMailboxSnapshot::full(a2i),
-                G17PMailboxSnapshot::read_pointer(a2i),
-                G17PMailboxSnapshot::write_pointer(a2i),
-                G17PMailboxSnapshot::enabled(a2i),
-                i2a,
-                G17PMailboxSnapshot::count(i2a),
-                G17PMailboxSnapshot::empty(i2a),
-                G17PMailboxSnapshot::full(i2a),
-                G17PMailboxSnapshot::read_pointer(i2a),
-                G17PMailboxSnapshot::write_pointer(i2a),
-                G17PMailboxSnapshot::enabled(i2a),
-            )
-        }
-        Err(error) => dev_err!(
-            dev,
-            "G17P mailbox-control checkpoint={} read failed ({:?})\n",
-            checkpoint,
-            error,
-        ),
-    }
-}
 
 const fn g17p_rtkit_uat_address(dva: u64) -> u64 {
     dva & G17P_RTKIT_UAT_DVA_MASK
@@ -1052,32 +937,11 @@ fn finish_boot_session(
         "G17P compute control: startup TA/3D retired at 3/3/3\n"
     );
 
-    // The accumulated 65-record capture history is not replayed at boot. At
-    // first CL bind, the manager publishes the six output-positive readiness
-    // records one at a time. Each producer gets one control-done 0x84 and must
-    // retire before the next producer or either EP83 work notification.
+    let queue = manager.prepare_g17p_compute_queue(drm)?;
     dev_info!(
         pdev.as_ref(),
-        "G17P compute control: ctx1/ctx2 readiness suffix deferred to first CL submit\n"
-    );
-
-    let queue = manager.configure_g17p_compute_queue(drm, registers)?;
-    dev_info!(
-        pdev.as_ref(),
-        "G17P session: SKSM QID 4 / selector 2 ready; stage {}\n",
+        "G17P session: SKSM QID 4 / selector 2 memory prepared; hardware registration deferred to first direct submitBuffer; stage {}\n",
         test_stage.name()
-    );
-    dev_info!(
-        pdev.as_ref(),
-        "G17P compute: candidate readiness-per-record-v2 armed\n"
-    );
-    dev_info!(
-        pdev.as_ref(),
-        "G17P diagnostic: type4-j700-a000-pointer-chain-v2 armed\n"
-    );
-    dev_info!(
-        pdev.as_ref(),
-        "G17P diagnostic: j700-a000-ep21-ingress-v1 armed\n"
     );
     dev_info!(
         pdev.as_ref(),
@@ -1085,7 +949,7 @@ fn finish_boot_session(
     );
     dev_info!(
         pdev.as_ref(),
-        "G17P diagnostic: j700-status-a-v1 armed\n"
+        "G17P compute: native-first-submit-v1 armed; no readiness/type4 prephase\n"
     );
     Ok(G17PBootedSession {
         cpus,
@@ -1333,6 +1197,7 @@ pub(crate) struct G17PLiveRuntime {
     gfx1_rtkit: Option<rtkit::RtKit<G17PRtkitOps>>,
     queue: Option<g17_manager::G17PSksmQueue>,
     compute_binding: Option<g17_manager::G17PComputeUserBinding>,
+    compute_timestamps: Option<mmu::KernelMapping>,
     completion_indices: g17_completion::QueueIndices,
     render_tracker: Option<g17_manager::G17PPartialOpeningRenderTracker>,
     test_stage: G17PTestStage,
@@ -1352,143 +1217,6 @@ impl G17PLiveRuntime {
                 .gfx1_state
                 .as_ref()
                 .is_some_and(|state| state.crashed.load(Ordering::Acquire))
-    }
-
-    /// Publish the six first-CL readiness records one at a time. Each producer
-    /// gets its own device-control announcement and must retire before the
-    /// next record, or before any command/SKSM/CL2 state becomes visible.
-    fn publish_compute_readiness_per_record(
-        &mut self,
-        command: &g17_uapi::TranslatedComputeCommand,
-    ) -> Result {
-        const PRE_ANNOUNCEMENT_PHASES: [&str; g17_initdata::COMPUTE_READINESS_RECORDS] = [
-            "readiness-record0-target5-pre-0x84",
-            "readiness-record1-target6-pre-0x84",
-            "readiness-record2-target7-pre-0x84",
-            "readiness-record3-target8-pre-0x84",
-            "readiness-record4-target9-pre-0x84",
-            "readiness-record5-target10-pre-0x84",
-        ];
-
-        if command.g17p_add3_buffers.is_some() {
-            g17_submission::require_g17p_first_bind_direct_hardware_release(
-                g17_submission::G17P_FIRST_BIND_COMMAND_PLAN,
-            )
-            .map_err(|_| ENOTSUPP)?;
-        }
-        {
-            let manager = self.manager.as_mut().ok_or(ENODEV)?;
-            let queue = self.queue.as_mut().ok_or(ENODEV)?;
-            manager.prepare_compute_readiness_prelude(queue)?;
-        }
-
-        for (index, phase) in PRE_ANNOUNCEMENT_PHASES.iter().enumerate() {
-            let boundary = {
-                let manager = self.manager.as_mut().ok_or(ENODEV)?;
-                let queue = self.queue.as_mut().ok_or(ENODEV)?;
-                manager.publish_next_compute_readiness_record(queue)?
-            };
-            if boundary.index as usize != index {
-                return Err(EIO);
-            }
-            let staged = self.manager.as_mut().ok_or(ENODEV)?.control_counters()?;
-            if !staged.compute_readiness_record_staged(boundary.producer_after) {
-                return Err(EIO);
-            }
-            match self
-                .manager
-                .as_mut()
-                .ok_or(ENODEV)?
-                .control_pointer_snapshot()
-            {
-                Ok(pointer) => {
-                    let exact = pointer.raw_state_pointers == pointer.expected_state_pointers;
-                    dev_info!(
-                        self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
-                        "G17P type4 pointer-chain checkpoint={} main={:#x} raw(actual,mirror,producer)={:#x?} expected={:#x?} values={:?} exact={}\n",
-                        phase,
-                        pointer.main_config,
-                        pointer.raw_state_pointers,
-                        pointer.expected_state_pointers,
-                        pointer.state_values,
-                        exact,
-                    )
-                }
-                Err(error) => dev_err!(
-                    self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
-                    "G17P type4 pointer-chain checkpoint={} read failed ({:?})\n",
-                    phase,
-                    error,
-                ),
-            }
-            log_g17p_status_a_snapshot(
-                self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
-                self.manager.as_mut().ok_or(ENODEV)?,
-                phase,
-            );
-            dev_info!(
-                self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
-                "G17P compute readiness per-record-v2: publish index={} opcode={:#x} sequence={} context={} producer={}->{} counters={:?}/{:?} announcement={:#x}\n",
-                boundary.index,
-                boundary.opcode,
-                boundary.sequence,
-                boundary.context,
-                boundary.producer_before,
-                boundary.producer_after,
-                staged.primary,
-                staged.secondary,
-                g17_submission::G17P_READINESS_CONTROL_DONE_MESSAGE,
-            );
-            log_g17p_mailbox_snapshot(
-                self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
-                self.cpus.as_ref().ok_or(ENODEV)?.gfx(),
-                phase,
-            );
-            Pin::new(self.gfx_rtkit.as_mut().ok_or(ENODEV)?).send_message(
-                g17_rtkit::ENDPOINT_GFX_INTERRUPTS,
-                g17_submission::G17P_READINESS_CONTROL_DONE_MESSAGE,
-            )?;
-            log_g17p_mailbox_snapshot(
-                self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
-                self.cpus.as_ref().ok_or(ENODEV)?.gfx(),
-                "readiness-post-0x84",
-            );
-            log_g17p_status_a_snapshot(
-                self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
-                self.manager.as_mut().ok_or(ENODEV)?,
-                "readiness-post-0x84",
-            );
-            let retired = match self
-                .manager
-                .as_mut()
-                .ok_or(ENODEV)?
-                .wait_compute_readiness_record_retirement(boundary.producer_after)
-            {
-                Ok(retired) => retired,
-                Err(error) => {
-                    log_g17p_mailbox_snapshot(
-                        self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
-                        self.cpus.as_ref().ok_or(ENODEV)?.gfx(),
-                        "readiness-timeout",
-                    );
-                    log_g17p_status_a_snapshot(
-                        self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
-                        self.manager.as_mut().ok_or(ENODEV)?,
-                        "readiness-timeout",
-                    );
-                    return Err(error);
-                }
-            };
-            dev_info!(
-                self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
-                "G17P compute readiness per-record-v2: boundary index={} target={} retired counters={:?}/{:?}\n",
-                boundary.index,
-                boundary.producer_after,
-                retired.primary,
-                retired.secondary,
-            );
-        }
-        Ok(())
     }
 
     pub(crate) fn mark_firmware_cache_flush_ready(&self) -> Result {
@@ -1587,10 +1315,10 @@ impl G17PLiveRuntime {
         Ok(())
     }
 
-    /// Publish one translated compute command and wait for the start and end
-    /// timestamps owned by its descriptor. The caller retains the mapping
-    /// until this method returns, so firmware cannot outlive its completion
-    /// words.
+    /// Publish one translated compute command and wait for its execution
+    /// timestamps. The direct first-bind path retains the mapping and VM bind
+    /// beyond this return until correlated ordinal-0 completion or stopped-CPU
+    /// recovery, so timestamp visibility alone cannot release firmware state.
     pub(crate) fn submit_translated_compute(
         &mut self,
         vm: &mmu::Vm,
@@ -1600,7 +1328,10 @@ impl G17PLiveRuntime {
         if !self.accepting_submissions {
             return Err(ENOTSUPP);
         }
-        if self.is_crashed() || self.compute_binding.is_some() {
+        if self.is_crashed()
+            || self.compute_binding.is_some()
+            || self.compute_timestamps.is_some()
+        {
             g17_lifecycle::recover_persistent_runtime(self)?;
         }
         if self
@@ -1639,12 +1370,6 @@ impl G17PLiveRuntime {
             manager.bind_compute_user_vm(queue, vm)?
         };
         self.compute_binding = Some(binding);
-        if let Err(error) = self.publish_compute_readiness_per_record(command) {
-            return match g17_lifecycle::recover_persistent_runtime(self) {
-                Ok(()) => Err(error),
-                Err(recovery_error) => Err(recovery_error),
-            };
-        }
         let submit_result = {
             let registers = self.registers.as_ref().ok_or(ENODEV)?;
             let manager = self.manager.as_mut().ok_or(ENODEV)?;
@@ -1862,7 +1587,15 @@ impl G17PLiveRuntime {
                 };
             }
         }
-        drop(self.compute_binding.take());
+        if channel_path {
+            self.compute_timestamps = Some(owned_timestamps);
+            dev_info!(
+                self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                "G17P compute: first direct CL timestamps complete; retaining timestamp mapping, VM binding, and QID state until native ordinal-0 completion is wired\n"
+            );
+        } else {
+            drop(self.compute_binding.take());
+        }
         Ok(completion)
     }
 
@@ -1929,6 +1662,7 @@ impl G17PLiveRuntime {
             gfx1_rtkit: Some(session.gfx1_rtkit),
             queue: session.queue,
             compute_binding: None,
+            compute_timestamps: None,
             completion_indices: g17_completion::QueueIndices {
                 done: 0,
                 read: 0,
@@ -2071,6 +1805,7 @@ impl g17_lifecycle::PersistentRuntimeRecovery for G17PLiveRuntime {
     }
 
     fn release_runtime_objects(&mut self) {
+        drop(self.compute_timestamps.take());
         drop(self.compute_binding.take());
         drop(self.queue.take());
         if let Some(manager) = self.manager.as_mut() {
@@ -2135,6 +1870,7 @@ impl g17_lifecycle::PersistentRuntimeTeardown for G17PLiveRuntime {
 
     fn retain_after_stop_failure(&mut self) {
         self.accepting_submissions = false;
+        core::mem::forget(self.compute_timestamps.take());
         core::mem::forget(self.compute_binding.take());
         core::mem::forget(self.queue.take());
         core::mem::forget(self.gfx1_rtkit.take());
@@ -2159,6 +1895,7 @@ impl g17_lifecycle::PersistentRuntimeTeardown for G17PLiveRuntime {
     }
 
     fn drop_queue(&mut self) {
+        drop(self.compute_timestamps.take());
         drop(self.compute_binding.take());
         drop(self.queue.take());
     }
