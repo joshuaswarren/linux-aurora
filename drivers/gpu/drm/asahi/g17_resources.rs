@@ -58,6 +58,16 @@ pub(crate) const G17P_CL_SUPPORT_STATE_SIZE: usize = 0x4000;
 pub(crate) const G17P_CL_OPERAND_TABLE_SIZE: usize = 0x4000;
 pub(crate) const G17P_CL_LOW_VA_START: u64 = 0x70_0000_0000;
 pub(crate) const G17P_CL_LOW_VA_END: u64 = 0x71_0000_0000;
+/// Dynamic queue, descriptor, and render state live above every native fixed
+/// low resource. The lower 32 MiB remain available for temporal bootstrap,
+/// readiness, and B2 aliases. Relocatable completion aliases also belong in
+/// this dynamic range when their live owner is implemented.
+pub(crate) const G17P_CL_DYNAMIC_LOW_VA_START: u64 = 0x70_0200_0000;
+
+#[cfg(not(test))]
+fn g17p_cl_dynamic_low_va_range() -> Range<u64> {
+    G17P_CL_DYNAMIC_LOW_VA_START..G17P_CL_LOW_VA_END
+}
 pub(crate) const G17P_COMPUTE_DESCRIPTOR_SLOT_SIZE: usize = 0x4000;
 pub(crate) const G17P_COMPUTE_DESCRIPTOR_SLOT_COUNT: usize =
     g17_submission::T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY.stamp_count() as usize;
@@ -1617,7 +1627,7 @@ impl G17PComputeDescriptorStorage {
         let mut descriptors = MappedObject::new_wc_in_range(
             dev,
             uat.kernel_lower_vm(),
-            G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END,
+            g17p_cl_dynamic_low_va_range(),
             G17P_COMPUTE_DESCRIPTOR_STORAGE_SIZE,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
@@ -1645,7 +1655,7 @@ impl G17PComputeDescriptorStorage {
         let operand_state = MappedObject::new_wc_in_range(
             dev,
             uat.kernel_lower_vm(),
-            G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END,
+            g17p_cl_dynamic_low_va_range(),
             G17P_COMPUTE_OPERAND_STATE_SIZE,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
@@ -1682,7 +1692,7 @@ impl G17PComputeDescriptorStorage {
         let queue_context_low = MappedObject::new_wc_in_range(
             dev,
             uat.kernel_lower_vm(),
-            G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END,
+            g17p_cl_dynamic_low_va_range(),
             g17_compute::COMPUTE_QUEUE_CONTEXT_EXTENT,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
@@ -1730,31 +1740,31 @@ impl G17PComputeDescriptorStorage {
     ) -> Result<G17PComputeUserMappings> {
         let descriptors = self.descriptors.map_alias_in_range(
             vm,
-            G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END,
+            g17p_cl_dynamic_low_va_range(),
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
         let preempt = self.preempt.map_alias_in_range(
             vm,
-            G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END,
+            g17p_cl_dynamic_low_va_range(),
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
         let robustness = self.robustness.map_alias_in_range(
             vm,
-            G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END,
+            g17p_cl_dynamic_low_va_range(),
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
         let operand_state = self.operand_state.map_alias_in_range(
             vm,
-            G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END,
+            g17p_cl_dynamic_low_va_range(),
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
         let queue_context = self.queue_context_low.map_alias_in_range(
             vm,
-            G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END,
+            g17p_cl_dynamic_low_va_range(),
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
@@ -2183,7 +2193,7 @@ impl G17PUserRenderStorage {
         let mut render_state = bootstrap_stage!("state allocation", MappedObject::new_wc_in_range(
             dev,
             vm,
-            G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END,
+            g17p_cl_dynamic_low_va_range(),
             render_layout.total_size,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
@@ -2216,7 +2226,7 @@ impl G17PUserRenderStorage {
         let timestamps = bootstrap_stage!("timestamp allocation", MappedObject::new_wc_in_range(
             dev,
             vm,
-            G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END,
+            g17p_cl_dynamic_low_va_range(),
             mmu::UAT_PGSZ,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
@@ -2564,7 +2574,7 @@ impl G17PUserRenderStorage {
         let mut next_render_state = MappedObject::new_wc_in_range(
             dev,
             vm,
-            G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END,
+            g17p_cl_dynamic_low_va_range(),
             render_layout.total_size,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
@@ -2572,7 +2582,7 @@ impl G17PUserRenderStorage {
         let next_timestamps = MappedObject::new_wc_in_range(
             dev,
             vm,
-            G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END,
+            g17p_cl_dynamic_low_va_range(),
             mmu::UAT_PGSZ,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
@@ -3055,7 +3065,7 @@ impl G17PClRuntimeStorage {
         let entries = MappedObject::new_wc_in_range(
             dev,
             uat.kernel_lower_vm(),
-            G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END,
+            g17p_cl_dynamic_low_va_range(),
             backing_size,
             mapping_alignment,
             mmu::PROT_GPU_FW_SHARED_RW,
@@ -3316,7 +3326,7 @@ struct G17MappedResources {
     compute_readiness_class1_support: MappedObject,
     compute_readiness_class1_state: MappedObject,
     compute_readiness_class3_state: MappedObject,
-    compute_readiness_context1: G17PComputeReadinessMappings,
+    compute_readiness_context1: Option<G17PComputeReadinessMappings>,
     compute_readiness_class3_support_active: bool,
     register_windows: KVec<mmu::KernelMapping>,
 }
@@ -3678,19 +3688,9 @@ impl G17ResourceOwner {
             g17_initdata::COMPUTE_READINESS_PAGE_SIZE,
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
-        // Reserve the complete fixed final-compute operand namespace before
-        // any queue or descriptor object can allocate from the same low-VA
-        // range. First bind rewrites the table bytes but never remaps it.
-        let compute_readiness_context1 = map_compute_readiness_mappings(
-            dev,
-            &mut control_operand_table,
-            &mut control_operand_buffers,
-            address_space.uat.kernel_lower_vm(),
-        )?;
-        dev_info!(
-            dev.as_ref(),
-            "G17P resources: readiness operand table plus entries 0..20 reserved in context 1\n"
-        );
+        // Bootstrap owns overlapping low aliases first. Readiness replaces
+        // them only after render retirement restores the kernel context.
+        let compute_readiness_context1 = None;
         let compute_readiness_class3_support_active = false;
         compute_runtime_support.with_bytes_mut(|bytes| {
             g17_initdata::encode_compute_runtime_class1_support(bytes).map_err(|_| EINVAL)
@@ -4174,6 +4174,31 @@ impl G17ResourceOwner {
             g17_initdata::encode_compute_readiness_operand_table(bytes)
                 .map_err(|_| EINVAL)
         })?;
+        let mut mapped_now = false;
+        if self.resources.compute_readiness_context1.is_none() {
+            let vm = self.address_space.uat.kernel_lower_vm();
+            self.resources.compute_readiness_context1 = Some(map_compute_readiness_mappings(
+                &self.dev,
+                &mut self.resources.control_operand_table,
+                &mut self.resources.control_operand_buffers,
+                vm,
+            )?);
+            mapped_now = true;
+        }
+        let mappings = self
+            .resources
+            .compute_readiness_context1
+            .as_ref()
+            .ok_or(EINVAL)?;
+        if !mappings.all_reachable_from(self.address_space.uat.kernel_lower_vm()) {
+            return Err(EFAULT);
+        }
+        if mapped_now {
+            dev_info!(
+                self.dev.as_ref(),
+                "G17P resources: readiness operand table plus entries 0..20 mapped after bootstrap retirement\n"
+            );
+        }
         if !self.resources.compute_readiness_class3_support_active {
             let start = G17P_COMPUTE_READINESS_CLASS3_PRIMARY_INDEX_OFFSET;
             let end = start
@@ -4195,10 +4220,6 @@ impl G17ResourceOwner {
                 self.resources.partial_primary_index.iova(),
                 start,
             );
-        }
-        let mappings = &self.resources.compute_readiness_context1;
-        if !mappings.all_reachable_from(self.address_space.uat.kernel_lower_vm()) {
-            return Err(EFAULT);
         }
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         Ok(())
@@ -4583,6 +4604,7 @@ impl G17ResourceOwner {
         self.resources.compute_runtime_zero_buffer_1_mapping = None;
         self.resources.compute_runtime_table_alias = None;
         self.resources.compute_runtime_buffer_aliases.clear();
+        self.resources.compute_readiness_context1 = None;
         self.resources.compute_readiness_class3_support_active = false;
         self.address_space
             .uat
@@ -5588,30 +5610,47 @@ mod tests {
     }
 
     #[test]
-    fn readiness_fixed_ranges_are_reserved_before_dynamic_cl_placement() {
-        let dynamic = G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END;
+    fn dynamic_cl_range_excludes_the_complete_fixed_low_arena() {
+        let dynamic = G17P_CL_DYNAMIC_LOW_VA_START..G17P_CL_LOW_VA_END;
+        assert_eq!(dynamic.start, 0x70_0200_0000);
+        assert!(G17P_CL_LOW_VA_START < dynamic.start && dynamic.start < dynamic.end);
         let table = G17P_CONTROL_OPERAND_TABLE_VA
             ..G17P_CONTROL_OPERAND_TABLE_VA
                 + g17_initdata::CONTROL_OPERAND_TABLE_SIZE as u64;
-        assert!(dynamic.start <= table.start && table.end <= dynamic.end);
+        assert!(table.end <= dynamic.start);
 
-        for index in 0..g17_initdata::COMPUTE_READINESS_OPERAND_ENTRY_COUNT {
+        for index in 0..G17P_CONTROL_OPERAND_BUFFER_COUNT {
             let start = g17p_control_operand_buffer_va(index).unwrap();
             let end = start + G17P_CONTROL_OPERAND_BUFFER_SIZE as u64;
-            assert!(dynamic.start <= start && end <= dynamic.end);
-            for b2 in g17_initdata::REGION_VIEW_LOW_ADDRS {
-                assert!(b2 < start || b2 >= end);
-            }
+            assert!(end <= dynamic.start);
         }
+        let fixed_end = g17p_control_operand_buffer_va(G17P_CONTROL_OPERAND_BUFFER_COUNT - 1)
+            .unwrap()
+            + G17P_CONTROL_OPERAND_BUFFER_SIZE as u64;
+        assert_eq!(fixed_end, 0x70_01ef_8000);
+        assert_eq!(dynamic.start - fixed_end, 0x10_8000);
 
-        let first_unreserved = g17p_control_operand_buffer_va(
-            g17_initdata::COMPUTE_READINESS_OPERAND_ENTRY_COUNT,
-        )
-        .unwrap();
-        let first_unreserved_end = first_unreserved + G17P_CONTROL_OPERAND_BUFFER_SIZE as u64;
+        for (start, size) in [
+            (G17P_CONTROL_DIRECTORY_VA, G17P_CONTROL_DIRECTORY_SIZE),
+            (G17P_BOOTSTRAP_TA_DESCRIPTOR_LOW_VA, G17P_PAGE_SIZE),
+            (G17P_BOOTSTRAP_3D_DESCRIPTOR_LOW_VA, G17P_PAGE_SIZE),
+            (G17P_BOOTSTRAP_TA_CONTEXT_LOW_VA, G17P_BOOTSTRAP_CONTEXT_PEER_SIZE),
+            (G17P_BOOTSTRAP_3D_CONTEXT_LOW_VA, G17P_BOOTSTRAP_CONTEXT_PEER_SIZE),
+            (
+                g17_initdata::COMPUTE_RUNTIME_CLASS1_TABLE_ADDRESS,
+                g17_initdata::COMPUTE_RUNTIME_CLASS1_TABLE_SIZE,
+            ),
+            (
+                g17_initdata::COMPUTE_RUNTIME_PAGE_LIST_ADDRESS,
+                g17_initdata::COMPUTE_RUNTIME_PAGE_LIST_SIZE,
+            ),
+        ] {
+            assert!(start >= G17P_CL_LOW_VA_START);
+            assert!(start + size as u64 <= dynamic.start);
+        }
         assert!(g17_initdata::REGION_VIEW_LOW_ADDRS
             .into_iter()
-            .all(|b2| first_unreserved <= b2 && b2 < first_unreserved_end));
+            .all(|address| address < dynamic.start));
     }
 
     #[test]
