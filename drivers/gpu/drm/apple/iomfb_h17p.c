@@ -62,6 +62,22 @@ static const struct dcp_method_entry dcp_methods[dcpep_num_methods] = {
 
 #include "iomfb_template.c"
 
+static void dcp_h17p_probe_is_main_display_complete(struct apple_dcp *dcp,
+						    void *out, void *cookie)
+{
+	dev_info(dcp->dev,
+		 "DCP25G83_EP37_OOB_A412_REPLY raw output %#x; diagnostic only\n",
+		 le32_to_cpup((__le32 *)out));
+}
+
+void apple_dcp_h17p_probe_is_main_display(struct apple_dcp *dcp)
+{
+	dev_info(dcp->dev,
+		 "DCP25G83_EP37_OOB_A412_PROBE issue A412 input/output 0/4 on stream 1; no display-state completion\n");
+	dcp_is_main_display(dcp, true,
+			    dcp_h17p_probe_is_main_display_complete, NULL);
+}
+
 static bool trampoline_rt_bandwidth_h17p(struct apple_dcp *dcp, int tag,
 					 void *out, void *in)
 {
