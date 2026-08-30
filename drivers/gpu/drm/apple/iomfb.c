@@ -41,8 +41,8 @@
 #define APPLE_DCP_LINK_PHASE_PROPERTY	"apple,dcp-link-phase"
 #define APPLE_DCP_LINK_MESSAGE_PROPERTY	"apple,dcp-link-message"
 
-#define DCP25G83_CB197_A412_REQUEST	0x1000100002ULL
-#define DCP25G83_CB197_A412_REPLY	0x42ULL
+#define DCP25G83_D100_A386_REQUEST	0x1000100002ULL
+#define DCP25G83_D100_A386_REPLY		0x42ULL
 
 static int dcp_tx_offset(enum dcp_context_id id)
 {
@@ -323,12 +323,6 @@ void iomfb_link_timeout_snapshot(struct apple_dcp *dcp)
 		 le32_to_cpu(callback->output_size),
 		 callback_input + max_t(u32, le32_to_cpu(callback->input_size), 16) - 16,
 		 callback_output, READ_ONCE(dcp->ch_cb.depth));
-	if (READ_ONCE(dcp->link_cb197_a412_inflight))
-		dev_info(dcp->dev,
-			 "DCP25G83_CB197_SAME_STREAM_A412 timeout: no exact reply %#llx; cmd depth %u top %#x cb depth %u; D102 ACK remained held\n",
-			 DCP25G83_CB197_A412_REPLY, depth,
-			 READ_ONCE(dcp->link_top[false][0]),
-			 READ_ONCE(dcp->ch_cb.depth));
 	if (dcp->link_d563_a2i_count ==
 	    (u8)ARRAY_SIZE(dcp25g83_d563_tail_properties)) {
 		u32 control;
@@ -566,11 +560,10 @@ static int dcp_link_push_context(struct apple_dcp *dcp,
 			 in_len, out_len);
 	}
 	ret = dcp_send_message_sync(dcp, APPLE_DCP_LINK_ENDPOINT, message);
-	if (call_tag == APPLE_DCP_H17P_CALL_IS_MAIN_DISPLAY &&
-	    dcp->link_cb197_a412_inflight)
+	if (call_tag == APPLE_DCP_H17P_CALL_VI_SET_TEMPERATURE_HINT)
 		dev_info(dcp->dev,
-			 "DCP25G83_CB197_SAME_STREAM_A412 TX %#llx expected %#llx stream %u remote %u new %u offset %#x size %#x top %#x->%#x depth %u result %d\n",
-			 message, DCP25G83_CB197_A412_REQUEST, stream, remote,
+			 "DCP25G83_D100_A386_EXISTING_STREAM TX %#llx expected %#llx stream %u remote %u new %u offset %#x size %#x top %#x->%#x depth %u result %d\n",
+			 message, DCP25G83_D100_A386_REQUEST, stream, remote,
 			 new_stream, offset, payload_size, old_top, next_top,
 			 depth, ret);
 	if (call_tag == APPLE_DCP_H17P_CALL_VI_SET_TEMPERATURE_HINT ||
@@ -644,11 +637,6 @@ static const struct dcp_method_entry dcp_link_backlight_service_matched = {
 	.tag = { 'A', '1', '3', '2' },
 };
 
-static const struct dcp_method_entry dcp_link_is_main_display = {
-	.name = "is_main_display",
-	.tag = { 'A', '4', '1', '2' },
-};
-
 enum dcp_link_service_match_bit {
 	DCP_LINK_SERVICE_MATCH_TEMPERATURE,
 	DCP_LINK_SERVICE_MATCH_PMU,
@@ -709,11 +697,13 @@ static void dcp_link_temperature_hint_complete(struct apple_dcp *dcp, void *out,
 {
 	int ret;
 
-	dev_info(dcp->dev, "DCPLink A386 reply %#x\n",
+	dev_info(dcp->dev,
+		 "DCP25G83_D100_A386_EXISTING_STREAM output %#x; release D100 ACK\n",
 		 le32_to_cpup((__le32 *)out));
 	ret = dcp_link_ack(dcp, DCP_CONTEXT_CB);
 	dev_info(dcp->dev,
-		 "DCPLink A386 completed deferred D100 ACK result %d\n", ret);
+		 "DCP25G83_D100_A386_EXISTING_STREAM D100 ACK %#llx result %d\n",
+		 DCP25G83_D100_A386_REPLY, ret);
 	dcp_link_service_match_done(dcp);
 }
 
@@ -735,8 +725,8 @@ static void dcp_link_service_match_work(struct work_struct *work)
 			       &dcp->link_service_match_state)) {
 		call = &dcp_link_temperature_hint;
 		complete = dcp_link_temperature_hint_complete;
-		context = DCP_CONTEXT_OOBCMD;
-		new_stream = true;
+		context = DCP_CONTEXT_CMD;
+		new_stream = false;
 	} else if (test_and_clear_bit(DCP_LINK_SERVICE_MATCH_PMU,
 				      &dcp->link_service_match_state)) {
 		call = &dcp_link_pmu_service_matched;
@@ -797,65 +787,6 @@ bool dcp_link_defer_service_match(struct apple_dcp *dcp, int tag, void *out,
 
 	dcp_link_queue_service_match(dcp, tag);
 	return false;
-}
-
-static void dcp25g83_cb197_a412_complete(struct apple_dcp *dcp, void *out,
-					 void *cookie)
-{
-	u32 value = le32_to_cpup((__le32 *)out);
-	int ret;
-
-	if (!dcp->link_cb197_a412_inflight) {
-		dev_err(dcp->dev,
-			"DCP25G83_CB197_SAME_STREAM_A412 reply without held D102 ACK\n");
-		return;
-	}
-
-	dev_info(dcp->dev,
-		 "DCP25G83_CB197_SAME_STREAM_A412 exact reply %#llx output %#x; release held D102 ACK %#llx\n",
-		 DCP25G83_CB197_A412_REPLY, value,
-		 DCP25G83_CB197_A412_REPLY);
-	ret = dcp_link_ack(dcp, DCP_CONTEXT_CB);
-	dcp->link_cb197_a412_inflight = false;
-	dev_info(dcp->dev,
-		 "DCP25G83_CB197_SAME_STREAM_A412 held D102 ACK %#llx result %d\n",
-		 DCP25G83_CB197_A412_REPLY, ret);
-}
-
-static bool dcp25g83_cb197_a412_probe(struct apple_dcp *dcp, u16 sequence,
-				      int tag,
-				      const struct apple_dcp_link_rpc_view *view)
-{
-	static const char property[] = "SupportRelbufInfoCb";
-	int ret;
-
-	if (dcp->fw_compat != DCP_FIRMWARE_H17P || !dcp->adopted_session ||
-	    dcp->link_abi != APPLE_DCP_LINK_ABI_C3 ||
-	    dcp->link_cb197_a412_inflight || sequence != 197 || tag != 102 ||
-	    view->input_size != 0x44 || view->output_size ||
-	    memcmp(view->input, property, sizeof(property)))
-		return false;
-
-	/*
-	 * Hold only the final D102 reply.  A non-new A412 is pushed on the
-	 * already-active A401 command stream at top 0x10.  Firmware can answer
-	 * it only after the callback197 sender reaches its nested wait loop.
-	 */
-	dcp->link_cb197_a412_inflight = true;
-	ret = dcp_link_push_context(dcp, DCP_CONTEXT_CMD, false,
-				    &dcp_link_is_main_display, 0,
-				    sizeof(__le32), NULL,
-				    dcp25g83_cb197_a412_complete, NULL);
-	if (ret)
-		dev_err(dcp->dev,
-			"DCP25G83_CB197_SAME_STREAM_A412 could not queue at outer top %#x: %d; D102 ACK remains held\n",
-			dcp->link_top[false][0], ret);
-	else
-		dev_info(dcp->dev,
-			 "DCP25G83_CB197_SAME_STREAM_A412 callback %u D%03d ACK held pending exact nested reply %#llx\n",
-			 sequence, tag, DCP25G83_CB197_A412_REPLY);
-
-	return true;
 }
 
 static int dcp_link_ack(struct apple_dcp *dcp,
@@ -958,15 +889,11 @@ static void dcp_link_handle_reply(struct apple_dcp *dcp, u64 message)
 		dev_warn(dcp->dev, "DCPLink reply without an active call\n");
 		return;
 	}
-	if (request_call == APPLE_DCP_H17P_CALL_IS_MAIN_DISPLAY &&
-	    dcp->link_cb197_a412_inflight &&
-	    message != DCP25G83_CB197_A412_REPLY) {
-		dev_err(dcp->dev,
-			"DCP25G83_CB197_SAME_STREAM_A412 unexpected reply %#llx expected %#llx; D102 ACK remains held\n",
-			message, DCP25G83_CB197_A412_REPLY);
-		return;
-	}
-
+	if (request_call == APPLE_DCP_H17P_CALL_VI_SET_TEMPERATURE_HINT)
+		dev_info(dcp->dev,
+			 "DCP25G83_D100_A386_EXISTING_STREAM RX %#llx expected %#llx depth %u top %#x\n",
+			 message, DCP25G83_D100_A386_REPLY, ch->depth,
+			 top_before);
 	depth = dcp_pop_depth(&ch->depth);
 	ret = apple_dcp_link_stack_pop(*top, ch->link_size[depth],
 				       APPLE_DCP_LINK_RPC_ALIGNMENT, top);
@@ -1128,8 +1055,6 @@ static void dcp_link_handle_callback(struct apple_dcp *dcp, u64 message)
 				 handled ? reply : 0);
 	}
 	if (handled) {
-		if (dcp25g83_cb197_a412_probe(dcp, sequence, tag, &view))
-			return;
 		ack_ret = dcp_link_ack(dcp, DCP_CONTEXT_CB);
 		dcp25g83_d563_a2i_end(dcp, d563_tail_index, ack_ret);
 		if (log_callback && sequence >= 165)
@@ -1254,7 +1179,6 @@ static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 	dcp->link_service_match_state = 0;
 	dcp->link_service_match_output = NULL;
 	dcp->link_service_match_callback_tag = 0;
-	dcp->link_cb197_a412_inflight = false;
 	dcp->link_d563_a2i_count = 0;
 	dcp->link_d563_a2i_ep1_observed = false;
 	memset(dcp->link_d563_a2i_before, 0,
