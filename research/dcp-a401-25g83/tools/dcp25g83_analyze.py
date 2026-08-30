@@ -120,7 +120,12 @@ def verify(image: Image) -> None:
         0x041B5438: 0x79409268,  # ldrh w8, [stream, #0x48]
         0x041B543C: 0x0A150108,  # and w8, w8, #0xc3
         0x041B5440: 0x7101091F,  # cmp w8, #0x42
+        0x041B7444: 0x7100051F,  # reject a newly allocated reply stream
+        0x041B7448: 0x540006C0,  # newly allocated stream takes abort path
+        0x041B7450: 0x940000A4,  # enter existing stream gate
+        0x041B7528: 0x97F9AA7C,  # invalid reply stream firmware abort
         0x041B781C: 0xF9002509,  # str x9, [x8, #0x48]
+        0x041B7820: 0x97F9EA9B,  # unconditional condition signal after store
         0x041B552C: 0xB844A268,  # ldur w8, [stream, #0x4a] / remote error
         0x041B5530: 0x35000D88,  # cbnz w8, firmware abort branch
         0x041B56E0: 0xD0001429,  # form abort-path target

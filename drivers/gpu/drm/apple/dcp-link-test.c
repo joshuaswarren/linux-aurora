@@ -717,6 +717,41 @@ static void apple_dcp_link_rpc_reply_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, reply, 0x0000000000000f42ULL);
 }
 
+static void apple_dcp_mbox_fifo_transition_test(struct kunit *test)
+{
+	struct apple_dcp_mbox_fifo_state state;
+	u32 before = 0x00027701;
+	u32 queued = 0x00107801;
+	u32 consumed = 0x00028801;
+
+	state = apple_dcp_mbox_fifo_decode(before);
+	KUNIT_EXPECT_EQ(test, state.count, 0);
+	KUNIT_EXPECT_EQ(test, state.read_ptr, 7);
+	KUNIT_EXPECT_EQ(test, state.write_ptr, 7);
+	KUNIT_EXPECT_TRUE(test, state.empty);
+	KUNIT_EXPECT_FALSE(test, state.full);
+	KUNIT_EXPECT_TRUE(test, state.enabled);
+
+	state = apple_dcp_mbox_fifo_decode(queued);
+	KUNIT_EXPECT_EQ(test, state.count, 1);
+	KUNIT_EXPECT_EQ(test, state.read_ptr, 7);
+	KUNIT_EXPECT_EQ(test, state.write_ptr, 8);
+	KUNIT_EXPECT_FALSE(test, state.empty);
+
+	KUNIT_EXPECT_TRUE(test,
+		apple_dcp_mbox_single_tx_consumed(before, queued, consumed));
+	KUNIT_EXPECT_TRUE(test,
+		apple_dcp_mbox_single_tx_consumed(before, consumed, consumed));
+	KUNIT_EXPECT_TRUE(test,
+		apple_dcp_mbox_single_tx_pending(before, queued, queued));
+	KUNIT_EXPECT_FALSE(test,
+		apple_dcp_mbox_single_tx_consumed(before, queued, queued));
+	KUNIT_EXPECT_FALSE(test,
+		apple_dcp_mbox_single_tx_pending(before, consumed, consumed));
+	KUNIT_EXPECT_FALSE(test,
+		apple_dcp_mbox_single_tx_consumed(before, queued, 0x00029901));
+}
+
 static void apple_dcp_h17p_rt_bw_test(struct kunit *test)
 {
 	struct apple_dcp_h17p_rt_bw_config config;
@@ -777,6 +812,7 @@ static struct kunit_case apple_dcp_link_test_cases[] = {
 	KUNIT_CASE(apple_dcp_link_stack_test),
 	KUNIT_CASE(apple_dcp_link_rpc_decode_test),
 	KUNIT_CASE(apple_dcp_link_rpc_reply_test),
+	KUNIT_CASE(apple_dcp_mbox_fifo_transition_test),
 	KUNIT_CASE(apple_dcp_h17p_rt_bw_test),
 	KUNIT_CASE(apple_dcp_h17p_rt_bw_reply_test),
 	{}

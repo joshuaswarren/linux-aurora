@@ -46,6 +46,14 @@
 #define APPLE_DCP_LINK_MSG_VERSION		GENMASK_ULL(63, 48)
 #define APPLE_DCP_LINK_REPLY_CONTROL_MASK	0xff3e
 
+/* ASC A2I control fields used by the 25G83 D563 transport diagnostic. */
+#define APPLE_DCP_MBOX_CONTROL_FIFO_COUNT	GENMASK(23, 20)
+#define APPLE_DCP_MBOX_CONTROL_EMPTY		BIT(17)
+#define APPLE_DCP_MBOX_CONTROL_FULL		BIT(16)
+#define APPLE_DCP_MBOX_CONTROL_READ_PTR		GENMASK(15, 12)
+#define APPLE_DCP_MBOX_CONTROL_WRITE_PTR	GENMASK(11, 8)
+#define APPLE_DCP_MBOX_CONTROL_ENABLE		BIT(0)
+
 #define APPLE_DCP_LINK_CALL_D003		0x44303033
 #define APPLE_DCP_H17P_CLOCK_ID_154		0x154
 #define APPLE_DCP_H17P_CLOCK_ID_194		0x194
@@ -244,6 +252,15 @@ struct apple_dcp_link_rpc_view {
 	void *output;
 };
 
+struct apple_dcp_mbox_fifo_state {
+	u8 count;
+	u8 read_ptr;
+	u8 write_ptr;
+	bool empty;
+	bool full;
+	bool enabled;
+};
+
 static_assert(sizeof(struct apple_dcp_link_init_desc) == 0x10);
 static_assert(sizeof(struct apple_dcp_link_rpc_header) == 0x0c);
 static_assert(sizeof(struct apple_dcp_h17p_clock_request) == 0x08);
@@ -255,6 +272,72 @@ static_assert(APPLE_DCP_LINK_STREAM_BUFFER_SIZE *
 	      APPLE_DCP_LINK_STREAM_HALF_SIZE);
 static_assert(APPLE_DCP_LINK_HEAP_OFFSET + APPLE_DCP_LINK_HEAP_SIZE ==
 	      APPLE_DCP_LINK_RPC_MEMORY_SIZE);
+
+static inline struct apple_dcp_mbox_fifo_state
+apple_dcp_mbox_fifo_decode(u32 control)
+{
+	return (struct apple_dcp_mbox_fifo_state) {
+		.count = FIELD_GET(APPLE_DCP_MBOX_CONTROL_FIFO_COUNT, control),
+		.read_ptr = FIELD_GET(APPLE_DCP_MBOX_CONTROL_READ_PTR, control),
+		.write_ptr = FIELD_GET(APPLE_DCP_MBOX_CONTROL_WRITE_PTR, control),
+		.empty = control & APPLE_DCP_MBOX_CONTROL_EMPTY,
+		.full = control & APPLE_DCP_MBOX_CONTROL_FULL,
+		.enabled = control & APPLE_DCP_MBOX_CONTROL_ENABLE,
+	};
+}
+
+static inline bool
+apple_dcp_mbox_single_tx_consumed(u32 before, u32 after, u32 observed)
+{
+	struct apple_dcp_mbox_fifo_state pre =
+		apple_dcp_mbox_fifo_decode(before);
+	struct apple_dcp_mbox_fifo_state post =
+		apple_dcp_mbox_fifo_decode(after);
+	struct apple_dcp_mbox_fifo_state now =
+		apple_dcp_mbox_fifo_decode(observed);
+	u8 expected = (pre.write_ptr + 1) & 0xf;
+	bool valid_post;
+
+	if (!pre.enabled || !pre.empty || pre.count || pre.full ||
+	    pre.read_ptr != pre.write_ptr || post.write_ptr != expected)
+		return false;
+
+	valid_post = (post.empty && !post.count && !post.full &&
+		      post.read_ptr == expected) ||
+		     (!post.empty && post.count == 1 && !post.full &&
+		      post.read_ptr == pre.read_ptr);
+	if (!valid_post)
+		return false;
+
+	return now.enabled && now.empty && !now.count && !now.full &&
+	       now.read_ptr == expected && now.write_ptr == expected;
+}
+
+static inline bool
+apple_dcp_mbox_single_tx_pending(u32 before, u32 after, u32 observed)
+{
+	struct apple_dcp_mbox_fifo_state pre =
+		apple_dcp_mbox_fifo_decode(before);
+	struct apple_dcp_mbox_fifo_state post =
+		apple_dcp_mbox_fifo_decode(after);
+	struct apple_dcp_mbox_fifo_state now =
+		apple_dcp_mbox_fifo_decode(observed);
+	u8 expected = (pre.write_ptr + 1) & 0xf;
+	bool valid_post;
+
+	if (!pre.enabled || !pre.empty || pre.count || pre.full ||
+	    pre.read_ptr != pre.write_ptr || post.write_ptr != expected)
+		return false;
+	valid_post = (post.empty && !post.count && !post.full &&
+		      post.read_ptr == expected) ||
+		     (!post.empty && post.count == 1 && !post.full &&
+		      post.read_ptr == pre.read_ptr);
+	if (!valid_post)
+		return false;
+
+	return now.enabled && !now.empty && now.count == 1 && !now.full &&
+	       now.read_ptr == pre.read_ptr && now.write_ptr == expected;
+}
 
 static inline int
 apple_dcp_h17p_clock_rate(const struct apple_dcp_h17p_clock_request *request,
