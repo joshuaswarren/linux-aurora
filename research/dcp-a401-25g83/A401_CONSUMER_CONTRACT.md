@@ -480,19 +480,18 @@ reply was rejected with `-EINVAL` only after that. This confirms a real crash
 and rules out any EP1 request/reply handshake as its cause.
 
 The 25G83 firmware template at decompressed bundle file offset `0xeb60` gives
-Crl4 signature `0x43726c34`, version `0x401`, and section size `0x378`.
-Mac17p `RTBuddyRegisterFrameDecoder::registerDecoderCl4` routes it through the
-same ARMv8 register-frame decoder as Crg8. The section payload begins with
-flags at `+0x0` and required body size `0x348` at `+0x4`; the register body
-begins at `+0x8`. The exact payload-relative fields are SP `+0x100`, PC
-`+0x108`, PSR `+0x110`, FAR `+0x330`, physical FAR `+0x338`, and ESR
-`+0x340`. Flags bit 16 still marks the record non-decodable.
+Crl4 signature `0x43726c34`, version `0x401`, and section size `0x378`. Crl4
+is not the Crg8/ARMv8 `0x348` frame. Its exact 25G83 cL4 section-relative
+layout has flags at `+0x10` (bit 16 marks it non-decodable), nominal size
+`0xd8` at `+0x14`, and raw context at `+0x18`. The decoded fields are LR
+`+0x108`, PC/ELR `+0x110`, SP `+0x118`, PSR `+0x120`, FPSR `+0x128`, FPCR
+`+0x130`, TPIDR_EL0 `+0x138`, ESR `+0x358`, and FAR `+0x360`.
 
-The observer and offline parser now decode both Crg8 and Crl4 through those
-same gates. `exception.c:59` identifies the firmware kernel's generic exception
-recording site; it does not identify the faulting instruction. The next valid
-discriminator is `DCP25G83_A401_CRASHLOG_CRL4 pc ...`, which can locate the
-actual pre-notification failure against the exact 25G83 image.
+The observer and offline parser keep the Crg8 and Crl4 gates distinct.
+`exception.c:59` identifies the firmware kernel's generic exception recording
+site; it does not identify the faulting instruction. The next valid
+discriminator is `DCP25G83_A401_CRASHLOG_CRL4 ... pc ...`, which can locate
+the actual pre-notification failure against the exact 25G83 image.
 
 ## Queued post-A401 H17P callback table correction
 

@@ -92,6 +92,20 @@
 #define DCP_RTKIT_CRASHLOG_REGS_UNDECODABLE BIT(16)
 #define DCP_RTKIT_CRASHLOG_INCOMPLETE BIT(8)
 
+#define DCP_RTKIT_CRASHLOG_CL4_SECTION_SIZE 0x378
+#define DCP_RTKIT_CRASHLOG_CL4_NOMINAL_SIZE 0xd8
+#define DCP_RTKIT_CRASHLOG_CL4_FLAGS 0x10
+#define DCP_RTKIT_CRASHLOG_CL4_SIZE 0x14
+#define DCP_RTKIT_CRASHLOG_CL4_LR 0x108
+#define DCP_RTKIT_CRASHLOG_CL4_PC 0x110
+#define DCP_RTKIT_CRASHLOG_CL4_SP 0x118
+#define DCP_RTKIT_CRASHLOG_CL4_PSR 0x120
+#define DCP_RTKIT_CRASHLOG_CL4_FPSR 0x128
+#define DCP_RTKIT_CRASHLOG_CL4_FPCR 0x130
+#define DCP_RTKIT_CRASHLOG_CL4_TPIDR_EL0 0x138
+#define DCP_RTKIT_CRASHLOG_CL4_ESR 0x358
+#define DCP_RTKIT_CRASHLOG_CL4_FAR 0x360
+
 #define DCP_25G83_INHERITED_CRASHLOG_WORD 0x12610008784000ULL
 
 struct dcp_rtkit_crashlog_header {
@@ -587,34 +601,52 @@ static bool dcp_rtk_report_adopted_crashlog(struct apple_dcp *dcp,
 			text_size = strnlen(text, payload_size - 16);
 			dev_err(dcp->dev, "DCP firmware version: %.*s\n",
 				(int)min_t(size_t, text_size, SZ_4K), text);
-		} else if ((fourcc == DCP_RTKIT_CRASHLOG_REGS ||
-			    fourcc == DCP_RTKIT_CRASHLOG_REGS_CL4) &&
+		} else if (fourcc == DCP_RTKIT_CRASHLOG_REGS &&
 			   payload_size >= DCP_RTKIT_CRASHLOG_REGS_SIZE) {
 			u8 *regs = section + 16;
-			const char *kind = fourcc == DCP_RTKIT_CRASHLOG_REGS ?
-					   "CRG8" : "CRL4";
 			u32 regs_flags = get_unaligned_le32(regs);
 			u32 regs_size = get_unaligned_le32(regs + 4);
-
-			if (fourcc == DCP_RTKIT_CRASHLOG_REGS_CL4)
-				dev_info(dcp->dev,
-					 "DCP25G83_A401_CRASHLOG_CRL4_RAW head %16phN frame %40phN fault %32phN\n",
-					 regs, regs + 0xf0, regs + 0x328);
 
 			if (regs_size != DCP_RTKIT_CRASHLOG_REGS_BODY_SIZE ||
 			    (regs_flags & DCP_RTKIT_CRASHLOG_REGS_UNDECODABLE)) {
 				dev_err(dcp->dev,
-					"DCP25G83_A401_CRASHLOG_%s_INVALID flags %#x size %#x\n",
-					kind, regs_flags, regs_size);
+					"DCP25G83_A401_CRASHLOG_CRG8_INVALID flags %#x size %#x\n",
+					regs_flags, regs_size);
 			} else {
 				dev_err(dcp->dev,
-					"DCP25G83_A401_CRASHLOG_%s pc %#llx sp %#llx psr %#llx far %#llx esr %#llx\n",
-					kind,
+					"DCP25G83_A401_CRASHLOG_CRG8 pc %#llx sp %#llx psr %#llx far %#llx esr %#llx\n",
 					get_unaligned_le64(regs + DCP_RTKIT_CRASHLOG_REGS_PC),
 					get_unaligned_le64(regs + DCP_RTKIT_CRASHLOG_REGS_SP),
 					get_unaligned_le64(regs + DCP_RTKIT_CRASHLOG_REGS_PSR),
 					get_unaligned_le64(regs + DCP_RTKIT_CRASHLOG_REGS_FAR),
 					get_unaligned_le64(regs + DCP_RTKIT_CRASHLOG_REGS_ESR));
+			}
+		} else if (fourcc == DCP_RTKIT_CRASHLOG_REGS_CL4 &&
+			   section_size >= DCP_RTKIT_CRASHLOG_CL4_SECTION_SIZE) {
+			u8 *cl4 = section;
+			u32 cl4_flags = get_unaligned_le32(cl4 + DCP_RTKIT_CRASHLOG_CL4_FLAGS);
+			u32 cl4_size = get_unaligned_le32(cl4 + DCP_RTKIT_CRASHLOG_CL4_SIZE);
+
+			dev_info(dcp->dev,
+				 "DCP25G83_A401_CRASHLOG_CRL4_RAW head %16phN frame %64phN fault %32phN\n",
+				 cl4 + 0x10, cl4 + 0x100, cl4 + 0x350);
+			if (cl4_size != DCP_RTKIT_CRASHLOG_CL4_NOMINAL_SIZE ||
+			    (cl4_flags & DCP_RTKIT_CRASHLOG_REGS_UNDECODABLE)) {
+				dev_err(dcp->dev,
+					"DCP25G83_A401_CRASHLOG_CRL4_INVALID flags %#x size %#x\n",
+					cl4_flags, cl4_size);
+			} else {
+				dev_err(dcp->dev,
+					"DCP25G83_A401_CRASHLOG_CRL4 lr %#llx pc %#llx sp %#llx psr %#llx fpsr %#llx fpcr %#llx tpidr_el0 %#llx esr %#llx far %#llx\n",
+					get_unaligned_le64(cl4 + DCP_RTKIT_CRASHLOG_CL4_LR),
+					get_unaligned_le64(cl4 + DCP_RTKIT_CRASHLOG_CL4_PC),
+					get_unaligned_le64(cl4 + DCP_RTKIT_CRASHLOG_CL4_SP),
+					get_unaligned_le64(cl4 + DCP_RTKIT_CRASHLOG_CL4_PSR),
+					get_unaligned_le64(cl4 + DCP_RTKIT_CRASHLOG_CL4_FPSR),
+					get_unaligned_le64(cl4 + DCP_RTKIT_CRASHLOG_CL4_FPCR),
+					get_unaligned_le64(cl4 + DCP_RTKIT_CRASHLOG_CL4_TPIDR_EL0),
+					get_unaligned_le64(cl4 + DCP_RTKIT_CRASHLOG_CL4_ESR),
+					get_unaligned_le64(cl4 + DCP_RTKIT_CRASHLOG_CL4_FAR));
 			}
 		} else {
 			dev_info(dcp->dev,

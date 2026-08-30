@@ -28,6 +28,20 @@ REGS_PSR = 0x110
 REGS_FAR = 0x330
 REGS_ESR = 0x340
 
+CL4_SECTION_SIZE = 0x378
+CL4_NOMINAL_SIZE = 0xD8
+CL4_FLAGS = 0x10
+CL4_SIZE = 0x14
+CL4_LR = 0x108
+CL4_PC = 0x110
+CL4_SP = 0x118
+CL4_PSR = 0x120
+CL4_FPSR = 0x128
+CL4_FPCR = 0x130
+CL4_TPIDR_EL0 = 0x138
+CL4_ESR = 0x358
+CL4_FAR = 0x360
+
 
 def u32(data: bytes | bytearray, offset: int) -> int:
     return struct.unpack_from("<I", data, offset)[0]
@@ -114,20 +128,37 @@ def summarize(data: bytes) -> None:
             message_id = u32(data, payload)
             text = data[payload + 4 : section + size].split(b"\0", 1)[0]
             print(f"Cstr id={message_id:#x}: {text.decode(errors='replace')}")
-        elif signature in (CRG8, CRL4) and payload_size >= REGS_SIZE:
-            kind = "Crg8" if signature == CRG8 else "Crl4"
+        elif signature == CRG8 and payload_size >= REGS_SIZE:
             regs_flags = u32(data, payload)
             regs_size = u32(data, payload + 4)
             if regs_size != REGS_BODY_SIZE or regs_flags & 0x10000:
-                print(f"{kind} invalid flags={regs_flags:#x} size={regs_size:#x}")
+                print(f"Crg8 invalid flags={regs_flags:#x} size={regs_size:#x}")
             else:
                 print(
-                    f"{kind} "
+                    "Crg8 "
                     f"pc={u64(data, payload + REGS_PC):#x} "
                     f"sp={u64(data, payload + REGS_SP):#x} "
                     f"psr={u64(data, payload + REGS_PSR):#x} "
                     f"far={u64(data, payload + REGS_FAR):#x} "
                     f"esr={u64(data, payload + REGS_ESR):#x}"
+                )
+        elif signature == CRL4 and size >= CL4_SECTION_SIZE:
+            flags = u32(data, section + CL4_FLAGS)
+            nominal_size = u32(data, section + CL4_SIZE)
+            if nominal_size != CL4_NOMINAL_SIZE or flags & 0x10000:
+                print(f"Crl4 invalid flags={flags:#x} size={nominal_size:#x}")
+            else:
+                print(
+                    "Crl4 "
+                    f"lr={u64(data, section + CL4_LR):#x} "
+                    f"pc={u64(data, section + CL4_PC):#x} "
+                    f"sp={u64(data, section + CL4_SP):#x} "
+                    f"psr={u64(data, section + CL4_PSR):#x} "
+                    f"fpsr={u64(data, section + CL4_FPSR):#x} "
+                    f"fpcr={u64(data, section + CL4_FPCR):#x} "
+                    f"tpidr_el0={u64(data, section + CL4_TPIDR_EL0):#x} "
+                    f"esr={u64(data, section + CL4_ESR):#x} "
+                    f"far={u64(data, section + CL4_FAR):#x}"
                 )
         offset += size
 
@@ -142,15 +173,15 @@ def self_test() -> None:
     struct.pack_into("<IIIII", data, 0x80, CLGH, 0x202, 0x780, inner_id, 1)
     struct.pack_into("<QQII", data, 0x94, inner_id, 0, 0x40, 0)
     struct.pack_into("<IIII16s", data, 0xC0, CLHE, 0x300, 0x3B8, 0, b"\0" * 16)
-    struct.pack_into("<IIII", data, 0xE0, CRL4, 0, 0, 0x378)
-    struct.pack_into("<II", data, 0xF0, 0, REGS_BODY_SIZE)
-    struct.pack_into("<Q", data, 0xF0 + REGS_PC, 0x41B7528)
+    struct.pack_into("<IIII", data, 0xE0, CRL4, 0, 0x401, CL4_SECTION_SIZE)
+    struct.pack_into("<II", data, 0xF0, 0, CL4_NOMINAL_SIZE)
+    struct.pack_into("<Q", data, 0xE0 + CL4_PC, 0x41B7528)
     data[0x458:0x478] = data[0xC0:0xE0]
 
     offset, generations = select_current(data)
     assert offset == 0xC0
     assert generations == [outer_id, inner_id]
-    assert u64(data, offset + LOG_HEADER_SIZE + SECTION_HEADER_SIZE + REGS_PC) == 0x41B7528
+    assert u64(data, offset + LOG_HEADER_SIZE + CL4_PC) == 0x41B7528
     summarize(data)
     print("OK nested CLGH selection, CLHE footer, and Crl4 gates")
 
