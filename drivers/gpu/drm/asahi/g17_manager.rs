@@ -570,13 +570,6 @@ impl G17PManagerConstruction {
         self.resources.status_a_snapshot()
     }
 
-    pub(crate) fn observe_status_a_work_scan_tight(
-        &mut self,
-        samples: u32,
-    ) -> Result<g17_resources::G17PStatusATightScanObservation> {
-        self.resources.observe_status_a_work_scan_tight(samples)
-    }
-
     /// Verify the untouched native pre-user root phase. The first real user
     /// bind owns the transition from the retained context-0 roots to context
     /// 1; no driver-owned startup render VM is needed to manufacture it.

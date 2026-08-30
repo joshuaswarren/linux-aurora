@@ -68,7 +68,6 @@ const CONTROL_START_TYPE: u16 = 0x89;
 const INITDATA_ACK_POLLS: usize = 200;
 const CONTROL_COUNTER_POLLS: usize = 100;
 const G17P_CRASHLOG_MAX_BYTES: usize = 256 * 1024;
-const G17P_STATUS_A_TIGHT_SCAN_SAMPLES: u32 = 32 * 1024;
 const G17P_RTKIT_UAT_DVA_MASK: u64 = (1u64 << 40) - 1;
 
 /// Module-local, read-only view of one existing ASCWrap mailbox provider.
@@ -256,6 +255,31 @@ fn log_g17p_status_a(
         Err(error) => dev_err!(
             dev,
             "G17P Status-A checkpoint={} read failed ({:?})\n",
+            checkpoint,
+            error,
+        ),
+    }
+}
+
+fn log_g17p_scheduler_gate(
+    dev: &kernel::device::Device,
+    registers: &regs::Resources,
+    checkpoint: &'static str,
+) {
+    match registers.g17p_scheduler_gate_registers() {
+        Ok(snapshot) => dev_info!(
+            dev,
+            "G17P scheduler gate checkpoint={} fender={:#x} armed={} gpc-state={:#x} host-irq-enable={:#x} host-irq-status={:#x}\n",
+            checkpoint,
+            snapshot.fender_dynamic_gating,
+            snapshot.fender_wake_armed(),
+            snapshot.host_irq_summary,
+            snapshot.host_irq_enable,
+            snapshot.host_irq_status,
+        ),
+        Err(error) => dev_err!(
+            dev,
+            "G17P scheduler gate checkpoint={} read failed ({:?})\n",
             checkpoint,
             error,
         ),
@@ -1426,6 +1450,11 @@ impl G17PLiveRuntime {
         let channel_path = notifications.is_some();
         if let Some(notifications) = notifications {
             if let Some(activation) = notifications.activation {
+                log_g17p_scheduler_gate(
+                    self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                    self.registers.as_ref().ok_or(ENODEV)?,
+                    "native-first-pre-0x0a",
+                );
                 log_g17p_status_a(
                     self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
                     self.manager.as_mut().ok_or(ENODEV)?,
@@ -1475,31 +1504,11 @@ impl G17PLiveRuntime {
                         Err(recovery_error) => Err(recovery_error),
                     };
                 }
-                match self
-                    .manager
-                    .as_mut()
-                    .ok_or(ENODEV)
-                    .and_then(|manager| {
-                        manager.observe_status_a_work_scan_tight(
-                            G17P_STATUS_A_TIGHT_SCAN_SAMPLES,
-                        )
-                    }) {
-                    Ok(observation) => dev_info!(
-                        self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
-                        "G17P Status-A tight scan checkpoint=native-first-immediate-post-0x10 address={:#x} first={} last={} or={} transitions={} samples={}\n",
-                        observation.scan_address,
-                        observation.first,
-                        observation.last,
-                        observation.observed_or,
-                        observation.transitions,
-                        observation.samples,
-                    ),
-                    Err(error) => dev_err!(
-                        self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
-                        "G17P Status-A tight scan checkpoint=native-first-immediate-post-0x10 read failed ({:?})\n",
-                        error,
-                    ),
-                }
+                log_g17p_scheduler_gate(
+                    self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                    self.registers.as_ref().ok_or(ENODEV)?,
+                    "native-first-post-0x10",
+                );
                 log_g17p_a2i_control(
                     self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
                     self.cpus.as_ref().ok_or(ENODEV)?.gfx(),
@@ -1550,6 +1559,11 @@ impl G17PLiveRuntime {
             Ok(completion) => completion,
             Err(error) => {
                 if channel_path {
+                    log_g17p_scheduler_gate(
+                        self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                        self.registers.as_ref().ok_or(ENODEV)?,
+                        "native-first-timeout",
+                    );
                     log_g17p_status_a(
                         self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
                         self.manager.as_mut().ok_or(ENODEV)?,
