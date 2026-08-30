@@ -253,6 +253,7 @@ enum mt7932_live_start_phase {
 };
 
 int mt7932_mcu_load_live_start_phase(struct mt792x_dev *dev, u8 phase);
+extern bool mt7932_replay_au_policy;
 int mt7932_mcu_set_6g_scan(struct mt792x_dev *dev, bool enable);
 int mt7932_mcu_load_wcal(struct mt792x_dev *dev);
 int mt7932_mcu_load_one_time_cal(struct mt792x_dev *dev);
