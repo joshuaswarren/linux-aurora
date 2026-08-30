@@ -30,7 +30,9 @@ use kernel::{
     platform,
     prelude::*,
     soc::apple::{
-        mailbox::{AscwrapV6Lifecycle, AscwrapV6Provider, AscwrapV6Role},
+        mailbox::{
+            AscwrapV6Lifecycle, AscwrapV6MailboxSnapshot, AscwrapV6Provider, AscwrapV6Role,
+        },
         rtkit,
     },
     sync::Arc,
@@ -88,6 +90,44 @@ fn log_g17p_scheduler_gate_registers(
         Err(error) => dev_err!(
             dev,
             "G17P scheduler-gate-mmio checkpoint={} read failed ({:?})\n",
+            checkpoint,
+            error,
+        ),
+    }
+}
+
+fn log_g17p_mailbox_snapshot(
+    dev: &kernel::device::Device,
+    provider: &AscwrapV6Provider,
+    checkpoint: &'static str,
+) {
+    match provider.mailbox_snapshot() {
+        Ok(snapshot) => {
+            let a2i = snapshot.a2i_control;
+            let i2a = snapshot.i2a_control;
+            dev_info!(
+                dev,
+                "G17P mailbox-control checkpoint={} a2i={:#x} count={} empty={} full={} read={} write={} enabled={} i2a={:#x} count={} empty={} full={} read={} write={} enabled={}\n",
+                checkpoint,
+                a2i,
+                AscwrapV6MailboxSnapshot::count(a2i),
+                AscwrapV6MailboxSnapshot::empty(a2i),
+                AscwrapV6MailboxSnapshot::full(a2i),
+                AscwrapV6MailboxSnapshot::read_pointer(a2i),
+                AscwrapV6MailboxSnapshot::write_pointer(a2i),
+                AscwrapV6MailboxSnapshot::enabled(a2i),
+                i2a,
+                AscwrapV6MailboxSnapshot::count(i2a),
+                AscwrapV6MailboxSnapshot::empty(i2a),
+                AscwrapV6MailboxSnapshot::full(i2a),
+                AscwrapV6MailboxSnapshot::read_pointer(i2a),
+                AscwrapV6MailboxSnapshot::write_pointer(i2a),
+                AscwrapV6MailboxSnapshot::enabled(i2a),
+            )
+        }
+        Err(error) => dev_err!(
+            dev,
+            "G17P mailbox-control checkpoint={} read failed ({:?})\n",
             checkpoint,
             error,
         ),
@@ -905,6 +945,10 @@ fn finish_boot_session(
         pdev.as_ref(),
         "G17P diagnostic: type4-j700-a000-pointer-chain-v2 armed\n"
     );
+    dev_info!(
+        pdev.as_ref(),
+        "G17P diagnostic: j700-a000-ep21-ingress-v1 armed\n"
+    );
     Ok(G17PBootedSession {
         cpus,
         gfx_state,
@@ -1261,15 +1305,59 @@ impl G17PLiveRuntime {
                 staged.secondary,
                 g17_submission::G17P_READINESS_CONTROL_DONE_MESSAGE,
             );
+            log_g17p_mailbox_snapshot(
+                self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                self.cpus.as_ref().ok_or(ENODEV)?.gfx(),
+                phase,
+            );
+            #[cfg(CONFIG_DEV_COREDUMP)]
+            let pending_probe = self
+                .manager
+                .as_ref()
+                .ok_or(ENODEV)?
+                .prepare_type4_pending_probe()?;
             Pin::new(self.gfx_rtkit.as_mut().ok_or(ENODEV)?).send_message(
                 g17_rtkit::ENDPOINT_GFX_INTERRUPTS,
                 g17_submission::G17P_READINESS_CONTROL_DONE_MESSAGE,
             )?;
-            let retired = self
+            #[cfg(CONFIG_DEV_COREDUMP)]
+            match pending_probe.observe_mask(1 << 17, 256) {
+                Ok(observation) => dev_info!(
+                    self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                    "G17P type4-pending observation first={:#x} last={:#x} or={:#x} mask-seen={} polls={}\n",
+                    observation.first,
+                    observation.last,
+                    observation.observed_or,
+                    observation.mask_seen,
+                    observation.polls,
+                ),
+                Err(error) => dev_err!(
+                    self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                    "G17P type4-pending observation failed ({:?})\n",
+                    error,
+                ),
+            }
+            log_g17p_mailbox_snapshot(
+                self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                self.cpus.as_ref().ok_or(ENODEV)?.gfx(),
+                "readiness-post-0x84",
+            );
+            let retired = match self
                 .manager
                 .as_mut()
                 .ok_or(ENODEV)?
-                .wait_compute_readiness_record_retirement(boundary.producer_after)?;
+                .wait_compute_readiness_record_retirement(boundary.producer_after)
+            {
+                Ok(retired) => retired,
+                Err(error) => {
+                    log_g17p_mailbox_snapshot(
+                        self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                        self.cpus.as_ref().ok_or(ENODEV)?.gfx(),
+                        "readiness-timeout",
+                    );
+                    return Err(error);
+                }
+            };
             dev_info!(
                 self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
                 "G17P compute readiness per-record-v2: boundary index={} target={} retired counters={:?}/{:?}\n",

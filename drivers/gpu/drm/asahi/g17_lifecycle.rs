@@ -99,6 +99,12 @@ impl<P: AscCpuLifecycle> StartedCpuPair<P> {
         }
         first_error.map_or(Ok(()), Err)
     }
+
+    /// Borrow the retained primary provider while both lifecycle owners stay
+    /// inside this pair.
+    pub(crate) fn gfx(&self) -> &P {
+        &self.gfx
+    }
 }
 
 impl<P: AscCpuLifecycle> Drop for StartedCpuPair<P> {
