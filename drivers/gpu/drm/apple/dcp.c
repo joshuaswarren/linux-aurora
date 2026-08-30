@@ -22,6 +22,7 @@
 #include <linux/of_address.h>
 #include <linux/of_device.h>
 #include <linux/of_platform.h>
+#include <linux/overflow.h>
 #include <linux/slab.h>
 #include <linux/sizes.h>
 #include <linux/soc/apple/rtkit.h>
@@ -70,9 +71,25 @@
 #define DCP_RTKIT_FOURCC(a, b, c, d) \
 	(((u32)(a) << 24) | ((u32)(b) << 16) | ((u32)(c) << 8) | (u32)(d))
 #define DCP_RTKIT_CRASHLOG_HEADER DCP_RTKIT_FOURCC('C', 'L', 'H', 'E')
+#define DCP_RTKIT_CRASHLOG_MULTI_HEADER DCP_RTKIT_FOURCC('C', 'L', 'G', 'H')
 #define DCP_RTKIT_EP_CRASHLOG 1
 #define DCP_RTKIT_CRASHLOG_STR DCP_RTKIT_FOURCC('C', 's', 't', 'r')
 #define DCP_RTKIT_CRASHLOG_VERSION DCP_RTKIT_FOURCC('C', 'v', 'e', 'r')
+#define DCP_RTKIT_CRASHLOG_REGS DCP_RTKIT_FOURCC('C', 'r', 'g', '8')
+
+#define DCP_RTKIT_CRASHLOG_MULTI_VERSION 2
+#define DCP_RTKIT_CRASHLOG_VERSION_V3 3
+#define DCP_RTKIT_CRASHLOG_MULTI_MAX_DEPTH 8
+
+#define DCP_RTKIT_CRASHLOG_REGS_SIZE 0x350
+#define DCP_RTKIT_CRASHLOG_REGS_SP 0x100
+#define DCP_RTKIT_CRASHLOG_REGS_PC 0x108
+#define DCP_RTKIT_CRASHLOG_REGS_PSR 0x110
+#define DCP_RTKIT_CRASHLOG_REGS_FAR 0x330
+#define DCP_RTKIT_CRASHLOG_REGS_ESR 0x340
+#define DCP_RTKIT_CRASHLOG_REGS_BODY_SIZE 0x348
+#define DCP_RTKIT_CRASHLOG_REGS_UNDECODABLE BIT(16)
+#define DCP_RTKIT_CRASHLOG_INCOMPLETE BIT(8)
 
 struct dcp_rtkit_crashlog_header {
 	__le32 fourcc;
@@ -82,6 +99,25 @@ struct dcp_rtkit_crashlog_header {
 	u8 reserved[16];
 };
 static_assert(sizeof(struct dcp_rtkit_crashlog_header) == 0x20);
+
+struct dcp_rtkit_crashlog_multi_header {
+	__le32 fourcc;
+	__le32 version;
+	__le32 size;
+	__le32 current_id;
+	__le32 record_count;
+};
+
+static_assert(sizeof(struct dcp_rtkit_crashlog_multi_header) == 0x14);
+
+struct dcp_rtkit_crashlog_multi_record {
+	__le64 id;
+	__le64 reserved;
+	__le32 offset;
+	__le32 reserved2;
+};
+
+static_assert(sizeof(struct dcp_rtkit_crashlog_multi_record) == 0x18);
 
 static bool show_notch;
 module_param(show_notch, bool, 0644);
@@ -337,6 +373,78 @@ static void dcp_rtk_crashed(void *cookie, const void *crashlog, size_t crashlog_
 }
 
 /*
+ * RTBuddyCrashlogDecoder::_multiCrashlogFindFirstCrash() follows the record
+ * whose 64-bit ID equals the CLGH header's 32-bit current ID. The selected
+ * record can itself contain CLGH, so preserve the native recursive contract
+ * while rejecting cycles and out-of-range offsets in a corrupt snapshot.
+ */
+static bool dcp_rtk_select_crashlog(u8 *data, size_t data_size,
+				    size_t *log_offset, u32 *generation,
+				    u32 *depth)
+{
+	size_t offset = 0;
+	u32 selected_generation = 0;
+	u32 level;
+
+	for (level = 0; level < DCP_RTKIT_CRASHLOG_MULTI_MAX_DEPTH; level++) {
+		struct dcp_rtkit_crashlog_multi_header *header;
+		struct dcp_rtkit_crashlog_multi_record *records;
+		size_t records_size, selected_offset = 0;
+		u32 count, current_id, version;
+		bool found = false;
+		u32 i;
+
+		if (data_size - offset < sizeof(*header))
+			return false;
+
+		header = (void *)(data + offset);
+		if (le32_to_cpu(header->fourcc) !=
+		    DCP_RTKIT_CRASHLOG_MULTI_HEADER)
+			break;
+
+		version = le32_to_cpu(header->version);
+		if (((version >> 8) & 0xff) !=
+		    DCP_RTKIT_CRASHLOG_MULTI_VERSION)
+			return false;
+
+		count = le32_to_cpu(header->record_count);
+		if (!count || check_mul_overflow((size_t)count,
+						 sizeof(*records), &records_size) ||
+		    records_size > data_size - offset - sizeof(*header))
+			return false;
+
+		current_id = le32_to_cpu(header->current_id);
+		records = (void *)(header + 1);
+		for (i = 0; i < count; i++) {
+			if (le64_to_cpu(records[i].id) != current_id)
+				continue;
+
+			selected_offset = le32_to_cpu(records[i].offset);
+			found = true;
+			break;
+		}
+
+		if (!found || selected_offset < sizeof(*header) ||
+		    selected_offset > data_size - offset ||
+		    data_size - offset - selected_offset <
+					      sizeof(struct dcp_rtkit_crashlog_header))
+			return false;
+
+		selected_generation = current_id;
+		offset += selected_offset;
+	}
+
+	if (level == DCP_RTKIT_CRASHLOG_MULTI_MAX_DEPTH ||
+	    data_size - offset < sizeof(struct dcp_rtkit_crashlog_header))
+		return false;
+
+	*log_offset = offset;
+	*generation = selected_generation;
+	*depth = level;
+	return true;
+}
+
+/*
  * An adopted RTKit session has already initialized EP1, but RTKit's local
  * crashlog_buffer state starts empty.  The first inherited EP1 type-1 message
  * can therefore be a crash notification rather than the initial buffer
@@ -347,7 +455,8 @@ static bool dcp_rtk_report_adopted_crashlog(struct apple_dcp *dcp,
 					    struct apple_rtkit_shmem *bfr)
 {
 	struct dcp_rtkit_crashlog_header header;
-	size_t crash_size, offset;
+	size_t buffer_size, crash_size, log_offset, section_end, offset;
+	u32 generation, depth;
 	u8 *data;
 
 	if (!dcp->adopted_session || bfr != &dcp->rtk->crashlog_buffer ||
@@ -356,52 +465,114 @@ static bool dcp_rtk_report_adopted_crashlog(struct apple_dcp *dcp,
 
 	dma_rmb();
 	memcpy_fromio(&header, bfr->iomem, sizeof(header));
-	if (le32_to_cpu(header.fourcc) != DCP_RTKIT_CRASHLOG_HEADER)
+	if (le32_to_cpu(header.fourcc) != DCP_RTKIT_CRASHLOG_HEADER &&
+	    le32_to_cpu(header.fourcc) != DCP_RTKIT_CRASHLOG_MULTI_HEADER)
 		return false;
 
-	crash_size = le32_to_cpu(header.size);
-	if (crash_size < sizeof(header) || crash_size > bfr->size) {
+	buffer_size = le32_to_cpu(header.size);
+	if (buffer_size < sizeof(struct dcp_rtkit_crashlog_multi_header) ||
+	    buffer_size > bfr->size) {
 		dev_err(dcp->dev,
 			"inherited DCP crashlog has invalid size %#zx (buffer %#zx)\n",
-			crash_size, bfr->size);
-		goto crashed;
+			buffer_size, bfr->size);
+		return false;
 	}
 
-	data = kmalloc(crash_size, GFP_KERNEL);
+	data = kmalloc(buffer_size, GFP_KERNEL);
 	if (!data) {
 		dev_err(dcp->dev,
 			"could not allocate %#zx-byte inherited DCP crashlog copy\n",
-			crash_size);
-		goto crashed;
+			buffer_size);
+		return false;
 	}
 
-	memcpy_fromio(data, bfr->iomem, crash_size);
+	memcpy_fromio(data, bfr->iomem, buffer_size);
+	if (!dcp_rtk_select_crashlog(data, buffer_size, &log_offset,
+				     &generation, &depth)) {
+		dev_err(dcp->dev,
+			"DCP25G83_A401_CRASHLOG_SELECT_FAILED header %32phN\n",
+			data);
+		kfree(data);
+		return false;
+	}
+	dev_info(dcp->dev,
+		 "DCP25G83_A401_CRASHLOG_GENERATION id %#x depth %u offset %#zx\n",
+		 generation, depth, log_offset);
+
+	memcpy(&header, data + log_offset, sizeof(header));
+	if (le32_to_cpu(header.fourcc) != DCP_RTKIT_CRASHLOG_HEADER ||
+	    ((le32_to_cpu(header.version) >> 8) & 0xff) !=
+						DCP_RTKIT_CRASHLOG_VERSION_V3) {
+		dev_err(dcp->dev,
+			"DCP25G83_A401_CRASHLOG_SELECTED_INVALID generation %#x depth %u offset %#zx header %32phN\n",
+			generation, depth, log_offset, data + log_offset);
+		kfree(data);
+		return false;
+	}
+
+	crash_size = le32_to_cpu(header.size);
+	if (crash_size < 2 * sizeof(header) ||
+	    crash_size > buffer_size - log_offset) {
+		dev_err(dcp->dev,
+			"DCP25G83_A401_CRASHLOG_SELECTED_SIZE generation %#x offset %#zx size %#zx remaining %#zx\n",
+			generation, log_offset, crash_size,
+			buffer_size - log_offset);
+		kfree(data);
+		return false;
+	}
+	if (le32_to_cpu(header.flags) & DCP_RTKIT_CRASHLOG_INCOMPLETE) {
+		dev_err(dcp->dev,
+			"DCP25G83_A401_CRASHLOG_INCOMPLETE generation %#x flags %#x\n",
+			generation, le32_to_cpu(header.flags));
+		kfree(data);
+		return false;
+	}
+
+	section_end = crash_size - sizeof(header);
+	if (memcmp(data + log_offset, data + log_offset + section_end,
+		   sizeof(header))) {
+		dev_err(dcp->dev,
+			"DCP25G83_A401_CRASHLOG_FOOTER_MISMATCH generation %#x offset %#zx footer %32phN\n",
+			generation, log_offset + section_end,
+			data + log_offset + section_end);
+		kfree(data);
+		return false;
+	}
+
 	dev_err(dcp->dev,
-		"inherited DCP crashlog version %u size %#zx flags %#x\n",
+		"inherited DCP crashlog generation %#x depth %u offset %#zx version %u size %#zx flags %#x\n",
+		generation, depth, log_offset,
 		le32_to_cpu(header.version), crash_size,
 		le32_to_cpu(header.flags));
 
-	for (offset = sizeof(header); offset + 16 <= crash_size;) {
-		u32 fourcc = get_unaligned_le32(data + offset);
-		u32 section_size = get_unaligned_le32(data + offset + 12);
+	for (offset = sizeof(header); offset < section_end;) {
+		u8 *section = data + log_offset + offset;
+		u32 fourcc, section_size;
 		size_t payload_size;
 		const char *text;
 
-		if (fourcc == DCP_RTKIT_CRASHLOG_HEADER)
-			break;
-		if (section_size < 16 || section_size > crash_size - offset) {
+		if (section_end - offset < 16) {
+			dev_err(dcp->dev,
+				"inherited DCP crashlog has truncated section header at %#zx\n",
+				offset);
+			goto invalid_sections;
+		}
+
+		fourcc = get_unaligned_le32(section);
+		section_size = get_unaligned_le32(section + 12);
+		if (section_size < 16 || section_size > section_end - offset) {
 			dev_err(dcp->dev,
 				"inherited DCP crashlog section %#x has invalid size %#x at %#zx\n",
 				fourcc, section_size, offset);
-			break;
+			goto invalid_sections;
 		}
 
 		payload_size = section_size - 16;
 		if (fourcc == DCP_RTKIT_CRASHLOG_STR && payload_size > 4) {
-			u32 id = get_unaligned_le32(data + offset + 16);
+			u32 id = get_unaligned_le32(section + 16);
 			size_t text_size;
 
-			text = data + offset + 20;
+			text = section + 20;
 			text_size = strnlen(text, payload_size - 4);
 			dev_err(dcp->dev, "DCP crash message %u: %.*s\n", id,
 				(int)min_t(size_t, text_size, SZ_4K), text);
@@ -409,10 +580,30 @@ static bool dcp_rtk_report_adopted_crashlog(struct apple_dcp *dcp,
 			   payload_size > 16) {
 			size_t text_size;
 
-			text = data + offset + 32;
+			text = section + 32;
 			text_size = strnlen(text, payload_size - 16);
 			dev_err(dcp->dev, "DCP firmware version: %.*s\n",
 				(int)min_t(size_t, text_size, SZ_4K), text);
+		} else if (fourcc == DCP_RTKIT_CRASHLOG_REGS &&
+			   payload_size >= DCP_RTKIT_CRASHLOG_REGS_SIZE) {
+			u8 *regs = section + 16;
+			u32 regs_flags = get_unaligned_le32(regs);
+			u32 regs_size = get_unaligned_le32(regs + 4);
+
+			if (regs_size != DCP_RTKIT_CRASHLOG_REGS_BODY_SIZE ||
+			    (regs_flags & DCP_RTKIT_CRASHLOG_REGS_UNDECODABLE)) {
+				dev_err(dcp->dev,
+					"DCP25G83_A401_CRASHLOG_CRG8_INVALID flags %#x size %#x\n",
+					regs_flags, regs_size);
+			} else {
+				dev_err(dcp->dev,
+					"DCP25G83_A401_CRASHLOG_CRG8 pc %#llx sp %#llx psr %#llx far %#llx esr %#llx\n",
+					get_unaligned_le64(regs + DCP_RTKIT_CRASHLOG_REGS_PC),
+					get_unaligned_le64(regs + DCP_RTKIT_CRASHLOG_REGS_SP),
+					get_unaligned_le64(regs + DCP_RTKIT_CRASHLOG_REGS_PSR),
+					get_unaligned_le64(regs + DCP_RTKIT_CRASHLOG_REGS_FAR),
+					get_unaligned_le64(regs + DCP_RTKIT_CRASHLOG_REGS_ESR));
+			}
 		} else {
 			dev_info(dcp->dev,
 				 "inherited DCP crashlog section %#x size %#x\n",
@@ -424,10 +615,15 @@ static bool dcp_rtk_report_adopted_crashlog(struct apple_dcp *dcp,
 
 	kfree(data);
 
-crashed:
-	dcp->rtk->crashed = true;
-	dcp_rtk_crashed(dcp, NULL, 0);
+	if (!dcp->rtk->crashed) {
+		dcp->rtk->crashed = true;
+		dcp_rtk_crashed(dcp, NULL, 0);
+	}
 	return true;
+
+invalid_sections:
+	kfree(data);
+	return false;
 }
 
 void dcp_rtk_timeout_crashlog_snapshot(struct apple_dcp *dcp)

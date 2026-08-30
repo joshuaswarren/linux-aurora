@@ -42,6 +42,7 @@ shasum -a 256 \
   source/25G83__MacOS/Firmware/dcp/t8140dcp.im4p \
   extracted/t8140dcp-25G83.bin
 python3 tools/dcp25g83_analyze.py verify
+python3 tools/parse_rtbuddy_crashlog.py --self-test
 ```
 
 The range downloader fetches only the named DCP member, not the full restore
@@ -69,3 +70,11 @@ The full consumer contract and live-log correlation are in
 It also records why the attempted AP read of a DCP-private reply stream was
 not a valid association discriminator and why the reply error field is not a
 safe substitute.
+
+`parse_rtbuddy_crashlog.py` mirrors native RTBuddy's current-generation CLGH
+selection and summarizes Cstr and Crg8 from a raw crashlog-buffer dump. The
+layout was recovered from the local Mac17p reference kernelcache
+`kernelcache.release.mac17p.decompressed`, size `119504896`, SHA-256
+`a5f69db1ddd3052f166ab71e86ee63dfe6549e0e93f06d99621cb90c29f346cc`.
+That reference reports XNU `13432.0.50.501.3`; it corroborates the host decoder
+format and is not represented as the exact 25G83 DCP firmware artifact above.
