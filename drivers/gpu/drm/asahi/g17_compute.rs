@@ -16,6 +16,8 @@ pub(crate) const COMPUTE_REGISTER_SIZE: usize = 0x0c;
 pub(crate) const COMPUTE_QUEUE_GRAPH_SIZE: usize = 0x8000;
 pub(crate) const COMPUTE_QUEUE_CONTEXT_SIZE: usize = 0x4000;
 pub(crate) const COMPUTE_QUEUE_CONTEXT_EXTENT: usize = 8 * COMPUTE_QUEUE_CONTEXT_SIZE;
+/// Native G17P HAL200 SKSM entry backing: 256 entries at a 0x200 stride.
+pub(crate) const COMPUTE_SKSM_ENTRY_BACKING_SIZE: usize = 0x20000;
 pub(crate) const COMPUTE_OPTIONAL_SIZE: usize = 0xc0;
 pub(crate) const COMPUTE_EVENT_SIZE: usize = 0x400;
 pub(crate) const COMPUTE_CHANNEL_WRITE_INDEX: u32 = 3;
@@ -46,9 +48,65 @@ pub(crate) enum ComputeBuildError {
     CdmTerminatorBeforeStream,
     SubmissionIndexZero,
     QueueSubmissionZero,
+    InvalidSksmEntryAliases,
     SamplerCountOutOfRange,
     SamplerPair,
     SamplerAlignment,
+}
+
+/// Low and high GPU aliases of one retained SKSM entry backing.
+///
+/// Native tag-15 ConfigUpdate reads these from the same KSM queue object at
+/// `+0x80/+0x88`. Keeping them typed prevents the classic CL2 queue-context
+/// allocation from being substituted for either address.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct ComputeSksmEntryAliases {
+    low: u64,
+    high: u64,
+}
+
+impl ComputeSksmEntryAliases {
+    pub(crate) const fn new(low: u64, high: u64) -> Result<Self, ComputeBuildError> {
+        if low == 0
+            || high == 0
+            || low == high
+            || low & (COMPUTE_QUEUE_CONTEXT_SIZE as u64 - 1) != 0
+            || high & (COMPUTE_QUEUE_CONTEXT_SIZE as u64 - 1) != 0
+            || low
+                .checked_add(COMPUTE_SKSM_ENTRY_BACKING_SIZE as u64)
+                .is_none()
+            || high
+                .checked_add(COMPUTE_SKSM_ENTRY_BACKING_SIZE as u64)
+                .is_none()
+        {
+            return Err(ComputeBuildError::InvalidSksmEntryAliases);
+        }
+        Ok(Self { low, high })
+    }
+
+    pub(crate) const fn low(self) -> u64 {
+        self.low
+    }
+
+    pub(crate) const fn high(self) -> u64 {
+        self.high
+    }
+
+    /// Return corresponding addresses within both aliases of the one backing.
+    pub(crate) const fn range_at(
+        self,
+        offset: usize,
+        size: usize,
+    ) -> Result<[u64; 2], ComputeBuildError> {
+        let end = match offset.checked_add(size) {
+            Some(end) => end,
+            None => return Err(ComputeBuildError::InvalidSksmEntryAliases),
+        };
+        if end > COMPUTE_SKSM_ENTRY_BACKING_SIZE {
+            return Err(ComputeBuildError::InvalidSksmEntryAliases);
+        }
+        Ok([self.low + offset as u64, self.high + offset as u64])
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -244,8 +302,7 @@ pub(crate) fn build_compute_queue_graph(
 pub(crate) fn build_initial_compute_channel_group(
     base: u64,
     descriptor: u64,
-    context_low: u64,
-    context_high: u64,
+    sksm_entries: ComputeSksmEntryAliases,
     shared_control: u64,
     channel_control: u64,
     graph: &mut [u8],
@@ -275,8 +332,8 @@ pub(crate) fn build_initial_compute_channel_group(
     let optional_raw = &mut graph[COMPUTE_OPTIONAL..COMPUTE_OPTIONAL + COMPUTE_OPTIONAL_SIZE];
     optional_raw.fill(0);
     put_u32(optional_raw, 0x00, 0x0f);
-    put_u64(optional_raw, 0x08, context_low);
-    put_u64(optional_raw, 0x10, context_high);
+    put_u64(optional_raw, 0x08, sksm_entries.low());
+    put_u64(optional_raw, 0x10, sksm_entries.high());
     for (offset, value) in [
         (0x18, 4u16),
         (0x1a, 1),
@@ -640,8 +697,7 @@ mod tests {
         let addresses = build_initial_compute_channel_group(
             base,
             descriptor,
-            0x70_0040_0000,
-            0xffff_fc20_c300_0000,
+            ComputeSksmEntryAliases::new(0x70_0040_0000, 0xffff_fc20_c300_0000).unwrap(),
             0xffff_fc20_c400_0000,
             0xffff_fc20_c500_0000,
             &mut graph,
@@ -659,5 +715,31 @@ mod tests {
         );
         assert_eq!(fnv1a64(&graph), 0xc8d6_b367_6415_8da7);
         assert_eq!(fnv1a64(&context), 0x5ba5_b355_8c90_0783);
+    }
+
+    #[test]
+    fn sksm_entry_aliases_preserve_one_backing_offset() {
+        let aliases =
+            ComputeSksmEntryAliases::new(0x70_004d_8000, 0xffff_fc20_0027_8000).unwrap();
+        assert_eq!(
+            aliases.range_at(0x200, 0x200),
+            Ok([0x70_004d_8200, 0xffff_fc20_0027_8200])
+        );
+        assert_eq!(
+            aliases.range_at(COMPUTE_SKSM_ENTRY_BACKING_SIZE - 0x200, 0x200),
+            Ok([0x70_004f_7e00, 0xffff_fc20_0029_7e00])
+        );
+        assert_eq!(
+            aliases.range_at(COMPUTE_SKSM_ENTRY_BACKING_SIZE, 1),
+            Err(ComputeBuildError::InvalidSksmEntryAliases)
+        );
+        assert_eq!(
+            ComputeSksmEntryAliases::new(0x70_004d_8000, 0x70_004d_8000),
+            Err(ComputeBuildError::InvalidSksmEntryAliases)
+        );
+        assert_eq!(
+            ComputeSksmEntryAliases::new(0x70_004d_8001, 0xffff_fc20_0027_8000),
+            Err(ComputeBuildError::InvalidSksmEntryAliases)
+        );
     }
 }
