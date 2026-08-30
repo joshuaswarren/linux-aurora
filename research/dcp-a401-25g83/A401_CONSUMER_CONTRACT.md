@@ -493,6 +493,32 @@ site; it does not identify the faulting instruction. The next valid
 discriminator is `DCP25G83_A401_CRASHLOG_CRL4 ... pc ...`, which can locate
 the actual pre-notification failure against the exact 25G83 image.
 
+The corrected main-path run with commit `00f9edd` decoded LR `0x042a13d0`,
+PC `0x04141324`, PSR `0x60400000`, ESR `0x92000410`, and FAR
+`0x3028aa140`. ESR EC `0x24` is a lower-EL data abort, DFSC `0x10` is a
+synchronous external abort, WnR is clear, and FnV is set. FAR is therefore not
+valid. The exact instruction at PC is `pacibsp`, followed by the stack-frame
+prologue; it performs no data access. The saved LR points at `mov w6, w19`
+inside the UPBlock/PTUC register-programming family, not at a call instruction.
+Neither address can be treated as a precise faulting read.
+
+Strings and control flow identify the PC function as
+`getRequestedDriveSettings`. Its first external operation is an AUX/DPCD read
+of adjustment-request register `0x206`, with an optional second read of `0x335`.
+That identity locates the task active when the fabric abort was reported; it
+does not prove that the AUX read caused the abort. Patching or delaying this
+function would contradict the Crl4 syndrome.
+
+The remaining current-generation section is CasC version `0x101`, total size
+`0x48`. Its native payload begins at section `+0x10` with seven 64-bit fabric records:
+L2C error status, L2C error address, L2C error info, LSU error status, FED error
+status, MMU error status, and a 25G83-only extra qword which older decoders
+ignore. Commit after `00f9edd` logs the exact 56-byte payload, all seven qwords, and
+the Crl4 x0--x29 set without changing mailbox, RPC, or hardware behavior. This
+is the first discriminator that can name the async source/master and distinguish
+a missing PTUC mapping from a powered-off display block. No behavior change is
+justified until those values are known.
+
 ## Queued post-A401 H17P callback table correction
 
 This is downstream ABI evidence and must not be folded into the crash-PC
