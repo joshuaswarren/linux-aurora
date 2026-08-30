@@ -332,6 +332,7 @@ void iomfb_link_timeout_snapshot(struct apple_dcp *dcp)
 				 dcp->link_d563_a2i_after[4], control,
 				 dcp->link_d563_a2i_ep1_observed);
 	}
+	dcp_rtk_timeout_crashlog_snapshot(dcp);
 }
 
 static void dcp_link_log_init(struct apple_dcp *dcp,

@@ -430,6 +430,32 @@ crashed:
 	return true;
 }
 
+void dcp_rtk_timeout_crashlog_snapshot(struct apple_dcp *dcp)
+{
+	struct apple_rtkit_shmem *bfr;
+	struct dcp_rtkit_crashlog_header header = {};
+	bool reported;
+
+	if (!dcp->adopted_session || dcp->fw_compat != DCP_FIRMWARE_H17P ||
+	    !dcp->rtk)
+		return;
+
+	bfr = &dcp->rtk->crashlog_buffer;
+	if (!bfr->iomem || bfr->size < sizeof(header)) {
+		dev_info(dcp->dev,
+			 "DCP25G83_A401_CRASHLOG_TIMEOUT mapped 0 size %#zx reported 0\n",
+			 bfr->size);
+		return;
+	}
+
+	dma_rmb();
+	memcpy_fromio(&header, bfr->iomem, sizeof(header));
+	reported = dcp_rtk_report_adopted_crashlog(dcp, bfr);
+	dev_info(dcp->dev,
+		 "DCP25G83_A401_CRASHLOG_TIMEOUT mapped 1 size %#zx header %32phN reported %u\n",
+		 bfr->size, &header, reported);
+}
+
 static int dcp_rtk_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
 {
 	struct apple_dcp *dcp = cookie;
