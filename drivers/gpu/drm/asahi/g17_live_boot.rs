@@ -72,25 +72,24 @@ const CONTROL_COUNTER_POLLS: usize = 100;
 const G17P_CRASHLOG_MAX_BYTES: usize = 256 * 1024;
 const G17P_RTKIT_UAT_DVA_MASK: u64 = (1u64 << 40) - 1;
 
-fn log_g17p_scheduler_gate_registers(
+fn log_g17p_status_a_snapshot(
     dev: &kernel::device::Device,
-    registers: &regs::Resources,
+    manager: &mut g17_manager::G17PManagerConstruction,
     checkpoint: &'static str,
 ) {
-    match registers.g17p_scheduler_gate_registers() {
+    match manager.status_a_snapshot() {
         Ok(snapshot) => dev_info!(
             dev,
-            "G17P scheduler-gate-mmio checkpoint={} fender-d06030={:#x} wake-armed={} irq-e01000-low={:#x} irq-enable-e01010={:#x} irq-status-e01014={:#x}\n",
+            "G17P status-a-j700-a000 checkpoint={} address={:#x} raw={:#x} active={} scheduler-constructed={}\n",
             checkpoint,
-            snapshot.fender_dynamic_gating,
-            snapshot.fender_wake_armed(),
-            snapshot.host_irq_summary,
-            snapshot.host_irq_enable,
-            snapshot.host_irq_status,
+            snapshot.address,
+            snapshot.raw,
+            snapshot.active,
+            snapshot.scheduler_constructed,
         ),
         Err(error) => dev_err!(
             dev,
-            "G17P scheduler-gate-mmio checkpoint={} read failed ({:?})\n",
+            "G17P status-a-j700-a000 checkpoint={} read failed ({:?})\n",
             checkpoint,
             error,
         ),
@@ -887,7 +886,6 @@ fn finish_boot_session(
     gfx1_state: Arc<G17PRoleRtkitState>,
     gfx1_rtkit: rtkit::RtKit<G17PRtkitOps>,
 ) -> Result<G17PBootedSession> {
-    manager.log_mbi_trace_lease_checkpoint("post-initdata-acks");
     let staged = manager.control_counters()?;
     if !staged.opening_staged() {
         dev_err!(
@@ -1047,12 +1045,6 @@ fn finish_boot_session(
     if gfx_state.crashed.load(Ordering::Acquire) || gfx1_state.crashed.load(Ordering::Acquire) {
         return Err(EIO);
     }
-    log_g17p_scheduler_gate_registers(
-        pdev.as_ref(),
-        registers,
-        "bootstrap-after-retirement",
-    );
-    manager.log_mbi_trace_lease_checkpoint("bootstrap-after-retirement");
     Pin::new(&mut gfx_rtkit)
         .send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, control_done)?;
     dev_info!(
@@ -1089,15 +1081,11 @@ fn finish_boot_session(
     );
     dev_info!(
         pdev.as_ref(),
-        "G17P diagnostic: j700-a000-mbi-trace-leases-v1 armed\n"
-    );
-    dev_info!(
-        pdev.as_ref(),
         "G17P diagnostic: j700-dual-initdata-publication-v1 armed\n"
     );
     dev_info!(
         pdev.as_ref(),
-        "G17P diagnostic: j700-gfx1-root-main-flags-v1 armed\n"
+        "G17P diagnostic: j700-status-a-v1 armed\n"
     );
     Ok(G17PBootedSession {
         cpus,
@@ -1388,10 +1376,6 @@ impl G17PLiveRuntime {
             )
             .map_err(|_| ENOTSUPP)?;
         }
-        self.manager
-            .as_ref()
-            .ok_or(ENODEV)?
-            .log_mbi_trace_lease_checkpoint("first-submit-pre-readiness");
         {
             let manager = self.manager.as_mut().ok_or(ENODEV)?;
             let queue = self.queue.as_mut().ok_or(ENODEV)?;
@@ -1437,13 +1421,9 @@ impl G17PLiveRuntime {
                     error,
                 ),
             }
-            self.manager
-                .as_ref()
-                .ok_or(ENODEV)?
-                .log_scheduler_root_checkpoint(phase);
-            log_g17p_scheduler_gate_registers(
+            log_g17p_status_a_snapshot(
                 self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
-                self.registers.as_ref().ok_or(ENODEV)?,
+                self.manager.as_mut().ok_or(ENODEV)?,
                 phase,
             );
             dev_info!(
@@ -1464,42 +1444,20 @@ impl G17PLiveRuntime {
                 self.cpus.as_ref().ok_or(ENODEV)?.gfx(),
                 phase,
             );
-            #[cfg(CONFIG_DEV_COREDUMP)]
-            let pending_probe = self
-                .manager
-                .as_ref()
-                .ok_or(ENODEV)?
-                .prepare_type4_pending_probe()?;
             Pin::new(self.gfx_rtkit.as_mut().ok_or(ENODEV)?).send_message(
                 g17_rtkit::ENDPOINT_GFX_INTERRUPTS,
                 g17_submission::G17P_READINESS_CONTROL_DONE_MESSAGE,
             )?;
-            #[cfg(CONFIG_DEV_COREDUMP)]
-            match pending_probe.observe_mask(1 << 17, 256) {
-                Ok(observation) => dev_info!(
-                    self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
-                    "G17P type4-pending observation first={:#x} last={:#x} or={:#x} mask-seen={} polls={}\n",
-                    observation.first,
-                    observation.last,
-                    observation.observed_or,
-                    observation.mask_seen,
-                    observation.polls,
-                ),
-                Err(error) => dev_err!(
-                    self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
-                    "G17P type4-pending observation failed ({:?})\n",
-                    error,
-                ),
-            }
             log_g17p_mailbox_snapshot(
                 self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
                 self.cpus.as_ref().ok_or(ENODEV)?.gfx(),
                 "readiness-post-0x84",
             );
-            self.manager
-                .as_ref()
-                .ok_or(ENODEV)?
-                .log_mbi_trace_lease_checkpoint("readiness-post-0x84");
+            log_g17p_status_a_snapshot(
+                self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                self.manager.as_mut().ok_or(ENODEV)?,
+                "readiness-post-0x84",
+            );
             let retired = match self
                 .manager
                 .as_mut()
@@ -1511,6 +1469,11 @@ impl G17PLiveRuntime {
                     log_g17p_mailbox_snapshot(
                         self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
                         self.cpus.as_ref().ok_or(ENODEV)?.gfx(),
+                        "readiness-timeout",
+                    );
+                    log_g17p_status_a_snapshot(
+                        self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                        self.manager.as_mut().ok_or(ENODEV)?,
                         "readiness-timeout",
                     );
                     return Err(error);
