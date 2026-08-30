@@ -570,6 +570,12 @@ impl G17PManagerConstruction {
         self.resources.status_a_snapshot()
     }
 
+    pub(crate) fn hardware_init_handshake_snapshot(
+        &mut self,
+    ) -> Result<g17_resources::G17PHardwareInitHandshakeSnapshot> {
+        self.resources.hardware_init_handshake_snapshot()
+    }
+
     /// Verify the untouched native pre-user root phase. The first real user
     /// bind owns the transition from the retained context-0 roots to context
     /// 1; no driver-owned startup render VM is needed to manufacture it.
