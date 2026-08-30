@@ -2790,7 +2790,12 @@ generic_scan:
 		       sreq->ssids[i].ssid_len);
 		n_ssids++;
 	}
-	req->ssid_type = n_ssids ? BIT(2) : BIT(0);
+	/* Apple 25G83's directed AIS scans (ordinals 552..590) use selector
+	 * bit 3 with one populated SSID.  The public generic bit-2 selector
+	 * does not find the requested BSS on this firmware.
+	 */
+	req->ssid_type = mt7932 && n_ssids ? BIT(3) :
+			 n_ssids ? BIT(2) : BIT(0);
 	if (!mt7932)
 		req->ssid_type_ext = n_ssids ? BIT(0) : 0;
 	req->ssids_num = n_ssids;
@@ -2853,9 +2858,12 @@ generic_scan:
 		memcpy(req->ies, sreq->ie, sreq->ie_len);
 		req->ies_len = cpu_to_le16(sreq->ie_len);
 	}
-	if (mt7932) {
+	if (mt7932 && !n_ssids) {
 		memcpy(req->ies, mt7932_scan_ie, sizeof(mt7932_scan_ie));
 		req->ies_len = cpu_to_le16(sizeof(mt7932_scan_ie));
+	} else if (mt7932) {
+		memset(req->ies, 0, sizeof(req->ies));
+		req->ies_len = 0;
 	}
 
 	if (is_connac2(phy->dev) && !mt7932)
