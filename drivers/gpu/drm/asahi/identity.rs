@@ -62,6 +62,70 @@ pub(crate) enum SubmissionTransport {
     Sksm,
 }
 
+/// Host submission family selected from a complete decoded GPU identity.
+///
+/// This is intentionally narrower than [`SubmissionTransport`]. A binary may
+/// link both classic and SKSM infrastructure while its target factories still
+/// select exactly one data path.
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub(crate) enum SubmissionBackendFamily {
+    /// Classic SKU channels used by G13-G15 and G16G.
+    ClassicSku,
+    /// G16 SKSM hybrid used by the G16X targets.
+    G16Hal200Sksm,
+    /// G16 SKSM machinery under G17's dual-firmware topology.
+    G17Hal200Hybrid,
+    /// PI_300 target SKSM channels used by G17G and G17X.
+    G17Hal300Sksm,
+}
+
+/// Strength of the target-specific evidence behind one family selection.
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub(crate) enum SubmissionBackendProvenance {
+    /// The named target's own channel factories establish the selection.
+    KextProven,
+    /// An adjacent target shares the gate, but the named target is not pinned.
+    CrossGenerationDerived,
+}
+
+/// Runtime implementation available in this driver checkout.
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub(crate) enum SubmissionBackendImplementation {
+    /// Existing mature classic submission path; no G17 code is substituted.
+    ExistingClassic,
+    /// The bounded T8140/G17P first-partial path in this checkout.
+    T8140G17PFirstPartial,
+    /// The family is target-proven but no executable backend is wired here.
+    NotImplemented,
+    /// The family is only cross-generation-derived and cannot be enabled.
+    Unconfirmed,
+}
+
+/// Identity-backed family, evidence, and implementation decision.
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub(crate) struct SubmissionBackendSelection {
+    pub(crate) family: SubmissionBackendFamily,
+    pub(crate) provenance: SubmissionBackendProvenance,
+    pub(crate) implementation: SubmissionBackendImplementation,
+}
+
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub(crate) enum SubmissionBackendSelectionError {
+    /// The generation/variant/HAL/role/transport axes contradict each other.
+    InconsistentIdentity,
+    /// No independently proven target family exists for the decoded identity.
+    UnconfirmedTarget,
+    /// The target family is proven but not executable in this checkout.
+    BackendNotImplemented,
+}
+
+pub(crate) const T8140_G17P_SUBMISSION_BACKEND: SubmissionBackendSelection =
+    SubmissionBackendSelection {
+        family: SubmissionBackendFamily::G17Hal200Hybrid,
+        provenance: SubmissionBackendProvenance::KextProven,
+        implementation: SubmissionBackendImplementation::T8140G17PFirstPartial,
+    };
+
 /// Target subclass instantiated by Apple's data-master channel factory.
 #[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -1318,6 +1382,155 @@ pub(crate) fn decode_gpu_identity(family: u8, variant: u8, num_dies: u8) -> Opti
         submission_transport,
         uat_input_address_bits,
     })
+}
+
+/// Classify a decoded identity without enabling an unimplemented backend.
+///
+/// Target factory disassembly proves the classic, G16X, G17P, G17G, and G17X
+/// arms. G17A is exposed as the shared HAL200 family but remains explicitly
+/// unconfirmed because no independent G17A target artifact was recovered.
+pub(crate) const fn submission_backend_selection(
+    identity: GpuIdentity,
+) -> Result<SubmissionBackendSelection, SubmissionBackendSelectionError> {
+    use FirmwareRoleTopology::*;
+    use GpuGen::*;
+    use GpuHalGeneration::*;
+    use GpuVariant::*;
+    use SubmissionBackendImplementation::*;
+    use SubmissionBackendProvenance::*;
+    use SubmissionTransport::*;
+
+    match identity {
+        GpuIdentity {
+            gpu_gen: G13,
+            gpu_variant: P | G | S | C,
+            usc_generation: 2,
+            gpu_hal_generation: Legacy,
+            firmware_roles: Single,
+            submission_transport: Classic,
+            uat_input_address_bits: 39,
+        }
+        | GpuIdentity {
+            gpu_gen: G14,
+            gpu_variant: P | G | S | C | D,
+            usc_generation: 2,
+            gpu_hal_generation: Legacy,
+            firmware_roles: Single,
+            submission_transport: Classic,
+            uat_input_address_bits: 39,
+        }
+        | GpuIdentity {
+            gpu_gen: G15,
+            gpu_variant: P,
+            usc_generation: 2,
+            gpu_hal_generation: Legacy,
+            firmware_roles: Single,
+            submission_transport: Classic,
+            uat_input_address_bits: 42,
+        }
+        | GpuIdentity {
+            gpu_gen: G15,
+            gpu_variant: G | S | C | D,
+            usc_generation: 3,
+            gpu_hal_generation: Legacy,
+            firmware_roles: Single,
+            submission_transport: Classic,
+            uat_input_address_bits: 42,
+        }
+        | GpuIdentity {
+            gpu_gen: G16,
+            gpu_variant: G,
+            usc_generation: 3,
+            gpu_hal_generation: Hal200,
+            firmware_roles: Single,
+            submission_transport: Classic,
+            uat_input_address_bits: 42,
+        } => Ok(SubmissionBackendSelection {
+            family: SubmissionBackendFamily::ClassicSku,
+            provenance: KextProven,
+            implementation: ExistingClassic,
+        }),
+        GpuIdentity {
+            gpu_gen: G16,
+            gpu_variant: S | C,
+            usc_generation: 3,
+            gpu_hal_generation: Hal200,
+            firmware_roles: Single,
+            submission_transport: ClassicAndSksm,
+            uat_input_address_bits: 42,
+        } => Ok(SubmissionBackendSelection {
+            family: SubmissionBackendFamily::G16Hal200Sksm,
+            provenance: KextProven,
+            implementation: NotImplemented,
+        }),
+        GpuIdentity {
+            gpu_gen: G17,
+            gpu_variant: P,
+            usc_generation: 3,
+            gpu_hal_generation: Hal200,
+            firmware_roles: Dual,
+            submission_transport: ClassicAndSksm,
+            uat_input_address_bits: 42,
+        } => Ok(T8140_G17P_SUBMISSION_BACKEND),
+        GpuIdentity {
+            gpu_gen: G17,
+            gpu_variant: A,
+            usc_generation: 3,
+            gpu_hal_generation: Hal200,
+            firmware_roles: Dual,
+            submission_transport: ClassicAndSksm,
+            uat_input_address_bits: 42,
+        } => Ok(SubmissionBackendSelection {
+            family: SubmissionBackendFamily::G17Hal200Hybrid,
+            provenance: CrossGenerationDerived,
+            implementation: Unconfirmed,
+        }),
+        GpuIdentity {
+            gpu_gen: G17,
+            gpu_variant: G | S | C,
+            usc_generation: 3,
+            gpu_hal_generation: Hal300,
+            firmware_roles: Dual,
+            submission_transport: Sksm,
+            uat_input_address_bits: 42,
+        } => Ok(SubmissionBackendSelection {
+            family: SubmissionBackendFamily::G17Hal300Sksm,
+            provenance: KextProven,
+            implementation: NotImplemented,
+        }),
+        // G16P is represented by the identity decoder, but the recovered
+        // factory-family contract does not independently admit it here.
+        GpuIdentity {
+            gpu_gen: G16,
+            gpu_variant: P,
+            usc_generation: 3,
+            gpu_hal_generation: Hal200,
+            firmware_roles: Single,
+            submission_transport: Classic,
+            uat_input_address_bits: 42,
+        } => Err(SubmissionBackendSelectionError::UnconfirmedTarget),
+        _ => Err(SubmissionBackendSelectionError::InconsistentIdentity),
+    }
+}
+
+/// Require a backend that this checkout can actually execute.
+pub(crate) const fn require_executable_submission_backend(
+    identity: GpuIdentity,
+) -> Result<SubmissionBackendSelection, SubmissionBackendSelectionError> {
+    let selection = match submission_backend_selection(identity) {
+        Ok(selection) => selection,
+        Err(error) => return Err(error),
+    };
+    match selection.implementation {
+        SubmissionBackendImplementation::ExistingClassic
+        | SubmissionBackendImplementation::T8140G17PFirstPartial => Ok(selection),
+        SubmissionBackendImplementation::NotImplemented => {
+            Err(SubmissionBackendSelectionError::BackendNotImplemented)
+        }
+        SubmissionBackendImplementation::Unconfirmed => {
+            Err(SubmissionBackendSelectionError::UnconfirmedTarget)
+        }
+    }
 }
 
 /// Return the exact data-master channel factory selection for one target.
@@ -2653,6 +2866,96 @@ mod tests {
             assert_eq!(g17_hal300.submission_transport, SubmissionTransport::Sksm);
             assert_eq!(g17_hal300.uat_input_address_bits, 42);
         }
+    }
+
+    #[test]
+    fn submission_backend_family_is_selected_from_the_complete_identity() {
+        let classic = SubmissionBackendSelection {
+            family: SubmissionBackendFamily::ClassicSku,
+            provenance: SubmissionBackendProvenance::KextProven,
+            implementation: SubmissionBackendImplementation::ExistingClassic,
+        };
+        for identity in [
+            id(0x4, 0, 1),
+            id(0x4, 4, 1),
+            id(0x5, 2, 1),
+            id(0x6, 4, 2),
+            id(0x7, 0, 1),
+            id(0x7, 2, 1),
+            id(0x7, 4, 2),
+            id(0xa, 2, 1),
+        ] {
+            assert_eq!(submission_backend_selection(identity), Ok(classic));
+            assert_eq!(require_executable_submission_backend(identity), Ok(classic));
+        }
+
+        let g16_sksm = SubmissionBackendSelection {
+            family: SubmissionBackendFamily::G16Hal200Sksm,
+            provenance: SubmissionBackendProvenance::KextProven,
+            implementation: SubmissionBackendImplementation::NotImplemented,
+        };
+        for identity in [id(0xa, 3, 1), id(0xa, 4, 1)] {
+            assert_eq!(submission_backend_selection(identity), Ok(g16_sksm));
+            assert_eq!(
+                require_executable_submission_backend(identity),
+                Err(SubmissionBackendSelectionError::BackendNotImplemented)
+            );
+        }
+
+        let g17p = id(0xa, 0, 1);
+        assert_eq!(
+            submission_backend_selection(g17p),
+            Ok(T8140_G17P_SUBMISSION_BACKEND)
+        );
+        assert_eq!(
+            require_executable_submission_backend(g17p),
+            Ok(T8140_G17P_SUBMISSION_BACKEND)
+        );
+
+        let g17a = SubmissionBackendSelection {
+            family: SubmissionBackendFamily::G17Hal200Hybrid,
+            provenance: SubmissionBackendProvenance::CrossGenerationDerived,
+            implementation: SubmissionBackendImplementation::Unconfirmed,
+        };
+        assert_eq!(submission_backend_selection(id(0xa, 5, 1)), Ok(g17a));
+        assert_eq!(
+            require_executable_submission_backend(id(0xa, 5, 1)),
+            Err(SubmissionBackendSelectionError::UnconfirmedTarget)
+        );
+
+        let hal300 = SubmissionBackendSelection {
+            family: SubmissionBackendFamily::G17Hal300Sksm,
+            provenance: SubmissionBackendProvenance::KextProven,
+            implementation: SubmissionBackendImplementation::NotImplemented,
+        };
+        for identity in [id(0xb, 2, 1), id(0xb, 3, 1), id(0xb, 4, 1)] {
+            assert_eq!(submission_backend_selection(identity), Ok(hal300));
+            assert_eq!(
+                require_executable_submission_backend(identity),
+                Err(SubmissionBackendSelectionError::BackendNotImplemented)
+            );
+        }
+    }
+
+    #[test]
+    fn submission_backend_selection_does_not_enable_unproven_or_forged_targets() {
+        assert_eq!(
+            submission_backend_selection(id(0x8, 0, 1)),
+            Err(SubmissionBackendSelectionError::UnconfirmedTarget)
+        );
+
+        let mut forged = id(0xa, 0, 1);
+        forged.gpu_hal_generation = GpuHalGeneration::Hal300;
+        assert_eq!(
+            submission_backend_selection(forged),
+            Err(SubmissionBackendSelectionError::InconsistentIdentity)
+        );
+        forged = id(0xb, 2, 1);
+        forged.submission_transport = SubmissionTransport::ClassicAndSksm;
+        assert_eq!(
+            submission_backend_selection(forged),
+            Err(SubmissionBackendSelectionError::InconsistentIdentity)
+        );
     }
 
     #[test]

@@ -53,6 +53,7 @@ pub(crate) struct T8140ManagerConfig {
     pub(crate) secondary_shared_region_delta: u64,
     pub(crate) shared_cluster_size: usize,
     pub(crate) work_channel_count: usize,
+    pub(crate) submission_backend: identity::SubmissionBackendSelection,
 }
 
 /// Exact facts needed to construct, but not execute, a T8140 manager.
@@ -76,6 +77,7 @@ pub(crate) const T8140_MANAGER_CONFIG: T8140ManagerConfig = T8140ManagerConfig {
     secondary_shared_region_delta: g17_initdata::SECONDARY_SHARED_REGION_DELTA,
     shared_cluster_size: g17_initdata::NATIVE_SHARED_CLUSTER_SIZE,
     work_channel_count: g17_initdata::WORK_CHANNEL_COUNT,
+    submission_backend: identity::T8140_G17P_SUBMISSION_BACKEND,
 };
 
 /// Platform-derived SKSM scratch offsets within the mapped accelerator
@@ -182,6 +184,7 @@ pub(crate) enum ConstructionError {
     WrongUatGeometry,
     UndecodableIdentity,
     WrongDecodedIdentity,
+    WrongSubmissionBackend,
     NullUatOwner,
     SplitUatOwner,
     WrongRoleTopology,
@@ -227,6 +230,11 @@ pub(crate) fn validate_target(
         || decoded.uat_input_address_bits != config.uat_ias
     {
         return Err(ConstructionError::WrongDecodedIdentity);
+    }
+    let submission_backend = identity::require_executable_submission_backend(decoded)
+        .map_err(|_| ConstructionError::WrongSubmissionBackend)?;
+    if submission_backend != config.submission_backend {
+        return Err(ConstructionError::WrongSubmissionBackend);
     }
 
     Ok(())
@@ -1715,6 +1723,10 @@ mod tests {
         assert_eq!(T8140_MANAGER_CONFIG.secondary_root_delta, 0x8000);
         assert_eq!(T8140_MANAGER_CONFIG.secondary_shared_region_delta, 0x40000);
         assert_eq!(T8140_MANAGER_CONFIG.shared_cluster_size, 0x28000);
+        assert_eq!(
+            T8140_MANAGER_CONFIG.submission_backend,
+            identity::T8140_G17P_SUBMISSION_BACKEND
+        );
         assert_eq!(T8140_MANAGER_CONFIG.work_channel_count, 12);
     }
 
