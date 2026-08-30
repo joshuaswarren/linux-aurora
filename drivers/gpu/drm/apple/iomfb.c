@@ -41,6 +41,9 @@
 #define APPLE_DCP_LINK_PHASE_PROPERTY	"apple,dcp-link-phase"
 #define APPLE_DCP_LINK_MESSAGE_PROPERTY	"apple,dcp-link-message"
 
+#define DCP25G83_CB197_A412_REQUEST	0x1000100002ULL
+#define DCP25G83_CB197_A412_REPLY	0x42ULL
+
 static int dcp_tx_offset(enum dcp_context_id id)
 {
 	switch (id) {
@@ -320,6 +323,12 @@ void iomfb_link_timeout_snapshot(struct apple_dcp *dcp)
 		 le32_to_cpu(callback->output_size),
 		 callback_input + max_t(u32, le32_to_cpu(callback->input_size), 16) - 16,
 		 callback_output, READ_ONCE(dcp->ch_cb.depth));
+	if (READ_ONCE(dcp->link_cb197_a412_inflight))
+		dev_info(dcp->dev,
+			 "DCP25G83_CB197_SAME_STREAM_A412 timeout: no exact reply %#llx; cmd depth %u top %#x cb depth %u; D102 ACK remained held\n",
+			 DCP25G83_CB197_A412_REPLY, depth,
+			 READ_ONCE(dcp->link_top[false][0]),
+			 READ_ONCE(dcp->ch_cb.depth));
 	if (dcp->link_d563_a2i_count ==
 	    (u8)ARRAY_SIZE(dcp25g83_d563_tail_properties)) {
 		u32 control;
@@ -557,6 +566,13 @@ static int dcp_link_push_context(struct apple_dcp *dcp,
 			 in_len, out_len);
 	}
 	ret = dcp_send_message_sync(dcp, APPLE_DCP_LINK_ENDPOINT, message);
+	if (call_tag == APPLE_DCP_H17P_CALL_IS_MAIN_DISPLAY &&
+	    dcp->link_cb197_a412_inflight)
+		dev_info(dcp->dev,
+			 "DCP25G83_CB197_SAME_STREAM_A412 TX %#llx expected %#llx stream %u remote %u new %u offset %#x size %#x top %#x->%#x depth %u result %d\n",
+			 message, DCP25G83_CB197_A412_REQUEST, stream, remote,
+			 new_stream, offset, payload_size, old_top, next_top,
+			 depth, ret);
 	if (call_tag == APPLE_DCP_H17P_CALL_VI_SET_TEMPERATURE_HINT ||
 	    call_tag == APPLE_DCP_H17P_CALL_PMU_SERVICE_MATCHED ||
 	    call_tag == APPLE_DCP_H17P_CALL_BACKLIGHT_SERVICE_MATCHED)
@@ -626,6 +642,11 @@ static const struct dcp_method_entry dcp_link_pmu_service_matched = {
 static const struct dcp_method_entry dcp_link_backlight_service_matched = {
 	.name = "backlight_service_matched",
 	.tag = { 'A', '1', '3', '2' },
+};
+
+static const struct dcp_method_entry dcp_link_is_main_display = {
+	.name = "is_main_display",
+	.tag = { 'A', '4', '1', '2' },
 };
 
 enum dcp_link_service_match_bit {
@@ -778,6 +799,65 @@ bool dcp_link_defer_service_match(struct apple_dcp *dcp, int tag, void *out,
 	return false;
 }
 
+static void dcp25g83_cb197_a412_complete(struct apple_dcp *dcp, void *out,
+					 void *cookie)
+{
+	u32 value = le32_to_cpup((__le32 *)out);
+	int ret;
+
+	if (!dcp->link_cb197_a412_inflight) {
+		dev_err(dcp->dev,
+			"DCP25G83_CB197_SAME_STREAM_A412 reply without held D102 ACK\n");
+		return;
+	}
+
+	dev_info(dcp->dev,
+		 "DCP25G83_CB197_SAME_STREAM_A412 exact reply %#llx output %#x; release held D102 ACK %#llx\n",
+		 DCP25G83_CB197_A412_REPLY, value,
+		 DCP25G83_CB197_A412_REPLY);
+	ret = dcp_link_ack(dcp, DCP_CONTEXT_CB);
+	dcp->link_cb197_a412_inflight = false;
+	dev_info(dcp->dev,
+		 "DCP25G83_CB197_SAME_STREAM_A412 held D102 ACK %#llx result %d\n",
+		 DCP25G83_CB197_A412_REPLY, ret);
+}
+
+static bool dcp25g83_cb197_a412_probe(struct apple_dcp *dcp, u16 sequence,
+				      int tag,
+				      const struct apple_dcp_link_rpc_view *view)
+{
+	static const char property[] = "SupportRelbufInfoCb";
+	int ret;
+
+	if (dcp->fw_compat != DCP_FIRMWARE_H17P || !dcp->adopted_session ||
+	    dcp->link_abi != APPLE_DCP_LINK_ABI_C3 ||
+	    dcp->link_cb197_a412_inflight || sequence != 197 || tag != 102 ||
+	    view->input_size != 0x44 || view->output_size ||
+	    memcmp(view->input, property, sizeof(property)))
+		return false;
+
+	/*
+	 * Hold only the final D102 reply.  A non-new A412 is pushed on the
+	 * already-active A401 command stream at top 0x10.  Firmware can answer
+	 * it only after the callback197 sender reaches its nested wait loop.
+	 */
+	dcp->link_cb197_a412_inflight = true;
+	ret = dcp_link_push_context(dcp, DCP_CONTEXT_CMD, false,
+				    &dcp_link_is_main_display, 0,
+				    sizeof(__le32), NULL,
+				    dcp25g83_cb197_a412_complete, NULL);
+	if (ret)
+		dev_err(dcp->dev,
+			"DCP25G83_CB197_SAME_STREAM_A412 could not queue at outer top %#x: %d; D102 ACK remains held\n",
+			dcp->link_top[false][0], ret);
+	else
+		dev_info(dcp->dev,
+			 "DCP25G83_CB197_SAME_STREAM_A412 callback %u D%03d ACK held pending exact nested reply %#llx\n",
+			 sequence, tag, DCP25G83_CB197_A412_REPLY);
+
+	return true;
+}
+
 static int dcp_link_ack(struct apple_dcp *dcp,
 			enum dcp_context_id context)
 {
@@ -878,6 +958,14 @@ static void dcp_link_handle_reply(struct apple_dcp *dcp, u64 message)
 		dev_warn(dcp->dev, "DCPLink reply without an active call\n");
 		return;
 	}
+	if (request_call == APPLE_DCP_H17P_CALL_IS_MAIN_DISPLAY &&
+	    dcp->link_cb197_a412_inflight &&
+	    message != DCP25G83_CB197_A412_REPLY) {
+		dev_err(dcp->dev,
+			"DCP25G83_CB197_SAME_STREAM_A412 unexpected reply %#llx expected %#llx; D102 ACK remains held\n",
+			message, DCP25G83_CB197_A412_REPLY);
+		return;
+	}
 
 	depth = dcp_pop_depth(&ch->depth);
 	ret = apple_dcp_link_stack_pop(*top, ch->link_size[depth],
@@ -897,8 +985,6 @@ static void dcp_link_handle_reply(struct apple_dcp *dcp, u64 message)
 		dev_info(dcp->dev,
 			 "DCPLink A401 reply: endpoint %#x request %#llx reply %#llx stream %u remote %u\n",
 			 APPLE_DCP_LINK_ENDPOINT, request, message, stream, remote);
-		dev_info(dcp->dev,
-			 "DCP25G83_C3_CALLBACK_WORKQUEUE A401 reply handled on callback worker\n");
 		if (dcp_link_service_notifier_pending(dcp))
 			schedule_work(&dcp->link_service_match_work);
 	}
@@ -1042,6 +1128,8 @@ static void dcp_link_handle_callback(struct apple_dcp *dcp, u64 message)
 				 handled ? reply : 0);
 	}
 	if (handled) {
+		if (dcp25g83_cb197_a412_probe(dcp, sequence, tag, &view))
+			return;
 		ack_ret = dcp_link_ack(dcp, DCP_CONTEXT_CB);
 		dcp25g83_d563_a2i_end(dcp, d563_tail_index, ack_ret);
 		if (log_callback && sequence >= 165)
@@ -1082,97 +1170,6 @@ static int dcp_link_publish_init(struct apple_dcp *dcp, bool firmware_rendezvous
 out_unlock:
 	mutex_unlock(&dcp->link_init_lock);
 	return ret;
-}
-
-struct dcp_link_rpc_work {
-	struct work_struct dispatch_work;
-	struct work_struct handler_work;
-	struct apple_dcp *dcp;
-	u64 message;
-	u16 sequence;
-	bool reply;
-};
-
-static void dcp_link_rpc_handler_work(struct work_struct *work)
-{
-	struct dcp_link_rpc_work *rpc_work =
-		container_of(work, struct dcp_link_rpc_work, handler_work);
-	struct apple_dcp *dcp = rpc_work->dcp;
-
-	if (!rpc_work->reply && rpc_work->sequence >= 196 &&
-	    rpc_work->sequence <= 197)
-		dev_info(dcp->dev,
-			 "DCP25G83_C3_CALLBACK_WORKQUEUE handle callback %u raw %#llx\n",
-			 rpc_work->sequence, rpc_work->message);
-
-	if (rpc_work->reply)
-		dcp_link_handle_reply(dcp, rpc_work->message);
-	else
-		dcp_link_handle_callback(dcp, rpc_work->message);
-
-	kfree(rpc_work);
-}
-
-static void dcp_link_rpc_dispatch_work(struct work_struct *work)
-{
-	struct dcp_link_rpc_work *rpc_work =
-		container_of(work, struct dcp_link_rpc_work, dispatch_work);
-	struct apple_dcp *dcp = rpc_work->dcp;
-
-	if (!queue_work(dcp->link_callback_wq, &rpc_work->handler_work)) {
-		dev_err(dcp->dev,
-			"DCP25G83_C3_CALLBACK_WORKQUEUE could not dispatch raw %#llx\n",
-			rpc_work->message);
-		kfree(rpc_work);
-	}
-}
-
-static int dcp_link_queue_rpc_work(struct apple_dcp *dcp, u64 message)
-{
-	struct dcp_link_rpc_work *rpc_work;
-	bool reply = (message & GENMASK_ULL(7, 6)) == BIT_ULL(6);
-	u16 sequence = reply ? READ_ONCE(dcp->link_reply_log_count) :
-			       READ_ONCE(dcp->link_rx_log_count);
-
-	if (!dcp->link_callback_wq)
-		return -ENODEV;
-
-	rpc_work = kzalloc_obj(*rpc_work, GFP_KERNEL);
-	if (!rpc_work)
-		return -ENOMEM;
-
-	/*
-	 * A firmware callback is synchronous: its shared RPC record remains
-	 * stable until this worker sends the acknowledgment.
-	 */
-	rpc_work->dcp = dcp;
-	rpc_work->message = message;
-	rpc_work->sequence = sequence;
-	rpc_work->reply = reply;
-	INIT_WORK(&rpc_work->dispatch_work, dcp_link_rpc_dispatch_work);
-	INIT_WORK(&rpc_work->handler_work, dcp_link_rpc_handler_work);
-	if (!dcp_queue_rtkit_work(dcp, &rpc_work->dispatch_work)) {
-		kfree(rpc_work);
-		return -EALREADY;
-	}
-
-	if (!reply && sequence >= 196 && sequence <= 197)
-		dev_info(dcp->dev,
-			 "DCP25G83_C3_CALLBACK_WORKQUEUE enqueue callback %u raw %#llx behind RTKit RX\n",
-			 sequence, message);
-
-	return 0;
-}
-
-static void dcp_link_callback_wq_destroy(void *data)
-{
-	struct apple_dcp *dcp = data;
-
-	if (!dcp->link_callback_wq)
-		return;
-
-	destroy_workqueue(dcp->link_callback_wq);
-	dcp->link_callback_wq = NULL;
 }
 
 static void dcp_link_recv_msg(struct apple_dcp *dcp, u64 message)
@@ -1241,10 +1238,10 @@ static void dcp_link_recv_msg(struct apple_dcp *dcp, u64 message)
 		return;
 	}
 
-	if (dcp_link_queue_rpc_work(dcp, message))
-		dev_err(dcp->dev,
-			"DCP25G83_C3_CALLBACK_WORKQUEUE could not queue raw %#llx\n",
-			message);
+	if ((message & GENMASK_ULL(7, 6)) == BIT_ULL(6))
+		dcp_link_handle_reply(dcp, message);
+	else
+		dcp_link_handle_callback(dcp, message);
 }
 
 static int dcp_link_start_rtkit(struct apple_dcp *dcp)
@@ -1253,25 +1250,11 @@ static int dcp_link_start_rtkit(struct apple_dcp *dcp)
 	u64 init_message;
 	int ret;
 
-	if (!dcp->link_callback_wq) {
-		dcp->link_callback_wq =
-			alloc_ordered_workqueue("dcp-link-callback-%s",
-						WQ_HIGHPRI | WQ_MEM_RECLAIM,
-						dev_name(dcp->dev));
-		if (!dcp->link_callback_wq)
-			return -ENOMEM;
-		ret = devm_add_action_or_reset(dcp->dev,
-					       dcp_link_callback_wq_destroy, dcp);
-		if (ret)
-			return ret;
-	}
-	dev_info(dcp->dev,
-		 "DCP25G83_C3_CALLBACK_WORKQUEUE armed; RPC callbacks and replies serialized off RTKit RX\n");
-
 	INIT_WORK(&dcp->link_service_match_work, dcp_link_service_match_work);
 	dcp->link_service_match_state = 0;
 	dcp->link_service_match_output = NULL;
 	dcp->link_service_match_callback_tag = 0;
+	dcp->link_cb197_a412_inflight = false;
 	dcp->link_d563_a2i_count = 0;
 	dcp->link_d563_a2i_ep1_observed = false;
 	memset(dcp->link_d563_a2i_before, 0,
@@ -1982,13 +1965,8 @@ void iomfb_shutdown(struct apple_dcp *dcp)
 	/* We're going down */
 	dcp->active = false;
 	dcp->valid_mode = false;
-	if (dcp->fw_compat == DCP_FIRMWARE_H17P) {
-		if (dcp->link_callback_wq)
-			flush_workqueue(dcp->link_callback_wq);
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P)
 		cancel_work_sync(&dcp->link_service_match_work);
-		if (dcp->link_callback_wq)
-			flush_workqueue(dcp->link_callback_wq);
-	}
 
 	switch (dcp->fw_compat) {
 	case DCP_FIRMWARE_V_12_3:

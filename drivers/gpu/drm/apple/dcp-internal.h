@@ -14,7 +14,6 @@
 #include <linux/platform_device.h>
 #include <linux/scatterlist.h>
 #include <linux/usb/typec_mux.h>
-#include <linux/workqueue.h>
 
 #include "dcp-link.h"
 #include "dptxep.h"
@@ -194,7 +193,7 @@ struct apple_dcp {
 	u64 link_init_message;
 	u16 link_rx_log_count;
 	u16 link_reply_log_count;
-	struct workqueue_struct *link_callback_wq;
+	bool link_cb197_a412_inflight;
 	u32 link_d563_a2i_before[5];
 	u32 link_d563_a2i_after[5];
 	u8 link_d563_a2i_count;

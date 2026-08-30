@@ -1022,15 +1022,6 @@ int dcp_start_rtkit_endpoint(struct apple_dcp *dcp, u8 endpoint)
 	return ret;
 }
 
-bool dcp_queue_rtkit_work(struct apple_dcp *dcp, struct work_struct *work)
-{
-	if (!dcp || !dcp->rtk || !dcp->rtk->wq || !work)
-		return false;
-
-	/* The ordered queue runs this only after the current RX work returns. */
-	return queue_work(dcp->rtk->wq, work);
-}
-
 int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state *state)
 {
 	struct platform_device *pdev = to_apple_crtc(crtc)->dcp;
