@@ -742,6 +742,32 @@ impl UatPageTable {
         ias: u8,
         oas: u32,
     ) -> Result {
+        Self::copy_from_phys_root_inner(ttb, address, out, ias, oas, false)
+    }
+
+    /// Copy a live firmware-owned DVA after invalidating every page-table and
+    /// payload cacheline before it is read. This is the dynamic-pointer form
+    /// of [`Self::copy_live_firmware_physical_range`].
+    #[cfg(CONFIG_DEV_COREDUMP)]
+    pub(crate) fn copy_live_from_phys_root(
+        ttb: PhysicalAddr,
+        address: u64,
+        out: &mut [u8],
+        ias: u8,
+        oas: u32,
+    ) -> Result {
+        Self::copy_from_phys_root_inner(ttb, address, out, ias, oas, true)
+    }
+
+    #[cfg(CONFIG_DEV_COREDUMP)]
+    fn copy_from_phys_root_inner(
+        ttb: PhysicalAddr,
+        address: u64,
+        out: &mut [u8],
+        ias: u8,
+        oas: u32,
+        live: bool,
+    ) -> Result {
         if out.is_empty() || (ttb | address | out.len() as u64) & 7 != 0 {
             return Err(EINVAL);
         }
@@ -763,6 +789,9 @@ impl UatPageTable {
                 let shift = UAT_PGBIT + (level + 1) * UAT_LVBIT;
                 let index = ((iova_page >> shift) & UAT_LVMSK) as usize;
                 let table = PhysPageMapping::new(table_phys)?;
+                if live {
+                    table.invalidate_live_range(index * PTE_SIZE, PTE_SIZE)?;
+                }
                 let pte = table.read_u64(index * PTE_SIZE)?;
                 if pte & PTE_TYPE_BITS != PTE_TYPE_LEAF_TABLE {
                     pr_err!(
@@ -779,6 +808,9 @@ impl UatPageTable {
 
             let leaf_index = ((iova_page >> UAT_PGBIT) & UAT_LVMSK) as usize;
             let leaf_table = PhysPageMapping::new(table_phys)?;
+            if live {
+                leaf_table.invalidate_live_range(leaf_index * PTE_SIZE, PTE_SIZE)?;
+            }
             let leaf = leaf_table.read_u64(leaf_index * PTE_SIZE)?;
             if leaf & PTE_TYPE_BITS != PTE_TYPE_LEAF_TABLE {
                 pr_err!(
@@ -797,6 +829,9 @@ impl UatPageTable {
             let payload = PhysPageMapping::new(payload_phys)?;
             let offset = (iova & page_mask) as usize;
             let length = (UAT_PGSZ - offset).min(out.len() - copied);
+            if live {
+                payload.invalidate_live_range(offset, length)?;
+            }
             payload.copy_atomic(offset, &mut out[copied..copied + length])?;
             copied = copied.checked_add(length).ok_or(EOVERFLOW)?;
         }

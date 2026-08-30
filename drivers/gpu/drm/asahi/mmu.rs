@@ -251,6 +251,33 @@ impl FirmwarePageTableRoot {
         )?;
         Ok(data)
     }
+
+    /// Copy live firmware-owned memory through this root with cache
+    /// invalidation before every page-table and payload load.
+    #[cfg(CONFIG_DEV_COREDUMP)]
+    pub(crate) fn copy_live_firmware_range(
+        &self,
+        address: u64,
+        size: usize,
+    ) -> Result<KVVec<u8>> {
+        if size == 0 {
+            return Err(EINVAL);
+        }
+        let geometry = uat_geometry(self.cfg)?;
+        let end = address.checked_add(size as u64).ok_or(EOVERFLOW)?;
+        if end > geometry.user_va_top() {
+            return Err(EFAULT);
+        }
+        let mut data = KVVec::from_elem(0, size, GFP_KERNEL)?;
+        UatPageTable::copy_live_from_phys_root(
+            self.ttb,
+            address,
+            &mut data,
+            self.cfg.ias,
+            self.cfg.oas,
+        )?;
+        Ok(data)
+    }
 }
 
 /// Retained read-only access to the live TTBAT. RTKit can replace context 0's
