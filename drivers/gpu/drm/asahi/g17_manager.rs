@@ -15,7 +15,24 @@ use kernel::prelude::*;
 use kernel::time::{delay::fsleep, Delta};
 
 #[cfg(not(test))]
-use core::sync::atomic::{fence, Ordering};
+use core::sync::atomic::{fence, AtomicU32, Ordering};
+
+#[cfg(not(test))]
+pub(crate) const G17P_SUBMIT_PHASE_IDLE: u32 = 0;
+#[cfg(not(test))]
+pub(crate) const G17P_SUBMIT_PHASE_B2: u32 = 1;
+#[cfg(not(test))]
+pub(crate) const G17P_SUBMIT_PHASE_TAG15: u32 = 2;
+#[cfg(not(test))]
+pub(crate) const G17P_SUBMIT_PHASE_QID: u32 = 3;
+#[cfg(not(test))]
+pub(crate) const G17P_SUBMIT_PHASE_SKSM_ENTRY: u32 = 4;
+#[cfg(not(test))]
+pub(crate) const G17P_SUBMIT_PHASE_TAG16: u32 = 5;
+#[cfg(not(test))]
+pub(crate) const G17P_SUBMIT_PHASE_ADD_KICKS: u32 = 6;
+#[cfg(not(test))]
+pub(crate) const G17P_SUBMIT_PHASE_CL2: u32 = 7;
 
 #[cfg(not(test))]
 use crate::{
@@ -418,6 +435,7 @@ pub(crate) struct G17PManagerConstruction {
     render_tracker: Option<G17PPartialOpeningRenderTracker>,
     render_bind: Option<mmu::VmBind>,
     render_submission_ordinal: u32,
+    accepted_firmware_recovery_generation: u64,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -543,6 +561,7 @@ impl G17PManagerConstruction {
                 render_tracker: None,
                 render_bind: None,
                 render_submission_ordinal: 0,
+                accepted_firmware_recovery_generation: 0,
             },
             GFP_KERNEL,
         )?)
@@ -570,10 +589,60 @@ impl G17PManagerConstruction {
         self.resources.status_a_snapshot()
     }
 
-    pub(crate) fn hardware_init_handshake_snapshot(
+    pub(crate) fn firmware_recovery_handshake_snapshot(
         &mut self,
-    ) -> Result<g17_resources::G17PHardwareInitHandshakeSnapshot> {
-        self.resources.hardware_init_handshake_snapshot()
+    ) -> Result<g17_resources::G17PFirmwareRecoveryHandshakeSnapshot> {
+        self.resources.firmware_recovery_handshake_snapshot()
+    }
+
+    pub(crate) fn drain_primary_firmware_event(
+        &mut self,
+    ) -> Result<Option<g17_resources::G17PPrimaryFirmwareEventRecord>> {
+        self.resources.drain_primary_firmware_event()
+    }
+
+    pub(crate) fn primary_firmware_recovery_cause_snapshot(
+        &mut self,
+    ) -> Result<g17_resources::G17PFirmwareRecoveryCauseSnapshot> {
+        self.resources.primary_firmware_recovery_cause_snapshot()
+    }
+
+    pub(crate) fn primary_firmware_recovery_info_snapshot(
+        &mut self,
+    ) -> Result<g17_resources::G17PFirmwareRecoveryInfoSnapshot> {
+        self.resources.primary_firmware_recovery_info_snapshot()
+    }
+
+    /// Accept one firmware-initiated recovery before Linux has constructed a
+    /// queue, fence, or user submission. Native macOS compares the packet to
+    /// its host-side accepted generation and increments that generation before
+    /// it publishes recovery state 2.
+    pub(crate) fn accept_empty_primary_firmware_recovery(
+        &mut self,
+        packet_generation: u64,
+    ) -> Result<u64> {
+        if packet_generation != self.accepted_firmware_recovery_generation {
+            return Err(EIO);
+        }
+        if self.render_storage.is_some()
+            || self.render_tracker.is_some()
+            || self.render_bind.is_some()
+            || self.render_submission_ordinal != 0
+        {
+            return Err(EBUSY);
+        }
+        self.accepted_firmware_recovery_generation =
+            self.accepted_firmware_recovery_generation.wrapping_add(1);
+        Ok(self.accepted_firmware_recovery_generation)
+    }
+
+    pub(crate) fn acknowledge_primary_firmware_recovery(
+        &mut self,
+        expected: u32,
+        next: u32,
+    ) -> Result {
+        self.resources
+            .acknowledge_primary_firmware_recovery(expected, next)
     }
 
     /// Verify the untouched native pre-user root phase. The first real user
@@ -1055,6 +1124,7 @@ impl G17PManagerConstruction {
             return Err(EBUSY);
         }
         self.resources.reset_session_after_processor_stop()?;
+        self.accepted_firmware_recovery_generation = 0;
         Ok(())
     }
 
@@ -1244,6 +1314,34 @@ impl G17PManagerConstruction {
             return Err(EINVAL);
         }
         Ok(queue.queue_id)
+    }
+
+    /// Prove that a prepared compute queue is still host-only and has never
+    /// been registered, published, kicked, or assigned a command timestamp.
+    pub(crate) fn validate_prepublication_compute_queue(
+        &self,
+        queue: &G17PSksmQueue,
+    ) -> Result {
+        if queue.scratch != self.sksm_scratch()
+            || queue.uat_owner != self.uat().ttb_base()
+            || queue.hardware_state != G17PSksmQueueHardwareState::PreparedMemory
+            || queue.submission_ordinal != 0
+            || queue.b2_activation != g17_submission::G17PClB2ActivationState::Pending
+            || queue.producer.submitted != 0
+            || queue.producer.current_timestamp != queue.producer.geometry.timestamp_seed()
+            || queue.producer.last_add_kicks_timestamp
+                != queue.producer.geometry.timestamp_seed()
+            || queue.producer.base_timestamp != queue.producer.geometry.timestamp_seed()
+            || queue.producer.previous_valid
+            || queue.producer.previous_timestamp != 0
+            || queue.producer.queue_id != queue.queue_id
+            || !queue.direct_lifecycle.queue_config_dirty
+            || queue.direct_lifecycle.cached_channel_identity != 0
+            || queue.direct_lifecycle.next_correlation_token != 1
+        {
+            return Err(EBUSY);
+        }
+        Ok(())
     }
 
     pub(crate) fn bind_compute_user_vm(
@@ -1449,6 +1547,7 @@ impl G17PManagerConstruction {
         &mut self,
         registers: &regs::Resources,
         queue: &mut G17PSksmQueue,
+        submission_phase: &AtomicU32,
         binding: &G17PComputeUserBinding,
         command: &g17_uapi::TranslatedComputeCommand,
         context: G17PComputeSubmissionContext<'_>,
@@ -1581,13 +1680,16 @@ impl G17PManagerConstruction {
             return Err(EINVAL);
         }
         self.publish_compute_b2_once(queue)?;
+        submission_phase.store(G17P_SUBMIT_PHASE_B2, Ordering::Release);
         queue
             .compute
             .publish_initial_config_update_pointer(group)?;
+        submission_phase.store(G17P_SUBMIT_PHASE_TAG15, Ordering::Release);
         // Native submitBuffer publishes tag 15 before the dirty queue's
         // configureHardware vcall. The four QID stores must therefore occur
         // here: after ConfigUpdate is visible, before the SKSM entry body.
         self.register_prepared_compute_sksm_queue(registers, queue)?;
+        submission_phase.store(G17P_SUBMIT_PHASE_QID, Ordering::Release);
         dev_info!(
             self.resources.dev().as_ref(),
             "G17P submitBuffer/configureHardware: tag15 published, then QID 4 configured and enabled; writing first SKSM entry\n"
@@ -1599,6 +1701,7 @@ impl G17PManagerConstruction {
         )?;
         fence(Ordering::SeqCst);
         queue.producer = prepared_entry.producer_after;
+        submission_phase.store(G17P_SUBMIT_PHASE_SKSM_ENTRY, Ordering::Release);
         let descriptor_generation =
             g17_submission::advance_g17p_compute_descriptor_generation(0, 0)
                 .map_err(|_| EINVAL)?;
@@ -1606,14 +1709,17 @@ impl G17PManagerConstruction {
         queue
             .compute
             .publish_initial_entry_signal(&entry_signal)?;
+        submission_phase.store(G17P_SUBMIT_PHASE_TAG16, Ordering::Release);
         // AGXFirmware::submitCLChannel first reconciles the already-published
         // inner group with SKSM, then makes the classic outer slot visible.
         self.add_sksm_kicks(registers, queue, 1)?;
         queue.producer.last_add_kicks_timestamp = prepared_entry.current_timestamp;
         fence(Ordering::SeqCst);
+        submission_phase.store(G17P_SUBMIT_PHASE_ADD_KICKS, Ordering::Release);
         let prepared = self
             .resources
             .publish_compute_channel(group.queue, group.write_index)?;
+        submission_phase.store(G17P_SUBMIT_PHASE_CL2, Ordering::Release);
         if lifecycle.notifications.activation != Some(prepared.doorbell) {
             return Err(EINVAL);
         }
@@ -1641,6 +1747,7 @@ impl G17PManagerConstruction {
         &mut self,
         registers: &regs::Resources,
         queue: &mut G17PSksmQueue,
+        submission_phase: &AtomicU32,
         binding: &G17PComputeUserBinding,
         command: &g17_uapi::TranslatedComputeCommand,
         context: G17PComputeSubmissionContext<'_>,
@@ -1653,7 +1760,13 @@ impl G17PManagerConstruction {
         if let Some(buffers) = command.g17p_add3_buffers {
             return self
                 .submit_translated_add3_channel(
-                    registers, queue, binding, command, context, buffers,
+                    registers,
+                    queue,
+                    submission_phase,
+                    binding,
+                    command,
+                    context,
+                    buffers,
                 )
                 .map(Some);
         }
