@@ -46,7 +46,10 @@ pub(crate) const EXECUTABLE_T8140_ROLE_RESOURCES_AVAILABLE: bool = true;
 #[cfg(not(test))]
 const ROOT_PAIR_ALLOC_SIZE: usize = 0xc000;
 const PRIMARY_STATUS_A_STATE_GRID_OFFSET: u64 = 0xee40;
+const PRIMARY_STATUS_A_WORK_SCAN_OFFSET: u64 = 0x0c;
 const PRIMARY_STATUS_A_RUNTIME_OFFSET: u64 = 0x10;
+const PRIMARY_STATUS_A_WORK_SCAN_STATE_GRID_OFFSET: u64 =
+    PRIMARY_STATUS_A_STATE_GRID_OFFSET + PRIMARY_STATUS_A_WORK_SCAN_OFFSET;
 const PRIMARY_STATUS_A_RUNTIME_STATE_GRID_OFFSET: u64 =
     PRIMARY_STATUS_A_STATE_GRID_OFFSET + PRIMARY_STATUS_A_RUNTIME_OFFSET;
 const SECONDARY_EXTRA_0_BEFORE_PRIMARY_STATUS_A: u64 = 0x6c0;
@@ -664,10 +667,13 @@ pub(crate) struct G17PControlPointerSnapshot {
 }
 
 /// Cache-safe Status-A state written through the primary WC/firmware-uncached
-/// state grid. Exact J700 A000 consumers read `active` at Status-A `+0x10`
-/// and `scheduler_constructed` in the adjacent high word.
+/// state grid. Exact J700 A000 writes the full work-scan flag at Status-A
+/// `+0x0c`, then exposes `active` at `+0x10` and `scheduler_constructed` in
+/// the adjacent high word.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct G17PStatusASnapshot {
+    pub(crate) scan_address: u64,
+    pub(crate) scan_active: u32,
     pub(crate) address: u64,
     pub(crate) raw: u64,
     pub(crate) active: u32,
@@ -675,8 +681,10 @@ pub(crate) struct G17PStatusASnapshot {
 }
 
 impl G17PStatusASnapshot {
-    const fn decode(address: u64, raw: u64) -> Self {
+    const fn decode(scan_address: u64, scan_active: u32, address: u64, raw: u64) -> Self {
         Self {
+            scan_address,
+            scan_active,
             address,
             raw,
             active: raw as u32,
@@ -4256,30 +4264,43 @@ impl G17ResourceOwner {
         })
     }
 
-    /// Read primary Status-A `+0x10` through the existing WC object. Firmware
-    /// maps this host-owned state grid uncached, so this snapshot does not rely
-    /// on observing dirty private firmware cachelines.
+    /// Read primary Status-A `+0x0c/+0x10/+0x14` through the existing WC
+    /// object. Firmware maps this host-owned state grid uncached, so this
+    /// snapshot does not rely on dirty private firmware cachelines.
     pub(crate) fn status_a_snapshot(&mut self) -> Result<G17PStatusASnapshot> {
+        let scan_address = self
+            .handoff
+            .primary
+            .state_grid
+            .checked_add(PRIMARY_STATUS_A_WORK_SCAN_STATE_GRID_OFFSET)
+            .ok_or(EINVAL)?;
         let address = self
             .handoff
             .primary
             .state_grid
             .checked_add(PRIMARY_STATUS_A_RUNTIME_STATE_GRID_OFFSET)
             .ok_or(EINVAL)?;
-        if address
-            != self
-                .handoff
-                .primary
-                .instance
-                .status_a
-                .checked_add(PRIMARY_STATUS_A_RUNTIME_OFFSET)
+        let status_a = self.handoff.primary.instance.status_a;
+        if scan_address
+            != status_a
+                .checked_add(PRIMARY_STATUS_A_WORK_SCAN_OFFSET)
                 .ok_or(EINVAL)?
+            || address
+                != status_a
+                    .checked_add(PRIMARY_STATUS_A_RUNTIME_OFFSET)
+                    .ok_or(EINVAL)?
         {
             return Err(EINVAL);
         }
         core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        let scan_active = self.resources.primary_state.read_u32(scan_address)?;
         let raw = self.resources.primary_state.read_u64(address)?;
-        Ok(G17PStatusASnapshot::decode(address, raw))
+        Ok(G17PStatusASnapshot::decode(
+            scan_address,
+            scan_active,
+            address,
+            raw,
+        ))
     }
 
     pub(crate) fn control_opening_effect(&mut self) -> Result<G17PControlOpeningEffect> {
@@ -6846,12 +6867,22 @@ mod tests {
     }
 
     #[test]
-    fn status_a_runtime_word_is_exact_and_decodes_both_u32_fields() {
+    fn status_a_scan_and_runtime_words_are_exact() {
         assert_eq!(PRIMARY_STATUS_A_STATE_GRID_OFFSET, 0xee40);
+        assert_eq!(PRIMARY_STATUS_A_WORK_SCAN_OFFSET, 0x0c);
         assert_eq!(PRIMARY_STATUS_A_RUNTIME_OFFSET, 0x10);
+        assert_eq!(PRIMARY_STATUS_A_WORK_SCAN_STATE_GRID_OFFSET, 0xee4c);
         assert_eq!(PRIMARY_STATUS_A_RUNTIME_STATE_GRID_OFFSET, 0xee50);
+        let scan_address = KERN + PRIMARY_STATUS_A_WORK_SCAN_STATE_GRID_OFFSET;
         let address = KERN + PRIMARY_STATUS_A_RUNTIME_STATE_GRID_OFFSET;
-        let snapshot = G17PStatusASnapshot::decode(address, 0xaabb_ccdd_1122_3344);
+        let snapshot = G17PStatusASnapshot::decode(
+            scan_address,
+            0x55aa_55aa,
+            address,
+            0xaabb_ccdd_1122_3344,
+        );
+        assert_eq!(snapshot.scan_address, scan_address);
+        assert_eq!(snapshot.scan_active, 0x55aa_55aa);
         assert_eq!(snapshot.address, address);
         assert_eq!(snapshot.raw, 0xaabb_ccdd_1122_3344);
         assert_eq!(snapshot.active, 0x1122_3344);
