@@ -21,20 +21,21 @@
 
 #![allow(dead_code)]
 
-use core::sync::atomic::{fence, AtomicBool, AtomicU32, Ordering};
+use core::{
+    mem::MaybeUninit,
+    sync::atomic::{fence, AtomicBool, AtomicU32, Ordering},
+};
 
 use kernel::macros::vtable;
 use kernel::{
+    bindings,
     device::Core,
+    error::{from_err_ptr, to_result},
+    io::{Io, Mmio, MmioRaw},
     iosys_map::IoSysMapRef,
     platform,
     prelude::*,
-    soc::apple::{
-        mailbox::{
-            AscwrapV6Lifecycle, AscwrapV6MailboxSnapshot, AscwrapV6Provider, AscwrapV6Role,
-        },
-        rtkit,
-    },
+    soc::apple::rtkit,
     sync::Arc,
     time::{delay::fsleep, Delta},
 };
@@ -96,12 +97,147 @@ fn log_g17p_scheduler_gate_registers(
     }
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+struct G17PMailboxSnapshot {
+    a2i_control: u32,
+    i2a_control: u32,
+}
+
+impl G17PMailboxSnapshot {
+    const fn count(control: u32) -> u8 {
+        ((control >> 20) & 0xf) as u8
+    }
+
+    const fn read_pointer(control: u32) -> u8 {
+        ((control >> 12) & 0xf) as u8
+    }
+
+    const fn write_pointer(control: u32) -> u8 {
+        ((control >> 8) & 0xf) as u8
+    }
+
+    const fn empty(control: u32) -> bool {
+        control & (1 << 17) != 0
+    }
+
+    const fn full(control: u32) -> bool {
+        control & (1 << 16) != 0
+    }
+
+    const fn enabled(control: u32) -> bool {
+        control & 1 != 0
+    }
+}
+
+/// Module-local, read-only view of one existing ASCWrap mailbox provider.
+///
+/// The C provider owns the mapping and all lifecycle transitions. This view
+/// neither maps an alias nor changes callback ownership; it only borrows the
+/// provider's established mailbox-register pointer for two control reads.
+struct G17PMailboxProvider {
+    mbox: *mut bindings::apple_mbox,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum G17PAscwrapV6Role {
+    Gfx,
+    Gfx1,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+struct G17PAscwrapV6Lifecycle {
+    role: G17PAscwrapV6Role,
+    wrapper: (u64, u64),
+    iop_vbar: (u64, u64),
+    missing: u32,
+}
+
+impl G17PMailboxProvider {
+    fn get(dev: &kernel::device::Device, index: usize) -> Result<Self> {
+        // SAFETY: `dev` is live and apple_mbox_get() establishes a device link
+        // to keep the resolved provider alive for this consumer.
+        let mbox = unsafe {
+            from_err_ptr(bindings::apple_mbox_get(
+                dev.as_raw(),
+                index.try_into()?,
+            ))?
+        };
+        Ok(Self { mbox })
+    }
+
+    fn lifecycle(&self) -> Result<G17PAscwrapV6Lifecycle> {
+        let mut raw = MaybeUninit::<bindings::apple_mbox_ascwrap_v6_lifecycle>::uninit();
+        // SAFETY: `self.mbox` is the live provider returned by
+        // apple_mbox_get() and `raw` points to writable storage.
+        to_result(unsafe {
+            bindings::apple_mbox_ascwrap_v6_get_lifecycle(self.mbox, raw.as_mut_ptr())
+        })?;
+        // SAFETY: the successful C call initialized every field.
+        let raw = unsafe { raw.assume_init() };
+        let role = match raw.role as u32 {
+            1 => G17PAscwrapV6Role::Gfx,
+            2 => G17PAscwrapV6Role::Gfx1,
+            _ => return Err(EINVAL),
+        };
+        Ok(G17PAscwrapV6Lifecycle {
+            role,
+            wrapper: (raw.wrapper_start, raw.wrapper_size),
+            iop_vbar: (raw.iop_vbar_start, raw.iop_vbar_size),
+            missing: raw.missing,
+        })
+    }
+
+    fn require_safe_cpu_lifecycle(&self) -> Result {
+        // SAFETY: this is a capability check on the live provider pointer.
+        to_result(unsafe {
+            bindings::apple_mbox_ascwrap_v6_require_safe_cpu_lifecycle(self.mbox)
+        })
+    }
+
+    fn start_cpu(&self) -> Result {
+        // SAFETY: lifecycle serialization and MMIO ownership remain in C.
+        to_result(unsafe { bindings::apple_mbox_ascwrap_v6_start_cpu(self.mbox) })
+    }
+
+    fn stop_cpu(&self) -> Result {
+        // SAFETY: lifecycle serialization and MMIO ownership remain in C.
+        to_result(unsafe { bindings::apple_mbox_ascwrap_v6_stop_cpu(self.mbox) })
+    }
+
+    fn snapshot(&self) -> Result<G17PMailboxSnapshot> {
+        const A2I_CONTROL: usize = 0x110;
+        const I2A_CONTROL: usize = 0x114;
+        const CONTROL_WINDOW_SIZE: usize = I2A_CONTROL + core::mem::size_of::<u32>();
+
+        // SAFETY: the provider's mapping starts at the ASC mailbox block and
+        // its T8140 probe validated the enclosing 0x88000 ASCWrap resource.
+        // The consumer device link established by `get` keeps it live.
+        let raw = MmioRaw::<CONTROL_WINDOW_SIZE>::new(
+            unsafe { (*self.mbox).regs as usize },
+            CONTROL_WINDOW_SIZE,
+        )?;
+        // SAFETY: `raw` describes the live provider-owned mapping and the two
+        // reads below are bounded to the standard ASC control window.
+        let regs = unsafe { Mmio::from_raw(&raw) }.relaxed();
+        Ok(G17PMailboxSnapshot {
+            a2i_control: regs.read32(A2I_CONTROL),
+            i2a_control: regs.read32(I2A_CONTROL),
+        })
+    }
+}
+
+// SAFETY: the provider mapping is device-link protected and the reader issues
+// only relaxed MMIO reads. Mailbox mutation remains synchronized in C.
+unsafe impl Send for G17PMailboxProvider {}
+// SAFETY: as above; concurrent snapshots do not change either FIFO.
+unsafe impl Sync for G17PMailboxProvider {}
+
 fn log_g17p_mailbox_snapshot(
     dev: &kernel::device::Device,
-    provider: &AscwrapV6Provider,
+    mailbox: &G17PMailboxProvider,
     checkpoint: &'static str,
 ) {
-    match provider.mailbox_snapshot() {
+    match mailbox.snapshot() {
         Ok(snapshot) => {
             let a2i = snapshot.a2i_control;
             let i2a = snapshot.i2a_control;
@@ -110,19 +246,19 @@ fn log_g17p_mailbox_snapshot(
                 "G17P mailbox-control checkpoint={} a2i={:#x} count={} empty={} full={} read={} write={} enabled={} i2a={:#x} count={} empty={} full={} read={} write={} enabled={}\n",
                 checkpoint,
                 a2i,
-                AscwrapV6MailboxSnapshot::count(a2i),
-                AscwrapV6MailboxSnapshot::empty(a2i),
-                AscwrapV6MailboxSnapshot::full(a2i),
-                AscwrapV6MailboxSnapshot::read_pointer(a2i),
-                AscwrapV6MailboxSnapshot::write_pointer(a2i),
-                AscwrapV6MailboxSnapshot::enabled(a2i),
+                G17PMailboxSnapshot::count(a2i),
+                G17PMailboxSnapshot::empty(a2i),
+                G17PMailboxSnapshot::full(a2i),
+                G17PMailboxSnapshot::read_pointer(a2i),
+                G17PMailboxSnapshot::write_pointer(a2i),
+                G17PMailboxSnapshot::enabled(a2i),
                 i2a,
-                AscwrapV6MailboxSnapshot::count(i2a),
-                AscwrapV6MailboxSnapshot::empty(i2a),
-                AscwrapV6MailboxSnapshot::full(i2a),
-                AscwrapV6MailboxSnapshot::read_pointer(i2a),
-                AscwrapV6MailboxSnapshot::write_pointer(i2a),
-                AscwrapV6MailboxSnapshot::enabled(i2a),
+                G17PMailboxSnapshot::count(i2a),
+                G17PMailboxSnapshot::empty(i2a),
+                G17PMailboxSnapshot::full(i2a),
+                G17PMailboxSnapshot::read_pointer(i2a),
+                G17PMailboxSnapshot::write_pointer(i2a),
+                G17PMailboxSnapshot::enabled(i2a),
             )
         }
         Err(error) => dev_err!(
@@ -671,27 +807,27 @@ impl rtkit::Operations for G17PRtkitOps {
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 struct ExpectedProvider {
-    role: AscwrapV6Role,
+    role: G17PAscwrapV6Role,
     wrapper: (u64, u64),
     iop_vbar: (u64, u64),
 }
 
 const GFX_PROVIDER: ExpectedProvider = ExpectedProvider {
-    role: AscwrapV6Role::Gfx,
+    role: G17PAscwrapV6Role::Gfx,
     wrapper: (0x4826_00000, 0x88000),
     iop_vbar: (0x4820_50000, 0x8),
 };
 
 const GFX1_PROVIDER: ExpectedProvider = ExpectedProvider {
-    role: AscwrapV6Role::Gfx1,
+    role: G17PAscwrapV6Role::Gfx1,
     wrapper: (0x482e_00000, 0x88000),
     iop_vbar: (0x4828_50000, 0x8),
 };
 
 fn validate_provider(
-    provider: &AscwrapV6Provider,
+    provider: &G17PMailboxProvider,
     expected: ExpectedProvider,
-) -> Result<AscwrapV6Lifecycle> {
+) -> Result<G17PAscwrapV6Lifecycle> {
     let lifecycle = provider.lifecycle()?;
     if lifecycle.role != expected.role
         || lifecycle.wrapper != expected.wrapper
@@ -703,20 +839,20 @@ fn validate_provider(
     Ok(lifecycle)
 }
 
-impl g17_lifecycle::AscCpuLifecycle for AscwrapV6Provider {
+impl g17_lifecycle::AscCpuLifecycle for G17PMailboxProvider {
     type Error = Error;
 
     fn start_cpu(&self) -> Result {
-        AscwrapV6Provider::start_cpu(self)
+        G17PMailboxProvider::start_cpu(self)
     }
 
     fn stop_cpu(&self) -> Result {
-        AscwrapV6Provider::stop_cpu(self)
+        G17PMailboxProvider::stop_cpu(self)
     }
 }
 
 struct G17PBootedSession {
-    cpus: g17_lifecycle::StartedCpuPair<AscwrapV6Provider>,
+    cpus: g17_lifecycle::StartedCpuPair<G17PMailboxProvider>,
     gfx_state: Arc<G17PRoleRtkitState>,
     gfx_rtkit: rtkit::RtKit<G17PRtkitOps>,
     gfx1_state: Arc<G17PRoleRtkitState>,
@@ -745,7 +881,7 @@ fn finish_boot_session(
     registers: &regs::Resources,
     manager: &mut g17_manager::G17PManagerConstruction,
     test_stage: G17PTestStage,
-    cpus: g17_lifecycle::StartedCpuPair<AscwrapV6Provider>,
+    cpus: g17_lifecycle::StartedCpuPair<G17PMailboxProvider>,
     gfx_state: Arc<G17PRoleRtkitState>,
     mut gfx_rtkit: rtkit::RtKit<G17PRtkitOps>,
     gfx1_state: Arc<G17PRoleRtkitState>,
@@ -967,9 +1103,9 @@ fn boot_session(
     manager: &mut g17_manager::G17PManagerConstruction,
     test_stage: G17PTestStage,
 ) -> Result<G17PBootedSession> {
-    let gfx = AscwrapV6Provider::get(pdev.as_ref(), 0)?;
+    let gfx = G17PMailboxProvider::get(pdev.as_ref(), 0)?;
     let gfx_lifecycle = validate_provider(&gfx, GFX_PROVIDER)?;
-    let gfx1 = AscwrapV6Provider::get(pdev.as_ref(), 1)?;
+    let gfx1 = G17PMailboxProvider::get(pdev.as_ref(), 1)?;
     let gfx1_lifecycle = validate_provider(&gfx1, GFX1_PROVIDER)?;
     let gfx_gate = gfx.require_safe_cpu_lifecycle();
     let gfx1_gate = gfx1.require_safe_cpu_lifecycle();
@@ -1067,9 +1203,9 @@ fn boot_initial_session(
     num_clusters: u32,
     test_stage: G17PTestStage,
 ) -> Result<(KBox<g17_manager::G17PManagerConstruction>, G17PBootedSession)> {
-    let gfx = AscwrapV6Provider::get(pdev.as_ref(), 0)?;
+    let gfx = G17PMailboxProvider::get(pdev.as_ref(), 0)?;
     let gfx_lifecycle = validate_provider(&gfx, GFX_PROVIDER)?;
-    let gfx1 = AscwrapV6Provider::get(pdev.as_ref(), 1)?;
+    let gfx1 = G17PMailboxProvider::get(pdev.as_ref(), 1)?;
     let gfx1_lifecycle = validate_provider(&gfx1, GFX1_PROVIDER)?;
     let gfx_gate = gfx.require_safe_cpu_lifecycle();
     let gfx1_gate = gfx1.require_safe_cpu_lifecycle();
@@ -1188,7 +1324,7 @@ pub(crate) struct G17PLiveRuntime {
     drm: Option<ARef<AsahiDevice>>,
     registers: Option<regs::Resources>,
     manager: Option<KBox<g17_manager::G17PManagerConstruction>>,
-    cpus: Option<g17_lifecycle::StartedCpuPair<AscwrapV6Provider>>,
+    cpus: Option<g17_lifecycle::StartedCpuPair<G17PMailboxProvider>>,
     gfx_state: Option<Arc<G17PRoleRtkitState>>,
     gfx_rtkit: Option<rtkit::RtKit<G17PRtkitOps>>,
     gfx1_state: Option<Arc<G17PRoleRtkitState>>,
