@@ -156,11 +156,21 @@ fn map_compute_readiness_mappings(
     if buffers.len() != G17P_CONTROL_OPERAND_BUFFER_COUNT {
         return Err(EINVAL);
     }
-    let table = table.map_at(
-        vm,
-        G17P_CONTROL_OPERAND_TABLE_VA,
-        mmu::PROT_GPU_FW_SHARED_RW,
-    )?;
+    let table = table
+        .map_at(
+            vm,
+            G17P_CONTROL_OPERAND_TABLE_VA,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )
+        .inspect_err(|error| {
+            dev_err!(
+                dev.as_ref(),
+                "G17P compute readiness: operand table map at {:#x}:{:#x} failed ({:?})\n",
+                G17P_CONTROL_OPERAND_TABLE_VA,
+                g17_initdata::CONTROL_OPERAND_TABLE_SIZE,
+                error,
+            );
+        })?;
     let mut mappings = KVec::with_capacity(
         g17_initdata::COMPUTE_READINESS_OPERAND_ENTRY_COUNT,
         GFP_KERNEL,
@@ -3306,7 +3316,7 @@ struct G17MappedResources {
     compute_readiness_class1_support: MappedObject,
     compute_readiness_class1_state: MappedObject,
     compute_readiness_class3_state: MappedObject,
-    compute_readiness_context1: Option<G17PComputeReadinessMappings>,
+    compute_readiness_context1: G17PComputeReadinessMappings,
     compute_readiness_class3_support_active: bool,
     register_windows: KVec<mmu::KernelMapping>,
 }
@@ -3668,7 +3678,19 @@ impl G17ResourceOwner {
             g17_initdata::COMPUTE_READINESS_PAGE_SIZE,
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
-        let compute_readiness_context1 = None;
+        // Reserve the complete fixed final-compute operand namespace before
+        // any queue or descriptor object can allocate from the same low-VA
+        // range. First bind rewrites the table bytes but never remaps it.
+        let compute_readiness_context1 = map_compute_readiness_mappings(
+            dev,
+            &mut control_operand_table,
+            &mut control_operand_buffers,
+            address_space.uat.kernel_lower_vm(),
+        )?;
+        dev_info!(
+            dev.as_ref(),
+            "G17P resources: readiness operand table plus entries 0..20 reserved in context 1\n"
+        );
         let compute_readiness_class3_support_active = false;
         compute_runtime_support.with_bytes_mut(|bytes| {
             g17_initdata::encode_compute_runtime_class1_support(bytes).map_err(|_| EINVAL)
@@ -4174,20 +4196,7 @@ impl G17ResourceOwner {
                 start,
             );
         }
-        if self.resources.compute_readiness_context1.is_none() {
-            let vm = self.address_space.uat.kernel_lower_vm();
-            self.resources.compute_readiness_context1 = Some(map_compute_readiness_mappings(
-                &self.dev,
-                &mut self.resources.control_operand_table,
-                &mut self.resources.control_operand_buffers,
-                vm,
-            )?);
-        }
-        let mappings = self
-            .resources
-            .compute_readiness_context1
-            .as_ref()
-            .ok_or(EINVAL)?;
+        let mappings = &self.resources.compute_readiness_context1;
         if !mappings.all_reachable_from(self.address_space.uat.kernel_lower_vm()) {
             return Err(EFAULT);
         }
@@ -4574,7 +4583,6 @@ impl G17ResourceOwner {
         self.resources.compute_runtime_zero_buffer_1_mapping = None;
         self.resources.compute_runtime_table_alias = None;
         self.resources.compute_runtime_buffer_aliases.clear();
-        self.resources.compute_readiness_context1 = None;
         self.resources.compute_readiness_class3_support_active = false;
         self.address_space
             .uat
@@ -5577,6 +5585,33 @@ mod tests {
         ] {
             assert!(address >= owner_end || address + size <= owner);
         }
+    }
+
+    #[test]
+    fn readiness_fixed_ranges_are_reserved_before_dynamic_cl_placement() {
+        let dynamic = G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END;
+        let table = G17P_CONTROL_OPERAND_TABLE_VA
+            ..G17P_CONTROL_OPERAND_TABLE_VA
+                + g17_initdata::CONTROL_OPERAND_TABLE_SIZE as u64;
+        assert!(dynamic.start <= table.start && table.end <= dynamic.end);
+
+        for index in 0..g17_initdata::COMPUTE_READINESS_OPERAND_ENTRY_COUNT {
+            let start = g17p_control_operand_buffer_va(index).unwrap();
+            let end = start + G17P_CONTROL_OPERAND_BUFFER_SIZE as u64;
+            assert!(dynamic.start <= start && end <= dynamic.end);
+            for b2 in g17_initdata::REGION_VIEW_LOW_ADDRS {
+                assert!(b2 < start || b2 >= end);
+            }
+        }
+
+        let first_unreserved = g17p_control_operand_buffer_va(
+            g17_initdata::COMPUTE_READINESS_OPERAND_ENTRY_COUNT,
+        )
+        .unwrap();
+        let first_unreserved_end = first_unreserved + G17P_CONTROL_OPERAND_BUFFER_SIZE as u64;
+        assert!(g17_initdata::REGION_VIEW_LOW_ADDRS
+            .into_iter()
+            .all(|b2| first_unreserved <= b2 && b2 < first_unreserved_end));
     }
 
     #[test]
