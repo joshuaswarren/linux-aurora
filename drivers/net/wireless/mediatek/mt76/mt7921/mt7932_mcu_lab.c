@@ -174,7 +174,7 @@ static int mt7932_mcu_lab_prepare_fullmac_data_path(
 	mt76_wcid_init(&mlink->wcid, 0);
 	mlink->wcid.idx = lab->fullmac_wtbl_ids[0];
 	mlink->wcid.hw_key_idx = 0;
-	mlink->wcid.tx_info |= MT_WCID_TX_INFO_SET;
+	mlink->wcid.tx_info |= MT_WCID_TX_INFO_SET | MT_WCID_TX_INFO_ALTQ;
 	mlink->last_txs = jiffies;
 	mlink->sta = &lab->fullmac_sta;
 	lab->fullmac_sta.vif = mvif;
@@ -190,7 +190,7 @@ static int mt7932_mcu_lab_prepare_fullmac_data_path(
 				   &mlink->wcid);
 	mutex_unlock(&dev->mt76.mutex);
 	dev_info(dev->mt76.dev,
-		 "J700_MT7932_FULLMAC_DATA_PATH_READY: netdev=%s wtbl_count=4 tx=802.3 rx=802.3 ac=BE amsdu=off identity=redacted\n",
+		 "J700_MT7932_FULLMAC_DATA_PATH_READY: netdev=%s wtbl_count=4 tx=802.3 rx=802.3 queue=ALTX0 amsdu=off identity=redacted\n",
 		 lab->fullmac_ndev->name);
 
 	return 0;
