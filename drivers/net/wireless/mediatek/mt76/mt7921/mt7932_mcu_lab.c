@@ -8,6 +8,7 @@
 #include <linux/pci.h>
 #include <linux/poll.h>
 #include <linux/rcupdate.h>
+#include <linux/unaligned.h>
 #include <linux/uaccess.h>
 #include <linux/xarray.h>
 
@@ -58,12 +59,81 @@ struct mt7932_mcu_lab {
 	atomic_t dropped_events;
 	enum neo_wifid_phase phase;
 	u32 command_count;
+	u8 fullmac_sta_ids[NEO_WIFID_FULLMAC_STA_IDS];
+	u8 fullmac_wtbl_ids[NEO_WIFID_FULLMAC_WTBL_IDS];
+	u8 fullmac_reserved_count;
 	bool checkpoint_waiting;
 	bool response_timed_out;
 	bool irq_disabled;
 	bool tasklet_disabled;
 	bool dead;
 };
+
+static void mt7932_mcu_lab_release_fullmac_resources(
+	struct mt7932_mcu_lab *lab)
+{
+	struct mt792x_dev *dev = lab->dev;
+	int i;
+
+	if (!lab->fullmac_reserved_count)
+		return;
+	mutex_lock(&dev->mt76.mutex);
+	for (i = 0; i < lab->fullmac_reserved_count; i++) {
+		u8 id = i < NEO_WIFID_FULLMAC_STA_IDS ?
+			lab->fullmac_sta_ids[i] :
+			lab->fullmac_wtbl_ids[i - NEO_WIFID_FULLMAC_STA_IDS];
+
+		mt76_wcid_mask_clear(dev->mt76.wcid_mask, id);
+	}
+	mutex_unlock(&dev->mt76.mutex);
+	memset(lab->fullmac_sta_ids, 0, sizeof(lab->fullmac_sta_ids));
+	memset(lab->fullmac_wtbl_ids, 0, sizeof(lab->fullmac_wtbl_ids));
+	lab->fullmac_reserved_count = 0;
+}
+
+static int mt7932_mcu_lab_reserve_fullmac_resources(
+	struct mt7932_mcu_lab *lab)
+{
+	struct mt792x_dev *dev = lab->dev;
+	int id, i;
+
+	if (lab->fullmac_reserved_count)
+		return -EBUSY;
+
+	mutex_lock(&dev->mt76.mutex);
+	for (i = 0; i < NEO_WIFID_FULLMAC_STA_IDS; i++) {
+		id = mt76_wcid_alloc(dev->mt76.wcid_mask, 15);
+		if (id < 0)
+			goto unwind;
+		lab->fullmac_sta_ids[i] = id;
+		lab->fullmac_reserved_count++;
+	}
+	for (i = 0; i < NEO_WIFID_FULLMAC_WTBL_IDS; i++) {
+		id = mt76_wcid_alloc(dev->mt76.wcid_mask, MT792x_WTBL_STA - 1);
+		if (id < 0)
+			goto unwind;
+		lab->fullmac_wtbl_ids[i] = id;
+		lab->fullmac_reserved_count++;
+	}
+	mutex_unlock(&dev->mt76.mutex);
+
+	return 0;
+
+unwind:
+	while (lab->fullmac_reserved_count) {
+		int pos = --lab->fullmac_reserved_count;
+		u8 allocated = pos < NEO_WIFID_FULLMAC_STA_IDS ?
+			lab->fullmac_sta_ids[pos] :
+			lab->fullmac_wtbl_ids[pos - NEO_WIFID_FULLMAC_STA_IDS];
+
+		mt76_wcid_mask_clear(dev->mt76.wcid_mask, allocated);
+	}
+	mutex_unlock(&dev->mt76.mutex);
+	memset(lab->fullmac_sta_ids, 0, sizeof(lab->fullmac_sta_ids));
+	memset(lab->fullmac_wtbl_ids, 0, sizeof(lab->fullmac_wtbl_ids));
+
+	return -ENOSPC;
+}
 
 static DEFINE_XARRAY(mt7932_mcu_labs);
 
@@ -78,6 +148,11 @@ module_param_named(j700_mcu_lab_timeout_ms, mt7932_mcu_lab_timeout_ms,
 		   uint, 0444);
 MODULE_PARM_DESC(j700_mcu_lab_timeout_ms,
 		 "fail-closed J700 early-probe checkpoint timeout in milliseconds");
+
+static bool mt7932_mcu_lab_runtime;
+module_param_named(j700_mcu_lab_runtime, mt7932_mcu_lab_runtime, bool, 0444);
+MODULE_PARM_DESC(j700_mcu_lab_runtime,
+		 "create the J700 typed MCU lab endpoint after normal hardware init");
 
 bool mt7932_mcu_lab_conformance_active(void)
 {
@@ -558,6 +633,52 @@ static int mt7932_mcu_lab_reset(struct mt7932_mcu_lab *lab)
 	return 0;
 }
 
+static int mt7932_mcu_lab_fullmac_connect(
+	struct mt7932_mcu_lab *lab,
+	const struct neo_wifid_fullmac_connect *request,
+	u32 payload_len, u32 *command)
+{
+	struct mt7932_fullmac_connect_params params = {};
+	int ret;
+
+	BUILD_BUG_ON(sizeof(*request) != 176);
+	if (payload_len != sizeof(*request) ||
+	    memchr_inv(request->reserved0, 0, sizeof(request->reserved0)) ||
+	    memchr_inv(request->reserved1, 0, sizeof(request->reserved1)) ||
+	    !request->ssid_len || request->ssid_len > sizeof(request->ssid) ||
+	    request->key_len > sizeof(request->key) ||
+	    !request->pmk_len || request->pmk_len > sizeof(request->pmk) ||
+	    request->band < 1 || request->band > 3 || !request->channel ||
+	    is_zero_ether_addr(request->bssid))
+		return -EINVAL;
+	if (lab->phase != NEO_WIFID_PHASE_CONTINUED ||
+	    lab->checkpoint_waiting || !lab->dev->hw_init_done)
+		return -EBUSY;
+
+	ret = mt7932_mcu_lab_reserve_fullmac_resources(lab);
+	if (ret)
+		return ret;
+	params.ssid = request->ssid;
+	params.key = request->key;
+	params.pmk = request->pmk;
+	params.bssid = request->bssid;
+	params.ssid_len = request->ssid_len;
+	params.key_len = request->key_len;
+	params.pmk_len = request->pmk_len;
+	params.band = request->band;
+	params.channel = request->channel;
+	memcpy(params.sta_ids, lab->fullmac_sta_ids, sizeof(params.sta_ids));
+	memcpy(params.wtbl_ids, lab->fullmac_wtbl_ids, sizeof(params.wtbl_ids));
+	ret = mt7932_mcu_fullmac_connect(lab->dev, &params, command);
+	memzero_explicit(&params, sizeof(params));
+	if (ret)
+		mt7932_mcu_lab_release_fullmac_resources(lab);
+	else
+		lab->command_count++;
+
+	return ret;
+}
+
 static ssize_t mt7932_mcu_lab_write(struct file *file, const char __user *buf,
 				    size_t count, loff_t *ppos)
 {
@@ -643,6 +764,13 @@ static ssize_t mt7932_mcu_lab_write(struct file *file, const char __user *buf,
 		else
 			ret = mt7932_mcu_lab_continue(lab);
 		break;
+	case NEO_WIFID_OP_FULLMAC_CONNECT:
+		if (flags)
+			ret = -EINVAL;
+		else
+			ret = mt7932_mcu_lab_fullmac_connect(
+				lab, payload, payload_len, &command);
+		break;
 	default:
 		ret = -EOPNOTSUPP;
 		break;
@@ -656,7 +784,7 @@ result:
 		mt7932_mcu_lab_result(lab, record_type, cookie, ret,
 					 command, sequence, NULL, 0);
 	mutex_unlock(&lab->operation_lock);
-	kfree(payload);
+	kfree_sensitive(payload);
 
 	return count;
 }
@@ -897,6 +1025,44 @@ fail:
 	return ret;
 }
 
+int mt7932_mcu_lab_runtime_create(struct mt792x_dev *dev)
+{
+	struct mt7932_mcu_lab *lab;
+	int ret;
+
+	if (!mt7932_mcu_lab_runtime)
+		return 0;
+	if (!is_mt7932(&dev->mt76) || !dev->hw_init_done)
+		return -ENODEV;
+	if (mt7932_mcu_lab_conformance)
+		return -EINVAL;
+
+	lab = mt7932_mcu_lab_get(dev);
+	if (!lab) {
+		ret = mt7932_mcu_lab_create(dev, &lab);
+		if (ret)
+			return ret;
+		kref_get(&lab->ref);
+	}
+	mutex_lock(&lab->operation_lock);
+	if (lab->dead) {
+		ret = -ENODEV;
+	} else if (lab->checkpoint_waiting ||
+		   lab->phase != NEO_WIFID_PHASE_CHECKPOINT) {
+		ret = -EBUSY;
+	} else {
+		lab->phase = NEO_WIFID_PHASE_CONTINUED;
+		ret = 0;
+	}
+	mutex_unlock(&lab->operation_lock);
+	if (!ret)
+		dev_info(dev->mt76.dev,
+			 "J700_MT7932_MCU_LAB_RUNTIME_PASS: phase=continued credentials=never-logged\n");
+	mt7932_mcu_lab_put(lab);
+
+	return ret;
+}
+
 void mt7932_mcu_lab_destroy(struct mt792x_dev *dev)
 {
 	struct mt7932_mcu_lab *lab;
@@ -908,6 +1074,7 @@ void mt7932_mcu_lab_destroy(struct mt792x_dev *dev)
 	misc_deregister(&lab->misc);
 	mutex_lock(&lab->operation_lock);
 	mt7932_mcu_lab_abort_epoch(lab, "neo-wifid-destroy");
+	mt7932_mcu_lab_release_fullmac_resources(lab);
 	lab->dead = true;
 	complete_all(&lab->connected);
 	complete_all(&lab->continued);
@@ -932,6 +1099,26 @@ bool mt7932_mcu_lab_rx(struct mt792x_dev *dev, struct sk_buff *skb)
 	if (unlikely(skb->len < sizeof(*rxd)))
 		goto out;
 	rxd = (void *)skb->data;
+	if (rxd->eid == 0xea &&
+	    skb->len >= sizeof(*rxd) + 16) {
+		struct mt76_queue *q = &dev->mt76.q_rx[0];
+		u32 subevent = get_unaligned_le32(rxd->tlv + 4);
+		u16 status = subevent == 0x42 ?
+			get_unaligned_le16(rxd->tlv + 12) : 0xffff;
+
+		if (status == 0xffff)
+			dev_info(dev->mt76.dev,
+				 "J700_MT7932_FULLMAC_EVENT: eid=0xea subevent=0x%02x status=na q0_cidx=%u q0_didx=%u q0_head=%u q0_tail=%u q0_queued=%u\n",
+				 subevent, readl(&q->regs->cpu_idx),
+				 readl(&q->regs->dma_idx), q->head, q->tail,
+				 READ_ONCE(q->queued));
+		else
+			dev_info(dev->mt76.dev,
+				 "J700_MT7932_FULLMAC_EVENT: eid=0xea subevent=0x%02x status=%u q0_cidx=%u q0_didx=%u q0_head=%u q0_tail=%u q0_queued=%u\n",
+				 subevent, status, readl(&q->regs->cpu_idx),
+				 readl(&q->regs->dma_idx), q->head, q->tail,
+				 READ_ONCE(q->queued));
+	}
 	sequence = rxd->seq;
 	if (sequence) {
 		spin_lock_irqsave(&lab->pending_lock, flags);

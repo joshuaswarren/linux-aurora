@@ -20,6 +20,7 @@ enum neo_wifid_opcode {
 	NEO_WIFID_OP_ARM_RUNTIME_EPOCH = 4,
 	NEO_WIFID_OP_RUNTIME_EPOCH = 5,
 	NEO_WIFID_OP_CONTINUE = 6,
+	NEO_WIFID_OP_FULLMAC_CONNECT = 7,
 };
 
 enum neo_wifid_transport {
@@ -101,10 +102,53 @@ struct neo_wifid_state {
 	__le32 tx17_queued;
 } __packed;
 
+#define NEO_WIFID_FULLMAC_SSID_MAX	32
+#define NEO_WIFID_FULLMAC_KEY_MAX	64
+#define NEO_WIFID_FULLMAC_PMK_MAX	64
+#define NEO_WIFID_FULLMAC_STA_IDS	2
+#define NEO_WIFID_FULLMAC_WTBL_IDS	4
+
+/* Typed, credential-bearing lab request.  It is accepted only by the
+ * CAP_SYS_RAWIO checkpoint endpoint, is never returned in a record and is
+ * released with kfree_sensitive().
+ */
+struct neo_wifid_fullmac_connect {
+	u8 ssid_len;
+	u8 key_len;
+	u8 pmk_len;
+	u8 band;
+	u8 channel;
+	u8 reserved0[3];
+	u8 bssid[ETH_ALEN];
+	u8 reserved1[2];
+	u8 ssid[NEO_WIFID_FULLMAC_SSID_MAX];
+	u8 key[NEO_WIFID_FULLMAC_KEY_MAX];
+	u8 pmk[NEO_WIFID_FULLMAC_PMK_MAX];
+} __packed;
+
+struct mt7932_fullmac_connect_params {
+	const u8 *ssid;
+	const u8 *key;
+	const u8 *pmk;
+	const u8 *bssid;
+	u8 ssid_len;
+	u8 key_len;
+	u8 pmk_len;
+	u8 band;
+	u8 channel;
+	u8 sta_ids[NEO_WIFID_FULLMAC_STA_IDS];
+	u8 wtbl_ids[NEO_WIFID_FULLMAC_WTBL_IDS];
+};
+
 int mt7932_mcu_runtime_epoch(struct mt792x_dev *dev);
+int mt7932_mcu_fullmac_connect(
+	struct mt792x_dev *dev,
+	const struct mt7932_fullmac_connect_params *params,
+	u32 *command_out);
 #if IS_ENABLED(CONFIG_MT7921_J700_MCU_LAB)
 bool mt7932_mcu_lab_conformance_active(void);
 int mt7932_mcu_lab_checkpoint(struct mt792x_dev *dev);
+int mt7932_mcu_lab_runtime_create(struct mt792x_dev *dev);
 void mt7932_mcu_lab_destroy(struct mt792x_dev *dev);
 bool mt7932_mcu_lab_rx(struct mt792x_dev *dev, struct sk_buff *skb);
 #else
@@ -114,6 +158,11 @@ static inline bool mt7932_mcu_lab_conformance_active(void)
 }
 
 static inline int mt7932_mcu_lab_checkpoint(struct mt792x_dev *dev)
+{
+	return 0;
+}
+
+static inline int mt7932_mcu_lab_runtime_create(struct mt792x_dev *dev)
 {
 	return 0;
 }
