@@ -3790,6 +3790,129 @@ struct mt7932_cmd_set_bss_info {
 	u8 padding[12];
 };
 
+/* AppleSunriseWLAN 25G83 _assocSendConnectCmd() constructs this exact
+ * 0x358-byte body and submits direct layer-1 EA/0x40.  Credential-bearing
+ * regions are populated only from live typed inputs and are explicitly
+ * cleared after submission.
+ */
+struct mt7932_cmd_fullmac_connect {
+	u8 version;
+	u8 security_version;
+	u8 network_assurance;
+	u8 reserved_003;
+	__le32 ad_mode;
+	__le32 auth_upper;
+	__le32 auth_lower;
+	__le16 wsec_flags;
+	__le16 battery_mode;
+	__le16 assoc_dwell_time;
+	__le16 reserved_016;
+	__le32 ssid_len;
+	u8 ssid[32];
+	__le32 key_version;
+	__le32 key_len;
+	__le32 key_cipher;
+	__le16 key_flags;
+	__le16 key_index;
+	u8 key_storage[0x14c];
+	__le16 rsn_ie_len;
+	u8 rsn_pmk_union[0x72];
+	__le32 allow_auths;
+	u8 reserved_210[8];
+	__le32 auth_upper_ext;
+	__le32 transition_disabled_flags;
+	__le32 pairwise_cipher_type;
+	__le32 candidate_bssid_count;
+	u8 candidate_reserved[2];
+	u8 candidate_blob[0x100];
+	u8 reserved_32a[2];
+	u8 bssid[ETH_ALEN];
+	u8 owe_bssid[ETH_ALEN];
+	u8 band;
+	u8 channel;
+	u8 reserved_33a[2];
+	u8 connection_resource_valid;
+	u8 sta_count;
+	u8 wtbl_count;
+	u8 reserved_33f;
+	u8 sta_ids[8];
+	u8 wtbl_ids[16];
+} __packed;
+
+int mt7932_mcu_fullmac_connect(
+	struct mt792x_dev *dev,
+	const struct mt7932_fullmac_connect_params *params,
+	u32 *command_out)
+{
+	struct mt7932_cmd_fullmac_connect req = {
+		.security_version = 4,
+		.ad_mode = cpu_to_le32(0x10),
+		.auth_upper = cpu_to_le32(0x78),
+		.battery_mode = cpu_to_le16(1),
+		.assoc_dwell_time = cpu_to_le16(8),
+		.key_cipher = cpu_to_le32(10),
+		.allow_auths = cpu_to_le32(0x40000004),
+		.connection_resource_valid = 1,
+		.sta_count = NEO_WIFID_FULLMAC_STA_IDS,
+		.wtbl_count = NEO_WIFID_FULLMAC_WTBL_IDS,
+	};
+	u32 command = FIELD_PREP(__MCU_CMD_FIELD_ID, 0xea) |
+		      FIELD_PREP(__MCU_CMD_FIELD_EXT_ID, 0x40);
+	int ret;
+
+	BUILD_BUG_ON(sizeof(req) != 0x358);
+	BUILD_BUG_ON(offsetof(struct mt7932_cmd_fullmac_connect, ssid_len) !=
+		     0x18);
+	BUILD_BUG_ON(offsetof(struct mt7932_cmd_fullmac_connect, key_len) !=
+		     0x40);
+	BUILD_BUG_ON(offsetof(struct mt7932_cmd_fullmac_connect, rsn_ie_len) !=
+		     0x198);
+	BUILD_BUG_ON(offsetof(struct mt7932_cmd_fullmac_connect, allow_auths) !=
+		     0x20c);
+	BUILD_BUG_ON(offsetof(struct mt7932_cmd_fullmac_connect, bssid) !=
+		     0x32c);
+	BUILD_BUG_ON(offsetof(struct mt7932_cmd_fullmac_connect, sta_count) !=
+		     0x33d);
+	BUILD_BUG_ON(offsetof(struct mt7932_cmd_fullmac_connect, sta_ids) !=
+		     0x340);
+	BUILD_BUG_ON(offsetof(struct mt7932_cmd_fullmac_connect, wtbl_ids) !=
+		     0x348);
+
+	if (!params || !params->ssid || !params->pmk || !params->bssid ||
+	    !params->ssid_len || params->ssid_len > sizeof(req.ssid) ||
+	    params->key_len > NEO_WIFID_FULLMAC_KEY_MAX ||
+	    !params->pmk_len || params->pmk_len > 64 ||
+	    params->band < 1 || params->band > 3 || !params->channel ||
+	    is_zero_ether_addr(params->bssid) ||
+	    (params->key_len && !params->key))
+		return -EINVAL;
+
+	req.ssid_len = cpu_to_le32(params->ssid_len);
+	memcpy(req.ssid, params->ssid, params->ssid_len);
+	req.key_len = cpu_to_le32(params->key_len);
+	if (params->key_len)
+		memcpy(req.key_storage, params->key, params->key_len);
+	/* PMK length/data are the second arm of Apple's RSN/PMK union. */
+	put_unaligned_le32(params->pmk_len, &req.rsn_pmk_union[0x2e]);
+	memcpy(&req.rsn_pmk_union[0x32], params->pmk, params->pmk_len);
+	memcpy(req.bssid, params->bssid, ETH_ALEN);
+	req.band = params->band;
+	req.channel = params->channel;
+	memcpy(req.sta_ids, params->sta_ids, sizeof(params->sta_ids));
+	memcpy(req.wtbl_ids, params->wtbl_ids, sizeof(params->wtbl_ids));
+
+	dev_info(dev->mt76.dev,
+		 "J700_MT7932_FULLMAC_CONNECT: cid=0xea ext=0x40 bytes=856 ssid_len=%u key_len=%u pmk_len=%u band=%u channel=%u sta_count=2 wtbl_count=4 response=async-eid-ea secrets=redacted\n",
+		 params->ssid_len, params->key_len, params->pmk_len,
+		 params->band, params->channel);
+	ret = mt76_mcu_send_msg(&dev->mt76, command, &req, sizeof(req), false);
+	memzero_explicit(&req, sizeof(req));
+	if (command_out)
+		*command_out = command;
+
+	return ret;
+}
+
 static u16 mt7932_mcu_legacy_rate_set(u32 rates, enum nl80211_band band)
 {
 	if (band == NL80211_BAND_2GHZ)
@@ -4001,7 +4124,6 @@ mt7932_mcu_sta_update_legacy(struct mt792x_dev *dev,
 						    state);
 		if (ret)
 			return ret;
-
 		memcpy(req.mac_addr, sta->deflink.addr, ETH_ALEN);
 		if (sta->deflink.ht_cap.ht_supported)
 			req.desired_phy_type |= BIT(4);

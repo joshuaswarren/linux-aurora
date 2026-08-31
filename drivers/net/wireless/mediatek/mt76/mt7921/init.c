@@ -7,6 +7,7 @@
 #include <linux/thermal.h>
 #include <linux/firmware.h>
 #include "mt7921.h"
+#include "mt7932_mcu_lab.h"
 #include "../mt76_connac2_mac.h"
 #include "mcu.h"
 #include "regd.h"
@@ -264,6 +265,9 @@ static int mt7921_init_work_run(struct mt792x_dev *dev)
 
 	/* we support chip reset now */
 	dev->hw_init_done = true;
+	ret = mt7932_mcu_lab_runtime_create(dev);
+	if (ret)
+		return ret;
 
 	mt76_connac_mcu_set_deep_sleep(&dev->mt76, dev->pm.ds_enable);
 
