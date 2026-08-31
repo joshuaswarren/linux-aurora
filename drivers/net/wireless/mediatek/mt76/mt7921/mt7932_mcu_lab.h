@@ -151,6 +151,7 @@ int mt7932_mcu_lab_checkpoint(struct mt792x_dev *dev);
 int mt7932_mcu_lab_runtime_create(struct mt792x_dev *dev);
 void mt7932_mcu_lab_destroy(struct mt792x_dev *dev);
 bool mt7932_mcu_lab_rx(struct mt792x_dev *dev, struct sk_buff *skb);
+bool mt7932_mcu_lab_fullmac_rx(struct mt792x_dev *dev, struct sk_buff *skb);
 #else
 static inline bool mt7932_mcu_lab_conformance_active(void)
 {
@@ -173,6 +174,12 @@ static inline void mt7932_mcu_lab_destroy(struct mt792x_dev *dev)
 
 static inline bool mt7932_mcu_lab_rx(struct mt792x_dev *dev,
 				     struct sk_buff *skb)
+{
+	return false;
+}
+
+static inline bool mt7932_mcu_lab_fullmac_rx(struct mt792x_dev *dev,
+					     struct sk_buff *skb)
 {
 	return false;
 }
