@@ -4,6 +4,7 @@
  * Copyright The Asahi Linux Contributors
  */
 
+#include <clocksource/arm_arch_timer.h>
 #include <linux/align.h>
 #include <linux/bitmap.h>
 #include <linux/clk.h>
@@ -40,6 +41,9 @@
 
 /* Register defines used in bandwidth setup structure */
 #define REG_DOORBELL_BIT(idx) (2 + (idx))
+
+static_assert(offsetof(struct DCP_FW_NAME(dcp_swap), timestamp[6]) == 0x30);
+static_assert(offsetof(struct DCP_FW_NAME(dcp_swap), flags1) == 0x40);
 
 struct dcp_wait_cookie {
 	struct kref refcount;
@@ -1022,7 +1026,9 @@ static bool dcpep_process_chunks(struct apple_dcp *dcp,
 	if (!strcmp(req->key, "TimingElements")) {
 		dcp->modes = enumerate_modes(&ctx, &dcp->nr_modes,
 					     dcp->width_mm, dcp->height_mm,
-					     dcp->notch_height);
+					     dcp->notch_height,
+					     dcp->fixed_connector_type ==
+						     DRM_MODE_CONNECTOR_eDP);
 
 		if (IS_ERR(dcp->modes)) {
 			dev_warn(dcp->dev, "failed to parse modes\n");
@@ -2031,10 +2037,7 @@ static void dcp_swapped(struct apple_dcp *dcp, void *data, void *cookie)
 		return;
 	}
 	dcp->swap_start = ktime_get();
-	if (dcp_swap_trace)
-		dev_info(dcp->dev, "swap-trace: submitted id=%u t=%lld us\n",
-			 DCP_FW_UNION(dcp->swap).swap.swap_id,
-			 ktime_to_us(dcp->swap_start));
+	dcp->swap_submit_timestamp = arch_timer_read_counter();
 
 	dcp_release_swapped_out_fbs(dcp);
 }
@@ -2091,6 +2094,35 @@ static void complete_set_digital_out_mode(struct apple_dcp *dcp, void *data,
 	}
 }
 
+/* DCP applies Adaptive Sync changes when the display mode is reselected. */
+static void dcp_on_set_adaptive_sync(struct apple_dcp *dcp, void *out,
+				     void *cookie)
+{
+	dcp_set_digital_out_mode(dcp, false, &dcp->mode,
+				 complete_set_digital_out_mode, cookie);
+}
+
+static void dcp_set_adaptive_sync(struct apple_dcp *dcp, u32 min_vrr,
+				  void *cookie)
+{
+	struct dcp_set_parameter_dcp param = {
+		.param = IOMFBPARAM_ADAPTIVE_SYNC,
+		.value = {
+			min_vrr, /* minRR, 16.16 fixed-point Hz */
+			0,       /* mediaTargetRate */
+			0,       /* fractional rate */
+		},
+#if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
+		.count = 3,
+#else
+		.count = 1,
+#endif
+	};
+
+	dcp_set_parameter_dcp(dcp, false, &param, dcp_on_set_adaptive_sync,
+			      cookie);
+}
+
 int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 			       struct drm_crtc_state *crtc_state)
 {
@@ -2130,8 +2162,8 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 		.timing_mode_id = mode->timing_mode_id
 	};
 
-	/* Keep track of suspected vrr modes */
-	dcp->use_timestamps = mode->vrr;
+	/* Built-in ProMotion panels require timestamps even in fixed-120 mode. */
+	dcp->use_timestamps = mode->vrr && dcp->main_display;
 
 	cookie = kzalloc(sizeof(*cookie), GFP_KERNEL);
 	if (!cookie) {
@@ -2144,24 +2176,15 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	kref_get(&cookie->refcount);
 
 	dcp->during_modeset = true;
+	dcp->swap_submit_timestamp = 0;
 
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
-	/*
-	 * Inherit the mode iBoot already programmed instead of asking for one.
-	 *
-	 * macOS never issues A413 in a full capture -- it attaches to a display
-	 * iBoot has already configured.  Ours asks for colorID 1 / timingID 2
-	 * and the firmware answers 0x8000000b, so the timing generator never
-	 * starts: no vblank, no swap completion, black panel.  The panel is
-	 * already running at its native 2408x1506, so skip the modeset and let
-	 * that timing stand.
-	 */
-	dev_info(dcp->dev, "inheriting the bootloader's display mode\n");
-	complete_set_digital_out_mode(dcp, NULL, cookie);
-#else
-	dcp_set_digital_out_mode(dcp, false, &dcp->mode,
-				 complete_set_digital_out_mode, cookie);
-#endif
+	if (mode->vrr)
+		dcp_set_adaptive_sync(dcp,
+				      crtc_state->vrr_enabled ? mode->min_vrr : 0,
+				      cookie);
+	else
+		dcp_set_digital_out_mode(dcp, false, &dcp->mode,
+					 complete_set_digital_out_mode, cookie);
 
 	/*
 	 * The DCP firmware has an internal timeout of ~8 seconds for
@@ -2171,7 +2194,6 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	ret = wait_for_completion_timeout(&cookie->done,
 					  msecs_to_jiffies(8500));
 
-	kref_put(&cookie->refcount, release_wait_cookie);
 	dcp->during_modeset = false;
 
 	if (dcp->pending_hotplug) {
@@ -2195,18 +2217,21 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 
 	if (ret == 0) {
 		dev_info(dcp->dev, "set_digital_out_mode timed out\n");
+		kref_put(&cookie->refcount, release_wait_cookie);
 		return -EIO;
 	} else if (ret < 0) {
 		dev_info(dcp->dev,
 			 "waiting on set_digital_out_mode failed:%d\n", ret);
+		kref_put(&cookie->refcount, release_wait_cookie);
 		return -EIO;
-
-	} else if (ret > 0) {
+	} else {
 		dev_dbg(dcp->dev,
 			"set_digital_out_mode finished with %d to spare\n",
 			jiffies_to_msecs(ret));
 	}
+	kref_put(&cookie->refcount, release_wait_cookie);
 	dcp->valid_mode = true;
+	dcp->vrr_enabled = mode->vrr && crtc_state->vrr_enabled;
 
 	return 0;
 }
@@ -2317,28 +2342,26 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		req->clear = 1;
 	}
 
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
-	/*
-	 * A swap with no surface at all makes this firmware fetch from a null
-	 * base and take the app NMI described in iomfb_poweroff.  Keep the
-	 * last surface on the panel instead and let the commit complete.
-	 */
-	if (!has_surface) {
-		dev_warn_once(dcp->dev,
-			      "refusing a surface-less swap on H17P; keeping the last surface\n");
-		schedule_work(&dcp->vblank_wq);
-		return;
-	}
-#endif
+	if (has_surface && (dcp->use_timestamps || dcp->vrr_enabled)) {
+		u64 submit_timestamp = dcp->swap_submit_timestamp;
+		u64 timestamp = arch_timer_read_counter();
 
-	if (has_surface && dcp->use_timestamps) {
 		/*
-		 * Fake timstamps to get 120hz refresh rate. It looks
-		 * like the actual value does not matter, as long  as it is non zero.
+		 * IOMobileFramebuffer uses Mach continuous-time values here. On
+		 * Apple Silicon that is the ARM architectural counter. Empirical
+		 * testing shows that using the current submission time together
+		 * with the previous accepted swap makes DCP follow swap pacing.
 		 */
-		req->swap.ts1 = 120;
-		req->swap.ts2 = 120;
-		req->swap.ts3 = 120;
+		if (!submit_timestamp)
+			submit_timestamp = timestamp;
+
+		/* Firmware 12.x/13.x requires timestamp types 1, 2, and 7. */
+		req->swap.timestamp[0] = timestamp;
+		req->swap.timestamp[1] = submit_timestamp;
+		req->swap.timestamp[6] = timestamp;
+
+		trace_iomfb_vrr_timestamps(dcp, dcp->vrr_enabled, timestamp,
+					   submit_timestamp);
 	}
 
 	/* These fields should be set together */
