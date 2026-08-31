@@ -44,6 +44,7 @@ int mt7921e_tx_prepare_skb(struct mt76_dev *mdev, void *txwi_ptr,
 	mt76_connac2_mac_write_txwi(mdev, txwi_ptr, tx_info->skb, wcid, key,
 				    pid, qid, 0);
 	if (is_mt7932(mdev) &&
+	    !(info->flags & IEEE80211_TX_CTL_HW_80211_ENCAP) &&
 	    ieee80211_is_auth(((struct ieee80211_hdr *)
 			      tx_info->skb->data)->frame_control)) {
 		__le32 *txd = txwi_ptr;

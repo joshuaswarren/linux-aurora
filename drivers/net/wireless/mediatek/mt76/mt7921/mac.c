@@ -5,6 +5,7 @@
 #include <linux/etherdevice.h>
 #include <linux/timekeeping.h>
 #include "mt7921.h"
+#include "mt7932_mcu_lab.h"
 #include "../dma.h"
 #include "../mt76_connac2_mac.h"
 #include "regd.h"
@@ -671,6 +672,8 @@ void mt7921_queue_rx_skb(struct mt76_dev *mdev, enum mt76_rxq_id q,
 	case PKT_TYPE_NORMAL_MCU:
 	case PKT_TYPE_NORMAL:
 		if (!mt7921_mac_fill_rx(dev, skb)) {
+			if (mt7932_mcu_lab_fullmac_rx(dev, skb))
+				return;
 			mt76_rx(&dev->mt76, q, skb);
 			return;
 		}
