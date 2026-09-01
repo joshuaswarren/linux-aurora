@@ -887,7 +887,7 @@ static int mt7932_mcu_lab_fullmac_connect(
 			return -EINVAL;
 	} else if (request->security == NEO_WIFID_FULLMAC_SECURITY_WPA3_SAE) {
 		if (request->key_len < 8 || request->key_len > 63 ||
-		    request->pmk_len)
+		    request->pmk_len != 32)
 			return -EINVAL;
 	} else {
 		return -EINVAL;
@@ -915,6 +915,19 @@ static int mt7932_mcu_lab_fullmac_connect(
 			 request->pre_assoc_cbw,
 			 request->pre_assoc_extension);
 
+	/* Apple forwards SAE status 126 (Hash-to-Element) to IO80211, which
+	 * starts a fresh association with newly reserved connection resources.
+	 * The runtime lab has no IO80211 peer, so a second typed connect request
+	 * performs the same bounded resource rollover here.
+	 */
+	if (lab->fullmac_reserved_count) {
+		dev_info(lab->dev->mt76.dev,
+			 "J700_MT7932_FULLMAC_H2E_RESOURCE_ROLLOVER: old_sta=%u,%u old_wtbl=%u,%u,%u,%u source=apple-io80211-auth-message-0x4a\n",
+			 lab->fullmac_sta_ids[0], lab->fullmac_sta_ids[1],
+			 lab->fullmac_wtbl_ids[0], lab->fullmac_wtbl_ids[1],
+			 lab->fullmac_wtbl_ids[2], lab->fullmac_wtbl_ids[3]);
+		mt7932_mcu_lab_release_fullmac_resources(lab);
+	}
 	ret = mt7932_mcu_lab_reserve_fullmac_resources(lab);
 	if (ret)
 		return ret;

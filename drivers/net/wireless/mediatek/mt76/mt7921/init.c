@@ -267,7 +267,7 @@ int mt7932_apply_manufacture_policy(struct mt792x_dev *dev)
 	ret = mt76_connac_mcu_set_channel_domain(&dev->mphy);
 	if (!ret)
 		dev_info(dev->mt76.dev,
-			 "J700_MT7932_TYPED_AU_POLICY_PASS: country=AU mode6g=SP domain=initial,refresh power=42 dbdc=typed replay=0\n");
+			 "J700_MT7932_TYPED_AU_POLICY_PASS: country=AU mode6g=VLP domain=initial,refresh power=42 dbdc=typed replay=0\n");
 
 	return ret;
 }

@@ -1090,7 +1090,7 @@ EXPORT_SYMBOL_GPL(mt7932_mcu_set_6g_scan);
 
 #define MT7932_CUSTOMER_CFG_NAME	"mediatek/IZUBA_wifi.cfg"
 #define MT7932_POWER_TRANSCRIPT_NAME \
-	"mediatek/j700-mt7932-au-sp-power-transcript.bin"
+	"mediatek/j700-mt7932-au-vlp-power-transcript.bin"
 MODULE_FIRMWARE(MT7932_POWER_TRANSCRIPT_NAME);
 #define MT7932_POWER_TRANSCRIPT_VERSION	1
 #define MT7932_POWER_TRANSCRIPT_RECORDS	48
@@ -2385,7 +2385,7 @@ int mt7932_mcu_load_power_transcript(struct mt792x_dev *dev)
 		goto release_firmware;
 	}
 	dev_info(dev->mt76.dev,
-		 "J700_MT7932_POWER_TRANSCRIPT_PASS: country=AU mode6g=SP packets=42 cid5d=28 cid95=14 source=%s bytes=%zu\n",
+		 "J700_MT7932_POWER_TRANSCRIPT_PASS: country=AU mode6g=VLP packets=42 cid5d=28 cid95=14 source=%s bytes=%zu\n",
 		 MT7932_POWER_TRANSCRIPT_NAME, fw->size);
 
 release_firmware:
@@ -3863,6 +3863,12 @@ struct mt7932_fullmac_obss_state {
 	unsigned long channels;
 };
 
+static int mt7932_fullmac_obss_2g_override = -1;
+module_param_named(j700_fullmac_obss_2g_override,
+		   mt7932_fullmac_obss_2g_override, int, 0600);
+MODULE_PARM_DESC(j700_fullmac_obss_2g_override,
+		 "diagnostic override for Apple EA/0x40 body+0x1c0");
+
 static int mt7932_mcu_fullmac_preconnect(
 	struct mt792x_dev *dev,
 	const struct mt7932_fullmac_connect_params *params)
@@ -4039,7 +4045,7 @@ int mt7932_mcu_fullmac_connect(
 		req.allow_auths = cpu_to_le32(0x40000004);
 	} else if (params->security == NEO_WIFID_FULLMAC_SECURITY_WPA3_SAE) {
 		if (params->key_len < 8 || params->key_len > 63 ||
-		    params->pmk_len)
+		    !params->pmk || params->pmk_len != 32)
 			return -EINVAL;
 		req.security_version = 8;
 		req.ad_mode = cpu_to_le32(6);
@@ -4068,6 +4074,10 @@ int mt7932_mcu_fullmac_connect(
 	/* PMK length/data are the second arm of Apple's RSN/PMK union. */
 	req.obss_2g_20mhz_request_channel_count =
 		mt7932_fullmac_obss_2g_20mhz_count(dev);
+	if (mt7932_fullmac_obss_2g_override >= 0 &&
+	    mt7932_fullmac_obss_2g_override <= 0x3f)
+		req.obss_2g_20mhz_request_channel_count =
+			mt7932_fullmac_obss_2g_override;
 	/* Apple copies CONNECTION_SETTINGS+0xe54 bits 0/1 into body+0x1c4.
 	 * Its own diagnostic names them 6G-disable and 6GHzOnly.  A directed
 	 * band-3 connect therefore advertises only the latter bit.
