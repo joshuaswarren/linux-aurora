@@ -213,6 +213,10 @@ pub(crate) enum SubmissionError {
     CommandTagInvalid,
     /// The host names this tag, but the matched firmware handles it fatally.
     CommandTagInvalidForFirmware,
+    /// A tag-14 AddKicks command must publish at least one new kick entry.
+    KsmAddKicksCountZero,
+    /// The tag-14 AddKicks count does not fit the record's 16-bit field.
+    KsmAddKicksCountOutOfRange,
 }
 
 /// Encode a work-submission doorbell exactly as `gpu.rs::run_job` does:
@@ -981,19 +985,53 @@ pub(crate) const G17P_PARTIAL_OPENING_PRIMARY_INDEX_SIZE: usize =
     4 * G17P_PARTIAL_OPENING_PAGE_SIZE;
 pub(crate) const G17P_PARTIAL_OPENING_FWCTL_OFFSET: u64 = 0x001c_0000;
 pub(crate) const G17P_PARTIAL_OPENING_CONTROL_MESSAGE_SIZE: u64 = 0x40;
+/// Legacy Linux render work-submission doorbell channel.
+///
+/// `encode_tx_doorbell` (this file) gives the layout as
+/// `MSG_TX_DOORBELL | pipe_type | (index << 2)`, `index` being the queue
+/// priority. The three actual GPU pipes are:
+///
+///   TA      = Vertex(0)
+///   3D      = Fragment(1)
+///   compute = Compute(2)
+///
+/// Linux historically sent only Vertex/priority 0 after publishing both render
+/// queues. A gate probe proved that message wakes the cores, not that it
+/// dispatches both pipes. Mac17P `AGXArmFirmware::submit3DChannel` at
+/// `0x8a43aa0` sends Fragment first (tail `0x8a43c6c`), then
+/// `submitTAChannel` at `0x8a43cdc` sends Vertex (tail `0x8a43e10`). The
+/// `slots-gfx` witness passes priority 2 to both functions. Keep the legacy
+/// constant for the default path and expose that exact native pair separately
+/// for the opt-in diagnostic.
 pub(crate) const G17P_PARTIAL_OPENING_WORK_DOORBELL_CHANNEL: u8 = 0;
 pub(crate) const G17P_PARTIAL_OPENING_PAIRED_DOORBELL: u64 =
     MSG_TX_DOORBELL | G17P_PARTIAL_OPENING_WORK_DOORBELL_CHANNEL as u64;
+pub(crate) const G17P_NATIVE_RENDER_DOORBELL_PRIORITY: u8 = 2;
+/// Mac17P submits 3D first: Fragment(1) | (priority 2 << 2) = 0x09.
+pub(crate) const G17P_NATIVE_3D_DOORBELL: u64 = MSG_TX_DOORBELL
+    | PipeType::Fragment as u64
+    | ((G17P_NATIVE_RENDER_DOORBELL_PRIORITY as u64) << DOORBELL_INDEX_SHIFT);
+/// Mac17P then submits TA: Vertex(0) | (priority 2 << 2) = 0x08.
+pub(crate) const G17P_NATIVE_TA_DOORBELL: u64 = MSG_TX_DOORBELL
+    | PipeType::Vertex as u64
+    | ((G17P_NATIVE_RENDER_DOORBELL_PRIORITY as u64) << DOORBELL_INDEX_SHIFT);
 pub(crate) const G17P_PARTIAL_OPENING_OUTER_SLOT_SIZE: usize = 0x18;
 pub(crate) const G17P_PARTIAL_OPENING_OUTER_SLOT_COUNT: u32 = 0x100;
 pub(crate) const G17P_PARTIAL_OPENING_TILING_CHANNEL_TABLE_INDEX: u8 = 0;
 pub(crate) const G17P_PARTIAL_OPENING_FRAGMENT_CHANNEL_TABLE_INDEX: u8 = 1;
 pub(crate) const G17P_COMPUTE_CHANNEL_TABLE_INDEX: u8 = 8;
 pub(crate) const G17P_COMPUTE_CHANNEL_GRID_INDEX: u8 = 4;
+/// Compute work-submission doorbell channel. VALIDATED by 2000 consecutive
+/// passing computes. Decodes under `encode_tx_doorbell` as
+/// `pipe Compute(2) | (priority 2 << 2)` = 0x0a, which is why it is not simply
+/// the channel-table index (8).
 pub(crate) const G17P_COMPUTE_WORK_DOORBELL_CHANNEL: u8 = 0x0a;
 pub(crate) const G17P_COMPUTE_WORK_DOORBELL: u64 =
     MSG_TX_DOORBELL | G17P_COMPUTE_WORK_DOORBELL_CHANNEL as u64;
-pub(crate) const G17P_COLD_OPENING_RECORD_POOL_A_SIZE: usize = 35 * 0x100;
+pub(crate) const G17P_COLD_OPENING_RECORD_POOL_A_COUNT: usize = 35;
+pub(crate) const G17P_COLD_OPENING_RECORD_POOL_A_STRIDE: usize = 0x100;
+pub(crate) const G17P_COLD_OPENING_RECORD_POOL_A_SIZE: usize =
+    G17P_COLD_OPENING_RECORD_POOL_A_COUNT * G17P_COLD_OPENING_RECORD_POOL_A_STRIDE;
 pub(crate) const G17P_COLD_OPENING_RECORD_POOL_B_SIZE: usize = 79 * 0x80;
 pub(crate) const G17P_COLD_OPENING_SHARED_OBJECT_SIZE: usize = 0x88;
 pub(crate) const G17P_COLD_OPENING_SHARED_CONTROL_SIZE: usize = 0x70;
@@ -1046,9 +1084,22 @@ pub(crate) struct G17PColdOpeningGraphAddresses {
 pub(crate) struct G17PColdOpeningOptionalAddresses {
     pub(crate) context_scratch: u64,
     pub(crate) firmware_scratch: u64,
-    pub(crate) shared_control: u64,
+    pub(crate) usc_priv_mem_flist: u64,
+    /// HardwareBufferID of `usc_priv_mem_flist`, copied to tag-15 +0x46.
+    pub(crate) usc_freelist_hardware_buffer_id: u32,
     pub(crate) channel_control: u64,
     pub(crate) tiling_shared_object: u64,
+    /// PID of the process that owns the paired TA/3D channels. Native stores
+    /// the same u32 in `_AGFIChannelState +0x44` and ConfigUpdate +0x5a.
+    pub(crate) owner_pid: u32,
+    /// TA HardwareBufferID owned by the command being published.
+    ///
+    /// Native copies one allocator result to five firmware-visible sinks: TA
+    /// command +0x18, register 0x1c830, ConfigUpdate +0x7e, PBState +0x0c, and
+    /// the PBDesc ring index. Keeping the ConfigUpdate copy beside its object
+    /// pointer prevents those fields from being staged from different command
+    /// lifetimes.
+    pub(crate) ta_hardware_buffer_id: u32,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -1057,6 +1108,8 @@ pub(crate) struct G17PColdOpeningQueueAddresses {
     pub(crate) item_ring: u64,
     pub(crate) job_list: u64,
     pub(crate) channel_control: u64,
+    /// PID of the process that owns this channel state.
+    pub(crate) owner_pid: u32,
 }
 
 /// Root, queue, and scheduler identities at the proven first-work boundary.
@@ -1270,11 +1323,48 @@ pub(crate) fn apply_g17p_cold_opening_leaf_page(
     Ok(())
 }
 
-/// Write the 35-record Pool-A array with relocatable slot pointers.
-pub(crate) fn apply_g17p_cold_opening_record_pool_a(
-    addresses: G17PColdOpeningGraphAddresses,
+/// Select the Pool-A record used by one render pass. The diagnostic moves only
+/// the cold first pass from record 0 to the captured record 1. Retained native
+/// scenes can reuse an index across multiple sequence values, so the traces do
+/// not justify replacing Linux's retained `ordinal * 2` policy globally.
+pub(crate) const fn g17p_render_pool_a_record_index(
+    submission_ordinal: u32,
+    native_first_record: bool,
+) -> usize {
+    if native_first_record && submission_ordinal == 0 {
+        1
+    } else {
+        (submission_ordinal as usize * 2) % G17P_COLD_OPENING_RECORD_POOL_A_COUNT
+    }
+}
+
+/// Initialize only the Pool-A slot corresponding to the selected first
+/// record. The slot page has no other modeled contents.
+pub(crate) fn apply_g17p_cold_opening_pool_a_start_slot(
+    record_index: usize,
     out: &mut [u8],
 ) -> Result<(), SubmissionError> {
+    if out.len() != G17P_PARTIAL_OPENING_PAGE_SIZE {
+        return Err(SubmissionError::PartialOpeningGraphObjectSize);
+    }
+    if record_index >= G17P_COLD_OPENING_RECORD_POOL_A_COUNT {
+        return Err(SubmissionError::PartialOpeningQueueHeadOutOfRange);
+    }
+    out.fill(0);
+    put_u32_le(out, 4 + record_index * 4, 1);
+    Ok(())
+}
+
+/// Write the 35-record Pool-A array with relocatable slot pointers and select
+/// the record whose first-pass state word is initialized to 0x50.
+pub(crate) fn apply_g17p_cold_opening_record_pool_a_at(
+    addresses: G17PColdOpeningGraphAddresses,
+    active_record_index: usize,
+    out: &mut [u8],
+) -> Result<(), SubmissionError> {
+    if active_record_index >= G17P_COLD_OPENING_RECORD_POOL_A_COUNT {
+        return Err(SubmissionError::PartialOpeningQueueHeadOutOfRange);
+    }
     if out.len() != G17P_COLD_OPENING_RECORD_POOL_A_SIZE {
         return Err(SubmissionError::PartialOpeningGraphObjectSize);
     }
@@ -1283,17 +1373,25 @@ pub(crate) fn apply_g17p_cold_opening_record_pool_a(
         .pool_a_slots
         .checked_add(4)
         .ok_or(SubmissionError::PartialOpeningAddressOverflow)?;
-    for index in 0..35usize {
+    for index in 0..G17P_COLD_OPENING_RECORD_POOL_A_COUNT {
         let slot = slot_base
             .checked_add((index * 4) as u64)
             .ok_or(SubmissionError::PartialOpeningAddressOverflow)?;
-        let base = index * 0x100;
+        let base = index * G17P_COLD_OPENING_RECORD_POOL_A_STRIDE;
         put_u64_le(out, base, slot);
-        if index == 0 {
+        if index == active_record_index {
             put_u32_le(out, base + 0x10, 0x50);
         }
     }
     Ok(())
+}
+
+/// Established record-zero wrapper retained for callers and fixture tests.
+pub(crate) fn apply_g17p_cold_opening_record_pool_a(
+    addresses: G17PColdOpeningGraphAddresses,
+    out: &mut [u8],
+) -> Result<(), SubmissionError> {
+    apply_g17p_cold_opening_record_pool_a_at(addresses, 0, out)
 }
 
 /// Write the 79-record Pool-B array in the cold pair-zero namespace.
@@ -1339,7 +1437,9 @@ pub(crate) fn apply_g17p_cold_opening_record_pool_b(
     Ok(())
 }
 
-/// Write the packed pair-zero, eight-group object named by both descriptors.
+/// Write the legacy packed HWPB-shaped object used by TA and by the
+/// established Fragment path. Native Fragment can instead name the dedicated
+/// PM HWPB state; TA keeps this distinct object.
 pub(crate) fn apply_g17p_cold_opening_shared_object(
     addresses: G17PColdOpeningGraphAddresses,
     out: &mut [u8],
@@ -1425,6 +1525,9 @@ pub(crate) fn apply_g17p_cold_opening_channel_control(
 pub(crate) fn apply_g17p_cold_opening_optional(
     stage: G17PColdOpeningStage,
     addresses: G17PColdOpeningOptionalAddresses,
+    queue_id: u16,
+    install: u16,
+    context_id: u16,
     out: &mut [u8],
 ) -> Result<(), SubmissionError> {
     if out.len() != G17P_COLD_OPENING_OPTIONAL_SIZE {
@@ -1435,34 +1538,36 @@ pub(crate) fn apply_g17p_cold_opening_optional(
     for (offset, address) in [
         (0x08, addresses.context_scratch),
         (0x10, addresses.firmware_scratch),
-        (0x36, addresses.shared_control),
+        (0x36, addresses.usc_priv_mem_flist),
         (0x4a, addresses.channel_control),
     ] {
         put_u64_le(out, offset, address);
     }
     let fields: &[(usize, u16)] = match stage {
+        // +0x56 is the dynamically allocated AGXQOSQueue HardwareBufferID.
+        // Native captures contain 1, 2 and 4. Linux reserves slot 2 and must
+        // publish that same ID in ConfigUpdate, the qid*8 QoS record and the
+        // KSM dependency-control qword.
         G17PColdOpeningStage::Tiling => &[
-            (0x18, 0),
-            (0x1a, 1),
+            (0x18, queue_id),
+            (0x1a, install),
             (0x1e, 2),
             (0x26, 1),
-            (0x32, 1),
             (0x52, 1),
-            (0x5a, 0x15),
+            (0x56, 2),
             (0x5e, 2),
             (0x62, 1),
             (0x66, 1),
             (0x82, 1),
         ],
         G17PColdOpeningStage::Fragment => &[
-            (0x18, 1),
-            (0x1a, 1),
+            (0x18, queue_id),
+            (0x1a, install),
             (0x1e, 2),
             (0x22, 1),
             (0x26, 1),
-            (0x32, 1),
             (0x52, 1),
-            (0x5a, 0x15),
+            (0x56, 2),
             (0x5e, 2),
             (0x62, 1),
             (0x66, 1),
@@ -1471,8 +1576,27 @@ pub(crate) fn apply_g17p_cold_opening_optional(
     for (offset, value) in fields {
         put_u16_le(out, *offset, *value);
     }
+    // AGXChannel::resetChannelState copies channel+0x4c (the owning process
+    // PID) to state+0x44. ConfigUpdate carries that same u32 at unaligned
+    // +0x5a; the working Metal capture has 0x625 in both locations.
+    put_u32_le(out, 0x5a, addresses.owner_pid);
+    // Native copies the HardwareBufferID allocated for the FList named at
+    // +0x36 into this tag-15 field. Keep the object pointer and its table slot
+    // sourced from the same retained owner.
+    put_u32_le(out, 0x46, addresses.usc_freelist_hardware_buffer_id);
+    // +0x32 is the parameter-buffer binding context when +0x6e is nonzero.
+    // It is a distinct kext allocation/source from TA command +0x0c even when
+    // both happen to be context 1 in our single-client bring-up path.
+    put_u16_le(out, 0x32, context_id);
     match stage {
-        G17PColdOpeningStage::Tiling => put_u64_le(out, 0x6e, addresses.tiling_shared_object),
+        G17PColdOpeningStage::Tiling => {
+            put_u64_le(out, 0x6e, addresses.tiling_shared_object);
+            // AGXTAChannelSKSM::submitBuffer copies descriptor +0x1248 here
+            // with a 32-bit store. The same source feeds TA command +0x18,
+            // register 0x1c830, PBState +0x0c, and the PBDesc ring; firmware
+            // uses it to index the 0x50-byte PB binding table.
+            put_u32_le(out, 0x7e, addresses.ta_hardware_buffer_id);
+        }
         G17PColdOpeningStage::Fragment => out[0x76..0x86].fill(0xff),
     }
     Ok(())
@@ -1481,6 +1605,7 @@ pub(crate) fn apply_g17p_cold_opening_optional(
 /// Write one cold event record. Both halves use the measured counter 0x102.
 pub(crate) fn apply_g17p_cold_opening_event(
     stage: G17PColdOpeningStage,
+    queue_id: u16,
     out: &mut [u8],
 ) -> Result<(), SubmissionError> {
     if out.len() != G17P_COLD_OPENING_EVENT_SIZE {
@@ -1488,15 +1613,10 @@ pub(crate) fn apply_g17p_cold_opening_event(
     }
     out.fill(0);
     put_u32_le(out, 0x00, 0x0e);
-    put_u32_le(
-        out,
-        0x04,
-        0x0001_0000
-            | match stage {
-                G17PColdOpeningStage::Tiling => 0,
-                G17PColdOpeningStage::Fragment => 1,
-            },
-    );
+    // +0x04 is [u16 queue_id][u16 1]: the firmware's own 0x41 tag14-addkicks
+    // receipt reads the QID with `ldrh w21, [x19, #4]`, and the native capture
+    // carries 0x11/0x12 there for TA/3D.
+    put_u32_le(out, 0x04, 0x0001_0000 | queue_id as u32);
     put_u32_le(out, 0x08, 0x102);
     if stage == G17PColdOpeningStage::Fragment {
         put_u32_le(out, 0x10, 0x100);
@@ -1510,44 +1630,121 @@ pub(crate) fn apply_g17p_retained_optional(
     stage: G17PColdOpeningStage,
     addresses: G17PColdOpeningOptionalAddresses,
     submission_ordinal: u32,
+    bias_generation: bool,
+    queue_id: u16,
+    install: u16,
+    context_id: u16,
     out: &mut [u8],
 ) -> Result<(), SubmissionError> {
     if submission_ordinal > 0xff {
         return Err(SubmissionError::PartialOpeningQueueHeadOutOfRange);
     }
-    apply_g17p_cold_opening_optional(stage, addresses, out)?;
+    apply_g17p_cold_opening_optional(
+        stage,
+        addresses,
+        queue_id,
+        install,
+        context_id,
+        out,
+    )?;
     if submission_ordinal != 0 {
         for offset in [0x1a, 0x52, 0x62] {
             put_u16_le(out, offset, 0);
         }
     }
-    put_u16_le(out, 0x2a, submission_ordinal as u16);
-    put_u16_le(out, 0x2e, (submission_ordinal as u16) << 8);
-    put_u16_le(out, 0x3e, submission_ordinal as u16);
-    if stage == G17PColdOpeningStage::Tiling {
-        put_u16_le(out, 0x76, submission_ordinal as u16);
+    // +0x2a is read by the firmware as a whole u64 (`ldur x27, [x19, #42]` in
+    // the tag-15 ConfigUpdate handler) and stored into its per-queue table at
+    // `0xfffffc0000125df0 + qid * 8`. Every consumer of that table uses
+    // `lsr x9, x11, #40` + `uxtb` -- bits 47:40, which is byte 0x2f, the high
+    // byte of the u16 written at +0x2e, i.e. `ordinal & 0xff`. And each one
+    // compares it against a cached byte and SKIPS when they are equal:
+    //
+    //     ldr  x11, [table + qid*8]
+    //     lsr  x9, x11, #40
+    //     ldrb w10, [x19, #40]
+    //     cmp  w10, w9, uxtb
+    //     b.eq <skip>            ; unchanged -> do nothing
+    //     strb w9, [x19, #40]
+    //
+    // It is a change-detected generation. The raw ordinal is 0 on the first
+    // render submit, which matches the firmware's initial cached 0, so the
+    // very first submission of a boot reads as "nothing changed" and the
+    // firmware declines to act -- with no record emitted either way, which is
+    // why no capture ever showed it.
+    //
+    // This is the same defect already fixed at +0x3e in this function, whose
+    // comment records that native never publishes zero there. Apply the same
+    // bias so the first submit publishes a generation the firmware sees as new.
+    let generation = if bias_generation {
+        (submission_ordinal as u16).wrapping_add(1)
+    } else {
+        submission_ordinal as u16
+    };
+    put_u16_le(out, 0x2a, generation);
+    put_u16_le(out, 0x2e, generation << 8);
+    // +0x3e is the AGXUSCPrivMemFList generation. Native copies FList+0xb0
+    // here and copies the same value into opcode-0x20 +0x0c during
+    // AsyncGrowEngine::updateSubmitInfo. Keep both Linux producers on the
+    // shared helper below: changing this generation between registration and
+    // the tag-15 kick makes B1 release and re-register the just-published USC
+    // allocation before fragment engine service.
+    put_u16_le(out, 0x3e, g17p_render_flist_generation(submission_ordinal));
+    // Native allocates +0x56 dynamically; Linux retains its reserved slot 2
+    // across submissions and publishes it consistently in every QoS sink.
+    put_u16_le(out, 0x56, 2);
+    // TA +0x76 is not the submission ordinal. Native copies the u64 at
+    // AGXHardwareBufferBase +0x68 here. Leave the freshly initialized local
+    // token intact until that command-owned PB state is modeled explicitly;
+    // in particular, never let an unrelated ordinal overwrite +0x76/+0x7e.
+    Ok(())
+}
+
+/// Host-owned equivalent of AGXUSCPrivMemFList +0xb0 for a retained render
+/// queue. Zero is the firmware BSS/reset value, so the first registration must
+/// publish one; each later restage advances the same generation once.
+pub(crate) const fn g17p_render_flist_generation(submission_ordinal: u32) -> u16 {
+    (submission_ordinal as u16).wrapping_add(1)
+}
+
+/// Refresh the canonical event record while retaining its physical address.
+///
+/// `entry_stamp` is the u24 at tag-14 `+0x09`: the KSM producer stamp of the
+/// kick this AddKicks announces. `+0x08` stays the constant queue priority 2
+/// that every captured native AddKicks carries.
+pub(crate) fn apply_g17p_retained_event_with_stamp(
+    stage: G17PColdOpeningStage,
+    entry_stamp: u32,
+    queue_id: u16,
+    out: &mut [u8],
+) -> Result<(), SubmissionError> {
+    if entry_stamp == 0 || entry_stamp > 0x00ff_ffff {
+        return Err(SubmissionError::PartialOpeningQueueHeadOutOfRange);
     }
+    apply_g17p_cold_opening_event(stage, queue_id, out)?;
+    put_u32_le(out, 0x08, (entry_stamp << 8) | 2);
     Ok(())
 }
 
 /// Refresh the canonical event record while retaining its physical address.
+///
+/// Without the SKSM half there is no KSM producer to read a stamp from, so
+/// the stamp is derived as `submission_ordinal + 1` -- which is exactly what
+/// the producer would have yielded for the first `stamp_count` submissions,
+/// since the geometry seeds `current_timestamp` at 1 and advances it by one
+/// per kick.
 pub(crate) fn apply_g17p_retained_event(
     stage: G17PColdOpeningStage,
     submission_ordinal: u32,
+    queue_id: u16,
     out: &mut [u8],
 ) -> Result<(), SubmissionError> {
     let group_number = submission_ordinal
         .checked_add(1)
         .ok_or(SubmissionError::PartialOpeningQueueHeadOutOfRange)?;
-    if group_number > 0x00ff_ffff {
-        return Err(SubmissionError::PartialOpeningQueueHeadOutOfRange);
-    }
-    apply_g17p_cold_opening_event(stage, out)?;
-    put_u32_le(out, 0x08, (group_number << 8) | 2);
-    Ok(())
+    apply_g17p_retained_event_with_stamp(stage, group_number, queue_id, out)
 }
 
-/// Write the cold class-2 queue record with queue identity 0x15.
+/// Write the cold class-2 queue record for the owning process.
 pub(crate) fn apply_g17p_cold_opening_queue_record(
     addresses: G17PColdOpeningQueueAddresses,
     out: &mut [u8],
@@ -1560,15 +1757,25 @@ pub(crate) fn apply_g17p_cold_opening_queue_record(
     put_u64_le(out, 0x08, addresses.item_ring);
     put_u64_le(out, 0x10, addresses.job_list);
     put_u32_le(out, 0x24, u32::MAX);
+    // The live native render path reads state +0x28 through getPriority(),
+    // copies it to 3D setup +0xe5c, and validates it against KSM queue +0x1c.
+    // The captured ordinary Metal command carries 2. Channel +0x1c0 is only
+    // context-priority bookkeeping and is not the live-state value.
     put_u32_le(out, 0x28, 2);
     put_u32_le(out, 0x2c, 2);
     out[0x36..0x38].fill(0xff);
     put_u32_le(out, 0x38, 0);
-    put_u32_le(out, 0x40, 2);
-    put_u32_le(out, 0x44, u32::MAX);
-    put_u32_le(out, 0x48, 0x15);
+    put_u32_le(out, 0x3c, 2);
+    put_u32_le(out, 0x40, u32::MAX);
+    // Native reset copies the channel owner's process PID here. The same
+    // value is published in ConfigUpdate +0x5a.
+    put_u32_le(out, 0x44, addresses.owner_pid);
+    // Native reset clears +0x48 and copies channel+0xf8 to state+0x70. The
+    // firmware resource stack allocates this object with an exact 0x80-byte
+    // stride, so the old inherited +0x9c pointer was outside the object KSM
+    // receives through entry payload +0x18.
+    put_u64_le(out, 0x70, addresses.channel_control);
     put_u32_le(out, 0x94, 0);
-    put_u64_le(out, 0x9c, addresses.channel_control);
     Ok(())
 }
 
@@ -1775,7 +1982,7 @@ pub(crate) const fn prepare_g17p_partial_opening_pre_0x84_status(
 fn prepare_g17p_partial_opening_outer_slot(
     state: G17PPartialOpeningOuterChannelState,
     channel_table_index: u8,
-    queue_grid_index: u8,
+    queue_grid_index: u8, // the QID this slot dispatches to
     kind: u32,
 ) -> Result<G17PPartialOpeningOuterSlotPlan, SubmissionError> {
     if state.producer >= G17P_PARTIAL_OPENING_OUTER_SLOT_COUNT
@@ -1798,6 +2005,20 @@ fn prepare_g17p_partial_opening_outer_slot(
     let mut slot = [0u8; G17P_PARTIAL_OPENING_OUTER_SLOT_SIZE];
     put_u64_le(&mut slot, 0x08, state.queue_gpu_va);
     put_u32_le(&mut slot, 0x10, kind);
+    // +0x14 is [u16 write_index][u8 queue_id][u8 1]. The middle byte is the
+    // QUEUE ID, not a separate "grid index" -- macOS's own
+    // AGFIAcceleratorDataMasterEntry slot carries 0x11 (TA) and 0x12 (3D)
+    // there, matching the QIDs its tag-15 publishes, and the rest of the
+    // 0x18-byte entry matches this encoder field for field:
+    //
+    //   +0x00 zero                       +0x00 zero
+    //   +0x08 queue record VA            +0x08 state.queue_gpu_va
+    //   +0x10 data master (TA 0 / 3D 1)  +0x10 kind (PipeType Vertex/Fragment)
+    //   +0x14 0x01_11_0003 / 0x01_12_0003  write_index 3, qid, bit24 set
+    //
+    // The name hid a coupling: this byte must agree with the QID published in
+    // tag-15, tag-14 and the SKSM registration. Compute never exposed it
+    // because G17P_COMPUTE_CHANNEL_GRID_INDEX is 4 and its QID is also 4.
     put_u32_le(
         &mut slot,
         0x14,
@@ -1835,11 +2056,13 @@ pub(crate) fn prepare_g17p_compute_channel_work(
 pub(crate) fn prepare_g17p_partial_opening_work_pair(
     fragment: G17PPartialOpeningOuterChannelState,
     tiling: G17PPartialOpeningOuterChannelState,
+    fragment_queue_id: u8,
+    tiling_queue_id: u8,
 ) -> Result<PreparedG17PPartialOpeningWorkPair, SubmissionError> {
     let fragment = match prepare_g17p_partial_opening_outer_slot(
         fragment,
         G17P_PARTIAL_OPENING_FRAGMENT_CHANNEL_TABLE_INDEX,
-        1,
+        fragment_queue_id,
         1,
     ) {
         Ok(value) => value,
@@ -1848,7 +2071,7 @@ pub(crate) fn prepare_g17p_partial_opening_work_pair(
     let tiling = match prepare_g17p_partial_opening_outer_slot(
         tiling,
         G17P_PARTIAL_OPENING_TILING_CHANNEL_TABLE_INDEX,
-        0,
+        tiling_queue_id,
         0,
     ) {
         Ok(value) => value,
@@ -2111,6 +2334,32 @@ pub(crate) const fn decode_kick_timestamp(
 /// Encode the host timestamp layout without a queue ID.
 pub(crate) const fn encode_kick_timestamp(timestamp: KickTimestamp) -> u64 {
     ((timestamp.stamp as u64) << KICK_STAMP_SHIFT) | timestamp.stamp_index as u64
+}
+
+/// G17P 3D-channel payload returned by
+/// `AGX3DChannel::getSKSMCompletionScratchRegPayload()`.
+///
+/// The native channel stores this byte at channel +0x1d4 and every captured
+/// G17P 3D submission returns one. It is a payload selector, not a QID and not
+/// an address-space tag.
+pub(crate) const G17P_3D_COMPLETION_SCRATCH_PAYLOAD: u8 = 1;
+
+/// Pack `AGX3DCommandDescriptor::getSKSMCompletionScratchRegValue()`.
+///
+/// The kext stores this value in both its host descriptor and the emitted GPU
+/// command at +0x2160. Bits [39:0] are the command's SKSM queue timestamp and
+/// bits [47:40] are the 3D-channel scratch payload. The native full-command
+/// witness `0x0000010000000f76` therefore decodes as payload one and timestamp
+/// `0xf76`; it is categorically not a USC FList pointer.
+pub(crate) const fn encode_g17p_3d_completion_scratch(
+    timestamp: u64,
+    payload: u8,
+) -> Result<u64, SubmissionError> {
+    if timestamp & !KICK_TS_MASK != 0 {
+        Err(SubmissionError::KickTimestampOutOfRange)
+    } else {
+        Ok(timestamp | ((payload as u64) << KICK_QID_SHIFT))
+    }
 }
 
 /// Prepare the exact entry-slot/doorbell/next-timestamp tuple for one kick.
@@ -2476,6 +2725,89 @@ pub(crate) fn prepare_g17p_compute_primary_event(
     })
 }
 
+/// Host-written extent of the tag-14 `KsmKickQueueAddKicks` channel command.
+///
+/// `AGXCLChannelSKSM::submitBuffer` writes exactly these 0x15 bytes inline at
+/// mac17p `0xfffffe00089fa39c-0xfffffe00089fa3cc`, then publishes the record's
+/// GPU address through `AGXChannel::writeChannelCommandPointer`.
+pub(crate) const G17P_KSM_ADD_KICKS_COMMAND_SIZE: usize = 0x15;
+/// Bytes the matched J700 A000 handler cache-invalidates before reading the
+/// record (`mov w1, #0x18` at `0xfffffc0000011714`). The three bytes past the
+/// host-written extent are never loaded, but must not be stale.
+pub(crate) const G17P_KSM_ADD_KICKS_COMMAND_FETCH_SIZE: usize = 0x18;
+
+/// Fields the native host copies into one tag-14 AddKicks record.
+///
+/// Native sources, all from `submitBuffer`:
+/// * `queue_id`      = `AGXKSMKickQueue[0x0c]`, the QID.
+/// * `add_count`     = `AGXCLCommandDescriptor[0x2e4]`, the number of kick
+///   entries this submission published (NOPs plus the one CL entry). It is the
+///   same value the suppressed MMIO variant passes to
+///   `AGXKSMKickQueueG16::addKicks`.
+/// * `queue_priority`= `AGXKSMKickQueue[0x1c]`, i.e. `AGXChannel::getPriority()`.
+///   This queue's value is the retained completion selector.
+/// * `entry_stamp`   = the queue's producer stamp **before** the CL entry
+///   advanced it, returned by `AGXKSMKickQueueG16::encodeKickEntry`
+///   (`ldr x0, [x19, #0x48]` at `0xfffffe0008a56e00`). Its low byte is the ring
+///   entry index; A000 reads it only for its trace event.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PKsmAddKicksCommand {
+    pub(crate) queue_id: u8,
+    pub(crate) add_count: u32,
+    pub(crate) queue_priority: u8,
+    pub(crate) entry_stamp: u64,
+}
+
+/// Bytes for one tag-14 record, ready to copy into retained queue storage.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct PreparedG17PKsmAddKicks {
+    pub(crate) bytes: [u8; G17P_KSM_ADD_KICKS_COMMAND_SIZE],
+}
+
+/// Build the tag-14 `KsmKickQueueAddKicks` channel command.
+///
+/// The record replaces the host SKSM-port `addKicks` pair on J700, where every
+/// host access to `sgx 0x0..0x2ffff` takes an asynchronous SError. The matched
+/// A000 firmware dispatches type 14 to `0xfffffc0000011710`, which writes the
+/// QID to `sgx+0x103a8` and this record's `add_count` to `sgx+0x21018` through
+/// the firmware's own mapping of the block.
+///
+/// The A000 handler loads only `+0x04`, `+0x06` and `+0x09`; `+0x08` and `+0x11`
+/// are written for host parity.
+pub(crate) fn prepare_g17p_ksm_add_kicks_command(
+    command: G17PKsmAddKicksCommand,
+) -> Result<PreparedG17PKsmAddKicks, SubmissionError> {
+    if command.queue_id > KICK_QID_MASK {
+        return Err(SubmissionError::QueueIdOutOfRange);
+    }
+    if command.queue_priority > 3 {
+        return Err(SubmissionError::KickQueueCompletionSelectorOutOfRange);
+    }
+    if command.entry_stamp & !KICK_TS_MASK != 0 {
+        return Err(SubmissionError::KickTimestampOutOfRange);
+    }
+    if command.add_count == 0 {
+        return Err(SubmissionError::KsmAddKicksCountZero);
+    }
+    let add_count = match u16::try_from(command.add_count) {
+        Ok(add_count) => add_count,
+        Err(_) => return Err(SubmissionError::KsmAddKicksCountOutOfRange),
+    };
+
+    let mut bytes = [0u8; G17P_KSM_ADD_KICKS_COMMAND_SIZE];
+    put_u32_le(
+        &mut bytes,
+        0x00,
+        G17PTopLevelCommandType::KsmKickQueueAddKicks as u32,
+    );
+    put_u16_le(&mut bytes, 0x04, u16::from(command.queue_id));
+    put_u16_le(&mut bytes, 0x06, add_count);
+    bytes[0x08] = command.queue_priority;
+    put_u64_le(&mut bytes, 0x09, command.entry_stamp);
+    put_u32_le(&mut bytes, 0x11, G17P_COMPUTE_DATA_MASTER);
+    Ok(PreparedG17PKsmAddKicks { bytes })
+}
+
 /// Encode tag 16 only when the host descriptor carries its optional pointer.
 /// The simple direct first add3 profile does not publish this record.
 pub(crate) fn encode_g17p_compute_optional_event(
@@ -2527,6 +2859,49 @@ pub(crate) fn prepare_g17p_compute_cl_command_state(
             empty,
             empty,
         ],
+    })
+}
+
+/// Select the descriptor-embedded RegisterArrays consumed by a native render
+/// kick. 3D's four complete arrays start at command +0xa0 and follow at the
+/// 0x720-byte stride present in every working capture.
+pub(crate) fn prepare_g17p_render_cl_command_state(
+    descriptor_low: u64,
+    tiling: bool,
+) -> Result<G17PComputeClCommandState, SubmissionError> {
+    const FRAGMENT_RCE_PROGRAM_STRIDE: u64 = 0x720;
+    const FRAGMENT_RCE_PROGRAM_OFFSET: u64 = 0xa0;
+    let binding = |offset: u64, tag: u8| {
+        descriptor_low
+            .checked_add(offset)
+            .map(|address| G17PClRceBinding { address, tag })
+            .ok_or(SubmissionError::ComputeRceAddressOverflow)
+    };
+    let empty = G17PClRceBinding { address: 0, tag: 0 };
+
+    let rce_bindings = if tiling {
+        [binding(0x60, 0x47)?, empty, empty, empty]
+    } else {
+        let fragment_rce = descriptor_low
+            .checked_add(FRAGMENT_RCE_PROGRAM_OFFSET)
+            .ok_or(SubmissionError::ComputeRceAddressOverflow)?;
+        let external_binding = |index: u64, tag: u8| {
+            fragment_rce
+                .checked_add(index * FRAGMENT_RCE_PROGRAM_STRIDE)
+                .map(|address| G17PClRceBinding { address, tag })
+                .ok_or(SubmissionError::ComputeRceAddressOverflow)
+        };
+        [
+            external_binding(0, 0x56)?,
+            external_binding(1, 0x10)?,
+            external_binding(2, 0x17)?,
+            external_binding(3, 0x0a)?,
+        ]
+    };
+
+    Ok(G17PComputeClCommandState {
+        event_mask: [0; 4],
+        rce_bindings,
     })
 }
 
@@ -2776,6 +3151,8 @@ pub(crate) fn prepare_g17p_cl_kick_entry(
     if queue.qos.class_40 > 0x1f {
         return Err(SubmissionError::KickQosClassOutOfRange);
     }
+    // Native writes `(RCEInfo + 0x00) & 3` here. RCEInfo +0x04 is the active
+    // RegisterArray count (1 for TA, 4 for 3D), not this field.
     if operands.rce_kind > 3 {
         return Err(SubmissionError::KickRceKindOutOfRange);
     }
@@ -3436,6 +3813,38 @@ pub(crate) const fn prepare_g17p_compute_sksm_queue_config(
     )
 }
 
+/// Prepare the queue-configuration transaction for one G17P *render* queue.
+///
+/// Identical to the compute helper except for the data master, which the
+/// twelve captured macOS render passes pin to TA = 0 and 3D = 1 in three
+/// independent places (outer ring slot `+0x10`, tag-14 `+0x11`, tag-15
+/// `+0x22`). The compute data master is rejected here so a render caller
+/// cannot silently configure a CL queue.
+pub(crate) const fn prepare_g17p_render_sksm_queue_config(
+    routing: G17PComputeQueueRouting,
+    data_master: u32,
+    geometry: G17SksmScratchGeometry,
+) -> Result<PreparedG17PSksmQueueConfig, SubmissionError> {
+    match routing.geometry.validate() {
+        Ok(()) => {}
+        Err(error) => return Err(error),
+    }
+    if data_master != G17P_TA_DATA_MASTER && data_master != G17P_3D_DATA_MASTER {
+        return Err(SubmissionError::KickQueueDataMasterOutOfRange);
+    }
+    if routing.entry_gpu_va & (routing.geometry.allocation_alignment() - 1) != 0 {
+        return Err(SubmissionError::KickQueueEntryAddressUnencodable);
+    }
+    prepare_g17p_sksm_queue_config(
+        G17ChannelAbiTarget::A18ProG17P,
+        routing.queue_id,
+        data_master,
+        routing.completion_selector,
+        routing.entry_gpu_va,
+        geometry,
+    )
+}
+
 pub(crate) const G17P_KSM_COMPLETION_QUEUE_COUNT: u8 = 4;
 pub(crate) const G17P_KSM_COMPLETION_DESCRIPTOR_SIZE: usize = 0x20;
 pub(crate) const G17P_KSM_COMPLETION_ENTRY_SIZE: u32 = 0x40;
@@ -3851,6 +4260,49 @@ pub(crate) const SUBMISSION_LIVE_GAPS: SubmissionLiveGaps = SubmissionLiveGaps {
 mod tests {
     use super::*;
 
+    /// Witnessed against the macOS capture: a real Metal render leaves the
+    /// parameter-buffer ring state at {7, 7, 0, 0}, and `PBState[+0x28]`
+    /// holds the full tagged address `0x1000190000`. The encode and decode
+    /// must be exact inverses -- that is what makes the field map from the two
+    /// kernelcache functions trustworthy.
+    #[test]
+    fn g17p_pbdesc_round_trips_the_witnessed_ring_state() {
+        assert_eq!(g17p_pbdesc_segment(0x10_0019_0000), 0);
+        assert_eq!(
+            g17p_pbdesc_reconstructed_address(0x10_0019_0000),
+            0x10_0019_0000
+        );
+        assert_eq!(
+            g17p_pbdesc_reconstructed_address(0x70_0247_8000),
+            0x70_0247_8000
+        );
+        assert_eq!(
+            g17p_pbdesc_reconstructed_address(0x0247_8000),
+            0x80_0247_8000
+        );
+        let state = G17PPbDescRingState {
+            counter_a: 7,
+            counter_b: 7,
+            flag_high: 0,
+            flag_low: 0,
+        };
+        let descriptor = encode_g17p_pbdesc([0; 4], 0x10_0019_0000, 0, state);
+        // dword0 carries the address >> 4; dword1 the segment >> 8 up top.
+        assert_eq!(descriptor[0], 0x0001_9000);
+        assert_eq!(descriptor[1] >> 28, 0x0);
+        assert_eq!(decode_g17p_pbdesc(descriptor), state);
+
+        // Bits the firmware owns survive a re-encode.
+        let previous = [0x0000_0005u32, 0x0abc_defu32, 0xf000_0000u32, 0x4000_0000u32];
+        let again = encode_g17p_pbdesc(previous, 0x10_0019_0000, 0x0012_3456, state);
+        assert_eq!(again[0] & 0x6, previous[0] & 0x6);
+        assert_eq!(again[1] & 0x003f_ffff, 0x0012_3456);
+        assert_eq!(again[2] & !0x003f_ffff, previous[2] & !0x003f_ffff);
+        assert_eq!(decode_g17p_pbdesc(again), state);
+
+        assert_eq!(g17p_pbdesc_offset(2), 2 * G17P_PBDESC_ENTRY_SIZE);
+    }
+
     fn get_u64_le(raw: &[u8], offset: usize) -> u64 {
         u64::from_le_bytes(raw[offset..offset + 8].try_into().unwrap())
     }
@@ -3930,6 +4382,48 @@ mod tests {
     }
 
     #[test]
+    fn render_command_state_selects_native_descriptor_register_arrays() {
+        let ta = prepare_g17p_render_cl_command_state(0x70_0001_0740, true).unwrap();
+        assert_eq!(ta.event_mask, [0; 4]);
+        assert_eq!(
+            ta.rce_bindings,
+            [
+                G17PClRceBinding {
+                    address: 0x70_0001_07a0,
+                    tag: 0x47,
+                },
+                G17PClRceBinding { address: 0, tag: 0 },
+                G17PClRceBinding { address: 0, tag: 0 },
+                G17PClRceBinding { address: 0, tag: 0 },
+            ]
+        );
+
+        let fragment =
+            prepare_g17p_render_cl_command_state(0x70_0016_5800, false).unwrap();
+        assert_eq!(
+            fragment.rce_bindings,
+            [
+                G17PClRceBinding {
+                    address: 0x70_0016_58a0,
+                    tag: 0x56,
+                },
+                G17PClRceBinding {
+                    address: 0x70_0016_5fc0,
+                    tag: 0x10,
+                },
+                G17PClRceBinding {
+                    address: 0x70_0016_66e0,
+                    tag: 0x17,
+                },
+                G17PClRceBinding {
+                    address: 0x70_0016_6e00,
+                    tag: 0x0a,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn tx_doorbell_matches_the_shipping_agx2_wire_form() {
         // gpu.rs: MSG_TX_DOORBELL = 0x83 << 48; run_job kicks
         // MSG_TX_DOORBELL | pipe_type | (index << 2).
@@ -3951,6 +4445,36 @@ mod tests {
         assert_eq!(
             encode_tx_doorbell(PipeType::Vertex, 8),
             Err(SubmissionError::DoorbellIndexOutOfRange)
+        );
+    }
+
+    #[test]
+    fn native_render_doorbells_are_3d_then_ta_at_priority_two() {
+        // Pipe identity at priority zero: 3D is the low Fragment pipe 1 and
+        // TA is the low Vertex pipe 0. Compute is the remaining pipe 2.
+        assert_eq!(
+            encode_tx_doorbell(PipeType::Fragment, 0),
+            Ok(0x0083_0000_0000_0001)
+        );
+        assert_eq!(
+            encode_tx_doorbell(PipeType::Vertex, 0),
+            Ok(0x0083_0000_0000_0000)
+        );
+        assert_eq!(
+            encode_tx_doorbell(PipeType::Compute, 0),
+            Ok(0x0083_0000_0000_0002)
+        );
+
+        assert_eq!(G17P_NATIVE_RENDER_DOORBELL_PRIORITY, 2);
+        assert_eq!(G17P_NATIVE_3D_DOORBELL, 0x0083_0000_0000_0009);
+        assert_eq!(G17P_NATIVE_TA_DOORBELL, 0x0083_0000_0000_0008);
+        assert_eq!(
+            encode_tx_doorbell(PipeType::Fragment, 2),
+            Ok(G17P_NATIVE_3D_DOORBELL)
+        );
+        assert_eq!(
+            encode_tx_doorbell(PipeType::Vertex, 2),
+            Ok(G17P_NATIVE_TA_DOORBELL)
         );
     }
 
@@ -4595,18 +5119,63 @@ mod tests {
     }
 
     #[test]
+    fn g17p_native_cold_pool_a_starts_at_initialized_record_one_only() {
+        let addresses = G17PColdOpeningGraphAddresses {
+            primary_index: 0x70_0100_0000,
+            secondary_index: 0x70_0100_4000,
+            pool_a_slots: 0x70_0100_8000,
+            pool_b_slots: 0x70_0100_c000,
+            shared_slots: 0x70_0101_0000,
+            flag: 0x70_0101_4000,
+        };
+        assert_eq!(g17p_render_pool_a_record_index(0, false), 0);
+        assert_eq!(g17p_render_pool_a_record_index(0, true), 1);
+        assert_eq!(g17p_render_pool_a_record_index(1, false), 2);
+        assert_eq!(g17p_render_pool_a_record_index(1, true), 2);
+
+        let mut slots = [0xa5; G17P_PARTIAL_OPENING_PAGE_SIZE];
+        apply_g17p_cold_opening_pool_a_start_slot(1, &mut slots).unwrap();
+        assert_eq!(get_u32_le(&slots, 4), 0);
+        assert_eq!(get_u32_le(&slots, 8), 1);
+        assert!(slots[..4].iter().all(|byte| *byte == 0));
+        assert!(slots[12..].iter().all(|byte| *byte == 0));
+
+        let mut records = [0xa5; G17P_COLD_OPENING_RECORD_POOL_A_SIZE];
+        apply_g17p_cold_opening_record_pool_a_at(addresses, 1, &mut records).unwrap();
+        assert_eq!(get_u64_le(&records, 0), addresses.pool_a_slots + 4);
+        assert_eq!(get_u32_le(&records, 0x10), 0);
+        assert_eq!(get_u64_le(&records, 0x100), addresses.pool_a_slots + 8);
+        assert_eq!(get_u32_le(&records, 0x110), 0x50);
+        assert_eq!(get_u32_le(&records, 0x108), 0);
+        assert_eq!(
+            get_u64_le(
+                &records,
+                (G17P_COLD_OPENING_RECORD_POOL_A_COUNT - 1)
+                    * G17P_COLD_OPENING_RECORD_POOL_A_STRIDE,
+            ),
+            addresses.pool_a_slots
+                + 4
+                + ((G17P_COLD_OPENING_RECORD_POOL_A_COUNT - 1) * 4) as u64
+        );
+    }
+
+    #[test]
     fn g17p_cold_opening_work_records_keep_identity_context_and_relocatable_pointers() {
         let optional_addresses = G17PColdOpeningOptionalAddresses {
             context_scratch: 0x70_0200_0000,
             firmware_scratch: 0x70_0200_4000,
-            shared_control: 0x70_0200_8000,
+            usc_priv_mem_flist: 0x70_0200_8000,
+            usc_freelist_hardware_buffer_id: 0,
             channel_control: 0x70_0200_c000,
             tiling_shared_object: 0x70_0201_0000,
+            owner_pid: 0x15,
+            ta_hardware_buffer_id: 0,
         };
         let supplied = 0x70_0200_0000..0x70_0202_0000;
         for stage in [G17PColdOpeningStage::Tiling, G17PColdOpeningStage::Fragment] {
             let mut optional = [0u8; G17P_COLD_OPENING_OPTIONAL_SIZE];
-            apply_g17p_cold_opening_optional(stage, optional_addresses, &mut optional).unwrap();
+            apply_g17p_cold_opening_optional(stage, optional_addresses, 0, 1, 1, &mut optional)
+                .unwrap();
             assert_eq!(get_u32_le(&optional, 0), 0x0f);
             for offset in [0x08, 0x10, 0x36, 0x4a] {
                 assert!(supplied.contains(&get_u64_le(&optional, offset)));
@@ -4615,7 +5184,7 @@ mod tests {
             assert_eq!(get_u16_le(&optional, 0x32), 1);
             assert_eq!(get_u16_le(&optional, 0x46), 0);
             assert_eq!(get_u16_le(&optional, 0x56), 0);
-            assert_eq!(get_u16_le(&optional, 0x5a), 0x15);
+            assert_eq!(get_u32_le(&optional, 0x5a), 0x15);
             assert_eq!(get_u16_le(&optional, 0x5e), 2);
             assert_eq!(get_u16_le(&optional, 0x3e), 0);
             assert_eq!(
@@ -4627,7 +5196,7 @@ mod tests {
             );
 
             let mut event = [0u8; G17P_COLD_OPENING_EVENT_SIZE];
-            apply_g17p_cold_opening_event(stage, &mut event).unwrap();
+            apply_g17p_cold_opening_event(stage, 0, &mut event).unwrap();
             assert_eq!(get_u32_le(&event, 0x08), 0x102);
             assert_eq!(
                 source_fixture_fingerprint(&event),
@@ -4681,16 +5250,19 @@ mod tests {
             item_ring: 0x70_0200_4000,
             job_list: 0x70_0200_8000,
             channel_control: 0x70_0200_c000,
+            owner_pid: 0x15,
         };
         let mut queue = [0u8; G17P_COLD_OPENING_QUEUE_RECORD_SIZE];
         apply_g17p_cold_opening_queue_record(queue_addresses, &mut queue).unwrap();
-        for offset in [0x00, 0x08, 0x10, 0x9c] {
+        for offset in [0x00, 0x08, 0x10, 0x70] {
             assert!(supplied.contains(&get_u64_le(&queue, offset)));
         }
-        assert_eq!(get_u32_le(&queue, 0x48), 0x15);
+        assert_eq!(get_u32_le(&queue, 0x48), 0);
         assert_eq!(get_u32_le(&queue, 0x28), 2);
-        assert_eq!(get_u32_le(&queue, 0x40), 2);
-        assert_eq!(source_fixture_fingerprint(&queue), 0xd8d9_be7f_d49a_1f14);
+        assert_eq!(get_u32_le(&queue, 0x3c), 2);
+        assert_eq!(get_u32_le(&queue, 0x40), u32::MAX);
+        assert_eq!(get_u32_le(&queue, 0x44), 0x15);
+        assert_eq!(source_fixture_fingerprint(&queue), 0x0704_bf11_9ee1_8084);
 
         let mut pointers = [0u8; G17P_COLD_OPENING_POINTER_BLOCK_SIZE];
         apply_g17p_cold_opening_pointer_block(&mut pointers).unwrap();
@@ -4896,7 +5468,9 @@ mod tests {
                     0, 0, 3, 0, 1, 1,
                 ],
                 next_producer: 1,
-            }
+            },
+            1,
+            0
         );
         assert_eq!(
             prepared.tiling,
@@ -4955,7 +5529,7 @@ mod tests {
             queue_write_index: 3,
         };
         assert_eq!(
-            prepare_g17p_partial_opening_work_pair(full, full),
+            prepare_g17p_partial_opening_work_pair(full, full, 1, 0),
             Err(SubmissionError::RingFull)
         );
         assert_eq!(
@@ -4965,6 +5539,8 @@ mod tests {
                     ..full
                 },
                 full,
+                1,
+                0,
             ),
             Err(SubmissionError::PartialOpeningChannelCounterOutOfRange)
         );
@@ -4977,6 +5553,8 @@ mod tests {
                     ..full
                 },
                 full,
+                1,
+                0,
             ),
             Err(SubmissionError::PartialOpeningQueueHeadOutOfRange)
         );
@@ -5125,18 +5703,139 @@ mod tests {
         }
     }
 
+    /// Native tag-14 AddKicks, PROVEN on all 25 captured publishes:
+    /// `+0x00 = 0x0e`, `+0x04 u16 = qid`, `+0x06 u16 = 1` kick, `+0x08 u8 = 2`
+    /// queue priority, `+0x09 u24 = entry stamp`, `+0x11 u8 = data master`,
+    /// everything else zero.
+    #[test]
+    fn g17p_retained_event_carries_native_addkicks_bytes() {
+        for (stage, qid, data_master) in [
+            (G17PColdOpeningStage::Tiling, 0u16, 0u8),
+            (G17PColdOpeningStage::Fragment, 1u16, 1u8),
+        ] {
+            let mut event = [0xa5u8; G17P_COLD_OPENING_EVENT_SIZE];
+            apply_g17p_retained_event_with_stamp(stage, 0x3d9, 0, &mut event).unwrap();
+            assert_eq!(get_u32_le(&event, 0x00), 0x0e);
+            assert_eq!(get_u16_le(&event, 0x04), qid);
+            assert_eq!(get_u16_le(&event, 0x06), 1);
+            assert_eq!(event[0x08], 2);
+            assert_eq!(
+                u32::from_le_bytes([event[0x09], event[0x0a], event[0x0b], 0]),
+                0x3d9
+            );
+            assert_eq!(event[0x11], data_master);
+            for (index, byte) in event.iter().enumerate() {
+                if !(0x00..0x0c).contains(&index) && index != 0x11 {
+                    assert_eq!(*byte, 0, "unproven byte set at {index:#x}");
+                }
+            }
+        }
+        // A zero stamp is not a legal AddKicks value and must be refused
+        // rather than published.
+        let mut event = [0u8; G17P_COLD_OPENING_EVENT_SIZE];
+        assert!(
+            apply_g17p_retained_event_with_stamp(G17PColdOpeningStage::Tiling, 0, 0, &mut event)
+                .is_err()
+        );
+    }
+
+    /// The render pair configures TA on data master 0 and 3D on data master 1;
+    /// the compute data master must be refused on this path.
+    #[test]
+    fn g17p_render_queue_config_admits_only_render_data_masters() {
+        let geometry = T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY;
+        let scratch = g17_manager::T8140_G17P_PLATFORM_CONFIG.sksm_scratch;
+        for (queue_id, data_master, entry) in [
+            (
+                G17P_PARTIAL_OPENING_TILING_CHANNEL_TABLE_INDEX,
+                G17P_TA_DATA_MASTER,
+                0x70_0043_8000u64,
+            ),
+            (
+                G17P_PARTIAL_OPENING_FRAGMENT_CHANNEL_TABLE_INDEX,
+                G17P_3D_DATA_MASTER,
+                0x70_0046_0000u64,
+            ),
+        ] {
+            let routing = G17PComputeQueueRouting {
+                queue_id,
+                completion_selector: 2,
+                entry_gpu_va: entry,
+                geometry,
+            };
+            let config =
+                prepare_g17p_render_sksm_queue_config(routing, data_master, scratch).unwrap();
+            assert_eq!(config.payload & G17P_SKSM_QUEUE_ENTRY_ADDRESS_MASK, entry);
+            assert_eq!(config.payload >> 60, data_master as u64 + 1);
+            assert_eq!(config.enable_pair.word1, 1u64 << queue_id);
+            assert_eq!(config.enable_pair.word0, 0);
+            assert!(prepare_g17p_render_sksm_queue_config(
+                routing,
+                G17P_COMPUTE_DATA_MASTER,
+                scratch
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn g17p_render_config_update_carries_context_hardware_buffer_id_and_pid() {
+        let addresses = G17PColdOpeningOptionalAddresses {
+            context_scratch: 0x70_0200_0000,
+            firmware_scratch: 0x70_0200_4000,
+            usc_priv_mem_flist: 0x70_0200_8000,
+            usc_freelist_hardware_buffer_id: 5,
+            channel_control: 0x70_0200_c000,
+            tiling_shared_object: 0x70_0201_0000,
+            owner_pid: 0x625,
+            ta_hardware_buffer_id: 7,
+        };
+        for (stage, context_id) in [
+            (G17PColdOpeningStage::Tiling, 2),
+            (G17PColdOpeningStage::Fragment, 6),
+        ] {
+            let mut optional = [0u8; G17P_COLD_OPENING_OPTIONAL_SIZE];
+            apply_g17p_retained_optional(
+                stage,
+                addresses,
+                0,
+                false,
+                0,
+                1,
+                context_id,
+                &mut optional,
+            )
+            .unwrap();
+            assert_eq!(get_u16_le(&optional, 0x32), context_id);
+            assert_eq!(get_u32_le(&optional, 0x46), 5);
+            assert_eq!(get_u32_le(&optional, 0x5a), 0x625);
+            assert_eq!(
+                get_u32_le(&optional, 0x7e),
+                if stage == G17PColdOpeningStage::Tiling {
+                    7
+                } else {
+                    u32::MAX
+                }
+            );
+        }
+    }
+
     #[test]
     fn g17p_retained_canonical_records_advance_logically_without_moving() {
         let addresses = G17PColdOpeningOptionalAddresses {
             context_scratch: 0x70_0200_0000,
             firmware_scratch: 0x70_0200_4000,
-            shared_control: 0x70_0200_8000,
+            usc_priv_mem_flist: 0x70_0200_8000,
+            usc_freelist_hardware_buffer_id: 0,
             channel_control: 0x70_0200_c000,
             tiling_shared_object: 0x70_0201_0000,
+            owner_pid: 0x15,
+            ta_hardware_buffer_id: 0,
         };
         for stage in [G17PColdOpeningStage::Tiling, G17PColdOpeningStage::Fragment] {
             let mut optional = [0u8; G17P_COLD_OPENING_OPTIONAL_SIZE];
-            apply_g17p_retained_optional(stage, addresses, 1, &mut optional).unwrap();
+            apply_g17p_retained_optional(stage, addresses, 1, false, 0, 1, 1, &mut optional)
+                .unwrap();
             assert_eq!(get_u16_le(&optional, 0x1a), 0);
             assert_eq!(get_u16_le(&optional, 0x2a), 1);
             assert_eq!(get_u16_le(&optional, 0x2e), 0x100);
@@ -5146,14 +5845,14 @@ mod tests {
             assert_eq!(
                 get_u16_le(&optional, 0x76),
                 if stage == G17PColdOpeningStage::Tiling {
-                    1
+                    0
                 } else {
                     u16::MAX
                 }
             );
 
             let mut event = [0u8; G17P_COLD_OPENING_EVENT_SIZE];
-            apply_g17p_retained_event(stage, 1, &mut event).unwrap();
+            apply_g17p_retained_event(stage, 1, 0, &mut event).unwrap();
             assert_eq!(get_u32_le(&event, 0x08), 0x202);
         }
 
@@ -5208,7 +5907,9 @@ mod tests {
                 timestamp: ts,
                 queue_id: 0x7f,
                 mask_selector: 1,
-            })
+            }),
+            1,
+            0
         );
         // A word with bit 47 set is outside the modeled form.
         assert_eq!(
@@ -5222,6 +5923,24 @@ mod tests {
         assert_eq!(
             encode_kick_word(0, 0x80),
             Err(SubmissionError::QueueIdOutOfRange)
+        );
+    }
+
+    #[test]
+    fn g17p_3d_completion_scratch_matches_native_full_command() {
+        assert_eq!(
+            encode_g17p_3d_completion_scratch(
+                0xf76,
+                G17P_3D_COMPLETION_SCRATCH_PAYLOAD,
+            ),
+            Ok(0x0000_0100_0000_0f76),
+        );
+        assert_eq!(
+            encode_g17p_3d_completion_scratch(
+                KICK_TS_MASK + 1,
+                G17P_3D_COMPLETION_SCRATCH_PAYLOAD,
+            ),
+            Err(SubmissionError::KickTimestampOutOfRange),
         );
     }
 
@@ -5536,6 +6255,71 @@ mod tests {
         assert_eq!(
             prepare_g17p_compute_primary_event(u16::MAX as u32, 0, 4, 2, 1),
             Err(SubmissionError::ComputeEventCounterOverflow)
+        );
+
+        // The tag-14 transport builder reproduces the same captured record.
+        // mac17p 0xfffffe00089fa39c writes type 14, QID 4, one kick, the queue
+        // QoS priority 2, the pre-increment entry stamp 1, and data master 2.
+        let add_kicks = prepare_g17p_ksm_add_kicks_command(G17PKsmAddKicksCommand {
+            queue_id: 4,
+            add_count: 1,
+            queue_priority: 2,
+            entry_stamp: T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY.timestamp_seed(),
+        })
+        .unwrap();
+        assert_eq!(add_kicks.bytes, *PRIMARY);
+        assert_eq!(add_kicks.bytes.len(), G17P_KSM_ADD_KICKS_COMMAND_SIZE);
+        assert!(G17P_KSM_ADD_KICKS_COMMAND_SIZE <= G17P_KSM_ADD_KICKS_COMMAND_FETCH_SIZE);
+        assert_eq!(add_kicks.bytes[0x08], 2);
+        assert_eq!(
+            u32::from_le_bytes(add_kicks.bytes[0x11..0x15].try_into().unwrap()),
+            G17P_COMPUTE_DATA_MASTER
+        );
+
+        assert_eq!(
+            prepare_g17p_ksm_add_kicks_command(G17PKsmAddKicksCommand {
+                queue_id: 4,
+                add_count: 0,
+                queue_priority: 2,
+                entry_stamp: 1,
+            }),
+            Err(SubmissionError::KsmAddKicksCountZero)
+        );
+        assert_eq!(
+            prepare_g17p_ksm_add_kicks_command(G17PKsmAddKicksCommand {
+                queue_id: KICK_QID_MASK + 1,
+                add_count: 1,
+                queue_priority: 2,
+                entry_stamp: 1,
+            }),
+            Err(SubmissionError::QueueIdOutOfRange)
+        );
+        assert_eq!(
+            prepare_g17p_ksm_add_kicks_command(G17PKsmAddKicksCommand {
+                queue_id: 4,
+                add_count: 1,
+                queue_priority: 4,
+                entry_stamp: 1,
+            }),
+            Err(SubmissionError::KickQueueCompletionSelectorOutOfRange)
+        );
+        assert_eq!(
+            prepare_g17p_ksm_add_kicks_command(G17PKsmAddKicksCommand {
+                queue_id: 4,
+                add_count: 1,
+                queue_priority: 2,
+                entry_stamp: 1 << KICK_TS_BITS,
+            }),
+            Err(SubmissionError::KickTimestampOutOfRange)
+        );
+        assert_eq!(
+            prepare_g17p_ksm_add_kicks_command(G17PKsmAddKicksCommand {
+                queue_id: 4,
+                add_count: u16::MAX as u32 + 1,
+                queue_priority: 2,
+                entry_stamp: 1,
+            }),
+            Err(SubmissionError::KsmAddKicksCountOutOfRange)
         );
     }
 
@@ -6137,6 +6921,66 @@ mod tests {
         assert_eq!(get_u64_le(&prepared.entry, 0x178), 0xa5a5_5a5a_1234_5678);
         assert_eq!(prepared.submitted_after, 3);
         assert_eq!(prepared.previous_timestamp_after, 2);
+    }
+
+    /// G17P's native graphics wrappers select stage-specific launch classes,
+    /// while direct entry-ring captures show the same 0xffff word for both
+    /// ordinary TA and 3D kicks. Keep those exact +0x20 qwords pinned
+    /// independently of the CL profile.
+    #[test]
+    fn g17p_native_render_dependency_control_words_are_exact() {
+        fn operands(barriers: &[G17PClBarrierDependency]) -> G17PClKickEntryOperands<'_> {
+            let empty = G17PClRceBinding { address: 0, tag: 0 };
+            G17PClKickEntryOperands {
+                descriptor_flag_4c: false,
+                descriptor_flag_5c8: false,
+                converted_command_timestamp: 1,
+                barriers,
+                mcache: None,
+                payload: [0; 2],
+                event_mask: [0; 4],
+                rce_kind: 0,
+                rce_bindings: [empty; 4],
+                auxiliary: 0,
+            }
+        }
+
+        let ta = T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY
+            .initial_producer_state(
+                0,
+                2,
+                G17PClQosConfig {
+                    queue_byte_32: 2,
+                    class_40: 0x0c,
+                    word_48: 0xffff,
+                },
+            )
+            .unwrap();
+        let ta = prepare_g17p_cl_kick_entry(ta, operands(&[])).unwrap();
+        assert_eq!(get_u64_le(&ta.entry, 0x20), 0xffff_0c02_0000_0001);
+
+        let fragment_barrier = [G17PClBarrierDependency {
+            event_word: 0x100,
+            shared_stamp: 0,
+            queue_id: 0,
+        }];
+        let fragment = T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY
+            .initial_producer_state(
+                1,
+                2,
+                G17PClQosConfig {
+                    queue_byte_32: 2,
+                    class_40: 0x18,
+                    word_48: 0xffff,
+                },
+            )
+            .unwrap();
+        let fragment =
+            prepare_g17p_cl_kick_entry(fragment, operands(&fragment_barrier)).unwrap();
+        assert_eq!(
+            get_u64_le(&fragment.entry, 0x20),
+            0xffff_1802_0000_0003
+        );
     }
 
     #[test]
@@ -7034,5 +7878,305 @@ mod tests {
             ..native
         }
         .native_sksm_proven());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Parameter-buffer descriptor handshake
+//
+// Metal performs this around every render submit and this driver has never
+// performed it at all. Decoded from the 25G83 host kernelcache, which carries
+// both halves symbolised:
+//
+//   AGXAcceleratorG16::halLoadPBDesc  @ 0xfffffe0008a52890   before submit
+//   AGXAcceleratorG16::halStorePBDesc @ 0xfffffe0008a527f0   on completion
+//
+// They are exact inverses, which is what makes the field map trustworthy: the
+// store reads back precisely the four quantities the load wrote. Confirmed on
+// hardware -- a real Metal render leaves the ring state {7, 7, 0, 0}.
+//
+// The ring lives at `[[accelerator + 0x11358] + 0x60]` with 16-byte entries
+// indexed by the `uint` third argument, and `halStorePBDesc` runs on
+// `kernel_task`, i.e. from the completion path rather than the submitting
+// thread.
+// ---------------------------------------------------------------------------
+
+/// One parameter-buffer descriptor ring entry.
+pub(crate) const G17P_PBDESC_ENTRY_SIZE: usize = 16;
+
+/// The four quantities the handshake exchanges: two 22-bit counters and two
+/// flags. This is `AGXSPBDescRingState`.
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+pub(crate) struct G17PPbDescRingState {
+    /// Descriptor dword2, low 22 bits.
+    pub(crate) counter_a: u32,
+    /// Descriptor dword3, low 22 bits.
+    pub(crate) counter_b: u32,
+    /// Descriptor dword3 bit 31.
+    pub(crate) flag_high: u32,
+    /// Descriptor dword0 bit 0.
+    pub(crate) flag_low: u32,
+}
+
+/// Encode the high segment of a parameter-buffer address.
+///
+/// `PBState[+0x28]` contains the full tagged address: native passes
+/// `0x1000190000`. Hardware adds an implicit `0x1000000000` bias when it
+/// rebuilds the address from this segment and dword0's low 36 bits. Bit 42
+/// selects between the two kext encoding forms.
+pub(crate) const fn g17p_pbdesc_segment(pb_address: u64) -> u64 {
+    let base: u64 = if pb_address & 0x400_0000_0000 == 0 {
+        0x70_0000_0000
+    } else {
+        0
+    };
+    let high = (pb_address >> 3) & 0x80_0000_0000;
+    ((base.wrapping_add(pb_address)) & 0x70_0000_0000) | high
+}
+
+/// Address reconstructed by the first G17P PB page-list read. This models the
+/// hardware bias witnessed by the exact `0x8002478000` fault when the host
+/// incorrectly encoded stripped address `0x2478000`.
+pub(crate) const fn g17p_pbdesc_reconstructed_address(pb_address: u64) -> u64 {
+    (g17p_pbdesc_segment(pb_address).wrapping_add(0x10_0000_0000))
+        | (pb_address & 0x0f_ffff_ffff)
+}
+
+/// `halLoadPBDesc`: fold the ring state and the parameter-buffer address into
+/// the descriptor, preserving every bit the firmware owns.
+pub(crate) const fn encode_g17p_pbdesc(
+    previous: [u32; 4],
+    pb_address: u64,
+    pb_state_word_34: u32,
+    state: G17PPbDescRingState,
+) -> [u32; 4] {
+    let segment = g17p_pbdesc_segment(pb_address);
+
+    // dword0: address >> 4, low 3 bits kept, then bit 0 = flag_low.
+    let mut dword0 = ((pb_address >> 4) as u32 & !0x7) | (previous[0] & 0x7);
+    dword0 = (dword0 & !1) | if state.flag_low != 0 { 1 } else { 0 };
+
+    // dword1: segment >> 8 in the top nibble, low 28 kept, then low 22 from
+    // PBState[+0x34].
+    let mut dword1 = ((segment >> 8) as u32 & !0x0fff_ffff) | (previous[1] & 0x0fff_ffff);
+    dword1 = (dword1 & !0x003f_ffff) | (pb_state_word_34 & 0x003f_ffff);
+
+    // dword2/dword3: the two 22-bit counters, plus bit 31.
+    let dword2 = (previous[2] & !0x003f_ffff) | (state.counter_a & 0x003f_ffff);
+    let mut dword3 = (previous[3] & !0x003f_ffff) | (state.counter_b & 0x003f_ffff);
+    dword3 = (dword3 & !0x8000_0000) | ((state.flag_high & 1) << 31);
+
+    [dword0, dword1, dword2, dword3]
+}
+
+/// `halStorePBDesc`: read the ring state back out. Exact inverse of the encode.
+pub(crate) const fn decode_g17p_pbdesc(descriptor: [u32; 4]) -> G17PPbDescRingState {
+    G17PPbDescRingState {
+        counter_a: descriptor[2] & 0x003f_ffff,
+        counter_b: descriptor[3] & 0x003f_ffff,
+        flag_high: descriptor[3] >> 31,
+        flag_low: descriptor[0] & 1,
+    }
+}
+
+/// Byte offset of one descriptor within the ring.
+pub(crate) const fn g17p_pbdesc_offset(index: u32) -> usize {
+    index as usize * G17P_PBDESC_ENTRY_SIZE
+}
+
+// ---------------------------------------------------------------------------
+// UMA page-pool descriptor handshake
+//
+// `AGXAcceleratorG16::halLoadUMADesc` publishes one 0x20-byte descriptor at
+// `[[accelerator + 0x11360] + 0x60] + HardwareBufferID * 0x20` before the
+// command descriptors become visible. `halStoreUMADesc` is the inverse on
+// completion. The fourth qword belongs to the firmware and is not touched by
+// either load or store.
+// ---------------------------------------------------------------------------
+
+pub(crate) const G17P_UMA_DESC_ENTRY_SIZE: usize = 0x20;
+pub(crate) const G17P_UMA_DESC_ENTRY_COUNT: u32 = 0x100;
+
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+pub(crate) struct G17PUmaPagePoolState {
+    pub(crate) page_list: u64,
+    pub(crate) unit_pages: u32,
+    pub(crate) counter_a: u32,
+    pub(crate) counter_b: u32,
+    pub(crate) empty: u32,
+    pub(crate) total_pages: u32,
+}
+
+/// Exact `halLoadUMADesc` packing. The source fields live at unaligned
+/// offsets `+0x14/+0x1c/+0x20/+0x24/+0x28/+0x2c` in
+/// `_AGFIUMAPagePoolState`.
+pub(crate) const fn encode_g17p_umadesc(
+    previous: [u64; 4],
+    state: G17PUmaPagePoolState,
+) -> [u64; 4] {
+    [
+        ((state.unit_pages as u64) << 41) | (state.page_list >> 7),
+        ((state.counter_b as u64) << 33)
+            | ((state.counter_a as u64) << 5)
+            | ((state.empty as u64) << 61),
+        state.total_pages as u64,
+        previous[3],
+    ]
+}
+
+pub(crate) const fn g17p_umadesc_offset(hardware_buffer_id: u32) -> Option<usize> {
+    if hardware_buffer_id >= G17P_UMA_DESC_ENTRY_COUNT {
+        return None;
+    }
+    Some(hardware_buffer_id as usize * G17P_UMA_DESC_ENTRY_SIZE)
+}
+
+#[cfg(test)]
+mod uma_descriptor_tests {
+    use super::*;
+
+    #[test]
+    fn first_render_uma_descriptor_matches_the_native_packer() {
+        let encoded = encode_g17p_umadesc(
+            [0, 0, 0, 0xfeed_face_dead_beef],
+            G17PUmaPagePoolState {
+                page_list: 0x70_0000_0000,
+                unit_pages: 0x4_0000,
+                counter_a: 0,
+                counter_b: 0x1600,
+                empty: 0,
+                total_pages: 0x1600,
+            },
+        );
+        assert_eq!(
+            encoded,
+            [
+                0x0800_0000_e000_0000,
+                0x0000_2c00_0000_0000,
+                0x0000_0000_0000_1600,
+                0xfeed_face_dead_beef,
+            ]
+        );
+        assert_eq!(g17p_umadesc_offset(0), Some(0));
+        assert_eq!(g17p_umadesc_offset(0xff), Some(0x1fe0));
+        assert_eq!(g17p_umadesc_offset(0x100), None);
+    }
+}
+
+/// Opcode of the USC private-memory free-list device-control record.
+///
+/// MISIDENTIFIED ONCE, corrected 2026-08-31. This was briefly taken for the
+/// parameter-buffer descriptor-ring publication because it is the only
+/// device-control record in a whole process lifetime that carries low VAs, and
+/// it appears once per queue right after `allocParameterManagement`. That is
+/// adjacency, not provenance. The record is built by
+/// `AGXUSCPrivMemFList::updateSubmitInfo(AGXUMADataRec*, int)`, which belongs
+/// to the USC/UMA page-pool family (`halLoadUMADesc`/`halStoreUMADesc`), not
+/// the parameter-buffer family (`halLoadPBDesc`/`halStorePBDesc`).
+///
+/// The real owner of the PBDesc ring is `AGXAccelerator::allocPBDescriptor`,
+/// which is the ONLY site in the image that stores to `accelerator + 0x11358`
+/// -- the pointer `halLoadPBDesc` dereferences. It allocates the object; it
+/// publishes no device-control record, so the ring reaches firmware by some
+/// other route we have not yet found.
+pub(crate) const G17P_DEVCTL_USC_FREELIST: u32 = 0x20;
+
+/// Span of the USC free-list ring, as published by the opcode-0x20 record.
+///
+/// Stable across four independent captures, so it is a fixed address rather
+/// than an allocation. It is NOT the parameter-buffer descriptor ring -- see
+/// `G17P_DEVCTL_USC_FREELIST`. Kept because if the USC free list is a third
+/// thing this driver does not maintain, this is where it lives.
+pub(crate) const G17P_USC_FREELIST_LOW_VA: u64 = 0x70_0020_8000;
+pub(crate) const G17P_USC_FREELIST_LOW_END: u64 = 0x70_0020_8580;
+
+/// The three fields that move between boots. 256x256 and 1024x1024 gave identical values for `word_04`, and
+/// `word_0c` moved by 2 between them, so none of these encode geometry -- they
+/// read as per-submission or per-boot sequence counters.
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+pub(crate) struct G17PUscFreelistSequence {
+    /// +0x04. Observed 1, 1, 6.
+    pub(crate) word_04: u32,
+    /// +0x0c. Observed 0x8df, 0x8e1, 0x65e.
+    pub(crate) word_0c: u32,
+    /// +0x30. Observed 2, 1, 3.
+    pub(crate) word_30: u32,
+}
+
+/// Build the opcode-0x20 (USC free-list) device-control record.
+///
+/// Only the first 0x40 bytes of an `AGFIAcceleratorDeviceControlEntry` ever
+/// reach firmware: `AGXFirmware::submitDeviceControl` copies exactly four
+/// 16-byte SIMD pairs (`ldp q0,q1` / `ldp q2,q3` then `stp`) into a ring whose
+/// stride is `1 << 6` and whose bound is `cmp w8, #0x100`. Our
+/// `CONTROL_RECORD_SIZE` (0x40) and `CONTROL_RING_ENTRIES` (0x100) already
+/// match, so the fields the capture shows at +0x40/+0x44/+0x4c are kext-side
+/// bookkeeping that never crosses the interface.
+pub(crate) fn encode_g17p_usc_freelist_control(
+    firmware_half_va: u64,
+    ring_low_va: u64,
+    ring_low_end: u64,
+    sequence: G17PUscFreelistSequence,
+    out: &mut [u8],
+) -> Result<(), SubmissionError> {
+    if out.len() != 0x40 {
+        return Err(SubmissionError::PartialOpeningGraphObjectSize);
+    }
+    if ring_low_end <= ring_low_va {
+        return Err(SubmissionError::PartialOpeningAddressOverflow);
+    }
+    out.fill(0);
+    put_u32_le(out, 0x00, G17P_DEVCTL_USC_FREELIST);
+    put_u32_le(out, 0x04, sequence.word_04);
+    put_u32_le(out, 0x08, 0x3f); // constant across all three captures
+    put_u32_le(out, 0x0c, sequence.word_0c);
+    put_u32_le(out, 0x10, 0);
+    put_u64_le(out, 0x14, firmware_half_va);
+    put_u64_le(out, 0x1c, ring_low_va);
+    put_u64_le(out, 0x24, ring_low_end);
+    put_u32_le(out, 0x2c, 0x20); // constant
+    put_u32_le(out, 0x30, sequence.word_30);
+    put_u32_le(out, 0x34, 1); // constant
+    Ok(())
+}
+
+#[cfg(test)]
+mod usc_freelist_tests {
+    use super::*;
+
+    fn u32_at(raw: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes(raw[offset..offset + 4].try_into().unwrap())
+    }
+
+    fn u64_at(raw: &[u8], offset: usize) -> u64 {
+        u64::from_le_bytes(raw[offset..offset + 8].try_into().unwrap())
+    }
+
+    #[test]
+    fn linux_owned_first_render_usc_freelist_record_is_exact() {
+        let mut record = [0xa5; 0x40];
+        encode_g17p_usc_freelist_control(
+            0xffff_fc20_c082_8000,
+            G17P_USC_FREELIST_LOW_VA,
+            G17P_USC_FREELIST_LOW_END,
+            G17PUscFreelistSequence {
+                word_04: 1,
+                word_0c: 0,
+                word_30: 0,
+            },
+            &mut record,
+        )
+        .unwrap();
+        assert_eq!(u32_at(&record, 0x00), G17P_DEVCTL_USC_FREELIST);
+        assert_eq!(u32_at(&record, 0x04), 1);
+        assert_eq!(u32_at(&record, 0x08), 0x3f);
+        assert_eq!(u32_at(&record, 0x0c), 0);
+        assert_eq!(u64_at(&record, 0x14), 0xffff_fc20_c082_8000);
+        assert_eq!(u64_at(&record, 0x1c), G17P_USC_FREELIST_LOW_VA);
+        assert_eq!(u64_at(&record, 0x24), G17P_USC_FREELIST_LOW_END);
+        assert_eq!(u32_at(&record, 0x2c), 0x20);
+        assert_eq!(u32_at(&record, 0x30), 0);
+        assert_eq!(u32_at(&record, 0x34), 1);
+        assert!(record[0x38..].iter().all(|byte| *byte == 0));
     }
 }

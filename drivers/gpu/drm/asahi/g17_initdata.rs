@@ -86,6 +86,19 @@ pub(crate) const ROOT_SIZE_PRIMARY: usize = 0x0b8;
 pub(crate) const ROOT_SIZE_SECONDARY: usize = 0x0c8;
 pub(crate) const MAIN_CONFIG_SIZE: usize = 0x600;
 pub(crate) const HW_DATA_SIZE: usize = 0x3db4;
+/// Native QoS manager block published through hardware data.
+pub(crate) const G17P_QOS_RESOURCE_OFFSET: usize = 0x27a4;
+pub(crate) const G17P_QOS_RESOURCE_SIZE: usize = 0xe40;
+/// Native global SKSM/QID configuration block in hardware data.
+pub(crate) const G17P_SKSM_QID_CONFIG_2700_OFFSET: usize = 0x2700;
+pub(crate) const G17P_SKSM_QID_CONFIG_2708_OFFSET: usize = 0x2708;
+pub(crate) const G17P_SKSM_QID_RESOURCE_OFFSET: usize = 0x27ac;
+pub(crate) const G17P_SKSM_QID_CONFIG_2700: u64 = 1;
+pub(crate) const G17P_SKSM_QID_CONFIG_2708: u32 = 0x100;
+/// Firmware log enable word inside main config.
+pub(crate) const MAIN_FIRMWARE_LOG_ENABLE: usize = 0x250;
+
+pub(crate) const G17P_SKSM_QID_RESOURCE_SIZE: usize = 0x2000;
 pub(crate) const REGION_A_SIZE: usize = 0x4000;
 pub(crate) const REGION_C_SIZE: usize = 0x1000;
 pub(crate) const STATUS_BLOCK_SIZE: usize = 0x80;
@@ -201,14 +214,53 @@ const MAIN_CONTROL_RING: usize = 0x4c0;
 pub(crate) const CONTROL_OPENING_OPCODE_PRIMARY: u32 = 0x16;
 pub(crate) const CONTROL_OPENING_OPCODE_SECONDARY: u32 = 0x2a;
 pub(crate) const CONTROL_RECORD_SIZE: usize = 0x40;
-pub(crate) const CONTROL_OPENING_PRIMARY_RECORDS: usize = 4;
+pub(crate) const CONTROL_OPENING_PRIMARY_RECORDS: usize = 3;
 pub(crate) const CONTROL_OPENING_SECONDARY_RECORDS: usize = 16;
-pub(crate) const CONTROL_OPENING_PRIMARY_PRODUCER: u32 = 4;
+pub(crate) const CONTROL_OPENING_PRIMARY_PRODUCER: u32 = 3;
 pub(crate) const CONTROL_OPENING_SECONDARY_PRODUCER: u32 = 16;
 pub(crate) const CONTROL_OPENING_PRIMARY_REGISTER_OPCODE: u32 = 0x20;
 pub(crate) const CONTROL_OPENING_SECONDARY_CONTINUE_OPCODE: u32 = 0x22;
+/// Hardware-buffer release emitted after the opening UMA grow request retires.
+pub(crate) const CONTROL_BOOTSTRAP_UMA_RELEASE_OPCODE: u32 = 0x2e;
+/// Device-control ring capacity. FW_PROVEN (b1
+/// `AGFAcceleratorDrainDeviceControlRing` @ `0xfffffc0000003a74`): the drain
+/// walks `ring + index * 0x40` and advances its consumer with
+/// `(consumer + 1) & 0xff`, so the ring is exactly 256 records. The placement
+/// agrees byte for byte: the primary ring starts at
+/// [`NATIVE_PRIMARY_MAIN_BUNDLE_OFFSET`] `+ 0x4c0` = bundle `+0x1ea80` and the
+/// secondary main configuration begins at bundle `+0x22a80`, exactly
+/// `0x100 * 0x40` bytes later.
+pub(crate) const CONTROL_RING_ENTRIES: usize = 0x100;
+pub(crate) const CONTROL_RING_INDEX_MASK: u32 = CONTROL_RING_ENTRIES as u32 - 1;
+/// Device control `IdlePowerOff(arg)`. FW_PROVEN: the opcode jump table at
+/// `0xfffffc0000005380` (indexed by `opcode - 4`) sends `0x0a` to
+/// `0xfffffc0000003fd8`, which stores the record's `arg` into the idle-power-off
+/// enable word `[0xfffffc0000177838]` and, **only when that arg is zero**, does
+/// an unconditional `bl 0xfffffc0000021960`. That routine is the one thing in
+/// the image that releases KSM pause reason bit 1 (mask `0x2`) in steady state:
+/// it latches `[0xfffffc00001771f8] |= 2` and tail-calls
+/// `gpu_core_power(0, 1, 0)` @ `0xfffffc000000e004`, whose power-on arm clears
+/// the reason bit at `0xe488` and emits KTrace `0x46 (0, 0x2, mask)` at
+/// `0xe4cc`. It is gated by nothing -- unlike the EP-0x21 work doorbell, which
+/// handler `0x261a4` drops silently while `[0x1771f8] & 0x18` (RTKit
+/// SLEEP/NAP) -- and it is idempotent, because `0x21960` returns immediately
+/// when the powered latch is already set.
+pub(crate) const DEVICE_CONTROL_OPCODE_IDLE_POWER_OFF: u32 = 0x0a;
+/// The argument that means "disable idle power off, and power the cores on
+/// now". Any non-zero value only stores the enable word and returns.
+pub(crate) const DEVICE_CONTROL_IDLE_POWER_OFF_ARG_POWER_ON: u32 = 0;
+/// Non-zero inhibits the firmware's idle power-down. The scheduler idle-off
+/// routine `0x7ca0` reads `[0xfffffc0000177838]` as one of a chain of guards
+/// (b1 `0x8634`), each of which branches to `0x871c` = `mov w0,#1; ret` when
+/// set — an early return that skips the bit-1 acquire at `0x8228`, i.e. skips
+/// closing the GPU core power gate. `arg = 0` powers the cores on but leaves
+/// this permissive, so the cores are gated off again shortly after; `arg != 0`
+/// sets the inhibit but the handler's `cbnz w8, 0x5238` then skips the
+/// power-on. Hence the pair: power on, then hold.
+pub(crate) const DEVICE_CONTROL_IDLE_POWER_OFF_ARG_INHIBIT: u32 = 1;
 pub(crate) const COMPUTE_RUNTIME_CONTROL_RECORDS: usize = 65;
-pub(crate) const COMPUTE_RUNTIME_CONTROL_FINAL_COUNTER: u32 = 69;
+pub(crate) const COMPUTE_RUNTIME_CONTROL_FINAL_COUNTER: u32 =
+    CONTROL_OPENING_PRIMARY_PRODUCER + COMPUTE_RUNTIME_CONTROL_RECORDS as u32;
 pub(crate) const COMPUTE_RUNTIME_CLASS1_RECORD_INDEX: usize = 54;
 pub(crate) const COMPUTE_RUNTIME_CLASS2_RECORD_INDEX: usize = 57;
 pub(crate) const COMPUTE_RUNTIME_SUPPORT_ADDRESS: u64 = 0xffff_fc20_c086_8000;
@@ -222,8 +274,9 @@ pub(crate) const COMPUTE_RUNTIME_CLASS1_TABLE_SIZE: usize = 0x4000;
 pub(crate) const COMPUTE_RUNTIME_PAGE_LIST_SIZE: usize = 0xa800;
 pub(crate) const COMPUTE_DISPATCH_RECORD_SIZE: usize = 0x20;
 
-/// Output-positive first-CL readiness suffix. These six records occupy primary
-/// slots 4..9. Native publishes and retires each slot before exposing the next.
+/// Output-positive first-CL readiness suffix. These six records follow the
+/// clean three-record QoS opening. Native publishes and retires each slot
+/// before exposing the next.
 pub(crate) const COMPUTE_READINESS_RECORDS: usize = 6;
 /// Output-positive final compute graph maps and names exactly operand entries
 /// 0..20. The retained opening still owns 28 backing objects.
@@ -400,8 +453,19 @@ pub(crate) const CONTROL_SHARED_INNER_PRESENTED: u64 = 2;
 pub(crate) const PARTIAL_OPENING_CONTROL_SHARED_ADDRESS: u64 = 0xffff_fc20_c082_8000;
 pub(crate) const PARTIAL_OPENING_CONTROL_SHARED_INNER_ADDRESS: u64 =
     0xffff_fc20_0160_0000;
-pub(crate) const PARTIAL_OPENING_CONTROL_SHARED_CURSOR_BEFORE: u32 = 0xc8;
-pub(crate) const PARTIAL_OPENING_CONTROL_SHARED_INNER_PRESENTED: u64 = 2;
+/// Initial compact FList cursor in qwords.
+///
+/// `AGXUSCPrivMemFList::prepareBufferResources` encodes one 1-MiB run for
+/// each of the 22 initial pool blocks, then rounds the cursor to an eight-qword
+/// boundary after *each* block. The first asynchronous grow therefore starts
+/// at qword 22 * 8 = 0xb0 (byte offset 0x580). The older value 0x18 rounded
+/// 21 runs only once and made the opcode-0x20 grow span name zeroed memory.
+pub(crate) const PARTIAL_OPENING_CONTROL_SHARED_CURSOR_BEFORE: u32 = 0xb0;
+pub(crate) const PARTIAL_OPENING_CONTROL_SHARED_INNER_PRESENTED: u64 = 0;
+/// Linux owns one USC private-memory FList. HardwareBufferIDManager permits
+/// slot zero (native's generic allocator pops 0 first); macOS observed ID 1
+/// only because another live FList already owned slot zero in that session.
+pub(crate) const PARTIAL_OPENING_FREELIST_HARDWARE_BUFFER_ID: u32 = 0;
 pub(crate) const CONTROL_OPERAND_TABLE_ADDRESS: u64 = 0x70_0020_8000;
 pub(crate) const CONTROL_OPERAND_TABLE_SIZE: usize = 0x4000;
 pub(crate) const CONTROL_OPERAND_SLOT_OFFSET: u64 = 0x440;
@@ -478,8 +542,27 @@ fn encode_control_registration(
 
 fn encode_control_tick(out: &mut [u8], slot: usize, sequence: u32) {
     let base = slot * CONTROL_RECORD_SIZE;
-    put_u32(out, base, 0x2e);
+    put_u32(out, base, CONTROL_BOOTSTRAP_UMA_RELEASE_OPCODE);
     put_u32(out, base + 0x04, sequence);
+}
+
+/// Encode the exact release record produced when an Async FList grow request
+/// drops its last HardwareBuffer ID reference. The captured opening uses
+/// sequence zero and ID zero; accepting them as operands keeps the encoder
+/// tied to the retained host ownership rather than to a raw type-13 tuple.
+pub(crate) fn encode_bootstrap_uma_release_record(
+    sequence: u64,
+    hardware_buffer_id: u32,
+    out: &mut [u8],
+) -> Result<(), InitdataError> {
+    if out.len() != CONTROL_RECORD_SIZE {
+        return Err(InitdataError::BufferSize);
+    }
+    out.fill(0);
+    put_u32(out, 0, CONTROL_BOOTSTRAP_UMA_RELEASE_OPCODE);
+    put_u64(out, 0x04, sequence);
+    put_u32(out, 0x0c, hardware_buffer_id);
+    Ok(())
 }
 
 fn encode_control_tick_with_context(
@@ -655,17 +738,6 @@ pub(crate) fn encode_control_opening(
                     CONTROL_OPENING_OPCODE_PRIMARY,
                 );
             }
-            encode_control_registration(
-                out,
-                3,
-                1,
-                0,
-                PARTIAL_OPENING_CONTROL_SHARED_ADDRESS,
-                CONTROL_OPERAND_TABLE_ADDRESS,
-                PARTIAL_OPENING_CONTROL_OPERAND_SLOT_OFFSET,
-                PARTIAL_OPENING_CONTROL_REGISTER_COUNT,
-                0,
-            );
         }
         InstanceRole::Secondary => {
             for slot in 0..3 {
@@ -687,8 +759,30 @@ pub(crate) fn encode_control_opening(
     Ok(())
 }
 
+/// Encode one bare device-control record: `u32 opcode @ +0x00`,
+/// `u32 arg @ +0x04`, and 0x38 zero bytes.
+///
+/// FW_PROVEN (b1 `0x3a74` drain): a record is 0x40 bytes at
+/// `ring + index * 0x40`; the drain loads the opcode with `ldr w?, [x24]` and
+/// the argument with `ldr w8, [x24, #4]`. Every opcode that carries no further
+/// operands leaves the remaining 0x38 bytes untouched, exactly as the opening
+/// records this module already stages do.
+pub(crate) fn encode_device_control_record(
+    opcode: u32,
+    arg: u32,
+    out: &mut [u8],
+) -> Result<(), InitdataError> {
+    if out.len() != CONTROL_RECORD_SIZE {
+        return Err(InitdataError::BufferSize);
+    }
+    out.fill(0);
+    put_u32(out, 0x00, opcode);
+    put_u32(out, 0x04, arg);
+    Ok(())
+}
+
 /// Encode one record in the output-positive 65-record runtime control tail.
-/// Record zero is published at primary slot four after the compute opening.
+/// Record zero follows the clean three-record QoS opening.
 pub(crate) fn encode_compute_runtime_control_record(
     index: usize,
     out: &mut [u8],
@@ -868,12 +962,25 @@ pub(crate) fn encode_partial_opening_control_shared(
         return Err(InitdataError::BufferSize);
     }
     out.fill(0);
+    // AGXUSCPrivMemFList::populateInitialFirmwareState seeds this hardware
+    // buffer id with -1, but AGXUSCPrivMemPool::prepareLocked replaces it with
+    // the allocated id before publishing the first tag-15 record. Linux owns
+    // the cold-opening slot zero statically, so encode the post-allocation
+    // state that the firmware actually receives.
+    put_u32(
+        out,
+        0x08,
+        PARTIAL_OPENING_FREELIST_HARDWARE_BUFFER_ID,
+    );
     for (offset, value) in [
         (0x00, 0x0000_0000_0000_0001),
         (0x10, 0x0000_0000_0000_0002),
         (0x18, 0x0004_0000_0000_0070),
-        (0x20, 0x0000_1900_0000_0000),
-        (0x28, 0x0000_1900_0000_0000),
+        // The ordinary Metal TA prepare allocates 22 one-MiB blocks before
+        // `populateInitialFirmwareState`: 22 MiB / 4 KiB = 0x1600 pages.
+        // The following opcode-0x20 appends four more blocks asynchronously.
+        (0x20, 0x0000_1600_0000_0000),
+        (0x28, 0x0000_1600_0000_0000),
         (0x30, CONTROL_OPERAND_TABLE_ADDRESS),
         (0x40, 0x0000_0000_0000_0004),
         (0x60, 0x0000_0000_0000_0003),
@@ -953,11 +1060,9 @@ pub(crate) const BUNDLE_VIEW_OFFSETS: [usize; 5] = [0x2740, 0x3380, 0x4400, 0xbc
 /// Logical extents of the five views.
 pub(crate) const BUNDLE_VIEW_EXTENTS: [usize; 5] = [0x18c0, 0x0c80, 0x3c00, 0x3380, 0x3300];
 
-/// The two low/context-0 addresses in the region views at main `+0x2d0`.
-/// Captured as `(value, 0x70)` u32 pairs, which are really the low and high
-/// halves of full context-0 virtual addresses; the secondary carries the same
-/// two values with no high aliases at all, so they are not properties of any
-/// region the host allocates.
+/// The context-0 mappings of the PB descriptor and UMA page-pool descriptor
+/// tables published at main `+0x2d8` and `+0x2e8`, respectively. The matching
+/// firmware-high mappings are published at `+0x2e0` and `+0x2f0`.
 pub(crate) const REGION_VIEW_LOW_ADDRS: [u64; 2] = [0x70_0183_8000, 0x70_0184_0000];
 
 // --- Channel table ---------------------------------------------------------------
@@ -1118,12 +1223,40 @@ const HW_PERF_MEMORY_VOLTAGE: [u32; HW_PERF_LADDER_ENTRIES] =
 
 // --- Region C ---------------------------------------------------------------------
 
-/// Region C `+0xe50` must hold this u32 (bytes `00 01 00 00`) before the
-/// first compact class-1 registration. Leaving it zero makes the *primary*
-/// firmware take an asynchronous SError while consuming device-control opcode
-/// `0x20`.
+/// Region C bytes `0xe50..0xe54` are `00 01 00 00` in the capture, and leaving
+/// them zero makes the *primary* firmware take an asynchronous SError while
+/// consuming device-control opcode `0x20`.
+///
+/// The framing behind those four bytes is now known, and it is not a "required
+/// word". FW_PROVEN (b1, exhaustive): nothing in the image reads region C at
+/// `+0xe50` or at `+0xe55`. The only field there is an **unaligned u32 at
+/// `+0xe51`**, read twice at the top of `AGFAcceleratorDrainDeviceControlRing`
+/// (`0x3aa8` `add x8, x8, #0xe51` / `ldr w28, [x8]`, and the fresh re-read at
+/// `0x3b20`). So the captured bytes decode as `region_c[0xe50] == 0` plus a
+/// counter of **1** at `+0xe51`; the two constants below preserve the same
+/// bytes, they only name them correctly.
 pub(crate) const REGION_C_REQUIRED_OFFSET: usize = 0xe50;
 pub(crate) const REGION_C_REQUIRED_VALUE: u32 = 0x0000_0100;
+/// Unaligned host-owned GPU-core power-assert counter.
+///
+/// FW_PROVEN (b1 `0x3aa8`/`0x3b20`): the firmware reads this **unaligned** u32
+/// and compares it with its own tally `status_b[0xe438]`, which it increments
+/// once per drained record whose opcode flag byte (`__const 0x45430 + opcode`)
+/// is non-zero. When the GPU is unpowered and the two disagree, `0x3b2c` calls
+/// `0x21960` and powers the cores on before draining. Equal values mean "no
+/// unaccounted power-asserting work", so a value pinned forever at 1 — which is
+/// what [`REGION_C_RUNS`] ships — can never trigger that arm after the first
+/// flagged record.
+///
+/// Was `0xe55`, which is off by four: that offset is read nowhere in b1.
+/// The flag byte is `0` (i.e. no power assert) for opcodes `0x00`, `0x0e`,
+/// `0x15`, `0x16`, `0x1b`, `0x22`, `0x2a`, `0x2e` and `0x3a..=0x3f`; note that
+/// includes `0x2e`, contradicting the older comment here that named it as a
+/// core-power claimant.
+pub(crate) const REGION_C_GPU_CORE_PWR_ASSERT_COUNTER_OFFSET: usize = 0xe51;
+/// The count [`REGION_C_RUNS`] publishes at
+/// [`REGION_C_GPU_CORE_PWR_ASSERT_COUNTER_OFFSET`].
+pub(crate) const REGION_C_GPU_CORE_PWR_ASSERT_COUNT: u32 = 1;
 
 // --- Status blocks -----------------------------------------------------------------
 
@@ -1210,11 +1343,12 @@ impl ChannelEntry {
     };
 }
 
-/// The primary's region views at main `+0x2d0`: a high-only blank sentinel,
-/// then the high halves of two low/high alias pairs (the low halves are the
-/// fixed context-0 addresses in [`REGION_VIEW_LOW_ADDRS`]). Each pair must map
-/// one physical page from both address spaces — an invariant of the UAT
-/// mapping layer that cannot be checked from the addresses alone.
+/// The primary's descriptor-table views at main `+0x2d0`: a high-only blank
+/// sentinel, then the high halves of the PB and UMA low/high alias pairs (the
+/// low halves are the fixed context-0 addresses in
+/// [`REGION_VIEW_LOW_ADDRS`]). Each pair must map one physical page from both
+/// address spaces — an invariant of the UAT mapping layer that cannot be
+/// checked from the addresses alone.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct PrimaryRegionViews {
     pub(crate) sentinel_high: u64,
@@ -1720,6 +1854,15 @@ pub(crate) fn encode_main_config(
     }
 
     out.fill(0);
+    // Firmware log enable. The emitter at A000 0xfffffc0000021fa0 reads this
+    // word and returns immediately when it is zero; every buffer the facility
+    // needs is already allocated and pointed at by the addresses below. The
+    // records are plain ASCII. Shipping macOS provisions the whole facility
+    // and then throws the messages away (drainFirmwareLogRing is `bti c; ret`),
+    // which is why the captured value is zero.
+    if *crate::module_parameters::g17p_fw_log.value() != 0 {
+        put_u32(out, MAIN_FIRMWARE_LOG_ENABLE, 1);
+    }
     let bundle = shared.hw_data_bundle;
     put_u64(out, MAIN_HW_DATA, bundle);
     let repeated = bundle + MAIN_REPEATED_REGION_BUNDLE_OFFSET as u64;
@@ -1741,14 +1884,13 @@ pub(crate) fn encode_main_config(
             for (index, offset) in BUNDLE_VIEW_OFFSETS.iter().enumerate() {
                 put_u64(out, MAIN_BUNDLE_VIEWS + index * 8, bundle + *offset as u64);
             }
-            // Six region-view qwords: high-only sentinel, two low/high alias
-            // pairs, null terminator.
+            // High-only sentinel followed by the PB descriptor and UMA
+            // page-pool descriptor low/high alias pairs.
             put_u64(out, MAIN_REGION_VIEWS, views.sentinel_high);
             put_u64(out, MAIN_REGION_VIEWS + 0x08, REGION_VIEW_LOW_ADDRS[0]);
             put_u64(out, MAIN_REGION_VIEWS + 0x10, views.alias_high[0]);
             put_u64(out, MAIN_REGION_VIEWS + 0x18, REGION_VIEW_LOW_ADDRS[1]);
             put_u64(out, MAIN_REGION_VIEWS + 0x20, views.alias_high[1]);
-            // +0x2f0 stays zero.
             put_u32(out, MAIN_PRIMARY_SCALAR_32C, 1);
             put_u32(out, MAIN_PRIMARY_SCALAR_344, 0xabcd_abcd);
             put_u32(out, MAIN_PRIMARY_MASK, MAIN_PRIMARY_MASK_VALUE);
@@ -1784,6 +1926,8 @@ pub(crate) fn encode_hw_data(
     windows: &[RegisterWindow],
     flag_only_slots: &[(usize, u32)],
     completion_aliases: [G17PKsmCompletionAliases; 2],
+    qos_resource_high: u64,
+    sksm_qid_resource_high: u64,
     out: &mut [u8],
 ) -> Result<(), InitdataError> {
     if out.len() != HW_DATA_SIZE {
@@ -1815,6 +1959,8 @@ pub(crate) fn encode_hw_data(
         required_address(aliases.low)?;
         required_address(aliases.high)?;
     }
+    required_address(qos_resource_high)?;
+    required_address(sksm_qid_resource_high)?;
 
     out.fill(0);
     for window in windows {
@@ -1919,6 +2065,23 @@ pub(crate) fn encode_hw_data(
         // +0x1c is the firmware-owned processed cursor and starts at zero.
     }
 
+    put_u64(out, G17P_QOS_RESOURCE_OFFSET, qos_resource_high);
+    put_u64(
+        out,
+        G17P_SKSM_QID_CONFIG_2700_OFFSET,
+        G17P_SKSM_QID_CONFIG_2700,
+    );
+    put_u32(
+        out,
+        G17P_SKSM_QID_CONFIG_2708_OFFSET,
+        G17P_SKSM_QID_CONFIG_2708,
+    );
+    put_u64(
+        out,
+        G17P_SKSM_QID_RESOURCE_OFFSET,
+        sksm_qid_resource_high,
+    );
+
     // Recorded platform constants. Descriptor *acceptance* survives without
     // them, but the device-control phase that follows does not. +0x2630 is
     // deliberately absent from the runs: it is firmware state and must start
@@ -1938,6 +2101,28 @@ pub(crate) fn encode_region_c(out: &mut [u8]) -> Result<(), InitdataError> {
     }
     out.fill(0);
     write_runs(out, REGION_C_RUNS);
+    // regionC+0x9cc is the KSM progress-watchdog threshold for data master 2
+    // (compute); the firmware copies it to 0x1778d0 and its handler starts
+    // `cbz w20 -> ret`, so 0 disables the watchdog. We ship 0x32 (50) here and
+    // leave the other data master's slot at 0 -- i.e. we arm the watchdog on
+    // exactly the queue we submit to. When work cannot progress for any other
+    // reason this turns a stall into a self-sustaining recovery loop.
+    if *crate::module_parameters::g17p_progress_watchdog.value() == 0 {
+        put_u32(out, 0x9cc, 0);
+    }
+    // regionC+0xe21 is the idle-descent selector. The firmware copies it to
+    // [0x177d20] (at 0x36f4), where it chooses which arm of the outstanding-kick
+    // check at 0xdeb8 decides whether the scheduler may descend to idle. Shipping
+    // 0 selects an arm we do not drive, so the idle-descent block at 0x25980
+    // re-takes KSM pause reason bit 3, then bit 1 through gpu_core_power(), and
+    // closes the GPU core power gate in the middle of our submit -- the observed
+    // oscillation that ends with the gate shut. Non-zero selects the arm that is
+    // permanently "must not idle" once [0x125de0] != 0, which direct mode
+    // guarantees after the first AddKicks (the decrement at 0xd2ac is skipped).
+    // One byte, and [0x177d20] has exactly two accesses image-wide.
+    if *crate::module_parameters::g17p_idle_selector.value() != 0 {
+        out[0xe21] = 1;
+    }
     for (offset, value) in [
         (0x7c, 1),
         (0x80, 1),
@@ -2565,6 +2750,22 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_table_aliases_are_published_in_both_main_configs() {
+        let views = region_views();
+        let primary = encode_main_bytes(InstanceRole::Primary);
+        assert_eq!(get_u64(&primary, 0x2d8), REGION_VIEW_LOW_ADDRS[0]);
+        assert_eq!(get_u64(&primary, 0x2e0), views.alias_high[0]);
+        assert_eq!(get_u64(&primary, 0x2e8), REGION_VIEW_LOW_ADDRS[1]);
+        assert_eq!(get_u64(&primary, 0x2f0), views.alias_high[1]);
+
+        let secondary = encode_main_bytes(InstanceRole::Secondary);
+        assert_eq!(get_u64(&secondary, 0x2d8), REGION_VIEW_LOW_ADDRS[0]);
+        assert_eq!(get_u64(&secondary, 0x2e0), 0);
+        assert_eq!(get_u64(&secondary, 0x2e8), REGION_VIEW_LOW_ADDRS[1]);
+        assert_eq!(get_u64(&secondary, 0x2f0), 0);
+    }
+
+    #[test]
     fn per_role_root_sizes_version_tuple_and_handoff_zeroes() {
         assert_eq!(ROOT_SIZE_PRIMARY, 0xb8);
         assert_eq!(ROOT_SIZE_SECONDARY, 0xc8);
@@ -2762,11 +2963,11 @@ mod tests {
     }
 
     #[test]
-    fn primary_control_opening_is_three_init_records_then_registration() {
+    fn primary_control_opening_is_only_three_qos_records() {
         let mut opening = vec![0; control_opening_size(InstanceRole::Primary)];
         encode_control_opening(InstanceRole::Primary, &mut opening).unwrap();
 
-        assert_eq!(control_opening_producer(InstanceRole::Primary), 4);
+        assert_eq!(control_opening_producer(InstanceRole::Primary), 3);
         for slot in 0..3 {
             let base = slot * CONTROL_RECORD_SIZE;
             assert_eq!(get_u32(&opening, base), CONTROL_OPENING_OPCODE_PRIMARY);
@@ -2774,32 +2975,7 @@ mod tests {
                 .iter()
                 .all(|byte| *byte == 0));
         }
-        let base = 3 * CONTROL_RECORD_SIZE;
-        assert_eq!(
-            get_u32(&opening, base),
-            CONTROL_OPENING_PRIMARY_REGISTER_OPCODE
-        );
-        assert_eq!(get_u32(&opening, base + 0x04), 1);
-        assert_eq!(get_u32(&opening, base + 0x08), 0x3f);
-        assert_eq!(get_u32(&opening, base + 0x0c), 0);
-        assert_eq!(
-            get_u64(&opening, base + 0x14),
-            PARTIAL_OPENING_CONTROL_SHARED_ADDRESS
-        );
-        assert_eq!(
-            get_u64(&opening, base + 0x1c),
-            CONTROL_OPERAND_TABLE_ADDRESS
-        );
-        assert_eq!(
-            get_u64(&opening, base + 0x24),
-            CONTROL_OPERAND_TABLE_ADDRESS + PARTIAL_OPENING_CONTROL_OPERAND_SLOT_OFFSET
-        );
-        assert_eq!(
-            get_u32(&opening, base + 0x2c),
-            PARTIAL_OPENING_CONTROL_REGISTER_COUNT
-        );
-        assert_eq!(get_u32(&opening, base + 0x30), 0);
-        assert_eq!(get_u32(&opening, base + 0x34), 1);
+        assert_eq!(opening.len(), 3 * CONTROL_RECORD_SIZE);
     }
 
     #[test]
@@ -2821,7 +2997,7 @@ mod tests {
         }
         assert_eq!(tail.len(), 65 * 0x40);
         assert_eq!(fnv1a64(&tail), 0x544f_a4b7_bc23_e65a);
-        assert_eq!(COMPUTE_RUNTIME_CONTROL_FINAL_COUNTER, 69);
+        assert_eq!(COMPUTE_RUNTIME_CONTROL_FINAL_COUNTER, 68);
 
         for (index, sequence) in [(0, 0), (53, 53), (55, 54), (56, 55), (58, 56), (64, 62)] {
             let base = index * CONTROL_RECORD_SIZE;
@@ -2862,6 +3038,20 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_uma_release_record_is_exact() {
+        let mut record = [0xa5; CONTROL_RECORD_SIZE];
+        encode_bootstrap_uma_release_record(0, 0, &mut record).unwrap();
+        assert_eq!(get_u32(&record, 0), CONTROL_BOOTSTRAP_UMA_RELEASE_OPCODE);
+        assert!(record[4..].iter().all(|byte| *byte == 0));
+
+        encode_bootstrap_uma_release_record(0x1122_3344_5566_7788, 0xaabb_ccdd, &mut record)
+            .unwrap();
+        assert_eq!(get_u64(&record, 0x04), 0x1122_3344_5566_7788);
+        assert_eq!(get_u32(&record, 0x0c), 0xaabb_ccdd);
+        assert!(record[0x10..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
     fn first_cl_readiness_suffix_has_exact_sequences_contexts_and_bytes() {
         assert_eq!(
             COMPUTE_READINESS_PUBLICATION_ORDER,
@@ -2882,8 +3072,14 @@ mod tests {
 
         for (index, boundary) in COMPUTE_READINESS_BOUNDARIES.iter().enumerate() {
             assert_eq!(boundary.index as usize, index);
-            assert_eq!(boundary.producer_before, 4 + index as u32);
-            assert_eq!(boundary.producer_after, 5 + index as u32);
+            assert_eq!(
+                boundary.producer_before,
+                CONTROL_OPENING_PRIMARY_PRODUCER + index as u32
+            );
+            assert_eq!(
+                boundary.producer_after,
+                CONTROL_OPENING_PRIMARY_PRODUCER + 1 + index as u32
+            );
             assert_eq!(get_u32(&records[index], 0x00), boundary.opcode);
             let (sequence_offset, context_offset) = if boundary.opcode == 0x20 {
                 (0x0c, 0x30)
@@ -2951,7 +3147,10 @@ mod tests {
             assert_eq!(get_u32(record, 0x0c), context);
             assert!(record[0x10..].iter().all(|byte| *byte == 0));
         }
-        assert_eq!(COMPUTE_READINESS_FINAL_COUNTER, 10);
+        assert_eq!(
+            COMPUTE_READINESS_FINAL_COUNTER,
+            CONTROL_OPENING_PRIMARY_PRODUCER + COMPUTE_READINESS_RECORDS as u32
+        );
         assert!(encode_compute_readiness_record(COMPUTE_READINESS_RECORDS, &mut records[0])
             .is_err());
     }
@@ -3127,9 +3326,11 @@ mod tests {
 
         assert_eq!(PARTIAL_OPENING_CONTROL_SHARED_ADDRESS, 0xffff_fc20_c082_8000);
         assert_eq!(get_u64(&shared, 0x00), 1);
+        assert_eq!(get_u32(&shared, 0x08), 0);
+        assert_eq!(get_u32(&shared, 0x0c), 0);
         assert_eq!(get_u64(&shared, 0x10), 2);
-        assert_eq!(get_u64(&shared, 0x20), 0x0000_1900_0000_0000);
-        assert_eq!(get_u64(&shared, 0x28), 0x0000_1900_0000_0000);
+        assert_eq!(get_u64(&shared, 0x20), 0x0000_1600_0000_0000);
+        assert_eq!(get_u64(&shared, 0x28), 0x0000_1600_0000_0000);
         assert_eq!(get_u64(&shared, 0x30), CONTROL_OPERAND_TABLE_ADDRESS);
         assert_eq!(
             get_u32(&shared, CONTROL_SHARED_CURSOR_OFFSET),
@@ -3140,7 +3341,7 @@ mod tests {
             PARTIAL_OPENING_CONTROL_SHARED_INNER_ADDRESS
         );
         assert_eq!(get_u64(&shared, 0x60), 3);
-        assert_eq!(PARTIAL_OPENING_CONTROL_SHARED_INNER_PRESENTED, 2);
+        assert_eq!(PARTIAL_OPENING_CONTROL_SHARED_INNER_PRESENTED, 0);
     }
 
     #[test]
@@ -3266,6 +3467,14 @@ mod tests {
         ]
     }
 
+    fn sksm_qid_resource_high() -> u64 {
+        shared().hw_data_bundle + NATIVE_SHARED_CLUSTER_SIZE as u64 + 0x4000
+    }
+
+    fn qos_resource_high() -> u64 {
+        shared().hw_data_bundle + NATIVE_SHARED_CLUSTER_SIZE as u64 + 0x8000
+    }
+
     #[test]
     fn hw_data_size_acceptance_completion_table_and_firmware_state() {
         assert_eq!(HW_DATA_SIZE, 0x3db4);
@@ -3273,7 +3482,17 @@ mod tests {
         let flag_only = [(3usize, 2u32), (7, 2)];
         let aliases = completion_aliases();
         let mut hw = vec![0xa5; HW_DATA_SIZE];
-        encode_hw_data(&windows, &flag_only, aliases, &mut hw).unwrap();
+        let qos_resource = qos_resource_high();
+        let sksm_qid_resource = sksm_qid_resource_high();
+        encode_hw_data(
+            &windows,
+            &flag_only,
+            aliases,
+            qos_resource,
+            sksm_qid_resource,
+            &mut hw,
+        )
+        .unwrap();
         assert_eq!(hw.len(), 0x3db4);
 
         // Chip id at +0xe90.
@@ -3328,6 +3547,13 @@ mod tests {
             assert_eq!(get_u32(&hw, base + 0x18), ordinal);
             assert_eq!(get_u32(&hw, base + 0x1c), 0);
         }
+        assert_eq!(get_u64(&hw, G17P_SKSM_QID_CONFIG_2700_OFFSET), 1);
+        assert_eq!(get_u32(&hw, G17P_SKSM_QID_CONFIG_2708_OFFSET), 0x100);
+        assert_eq!(get_u64(&hw, G17P_QOS_RESOURCE_OFFSET), qos_resource);
+        assert_eq!(
+            get_u64(&hw, G17P_SKSM_QID_RESOURCE_OFFSET),
+            sksm_qid_resource
+        );
 
         // The recorded opaque runs landed (spot check the two 0xffffffff tails).
         assert_eq!(get_u32(&hw, 0x3d98), 0xffff_ffff);
@@ -3351,13 +3577,27 @@ mod tests {
         let mut window = register_windows();
         window[0].device_va = 0x1000;
         assert_eq!(
-            encode_hw_data(&window, &[], aliases, &mut hw),
+            encode_hw_data(
+                &window,
+                &[],
+                aliases,
+                qos_resource_high(),
+                sksm_qid_resource_high(),
+                &mut hw,
+            ),
             Err(InitdataError::RegisterWindow)
         );
 
         // Two declarations for the same slot fail closed.
         assert_eq!(
-            encode_hw_data(&register_windows(), &[(0usize, 2u32)], aliases, &mut hw),
+            encode_hw_data(
+                &register_windows(),
+                &[(0usize, 2u32)],
+                aliases,
+                qos_resource_high(),
+                sksm_qid_resource_high(),
+                &mut hw,
+            ),
             Err(InitdataError::RegisterWindow)
         );
     }
@@ -3373,6 +3613,15 @@ mod tests {
         assert_eq!(REGION_C_REQUIRED_VALUE, 0x0000_0100);
         assert_eq!(get_u32(&region_c, 0xe50), REGION_C_REQUIRED_VALUE);
         assert_eq!(&region_c[0xe50..0xe54], &[0x00, 0x01, 0x00, 0x00]);
+        // Those same four bytes, framed the way b1 actually reads them: the
+        // byte at +0xe50 is zero and the GPU-core power-assert counter is the
+        // UNALIGNED u32 at +0xe51. Nothing in the image reads +0xe50 or +0xe55.
+        assert_eq!(region_c[REGION_C_REQUIRED_OFFSET], 0);
+        assert_eq!(
+            get_u32(&region_c, REGION_C_GPU_CORE_PWR_ASSERT_COUNTER_OFFSET),
+            REGION_C_GPU_CORE_PWR_ASSERT_COUNT
+        );
+        assert_eq!(REGION_C_GPU_CORE_PWR_ASSERT_COUNTER_OFFSET, 0xe51);
         // A recorded run near the front landed; the tail past the last run is 0.
         assert_eq!(get_u32(&region_c, 0x24), 0x0000_0bb8);
         assert_eq!(get_u32(&region_c, 0x7c), 1);
@@ -3510,11 +3759,11 @@ mod tests {
         assert_eq!(REGION_C_REQUIRED_OFFSET, 0xe50);
         assert_eq!(STATUS_BLOCK_POST_ACK_OFFSETS, [0x10, 0x14]);
         assert_eq!(PRIMARY_STATUS_B_OBJECT_SIZE, 0xeb00);
-        // Device-control record framing and both complete opening prefixes.
+        // Device-control framing and the ownerless-UMA-free opening prefixes.
         assert_eq!(CONTROL_RECORD_SIZE, 0x40);
-        assert_eq!(CONTROL_OPENING_PRIMARY_PRODUCER, 4);
+        assert_eq!(CONTROL_OPENING_PRIMARY_PRODUCER, 3);
         assert_eq!(COMPUTE_RUNTIME_CONTROL_RECORDS, 65);
-        assert_eq!(COMPUTE_RUNTIME_CONTROL_FINAL_COUNTER, 69);
+        assert_eq!(COMPUTE_RUNTIME_CONTROL_FINAL_COUNTER, 68);
         assert_eq!(CONTROL_OPENING_SECONDARY_PRODUCER, 16);
         // Channel state-block stride within the compact grid.
         assert_eq!(CHANNEL_STATE_STRIDE, 0x40);

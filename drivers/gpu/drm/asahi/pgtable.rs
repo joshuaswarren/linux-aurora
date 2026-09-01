@@ -89,6 +89,33 @@ const fn complete_coverage(expected: u64, visited: u64, permitted: bool) -> bool
     permitted && visited == expected
 }
 
+/// One maximal run of leaf-mapped pages found by
+/// [`UatPageTable::collect_mapped_ranges`].
+///
+/// `pte` is the run's first leaf entry, kept so a caller can tell a
+/// GPU-readable mapping apart from a firmware-only one without walking again.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
+pub(crate) struct MappedRange {
+    pub(crate) start: u64,
+    pub(crate) end: u64,
+    pub(crate) pte: u64,
+}
+
+fn push_mapped_range(
+    out: &mut [MappedRange],
+    count: &mut usize,
+    truncated: &mut bool,
+    run: MappedRange,
+) {
+    match out.get_mut(*count) {
+        Some(slot) => {
+            *slot = run;
+            *count += 1;
+        }
+        None => *truncated = true,
+    }
+}
+
 #[cfg(CONFIG_DEV_COREDUMP)]
 pub(crate) const PTE_ADDR_BITS: u64 = (!UAT_PGMSK as u64) & (!UAT_HIGH_BITS);
 
@@ -298,6 +325,27 @@ impl UatPageTable {
             geometry,
             oas_mask: (1u64 << oas) - 1,
         })
+    }
+
+    /// Resolve one mapped IOVA through this page table without touching the
+    /// mapped memory. This is used to prove that separately named aliases
+    /// refer to the same backing page before firmware can consume them.
+    pub(crate) fn translate_iova(&mut self, iova: u64) -> Result<PhysicalAddr> {
+        let page_mask = UAT_PGMSK as u64;
+        let page = iova & !page_mask;
+        let end = page.checked_add(UAT_PGSZ as u64).ok_or(EOVERFLOW)?;
+        let offset = iova & page_mask;
+        let oas_mask = self.oas_mask;
+        let mut translated = None;
+        self.with_pages(page..end, false, false, |_, ptes| {
+            let pte = ptes.first().ok_or(EFAULT)?.load(Ordering::Acquire);
+            if pte & PTE_TYPE_BITS != PTE_TYPE_LEAF_TABLE {
+                return Err(EFAULT);
+            }
+            translated = Some((pte & oas_mask & !page_mask).checked_add(offset).ok_or(EOVERFLOW)?);
+            Ok(())
+        })?;
+        translated.ok_or(EFAULT)
     }
 
     pub(crate) fn new_with_ttb(
@@ -540,6 +588,62 @@ impl UatPageTable {
             Ok(())
         })?;
         Ok(complete_coverage(expected, visited, permitted))
+    }
+
+    /// Collect the maximal runs of leaf-mapped pages inside `iova_range`.
+    ///
+    /// This reads page-table memory only -- ordinary DRAM, never GPU MMIO --
+    /// so it is safe to call with the GPU cores power-gated, which is the
+    /// state a faulted submission leaves them in.  Holes are skipped at
+    /// whole-table granularity by `with_pages`, so walking the full user
+    /// window costs one pass over the tables that actually exist.
+    ///
+    /// Returns the number of runs written to `out` and whether `out` was too
+    /// small to hold them all.
+    pub(crate) fn collect_mapped_ranges(
+        &mut self,
+        iova_range: Range<u64>,
+        out: &mut [MappedRange],
+    ) -> Result<(usize, bool)> {
+        if (iova_range.start | iova_range.end) & UAT_PGMSK as u64 != 0 {
+            return Err(EINVAL);
+        }
+
+        let page = UAT_PGSZ as u64;
+        let mut count = 0usize;
+        let mut truncated = false;
+        let mut current: Option<MappedRange> = None;
+
+        self.with_pages(iova_range, false, false, |iova, ptes| {
+            for (idx, ppte) in ptes.iter().enumerate() {
+                let pte = ppte.load(Ordering::Acquire);
+                let addr = iova + (idx as u64) * page;
+                if pte & PTE_TYPE_BITS == PTE_TYPE_LEAF_TABLE {
+                    if let Some(run) = current.as_mut() {
+                        if run.end == addr {
+                            run.end = addr + page;
+                            continue;
+                        }
+                    }
+                    if let Some(run) = current.take() {
+                        push_mapped_range(out, &mut count, &mut truncated, run);
+                    }
+                    current = Some(MappedRange {
+                        start: addr,
+                        end: addr + page,
+                        pte,
+                    });
+                } else if let Some(run) = current.take() {
+                    push_mapped_range(out, &mut count, &mut truncated, run);
+                }
+            }
+            Ok(())
+        })?;
+
+        if let Some(run) = current.take() {
+            push_mapped_range(out, &mut count, &mut truncated, run);
+        }
+        Ok((count, truncated))
     }
 
     fn pte_bits(&self) -> u64 {

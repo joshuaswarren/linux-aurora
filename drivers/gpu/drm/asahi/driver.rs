@@ -18,7 +18,8 @@ use kernel::{
     sync::{
         aref::ARef,
         Arc, //
-    }, //
+    },
+    workqueue::{self, impl_has_work, new_work, Work, WorkItem}, //
 };
 
 use crate::{
@@ -49,10 +50,74 @@ pub(crate) struct AsahiData {
     pub(crate) gpu: Arc<dyn drm_gpu::DrmGpu>,
     pub(crate) pdev: ARef<platform::Device>,
     pub(crate) resources: Option<regs::Resources>,
+    pub(crate) g17_runtime: Option<g17_drm::G17PRuntimeRef>,
+    #[pin]
+    g17_event_work: Work<AsahiDevice, 1>,
+    #[pin]
+    g17_recovery_work: Work<AsahiDevice, 2>,
 }
 
 unsafe impl Send for AsahiData {}
 unsafe impl Sync for AsahiData {}
+
+impl_has_work! {
+    impl HasWork<AsahiDevice, 1> for AsahiData { self.g17_event_work }
+    impl HasWork<AsahiDevice, 2> for AsahiData { self.g17_recovery_work }
+}
+
+impl WorkItem<1> for AsahiData {
+    type Pointer = ARef<AsahiDevice>;
+
+    fn run(dev: ARef<AsahiDevice>) {
+        let Some(runtime) = dev.g17_runtime else {
+            return;
+        };
+        if let Err(error) = runtime.service_primary_firmware_events() {
+            dev_err!(
+                dev.as_ref(),
+                "G17P event worker: serialized drain/recovery failed ({:?})\n",
+                error
+            );
+            return;
+        }
+        if runtime.primary_recovery_pending() {
+            queue_g17p_recovery_worker(dev);
+        } else if runtime.primary_firmware_event_pending() {
+            queue_g17p_firmware_event_worker(dev);
+        }
+    }
+}
+
+impl WorkItem<2> for AsahiData {
+    type Pointer = ARef<AsahiDevice>;
+
+    fn run(dev: ARef<AsahiDevice>) {
+        let Some(runtime) = dev.g17_runtime else {
+            return;
+        };
+        if let Err(error) = runtime.service_primary_recovery() {
+            dev_err!(
+                dev.as_ref(),
+                "G17P recovery worker: serialized recovery failed ({:?})\n",
+                error
+            );
+            return;
+        }
+        if runtime.primary_firmware_event_pending() {
+            queue_g17p_firmware_event_worker(dev);
+        } else if runtime.primary_recovery_pending() {
+            queue_g17p_recovery_worker(dev);
+        }
+    }
+}
+
+pub(crate) fn queue_g17p_firmware_event_worker(dev: ARef<AsahiDevice>) {
+    let _ = workqueue::system_highpri().enqueue::<ARef<AsahiDevice>, 1>(dev);
+}
+
+pub(crate) fn queue_g17p_recovery_worker(dev: ARef<AsahiDevice>) {
+    let _ = workqueue::system_highpri().enqueue::<ARef<AsahiDevice>, 2>(dev);
+}
 
 #[allow(dead_code)]
 enum AsahiRuntime {
@@ -287,18 +352,22 @@ fn probe_t8140_runtime(
         registers,
         soc,
         &expected,
+        &observed,
         topology,
     )?;
     let runtime = Arc::pin_init(new_mutex!(runtime), GFP_KERNEL)?;
     let runtime_ref = g17_drm::G17PRuntimeRef::new(&runtime);
     let gpu: Arc<dyn drm_gpu::DrmGpu> = Arc::new(
-        g17_drm::G17PDrmGpu::new(runtime_ref, soc, observed),
+        g17_drm::G17PDrmGpu::new(runtime_ref, soc, observed)?,
         GFP_KERNEL,
     )?;
     let data = try_pin_init!(AsahiData {
         gpu,
         pdev: pdev.into(),
         resources: None,
+        g17_runtime: Some(runtime_ref),
+        g17_event_work <- new_work!("AsahiData::g17_event_work"),
+        g17_recovery_work <- new_work!("AsahiData::g17_recovery_work"),
     });
     let ptr: *const AsahiData = &raw const **drm;
     // SAFETY: `drm` was created with an uninitialized data slot above; this
@@ -306,6 +375,7 @@ fn probe_t8140_runtime(
     unsafe {
         data.__pinned_init(ptr as *mut AsahiData)?;
     }
+    runtime.lock().arm_primary_firmware_event_worker()?;
     runtime.lock().mark_firmware_cache_flush_ready()?;
     (*drm).gpu.init()?;
     drm::driver::Registration::new_foreign_owned(&drm, pdev.as_ref(), 0)?;
@@ -914,6 +984,9 @@ impl platform::Driver for AsahiDriver {
             gpu,
             pdev: pdev.into(),
             resources: Some(res),
+            g17_runtime: None,
+            g17_event_work <- new_work!("AsahiData::g17_event_work"),
+            g17_recovery_work <- new_work!("AsahiData::g17_recovery_work"),
         });
 
         let ptr: *const AsahiData = &raw const **drm;

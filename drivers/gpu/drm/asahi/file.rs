@@ -561,6 +561,18 @@ impl File {
 
         for _i in 0..data.num_binds {
             let bind: uapi::drm_asahi_gem_bind_op = reader.read_up_to(data.stride as usize)?;
+            // Vulkan faults on an unmapped USC exec window. Log every bind so we
+            // can tell whether Mesa asks for that range and we drop it, or never
+            // asks at all.
+            pr_info!(
+                "G17P bind: vm={} addr={:#x} range={:#x} offset={:#x} flags={:#x} handle={}\n",
+                data.vm_id,
+                bind.addr,
+                bind.range,
+                bind.offset,
+                bind.flags,
+                bind.handle,
+            );
             Self::do_gem_bind_unbind(vm_id, &bind, file)?;
         }
 
@@ -682,7 +694,17 @@ impl File {
             return Err(EINVAL);
         }
 
+        vm.validate_t8140_native_context_binding(data.addr, data.range, single_page)?;
         vm.bind_object(&bo, data.addr, data.range, data.offset, prot, single_page)?;
+        // G17P secure GART has a second, context-0 view for fixed resource
+        // subranges. Record backing identity here, but do not publish the
+        // global context-0 aliases until this VM owns a render submission.
+        vm.track_t8140_native_context_binding(
+            bo.clone(),
+            data.addr,
+            data.range,
+            data.offset,
+        )?;
 
         vm.bo_deferred_cleanup();
 
@@ -757,6 +779,7 @@ impl File {
         }
 
         vm.unmap_range(range.start, range.range())?;
+        vm.untrack_t8140_native_context_range(range);
 
         vm.bo_deferred_cleanup();
 
@@ -776,6 +799,7 @@ impl File {
                     let vm = file_vm.borrow().vm.clone();
                     core::mem::drop(file_vm);
                     vm.drop_mappings(bo)?;
+                    vm.untrack_t8140_native_context_object(bo);
                     if idx == usize::MAX {
                         break;
                     }

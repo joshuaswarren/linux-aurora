@@ -86,5 +86,330 @@ kernel::module_platform_driver! {
             // permissions: 0,
             description: "G17P bring-up stage (0: control, 1: QID4, 2: compute UAPI)",
         },
+        g17p_max_recoveries: u32 {
+
+            default: 0,
+
+            description: "Max firmware recoveries serviced per session (0: unlimited). Diagnostic for the J700 recovery loop.",
+
+        },
+        g17p_native_order: u32 {
+            default: 1,
+            description: "G17P command publication order (1: kext order tag3,15,14,16 -- the default; 0: legacy tag15,16,14)",
+        },
+        g17p_submit_polls: u32 {
+            default: 500,
+            description: "G17P first-submit completion polls, 1ms each (default 500)",
+        },
+        g17p_probe_low_range: u32 {
+            default: 0,
+            description: "Probe sgx low register range mid-submit while the GPU is powered (0: off)",
+        },
+        g17p_late_sksm: u32 {
+            default: 0,
+            description: "Replay suppressed SKSM port writes once the GPU cores are powered (0: off)",
+        },
+        g17p_fw_log: u32 {
+            default: 0,
+            description: "Enable the GPU firmware log ring (main_config+0x250)",
+        },
+        g17p_fw_trace: u32 {
+            default: 0,
+            description: "Firmware trace class mask written to status_a+0x00 on BOTH roles before the initdata doorbell. Bit N enables trace channel N; bit 0 carries the whole KSM submission path. Non-zero also enables the KTrace drain (arming without draining makes the firmware busy-wait ~3ms once and then drop records). 0: off",
+        },
+        g17p_fw_ktrace_verbose: u32 {
+            default: 0,
+            description: "Print every KTrace record instead of only the submission-path codes (0x41/0x46/0x4b/0x57/0x0a/0x0c/0x0e/0x20 and the 0x11c lost marker)",
+        },
+        g17p_fw_ktrace_budget: u32 {
+            default: 32,
+            description: "Maximum KTrace records printed per drain pass (0: unlimited). Records over budget are still consumed and acknowledged.",
+        },
+        g17p_flushid_fix: u32 {
+            default: 0,
+            description: "Tag-15 FlushID fields: 0 keeps ours (shared_control/0x3f/1), 1 uses the kext constants (0/-1/-1)",
+        },
+        g17p_skip: u32 {
+            default: 0,
+            description: "Bisect the submission: bit0 skip tag-14 AddKicks, bit1 skip tag-16 EntrySignal, bit2 skip EP21 doorbells",
+        },
+        g17p_defer_add_kicks: u32 {
+            default: 0,
+            description: "Publish tag-14 AddKicks only after the firmware recovery/power-up closes (1: native behaviour)",
+        },
+        g17p_clear_fault: u32 {
+            default: 1,
+            description: "Acknowledge any stale GMMU fault before booting the firmware (1: on)",
+        },
+        g17p_ctx2_root: u32 {
+            default: 3,
+            description: "Bitmask of the compute kick's GPU hardware contexts to publish translation roots for: bit0 = context 2 (workload 0), bit1 = context 3 (m1n1's retained pair, every later workload). Each context is aliased onto the bound compute VM's low root plus the populated firmware high root, tagged with the context as its ASID, exactly as m1n1's hardware-proven agx_g17p_native_add3.py set_l0(CONTEXT,0,root,CONTEXT)/set_l0(CONTEXT,1,ttbr1_base,CONTEXT) does. Default 3. 0: previous behaviour, those contexts have no root at all and the first gUPM fetch takes a Page Invalid fault with vm_slot=2.",
+        },
+        // NOTE: every `permissions:` line in this block is commented out, so
+        // the macro gives each parameter permissions 0. That means NONE of
+        // these appear under /sys/module/asahi/parameters -- they can only be
+        // set on the insmod command line. Looking for one in sysfs and not
+        // finding it does not mean the build lacks it; check
+        // `strings asahi.ko | grep parmtype=` instead. This cost a hardware
+        // cycle once already.
+        g17p_vm_probe_va: u64 {
+            default: 0,
+            description: "Non-zero: at every compute submit, hexdump 64 bytes of GPU-visible memory at this VA and probe every 8-byte word inside it that looks like a user VA, dumping 32 bytes at each. Chases the descriptor chain the SHADER walks -- root descriptor -> sets[0] -> the buffer address it stores through -- none of which appears in the UAPI or in the command stream, so nothing else can name it. Set it to Mesa's `G17P root: va=` value (HK_G17P_LAUNCH_TRACE=1). 0: off.",
+        },
+        g17p_fault_report: u32 {
+            default: 1,
+            description: "Log the firmware fault report reached through main_config+0x26c (blamed qid, data master, recovery state) next to the MMU fault bank (1: on)",
+        },
+        g17p_progress_watchdog: u32 {
+            default: 1,
+            description: "KSM progress watchdog threshold at regionC+0x9cc (1: keep native 0x32, 0: disable)",
+        },
+        g17p_generic_compute: u32 {
+            default: 1,
+            description: "Let a compute command that carries no DRM_ASAHI_COMPUTE_G17P_ADD3_PROOF flag drive the binary-verified first-bind chronology (tag 3 -> 15 -> QID configure -> SKSM entry -> 14 -> 16 -> CL_2) when its queue is still in PreparedMemory. 1: on -- required for any Mesa/Honeykrisp dispatch, which binds resources through the command stream and so declares no attachments. 0: previous behaviour, only the add3 probe reaches the firmware and every other first compute submit returns ENOTSUPP.",
+        },
+        g17p_power_hold: u32 {
+            default: 0,
+            description: "After IdlePowerOff(0) powers the cores, publish a second device-control record with arg=1 to inhibit the firmware's idle power-down for the duration of the submit (1: on)",
+        },
+        g17p_power_wire: u32 {
+            default: 0,
+            description: "Publish a device-control IdlePowerOff(0) record (opcode 0x0a, arg 0) and announce it on EP 0x21. It reaches 0xfffffc0000021960, which is the only routine that releases KSM pause reason bit 1. 0: off (default, and what native does -- a live dtrace capture of a Metal dispatch shows no device-control record at all). 1: publish it in the submit PREAMBLE, before the kick. 2: publish it AFTER the kick and its doorbell. Mode 2 exists because firmware RE of b1 shows the ORDER is load-bearing whenever the pause mask has more than one bit set: every clear site -- bit 1 at 0xe488, bit 3 at 0x25dd4 -- is an `ands` followed by `b.ne <skip>`, so the core power sequencer 0x20a70 runs ONLY on the transition to mask == 0. With the post-fault mask of 0xa (bits 3|1) a preamble clear of bit 1 leaves 0x8 and is skipped by construction, which is why mode 1 measured as a no-op. Deferring lets the scheduler clear bit 3 first (0xdeb8 reports outstanding work -> 0x25c00 -> 0x25dc0) so that this record's bit-1 clear is the one that reaches zero. NOTE 0x21960 is itself double-gated: it early-exits at 0x21980 when [0xfffffc00001771f8] bit 1 says the ASC has napped.",
+        },
+        g17p_idle_selector: u32 {
+            default: 1,
+            description: "Set regionC+0xe21 to 1 (one byte). The firmware copies it to [0x177d20], where it selects which arm of the outstanding-kick check at 0xdeb8 decides whether the scheduler may descend to idle. Ours ships 0, selecting an arm we do not control, so the idle-descent block at 0x25980 re-takes pause reason bit 3 and then bit 1 and closes the GPU core power gate mid-submit. Non-zero selects the arm that is permanently 'must not idle' once [0x125de0] != 0, which is guaranteed after the first AddKicks in direct mode. [0x177d20] has exactly two accesses image-wide, so the blast radius is one branch. 1: on (default), 0: previous behaviour.",
+        },
+        g17p_render_absolute_pointers: u32 {
+            default: 0,
+            description: "Diagnostic escape hatch for G17P VDM register 0x1c880. Native lowers a task VA to a task-relative offset, maps the same backing into the architectural GART window at 0x1000000000 + offset, and writes the offset; live fault words prove hardware adds 0x1000000000 back when compact-pointer bit 39 is clear, while bit 39 selects the upper UAT root. Linux userspace supplies the validated full GART-alias VA. 0 (default): subtract 0x1000000000 and reject offsets >= 1<<39. 1: write the full VA directly, reproducing the upper-root dVDM_CSD fault. Tilemap/TPC/heapmeta remain relative to the separate driver-private render-state context in both modes.",
+        },
+        g17p_render_status_flag: u32 {
+            default: 0,
+            description: "Seed word 0 of the render status page(s) with 1, matching what the driver already writes into the compute runtime state. MEASURED BASIS: the page at 0xfffffc2001630000 reads word0=1 on a compute submit that completes 64/64 exact, and word0=0 on every render submit, sampled at the same points. That VA is declared to the firmware by initdata (g17_initdata.rs:838, put_u64(out, 0x4c, COMPUTE_RUNTIME_STATE_ADDRESS)) and G17P_BOOTSTRAP_3D_STATUS_VA is bit-for-bit the same address, so on a render-only boot the firmware's declared runtime-state page is backed by render's zeroed 3D status page. The driver seeds the compute object's word 0 with 1 in three places (g17_resources.rs ~5278, ~7374, ~7859); render has no equivalent. 0: off (default), 1: seed the 3D status page only -- the one that shares the VA, 2: seed the TA status page as well. NOTE the 1 is written by the DRIVER, not the firmware, so this tests whether the firmware requires that flag, not whether the firmware sets it.",
+        },
+        g17p_render_gate_probe: u32 {
+            default: 0,
+            description: "Sample the scheduler-gate registers (gpc-state, fender dynamic gating, host IRQ enable/status) in a burst immediately after the render doorbell, logged as checkpoint render-post-doorbell. This is the observable that actually moves on a submission which executes: a working compute submit reports gpc-state 0x0 -> 0x1 -> 0x0, while scan-active reads 0 on that same run and is therefore meaningless. The render path had no equivalent sample at all. UNSAFE BY CONSTRUCTION, which is why it defaults off: the read touches the sgx register file, and an sgx read with the GPU cores power-gated raises an asynchronous SError and panics the machine. It is taken ONLY in the window right after the doorbell, never before publish (cores may still be gated -- render-pre-doorbell is DRAM-only for that reason) and never at the wait timeout (cores have powered back down; this panicked the box every time it was tried on the compute path). Compute's own sample is safe only because it runs after a completion woke the caller. 0: off (default), 1: 12 samples at 1ms, 2: 40 samples at 1ms for a wider window.",
+        },
+        g17p_render_ksm_probe: u32 {
+            default: 0,
+            description: "DIAGNOSTIC ONLY. After both native G17P render doorbells are sent, wait up to 40ms for non-zero QID1 admission state, then take one power-gated-safe snapshot: QID1 KSM state/progress through the SKSM port (0xc020/0xc078) plus the global current-command/context pointers (0xc0f0/0xc0f8). Sampling only after the 3D doorbell is too early because the fragment has a TA dependency and modes 2/3 have not published TA yet. The firmware recovery path reads these same words to identify a selected command which never started. Requires g17p_render_native_doorbells=1..3; paired and split-launch paths are deliberately not probed. UNSAFE if the hardware power-state indication is wrong: the low SGX register file SErrors while GPU cores are off. 0: off (default), 1: one bounded post-doorbell snapshot.",
+        },
+        g17p_render_header_flags: u32 {
+            default: 0,
+            description: "DIAGNOSTIC ONLY. Force native conditional bits in the render KSM entry header. Bit 0 sets header bit 1 on the 3D entry only; AGXKSMKickQueueG16::encode3DKickEntry passes it when host descriptor +0xc6c is 3 or +0x4c bit 0 is set. Bit 1 sets header bit 61 on both render entries; native actually sources it from the device-global [channel->device+0x6b7] & 3 mode, not descriptor memory. The captured/default device mode leaves it clear. 0 is the native default encoding.",
+        },
+        g17p_render_generation_bias: u32 {
+            default: 0,
+            description: "Bias the render tag-15 generation fields +0x2a/+0x2e by one, so the first submit of a boot does not publish zero. The firmware reads +0x2a as a u64 (tag-15 handler at 0xfffffc0000011404), stores it in its per-queue table at 0xfffffc0000125df0 + qid*8, and every consumer takes bits 47:40 -- byte 0x2f, the high byte of the u16 at +0x2e, i.e. ordinal & 0xff -- compares it against a cached byte and SKIPS on equality. The raw ordinal is 0 on the first render submit, matching the firmware's initial cached 0, so it reads as 'unchanged'. Same defect already fixed at +0x3e in the same function, whose comment records that native never publishes zero there. CAVEAT, and the reason this defaults OFF: a working compute submit publishes graphics=0, so the firmware skips this block entirely and leaves the same table entry at zero -- compute therefore reaches the SAME table state and still executes, which argues this is not what distinguishes render from compute. 0: off (default), 1: on.",
+        },
+        g17p_render_bg_prefix: u32 {
+            default: 0,
+            description: "Use the witnessed high bits for the background program resource-specifier bind. WITNESSED: native reg 0x15369 = 0xffff800000000040, so the prefix is 0xffff_8000_0000_0000. Ours has always been 0x0007_8000_0000_0000, taken from the in-tree selftest bg_rsrc_spec_hi = 0x00078000 -- itself a guess, since the earlier 192-byte capture stopped before this register was visible. The low half, the resource spec proper, is unchanged and still comes from userspace. 0: keep 0x00078000 (default), 1: use the witnessed 0xffff8000.",
+        },
+        g17p_render_fragment_lifecycle: u32 {
+            default: 0,
+            description: "DIAGNOSTIC, native-derived ownership without captured literals. Metal writes one nonzero 64-bit fragment event correlation to registers 0x160e0/0x01499/0x0a341: low32 is the current 3D command-publication stamp and high32 is a preceding dependency event. Linux currently writes zero to all three and incorrectly shares the source field with TA, whose native correlation is separate. Mode 1 leaves TA unchanged, samples the firmware StatusB +0x4920 TDR scheduler-progress cache only as a safe Linux seed, and derives a nonzero monotonic fragment-local dependency/current pair from the retained render ordinal. That StatusB word is not established as the native event source. Firmware does not validate the captured numeric values, so none are copied. 0: current zero baseline. 1: stage-specific derived fragment correlation.",
+        },
+        g17p_render_eot_bind_zero: u32 {
+            default: 0,
+            description: "DIAGNOSTIC ONLY. Force the G17P fragment end-of-tile/store resource-specifier bind to zero in the main, partial-store, partial-resume, and retained descriptor-tail copies. Every available working Metal 3D command capture writes register 0x15379 as zero in all captured phases, while Mesa currently supplies resource spec 8. This switch changes the shared source fields before descriptor encoding so all duplicated command fields remain coherent. 0: preserve the userspace ABI value. 1: match the captured Metal value zero.",
+        },
+        g17p_render_dump_descriptor: u32 {
+            default: 0,
+            description: "DIAGNOSTIC ONLY. Dump the complete post-encoding 0x2240-byte G17P 3D descriptor in compact 64-byte rows before the first render publication, after retained fields, generic tails, and optional MCache mutations have all been applied. This is intended for byte-for-byte comparison against a working Metal descriptor capture without evicting launch evidence from the printk ring. 0: off. 1: dump the bootstrap descriptor.",
+        },
+        g17p_render_mcache_hwsid: u32 {
+            default: 0,
+            description: "DIAGNOSTIC ONLY. 0 disables active render MCache mappings. A value 1..255 packs validated UAPI fragment-write ranges into the native G17P 3D descriptor +0x6a0 table and publishes the matching KSM aperture, using this value as HWDSID. Kext RE proves G16 configureDevice sets the default physical HWDSID to 0x18 and G17P expands the supported range to 0x60 IDs; logical DSID 0x100 directly selects that default without getHWDSID/updateDSIDConfiguration. Therefore 24 is the native default, not captured allocator state. It remains explicit while the complete MCache path is under bring-up. Never use with absent fragment attachments.",
+        },
+        g17p_render_mcache_mode: u32 {
+            default: 0,
+            description: "DIAGNOSTIC ONLY. 0 emits the established one-range-per-UAPI-fragment-attachment MCache table. 1 requires exactly one validated fragment attachment and emits the earlier topology probe: mapped aux-FB with shift 2 at +0x6a0, then the attachment with shift 1 at +0x6b0. 2 requires exactly two validated UAPI ranges and emits them unchanged in native order with shifts 2/1; userspace derives these from its complete live writable main/USC BO spans. Modes 1/2 share one HWDSID/selector and publish KSM index 0/count 2. No captured native VA is copied. Requires non-zero g17p_render_mcache_hwsid.",
+        },
+        g17p_render_mcache_selector: u32 {
+            default: 64,
+            description: "DIAGNOSTIC ONLY. MCache write-range selector shared by every emitted record. Values 0..63 are encoded directly; 64 (default) uses the currently bound render root slot. Working Metal witnesses use AGXContextIDManager-derived selectors 2 or 3 even when descriptor context is 1. For those two witnessed values Linux now mirrors the bound render GART roots into the matching TTBAT slot before making the first outer producer visible, reproducing AGXSecureGart::registerContextID instead of emitting an unbacked selector. Values above 64 reject the render.",
+        },
+        g17p_render_ksm_mcache: u32 {
+            default: 0,
+            description: "DIAGNOSTIC ONLY. Independently publish the descriptor MCache write table as a KSM entry aperture. Native Metal populates the 3D firmware descriptor +0x6a0 mappings for the captured render while leaving host AGX3DCommandDescriptor +0xaa8 count zero; encodeKickEntry therefore leaves header bit58 and entry +0x08 clear. Linux previously coupled these two distinct objects. 0 (default): native, descriptor mappings only and no KSM aperture. 1: reproduce the old coupled diagnostic.",
+        },
+        g17p_render_no_barrier: u32 {
+            default: 0,
+            description: "DIAGNOSTIC ONLY -- delete the real TA timestamp dependency from the 3D KSM entry. Kext RE corrected the earlier pool theory: the KSM dependency contains only timestamp+QID, never a barrier-pool slot or pointer. Native does reserve temporary vendevtBarrierRec storage while building the event list, but setupBarrierCommand compares source ownership against the target context ID and deliberately skips publishing tag-4 for this captured same-context TA-to-3D edge; completion releases the temporary host record regardless. Therefore Linux's one explicit dependency is the native payload and there is no dangling unowned slot. 0: correct dependency present (default). 1: historical suppression diagnostic only; not a fix.",
+        },
+        g17p_render_split_launch: u32 {
+            default: 0,
+            description: "DIAGNOSTIC ONLY -- make the paired render submission a true whole-group split. Before the first channel-0 doorbell the 3D command/tag-15 bytes may be staged in host memory, but its SKSM entry, tag-14 AddKicks/item producer, and outer data-master producer all remain unpublished; only the complete TA group is visible. After both TA-owned timestamps become non-zero, the driver publishes the 3D SKSM entry/dependency, then tag-14 and its inner producer, then the retained 3D outer slot/producer, and sends the same channel-0 doorbell again. This isolates 3D descriptor execution from simultaneous paired-launch/dependency chronology without ever publishing and rewinding live state. 0: normal fragment-first paired publication (default, byte-for-byte unchanged), 1: TA completion then complete 3D group publication.",
+        },
+        g17p_render_native_doorbells: u32 {
+            default: 0,
+            description: "Native Mac17P render TX doorbells. 0: legacy paired publication followed by only Vertex/priority0 (0x0083000000000000, default). 1: paired publication followed by 3D Fragment/priority2 (0x0083000000000009) then TA Vertex/priority2 (0x0083000000000008). 2: exact native publication chronology -- publish only the complete 3D descriptor/tag15/SKSM/tag14/inner/outer group, send 0x...09, then publish the complete TA tag15/SKSM/tag14/inner/outer and late Pool-A transition, then send 0x...08. 3: mode 2 plus a bounded 10ms pre-ack after 0x...09; TA remains wholly unpublished until the Fragment outer channel's firmware-owned actual consumer and host producer both equal the published producer (the coherency cursor is logged but does not gate). Modes 1/2/3 are mutually exclusive with g17p_render_split_launch; modes 2/3 require render SKSM.",
+        },
+        g17p_render_native_pool_a_first_record: u32 {
+            default: 0,
+            description: "DIAGNOSTIC ONLY -- use initialized Pool-A record 1 for the cold first render pass, matching recs-var/recsmax: TA descriptor +0x10 and 3D descriptor +0x20 both advance from the Linux Pool-A base by 0x100, record 1 carries its matching slot pointer and +0x10 state 0x50, slot 1 is seeded to 1 before 3D publication, and late TA publication advances that same slot to 2. The established path uses record/slot 0. Retained ordinal*2 selection is deliberately unchanged because native scenes can reuse an index across multiple sequence values. No tag16, queue, RCE, SKSM, or doorbell field changes. 0: record 0 (default), 1: record 1 for cold ordinal 0 only.",
+        },
+        g17p_render_native_fragment_hwpb: u32 {
+            default: 0,
+            description: "G17P parameter-buffer binding mode. 0: established packed-object fallback. 1: bind the exact PM-mode2 0xc0-byte HWPB state at both TA +0x20 and Fragment +0x28 and publish the same object in TA ConfigUpdate +0x6e, matching Metal pointer identity. 2: DIAGNOSTIC ONLY -- keep the mode-1 descriptor pointers and coherent PBDesc/HWPB ID but publish zero at TA ConfigUpdate +0x6e, isolating firmware HWPB-bind admission from descriptor execution. 3: DIAGNOSTIC ONLY -- reproduce the last TA-starting Linux pointer arrangement: packed object at TA +0x20 and TA ConfigUpdate +0x6e, PM HWPB only at Fragment +0x28.",
+        },
+        g17p_render_usc_freelist: u32 {
+            default: 0,
+            description: "NATIVE-DERIVED FIRST-SUBMIT CONTROL. Before the first render doorbell, publish AGXUSCPrivMemFList::updateSubmitInfo as the exact 0x40-byte opcode-0x20 device-control record. The operands name Linux-owned resources: firmware state 0xfffffc20c0828000, FList runs 0x7000208000..0x7000208580, sequence 0, HardwareBufferID 0, and submit stamp 1. A matching firmware type-13 record is accepted only while the retained two-reference owner is live; its final reference publishes the exact opcode-0x2e sequence/ID release and keeps the lifecycle retained through consumption or processor stop. This is asynchronous like native: render does not wait for type 13 before ringing its doorbells. 0: off (default), 1: enable once for the cold render FList.",
+        },
+        g17p_recovery_allow_active_scheduler: u32 {
+            default: 0,
+            description: "Let a firmware recovery be serviced while render scheduler state is live. validate_empty_primary_firmware_recovery_scheduler refuses with EBUSY whenever render_storage, render_tracker or render_bind exists, or render_submission_ordinal is non-zero. That precondition is UNSATISFIABLE for a render-blamed recovery: the firmware raises the type-4 restart request DURING the render wait, so those fields are populated by construction at exactly the moment the handshake must be answered. Measured with g17p_render_service_events=1 -- the drain now reaches the recovery, decodes it, does the generation bookkeeping, logs 'servicing', and then dies on this guard. The guard predates render being able to trigger a recovery at all; for compute the scheduler genuinely was empty. What it actually protects is the generation-0 SKSM last-submitted timestamp wipe, which would erase a live render's progress markers and make the firmware immediately request another recovery (observed on J700 as 105 identical fault-free recoveries in one 625ms window). So this option scopes the refusal to that wipe instead of the whole handshake: with it set, the acknowledge (write 2 into status_b[0x4900]) and the final clear run regardless, and the wipe is skipped while render state is live. The precedent is in the same function -- the non-empty recovery-info table used to abort there too, until it was understood that refusing to clear is strictly worse than clearing because it pins the firmware waiting for a host answer that never comes. NOTE THE SCOPE, again: this completes the recovery handshake for a render halt. It does not make a render succeed. 0: off, keep the EBUSY (default), 1: service with a live scheduler, skipping the wipe.",
+        },
+        g17p_render_service_events: u32 {
+            default: 0,
+            description: "Service firmware events between polls of the render completion wait. The render submit runs under the runtime mutex -- g17_drm.rs calls submit_translated_render on a locked guard and the wait happens inside that call -- so the workqueue item that drains the firmware event ring blocks on mutex().lock() for the entire wait. Measured: the firmware halts, posts a type-4 kAGFIFirmwareEventTypeGPURestart naming stamp slot 0, raises the RTKit notification (four seen, role=GFX1), and the ring still reads producer=1 consumer=0 pending=1 when the wait gives up. The firmware spins until the host writes 2 into status_b[0x4900]; never answering leaves KSM halted forever, which is the ETIMEDOUT. This mirrors submit_translated_compute, which polls with the mutex held and therefore calls service_firmware_events_inline from inside its own loop instead of relying on the worker; that helper also does the queue_primary_recovery(generation, ..) bookkeeping a bare drain would skip, which is the failure mode recorded at g17_live_boot.rs:620. NOTE THE SCOPE: this makes a render halt RECOVERABLE, it does not make a render succeed. The completion records were read directly from the KSM rings, not through the worker, and were genuinely empty -- so the work did not run, and nothing here makes it run. Expect the consumer to advance to 1 and the render to fail cleanly or recover-and-fail rather than wedge. 0: off (default), 1: service inline. No locking changes either way, so compute and the DRM-level compute wait are untouched.",
+        },
+        g17p_compute_sksm_entry: u32 {
+            default: 1,
+            description: "DIAGNOSTIC CONTROL on the COMPUTE path. 1 (default): normal. 0: publish everything a compute submit normally publishes -- tag 3/15/14/16, the classic item-ring CL_2 command, the doorbell, the SKSM producer advance -- but never write the SKSM kick entry BODY. This tests the control rather than the failing path. The suppressed SKSM queue-enable (g17p_sksm_mmio=0, a no-op because the port raises an SError) was dismissed as a render blocker on the grounds that compute calls the identical suppressed function and still completes 64/64. That argument only carries if compute's completion actually depends on SKSM scheduling. This driver straddles both mechanisms: compute writes an SKSM entry AND appends a classic item-ring command, and the compute throughput ceiling that was fixed earlier was an ITEM-RING WRAP -- which a purely SKSM-scheduled path could not have been gated by. So compute may well be scheduled classically with its SKSM entry vestigial, in which case the dismissal proves nothing about render, which has no classic path at all. If compute still passes with this at 0, the SKSM enable is a live render candidate again; if compute fails, the original refutation stands. Note that a live SKSM would then be reading a zeroed entry, so a hang on that outcome is expected and is itself the answer.",
+        },
+        g17p_report_drain: u32 {
+            default: 0,
+            description: "Read the firmware EVENT ring (channel-table entry 13) at the render checkpoints and log every record. This ring carries Fault / Flag / Timeout / GrowTilingBuffer / ChannelError, and until now nothing in the driver read it: decode_channel13_event and decode_firmware_report had no live caller outside a unit test, and no code outside g17_initdata.rs referenced the report ring offsets at all. Event type 7 is the firmware asking the HOST to grow the tiling parameter buffer; the legacy AGX2 path answers it (channel.rs EventMsg::GrowTVB -> BufferManager::grow -> DeviceControlMsg::GrowTVBAck), the G17P path does not, so such a request would sit unread in DRAM while the tiler waits for a reply that never arrives -- which is exactly what a render that dispatches, powers the cores, holds them for 40ms and completes nothing looks like. NOTE the pointer arithmetic, because it is easy to get wrong: a report channel-table entry is TWO (state, ring) pairs, not three states and a ring. Entry 14 proves the shape -- the working ktrace drain uses entry[0] (status_a+0x240) and entry[1] (status_a+0xa6ac0). So entry 13 = [0x40, 0x2c0, 0x80, 0x4ac0] means the event state is status_a+0x40 (consumer +0x00, producer +0x20) and the event ring is status_a+0x2c0; status_a+0x80 is entry[2], the firmware LOG ring-0 control block that dump_firmware_log walks at 0x30 stride, and it is non-zero on every boot for reasons unrelated to tiling. The drain logs that word too, labelled fwlog-write, so the two can never be confused. 0: off (default), 1: read and log without touching the consumer cursor, 2: also publish the consumer cursor as the ktrace drain does. Mode 1 is the safe first experiment: it answers whether anything is there without writing to firmware-shared state on a ring whose consumer has never moved. Nothing acts on a record in any mode.",
+        },
+        g17p_report_drain_budget: u32 {
+            default: 0,
+            description: "Maximum event-ring records logged per drain call (0: unlimited). Records over budget are still counted.",
+        },
+        // 2026-09-01 follow-up: descriptor +0x789=0x10 was also hardware-null
+        // (same fault-free TA timeout and recovery as the 0x08 baseline).
+        g17p_render_native_regs: u32 {
+            default: 0,
+            description: "DIAGNOSTIC captured register values retained after native provenance auditing. Active bits: bit 1 (2) replaces TA 0x0a5a1's lawful zero-source fallback 0x6000400020 with one workload-derived Metal value 0xfe00400020; bit 3 (8) similarly replaces fragment 0x0a5a9 with captured 0xd500400020; bit 5 (32) forces fragment register 0x1c838 to zero without changing the independently sourced descriptor tail. TA 0x14308 and fragment 0x14048 now both come from the retained shared USC FList HardwareBufferID. Bits 0 (1) and 4 (16) are retired; TA 0x1c830 comes from the native-shaped parameter-buffer ID allocator. Bit 2 (4) is retired because fragment 0x1c838 comes from cached SGX 0xe01480 bits 19:16; tail +0x210c comes from bits 3:0, +0x2104 from SGX 0xe0141c bit 0, and +0x2110 is a separate native render-setup field. 0: lawful Linux-owned values (default).",
+        },
+        g17p_render_native_bytes: u32 {
+            default: 0,
+            description: "MEASURED 2026-08-31: NO EFFECT. Setting this to 1 on hardware produced a run identical to baseline in every observable -- both descriptors retired into completion ordinal 0 with start=0x0, ordinal 2 empty, pause-mask 0x0, restart request serviced, same sequence. So TA descriptor bytes +0x93f (0x91 vs native 0x87) and +0x94d (0x01 vs native 0x03) DO NOT MATTER, and the two-byte divergence found by auditing our literals against recs4096-gfx.txt is a dead end. Do not regenerate this change from the same capture. Kept as a parameter so the null result stays reproducible. ORIGINAL RATIONALE: send the witnessed values for two TA descriptor bytes -- +0x93f = 0x87 and +0x94d = 0x03 -- instead of this driver's 0x91 and 0x01. A systematic audit of every literal put_u8/16/32/64 in build_ta_descriptor and build_cold_opening_ta_descriptor against native TA descriptor 0 in recs4096-gfx.txt found 9 literals inside 0x9c0, 7 matching and exactly these 2 differing, so this is the complete known divergence set on the TA side. THAT IS NOT SUFFICIENT GROUNDS TO CHANGE THE CONSTANTS, which is why this is a parameter and not an edit: one sighting cannot distinguish 'our constant is wrong' from 'this offset is not a constant'. The control is +0x789, which reads 0x10 in recs2048-gfx.txt and 0x08 in recs4096-gfx.txt -- the identical audit run against the earlier capture reports it as a third mismatch and would have had us pin 0x10, which we now know is wrong. About 4% of the TA record differs between the two captures, and three of the eight differing runs past 0x700 sit within 16 bytes of 0x789, so that whole neighbourhood is per-submit data. Applying the two-observations rule to all nine pinned constants: only the 0x38/0x3a/0x3c tag triple is stable across both captures; 0x789 provably varies; and 0x932, 0x93c, 0x93e, 0x93f, 0x94d have exactly ONE observation each because recs2048's TA block stops at 0x800 and recs4096's descriptor 1 reaches only 0x640. So this flag asks the answerable question -- do these bytes have any effect on hardware -- rather than the unanswerable one. If it proves inert, record that here so nobody re-derives a change from the same capture later. 0: send 0x91/0x01 (default, and what every result to date was measured with), 1: send 0x87/0x03.",
+        },
+        g17p_render_tvb: u32 {
+            default: 0,
+            description: "Build the G17P tiler parameter-management graph. 0: off (default). 1: reserve aligned TVB storage only. 2: build the macOS-trace/kext-matched graph and bind it through the common TA/3D record header. Mode 2 allocates 0x20000-byte blocks at the witnessed 0x28000 stride, emits four u32 32 KiB page IDs per block, the 0x68d0 block-base table, shared BlockControl/Stats, 0x140 dual-mapped page metrics, 0xc0 HWPB state, counter and discard page, plus the 0x50*0x80+0x40 Scene allocation. The selected Scene entry and real trailer are written to TA +0x28/+0x30 and 3D +0x30/+0x38 exactly as loadParameterManagementData and the final writeChanCmdPtr captures prove. Captured host AGXParameterBufferBlock C++ objects are deliberately not copied into firmware memory.",
+        },
+        g17p_render_tag16: u32 {
+            default: 0,
+            description: "Publish tag-16, the entry-signal record (selector 0x10), as a fourth ring item on both render queues after their tag-14 AddKicks. The compute path publishes this on first bind -- encode_g17p_compute_optional_event, gated by g17p_first_bind_tag16_required -- and compute is the path that runs; the render path emits only selectors 0x0f (tag 15) and 0x0e (tag 14) and has never published 0x10 at all, which the kext order tag3->15->14->16 puts last, after AddKicks. The record carries {queue_id, old_timestamp} plus 0xfe and reads as a producer-advance notification, so without it the firmware holds a kick entry in the ring with nothing telling it the ring moved -- the published-but-never-started shape the tiler shows, with scan-active stuck at 0, no completion and no fault. Publishing it also raises each queue's published prefix from 3 to 4, so completion requires done >= 4. INFERRED from the compute contract: no capture ever dumped a render tag-16. 0: off (default, current behaviour), 1: on. Applies on BOTH render paths: the SKSM staging path via stage_fragment_kick and the plain path via stage_fragment, with the tiling half covered by build_g17p_late_tiling_bytes in both cases. On the plain path the stamp it names is ordinal+1, the same value tag-14 announces and the firmware echoed back as stamp 1 in its 0x41 receipt.",
+        },
+        g17p_render_context_id: u32 {
+            default: 0,
+            description: "Final render app-GART hardware context. Kext RE proves AGXTACommandDescriptor::prepare and AGX3DCommandDescriptor::prepare allocate one shared ID from AGXContextIDManager, AGXSecureGart::registerContextID roots that TTBAT slot, and both SKSM submitBuffer paths copy the same ID into final command +0x0c and ConfigUpdate/tag-15 +0x32. Working traces carry coherent IDs 1, 5, or 6 depending on allocator state. Linux's bound render VM already owns rooted context 1, so 0 selects coherent context 1 in all four sinks. 1 selects coherently rooted context 2, retained only to reproduce the 2026-09-01 hardware discriminator: it produced the identical dIPP fault quartet and no 3D timestamp, proving context selection is not the cause.",
+        },
+        g17p_render_populated_high_root: u32 {
+            default: 0,
+            description: "DIAGNOSTIC ONLY -- expose the populated driver/kernel TTB1 to the bound render context 1 instead of its distinct empty client-high root. Native AGXUAT allocates separate root0/root1 page tables and mapTaskIdIntoGPTBAT publishes both; the output-positive first-partial trace and m1n1 path prove that the app root1 is empty while the populated firmware high root remains off-table. Therefore 0 is the native topology and the only candidate final design. Setting 1 deliberately overexposes the populated Linux high root to answer one narrow question: did Linux accidentally leave a fragment-consumed pointer in the firmware-high VA domain? If 3D starts, the final fix is to move that pointer into client-low or construct a scoped client high mapping, not to keep this switch enabled. Slot 0, descriptor/tag-15 context IDs, root ownership, and TLBI sequencing are unchanged.",
+        },
+        g17p_render_qid_base: u32 {
+            default: 0,
+            description: "DISPROVEN -- DO NOT SET. Base QID for the two render queues (TA = base, 3D = base+1) across the tag-15 ConfigUpdate +0x18, the tag-14 AddKicks +0x04, the SKSM registration and the tag-16 entry signal. The macOS witness (macos-trace/agxtrace/recs-gfx.txt) publishes TA 17 / 3D 18, and 17 appears again inside the 3D kick entry vendevtBarrierRec, so those are certainly what native sent. Transferring them to G17P was tested on hardware 2026-08-31 and does not merely fail -- it CRASHES THE ASC SESSION: RTKit reports Message to undiscovered endpoint 0x20 repeatedly, the rebuild times out on the IOP HELLO/EPMAP (rtkit-boot role=gfx ok=false took=1011758us), and the submit returns ETIME with no 0x40, no 0x41 and no render-pre-doorbell. Endpoint 0x20 is the doorbell, so nothing can be delivered afterwards. A control run on the same module with no qid params showed zero undiscovered-endpoint messages and the normal baseline. RE-TESTED 2026-08-31 after the outer-slot queue-id byte (+0x16 of the AGFIAcceleratorDataMasterEntry slot) was fixed to follow this parameter instead of a hardcoded 0/1 -- the first run had moved tag-15/tag-14/SKSM to 17/18 while that byte still said 0/1, so it tested an inconsistent driver rather than the hypothesis. With the driver now internally consistent the result is the SAME: 8 undiscovered-endpoint messages, identical trace codes, both completion ordinals empty. So this is settled, not merely unproven. Likely explanation: native 17/18 are what its queue allocator handed out on a live system with other clients -- incidental to that capture rather than architectural, exactly as this driver own compute rotation hands out 4, 5, 6 -- so 0/1 may be correct for render on G17P. Setting this non-zero logs a warning at every render submit. 0: TA 0 / 3D 1 (default, and the only value known to work).",
+        },
+        g17p_render_3d_install: u32 {
+            default: 1,
+            description: "Value of the tag-15 queue-install flag (+0x1a) on the 3D queue. WITNESSED: native publishes install=1 on TA and install=0 on 3D within one submission; we have always sent 1 on both. Firmware RE says the per-queue slot 0x127628 + qid*0x28 is written, and the 0x40 tag15-programmed receipt emitted, only when this is non-zero -- so sending 1 on 3D programs a slot native leaves alone. UNRESOLVED: the capture is a single render pass, so native's 0 may mean 'already installed earlier in this boot' rather than 'never install'; our own retained path already zeroes this for every submission after the first. TA is always 1. 1: current behaviour (default), 0: match the witness.",
+        },
+        g17p_render_sksm: u32 {
+            default: 0,
+            description: "Install the render QIDs on the KSM bridge and write kick entries, sequenced between tag-15 and tag-14 exactly as compute does. 0: off. 1: legacy compute-shaped command state. 2: bare entry with no RegisterArray bindings. 3: exact captured Metal render shape: zero event mask and kind, TA descriptor+0x60/tag0x47, and 3D descriptor+0xa0/+0x7c0/+0xee0/+0x1600 tagged 0x56/0x10/0x17/0x0a. 4: compatibility alias for 3. Non-zero also maps the render entry rings GPU read-write.",
+        },
+        g17p_irq_completion: u32 {
+            default: 1,
+            description: "Retire a compute submission from the firmware doorbell instead of polling. The submit publishes and returns, the caller waits on a condvar with the runtime mutex released, and the RTKit event worker reads the KSM completion record and wakes it. 0 restores the legacy in-submit poll, which holds the runtime mutex for the whole wait and therefore cannot observe anything the worker would have drained.",
+        },
+        g17p_ring_normalize: u32 {
+            default: 0,
+            description: "Fold an item-ring cursor that reads >= the ring entry count back into range instead of refusing it. Default 0 is the conservative behaviour of the 319-deep build: refuse. 1 was intended to survive a consumer reported as exactly `count` at the wrap, but if the firmware can report an out-of-range consumer for any other reason, folding it makes reclaim zero slots the firmware has NOT consumed and a later repeat then overwrites live entries -- which degrades depth sharply and non-deterministically. Only enable it alongside evidence that a cursor really did read `count` at a wrap.",
+        },
+        g17p_repeat_settle_us: u32 {
+            default: 0,
+            description: "Sleep this many microseconds after publishing a steady-state submission, before returning to the caller. Exists to test whether submission depth depends on TIMING rather than logic: the 319-deep build emitted several console lines per submission, and on a dockchannel console each of those can cost around a millisecond, so it was padding every submission by several milliseconds. If depth collapses when that padding is removed and returns when this knob replaces it, a race remains after the tag-16 fix and its scale is whatever value restores depth.",
+        },
+        g17p_ring_limit: u32 {
+            default: 0,
+            description: "Shrink the compute item ring to this many entries instead of the full 0x500, so the ring WRAP is reached in a few submissions rather than 320. At four records per submission a 32-entry ring wraps on the eighth, and wrap behaviour is size-independent, so this converts a 400-iteration experiment -- which overflows the kernel log and destroys its own evidence -- into a 20-iteration one. Rounded down to a multiple of 4 and floored at 12. 0 uses the full ring.",
+        },
+        g17p_ring_wrap: u32 {
+            default: 0,
+            description: "How the outer CL_2 slot reports a queue write index that has just wrapped to 0. 0 (current) sends 0, the plain ring index. 1 sends the ring entry count instead, i.e. reports the head in 1..=count, for a firmware that reads 0 as 'empty' rather than 'wrapped'. This is the exact submission that fails at depth 320: it is the one whose four records fill the last slots and leave the producer at 0.",
+        },
+        g17p_trace_depth: u32 {
+            default: 0,
+            description: "Emit the per-submission compute traces (ring cursors, outer channel, retire) only for the first N submissions of a queue. 0 (default) traces every submission, which is what the 319-deep build did -- the default deliberately reproduces it, because console writes cost around a millisecond each on a dockchannel console and therefore pad every submission by several milliseconds, and depth may depend on that padding. Set a small value for deep runs, where thousands of lines otherwise overflow the kernel ring buffer and destroy the evidence at the end of the run; but do not compare a quiet run's depth against a verbose one's without also setting g17p_repeat_settle_us. Timeout samples and publish failures are never suppressed.",
+        },
+        g17p_completion_stamp: u32 {
+            default: 1,
+            description: "Gate a compute retire on the firmware's COMPLETION STAMP, not just on the KSM completion record. Firmware RE (b1): the KSM completion record is produced by the KSM hardware block and is consumed by the firmware at the TOP of the completion interrupt; only afterwards does the firmware run its GPU cache-maintenance command (sgx+0x1_8030, polled on 0x1_8038 bit 1) and then store the stamp value from descriptor +0x0F50 through the pointer at descriptor +0x0F40 -- which is the queue support page's dispatch-A word. So the record's arrival says nothing about the dispatch's stores being visible, while the stamp write happens strictly after the flush and does. 1 (default) zeroes that word before publishing and holds the retire until the firmware writes it back, which is what makes completion imply visibility. If the stamp never arrives the retire proceeds anyway with a loud log, so this can only be as bad as 0. 0 restores record-only retire.",
+        },
+        g17p_completion_stamp_us: u32 {
+            default: 500,
+            description: "Upper bound, in microseconds, on how long a retire waits for the firmware completion stamp when g17p_completion_stamp=1. This is a bound on a data gate, not a settle: hardware says the stamp is already present at retire for the large majority of submissions, in which case nothing is waited for at all. It is NOT always published, though -- a 300-iteration run left 19 submissions without one -- so the bound is what those cost. 500us is 2.5x the measured 0-200us visibility lag and an order of magnitude cheaper than the 2000us this defaulted to. Exceeding it logs (rate-limited) and proceeds.",
+        },
+        g17p_completion_trace: u32 {
+            default: 1,
+            description: "Trace every SUCCESSFUL compute retire: the completion's start/end GPU timestamps, their difference, and the support page's dispatch/status words. Needed because the failure mode is now a submission that retires cleanly while the GPU writes nothing, which a timeout-only diagnostic can never see. A duration that is zero or constant means the firmware retired work the GPU never ran; a plausible varying duration means it ran and the result is invisible to the reader. 2 additionally decodes the whole completion ring on every retire, which is verbose. 0 disables the trace.",
+        },
+        g17p_repeat_context: u32 {
+            default: 1,
+            description: "Queue-context handling on a steady-state submission. 1 (default, and what six consecutive passes were achieved with) repoints the item the first bind wrote at this submission's descriptor. 0 leaves it naming submission 1's descriptor. 2 instead writes a COMPLETE item at index = this submission's stamp index, on the reading that the array is a sibling of the SKSM entry array: extent 0x20000 at stride 0x200 is 0x100 items, exactly the geometry's stamp_count and exactly the entry backing's size and stride, and the first bind writes item 1 while consuming stamp index 1. If that reading is right, items 2.. have never been written and every repeat has run against a zero item.",
+        },
+        g17p_repeat_ring: u32 {
+            default: 1,
+            description: "Item-ring model for a steady-state compute submission. 1 = append the four records at the live producer, leaving the first bind's records in slots 0..3. 0 = rewind, i.e. zero slots 0..3, put the producer back to 0 and reuse them exactly as the first bind did. The two models are indistinguishable in the macOS captures because every captured process submitted once. Decide between them with the G17P ring[...] consumer value: if it advances after a submission the firmware demonstrably executed, the firmware owns that cursor and append is correct; if it stays 0, rewind is.",
+        },
+        g17p_repeat_activation: u32 {
+            default: 0,
+            description: "Also send the priority-2 CL activation (EP 0x21 0x0a) on a steady-state compute submission, not just the direct kick (0x10). Default 0 follows the modelled native lifecycle, where activation is emitted only when the submitted channel identity CHANGES -- so a repeat on the same queue graph sends the kick alone. Set 1 if a repeat publishes but the firmware never consumes it: that is the symptom of the kick alone being insufficient to start a channel scan.",
+        },
+        g17p_tag15_install: u32 {
+            default: 2,
+            description: "Tag-15 ConfigUpdate +0x1a, the queue-install flag. 2 (default) = 1 on a queue's first bind and 0 afterwards. 1 = always 1, which is what the driver sent before the first-bind gate existed. 0 = always 0, which is literally what every captured macOS compute submission sends. The three settings exist because the two sources of truth disagree: firmware RE says the store to the per-queue slot 0x127628+qid*0x28 is reachable only when this field is non-zero, and sending 0 left slot[+0x08] NULL so the tag-16 handler faulted at pc=0x1190c; while macOS never sends anything but 0. Both are explicable if native installs the queue outside the traced submit window, but that is not proven, so make it selectable rather than guessed.",
+        },
+        g17p_repeat_submit: u32 {
+            default: 1,
+            description: "Publish a second and later compute submission through the steady-state channel chronology (tag 3 -> 15 -> 14 -> 16 -> CL_2) on the already-installed queue, appending at the live item-ring producer. 0 restores the previous behaviour, where every repeat tore down and rebuilt the whole firmware session before re-running the first-bind path.",
+        },
+        g17p_repeat_tag16: u32 {
+            default: 0,
+            description: "Tag-16 EntrySignal +0x06, encoded by G17PComputeOptionalEvent as `old_timestamp`. 0 (default, proven) sends this submission's OWN stamp. 1 sends the PREVIOUS entry's stamp on repeats, which is what the field name literally describes; 2 extends that to the first bind too, where the previous stamp is 0 -- a value that path has never sent. This matters because sending our own in-flight stamp may be declaring the work already retired, which is exactly the shape of the current failure: a submission that retires cleanly while the GPU writes nothing, non-deterministically. It also unifies the compute and Mesa failures, since a longer dispatch would lose that race every time while a tiny add3 kernel usually wins it.",
+        },
+        g17p_repeat_ordinal: u32 {
+            default: 0,
+            description: "Descriptor per-submission ordinals on a steady-state submission. 1 advances all of them (submit_sequence, work_ordinal, queue_submission/ordinal, submission_index) -- hardware says this FAILS on the first repeat. 0 pins all of them to the first bind's constants -- hardware says this gets two consecutive submissions and then stops. 2 is the split neither run has tested: the sequence fields advance, matching macOS's CL command record whose +0x04 sequence increments per published record, while work_ordinal stays 0 because it alone feeds context_word = (context_id << 8) | work_ordinal in the register program, which m1n1's proven add3 left at 0x200 and which mode 1 was corrupting to 0x201.",
+        },
+        g17p_queue_recycle: u32 {
+            default: 2,
+            description: "How the single hardware compute queue is handed from one DRM client to the next. A DRM client owns the QID4 graph and the slot-1 user-VM binding from its first submit until its queue object is destroyed (queue_destroy or file close). 2 (default) RETAINS the installed QID4 graph and hands over only the user-VM binding: the outgoing client's binding and timestamp page are released, the incoming client binds its own VM into slot 1 (and the ctx2/ctx3 compute aliases), and the submission takes the steady-state chronology -- tag 3 -> 15 (install flag CLEAR) -> 14 -> 16 -> CL_2 appended at the live item-ring producer -- exactly as a same-client repeat does. This is the only mode that never re-runs the first-bind chronology against a QID the firmware already has installed. 1 recycles the queue graph instead: the previous owner's binding and timestamp page are released, QID4 is taken off the SKSM bridge, its storage is RETIRED (kept allocated, never reused) and a fresh PreparedMemory graph is built, whose first submission re-runs the first-bind chronology with the tag-15 queue-install flag SET on an already-installed QID -- which is what makes the second DRM client publish cleanly and never complete. 0 forces a full recover_persistent_runtime, i.e. both firmware CPUs stop and the session is rebuilt; note that this does NOT clear the firmware/KSMFE per-QID install either, because unregister_compute_sksm_queue's disable transaction is a suppressed no-op whenever g17p_sksm_mmio=0. Mode 2 falls back to mode 1 when the retained graph is unusable (crashed session, an abandoned or in-flight submission, or a queue that was never installed), and mode 1 falls back to mode 0 on error.",
+        },
+        g17p_zero_duration: u32 {
+            default: 1,
+            description: "CONFIRMED ON RENDER 2026-08-31: with g17p_render_service_events=1 and g17p_recovery_allow_active_scheduler=1 both render queues RETIRE -- the KSM completion ring names G17P_COLD_OPENING_TA_DESCRIPTOR_BASE (0xfffffc20c0018000) and G17P_COLD_OPENING_3D_DESCRIPTOR_BASE (0xfffffc20c00b0000) in separate records with end timestamps 12 ticks apart -- while BOTH carry start=0x0. That is this parameter's retired-without-executing signature, now reproduced on render: retired=true (both queue prefixes advanced), observed=false (RenderExecutionState::observed requires every timestamp non-zero), so the render wait times out CORRECTLY and there is no ordinal or selector bug behind it. The GPU did not execute; the recovery retired the kicks and the advancing end timestamps are retirement bookkeeping. Second independent confirmation that the absent tiler parameter buffer is the cause: a tiler with nowhere to bin geometry never starts, so no start timestamp is ever stamped. Note also that these records landed on completion ordinal 0 although the render SKSM queues are configured with RENDER_COMPLETION_SELECTOR = 2 (g17_manager.rs), pointing at the CLASSIC item-ring path having retired them rather than the SKSM half. ORIGINAL: what to do when a compute submission retires with EQUAL start and end GPU timestamps, i.e. the firmware retired work the GPU never executed. Measured on J700: a healthy add3 retires with duration 0xda-0xdd ticks; every submission after a fault-blamed firmware recovery retires with duration 0 and leaves its destination buffer untouched, while the queue/firmware alignment either side of that recovery is byte-identical. 0: log and mark only, and still report the submission as successful -- the previous behaviour, and a silent wrong answer. 1 (default): log it and fail the submission with ETIMEDOUT rather than reporting success, but do NOT rebuild the firmware session. 2: additionally force a session rebuild at the next client handoff. Mode 2 is NOT the default because a rebuild attempted from a gated session has been measured to FAIL after ~1.02s -- one apple_rtkit_wait_for_completion timeout inside apple_rtkit_boot, waiting for an IOP HELLO/EPMAP the restarted ASC never sends -- and a failed rebuild is destructive: it has already dropped both ASC CPUs and both RTKit owners and never reaches resume_submissions, so the device is dead for the rest of the boot. An immediate honest error beats a one-second stall that kills the device.",
+        },
+        g17p_gate_quiesce_ms: u32 {
+            default: 0,
+            description: "After a zero-duration retire has shown the core power gate is closed, publish nothing for this many milliseconds before the next submission. FW RE of b1: pause bit 3 has exactly ONE clear site in the whole image -- 0x25dd8, inside the scheduler thread idle descent, reached only from 0x25c00 and the cbnz->0x25dc0 routes -- and the generic pause helper 0xa1c4(set,bit) is never called with bit 8 anywhere, so no host message can clear it directly. The descent guards at 0x25940 are queue state the driver does drive, though: it descends only when the queue producer equals the consumer and two other words are clear, and submitting continuously is what pins the thread to the work path at 0x25e2c -- which is why no 0x46 record is emitted at all after a fault. Going quiet lets the thread reach a genuine idle whose EXIT clears bit 3, leaving mask 0x2, from which the IdlePowerOff(0) lever is the clear that reaches zero and therefore actually calls the core power sequencer 0x20a70. Use with g17p_power_wire=2. 0: off. Try 200-1000.",
+        },
+        g17p_qid_rotate: u32 {
+            default: 1,
+            description: "Give each REBUILT firmware session a compute QID that has never been installed, instead of always reusing QID 4. A session cannot un-install a QID -- the SKSM disable transaction is a suppressed no-op while g17p_sksm_mmio=0 -- so a rebuilt session's first bind otherwise re-asserts the tag-15 queue-install flag on a QID the firmware and KSMFE still have installed, which reprograms a live queue and leaves every later submission published-but-never-completed. Rotating is also what native does: macOS creates a new AGXKSMKickQueue per queue rather than recycling one, and the firmware's KSM restore set has 128 slots for exactly that. 1 (default): the first graph of a boot still gets QID 4 -- the QID the captured native CL2 queue uses and the only one any proven run has exercised -- and each rebuild advances through 5..63, staying inside the low enable-bitmask word and clear of the two render QIDs. 0: every graph gets QID 4.",
+        },
+        g17p_recovery_resync: u32 {
+            default: 1,
+            description: "Bitmask. What to resynchronise on the RETAINED compute queue after the driver services a firmware recovery, instead of assuming the queue and the firmware still agree. A recovery is raised by a GMMU fault, and after one every later kick on the retained graph is accepted, retired, and never executed -- while a boot with no fault runs any number of sequential clients. bit0 (1, default): mark the queue's predecessor UNKNOWN, i.e. clear producer.previous_valid, so the next kick encodes its implicit self-dependency as the no-predecessor form (converted_command_timestamp - 1 = 0, dependency on QID stamp 0) that a proven first bind sends, rather than depending on a stamp the firmware's event machine may no longer acknowledge across a recovery. That single dependency qword is the only difference between a post-recovery repeat and a working first bind. bit1 (2): additionally align producer.current_timestamp/base_timestamp FORWARD to the firmware's per-QID last-submitted HW timestamp (primary main-config +0x274, bundle view 4, QID 4 at table offset 0x40) when that entry reads valid; never backwards, and a no-op while the entry reads invalid, which is what it read the last time it was sampled. bit2 (4): additionally clear the cached channel identity so the next submission re-sends the priority-2 CL activation (EP 0x21 0x0a) as well as the direct kick -- it only affects the notification predicate, never the tag-15 queue-install flag. 0 disables all of it and restores the previous behaviour, where the graph marches on across a recovery. Bisect ladder: 0, 1, 3, 5, 7.",
+        },
+        g17p_abandon_recovery: u32 {
+            default: 1,
+            description: "Recover from a client whose compute submission was published and never seen to retire, instead of poisoning the rest of the boot. 1 (default): the outgoing client's binding is QUARANTINED -- its UAT slot is handed back immediately while its page tables and mapped GEM objects stay allocated, so nothing the firmware might still name is freed and no CPU stop is needed -- the retained QID4 graph has the abandoned kick written off its outstanding count, its armed completion stamp disarmed and its stale KSM record cleared, and the next client rebinds onto it exactly as it would after a clean handoff. A same-owner retry after an abandoned kick performs the same write-off without quarantining, since that client still owns its own memory. It also lets a crashed session be rebuilt (at most four times per module load) when a NEW client queries the device, so a dead session no longer means ENODEV for every later process until a reboot. 0 restores the previous behaviour: an abandoned submission forces the next handoff down the full rebuild path, which re-asserts the tag-15 queue-install flag on an already-installed QID and therefore breaks every client after the one that failed.",
+        },
+        g17p_sksm_mmio: u32 {
+            default: 0,
+            // permissions: 0,
+            description: "G17P SKSM port MMIO (0: suppressed, 1: enabled). Host writes to                           sgx+0x4090/0x4098 take an asynchronous SError on J700; the whole                           sgx 0x0..0x2ffff range is unreachable from the AP. Default off so                           the driver stays alive; set 1 only to re-test the port.",
+        },
     },
 }
