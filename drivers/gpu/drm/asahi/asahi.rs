@@ -252,6 +252,10 @@ kernel::module_platform_driver! {
             default: 1,
             description: "Use initialized Pool-A record 1 for the cold first render pass, matching the native G17P publication: TA descriptor +0x10 and 3D descriptor +0x20 both advance from the Pool-A base by 0x100, record 1 carries its matching slot pointer and +0x10 state 0x50, slot 1 is seeded to 1 before 3D publication, and late TA publication advances that same slot to 2. Value 0 retains the obsolete record-0 diagnostic. Retained ordinal*2 selection is unchanged because native scenes can reuse an index across multiple sequence values. No tag16, queue, RCE, SKSM, or doorbell field changes.",
         },
+        g17p_render_pdm_remap: u32 {
+            default: 0,
+            description: "DIAGNOSTIC ONLY -- remap the fragment descriptor's PDM/RCE scheduler coordinate at +0x79c/+0x7a8 to the existing 3D SKSM queue/slot 1. Native carries queue 0 and timestamp 0x042c0059 here, naming a separate queue-0 slot-89 object which Linux does not yet construct; the remap tests that pre-activation gate but deliberately destroys the native register-array count word. 0: native descriptor bytes, 1: qid 1/timestamp 1 proof experiment.",
+        },
         g17p_render_native_fragment_hwpb: u32 {
             default: 0,
             description: "G17P parameter-buffer binding mode. 0: established packed-object fallback. 1: bind the exact PM-mode2 0xc0-byte HWPB state at both TA +0x20 and Fragment +0x28 and publish the same object in TA ConfigUpdate +0x6e, matching Metal pointer identity. 2: DIAGNOSTIC ONLY -- keep the mode-1 descriptor pointers and coherent PBDesc/HWPB ID but publish zero at TA ConfigUpdate +0x6e, isolating firmware HWPB-bind admission from descriptor execution. 3: DIAGNOSTIC ONLY -- reproduce the last TA-starting Linux pointer arrangement: packed object at TA +0x20 and TA ConfigUpdate +0x6e, PM HWPB only at Fragment +0x28.",

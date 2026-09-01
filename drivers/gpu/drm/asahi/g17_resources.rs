@@ -4294,6 +4294,25 @@ pub(crate) fn g17p_render_native_pool_a_first_record_enabled() -> bool {
     *crate::module_parameters::g17p_render_native_pool_a_first_record.value() != 0
 }
 
+fn apply_g17p_fragment_pdm_remap(fragment: &mut [u8]) -> Result {
+    if *crate::module_parameters::g17p_render_pdm_remap.value() == 0 {
+        return Ok(());
+    }
+    if fragment.len() < 0x7b0 {
+        return Err(EINVAL);
+    }
+
+    // B1 treats these common-passthrough fields as a scheduler coordinate
+    // before it enters the 3D activation routine. Native names a separate PDM
+    // queue-0 slot whose timeline Linux does not yet construct. Pointing the
+    // coordinate at the already-published 3D slot 1 is a bounded proof of that
+    // missing owner; it is not a production substitute because +0x7a8 also
+    // carries the native first RCE array's packed byte/count word.
+    put_u32(fragment, 0x079c, u32::from(g17p_render_queue_id(false)));
+    put_u64(fragment, 0x07a8, 1);
+    Ok(())
+}
+
 pub(crate) fn g17p_render_native_fragment_hwpb_mode() -> u32 {
     *crate::module_parameters::g17p_render_native_fragment_hwpb.value()
 }
@@ -5070,6 +5089,7 @@ impl G17PUserRenderStorage {
                 fragment,
             )
             .map_err(|error| render_build_fail_named(19, error))?;
+            apply_g17p_fragment_pdm_remap(fragment)?;
             fragment_rce.with_bytes_mut(|rce| {
                 g17_render::stage_g17p_fragment_rce_programs(
                     fragment,
@@ -5501,6 +5521,7 @@ impl G17PUserRenderStorage {
                 fragment,
             )
             .map_err(|_| EINVAL)?;
+            apply_g17p_fragment_pdm_remap(fragment)?;
             fragment_rce.with_bytes_mut(|rce| {
                 g17_render::stage_g17p_fragment_rce_programs(
                     fragment,

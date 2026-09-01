@@ -3141,6 +3141,11 @@ impl G17PManagerConstruction {
         };
         self.resources.log_render_sksm_entry(true, label, 0);
         self.resources.log_render_sksm_entry(true, label, strides[0]);
+        // Fragment descriptor +0x79c/+0x7a8 names native PDM queue 0 slot 89
+        // for the first RCE program (packed count 0x042c0059). Linux currently
+        // owns no such PDM entry, so keep its exact would-be backing visible.
+        self.resources
+            .log_render_sksm_entry(true, label, 89 * strides[0]);
         self.resources
             .log_render_sksm_entry(true, label, strides[0] + 0x120);
         self.resources.log_render_sksm_entry(false, label, 0);
