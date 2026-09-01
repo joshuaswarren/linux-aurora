@@ -8,6 +8,7 @@
 #include <net/ipv6.h>
 #include "mt7921.h"
 #include "mcu.h"
+#include "mt7932_mcu_lab.h"
 
 static int
 mt7921_init_he_caps(struct mt792x_phy *phy, enum nl80211_band band,
@@ -1077,7 +1078,10 @@ void mt7921_scan_work(struct work_struct *work)
 					.aborted = next < 0,
 				};
 
-				ieee80211_scan_completed(phy->mt76->hw, &info);
+				if (!mt7932_mcu_lab_scan_done(phy->dev,
+							  info.aborted))
+					ieee80211_scan_completed(phy->mt76->hw,
+								&info);
 			}
 		} else if (test_and_clear_bit(MT76_HW_SCANNING,
 					      &phy->mt76->state)) {
