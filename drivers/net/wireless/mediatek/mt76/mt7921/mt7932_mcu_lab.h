@@ -119,6 +119,7 @@ enum neo_wifid_fullmac_security {
 	NEO_WIFID_FULLMAC_SECURITY_WPA2_PSK = 1,
 	NEO_WIFID_FULLMAC_SECURITY_WPA3_SAE = 2,
 	NEO_WIFID_FULLMAC_SECURITY_OWE = 3,
+	NEO_WIFID_FULLMAC_SECURITY_OPEN = 4,
 };
 
 /* Typed, credential-bearing lab request.  It is accepted only by the

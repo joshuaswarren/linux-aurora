@@ -4156,6 +4156,7 @@ int mt7932_mcu_fullmac_connect(
 	};
 	u32 command = FIELD_PREP(__MCU_CMD_FIELD_ID, 0xea) |
 		      FIELD_PREP(__MCU_CMD_FIELD_EXT_ID, 0x40);
+	const char *security_name;
 	int ret;
 
 	BUILD_BUG_ON(sizeof(req) != 0x358);
@@ -4208,6 +4209,7 @@ int mt7932_mcu_fullmac_connect(
 		req.akm_suite_mask = cpu_to_le16(8);
 		req.key_cipher = cpu_to_le32(10);
 		req.allow_auths = cpu_to_le32(0x40000004);
+		security_name = "wpa2-psk";
 	} else if (params->security == NEO_WIFID_FULLMAC_SECURITY_WPA3_SAE) {
 		if (params->key_len < 8 || params->key_len > 63 ||
 		    !params->pmk || params->pmk_len != 32)
@@ -4223,6 +4225,7 @@ int mt7932_mcu_fullmac_connect(
 		 * pure WPA3 candidate ineligible before the SAE state machine.
 		 */
 		req.allow_auths = cpu_to_le32(0x00000100);
+		security_name = "wpa3-sae";
 	} else if (params->security == NEO_WIFID_FULLMAC_SECURITY_OWE) {
 		if (params->key_len || params->pmk_len)
 			return -EINVAL;
@@ -4236,6 +4239,18 @@ int mt7932_mcu_fullmac_connect(
 		req.auth_upper = cpu_to_le32(0x78);
 		req.battery_mode = cpu_to_le16(1);
 		req.allow_auths = cpu_to_le32(0x00040000);
+		security_name = "owe";
+	} else if (params->security == NEO_WIFID_FULLMAC_SECURITY_OPEN) {
+		if (params->key_len || params->pmk_len)
+			return -EINVAL;
+		/* Apple copies the open apple80211 auth bit into body+0x08 and
+		 * the candidate-selected MediaTek AUTH_TYPE_OPEN_SYSTEM bit into
+		 * body+0x20c.  Both are BIT(0).  WPA version, AKM, cipher and all
+		 * credential fields remain zero.
+		 */
+		req.auth_upper = cpu_to_le32(BIT(0));
+		req.allow_auths = cpu_to_le32(BIT(0));
+		security_name = "open";
 	} else {
 		return -EINVAL;
 	}
@@ -4277,10 +4292,7 @@ int mt7932_mcu_fullmac_connect(
 
 	dev_info(dev->mt76.dev,
 		 "J700_MT7932_FULLMAC_CONNECT: cid=0xea ext=0x40 bytes=856 security=%s ssid_len=%u key_len=%u pmk_len=%u listen_interval=%u obss_2g_20mhz=%u six_ghz_policy=0x%02x ext_report=%u band=%u channel=%u sta_count=2 wtbl_count=4 response=async-eid-ea secrets=redacted\n",
-		 params->security == NEO_WIFID_FULLMAC_SECURITY_WPA3_SAE ?
-		 "wpa3-sae" :
-		 params->security == NEO_WIFID_FULLMAC_SECURITY_OWE ?
-		 "owe" : "wpa2-psk",
+		 security_name,
 		 params->ssid_len, params->key_len, params->pmk_len,
 		 le16_to_cpu(req.listen_interval),
 		 req.obss_2g_20mhz_request_channel_count,
