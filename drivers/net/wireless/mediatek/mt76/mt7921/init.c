@@ -12,6 +12,64 @@
 #include "mcu.h"
 #include "regd.h"
 
+/* The minimal bring-up root has no regulatory.db, so cfg80211 otherwise
+ * leaves every 6 GHz channel disabled under country 00 even though firmware
+ * already runs the measured AU policy.  This conservative fallback is
+ * derived from 25G83 IZUBA_db.dat SHA-256 a61e0b70...: AU enables 6 GHz
+ * channels 1..93 (5925..6425 MHz).  Use the all-location 14 dBm VLP ceiling;
+ * the platform's higher-power indoor policy remains firmware-owned.
+ */
+static const struct ieee80211_regdomain mt7932_j700_au_regdom = {
+	.alpha2 = "AU",
+	.n_reg_rules = 7,
+	.reg_rules = {
+		REG_RULE(2402, 2472, 40, 0, 20, 0),
+		REG_RULE(2457, 2482, 20, 0, 20, NL80211_RRF_NO_IR),
+		REG_RULE(5170, 5250, 80, 0, 20, NL80211_RRF_NO_IR),
+		REG_RULE(5250, 5330, 80, 0, 20,
+			 NL80211_RRF_DFS | NL80211_RRF_NO_IR),
+		REG_RULE(5490, 5730, 160, 0, 20,
+			 NL80211_RRF_DFS | NL80211_RRF_NO_IR),
+		REG_RULE(5735, 5835, 80, 0, 20, NL80211_RRF_NO_IR),
+		REG_RULE(5925, 6425, 160, 0, 14, 0),
+	},
+};
+
+static int mt7932_j700_verify_au_regdom(struct mt792x_dev *dev)
+{
+	struct ieee80211_supported_band *sband;
+	unsigned int enabled = 0, upper = 0;
+	int i;
+
+	sband = dev->mt76.hw->wiphy->bands[NL80211_BAND_6GHZ];
+	if (!sband)
+		return -ENODEV;
+	for (i = 0; i < sband->n_channels; i++) {
+		struct ieee80211_channel *ch = &sband->channels[i];
+
+		if (ch->flags & IEEE80211_CHAN_DISABLED)
+			continue;
+		if (ch->center_freq > 6415)
+			upper++;
+		else if (ch->center_freq >= 5955)
+			enabled++;
+		if (ch->max_reg_power > 14)
+			upper++;
+	}
+	if (enabled == 24 && !upper) {
+		dev_info(dev->mt76.dev,
+			 "J700_MT7932_AU_REGDOM_PASS: enabled_6g=24 channels=1-93 upper_enabled=0 max_eirp=14dBm source=25G83-IZUBA-db-a61e0b70\n");
+		return 0;
+	}
+
+	for (i = 0; i < sband->n_channels; i++)
+		sband->channels[i].flags |= IEEE80211_CHAN_DISABLED;
+	dev_err(dev->mt76.dev,
+		"J700_MT7932_AU_REGDOM_FAIL: enabled_6g=%u invalid_or_upper=%u action=disable-all-6g\n",
+		enabled, upper);
+	return -EIO;
+}
+
 /* Cycle395 private J700 image: target WCAL/OCA2 are now captured, SHA-pinned
  * and embedded in the RAM-only initramfs. Keep the runtime parameters so a
  * later generic build can still override policy, but make this image fit the
@@ -101,17 +159,9 @@ int mt7921_mac_init(struct mt792x_dev *dev)
 }
 EXPORT_SYMBOL_GPL(mt7921_mac_init);
 
-static int __mt7921_init_hardware(struct mt792x_dev *dev)
+static int mt7921_post_firmware_init(struct mt792x_dev *dev)
 {
 	int ret;
-
-	/* force firmware operation mode into normal state,
-	 * which should be set before firmware download stage.
-	 */
-	mt76_wr(dev, MT_SWDEF_MODE, MT_SWDEF_NORMAL_MODE);
-	ret = mt792x_mcu_init(dev);
-	if (ret)
-		goto out;
 
 	ret = mt76_eeprom_override(&dev->mphy);
 	if (ret) {
@@ -181,6 +231,63 @@ out:
 	return ret;
 }
 
+int mt7921_reset_hardware(struct mt792x_dev *dev)
+{
+	int ret;
+
+	if (!is_mt7932(&dev->mt76))
+		return -EOPNOTSUPP;
+	dev->mt7932_6g_scan_policy_enabled = false;
+	dev->mt7932_scan_fwlog_enabled = false;
+	ret = mt7921_post_firmware_init(dev);
+	if (!ret)
+		dev_info(dev->mt76.dev,
+			 "J700_MT7932_RESET_HARDWARE_PASS: eeprom=restored wcal=pass one-time-cal=pass mac=pass\n");
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(mt7921_reset_hardware);
+
+int mt7932_apply_manufacture_policy(struct mt792x_dev *dev)
+{
+	int ret;
+
+	ret = mt76_connac_mcu_set_channel_domain(&dev->mphy);
+	if (ret)
+		return ret;
+	ret = mt7932_mcu_load_power_transcript(dev);
+	if (ret)
+		return ret;
+	ret = mt7932_mcu_drain_tx17(dev, "power-post", false);
+	if (ret)
+		return ret;
+	ret = mt7932_mcu_init_dbdc(dev);
+	if (ret)
+		return ret;
+	ret = mt76_connac_mcu_set_channel_domain(&dev->mphy);
+	if (!ret)
+		dev_info(dev->mt76.dev,
+			 "J700_MT7932_TYPED_AU_POLICY_PASS: country=AU mode6g=SP domain=initial,refresh power=42 dbdc=typed replay=0\n");
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(mt7932_apply_manufacture_policy);
+
+static int __mt7921_init_hardware(struct mt792x_dev *dev)
+{
+	int ret;
+
+	/* force firmware operation mode into normal state,
+	 * which should be set before firmware download stage.
+	 */
+	mt76_wr(dev, MT_SWDEF_MODE, MT_SWDEF_NORMAL_MODE);
+	ret = mt792x_mcu_init(dev);
+	if (ret)
+		return ret;
+
+	return mt7921_post_firmware_init(dev);
+}
+
 static int mt7921_init_hardware(struct mt792x_dev *dev)
 {
 	int ret, i;
@@ -219,6 +326,11 @@ static int mt7921_init_work_run(struct mt792x_dev *dev)
 	ret = mt7921_init_hardware(dev);
 	if (ret)
 		return ret;
+	if (is_mt7932(&dev->mt76)) {
+		ret = mt7932_apply_manufacture_policy(dev);
+		if (ret)
+			return ret;
+	}
 
 	mt76_set_stream_caps(&dev->mphy, true);
 	mt7921_set_stream_he_caps(&dev->phy);
@@ -229,27 +341,17 @@ static int mt7921_init_work_run(struct mt792x_dev *dev)
 		dev_err(dev->mt76.dev, "register device failed\n");
 		return ret;
 	}
-	if (is_mt7932(&dev->mt76))
+	if (is_mt7932(&dev->mt76)) {
+		ret = mt7932_j700_verify_au_regdom(dev);
+		if (ret)
+			return ret;
 		dev_info(dev->mt76.dev,
 			 "J700_MT7932_NETWORK_REGISTER_PASS: firmware=%s\n",
 			 dev->mt76.hw->wiphy->fw_version);
-	if (is_mt7932(&dev->mt76) && mt7932_replay_au_policy) {
-		/* Cycle616 proves the later AU range still needs its full asynchronous
-		 * IRQ/RX gates. Keep it isolated from the now-mandatory 84..134 startup
-		 * transaction until the semantic-program executor owns those gates.
-		 */
-		ret = mt7932_mcu_load_live_start_phase(
-			dev, MT7932_LIVE_PHASE_AU_UPDATE);
-		if (ret)
-			return ret;
-		ret = mt7932_mcu_drain_tx17(dev, "live-au-post", false);
-		if (ret)
-			return ret;
+	}
+	if (is_mt7932(&dev->mt76)) {
 		dev_info(dev->mt76.dev,
-			 "J700_MT7932_AU_POLICY_LAB_PASS: ordinals=601-643 commands=43 source=25G83-macos-ssh-pass\n");
-	} else if (is_mt7932(&dev->mt76)) {
-		dev_info(dev->mt76.dev,
-			 "J700_MT7932_AU_POLICY_REPLAY_DEFERRED: ordinals=601-643 reason=async-gates-pending startup=84-134-exact interface=160-199-pending source=cycle616+semantic-program\n");
+			 "J700_MT7932_AU_POLICY_REPLAY_DISABLED: ordinals=601-643 replacement=typed-device-policy\n");
 	}
 	ret = mt7921_init_debugfs(dev);
 	if (ret) {
@@ -346,6 +448,19 @@ int mt7921_register_device(struct mt792x_dev *dev)
 	ret = mt792x_init_wiphy(hw);
 	if (ret)
 		return ret;
+	if (is_mt7932(&dev->mt76)) {
+		hw->wiphy->regulatory_flags |= REGULATORY_CUSTOM_REG;
+		dev->mt76.custom_regd = &mt7932_j700_au_regdom;
+		dev_info(dev->mt76.dev,
+			 "J700_MT7932_AU_REGDOM_STAGED: source=25G83-IZUBA-db-a61e0b70 channels=6g1-93 max_eirp=14dBm mode=VLP root-regdb=absent\n");
+	}
+	/* AppleSunriseWLAN 25G83 carries the live association listen interval in
+	 * EA/0x40 and caps that policy input at 20 beacon intervals.  Advertising
+	 * the same J700 capability also makes mac80211 initialize the live value
+	 * consumed by the typed fullmac builder instead of its generic fallback 5.
+	 */
+	if (is_mt7932(&dev->mt76))
+		hw->max_listen_interval = 20;
 
 	hw->wiphy->reg_notifier = mt7921_regd_notifier;
 	dev->mphy.sband_2g.sband.ht_cap.cap |=

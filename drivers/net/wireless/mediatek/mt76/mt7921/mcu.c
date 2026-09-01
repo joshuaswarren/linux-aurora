@@ -287,9 +287,19 @@ mt7921_mcu_scan_event(struct mt792x_dev *dev, struct sk_buff *skb)
 	struct mt792x_phy *phy = mphy->priv;
 	struct mt76_connac2_mcu_rxd *rxd = (void *)skb->data;
 
-	if (is_mt7932(&dev->mt76))
+	if (is_mt7932(&dev->mt76) &&
+	    skb->len >= sizeof(*rxd) + 16)
 		dev_info(dev->mt76.dev,
-			 "J700_MT7932_SCAN_EVENT_INGRESS: eid=%u seq=%u len=%u\n",
+			 "J700_MT7932_SCAN_EVENT_INGRESS: eid=%u seq=%u len=%u tlv=%02x/%02x/%02x/%02x/%02x/%02x/%02x/%02x/%02x/%02x/%02x/%02x/%02x/%02x/%02x/%02x\n",
+			 rxd->eid, rxd->seq, skb->len,
+			 rxd->tlv[0], rxd->tlv[1], rxd->tlv[2], rxd->tlv[3],
+			 rxd->tlv[4], rxd->tlv[5], rxd->tlv[6], rxd->tlv[7],
+			 rxd->tlv[8], rxd->tlv[9], rxd->tlv[10], rxd->tlv[11],
+			 rxd->tlv[12], rxd->tlv[13], rxd->tlv[14],
+			 rxd->tlv[15]);
+	else if (is_mt7932(&dev->mt76))
+		dev_info(dev->mt76.dev,
+			 "J700_MT7932_SCAN_EVENT_INGRESS: eid=%u seq=%u len=%u tlv=short\n",
 			 rxd->eid, rxd->seq, skb->len);
 
 	spin_lock_bh(&dev->mt76.lock);
@@ -2930,7 +2940,7 @@ static int mt7932_validate_cal_record(const u8 *record, size_t length,
 	return 0;
 }
 
-static int mt7932_validate_cal_stream(const struct firmware *fw, u16 *countp)
+int mt7932_validate_cal_stream(const struct firmware *fw, u16 *countp)
 {
 	static const u8 magic[8] = { 'J', '7', 'C', 'A', 'L', 'D', '6', 0 };
 	const struct mt7932_cal_stream_header *header;
@@ -3805,7 +3815,7 @@ struct mt7932_cmd_fullmac_connect {
 	__le32 auth_lower;
 	__le16 wsec_flags;
 	__le16 battery_mode;
-	__le16 assoc_dwell_time;
+	__le16 akm_suite_mask;
 	__le16 reserved_016;
 	__le32 ssid_len;
 	u8 ssid[32];
@@ -3816,14 +3826,20 @@ struct mt7932_cmd_fullmac_connect {
 	__le16 key_index;
 	u8 key_storage[0x14c];
 	__le16 rsn_ie_len;
-	u8 rsn_pmk_union[0x72];
+	u8 rsn_pmk_union_prefix[0x26];
+	u8 obss_2g_20mhz_request_channel_count;
+	u8 rsn_pmk_union_reserved_1c1[3];
+	u8 six_ghz_policy;
+	u8 rsn_pmk_union_reserved_1c5[3];
+	__le32 pmk_len;
+	u8 pmk[64];
 	__le32 allow_auths;
 	u8 reserved_210[8];
 	__le32 auth_upper_ext;
 	__le32 transition_disabled_flags;
 	__le32 pairwise_cipher_type;
 	__le32 candidate_bssid_count;
-	u8 candidate_reserved[2];
+	__le16 listen_interval;
 	u8 candidate_blob[0x100];
 	u8 reserved_32a[2];
 	u8 bssid[ETH_ALEN];
@@ -3835,9 +3851,127 @@ struct mt7932_cmd_fullmac_connect {
 	u8 sta_count;
 	u8 wtbl_count;
 	u8 reserved_33f;
-	u8 sta_ids[8];
-	u8 wtbl_ids[16];
+	u8 sta_ids[2];
+	u8 reserved_sta_ids[6];
+	u8 wtbl_ids[4];
+	u8 reserved_wtbl_ids[8];
+	u8 ext_report_info;
+	u8 reserved_355[3];
 } __packed;
+
+struct mt7932_fullmac_obss_state {
+	unsigned long channels;
+};
+
+static int mt7932_mcu_fullmac_preconnect(
+	struct mt792x_dev *dev,
+	const struct mt7932_fullmac_connect_params *params)
+{
+	struct {
+		u8 control[2];
+		u8 addr[ETH_ALEN];
+	} __packed sta_mac = {};
+	int ret;
+
+	BUILD_BUG_ON(sizeof(sta_mac) != 8);
+	memcpy(sta_mac.addr, params->vif_mac, ETH_ALEN);
+	ret = mt76_mcu_send_msg(&dev->mt76, MCU_CE_CMD(SET_STA_MAC),
+			       &sta_mac, sizeof(sta_mac), false);
+	if (ret)
+		return ret;
+	ret = mt76_mcu_send_msg(&dev->mt76, MCU_CE_CMD(SET_INFRASTRUCTURE),
+			       NULL, 0, false);
+	if (ret)
+		return ret;
+	dev_info(dev->mt76.dev,
+		 "J700_MT7932_FULLMAC_PRECONNECT_PASS: cid=b8,09 mac=live source=apple25G83-production-path\n");
+
+	return 0;
+}
+
+struct mt7932_cmd_fullmac_queue_bind {
+	__le16 bss_txq_bitmap;
+	u8 action;
+	u8 bss_idx;
+	u8 reserved_004[10];
+	u8 default_bss_txq;
+	u8 sta_idx;
+	__le16 sta_txq_bitmap;
+	u8 mapping_shift;
+	u8 reserved_013;
+	u8 tid_to_txq[8];
+	u8 dynamic_txq_tracking[4];
+} __packed;
+
+int mt7932_mcu_fullmac_queue_bind(struct mt792x_dev *dev, u8 bss_idx,
+				  u8 sta_idx, u32 *command_out)
+{
+	struct mt7932_cmd_fullmac_queue_bind req = {
+		.bss_txq_bitmap = cpu_to_le16(0x000f),
+		.action = 5,
+		.bss_idx = bss_idx,
+		.default_bss_txq = 1,
+		.sta_idx = sta_idx,
+		.sta_txq_bitmap = cpu_to_le16(0x000f),
+		.tid_to_txq = { 1, 0, 0, 1, 2, 2, 3, 3 },
+	};
+	u32 command = __MCU_CMD_FIELD_CE |
+		FIELD_PREP(__MCU_CMD_FIELD_ID, 0x6b);
+	int ret;
+
+	BUILD_BUG_ON(sizeof(req) != 32);
+	ret = mt76_mcu_send_msg(&dev->mt76, command, &req, sizeof(req), false);
+	if (command_out)
+		*command_out = command;
+	if (!ret)
+		dev_info(dev->mt76.dev,
+			 "J700_MT7932_FULLMAC_QUEUE_BIND_PASS: cid=0x6b bytes=32 bss=%u sta=%u txq=live-typed\n",
+			 bss_idx, sta_idx);
+
+	return ret;
+}
+
+static void
+mt7932_fullmac_obss_iter(struct wiphy *wiphy, struct cfg80211_bss *bss,
+			 void *data)
+{
+	struct mt7932_fullmac_obss_state *state = data;
+	const struct element *elem;
+	bool request_20mhz = false;
+	int channel;
+
+	if (bss->channel->band != NL80211_BAND_2GHZ)
+		return;
+
+	rcu_read_lock();
+	elem = ieee80211_bss_get_elem(bss, WLAN_EID_HT_CAPABILITY);
+	if (elem && elem->datalen >= sizeof(__le16) &&
+	    (get_unaligned_le16(elem->data) &
+	     IEEE80211_HT_CAP_40MHZ_INTOLERANT))
+		request_20mhz = true;
+
+	elem = ieee80211_bss_get_elem(bss, WLAN_EID_BSS_COEX_2040);
+	if (elem && elem->datalen >= 1 && (elem->data[0] & BIT(1)))
+		request_20mhz = true;
+	rcu_read_unlock();
+
+	if (!request_20mhz)
+		return;
+
+	channel = ieee80211_frequency_to_channel(bss->channel->center_freq);
+	if (channel >= 1 && channel <= 14)
+		set_bit(channel, &state->channels);
+}
+
+static u8 mt7932_fullmac_obss_2g_20mhz_count(struct mt792x_dev *dev)
+{
+	struct mt7932_fullmac_obss_state state = {};
+
+	cfg80211_bss_iter(dev->mphy.hw->wiphy, NULL,
+			  mt7932_fullmac_obss_iter, &state);
+
+	return min_t(unsigned int, hweight_long(state.channels), 0x3f);
+}
 
 int mt7932_mcu_fullmac_connect(
 	struct mt792x_dev *dev,
@@ -3845,13 +3979,6 @@ int mt7932_mcu_fullmac_connect(
 	u32 *command_out)
 {
 	struct mt7932_cmd_fullmac_connect req = {
-		.security_version = 4,
-		.ad_mode = cpu_to_le32(0x10),
-		.auth_upper = cpu_to_le32(0x78),
-		.battery_mode = cpu_to_le16(1),
-		.assoc_dwell_time = cpu_to_le16(8),
-		.key_cipher = cpu_to_le32(10),
-		.allow_auths = cpu_to_le32(0x40000004),
 		.connection_resource_valid = 1,
 		.sta_count = NEO_WIFID_FULLMAC_STA_IDS,
 		.wtbl_count = NEO_WIFID_FULLMAC_WTBL_IDS,
@@ -3863,12 +3990,22 @@ int mt7932_mcu_fullmac_connect(
 	BUILD_BUG_ON(sizeof(req) != 0x358);
 	BUILD_BUG_ON(offsetof(struct mt7932_cmd_fullmac_connect, ssid_len) !=
 		     0x18);
+	BUILD_BUG_ON(offsetof(struct mt7932_cmd_fullmac_connect,
+			      akm_suite_mask) != 0x14);
 	BUILD_BUG_ON(offsetof(struct mt7932_cmd_fullmac_connect, key_len) !=
 		     0x40);
 	BUILD_BUG_ON(offsetof(struct mt7932_cmd_fullmac_connect, rsn_ie_len) !=
 		     0x198);
+	BUILD_BUG_ON(offsetof(struct mt7932_cmd_fullmac_connect,
+			      obss_2g_20mhz_request_channel_count) != 0x1c0);
+	BUILD_BUG_ON(offsetof(struct mt7932_cmd_fullmac_connect, pmk_len) !=
+		     0x1c8);
+	BUILD_BUG_ON(offsetof(struct mt7932_cmd_fullmac_connect,
+			      six_ghz_policy) != 0x1c4);
 	BUILD_BUG_ON(offsetof(struct mt7932_cmd_fullmac_connect, allow_auths) !=
 		     0x20c);
+	BUILD_BUG_ON(offsetof(struct mt7932_cmd_fullmac_connect,
+			      listen_interval) != 0x228);
 	BUILD_BUG_ON(offsetof(struct mt7932_cmd_fullmac_connect, bssid) !=
 		     0x32c);
 	BUILD_BUG_ON(offsetof(struct mt7932_cmd_fullmac_connect, sta_count) !=
@@ -3877,15 +4014,51 @@ int mt7932_mcu_fullmac_connect(
 		     0x340);
 	BUILD_BUG_ON(offsetof(struct mt7932_cmd_fullmac_connect, wtbl_ids) !=
 		     0x348);
+	BUILD_BUG_ON(offsetof(struct mt7932_cmd_fullmac_connect,
+			      ext_report_info) != 0x354);
 
-	if (!params || !params->ssid || !params->pmk || !params->bssid ||
+	if (!params || !params->ssid || !params->bssid ||
+	    !params->vif_mac ||
 	    !params->ssid_len || params->ssid_len > sizeof(req.ssid) ||
 	    params->key_len > NEO_WIFID_FULLMAC_KEY_MAX ||
-	    !params->pmk_len || params->pmk_len > 64 ||
+	    params->pmk_len > 64 ||
 	    params->band < 1 || params->band > 3 || !params->channel ||
 	    is_zero_ether_addr(params->bssid) ||
+	    is_zero_ether_addr(params->vif_mac) ||
 	    (params->key_len && !params->key))
 		return -EINVAL;
+	if (params->security == NEO_WIFID_FULLMAC_SECURITY_WPA2_PSK) {
+		if (!params->pmk || !params->pmk_len)
+			return -EINVAL;
+		req.security_version = 4;
+		req.ad_mode = cpu_to_le32(0x10);
+		req.auth_upper = cpu_to_le32(0x78);
+		req.battery_mode = cpu_to_le16(1);
+		req.akm_suite_mask = cpu_to_le16(8);
+		req.key_cipher = cpu_to_le32(10);
+		req.allow_auths = cpu_to_le32(0x40000004);
+	} else if (params->security == NEO_WIFID_FULLMAC_SECURITY_WPA3_SAE) {
+		if (params->key_len < 8 || params->key_len > 63 ||
+		    params->pmk_len)
+			return -EINVAL;
+		req.security_version = 8;
+		req.ad_mode = cpu_to_le32(6);
+		req.auth_upper = cpu_to_le32(0x78);
+		req.battery_mode = cpu_to_le16(5);
+		req.akm_suite_mask = cpu_to_le16(0x1000);
+		req.key_cipher = cpu_to_le32(10);
+		/* Apple has a dedicated pure-SAE selector for exactly BIT(8).
+		 * BIT(30) belongs to the legacy/transition policy arm and makes a
+		 * pure WPA3 candidate ineligible before the SAE state machine.
+		 */
+		req.allow_auths = cpu_to_le32(0x00000100);
+	} else {
+		return -EINVAL;
+	}
+
+	ret = mt7932_mcu_fullmac_preconnect(dev, params);
+	if (ret)
+		return ret;
 
 	req.ssid_len = cpu_to_le32(params->ssid_len);
 	memcpy(req.ssid, params->ssid, params->ssid_len);
@@ -3893,17 +4066,36 @@ int mt7932_mcu_fullmac_connect(
 	if (params->key_len)
 		memcpy(req.key_storage, params->key, params->key_len);
 	/* PMK length/data are the second arm of Apple's RSN/PMK union. */
-	put_unaligned_le32(params->pmk_len, &req.rsn_pmk_union[0x2e]);
-	memcpy(&req.rsn_pmk_union[0x32], params->pmk, params->pmk_len);
+	req.obss_2g_20mhz_request_channel_count =
+		mt7932_fullmac_obss_2g_20mhz_count(dev);
+	/* Apple copies CONNECTION_SETTINGS+0xe54 bits 0/1 into body+0x1c4.
+	 * Its own diagnostic names them 6G-disable and 6GHzOnly.  A directed
+	 * band-3 connect therefore advertises only the latter bit.
+	 */
+	if (params->band == 3)
+		req.six_ghz_policy = BIT(1);
+	req.pmk_len = cpu_to_le32(params->pmk_len);
+	if (params->pmk_len)
+		memcpy(req.pmk, params->pmk, params->pmk_len);
+	req.listen_interval = cpu_to_le16(min_t(u16,
+						 params->listen_interval, 20));
 	memcpy(req.bssid, params->bssid, ETH_ALEN);
 	req.band = params->band;
 	req.channel = params->channel;
 	memcpy(req.sta_ids, params->sta_ids, sizeof(params->sta_ids));
 	memcpy(req.wtbl_ids, params->wtbl_ids, sizeof(params->wtbl_ids));
+	if (params->ext_report_info)
+		req.ext_report_info |= BIT(0);
 
 	dev_info(dev->mt76.dev,
-		 "J700_MT7932_FULLMAC_CONNECT: cid=0xea ext=0x40 bytes=856 ssid_len=%u key_len=%u pmk_len=%u band=%u channel=%u sta_count=2 wtbl_count=4 response=async-eid-ea secrets=redacted\n",
+		 "J700_MT7932_FULLMAC_CONNECT: cid=0xea ext=0x40 bytes=856 security=%s ssid_len=%u key_len=%u pmk_len=%u listen_interval=%u obss_2g_20mhz=%u six_ghz_policy=0x%02x ext_report=%u band=%u channel=%u sta_count=2 wtbl_count=4 response=async-eid-ea secrets=redacted\n",
+		 params->security == NEO_WIFID_FULLMAC_SECURITY_WPA3_SAE ?
+		 "wpa3-sae" : "wpa2-psk",
 		 params->ssid_len, params->key_len, params->pmk_len,
+		 le16_to_cpu(req.listen_interval),
+		 req.obss_2g_20mhz_request_channel_count,
+		 req.six_ghz_policy,
+		 !!(req.ext_report_info & BIT(0)),
 		 params->band, params->channel);
 	ret = mt76_mcu_send_msg(&dev->mt76, command, &req, sizeof(req), false);
 	memzero_explicit(&req, sizeof(req));

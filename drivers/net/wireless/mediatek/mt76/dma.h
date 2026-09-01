@@ -193,6 +193,7 @@ void mt76_dma_queue_reset(struct mt76_dev *dev, struct mt76_queue *q,
 			  bool reset_idx);
 int mt76_dma_alloc_tx_bounce(struct mt76_dev *dev, struct mt76_queue *q,
 			     u32 entries, u32 stride);
+void mt76_dma_reset_tx_pools(struct mt76_dev *dev, struct mt76_queue *q);
 int mt76_dma_prealloc_txwi(struct mt76_dev *dev, int count);
 
 static inline void

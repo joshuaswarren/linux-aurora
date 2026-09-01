@@ -303,6 +303,8 @@ struct mt792x_dev {
 	bool regd_change:1;
 	/* Select the measured post-download MT7932 WFDMA enable sequence. */
 	bool mt7932_runtime_dma_epoch:1;
+	bool mt7932_6g_scan_policy_enabled:1;
+	bool mt7932_scan_fwlog_enabled:1;
 	wait_queue_head_t wait;
 
 	struct work_struct init_work;

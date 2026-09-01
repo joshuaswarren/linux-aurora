@@ -398,6 +398,7 @@ DECLARE_EWMA(signal, 10, 8);
 #define MT_WCID_TX_INFO_RATE		GENMASK(15, 0)
 #define MT_WCID_TX_INFO_NSS		GENMASK(17, 16)
 #define MT_WCID_TX_INFO_TXPWR_ADJ	GENMASK(25, 18)
+#define MT_WCID_TX_INFO_J700_FULLMAC	BIT(29)
 #define MT_WCID_TX_INFO_ALTQ		BIT(30)
 #define MT_WCID_TX_INFO_SET		BIT(31)
 
@@ -1044,6 +1045,7 @@ struct mt76_dev {
 	struct debugfs_blob_wrapper otp;
 
 	char alpha2[3];
+	const struct ieee80211_regdomain *custom_regd;
 	enum nl80211_dfs_regions region;
 
 	struct mt76_scan_rnr_param rnr;

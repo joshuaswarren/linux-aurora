@@ -725,6 +725,40 @@ int mt792x_wpdma_reset(struct mt792x_dev *dev, bool force)
 	err = mt792x_dma_reset(dev, force);
 	if (err)
 		return err;
+	if (is_mt7932(&dev->mt76) && (apple_runtime || force)) {
+		/* WFDMA has been reset at this boundary; a forced recovery has reset
+		 * WFSYS as well.  The device can no longer observe the retained
+		 * firmware and command payloads, so reclaim their software cursors
+		 * before mt7921_run_firmware() enters a second download epoch.  Without
+		 * this, the exactly-sized TX16 pool fails at RAM upload on the first
+		 * normal mac80211 recovery and every later retry fails during the patch.
+		 */
+		for (i = 0; i < ARRAY_SIZE(dev->mt76.q_mcu); i++)
+			mt76_dma_reset_tx_pools(&dev->mt76,
+						  dev->mt76.q_mcu[i]);
+	}
+
+	if (is_mt7932(&dev->mt76) && force && !apple_runtime) {
+		u32 queues = 0;
+
+		/* The measured runtime epoch temporarily publishes every RX slot.
+		 * Generic forced recovery subsequently cleans those buffers and must
+		 * restore mt76's one-empty-slot geometry before refilling.  Leaving
+		 * rx_full_ring set fills all slots, so the next measured runtime rebuild
+		 * correctly rejects the queue with -EINVAL.
+		 */
+		mt76_for_each_q_rx(&dev->mt76, i) {
+			struct mt76_queue *q = &dev->mt76.q_rx[i];
+
+			if (!q->ndesc)
+				continue;
+			q->rx_full_ring = false;
+			queues++;
+		}
+		dev_info(dev->mt76.dev,
+			 "J700_MT7932_RX_GEOMETRY_RESET_PASS: queues=%u full_ring=0 structural_empty=1 boundary=post-forced-wpdma\n",
+			 queues);
+	}
 
 	if (!(is_mt7932(&dev->mt76) && dev->mt7932_runtime_dma_epoch))
 		mt76_for_each_q_rx(&dev->mt76, i)

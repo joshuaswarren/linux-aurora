@@ -2644,6 +2644,16 @@ int mt76_connac_mcu_hw_scan(struct mt76_phy *phy, struct ieee80211_vif *vif,
 	struct sk_buff *skb;
 	int req_len = sizeof(*req);
 	bool mt7932 = mt76_chip(mdev) == 0x7932;
+	bool mt7932_only_6ghz = false;
+
+	if (mt7932 && sreq->n_channels) {
+		mt7932_only_6ghz = true;
+		for (i = 0; i < sreq->n_channels; i++)
+			if (scan_list[i]->band != NL80211_BAND_6GHZ) {
+				mt7932_only_6ghz = false;
+				break;
+			}
+	}
 
 	/* The sealed 25G83 TX17 capture is post-conversion device-visible traffic:
 	 * Apple places the complete 0x4d4-byte CMD_SCAN_REQ_V2 on TX17 as legacy
@@ -2772,7 +2782,14 @@ generic_scan:
 	 * the proven parser ABI while the scan-only userspace gate still exits
 	 * before association.
 	 */
-	req->scan_type = mt7932 ? 1 : (sreq->n_ssids ? 1 : 0);
+	/* A standalone 6 GHz PSC scan without RNR targets is passive.  Active
+	 * 6 GHz follow-up is valid only when cfg80211 supplied directed RNR
+	 * parameters.  Keep the hardware-proven active wildcard behavior for
+	 * ordinary 2.4/5 GHz scans.
+	 */
+	req->scan_type = mt7932 ?
+		(mt7932_only_6ghz && !sreq->n_6ghz_params ? 0 : 1) :
+		(sreq->n_ssids ? 1 : 0);
 	/* 25G83's ordinary active-wildcard AIS request leaves both the probe
 	 * count and firmware timeout zero, selecting the MT7932 firmware defaults.
 	 * Linux's generic connac values (2 probes and channels*dwell timeout)
@@ -2794,7 +2811,8 @@ generic_scan:
 	 * bit 3 with one populated SSID.  The public generic bit-2 selector
 	 * does not find the requested BSS on this firmware.
 	 */
-	req->ssid_type = mt7932 && n_ssids ? BIT(3) :
+	req->ssid_type = mt7932_only_6ghz && !sreq->n_6ghz_params ? 0 :
+			 mt7932 && n_ssids ? BIT(3) :
 			 n_ssids ? BIT(2) : BIT(0);
 	if (!mt7932)
 		req->ssid_type_ext = n_ssids ? BIT(0) : 0;
@@ -2888,7 +2906,7 @@ generic_scan:
 		req7932->scan_func_ext = cpu_to_le32(0x1800);
 	if (mt7932)
 		dev_info(mdev->dev,
-			 "J700_MT7932_SCAN_REQ_V2: bytes=0x%x seq=%u bss=%u type=%u ssids=%u probes=%u channels=%u+%u dwell=%u min=%u timeout=%u passive=%u opstay=%u away=%u func=0x%02x/0x%08x\n",
+			 "J700_MT7932_SCAN_REQ_V2: bytes=0x%x seq=%u bss=%u type=%u ssids=%u probes=%u channels=%u+%u dwell=%u min=%u timeout=%u passive=%u opstay=%u away=%u func=0x%02x/0x%08x pure6=%u rnr=%u\n",
 			 req_len, req->seq_num, req->bss_idx, req->scan_type,
 			 req->ssids_num, req->probe_req_num, req->channels_num,
 			 req->ext_channels_num,
@@ -2898,7 +2916,8 @@ generic_scan:
 			 le16_to_cpu(req7932->passive_channel_dwell_time),
 			 le32_to_cpu(req7932->op_channel_stay_time),
 			 le16_to_cpu(req7932->home_away_time), req->scan_func,
-			 le32_to_cpu(req7932->scan_func_ext));
+			 le32_to_cpu(req7932->scan_func_ext), mt7932_only_6ghz,
+			 !!sreq->n_6ghz_params);
 	if (mt7932) {
 		err = mt7932_scan_queue_batches(phy, mvif, req7932,
 						 scan_list, sreq->n_channels);

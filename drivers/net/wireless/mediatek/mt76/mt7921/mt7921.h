@@ -7,6 +7,8 @@
 #include "../mt792x.h"
 #include "regs.h"
 
+struct firmware;
+
 #define MT7921_MAX_AID                  20
 
 #define MT7921_TX_RING_SIZE		2048
@@ -257,6 +259,7 @@ extern bool mt7932_replay_au_policy;
 int mt7932_mcu_set_6g_scan(struct mt792x_dev *dev, bool enable);
 int mt7932_mcu_load_wcal(struct mt792x_dev *dev);
 int mt7932_mcu_load_one_time_cal(struct mt792x_dev *dev);
+int mt7932_validate_cal_stream(const struct firmware *fw, u16 *countp);
 int mt7932_mcu_drain_tx17(struct mt792x_dev *dev, const char *phase,
 			  bool reset_bounce);
 int mt7921_mcu_get_rx_rate(struct mt792x_phy *phy, struct ieee80211_vif *vif,
@@ -306,6 +309,8 @@ mt7921_l1_rmw(struct mt792x_dev *dev, u32 addr, u32 mask, u32 val)
 #define mt7921_l1_clear(dev, addr, val)	mt7921_l1_rmw(dev, addr, val, 0)
 
 int mt7921_mac_init(struct mt792x_dev *dev);
+int mt7921_reset_hardware(struct mt792x_dev *dev);
+int mt7932_apply_manufacture_policy(struct mt792x_dev *dev);
 bool mt7921_mac_wtbl_update(struct mt792x_dev *dev, int idx, u32 mask);
 int mt7921_mac_sta_add(struct mt76_dev *mdev, struct ieee80211_vif *vif,
 		       struct ieee80211_sta *sta);

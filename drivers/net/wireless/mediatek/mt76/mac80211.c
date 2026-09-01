@@ -817,6 +817,8 @@ int mt76_register_device(struct mt76_dev *dev, bool vht,
 	mt76_check_sband(&dev->phy, &phy->sband_2g, NL80211_BAND_2GHZ);
 	mt76_check_sband(&dev->phy, &phy->sband_5g, NL80211_BAND_5GHZ);
 	mt76_check_sband(&dev->phy, &phy->sband_6g, NL80211_BAND_6GHZ);
+	if (dev->custom_regd)
+		wiphy_apply_custom_regulatory(hw->wiphy, dev->custom_regd);
 
 	if (dev->init_wiphy) {
 		ret = dev->init_wiphy(dev);
