@@ -23,6 +23,9 @@ enum neo_wifid_opcode {
 	NEO_WIFID_OP_FULLMAC_CONNECT = 7,
 	NEO_WIFID_OP_FULLMAC_QUEUE_BIND = 8,
 	NEO_WIFID_OP_FULLMAC_ASSOC_CAL = 9,
+	NEO_WIFID_OP_FULLMAC_COLD_TEARDOWN = 10,
+	NEO_WIFID_OP_FULLMAC_DISCONNECT = 11,
+	NEO_WIFID_OP_FULLMAC_ASSOC_POWER = 12,
 };
 
 enum neo_wifid_transport {
@@ -115,6 +118,7 @@ struct neo_wifid_state {
 enum neo_wifid_fullmac_security {
 	NEO_WIFID_FULLMAC_SECURITY_WPA2_PSK = 1,
 	NEO_WIFID_FULLMAC_SECURITY_WPA3_SAE = 2,
+	NEO_WIFID_FULLMAC_SECURITY_OWE = 3,
 };
 
 /* Typed, credential-bearing lab request.  It is accepted only by the
@@ -163,6 +167,11 @@ int mt7932_mcu_fullmac_connect(
 	u32 *command_out);
 int mt7932_mcu_fullmac_queue_bind(struct mt792x_dev *dev, u8 bss_idx,
 				  u8 sta_idx, u32 *command_out);
+int mt7932_mcu_fullmac_disconnect(struct mt792x_dev *dev, const u8 *bssid,
+				   u32 *command_out);
+int mt7932_mcu_fullmac_queue_unbind(struct mt792x_dev *dev, u8 bss_idx,
+				    u8 sta_idx, u32 *command_out);
+int mt7932_mcu_load_assoc_power(struct mt792x_dev *dev, u32 *command_out);
 #if IS_ENABLED(CONFIG_MT7921_J700_MCU_LAB)
 bool mt7932_mcu_lab_conformance_active(void);
 int mt7932_mcu_lab_checkpoint(struct mt792x_dev *dev);

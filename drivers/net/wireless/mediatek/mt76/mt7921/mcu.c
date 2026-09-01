@@ -2394,6 +2394,91 @@ release_firmware:
 }
 EXPORT_SYMBOL_GPL(mt7932_mcu_load_power_transcript);
 
+int mt7932_mcu_load_assoc_power(struct mt792x_dev *dev, u32 *command_out)
+{
+	static const char * const expected_name[] = {
+		"per-rate-6g-vlp-0", "per-rate-6g-vlp-1",
+	};
+	static const u8 expected_selector[] = { 0x02, 0x0f };
+	const struct mt7932_power_transcript_header *header;
+	const struct firmware *fw;
+	size_t offset;
+	u32 command, count, i;
+	u8 seen = 0;
+	int ret;
+
+	if (!is_mt7932(&dev->mt76))
+		return -EOPNOTSUPP;
+	BUILD_BUG_ON(ARRAY_SIZE(expected_name) !=
+		     ARRAY_SIZE(expected_selector));
+
+	ret = request_firmware(&fw, MT7932_POWER_TRANSCRIPT_NAME,
+			       dev->mt76.dev);
+	if (ret)
+		return ret;
+	ret = mt7932_validate_power_transcript(fw);
+	if (ret)
+		goto release;
+
+	command = __MCU_CMD_FIELD_CE |
+		  FIELD_PREP(__MCU_CMD_FIELD_ID, 0x5d);
+	header = (const void *)fw->data;
+	count = le32_to_cpu(header->records);
+	offset = sizeof(*header);
+	for (i = 0; i < count; i++) {
+		const struct mt7932_power_transcript_record *record;
+		const char *name;
+		const u8 *data;
+		u32 name_len, data_len;
+		int slot;
+
+		record = (const void *)(fw->data + offset);
+		offset += sizeof(*record);
+		name_len = le32_to_cpu(record->name_len);
+		data_len = le32_to_cpu(record->data_len);
+		name = (const void *)(fw->data + offset);
+		offset += name_len;
+		data = fw->data + offset;
+		offset += data_len;
+		if (record->kind != 1 || record->cid != 0x5d ||
+		    record->band != 3)
+			continue;
+
+		for (slot = 0; slot < ARRAY_SIZE(expected_name); slot++)
+			if (name_len == strlen(expected_name[slot]) &&
+			    !memcmp(name, expected_name[slot], name_len))
+				break;
+		if (slot == ARRAY_SIZE(expected_name))
+			continue;
+		if (seen & BIT(slot) || data_len != 1020 || data[0] != 3 ||
+		    data[1] != 0x2a || get_unaligned_le16(data + 2) != data_len ||
+		    data[4] != 8 || data[5] != 3 ||
+		    data[44] != expected_selector[slot]) {
+			ret = -EINVAL;
+			goto release;
+		}
+		ret = mt76_mcu_send_msg(&dev->mt76, command, data, data_len,
+					false);
+		if (ret)
+			goto release;
+		seen |= BIT(slot);
+	}
+	if (seen != GENMASK(ARRAY_SIZE(expected_name) - 1, 0)) {
+		ret = -ENOENT;
+		goto release;
+	}
+	if (command_out)
+		*command_out = command;
+	dev_info(dev->mt76.dev,
+		 "J700_MT7932_FULLMAC_ASSOC_POWER_TYPED: country=AU mode6g=VLP pages=2 selectors=02,0f entries=8,8 source=audited-board-power-container\n");
+	ret = 0;
+
+release:
+	release_firmware(fw);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(mt7932_mcu_load_assoc_power);
+
 int mt7921_run_firmware(struct mt792x_dev *dev)
 {
 	int err;
@@ -3909,6 +3994,86 @@ struct mt7932_cmd_fullmac_queue_bind {
 	u8 dynamic_txq_tracking[4];
 } __packed;
 
+struct mt7932_cmd_fullmac_disconnect {
+	__le64 version;
+	__le16 enabled;
+	u8 auth_mode;
+	__le16 reserved_00b;
+	u8 bssid[ETH_ALEN];
+	u8 reserved_013;
+	__le16 reason;
+	__le16 reserved_016;
+} __packed;
+
+int mt7932_mcu_fullmac_disconnect(struct mt792x_dev *dev, const u8 *bssid,
+				   u32 *command_out)
+{
+	struct mt7932_cmd_fullmac_disconnect req = {
+		.version = cpu_to_le64(8),
+		.enabled = cpu_to_le16(1),
+		.auth_mode = 8,
+		.reason = cpu_to_le16(30),
+	};
+	u32 command = FIELD_PREP(__MCU_CMD_FIELD_ID, 0xea) |
+		      FIELD_PREP(__MCU_CMD_FIELD_EXT_ID, 0x42);
+	int ret;
+
+	BUILD_BUG_ON(sizeof(req) != 24);
+	BUILD_BUG_ON(offsetof(struct mt7932_cmd_fullmac_disconnect, bssid) != 13);
+	BUILD_BUG_ON(offsetof(struct mt7932_cmd_fullmac_disconnect, reason) != 20);
+	if (!bssid || is_zero_ether_addr(bssid))
+		return -EINVAL;
+
+	memcpy(req.bssid, bssid, ETH_ALEN);
+	ret = mt76_mcu_send_msg(&dev->mt76, command, &req, sizeof(req), false);
+	if (command_out)
+		*command_out = command;
+	memzero_explicit(&req, sizeof(req));
+	if (!ret)
+		dev_info(dev->mt76.dev,
+			 "J700_MT7932_FULLMAC_DISCONNECT_SUBMIT: cid=0xea ext=0x42 bytes=24 source=live-previous-bssid identity=redacted\n");
+
+	return ret;
+}
+
+int mt7932_mcu_fullmac_queue_unbind(struct mt792x_dev *dev, u8 bss_idx,
+				    u8 sta_idx, u32 *command_out)
+{
+	struct mt7932_cmd_fullmac_queue_bind sta = {
+		.bss_txq_bitmap = cpu_to_le16(0x000f),
+		.action = 5,
+		.bss_idx = bss_idx,
+		.default_bss_txq = 1,
+		.sta_idx = sta_idx,
+		/* Apple's live old-station cleanup selects the active WMM queue. */
+		.sta_txq_bitmap = cpu_to_le16(BIT(1)),
+		.tid_to_txq = { 1, 0, 0, 1, 2, 2, 3, 3 },
+	};
+	struct mt7932_cmd_fullmac_queue_bind bss = {
+		.bss_txq_bitmap = cpu_to_le16(0x000f),
+		.action = 1,
+		.bss_idx = bss_idx,
+		.default_bss_txq = 1,
+	};
+	u32 command = __MCU_CMD_FIELD_CE |
+		FIELD_PREP(__MCU_CMD_FIELD_ID, 0x6b);
+	int ret;
+
+	BUILD_BUG_ON(sizeof(sta) != 32);
+	ret = mt76_mcu_send_msg(&dev->mt76, command, &sta, sizeof(sta), false);
+	if (ret)
+		return ret;
+	ret = mt76_mcu_send_msg(&dev->mt76, command, &bss, sizeof(bss), false);
+	if (command_out)
+		*command_out = command;
+	if (!ret)
+		dev_info(dev->mt76.dev,
+			 "J700_MT7932_FULLMAC_QUEUE_UNBIND_PASS: cid=0x6b actions=5,1 bytes=32,32 bss=%u sta=%u bitmap=0x0002 source=apple25G83-live-teardown\n",
+			 bss_idx, sta_idx);
+
+	return ret;
+}
+
 int mt7932_mcu_fullmac_queue_bind(struct mt792x_dev *dev, u8 bss_idx,
 				  u8 sta_idx, u32 *command_out)
 {
@@ -4058,6 +4223,19 @@ int mt7932_mcu_fullmac_connect(
 		 * pure WPA3 candidate ineligible before the SAE state machine.
 		 */
 		req.allow_auths = cpu_to_le32(0x00000100);
+	} else if (params->security == NEO_WIFID_FULLMAC_SECURITY_OWE) {
+		if (params->key_len || params->pmk_len)
+			return -EINVAL;
+		/* A live 25G83 Enhanced-Open association on J700 proves Apple's
+		 * complete OWE arm.  It is not the inferred SAE-style version-8
+		 * request: security version is 1, body+0x20c selects BIT(18), and
+		 * the ad-mode, AKM, cipher and auth-upper-extension fields remain
+		 * zero.  The request carries no password or initial PMK.
+		 */
+		req.security_version = 1;
+		req.auth_upper = cpu_to_le32(0x78);
+		req.battery_mode = cpu_to_le16(1);
+		req.allow_auths = cpu_to_le32(0x00040000);
 	} else {
 		return -EINVAL;
 	}
@@ -4100,7 +4278,9 @@ int mt7932_mcu_fullmac_connect(
 	dev_info(dev->mt76.dev,
 		 "J700_MT7932_FULLMAC_CONNECT: cid=0xea ext=0x40 bytes=856 security=%s ssid_len=%u key_len=%u pmk_len=%u listen_interval=%u obss_2g_20mhz=%u six_ghz_policy=0x%02x ext_report=%u band=%u channel=%u sta_count=2 wtbl_count=4 response=async-eid-ea secrets=redacted\n",
 		 params->security == NEO_WIFID_FULLMAC_SECURITY_WPA3_SAE ?
-		 "wpa3-sae" : "wpa2-psk",
+		 "wpa3-sae" :
+		 params->security == NEO_WIFID_FULLMAC_SECURITY_OWE ?
+		 "owe" : "wpa2-psk",
 		 params->ssid_len, params->key_len, params->pmk_len,
 		 le16_to_cpu(req.listen_interval),
 		 req.obss_2g_20mhz_request_channel_count,

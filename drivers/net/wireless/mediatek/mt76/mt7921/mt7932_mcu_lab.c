@@ -12,6 +12,7 @@
 #include <linux/pci.h>
 #include <linux/poll.h>
 #include <linux/rcupdate.h>
+#include <linux/rtnetlink.h>
 #include <linux/unaligned.h>
 #include <linux/udp.h>
 #include <linux/uaccess.h>
@@ -70,6 +71,7 @@ struct mt7932_mcu_lab {
 	wait_queue_head_t read_wait;
 	struct completion connected;
 	struct completion continued;
+	struct completion disconnected;
 	atomic_t opened;
 	atomic_t dropped_events;
 	enum neo_wifid_phase phase;
@@ -84,6 +86,10 @@ struct mt7932_mcu_lab {
 	bool fullmac_wcid_initialized;
 	bool fullmac_connected;
 	bool fullmac_peer_ready;
+	bool fullmac_disconnect_pending;
+	bool fullmac_cold_teardown_done;
+	u16 fullmac_disconnect_status;
+	u8 fullmac_bssid[ETH_ALEN];
 	struct mt7932_fullmac_assoc_cal_snapshot assoc_cal;
 	bool checkpoint_waiting;
 	bool response_timed_out;
@@ -209,6 +215,20 @@ static int mt7932_mcu_lab_prepare_fullmac_data_path(
 	if (!lab->fullmac_vif || !lab->fullmac_ndev)
 		return -ENODEV;
 
+	/* The lab Ethernet facade and firmware station must expose one identity.
+	 * mac80211 can select a per-network/private station address after the
+	 * facade was registered; keeping the old mphy address here makes DHCP and
+	 * bridged data disagree with the address programmed by CID 0xb8.
+	 */
+	rtnl_lock();
+	eth_hw_addr_set(lab->fullmac_ndev,
+			lab->fullmac_vif->bss_conf.addr);
+	ether_addr_copy(lab->fullmac_ndev->perm_addr,
+			lab->fullmac_vif->bss_conf.addr);
+	rtnl_unlock();
+	dev_info(dev->mt76.dev,
+		 "J700_MT7932_FULLMAC_IDENTITY_SYNC_PASS: netdev=ethernet station=selected-vif identity=redacted\n");
+
 	mvif = (struct mt792x_vif *)lab->fullmac_vif->drv_priv;
 	memset(&lab->fullmac_sta, 0, sizeof(lab->fullmac_sta));
 	mt76_wcid_init(&mlink->wcid, 0);
@@ -273,6 +293,9 @@ static void mt7932_mcu_lab_release_fullmac_resources(
 	}
 	lab->fullmac_vif = NULL;
 	lab->fullmac_peer_ready = false;
+	lab->fullmac_disconnect_pending = false;
+	lab->fullmac_disconnect_status = 0xffff;
+	eth_zero_addr(lab->fullmac_bssid);
 	memset(lab->fullmac_sta_ids, 0, sizeof(lab->fullmac_sta_ids));
 	memset(lab->fullmac_wtbl_ids, 0, sizeof(lab->fullmac_wtbl_ids));
 	lab->fullmac_reserved_count = 0;
@@ -854,6 +877,7 @@ void mt7932_mcu_lab_reset_prepare(struct mt792x_dev *dev)
 	lab->assoc_cal.valid = false;
 	spin_unlock_irqrestore(&lab->pending_lock, flags);
 	lab->response_timed_out = false;
+	lab->fullmac_cold_teardown_done = false;
 	lab->phase = NEO_WIFID_PHASE_CONTINUED;
 	mutex_unlock(&lab->operation_lock);
 	dev_info(dev->mt76.dev,
@@ -861,6 +885,107 @@ void mt7932_mcu_lab_reset_prepare(struct mt792x_dev *dev)
 	mt7932_mcu_lab_put(lab);
 }
 EXPORT_SYMBOL_GPL(mt7932_mcu_lab_reset_prepare);
+
+static int mt7932_mcu_lab_teardown_fullmac(
+	struct mt7932_mcu_lab *lab, const u8 *bssid, u32 *command,
+	const char *phase)
+{
+	struct mt792x_vif *old_mvif;
+	u8 old_sta;
+	int ret;
+
+	if (!lab->fullmac_reserved_count || !lab->fullmac_vif ||
+	    !bssid || is_zero_ether_addr(bssid))
+		return -EINVAL;
+
+	old_mvif = (struct mt792x_vif *)lab->fullmac_vif->drv_priv;
+	old_sta = lab->fullmac_sta_ids[0];
+	reinit_completion(&lab->disconnected);
+	WRITE_ONCE(lab->fullmac_disconnect_status, 0xffff);
+	WRITE_ONCE(lab->fullmac_disconnect_pending, true);
+	ret = mt7932_mcu_fullmac_disconnect(lab->dev, bssid, command);
+	if (ret)
+		goto fail;
+	if (!wait_for_completion_timeout(&lab->disconnected,
+					 msecs_to_jiffies(10000))) {
+		ret = -ETIMEDOUT;
+		goto fail;
+	}
+	if (READ_ONCE(lab->fullmac_disconnect_status)) {
+		ret = -EREMOTEIO;
+		goto fail;
+	}
+	ret = mt7932_mcu_fullmac_queue_unbind(
+		lab->dev, old_mvif->bss_conf.mt76.idx, old_sta, command);
+	if (ret)
+		goto fail;
+
+	dev_info(lab->dev->mt76.dev,
+		 "J700_MT7932_FULLMAC_TEARDOWN_PASS: phase=%s disconnect=ea42 queue_actions=5,1 old_bss=%u old_sta=%u wait=event-gated source=apple25G83\n",
+		 phase, old_mvif->bss_conf.mt76.idx, old_sta);
+
+	return 0;
+
+fail:
+	WRITE_ONCE(lab->fullmac_disconnect_pending, false);
+	dev_err(lab->dev->mt76.dev,
+		"J700_MT7932_FULLMAC_TEARDOWN_FAIL: err=%d phase=%s stage=disconnect-or-queue-cleanup\n",
+		ret, phase);
+
+	return ret;
+}
+
+static int mt7932_mcu_lab_cold_teardown(
+	struct mt7932_mcu_lab *lab, const u8 *bssid, u32 payload_len,
+	u32 *command)
+{
+	int ret;
+
+	if (payload_len != ETH_ALEN || !bssid || is_zero_ether_addr(bssid))
+		return -EINVAL;
+	if (lab->phase != NEO_WIFID_PHASE_CONTINUED ||
+	    lab->checkpoint_waiting || !lab->dev->hw_init_done ||
+	    lab->fullmac_reserved_count || lab->fullmac_cold_teardown_done)
+		return -EBUSY;
+
+	ret = mt7932_mcu_lab_reserve_fullmac_resources(lab);
+	if (ret)
+		return ret;
+	ret = mt7932_mcu_lab_prepare_fullmac_data_path(lab);
+	if (ret)
+		goto release;
+	ret = mt7932_mcu_lab_teardown_fullmac(
+		lab, bssid, command, "cold-preconnect");
+
+release:
+	mt7932_mcu_lab_release_fullmac_resources(lab);
+	if (!ret)
+		lab->fullmac_cold_teardown_done = true;
+
+	return ret;
+}
+
+static int mt7932_mcu_lab_disconnect_fullmac(
+	struct mt7932_mcu_lab *lab, u32 *command)
+{
+	int ret;
+
+	if (lab->phase != NEO_WIFID_PHASE_CONTINUED ||
+	    lab->checkpoint_waiting || !lab->dev->hw_init_done ||
+	    !lab->fullmac_reserved_count || !lab->fullmac_vif ||
+	    is_zero_ether_addr(lab->fullmac_bssid))
+		return -EBUSY;
+
+	ret = mt7932_mcu_lab_teardown_fullmac(
+		lab, lab->fullmac_bssid, command, "explicit-disconnect");
+	if (ret)
+		return ret;
+	mt7932_mcu_lab_release_fullmac_resources(lab);
+	dev_info(lab->dev->mt76.dev,
+		 "J700_MT7932_FULLMAC_EXPLICIT_DISCONNECT_PASS: carrier=off resources=0 source=typed-ea42+cid6b-actions5,1\n");
+
+	return 0;
+}
 
 static int mt7932_mcu_lab_fullmac_connect(
 	struct mt7932_mcu_lab *lab,
@@ -889,6 +1014,9 @@ static int mt7932_mcu_lab_fullmac_connect(
 		if (request->key_len < 8 || request->key_len > 63 ||
 		    request->pmk_len != 32)
 			return -EINVAL;
+	} else if (request->security == NEO_WIFID_FULLMAC_SECURITY_OWE) {
+		if (request->key_len || request->pmk_len)
+			return -EINVAL;
 	} else {
 		return -EINVAL;
 	}
@@ -915,19 +1043,29 @@ static int mt7932_mcu_lab_fullmac_connect(
 			 request->pre_assoc_cbw,
 			 request->pre_assoc_extension);
 
-	/* Apple forwards SAE status 126 (Hash-to-Element) to IO80211, which
-	 * starts a fresh association with newly reserved connection resources.
-	 * The runtime lab has no IO80211 peer, so a second typed connect request
-	 * performs the same bounded resource rollover here.
+	/* The live 25G83 OWE trace performs EA/0x42 and both CID 0x6b
+	 * removal actions before its first visible connect request.  A fresh
+	 * Linux firmware session otherwise transmits the first authentication
+	 * frame without receiving an ACK; the byte-identical retry succeeds only
+	 * after this measured cleanup.  Allocate temporary live IDs so the cold
+	 * path uses the typed queue builder rather than captured station numbers.
 	 */
+	if (!lab->fullmac_reserved_count &&
+	    !lab->fullmac_cold_teardown_done) {
+		ret = mt7932_mcu_lab_cold_teardown(
+			lab, request->bssid, ETH_ALEN, command);
+		if (ret)
+			return ret;
+	}
+
 	if (lab->fullmac_reserved_count) {
-		dev_info(lab->dev->mt76.dev,
-			 "J700_MT7932_FULLMAC_H2E_RESOURCE_ROLLOVER: old_sta=%u,%u old_wtbl=%u,%u,%u,%u source=apple-io80211-auth-message-0x4a\n",
-			 lab->fullmac_sta_ids[0], lab->fullmac_sta_ids[1],
-			 lab->fullmac_wtbl_ids[0], lab->fullmac_wtbl_ids[1],
-			 lab->fullmac_wtbl_ids[2], lab->fullmac_wtbl_ids[3]);
+		ret = mt7932_mcu_lab_teardown_fullmac(
+			lab, lab->fullmac_bssid, command, "previous-connect");
+		if (ret)
+			return ret;
 		mt7932_mcu_lab_release_fullmac_resources(lab);
 	}
+
 	ret = mt7932_mcu_lab_reserve_fullmac_resources(lab);
 	if (ret)
 		return ret;
@@ -963,6 +1101,8 @@ static int mt7932_mcu_lab_fullmac_connect(
 		 params.wtbl_ids[0], params.wtbl_ids[1],
 		 params.wtbl_ids[2], params.wtbl_ids[3]);
 	ret = mt7932_mcu_fullmac_connect(lab->dev, &params, command);
+	if (!ret)
+		ether_addr_copy(lab->fullmac_bssid, request->bssid);
 	memzero_explicit(&params, sizeof(params));
 	if (ret)
 		mt7932_mcu_lab_release_fullmac_resources(lab);
@@ -1229,6 +1369,17 @@ static int mt7932_mcu_lab_fullmac_queue_bind(
 		lab->fullmac_sta_ids[0], command);
 }
 
+static int mt7932_mcu_lab_fullmac_assoc_power(
+	struct mt7932_mcu_lab *lab, u32 *command)
+{
+	if (lab->phase != NEO_WIFID_PHASE_CONTINUED ||
+	    !lab->fullmac_reserved_count || !lab->fullmac_vif ||
+	    !lab->fullmac_ndev)
+		return -EBUSY;
+
+	return mt7932_mcu_load_assoc_power(lab->dev, command);
+}
+
 static ssize_t mt7932_mcu_lab_write(struct file *file, const char __user *buf,
 				    size_t count, loff_t *ppos)
 {
@@ -1333,6 +1484,25 @@ static ssize_t mt7932_mcu_lab_write(struct file *file, const char __user *buf,
 		else
 			ret = mt7932_mcu_lab_fullmac_assoc_cal(
 				lab, cookie, &command, &sequence);
+		break;
+	case NEO_WIFID_OP_FULLMAC_COLD_TEARDOWN:
+		if (flags)
+			ret = -EINVAL;
+		else
+			ret = mt7932_mcu_lab_cold_teardown(
+				lab, payload, payload_len, &command);
+		break;
+	case NEO_WIFID_OP_FULLMAC_DISCONNECT:
+		if (payload_len || flags)
+			ret = -EINVAL;
+		else
+			ret = mt7932_mcu_lab_disconnect_fullmac(lab, &command);
+		break;
+	case NEO_WIFID_OP_FULLMAC_ASSOC_POWER:
+		if (payload_len || flags)
+			ret = -EINVAL;
+		else
+			ret = mt7932_mcu_lab_fullmac_assoc_power(lab, &command);
 		break;
 	default:
 		ret = -EOPNOTSUPP;
@@ -1492,6 +1662,7 @@ static int mt7932_mcu_lab_create(struct mt792x_dev *dev,
 	init_waitqueue_head(&lab->read_wait);
 	init_completion(&lab->connected);
 	init_completion(&lab->continued);
+	init_completion(&lab->disconnected);
 	atomic_set(&lab->opened, 0);
 	atomic_set(&lab->dropped_events, 0);
 	lab->phase = NEO_WIFID_PHASE_CHECKPOINT;
@@ -1757,7 +1928,23 @@ bool mt7932_mcu_lab_rx(struct mt792x_dev *dev, struct sk_buff *skb)
 				 get_unaligned_le32(body),
 				 get_unaligned_le32(body + 4), body_len);
 
-		if (subevent == 0x42 && lab->fullmac_ndev) {
+		if (subevent == 0x44 &&
+		    READ_ONCE(lab->fullmac_disconnect_pending)) {
+			/* Apple 25G83 completes rDisconnectComp from the firmware
+			 * disconnect-event selector 0x44.  Selector 0x42 is the
+			 * separate connect-complete notification.
+			 */
+			WRITE_ONCE(lab->fullmac_disconnect_status, 0);
+			WRITE_ONCE(lab->fullmac_disconnect_pending, false);
+			WRITE_ONCE(lab->fullmac_connected, false);
+			if (lab->fullmac_ndev) {
+				netif_carrier_off(lab->fullmac_ndev);
+				netif_tx_disable(lab->fullmac_ndev);
+			}
+			complete(&lab->disconnected);
+			dev_info(dev->mt76.dev,
+				 "J700_MT7932_FULLMAC_DISCONNECT_COMPLETE: status=0 source=eid0xee-selector0x44\n");
+		} else if (subevent == 0x42 && lab->fullmac_ndev) {
 			if (!status && READ_ONCE(lab->fullmac_peer_ready)) {
 				bool was_offchannel = READ_ONCE(dev->mphy.offchannel);
 

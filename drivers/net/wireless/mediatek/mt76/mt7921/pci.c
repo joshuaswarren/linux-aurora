@@ -82,9 +82,17 @@ static int mt7921e_init_reset(struct mt792x_dev *dev)
 	return mt792x_wpdma_reset(dev, true);
 }
 
-static void mt7921e_unregister_device(struct mt792x_dev *dev)
+static void mt7921e_dma_cleanup(struct mt792x_dev *dev)
 {
 	int i;
+
+	mt76_for_each_q_rx(&dev->mt76, i)
+		napi_disable(&dev->mt76.napi[i]);
+	mt792x_dma_cleanup(dev);
+}
+
+static void mt7921e_unregister_device(struct mt792x_dev *dev)
+{
 	struct mt76_connac_pm *pm = &dev->pm;
 	struct ieee80211_hw *hw = mt76_hw(dev);
 
@@ -93,15 +101,13 @@ static void mt7921e_unregister_device(struct mt792x_dev *dev)
 
 	cancel_work_sync(&dev->init_work);
 	mt76_unregister_device(&dev->mt76);
-	mt76_for_each_q_rx(&dev->mt76, i)
-		napi_disable(&dev->mt76.napi[i]);
 	cancel_delayed_work_sync(&pm->ps_work);
 	cancel_work_sync(&pm->wake_work);
 	cancel_work_sync(&dev->reset_work);
 
 	mt76_connac2_tx_token_put(&dev->mt76);
 	__mt792x_mcu_drv_pmctrl(dev);
-	mt792x_dma_cleanup(dev);
+	mt7921e_dma_cleanup(dev);
 	mt792x_wfsys_reset(dev);
 	skb_queue_purge(&dev->mt76.mcu.res_q);
 
@@ -485,7 +491,11 @@ static int mt7921_dma_init(struct mt792x_dev *dev)
 			  mt792x_poll_tx);
 	napi_enable(&dev->mt76.tx_napi);
 
-	return mt792x_dma_enable(dev);
+	ret = mt792x_dma_enable(dev);
+	if (ret)
+		mt7921e_dma_cleanup(dev);
+
+	return ret;
 }
 
 static int mt7921_pci_probe(struct pci_dev *pdev,
@@ -856,13 +866,16 @@ static int mt7921_pci_probe(struct pci_dev *pdev,
 
 	ret = mt7921_register_device(dev);
 	if (ret)
-		goto err_free_irq;
+		goto err_free_dma;
 
 	if (of_property_read_bool(dev->mt76.dev->of_node, "wakeup-source"))
 		device_init_wakeup(dev->mt76.dev, true);
 
 	return 0;
 
+err_free_dma:
+	mt76_unregister_device(&dev->mt76);
+	mt7921e_dma_cleanup(dev);
 err_free_irq:
 	devm_free_irq(&pdev->dev, pdev->irq, dev);
 err_free_dev:
