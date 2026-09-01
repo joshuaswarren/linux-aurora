@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 /* J700-only MT7932 MCU conformance checkpoint. */
 
+#include <crypto/sha1.h>
 #include <linux/capability.h>
 #include <linux/delay.h>
 #include <linux/fs.h>
@@ -114,6 +115,7 @@ struct mt7932_mcu_lab {
 	bool fullmac_cold_teardown_done;
 	u16 fullmac_disconnect_status;
 	u8 fullmac_bssid[ETH_ALEN];
+	u8 fullmac_security;
 	u8 fullmac_oper_band;
 	u8 fullmac_oper_channel;
 	struct mt7932_fullmac_assoc_cal_snapshot assoc_cal;
@@ -175,7 +177,9 @@ static netdev_tx_t mt7932_mcu_lab_fullmac_xmit(struct sk_buff *skb,
 	memset(info, 0, sizeof(*info));
 	info->flags = IEEE80211_TX_CTL_HW_80211_ENCAP;
 	info->control.vif = READ_ONCE(lab->fullmac_vif);
-	info->control.hw_key = &lab->fullmac_key;
+	if (READ_ONCE(lab->fullmac_security) !=
+	    NEO_WIFID_FULLMAC_SECURITY_OPEN)
+		info->control.hw_key = &lab->fullmac_key;
 	if (mt7932_mcu_lab_fullmac_critical_data(skb))
 		info->flags |= IEEE80211_TX_CTL_REQ_TX_STATUS;
 	skb_set_queue_mapping(skb, IEEE80211_AC_BE);
@@ -496,6 +500,11 @@ static int mt7932_mcu_lab_register_fullmac_netdev(
 			ARRAY_SIZE(mt7932_fullmac_cipher_suites);
 		wiphy_ext_feature_set(lab->fullmac_wiphy,
 				      NL80211_EXT_FEATURE_OWE_OFFLOAD);
+		wiphy_ext_feature_set(lab->fullmac_wiphy,
+				      NL80211_EXT_FEATURE_SAE_OFFLOAD);
+		wiphy_ext_feature_set(
+			lab->fullmac_wiphy,
+			NL80211_EXT_FEATURE_4WAY_HANDSHAKE_STA_PSK);
 		lab->fullmac_wiphy->bands[NL80211_BAND_2GHZ] =
 			source->bands[NL80211_BAND_2GHZ];
 		lab->fullmac_wiphy->bands[NL80211_BAND_5GHZ] =
@@ -640,7 +649,8 @@ static int mt7932_mcu_lab_prepare_fullmac_data_path(
 	memset(&lab->fullmac_sta, 0, sizeof(lab->fullmac_sta));
 	mt76_wcid_init(&mlink->wcid, 0);
 	mlink->wcid.idx = lab->fullmac_wtbl_ids[0];
-	mlink->wcid.hw_key_idx = 0;
+	mlink->wcid.hw_key_idx = lab->fullmac_security ==
+		NEO_WIFID_FULLMAC_SECURITY_OPEN ? -1 : 0;
 	mlink->wcid.tx_info |= MT_WCID_TX_INFO_SET | MT_WCID_TX_INFO_ALTQ |
 		MT_WCID_TX_INFO_J700_FULLMAC;
 	mlink->last_txs = jiffies;
@@ -659,8 +669,10 @@ static int mt7932_mcu_lab_prepare_fullmac_data_path(
 				   &mlink->wcid);
 	mutex_unlock(&dev->mt76.mutex);
 	dev_info(dev->mt76.dev,
-		 "J700_MT7932_FULLMAC_DATA_PATH_READY: netdev=%s wtbl_count=4 tx=802.3 rx=802.3 queue=ALTX0 txd=j700-fullmac amsdu=off identity=redacted\n",
-		 lab->fullmac_ndev->name);
+		 "J700_MT7932_FULLMAC_DATA_PATH_READY: netdev=%s wtbl_count=4 tx=802.3 rx=802.3 queue=ALTX0 txd=j700-fullmac hw_key=%s amsdu=off identity=redacted\n",
+		 lab->fullmac_ndev->name,
+		 lab->fullmac_security == NEO_WIFID_FULLMAC_SECURITY_OPEN ?
+		 "none" : "firmware-installed");
 
 	return 0;
 }
@@ -676,6 +688,7 @@ static void mt7932_mcu_lab_release_fullmac_resources(
 	WRITE_ONCE(lab->fullmac_connected, false);
 	WRITE_ONCE(lab->fullmac_oper_band, 0);
 	WRITE_ONCE(lab->fullmac_oper_channel, 0);
+	WRITE_ONCE(lab->fullmac_security, 0);
 	if (lab->fullmac_ndev) {
 		netif_carrier_off(lab->fullmac_ndev);
 		netif_tx_disable(lab->fullmac_ndev);
@@ -1443,6 +1456,9 @@ static int mt7932_mcu_lab_fullmac_connect(
 	} else if (request->security == NEO_WIFID_FULLMAC_SECURITY_OWE) {
 		if (request->key_len || request->pmk_len)
 			return -EINVAL;
+	} else if (request->security == NEO_WIFID_FULLMAC_SECURITY_OPEN) {
+		if (request->key_len || request->pmk_len)
+			return -EINVAL;
 	} else {
 		return -EINVAL;
 	}
@@ -1492,9 +1508,12 @@ static int mt7932_mcu_lab_fullmac_connect(
 		mt7932_mcu_lab_release_fullmac_resources(lab);
 	}
 
+	lab->fullmac_security = request->security;
 	ret = mt7932_mcu_lab_reserve_fullmac_resources(lab);
-	if (ret)
+	if (ret) {
+		lab->fullmac_security = 0;
 		return ret;
+	}
 	ret = mt7932_mcu_lab_prepare_fullmac_data_path(lab);
 	if (ret) {
 		mt7932_mcu_lab_release_fullmac_resources(lab);
@@ -1813,18 +1832,65 @@ static struct mt7932_mcu_lab *mt7932_fullmac_wiphy_lab(struct wiphy *wiphy)
 
 static struct cfg80211_bss *
 mt7932_fullmac_cfg_seed_bss(struct wiphy *wiphy,
-			   struct ieee80211_channel *channel,
+			   struct ieee80211_channel *channel, bool privacy,
 			   const u8 *bssid, const u8 *ssid, size_t ssid_len)
 {
+	u16 capability = WLAN_CAPABILITY_ESS;
 	u8 ie[2 + IEEE80211_MAX_SSID_LEN] = {
 		WLAN_EID_SSID, ssid_len,
 	};
 
+	if (privacy)
+		capability |= WLAN_CAPABILITY_PRIVACY;
 	memcpy(ie + 2, ssid, ssid_len);
 	return cfg80211_inform_bss(
 		wiphy, channel, CFG80211_BSS_FTYPE_UNKNOWN, bssid, 0,
-		WLAN_CAPABILITY_ESS | WLAN_CAPABILITY_PRIVACY,
+		capability,
 		100, ie, 2 + ssid_len, 0, GFP_KERNEL);
+}
+
+static const char *mt7932_fullmac_security_name(u8 security)
+{
+	return security == NEO_WIFID_FULLMAC_SECURITY_OPEN ? "open" :
+	       security == NEO_WIFID_FULLMAC_SECURITY_OWE ? "owe" :
+	       security == NEO_WIFID_FULLMAC_SECURITY_WPA3_SAE ? "wpa3-sae" :
+	       "wpa2-psk";
+}
+
+static void mt7932_fullmac_derive_sae_pmk(const u8 *password,
+					  size_t password_len,
+					  const u8 *ssid, size_t ssid_len,
+					  u8 pmk[WLAN_PMK_LEN])
+{
+	struct hmac_sha1_key key;
+	u8 salt[IEEE80211_MAX_SSID_LEN + sizeof(__be32)];
+	u8 u[SHA1_DIGEST_SIZE], next[SHA1_DIGEST_SIZE];
+	u8 block_value[SHA1_DIGEST_SIZE];
+	unsigned int block, iteration, i, copied = 0;
+
+	hmac_sha1_preparekey(&key, password, password_len);
+	memcpy(salt, ssid, ssid_len);
+	for (block = 1; copied < WLAN_PMK_LEN; block++) {
+		size_t length = min_t(size_t, SHA1_DIGEST_SIZE,
+				      WLAN_PMK_LEN - copied);
+
+		put_unaligned_be32(block, salt + ssid_len);
+		hmac_sha1(&key, salt, ssid_len + sizeof(__be32), u);
+		memcpy(block_value, u, sizeof(block_value));
+		for (iteration = 1; iteration < 4096; iteration++) {
+			hmac_sha1(&key, u, sizeof(u), next);
+			memcpy(u, next, sizeof(u));
+			for (i = 0; i < sizeof(block_value); i++)
+				block_value[i] ^= u[i];
+		}
+		memcpy(pmk + copied, block_value, length);
+		copied += length;
+	}
+	memzero_explicit(&key, sizeof(key));
+	memzero_explicit(salt, sizeof(salt));
+	memzero_explicit(u, sizeof(u));
+	memzero_explicit(next, sizeof(next));
+	memzero_explicit(block_value, sizeof(block_value));
 }
 
 static int mt7932_fullmac_cfg_attempt(struct mt7932_mcu_lab *lab,
@@ -1901,9 +1967,10 @@ static void mt7932_fullmac_cfg_connect_work(struct work_struct *work)
 	frequency = ieee80211_channel_to_frequency(request.channel, band);
 	channel = ieee80211_get_channel(lab->fullmac_wiphy, frequency);
 	if (channel)
-		bss = mt7932_fullmac_cfg_seed_bss(lab->fullmac_wiphy, channel,
-						 request.bssid, request.ssid,
-						 request.ssid_len);
+		bss = mt7932_fullmac_cfg_seed_bss(
+			lab->fullmac_wiphy, channel,
+			request.security != NEO_WIFID_FULLMAC_SECURITY_OPEN,
+			request.bssid, request.ssid, request.ssid_len);
 	response.status = ret ? WLAN_STATUS_UNSPECIFIED_FAILURE :
 				WLAN_STATUS_SUCCESS;
 	response.links[0].bssid = request.bssid;
@@ -1915,8 +1982,8 @@ static void mt7932_fullmac_cfg_connect_work(struct work_struct *work)
 		cfg80211_port_authorized(lab->fullmac_ndev, request.bssid,
 					 NULL, 0, GFP_KERNEL);
 		dev_info(lab->dev->mt76.dev,
-			 "J700_MT7932_CFG80211_CONNECT_PASS: security=owe attempts=%u port=firmware-authorized identity=redacted\n",
-			 attempt + 1);
+			 "J700_MT7932_CFG80211_CONNECT_PASS: security=%s attempts=%u port=firmware-authorized identity=redacted\n",
+			 mt7932_fullmac_security_name(request.security), attempt + 1);
 	}
 	memzero_explicit(&request, sizeof(request));
 	memzero_explicit(&lab->fullmac_cfg_request,
@@ -1931,22 +1998,56 @@ static int mt7932_fullmac_cfg_connect(struct wiphy *wiphy,
 	struct ieee80211_channel *channel = params->channel ?: params->channel_hint;
 	const u8 *bssid = params->bssid ?: params->bssid_hint;
 	struct neo_wifid_fullmac_connect request = {};
+	bool open, owe, sae;
 	int ret = 0;
 
+	open = !params->privacy && !params->crypto.n_akm_suites;
+	owe = params->crypto.n_akm_suites == 1 &&
+	      params->crypto.akm_suites[0] == WLAN_AKM_SUITE_OWE;
+	sae = params->crypto.n_akm_suites == 1 &&
+	      params->crypto.akm_suites[0] == WLAN_AKM_SUITE_SAE;
+	if (sae && lab)
+		dev_info(lab->dev->mt76.dev,
+			 "J700_MT7932_CFG80211_SAE_INPUT: password=%u pmk=%u auth_type=%u secrets=redacted\n",
+			 !!params->crypto.sae_pwd, !!params->crypto.psk,
+			 params->auth_type);
 	if (!lab || ndev != lab->fullmac_ndev || !channel || !bssid ||
 	    !params->ssid || !params->ssid_len ||
 	    params->ssid_len > sizeof(request.ssid) ||
-	    params->crypto.n_akm_suites != 1 ||
-	    params->crypto.akm_suites[0] != WLAN_AKM_SUITE_OWE)
+	    (!open && !owe && !sae) ||
+	    (sae && (!params->crypto.sae_pwd ||
+		     params->crypto.sae_pwd_len < 8 ||
+		     params->crypto.sae_pwd_len > sizeof(request.key))) ||
+	    (params->auth_type != NL80211_AUTHTYPE_AUTOMATIC &&
+	     params->auth_type != NL80211_AUTHTYPE_OPEN_SYSTEM &&
+	     (!sae || params->auth_type != NL80211_AUTHTYPE_SAE)))
 		return -EINVAL;
 
 	request.ssid_len = params->ssid_len;
 	request.band = channel->band == NL80211_BAND_2GHZ ? 1 :
 		       channel->band == NL80211_BAND_5GHZ ? 2 : 3;
 	request.channel = ieee80211_frequency_to_channel(channel->center_freq);
-	request.security = NEO_WIFID_FULLMAC_SECURITY_OWE;
+	request.security = open ? NEO_WIFID_FULLMAC_SECURITY_OPEN :
+			   sae ? NEO_WIFID_FULLMAC_SECURITY_WPA3_SAE :
+				 NEO_WIFID_FULLMAC_SECURITY_OWE;
 	memcpy(request.bssid, bssid, ETH_ALEN);
 	memcpy(request.ssid, params->ssid, params->ssid_len);
+	if (sae) {
+		request.key_len = params->crypto.sae_pwd_len;
+		request.pmk_len = WLAN_PMK_LEN;
+		memcpy(request.key, params->crypto.sae_pwd, request.key_len);
+		if (params->crypto.psk) {
+			memcpy(request.pmk, params->crypto.psk,
+			       request.pmk_len);
+		} else {
+			mt7932_fullmac_derive_sae_pmk(
+				params->crypto.sae_pwd,
+				params->crypto.sae_pwd_len,
+				params->ssid, params->ssid_len, request.pmk);
+			dev_info(lab->dev->mt76.dev,
+				 "J700_MT7932_CFG80211_SAE_PMK_DERIVED: method=pbkdf2-hmac-sha1 iterations=4096 bytes=32 secrets=redacted\n");
+		}
+	}
 
 	mutex_lock(&lab->operation_lock);
 	if (lab->fullmac_cfg_connecting || lab->dead) {
