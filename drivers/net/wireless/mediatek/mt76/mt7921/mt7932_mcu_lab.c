@@ -37,6 +37,7 @@
 #define NEO_WIFID_STATE_FULLMAC_CONNECTED	BIT(8)
 
 static bool mt7932_fullmac_cfg80211;
+static bool mt7932_fullmac_private_vif;
 
 struct mt7932_mcu_lab_pending {
 	bool valid;
@@ -86,6 +87,7 @@ struct mt7932_mcu_lab {
 	u8 fullmac_reserved_count;
 	struct mt792x_sta fullmac_sta;
 	struct ieee80211_vif *fullmac_vif;
+	struct ieee80211_vif *fullmac_internal_vif;
 	struct ieee80211_key_conf fullmac_key;
 	struct net_device *fullmac_ndev;
 	struct wiphy *fullmac_wiphy;
@@ -104,6 +106,7 @@ struct mt7932_mcu_lab {
 	bool fullmac_hw_scan_observing;
 	bool fullmac_hw_scan_aborted;
 	bool fullmac_cfg_connecting;
+	bool fullmac_internal_started;
 	bool fullmac_wcid_initialized;
 	bool fullmac_connected;
 	bool fullmac_peer_ready;
@@ -240,10 +243,11 @@ mt7932_fullmac_scan_request_alloc(struct mt7932_mcu_lab *lab,
 	struct wiphy *source_wiphy = lab->dev->mt76.hw->wiphy;
 	unsigned int i, n_channels = request->n_channels;
 
-	lab->fullmac_vif = NULL;
-	ieee80211_iterate_interfaces(mt76_hw(lab->dev),
-				     IEEE80211_IFACE_ITER_NORMAL,
-				     mt7932_mcu_lab_select_vif, lab);
+	lab->fullmac_vif = lab->fullmac_internal_vif;
+	if (!lab->fullmac_vif)
+		ieee80211_iterate_interfaces(mt76_hw(lab->dev),
+					     IEEE80211_IFACE_ITER_NORMAL,
+					     mt7932_mcu_lab_select_vif, lab);
 	if (!lab->fullmac_vif)
 		return NULL;
 	if (READ_ONCE(lab->fullmac_connected) &&
@@ -262,8 +266,8 @@ mt7932_fullmac_scan_request_alloc(struct mt7932_mcu_lab *lab,
 	source->ie_len = request->ie_len;
 	source->flags = request->flags;
 	source->wiphy = source_wiphy;
-	source->wdev = lab->fullmac_vif ?
-		ieee80211_vif_to_wdev(lab->fullmac_vif) : NULL;
+	source->wdev = lab->fullmac_internal_vif ? NULL :
+		lab->fullmac_vif ? ieee80211_vif_to_wdev(lab->fullmac_vif) : NULL;
 	memcpy(source->rates, request->rates, sizeof(source->rates));
 	memcpy(source->mac_addr, request->mac_addr, ETH_ALEN);
 	memcpy(source->mac_addr_mask, request->mac_addr_mask, ETH_ALEN);
@@ -527,8 +531,44 @@ static int mt7932_mcu_lab_register_fullmac_netdev(
 static int mt7932_mcu_lab_enable_internal_scan_vif(
 	struct mt7932_mcu_lab *lab)
 {
+	struct ieee80211_hw *hw = mt76_hw(lab->dev);
+	struct ieee80211_vif *vif;
 	struct wireless_dev *wdev;
 	int ret;
+
+	if (mt7932_mcu_lab_private_vif_enabled()) {
+		vif = kzalloc(sizeof(*vif) + hw->vif_data_size, GFP_KERNEL);
+		if (!vif)
+			return -ENOMEM;
+		vif->type = NL80211_IFTYPE_STATION;
+		vif->cfg.idle = true;
+		vif->addr_valid = true;
+		ether_addr_copy(vif->addr, lab->dev->mphy.macaddr);
+		ether_addr_copy(vif->bss_conf.addr, vif->addr);
+		vif->bss_conf.bssid = vif->addr;
+		vif->bss_conf.vif = vif;
+		vif->bss_conf.link_id = 0;
+		mt792x_mutex_acquire(lab->dev);
+		ret = __mt7921_start(&lab->dev->phy);
+		mt792x_mutex_release(lab->dev);
+		if (ret) {
+			kfree(vif);
+			return ret;
+		}
+		lab->fullmac_internal_started = true;
+		ret = mt7921_add_driver_internal_vif(lab->dev, vif);
+		if (ret) {
+			mt792x_stop(hw, false);
+			lab->fullmac_internal_started = false;
+			kfree(vif);
+			return ret;
+		}
+		lab->fullmac_internal_vif = vif;
+		lab->fullmac_vif = vif;
+		dev_info(lab->dev->mt76.dev,
+			 "J700_MT7932_CFG80211_PRIVATE_VIF_READY: source=driver-private state=up mac80211_netdev=0 ownership=driver-internal\n");
+		return 0;
+	}
 
 	lab->fullmac_vif = NULL;
 	ieee80211_iterate_interfaces(mt76_hw(lab->dev),
@@ -549,6 +589,23 @@ static int mt7932_mcu_lab_enable_internal_scan_vif(
 	return ret;
 }
 
+static void mt7932_mcu_lab_remove_internal_scan_vif(
+	struct mt7932_mcu_lab *lab)
+{
+	struct ieee80211_vif *vif = lab->fullmac_internal_vif;
+
+	if (!vif)
+		return;
+	mt7921_remove_driver_internal_vif(lab->dev, vif);
+	if (lab->fullmac_internal_started) {
+		mt792x_stop(mt76_hw(lab->dev), false);
+		lab->fullmac_internal_started = false;
+	}
+	lab->fullmac_internal_vif = NULL;
+	lab->fullmac_vif = NULL;
+	kfree(vif);
+}
+
 static int mt7932_mcu_lab_prepare_fullmac_data_path(
 	struct mt7932_mcu_lab *lab)
 {
@@ -557,9 +614,11 @@ static int mt7932_mcu_lab_prepare_fullmac_data_path(
 	struct mt792x_vif *mvif;
 	int i;
 
-	lab->fullmac_vif = NULL;
-	ieee80211_iterate_interfaces(mt76_hw(dev), IEEE80211_IFACE_ITER_NORMAL,
-				     mt7932_mcu_lab_select_vif, lab);
+	lab->fullmac_vif = lab->fullmac_internal_vif;
+	if (!lab->fullmac_vif)
+		ieee80211_iterate_interfaces(mt76_hw(dev),
+					     IEEE80211_IFACE_ITER_NORMAL,
+					     mt7932_mcu_lab_select_vif, lab);
 	if (!lab->fullmac_vif || !lab->fullmac_ndev)
 		return -ENODEV;
 
@@ -718,9 +777,20 @@ module_param_named(j700_fullmac_cfg80211, mt7932_fullmac_cfg80211, bool, 0444);
 MODULE_PARM_DESC(j700_fullmac_cfg80211,
 		 "register the experimental J700 cfg80211 fullmac station interface");
 
+module_param_named(j700_fullmac_private_vif, mt7932_fullmac_private_vif,
+		   bool, 0444);
+MODULE_PARM_DESC(j700_fullmac_private_vif,
+		 "use a driver-private MT7932 vif without a mac80211 netdev");
+
 bool mt7932_mcu_lab_conformance_active(void)
 {
 	return READ_ONCE(mt7932_mcu_lab_conformance);
+}
+
+bool mt7932_mcu_lab_private_vif_enabled(void)
+{
+	return READ_ONCE(mt7932_fullmac_cfg80211) &&
+	       READ_ONCE(mt7932_fullmac_private_vif);
 }
 
 static void mt7932_mcu_lab_release(struct kref *ref)
@@ -2390,6 +2460,7 @@ void mt7932_mcu_lab_destroy(struct mt792x_dev *dev)
 	complete_all(&lab->connected);
 	complete_all(&lab->continued);
 	mutex_unlock(&lab->operation_lock);
+	mt7932_mcu_lab_remove_internal_scan_vif(lab);
 	wake_up_interruptible(&lab->read_wait);
 	mt7932_mcu_lab_put(lab);
 }

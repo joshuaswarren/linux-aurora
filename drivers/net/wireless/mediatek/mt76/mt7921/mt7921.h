@@ -311,6 +311,10 @@ mt7921_l1_rmw(struct mt792x_dev *dev, u32 addr, u32 mask, u32 val)
 int mt7921_mac_init(struct mt792x_dev *dev);
 int mt7921_reset_hardware(struct mt792x_dev *dev);
 int mt7932_apply_manufacture_policy(struct mt792x_dev *dev);
+int mt7921_add_driver_internal_vif(struct mt792x_dev *dev,
+				    struct ieee80211_vif *vif);
+void mt7921_remove_driver_internal_vif(struct mt792x_dev *dev,
+				       struct ieee80211_vif *vif);
 bool mt7921_mac_wtbl_update(struct mt792x_dev *dev, int idx, u32 mask);
 int mt7921_mac_sta_add(struct mt76_dev *mdev, struct ieee80211_vif *vif,
 		       struct ieee80211_sta *sta);

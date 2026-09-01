@@ -380,6 +380,18 @@ out:
 	return ret;
 }
 
+int mt7921_add_driver_internal_vif(struct mt792x_dev *dev,
+				    struct ieee80211_vif *vif)
+{
+	return mt7921_add_interface(mt76_hw(dev), vif);
+}
+
+void mt7921_remove_driver_internal_vif(struct mt792x_dev *dev,
+				       struct ieee80211_vif *vif)
+{
+	mt792x_remove_interface(mt76_hw(dev), vif);
+}
+
 static void mt7921_roc_iter(void *priv, u8 *mac,
 			    struct ieee80211_vif *vif)
 {

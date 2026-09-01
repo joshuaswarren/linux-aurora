@@ -454,6 +454,11 @@ int mt7921_register_device(struct mt792x_dev *dev)
 		dev_info(dev->mt76.dev,
 			 "J700_MT7932_AU_REGDOM_STAGED: source=25G83-IZUBA-db-a61e0b70 channels=6g1-93 max_eirp=14dBm mode=VLP root-regdb=absent\n");
 	}
+	if (is_mt7932(&dev->mt76) && mt7932_mcu_lab_private_vif_enabled()) {
+		ieee80211_hw_set(hw, NO_AUTO_VIF);
+		dev_info(dev->mt76.dev,
+			 "J700_MT7932_PRIVATE_VIF_ARMED: mac80211_auto_netdev=0 cfg80211_facade=1\n");
+	}
 	/* AppleSunriseWLAN 25G83 carries the live association listen interval in
 	 * EA/0x40 and caps that policy input at 20 beacon intervals.  Advertising
 	 * the same J700 capability also makes mac80211 initialize the live value

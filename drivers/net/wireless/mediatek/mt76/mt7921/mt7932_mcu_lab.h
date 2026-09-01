@@ -174,6 +174,7 @@ int mt7932_mcu_fullmac_queue_unbind(struct mt792x_dev *dev, u8 bss_idx,
 int mt7932_mcu_load_assoc_power(struct mt792x_dev *dev, u32 *command_out);
 #if IS_ENABLED(CONFIG_MT7921_J700_MCU_LAB)
 bool mt7932_mcu_lab_conformance_active(void);
+bool mt7932_mcu_lab_private_vif_enabled(void);
 int mt7932_mcu_lab_checkpoint(struct mt792x_dev *dev);
 int mt7932_mcu_lab_runtime_create(struct mt792x_dev *dev);
 void mt7932_mcu_lab_destroy(struct mt792x_dev *dev);
@@ -183,6 +184,11 @@ bool mt7932_mcu_lab_fullmac_rx(struct mt792x_dev *dev, struct sk_buff *skb);
 bool mt7932_mcu_lab_scan_done(struct mt792x_dev *dev, bool aborted);
 #else
 static inline bool mt7932_mcu_lab_conformance_active(void)
+{
+	return false;
+}
+
+static inline bool mt7932_mcu_lab_private_vif_enabled(void)
 {
 	return false;
 }
