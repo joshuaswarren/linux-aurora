@@ -180,6 +180,7 @@ void mt7932_mcu_lab_destroy(struct mt792x_dev *dev);
 void mt7932_mcu_lab_reset_prepare(struct mt792x_dev *dev);
 bool mt7932_mcu_lab_rx(struct mt792x_dev *dev, struct sk_buff *skb);
 bool mt7932_mcu_lab_fullmac_rx(struct mt792x_dev *dev, struct sk_buff *skb);
+bool mt7932_mcu_lab_scan_done(struct mt792x_dev *dev, bool aborted);
 #else
 static inline bool mt7932_mcu_lab_conformance_active(void)
 {
@@ -208,6 +209,12 @@ static inline bool mt7932_mcu_lab_rx(struct mt792x_dev *dev,
 
 static inline bool mt7932_mcu_lab_fullmac_rx(struct mt792x_dev *dev,
 					     struct sk_buff *skb)
+{
+	return false;
+}
+
+static inline bool mt7932_mcu_lab_scan_done(struct mt792x_dev *dev,
+					    bool aborted)
 {
 	return false;
 }

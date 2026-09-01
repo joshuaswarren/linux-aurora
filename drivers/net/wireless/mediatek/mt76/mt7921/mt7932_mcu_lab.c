@@ -2,6 +2,7 @@
 /* J700-only MT7932 MCU conformance checkpoint. */
 
 #include <linux/capability.h>
+#include <linux/delay.h>
 #include <linux/fs.h>
 #include <linux/firmware.h>
 #include <linux/if_ether.h>
@@ -17,6 +18,7 @@
 #include <linux/udp.h>
 #include <linux/uaccess.h>
 #include <linux/xarray.h>
+#include <net/cfg80211.h>
 
 #include "mt7921.h"
 #include "mt7932_mcu_lab.h"
@@ -33,6 +35,8 @@
 #define NEO_WIFID_STATE_DEAD		BIT(6)
 #define NEO_WIFID_STATE_RESPONSE_TIMEOUT	BIT(7)
 #define NEO_WIFID_STATE_FULLMAC_CONNECTED	BIT(8)
+
+static bool mt7932_fullmac_cfg80211;
 
 struct mt7932_mcu_lab_pending {
 	bool valid;
@@ -74,6 +78,7 @@ struct mt7932_mcu_lab {
 	struct completion disconnected;
 	atomic_t opened;
 	atomic_t dropped_events;
+	atomic_t fullmac_scan_bss_count;
 	enum neo_wifid_phase phase;
 	u32 command_count;
 	u8 fullmac_sta_ids[NEO_WIFID_FULLMAC_STA_IDS];
@@ -83,6 +88,22 @@ struct mt7932_mcu_lab {
 	struct ieee80211_vif *fullmac_vif;
 	struct ieee80211_key_conf fullmac_key;
 	struct net_device *fullmac_ndev;
+	struct wiphy *fullmac_wiphy;
+	struct wireless_dev fullmac_wdev;
+	struct completion fullmac_assoc_started;
+	struct completion fullmac_cfg_connect_done;
+	struct completion fullmac_cfg_cal_done;
+	struct completion fullmac_hw_scan_done;
+	struct work_struct fullmac_connect_work;
+	struct work_struct fullmac_scan_work;
+	struct cfg80211_scan_request *fullmac_scan_request;
+	struct neo_wifid_fullmac_connect fullmac_cfg_request;
+	u32 fullmac_cfg_cal_cookie;
+	u16 fullmac_cfg_connect_status;
+	bool fullmac_hw_scan_owned;
+	bool fullmac_hw_scan_observing;
+	bool fullmac_hw_scan_aborted;
+	bool fullmac_cfg_connecting;
 	bool fullmac_wcid_initialized;
 	bool fullmac_connected;
 	bool fullmac_peer_ready;
@@ -90,8 +111,11 @@ struct mt7932_mcu_lab {
 	bool fullmac_cold_teardown_done;
 	u16 fullmac_disconnect_status;
 	u8 fullmac_bssid[ETH_ALEN];
+	u8 fullmac_oper_band;
+	u8 fullmac_oper_channel;
 	struct mt7932_fullmac_assoc_cal_snapshot assoc_cal;
 	bool checkpoint_waiting;
+	bool misc_registered;
 	bool response_timed_out;
 	bool irq_disabled;
 	bool tasklet_disabled;
@@ -101,6 +125,8 @@ struct mt7932_mcu_lab {
 struct mt7932_fullmac_netdev_priv {
 	struct mt7932_mcu_lab *lab;
 };
+
+static void mt7932_fullmac_scan_cancel(struct mt7932_mcu_lab *lab);
 
 static bool mt7932_mcu_lab_fullmac_critical_data(struct sk_buff *skb)
 {
@@ -157,8 +183,260 @@ static netdev_tx_t mt7932_mcu_lab_fullmac_xmit(struct sk_buff *skb,
 	return NETDEV_TX_OK;
 }
 
+static int mt7932_mcu_lab_fullmac_open(struct net_device *ndev)
+{
+	netif_start_queue(ndev);
+	return 0;
+}
+
+static int mt7932_mcu_lab_fullmac_stop(struct net_device *ndev)
+{
+	struct mt7932_fullmac_netdev_priv *priv = netdev_priv(ndev);
+	struct mt7932_mcu_lab *lab = READ_ONCE(priv->lab);
+	struct cfg80211_scan_request *request;
+	bool owned;
+
+	netif_stop_queue(ndev);
+	if (!lab)
+		return 0;
+	request = xchg(&lab->fullmac_scan_request, NULL);
+	owned = xchg(&lab->fullmac_hw_scan_owned, false);
+	WRITE_ONCE(lab->fullmac_hw_scan_observing, false);
+	WRITE_ONCE(lab->fullmac_hw_scan_aborted, true);
+	if (owned && lab->fullmac_vif)
+		mt7932_fullmac_scan_cancel(lab);
+	complete_all(&lab->fullmac_hw_scan_done);
+	cancel_work_sync(&lab->fullmac_scan_work);
+	if (request)
+		dev_info(lab->dev->mt76.dev,
+			 "J700_MT7932_CFG80211_SCAN_NETDEV_STOP: owner=netdev-down hardware_owned=%u completion=cfg80211-core\n",
+			 owned);
+
+	return 0;
+}
+
 static const struct net_device_ops mt7932_mcu_lab_fullmac_netdev_ops = {
+	.ndo_open = mt7932_mcu_lab_fullmac_open,
+	.ndo_stop = mt7932_mcu_lab_fullmac_stop,
 	.ndo_start_xmit = mt7932_mcu_lab_fullmac_xmit,
+};
+
+static int mt7932_fullmac_cfg_connect(struct wiphy *wiphy,
+				      struct net_device *ndev,
+				      struct cfg80211_connect_params *params);
+static int mt7932_fullmac_cfg_disconnect(struct wiphy *wiphy,
+					 struct net_device *ndev,
+					 u16 reason_code);
+static void mt7932_mcu_lab_select_vif(void *data, u8 *mac,
+				     struct ieee80211_vif *vif);
+static struct mt7932_mcu_lab *mt7932_fullmac_wiphy_lab(struct wiphy *wiphy);
+
+static struct ieee80211_scan_request *
+mt7932_fullmac_scan_request_alloc(struct mt7932_mcu_lab *lab,
+				  struct cfg80211_scan_request *request)
+{
+	struct ieee80211_scan_request *scan;
+	struct cfg80211_scan_request *source;
+	struct wiphy *source_wiphy = lab->dev->mt76.hw->wiphy;
+	unsigned int i, n_channels = request->n_channels;
+
+	lab->fullmac_vif = NULL;
+	ieee80211_iterate_interfaces(mt76_hw(lab->dev),
+				     IEEE80211_IFACE_ITER_NORMAL,
+				     mt7932_mcu_lab_select_vif, lab);
+	if (!lab->fullmac_vif)
+		return NULL;
+	if (READ_ONCE(lab->fullmac_connected) &&
+	    READ_ONCE(lab->fullmac_oper_channel))
+		n_channels = 1;
+	scan = kzalloc(sizeof(*scan) +
+		       n_channels * sizeof(source->channels[0]),
+		       GFP_KERNEL);
+	if (!scan)
+		return NULL;
+	source = &scan->req;
+	source->ssids = request->ssids;
+	source->n_ssids = request->n_ssids;
+	source->n_channels = n_channels;
+	source->ie = request->ie;
+	source->ie_len = request->ie_len;
+	source->flags = request->flags;
+	source->wiphy = source_wiphy;
+	source->wdev = lab->fullmac_vif ?
+		ieee80211_vif_to_wdev(lab->fullmac_vif) : NULL;
+	memcpy(source->rates, request->rates, sizeof(source->rates));
+	memcpy(source->mac_addr, request->mac_addr, ETH_ALEN);
+	memcpy(source->mac_addr_mask, request->mac_addr_mask, ETH_ALEN);
+	memcpy(source->bssid, request->bssid, ETH_ALEN);
+	if (n_channels == 1 && READ_ONCE(lab->fullmac_connected)) {
+		enum nl80211_band band = lab->fullmac_oper_band == 1 ?
+			NL80211_BAND_2GHZ : lab->fullmac_oper_band == 2 ?
+			NL80211_BAND_5GHZ : NL80211_BAND_6GHZ;
+		int frequency = ieee80211_channel_to_frequency(
+			lab->fullmac_oper_channel, band);
+
+		source->channels[0] = ieee80211_get_channel(source_wiphy,
+							     frequency);
+		if (!source->channels[0]) {
+			kfree(scan);
+			return NULL;
+		}
+	} else for (i = 0; i < request->n_channels; i++) {
+		source->channels[i] = ieee80211_get_channel(
+			source_wiphy, request->channels[i]->center_freq);
+		if (!source->channels[i]) {
+			kfree(scan);
+			return NULL;
+		}
+	}
+
+	return scan;
+}
+
+static void mt7932_fullmac_scan_cancel(struct mt7932_mcu_lab *lab)
+{
+	struct mt76_vif_link *mvif =
+		(struct mt76_vif_link *)lab->fullmac_vif->drv_priv;
+	struct {
+		u8 seq_num;
+		u8 is_ext_channel;
+		u8 reserved[2];
+	} __packed request = {
+		.seq_num = mvif->scan_seq_num,
+	};
+
+	mt792x_mutex_acquire(lab->dev);
+	skb_queue_purge(&lab->dev->mphy.scan_pending);
+	WRITE_ONCE(lab->dev->mphy.scan_active_seq, 0);
+	clear_bit(MT76_HW_SCANNING, &lab->dev->mphy.state);
+	mt76_mcu_send_msg(&lab->dev->mt76, MCU_CE_CMD(CANCEL_HW_SCAN),
+			  &request, sizeof(request), false);
+	mt792x_mutex_release(lab->dev);
+}
+
+static void mt7932_fullmac_cfg_scan_work(struct work_struct *work)
+{
+	struct mt7932_mcu_lab *lab = container_of(
+		work, struct mt7932_mcu_lab, fullmac_scan_work);
+	struct cfg80211_scan_request *request = READ_ONCE(
+		lab->fullmac_scan_request);
+	struct cfg80211_scan_info info = {};
+	struct ieee80211_scan_request *scan;
+	unsigned long timeout;
+	unsigned int found = 0, directed = 0, i;
+	int ret;
+
+	if (!request)
+		return;
+	for (i = 0; i < request->n_ssids; i++)
+		if (request->ssids[i].ssid_len)
+			directed++;
+	scan = mt7932_fullmac_scan_request_alloc(lab, request);
+	if (!scan) {
+		info.aborted = true;
+		goto done;
+	}
+	reinit_completion(&lab->fullmac_hw_scan_done);
+	WRITE_ONCE(lab->fullmac_hw_scan_aborted, false);
+	if (test_bit(MT76_HW_SCANNING, &lab->dev->mphy.state)) {
+		WRITE_ONCE(lab->fullmac_hw_scan_observing, true);
+		for (i = 0; i < 750 &&
+		     test_bit(MT76_HW_SCANNING, &lab->dev->mphy.state); i++)
+			msleep(20);
+		WRITE_ONCE(lab->fullmac_hw_scan_observing, false);
+		if (test_bit(MT76_HW_SCANNING, &lab->dev->mphy.state)) {
+			info.aborted = true;
+			goto free_scan;
+		}
+		found = atomic_read(&lab->fullmac_scan_bss_count);
+		dev_info(lab->dev->mt76.dev,
+			 "J700_MT7932_CFG80211_SCAN_OBSERVED: found=%u source=internal-mac80211-hardware-owner\n",
+			 found);
+		goto free_scan;
+	}
+	WRITE_ONCE(lab->fullmac_hw_scan_owned, true);
+	mt792x_mutex_acquire(lab->dev);
+	ret = mt7932_mcu_drain_tx17(lab->dev, "cfg80211-scan-pre", false);
+	if (!ret)
+		ret = mt76_connac_mcu_hw_scan(&lab->dev->mphy,
+					     lab->fullmac_vif, scan);
+	mt792x_mutex_release(lab->dev);
+	if (ret) {
+		WRITE_ONCE(lab->fullmac_hw_scan_owned, false);
+		info.aborted = true;
+		goto free_scan;
+	}
+	timeout = wait_for_completion_timeout(&lab->fullmac_hw_scan_done,
+					       msecs_to_jiffies(60000));
+	if (!timeout) {
+		WRITE_ONCE(lab->fullmac_hw_scan_owned, false);
+		mt7932_fullmac_scan_cancel(lab);
+		info.aborted = true;
+		dev_err(lab->dev->mt76.dev,
+			"J700_MT7932_CFG80211_SCAN_TIMEOUT: source=typed-cid03\n");
+		goto free_scan;
+	}
+	info.aborted = READ_ONCE(lab->fullmac_hw_scan_aborted);
+	if (!info.aborted)
+		found = atomic_read(&lab->fullmac_scan_bss_count);
+free_scan:
+	kfree(scan);
+done:
+	if (cmpxchg(&lab->fullmac_scan_request, request, NULL) == request) {
+		cfg80211_scan_done(request, &info);
+		dev_info(lab->dev->mt76.dev,
+			 "J700_MT7932_CFG80211_SCAN_MIRROR: directed_ssids=%u channels=%u found=%u aborted=%u source=typed-cid03+direct-rx-publication\n",
+			 directed, request->n_channels, found, info.aborted);
+	}
+}
+
+static int mt7932_fullmac_cfg_scan(struct wiphy *wiphy,
+				   struct cfg80211_scan_request *request)
+{
+	struct mt7932_mcu_lab *lab =
+		*(struct mt7932_mcu_lab **)wiphy_priv(wiphy);
+
+	if (!lab || cmpxchg(&lab->fullmac_scan_request, NULL, request))
+		return -EBUSY;
+	atomic_set(&lab->fullmac_scan_bss_count, 0);
+	schedule_work(&lab->fullmac_scan_work);
+	return 0;
+}
+
+static void mt7932_fullmac_cfg_abort_scan(struct wiphy *wiphy,
+					  struct wireless_dev *wdev)
+{
+	struct mt7932_mcu_lab *lab = mt7932_fullmac_wiphy_lab(wiphy);
+	struct cfg80211_scan_request *request;
+	struct cfg80211_scan_info info = { .aborted = true };
+	bool owned;
+
+	if (!lab || wdev != &lab->fullmac_wdev)
+		return;
+	request = xchg(&lab->fullmac_scan_request, NULL);
+	if (!request)
+		return;
+	owned = xchg(&lab->fullmac_hw_scan_owned, false);
+	WRITE_ONCE(lab->fullmac_hw_scan_observing, false);
+	WRITE_ONCE(lab->fullmac_hw_scan_aborted, true);
+	if (owned && lab->fullmac_vif)
+		mt7932_fullmac_scan_cancel(lab);
+	complete_all(&lab->fullmac_hw_scan_done);
+	cfg80211_scan_done(request, &info);
+	dev_info(lab->dev->mt76.dev,
+		 "J700_MT7932_CFG80211_SCAN_ABORT: owner=cfg80211 hardware_owned=%u completion=single\n",
+		 owned);
+}
+
+static const struct cfg80211_ops mt7932_fullmac_cfg_ops = {
+	.scan = mt7932_fullmac_cfg_scan,
+	.abort_scan = mt7932_fullmac_cfg_abort_scan,
+	.connect = mt7932_fullmac_cfg_connect,
+	.disconnect = mt7932_fullmac_cfg_disconnect,
+};
+
+static const u32 mt7932_fullmac_cipher_suites[] = {
+	WLAN_CIPHER_SUITE_CCMP,
 };
 
 static void mt7932_mcu_lab_select_vif(void *data, u8 *mac,
@@ -188,16 +466,87 @@ static int mt7932_mcu_lab_register_fullmac_netdev(
 	ndev->min_mtu = ETH_MIN_MTU;
 	ndev->max_mtu = ETH_DATA_LEN;
 	strscpy(ndev->name, "neo-wifi%d", IFNAMSIZ);
+	ndev->name_assign_type = NET_NAME_PREDICTABLE;
 	SET_NETDEV_DEV(ndev, lab->dev->mt76.dev);
 	eth_hw_addr_set(ndev, lab->dev->mphy.macaddr);
 	netif_carrier_off(ndev);
+	if (mt7932_fullmac_cfg80211) {
+		struct wiphy *source = lab->dev->mt76.hw->wiphy;
+		struct mt7932_mcu_lab **wiphy_lab;
+
+		lab->fullmac_wiphy = wiphy_new(&mt7932_fullmac_cfg_ops,
+					       sizeof(*wiphy_lab));
+		if (!lab->fullmac_wiphy) {
+			free_netdev(ndev);
+			return -ENOMEM;
+		}
+		wiphy_lab = wiphy_priv(lab->fullmac_wiphy);
+		*wiphy_lab = lab;
+		set_wiphy_dev(lab->fullmac_wiphy, lab->dev->mt76.dev);
+		lab->fullmac_wiphy->interface_modes = BIT(NL80211_IFTYPE_STATION);
+		lab->fullmac_wiphy->max_scan_ssids = 4;
+		lab->fullmac_wiphy->max_scan_ie_len = 2304;
+		lab->fullmac_wiphy->signal_type = CFG80211_SIGNAL_TYPE_MBM;
+		lab->fullmac_wiphy->cipher_suites = mt7932_fullmac_cipher_suites;
+		lab->fullmac_wiphy->n_cipher_suites =
+			ARRAY_SIZE(mt7932_fullmac_cipher_suites);
+		wiphy_ext_feature_set(lab->fullmac_wiphy,
+				      NL80211_EXT_FEATURE_OWE_OFFLOAD);
+		lab->fullmac_wiphy->bands[NL80211_BAND_2GHZ] =
+			source->bands[NL80211_BAND_2GHZ];
+		lab->fullmac_wiphy->bands[NL80211_BAND_5GHZ] =
+			source->bands[NL80211_BAND_5GHZ];
+		lab->fullmac_wiphy->bands[NL80211_BAND_6GHZ] =
+			source->bands[NL80211_BAND_6GHZ];
+		ret = wiphy_register(lab->fullmac_wiphy);
+		if (ret) {
+			wiphy_free(lab->fullmac_wiphy);
+			lab->fullmac_wiphy = NULL;
+			free_netdev(ndev);
+			return ret;
+		}
+		lab->fullmac_wdev.wiphy = lab->fullmac_wiphy;
+		lab->fullmac_wdev.iftype = NL80211_IFTYPE_STATION;
+		lab->fullmac_wdev.netdev = ndev;
+		ndev->ieee80211_ptr = &lab->fullmac_wdev;
+	}
 	ret = register_netdev(ndev);
 	if (ret) {
+		if (lab->fullmac_wiphy) {
+			wiphy_unregister(lab->fullmac_wiphy);
+			wiphy_free(lab->fullmac_wiphy);
+			lab->fullmac_wiphy = NULL;
+		}
 		free_netdev(ndev);
 		return ret;
 	}
 	lab->fullmac_ndev = ndev;
 	return 0;
+}
+
+static int mt7932_mcu_lab_enable_internal_scan_vif(
+	struct mt7932_mcu_lab *lab)
+{
+	struct wireless_dev *wdev;
+	int ret;
+
+	lab->fullmac_vif = NULL;
+	ieee80211_iterate_interfaces(mt76_hw(lab->dev),
+				     IEEE80211_IFACE_ITER_NORMAL,
+				     mt7932_mcu_lab_select_vif, lab);
+	if (!lab->fullmac_vif)
+		return -ENODEV;
+	wdev = ieee80211_vif_to_wdev(lab->fullmac_vif);
+	if (!wdev || !wdev->netdev)
+		return -ENODEV;
+	rtnl_lock();
+	ret = dev_open(wdev->netdev, NULL);
+	rtnl_unlock();
+	if (!ret)
+		dev_info(lab->dev->mt76.dev,
+			 "J700_MT7932_CFG80211_INTERNAL_SCAN_VIF_READY: source=mac80211 state=up ownership=driver-internal\n");
+
+	return ret;
 }
 
 static int mt7932_mcu_lab_prepare_fullmac_data_path(
@@ -209,9 +558,8 @@ static int mt7932_mcu_lab_prepare_fullmac_data_path(
 	int i;
 
 	lab->fullmac_vif = NULL;
-	ieee80211_iterate_active_interfaces_atomic(
-		mt76_hw(dev), IEEE80211_IFACE_ITER_NORMAL,
-		mt7932_mcu_lab_select_vif, lab);
+	ieee80211_iterate_interfaces(mt76_hw(dev), IEEE80211_IFACE_ITER_NORMAL,
+				     mt7932_mcu_lab_select_vif, lab);
 	if (!lab->fullmac_vif || !lab->fullmac_ndev)
 		return -ENODEV;
 
@@ -267,6 +615,8 @@ static void mt7932_mcu_lab_release_fullmac_resources(
 	if (!lab->fullmac_reserved_count)
 		return;
 	WRITE_ONCE(lab->fullmac_connected, false);
+	WRITE_ONCE(lab->fullmac_oper_band, 0);
+	WRITE_ONCE(lab->fullmac_oper_channel, 0);
 	if (lab->fullmac_ndev) {
 		netif_carrier_off(lab->fullmac_ndev);
 		netif_tx_disable(lab->fullmac_ndev);
@@ -364,6 +714,10 @@ module_param_named(j700_mcu_lab_runtime, mt7932_mcu_lab_runtime, bool, 0444);
 MODULE_PARM_DESC(j700_mcu_lab_runtime,
 		 "create the J700 typed MCU lab endpoint after normal hardware init");
 
+module_param_named(j700_fullmac_cfg80211, mt7932_fullmac_cfg80211, bool, 0444);
+MODULE_PARM_DESC(j700_fullmac_cfg80211,
+		 "register the experimental J700 cfg80211 fullmac station interface");
+
 bool mt7932_mcu_lab_conformance_active(void)
 {
 	return READ_ONCE(mt7932_mcu_lab_conformance);
@@ -377,6 +731,8 @@ static void mt7932_mcu_lab_release(struct kref *ref)
 	skb_queue_purge(&lab->records);
 	if (lab->fullmac_ndev)
 		free_netdev(lab->fullmac_ndev);
+	if (lab->fullmac_wiphy)
+		wiphy_free(lab->fullmac_wiphy);
 	kfree(lab->misc.name);
 	kfree(lab);
 }
@@ -1380,6 +1736,187 @@ static int mt7932_mcu_lab_fullmac_assoc_power(
 	return mt7932_mcu_load_assoc_power(lab->dev, command);
 }
 
+static struct mt7932_mcu_lab *mt7932_fullmac_wiphy_lab(struct wiphy *wiphy)
+{
+	return *(struct mt7932_mcu_lab **)wiphy_priv(wiphy);
+}
+
+static struct cfg80211_bss *
+mt7932_fullmac_cfg_seed_bss(struct wiphy *wiphy,
+			   struct ieee80211_channel *channel,
+			   const u8 *bssid, const u8 *ssid, size_t ssid_len)
+{
+	u8 ie[2 + IEEE80211_MAX_SSID_LEN] = {
+		WLAN_EID_SSID, ssid_len,
+	};
+
+	memcpy(ie + 2, ssid, ssid_len);
+	return cfg80211_inform_bss(
+		wiphy, channel, CFG80211_BSS_FTYPE_UNKNOWN, bssid, 0,
+		WLAN_CAPABILITY_ESS | WLAN_CAPABILITY_PRIVACY,
+		100, ie, 2 + ssid_len, 0, GFP_KERNEL);
+}
+
+static int mt7932_fullmac_cfg_attempt(struct mt7932_mcu_lab *lab,
+				      struct neo_wifid_fullmac_connect *request,
+				      unsigned int attempt)
+{
+	u32 command = 0, sequence = 0;
+	unsigned long timeout;
+	int ret;
+
+	reinit_completion(&lab->fullmac_assoc_started);
+	reinit_completion(&lab->fullmac_cfg_connect_done);
+	WRITE_ONCE(lab->fullmac_cfg_connect_status, 0xffff);
+	mutex_lock(&lab->operation_lock);
+	ret = mt7932_mcu_lab_fullmac_connect(
+		lab, request, sizeof(*request), &command);
+	mutex_unlock(&lab->operation_lock);
+	if (ret)
+		return ret;
+	timeout = wait_for_completion_timeout(
+		&lab->fullmac_assoc_started, msecs_to_jiffies(5000));
+	if (!timeout)
+		return -ETIMEDOUT;
+
+	reinit_completion(&lab->fullmac_cfg_cal_done);
+	WRITE_ONCE(lab->fullmac_cfg_cal_cookie, 0x4e430000 | attempt);
+	mutex_lock(&lab->operation_lock);
+	ret = mt7932_mcu_lab_fullmac_assoc_cal(
+		lab, lab->fullmac_cfg_cal_cookie, &command, &sequence);
+	mutex_unlock(&lab->operation_lock);
+	if (ret)
+		return ret;
+	timeout = wait_for_completion_timeout(
+		&lab->fullmac_cfg_cal_done, msecs_to_jiffies(5000));
+	if (!timeout)
+		return -ETIMEDOUT;
+
+	mutex_lock(&lab->operation_lock);
+	ret = mt7932_mcu_lab_fullmac_queue_bind(lab, &command);
+	if (!ret)
+		ret = mt7932_mcu_lab_fullmac_assoc_power(lab, &command);
+	mutex_unlock(&lab->operation_lock);
+	if (ret)
+		return ret;
+
+	timeout = wait_for_completion_timeout(
+		&lab->fullmac_cfg_connect_done,
+		msecs_to_jiffies(attempt ? 10000 : 3000));
+	if (!timeout)
+		return -ETIMEDOUT;
+	return READ_ONCE(lab->fullmac_cfg_connect_status) ? -EREMOTEIO : 0;
+}
+
+static void mt7932_fullmac_cfg_connect_work(struct work_struct *work)
+{
+	struct mt7932_mcu_lab *lab = container_of(
+		work, struct mt7932_mcu_lab, fullmac_connect_work);
+	struct neo_wifid_fullmac_connect request = lab->fullmac_cfg_request;
+	struct cfg80211_connect_resp_params response = {};
+	struct cfg80211_bss *bss = NULL;
+	enum nl80211_band band;
+	struct ieee80211_channel *channel;
+	unsigned int attempt;
+	int frequency, ret = -EINVAL;
+
+	for (attempt = 0; attempt < 2; attempt++) {
+		ret = mt7932_fullmac_cfg_attempt(lab, &request, attempt);
+		if (!ret)
+			break;
+	}
+	WRITE_ONCE(lab->fullmac_cfg_connecting, false);
+	band = request.band == 1 ? NL80211_BAND_2GHZ :
+	       request.band == 2 ? NL80211_BAND_5GHZ : NL80211_BAND_6GHZ;
+	frequency = ieee80211_channel_to_frequency(request.channel, band);
+	channel = ieee80211_get_channel(lab->fullmac_wiphy, frequency);
+	if (channel)
+		bss = mt7932_fullmac_cfg_seed_bss(lab->fullmac_wiphy, channel,
+						 request.bssid, request.ssid,
+						 request.ssid_len);
+	response.status = ret ? WLAN_STATUS_UNSPECIFIED_FAILURE :
+				WLAN_STATUS_SUCCESS;
+	response.links[0].bssid = request.bssid;
+	response.links[0].bss = bss;
+	cfg80211_connect_done(lab->fullmac_ndev, &response, GFP_KERNEL);
+	if (!ret) {
+		WRITE_ONCE(lab->fullmac_oper_band, request.band);
+		WRITE_ONCE(lab->fullmac_oper_channel, request.channel);
+		cfg80211_port_authorized(lab->fullmac_ndev, request.bssid,
+					 NULL, 0, GFP_KERNEL);
+		dev_info(lab->dev->mt76.dev,
+			 "J700_MT7932_CFG80211_CONNECT_PASS: security=owe attempts=%u port=firmware-authorized identity=redacted\n",
+			 attempt + 1);
+	}
+	memzero_explicit(&request, sizeof(request));
+	memzero_explicit(&lab->fullmac_cfg_request,
+			 sizeof(lab->fullmac_cfg_request));
+}
+
+static int mt7932_fullmac_cfg_connect(struct wiphy *wiphy,
+				      struct net_device *ndev,
+				      struct cfg80211_connect_params *params)
+{
+	struct mt7932_mcu_lab *lab = mt7932_fullmac_wiphy_lab(wiphy);
+	struct ieee80211_channel *channel = params->channel ?: params->channel_hint;
+	const u8 *bssid = params->bssid ?: params->bssid_hint;
+	struct neo_wifid_fullmac_connect request = {};
+	int ret = 0;
+
+	if (!lab || ndev != lab->fullmac_ndev || !channel || !bssid ||
+	    !params->ssid || !params->ssid_len ||
+	    params->ssid_len > sizeof(request.ssid) ||
+	    params->crypto.n_akm_suites != 1 ||
+	    params->crypto.akm_suites[0] != WLAN_AKM_SUITE_OWE)
+		return -EINVAL;
+
+	request.ssid_len = params->ssid_len;
+	request.band = channel->band == NL80211_BAND_2GHZ ? 1 :
+		       channel->band == NL80211_BAND_5GHZ ? 2 : 3;
+	request.channel = ieee80211_frequency_to_channel(channel->center_freq);
+	request.security = NEO_WIFID_FULLMAC_SECURITY_OWE;
+	memcpy(request.bssid, bssid, ETH_ALEN);
+	memcpy(request.ssid, params->ssid, params->ssid_len);
+
+	mutex_lock(&lab->operation_lock);
+	if (lab->fullmac_cfg_connecting || lab->dead) {
+		ret = -EBUSY;
+	} else {
+		lab->fullmac_cfg_request = request;
+		WRITE_ONCE(lab->fullmac_cfg_connecting, true);
+	}
+	mutex_unlock(&lab->operation_lock);
+	memzero_explicit(&request, sizeof(request));
+	if (ret)
+		return ret;
+	if (!schedule_work(&lab->fullmac_connect_work)) {
+		WRITE_ONCE(lab->fullmac_cfg_connecting, false);
+		memzero_explicit(&lab->fullmac_cfg_request,
+				 sizeof(lab->fullmac_cfg_request));
+		return -EBUSY;
+	}
+
+	return 0;
+}
+
+static int mt7932_fullmac_cfg_disconnect(struct wiphy *wiphy,
+					 struct net_device *ndev,
+					 u16 reason_code)
+{
+	struct mt7932_mcu_lab *lab = mt7932_fullmac_wiphy_lab(wiphy);
+	int ret;
+
+	if (!lab || ndev != lab->fullmac_ndev)
+		return -ENODEV;
+	mutex_lock(&lab->operation_lock);
+	ret = mt7932_mcu_lab_disconnect_fullmac(lab, NULL);
+	mutex_unlock(&lab->operation_lock);
+	if (!ret)
+		cfg80211_disconnected(ndev, reason_code, NULL, 0, true,
+				      GFP_KERNEL);
+	return ret;
+}
+
 static ssize_t mt7932_mcu_lab_write(struct file *file, const char __user *buf,
 				    size_t count, loff_t *ppos)
 {
@@ -1646,7 +2183,8 @@ static const struct file_operations mt7932_mcu_lab_fops = {
 };
 
 static int mt7932_mcu_lab_create(struct mt792x_dev *dev,
-				 struct mt7932_mcu_lab **result)
+				 struct mt7932_mcu_lab **result,
+				 bool register_misc)
 {
 	struct mt7932_mcu_lab *lab;
 	int ret;
@@ -1663,26 +2201,36 @@ static int mt7932_mcu_lab_create(struct mt792x_dev *dev,
 	init_completion(&lab->connected);
 	init_completion(&lab->continued);
 	init_completion(&lab->disconnected);
+	init_completion(&lab->fullmac_assoc_started);
+	init_completion(&lab->fullmac_cfg_connect_done);
+	init_completion(&lab->fullmac_cfg_cal_done);
+	init_completion(&lab->fullmac_hw_scan_done);
+	INIT_WORK(&lab->fullmac_connect_work, mt7932_fullmac_cfg_connect_work);
+	INIT_WORK(&lab->fullmac_scan_work, mt7932_fullmac_cfg_scan_work);
 	atomic_set(&lab->opened, 0);
 	atomic_set(&lab->dropped_events, 0);
+	atomic_set(&lab->fullmac_scan_bss_count, 0);
 	lab->phase = NEO_WIFID_PHASE_CHECKPOINT;
-	lab->misc.minor = MISC_DYNAMIC_MINOR;
-	lab->misc.name = kasprintf(GFP_KERNEL, "neo-wifi-mcu-%s",
-				   dev_name(dev->mt76.dev));
-	if (!lab->misc.name) {
-		ret = -ENOMEM;
-		goto free;
-	}
-	lab->misc.fops = &mt7932_mcu_lab_fops;
-	lab->misc.parent = dev->mt76.dev;
-	lab->misc.mode = 0600;
 	ret = xa_insert(&mt7932_mcu_labs, (unsigned long)dev, lab,
 			GFP_KERNEL);
 	if (ret)
 		goto free;
-	ret = misc_register(&lab->misc);
-	if (ret)
-		goto erase;
+	if (register_misc) {
+		lab->misc.minor = MISC_DYNAMIC_MINOR;
+		lab->misc.name = kasprintf(GFP_KERNEL, "neo-wifi-mcu-%s",
+					   dev_name(dev->mt76.dev));
+		if (!lab->misc.name) {
+			ret = -ENOMEM;
+			goto erase;
+		}
+		lab->misc.fops = &mt7932_mcu_lab_fops;
+		lab->misc.parent = dev->mt76.dev;
+		lab->misc.mode = 0600;
+		ret = misc_register(&lab->misc);
+		if (ret)
+			goto erase;
+		lab->misc_registered = true;
+	}
 	*result = lab;
 
 	return 0;
@@ -1707,7 +2255,7 @@ int mt7932_mcu_lab_checkpoint(struct mt792x_dev *dev)
 		return -ENODEV;
 	lab = mt7932_mcu_lab_get(dev);
 	if (!lab) {
-		ret = mt7932_mcu_lab_create(dev, &lab);
+		ret = mt7932_mcu_lab_create(dev, &lab, true);
 		if (ret)
 			return ret;
 		/* create returned the registry/base reference; take a local one. */
@@ -1764,7 +2312,7 @@ int mt7932_mcu_lab_runtime_create(struct mt792x_dev *dev)
 	struct mt7932_mcu_lab *lab;
 	int ret;
 
-	if (!mt7932_mcu_lab_runtime)
+	if (!mt7932_mcu_lab_runtime && !mt7932_fullmac_cfg80211)
 		return 0;
 	if (!is_mt7932(&dev->mt76) || !dev->hw_init_done)
 		return -ENODEV;
@@ -1773,7 +2321,8 @@ int mt7932_mcu_lab_runtime_create(struct mt792x_dev *dev)
 
 	lab = mt7932_mcu_lab_get(dev);
 	if (!lab) {
-		ret = mt7932_mcu_lab_create(dev, &lab);
+		ret = mt7932_mcu_lab_create(
+			dev, &lab, mt7932_mcu_lab_runtime);
 		if (ret)
 			return ret;
 		kref_get(&lab->ref);
@@ -1791,10 +2340,12 @@ int mt7932_mcu_lab_runtime_create(struct mt792x_dev *dev)
 	mutex_unlock(&lab->operation_lock);
 	if (!ret)
 		ret = mt7932_mcu_lab_register_fullmac_netdev(lab);
+	if (!ret && mt7932_fullmac_cfg80211)
+		ret = mt7932_mcu_lab_enable_internal_scan_vif(lab);
 	if (!ret)
 		dev_info(dev->mt76.dev,
-			 "J700_MT7932_MCU_LAB_RUNTIME_PASS: phase=continued netdev=%s credentials=never-logged\n",
-			 lab->fullmac_ndev->name);
+			 "J700_MT7932_MCU_LAB_RUNTIME_PASS: phase=continued netdev=%s cfg80211=%u credentials=never-logged\n",
+			 lab->fullmac_ndev->name, mt7932_fullmac_cfg80211);
 	mt7932_mcu_lab_put(lab);
 
 	return ret;
@@ -1803,14 +2354,35 @@ int mt7932_mcu_lab_runtime_create(struct mt792x_dev *dev)
 void mt7932_mcu_lab_destroy(struct mt792x_dev *dev)
 {
 	struct mt7932_mcu_lab *lab;
+	bool scan_owned;
 
 	lab = xa_erase(&mt7932_mcu_labs, (unsigned long)dev);
 	if (!lab)
 		return;
 	synchronize_rcu();
-	misc_deregister(&lab->misc);
+	/* unregister_netdev() runs ndo_stop before cfg80211's NETDEV_DOWN
+	 * notifier retires its scan request.  ndo_stop synchronously removes our
+	 * copy and drains the worker, so destroy must never report scan_done()
+	 * against a request cfg80211 may already have freed.
+	 */
 	if (lab->fullmac_ndev)
 		unregister_netdev(lab->fullmac_ndev);
+	xchg(&lab->fullmac_scan_request, NULL);
+	scan_owned = xchg(&lab->fullmac_hw_scan_owned, false);
+	WRITE_ONCE(lab->fullmac_hw_scan_observing, false);
+	WRITE_ONCE(lab->fullmac_hw_scan_aborted, true);
+	if (scan_owned && lab->fullmac_vif)
+		mt7932_fullmac_scan_cancel(lab);
+	complete_all(&lab->fullmac_hw_scan_done);
+	complete_all(&lab->fullmac_assoc_started);
+	complete_all(&lab->fullmac_cfg_cal_done);
+	complete_all(&lab->fullmac_cfg_connect_done);
+	cancel_work_sync(&lab->fullmac_connect_work);
+	cancel_work_sync(&lab->fullmac_scan_work);
+	if (lab->misc_registered)
+		misc_deregister(&lab->misc);
+	if (lab->fullmac_wiphy)
+		wiphy_unregister(lab->fullmac_wiphy);
 	mutex_lock(&lab->operation_lock);
 	mt7932_mcu_lab_abort_epoch(lab, "neo-wifid-destroy");
 	mt7932_mcu_lab_release_fullmac_resources(lab);
@@ -1822,6 +2394,25 @@ void mt7932_mcu_lab_destroy(struct mt792x_dev *dev)
 	mt7932_mcu_lab_put(lab);
 }
 EXPORT_SYMBOL_GPL(mt7932_mcu_lab_destroy);
+
+bool mt7932_mcu_lab_scan_done(struct mt792x_dev *dev, bool aborted)
+{
+	struct mt7932_mcu_lab *lab;
+	bool owned;
+
+	lab = mt7932_mcu_lab_get(dev);
+	if (!lab)
+		return false;
+	owned = READ_ONCE(lab->fullmac_hw_scan_owned);
+	if (owned) {
+		WRITE_ONCE(lab->fullmac_hw_scan_aborted, aborted);
+		WRITE_ONCE(lab->fullmac_hw_scan_owned, false);
+		complete(&lab->fullmac_hw_scan_done);
+	}
+	mt7932_mcu_lab_put(lab);
+
+	return owned;
+}
 
 bool mt7932_mcu_lab_rx(struct mt792x_dev *dev, struct sk_buff *skb)
 {
@@ -1866,6 +2457,8 @@ bool mt7932_mcu_lab_rx(struct mt792x_dev *dev, struct sk_buff *skb)
 				 "J700_MT7932_FULLMAC_ASSOC_CAL_SNAPSHOT: valid=%u band=%u primary=%u cbw=%u extension=%u source=selector0x4d\n",
 				 valid, band, body[0x11],
 				 body[0x10], body[0x13]);
+			if (READ_ONCE(lab->fullmac_cfg_connecting))
+				complete(&lab->fullmac_assoc_started);
 		}
 		if (subevent == 0x40 && body_len >= 0x34) {
 			struct mt792x_link_sta *mlink = &lab->fullmac_sta.deflink;
@@ -1977,6 +2570,10 @@ bool mt7932_mcu_lab_rx(struct mt792x_dev *dev, struct sk_buff *skb)
 				netif_carrier_off(lab->fullmac_ndev);
 				netif_tx_disable(lab->fullmac_ndev);
 			}
+			if (READ_ONCE(lab->fullmac_cfg_connecting)) {
+				WRITE_ONCE(lab->fullmac_cfg_connect_status, status);
+				complete(&lab->fullmac_cfg_connect_done);
+			}
 		}
 
 		if (status == 0xffff)
@@ -2010,6 +2607,9 @@ bool mt7932_mcu_lab_rx(struct mt792x_dev *dev, struct sk_buff *skb)
 	if (matched) {
 		struct sk_buff *record;
 
+		if (pending.cookie == READ_ONCE(lab->fullmac_cfg_cal_cookie))
+			complete(&lab->fullmac_cfg_cal_done);
+
 		record = mt7932_mcu_lab_record_alloc(
 			NEO_WIFID_RECORD_RESPONSE, pending.cookie, 0, 0,
 			sequence, skb->data, skb->len, GFP_ATOMIC);
@@ -2040,11 +2640,36 @@ bool mt7932_mcu_lab_fullmac_rx(struct mt792x_dev *dev, struct sk_buff *skb)
 	unsigned int len;
 	bool consumed = false;
 
-	if (!(status->flag & RX_FLAG_8023))
-		return false;
 	lab = mt7932_mcu_lab_get(dev);
 	if (!lab)
 		return false;
+	if (!(status->flag & RX_FLAG_8023)) {
+		struct ieee80211_mgmt *mgmt = (void *)skb->data;
+		struct ieee80211_channel *channel;
+		struct cfg80211_bss *bss;
+
+		if ((!READ_ONCE(lab->fullmac_hw_scan_owned) &&
+		     !READ_ONCE(lab->fullmac_hw_scan_observing)) ||
+		    !lab->fullmac_wiphy ||
+		    unlikely(skb->len < offsetof(struct ieee80211_mgmt,
+						 u.probe_resp.variable)) ||
+		    (!ieee80211_is_beacon(mgmt->frame_control) &&
+		     !ieee80211_is_probe_resp(mgmt->frame_control)))
+			goto out;
+		channel = ieee80211_get_channel(lab->fullmac_wiphy,
+					      status->freq);
+		if (!channel)
+			goto out;
+		bss = cfg80211_inform_bss_frame(lab->fullmac_wiphy, channel,
+						 mgmt, skb->len,
+						 status->signal * 100,
+						 GFP_ATOMIC);
+		if (bss) {
+			cfg80211_put_bss(lab->fullmac_wiphy, bss);
+			atomic_inc(&lab->fullmac_scan_bss_count);
+		}
+		goto out;
+	}
 	ndev = READ_ONCE(lab->fullmac_ndev);
 	if (!READ_ONCE(lab->fullmac_connected) || !ndev ||
 	    unlikely(!pskb_may_pull(skb, ETH_HLEN)))

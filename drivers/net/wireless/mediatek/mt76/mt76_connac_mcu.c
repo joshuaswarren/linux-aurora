@@ -2645,6 +2645,7 @@ int mt76_connac_mcu_hw_scan(struct mt76_phy *phy, struct ieee80211_vif *vif,
 	int req_len = sizeof(*req);
 	bool mt7932 = mt76_chip(mdev) == 0x7932;
 	bool mt7932_only_6ghz = false;
+	bool mt7932_directed_ssid = false;
 
 	if (mt7932 && sreq->n_channels) {
 		mt7932_only_6ghz = true;
@@ -2654,6 +2655,12 @@ int mt76_connac_mcu_hw_scan(struct mt76_phy *phy, struct ieee80211_vif *vif,
 				break;
 			}
 	}
+	if (mt7932)
+		for (i = 0; i < sreq->n_ssids; i++)
+			if (sreq->ssids[i].ssid_len) {
+				mt7932_directed_ssid = true;
+				break;
+			}
 
 	/* The sealed 25G83 TX17 capture is post-conversion device-visible traffic:
 	 * Apple places the complete 0x4d4-byte CMD_SCAN_REQ_V2 on TX17 as legacy
@@ -2782,13 +2789,15 @@ generic_scan:
 	 * the proven parser ABI while the scan-only userspace gate still exits
 	 * before association.
 	 */
-	/* A standalone 6 GHz PSC scan without RNR targets is passive.  Active
-	 * 6 GHz follow-up is valid only when cfg80211 supplied directed RNR
-	 * parameters.  Keep the hardware-proven active wildcard behavior for
-	 * ordinary 2.4/5 GHz scans.
+	/* A standalone 6 GHz PSC wildcard scan without RNR targets is passive.
+	 * A populated SSID is itself a directed request and uses the measured
+	 * active AIS selector; it must not be downgraded to a contradictory
+	 * passive request merely because cfg80211 supplied no RNR list.  Keep the
+	 * hardware-proven active wildcard behavior for ordinary 2.4/5 GHz scans.
 	 */
 	req->scan_type = mt7932 ?
-		(mt7932_only_6ghz && !sreq->n_6ghz_params ? 0 : 1) :
+		(mt7932_only_6ghz && !mt7932_directed_ssid &&
+		 !sreq->n_6ghz_params ? 0 : 1) :
 		(sreq->n_ssids ? 1 : 0);
 	/* 25G83's ordinary active-wildcard AIS request leaves both the probe
 	 * count and firmware timeout zero, selecting the MT7932 firmware defaults.
@@ -2811,7 +2820,8 @@ generic_scan:
 	 * bit 3 with one populated SSID.  The public generic bit-2 selector
 	 * does not find the requested BSS on this firmware.
 	 */
-	req->ssid_type = mt7932_only_6ghz && !sreq->n_6ghz_params ? 0 :
+	req->ssid_type = mt7932_only_6ghz && !mt7932_directed_ssid &&
+			 !sreq->n_6ghz_params ? 0 :
 			 mt7932 && n_ssids ? BIT(3) :
 			 n_ssids ? BIT(2) : BIT(0);
 	if (!mt7932)
