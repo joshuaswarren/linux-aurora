@@ -48,5 +48,10 @@ Keep this list short and evidence-only. A build is not a hardware checkpoint.
 
 ## Next experiment
 
-- Decode and expose the state/guards immediately preceding the `0x14ed8` call
-  to `0x162f8`, then compare those scheduler inputs with a working Metal trace.
+- Cold Pool-A record 1 is now the kernel default and was verified on hardware:
+  submit-ready 3D `+0x20` changed from Pool-A `+0x000` to `+0x100`, matching
+  three native capture corpora. TA still completes, while `+0x20f0` and both
+  3D timestamps remain zero, so this real mismatch was not sufficient.
+- Enable the firmware KTrace class-0 drain and identify the scheduler callback
+  state/guard before the `0x14ed8` call to `0x162f8`. Keep descriptor, SKSM,
+  QoS, completion-ring, recovery, and broad dockchannel dumps enabled.
