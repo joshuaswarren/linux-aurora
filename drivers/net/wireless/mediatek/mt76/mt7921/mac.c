@@ -17,6 +17,11 @@
 
 #define MT_WTBL_AC0_CTT_OFFSET		20
 
+static bool mt7932_native_rx_trace;
+module_param_named(j700_native_rx_trace, mt7932_native_rx_trace, bool, 0600);
+MODULE_PARM_DESC(j700_native_rx_trace,
+		 "trace J700 native RX3 descriptors and parser results");
+
 bool mt7921_mac_wtbl_update(struct mt792x_dev *dev, int idx, u32 mask)
 {
 	mt76_rmw(dev, MT_WTBL_UPDATE, MT_WTBL_UPDATE_WLAN_IDX,
@@ -471,8 +476,14 @@ void mt7921_mac_add_txs(struct mt792x_dev *dev, void *data)
 	pid = le32_get_bits(txs_data[3], MT_TXS3_PID);
 	if (is_mt7932(&dev->mt76) && wcidx == 1)
 		dev_info(dev->mt76.dev,
-			 "J700_MT7932_AUTH_TX_STATUS: wcid=%u pid=%u txs=%08x/%08x/%08x/%08x/%08x/%08x/%08x/%08x\n",
-			 wcidx, pid, le32_to_cpu(txs_data[0]),
+			 "J700_MT7932_AUTH_TX_STATUS: wcid=%u pid=%u ack_timeout=%u rts_timeout=%u queue_timeout=%u txop_timeout=%u ba_error=%u txs=%08x/%08x/%08x/%08x/%08x/%08x/%08x/%08x\n",
+			 wcidx, pid,
+			 !!(le32_to_cpu(txs_data[0]) & MT_TXS0_ACK_TIMEOUT),
+			 !!(le32_to_cpu(txs_data[0]) & MT_TXS0_RTS_TIMEOUT),
+			 !!(le32_to_cpu(txs_data[0]) & MT_TXS0_QUEUE_TIMEOUT),
+			 !!(le32_to_cpu(txs_data[0]) & MT_TXS0_TXOP_TIMEOUT),
+			 !!(le32_to_cpu(txs_data[0]) & MT_TXS0_BA_ERROR),
+			 le32_to_cpu(txs_data[0]),
 			 le32_to_cpu(txs_data[1]), le32_to_cpu(txs_data[2]),
 			 le32_to_cpu(txs_data[3]), le32_to_cpu(txs_data[4]),
 			 le32_to_cpu(txs_data[5]), le32_to_cpu(txs_data[6]),
@@ -719,6 +730,7 @@ void mt7921_queue_rx_skb(struct mt76_dev *mdev, enum mt76_rxq_id q,
 	__le32 *end = (__le32 *)&skb->data[skb->len];
 	enum rx_pkt_type type;
 	u16 flag;
+	int ret;
 
 	type = le32_get_bits(rxd[0], MT_RXD0_PKT_TYPE);
 	flag = le32_get_bits(rxd[0], MT_RXD0_PKT_FLAG);
@@ -733,6 +745,17 @@ void mt7921_queue_rx_skb(struct mt76_dev *mdev, enum mt76_rxq_id q,
 		dev_info_ratelimited(mdev->dev,
 				 "J700_MT7932_AUX_RX_INGRESS: q=%u type=%u flag=0x%x len=%u\n",
 				 q, type, flag, skb->len);
+	if (is_mt7932(mdev) && mt7932_native_rx_trace &&
+	    (q == MT_RXQ_BAND1 || q == MT_RXQ_BAND2) &&
+	    skb->len >= 8 * sizeof(*rxd) &&
+	    (type == PKT_TYPE_NORMAL || type == PKT_TYPE_NORMAL_MCU))
+		dev_info(mdev->dev,
+			 "J700_MT7932_NATIVE_RX_DESCRIPTOR: q=%u type=%u flag=0x%x len=%u dw=%08x/%08x/%08x/%08x/%08x/%08x/%08x/%08x\n",
+			 q, type, flag, skb->len,
+			 le32_to_cpu(rxd[0]), le32_to_cpu(rxd[1]),
+			 le32_to_cpu(rxd[2]), le32_to_cpu(rxd[3]),
+			 le32_to_cpu(rxd[4]), le32_to_cpu(rxd[5]),
+			 le32_to_cpu(rxd[6]), le32_to_cpu(rxd[7]));
 
 	if (type == PKT_TYPE_RX_EVENT && flag == 0x1)
 		type = PKT_TYPE_NORMAL_MCU;
@@ -777,12 +800,18 @@ void mt7921_queue_rx_skb(struct mt76_dev *mdev, enum mt76_rxq_id q,
 		break;
 	case PKT_TYPE_NORMAL_MCU:
 	case PKT_TYPE_NORMAL:
-		if (!mt7921_mac_fill_rx(dev, skb)) {
+		ret = mt7921_mac_fill_rx(dev, skb);
+		if (!ret) {
 			if (mt7932_mcu_lab_fullmac_rx(dev, skb))
 				return;
 			mt76_rx(&dev->mt76, q, skb);
 			return;
 		}
+		if (is_mt7932(mdev) && mt7932_native_rx_trace &&
+		    (q == MT_RXQ_BAND1 || q == MT_RXQ_BAND2))
+			dev_info(mdev->dev,
+				 "J700_MT7932_NATIVE_RX_DROP: q=%u parser_ret=%d type=%u flag=0x%x len=%u\n",
+				 q, ret, type, flag, skb->len);
 		fallthrough;
 	default:
 		dev_kfree_skb(skb);
