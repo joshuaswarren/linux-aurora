@@ -21,6 +21,8 @@ enum neo_wifid_opcode {
 	NEO_WIFID_OP_RUNTIME_EPOCH = 5,
 	NEO_WIFID_OP_CONTINUE = 6,
 	NEO_WIFID_OP_FULLMAC_CONNECT = 7,
+	NEO_WIFID_OP_FULLMAC_QUEUE_BIND = 8,
+	NEO_WIFID_OP_FULLMAC_ASSOC_CAL = 9,
 };
 
 enum neo_wifid_transport {
@@ -35,11 +37,13 @@ enum neo_wifid_request_flag {
 	NEO_WIFID_F_WIRE_ACK = BIT(1),
 	NEO_WIFID_F_WAIT_RESPONSE = BIT(2),
 	NEO_WIFID_F_DRAIN_TX = BIT(3),
+	NEO_WIFID_F_WAIT_EVENT = BIT(4),
 };
 
 #define NEO_WIFID_REQUEST_FLAGS \
 	(NEO_WIFID_F_QUERY | NEO_WIFID_F_WIRE_ACK | \
-	 NEO_WIFID_F_WAIT_RESPONSE | NEO_WIFID_F_DRAIN_TX)
+	 NEO_WIFID_F_WAIT_RESPONSE | NEO_WIFID_F_DRAIN_TX | \
+	 NEO_WIFID_F_WAIT_EVENT)
 
 enum neo_wifid_record_type {
 	NEO_WIFID_RECORD_SUBMIT = 1,
@@ -108,6 +112,11 @@ struct neo_wifid_state {
 #define NEO_WIFID_FULLMAC_STA_IDS	2
 #define NEO_WIFID_FULLMAC_WTBL_IDS	4
 
+enum neo_wifid_fullmac_security {
+	NEO_WIFID_FULLMAC_SECURITY_WPA2_PSK = 1,
+	NEO_WIFID_FULLMAC_SECURITY_WPA3_SAE = 2,
+};
+
 /* Typed, credential-bearing lab request.  It is accepted only by the
  * CAP_SYS_RAWIO checkpoint endpoint, is never returned in a record and is
  * released with kfree_sensitive().
@@ -118,7 +127,9 @@ struct neo_wifid_fullmac_connect {
 	u8 pmk_len;
 	u8 band;
 	u8 channel;
-	u8 reserved0[3];
+	u8 security;
+	u8 pre_assoc_cbw;
+	u8 pre_assoc_extension;
 	u8 bssid[ETH_ALEN];
 	u8 reserved1[2];
 	u8 ssid[NEO_WIFID_FULLMAC_SSID_MAX];
@@ -131,11 +142,16 @@ struct mt7932_fullmac_connect_params {
 	const u8 *key;
 	const u8 *pmk;
 	const u8 *bssid;
+	const u8 *vif_mac;
 	u8 ssid_len;
 	u8 key_len;
 	u8 pmk_len;
 	u8 band;
 	u8 channel;
+	u8 security;
+	u16 listen_interval;
+	u8 ext_report_info;
+	u8 bss_idx;
 	u8 sta_ids[NEO_WIFID_FULLMAC_STA_IDS];
 	u8 wtbl_ids[NEO_WIFID_FULLMAC_WTBL_IDS];
 };
@@ -145,11 +161,14 @@ int mt7932_mcu_fullmac_connect(
 	struct mt792x_dev *dev,
 	const struct mt7932_fullmac_connect_params *params,
 	u32 *command_out);
+int mt7932_mcu_fullmac_queue_bind(struct mt792x_dev *dev, u8 bss_idx,
+				  u8 sta_idx, u32 *command_out);
 #if IS_ENABLED(CONFIG_MT7921_J700_MCU_LAB)
 bool mt7932_mcu_lab_conformance_active(void);
 int mt7932_mcu_lab_checkpoint(struct mt792x_dev *dev);
 int mt7932_mcu_lab_runtime_create(struct mt792x_dev *dev);
 void mt7932_mcu_lab_destroy(struct mt792x_dev *dev);
+void mt7932_mcu_lab_reset_prepare(struct mt792x_dev *dev);
 bool mt7932_mcu_lab_rx(struct mt792x_dev *dev, struct sk_buff *skb);
 bool mt7932_mcu_lab_fullmac_rx(struct mt792x_dev *dev, struct sk_buff *skb);
 #else
