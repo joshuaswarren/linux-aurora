@@ -7,7 +7,7 @@
 //! the few operations that require that, mainly reading the MMU fault status, reading GPU ID
 //! information, and starting the GPU firmware coprocessor.
 
-use crate::{g17_submission, hw, identity};
+use crate::{g17_submission, hw, identity, module_parameters};
 use kernel::{
     c_str,
     device::Core,
@@ -44,6 +44,18 @@ const T8140_AXI_TRANSITION_0: usize = 0x1000104;
 const T8140_AXI_TRANSITION_1: usize = 0x1000108;
 /// Must be written 0 before ANY initdata is sent to either firmware
 /// instance (T8140 startup sequence step "write zero to SGX+0xd06030").
+/// AGX early-init "poke": read `sgx+0xd14000`, then write `0x70001`.
+///
+/// This is the generic Apple GPU bring-up poke the m1n1 AGX proxy performs in
+/// `AGX.poke_sgx()` before touching anything else, across generations. The
+/// driver has never done it, and on J700 the entire low `0x0..0x2ffff` GPU
+/// core register range (which holds the SKSM tag/data port at `0x4090` and the
+/// KSM queue registers at `0x21008`/`0x21068`) takes an asynchronous SError
+/// from the AP. The firmware reaches those same registers fine through its own
+/// mapping of PA `0x480000000`, so the range is real -- it is simply not
+/// enabled for host access.
+const T8140_SGX_EARLY_POKE: usize = 0xd14000;
+const T8140_SGX_EARLY_POKE_VALUE: u32 = 0x7_0001;
 const T8140_PRE_INITDATA_CLEAR: usize = 0xd06030;
 /// G17P Fender dynamic-gating control. The pinned host clears bits 1 and 2
 /// when it arms the firmware power callback; bit 2 set proves the callback is
@@ -51,9 +63,92 @@ const T8140_PRE_INITDATA_CLEAR: usize = 0xd06030;
 const T8140_FENDER_DYNAMIC_GATING: usize = 0xd06030;
 /// Host interrupt summary and enable/status words sampled by the native
 /// scheduler-active boundary audit.
+/// Offset of the native `accelerator+0x348` GPU register aperture within the
+/// single `sgx` resource Linux maps (PA `0x480000000`, 64 MiB).
+///
+/// Every register offset recovered from the mac17p kext (`0x4000`/`0x4008`
+/// tag/data port bases, `0x21068`/`0x21070` valid-mask registers, `0x21008`
+/// queue config) is relative to that aperture, so it is rebased through this
+/// one constant.
+///
+/// UNRESOLVED. `0` means "the aperture is the start of the sgx window", which
+/// is the literal reading of the kext but makes `sgx+0x4090` take an
+/// asynchronous SError on J700 because the whole `0x0..0x2ffff` range is
+/// undecoded from the AP. Two alternatives were measured and BOTH are decoded
+/// but inert -- writes are accepted and every readback stays `0x0`, so nothing
+/// is actually programmed:
+///   * `0xd00000` (second ADT sgx window, PA `0x480D00000`)
+///   * `0x2600000` (the `asc` window, PA `0x482600000`)
+/// Keep this at `0` until the true aperture is proven; a silent inert write is
+/// strictly worse than a loud fault.
+pub(crate) const T8140_GPU_REG_APERTURE_BASE: usize = 0;
+/// GPC performance state. macOS reads this as `getGPCPerformanceState`
+/// (`isGPUCorePowerEnabled` is `& 0xf` non-zero); it is a power register, not
+/// an interrupt summary, despite the historical name of its reader here.
 const T8140_HOST_IRQ_SUMMARY: usize = 0xe01000;
+/// GPC host-interrupt enable (`enableGPCHostInterrupts` in macOS).
 const T8140_HOST_IRQ_ENABLE: usize = 0xe01010;
 const T8140_HOST_IRQ_STATUS: usize = 0xe01014;
+/// GPC performance-state map used by the fragment register program.
+///
+/// `AGXAcceleratorG16::parsePerfStateMapRegs` maps the block at 0xe01400,
+/// reads the word at +0x80, and retains bits 19:16. The 3D channel copies that
+/// retained nibble into its command and `generate3DRegisterListG16Common`
+/// emits it as register 0x1c838. Capture values therefore vary with hardware
+/// state (3 and 7 have both been observed) and must not be inferred from render
+/// geometry or pinned to one trace.
+const T8140_GPC_PERF_STATE_MAP: usize = 0xe01480;
+/// Earlier word in the same native performance-map snapshot. The 3D submit
+/// path retains bit 0 and writes it to descriptor tail +0x2104.
+const T8140_GPC_PERF_STATE_CONTROL: usize = 0xe0141c;
+
+// G17P scheduler/USC engine-state diagnostics copied from the B1 firmware's
+// own fault and explicit USC-state dump paths. The service and debug-status
+// words are banked: B1 writes the USC pipe index to the corresponding selector
+// before reading all three data-master views.
+const T8140_KSM_ACTIVE_QUEUE_MASK: usize = 0xc120;
+const T8140_KSM_ACTIVE_QUEUE_STATE: usize = 0xc128;
+const T8140_KSM_FAULT_MASK_0: usize = 0xc0b0;
+const T8140_KSM_FAULT_MASK_1: usize = 0xc0c8;
+const T8140_KSM_FAULT_MASK_2: usize = 0xc0d8;
+const T8140_KSM_DM_MASK_0: usize = 0xc160;
+const T8140_KSM_DM_MASK_1: usize = 0xc168;
+const T8140_KSM_DM_MASK_2: usize = 0xc170;
+// Host reads of the KSM's 0x2_xxxx register namespace use the native
+// bit-42 read tag. All of these words are 64-bit in B1: the firmware uses
+// `ldr/str xN` for the pause and stop paths, and tests bits in the status and
+// work-channel producer words as 64-bit values.
+const T8140_KSM_QUEUE_STOPPED_MASK_LO: u64 = 0x21058;
+const T8140_KSM_QUEUE_STOPPED_MASK_HI: u64 = 0x21060;
+const T8140_KSM_QUEUE_STOP_REQUEST_LO: u64 = 0x210a8;
+const T8140_KSM_QUEUE_STOP_REQUEST_HI: u64 = 0x210b0;
+const T8140_KSM_WORK_CHANNEL_0: u64 = 0x21168;
+const T8140_KSM_WORK_CHANNEL_1: u64 = 0x21170;
+const T8140_KSM_WORK_CHANNEL_2: u64 = 0x21178;
+const T8140_KSM_WORK_CHANNEL_3: u64 = 0x21180;
+const T8140_KSM_SCHEDULING_PAUSE_REQUEST: u64 = 0x211c8;
+const T8140_KSM_SCHEDULING_PAUSE_STATUS: u64 = 0x211d0;
+const T8140_KSM_SCHEDULER_STATUS: u64 = 0x21208;
+const T8140_USC_SERV_SELECTOR: usize = 0xa010;
+const T8140_USC_VDM_SERV: usize = 0xa088;
+const T8140_USC_PDM_SERV: usize = 0xa068;
+const T8140_USC_CDM_SERV: usize = 0xa0a8;
+const T8140_USC_DEBUG_SELECTOR: usize = 0xa000;
+const T8140_USC_VDM_DEBUG_STATUS: usize = 0xa090;
+const T8140_USC_PDM_DEBUG_STATUS: usize = 0xa070;
+const T8140_USC_CDM_DEBUG_STATUS: usize = 0xa0b0;
+
+const fn t8140_gpc_perf_state_map(raw: u32) -> u32 {
+    (raw >> 16) & 0xf
+}
+
+const fn t8140_gpc_perf_state_map_low(raw: u32) -> u32 {
+    raw & 0xf
+}
+
+const fn t8140_gpc_perf_state_control(raw: u32) -> u32 {
+    raw & 1
+}
 
 const FAULT_INFO: usize = 0x17030;
 
@@ -81,11 +176,9 @@ const CORE_MASKS_G14X: usize = 0xe01500;
 // @ 0xfffffe0008af1f64). The fault address register holds VA >> 6.
 const FAULT_INFO_G14X: usize = 0xd8c0;
 const FAULT_ADDR_G14X: usize = 0xd8c8;
-/// Fault acknowledge/clear register (write-only). Recovered from the same
-/// helpers as the fault registers above; the ack value encoding is not yet
-/// modelled, so the driver does not write it.
-#[allow(dead_code)]
-const FAULT_ACK_G14X: usize = 0xd800;
+/// 64-bit requestor selector for the G14X+ fault-info/address window.
+/// Acknowledge is a separate store of 1 to 0xd8e8.
+const FAULT_REQUESTOR_G14X: usize = 0xd800;
 
 /// Enum representing the unit that caused an MMU fault.
 #[allow(non_camel_case_types)]
@@ -198,6 +291,27 @@ pub(crate) struct Resources {
     sgx: Pin<KBox<Devres<IoMem<0>>>>,
     /// Serializes the shared fixed-slot SKSM FIFO across every queue.
     sksm_fifo: Pin<KBox<Mutex<()>>>,
+    /// Suppressed SKSM port writes, kept so they can be replayed once the
+    /// firmware has raised the GPU core power state. The port is only
+    /// reachable from the AP while the cores are powered, and the driver has
+    /// to publish the queue configuration before that happens.
+    sksm_deferred: Pin<KBox<Mutex<G17PDeferredSksmWrites>>>,
+}
+
+pub(crate) struct G17PDeferredSksmWrites {
+    pairs: [Option<g17_submission::G17SksmOrderedWritePair>; 8],
+    count: usize,
+    replayed: bool,
+}
+
+impl G17PDeferredSksmWrites {
+    pub(crate) const fn new() -> Self {
+        Self {
+            pairs: [None; 8],
+            count: 0,
+            replayed: false,
+        }
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -206,6 +320,67 @@ pub(crate) struct G17PSchedulerGateRegisters {
     pub(crate) host_irq_summary: u32,
     pub(crate) host_irq_enable: u32,
     pub(crate) host_irq_status: u32,
+}
+
+/// Read-only view of the GMMU interrupt source while the GPU cores are live.
+///
+/// Unlike [`g17p_log_fault_requestors_pre_ack`], taking this snapshot never
+/// writes the requestor selector.  That makes it safe to sample in the dense
+/// post-doorbell loop while firmware may be servicing the level-triggered
+/// bit-35 interrupt itself.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PFaultIrqSnapshot {
+    pub(crate) gpc_state: u32,
+    pub(crate) fault_info: u64,
+    pub(crate) fault_addr_word: u64,
+    pub(crate) requestor_gate: u64,
+    pub(crate) sub_status: u64,
+    pub(crate) irq_status: u64,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PRenderKsmAdmissionSnapshot {
+    pub(crate) gpc_state: u32,
+    pub(crate) qid0_state: u64,
+    pub(crate) qid0_progress: u64,
+    pub(crate) qid1_state: u64,
+    pub(crate) qid1_progress: u64,
+    /// Per-QID {outstanding/timestamp, submitted, completed} from the same
+    /// KSMFE registers used by Apple's queue-state dumper.
+    pub(crate) qid_counters: [[u64; 3]; 2],
+    /// Authoritative queue-enabled status. These are not the write-only
+    /// set-valid strobes at 0x21068/0x21070.
+    pub(crate) queue_enabled: [u64; 2],
+    pub(crate) current_command: u64,
+    pub(crate) current_context: u64,
+    pub(crate) active_queue_mask: u64,
+    pub(crate) active_queue_state: u64,
+    pub(crate) fault_masks: [u64; 3],
+    pub(crate) dm_masks: [u64; 3],
+    pub(crate) scheduling_pause_request: u64,
+    pub(crate) scheduling_pause_status: u64,
+    pub(crate) queue_stop_request: [u64; 2],
+    pub(crate) queue_stopped: [u64; 2],
+    pub(crate) scheduler_status: u64,
+    pub(crate) work_channel_status: [u64; 4],
+    pub(crate) usc: Option<G17PUscEngineSnapshot>,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PUscEngineSnapshot {
+    pub(crate) pipe: u32,
+    pub(crate) vdm_serv: u64,
+    pub(crate) pdm_serv: u64,
+    pub(crate) cdm_serv: u64,
+    pub(crate) vdm_debug_status: u64,
+    pub(crate) pdm_debug_status: u64,
+    pub(crate) cdm_debug_status: u64,
+    /// Pipe-banked fragment RCE target registers sampled with the same tag
+    /// construction as B1's assigned-engine diagnostics. The first four keep
+    /// the original execution/strobe probes; the final four are persistent RT
+    /// bases (AXFB twice, heapmeta, tilemap) whose readback distinguishes a
+    /// malformed RCE fetch from dIPP starting with a zero per-cluster base.
+    pub(crate) fragment_rce_targets: [u64; 8],
 }
 
 impl G17PSchedulerGateRegisters {
@@ -220,6 +395,14 @@ const _: () = {
     assert!(T8140_HOST_IRQ_SUMMARY + 4 <= T8140_SGX_RESOURCE_SIZE);
     assert!(T8140_HOST_IRQ_ENABLE + 4 <= T8140_SGX_RESOURCE_SIZE);
     assert!(T8140_HOST_IRQ_STATUS + 4 <= T8140_SGX_RESOURCE_SIZE);
+    assert!(T8140_GPC_PERF_STATE_MAP + 4 <= T8140_SGX_RESOURCE_SIZE);
+    assert!(T8140_GPC_PERF_STATE_CONTROL + 4 <= T8140_SGX_RESOURCE_SIZE);
+    assert!(t8140_gpc_perf_state_map(0xffff_ffff) == 0xf);
+    assert!(t8140_gpc_perf_state_map(0x0003_0000) == 3);
+    assert!(t8140_gpc_perf_state_map(0x0007_0000) == 7);
+    assert!(t8140_gpc_perf_state_map_low(0xffff_fff3) == 3);
+    assert!(t8140_gpc_perf_state_control(0xffff_fff2) == 0);
+    assert!(t8140_gpc_perf_state_control(0xffff_fff3) == 1);
     assert!(
         G17PSchedulerGateRegisters {
             fender_dynamic_gating: 0,
@@ -252,7 +435,10 @@ impl g17_submission::G17SksmPairWriter for G17SksmSgxPairWriter<'_> {
     fn write64(&self, offset: u32, value: u64) -> Result {
         // Regular writeq ordering is required: word 0 must reach the device
         // before word 1. Publication never reads either scratch location.
-        self.0.try_write64(value, offset as usize)
+        // Offsets are aperture-relative (kext `accelerator+0x348`), so they are
+        // rebased onto the second `sgx` window before use.
+        self.0
+            .try_write64(value, T8140_GPU_REG_APERTURE_BASE + offset as usize)
     }
 }
 
@@ -266,12 +452,17 @@ impl Resources {
         let sgx_req = pdev.io_request_by_name(c_str!("sgx")).ok_or(EINVAL)?;
         let sgx_iomem = KBox::pin_init(sgx_req.iomap(), GFP_KERNEL)?;
         let sksm_fifo = KBox::pin_init(new_mutex!((), "g17_sksm_fifo"), GFP_KERNEL)?;
+        let sksm_deferred = KBox::pin_init(
+            new_mutex!(G17PDeferredSksmWrites::new(), "g17_sksm_deferred"),
+            GFP_KERNEL,
+        )?;
 
         Ok(Resources {
             // SAFETY: This device does DMA via the UAT IOMMU.
             dev: pdev.into(),
             sgx: sgx_iomem,
             sksm_fifo,
+            sksm_deferred,
         })
     }
 
@@ -280,7 +471,8 @@ impl Resources {
             let offset = offset as usize;
             offset % core::mem::size_of::<u64>() == 0
                 && offset
-                    .checked_add(core::mem::size_of::<u64>())
+                    .checked_add(T8140_GPU_REG_APERTURE_BASE)
+                    .and_then(|base| base.checked_add(core::mem::size_of::<u64>()))
                     .is_some_and(|end| end <= SGX_SIZE)
         };
 
@@ -306,6 +498,23 @@ impl Resources {
             return Err(EINVAL);
         }
 
+        // Host writes to the SKSM tag/data port take an asynchronous SError on
+        // J700: bisection showed that suppressing every one of them (the QID
+        // configure pair AND addKicks, which uses the same port) removes the
+        // fault entirely, while suppressing only one still panics. The whole
+        // sgx 0x0..0x2ffff range is unreachable from the AP even though the
+        // firmware reaches the same registers through its own mapping of
+        // PA 0x480000000. Gated off by default until the correct host aperture
+        // is proven or the KSM programming moves to firmware channel commands.
+        if *module_parameters::g17p_sksm_mmio.value() == 0 {
+            dev_info!(
+                self.dev.as_ref(),
+                "G17P SKSM port MMIO suppressed: {:#x}@{:#x} / {:#x}@{:#x}\n",
+                pair.word0, pair.word0_offset, pair.word1, pair.word1_offset
+            );
+            self.stash_deferred_sksm_pair(pair);
+            return Ok(());
+        }
         let _guard = self.sksm_fifo.lock();
         let sgx = self.sgx.try_access().ok_or(ENODEV)?;
         Self::g17p_sksm_publish_locked(&sgx, pair)
@@ -327,6 +536,17 @@ impl Resources {
             return Err(EINVAL);
         }
 
+        if *module_parameters::g17p_sksm_mmio.value() == 0 {
+            dev_info!(
+                self.dev.as_ref(),
+                "G17P QID configure suppressed (tag={:#x}@{:#x} payload={:#x}@{:#x} maskHi={:#x} maskLo={:#x})\n",
+                pair.word0, pair.word0_offset, pair.word1, pair.word1_offset,
+                enable_pair.word0, enable_pair.word1
+            );
+            self.stash_deferred_sksm_pair(pair);
+            self.stash_deferred_sksm_pair(enable_pair);
+            return Ok(());
+        }
         let _guard = self.sksm_fifo.lock();
         let sgx = self.sgx.try_access().ok_or(ENODEV)?;
         Self::g17p_sksm_publish_locked(&sgx, pair)?;
@@ -401,9 +621,642 @@ impl Resources {
     /// first, then set bit 0 of both AXI transition words. Observed
     /// post-write values on J700 are `0x00010001`/`0x000413b1`; a different
     /// readback is logged but not fatal (the upper bits are status).
+    /// Read `FAULT_INFO` in the sgx GPU-core register file. Unreachable from
+    /// the AP while the cores are unpowered (asynchronous SError); this exists
+    /// to retest it once the firmware has raised the GPC performance state.
+    fn stash_deferred_sksm_pair(&self, pair: g17_submission::G17SksmOrderedWritePair) {
+        let mut deferred = self.sksm_deferred.lock();
+        let count = deferred.count;
+        if count < deferred.pairs.len() {
+            deferred.pairs[count] = Some(pair);
+            deferred.count = count + 1;
+        }
+    }
+
+    /// Replay every suppressed SKSM port write, once. The port lives in the
+    /// sgx GPU-core register file, which the AP can only reach while the cores
+    /// are powered -- and the firmware only raises the GPC performance state
+    /// in response to a submission, after the queue configuration has already
+    /// had to be published. So the writes are recorded when they are skipped
+    /// and issued here, from the submit poll loop, once power is up.
+    pub(crate) fn g17p_replay_deferred_sksm(&self) -> Result<usize> {
+        let (pairs, count) = {
+            let mut deferred = self.sksm_deferred.lock();
+            if deferred.replayed {
+                return Ok(0);
+            }
+            deferred.replayed = true;
+            (deferred.pairs, deferred.count)
+        };
+        if count == 0 {
+            return Ok(0);
+        }
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let _guard = self.sksm_fifo.lock();
+        let mut issued = 0usize;
+        for slot in pairs.iter().take(count) {
+            let Some(pair) = slot else {
+                continue;
+            };
+            dev_info!(
+                self.dev.as_ref(),
+                "G17P SKSM replay (powered): {:#x}@{:#x} / {:#x}@{:#x}\n",
+                pair.word0, pair.word0_offset, pair.word1, pair.word1_offset
+            );
+            Self::g17p_sksm_publish_locked(&sgx, *pair)?;
+            issued += 1;
+        }
+        Ok(issued)
+    }
+
+    pub(crate) fn g17p_probe_fault_info(&self) -> Result<u32> {
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        sgx.relaxed().try_read32(FAULT_INFO)
+    }
+
+    /// Read one KSM register back through the SKSM tag/data port while the
+    /// GPU cores are powered. Native's own hang detector uses this same port
+    /// to read per-QID progress, so it is a supported read path -- unlike a
+    /// direct load of `0x21008`, which returns 0 because the register file is
+    /// only addressable through the port.
+    pub(crate) fn g17p_sksm_port_read(&self, reg: u64, qid: u64) -> Result<u64> {
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let _guard = self.sksm_fifo.lock();
+        Self::g17p_sksm_port_read_locked(&sgx, reg, qid, 1u64 << 42)
+    }
+
+    fn g17p_sksm_port_read_locked(
+        sgx: &IoMem<0>,
+        reg: u64,
+        qid: u64,
+        tag_flags: u64,
+    ) -> Result<u64> {
+        let tag = reg | (qid << 43) | tag_flags;
+        // The tag store and data load form one ordered transaction. Apple's
+        // host uses a device-memory STR/LDR pair; Linux's ordered writeq/readq
+        // provides the corresponding MMIO ordering. Relaxed accesses returned
+        // opaque values for 0x21028 and hid the TA -> 3D dependency frontier.
+        sgx.try_write64(tag, 0x4090)?;
+        sgx.try_read64(0x4098)
+    }
+
+    /// Take the hardware snapshot the G17P firmware uses when diagnosing a
+    /// selected command which has not reached its start timestamp.  Include
+    /// QID0 alongside the selected 3D QID so a TA dependency can be judged by
+    /// the KSM's own progress counter rather than descriptor timestamps alone.
+    ///
+    /// The low SGX register file is inaccessible while the GPU cores are off,
+    /// so the GPC-state read is a hard precondition rather than another field
+    /// sampled after the dangerous accesses. `None` means the caller may retry
+    /// briefly while it is still in the immediate post-doorbell window.
+    pub(crate) fn g17p_render_ksm_admission_snapshot(
+        &self,
+    ) -> Result<Option<G17PRenderKsmAdmissionSnapshot>> {
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let registers = sgx.relaxed();
+        let gpc_state = registers.try_read32(T8140_HOST_IRQ_SUMMARY)? & 0xf;
+        if gpc_state == 0 {
+            return Ok(None);
+        }
+
+        let _guard = self.sksm_fifo.lock();
+        // These tags are copied from the firmware's own readers. State uses
+        // the bit-42 KSM namespace; the hang-detector progress read does not.
+        let qid0_state =
+            Self::g17p_sksm_port_read_locked(&sgx, 0xc020, 0, 1u64 << 42)?;
+        let qid0_progress = Self::g17p_sksm_port_read_locked(&sgx, 0xc078, 0, 0)?;
+        let qid1_state =
+            Self::g17p_sksm_port_read_locked(&sgx, 0xc020, 1, 1u64 << 42)?;
+        let qid1_progress = Self::g17p_sksm_port_read_locked(&sgx, 0xc078, 1, 0)?;
+        let qid_counters = [
+            [
+                Self::g17p_sksm_port_read_locked(&sgx, 0x21010, 0, 1u64 << 42)?,
+                Self::g17p_sksm_port_read_locked(&sgx, 0x21020, 0, 1u64 << 42)?,
+                Self::g17p_sksm_port_read_locked(&sgx, 0x21028, 0, 1u64 << 42)?,
+            ],
+            [
+                Self::g17p_sksm_port_read_locked(&sgx, 0x21010, 1, 1u64 << 42)?,
+                Self::g17p_sksm_port_read_locked(&sgx, 0x21020, 1, 1u64 << 42)?,
+                Self::g17p_sksm_port_read_locked(&sgx, 0x21028, 1, 1u64 << 42)?,
+            ],
+        ];
+        let queue_enabled = [
+            Self::g17p_sksm_port_read_locked(&sgx, 0x21038, 0, 1u64 << 42)?,
+            Self::g17p_sksm_port_read_locked(&sgx, 0x21040, 0, 1u64 << 42)?,
+        ];
+        let current_command = registers.try_read64(0xc0f0)?;
+        let current_context = registers.try_read64(0xc0f8)?;
+        let active_queue_mask = registers.try_read64(T8140_KSM_ACTIVE_QUEUE_MASK)?;
+        let active_queue_state = registers.try_read64(T8140_KSM_ACTIVE_QUEUE_STATE)?;
+        let fault_masks = [
+            registers.try_read64(T8140_KSM_FAULT_MASK_0)?,
+            registers.try_read64(T8140_KSM_FAULT_MASK_1)?,
+            registers.try_read64(T8140_KSM_FAULT_MASK_2)?,
+        ];
+        let dm_masks = [
+            registers.try_read64(T8140_KSM_DM_MASK_0)?,
+            registers.try_read64(T8140_KSM_DM_MASK_1)?,
+            registers.try_read64(T8140_KSM_DM_MASK_2)?,
+        ];
+        // B1 accesses these as global 64-bit KSM registers. Use QID zero in
+        // the host tag because the index field is immaterial for globals; the
+        // bit-42 read tag is the same one already validated by 0x211d0.
+        // 0x210a8/0x210b0 are stop-request command registers, so their
+        // readback is diagnostic only. 0x21058/0x21060 are the authoritative
+        // stopped masks which B1 polls after issuing those requests.
+        let scheduling_pause_request = Self::g17p_sksm_port_read_locked(
+            &sgx,
+            T8140_KSM_SCHEDULING_PAUSE_REQUEST,
+            0,
+            1u64 << 42,
+        )?;
+        let scheduling_pause_status = Self::g17p_sksm_port_read_locked(
+            &sgx,
+            T8140_KSM_SCHEDULING_PAUSE_STATUS,
+            0,
+            1u64 << 42,
+        )?;
+        let queue_stop_request = [
+            Self::g17p_sksm_port_read_locked(
+                &sgx,
+                T8140_KSM_QUEUE_STOP_REQUEST_LO,
+                0,
+                1u64 << 42,
+            )?,
+            Self::g17p_sksm_port_read_locked(
+                &sgx,
+                T8140_KSM_QUEUE_STOP_REQUEST_HI,
+                0,
+                1u64 << 42,
+            )?,
+        ];
+        let queue_stopped = [
+            Self::g17p_sksm_port_read_locked(
+                &sgx,
+                T8140_KSM_QUEUE_STOPPED_MASK_LO,
+                0,
+                1u64 << 42,
+            )?,
+            Self::g17p_sksm_port_read_locked(
+                &sgx,
+                T8140_KSM_QUEUE_STOPPED_MASK_HI,
+                0,
+                1u64 << 42,
+            )?,
+        ];
+        let scheduler_status = Self::g17p_sksm_port_read_locked(
+            &sgx,
+            T8140_KSM_SCHEDULER_STATUS,
+            0,
+            1u64 << 42,
+        )?;
+        // B1's host-channel drain scanner treats bits 31:16 of these four
+        // consecutive words as producer counts. Its hang classifier also
+        // tests them when the c128 active class is empty.
+        let work_channel_status = [
+            Self::g17p_sksm_port_read_locked(
+                &sgx,
+                T8140_KSM_WORK_CHANNEL_0,
+                0,
+                1u64 << 42,
+            )?,
+            Self::g17p_sksm_port_read_locked(
+                &sgx,
+                T8140_KSM_WORK_CHANNEL_1,
+                0,
+                1u64 << 42,
+            )?,
+            Self::g17p_sksm_port_read_locked(
+                &sgx,
+                T8140_KSM_WORK_CHANNEL_2,
+                0,
+                1u64 << 42,
+            )?,
+            Self::g17p_sksm_port_read_locked(
+                &sgx,
+                T8140_KSM_WORK_CHANNEL_3,
+                0,
+                1u64 << 42,
+            )?,
+        ];
+
+        // Bits 25:24 of an admitted QID state encode pipe + 1. B1 uses this
+        // exact conversion before its banked USC reads. A zero value means no
+        // pipe has been assigned yet, so do not perturb either selector.
+        let usc = match ((qid1_state >> 24) & 0x3).checked_sub(1) {
+            Some(pipe) => {
+                let pipe = pipe as u32;
+                // B1's explicit USC dump writes these selectors but does not
+                // restore them; leave the same firmware-defined final state.
+                registers.try_write32(pipe, T8140_USC_SERV_SELECTOR)?;
+                let vdm_serv = registers.try_read64(T8140_USC_VDM_SERV)?;
+                let pdm_serv = registers.try_read64(T8140_USC_PDM_SERV)?;
+                let cdm_serv = registers.try_read64(T8140_USC_CDM_SERV)?;
+                registers.try_write32(pipe, T8140_USC_DEBUG_SELECTOR)?;
+                let vdm_debug_status = registers.try_read64(T8140_USC_VDM_DEBUG_STATUS)?;
+                let pdm_debug_status = registers.try_read64(T8140_USC_PDM_DEBUG_STATUS)?;
+                let cdm_debug_status = registers.try_read64(T8140_USC_CDM_DEBUG_STATUS)?;
+                let fragment_rce_targets = [
+                    Self::g17p_sksm_port_read_locked(&sgx, 0x01738, pipe as u64, 0)?,
+                    Self::g17p_sksm_port_read_locked(&sgx, 0x15020, pipe as u64, 0)?,
+                    Self::g17p_sksm_port_read_locked(&sgx, 0x14080, pipe as u64, 0)?,
+                    Self::g17p_sksm_port_read_locked(&sgx, 0x16068, pipe as u64, 0)?,
+                    Self::g17p_sksm_port_read_locked(&sgx, 0x16460, pipe as u64, 0)?,
+                    Self::g17p_sksm_port_read_locked(&sgx, 0x16090, pipe as u64, 0)?,
+                    Self::g17p_sksm_port_read_locked(&sgx, 0x16098, pipe as u64, 0)?,
+                    Self::g17p_sksm_port_read_locked(&sgx, 0x16428, pipe as u64, 0)?,
+                ];
+                Some(G17PUscEngineSnapshot {
+                    pipe,
+                    vdm_serv,
+                    pdm_serv,
+                    cdm_serv,
+                    vdm_debug_status,
+                    pdm_debug_status,
+                    cdm_debug_status,
+                    fragment_rce_targets,
+                })
+            }
+            None => None,
+        };
+
+        Ok(Some(G17PRenderKsmAdmissionSnapshot {
+            gpc_state,
+            qid0_state,
+            qid0_progress,
+            qid1_state,
+            qid1_progress,
+            qid_counters,
+            queue_enabled,
+            current_command,
+            current_context,
+            active_queue_mask,
+            active_queue_state,
+            fault_masks,
+            dm_masks,
+            scheduling_pause_request,
+            scheduling_pause_status,
+            queue_stop_request,
+            queue_stopped,
+            scheduler_status,
+            work_channel_status,
+            usc,
+        }))
+    }
+
+    /// Sample the three KSM words that change as a submission progresses:
+    /// the queue descriptor (bit 63 = hardware "queue active"), the
+    /// scheduling-pause word, and the AddKicks count.
+    pub(crate) fn g17p_sample_ksm(&self, qid: u64) -> Result<(u64, u64, u64)> {
+        Ok((
+            self.g17p_sksm_port_read(0x21008, qid)?,
+            self.g17p_sksm_port_read(0x211d0, qid)?,
+            self.g17p_sksm_port_read(0x21018, qid)?,
+        ))
+    }
+
+    /// Read back what the firmware's tag-15 handler actually programmed for a
+    /// queue: the descriptor (bit 63 = hardware "queue active") and the
+    /// 128-bit queue-enabled mask.
+    pub(crate) fn g17p_dump_queue_descriptor(&self, qid: u64) -> Result {
+        let descriptor = self.g17p_sksm_port_read(0x21008, qid)?;
+        let mask_lo = self.g17p_sksm_port_read(0x21038, 0)?;
+        let mask_hi = self.g17p_sksm_port_read(0x21040, 0)?;
+        let ring_base = (descriptor >> 5) & ((1u64 << 38) - 1);
+        dev_info!(
+            self.dev.as_ref(),
+            "G17P QID {} descriptor={:#018x} active={} ring_base_bits42_5={:#x} mask={:#x}:{:#x}\n",
+            qid,
+            descriptor,
+            descriptor >> 63,
+            ring_base,
+            mask_hi,
+            mask_lo
+        );
+        // AddKicks, native's hang-detector progress metric, and the two words
+        // tag 16's handler writes as -1 at the end of its "go" poke: if they
+        // are not -1 that handler never reached its tail.
+        for reg in [0x21010u64, 0x21020, 0x21028, 0x211c8, 0x211d0, 0x211b0] {
+            match self.g17p_sksm_port_read(reg, qid) {
+                Ok(value) => dev_info!(
+                    self.dev.as_ref(),
+                    "G17P QID {} port[{:#07x}] = {:#018x} (kicks={} ts={:#x})\n",
+                    qid,
+                    reg,
+                    value,
+                    (value >> 49) & 0x1ff,
+                    value & ((1u64 << 40) - 1)
+                ),
+                Err(error) => dev_warn!(
+                    self.dev.as_ref(),
+                    "G17P QID {} port[{:#07x}] read failed ({:?})\n",
+                    qid,
+                    reg,
+                    error
+                ),
+            }
+        }
+        // Establish whether these are per-QID or global: a register that is
+        // global will read identically whatever qid the tag encodes.
+        for reg in [0x211d0u64, 0x103a8, 0x21018, 0x21008] {
+            let mut values = [0u64; 3];
+            let mut ok = true;
+            for (slot, probe_qid) in [0u64, 1, 4].iter().enumerate() {
+                match self.g17p_sksm_port_read(reg, *probe_qid) {
+                    Ok(value) => values[slot] = value,
+                    Err(_) => ok = false,
+                }
+            }
+            if ok {
+                dev_info!(
+                    self.dev.as_ref(),
+                    "G17P port[{:#07x}] qid0={:#x} qid1={:#x} qid4={:#x}\n",
+                    reg, values[0], values[1], values[2]
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Read the KSM / SKSM register file while the GPU cores are powered.
+    /// Historically every one of these SErrored, which is why the driver
+    /// suppresses the SKSM port entirely; retest now that the precondition
+    /// (GPC performance state non-zero) actually holds.
+    pub(crate) fn g17p_probe_ksm_block(&self) -> Result {
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let res = sgx.relaxed();
+        let (fault_info, fault_addr) = self.g17p_fault_registers();
+        dev_info!(
+            self.dev.as_ref(),
+            "G17P MMU fault: latched={} info={:#018x} addr={:#018x} unit_code={:#04x} level={} read={} sideband={:#x} vm_slot={}\n",
+            fault_info & 1,
+            fault_info,
+            fault_addr,
+            (fault_info >> 9) & 0xff,
+            (fault_info >> 24) & 0x3,
+            (fault_info >> 23) & 1,
+            (fault_info >> 1) & 0xff,
+            (fault_info >> 17) & 0x3f
+        );
+
+        // 0xd8c0/0xd8c8 are the G14X+/AGX3 MMU fault-status pair upstream reads
+        // (0x17030 is the G13/G14G offset our FAULT_INFO still carries). If the
+        // firmware halted us for a GMMU fault these should name the address.
+        for offset in [
+            0xd8a0usize, 0xd8a8, 0xd8b0, 0xd8b8, 0xd8c0, 0xd8c8, 0xd8d0, 0xd8d8,
+            0xd8e0, 0xd8e8, 0xd8f0, 0xd8f8,
+        ] {
+            let value = res.try_read64(offset)?;
+            if value != 0 {
+                dev_info!(
+                    self.dev.as_ref(),
+                    "G17P fault bank {:#07x} = {:#018x}\n",
+                    offset,
+                    value
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Acknowledge a latched GMMU fault.
+    ///
+    /// The firmware unmasks GPU interrupt bit 35 inside its power-on routine
+    /// without clearing the GMMU latch first, so a fault inherited from a
+    /// previous OS is re-raised the moment the GPU powers up: recovery, KSM
+    /// halt, re-unmask, repeat. The only fault-clearing write in the image is
+    /// "select the requestor in `0xd800`, then store 1 to `0xd8e8`", taken from
+    /// the firmware's own context-teardown path.
+    pub(crate) fn g17p_ack_stale_fault(&self) -> Result {
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let res = sgx.relaxed();
+        // Per-context fault mask. `agfaProcessChannelCommand` selects the
+        // summary view (0xd800 = 0x100) and clears the context's bit in
+        // 0xd8f0. vm_slot 2 is the context our submission runs in. This bank
+        // is in the 0xd0xxxx control range, so unlike 0x1_0a18 it is reachable
+        // before the GPU cores are powered -- which is the only point at which
+        // we can get ahead of the firmware's power-on unmask.
+        res.try_write64(0x100, 0xd800)?;
+        let mask_before = res.try_read64(0xd8f0)?;
+        let gate_summary = res.try_read64(0xd918)?;
+        res.try_write64(mask_before & !(1u64 << 2), 0xd8f0)?;
+        let mask_after = res.try_read64(0xd8f0)?;
+        dev_info!(
+            self.dev.as_ref(),
+            "G17P fault ctx mask: summary-gate={:#x} 0xd8f0 {:#x} -> {:#x}\n",
+            gate_summary, mask_before, mask_after
+        );
+
+        // The firmware invalidates the GMMU before acknowledging: command at
+        // 0x1_8030, busy in 0x1_8038 bit 1.
+        let inv_before = res.try_read64(0x1_8038)?;
+        res.try_write64(0x007F_7377, 0x1_8030)?;
+        let mut spins = 0u32;
+        let mut busy = 0u64;
+        while spins < 10_000 {
+            busy = res.try_read64(0x1_8038)?;
+            if busy & 2 == 0 {
+                break;
+            }
+            spins += 1;
+        }
+        dev_info!(
+            self.dev.as_ref(),
+            "G17P gmmu invalidate: 0x18038 {:#x} -> {:#x} spins={}\n",
+            inv_before, busy, spins
+        );
+
+        // Every access to this bank is 64-bit in both the firmware and the
+        // kext (size=3 on every store). A 32-bit store to the 0xd800 selector
+        // is dropped, which silently leaves the select unmoved.
+        for requestor in 0u64..4 {
+            res.try_write64(requestor, 0xd800)?;
+            let before = res.try_read64(0xd8c0)?;
+            let gate = res.try_read64(0xd918)?;
+            res.try_write64(1, 0xd8e8)?;
+            let after = res.try_read64(0xd8c0)?;
+            dev_info!(
+                self.dev.as_ref(),
+                "G17P fault ack req {}: gate={:#x} {:#x} -> {:#x}\n",
+                requestor, gate, before, after
+            );
+        }
+        res.try_write64(0, 0xd800)?;
+        // Bit 35 is level-driven and its sub-condition is never written back
+        // (every other enabled bit reads a sub-status and writes it straight
+        // back one register later; bit 35 reads 0x1_0a00 and writes nothing).
+        // With the fault record exposed as a reset-default phantom, 0x1_0a00 is
+        // the only register that names what actually holds bit 35 up.
+        // NB: do not write 0x1_0a08 -- that is the enable register.
+        let sub_status = res.try_read64(0x1_0a00)?;
+        let irq_enable = res.try_read64(0x1_0a08)?;
+        dev_info!(
+            self.dev.as_ref(),
+            "G17P irq bit35 sub-status 0x10a00 = {:#018x} enable 0x10a08 = {:#018x}\n",
+            sub_status,
+            irq_enable
+        );
+        let irq_status = res.try_read64(0x1_0a10)?;
+        // 0x1_0a18 has exactly one writer in the firmware -- the interrupt
+        // handler -- while 0x1_0a10 has one reader: the classic status/clear
+        // pair. Try acknowledging bit 35 (GMMU page fault) there.
+        res.try_write64(1u64 << 35, 0x1_0a18)?;
+        let after_clear = res.try_read64(0x1_0a10)?;
+        let fault_after = res.try_read64(0xd8c0)?;
+        dev_info!(
+            self.dev.as_ref(),
+            "G17P GPU irq 0x10a10 {:#x} (bit35={}) -> after 0x10a18 ack {:#x} (bit35={}); fault {:#x}\n",
+            irq_status,
+            (irq_status >> 35) & 1,
+            after_clear,
+            (after_clear >> 35) & 1,
+            fault_after
+        );
+        let (info, addr) = self.g17p_fault_registers();
+        dev_info!(
+            self.dev.as_ref(),
+            "G17P fault ack: after clear latched={} info={:#x} addr={:#x}\n",
+            info & 1,
+            info,
+            addr
+        );
+        Ok(())
+    }
+
+    /// Snapshot and log the MMU fault bank. Safe with the GPU cores
+    /// unpowered: the fault registers live at `0xd8xx`, inside the `0xd0xxxx`
+    /// control range that is reachable from the AP at all times -- unlike the
+    /// `0x0..0x2ffff` core register file.
+    pub(crate) fn g17p_log_fault_bank(&self, when: &'static str) -> Result {
+        let (info, addr) = self.g17p_fault_registers();
+        dev_info!(
+            self.dev.as_ref(),
+            "G17P fault bank @{}: latched={} info={:#018x} addr={:#018x} reason={} read={} level={} unit={:#04x} vm_slot={}\n",
+            when,
+            info & 1,
+            info,
+            addr,
+            (info >> 1) & 7,
+            (info >> 4) & 1,
+            (info >> 7) & 3,
+            (info >> 9) & 0xff,
+            (info >> 17) & 0x3f
+        );
+        Ok(())
+    }
+
+    /// Sample the currently selected GMMU requestor and its authoritative GPU
+    /// IRQ source without changing or acknowledging any hardware state.
+    ///
+    /// The low core register block is unsafe to read after power-off on J700,
+    /// so report `None` when the always-on GPC state says the cores are gated.
+    pub(crate) fn g17p_render_fault_irq_snapshot(
+        &self,
+    ) -> Result<Option<G17PFaultIrqSnapshot>> {
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let registers = sgx.relaxed();
+        let gpc_state = registers.try_read32(T8140_HOST_IRQ_SUMMARY)? & 0xf;
+        if gpc_state == 0 {
+            return Ok(None);
+        }
+        Ok(Some(G17PFaultIrqSnapshot {
+            gpc_state,
+            fault_info: registers.try_read64(FAULT_INFO_G14X)?,
+            fault_addr_word: registers.try_read64(FAULT_ADDR_G14X)?,
+            requestor_gate: registers.try_read64(0xd918)?,
+            sub_status: registers.try_read64(0x1_0a00)?,
+            irq_status: registers.try_read64(0x1_0a10)?,
+        }))
+    }
+
+    /// Snapshot every GMMU fault requestor while firmware is halted in the
+    /// type-4 recovery state, without acknowledging or clearing any latch.
+    ///
+    /// This mirrors `AGXAcceleratorG16::getFirstMMUFaultStatus`: select each
+    /// requestor with a 64-bit store at 0xd800, read 0xd8c0, and read 0xd8c8
+    /// only when the valid bit is set.  The selector is restored to zero and
+    /// 0xd8e8 (the destructive acknowledge register) is never touched.
+    pub(crate) fn g17p_log_fault_requestors_pre_ack(&self, when: &'static str) -> Result {
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let registers = sgx.relaxed();
+        let gpc_state = registers.try_read32(T8140_HOST_IRQ_SUMMARY)? & 0xf;
+        if gpc_state == 0 {
+            dev_warn!(
+                self.dev.as_ref(),
+                "G17P fault requestors @{}: skipped because gpc-state=0\n",
+                when
+            );
+            return Ok(());
+        }
+
+        let mut sweep_error = None;
+        for requestor in 0u64..4 {
+            if let Err(error) = registers.try_write64(requestor, FAULT_REQUESTOR_G14X) {
+                sweep_error = Some(error);
+                break;
+            }
+            let info = match registers.try_read64(FAULT_INFO_G14X) {
+                Ok(value) => value,
+                Err(error) => {
+                    sweep_error = Some(error);
+                    break;
+                }
+            };
+            let addr_word = if info & 1 != 0 {
+                match registers.try_read64(FAULT_ADDR_G14X) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        sweep_error = Some(error);
+                        break;
+                    }
+                }
+            } else {
+                0
+            };
+            let address = (addr_word & ((1u64 << 42) - 1)) << 6;
+            dev_info!(
+                self.dev.as_ref(),
+                "G17P fault requestor @{} req={} gpc-state={:#x} latched={} info={:#018x} addr-word={:#018x} va={:#x} reason={} read={} level={} unit={:#04x} vm-slot={} sideband={:#x}\n",
+                when,
+                requestor,
+                gpc_state,
+                info & 1,
+                info,
+                addr_word,
+                address,
+                (info >> 1) & 7,
+                (info >> 4) & 1,
+                (info >> 7) & 3,
+                (info >> 9) & 0xff,
+                (info >> 17) & 0x3f,
+                (info >> 23) & 0x7f,
+            );
+        }
+
+        let restore = registers.try_write64(0, FAULT_REQUESTOR_G14X);
+        if let Some(error) = sweep_error {
+            return Err(error);
+        }
+        restore?;
+        Ok(())
+    }
+
     pub(crate) fn t8140_axi_transition_workaround(&self) -> Result {
         let sgx = self.sgx.try_access().ok_or(ENODEV)?;
         let res = sgx.relaxed();
+
+
+        // AGX early-init poke, before anything else touches the block.
+        let poke_before = res.try_read32(T8140_SGX_EARLY_POKE)?;
+        res.try_write32(T8140_SGX_EARLY_POKE_VALUE, T8140_SGX_EARLY_POKE)?;
+        let poke_after = res.try_read32(T8140_SGX_EARLY_POKE)?;
+        dev_info!(
+            self.dev.as_ref(),
+            "T8140 sgx early poke: {:#x} {:#x} -> {:#x}\n",
+            T8140_SGX_EARLY_POKE,
+            poke_before,
+            poke_after
+        );
 
         for (offset, observed) in [
             (T8140_AXI_TRANSITION_0, 0x0001_0001u32),
@@ -473,6 +1326,38 @@ impl Resources {
                 );
                 ENODEV
             })?;
+
+        // This is intentionally sampled only in the existing GPU-ID probe
+        // window. Those ID/core-mask reads already require the SGX control
+        // aperture to be safely accessible; reading this register later from
+        // render submission would race GPU core power-gating and can raise an
+        // asynchronous SError on G17P. Cache the decoded nibble in GpuIdConfig
+        // and carry it through ordinary host memory from here on.
+        let (gpc_perf_state_map, gpc_perf_state_map_low, gpc_perf_state_control) = if identity
+            .gpu_gen
+            == hw::GpuGen::G17
+            && identity.gpu_variant == identity::GpuVariant::P
+        {
+            let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+            let registers = sgx.relaxed();
+            let control_raw = registers.try_read32(T8140_GPC_PERF_STATE_CONTROL)?;
+            let map_raw = registers.try_read32(T8140_GPC_PERF_STATE_MAP)?;
+            let map = t8140_gpc_perf_state_map(map_raw);
+            let map_low = t8140_gpc_perf_state_map_low(map_raw);
+            let control = t8140_gpc_perf_state_control(control_raw);
+            dev_info!(
+                self.dev.as_ref(),
+                "G17P GPC performance-state map: control_raw={:#010x} map_raw={:#010x} control={} low={:#x} high={:#x}\n",
+                control_raw,
+                map_raw,
+                control,
+                map_low,
+                map,
+            );
+            (map, map_low, control)
+        } else {
+            (0, 0, 0)
+        };
 
         let mut core_mask_regs = KVec::new();
 
@@ -581,6 +1466,9 @@ impl Resources {
             total_active_cores,
             core_masks,
             core_masks_packed,
+            gpc_perf_state_map,
+            gpc_perf_state_map_low,
+            gpc_perf_state_control,
         })
     }
 

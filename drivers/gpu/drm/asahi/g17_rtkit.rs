@@ -116,6 +116,10 @@ const INITDATA_TAG: u64 = 0x0081_0000_0000_0000;
 const INITDATA_TAG_CHECK_MASK: u64 = 0x00bf_0000_0000_0000;
 const INITDATA_ADDRESS_MASK: u64 = 0x0000_0fff_ffff_ffff;
 const INITDATA_ADDRESS_PREFIX: u64 = 0xffff_f000_0000_0000;
+const RECOVERY_INSPECTION_TAG: u64 = 0x0086_0000_0000_0000;
+const RECOVERY_INSPECTION_GENERATION_MASK: u64 = (1u64 << 44) - 1;
+const DEVICE_CONTROL_TAG: u64 = 0x0084_0000_0000_0000;
+const DEVICE_CONTROL_PRIMARY_MODE: u64 = 0x11;
 
 const RUNTIME_TYPE_SHIFT: u32 = 44;
 const RUNTIME_TYPE_MASK: u64 = 0xffff;
@@ -271,6 +275,20 @@ pub(crate) const fn encode_initdata_doorbell(firmware_va: u64) -> Result<u64, Wi
     }
 
     Ok(INITDATA_TAG | (firmware_va & INITDATA_ADDRESS_MASK))
+}
+
+/// Encode `AGXArmFirmware::stopFirmwareForRecoveryInspection`'s role-0 note.
+/// Shipping macOS inserts the low 44 bits of the host-accepted recovery
+/// generation into a type-6 EP21 message before it resumes recovery state 1.
+pub(crate) const fn encode_recovery_inspection(generation: u64) -> u64 {
+    RECOVERY_INSPECTION_TAG | (generation & RECOVERY_INSPECTION_GENERATION_MASK)
+}
+
+/// Notify the primary firmware that one device-control record was published.
+/// The opening UMA release uses native submit mode one, which produces this
+/// single role-0 EP21 word and does not request a synchronous completion wait.
+pub(crate) const fn encode_primary_device_control() -> u64 {
+    DEVICE_CONTROL_TAG | DEVICE_CONTROL_PRIMARY_MODE
 }
 
 /// Decode an init-data handoff using the exact firmware tag check.
@@ -536,6 +554,21 @@ mod tests {
                 MSG_INIT | (va & INIT_DATA_MASK)
             );
         }
+    }
+
+    #[test]
+    fn recovery_inspection_keeps_the_native_tag_and_low_44_bit_generation() {
+        assert_eq!(encode_recovery_inspection(0), 0x0086_0000_0000_0000);
+        assert_eq!(encode_recovery_inspection(1), 0x0086_0000_0000_0001);
+        assert_eq!(
+            encode_recovery_inspection(0xffff_f123_4567_89ab),
+            0x0086_0123_4567_89ab
+        );
+    }
+
+    #[test]
+    fn primary_device_control_uses_native_mode_one() {
+        assert_eq!(encode_primary_device_control(), 0x0084_0000_0000_0011);
     }
 
     #[test]

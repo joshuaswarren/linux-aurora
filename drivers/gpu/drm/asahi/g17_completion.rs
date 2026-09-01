@@ -44,10 +44,235 @@ pub(crate) const G17P_FIRMWARE_EVENT_ENTRY_SIZE: usize = 0x48;
 pub(crate) const G17P_FIRMWARE_EVENT_CAPACITY: u32 = 0x100;
 pub(crate) const G17P_FIRMWARE_EVENT_CONSUMER_OFFSET: u32 = 0;
 pub(crate) const G17P_FIRMWARE_EVENT_PRODUCER_OFFSET: u32 = 0x20;
+/// Work-completion record. The firmware publishes one of these when a
+/// submission retires, carrying the event stamp (which advances by 0x100 per
+/// completion, as on M1/M2), the queue index, the command UUID and the context.
+pub(crate) const G17P_FIRMWARE_EVENT_COMPLETION_TYPE: u32 = 1;
 pub(crate) const G17P_FIRMWARE_EVENT_RECOVERY_TYPE: u32 = 4;
 pub(crate) const G17P_FIRMWARE_EVENT_UMA_GROW_TYPE: u32 = 13;
 pub(crate) const D93AP_G17P_SGX_SOURCE_INDEX: u8 = 4;
 pub(crate) const D93AP_G17P_SGX_INTERRUPTS_VALID: u32 = 0xdf;
+
+// ---------------------------------------------------------------------------
+// Firmware event ring -- channel-table entry 13, states[0]/states[1].
+//
+// A channel-table entry is four u64s, and on the two report entries those are
+// *two* (state, ring) pairs rather than three states plus one ring. Entry 14
+// proves the shape empirically: `drain_ktrace_ring` reads its state at
+// `status_a + 0x240` (entry[0]) and its ring at `status_a + 0xa6ac0`
+// (entry[1]) and returns real records, while entry[2]/entry[3]
+// (`0x280`/`0xafac0`) belong to the Stats channel that shares the entry.
+//
+// Entry 13 is `[0x40, 0x2c0, 0x80, 0x4ac0]`, so by the same shape the firmware
+// *event* channel is state `status_a + 0x40`, ring `status_a + 0x2c0`, and the
+// second pair is the firmware log. That second reading is independently
+// confirmed: `dump_firmware_log` walks nine 0x30-stride control blocks from
+// `status_a + 0x80` -- exactly entry[2] -- with a read pointer at +0x00 and a
+// write pointer at +0x20.
+//
+// This matters because `status_a + 0x80` is therefore the firmware *log*
+// ring-0 write pointer, not the event producer. It is expected to be non-zero
+// on every boot, for reasons that have nothing to do with tiler-buffer growth,
+// so reading it as evidence of a pending event would be a false positive. The
+// event producer is `status_a + 0x60` (state + 0x20).
+//
+// ENTRY SIZE IS 0x48, NOT `REPORT_ENTRY_SIZE` (0x40). `REPORT_ENTRY_SIZE` is
+// the AGX2 shape and does not apply here. Three independent confirmations:
+//
+//   * `AGXFirmware::drainFirmwareEventRing` (kext 0xfffffe0008a18bb0) zeroes
+//     exactly 0x48 bytes of stack (`stp q0,q0` at +0x50 and +0x70 plus
+//     `str xzr` at +0x90 = 0x50..0x98) as the destination for one entry;
+//   * the arithmetic closes exactly -- 0x100 x 0x48 = 0x4800, so the ring runs
+//     status_a + 0x2c0 .. 0x4ac0 and ends precisely where the log ring begins,
+//     where 0x100 x 0x40 would leave an unexplained 0x800 hole;
+//   * `G17P_FIRMWARE_EVENT_ENTRY_SIZE` (0x48) was already RE'd from J700 A000
+//     for THIS RING -- `read_primary_firmware_event` walks channel 13 through
+//     `PRIMARY_FIRMWARE_EVENT_CHANNEL_INDEX`, with the same entry, the same
+//     `states[0]`/`states[1]`, and the same 0x100 capacity.
+//
+// That last point also means this ring is NOT unread by the driver: the
+// firmware-event worker services it. A separate reader here exists only to
+// witness, without consuming, what the worker has or has not taken.
+// ---------------------------------------------------------------------------
+
+/// Channel-table index carrying the event state/ring pointer pair.
+pub(crate) const G17P_EVENT_CHANNEL_TABLE_INDEX: usize = 13;
+pub(crate) const G17P_EVENT_STATE_STATUS_A_OFFSET: u64 = 0x0_0040;
+pub(crate) const G17P_EVENT_RING_STATUS_A_OFFSET: u64 = 0x0_02c0;
+/// Firmware-log ring-0 control block. Read only to show, in the same line,
+/// that it is *not* the event producer.
+pub(crate) const G17P_FWLOG_CONTROL_STATUS_A_OFFSET: u64 = 0x0_0080;
+/// 0x100 entries. Same capacity as `G17P_FIRMWARE_EVENT_CAPACITY`, which
+/// describes this same ring.
+pub(crate) const G17P_EVENT_CAPACITY: u32 = G17P_FIRMWARE_EVENT_CAPACITY;
+/// 0x48 bytes per entry -- see the block comment above. Deliberately NOT
+/// `REPORT_ENTRY_SIZE`.
+pub(crate) const G17P_EVENT_ENTRY_SIZE: usize = G17P_FIRMWARE_EVENT_ENTRY_SIZE;
+/// Firmware event type names, for logging. Type 4 is the one that matters:
+/// the firmware halted and is asking the host to run the restart handshake.
+pub(crate) fn g17p_firmware_event_name(event_type: u32) -> &'static str {
+    match event_type {
+        0 => "fault",
+        1 => "stamp-flags",
+        4 => "gpu-restart",
+        7 => "uma-grow-request",
+        8 => "channel-error",
+        13 => "uma-async-grow-complete",
+        _ => "unmodelled",
+    }
+}
+/// Host-written read pointer, `state + 0x00`.
+pub(crate) const G17P_EVENT_CONSUMER_OFFSET: u64 = 0x00;
+/// Firmware-written write pointer, `state + 0x20`.
+pub(crate) const G17P_EVENT_PRODUCER_OFFSET: u64 = 0x20;
+
+impl Channel13EventRecord {
+    /// Short stable name for logging.
+    pub(crate) fn name(&self) -> &'static str {
+        match self {
+            Channel13EventRecord::Fault(_) => "fault",
+            Channel13EventRecord::Flag(_) => "flag",
+            Channel13EventRecord::Timeout(_) => "timeout",
+            Channel13EventRecord::GrowTilingBuffer(_) => "grow-tiling-buffer",
+            Channel13EventRecord::ChannelError => "channel-error",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// KTrace ring -- channel-table entry 14, states[0]/states[1].
+//
+// `main_config + 0x1e0` is the KTrace state block (`status_a + 0x240`) and
+// `main_config + 0x1e8` is the 0x200 x 0x48 KTrace ring (`status_a + 0xa6ac0`).
+// The Stats channel shares the same table entry through `states[2]` and
+// `ring`, which is why `REPORT_ENTRY_SIZE` / `REPORT_CURSOR_MASK` /
+// `SplitReportCursor` must not be reused here: this ring has 0x200 entries of
+// 0x48 bytes and cursors that run to 0x1ff.
+//
+// The firmware emitter writes every u64 field with `stur`, so all of them are
+// unaligned; the byte-copy `get_u64` helper below already handles that. Bytes
+// 0x34..0x47 of a record are never written by the firmware and must not be
+// read.
+// ---------------------------------------------------------------------------
+
+/// Channel-table index carrying the KTrace state/ring pointer pair.
+pub(crate) const G17P_KTRACE_CHANNEL_TABLE_INDEX: usize = 14;
+pub(crate) const G17P_KTRACE_STATE_STATUS_A_OFFSET: u64 = 0x0_0240;
+pub(crate) const G17P_KTRACE_RING_STATUS_A_OFFSET: u64 = 0xa_6ac0;
+pub(crate) const G17P_KTRACE_ENTRY_SIZE: usize = 0x48;
+pub(crate) const G17P_KTRACE_CAPACITY: u32 = 0x200;
+/// Host-written read pointer, `state + 0x00`.
+pub(crate) const G17P_KTRACE_CONSUMER_OFFSET: u64 = 0x00;
+/// Firmware-written write pointer, `state + 0x20`.
+pub(crate) const G17P_KTRACE_PRODUCER_OFFSET: u64 = 0x20;
+/// `kAGFIFirmwareEventTypeFWTrace`.
+pub(crate) const G17P_KTRACE_RECORD_TYPE: u32 = 5;
+/// Channel 1 code 0x1c: records-lost marker. Emitted from inside the emitter
+/// itself with no class-mask test, so it appears whatever the mask is.
+pub(crate) const G17P_KTRACE_LOST_KEY: u16 = 0x011c;
+/// Channel 0 code 0x41: tag-14 `KsmKickQueueAddKicks`. No branch separates the
+/// trace call from the `sgx+0x1_03a8` / `sgx+0x2_1018` stores, so one of these
+/// records proves the KSM was programmed.
+pub(crate) const G17P_KTRACE_ADD_KICKS_KEY: u16 = 0x0041;
+/// Channel 0 code 0x46: KSM scheduling-pause reason-mask change,
+/// `(set?, reason_bit, resulting_mask)`.
+pub(crate) const G17P_KTRACE_PAUSE_REASON_KEY: u16 = 0x0046;
+
+/// Submission-path keys printed by default (`channel << 8 | code`).
+pub(crate) const G17P_KTRACE_INTEREST_KEYS: [u16; 10] = [
+    0x000a, // stamp update / retire
+    0x000c, // stamp update / retire
+    0x000e, // stamp update / retire
+    0x0020, // device-control command retired
+    0x0040, // tag 15 queue programmed (emitted at b1 0x11a84)
+    0x0041, // tag 14 KsmKickQueueAddKicks
+    0x0046, // KSM scheduling-pause reason-mask change
+    0x004b, // kick-queue config value change (tag 15)
+    0x0057, // tag 16 KsmKickQueueEntrySignal
+    0x011c, // records lost
+];
+
+pub(crate) fn g17p_ktrace_key_is_interesting(key: u16) -> bool {
+    G17P_KTRACE_INTEREST_KEYS.contains(&key)
+}
+
+/// Short human tail naming the argument shape of the fixed-shape records.
+pub(crate) const fn g17p_ktrace_key_name(key: u16) -> &'static str {
+    match key {
+        0x0040 => "tag15-programmed qid/base/dm/prio",
+        0x0041 => "tag14-addkicks qid/stamp/slot/kicks",
+        0x0046 => "pause-reason set/bit/mask",
+        0x004b => "cfg qid/old/new",
+        0x0057 => "tag16-signal qid/stamp/value",
+        0x000a | 0x000c | 0x000e => "stamp-update value/index/uuid/ctx",
+        0x0020 => "devctl-retired",
+        0x011c => "RECORDS-LOST count/window",
+        _ => "",
+    }
+}
+
+/// One decoded KTrace record.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PKtraceRecord {
+    pub(crate) timestamp: u64,
+    pub(crate) args: [u64; 4],
+    pub(crate) code: u8,
+    pub(crate) channel: u8,
+    pub(crate) thread: u8,
+    pub(crate) flag: u32,
+}
+
+impl G17PKtraceRecord {
+    /// `channel << 8 | code`, the key used by the interest filter.
+    pub(crate) const fn key(&self) -> u16 {
+        ((self.channel as u16) << 8) | self.code as u16
+    }
+}
+
+pub(crate) fn decode_g17p_ktrace(raw: &[u8]) -> Result<G17PKtraceRecord, CompletionDecodeError> {
+    if raw.len() != G17P_KTRACE_ENTRY_SIZE {
+        return Err(CompletionDecodeError::RecordSize);
+    }
+    if get_u32(raw, 0x00) != G17P_KTRACE_RECORD_TYPE {
+        return Err(CompletionDecodeError::TraceShape);
+    }
+    let code_thread = get_u32(raw, 0x2c);
+    Ok(G17PKtraceRecord {
+        timestamp: get_u64(raw, 0x04),
+        args: [
+            get_u64(raw, 0x0c),
+            get_u64(raw, 0x14),
+            get_u64(raw, 0x1c),
+            get_u64(raw, 0x24),
+        ],
+        code: (code_thread & 0xff) as u8,
+        channel: ((code_thread >> 8) & 0xff) as u8,
+        thread: (code_thread >> 24) as u8,
+        flag: get_u32(raw, 0x30),
+    })
+}
+
+/// Wrap/empty logic for the trace ring. Returns the byte offset of the record
+/// at `consumer` and the read pointer to publish once it has been copied.
+///
+/// Both cursors are indices already reduced mod 0x200; the firmware publishes
+/// `(producer + 1) & 0x1ff`, so a difference must never be re-masked before
+/// being used as a count.
+pub(crate) const fn prepare_g17p_ktrace_read(
+    consumer: u32,
+    producer: u32,
+) -> Result<(u32, u32), CompletionDecodeError> {
+    if consumer >= G17P_KTRACE_CAPACITY || producer >= G17P_KTRACE_CAPACITY {
+        return Err(CompletionDecodeError::FirmwareEventCursor);
+    }
+    if consumer == producer {
+        return Err(CompletionDecodeError::FirmwareEventEmpty);
+    }
+    Ok((
+        consumer * G17P_KTRACE_ENTRY_SIZE as u32,
+        (consumer + 1) & (G17P_KTRACE_CAPACITY - 1),
+    ))
+}
 
 const REPORT_CURSOR_MASK: u32 = 0xff;
 const KSM_TIMESTAMP_MASK: u64 = 0x00ff_ffff_ffff;
@@ -1356,8 +1581,8 @@ mod tests {
         event[8..12].copy_from_slice(&0u32.to_le_bytes());
         event[12..20].copy_from_slice(&0xffff_fc20_c082_8000u64.to_le_bytes());
         event[20..28].copy_from_slice(&0x70_0020_8000u64.to_le_bytes());
-        event[28..36].copy_from_slice(&0x70_0020_8640u64.to_le_bytes());
-        event[36..40].copy_from_slice(&0x18u32.to_le_bytes());
+        event[28..36].copy_from_slice(&0x70_0020_8580u64.to_le_bytes());
+        event[36..40].copy_from_slice(&0x20u32.to_le_bytes());
         assert_eq!(
             decode_g17p_firmware_uma_grow_event(&event),
             Ok(G17PFirmwareUmaGrowEvent {
@@ -1365,8 +1590,8 @@ mod tests {
                 pool_index: 0,
                 shared_control: 0xffff_fc20_c082_8000,
                 operand_table: 0x70_0020_8000,
-                cookie: 0x70_0020_8640,
-                result: 0x18,
+                cookie: 0x70_0020_8580,
+                result: 0x20,
             })
         );
     }

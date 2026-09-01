@@ -83,7 +83,8 @@ pub(crate) enum UapiTranslateError {
     QueueUscRange,
     AddressRange,
     AddressAlignment,
-    Flags,
+    FlagsUnknownBits,
+    FlagsUnsupported,
     Dimensions,
     Layers,
     UtileDimensions,
@@ -109,6 +110,46 @@ impl From<RenderBuildError> for UapiTranslateError {
 impl From<g17_compute::ComputeBuildError> for UapiTranslateError {
     fn from(value: g17_compute::ComputeBuildError) -> Self {
         Self::ComputeBuild(value)
+    }
+}
+
+impl UapiTranslateError {
+    /// Stable short name for one rejection, so a failing submit reports which
+    /// check refused it instead of a bare EINVAL. Kept as `&'static str` (no
+    /// `Debug` formatting) to stay cheap on the ioctl path.
+    pub(crate) fn name(&self) -> &'static str {
+        match self {
+            Self::HeaderTruncated => "header-truncated",
+            Self::PayloadTruncated => "payload-truncated",
+            Self::PayloadTail => "payload-tail",
+            Self::CommandType => "command-type",
+            Self::AttachmentPayloadSize => "attachment-payload-size",
+            Self::AttachmentCount => "attachment-count",
+            Self::AttachmentFields => "attachment-fields",
+            Self::AttachmentBarrier => "attachment-barrier",
+            Self::HardwareCommandCount => "hardware-command-count",
+            Self::BarrierFuture => "barrier-future",
+            Self::QueueUscAlignment => "queue-usc-alignment",
+            Self::QueueUscRange => "queue-usc-range",
+            Self::AddressRange => "address-range",
+            Self::AddressAlignment => "address-alignment",
+            Self::FlagsUnknownBits => "flags-unknown-bits",
+            Self::FlagsUnsupported => "flags-unsupported",
+            Self::Dimensions => "dimensions",
+            Self::Layers => "layers",
+            Self::UtileDimensions => "utile-dimensions",
+            Self::Samples => "samples",
+            Self::TilebufferSize => "tilebuffer-size",
+            Self::SamplerCount => "sampler-count",
+            Self::SamplerPair => "sampler-pair",
+            Self::HelperProgram => "helper-program",
+            Self::Add3ProofAttachments => "add3-proof-attachments",
+            Self::ProgramOffset => "program-offset",
+            Self::ZlsFields => "zls-fields",
+            Self::StencilClearBits => "stencil-clear-bits",
+            Self::RenderBuild(_) => "render-build",
+            Self::ComputeBuild(_) => "compute-build",
+        }
     }
 }
 
@@ -571,9 +612,12 @@ impl QueueUscWindow {
             .checked_add((tagged_offset & !7) as u64)
             .ok_or(UapiTranslateError::ProgramOffset)?;
         require_range(address_space, allocation, 4, GpuAccess::Read)?;
-        self.base
-            .checked_add(tagged_offset as u64)
-            .ok_or(UapiTranslateError::ProgramOffset)
+        // Honeykrisp carries resource metadata in the low three UAPI bits,
+        // but G17P's native 3D command strips those bits before programming
+        // every BG/EOT/partial USC address. Preserving bit 2 launched four
+        // bytes into the instruction stream and contradicted all complete
+        // Metal register-list captures.
+        Ok(allocation)
     }
 }
 
@@ -691,22 +735,39 @@ pub(crate) fn translate_render_command<A: GpuAddressSpace>(
     address_space: &A,
     internal: RenderInternalState,
 ) -> Result<TranslatedRenderCommand, UapiTranslateError> {
-    if command.flags & !RENDER_FLAGS != 0
-        || command.flags & (RENDER_VERTEX_SCRATCH | RENDER_NO_VERTEX_CLUSTERING) != 0
-    {
-        return Err(UapiTranslateError::Flags);
+    if command.flags & !RENDER_FLAGS != 0 {
+        return Err(UapiTranslateError::FlagsUnknownBits);
     }
-    let has_resource_spec_high = [
-        command.background.resource_spec,
-        command.end_of_tile.resource_spec,
-        command.partial_background.resource_spec,
-        command.partial_end_of_tile.resource_spec,
-    ]
-    .iter()
-    .any(|value| value >> 32 != 0);
-    if has_resource_spec_high && command.flags & RENDER_RSRC_SPEC_HI == 0 {
-        return Err(UapiTranslateError::Flags);
+    // Genuinely unimplemented on G17P rather than merely unvalidated:
+    // `G17pRenderParameters` carries no helper-program fields at all, so
+    // VERTEX_SCRATCH has nowhere to put the scratch binding, and there is no
+    // cluster-count control for NO_VERTEX_CLUSTERING. A clean EINVAL beats
+    // rendering with the request silently dropped.
+    if command.flags & (RENDER_VERTEX_SCRATCH | RENDER_NO_VERTEX_CLUSTERING) != 0 {
+        return Err(UapiTranslateError::FlagsUnsupported);
     }
+    // RSRC_SPEC_HI is *declarative*, and honouring it must not mean rejecting.
+    // The UAPI defines it as "the appended resource-specifier high dwords are
+    // present", and states its purpose: "This flag lets old kernels report an
+    // unsupported render payload instead of silently truncating 64-bit G17
+    // values." It exists for kernels that do NOT understand the dwords.
+    //
+    // This kernel does understand them -- `program()` ORs the high dword in
+    // unconditionally, with no reference to the flag -- so the flag cannot
+    // change what we do with a payload that sets it. The old check therefore
+    // refused payloads it would otherwise have handled identically, protecting
+    // nothing; it is the same bring-up leftover as the stencil-clear mask.
+    //
+    // Honour the documented meaning instead: when the flag is clear the high
+    // dwords are "not present", so mask them off rather than refuse the
+    // submission. A userspace built against the 240-byte upstream struct (whose
+    // payload `padded_payload` zero-fills) and one that clears the flag now
+    // behave identically, which is what "not present" has to mean.
+    let resource_spec_mask = if command.flags & RENDER_RSRC_SPEC_HI != 0 {
+        u64::MAX
+    } else {
+        u32::MAX as u64
+    };
     if !(1..=16_384).contains(&command.width) || !(1..=16_384).contains(&command.height) {
         return Err(UapiTranslateError::Dimensions);
     }
@@ -782,9 +843,19 @@ pub(crate) fn translate_render_command<A: GpuAddressSpace>(
     {
         return Err(UapiTranslateError::HelperProgram);
     }
-    if command.stencil_clear & !0xff != 0 {
-        return Err(UapiTranslateError::StencilClearBits);
-    }
+    // `isp_bgobjvals` is the *whole* ISP_BGOBJVALS register value, not just
+    // the stencil clear: the UAPI documents "the bottom 8-bits contain the
+    // stencil buffer clear value", and every Mesa backend unconditionally
+    // seeds the upper bits with 0x300 before OR-ing the clear in
+    // (hk_cmd_draw.c `render->cr.isp_bgobjvals = 0x300;`,
+    // agx_pipe.c `c->isp_bgobjvals = 0x300;`, d12_queue.c `0x300 | stencil`).
+    // The legacy queue path passes the field straight through to the firmware
+    // (queue/render.rs `let load_bgobjvals = cmdbuf.isp_bgobjvals as u64`), so
+    // rejecting anything above 0xff refused every real render pass while the
+    // in-tree render selftest -- which leaves the field zero -- was accepted.
+    // Accept the register value; `build_*_descriptor` re-asserts the 0x300
+    // bits with `stencil_clear_value | 0x300`, which is idempotent for the
+    // value userspace sends and still supplies 0x300 when it sends zero.
 
     let background = queue.full_program(address_space, command.background.usc)?;
     let end_of_tile = queue.full_program(address_space, command.end_of_tile.usc)?;
@@ -836,13 +907,21 @@ pub(crate) fn translate_render_command<A: GpuAddressSpace>(
     parameters.merge_upper_y_bits = command.merge_upper_y;
     parameters.depth_clear_value_bits = command.depth_clear;
     parameters.stencil_clear_value = command.stencil_clear;
-    parameters.load_pipeline_bind = BG_RESOURCE_PREFIX | command.background.resource_spec;
+    parameters.load_pipeline_bind =
+        internal.parameters.bg_resource_prefix
+            | (command.background.resource_spec & resource_spec_mask);
     parameters.load_pipeline = background;
-    parameters.store_pipeline_bind = command.end_of_tile.resource_spec;
+    parameters.store_pipeline_bind = command.end_of_tile.resource_spec & resource_spec_mask;
     parameters.store_pipeline = end_of_tile;
-    parameters.partial_load_pipeline_bind = command.partial_background.resource_spec;
+    // Partial resume/load executes the same background program contract as
+    // the main load. Native writes the identical resource-specifier prefix at
+    // fragment +0xd4, +0xefc, +0x1604, and +0x1ea8; applying it only to the
+    // main phase left every partial path with a different address class.
+    parameters.partial_load_pipeline_bind = internal.parameters.bg_resource_prefix
+        | (command.partial_background.resource_spec & resource_spec_mask);
     parameters.partial_load_pipeline = partial_background;
-    parameters.partial_store_pipeline_bind = command.partial_end_of_tile.resource_spec;
+    parameters.partial_store_pipeline_bind =
+        command.partial_end_of_tile.resource_spec & resource_spec_mask;
     parameters.partial_store_pipeline = partial_end_of_tile;
 
     Ok(TranslatedRenderCommand {
@@ -895,7 +974,7 @@ pub(crate) fn translate_compute_command<A: GpuAddressSpace>(
 ) -> Result<TranslatedComputeCommand, UapiTranslateError> {
     queue.validate()?;
     if command.flags & !COMPUTE_G17P_ADD3_PROOF != 0 {
-        return Err(UapiTranslateError::Flags);
+        return Err(UapiTranslateError::FlagsUnknownBits);
     }
     if command.control_stream_base & 3 != 0
         || command.control_stream_end & 3 != 0
@@ -1171,15 +1250,15 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(translated.parameters.load_pipeline, 0x11_0001_0004);
-        assert_eq!(translated.parameters.store_pipeline, 0x11_0002_0004);
+        assert_eq!(translated.parameters.load_pipeline, 0x11_0001_0000);
+        assert_eq!(translated.parameters.store_pipeline, 0x11_0002_0000);
         assert_eq!(
             translated.parameters.load_pipeline_bind,
             0x0007_8000_0000_0040
         );
         assert_eq!(translated.parameters.store_pipeline_bind, 0x8);
-        assert_eq!(translated.parameters.partial_load_pipeline, 0x11_0001_0004);
-        assert_eq!(translated.parameters.partial_store_pipeline, 0x11_0002_0004);
+        assert_eq!(translated.parameters.partial_load_pipeline, 0x11_0001_0000);
+        assert_eq!(translated.parameters.partial_store_pipeline, 0x11_0002_0000);
         assert_eq!(translated.parameters.utile_config, 0xa000);
         assert_eq!(translated.parameters.tib_blocks, 2);
         assert_eq!(translated.parameters.tile_config, 0x1_0280);
@@ -1287,20 +1366,25 @@ mod tests {
             0x0007_8002_0000_0042
         );
 
+        // Clearing RSRC_SPEC_HI means "the high dwords are not present", so
+        // they are masked off -- not grounds to refuse the submission.
         let mut no_flag = payload;
         no_flag.flags &= !RENDER_RSRC_SPEC_HI;
+        let masked = translate_render_command(
+            no_flag,
+            vertex,
+            fragment,
+            window(),
+            &TestAddressSpace,
+            RenderInternalState {
+                parameters: G17pRenderParameters::source_rsrc8(),
+            },
+        )
+        .unwrap();
+        assert_eq!(masked.parameters.load_pipeline_bind, 0x0007_8000_0000_0042);
         assert_eq!(
-            translate_render_command(
-                no_flag,
-                vertex,
-                fragment,
-                window(),
-                &TestAddressSpace,
-                RenderInternalState {
-                    parameters: G17pRenderParameters::source_rsrc8(),
-                },
-            ),
-            Err(UapiTranslateError::Flags)
+            masked.parameters.partial_load_pipeline_bind,
+            0x0007_8000_0000_0043
         );
     }
 
