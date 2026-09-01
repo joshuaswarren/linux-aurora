@@ -1323,8 +1323,8 @@ pub(crate) fn apply_g17p_cold_opening_leaf_page(
     Ok(())
 }
 
-/// Select the Pool-A record used by one render pass. The diagnostic moves only
-/// the cold first pass from record 0 to the captured record 1. Retained native
+/// Select the Pool-A record used by one render pass. Native G17P moves the cold
+/// first pass from record 0 to the captured record 1. Retained native
 /// scenes can reuse an index across multiple sequence values, so the traces do
 /// not justify replacing Linux's retained `ordinal * 2` policy globally.
 pub(crate) const fn g17p_render_pool_a_record_index(
