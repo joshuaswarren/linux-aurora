@@ -252,6 +252,10 @@ kernel::module_platform_driver! {
             default: 1,
             description: "G17P parameter-buffer binding mode. 0: established packed-object fallback. 1: bind the exact PM-mode2 0xc0-byte HWPB state at both TA +0x20 and Fragment +0x28 and publish the same object in TA ConfigUpdate +0x6e, matching Metal pointer identity. 2: DIAGNOSTIC ONLY -- keep the mode-1 descriptor pointers and coherent PBDesc/HWPB ID but publish zero at TA ConfigUpdate +0x6e, isolating firmware HWPB-bind admission from descriptor execution. 3: DIAGNOSTIC ONLY -- reproduce the last TA-starting Linux pointer arrangement: packed object at TA +0x20 and TA ConfigUpdate +0x6e, PM HWPB only at Fragment +0x28.",
         },
+        g17p_ksm_cold_arm: u32 {
+            default: 0,
+            description: "DIAGNOSTIC ONLY -- before the render doorbell, perform from the host the one-time KSM arm that b1's scheduler pass FUN_25644 performs for itself (sgx+0x21140 = 1<<63, gated in firmware on DAT_124b8d && DAT_177d18). A cold-boot render publishes tag-15/tag-14 for both stages and is never drained; 21ms later firmware thread 4 raises pause reason 0x1000 and both queues are NOP-retired as stopped-with-pending-kicks. One completed compute makes the same publication drain 18us later and the TA execute. This asks whether that arm is the state the compute establishes. Native performs ZERO MMIO on the submit path, so a positive result identifies the gate, it does not license keeping this write.",
+        },
         g17p_render_usc_freelist: u32 {
             default: 1,
             description: "NATIVE-DERIVED FIRST-SUBMIT CONTROL. Before the first render doorbell, publish AGXUSCPrivMemFList::updateSubmitInfo as the exact 0x40-byte opcode-0x20 device-control record naming Linux-owned resources. A matching firmware type-13 record is accepted only while the retained owner is live; release uses opcode 0x2e. 0: diagnostic suppression, 1: publish the cold render FList (default).",

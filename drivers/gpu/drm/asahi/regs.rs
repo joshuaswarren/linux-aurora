@@ -583,6 +583,45 @@ impl Resources {
         Ok(())
     }
 
+    /// DIAGNOSTIC. Perform, from the host, the one-time KSM arm that b1's
+    /// scheduler pass `FUN_25644` does for itself.
+    ///
+    /// That pass writes `sgx+0x21140 = 1 << 63` exactly once, gated on the
+    /// firmware globals `DAT_124b8d == 1 && DAT_177d18 == 1`, and clears the
+    /// first one afterwards (b1 0x25b00/0x25d48). Measured on hardware: on a
+    /// cold boot a render publishes tag-15 and tag-14 for both stages and then
+    /// NOTHING drains the work channel for ~21ms, after which firmware thread
+    /// 4 raises pause reason 0x1000 and both queues are declared stopped with
+    /// pending kicks (KTrace 0x42 for qid 5 AND qid 6) and NOP-retired. With
+    /// one completed compute first, the same publication is drained 18us later
+    /// (KTrace 0x47) and the TA executes. Three renders from cold never
+    /// bootstrap it, so the trigger is a completed classic job, not merely a
+    /// prior submission.
+    ///
+    /// Native never writes this: the whole Metal submit path performs ZERO
+    /// MMIO (measured over every process, reads and writes). So this is not a
+    /// candidate fix, only an instrument to decide whether that arm is the
+    /// state a completed compute establishes.
+    ///
+    /// REFUTED ON HARDWARE 2026-09-02. The write lands (the port reports
+    /// success and the GPC gate is open), and the cold render fails exactly as
+    /// before: no drain, pause 0x1000 from thread 4, KTrace 0x42 for qid 5 and
+    /// qid 6, both NOP-retired, tiling timestamps still zero. The one-time
+    /// 0x21140 arm is therefore NOT what a completed compute establishes.
+    /// Kept, default off, so the negative result is not re-derived.
+    pub(crate) fn g17p_ksm_cold_arm(&self) -> Result {
+        if !self.g17p_sksm_port_powered() {
+            return Err(EAGAIN);
+        }
+        let _guard = self.sksm_fifo.lock();
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let registers = sgx.relaxed();
+        let tag = 0x21140u64 | (1u64 << 42);
+        registers.try_write64(tag, 0x4090)?;
+        registers.try_write64(1u64 << 63, 0x4098)?;
+        Ok(())
+    }
+
     /// Whether the SKSM tag/data port can be driven from the host right now.
     ///
     /// The asynchronous SErrors that made every host SKSM write suppressible
@@ -748,6 +787,12 @@ impl Resources {
         if count < deferred.pairs.len() {
             deferred.pairs[count] = Some(pair);
             deferred.count = count + 1;
+            // A newly deferred pair has never been issued, so the one-shot
+            // latch must reopen. It was written for a single compute replay;
+            // left latched, the FIRST render's suppressed fragment QID install
+            // would be the last one ever replayed and every later submission
+            // would silently drop its own.
+            deferred.replayed = false;
         }
     }
 

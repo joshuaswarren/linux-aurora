@@ -2004,6 +2004,7 @@ fn prepare_g17p_partial_opening_outer_slot(
     channel_table_index: u8,
     queue_grid_index: u8, // the QID this slot dispatches to
     kind: u32,
+    channel_started: bool,
 ) -> Result<G17PPartialOpeningOuterSlotPlan, SubmissionError> {
     if state.producer >= G17P_PARTIAL_OPENING_OUTER_SLOT_COUNT
         || state
@@ -2039,10 +2040,22 @@ fn prepare_g17p_partial_opening_outer_slot(
     // This byte must agree with the QID published in tag-15, tag-14 and the
     // SKSM registration. It follows the retained queue object even when a
     // recovered compute session advances past its first QID.
+    //
+    // +0x17 is NOT a constant. `AGXArmFirmware::encodeAcceleratorRingCommand`
+    // fills this entry as `+0x08 chanstate fwva, +0x10 type, +0x14 info[0],
+    // +0x16 qid, +0x17 !chan[0x3c]` -- the last byte is the logical NOT of a
+    // channel state word, so it is 0 once that word is set. MEASURED on macOS
+    // 2026-09-02: a live Metal render's data-master ring entries carry 0x00
+    // there for BOTH stages (`00 3c 00 10 .. 39 01 08 00` for 3D and
+    // `.. 43 01 07 00` for TA), across two independent captures with different
+    // queue ids. This driver hardcoded bit 24, i.e. it told firmware the
+    // channel state word was clear on every single submission.
     put_u32_le(
         &mut slot,
         0x14,
-        state.queue_write_index | ((queue_grid_index as u32) << 16) | (1 << 24),
+        state.queue_write_index
+            | ((queue_grid_index as u32) << 16)
+            | (if channel_started { 0 } else { 1 << 24 }),
     );
 
     Ok(G17PPartialOpeningOuterSlotPlan {
@@ -2058,11 +2071,14 @@ pub(crate) fn prepare_g17p_compute_channel_work(
     state: G17PPartialOpeningOuterChannelState,
     queue_id: u8,
 ) -> Result<PreparedG17PComputeChannelWork, SubmissionError> {
+    // Compute is left byte-for-byte as proven by 2000 consecutive passing
+    // submissions; only the render stages are moved onto the measured value.
     let outer = prepare_g17p_partial_opening_outer_slot(
         state,
         G17P_COMPUTE_CHANNEL_TABLE_INDEX,
         queue_id,
         PipeType::Compute as u32,
+        false,
     )?;
     Ok(PreparedG17PComputeChannelWork {
         outer,
@@ -2085,6 +2101,7 @@ pub(crate) fn prepare_g17p_partial_opening_work_pair(
         G17P_PARTIAL_OPENING_FRAGMENT_CHANNEL_TABLE_INDEX,
         fragment_queue_id,
         1,
+        true,
     ) {
         Ok(value) => value,
         Err(error) => return Err(error),
@@ -2094,6 +2111,7 @@ pub(crate) fn prepare_g17p_partial_opening_work_pair(
         G17P_PARTIAL_OPENING_TILING_CHANNEL_TABLE_INDEX,
         tiling_queue_id,
         0,
+        true,
     ) {
         Ok(value) => value,
         Err(error) => return Err(error),
