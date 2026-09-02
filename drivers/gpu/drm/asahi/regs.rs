@@ -795,6 +795,14 @@ impl Resources {
     /// is not receiving GPU hardware interrupts at all -- which would explain
     /// why no job is ever created for ANY workload, compute included.
     pub(crate) fn g17p_burst_sample_irq(&self, out: &mut [(u64, u64, u64); 12]) -> Result<usize> {
+        // MUST be gated: an sgx read taken with the graphics cores gated off
+        // raises an asynchronous SError and kills the machine. The render
+        // window happens to run with the cores up, so this was survivable
+        // there; calling the same helper from the compute path without the
+        // gate killed the target outright.
+        if !self.g17p_sksm_port_powered() {
+            return Err(EAGAIN);
+        }
         let sgx = self.sgx.try_access().ok_or(ENODEV)?;
         let registers = sgx.relaxed();
         let mut distinct = 0usize;
