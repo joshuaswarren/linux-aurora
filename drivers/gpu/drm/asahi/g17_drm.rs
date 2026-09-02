@@ -1175,7 +1175,13 @@ impl queue::Queue for G17PQueue {
                     // yields zero primitives. Its first bytes say whether it
                     // contains a draw at all.
                     if *module_parameters::g17p_vdm_dump.value() != 0 {
-                        let mut head = [0u8; 128];
+                        // 1 KiB, not 128 bytes: the G17P native bind tail
+                        // (hk_g17p_emit_native_bind_tail) emits its bind0
+                        // structure INLINE into this stream and reaches past
+                        // offset 0x340, so a 128-byte window stops before the
+                        // PPP/graphics-core state that decides whether
+                        // primitives survive.
+                        let mut head = [0u8; 1024];
                         match self.vm.read_bytes(payload.vdm_base, &mut head) {
                             Ok(()) => Self::log_hex("vdm", payload.vdm_base, &head),
                             Err(error) => pr_info!(
