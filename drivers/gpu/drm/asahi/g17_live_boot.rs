@@ -3537,6 +3537,23 @@ impl G17PLiveRuntime {
         // this driver rang between the two groups has no counterpart in the
         // oracle. Publish the tiling group first, then ring the single
         // doorbell below.
+        if *module_parameters::g17p_seed_work_channel.value() != 0 {
+            if let Some(registers) = self.registers.as_ref() {
+                let value = u64::from(*module_parameters::g17p_seed_work_channel.value());
+                match registers.g17p_seed_work_channel(value) {
+                    Ok(()) => dev_info!(
+                        self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                        "G17P render: DIAGNOSTIC seeded KSM work channel 0x21168 = {:#x}\n",
+                        value,
+                    ),
+                    Err(error) => dev_warn!(
+                        self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                        "G17P render: DIAGNOSTIC work-channel seed failed ({:?})\n",
+                        error,
+                    ),
+                }
+            }
+        }
         if *module_parameters::g17p_ksm_cold_arm.value() != 0 {
             if let Some(registers) = self.registers.as_ref() {
                 match registers.g17p_ksm_cold_arm() {
