@@ -2755,7 +2755,8 @@ fn build_g17p_late_tiling_bytes(
         g17_submission::encode_g17p_compute_optional_event(
             g17_submission::G17PComputeOptionalEvent {
                 queue_id: g17p_render_queue_id(true),
-                old_timestamp: u64::from(entry_stamp),
+                // See the fragment sites: this field is the previous stamp.
+                old_timestamp: u64::from(entry_stamp).saturating_sub(1),
             },
             &mut bytes.entry_signal,
         )?;
@@ -6395,7 +6396,12 @@ impl G17PUserRenderStorage {
                 g17_submission::encode_g17p_compute_optional_event(
                     g17_submission::G17PComputeOptionalEvent {
                         queue_id: g17p_render_queue_id(false),
-                        old_timestamp: u64::from(entry_stamp),
+                        // `old_timestamp` means the PREVIOUS stamp, not this
+                        // submission's own. Compute's depth wall was exactly
+                        // this field naming the stamp being queued, which let
+                        // the firmware retire the entry before the dispatch
+                        // ran; see the tag-16 fix that took compute to 100/100.
+                        old_timestamp: u64::from(entry_stamp).saturating_sub(1),
                     },
                     &mut raw[Self::FRAGMENT_ENTRY_SIGNAL
                         ..Self::FRAGMENT_ENTRY_SIGNAL
@@ -6706,7 +6712,12 @@ impl G17PUserRenderStorage {
                 g17_submission::encode_g17p_compute_optional_event(
                     g17_submission::G17PComputeOptionalEvent {
                         queue_id: g17p_render_queue_id(false),
-                        old_timestamp: u64::from(entry_stamp),
+                        // `old_timestamp` means the PREVIOUS stamp, not this
+                        // submission's own. Compute's depth wall was exactly
+                        // this field naming the stamp being queued, which let
+                        // the firmware retire the entry before the dispatch
+                        // ran; see the tag-16 fix that took compute to 100/100.
+                        old_timestamp: u64::from(entry_stamp).saturating_sub(1),
                     },
                     &mut raw[Self::FRAGMENT_ENTRY_SIGNAL
                         ..Self::FRAGMENT_ENTRY_SIGNAL
