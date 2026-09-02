@@ -3569,6 +3569,33 @@ impl G17PLiveRuntime {
                 }
             }
         }
+        if *module_parameters::g17p_admit_arm.value() != 0 {
+            if let Some(registers) = self.registers.as_ref() {
+                let both = *module_parameters::g17p_admit_arm.value() >= 2;
+                let mut queues = KVec::new();
+                queues.push(g17_resources::g17p_render_queue_id(true) as u8, GFP_KERNEL)?;
+                if both {
+                    queues.push(g17_resources::g17p_render_queue_id(false) as u8, GFP_KERNEL)?;
+                }
+                for qid in queues {
+                    match registers.g17p_arm_queue_admit(qid) {
+                        Ok((before, after)) => dev_info!(
+                            self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                            "G17P render: DIAGNOSTIC admit-arm qid {} descriptor {:#018x} -> {:#018x}\n",
+                            qid,
+                            before,
+                            after,
+                        ),
+                        Err(error) => dev_warn!(
+                            self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                            "G17P render: DIAGNOSTIC admit-arm qid {} failed ({:?})\n",
+                            qid,
+                            error,
+                        ),
+                    }
+                }
+            }
+        }
         if *module_parameters::g17p_render_seed_ts.value() != 0 {
             if let Some(registers) = self.registers.as_ref() {
                 for qid in [

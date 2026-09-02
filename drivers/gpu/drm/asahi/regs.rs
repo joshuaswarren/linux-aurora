@@ -762,6 +762,36 @@ impl Resources {
         Ok((before, after))
     }
 
+    /// DIAGNOSTIC. Set descriptor bit 63 for one queue before the doorbell.
+    ///
+    /// b1's admit block at 0x12dc0 windows the per-queue register file with
+    /// `sgx[0x103a8] = qid` and then tests `tbnz sgx[0x21008], #63`. Set, the
+    /// admitted byte becomes `0x21020 - 0x21028 + 1`; clear, it is zero, which
+    /// leaves A equal to B at `0x58010 + qid*0x28 + 0x418/0x419` and the
+    /// scheduler parks the queue and NOP-retires it with status 4 -- the exact
+    /// cold-render symptom. Nothing in the firmware image writes bit 63 (only
+    /// bit 62, at 0xd1d4 and 0x164e4), so it is hardware-set, and a cold boot
+    /// is precisely the case where the hardware has never set it.
+    ///
+    /// This asks whether that one bit is the cold gate. Native performs zero
+    /// MMIO on the submit path, so a positive result IDENTIFIES the gate and
+    /// does not license keeping the write.
+    pub(crate) fn g17p_arm_queue_admit(&self, qid: u8) -> Result<(u64, u64)> {
+        if !self.g17p_sksm_port_powered() {
+            return Err(EAGAIN);
+        }
+        let _guard = self.sksm_fifo.lock();
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let before = Self::g17p_sksm_port_read_locked(&sgx, 0x21008, u64::from(qid), 1u64 << 42)?;
+        let registers = sgx.relaxed();
+        let tag = 0x21008u64 | (u64::from(qid) << 43) | (1u64 << 42);
+        registers.try_write64(tag, 0x4090)?;
+        registers.try_write64(before | (1u64 << 63), 0x4098)?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        let after = Self::g17p_sksm_port_read_locked(&sgx, 0x21008, u64::from(qid), 1u64 << 42)?;
+        Ok((before, after))
+    }
+
     /// DIAGNOSTIC. Sample KSM slot 0's state register in a tight burst and
     /// return the distinct values seen, in order.
     ///
