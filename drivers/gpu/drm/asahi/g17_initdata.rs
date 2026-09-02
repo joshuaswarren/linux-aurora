@@ -93,6 +93,10 @@ pub(crate) const G17P_QOS_RESOURCE_SIZE: usize = 0xe40;
 pub(crate) const G17P_SKSM_QID_CONFIG_2700_OFFSET: usize = 0x2700;
 pub(crate) const G17P_SKSM_QID_CONFIG_2708_OFFSET: usize = 0x2708;
 pub(crate) const G17P_SKSM_QID_RESOURCE_OFFSET: usize = 0x27ac;
+/// Host->firmware transport selector, `initdata[0x26f8] = accel[0x4f8] & 1`
+/// (`AGXFirmware::initFirmwareData` @0xfffffe0008a20940). 1 = the host
+/// publishes channel commands; 0 = the host drives the MMIO kick bridge.
+const HW_DATA_TRANSPORT_SELECTOR_OFFSET: usize = 0x26f8;
 pub(crate) const G17P_SKSM_QID_CONFIG_2700: u64 = 1;
 pub(crate) const G17P_SKSM_QID_CONFIG_2708: u32 = 0x100;
 /// Firmware log enable word inside main config.
@@ -2150,6 +2154,26 @@ pub(crate) fn encode_hw_data(
     // deliberately absent from the runs: it is firmware state and must start
     // zero (the fill above guarantees it).
     write_runs(out, HW_DATA_OPAQUE_RUNS);
+    // The host->firmware transport selector.
+    //
+    // `AGXFirmware::initFirmwareData` @0xfffffe0008a20940 exports
+    // `initdata[0x26f8] = accel[0x4f8] & 1`. That same bit decides, in
+    // `AGX{TA,3D,CL}ChannelSKSM::submitBuffer`, whether the host publishes the
+    // command record and the tag-14 AddKicks as CHANNEL COMMANDS through
+    // `writeChannelCommandPointer` (bit set, `accel[0x10769] & 1 == 0`) or
+    // instead pushes onto the host kick-trace ring and drives
+    // `configureHardware`/`addKicks` over MMIO (bit clear).
+    //
+    // A live SKSM capture on this target shows tag-15 and tag-14 published as
+    // channel commands for both render queues, so native runs with the bit
+    // SET and this byte at 1. This driver uses the same channel-command
+    // transport but left the byte at 0 -- it is outside every
+    // `HW_DATA_OPAQUE_RUNS` extent and nothing else wrote it -- so the
+    // firmware was told the host drives the MMIO bridge while the host in
+    // fact speaks channel commands. Declare the transport we actually use.
+    if let Some(byte) = out.get_mut(HW_DATA_TRANSPORT_SELECTOR_OFFSET) {
+        *byte = 1;
+    }
     // Performance tables intentionally left zero; see
     // [`PERF_TABLE_VALUES_ENCODED`].
     Ok(())
