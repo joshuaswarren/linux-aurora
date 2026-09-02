@@ -14,16 +14,17 @@ Keep this list short and evidence-only. A build is not a hardware checkpoint.
 
 ## Current boundary
 
-- B1 creates the fragment job and `0x15a48` launches it into firmware state 2,
-  but hardware interrupt status `+0x10a10` remains `0x101`: required bit 3 is
-  absent. Consequently no per-slot completion is routed and firmware never
-  advances the job to state 3.
+- B1 creates the fragment job, but SGX `+0x10408` remains at its `0x100`
+  idle/reset value. `0x15a48` would overwrite it with 0 or 1 immediately
+  before launching the job into state 2, so the state-1 callback has not
+  reached the launch write. The absent `+0x10a10` bit 3 and empty per-slot
+  completion bitmap are consequences, not the first failed predicate.
 - The resource-manager clear/go masks and callback state stay zero throughout
   the live post-doorbell polls. KTrace `0x44/0x45` appears only after recovery
   starts, so it is recovery teardown, not the stalled admission callback.
 - B1's later 3D activation routine at `0x162f8` writes `1` to fragment
   descriptor `+0x20f0`. On hardware `+0x20f0` and both 3D timestamps remain
-  zero, consistent with the missing state-2-to-state-3 launch interrupt.
+  zero, consistent with the earlier state-1 callback stall.
 
 ## Corrected claims
 
@@ -60,8 +61,8 @@ Keep this list short and evidence-only. A build is not a hardware checkpoint.
   submit-ready 3D `+0x20` changed from Pool-A `+0x000` to `+0x100`, matching
   three native capture corpora. TA still completes, while `+0x20f0` and both
   3D timestamps remain zero, so this real mismatch was not sufficient.
-- Read back B1's exact launch chain (`+0x10398`, `+0x10408`, `+0x1c998`,
-  `+0x10a08`, `+0x10a10`, and `+0x10a50`) during the live polling window and
-  compare the programmed slot/mode against Metal's fragment job. Keep
-  descriptor, SKSM, QoS, completion-ring, recovery, and broad dockchannel
-  dumps enabled.
+- Read the firmware-private job state and exact `0x14cd4` state-1 predicate
+  inputs once QID 1 is selected: queue-generation cache, resource owner,
+  dependency flags, hardware slot, state, async state/gate and discard mode.
+  Keep the launch registers, descriptor, SKSM, QoS, completion-ring, recovery,
+  and broad dockchannel dumps enabled.
