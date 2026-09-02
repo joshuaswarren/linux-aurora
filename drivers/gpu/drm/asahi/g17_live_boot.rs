@@ -3294,6 +3294,25 @@ impl G17PLiveRuntime {
     /// The bound is deliberately below the measured ~84ms fragment recovery,
     /// so a failed TA phase cannot leave firmware halted at recovery state 1
     /// while this diagnostic keeps polling.
+    /// Release a timed-out render without tearing down the runtime.
+    ///
+    /// Drops this submission's retained render state so the next submission
+    /// builds its own, and leaves the session accepting work.
+    fn abandon_render_submission_after_timeout(&mut self) {
+        if let Some(pdev) = self.pdev.as_ref() {
+            dev_warn!(
+                pdev.as_ref(),
+                "G17P render: abandoning the timed-out submission; runtime stays up\n"
+            );
+        }
+        // Deliberately release nothing here. The firmware may still hold
+        // references to this submission's graph, and freeing it under a live
+        // pair of firmware CPUs is how you turn a stalled render into a DMA
+        // fault. The next submission reuses or rebuilds through the retained
+        // paths it already has; the only thing this path must guarantee is
+        // that the session keeps accepting work.
+    }
+
     fn wait_split_render_tiling_completion(&mut self) -> Result<[u64; 2]> {
         const POLLS: usize = 50;
         for _ in 0..POLLS {
@@ -3733,18 +3752,22 @@ impl G17PLiveRuntime {
                 .ok_or(ENODEV)?
                 .publish_split_render_fragment_group(&drm, registers, &prepared.fragment)
             {
-                return match g17_lifecycle::recover_persistent_runtime(self) {
-                    Ok(()) => Err(error),
-                    Err(recovery_error) => Err(recovery_error),
-                };
+                // See the completion-wait path: a post-publication render
+                // failure must not reboot the firmware CPUs. That reboot times
+                // out and the failure path leaves the session refusing every
+                // later submission.
+                self.abandon_render_submission_after_timeout();
+                return Err(error);
             }
             if let Err(error) = Pin::new(self.gfx_rtkit.as_mut().ok_or(ENODEV)?)
                 .send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, prepared.paired_doorbell)
             {
-                return match g17_lifecycle::recover_persistent_runtime(self) {
-                    Ok(()) => Err(error),
-                    Err(recovery_error) => Err(recovery_error),
-                };
+                // See the completion-wait path: a post-publication render
+                // failure must not reboot the firmware CPUs. That reboot times
+                // out and the failure path leaves the session refusing every
+                // later submission.
+                self.abandon_render_submission_after_timeout();
+                return Err(error);
             }
             if let Some(manager) = self.manager.as_mut() {
                 manager.log_render_status_pages("post-fragment-doorbell");
@@ -3768,10 +3791,23 @@ impl G17PLiveRuntime {
                     // scanned. DRAM only, so safe on the timeout path.
                     let _ = manager.dump_completion_records("render-wait-failed");
                 }
-                return match g17_lifecycle::recover_persistent_runtime(self) {
-                    Ok(()) => Err(error),
-                    Err(recovery_error) => Err(recovery_error),
-                };
+                // A render that does not complete is NOT a reason to tear the
+                // runtime down. `recover_persistent_runtime` stops and reboots
+                // both firmware CPUs; on this part that reboot regularly times
+                // out in apple_rtkit_boot (~1s), and the failure path then
+                // leaves `accepting_submissions` false forever, so every later
+                // submission -- render OR compute, from any client -- returns
+                // ENOTSUPP. One unfinished render bricked the device for the
+                // rest of the boot.
+                //
+                // The firmware is demonstrably alive here: it has already
+                // raised and serviced its own stamp-blamed recovery, answers
+                // KSM register reads and keeps draining its rings. So release
+                // this submission's own state and stay open for business. A
+                // genuine crash still reaches the full path through
+                // `is_crashed()` on the next submit.
+                self.abandon_render_submission_after_timeout();
+                return Err(error);
             }
         };
         if let (Some(pdev), Some(manager)) = (self.pdev.as_ref(), self.manager.as_mut()) {
@@ -4348,10 +4384,12 @@ impl G17PLiveRuntime {
                     phase,
                     error
                 );
-                return match g17_lifecycle::recover_persistent_runtime(self) {
-                    Ok(()) => Err(error),
-                    Err(recovery_error) => Err(recovery_error),
-                };
+                // See the completion-wait path: a post-publication render
+                // failure must not reboot the firmware CPUs. That reboot times
+                // out and the failure path leaves the session refusing every
+                // later submission.
+                self.abandon_render_submission_after_timeout();
+                return Err(error);
             }
         };
         let channel_path = notifications.is_some();
@@ -4913,10 +4951,12 @@ impl G17PLiveRuntime {
                         ),
                     }
                 }
-                return match g17_lifecycle::recover_persistent_runtime(self) {
-                    Ok(()) => Err(error),
-                    Err(recovery_error) => Err(recovery_error),
-                };
+                // See the completion-wait path: a post-publication render
+                // failure must not reboot the firmware CPUs. That reboot times
+                // out and the failure path leaves the session refusing every
+                // later submission.
+                self.abandon_render_submission_after_timeout();
+                return Err(error);
             }
         };
         if !channel_path {
@@ -4926,10 +4966,12 @@ impl G17PLiveRuntime {
                 .ok_or(ENODEV)?
                 .complete_compute_entries(self.queue.as_mut().ok_or(ENODEV)?, 1);
             if let Err(error) = retire_result {
-                return match g17_lifecycle::recover_persistent_runtime(self) {
-                    Ok(()) => Err(error),
-                    Err(recovery_error) => Err(recovery_error),
-                };
+                // See the completion-wait path: a post-publication render
+                // failure must not reboot the firmware CPUs. That reboot times
+                // out and the failure path leaves the session refusing every
+                // later submission.
+                self.abandon_render_submission_after_timeout();
+                return Err(error);
             }
         }
         if channel_path {
