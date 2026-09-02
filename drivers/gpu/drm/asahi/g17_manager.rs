@@ -52,6 +52,9 @@ mod identity;
 use g17_initdata::InstanceRole;
 use identity::{FirmwareRoleTopology, GpuGen, GpuHalGeneration, GpuVariant, SubmissionTransport};
 
+static G17P_STATE_DUMPED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// One-shot guard for the hardware-data dump: it must fire on the first
 /// render checkpoint whatever the label, since gating it on a specific label
 /// simply never matched.
@@ -3217,6 +3220,16 @@ impl G17PManagerConstruction {
 
     pub(crate) fn log_render_status_pages(&mut self, label: &str) {
         self.resources.dump_render_qos_regions(label);
+        if *crate::module_parameters::g17p_dump_state.value() != 0
+            && !G17P_STATE_DUMPED.swap(true, core::sync::atomic::Ordering::Relaxed)
+        {
+            let kib = *crate::module_parameters::g17p_dump_state.value() as usize;
+            if kib == 1 {
+                self.resources.checksum_primary_state(label);
+            } else {
+                self.resources.dump_primary_state(label, kib * 1024);
+            }
+        }
         if *crate::module_parameters::g17p_dump_hwdata.value() != 0
             && !G17P_HW_DATA_DUMPED.swap(true, core::sync::atomic::Ordering::Relaxed)
         {
