@@ -5044,6 +5044,7 @@ impl G17PUserRenderStorage {
                 g17_render::RenderDescriptorKind::Tiling,
                 G17P_BOOTSTRAP_TA_DESCRIPTOR_LOW_VA,
                 g17_initdata::CONTROL_SHARED_ADDRESS,
+                g17p_render_queue_id(true) as u8,
                 g17p_render_queue_id(false) as u8,
                 0,
                 true,
@@ -5062,6 +5063,7 @@ impl G17PUserRenderStorage {
                 g17_render::RenderDescriptorKind::Fragment,
                 descriptor_3d_render_va,
                 g17_initdata::CONTROL_SHARED_ADDRESS,
+                g17p_render_queue_id(false) as u8,
                 g17p_render_queue_id(false) as u8,
                 0,
                 true,
@@ -5474,6 +5476,7 @@ impl G17PUserRenderStorage {
                 g17_render::RenderDescriptorKind::Tiling,
                 G17P_BOOTSTRAP_TA_DESCRIPTOR_LOW_VA,
                 g17_initdata::CONTROL_SHARED_ADDRESS,
+                g17p_render_queue_id(true) as u8,
                 g17p_render_queue_id(false) as u8,
                 submission_ordinal,
                 false,
@@ -5497,6 +5500,7 @@ impl G17PUserRenderStorage {
                 g17_render::RenderDescriptorKind::Fragment,
                 descriptor_3d_render_va,
                 g17_initdata::CONTROL_SHARED_ADDRESS,
+                g17p_render_queue_id(false) as u8,
                 g17p_render_queue_id(false) as u8,
                 submission_ordinal,
                 false,
@@ -6564,6 +6568,33 @@ impl G17PUserRenderStorage {
                     .map_err(|_| ERANGE)?,
             );
             Ok((ta_qid, ta_stamp, sku_reserved, sku_pointer, sku_header))
+        })
+    }
+
+    /// Host-visible inputs to B1 `FUN_14cd4`'s state-1 admission decision.
+    /// These bytes are sampled from the final TA command, not inferred from
+    /// the builder, so a firmware mutation between publication and recovery is
+    /// visible. The resource-table and job-substate operands are firmware
+    /// private; KTrace supplies the corresponding path witnesses.
+    pub(crate) fn render_activation_gate_words(&mut self) -> Result<[u32; 5]> {
+        self.descriptors.with_bytes_mut(|raw| {
+            let tiling = raw.get(0x0000..0x4000).ok_or(ERANGE)?;
+            let u32_at = |offset: usize| -> Result<u32> {
+                Ok(u32::from_le_bytes(
+                    tiling
+                        .get(offset..offset + 4)
+                        .ok_or(ERANGE)?
+                        .try_into()
+                        .map_err(|_| ERANGE)?,
+                ))
+            };
+            Ok([
+                u32_at(0x07a4)?,
+                u32_at(0x0866)?,
+                u32_at(0x0892)?,
+                u32_at(0x08ba)?,
+                u32::from(*tiling.get(0x08cb).ok_or(ERANGE)?),
+            ])
         })
     }
 

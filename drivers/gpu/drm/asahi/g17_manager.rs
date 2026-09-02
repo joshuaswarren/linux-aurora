@@ -3176,6 +3176,20 @@ impl G17PManagerConstruction {
                     error,
                 ),
             }
+            match storage.render_activation_gate_words() {
+                Ok(gate) => dev_info!(
+                    dev.as_ref(),
+                    "G17P render activation gate[{}]: TA(+7a4,+866,+892,+8ba,+8cb)={:x?}\n",
+                    label,
+                    gate,
+                ),
+                Err(error) => dev_warn!(
+                    dev.as_ref(),
+                    "G17P render activation gate[{}]: descriptor inputs unreadable ({:?})\n",
+                    label,
+                    error,
+                ),
+            }
             storage.log_status_pages(&dev, label);
             storage.log_parameter_management(&dev, label);
         }
