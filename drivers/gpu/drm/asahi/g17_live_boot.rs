@@ -1207,132 +1207,6 @@ impl G17PRoleRtkitState {
 }
 
 #[cfg(CONFIG_DEV_COREDUMP)]
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-struct G17PFirmwareFragmentAdmissionSnapshot {
-    queue_generation: u64,
-    queue_owner: u64,
-    queue_owner_ready: u32,
-    job: u64,
-    callback: u64,
-    command: u64,
-    context: u64,
-    queue_selector: u32,
-    dependency_ready: u32,
-    completion_ready: u32,
-    hardware_slot: u32,
-    cached_generation: u8,
-    state: u32,
-    async_state: u32,
-    async_gate_owner: u64,
-    async_gate: u32,
-    discard_mode: u32,
-}
-
-#[cfg(CONFIG_DEV_COREDUMP)]
-fn g17p_firmware_address(address: u64) -> u64 {
-    address & G17P_RTKIT_UAT_DVA_MASK
-}
-
-#[cfg(CONFIG_DEV_COREDUMP)]
-fn g17p_live_firmware_bytes(
-    state: &G17PRoleRtkitState,
-    address: u64,
-    size: usize,
-) -> Result<KVVec<u8>> {
-    state
-        .firmware_contexts
-        .context0_root()
-        .ok_or(ENODEV)?
-        .copy_live_firmware_range(g17p_firmware_address(address), size)
-}
-
-#[cfg(CONFIG_DEV_COREDUMP)]
-fn g17p_live_firmware_u64(state: &G17PRoleRtkitState, address: u64) -> Result<u64> {
-    let bytes = g17p_live_firmware_bytes(state, address, 8)?;
-    Ok(u64::from_le_bytes(bytes[..8].try_into().map_err(|_| ERANGE)?))
-}
-
-#[cfg(CONFIG_DEV_COREDUMP)]
-fn g17p_live_firmware_u32(state: &G17PRoleRtkitState, address: u64) -> Result<u32> {
-    let bytes = g17p_live_firmware_bytes(state, address, 4)?;
-    Ok(u32::from_le_bytes(bytes[..4].try_into().map_err(|_| ERANGE)?))
-}
-
-/// Read the exact firmware-private inputs to FUN_14cd4's state-1 callback.
-/// The SGX launch registers cannot distinguish a job which is still waiting
-/// in state 1 from one for which FUN_15a48 actually issued the launch, while
-/// the 0x100 reset value at SGX+0x10408 makes that distinction essential.
-#[cfg(CONFIG_DEV_COREDUMP)]
-fn g17p_fragment_admission_firmware_snapshot(
-    state: &G17PRoleRtkitState,
-) -> Result<G17PFirmwareFragmentAdmissionSnapshot> {
-    const QUEUE_GENERATION_TABLE: u64 = 0xffff_fc00_0012_5df0;
-    const QUEUE_OWNER_TABLE: u64 = 0xffff_fc00_0012_59d8;
-    const QUEUE_JOB_TABLE: u64 = 0xffff_fc00_0012_f6f0;
-    const ASYNC_GATE_OWNER: u64 = 0xffff_fc00_0017_de90;
-    const DISCARD_MODE: u64 = 0xffff_fc00_0017_7d30;
-
-    // The current fragment descriptor names queue selector zero at +0x79c
-    // and resource selector zero at +0x8ba. Keep these reads explicit until
-    // those fields become dynamic in the production encoder.
-    let queue_generation = g17p_live_firmware_u64(state, QUEUE_GENERATION_TABLE)?;
-    let queue_owner = g17p_live_firmware_u64(state, QUEUE_OWNER_TABLE)?;
-    let queue_owner_ready = if queue_owner == 0 {
-        0
-    } else {
-        g17p_live_firmware_u32(state, queue_owner.checked_add(0x34).ok_or(EOVERFLOW)?)?
-    };
-    let job = g17p_live_firmware_u64(state, QUEUE_JOB_TABLE)?;
-    if job == 0 {
-        return Err(ENOENT);
-    }
-    let bytes = g17p_live_firmware_bytes(state, job, 0x38)?;
-    let u32_at = |offset: usize| -> Result<u32> {
-        Ok(u32::from_le_bytes(
-            bytes[offset..offset + 4]
-                .try_into()
-                .map_err(|_| ERANGE)?,
-        ))
-    };
-    let u64_at = |offset: usize| -> Result<u64> {
-        Ok(u64::from_le_bytes(
-            bytes[offset..offset + 8]
-                .try_into()
-                .map_err(|_| ERANGE)?,
-        ))
-    };
-    let async_gate_owner = g17p_live_firmware_u64(state, ASYNC_GATE_OWNER)?;
-    let async_gate = if async_gate_owner == 0 {
-        0
-    } else {
-        g17p_live_firmware_u32(
-            state,
-            async_gate_owner.checked_add(0x18).ok_or(EOVERFLOW)?,
-        )?
-    };
-
-    Ok(G17PFirmwareFragmentAdmissionSnapshot {
-        queue_generation,
-        queue_owner,
-        queue_owner_ready,
-        job,
-        callback: u64_at(0)?,
-        command: u64_at(8)?,
-        context: u64_at(0x10)?,
-        queue_selector: u32_at(0x18)?,
-        dependency_ready: u32_at(0x1c)?,
-        completion_ready: u32_at(0x20)?,
-        hardware_slot: u32_at(0x24)?,
-        cached_generation: bytes[0x28],
-        state: u32_at(0x2c)?,
-        async_state: u32_at(0x30)?,
-        async_gate_owner,
-        async_gate,
-        discard_mode: g17p_live_firmware_u32(state, DISCARD_MODE)?,
-    })
-}
-
-#[cfg(CONFIG_DEV_COREDUMP)]
 struct G17PCrashRecord {
     processor: G17PProcessor,
     original_size: usize,
@@ -5137,8 +5011,6 @@ impl G17PLiveRuntime {
         const POLLS: usize = 40;
         let mut last = None;
         let mut last_fault_irq = None;
-        #[cfg(CONFIG_DEV_COREDUMP)]
-        let mut firmware_admission_logged = false;
         for poll in 0..POLLS {
             let engine_timestamps = match self
                 .manager
@@ -5159,45 +5031,6 @@ impl G17PLiveRuntime {
             match registers.g17p_render_ksm_admission_snapshot() {
                 Ok(Some(snapshot)) => {
                     let observation = (snapshot, engine_timestamps);
-                    #[cfg(CONFIG_DEV_COREDUMP)]
-                    if !firmware_admission_logged && snapshot.qid1_state != 0 {
-                        firmware_admission_logged = true;
-                        match self
-                            .gfx_state
-                            .as_ref()
-                            .ok_or(ENODEV)
-                            .and_then(|state| g17p_fragment_admission_firmware_snapshot(state))
-                        {
-                            Ok(fw) => dev_info!(
-                                pdev.as_ref(),
-                                "G17P fragment firmware admission poll={} generation={:#018x} owner={:#018x}/ready={:#x} job={:#018x} callback={:#018x} command={:#018x} context={:#018x} selector={} dependency-ready={} completion-ready={} hw-slot={} cached-generation={:#x} state={} async-state={} async-gate={:#018x}/{} discard-mode={}\n",
-                                poll,
-                                fw.queue_generation,
-                                fw.queue_owner,
-                                fw.queue_owner_ready,
-                                fw.job,
-                                fw.callback,
-                                fw.command,
-                                fw.context,
-                                fw.queue_selector,
-                                fw.dependency_ready,
-                                fw.completion_ready,
-                                fw.hardware_slot,
-                                fw.cached_generation,
-                                fw.state,
-                                fw.async_state,
-                                fw.async_gate_owner,
-                                fw.async_gate,
-                                fw.discard_mode,
-                            ),
-                            Err(error) => dev_err!(
-                                pdev.as_ref(),
-                                "G17P fragment firmware admission poll={} read failed ({:?})\n",
-                                poll,
-                                error,
-                            ),
-                        }
-                    }
                     if last != Some(observation)
                         && (snapshot.qid0_state != 0
                             || snapshot.qid0_progress != 0
@@ -5269,7 +5102,7 @@ impl G17PLiveRuntime {
                         );
                         dev_info!(
                             pdev.as_ref(),
-                            "G17P render launch post-doorbells poll={} slot={:#010x} mode={:#018x} strobe={:#010x} irq=[enable={:#018x},status={:#018x},bit3={}] slot-bitmap=[pending={:#018x},ack={:#018x}]\n",
+                            "G17P render IRQ routing post-doorbells poll={} selector={:#010x} mode={:#018x} strobe={:#010x} irq=[enable={:#018x},status={:#018x},bit3={},bit4={}] completion-bitmap=[pending={:#018x},ack={:#018x}] new-work-bitmap=[pending={:#018x},ack={:#018x}]\n",
                             poll,
                             snapshot.launch_slot,
                             snapshot.launch_mode,
@@ -5277,8 +5110,11 @@ impl G17PLiveRuntime {
                             snapshot.launch_irq_enable,
                             snapshot.launch_irq_status,
                             (snapshot.launch_irq_status >> 3) & 1,
+                            (snapshot.launch_irq_status >> 4) & 1,
                             snapshot.launch_slot_pending,
                             snapshot.launch_slot_ack,
+                            snapshot.new_work_pending,
+                            snapshot.new_work_ack,
                         );
                         dev_info!(
                             pdev.as_ref(),

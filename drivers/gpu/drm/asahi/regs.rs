@@ -385,6 +385,11 @@ pub(crate) struct G17PRenderKsmAdmissionSnapshot {
     pub(crate) launch_irq_status: u64,
     pub(crate) launch_slot_pending: u64,
     pub(crate) launch_slot_ack: u64,
+    /// Bit-4 new-work interrupt source. FUN_216f0 reads the QID bitmap at
+    /// 0x10a60 and acknowledges that same bitmap at 0x10a68 before FUN_23004
+    /// allocates the firmware job and emits KTrace code 2.
+    pub(crate) new_work_pending: u64,
+    pub(crate) new_work_ack: u64,
     pub(crate) scheduler_status: u64,
     pub(crate) work_channel_status: [u64; 4],
     pub(crate) usc: Option<G17PUscEngineSnapshot>,
@@ -875,6 +880,8 @@ impl Resources {
         let launch_irq_status = registers.try_read64(0x1_0a10)?;
         let launch_slot_pending = registers.try_read64(0x1_0a50)?;
         let launch_slot_ack = registers.try_read64(0x1_0a58)?;
+        let new_work_pending = registers.try_read64(0x1_0a60)?;
+        let new_work_ack = registers.try_read64(0x1_0a68)?;
         let scheduler_status = Self::g17p_sksm_port_read_locked(
             &sgx,
             T8140_KSM_SCHEDULER_STATUS,
@@ -979,6 +986,8 @@ impl Resources {
             launch_irq_status,
             launch_slot_pending,
             launch_slot_ack,
+            new_work_pending,
+            new_work_ack,
             scheduler_status,
             work_channel_status,
             usc,

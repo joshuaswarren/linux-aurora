@@ -14,11 +14,14 @@ Keep this list short and evidence-only. A build is not a hardware checkpoint.
 
 ## Current boundary
 
-- B1 creates the fragment job, but SGX `+0x10408` remains at its `0x100`
-  idle/reset value. `0x15a48` would overwrite it with 0 or 1 immediately
-  before launching the job into state 2, so the state-1 callback has not
-  reached the launch write. The absent `+0x10a10` bit 3 and empty per-slot
-  completion bitmap are consequences, not the first failed predicate.
+- The fragment's tag-15/tag-14 records retire and hardware selects QID 1, but
+  B1 emits no KTrace code 2. Code 2 is in the bit-4 new-work path: the ISR
+  reads the QID bitmap at SGX `+0x10a60`, acknowledges it at `+0x10a68`, and
+  only then does `0x23004` allocate the firmware job. Other records guarded by
+  the same trace-class bit are present, so this is the earliest proven gap.
+- SGX `+0x10408` remains at its `0x100` idle/reset value, no bit-3 completion
+  interrupt appears, and the resource callback stays idle because all three
+  are downstream of the missing new-work interrupt/job allocation.
 - The resource-manager clear/go masks and callback state stay zero throughout
   the live post-doorbell polls. KTrace `0x44/0x45` appears only after recovery
   starts, so it is recovery teardown, not the stalled admission callback.
@@ -61,8 +64,8 @@ Keep this list short and evidence-only. A build is not a hardware checkpoint.
   submit-ready 3D `+0x20` changed from Pool-A `+0x000` to `+0x100`, matching
   three native capture corpora. TA still completes, while `+0x20f0` and both
   3D timestamps remain zero, so this real mismatch was not sufficient.
-- Read the firmware-private job state and exact `0x14cd4` state-1 predicate
-  inputs once QID 1 is selected: queue-generation cache, resource owner,
-  dependency flags, hardware slot, state, async state/gate and discard mode.
-  Keep the launch registers, descriptor, SKSM, QoS, completion-ring, recovery,
-  and broad dockchannel dumps enabled.
+- Sample the bit-4 new-work QID bitmap/ack pair (`+0x10a60/+0x10a68`) alongside
+  aggregate IRQ status at the fragment doorbell and after TA completion, then
+  compare the SKSM queue interrupt/configuration against Metal. Keep the later
+  launch registers, descriptor, SKSM, QoS, completion-ring, recovery, and broad
+  dockchannel dumps enabled.
