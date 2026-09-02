@@ -8892,40 +8892,68 @@ impl G17ResourceOwner {
     ///
     /// HW_DATA_OPAQUE_RUNS -- the 269 hardcoded bytes -- is verified byte-exact
     /// against native. The REST of the 0x3db4 block is computed here (register
-    /// windows, completion aliases, QoS and SKSM resource pointers, geometry),
+    /// windows, completion aliases, QoS and SKSM resource pointers, geometry)
     /// and has never been compared. Native's equivalent block was captured
     /// whole from AGXArmFirmwareASC + 0x2b8, so a full diff is possible; only
     /// the address-shaped fields are expected to differ.
+    ///
+    /// Copies through a heap buffer in ONE `with_bytes_mut` call rather than
+    /// logging chunk by chunk. Each call to that helper takes a fresh `vmap()`,
+    /// and calling it in a loop stopped producing bytes after the first chunk;
+    /// one call also lets the device handle be taken after the borrow ends.
     pub(crate) fn dump_hw_data(&mut self, label: &str) {
-        let mut window = [0u8; 0x40];
-        let mut offset = 0usize;
-        while offset < g17_initdata::HW_DATA_SIZE {
-            let take = core::cmp::min(0x40, g17_initdata::HW_DATA_SIZE - offset);
-            let ok = self
-                .resources
-                .shared_cluster
-                .with_bytes_mut(|bytes| {
-                    window[..take].copy_from_slice(bytes.get(offset..offset + take).ok_or(ERANGE)?);
-                    Ok(())
-                })
-                .is_ok();
-            if ok {
-                let dev = self.dev().clone();
-                let mut row = 0usize;
-                while row < take {
-                    let end = core::cmp::min(row + 16, take);
-                    dev_info!(
-                        dev.as_ref(),
-                        "G17PHWDATA {} {:#07x} {:02x?}\n",
-                        label,
-                        offset + row,
-                        &window[row..end],
-                    );
-                    row += 16;
+        let size = g17_initdata::HW_DATA_SIZE;
+        let mut buf: KVec<u8> = match KVec::with_capacity(size, GFP_KERNEL) {
+            Ok(buf) => buf,
+            Err(_) => return,
+        };
+        let mut exposed = 0usize;
+        let filled = self
+            .resources
+            .shared_cluster
+            .with_bytes_mut(|bytes| {
+                exposed = bytes.len();
+                let take = core::cmp::min(size, bytes.len());
+                let src = bytes.get(..take).ok_or(ERANGE)?;
+                for byte in src.iter() {
+                    buf.push(*byte, GFP_KERNEL)?;
                 }
-            }
-            offset += take;
+                Ok(())
+            })
+            .is_ok();
+        {
+            let dev = self.dev().clone();
+            dev_info!(
+                dev.as_ref(),
+                "G17PHWDATA {} extent: exposed={:#x} wanted={:#x} filled={} got={:#x}\n",
+                label,
+                exposed,
+                size,
+                filled,
+                buf.len(),
+            );
         }
+        if !filled {
+            return;
+        }
+        let dev = self.dev().clone();
+        let mut offset = 0usize;
+        while offset + 16 <= buf.len() {
+            dev_info!(
+                dev.as_ref(),
+                "G17PHWDATA {} {:#07x} {:02x?}\n",
+                label,
+                offset,
+                &buf[offset..offset + 16],
+            );
+            offset += 16;
+        }
+        dev_info!(
+            dev.as_ref(),
+            "G17PHWDATA {} complete: {} bytes\n",
+            label,
+            buf.len(),
+        );
     }
 
     pub(crate) fn dump_render_qos_regions(&mut self, label: &str) {
