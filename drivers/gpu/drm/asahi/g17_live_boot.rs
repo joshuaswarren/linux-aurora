@@ -3234,6 +3234,28 @@ impl G17PLiveRuntime {
                 .poll_translated_render_completion()?
             {
                 g17_manager::G17PRenderPollOutcome::Complete(completion) => {
+                    // Drain pending firmware notifications BEFORE retiring the
+                    // USC FList references. The lifecycle holds three: the
+                    // async-grow request, the TA and the 3D. The firmware's
+                    // type-13 async-grow completion retires the first (3 -> 2)
+                    // and only then may this paired completion retire the other
+                    // two. Returning straight out of the poll skipped that, so
+                    // the retire saw references=3 and refused with WrongPhase,
+                    // which the caller reported as a bare EIO -- AFTER the GPU
+                    // had finished the whole render. Ordering only: nothing is
+                    // retired here that was not already complete.
+                    match self.service_firmware_events_inline() {
+                        Ok(count) => serviced += count,
+                        Err(error) => {
+                            if let Some(pdev) = self.pdev.as_ref() {
+                                dev_warn!(
+                                    pdev.as_ref(),
+                                    "G17P render: event service at completion failed ({:?})\n",
+                                    error
+                                );
+                            }
+                        }
+                    }
                     let release = self
                         .manager
                         .as_mut()
