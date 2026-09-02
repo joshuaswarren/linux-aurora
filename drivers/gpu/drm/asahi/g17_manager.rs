@@ -3572,14 +3572,29 @@ impl G17PManagerConstruction {
                 return;
             }
         };
-        for snapshot in snapshots.into_iter().take(2) {
+        // Log EVERY work channel, not the first two. The render's tables moved
+        // to the priority-2 group (TA_2 = 6, 3D_2 = 7) and compute publishes on
+        // CL_2 = 8, so a `take(2)` only ever showed the empty priority-0 rings
+        // and made the render look like it published nothing at all.
+        for snapshot in snapshots.into_iter() {
             let name = if snapshot.table_index
                 == g17_submission::G17P_PARTIAL_OPENING_TILING_CHANNEL_TABLE_INDEX
             {
                 "TA"
-            } else {
+            } else if snapshot.table_index
+                == g17_submission::G17P_PARTIAL_OPENING_FRAGMENT_CHANNEL_TABLE_INDEX
+            {
                 "3D"
+            } else if snapshot.table_index
+                == g17_submission::G17P_COMPUTE_CHANNEL_TABLE_INDEX
+            {
+                "CL"
+            } else {
+                "--"
             };
+            if snapshot.cursors == [0, 0, 0] && snapshot.current_slot_queue == 0 {
+                continue;
+            }
             dev_info!(
                 self.resources.dev().as_ref(),
                 "G17P render outer[{}]: {} table={} cursors(actual,coherency,producer)={:?} current-slot={} record={:#x} kind={} queue-byte={}\n",
