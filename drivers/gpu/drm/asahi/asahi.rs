@@ -114,8 +114,8 @@ kernel::module_platform_driver! {
             description: "Enable the GPU firmware log ring (main_config+0x250)",
         },
         g17p_fw_trace: u32 {
-            default: 0,
-            description: "Firmware trace class mask written to status_a+0x00 on BOTH roles before the initdata doorbell. Bit N enables trace channel N; bit 0 carries the whole KSM submission path. Non-zero also enables the KTrace drain (arming without draining makes the firmware busy-wait ~3ms once and then drop records). 0: off",
+            default: 1,
+            description: "Firmware trace class mask written to status_a+0x00 on BOTH roles before the initdata doorbell. Bit N enables trace channel N; bit 0 carries the whole KSM submission path. Non-zero also enables the KTrace drain (arming without draining makes the firmware busy-wait ~3ms once and then drop records). Default 1 while G17P graphics bring-up needs the launch/callback trace; 0 disables it.",
         },
         g17p_fw_ktrace_verbose: u32 {
             default: 0,
@@ -189,8 +189,8 @@ kernel::module_platform_driver! {
             description: "Sample the scheduler-gate registers (gpc-state, fender dynamic gating, host IRQ enable/status) in a burst immediately after the render doorbell, logged as checkpoint render-post-doorbell. This is the observable that actually moves on a submission which executes: a working compute submit reports gpc-state 0x0 -> 0x1 -> 0x0, while scan-active reads 0 on that same run and is therefore meaningless. The render path had no equivalent sample at all. UNSAFE BY CONSTRUCTION, which is why it defaults off: the read touches the sgx register file, and an sgx read with the GPU cores power-gated raises an asynchronous SError and panics the machine. It is taken ONLY in the window right after the doorbell, never before publish (cores may still be gated -- render-pre-doorbell is DRAM-only for that reason) and never at the wait timeout (cores have powered back down; this panicked the box every time it was tried on the compute path). Compute's own sample is safe only because it runs after a completion woke the caller. 0: off (default), 1: 12 samples at 1ms, 2: 40 samples at 1ms for a wider window.",
         },
         g17p_render_ksm_probe: u32 {
-            default: 0,
-            description: "DIAGNOSTIC ONLY. After both native G17P render doorbells are sent, wait up to 40ms and take power-gated-safe snapshots of the kernel-owned TA/3D queue pair plus the fragment descriptor's distinct QID-0 RCE coordinate. Reads KSM state/progress through the SKSM port (0xc020/0xc078) plus the global current-command/context pointers (0xc0f0/0xc0f8). Sampling only after the 3D doorbell is too early because the fragment has a TA dependency and modes 2/3 have not published TA yet. The firmware recovery path reads these same words to identify a selected command which never started. Requires g17p_render_native_doorbells=1..3; paired and split-launch paths are deliberately not probed. UNSAFE if the hardware power-state indication is wrong: the low SGX register file SErrors while GPU cores are off. 0: off (default), 1: one bounded post-doorbell snapshot.",
+            default: 1,
+            description: "G17P GRAPHICS BRING-UP TRACE. After both native render doorbells are sent, wait up to 40ms and take power-gated-safe snapshots of the kernel-owned TA/3D queues, SGX current-command/context, and the bit-4 new-work / bit-3 completion launch registers consumed by B1 FUN_23004. The GPC-state read is a hard gate before low SGX accesses. Default 1 while the TA-to-3D callback boundary is under bring-up; 0 disables it.",
         },
         g17p_render_header_flags: u32 {
             default: 0,

@@ -735,8 +735,8 @@ impl Resources {
 
     /// Take the hardware snapshot the G17P firmware uses when diagnosing a
     /// selected command which has not reached its start timestamp. Include the
-    /// kernel-owned TA/3D pair and the fragment descriptor's distinct QID-0
-    /// RCE coordinate so neither namespace is inferred from stale fixed IDs.
+    /// kernel-owned TA/3D pair and the launch registers which move a TA command
+    /// through B1's bit-4 new-work and bit-3 completion callbacks.
     ///
     /// The low SGX register file is inaccessible while the GPU cores are off,
     /// so the GPC-state read is a hard precondition rather than another field
@@ -757,6 +757,9 @@ impl Resources {
         let _guard = self.sksm_fifo.lock();
         // These tags are copied from the firmware's own readers. State uses
         // the bit-42 KSM namespace; the hang-detector progress read does not.
+        // QID 0 remains useful only as a reserved-queue control. The type-1
+        // descriptor's +0x79c/+0x7a8 is an SKU register-stream header, not a
+        // QID-0/slot-89 dependency; the real dependency is in the TA record.
         let pdm_qid0_state =
             Self::g17p_sksm_port_read_locked(&sgx, 0xc020, 0, 1u64 << 42)?;
         let pdm_qid0_progress = Self::g17p_sksm_port_read_locked(&sgx, 0xc078, 0, 0)?;

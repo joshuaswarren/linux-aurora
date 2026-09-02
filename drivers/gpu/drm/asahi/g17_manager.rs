@@ -3127,11 +3127,6 @@ impl G17PManagerConstruction {
         };
         self.resources.log_render_sksm_entry(true, label, 0);
         self.resources.log_render_sksm_entry(true, label, strides[0]);
-        // Fragment descriptor +0x79c/+0x7a8 names native PDM queue 0 slot 89
-        // for the first RCE program (packed count 0x042c0059). Linux currently
-        // owns no such PDM entry, so keep its exact would-be backing visible.
-        self.resources
-            .log_render_sksm_entry(true, label, 89 * strides[0]);
         self.resources
             .log_render_sksm_entry(true, label, strides[0] + 0x120);
         self.resources.log_render_sksm_entry(false, label, 0);
@@ -3162,19 +3157,21 @@ impl G17PManagerConstruction {
             ),
         }
         if let Some(storage) = self.render_storage.as_mut() {
-            match storage.fragment_pdm_coordinate() {
-                Ok((qid, rce_pointer, packed)) => dev_info!(
+            match storage.render_activation_coordinates() {
+                Ok((ta_qid, ta_stamp, sku_reserved, sku_pointer, sku_header)) => dev_info!(
                     dev.as_ref(),
-                    "G17P render PDM[{}]: qid={} rce-pointer={:#x} packed={:#x} predecessor={:#x}\n",
+                    "G17P render activation[{}]: TA-link qid={} stamp={:#x} predecessor={:#x}; 3D-SKU reserved={:#x} stream={:#x} header={:#x}\n",
                     label,
-                    qid,
-                    rce_pointer,
-                    packed,
-                    packed.wrapping_sub(1) & ((1u64 << 40) - 1),
+                    ta_qid,
+                    ta_stamp,
+                    ta_stamp.wrapping_sub(1) & ((1u64 << 40) - 1),
+                    sku_reserved,
+                    sku_pointer,
+                    sku_header,
                 ),
                 Err(error) => dev_warn!(
                     dev.as_ref(),
-                    "G17P render PDM[{}]: descriptor coordinate unreadable ({:?})\n",
+                    "G17P render activation[{}]: descriptor coordinates unreadable ({:?})\n",
                     label,
                     error,
                 ),
