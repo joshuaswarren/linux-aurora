@@ -5929,6 +5929,59 @@ impl G17PUserRenderStorage {
             }
             Ok(())
         });
+        // The tilemap/heapmeta/TPC heads above live in the driver-owned render
+        // state. The TILING VERTEX BUFFER is a separate object and was never
+        // scanned, so "the tiler wrote nothing" could not be distinguished
+        // from "the tiler wrote where we do not look" -- which matters,
+        // because KTrace 0x43 reports status 3 (executed) for the TA and 4
+        // (NOP-retired) only for the fragment, i.e. the tiler really does run.
+        let tvb_nonzero = self.render_tvb.as_mut().map(|tvb| {
+            let size = tvb.logical_size;
+            tvb.with_bytes_mut(|raw| {
+                Ok(raw.iter().filter(|byte| **byte != 0).count())
+            })
+            .map(|count| (count, size))
+            .unwrap_or((usize::MAX, size))
+        });
+        if let Some((count, size)) = tvb_nonzero {
+            // Where the tiler wrote matters as much as how much: 32 bytes in a
+            // 1.2MB buffer is either a bare header or a single minimal tile
+            // list, and the two say opposite things about whether geometry was
+            // processed. Report the first non-zero offset and the bytes there.
+            let mut first = usize::MAX;
+            let mut window = [0u8; 64];
+            if let Some(tvb) = self.render_tvb.as_mut() {
+                let _ = tvb.with_bytes_mut(|raw| {
+                    if let Some(at) = raw.iter().position(|byte| *byte != 0) {
+                        first = at;
+                        let start = at & !0xf;
+                        for (index, slot) in window.iter_mut().enumerate() {
+                            *slot = raw.get(start + index).copied().unwrap_or(0);
+                        }
+                    }
+                    Ok(())
+                });
+            }
+            if first == usize::MAX {
+                dev_info!(
+                    dev.as_ref(),
+                    "G17P render TVB[{}]: nonzero={} of {} bytes (all zero)\n",
+                    label,
+                    count,
+                    size,
+                );
+            } else {
+                dev_info!(
+                    dev.as_ref(),
+                    "G17P render TVB[{}]: nonzero={} of {} bytes, first at {:#x}: {:02x?}\n",
+                    label,
+                    count,
+                    size,
+                    first,
+                    &window[..],
+                );
+            }
+        }
         match read {
             Ok(()) => {
                 dev_info!(
