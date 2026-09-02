@@ -2903,6 +2903,22 @@ impl G17PManagerConstruction {
             }
         }
         let retained = self.render_storage.is_some();
+        // Which construction path a render takes has never been logged, and a
+        // cold boot was measured taking the RESTAGE branch on what should be a
+        // first render (93cc292: neither log line inside new_user_render_storage
+        // appears cold, so the UMA page-pool descriptor is never staged, while
+        // the tiler parameter-management graph that faults binds that pool).
+        // Name the branch and its inputs so the two readings -- genuinely
+        // retained, versus construction attempted and abandoned -- separate in
+        // one run.
+        dev_info!(
+            self.resources.dev().as_ref(),
+            "G17P render storage path: retained={} ordinal={} bind={} tracker={}\n",
+            retained,
+            self.render_submission_ordinal,
+            self.render_bind.is_some(),
+            self.render_tracker.is_some(),
+        );
         if retained
             && !self
                 .render_bind
