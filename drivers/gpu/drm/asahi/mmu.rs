@@ -1641,17 +1641,48 @@ pub(crate) struct Uat {
 }
 
 impl Handoff {
-    /// Lock the handoff region from firmware access
+    /// Lock the handoff region from firmware access.
+    ///
+    /// Dekker's algorithm against the firmware. Both waits are BOUNDED: they
+    /// used to spin without limit on words only the firmware can clear, so a
+    /// wedged ASC hung the caller in kernel context forever. That is reachable
+    /// -- a render that fails crashes the GFX ASC, and the next submission's
+    /// `Uat::bind` takes this lock -- and it was measured as a submission that
+    /// never returns, with no task in D state because a spin never sleeps.
+    ///
+    /// Proceeding after the bound is the right call specifically here: on
+    /// T8140 the firmware never writes its half of this protocol at all
+    /// (hardware-verified; see `HandoffMode::AbsentStandinT8140` below), so in
+    /// the healthy case neither loop iterates and the bound is unreachable.
+    /// Reaching it means the peer is gone, and there is no peer to arbitrate
+    /// with. A warning beats an unkillable spin.
     fn lock(&self) {
+        const HANDOFF_SPIN_LIMIT: u32 = 10_000_000;
         self.lock_ap.store(1, Ordering::Relaxed);
         fence(Ordering::SeqCst);
 
+        let mut spins: u32 = 0;
         while self.lock_fw.load(Ordering::Relaxed) != 0 {
             if self.turn.load(Ordering::Relaxed) != 0 {
                 self.lock_ap.store(0, Ordering::Relaxed);
-                while self.turn.load(Ordering::Relaxed) != 0 {}
+                let mut turn_spins: u32 = 0;
+                while self.turn.load(Ordering::Relaxed) != 0 {
+                    turn_spins += 1;
+                    if turn_spins >= HANDOFF_SPIN_LIMIT {
+                        break;
+                    }
+                }
                 self.lock_ap.store(1, Ordering::Relaxed);
                 fence(Ordering::SeqCst);
+            }
+            spins += 1;
+            if spins >= HANDOFF_SPIN_LIMIT {
+                pr_warn!(
+                    "G17P handoff: firmware never released the handoff lock (lock_fw={}, turn={}); proceeding without the peer\n",
+                    self.lock_fw.load(Ordering::Relaxed),
+                    self.turn.load(Ordering::Relaxed),
+                );
+                break;
             }
         }
         fence(Ordering::Acquire);
