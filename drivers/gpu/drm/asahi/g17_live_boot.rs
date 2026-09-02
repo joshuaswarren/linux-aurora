@@ -3370,19 +3370,19 @@ impl G17PLiveRuntime {
                 Err(recovery_error) => Err(recovery_error),
             };
         }
-        // Native enters every graphics submission through ensurePoweredHardware.
-        // Linux does not yet have that kernel power-client lifecycle, so use the
-        // already RE-verified IdlePowerOff(0) device-control transaction before
-        // exposing either render group to the work doorbell.  In particular,
-        // the b1 pause mask's residual bit 1 (value 0x2) keeps sgx+0x211c8
-        // asserted and makes every TA/3D RCE timestamp remain zero even though
-        // ConfigUpdate and AddKicks have retired.  The helper also preserves the
-        // optional idle-off inhibit publication selected by g17p_power_hold.
-        if let Err(error) = self.wire_g17p_submit_gpu_power() {
-            return match g17_lifecycle::recover_persistent_runtime(self) {
-                Ok(()) => Err(error),
-                Err(recovery_error) => Err(recovery_error),
-            };
+        // Working Metal traces publish no device-control record before their
+        // render kicks.  Keep the RE-derived IdlePowerOff transaction strictly
+        // diagnostic and obey the same mode contract as compute: mode 1 before
+        // the kick, mode 2 after it, and the native/default mode 0 publishes
+        // nothing.  This used to call the helper unconditionally, which made a
+        // supposedly clean mode-0 render materially different from Metal.
+        if *module_parameters::g17p_power_wire.value() == 1 {
+            if let Err(error) = self.wire_g17p_submit_gpu_power() {
+                return match g17_lifecycle::recover_persistent_runtime(self) {
+                    Ok(()) => Err(error),
+                    Err(recovery_error) => Err(recovery_error),
+                };
+            }
         }
         // Status-A is a plain DRAM read of the host-owned primary state grid --
         // no sgx MMIO, so it is safe with the GPU cores still gated. `scan-active`
@@ -3561,6 +3561,14 @@ impl G17PLiveRuntime {
             }
             if native_doorbells {
                 self.probe_render_ksm_admission_after_render_doorbells();
+            }
+        }
+        if *module_parameters::g17p_power_wire.value() >= 2 {
+            if let Err(error) = self.wire_g17p_submit_gpu_power() {
+                return match g17_lifecycle::recover_persistent_runtime(self) {
+                    Ok(()) => Err(error),
+                    Err(recovery_error) => Err(recovery_error),
+                };
             }
         }
         // gpc-state probe -- OPT-IN, and deliberately confined to the window
