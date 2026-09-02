@@ -252,6 +252,10 @@ kernel::module_platform_driver! {
             default: 1,
             description: "G17P parameter-buffer binding mode. 0: established packed-object fallback. 1: bind the exact PM-mode2 0xc0-byte HWPB state at both TA +0x20 and Fragment +0x28 and publish the same object in TA ConfigUpdate +0x6e, matching Metal pointer identity. 2: DIAGNOSTIC ONLY -- keep the mode-1 descriptor pointers and coherent PBDesc/HWPB ID but publish zero at TA ConfigUpdate +0x6e, isolating firmware HWPB-bind admission from descriptor execution. 3: DIAGNOSTIC ONLY -- reproduce the last TA-starting Linux pointer arrangement: packed object at TA +0x20 and TA ConfigUpdate +0x6e, PM HWPB only at Fragment +0x28.",
         },
+        g17p_render_ta_dm: u32 {
+            default: 0xff,
+            description: "DIAGNOSTIC ONLY -- override the data master the TILING queue is published on. 0xff (default) keeps the native G17P_TA_DATA_MASTER. Companion to g17p_render_3d_dm: moving the fragment from DM1 to DM0 makes it execute, so this asks whether data master 1 is dead for ANY stage or only mis-configured for the fragment. Not a fix.",
+        },
         g17p_render_3d_dm: u32 {
             default: 0xff,
             description: "DIAGNOSTIC ONLY -- override the data master the fragment queue is published on. 0xff (default) keeps the native value G17P_3D_DATA_MASTER. The tiler (DM0) and compute (DM2) both dispatch and execute; the fragment (DM1) is retired with KTrace 0x43 status 4 without ever running, with an identically shaped descriptor, a satisfied barrier, and geometry already tiled into the TVB. This asks the one question that isolates the data master itself: does ANY queue on DM1 dispatch on this firmware? Rendering with the fragment on DM0 is not correct and this is not a candidate fix -- it is a discriminator.",

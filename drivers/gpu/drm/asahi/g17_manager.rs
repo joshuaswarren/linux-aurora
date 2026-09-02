@@ -3191,6 +3191,7 @@ impl G17PManagerConstruction {
     }
 
     pub(crate) fn log_render_status_pages(&mut self, label: &str) {
+        self.resources.dump_render_qos_regions(label);
         self.resources.log_render_parameter_buffer_descriptor(
             label,
             self.render_hardware_buffer_id.unwrap_or(0),

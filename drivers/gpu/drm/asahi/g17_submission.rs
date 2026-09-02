@@ -1593,11 +1593,12 @@ pub(crate) fn apply_g17p_cold_opening_optional(
     // execute; the fragment is retired with KTrace 0x43 status 4 without ever
     // running, with an identically shaped descriptor, a satisfied barrier and
     // geometry already tiled. Overriding this isolates the data master itself.
-    if matches!(stage, G17PColdOpeningStage::Fragment) {
-        let override_dm = *crate::module_parameters::g17p_render_3d_dm.value();
-        if override_dm != 0xff {
-            put_u16_le(out, 0x22, override_dm as u16);
-        }
+    let override_dm = match stage {
+        G17PColdOpeningStage::Fragment => *crate::module_parameters::g17p_render_3d_dm.value(),
+        G17PColdOpeningStage::Tiling => *crate::module_parameters::g17p_render_ta_dm.value(),
+    };
+    if override_dm != 0xff {
+        put_u16_le(out, 0x22, override_dm as u16);
     }
     // AGXChannel::resetChannelState copies channel+0x4c (the owning process
     // PID) to state+0x44. ConfigUpdate carries that same u32 at unaligned

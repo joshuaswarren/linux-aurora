@@ -8880,6 +8880,57 @@ impl G17ResourceOwner {
         Ok(published)
     }
 
+    /// Dump the QOS resource regions `AGXQOSQueue::willSubmit` touches.
+    ///
+    /// The kext writes rows at `qid*8`, counters at `+0x400+qid*4`, `+0x600`,
+    /// a u64 firmware VA per index at `+0x800`, `+0xc00`, and a further block
+    /// at `+0xe00` that is indexed PER DATA MASTER. This driver writes only
+    /// the `qid*8` row, `+0x800` and `+0xc00`, so the per-data-master block
+    /// has never been written by us at all -- and data master 1 is the one
+    /// that never dispatches, while 0 and 2 both do.
+    pub(crate) fn dump_render_qos_regions(&mut self, label: &str) {
+        const REGIONS: [(&str, usize, usize); 6] = [
+            ("rows", 0x000, 0x40),
+            ("cnt400", 0x400, 0x40),
+            ("blk600", 0x600, 0x40),
+            ("sched800", 0x800, 0x40),
+            ("sharec00", 0xc00, 0x40),
+            ("perdme00", 0xe00, 0x80),
+        ];
+        let mut windows = [[0u8; 0x80]; 6];
+        let mut ok = [false; 6];
+        let _ = self.resources.qos_resource.with_bytes_mut(|bytes| {
+            for (index, (_, base, len)) in REGIONS.iter().enumerate() {
+                let end = match base.checked_add(*len) {
+                    Some(end) => end,
+                    None => continue,
+                };
+                if let Some(slice) = bytes.get(*base..end) {
+                    windows[index][..*len].copy_from_slice(slice);
+                    ok[index] = true;
+                }
+            }
+            Ok(())
+        });
+        let dev = self.dev().clone();
+        for (index, (name, base, len)) in REGIONS.iter().enumerate() {
+            if !ok[index] {
+                continue;
+            }
+            for row in 0..(len / 16) {
+                let at = row * 16;
+                dev_info!(
+                    dev.as_ref(),
+                    "G17P QOS[{}] {} +{:#05x}: {:02x?}\n",
+                    label,
+                    name,
+                    base + at,
+                    &windows[index][at..at + 16],
+                );
+            }
+        }
+    }
+
     pub(crate) fn control_counters(&mut self) -> Result<G17PControlCounters> {
         core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
         let primary = read_control_counters(
