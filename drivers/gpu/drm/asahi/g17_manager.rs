@@ -3256,6 +3256,16 @@ impl G17PManagerConstruction {
     }
 
     pub(crate) fn log_render_sksm_entries(&mut self, label: &str) {
+        // DIAGNOSTIC ONLY, and it must stay that way. This runs from the
+        // render submit path at "pre-doorbell" -- i.e. immediately before the
+        // doorbell is rung -- and hexdumps roughly 19 KB per call once the two
+        // descriptor regions grew to 0x2400. Leaving that in the default path
+        // put a printk storm between building the kick and ringing it, and the
+        // render came back VK_ERROR_DEVICE_LOST on BOTH the cold and the warm
+        // path. Gate it exactly like log_render_status_pages just below.
+        if *crate::module_parameters::g17p_dep_records.value() == 0 {
+            return;
+        }
         let strides = match self.render_sksm.as_ref() {
             Some(queues) => [
                 queues.tiling.producer.geometry.entry_stride() as usize,
