@@ -1127,6 +1127,11 @@ impl VmBind {
         self.1
     }
 
+    /// The bound `Vm` itself, for diagnostics that need to walk its tables.
+    pub(crate) fn vm(&self) -> &Vm {
+        &self.0
+    }
+
     /// Whether this retained binding belongs to the supplied DRM VM.
     pub(crate) fn matches(&self, vm: &Vm) -> bool {
         core::ptr::eq(&*self.0.inner, &*vm.inner)

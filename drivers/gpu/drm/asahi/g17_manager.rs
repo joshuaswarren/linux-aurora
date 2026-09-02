@@ -38,7 +38,7 @@ pub(crate) const G17P_SUBMIT_PHASE_CL2: u32 = 7;
 use crate::{
     driver::AsahiDevice, g17_adt_j700, g17_completion, g17_compute, g17_initdata, g17_lifecycle,
     g17_render, g17_resources, g17_submission, g17_uapi, hw::agx3, identity, mmu,
-    module_parameters, regs,
+    module_parameters, pgtable, regs,
 };
 #[cfg(test)]
 use super as g17_submission;
@@ -3236,6 +3236,122 @@ impl G17PManagerConstruction {
     /// The recovery path retires both queue graphs and writes a synthetic 3D
     /// completion record, so the ordinary timeout dump is too late to tell a
     /// launch failure from recovery cleanup.
+    /// Locate a reported MMU fault address inside the render VM's own tables.
+    ///
+    /// The G14X fault-address register is documented as VA >> 6, but that
+    /// reading and the raw one cannot be told apart from a fault inside the
+    /// first page. Report both candidates against the client root: whether the
+    /// VM maps the page, and every mapped run within +/-1 MiB of it. A
+    /// candidate that abuts or falls just outside a live run is the real
+    /// address; one that lands in empty space at every scale is not.
+    pub(crate) fn log_fault_address_candidates(&mut self, label: &'static str, addr_word: u64) {
+        let Some(bind) = self.render_bind.as_ref() else {
+            dev_info!(
+                self.resources.dev().as_ref(),
+                "G17P fault address[{}]: no retained render bind to walk\n",
+                label,
+            );
+            return;
+        };
+        let vm = bind.vm();
+        let dev = self.resources.dev().clone();
+        let candidates = [
+            ("raw", addr_word),
+            ("shift6", (addr_word & ((1u64 << 42) - 1)) << 6),
+            ("shift6-masked", (addr_word << 6) & ((1u64 << 42) - 1)),
+        ];
+        for (name, candidate) in candidates {
+            let page = candidate & !(mmu::UAT_PGSZ as u64 - 1);
+            let mapped = vm.covers_range(page, mmu::UAT_PGSZ as u64, true, false);
+            let translation = vm.translate_iova(candidate);
+            dev_info!(
+                dev.as_ref(),
+                "G17P fault address[{}]: {} candidate {:#x} page {:#x} mapped={} translate={:?}\n",
+                label,
+                name,
+                candidate,
+                page,
+                mapped,
+                translation,
+            );
+            let window_start = page.saturating_sub(0x10_0000);
+            let window_end = match page.checked_add(0x10_0000) {
+                Some(end) => end,
+                None => continue,
+            };
+            let mut ranges = [pgtable::MappedRange::default(); 16];
+            match vm.mapped_ranges(window_start..window_end, &mut ranges) {
+                Ok((count, truncated)) => {
+                    dev_info!(
+                        dev.as_ref(),
+                        "G17P fault address[{}]: {} neighbourhood {:#x}..{:#x} has {} run(s){}\n",
+                        label,
+                        name,
+                        window_start,
+                        window_end,
+                        count,
+                        if truncated { " TRUNCATED" } else { "" },
+                    );
+                    for run in ranges.iter().take(count) {
+                        dev_info!(
+                            dev.as_ref(),
+                            "G17P fault address[{}]:   {:#x}..{:#x} pte={:#x}\n",
+                            label,
+                            run.start,
+                            run.end,
+                            run.pte,
+                        );
+                    }
+                }
+                Err(error) => dev_info!(
+                    dev.as_ref(),
+                    "G17P fault address[{}]: {} neighbourhood walk failed ({:?})\n",
+                    label,
+                    name,
+                    error,
+                ),
+            }
+        }
+
+        // The whole client root, so any decode of the address register can be
+        // tested against the real layout instead of one window at a time.
+        let mut all = [pgtable::MappedRange::default(); 96];
+        // The full 42-bit low half, from the client null view up to the
+        // unknown page, so no decode of the address register is excluded by
+        // the window rather than by the tables.
+        let user_range = 0u64..(1u64 << 42);
+        match vm.mapped_ranges(user_range.clone(), &mut all) {
+            Ok((count, truncated)) => {
+                dev_info!(
+                    dev.as_ref(),
+                    "G17P fault address[{}]: client root {:#x}..{:#x} holds {} run(s){}\n",
+                    label,
+                    user_range.start,
+                    user_range.end,
+                    count,
+                    if truncated { " TRUNCATED" } else { "" },
+                );
+                for run in all.iter().take(count) {
+                    dev_info!(
+                        dev.as_ref(),
+                        "G17P fault address[{}]: run {:#x}..{:#x} ({:#x}) pte={:#x}\n",
+                        label,
+                        run.start,
+                        run.end,
+                        run.end - run.start,
+                        run.pte,
+                    );
+                }
+            }
+            Err(error) => dev_info!(
+                dev.as_ref(),
+                "G17P fault address[{}]: client root walk failed ({:?})\n",
+                label,
+                error,
+            ),
+        }
+    }
+
     pub(crate) fn log_render_recovery_pre_ack(&mut self, label: &'static str) {
         let render_qids = self.render_sksm.as_ref().map(|queues| {
             [

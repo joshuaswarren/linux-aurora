@@ -857,9 +857,14 @@ fn complete_primary_real_recovery(
         cause.host_recovery
     );
     if cause.fault_status != 0 && *module_parameters::g17p_fault_report.value() != 0 {
+        let mut faulting_addr_word = None;
         if let Some(registers) = registers {
             match registers.g17p_render_fault_irq_snapshot() {
-                Ok(Some(snapshot)) => dev_info!(
+                Ok(Some(snapshot)) => {
+                    if snapshot.fault_info & 1 != 0 {
+                        faulting_addr_word = Some(snapshot.fault_addr_word);
+                    }
+                    dev_info!(
                     pdev.as_ref(),
                     "G17P fault IRQ @recovery-state-1: gpc-state={:#x} info={:#018x} addr-word={:#018x} gate={:#018x} sub-status={:#018x} irq-status={:#018x} bit35={}\n",
                     snapshot.gpc_state,
@@ -869,7 +874,8 @@ fn complete_primary_real_recovery(
                     snapshot.sub_status,
                     snapshot.irq_status,
                     (snapshot.irq_status >> 35) & 1,
-                ),
+                    )
+                }
                 Ok(None) => dev_warn!(
                     pdev.as_ref(),
                     "G17P fault IRQ @recovery-state-1: skipped because gpc-state=0\n"
@@ -889,6 +895,9 @@ fn complete_primary_real_recovery(
                     error
                 );
             }
+        }
+        if let Some(addr_word) = faulting_addr_word {
+            manager.log_fault_address_candidates("recovery-state-1", addr_word);
         }
     }
     if scheduler_active {

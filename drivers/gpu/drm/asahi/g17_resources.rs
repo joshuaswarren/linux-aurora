@@ -4981,6 +4981,54 @@ impl G17PUserRenderStorage {
             translated.parameters.heapmeta,
             translated.parameters.tpc,
         );
+        // Enumerate what the tiling VDM will actually dereference. The MMU
+        // fault bank names no usable address on this part, so the only way to
+        // tell a bad pointer from a bad descriptor is to read the control
+        // stream the GPU is about to fetch and check every plausible pointer
+        // in it against this VM's own tables.
+        {
+            let encoder = translated.parameters.encoder;
+            let mut stream = [0u8; 0x100];
+            match vm.read_bytes(encoder, &mut stream) {
+                Ok(()) => {
+                    for chunk in 0..(stream.len() / 32) {
+                        let base = chunk * 32;
+                        pr_info!(
+                            "G17P render vdm-stream +{:#05x}: {:02x?}\n",
+                            base,
+                            &stream[base..base + 32],
+                        );
+                    }
+                    for word in 0..(stream.len() / 8) {
+                        let mut bytes = [0u8; 8];
+                        bytes.copy_from_slice(&stream[word * 8..word * 8 + 8]);
+                        let value = u64::from_le_bytes(bytes);
+                        if value == 0 {
+                            continue;
+                        }
+                        let mapped = vm.covers_range(value & !0x3fff, 0x4000, true, false);
+                        let rebased = value.checked_add(0x10_0000_0000).unwrap_or(0);
+                        let rebased_mapped =
+                            rebased != 0 && vm.covers_range(rebased & !0x3fff, 0x4000, true, false);
+                        if mapped || rebased_mapped {
+                            pr_info!(
+                                "G17P render vdm-pointer +{:#05x}: {:#x} mapped={} rebased({:#x})={}\n",
+                                word * 8,
+                                value,
+                                mapped,
+                                rebased,
+                                rebased_mapped,
+                            );
+                        }
+                    }
+                }
+                Err(error) => pr_info!(
+                    "G17P render vdm-stream: read at {:#x} failed ({:?})\n",
+                    encoder,
+                    error,
+                ),
+            }
+        }
         pr_info!(
             "G17P render ta-inputs: deflake={:#x}/{:#x}/{:#x} {}x{} layers={} utile={}x{} bootstrap_vdm={}\n",
             translated.parameters.deflake_1,
