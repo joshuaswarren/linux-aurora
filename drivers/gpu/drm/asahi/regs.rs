@@ -704,6 +704,34 @@ impl Resources {
         Ok(())
     }
 
+    /// DIAGNOSTIC. Perform, from the host, the 3D launch strobe that b1's
+    /// tiling job would issue from its state 4.
+    ///
+    /// FW-PROVEN: `0x1c9a0 = 2` is the ONLY 3D launch in the image and has a
+    /// single writer, `FUN_14cd4` state 4, reached only from a tiling job's
+    /// state machine, after `0x10398` selects that job's slot. Measured here:
+    /// the new-work and tiling-done interrupts are enabled (0x10a08 =
+    /// 0xa00620038) and never raised, `0x10a60` stays 0, no job is ever built
+    /// (KTrace 2 absent), so state 4 is unreachable and the fragment sits in
+    /// its KSM slot. The hardware has meanwhile latched the fragment at
+    /// 0xc0f0/0xc0f8 with dm-masks[1] set, so the work is presented.
+    ///
+    /// Native performs ZERO MMIO, so this can never ship. It answers one
+    /// question: if the strobe is issued, does the fragment execute?
+    pub(crate) fn g17p_strobe_3d_launch(&self, selector: u32) -> Result<(u32, u64, u32)> {
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let registers = sgx.relaxed();
+        registers.try_write32(selector, 0x1_0398)?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        registers.try_write32(2, 0x1_c9a0)?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        Ok((
+            registers.try_read32(0x1_0398)?,
+            registers.try_read64(0x1_0408)?,
+            registers.try_read32(0x1_c9a0)?,
+        ))
+    }
+
     /// Whether the SKSM tag/data port can be driven from the host right now.
     ///
     /// The asynchronous SErrors that made every host SKSM write suppressible

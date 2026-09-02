@@ -5200,6 +5200,28 @@ impl G17PLiveRuntime {
         let mut last = None;
         let mut last_fault_irq = None;
         for poll in 0..POLLS {
+            if poll == 2 && *module_parameters::g17p_render_3d_strobe.value() != 0 {
+                if let (Some(registers), Some(pdev)) =
+                    (self.registers.as_ref(), self.pdev.as_ref())
+                {
+                    let selector = *module_parameters::g17p_render_3d_strobe.value() - 1;
+                    match registers.g17p_strobe_3d_launch(selector) {
+                        Ok((slot, mode, strobe)) => dev_info!(
+                            pdev.as_ref(),
+                            "G17P render: DIAGNOSTIC 3D strobe selector={} -> slot={:#x} mode={:#018x} strobe={:#x}\n",
+                            selector,
+                            slot,
+                            mode,
+                            strobe,
+                        ),
+                        Err(error) => dev_warn!(
+                            pdev.as_ref(),
+                            "G17P render: DIAGNOSTIC 3D strobe failed ({:?})\n",
+                            error,
+                        ),
+                    }
+                }
+            }
             let engine_timestamps = match self
                 .manager
                 .as_mut()
