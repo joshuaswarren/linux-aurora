@@ -1205,6 +1205,47 @@ pub(crate) fn build_fragment_descriptor(
     // copies it here; m1n1 derives the same field as `tib_blocks > 8`.
     // B1 firmware consumes it before the first RCE write and selects a
     // separate scheduler path when it is nonzero.
+    // ORACLE BISECT. Native's 3D command record (recs3.txt, 0x2240 stride, so
+    // this is the record itself and not the next one) differs from ours in 73
+    // of 1096 qwords; all but a dozen are allocation addresses. These are the
+    // STRUCTURAL ones -- values we leave zero or set differently, that are not
+    // pointers -- gathered behind one bitmask so they can be bisected without a
+    // rebuild each time. The fragment executes on DM0 and writes NO pixels, so
+    // one of these is a candidate for the missing store.
+    {
+        let oracle = *crate::module_parameters::g17p_frag_oracle.value();
+        if oracle & 0x01 != 0 {
+            put_u64(raw, 0x158, 0x7007);
+        }
+        if oracle & 0x02 != 0 {
+            put_u64(raw, 0x488, 1);
+        }
+        if oracle & 0x04 != 0 {
+            // native 0x8000005300000000 against our 0x0000005300000000
+            let mut cur = [0u8; 8];
+            cur.copy_from_slice(&raw[0x21c8..0x21d0]);
+            put_u64(raw, 0x21c8, u64::from_le_bytes(cur) | (1u64 << 63));
+        }
+        if oracle & 0x08 != 0 {
+            put_u64(raw, 0x78, 0x40);
+        }
+        if oracle & 0x10 != 0 {
+            put_u64(raw, 0x458, 3);
+            put_u64(raw, 0x470, 0x500);
+        }
+        if oracle & 0x20 != 0 {
+            put_u64(raw, 0x1f48, 0x0000_0100_0000_0100);
+        }
+        if oracle & 0x40 != 0 {
+            // fields native leaves ZERO and we populate
+            put_u64(raw, 0x1d0, 0);
+            put_u64(raw, 0x1f0, 0);
+            put_u64(raw, 0x1f8, 0);
+        }
+        if oracle & 0x80 != 0 {
+            put_u32(raw, 0x1d8 + 4, 0x3f80_0000);
+        }
+    }
     put_u8(raw, 0x2100, (parameters.tib_blocks > 8) as u8);
     // Exact G17P tail copied by AGX3DChannelSKSM::submitBuffer. +0x2104 is the
     // accelerator control snapshot and +0x210c its low map nibble. +0x2110 is
