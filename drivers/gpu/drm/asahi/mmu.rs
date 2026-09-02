@@ -211,6 +211,42 @@ const T8140_NATIVE_CONTEXT_VIEWS: [T8140NativeContextView; 7] = [
 ];
 const T8140_NATIVE_CONTEXT_VIEW_COUNT: usize = T8140_NATIVE_CONTEXT_VIEWS.len();
 
+/// Native's SecureGart low presentation of view 0, materialized in the
+/// submitting process's *own* low root rather than in the retained context-0
+/// root.
+///
+/// `AGXSecureGart` gives a process resource two presentations: the canonical
+/// GART address (0x10_0000_0000 here) and a low "user process" address, which
+/// `getGPUVirtualAddressForUserProcess` reports as zero for this resource.
+/// Linux materializes the low presentation itself, and hardware proved the
+/// client regime needs it too: with only the context-0 aliases installed, the
+/// first fragment publication latched four gUPM (unit 0xd9) faults at
+/// `0x1e00`/`0x1e80`/`0x1f00`/`0x1f80` with `reason=Unmapped` and `vm-slot=1`,
+/// i.e. inside the render VM's own root, which had no leaf below
+/// `IOVA_USER_BASE` at all.
+///
+/// The faulting transactions report `read=0`, so this view is mapped
+/// GPU-writable: an unmapped *write* cannot be satisfied by a read-only leaf.
+/// Contrast the context-0 copy above, which keeps the restricted class-1
+/// attributes captured from native for the canonical mapping.
+const T8140_CLIENT_NULL_VIEW: T8140NativeContextView = T8140NativeContextView {
+    source_address: 0x0010_0000_0000,
+    context_address: 0,
+    size: 0x1_0000,
+    requires_source_write: true,
+    context_prot: PROT_GPU_SHARED_RW,
+};
+
+/// VA window a T8140 client root keeps for [`T8140_CLIENT_NULL_VIEW`].
+///
+/// Reserved for the VM's whole lifetime even though the leaf itself only
+/// exists while that VM owns the render graph, so a user bind can never take
+/// the window between graphs. Mesa's own heap starts orders of magnitude
+/// above this, and Mesa binds the remaining low views (0x18000 upwards)
+/// itself.
+pub(crate) const T8140_CLIENT_NULL_VIEW_START: u64 = T8140_CLIENT_NULL_VIEW.context_address;
+pub(crate) const T8140_CLIENT_NULL_VIEW_SIZE: usize = T8140_CLIENT_NULL_VIEW.size;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct T8140RootLayout {
     low: [u64; 2],
@@ -1007,6 +1043,13 @@ pub(crate) struct T8140NativeContextAliases {
     source_vm_id: u64,
     source_generation: u64,
     mappings: KVec<KernelMapping>,
+    /// Native's low view 0 inside the submitting VM's own root. Dropped
+    /// before the context-0 copies so the client regime loses the leaf first.
+    client_mapping: Option<KernelMapping>,
+    /// Live UAT state, used at teardown to invalidate every hardware context
+    /// that still carries the client root (its render slot plus any
+    /// application-GART lease pointing at the same page tables).
+    inner: Arc<UatInner>,
 }
 no_debug!(T8140NativeContextAliases);
 
@@ -1027,11 +1070,26 @@ impl Drop for T8140NativeContextAliases {
         // KernelMapping removes the leaves first. kernel_lower_vm is installed
         // directly rather than through Vm::bind(), so it has no slot token and
         // its generic drop path cannot infer either hardware ASID.
+        //
+        // The client copy does infer its render slot, but the same root is also
+        // rooted in every live application-GART context, so those ASIDs are
+        // invalidated here from the live lease bitmap.
+        let client_contexts = self.inner.t8140_app_contexts.load(Ordering::Acquire);
+        self.client_mapping = None;
         self.mappings.clear();
         fence(Ordering::SeqCst);
         for view in T8140_NATIVE_CONTEXT_VIEWS {
             mem::tlbi_range(0, view.context_address as usize, view.size);
             mem::tlbi_range(1, view.context_address as usize, view.size);
+        }
+        for context_id in 0..UAT_NUM_CTX {
+            if client_contexts & (1u64 << context_id) != 0 {
+                mem::tlbi_range(
+                    context_id as u8,
+                    T8140_CLIENT_NULL_VIEW_START as usize,
+                    T8140_CLIENT_NULL_VIEW_SIZE,
+                );
+            }
         }
         mem::sync();
     }
@@ -1726,6 +1784,13 @@ impl Vm {
         };
 
         let lower_start = lower_vm_start(cfg, t8140_internal);
+        // Native's SecureGart presents a process's first fixed resource at low
+        // VA 0 inside that process's own translation regime, so a T8140 client
+        // root has to be able to hold a leaf below `IOVA_USER_BASE`. Only the
+        // driver's internal allocator is widened: the GPUVM range userspace
+        // binds through, and the `vm_start` the driver publishes, both still
+        // begin at `IOVA_USER_BASE`.
+        let driver_start = if cfg == UatConfig::T8140 { 0 } else { lower_start };
         let (va_range, gpuvm_range) = if is_kernel {
             (iova_kern_range, kernel_range.clone())
         } else {
@@ -1733,7 +1798,7 @@ impl Vm {
             // user/usable ranges byte-for-byte; 42-bit parts extend the
             // user half to the full per-root width.
             (
-                lower_start..uat_geometry(cfg)?.user_va_top(),
+                driver_start..uat_geometry(cfg)?.user_va_top(),
                 lower_start..(uat_geometry(cfg)?.user_va_top() - 2 * UAT_PGSZ as u64),
             )
         };
@@ -2052,6 +2117,31 @@ impl Vm {
     pub(crate) fn translate_iova(&self, address: u64) -> Result<PhysicalAddr> {
         let mut inner = self.inner.exec_lock(None, false)?;
         inner.page_table.translate_iova(address)
+    }
+
+    /// Resolve one offset of native's low view 0 through this VM's own root
+    /// and through the canonical GART address, so a caller can prove -- before
+    /// arming hardware -- that the client regime reaches the same physical
+    /// resource the GPU is about to write there.
+    pub(crate) fn t8140_client_null_view_probe(
+        &self,
+        offset: u64,
+    ) -> Result<(PhysicalAddr, PhysicalAddr)> {
+        if offset >= T8140_CLIENT_NULL_VIEW_SIZE as u64 {
+            return Err(EINVAL);
+        }
+        let canonical = self.translate_iova(
+            T8140_CLIENT_NULL_VIEW
+                .source_address
+                .checked_add(offset)
+                .ok_or(EOVERFLOW)?,
+        )?;
+        let client = self.translate_iova(
+            T8140_CLIENT_NULL_VIEW_START
+                .checked_add(offset)
+                .ok_or(EOVERFLOW)?,
+        )?;
+        Ok((canonical, client))
     }
 
     /// Collect this VM's GPU-visible mappings inside `range`.
@@ -2647,6 +2737,8 @@ impl Uat {
             source_vm_id: source.id,
             source_generation,
             mappings: KVec::new(),
+            client_mapping: None,
+            inner: self.inner.clone(),
         };
 
         for (index, (gem, object_offset)) in snapshot.iter().enumerate() {
@@ -2723,6 +2815,72 @@ impl Uat {
             );
         }
 
+        // Native also presents view 0 at low VA 0 inside the submitting
+        // process's own regime. Hardware asks for it there -- gUPM writes
+        // 0x1e00..0x1f80 through the client's own vm-slot -- and userspace
+        // cannot supply it, because the published user window starts at
+        // IOVA_USER_BASE. Same GEM, same object offset, same physical pages as
+        // the canonical high mapping and the context-0 copy.
+        {
+            let view = T8140_CLIENT_NULL_VIEW;
+            let (gem, object_offset) = snapshot.first().ok_or(EINVAL)?;
+            if !source.covers_range(
+                view.source_address,
+                view.size as u64,
+                true,
+                view.requires_source_write,
+            ) {
+                dev_err!(
+                    self.dev.as_ref(),
+                    "MMU: T8140 client null view source {:#x}+{:#x} lacks GPU write access\n",
+                    view.source_address,
+                    view.size,
+                );
+                return Err(EFAULT);
+            }
+            let object_end = object_offset.checked_add(view.size).ok_or(EOVERFLOW)?;
+            let mapping = source.map_in_range(
+                &**gem,
+                *object_offset..object_end,
+                UAT_PGSZ as u64,
+                view.context_address..view.context_address + view.size as u64,
+                view.context_prot,
+                false,
+            )?;
+            aliases.client_mapping = Some(mapping);
+
+            let source_last_address = view.source_address + view.size as u64 - 1;
+            let context_last_address = view.context_address + view.size as u64 - 1;
+            let source_first = source.translate_iova(view.source_address)?;
+            let source_last = source.translate_iova(source_last_address)?;
+            let client_first = source.translate_iova(view.context_address)?;
+            let client_last = source.translate_iova(context_last_address)?;
+            if source_first != client_first || source_last != client_last {
+                dev_err!(
+                    self.dev.as_ref(),
+                    "MMU: T8140 client null view {:#x}->{:#x} backing mismatch source=[{:#x},{:#x}] client=[{:#x},{:#x}]\n",
+                    view.source_address,
+                    view.context_address,
+                    source_first,
+                    source_last,
+                    client_first,
+                    client_last,
+                );
+                return Err(EFAULT);
+            }
+            dev_info!(
+                self.dev.as_ref(),
+                "MMU: T8140 client null view source {:#x} -> vm {} low {:#x}+{:#x} aliases object +{:#x}, PA [{:#x},{:#x}] writable\n",
+                view.source_address,
+                source.id,
+                view.context_address,
+                view.size,
+                object_offset,
+                client_first,
+                client_last,
+            );
+        }
+
         // A concurrent rebind can race the snapshot but cannot silently win:
         // physical-identity checks above catch changed leaves, and the
         // generation check catches a same-backing unbind/rebind sequence.
@@ -2747,13 +2905,23 @@ impl Uat {
         fence(Ordering::SeqCst);
         mem::tlbi_asid(0);
         mem::tlbi_asid(1);
+        // The client root is rooted in its render slot and in every live
+        // application-GART lease; a stale negative translation in any of them
+        // would fault exactly like the missing leaf did.
+        let client_contexts = self.inner.t8140_app_contexts.load(Ordering::Acquire);
+        for context_id in 0..UAT_NUM_CTX {
+            if client_contexts & (1u64 << context_id) != 0 {
+                mem::tlbi_asid(context_id as u8);
+            }
+        }
         mem::sync();
         dev_info!(
             self.dev.as_ref(),
-            "MMU: published all {} native context aliases for VM {} generation {} to ASIDs 0/1\n",
+            "MMU: published all {} native context aliases plus the client null view for VM {} generation {} to ASIDs 0/1 and contexts {:#x}\n",
             aliases.mappings.len(),
             source.id,
             aliases.source_generation,
+            client_contexts,
         );
         Ok(aliases)
     }
@@ -4322,6 +4490,38 @@ mod tests {
             source_high | TTBR_VALID | (1 << TTBR_ASID_SHIFT)
         );
         assert_ne!(opening, split);
+    }
+
+    #[test]
+    fn t8140_client_null_view_covers_the_faulting_gupm_writes() {
+        let canonical = T8140_NATIVE_CONTEXT_VIEWS[0];
+        let client = T8140_CLIENT_NULL_VIEW;
+
+        // Same resource, same offset, same span as native's canonical view 0:
+        // only the regime it is presented in differs.
+        assert_eq!(client.source_address, canonical.source_address);
+        assert_eq!(client.context_address, canonical.context_address);
+        assert_eq!(client.size, canonical.size);
+        assert_eq!(T8140_CLIENT_NULL_VIEW_START, client.context_address);
+        assert_eq!(T8140_CLIENT_NULL_VIEW_SIZE, client.size);
+
+        // Hardware reported these four as unmapped *writes* (read=0) in the
+        // client's own vm-slot, so the leaf has to be GPU-writable and the
+        // window has to contain all four.
+        assert!(client.requires_source_write);
+        assert!(client.context_prot.allows_gpu(true, true));
+        let window = T8140_CLIENT_NULL_VIEW_START
+            ..T8140_CLIENT_NULL_VIEW_START + T8140_CLIENT_NULL_VIEW_SIZE as u64;
+        for address in [0x1e00u64, 0x1e80, 0x1f00, 0x1f80] {
+            assert!(window.contains(&address));
+        }
+
+        // It begins below the published user base, so no user bind could ever
+        // reach the first view; the reservation only protects the tail that
+        // does overlap the user window.
+        assert_eq!(window.start, 0);
+        assert!(window.start < IOVA_USER_BASE);
+        assert!(window.end > IOVA_USER_BASE);
     }
 
     #[test]
