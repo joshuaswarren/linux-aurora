@@ -438,6 +438,10 @@ impl G17PBootstrapUmaLifecycle {
 const G17P_GFX_LINK_DATA_BASE: u64 = 0xffff_fc00_0004_c000;
 const G17P_GFX_LINK_DATA_END: u64 = 0xffff_fc00_0018_0000;
 const G17P_GFX_PHYSICAL_DATA_BASE: u64 = 0x0000_0100_01d7_c000;
+/// Firmware per-QID dependency records: `0x1261f0 + qid*0x18`, valid byte at
+/// `+0`, completed stamp at `+8`. Firmware DATA segment, so host-readable.
+const G17P_DEPENDENCY_RECORD_LINK_BASE: u64 = 0xffff_fc00_0012_61f0;
+const G17P_DEPENDENCY_RECORD_STRIDE: u64 = 0x18;
 const G17P_GFX1_LINK_DATA_BASE: u64 = 0xffff_fc00_0004_c000;
 const G17P_GFX1_LINK_DATA_END: u64 = 0xffff_fc00_0017_8000;
 const G17P_GFX1_PHYSICAL_DATA_BASE: u64 = 0x0000_0100_01eb_0000;
@@ -3232,6 +3236,66 @@ impl G17PManagerConstruction {
     }
 
     pub(crate) fn log_render_status_pages(&mut self, label: &str) {
+        if *crate::module_parameters::g17p_dep_records.value() != 0 {
+            let dev = self.resources.dev().clone();
+            for qid in [4u8, 5, 6] {
+                let link = G17P_DEPENDENCY_RECORD_LINK_BASE
+                    + u64::from(qid) * G17P_DEPENDENCY_RECORD_STRIDE;
+                let phys = G17P_GFX_PHYSICAL_DATA_BASE
+                    + (link - G17P_GFX_LINK_DATA_BASE);
+                let head = pgtable::LiveFirmwareU64Probe::new(phys)
+                    .and_then(|p| p.observe_mask(u64::MAX, 1))
+                    .map(|o| o.first);
+                let stamp = pgtable::LiveFirmwareU64Probe::new(phys + 8)
+                    .and_then(|p| p.observe_mask(u64::MAX, 1))
+                    .map(|o| o.first);
+                match (head, stamp) {
+                    (Ok(head), Ok(stamp)) => dev_info!(
+                        dev.as_ref(),
+                        "G17P dep-record[{}] qid={} link={:#x} phys={:#x} head={:#018x} valid={} completed={:#018x}\n",
+                        label,
+                        qid,
+                        link,
+                        phys,
+                        head,
+                        head & 1,
+                        stamp,
+                    ),
+                    _ => dev_warn!(
+                        dev.as_ref(),
+                        "G17P dep-record[{}] qid={} unreadable at phys={:#x}\n",
+                        label,
+                        qid,
+                        phys,
+                    ),
+                }
+            }
+        }
+
+        {
+            let dev = self.resources.dev().clone();
+            let mut cc = [0u8; 0x40];
+            let ok = self
+                .render_storage
+                .as_mut()
+                .map(|s| s.read_channel_control(&mut cc).is_ok())
+                .unwrap_or(false);
+            if ok {
+                dev_info!(
+                    dev.as_ref(),
+                    "G17P render channel-control[{}]: pid={:#04x} idx={:#04x} f2={:#04x} prio={:#04x} class={:#04x} qidmask={:02x?} hwbuf={:#04x}\n",
+                    label,
+                    cc[0],
+                    cc[1],
+                    cc[2],
+                    cc[3],
+                    cc[4],
+                    &cc[0x12..0x1a],
+                    cc[0x33],
+                );
+            }
+        }
+
         self.resources.dump_render_qos_regions(label);
         if *crate::module_parameters::g17p_dump_state.value() != 0
             && !G17P_STATE_DUMPED.swap(true, core::sync::atomic::Ordering::Relaxed)

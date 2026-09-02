@@ -3288,15 +3288,30 @@ pub(crate) fn prepare_g17p_cl_kick_entry(
         operands.converted_command_timestamp.wrapping_sub(1)
     };
     let implicit_index = operands.barriers.len();
-    put_u64_le(
-        &mut entry,
-        layout.dependencies + implicit_index * 8,
-        encode_g17p_cl_dependency(implicit_timestamp, queue.queue_id)?,
-    );
+    // DIAGNOSTIC. On a first submit this declares a self-dependency on stamp 0
+    // (`converted_command_timestamp` is 1, minus one). Measured on hardware at
+    // the stall: the TA entry's dependency word is 0x0000050000000000, i.e.
+    // {qid 5, stamp 0}, while the hardware's completed register for that queue,
+    // `0x21028[5]`, reads 0x862cde4910 -- not zero, and not the firmware's
+    // "never completed = base-1 = 0" convention. Firmware assumes one value and
+    // the hardware register holds another, so this dependency may be
+    // unsatisfiable from cold. Omitting it isolates whether the SKSM front-end
+    // is waiting on it.
+    let omit_implicit = !queue.previous_valid
+        && *crate::module_parameters::g17p_no_implicit_dep.value() != 0;
+    if !omit_implicit {
+        put_u64_le(
+            &mut entry,
+            layout.dependencies + implicit_index * 8,
+            encode_g17p_cl_dependency(implicit_timestamp, queue.queue_id)?,
+        );
+    }
 
-    let dependency_count = implicit_index + 1;
+    let dependency_count = implicit_index + usize::from(!omit_implicit);
     let dependency_mask = if dependency_count == G17P_CL_DEPENDENCIES_MAX {
         u32::MAX
+    } else if dependency_count == 0 {
+        0
     } else {
         (1u32 << dependency_count) - 1
     };

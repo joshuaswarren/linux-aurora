@@ -5450,7 +5450,7 @@ impl G17PLiveRuntime {
                         );
                         dev_info!(
                             pdev.as_ref(),
-                            "G17P render KSM counters post-doorbells poll={} TA[outstanding={:#018x},submitted={:#018x},completed={:#018x}] 3D[outstanding={:#018x},submitted={:#018x},completed={:#018x}] enabled-mask={:#018x}:{:#018x} descriptor[TA]={:#018x} descriptor[3D]={:#018x} CL4[outstanding={:#018x},submitted={:#018x},completed={:#018x}]\n",
+                            "G17P render KSM counters post-doorbells poll={} TA[outstanding={:#018x},submitted={:#018x},completed={:#018x}] 3D[outstanding={:#018x},submitted={:#018x},completed={:#018x}] enabled-mask={:#018x}:{:#018x} descriptor[TA]={:#018x} descriptor[3D]={:#018x} CL4[outstanding={:#018x},submitted={:#018x},completed={:#018x}] descriptor[CL4]={:#018x}\n",
                             poll,
                             snapshot.qid_counters[0][0],
                             snapshot.qid_counters[0][1],
@@ -5465,6 +5465,7 @@ impl G17PLiveRuntime {
                             snapshot.qid_counters[2][0],
                             snapshot.qid_counters[2][1],
                             snapshot.qid_counters[2][2],
+                            snapshot.queue_descriptor[2],
                         );
                         dev_info!(
                             pdev.as_ref(),
