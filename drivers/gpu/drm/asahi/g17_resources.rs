@@ -4839,8 +4839,22 @@ impl G17PUserRenderStorage {
         }));
 
         let graph_va = graph.iova();
+        // These pages ARE the SKSM entry rings: the queue-context template
+        // lands at offset 0x200, which is ring slot 1 -- exactly the slot
+        // stamp 1 will use. When the SKSM path is armed the real encoder
+        // writes that slot later, but the 3D doorbell rings first and its
+        // kick declares a barrier on {qid 5, stamp 1}; the KSM resolves that
+        // by reading queue 5's slot, and a synthetic entry sitting there
+        // self-identifies as QID 0 (word0 bits 42:48 = 0, own-dependency
+        // {stamp 0, qid 0}), which is what the firmware then loaded, ran and
+        // blamed. Native never stages anything into a live ring slot: the ring
+        // is zero until encodeKickEntry fills it. Leave it zero here too.
+        let sksm_owns_entry_ring = *crate::module_parameters::g17p_render_sksm.value() != 0;
         bootstrap_stage!("TA queue context", ta_context_peer.with_bytes_mut(|raw| {
             raw.fill(0);
+            if sksm_owns_entry_ring {
+                return Ok(());
+            }
             g17_submission::apply_g17p_cold_opening_queue_context(
                 g17_submission::G17PColdOpeningStage::Tiling,
                 g17_submission::G17P_COLD_OPENING_TA_DESCRIPTOR_BASE,
@@ -4851,6 +4865,9 @@ impl G17PUserRenderStorage {
         }));
         bootstrap_stage!("3D queue context", fragment_context_peer.with_bytes_mut(|raw| {
             raw.fill(0);
+            if sksm_owns_entry_ring {
+                return Ok(());
+            }
             g17_submission::apply_g17p_cold_opening_queue_context(
                 g17_submission::G17PColdOpeningStage::Fragment,
                 g17_submission::G17P_COLD_OPENING_3D_DESCRIPTOR_BASE,
@@ -8951,6 +8968,29 @@ impl G17ResourceOwner {
         })?;
         let event_type = u32::from_le_bytes(raw[0..4].try_into().map_err(|_| EIO)?);
         let validation = match event_type {
+            // Type 1 has had a decoder in g17_completion since the completion
+            // work, but nothing ever dispatched to it, so every stamp-signal
+            // record was logged as unmodelled and dropped. It is the
+            // firmware's own statement of which stamps it signalled: compute
+            // emits mask 0x10 (stamp 4, its QID) on the submission that
+            // passes, and a failing render emits 0x22 (stamps 1 and 5).
+            g17_completion::G17P_FIRMWARE_EVENT_STAMP_TYPE => {
+                match g17_completion::decode_g17p_firmware_stamp_event(&raw) {
+                    Ok(event) => {
+                        dev_info!(
+                            self.dev().as_ref(),
+                            "G17P firmware-event ring: stamp signal cursor={} producer={} masks=[{:#018x},{:#018x}] diagnostics={}\n",
+                            consumer,
+                            producer,
+                            event.masks[0],
+                            event.masks[1],
+                            event.diagnostic_pair_count,
+                        );
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                }
+            }
             g17_completion::G17P_FIRMWARE_EVENT_RECOVERY_TYPE => {
                 g17_completion::decode_g17p_firmware_recovery_event(&raw).map(|_| ())
             }
