@@ -296,6 +296,10 @@ kernel::module_platform_driver! {
             default: 0,
             description: "DIAGNOSTIC ONLY -- before the render doorbell, perform from the host the one-time KSM arm that b1's scheduler pass FUN_25644 performs for itself (sgx+0x21140 = 1<<63, gated in firmware on DAT_124b8d && DAT_177d18). A cold-boot render publishes tag-15/tag-14 for both stages and is never drained; 21ms later firmware thread 4 raises pause reason 0x1000 and both queues are NOP-retired as stopped-with-pending-kicks. One completed compute makes the same publication drain 18us later and the TA execute. This asks whether that arm is the state the compute establishes. Native performs ZERO MMIO on the submit path, so a positive result identifies the gate, it does not license keeping this write.",
         },
+        g17p_admit_arm: u32 {
+            default: 0,
+            description: "DIAGNOSTIC ONLY -- before the render doorbell, set bit 63 of each render queue's descriptor register 0x21008 through the SKSM port. b1's admit block at 0x12dc0 tests exactly this bit: set, the admitted byte A becomes 0x21020-0x21028+1; clear, A stays 0, which makes A == B at 0x58010+qid*0x28+0x418/0x419 and the scheduler parks the queue and NOP-retires it status 4 -- the cold-render symptom, byte for byte. Nothing in the firmware writes bit 63 (only bit 62 at 0xd1d4/0x164e4), so it is hardware-set and a cold boot is the case where the hardware never set it. Native performs ZERO MMIO on the submit path, so this can never ship; it answers whether that one bit is the cold gate. 0: off (default), 1: arm the TA queue, 2: arm both render queues.",
+        },
         g17p_render_usc_freelist: u32 {
             default: 1,
             description: "NATIVE-DERIVED FIRST-SUBMIT CONTROL. Before the first render doorbell, publish AGXUSCPrivMemFList::updateSubmitInfo as the exact 0x40-byte opcode-0x20 device-control record naming Linux-owned resources. A matching firmware type-13 record is accepted only while the retained owner is live; release uses opcode 0x2e. 0: diagnostic suppression, 1: publish the cold render FList (default).",
