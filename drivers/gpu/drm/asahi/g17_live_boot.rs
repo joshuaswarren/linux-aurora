@@ -3559,10 +3559,20 @@ impl G17PLiveRuntime {
             // 0x177808: byte 4 bits 1,2 -> qword bits 33,34; byte 5 bit 1 ->
             // qword bit 41.
             const CLASS_QWORD_LINK: u64 = 0xffff_fc00_0017_7808;
-            const CLASS_BITS: u64 = (1 << 33) | (1 << 34) | (1 << 41);
+            // Mode 1 arms the classes the firmware RE named (0x17780c bits
+            // 1-2, 0x17780d bit 1). Mode 2 arms EVERY class in both bytes:
+            // mode 1 produced ch=1 but no ch=9, so the one-bit-per-class
+            // reading is unconfirmed and the cheapest way to find 0x909 is to
+            // stop guessing the mapping.
+            let class_bits: u64 = if *module_parameters::g17p_fw_trace_classes.value() >= 2 {
+                0x0000_ffff_0000_0000
+            } else {
+                (1u64 << 33) | (1u64 << 34) | (1u64 << 41)
+            };
+            const CLASS_BITS_UNUSED: u64 = 0;
             let phys = g17_manager::g17p_gfx_link_to_physical(CLASS_QWORD_LINK);
             match crate::pgtable::LiveFirmwareU64Probe::new(phys)
-                .and_then(|p| p.set_bits(CLASS_BITS))
+                .and_then(|p| p.set_bits(class_bits))
             {
                 Ok((before, after)) => dev_info!(
                     self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
