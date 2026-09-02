@@ -8884,7 +8884,7 @@ impl G17ResourceOwner {
             // -- an independent check that the per-data-master block really is
             // the last one and really is 8-byte strided.
             //
-            // `+0x600` is deliberately NOT written here: its index is
+            // `+0x600`'s index is
             // `AGXQOSQueue+0x10`, which `init` @ 0xfffffe0008a81520 sets to
             // 0xffffffff and something outside init assigns. Writing it on a
             // guessed index would scribble on the object, so it stays open.
@@ -8893,6 +8893,16 @@ impl G17ResourceOwner {
                 .ok_or(EINVAL)?;
             let counter = bytes
                 .get_mut(submit_counter_offset..submit_counter_offset + 4)
+                .ok_or(EINVAL)?;
+            let bumped = u32::from_le_bytes(counter.try_into().map_err(|_| EINVAL)?)
+                .wrapping_add(1);
+            counter.copy_from_slice(&bumped.to_le_bytes());
+
+            let hardware_buffer_counter_offset = 0x600usize
+                .checked_add(hardware_buffer_id.checked_mul(4).ok_or(EINVAL)?)
+                .ok_or(EINVAL)?;
+            let counter = bytes
+                .get_mut(hardware_buffer_counter_offset..hardware_buffer_counter_offset + 4)
                 .ok_or(EINVAL)?;
             let bumped = u32::from_le_bytes(counter.try_into().map_err(|_| EINVAL)?)
                 .wrapping_add(1);
