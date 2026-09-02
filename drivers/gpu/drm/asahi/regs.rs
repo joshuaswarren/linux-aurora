@@ -363,6 +363,8 @@ pub(crate) struct G17PRenderKsmAdmissionSnapshot {
     /// Authoritative queue-enabled status. These are not the write-only
     /// set-valid strobes at 0x21068/0x21070.
     pub(crate) queue_enabled: [u64; 2],
+    /// The valid mask tag-15 tests before writing the enable strobe.
+    pub(crate) queue_valid_mask: [u64; 2],
     /// Per-QID descriptor register 0x21008 for the TA and 3D queues. This is
     /// what `configureHardware` writes and what the firmware's tag-15 install
     /// is expected to program: entry-ring base plus the hardware-set valid
@@ -1188,6 +1190,15 @@ impl Resources {
             completed_by_qid[qid as usize] =
                 Self::g17p_sksm_port_read_locked(&sgx, 0x21028, qid, 1u64 << 42)?;
         }
+        // The valid mask the tag-15 handler TESTS at fw 0x11b60 before deciding
+        // whether to write the enable strobe pair 0x21070/0x21068. If a queue
+        // already reads valid here the firmware SKIPS the enable entirely, so
+        // this is distinct from the authoritative enabled status at
+        // 0x21058/0x21060 that this snapshot already carries.
+        let queue_valid_mask = [
+            Self::g17p_sksm_port_read_locked(&sgx, 0x21038, 0, 1u64 << 42)?,
+            Self::g17p_sksm_port_read_locked(&sgx, 0x21040, 0, 1u64 << 42)?,
+        ];
         let queue_resume_mask = [
             Self::g17p_sksm_port_read_locked(&sgx, 0x21048, 0, 1u64 << 42)?,
             Self::g17p_sksm_port_read_locked(&sgx, 0x21050, 0, 1u64 << 42)?,
@@ -1453,6 +1464,7 @@ impl Resources {
             queue_enabled_mask,
             dm_control,
             dm_stopped,
+            queue_valid_mask,
             queue_resume_mask,
             completed_by_qid,
             pipe_vdm_stream,
