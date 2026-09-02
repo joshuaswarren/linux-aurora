@@ -5306,12 +5306,14 @@ impl G17PLiveRuntime {
                         );
                         dev_info!(
                             pdev.as_ref(),
-                            "G17P render KSM launch poll={} dm-control={:#018x} dm-stopped={:#018x} descriptor=[TA={:#018x},3D={:#018x}] resume=[{:#x},{:#x}] pipe-vdm-stream=[{:#x},{:#x},{:#x},{:#x}] pipe-work-stamp=[{:#x},{:#x},{:#x},{:#x}] completed-by-qid=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]\n",
+                            "G17P render KSM launch poll={} dm-control={:#018x} dm-stopped={:#018x} descriptor=[TA={:#018x},3D={:#018x}] enabled=[{:#x},{:#x}] resume=[{:#x},{:#x}] pipe-vdm-stream=[{:#x},{:#x},{:#x},{:#x}] pipe-work-stamp=[{:#x},{:#x},{:#x},{:#x}] completed-by-qid=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]\n",
                             poll,
                             snapshot.dm_control,
                             snapshot.dm_stopped,
                             snapshot.queue_descriptor[0],
                             snapshot.queue_descriptor[1],
+                            snapshot.queue_enabled_mask[0],
+                            snapshot.queue_enabled_mask[1],
                             snapshot.queue_resume_mask[0],
                             snapshot.queue_resume_mask[1],
                             snapshot.pipe_vdm_stream[0],
