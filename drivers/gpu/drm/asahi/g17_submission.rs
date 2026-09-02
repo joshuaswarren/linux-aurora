@@ -5791,7 +5791,7 @@ mod tests {
             ta_hardware_buffer_id: 7,
         };
         for (stage, context_id) in [
-            (G17PColdOpeningStage::Tiling, 2),
+            (G17PColdOpeningStage::Tiling, 6),
             (G17PColdOpeningStage::Fragment, 6),
         ] {
             let mut optional = [0u8; G17P_COLD_OPENING_OPTIONAL_SIZE];
