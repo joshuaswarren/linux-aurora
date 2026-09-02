@@ -394,10 +394,23 @@ fn encode_g17p_flist_runs(out: &mut [u8], block_count: usize) -> bool {
 }
 
 fn encode_g17p_compute_flist_runs(out: &mut [u8]) -> bool {
-    encode_g17p_flist_runs(
-        out,
-        g17_initdata::COMPUTE_READINESS_OPERAND_ENTRY_COUNT,
-    )
+    if out.len() != G17P_CONTROL_OPERAND_TABLE_BACKING_SIZE {
+        return false;
+    }
+    out.fill(0);
+    for buffer_index in 0..g17_initdata::COMPUTE_READINESS_OPERAND_ENTRY_COUNT {
+        let Some(buffer_base) = g17p_control_operand_buffer_va(buffer_index) else {
+            return false;
+        };
+        let offset = buffer_index * core::mem::size_of::<u64>();
+        let Some(slot) = out.get_mut(offset..offset + core::mem::size_of::<u64>()) else {
+            return false;
+        };
+        let run = (buffer_base & G17P_CONTROL_OPERAND_RUN_ADDRESS_MASK)
+            | (G17P_CONTROL_OPERAND_RUN_LENGTH_PAGES << 52);
+        slot.copy_from_slice(&run.to_le_bytes());
+    }
+    true
 }
 
 fn encode_g17p_pre_qid_flist_runs(out: &mut [u8]) -> bool {
@@ -11397,7 +11410,7 @@ impl G17ResourceOwner {
             self.resources
                 .partial_opening_control_shared
                 .with_bytes_mut(|bytes| {
-                    g17_initdata::encode_partial_opening_control_shared(bytes)
+                    g17_initdata::encode_compute_partial_opening_control_shared(bytes)
                         .map_err(|_| EINVAL)
                 })?;
             self.resources
@@ -11449,7 +11462,7 @@ impl G17ResourceOwner {
                 G17P_CONTROL_OPERAND_TABLE_BACKING_SIZE,
                 g17_initdata::PARTIAL_OPENING_CONTROL_SHARED_ADDRESS,
                 g17_initdata::PARTIAL_OPENING_CONTROL_SHARED_INNER_ADDRESS,
-                g17_initdata::PARTIAL_OPENING_CONTROL_SHARED_CURSOR_BEFORE
+                g17_initdata::COMPUTE_PARTIAL_OPENING_CONTROL_SHARED_CURSOR_BEFORE
             );
         }
         for (index, buffer) in self
@@ -12160,14 +12173,14 @@ mod tests {
         assert_eq!(count, 21);
         for buffer_index in 0..count {
             let base = g17p_control_operand_buffer_va(buffer_index).unwrap();
-            let offset = buffer_index * G17P_CONTROL_OPERAND_RUN_SLOT_SIZE;
+            let offset = buffer_index * core::mem::size_of::<u64>();
             assert_eq!(
                 u64::from_le_bytes(raw[offset..offset + 8].try_into().unwrap()),
                 (base & G17P_CONTROL_OPERAND_RUN_ADDRESS_MASK)
                     | (G17P_CONTROL_OPERAND_RUN_LENGTH_PAGES << 52)
             );
         }
-        assert!(raw[count * G17P_CONTROL_OPERAND_RUN_SLOT_SIZE..]
+        assert!(raw[count * core::mem::size_of::<u64>()..]
             .iter()
             .all(|byte| *byte == 0));
 
