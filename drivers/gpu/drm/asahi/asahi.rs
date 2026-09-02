@@ -82,9 +82,9 @@ kernel::module_platform_driver! {
             description: "Fully isolate GPU contexts (limits performance)",
         },
         g17p_test_stage: u32 {
-            default: 1,
+            default: 2,
             // permissions: 0,
-            description: "G17P bring-up stage (0: control, 1: QID4, 2: compute UAPI)",
+            description: "G17P bring-up stage (0: control, 1: QID4, 2: compute UAPI; default: full driver path)",
         },
         g17p_max_recoveries: u32 {
 
@@ -163,10 +163,6 @@ kernel::module_platform_driver! {
         g17p_progress_watchdog: u32 {
             default: 1,
             description: "KSM progress watchdog threshold at regionC+0x9cc (1: keep native 0x32, 0: disable)",
-        },
-        g17p_generic_compute: u32 {
-            default: 1,
-            description: "Let a compute command that carries no DRM_ASAHI_COMPUTE_G17P_ADD3_PROOF flag drive the binary-verified first-bind chronology (tag 3 -> 15 -> QID configure -> SKSM entry -> 14 -> 16 -> CL_2) when its queue is still in PreparedMemory. 1: on -- required for any Mesa/Honeykrisp dispatch, which binds resources through the command stream and so declares no attachments. 0: previous behaviour, only the add3 probe reaches the firmware and every other first compute submit returns ENOTSUPP.",
         },
         g17p_power_hold: u32 {
             default: 0,
@@ -369,22 +365,6 @@ kernel::module_platform_driver! {
         g17p_repeat_activation: u32 {
             default: 0,
             description: "Also send the priority-2 CL activation (EP 0x21 0x0a) on a steady-state compute submission, not just the direct kick (0x10). Default 0 follows the modelled native lifecycle, where activation is emitted only when the submitted channel identity CHANGES -- so a repeat on the same queue graph sends the kick alone. Set 1 if a repeat publishes but the firmware never consumes it: that is the symptom of the kick alone being insufficient to start a channel scan.",
-        },
-        g17p_tag15_install: u32 {
-            default: 2,
-            description: "Tag-15 ConfigUpdate +0x1a, the queue-install flag. 2 (default) = 1 on a queue's first bind and 0 afterwards. 1 = always 1, which is what the driver sent before the first-bind gate existed. 0 = always 0, which is literally what every captured macOS compute submission sends. The three settings exist because the two sources of truth disagree: firmware RE says the store to the per-queue slot 0x127628+qid*0x28 is reachable only when this field is non-zero, and sending 0 left slot[+0x08] NULL so the tag-16 handler faulted at pc=0x1190c; while macOS never sends anything but 0. Both are explicable if native installs the queue outside the traced submit window, but that is not proven, so make it selectable rather than guessed.",
-        },
-        g17p_repeat_submit: u32 {
-            default: 1,
-            description: "Publish a second and later compute submission through the steady-state channel chronology (tag 3 -> 15 -> 14 -> 16 -> CL_2) on the already-installed queue, appending at the live item-ring producer. 0 restores the previous behaviour, where every repeat tore down and rebuilt the whole firmware session before re-running the first-bind path.",
-        },
-        g17p_repeat_tag16: u32 {
-            default: 0,
-            description: "Tag-16 EntrySignal +0x06, encoded by G17PComputeOptionalEvent as `old_timestamp`. 0 (default, proven) sends this submission's OWN stamp. 1 sends the PREVIOUS entry's stamp on repeats, which is what the field name literally describes; 2 extends that to the first bind too, where the previous stamp is 0 -- a value that path has never sent. This matters because sending our own in-flight stamp may be declaring the work already retired, which is exactly the shape of the current failure: a submission that retires cleanly while the GPU writes nothing, non-deterministically. It also unifies the compute and Mesa failures, since a longer dispatch would lose that race every time while a tiny add3 kernel usually wins it.",
-        },
-        g17p_repeat_ordinal: u32 {
-            default: 0,
-            description: "Descriptor per-submission ordinals on a steady-state submission. 1 advances all of them (submit_sequence, work_ordinal, queue_submission/ordinal, submission_index) -- hardware says this FAILS on the first repeat. 0 pins all of them to the first bind's constants -- hardware says this gets two consecutive submissions and then stops. 2 is the split neither run has tested: the sequence fields advance, matching macOS's CL command record whose +0x04 sequence increments per published record, while work_ordinal stays 0 because it alone feeds context_word = (context_id << 8) | work_ordinal in the register program, which m1n1's proven add3 left at 0x200 and which mode 1 was corrupting to 0x201.",
         },
         g17p_queue_recycle: u32 {
             default: 2,

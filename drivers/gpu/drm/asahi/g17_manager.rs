@@ -73,22 +73,6 @@ const G17P_BOOTSTRAP_UMA_COUNT: u32 = 0x20;
 // physical-counter sample used by retained compute submissions.
 const G17P_NATIVE_RENDER_KICK_AUXILIARY: u64 = 0x003f_ffff_ffff_ffff;
 
-/// Native fills command-descriptor +0x178 with `mach_absolute_time()` and the
-/// KSM encoder copies it verbatim to entry +0x178. On Apple arm64 that is the
-/// raw architectural physical counter, the same source this driver reads in
-/// `File::get_time`. It remains monotonic when a physical queue is retained
-/// across submits; clamp only the theoretical at-boot zero so the first
-/// descriptor never selects native's fallback-table path.
-#[cfg(not(test))]
-fn g17p_kick_auxiliary_timestamp() -> u64 {
-    let timestamp: u64;
-    // SAFETY: Assembly only reads the userspace-accessible physical timer.
-    unsafe {
-        core::arch::asm!("mrs {timestamp}, CNTPCT_EL0", timestamp = out(reg) timestamp);
-    }
-    timestamp.max(1)
-}
-
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum G17PNativeRenderPublishPhase {
     FragmentVisible,
@@ -4312,7 +4296,7 @@ impl G17PManagerConstruction {
                 event_mask: command_state.event_mask,
                 rce_kind: 0,
                 rce_bindings: command_state.rce_bindings,
-                auxiliary: g17p_kick_auxiliary_timestamp(),
+                auxiliary: context.auxiliary,
             },
         )
         .map_err(|_| EINVAL)?;
@@ -4330,14 +4314,9 @@ impl G17PManagerConstruction {
         }
         let mut entry_signal =
             [0u8; g17_submission::G17P_COMPUTE_OPTIONAL_EVENT_SIZE];
-        // See the repeat path for why this field is under suspicion. Mode 2
-        // extends the "previous stamp" reading to the first bind as well, where
-        // the previous stamp is 0 -- a value this path has never sent.
-        let first_bind_old_timestamp = if *module_parameters::g17p_repeat_tag16.value() > 1 {
-            prepared_entry.current_timestamp.saturating_sub(1)
-        } else {
-            prepared_entry.current_timestamp
-        };
+        // Tag 16 names the last retired entry. A newly installed queue has no
+        // predecessor, so the protocol value is zero.
+        let first_bind_old_timestamp = prepared_entry.current_timestamp.saturating_sub(1);
         g17_submission::encode_g17p_compute_optional_event(
             g17_submission::G17PComputeOptionalEvent {
                 queue_id: u16::from(queue.queue_id),
@@ -4356,20 +4335,13 @@ impl G17PManagerConstruction {
         self.log_record("tag16-entry-signal", &entry_signal);
 
         let sksm_entry_aliases = queue.storage.entry_aliases()?;
-        // First bind, so this is `true` under the default policy -- byte-for-byte
-        // what the driver sent before the first-bind gate was introduced, since
-        // `hardware_state` is still `PreparedMemory` here (the QID configure
-        // transaction runs *after* tag 15, below). The gate therefore cannot
-        // change a boot's FIRST submission at all; it only clears the flag on
-        // later ones.
-        let install_queue = match *module_parameters::g17p_tag15_install.value() {
-            0 => false,
-            1 => true,
-            _ => matches!(
-                queue.hardware_state,
-                G17PSksmQueueHardwareState::PreparedMemory
-            ),
-        };
+        // Tag 15 installs a queue exactly once. This path is reachable only for
+        // the prepared first bind; retained submissions use the repeat encoder
+        // with the install flag clear.
+        let install_queue = matches!(
+            queue.hardware_state,
+            G17PSksmQueueHardwareState::PreparedMemory
+        );
         // The single most diagnostic line for a client handoff. The tag-15
         // queue-install flag must be published exactly ONCE per boot -- on the
         // first client's first bind. A second occurrence means some path has
@@ -4378,7 +4350,7 @@ impl G17PManagerConstruction {
         // and leaves the submission published-but-never-completed.
         dev_info!(
             self.resources.dev().as_ref(),
-            "G17PMARK tag15-install i={} z={} r={} h={} qid={} flag={} policy={} (first-bind chronology; a second install on the SAME qid in one boot is the second-client bug)\n",
+            "G17PMARK tag15-install i={} z={} r={} h={} qid={} flag={} (first-bind chronology; a second install on the SAME qid in one boot is the second-client bug)\n",
             {
                 let n = G17P_MARK_TAG15_INSTALLS.fetch_add(1, Ordering::Relaxed) + 1;
                 n
@@ -4388,7 +4360,6 @@ impl G17PManagerConstruction {
             G17P_MARK_RETAINED_HANDOFFS.load(Ordering::Relaxed),
             queue.queue_id,
             install_queue as u32,
-            *module_parameters::g17p_tag15_install.value(),
         );
         let mut group = queue
             .compute
@@ -4608,12 +4579,11 @@ impl G17PManagerConstruction {
         // program as `context_word = (context_id << 8) | work_ordinal`, which
         // m1n1's proven add3 left at 0x200. Mode 1 was sending 0x201, which is
         // the most likely reason it failed immediately.
-        let mode = *module_parameters::g17p_repeat_ordinal.value();
-        let (sequence_ordinal, work_ordinal) = match mode {
-            0 => (0, 0),
-            1 => (ordinal, ordinal),
-            _ => (ordinal, 0),
-        };
+        // The output-positive 100-submit run keeps both descriptor ordinals at
+        // their first-bind values. The item-ring producer and entry timestamp
+        // provide the forward progress for repeat commands.
+        let sequence_ordinal: u32 = 0;
+        let work_ordinal = 0;
         let queue_submission = sequence_ordinal.checked_add(1).ok_or(EINVAL)?;
         let stamp = g17_submission::decode_kick_timestamp(queue.producer.current_timestamp)
             .map_err(|_| EINVAL)?;
@@ -4686,7 +4656,7 @@ impl G17PManagerConstruction {
                 event_mask: command_state.event_mask,
                 rce_kind: context.rce_kind,
                 rce_bindings: command_state.rce_bindings,
-                auxiliary: g17p_kick_auxiliary_timestamp(),
+                auxiliary: context.auxiliary,
             },
         )
         .map_err(|_| EINVAL)?;
@@ -4696,23 +4666,8 @@ impl G17PManagerConstruction {
         }
         let backend = g17_submission::T8140_G17P_CL_BACKEND;
         let mut entry_signal = [0u8; g17_submission::G17P_COMPUTE_OPTIONAL_EVENT_SIZE];
-        // The field is named `old_timestamp`, and we send this submission's OWN
-        // stamp -- i.e. we may be telling the firmware that the work we are
-        // about to queue is already retired. That is precisely the shape of the
-        // failure now observed: a submission that retires cleanly while the GPU
-        // writes nothing, non-deterministically, as a race between the
-        // firmware acting on this declaration and the dispatch actually
-        // running. It also unifies with Mesa, whose longer dispatch would lose
-        // that race every time while the tiny add3 kernel usually wins it.
-        //
-        // On a first bind "own" (1) and "previous" (0) are both accepted by a
-        // queue with no predecessor, so that submission cannot distinguish the
-        // two readings; a repeat can.
-        let entry_old_timestamp = if *module_parameters::g17p_repeat_tag16.value() != 0 {
-            queue.producer.previous_timestamp
-        } else {
-            prepared_entry.current_timestamp
-        };
+        // Tag 16 names the last retired entry, never the kick being published.
+        let entry_old_timestamp = queue.producer.previous_timestamp;
         g17_submission::encode_g17p_compute_optional_event(
             g17_submission::G17PComputeOptionalEvent {
                 queue_id: u16::from(queue.queue_id),
@@ -4966,37 +4921,30 @@ impl G17PManagerConstruction {
         // while the add3 probe reached the firmware.
         let first_bind = queue.hardware_state == G17PSksmQueueHardwareState::PreparedMemory
             && queue.submission_ordinal == 0;
-        let generic_first_bind = *module_parameters::g17p_generic_compute.value() != 0;
         // Which of the three chronologies this submit takes. A submit that
         // produces no record dump at all took a path with no logging, so name
         // the route before branching -- otherwise "no output" is ambiguous
         // between "different path" and "never got here".
         if *module_parameters::g17p_fault_report.value() != 0 {
             let attachments = command.attachments.as_slice();
-            let route = if first_bind
-                && (command.g17p_add3_buffers.is_some() || generic_first_bind)
-            {
+            let route = if first_bind {
                 "first-bind"
             } else if queue.hardware_state
                 != G17PSksmQueueHardwareState::HardwareRegistered
             {
                 "REFUSED-not-registered"
-            } else if *module_parameters::g17p_repeat_submit.value() != 0
-                && queue.submission_ordinal != 0
-            {
+            } else if queue.submission_ordinal != 0 {
                 "repeat"
             } else {
                 "steady-state"
             };
             dev_info!(
                 self.resources.dev().as_ref(),
-                "G17P rec route={} hardware_state={:?} submission_ordinal={} first_bind={} generic_first_bind={} repeat_submit={} add3_proof={}\n",
+                "G17P rec route={} hardware_state={:?} submission_ordinal={} first_bind={} add3_proof={}\n",
                 route,
                 queue.hardware_state,
                 queue.submission_ordinal,
                 first_bind,
-                generic_first_bind,
-                *module_parameters::g17p_repeat_submit.value(),
                 command.g17p_add3_buffers.is_some(),
             );
             dev_info!(
@@ -5025,7 +4973,7 @@ impl G17PManagerConstruction {
         // unconditionally, which meant its second submission either hit the
         // `submission_ordinal != 0` gate or re-ran the first-bind builder on a
         // live queue and reset the item-ring producer under the firmware.
-        if first_bind && (command.g17p_add3_buffers.is_some() || generic_first_bind) {
+        if first_bind {
             return self
                 .submit_translated_first_bind_channel(
                     registers,
@@ -5041,12 +4989,12 @@ impl G17PManagerConstruction {
 
         // Post-registration path. It assumes the tag/configure chronology has
         // already run, so a still-prepared queue is refused here exactly as
-        // before when `g17p_generic_compute=0`.
+        // before the queue has been registered.
         if queue.hardware_state != G17PSksmQueueHardwareState::HardwareRegistered {
             return Err(ENOTSUPP);
         }
 
-        if *module_parameters::g17p_repeat_submit.value() != 0 && queue.submission_ordinal != 0 {
+        if queue.submission_ordinal != 0 {
             return self
                 .submit_translated_repeat_channel(
                     registers,
@@ -5082,7 +5030,7 @@ impl G17PManagerConstruction {
             event_mask: command_state.event_mask,
             rce_kind: context.rce_kind,
             rce_bindings: command_state.rce_bindings,
-            auxiliary: g17p_kick_auxiliary_timestamp(),
+            auxiliary: context.auxiliary,
         });
         let prepared = g17_submission::prepare_g17p_cl_kick_entry(queue.producer, operands)
             .map_err(|_| EINVAL)?;

@@ -4083,8 +4083,7 @@ impl G17PLiveRuntime {
         // tearing the firmware session down and re-running the first-bind
         // chronology instead is the behaviour that made repeats fail. Reuse
         // the binding when the queue is installed and the VM is unchanged.
-        let steady_state_queue = *module_parameters::g17p_repeat_submit.value() != 0
-            && !self.is_crashed()
+        let steady_state_queue = !self.is_crashed()
             && self
                 .queue
                 .as_ref()
