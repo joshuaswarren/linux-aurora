@@ -4330,11 +4330,11 @@ impl G17PUserRenderStorage {
     /// and `FUN_16f7c` then does `ldr w8,[rec,#148]; cbnz w8, <bare return>` --
     /// a non-zero `+0x94` makes the firmware DROP the TA work silently, with no
     /// job inserted, no trace and no fault, which is exactly our symptom.
-    pub(crate) fn read_pool_a_record(&mut self, out: &mut [u8; 0x100]) -> Result {
+    pub(crate) fn read_pool_a_record(&mut self, out: &mut [u8; 0x200]) -> Result {
         self.support.with_bytes_mut(|bytes| {
             out.copy_from_slice(
                 bytes
-                    .get(G17P_RENDER_POOL_A..G17P_RENDER_POOL_A + 0x100)
+                    .get(G17P_RENDER_POOL_A..G17P_RENDER_POOL_A + 0x200)
                     .ok_or(ERANGE)?,
             );
             Ok(())
