@@ -3626,16 +3626,26 @@ impl Uat {
 
                 let ttbs = uat_inner.ttbs();
                 uat_inner.handoff().lock();
+                let t8140_phase = self.t8140_context_phase.load(Ordering::Acquire);
                 if uat_inner.handoff().current_slot() == Some(idx as u32) {
                     pr_err!(
                         "Vm::bind to slot {}, but it is currently in use by the ASC?\n",
                         idx
                     );
                 }
-                // Native registers one GART context by writing only that
-                // GPTBAT entry's root0/root1 pair. It never rewrites context 0
-                // as a side effect of allocating an app context. Keep the
-                // retained firmware/kernel pair intact and publish only idx.
+                // At the first-work boundary the populated firmware high root
+                // leaves contexts 0 and 1. Compute contexts 2/3 retain that
+                // root explicitly, while the opening pair becomes the two
+                // measured empty-high roots.
+                let changed_ctx0 = self.cfg == UatConfig::T8140
+                    && idx == 1
+                    && t8140_phase == T8140_CONTEXT_BOOTSTRAP_SOURCE_HIGH;
+                if changed_ctx0 {
+                    let empty = self.t8140_empty_high_roots.as_ref().ok_or(EIO)?;
+                    ttbs[0]
+                        .ttb1
+                        .store(empty[0].ttb() | TTBR_VALID, Ordering::Release);
+                }
                 ttbs[idx].ttb0.store(ttb, Ordering::Release);
                 ttbs[idx].ttb1.store(ttb1, Ordering::Release);
                 if self.cfg == UatConfig::T8140 && idx == 1 {
@@ -3654,6 +3664,9 @@ impl Uat {
 
                 // Make sure all TLB entries from the previous owner of this ASID are gone.
                 fence(Ordering::SeqCst);
+                if changed_ctx0 {
+                    mem::tlbi_asid(0);
+                }
                 mem::tlbi_asid(idx as u8);
                 mem::sync();
             }

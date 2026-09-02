@@ -2802,6 +2802,9 @@ impl G17PManagerConstruction {
         if self.render_tracker.is_some() {
             return Err(EBUSY);
         }
+        self.resources
+            .stage_render_region_views()
+            .map_err(|error| Self::render_stage_fail("stage-region-views", error))?;
         match self.render_context_aliases.as_ref() {
             Some(aliases) if aliases.matches(vm) => {}
             Some(_) => {
@@ -4164,6 +4167,7 @@ impl G17PManagerConstruction {
     }
 
     fn publish_compute_b2_once(&mut self, queue: &mut G17PSksmQueue) -> Result {
+        self.resources.stage_compute_region_views()?;
         if queue.b2_activation == g17_submission::G17PClB2ActivationState::Pending {
             let channel_control_gpu_va = queue.storage.channel_control_gpu_va();
             queue.b2_activation =

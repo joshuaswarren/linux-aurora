@@ -7175,6 +7175,8 @@ struct G17MappedResources {
     secondary_status_a: MappedObject,
     primary_b2_sentinel: MappedObject,
     primary_b2_alias_1: MappedObject,
+    primary_b2_alias_0_low: mmu::KernelMapping,
+    primary_b2_alias_1_low: mmu::KernelMapping,
     completion_ordinal_0: MappedObject,
     completion_ordinal_0_low: mmu::KernelMapping,
     completion_ordinal_2: MappedObject,
@@ -7451,6 +7453,22 @@ impl G17ResourceOwner {
             )
             .map_err(|_| EINVAL)
         })?;
+        // The compute firmware consumes these two objects through the fixed
+        // context-0 low views published in primary main config. Keep the
+        // low/high pairs on the same backing; copying their bytes into an
+        // unrelated descriptor table is not equivalent once firmware writes
+        // scheduler state through one view and reads it through the other.
+        let primary_b2_alias_0_low = partial_scheduler.map_alias_at(
+            address_space.uat.kernel_lower_vm(),
+            g17_initdata::REGION_VIEW_LOW_ADDRS[0],
+            mmu::PROT_GPU_SHARED_RW,
+        )?;
+        let primary_b2_alias_1_low = primary_b2_alias_1.map_alias_at(
+            address_space.uat.kernel_lower_vm(),
+            g17_initdata::REGION_VIEW_LOW_ADDRS[1],
+            mmu::PROT_GPU_SHARED_RW,
+        )?;
+        dev_info!(dev.as_ref(), "G17P resources: compute B2 low/high aliases mapped\n");
         dev_info!(
             dev.as_ref(),
             "G17P resources: mapping primary-index owner at {:#x}, render alias {:#x}\n",
@@ -7934,9 +7952,10 @@ impl G17ResourceOwner {
             mmu::UAT_PGSZ as u64,
             mmu::PROT_FW_SHARED_RW,
         )?;
-        let pb_descriptor_table_low = pb_descriptor_table.map_alias_at(
+        let pb_descriptor_table_low = pb_descriptor_table.map_alias_in_range(
             address_space.uat.kernel_lower_vm(),
-            g17_initdata::REGION_VIEW_LOW_ADDRS[0],
+            g17p_cl_dynamic_low_va_range(),
+            mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_SHARED_RW,
         )?;
         let mut uma_page_pool_descriptor_table = MappedObject::new_wc(
@@ -7946,11 +7965,13 @@ impl G17ResourceOwner {
             mmu::UAT_PGSZ as u64,
             mmu::PROT_FW_SHARED_RW,
         )?;
-        let uma_page_pool_descriptor_table_low = uma_page_pool_descriptor_table.map_alias_at(
-            address_space.uat.kernel_lower_vm(),
-            g17_initdata::REGION_VIEW_LOW_ADDRS[1],
-            mmu::PROT_GPU_SHARED_RW,
-        )?;
+        let uma_page_pool_descriptor_table_low =
+            uma_page_pool_descriptor_table.map_alias_in_range(
+                address_space.uat.kernel_lower_vm(),
+                g17p_cl_dynamic_low_va_range(),
+                mmu::UAT_PGSZ as u64,
+                mmu::PROT_GPU_SHARED_RW,
+            )?;
         pb_descriptor_table.with_bytes_mut(|bytes| {
             bytes.fill(0);
             Ok(())
@@ -8050,10 +8071,7 @@ impl G17ResourceOwner {
         )?;
         let primary_region_views = g17_initdata::PrimaryRegionViews {
             sentinel_high: primary_b2_sentinel.iova(),
-            alias_high: [
-                pb_descriptor_table.iova(),
-                uma_page_pool_descriptor_table.iova(),
-            ],
+            alias_high: [partial_scheduler.iova(), primary_b2_alias_1.iova()],
         };
 
         let shared = SharedAddresses {
@@ -8206,13 +8224,12 @@ impl G17ResourceOwner {
                 return Err(EIO);
             }
         }
-        if pb_descriptor_table_low.iova() != g17_initdata::REGION_VIEW_LOW_ADDRS[0]
-            || uma_page_pool_descriptor_table_low.iova()
-                != g17_initdata::REGION_VIEW_LOW_ADDRS[1]
+        if primary_b2_alias_0_low.iova() != g17_initdata::REGION_VIEW_LOW_ADDRS[0]
+            || primary_b2_alias_1_low.iova() != g17_initdata::REGION_VIEW_LOW_ADDRS[1]
         {
             dev_err!(
                 dev.as_ref(),
-                "G17P resources: descriptor-table low aliases do not match initdata\n"
+                "G17P resources: compute B2 low aliases do not match initdata\n"
             );
             return Err(EIO);
         }
@@ -8350,6 +8367,8 @@ impl G17ResourceOwner {
                 secondary_status_a,
                 primary_b2_sentinel,
                 primary_b2_alias_1,
+                primary_b2_alias_0_low,
+                primary_b2_alias_1_low,
                 completion_ordinal_0,
                 completion_ordinal_0_low,
                 completion_ordinal_2,
@@ -8407,6 +8426,81 @@ impl G17ResourceOwner {
 
     pub(crate) fn mark_firmware_cache_flush_ready(&self) {
         self.address_space.uat.mark_firmware_cache_flush_ready();
+    }
+
+    /// Select the two global low/high region-view pairs used by the next
+    /// serialized workload. Compute and render need different same-backing
+    /// objects at these four main-config fields; the queue submission mutex
+    /// keeps the selected mode resident until that workload has retired.
+    fn stage_primary_region_views(
+        &mut self,
+        label: &str,
+        low: [u64; 2],
+        high: [u64; 2],
+    ) -> Result {
+        let shared_base = self.resources.shared_cluster.iova();
+        let main_offset: usize = self
+            .handoff
+            .primary
+            .instance
+            .main_config
+            .checked_sub(shared_base)
+            .ok_or(ERANGE)?
+            .try_into()
+            .map_err(|_| ERANGE)?;
+        let values = [low[0], high[0], low[1], high[1]];
+        let mut changed = false;
+        self.resources.shared_cluster.with_bytes_mut(|bytes| {
+            for (index, value) in values.into_iter().enumerate() {
+                let offset = main_offset
+                    .checked_add(0x2d8 + index * 8)
+                    .ok_or(EOVERFLOW)?;
+                let slot = bytes.get_mut(offset..offset + 8).ok_or(ERANGE)?;
+                let previous = u64::from_le_bytes(slot.try_into().map_err(|_| ERANGE)?);
+                if previous != value {
+                    slot.copy_from_slice(&value.to_le_bytes());
+                    changed = true;
+                }
+            }
+            Ok(())
+        })?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        if changed {
+            dev_info!(
+                self.dev().as_ref(),
+                "G17P resources: primary region views switched to {} [{:#x},{:#x}] [{:#x},{:#x}]\n",
+                label,
+                low[0],
+                high[0],
+                low[1],
+                high[1],
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn stage_compute_region_views(&mut self) -> Result {
+        let low = [
+            self.resources.primary_b2_alias_0_low.iova(),
+            self.resources.primary_b2_alias_1_low.iova(),
+        ];
+        let high = [
+            self.resources.partial_scheduler.iova(),
+            self.resources.primary_b2_alias_1.iova(),
+        ];
+        self.stage_primary_region_views("compute B2", low, high)
+    }
+
+    pub(crate) fn stage_render_region_views(&mut self) -> Result {
+        let low = [
+            self.resources.pb_descriptor_table_low.iova(),
+            self.resources.uma_page_pool_descriptor_table_low.iova(),
+        ];
+        let high = [
+            self.resources.pb_descriptor_table.iova(),
+            self.resources.uma_page_pool_descriptor_table.iova(),
+        ];
+        self.stage_primary_region_views("render PB/UMA", low, high)
     }
 
     /// Read one AGXQOSManager firmware-visible 8-byte queue record. Native
@@ -10845,8 +10939,8 @@ impl G17ResourceOwner {
         let primary_views = g17_initdata::PrimaryRegionViews {
             sentinel_high: self.resources.primary_b2_sentinel.iova(),
             alias_high: [
-                self.resources.pb_descriptor_table.iova(),
-                self.resources.uma_page_pool_descriptor_table.iova(),
+                self.resources.partial_scheduler.iova(),
+                self.resources.primary_b2_alias_1.iova(),
             ],
         };
         self.resources.shared_cluster.write_main_configs(
