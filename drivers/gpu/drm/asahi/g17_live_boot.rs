@@ -3487,18 +3487,27 @@ impl G17PLiveRuntime {
         // is constructed and made wholly visible for the second kick.
         // Mode 1 preserves the earlier diagnostic (both groups visible, then
         // both native doorbells), and mode 0 is byte-for-byte legacy behavior.
+        //
+        // MEASURED ON macOS 2026-09-02, and it settles the doorbell question.
+        // A dtrace probe over every function of the RTBuddy kext plus every
+        // IOMappedWrite64 for one Metal render pass shows the COMPLETE host to
+        // GPU surface:
+        //
+        //   ensurePoweredHardware(0)
+        //   sendAsyncNoteToFirmware(0x84000000000011)   device-control announce
+        //   3D: writeChannelCommandPointer x3, willSubmit(qid 8, dm 1)
+        //   submit3DChannel -> ensurePoweredHardware(1) -> DM ring nextEntry
+        //   TA: writeChannelCommandPointer x3, willSubmit(qid 7, dm 0)
+        //   submitTAChannel -> ensurePoweredHardware(1) -> DM ring nextEntry
+        //   sendAsyncNoteToFirmware(0x83000000000008)   <- the ONLY doorbell
+        //
+        // Zero MMIO writes, and exactly one doorbell -- Vertex, priority 2 --
+        // rung once, after BOTH groups and BOTH data-master ring publishes.
+        // Native never sends the Fragment doorbell 0x83..09 at all, so the one
+        // this driver rang between the two groups has no counterpart in the
+        // oracle. Publish the tiling group first, then ring the single
+        // doorbell below.
         if native_doorbell_mode == 2 || native_doorbell_mode == 3 {
-            if let Err(error) = Pin::new(self.gfx_rtkit.as_mut().ok_or(ENODEV)?)
-                .send_message(
-                    g17_rtkit::ENDPOINT_GFX_INTERRUPTS,
-                    g17_submission::G17P_NATIVE_3D_DOORBELL,
-                )
-            {
-                return match g17_lifecycle::recover_persistent_runtime(self) {
-                    Ok(()) => Err(error),
-                    Err(recovery_error) => Err(recovery_error),
-                };
-            }
             if native_doorbell_mode == 3 {
                 if let Err(error) = self
                     .manager

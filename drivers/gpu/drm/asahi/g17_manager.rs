@@ -3161,6 +3161,11 @@ impl G17PManagerConstruction {
             ],
             None => [0usize, 0usize],
         };
+        let dev = self.resources.dev().clone();
+        if let Some(storage) = self.render_storage.as_mut() {
+            storage.log_render_queue_record(&dev, true, label);
+            storage.log_render_queue_record(&dev, false, label);
+        }
         self.resources.log_render_sksm_entry(true, label, 0);
         self.resources.log_render_sksm_entry(true, label, strides[0]);
         self.resources

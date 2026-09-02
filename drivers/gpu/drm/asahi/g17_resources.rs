@@ -4312,8 +4312,69 @@ fn render_build_fail(site: u32) -> kernel::error::Error {
 }
 
 impl G17PUserRenderStorage {
-    const TILING_QUEUE: usize = 0x0000;
-    const FRAGMENT_QUEUE: usize = 0x00c0;
+    /// Dump one render queue record, to diff against the native capture.
+    ///
+    /// macOS 2026-09-02 (`fullrecords-gfx.txt`) gives the same object for a
+    /// real Metal render pass, so a byte diff of this against native's is the
+    /// direct answer to "what is missing from the record the KSM reads".
+    pub(crate) fn log_render_queue_record(&mut self, dev: &AsahiDevice, tiling: bool, label: &str) {
+        let offset = if tiling {
+            Self::TILING_QUEUE
+        } else {
+            Self::FRAGMENT_QUEUE
+        };
+        let mut words = [0u32; G17P_RENDER_QUEUE_RECORD_SIZE / 4];
+        let mut ok = false;
+        if let Ok(vmap) = self.graph.object.vmap() {
+            let bytes = unsafe {
+                // SAFETY: the VMap covers the page-rounded graph object and
+                // every index below is bounds-checked against it.
+                core::slice::from_raw_parts(vmap.as_ptr(), self.graph.logical_size)
+            };
+            for (index, slot) in words.iter_mut().enumerate() {
+                let at = offset + index * 4;
+                if at + 4 <= bytes.len() {
+                    *slot =
+                        u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
+                    ok = true;
+                }
+            }
+        }
+        if !ok {
+            return;
+        }
+        for row in 0..(G17P_RENDER_QUEUE_RECORD_SIZE / 32) {
+            let base = row * 8;
+            dev_info!(
+                dev.as_ref(),
+                "G17P render queue-record[{}] {} +{:#05x}: {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x}\n",
+                label,
+                if tiling { "TA" } else { "3D" },
+                row * 32,
+                words[base],
+                words[base + 1],
+                words[base + 2],
+                words[base + 3],
+                words[base + 4],
+                words[base + 5],
+                words[base + 6],
+                words[base + 7],
+            );
+        }
+    }
+
+    // The per-queue record is addressed by QUEUE ID, not by stage index.
+    // MEASURED ON macOS 2026-09-02: a native render's data-master ring slots
+    // name records at 0xfffffc20c0000540 for its TA (queue 7) and
+    // 0xfffffc20c0000600 for its 3D (queue 8) -- exactly base + qid * 0xc0
+    // in both cases, and the same addresses appear again in each kick entry's
+    // payload[1].  This driver placed them at index 0 and 1 instead, so every
+    // pointer it handed the firmware named a record 5 and 5 slots short of
+    // where a queue-id lookup would find one.  Keep our own base, index it the
+    // way native does.
+    const TILING_QUEUE: usize = G17P_RENDER_TA_QUEUE_ID as usize * G17P_RENDER_QUEUE_RECORD_SIZE;
+    const FRAGMENT_QUEUE: usize =
+        G17P_RENDER_3D_QUEUE_ID as usize * G17P_RENDER_QUEUE_RECORD_SIZE;
     const TILING_POINTERS: usize = G17P_USER_TILING_POINTERS;
     const FRAGMENT_POINTERS: usize = 0x1080;
     const JOB_LIST: usize = 0x2000;
