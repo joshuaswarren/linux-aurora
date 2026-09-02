@@ -118,8 +118,8 @@ kernel::module_platform_driver! {
             description: "Firmware trace class mask written to status_a+0x00 on BOTH roles before the initdata doorbell. Bit N enables trace channel N; bit 0 carries the whole KSM submission path. Non-zero also enables the KTrace drain (arming without draining makes the firmware busy-wait ~3ms once and then drop records). Default 1 while G17P graphics bring-up needs the launch/callback trace; 0 disables it.",
         },
         g17p_fw_ktrace_verbose: u32 {
-            default: 0,
-            description: "Print every KTrace record instead of only the submission-path codes (0x41/0x46/0x4b/0x57/0x0a/0x0c/0x0e/0x20 and the 0x11c lost marker)",
+            default: 1,
+            description: "Print every KTrace record instead of only the submission-path codes (0x41/0x46/0x4b/0x57/0x0a/0x0c/0x0e/0x20 and the 0x11c lost marker). Default 1 while G17P graphics bring-up needs the otherwise-hidden 0x1c/0x1f/0x60 admission-path witnesses.",
         },
         g17p_fw_ktrace_budget: u32 {
             default: 32,
