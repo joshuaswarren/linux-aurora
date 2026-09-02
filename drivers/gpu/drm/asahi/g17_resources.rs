@@ -4861,6 +4861,22 @@ impl G17PUserRenderStorage {
                 .as_ref()
                 .map(MappedObject::iova)
                 .ok_or_else(|| render_build_fail(2))?;
+            // Building this graph is what faults on a COLD boot and not on a
+            // warm one (0aa3646, bisected with g17p_render_tvb=2/1/0). The
+            // graph's own bytes are byte-identical cold and warm, so the fault
+            // is in something it POINTS AT. Log every address it binds.
+            dev_info!(
+                dev.as_ref(),
+                "G17P parameter-management binds: tvb={:#x} scene_scratch={:#x} discard={:#x} pagelist=[{:#x},{:#x}] metrics=[{:#x},{:#x}] hwbuf={}\n",
+                tvb_va,
+                scene_scratch_va,
+                discard_va,
+                parameter_page_list_vas[0],
+                parameter_page_list_vas[1],
+                parameter_metrics_vas[0],
+                parameter_metrics_vas[1],
+                translated.parameters.ta_hardware_buffer_id,
+            );
             Some(bootstrap_stage!(
                 "parameter-management allocation",
                 G17PParameterManagement::new(
