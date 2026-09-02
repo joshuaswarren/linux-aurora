@@ -1368,10 +1368,22 @@ impl Resources {
         // Find the slot whose progress word names the fragment's qid. The qid
         // lives at bits 46:40 of the progress word, the same field the slot
         // dump decodes.
+        // Prefer the fragment's slot. Fall back to any slot that has a pipe
+        // assigned, so the COLD render is measurable too: with no compute in
+        // the boot the tiler is the queue that occupies a slot and sticks,
+        // and gating solely on the fragment's qid would skip the one case
+        // PRIORITY 1 is about.
         let fragment_slot_state = slot_progress
             .iter()
             .position(|progress| ((progress >> 40) & 0x7f) == u64::from(fragment_qid))
             .map(|slot| slot_state[slot])
+            .filter(|state| (state >> 24) & 0x3 != 0)
+            .or_else(|| {
+                slot_state
+                    .iter()
+                    .copied()
+                    .find(|state| state & 1 != 0 && (state >> 24) & 0x3 != 0)
+            })
             .unwrap_or(0);
         let usc = match ((fragment_slot_state >> 24) & 0x3).checked_sub(1) {
             Some(pipe) => {
