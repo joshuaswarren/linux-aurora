@@ -55,6 +55,11 @@ pub(crate) const G17P_SOURCE_EOT_PIPELINE: u64 = 0x0000_0100_0199_0640;
 /// Native `mcacheApertureBufferSetup` writes its packed write ranges here in
 /// the 3D firmware command record. The KSM entry points at this table.
 pub(crate) const G17P_FRAGMENT_MCACHE_OFFSET: usize = 0x6a0;
+/// The tiler's MCache aperture table. `mcacheApertureBufferSetup` is called for
+/// the TA with `ksmBufferInfo = recTA+0x60` and writes its entries at
+/// `ksmBufferInfo + 0x600 + i*0x10`, i.e. `recTA + 0x660` -- the exact analogue
+/// of the 3D's `rec3D + 0x6a0`.
+pub(crate) const G17P_TILING_MCACHE_OFFSET: usize = 0x660;
 pub(crate) const G17P_MCACHE_MAPPING_SIZE: usize = 0x10;
 /// Temporary diagnostic mirror of the four Register Command Encoder programs.
 /// Native keeps the complete programs in the 3D command itself: the first is
