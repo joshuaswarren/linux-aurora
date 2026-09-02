@@ -4,15 +4,14 @@ Keep this list short and evidence-only. A build is not a hardware checkpoint.
 
 ## Previously verified
 
-- Vulkan compute is stable on commit `fc23e7648845f`: the staged 1, 2, 100 and
-  1000 exact-output gates all pass with an empty module parameter set. The
-  single retained QID 4 graph recorded 1103 real hardware retires, one queue
-  install, zero firmware recoveries and zero zero-duration completions on boot
-  `502af135-5e33-4fd3-bccf-4822cff36a25`.
+- Vulkan compute is stable on commit `ef3cc0d683485`: the staged 1, 2, 100 and
+  1000 exact-output gates all pass with an empty module parameter set. That
+  same boot retained QID 4 through 1103 real hardware retires before the first
+  render submission.
 - Render TA: the 32x32 Vulkan path publishes and executes TA; both TA hardware
   timestamps become non-zero.
-- Fragment admission: firmware selects QID 1, assigns PDM pipe 0
-  (`state=0x0100000d`), and publishes the expected current command/context.
+- The older QID-1 fragment path reached firmware admission and assigned PDM
+  pipe 0 (`state=0x0100000d`), but did not enter 3D activation.
 - Fragment descriptor reachability: all four SKSM RCE bindings resolve through
   the submitting VM to the same physical descriptor bytes written by the CPU.
 
@@ -23,11 +22,16 @@ Keep this list short and evidence-only. A build is not a hardware checkpoint.
   render automatically publishes its PB/UMA pairs at its own submission
   boundary. The compute entry also restores Metal's `0x003fffffffffffff`
   auxiliary value and the first-work context-0 empty-high transition.
-- The fragment's tag-15/tag-14 records retire and hardware selects QID 1, but
-  B1 emits no KTrace code 2. Code 2 is in the bit-4 new-work path: the ISR
-  reads the QID bitmap at SGX `+0x10a60`, acknowledges it at `+0x10a68`, and
-  only then does `0x23004` allocate the firmware job. Other records guarded by
-  the same trace-class bit are present, so this is the earliest proven gap.
+- Queue identity is now one kernel-owned protocol, not a parameter. QIDs 0..3
+  stay reserved, compute starts at 4, TA/3D use 5/6 with their matching
+  `base + qid * 0x28000` low/high aliases, and rebuilt compute graphs consume
+  7..127 without wrapping. Tag-15, tag-14, outer slots, QoS, SKSM entries,
+  barriers, TA's 3D link, descriptor metadata and compute recovery all use the
+  queue object's ID.
+- Hardware accepted the coherent QID-5/6 graph: the QoS bitmap became `0x60`,
+  the outer slots carried 5/6, TA executed with real timestamps, and both
+  queues retired their three item records. Fragment activation still did not
+  run: descriptor `+0x20f0` and both 3D timestamps remained zero.
 - SGX `+0x10408` remains at its `0x100` idle/reset value, no bit-3 completion
   interrupt appears, and the resource callback stays idle because all three
   are downstream of the missing new-work interrupt/job allocation.
@@ -37,6 +41,11 @@ Keep this list short and evidence-only. A build is not a hardware checkpoint.
 - B1's later 3D activation routine at `0x162f8` writes `1` to fragment
   descriptor `+0x20f0`. On hardware `+0x20f0` and both 3D timestamps remain
   zero, consistent with the earlier state-1 callback stall.
+- Metal keeps the type-1 fragment descriptor's `+0x79c=0` and packed
+  `+0x7a8=0x042c0059` even while its actual 3D queue is QID 6 or 15. Its TA
+  descriptor instead links dynamically to that actual 3D QID/stamp. Linux now
+  matches the dynamic TA link and preserves the distinct QID-0 RCE coordinate;
+  constructing the native QID-0 owner is the active RE boundary.
 
 ## Corrected claims
 
@@ -69,7 +78,7 @@ Keep this list short and evidence-only. A build is not a hardware checkpoint.
 
 ## Next experiment
 
-- On the same loaded parameter-free driver, run the Vulkan triangle and return
-  to the native-trace-guided QID 1 boundary with the new-work, launch,
-  descriptor, SKSM, QoS, completion-ring, recovery, and broad dockchannel
-  dumps enabled.
+- Reconstruct Metal's distinct QID-0 RCE/PDM owner from the kext and B1
+  firmware. Determine how slot 89 is populated and what descriptor pointer
+  `FUN_162f8` expects there, then implement that owner in the kernel without
+  changing the native type-1 descriptor bytes.
