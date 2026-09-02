@@ -441,6 +441,23 @@ const G17P_GFX_PHYSICAL_DATA_BASE: u64 = 0x0000_0100_01d7_c000;
 /// Firmware per-QID dependency records: `0x1261f0 + qid*0x18`, valid byte at
 /// `+0`, completed stamp at `+8`. Firmware DATA segment, so host-readable.
 const G17P_DEPENDENCY_RECORD_LINK_BASE: u64 = 0xffff_fc00_0012_61f0;
+/// GDirector per-HardwareBufferID shadow, `{u8 priority, u8 share}` per entry.
+/// `FUN_1451c` writes `sgx+0xd058 = prio | (share << 8)` and mirrors it here,
+/// where `share = ((weight << 5) / sum_weights) - 1` clamped at 0 and `0xff`
+/// means never programmed. A share of 0 gives the queue no scheduling weight.
+const G17P_GDIRECTOR_SHADOW_LINK_BASE: u64 = 0xffff_fc00_0012_f560;
+/// Submit-time firmware DRAM the tag-15 handler maintains. These are the only
+/// structures the KSM front-end plausibly scans that have never been diffed
+/// between a queue that launches and one that does not.
+/// Per-DM active-queue bitmap, `0x128a30 + dm*0x10` (+`0x08` is its sibling).
+/// The scheduler pass ANDs against exactly these before launching.
+const G17P_DM_ACTIVE_BITMAP_LINK_BASE: u64 = 0xffff_fc00_0012_8a30;
+/// Per-queue state, `0x127628 + qid*0x28` (written at fw `0x119b4`).
+const G17P_QUEUE_STATE_LINK_BASE: u64 = 0xffff_fc00_0012_7628;
+/// Ready mask (fw `0x11b5c`).
+const G17P_READY_MASK_LINK_BASE: u64 = 0xffff_fc00_0017_6ec0;
+/// `0x175aa0 + qid*0x28 + 0x40` (fw `0x11b3c`).
+const G17P_QUEUE_FLAG_LINK_BASE: u64 = 0xffff_fc00_0017_5aa0;
 const G17P_DEPENDENCY_RECORD_STRIDE: u64 = 0x18;
 const G17P_GFX1_LINK_DATA_BASE: u64 = 0xffff_fc00_0004_c000;
 const G17P_GFX1_LINK_DATA_END: u64 = 0xffff_fc00_0017_8000;
@@ -3235,6 +3252,74 @@ impl G17PManagerConstruction {
     pub(crate) fn log_render_status_pages(&mut self, label: &str) {
         if *crate::module_parameters::g17p_dep_records.value() != 0 {
             let dev = self.resources.dev().clone();
+            {
+                let phys = G17P_GFX_PHYSICAL_DATA_BASE
+                    + (G17P_GDIRECTOR_SHADOW_LINK_BASE - G17P_GFX_LINK_DATA_BASE);
+                match pgtable::LiveFirmwareU64Probe::new(phys)
+                    .and_then(|p| p.observe_mask(u64::MAX, 1))
+                    .map(|o| o.first)
+                {
+                    Ok(v) => dev_info!(
+                        dev.as_ref(),
+                        "G17P gdirector-shadow[{}] link={:#x} raw={:#018x} hwbuf0={{prio {:#04x},share {:#04x}}} hwbuf1={{{:#04x},{:#04x}}} hwbuf2={{{:#04x},{:#04x}}} hwbuf3={{{:#04x},{:#04x}}}\n",
+                        label,
+                        G17P_GDIRECTOR_SHADOW_LINK_BASE,
+                        v,
+                        v & 0xff, (v >> 8) & 0xff,
+                        (v >> 16) & 0xff, (v >> 24) & 0xff,
+                        (v >> 32) & 0xff, (v >> 40) & 0xff,
+                        (v >> 48) & 0xff, (v >> 56) & 0xff,
+                    ),
+                    Err(e) => dev_warn!(
+                        dev.as_ref(),
+                        "G17P gdirector-shadow[{}] unreadable ({:?})\n",
+                        label,
+                        e
+                    ),
+                }
+            }
+            {
+                let rd = |link: u64| -> Option<u64> {
+                    let phys = G17P_GFX_PHYSICAL_DATA_BASE
+                        + (link - G17P_GFX_LINK_DATA_BASE);
+                    pgtable::LiveFirmwareU64Probe::new(phys)
+                        .and_then(|p| p.observe_mask(u64::MAX, 1))
+                        .map(|o| o.first)
+                        .ok()
+                };
+                for dm in 0u64..3 {
+                    let a = rd(G17P_DM_ACTIVE_BITMAP_LINK_BASE + dm * 0x10);
+                    let b = rd(G17P_DM_ACTIVE_BITMAP_LINK_BASE + dm * 0x10 + 8);
+                    dev_info!(
+                        dev.as_ref(),
+                        "G17P dm-active[{}] dm={} lo={:#018x} hi={:#018x}\n",
+                        label,
+                        dm,
+                        a.unwrap_or(u64::MAX),
+                        b.unwrap_or(u64::MAX),
+                    );
+                }
+                dev_info!(
+                    dev.as_ref(),
+                    "G17P ready-mask[{}] = {:#018x}\n",
+                    label,
+                    rd(G17P_READY_MASK_LINK_BASE).unwrap_or(u64::MAX),
+                );
+                for qid in [4u64, 5, 6] {
+                    let st = rd(G17P_QUEUE_STATE_LINK_BASE + qid * 0x28);
+                    let st2 = rd(G17P_QUEUE_STATE_LINK_BASE + qid * 0x28 + 8);
+                    let fl = rd(G17P_QUEUE_FLAG_LINK_BASE + qid * 0x28 + 0x40);
+                    dev_info!(
+                        dev.as_ref(),
+                        "G17P qstate[{}] qid={} +0={:#018x} +8={:#018x} flag+0x40={:#018x}\n",
+                        label,
+                        qid,
+                        st.unwrap_or(u64::MAX),
+                        st2.unwrap_or(u64::MAX),
+                        fl.unwrap_or(u64::MAX),
+                    );
+                }
+            }
             for qid in [4u8, 5, 6] {
                 let link = G17P_DEPENDENCY_RECORD_LINK_BASE
                     + u64::from(qid) * G17P_DEPENDENCY_RECORD_STRIDE;
