@@ -139,6 +139,14 @@
 		clock-output-names = "clkref";
 	};
 
+	/* /arm-io/clock-frequencies[0x18c - 0x100] on J700. */
+	clk_200m: clock-200m {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <200000000>;
+		clock-output-names = "clk_200m";
+	};
+
 	gpu_opp: opp-table-gpu {
 		compatible = "operating-points-v2";
 
@@ -303,6 +311,19 @@
 			#address-cells = <1>;
 			#size-cells = <0>;
 			power-domains = <&ps_i2c2>;
+			status = "disabled";
+		};
+
+		qspi: spi@385110000 {
+			compatible = "apple,t8140-qspi";
+			/* One aperture; the command block starts at offset 0x800. */
+			reg = <0x3 0x85110000 0x0 0x4800>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1106 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clk_200m>;
+			power-domains = <&ps_qspi>;
+			#address-cells = <1>;
+			#size-cells = <0>;
 			status = "disabled";
 		};
 
