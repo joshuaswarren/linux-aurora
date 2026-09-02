@@ -374,6 +374,18 @@ pub(crate) struct G17PRenderKsmAdmissionSnapshot {
     /// work is loaded and waiting.
     pub(crate) slot_state: [u64; 4],
     pub(crate) slot_progress: [u64; 4],
+    /// Per-data-master control (0xc140) and stopped (0xc148) words. DM0 owns
+    /// bits 1:0 of the first and bit 0 of the second; a DM left stopped loads
+    /// slots and never runs them, which is exactly the render symptom.
+    pub(crate) dm_control: u64,
+    pub(crate) dm_stopped: u64,
+    /// Pipe-0 TA registers read the way the firmware's own hang detector reads
+    /// them (tag = pipe << 43 | reg, no namespace bit): the VDM control-stream
+    /// pointer and the work stamp. Non-zero means the SKU stream was fetched
+    /// and the TA is waiting for a launch; zero means the slot was admitted
+    /// but nothing was ever read.
+    pub(crate) pipe_vdm_stream: u64,
+    pub(crate) pipe_work_stamp: u64,
     pub(crate) current_command: u64,
     pub(crate) current_context: u64,
     pub(crate) active_queue_mask: u64,
@@ -868,6 +880,10 @@ impl Resources {
             slot_progress[slot as usize] =
                 Self::g17p_sksm_port_read_locked(&sgx, 0xc078, slot, 0)?;
         }
+        let dm_control = registers.try_read64(0xc140)?;
+        let dm_stopped = registers.try_read64(0xc148)?;
+        let pipe_vdm_stream = Self::g17p_sksm_port_read_locked(&sgx, 0x1_c880, 0, 0)?;
+        let pipe_work_stamp = Self::g17p_sksm_port_read_locked(&sgx, 0x1_c9f0, 0, 0)?;
         let queue_descriptor = [
             Self::g17p_sksm_port_read_locked(&sgx, 0x21008, u64::from(ta_qid), 1u64 << 42)?,
             Self::g17p_sksm_port_read_locked(
@@ -1077,6 +1093,10 @@ impl Resources {
             queue_descriptor,
             slot_state,
             slot_progress,
+            dm_control,
+            dm_stopped,
+            pipe_vdm_stream,
+            pipe_work_stamp,
             current_command,
             current_context,
             active_queue_mask,

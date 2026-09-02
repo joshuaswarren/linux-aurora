@@ -5186,6 +5186,15 @@ impl G17PLiveRuntime {
                             snapshot.queue_descriptor[0],
                             snapshot.queue_descriptor[1],
                         );
+                        dev_info!(
+                            pdev.as_ref(),
+                            "G17P render KSM launch poll={} dm-control={:#018x} dm-stopped={:#018x} pipe0-vdm-stream={:#018x} pipe0-work-stamp={:#018x}\n",
+                            poll,
+                            snapshot.dm_control,
+                            snapshot.dm_stopped,
+                            snapshot.pipe_vdm_stream,
+                            snapshot.pipe_work_stamp,
+                        );
                         for slot in 0..4 {
                             let progress = snapshot.slot_progress[slot];
                             dev_info!(
