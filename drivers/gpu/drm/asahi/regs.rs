@@ -346,10 +346,14 @@ pub(crate) struct G17PFaultIrqSnapshot {
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct G17PRenderKsmAdmissionSnapshot {
     pub(crate) gpc_state: u32,
-    pub(crate) qid0_state: u64,
-    pub(crate) qid0_progress: u64,
-    pub(crate) qid1_state: u64,
-    pub(crate) qid1_progress: u64,
+    pub(crate) pdm_qid0_state: u64,
+    pub(crate) pdm_qid0_progress: u64,
+    pub(crate) ta_qid: u8,
+    pub(crate) ta_state: u64,
+    pub(crate) ta_progress: u64,
+    pub(crate) fragment_qid: u8,
+    pub(crate) fragment_state: u64,
+    pub(crate) fragment_progress: u64,
     /// Per-QID {outstanding/timestamp, submitted, completed} from the same
     /// KSMFE registers used by Apple's queue-state dumper.
     pub(crate) qid_counters: [[u64; 3]; 2],
@@ -730,9 +734,9 @@ impl Resources {
     }
 
     /// Take the hardware snapshot the G17P firmware uses when diagnosing a
-    /// selected command which has not reached its start timestamp.  Include
-    /// QID0 alongside the selected 3D QID so a TA dependency can be judged by
-    /// the KSM's own progress counter rather than descriptor timestamps alone.
+    /// selected command which has not reached its start timestamp. Include the
+    /// kernel-owned TA/3D pair and the fragment descriptor's distinct QID-0
+    /// RCE coordinate so neither namespace is inferred from stale fixed IDs.
     ///
     /// The low SGX register file is inaccessible while the GPU cores are off,
     /// so the GPC-state read is a hard precondition rather than another field
@@ -740,6 +744,8 @@ impl Resources {
     /// briefly while it is still in the immediate post-doorbell window.
     pub(crate) fn g17p_render_ksm_admission_snapshot(
         &self,
+        ta_qid: u8,
+        fragment_qid: u8,
     ) -> Result<Option<G17PRenderKsmAdmissionSnapshot>> {
         let sgx = self.sgx.try_access().ok_or(ENODEV)?;
         let registers = sgx.relaxed();
@@ -751,22 +757,65 @@ impl Resources {
         let _guard = self.sksm_fifo.lock();
         // These tags are copied from the firmware's own readers. State uses
         // the bit-42 KSM namespace; the hang-detector progress read does not.
-        let qid0_state =
+        let pdm_qid0_state =
             Self::g17p_sksm_port_read_locked(&sgx, 0xc020, 0, 1u64 << 42)?;
-        let qid0_progress = Self::g17p_sksm_port_read_locked(&sgx, 0xc078, 0, 0)?;
-        let qid1_state =
-            Self::g17p_sksm_port_read_locked(&sgx, 0xc020, 1, 1u64 << 42)?;
-        let qid1_progress = Self::g17p_sksm_port_read_locked(&sgx, 0xc078, 1, 0)?;
+        let pdm_qid0_progress = Self::g17p_sksm_port_read_locked(&sgx, 0xc078, 0, 0)?;
+        let ta_state = Self::g17p_sksm_port_read_locked(
+            &sgx,
+            0xc020,
+            u64::from(ta_qid),
+            1u64 << 42,
+        )?;
+        let ta_progress =
+            Self::g17p_sksm_port_read_locked(&sgx, 0xc078, u64::from(ta_qid), 0)?;
+        let fragment_state = Self::g17p_sksm_port_read_locked(
+            &sgx,
+            0xc020,
+            u64::from(fragment_qid),
+            1u64 << 42,
+        )?;
+        let fragment_progress =
+            Self::g17p_sksm_port_read_locked(&sgx, 0xc078, u64::from(fragment_qid), 0)?;
         let qid_counters = [
             [
-                Self::g17p_sksm_port_read_locked(&sgx, 0x21010, 0, 1u64 << 42)?,
-                Self::g17p_sksm_port_read_locked(&sgx, 0x21020, 0, 1u64 << 42)?,
-                Self::g17p_sksm_port_read_locked(&sgx, 0x21028, 0, 1u64 << 42)?,
+                Self::g17p_sksm_port_read_locked(
+                    &sgx,
+                    0x21010,
+                    u64::from(ta_qid),
+                    1u64 << 42,
+                )?,
+                Self::g17p_sksm_port_read_locked(
+                    &sgx,
+                    0x21020,
+                    u64::from(ta_qid),
+                    1u64 << 42,
+                )?,
+                Self::g17p_sksm_port_read_locked(
+                    &sgx,
+                    0x21028,
+                    u64::from(ta_qid),
+                    1u64 << 42,
+                )?,
             ],
             [
-                Self::g17p_sksm_port_read_locked(&sgx, 0x21010, 1, 1u64 << 42)?,
-                Self::g17p_sksm_port_read_locked(&sgx, 0x21020, 1, 1u64 << 42)?,
-                Self::g17p_sksm_port_read_locked(&sgx, 0x21028, 1, 1u64 << 42)?,
+                Self::g17p_sksm_port_read_locked(
+                    &sgx,
+                    0x21010,
+                    u64::from(fragment_qid),
+                    1u64 << 42,
+                )?,
+                Self::g17p_sksm_port_read_locked(
+                    &sgx,
+                    0x21020,
+                    u64::from(fragment_qid),
+                    1u64 << 42,
+                )?,
+                Self::g17p_sksm_port_read_locked(
+                    &sgx,
+                    0x21028,
+                    u64::from(fragment_qid),
+                    1u64 << 42,
+                )?,
             ],
         ];
         let queue_enabled = [
@@ -921,7 +970,7 @@ impl Resources {
         // Bits 25:24 of an admitted QID state encode pipe + 1. B1 uses this
         // exact conversion before its banked USC reads. A zero value means no
         // pipe has been assigned yet, so do not perturb either selector.
-        let usc = match ((qid1_state >> 24) & 0x3).checked_sub(1) {
+        let usc = match ((fragment_state >> 24) & 0x3).checked_sub(1) {
             Some(pipe) => {
                 let pipe = pipe as u32;
                 // B1's explicit USC dump writes these selectors but does not
@@ -960,10 +1009,14 @@ impl Resources {
 
         Ok(Some(G17PRenderKsmAdmissionSnapshot {
             gpc_state,
-            qid0_state,
-            qid0_progress,
-            qid1_state,
-            qid1_progress,
+            pdm_qid0_state,
+            pdm_qid0_progress,
+            ta_qid,
+            ta_state,
+            ta_progress,
+            fragment_qid,
+            fragment_state,
+            fragment_progress,
             qid_counters,
             queue_enabled,
             current_command,
@@ -1051,7 +1104,7 @@ impl Resources {
         for reg in [0x211d0u64, 0x103a8, 0x21018, 0x21008] {
             let mut values = [0u64; 3];
             let mut ok = true;
-            for (slot, probe_qid) in [0u64, 1, 4].iter().enumerate() {
+            for (slot, probe_qid) in [0u64, 1, qid].iter().enumerate() {
                 match self.g17p_sksm_port_read(reg, *probe_qid) {
                     Ok(value) => values[slot] = value,
                     Err(_) => ok = false,
@@ -1060,8 +1113,8 @@ impl Resources {
             if ok {
                 dev_info!(
                     self.dev.as_ref(),
-                    "G17P port[{:#07x}] qid0={:#x} qid1={:#x} qid4={:#x}\n",
-                    reg, values[0], values[1], values[2]
+                    "G17P port[{:#07x}] qid0={:#x} qid1={:#x} qid{}={:#x}\n",
+                    reg, values[0], values[1], qid, values[2]
                 );
             }
         }

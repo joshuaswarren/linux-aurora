@@ -1272,6 +1272,7 @@ pub(crate) fn apply_g17p_retained_descriptor_fields(
     kind: RenderDescriptorKind,
     descriptor_gpu_va: u64,
     runtime_control: u64,
+    fragment_queue_id: u8,
     submission_ordinal: u32,
     cold_opening: bool,
     native_pm_bytes: bool,
@@ -1295,7 +1296,10 @@ pub(crate) fn apply_g17p_retained_descriptor_fields(
                     .checked_add(0x60)
                     .ok_or(RenderBuildError::ArithmeticOverflow)?,
             );
-            put_u32(raw, 0x079c, 1);
+            // Native TA links directly to the physical 3D kick queue which
+            // will consume this submission. This is queue allocator state,
+            // not the type-1 fragment descriptor's distinct QID-0 RCE field.
+            put_u32(raw, 0x079c, u32::from(fragment_queue_id));
             put_u32(raw, 0x07a0, item_number << 8);
             put_u32(raw, 0x07a8, item_number);
             put_u32(raw, 0x07b0, item_number | (item_number << 8));
@@ -2102,6 +2106,7 @@ mod tests {
             RenderDescriptorKind::Tiling,
             tiling_va,
             0xffff_fc20_c082_8000,
+            6,
             1,
             false,
             false,
@@ -2112,6 +2117,7 @@ mod tests {
             RenderDescriptorKind::Fragment,
             fragment_va,
             0xffff_fc20_c082_8000,
+            6,
             1,
             false,
             false,
@@ -2123,6 +2129,7 @@ mod tests {
         stage_g17p_fragment_rce_programs(&mut fragment, rce_va, &mut rce).unwrap();
 
         assert_eq!(get_u64(&tiling, 0x760), tiling_va + 0x60);
+        assert_eq!(get_u32(&tiling, 0x79c), 6);
         assert_eq!(get_u32(&tiling, 0x7a0), 0x200);
         assert_eq!(get_u32(&tiling, 0x7a8), 2);
         assert_eq!(get_u32(&tiling, 0x8d4), 0x1_0000);
