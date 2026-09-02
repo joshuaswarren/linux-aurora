@@ -379,6 +379,10 @@ pub(crate) struct G17PRenderKsmAdmissionSnapshot {
     /// slots and never runs them, which is exactly the render symptom.
     pub(crate) dm_control: u64,
     pub(crate) dm_stopped: u64,
+    /// The per-queue masks tag-15 consults before it issues the resume
+    /// strobes at 0x21098/0x210a0. If a render queue's bit is set here the
+    /// resume never happens, which would leave the slot loaded and unstarted.
+    pub(crate) queue_resume_mask: [u64; 2],
     /// Pipe-0 TA registers read the way the firmware's own hang detector reads
     /// them (tag = pipe << 43 | reg, no namespace bit): the VDM control-stream
     /// pointer and the work stamp. Non-zero means the SKU stream was fetched
@@ -880,6 +884,10 @@ impl Resources {
             slot_progress[slot as usize] =
                 Self::g17p_sksm_port_read_locked(&sgx, 0xc078, slot, 0)?;
         }
+        let queue_resume_mask = [
+            Self::g17p_sksm_port_read_locked(&sgx, 0x21048, 0, 1u64 << 42)?,
+            Self::g17p_sksm_port_read_locked(&sgx, 0x21050, 0, 1u64 << 42)?,
+        ];
         let dm_control = registers.try_read64(0xc140)?;
         let dm_stopped = registers.try_read64(0xc148)?;
         let pipe_vdm_stream = Self::g17p_sksm_port_read_locked(&sgx, 0x1_c880, 0, 0)?;
@@ -1095,6 +1103,7 @@ impl Resources {
             slot_progress,
             dm_control,
             dm_stopped,
+            queue_resume_mask,
             pipe_vdm_stream,
             pipe_work_stamp,
             current_command,
