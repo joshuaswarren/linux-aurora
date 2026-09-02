@@ -736,13 +736,13 @@ void mt7921_queue_rx_skb(struct mt76_dev *mdev, enum mt76_rxq_id q,
 	flag = le32_get_bits(rxd[0], MT_RXD0_PKT_FLAG);
 	if (is_mt7932(mdev) &&
 	    test_bit(MT76_STATE_MCU_RUNNING, &dev->mphy.state))
-		dev_info_ratelimited(mdev->dev,
+		dev_dbg_ratelimited(mdev->dev,
 				 "J700_MT7932_RUNTIME_RX_INGRESS: q=%u type=%u flag=0x%x len=%u dw0=0x%08x dw1=0x%08x\n",
 				 q, type, flag, skb->len, le32_to_cpu(rxd[0]),
 				 skb->len >= 8 ? le32_to_cpu(rxd[1]) : 0);
 	if (is_mt7932(mdev) &&
 	    (q == MT_RXQ_BAND1 || q == MT_RXQ_BAND1_WA))
-		dev_info_ratelimited(mdev->dev,
+		dev_dbg_ratelimited(mdev->dev,
 				 "J700_MT7932_AUX_RX_INGRESS: q=%u type=%u flag=0x%x len=%u\n",
 				 q, type, flag, skb->len);
 	if (is_mt7932(mdev) && mt7932_native_rx_trace &&

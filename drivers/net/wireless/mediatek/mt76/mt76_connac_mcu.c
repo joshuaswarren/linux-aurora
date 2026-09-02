@@ -2897,7 +2897,12 @@ generic_scan:
 	if (is_connac2(phy->dev) && !mt7932)
 		req->scan_func |= SCAN_FUNC_SPLIT_SCAN;
 	else if (mt7932)
-		req->scan_func = 0x13;
+		/* Apple sets bit zero together with a populated private scan
+		 * address.  Honor cfg80211's privacy choice: without the random
+		 * flag firmware must use the vif address, never an all-zero random
+		 * address advertised as valid.
+		 */
+		req->scan_func = 0x12;
 
 	if (mt7932)
 		memcpy(req7932->bssid, sreq->bssid, ETH_ALEN);
