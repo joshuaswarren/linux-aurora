@@ -169,7 +169,7 @@ int mt7932_mcu_fullmac_connect(
 int mt7932_mcu_fullmac_queue_bind(struct mt792x_dev *dev, u8 bss_idx,
 				  u8 sta_idx, u32 *command_out);
 int mt7932_mcu_fullmac_disconnect(struct mt792x_dev *dev, const u8 *bssid,
-				   u32 *command_out);
+				   u16 reason, u32 *command_out);
 int mt7932_mcu_fullmac_queue_unbind(struct mt792x_dev *dev, u8 bss_idx,
 				    u8 sta_idx, u32 *command_out);
 int mt7932_mcu_load_assoc_power(struct mt792x_dev *dev, u32 *command_out);

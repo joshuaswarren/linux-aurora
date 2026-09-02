@@ -4006,13 +4006,13 @@ struct mt7932_cmd_fullmac_disconnect {
 } __packed;
 
 int mt7932_mcu_fullmac_disconnect(struct mt792x_dev *dev, const u8 *bssid,
-				   u32 *command_out)
+				   u16 reason, u32 *command_out)
 {
 	struct mt7932_cmd_fullmac_disconnect req = {
 		.version = cpu_to_le64(8),
 		.enabled = cpu_to_le16(1),
 		.auth_mode = 8,
-		.reason = cpu_to_le16(30),
+		.reason = cpu_to_le16(reason),
 	};
 	u32 command = FIELD_PREP(__MCU_CMD_FIELD_ID, 0xea) |
 		      FIELD_PREP(__MCU_CMD_FIELD_EXT_ID, 0x42);
@@ -4021,7 +4021,8 @@ int mt7932_mcu_fullmac_disconnect(struct mt792x_dev *dev, const u8 *bssid,
 	BUILD_BUG_ON(sizeof(req) != 24);
 	BUILD_BUG_ON(offsetof(struct mt7932_cmd_fullmac_disconnect, bssid) != 13);
 	BUILD_BUG_ON(offsetof(struct mt7932_cmd_fullmac_disconnect, reason) != 20);
-	if (!bssid || is_zero_ether_addr(bssid))
+	if (!bssid || is_zero_ether_addr(bssid) ||
+	    (reason != 10 && reason != 30))
 		return -EINVAL;
 
 	memcpy(req.bssid, bssid, ETH_ALEN);
@@ -4031,7 +4032,8 @@ int mt7932_mcu_fullmac_disconnect(struct mt792x_dev *dev, const u8 *bssid,
 	memzero_explicit(&req, sizeof(req));
 	if (!ret)
 		dev_info(dev->mt76.dev,
-			 "J700_MT7932_FULLMAC_DISCONNECT_SUBMIT: cid=0xea ext=0x42 bytes=24 source=live-previous-bssid identity=redacted\n");
+			 "J700_MT7932_FULLMAC_DISCONNECT_SUBMIT: cid=0xea ext=0x42 bytes=24 reason=%u source=live-previous-bssid identity=redacted\n",
+			 reason);
 
 	return ret;
 }
