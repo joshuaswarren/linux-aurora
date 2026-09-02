@@ -3166,6 +3166,23 @@ impl G17PManagerConstruction {
             ),
         }
         if let Some(storage) = self.render_storage.as_mut() {
+            match storage.fragment_pdm_coordinate() {
+                Ok((qid, rce_pointer, packed)) => dev_info!(
+                    dev.as_ref(),
+                    "G17P render PDM[{}]: qid={} rce-pointer={:#x} packed={:#x} predecessor={:#x}\n",
+                    label,
+                    qid,
+                    rce_pointer,
+                    packed,
+                    packed.wrapping_sub(1) & ((1u64 << 40) - 1),
+                ),
+                Err(error) => dev_warn!(
+                    dev.as_ref(),
+                    "G17P render PDM[{}]: descriptor coordinate unreadable ({:?})\n",
+                    label,
+                    error,
+                ),
+            }
             storage.log_status_pages(&dev, label);
             storage.log_parameter_management(&dev, label);
         }
