@@ -11925,6 +11925,37 @@ impl G17ResourceOwner {
         }
     }
 
+    /// DIAGNOSTIC. Clear the firmware-owned parent link in the fragment's
+    /// kick entry, the way b1 `FUN_162f8` does from the tiling job's state 7.
+    ///
+    /// `FUN_162f8(sku+0x79c, sku+0x7a8)` indexes the entry as
+    /// `ring_base(qid) + (index & 0xff) * 0x200` and, among other things,
+    /// does `entry[0x20] &= ~1` -- clearing dependency slot 0, which is the
+    /// link the firmware itself owns and releases when tiling completes. Our
+    /// tiling SKU carries the right values there (+0x79c = 6, +0x7a8 = 1), but
+    /// the state machine that would call it never runs, so the entry stays
+    /// parented and no strobe can start it.
+    ///
+    /// Returns the dependency word before and after.
+    pub(crate) fn g17p_release_fragment_parent(&mut self, index: usize) -> Result<(u32, u32)> {
+        let object = &mut self.resources.bootstrap_3d_context_peer;
+        let at = index
+            .checked_mul(0x200)
+            .and_then(|base| base.checked_add(0x20))
+            .ok_or(EINVAL)?;
+        let mut before = 0u32;
+        let mut after = 0u32;
+        object.with_bytes_mut(|bytes| {
+            let word = bytes.get_mut(at..at + 4).ok_or(ERANGE)?;
+            before = u32::from_le_bytes([word[0], word[1], word[2], word[3]]);
+            after = before & !1;
+            word.copy_from_slice(&after.to_le_bytes());
+            Ok(())
+        })?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        Ok((before, after))
+    }
+
     pub(crate) fn log_render_sksm_entry(&mut self, tiling: bool, label: &str, offset: usize) {
         let object = if tiling {
             &mut self.resources.bootstrap_ta_context_peer

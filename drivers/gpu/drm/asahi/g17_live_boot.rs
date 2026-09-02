@@ -5201,6 +5201,45 @@ impl G17PLiveRuntime {
         let mut last_fault_irq = None;
         for poll in 0..POLLS {
             if poll == 2 && *module_parameters::g17p_render_3d_strobe.value() != 0 {
+                // b1's state 7 releases the fragment's entry and activates its
+                // descriptor BEFORE state 4 strobes; a still-parented entry
+                // cannot start, which is why a bare strobe did nothing.
+                let fragment_qid = g17_resources::g17p_render_queue_id(false) as u8;
+                if let (Some(manager), Some(pdev)) =
+                    (self.manager.as_mut(), self.pdev.as_ref())
+                {
+                    match manager.release_fragment_parent(1) {
+                        Ok((before, after)) => dev_info!(
+                            pdev.as_ref(),
+                            "G17P render: DIAGNOSTIC released fragment parent link {:#x} -> {:#x}\n",
+                            before,
+                            after,
+                        ),
+                        Err(error) => dev_warn!(
+                            pdev.as_ref(),
+                            "G17P render: DIAGNOSTIC parent release failed ({:?})\n",
+                            error,
+                        ),
+                    }
+                }
+                if let (Some(registers), Some(pdev)) =
+                    (self.registers.as_ref(), self.pdev.as_ref())
+                {
+                    match registers.g17p_activate_queue_descriptor(fragment_qid) {
+                        Ok((before, after)) => dev_info!(
+                            pdev.as_ref(),
+                            "G17P render: DIAGNOSTIC activated qid {} descriptor {:#018x} -> {:#018x}\n",
+                            fragment_qid,
+                            before,
+                            after,
+                        ),
+                        Err(error) => dev_warn!(
+                            pdev.as_ref(),
+                            "G17P render: DIAGNOSTIC descriptor activate failed ({:?})\n",
+                            error,
+                        ),
+                    }
+                }
                 if let (Some(registers), Some(pdev)) =
                     (self.registers.as_ref(), self.pdev.as_ref())
                 {

@@ -732,6 +732,27 @@ impl Resources {
         ))
     }
 
+    /// DIAGNOSTIC. Set descriptor bit 62 for one queue, as b1 `FUN_162f8`
+    /// does (`0x21008 |= 1 << 62`) after releasing the fragment's kick entry.
+    /// Measured: our descriptors read 0x11.. and 0x21.. with bit 62 clear on
+    /// both queues, and tag-16 -- which the firmware acknowledges with KTrace
+    /// 0x57 for both render queues -- does not set it either.
+    pub(crate) fn g17p_activate_queue_descriptor(&self, qid: u8) -> Result<(u64, u64)> {
+        if !self.g17p_sksm_port_powered() {
+            return Err(EAGAIN);
+        }
+        let _guard = self.sksm_fifo.lock();
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let before = Self::g17p_sksm_port_read_locked(&sgx, 0x21008, u64::from(qid), 1u64 << 42)?;
+        let registers = sgx.relaxed();
+        let tag = 0x21008u64 | (u64::from(qid) << 43) | (1u64 << 42);
+        registers.try_write64(tag, 0x4090)?;
+        registers.try_write64(before | (1u64 << 62), 0x4098)?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        let after = Self::g17p_sksm_port_read_locked(&sgx, 0x21008, u64::from(qid), 1u64 << 42)?;
+        Ok((before, after))
+    }
+
     /// Whether the SKSM tag/data port can be driven from the host right now.
     ///
     /// The asynchronous SErrors that made every host SKSM write suppressible
