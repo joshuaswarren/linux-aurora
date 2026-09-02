@@ -4,9 +4,11 @@ Keep this list short and evidence-only. A build is not a hardware checkpoint.
 
 ## Previously verified
 
-- Vulkan compute reached repeated exact-output dispatches on an earlier build.
-  The current build has regressed before hardware publication and is not a
-  valid compute baseline until the staged 1/2/100/1000 rerun passes.
+- Vulkan compute is stable on commit `fc23e7648845f`: the staged 1, 2, 100 and
+  1000 exact-output gates all pass with an empty module parameter set. The
+  single retained QID 4 graph recorded 1103 real hardware retires, one queue
+  install, zero firmware recoveries and zero zero-duration completions on boot
+  `502af135-5e33-4fd3-bccf-4822cff36a25`.
 - Render TA: the 32x32 Vulkan path publishes and executes TA; both TA hardware
   timestamps become non-zero.
 - Fragment admission: firmware selects QID 1, assigns PDM pipe 0
@@ -16,15 +18,11 @@ Keep this list short and evidence-only. A build is not a hardware checkpoint.
 
 ## Current boundary
 
-- The compute-root alias collision is fixed: normal roots stop after 21
-  one-MiB UMA operand blocks, leaving the completion aliases at
-  `0x7001848000/0x7001870000` free. Hardware now receives the first kick.
-- The narrow collision test then retired zero-duration because compute still
-  carried render's 0x40-stride FList run table and `0xb0` cursor. The last
-  output-positive compute shape is 21 consecutive qwords, a zero initial page
-  list and cursor `0x18`; that complete schema is now the next build.
-- Render work is paused. Restore one exact-output dispatch, then prove 2, 100,
-  and 1000 consecutive dispatches before resuming fragment experiments.
+- Compute and render no longer overwrite one global region-view topology.
+  Compute automatically publishes same-backing scheduler/B2 low/high pairs;
+  render automatically publishes its PB/UMA pairs at its own submission
+  boundary. The compute entry also restores Metal's `0x003fffffffffffff`
+  auxiliary value and the first-work context-0 empty-high transition.
 - The fragment's tag-15/tag-14 records retire and hardware selects QID 1, but
   B1 emits no KTrace code 2. Code 2 is in the bit-4 new-work path: the ISR
   reads the QID bitmap at SGX `+0x10a60`, acknowledges it at `+0x10a68`, and
@@ -71,9 +69,7 @@ Keep this list short and evidence-only. A build is not a hardware checkpoint.
 
 ## Next experiment
 
-- Test the restored 21-block compact compute schema while keeping render's
-  22+4 pool encoding separate. Validate exact output at 1, 2, 100, then 1000
-  consecutive Vulkan compute dispatches on hardware.
-- After compute is stable, return to the native-trace-guided QID 1 boundary
-  with the new-work, launch, descriptor, SKSM, QoS, completion-ring, recovery,
-  and broad dockchannel dumps enabled.
+- On the same loaded parameter-free driver, run the Vulkan triangle and return
+  to the native-trace-guided QID 1 boundary with the new-work, launch,
+  descriptor, SKSM, QoS, completion-ring, recovery, and broad dockchannel
+  dumps enabled.
