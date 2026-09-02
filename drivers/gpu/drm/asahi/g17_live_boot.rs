@@ -3524,11 +3524,14 @@ impl G17PLiveRuntime {
                     g17_resources::g17p_render_queue_id(true) as u8,
                     g17_resources::g17p_render_queue_id(false) as u8,
                 ] {
-                    match registers.g17p_seed_queue_completed_timestamp(qid) {
+                    let seed =
+                        u64::from(*module_parameters::g17p_render_seed_ts.value()) - 1;
+                    match registers.g17p_seed_queue_completed_timestamp(qid, seed) {
                         Ok(()) => dev_info!(
                             self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
-                            "G17P render: seeded qid {} completed-timestamp to 0\n",
+                            "G17P render: seeded qid {} completed-timestamp to {}\n",
                             qid,
+                            seed,
                         ),
                         Err(error) => dev_warn!(
                             self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
@@ -5245,12 +5248,20 @@ impl G17PLiveRuntime {
                         );
                         dev_info!(
                             pdev.as_ref(),
-                            "G17P render KSM launch poll={} dm-control={:#018x} dm-stopped={:#018x} pipe0-vdm-stream={:#018x} pipe0-work-stamp={:#018x}\n",
+                            "G17P render KSM launch poll={} dm-control={:#018x} dm-stopped={:#018x} pipe0-vdm-stream={:#018x} pipe0-work-stamp={:#018x} completed-by-qid=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]\n",
                             poll,
                             snapshot.dm_control,
                             snapshot.dm_stopped,
                             snapshot.pipe_vdm_stream,
                             snapshot.pipe_work_stamp,
+                            snapshot.completed_by_qid[0],
+                            snapshot.completed_by_qid[1],
+                            snapshot.completed_by_qid[2],
+                            snapshot.completed_by_qid[3],
+                            snapshot.completed_by_qid[4],
+                            snapshot.completed_by_qid[5],
+                            snapshot.completed_by_qid[6],
+                            snapshot.completed_by_qid[7],
                         );
                         for slot in 0..4 {
                             let progress = snapshot.slot_progress[slot];
