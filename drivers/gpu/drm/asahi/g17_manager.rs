@@ -2374,7 +2374,10 @@ impl G17PManagerConstruction {
             )?,
             fragment: build(
                 g17_resources::g17p_render_queue_id(false) as u8,
-                g17_submission::G17P_3D_DATA_MASTER,
+                match *crate::module_parameters::g17p_render_3d_dm.value() {
+                    0xff => g17_submission::G17P_3D_DATA_MASTER,
+                    other => other,
+                },
                 false,
             )?,
         })
