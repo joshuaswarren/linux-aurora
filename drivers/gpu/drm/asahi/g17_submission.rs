@@ -2135,12 +2135,19 @@ pub(crate) fn prepare_g17p_partial_opening_work_pair(
     fragment_queue_id: u8,
     tiling_queue_id: u8,
 ) -> Result<PreparedG17PPartialOpeningWorkPair, SubmissionError> {
+    // Ring slot +0x14 bit 24 is "first submission on this queue" (set when
+    // `channel_started` is false). Compute passes false and dispatches; render
+    // hardcoded true, declaring NOT-first on a cold boot when these queues have
+    // never been submitted to. `g17p_render_first_submit` restores the honest
+    // value for the first render of a boot.
+    let render_channel_started =
+        *crate::module_parameters::g17p_render_first_submit.value() == 0;
     let fragment = match prepare_g17p_partial_opening_outer_slot(
         fragment,
         G17P_PARTIAL_OPENING_FRAGMENT_CHANNEL_TABLE_INDEX,
         fragment_queue_id,
         1,
-        true,
+        render_channel_started,
     ) {
         Ok(value) => value,
         Err(error) => return Err(error),
@@ -2150,7 +2157,7 @@ pub(crate) fn prepare_g17p_partial_opening_work_pair(
         G17P_PARTIAL_OPENING_TILING_CHANNEL_TABLE_INDEX,
         tiling_queue_id,
         0,
-        true,
+        render_channel_started,
     ) {
         Ok(value) => value,
         Err(error) => return Err(error),
