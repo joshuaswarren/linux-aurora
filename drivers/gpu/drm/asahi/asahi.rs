@@ -264,6 +264,10 @@ kernel::module_platform_driver! {
             default: 0,
             description: "DIAGNOSTIC ONLY -- issue the 3D launch strobe from the host during the render poll: write (value-1) to sgx+0x10398 then 2 to sgx+0x1c9a0. 0: off. b1's 0x1c9a0 = 2 is the only 3D launch in the image and its single writer is the tiling job's state 4, which is unreachable here because the new-work interrupt is never raised and no firmware job is ever built. The hardware has latched the fragment at 0xc0f0/0xc0f8 with dm-masks[1] set, so the work is presented and only the strobe is missing. Native performs zero MMIO on the submit path, so this can never ship; it answers whether the strobe alone starts the fragment.",
         },
+        g17p_dump_hwdata: u32 {
+            default: 0,
+            description: "DIAGNOSTIC ONLY -- dump the whole 0x3db4 hardware-data block this driver builds, once, at the first render checkpoint. HW_DATA_OPAQUE_RUNS (the 269 hardcoded bytes) is already verified byte-exact against native; the rest of the block is computed and has never been compared. Native's block was captured whole from AGXArmFirmwareASC + 0x2b8, so this makes a full diff possible. Very noisy; off by default.",
+        },
         g17p_pipe_sweep: u32 {
             default: 0,
             description: "DIAGNOSTIC ONLY -- sweep the pipe register window 0x1c800..0x1cc00 for both pipes during the render poll and log every offset that differs or is non-zero. This is 256 SKSM tag/data port reads on the submit path and it destabilises the machine, so it is off by default and must never be enabled in a canonical run. It already produced its result: pipe 1's register file is present and configured (0x1c800, 0x1c820, 0x1c890, 0x1c8e0/e8, 0x1c990, 0x1c9f8/0x1ca00, 0x1cbe0 all read identically on both pipes), pipe 0 alone carries the render's buffers (0x1c9c8=0x02018000 tilemap, 0x1c9d8=0x02019000 heapmeta, 0x1c880 control stream, 0x1c9f0 work stamp), and the one flag-shaped asymmetry is 0x1cbd8, where pipe0=0xe0000007 and pipe1=0x60000007 -- identical but for bit 31.",

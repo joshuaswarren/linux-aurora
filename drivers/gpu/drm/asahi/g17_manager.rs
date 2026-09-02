@@ -52,6 +52,12 @@ mod identity;
 use g17_initdata::InstanceRole;
 use identity::{FirmwareRoleTopology, GpuGen, GpuHalGeneration, GpuVariant, SubmissionTransport};
 
+/// One-shot guard for the hardware-data dump: it must fire on the first
+/// render checkpoint whatever the label, since gating it on a specific label
+/// simply never matched.
+static G17P_HW_DATA_DUMPED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 // Kext RE: AsyncGrowEngine::updateSubmitInfo copies AGXUSCPrivMemFList +0xb0
 // into opcode-0x20 +0x0c, and the 3D submit path copies that same field into
 // tag-15 +0x3e. The first Linux render tag therefore owns generation 1 and its
@@ -3211,6 +3217,11 @@ impl G17PManagerConstruction {
 
     pub(crate) fn log_render_status_pages(&mut self, label: &str) {
         self.resources.dump_render_qos_regions(label);
+        if *crate::module_parameters::g17p_dump_hwdata.value() != 0
+            && !G17P_HW_DATA_DUMPED.swap(true, core::sync::atomic::Ordering::Relaxed)
+        {
+            self.resources.dump_hw_data(label);
+        }
         self.resources.log_render_parameter_buffer_descriptor(
             label,
             self.render_hardware_buffer_id.unwrap_or(0),

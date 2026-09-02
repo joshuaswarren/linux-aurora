@@ -8888,6 +8888,46 @@ impl G17ResourceOwner {
     /// the `qid*8` row, `+0x800` and `+0xc00`, so the per-data-master block
     /// has never been written by us at all -- and data master 1 is the one
     /// that never dispatches, while 0 and 2 both do.
+    /// DIAGNOSTIC. Dump the whole hardware-data block this driver builds.
+    ///
+    /// HW_DATA_OPAQUE_RUNS -- the 269 hardcoded bytes -- is verified byte-exact
+    /// against native. The REST of the 0x3db4 block is computed here (register
+    /// windows, completion aliases, QoS and SKSM resource pointers, geometry),
+    /// and has never been compared. Native's equivalent block was captured
+    /// whole from AGXArmFirmwareASC + 0x2b8, so a full diff is possible; only
+    /// the address-shaped fields are expected to differ.
+    pub(crate) fn dump_hw_data(&mut self, label: &str) {
+        let mut window = [0u8; 0x40];
+        let mut offset = 0usize;
+        while offset < g17_initdata::HW_DATA_SIZE {
+            let take = core::cmp::min(0x40, g17_initdata::HW_DATA_SIZE - offset);
+            let ok = self
+                .resources
+                .shared_cluster
+                .with_bytes_mut(|bytes| {
+                    window[..take].copy_from_slice(bytes.get(offset..offset + take).ok_or(ERANGE)?);
+                    Ok(())
+                })
+                .is_ok();
+            if ok {
+                let dev = self.dev().clone();
+                let mut row = 0usize;
+                while row < take {
+                    let end = core::cmp::min(row + 16, take);
+                    dev_info!(
+                        dev.as_ref(),
+                        "G17PHWDATA {} {:#07x} {:02x?}\n",
+                        label,
+                        offset + row,
+                        &window[row..end],
+                    );
+                    row += 16;
+                }
+            }
+            offset += take;
+        }
+    }
+
     pub(crate) fn dump_render_qos_regions(&mut self, label: &str) {
         const REGIONS: [(&str, usize, usize); 6] = [
             ("rows", 0x000, 0x40),
