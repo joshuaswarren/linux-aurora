@@ -377,6 +377,12 @@ pub(crate) struct G17PRenderKsmAdmissionSnapshot {
     /// Per-data-master control (0xc140) and stopped (0xc148) words. DM0 owns
     /// bits 1:0 of the first and bit 0 of the second; a DM left stopped loads
     /// slots and never runs them, which is exactly the render symptom.
+    /// The KSM's live per-queue ENABLED mask (0x21058/0x21060), the readback
+    /// side of the enable pair the QID install writes to 0x21068/0x21070.
+    /// b1 `FUN_12a84` walks the enabled queues by comparing its shadow
+    /// (DAT_583d8/583e0) against these two words, so a queue whose bit is
+    /// clear here is one the scheduler will never dispatch.
+    pub(crate) queue_enabled_mask: [u64; 2],
     pub(crate) dm_control: u64,
     pub(crate) dm_stopped: u64,
     /// The per-queue masks tag-15 consults before it issues the resume
@@ -972,6 +978,10 @@ impl Resources {
             Self::g17p_sksm_port_read_locked(&sgx, 0x21048, 0, 1u64 << 42)?,
             Self::g17p_sksm_port_read_locked(&sgx, 0x21050, 0, 1u64 << 42)?,
         ];
+        let queue_enabled_mask = [
+            Self::g17p_sksm_port_read_locked(&sgx, 0x21058, 0, 1u64 << 42)?,
+            Self::g17p_sksm_port_read_locked(&sgx, 0x21060, 0, 1u64 << 42)?,
+        ];
         let dm_control = registers.try_read64(0xc140)?;
         let dm_stopped = registers.try_read64(0xc148)?;
         let pipe_vdm_stream = [
@@ -1195,6 +1205,7 @@ impl Resources {
             queue_descriptor,
             slot_state,
             slot_progress,
+            queue_enabled_mask,
             dm_control,
             dm_stopped,
             queue_resume_mask,
