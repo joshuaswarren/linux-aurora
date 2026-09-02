@@ -119,6 +119,14 @@ const T8140_CONTEXT_OPENING_RENDER_SHARED: u8 = 3;
 /// m1n1 installs both halves of both contexts' roots before it kicks
 /// (`:1072-1073` and `:1087-1089`).
 const T8140_COMPUTE_CTXS: [usize; 2] = [2, 3];
+/// First context handed out by native's application-GART context manager on
+/// the captured G17P system. Contexts 0/1 are the opening pair, 2/3 are the
+/// fixed compute aliases and context 4 is accelerator-reserved. Native render
+/// command GARTs consequently appear at 5, 6, ... depending on live allocator
+/// state; those values are allocator results, not descriptor constants.
+const T8140_APP_CONTEXT_START: usize = 5;
+const T8140_APP_CONTEXT_RESERVED_MASK: u64 = (1u64 << T8140_APP_CONTEXT_START) - 1;
+const T8140_APP_CONTEXT_AVAILABLE_MASK: u64 = !T8140_APP_CONTEXT_RESERVED_MASK;
 pub(crate) const T8140_PARAMETER_METRICS_LOW_VA: u64 = 0x0000_0010_0008_0000;
 pub(crate) const T8140_PARAMETER_METRICS_SIZE: usize = 0x8000;
 
@@ -1108,6 +1116,82 @@ impl Clone for VmBind {
     }
 }
 
+/// One dynamically allocated T8140 application-GART context.
+///
+/// The lease retains the ordinary VM binding for at least as long as its
+/// TTBAT alias is live. Dropping it first retracts the exact root pair it
+/// installed, invalidates that ASID, and only then returns the ID to the
+/// allocator. This mirrors `AGXContextIDManager::alloc` plus
+/// `AGXSecureGart::registerContextID` without making an allocator ID a module
+/// parameter or letting a recycled page-table page confuse ownership.
+pub(crate) struct T8140AppContextLease {
+    inner: Arc<UatInner>,
+    _bind: VmBind,
+    context_id: u8,
+    low: u64,
+    high: u64,
+}
+no_debug!(T8140AppContextLease);
+
+impl T8140AppContextLease {
+    pub(crate) fn context_id(&self) -> u32 {
+        u32::from(self.context_id)
+    }
+
+    pub(crate) fn matches(&self, bind: &VmBind) -> bool {
+        self._bind.matches(&bind.0) && self._bind.root() == bind.root()
+    }
+}
+
+impl Drop for T8140AppContextLease {
+    fn drop(&mut self) {
+        let context_id = self.context_id as usize;
+        let mut release = false;
+        {
+            let inner = self.inner.lock();
+            inner.handoff().lock();
+            let ttbs = inner.ttbs();
+            let low = ttbs[context_id].ttb0.load(Ordering::Acquire);
+            let high = ttbs[context_id].ttb1.load(Ordering::Acquire);
+            if low == self.low && high == self.high {
+                if inner.handoff().current_slot() == Some(self.context_id as u32) {
+                    pr_err!(
+                        "Uat: dropping live T8140 app context {}; retracting its roots to prevent a stale VM reference\n",
+                        context_id,
+                    );
+                }
+                ttbs[context_id].ttb0.store(0, Ordering::Release);
+                ttbs[context_id].ttb1.store(0, Ordering::Release);
+                release = true;
+            } else if low == 0 && high == 0 {
+                // A stopped-session reset may have cleared the table first.
+                release = true;
+            } else {
+                // Never make a context reusable while a different root pair
+                // is resident. Leaking one ID is safer than aliasing two VMs.
+                pr_err!(
+                    "Uat: T8140 app context {} root ownership changed while leased: expected [{:#x},{:#x}], found [{:#x},{:#x}]; quarantining ID\n",
+                    context_id,
+                    self.low,
+                    self.high,
+                    low,
+                    high,
+                );
+            }
+            inner.handoff().unlock();
+        }
+
+        if release {
+            fence(Ordering::SeqCst);
+            mem::tlbi_asid(self.context_id);
+            mem::sync();
+            self.inner
+                .t8140_app_contexts
+                .fetch_and(!(1u64 << context_id), Ordering::AcqRel);
+        }
+    }
+}
+
 /// Inner data required for an object mapping into a [`Vm`].
 pub(crate) struct KernelMappingInner {
     // Drop order matters:
@@ -1447,6 +1531,11 @@ struct UatInner {
     /// aliases the new VM just published.  Keying on the VM id instead makes
     /// that impossible.
     t8140_alias_owner: AtomicU64,
+    /// Allocation bitmap for native-style application-GART context leases.
+    /// Reserved and fixed contexts are permanently marked; bits 5..63 are
+    /// claimed before their TTBAT roots become visible and released only
+    /// after lease teardown invalidates the corresponding ASID.
+    t8140_app_contexts: AtomicU64,
     #[pin]
     shared: Mutex<UatShared>,
     #[pin]
@@ -3378,7 +3467,10 @@ impl Uat {
     ) -> Result<(u64, u64)> {
         if self.cfg != UatConfig::T8140
             || bind.slot() != 1
-            || (context_id != 1 && !T8140_COMPUTE_CTXS.contains(&context_id))
+            || context_id >= UAT_NUM_CTX
+            || (context_id != 1
+                && !T8140_COMPUTE_CTXS.contains(&context_id)
+                && context_id < T8140_APP_CONTEXT_START)
         {
             return Err(EINVAL);
         }
@@ -3407,10 +3499,75 @@ impl Uat {
         fence(Ordering::SeqCst);
         mem::tlbi_asid(context_id as u8);
         mem::sync();
-        self.inner
-            .t8140_alias_owner
-            .store(bind.0.id, Ordering::Release);
+        if T8140_COMPUTE_CTXS.contains(&context_id) {
+            self.inner
+                .t8140_alias_owner
+                .store(bind.0.id, Ordering::Release);
+        }
         Ok((low, high))
+    }
+
+    /// Allocate and root one native-style application-GART hardware context.
+    ///
+    /// IDs 0..4 are never candidates: the opening pair and fixed compute
+    /// aliases already give those values architectural meaning on T8140.
+    /// Native's allocator therefore yielded 5/6 in one process and later
+    /// values when other GARTs were live. The ID returned here must be copied
+    /// from this lease into every firmware-visible descriptor field that names
+    /// this GART; callers must never independently reconstruct it.
+    pub(crate) fn allocate_t8140_app_context(
+        &self,
+        bind: &VmBind,
+    ) -> Result<T8140AppContextLease> {
+        if self.cfg != UatConfig::T8140 || bind.slot() != 1 {
+            return Err(EINVAL);
+        }
+
+        let context_id = loop {
+            let used = self
+                .inner
+                .t8140_app_contexts
+                .load(Ordering::Acquire);
+            let available = !used & T8140_APP_CONTEXT_AVAILABLE_MASK;
+            if available == 0 {
+                return Err(ENOSPC);
+            }
+            let context_id = available.trailing_zeros() as usize;
+            let claimed = used | (1u64 << context_id);
+            if self
+                .inner
+                .t8140_app_contexts
+                .compare_exchange_weak(used, claimed, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break context_id;
+            }
+        };
+
+        let (low, high) = match self.install_t8140_app_context_alias(bind, context_id) {
+            Ok(roots) => roots,
+            Err(error) => {
+                self.inner
+                    .t8140_app_contexts
+                    .fetch_and(!(1u64 << context_id), Ordering::AcqRel);
+                return Err(error);
+            }
+        };
+        dev_info!(
+            self.dev.as_ref(),
+            "MMU: allocated T8140 app-GART context {} roots low={:#x} high={:#x} (vm {})\n",
+            context_id,
+            low,
+            high,
+            bind.0.id,
+        );
+        Ok(T8140AppContextLease {
+            inner: self.inner.clone(),
+            _bind: bind.clone(),
+            context_id: context_id as u8,
+            low,
+            high,
+        })
     }
 
     /// Register the render app GART in the hardware context written to final
@@ -3713,6 +3870,7 @@ impl Uat {
                     handoff_mode == HandoffMode::FirmwareDekker
                 ),
                 t8140_alias_owner: AtomicU64::new(0),
+                t8140_app_contexts: AtomicU64::new(T8140_APP_CONTEXT_RESERVED_MASK),
                 handoff_flush <- pin_init::pin_init_array_from_fn(|i| {
                     new_mutex!(HandoffFlush(&handoff.flush[i], handoff_mode), "handoff_flush")
                 }),
