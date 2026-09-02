@@ -2768,6 +2768,7 @@ fn build_g17p_late_tiling_bytes(
         submission_ordinal,
         g17p_render_generation_bias_enabled(),
         g17p_render_queue_id(true),
+        g17p_render_queue_id(false),
         g17p_render_install(true),
         ta_tag15_context_id,
         &mut bytes.optional,
@@ -6656,6 +6657,7 @@ impl G17PUserRenderStorage {
                 submission_ordinal,
                 g17p_render_generation_bias_enabled(),
                 g17p_render_queue_id(false),
+                g17p_render_queue_id(true),
                 g17p_render_install(false),
                 self.command_context.context_id() as u16,
                 &mut raw[Self::FRAGMENT_OPTIONAL
@@ -6953,6 +6955,7 @@ impl G17PUserRenderStorage {
                 submission_ordinal,
                 g17p_render_generation_bias_enabled(),
                 g17p_render_queue_id(false),
+                g17p_render_queue_id(true),
                 g17p_render_install(false),
                 self.command_context.context_id() as u16,
                 &mut raw[Self::FRAGMENT_OPTIONAL

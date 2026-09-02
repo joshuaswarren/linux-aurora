@@ -1552,6 +1552,7 @@ pub(crate) fn apply_g17p_cold_opening_optional(
     stage: G17PColdOpeningStage,
     addresses: G17PColdOpeningOptionalAddresses,
     queue_id: u16,
+    partner_queue_id: u16,
     install: u16,
     context_id: u16,
     out: &mut [u8],
@@ -1597,7 +1598,15 @@ pub(crate) fn apply_g17p_cold_opening_optional(
             (0x5e, 2),
             (0x62, 1),
             (0x66, 1),
-            (0x82, 1),
+            // +0x82 is the TA's FORWARD REFERENCE TO ITS 3D PARTNER, not a
+            // flag. MEASURED ON macOS 2026-09-02 (recs2-run1.txt): across two
+            // processes and six passes, a native TA ConfigUpdate carries the
+            // partner FRAGMENT queue's id here -- 0x10 while its own +0x18 is
+            // 0x0f -- and the matching 3D record fills +0x76..+0x85 with 0xff,
+            // the "no forward reference" sentinel this encoder already writes
+            // for the Fragment stage. The constant 1 published here before
+            // named queue 1, which is neither stage.
+            (0x82, partner_queue_id),
         ],
         G17PColdOpeningStage::Fragment => &[
             (0x18, queue_id),
@@ -1683,6 +1692,7 @@ pub(crate) fn apply_g17p_retained_optional(
     submission_ordinal: u32,
     bias_generation: bool,
     queue_id: u16,
+    partner_queue_id: u16,
     install: u16,
     context_id: u16,
     out: &mut [u8],
@@ -1694,6 +1704,7 @@ pub(crate) fn apply_g17p_retained_optional(
         stage,
         addresses,
         queue_id,
+        partner_queue_id,
         install,
         context_id,
         out,
@@ -5281,7 +5292,7 @@ mod tests {
         let supplied = 0x70_0200_0000..0x70_0202_0000;
         for stage in [G17PColdOpeningStage::Tiling, G17PColdOpeningStage::Fragment] {
             let mut optional = [0u8; G17P_COLD_OPENING_OPTIONAL_SIZE];
-            apply_g17p_cold_opening_optional(stage, optional_addresses, 0, 1, 1, &mut optional)
+            apply_g17p_cold_opening_optional(stage, optional_addresses, 0, 0, 1, 1, &mut optional)
                 .unwrap();
             assert_eq!(get_u32_le(&optional, 0), 0x0f);
             for offset in [0x08, 0x10, 0x36, 0x4a] {
@@ -5942,7 +5953,7 @@ mod tests {
         };
         for stage in [G17PColdOpeningStage::Tiling, G17PColdOpeningStage::Fragment] {
             let mut optional = [0u8; G17P_COLD_OPENING_OPTIONAL_SIZE];
-            apply_g17p_retained_optional(stage, addresses, 1, false, 0, 1, 1, &mut optional)
+            apply_g17p_retained_optional(stage, addresses, 1, false, 0, 0, 1, 1, &mut optional)
                 .unwrap();
             assert_eq!(get_u16_le(&optional, 0x1a), 0);
             assert_eq!(get_u16_le(&optional, 0x2a), 1);
