@@ -383,6 +383,11 @@ pub(crate) struct G17PRenderKsmAdmissionSnapshot {
     /// strobes at 0x21098/0x210a0. If a render queue's bit is set here the
     /// resume never happens, which would leave the slot loaded and unstarted.
     pub(crate) queue_resume_mask: [u64; 2],
+    /// Completed-timestamp register 0x21028 for queues 0..7. The render's 3D
+    /// barrier waits on the TA queue's value, which never advances; sampling
+    /// every queue shows whether the COMPUTE queue's accounting works, i.e.
+    /// whether the mechanism exists at all and render simply misses it.
+    pub(crate) completed_by_qid: [u64; 8],
     /// Pipe-0 TA registers read the way the firmware's own hang detector reads
     /// them (tag = pipe << 43 | reg, no namespace bit): the VDM control-stream
     /// pointer and the work stamp. Non-zero means the SKU stream was fetched
@@ -559,7 +564,7 @@ impl Resources {
     /// slot loads, the pipe arms, and nothing ever starts. Native never does
     /// this (the firmware seeds the register when it creates the job), so this
     /// exists only to identify the gate.
-    pub(crate) fn g17p_seed_queue_completed_timestamp(&self, qid: u8) -> Result {
+    pub(crate) fn g17p_seed_queue_completed_timestamp(&self, qid: u8, value: u64) -> Result {
         if !self.g17p_sksm_port_powered() {
             return Err(EAGAIN);
         }
@@ -568,7 +573,7 @@ impl Resources {
         let registers = sgx.relaxed();
         let tag = 0x21028u64 | (u64::from(qid) << 43) | (1u64 << 42);
         registers.try_write64(tag, 0x4090)?;
-        registers.try_write64(0, 0x4098)?;
+        registers.try_write64(value, 0x4098)?;
         Ok(())
     }
 
@@ -907,6 +912,11 @@ impl Resources {
             slot_progress[slot as usize] =
                 Self::g17p_sksm_port_read_locked(&sgx, 0xc078, slot, 0)?;
         }
+        let mut completed_by_qid = [0u64; 8];
+        for qid in 0..8u64 {
+            completed_by_qid[qid as usize] =
+                Self::g17p_sksm_port_read_locked(&sgx, 0x21028, qid, 1u64 << 42)?;
+        }
         let queue_resume_mask = [
             Self::g17p_sksm_port_read_locked(&sgx, 0x21048, 0, 1u64 << 42)?,
             Self::g17p_sksm_port_read_locked(&sgx, 0x21050, 0, 1u64 << 42)?,
@@ -1127,6 +1137,7 @@ impl Resources {
             dm_control,
             dm_stopped,
             queue_resume_mask,
+            completed_by_qid,
             pipe_vdm_stream,
             pipe_work_stamp,
             current_command,
