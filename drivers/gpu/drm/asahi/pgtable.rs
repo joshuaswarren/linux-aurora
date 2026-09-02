@@ -1048,6 +1048,11 @@ impl LiveFirmwareU64Probe {
     }
 
     /// Observe one mask for at most `polls` cache-invalidated qword loads.
+    /// DIAGNOSTIC. Set bits in the probed qword; returns (before, after).
+    pub(crate) fn set_bits(&self, bits: u64) -> Result<(u64, u64)> {
+        self.page.set_bits_u64(self.offset, bits)
+    }
+
     pub(crate) fn observe_mask(
         &self,
         mask: u64,
@@ -1165,6 +1170,31 @@ impl PhysPageMapping {
             self.ptr.as_ptr().cast::<u8>().add(offset).cast::<AtomicU64>()
         };
         Ok(unsafe { &*pointer }.load(Ordering::Acquire))
+    }
+
+    /// DIAGNOSTIC. Set bits in one firmware-DRAM qword.
+    ///
+    /// The b1 image gates KTrace emission on class bytes at 0x17780c/0x17780d:
+    /// bit 0 is the only one this driver has ever had set, which is why the
+    /// halt-decision records (0x909 with the scan's own inputs, 0x113 at the
+    /// thread-4 wake, 0x105, 0x110) have never appeared in a capture. Arming
+    /// them is a read-modify-write of a debug-enable byte the firmware only
+    /// reads; it steers no scheduling decision.
+    fn set_bits_u64(&self, offset: usize, bits: u64) -> Result<(u64, u64)> {
+        let end = offset.checked_add(8).ok_or(EOVERFLOW)?;
+        if offset & 7 != 0 || end > UAT_PGSZ {
+            return Err(EINVAL);
+        }
+        let pointer = unsafe {
+            // SAFETY: offset is qword-aligned and bounded to the mapped page,
+            // exactly as read_u64 checks above.
+            self.ptr.as_ptr().cast::<u8>().add(offset).cast::<AtomicU64>()
+        };
+        let cell = unsafe { &*pointer };
+        let before = cell.load(Ordering::Acquire);
+        cell.store(before | bits, Ordering::Release);
+        let after = cell.load(Ordering::Acquire);
+        Ok((before, after))
     }
 
     fn copy_atomic(&self, offset: usize, out: &mut [u8]) -> Result {
