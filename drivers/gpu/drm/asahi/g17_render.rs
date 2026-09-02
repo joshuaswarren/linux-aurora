@@ -666,6 +666,32 @@ pub(crate) fn build_ta_registers(
     ])
 }
 
+/// DIAGNOSTIC. Write native's value into TA-descriptor fields where ours differs
+/// structurally at MATCHED 256x256 geometry (recs3.txt TA record, stride 0x9c0).
+/// The tiler bins ~60 bytes of a 1.28 MB TVB with every input verified correct,
+/// so these are what is left that we demonstrably send differently.
+fn apply_g17p_ta_oracle(raw: &mut [u8]) {
+    let mask = *crate::module_parameters::g17p_ta_oracle.value();
+    if mask == 0 {
+        return;
+    }
+    if mask & 0x01 != 0 {
+        put_u64(raw, 0x370, 0x500);
+        put_u64(raw, 0x388, 0x500);
+        put_u64(raw, 0x8d0, 0x500);
+    }
+    if mask & 0x02 != 0 {
+        put_u64(raw, 0x018, 3);
+    }
+    if mask & 0x04 != 0 {
+        put_u32(raw, 0x33c, 0xa9);
+    }
+    if mask & 0x08 != 0 {
+        put_u64(raw, 0x7d8, 0x6);
+        put_u32(raw, 0x798, 0xa);
+    }
+}
+
 pub(crate) fn build_fragment_registers(
     p: &G17pRenderParameters,
 ) -> Result<[RegisterWrite; FRAGMENT_REGISTER_COUNT], RenderBuildError> {
@@ -1097,6 +1123,7 @@ pub(crate) fn build_ta_descriptor(
     // are deliberately unaligned in the native 0x9c0-byte command layout.
     put_u32(raw, 0x086e, (parameters.lifecycle >> 32) as u32);
     put_u64(raw, 0x08ce, parameters.lifecycle as u32 as u64);
+    apply_g17p_ta_oracle(raw);
     Ok(())
 }
 
