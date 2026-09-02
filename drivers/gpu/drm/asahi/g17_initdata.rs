@@ -2335,24 +2335,30 @@ pub(crate) fn check_firmware_root_gates(root: &[u8]) -> Result<(), InitdataError
 /// not; generated from the hardware-validated `g17p_initdata.py`
 /// `HWDATA_CONSTANTS`). 29 sparse runs, 269 bytes total. `+0x2630` is
 /// deliberately absent: it is firmware state, not host configuration.
-/// COMPARED AGAINST NATIVE 2026-09-02. macOS's own hardware-data block was
-/// located at `AGXArmFirmwareASC + 0x2b8` (identified by the 0x1f this table
-/// puts at +0x0f04, which it carries) and dumped whole; the capture is
-/// `/tmp/g17p-re/work/hwdata-gfx.txt`. Result:
+/// VERIFIED AGAINST NATIVE 2026-09-02: all 29 runs match BYTE FOR BYTE.
 ///
-///   * 14 of these 19 runs match native BYTE FOR BYTE.
-///   * 5 differ -- 0x0014, 0x00f4, 0x05d8, 0x0fb8, 0x2544 -- and every one of
-///     the 61 differing bytes is the same shape: we write a value, native
-///     reads 0x00 there.
-///   * +0x0f08, the ISR mask selector, is ZERO in native too, which confirms
-///     leaving it unset here is correct and that this part is not the
-///     `DAT_1785f4 == 2` variant.
+/// macOS's own hardware-data block was located at `AGXArmFirmwareASC + 0x2b8`
+/// (identified by the 0x1f this table puts at +0x0f04, which it carries) and
+/// dumped whole; the capture is `/tmp/g17p-re/work/hwdata-gfx.txt`. Every one
+/// of these 29 runs, 269 bytes in total, is identical to what the kext hands
+/// its firmware. This table is not a source of divergence.
 ///
-/// Do NOT simply zero the five runs to "match the kext": tested, and the
-/// driver's own probe then fails with -22. Native reading zero at submit time
-/// does not mean those fields are never populated -- the block is live, and
-/// firmware or a later kext path may fill them. Any change here needs to
-/// establish WHEN native writes them, not just what it reads once.
+/// +0x0f08 is zero in native too. That field is the firmware's ISR mask
+/// selector -- FUN_1e858 copies it to DAT_1785f4, and FUN_215cc picks the
+/// interrupt-enable word from it as
+///     DAT_1785f4 == 2 ? 0x0e00620038 : 0x0a00620038
+/// storing it to DAT_179328, which the ISR ANDs against MMIO[0x10a10]. Writing
+/// 2 here was tested and does exactly that (0x10a08 measured 0x0e00620038,
+/// bit 34 enabled) and changes nothing else, so leaving it unset is right and
+/// this part is not the variant-2 configuration.
+///
+/// A caution for anyone diffing this table again: it has TWENTY-NINE runs,
+/// several spanning many lines. A naive `\(0x..,\s*&\[(.*?)\]\)` regex
+/// silently matches only 19 of them and mis-associates offsets, which
+/// manufactures differences that are not there and, if used to rewrite the
+/// table, corrupts it into 17 runs / 292 bytes and makes probe fail with -22.
+/// Parse by matching brackets, and check the 29/269 totals before trusting a
+/// comparison.
 pub(crate) const HW_DATA_OPAQUE_RUNS: &[(usize, &[u8])] = &[
     (0x0004, &[0x6f, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0xff]),
     (
