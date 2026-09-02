@@ -1460,6 +1460,7 @@ static int mt7932_mcu_lab_teardown_fullmac(
 {
 	struct mt792x_vif *old_mvif;
 	u8 old_sta;
+	u16 reason;
 	int ret;
 
 	if (!lab->fullmac_reserved_count || !lab->fullmac_vif ||
@@ -1471,7 +1472,9 @@ static int mt7932_mcu_lab_teardown_fullmac(
 	reinit_completion(&lab->disconnected);
 	WRITE_ONCE(lab->fullmac_disconnect_status, 0xffff);
 	WRITE_ONCE(lab->fullmac_disconnect_pending, true);
-	ret = mt7932_mcu_fullmac_disconnect(lab->dev, bssid, command);
+	reason = !strcmp(phase, "cold-preconnect") ? 10 : 30;
+	ret = mt7932_mcu_fullmac_disconnect(
+		lab->dev, bssid, reason, command);
 	if (ret)
 		goto fail;
 	if (!wait_for_completion_timeout(&lab->disconnected,
@@ -1489,8 +1492,8 @@ static int mt7932_mcu_lab_teardown_fullmac(
 		goto fail;
 
 	dev_info(lab->dev->mt76.dev,
-		 "J700_MT7932_FULLMAC_TEARDOWN_PASS: phase=%s disconnect=ea42 queue_actions=5,1 old_bss=%u old_sta=%u wait=event-gated source=apple25G83\n",
-		 phase, old_mvif->bss_conf.mt76.idx, old_sta);
+		 "J700_MT7932_FULLMAC_TEARDOWN_PASS: phase=%s disconnect=ea42 reason=%u queue_actions=5,1 old_bss=%u old_sta=%u wait=event-gated source=apple25G83\n",
+		 phase, reason, old_mvif->bss_conf.mt76.idx, old_sta);
 
 	return 0;
 
@@ -1549,8 +1552,9 @@ static int mt7932_mcu_lab_disconnect_fullmac(
 	if (ret)
 		return ret;
 	mt7932_mcu_lab_release_fullmac_resources(lab);
+	lab->fullmac_cold_teardown_done = false;
 	dev_info(lab->dev->mt76.dev,
-		 "J700_MT7932_FULLMAC_EXPLICIT_DISCONNECT_PASS: carrier=off resources=0 source=typed-ea42+cid6b-actions5,1\n");
+		 "J700_MT7932_FULLMAC_EXPLICIT_DISCONNECT_PASS: carrier=off resources=0 next_cold_cleanup=reason10 source=typed-ea42+cid6b-actions5,1\n");
 
 	return 0;
 }
