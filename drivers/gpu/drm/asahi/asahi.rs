@@ -332,7 +332,7 @@ kernel::module_platform_driver! {
         },
         g17p_render_sksm: u32 {
             default: 3,
-            description: "Install the render QIDs on the KSM bridge and write kick entries, sequenced between tag-15 and tag-14 exactly as compute does. 0: off. 1: legacy compute-shaped command state. 2: bare entry with no RegisterArray bindings. 3: exact captured Metal render shape: zero event mask and kind, TA descriptor+0x60/tag0x47, and 3D descriptor+0xa0/+0x7c0/+0xee0/+0x1600 tagged 0x56/0x10/0x17/0x0a. 4: compatibility alias for 3. Non-zero also maps the render entry rings GPU read-write.",
+            description: "Install the render QIDs on the KSM bridge and write kick entries, sequenced between tag-15 and tag-14 exactly as compute does. 0: off. 1: legacy compute-shaped command state. 2: bare entry with no RegisterArray bindings. 3: exact captured Metal render shape: zero event mask and kind, TA descriptor+0x60/tag0x47, and 3D descriptor+0xa0/+0x7c0/+0xee0/+0x1600 tagged 0x56/0x10/0x17/0x0a. 4: compatibility alias for 3. Non-zero also maps the render entry rings GPU read-write. MEASURED 2026-09-02, all with a compute first: mode 3 is the only shape that lets the TILER run. Mode 0 publishes no work at all -- the KSM slots stay empty and no completion record of any kind appears. Modes 1 and 2 are strictly WORSE than 3: the tiler itself is then admitted to KSM slot 0 (state 0x0100000d, phase 6) and retired with status 4, tiling timestamps [0x0,0x0], exactly the way the fragment fails under mode 3. So the entry SHAPE decides whether a queue is dispatched classically or admitted to the SKSM scheduler and stuck; do not use 0, 1 or 2.",
         },
         g17p_irq_completion: u32 {
             default: 1,
