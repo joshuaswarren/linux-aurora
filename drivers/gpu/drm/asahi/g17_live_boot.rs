@@ -4409,6 +4409,11 @@ impl G17PLiveRuntime {
                 .ok_or(ENODEV)?
                 .compute_queue_id(self.queue.as_ref().ok_or(ENODEV)?)?,
         );
+        // Control sample for the render blocker: compute reaches dispatch on
+        // this same driver, so reading the KSM slot bank and the bit-4
+        // new-work path right after a compute kick shows what a working
+        // notification looks like. Same probe, same registers, same gate.
+        self.probe_render_ksm_admission_after_render_doorbells();
         let mut scan_observation = G17PWorkScanObservation::new();
         let mut serviced_notifications: u32 = 0;
         let mut last_ksm_sample: (u64, u64, u64) = (0, 0, 0);
@@ -5066,14 +5071,11 @@ impl G17PLiveRuntime {
                 .and_then(|manager| manager.render_engine_timestamps())
             {
                 Ok(timestamps) => timestamps,
-                Err(error) => {
-                    dev_err!(
-                        pdev.as_ref(),
-                        "G17P render KSM admission could not sample TA timestamps ({:?})\n",
-                        error,
-                    );
-                    return;
-                }
+                // A compute submission has no render storage. Sample the
+                // hardware anyway: this probe's whole value on the compute
+                // path is the KSM slot bank and the bit-4 new-work registers,
+                // which are what a working dispatch has to move.
+                Err(_) => [[0, 0]; 2],
             };
             match registers.g17p_render_ksm_admission_snapshot(ta_qid, fragment_qid) {
                 Ok(Some(snapshot)) => {
@@ -5184,6 +5186,22 @@ impl G17PLiveRuntime {
                             snapshot.queue_descriptor[0],
                             snapshot.queue_descriptor[1],
                         );
+                        for slot in 0..4 {
+                            let progress = snapshot.slot_progress[slot];
+                            dev_info!(
+                                pdev.as_ref(),
+                                "G17P render KSM slot {} poll={} state={:#018x} progress={:#018x} -> qid={} ts={:#x} occupied={} phase={:#x} pipe={}\n",
+                                slot,
+                                poll,
+                                snapshot.slot_state[slot],
+                                progress,
+                                (progress >> 40) & 0x7f,
+                                progress & 0xff_ffff_ffff,
+                                snapshot.slot_state[slot] & 1,
+                                (snapshot.slot_state[slot] >> 1) & 0x1f,
+                                ((snapshot.slot_state[slot] >> 24) & 3) as i64 - 1,
+                            );
+                        }
                         if let Some(usc) = snapshot.usc {
                             dev_info!(
                                 pdev.as_ref(),

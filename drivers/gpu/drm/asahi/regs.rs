@@ -366,6 +366,14 @@ pub(crate) struct G17PRenderKsmAdmissionSnapshot {
     /// bit. Zero here means the queue was never installed, whatever the
     /// enable mask says.
     pub(crate) queue_descriptor: [u64; 2],
+    /// KSM slots 0..3 read by SLOT index, not by queue id. The 0xc020/0xc078
+    /// bank is indexed by the scheduler slot a queue is loaded into; the queue
+    /// id is recovered from the progress word's bits 46:40, and the kick
+    /// timestamp from its low 40 bits. Reading these by queue id -- as the
+    /// probe originally did -- samples empty slots and hides the fact that the
+    /// work is loaded and waiting.
+    pub(crate) slot_state: [u64; 4],
+    pub(crate) slot_progress: [u64; 4],
     pub(crate) current_command: u64,
     pub(crate) current_context: u64,
     pub(crate) active_queue_mask: u64,
@@ -852,6 +860,14 @@ impl Resources {
             Self::g17p_sksm_port_read_locked(&sgx, 0x21038, 0, 1u64 << 42)?,
             Self::g17p_sksm_port_read_locked(&sgx, 0x21040, 0, 1u64 << 42)?,
         ];
+        let mut slot_state = [0u64; 4];
+        let mut slot_progress = [0u64; 4];
+        for slot in 0..4u64 {
+            slot_state[slot as usize] =
+                Self::g17p_sksm_port_read_locked(&sgx, 0xc020, slot, 1u64 << 42)?;
+            slot_progress[slot as usize] =
+                Self::g17p_sksm_port_read_locked(&sgx, 0xc078, slot, 0)?;
+        }
         let queue_descriptor = [
             Self::g17p_sksm_port_read_locked(&sgx, 0x21008, u64::from(ta_qid), 1u64 << 42)?,
             Self::g17p_sksm_port_read_locked(
@@ -1059,6 +1075,8 @@ impl Resources {
             qid_counters,
             queue_enabled,
             queue_descriptor,
+            slot_state,
+            slot_progress,
             current_command,
             current_context,
             active_queue_mask,

@@ -48,6 +48,11 @@ pub(crate) const G17P_FIRMWARE_EVENT_PRODUCER_OFFSET: u32 = 0x20;
 /// submission retires, carrying the event stamp (which advances by 0x100 per
 /// completion, as on M1/M2), the queue index, the command UUID and the context.
 pub(crate) const G17P_FIRMWARE_EVENT_COMPLETION_TYPE: u32 = 1;
+/// `kAGFIFirmwareEventTypeStampSignal`: a bitmask of the stamp indices the
+/// firmware has just signalled, in the same 128-bit space the completion
+/// records index. Both the working compute path and the failing render path
+/// emit one, so it is the firmware's own account of which stamps moved.
+pub(crate) const G17P_FIRMWARE_EVENT_STAMP_TYPE: u32 = 1;
 pub(crate) const G17P_FIRMWARE_EVENT_RECOVERY_TYPE: u32 = 4;
 pub(crate) const G17P_FIRMWARE_EVENT_UMA_GROW_TYPE: u32 = 13;
 pub(crate) const D93AP_G17P_SGX_SOURCE_INDEX: u8 = 4;
