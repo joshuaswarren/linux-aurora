@@ -39,6 +39,12 @@
 
 static bool mt7932_fullmac_cfg80211;
 static bool mt7932_fullmac_private_vif;
+static bool mt7932_fullmac_rx_dup_trace;
+
+module_param_named(j700_fullmac_rx_dup_trace,
+		   mt7932_fullmac_rx_dup_trace, bool, 0600);
+MODULE_PARM_DESC(j700_fullmac_rx_dup_trace,
+		 "trace J700 fullmac retry duplicate suppression");
 
 struct mt7932_mcu_lab_pending {
 	bool valid;
@@ -71,6 +77,8 @@ struct mt7932_mcu_lab {
 	struct mutex operation_lock;
 	/* Protects response-sequence ownership against the MCU RX path. */
 	spinlock_t pending_lock;
+	/* Protects the per-peer receive sequence cache across RX NAPI queues. */
+	spinlock_t fullmac_rx_lock;
 	struct mt7932_mcu_lab_pending pending[256];
 	unsigned int pending_count;
 	struct sk_buff_head records;
@@ -119,6 +127,11 @@ struct mt7932_mcu_lab {
 	u8 fullmac_security;
 	u8 fullmac_oper_band;
 	u8 fullmac_oper_channel;
+	u8 fullmac_assoc_band;
+	u16 fullmac_rx_seq[IEEE80211_NUM_TIDS + 1];
+	bool fullmac_rx_seq_valid[IEEE80211_NUM_TIDS + 1];
+	bool fullmac_rx_ignore_amsdu_dup[IEEE80211_NUM_TIDS + 1];
+	u64 fullmac_rx_duplicates;
 	struct mt7932_fullmac_assoc_cal_snapshot assoc_cal;
 	bool checkpoint_waiting;
 	bool misc_registered;
@@ -133,6 +146,54 @@ struct mt7932_fullmac_netdev_priv {
 };
 
 static void mt7932_fullmac_scan_cancel(struct mt7932_mcu_lab *lab);
+
+static bool mt7932_fullmac_rx_is_duplicate(struct mt7932_mcu_lab *lab,
+					    struct mt76_rx_status *status)
+{
+	unsigned long flags;
+	unsigned int index;
+	bool duplicate = false;
+
+	if (!status->wcid)
+		return false;
+	index = status->aggr ?
+		(status->qos_ctl & IEEE80211_QOS_CTL_TID_MASK) :
+		IEEE80211_NUM_TIDS;
+
+	/* Match MediaTek's public nicRxIsDuplicateFrame semantics.  A fresh
+	 * frame always refreshes the sequence cache.  A retry is dropped only
+	 * when it repeats that cached sequence.  If the first copy of an A-MSDU
+	 * was itself a retry, retain its remaining translated subframes through
+	 * the last-subframe marker before enabling duplicate rejection again.
+	 */
+	spin_lock_irqsave(&lab->fullmac_rx_lock, flags);
+	if (!status->retry) {
+		lab->fullmac_rx_seq[index] = status->seqno;
+		lab->fullmac_rx_seq_valid[index] = true;
+		lab->fullmac_rx_ignore_amsdu_dup[index] = false;
+	} else if (!lab->fullmac_rx_seq_valid[index] ||
+		   lab->fullmac_rx_seq[index] != status->seqno) {
+		lab->fullmac_rx_seq[index] = status->seqno;
+		lab->fullmac_rx_seq_valid[index] = true;
+		lab->fullmac_rx_ignore_amsdu_dup[index] =
+			status->first_amsdu;
+	} else if (lab->fullmac_rx_ignore_amsdu_dup[index]) {
+		if (status->last_amsdu)
+			lab->fullmac_rx_ignore_amsdu_dup[index] = false;
+	} else {
+		lab->fullmac_rx_duplicates++;
+		duplicate = true;
+	}
+	spin_unlock_irqrestore(&lab->fullmac_rx_lock, flags);
+
+	if (duplicate && READ_ONCE(mt7932_fullmac_rx_dup_trace))
+		dev_info_ratelimited(lab->dev->mt76.dev,
+			 "J700_MT7932_FULLMAC_RX_DUP_DROP: cache=%u seq=%u retry=1 amsdu=%u first=%u last=%u\n",
+			 index, status->seqno, status->amsdu,
+			 status->first_amsdu, status->last_amsdu);
+
+	return duplicate;
+}
 
 static bool mt7932_mcu_lab_fullmac_critical_data(struct sk_buff *skb)
 {
@@ -775,6 +836,14 @@ static int mt7932_mcu_lab_prepare_fullmac_data_path(
 
 	mvif = (struct mt792x_vif *)lab->fullmac_vif->drv_priv;
 	memset(&lab->fullmac_sta, 0, sizeof(lab->fullmac_sta));
+	spin_lock_bh(&lab->fullmac_rx_lock);
+	memset(lab->fullmac_rx_seq, 0, sizeof(lab->fullmac_rx_seq));
+	memset(lab->fullmac_rx_seq_valid, 0,
+	       sizeof(lab->fullmac_rx_seq_valid));
+	memset(lab->fullmac_rx_ignore_amsdu_dup, 0,
+	       sizeof(lab->fullmac_rx_ignore_amsdu_dup));
+	lab->fullmac_rx_duplicates = 0;
+	spin_unlock_bh(&lab->fullmac_rx_lock);
 	mt76_wcid_init(&mlink->wcid, 0);
 	mlink->wcid.idx = lab->fullmac_wtbl_ids[0];
 	mlink->wcid.hw_key_idx = lab->fullmac_security ==
@@ -1443,6 +1512,7 @@ void mt7932_mcu_lab_reset_prepare(struct mt792x_dev *dev)
 	memset(lab->pending, 0, sizeof(lab->pending));
 	lab->pending_count = 0;
 	lab->assoc_cal.valid = false;
+	lab->fullmac_assoc_band = 0;
 	spin_unlock_irqrestore(&lab->pending_lock, flags);
 	lab->response_timed_out = false;
 	lab->fullmac_cold_teardown_done = false;
@@ -1600,6 +1670,7 @@ static int mt7932_mcu_lab_fullmac_connect(
 		return -EBUSY;
 	spin_lock_irqsave(&lab->pending_lock, flags);
 	lab->assoc_cal.valid = false;
+	lab->fullmac_assoc_band = 0;
 	if (request->pre_assoc_cbw || request->pre_assoc_extension) {
 		lab->assoc_cal.primary = request->channel;
 		lab->assoc_cal.cbw = request->pre_assoc_cbw;
@@ -1918,6 +1989,7 @@ static int mt7932_mcu_lab_fullmac_assoc_cal(
 				    20 + cal_data_len[1], &command, &sequence);
 	if (ret)
 		goto out_free;
+	lab->fullmac_assoc_band = snapshot.band;
 	*command_out = command;
 	*sequence_out = sequence;
 	dev_info(lab->dev->mt76.dev,
@@ -1950,10 +2022,18 @@ static int mt7932_mcu_lab_fullmac_queue_bind(
 static int mt7932_mcu_lab_fullmac_assoc_power(
 	struct mt7932_mcu_lab *lab, u32 *command)
 {
+	u8 band = READ_ONCE(lab->fullmac_assoc_band);
+
 	if (lab->phase != NEO_WIFID_PHASE_CONTINUED ||
 	    !lab->fullmac_reserved_count || !lab->fullmac_vif ||
 	    !lab->fullmac_ndev)
 		return -EBUSY;
+	if (band != 3) {
+		dev_info(lab->dev->mt76.dev,
+			 "J700_MT7932_FULLMAC_ASSOC_POWER_SKIP: band=%u reason=6g-vlp-pages-not-applicable source=apple25G83-band-specific-order\n",
+			 band);
+		return 0;
+	}
 
 	return mt7932_mcu_load_assoc_power(lab->dev, command);
 }
@@ -2534,6 +2614,7 @@ static int mt7932_mcu_lab_create(struct mt792x_dev *dev,
 	lab->dev = dev;
 	mutex_init(&lab->operation_lock);
 	spin_lock_init(&lab->pending_lock);
+	spin_lock_init(&lab->fullmac_rx_lock);
 	skb_queue_head_init(&lab->records);
 	init_waitqueue_head(&lab->read_wait);
 	init_completion(&lab->connected);
@@ -3014,6 +3095,12 @@ bool mt7932_mcu_lab_fullmac_rx(struct mt792x_dev *dev, struct sk_buff *skb)
 	ndev = READ_ONCE(lab->fullmac_ndev);
 	if (!READ_ONCE(lab->fullmac_connected) || !ndev ||
 	    unlikely(!pskb_may_pull(skb, ETH_HLEN))) {
+		dev_kfree_skb(skb);
+		consumed = true;
+		goto out;
+	}
+	if (mt7932_fullmac_rx_is_duplicate(lab, status)) {
+		ndev->stats.rx_dropped++;
 		dev_kfree_skb(skb);
 		consumed = true;
 		goto out;
