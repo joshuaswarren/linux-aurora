@@ -808,10 +808,16 @@ impl Resources {
         let mut distinct = 0usize;
         let mut last = (u64::MAX, u64::MAX, u64::MAX);
         for _ in 0..512 {
+            // 0x10a10 is the raw pending status, which the ISR clears almost
+            // immediately, so a host sample nearly always reads it as 0.
+            // 0x10a18 is where the ISR WRITES the bits it just serviced
+            // (b1 0x21760: str x9, [x8, #0x10a18], x9 = status & DAT_179328),
+            // so it retains the last serviced set and is the register that
+            // actually answers "has bit 4 ever been handled".
             let now = (
                 registers.try_read64(0x1_0a10)?,
+                registers.try_read64(0x1_0a18)?,
                 registers.try_read64(0x1_0a60)?,
-                registers.try_read64(0x1_0a50)?,
             );
             if now != last {
                 if distinct < out.len() {
