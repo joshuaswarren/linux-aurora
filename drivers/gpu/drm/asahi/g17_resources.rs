@@ -370,13 +370,13 @@ fn g17p_control_operand_buffer_va(index: usize) -> Option<u64> {
         .checked_add(index as u64 * G17P_CONTROL_OPERAND_BUFFER_STRIDE as u64)
 }
 
-fn encode_g17p_pre_qid_flist_runs(out: &mut [u8]) -> bool {
+fn encode_g17p_flist_runs(out: &mut [u8], block_count: usize) -> bool {
     if out.len() != G17P_CONTROL_OPERAND_TABLE_BACKING_SIZE {
         return false;
     }
 
     out.fill(0);
-    for buffer_index in 0..G17P_CONTROL_OPERAND_ACTIVE_BLOCK_COUNT {
+    for buffer_index in 0..block_count {
         let Some(buffer_base) = g17p_control_operand_buffer_va(buffer_index) else {
             return false;
         };
@@ -391,6 +391,17 @@ fn encode_g17p_pre_qid_flist_runs(out: &mut [u8]) -> bool {
         slot.copy_from_slice(&run.to_le_bytes());
     }
     true
+}
+
+fn encode_g17p_compute_flist_runs(out: &mut [u8]) -> bool {
+    encode_g17p_flist_runs(
+        out,
+        g17_initdata::COMPUTE_READINESS_OPERAND_ENTRY_COUNT,
+    )
+}
+
+fn encode_g17p_pre_qid_flist_runs(out: &mut [u8]) -> bool {
+    encode_g17p_flist_runs(out, G17P_CONTROL_OPERAND_ACTIVE_BLOCK_COUNT)
 }
 
 /// Encode the page-address array consumed by the initial UMA descriptor.
@@ -11314,14 +11325,17 @@ impl G17ResourceOwner {
         vm: &mmu::Vm,
         bootstrap_vdm: bool,
     ) -> Result {
-        // The VDM bootstrap root owns the complete captured aperture. A cold
-        // render root needs the 22 initial FList blocks plus the four blocks
-        // appended by opcode 0x20. Context-0 aliases may share these numeric
-        // VAs because they live in a different low root, as they do natively.
+        // The VDM bootstrap root owns the complete captured aperture. An
+        // ordinary client root must stop at operand block 20: block 21 spans
+        // 0x70017c8000..0x70018c8000 and therefore overlaps both native SKSM
+        // completion aliases at 0x7001848000/0x7001870000. The render pool's
+        // 22 initial plus four grown blocks need a render-specific translation
+        // context; installing them in every client root makes the first
+        // compute bind fail with ENOSPC before any hardware publication.
         let operand_buffer_count = if bootstrap_vdm {
             G17P_CONTROL_OPERAND_BUFFER_COUNT
         } else {
-            G17P_CONTROL_OPERAND_ACTIVE_BLOCK_COUNT
+            g17_initdata::COMPUTE_READINESS_OPERAND_ENTRY_COUNT
         };
         let mut mappings = KVec::with_capacity(
             operand_buffer_count + if bootstrap_vdm { 6 } else { 4 },
@@ -11395,13 +11409,13 @@ impl G17ResourceOwner {
             self.resources
                 .control_operand_page_lists
                 .with_bytes_mut(|bytes| {
-                    if !encode_g17p_initial_flist_page_list(bytes) {
-                        return Err(EINVAL);
-                    }
+                    // The proven compute opening starts with no populated UMA
+                    // page list. Render publishes its prepared pool separately.
+                    bytes.fill(0);
                     Ok(())
                 })?;
             self.resources.control_operand_table.with_bytes_mut(|bytes| {
-                if !encode_g17p_pre_qid_flist_runs(bytes) {
+                if !encode_g17p_compute_flist_runs(bytes) {
                     return Err(EINVAL);
                 }
                 Ok(())
@@ -12137,6 +12151,34 @@ impl G17ResourceOwner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compute_flist_stops_before_native_completion_aliases() {
+        let mut raw = vec![0xa5; G17P_CONTROL_OPERAND_TABLE_BACKING_SIZE];
+        assert!(encode_g17p_compute_flist_runs(&mut raw));
+        let count = g17_initdata::COMPUTE_READINESS_OPERAND_ENTRY_COUNT;
+        assert_eq!(count, 21);
+        for buffer_index in 0..count {
+            let base = g17p_control_operand_buffer_va(buffer_index).unwrap();
+            let offset = buffer_index * G17P_CONTROL_OPERAND_RUN_SLOT_SIZE;
+            assert_eq!(
+                u64::from_le_bytes(raw[offset..offset + 8].try_into().unwrap()),
+                (base & G17P_CONTROL_OPERAND_RUN_ADDRESS_MASK)
+                    | (G17P_CONTROL_OPERAND_RUN_LENGTH_PAGES << 52)
+            );
+        }
+        assert!(raw[count * G17P_CONTROL_OPERAND_RUN_SLOT_SIZE..]
+            .iter()
+            .all(|byte| *byte == 0));
+
+        let last_end = g17p_control_operand_buffer_va(count - 1).unwrap()
+            + G17P_CONTROL_OPERAND_BUFFER_SIZE as u64;
+        let first_completion = g17_initdata::G17P_KSM_COMPLETION_LOW_VAS[0];
+        assert!(last_end <= first_completion);
+        let opening_only = g17p_control_operand_buffer_va(count).unwrap();
+        assert!(opening_only < first_completion);
+        assert!(first_completion < opening_only + G17P_CONTROL_OPERAND_BUFFER_SIZE as u64);
+    }
 
     #[test]
     fn render_flist_run_list_matches_native_initial_and_first_grow_slots() {
