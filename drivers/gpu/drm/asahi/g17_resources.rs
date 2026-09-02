@@ -8956,6 +8956,107 @@ impl G17ResourceOwner {
         );
     }
 
+    /// DIAGNOSTIC. Dump the primary firmware-visible state object.
+    ///
+    /// A completed compute is what makes the tiler run. Registers have been
+    /// compared cold-vs-warm and only work-channels[0] differed, which was
+    /// refuted as a cause by seeding it. The firmware-visible DRAM the
+    /// firmware itself keeps state in has never been compared, and whatever a
+    /// compute changes there is the candidate set for the bootstrap.
+    pub(crate) fn dump_primary_state(&mut self, label: &str, len: usize) {
+        let mut buf: KVec<u8> = match KVec::with_capacity(len, GFP_KERNEL) {
+            Ok(buf) => buf,
+            Err(_) => return,
+        };
+        let mut exposed = 0usize;
+        let ok = self
+            .resources
+            .primary_state
+            .with_bytes_mut(|bytes| {
+                exposed = bytes.len();
+                let take = core::cmp::min(len, bytes.len());
+                for byte in bytes.get(..take).ok_or(ERANGE)?.iter() {
+                    buf.push(*byte, GFP_KERNEL)?;
+                }
+                Ok(())
+            })
+            .is_ok();
+        let dev = self.dev().clone();
+        dev_info!(
+            dev.as_ref(),
+            "G17PSTATE {} exposed={:#x} got={:#x} ok={}\n",
+            label,
+            exposed,
+            buf.len(),
+            ok,
+        );
+        if !ok {
+            return;
+        }
+        let mut offset = 0usize;
+        while offset + 16 <= buf.len() {
+            dev_info!(
+                dev.as_ref(),
+                "G17PSTATE {} {:#07x} {:02x?}\n",
+                label,
+                offset,
+                &buf[offset..offset + 16],
+            );
+            offset += 16;
+        }
+    }
+
+    /// DIAGNOSTIC. Checksum every 0x100 block of the primary state object.
+    ///
+    /// The object is 0xc4000 bytes; dumping it raw is ~50k printk lines. A
+    /// per-block hash covers all of it in a few hundred, and the blocks that
+    /// differ between a cold and a compute-first boot can then be dumped raw.
+    pub(crate) fn checksum_primary_state(&mut self, label: &str) {
+        let mut hashes: KVec<u32> = KVec::new();
+        let ok = self
+            .resources
+            .primary_state
+            .with_bytes_mut(|bytes| {
+                let mut off = 0usize;
+                while off + 0x100 <= bytes.len() {
+                    let mut h: u32 = 0x811c9dc5;
+                    let mut k = 0usize;
+                    while k < 0x100 {
+                        h ^= bytes[off + k] as u32;
+                        h = h.wrapping_mul(0x0100_0193);
+                        k += 1;
+                    }
+                    hashes.push(h, GFP_KERNEL)?;
+                    off += 0x100;
+                }
+                Ok(())
+            })
+            .is_ok();
+        let dev = self.dev().clone();
+        dev_info!(
+            dev.as_ref(),
+            "G17PSUM {} blocks={} ok={}\n",
+            label,
+            hashes.len(),
+            ok,
+        );
+        if !ok {
+            return;
+        }
+        let mut i = 0usize;
+        while i + 8 <= hashes.len() {
+            dev_info!(
+                dev.as_ref(),
+                "G17PSUM {} {:#07x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}\n",
+                label,
+                i * 0x100,
+                hashes[i], hashes[i + 1], hashes[i + 2], hashes[i + 3],
+                hashes[i + 4], hashes[i + 5], hashes[i + 6], hashes[i + 7],
+            );
+            i += 8;
+        }
+    }
+
     pub(crate) fn dump_render_qos_regions(&mut self, label: &str) {
         const REGIONS: [(&str, usize, usize); 6] = [
             ("rows", 0x000, 0x40),

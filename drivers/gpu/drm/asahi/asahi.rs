@@ -272,6 +272,10 @@ kernel::module_platform_driver! {
             default: 0,
             description: "DIAGNOSTIC ONLY -- immediately after the render doorbell, sample KSM slot 0's state register 256 times and log the distinct values in order. The poll loop only ever sees the slot empty and then the fragment stuck at 0x0100000d a millisecond later, so no sample has ever caught a queue while it is actually dispatched and progressing. This is read-only through the SKSM port.",
         },
+        g17p_dump_state: u32 {
+            default: 0,
+            description: "DIAGNOSTIC ONLY -- dump this many KiB of the primary firmware-visible state object once, at the first render checkpoint. A completed compute is what makes the tiler run; registers have been compared cold-versus-warm and the only difference, work-channels[0] going 0 to 1, was refuted by seeding it. The firmware-visible DRAM has never been compared, and whatever a compute changes there is the candidate set for the bootstrap. Very noisy; capture via /dev/kmsg, not dmesg, since the ring buffer wraps.",
+        },
         g17p_dump_hwdata: u32 {
             default: 0,
             description: "DIAGNOSTIC ONLY -- dump the whole 0x3db4 hardware-data block this driver builds, once, at the first render checkpoint. HW_DATA_OPAQUE_RUNS (the 269 hardcoded bytes) is already verified byte-exact against native; the rest of the block is computed and has never been compared. Native's block was captured whole from AGXArmFirmwareASC + 0x2b8, so this makes a full diff possible. Very noisy; off by default.",
