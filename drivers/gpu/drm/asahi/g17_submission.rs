@@ -1547,6 +1547,12 @@ pub(crate) fn apply_g17p_cold_opening_optional(
         // Native captures contain 1, 2 and 4. Linux reserves slot 2 and must
         // publish that same ID in ConfigUpdate, the qid*8 QoS record and the
         // KSM dependency-control qword.
+        // +0x62/+0x66 are deliberately absent. Every native ConfigUpdate ever
+        // captured -- TA and 3D, recs-var and state1-final -- has +0x62 = 0.
+        // With +0x62 and +0x66 set, the firmware executes `0xd800 = 0x100;
+        // 0xd8f0 |= 1 << ctx` (b1 0x12378-0x1239c), the only per-context
+        // GMMU-block write our render submission adds and one native never
+        // performs. The compute path does not go through this record at all.
         G17PColdOpeningStage::Tiling => &[
             (0x18, queue_id),
             (0x1a, install),
@@ -1555,8 +1561,6 @@ pub(crate) fn apply_g17p_cold_opening_optional(
             (0x52, 1),
             (0x56, 2),
             (0x5e, 2),
-            (0x62, 1),
-            (0x66, 1),
             (0x82, 1),
         ],
         G17PColdOpeningStage::Fragment => &[
@@ -1568,8 +1572,6 @@ pub(crate) fn apply_g17p_cold_opening_optional(
             (0x52, 1),
             (0x56, 2),
             (0x5e, 2),
-            (0x62, 1),
-            (0x66, 1),
         ],
     };
     for (offset, value) in fields {
