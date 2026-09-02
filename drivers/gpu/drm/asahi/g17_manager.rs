@@ -3055,6 +3055,42 @@ impl G17PManagerConstruction {
             roots[3].0,
             roots[3].1,
         );
+        // Prove the client regime reaches native's low view 0 before anything
+        // is armed. gUPM's first fragment traffic writes 0x1e00..0x1f80
+        // through this VM's own slot, and an unmapped write there is exactly
+        // the fault this view exists to remove; a wrong or missing leaf must
+        // fail here, on the host, rather than as another opaque dIPP miss.
+        for offset in [0x1e00u64, 0x1f80u64] {
+            let (canonical, client) = vm
+                .t8140_client_null_view_probe(offset)
+                .map_err(|error| {
+                    dev_err!(
+                        dev.as_ref(),
+                        "G17P render client null view: +{:#x} does not translate ({:?})\n",
+                        offset,
+                        error,
+                    );
+                    Self::render_stage_fail("client-null-view-unmapped", error)
+                })?;
+            if canonical != client {
+                dev_err!(
+                    dev.as_ref(),
+                    "G17P render client null view: +{:#x} client PA {:#x} != canonical PA {:#x}\n",
+                    offset,
+                    client,
+                    canonical,
+                );
+                return Err(Self::render_stage_fail("client-null-view-mismatch", EFAULT));
+            }
+            dev_info!(
+                dev.as_ref(),
+                "G17P render client null view: +{:#x} -> PA {:#x}, identical to canonical {:#x}+{:#x}\n",
+                offset,
+                client,
+                0x0010_0000_0000u64,
+                offset,
+            );
+        }
         self.render_storage
             .as_mut()
             .ok_or(ENODEV)?

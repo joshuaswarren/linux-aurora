@@ -11618,6 +11618,15 @@ impl G17ResourceOwner {
             GFP_KERNEL,
         )?;
         let mut reserved_ranges = KVec::new();
+        // Native's SecureGart owns the first low view of a process's fixed
+        // resources (VA 0..0x10000); the driver materializes it in this root
+        // while the VM owns a render graph. Reserve it for the VM's whole
+        // lifetime so a user bind can never take the window between graphs.
+        reserved_ranges.push(
+            mmu::T8140_CLIENT_NULL_VIEW_START
+                ..mmu::T8140_CLIENT_NULL_VIEW_START + mmu::T8140_CLIENT_NULL_VIEW_SIZE as u64,
+            GFP_KERNEL,
+        )?;
         reserved_ranges.push(G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END, GFP_KERNEL)?;
         // Keep only the low-half render aperture driver-owned. Honeykrisp's VDM
         // command BO aliases descend from the top of this 4 GiB window, so
