@@ -374,9 +374,10 @@ pub(crate) struct G17PRenderKsmAdmissionSnapshot {
     pub(crate) resource_go: [u64; 2],
     pub(crate) resource_callback_state: u64,
     /// PDM launch/interrupt chain used by B1 to advance a fragment job from
-    /// scheduler state 2 to state 3. Firmware writes `launch_slot`,
-    /// `launch_mode`, and `launch_strobe`, then requires bit 3 in
-    /// `launch_irq_status` and the matching bit in `launch_slot_pending`.
+    /// scheduler state 2 to state 3. `launch_mode == 0x100` is the idle/reset
+    /// value; FUN_15a48 overwrites it with 0 or 1 before `launch_strobe`.
+    /// Firmware then requires bit 3 in `launch_irq_status` and the matching
+    /// bit in `launch_slot_pending`.
     pub(crate) launch_slot: u32,
     pub(crate) launch_mode: u64,
     pub(crate) launch_strobe: u32,
@@ -863,7 +864,8 @@ impl Resources {
         )?;
         // FUN_15a48 publishes these immediately before marking the firmware
         // job state 2. FUN_216f0 then consumes IRQ status bit 3 and the
-        // per-slot pending bitmap to make the state-3 callback runnable.
+        // per-slot pending bitmap to make the state-3 callback runnable. A
+        // 0x100 mode readback proves the launch write was not reached.
         // These are read-only observations; in particular, do not write the
         // 0x10a58 acknowledge register from the live diagnostic path.
         let launch_slot = registers.try_read32(0x1_0398)?;
