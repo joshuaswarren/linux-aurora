@@ -2171,8 +2171,14 @@ pub(crate) fn encode_hw_data(
     // `HW_DATA_OPAQUE_RUNS` extent and nothing else wrote it -- so the
     // firmware was told the host drives the MMIO bridge while the host in
     // fact speaks channel commands. Declare the transport we actually use.
+    // MEASURED 2026-09-02, and it contradicts the reasoning above. Native's
+    // complete hardware-data block (hwdata-gfx.txt, captured from
+    // accel+0x5b0 -> +0x2b8 at submit3DChannel ENTRY, i.e. long after init)
+    // carries ZERO at 0x26f8. The "native runs with the bit SET" conclusion was
+    // inferred from seeing channel commands on the wire, not read off the
+    // block, and the block disagrees. Publish what native publishes.
     if let Some(byte) = out.get_mut(HW_DATA_TRANSPORT_SELECTOR_OFFSET) {
-        *byte = 1;
+        *byte = 0;
     }
     // Performance tables intentionally left zero; see
     // [`PERF_TABLE_VALUES_ENCODED`].
