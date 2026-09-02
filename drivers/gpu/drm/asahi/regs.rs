@@ -784,6 +784,38 @@ impl Resources {
         Ok(distinct)
     }
 
+    /// DIAGNOSTIC. Burst-sample the GPU interrupt status 0x1_0a10 together
+    /// with the new-work and completion slot masks, returning the distinct
+    /// (status, new-work, completion) triples seen.
+    ///
+    /// Every sample so far has been a poll a millisecond apart, and has shown
+    /// bit 3 and bit 4 clear with 0x10a60 empty. Both are enabled in 0x10a08
+    /// (0xa00620038). If they are raised and serviced between polls this would
+    /// catch them; if they never appear in a tight burst either, the firmware
+    /// is not receiving GPU hardware interrupts at all -- which would explain
+    /// why no job is ever created for ANY workload, compute included.
+    pub(crate) fn g17p_burst_sample_irq(&self, out: &mut [(u64, u64, u64); 12]) -> Result<usize> {
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let registers = sgx.relaxed();
+        let mut distinct = 0usize;
+        let mut last = (u64::MAX, u64::MAX, u64::MAX);
+        for _ in 0..512 {
+            let now = (
+                registers.try_read64(0x1_0a10)?,
+                registers.try_read64(0x1_0a60)?,
+                registers.try_read64(0x1_0a50)?,
+            );
+            if now != last {
+                if distinct < out.len() {
+                    out[distinct] = now;
+                }
+                distinct += 1;
+                last = now;
+            }
+        }
+        Ok(distinct)
+    }
+
     /// Whether the SKSM tag/data port can be driven from the host right now.
     ///
     /// The asynchronous SErrors that made every host SKSM write suppressible
