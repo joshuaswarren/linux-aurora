@@ -2,9 +2,11 @@
 
 Keep this list short and evidence-only. A build is not a hardware checkpoint.
 
-## Verified working
+## Previously verified
 
-- Vulkan compute: repeated exact-output dispatches complete without GPU faults.
+- Vulkan compute reached repeated exact-output dispatches on an earlier build.
+  The current build has regressed before hardware publication and is not a
+  valid compute baseline until the staged 1/2/100/1000 rerun passes.
 - Render TA: the 32x32 Vulkan path publishes and executes TA; both TA hardware
   timestamps become non-zero.
 - Fragment admission: firmware selects QID 1, assigns PDM pipe 0
@@ -14,6 +16,13 @@ Keep this list short and evidence-only. A build is not a hardware checkpoint.
 
 ## Current boundary
 
+- A fresh-boot Vulkan compute submit currently fails in the host with ENOSPC
+  at `submit-translated-compute`, before any GPU doorbell or fault. Normal user
+  roots were incorrectly expanded from 21 to 26 one-MiB UMA operand blocks;
+  block 21 overlaps the fixed compute completion aliases at
+  `0x7001848000/0x7001870000`, so the first compute binding cannot be built.
+- Render work is paused. Restore one exact-output dispatch, then prove 2, 100,
+  and 1000 consecutive dispatches before resuming fragment experiments.
 - The fragment's tag-15/tag-14 records retire and hardware selects QID 1, but
   B1 emits no KTrace code 2. Code 2 is in the bit-4 new-work path: the ISR
   reads the QID bitmap at SGX `+0x10a60`, acknowledges it at `+0x10a68`, and
@@ -60,12 +69,9 @@ Keep this list short and evidence-only. A build is not a hardware checkpoint.
 
 ## Next experiment
 
-- Cold Pool-A record 1 is now the kernel default and was verified on hardware:
-  submit-ready 3D `+0x20` changed from Pool-A `+0x000` to `+0x100`, matching
-  three native capture corpora. TA still completes, while `+0x20f0` and both
-  3D timestamps remain zero, so this real mismatch was not sufficient.
-- Sample the bit-4 new-work QID bitmap/ack pair (`+0x10a60/+0x10a68`) alongside
-  aggregate IRQ status at the fragment doorbell and after TA completion, then
-  compare the SKSM queue interrupt/configuration against Metal. Keep the later
-  launch registers, descriptor, SKSM, QoS, completion-ring, recovery, and broad
-  dockchannel dumps enabled.
+- Restore the proven 21-block compute-root layout while keeping render's 22+4
+  pool encoding separate. Validate exact output at 1, 2, 100, then 1000
+  consecutive Vulkan compute dispatches on hardware.
+- After compute is stable, return to the native-trace-guided QID 1 boundary
+  with the new-work, launch, descriptor, SKSM, QoS, completion-ring, recovery,
+  and broad dockchannel dumps enabled.
