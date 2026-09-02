@@ -184,14 +184,30 @@ pub(crate) const G17P_KTRACE_ADD_KICKS_KEY: u16 = 0x0041;
 pub(crate) const G17P_KTRACE_PAUSE_REASON_KEY: u16 = 0x0046;
 
 /// Submission-path keys printed by default (`channel << 8 | code`).
-pub(crate) const G17P_KTRACE_INTEREST_KEYS: [u16; 10] = [
+pub(crate) const G17P_KTRACE_INTEREST_KEYS: [u16; 14] = [
+    // Code 0x02 is emitted by the new-work IRQ handler (b1 `FUN_23004` at
+    // 0x232dc) exactly where it creates the per-DM job state machine, which
+    // is the only path to the DM0 launch strobe `sgx+0x1_c998 = 1`. It was
+    // never in this list, so every capture reported it absent and the render
+    // path was analysed on the false premise that firmware never creates a
+    // job. Absence of 0x02 from a drain said only that nobody looked.
+    0x0002, // firmware job creation (new-work IRQ)
     0x000a, // stamp update / retire
     0x000c, // stamp update / retire
     0x000e, // stamp update / retire
     0x0020, // device-control command retired
     0x0040, // tag 15 queue programmed (emitted at b1 0x11a84)
     0x0041, // tag 14 KsmKickQueueAddKicks
+    // 0x42/0x43/0x47 are the completion half. `FUN_12a84` emits 0x42 when a
+    // queue is stopped with kicks pending and re-adds them; `FUN_0ab64` emits
+    // 0x43 on completion processing and is the sole writer of the barrier
+    // table the 3D waits on; `FUN_0d550` emits 0x47 draining the classic
+    // work channel. A render that is admitted but never launches is decided
+    // entirely in these three, so none of them may stay filtered.
+    0x0042, // queue stopped with pending kicks -> re-add
+    0x0043, // completion processing entry
     0x0046, // KSM scheduling-pause reason-mask change
+    0x0047, // classic work-channel drain
     0x004b, // kick-queue config value change (tag 15)
     0x0057, // tag 16 KsmKickQueueEntrySignal
     0x011c, // records lost
