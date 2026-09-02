@@ -3334,6 +3334,35 @@ impl G17PLiveRuntime {
         if self.is_crashed() {
             g17_lifecycle::recover_persistent_runtime(self)?;
         }
+        // Compute retains its client aliases and VmBind after retirement so
+        // repeated dispatches can reuse the installed QID4 graph.  Render's
+        // full FList view cannot coexist with those aliases: its block 21
+        // contains the two low completion-ring addresses.  Native solves this
+        // with workload-specific app-GART contexts.  Until Linux retains both
+        // roots concurrently, hand the *idle* compute graph back before
+        // building the render view.  The graph itself stays installed; only
+        // the completed client's mappings and UAT binding are released, and a
+        // later compute submission rebinds them through the already-proven
+        // steady-state handoff path.
+        if self.compute_binding.is_some() {
+            if self.pending_compute.is_some() || self.compute_abandoned {
+                return Err(EBUSY);
+            }
+            let installed = match (self.queue.as_ref(), self.manager.as_ref()) {
+                (Some(queue), Some(manager)) => manager.compute_queue_is_installed(queue),
+                _ => false,
+            };
+            if !installed {
+                return Err(EIO);
+            }
+            self.rebind_compute_queue()?;
+            if let Some(pdev) = self.pdev.as_ref() {
+                dev_info!(
+                    pdev.as_ref(),
+                    "G17P workload switch: released idle compute app-GART view before render; retained QID4 graph remains installed\n"
+                );
+            }
+        }
         let recycle = self
             .manager
             .as_ref()
