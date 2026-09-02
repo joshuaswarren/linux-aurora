@@ -360,6 +360,12 @@ pub(crate) struct G17PRenderKsmAdmissionSnapshot {
     /// Authoritative queue-enabled status. These are not the write-only
     /// set-valid strobes at 0x21068/0x21070.
     pub(crate) queue_enabled: [u64; 2],
+    /// Per-QID descriptor register 0x21008 for the TA and 3D queues. This is
+    /// what `configureHardware` writes and what the firmware's tag-15 install
+    /// is expected to program: entry-ring base plus the hardware-set valid
+    /// bit. Zero here means the queue was never installed, whatever the
+    /// enable mask says.
+    pub(crate) queue_descriptor: [u64; 2],
     pub(crate) current_command: u64,
     pub(crate) current_context: u64,
     pub(crate) active_queue_mask: u64,
@@ -519,6 +525,23 @@ impl Resources {
         g17_submission::publish_g17p_sksm_write_pair(&G17SksmSgxPairWriter(sgx), pair)
     }
 
+    /// Whether the SKSM tag/data port can be driven from the host right now.
+    ///
+    /// The asynchronous SErrors that made every host SKSM write suppressible
+    /// were taken with the graphics cores gated off. The read path already
+    /// writes the same port -- `g17p_sksm_port_read_locked` stores a tag at
+    /// 0x4090 before loading 0x4098 -- and does so without incident whenever
+    /// the always-on GPC state is non-zero, which is direct evidence that the
+    /// aperture is decoded and the fault was a power-gate artifact. Apply the
+    /// same precondition to writes instead of refusing them outright.
+    fn g17p_sksm_port_powered(&self) -> bool {
+        self.sgx.try_access().is_some_and(|sgx| {
+            sgx.relaxed()
+                .try_read32(T8140_HOST_IRQ_SUMMARY)
+                .is_ok_and(|state| state & 0xf != 0)
+        })
+    }
+
     /// Publish word 0 then word 1 through J700 resource 0 (`sgx`).
     ///
     /// The pair is checked completely before either write. The fixed-slot
@@ -539,10 +562,12 @@ impl Resources {
         // firmware reaches the same registers through its own mapping of
         // PA 0x480000000. Gated off by default until the correct host aperture
         // is proven or the KSM programming moves to firmware channel commands.
-        if *module_parameters::g17p_sksm_mmio.value() == 0 {
+        if *module_parameters::g17p_sksm_mmio.value() == 0 || !self.g17p_sksm_port_powered() {
             dev_info!(
                 self.dev.as_ref(),
-                "G17P SKSM port MMIO suppressed: {:#x}@{:#x} / {:#x}@{:#x}\n",
+                "G17P SKSM port MMIO suppressed (enabled={}, powered={}): {:#x}@{:#x} / {:#x}@{:#x}\n",
+                *module_parameters::g17p_sksm_mmio.value(),
+                self.g17p_sksm_port_powered(),
                 pair.word0, pair.word0_offset, pair.word1, pair.word1_offset
             );
             self.stash_deferred_sksm_pair(pair);
@@ -569,10 +594,12 @@ impl Resources {
             return Err(EINVAL);
         }
 
-        if *module_parameters::g17p_sksm_mmio.value() == 0 {
+        if *module_parameters::g17p_sksm_mmio.value() == 0 || !self.g17p_sksm_port_powered() {
             dev_info!(
                 self.dev.as_ref(),
-                "G17P QID configure suppressed (tag={:#x}@{:#x} payload={:#x}@{:#x} maskHi={:#x} maskLo={:#x})\n",
+                "G17P QID configure suppressed (enabled={}, powered={}, tag={:#x}@{:#x} payload={:#x}@{:#x} maskHi={:#x} maskLo={:#x})\n",
+                *module_parameters::g17p_sksm_mmio.value(),
+                self.g17p_sksm_port_powered(),
                 pair.word0, pair.word0_offset, pair.word1, pair.word1_offset,
                 enable_pair.word0, enable_pair.word1
             );
@@ -825,6 +852,15 @@ impl Resources {
             Self::g17p_sksm_port_read_locked(&sgx, 0x21038, 0, 1u64 << 42)?,
             Self::g17p_sksm_port_read_locked(&sgx, 0x21040, 0, 1u64 << 42)?,
         ];
+        let queue_descriptor = [
+            Self::g17p_sksm_port_read_locked(&sgx, 0x21008, u64::from(ta_qid), 1u64 << 42)?,
+            Self::g17p_sksm_port_read_locked(
+                &sgx,
+                0x21008,
+                u64::from(fragment_qid),
+                1u64 << 42,
+            )?,
+        ];
         let current_command = registers.try_read64(0xc0f0)?;
         let current_context = registers.try_read64(0xc0f8)?;
         let active_queue_mask = registers.try_read64(T8140_KSM_ACTIVE_QUEUE_MASK)?;
@@ -1022,6 +1058,7 @@ impl Resources {
             fragment_progress,
             qid_counters,
             queue_enabled,
+            queue_descriptor,
             current_command,
             current_context,
             active_queue_mask,

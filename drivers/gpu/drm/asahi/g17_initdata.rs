@@ -1181,6 +1181,17 @@ pub(crate) const NATIVE_SECONDARY_MAIN_BUNDLE_OFFSET: usize = 0x22a80;
 /// Register-mapping array: 53 slots of 0x28 bytes at `+0x640`. Slots may also
 /// carry only the flag at `+0x20` (declared but unmapped). Register windows
 /// come from the ADT; do not replace ADT-defined sizes or addresses.
+/// The five qwords `AGXFirmware::initFirmwareData` writes at the head of the
+/// hardware-data object: `{range-3 base, range-3 size, GART window base, GART
+/// window base, reserved top-of-range-5 page}`.
+pub(crate) const HW_FIRMWARE_RANGE_HEAD: &[(usize, u64)] = &[
+    (0x00, 0x0000_006f_0000_0000),
+    (0x08, 0x0000_0000_ffc0_0000),
+    (0x10, 0x0000_0010_0000_0000),
+    (0x18, 0x0000_0010_0000_0000),
+    (0x20, 0x0000_02ff_ffff_8000),
+];
+
 pub(crate) const HW_REGISTER_MAP_OFFSET: usize = 0x640;
 pub(crate) const HW_REGISTER_MAP_ENTRY_SIZE: usize = 0x28;
 pub(crate) const HW_REGISTER_MAP_SLOTS: usize = 53;
@@ -2005,6 +2016,16 @@ pub(crate) fn encode_hw_data(
     required_address(sksm_qid_resource_high)?;
 
     out.fill(0);
+    // Native's `AGXFirmware::initFirmwareData` opens this object with five
+    // qwords that Linux has always left zero: the range-3 base and size, the
+    // architectural GART window base twice (Asahi's HwDataB calls the pair
+    // "USC start"), and the reserved page at the top of range 5. They are the
+    // only place the host tells the firmware side about 0x10_0000_0000, which
+    // is the base hardware folds into every compact TA/VDM pointer, so a zero
+    // here leaves USC-class units resolving bare offsets.
+    for (offset, value) in HW_FIRMWARE_RANGE_HEAD {
+        put_u64(out, *offset, *value);
+    }
     for window in windows {
         let base = HW_REGISTER_MAP_OFFSET + window.slot * HW_REGISTER_MAP_ENTRY_SIZE;
         put_u64(out, base, window.phys);

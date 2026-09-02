@@ -5171,7 +5171,7 @@ impl G17PLiveRuntime {
                         );
                         dev_info!(
                             pdev.as_ref(),
-                            "G17P render KSM counters post-doorbells poll={} TA[outstanding={:#018x},submitted={:#018x},completed={:#018x}] 3D[outstanding={:#018x},submitted={:#018x},completed={:#018x}] enabled-mask={:#018x}:{:#018x}\n",
+                            "G17P render KSM counters post-doorbells poll={} TA[outstanding={:#018x},submitted={:#018x},completed={:#018x}] 3D[outstanding={:#018x},submitted={:#018x},completed={:#018x}] enabled-mask={:#018x}:{:#018x} descriptor[TA]={:#018x} descriptor[3D]={:#018x}\n",
                             poll,
                             snapshot.qid_counters[0][0],
                             snapshot.qid_counters[0][1],
@@ -5181,6 +5181,8 @@ impl G17PLiveRuntime {
                             snapshot.qid_counters[1][2],
                             snapshot.queue_enabled[1],
                             snapshot.queue_enabled[0],
+                            snapshot.queue_descriptor[0],
+                            snapshot.queue_descriptor[1],
                         );
                         if let Some(usc) = snapshot.usc {
                             dev_info!(
