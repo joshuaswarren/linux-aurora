@@ -184,7 +184,7 @@ pub(crate) const G17P_KTRACE_ADD_KICKS_KEY: u16 = 0x0041;
 pub(crate) const G17P_KTRACE_PAUSE_REASON_KEY: u16 = 0x0046;
 
 /// Submission-path keys printed by default (`channel << 8 | code`).
-pub(crate) const G17P_KTRACE_INTEREST_KEYS: [u16; 14] = [
+pub(crate) const G17P_KTRACE_INTEREST_KEYS: [u16; 20] = [
     // Code 0x02 is emitted by the new-work IRQ handler (b1 `FUN_23004` at
     // 0x232dc) exactly where it creates the per-DM job state machine, which
     // is the only path to the DM0 launch strobe `sgx+0x1_c998 = 1`. It was
@@ -192,6 +192,19 @@ pub(crate) const G17P_KTRACE_INTEREST_KEYS: [u16; 14] = [
     // path was analysed on the false premise that firmware never creates a
     // job. Absence of 0x02 from a drain said only that nobody looked.
     0x0002, // firmware job creation (new-work IRQ)
+    // The 3D is launched by the TILING job's state machine, not on its own:
+    // new-work (code 2) -> FUN_15a48 strobes 0x1c998 -> IRQ bit 3 (code 3,
+    // tiling done) -> FUN_15608 -> FUN_162f8 patches the fragment's kick
+    // entry and sets descriptor bit 62 (code 0x58) -> state 4 strobes
+    // 0x1c9a0 = 2, the actual 3D launch (code 0x1c with a2=1). Every one of
+    // those was filtered out, so the sequence could not be followed and the
+    // point where it stops -- which names the gate -- was invisible.
+    0x0003, // tiling done (IRQ bit 3)
+    0x001c, // DM launch strobe: a2=0 phase 1, a2=1 the 3D launch
+    0x001f, // job waiting on a host reply to message type 6
+    0x0045, // queue resume request
+    0x0058, // FUN_162f8 released the 3D kick entry
+    0x0060, // job freed via the flist fast path
     0x000a, // stamp update / retire
     0x000c, // stamp update / retire
     0x000e, // stamp update / retire

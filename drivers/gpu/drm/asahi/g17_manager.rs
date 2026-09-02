@@ -3183,6 +3183,13 @@ impl G17PManagerConstruction {
             // fragment is never launched, so read that byte on both stages.
             storage.dump_descriptor_region(&dumpdev, "kind-TA", label, 0x0840, 0x40);
             storage.dump_descriptor_region(&dumpdev, "kind-3D", label, 0x4840, 0x40);
+            // b1 FUN_162f8, the 3D activation, is called as
+            // FUN_162f8(sku+0x79c, sku+0x7a8) from the TILING job's state 7:
+            // +0x79c names the fragment's QUEUE ID and +0x7a8 the fragment
+            // kick entry's index. It uses exactly those two to find the entry
+            // it patches, so if either is wrong in the tiling SKU the fragment
+            // is never released. Dump that window of the tiling record.
+            storage.dump_descriptor_region(&dumpdev, "link-TA", label, 0x0780, 0x40);
         }
         self.resources.dump_render_sksm_entry(true, label);
         self.resources.dump_render_sksm_entry(false, label);
