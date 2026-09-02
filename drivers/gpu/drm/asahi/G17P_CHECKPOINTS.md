@@ -42,10 +42,16 @@ Keep this list short and evidence-only. A build is not a hardware checkpoint.
   descriptor `+0x20f0`. On hardware `+0x20f0` and both 3D timestamps remain
   zero, consistent with the earlier state-1 callback stall.
 - Metal keeps the type-1 fragment descriptor's `+0x79c=0` and packed
-  `+0x7a8=0x042c0059` even while its actual 3D queue is QID 6 or 15. Its TA
-  descriptor instead links dynamically to that actual 3D QID/stamp. Linux now
-  matches the dynamic TA link and preserves the distinct QID-0 RCE coordinate;
-  constructing the native QID-0 owner is the active RE boundary.
+  `+0x7a8=0x042c0059` even while its actual 3D queue is QID 6 or 15. Kext RE
+  proves these are the reserved word and `{0x42c bytes, 0x59 records}` header
+  of an SKU register stream, not a KSM dependency. Its TA descriptor instead
+  links dynamically to the actual 3D QID/stamp, and Linux matches that link.
+- B1's bit-4 new-work handler registers the 0x9a0-byte TA descriptor read from
+  SGX `+0xc0f0`. FUN_14cd4 follows TA `+0x79c/+0x7a8`, writes the per-launch
+  slot/mode/strobe at `+0x10398/+0x10408/+0x1c998`, and the bit-3 completion
+  callback ultimately calls FUN_162f8 on the real 3D KSM entry. The current
+  boundary is before that callback chain: TA executes, while `+0x10408` stays
+  idle and 3D `+0x20f0` stays zero.
 
 ## Corrected claims
 
@@ -78,7 +84,8 @@ Keep this list short and evidence-only. A build is not a hardware checkpoint.
 
 ## Next experiment
 
-- Reconstruct Metal's distinct QID-0 RCE/PDM owner from the kext and B1
-  firmware. Determine how slot 89 is populated and what descriptor pointer
-  `FUN_162f8` expects there, then implement that owner in the kernel without
-  changing the native type-1 descriptor bytes.
+- On the automatic empty-parameter path, retain the firmware KTrace and sample
+  B1's exact bit-4/bit-3 IRQ status plus the new-work/completion sub-bitmaps,
+  launch slot/mode/strobe and TA descriptor link. Compare that state directly
+  with Metal's TA descriptor and firmware callback contract, then fix the first
+  mismatched producer or registration field in the kernel.

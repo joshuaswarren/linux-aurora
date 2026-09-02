@@ -6515,37 +6515,55 @@ impl G17PUserRenderStorage {
         })
     }
 
-    /// Read the descriptor-local PDM/RCE dependency coordinate exactly as B1
-    /// consumes it before 3D activation. The packed value is simultaneously
-    /// the first embedded register-array {byte_count, entry_count} word and a
-    /// 40-bit queue timeline target; keeping the read beside +0x20f0 makes a
-    /// failed proof distinguish "encoder did not change" from "changed but
-    /// rejected downstream" without requiring a full descriptor dump.
-    pub(crate) fn fragment_pdm_coordinate(&mut self) -> Result<(u32, u64, u64)> {
+    /// Read the two superficially similar but semantically distinct coordinate
+    /// sets at the TA-to-3D activation boundary.
+    ///
+    /// B1 registers the 0x9a0-byte TA record on the bit-4 new-work interrupt;
+    /// its +0x79c/+0x7a8 names the physical 3D KSM QID/stamp. FUN_14cd4 waits
+    /// for stamp-1 and FUN_162f8 later indexes that exact queue entry. The
+    /// type-1 3D record's +0x79c/+0x7a0/+0x7a8 instead forms an SKU register
+    /// stream header: reserved zero, stream pointer, and {0x42c bytes, 0x59
+    /// records}. It is not a QID-0/slot-89 dependency.
+    pub(crate) fn render_activation_coordinates(&mut self) -> Result<(u32, u64, u32, u64, u64)> {
         self.descriptors.with_bytes_mut(|raw| {
+            let tiling = raw.get(0x0000..0x4000).ok_or(ERANGE)?;
             let fragment = raw.get(0x4000..0x8000).ok_or(ERANGE)?;
-            let qid = u32::from_le_bytes(
+            let ta_qid = u32::from_le_bytes(
+                tiling
+                    .get(0x079c..0x07a0)
+                    .ok_or(ERANGE)?
+                    .try_into()
+                    .map_err(|_| ERANGE)?,
+            );
+            let ta_stamp = u64::from_le_bytes(
+                tiling
+                    .get(0x07a8..0x07b0)
+                    .ok_or(ERANGE)?
+                    .try_into()
+                    .map_err(|_| ERANGE)?,
+            );
+            let sku_reserved = u32::from_le_bytes(
                 fragment
                     .get(0x079c..0x07a0)
                     .ok_or(ERANGE)?
                     .try_into()
                     .map_err(|_| ERANGE)?,
             );
-            let rce_pointer = u64::from_le_bytes(
+            let sku_pointer = u64::from_le_bytes(
                 fragment
                     .get(0x07a0..0x07a8)
                     .ok_or(ERANGE)?
                     .try_into()
                     .map_err(|_| ERANGE)?,
             );
-            let packed = u64::from_le_bytes(
+            let sku_header = u64::from_le_bytes(
                 fragment
                     .get(0x07a8..0x07b0)
                     .ok_or(ERANGE)?
                     .try_into()
                     .map_err(|_| ERANGE)?,
             );
-            Ok((qid, rce_pointer, packed))
+            Ok((ta_qid, ta_stamp, sku_reserved, sku_pointer, sku_header))
         })
     }
 
