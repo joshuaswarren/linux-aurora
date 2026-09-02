@@ -2389,6 +2389,23 @@ pub(crate) const HW_DATA_OPAQUE_RUNS: &[(usize, &[u8])] = &[
         ],
     ),
     (0x0f04, &[0x1f]),
+    // NOTE, do not "fix" this by adding 0x0f08 without evidence. That u32 is
+    // the firmware's ISR mask selector: FUN_1e858 copies hw-data +0xf08 to
+    // DAT_1785f4 (store at b1 0x1e9e8), and FUN_215cc picks the interrupt
+    // enable word from it with
+    //     csel: DAT_1785f4 == 2 ? 0x0e00620038 : 0x0a00620038
+    // storing the result to DAT_179328, which the ISR at 0x216f0 ANDs against
+    // MMIO[0x10a10] to decide which interrupts to service. The field is absent
+    // here, so it reads zero and 0x10a08 measures 0x0a00620038 -- the variant
+    // without bit 34.
+    //
+    // TESTED 2026-09-02: writing 2 here does exactly what the disassembly
+    // says -- 0x10a08 measured 0x0e00620038, bit 34 enabled -- and changes
+    // nothing else. The render still stalls with bit 4 clear, no KTrace 2,
+    // fragment status 4. Reverted because there is no oracle saying this part
+    // is variant 2 and it alters firmware interrupt behaviour on a guess.
+    // Both variants already enable bits 3, 4 and 5, so neither withholds
+    // new-work.
     (0x0f24, &[0x04]),
     (0x0f34, &[0x01, 0x00, 0x00, 0x00, 0x01]),
     (0x0f4c, &[0x31]),
