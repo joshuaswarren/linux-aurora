@@ -1547,12 +1547,19 @@ pub(crate) fn apply_g17p_cold_opening_optional(
         // Native captures contain 1, 2 and 4. Linux reserves slot 2 and must
         // publish that same ID in ConfigUpdate, the qid*8 QoS record and the
         // KSM dependency-control qword.
-        // +0x62 is absent and +0x66 is 1, both measured on macOS 2026-09-02 by
-        // dumping the live ConfigUpdate record of a real Metal render pass
-        // (`records-gfx.txt`): the TA tag-15 reads +0x62 = 0x0000 and
-        // +0x66 = 0x0001. Setting +0x62 makes the firmware execute
-        // `0xd800 = 0x100; 0xd8f0 |= 1 << ctx` (b1 0x12378-0x1239c), a
-        // per-context GMMU-block write native never performs.
+        // Byte-diffed against live ConfigUpdate records from two independent
+        // Metal render passes on the target (macOS 2026-09-02,
+        // `records-gfx.txt` and `everyobj-gfx.txt`):
+        //
+        //   +0x66 = 1 in both.
+        //   +0x46 is written below as a u32 from the allocated FList hardware
+        //           buffer id; it reads 0 in one capture and 2 in the other,
+        //           so it is dynamic, not a constant.
+        //   +0x62 read 1 in one capture and 0 in the other, so it is dynamic,
+        //           not a constant; 1 is what this driver always sent and what
+        //           the majority of captured records carry. An earlier claim
+        //           that native always has 0 came from a single record and is
+        //           contradicted by the wider capture.
         G17PColdOpeningStage::Tiling => &[
             (0x18, queue_id),
             (0x1a, install),
@@ -1561,6 +1568,7 @@ pub(crate) fn apply_g17p_cold_opening_optional(
             (0x52, 1),
             (0x56, 2),
             (0x5e, 2),
+            (0x62, 1),
             (0x66, 1),
             (0x82, 1),
         ],
@@ -1573,6 +1581,7 @@ pub(crate) fn apply_g17p_cold_opening_optional(
             (0x52, 1),
             (0x56, 2),
             (0x5e, 2),
+            (0x62, 1),
             (0x66, 1),
         ],
     };
