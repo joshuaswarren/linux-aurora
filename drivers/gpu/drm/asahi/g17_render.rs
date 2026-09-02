@@ -1085,6 +1085,11 @@ pub(crate) fn build_ta_descriptor(
     put_u64(raw, 0x087a, parameters.sampler_array);
     put_u32(raw, 0x0882, parameters.sampler_count);
     put_u32(raw, 0x0886, sampler_max);
+    // TA descriptor +0x892 is a host-written constant 1. This driver's own
+    // render activation gate samples (+0x7a4, +0x866, +0x892, +0x8ba, +0x8cb)
+    // and has always reported +0x892 as 0 -- it sits between +0x886 and +0x932,
+    // both of which are written here, and was simply skipped.
+    put_u8(raw, 0x0892, 1);
     put_u8(raw, 0x0932, 0x44);
     put_u8(raw, 0x093c, 1);
     put_u8(raw, 0x094d, if parameters.native_pm_bytes { 3 } else { 1 });
@@ -1165,6 +1170,16 @@ pub(crate) fn build_fragment_descriptor(
 
     put_u64(raw, 0x40, parameters.tilemap);
     put_u64(raw, 0x48, parameters.multisample_control);
+    // Job state-machine selector. b1 `FUN_23004` reads the command record's
+    // +0x866 as a u32 and picks the state function with
+    //     0x23278 add x8,x23,#0x866 ; 0x2327c ldr w8,[x8] ; 0x23280 cmp w8,#3
+    //     0x23284 x16=0x14cd4 (tiling) ; 0x23294 x16=0x15bcc (fragment)
+    //     0x232a0 csel x8,x16,x8,eq
+    // so 3 selects the FRAGMENT machine and anything else selects the tiling
+    // one. This driver never wrote the field, so a fragment job would have been
+    // built with the tiling state machine. The TA's own +0x866 stays 0, which
+    // correctly selects tiling for it.
+    put_u32(raw, 0x0866, 3);
     put_u32(raw, 0x54, geometry.macro_size as u32);
     put_u32(raw, 0x68, parameters.merge_upper_x_bits);
     put_u32(raw, 0x6c, parameters.merge_upper_y_bits);
