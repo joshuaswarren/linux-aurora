@@ -454,6 +454,14 @@ const G17P_GDIRECTOR_SHADOW_LINK_BASE: u64 = 0xffff_fc00_0012_f560;
 const G17P_DM_ACTIVE_BITMAP_LINK_BASE: u64 = 0xffff_fc00_0012_8a30;
 /// Per-queue state, `0x127628 + qid*0x28` (written at fw `0x119b4`).
 const G17P_QUEUE_STATE_LINK_BASE: u64 = 0xffff_fc00_0012_7628;
+/// KSM park record, `0x58010 + qid*0x28`: byte A at +0x418, B at +0x419,
+/// C at +0x41a, deadline at +0x400. FW_PROVEN: the scheduler pass compares
+/// A and B at 0x13100 and PARKS the queue when they are equal -- KTrace 0x42,
+/// runnable bit cleared, then a status-4 NOP retire. A is written only by the
+/// admit block at 0x12e38 (which also zeroes B and C); B only by the retire
+/// path at 0xcf0c. Both start at zero, so a queue whose admit never ran is
+/// parked by construction. Nothing has ever read these bytes from the host.
+const G17P_KSM_PARK_RECORD_LINK_BASE: u64 = 0xffff_fc00_0005_8010;
 /// Ready mask (fw `0x11b5c`).
 const G17P_READY_MASK_LINK_BASE: u64 = 0xffff_fc00_0017_6ec0;
 /// `0x175aa0 + qid*0x28 + 0x40` (fw `0x11b3c`).
@@ -3305,6 +3313,53 @@ impl G17PManagerConstruction {
                     label,
                     rd(G17P_READY_MASK_LINK_BASE).unwrap_or(u64::MAX),
                 );
+                for qid in [4u64, 5, 6] {
+                    let park = G17P_KSM_PARK_RECORD_LINK_BASE + qid * 0x28;
+                    let counters = rd(park + 0x418);
+                    let deadline = rd(park + 0x400);
+                    // Same record through the SECOND ASC's data window. The
+                    // scheduler pass may not run on the ASC whose base the
+                    // other probes here use, and a per-queue deadline that
+                    // reads identically for every qid says this one does not.
+                    let rd1 = |link: u64| -> Option<u64> {
+                        let phys = G17P_GFX1_PHYSICAL_DATA_BASE
+                            + (link - G17P_GFX1_LINK_DATA_BASE);
+                        pgtable::LiveFirmwareU64Probe::new(phys)
+                            .and_then(|p| p.observe_mask(u64::MAX, 1))
+                            .map(|o| o.first)
+                            .ok()
+                    };
+                    let counters1 = rd1(park + 0x418);
+                    let deadline1 = rd1(park + 0x400);
+                    let raw1 = counters1.unwrap_or(u64::MAX);
+                    let dl1 = deadline1.unwrap_or(u64::MAX);
+                    dev_info!(
+                        dev.as_ref(),
+                        "G17P park-gfx1[{}] qid={} raw={:#018x} deadline={:#018x}\n",
+                        label,
+                        qid,
+                        raw1,
+                        dl1,
+                    );
+                    let raw = counters.unwrap_or(u64::MAX);
+                    let byte_a = raw & 0xff;
+                    let byte_b = (raw >> 8) & 0xff;
+                    let byte_c = (raw >> 16) & 0xff;
+                    let parked = byte_a == byte_b;
+                    let dl = deadline.unwrap_or(u64::MAX);
+                    dev_info!(
+                        dev.as_ref(),
+                        "G17P park[{}] qid={} A={} B={} C={} A==B(park)={} raw={:#018x} deadline={:#018x}\n",
+                        label,
+                        qid,
+                        byte_a,
+                        byte_b,
+                        byte_c,
+                        parked,
+                        raw,
+                        dl,
+                    );
+                }
                 for qid in [4u64, 5, 6] {
                     let st = rd(G17P_QUEUE_STATE_LINK_BASE + qid * 0x28);
                     let st2 = rd(G17P_QUEUE_STATE_LINK_BASE + qid * 0x28 + 8);
