@@ -2335,6 +2335,24 @@ pub(crate) fn check_firmware_root_gates(root: &[u8]) -> Result<(), InitdataError
 /// not; generated from the hardware-validated `g17p_initdata.py`
 /// `HWDATA_CONSTANTS`). 29 sparse runs, 269 bytes total. `+0x2630` is
 /// deliberately absent: it is firmware state, not host configuration.
+/// COMPARED AGAINST NATIVE 2026-09-02. macOS's own hardware-data block was
+/// located at `AGXArmFirmwareASC + 0x2b8` (identified by the 0x1f this table
+/// puts at +0x0f04, which it carries) and dumped whole; the capture is
+/// `/tmp/g17p-re/work/hwdata-gfx.txt`. Result:
+///
+///   * 14 of these 19 runs match native BYTE FOR BYTE.
+///   * 5 differ -- 0x0014, 0x00f4, 0x05d8, 0x0fb8, 0x2544 -- and every one of
+///     the 61 differing bytes is the same shape: we write a value, native
+///     reads 0x00 there.
+///   * +0x0f08, the ISR mask selector, is ZERO in native too, which confirms
+///     leaving it unset here is correct and that this part is not the
+///     `DAT_1785f4 == 2` variant.
+///
+/// Do NOT simply zero the five runs to "match the kext": tested, and the
+/// driver's own probe then fails with -22. Native reading zero at submit time
+/// does not mean those fields are never populated -- the block is live, and
+/// firmware or a later kext path may fill them. Any change here needs to
+/// establish WHEN native writes them, not just what it reads once.
 pub(crate) const HW_DATA_OPAQUE_RUNS: &[(usize, &[u8])] = &[
     (0x0004, &[0x6f, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0xff]),
     (
