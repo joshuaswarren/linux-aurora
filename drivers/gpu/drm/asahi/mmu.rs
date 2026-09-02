@@ -3570,29 +3570,6 @@ impl Uat {
         })
     }
 
-    /// Register the render app GART in the hardware context written to final
-    /// TA/3D command +0x0c. Native obtains this ID from
-    /// `AGXContextIDManager::alloc(gart, ...)`, calls
-    /// `AGXSecureGart::registerContextID`, and only then publishes the final
-    /// command. It is independent of the queue/tag-15 context and the MCache
-    /// aperture selector.
-    pub(crate) fn install_t8140_render_gart_context_alias(
-        &self,
-        bind: &VmBind,
-        context_id: usize,
-    ) -> Result {
-        let (low, high) = self.install_t8140_app_context_alias(bind, context_id)?;
-        dev_info!(
-            self.dev.as_ref(),
-            "MMU: render app-GART context {} roots low={:#x} high={:#x} (vm {})\n",
-            context_id,
-            low,
-            high,
-            bind.0.id,
-        );
-        Ok(())
-    }
-
     pub(crate) fn install_t8140_render_mcache_context_alias(
         &self,
         bind: &VmBind,

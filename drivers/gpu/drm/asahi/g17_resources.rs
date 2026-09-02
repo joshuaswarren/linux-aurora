@@ -2490,6 +2490,12 @@ impl G17PRenderUserAliases {
 
 #[cfg(not(test))]
 pub(crate) struct G17PUserRenderStorage {
+    /// Command GART shared by the final TA and 3D descriptors. Declare the
+    /// lease first so teardown retracts and invalidates its TTBAT root before
+    /// any of the mappings reachable through that root are destroyed. Native's
+    /// second AGXContextIDManager allocation is a refcounted lookup of this
+    /// same GART, not a second hardware context.
+    command_context: mmu::T8140AppContextLease,
     /// Render-only tail of the USC private-memory aperture.  Ordinary client
     /// VMs start with the 21-buffer compute closure; a render submission adds
     /// blocks 21..25 for the native 22-block initial pool plus four-block
@@ -2696,6 +2702,7 @@ fn build_g17p_late_tiling_bytes(
     descriptor: u64,
     graph: u64,
     optional_addresses: g17_submission::G17PColdOpeningOptionalAddresses,
+    ta_tag15_context_id: u16,
     submission_ordinal: u32,
     entry_stamp: u32,
     tag16: bool,
@@ -2746,7 +2753,7 @@ fn build_g17p_late_tiling_bytes(
         g17p_render_generation_bias_enabled(),
         g17p_render_queue_id(true),
         g17p_render_install(true),
-        g17p_render_context_id(true) as u16,
+        ta_tag15_context_id,
         &mut bytes.optional,
     )?;
     g17_submission::apply_g17p_retained_event_with_stamp(
@@ -3746,34 +3753,13 @@ pub(crate) fn g17p_render_queue_id(tiling: bool) -> u16 {
     }
 }
 
-/// Tag-15 install flag for one stage. WITNESSED: native publishes install=1 on
-/// TA and install=0 on 3D in the same submission; we have always sent 1 on
-/// both, and `0x40 tag15-programmed` is emitted only for a non-zero install.
-pub(crate) fn g17p_render_install(tiling: bool) -> u16 {
-    if tiling {
-        1
-    } else {
-        *crate::module_parameters::g17p_render_3d_install.value() as u16
-    }
-}
-
-/// Default Linux-owned app-GART hardware context. Native allocates one ID from
-/// `AGXContextIDManager`, registers the command GART in that TTBAT slot, and
-/// copies the same ID into final TA/3D +0x0c and both tag-15 records +0x32.
-/// Linux's sole bound render VM already owns rooted context 1. A coherent
-/// context-2 hardware discriminator produced the identical dIPP fault quartet,
-/// so context selection is not the cause and the native-shaped default is 1.
-pub(crate) const G17P_RENDER_GART_CONTEXT_ID: u32 = 1;
-
-/// Value written to final descriptor +0x0c and tag-15 +0x32. Pre-submit
-/// descriptor captures carrying 1 predate `AGX*ChannelSKSM::submitBuffer`'s
-/// overwrite and are not the hardware GART context.
-pub(crate) fn g17p_render_context_id(_tiling: bool) -> u32 {
-    if *crate::module_parameters::g17p_render_context_id.value() == 0 {
-        G17P_RENDER_GART_CONTEXT_ID
-    } else {
-        2
-    }
+/// First-bind flag for a newly allocated render queue. Kext RE sources this
+/// from descriptor lifecycle state, not stage identity. Captured native 3D
+/// queues can carry zero because the queue already exists; Linux QIDs 0/1 are
+/// fresh here and must be installed once. `apply_g17p_retained_optional`
+/// clears the flag automatically after submission zero.
+pub(crate) fn g17p_render_install(_tiling: bool) -> u16 {
+    1
 }
 
 /// Convert the validated UAPI fragment write ranges into the exact packed
@@ -4414,6 +4400,7 @@ impl G17PUserRenderStorage {
         owner_pid: u32,
         user_timestamps: [u64; 4],
         user_timestamp_aliases: KVec<mmu::KernelMapping>,
+        command_context: mmu::T8140AppContextLease,
     ) -> Result<Self> {
         macro_rules! bootstrap_stage {
             ($name:literal, $expression:expr) => {
@@ -4431,6 +4418,8 @@ impl G17PUserRenderStorage {
                 }
             };
         }
+
+        let command_context_id = command_context.context_id();
 
         // The render context peers ARE the two render queues' SKSM entry
         // regions: their low VAs are what the render tag-15 ConfigUpdate
@@ -5087,7 +5076,7 @@ impl G17PUserRenderStorage {
             g17_render::build_cold_opening_ta_descriptor(
                 &translated.parameters,
                 tiling_objects,
-                g17p_render_context_id(true),
+                command_context_id,
                 translated.parameters.ta_hardware_buffer_id,
                 tiling,
             )
@@ -5105,7 +5094,7 @@ impl G17PUserRenderStorage {
             g17_render::build_cold_opening_fragment_descriptor(
                 &translated.parameters,
                 objects,
-                g17p_render_context_id(false),
+                command_context_id,
                 fragment,
             )
             .map_err(|error| render_build_fail_named(18, error))?;
@@ -5161,7 +5150,7 @@ impl G17PUserRenderStorage {
                 dev_info!(
                     dev.as_ref(),
                     "G17P ta-desc bootstrap context={} ordinal=0 low_va={:#x} bytes={:#x}\n",
-                    g17p_render_context_id(true),
+                    command_context_id,
                     G17P_BOOTSTRAP_TA_DESCRIPTOR_LOW_VA,
                     g17_render::TA_DESCRIPTOR_SIZE,
                 );
@@ -5179,7 +5168,7 @@ impl G17PUserRenderStorage {
                 dev_info!(
                     dev.as_ref(),
                     "G17P 3d-desc bootstrap context={} ordinal=0 low_va={:#x} bytes={:#x}\n",
-                    g17p_render_context_id(false),
+                    command_context_id,
                     descriptor_3d_render_va,
                     g17_render::FRAGMENT_DESCRIPTOR_SIZE,
                 );
@@ -5284,6 +5273,7 @@ impl G17PUserRenderStorage {
             ta_hardware_buffer_id: translated.parameters.ta_hardware_buffer_id,
             owner_pid,
             lifecycle_predecessor,
+            command_context,
         })
     }
 
@@ -5512,7 +5502,7 @@ impl G17PUserRenderStorage {
                 &translated.parameters,
                 tiling_objects,
                 g17_render::RenderDescriptorMetadata {
-                    context_id: g17p_render_context_id(true),
+                    context_id: self.command_context.context_id(),
                     submission_ordinal,
                     ta_hardware_buffer_id: translated.parameters.ta_hardware_buffer_id,
                     submit_sequence: submission_ordinal as u64 * 2 + 1,
@@ -5534,7 +5524,7 @@ impl G17PUserRenderStorage {
                 &translated.parameters,
                 objects,
                 g17_render::RenderDescriptorMetadata {
-                    context_id: g17p_render_context_id(false),
+                    context_id: self.command_context.context_id(),
                     submission_ordinal,
                     ta_hardware_buffer_id: 0,
                     submit_sequence: submission_ordinal as u64 * 2,
@@ -6375,7 +6365,7 @@ impl G17PUserRenderStorage {
                 g17p_render_generation_bias_enabled(),
                 g17p_render_queue_id(false),
                 g17p_render_install(false),
-                g17p_render_context_id(false) as u16,
+                self.command_context.context_id() as u16,
                 &mut raw[Self::FRAGMENT_OPTIONAL
                     ..Self::FRAGMENT_OPTIONAL + g17_submission::G17P_COLD_OPENING_OPTIONAL_SIZE],
             )
@@ -6457,7 +6447,7 @@ impl G17PUserRenderStorage {
             dev_info!(
                 dev.as_ref(),
                 "G17P 3d-desc submit-ready context={} ordinal={} low_va={:#x} bytes={:#x}\n",
-                g17p_render_context_id(false),
+                self.command_context.context_id(),
                 submission_ordinal,
                 descriptor_3d_render_va,
                 g17_render::FRAGMENT_DESCRIPTOR_SIZE,
@@ -6588,7 +6578,7 @@ impl G17PUserRenderStorage {
                 g17p_render_generation_bias_enabled(),
                 g17p_render_queue_id(false),
                 g17p_render_install(false),
-                g17p_render_context_id(false) as u16,
+                self.command_context.context_id() as u16,
                 &mut raw[Self::FRAGMENT_OPTIONAL
                     ..Self::FRAGMENT_OPTIONAL + g17_submission::G17P_COLD_OPENING_OPTIONAL_SIZE],
             )
@@ -6666,6 +6656,7 @@ impl G17PUserRenderStorage {
             g17_submission::G17P_COLD_OPENING_TA_DESCRIPTOR_BASE,
             graph_va,
             self.optional_addresses(true),
+            self.command_context.context_id() as u16,
             submission_ordinal,
             entry_stamp,
             g17p_render_tag16_enabled(),
@@ -11280,6 +11271,17 @@ impl G17ResourceOwner {
         let render_operand_aliases = self.stage_user_render_flist(vm)?;
         self.stage_render_uma_page_pool_descriptor()?;
         let parameter_page_list_vas = self.parameter_buffer_page_list_vas();
+        let render_bind = self.address_space.uat.bind(vm)?;
+        let command_context = self
+            .address_space
+            .uat
+            .allocate_t8140_app_context(&render_bind)?;
+        dev_info!(
+            dev.as_ref(),
+            "G17P render app-GART allocation: shared TA/3D command context {} (vm {})\n",
+            command_context.context_id(),
+            render_bind.vm_id(),
+        );
         let mut storage = G17PUserRenderStorage::new(
             dev,
             &self.address_space.uat,
@@ -11293,6 +11295,7 @@ impl G17ResourceOwner {
             owner_pid,
             user_timestamps,
             user_timestamp_aliases,
+            command_context,
         )?;
         storage.render_operand_aliases = render_operand_aliases;
         self.stage_render_parameter_buffer_page_list(&mut storage)?;
@@ -12214,28 +12217,17 @@ impl G17ResourceOwner {
             .copy_from_slice(&prepared.fragment.slot);
         let render_bind = if let Some(vm) = render_vm {
             let bind = self.address_space.uat.bind(vm)?;
-            let render_context_id = g17p_render_context_id(false) as usize;
-            self.address_space
-                .uat
-                .install_t8140_render_gart_context_alias(&bind, render_context_id)?;
+            // G17PUserRenderStorage owns two native-style dynamic app-GART
+            // leases already rooted against this binding. Do not overwrite a
+            // fixed context here: descriptor and tag-15 IDs come from those
+            // leases, exactly as AGXContextIDManager allocates them.
             let mcache_hwsid = *crate::module_parameters::g17p_render_mcache_hwsid.value();
             let mcache_selector =
                 *crate::module_parameters::g17p_render_mcache_selector.value() as usize;
-            if mcache_hwsid != 0
-                && matches!(mcache_selector, 2 | 3)
-                && mcache_selector != render_context_id
-            {
+            if mcache_hwsid != 0 && matches!(mcache_selector, 2 | 3) {
                 self.address_space
                     .uat
                     .install_t8140_render_mcache_context_alias(&bind, mcache_selector)?;
-            } else if mcache_hwsid != 0
-                && mcache_selector == render_context_id
-            {
-                dev_info!(
-                    self.dev.as_ref(),
-                    "G17P render MCache selector {} reuses rooted app-GART context\n",
-                    mcache_selector,
-                );
             }
             Some(bind)
         } else if context_already_bound {
@@ -13531,7 +13523,7 @@ mod tests {
         // An address-construction error occurs before any publication and
         // cannot change the early 3D-visible bytes.
         assert!(
-            build_g17p_late_tiling_bytes(descriptor, u64::MAX, addresses, 0, 1, false, false)
+            build_g17p_late_tiling_bytes(descriptor, u64::MAX, addresses, 6, 0, 1, false, false)
                 .is_err()
         );
         assert!(graph[G17P_USER_TILING_RING..G17P_USER_TILING_RING + 24]
@@ -13541,7 +13533,7 @@ mod tests {
         assert_eq!(get_u32(&support, G17P_RENDER_SHARED_CONTROL_INNER), 1);
 
         let late =
-            build_g17p_late_tiling_bytes(descriptor, graph_va, addresses, 0, 1, false, false)
+            build_g17p_late_tiling_bytes(descriptor, graph_va, addresses, 6, 0, 1, false, false)
                 .unwrap();
         late.apply(&mut graph, &mut support);
         assert_eq!(get_u64(&graph, G17P_USER_TILING_RING), descriptor);
@@ -13554,12 +13546,13 @@ mod tests {
             graph_va + G17P_USER_TILING_EVENT as u64
         );
         assert_eq!(get_u32(&graph, G17P_USER_TILING_POINTERS + 0x40), 3);
+        assert_eq!(get_u32(&graph, G17P_USER_TILING_OPTIONAL + 0x32), 6);
         assert_eq!(get_u32(&graph, G17P_USER_TILING_EVENT + 0x08), 0x102);
         assert_eq!(get_u32(&support, G17P_RENDER_POOL_A_SLOTS + 4), 2);
         assert_eq!(get_u32(&support, G17P_RENDER_SHARED_CONTROL_INNER), 2);
 
         let retained =
-            build_g17p_late_tiling_bytes(descriptor, graph_va, addresses, 1, 2, false, false)
+            build_g17p_late_tiling_bytes(descriptor, graph_va, addresses, 6, 1, 2, false, false)
                 .unwrap();
         retained.apply(&mut graph, &mut support);
         assert_eq!(get_u32(&graph, G17P_USER_TILING_EVENT + 0x08), 0x202);
@@ -13569,13 +13562,13 @@ mod tests {
         let mut native_support = vec![0u8; G17P_RENDER_SUPPORT_SIZE];
         put_u32(&mut native_support, G17P_RENDER_POOL_A_SLOTS + 8, 1);
         let native_first =
-            build_g17p_late_tiling_bytes(descriptor, graph_va, addresses, 0, 1, false, true)
+            build_g17p_late_tiling_bytes(descriptor, graph_va, addresses, 6, 0, 1, false, true)
                 .unwrap();
         native_first.apply(&mut graph, &mut native_support);
         assert_eq!(get_u32(&native_support, G17P_RENDER_POOL_A_SLOTS + 4), 0);
         assert_eq!(get_u32(&native_support, G17P_RENDER_POOL_A_SLOTS + 8), 2);
         let native_retained =
-            build_g17p_late_tiling_bytes(descriptor, graph_va, addresses, 1, 2, false, true)
+            build_g17p_late_tiling_bytes(descriptor, graph_va, addresses, 6, 1, 2, false, true)
                 .unwrap();
         assert_eq!(native_retained.pool_a_slot_offset, retained.pool_a_slot_offset);
     }
@@ -13595,7 +13588,7 @@ mod tests {
             ta_hardware_buffer_id: 0,
         };
         let late =
-            build_g17p_late_tiling_bytes(descriptor, graph_va, addresses, 0, 1, true, false)
+            build_g17p_late_tiling_bytes(descriptor, graph_va, addresses, 6, 0, 1, true, false)
                 .unwrap();
         let mut graph = vec![0u8; G17P_RENDER_QUEUE_GRAPH_SIZE];
         let mut support = vec![0u8; G17P_RENDER_SUPPORT_SIZE];
