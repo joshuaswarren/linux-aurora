@@ -3017,9 +3017,9 @@ impl G17PComputeDescriptorStorage {
     /// maintenance has been issued AND polled to completion. Zeroing the word
     /// first is what turns "non-zero" into "written for this submission" --
     /// the same discipline `clear_compute_completion` applies to the KSM
-    /// record, and necessary here for the same reason: with
-    /// `g17p_repeat_ordinal=0` every submission programs the SAME stamp value,
-    /// so the value alone cannot distinguish submissions.
+    /// record, and necessary here for the same reason: retained submissions
+    /// program the same descriptor stamp value, so the value alone cannot
+    /// distinguish submissions.
     ///
     /// The firmware only ever STORES to this word (`str w22, [x26]`), so
     /// clearing it cannot disturb anything in flight.
@@ -3287,9 +3287,8 @@ impl G17PComputeDescriptorStorage {
                 channel_control,
                 // A repeat is by definition not a first bind, so the install
                 // flag is clear -- which is also what every captured macOS
-                // submission sends. `g17p_tag15_install=1` forces it back on
-                // for both paths, to bisect against the pre-gate behaviour.
-                *crate::module_parameters::g17p_tag15_install.value() == 1,
+                // steady-state submission sends.
+                false,
             )
             .map_err(|_| EINVAL)
         })?;
