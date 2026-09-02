@@ -5077,7 +5077,7 @@ impl G17PLiveRuntime {
                         );
                         dev_info!(
                             pdev.as_ref(),
-                            "G17P render KSM scheduler post-doorbells poll={} pause=[request={:#018x},status={:#018x}] stop-request=[{:#018x},{:#018x}] stopped=[{:#018x},{:#018x}] scheduler-status={:#018x} work-channels=[{:#018x},{:#018x},{:#018x},{:#018x}] producers16=[{:#x},{:#x},{:#x},{:#x}]\n",
+                            "G17P render KSM scheduler post-doorbells poll={} pause=[request={:#018x},status={:#018x}] stop-request=[{:#018x},{:#018x}] stopped=[{:#018x},{:#018x}] resource=[clear={:#018x}:{:#018x},go={:#018x}:{:#018x},callback={:#018x}] scheduler-status={:#018x} work-channels=[{:#018x},{:#018x},{:#018x},{:#018x}] producers16=[{:#x},{:#x},{:#x},{:#x}]\n",
                             poll,
                             snapshot.scheduling_pause_request,
                             snapshot.scheduling_pause_status,
@@ -5085,6 +5085,11 @@ impl G17PLiveRuntime {
                             snapshot.queue_stop_request[1],
                             snapshot.queue_stopped[0],
                             snapshot.queue_stopped[1],
+                            snapshot.resource_clear[1],
+                            snapshot.resource_clear[0],
+                            snapshot.resource_go[1],
+                            snapshot.resource_go[0],
+                            snapshot.resource_callback_state,
                             snapshot.scheduler_status,
                             snapshot.work_channel_status[0],
                             snapshot.work_channel_status[1],
