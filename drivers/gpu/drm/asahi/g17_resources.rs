@@ -3739,8 +3739,12 @@ pub(crate) const fn g17p_render_queue_id(tiling: bool) -> u16 {
 /// queues can carry zero because the queue already exists; Linux QIDs 0/1 are
 /// fresh here and must be installed once. `apply_g17p_retained_optional`
 /// clears the flag automatically after submission zero.
-pub(crate) fn g17p_render_install(_tiling: bool) -> u16 {
-    1
+pub(crate) fn g17p_render_install(tiling: bool) -> u16 {
+    match *crate::module_parameters::g17p_render_no_install.value() {
+        1 if tiling => 0,
+        2 => 0,
+        _ => 1,
+    }
 }
 
 /// Convert the validated UAPI fragment write ranges into the exact packed
