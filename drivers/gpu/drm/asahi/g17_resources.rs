@@ -2548,6 +2548,7 @@ pub(crate) struct G17PUserRenderStorage {
     timestamps: MappedObject,
     user_timestamp_aliases: KVec<mmu::KernelMapping>,
     fragment_mcache: Option<g17_submission::G17PClMcacheAperture>,
+    tiling_mcache: Option<g17_submission::G17PClMcacheAperture>,
     /// HardwareBufferID owned by the currently staged TA command.  Retained
     /// storage can outlive a command, so restaging replaces this together with
     /// the descriptors before the next tag-15 record is built.
@@ -3749,6 +3750,7 @@ fn apply_g17p_fragment_mcache(
     fragment_internal_address: u64,
     fragment_internal_size: u64,
     descriptor_low: u64,
+    mcache_offset: usize,
     fragment: &mut [u8],
 ) -> Result<Option<g17_submission::G17PClMcacheAperture>> {
     let hwsid = *crate::module_parameters::g17p_render_mcache_hwsid.value();
@@ -3787,7 +3789,7 @@ fn apply_g17p_fragment_mcache(
     let table_size = count
         .checked_mul(g17_render::G17P_MCACHE_MAPPING_SIZE)
         .ok_or(EOVERFLOW)?;
-    let table_end = g17_render::G17P_FRAGMENT_MCACHE_OFFSET
+    let table_end = mcache_offset
         .checked_add(table_size)
         .ok_or(EOVERFLOW)?;
     if table_end > fragment.len() {
@@ -3816,7 +3818,7 @@ fn apply_g17p_fragment_mcache(
                 },
             )
             .map_err(|_| EINVAL)?;
-            let offset = g17_render::G17P_FRAGMENT_MCACHE_OFFSET
+            let offset = mcache_offset
                 + index * g17_render::G17P_MCACHE_MAPPING_SIZE;
             fragment[offset..offset + mapping.len()].copy_from_slice(&mapping);
             Ok(())
@@ -3865,8 +3867,7 @@ fn apply_g17p_fragment_mcache(
     }
 
     Ok(Some(g17_submission::G17PClMcacheAperture {
-        address: descriptor_low
-            + g17_render::G17P_FRAGMENT_MCACHE_OFFSET as u64,
+        address: descriptor_low + mcache_offset as u64,
         index: 0,
         count: u8::try_from(count).map_err(|_| EOVERFLOW)?,
     }))
@@ -4487,6 +4488,10 @@ impl G17PUserRenderStorage {
 
     pub(crate) fn fragment_mcache(&self) -> Option<g17_submission::G17PClMcacheAperture> {
         self.fragment_mcache
+    }
+
+    pub(crate) fn tiling_mcache(&self) -> Option<g17_submission::G17PClMcacheAperture> {
+        self.tiling_mcache
     }
 
     pub(crate) fn descriptor_low_va(&self, tiling: bool) -> u64 {
@@ -5251,7 +5256,7 @@ impl G17PUserRenderStorage {
             fragment_rce_va + 3 * g17_render::G17P_FRAGMENT_RCE_PROGRAM_STRIDE,
             g17_render::G17P_FRAGMENT_RCE_PROGRAM_STRIDE,
         );
-        let fragment_mcache = bootstrap_stage!("descriptor encoding", descriptors.with_bytes_mut(|raw| {
+        let (fragment_mcache, tiling_mcache) = bootstrap_stage!("descriptor encoding", descriptors.with_bytes_mut(|raw| {
             let (tiling, fragment) = raw.split_at_mut(0x4000);
             g17_render::build_cold_opening_ta_descriptor(
                 &translated.parameters,
@@ -5327,7 +5332,19 @@ impl G17PUserRenderStorage {
                 translated.parameters.aux_fb,
                 G17P_RENDER_STATE_AUX_FB_SIZE as u64,
                 descriptor_3d_render_va,
+                g17_render::G17P_FRAGMENT_MCACHE_OFFSET,
                 fragment,
+            )?;
+            // The kext runs `mcacheApertureBufferSetup` for the TA as well as
+            // the 3D; this driver has only ever built the fragment's table, so
+            // the tiler's kick entry carries neither word1 nor header bit 58.
+            let tiling_mcache = apply_g17p_fragment_mcache(
+                &translated.fragment_attachments,
+                translated.parameters.aux_fb,
+                G17P_RENDER_STATE_AUX_FB_SIZE as u64,
+                G17P_BOOTSTRAP_TA_DESCRIPTOR_LOW_VA,
+                g17_render::G17P_TILING_MCACHE_OFFSET,
+                tiling,
             )?;
             if *crate::module_parameters::g17p_render_dump_descriptor.value() != 0 {
                 dev_info!(
@@ -5367,7 +5384,7 @@ impl G17PUserRenderStorage {
                     );
                 }
             }
-            Ok(fragment_mcache)
+            Ok((fragment_mcache, tiling_mcache))
         }));
         dev_info!(
             dev.as_ref(),
@@ -5453,6 +5470,7 @@ impl G17PUserRenderStorage {
             timestamps,
             user_timestamp_aliases,
             fragment_mcache,
+            tiling_mcache,
             ta_hardware_buffer_id: translated.parameters.ta_hardware_buffer_id,
             owner_pid,
             lifecycle_predecessor,
@@ -5763,6 +5781,7 @@ impl G17PUserRenderStorage {
                 translated.parameters.aux_fb,
                 G17P_RENDER_STATE_AUX_FB_SIZE as u64,
                 descriptor_3d_render_va,
+                g17_render::G17P_FRAGMENT_MCACHE_OFFSET,
                 fragment,
             )
         })?;

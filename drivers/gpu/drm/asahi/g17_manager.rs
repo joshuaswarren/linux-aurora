@@ -2471,15 +2471,12 @@ impl G17PManagerConstruction {
         // leaves host AGX3DCommandDescriptor +0xaa8 count zero, so bit58 and
         // KSM entry +0x08 must remain clear. Keep the historical coupling only
         // as an explicit diagnostic.
-        let mcache = if tiling
-            || *crate::module_parameters::g17p_render_ksm_mcache.value() == 0
-        {
+        let mcache = if *crate::module_parameters::g17p_render_ksm_mcache.value() == 0 {
             None
+        } else if tiling {
+            self.render_storage.as_ref().ok_or(ENODEV)?.tiling_mcache()
         } else {
-            self.render_storage
-                .as_ref()
-                .ok_or(ENODEV)?
-                .fragment_mcache()
+            self.render_storage.as_ref().ok_or(ENODEV)?.fragment_mcache()
         };
         let empty_binding = g17_submission::G17PClRceBinding { address: 0, tag: 0 };
         let command_state = if minimal {
