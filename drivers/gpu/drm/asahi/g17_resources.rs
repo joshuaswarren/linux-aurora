@@ -9901,6 +9901,51 @@ impl G17ResourceOwner {
             return Ok(stats);
         }
 
+        // The consumer is already level with the producer by the time any
+        // render checkpoint runs -- the event worker services this ring during
+        // the submit -- so a cursor-driven walk reports pending=0 and reads
+        // nothing, and the records that actually described the render are
+        // never seen. They are still in DRAM: dump the slots ending at the
+        // producer regardless of the cursor, so a stalled render can be read
+        // after the fact.
+        {
+            let capacity = g17_completion::G17P_EVENT_CAPACITY;
+            let size = g17_completion::G17P_EVENT_ENTRY_SIZE;
+            let history = if capacity < 8 { capacity } else { 8 };
+            for back in (1..=history).rev() {
+                let slot = (producer + capacity - back) & (capacity - 1);
+                let record_address = ring
+                    .checked_add((slot as usize * size) as u64)
+                    .ok_or(EINVAL)?;
+                let record_offset = record_address
+                    .checked_sub(self.ktrace_object(role).iova())
+                    .ok_or(EINVAL)? as usize;
+                let record_end = record_offset.checked_add(size).ok_or(EINVAL)?;
+                let mut raw = [0u8; g17_completion::G17P_EVENT_ENTRY_SIZE];
+                if self
+                    .ktrace_object(role)
+                    .with_bytes_mut(|bytes| {
+                        raw.copy_from_slice(bytes.get(record_offset..record_end).ok_or(EINVAL)?);
+                        Ok(())
+                    })
+                    .is_err()
+                {
+                    continue;
+                }
+                if raw.iter().all(|byte| *byte == 0) {
+                    continue;
+                }
+                dev_info!(
+                    self.dev().as_ref(),
+                    "G17P report[{}] history slot {} type={:#04x}: {:02x?}\n",
+                    role_name,
+                    slot,
+                    raw[0],
+                    &raw[..],
+                );
+            }
+        }
+
         let mut budget = g17_completion::G17P_EVENT_CAPACITY;
         while consumer != producer && budget > 0 {
             budget -= 1;
