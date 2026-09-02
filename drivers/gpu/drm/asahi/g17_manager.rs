@@ -3177,6 +3177,12 @@ impl G17PManagerConstruction {
             storage.dump_graph_region(&dumpdev, "evt-3D", label, 0x3600, 0x40);
             storage.dump_descriptor_region(&dumpdev, "desc-TA", label, 0x0000, 0x200);
             storage.dump_descriptor_region(&dumpdev, "desc-3D", label, 0x4000, 0x200);
+            // b1 FUN_23004 selects the RENDER job state machine (FUN_15bcc,
+            // which ends at the DM launch strobe FUN_15a48 -> 0x1c998 = 1)
+            // when the command it builds the job from has +0x866 == 3. The
+            // fragment is never launched, so read that byte on both stages.
+            storage.dump_descriptor_region(&dumpdev, "kind-TA", label, 0x0840, 0x40);
+            storage.dump_descriptor_region(&dumpdev, "kind-3D", label, 0x4840, 0x40);
         }
         self.resources.dump_render_sksm_entry(true, label);
         self.resources.dump_render_sksm_entry(false, label);
