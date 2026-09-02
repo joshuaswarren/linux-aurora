@@ -453,6 +453,9 @@ pub(crate) const CONTROL_SHARED_INNER_PRESENTED: u64 = 2;
 pub(crate) const PARTIAL_OPENING_CONTROL_SHARED_ADDRESS: u64 = 0xffff_fc20_c082_8000;
 pub(crate) const PARTIAL_OPENING_CONTROL_SHARED_INNER_ADDRESS: u64 =
     0xffff_fc20_0160_0000;
+/// Hardware-proven compact compute cursor. Twenty-one consecutive run qwords
+/// occupy slots 0..20 and the next eight-qword boundary is 0x18.
+pub(crate) const COMPUTE_PARTIAL_OPENING_CONTROL_SHARED_CURSOR_BEFORE: u32 = 0x18;
 /// Initial compact FList cursor in qwords.
 ///
 /// `AGXUSCPrivMemFList::prepareBufferResources` encodes one 1-MiB run for
@@ -991,6 +994,46 @@ pub(crate) fn encode_partial_opening_control_shared(
         out,
         CONTROL_SHARED_CURSOR_OFFSET,
         PARTIAL_OPENING_CONTROL_SHARED_CURSOR_BEFORE,
+    );
+    put_u64(
+        out,
+        0x4c,
+        PARTIAL_OPENING_CONTROL_SHARED_INNER_ADDRESS,
+    );
+    Ok(())
+}
+
+/// Encode the hardware-proven compute form of the compact class-2 object.
+///
+/// This is deliberately separate from the render UMA form above. Compute's
+/// successful opening uses 21 compact consecutive run descriptors, a cursor of
+/// 0x18 and the original unallocated HardwareBufferID sentinel. Substituting
+/// render's 22-block plus asynchronous-grow state makes compute retire without
+/// executing.
+pub(crate) fn encode_compute_partial_opening_control_shared(
+    out: &mut [u8],
+) -> Result<(), InitdataError> {
+    if out.len() != CONTROL_SHARED_OBJECT_SIZE {
+        return Err(InitdataError::BufferSize);
+    }
+    out.fill(0);
+    put_u32(out, 0x08, u32::MAX);
+    for (offset, value) in [
+        (0x00, 0x0000_0000_0000_0001),
+        (0x10, 0x0000_0000_0000_0002),
+        (0x18, 0x0004_0000_0000_0070),
+        (0x20, 0x0000_1900_0000_0000),
+        (0x28, 0x0000_1900_0000_0000),
+        (0x30, CONTROL_OPERAND_TABLE_ADDRESS),
+        (0x40, 0x0000_0000_0000_0004),
+        (0x60, 0x0000_0000_0000_0003),
+    ] {
+        put_u64(out, offset, value);
+    }
+    put_u32(
+        out,
+        CONTROL_SHARED_CURSOR_OFFSET,
+        COMPUTE_PARTIAL_OPENING_CONTROL_SHARED_CURSOR_BEFORE,
     );
     put_u64(
         out,
@@ -3317,6 +3360,29 @@ mod tests {
         assert_eq!(get_u64(&shared, 0x4c), CONTROL_SHARED_INNER_ADDRESS);
         assert_eq!(get_u64(&shared, 0x60), 2);
         assert_eq!(CONTROL_SHARED_INNER_PRESENTED, 2);
+    }
+
+    #[test]
+    fn compute_partial_support_preserves_hardware_proven_compact_state() {
+        let mut shared = vec![0; CONTROL_SHARED_OBJECT_SIZE];
+        encode_compute_partial_opening_control_shared(&mut shared).unwrap();
+
+        assert_eq!(get_u64(&shared, 0x00), 1);
+        assert_eq!(get_u32(&shared, 0x08), u32::MAX);
+        assert_eq!(get_u64(&shared, 0x10), 2);
+        assert_eq!(get_u64(&shared, 0x20), 0x0000_1900_0000_0000);
+        assert_eq!(get_u64(&shared, 0x28), 0x0000_1900_0000_0000);
+        assert_eq!(get_u64(&shared, 0x30), CONTROL_OPERAND_TABLE_ADDRESS);
+        assert_eq!(
+            get_u32(&shared, CONTROL_SHARED_CURSOR_OFFSET),
+            COMPUTE_PARTIAL_OPENING_CONTROL_SHARED_CURSOR_BEFORE
+        );
+        assert_eq!(COMPUTE_PARTIAL_OPENING_CONTROL_SHARED_CURSOR_BEFORE, 0x18);
+        assert_eq!(
+            get_u64(&shared, 0x4c),
+            PARTIAL_OPENING_CONTROL_SHARED_INNER_ADDRESS
+        );
+        assert_eq!(get_u64(&shared, 0x60), 3);
     }
 
     #[test]
