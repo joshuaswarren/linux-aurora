@@ -3156,6 +3156,12 @@ impl G17PManagerConstruction {
         queue.storage.log_entry(label, &dev, stride);
     }
 
+    /// DIAGNOSTIC. Release the fragment's parent link (see
+    /// `g17p_release_fragment_parent`).
+    pub(crate) fn release_fragment_parent(&mut self, index: usize) -> Result<(u32, u32)> {
+        self.resources.g17p_release_fragment_parent(index)
+    }
+
     pub(crate) fn log_render_sksm_entries(&mut self, label: &str) {
         let strides = match self.render_sksm.as_ref() {
             Some(queues) => [
