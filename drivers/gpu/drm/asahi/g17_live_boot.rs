@@ -3689,6 +3689,27 @@ impl G17PLiveRuntime {
                     Err(recovery_error) => Err(recovery_error),
                 };
             }
+            if *module_parameters::g17p_irq_burst.value() != 0 {
+                if let Some(registers) = self.registers.as_ref() {
+                    let mut seen = [(0u64, 0u64, 0u64); 12];
+                    match registers.g17p_burst_sample_irq(&mut seen) {
+                        Ok(n) => dev_info!(
+                            self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                            "G17P render IRQBURST distinct={} [{:#x}/{:#x}/{:#x}] [{:#x}/{:#x}/{:#x}] [{:#x}/{:#x}/{:#x}] [{:#x}/{:#x}/{:#x}]\n",
+                            n,
+                            seen[0].0, seen[0].1, seen[0].2,
+                            seen[1].0, seen[1].1, seen[1].2,
+                            seen[2].0, seen[2].1, seen[2].2,
+                            seen[3].0, seen[3].1, seen[3].2,
+                        ),
+                        Err(error) => dev_warn!(
+                            self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                            "G17P render IRQBURST failed ({:?})\n",
+                            error,
+                        ),
+                    }
+                }
+            }
             if *module_parameters::g17p_slot_burst.value() != 0 {
                 if let Some(registers) = self.registers.as_ref() {
                     let mut seen = [0u64; 16];
