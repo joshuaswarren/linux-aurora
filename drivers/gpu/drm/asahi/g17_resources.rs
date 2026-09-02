@@ -4923,12 +4923,24 @@ impl G17PUserRenderStorage {
             translated.parameters.aux_fb,
             render_tvb.as_ref().map_or(0, MappedObject::iova),
         );
+        // NATIVE LAYOUT, macOS 26.6.2 2026-09-02 (recs3.txt, three passes,
+        // byte-stable): a render pass owns ONE (start, end) pair, not one per
+        // stage. The TA descriptor carries only a START pointer and leaves its
+        // end field ZERO (+0x08fe = 0xfffffc2000024c68, +0x0906 = 0); the 3D
+        // points its START at the SAME address and its END at start+8. The
+        // tiler stamps the pass start, the fragment stamps the pass end.
+        //
+        // This driver published four distinct qwords and required all four to
+        // be non-zero before calling a render complete, which the hardware can
+        // never satisfy because nothing writes a TA end. That is why a render
+        // whose completion ring showed BOTH stages finished with real
+        // start/end timestamps was still abandoned after 2000 polls.
         translated.parameters.ta_timestamp_start = timestamp_va;
-        translated.parameters.ta_timestamp_end = timestamp_va + 8;
+        translated.parameters.ta_timestamp_end = 0;
         translated.parameters.ta_user_timestamp_start = user_timestamps[0];
         translated.parameters.ta_user_timestamp_end = user_timestamps[1];
-        translated.parameters.fragment_timestamp_start = timestamp_va + 16;
-        translated.parameters.fragment_timestamp_end = timestamp_va + 24;
+        translated.parameters.fragment_timestamp_start = timestamp_va;
+        translated.parameters.fragment_timestamp_end = timestamp_va + 8;
         translated.parameters.fragment_user_timestamp_start = user_timestamps[2];
         translated.parameters.fragment_user_timestamp_end = user_timestamps[3];
         let lifecycle_predecessor = g17p_reserve_render_gid_group()?;
@@ -5636,12 +5648,24 @@ impl G17PUserRenderStorage {
         if let Some(pm) = next_parameter_management.as_ref() {
             translated.parameters.parameter_buffer = pm.selected_scene_va();
         }
+        // NATIVE LAYOUT, macOS 26.6.2 2026-09-02 (recs3.txt, three passes,
+        // byte-stable): a render pass owns ONE (start, end) pair, not one per
+        // stage. The TA descriptor carries only a START pointer and leaves its
+        // end field ZERO (+0x08fe = 0xfffffc2000024c68, +0x0906 = 0); the 3D
+        // points its START at the SAME address and its END at start+8. The
+        // tiler stamps the pass start, the fragment stamps the pass end.
+        //
+        // This driver published four distinct qwords and required all four to
+        // be non-zero before calling a render complete, which the hardware can
+        // never satisfy because nothing writes a TA end. That is why a render
+        // whose completion ring showed BOTH stages finished with real
+        // start/end timestamps was still abandoned after 2000 polls.
         translated.parameters.ta_timestamp_start = timestamp_va;
-        translated.parameters.ta_timestamp_end = timestamp_va + 8;
+        translated.parameters.ta_timestamp_end = 0;
         translated.parameters.ta_user_timestamp_start = user_timestamps[0];
         translated.parameters.ta_user_timestamp_end = user_timestamps[1];
-        translated.parameters.fragment_timestamp_start = timestamp_va + 16;
-        translated.parameters.fragment_timestamp_end = timestamp_va + 24;
+        translated.parameters.fragment_timestamp_start = timestamp_va;
+        translated.parameters.fragment_timestamp_end = timestamp_va + 8;
         translated.parameters.fragment_user_timestamp_start = user_timestamps[2];
         translated.parameters.fragment_user_timestamp_end = user_timestamps[3];
         let (fragment_lifecycle, tiling_lifecycle) =
@@ -7178,12 +7202,17 @@ impl G17PUserRenderStorage {
             Ok(())
         })?;
         self.timestamps.with_bytes_mut(|raw| {
-            let tiling_start = u64::from_le_bytes(raw[0..8].try_into().map_err(|_| EINVAL)?);
-            let tiling_end = u64::from_le_bytes(raw[8..16].try_into().map_err(|_| EINVAL)?);
-            let fragment_start = u64::from_le_bytes(raw[16..24].try_into().map_err(|_| EINVAL)?);
-            let fragment_end = u64::from_le_bytes(raw[24..32].try_into().map_err(|_| EINVAL)?);
-            state.tiling_timestamps = [tiling_start, tiling_end];
-            state.fragment_timestamps = [fragment_start, fragment_end];
+            // One pass-wide pair, per the native layout published above: the
+            // tiler writes [0..8], the fragment writes [8..16]. The per-stage
+            // arrays are kept because every completion predicate is written
+            // against them, but they are now views onto that pair -- the
+            // tiler's "end" is its own start, because native gives the TA no
+            // end pointer, so "all non-zero" still means exactly "this stage
+            // has stamped what it owns".
+            let pass_start = u64::from_le_bytes(raw[0..8].try_into().map_err(|_| EINVAL)?);
+            let pass_end = u64::from_le_bytes(raw[8..16].try_into().map_err(|_| EINVAL)?);
+            state.tiling_timestamps = [pass_start, pass_start];
+            state.fragment_timestamps = [pass_start, pass_end];
             Ok(())
         })?;
         Ok(state)
