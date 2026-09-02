@@ -2942,12 +2942,19 @@ pub(crate) fn prepare_g17p_render_cl_command_state(
                 .map(|address| G17PClRceBinding { address, tag })
                 .ok_or(SubmissionError::ComputeRceAddressOverflow)
         };
-        [
+        let full = [
             external_binding(0, 0x56)?,
             external_binding(1, 0x10)?,
             external_binding(2, 0x17)?,
             external_binding(3, 0x0a)?,
-        ]
+        ];
+        match *crate::module_parameters::g17p_render_3d_rce.value() {
+            0 => [empty, empty, empty, empty],
+            1 => [full[0], empty, empty, empty],
+            2 => [full[0], full[1], empty, empty],
+            3 => [full[0], full[1], full[2], empty],
+            _ => full,
+        }
     };
 
     Ok(G17PComputeClCommandState {
