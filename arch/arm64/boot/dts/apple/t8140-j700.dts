@@ -20,6 +20,7 @@
 		dcp0 = &dcp;
 		disp0 = &display;
 		disp0_piodma = &disp0_piodma;
+		nvram = &nvram;
 		serial0 = &serial0;
 		keyboard = &keyboard;
 	};
@@ -191,6 +192,27 @@
 
 &pinctrl_ap {
 	status = "okay";
+};
+
+&qspi {
+	status = "okay";
+
+	flash@0 {
+		compatible = "jedec,spi-nor";
+		reg = <0>;
+		spi-max-frequency = <40000000>;
+
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			nvram: partition@24000 {
+				label = "nvram";
+				reg = <0x24000 0x1d0000>;
+			};
+		};
+	};
 };
 
 /*
