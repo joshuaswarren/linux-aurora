@@ -373,6 +373,17 @@ pub(crate) struct G17PRenderKsmAdmissionSnapshot {
     pub(crate) resource_clear: [u64; 2],
     pub(crate) resource_go: [u64; 2],
     pub(crate) resource_callback_state: u64,
+    /// PDM launch/interrupt chain used by B1 to advance a fragment job from
+    /// scheduler state 2 to state 3. Firmware writes `launch_slot`,
+    /// `launch_mode`, and `launch_strobe`, then requires bit 3 in
+    /// `launch_irq_status` and the matching bit in `launch_slot_pending`.
+    pub(crate) launch_slot: u32,
+    pub(crate) launch_mode: u64,
+    pub(crate) launch_strobe: u32,
+    pub(crate) launch_irq_enable: u64,
+    pub(crate) launch_irq_status: u64,
+    pub(crate) launch_slot_pending: u64,
+    pub(crate) launch_slot_ack: u64,
     pub(crate) scheduler_status: u64,
     pub(crate) work_channel_status: [u64; 4],
     pub(crate) usc: Option<G17PUscEngineSnapshot>,
@@ -850,6 +861,18 @@ impl Resources {
             0,
             1u64 << 42,
         )?;
+        // FUN_15a48 publishes these immediately before marking the firmware
+        // job state 2. FUN_216f0 then consumes IRQ status bit 3 and the
+        // per-slot pending bitmap to make the state-3 callback runnable.
+        // These are read-only observations; in particular, do not write the
+        // 0x10a58 acknowledge register from the live diagnostic path.
+        let launch_slot = registers.try_read32(0x1_0398)?;
+        let launch_mode = registers.try_read64(0x1_0408)?;
+        let launch_strobe = registers.try_read32(0x1_c998)?;
+        let launch_irq_enable = registers.try_read64(0x1_0a08)?;
+        let launch_irq_status = registers.try_read64(0x1_0a10)?;
+        let launch_slot_pending = registers.try_read64(0x1_0a50)?;
+        let launch_slot_ack = registers.try_read64(0x1_0a58)?;
         let scheduler_status = Self::g17p_sksm_port_read_locked(
             &sgx,
             T8140_KSM_SCHEDULER_STATUS,
@@ -947,6 +970,13 @@ impl Resources {
             resource_clear,
             resource_go,
             resource_callback_state,
+            launch_slot,
+            launch_mode,
+            launch_strobe,
+            launch_irq_enable,
+            launch_irq_status,
+            launch_slot_pending,
+            launch_slot_ack,
             scheduler_status,
             work_channel_status,
             usc,
