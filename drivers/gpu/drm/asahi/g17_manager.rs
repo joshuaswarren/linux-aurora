@@ -3356,6 +3356,32 @@ impl G17PManagerConstruction {
 
         {
             let dev = self.resources.dev().clone();
+            {
+                let mut pa = [0u8; 0x100];
+                if self
+                    .render_storage
+                    .as_mut()
+                    .map(|s| s.read_pool_a_record(&mut pa).is_ok())
+                    .unwrap_or(false)
+                {
+                    let g94 = u32::from_le_bytes([pa[0x94], pa[0x95], pa[0x96], pa[0x97]]);
+                    let verdict = if g94 != 0 {
+                        "NONZERO -> firmware drops the TA work silently"
+                    } else {
+                        "zero -> gate passes"
+                    };
+                    dev_info!(
+                        dev.as_ref(),
+                        "G17P pool-a[{}] +0x00={:02x?} +0x10={:02x?} +0x90={:02x?} GATE+0x94={:#010x} {}\n",
+                        label,
+                        &pa[0x00..0x08],
+                        &pa[0x10..0x14],
+                        &pa[0x90..0x94],
+                        g94,
+                        verdict,
+                    );
+                }
+            }
             let mut cc = [0u8; 0x40];
             let ok = self
                 .render_storage
