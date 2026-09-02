@@ -393,8 +393,14 @@ pub(crate) struct G17PRenderKsmAdmissionSnapshot {
     /// pointer and the work stamp. Non-zero means the SKU stream was fetched
     /// and the TA is waiting for a launch; zero means the slot was admitted
     /// but nothing was ever read.
-    pub(crate) pipe_vdm_stream: u64,
-    pub(crate) pipe_work_stamp: u64,
+    ///
+    /// Read for EVERY pipe, not just pipe 0. The KSM admits the fragment to a
+    /// slot of its own, so a pipe-0-only read cannot distinguish "the fragment
+    /// pipe was never armed" from "the fragment pipe was armed and stalled" --
+    /// and pipe 0 still holds the TILING stream long after the TA retires,
+    /// which made the single reading look armed when it was simply stale.
+    pub(crate) pipe_vdm_stream: [u64; 4],
+    pub(crate) pipe_work_stamp: [u64; 4],
     pub(crate) current_command: u64,
     pub(crate) current_context: u64,
     pub(crate) active_queue_mask: u64,
@@ -923,8 +929,18 @@ impl Resources {
         ];
         let dm_control = registers.try_read64(0xc140)?;
         let dm_stopped = registers.try_read64(0xc148)?;
-        let pipe_vdm_stream = Self::g17p_sksm_port_read_locked(&sgx, 0x1_c880, 0, 0)?;
-        let pipe_work_stamp = Self::g17p_sksm_port_read_locked(&sgx, 0x1_c9f0, 0, 0)?;
+        let pipe_vdm_stream = [
+            Self::g17p_sksm_port_read_locked(&sgx, 0x1_c880, 0, 0)?,
+            Self::g17p_sksm_port_read_locked(&sgx, 0x1_c880, 1, 0)?,
+            Self::g17p_sksm_port_read_locked(&sgx, 0x1_c880, 2, 0)?,
+            Self::g17p_sksm_port_read_locked(&sgx, 0x1_c880, 3, 0)?,
+        ];
+        let pipe_work_stamp = [
+            Self::g17p_sksm_port_read_locked(&sgx, 0x1_c9f0, 0, 0)?,
+            Self::g17p_sksm_port_read_locked(&sgx, 0x1_c9f0, 1, 0)?,
+            Self::g17p_sksm_port_read_locked(&sgx, 0x1_c9f0, 2, 0)?,
+            Self::g17p_sksm_port_read_locked(&sgx, 0x1_c9f0, 3, 0)?,
+        ];
         let queue_descriptor = [
             Self::g17p_sksm_port_read_locked(&sgx, 0x21008, u64::from(ta_qid), 1u64 << 42)?,
             Self::g17p_sksm_port_read_locked(
