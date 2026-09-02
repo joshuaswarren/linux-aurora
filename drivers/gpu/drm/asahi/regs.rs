@@ -676,6 +676,34 @@ impl Resources {
         Ok(())
     }
 
+    /// DIAGNOSTIC. Seed the KSM work-channel word the compute establishes.
+    ///
+    /// Diffing a cold render-only boot against a compute-then-render boot at
+    /// the same poll shows exactly one difference in the scheduler bank:
+    ///
+    ///   render-only cold   work-channels=[0,0,0,0]  KSM slot 0 holds the
+    ///                      TILER (qid 5) at state 0x0100000d phase 6, stuck
+    ///   compute first      work-channels=[1,0,0,0]  KSM slot 0 holds the
+    ///                      FRAGMENT (qid 6) in that same stuck state, and
+    ///                      the tiler ran instead
+    ///
+    /// So whichever render queue is admitted to the KSM sticks at phase 6, and
+    /// what a completed compute changes is this word going 0 -> 1, after which
+    /// the tiler takes the classic path and executes. This asks whether the
+    /// word itself is the gate.
+    pub(crate) fn g17p_seed_work_channel(&self, value: u64) -> Result {
+        if !self.g17p_sksm_port_powered() {
+            return Err(EAGAIN);
+        }
+        let _guard = self.sksm_fifo.lock();
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let registers = sgx.relaxed();
+        let tag = T8140_KSM_WORK_CHANNEL_0 | (1u64 << 42);
+        registers.try_write64(tag, 0x4090)?;
+        registers.try_write64(value, 0x4098)?;
+        Ok(())
+    }
+
     /// Whether the SKSM tag/data port can be driven from the host right now.
     ///
     /// The asynchronous SErrors that made every host SKSM write suppressible
