@@ -4325,6 +4325,22 @@ impl G17PUserRenderStorage {
     /// cache-cleans the object back to host memory at `0x12488`, so a host read
     /// after the first submit shows whether the bind actually ran. Fields still
     /// reading `0xff` mean it did not.
+    /// DIAGNOSTIC. Pool-A record 0. The classic TA command handler dereferences
+    /// TA descriptor `+0x10` (the Pool-A record), invalidates 0xc8 bytes there,
+    /// and `FUN_16f7c` then does `ldr w8,[rec,#148]; cbnz w8, <bare return>` --
+    /// a non-zero `+0x94` makes the firmware DROP the TA work silently, with no
+    /// job inserted, no trace and no fault, which is exactly our symptom.
+    pub(crate) fn read_pool_a_record(&mut self, out: &mut [u8; 0x100]) -> Result {
+        self.support.with_bytes_mut(|bytes| {
+            out.copy_from_slice(
+                bytes
+                    .get(G17P_RENDER_POOL_A..G17P_RENDER_POOL_A + 0x100)
+                    .ok_or(ERANGE)?,
+            );
+            Ok(())
+        })
+    }
+
     pub(crate) fn read_channel_control(&mut self, out: &mut [u8; 0x40]) -> Result {
         self.support.with_bytes_mut(|bytes| {
             out.copy_from_slice(
