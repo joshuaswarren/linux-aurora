@@ -5102,6 +5102,19 @@ impl G17PLiveRuntime {
                         );
                         dev_info!(
                             pdev.as_ref(),
+                            "G17P render launch post-doorbells poll={} slot={:#010x} mode={:#018x} strobe={:#010x} irq=[enable={:#018x},status={:#018x},bit3={}] slot-bitmap=[pending={:#018x},ack={:#018x}]\n",
+                            poll,
+                            snapshot.launch_slot,
+                            snapshot.launch_mode,
+                            snapshot.launch_strobe,
+                            snapshot.launch_irq_enable,
+                            snapshot.launch_irq_status,
+                            (snapshot.launch_irq_status >> 3) & 1,
+                            snapshot.launch_slot_pending,
+                            snapshot.launch_slot_ack,
+                        );
+                        dev_info!(
+                            pdev.as_ref(),
                             "G17P render KSM counters post-doorbells poll={} TA[outstanding={:#018x},submitted={:#018x},completed={:#018x}] 3D[outstanding={:#018x},submitted={:#018x},completed={:#018x}] enabled-mask={:#018x}:{:#018x}\n",
                             poll,
                             snapshot.qid_counters[0][0],

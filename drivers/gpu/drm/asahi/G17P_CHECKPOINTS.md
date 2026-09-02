@@ -14,11 +14,16 @@ Keep this list short and evidence-only. A build is not a hardware checkpoint.
 
 ## Current boundary
 
-- B1 firmware's 3D activation routine at `0x162f8` writes `1` to fragment
-  descriptor `+0x20f0` before consuming any RCE register list.
-- On hardware, after TA completes and QID 1 is selected, `+0x20f0` remains zero
-  and both 3D timestamps remain zero. The blocker is therefore before the B1
-  activation routine, in the fragment scheduler admission state machine.
+- B1 creates the fragment job and `0x15a48` launches it into firmware state 2,
+  but hardware interrupt status `+0x10a10` remains `0x101`: required bit 3 is
+  absent. Consequently no per-slot completion is routed and firmware never
+  advances the job to state 3.
+- The resource-manager clear/go masks and callback state stay zero throughout
+  the live post-doorbell polls. KTrace `0x44/0x45` appears only after recovery
+  starts, so it is recovery teardown, not the stalled admission callback.
+- B1's later 3D activation routine at `0x162f8` writes `1` to fragment
+  descriptor `+0x20f0`. On hardware `+0x20f0` and both 3D timestamps remain
+  zero, consistent with the missing state-2-to-state-3 launch interrupt.
 
 ## Corrected claims
 
@@ -36,6 +41,9 @@ Keep this list short and evidence-only. A build is not a hardware checkpoint.
   not reached the point where it reads them.
 - Native has no tag-4 command for this same-context TA-to-3D dependency.
 - Native HardwareBufferID values are allocator results, not fixed ABI values.
+- A Linux-only render power request is not the cause. With the power-wire mode
+  disabled Linux matches Metal's message ordering, while the same launch bit-3
+  failure remains.
 
 ## Grounded parameter work
 
@@ -52,6 +60,8 @@ Keep this list short and evidence-only. A build is not a hardware checkpoint.
   submit-ready 3D `+0x20` changed from Pool-A `+0x000` to `+0x100`, matching
   three native capture corpora. TA still completes, while `+0x20f0` and both
   3D timestamps remain zero, so this real mismatch was not sufficient.
-- Enable the firmware KTrace class-0 drain and identify the scheduler callback
-  state/guard before the `0x14ed8` call to `0x162f8`. Keep descriptor, SKSM,
-  QoS, completion-ring, recovery, and broad dockchannel dumps enabled.
+- Read back B1's exact launch chain (`+0x10398`, `+0x10408`, `+0x1c998`,
+  `+0x10a08`, `+0x10a10`, and `+0x10a50`) during the live polling window and
+  compare the programmed slot/mode against Metal's fragment job. Keep
+  descriptor, SKSM, QoS, completion-ring, recovery, and broad dockchannel
+  dumps enabled.
