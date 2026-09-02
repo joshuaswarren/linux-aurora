@@ -4312,6 +4312,32 @@ fn render_build_fail(site: u32) -> kernel::error::Error {
 }
 
 impl G17PUserRenderStorage {
+    /// DIAGNOSTIC. Read the render `channel_control` object the tag-15 record
+    /// names at `+0x4a`.
+    ///
+    /// Firmware RE of b1: the tag-15 tail binds this object into the scheduler
+    /// state, filling in fields the host leaves as `0xff` -- `[1]` the firmware
+    /// index (allocated at `0x12408`, published to `0x124ba8[idx]` at
+    /// `0x12460`), `[0]` the pid slot (`FUN_98f0` `0x99b0`), `[2] = 4`,
+    /// `[3] = priority`, `[4]` the class from `table_0x47467`, `+0x12` the
+    /// 128-bit qid mask, and `[0x33]` the HardwareBufferID. The firmware
+    /// cache-cleans the object back to host memory at `0x12488`, so a host read
+    /// after the first submit shows whether the bind actually ran. Fields still
+    /// reading `0xff` mean it did not.
+    pub(crate) fn read_channel_control(&mut self, out: &mut [u8; 0x40]) -> Result {
+        self.support.with_bytes_mut(|bytes| {
+            out.copy_from_slice(
+                bytes
+                    .get(
+                        G17P_RENDER_CHANNEL_CONTROL
+                            ..G17P_RENDER_CHANNEL_CONTROL + 0x40,
+                    )
+                    .ok_or(ERANGE)?,
+            );
+            Ok(())
+        })
+    }
+
     /// Same, for the descriptor object the kick entry names at +0x10.
     pub(crate) fn dump_descriptor_region(
         &mut self,

@@ -368,7 +368,11 @@ pub(crate) struct G17PRenderKsmAdmissionSnapshot {
     /// is expected to program: entry-ring base plus the hardware-set valid
     /// bit. Zero here means the queue was never installed, whatever the
     /// enable mask says.
-    pub(crate) queue_descriptor: [u64; 2],
+    /// TA, 3D, and the COMPUTE queue (qid 4). Bit 63 is the hardware's
+    /// "queue active" flag: `FUN_20d20` refuses to advance the completed
+    /// stamp `0x21028[qid]` unless it is set, so the queue that provably
+    /// dispatches is the control for whether the hardware ever sets it.
+    pub(crate) queue_descriptor: [u64; 3],
     /// KSM slots 0..3 read by SLOT index, not by queue id. The 0xc020/0xc078
     /// bank is indexed by the scheduler slot a queue is loaded into; the queue
     /// id is recovered from the progress word's bits 46:40, and the kick
@@ -1214,6 +1218,7 @@ impl Resources {
                 u64::from(fragment_qid),
                 1u64 << 42,
             )?,
+                    Self::g17p_sksm_port_read_locked(&sgx, 0x21008, 4, 1u64 << 42)?,
         ];
         let current_command = registers.try_read64(0xc0f0)?;
         let current_context = registers.try_read64(0xc0f8)?;
