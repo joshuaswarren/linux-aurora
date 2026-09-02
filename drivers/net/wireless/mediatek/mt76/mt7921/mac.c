@@ -451,12 +451,13 @@ mt7921_mac_fill_rx(struct mt792x_dev *dev, struct sk_buff *skb)
 	if (rxv && mode >= MT_PHY_TYPE_HE_SU && !(status->flag & RX_FLAG_8023))
 		mt76_connac2_mac_decode_he_radiotap(&dev->mt76, skb, rxv, mode);
 
+	status->retry = ieee80211_has_retry(fc);
+	status->seqno = IEEE80211_SEQ_TO_SN(seq_ctrl);
+	status->qos_ctl = qos_ctl;
 	if (!status->wcid || !ieee80211_is_data_qos(fc))
 		return 0;
 
 	status->aggr = unicast && !ieee80211_is_qos_nullfunc(fc);
-	status->seqno = IEEE80211_SEQ_TO_SN(seq_ctrl);
-	status->qos_ctl = qos_ctl;
 
 	return 0;
 }
@@ -802,6 +803,21 @@ void mt7921_queue_rx_skb(struct mt76_dev *mdev, enum mt76_rxq_id q,
 	case PKT_TYPE_NORMAL:
 		ret = mt7921_mac_fill_rx(dev, skb);
 		if (!ret) {
+			struct mt76_rx_status *status = (void *)skb->cb;
+
+			if (is_mt7932(mdev) && mt7932_native_rx_trace &&
+			    (status->flag & RX_FLAG_8023))
+				dev_info(mdev->dev,
+					 "J700_MT7932_FULLMAC_RX_DESCRIPTOR: q=%u wcid=%u seq=%u qos=0x%02x aggr=%u retry=%u amsdu=%u first=%u last=%u timestamp=0x%08x flags=0x%x signal=%d chains=0x%x chain=%d,%d rate=%u encoding=%u nss=%u bw=%u len=%u\n",
+					 q, status->wcid ? status->wcid->idx : 0xffff,
+					 status->seqno, status->qos_ctl, status->aggr,
+					 status->retry,
+					 status->amsdu, status->first_amsdu,
+					 status->last_amsdu, status->timestamp,
+					 status->flag, status->signal, status->chains,
+					 status->chain_signal[0], status->chain_signal[1],
+					 status->rate_idx, status->encoding,
+					 status->nss, status->bw, skb->len);
 			if (mt7932_mcu_lab_fullmac_rx(dev, skb))
 				return;
 			mt76_rx(&dev->mt76, q, skb);

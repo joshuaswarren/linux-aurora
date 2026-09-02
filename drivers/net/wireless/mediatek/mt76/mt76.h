@@ -774,6 +774,7 @@ struct mt76_rx_status {
 
 	u8 phy_idx:2;
 	u8 aggr:1;
+	u8 retry:1;
 	u8 qos_ctl;
 	u16 seqno;
 
