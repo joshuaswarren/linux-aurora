@@ -3537,6 +3537,21 @@ impl G17PLiveRuntime {
         // this driver rang between the two groups has no counterpart in the
         // oracle. Publish the tiling group first, then ring the single
         // doorbell below.
+        if *module_parameters::g17p_ksm_cold_arm.value() != 0 {
+            if let Some(registers) = self.registers.as_ref() {
+                match registers.g17p_ksm_cold_arm() {
+                    Ok(()) => dev_info!(
+                        self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                        "G17P render: DIAGNOSTIC host KSM cold arm written (0x21140 = 1<<63)\n"
+                    ),
+                    Err(error) => dev_warn!(
+                        self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                        "G17P render: DIAGNOSTIC host KSM cold arm failed ({:?})\n",
+                        error,
+                    ),
+                }
+            }
+        }
         if *module_parameters::g17p_render_seed_ts.value() != 0 {
             if let Some(registers) = self.registers.as_ref() {
                 for qid in [
@@ -3645,6 +3660,7 @@ impl G17PLiveRuntime {
                     Err(recovery_error) => Err(recovery_error),
                 };
             }
+
             if let Err(error) = Pin::new(self.gfx_rtkit.as_mut().ok_or(ENODEV)?)
                 .send_message(
                     g17_rtkit::ENDPOINT_GFX_INTERRUPTS,
@@ -5290,10 +5306,14 @@ impl G17PLiveRuntime {
                         );
                         dev_info!(
                             pdev.as_ref(),
-                            "G17P render KSM launch poll={} dm-control={:#018x} dm-stopped={:#018x} pipe-vdm-stream=[{:#x},{:#x},{:#x},{:#x}] pipe-work-stamp=[{:#x},{:#x},{:#x},{:#x}] completed-by-qid=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]\n",
+                            "G17P render KSM launch poll={} dm-control={:#018x} dm-stopped={:#018x} descriptor=[TA={:#018x},3D={:#018x}] resume=[{:#x},{:#x}] pipe-vdm-stream=[{:#x},{:#x},{:#x},{:#x}] pipe-work-stamp=[{:#x},{:#x},{:#x},{:#x}] completed-by-qid=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]\n",
                             poll,
                             snapshot.dm_control,
                             snapshot.dm_stopped,
+                            snapshot.queue_descriptor[0],
+                            snapshot.queue_descriptor[1],
+                            snapshot.queue_resume_mask[0],
+                            snapshot.queue_resume_mask[1],
                             snapshot.pipe_vdm_stream[0],
                             snapshot.pipe_vdm_stream[1],
                             snapshot.pipe_vdm_stream[2],
