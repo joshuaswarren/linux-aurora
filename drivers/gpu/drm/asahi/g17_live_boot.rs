@@ -3811,6 +3811,17 @@ impl G17PLiveRuntime {
                     }
                 }
             }
+            // Same words as the macOS fwconsume.d oracle watches (the DM ring
+            // {read, consumed, write} triple per stage). Native bumps the write
+            // index for BOTH stages before its single doorbell and the firmware
+            // then advances read+consumed on both. The pre-fragment-doorbell
+            // snapshot is taken before the late tiling publication, so it cannot
+            // say whether the TA producer is ever bumped at all -- this one can.
+            if *module_parameters::g17p_dep_records.value() != 0 {
+                if let Some(manager) = self.manager.as_mut() {
+                    manager.log_render_outer_channels("post-doorbells");
+                }
+            }
             self.probe_render_ksm_admission_after_render_doorbells();
         } else {
             let doorbells: &[u64] = if native_doorbells {
