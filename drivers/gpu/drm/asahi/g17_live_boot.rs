@@ -5227,6 +5227,34 @@ impl G17PLiveRuntime {
     /// `regs`, because performing it later on the recovery/timeout path panics
     /// the machine instead of yielding a useful diagnostic.
     fn probe_render_ksm_admission_after_render_doorbells(&mut self) {
+        // Called from BOTH the compute and the render submit paths, and
+        // deliberately sampled before the ksm_probe gate below so one hook
+        // covers both. The open question is whether the new-work interrupt
+        // ever fires at all: the render window measures bit 4 clear and
+        // 0x10a60 = 0, and compute is the workload that actually completes.
+        if *module_parameters::g17p_irq_burst.value() >= 2 {
+            if let (Some(registers), Some(bpdev)) =
+                (self.registers.as_ref(), self.pdev.as_ref())
+            {
+                let mut seen = [(0u64, 0u64, 0u64); 12];
+                match registers.g17p_burst_sample_irq(&mut seen) {
+                    Ok(n) => dev_info!(
+                        bpdev.as_ref(),
+                        "G17P PATHIRQ distinct={} [{:#x}/{:#x}/{:#x}] [{:#x}/{:#x}/{:#x}] [{:#x}/{:#x}/{:#x}] [{:#x}/{:#x}/{:#x}]\n",
+                        n,
+                        seen[0].0, seen[0].1, seen[0].2,
+                        seen[1].0, seen[1].1, seen[1].2,
+                        seen[2].0, seen[2].1, seen[2].2,
+                        seen[3].0, seen[3].1, seen[3].2,
+                    ),
+                    Err(error) => dev_warn!(
+                        bpdev.as_ref(),
+                        "G17P PATHIRQ failed ({:?})\n",
+                        error,
+                    ),
+                }
+            }
+        }
         if *module_parameters::g17p_render_ksm_probe.value() == 0 {
             return;
         }
