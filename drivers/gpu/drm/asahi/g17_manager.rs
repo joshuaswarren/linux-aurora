@@ -2805,6 +2805,9 @@ impl G17PManagerConstruction {
         self.resources
             .stage_render_region_views()
             .map_err(|error| Self::render_stage_fail("stage-region-views", error))?;
+        self.resources
+            .stage_render_flist_state()
+            .map_err(|error| Self::render_stage_fail("stage-render-flist", error))?;
         match self.render_context_aliases.as_ref() {
             Some(aliases) if aliases.matches(vm) => {}
             Some(_) => {

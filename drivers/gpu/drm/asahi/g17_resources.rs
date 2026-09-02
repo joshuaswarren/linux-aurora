@@ -2490,6 +2490,13 @@ impl G17PRenderUserAliases {
 
 #[cfg(not(test))]
 pub(crate) struct G17PUserRenderStorage {
+    /// Render-only tail of the USC private-memory aperture.  Ordinary client
+    /// VMs start with the 21-buffer compute closure; a render submission adds
+    /// blocks 21..25 for the native 22-block initial pool plus four-block
+    /// first grow.  Keeping these aliases with the retained render graph makes
+    /// the workload switch automatic without placing the overlapping range in
+    /// every compute VM.
+    render_operand_aliases: KVec<mmu::KernelMapping>,
     descriptors: MappedObject,
     /// Entries-only diagnostic mirror of the descriptor-embedded 3D RCE
     /// programs. Native KSM never binds this incomplete mirror.
@@ -5251,6 +5258,7 @@ impl G17PUserRenderStorage {
         }));
 
         Ok(Self {
+            render_operand_aliases: KVec::new(),
             descriptors,
             fragment_rce,
             descriptor_ta_high,
@@ -11269,6 +11277,7 @@ impl G17ResourceOwner {
             "G17P render channel owner: process pid={}\n",
             owner_pid
         );
+        let render_operand_aliases = self.stage_user_render_flist(vm)?;
         self.stage_render_uma_page_pool_descriptor()?;
         let parameter_page_list_vas = self.parameter_buffer_page_list_vas();
         let mut storage = G17PUserRenderStorage::new(
@@ -11285,9 +11294,126 @@ impl G17ResourceOwner {
             user_timestamps,
             user_timestamp_aliases,
         )?;
+        storage.render_operand_aliases = render_operand_aliases;
         self.stage_render_parameter_buffer_page_list(&mut storage)?;
         self.stage_render_parameter_buffer_descriptor(storage.parameter_buffer_descriptor()?)?;
         Ok(storage)
+    }
+
+    /// Upgrade an ordinary compute-capable client VM to the complete native
+    /// render FList aperture when its first TA/3D submission arrives.
+    ///
+    /// Blocks 21..25 cannot live in the device-global context-0 root: block 21
+    /// overlaps the fixed KSM completion aliases.  Native resolves the render
+    /// pool through the client translation context, so map the tail only in
+    /// that client VM and retain it with the render graph.  The whole aperture
+    /// is reserved from userspace at VM creation, making this late mapping
+    /// deterministic and race-free.
+    fn stage_user_render_flist(
+        &mut self,
+        vm: &mmu::Vm,
+    ) -> Result<KVec<mmu::KernelMapping>> {
+        if !all_ranges_covered(
+            (0..g17_initdata::COMPUTE_READINESS_OPERAND_ENTRY_COUNT).map(|index| {
+                (
+                    g17p_control_operand_buffer_va(index).unwrap_or(0),
+                    G17P_CONTROL_OPERAND_BUFFER_SIZE as u64,
+                )
+            }),
+            |address, size| vm.covers_range(address, size, true, true),
+        ) {
+            return Err(EFAULT);
+        }
+
+        let tail_count = G17P_CONTROL_OPERAND_ACTIVE_BLOCK_COUNT
+            .checked_sub(g17_initdata::COMPUTE_READINESS_OPERAND_ENTRY_COUNT)
+            .ok_or(EINVAL)?;
+        let mut aliases = KVec::with_capacity(tail_count, GFP_KERNEL)?;
+        for index in g17_initdata::COMPUTE_READINESS_OPERAND_ENTRY_COUNT
+            ..G17P_CONTROL_OPERAND_ACTIVE_BLOCK_COUNT
+        {
+            let address = g17p_control_operand_buffer_va(index).ok_or(EINVAL)?;
+            // The driver-owned bootstrap render VM starts with all 28 blocks.
+            // Ordinary Vulkan VMs start with 21 and enter this arm for the
+            // five render-only aliases.
+            if vm.covers_range(
+                address,
+                G17P_CONTROL_OPERAND_BUFFER_SIZE as u64,
+                true,
+                true,
+            ) {
+                continue;
+            }
+            aliases.push(
+                self.resources.control_operand_buffers[index].map_at(
+                    vm,
+                    address,
+                    mmu::PROT_GPU_SHARED_RW,
+                )?,
+                GFP_KERNEL,
+            )?;
+        }
+        self.stage_render_flist_state()?;
+
+        if !all_ranges_covered(
+            (0..G17P_CONTROL_OPERAND_ACTIVE_BLOCK_COUNT).map(|index| {
+                (
+                    g17p_control_operand_buffer_va(index).unwrap_or(0),
+                    G17P_CONTROL_OPERAND_BUFFER_SIZE as u64,
+                )
+            }),
+            |address, size| vm.covers_range(address, size, true, true),
+        ) {
+            return Err(EFAULT);
+        }
+        dev_info!(
+            self.dev().as_ref(),
+            "G17P resources: client VM upgraded to render FList ({} initial blocks + {} first-grow blocks)\n",
+            G17P_CONTROL_OPERAND_INITIAL_BLOCK_COUNT,
+            G17P_CONTROL_OPERAND_FIRST_GROW_BLOCK_COUNT,
+        );
+        Ok(aliases)
+    }
+
+    /// Restore the shared render shape on every render submission.  Compute
+    /// intentionally reuses these backings with a compact 21-run table and an
+    /// empty page list, so staging only when a retained render graph is first
+    /// allocated is not sufficient for compute -> render transitions.
+    pub(crate) fn stage_render_flist_state(&mut self) -> Result {
+        self.resources
+            .control_operand_page_lists
+            .with_bytes_mut(|bytes| {
+                if encode_g17p_initial_flist_page_list(bytes) {
+                    Ok(())
+                } else {
+                    Err(EINVAL)
+                }
+            })?;
+        self.resources.control_operand_table.with_bytes_mut(|bytes| {
+            if encode_g17p_pre_qid_flist_runs(bytes) {
+                Ok(())
+            } else {
+                Err(EINVAL)
+            }
+        })?;
+        self.resources
+            .partial_opening_control_shared
+            .with_bytes_mut(|bytes| {
+                g17_initdata::encode_partial_opening_control_shared(bytes)
+                    .map_err(|_| EINVAL)
+            })?;
+        self.resources
+            .partial_opening_control_shared_inner
+            .with_bytes_mut(|bytes| {
+                bytes.fill(0);
+                bytes[..8].copy_from_slice(
+                    &g17_initdata::PARTIAL_OPENING_CONTROL_SHARED_INNER_PRESENTED
+                        .to_le_bytes(),
+                );
+                Ok(())
+            })?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        Ok(())
     }
 
     /// Install every hardware-fixed low alias before the VM is exposed to
