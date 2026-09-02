@@ -4394,6 +4394,12 @@ impl G17PLiveRuntime {
                 );
             }
         }
+        let compute_queue_id = u64::from(
+            self.manager
+                .as_ref()
+                .ok_or(ENODEV)?
+                .compute_queue_id(self.queue.as_ref().ok_or(ENODEV)?)?,
+        );
         let mut scan_observation = G17PWorkScanObservation::new();
         let mut serviced_notifications: u32 = 0;
         let mut last_ksm_sample: (u64, u64, u64) = (0, 0, 0);
@@ -4438,7 +4444,7 @@ impl G17PLiveRuntime {
                     && poll % 50 == 0
                 {
                     if let Some(registers) = self.registers.as_ref() {
-                        if let Ok(sample) = registers.g17p_sample_ksm(4) {
+                        if let Ok(sample) = registers.g17p_sample_ksm(compute_queue_id) {
                             if sample != last_ksm_sample {
                                 last_ksm_sample = sample;
                                 dev_info!(
@@ -4470,7 +4476,9 @@ impl G17PLiveRuntime {
                                         error
                                     );
                                 }
-                                if let Err(error) = registers.g17p_dump_queue_descriptor(4) {
+                                if let Err(error) =
+                                    registers.g17p_dump_queue_descriptor(compute_queue_id)
+                                {
                                     dev_warn!(
                                         self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
                                         "G17P queue descriptor read failed ({:?})\n",
@@ -5035,6 +5043,8 @@ impl G17PLiveRuntime {
         let (Some(pdev), Some(registers)) = (self.pdev.as_ref(), self.registers.as_ref()) else {
             return;
         };
+        let ta_qid = g17_resources::g17p_render_queue_id(true) as u8;
+        let fragment_qid = g17_resources::g17p_render_queue_id(false) as u8;
 
         const POLLS: usize = 40;
         let mut last = None;
@@ -5056,14 +5066,16 @@ impl G17PLiveRuntime {
                     return;
                 }
             };
-            match registers.g17p_render_ksm_admission_snapshot() {
+            match registers.g17p_render_ksm_admission_snapshot(ta_qid, fragment_qid) {
                 Ok(Some(snapshot)) => {
                     let observation = (snapshot, engine_timestamps);
                     if last != Some(observation)
-                        && (snapshot.qid0_state != 0
-                            || snapshot.qid0_progress != 0
-                            || snapshot.qid1_state != 0
-                            || snapshot.qid1_progress != 0
+                        && (snapshot.pdm_qid0_state != 0
+                            || snapshot.pdm_qid0_progress != 0
+                            || snapshot.ta_state != 0
+                            || snapshot.ta_progress != 0
+                            || snapshot.fragment_state != 0
+                            || snapshot.fragment_progress != 0
                             || snapshot.qid_counters != [[0; 3]; 2]
                             || snapshot.queue_enabled != [0; 2]
                             || snapshot.current_command != 0
@@ -5077,17 +5089,21 @@ impl G17PLiveRuntime {
                     {
                         dev_info!(
                             pdev.as_ref(),
-                            "G17P render KSM admission post-doorbells poll={} gpc-state={:#x} qid0-state={:#018x} qid0-low6={:#x} qid0-progress={:#018x} qid0-progress-low40={:#x} qid1-state={:#018x} qid1-low6={:#x} qid1-progress={:#018x} qid1-progress-low40={:#x} current-command={:#018x} current-context={:#018x} active-queue=[{:#018x},{:#018x}] stage-masks=[{:#018x},{:#018x},{:#018x}] dm-masks=[{:#018x},{:#018x},{:#018x}] ta-ts=[{:#x},{:#x}] 3d-ts=[{:#x},{:#x}]\n",
+                            "G17P render KSM admission post-doorbells poll={} gpc-state={:#x} pdm-qid0=[state={:#018x},progress={:#018x}] ta-qid{}=[state={:#018x},low6={:#x},progress={:#018x},progress-low40={:#x}] 3d-qid{}=[state={:#018x},low6={:#x},progress={:#018x},progress-low40={:#x}] current-command={:#018x} current-context={:#018x} active-queue=[{:#018x},{:#018x}] stage-masks=[{:#018x},{:#018x},{:#018x}] dm-masks=[{:#018x},{:#018x},{:#018x}] ta-ts=[{:#x},{:#x}] 3d-ts=[{:#x},{:#x}]\n",
                             poll,
                             snapshot.gpc_state,
-                            snapshot.qid0_state,
-                            snapshot.qid0_state & 0x3f,
-                            snapshot.qid0_progress,
-                            snapshot.qid0_progress & ((1u64 << 40) - 1),
-                            snapshot.qid1_state,
-                            snapshot.qid1_state & 0x3f,
-                            snapshot.qid1_progress,
-                            snapshot.qid1_progress & ((1u64 << 40) - 1),
+                            snapshot.pdm_qid0_state,
+                            snapshot.pdm_qid0_progress,
+                            snapshot.ta_qid,
+                            snapshot.ta_state,
+                            snapshot.ta_state & 0x3f,
+                            snapshot.ta_progress,
+                            snapshot.ta_progress & ((1u64 << 40) - 1),
+                            snapshot.fragment_qid,
+                            snapshot.fragment_state,
+                            snapshot.fragment_state & 0x3f,
+                            snapshot.fragment_progress,
+                            snapshot.fragment_progress & ((1u64 << 40) - 1),
                             snapshot.current_command,
                             snapshot.current_context,
                             snapshot.active_queue_mask,

@@ -1020,7 +1020,6 @@ pub(crate) const G17P_PARTIAL_OPENING_OUTER_SLOT_COUNT: u32 = 0x100;
 pub(crate) const G17P_PARTIAL_OPENING_TILING_CHANNEL_TABLE_INDEX: u8 = 0;
 pub(crate) const G17P_PARTIAL_OPENING_FRAGMENT_CHANNEL_TABLE_INDEX: u8 = 1;
 pub(crate) const G17P_COMPUTE_CHANNEL_TABLE_INDEX: u8 = 8;
-pub(crate) const G17P_COMPUTE_CHANNEL_GRID_INDEX: u8 = 4;
 /// Compute work-submission doorbell channel. VALIDATED by 2000 consecutive
 /// passing computes. Decodes under `encode_tx_doorbell` as
 /// `pipe Compute(2) | (priority 2 << 2)` = 0x0a, which is why it is not simply
@@ -2016,9 +2015,9 @@ fn prepare_g17p_partial_opening_outer_slot(
     //   +0x10 data master (TA 0 / 3D 1)  +0x10 kind (PipeType Vertex/Fragment)
     //   +0x14 0x01_11_0003 / 0x01_12_0003  write_index 3, qid, bit24 set
     //
-    // The name hid a coupling: this byte must agree with the QID published in
-    // tag-15, tag-14 and the SKSM registration. Compute never exposed it
-    // because G17P_COMPUTE_CHANNEL_GRID_INDEX is 4 and its QID is also 4.
+    // This byte must agree with the QID published in tag-15, tag-14 and the
+    // SKSM registration. It follows the retained queue object even when a
+    // recovered compute session advances past its first QID.
     put_u32_le(
         &mut slot,
         0x14,
@@ -2036,11 +2035,12 @@ fn prepare_g17p_partial_opening_outer_slot(
 
 pub(crate) fn prepare_g17p_compute_channel_work(
     state: G17PPartialOpeningOuterChannelState,
+    queue_id: u8,
 ) -> Result<PreparedG17PComputeChannelWork, SubmissionError> {
     let outer = prepare_g17p_partial_opening_outer_slot(
         state,
         G17P_COMPUTE_CHANNEL_TABLE_INDEX,
-        G17P_COMPUTE_CHANNEL_GRID_INDEX,
+        queue_id,
         PipeType::Compute as u32,
     )?;
     Ok(PreparedG17PComputeChannelWork {
@@ -5455,6 +5455,7 @@ mod tests {
                 queue_gpu_va: 0xffff_fc20_c000_0000,
                 queue_write_index: 3,
             },
+            4,
         )
         .unwrap();
         assert_eq!(

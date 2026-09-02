@@ -853,7 +853,7 @@ pub(crate) struct G17PManagerConstruction {
     /// handoff exists to avoid. Rotating is also what native does: macOS
     /// creates a new `AGXKSMKickQueue` per queue rather than recycling one,
     /// and the firmware's KSM restore set has 128 slots for exactly that.
-    next_compute_queue_id: u8,
+    next_compute_queue_id: Option<u8>,
     /// End timestamp of the last completion already handed to a waiter. The
     /// KSM record is a single overwritten slot, so without this the record
     /// left behind by submission N is indistinguishable from submission N+1's
@@ -947,15 +947,11 @@ pub(crate) fn g17p_mark_counts() -> (u32, u32, u32, u32) {
 /// First compute QID of a boot. The captured native CL2 queue uses QID 4, and
 /// every proven run of this driver has used it.
 pub(crate) const G17P_COMPUTE_QUEUE_ID_BASE: u8 = 4;
-/// Last QID the rotation may hand out. `KICK_QID_MASK` is 127 and the firmware's
-/// KSM restore set has 128 slots, so 4..=127 is the whole usable space once the
-/// two render QIDs (0 = TA, 1 = 3D) are excluded -- 124 rebuilds per boot before
-/// the rotation wraps back onto a QID this session has already installed, which
-/// is the one thing it cannot do safely and which is therefore logged loudly.
-/// The low-64 restriction the first version used was cosmetic: the enable and
-/// disable bitmask words are only written by the SKSM MMIO path, which is a
-/// suppressed no-op by default, and `prepare_g17p_sksm_queue_config` selects the
-/// high word correctly for a QID >= 64 in any case.
+/// Last QID the allocator may hand out. `KICK_QID_MASK` is 127 and the
+/// firmware's KSM restore set has 128 slots. IDs 0..3 are reserved, 4 is the
+/// first compute queue, 5/6 are the retained render pair, and rebuilt compute
+/// graphs consume 7..127 exactly once. Exhaustion returns ENOSPC rather than
+/// reprogramming a queue still installed in the firmware.
 pub(crate) const G17P_COMPUTE_QUEUE_ID_LAST: u8 = 127;
 const _: () = assert!(G17P_COMPUTE_QUEUE_ID_BASE > 1);
 const _: () = assert!(G17P_COMPUTE_QUEUE_ID_LAST <= 127);
@@ -1235,7 +1231,7 @@ impl G17PManagerConstruction {
                 pending_primary_recovery: None,
                 pending_add_kicks: None,
                 last_published_descriptor: 0,
-                next_compute_queue_id: G17P_COMPUTE_QUEUE_ID_BASE,
+                next_compute_queue_id: Some(G17P_COMPUTE_QUEUE_ID_BASE),
                 last_completion_end: 0,
                 compute_stamp_armed: false,
                 compute_stamp_waits: AtomicU32::new(0),
@@ -3974,37 +3970,22 @@ impl G17PManagerConstruction {
     ///
     /// The first graph of a boot always gets `G17P_COMPUTE_QUEUE_ID_BASE` (4),
     /// which is the QID the captured native CL2 queue uses and the only one any
-    /// of this driver's proven runs have exercised. Only a REBUILT session
-    /// moves on, and only when `g17p_qid_rotate` is set -- see
-    /// `next_compute_queue_id` for why a rebuild cannot reuse one.
+    /// of this driver's proven runs have exercised. A rebuilt session advances
+    /// into the unused pool at QID 7; QIDs 5/6 are the retained TA/3D pair.
     ///
-    /// Stays inside the low 64 so the enable/disable bitmask pair keeps using
-    /// its low word, and skips the two render QIDs.
-    fn allocate_compute_queue_id(&mut self) -> u8 {
-        let id = self.next_compute_queue_id;
-        if *module_parameters::g17p_qid_rotate.value() != 0 {
-            let mut next = id.wrapping_add(1);
-            // The rotation space was documented as "4..=127 once the two render
-            // QIDs (0 = TA, 1 = 3D) are excluded". Those two are no longer
-            // fixed, so skip whichever pair render is actually using or the
-            // rotation will eventually reprogram a live render queue.
-            let render_ta = g17_resources::g17p_render_queue_id(true) as u8;
-            let render_3d = g17_resources::g17p_render_queue_id(false) as u8;
-            while next == render_ta || next == render_3d {
-                next = next.wrapping_add(1);
-            }
-            if next > G17P_COMPUTE_QUEUE_ID_LAST {
-                next = G17P_COMPUTE_QUEUE_ID_BASE;
-                dev_err!(
-                    self.resources.dev().as_ref(),
-                    "G17PMARK qid-rotation-wrapped back to {} after {} sessions; every QID from here on has already been installed in this boot and its first bind will reprogram a live KSMFE queue -- reboot to reset the rotation\n",
-                    G17P_COMPUTE_QUEUE_ID_BASE,
-                    G17P_COMPUTE_QUEUE_ID_LAST - G17P_COMPUTE_QUEUE_ID_BASE + 1,
-                );
-            }
-            self.next_compute_queue_id = next;
+    /// Skips the two render QIDs and never wraps onto an installed queue.
+    fn allocate_compute_queue_id(&mut self) -> Result<u8> {
+        let id = self.next_compute_queue_id.ok_or(ENOSPC)?;
+        let mut next = id.checked_add(1);
+        while next.is_some_and(|candidate| {
+            candidate == g17_resources::g17p_render_queue_id(true) as u8
+                || candidate == g17_resources::g17p_render_queue_id(false) as u8
+        }) {
+            next = next.and_then(|candidate| candidate.checked_add(1));
         }
-        id
+        self.next_compute_queue_id =
+            next.filter(|candidate| *candidate <= G17P_COMPUTE_QUEUE_ID_LAST);
+        Ok(id)
     }
 
     /// Allocate and encode the native compute queue without touching the SKSM
@@ -4014,7 +3995,7 @@ impl G17PManagerConstruction {
         &mut self,
         dev: &AsahiDevice,
     ) -> Result<G17PSksmQueue> {
-        let queue_id = self.allocate_compute_queue_id();
+        let queue_id = self.allocate_compute_queue_id()?;
         const COMPLETION_SELECTOR: u8 = 2;
 
         let geometry = self.sksm_queue_geometry();
@@ -4283,7 +4264,7 @@ impl G17PManagerConstruction {
                 g17_compute::ComputeDescriptorMetadata {
                     submit_sequence: 0,
                     context_id: context.context_id,
-                    grid_index: g17_submission::G17P_COMPUTE_CHANNEL_GRID_INDEX as u32,
+                    grid_index: u32::from(queue.queue_id),
                     work_ordinal: 0,
                     queue_submission: 1,
                     queue_ordinal: 0,
@@ -4392,6 +4373,7 @@ impl G17PManagerConstruction {
                 sksm_entry_aliases,
                 shared_control,
                 queue.storage.channel_control_gpu_va(),
+                queue.queue_id,
                 install_queue,
             )?;
         // Purely precompute the host-only sequence token and notification
@@ -4524,7 +4506,7 @@ impl G17PManagerConstruction {
         }
         let prepared = self
             .resources
-            .publish_compute_channel(group.queue, group.write_index)?;
+            .publish_compute_channel(group.queue, group.write_index, queue.queue_id)?;
         submission_phase.store(G17P_SUBMIT_PHASE_CL2, Ordering::Release);
         if lifecycle.notifications.activation != Some(prepared.doorbell) {
             return Err(EINVAL);
@@ -4642,7 +4624,7 @@ impl G17PManagerConstruction {
                 g17_compute::ComputeDescriptorMetadata {
                     submit_sequence: sequence_ordinal as u64,
                     context_id: context.context_id,
-                    grid_index: g17_submission::G17P_COMPUTE_CHANNEL_GRID_INDEX as u32,
+                    grid_index: u32::from(queue.queue_id),
                     work_ordinal,
                     queue_submission,
                     queue_ordinal: sequence_ordinal,
@@ -4722,7 +4704,11 @@ impl G17PManagerConstruction {
             0 => {}
             2 => queue
                 .compute
-                .write_repeat_queue_context_item(descriptor_slot, descriptor_high)?,
+                .write_repeat_queue_context_item(
+                    descriptor_slot,
+                    descriptor_high,
+                    queue.queue_id,
+                )?,
             _ => queue.compute.refresh_repeat_queue_context(descriptor_high)?,
         }
         let rewind = *module_parameters::g17p_repeat_ring.value() == 0;
@@ -4730,6 +4716,7 @@ impl G17PManagerConstruction {
             sksm_entry_aliases,
             shared_control,
             queue.storage.channel_control_gpu_va(),
+            queue.queue_id,
             rewind,
         )?;
         // `queue_config_dirty` is already false here, so the lifecycle reports
@@ -4849,7 +4836,7 @@ impl G17PManagerConstruction {
         };
         let prepared = self
             .resources
-            .publish_compute_channel(group.queue, reported_write_index)?;
+            .publish_compute_channel(group.queue, reported_write_index, queue.queue_id)?;
         submission_phase.store(G17P_SUBMIT_PHASE_CL2, Ordering::Release);
         let _ = prepared;
         queue.direct_lifecycle = lifecycle.next;
@@ -5102,7 +5089,7 @@ impl G17PManagerConstruction {
                     g17_compute::ComputeDescriptorMetadata {
                         submit_sequence: ordinal as u64,
                         context_id: context.context_id,
-                        grid_index: 6,
+                        grid_index: u32::from(queue.queue_id),
                         work_ordinal: ordinal,
                         queue_submission,
                         queue_ordinal: ordinal,

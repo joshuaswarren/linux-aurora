@@ -358,6 +358,7 @@ pub(crate) fn encode_compute_config_update(
     sksm_entries: ComputeSksmEntryAliases,
     shared_control: u64,
     channel_control: u64,
+    queue_id: u8,
     install_queue: bool,
 ) -> Result<(), ComputeBuildError> {
     let flushid_fix = *crate::module_parameters::g17p_flushid_fix.value() != 0;
@@ -374,7 +375,7 @@ pub(crate) fn encode_compute_config_update(
     put_u64(optional_raw, 0x08, sksm_entries.low());
     put_u64(optional_raw, 0x10, sksm_entries.high());
     for (offset, value) in [
-        (0x18, 4u16),
+        (0x18, u16::from(queue_id)),
         // +0x1a is the QUEUE-INSTALL flag, and it must be non-zero on a first
         // bind. Firmware RE (2026-08-31): the only writer of the per-queue slot
         // `0x127628 + qid*0x28` is at 0x119b8, and that store -- together with
@@ -430,6 +431,7 @@ pub(crate) fn encode_compute_queue_context_item(
     item_index: usize,
     descriptor: u64,
     queue_base: u64,
+    queue_id: u8,
 ) -> Result<(), ComputeBuildError> {
     let offset = item_index
         .checked_mul(COMPUTE_QUEUE_CONTEXT_ITEM)
@@ -446,7 +448,7 @@ pub(crate) fn encode_compute_queue_context_item(
     put_u64(context, 0x10, descriptor);
     put_u64(context, 0x18, queue_base);
     put_u64(context, 0x20, 0xffff_0801_0000_0001);
-    put_u64(context, 0x28, 4u64 << 40);
+    put_u64(context, 0x28, u64::from(queue_id) << 40);
     put_u64(context, 0x130, 0);
     put_u64(context, 0x138, 4);
     put_u64(context, 0x150, 0x0001_1003_8001_a002);
@@ -467,6 +469,7 @@ pub(crate) fn build_initial_compute_channel_group(
     sksm_entries: ComputeSksmEntryAliases,
     shared_control: u64,
     channel_control: u64,
+    queue_id: u8,
     graph: &mut [u8],
     queue_context: &mut [u8],
     install_queue: bool,
@@ -509,13 +512,14 @@ pub(crate) fn build_initial_compute_channel_group(
         sksm_entries,
         shared_control,
         channel_control,
+        queue_id,
         install_queue,
     )?;
 
     let event_raw = &mut graph[COMPUTE_EVENT..COMPUTE_EVENT + COMPUTE_EVENT_SIZE];
     event_raw.fill(0);
     put_u32(event_raw, 0x00, 0x0e);
-    put_u32(event_raw, 0x04, 0x0001_0004);
+    put_u32(event_raw, 0x04, (1u32 << 16) | u32::from(queue_id));
     put_u32(event_raw, 0x08, 0x0102);
     put_u32(event_raw, 0x10, 0x0200);
 
@@ -523,7 +527,7 @@ pub(crate) fn build_initial_compute_channel_group(
     // Item index 1, which is also the stamp index the first bind consumes
     // (the geometry seeds `current_timestamp` at 1). See
     // `encode_compute_queue_context_item` for why that coincidence matters.
-    encode_compute_queue_context_item(queue_context, 1, descriptor, base)?;
+    encode_compute_queue_context_item(queue_context, 1, descriptor, base, queue_id)?;
 
     Ok(ComputeChannelGroupAddresses {
         queue: base,
@@ -855,8 +859,10 @@ mod tests {
             .unwrap(),
             0xffff_fc20_c400_0000,
             0xffff_fc20_c500_0000,
+            4,
             &mut graph,
             &mut context,
+            true,
         )
         .unwrap();
         assert_eq!(

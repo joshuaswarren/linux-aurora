@@ -357,10 +357,24 @@ const G17P_BOOTSTRAP_DESCRIPTOR_ZERO_B_VA: u64 = 0xffff_fc20_c07c_0000;
 const G17P_BOOTSTRAP_TA_STATUS_VA: u64 = 0xffff_fc20_0168_0000;
 const G17P_BOOTSTRAP_3D_STATUS_VA: u64 = 0xffff_fc20_0163_0000;
 const G17P_BOOTSTRAP_CONTEXT_PEER_SIZE: usize = 0x20_000;
-const G17P_BOOTSTRAP_TA_CONTEXT_LOW_VA: u64 = 0x70_0043_8000;
-const G17P_BOOTSTRAP_TA_CONTEXT_HIGH_VA: u64 = 0xffff_fc20_001d_8000;
-const G17P_BOOTSTRAP_3D_CONTEXT_LOW_VA: u64 = 0x70_0046_0000;
-const G17P_BOOTSTRAP_3D_CONTEXT_HIGH_VA: u64 = 0xffff_fc20_0020_0000;
+/// QIDs 0 and 1 are not ordinary application queues on G17P. Metal's type-1
+/// 3D descriptor retains a distinct QID-0 RCE coordinate even while its
+/// actual TA/3D queues use allocator-issued IDs. Keep the application's three
+/// physical queues together at the first proven ordinary QID: compute is 4,
+/// TA is 5, and 3D is 6.
+pub(crate) const G17P_RENDER_TA_QUEUE_ID: u16 = 5;
+pub(crate) const G17P_RENDER_3D_QUEUE_ID: u16 = 6;
+const G17P_RENDER_QUEUE_LOW_BASE: u64 = 0x70_0043_8000;
+const G17P_RENDER_QUEUE_HIGH_BASE: u64 = 0xffff_fc20_001d_8000;
+const G17P_RENDER_QUEUE_VA_STRIDE: u64 = 0x28_000;
+const G17P_BOOTSTRAP_TA_CONTEXT_LOW_VA: u64 =
+    G17P_RENDER_QUEUE_LOW_BASE + G17P_RENDER_TA_QUEUE_ID as u64 * G17P_RENDER_QUEUE_VA_STRIDE;
+const G17P_BOOTSTRAP_TA_CONTEXT_HIGH_VA: u64 =
+    G17P_RENDER_QUEUE_HIGH_BASE + G17P_RENDER_TA_QUEUE_ID as u64 * G17P_RENDER_QUEUE_VA_STRIDE;
+const G17P_BOOTSTRAP_3D_CONTEXT_LOW_VA: u64 =
+    G17P_RENDER_QUEUE_LOW_BASE + G17P_RENDER_3D_QUEUE_ID as u64 * G17P_RENDER_QUEUE_VA_STRIDE;
+const G17P_BOOTSTRAP_3D_CONTEXT_HIGH_VA: u64 =
+    G17P_RENDER_QUEUE_HIGH_BASE + G17P_RENDER_3D_QUEUE_ID as u64 * G17P_RENDER_QUEUE_VA_STRIDE;
 
 fn g17p_control_operand_buffer_va(index: usize) -> Option<u64> {
     if index >= G17P_CONTROL_OPERAND_BUFFER_COUNT {
@@ -3081,6 +3095,7 @@ impl G17PComputeDescriptorStorage {
         sksm_entries: g17_compute::ComputeSksmEntryAliases,
         shared_control: u64,
         channel_control: u64,
+        queue_id: u8,
         install_queue: bool,
     ) -> Result<g17_compute::ComputeChannelGroupAddresses> {
         let queue = self.queue_graph.iova();
@@ -3103,6 +3118,7 @@ impl G17PComputeDescriptorStorage {
             sksm_entries,
             shared_control,
             channel_control,
+            queue_id,
             graph,
             queue_context,
             install_queue,
@@ -3284,6 +3300,7 @@ impl G17PComputeDescriptorStorage {
         sksm_entries: g17_compute::ComputeSksmEntryAliases,
         shared_control: u64,
         channel_control: u64,
+        queue_id: u8,
         rewind: bool,
     ) -> Result<g17_compute::ComputeChannelGroupAddresses> {
         let queue = self.queue_graph.iova();
@@ -3299,6 +3316,7 @@ impl G17PComputeDescriptorStorage {
                 sksm_entries,
                 shared_control,
                 channel_control,
+                queue_id,
                 // A repeat is by definition not a first bind, so the install
                 // flag is clear -- which is also what every captured macOS
                 // steady-state submission sends.
@@ -3395,6 +3413,7 @@ impl G17PComputeDescriptorStorage {
         &mut self,
         stamp_index: u8,
         descriptor: u64,
+        queue_id: u8,
     ) -> Result {
         let queue_base = self.queue_graph.iova();
         self.queue_context_high.with_bytes_mut(|context| {
@@ -3403,6 +3422,7 @@ impl G17PComputeDescriptorStorage {
                 stamp_index as usize,
                 descriptor,
                 queue_base,
+                queue_id,
             )
             .map_err(|_| ERANGE)
         })?;
@@ -3698,58 +3718,16 @@ fn render_build_fail_named(site: u32, error: g17_render::RenderBuildError) -> ke
     EINVAL
 }
 
-/// Whether the render path publishes tag-16, the entry-signal record.
-/// Render QID for one stage. Always 0 (TA) and 1 (3D) unless deliberately
-/// overridden, and overriding it is known to break the machine.
-///
-/// DISPROVEN ON HARDWARE, 2026-08-31. The macOS witness
-/// (macos-trace/agxtrace/recs-gfx.txt, a G16 capture) publishes TA = 17 (0x11)
-/// and 3D = 18 (0x12), with 17 appearing a second time inside the
-/// `vendevtBarrierRec` the 3D kick entry is built from. Transferring that to
-/// G17P does NOT merely fail to help -- it takes the ASC session down:
-///
-///     RTKit: Message to undiscovered endpoint 0x20    (x13+)
-///     G17PMARK rtkit-boot role=gfx ok=false took=1011758us
-///     submit failed (ETIME); no 0x40, no 0x41, no render-pre-doorbell
-///
-/// The session dies, the driver rebuilds it, and the rebuild times out on the
-/// IOP HELLO/EPMAP -- the documented post-fault rebuild failure. Endpoint 0x20
-/// is the doorbell, so once it is undiscovered nothing can be delivered.
-///
-/// The lesson is about provenance, not about QIDs: a captured value only means
-/// something if you know what established it. Native's 17/18 are most likely
-/// what its queue allocator happened to hand out on a live system with other
-/// clients running -- the same way this driver's own compute rotation hands out
-/// 4, 5, 6... That makes those two numbers incidental to that capture rather
-/// than architectural, and 0/1 may be exactly right for render on G17P.
-///
-/// Apply the same test to the rest of the witness before copying a value:
-///   architectural  -- the RCE kind (1 TA / 4 3D) and tags (0x47 / 0x56), the
-///                     all-zero event mask, the tiler-register relative
-///                     encoding, the barrier `stamp << 8` formula
-///   allocator-set  -- the QIDs, the RCE addresses (0x7000011160 and friends),
-///                     the entry VAs, the AddKicks stamps
-pub(crate) fn g17p_render_queue_id(tiling: bool) -> u16 {
-    let base = *crate::module_parameters::g17p_render_qid_base.value();
-    if base != 0 {
-        pr_info!(
-            "G17P render: WARNING g17p_render_qid_base={} is DISPROVEN -- non-zero killed the ASC session on hardware (undiscovered endpoint 0x20, rtkit-boot timeout, ETIME). Expect no submission to complete.\n",
-            base
-        );
-    }
-    if base == 0 {
-        if tiling {
-            0
-        } else {
-            1
-        }
+/// Kernel-owned physical render queue identity. The native allocator chooses
+/// IDs per workqueue; the architectural requirement is internal coherence,
+/// not copying one captured allocator result. IDs 5/6 keep the application
+/// queues clear of the descriptor's distinct QID-0 RCE coordinate and of the
+/// retained compute queue at QID 4.
+pub(crate) const fn g17p_render_queue_id(tiling: bool) -> u16 {
+    if tiling {
+        G17P_RENDER_TA_QUEUE_ID
     } else {
-        let base = base as u16;
-        if tiling {
-            base
-        } else {
-            base.saturating_add(1)
-        }
+        G17P_RENDER_3D_QUEUE_ID
     }
 }
 
@@ -4308,29 +4286,6 @@ pub(crate) fn g17p_render_tag16_enabled() -> bool {
 
 pub(crate) fn g17p_render_native_pool_a_first_record_enabled() -> bool {
     *crate::module_parameters::g17p_render_native_pool_a_first_record.value() != 0
-}
-
-fn apply_g17p_fragment_pdm_remap(fragment: &mut [u8]) -> Result {
-    if *crate::module_parameters::g17p_render_pdm_remap.value() == 0 {
-        return Ok(());
-    }
-    if fragment.len() < 0x7b0 {
-        return Err(EINVAL);
-    }
-
-    // B1 treats these common-passthrough fields as a scheduler coordinate
-    // before it enters the 3D activation routine. Native names a separate PDM
-    // queue-0 slot whose timeline Linux does not yet construct. Pointing the
-    // coordinate at the already-published 3D slot 1 is a bounded proof of that
-    // missing owner; it is not a production substitute because +0x7a8 also
-    // carries the native first RCE array's packed byte/count word.
-    put_u32(fragment, 0x079c, u32::from(g17p_render_queue_id(false)));
-    put_u64(fragment, 0x07a8, 1);
-    pr_info!(
-        "G17P render PDM proof remap applied: descriptor coordinate qid={} packed=0x1\n",
-        g17p_render_queue_id(false),
-    );
-    Ok(())
 }
 
 pub(crate) fn g17p_render_native_fragment_hwpb_mode() -> u32 {
@@ -5089,6 +5044,7 @@ impl G17PUserRenderStorage {
                 g17_render::RenderDescriptorKind::Tiling,
                 G17P_BOOTSTRAP_TA_DESCRIPTOR_LOW_VA,
                 g17_initdata::CONTROL_SHARED_ADDRESS,
+                g17p_render_queue_id(false) as u8,
                 0,
                 true,
                 g17p_render_native_pm_bytes(),
@@ -5106,13 +5062,13 @@ impl G17PUserRenderStorage {
                 g17_render::RenderDescriptorKind::Fragment,
                 descriptor_3d_render_va,
                 g17_initdata::CONTROL_SHARED_ADDRESS,
+                g17p_render_queue_id(false) as u8,
                 0,
                 true,
                 g17p_render_native_pm_bytes(),
                 fragment,
             )
             .map_err(|error| render_build_fail_named(19, error))?;
-            apply_g17p_fragment_pdm_remap(fragment)?;
             fragment_rce.with_bytes_mut(|rce| {
                 g17_render::stage_g17p_fragment_rce_programs(
                     fragment,
@@ -5518,6 +5474,7 @@ impl G17PUserRenderStorage {
                 g17_render::RenderDescriptorKind::Tiling,
                 G17P_BOOTSTRAP_TA_DESCRIPTOR_LOW_VA,
                 g17_initdata::CONTROL_SHARED_ADDRESS,
+                g17p_render_queue_id(false) as u8,
                 submission_ordinal,
                 false,
                 g17p_render_native_pm_bytes(),
@@ -5540,13 +5497,13 @@ impl G17PUserRenderStorage {
                 g17_render::RenderDescriptorKind::Fragment,
                 descriptor_3d_render_va,
                 g17_initdata::CONTROL_SHARED_ADDRESS,
+                g17p_render_queue_id(false) as u8,
                 submission_ordinal,
                 false,
                 g17p_render_native_pm_bytes(),
                 fragment,
             )
             .map_err(|_| EINVAL)?;
-            apply_g17p_fragment_pdm_remap(fragment)?;
             fragment_rce.with_bytes_mut(|rce| {
                 g17_render::stage_g17p_fragment_rce_programs(
                     fragment,
@@ -11462,13 +11419,10 @@ impl G17ResourceOwner {
     /// The low (client-half) GPU address of one render queue's SKSM entry
     /// region.
     ///
-    /// These are the two fixed VAs the render tag-15 ConfigUpdate already
-    /// publishes at `+0x08`, backed by `bootstrap_{ta,3d}_context_peer`. They
-    /// are NOT slots of a global `base + qid * 0x28000` array to be indexed:
-    /// the driver owns exactly these two 0x20000 regions, and the stride
-    /// correspondence to the native formula is a coincidence of qid 0 and 1.
-    /// Writing anywhere else in that window lands in whatever else occupies
-    /// those pages.
+    /// These are the per-QID VAs the render tag-15 ConfigUpdate publishes at
+    /// `+0x08`, backed by `bootstrap_{ta,3d}_context_peer`. Metal's live queue
+    /// objects prove both aliases follow `base + qid * 0x28000`; Linux maps
+    /// only the two kernel-owned application queues into those slots.
     pub(crate) const fn render_sksm_entry_low_va(tiling: bool) -> u64 {
         if tiling {
             G17P_BOOTSTRAP_TA_CONTEXT_LOW_VA
@@ -11830,6 +11784,7 @@ impl G17ResourceOwner {
         &mut self,
         queue_gpu_va: u64,
         queue_write_index: u32,
+        queue_id: u8,
     ) -> Result<g17_submission::PreparedG17PComputeChannelWork> {
         let channels = g17_initdata::derive_channel_table(
             InstanceRole::Primary,
@@ -11850,8 +11805,8 @@ impl G17ResourceOwner {
             queue_gpu_va,
             queue_write_index,
         };
-        let prepared =
-            g17_submission::prepare_g17p_compute_channel_work(state).map_err(|_| EINVAL)?;
+        let prepared = g17_submission::prepare_g17p_compute_channel_work(state, queue_id)
+            .map_err(|_| EINVAL)?;
         let slot_gpu_va = channel
             .ring
             .checked_add(prepared.outer.slot_byte_offset as u64)
@@ -13017,8 +12972,10 @@ mod tests {
             sksm_entries,
             SHARED_SUPPORT,
             CHANNEL_CONTROL,
+            4,
             &mut graph,
             &mut context,
+            true,
         )
         .unwrap();
         let actual = &graph
@@ -13062,8 +13019,10 @@ mod tests {
             relocated,
             SHARED_SUPPORT,
             CHANNEL_CONTROL,
+            4,
             &mut relocated_graph,
             &mut relocated_context,
+            true,
         )
         .unwrap();
         let relocated_actual = &relocated_graph
