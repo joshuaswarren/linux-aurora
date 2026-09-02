@@ -9,6 +9,7 @@
 #include <linux/mfd/macsmc.h>
 #include <linux/module.h>
 #include <linux/nvmem-consumer.h>
+#include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/reboot.h>
 #include <linux/slab.h>
@@ -209,7 +210,14 @@ static int macsmc_reboot_probe(struct platform_device *pdev)
 	 * thus bail out early if the SMC on the current machines does not
 	 * support reboot and has no node in the device tree.
 	 */
-	if (!pdev->dev.of_node)
+	/*
+	 * J700 has a working MBSE restart path but its installed handoff DT
+	 * predates the apple,smc-reboot child.  The macsmc MFD child is still
+	 * sufficient: its parent supplies the SMC instance and J700 does not
+	 * expose the optional reboot NVMEM cells.
+	 */
+	if (!pdev->dev.of_node &&
+	    !of_machine_is_compatible("apple,j700"))
 		return -ENODEV;
 
 	reboot = devm_kzalloc(&pdev->dev, sizeof(*reboot), GFP_KERNEL);
