@@ -1386,9 +1386,9 @@ impl ChannelEntry {
     };
 }
 
-/// The primary's descriptor-table views at main `+0x2d0`: a high-only blank
-/// sentinel, then the high halves of the PB and UMA low/high alias pairs (the
-/// low halves are the fixed context-0 addresses in
+/// The primary's global region views at main `+0x2d0`: a high-only blank
+/// sentinel, then the high halves of two low/high alias pairs (the low halves
+/// are the fixed context-0 addresses in
 /// [`REGION_VIEW_LOW_ADDRS`]). Each pair must map one physical page from both
 /// address spaces — an invariant of the UAT mapping layer that cannot be
 /// checked from the addresses alone.
@@ -1927,8 +1927,7 @@ pub(crate) fn encode_main_config(
             for (index, offset) in BUNDLE_VIEW_OFFSETS.iter().enumerate() {
                 put_u64(out, MAIN_BUNDLE_VIEWS + index * 8, bundle + *offset as u64);
             }
-            // High-only sentinel followed by the PB descriptor and UMA
-            // page-pool descriptor low/high alias pairs.
+            // High-only sentinel followed by two low/high region-view pairs.
             put_u64(out, MAIN_REGION_VIEWS, views.sentinel_high);
             put_u64(out, MAIN_REGION_VIEWS + 0x08, REGION_VIEW_LOW_ADDRS[0]);
             put_u64(out, MAIN_REGION_VIEWS + 0x10, views.alias_high[0]);
