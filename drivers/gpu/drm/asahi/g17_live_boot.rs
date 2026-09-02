@@ -3798,6 +3798,7 @@ impl G17PLiveRuntime {
                     // pause-reason: the three codes that diagnosed compute.
                     probe_g17p_ktrace(pdev.as_ref(), manager, "render-wait-failed");
                     probe_g17p_reports(pdev.as_ref(), manager, "render-wait-failed");
+
                     dump_g17p_firmware_log(pdev.as_ref(), manager, "render-wait-failed");
                 }
                 if let Some(manager) = self.manager.as_mut() {
@@ -5273,6 +5274,18 @@ impl G17PLiveRuntime {
                             (snapshot.work_channel_status[2] >> 16) & 0xffff,
                             (snapshot.work_channel_status[3] >> 16) & 0xffff,
                         );
+                        // Sweep the pipe window while the cores are still up:
+                        // by the wait-failed checkpoint the port is no longer
+                        // drivable and the read returns EAGAIN.
+                        if poll == 1 && *module_parameters::g17p_pipe_sweep.value() != 0 {
+                            if let Err(error) = registers.g17p_sweep_pipe_registers("poll1") {
+                                dev_warn!(
+                                    pdev.as_ref(),
+                                    "G17P pipe sweep failed ({:?})\n",
+                                    error,
+                                );
+                            }
+                        }
                         dev_info!(
                             pdev.as_ref(),
                             "G17P render IRQ routing post-doorbells poll={} selector={:#010x} mode={:#018x} strobe={:#010x} irq=[enable={:#018x},status={:#018x},bit3={},bit4={}] completion-bitmap=[pending={:#018x},ack={:#018x}] new-work-bitmap=[pending={:#018x},ack={:#018x}]\n",

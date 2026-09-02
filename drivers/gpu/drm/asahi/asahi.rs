@@ -252,6 +252,10 @@ kernel::module_platform_driver! {
             default: 1,
             description: "G17P parameter-buffer binding mode. 0: established packed-object fallback. 1: bind the exact PM-mode2 0xc0-byte HWPB state at both TA +0x20 and Fragment +0x28 and publish the same object in TA ConfigUpdate +0x6e, matching Metal pointer identity. 2: DIAGNOSTIC ONLY -- keep the mode-1 descriptor pointers and coherent PBDesc/HWPB ID but publish zero at TA ConfigUpdate +0x6e, isolating firmware HWPB-bind admission from descriptor execution. 3: DIAGNOSTIC ONLY -- reproduce the last TA-starting Linux pointer arrangement: packed object at TA +0x20 and TA ConfigUpdate +0x6e, PM HWPB only at Fragment +0x28.",
         },
+        g17p_pipe_sweep: u32 {
+            default: 0,
+            description: "DIAGNOSTIC ONLY -- sweep the pipe register window 0x1c800..0x1cc00 for both pipes during the render poll and log every offset that differs or is non-zero. This is 256 SKSM tag/data port reads on the submit path and it destabilises the machine, so it is off by default and must never be enabled in a canonical run. It already produced its result: pipe 1's register file is present and configured (0x1c800, 0x1c820, 0x1c890, 0x1c8e0/e8, 0x1c990, 0x1c9f8/0x1ca00, 0x1cbe0 all read identically on both pipes), pipe 0 alone carries the render's buffers (0x1c9c8=0x02018000 tilemap, 0x1c9d8=0x02019000 heapmeta, 0x1c880 control stream, 0x1c9f0 work stamp), and the one flag-shaped asymmetry is 0x1cbd8, where pipe0=0xe0000007 and pipe1=0x60000007 -- identical but for bit 31.",
+        },
         g17p_render_ta_dm: u32 {
             default: 0xff,
             description: "DIAGNOSTIC ONLY -- override the data master the TILING queue is published on. 0xff (default) keeps the native G17P_TA_DATA_MASTER. Companion to g17p_render_3d_dm: moving the fragment from DM1 to DM0 makes it execute, so this asks whether data master 1 is dead for ANY stage or only mis-configured for the fragment. Not a fix.",

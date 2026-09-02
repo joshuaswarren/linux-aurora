@@ -628,6 +628,54 @@ impl Resources {
         Ok(())
     }
 
+    /// Sweep the pipe register window for BOTH pipes and log every offset
+    /// whose two readings differ or are non-zero.
+    ///
+    /// The fragment is retired by hardware with no data-master fetch, and the
+    /// two pipe registers we already read (0x1_c880 control stream, 0x1_c9f0
+    /// work stamp) say pipe 0 is armed with the tiling stream while pipe 1
+    /// stays zero. Rather than guess which further register arms a pipe, read
+    /// the whole window both ways and let the asymmetry name itself.
+    ///
+    /// Reads only, through the same tag/data port the existing snapshot uses,
+    /// and gated on the port being drivable.
+    pub(crate) fn g17p_sweep_pipe_registers(&self, label: &str) -> Result {
+        if !self.g17p_sksm_port_powered() {
+            return Err(EAGAIN);
+        }
+        let _guard = self.sksm_fifo.lock();
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let mut differing = 0usize;
+        let mut offset = 0x1_c800u64;
+        while offset < 0x1_cc00 {
+            let pipe0 = Self::g17p_sksm_port_read_locked(&sgx, offset, 0, 0);
+            let pipe1 = Self::g17p_sksm_port_read_locked(&sgx, offset, 1, 0);
+            if let (Ok(a), Ok(b)) = (pipe0, pipe1) {
+                if a != b || a != 0 {
+                    let mark = if a != b { " DIFF" } else { "" };
+                    dev_info!(
+                        self.dev.as_ref(),
+                        "G17P PIPESWEEP[{}] {:#07x}: pipe0={:#018x} pipe1={:#018x}{}\n",
+                        label,
+                        offset,
+                        a,
+                        b,
+                        mark,
+                    );
+                    differing += 1;
+                }
+            }
+            offset += 8;
+        }
+        dev_info!(
+            self.dev.as_ref(),
+            "G17P PIPESWEEP[{}]: {} interesting offsets in 0x1c800..0x1cc00\n",
+            label,
+            differing,
+        );
+        Ok(())
+    }
+
     /// Whether the SKSM tag/data port can be driven from the host right now.
     ///
     /// The asynchronous SErrors that made every host SKSM write suppressible
