@@ -2354,13 +2354,26 @@ impl G17PManagerConstruction {
                             // dynamically (captured values include 1, 2 and
                             // 4); Linux reserves and publishes slot 2 in all
                             // three places.
-                            queue_byte_32: 2,
+                            queue_byte_32: match *crate::module_parameters::g17p_render_kick_qos
+                                .value()
+                            {
+                                1 if tiling => 1,
+                                2 => 1,
+                                _ => 2,
+                            },
                             // G17P's stage wrappers select row 1 of the native
                             // 9x3 QoS table: TA=0x0c, 3D=0x18, CL=0x08. The
                             // former render path copied CL's class into both
                             // graphics queues, leaving 3D on the wrong launch
                             // class even after TA completed successfully.
-                            class_40: if tiling { 0x0c } else { 0x18 },
+                            class_40: match *crate::module_parameters::g17p_render_kick_qos
+                                .value()
+                            {
+                                1 if tiling => 0x08,
+                                2 => 0x08,
+                                _ if tiling => 0x0c,
+                                _ => 0x18,
+                            },
                             // Direct entry-ring captures show 0xffff here for
                             // both ordinary Metal TA and 3D kicks. Earlier
                             // values 1/0 came from the wrong adjacent global,
