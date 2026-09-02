@@ -3166,6 +3166,17 @@ impl G17PManagerConstruction {
             storage.log_render_queue_record(&dev, true, label);
             storage.log_render_queue_record(&dev, false, label);
         }
+        let dumpdev = self.resources.dev().clone();
+        if let Some(storage) = self.render_storage.as_mut() {
+            storage.dump_graph_region(&dumpdev, "opt-TA", label, 0x3000, 0xc0);
+            storage.dump_graph_region(&dumpdev, "opt-3D", label, 0x30c0, 0xc0);
+            storage.dump_graph_region(&dumpdev, "evt-TA", label, 0x3200, 0x40);
+            storage.dump_graph_region(&dumpdev, "evt-3D", label, 0x3600, 0x40);
+            storage.dump_descriptor_region(&dumpdev, "desc-TA", label, 0x0000, 0x200);
+            storage.dump_descriptor_region(&dumpdev, "desc-3D", label, 0x4000, 0x200);
+        }
+        self.resources.dump_render_sksm_entry(true, label);
+        self.resources.dump_render_sksm_entry(false, label);
         self.resources.log_render_sksm_entry(true, label, 0);
         self.resources.log_render_sksm_entry(true, label, strides[0]);
         self.resources

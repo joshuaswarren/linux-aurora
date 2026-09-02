@@ -4312,6 +4312,73 @@ fn render_build_fail(site: u32) -> kernel::error::Error {
 }
 
 impl G17PUserRenderStorage {
+    /// Same, for the descriptor object the kick entry names at +0x10.
+    pub(crate) fn dump_descriptor_region(
+        &mut self,
+        dev: &AsahiDevice,
+        who: &str,
+        label: &str,
+        offset: usize,
+        length: usize,
+    ) {
+        let Ok(vmap) = self.descriptors.object.vmap() else {
+            return;
+        };
+        let bytes = unsafe {
+            // SAFETY: the VMap covers the page-rounded descriptor object; the
+            // slice below is bounds-checked against logical_size.
+            core::slice::from_raw_parts(vmap.as_ptr(), self.descriptors.logical_size)
+        };
+        if offset + length > bytes.len() {
+            return;
+        }
+        for row in 0..(length / 16) {
+            let at = offset + row * 16;
+            dev_info!(
+                dev.as_ref(),
+                "G17PDUMP {} {} {:#05x} {:02x?}\n",
+                who,
+                label,
+                row * 16,
+                &bytes[at..at + 16],
+            );
+        }
+    }
+
+    /// Machine-parseable dump of any graph region, for byte-diffing against
+    /// the native capture. Lines are `G17PDUMP <who> <label> <off> <bytes>`.
+    pub(crate) fn dump_graph_region(
+        &mut self,
+        dev: &AsahiDevice,
+        who: &str,
+        label: &str,
+        offset: usize,
+        length: usize,
+    ) {
+        let Ok(vmap) = self.graph.object.vmap() else {
+            return;
+        };
+        let bytes = unsafe {
+            // SAFETY: the VMap covers the page-rounded graph object; the slice
+            // below is bounds-checked against logical_size.
+            core::slice::from_raw_parts(vmap.as_ptr(), self.graph.logical_size)
+        };
+        if offset + length > bytes.len() {
+            return;
+        }
+        for row in 0..(length / 16) {
+            let at = offset + row * 16;
+            dev_info!(
+                dev.as_ref(),
+                "G17PDUMP {} {} {:#05x} {:02x?}\n",
+                who,
+                label,
+                row * 16,
+                &bytes[at..at + 16],
+            );
+        }
+    }
+
     /// Dump one render queue record, to diff against the native capture.
     ///
     /// macOS 2026-09-02 (`fullrecords-gfx.txt`) gives the same object for a
@@ -11670,6 +11737,44 @@ impl G17ResourceOwner {
     /// firmware changes here is direct evidence it touched the entry -- as
     /// opposed to `0x47`, which only reports whether the scheduler was idling.
     /// DRAM only; safe at any point including a timeout.
+    /// Machine-parseable dump of a whole SKSM kick entry, for byte-diffing
+    /// against the native capture. Lines are `G17PDUMP <who> <off> <bytes>`.
+    pub(crate) fn dump_render_sksm_entry(&mut self, tiling: bool, label: &str) {
+        let object = if tiling {
+            &mut self.resources.bootstrap_ta_context_peer
+        } else {
+            &mut self.resources.bootstrap_3d_context_peer
+        };
+        let mut body = [0u8; 0x200];
+        let mut ok = false;
+        if let Ok(vmap) = object.object.vmap() {
+            let bytes = unsafe {
+                // SAFETY: the VMap covers the page-rounded object and every
+                // index below is bounds-checked against logical_size.
+                core::slice::from_raw_parts(vmap.as_ptr(), object.logical_size)
+            };
+            if bytes.len() >= 0x400 {
+                body.copy_from_slice(&bytes[0x200..0x400]);
+                ok = true;
+            }
+        }
+        if !ok {
+            return;
+        }
+        let dev = self.dev().clone();
+        for row in 0..(0x200 / 16) {
+            let at = row * 16;
+            dev_info!(
+                dev.as_ref(),
+                "G17PDUMP entry-{} {} {:#05x} {:02x?}\n",
+                if tiling { "TA" } else { "3D" },
+                label,
+                at,
+                &body[at..at + 16],
+            );
+        }
+    }
+
     pub(crate) fn log_render_sksm_entry(&mut self, tiling: bool, label: &str, offset: usize) {
         let object = if tiling {
             &mut self.resources.bootstrap_ta_context_peer
