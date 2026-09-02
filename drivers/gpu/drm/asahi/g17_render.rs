@@ -1312,7 +1312,15 @@ pub(crate) fn apply_g17p_retained_descriptor_fields(
             // commands carry 7 here while +0x79c links QID 8, and 9 here while
             // +0x79c links QID 10. Leaving it zero made Linux consult the
             // unrelated QID-0 scheduler state at the TA-to-3D handoff.
-            put_u32(raw, 0x08ba, u32::from(queue_id));
+            put_u32(
+                raw,
+                0x08ba,
+                if *crate::module_parameters::g17p_render_ta_qid_field.value() != 0 {
+                    u32::from(queue_id)
+                } else {
+                    0
+                },
+            );
             put_u32(raw, 0x08c4, item_number << 16);
             put_u32(raw, 0x08c8, item_number << 24);
             put_u32(raw, 0x08d4, submission_ordinal << 16);
