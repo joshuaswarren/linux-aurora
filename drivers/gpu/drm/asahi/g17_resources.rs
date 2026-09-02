@@ -3953,11 +3953,25 @@ fn encode_g17p_parameter_management(
         return Err(EINVAL);
     }
     for index in 0..render_layout.tvb_blocks {
-        // AGXParameterManagementVirtual::prepareParameterBufferBlock stores
-        // `(gpu_va >> 15) & 0x01ff_ffff` verbatim.  Unlike Scene +0x28 and the
-        // discard pointer below, a PB page ID retains the 0x1000000000 GART
-        // segment as bit 21.  Subtracting G17P_RENDER_USER_BASE here made the
-        // page list name the same offsets in the wrong address class.
+        // A PB page ID is WINDOW-RELATIVE, like Scene +0x28 and the discard
+        // pointer below -- it does not carry the 0x1000000000 GART segment.
+        //
+        // `AGXParameterManagementVirtual::prepareParameterBufferBlock`
+        // (0xfffffe0008a75104) derives the id from `block[+0x18]->vt+0x160`
+        // (PAC diversity 0x8567). `getDiscardPageAddress` (0xfffffe0008a748e8)
+        // calls that SAME vtable slot with the same diversity, and its traced
+        // result is 0x180000 -- the compact form -- which is what lands in
+        // PBState +0x84. Firmware agrees: `FUN_14cd4` (0x14dc4 branch) and
+        // `FUN_1e330` fill page-list entries with
+        // `(PBState+0x84 >> 15) & 0x1ffffff`, one encoding for both. So native
+        // page ids are small, e.g. 0x30.
+        //
+        // The comment previously here justified keeping the segment bit by
+        // citing the 0x8002478000 fault. That fault was about PBDesc dword0/1
+        // (PBState +0x28), a DIFFERENT field which genuinely does take the full
+        // VA -- the two were conflated. With the segment retained this driver
+        // published page-list=[0x200420, ...] (bit 21 set), naming pages in an
+        // address class the parameter-buffer manager does not use.
         let backing = tvb_va
             .checked_add(
                 (index
@@ -3965,7 +3979,11 @@ fn encode_g17p_parameter_management(
                     .ok_or(EINVAL)?) as u64,
             )
             .ok_or(EINVAL)?;
-        let first_page = ((backing >> 15) & 0x01ff_ffff) as u32;
+        let first_page = ((backing
+            .checked_sub(G17P_RENDER_USER_BASE)
+            .ok_or(EINVAL)?
+            >> 15)
+            & 0x01ff_ffff) as u32;
         put_u32(raw, pm_layout.block_page_bases + index * 8, first_page);
         for page in 0..G17P_PM_PAGES_PER_BLOCK {
             let slot = index * G17P_PM_PAGES_PER_BLOCK + page;
