@@ -581,9 +581,11 @@ static int mt7921_pci_probe(struct pci_dev *pdev,
 
 	if (id->device == 0x7932 && mt7932_apple_l1ss) {
 		struct pci_dev *parent;
+		u32 ep_l1ss_cap = 0, root_l1ss_cap = 0;
 		u32 ep_l1ss_ctl1 = 0, ep_l1ss_ctl2 = 0;
 		u32 root_l1ss_ctl1 = 0, root_l1ss_ctl2 = 0;
 		u32 ep_ltr_value = 0;
+		u32 l1ss_enable, ep_l1ss_expected, root_l1ss_expected;
 		u16 ep_lnkctl = 0, root_lnkctl = 0;
 		int ep_l1ss, root_l1ss, ep_ltr, aer;
 
@@ -608,15 +610,37 @@ static int mt7921_pci_probe(struct pci_dev *pdev,
 			ret = -ENODEV;
 			goto err_free_pci_vec;
 		}
+		pci_read_config_dword(pdev, ep_l1ss + PCI_L1SS_CAP,
+				      &ep_l1ss_cap);
+		pci_read_config_dword(parent, root_l1ss + PCI_L1SS_CAP,
+				      &root_l1ss_cap);
+		l1ss_enable = ep_l1ss_cap & root_l1ss_cap &
+			      PCI_L1SS_CTL1_L1SS_MASK;
+		/* A cold J700 endpoint advertises all four substates, producing
+		 * Apple's exact endpoint/root images 0x4055000f/0x4055040f.
+		 * After an unbind the endpoint can legitimately advertise only the
+		 * two L1.2 bits, so recompute the coordinated low nibble rather than
+		 * requiring an unsupported L1.1 enable to latch.
+		 */
+		if ((l1ss_enable & PCI_L1SS_CTL1_L1_2_MASK) !=
+		    PCI_L1SS_CTL1_L1_2_MASK) {
+			dev_err(&pdev->dev,
+				"J700_MT7932_L1SS_APPLE_FAIL: common L1.2 unavailable ep_cap=%#x root_cap=%#x common=%#x\n",
+				ep_l1ss_cap, root_l1ss_cap, l1ss_enable);
+			ret = -ENODEV;
+			goto err_free_pci_vec;
+		}
+		ep_l1ss_expected = 0x40550000 | l1ss_enable;
+		root_l1ss_expected = 0x40550400 | l1ss_enable;
 
 		pci_write_config_dword(pdev, ep_ltr + PCI_LTR_MAX_SNOOP_LAT,
 				       0x10081008);
 		pci_write_config_dword(parent, root_l1ss + PCI_L1SS_CTL2, 0x28);
 		pci_write_config_dword(pdev, ep_l1ss + PCI_L1SS_CTL2, 0x48);
 		pci_write_config_dword(parent, root_l1ss + PCI_L1SS_CTL1,
-				       0x4055040f);
+				       root_l1ss_expected);
 		pci_write_config_dword(pdev, ep_l1ss + PCI_L1SS_CTL1,
-				       0x4055000f);
+				       ep_l1ss_expected);
 		pcie_capability_clear_and_set_word(parent, PCI_EXP_LNKCTL,
 					   PCI_EXP_LNKCTL_ASPMC,
 					   PCI_EXP_LNKCTL_ASPM_L1);
@@ -639,13 +663,15 @@ static int mt7921_pci_probe(struct pci_dev *pdev,
 		pcie_capability_read_word(pdev, PCI_EXP_LNKCTL, &ep_lnkctl);
 		pcie_capability_read_word(parent, PCI_EXP_LNKCTL, &root_lnkctl);
 		dev_info(&pdev->dev,
-			 "J700_MT7932_L1SS_APPLE_PASS: ep_lnkctl=0x%04x root_lnkctl=0x%04x ltr=%#x ep=%#x/%#x root=%#x/%#x\n",
+			 "J700_MT7932_L1SS_APPLE_PASS: ep_lnkctl=0x%04x root_lnkctl=0x%04x ltr=%#x ep_cap=%#x root_cap=%#x common=%#x ep=%#x/%#x root=%#x/%#x\n",
 			 ep_lnkctl, root_lnkctl, ep_ltr_value,
+			 ep_l1ss_cap, root_l1ss_cap, l1ss_enable,
 			 ep_l1ss_ctl1, ep_l1ss_ctl2,
 			 root_l1ss_ctl1, root_l1ss_ctl2);
 		if (ep_ltr_value != 0x10081008 ||
-		    ep_l1ss_ctl1 != 0x4055000f || ep_l1ss_ctl2 != 0x48 ||
-		    root_l1ss_ctl1 != 0x4055040f || root_l1ss_ctl2 != 0x28 ||
+		    ep_l1ss_ctl1 != ep_l1ss_expected || ep_l1ss_ctl2 != 0x48 ||
+		    root_l1ss_ctl1 != root_l1ss_expected ||
+		    root_l1ss_ctl2 != 0x28 ||
 		    (ep_lnkctl & (PCI_EXP_LNKCTL_ASPMC |
 				  PCI_EXP_LNKCTL_CCC |
 				  PCI_EXP_LNKCTL_CLKREQ_EN)) !=
