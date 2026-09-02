@@ -4977,7 +4977,8 @@ impl G17PUserRenderStorage {
         // {stamp 0, qid 0}), which is what the firmware then loaded, ran and
         // blamed. Native never stages anything into a live ring slot: the ring
         // is zero until encodeKickEntry fills it. Leave it zero here too.
-        let sksm_owns_entry_ring = *crate::module_parameters::g17p_render_sksm.value() != 0;
+        let sksm_owns_entry_ring = *crate::module_parameters::g17p_render_sksm.value() != 0
+            && *crate::module_parameters::g17p_render_slot_template.value() == 0;
         bootstrap_stage!("TA queue context", ta_context_peer.with_bytes_mut(|raw| {
             raw.fill(0);
             if sksm_owns_entry_ring {
