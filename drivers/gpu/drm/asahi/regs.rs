@@ -549,6 +549,29 @@ impl Resources {
         g17_submission::publish_g17p_sksm_write_pair(&G17SksmSgxPairWriter(sgx), pair)
     }
 
+    /// DIAGNOSTIC: seed a queue's completed-timestamp register to zero.
+    ///
+    /// A fresh render queue's 0x21028 reads a different uninitialised value
+    /// every boot, and the TA's kick entry carries an implicit parent of
+    /// {own qid, TS 0}. If the KSM will not make a queue eligible until its
+    /// completed timestamp actually reaches that parent, a garbage register
+    /// blocks the launch forever -- which is exactly the observed symptom: the
+    /// slot loads, the pipe arms, and nothing ever starts. Native never does
+    /// this (the firmware seeds the register when it creates the job), so this
+    /// exists only to identify the gate.
+    pub(crate) fn g17p_seed_queue_completed_timestamp(&self, qid: u8) -> Result {
+        if !self.g17p_sksm_port_powered() {
+            return Err(EAGAIN);
+        }
+        let _guard = self.sksm_fifo.lock();
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let registers = sgx.relaxed();
+        let tag = 0x21028u64 | (u64::from(qid) << 43) | (1u64 << 42);
+        registers.try_write64(tag, 0x4090)?;
+        registers.try_write64(0, 0x4098)?;
+        Ok(())
+    }
+
     /// Whether the SKSM tag/data port can be driven from the host right now.
     ///
     /// The asynchronous SErrors that made every host SKSM write suppressible

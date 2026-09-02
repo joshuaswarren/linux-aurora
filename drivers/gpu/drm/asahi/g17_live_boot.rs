@@ -3343,6 +3343,17 @@ impl G17PLiveRuntime {
         if self.is_crashed() {
             g17_lifecycle::recover_persistent_runtime(self)?;
         }
+        // Never publish while a firmware recovery is open. The compute path
+        // has done this since the recovery work; render never did, and the
+        // firmware behaviour it guards against is exactly render's symptom:
+        // while `status_b[0x4900] != 0` the scheduler dispatches only the
+        // unhalt event and STASHES EVERY WORK-SCAN BIT, so nothing published
+        // can run -- and the unhalt's 128-queue restore rewrites
+        // 0x21010/0x21018/0x21020 for every queue from the halt-time
+        // snapshot, erasing any tag-14 AddKicks published while it was open.
+        // A render that is admitted, armed on its pipe and never launched is
+        // what that produces.
+        self.settle_open_recovery_before_publication()?;
         // Compute retains its client aliases and VmBind after retirement so
         // repeated dispatches can reuse the installed QID4 graph.  Render's
         // full FList view cannot coexist with those aliases: its block 21
@@ -3507,6 +3518,43 @@ impl G17PLiveRuntime {
         // this driver rang between the two groups has no counterpart in the
         // oracle. Publish the tiling group first, then ring the single
         // doorbell below.
+        if *module_parameters::g17p_render_seed_ts.value() != 0 {
+            if let Some(registers) = self.registers.as_ref() {
+                for qid in [
+                    g17_resources::g17p_render_queue_id(true) as u8,
+                    g17_resources::g17p_render_queue_id(false) as u8,
+                ] {
+                    match registers.g17p_seed_queue_completed_timestamp(qid) {
+                        Ok(()) => dev_info!(
+                            self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                            "G17P render: seeded qid {} completed-timestamp to 0\n",
+                            qid,
+                        ),
+                        Err(error) => dev_warn!(
+                            self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                            "G17P render: seeding qid {} failed ({:?})\n",
+                            qid,
+                            error,
+                        ),
+                    }
+                }
+            }
+        }
+        if (native_doorbell_mode == 2 || native_doorbell_mode == 3)
+            && *module_parameters::g17p_render_slot_template.value() != 0
+        {
+            if let Err(error) = Pin::new(self.gfx_rtkit.as_mut().ok_or(ENODEV)?)
+                .send_message(
+                    g17_rtkit::ENDPOINT_GFX_INTERRUPTS,
+                    g17_submission::G17P_NATIVE_3D_DOORBELL,
+                )
+            {
+                return match g17_lifecycle::recover_persistent_runtime(self) {
+                    Ok(()) => Err(error),
+                    Err(recovery_error) => Err(recovery_error),
+                };
+            }
+        }
         if native_doorbell_mode == 2 || native_doorbell_mode == 3 {
             if native_doorbell_mode == 3 {
                 if let Err(error) = self
