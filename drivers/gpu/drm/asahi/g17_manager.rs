@@ -3274,8 +3274,12 @@ impl G17PManagerConstruction {
             storage.dump_graph_region(&dumpdev, "opt-3D", label, 0x30c0, 0xc0);
             storage.dump_graph_region(&dumpdev, "evt-TA", label, 0x3200, 0x40);
             storage.dump_graph_region(&dumpdev, "evt-3D", label, 0x3600, 0x40);
-            storage.dump_descriptor_region(&dumpdev, "desc-TA", label, 0x0000, 0x200);
-            storage.dump_descriptor_region(&dumpdev, "desc-3D", label, 0x4000, 0x200);
+            storage.dump_descriptor_region(&dumpdev, "desc-TA", label, 0x0000, 0x2400);
+            // Full fragment descriptor, not the first 0x200. Native's 3D command
+            // record is captured to 0x2400 (recs3.txt), so dumping the same
+            // extent makes a byte diff possible -- which is what "the fragment
+            // executes but writes no pixels" now needs.
+            storage.dump_descriptor_region(&dumpdev, "desc-3D", label, 0x4000, 0x2400);
             // b1 FUN_23004 selects the RENDER job state machine (FUN_15bcc,
             // which ends at the DM launch strobe FUN_15a48 -> 0x1c998 = 1)
             // when the command it builds the job from has +0x866 == 3. The
