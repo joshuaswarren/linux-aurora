@@ -84,6 +84,11 @@
 							 &pcie_radio_port 0x2
 						 0x0 0x0 0x0 0x4
 							 &pcie_radio_port 0x3>;
+
+					wifi@0,0 {
+						compatible = "pci14c3,7932";
+						reg = <0x10000 0x0 0x0 0x0 0x0>;
+					};
 				};
 			};
 		};
