@@ -3357,28 +3357,39 @@ impl G17PManagerConstruction {
         {
             let dev = self.resources.dev().clone();
             {
-                let mut pa = [0u8; 0x100];
+                let mut pa = [0u8; 0x200];
                 if self
                     .render_storage
                     .as_mut()
                     .map(|s| s.read_pool_a_record(&mut pa).is_ok())
                     .unwrap_or(false)
                 {
-                    let g94 = u32::from_le_bytes([pa[0x94], pa[0x95], pa[0x96], pa[0x97]]);
-                    let verdict = if g94 != 0 {
-                        "NONZERO -> firmware drops the TA work silently"
+                    // The TA descriptor's +0x10 selects WHICH Pool-A record the
+                    // firmware gates on, and it is record 1 by default -- read
+                    // both. `FUN_16f7c` sets +0x94 = 1 after linking the job, so
+                    // a 1 proves the classic TA enqueue ran and the job is
+                    // sitting in the list; a 0 proves it never ran at all.
+                    let r0 = u32::from_le_bytes([pa[0x94], pa[0x95], pa[0x96], pa[0x97]]);
+                    let r1 = u32::from_le_bytes([
+                        pa[0x194], pa[0x195], pa[0x196], pa[0x197],
+                    ]);
+                    let v1 = if r1 != 0 {
+                        "rec1 QUEUED (FUN_16f7c ran, job linked, nothing dequeues DM0)"
                     } else {
-                        "zero -> gate passes"
+                        "rec1 NOT queued (FUN_16f7c never ran)"
                     };
                     dev_info!(
                         dev.as_ref(),
-                        "G17P pool-a[{}] +0x00={:02x?} +0x10={:02x?} +0x90={:02x?} GATE+0x94={:#010x} {}\n",
+                        "G17P pool-a[{}] rec0(+0x00={:02x?} +0x10={:02x?} +0x94={:#010x}) rec1(+0x00={:02x?} +0x10={:02x?} +0x94={:#010x} link={:02x?}) {}\n",
                         label,
                         &pa[0x00..0x08],
                         &pa[0x10..0x14],
-                        &pa[0x90..0x94],
-                        g94,
-                        verdict,
+                        r0,
+                        &pa[0x100..0x108],
+                        &pa[0x110..0x114],
+                        r1,
+                        &pa[0x198..0x1a8],
+                        v1,
                     );
                 }
             }
