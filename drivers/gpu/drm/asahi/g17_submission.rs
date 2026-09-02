@@ -1017,9 +1017,36 @@ pub(crate) const G17P_NATIVE_TA_DOORBELL: u64 = MSG_TX_DOORBELL
     | ((G17P_NATIVE_RENDER_DOORBELL_PRIORITY as u64) << DOORBELL_INDEX_SHIFT);
 pub(crate) const G17P_PARTIAL_OPENING_OUTER_SLOT_SIZE: usize = 0x18;
 pub(crate) const G17P_PARTIAL_OPENING_OUTER_SLOT_COUNT: u32 = 0x100;
-pub(crate) const G17P_PARTIAL_OPENING_TILING_CHANNEL_TABLE_INDEX: u8 = 0;
-pub(crate) const G17P_PARTIAL_OPENING_FRAGMENT_CHANNEL_TABLE_INDEX: u8 = 1;
-pub(crate) const G17P_COMPUTE_CHANNEL_TABLE_INDEX: u8 = 8;
+/// Work-channel table index is `priority * 3 + pipe`, with pipe Vertex(TA)=0,
+/// Fragment(3D)=1, Compute(CL)=2. That is exactly the grouping
+/// [`g17_initdata::WORK_STATE_GRID_OFFSETS`] documents: indices 0,1,2 are
+/// TA_0/3D_0/CL_0 and indices 6,7,8 are TA_2/3D_2/CL_2.
+///
+/// The render must publish into the rings for the priority it actually
+/// configures and announces, not priority 0. Its tag-15 programs both queues
+/// at priority 2 -- firmware KTrace 0x40 reports `prio 2` for qid 5 and qid 6
+/// -- and its doorbell is `G17P_NATIVE_TA_DOORBELL`, which encodes priority 2.
+/// Publishing the work at priority 0 while telling the firmware priority 2 has
+/// work leaves the rings it consults empty, so the kick is registered on the
+/// KSM side (the slot is occupied and a pipe is assigned) while nothing ever
+/// dispatches.
+///
+/// Compute is the worked example of the rule: index 8 is CL at priority 2, it
+/// agrees with its own priority-2 doorbell 0x0a, and it is validated by 2000
+/// consecutive passing computes.
+const fn g17p_work_channel_table_index(priority: u8, pipe: PipeType) -> u8 {
+    priority * 3 + pipe as u8
+}
+pub(crate) const G17P_PARTIAL_OPENING_TILING_CHANNEL_TABLE_INDEX: u8 =
+    g17p_work_channel_table_index(G17P_NATIVE_RENDER_DOORBELL_PRIORITY, PipeType::Vertex);
+pub(crate) const G17P_PARTIAL_OPENING_FRAGMENT_CHANNEL_TABLE_INDEX: u8 =
+    g17p_work_channel_table_index(G17P_NATIVE_RENDER_DOORBELL_PRIORITY, PipeType::Fragment);
+pub(crate) const G17P_COMPUTE_CHANNEL_TABLE_INDEX: u8 =
+    g17p_work_channel_table_index(2, PipeType::Compute);
+// The compute index is the validated anchor for the rule above: it must stay 8.
+const _: () = assert!(G17P_COMPUTE_CHANNEL_TABLE_INDEX == 8);
+const _: () = assert!(G17P_PARTIAL_OPENING_TILING_CHANNEL_TABLE_INDEX == 6);
+const _: () = assert!(G17P_PARTIAL_OPENING_FRAGMENT_CHANNEL_TABLE_INDEX == 7);
 /// Compute work-submission doorbell channel. VALIDATED by 2000 consecutive
 /// passing computes. Decodes under `encode_tx_doorbell` as
 /// `pipe Compute(2) | (priority 2 << 2)` = 0x0a, which is why it is not simply
