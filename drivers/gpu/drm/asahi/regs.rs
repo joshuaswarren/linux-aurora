@@ -356,7 +356,10 @@ pub(crate) struct G17PRenderKsmAdmissionSnapshot {
     pub(crate) fragment_progress: u64,
     /// Per-QID {outstanding/timestamp, submitted, completed} from the same
     /// KSMFE registers used by Apple's queue-state dumper.
-    pub(crate) qid_counters: [[u64; 3]; 2],
+    /// TA, 3D, and the COMPUTE queue (qid 4). The third row is the control:
+    /// compute is the queue that provably dispatches, so its counter domain
+    /// is what the render rows must be compared against.
+    pub(crate) qid_counters: [[u64; 3]; 3],
     /// Authoritative queue-enabled status. These are not the write-only
     /// set-valid strobes at 0x21068/0x21070.
     pub(crate) queue_enabled: [u64; 2],
@@ -1157,6 +1160,11 @@ impl Resources {
                     u64::from(fragment_qid),
                     1u64 << 42,
                 )?,
+            ],
+            [
+                Self::g17p_sksm_port_read_locked(&sgx, 0x21010, 4, 1u64 << 42)?,
+                Self::g17p_sksm_port_read_locked(&sgx, 0x21020, 4, 1u64 << 42)?,
+                Self::g17p_sksm_port_read_locked(&sgx, 0x21028, 4, 1u64 << 42)?,
             ],
         ];
         let queue_enabled = [
