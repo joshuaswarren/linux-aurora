@@ -1588,6 +1588,17 @@ pub(crate) fn apply_g17p_cold_opening_optional(
     for (offset, value) in fields {
         put_u16_le(out, *offset, *value);
     }
+    // DIAGNOSTIC. +0x22 is the ConfigUpdate's data-master field, hardcoded to
+    // 1 for the fragment. The tiler (DM0) and compute (DM2) both dispatch and
+    // execute; the fragment is retired with KTrace 0x43 status 4 without ever
+    // running, with an identically shaped descriptor, a satisfied barrier and
+    // geometry already tiled. Overriding this isolates the data master itself.
+    if matches!(stage, G17PColdOpeningStage::Fragment) {
+        let override_dm = *crate::module_parameters::g17p_render_3d_dm.value();
+        if override_dm != 0xff {
+            put_u16_le(out, 0x22, override_dm as u16);
+        }
+    }
     // AGXChannel::resetChannelState copies channel+0x4c (the owning process
     // PID) to state+0x44. ConfigUpdate carries that same u32 at unaligned
     // +0x5a; the working Metal capture has 0x625 in both locations.
