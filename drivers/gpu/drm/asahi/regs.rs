@@ -122,6 +122,11 @@ const T8140_KSM_QUEUE_STOPPED_MASK_LO: u64 = 0x21058;
 const T8140_KSM_QUEUE_STOPPED_MASK_HI: u64 = 0x21060;
 const T8140_KSM_QUEUE_STOP_REQUEST_LO: u64 = 0x210a8;
 const T8140_KSM_QUEUE_STOP_REQUEST_HI: u64 = 0x210b0;
+const T8140_KSM_RESOURCE_CLEAR_LO: u64 = 0x210c8;
+const T8140_KSM_RESOURCE_CLEAR_HI: u64 = 0x210d0;
+const T8140_KSM_RESOURCE_GO_LO: u64 = 0x210d8;
+const T8140_KSM_RESOURCE_GO_HI: u64 = 0x210e0;
+const T8140_KSM_RESOURCE_CALLBACK_STATE: u64 = 0x211b0;
 const T8140_KSM_WORK_CHANNEL_0: u64 = 0x21168;
 const T8140_KSM_WORK_CHANNEL_1: u64 = 0x21170;
 const T8140_KSM_WORK_CHANNEL_2: u64 = 0x21178;
@@ -361,6 +366,13 @@ pub(crate) struct G17PRenderKsmAdmissionSnapshot {
     pub(crate) scheduling_pause_status: u64,
     pub(crate) queue_stop_request: [u64; 2],
     pub(crate) queue_stopped: [u64; 2],
+    /// Resource-manager broadcasts used by B1's callback path. `clear` is
+    /// written by 0x12a84 while releasing a requested mask; `go` is written by
+    /// 0x15608 after installing the job callback. 0x211b0 becomes 4 while the
+    /// callback list remains pending.
+    pub(crate) resource_clear: [u64; 2],
+    pub(crate) resource_go: [u64; 2],
+    pub(crate) resource_callback_state: u64,
     pub(crate) scheduler_status: u64,
     pub(crate) work_channel_status: [u64; 4],
     pub(crate) usc: Option<G17PUscEngineSnapshot>,
@@ -804,6 +816,40 @@ impl Resources {
                 1u64 << 42,
             )?,
         ];
+        let resource_clear = [
+            Self::g17p_sksm_port_read_locked(
+                &sgx,
+                T8140_KSM_RESOURCE_CLEAR_LO,
+                0,
+                1u64 << 42,
+            )?,
+            Self::g17p_sksm_port_read_locked(
+                &sgx,
+                T8140_KSM_RESOURCE_CLEAR_HI,
+                0,
+                1u64 << 42,
+            )?,
+        ];
+        let resource_go = [
+            Self::g17p_sksm_port_read_locked(
+                &sgx,
+                T8140_KSM_RESOURCE_GO_LO,
+                0,
+                1u64 << 42,
+            )?,
+            Self::g17p_sksm_port_read_locked(
+                &sgx,
+                T8140_KSM_RESOURCE_GO_HI,
+                0,
+                1u64 << 42,
+            )?,
+        ];
+        let resource_callback_state = Self::g17p_sksm_port_read_locked(
+            &sgx,
+            T8140_KSM_RESOURCE_CALLBACK_STATE,
+            0,
+            1u64 << 42,
+        )?;
         let scheduler_status = Self::g17p_sksm_port_read_locked(
             &sgx,
             T8140_KSM_SCHEDULER_STATUS,
@@ -898,6 +944,9 @@ impl Resources {
             scheduling_pause_status,
             queue_stop_request,
             queue_stopped,
+            resource_clear,
+            resource_go,
+            resource_callback_state,
             scheduler_status,
             work_channel_status,
             usc,
