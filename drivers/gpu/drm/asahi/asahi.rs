@@ -264,6 +264,10 @@ kernel::module_platform_driver! {
             default: 0,
             description: "DIAGNOSTIC ONLY -- issue the 3D launch strobe from the host during the render poll: write (value-1) to sgx+0x10398 then 2 to sgx+0x1c9a0. 0: off. b1's 0x1c9a0 = 2 is the only 3D launch in the image and its single writer is the tiling job's state 4, which is unreachable here because the new-work interrupt is never raised and no firmware job is ever built. The hardware has latched the fragment at 0xc0f0/0xc0f8 with dm-masks[1] set, so the work is presented and only the strobe is missing. Native performs zero MMIO on the submit path, so this can never ship; it answers whether the strobe alone starts the fragment.",
         },
+        g17p_slot_burst: u32 {
+            default: 0,
+            description: "DIAGNOSTIC ONLY -- immediately after the render doorbell, sample KSM slot 0's state register 256 times and log the distinct values in order. The poll loop only ever sees the slot empty and then the fragment stuck at 0x0100000d a millisecond later, so no sample has ever caught a queue while it is actually dispatched and progressing. This is read-only through the SKSM port.",
+        },
         g17p_dump_hwdata: u32 {
             default: 0,
             description: "DIAGNOSTIC ONLY -- dump the whole 0x3db4 hardware-data block this driver builds, once, at the first render checkpoint. HW_DATA_OPAQUE_RUNS (the 269 hardcoded bytes) is already verified byte-exact against native; the rest of the block is computed and has never been compared. Native's block was captured whole from AGXArmFirmwareASC + 0x2b8, so this makes a full diff possible. Very noisy; off by default.",

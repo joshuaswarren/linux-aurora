@@ -753,6 +753,37 @@ impl Resources {
         Ok((before, after))
     }
 
+    /// DIAGNOSTIC. Sample KSM slot 0's state register in a tight burst and
+    /// return the distinct values seen, in order.
+    ///
+    /// The render poll loop samples before the doorbell and again about a
+    /// millisecond later, by which time the tiler has already run and retired.
+    /// Everything known about a slot's life therefore comes from two frames:
+    /// empty, then the fragment stuck at 0x0100000d. A burst catches the
+    /// transitions -- what a slot looks like while a queue is actually
+    /// dispatched and progressing -- which is the "good" reference this has
+    /// never had.
+    pub(crate) fn g17p_burst_sample_slot0(&self, out: &mut [u64; 16]) -> Result<usize> {
+        if !self.g17p_sksm_port_powered() {
+            return Err(EAGAIN);
+        }
+        let _guard = self.sksm_fifo.lock();
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let mut distinct = 0usize;
+        let mut last = u64::MAX;
+        for _ in 0..256 {
+            let state = Self::g17p_sksm_port_read_locked(&sgx, 0xc020, 0, 1u64 << 42)?;
+            if state != last {
+                if distinct < out.len() {
+                    out[distinct] = state;
+                }
+                distinct += 1;
+                last = state;
+            }
+        }
+        Ok(distinct)
+    }
+
     /// Whether the SKSM tag/data port can be driven from the host right now.
     ///
     /// The asynchronous SErrors that made every host SKSM write suppressible
