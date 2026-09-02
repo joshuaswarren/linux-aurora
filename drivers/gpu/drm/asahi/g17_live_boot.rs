@@ -3689,6 +3689,25 @@ impl G17PLiveRuntime {
                     Err(recovery_error) => Err(recovery_error),
                 };
             }
+            if *module_parameters::g17p_slot_burst.value() != 0 {
+                if let Some(registers) = self.registers.as_ref() {
+                    let mut seen = [0u64; 16];
+                    match registers.g17p_burst_sample_slot0(&mut seen) {
+                        Ok(n) => dev_info!(
+                            self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                            "G17P render SLOTBURST distinct={} [{:#018x},{:#018x},{:#018x},{:#018x},{:#018x},{:#018x},{:#018x},{:#018x}]\n",
+                            n,
+                            seen[0], seen[1], seen[2], seen[3],
+                            seen[4], seen[5], seen[6], seen[7],
+                        ),
+                        Err(error) => dev_warn!(
+                            self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                            "G17P render SLOTBURST failed ({:?})\n",
+                            error,
+                        ),
+                    }
+                }
+            }
             self.probe_render_ksm_admission_after_render_doorbells();
         } else {
             let doorbells: &[u64] = if native_doorbells {
