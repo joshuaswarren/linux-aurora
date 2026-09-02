@@ -198,24 +198,15 @@ struct G17PHardwareBufferIdAllocator {
 
 impl G17PHardwareBufferIdAllocator {
     fn new() -> Self {
-        // ID 0 is RESERVED, never handed out. `AGXHardwareBufferIDManager` is
-        // the native allocator for this id, and every captured render carries
-        // 2, 3, 4 or 5 in TA descriptor +0x18 -- never 0. The same value is the
-        // PBDesc index, PBState +0x0c, register 0x1c830 and tag-15 +0x7e, so a
-        // zero would name entry zero of each of those tables; whether that is
-        // legal to the parameter-buffer manager is not established anywhere in
-        // the captures. Starting at 1 removes the variable at the cost of one
-        // id out of 127.
         let mut stack = [0u8; G17P_TA_HARDWARE_BUFFER_ID_COUNT];
-        let usable = G17P_TA_HARDWARE_BUFFER_ID_COUNT - 1;
-        for (index, slot) in stack.iter_mut().take(usable).enumerate() {
+        for (index, slot) in stack.iter_mut().enumerate() {
             *slot = (G17P_TA_HARDWARE_BUFFER_ID_COUNT - 1 - index) as u8;
         }
         Self {
-            // 127 valid bits: IDs 0..126, with 0 withheld.
-            free: [u64::MAX & !1, u64::MAX >> 1],
+            // 127 valid bits: IDs 0..126.
+            free: [u64::MAX, u64::MAX >> 1],
             stack,
-            stack_len: usable,
+            stack_len: G17P_TA_HARDWARE_BUFFER_ID_COUNT,
         }
     }
 
