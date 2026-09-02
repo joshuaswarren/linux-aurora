@@ -4079,7 +4079,21 @@ impl G17PManagerConstruction {
         let (completion_ordinal_0, completion_ordinal_2) =
             self.resources.map_user_completion_aliases(vm)?;
         let mappings = queue.compute.map_user_execution_state(vm)?;
+        // Bracketed to localise the ordering hang: after a failed render the
+        // next compute goes silent for tens of seconds here. slotalloc's
+        // get_inner is documented "Blocks if no slots are free", and T8140
+        // limits the allocator to ONE user slot, so a retained binding from a
+        // previous client blocks every later one.
+        dev_info!(
+            self.resources.dev().as_ref(),
+            "G17P compute: acquiring UAT bind for vm\n"
+        );
         let vm_bind = self.resources.uat().bind(vm)?;
+        dev_info!(
+            self.resources.dev().as_ref(),
+            "G17P compute: UAT bind acquired, slot {}\n",
+            vm_bind.slot()
+        );
         // Slot 1 is where the VM is *bound*: the first-partial opening pins
         // the render/descriptor/optional-identity context there and the
         // root-phase machine reads `ttbs[0]`/`ttbs[1]` back verbatim. It is
