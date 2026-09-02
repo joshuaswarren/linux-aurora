@@ -4326,6 +4326,10 @@ fn apply_g17p_fragment_pdm_remap(fragment: &mut [u8]) -> Result {
     // carries the native first RCE array's packed byte/count word.
     put_u32(fragment, 0x079c, u32::from(g17p_render_queue_id(false)));
     put_u64(fragment, 0x07a8, 1);
+    pr_info!(
+        "G17P render PDM proof remap applied: descriptor coordinate qid={} packed=0x1\n",
+        g17p_render_queue_id(false),
+    );
     Ok(())
 }
 
@@ -6551,6 +6555,40 @@ impl G17PUserRenderStorage {
                     .try_into()
                     .map_err(|_| ERANGE)?,
             ))
+        })
+    }
+
+    /// Read the descriptor-local PDM/RCE dependency coordinate exactly as B1
+    /// consumes it before 3D activation. The packed value is simultaneously
+    /// the first embedded register-array {byte_count, entry_count} word and a
+    /// 40-bit queue timeline target; keeping the read beside +0x20f0 makes a
+    /// failed proof distinguish "encoder did not change" from "changed but
+    /// rejected downstream" without requiring a full descriptor dump.
+    pub(crate) fn fragment_pdm_coordinate(&mut self) -> Result<(u32, u64, u64)> {
+        self.descriptors.with_bytes_mut(|raw| {
+            let fragment = raw.get(0x4000..0x8000).ok_or(ERANGE)?;
+            let qid = u32::from_le_bytes(
+                fragment
+                    .get(0x079c..0x07a0)
+                    .ok_or(ERANGE)?
+                    .try_into()
+                    .map_err(|_| ERANGE)?,
+            );
+            let rce_pointer = u64::from_le_bytes(
+                fragment
+                    .get(0x07a0..0x07a8)
+                    .ok_or(ERANGE)?
+                    .try_into()
+                    .map_err(|_| ERANGE)?,
+            );
+            let packed = u64::from_le_bytes(
+                fragment
+                    .get(0x07a8..0x07b0)
+                    .ok_or(ERANGE)?
+                    .try_into()
+                    .map_err(|_| ERANGE)?,
+            );
+            Ok((qid, rce_pointer, packed))
         })
     }
 
