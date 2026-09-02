@@ -438,6 +438,12 @@ impl G17PBootstrapUmaLifecycle {
 const G17P_GFX_LINK_DATA_BASE: u64 = 0xffff_fc00_0004_c000;
 const G17P_GFX_LINK_DATA_END: u64 = 0xffff_fc00_0018_0000;
 const G17P_GFX_PHYSICAL_DATA_BASE: u64 = 0x0000_0100_01d7_c000;
+
+/// Translate a GFX firmware LINK address into the physical address the host
+/// can map. Same arithmetic the render status-page probes use.
+pub(crate) fn g17p_gfx_link_to_physical(link: u64) -> u64 {
+    G17P_GFX_PHYSICAL_DATA_BASE + (link - G17P_GFX_LINK_DATA_BASE)
+}
 /// Firmware per-QID dependency records: `0x1261f0 + qid*0x18`, valid byte at
 /// `+0`, completed stamp at `+8`. Firmware DATA segment, so host-readable.
 const G17P_DEPENDENCY_RECORD_LINK_BASE: u64 = 0xffff_fc00_0012_61f0;

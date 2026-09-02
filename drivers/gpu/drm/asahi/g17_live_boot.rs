@@ -3554,6 +3554,29 @@ impl G17PLiveRuntime {
                 }
             }
         }
+        if *module_parameters::g17p_fw_trace_classes.value() != 0 {
+            // 0x17780c bits 1,2 and 0x17780d bit 1, inside the qword at
+            // 0x177808: byte 4 bits 1,2 -> qword bits 33,34; byte 5 bit 1 ->
+            // qword bit 41.
+            const CLASS_QWORD_LINK: u64 = 0xffff_fc00_0017_7808;
+            const CLASS_BITS: u64 = (1 << 33) | (1 << 34) | (1 << 41);
+            let phys = g17_manager::g17p_gfx_link_to_physical(CLASS_QWORD_LINK);
+            match crate::pgtable::LiveFirmwareU64Probe::new(phys)
+                .and_then(|p| p.set_bits(CLASS_BITS))
+            {
+                Ok((before, after)) => dev_info!(
+                    self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                    "G17P render: DIAGNOSTIC armed fw trace classes {:#018x} -> {:#018x}\n",
+                    before,
+                    after,
+                ),
+                Err(error) => dev_warn!(
+                    self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                    "G17P render: DIAGNOSTIC fw trace class arm failed ({:?})\n",
+                    error,
+                ),
+            }
+        }
         if *module_parameters::g17p_ksm_cold_arm.value() != 0 {
             if let Some(registers) = self.registers.as_ref() {
                 match registers.g17p_ksm_cold_arm() {
