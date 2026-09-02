@@ -8871,6 +8871,42 @@ impl G17ResourceOwner {
                 .get_mut(share_offset..share_offset + 4)
                 .ok_or(EINVAL)?
                 .copy_from_slice(&G17P_SINGLE_RENDER_QOS_SHARE.to_le_bytes());
+            // `AGXQOSQueue::willSubmit(qid, dm)` @ 0xfffffe0008a80fa8 also bumps
+            // two monotonic counters in this same object, which this driver has
+            // never written. Decoded from the kext:
+            //
+            //   x9 = QoS base
+            //   +0x400 + qid*4   u32, ldr/add #1/str            (qid-indexed)
+            //   +0x600 + idx*4   u32, ldr/add #1/str            (idx = obj+0x10)
+            //   +0xe20 + dm*8    u64, ldr/add #1/str, then dmb  (DM-indexed)
+            //
+            // The object is 0xe40 bytes, which is exactly 0xe20 plus four u64s
+            // -- an independent check that the per-data-master block really is
+            // the last one and really is 8-byte strided.
+            //
+            // `+0x600` is deliberately NOT written here: its index is
+            // `AGXQOSQueue+0x10`, which `init` @ 0xfffffe0008a81520 sets to
+            // 0xffffffff and something outside init assigns. Writing it on a
+            // guessed index would scribble on the object, so it stays open.
+            let submit_counter_offset = 0x400usize
+                .checked_add(usize::from(header.queue_id).checked_mul(4).ok_or(EINVAL)?)
+                .ok_or(EINVAL)?;
+            let counter = bytes
+                .get_mut(submit_counter_offset..submit_counter_offset + 4)
+                .ok_or(EINVAL)?;
+            let bumped = u32::from_le_bytes(counter.try_into().map_err(|_| EINVAL)?)
+                .wrapping_add(1);
+            counter.copy_from_slice(&bumped.to_le_bytes());
+
+            let data_master_offset = 0xe20usize
+                .checked_add(usize::from(header.data_master).checked_mul(8).ok_or(EINVAL)?)
+                .ok_or(EINVAL)?;
+            let per_dm = bytes
+                .get_mut(data_master_offset..data_master_offset + 8)
+                .ok_or(EINVAL)?;
+            let bumped = u64::from_le_bytes(per_dm.try_into().map_err(|_| EINVAL)?)
+                .wrapping_add(1);
+            per_dm.copy_from_slice(&bumped.to_le_bytes());
             Ok(())
         })?;
         // Native ends `willSubmit` with `dmb ish`. Order these shared WC
