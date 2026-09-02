@@ -1352,10 +1352,28 @@ impl Resources {
             )?,
         ];
 
-        // Bits 25:24 of an admitted QID state encode pipe + 1. B1 uses this
+        // Bits 25:24 of an admitted slot state encode pipe + 1. B1 uses this
         // exact conversion before its banked USC reads. A zero value means no
         // pipe has been assigned yet, so do not perturb either selector.
-        let usc = match ((fragment_state >> 24) & 0x3).checked_sub(1) {
+        //
+        // Index the state bank by SLOT, not by QID. `0xc020` is the same
+        // register `slot_state` reads with a slot index above, and measurement
+        // settles which meaning is right: with the fragment stuck in KSM slot
+        // 0, the read at index 0 returns 0x0100000d with progress naming qid 6,
+        // while the reads at index 5 and index 6 -- the TA and 3D qids -- both
+        // return zero. So a QID-indexed read of this bank reports "no pipe" for
+        // work that demonstrably has one, which is why this snapshot was always
+        // skipped for the one queue it exists to describe.
+        //
+        // Find the slot whose progress word names the fragment's qid. The qid
+        // lives at bits 46:40 of the progress word, the same field the slot
+        // dump decodes.
+        let fragment_slot_state = slot_progress
+            .iter()
+            .position(|progress| ((progress >> 40) & 0x7f) == u64::from(fragment_qid))
+            .map(|slot| slot_state[slot])
+            .unwrap_or(0);
+        let usc = match ((fragment_slot_state >> 24) & 0x3).checked_sub(1) {
             Some(pipe) => {
                 let pipe = pipe as u32;
                 // B1's explicit USC dump writes these selectors but does not
