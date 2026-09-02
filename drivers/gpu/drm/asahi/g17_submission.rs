@@ -1768,17 +1768,25 @@ pub(crate) fn apply_g17p_cold_opening_queue_record(
     put_u32_le(out, 0x2c, 2);
     out[0x36..0x38].fill(0xff);
     put_u32_le(out, 0x38, 0);
-    put_u32_le(out, 0x3c, 2);
-    put_u32_le(out, 0x40, u32::MAX);
+    // MEASURED ON macOS 2026-09-02 (`ringrec-gfx.txt`): the live per-queue
+    // record of a real Metal render pass, read through the kernel alias the
+    // AGXChannel keeps at +0x58 for the firmware VA at +0x80, is
+    //
+    //   +0x24 0xffffffff   +0x28 2   +0x2c 2   +0x36 0xffff
+    //   +0x40 2   +0x44 0xffffffff   +0x48 <pid>
+    //   +0x9c <scheduler/channel-control pointer>
+    //
+    // This driver had that {2, 0xffffffff, pid} block four bytes early, at
+    // +0x3c/+0x40/+0x44, and the pointer at +0x70. The pointer had once been
+    // at +0x9c and was moved on the theory that the object is 0x80 bytes; the
+    // ring slots name records on an exact 0xc0 stride (base + qid * 0xc0), so
+    // 0x9c is inside the object and was right all along.
+    put_u32_le(out, 0x40, 2);
+    put_u32_le(out, 0x44, u32::MAX);
     // Native reset copies the channel owner's process PID here. The same
     // value is published in ConfigUpdate +0x5a.
-    put_u32_le(out, 0x44, addresses.owner_pid);
-    // Native reset clears +0x48 and copies channel+0xf8 to state+0x70. The
-    // firmware resource stack allocates this object with an exact 0x80-byte
-    // stride, so the old inherited +0x9c pointer was outside the object KSM
-    // receives through entry payload +0x18.
-    put_u64_le(out, 0x70, addresses.channel_control);
-    put_u32_le(out, 0x94, 0);
+    put_u32_le(out, 0x48, addresses.owner_pid);
+    put_u64_le(out, 0x9c, addresses.channel_control);
     Ok(())
 }
 
