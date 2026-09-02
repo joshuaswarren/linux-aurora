@@ -156,6 +156,10 @@ kernel::module_platform_driver! {
             default: 0,
             description: "Non-zero: at every compute submit, hexdump 64 bytes of GPU-visible memory at this VA and probe every 8-byte word inside it that looks like a user VA, dumping 32 bytes at each. Chases the descriptor chain the SHADER walks -- root descriptor -> sets[0] -> the buffer address it stores through -- none of which appears in the UAPI or in the command stream, so nothing else can name it. Set it to Mesa's `G17P root: va=` value (HK_G17P_LAUNCH_TRACE=1). 0: off.",
         },
+        g17p_vdm_dump: u32 {
+            default: 0,
+            description: "DIAGNOSTIC ONLY -- hexdump the first 128 bytes of Mesa's VDM control stream at render submit. The tiler demonstrably fetches this stream (pipe-vdm-stream reads back the encoded pointer on pipes 0 and 2 with work stamps 0x100) and then bins essentially nothing: 60 non-zero bytes in a 1277952-byte tile buffer, and the content is an initialised-but-empty bounding box carrying 0x7fc00000 (NaN) and 0x7fffffff extremes. Either the stream contains no draw, or it draws primitives that are all culled. This shows which. 0: off (default), 1: dump.",
+        },
         g17p_fault_report: u32 {
             default: 1,
             description: "Log the firmware fault report reached through main_config+0x26c (blamed qid, data master, recovery state) next to the MMU fault bank (1: on)",

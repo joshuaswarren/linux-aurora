@@ -1166,6 +1166,42 @@ impl queue::Queue for G17PQueue {
                     ..
                 } => {
                     Self::log_render_payload(submission_id, &payload);
+                    // Dump Mesa's VDM control stream. The tiler provably
+                    // FETCHES it -- pipe-vdm-stream reads back the encoded
+                    // pointer on pipes 0 and 2 -- and then bins 60 non-zero
+                    // bytes into a 1.28 MB tile buffer, whose content is an
+                    // empty bounding box (0x7fc00000 NaN and 0x7fffffff
+                    // extremes). So the stream is reached and executed and
+                    // yields zero primitives. Its first bytes say whether it
+                    // contains a draw at all.
+                    if *module_parameters::g17p_vdm_dump.value() != 0 {
+                        let mut head = [0u8; 128];
+                        match self.vm.read_bytes(payload.vdm_base, &mut head) {
+                            Ok(()) => Self::log_hex("vdm", payload.vdm_base, &head),
+                            Err(error) => pr_info!(
+                                "G17P vdm dump: read {:#x} failed ({:?})\n",
+                                payload.vdm_base,
+                                error
+                            ),
+                        }
+                        // g17p_vm_probe_va was compute-only. The render path
+                        // needs it more: the VDM stream embeds the vertex
+                        // buffer address, and NaN bounds in the tile buffer
+                        // point at what the shader READS rather than at the
+                        // stream itself.
+                        let probe = *module_parameters::g17p_vm_probe_va.value();
+                        if probe != 0 {
+                            let mut buf = [0u8; 64];
+                            match self.vm.read_bytes(probe, &mut buf) {
+                                Ok(()) => Self::log_hex("vdm-probe", probe, &buf),
+                                Err(error) => pr_info!(
+                                    "G17P vdm probe: read {:#x} failed ({:?})\n",
+                                    probe,
+                                    error
+                                ),
+                            }
+                        }
+                    }
                     G17PPendingCommand::Render(
                         g17_uapi::translate_render_command(
                             payload,
