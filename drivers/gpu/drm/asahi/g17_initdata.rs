@@ -88,6 +88,20 @@ pub(crate) const MAIN_CONFIG_SIZE: usize = 0x600;
 pub(crate) const HW_DATA_SIZE: usize = 0x3db4;
 /// Native QoS manager block published through hardware data.
 pub(crate) const G17P_QOS_RESOURCE_OFFSET: usize = 0x27a4;
+/// The QoS table pointer as the LIVE 25G83 build reads it.
+///
+/// KEXT_PROVEN (25G83 decompile): the live initdata object is 0x2708 bytes and
+/// no instruction in that build references 0x27a4 or 0x27ac at all -- both of
+/// our writes land past its end, in space the firmware never reads. The real
+/// field is +0x26ac, written from `AGXQOSManager + 0x28`. The neighbouring
+/// live fields are +0x2614 (the 4 x 0x20 KSM completion table, which we do
+/// populate), +0x2694 (a 0x40-entry table fwva), +0x2604 (deferred-kick-mode
+/// selector) and the flags at +0x2600/+0x2608/+0x2610.
+///
+/// We keep writing 0x27a4 as well: if that offset really is dead space the
+/// extra store is inert, and leaving it in place keeps this a single-variable
+/// change.
+pub(crate) const G17P_QOS_RESOURCE_LIVE_OFFSET: usize = 0x26ac;
 pub(crate) const G17P_QOS_RESOURCE_SIZE: usize = 0xe40;
 /// Native global SKSM/QID configuration block in hardware data.
 pub(crate) const G17P_SKSM_QID_CONFIG_2700_OFFSET: usize = 0x2700;
@@ -2133,6 +2147,7 @@ pub(crate) fn encode_hw_data(
     }
 
     put_u64(out, G17P_QOS_RESOURCE_OFFSET, qos_resource_high);
+    put_u64(out, G17P_QOS_RESOURCE_LIVE_OFFSET, qos_resource_high);
     put_u64(
         out,
         G17P_SKSM_QID_CONFIG_2700_OFFSET,
