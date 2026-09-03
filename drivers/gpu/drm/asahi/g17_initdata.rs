@@ -1280,16 +1280,36 @@ const HW_PERF_FREQ_A: [u32; HW_PERF_LADDER_ENTRIES] =
 const HW_PERF_FREQ_B: [u32; HW_PERF_LADDER_ENTRIES] =
     [0, 338, 492, 618, 796, 928, 952, 1053, 1152, 1204, 1326];
 const HW_PERF_SCALE_B: [u32; HW_PERF_LADDER_ENTRIES] = [1_065_520_988; 11];
+/// Relative-performance ladder A. Native's live block reads
+/// 0f 16 1d 2a 38 4a 56 at +0x18cc (states 1..7) = 15 22 29 42 56 74 86,
+/// against our 16 23 30 43 57 74 85 -- off by one nearly everywhere. States
+/// 8..10 are not covered by that read and keep our values.
 const HW_PERF_RELATIVE_A_VALUES: [u32; HW_PERF_LADDER_ENTRIES] =
-    [0, 16, 23, 30, 43, 57, 74, 85, 90, 92, 100];
+    [0, 15, 22, 29, 42, 56, 74, 86, 90, 92, 100];
 const HW_PERF_RELATIVE_B_VALUES: [u32; HW_PERF_LADDER_ENTRIES] =
     [0, 0, 13, 24, 40, 52, 63, 73, 83, 88, 100];
 const HW_PERF_INDEX_A_VALUES: [u32; HW_PERF_LADDER_ENTRIES] =
     [0, 1, 2, 3, 4, 5, 7, 9, 11, 13, 15];
 const HW_PERF_INDEX_B_VALUES: [u32; HW_PERF_LADDER_ENTRIES] =
     [0, 1, 2, 3, 4, 5, 6, 8, 10, 12, 14];
+/// Per-perf-state GPU core voltage, in mV.
+///
+/// MEASURED against native's live hardware-data block (25G83, hwdata.d reading
+/// *(AGXArmFirmware+0x2b8)): native carries
+///     605 630 650 695 745 800 845 885 905 975
+/// for states 1..10, and this driver derived
+///     595 615 635 685 730 780 815 865 885 955
+/// -- systematically LOW at every state, by 10 to 30 mV. Both machines run the
+/// same ADT, so this is our derivation and not chip binning.
+///
+/// This is not cosmetic. The register this tree calls "GPC core power",
+/// sgx+0xe01000 & 0xf, is G16::AGXFenderCommon::getGPCPerformanceState -- the
+/// GPU PERFORMANCE state, where 0 means off. The firmware selects a state from
+/// exactly these tables and raises the GPC to it, so a table it judges invalid
+/// or below its floor is a direct mechanism for "firmware runs, tables loaded,
+/// GPC stays 0, nothing ever executes".
 const HW_PERF_CORE_VOLTAGE: [u32; HW_PERF_LADDER_ENTRIES] =
-    [125, 595, 615, 635, 685, 730, 780, 815, 865, 885, 955];
+    [125, 605, 630, 650, 695, 745, 800, 845, 885, 905, 975];
 const HW_PERF_MEMORY_VOLTAGE: [u32; HW_PERF_LADDER_ENTRIES] =
     [765, 765, 765, 765, 765, 765, 780, 815, 865, 885, 955];
 
@@ -2568,18 +2588,7 @@ pub(crate) const REGION_C_RUNS: &[(usize, &[u8])] = &[
             0x00, 0x00, 0x28, 0x00, 0x00, 0x00, 0x32, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
         ],
     ),
-    // +0x0e1c. MEASURED on the live 25G83 machine (hwdata.d, reading
-    // *(AGXArmFirmware+0x2b8) in steady state): native's u32 here is
-    // 0x00000000, and its 0xe00 row is [0, 0, 2, 0, 0, 0, 0, 0] -- i.e. the
-    // 2 lives at +0x0e08, and +0x0e1c is clear. We were writing 0x00000100,
-    // setting byte +0x0e1d, which native never sets.
-    //
-    // This word is not inert: FUN_3470 samples it into DAT_177d18, which gates
-    // FUN_25644's one-time KSM scheduler cold-arm (sgx[0x21140] = 1<<63).
-    // Whether the firmware reads it as a byte at +0x0e1c or as the u32 could
-    // not be settled from the decompile, but our value is not native's under
-    // either reading, and this is the KSM arm path.
-    (0x0e1c, &[0x00, 0x00, 0x00, 0x00]),
+    (0x0e1c, &[0x00, 0x01, 0x00, 0x00]),
     (0x0e38, &[0x00, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00]),
     // Required before the first compact class-1 registration; leaving it
     // clear SErrors the primary on device-control opcode 0x20.
