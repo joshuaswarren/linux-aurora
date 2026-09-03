@@ -81,6 +81,10 @@ kernel::module_platform_driver! {
             // permissions: 0o644,
             description: "Fully isolate GPU contexts (limits performance)",
         },
+        g17p_render_qrec_shared: u32 {
+            default: 0,
+            description: "DIAGNOSTIC A/B. Write native's shared pointer 0xfffffc2000000060 at +0x10 of the per-queue ring record instead of our per-stage job_list. MEASURED (ringrec-gfx.txt, macOS 25G83): native's TA record at fwva 0xfffffc20c0000b40 and its 3D record at 0xfffffc20c0000c00 carry that identical value there while +0x00/+0x08 differ per stage, and the same address is the a5 argument of every AGXChannel::init for dm=0 and dm=1. This driver writes a per-stage job list. Compute does the same and runs, but compute is the CLASSIC mechanism and is not a control for SKSM. 0: our value (default). 1: native's shared pointer.",
+        },
         g17p_test_stage: u32 {
             default: 2,
             // permissions: 0,

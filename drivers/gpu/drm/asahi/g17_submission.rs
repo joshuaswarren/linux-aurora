@@ -1807,6 +1807,11 @@ pub(crate) fn apply_g17p_retained_event(
 }
 
 /// Write the cold class-2 queue record for the owning process.
+/// The one pointer native repeats in EVERY per-queue ring record and passes as
+/// `a5` to every `AGXChannel::init`, for both data masters. Measured on macOS
+/// 25G83; see `apply_g17p_cold_opening_queue_record`.
+const G17P_NATIVE_QUEUE_RECORD_SHARED_POINTER: u64 = 0xffff_fc20_0000_0060;
+
 pub(crate) fn apply_g17p_cold_opening_queue_record(
     addresses: G17PColdOpeningQueueAddresses,
     out: &mut [u8],
@@ -1817,7 +1822,23 @@ pub(crate) fn apply_g17p_cold_opening_queue_record(
     out.fill(0);
     put_u64_le(out, 0x00, addresses.pointers);
     put_u64_le(out, 0x08, addresses.item_ring);
-    put_u64_le(out, 0x10, addresses.job_list);
+    // +0x10. MEASURED, macOS 25G83, ringrec-gfx.txt: native's 0xc0-byte
+    // per-queue ring records carry the SAME pointer here for both render
+    // stages -- 0xfffffc2000000060 in the TA record (fwva 0xfffffc20c0000b40)
+    // and in the 3D record (fwva 0xfffffc20c0000c00) -- while +0x00 and +0x08
+    // differ per stage. The same value is the a5 argument of every
+    // AGXChannel::init in once-gfx.txt, for dm=0 and dm=1 alike. So it is one
+    // shared object, not a per-queue job list.
+    //
+    // We write a per-stage job_list. Our compute path does too and compute
+    // runs, but compute is the CLASSIC mechanism and says nothing about SKSM.
+    // 0 keeps our value; 1 writes native's shared pointer, for a single-boot
+    // A/B while the provenance of that address is being read out of the kext.
+    if *crate::module_parameters::g17p_render_qrec_shared.value() != 0 {
+        put_u64_le(out, 0x10, G17P_NATIVE_QUEUE_RECORD_SHARED_POINTER);
+    } else {
+        put_u64_le(out, 0x10, addresses.job_list);
+    }
     put_u32_le(out, 0x24, u32::MAX);
     // The live native render path reads state +0x28 through getPriority(),
     // copies it to 3D setup +0xe5c, and validates it against KSM queue +0x1c.
