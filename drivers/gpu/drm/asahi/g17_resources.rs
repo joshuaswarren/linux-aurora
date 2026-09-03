@@ -190,15 +190,30 @@ const G17P_QOS_QUEUE_COUNT: usize = 0x80;
 /// priority-2 command queue.
 ///
 /// The G17P kext indexes the five-byte table `{0x14, 0x0f, 0x04, 0x01, 0}`
-/// with zero for every command-queue priority other than 0/1, then stores the
-/// selected byte at `AGXQOSQueue + 0x46`. Both TA and 3D `willSubmit` calls
-/// copy that byte to their QID-indexed firmware-visible queue records.
-const G17P_DEFAULT_RENDER_QOS_CLASS: u8 = 0x14;
-/// Native's normalized per-HardwareBufferID share for one registered queue:
-/// `qos_class * group_weight * 2^13 / (queue_count * total_weight)`.
-/// Linux currently serializes one render command queue, so both weights and
-/// the queue count cancel and the exact value is `0x14 << 13`.
-const G17P_SINGLE_RENDER_QOS_SHARE: u32 = (G17P_DEFAULT_RENDER_QOS_CLASS as u32) << 13;
+/// with the command-queue priority, then stores the selected byte at
+/// `AGXQOSQueue + 0x46`. Both TA and 3D `willSubmit` calls copy that byte to
+/// their QID-indexed firmware-visible queue records.
+///
+/// MEASURED, macOS 25G83, once.d against a real Metal render pass: the render
+/// queue's install is
+///
+///     willSubmit qid=7 dm=1 firstTime=1
+///     QoS row 7 (+0x38):  ff 00 .. -> 04 04 00 00 00 00 00 00
+///
+/// so byte 1, the class, is 0x04 -- table INDEX 2, for a priority-2 queue --
+/// not 0x14. This driver previously assumed index 0 because no capture in the
+/// corpus contained a native render willSubmit; one does now.
+const G17P_DEFAULT_RENDER_QOS_CLASS: u8 = 0x04;
+/// Native's normalized per-HardwareBufferID share, read out of the same
+/// capture's `+0xc00` index row:
+///
+///     +0xc00: [0x1000, 0x2000, 0x2000, 0x1000, 0x2000, 0, ...]
+///
+/// The render queue's HardwareBufferID is 4 and its share is 0x2000 == 2^13,
+/// i.e. the whole normalization base for a single registered queue. The old
+/// `class << 13` form produced 0x28000, which overshoots that base by 20x --
+/// it cannot be a normalized share at all.
+const G17P_SINGLE_RENDER_QOS_SHARE: u32 = 0x2000;
 /// `AGXArmFirmware::initFirmwareSharedData` publishes this allocation through
 /// primary main-config `+0x274`, the fifth pointer in the packed bundle-view
 /// array.  The native CPU mapping is `AGXFirmware + 0x2f0`, its firmware GPU
