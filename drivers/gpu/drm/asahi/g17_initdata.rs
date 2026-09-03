@@ -111,7 +111,11 @@ pub(crate) const G17P_SKSM_QID_RESOURCE_OFFSET: usize = 0x27ac;
 /// (`AGXFirmware::initFirmwareData` @0xfffffe0008a20940). 1 = the host
 /// publishes channel commands; 0 = the host drives the MMIO kick bridge.
 const HW_DATA_TRANSPORT_SELECTOR_OFFSET: usize = 0x26f8;
-pub(crate) const G17P_SKSM_QID_CONFIG_2700: u64 = 1;
+/// MEASURED, live 25G83 hardware-data block: native reads 0 here.
+/// initFirmwareData clears the u32 at +0x26fe, which covers +0x2700..+0x2701,
+/// and never sets it. Our 1 was a non-native write inside the live object --
+/// the last non-perf difference in the whole 0x2708-byte structure.
+pub(crate) const G17P_SKSM_QID_CONFIG_2700: u64 = 0;
 pub(crate) const G17P_SKSM_QID_CONFIG_2708: u32 = 0x100;
 /// Firmware log enable word inside main config.
 pub(crate) const MAIN_FIRMWARE_LOG_ENABLE: usize = 0x250;
@@ -2153,11 +2157,13 @@ pub(crate) fn encode_hw_data(
     for offset in HW_ACCEPT_TRAILING_ONES {
         // NB +0x2600 is also DAT_178648, a firmware GATE: FUN_e004's per-DM
         // KSM completion-block arm runs only when (a == 0 || DAT_178648 == 0).
-        // Writing 0 here to let that arm run was TESTED and is wrong twice
-        // over: the driver fails probe with -22 (our own initdata validation
-        // rejects it), and the hardware-data object has been diffed
-        // byte-exact against native across 29 runs with only perf/DVFS fields
-        // differing, so 1 is native's value.
+        // Writing 0 here to let that arm run was TESTED and the driver failed
+        // probe with -22. I first wrote that our own initdata validation
+        // rejected it; that was an invention -- nothing in the runtime path
+        // validates this field, and the cause of the -22 was never
+        // established. What settles it instead is the live 25G83 capture:
+        // native's hardware-data block reads 1 at +0x2600 and 1 at +0x2608,
+        // the same as ours, so this is not a divergence.
         put_u32(out, offset, 1);
     }
 
