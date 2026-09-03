@@ -3822,6 +3822,50 @@ impl G17PLiveRuntime {
                     manager.log_render_outer_channels("post-doorbells");
                 }
             }
+            // Work-scan entry gate. FW RE of b1: FUN_261a4 is the pass that
+            // consumes DM work-ring entries, and it advances the read index
+            // and sets coherency=write on ALL TWELVE rings on every pass,
+            // whatever they contain. So render tables 6/7 sitting at
+            // {read 0, coherency 0, producer 1} after the doorbell does NOT
+            // mean the scan looked at our entry and rejected it -- a rejected
+            // or type-mismatched entry is skipped WITH the read index
+            // advanced. It means the scan did not run at all.
+            //
+            // Its entry gate at 0x263b8..0x263dc is
+            //     (DAT_1771f8 & 0x18) == 0
+            //  && ((DAT_1771f8 & 0x60) == 0 || DAT_124ba4 == 1)
+            // so read both. If 0x18 or 0x60 is set here, the firmware is
+            // skipping the work scan and that is the whole bug.
+            if *module_parameters::g17p_scan_gate.value() != 0 {
+                let polls = 64usize;
+                for (label, link, mask) in [
+                    ("run-state 0x1771f8", 0xffff_fc00_0017_71f8u64, 0x78u64),
+                    ("DAT_124ba0", 0xffff_fc00_0012_4ba0u64, 0xffff_ffff_0000_0000u64),
+                ] {
+                    let phys = g17_manager::g17p_gfx_link_to_physical(link);
+                    match crate::pgtable::LiveFirmwareU64Probe::new(phys)
+                        .and_then(|p| p.observe_mask(mask, polls))
+                    {
+                        Ok(o) => dev_info!(
+                            self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                            "G17P scan-gate[{}]: first={:#018x} last={:#018x} or={:#018x} mask={:#x} seen={} polls={}\n",
+                            label,
+                            o.first,
+                            o.last,
+                            o.observed_or,
+                            mask,
+                            o.mask_seen,
+                            o.polls,
+                        ),
+                        Err(error) => dev_warn!(
+                            self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                            "G17P scan-gate[{}]: read failed ({:?})\n",
+                            label,
+                            error,
+                        ),
+                    }
+                }
+            }
             self.probe_render_ksm_admission_after_render_doorbells();
         } else {
             let doorbells: &[u64] = if native_doorbells {
