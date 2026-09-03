@@ -1119,6 +1119,19 @@ impl Resources {
     /// so the GPC-state read is a hard precondition rather than another field
     /// sampled after the dangerous accesses. `None` means the caller may retry
     /// briefly while it is still in the immediate post-doorbell window.
+    /// Read one 0x100-byte sgx register window for the pre-firmware
+    /// hardware-state audit. Caller must only invoke this where the GPU cores
+    /// are known powered: an sgx read with the cores gated raises an
+    /// asynchronous SError and panics the machine.
+    pub(crate) fn g17p_dump_sgx_window(&self, base: usize, out: &mut [u32; 64]) -> Result {
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let registers = sgx.relaxed();
+        for (index, word) in out.iter_mut().enumerate() {
+            *word = registers.try_read32(base + index * 4)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn g17p_render_ksm_admission_snapshot(
         &self,
         ta_qid: u8,

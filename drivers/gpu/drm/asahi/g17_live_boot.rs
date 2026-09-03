@@ -3874,6 +3874,47 @@ impl G17PLiveRuntime {
                     }
                 }
             }
+            // Configurable GPU register-window dump for the pre-firmware
+            // hardware-state audit. Software is exhausted -- submit protocol,
+            // initdata and the kext's one-time bring-up are all byte-exact or
+            // equivalent to native -- so the remaining variable is the register
+            // state m1n1 and this driver leave the GPU in, which initdata does
+            // not describe. Dumped here so it can be diffed against a macOS
+            // read of the same physical addresses.
+            //
+            // Placed at this checkpoint deliberately: it is the one window
+            // where sgx reads are known safe, because the cores are powered
+            // after the doorbell. An sgx read with the cores gated raises an
+            // asynchronous SError and panics the machine, which is why this is
+            // opt-in and 0x100-granular rather than an arbitrary address.
+            let dump = *module_parameters::g17p_reg_dump.value();
+            if dump != 0 {
+                if let Some(registers) = self.registers.as_ref() {
+                    let base = (dump as usize) << 8;
+                    let mut words = [0u32; 64];
+                    match registers.g17p_dump_sgx_window(base, &mut words) {
+                        Ok(()) => {
+                            for row in 0..16usize {
+                                dev_info!(
+                                    self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                                    "G17P regdump {:#08x}: {:08x} {:08x} {:08x} {:08x}\n",
+                                    base + row * 16,
+                                    words[row * 4],
+                                    words[row * 4 + 1],
+                                    words[row * 4 + 2],
+                                    words[row * 4 + 3],
+                                );
+                            }
+                        }
+                        Err(error) => dev_warn!(
+                            self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                            "G17P regdump {:#08x}: read failed ({:?})\n",
+                            base,
+                            error,
+                        ),
+                    }
+                }
+            }
             self.probe_render_ksm_admission_after_render_doorbells();
             // LATE sample. The post-doorbells checkpoint above is far too early
             // to conclude anything: native's own DM ring cursors do not move
