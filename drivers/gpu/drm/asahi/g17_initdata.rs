@@ -2568,7 +2568,18 @@ pub(crate) const REGION_C_RUNS: &[(usize, &[u8])] = &[
             0x00, 0x00, 0x28, 0x00, 0x00, 0x00, 0x32, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
         ],
     ),
-    (0x0e1c, &[0x00, 0x01, 0x00, 0x00]),
+    // +0x0e1c. MEASURED on the live 25G83 machine (hwdata.d, reading
+    // *(AGXArmFirmware+0x2b8) in steady state): native's u32 here is
+    // 0x00000000, and its 0xe00 row is [0, 0, 2, 0, 0, 0, 0, 0] -- i.e. the
+    // 2 lives at +0x0e08, and +0x0e1c is clear. We were writing 0x00000100,
+    // setting byte +0x0e1d, which native never sets.
+    //
+    // This word is not inert: FUN_3470 samples it into DAT_177d18, which gates
+    // FUN_25644's one-time KSM scheduler cold-arm (sgx[0x21140] = 1<<63).
+    // Whether the firmware reads it as a byte at +0x0e1c or as the u32 could
+    // not be settled from the decompile, but our value is not native's under
+    // either reading, and this is the KSM arm path.
+    (0x0e1c, &[0x00, 0x00, 0x00, 0x00]),
     (0x0e38, &[0x00, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00]),
     // Required before the first compact class-1 registration; leaving it
     // clear SErrors the primary on device-control opcode 0x20.
