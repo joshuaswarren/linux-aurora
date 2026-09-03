@@ -3841,6 +3841,14 @@ impl G17PLiveRuntime {
                 for (label, link, mask) in [
                     ("run-state 0x1771f8", 0xffff_fc00_0017_71f8u64, 0x78u64),
                     ("DAT_124ba0", 0xffff_fc00_0012_4ba0u64, 0xffff_ffff_0000_0000u64),
+                    // The scan's OTHER precondition: wakeup bits 0/1/2 in
+                    // DAT_177190, posted by the 0x83 doorbell handler. The
+                    // run-state gate above measured OPEN while our cursors
+                    // stayed [0,0,1], and compute's ring reads [1,1,1] -- one
+                    // scan pass advances EVERY ring, so the scan ran for
+                    // compute's doorbell and never again for the render's.
+                    // That makes the wakeup the remaining suspect.
+                    ("wakeup 0x177190", 0xffff_fc00_0017_7190u64, 0x7u64),
                 ] {
                     let phys = g17_manager::g17p_gfx_link_to_physical(link);
                     match crate::pgtable::LiveFirmwareU64Probe::new(phys)
