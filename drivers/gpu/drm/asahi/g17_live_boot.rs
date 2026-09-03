@@ -3875,6 +3875,45 @@ impl G17PLiveRuntime {
                 }
             }
             self.probe_render_ksm_admission_after_render_doorbells();
+            // LATE sample. The post-doorbells checkpoint above is far too early
+            // to conclude anything: native's own DM ring cursors do not move
+            // until ~420us after its doorbell (fwconsume-gfx.txt, doorbell at
+            // 22881us, DMTA2R/DM3D2R -> 0x35 at 23302us), and the KSM admission
+            // probe just above waits up to 40ms. Sample here instead.
+            //
+            // Also read the recovery stash. FW RE of b1: while DAT_1771e8 != 0
+            // a recovery is open and every scheduler event except 0x2000000 is
+            // OR-ed into DAT_1771e0 rather than dispatched. Both the normal
+            // work scan (FUN_261a4) and the recovery replay (FUN_eb7c) advance
+            // read and coherency, so the cursors alone cannot say WHICH path
+            // consumed our rings -- these two words can.
+            if *module_parameters::g17p_scan_gate.value() != 0 {
+                if let Some(manager) = self.manager.as_mut() {
+                    manager.log_render_outer_channels("post-wait");
+                }
+                for (label, link) in [
+                    ("recovery-open 0x1771e8", 0xffff_fc00_0017_71e8u64),
+                    ("event-stash 0x1771e0", 0xffff_fc00_0017_71e0u64),
+                ] {
+                    let phys = g17_manager::g17p_gfx_link_to_physical(link);
+                    match crate::pgtable::LiveFirmwareU64Probe::new(phys)
+                        .and_then(|p| p.observe_mask(!0u64, 2))
+                    {
+                        Ok(o) => dev_info!(
+                            self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                            "G17P scan-late[{}]: {:#018x}\n",
+                            label,
+                            o.last,
+                        ),
+                        Err(error) => dev_warn!(
+                            self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                            "G17P scan-late[{}]: read failed ({:?})\n",
+                            label,
+                            error,
+                        ),
+                    }
+                }
+            }
         } else {
             let doorbells: &[u64] = if native_doorbells {
                 &[
