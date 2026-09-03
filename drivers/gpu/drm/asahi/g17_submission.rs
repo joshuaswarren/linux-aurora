@@ -1807,11 +1807,6 @@ pub(crate) fn apply_g17p_retained_event(
 }
 
 /// Write the cold class-2 queue record for the owning process.
-/// The one pointer native repeats in EVERY per-queue ring record and passes as
-/// `a5` to every `AGXChannel::init`, for both data masters. Measured on macOS
-/// 25G83; see `apply_g17p_cold_opening_queue_record`.
-const G17P_NATIVE_QUEUE_RECORD_SHARED_POINTER: u64 = 0xffff_fc20_0000_0060;
-
 pub(crate) fn apply_g17p_cold_opening_queue_record(
     addresses: G17PColdOpeningQueueAddresses,
     out: &mut [u8],
@@ -1822,23 +1817,29 @@ pub(crate) fn apply_g17p_cold_opening_queue_record(
     out.fill(0);
     put_u64_le(out, 0x00, addresses.pointers);
     put_u64_le(out, 0x08, addresses.item_ring);
-    // +0x10. MEASURED, macOS 25G83, ringrec-gfx.txt: native's 0xc0-byte
-    // per-queue ring records carry the SAME pointer here for both render
-    // stages -- 0xfffffc2000000060 in the TA record (fwva 0xfffffc20c0000b40)
-    // and in the 3D record (fwva 0xfffffc20c0000c00) -- while +0x00 and +0x08
-    // differ per stage. The same value is the a5 argument of every
-    // AGXChannel::init in once-gfx.txt, for dm=0 and dm=1 alike. So it is one
-    // shared object, not a per-queue job list.
+    // +0x10. Native's per-queue ring records carry the SAME pointer here for
+    // both render stages (ringrec-gfx.txt: 0xfffffc2000000060 in the TA record
+    // at fwva 0xfffffc20c0000b40 and in the 3D record at 0xfffffc20c0000c00),
+    // and it is the a5 argument of every AGXChannel::init. That looked like a
+    // shared firmware constant we were failing to write. It is NOT.
     //
-    // We write a per-stage job_list. Our compute path does too and compute
-    // runs, but compute is the CLASSIC mechanism and says nothing about SKSM.
-    // 0 keeps our value; 1 writes native's shared pointer, for a single-boot
-    // A/B while the provenance of that address is being read out of the kext.
-    if *crate::module_parameters::g17p_render_qrec_shared.value() != 0 {
-        put_u64_le(out, 0x10, G17P_NATIVE_QUEUE_RECORD_SHARED_POINTER);
-    } else {
-        put_u64_le(out, 0x10, addresses.job_list);
-    }
+    // KEXT_PROVEN (25G83): cmdq+0x680 is an AGXTimeStampQueue whose +0x28 is
+    // its firmware VA; AGXCommandQueue::allocate3DWorkQueueInner passes that
+    // as a5 to the channel init, AGXChannel::init stores it at chan+0x98 and
+    // resetChannelState copies it to state+0x10. The 0x18-byte
+    // _AGFITimeStampQueue slots are host-allocated out of a firmware-shared
+    // stack, and 0x60 is simply slot 4. The value repeats across boots only
+    // because the Metal test app is always the fifth client. Writing that
+    // literal from Linux would have published a pointer into someone else's
+    // allocation.
+    //
+    // FW_PROVEN: nothing in the DM-ring consumption path (FUN_261a4 /
+    // FUN_12638) nor in the job builder FUN_23004 reads state+0x10 at all. It
+    // is a per-command-queue timestamp list head, used only by
+    // AGFAcceleratorProcessTimeStampQueue on the completion side. It cannot
+    // stop consumption or launch, so it is not our bug. Our per-graph value
+    // stays.
+    put_u64_le(out, 0x10, addresses.job_list);
     put_u32_le(out, 0x24, u32::MAX);
     // The live native render path reads state +0x28 through getPriority(),
     // copies it to 3D setup +0xe5c, and validates it against KSM queue +0x1c.
