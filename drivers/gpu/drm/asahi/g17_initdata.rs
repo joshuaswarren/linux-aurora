@@ -2124,6 +2124,13 @@ pub(crate) fn encode_hw_data(
         put_u32(out, HW_ACCEPT_UNASSIGNED_TABLE + channel * 4, 0xffff_ffff);
     }
     for offset in HW_ACCEPT_TRAILING_ONES {
+        // NB +0x2600 is also DAT_178648, a firmware GATE: FUN_e004's per-DM
+        // KSM completion-block arm runs only when (a == 0 || DAT_178648 == 0).
+        // Writing 0 here to let that arm run was TESTED and is wrong twice
+        // over: the driver fails probe with -22 (our own initdata validation
+        // rejects it), and the hardware-data object has been diffed
+        // byte-exact against native across 29 runs with only perf/DVFS fields
+        // differing, so 1 is native's value.
         put_u32(out, offset, 1);
     }
 
