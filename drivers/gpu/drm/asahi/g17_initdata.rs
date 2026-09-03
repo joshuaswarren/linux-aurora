@@ -1310,8 +1310,15 @@ const HW_PERF_INDEX_B_VALUES: [u32; HW_PERF_LADDER_ENTRIES] =
 /// GPC stays 0, nothing ever executes".
 const HW_PERF_CORE_VOLTAGE: [u32; HW_PERF_LADDER_ENTRIES] =
     [125, 605, 630, 650, 695, 745, 800, 845, 885, 905, 975];
+/// Per-perf-state SRAM/memory-rail voltage, in mV.
+///
+/// Same defect as the core table: our tail tracked our own (wrong) core values.
+/// Native's live block carries 765 x6 then 800 845 885 905 975, which is the
+/// ADT perf-states-sram column mapped through HW_PERF_INDEX_A. The correct
+/// derivation is memory[i] = ADT perf-states-sram[INDEX_A[i]].volt, not "the
+/// memory tail tracks core".
 const HW_PERF_MEMORY_VOLTAGE: [u32; HW_PERF_LADDER_ENTRIES] =
-    [765, 765, 765, 765, 765, 765, 780, 815, 865, 885, 955];
+    [765, 765, 765, 765, 765, 765, 800, 845, 885, 905, 975];
 
 // --- Region C ---------------------------------------------------------------------
 
