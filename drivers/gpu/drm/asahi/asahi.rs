@@ -81,6 +81,10 @@ kernel::module_platform_driver! {
             // permissions: 0o644,
             description: "Fully isolate GPU contexts (limits performance)",
         },
+        g17p_reg_dump: u32 {
+            default: 0,
+            description: "DIAGNOSTIC. Dump 0x100 bytes of the sgx register window at (value << 8), after the render doorbells, as 16 rows of four u32. For the pre-firmware hardware-state audit: the SKSM submit protocol, the initdata and the kext's one-time bring-up have all been shown byte-exact or equivalent to native, so the remaining variable is the GPU register state m1n1 and this driver leave behind, which initdata does not describe. Read-only, and placed in the post-doorbell window where the cores are powered -- an sgx read with the cores gated raises an asynchronous SError and panics the machine, which is why this is opt-in and 0x100-granular rather than an arbitrary address. Example: 0xe010 dumps the GPC block at 0xe01000. 0: off (default).",
+        },
         g17p_scan_gate: u32 {
             default: 0,
             description: "DIAGNOSTIC. After the render doorbells, read the two firmware words that gate b1's DM work-ring scan FUN_261a4 at 0x263b8..0x263dc: the run-state word 0x1771f8 (bits 0x18 and 0x60) and DAT_124ba4. The gate is (DAT_1771f8 & 0x18)==0 && ((DAT_1771f8 & 0x60)==0 || DAT_124ba4==1). This matters because FUN_261a4 advances the read index and sets coherency=write on ALL twelve rings on every pass regardless of contents, so our render tables 6/7 staying at {0,0,1} after a doorbell means the scan never ran -- a rejected entry would still have had its read index advanced. If these bits are set, the firmware is skipping the work scan and that is the blocker. Read-only; the driver never writes either word. 0: off (default), 1: sample 64 times at each of the two addresses.",
