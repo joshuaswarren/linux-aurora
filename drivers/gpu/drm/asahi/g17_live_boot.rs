@@ -2161,6 +2161,24 @@ fn boot_initial_session(
     }
     dev_info!(pdev.as_ref(), "G17P session: secondary initdata ACK received\n");
 
+    // Close the GPU power-on transition, as AGXArmFirmware::powerTransitionEnd
+    // does. MEASURED on the m1n1 hv capture 20260904-001852Z: this is the LAST
+    // EP-0x21 message of native bring-up, one per role, immediately after the
+    // initdata handshake and long before the first work doorbell. The kext
+    // sends the bare tag with payload zero to both role objects. This driver
+    // never sent it, and the firmware has been admitting our queues without
+    // ever being told the power transition completed.
+    {
+        let note = g17_rtkit::encode_power_transition_end();
+        Pin::new(&mut gfx_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, note)?;
+        Pin::new(&mut gfx1_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, note)?;
+        dev_info!(
+            pdev.as_ref(),
+            "G17P session: power-transition-end {:#018x} sent to both roles\n",
+            note,
+        );
+    }
+
     probe_g17p_ktrace(pdev.as_ref(), &mut manager, "post-initdata-ack");
 
     let session = finish_boot_session(

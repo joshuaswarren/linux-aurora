@@ -119,6 +119,36 @@ const INITDATA_ADDRESS_PREFIX: u64 = 0xffff_f000_0000_0000;
 const RECOVERY_INSPECTION_TAG: u64 = 0x0086_0000_0000_0000;
 const RECOVERY_INSPECTION_GENERATION_MASK: u64 = (1u64 << 44) - 1;
 const DEVICE_CONTROL_TAG: u64 = 0x0084_0000_0000_0000;
+/// `AGXArmFirmware::powerTransitionEnd(AGFIFirmwareRole, bool)` closes the GPU
+/// power-on transition by sending this note to EACH firmware role.
+///
+/// KEXT_PROVEN, 25G83 @0xfffffe00088936a4. Both send sites are identical:
+///
+///     ldr   x0, [x19, #6616]  /  [x19, #6672]   ; the two role objects
+///     ldr   x8, [obj + 0x8a8]                   ; sendAsyncNoteToFirmware
+///     mov   x1, #0x89000000000000               ; tag 0x89, payload 0
+///     mov   w2, #0x1                            ; gated=true
+///     blraa x8, x16
+///
+/// MEASURED on hardware (m1n1 hv capture 20260904-001852Z): it is the LAST
+/// EP-0x21 message of bring-up, sent once per role right after the initdata
+/// handshake completes and 11.4 seconds before the first work doorbell:
+///
+///     57.95ms  role0 -> ep=0x21 0x0089000000000000
+///     59.31ms  role1 -> ep=0x21 0x0089000000000000
+///     ...
+///   11425.12ms role0 -> ep=0x21 0x0083000000000000   <- first doorbell
+///
+/// This driver has never sent it. Its EP-0x21 vocabulary was 0x81 initdata,
+/// 0x83 doorbell, 0x84 device control and 0x86 recovery inspection only.
+const POWER_TRANSITION_END_TAG: u64 = 0x0089_0000_0000_0000;
+
+/// Encode the role's power-transition-end note. The payload is zero in every
+/// captured instance and the kext materialises the bare tag with a single
+/// `movz x1, #0x89, lsl #48`.
+pub(crate) const fn encode_power_transition_end() -> u64 {
+    POWER_TRANSITION_END_TAG
+}
 const DEVICE_CONTROL_PRIMARY_MODE: u64 = 0x11;
 
 const RUNTIME_TYPE_SHIFT: u32 = 44;
