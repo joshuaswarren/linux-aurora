@@ -236,10 +236,10 @@ const MAIN_CONTROL_RING: usize = 0x4c0;
 pub(crate) const CONTROL_OPENING_OPCODE_PRIMARY: u32 = 0x16;
 pub(crate) const CONTROL_OPENING_OPCODE_SECONDARY: u32 = 0x2a;
 pub(crate) const CONTROL_RECORD_SIZE: usize = 0x40;
-pub(crate) const CONTROL_OPENING_PRIMARY_RECORDS: usize = 3;
-pub(crate) const CONTROL_OPENING_SECONDARY_RECORDS: usize = 16;
-pub(crate) const CONTROL_OPENING_PRIMARY_PRODUCER: u32 = 3;
-pub(crate) const CONTROL_OPENING_SECONDARY_PRODUCER: u32 = 16;
+pub(crate) const CONTROL_OPENING_PRIMARY_RECORDS: usize = 1;
+pub(crate) const CONTROL_OPENING_SECONDARY_RECORDS: usize = 1;
+pub(crate) const CONTROL_OPENING_PRIMARY_PRODUCER: u32 = 1;
+pub(crate) const CONTROL_OPENING_SECONDARY_PRODUCER: u32 = 1;
 pub(crate) const CONTROL_OPENING_PRIMARY_REGISTER_OPCODE: u32 = 0x20;
 pub(crate) const CONTROL_OPENING_SECONDARY_CONTINUE_OPCODE: u32 = 0x22;
 /// Hardware-buffer release emitted after the opening UMA grow request retires.
@@ -755,7 +755,7 @@ pub(crate) fn encode_control_opening(
 
     match role {
         InstanceRole::Primary => {
-            for slot in 0..3 {
+            for slot in 0..CONTROL_OPENING_PRIMARY_RECORDS {
                 put_u32(
                     out,
                     slot * CONTROL_RECORD_SIZE,
@@ -764,14 +764,15 @@ pub(crate) fn encode_control_opening(
             }
         }
         InstanceRole::Secondary => {
-            for slot in 0..3 {
+            let initial_records = core::cmp::min(3, CONTROL_OPENING_SECONDARY_RECORDS);
+            for slot in 0..initial_records {
                 put_u32(
                     out,
                     slot * CONTROL_RECORD_SIZE,
                     CONTROL_OPENING_OPCODE_SECONDARY,
                 );
             }
-            for slot in 3..CONTROL_OPENING_SECONDARY_RECORDS {
+            for slot in initial_records..CONTROL_OPENING_SECONDARY_RECORDS {
                 put_u32(
                     out,
                     slot * CONTROL_RECORD_SIZE,
@@ -1020,6 +1021,20 @@ pub(crate) fn encode_partial_opening_control_shared(
         0x4c,
         PARTIAL_OPENING_CONTROL_SHARED_INNER_ADDRESS,
     );
+    Ok(())
+}
+
+/// Encode the live render FList state at the native c0830000 owner address.
+///
+/// The page-pool fields are the same prepared 17-block plus first-grow state
+/// used by the first-partial encoder, but +0 is a pointer to the distinct
+/// c01608000 inner object. Valid cold opcode-0x20, both render tag-15 records,
+/// and descriptor +0x21ce all name this one object; c0828000 remains the
+/// separate compact compute/first-partial state.
+pub(crate) fn encode_render_control_shared(out: &mut [u8]) -> Result<(), InitdataError> {
+    encode_partial_opening_control_shared(out)?;
+    put_u64(out, 0x00, CONTROL_SHARED_INNER_ADDRESS);
+    put_u64(out, 0x4c, CONTROL_SHARED_INNER_ADDRESS);
     Ok(())
 }
 
@@ -3149,19 +3164,19 @@ mod tests {
     }
 
     #[test]
-    fn primary_control_opening_is_only_three_qos_records() {
+    fn primary_control_opening_is_the_single_native_record() {
         let mut opening = vec![0; control_opening_size(InstanceRole::Primary)];
         encode_control_opening(InstanceRole::Primary, &mut opening).unwrap();
 
-        assert_eq!(control_opening_producer(InstanceRole::Primary), 3);
-        for slot in 0..3 {
+        assert_eq!(control_opening_producer(InstanceRole::Primary), 1);
+        for slot in 0..1 {
             let base = slot * CONTROL_RECORD_SIZE;
             assert_eq!(get_u32(&opening, base), CONTROL_OPENING_OPCODE_PRIMARY);
             assert!(opening[base + 4..base + CONTROL_RECORD_SIZE]
                 .iter()
                 .all(|byte| *byte == 0));
         }
-        assert_eq!(opening.len(), 3 * CONTROL_RECORD_SIZE);
+        assert_eq!(opening.len(), CONTROL_RECORD_SIZE);
     }
 
     #[test]
@@ -3183,7 +3198,7 @@ mod tests {
         }
         assert_eq!(tail.len(), 65 * 0x40);
         assert_eq!(fnv1a64(&tail), 0x544f_a4b7_bc23_e65a);
-        assert_eq!(COMPUTE_RUNTIME_CONTROL_FINAL_COUNTER, 68);
+        assert_eq!(COMPUTE_RUNTIME_CONTROL_FINAL_COUNTER, 66);
 
         for (index, sequence) in [(0, 0), (53, 53), (55, 54), (56, 55), (58, 56), (64, 62)] {
             let base = index * CONTROL_RECORD_SIZE;
@@ -3466,14 +3481,14 @@ mod tests {
     }
 
     #[test]
-    fn secondary_control_opening_is_three_init_then_thirteen_continue_records() {
+    fn secondary_control_opening_is_the_single_native_record() {
         let mut opening = vec![0; control_opening_size(InstanceRole::Secondary)];
         encode_control_opening(InstanceRole::Secondary, &mut opening).unwrap();
 
-        assert_eq!(control_opening_producer(InstanceRole::Secondary), 16);
+        assert_eq!(control_opening_producer(InstanceRole::Secondary), 1);
         for slot in 0..CONTROL_OPENING_SECONDARY_RECORDS {
             let base = slot * CONTROL_RECORD_SIZE;
-            let expected = if slot < 3 {
+            let expected = if slot < core::cmp::min(3, CONTROL_OPENING_SECONDARY_RECORDS) {
                 CONTROL_OPENING_OPCODE_SECONDARY
             } else {
                 CONTROL_OPENING_SECONDARY_CONTINUE_OPCODE
@@ -3551,6 +3566,15 @@ mod tests {
         );
         assert_eq!(get_u64(&shared, 0x60), 3);
         assert_eq!(PARTIAL_OPENING_CONTROL_SHARED_INNER_PRESENTED, 0);
+
+        encode_render_control_shared(&mut shared).unwrap();
+        assert_eq!(get_u64(&shared, 0x00), CONTROL_SHARED_INNER_ADDRESS);
+        assert_eq!(get_u32(&shared, 0x08), 0);
+        assert_eq!(get_u64(&shared, 0x10), 2);
+        assert_eq!(get_u64(&shared, 0x14), COMPUTE_RUNTIME_ZERO_BUFFER_0_ADDRESS);
+        assert_eq!(get_u64(&shared, 0x30), CONTROL_OPERAND_TABLE_ADDRESS);
+        assert_eq!(get_u64(&shared, 0x4c), CONTROL_SHARED_INNER_ADDRESS);
+        assert_eq!(get_u64(&shared, 0x60), 3);
     }
 
     #[test]
@@ -3970,10 +3994,10 @@ mod tests {
         assert_eq!(PRIMARY_STATUS_B_OBJECT_SIZE, 0xeb00);
         // Device-control framing and the ownerless-UMA-free opening prefixes.
         assert_eq!(CONTROL_RECORD_SIZE, 0x40);
-        assert_eq!(CONTROL_OPENING_PRIMARY_PRODUCER, 3);
+        assert_eq!(CONTROL_OPENING_PRIMARY_PRODUCER, 1);
         assert_eq!(COMPUTE_RUNTIME_CONTROL_RECORDS, 65);
-        assert_eq!(COMPUTE_RUNTIME_CONTROL_FINAL_COUNTER, 68);
-        assert_eq!(CONTROL_OPENING_SECONDARY_PRODUCER, 16);
+        assert_eq!(COMPUTE_RUNTIME_CONTROL_FINAL_COUNTER, 66);
+        assert_eq!(CONTROL_OPENING_SECONDARY_PRODUCER, 1);
         // Channel state-block stride within the compact grid.
         assert_eq!(CHANNEL_STATE_STRIDE, 0x40);
         // Performance-table geometry and measured values.

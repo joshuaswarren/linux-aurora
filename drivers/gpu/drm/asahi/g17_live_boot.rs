@@ -548,7 +548,7 @@ fn validate_primary_bootstrap_uma_completion(
     let expected_cookie = g17_submission::G17P_USC_FREELIST_LOW_END;
     if uma.stamp_index != 1
         || uma.pool_index != 0
-        || uma.shared_control != g17_initdata::PARTIAL_OPENING_CONTROL_SHARED_ADDRESS
+        || uma.shared_control != g17_initdata::CONTROL_SHARED_ADDRESS
         || uma.operand_table != expected_operand_table
         || uma.cookie != expected_cookie
         || uma.result != g17_submission::G17P_USC_FREELIST_GROW_DESCRIPTOR_BYTES
@@ -1745,9 +1745,11 @@ fn finish_boot_session(
     if !counters.opening_retired() {
         dev_err!(
             pdev.as_ref(),
-            "G17P control: counters stopped at {:?}/{:?}, expected [3, 3, 3]/[16, 16, 16]\n",
+            "G17P control: counters stopped at {:?}/{:?}, expected {:?}/{:?}\n",
             counters.primary,
-            counters.secondary
+            counters.secondary,
+            [g17_initdata::CONTROL_OPENING_PRIMARY_PRODUCER; 3],
+            [g17_initdata::CONTROL_OPENING_SECONDARY_PRODUCER; 3],
         );
         return Err(ETIMEDOUT);
     }
@@ -2383,8 +2385,9 @@ impl G17PLiveRuntime {
     }
 
     /// Announce native's one cold-workqueue USC FList update before any render
-    /// doorbell. The device-control path is asynchronous; the matching type-13
-    /// event is serviced later and does not gate the render kick.
+    /// doorbell. Native does not expose the render queues while this FList is
+    /// busy: wait for both control-ring retirement and the matching type-13
+    /// grow completion before returning to work publication.
     fn publish_render_usc_freelist_request(&mut self) -> Result {
         if *module_parameters::g17p_render_usc_freelist.value() == 0 {
             return Ok(());
@@ -2412,7 +2415,75 @@ impl G17PLiveRuntime {
             announcement,
         );
         Pin::new(self.gfx_rtkit.as_mut().ok_or(ENODEV)?)
-            .send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, announcement)
+            .send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, announcement)?;
+
+        // Native's first work snapshot has the opcode-0x20 record fully
+        // consumed before the qid0/qid1 doorbell: ch12 is [2,2,2]. The
+        // control reply and its asynchronous grow completion are distinct.
+        let target = publication.producer_after;
+        let mut counters = self.manager.as_mut().ok_or(ENODEV)?.control_counters()?;
+        let mut control_retired = false;
+        for poll in 0..CONTROL_COUNTER_POLLS {
+            if counters.primary == [target; 3] {
+                dev_info!(
+                    self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                    "G17P render USC FList: control record retired before work after {}ms counters={:?}\n",
+                    poll,
+                    counters.primary,
+                );
+                control_retired = true;
+                break;
+            }
+            if self.is_crashed() {
+                return Err(EIO);
+            }
+            fsleep(Delta::from_millis(1));
+            counters = self.manager.as_mut().ok_or(ENODEV)?.control_counters()?;
+        }
+        if !control_retired {
+            dev_err!(
+                self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                "G17P render USC FList: control retirement timed out target={} counters={:?}\n",
+                target,
+                counters.primary,
+            );
+            return Err(ETIMEDOUT);
+        }
+
+        // B1 marks c083 +0x44 busy while opcode 0x20 drives UMA. Registering
+        // render qids against that busy owner suspends them with reason 4;
+        // the verbose firmware trace shows the later type-13 event resuming
+        // qids0/1 immediately before qid1 is NOP-retired. Service that event
+        // now, while this thread owns the runtime mutex, and do not publish a
+        // render doorbell until the retained lifecycle reaches Matched.
+        const UMA_GROW_POLLS: usize = 200;
+        let mut serviced = 0u32;
+        for poll in 0..UMA_GROW_POLLS {
+            if self
+                .manager
+                .as_ref()
+                .is_some_and(|manager| manager.render_usc_freelist_grow_matched())
+            {
+                dev_info!(
+                    self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                    "G17P render USC FList: type13 grow completed before work after {}ms serviced={}\n",
+                    poll,
+                    serviced,
+                );
+                return Ok(());
+            }
+            if self.is_crashed() {
+                return Err(EIO);
+            }
+            serviced = serviced.saturating_add(self.service_firmware_events_inline()?);
+            fsleep(Delta::from_millis(1));
+        }
+        dev_err!(
+            self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+            "G17P render USC FList: type13 grow did not complete before work (serviced={})\n",
+            serviced,
+        );
+        Err(ETIMEDOUT)
     }
 
     /// Drop the final host reference named by a matched type-13 event. Native

@@ -1005,7 +1005,11 @@ pub(crate) const G17P_PARTIAL_OPENING_CONTROL_MESSAGE_SIZE: u64 = 0x40;
 pub(crate) const G17P_PARTIAL_OPENING_WORK_DOORBELL_CHANNEL: u8 = 0;
 pub(crate) const G17P_PARTIAL_OPENING_PAIRED_DOORBELL: u64 =
     MSG_TX_DOORBELL | G17P_PARTIAL_OPENING_WORK_DOORBELL_CHANNEL as u64;
-pub(crate) const G17P_NATIVE_RENDER_DOORBELL_PRIORITY: u8 = 2;
+pub(crate) const G17P_NATIVE_RENDER_DOORBELL_PRIORITY: u8 = 0;
+pub(crate) const G17P_NATIVE_RENDER_QOS_HARDWARE_BUFFER_ID: u8 =
+    if G17P_NATIVE_RENDER_DOORBELL_PRIORITY == 0 { 0 } else { 2 };
+pub(crate) const G17P_NATIVE_RENDER_POLICY: u16 =
+    if G17P_NATIVE_RENDER_DOORBELL_PRIORITY == 0 { 1 } else { 2 };
 /// Mac17P submits 3D first: Fragment(1) | (priority 2 << 2) = 0x09.
 pub(crate) const G17P_NATIVE_3D_DOORBELL: u64 = MSG_TX_DOORBELL
     | PipeType::Fragment as u64
@@ -1022,11 +1026,10 @@ pub(crate) const G17P_PARTIAL_OPENING_OUTER_SLOT_COUNT: u32 = 0x100;
 /// TA_0/3D_0/CL_0 and indices 6,7,8 are TA_2/3D_2/CL_2.
 ///
 /// The render must publish into the rings for the priority it actually
-/// configures and announces. Its tag-15 programs both queues at priority 2 --
-/// firmware KTrace 0x40 reports `prio 2` for qid 5 and qid 6 -- and its
-/// doorbell is `G17P_NATIVE_TA_DOORBELL`, which encodes priority 2. The full
-/// boot trace separately captures native priority-0 system queues; mixing their
-/// table/doorbell with a priority-2 queue record makes an invalid hybrid.
+/// configures and announces. This profile follows native's initial priority-0
+/// qid-0/1 pair consistently through table selection, queue records, tags,
+/// QoS and the paired doorbell. Later priority-2 userspace queues use indices
+/// 6/7 and must likewise remain internally coherent.
 ///
 /// Compute is the worked example of the rule: index 8 is CL at priority 2, it
 /// agrees with its own priority-2 doorbell 0x0a, and it is validated by 2000
@@ -1042,8 +1045,8 @@ pub(crate) const G17P_COMPUTE_CHANNEL_TABLE_INDEX: u8 =
     g17p_work_channel_table_index(2, PipeType::Compute);
 // The compute index is the validated anchor for the rule above: it must stay 8.
 const _: () = assert!(G17P_COMPUTE_CHANNEL_TABLE_INDEX == 8);
-const _: () = assert!(G17P_PARTIAL_OPENING_TILING_CHANNEL_TABLE_INDEX == 6);
-const _: () = assert!(G17P_PARTIAL_OPENING_FRAGMENT_CHANNEL_TABLE_INDEX == 7);
+const _: () = assert!(G17P_PARTIAL_OPENING_TILING_CHANNEL_TABLE_INDEX == 0);
+const _: () = assert!(G17P_PARTIAL_OPENING_FRAGMENT_CHANNEL_TABLE_INDEX == 1);
 /// Compute work-submission doorbell channel. VALIDATED by 2000 consecutive
 /// passing computes. Decodes under `encode_tx_doorbell` as
 /// `pipe Compute(2) | (priority 2 << 2)` = 0x0a, which is why it is not simply
@@ -1588,11 +1591,11 @@ pub(crate) fn apply_g17p_cold_opening_optional(
         G17PColdOpeningStage::Tiling => &[
             (0x18, queue_id),
             (0x1a, install),
-            (0x1e, 2),
+            (0x1e, G17P_NATIVE_RENDER_DOORBELL_PRIORITY as u16),
             (0x26, 1),
             (0x52, 1),
-            (0x56, 2),
-            (0x5e, 2),
+            (0x56, G17P_NATIVE_RENDER_QOS_HARDWARE_BUFFER_ID as u16),
+            (0x5e, G17P_NATIVE_RENDER_POLICY),
             (0x62, 1),
             (0x66, 1),
             // +0x82 is the TA's FORWARD REFERENCE TO ITS 3D PARTNER, not a
@@ -1608,12 +1611,12 @@ pub(crate) fn apply_g17p_cold_opening_optional(
         G17PColdOpeningStage::Fragment => &[
             (0x18, queue_id),
             (0x1a, install),
-            (0x1e, 2),
+            (0x1e, G17P_NATIVE_RENDER_DOORBELL_PRIORITY as u16),
             (0x22, 1),
             (0x26, 1),
             (0x52, 1),
-            (0x56, 2),
-            (0x5e, 2),
+            (0x56, G17P_NATIVE_RENDER_QOS_HARDWARE_BUFFER_ID as u16),
+            (0x5e, G17P_NATIVE_RENDER_POLICY),
             (0x62, 1),
             (0x66, 1),
         ],
@@ -1674,7 +1677,11 @@ pub(crate) fn apply_g17p_cold_opening_event(
     // receipt reads the QID with `ldrh w21, [x19, #4]`, and the native capture
     // carries 0x11/0x12 there for TA/3D.
     put_u32_le(out, 0x04, 0x0001_0000 | queue_id as u32);
-    put_u32_le(out, 0x08, 0x102);
+    put_u32_le(
+        out,
+        0x08,
+        0x100 | u32::from(G17P_NATIVE_RENDER_DOORBELL_PRIORITY),
+    );
     if stage == G17PColdOpeningStage::Fragment {
         put_u32_le(out, 0x10, 0x100);
     }
@@ -1748,9 +1755,13 @@ pub(crate) fn apply_g17p_retained_optional(
     // the tag-15 kick makes B1 release and re-register the just-published USC
     // allocation before fragment engine service.
     put_u16_le(out, 0x3e, g17p_render_flist_generation(submission_ordinal));
-    // Native allocates +0x56 dynamically; Linux retains its reserved slot 2
-    // across submissions and publishes it consistently in every QoS sink.
-    put_u16_le(out, 0x56, 2);
+    // Keep the selected profile's HardwareBufferID identical in ConfigUpdate,
+    // the QID-indexed QoS row, and the KSM dependency-control qword.
+    put_u16_le(
+        out,
+        0x56,
+        G17P_NATIVE_RENDER_QOS_HARDWARE_BUFFER_ID as u16,
+    );
     // TA +0x76 is not the submission ordinal. Native copies the u64 at
     // AGXHardwareBufferBase +0x68 here. Leave the freshly initialized local
     // token intact until that command-owned PB state is modeled explicitly;
@@ -1759,10 +1770,10 @@ pub(crate) fn apply_g17p_retained_optional(
 }
 
 /// Host-owned equivalent of AGXUSCPrivMemFList +0xb0 for a retained render
-/// queue. Zero is the firmware BSS/reset value, so the first registration must
-/// publish one; each later restage advances the same generation once.
+/// queue. Valid native cold records start at zero; each later retained restage
+/// advances the same generation once.
 pub(crate) const fn g17p_render_flist_generation(submission_ordinal: u32) -> u16 {
-    (submission_ordinal as u16).wrapping_add(1)
+    submission_ordinal as u16
 }
 
 /// Refresh the canonical event record while retaining its physical address.
@@ -1780,7 +1791,11 @@ pub(crate) fn apply_g17p_retained_event_with_stamp(
         return Err(SubmissionError::PartialOpeningQueueHeadOutOfRange);
     }
     apply_g17p_cold_opening_event(stage, queue_id, out)?;
-    put_u32_le(out, 0x08, (entry_stamp << 8) | 2);
+    put_u32_le(
+        out,
+        0x08,
+        (entry_stamp << 8) | u32::from(G17P_NATIVE_RENDER_DOORBELL_PRIORITY),
+    );
     Ok(())
 }
 
@@ -1842,10 +1857,16 @@ pub(crate) fn apply_g17p_cold_opening_queue_record(
     // copies it to 3D setup +0xe5c, and validates it against KSM queue +0x1c.
     // The captured ordinary Metal command carries 2. Channel +0x1c0 is only
     // context-priority bookkeeping and is not the live-state value.
-    put_u32_le(out, 0x28, 2);
-    put_u32_le(out, 0x2c, 2);
-    out[0x36..0x38].fill(0xff);
-    put_u32_le(out, 0x38, 0);
+    let priority = u32::from(G17P_NATIVE_RENDER_DOORBELL_PRIORITY);
+    put_u32_le(out, 0x28, priority);
+    put_u32_le(out, 0x2c, priority);
+    if priority == 0 {
+        out[0x32..0x38].fill(0xff);
+        put_u32_le(out, 0x38, 1);
+    } else {
+        out[0x36..0x38].fill(0xff);
+        put_u32_le(out, 0x38, 0);
+    }
     // MEASURED ON macOS 2026-09-02 (`ringrec-gfx.txt`): the live per-queue
     // record of a real Metal render pass, read through the kernel alias the
     // AGXChannel keeps at +0x58 for the firmware VA at +0x80, is
@@ -1859,7 +1880,7 @@ pub(crate) fn apply_g17p_cold_opening_queue_record(
     // at +0x9c and was moved on the theory that the object is 0x80 bytes; the
     // ring slots name records on an exact 0xc0 stride (base + qid * 0xc0), so
     // 0x9c is inside the object and was right all along.
-    put_u32_le(out, 0x40, 2);
+    put_u32_le(out, 0x40, u32::from(G17P_NATIVE_RENDER_POLICY));
     put_u32_le(out, 0x44, u32::MAX);
     // Native reset copies the channel owner's process PID here. The same
     // value is published in ConfigUpdate +0x5a.
@@ -4584,7 +4605,7 @@ mod tests {
     }
 
     #[test]
-    fn native_render_doorbells_are_3d_then_ta_at_priority_two() {
+    fn native_initial_render_uses_the_paired_priority_zero_doorbell() {
         // Pipe identity at priority zero: 3D is the low Fragment pipe 1 and
         // TA is the low Vertex pipe 0. Compute is the remaining pipe 2.
         assert_eq!(
@@ -4600,15 +4621,15 @@ mod tests {
             Ok(0x0083_0000_0000_0002)
         );
 
-        assert_eq!(G17P_NATIVE_RENDER_DOORBELL_PRIORITY, 2);
-        assert_eq!(G17P_NATIVE_3D_DOORBELL, 0x0083_0000_0000_0009);
-        assert_eq!(G17P_NATIVE_TA_DOORBELL, 0x0083_0000_0000_0008);
+        assert_eq!(G17P_NATIVE_RENDER_DOORBELL_PRIORITY, 0);
+        assert_eq!(G17P_NATIVE_3D_DOORBELL, 0x0083_0000_0000_0001);
+        assert_eq!(G17P_NATIVE_TA_DOORBELL, 0x0083_0000_0000_0000);
         assert_eq!(
-            encode_tx_doorbell(PipeType::Fragment, 2),
+            encode_tx_doorbell(PipeType::Fragment, 0),
             Ok(G17P_NATIVE_3D_DOORBELL)
         );
         assert_eq!(
-            encode_tx_doorbell(PipeType::Vertex, 2),
+            encode_tx_doorbell(PipeType::Vertex, 0),
             Ok(G17P_NATIVE_TA_DOORBELL)
         );
     }

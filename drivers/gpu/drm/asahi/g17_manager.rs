@@ -63,8 +63,8 @@ static G17P_HW_DATA_DUMPED: core::sync::atomic::AtomicBool =
 
 // Kext RE: AsyncGrowEngine::updateSubmitInfo copies AGXUSCPrivMemFList +0xb0
 // into opcode-0x20 +0x0c, and the 3D submit path copies that same field into
-// tag-15 +0x3e. The first Linux render tag therefore owns generation 1 and its
-// preceding FList registration must publish 1 as well.
+// tag-15 +0x3e. Valid cold native opcode-0x20 and qid0/qid1 tag-15 records
+// both publish generation zero; retained generations advance from there.
 const G17P_BOOTSTRAP_UMA_SEQUENCE: u64 =
     g17_submission::g17p_render_flist_generation(0) as u64;
 const G17P_BOOTSTRAP_UMA_HARDWARE_BUFFER_ID: u32 =
@@ -318,7 +318,7 @@ impl G17PBootstrapUmaLifecycle {
             request: G17PBootstrapUmaCompletion {
                 stamp: G17P_BOOTSTRAP_UMA_STAMP,
                 hardware_buffer_id: G17P_BOOTSTRAP_UMA_HARDWARE_BUFFER_ID,
-                shared_control: g17_initdata::PARTIAL_OPENING_CONTROL_SHARED_ADDRESS,
+                shared_control: g17_initdata::CONTROL_SHARED_ADDRESS,
                 operand_table: g17_initdata::CONTROL_OPERAND_TABLE_ADDRESS,
                 cookie: G17P_BOOTSTRAP_UMA_COOKIE,
                 count: G17P_BOOTSTRAP_UMA_COUNT,
@@ -1926,7 +1926,7 @@ impl G17PManagerConstruction {
 
         let mut record = [0u8; g17_initdata::CONTROL_RECORD_SIZE];
         g17_submission::encode_g17p_usc_freelist_control(
-            g17_initdata::PARTIAL_OPENING_CONTROL_SHARED_ADDRESS,
+            g17_initdata::CONTROL_SHARED_ADDRESS,
             g17_submission::G17P_USC_FREELIST_LOW_VA,
             g17_submission::G17P_USC_FREELIST_LOW_END,
             g17_submission::G17PUscFreelistSequence {
@@ -1962,6 +1962,15 @@ impl G17PManagerConstruction {
             .map_err(|_| EIO)?;
         self.resources.log_render_uma_growth("type13");
         Ok(())
+    }
+
+    /// Whether the asynchronous opcode-0x20 grow has retired its own
+    /// reference. TA/3D references intentionally remain live until paired
+    /// render completion.
+    pub(crate) fn render_usc_freelist_grow_matched(&self) -> bool {
+        self.bootstrap_uma
+            .as_ref()
+            .is_some_and(|lifecycle| lifecycle.state == G17PBootstrapUmaRequestState::Matched)
     }
 
     /// Retire the TA and 3D FList references after paired render completion.
@@ -2358,16 +2367,10 @@ impl G17PManagerConstruction {
     /// Prepare the two render KSM kick queues without touching the hardware
     /// bridge: QID 0 (TA, data master 0) and QID 1 (3D, data master 1).
     ///
-    /// PROVEN from twelve captured macOS render passes: the render queues are a
-    /// consecutive TA-first QID pair, each queue's data master is its channel
-    /// grid index, and every captured `AGXKSMKickQueue` carries priority 2 at
-    /// `+0x1c`, which is what tag-14 `+0x08` echoes. Our grid indices are
-    /// already 0 (tiling) and 1 (fragment), so the QIDs come from the same
-    /// constants the outer channel slots use and nothing new is invented here.
-    ///
-    /// RISK (UNKNOWN): no QID 0 or 1 was ever observed in use on macOS. If the
-    /// firmware reserves them, moving the pair is a two-constant change --
-    /// the queue ids below plus the entry regions in `g17_resources`.
+    /// PROVEN by the valid cold macOS doorbell-1 capture: the first render uses
+    /// QID 0 for TA/DM0 and QID 1 for 3D/DM1, both on priority zero. The QIDs,
+    /// data masters, outer slots, tag-14 records, and SKSM entries below retain
+    /// that exact initial profile.
     /// Name the render publish step that failed. `submit_translated_render`
     /// reports only a propagated errno, so before this every EINVAL raised
     /// below `begin_translated_render` -- render storage setup, the two-QID
@@ -2382,7 +2385,8 @@ impl G17PManagerConstruction {
     }
 
     fn new_render_sksm_queues(&self) -> Result<G17PRenderSksmQueues> {
-        const RENDER_COMPLETION_SELECTOR: u8 = 2;
+        const RENDER_COMPLETION_SELECTOR: u8 =
+            g17_submission::G17P_NATIVE_RENDER_DOORBELL_PRIORITY;
         let geometry = self.sksm_queue_geometry();
         let scratch = self.sksm_scratch();
         let build = |queue_id: u8, data_master: u32, tiling: bool| -> Result<G17PRenderSksmQueue> {
@@ -2420,7 +2424,7 @@ impl G17PManagerConstruction {
                             {
                                 1 if tiling => 1,
                                 2 => 1,
-                                _ => 2,
+                                _ => g17_submission::G17P_NATIVE_RENDER_QOS_HARDWARE_BUFFER_ID,
                             },
                             // G17P's stage wrappers select row 1 of the native
                             // 9x3 QoS table: TA=0x0c, 3D=0x18, CL=0x08. The
@@ -2488,12 +2492,9 @@ impl G17PManagerConstruction {
         }
         let scratch = self.sksm_scratch();
         let uat_owner = self.uat().ttb_base();
-        // Mode 2 publishes a bare entry -- no RCE bindings, no event mask -- so
-        // one build can bisect whether the compute-shaped command state is what
-        // a render kick needs. There is no captured render kick entry: the
-        // captures never dumped the KSM entry ring, so the default (mode 1) is
-        // the compute analogue on the same descriptor low alias and is INFERRED,
-        // not proven.
+        // Mode 2 publishes a bare entry -- no RCE bindings or event mask -- as
+        // a retained diagnostic. The default is the byte-exact render shape
+        // recovered from the valid cold macOS SKSM entry-ring capture.
         let sksm_mode = *crate::module_parameters::g17p_render_sksm.value();
         let minimal = sksm_mode == 2;
         // Mode 3 is the shape a real Metal render pass uses, read out of the
@@ -3376,7 +3377,11 @@ impl G17PManagerConstruction {
                     label,
                     rd(G17P_READY_MASK_LINK_BASE).unwrap_or(u64::MAX),
                 );
-                for qid in [4u64, 5, 6] {
+                for qid in [
+                    4u64,
+                    u64::from(g17_resources::g17p_render_queue_id(true)),
+                    u64::from(g17_resources::g17p_render_queue_id(false)),
+                ] {
                     let park = G17P_KSM_PARK_RECORD_LINK_BASE + qid * 0x28;
                     let counters = rd(park + 0x418);
                     let deadline = rd(park + 0x400);
@@ -3438,7 +3443,11 @@ impl G17PManagerConstruction {
                     );
                 }
             }
-            for qid in [4u8, 5, 6] {
+            for qid in [
+                4u8,
+                g17_resources::g17p_render_queue_id(true) as u8,
+                g17_resources::g17p_render_queue_id(false) as u8,
+            ] {
                 let link = G17P_DEPENDENCY_RECORD_LINK_BASE
                     + u64::from(qid) * G17P_DEPENDENCY_RECORD_STRIDE;
                 let phys = G17P_GFX_PHYSICAL_DATA_BASE
@@ -4273,16 +4282,16 @@ impl G17PManagerConstruction {
             .render_storage
             .as_mut()
             .ok_or(ENODEV)
-            .and_then(|storage| storage.fragment_activation_word())
+            .and_then(|storage| storage.fragment_word_20f0())
         {
             Ok(value) => dev_err!(
                 self.resources.dev().as_ref(),
-                "G17P render activation witness: descriptor +0x20f0={:#010x} (0: B1 3D activation not entered, 1: entered)\n",
+                "G17P render descriptor diagnostic: +0x20f0={:#010x} (not an activation witness)\n",
                 value,
             ),
             Err(error) => dev_err!(
                 self.resources.dev().as_ref(),
-                "G17P render activation witness: descriptor +0x20f0 read failed ({:?})\n",
+                "G17P render descriptor diagnostic: +0x20f0 read failed ({:?})\n",
                 error,
             ),
         }
@@ -4539,7 +4548,7 @@ impl G17PManagerConstruction {
     /// The first graph of a boot always gets `G17P_COMPUTE_QUEUE_ID_BASE` (4),
     /// which is the QID the captured native CL2 queue uses and the only one any
     /// of this driver's proven runs have exercised. A rebuilt session advances
-    /// into the unused pool at QID 7; QIDs 5/6 are the retained TA/3D pair.
+    /// into the unused pool at QID 7; QIDs 0/1 are the retained TA/3D pair.
     ///
     /// Skips the two render QIDs and never wraps onto an installed queue.
     fn allocate_compute_queue_id(&mut self) -> Result<u8> {
