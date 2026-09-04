@@ -1291,6 +1291,48 @@ pub(crate) struct G17PFirmwareFaultReportSnapshot {
     pub(crate) reason: u32,
 }
 
+/// B1 `FUN_6a20(1, slot)` maintains 0x18-byte DM1 progress-monitor records
+/// at `*(main + 0x25c) + 0xa40 + slot * 0x18`. `FUN_5450` reads the same
+/// state and timestamp when scanning hardware slots; these are not QIDs.
+const MAIN_CONFIG_DM1_WATCHDOG_POINTER: u64 = 0x25c;
+const DM1_WATCHDOG_VIEW_INDEX: usize = 1;
+const DM1_WATCHDOG_SLOT0_OFFSET: usize = 0xa40;
+const DM1_WATCHDOG_RECORD_SIZE: usize = 0x18;
+
+/// Validate the entire read against the expected host-owned view before
+/// following the serialized pointer. Reject overflow at either end.
+fn g17p_dm1_slot0_address(
+    view_pointer: u64,
+    expected_view: u64,
+    view_extent: usize,
+) -> Option<u64> {
+    let end = DM1_WATCHDOG_SLOT0_OFFSET.checked_add(DM1_WATCHDOG_RECORD_SIZE)?;
+    if view_pointer != expected_view || end > view_extent {
+        return None;
+    }
+    view_pointer.checked_add(end as u64)?;
+    view_pointer.checked_add(DM1_WATCHDOG_SLOT0_OFFSET as u64)
+}
+
+/// Raw host-memory sample, not an atomic firmware snapshot. Only word 0
+/// (progress-monitor state) and the unaligned timestamp at +0x0c are named:
+/// B1 keeps its unchanged-sample counter elsewhere, not at record +0x08.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PFirmwareDm1Slot0Snapshot {
+    pub(crate) address: u64,
+    pub(crate) raw: [u32; 6],
+}
+
+impl G17PFirmwareDm1Slot0Snapshot {
+    pub(crate) fn state(&self) -> u32 {
+        self.raw[0]
+    }
+
+    pub(crate) fn timestamp(&self) -> u64 {
+        u64::from(self.raw[3]) | (u64::from(self.raw[4]) << 32)
+    }
+}
+
 /// One record consumed from the primary role's native 0x48-byte firmware
 /// event ring. The indices are retained so the host publication can be
 /// checked against the same snapshot that selected the entry.
@@ -9564,8 +9606,8 @@ impl G17ResourceOwner {
     /// Two firmware paths fill it: the queue-progress fault scan in
     /// `fw_gpu_recovery` (b1 `0x5450`, which zeroes the presence tags at
     /// `0x5494-0x54a4` before scanning) and the KSM kick-timeout blame path in
-    /// the recovery worker (b1 `0x26c94`, `0x26e40-0x26e9c`). Only the second
-    /// fills the KSM-slot field.
+    /// the recovery worker (b1 `0x26c94`, `0x26e40-0x26e9c`). Both can fill
+    /// the slot and data-master fields; only the latter supplies a QID.
     pub(crate) fn firmware_fault_report_snapshot(
         &mut self,
     ) -> Result<G17PFirmwareFaultReportSnapshot> {
@@ -9602,6 +9644,43 @@ impl G17ResourceOwner {
             source_count: read(FAULT_REPORT_SOURCE_COUNT)?,
             reason: read(FAULT_REPORT_REASON)?,
         })
+    }
+
+    /// Sample DM1 hardware slot 0's progress record through the retained WC
+    /// shared object. This does not read SGX registers or firmware-private
+    /// cached memory, and it cannot follow a pointer outside bundle view 1.
+    pub(crate) fn firmware_dm1_slot0_snapshot(
+        &mut self,
+    ) -> Result<G17PFirmwareDm1Slot0Snapshot> {
+        let pointer_address = self
+            .handoff
+            .primary
+            .instance
+            .main_config
+            .checked_add(MAIN_CONFIG_DM1_WATCHDOG_POINTER)
+            .ok_or(EINVAL)?;
+        let expected_view = self
+            .handoff
+            .shared
+            .hw_data_bundle
+            .checked_add(g17_initdata::BUNDLE_VIEW_OFFSETS[DM1_WATCHDOG_VIEW_INDEX] as u64)
+            .ok_or(EINVAL)?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        let view_pointer = self.resources.shared_cluster.read_u64(pointer_address)?;
+        let address = g17p_dm1_slot0_address(
+            view_pointer,
+            expected_view,
+            g17_initdata::BUNDLE_VIEW_EXTENTS[DM1_WATCHDOG_VIEW_INDEX],
+        )
+        .ok_or(EINVAL)?;
+        let mut raw = [0u32; 6];
+        for (index, word) in raw.iter_mut().enumerate() {
+            *word = self
+                .resources
+                .shared_cluster
+                .read_u32(address.checked_add(index as u64 * 4).ok_or(EINVAL)?)?;
+        }
+        Ok(G17PFirmwareDm1Slot0Snapshot { address, raw })
     }
 
     pub(crate) fn firmware_recovery_handshake_snapshot(
@@ -13544,6 +13623,34 @@ impl G17ResourceOwner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dm1_watchdog_slot0_validates_pointer_identity_and_complete_extent() {
+        let view = 0xffff_fc20_c078_b380;
+        assert_eq!(g17p_dm1_slot0_address(view, view, 0xc80), Some(view + 0xa40));
+        assert_eq!(g17p_dm1_slot0_address(view, view, 0xa58), Some(view + 0xa40));
+        assert_eq!(g17p_dm1_slot0_address(view, view, 0xa57), None);
+        assert_eq!(g17p_dm1_slot0_address(view + 4, view, 0xc80), None);
+    }
+
+    #[test]
+    fn dm1_watchdog_slot0_rejects_start_and_end_overflow() {
+        let start_overflow = u64::MAX - 0xa3f;
+        assert_eq!(g17p_dm1_slot0_address(start_overflow, start_overflow, 0xc80), None);
+        let end_overflow = u64::MAX - 0xa40;
+        assert_eq!(g17p_dm1_slot0_address(end_overflow, end_overflow, 0xc80), None);
+    }
+
+    #[test]
+    fn dm1_watchdog_slot0_timestamp_uses_unaligned_words_three_and_four() {
+        let snapshot = G17PFirmwareDm1Slot0Snapshot {
+            address: 0,
+            raw: [2, 0x1111_1111, 0x2222_2222, 0x89ab_cdef, 0x0123_4567, 0x5555_5555],
+        };
+        assert_eq!(snapshot.state(), 2);
+        assert_eq!(snapshot.timestamp(), 0x0123_4567_89ab_cdef);
+        assert_eq!(snapshot.raw[2], 0x2222_2222);
+    }
 
     #[test]
     fn initial_render_qos_row_matches_valid_qid0_qid1_profile() {

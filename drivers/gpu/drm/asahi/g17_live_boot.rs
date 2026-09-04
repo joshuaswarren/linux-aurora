@@ -536,6 +536,25 @@ fn log_g17p_fault_report(
             error,
         ),
     }
+    // Keep this independent of the report read: failure of either bounded
+    // host-memory diagnostic must not suppress the other or touch MMIO.
+    match manager.firmware_dm1_slot0_snapshot() {
+        Ok(snapshot) => dev_info!(
+            dev,
+            "G17P DM1 slot0 monitor checkpoint={} address={:#x} raw={:08x?} monitor-state={} monitor-timestamp={:#x}\n",
+            checkpoint,
+            snapshot.address,
+            snapshot.raw,
+            snapshot.state(),
+            snapshot.timestamp(),
+        ),
+        Err(error) => dev_warn!(
+            dev,
+            "G17P DM1 slot0 monitor checkpoint={} read failed ({:?})\n",
+            checkpoint,
+            error,
+        ),
+    }
 }
 
 fn validate_primary_bootstrap_uma_completion(
