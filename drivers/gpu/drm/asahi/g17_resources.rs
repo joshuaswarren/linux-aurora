@@ -1063,6 +1063,10 @@ pub(crate) enum G17PDeferredOuterPublication {
     None,
     Fragment,
     Tiling,
+    /// Retain the complete pair until the pre-render USC FList transaction
+    /// has retired. Its device-control notification wakes the same scheduler,
+    /// so publishing either outer producer before it races first TA work.
+    Both,
 }
 
 fn g17p_deferred_outer_plan_ready(
@@ -13311,7 +13315,10 @@ impl G17ResourceOwner {
             None
         };
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        if deferred_outer != G17PDeferredOuterPublication::Fragment {
+        if !matches!(
+            deferred_outer,
+            G17PDeferredOuterPublication::Fragment | G17PDeferredOuterPublication::Both
+        ) {
             state[fragment_producer_offset..fragment_producer_offset + 4]
                 .copy_from_slice(&prepared.fragment.next_producer.to_le_bytes());
         }
@@ -13320,13 +13327,109 @@ impl G17ResourceOwner {
         shared[tiling_slot_offset..tiling_slot_offset + prepared.tiling.slot.len()]
             .copy_from_slice(&prepared.tiling.slot);
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        if deferred_outer != G17PDeferredOuterPublication::Tiling {
+        if !matches!(
+            deferred_outer,
+            G17PDeferredOuterPublication::Tiling | G17PDeferredOuterPublication::Both
+        ) {
             state[tiling_producer_offset..tiling_producer_offset + 4]
                 .copy_from_slice(&prepared.tiling.next_producer.to_le_bytes());
         }
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 
         Ok((prepared, render_bind))
+    }
+
+    /// Publish a render pair whose two complete outer slots were retained
+    /// while the first-submit USC FList update/grow transaction retired.
+    ///
+    /// All cursor checks, bounds checks, and VMap acquisition happen before
+    /// either producer advances. The final transaction rewrites both slot
+    /// bodies, then exposes Fragment followed by TA, matching the ordinary
+    /// paired publication without giving the control-ring wake a partial or
+    /// premature render to consume.
+    pub(crate) fn publish_deferred_partial_opening_pair(
+        &mut self,
+        prepared: &g17_submission::PreparedG17PPartialOpeningWorkPair,
+    ) -> Result {
+        let binding = self.partial_opening_binding();
+        let plans = [&prepared.fragment, &prepared.tiling];
+        let channels = [binding.fragment_channel, binding.tiling_channel];
+        let expected_indices = [
+            g17_submission::G17P_PARTIAL_OPENING_FRAGMENT_CHANNEL_TABLE_INDEX,
+            g17_submission::G17P_PARTIAL_OPENING_TILING_CHANNEL_TABLE_INDEX,
+        ];
+        let mut slot_offsets = [0usize; 2];
+        let mut slot_ends = [0usize; 2];
+        let mut producer_offsets = [0usize; 2];
+        let mut producer_ends = [0usize; 2];
+
+        for index in 0..2 {
+            let plan = plans[index];
+            let channel = channels[index];
+            let current_producer = self.resources.primary_state.read_u32(
+                channel.states[g17_initdata::CHANNEL_STATE_PRODUCER],
+            )?;
+            if !g17p_deferred_outer_plan_ready(
+                plan,
+                expected_indices[index],
+                current_producer,
+            ) {
+                return Err(EBUSY);
+            }
+            let slot_gpu_va = channel
+                .ring
+                .checked_add(plan.slot_byte_offset as u64)
+                .ok_or(EINVAL)?;
+            slot_offsets[index] = slot_gpu_va
+                .checked_sub(self.resources.shared_cluster.iova())
+                .ok_or(EINVAL)?
+                .try_into()?;
+            slot_ends[index] = slot_offsets[index]
+                .checked_add(plan.slot.len())
+                .ok_or(EINVAL)?;
+            let producer_gpu_va =
+                channel.states[g17_initdata::CHANNEL_STATE_PRODUCER];
+            producer_offsets[index] = producer_gpu_va
+                .checked_sub(self.resources.primary_state.iova())
+                .ok_or(EINVAL)?
+                .try_into()?;
+            producer_ends[index] = producer_offsets[index]
+                .checked_add(core::mem::size_of::<u32>())
+                .ok_or(EINVAL)?;
+            if slot_ends[index] > self.resources.shared_cluster.logical_size
+                || producer_ends[index] > self.resources.primary_state.logical_size
+            {
+                return Err(ERANGE);
+            }
+        }
+
+        let shared_vmap = self.resources.shared_cluster.object.vmap()?;
+        let state_vmap = self.resources.primary_state.object.vmap()?;
+        let shared = unsafe {
+            // SAFETY: every slot range was checked against the complete VMap.
+            core::slice::from_raw_parts_mut(
+                shared_vmap.as_mut_ptr(),
+                self.resources.shared_cluster.logical_size,
+            )
+        };
+        let state = unsafe {
+            // SAFETY: both producer ranges were checked against this VMap.
+            core::slice::from_raw_parts_mut(
+                state_vmap.as_mut_ptr(),
+                self.resources.primary_state.logical_size,
+            )
+        };
+
+        for index in 0..2 {
+            shared[slot_offsets[index]..slot_ends[index]].copy_from_slice(&plans[index].slot);
+        }
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        for index in 0..2 {
+            state[producer_offsets[index]..producer_ends[index]]
+                .copy_from_slice(&plans[index].next_producer.to_le_bytes());
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        }
+        Ok(())
     }
 
     /// Make a fragment outer slot retained by a split render publication

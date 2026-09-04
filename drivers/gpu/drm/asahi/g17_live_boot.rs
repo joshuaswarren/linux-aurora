@@ -3538,11 +3538,11 @@ impl G17PLiveRuntime {
                 timestamp_aliases,
                 registers,
             )?;
-        // Native performs AGXUSCPrivMemFList::updateSubmitInfo after its first
-        // barrier setup and before either render doorbell. Our render records
-        // are already staged, but firmware cannot consume them until the
-        // doorbell below, so this control announcement preserves the same
-        // externally visible order without splitting manager publication.
+        // Native retires AGXUSCPrivMemFList::updateSubmitInfo and its type-13
+        // grow before exposing either render outer producer. The control-ring
+        // notification itself wakes the scheduler, so a merely staged final
+        // work doorbell is not a visibility barrier: the old ordering let TA
+        // run here against a half-grown FList and emit only an empty header.
         if let Err(error) = self.publish_render_usc_freelist_request() {
             return match g17_lifecycle::recover_persistent_runtime(self) {
                 Ok(()) => Err(error),
@@ -4047,22 +4047,58 @@ impl G17PLiveRuntime {
                 }
             }
         } else {
-            let doorbells: &[u64] = if native_doorbells {
-                &[
+            if native_doorbells {
+                for doorbell in [
                     g17_submission::G17P_NATIVE_3D_DOORBELL,
                     g17_submission::G17P_NATIVE_TA_DOORBELL,
-                ]
+                ] {
+                    if let Err(error) = Pin::new(self.gfx_rtkit.as_mut().ok_or(ENODEV)?)
+                        .send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, doorbell)
+                    {
+                        return match g17_lifecycle::recover_persistent_runtime(self) {
+                            Ok(()) => Err(error),
+                            Err(recovery_error) => Err(recovery_error),
+                        };
+                    }
+                }
             } else {
-                core::slice::from_ref(&prepared.paired_doorbell)
-            };
-            for doorbell in doorbells {
-                if let Err(error) = Pin::new(self.gfx_rtkit.as_mut().ok_or(ENODEV)?)
-                    .send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, *doorbell)
-                {
+                // Keep the producer store(s) and the initial work doorbell
+                // adjacent. Default publishes the complete pair; split launch
+                // publishes only TA and retains Fragment until TA completion.
+                let publish = match self.manager.as_mut() {
+                    Some(manager) if split_launch => manager
+                        .publish_split_render_tiling_after_freelist(&prepared.tiling),
+                    Some(manager) => {
+                        manager.publish_default_render_pair_after_freelist(&prepared)
+                    }
+                    None => Err(ENODEV),
+                };
+                if let Err(error) = publish {
                     return match g17_lifecycle::recover_persistent_runtime(self) {
                         Ok(()) => Err(error),
                         Err(recovery_error) => Err(recovery_error),
                     };
+                }
+                fence(Ordering::SeqCst);
+                let send = match self.gfx_rtkit.as_mut() {
+                    Some(rtkit) => Pin::new(rtkit).send_message(
+                        g17_rtkit::ENDPOINT_GFX_INTERRUPTS,
+                        prepared.paired_doorbell,
+                    ),
+                    None => Err(ENODEV),
+                };
+                if let Err(error) = send {
+                    return match g17_lifecycle::recover_persistent_runtime(self) {
+                        Ok(()) => Err(error),
+                        Err(recovery_error) => Err(recovery_error),
+                    };
+                }
+                if let Some(pdev) = self.pdev.as_ref() {
+                    dev_info!(
+                        pdev.as_ref(),
+                        "G17P render: deferred {} outer publication completed after USC FList retirement and initial doorbell sent\n",
+                        if split_launch { "TA-only" } else { "paired" },
+                    );
                 }
             }
             // The default path uses the valid cold-native paired priority-0
