@@ -1250,16 +1250,17 @@ const FAULT_REPORT_RECOVERY_STATE: u64 = 0x00;
 /// Set when *the host* asked for the recovery; the firmware then wipes the
 /// blame fields before the handshake, so an empty report is correct here.
 const FAULT_REPORT_HOST_REQUESTED: u64 = 0x04;
-/// The blame fields are packed `{u32 present, u32 value}` pairs. The consumer
-/// at b1 `0xe8b0` proves the naming: it compares `report+0x38` against
-/// `0xfffffc0000127628 + qid*0x28 + 0x20` (the per-queue data-master index)
-/// and `report+0x28` against the queue id.
-const FAULT_REPORT_BLAMED_QID_PRESENT: u64 = 0x24;
-const FAULT_REPORT_BLAMED_QID: u64 = 0x28;
-/// KSM slot index. Written only on the kick-timeout path (b1 `0x26e80`); the
-/// fault-scan path explicitly zeroes it (`0x54a0`), so 0 here is normal.
-const FAULT_REPORT_BLAMED_SLOT_PRESENT: u64 = 0x2c;
-const FAULT_REPORT_BLAMED_SLOT: u64 = 0x30;
+/// The blame fields are packed `{u32 present, u32 value}` pairs. The fault
+/// scan in B1 `FUN_5450` stores the first set bit of the three KSM fault masks
+/// at `+0x28`, making `+0x24/+0x28` slot-present/slot. `FUN_e85c` receives the
+/// physical QID separately and compares its slot argument with that word.
+const FAULT_REPORT_BLAMED_SLOT_PRESENT: u64 = 0x24;
+const FAULT_REPORT_BLAMED_SLOT: u64 = 0x28;
+/// Physical QID. The explicit timeout path stores `DAT_12dae0` at `+0x30` and
+/// uses that same value to index the qid*0x28 scheduler table. The ordinary
+/// fault-mask scan leaves this pair clear, so a zero presence tag is normal.
+const FAULT_REPORT_BLAMED_QID_PRESENT: u64 = 0x2c;
+const FAULT_REPORT_BLAMED_QID: u64 = 0x30;
 /// That queue's data master (2 == compute on G17P).
 const FAULT_REPORT_DATA_MASTER_PRESENT: u64 = 0x34;
 const FAULT_REPORT_DATA_MASTER: u64 = 0x38;
@@ -9601,10 +9602,10 @@ impl G17ResourceOwner {
             report,
             state: read(FAULT_REPORT_RECOVERY_STATE)?,
             host_requested: read(FAULT_REPORT_HOST_REQUESTED)?,
-            qid_present: read(FAULT_REPORT_BLAMED_QID_PRESENT)?,
-            qid: read(FAULT_REPORT_BLAMED_QID)?,
             slot_present: read(FAULT_REPORT_BLAMED_SLOT_PRESENT)?,
             slot: read(FAULT_REPORT_BLAMED_SLOT)?,
+            qid_present: read(FAULT_REPORT_BLAMED_QID_PRESENT)?,
+            qid: read(FAULT_REPORT_BLAMED_QID)?,
             data_master_present: read(FAULT_REPORT_DATA_MASTER_PRESENT)?,
             data_master: read(FAULT_REPORT_DATA_MASTER)?,
             source_count: read(FAULT_REPORT_SOURCE_COUNT)?,
