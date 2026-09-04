@@ -337,13 +337,11 @@ const G17P_CONTROL_OPERAND_RUN_LENGTH_PAGES: u64 = 0x100;
 const G17P_CONTROL_OPERAND_RUN_ADDRESS_MASK: u64 = 0x0000_ffff_ffff_f000;
 const G17P_CONTROL_OPERAND_BUFFER_BASE: u64 = g17_initdata::CONTROL_OPERAND_BUFFER_BASE;
 const G17P_CONTROL_OPERAND_BUFFER_COUNT: usize = 28;
-/// Native allocates 22 one-MiB blocks before publishing the UMA state, then
-/// appends four blocks in the first asynchronous grow advertised by opcode
-/// 0x20. Each block consumes eight qword slots even though only slot zero is
-/// populated.
-const G17P_CONTROL_OPERAND_INITIAL_BLOCK_COUNT: usize =
-    g17_initdata::CONTROL_OPERAND_ENTRY_COUNT;
-const G17P_CONTROL_OPERAND_FIRST_GROW_BLOCK_COUNT: usize = 4;
+/// The complete 25G83 first-render trace resolves the split exactly: native
+/// publishes 17 initial one-MiB blocks, then opcode 0x20 appends five more.
+/// Each run owns an eight-qword slot even though only slot zero is populated.
+const G17P_CONTROL_OPERAND_INITIAL_BLOCK_COUNT: usize = 17;
+const G17P_CONTROL_OPERAND_FIRST_GROW_BLOCK_COUNT: usize = 5;
 const G17P_CONTROL_OPERAND_ACTIVE_BLOCK_COUNT: usize =
     G17P_CONTROL_OPERAND_INITIAL_BLOCK_COUNT + G17P_CONTROL_OPERAND_FIRST_GROW_BLOCK_COUNT;
 const G17P_CONTROL_OPERAND_RUN_SLOT_SIZE: usize = 8 * core::mem::size_of::<u64>();
@@ -447,8 +445,8 @@ fn encode_g17p_pre_qid_flist_runs(out: &mut [u8]) -> bool {
 }
 
 /// Encode the page-address array consumed by the initial UMA descriptor.
-/// Native prepares this before `halLoadUMADesc`: 22 initial one-MiB blocks,
-/// expanded into 256 4-KiB page addresses each. The four blocks described by
+/// Native prepares this before `halLoadUMADesc`: 17 initial one-MiB blocks,
+/// expanded into 256 4-KiB page addresses each. The five blocks described by
 /// the opcode-0x20 grow are deliberately absent; firmware expands their run
 /// descriptors into this list when it consumes the grow request.
 fn encode_g17p_initial_flist_page_list(out: &mut [u8]) -> bool {
@@ -6612,7 +6610,7 @@ impl G17PUserRenderStorage {
                     true,
                 ),
             ),
-            // The cold render FList publishes 22 initial blocks and four first-
+            // The cold render FList publishes 17 initial blocks and five first-
             // grow blocks. Their captured low addresses deliberately overlap
             // context-0 aliases, but this check is against the client low root;
             // native uses the same split-root topology.
@@ -11949,8 +11947,7 @@ impl G17ResourceOwner {
     }
 
     /// Diagnose the firmware mutation expected after a successful opcode-0x20
-    /// grow. Native appends four 1-MiB blocks after the 0x1600 initial pages,
-    /// so page-list entry 0x1600 must become 0x70018d0000 and advance by 4 KiB.
+    /// grow. Native appends five 1-MiB blocks after the 0x1100 initial pages.
     pub(crate) fn log_render_uma_growth(&mut self, checkpoint: &str) {
         let mut state = [0u32; 7];
         let state_result = self
@@ -11969,9 +11966,9 @@ impl G17ResourceOwner {
                 }
                 Ok(())
             });
-        let mut appended = [0u64; 4];
+        let mut appended = [0u64; 5];
         let page_result = self.resources.control_operand_page_lists.with_bytes_mut(|bytes| {
-            let start = 0x1600usize * 8;
+            let start = 0x1100usize * 8;
             for (index, value) in appended.iter_mut().enumerate() {
                 let offset = start + index * 8;
                 *value = u64::from_le_bytes(
@@ -11985,7 +11982,7 @@ impl G17ResourceOwner {
         match (state_result, page_result) {
             (Ok(()), Ok(())) => dev_info!(
                 self.dev().as_ref(),
-                "G17P render UMA growth[{}]: state(+20,+24,+28,+2c,+40,+44,+48)={:x?} page-list[0x1600..]={:x?}\n",
+                "G17P render UMA growth[{}]: state(+20,+24,+28,+2c,+40,+44,+48)={:x?} page-list[0x1100..]={:x?}\n",
                 checkpoint,
                 state,
                 appended,
@@ -12059,7 +12056,7 @@ impl G17ResourceOwner {
     /// Upgrade an ordinary compute-capable client VM to the complete native
     /// render FList aperture when its first TA/3D submission arrives.
     ///
-    /// Blocks 21..25 cannot live in the device-global context-0 root: block 21
+    /// Block 21 cannot live in the device-global context-0 root: it
     /// overlaps the fixed KSM completion aliases.  Native resolves the render
     /// pool through the client translation context, so map the tail only in
     /// that client VM and retain it with the render graph.  The whole aperture
@@ -12090,8 +12087,8 @@ impl G17ResourceOwner {
         {
             let address = g17p_control_operand_buffer_va(index).ok_or(EINVAL)?;
             // The driver-owned bootstrap render VM starts with all 28 blocks.
-            // Ordinary Vulkan VMs start with 21 and enter this arm for the
-            // five render-only aliases.
+            // Ordinary Vulkan VMs start with 21 and enter this arm for the one
+            // render-only alias in the native 17+5 active set.
             if vm.covers_range(
                 address,
                 G17P_CONTROL_OPERAND_BUFFER_SIZE as u64,
@@ -12383,7 +12380,7 @@ impl G17ResourceOwner {
         // ordinary client root must stop at operand block 20: block 21 spans
         // 0x70017c8000..0x70018c8000 and therefore overlaps both native SKSM
         // completion aliases at 0x7001848000/0x7001870000. The render pool's
-        // 22 initial plus four grown blocks need a render-specific translation
+        // The 17 initial plus five grown blocks need a render-specific translation
         // context; installing them in every client root makes the first
         // compute bind fail with ENOSPC before any hardware publication.
         let operand_buffer_count = if bootstrap_vdm {
@@ -13253,8 +13250,8 @@ mod tests {
         }
         let used = G17P_CONTROL_OPERAND_ACTIVE_BLOCK_COUNT
             * G17P_CONTROL_OPERAND_RUN_SLOT_SIZE;
-        assert_eq!(G17P_CONTROL_OPERAND_INITIAL_BLOCK_COUNT * 0x40, 0x580);
-        assert_eq!(G17P_CONTROL_OPERAND_FIRST_GROW_BLOCK_COUNT * 8, 0x20);
+        assert_eq!(G17P_CONTROL_OPERAND_INITIAL_BLOCK_COUNT * 0x40, 0x440);
+        assert_eq!(G17P_CONTROL_OPERAND_FIRST_GROW_BLOCK_COUNT * 8, 0x28);
         assert!(raw[used..].iter().all(|byte| *byte == 0));
         assert!(!encode_g17p_pre_qid_flist_runs(
             &mut raw[..G17P_CONTROL_OPERAND_TABLE_BACKING_SIZE - 1]
@@ -13262,12 +13259,12 @@ mod tests {
     }
 
     #[test]
-    fn render_flist_initial_page_list_expands_the_22_native_blocks() {
+    fn render_flist_initial_page_list_expands_the_17_native_blocks() {
         let mut raw = vec![0xa5; G17P_CONTROL_OPERAND_PAGE_LIST_SIZE];
         assert!(encode_g17p_initial_flist_page_list(&mut raw));
         let entries = G17P_CONTROL_OPERAND_INITIAL_BLOCK_COUNT
             * G17P_CONTROL_OPERAND_RUN_LENGTH_PAGES as usize;
-        assert_eq!(entries, 0x1600);
+        assert_eq!(entries, 0x1100);
         for block in 0..G17P_CONTROL_OPERAND_INITIAL_BLOCK_COUNT {
             let base = g17p_control_operand_buffer_va(block).unwrap();
             for page in 0..G17P_CONTROL_OPERAND_RUN_LENGTH_PAGES as usize {

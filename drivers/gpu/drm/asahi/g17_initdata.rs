@@ -481,11 +481,10 @@ pub(crate) const COMPUTE_PARTIAL_OPENING_CONTROL_SHARED_CURSOR_BEFORE: u32 = 0x1
 /// Initial compact FList cursor in qwords.
 ///
 /// `AGXUSCPrivMemFList::prepareBufferResources` encodes one 1-MiB run for
-/// each of the 22 initial pool blocks, then rounds the cursor to an eight-qword
-/// boundary after *each* block. The first asynchronous grow therefore starts
-/// at qword 22 * 8 = 0xb0 (byte offset 0x580). The older value 0x18 rounded
-/// 21 runs only once and made the opcode-0x20 grow span name zeroed memory.
-pub(crate) const PARTIAL_OPENING_CONTROL_SHARED_CURSOR_BEFORE: u32 = 0xb0;
+/// each of the 17 initial pool blocks, rounding to an eight-qword slot after
+/// each block. The first grow starts at qword 17 * 8 = 0x88 (byte +0x440),
+/// exactly as the complete 25G83 first-render opcode-0x20 record publishes.
+pub(crate) const PARTIAL_OPENING_CONTROL_SHARED_CURSOR_BEFORE: u32 = 0x88;
 pub(crate) const PARTIAL_OPENING_CONTROL_SHARED_INNER_PRESENTED: u64 = 0;
 /// Linux owns one USC private-memory FList. HardwareBufferIDManager permits
 /// slot zero (native's generic allocator pops 0 first); macOS observed ID 1
@@ -1001,11 +1000,10 @@ pub(crate) fn encode_partial_opening_control_shared(
         (0x00, 0x0000_0000_0000_0001),
         (0x10, 0x0000_0000_0000_0002),
         (0x18, 0x0004_0000_0000_0070),
-        // The ordinary Metal TA prepare allocates 22 one-MiB blocks before
-        // `populateInitialFirmwareState`: 22 MiB / 4 KiB = 0x1600 pages.
-        // The following opcode-0x20 appends four more blocks asynchronously.
-        (0x20, 0x0000_1600_0000_0000),
-        (0x28, 0x0000_1600_0000_0000),
+        // The complete first-render trace has 17 initial one-MiB blocks:
+        // 17 MiB / 4 KiB = 0x1100 pages. Opcode 0x20 appends five blocks.
+        (0x20, 0x0000_1100_0000_0000),
+        (0x28, 0x0000_1100_0000_0000),
         (0x30, CONTROL_OPERAND_TABLE_ADDRESS),
         (0x40, 0x0000_0000_0000_0004),
         (0x60, 0x0000_0000_0000_0003),
@@ -3541,8 +3539,8 @@ mod tests {
         assert_eq!(get_u32(&shared, 0x08), 0);
         assert_eq!(get_u32(&shared, 0x0c), 0);
         assert_eq!(get_u64(&shared, 0x10), 2);
-        assert_eq!(get_u64(&shared, 0x20), 0x0000_1600_0000_0000);
-        assert_eq!(get_u64(&shared, 0x28), 0x0000_1600_0000_0000);
+        assert_eq!(get_u64(&shared, 0x20), 0x0000_1100_0000_0000);
+        assert_eq!(get_u64(&shared, 0x28), 0x0000_1100_0000_0000);
         assert_eq!(get_u64(&shared, 0x30), CONTROL_OPERAND_TABLE_ADDRESS);
         assert_eq!(
             get_u32(&shared, CONTROL_SHARED_CURSOR_OFFSET),
