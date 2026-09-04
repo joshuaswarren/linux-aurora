@@ -1339,20 +1339,9 @@ const HW_PERF_MEMORY_VOLTAGE: [u32; HW_PERF_LADDER_ENTRIES] =
 
 // --- Region C ---------------------------------------------------------------------
 
-/// Region C bytes `0xe50..0xe54` are `00 01 00 00` in the capture, and leaving
-/// them zero makes the *primary* firmware take an asynchronous SError while
-/// consuming device-control opcode `0x20`.
-///
-/// The framing behind those four bytes is now known, and it is not a "required
-/// word". FW_PROVEN (b1, exhaustive): nothing in the image reads region C at
-/// `+0xe50` or at `+0xe55`. The only field there is an **unaligned u32 at
-/// `+0xe51`**, read twice at the top of `AGFAcceleratorDrainDeviceControlRing`
-/// (`0x3aa8` `add x8, x8, #0xe51` / `ldr w28, [x8]`, and the fresh re-read at
-/// `0x3b20`). So the captured bytes decode as `region_c[0xe50] == 0` plus a
-/// counter of **1** at `+0xe51`; the two constants below preserve the same
-/// bytes, they only name them correctly.
+/// Byte immediately preceding the unaligned host power-assert counter.
 pub(crate) const REGION_C_REQUIRED_OFFSET: usize = 0xe50;
-pub(crate) const REGION_C_REQUIRED_VALUE: u32 = 0x0000_0100;
+pub(crate) const REGION_C_REQUIRED_VALUE: u32 = 0;
 /// Unaligned host-owned GPU-core power-assert counter.
 ///
 /// FW_PROVEN (b1 `0x3aa8`/`0x3b20`): the firmware reads this **unaligned** u32
@@ -1360,9 +1349,9 @@ pub(crate) const REGION_C_REQUIRED_VALUE: u32 = 0x0000_0100;
 /// once per drained record whose opcode flag byte (`__const 0x45430 + opcode`)
 /// is non-zero. When the GPU is unpowered and the two disagree, `0x3b2c` calls
 /// `0x21960` and powers the cores on before draining. Equal values mean "no
-/// unaccounted power-asserting work", so a value pinned forever at 1 — which is
-/// what [`REGION_C_RUNS`] ships — can never trigger that arm after the first
-/// flagged record.
+/// unaccounted power-asserting work", so a value pinned forever at 1 — the old
+/// static initializer — can never trigger that arm after the first flagged
+/// record.
 ///
 /// Was `0xe55`, which is off by four: that offset is read nowhere in b1.
 /// The flag byte is `0` (i.e. no power assert) for opcodes `0x00`, `0x0e`,
@@ -1370,9 +1359,21 @@ pub(crate) const REGION_C_REQUIRED_VALUE: u32 = 0x0000_0100;
 /// includes `0x2e`, contradicting the older comment here that named it as a
 /// core-power claimant.
 pub(crate) const REGION_C_GPU_CORE_PWR_ASSERT_COUNTER_OFFSET: usize = 0xe51;
-/// The count [`REGION_C_RUNS`] publishes at
-/// [`REGION_C_GPU_CORE_PWR_ASSERT_COUNTER_OFFSET`].
-pub(crate) const REGION_C_GPU_CORE_PWR_ASSERT_COUNT: u32 = 1;
+/// Native cold value before the host publishes its first flag-1 control.
+pub(crate) const REGION_C_GPU_CORE_PWR_ASSERT_COUNT: u32 = 0;
+
+/// Whether a device-control opcode advances the host GPU-core power-assert
+/// counter. The 64-entry table is exhaustive in B1; values outside it are not
+/// valid device-control opcodes.
+pub(crate) const fn device_control_asserts_gpu_power(opcode: u32) -> Option<bool> {
+    if opcode > 0x3f {
+        return None;
+    }
+    Some(!matches!(
+        opcode,
+        0x00 | 0x0e | 0x15 | 0x16 | 0x1b | 0x22 | 0x2a | 0x2e | 0x3a..=0x3f
+    ))
+}
 
 // --- Status blocks -----------------------------------------------------------------
 
@@ -2263,16 +2264,8 @@ pub(crate) fn encode_region_c(out: &mut [u8]) -> Result<(), InitdataError> {
     if *crate::module_parameters::g17p_progress_watchdog.value() == 0 {
         put_u32(out, 0x9cc, 0);
     }
-    // regionC+0xe21 is the idle-descent selector. The firmware copies it to
-    // [0x177d20] (at 0x36f4), where it chooses which arm of the outstanding-kick
-    // check at 0xdeb8 decides whether the scheduler may descend to idle. Shipping
-    // 0 selects an arm we do not drive, so the idle-descent block at 0x25980
-    // re-takes KSM pause reason bit 3, then bit 1 through gpu_core_power(), and
-    // closes the GPU core power gate in the middle of our submit -- the observed
-    // oscillation that ends with the gate shut. Non-zero selects the arm that is
-    // permanently "must not idle" once [0x125de0] != 0, which direct mode
-    // guarantees after the first AddKicks (the decrement at 0xd2ac is skipped).
-    // One byte, and [0x177d20] has exactly two accesses image-wide.
+    // Native initializes the idle-descent selector to zero. Keep the old
+    // alternate predicate only as an explicit diagnostic override.
     if *crate::module_parameters::g17p_idle_selector.value() != 0 {
         out[0xe21] = 1;
     }
@@ -2557,8 +2550,9 @@ pub(crate) const HW_DATA_OPAQUE_RUNS: &[(usize, &[u8])] = &[
 
 /// Recorded T8140 region-C platform tuning constants (values known, meanings
 /// not; generated from the hardware-validated `g17p_initdata.py`
-/// `REGION_C_CONSTANTS`). 12 sparse runs, 180 bytes total, including the
-/// required word at [`REGION_C_REQUIRED_OFFSET`].
+/// `REGION_C_CONSTANTS`). 12 sparse runs, 180 bytes total. The final run
+/// initializes the byte preceding the host power-assert counter and the
+/// counter itself to their native cold value of zero.
 pub(crate) const REGION_C_RUNS: &[(usize, &[u8])] = &[
     (0x0024, &[0xb8, 0x0b, 0x00, 0x00]),
     (
@@ -2602,15 +2596,13 @@ pub(crate) const REGION_C_RUNS: &[(usize, &[u8])] = &[
     (
         0x09b8,
         &[
-            0xc0, 0x27, 0x09, 0x00, 0xc0, 0x27, 0x09, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x02, 0x00, 0x00, 0x00, 0x28, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x28, 0x00, 0x00, 0x00, 0x32, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
         ],
     ),
     (0x0e1c, &[0x00, 0x01, 0x00, 0x00]),
     (0x0e38, &[0x00, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00]),
-    // Required before the first compact class-1 registration; leaving it
-    // clear SErrors the primary on device-control opcode 0x20.
-    (0x0e50, &[0x00, 0x01, 0x00, 0x00]),
+    (0x0e50, &[0x00, 0x00, 0x00, 0x00]),
 ];
 
 pub(crate) const BUNDLE_VIEW_RUNS: [&[(usize, &[u8])]; 5] = [
@@ -3830,11 +3822,9 @@ mod tests {
         let mut region_c = vec![0xa5; REGION_C_SIZE];
         encode_region_c(&mut region_c).unwrap();
         assert_eq!(region_c.len(), 0x1000);
-        // +0xe50 must hold 0x0000_0100 (bytes 00 01 00 00) or the primary takes
-        // an asynchronous SError on device-control opcode 0x20.
-        assert_eq!(REGION_C_REQUIRED_VALUE, 0x0000_0100);
+        assert_eq!(REGION_C_REQUIRED_VALUE, 0);
         assert_eq!(get_u32(&region_c, 0xe50), REGION_C_REQUIRED_VALUE);
-        assert_eq!(&region_c[0xe50..0xe54], &[0x00, 0x01, 0x00, 0x00]);
+        assert_eq!(&region_c[0xe50..0xe55], &[0; 5]);
         // Those same four bytes, framed the way b1 actually reads them: the
         // byte at +0xe50 is zero and the GPU-core power-assert counter is the
         // UNALIGNED u32 at +0xe51. Nothing in the image reads +0xe50 or +0xe55.
@@ -3844,6 +3834,9 @@ mod tests {
             REGION_C_GPU_CORE_PWR_ASSERT_COUNT
         );
         assert_eq!(REGION_C_GPU_CORE_PWR_ASSERT_COUNTER_OFFSET, 0xe51);
+        assert_eq!(get_u32(&region_c, 0x9b8), 2);
+        assert_eq!(get_u32(&region_c, 0x9bc), 40);
+        assert_eq!(region_c[0xe21], 0);
         // A recorded run near the front landed; the tail past the last run is 0.
         assert_eq!(get_u32(&region_c, 0x24), 0x0000_0bb8);
         assert_eq!(get_u32(&region_c, 0x7c), 1);
@@ -3851,6 +3844,32 @@ mod tests {
         assert_eq!(get_u32(&region_c, 0x9c), 0x3000_001d);
         assert_eq!(get_u32(&region_c, 0xa0), 0x3100_0002);
         assert_eq!(region_c[REGION_C_SIZE - 1], 0);
+    }
+
+    #[test]
+    fn device_control_power_assert_flags_match_b1() {
+        const CLEAR: [u32; 15] = [
+            0x00, 0x0e, 0x15, 0x16, 0x1b, 0x22, 0x2a, 0x2e, 0x3a, 0x3b, 0x3c, 0x3d,
+            0x3e, 0x3f, 0x40,
+        ];
+        for opcode in 0..=0x3f {
+            assert_eq!(
+                device_control_asserts_gpu_power(opcode),
+                Some(!CLEAR[..CLEAR.len() - 1].contains(&opcode)),
+                "opcode {opcode:#x}",
+            );
+        }
+        assert_eq!(device_control_asserts_gpu_power(CLEAR[CLEAR.len() - 1]), None);
+
+        // Native host-tally lifecycle for two updateSubmitInfo records, one
+        // HardwareBufferID release, and one IdlePowerOff record.
+        let mut tally = REGION_C_GPU_CORE_PWR_ASSERT_COUNT;
+        for (opcode, expected) in [(0x20, 1), (0x20, 2), (0x2e, 2), (0x0a, 3)] {
+            if device_control_asserts_gpu_power(opcode).unwrap() {
+                tally = tally.wrapping_add(1);
+            }
+            assert_eq!(tally, expected);
+        }
     }
 
     #[test]

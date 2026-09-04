@@ -2249,25 +2249,6 @@ fn write_control_counters(object: &mut MappedObject, counters: [u32; 3]) -> Resu
     })
 }
 
-#[cfg(not(test))]
-fn write_control_counter(object: &mut MappedObject, index: usize, counter: u32) -> Result {
-    if index >= g17_initdata::CHANNEL_ENTRY_STATE_COUNT {
-        return Err(EINVAL);
-    }
-    object.with_bytes_mut(|bytes| {
-        let offset = g17_initdata::WORK_STATE_GRID_OFFSETS
-            [g17_initdata::CONTROL_CHANNEL_INDEX]
-            .checked_add(index * g17_initdata::CHANNEL_STATE_SPACING)
-            .ok_or(EINVAL)?;
-        let end = offset.checked_add(4).ok_or(EINVAL)?;
-        bytes
-            .get_mut(offset..end)
-            .ok_or(EINVAL)?
-            .copy_from_slice(&counter.to_le_bytes());
-        Ok(())
-    })
-}
-
 fn register_window_pages(window: &g17_initdata::RegisterWindow) -> Option<(u64, u64, u64)> {
     let page_mask = G17P_PAGE_SIZE as u64 - 1;
     let phys_page = window.phys & !page_mask;
@@ -11363,17 +11344,9 @@ impl G17ResourceOwner {
             if !destination.iter().all(|byte| *byte == 0) {
                 return Err(EINVAL);
             }
-            destination.copy_from_slice(&record);
             Ok(())
         })?;
-        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        write_control_counter(
-            &mut self.resources.primary_state,
-            g17_initdata::CHANNEL_STATE_PRODUCER,
-            boundary.producer_after,
-        )?;
-        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        Ok(boundary.producer_after)
+        Ok(self.publish_primary_device_control_raw(&record)?.producer_after)
     }
 
     /// Append one bare device-control record to the primary channel-12 ring at
@@ -11421,9 +11394,13 @@ impl G17ResourceOwner {
         if opcode == 0 {
             return Err(EINVAL);
         }
+        let asserts_gpu_power =
+            g17_initdata::device_control_asserts_gpu_power(opcode).ok_or(EINVAL)?;
         let before = self.control_counters()?;
         let consumer_before = before.primary[g17_initdata::CHANNEL_STATE_CONSUMER];
         let producer_before = before.primary[g17_initdata::CHANNEL_STATE_PRODUCER];
+        let producer_after =
+            producer_before.wrapping_add(1) & g17_initdata::CONTROL_RING_INDEX_MASK;
         let slot = producer_before & g17_initdata::CONTROL_RING_INDEX_MASK;
         let channels = g17_initdata::derive_channel_table(
             InstanceRole::Primary,
@@ -11443,22 +11420,93 @@ impl G17ResourceOwner {
         let end = offset
             .checked_add(g17_initdata::CONTROL_RECORD_SIZE)
             .ok_or(EINVAL)?;
-        self.resources.shared_cluster.with_bytes_mut(|bytes| {
-            bytes
-                .get_mut(offset..end)
-                .ok_or(EINVAL)?
-                .copy_from_slice(record);
-            Ok(())
-        })?;
-        // The record must be visible before the producer that publishes it.
+
+        // Acquire and validate every CPU view before making the first write.
+        // Once the ring record is visible, publication is transactional: no
+        // later fallible operation may leave the power tally or producer half
+        // advanced.
+        let state_offset = g17_initdata::WORK_STATE_GRID_OFFSETS
+            [g17_initdata::CONTROL_CHANNEL_INDEX]
+            .checked_add(
+                g17_initdata::CHANNEL_STATE_PRODUCER
+                    .checked_mul(g17_initdata::CHANNEL_STATE_SPACING)
+                    .ok_or(EINVAL)?,
+            )
+            .ok_or(EINVAL)?;
+        let state_end = state_offset.checked_add(4).ok_or(EINVAL)?;
+        let power_offset = g17_initdata::REGION_C_GPU_CORE_PWR_ASSERT_COUNTER_OFFSET;
+        let power_end = power_offset.checked_add(4).ok_or(EINVAL)?;
+        if end > self.resources.shared_cluster.logical_size
+            || state_end > self.resources.primary_state.logical_size
+            || power_end > self.resources.region_c.logical_size
+        {
+            return Err(EINVAL);
+        }
+        let shared_view_end = self
+            .resources
+            .shared_cluster
+            .object_offset
+            .checked_add(self.resources.shared_cluster.logical_size)
+            .ok_or(EINVAL)?;
+        let state_view_end = self
+            .resources
+            .primary_state
+            .object_offset
+            .checked_add(self.resources.primary_state.logical_size)
+            .ok_or(EINVAL)?;
+        let region_c_view_end = self
+            .resources
+            .region_c
+            .object_offset
+            .checked_add(self.resources.region_c.logical_size)
+            .ok_or(EINVAL)?;
+        let shared_vmap = self.resources.shared_cluster.object.vmap()?;
+        let state_vmap = self.resources.primary_state.object.vmap()?;
+        let region_c_vmap = self.resources.region_c.object.vmap()?;
+        let shared_bytes = unsafe {
+            // SAFETY: construction bounds every logical subview inside the
+            // page-rounded GEM object; all offset arithmetic was checked above.
+            core::slice::from_raw_parts_mut(
+                shared_vmap
+                    .as_mut_ptr()
+                    .add(self.resources.shared_cluster.object_offset),
+                shared_view_end - self.resources.shared_cluster.object_offset,
+            )
+        };
+        let state_bytes = unsafe {
+            // SAFETY: as above, for the primary state-grid subview.
+            core::slice::from_raw_parts_mut(
+                state_vmap
+                    .as_mut_ptr()
+                    .add(self.resources.primary_state.object_offset),
+                state_view_end - self.resources.primary_state.object_offset,
+            )
+        };
+        let region_c_bytes = unsafe {
+            // SAFETY: as above, for the native Region-C subview.
+            core::slice::from_raw_parts_mut(
+                region_c_vmap
+                    .as_mut_ptr()
+                    .add(self.resources.region_c.object_offset),
+                region_c_view_end - self.resources.region_c.object_offset,
+            )
+        };
+
+        shared_bytes[offset..end].copy_from_slice(record);
+        if asserts_gpu_power {
+            let power_before = u32::from_le_bytes([
+                region_c_bytes[power_offset],
+                region_c_bytes[power_offset + 1],
+                region_c_bytes[power_offset + 2],
+                region_c_bytes[power_offset + 3],
+            ]);
+            region_c_bytes[power_offset..power_end]
+                .copy_from_slice(&power_before.wrapping_add(1).to_le_bytes());
+        }
+        // Native publishes record, then the matching host power-assert tally,
+        // and only then advances the host-owned ring producer.
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        let producer_after =
-            producer_before.wrapping_add(1) & g17_initdata::CONTROL_RING_INDEX_MASK;
-        write_control_counter(
-            &mut self.resources.primary_state,
-            g17_initdata::CHANNEL_STATE_PRODUCER,
-            producer_after,
-        )?;
+        state_bytes[state_offset..state_end].copy_from_slice(&producer_after.to_le_bytes());
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         Ok(G17PDeviceControlPublication {
             opcode,
@@ -11491,38 +11539,7 @@ impl G17ResourceOwner {
         let mut record = [0u8; g17_initdata::CONTROL_RECORD_SIZE];
         g17_initdata::encode_compute_runtime_control_record(index, &mut record)
             .map_err(|_| EINVAL)?;
-        let channels = g17_initdata::derive_channel_table(
-            InstanceRole::Primary,
-            self.handoff.primary.state_grid,
-            self.handoff.primary.instance.status_a,
-            self.handoff.primary.instance.main_config,
-            self.handoff.shared.hw_data_bundle,
-        );
-        let ring = channels[g17_initdata::CONTROL_CHANNEL_INDEX].ring;
-        let record_address = ring
-            .checked_add(producer as u64 * g17_initdata::CONTROL_RECORD_SIZE as u64)
-            .ok_or(EINVAL)?;
-        let offset: usize = record_address
-            .checked_sub(self.resources.shared_cluster.iova())
-            .ok_or(EINVAL)?
-            .try_into()?;
-        let end = offset.checked_add(record.len()).ok_or(EINVAL)?;
-        self.resources.shared_cluster.with_bytes_mut(|bytes| {
-            bytes
-                .get_mut(offset..end)
-                .ok_or(EINVAL)?
-                .copy_from_slice(&record);
-            Ok(())
-        })?;
-        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        let target = producer.checked_add(1).ok_or(EINVAL)?;
-        write_control_counter(
-            &mut self.resources.primary_state,
-            g17_initdata::CHANNEL_STATE_PRODUCER,
-            target,
-        )?;
-        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        Ok(target)
+        Ok(self.publish_primary_device_control_raw(&record)?.producer_after)
     }
 
     /// Rewrite the shared support object for the measured sequence-56
