@@ -10808,7 +10808,10 @@ impl G17ResourceOwner {
     ///
     /// Printing is filtered to the submission-path codes (plus the ungated
     /// records-lost marker) unless `verbose`, and capped at `print_budget`
-    /// lines per call (0: unlimited). Records over budget are still consumed.
+    /// lines per call (0: unlimited). Native DM progress-monitor records have
+    /// a separate 64-record allowance with explicit drop accounting, so a
+    /// full ordinary budget cannot silently hide the state transition.
+    /// Records over either budget are still consumed.
     pub(crate) fn drain_ktrace_ring(
         &mut self,
         role: InstanceRole,
@@ -10860,6 +10863,7 @@ impl G17ResourceOwner {
         // Bound the walk by the ring capacity, never by the producer alone: a
         // corrupt pointer must not spin the submit path.
         let mut budget = g17_completion::G17P_KTRACE_CAPACITY;
+        let mut printing = g17_completion::G17PKtracePrintBudget::default();
         while consumer != producer && budget > 0 {
             budget -= 1;
             let (entry_offset, published) =
@@ -10920,9 +10924,7 @@ impl G17ResourceOwner {
                 stats.last_pause_mask = record.args[2];
             }
             let wanted = verbose || g17_completion::g17p_ktrace_key_is_interesting(key);
-            let within_budget =
-                lost_marker || print_budget == 0 || stats.printed < print_budget;
-            if wanted && within_budget {
+            if wanted && printing.allow(key, print_budget) {
                 let name = g17_completion::g17p_ktrace_key_name(key);
                 dev_info!(
                     self.dev().as_ref(),
@@ -10941,6 +10943,16 @@ impl G17ResourceOwner {
                 );
                 stats.printed = stats.printed.saturating_add(1);
             }
+        }
+        if printing.monitor_printed != 0 || printing.monitor_dropped != 0 {
+            dev_info!(
+                self.dev().as_ref(),
+                "G17P ktrace[{}] monitor-print-budget printed={} dropped={} limit=64 ordinary-printed={}\n",
+                role_name,
+                printing.monitor_printed,
+                printing.monitor_dropped,
+                printing.ordinary_printed,
+            );
         }
         Ok(stats)
     }

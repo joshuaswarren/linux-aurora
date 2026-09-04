@@ -4171,9 +4171,11 @@ impl G17PLiveRuntime {
                 fsleep(Delta::from_millis(1));
             }
         }
-        if let Some(manager) = self.manager.as_mut() {
-            manager.log_render_status_pages("post-doorbell");
-        }
+        // Do not scan the multi-MiB TVB/RT allocations while the render is
+        // running. This call owns the runtime mutex, so that scan also delays
+        // the firmware-event worker; observed scans exceeded the firmware's
+        // watchdog interval before the first inline event service. Preserve
+        // full memory dumps at recovery/failure or after completion instead.
         if split_launch {
             let tiling_timestamps = match self.wait_split_render_tiling_completion() {
                 Ok(timestamps) => timestamps,
@@ -4216,9 +4218,8 @@ impl G17PLiveRuntime {
                 self.abandon_render_submission_after_timeout();
                 return Err(error);
             }
-            if let Some(manager) = self.manager.as_mut() {
-                manager.log_render_status_pages("post-fragment-doorbell");
-            }
+            // As for paired publication, enter the servicing wait before any
+            // expensive host-memory dump of the now-live fragment resources.
         }
         let completion = match self.wait_render_completion_servicing_events() {
             Ok(completion) => completion,
@@ -4262,6 +4263,7 @@ impl G17PLiveRuntime {
             log_g17p_status_a(pdev.as_ref(), manager, "render-post-wait");
             probe_g17p_ktrace(pdev.as_ref(), manager, "render-post-wait");
             dump_g17p_firmware_log(pdev.as_ref(), manager, "render-post-wait");
+            manager.log_render_status_pages("post-completion");
         }
         if !completion.complete {
             return match g17_lifecycle::recover_persistent_runtime(self) {
