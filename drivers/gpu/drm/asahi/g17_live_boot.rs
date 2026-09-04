@@ -69,7 +69,6 @@ pub(crate) enum BootStage {
 }
 
 const INITDATA_ACK_TYPE: u16 = 0x09;
-const CONTROL_START_TYPE: u16 = 0x89;
 const INITDATA_ACK_POLLS: usize = 200;
 const CONTROL_COUNTER_POLLS: usize = 100;
 const FIRMWARE_RECOVERY_POLLS: usize = 500;
@@ -1720,35 +1719,18 @@ fn finish_boot_session(
     test_stage: G17PTestStage,
     cpus: g17_lifecycle::StartedCpuPair<G17PMailboxProvider>,
     gfx_state: Arc<G17PRoleRtkitState>,
-    mut gfx_rtkit: rtkit::RtKit<G17PRtkitOps>,
+    gfx_rtkit: rtkit::RtKit<G17PRtkitOps>,
     gfx1_state: Arc<G17PRoleRtkitState>,
     gfx1_rtkit: rtkit::RtKit<G17PRtkitOps>,
 ) -> Result<G17PBootedSession> {
-    let staged = manager.control_counters()?;
-    if !staged.opening_staged() {
-        dev_err!(
-            pdev.as_ref(),
-            "G17P control: staged counters are {:?}/{:?}, expected [0, 0, 3]/[0, 0, 16]\n",
-            staged.primary,
-            staged.secondary
-        );
-        return Err(EIO);
-    }
-    dev_info!(
-        pdev.as_ref(),
-        "G17P control: 3 primary QoS and 16 secondary records staged; no ownerless UMA opcode-0x20\n"
-    );
-
-    let control_start = (CONTROL_START_TYPE as u64) << 48;
-    Pin::new(&mut gfx_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, control_start)?;
-    fsleep(Delta::from_millis(12));
-    let mut gfx1_rtkit = gfx1_rtkit;
-    Pin::new(&mut gfx1_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, control_start)?;
-    dev_info!(pdev.as_ref(), "G17P control: both start messages sent\n");
-
-    let mut counters = staged;
+    let mut counters = manager.control_counters()?;
+    // The single native 0x89 sent immediately after both initdata ACKs is both
+    // powerTransitionEnd and the event that releases the opening control rings.
+    // Once the root pointers use the real shared arena, firmware may retire the
+    // rings before the host samples them here. Linux previously sent a second
+    // synthetic 0x89 only because its disconnected state objects hid the first
+    // transition from these counters.
     for _ in 0..CONTROL_COUNTER_POLLS {
-        counters = manager.control_counters()?;
         if counters.opening_retired() {
             break;
         }
@@ -1758,6 +1740,7 @@ fn finish_boot_session(
             return Err(EIO);
         }
         fsleep(Delta::from_millis(1));
+        counters = manager.control_counters()?;
     }
     if !counters.opening_retired() {
         dev_err!(
@@ -1770,7 +1753,7 @@ fn finish_boot_session(
     }
     dev_info!(
         pdev.as_ref(),
-        "G17P control: counters retired at [3, 3, 3]/[16, 16, 16]\n"
+        "G17P control: counters retired by the single native post-initdata 0x89; no duplicate start message sent\n"
     );
     log_g17p_firmware_recovery_handshake(
         pdev.as_ref(),
