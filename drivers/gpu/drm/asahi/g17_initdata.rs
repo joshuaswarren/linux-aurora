@@ -2199,23 +2199,15 @@ pub(crate) fn encode_hw_data(
         // +0x1c is the firmware-owned processed cursor and starts at zero.
     }
 
-    put_u64(out, G17P_QOS_RESOURCE_OFFSET, qos_resource_high);
     put_u64(out, G17P_QOS_RESOURCE_LIVE_OFFSET, qos_resource_high);
     put_u64(
         out,
         G17P_SKSM_QID_CONFIG_2700_OFFSET,
         G17P_SKSM_QID_CONFIG_2700,
     );
-    put_u32(
-        out,
-        G17P_SKSM_QID_CONFIG_2708_OFFSET,
-        G17P_SKSM_QID_CONFIG_2708,
-    );
-    put_u64(
-        out,
-        G17P_SKSM_QID_RESOURCE_OFFSET,
-        sksm_qid_resource_high,
-    );
+    // The valid live G17P HWData object leaves +0x2708, +0x27a4 and +0x27ac
+    // zero. The kext writes those only in a staging/version tail and B1 has no
+    // consumer; the live QoS pointer is the independent +0x26ac field above.
 
     // Recorded platform constants. Descriptor *acceptance* survives without
     // them, but the device-control phase that follows does not. +0x2630 is
@@ -3780,13 +3772,10 @@ mod tests {
             assert_eq!(get_u32(&hw, base + 0x18), ordinal);
             assert_eq!(get_u32(&hw, base + 0x1c), 0);
         }
-        assert_eq!(get_u64(&hw, G17P_SKSM_QID_CONFIG_2700_OFFSET), 1);
-        assert_eq!(get_u32(&hw, G17P_SKSM_QID_CONFIG_2708_OFFSET), 0x100);
-        assert_eq!(get_u64(&hw, G17P_QOS_RESOURCE_OFFSET), qos_resource);
-        assert_eq!(
-            get_u64(&hw, G17P_SKSM_QID_RESOURCE_OFFSET),
-            sksm_qid_resource
-        );
+        assert_eq!(get_u64(&hw, G17P_SKSM_QID_CONFIG_2700_OFFSET), 0);
+        assert_eq!(get_u32(&hw, G17P_SKSM_QID_CONFIG_2708_OFFSET), 0);
+        assert_eq!(get_u64(&hw, G17P_QOS_RESOURCE_OFFSET), 0);
+        assert_eq!(get_u64(&hw, G17P_SKSM_QID_RESOURCE_OFFSET), 0);
 
         // The recorded opaque runs landed (spot check the two 0xffffffff tails).
         assert_eq!(get_u32(&hw, 0x3d98), 0xffff_ffff);
