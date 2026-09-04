@@ -227,39 +227,39 @@ kernel::module_platform_driver! {
         },
         g17p_render_generation_bias: u32 {
             default: 0,
-            description: "Bias the render tag-15 generation fields +0x2a/+0x2e by one, so the first submit of a boot does not publish zero. The firmware reads +0x2a as a u64 (tag-15 handler at 0xfffffc0000011404), stores it in its per-queue table at 0xfffffc0000125df0 + qid*8, and every consumer takes bits 47:40 -- byte 0x2f, the high byte of the u16 at +0x2e, i.e. ordinal & 0xff -- compares it against a cached byte and SKIPS on equality. The raw ordinal is 0 on the first render submit, matching the firmware's initial cached 0, so it reads as 'unchanged'. Same defect already fixed at +0x3e in the same function, whose comment records that native never publishes zero there. CAVEAT, and the reason this defaults OFF: a working compute submit publishes graphics=0, so the firmware skips this block entirely and leaves the same table entry at zero -- compute therefore reaches the SAME table state and still executes, which argues this is not what distinguishes render from compute. 0: off (default), 1: on.",
+            description: "DIAGNOSTIC ONLY. Bias the render tag-15 generation fields +0x2a/+0x2e by one. 0 (default) keeps the native cold generation zero. The complete valid trace also proves opcode-0x20 +0x0c and tag-15 +0x3e begin at zero; forcing a first-generation replacement diverges from B1's reset state. 1 retains the historical bias experiment.",
         },
         g17p_render_bg_prefix: u32 {
-            default: 1,
-            description: "Use the witnessed high bits for the background program resource-specifier bind. WITNESSED: native reg 0x15369 = 0xffff800000000040, so the prefix is 0xffff_8000_0000_0000. Ours had used 0x0007_8000_0000_0000 from an earlier incomplete capture. The low half still comes from userspace. 0: legacy prefix, 1: witnessed 0xffff8000 (default).",
+            default: 0,
+            description: "DIAGNOSTIC ONLY. Override the main background program resource-specifier prefix. 0 (default) preserves the UAPI value; valid cold qid1 carries 0x0007800000000040 and 308/437 valid commands use the same high prefix. 1 forces the stale single-capture 0xffff8000 prefix. Partial-background policy is distinct and must not be inferred from this switch.",
         },
         g17p_render_fragment_lifecycle: u32 {
             default: 0,
             description: "DIAGNOSTIC, native-derived ownership without captured literals. Metal writes one nonzero 64-bit fragment event correlation to registers 0x160e0/0x01499/0x0a341: low32 is the current 3D command-publication stamp and high32 is a preceding dependency event. Linux currently writes zero to all three and incorrectly shares the source field with TA, whose native correlation is separate. Mode 1 leaves TA unchanged, samples the firmware StatusB +0x4920 TDR scheduler-progress cache only as a safe Linux seed, and derives a nonzero monotonic fragment-local dependency/current pair from the retained render ordinal. That StatusB word is not established as the native event source. Firmware does not validate the captured numeric values, so none are copied. 0: current zero baseline. 1: stage-specific derived fragment correlation.",
         },
         g17p_render_eot_bind_zero: u32 {
-            default: 0,
-            description: "DIAGNOSTIC ONLY. Force the G17P fragment end-of-tile/store resource-specifier bind to zero in the main, partial-store, partial-resume, and retained descriptor-tail copies. Every available working Metal 3D command capture writes register 0x15379 as zero in all captured phases, while Mesa currently supplies resource spec 8. This switch changes the shared source fields before descriptor encoding so all duplicated command fields remain coherent. 0: preserve the userspace ABI value. 1: match the captured Metal value zero.",
+            default: 1,
+            description: "G17P fragment end-of-tile/store resource-specifier bind. 1 (default) writes zero coherently in the main, partial-store, partial-resume, and retained descriptor-tail copies; all 437 unique valid Metal 3D command captures write register 0x15379 as zero. 0 diagnostically preserves the legacy userspace ABI value (currently 8).",
         },
         g17p_render_dump_descriptor: u32 {
             default: 0,
             description: "DIAGNOSTIC ONLY. Dump the complete post-encoding 0x2240-byte G17P 3D descriptor in compact 64-byte rows before the first render publication, after retained fields, generic tails, and optional MCache mutations have all been applied. This is intended for byte-for-byte comparison against a working Metal descriptor capture without evicting launch evidence from the printk ring. 0: off. 1: dump the bootstrap descriptor.",
         },
         g17p_render_mcache_hwsid: u32 {
-            default: 0,
-            description: "DIAGNOSTIC ONLY. 0 disables active render MCache mappings. A value 1..255 packs validated UAPI fragment-write ranges into the native G17P 3D descriptor +0x6a0 table and publishes the matching KSM aperture, using this value as HWDSID. Kext RE proves G16 configureDevice sets the default physical HWDSID to 0x18 and G17P expands the supported range to 0x60 IDs; logical DSID 0x100 directly selects that default without getHWDSID/updateDSIDConfiguration. Therefore 24 is the native default, not captured allocator state. It remains explicit while the complete MCache path is under bring-up. Never use with absent fragment attachments.",
+            default: 24,
+            description: "Render MCache HWDSID. 24 (default) is the physical default selected by logical DSID 0x100 in the G17P kext and is present in both records of the valid cold class-0 3D aperture. 0 diagnostically suppresses active render MCache mappings. Values 1..255 pack validated UAPI fragment-write ranges into descriptor +0x6a0 and the matching fragment SKSM aperture. The native class-0 shape with 24 was tested on Neo without regression. Never use with absent fragment attachments.",
         },
         g17p_render_mcache_mode: u32 {
-            default: 0,
-            description: "DIAGNOSTIC ONLY. 0 emits the established one-range-per-UAPI-fragment-attachment MCache table. 1 requires exactly one validated fragment attachment and emits the earlier topology probe: mapped aux-FB with shift 2 at +0x6a0, then the attachment with shift 1 at +0x6b0. 2 requires exactly two validated UAPI ranges and emits them unchanged in native order with shifts 2/1; userspace derives these from its complete live writable main/USC BO spans. Modes 1/2 share one HWDSID/selector and publish KSM index 0/count 2. No captured native VA is copied. Requires non-zero g17p_render_mcache_hwsid.",
+            default: 1,
+            description: "Render MCache range topology. 1 (default) reproduces the valid cold class-0 two-range shape: driver-owned aux-FB with shift 2 at +0x6a0, then the single validated fragment attachment with shift 1 at +0x6b0. 0 emits one record per UAPI attachment. 2 requires exactly two validated UAPI ranges and emits them unchanged in native order with shifts 2/1. Modes 1/2 share one HWDSID/selector and publish fragment KSM index 0/count 2. No captured native VA is copied. Requires non-zero g17p_render_mcache_hwsid.",
         },
         g17p_render_mcache_selector: u32 {
             default: 64,
             description: "DIAGNOSTIC ONLY. MCache write-range selector shared by every emitted record. Values 0..63 are encoded directly; 64 (default) uses the currently bound render root slot. Working Metal witnesses use AGXContextIDManager-derived selectors 2 or 3 even when descriptor context is 1. For those two witnessed values Linux now mirrors the bound render GART roots into the matching TTBAT slot before making the first outer producer visible, reproducing AGXSecureGart::registerContextID instead of emitting an unbacked selector. Values above 64 reject the render.",
         },
         g17p_render_ksm_mcache: u32 {
-            default: 0,
-            description: "DIAGNOSTIC ONLY. Independently publish the descriptor MCache write table as a KSM entry aperture. Native Metal populates the 3D firmware descriptor +0x6a0 mappings for the captured render while leaving host AGX3DCommandDescriptor +0xaa8 count zero; encodeKickEntry therefore leaves header bit58 and entry +0x08 clear. Linux previously coupled these two distinct objects. 0 (default): native, descriptor mappings only and no KSM aperture. 1: reproduce the old coupled diagnostic.",
+            default: 1,
+            description: "Publish the fragment descriptor MCache table as a KSM entry aperture. 1 (default) matches the valid cold class-0 qid1 entry: header bit58 set and +0x08 naming descriptor +0x6a0, index 0, count 2. 0 suppresses the KSM aperture for later native priority-2 profiles whose host command count is zero. The native class-0 shape was tested on Neo without regression. The TA entry never receives an aperture.",
         },
         g17p_render_no_barrier: u32 {
             default: 0,
@@ -270,8 +270,8 @@ kernel::module_platform_driver! {
             description: "DIAGNOSTIC ONLY -- make the paired render submission a true whole-group split. Before the first channel-0 doorbell the 3D command/tag-15 bytes may be staged in host memory, but its SKSM entry, tag-14 AddKicks/item producer, and outer data-master producer all remain unpublished; only the complete TA group is visible. After both TA-owned timestamps become non-zero, the driver publishes the 3D SKSM entry/dependency, then tag-14 and its inner producer, then the retained 3D outer slot/producer, and sends the same channel-0 doorbell again. This isolates 3D descriptor execution from simultaneous paired-launch/dependency chronology without ever publishing and rewinding live state. 0: normal fragment-first paired publication (default, byte-for-byte unchanged), 1: TA completion then complete 3D group publication.",
         },
         g17p_render_native_doorbells: u32 {
-            default: 2,
-            description: "Native Mac17P userspace-render TX doorbells. 0: legacy paired publication followed by only Vertex/priority0. 1: paired Fragment then TA priority-2 doorbells. 2 (default): exact userspace publication chronology -- complete 3D group, 3D doorbell, complete TA group plus late Pool-A transition, TA doorbell. 3: mode 2 plus a diagnostic bounded pre-ack. Native's earlier priority-0 system bring-up queues are a separate profile, not this userspace queue. Modes 1/2/3 are mutually exclusive with split launch; modes 2/3 require render SKSM.",
+            default: 0,
+            description: "Mac17P render TX chronology. 0 (default): initial-bring-up profile -- qids 0/1 on TA_0/3D_0, publish the complete pair and send the single paired Vertex/priority-0 doorbell captured before native creates userspace priority-2 queues. 1: paired Fragment then TA diagnostic. 2: later userspace fragment-first chronology. 3: mode 2 plus a diagnostic bounded pre-ack. Modes 1/2/3 are mutually exclusive with split launch; modes 2/3 require render SKSM.",
         },
         g17p_render_native_pool_a_first_record: u32 {
             default: 1,

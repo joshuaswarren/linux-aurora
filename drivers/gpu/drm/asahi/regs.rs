@@ -44,18 +44,6 @@ const T8140_AXI_TRANSITION_0: usize = 0x1000104;
 const T8140_AXI_TRANSITION_1: usize = 0x1000108;
 /// Must be written 0 before ANY initdata is sent to either firmware
 /// instance (T8140 startup sequence step "write zero to SGX+0xd06030").
-/// AGX early-init "poke": read `sgx+0xd14000`, then write `0x70001`.
-///
-/// This is the generic Apple GPU bring-up poke the m1n1 AGX proxy performs in
-/// `AGX.poke_sgx()` before touching anything else, across generations. The
-/// driver has never done it, and on J700 the entire low `0x0..0x2ffff` GPU
-/// core register range (which holds the SKSM tag/data port at `0x4090` and the
-/// KSM queue registers at `0x21008`/`0x21068`) takes an asynchronous SError
-/// from the AP. The firmware reaches those same registers fine through its own
-/// mapping of PA `0x480000000`, so the range is real -- it is simply not
-/// enabled for host access.
-const T8140_SGX_EARLY_POKE: usize = 0xd14000;
-const T8140_SGX_EARLY_POKE_VALUE: u32 = 0x7_0001;
 const T8140_PRE_INITDATA_CLEAR: usize = 0xd06030;
 /// G17P Fender dynamic-gating control. The pinned host clears bits 1 and 2
 /// when it arms the firmware power callback; bit 2 set proves the callback is
@@ -1880,20 +1868,6 @@ impl Resources {
     pub(crate) fn t8140_axi_transition_workaround(&self) -> Result {
         let sgx = self.sgx.try_access().ok_or(ENODEV)?;
         let res = sgx.relaxed();
-
-
-        // AGX early-init poke, before anything else touches the block.
-        let poke_before = res.try_read32(T8140_SGX_EARLY_POKE)?;
-        res.try_write32(T8140_SGX_EARLY_POKE_VALUE, T8140_SGX_EARLY_POKE)?;
-        let poke_after = res.try_read32(T8140_SGX_EARLY_POKE)?;
-        dev_info!(
-            self.dev.as_ref(),
-            "T8140 sgx early poke: {:#x} {:#x} -> {:#x}\n",
-            T8140_SGX_EARLY_POKE,
-            poke_before,
-            poke_after
-        );
-
         for (offset, observed) in [
             (T8140_AXI_TRANSITION_0, 0x0001_0001u32),
             (T8140_AXI_TRANSITION_1, 0x0004_13b1u32),
@@ -1914,15 +1888,23 @@ impl Resources {
         Ok(())
     }
 
-    /// T8140: write zero to the pre-initdata gate register.
+    /// T8140: enable dynamic Fender gating before initdata.
     ///
-    /// The grounded startup sequence requires this write after the AXI
-    /// transition workaround and before ANY initdata is sent to either
-    /// firmware instance.
+    /// Native preserves every unrelated bit and clears only bits 1 and 2
+    /// (`value & 0xfffffff9`) after AXI2AF and before either role's initdata.
     pub(crate) fn t8140_pre_initdata_clear(&self) -> Result {
         let sgx = self.sgx.try_access().ok_or(ENODEV)?;
         let res = sgx.relaxed();
-        res.try_write32(0, T8140_PRE_INITDATA_CLEAR)?;
+        let before = res.try_read32(T8140_PRE_INITDATA_CLEAR)?;
+        res.try_write32(before & !0x6, T8140_PRE_INITDATA_CLEAR)?;
+        let after = res.try_read32(T8140_PRE_INITDATA_CLEAR)?;
+        dev_info!(
+            self.dev.as_ref(),
+            "T8140 Fender dynamic gating: {:#x} {:#x} -> {:#x}\n",
+            T8140_PRE_INITDATA_CLEAR,
+            before,
+            after,
+        );
         Ok(())
     }
 
