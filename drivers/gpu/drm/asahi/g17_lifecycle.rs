@@ -50,18 +50,42 @@ impl<P: AscCpuLifecycle> StartedCpuPair<P> {
         Self::start_staged(gfx, gfx1, || Ok(()))
     }
 
-    /// Start GFX, finish its caller-owned handshake, then start GFX1.
+    /// Start GFX1 then GFX, and only then run the caller's GFX handshake.
+    ///
+    /// MEASURED, m1n1 hv capture 20260904-001852Z, macOS on this silicon:
+    ///
+    ///     t+0.000ms  sgx 0x2600044 = 0x0    gfx-asc  RUN cleared
+    ///     t+1.150ms  sgx 0x2e00044 = 0x0    gfx1-asc RUN cleared
+    ///     t+1.815ms  sgx 0x2e00044 = 0x10   SECONDARY started FIRST
+    ///     t+2.740ms  sgx 0x2600044 = 0x10   primary started 0.9ms later
+    ///     t+5.460ms  role1 <- ep0 HELLO
+    ///     t+9.997ms  role0 <- ep0 HELLO
+    ///
+    /// Native brings BOTH processors up back to back, secondary first, and only
+    /// then lets the two RTKit handshakes proceed. This driver started GFX, ran
+    /// its ENTIRE blocking HELLO/EPMAP handshake, and only afterwards powered on
+    /// GFX1 -- so the secondary CPU was still halted throughout the primary's
+    /// handshake.
+    ///
+    /// The order correlates with outcome across every capture we have:
+    ///     sme-zt0      healthy   SECONDARY then PRIMARY
+    ///     live-uat43   healthy   SECONDARY then PRIMARY
+    ///     uat-guest-nc wedged    PRIMARY then SECONDARY
+    ///     uat-remap    wedged    PRIMARY then SECONDARY
+    /// and it matches this project's own recorded contract, which says to start
+    /// the secondary before the primary.
     pub(crate) fn start_staged<F>(gfx: P, gfx1: P, gfx_ready: F) -> Result<Self, P::Error>
     where
         F: FnOnce() -> Result<(), P::Error>,
     {
-        gfx.start_cpu()?;
-        if let Err(err) = gfx_ready() {
-            let _ = gfx.stop_cpu();
+        gfx1.start_cpu()?;
+        if let Err(err) = gfx.start_cpu() {
+            let _ = gfx1.stop_cpu();
             return Err(err);
         }
-        if let Err(err) = gfx1.start_cpu() {
+        if let Err(err) = gfx_ready() {
             let _ = gfx.stop_cpu();
+            let _ = gfx1.stop_cpu();
             return Err(err);
         }
 
@@ -203,9 +227,10 @@ where
     P: AscCpuLifecycle,
     F: FnOnce() -> Result<(), P::Error>,
 {
-    gfx.start_cpu()?;
-    if let Err(err) = gfx1.start_cpu() {
-        let _ = gfx.stop_cpu();
+    // Secondary first, matching native; see StartedCpuPair::start_staged.
+    gfx1.start_cpu()?;
+    if let Err(err) = gfx.start_cpu() {
+        let _ = gfx1.stop_cpu();
         return Err(err);
     }
 
