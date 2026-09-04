@@ -4065,9 +4065,12 @@ impl G17PLiveRuntime {
                     };
                 }
             }
-            if native_doorbells {
-                self.probe_render_ksm_admission_after_render_doorbells();
-            }
+            // The default path uses the valid cold-native paired priority-0
+            // doorbell. Keep the read-only admission/IRQ probe available on
+            // that path too: gating it on the obsolete split-doorbell
+            // diagnostic hid the decisive 0x10a10 bit-4 / 0x10a60 new-work
+            // predicate during otherwise native-shaped submissions.
+            self.probe_render_ksm_admission_after_render_doorbells();
         }
         if *module_parameters::g17p_power_wire.value() >= 2 {
             if let Err(error) = self.wire_g17p_submit_gpu_power() {
@@ -5573,6 +5576,31 @@ impl G17PLiveRuntime {
         }
         if *module_parameters::g17p_render_ksm_probe.value() == 0 {
             return;
+        }
+        // B1's new-work path is a two-stage latch. FUN_216f0 first masks the
+        // hardware IRQ status with DAT_179328 and moves SGX+0x10a60 into
+        // DAT_177130; FUN_1db24 then transfers it to DAT_177230 and sets bit 4
+        // in DAT_177200. Sample those firmware globals before the slower SGX
+        // window walk so a missing code-02 job allocation can be localized to
+        // hardware generation, IRQ service, or the pending transfer.
+        if let Some(pdev) = self.pdev.as_ref() {
+            let read = |link: u64| -> Option<u64> {
+                crate::pgtable::LiveFirmwareU64Probe::new(
+                    g17_manager::g17p_gfx_link_to_physical(link),
+                )
+                .and_then(|probe| probe.observe_mask(u64::MAX, 1))
+                .map(|observation| observation.first)
+                .ok()
+            };
+            dev_info!(
+                pdev.as_ref(),
+                "G17P render new-work globals: irq-mask={:#018x} latched={:#018x} pending={:#018x} events={:#018x} selector-word={:#018x}\n",
+                read(0xffff_fc00_0017_9328).unwrap_or(u64::MAX),
+                read(0xffff_fc00_0017_7130).unwrap_or(u64::MAX),
+                read(0xffff_fc00_0017_7230).unwrap_or(u64::MAX),
+                read(0xffff_fc00_0017_7200).unwrap_or(u64::MAX),
+                read(0xffff_fc00_0017_85f0).unwrap_or(u64::MAX),
+            );
         }
         let (Some(pdev), Some(registers)) = (self.pdev.as_ref(), self.registers.as_ref()) else {
             return;

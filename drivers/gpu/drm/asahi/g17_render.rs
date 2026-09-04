@@ -1145,11 +1145,9 @@ pub(crate) fn build_cold_opening_ta_descriptor(
     put_u16(raw, 0x38, 0x47);
     put_u16(raw, 0x3a, 0x49);
     put_u16(raw, 0x3c, 0x49);
-    // Native captures prove this byte varies (0x10 in recs2048, 0x08 in
-    // recs4096), but not what derives it. A 2026-09-01 hardware run with 0x10
-    // was identical to the 0x08 baseline, so retain the established value and
-    // do not re-baseline the descriptor around an inferred profile label.
-    put_u8(raw, 0x789, 0x08);
+    // The valid cold priority-0 qid0 corpus carries 0x78 in every first TA
+    // command. `build_ta_descriptor` already installs that value; do not
+    // replace it with the older mismatched-profile 0x08 fixture here.
     put_u8(raw, 0x93e, 0xd0);
     put_u8(raw, 0x93f, if parameters.native_pm_bytes { 0x87 } else { 0x91 });
     Ok(())
@@ -1332,8 +1330,6 @@ pub(crate) fn build_cold_opening_fragment_descriptor(
     put_u16(raw, 0x88, 0x59);
     put_u32(raw, 0x90, 1);
     put_u32(raw, 0x215c, 0);
-    put_u8(raw, 0x21d8, 0x10);
-    put_u8(raw, 0x21d9, 0xa2);
     put_u8(raw, 0x222d, 0);
     Ok(())
 }
@@ -1399,9 +1395,6 @@ pub(crate) fn apply_g17p_retained_descriptor_fields(
             put_u32(raw, 0x08d4, submission_ordinal << 16);
             put_u64(raw, 0x0934, runtime_control);
             if cold_opening {
-                // Keep the retained image consistent with the cold-opening
-                // builder; the 0x10 variant is measured inert.
-                put_u8(raw, 0x0789, 0x08);
                 put_u8(raw, 0x093e, 0xd0);
                 put_u8(raw, 0x093f, if native_pm_bytes { 0x87 } else { 0x91 });
             }
@@ -1439,8 +1432,6 @@ pub(crate) fn apply_g17p_retained_descriptor_fields(
             put_u32(raw, 0x2170, submission_ordinal);
             put_u64(raw, 0x21ce, runtime_control);
             if cold_opening {
-                put_u8(raw, 0x21d8, 0x10);
-                put_u8(raw, 0x21d9, 0xa2);
                 put_u8(raw, 0x222d, 0);
             }
         }
@@ -2037,7 +2028,7 @@ mod tests {
         build_cold_opening_fragment_descriptor(&parameters, objects(), 1, &mut fragment).unwrap();
 
         assert_eq!(&tiling[0x38..0x3e], &[0x47, 0, 0x49, 0, 0x49, 0]);
-        assert_eq!(tiling[0x789], 0x08);
+        assert_eq!(tiling[0x789], 0x78);
         assert_eq!(&tiling[0x93e..0x940], &[0xd0, 0x91]);
 
         assert_eq!(get_u32(&fragment, 0x50), 1);
@@ -2048,10 +2039,9 @@ mod tests {
         assert_eq!(get_u32(&fragment, 0x215c), 1);
         assert_eq!(fragment[0x2100], (parameters.tib_blocks > 8) as u8);
         assert_eq!(&fragment[0x2114..0x2134], &[0; 0x20]);
-        assert_eq!(&fragment[0x21d8..0x21da], &[0x10, 0xa2]);
+        assert_eq!(get_u64(&fragment, 0x21d7), 0);
         assert_eq!(fragment[0x222d], 0);
 
-        assert_eq!(fnv1a64(&[&tiling]), 0xb81a_1c11_1ede_fe5f);
     }
 
     #[test]

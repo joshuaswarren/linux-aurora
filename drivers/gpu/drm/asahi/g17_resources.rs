@@ -976,11 +976,12 @@ fn apply_g17p_generic_descriptor_tail(
     tiling: &mut [u8],
     fragment: &mut [u8],
     fragment_queue_id: u16,
+    fragment_status_low: u64,
 ) -> Option<()> {
     tiling.get(0x08a6..0x08b6)?;
     tiling.get(0x0945..0x094d)?;
     fragment.get(0x2140..0x2150)?;
-    fragment.get(0x21df..0x21e7)?;
+    fragment.get(0x21d7..0x21e7)?;
 
     put_u64(tiling, 0x08a6, G17P_BOOTSTRAP_DESCRIPTOR_ZERO_A_VA);
     put_u64(tiling, 0x08ae, G17P_BOOTSTRAP_DESCRIPTOR_ZERO_B_VA);
@@ -990,6 +991,10 @@ fn apply_g17p_generic_descriptor_tail(
     let queue_lane = u64::from(fragment_queue_id).checked_mul(4)?;
     put_u64(fragment, 0x2140, G17P_BOOTSTRAP_DESCRIPTOR_ZERO_A_VA + queue_lane);
     put_u64(fragment, 0x2148, G17P_BOOTSTRAP_DESCRIPTOR_ZERO_B_VA + queue_lane);
+    // AGX3DChannelSKSM::submitBuffer copies one complete, unaligned low/high
+    // alias pair here. The old byte patches synthesized the unmapped address
+    // 0xa21000; use the Linux-owned low alias of this exact status backing.
+    put_u64(fragment, 0x21d7, fragment_status_low);
     put_u64(fragment, 0x21df, G17P_BOOTSTRAP_3D_STATUS_VA);
     Some(())
 }
@@ -5475,6 +5480,7 @@ impl G17PUserRenderStorage {
                 tiling,
                 fragment,
                 g17p_render_queue_id(false),
+                translated.parameters.fragment_status,
             )
                 .ok_or_else(|| render_build_fail(20))?;
             // AGX3DChannelSKSM::submitBuffer fills +0x2160 from the physical
@@ -5941,6 +5947,7 @@ impl G17PUserRenderStorage {
                 tiling,
                 fragment,
                 g17p_render_queue_id(false),
+                translated.parameters.fragment_status,
             )
             .ok_or(EINVAL)?;
             // The physical queue timestamp is staged after this fresh image
@@ -14389,7 +14396,12 @@ mod tests {
         fragment[0x1f4e..0x1f56].copy_from_slice(&overlapping_context_base);
 
         assert_eq!(
-            apply_g17p_generic_descriptor_tail(&mut tiling, &mut fragment, 1),
+            apply_g17p_generic_descriptor_tail(
+                &mut tiling,
+                &mut fragment,
+                1,
+                G17P_RENDER_FRAGMENT_STATUS_VA,
+            ),
             Some(())
         );
         assert_eq!(get_u64(&tiling, 0x08a6), G17P_BOOTSTRAP_DESCRIPTOR_ZERO_A_VA);
@@ -14404,6 +14416,7 @@ mod tests {
             G17P_BOOTSTRAP_DESCRIPTOR_ZERO_B_VA + 0x04
         );
         assert_eq!(get_u64(&fragment, 0x21df), G17P_BOOTSTRAP_3D_STATUS_VA);
+        assert_eq!(get_u64(&fragment, 0x21d7), G17P_RENDER_FRAGMENT_STATUS_VA);
         assert_eq!(
             &fragment[0x1f4e..0x1f56],
             &overlapping_context_base,

@@ -3428,7 +3428,11 @@ impl G17PManagerConstruction {
                         dl,
                     );
                 }
-                for qid in [4u64, 5, 6] {
+                for qid in [
+                    4u64,
+                    u64::from(g17_resources::g17p_render_queue_id(true)),
+                    u64::from(g17_resources::g17p_render_queue_id(false)),
+                ] {
                     let st = rd(G17P_QUEUE_STATE_LINK_BASE + qid * 0x28);
                     let st2 = rd(G17P_QUEUE_STATE_LINK_BASE + qid * 0x28 + 8);
                     let fl = rd(G17P_QUEUE_FLAG_LINK_BASE + qid * 0x28 + 0x40);
