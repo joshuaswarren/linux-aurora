@@ -8543,23 +8543,14 @@ impl G17ResourceOwner {
             mmu::PROT_FW_SHARED_RW,
         )?;
         qos_resource.with_bytes_mut(|bytes| {
+            // The valid 20260904-092506Z 25G83 capture dereferences the live
+            // HWData +0x26ac pointer: the complete 0xe40-byte QoS object is
+            // zero at both roles' initdata publication. Before doorbell 1,
+            // only QID rows 0/1 contain {HardwareBufferID=0, qos_class=0x0f}.
+            // Those rows become 0xff after retirement before doorbell 2;
+            // never-used rows remain zero. Preserve that cold state rather
+            // than marking all 128 rows retired before any queue exists.
             bytes.fill(0);
-            // The first 0x400 bytes are 128 eight-byte QID rows carrying
-            // {HardwareBufferID, qos_class}. MEASURED, macOS 25G83 once.d: a
-            // native table reads `ff 00 00 00 00 00 00 00` in every row that
-            // has no queue installed, and willSubmit replaces byte 0 with the
-            // real HardwareBufferID. 0xff is the unassigned marker.
-            //
-            // Zero-filling instead makes every one of our 128 rows read as a
-            // live assignment to HardwareBufferID 0, class 0. That matters
-            // only on the SKSM path -- compute is the classic mechanism and
-            // never consults this table -- which is exactly the asymmetry the
-            // hardware shows: compute dispatches, neither render stage does.
-            for row in 0..G17P_QOS_QUEUE_COUNT {
-                if let Some(byte) = bytes.get_mut(row * 8) {
-                    *byte = 0xff;
-                }
-            }
             Ok(())
         })?;
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
