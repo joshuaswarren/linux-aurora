@@ -7611,7 +7611,7 @@ impl G17PClRuntimeStorage {
 struct G17MappedResources {
     native_private_cluster: MappedObject,
     partial_computed: MappedObject,
-    partial_scheduler: MappedObject,
+    pb_descriptor_table: MappedObject,
     partial_primary_index: MappedObject,
     roots: MappedObject,
     shared_cluster: MappedObject,
@@ -7621,19 +7621,15 @@ struct G17MappedResources {
     secondary_state: MappedObject,
     secondary_status_a: MappedObject,
     primary_b2_sentinel: MappedObject,
-    primary_b2_alias_1: MappedObject,
-    primary_b2_alias_0_low: mmu::KernelMapping,
-    primary_b2_alias_1_low: mmu::KernelMapping,
+    uma_page_pool_descriptor_table: MappedObject,
+    pb_descriptor_table_low: mmu::KernelMapping,
+    uma_page_pool_descriptor_table_low: mmu::KernelMapping,
     completion_ordinal_0: MappedObject,
     completion_ordinal_0_low: mmu::KernelMapping,
     completion_ordinal_2: MappedObject,
     completion_ordinal_2_low: mmu::KernelMapping,
     qos_resource: MappedObject,
     sksm_qid_resource: MappedObject,
-    pb_descriptor_table: MappedObject,
-    pb_descriptor_table_low: mmu::KernelMapping,
-    uma_page_pool_descriptor_table: MappedObject,
-    uma_page_pool_descriptor_table_low: mmu::KernelMapping,
     parameter_metrics: MappedObject,
     parameter_metrics_low_va: u64,
     fwctl: MappedObject,
@@ -7857,29 +7853,34 @@ impl G17ResourceOwner {
             g17_submission::G17P_PARTIAL_OPENING_PAGE_SIZE,
             mmu::PROT_FW_PRIV_RW,
         )?;
-        let mut partial_scheduler = MappedObject::new_wc_at(
+        // Native primary main +0x2d8/+0x2e0 permanently names this fixed
+        // low/high PBDesc table. It is not a scheduler scratch page.
+        let mut pb_descriptor_table = MappedObject::new_wc_at(
             dev,
             address_space.uat.kernel_vm(),
             g17_submission::G17P_PARTIAL_OPENING_SCHEDULER_GPU_VA,
             g17_submission::G17P_PARTIAL_OPENING_PAGE_SIZE,
             mmu::PROT_FW_SHARED_RW,
         )?;
-        partial_scheduler.with_bytes_mut(|bytes| {
+        pb_descriptor_table.with_bytes_mut(|bytes| {
             g17_submission::apply_g17p_partial_opening_scheduler_page(bytes).map_err(|_| EINVAL)
         })?;
-        let primary_b2_alias_1_gpu_va =
+        // Main +0x2e8/+0x2f0 permanently names the companion UMA descriptor
+        // table. The bytes previously called a compute dispatch record decode
+        // exactly as an UMA descriptor in every valid native capture.
+        let uma_page_pool_descriptor_table_gpu_va =
             g17_submission::G17P_PARTIAL_OPENING_SCHEDULER_GPU_VA
                 .checked_add(0x8000)
                 .ok_or(EINVAL)?;
         dev_info!(
             dev.as_ref(),
-            "G17P resources: mapping B2 alias at {:#x}\n",
-            primary_b2_alias_1_gpu_va
+            "G17P resources: mapping fixed UMA descriptor table at {:#x}\n",
+            uma_page_pool_descriptor_table_gpu_va
         );
-        let mut primary_b2_alias_1 = match MappedObject::new_wc_at(
+        let mut uma_page_pool_descriptor_table = match MappedObject::new_wc_at(
             dev,
             address_space.uat.kernel_vm(),
-            primary_b2_alias_1_gpu_va,
+            uma_page_pool_descriptor_table_gpu_va,
             G17P_CL_B2_OBJECT_SIZE,
             mmu::PROT_FW_SHARED_RW,
         ) {
@@ -7888,13 +7889,13 @@ impl G17ResourceOwner {
                 dev_err!(
                     dev.as_ref(),
                     "G17P resources: B2 alias map at {:#x} failed ({:?})\n",
-                    primary_b2_alias_1_gpu_va,
+                    uma_page_pool_descriptor_table_gpu_va,
                     error
                 );
                 return Err(error);
             }
         };
-        primary_b2_alias_1.with_bytes_mut(|bytes| {
+        uma_page_pool_descriptor_table.with_bytes_mut(|bytes| {
             g17_initdata::encode_compute_dispatch_record(
                 &mut bytes[0x20..0x20 + g17_initdata::COMPUTE_DISPATCH_RECORD_SIZE],
             )
@@ -7905,17 +7906,17 @@ impl G17ResourceOwner {
         // low/high pairs on the same backing; copying their bytes into an
         // unrelated descriptor table is not equivalent once firmware writes
         // scheduler state through one view and reads it through the other.
-        let primary_b2_alias_0_low = partial_scheduler.map_alias_at(
+        let pb_descriptor_table_low = pb_descriptor_table.map_alias_at(
             address_space.uat.kernel_lower_vm(),
             g17_initdata::REGION_VIEW_LOW_ADDRS[0],
             mmu::PROT_GPU_SHARED_RW,
         )?;
-        let primary_b2_alias_1_low = primary_b2_alias_1.map_alias_at(
+        let uma_page_pool_descriptor_table_low = uma_page_pool_descriptor_table.map_alias_at(
             address_space.uat.kernel_lower_vm(),
             g17_initdata::REGION_VIEW_LOW_ADDRS[1],
             mmu::PROT_GPU_SHARED_RW,
         )?;
-        dev_info!(dev.as_ref(), "G17P resources: compute B2 low/high aliases mapped\n");
+        dev_info!(dev.as_ref(), "G17P resources: fixed PBDesc/UMA low/high aliases mapped\n");
         dev_info!(
             dev.as_ref(),
             "G17P resources: mapping primary-index owner at {:#x}, render alias {:#x}\n",
@@ -8404,46 +8405,9 @@ impl G17ResourceOwner {
             qos_resource.iova(),
             g17_initdata::G17P_QOS_RESOURCE_SIZE
         );
-        // G16 createHardwareMappings allocates these two global descriptor
-        // tables after the QID and QoS resources. Their firmware-high and
-        // GPU-task-low views name the same zeroed backing, and all four
-        // mappings are prepared before either firmware receives initdata.
-        let mut pb_descriptor_table = MappedObject::new_wc(
-            dev,
-            &address_space.uat,
-            G17P_PB_DESCRIPTOR_TABLE_SIZE,
-            mmu::UAT_PGSZ as u64,
-            mmu::PROT_FW_SHARED_RW,
-        )?;
-        let pb_descriptor_table_low = pb_descriptor_table.map_alias_in_range(
-            address_space.uat.kernel_lower_vm(),
-            g17p_cl_dynamic_low_va_range(),
-            mmu::UAT_PGSZ as u64,
-            mmu::PROT_GPU_SHARED_RW,
-        )?;
-        let mut uma_page_pool_descriptor_table = MappedObject::new_wc(
-            dev,
-            &address_space.uat,
-            G17P_UMA_PAGE_POOL_DESCRIPTOR_TABLE_SIZE,
-            mmu::UAT_PGSZ as u64,
-            mmu::PROT_FW_SHARED_RW,
-        )?;
-        let uma_page_pool_descriptor_table_low =
-            uma_page_pool_descriptor_table.map_alias_in_range(
-                address_space.uat.kernel_lower_vm(),
-                g17p_cl_dynamic_low_va_range(),
-                mmu::UAT_PGSZ as u64,
-                mmu::PROT_GPU_SHARED_RW,
-            )?;
-        pb_descriptor_table.with_bytes_mut(|bytes| {
-            bytes.fill(0);
-            Ok(())
-        })?;
-        uma_page_pool_descriptor_table.with_bytes_mut(|bytes| {
-            bytes.fill(0);
-            Ok(())
-        })?;
-        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        // The two fixed objects above are the sole native PBDesc/UMA tables.
+        // Do not allocate a second pair and swap the main-config pointers after
+        // firmware has cached initdata.
         dev_info!(
             dev.as_ref(),
             "G17P resources: PB descriptors low/high=[{:#x},{:#x}], UMA page-pool descriptors low/high=[{:#x},{:#x}]\n",
@@ -8534,7 +8498,10 @@ impl G17ResourceOwner {
         )?;
         let primary_region_views = g17_initdata::PrimaryRegionViews {
             sentinel_high: primary_b2_sentinel.iova(),
-            alias_high: [partial_scheduler.iova(), primary_b2_alias_1.iova()],
+            alias_high: [
+                pb_descriptor_table.iova(),
+                uma_page_pool_descriptor_table.iova(),
+            ],
         };
 
         let shared = SharedAddresses {
@@ -8582,8 +8549,11 @@ impl G17ResourceOwner {
         let fixed_high_ranges = [
             ("native private cluster", &native_private_cluster),
             ("partial computed", &partial_computed),
-            ("partial scheduler", &partial_scheduler),
-            ("B2 alias", &primary_b2_alias_1),
+            ("fixed PB descriptor table", &pb_descriptor_table),
+            (
+                "fixed UMA page-pool descriptor table",
+                &uma_page_pool_descriptor_table,
+            ),
             ("primary index", &partial_primary_index),
             ("fwctl", &fwctl),
             ("control shared", &control_shared),
@@ -8620,11 +8590,6 @@ impl G17ResourceOwner {
             ("KSM completion ordinal 2 high", &completion_ordinal_2),
             ("global QoS state", &qos_resource),
             ("global SKSM QID state", &sksm_qid_resource),
-            ("PB descriptor table high", &pb_descriptor_table),
-            (
-                "UMA page-pool descriptor table high",
-                &uma_page_pool_descriptor_table,
-            ),
             ("PM page metrics high", &parameter_metrics),
             ("region A", &region_a),
             ("region C", &region_c),
@@ -8687,12 +8652,13 @@ impl G17ResourceOwner {
                 return Err(EIO);
             }
         }
-        if primary_b2_alias_0_low.iova() != g17_initdata::REGION_VIEW_LOW_ADDRS[0]
-            || primary_b2_alias_1_low.iova() != g17_initdata::REGION_VIEW_LOW_ADDRS[1]
+        if pb_descriptor_table_low.iova() != g17_initdata::REGION_VIEW_LOW_ADDRS[0]
+            || uma_page_pool_descriptor_table_low.iova()
+                != g17_initdata::REGION_VIEW_LOW_ADDRS[1]
         {
             dev_err!(
                 dev.as_ref(),
-                "G17P resources: compute B2 low aliases do not match initdata\n"
+                "G17P resources: fixed PBDesc/UMA low aliases do not match initdata\n"
             );
             return Err(EIO);
         }
@@ -8819,7 +8785,7 @@ impl G17ResourceOwner {
             resources: G17MappedResources {
                 native_private_cluster,
                 partial_computed,
-                partial_scheduler,
+                pb_descriptor_table,
                 partial_primary_index,
                 roots,
                 shared_cluster,
@@ -8829,19 +8795,15 @@ impl G17ResourceOwner {
                 secondary_state,
                 secondary_status_a,
                 primary_b2_sentinel,
-                primary_b2_alias_1,
-                primary_b2_alias_0_low,
-                primary_b2_alias_1_low,
+                uma_page_pool_descriptor_table,
+                pb_descriptor_table_low,
+                uma_page_pool_descriptor_table_low,
                 completion_ordinal_0,
                 completion_ordinal_0_low,
                 completion_ordinal_2,
                 completion_ordinal_2_low,
                 qos_resource,
                 sksm_qid_resource,
-                pb_descriptor_table,
-                pb_descriptor_table_low,
-                uma_page_pool_descriptor_table,
-                uma_page_pool_descriptor_table_low,
                 parameter_metrics,
                 parameter_metrics_low_va,
                 fwctl,
@@ -8891,10 +8853,9 @@ impl G17ResourceOwner {
         self.address_space.uat.mark_firmware_cache_flush_ready();
     }
 
-    /// Select the two global low/high region-view pairs used by the next
-    /// serialized workload. Compute and render need different same-backing
-    /// objects at these four main-config fields; the queue submission mutex
-    /// keeps the selected mode resident until that workload has retired.
+    /// Validate the two immutable PBDesc/UMA low/high pairs published at
+    /// initdata time. Native never changes these four main-config words across
+    /// compute, system render, or userspace render submissions.
     fn stage_primary_region_views(
         &mut self,
         label: &str,
@@ -8918,10 +8879,9 @@ impl G17ResourceOwner {
                 let offset = main_offset
                     .checked_add(0x2d8 + index * 8)
                     .ok_or(EOVERFLOW)?;
-                let slot = bytes.get_mut(offset..offset + 8).ok_or(ERANGE)?;
+                let slot = bytes.get(offset..offset + 8).ok_or(ERANGE)?;
                 let previous = u64::from_le_bytes(slot.try_into().map_err(|_| ERANGE)?);
                 if previous != value {
-                    slot.copy_from_slice(&value.to_le_bytes());
                     changed = true;
                 }
             }
@@ -8929,29 +8889,30 @@ impl G17ResourceOwner {
         })?;
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         if changed {
-            dev_info!(
+            dev_err!(
                 self.dev().as_ref(),
-                "G17P resources: primary region views switched to {} [{:#x},{:#x}] [{:#x},{:#x}]\n",
+                "G17P resources: immutable primary PBDesc/UMA views disagree at {} [{:#x},{:#x}] [{:#x},{:#x}]\n",
                 label,
                 low[0],
                 high[0],
                 low[1],
                 high[1],
             );
+            return Err(EIO);
         }
         Ok(())
     }
 
     pub(crate) fn stage_compute_region_views(&mut self) -> Result {
         let low = [
-            self.resources.primary_b2_alias_0_low.iova(),
-            self.resources.primary_b2_alias_1_low.iova(),
+            self.resources.pb_descriptor_table_low.iova(),
+            self.resources.uma_page_pool_descriptor_table_low.iova(),
         ];
         let high = [
-            self.resources.partial_scheduler.iova(),
-            self.resources.primary_b2_alias_1.iova(),
+            self.resources.pb_descriptor_table.iova(),
+            self.resources.uma_page_pool_descriptor_table.iova(),
         ];
-        self.stage_primary_region_views("compute B2", low, high)
+        self.stage_primary_region_views("compute", low, high)
     }
 
     pub(crate) fn stage_render_region_views(&mut self) -> Result {
@@ -8963,7 +8924,7 @@ impl G17ResourceOwner {
             self.resources.pb_descriptor_table.iova(),
             self.resources.uma_page_pool_descriptor_table.iova(),
         ];
-        self.stage_primary_region_views("render PB/UMA", low, high)
+        self.stage_primary_region_views("render", low, high)
     }
 
     /// Read one AGXQOSManager firmware-visible 8-byte queue record. Native
@@ -11394,12 +11355,14 @@ impl G17ResourceOwner {
         if !self.control_counters()?.compute_runtime_ready() {
             return Err(EINVAL);
         }
-        self.resources.primary_b2_alias_1.with_bytes_mut(|bytes| {
-            g17_initdata::encode_compute_dispatch_record(
-                &mut bytes[0x20..0x20 + g17_initdata::COMPUTE_DISPATCH_RECORD_SIZE],
-            )
-            .map_err(|_| EINVAL)
-        })?;
+        self.resources
+            .uma_page_pool_descriptor_table
+            .with_bytes_mut(|bytes| {
+                g17_initdata::encode_compute_dispatch_record(
+                    &mut bytes[0x20..0x20 + g17_initdata::COMPUTE_DISPATCH_RECORD_SIZE],
+                )
+                .map_err(|_| EINVAL)
+            })?;
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
@@ -11466,7 +11429,7 @@ impl G17ResourceOwner {
             .uat
             .restore_t8140_bootstrap_roots_after_processor_stop()?;
 
-        self.resources.partial_scheduler.with_bytes_mut(|bytes| {
+        self.resources.pb_descriptor_table.with_bytes_mut(|bytes| {
             g17_submission::apply_g17p_partial_opening_scheduler_page(bytes).map_err(|_| EINVAL)
         })?;
         self.resources
@@ -11487,16 +11450,6 @@ impl G17ResourceOwner {
                     &mut bytes[..g17_submission::G17P_PARTIAL_OPENING_PAGE_SIZE],
                 )
                 .map_err(|_| EINVAL)
-            })?;
-        self.resources.pb_descriptor_table.with_bytes_mut(|bytes| {
-            bytes.fill(0);
-            Ok(())
-        })?;
-        self.resources
-            .uma_page_pool_descriptor_table
-            .with_bytes_mut(|bytes| {
-                bytes.fill(0);
-                Ok(())
             })?;
         self.resources.parameter_metrics.with_bytes_mut(|bytes| {
             bytes.fill(0);
@@ -11534,13 +11487,15 @@ impl G17ResourceOwner {
             bytes.fill(0);
             Ok(())
         })?;
-        self.resources.primary_b2_alias_1.with_bytes_mut(|bytes| {
-            bytes.fill(0);
-            g17_initdata::encode_compute_dispatch_record(
-                &mut bytes[0x20..0x20 + g17_initdata::COMPUTE_DISPATCH_RECORD_SIZE],
-            )
-            .map_err(|_| EINVAL)
-        })?;
+        self.resources
+            .uma_page_pool_descriptor_table
+            .with_bytes_mut(|bytes| {
+                bytes.fill(0);
+                g17_initdata::encode_compute_dispatch_record(
+                    &mut bytes[0x20..0x20 + g17_initdata::COMPUTE_DISPATCH_RECORD_SIZE],
+                )
+                .map_err(|_| EINVAL)
+            })?;
         self.resources.completion_ordinal_0.with_bytes_mut(|bytes| {
             bytes.fill(0);
             Ok(())
@@ -11736,8 +11691,8 @@ impl G17ResourceOwner {
         let primary_views = g17_initdata::PrimaryRegionViews {
             sentinel_high: self.resources.primary_b2_sentinel.iova(),
             alias_high: [
-                self.resources.partial_scheduler.iova(),
-                self.resources.primary_b2_alias_1.iova(),
+                self.resources.pb_descriptor_table.iova(),
+                self.resources.uma_page_pool_descriptor_table.iova(),
             ],
         };
         self.resources.shared_cluster.write_main_configs(
@@ -12648,7 +12603,7 @@ impl G17ResourceOwner {
         );
         G17PPartialOpeningResourceBinding {
             kernel_va_base: self.kernel_va_base,
-            scheduler_page: self.resources.partial_scheduler.iova(),
+            scheduler_page: self.resources.pb_descriptor_table.iova(),
             primary_index_page: g17_submission::G17P_PARTIAL_OPENING_PRIMARY_INDEX_GPU_VA,
             fwctl: self.resources.fwctl.iova(),
             tiling_channel: channels
@@ -12958,6 +12913,7 @@ impl G17ResourceOwner {
         fragment_queue_write_index: u32,
         tiling_queue_gpu_va: u64,
         tiling_queue_write_index: u32,
+        first_submit: bool,
         publish_late_tiling_state: F,
     ) -> Result<(
         g17_submission::PreparedG17PPartialOpeningWorkPair,
@@ -13013,6 +12969,7 @@ impl G17ResourceOwner {
             tiling,
             g17p_render_queue_id(false) as u8,
             g17p_render_queue_id(true) as u8,
+            first_submit,
         )
             .map_err(|_| EINVAL)?;
         if prepared.fragment.channel_table_index
@@ -13228,8 +13185,8 @@ impl G17ResourceOwner {
         f: impl FnOnce(&mut [u8], &mut [u8], &mut [u8]) -> Result<R>,
     ) -> Result<R> {
         let computed = self.resources.partial_computed.object.vmap()?;
-        let region_1 = self.resources.partial_scheduler.object.vmap()?;
-        let region_2 = self.resources.primary_b2_alias_1.object.vmap()?;
+        let region_1 = self.resources.pb_descriptor_table.object.vmap()?;
+        let region_2 = self.resources.uma_page_pool_descriptor_table.object.vmap()?;
         let computed = unsafe {
             // SAFETY: each VMap covers its complete 16 KiB object.
             core::slice::from_raw_parts_mut(computed.as_mut_ptr(), G17P_CL_B2_OBJECT_SIZE)

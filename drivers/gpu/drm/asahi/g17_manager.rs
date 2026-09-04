@@ -1825,6 +1825,7 @@ impl G17PManagerConstruction {
             3,
             tiling_queue,
             3,
+            true,
             move || late_tiling.publish(),
         )?;
         if render_bind.is_some() {
@@ -2183,6 +2184,7 @@ impl G17PManagerConstruction {
             submission.fragment_queue_write_index,
             submission.tiling_queue_gpu_va,
             submission.tiling_queue_write_index,
+            true,
             publish_late_tiling_state,
         )?;
         if render_bind.is_some() {
@@ -3114,6 +3116,7 @@ impl G17PManagerConstruction {
                 published_prefix,
                 tiling_queue,
                 published_prefix,
+                self.render_submission_ordinal == 0,
                 move || {
                     if let Some(publication) = late_tiling {
                         publication.publish();
@@ -3808,10 +3811,9 @@ impl G17PManagerConstruction {
                 return;
             }
         };
-        // Log EVERY work channel, not the first two. The render's tables moved
-        // to the priority-2 group (TA_2 = 6, 3D_2 = 7) and compute publishes on
-        // CL_2 = 8, so a `take(2)` only ever showed the empty priority-0 rings
-        // and made the render look like it published nothing at all.
+        // Log EVERY work channel, not the first two. The userspace render's
+        // tables are TA_2/3D_2 (indices 6/7) and compute publishes on CL_2 (8).
+        // Native's distinct system bring-up queues occupy TA_0/3D_0.
         for snapshot in snapshots.into_iter() {
             let name = if snapshot.table_index
                 == g17_submission::G17P_PARTIAL_OPENING_TILING_CHANNEL_TABLE_INDEX

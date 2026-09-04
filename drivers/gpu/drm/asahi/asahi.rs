@@ -271,7 +271,7 @@ kernel::module_platform_driver! {
         },
         g17p_render_native_doorbells: u32 {
             default: 2,
-            description: "Native Mac17P render TX doorbells. 0: legacy paired publication followed by only Vertex/priority0. 1: paired Fragment then TA priority-2 doorbells. 2 (default): exact native publication chronology -- complete 3D group, 3D doorbell, complete TA group plus late Pool-A transition, TA doorbell. 3: mode 2 plus a diagnostic bounded pre-ack. Modes 1/2/3 are mutually exclusive with split launch; modes 2/3 require render SKSM.",
+            description: "Native Mac17P userspace-render TX doorbells. 0: legacy paired publication followed by only Vertex/priority0. 1: paired Fragment then TA priority-2 doorbells. 2 (default): exact userspace publication chronology -- complete 3D group, 3D doorbell, complete TA group plus late Pool-A transition, TA doorbell. 3: mode 2 plus a diagnostic bounded pre-ack. Native's earlier priority-0 system bring-up queues are a separate profile, not this userspace queue. Modes 1/2/3 are mutually exclusive with split launch; modes 2/3 require render SKSM.",
         },
         g17p_render_native_pool_a_first_record: u32 {
             default: 1,
@@ -393,7 +393,7 @@ kernel::module_platform_driver! {
         },
         g17p_render_first_submit: u32 {
             default: 0,
-            description: "Declare the render's work-channel ring slots as the FIRST submission on their queues. Slot +0x14 bit 24 is documented as 'first submission on this queue' and is set when the builder's channel_started argument is false. The compute path passes false and dispatches; the render path hardcoded true, so on a cold boot -- where the TA and 3D queues have provably never been submitted to -- the host told the firmware these were continuation submissions on already-running queues. 0: off (current behaviour). 1: pass the honest first-submit value for the render.",
+            description: "Deprecated compatibility parameter; ignored. The render now derives outer-slot +0x17 from retained queue lifecycle: 1 on the physical queue's first submit and 0 thereafter, matching every valid native trace.",
         },
         g17p_render_ta_qid_field: u32 {
             default: 1,

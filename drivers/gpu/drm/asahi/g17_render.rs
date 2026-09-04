@@ -1425,8 +1425,13 @@ pub(crate) fn apply_g17p_retained_descriptor_fields(
                 );
             }
             put_u32(raw, 0x2150, item_number << 8);
-            put_u32(raw, 0x2154, 1);
-            put_u32(raw, 0x215c, if cold_opening { 0 } else { item_number });
+            // Valid native queues prove +0x2154 is the physical 3D QID: it is
+            // 1/3/8 for qids 1/3/8, respectively. The old literal only happened
+            // to match the first captured qid.
+            put_u32(raw, 0x2154, u32::from(queue_id));
+            // Queue lifecycle flag, not an item number: one for the first
+            // submission on this physical queue, then zero on every repeat.
+            put_u32(raw, 0x215c, u32::from(submission_ordinal == 0));
             // +0x2160 is the packed 3D-channel SKSM completion scratch value:
             // the physical queue timestamp in bits [39:0] and the channel's
             // payload byte in bits [47:40]. G17PUserRenderStorage stages it
@@ -2039,7 +2044,8 @@ mod tests {
         assert_eq!(&fragment[0x80..0x86], &[0x56, 0, 0x57, 0, 0x57, 0]);
         assert_eq!(&fragment[0x88..0x8a], &[0x59, 0]);
         assert_eq!(get_u32(&fragment, 0x90), 1);
-        assert_eq!(get_u32(&fragment, 0x215c), 0);
+        assert_eq!(get_u32(&fragment, 0x2154), 1);
+        assert_eq!(get_u32(&fragment, 0x215c), 1);
         assert_eq!(fragment[0x2100], (parameters.tib_blocks > 8) as u8);
         assert_eq!(&fragment[0x2114..0x2134], &[0; 0x20]);
         assert_eq!(&fragment[0x21d8..0x21da], &[0x10, 0xa2]);
@@ -2243,7 +2249,8 @@ mod tests {
             &rce[0x720..0x720 + PARTIAL_STORE_REGISTER_COUNT * REGISTER_BYTES],
             &fragment[0x7c0..0x7c0 + PARTIAL_STORE_REGISTER_COUNT * REGISTER_BYTES],
         );
-        assert_eq!(get_u32(&fragment, 0x215c), 2);
+        assert_eq!(get_u32(&fragment, 0x2154), 6);
+        assert_eq!(get_u32(&fragment, 0x215c), 0);
         assert_eq!(get_u32(&fragment, 0x2170), 1);
         assert_eq!(get_u64(&fragment, 0x21ce), 0xffff_fc20_c082_8000);
     }

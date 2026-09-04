@@ -3568,14 +3568,16 @@ impl G17PLiveRuntime {
                 );
             }
         }
-        // Modes 2/3 match the complete native chronology, not just its mailbox
-        // values: only the complete 3D group is visible for the first kick;
+        // Modes 2/3 reproduce the priority-2 userspace chronology: only
+        // the complete 3D group is visible for the first kick;
         // mode 3 additionally waits for Fragment outer consumption before TA
         // is constructed and made wholly visible for the second kick.
         // Mode 1 preserves the earlier diagnostic (both groups visible, then
         // both native doorbells), and mode 0 is byte-for-byte legacy behavior.
         //
-        // MEASURED ON macOS 2026-09-02, and it settles the doorbell question.
+        // The full 25G83 boot trace also contains earlier priority-0 system
+        // queues. Those are a distinct initial-bring-up profile; this Vulkan
+        // client queue matches the later native priority-2 class.
         // A dtrace probe over every function of the RTBuddy kext plus every
         // IOMappedWrite64 for one Metal render pass shows the COMPLETE host to
         // GPU surface:
