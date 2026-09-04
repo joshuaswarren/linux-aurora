@@ -1338,6 +1338,12 @@ impl G17PManagerConstruction {
         self.resources.firmware_fault_report_snapshot()
     }
 
+    pub(crate) fn firmware_dm1_slot0_snapshot(
+        &mut self,
+    ) -> Result<g17_resources::G17PFirmwareDm1Slot0Snapshot> {
+        self.resources.firmware_dm1_slot0_snapshot()
+    }
+
     pub(crate) fn drain_primary_firmware_event(
         &mut self,
     ) -> Result<Option<g17_resources::G17PPrimaryFirmwareEventRecord>> {
