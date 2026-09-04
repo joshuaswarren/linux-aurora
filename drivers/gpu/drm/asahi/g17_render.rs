@@ -1335,8 +1335,10 @@ pub(crate) fn build_cold_opening_fragment_descriptor(
     put_u16(raw, 0x84, 0x57);
     put_u16(raw, 0x88, 0x59);
     put_u32(raw, 0x90, 1);
-    put_u32(raw, 0x215c, 0);
-    put_u8(raw, 0x222d, 0);
+    // A newly published native 3D queue carries 1 here; retained submissions
+    // clear it. This lifecycle is independent of the outer-slot first-submit
+    // byte and appears identically on cold QIDs 1 and 8 in both valid traces.
+    put_u32(raw, 0x215c, 1);
     Ok(())
 }
 
@@ -1431,21 +1433,20 @@ pub(crate) fn apply_g17p_retained_descriptor_fields(
             // 1/3/8 for qids 1/3/8, respectively. The old literal only happened
             // to match the first captured qid.
             put_u32(raw, 0x2154, u32::from(queue_id));
-            // `AGX3DChannelSKSM::submitBuffer` sources this from whether the
-            // IOGPU command descriptor owns a non-empty IO-fence list. Linux
-            // does not publish that list, so claiming one on the first submit
-            // can only create an unsatisfiable hardware dependency. This is
-            // independent of outer-slot +0x17's real first-submit lifecycle.
-            put_u32(raw, 0x215c, 0);
+            // Valid cold QIDs 1 and 8 both carry 1; every later submission on
+            // the retained physical queue carries 0. The prior IO-fence guard
+            // was an unsupported semantic guess which inverted this native
+            // lifecycle exactly where first-work setup needs it.
+            put_u32(raw, 0x215c, u32::from(submission_ordinal == 0));
             // +0x2160 is the packed 3D-channel SKSM completion scratch value:
             // the physical queue timestamp in bits [39:0] and the channel's
             // payload byte in bits [47:40]. G17PUserRenderStorage stages it
             // from the retained fragment producer immediately before publish.
             put_u32(raw, 0x2170, submission_ordinal);
             put_u64(raw, 0x21ce, runtime_control);
-            if cold_opening {
-                put_u8(raw, 0x222d, 0);
-            }
+            // +0x222c is the four-qword AGXCommandHWDSIDData mask tail.
+            // Initial priority-0 3D_0 commands retain the generic 0x100 mask
+            // at this lane; zero belongs to the separate 3D_2/qid8 profile.
         }
     }
     Ok(())
@@ -2049,11 +2050,11 @@ mod tests {
         assert_eq!(&fragment[0x88..0x8a], &[0x59, 0]);
         assert_eq!(get_u32(&fragment, 0x90), 1);
         assert_eq!(get_u32(&fragment, 0x2154), 1);
-        assert_eq!(get_u32(&fragment, 0x215c), 0);
+        assert_eq!(get_u32(&fragment, 0x215c), 1);
         assert_eq!(fragment[0x2100], (parameters.tib_blocks > 8) as u8);
         assert_eq!(&fragment[0x2114..0x2134], &[0; 0x20]);
         assert_eq!(get_u64(&fragment, 0x21d7), 0);
-        assert_eq!(fragment[0x222d], 0);
+        assert_eq!(fragment[0x222d], 1);
 
     }
 
