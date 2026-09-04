@@ -13,6 +13,10 @@
 use kernel::prelude::*;
 #[cfg(not(test))]
 use kernel::time::{delay::fsleep, Delta};
+#[cfg(all(not(test), CONFIG_DEV_COREDUMP))]
+use crate::g17_trace_capture::{self as trace, TraceArchive};
+#[cfg(all(not(test), CONFIG_DEV_COREDUMP))]
+use kernel::time::{ClockSource, Monotonic};
 
 #[cfg(not(test))]
 use core::sync::atomic::{fence, AtomicU32, Ordering};
@@ -862,6 +866,10 @@ fn resource_observation(
 #[cfg(not(test))]
 pub(crate) struct G17PManagerConstruction {
     resources: g17_resources::G17ResourceOwner,
+    /// One bounded first-render archive. Allocated before initdata publication;
+    /// exported by ownership transfer only after a terminal observation.
+    #[cfg(CONFIG_DEV_COREDUMP)]
+    trace_capture: Option<KBox<G17PTraceDump>>,
     platform: G17PPlatformConfig,
     num_clusters: u32,
     /// Cached SGX 0xe01480 bits 19:16 from the pre-ASC GPU-ID probe.
@@ -936,6 +944,49 @@ pub(crate) struct G17PManagerConstruction {
     /// warning is rate-limited rather than removed: a per-submission console
     /// write costs about a millisecond and would itself distort the timing.
     compute_stamp_misses: AtomicU32,
+}
+
+/// A preallocated evidence buffer, not a live mapping exposed to readers.
+/// `used` remains zero until the archive is sealed; the only export path takes
+/// this owner out of the manager so later submits cannot overwrite evidence.
+#[cfg(all(not(test), CONFIG_DEV_COREDUMP))]
+pub(crate) struct G17PTraceDump {
+    arena: KVVec<u8>,
+    used: usize,
+    phase_sequence: u64,
+    prepared: bool,
+    job_stamp: u64,
+}
+
+#[cfg(all(not(test), CONFIG_DEV_COREDUMP))]
+impl G17PTraceDump {
+    fn new(resources: &mut g17_resources::G17ResourceOwner) -> Result<KBox<Self>> {
+        let mut arena = KVVec::from_elem(0, trace::DEFAULT_CAPACITY, GFP_KERNEL)?;
+        let mut archive = TraceArchive::new(&mut arena).map_err(|_| EINVAL)?;
+        if resources.capture_owned_trace(
+            &mut archive, trace::Phase::BootConstructed, 1,
+            &mut || Monotonic::ktime_get() as u64,
+        ).is_err() {
+            archive.omit(
+                trace::Meta::new(trace::Kind::CaptureBoundary, trace::Phase::BootConstructed, 1),
+                trace::Omission::ReadError,
+            ).map_err(|_| EINVAL)?;
+        }
+        Ok(KBox::new(Self {
+            arena, used: 0, phase_sequence: 1, prepared: false, job_stamp: 0,
+        }, GFP_KERNEL)?)
+    }
+
+    pub(crate) fn len(&self) -> usize { self.used }
+}
+
+#[cfg(all(not(test), CONFIG_DEV_COREDUMP))]
+impl kernel::devcoredump::DevCoreDump for G17PTraceDump {
+    fn read(&self, output: &mut [u8], offset: usize) -> Result<usize> {
+        // No caller is allowed to expose an in-progress archive.
+        if self.used == 0 { return Err(EINVAL); }
+        trace::read_sealed_prefix(&self.arena[..self.used], output, offset).map_err(|_| EINVAL)
+    }
 }
 
 /// One record a steady-state submission publishes into the item ring.
@@ -1266,14 +1317,27 @@ impl G17PManagerConstruction {
         validate_target(target_observation(soc)).map_err(|_| EINVAL)?;
         validate_platform(platform).map_err(|_| EINVAL)?;
 
-        let resources = g17_resources::G17ResourceOwner::new_with_uat(dev, uat)?;
+        let mut resources = g17_resources::G17ResourceOwner::new_with_uat(dev, uat)?;
         g17_resources::validate_handoff(resources.handoff()).map_err(|_| EINVAL)?;
         validate_resources(resource_observation(resources.handoff(), resources.uat()))
             .map_err(|_| EINVAL)?;
 
+        #[cfg(CONFIG_DEV_COREDUMP)]
+        let trace_capture = match G17PTraceDump::new(&mut resources) {
+            Ok(capture) => Some(capture),
+            Err(error) => {
+                // Evidence collection must not turn memory pressure into a
+                // GPU execution failure. This absence is explicit in the log.
+                dev_warn!(dev.as_ref(), "G17P binary capture unavailable: {:?}\n", error);
+                None
+            }
+        };
+
         Ok(KBox::new(
             Self {
                 resources,
+                #[cfg(CONFIG_DEV_COREDUMP)]
+                trace_capture,
                 platform,
                 num_clusters,
                 gpc_perf_state_map,
@@ -1302,6 +1366,77 @@ impl G17PManagerConstruction {
             },
             GFP_KERNEL,
         )?)
+    }
+
+    /// Large prepared-source observation before FList and outer publication.
+    /// Diagnostic modes which expose an outer early receive an explicit
+    /// omission instead of a misleading or timing-invasive "before" snapshot.
+    pub(crate) fn capture_prepared_render_trace(&mut self, outers_deferred: bool) -> Result {
+        #[cfg(CONFIG_DEV_COREDUMP)]
+        {
+            let Some(capture) = self.trace_capture.as_mut() else { return Ok(()); };
+            if capture.prepared { return Ok(()); }
+            capture.prepared = true;
+            capture.job_stamp = self.render_sksm.as_ref()
+                .map_or(0, |queues| queues.fragment.producer.last_add_kicks_timestamp);
+            self.capture_render_trace_observation(trace::Phase::PreparedBeforeFList, outers_deferred)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(CONFIG_DEV_COREDUMP)]
+    fn capture_render_trace_observation(&mut self, phase: trace::Phase, safe: bool) -> Result {
+        let Some(capture) = self.trace_capture.as_mut() else { return Ok(()); };
+        capture.phase_sequence += 1;
+        let sequence = capture.phase_sequence;
+        let stamp = capture.job_stamp;
+        let mut archive = TraceArchive::resume(&mut capture.arena).map_err(|_| EINVAL)?;
+        let mut boundary = trace::Meta::new(trace::Kind::CaptureBoundary, phase, sequence);
+        boundary.job_stamp = stamp;
+        if !safe {
+            archive.omit(boundary, trace::Omission::NotImplemented).map_err(|_| EINVAL)?;
+            return Ok(());
+        }
+        let mut clock = || Monotonic::ktime_get() as u64;
+        if self.resources.capture_owned_trace(&mut archive, phase, sequence, &mut clock).is_err() {
+            archive.omit(boundary, trace::Omission::ReadError).map_err(|_| EINVAL)?;
+        }
+        match self.render_storage.as_mut() {
+            Some(storage) => {
+                if storage.capture_owned_trace(&mut archive, phase, sequence, stamp, &mut clock).is_err() {
+                    boundary.instance = 1;
+                    archive.omit(boundary, trace::Omission::ReadError).map_err(|_| EINVAL)?;
+                }
+            }
+            None => {
+                boundary.instance = 1;
+                archive.omit(boundary, trace::Omission::Unavailable).map_err(|_| EINVAL)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Only call after paired completion (before FList release), or after the
+    /// state-1 recovery handshake has been validated (before ACK). A timeout
+    /// alone is not permission to label a running GPU's memory "halted".
+    #[cfg(CONFIG_DEV_COREDUMP)]
+    pub(crate) fn finish_render_trace(
+        &mut self, phase: trace::Phase,
+    ) -> Result<Option<KBox<G17PTraceDump>>> {
+        if !matches!(phase, trace::Phase::AfterPairRetirement | trace::Phase::RecoveryBeforeAck) {
+            return Err(EINVAL);
+        }
+        if !self.trace_capture.as_ref().is_some_and(|capture| capture.prepared) {
+            return Ok(None);
+        }
+        self.capture_render_trace_observation(phase, true)?;
+        let mut capture = self.trace_capture.take().ok_or(EINVAL)?;
+        let mut archive = TraceArchive::resume(&mut capture.arena).map_err(|_| EINVAL)?;
+        archive.seal();
+        let used = archive.bytes().len();
+        drop(archive);
+        capture.used = used;
+        Ok(Some(capture))
     }
 
     pub(crate) fn config(&self) -> &'static T8140ManagerConfig {
