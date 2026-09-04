@@ -10808,10 +10808,11 @@ impl G17ResourceOwner {
     ///
     /// Printing is filtered to the submission-path codes (plus the ungated
     /// records-lost marker) unless `verbose`, and capped at `print_budget`
-    /// lines per call (0: unlimited). Native DM progress-monitor records have
-    /// a separate 64-record allowance with explicit drop accounting, so a
-    /// full ordinary budget cannot silently hide the state transition.
-    /// Records over either budget are still consumed.
+    /// lines per call (0: unlimited). Submission class0 and native DM
+    /// progress-monitor records each have a separate 64-record allowance
+    /// with explicit drop accounting, so ordinary verbose chatter cannot
+    /// silently hide completion or monitor transitions. Records over every
+    /// print budget are still consumed.
     pub(crate) fn drain_ktrace_ring(
         &mut self,
         role: InstanceRole,
@@ -10944,11 +10945,15 @@ impl G17ResourceOwner {
                 stats.printed = stats.printed.saturating_add(1);
             }
         }
-        if printing.monitor_printed != 0 || printing.monitor_dropped != 0 {
+        if printing.monitor_printed != 0 || printing.monitor_dropped != 0
+            || printing.submission_printed != 0 || printing.submission_dropped != 0
+        {
             dev_info!(
                 self.dev().as_ref(),
-                "G17P ktrace[{}] monitor-print-budget printed={} dropped={} limit=64 ordinary-printed={}\n",
+                "G17P ktrace[{}] print-budgets class0-printed={} class0-dropped={} monitor-printed={} monitor-dropped={} per-class-limit=64 ordinary-printed={}\n",
                 role_name,
+                printing.submission_printed,
+                printing.submission_dropped,
                 printing.monitor_printed,
                 printing.monitor_dropped,
                 printing.ordinary_printed,

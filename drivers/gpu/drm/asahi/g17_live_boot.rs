@@ -351,11 +351,13 @@ fn probe_g17p_ktrace(
         match manager.drain_ktrace_ring(role, verbose, budget) {
             Ok(stats) => dev_info!(
                 dev,
-                "G17P ktrace armed check checkpoint={} role={} producer={} consumed={} printed={} skipped={} lost={}/{} addkicks={} pause-mask={:#x}\n",
+                "G17P ktrace armed check checkpoint={} role={} producer-snapshot={} consumed-count={} consumer-before={} consumer-after={} printed={} skipped={} lost={}/{} addkicks={} pause-mask={:#x}\n",
                 checkpoint,
                 role_name,
                 stats.producer,
                 stats.consumed,
+                stats.consumer_before,
+                (stats.consumer_before + stats.consumed) % g17_completion::G17P_KTRACE_CAPACITY,
                 stats.printed,
                 stats.skipped,
                 stats.lost_records,
@@ -554,6 +556,60 @@ fn log_g17p_fault_report(
             checkpoint,
             error,
         ),
+    }
+}
+
+/// A narrowly scoped, already-halted slot discriminator. Failure to observe
+/// it must never prevent the host acknowledgement that resumes recovery.
+fn log_g17p_halted_dm1_slot0(
+    dev: &kernel::device::Device,
+    manager: &mut g17_manager::G17PManagerConstruction,
+    registers: Option<&regs::Resources>,
+    expected_epoch: u64,
+) {
+    let Some(registers) = registers else { return };
+    let selected = match (
+        manager.firmware_recovery_handshake_snapshot(),
+        manager.firmware_fault_report_snapshot(),
+    ) {
+        (Ok(handshake), Ok(report)) => {
+            g17_completion::G17PHaltedSlot0Gate {
+                handshake_state: handshake.state,
+                epoch: handshake.epoch,
+                expected_epoch,
+                report_state: report.state,
+                host_requested: report.host_requested,
+                slot_present: report.slot_present,
+                slot: report.slot,
+                data_master_present: report.data_master_present,
+                data_master: report.data_master,
+            }.allows_sample()
+        }
+        _ => false,
+    };
+    if !selected {
+        return;
+    }
+    match registers.g17p_halted_slot0_snapshot() {
+        Ok(Some(snapshot)) => {
+            let stable = snapshot.state_before == snapshot.state_after;
+            dev_info!(
+                dev,
+                "G17P halted DM1 slot0 epoch={} gpc={:#x} c020-before={:#018x} c078={:#018x} c020-after={:#018x} stable={} progress-selector={} selector={} key-qid={} key-stamp={:#x}\n",
+                expected_epoch,
+                snapshot.gpc_state,
+                snapshot.state_before,
+                snapshot.key,
+                snapshot.state_after,
+                stable,
+                g17_completion::g17p_slot_has_progress_selector(snapshot.state_before),
+                (snapshot.state_before >> 24) & 3,
+                (snapshot.key >> 40) & 0x7f,
+                snapshot.key & 0xff_ffff_ffff,
+            );
+        }
+        Ok(None) => dev_info!(dev, "G17P halted DM1 slot0: GPC off; no low-SGX access\n"),
+        Err(error) => dev_warn!(dev, "G17P halted DM1 slot0: read failed ({:?}); continuing recovery\n", error),
     }
 }
 
@@ -861,6 +917,7 @@ fn complete_primary_real_recovery(
     // firmware is halted at state 1, before the host's 1 -> 2 acknowledge.
     // Match that exact window below, guarded by the always-on GPC state.
     log_g17p_fault_report(pdev.as_ref(), manager, "recovery-blamed-cause");
+    log_g17p_halted_dm1_slot0(pdev.as_ref(), manager, registers, handshake.epoch);
     let cause = manager.primary_firmware_recovery_cause_snapshot()?;
     dev_info!(
         pdev.as_ref(),

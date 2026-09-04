@@ -183,6 +183,34 @@ pub(crate) const G17P_KTRACE_ADD_KICKS_KEY: u16 = 0x0041;
 /// `(set?, reason_bit, resulting_mask)`.
 pub(crate) const G17P_KTRACE_PAUSE_REASON_KEY: u16 = 0x0046;
 
+/// B1's DM progress sampler only selects registers for this exact c020
+/// predicate. A zero result must not be called an idle shader or completion.
+pub(crate) const fn g17p_slot_has_progress_selector(state: u64) -> bool {
+    state & 1 != 0 && state & 0x3c == 0x0c && (state >> 24) & 3 != 0
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PHaltedSlot0Gate {
+    pub(crate) handshake_state: u32,
+    pub(crate) epoch: u64,
+    pub(crate) expected_epoch: u64,
+    pub(crate) report_state: u32,
+    pub(crate) host_requested: u32,
+    pub(crate) slot_present: u32,
+    pub(crate) slot: u32,
+    pub(crate) data_master_present: u32,
+    pub(crate) data_master: u32,
+}
+
+impl G17PHaltedSlot0Gate {
+    pub(crate) const fn allows_sample(self) -> bool {
+        self.handshake_state == 1 && self.epoch == self.expected_epoch
+            && self.report_state == 2 && self.host_requested == 0
+            && self.slot_present == 1 && self.slot == 0
+            && self.data_master_present == 1 && self.data_master == 1
+    }
+}
+
 /// Submission-path keys printed by default (`channel << 8 | code`).
 pub(crate) const G17P_KTRACE_INTEREST_KEYS: [u16; 20] = [
     // Code 0x02 is emitted by the new-work IRQ handler (b1 `FUN_23004` at
@@ -227,7 +255,8 @@ pub(crate) const G17P_KTRACE_INTEREST_KEYS: [u16; 20] = [
 ];
 
 pub(crate) fn g17p_ktrace_key_is_interesting(key: u16) -> bool {
-    G17P_KTRACE_INTEREST_KEYS.contains(&key) || g17p_ktrace_key_is_dm_monitor(key)
+    key < 0x100 || G17P_KTRACE_INTEREST_KEYS.contains(&key)
+        || g17p_ktrace_key_is_dm_monitor(key)
 }
 
 /// Native B1 progress-monitor records: sample threshold (class1), then
@@ -241,6 +270,8 @@ pub(crate) const fn g17p_ktrace_key_is_dm_monitor(key: u16) -> bool {
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
 pub(crate) struct G17PKtracePrintBudget {
     pub(crate) ordinary_printed: u32,
+    pub(crate) submission_printed: u32,
+    pub(crate) submission_dropped: u32,
     pub(crate) monitor_printed: u32,
     pub(crate) monitor_dropped: u32,
 }
@@ -253,6 +284,14 @@ impl G17PKtracePrintBudget {
                 return false;
             }
             self.monitor_printed += 1;
+            return true;
+        }
+        if key < 0x100 {
+            if self.submission_printed >= 64 {
+                self.submission_dropped = self.submission_dropped.saturating_add(1);
+                return false;
+            }
+            self.submission_printed += 1;
             return true;
         }
         if key == G17P_KTRACE_LOST_KEY
@@ -1281,12 +1320,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn halted_slot_gate_rejects_every_wrong_state_or_identity() {
+        let valid = G17PHaltedSlot0Gate {
+            handshake_state: 1, epoch: 7, expected_epoch: 7,
+            report_state: 2, host_requested: 0, slot_present: 1, slot: 0,
+            data_master_present: 1, data_master: 1,
+        };
+        assert!(valid.allows_sample());
+        for wrong in [
+            G17PHaltedSlot0Gate { handshake_state: 0, ..valid },
+            G17PHaltedSlot0Gate { handshake_state: 2, ..valid },
+            G17PHaltedSlot0Gate { epoch: 8, ..valid },
+            G17PHaltedSlot0Gate { report_state: 0, ..valid },
+            G17PHaltedSlot0Gate { host_requested: 1, ..valid },
+            G17PHaltedSlot0Gate { slot_present: 0, ..valid },
+            G17PHaltedSlot0Gate { slot: 1, ..valid },
+            G17PHaltedSlot0Gate { data_master_present: 0, ..valid },
+            G17PHaltedSlot0Gate { data_master: 0, ..valid },
+            G17PHaltedSlot0Gate { data_master: 2, ..valid },
+        ] {
+            assert!(!wrong.allows_sample());
+        }
+    }
+
+    #[test]
+    fn slot_progress_selection_matches_b1_c020_predicate() {
+        assert!(!g17p_slot_has_progress_selector(0));
+        assert!(!g17p_slot_has_progress_selector(0x0d));
+        for selector in 1..=3u64 {
+            let active = (selector << 24) | 0x0d;
+            assert!(g17p_slot_has_progress_selector(active));
+            assert!(!g17p_slot_has_progress_selector(active & !1));
+            assert!(!g17p_slot_has_progress_selector((selector << 24) | 0x19));
+        }
+    }
+
+    #[test]
     fn ktrace_monitor_keys_have_an_independent_bounded_print_budget() {
         let mut budget = G17PKtracePrintBudget::default();
         for _ in 0..32 {
-            assert!(budget.allow(0x0041, 32));
+            assert!(budget.allow(0x0101, 32));
         }
-        assert!(!budget.allow(0x0041, 32));
+        assert!(!budget.allow(0x0101, 32));
         for key in [0x0110, 0x0900, 0x0901, 0x0902, 0x0903, 0x0904, 0x0909] {
             assert!(g17p_ktrace_key_is_interesting(key));
             assert!(budget.allow(key, 32));
@@ -1307,9 +1382,30 @@ mod tests {
     fn ktrace_monitor_prints_do_not_spend_the_ordinary_allowance() {
         let mut budget = G17PKtracePrintBudget::default();
         assert!(budget.allow(0x0903, 1));
-        assert!(budget.allow(0x0041, 1));
-        assert!(!budget.allow(0x0041, 1));
-        assert!(budget.allow(0x0041, 0));
+        assert!(budget.allow(0x0101, 1));
+        assert!(!budget.allow(0x0101, 1));
+        assert!(budget.allow(0x0101, 0));
+    }
+
+    #[test]
+    fn ktrace_class0_is_not_buried_by_verbose_or_monitor_records() {
+        let mut budget = G17PKtracePrintBudget::default();
+        for _ in 0..32 {
+            assert!(budget.allow(0x0101, 32));
+        }
+        for _ in 0..64 {
+            assert!(budget.allow(0x0900, 32));
+        }
+        for key in [0x002a, 0x002b, 0x0028, 0x0043, 0x0048, 0x0056] {
+            assert!(g17p_ktrace_key_is_interesting(key));
+            assert!(budget.allow(key, 32));
+        }
+        for _ in budget.submission_printed..64 {
+            assert!(budget.allow(0x0041, 32));
+        }
+        assert!(!budget.allow(0x0043, 32));
+        assert_eq!(budget.submission_dropped, 1);
+        assert!(budget.allow(G17P_KTRACE_LOST_KEY, 32));
     }
 
     // J700 hardware capture from

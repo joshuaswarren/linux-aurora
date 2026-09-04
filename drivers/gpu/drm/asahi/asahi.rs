@@ -131,7 +131,7 @@ kernel::module_platform_driver! {
         },
         g17p_fw_ktrace_budget: u32 {
             default: 32,
-            description: "Maximum KTrace records printed per drain pass (0: unlimited). Records over budget are still consumed and acknowledged.",
+            description: "Maximum other verbose KTrace records printed per drain pass (0: unlimited). Submission class0 and native monitor keys each have an independent64-record allowance and explicit drop counts. Records over every print budget are still consumed and acknowledged.",
         },
         g17p_flushid_fix: u32 {
             default: 0,
