@@ -164,6 +164,24 @@ fn g17p_native_fragment_first_mode(mode: u32) -> bool {
     mode == 2 || mode == 3
 }
 
+fn g17p_render_deferred_outer_mode(
+    native_doorbell_mode: u32,
+    split_launch: bool,
+) -> g17_resources::G17PDeferredOuterPublication {
+    if split_launch {
+        // The TA group is complete, but the USC FList control notification
+        // can wake it before the intended initial doorbell. Retain both here;
+        // split launch publishes only TA after the FList transaction retires.
+        g17_resources::G17PDeferredOuterPublication::Both
+    } else if g17p_native_fragment_first_mode(native_doorbell_mode) {
+        g17_resources::G17PDeferredOuterPublication::Tiling
+    } else if native_doorbell_mode == 0 {
+        g17_resources::G17PDeferredOuterPublication::Both
+    } else {
+        g17_resources::G17PDeferredOuterPublication::None
+    }
+}
+
 fn g17p_native_fragment_preack_mode(mode: u32) -> bool {
     mode == 3
 }
@@ -3107,13 +3125,7 @@ impl G17PManagerConstruction {
             .publish_partial_opening_pair(
                 if retained { None } else { Some(vm) },
                 retained,
-                if split_launch {
-                    g17_resources::G17PDeferredOuterPublication::Fragment
-                } else if g17p_native_fragment_first_mode(native_doorbell_mode) {
-                    g17_resources::G17PDeferredOuterPublication::Tiling
-                } else {
-                    g17_resources::G17PDeferredOuterPublication::None
-                },
+                g17p_render_deferred_outer_mode(native_doorbell_mode, split_launch),
                 fragment_queue,
                 published_prefix,
                 tiling_queue,
@@ -3230,6 +3242,42 @@ impl G17PManagerConstruction {
             fragment_prefix: published_prefix,
         });
         Ok(prepared)
+    }
+
+    /// Expose the complete default-profile render pair after the USC FList
+    /// update/grow has retired and before the one paired work doorbell.
+    pub(crate) fn publish_default_render_pair_after_freelist(
+        &mut self,
+        prepared: &g17_submission::PreparedG17PPartialOpeningWorkPair,
+    ) -> Result {
+        if *crate::module_parameters::g17p_render_native_doorbells.value() != 0
+            || *crate::module_parameters::g17p_render_split_launch.value() != 0
+            || self.render_tracker.is_none()
+            || self.render_storage.is_none()
+            || self.render_bind.is_none()
+        {
+            return Err(EINVAL);
+        }
+        self.resources.publish_deferred_partial_opening_pair(prepared)
+    }
+
+    /// Split launch's initial phase: expose only the complete TA outer slot
+    /// after the same first-submit FList transaction has retired. The fragment
+    /// prefix stays hidden until TA completion publishes its SKSM/AddKicks and
+    /// matching deferred outer slot as one later transaction.
+    pub(crate) fn publish_split_render_tiling_after_freelist(
+        &mut self,
+        plan: &g17_submission::G17PPartialOpeningOuterSlotPlan,
+    ) -> Result {
+        if *crate::module_parameters::g17p_render_native_doorbells.value() != 0
+            || *crate::module_parameters::g17p_render_split_launch.value() == 0
+            || self.render_tracker.is_none()
+            || self.render_storage.is_none()
+            || self.render_bind.is_none()
+        {
+            return Err(EINVAL);
+        }
+        self.resources.publish_deferred_partial_opening_tiling(plan)
     }
 
     /// DRAM-only status-page sample; safe at any point, timeout included.
@@ -6264,6 +6312,19 @@ mod tests {
         assert!(g17p_native_fragment_outer_consumed([1, 0, 1], 1));
         assert!(g17p_native_fragment_outer_consumed([1, 1, 1], 1));
         assert!(!g17p_native_fragment_outer_consumed([1, 1, 2], 1));
+    }
+
+    #[test]
+    fn render_outer_deferral_mode_matrix_is_explicit() {
+        use g17_resources::G17PDeferredOuterPublication::{Both, None, Tiling};
+
+        assert_eq!(g17p_render_deferred_outer_mode(0, false), Both);
+        assert_eq!(g17p_render_deferred_outer_mode(1, false), None);
+        assert_eq!(g17p_render_deferred_outer_mode(2, false), Tiling);
+        assert_eq!(g17p_render_deferred_outer_mode(3, false), Tiling);
+        for mode in 0..=3 {
+            assert_eq!(g17p_render_deferred_outer_mode(mode, true), Both);
+        }
     }
 
     #[test]
