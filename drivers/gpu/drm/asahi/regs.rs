@@ -332,6 +332,14 @@ pub(crate) struct G17PFaultIrqSnapshot {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PHaltedSlot0Snapshot {
+    pub(crate) gpc_state: u32,
+    pub(crate) state_before: u64,
+    pub(crate) key: u64,
+    pub(crate) state_after: u64,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct G17PRenderKsmAdmissionSnapshot {
     pub(crate) gpc_state: u32,
     pub(crate) pdm_qid0_state: u64,
@@ -1096,6 +1104,33 @@ impl Resources {
         // opaque values for 0x21028 and hid the TA -> 3D dependency frontier.
         sgx.try_write64(tag, 0x4090)?;
         sgx.try_read64(0x4098)
+    }
+
+    /// Caller must own the runtime mutex and have just verified the firmware
+    /// is stopped at the pre-ACK recovery handshake with DM1 slot0 blamed.
+    /// This is not an admission probe and must never run before that halt.
+    pub(crate) fn g17p_halted_slot0_snapshot(&self) -> Result<Option<G17PHaltedSlot0Snapshot>> {
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let _guard = self.sksm_fifo.lock();
+        // The GPC summary is in the always-on range. A halted firmware need
+        // not imply powered graphics cores; skip all low-SGX access if off.
+        let gpc_state = sgx.try_read32(T8140_HOST_IRQ_SUMMARY)? & 0xf;
+        if gpc_state == 0 {
+            return Ok(None);
+        }
+        // B1 FUN_6a20 uses the bit42 namespace for c020, but not c078.
+        // Index 0 is a hardware SLOT, never the fragment's physical QID.
+        // The host port at4090 is distinct from B1's seven thread ports
+        // (4080,40a0,40b0,40c0,40d0,40e0,40f0; table45c78).
+        let state_before = Self::g17p_sksm_port_read_locked(&sgx, 0xc020, 0, 1u64 << 42)?;
+        let key = Self::g17p_sksm_port_read_locked(&sgx, 0xc078, 0, 0)?;
+        let state_after = Self::g17p_sksm_port_read_locked(&sgx, 0xc020, 0, 1u64 << 42)?;
+        Ok(Some(G17PHaltedSlot0Snapshot {
+            gpc_state,
+            state_before,
+            key,
+            state_after,
+        }))
     }
 
     /// Take the hardware snapshot the G17P firmware uses when diagnosing a
