@@ -1912,6 +1912,7 @@ pub(crate) fn apply_g17p_cold_opening_descriptor_overrides(
             (0x38, 0x47),
             (0x3a, 0x49),
             (0x3c, 0x49),
+            (0x0789, 0x08),
             (0x093e, 0xd0),
             (0x093f, 0x91),
         ],
