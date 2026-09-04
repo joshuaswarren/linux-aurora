@@ -509,9 +509,9 @@ fn log_g17p_fault_report(
     manager: &mut g17_manager::G17PManagerConstruction,
     checkpoint: &'static str,
 ) {
-    if *module_parameters::g17p_fault_report.value() == 0 {
-        return;
-    }
+    // This report is validated host-owned WC memory, not the diagnostic MMIO
+    // fault bank. Keep it available with register probing disabled, especially
+    // before recovery acknowledgement clears the firmware's blame fields.
     match manager.firmware_fault_report_snapshot() {
         Ok(snapshot) => dev_info!(
             dev,
