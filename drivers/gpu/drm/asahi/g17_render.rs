@@ -1111,6 +1111,10 @@ pub(crate) fn build_ta_descriptor(
     put_u64(raw, 0x087a, parameters.sampler_array);
     put_u32(raw, 0x0882, parameters.sampler_count);
     put_u32(raw, 0x0886, sampler_max);
+    // Present in 436/438 valid G17P TA records, including both exact 32x32
+    // geometry matches. This belongs to the TA output/activation tail; leaving
+    // it zero is a structural mismatch before the linked 3D job is generated.
+    put_u32(raw, 0x0892, 1);
     put_u8(raw, 0x0932, 0x44);
     put_u8(raw, 0x093c, 1);
     put_u8(raw, 0x094d, if parameters.native_pm_bytes { 3 } else { 1 });
@@ -2037,6 +2041,7 @@ mod tests {
 
         assert_eq!(&tiling[0x38..0x3e], &[0x47, 0, 0x49, 0, 0x49, 0]);
         assert_eq!(tiling[0x789], 0x08);
+        assert_eq!(get_u32(&tiling, 0x892), 1);
         assert_eq!(&tiling[0x93e..0x940], &[0xd0, 0x91]);
 
         assert_eq!(get_u32(&fragment, 0x50), 1);
