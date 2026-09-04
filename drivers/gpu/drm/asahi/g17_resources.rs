@@ -6661,13 +6661,16 @@ impl G17PUserRenderStorage {
                     false,
                 ),
             ),
+            // Native's high SKSM entry view is firmware-only.  This guard
+            // proves the PTE range exists; GPU read/write permission belongs
+            // only to the low alias below.
             (
                 "ta-context-high-mapped",
                 uat.kernel_vm().covers_range(
                     G17P_BOOTSTRAP_TA_CONTEXT_HIGH_VA,
                     G17P_BOOTSTRAP_CONTEXT_PEER_SIZE as u64,
-                    true,
-                    true,
+                    false,
+                    false,
                 ),
             ),
             (
@@ -6681,13 +6684,15 @@ impl G17PUserRenderStorage {
                         false,
                     ),
             ),
+            // Same split permissions as the tiling queue: firmware consumes
+            // the high alias and hardware reaches the low GPU-RW alias.
             (
                 "3d-context-high-mapped",
                 uat.kernel_vm().covers_range(
                     G17P_BOOTSTRAP_3D_CONTEXT_HIGH_VA,
                     G17P_BOOTSTRAP_CONTEXT_PEER_SIZE as u64,
-                    true,
-                    true,
+                    false,
+                    false,
                 ),
             ),
             (
@@ -8215,7 +8220,7 @@ impl G17ResourceOwner {
             "bootstrap TA context peer",
             G17P_BOOTSTRAP_TA_CONTEXT_HIGH_VA,
             G17P_BOOTSTRAP_CONTEXT_PEER_SIZE,
-            mmu::PROT_GPU_FW_SHARED_RW,
+            mmu::PROT_FW_SHARED_RW,
         )?;
         let bootstrap_3d_context_peer = map_fixed_wc_object(
             dev,
@@ -8223,7 +8228,7 @@ impl G17ResourceOwner {
             "bootstrap 3D context peer",
             G17P_BOOTSTRAP_3D_CONTEXT_HIGH_VA,
             G17P_BOOTSTRAP_CONTEXT_PEER_SIZE,
-            mmu::PROT_GPU_FW_SHARED_RW,
+            mmu::PROT_FW_SHARED_RW,
         )?;
         dev_info!(
             dev.as_ref(),
