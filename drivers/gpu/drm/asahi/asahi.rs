@@ -122,8 +122,8 @@ kernel::module_platform_driver! {
             description: "Enable the GPU firmware log ring (main_config+0x250)",
         },
         g17p_fw_trace: u32 {
-            default: 1,
-            description: "Firmware trace class mask written to status_a+0x00 on BOTH roles before the initdata doorbell. Bit N enables trace channel N; bit 0 carries the whole KSM submission path. Non-zero also enables the KTrace drain (arming without draining makes the firmware busy-wait ~3ms once and then drop records). Default 1 while G17P graphics bring-up needs the launch/callback trace; 0 disables it.",
+            default: 0x203,
+            description: "Firmware trace class mask written to status_a+0x00 on BOTH roles before the initdata doorbell. Bit N enables trace channel N. Default 0x203 enables submission class0 and native progress-monitor classes1/9 during G17P bring-up. Non-zero also enables the KTrace drain (arming without draining makes the firmware busy-wait ~3ms once and then drop records); 0 disables it.",
         },
         g17p_fw_ktrace_verbose: u32 {
             default: 1,

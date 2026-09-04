@@ -227,7 +227,43 @@ pub(crate) const G17P_KTRACE_INTEREST_KEYS: [u16; 20] = [
 ];
 
 pub(crate) fn g17p_ktrace_key_is_interesting(key: u16) -> bool {
-    G17P_KTRACE_INTEREST_KEYS.contains(&key)
+    G17P_KTRACE_INTEREST_KEYS.contains(&key) || g17p_ktrace_key_is_dm_monitor(key)
+}
+
+/// Native B1 progress-monitor records: sample threshold (class1), then
+/// elapsed time, state changes and recovery scan decisions (class9).
+pub(crate) const fn g17p_ktrace_key_is_dm_monitor(key: u16) -> bool {
+    matches!(key, 0x0110 | 0x0900..=0x0909)
+}
+
+/// A separate bounded allowance keeps monitor evidence independent of a
+/// full ordinary print budget. Ring acknowledgement is never budget-gated.
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+pub(crate) struct G17PKtracePrintBudget {
+    pub(crate) ordinary_printed: u32,
+    pub(crate) monitor_printed: u32,
+    pub(crate) monitor_dropped: u32,
+}
+
+impl G17PKtracePrintBudget {
+    pub(crate) fn allow(&mut self, key: u16, ordinary_limit: u32) -> bool {
+        if g17p_ktrace_key_is_dm_monitor(key) {
+            if self.monitor_printed >= 64 {
+                self.monitor_dropped = self.monitor_dropped.saturating_add(1);
+                return false;
+            }
+            self.monitor_printed += 1;
+            return true;
+        }
+        if key == G17P_KTRACE_LOST_KEY
+            || ordinary_limit == 0
+            || self.ordinary_printed < ordinary_limit
+        {
+            self.ordinary_printed = self.ordinary_printed.saturating_add(1);
+            return true;
+        }
+        false
+    }
 }
 
 /// Short human tail naming the argument shape of the fixed-shape records.
@@ -241,6 +277,13 @@ pub(crate) const fn g17p_ktrace_key_name(key: u16) -> &'static str {
         0x000a | 0x000c | 0x000e => "stamp-update value/index/uuid/ctx",
         0x0020 => "devctl-retired",
         0x011c => "RECORDS-LOST count/window",
+        0x0110 => "monitor-sample dm/slot/threshold",
+        0x0900 => "monitor-time delta/now/last-completion-drain (ticks/24)",
+        0x0901 => "monitor-classify state1",
+        0x0902 => "monitor-classify state2",
+        0x0903 => "monitor-state-change dm/slot/state",
+        0x0904 => "monitor-key-changed dm/slot/previous-key",
+        0x0909 => "monitor-recovery-scan total/state1/state2/raw-flags",
         _ => "",
     }
 }
@@ -1236,6 +1279,38 @@ pub(crate) fn observe_paired_render_completion(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ktrace_monitor_keys_have_an_independent_bounded_print_budget() {
+        let mut budget = G17PKtracePrintBudget::default();
+        for _ in 0..32 {
+            assert!(budget.allow(0x0041, 32));
+        }
+        assert!(!budget.allow(0x0041, 32));
+        for key in [0x0110, 0x0900, 0x0901, 0x0902, 0x0903, 0x0904, 0x0909] {
+            assert!(g17p_ktrace_key_is_interesting(key));
+            assert!(budget.allow(key, 32));
+        }
+        for _ in budget.monitor_printed..64 {
+            assert!(budget.allow(0x0900, 32));
+        }
+        assert!(!budget.allow(0x0903, 32));
+        assert_eq!(budget.monitor_printed, 64);
+        assert_eq!(budget.monitor_dropped, 1);
+        assert_eq!(budget.ordinary_printed, 32);
+        assert!(budget.allow(G17P_KTRACE_LOST_KEY, 32));
+        assert!(!g17p_ktrace_key_is_dm_monitor(0x010f));
+        assert!(!g17p_ktrace_key_is_dm_monitor(0x090a));
+    }
+
+    #[test]
+    fn ktrace_monitor_prints_do_not_spend_the_ordinary_allowance() {
+        let mut budget = G17PKtracePrintBudget::default();
+        assert!(budget.allow(0x0903, 1));
+        assert!(budget.allow(0x0041, 1));
+        assert!(!budget.allow(0x0041, 1));
+        assert!(budget.allow(0x0041, 0));
+    }
 
     // J700 hardware capture from
     // neo-bringup/logs/20260827-g17p-compact-contract-queue-live12/run.log.
