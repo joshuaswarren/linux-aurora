@@ -189,6 +189,27 @@ pub(crate) const fn g17p_slot_has_progress_selector(state: u64) -> bool {
     state & 1 != 0 && state & 0x3c == 0x0c && (state >> 24) & 3 != 0
 }
 
+/// Exact DM1 sample ranges in B1 tables45580/4558c. The second tuple member
+/// is the extended read namespace, not a value to write to a PDM selector.
+pub(crate) const G17P_DM1_MONITOR_READS: [(u64, u64); 8] = [
+    (0x1668, 0),
+    (0x13020, (1u64 << 42) | (2u64 << 40)),
+    (0x15150, (1u64 << 42) | (2u64 << 40)),
+    (0x15388, (1u64 << 42) | (2u64 << 40)),
+    (0x15390, (1u64 << 42) | (2u64 << 40)),
+    (0x15510, (1u64 << 42) | (2u64 << 40)),
+    (0x15518, (1u64 << 42) | (2u64 << 40)),
+    (0xa068, (1u64 << 42) | (1u64 << 40)),
+];
+
+pub(crate) const fn g17p_dm1_monitor_selector_index(state: u64) -> Option<u64> {
+    if g17p_slot_has_progress_selector(state) {
+        Some(((state >> 24) & 3) - 1)
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct G17PHaltedSlot0Gate {
     pub(crate) handshake_state: u32,
@@ -200,6 +221,20 @@ pub(crate) struct G17PHaltedSlot0Gate {
     pub(crate) slot: u32,
     pub(crate) data_master_present: u32,
     pub(crate) data_master: u32,
+}
+
+/// A reason-3 report is independent of the copied hardware-slot mask. B1
+/// selects its first valid GMMU requestor before the state-1 host handshake.
+pub(crate) const fn g17p_halted_gmmu_sample_allowed(
+    handshake_state: u32,
+    epoch: u64,
+    expected_epoch: u64,
+    report_state: u32,
+    host_requested: u32,
+    reason: u32,
+) -> bool {
+    handshake_state == 1 && epoch == expected_epoch && report_state == 2
+        && host_requested == 0 && reason == 3
 }
 
 impl G17PHaltedSlot0Gate {
@@ -1318,6 +1353,36 @@ pub(crate) fn observe_paired_render_completion(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn halted_gmmu_gate_requires_current_nonhost_reason3_report() {
+        assert!(g17p_halted_gmmu_sample_allowed(1, 7, 7, 2, 0, 3));
+        for (state, epoch, expected, report, host, reason) in [
+            (0, 7, 7, 2, 0, 3), (2, 7, 7, 2, 0, 3),
+            (1, 8, 7, 2, 0, 3), (1, 7, 8, 2, 0, 3),
+            (1, 7, 7, 0, 0, 3), (1, 7, 7, 2, 1, 3),
+            (1, 7, 7, 2, 0, 0), (1, 7, 7, 2, 0, 4),
+        ] {
+            assert!(!g17p_halted_gmmu_sample_allowed(state, epoch, expected, report, host, reason));
+        }
+    }
+
+    #[test]
+    fn dm1_monitor_reads_match_native_tables_and_selector_index() {
+        assert_eq!(g17p_dm1_monitor_selector_index(0x0302_000d), Some(2));
+        assert_eq!(g17p_dm1_monitor_selector_index(0), None);
+        assert_eq!(g17p_dm1_monitor_selector_index(0x0002_000d), None);
+        let registers: Vec<_> = G17P_DM1_MONITOR_READS.iter().map(|entry| entry.0).collect();
+        assert_eq!(registers, [0x1668, 0x13020, 0x15150, 0x15388, 0x15390, 0x15510, 0x15518, 0xa068]);
+        assert_eq!(G17P_DM1_MONITOR_READS[0].1, 0);
+        assert!(G17P_DM1_MONITOR_READS[1..7].iter().all(|entry| entry.1 == 0x600_0000_0000));
+        assert_eq!(G17P_DM1_MONITOR_READS[7].1, 0x500_0000_0000);
+        let tags: Vec<_> = G17P_DM1_MONITOR_READS.iter()
+            .map(|(register, flags)| register | flags | (2u64 << 43)).collect();
+        assert_eq!(tags[0], 0x1000_0000_1668);
+        assert_eq!(tags[1], 0x1600_0001_3020);
+        assert_eq!(tags[7], 0x1500_0000_a068);
+    }
 
     #[test]
     fn halted_slot_gate_rejects_every_wrong_state_or_identity() {

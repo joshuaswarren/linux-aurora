@@ -607,9 +607,74 @@ fn log_g17p_halted_dm1_slot0(
                 (snapshot.key >> 40) & 0x7f,
                 snapshot.key & 0xff_ffff_ffff,
             );
+            if let Some(selector) = g17_completion::g17p_dm1_monitor_selector_index(snapshot.state_before) {
+                dev_info!(
+                    dev,
+                    "G17P halted DM1 selected-progress epoch={} selector-index={} c020-stable={} count={}/8 errno={} regs=1668/13020/15150/15388/15390/15510/15518/a068 raw={:016x?}\n",
+                    expected_epoch,
+                    selector,
+                    stable,
+                    snapshot.progress_count,
+                    snapshot.progress_errno,
+                    &snapshot.progress[..snapshot.progress_count],
+                );
+            }
         }
         Ok(None) => dev_info!(dev, "G17P halted DM1 slot0: GPC off; no low-SGX access\n"),
         Err(error) => dev_warn!(dev, "G17P halted DM1 slot0: read failed ({:?}); continuing recovery\n", error),
+    }
+}
+
+/// Preserve the fault selected by B1's reason-3 classifier before ACK. This
+/// does not use Status-B's copied slot mask as a GMMU-fault predicate.
+fn log_g17p_halted_gmmu(
+    dev: &kernel::device::Device,
+    manager: &mut g17_manager::G17PManagerConstruction,
+    registers: Option<&regs::Resources>,
+    expected_epoch: u64,
+) {
+    let Some(registers) = registers else { return };
+    let allowed = match (
+        manager.firmware_recovery_handshake_snapshot(),
+        manager.firmware_fault_report_snapshot(),
+    ) {
+        (Ok(handshake), Ok(report)) => g17_completion::g17p_halted_gmmu_sample_allowed(
+            handshake.state, handshake.epoch, expected_epoch,
+            report.state, report.host_requested, report.reason,
+        ),
+        _ => false,
+    };
+    if !allowed {
+        return;
+    }
+    match registers.g17p_halted_gmmu_snapshot() {
+        Ok(Some(snapshot)) => {
+            let stable = snapshot.info_before == snapshot.info_after;
+            if let Some(address_word) = snapshot.address_word {
+                let address = address_word << 6;
+                dev_info!(
+                    dev,
+                    "G17P halted GMMU reason3 epoch={} gpc={:#x} info-before={:#018x} addr-word={:#018x} va={:#x} info-after={:#018x} stable={} reason={} read={} level={} unit={:#x} vm-slot={}\n",
+                    expected_epoch, snapshot.gpc_state, snapshot.info_before,
+                    address_word, address, snapshot.info_after, stable,
+                    (snapshot.info_before >> 1) & 7,
+                    (snapshot.info_before >> 4) & 1,
+                    (snapshot.info_before >> 7) & 3,
+                    (snapshot.info_before >> 9) & 0xff,
+                    (snapshot.info_before >> 17) & 0x3f,
+                );
+                manager.log_fault_address_candidates("halted-reason3", address_word);
+            } else {
+                dev_info!(
+                    dev,
+                    "G17P halted GMMU reason3 epoch={} gpc={:#x} info-before={:#018x} info-after={:#018x} stable={} no-valid-fault; address not read\n",
+                    expected_epoch, snapshot.gpc_state,
+                    snapshot.info_before, snapshot.info_after, stable,
+                );
+            }
+        }
+        Ok(None) => dev_info!(dev, "G17P halted GMMU reason3: GPC off; no low-SGX access\n"),
+        Err(error) => dev_warn!(dev, "G17P halted GMMU reason3: read failed ({:?}); continuing recovery\n", error),
     }
 }
 
@@ -918,6 +983,7 @@ fn complete_primary_real_recovery(
     // Match that exact window below, guarded by the always-on GPC state.
     log_g17p_fault_report(pdev.as_ref(), manager, "recovery-blamed-cause");
     log_g17p_halted_dm1_slot0(pdev.as_ref(), manager, registers, handshake.epoch);
+    log_g17p_halted_gmmu(pdev.as_ref(), manager, registers, handshake.epoch);
     let cause = manager.primary_firmware_recovery_cause_snapshot()?;
     dev_info!(
         pdev.as_ref(),
