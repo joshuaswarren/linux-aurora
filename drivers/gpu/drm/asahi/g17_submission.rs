@@ -1000,9 +1000,8 @@ pub(crate) const G17P_PARTIAL_OPENING_CONTROL_MESSAGE_SIZE: u64 = 0x40;
 /// dispatches both pipes. Mac17P `AGXArmFirmware::submit3DChannel` at
 /// `0x8a43aa0` sends Fragment first (tail `0x8a43c6c`), then
 /// `submitTAChannel` at `0x8a43cdc` sends Vertex (tail `0x8a43e10`). The
-/// `slots-gfx` witness passes priority 2 to both functions. Keep the legacy
-/// constant for the default path and expose that exact native pair separately
-/// for the opt-in diagnostic.
+/// byte-complete boot trace confirms ordinary userspace queues use priority 2;
+/// the earlier priority-0 pairs are a distinct system bring-up class.
 pub(crate) const G17P_PARTIAL_OPENING_WORK_DOORBELL_CHANNEL: u8 = 0;
 pub(crate) const G17P_PARTIAL_OPENING_PAIRED_DOORBELL: u64 =
     MSG_TX_DOORBELL | G17P_PARTIAL_OPENING_WORK_DOORBELL_CHANNEL as u64;
@@ -1023,13 +1022,11 @@ pub(crate) const G17P_PARTIAL_OPENING_OUTER_SLOT_COUNT: u32 = 0x100;
 /// TA_0/3D_0/CL_0 and indices 6,7,8 are TA_2/3D_2/CL_2.
 ///
 /// The render must publish into the rings for the priority it actually
-/// configures and announces, not priority 0. Its tag-15 programs both queues
-/// at priority 2 -- firmware KTrace 0x40 reports `prio 2` for qid 5 and qid 6
-/// -- and its doorbell is `G17P_NATIVE_TA_DOORBELL`, which encodes priority 2.
-/// Publishing the work at priority 0 while telling the firmware priority 2 has
-/// work leaves the rings it consults empty, so the kick is registered on the
-/// KSM side (the slot is occupied and a pipe is assigned) while nothing ever
-/// dispatches.
+/// configures and announces. Its tag-15 programs both queues at priority 2 --
+/// firmware KTrace 0x40 reports `prio 2` for qid 5 and qid 6 -- and its
+/// doorbell is `G17P_NATIVE_TA_DOORBELL`, which encodes priority 2. The full
+/// boot trace separately captures native priority-0 system queues; mixing their
+/// table/doorbell with a priority-2 queue record makes an invalid hybrid.
 ///
 /// Compute is the worked example of the rule: index 8 is CL at priority 2, it
 /// agrees with its own priority-2 doorbell 0x0a, and it is validated by 2000
@@ -2167,14 +2164,12 @@ pub(crate) fn prepare_g17p_partial_opening_work_pair(
     tiling: G17PPartialOpeningOuterChannelState,
     fragment_queue_id: u8,
     tiling_queue_id: u8,
+    first_submit: bool,
 ) -> Result<PreparedG17PPartialOpeningWorkPair, SubmissionError> {
-    // Ring slot +0x14 bit 24 is "first submission on this queue" (set when
-    // `channel_started` is false). Compute passes false and dispatches; render
-    // hardcoded true, declaring NOT-first on a cold boot when these queues have
-    // never been submitted to. `g17p_render_first_submit` restores the honest
-    // value for the first render of a boot.
-    let render_channel_started =
-        *crate::module_parameters::g17p_render_first_submit.value() == 0;
+    // `+0x17` is `!AGXChannel[0x3c]`: one on the first publication of a
+    // physical queue and zero after it has started. Every valid native queue
+    // follows 1 -> 0; a module-wide constant encoded one side incorrectly.
+    let render_channel_started = !first_submit;
     let fragment = match prepare_g17p_partial_opening_outer_slot(
         fragment,
         G17P_PARTIAL_OPENING_FRAGMENT_CHANNEL_TABLE_INDEX,
@@ -5595,13 +5590,15 @@ mod tests {
                 queue_gpu_va: 0xffff_fc20_c000_0000,
                 queue_write_index: 3,
             },
-            4,
+            1,
+            0,
+            true,
         )
         .unwrap();
         assert_eq!(
             prepared.fragment,
             G17PPartialOpeningOuterSlotPlan {
-                channel_table_index: 1,
+                channel_table_index: 7,
                 slot_index: 0,
                 slot_byte_offset: 0,
                 slot: [
@@ -5616,7 +5613,7 @@ mod tests {
         assert_eq!(
             prepared.tiling,
             G17PPartialOpeningOuterSlotPlan {
-                channel_table_index: 0,
+                channel_table_index: 6,
                 slot_index: 0,
                 slot_byte_offset: 0,
                 slot: [
@@ -5628,8 +5625,8 @@ mod tests {
         );
         assert_eq!(G17P_PARTIAL_OPENING_OUTER_SLOT_SIZE, 0x18);
         assert_eq!(G17P_PARTIAL_OPENING_OUTER_SLOT_COUNT, 0x100);
-        assert_eq!(G17P_PARTIAL_OPENING_TILING_CHANNEL_TABLE_INDEX, 0);
-        assert_eq!(G17P_PARTIAL_OPENING_FRAGMENT_CHANNEL_TABLE_INDEX, 1);
+        assert_eq!(G17P_PARTIAL_OPENING_TILING_CHANNEL_TABLE_INDEX, 6);
+        assert_eq!(G17P_PARTIAL_OPENING_FRAGMENT_CHANNEL_TABLE_INDEX, 7);
         assert_eq!(G17P_PARTIAL_OPENING_WORK_DOORBELL_CHANNEL, 0);
         assert_eq!(prepared.paired_doorbell, 0x0083_0000_0000_0000);
         assert_eq!(
@@ -5670,7 +5667,7 @@ mod tests {
             queue_write_index: 3,
         };
         assert_eq!(
-            prepare_g17p_partial_opening_work_pair(full, full, 1, 0),
+            prepare_g17p_partial_opening_work_pair(full, full, 1, 0, true),
             Err(SubmissionError::RingFull)
         );
         assert_eq!(
@@ -5682,6 +5679,7 @@ mod tests {
                 full,
                 1,
                 0,
+                true,
             ),
             Err(SubmissionError::PartialOpeningChannelCounterOutOfRange)
         );
@@ -5696,6 +5694,7 @@ mod tests {
                 full,
                 1,
                 0,
+                true,
             ),
             Err(SubmissionError::PartialOpeningQueueHeadOutOfRange)
         );
@@ -6010,14 +6009,17 @@ mod tests {
                 queue_gpu_va: 0x70_0300_0000,
                 queue_write_index: 3,
             },
+            1,
+            0,
+            false,
         )
         .unwrap();
         assert_eq!(pair.fragment.slot_index, 1);
         assert_eq!(pair.tiling.slot_index, 1);
         assert_eq!(pair.fragment.next_producer, 2);
         assert_eq!(pair.tiling.next_producer, 2);
-        assert_eq!(get_u32_le(&pair.fragment.slot, 0x14), 0x0101_0003);
-        assert_eq!(get_u32_le(&pair.tiling.slot, 0x14), 0x0100_0003);
+        assert_eq!(get_u32_le(&pair.fragment.slot, 0x14), 0x0001_0003);
+        assert_eq!(get_u32_le(&pair.tiling.slot, 0x14), 0x0000_0003);
     }
 
     #[test]
