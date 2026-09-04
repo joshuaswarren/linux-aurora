@@ -1399,6 +1399,17 @@ pub(crate) fn apply_g17p_retained_descriptor_fields(
                 },
             );
             put_u32(raw, 0x08c4, item_number << 16);
+            // Our priority-0/QID-0 path submits one TA per render. Native
+            // QID 0 keeps this stamp-info force flag set for stamps 0x100,
+            // 0x200 and 0x300 in all three valid boot captures. FUN_ab64
+            // ORs it into Pool-A +0x20; FUN_168d0 then publishes the TA stamp
+            // even while the paired fragment keeps the batch incomplete.
+            // With zero here Linux deferred that stamp until recovery.
+            // Other native queues vary this flag per submission, so do not
+            // infer their batching policy from the initial QID-0 sequence.
+            if queue_id == 0 && crate::g17_submission::G17P_NATIVE_RENDER_DOORBELL_PRIORITY == 0 {
+                put_u32(raw, 0x08c2, 1);
+            }
             put_u32(raw, 0x08c8, item_number << 24);
             put_u32(raw, 0x08d4, submission_ordinal << 16);
             put_u64(raw, 0x0934, runtime_control);
@@ -2166,6 +2177,37 @@ mod tests {
             assert_eq!(get_u32(&descriptor, 0x2128), 1);
             assert_eq!(get_u32(&descriptor, 0x212c), 0);
             assert_eq!(get_u32(&descriptor, 0x2130), 0);
+        }
+    }
+
+    #[test]
+    fn priority_zero_ta_forces_stamp_on_cold_and_retained_submissions() {
+        for (queue_id, ordinal, cold, expected) in [
+            (0, 0, true, 1),
+            (0, 1, false, 1),
+            (0, 2, false, 1),
+            (5, 0, true, 0),
+            (5, 1, false, 0),
+        ] {
+            let mut tiling = [0u8; TA_DESCRIPTOR_SIZE];
+            apply_g17p_retained_descriptor_fields(
+                RenderDescriptorKind::Tiling,
+                0x70_0001_8000,
+                0xffff_fc20_c082_8000,
+                queue_id,
+                queue_id + 1,
+                ordinal,
+                cold,
+                true,
+                &mut tiling,
+            )
+            .unwrap();
+            assert_eq!(get_u32(&tiling, 0x8c2), expected);
+            assert_eq!(get_u32(&tiling, 0x8be), 0);
+            assert_eq!(
+                get_u64(&tiling, 0x8c6),
+                ((ordinal + 1) as u64) << 40 | (ordinal + 1) as u64
+            );
         }
     }
 
