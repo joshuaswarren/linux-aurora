@@ -1145,9 +1145,11 @@ pub(crate) fn build_cold_opening_ta_descriptor(
     put_u16(raw, 0x38, 0x47);
     put_u16(raw, 0x3a, 0x49);
     put_u16(raw, 0x3c, 0x49);
-    // The valid cold priority-0 qid0 corpus carries 0x78 in every first TA
-    // command. `build_ta_descriptor` already installs that value; do not
-    // replace it with the older mismatched-profile 0x08 fixture here.
+    // +0x788 carries the GTP-only RT-buffer size. The valid 32x32 records use
+    // one 0x800-byte buffer and therefore encode qword 0x800 (byte +0x789 =
+    // 0x08). Cold qid0's 0x7800 belongs to a different 15-buffer pool and must
+    // not be copied into this one-buffer Linux pool.
+    put_u8(raw, 0x789, 0x08);
     put_u8(raw, 0x93e, 0xd0);
     put_u8(raw, 0x93f, if parameters.native_pm_bytes { 0x87 } else { 0x91 });
     Ok(())
@@ -1395,6 +1397,9 @@ pub(crate) fn apply_g17p_retained_descriptor_fields(
             put_u32(raw, 0x08d4, submission_ordinal << 16);
             put_u64(raw, 0x0934, runtime_control);
             if cold_opening {
+                // Retain the one-buffer GTP size installed by the cold
+                // descriptor builder.
+                put_u8(raw, 0x0789, 0x08);
                 put_u8(raw, 0x093e, 0xd0);
                 put_u8(raw, 0x093f, if native_pm_bytes { 0x87 } else { 0x91 });
             }
@@ -1422,9 +1427,12 @@ pub(crate) fn apply_g17p_retained_descriptor_fields(
             // 1/3/8 for qids 1/3/8, respectively. The old literal only happened
             // to match the first captured qid.
             put_u32(raw, 0x2154, u32::from(queue_id));
-            // Queue lifecycle flag, not an item number: one for the first
-            // submission on this physical queue, then zero on every repeat.
-            put_u32(raw, 0x215c, u32::from(submission_ordinal == 0));
+            // `AGX3DChannelSKSM::submitBuffer` sources this from whether the
+            // IOGPU command descriptor owns a non-empty IO-fence list. Linux
+            // does not publish that list, so claiming one on the first submit
+            // can only create an unsatisfiable hardware dependency. This is
+            // independent of outer-slot +0x17's real first-submit lifecycle.
+            put_u32(raw, 0x215c, 0);
             // +0x2160 is the packed 3D-channel SKSM completion scratch value:
             // the physical queue timestamp in bits [39:0] and the channel's
             // payload byte in bits [47:40]. G17PUserRenderStorage stages it
@@ -2028,7 +2036,7 @@ mod tests {
         build_cold_opening_fragment_descriptor(&parameters, objects(), 1, &mut fragment).unwrap();
 
         assert_eq!(&tiling[0x38..0x3e], &[0x47, 0, 0x49, 0, 0x49, 0]);
-        assert_eq!(tiling[0x789], 0x78);
+        assert_eq!(tiling[0x789], 0x08);
         assert_eq!(&tiling[0x93e..0x940], &[0xd0, 0x91]);
 
         assert_eq!(get_u32(&fragment, 0x50), 1);
@@ -2036,7 +2044,7 @@ mod tests {
         assert_eq!(&fragment[0x88..0x8a], &[0x59, 0]);
         assert_eq!(get_u32(&fragment, 0x90), 1);
         assert_eq!(get_u32(&fragment, 0x2154), 1);
-        assert_eq!(get_u32(&fragment, 0x215c), 1);
+        assert_eq!(get_u32(&fragment, 0x215c), 0);
         assert_eq!(fragment[0x2100], (parameters.tib_blocks > 8) as u8);
         assert_eq!(&fragment[0x2114..0x2134], &[0; 0x20]);
         assert_eq!(get_u64(&fragment, 0x21d7), 0);
