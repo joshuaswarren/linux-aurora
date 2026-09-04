@@ -2415,16 +2415,15 @@ pub(crate) fn check_firmware_root_gates(root: &[u8]) -> Result<(), InitdataError
 }
 
 /// Recorded T8140 hardware-data platform constants (values known, meanings
-/// not; generated from the hardware-validated `g17p_initdata.py`
-/// `HWDATA_CONSTANTS`). 29 sparse runs, 269 bytes total. `+0x2630` is
+/// not; derived from the hardware-validated `g17p_initdata.py`
+/// `HWDATA_CONSTANTS`). 29 sparse runs, 262 bytes total. `+0x2630` is
 /// deliberately absent: it is firmware state, not host configuration.
-/// VERIFIED AGAINST NATIVE 2026-09-02: all 29 runs match BYTE FOR BYTE.
 ///
-/// macOS's own hardware-data block was located at `AGXArmFirmwareASC + 0x2b8`
-/// (identified by the 0x1f this table puts at +0x0f04, which it carries) and
-/// dumped whole; the capture is `/tmp/g17p-re/work/hwdata-gfx.txt`. Every one
-/// of these 29 runs, 269 bytes in total, is identical to what the kext hands
-/// its firmware. This table is not a source of divergence.
+/// Native fixture pointer bytes are not platform constants. The original
+/// +0x26ad run included seven bytes of the captured QoS allocation address;
+/// replaying it after encode_hw_data's live pointer store silently replaced
+/// the owned allocation with that unrelated address. Keep only its adjacent
+/// state words here and encode the complete pointer from its retained owner.
 ///
 /// +0x0f08 is zero in native too. That field is the firmware's ISR mask
 /// selector -- FUN_1e858 copies it to DAT_1785f4, and FUN_215cc picks the
@@ -2440,7 +2439,7 @@ pub(crate) fn check_firmware_root_gates(root: &[u8]) -> Result<(), InitdataError
 /// silently matches only 19 of them and mis-associates offsets, which
 /// manufactures differences that are not there and, if used to rewrite the
 /// table, corrupts it into 17 runs / 292 bytes and makes probe fail with -22.
-/// Parse by matching brackets, and check the 29/269 totals before trusting a
+/// Parse by matching brackets, and check the 29/262 totals before trusting a
 /// comparison.
 pub(crate) const HW_DATA_OPAQUE_RUNS: &[(usize, &[u8])] = &[
     (0x0004, &[0x6f, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0xff]),
@@ -2537,12 +2536,8 @@ pub(crate) const HW_DATA_OPAQUE_RUNS: &[(usize, &[u8])] = &[
         0x2568,
         &[0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01],
     ),
-    (
-        0x26ad,
-        &[
-            0x80, 0x5d, 0x01, 0x20, 0xfc, 0xff, 0xff, 0x01, 0x00, 0x00, 0x00, 0x01,
-        ],
-    ),
+    // +0x26ac..+0x26b3 is the live QoS pointer, never captured allocation bytes.
+    (0x26b4, &[0x01, 0x00, 0x00, 0x00, 0x01]),
     (0x26e8, &[0x01]),
     (0x3d98, &[0xff, 0xff, 0xff, 0xff]),
     (0x3db0, &[0xff, 0xff, 0xff, 0xff]),
@@ -3693,6 +3688,71 @@ mod tests {
     }
 
     #[test]
+    fn hw_data_live_pointers_survive_opaque_constants() {
+        for qos_resource in [
+            0xffff_fc20_001f_8000,
+            0xffff_fc20_013a_c000,
+            0xffff_fc20_cabc_4000,
+        ] {
+            let aliases = [
+                G17PKsmCompletionAliases {
+                    low: 0x70_0240_0000,
+                    high: 0xffff_fc20_c240_0000,
+                },
+                G17PKsmCompletionAliases {
+                    low: 0x70_0280_0000,
+                    high: 0xffff_fc20_c280_0000,
+                },
+            ];
+            let windows: Vec<_> = (0..HW_REGISTER_MAP_SLOTS)
+                .map(|slot| RegisterWindow {
+                    slot,
+                    phys: 0x4_0000_0000 + (slot as u64) * 0x4000,
+                    device_va: HW_REGISTER_APERTURE.start + (slot as u64) * 0x4000,
+                    size: 0x4000,
+                    unk_18: 0,
+                    flag: 2,
+                })
+                .collect();
+            let mut hw = vec![0xa5; HW_DATA_SIZE];
+            encode_hw_data(&windows, &[], aliases, qos_resource,
+                sksm_qid_resource_high(), &mut hw).unwrap();
+            assert_eq!(get_u64(&hw, G17P_QOS_RESOURCE_LIVE_OFFSET), qos_resource);
+            assert_eq!(get_u32(&hw, 0x26b4), 1);
+            assert_eq!(get_u32(&hw, 0x26b8), 1);
+            for (aliases, ordinal) in aliases.iter().zip(G17P_KSM_COMPLETION_PRESENT_ORDINALS) {
+                let base = G17P_KSM_COMPLETION_TABLE_OFFSET
+                    + ordinal as usize * G17P_KSM_COMPLETION_DESCRIPTOR_STRIDE;
+                assert_eq!(get_u64(&hw, base), aliases.low);
+                assert_eq!(get_u64(&hw, base + 8), aliases.high);
+            }
+            for window in windows {
+                let base = HW_REGISTER_MAP_OFFSET + window.slot * HW_REGISTER_MAP_ENTRY_SIZE;
+                assert_eq!(get_u64(&hw, base), window.phys);
+                assert_eq!(get_u64(&hw, base + 8), window.device_va);
+            }
+        }
+    }
+
+    #[test]
+    fn hw_data_opaque_runs_do_not_overlap_live_fields() {
+        let live = [
+            HW_REGISTER_MAP_OFFSET
+                ..HW_REGISTER_MAP_OFFSET + HW_REGISTER_MAP_SLOTS * HW_REGISTER_MAP_ENTRY_SIZE,
+            G17P_KSM_COMPLETION_TABLE_OFFSET
+                ..G17P_KSM_COMPLETION_TABLE_OFFSET + 4 * G17P_KSM_COMPLETION_DESCRIPTOR_STRIDE,
+            G17P_QOS_RESOURCE_LIVE_OFFSET..G17P_QOS_RESOURCE_LIVE_OFFSET + 8,
+        ];
+        for (offset, data) in HW_DATA_OPAQUE_RUNS {
+            for range in &live {
+                assert!(*offset + data.len() <= range.start || *offset >= range.end,
+                    "opaque range {offset:#x}..{:#x} overlaps live {range:#x?}",
+                    offset + data.len());
+            }
+        }
+    }
+
+    #[test]
     fn hw_data_size_acceptance_completion_table_and_firmware_state() {
         assert_eq!(HW_DATA_SIZE, 0x3db4);
         let windows = register_windows();
@@ -3765,6 +3825,7 @@ mod tests {
             assert_eq!(get_u32(&hw, base + 0x1c), 0);
         }
         assert_eq!(get_u64(&hw, G17P_SKSM_QID_CONFIG_2700_OFFSET), 0);
+        assert_eq!(get_u64(&hw, G17P_QOS_RESOURCE_LIVE_OFFSET), qos_resource);
         assert_eq!(get_u32(&hw, G17P_SKSM_QID_CONFIG_2708_OFFSET), 0);
         assert_eq!(get_u64(&hw, G17P_QOS_RESOURCE_OFFSET), 0);
         assert_eq!(get_u64(&hw, G17P_SKSM_QID_RESOURCE_OFFSET), 0);
@@ -3969,9 +4030,11 @@ mod tests {
 
     #[test]
     fn recorded_run_tables_match_the_serializer_totals() {
-        // These byte totals match the hardware-validated g17p_initdata.py.
+        // HWData excludes the seven captured QoS pointer bytes; the adjacent
+        // state words and the remaining platform runs are preserved.
         let hw: usize = HW_DATA_OPAQUE_RUNS.iter().map(|(_, data)| data.len()).sum();
-        assert_eq!(hw, 269);
+        assert_eq!(HW_DATA_OPAQUE_RUNS.len(), 29);
+        assert_eq!(hw, 262);
         let region_c: usize = REGION_C_RUNS.iter().map(|(_, data)| data.len()).sum();
         assert_eq!(region_c, 180);
         // Every run fits its object.
