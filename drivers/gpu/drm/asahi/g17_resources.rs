@@ -186,28 +186,15 @@ const G17P_LAST_SUBMITTED_HW_TIMESTAMP_TABLE_SIZE: usize =
 /// `AGXQOSManager` constructs its `QOSQueueIDAllocator` with capacity 0x80;
 /// firmware's QID/HWBufferID tables have the same 128-entry geometry.
 const G17P_QOS_QUEUE_COUNT: usize = 0x80;
-/// QoS weight selected by `AGXQOSManager::registerQueue` for the active
-/// render-priority profile.
+/// QoS class selected by `AGXQOSManager::registerQueue` for the valid cold
+/// qid0/qid1 render profile.
 ///
-/// The G17P kext indexes the five-byte table `{0x14, 0x0f, 0x04, 0x01, 0}`
-/// with the command-queue priority, then stores the selected byte at
-/// `AGXQOSQueue + 0x46`. Both TA and 3D `willSubmit` calls copy that byte to
-/// their QID-indexed firmware-visible queue records.
-///
-/// MEASURED, macOS 25G83, once.d against a real Metal render pass: the render
-/// queue's install is
-///
-///     willSubmit qid=7 dm=1 firstTime=1
-///     QoS row 7 (+0x38):  ff 00 .. -> 04 04 00 00 00 00 00 00
-///
-/// so byte 1 is selected by the queue priority: 0x14 for initial priority 0,
-/// 0x04 for later priority 2. A hybrid value does not describe either trace.
-const G17P_DEFAULT_RENDER_QOS_CLASS: u8 =
-    if g17_submission::G17P_NATIVE_RENDER_DOORBELL_PRIORITY == 0 {
-        0x14
-    } else {
-        0x04
-    };
+/// Both valid full captures have byte-exact rows `00 0f 00...` for the initial
+/// physical qids 0 and 1. Their tag-15 and channel-control class is also 0x0f;
+/// Linux's old 0x14 made the QID resource disagree with its own queue class.
+/// Kext RE confirms the five-byte table is selected through accelerator policy
+/// fields, not by directly indexing it with the outer doorbell priority.
+const G17P_DEFAULT_RENDER_QOS_CLASS: u8 = 0x0f;
 /// Native's normalized per-HardwareBufferID share, read out of the same
 /// capture's `+0xc00` index row:
 ///
@@ -9133,9 +9120,11 @@ impl G17ResourceOwner {
     /// class to byte 1 before it makes tag-15 visible. On the first submit it
     /// also publishes two HardwareBufferID-indexed properties: `+0x800` is the
     /// exact same `_AGFISchedulerState` firmware VA carried by ConfigUpdate
-    /// `+0x4a`, while `+0xc00` is the queue's normalized QoS share. The
-    /// remaining six queue-record bytes belong to other runtime state and must
-    /// not be reset on a retained submission.
+    /// `+0x4a`, while `+0xc00` is the queue's normalized QoS share. Finally it
+    /// increments the total at `+0xe00`, records `mach_absolute_time()` in the
+    /// data-master slot at `+0xe08 + dm*8`, and increments the matching count
+    /// at `+0xe20 + dm*8`. The remaining six queue-record bytes belong to other
+    /// runtime state and must not be reset on a retained submission.
     pub(crate) fn publish_render_qos_queue_record(
         &mut self,
         header: G17PRenderConfigUpdateHeader,
@@ -9158,6 +9147,26 @@ impl G17ResourceOwner {
         let share_offset = 0xc00usize
             .checked_add(hardware_buffer_id.checked_mul(4).ok_or(EINVAL)?)
             .ok_or(EINVAL)?;
+        let data_master = usize::from(header.data_master);
+        let data_master_time_offset = 0xe08usize
+            .checked_add(data_master.checked_mul(8).ok_or(EINVAL)?)
+            .ok_or(EINVAL)?;
+        let data_master_count_offset = 0xe20usize
+            .checked_add(data_master.checked_mul(8).ok_or(EINVAL)?)
+            .ok_or(EINVAL)?;
+        let submit_time: u64;
+        // Native stores mach_absolute_time(), which is the architectural
+        // physical counter on arm64. Read that same counter rather than a
+        // nanosecond-converted Linux clock or a captured fixture literal.
+        // SAFETY: CNTPCT_EL0 is enabled for kernel reads and this assembly has
+        // no memory side effects.
+        unsafe {
+            core::arch::asm!(
+                "mrs {counter}, CNTPCT_EL0",
+                counter = out(reg) submit_time,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
         let mut published = [0u8; 8];
         self.resources.qos_resource.with_bytes_mut(|bytes| {
             let record = bytes.get_mut(offset..offset + 8).ok_or(EINVAL)?;
@@ -9172,13 +9181,15 @@ impl G17ResourceOwner {
                 .get_mut(share_offset..share_offset + 4)
                 .ok_or(EINVAL)?
                 .copy_from_slice(&G17P_SINGLE_RENDER_QOS_SHARE.to_le_bytes());
-            // `AGXQOSQueue::willSubmit(qid, dm)` @ 0xfffffe0008a80fa8 also bumps
-            // two monotonic counters in this same object, which this driver has
-            // never written. Decoded from the kext:
+            // `AGXQOSQueue::willSubmit(qid, dm)` @ 0xfffffe0008a80fa8 also
+            // updates its monotonic accounting in this object. Decoded from
+            // the kext and checked against the valid cold native capture:
             //
             //   x9 = QoS base
             //   +0x400 + qid*4   u32, ldr/add #1/str            (qid-indexed)
             //   +0x600 + idx*4   u32, ldr/add #1/str            (idx = obj+0x10)
+            //   +0xe00           u64, ldr/add #1/str            (total)
+            //   +0xe08 + dm*8    u64, mach_absolute_time/str    (DM-indexed)
             //   +0xe20 + dm*8    u64, ldr/add #1/str, then dmb  (DM-indexed)
             //
             // The object is 0xe40 bytes, which is exactly 0xe20 plus four u64s
@@ -9209,11 +9220,18 @@ impl G17ResourceOwner {
                 .wrapping_add(1);
             counter.copy_from_slice(&bumped.to_le_bytes());
 
-            let data_master_offset = 0xe20usize
-                .checked_add(usize::from(header.data_master).checked_mul(8).ok_or(EINVAL)?)
-                .ok_or(EINVAL)?;
+            let total = bytes.get_mut(0xe00..0xe08).ok_or(EINVAL)?;
+            let bumped = u64::from_le_bytes(total.try_into().map_err(|_| EINVAL)?)
+                .wrapping_add(1);
+            total.copy_from_slice(&bumped.to_le_bytes());
+
+            bytes
+                .get_mut(data_master_time_offset..data_master_time_offset + 8)
+                .ok_or(EINVAL)?
+                .copy_from_slice(&submit_time.to_le_bytes());
+
             let per_dm = bytes
-                .get_mut(data_master_offset..data_master_offset + 8)
+                .get_mut(data_master_count_offset..data_master_count_offset + 8)
                 .ok_or(EINVAL)?;
             let bumped = u64::from_le_bytes(per_dm.try_into().map_err(|_| EINVAL)?)
                 .wrapping_add(1);
@@ -13429,6 +13447,12 @@ impl G17ResourceOwner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initial_render_qos_row_matches_valid_qid0_qid1_profile() {
+        assert_eq!(g17_submission::G17P_NATIVE_RENDER_DOORBELL_PRIORITY, 0);
+        assert_eq!(G17P_DEFAULT_RENDER_QOS_CLASS, 0x0f);
+    }
 
     #[test]
     fn compute_flist_stops_before_native_completion_aliases() {
