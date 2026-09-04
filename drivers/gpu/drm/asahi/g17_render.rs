@@ -1230,12 +1230,6 @@ pub(crate) fn build_fragment_descriptor(
     put_u64(raw, 0x1f9c, parameters.partial_store_pipeline);
     put_u32(raw, 0x1fa8, parameters.depth_clear_value_bits);
     put_u64(raw, 0x1fac, (parameters.tib_blocks << 33) | 0x300);
-    // Start3DStruct6.unk_c is the large-TIB predicate. It is independent of
-    // the empty-tile control already encoded in register 0x10039 bit 16.
-    // Native's host descriptor +0x8bf carries this predicate and the kext
-    // copies it here; m1n1 derives the same field as `tib_blocks > 8`.
-    // B1 firmware consumes it before the first RCE write and selects a
-    // separate scheduler path when it is nonzero.
     // ORACLE BISECT. Native's 3D command record (recs3.txt, 0x2240 stride, so
     // this is the record itself and not the next one) differs from ours in 73
     // of 1096 qwords; all but a dozen are allocation addresses. These are the
@@ -1277,7 +1271,15 @@ pub(crate) fn build_fragment_descriptor(
             put_u32(raw, 0x1d8 + 4, 0x3f80_0000);
         }
     }
-    put_u8(raw, 0x2100, (parameters.tib_blocks > 8) as u8);
+    // Native copies isMemorylessRender through the UMD render record +0x240,
+    // parsed record +0x1b8, and host descriptor +0x8bf into this byte. It is
+    // not a TIB-size predicate: native's memoryless policy also selects the
+    // shortened SPM phase programs. The admitted render UAPI represents
+    // memory-backed resources and has no memoryless-render policy or matching
+    // SPM-program construction. Keep that policy clear even for >8 TIB
+    // blocks; supporting memoryless renders requires modeling both together.
+    // Empty-tile processing remains independent in register 0x10039 bit 16.
+    put_u8(raw, 0x2100, 0);
     // Exact G17P tail copied by AGX3DChannelSKSM::submitBuffer. +0x2104 is the
     // accelerator control snapshot and +0x210c its low map nibble. +0x2110 is
     // a separate render-setup field: prepare copies descriptor +0xc00 to setup
@@ -2044,6 +2046,38 @@ mod tests {
     }
 
     #[test]
+    fn memory_backed_render_policy_is_independent_of_tib_size() {
+        for tib_blocks in [4, 8, 9, 12, 16] {
+            for process_empty_tiles in [false, true] {
+                let mut parameters = G17pRenderParameters::source_rsrc8();
+                parameters.tib_blocks = tib_blocks;
+                parameters.process_empty_tiles = process_empty_tiles;
+                parameters.tile_config = 0x280
+                    | if process_empty_tiles { 0x1_0000 } else { 0 };
+                let mut fragment = [0xa5u8; FRAGMENT_DESCRIPTOR_SIZE];
+                build_cold_opening_fragment_descriptor(
+                    &parameters, objects(), 1, &mut fragment,
+                )
+                .unwrap();
+                assert_eq!(fragment[0x2100], 0);
+                assert_eq!(get_u64(&fragment, 0x1f38), tib_blocks);
+                assert_eq!(get_u64(&fragment, 0x1f58), parameters.tile_config);
+                // Keep real memory-backed partial phase programs, not the
+                // native memoryless count-two reset-only phase variant.
+                for (at, count) in [(0xec8, 16), (0x15e8, 23), (0x1d08, 10)] {
+                    assert_eq!(get_u32(&fragment, at) & 0xffff, count);
+                }
+                apply_g17p_retained_descriptor_fields(
+                    RenderDescriptorKind::Fragment, 0x7000098000, 0,
+                    1, 1, 1, false, false, &mut fragment,
+                )
+                .unwrap();
+                assert_eq!(fragment[0x2100], 0);
+            }
+        }
+    }
+
+    #[test]
     fn cold_opening_descriptors_apply_only_the_native_first_work_overrides() {
         let parameters = G17pRenderParameters::source_rsrc8();
         let mut tiling = [0u8; TA_DESCRIPTOR_SIZE];
@@ -2062,7 +2096,7 @@ mod tests {
         assert_eq!(get_u32(&fragment, 0x90), 1);
         assert_eq!(get_u32(&fragment, 0x2154), 1);
         assert_eq!(get_u32(&fragment, 0x215c), 1);
-        assert_eq!(fragment[0x2100], (parameters.tib_blocks > 8) as u8);
+        assert_eq!(fragment[0x2100], 0);
         assert_eq!(&fragment[0x2114..0x2134], &[0; 0x20]);
         assert_eq!(get_u64(&fragment, 0x21d7), 0);
         assert_eq!(fragment[0x222d], 1);
