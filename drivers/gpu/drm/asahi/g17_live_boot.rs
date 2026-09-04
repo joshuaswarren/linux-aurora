@@ -2126,12 +2126,24 @@ fn boot_initial_session(
         g17_rtkit::encode_initdata_doorbell(handoff.primary.instance.root).map_err(|_| EINVAL)?;
     let gfx1_init = g17_rtkit::encode_initdata_doorbell(handoff.secondary.instance.root)
         .map_err(|_| EINVAL)?;
+    // Serialise the two roles' initdata handshakes, as native does. MEASURED
+    // on the m1n1 hv capture 20260904-001852Z: macOS completes role 0 entirely
+    // before it touches role 1's endpoints.
+    //
+    //     36.32ms role0 -> ep0  start ep 0x20
+    //     38.88ms role0 -> ep0  start ep 0x21
+    //     40.40ms role0 -> ep20 initdata
+    //     43.59ms role0 <- ep20 ACK           <-- role 0 complete
+    //     44.08ms role1 -> ep0  start ep 0x20 <-- role 1 only begins here
+    //     52.01ms role1 -> ep20 initdata
+    //     57.55ms role1 <- ep20 ACK
+    //
+    // This driver started all four endpoints, published both initdata blocks
+    // and only then waited for either ACK, so the secondary's endpoints came up
+    // while the primary was still mid-handshake.
     Pin::new(&mut gfx_rtkit).start_endpoint(g17_rtkit::ENDPOINT_GFX_MESSAGES)?;
     Pin::new(&mut gfx_rtkit).start_endpoint(g17_rtkit::ENDPOINT_GFX_INTERRUPTS)?;
-    Pin::new(&mut gfx1_rtkit).start_endpoint(g17_rtkit::ENDPOINT_GFX_MESSAGES)?;
-    Pin::new(&mut gfx1_rtkit).start_endpoint(g17_rtkit::ENDPOINT_GFX_INTERRUPTS)?;
     Pin::new(&mut gfx_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_MESSAGES, gfx_init)?;
-    Pin::new(&mut gfx1_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_MESSAGES, gfx1_init)?;
     dev_info!(
         pdev.as_ref(),
         "G17P session: primary and secondary initdata published\n"
@@ -2148,6 +2160,11 @@ fn boot_initial_session(
         result?;
     }
     dev_info!(pdev.as_ref(), "G17P session: primary initdata ACK received\n");
+
+    // Only now bring up the secondary, per the native ordering above.
+    Pin::new(&mut gfx1_rtkit).start_endpoint(g17_rtkit::ENDPOINT_GFX_MESSAGES)?;
+    Pin::new(&mut gfx1_rtkit).start_endpoint(g17_rtkit::ENDPOINT_GFX_INTERRUPTS)?;
+    Pin::new(&mut gfx1_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_MESSAGES, gfx1_init)?;
     {
         let started = Instant::<Monotonic>::now();
         let result = wait_initdata_ack(&gfx1_state);
