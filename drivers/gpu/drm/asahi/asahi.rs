@@ -169,7 +169,9 @@ kernel::module_platform_driver! {
             description: "DIAGNOSTIC ONLY -- hexdump the first 128 bytes of Mesa's VDM control stream at render submit. The tiler demonstrably fetches this stream (pipe-vdm-stream reads back the encoded pointer on pipes 0 and 2 with work stamps 0x100) and then bins essentially nothing: 60 non-zero bytes in a 1277952-byte tile buffer, and the content is an initialised-but-empty bounding box carrying 0x7fc00000 (NaN) and 0x7fffffff extremes. Either the stream contains no draw, or it draws primitives that are all culled. This shows which. 0: off (default), 1: dump.",
         },
         g17p_fault_report: u32 {
-            default: 1,
+            // Default 0, for the same reason as g17p_render_ksm_probe: it
+            // performs sgx MMIO on the submit path, and native performs none.
+            default: 0,
             description: "Log the firmware fault report reached through main_config+0x26c (blamed qid, data master, recovery state) next to the MMU fault bank (1: on)",
         },
         g17p_progress_watchdog: u32 {
@@ -201,7 +203,22 @@ kernel::module_platform_driver! {
             description: "Sample the scheduler-gate registers (gpc-state, fender dynamic gating, host IRQ enable/status) in a burst immediately after the render doorbell, logged as checkpoint render-post-doorbell. This is the observable that actually moves on a submission which executes: a working compute submit reports gpc-state 0x0 -> 0x1 -> 0x0, while scan-active reads 0 on that same run and is therefore meaningless. The render path had no equivalent sample at all. UNSAFE BY CONSTRUCTION, which is why it defaults off: the read touches the sgx register file, and an sgx read with the GPU cores power-gated raises an asynchronous SError and panics the machine. It is taken ONLY in the window right after the doorbell, never before publish (cores may still be gated -- render-pre-doorbell is DRAM-only for that reason) and never at the wait timeout (cores have powered back down; this panicked the box every time it was tried on the compute path). Compute's own sample is safe only because it runs after a completion woke the caller. 0: off (default), 1: 12 samples at 1ms, 2: 40 samples at 1ms for a wider window.",
         },
         g17p_render_ksm_probe: u32 {
-            default: 1,
+            // Default 0. MEASURED on macOS 25G83 under the m1n1 hypervisor
+            // (20260904-001852Z, full desktop session, 95,726 sgx MMIO events
+            // with PC attribution against the 25G83 kernelcache): the AGX
+            // driver performs TWENTY-SIX register accesses in the entire
+            // session -- 16 in parsePerfStateMapRegs, 7 in readChipInfo, and 3
+            // on 0xd06030 -- all one-time init apart from the fender gating.
+            // ZERO during any of its 10,803 render doorbells.
+            //
+            // This probe reads the KSM through the SKSM tag/data port, and
+            // g17p_sksm_port_read_locked WRITES the tag to sgx+0x4090 before
+            // reading 0x4098. Native never touches that port at all, and this
+            // file's own regs.rs:517 says it "must never be loaded". Doing it
+            // on every submit is a host action with no counterpart in the
+            // oracle, on the path where the KSM decides whether to promote an
+            // admitted queue. Diagnostics do not belong in PARAMS=''.
+            default: 0,
             description: "G17P GRAPHICS BRING-UP TRACE. After both native render doorbells are sent, wait up to 40ms and take power-gated-safe snapshots of the kernel-owned TA/3D queues, SGX current-command/context, and the bit-4 new-work / bit-3 completion launch registers consumed by B1 FUN_23004. The GPC-state read is a hard gate before low SGX accesses. Default 1 while the TA-to-3D callback boundary is under bring-up; 0 disables it.",
         },
         g17p_render_header_flags: u32 {
