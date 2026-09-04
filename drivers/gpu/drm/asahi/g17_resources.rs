@@ -321,8 +321,13 @@ const G17P_CONTROL_OPERAND_PAGE_LIST_SIZE: usize = G17P_CONTROL_DIRECTORY_SIZE;
 // leaf observed on GFX1 was base +0x17c000, inside this exact source-built run.
 const G17P_NATIVE_PRIVATE_CLUSTER_OFFSET: u64 = 0x0002_0000;
 const G17P_NATIVE_PRIVATE_CLUSTER_SIZE: usize = 0x0017_8000;
-#[cfg(test)]
-const G17P_NATIVE_SECONDARY_STATUS_A_OFFSET: u64 = 0x000e_3100;
+const G17P_NATIVE_PRIMARY_STATE_OFFSET: usize = 0;
+const G17P_NATIVE_SECONDARY_STATUS_A_OFFSET: usize = 0x000c_3100;
+const G17P_NATIVE_SECONDARY_STATE_OFFSET: usize = 0x0017_70c0;
+const G17P_NATIVE_SECONDARY_STATUS_A_VIEW_SIZE: usize =
+    G17P_NATIVE_PRIVATE_CLUSTER_SIZE - G17P_NATIVE_SECONDARY_STATUS_A_OFFSET;
+const G17P_NATIVE_SECONDARY_STATE_VIEW_SIZE: usize =
+    G17P_NATIVE_PRIVATE_CLUSTER_SIZE - G17P_NATIVE_SECONDARY_STATE_OFFSET;
 /// Exact executable extent used by the positive first-partial render root.
 pub(crate) const G17P_BOOTSTRAP_VDM_VA: u64 = 0x10_0001_8000;
 const G17P_BOOTSTRAP_VDM_SIZE: usize = 0x8000;
@@ -1136,14 +1141,9 @@ fn g17p_cold_opening_metadata(
         },
     }
 }
-// Native Status A starts at private-cluster +0xe3100 and stays backed until
-// the cluster end at +0x198000: 0xb4f00 bytes, or 0xb8000 page-rounded when
-// represented as a separate Linux object. GFX1 writes through +0xb4004.
-const STATUS_A_ALLOC_SIZE: usize = 0xb8000;
-#[cfg(not(test))]
+// The primary view begins at the fixed arena base and covers its status-A
+// tail through the start of the overlapping secondary status-A view.
 const PRIMARY_STATE_ALLOC_SIZE: usize = 0xc4000;
-#[cfg(not(test))]
-const SECONDARY_STATE_ALLOC_SIZE: usize = 0x4000;
 
 /// One role's view of the common UAT owner and its private objects.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -1569,8 +1569,12 @@ pub(crate) fn validate_handoff(
 
 #[cfg(not(test))]
 struct MappedObject {
-    mapping: mmu::KernelMapping,
+    /// Present for an owning GPU mapping and absent for a subview retained by
+    /// another `MappedObject` in the same resource bundle.
+    mapping: Option<mmu::KernelMapping>,
     object: gem::ObjectRef,
+    iova: u64,
+    object_offset: usize,
     logical_size: usize,
 }
 
@@ -1694,9 +1698,12 @@ impl MappedObject {
         let mut object = gem::new_kernel_object_wc(dev, size)?;
         object.vmap()?.memset(0);
         let mapping = object.map_into_range(vm, range, alignment, prot, true)?;
+        let iova = mapping.iova();
         Ok(Self {
-            mapping,
+            mapping: Some(mapping),
             object,
+            iova,
+            object_offset: 0,
             logical_size: size,
         })
     }
@@ -1728,9 +1735,12 @@ impl MappedObject {
         let mut object = gem::new_kernel_object_wc(dev, size)?;
         object.vmap()?.memset(0);
         let mapping = object.map_at(vm, address, prot, false)?;
+        let iova = mapping.iova();
         Ok(Self {
-            mapping,
+            mapping: Some(mapping),
             object,
+            iova,
+            object_offset: 0,
             logical_size: size,
         })
     }
@@ -1746,9 +1756,12 @@ impl MappedObject {
         let mut object = gem::new_kernel_object(dev, size)?;
         object.vmap()?.memset(0);
         let mapping = object.map_into_range(vm, range, alignment, prot, true)?;
+        let iova = mapping.iova();
         Ok(Self {
-            mapping,
+            mapping: Some(mapping),
             object,
+            iova,
+            object_offset: 0,
             logical_size: size,
         })
     }
@@ -1780,25 +1793,45 @@ impl MappedObject {
         let mut object = gem::new_kernel_object(dev, size)?;
         object.vmap()?.memset(0);
         let mapping = object.map_at(vm, address, prot, false)?;
+        let iova = mapping.iova();
         Ok(Self {
-            mapping,
+            mapping: Some(mapping),
             object,
+            iova,
+            object_offset: 0,
             logical_size: size,
         })
     }
 
     fn iova(&self) -> u64 {
-        self.mapping.iova()
+        self.iova
     }
 
     fn with_bytes_mut<R>(&mut self, f: impl FnOnce(&mut [u8]) -> Result<R>) -> Result<R> {
         let vmap = self.object.vmap()?;
         let bytes = unsafe {
             // SAFETY: the VMap covers this object's complete, page-rounded
-            // allocation and logical_size never exceeds the object size.
-            core::slice::from_raw_parts_mut(vmap.as_mut_ptr(), self.logical_size)
+            // allocation; construction bounds-checks the view offset and size.
+            core::slice::from_raw_parts_mut(
+                vmap.as_mut_ptr().add(self.object_offset),
+                self.logical_size,
+            )
         };
         f(bytes)
+    }
+
+    fn subview(parent: &Self, offset: usize, logical_size: usize) -> Result<Self> {
+        let end = offset.checked_add(logical_size).ok_or(EOVERFLOW)?;
+        if end > parent.logical_size {
+            return Err(ERANGE);
+        }
+        Ok(Self {
+            mapping: None,
+            object: gem::ObjectRef::new(parent.object.gem.clone()),
+            iova: parent.iova.checked_add(offset as u64).ok_or(EOVERFLOW)?,
+            object_offset: parent.object_offset.checked_add(offset).ok_or(EOVERFLOW)?,
+            logical_size,
+        })
     }
 
     fn read_u32(&mut self, address: u64) -> Result<u32> {
@@ -1845,6 +1878,9 @@ impl MappedObject {
         address: u64,
         prot: mmu::Prot,
     ) -> Result<mmu::KernelMapping> {
+        if self.object_offset != 0 {
+            return Err(EINVAL);
+        }
         self.object.map_at(vm, address, prot, false)
     }
 
@@ -1855,6 +1891,9 @@ impl MappedObject {
         alignment: u64,
         prot: mmu::Prot,
     ) -> Result<mmu::KernelMapping> {
+        if self.object_offset != 0 {
+            return Err(EINVAL);
+        }
         self.object
             .map_into_range(vm, range, alignment, prot, false)
     }
@@ -7302,12 +7341,13 @@ impl G17PClRuntimeStorage {
         // exact GEM subrange so size and backing identity cannot diverge. The
         // firmware-high view intentionally retains its separate RW access
         // class; native queue +0x80 and +0x88 are not protection-identical.
-        let entries_high = entries.mapping.map_alias_into_range(
+        let entries_mapping = entries.mapping.as_ref().ok_or(EINVAL)?;
+        let entries_high = entries_mapping.map_alias_into_range(
             uat.kernel_vm(),
             uat.kernel_va_range()?,
             mmu::PROT_FW_SHARED_RW,
         )?;
-        if entries.mapping.size() != backing_size || entries_high.size() != backing_size
+        if entries_mapping.size() != backing_size || entries_high.size() != backing_size
         {
             return Err(EINVAL);
         }
@@ -7389,7 +7429,7 @@ impl G17PClRuntimeStorage {
     /// Make both queue-entry aliases visible to the already-running G17P UAT
     /// before the write-only SKSM configuration transaction.
     pub(crate) fn prepare_live_mappings(&self, uat: &mmu::Uat) -> Result {
-        let low = &self.entries.mapping;
+        let low = self.entries.mapping.as_ref().ok_or(EINVAL)?;
         let high = &self.entries_high;
         if low.size() == 0
             || low.size() != high.size()
@@ -8426,9 +8466,12 @@ impl G17ResourceOwner {
             mmu::PROT_GPU_FW_SHARED_RW,
             false,
         )?;
+        let parameter_metrics_iova = parameter_metrics_high.iova();
         let mut parameter_metrics = MappedObject {
-            mapping: parameter_metrics_high,
+            mapping: Some(parameter_metrics_high),
             object: parameter_metrics_object,
+            iova: parameter_metrics_iova,
+            object_offset: 0,
             logical_size: mmu::T8140_PARAMETER_METRICS_SIZE,
         };
         parameter_metrics.with_bytes_mut(|bytes| {
@@ -8473,27 +8516,32 @@ impl G17ResourceOwner {
             mmu::UAT_PGSZ as u64,
             mmu::PROT_FW_SHARED_RW,
         )?;
-        let mut primary_state = MappedObject::new_wc(
-            dev,
-            &address_space.uat,
+        // The two firmware roles do not own independent allocations here.
+        // Every valid native PTE and root pointer resolves into overlapping
+        // views of the one fixed 0x178000 private arena mapped above.
+        let mut primary_state = MappedObject::subview(
+            &native_private_cluster,
+            G17P_NATIVE_PRIMARY_STATE_OFFSET,
             PRIMARY_STATE_ALLOC_SIZE,
-            mmu::UAT_PGSZ as u64,
-            mmu::PROT_FW_SHARED_RW,
         )?;
-        let mut secondary_state = MappedObject::new_wc(
-            dev,
-            &address_space.uat,
-            SECONDARY_STATE_ALLOC_SIZE,
-            mmu::UAT_PGSZ as u64,
-            mmu::PROT_FW_SHARED_RW,
+        let mut secondary_status_a = MappedObject::subview(
+            &native_private_cluster,
+            G17P_NATIVE_SECONDARY_STATUS_A_OFFSET,
+            G17P_NATIVE_SECONDARY_STATUS_A_VIEW_SIZE,
         )?;
-        let mut secondary_status_a = MappedObject::new_wc(
-            dev,
-            &address_space.uat,
-            STATUS_A_ALLOC_SIZE,
-            mmu::UAT_PGSZ as u64,
-            mmu::PROT_FW_SHARED_RW,
+        let mut secondary_state = MappedObject::subview(
+            &native_private_cluster,
+            G17P_NATIVE_SECONDARY_STATE_OFFSET,
+            G17P_NATIVE_SECONDARY_STATE_VIEW_SIZE,
         )?;
+        dev_info!(
+            dev.as_ref(),
+            "G17P resources: native private arena views primary={:#x} primary-statusA={:#x} secondary-statusA={:#x} secondary-grid={:#x}\n",
+            primary_state.iova(),
+            primary_state.iova() + PRIMARY_STATUS_A_STATE_GRID_OFFSET,
+            secondary_status_a.iova(),
+            secondary_state.iova(),
+        );
         let primary_region_views = g17_initdata::PrimaryRegionViews {
             sentinel_high: primary_b2_sentinel.iova(),
             alias_high: [
@@ -8765,7 +8813,7 @@ impl G17ResourceOwner {
         )?;
         roots.write_roots(&shared, &primary_instance, &secondary_instance)?;
         // Publish both opening producers after the rings and descriptor graph.
-        // Firmware owns the two consumer cursors until CONTROL_START.
+        // Firmware owns the two consumer cursors until the post-initdata 0x89.
         write_control_counters(
             &mut primary_state,
             [0, 0, g17_initdata::CONTROL_OPENING_PRIMARY_PRODUCER],
@@ -11468,18 +11516,6 @@ impl G17ResourceOwner {
         self.resources.region_c.with_bytes_mut(|bytes| {
             bytes.fill(0);
             g17_initdata::encode_region_c(bytes).map_err(|_| EINVAL)
-        })?;
-        self.resources.primary_state.with_bytes_mut(|bytes| {
-            bytes.fill(0);
-            Ok(())
-        })?;
-        self.resources.secondary_state.with_bytes_mut(|bytes| {
-            bytes.fill(0);
-            Ok(())
-        })?;
-        self.resources.secondary_status_a.with_bytes_mut(|bytes| {
-            bytes.fill(0);
-            Ok(())
         })?;
         self.resources.primary_b2_sentinel.with_bytes_mut(|bytes| {
             bytes.fill(0);
@@ -14869,15 +14905,19 @@ mod tests {
     }
 
     #[test]
-    fn status_a_uses_the_page_rounded_native_extent() {
-        let cluster_end = G17P_NATIVE_PRIVATE_CLUSTER_OFFSET
-            + G17P_NATIVE_PRIVATE_CLUSTER_SIZE as u64;
-        let source_extent = cluster_end - G17P_NATIVE_SECONDARY_STATUS_A_OFFSET;
+    fn private_arena_views_match_the_native_overlaps() {
+        let source_extent = G17P_NATIVE_PRIVATE_CLUSTER_SIZE
+            - G17P_NATIVE_SECONDARY_STATUS_A_OFFSET;
         assert_eq!(source_extent, 0xb4f00);
-        assert_eq!(STATUS_A_ALLOC_SIZE, 0xb8000);
-        assert!(0xb4004 < STATUS_A_ALLOC_SIZE);
-        assert!(STATUS_A_ALLOC_SIZE as u64 >= source_extent);
-        assert_eq!(STATUS_A_ALLOC_SIZE % G17P_PAGE_SIZE, 0);
+        assert_eq!(G17P_NATIVE_SECONDARY_STATUS_A_VIEW_SIZE, 0xb4f00);
+        assert!(0xb4004 < G17P_NATIVE_SECONDARY_STATUS_A_VIEW_SIZE);
+        assert_eq!(G17P_NATIVE_SECONDARY_STATE_OFFSET, 0x1770c0);
+        assert_eq!(G17P_NATIVE_SECONDARY_STATE_VIEW_SIZE, 0xf40);
+        assert_eq!(
+            G17P_NATIVE_SECONDARY_STATE_OFFSET
+                + g17_initdata::PRIMARY_STATUS_B_STATE_GRID_OFFSET,
+            0x177400,
+        );
     }
 
     #[test]
