@@ -35,6 +35,7 @@ mod g17_render;
 mod g17_resources;
 mod g17_rtkit;
 mod g17_submission;
+mod g17_trace_capture;
 mod g17_uapi;
 mod gem;
 mod gpu;

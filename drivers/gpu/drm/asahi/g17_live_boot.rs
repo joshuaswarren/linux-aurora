@@ -1074,6 +1074,9 @@ fn complete_primary_real_recovery(
             "G17P recovery: published 128 invalid/zero last-submitted HW timestamps\n"
         );
     }
+    // Full binary observation while the validated state-1 halt still holds.
+    // The archive owns copies; exposing it does not expose mutable GPU memory.
+    finish_g17p_render_trace(pdev.as_ref(), manager, crate::g17_trace_capture::Phase::RecoveryBeforeAck);
     manager.acknowledge_primary_firmware_recovery(1, 2)?;
     let mut post_state = 2;
     for _ in 0..FIRMWARE_RECOVERY_POLLS {
@@ -1148,6 +1151,27 @@ fn complete_primary_real_recovery(
 }
 
 static INLINE_RECOVERIES_SERVICED: AtomicU32 = AtomicU32::new(0);
+
+/// Offer only a sealed first-render archive through the established coredump
+/// mechanism. Existing coredumps can occupy the device slot; the host must
+/// verify the G17TRC01 magic rather than assume every devcd contains this data.
+fn finish_g17p_render_trace(
+    dev: &kernel::device::Device,
+    manager: &mut g17_manager::G17PManagerConstruction,
+    phase: crate::g17_trace_capture::Phase,
+) {
+    #[cfg(CONFIG_DEV_COREDUMP)]
+    match manager.finish_render_trace(phase) {
+        Ok(Some(capture)) => {
+            let size = capture.len();
+            devcoredump::dev_coredump(dev, &crate::THIS_MODULE, capture, GFP_KERNEL,
+                msecs_to_jiffies(60 * 60 * 1000));
+            dev_info!(dev, "G17P binary capture: sealed {} bytes phase={:?}; offered to devcoredump (G17TRC01)\n", size, phase);
+        }
+        Ok(None) => {}
+        Err(error) => dev_warn!(dev, "G17P binary capture finalization failed: {:?}\n", error),
+    }
+}
 
 fn settle_primary_empty_recovery(
     pdev: &platform::Device,
@@ -3454,6 +3478,10 @@ impl G17PLiveRuntime {
                 .as_mut()
                 .ok_or(ENODEV)?
                 .wait_translated_render_completion()?;
+            if let (Some(pdev), Some(manager)) = (self.pdev.as_ref(), self.manager.as_mut()) {
+                finish_g17p_render_trace(pdev.as_ref(), manager,
+                    crate::g17_trace_capture::Phase::AfterPairRetirement);
+            }
             let release = self
                 .manager
                 .as_mut()
@@ -3495,6 +3523,10 @@ impl G17PLiveRuntime {
                                 );
                             }
                         }
+                    }
+                    if let (Some(pdev), Some(manager)) = (self.pdev.as_ref(), self.manager.as_mut()) {
+                        finish_g17p_render_trace(pdev.as_ref(), manager,
+                            crate::g17_trace_capture::Phase::AfterPairRetirement);
                     }
                     let release = self
                         .manager
@@ -3689,6 +3721,17 @@ impl G17PLiveRuntime {
                 timestamp_aliases,
                 registers,
             )?;
+        // Copy only before the FList wake and while both outers are deferred.
+        // Never insert this scan between producer publication and doorbell.
+        if let Some(manager) = self.manager.as_mut() {
+            if let Err(error) = manager.capture_prepared_render_trace(
+                native_doorbell_mode == 0 && !split_launch,
+            ) {
+                if let Some(pdev) = self.pdev.as_ref() {
+                    dev_warn!(pdev.as_ref(), "G17P prepared binary capture failed: {:?}\n", error);
+                }
+            }
+        }
         // Native retires AGXUSCPrivMemFList::updateSubmitInfo and its type-13
         // grow before exposing either render outer producer. The control-ring
         // notification itself wakes the scheduler, so a merely staged final

@@ -13,6 +13,9 @@ use kernel::prelude::*;
 #[cfg(not(test))]
 use crate::g17_initdata;
 #[cfg(not(test))]
+use crate::g17_trace_capture::{self as trace, Kind as TraceKind, Meta as TraceMeta,
+    Omission as TraceOmission, Phase as TracePhase, TraceArchive};
+#[cfg(not(test))]
 use crate::{
     driver::{AsahiDevRef, AsahiDevice},
     g17_completion, g17_compute, g17_render, g17_submission, g17_uapi, gem, mem, mmu,
@@ -1645,6 +1648,9 @@ struct MappedObject {
     iova: u64,
     object_offset: usize,
     logical_size: usize,
+    /// Records the existing owning CPU mapping; capture never creates a
+    /// physical alias or upgrades a WB observation to GPU-coherent evidence.
+    cpu_wc: bool,
 }
 
 /// Kernel-owned storage whose GPU mapping belongs only to a render VM.
@@ -1902,6 +1908,7 @@ impl MappedObject {
             iova,
             object_offset: 0,
             logical_size: size,
+            cpu_wc: true,
         })
     }
 
@@ -1939,6 +1946,7 @@ impl MappedObject {
             iova,
             object_offset: 0,
             logical_size: size,
+            cpu_wc: true,
         })
     }
 
@@ -1960,6 +1968,7 @@ impl MappedObject {
             iova,
             object_offset: 0,
             logical_size: size,
+            cpu_wc: false,
         })
     }
 
@@ -1997,6 +2006,7 @@ impl MappedObject {
             iova,
             object_offset: 0,
             logical_size: size,
+            cpu_wc: false,
         })
     }
 
@@ -2028,7 +2038,49 @@ impl MappedObject {
             iova: parent.iova.checked_add(offset as u64).ok_or(EOVERFLOW)?,
             object_offset: parent.object_offset.checked_add(offset).ok_or(EOVERFLOW)?,
             logical_size,
+            cpu_wc: parent.cpu_wc,
         })
+    }
+
+    /// Copy only this retained object's existing CPU view into a preallocated
+    /// archive. Full expected bytes or an explicit omission; never a short
+    /// object padded with zeros. An explicit DVA can name a retained alias.
+    fn capture_trace_range(
+        &mut self, archive: &mut TraceArchive<'_>, mut meta: TraceMeta,
+        offset: usize, size: usize, clock: &mut impl FnMut() -> u64,
+    ) -> Result {
+        meta.expected_len = size as u64;
+        meta.provenance = if self.cpu_wc { trace::Provenance::ExistingOwnedWc }
+                          else { trace::Provenance::ExistingOwnedWb };
+        if meta.dva == 0 {
+            let Some(dva) = self.iova.checked_add(offset as u64) else {
+                archive.omit(meta, TraceOmission::InvalidRange).map_err(|_| EINVAL)?;
+                return Ok(());
+            };
+            meta.dva = dva;
+        }
+        if meta.root == trace::ROOT_UNKNOWN {
+            meta.root = if meta.dva & (1u64 << 42) != 0 { trace::ROOT_GLOBAL }
+                        else { trace::ROOT_CONTEXT_LOW };
+        }
+        let Some(end) = offset.checked_add(size).filter(|end| *end <= self.logical_size) else {
+            archive.omit(meta, TraceOmission::InvalidRange).map_err(|_| EINVAL)?;
+            return Ok(());
+        };
+        archive.capture(meta, clock, |out| {
+            self.with_bytes_mut(|bytes| {
+                out.copy_from_slice(&bytes[offset..end]);
+                Ok(())
+            }).map_err(|_| TraceOmission::ReadError)
+        }).map_err(|_| EINVAL)?;
+        Ok(())
+    }
+
+    fn capture_trace(
+        &mut self, archive: &mut TraceArchive<'_>, meta: TraceMeta,
+        clock: &mut impl FnMut() -> u64,
+    ) -> Result {
+        self.capture_trace_range(archive, meta, 0, self.logical_size, clock)
     }
 
     fn read_u32(&mut self, address: u64) -> Result<u32> {
@@ -4473,6 +4525,123 @@ fn render_build_fail(site: u32) -> kernel::error::Error {
 }
 
 impl G17PUserRenderStorage {
+    /// First-stage raw capture of the retained host-authored render graph.
+    /// Descriptor pages include the actual embedded RCE arrays. The separate
+    /// fragment_rce diagnostic mirror is deliberately not substituted for them.
+    pub(crate) fn capture_owned_trace(
+        &mut self, archive: &mut TraceArchive<'_>, phase: TracePhase,
+        phase_sequence: u64, job_stamp: u64, clock: &mut impl FnMut() -> u64,
+    ) -> Result {
+        // The app-GART lease is an additional alias (currently slot 5), not
+        // the execution context encoded in this TA/3D pair. Manager retains
+        // the same client VM in native render slot 1 throughout this capture.
+        let context = u32::from(g17p_render_descriptor_context_id());
+        let mut meta = TraceMeta::new(TraceKind::RenderDescriptors, phase, phase_sequence);
+        meta.role = 0;
+        meta.context = 0;
+        meta.job_stamp = job_stamp;
+        for (offset, dva, qid) in [
+            (0, self.descriptor_ta_high.iova(), G17P_RENDER_TA_QUEUE_ID),
+            (mmu::UAT_PGSZ, self.descriptor_3d_high.iova(), G17P_RENDER_3D_QUEUE_ID),
+        ] {
+            let mut item = meta;
+            item.dva = dva;
+            item.qid = u32::from(qid);
+            self.descriptors.capture_trace_range(archive, item, offset, mmu::UAT_PGSZ, clock)?;
+        }
+        // Preserve the existing alias identities too: RCE self pointers are
+        // low addresses, not addresses in the descriptor's high root.
+        for (offset, dva, qid, alias_context, instance) in [
+            (0, self.descriptor_ta_low.iova(), G17P_RENDER_TA_QUEUE_ID, 0, 1),
+            (mmu::UAT_PGSZ, self.descriptor_3d_low.iova(), G17P_RENDER_3D_QUEUE_ID, 0, 1),
+            (mmu::UAT_PGSZ, self.descriptor_3d_render.iova(), G17P_RENDER_3D_QUEUE_ID, context, 2),
+        ] {
+            let mut item = meta;
+            item.dva = dva;
+            item.qid = u32::from(qid);
+            item.context = alias_context;
+            item.root = trace::ROOT_CONTEXT_LOW;
+            item.instance = instance;
+            self.descriptors.capture_trace_range(archive, item, offset, mmu::UAT_PGSZ, clock)?;
+        }
+        for (kind, object, object_context) in [
+            (TraceKind::RenderQueueGraph, &mut self.graph, 0),
+            (TraceKind::RenderSupport, &mut self.support, 0),
+            (TraceKind::RenderState, &mut self.render_state, context),
+            (TraceKind::RenderTimestamps, &mut self.timestamps, 0),
+            (TraceKind::FragmentStatus, &mut self.fragment_status, 0),
+        ] {
+            let mut item = meta;
+            item.kind = kind;
+            item.context = object_context;
+            object.capture_trace(archive, item, clock)?;
+        }
+        // Follow the exact retained alias owners/constructor source offsets.
+        // These compact addresses, not the generic backing allocation's DVA,
+        // are what the actual RCE arrays publish for TMAP/HMTA/TPC/AXFB.
+        for (instance, offset, mapping) in [
+            (1, G17P_RENDER_STATE_DEFLAKE, &self.render_user_aliases.deflake),
+            (2, self.render_layout.tilemap, &self.render_user_aliases.rt_memory),
+            (3, self.render_layout.tpc, &self.render_user_aliases.tpc),
+            (4, self.render_layout.aux_fb, &self.render_user_aliases.aux_fb),
+        ] {
+            let mut item = meta;
+            item.kind = TraceKind::RenderState;
+            item.context = context;
+            item.root = trace::ROOT_CONTEXT_LOW;
+            item.instance = instance;
+            item.dva = mapping.iova();
+            self.render_state.capture_trace_range(archive, item, offset, mapping.size(), clock)?;
+        }
+        if let Some(mapping) = &self.render_ta_status {
+            let mut item = meta;
+            item.kind = TraceKind::RenderState;
+            item.instance = 5;
+            item.dva = mapping.iova();
+            self.render_state.capture_trace_range(
+                archive, item, G17P_RENDER_STATE_TA_STATUS, mapping.size(), clock)?;
+        }
+        let mut status = meta;
+        status.kind = TraceKind::FragmentStatus;
+        status.context = context;
+        status.root = trace::ROOT_CONTEXT_LOW;
+        status.instance = 1;
+        status.dva = self.fragment_status_low.iova();
+        self.fragment_status.capture_trace_range(
+            archive, status, 0, self.fragment_status_low.size(), clock)?;
+        for (kind, object, object_context) in [
+            (TraceKind::SceneScratch, self.scene_scratch.as_mut(), context),
+            (TraceKind::Discard, self.discard.as_mut(), context),
+            // PM descriptors/PoolA/Scene/HWPB are firmware-high objects.
+            (TraceKind::ParameterManagement, self.parameter_management.as_mut().map(|pm| &mut pm.backing), 0),
+        ] {
+            let mut item = meta;
+            item.kind = kind;
+            item.context = object_context;
+            if let Some(object) = object {
+                object.capture_trace(archive, item, clock)?;
+            } else {
+                archive.omit(item, TraceOmission::Unavailable).map_err(|_| EINVAL)?;
+            }
+        }
+        // These buffers require separate ownership-aware traversal; a missing
+        // payload must not turn into a fabricated all-zero native comparison.
+        for kind in [TraceKind::ClientObjects, TraceKind::TvbPayload] {
+            let mut item = meta;
+            item.kind = kind;
+            item.context = context;
+            item.root = trace::ROOT_CONTEXT_LOW;
+            if kind == TraceKind::TvbPayload {
+                if let Some(tvb) = &self.render_tvb {
+                    item.dva = tvb.iova();
+                    item.expected_len = (tvb.block_mappings.len() * G17P_RENDER_TVB_BLOCK_SIZE) as u64;
+                }
+            }
+            archive.omit(item, TraceOmission::NotImplemented).map_err(|_| EINVAL)?;
+        }
+        Ok(())
+    }
+
     /// DIAGNOSTIC. Read the render `channel_control` object the tag-15 record
     /// names at `+0x4a`.
     ///
@@ -7481,6 +7650,38 @@ impl G17PUserRenderStorage {
 
 #[cfg(not(test))]
 impl G17PClRuntimeStorage {
+    /// Capture the exact live SKSM backing and both existing address aliases,
+    /// plus every owned queue/config support object. QID/stamp identify the
+    /// current job; this does not infer execution from a completion timestamp.
+    pub(crate) fn capture_owned_trace(
+        &mut self, archive: &mut TraceArchive<'_>, phase: TracePhase,
+        phase_sequence: u64, qid: u32, job_stamp: u64,
+        clock: &mut impl FnMut() -> u64,
+    ) -> Result {
+        let mut meta = TraceMeta::new(TraceKind::SksmEntries, phase, phase_sequence);
+        meta.role = 0;
+        meta.context = 0;
+        meta.qid = qid;
+        meta.job_stamp = job_stamp;
+        self.entries.capture_trace(archive, meta, clock)?;
+        let mut high = meta;
+        high.dva = self.entries_high.iova();
+        high.instance = 1;
+        self.entries.capture_trace(archive, high, clock)?;
+        for (kind, object) in [
+            (TraceKind::ClSharedSupport, &mut self.shared_support),
+            (TraceKind::ClChannelControl, &mut self.channel_control),
+            (TraceKind::ClSupportState, &mut self.support_state),
+            (TraceKind::ClSchedulerState, &mut self.scheduler_state),
+            (TraceKind::ClOperandTable, &mut self.operand_table),
+        ] {
+            let mut item = meta;
+            item.kind = kind;
+            object.capture_trace(archive, item, clock)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn new(
         dev: &AsahiDevice,
         uat: &mmu::Uat,
@@ -7898,6 +8099,110 @@ pub(crate) struct G17ResourceOwner {
 #[cfg(not(test))]
 #[allow(dead_code)]
 impl G17ResourceOwner {
+    /// Raw boot/shared-memory observation using retained owning mappings only.
+    /// Large roots/main/state allocations are copied without live formatting.
+    /// Callers preallocate and retain the archive, and export it after halt or
+    /// completion. Existing WB views carry distinct provenance in each record.
+    pub(crate) fn capture_owned_trace(
+        &mut self, archive: &mut TraceArchive<'_>, phase: TracePhase,
+        phase_sequence: u64, clock: &mut impl FnMut() -> u64,
+    ) -> Result {
+        let mut meta = TraceMeta::new(TraceKind::InitdataRoot, phase, phase_sequence);
+        meta.context = 0;
+        for (role, offset, size) in [
+            (0, 0, g17_initdata::ROOT_SIZE_PRIMARY),
+            (1, g17_initdata::SECONDARY_ROOT_DELTA as usize, g17_initdata::ROOT_SIZE_SECONDARY),
+        ] {
+            let mut item = meta;
+            item.role = role;
+            self.resources.roots.capture_trace_range(archive, item, offset, size, clock)?;
+        }
+        for (role, offset) in [
+            (0, g17_initdata::NATIVE_PRIMARY_MAIN_BUNDLE_OFFSET),
+            (1, g17_initdata::NATIVE_SECONDARY_MAIN_BUNDLE_OFFSET),
+        ] {
+            let mut item = meta;
+            item.kind = TraceKind::MainConfig;
+            item.role = role;
+            self.resources.shared_cluster.capture_trace_range(
+                archive, item, offset, g17_initdata::MAIN_CONFIG_SIZE, clock)?;
+        }
+        for (kind, role, instance, object) in [
+            (TraceKind::SharedHwdataCluster, trace::SHARED_ROLE, 0, &mut self.resources.shared_cluster),
+            (TraceKind::PrivateState, 0, 0, &mut self.resources.primary_state),
+            (TraceKind::PrivateState, 1, 0, &mut self.resources.secondary_state),
+            (TraceKind::SecondaryStatusA, 1, 0, &mut self.resources.secondary_status_a),
+            (TraceKind::RegionA, trace::SHARED_ROLE, 0, &mut self.resources.region_a),
+            (TraceKind::RegionC, trace::SHARED_ROLE, 0, &mut self.resources.region_c),
+            (TraceKind::Qos, trace::SHARED_ROLE, 0, &mut self.resources.qos_resource),
+            (TraceKind::SksmQid, trace::SHARED_ROLE, 0, &mut self.resources.sksm_qid_resource),
+            (TraceKind::CompletionRing, trace::SHARED_ROLE, 0, &mut self.resources.completion_ordinal_0),
+            (TraceKind::CompletionRing, trace::SHARED_ROLE, 2, &mut self.resources.completion_ordinal_2),
+            (TraceKind::ParameterMetrics, trace::SHARED_ROLE, 0, &mut self.resources.parameter_metrics),
+            (TraceKind::PbDescriptorTable, trace::SHARED_ROLE, 0, &mut self.resources.pb_descriptor_table),
+            (TraceKind::UmaDescriptorTable, trace::SHARED_ROLE, 0, &mut self.resources.uma_page_pool_descriptor_table),
+            (TraceKind::ControlShared, trace::SHARED_ROLE, 0, &mut self.resources.control_shared),
+            (TraceKind::ControlShared, trace::SHARED_ROLE, 1, &mut self.resources.control_shared_inner),
+            (TraceKind::PartialControl, trace::SHARED_ROLE, 0, &mut self.resources.partial_opening_control_shared),
+            (TraceKind::PartialControl, trace::SHARED_ROLE, 1, &mut self.resources.partial_opening_control_shared_inner),
+            (TraceKind::ContextPeer, 0, 0, &mut self.resources.bootstrap_ta_context_peer),
+            (TraceKind::ContextPeer, 0, 1, &mut self.resources.bootstrap_3d_context_peer),
+            (TraceKind::PartialPrimaryIndex, trace::SHARED_ROLE, 0, &mut self.resources.partial_primary_index),
+        ] {
+            let mut item = meta;
+            item.kind = kind;
+            item.role = role;
+            item.instance = instance;
+            object.capture_trace(archive, item, clock)?;
+        }
+        // The same owned context-peer backing is the native render SKSM
+        // entry ring. Keep its low root-0 identity as well as the high object
+        // above; graph readers must not silently infer a client-root alias.
+        for (tiling, object) in [
+            (true, &mut self.resources.bootstrap_ta_context_peer),
+            (false, &mut self.resources.bootstrap_3d_context_peer),
+        ] {
+            let mut item = TraceMeta::new(TraceKind::SksmEntries, phase, phase_sequence);
+            item.role = 0;
+            item.context = 0;
+            item.root = trace::ROOT_CONTEXT_LOW;
+            item.qid = u32::from(g17p_render_queue_id(tiling));
+            item.dva = Self::render_sksm_entry_low_va(tiling);
+            item.instance = u32::from(!tiling);
+            object.capture_trace(archive, item, clock)?;
+        }
+        // These are retained, established context-0 mappings. Their numeric
+        // low addresses must not be reinterpreted as application context 1.
+        for (kind, instance, object, mapping) in [
+            (TraceKind::PbDescriptorTable, 1, &mut self.resources.pb_descriptor_table, &self.resources.pb_descriptor_table_low),
+            (TraceKind::UmaDescriptorTable, 1, &mut self.resources.uma_page_pool_descriptor_table, &self.resources.uma_page_pool_descriptor_table_low),
+            (TraceKind::PartialPrimaryIndex, 1, &mut self.resources.partial_primary_index, &self.resources.partial_primary_index_low),
+            (TraceKind::CompletionRing, 1, &mut self.resources.completion_ordinal_0, &self.resources.completion_ordinal_0_low),
+            (TraceKind::CompletionRing, 3, &mut self.resources.completion_ordinal_2, &self.resources.completion_ordinal_2_low),
+        ] {
+            let mut item = TraceMeta::new(kind, phase, phase_sequence);
+            item.context = 0;
+            item.root = trace::ROOT_CONTEXT_LOW;
+            item.instance = instance;
+            item.dva = mapping.iova();
+            object.capture_trace(archive, item, clock)?;
+        }
+        // Uat itself retains this mapping and the same GEM: unlike an
+        // invented physical alias, t8140_parameter_metrics() supplies both.
+        let mut metrics = TraceMeta::new(TraceKind::ParameterMetrics, phase, phase_sequence);
+        metrics.context = 0;
+        metrics.root = trace::ROOT_CONTEXT_LOW;
+        metrics.instance = 1;
+        metrics.dva = self.resources.parameter_metrics_low_va;
+        self.resources.parameter_metrics.capture_trace(archive, metrics, clock)?;
+        for kind in [TraceKind::OperandPayload, TraceKind::MmioEvents,
+                     TraceKind::MailboxEvents, TraceKind::PageTables] {
+            let item = TraceMeta::new(kind, phase, phase_sequence);
+            archive.omit(item, TraceOmission::NotImplemented).map_err(|_| EINVAL)?;
+        }
+        Ok(())
+    }
+
     /// Read the real shared page-metrics object referenced by the PB
     /// descriptor. The per-submit render backing has an unused placeholder
     /// with the same shape, but firmware never consumes that copy.
@@ -8639,6 +8944,8 @@ impl G17ResourceOwner {
             iova: parameter_metrics_iova,
             object_offset: 0,
             logical_size: mmu::T8140_PARAMETER_METRICS_SIZE,
+            // Uat::new_t8140 owns this object via new_kernel_object_wc.
+            cpu_wc: true,
         };
         parameter_metrics.with_bytes_mut(|bytes| {
             bytes.fill(0);
