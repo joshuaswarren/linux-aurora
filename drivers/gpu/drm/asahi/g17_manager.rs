@@ -3213,7 +3213,7 @@ impl G17PManagerConstruction {
         self.render_storage
             .as_mut()
             .ok_or(ENODEV)?
-            .audit_fragment_rce_mapping(dev, vm)
+            .audit_fragment_rce_mapping(dev, self.resources.uat().kernel_lower_vm())
             .map_err(|error| Self::render_stage_fail("fragment-rce-vm-audit", error))?;
         if g17p_native_fragment_first_mode(native_doorbell_mode) {
             fence(Ordering::Acquire);

@@ -2711,9 +2711,11 @@ pub(crate) struct G17PUserRenderStorage {
     descriptor_3d_high: mmu::KernelMapping,
     descriptor_ta_low: mmu::KernelMapping,
     descriptor_3d_low: mmu::KernelMapping,
-    /// Render-VM alias of the 3D descriptor backing page. Native allocates
-    /// this low address dynamically and uses it for both the descriptor's RCE
-    /// self trailers and the four KSM RCEInfo bindings.
+    /// Retained diagnostic client alias, unused by hardware encoding. KSM's
+    /// RCE arrays, self trailers and MCache table pointer use descriptor_3d_low
+    /// in context 0. Keep this allocation for now to isolate the pointer fix
+    /// from allocator-layout changes; the MCache range contents still name
+    /// the client execution context independently of the table's own address.
     descriptor_3d_render: mmu::KernelMapping,
     ta_context_low: mmu::KernelMapping,
     fragment_context_low: mmu::KernelMapping,
@@ -4672,7 +4674,11 @@ impl G17PUserRenderStorage {
         if tiling {
             G17P_BOOTSTRAP_TA_DESCRIPTOR_LOW_VA
         } else {
-            self.descriptor_3d_render.iova()
+            // Valid cold native captures encode 0x7000098000+array-offset.
+            // KSM fetches RCE arrays through context 0 (unit 0xd8), not the
+            // command's client GART. An unrelated eager compute mapping used
+            // to hide the missing mapping of the old client-only RCE VA.
+            self.descriptor_3d_low.iova()
         }
     }
 
@@ -5479,9 +5485,11 @@ impl G17PUserRenderStorage {
             )
         );
         let descriptor_3d_render_va = descriptor_3d_render.iova();
+        let descriptor_3d_rce_va = descriptor_3d_low.iova();
         dev_info!(
             dev.as_ref(),
-            "G17P render RCE: descriptor backing aliased into render VM at {:#x}; diagnostic entry mirrors={:#x}/{:#x}/{:#x}/{:#x} stride={:#x}\n",
+            "G17P render RCE: context0 descriptor={:#x}, retained diagnostic client alias={:#x}; diagnostic entry mirrors={:#x}/{:#x}/{:#x}/{:#x} stride={:#x}\n",
+            descriptor_3d_rce_va,
             descriptor_3d_render_va,
             fragment_rce_va,
             fragment_rce_va + g17_render::G17P_FRAGMENT_RCE_PROGRAM_STRIDE,
@@ -5520,7 +5528,7 @@ impl G17PUserRenderStorage {
             .map_err(|error| render_build_fail_named(18, error))?;
             g17_render::apply_g17p_retained_descriptor_fields(
                 g17_render::RenderDescriptorKind::Fragment,
-                descriptor_3d_render_va,
+                descriptor_3d_rce_va,
                 g17_initdata::CONTROL_SHARED_ADDRESS,
                 g17p_render_queue_id(false) as u8,
                 g17p_render_queue_id(false) as u8,
@@ -5569,7 +5577,7 @@ impl G17PUserRenderStorage {
                 &translated.fragment_attachments,
                 translated.parameters.aux_fb,
                 G17P_RENDER_STATE_AUX_FB_SIZE as u64,
-                descriptor_3d_render_va,
+                descriptor_3d_rce_va,
                 g17_render::G17P_FRAGMENT_MCACHE_OFFSET,
                 fragment,
             )?;
@@ -5599,7 +5607,7 @@ impl G17PUserRenderStorage {
                     dev.as_ref(),
                     "G17P 3d-desc bootstrap context={} ordinal=0 low_va={:#x} bytes={:#x}\n",
                     command_context_id,
-                    descriptor_3d_render_va,
+                    descriptor_3d_rce_va,
                     g17_render::FRAGMENT_DESCRIPTOR_SIZE,
                 );
                 for (index, chunk) in fragment[..g17_render::FRAGMENT_DESCRIPTOR_SIZE]
@@ -5629,7 +5637,7 @@ impl G17PUserRenderStorage {
         dev_info!(
             dev.as_ref(),
             "G17P render storage: 3D self={:#x} context={:#x}/{:#x} tails={:#x}/{:#x}/{:#x}\n",
-            descriptor_3d_render_va,
+            descriptor_3d_rce_va,
             G17P_BOOTSTRAP_3D_CONTEXT_LOW_VA,
             G17P_BOOTSTRAP_3D_CONTEXT_HIGH_VA,
             G17P_BOOTSTRAP_DESCRIPTOR_ZERO_A_VA + 4,
@@ -5934,7 +5942,7 @@ impl G17PUserRenderStorage {
             objects
         };
         let fragment_rce_va = self.fragment_rce.iova();
-        let descriptor_3d_render_va = self.descriptor_3d_render.iova();
+        let descriptor_3d_rce_va = self.descriptor_3d_low.iova();
         let fragment_rce = &mut self.fragment_rce;
         let fragment_mcache = next_descriptors.with_bytes_mut(|raw| {
             let (tiling, fragment) = raw.split_at_mut(0x4000);
@@ -5976,7 +5984,7 @@ impl G17PUserRenderStorage {
             .map_err(|_| EINVAL)?;
             g17_render::apply_g17p_retained_descriptor_fields(
                 g17_render::RenderDescriptorKind::Fragment,
-                descriptor_3d_render_va,
+                descriptor_3d_rce_va,
                 g17_initdata::CONTROL_SHARED_ADDRESS,
                 g17p_render_queue_id(false) as u8,
                 g17p_render_queue_id(false) as u8,
@@ -6025,7 +6033,7 @@ impl G17PUserRenderStorage {
                 &translated.fragment_attachments,
                 translated.parameters.aux_fb,
                 G17P_RENDER_STATE_AUX_FB_SIZE as u64,
-                descriptor_3d_render_va,
+                descriptor_3d_rce_va,
                 g17_render::G17P_FRAGMENT_MCACHE_OFFSET,
                 fragment,
             )
@@ -7028,7 +7036,7 @@ impl G17PUserRenderStorage {
         })
     }
 
-    /// Prove that every RCE binding resolves through the submitted app VM to
+    /// Prove that every RCE binding resolves through context 0's lower VM to
     /// the descriptor bytes the CPU just built.  A syntactically correct
     /// binding is insufficient if the selected hardware context names a
     /// different page-table root; that failure reaches KSM pipe assignment
@@ -7037,20 +7045,18 @@ impl G17PUserRenderStorage {
     pub(crate) fn audit_fragment_rce_mapping(
         &mut self,
         dev: &AsahiDevice,
-        vm: &mmu::Vm,
+        rce_vm: &mmu::Vm,
     ) -> Result {
-        if *crate::module_parameters::g17p_render_dump_descriptor.value() == 0 {
-            return Ok(());
-        }
-
-        let base = self.descriptor_3d_render.iova();
+        let verbose = *crate::module_parameters::g17p_render_dump_descriptor.value() != 0;
+        let base = self.descriptor_3d_low.iova();
         let mut roots = [(0u64, 0u64); 4];
-        vm.context_roots(&mut roots)?;
+        rce_vm.context_roots(&mut roots)?;
+        if verbose {
         dev_info!(
             dev.as_ref(),
-            "G17P 3d-rce VM audit: base={:#x} vm-root={:#x} ctx0=[{:#x},{:#x}] ctx1=[{:#x},{:#x}] ctx2=[{:#x},{:#x}] ctx3=[{:#x},{:#x}]\n",
+            "G17P 3d-rce context0 audit: base={:#x} vm-root={:#x} ctx0=[{:#x},{:#x}] ctx1=[{:#x},{:#x}] ctx2=[{:#x},{:#x}] ctx3=[{:#x},{:#x}]\n",
             base,
-            vm.page_table_root(),
+            rce_vm.page_table_root(),
             roots[0].0,
             roots[0].1,
             roots[1].0,
@@ -7060,12 +7066,13 @@ impl G17PUserRenderStorage {
             roots[3].0,
             roots[3].1,
         );
+        }
 
         for (tag, offset) in [(56u8, 0xa0usize), (10, 0x7c0), (17, 0xee0), (10, 0x1600)] {
             let address = base.checked_add(offset as u64).ok_or(EOVERFLOW)?;
-            let physical = vm.translate_iova(address)?;
+            let physical = rce_vm.translate_iova(address)?;
             let mut gpu_bytes = [0u8; 16];
-            vm.read_bytes(address, &mut gpu_bytes)?;
+            rce_vm.read_bytes(address, &mut gpu_bytes)?;
             let mut cpu_bytes = [0u8; 16];
             self.descriptors.with_bytes_mut(|raw| {
                 cpu_bytes.copy_from_slice(
@@ -7077,7 +7084,7 @@ impl G17PUserRenderStorage {
             if gpu_bytes != cpu_bytes {
                 dev_err!(
                     dev.as_ref(),
-                    "G17P 3d-rce VM audit: tag={} address={:#x} physical={:#x} GPU bytes {:02x?} != descriptor bytes {:02x?}\n",
+                    "G17P 3d-rce context0 audit: tag={} address={:#x} physical={:#x} GPU bytes {:02x?} != descriptor bytes {:02x?}\n",
                     tag,
                     address,
                     physical,
@@ -7086,14 +7093,14 @@ impl G17PUserRenderStorage {
                 );
                 return Err(EIO);
             }
-            dev_info!(
+            if verbose { dev_info!(
                 dev.as_ref(),
-                "G17P 3d-rce VM audit: tag={} address={:#x} physical={:#x} bytes={:02x?}\n",
+                "G17P 3d-rce context0 audit: tag={} address={:#x} physical={:#x} bytes={:02x?}\n",
                 tag,
                 address,
                 physical,
                 gpu_bytes,
-            );
+            ); }
         }
         Ok(())
     }
