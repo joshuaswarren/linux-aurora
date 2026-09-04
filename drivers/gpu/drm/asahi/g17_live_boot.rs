@@ -1303,6 +1303,12 @@ impl G17PTestStage {
         !matches!(self, Self::Control)
     }
 
+    /// Only the explicit QID4 diagnostic prepares a queue without a submit.
+    /// Normal render/compute UAPI sessions allocate it on first compute use.
+    const fn prepares_qid4_at_startup(self) -> bool {
+        matches!(self, Self::Qid4)
+    }
+
     const fn enables_compute_uapi(self) -> bool {
         matches!(self, Self::ComputeUapi)
     }
@@ -1936,18 +1942,20 @@ fn finish_boot_session(
         });
     }
 
-    dev_info!(
-        pdev.as_ref(),
-        "G17P session: deferring recovery and SKSM QID 4 memory preparation to serialized runtime work; stage {}\n",
-        test_stage.name()
-    );
+    if test_stage.prepares_qid4_at_startup() {
+        dev_info!(
+            pdev.as_ref(),
+            "G17P session: explicit QID4 diagnostic defers queue memory preparation to serialized runtime work\n"
+        );
+    } else {
+        dev_info!(
+            pdev.as_ref(),
+            "G17P session: render/compute UAPI ready; QID4 allocation deferred until first compute submit\n"
+        );
+    }
     dev_info!(
         pdev.as_ref(),
         "G17P diagnostic: j700-dual-initdata-publication-v1 armed\n"
-    );
-    dev_info!(
-        pdev.as_ref(),
-        "G17P compute: native-first-submit-v2 armed; pre-user EP21 quiet, first real CL sends 0x0a then 0x10\n"
     );
     Ok(G17PBootedSession {
         cpus,
@@ -1957,7 +1965,7 @@ fn finish_boot_session(
         gfx1_rtkit,
         queue: None,
         compute_uapi_enabled: test_stage.enables_compute_uapi(),
-        queue_setup_pending: true,
+        queue_setup_pending: test_stage.prepares_qid4_at_startup(),
     })
 }
 
@@ -2961,11 +2969,12 @@ impl G17PLiveRuntime {
 
     /// Build the retained QID 4 graph if this session has none.
     ///
-    /// The boot path deliberately defers this to the serialized event worker,
-    /// so that firmware recovery requests are answered first. That deferral is
-    /// kept -- but a submit must not *depend* on the worker having run, and a
-    /// rebuilt session must not sit un-submittable until it does. Preparing a
-    /// queue is allocation plus encoding: no MMIO, no firmware message.
+    /// Normal startup leaves this graph absent so first render does not depend
+    /// on compute-owned allocations or their live UAT mappings. The compute
+    /// submit path calls this synchronously, including after recovery; only
+    /// the explicit QID4 diagnostic asks the event worker to prepare it. This
+    /// allocates and encodes mapped memory, but sends no firmware message and
+    /// does not register the queue or issue compute work.
     pub(crate) fn ensure_compute_queue(&mut self) -> Result {
         if !self.test_stage.configures_qid4() {
             return Ok(());
@@ -4720,8 +4729,8 @@ impl G17PLiveRuntime {
         if !self.test_stage.enables_compute_uapi() {
             return Err(ENOTSUPP);
         }
-        // Never depend on the event worker having run. `ensure_compute_queue`
-        // is a no-op once a graph exists, and building one is allocation only.
+        // Allocate the compute graph on actual compute use, never as a
+        // prerequisite for render. This is a no-op once a graph exists.
         self.ensure_compute_queue()?;
         if !self.accepting_submissions {
             return Err(ENOTSUPP);
@@ -6221,7 +6230,9 @@ impl G17PLiveRuntime {
                 return Err(error);
             }
         };
-        let accepting_submissions = session.compute_uapi_enabled && session.queue.is_some();
+        // Render admission is independent of whether compute has ever been
+        // used. The first compute submit ensures its own graph synchronously.
+        let accepting_submissions = session.compute_uapi_enabled;
 
         Ok(Self {
             pdev: Some(pdev_ref),
@@ -6434,12 +6445,9 @@ impl g17_lifecycle::PersistentRuntimeRecovery for G17PLiveRuntime {
     }
 
     fn resume_submissions(&mut self) {
-        // NOT `&& self.queue.is_some()`. A rebuilt session comes back with no
-        // queue at all -- `boot_session` defers QID 4 to the event worker --
-        // so requiring one here left `accepting_submissions` false after every
-        // recovery, and the next client's VM_CREATE and submit both returned
-        // ENOTSUPP until an asynchronous worker happened to run. The submit
-        // path calls `ensure_compute_queue` instead, which is synchronous.
+        // As on initial boot, admission must not depend on the lazy compute
+        // graph. Render can be first after recovery; compute ensures its own
+        // graph synchronously when submitted.
         self.accepting_submissions = self.test_stage.enables_compute_uapi();
     }
 }
