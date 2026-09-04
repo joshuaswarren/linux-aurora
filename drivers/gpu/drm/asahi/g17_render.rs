@@ -277,12 +277,12 @@ pub(crate) struct G17pRenderParameters {
     /// pointers whose bit 39 is clear.
     pub(crate) absolute_pointers: bool,
     ///
-    /// High 16 bits of the background program's resource-specifier bind.
-    ///
-    /// WITNESSED: native reg 0x15369 = 0xffff800000000040, so the prefix is
-    /// 0xffff_8000_0000_0000. Ours has always been 0x0007_8000_0000_0000,
-    /// taken from the in-tree selftest's `bg_rsrc_spec_hi = 0x00078000`, which
-    /// was itself a guess -- the 192-byte capture stopped before this register.
+    /// Legacy diagnostic OR-mask for the BG resource-specifier high 17 bits.
+    /// Native calls this field PassControlMaskType and derives it from shader
+    /// outputs, including extension of the highest active pass bit; it is not
+    /// an address class or a universal constant. Main and partial shaders can
+    /// legitimately differ. Default zero preserves the userspace mask;
+    /// a nonzero value is an explicit diagnostic override only.
     pub(crate) bg_resource_prefix: u64,
     /// Use the single-capture witnessed values for the two TA descriptor bytes
     /// `+0x93f` and `+0x94d` instead of the values this driver has always sent.
@@ -409,7 +409,7 @@ impl G17pRenderParameters {
             fragment_user_timestamp_start: 0,
             fragment_user_timestamp_end: 0,
             absolute_pointers: false,
-            bg_resource_prefix: 0x0007_8000_0000_0000,
+            bg_resource_prefix: 0,
             native_pm_bytes: false,
             ta_hardware_buffer_id: 0,
             usc_flist_hardware_buffer_id: 0,
