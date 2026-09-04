@@ -65,7 +65,6 @@ const RENDER_FLAGS: u32 = RENDER_VERTEX_SCRATCH
 const SAMPLER_SIZE: u64 = 8;
 const MAX_SAMPLERS: u32 = 1024;
 const PAGE_SIZE: u64 = 0x4000;
-const BG_RESOURCE_PREFIX: u64 = 0x0007_8000_0000_0000;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum UapiTranslateError {
@@ -907,18 +906,23 @@ pub(crate) fn translate_render_command<A: GpuAddressSpace>(
     parameters.merge_upper_y_bits = command.merge_upper_y;
     parameters.depth_clear_value_bits = command.depth_clear;
     parameters.stencil_clear_value = command.stencil_clear;
-    parameters.load_pipeline_bind =
-        internal.parameters.bg_resource_prefix
-            | (command.background.resource_spec & resource_spec_mask);
+    parameters.load_pipeline_bind = g17p_bg_resource_spec(
+        command.background.resource_spec,
+        resource_spec_mask,
+        internal.parameters.bg_resource_prefix,
+    );
     parameters.load_pipeline = background;
     parameters.store_pipeline_bind = command.end_of_tile.resource_spec & resource_spec_mask;
     parameters.store_pipeline = end_of_tile;
-    // Partial resume/load executes the same background program contract as
-    // the main load. Native writes the identical resource-specifier prefix at
-    // fragment +0xd4, +0xefc, +0x1604, and +0x1ea8; applying it only to the
-    // main phase left every partial path with a different address class.
-    parameters.partial_load_pipeline_bind = internal.parameters.bg_resource_prefix
-        | (command.partial_background.resource_spec & resource_spec_mask);
+    // These high 17 bits are BG shader pass control, not an address class.
+    // Native derives main and partial masks from their respective shader
+    // outputs; they need not match. The default diagnostic prefix is zero,
+    // preserving both full RT0 output masks and no-output masks from userspace.
+    parameters.partial_load_pipeline_bind = g17p_bg_resource_spec(
+        command.partial_background.resource_spec,
+        resource_spec_mask,
+        internal.parameters.bg_resource_prefix,
+    );
     parameters.partial_load_pipeline = partial_background;
     parameters.partial_store_pipeline_bind =
         command.partial_end_of_tile.resource_spec & resource_spec_mask;
@@ -933,6 +937,10 @@ pub(crate) fn translate_render_command<A: GpuAddressSpace>(
         vertex_timestamps: command.vertex_timestamps,
         fragment_timestamps: command.fragment_timestamps,
     })
+}
+
+fn g17p_bg_resource_spec(resource_spec: u64, present_mask: u64, diagnostic_prefix: u64) -> u64 {
+    diagnostic_prefix | (resource_spec & present_mask)
 }
 
 pub(crate) fn build_render_descriptors(
@@ -1239,6 +1247,9 @@ mod tests {
 
         let mut internal = G17pRenderParameters::source_rsrc8();
         internal.context_base = 0;
+        // This frozen descriptor fixture predates userspace high-dword masks;
+        // retain its explicit legacy diagnostic mask, not a default injection.
+        internal.bg_resource_prefix = 0x0007_8000_0000_0000;
         let translated = translate_render_command(
             payload,
             vertex,
@@ -1294,6 +1305,19 @@ mod tests {
     }
 
     #[test]
+    fn background_pass_masks_preserve_userspace_and_explicit_diagnostics() {
+        let default_prefix = G17pRenderParameters::source_rsrc8().bg_resource_prefix;
+        assert_eq!(default_prefix, 0);
+        assert_eq!(g17p_bg_resource_spec(0xffff_8000_0000_0040, u64::MAX, default_prefix),
+                   0xffff_8000_0000_0040);
+        assert_eq!(g17p_bg_resource_spec(0x40, u64::MAX, default_prefix), 0x40);
+        assert_eq!(g17p_bg_resource_spec(0xffff_8000_0000_0040, u32::MAX as u64, default_prefix),
+                   0x40);
+        assert_eq!(g17p_bg_resource_spec(0x40, u64::MAX, 0xffff_8000_0000_0000),
+                   0xffff_8000_0000_0040);
+    }
+
+    #[test]
     fn render_resource_spec_high_dwords_reach_g17_register_programs() {
         const RENDER_HEADER: usize = 64;
         const PAYLOAD: usize = RENDER_HEADER + UAPI_COMMAND_HEADER_SIZE;
@@ -1311,8 +1335,8 @@ mod tests {
         for (offset, value) in [
             (0xf0, 0x0007_8000),
             (0xf4, 0x0007_8001),
-            (0xf8, 0x0007_8002),
-            (0xfc, 0x0007_8003),
+            (0xf8, 0xffff_8002),
+            (0xfc, 0),
         ] {
             extended[PAYLOAD + offset..PAYLOAD + offset + 4]
                 .copy_from_slice(&(value as u32).to_le_bytes());
@@ -1350,11 +1374,11 @@ mod tests {
         );
         assert_eq!(
             translated.parameters.load_pipeline_bind,
-            0x0007_8002_0000_0042
+            0xffff_8002_0000_0042
         );
         assert_eq!(
             translated.parameters.partial_load_pipeline_bind,
-            0x0007_8003_0000_0043
+            0x43
         );
         let registers = g17_render::build_fragment_registers(&translated.parameters).unwrap();
         assert_eq!(
@@ -1363,7 +1387,7 @@ mod tests {
                 .find(|register| register.number == 0x15369)
                 .unwrap()
                 .value,
-            0x0007_8002_0000_0042
+            0xffff_8002_0000_0042
         );
 
         // Clearing RSRC_SPEC_HI means "the high dwords are not present", so
@@ -1381,10 +1405,25 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(masked.parameters.load_pipeline_bind, 0x0007_8000_0000_0042);
+        assert_eq!(masked.parameters.load_pipeline_bind, 0x42);
         assert_eq!(
             masked.parameters.partial_load_pipeline_bind,
-            0x0007_8000_0000_0043
+            0x43
+        );
+
+        // An explicitly selected diagnostic OR-mask still applies; it is no
+        // longer silently imposed on ordinary no-output background programs.
+        let mut diagnostic = G17pRenderParameters::source_rsrc8();
+        diagnostic.bg_resource_prefix = 0xffff_8000_0000_0000;
+        let overridden = translate_render_command(
+            no_flag, vertex, fragment, window(), &TestAddressSpace,
+            RenderInternalState { parameters: diagnostic },
+        )
+        .unwrap();
+        assert_eq!(overridden.parameters.load_pipeline_bind, 0xffff_8000_0000_0042);
+        assert_eq!(
+            overridden.parameters.partial_load_pipeline_bind,
+            0xffff_8000_0000_0043
         );
     }
 
