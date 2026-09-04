@@ -332,11 +332,22 @@ pub(crate) struct G17PFaultIrqSnapshot {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PHaltedGmmuSnapshot {
+    pub(crate) gpc_state: u32,
+    pub(crate) info_before: u64,
+    pub(crate) address_word: Option<u64>,
+    pub(crate) info_after: u64,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct G17PHaltedSlot0Snapshot {
     pub(crate) gpc_state: u32,
     pub(crate) state_before: u64,
     pub(crate) key: u64,
     pub(crate) state_after: u64,
+    pub(crate) progress: [u64; 8],
+    pub(crate) progress_count: usize,
+    pub(crate) progress_errno: i32,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -1124,12 +1135,37 @@ impl Resources {
         // (4080,40a0,40b0,40c0,40d0,40e0,40f0; table45c78).
         let state_before = Self::g17p_sksm_port_read_locked(&sgx, 0xc020, 0, 1u64 << 42)?;
         let key = Self::g17p_sksm_port_read_locked(&sgx, 0xc078, 0, 0)?;
+        let mut progress = [0u64; 8];
+        let mut progress_count = 0;
+        let mut progress_errno = 0;
+        if let Some(selector) = crate::g17_completion::g17p_dm1_monitor_selector_index(state_before) {
+            // These are the eight reads B1 FUN_6a20 performs for DM1, through
+            // the selected progress port. Do not write10400/10408 or touch
+            // any bank absent from the native sample table.
+            for (index, (register, flags)) in crate::g17_completion::G17P_DM1_MONITOR_READS
+                .iter().enumerate()
+            {
+                match Self::g17p_sksm_port_read_locked(&sgx, *register, selector, *flags) {
+                    Ok(value) => {
+                        progress[index] = value;
+                        progress_count += 1;
+                    }
+                    Err(error) => {
+                        progress_errno = error.to_errno();
+                        break;
+                    }
+                }
+            }
+        }
         let state_after = Self::g17p_sksm_port_read_locked(&sgx, 0xc020, 0, 1u64 << 42)?;
         Ok(Some(G17PHaltedSlot0Snapshot {
             gpc_state,
             state_before,
             key,
             state_after,
+            progress,
+            progress_count,
+            progress_errno,
         }))
     }
 
@@ -1825,6 +1861,31 @@ impl Resources {
             requestor_gate: registers.try_read64(0xd918)?,
             sub_status: registers.try_read64(0x1_0a00)?,
             irq_status: registers.try_read64(0x1_0a10)?,
+        }))
+    }
+
+    /// Read only B1's retained first-fault requestor. The caller must validate
+    /// the current reason-3 report and state-1 pre-ACK epoch. FUN_5450 selects
+    /// d800=0..3 until d8c0.valid, then leaves that requestor selected while
+    /// waiting for the host. Do not change d800 or acknowledge at d8e8 here.
+    pub(crate) fn g17p_halted_gmmu_snapshot(
+        &self,
+    ) -> Result<Option<G17PHaltedGmmuSnapshot>> {
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let registers = &*sgx;
+        let gpc_state = registers.try_read32(T8140_HOST_IRQ_SUMMARY)? & 0xf;
+        if gpc_state == 0 {
+            return Ok(None);
+        }
+        let info_before = registers.try_read64(FAULT_INFO_G14X)?;
+        let address_word = if info_before & 1 != 0 {
+            Some(registers.try_read64(FAULT_ADDR_G14X)?)
+        } else {
+            None
+        };
+        let info_after = registers.try_read64(FAULT_INFO_G14X)?;
+        Ok(Some(G17PHaltedGmmuSnapshot {
+            gpc_state, info_before, address_word, info_after,
         }))
     }
 
