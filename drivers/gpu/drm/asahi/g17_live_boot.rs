@@ -1868,8 +1868,8 @@ fn boot_session(
         rtkit::RtKit::<G17PRtkitOps>::new_g17p(drm.as_ref(), None, 1, gfx1_state.clone())?;
     dev_info!(pdev.as_ref(), "G17P session: both RTKit receivers armed\n");
 
-    registers.t8140_axi_transition_workaround()?;
-    dev_info!(pdev.as_ref(), "G17P session: AXI transition configured\n");
+    registers.validate_t8140_axi_transition()?;
+    dev_info!(pdev.as_ref(), "G17P session: provider AXI transition validated\n");
     let trace_mask = *module_parameters::g17p_fw_trace.value();
     if trace_mask != 0 {
         if let Err(error) = manager.arm_firmware_trace_classes(trace_mask) {
@@ -2037,8 +2037,8 @@ fn boot_initial_session(
         rtkit::RtKit::<G17PRtkitOps>::new_g17p(drm.as_ref(), None, 1, gfx1_state.clone())?;
     dev_info!(pdev.as_ref(), "G17P session: both RTKit receivers armed\n");
 
-    registers.t8140_axi_transition_workaround()?;
-    dev_info!(pdev.as_ref(), "G17P session: AXI transition configured\n");
+    registers.validate_t8140_axi_transition()?;
+    dev_info!(pdev.as_ref(), "G17P session: provider AXI transition validated\n");
     // Marker + timing on the two steps a session REBUILD can hang in.
     //
     // `apple_rtkit_boot` performs two `apple_rtkit_wait_for_completion` waits,

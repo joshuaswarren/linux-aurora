@@ -1865,7 +1865,10 @@ impl Resources {
         Ok(())
     }
 
-    pub(crate) fn t8140_axi_transition_workaround(&self) -> Result {
+    /// Validate the GFX power provider's AXI2AF handshake. It must complete
+    /// before PMGR AUTO_ENABLE, including power-ons preceding DRM probe.
+    /// Keep this legacy call site read-only: repairing the words here is late.
+    pub(crate) fn validate_t8140_axi_transition(&self) -> Result {
         let sgx = self.sgx.try_access().ok_or(ENODEV)?;
         let res = sgx.relaxed();
         for (offset, observed) in [
@@ -1873,14 +1876,27 @@ impl Resources {
             (T8140_AXI_TRANSITION_1, 0x0004_13b1u32),
         ] {
             let val = res.try_read32(offset)?;
-            res.try_write32(val | 1, offset)?;
-            let after = res.try_read32(offset)?;
-            if after != observed {
+            dev_info!(
+                self.dev.as_ref(),
+                "T8140 AXI validation: offset={:#x} value={:#010x} provider_bit0={}\n",
+                offset,
+                val,
+                val & 1,
+            );
+            if val & 1 == 0 {
+                dev_err!(
+                    self.dev.as_ref(),
+                    "T8140 AXI transition word {:#x} lacks the power-provider handshake\n",
+                    offset,
+                );
+                return Err(EIO);
+            }
+            if val != observed {
                 dev_warn!(
                     self.dev.as_ref(),
-                    "T8140 AXI transition word {:#x} reads {:#x} after set (J700 observed {:#x})\n",
+                    "T8140 AXI transition word {:#x} reads {:#x} (J700 observed {:#x})\n",
                     offset,
-                    after,
+                    val,
                     observed
                 );
             }
