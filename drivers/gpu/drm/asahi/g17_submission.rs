@@ -1377,7 +1377,10 @@ pub(crate) fn apply_g17p_cold_opening_pool_a_start_slot(
         return Err(SubmissionError::PartialOpeningQueueHeadOutOfRange);
     }
     out.fill(0);
-    put_u32_le(out, 4 + record_index * 4, 1);
+    // Native numbers the slot words from the start of the page: cold record
+    // index 1 points at page +0x04. The old extra +4 coupled index 1 to +0x08
+    // and made the host graph one slot ahead of the valid first-render graph.
+    put_u32_le(out, record_index * 4, 1);
     Ok(())
 }
 
@@ -1395,10 +1398,7 @@ pub(crate) fn apply_g17p_cold_opening_record_pool_a_at(
         return Err(SubmissionError::PartialOpeningGraphObjectSize);
     }
     out.fill(0);
-    let slot_base = addresses
-        .pool_a_slots
-        .checked_add(4)
-        .ok_or(SubmissionError::PartialOpeningAddressOverflow)?;
+    let slot_base = addresses.pool_a_slots;
     for index in 0..G17P_COLD_OPENING_RECORD_POOL_A_COUNT {
         let slot = slot_base
             .checked_add((index * 4) as u64)
@@ -5196,13 +5196,13 @@ mod tests {
 
         let mut pool_a = [0u8; G17P_COLD_OPENING_RECORD_POOL_A_SIZE];
         apply_g17p_cold_opening_record_pool_a(addresses, &mut pool_a).unwrap();
-        assert_eq!(get_u64_le(&pool_a, 0), addresses.pool_a_slots + 4);
+        assert_eq!(get_u64_le(&pool_a, 0), addresses.pool_a_slots);
         assert_eq!(get_u32_le(&pool_a, 0x10), 0x50);
         assert_eq!(
             get_u64_le(&pool_a, 34 * 0x100),
-            addresses.pool_a_slots + 4 + 34 * 4
+            addresses.pool_a_slots + 34 * 4
         );
-        assert_eq!(source_fixture_fingerprint(&pool_a), 0x0c16_5264_f344_46d2);
+        assert_eq!(source_fixture_fingerprint(&pool_a), 0x42cb_4f83_a145_54be);
 
         let mut pool_b = [0u8; G17P_COLD_OPENING_RECORD_POOL_B_SIZE];
         apply_g17p_cold_opening_record_pool_b(addresses, &mut pool_b).unwrap();
@@ -5289,16 +5289,16 @@ mod tests {
 
         let mut slots = [0xa5; G17P_PARTIAL_OPENING_PAGE_SIZE];
         apply_g17p_cold_opening_pool_a_start_slot(1, &mut slots).unwrap();
-        assert_eq!(get_u32_le(&slots, 4), 0);
-        assert_eq!(get_u32_le(&slots, 8), 1);
+        assert_eq!(get_u32_le(&slots, 4), 1);
+        assert_eq!(get_u32_le(&slots, 8), 0);
         assert!(slots[..4].iter().all(|byte| *byte == 0));
         assert!(slots[12..].iter().all(|byte| *byte == 0));
 
         let mut records = [0xa5; G17P_COLD_OPENING_RECORD_POOL_A_SIZE];
         apply_g17p_cold_opening_record_pool_a_at(addresses, 1, &mut records).unwrap();
-        assert_eq!(get_u64_le(&records, 0), addresses.pool_a_slots + 4);
+        assert_eq!(get_u64_le(&records, 0), addresses.pool_a_slots);
         assert_eq!(get_u32_le(&records, 0x10), 0);
-        assert_eq!(get_u64_le(&records, 0x100), addresses.pool_a_slots + 8);
+        assert_eq!(get_u64_le(&records, 0x100), addresses.pool_a_slots + 4);
         assert_eq!(get_u32_le(&records, 0x110), 0x50);
         assert_eq!(get_u32_le(&records, 0x108), 0);
         assert_eq!(
@@ -5308,7 +5308,6 @@ mod tests {
                     * G17P_COLD_OPENING_RECORD_POOL_A_STRIDE,
             ),
             addresses.pool_a_slots
-                + 4
                 + ((G17P_COLD_OPENING_RECORD_POOL_A_COUNT - 1) * 4) as u64
         );
     }
