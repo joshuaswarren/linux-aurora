@@ -2880,7 +2880,9 @@ fn build_g17p_late_tiling_bytes(
         entry_signal: [0; g17_submission::G17P_COMPUTE_OPTIONAL_EVENT_SIZE],
         optional: [0; g17_submission::G17P_COLD_OPENING_OPTIONAL_SIZE],
         event: [0; g17_submission::G17P_COLD_OPENING_EVENT_SIZE],
-        pool_a_slot_offset: G17P_RENDER_POOL_A_SLOTS + 4 + record_a * 4,
+        // Native cold record index 1 points at slot-page +0x04. There is no
+        // additional reserved-word bias in this array.
+        pool_a_slot_offset: G17P_RENDER_POOL_A_SLOTS + record_a * 4,
         shared_inner_value: submission_ordinal
             .checked_add(1)
             .and_then(|value| value.checked_mul(2))
@@ -6011,7 +6013,7 @@ impl G17PUserRenderStorage {
         put_u32(support, record_a + 0x10, 0x50);
         put_u32(
             support,
-            G17P_RENDER_POOL_A_SLOTS + 4 + record_a_index * 4,
+            G17P_RENDER_POOL_A_SLOTS + record_a_index * 4,
             1,
         );
         put_u32(
@@ -14747,7 +14749,7 @@ mod tests {
         };
         let mut graph = vec![0u8; G17P_RENDER_QUEUE_GRAPH_SIZE];
         let mut support = vec![0u8; G17P_RENDER_SUPPORT_SIZE];
-        put_u32(&mut support, G17P_RENDER_POOL_A_SLOTS + 4, 1);
+        put_u32(&mut support, G17P_RENDER_POOL_A_SLOTS, 1);
         put_u32(&mut support, G17P_RENDER_SHARED_CONTROL_INNER, 1);
 
         // An address-construction error occurs before any publication and
@@ -14759,7 +14761,7 @@ mod tests {
         assert!(graph[G17P_USER_TILING_RING..G17P_USER_TILING_RING + 24]
             .iter()
             .all(|byte| *byte == 0));
-        assert_eq!(get_u32(&support, G17P_RENDER_POOL_A_SLOTS + 4), 1);
+        assert_eq!(get_u32(&support, G17P_RENDER_POOL_A_SLOTS), 1);
         assert_eq!(get_u32(&support, G17P_RENDER_SHARED_CONTROL_INNER), 1);
 
         let late =
@@ -14778,7 +14780,7 @@ mod tests {
         assert_eq!(get_u32(&graph, G17P_USER_TILING_POINTERS + 0x40), 3);
         assert_eq!(get_u32(&graph, G17P_USER_TILING_OPTIONAL + 0x32), 6);
         assert_eq!(get_u32(&graph, G17P_USER_TILING_EVENT + 0x08), 0x102);
-        assert_eq!(get_u32(&support, G17P_RENDER_POOL_A_SLOTS + 4), 2);
+        assert_eq!(get_u32(&support, G17P_RENDER_POOL_A_SLOTS), 2);
         assert_eq!(get_u32(&support, G17P_RENDER_SHARED_CONTROL_INNER), 2);
 
         let retained =
@@ -14786,17 +14788,17 @@ mod tests {
                 .unwrap();
         retained.apply(&mut graph, &mut support);
         assert_eq!(get_u32(&graph, G17P_USER_TILING_EVENT + 0x08), 0x202);
-        assert_eq!(get_u32(&support, G17P_RENDER_POOL_A_SLOTS + 4 + 2 * 4), 2);
+        assert_eq!(get_u32(&support, G17P_RENDER_POOL_A_SLOTS + 2 * 4), 2);
         assert_eq!(get_u32(&support, G17P_RENDER_SHARED_CONTROL_INNER), 4);
 
         let mut native_support = vec![0u8; G17P_RENDER_SUPPORT_SIZE];
-        put_u32(&mut native_support, G17P_RENDER_POOL_A_SLOTS + 8, 1);
+        put_u32(&mut native_support, G17P_RENDER_POOL_A_SLOTS + 4, 1);
         let native_first =
             build_g17p_late_tiling_bytes(descriptor, graph_va, addresses, 6, 0, 1, false, true)
                 .unwrap();
         native_first.apply(&mut graph, &mut native_support);
-        assert_eq!(get_u32(&native_support, G17P_RENDER_POOL_A_SLOTS + 4), 0);
-        assert_eq!(get_u32(&native_support, G17P_RENDER_POOL_A_SLOTS + 8), 2);
+        assert_eq!(get_u32(&native_support, G17P_RENDER_POOL_A_SLOTS), 0);
+        assert_eq!(get_u32(&native_support, G17P_RENDER_POOL_A_SLOTS + 4), 2);
         let native_retained =
             build_g17p_late_tiling_bytes(descriptor, graph_va, addresses, 6, 1, 2, false, true)
                 .unwrap();
@@ -14822,7 +14824,7 @@ mod tests {
                 .unwrap();
         let mut graph = vec![0u8; G17P_RENDER_QUEUE_GRAPH_SIZE];
         let mut support = vec![0u8; G17P_RENDER_SUPPORT_SIZE];
-        put_u32(&mut support, G17P_RENDER_POOL_A_SLOTS + 4, 1);
+        put_u32(&mut support, G17P_RENDER_POOL_A_SLOTS, 1);
         put_u32(&mut support, G17P_RENDER_SHARED_CONTROL_INNER, 1);
 
         // Pre-TA callback: no TA inner producer or group is visible.
@@ -14835,7 +14837,7 @@ mod tests {
         assert_eq!(get_u32(&graph, G17P_USER_TILING_POINTERS + 0x40), 2);
         assert_eq!(get_u64(&graph, G17P_USER_TILING_RING), descriptor);
         assert_eq!(get_u64(&graph, G17P_USER_TILING_RING + 16), 0);
-        assert_eq!(get_u32(&support, G17P_RENDER_POOL_A_SLOTS + 4), 1);
+        assert_eq!(get_u32(&support, G17P_RENDER_POOL_A_SLOTS), 1);
 
         // The runtime publishes SKSM between these two pure byte phases.
         late.apply_native_kick(&mut graph);
@@ -14845,12 +14847,12 @@ mod tests {
             graph_va + G17P_USER_TILING_EVENT as u64
         );
         assert_eq!(get_u32(&graph, G17P_USER_TILING_EVENT + 0x08), 0x102);
-        assert_eq!(get_u32(&support, G17P_RENDER_POOL_A_SLOTS + 4), 1);
+        assert_eq!(get_u32(&support, G17P_RENDER_POOL_A_SLOTS), 1);
         assert_eq!(get_u32(&support, G17P_RENDER_SHARED_CONTROL_INNER), 1);
 
         // The runtime advances the outer producer before this final phase.
         late.apply_native_pool_transition(&mut support);
-        assert_eq!(get_u32(&support, G17P_RENDER_POOL_A_SLOTS + 4), 2);
+        assert_eq!(get_u32(&support, G17P_RENDER_POOL_A_SLOTS), 2);
         assert_eq!(get_u32(&support, G17P_RENDER_SHARED_CONTROL_INNER), 2);
     }
 
