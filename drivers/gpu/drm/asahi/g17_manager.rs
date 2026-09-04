@@ -75,7 +75,8 @@ const G17P_BOOTSTRAP_UMA_STAMP: i32 = 1;
 // values rather than the adjacent operand-buffer cookie used by the older
 // opening graph.
 const G17P_BOOTSTRAP_UMA_COOKIE: u64 = g17_submission::G17P_USC_FREELIST_LOW_END;
-const G17P_BOOTSTRAP_UMA_COUNT: u32 = 0x20;
+const G17P_BOOTSTRAP_UMA_COUNT: u32 =
+    g17_submission::G17P_USC_FREELIST_GROW_DESCRIPTOR_BYTES;
 // Direct 2026-09-01 entry-ring captures of ordinary Metal TA and 3D kicks
 // both carry this exact value at KSM entry +0x178.  It is selected by the
 // descriptor wrapper immediately before encodeKickEntry; it is not the host

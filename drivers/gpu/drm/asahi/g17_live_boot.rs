@@ -552,7 +552,7 @@ fn validate_primary_bootstrap_uma_completion(
         || uma.shared_control != g17_initdata::PARTIAL_OPENING_CONTROL_SHARED_ADDRESS
         || uma.operand_table != expected_operand_table
         || uma.cookie != expected_cookie
-        || uma.result != 0x20
+        || uma.result != g17_submission::G17P_USC_FREELIST_GROW_DESCRIPTOR_BYTES
     {
         dev_err!(
             pdev.as_ref(),

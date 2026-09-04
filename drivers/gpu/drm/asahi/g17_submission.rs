@@ -8231,7 +8231,8 @@ pub(crate) const G17P_DEVCTL_USC_FREELIST: u32 = 0x20;
 /// `G17P_DEVCTL_USC_FREELIST`. Kept because if the USC free list is a third
 /// thing this driver does not maintain, this is where it lives.
 pub(crate) const G17P_USC_FREELIST_LOW_VA: u64 = 0x70_0020_8000;
-pub(crate) const G17P_USC_FREELIST_LOW_END: u64 = 0x70_0020_8580;
+pub(crate) const G17P_USC_FREELIST_LOW_END: u64 = 0x70_0020_8440;
+pub(crate) const G17P_USC_FREELIST_GROW_DESCRIPTOR_BYTES: u32 = 0x28;
 
 /// The three fields that move between boots. 256x256 and 1024x1024 gave identical values for `word_04`, and
 /// `word_0c` moved by 2 between them, so none of these encode geometry -- they
@@ -8277,7 +8278,7 @@ pub(crate) fn encode_g17p_usc_freelist_control(
     put_u64_le(out, 0x14, firmware_half_va);
     put_u64_le(out, 0x1c, ring_low_va);
     put_u64_le(out, 0x24, ring_low_end);
-    put_u32_le(out, 0x2c, 0x20); // constant
+    put_u32_le(out, 0x2c, G17P_USC_FREELIST_GROW_DESCRIPTOR_BYTES);
     put_u32_le(out, 0x30, sequence.word_30);
     put_u32_le(out, 0x34, 1); // constant
     Ok(())
@@ -8317,7 +8318,10 @@ mod usc_freelist_tests {
         assert_eq!(u64_at(&record, 0x14), 0xffff_fc20_c082_8000);
         assert_eq!(u64_at(&record, 0x1c), G17P_USC_FREELIST_LOW_VA);
         assert_eq!(u64_at(&record, 0x24), G17P_USC_FREELIST_LOW_END);
-        assert_eq!(u32_at(&record, 0x2c), 0x20);
+        assert_eq!(
+            u32_at(&record, 0x2c),
+            G17P_USC_FREELIST_GROW_DESCRIPTOR_BYTES
+        );
         assert_eq!(u32_at(&record, 0x30), 0);
         assert_eq!(u32_at(&record, 0x34), 1);
         assert!(record[0x38..].iter().all(|byte| *byte == 0));
