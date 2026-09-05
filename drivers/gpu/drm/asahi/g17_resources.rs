@@ -221,6 +221,10 @@ pub(crate) const G17P_CL_LOW_VA_END: u64 = 0x71_0000_0000;
 /// low resource. The lower 32 MiB retain native render/bootstrap coordinates;
 /// the next 32 MiB hold an independent compute pool and completion rings.
 pub(crate) const G17P_CL_DYNAMIC_LOW_VA_START: u64 = 0x70_0400_0000;
+/// Canonical queue mappings must be free in every client root. Independent
+/// allocators cannot reserve each other's addresses, so never allocate a
+/// client-private render/compute alias in this device-global queue arena.
+const G17P_CL_CLIENT_LOW_VA_START: u64 = 0x70_0800_0000;
 /// Architectural base for compact user/GART pointers consumed by the TA.
 const G17P_RENDER_USER_BASE: u64 = 0x10_0000_0000;
 const G17P_RENDER_USER_END: u64 = 0x11_0000_0000;
@@ -271,7 +275,12 @@ fn g17p_native_tvb_block_va(index: usize) -> Option<u64> {
 
 #[cfg(not(test))]
 fn g17p_cl_dynamic_low_va_range() -> Range<u64> {
-    G17P_CL_DYNAMIC_LOW_VA_START..G17P_CL_LOW_VA_END
+    G17P_CL_DYNAMIC_LOW_VA_START..G17P_CL_CLIENT_LOW_VA_START
+}
+
+#[cfg(not(test))]
+fn g17p_cl_client_low_va_range() -> Range<u64> {
+    G17P_CL_CLIENT_LOW_VA_START..G17P_CL_LOW_VA_END
 }
 
 fn clear_g17p_last_submitted_hw_timestamps(bytes: &mut [u8]) -> bool {
@@ -3419,25 +3428,25 @@ impl G17PComputeDescriptorStorage {
                 .map_alias_at(vm, descriptor_low, mmu::PROT_GPU_FW_SHARED_RW)?;
         let preempt = self.preempt.map_alias_in_range(
             vm,
-            g17p_cl_dynamic_low_va_range(),
+            g17p_cl_client_low_va_range(),
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
         let robustness = self.robustness.map_alias_in_range(
             vm,
-            g17p_cl_dynamic_low_va_range(),
+            g17p_cl_client_low_va_range(),
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
         let operand_state = self.operand_state.map_alias_in_range(
             vm,
-            g17p_cl_dynamic_low_va_range(),
+            g17p_cl_client_low_va_range(),
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
         let queue_context = self.queue_context_low.map_alias_in_range(
             vm,
-            g17p_cl_dynamic_low_va_range(),
+            g17p_cl_client_low_va_range(),
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
@@ -5393,7 +5402,7 @@ impl G17PUserRenderStorage {
         let mut render_state = bootstrap_stage!("state allocation", MappedObject::new_wc_in_range(
             dev,
             vm,
-            g17p_cl_dynamic_low_va_range(),
+            g17p_cl_client_low_va_range(),
             render_layout.total_size,
             if g17p_render_tvb_enabled() {
                 G17P_PM_PAGE_SIZE as u64
@@ -5998,7 +6007,7 @@ impl G17PUserRenderStorage {
             MappedObject::new_wc_in_range(
                 dev,
                 vm,
-                g17p_cl_dynamic_low_va_range(),
+                g17p_cl_client_low_va_range(),
                 g17_render::G17P_FRAGMENT_RCE_STORAGE_SIZE,
                 mmu::UAT_PGSZ as u64,
                 mmu::PROT_GPU_SHARED_RO,
@@ -6010,7 +6019,7 @@ impl G17PUserRenderStorage {
             descriptors.object.map_range_into_range(
                 vm,
                 mmu::UAT_PGSZ..2 * mmu::UAT_PGSZ,
-                g17p_cl_dynamic_low_va_range(),
+                g17p_cl_client_low_va_range(),
                 mmu::UAT_PGSZ as u64,
                 mmu::PROT_GPU_SHARED_RO,
                 false,
@@ -6350,7 +6359,7 @@ impl G17PUserRenderStorage {
         let mut next_render_state = MappedObject::new_wc_in_range(
             dev,
             vm,
-            g17p_cl_dynamic_low_va_range(),
+            g17p_cl_client_low_va_range(),
             render_layout.total_size,
             if g17p_render_tvb_enabled() {
                 G17P_PM_PAGE_SIZE as u64
@@ -14554,7 +14563,7 @@ mod tests {
         let count = g17_initdata::COMPUTE_READINESS_OPERAND_ENTRY_COUNT;
         assert_eq!(count, 21);
         for buffer_index in 0..count {
-            let base = g17p_control_operand_buffer_va(buffer_index).unwrap();
+            let base = g17p_compute_operand_buffer_va(buffer_index).unwrap();
             let offset = buffer_index * core::mem::size_of::<u64>();
             assert_eq!(
                 u64::from_le_bytes(raw[offset..offset + 8].try_into().unwrap()),
@@ -14566,13 +14575,13 @@ mod tests {
             .iter()
             .all(|byte| *byte == 0));
 
-        let last_end = g17p_control_operand_buffer_va(count - 1).unwrap()
+        let last_end = g17p_compute_operand_buffer_va(count - 1).unwrap()
             + G17P_CONTROL_OPERAND_BUFFER_SIZE as u64;
         let first_completion = g17_initdata::G17P_KSM_COMPLETION_LOW_VAS[0];
         assert!(last_end <= first_completion);
-        let opening_only = g17p_control_operand_buffer_va(count).unwrap();
+        let opening_only = g17p_compute_operand_buffer_va(count).unwrap();
         assert!(opening_only < first_completion);
-        assert!(first_completion < opening_only + G17P_CONTROL_OPERAND_BUFFER_SIZE as u64);
+        assert!(opening_only + G17P_CONTROL_OPERAND_BUFFER_SIZE as u64 <= first_completion);
     }
 
     #[test]
@@ -15030,7 +15039,7 @@ mod tests {
     #[test]
     fn dynamic_cl_range_excludes_the_complete_fixed_low_arena() {
         let dynamic = G17P_CL_DYNAMIC_LOW_VA_START..G17P_CL_LOW_VA_END;
-        assert_eq!(dynamic.start, 0x70_0200_0000);
+        assert_eq!(dynamic.start, 0x70_0400_0000);
         assert!(G17P_CL_LOW_VA_START < dynamic.start && dynamic.start < dynamic.end);
         let table = G17P_CONTROL_OPERAND_TABLE_VA
             ..G17P_CONTROL_OPERAND_TABLE_VA
@@ -15046,7 +15055,7 @@ mod tests {
             .unwrap()
             + G17P_CONTROL_OPERAND_BUFFER_SIZE as u64;
         assert_eq!(fixed_end, 0x70_01ef_8000);
-        assert_eq!(dynamic.start - fixed_end, 0x10_8000);
+        assert_eq!(dynamic.start - fixed_end, 0x210_8000);
 
         for (start, size) in [
             (G17P_CONTROL_DIRECTORY_VA, G17P_CONTROL_DIRECTORY_SIZE),
@@ -16144,7 +16153,7 @@ mod tests {
         for index in 0..18 {
             assert_eq!(
                 g17_initdata::COMPUTE_RUNTIME_BUFFER_ADDRESSES[index],
-                g17p_control_operand_buffer_va(index).unwrap()
+                g17p_compute_operand_buffer_va(index).unwrap()
             );
         }
         assert_eq!(
@@ -16152,14 +16161,14 @@ mod tests {
             [
                 g17_initdata::COMPUTE_RUNTIME_ZERO_BUFFER_0_ADDRESS,
                 g17_initdata::COMPUTE_RUNTIME_ZERO_BUFFER_1_ADDRESS,
-                g17p_control_operand_buffer_va(18).unwrap(),
+                g17p_compute_operand_buffer_va(18).unwrap(),
             ]
         );
         assert_eq!(
             g17_initdata::COMPUTE_RUNTIME_PAGE_LIST_ADDRESS,
-            g17p_control_operand_buffer_va(22).unwrap()
+            g17p_compute_operand_buffer_va(22).unwrap()
         );
-        let buffer_23_end = g17p_control_operand_buffer_va(23).unwrap()
+        let buffer_23_end = (g17_initdata::COMPUTE_FLIST_BUFFER_BASE + 23 * G17P_CONTROL_OPERAND_BUFFER_STRIDE as u64)
             + G17P_CONTROL_OPERAND_BUFFER_SIZE as u64;
         assert_eq!(
             g17_initdata::COMPUTE_RUNTIME_CLASS1_TABLE_ADDRESS,
@@ -16168,20 +16177,19 @@ mod tests {
         assert!(
             g17_initdata::COMPUTE_RUNTIME_CLASS1_TABLE_ADDRESS
                 + g17_initdata::COMPUTE_RUNTIME_CLASS1_TABLE_SIZE as u64
-                <= g17p_control_operand_buffer_va(24).unwrap()
+                <= (g17_initdata::COMPUTE_FLIST_BUFFER_BASE + 24 * G17P_CONTROL_OPERAND_BUFFER_STRIDE as u64)
         );
 
-        // Operand buffer 2 deliberately reuses both generic bootstrap peer
-        // ranges. Its context-0 alias must therefore be installed only after
-        // the startup render storage and its two peer aliases are dropped.
-        let buffer_2 = g17p_control_operand_buffer_va(2).unwrap();
+        // Compute's relocated operand buffer 2 no longer aliases either
+        // retained render bootstrap peer in the device-global lower root.
+        let buffer_2 = g17p_compute_operand_buffer_va(2).unwrap();
         let buffer_2_end = buffer_2 + G17P_CONTROL_OPERAND_BUFFER_SIZE as u64;
         for peer in [
             G17P_BOOTSTRAP_TA_CONTEXT_LOW_VA,
             G17P_BOOTSTRAP_3D_CONTEXT_LOW_VA,
         ] {
-            assert!(buffer_2 <= peer);
-            assert!(peer + G17P_BOOTSTRAP_CONTEXT_PEER_SIZE as u64 <= buffer_2_end);
+            assert!(peer + G17P_BOOTSTRAP_CONTEXT_PEER_SIZE as u64 <= buffer_2
+                || buffer_2_end <= peer);
         }
     }
 
