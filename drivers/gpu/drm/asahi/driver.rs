@@ -150,7 +150,7 @@ pub(crate) type AsahiDevRef = ARef<AsahiDevice>;
 /// DRM Driver metadata
 const INFO: drm::driver::DriverInfo = drm::driver::DriverInfo {
     major: 0,
-    minor: 1,
+    minor: 2,
     patchlevel: 0,
     name: c_str!("asahi"),
     desc: c_str!("Apple AGX Graphics"),

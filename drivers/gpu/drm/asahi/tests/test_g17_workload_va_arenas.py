@@ -4,6 +4,7 @@ from pathlib import Path
 import re,subprocess,tempfile
 p=Path(__file__).resolve().parents[1]
 s=(p/'g17_resources.rs').read_text()
+limits=(p/'g17_queue_limits.rs').read_text().replace('//!','//')
 names=['G17P_CL_DYNAMIC_LOW_VA_START','G17P_CL_CLIENT_LOW_VA_START','G17P_CL_LOW_VA_END']
 constants='\n'.join(re.search(r'(?:pub\(crate\) )?const '+n+r': u64 = [^;]+;',s)[0] for n in names)
 def method(name):
@@ -36,8 +37,22 @@ fn overlap(a:&Range<u64>,b:&Range<u64>)->bool{a.start<b.end&&b.start<a.end}
  assert_eq!(global.end,client.start);assert_eq!(client.end,G17P_CL_LOW_VA_END);
 }
 '''
+tests+=r'''
+#[test]fn full_queue_pool_fits_canonical_arena_with_render_headroom(){
+ let arena=g17p_cl_dynamic_low_va_range();let mut cursor=arena.start;
+ // Each canonical entry allocation may require128KiB alignment. Descriptor
+ // arena4MiB, operand80KiB, context128KiB use16KiB alignment.
+ for _ in 0..crate::g17_queue_limits::MAX_QUEUES{
+  for(size,align)in[(0x20000,0x20000),(0x400000,0x4000),(0x14000,0x4000),(0x20000,0x4000)]{cursor=(cursor+align-1)&!(align-1);cursor+=size;assert!(cursor<=arena.end);}
+ }
+ assert!(arena.end-cursor>=0x4000000); // at least64MiB for render/runtime
+ assert!(g17p_cl_client_low_va_range().end-g17p_cl_client_low_va_range().start>=0xc0000000);
+ assert_eq!(crate::g17_queue_limits::MAX_QUEUES,58);
+ assert_eq!(crate::g17_queue_limits::encode_limits()[..8],[58,0,0,0,1,0,0,0]);
+}
+'''
 with tempfile.TemporaryDirectory() as d:
- f=Path(d)/'test.rs';f.write_text(constants+functions+tests);exe=Path(d)/'test'
+ f=Path(d)/'test.rs';f.write_text('mod g17_queue_limits{'+limits+'}'+constants+functions+tests);exe=Path(d)/'test'
  subprocess.run(['rustc','--edition=2021','--test',str(f),'-o',str(exe)],check=True)
  subprocess.run([str(exe)],check=True)
 print('PASS actual VA arena functions: captured old collision reproduced; complete canonical/private ranges disjoint')

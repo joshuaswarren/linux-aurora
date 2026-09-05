@@ -224,7 +224,7 @@ pub(crate) const G17P_CL_DYNAMIC_LOW_VA_START: u64 = 0x70_0400_0000;
 /// Canonical queue mappings must be free in every client root. Independent
 /// allocators cannot reserve each other's addresses, so never allocate a
 /// client-private render/compute alias in this device-global queue arena.
-const G17P_CL_CLIENT_LOW_VA_START: u64 = 0x70_0800_0000;
+const G17P_CL_CLIENT_LOW_VA_START: u64 = crate::g17_queue_limits::CLIENT_LOW_VA_START;
 /// Architectural base for compact user/GART pointers consumed by the TA.
 const G17P_RENDER_USER_BASE: u64 = 0x10_0000_0000;
 const G17P_RENDER_USER_END: u64 = 0x11_0000_0000;
@@ -414,6 +414,18 @@ const G17P_BOOTSTRAP_DESCRIPTOR_ZERO_B_VA: u64 = 0xffff_fc20_c07c_0000;
 /// stay consistent.
 const G17P_BOOTSTRAP_TA_STATUS_VA: u64 = 0xffff_fc20_0168_0000;
 const G17P_BOOTSTRAP_3D_STATUS_VA: u64 = 0xffff_fc20_0163_0000;
+
+/// Keep allocator-selected high mappings AND their trailing guard pages away
+/// from the native status islands installed on first render. A missing PTE
+/// does not imply free VA: drm_mm also owns unmapped guard nodes. Compute-first
+/// allocation otherwise occupies the future3D status page as a guard.
+pub(crate) fn g17p_dynamic_kernel_va_range(mut available: Range<u64>) -> Option<Range<u64>> {
+    let fixed_end = G17P_BOOTSTRAP_TA_STATUS_VA.max(G17P_BOOTSTRAP_3D_STATUS_VA)
+        .checked_add(G17P_PAGE_SIZE as u64)?;
+    available.start = available.start.max(fixed_end);
+    (available.start < available.end).then_some(available)
+}
+
 const G17P_BOOTSTRAP_CONTEXT_PEER_SIZE: usize = 0x20_000;
 /// QIDs 0 and 1 are not ordinary application queues on G17P. Metal's type-1
 /// 3D descriptor retains a distinct QID-0 RCE coordinate even while its
@@ -1978,7 +1990,7 @@ impl MappedObject {
         Self::new_wc_in_range(
             dev,
             uat.kernel_vm(),
-            uat.kernel_va_range()?,
+            g17p_dynamic_kernel_va_range(uat.kernel_va_range()?).ok_or(ERANGE)?,
             size,
             alignment,
             prot,
@@ -2038,7 +2050,7 @@ impl MappedObject {
         Self::new_in_range(
             dev,
             uat.kernel_vm(),
-            uat.kernel_va_range()?,
+            g17p_dynamic_kernel_va_range(uat.kernel_va_range()?).ok_or(ERANGE)?,
             size,
             alignment,
             prot,
@@ -3296,7 +3308,7 @@ impl G17PComputeDescriptorStorage {
         )?;
         let descriptors_high = descriptors.map_alias_in_range(
             uat.kernel_vm(),
-            uat.kernel_va_range()?,
+            g17p_dynamic_kernel_va_range(uat.kernel_va_range()?).ok_or(ERANGE)?,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
@@ -8209,7 +8221,7 @@ impl G17PClRuntimeStorage {
         let entries_mapping = entries.mapping.as_ref().ok_or(EINVAL)?;
         let entries_high = entries_mapping.map_alias_into_range(
             uat.kernel_vm(),
-            uat.kernel_va_range()?,
+            g17p_dynamic_kernel_va_range(uat.kernel_va_range()?).ok_or(ERANGE)?,
             mmu::PROT_FW_SHARED_RW,
         )?;
         if entries_mapping.size() != backing_size || entries_high.size() != backing_size
@@ -9441,7 +9453,7 @@ impl G17ResourceOwner {
             address_space.uat.t8140_parameter_metrics()?;
         let parameter_metrics_high = parameter_metrics_object.map_into_range(
             address_space.uat.kernel_vm(),
-            address_space.uat.kernel_va_range()?,
+            g17p_dynamic_kernel_va_range(address_space.uat.kernel_va_range()?).ok_or(ERANGE)?,
             mmu::T8140_PARAMETER_METRICS_SIZE as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
             false,

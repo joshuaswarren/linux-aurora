@@ -3922,10 +3922,10 @@ impl Uat {
     ///
     /// IDs 0..4 are never candidates: the opening pair and fixed compute
     /// aliases already give those values architectural meaning on T8140.
-    /// Native's allocator therefore yielded 5/6 in one process and later
-    /// values when other GARTs were live. The ID returned here must be copied
-    /// from this lease into every firmware-visible descriptor field that names
-    /// this GART; callers must never independently reconstruct it.
+    /// The qualified renderer still encodes selector1 and retains this
+    /// duplicate root only for its app-context ownership. Reserve slot63 for
+    /// that exclusive renderer so eager compute queue reservations cannot
+    /// exhaust the root it needs. Compute execution uses independent5..62.
     pub(crate) fn allocate_t8140_app_context(
         &self,
         bind: &VmBind,
@@ -3939,7 +3939,7 @@ impl Uat {
                 .inner
                 .t8140_app_contexts
                 .load(Ordering::Acquire);
-            let available = !used & T8140_APP_CONTEXT_AVAILABLE_MASK;
+            let available = !used & (1u64 << crate::g17_queue_limits::RENDER_APP_CONTEXT);
             if available == 0 {
                 return Err(ENOSPC);
             }
@@ -3995,7 +3995,7 @@ impl Uat {
         }
         let context_id = loop {
             let used = self.inner.t8140_app_contexts.load(Ordering::Acquire);
-            let free = !used & T8140_APP_CONTEXT_AVAILABLE_MASK;
+            let free = !used & crate::g17_queue_limits::COMPUTE_CONTEXT_MASK;
             if free == 0 { return Err(ENOSPC); }
             let index = free.trailing_zeros() as usize;
             if self.inner.t8140_app_contexts.compare_exchange_weak(

@@ -29,6 +29,7 @@ mod g17_firmware;
 mod g17_initdata;
 mod g17_job;
 mod g17_status;
+mod g17_queue_limits;
 mod g17_lifecycle;
 mod g17_live_boot;
 mod g17_manager;
