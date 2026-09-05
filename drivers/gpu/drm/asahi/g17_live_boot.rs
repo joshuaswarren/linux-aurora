@@ -3672,7 +3672,6 @@ impl G17PLiveRuntime {
         if !self.accepting_submissions {
             return Err(ENOTSUPP);
         }
-        self.check_retained_render_owner(vm)?;
         let native_doorbell_mode =
             *module_parameters::g17p_render_native_doorbells.value();
         let native_doorbells = native_doorbell_mode != 0;
@@ -3729,6 +3728,7 @@ impl G17PLiveRuntime {
                 );
             }
         }
+        self.manager.as_mut().ok_or(ENODEV)?.handoff_retained_render_vm(vm)?;
         let recycle = self
             .manager
             .as_ref()

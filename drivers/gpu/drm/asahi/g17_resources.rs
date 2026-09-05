@@ -1657,6 +1657,24 @@ struct MappedObject {
     cpu_wc: bool,
 }
 
+/// Address metadata remains with the shared render graph; owning mappings
+/// live in each VM's driver-alias cache instead of pinning the first client.
+#[cfg(not(test))]
+#[derive(Clone, Copy)]
+struct G17PRenderClientAlias {
+    address: u64,
+    size: usize,
+}
+
+#[cfg(not(test))]
+impl G17PRenderClientAlias {
+    fn new(mapping: &mmu::KernelMapping) -> Self {
+        Self { address: mapping.iova(), size: mapping.size() }
+    }
+    fn iova(&self) -> u64 { self.address }
+    fn size(&self) -> usize { self.size }
+}
+
 /// Kernel-owned storage whose GPU mapping belongs only to a render VM.
 ///
 /// The context-0 low root has unrelated B2 aliases inside the render operand
@@ -1706,6 +1724,7 @@ impl RenderBackingObject {
 #[cfg(not(test))]
 struct G17PRenderTvb {
     block_mappings: KVec<mmu::KernelMapping>,
+    block_count: usize,
     backing: RenderBackingObject,
     logical_size: usize,
 }
@@ -1790,9 +1809,28 @@ impl G17PRenderTvb {
 
         Ok(Self {
             block_mappings,
+            block_count: render_layout.tvb_blocks,
             backing,
             logical_size: render_layout.tvb_size,
         })
+    }
+
+    /// Install only PTEs on first use by another VM. The live PB backing and
+    /// firmware-owned page lists/cursors remain exactly the same objects.
+    fn map_cached_blocks(&mut self, vm: &mmu::Vm) -> Result<KVec<mmu::KernelMapping>> {
+        let mut aliases = KVec::with_capacity(self.block_count, GFP_KERNEL)?;
+        for index in 0..self.block_count {
+            let start = index.checked_mul(G17P_RENDER_TVB_BLOCK_STRIDE).ok_or(EOVERFLOW)?;
+            let end = start.checked_add(G17P_RENDER_TVB_BLOCK_SIZE).ok_or(EOVERFLOW)?;
+            if end > self.backing.logical_size { return Err(ERANGE); }
+            let address = g17p_native_tvb_block_va(index).ok_or(EINVAL)?;
+            aliases.push(self.backing.object.map_range_into_range(
+                vm, start..end,
+                address..address + G17P_RENDER_TVB_BLOCK_SIZE as u64,
+                G17P_PM_PAGE_SIZE as u64, mmu::PROT_GPU_SHARED_RW, false,
+            )?, GFP_KERNEL)?;
+        }
+        Ok(aliases)
     }
 
     fn iova(&self) -> u64 {
@@ -1804,13 +1842,12 @@ impl G17PRenderTvb {
     }
 
     fn all_reachable_from(&self, vm: &mmu::Vm) -> bool {
-        self.block_mappings.len() == G17P_NATIVE_TVB_BLOCK_PAGE_IDS.len()
-            && self.block_mappings.iter().enumerate().all(|(index, mapping)| {
+        self.block_count == G17P_NATIVE_TVB_BLOCK_PAGE_IDS.len()
+            && self.logical_size >= (self.block_count - 1) * G17P_RENDER_TVB_BLOCK_STRIDE + G17P_RENDER_TVB_BLOCK_SIZE
+            && (0..self.block_count).all(|index| {
                 g17p_native_tvb_block_va(index).is_some_and(|address| {
                     let guard = address + G17P_RENDER_TVB_BLOCK_SIZE as u64;
-                    mapping.iova() == address
-                        && mapping.size() >= G17P_RENDER_TVB_BLOCK_SIZE
-                        && vm.covers_range(
+                    vm.covers_range(
                             address,
                             G17P_RENDER_TVB_BLOCK_SIZE as u64,
                             true,
@@ -2751,7 +2788,7 @@ pub(crate) struct G17PUserRenderStorage {
     /// any of the mappings reachable through that root are destroyed. Native's
     /// second AGXContextIDManager allocation is a refcounted lookup of this
     /// same GART, not a second hardware context.
-    _command_context: mmu::T8140AppContextLease,
+    _command_context: Option<mmu::T8140AppContextLease>,
     /// Render-only tail of the USC private-memory aperture.  Ordinary client
     /// VMs start with the 21-buffer compute closure; a render submission adds
     /// blocks 21..25 for the native 22-block initial pool plus four-block
@@ -2772,7 +2809,7 @@ pub(crate) struct G17PUserRenderStorage {
     /// in context 0. Keep this allocation for now to isolate the pointer fix
     /// from allocator-layout changes; the MCache range contents still name
     /// the client execution context independently of the table's own address.
-    descriptor_3d_render: mmu::KernelMapping,
+    descriptor_3d_render: G17PRenderClientAlias,
     ta_context_low: mmu::KernelMapping,
     fragment_context_low: mmu::KernelMapping,
     graph: MappedObject,
@@ -2790,7 +2827,7 @@ pub(crate) struct G17PUserRenderStorage {
     parameter_buffer_token: u64,
     render_ta_status: Option<mmu::KernelMapping>,
     /// Stable client-root PDM mapping; dropped before its fixed high owner.
-    fragment_status_low: mmu::KernelMapping,
+    fragment_status_low: G17PRenderClientAlias,
     /// Standalone native status page at 0xfffffc2001630000. Native maps this
     /// firmware-high read-only and aliases the same PA GPU read-write at
     /// context-base +0x1a8000; it is not a subpage of generic render state.
@@ -4929,7 +4966,7 @@ impl G17PUserRenderStorage {
             if kind == TraceKind::TvbPayload {
                 if let Some(tvb) = &self.render_tvb {
                     item.dva = tvb.iova();
-                    item.expected_len = (tvb.block_mappings.len() * G17P_RENDER_TVB_BLOCK_SIZE) as u64;
+                    item.expected_len = (tvb.block_count * G17P_RENDER_TVB_BLOCK_SIZE) as u64;
                 }
             }
             archive.omit(item, TraceOmission::NotImplemented).map_err(|_| EINVAL)?;
@@ -6162,15 +6199,20 @@ impl G17PUserRenderStorage {
             Ok(())
         }));
 
+        let descriptor_3d_render_info = G17PRenderClientAlias::new(&descriptor_3d_render);
+        let fragment_status_low_info = G17PRenderClientAlias::new(&fragment_status_low);
+        let mut render_operand_aliases = KVec::with_capacity(2, GFP_KERNEL)?;
+        render_operand_aliases.push(descriptor_3d_render, GFP_KERNEL)?;
+        render_operand_aliases.push(fragment_status_low, GFP_KERNEL)?;
         Ok(Self {
-            render_operand_aliases: KVec::new(),
+            render_operand_aliases,
             descriptors,
             fragment_rce,
             descriptor_ta_high,
             descriptor_3d_high,
             descriptor_ta_low,
             descriptor_3d_low,
-            descriptor_3d_render,
+            descriptor_3d_render: descriptor_3d_render_info,
             ta_context_low,
             fragment_context_low,
             graph,
@@ -6184,7 +6226,7 @@ impl G17PUserRenderStorage {
             parameter_management,
             parameter_buffer_token: 0,
             render_ta_status: Some(render_ta_status),
-            fragment_status_low,
+            fragment_status_low: fragment_status_low_info,
             fragment_status,
             timestamps,
             user_timestamp_aliases,
@@ -6193,8 +6235,64 @@ impl G17PUserRenderStorage {
             ta_hardware_buffer_id: translated.parameters.ta_hardware_buffer_id,
             owner_pid,
             lifecycle_predecessor,
-            _command_context: command_context,
+            _command_context: Some(command_context),
         })
+    }
+
+    pub(crate) fn render_pool_id(&self) -> u64 {
+        // This checked, monotonic native GID reservation is unique to this
+        // retained graph, even if its GPU addresses are reused after reset.
+        u64::from(self.lifecycle_predecessor)
+    }
+
+    fn take_persistent_client_mappings(&mut self) -> Result<KVec<mmu::KernelMapping>> {
+        let mut aliases = core::mem::take(&mut self.render_operand_aliases);
+        for object in [self.scene_scratch.as_mut(), self.discard.as_mut(),
+                       Some(&mut self.fragment_rce)] {
+            if let Some(object) = object {
+                aliases.push(object.mapping.take().ok_or(EIO)?, GFP_KERNEL)?;
+            }
+        }
+        if let Some(tvb) = self.render_tvb.as_mut() {
+            for mapping in core::mem::take(&mut tvb.block_mappings) {
+                aliases.push(mapping, GFP_KERNEL)?;
+            }
+        }
+        Ok(aliases)
+    }
+
+    fn map_persistent_client_aliases(&mut self, vm: &mmu::Vm) -> Result<KVec<mmu::KernelMapping>> {
+        let mut aliases = KVec::new();
+        if let Some(tvb) = self.render_tvb.as_mut() {
+            aliases = tvb.map_cached_blocks(vm)?;
+        }
+        for object in [self.scene_scratch.as_mut(), self.discard.as_mut()] {
+            if let Some(object) = object {
+                aliases.push(object.map_alias_at(vm, object.iova(), mmu::PROT_GPU_SHARED_RW)?, GFP_KERNEL)?;
+            }
+        }
+        aliases.push(self.fragment_rce.map_alias_at(
+            vm, self.fragment_rce.iova(), mmu::PROT_GPU_SHARED_RO,
+        )?, GFP_KERNEL)?;
+        aliases.push(self.descriptors.object.map_range_into_range(
+            vm, mmu::UAT_PGSZ..2 * mmu::UAT_PGSZ,
+            self.descriptor_3d_render.iova()
+                ..self.descriptor_3d_render.iova() + self.descriptor_3d_render.size() as u64,
+            mmu::UAT_PGSZ as u64, mmu::PROT_GPU_SHARED_RO, false,
+        )?, GFP_KERNEL)?;
+        aliases.push(self.fragment_status.map_alias_at(
+            vm, self.fragment_status_low.iova(), mmu::PROT_GPU_SHARED_RW,
+        )?, GFP_KERNEL)?;
+        Ok(aliases)
+    }
+
+    /// Called only after semantic paired completion and FList release.
+    pub(crate) fn release_client_context(&mut self) {
+        self._command_context = None;
+    }
+
+    pub(crate) fn install_client_context(&mut self, context: mmu::T8140AppContextLease) {
+        self._command_context = Some(context);
     }
 
     /// Refresh the canonical queue group's command-owned objects after the
@@ -6704,7 +6802,7 @@ impl G17PUserRenderStorage {
         let mut first = usize::MAX;
         let mut window = [0u8; 64];
         let tvb_nonzero = self.render_tvb.as_mut().map(|tvb| {
-            let block_count = tvb.block_mappings.len();
+            let block_count = tvb.block_count;
             let size = block_count * G17P_RENDER_TVB_BLOCK_SIZE;
             tvb.with_bytes_mut(|raw| {
                 let mut count = 0usize;
@@ -7122,7 +7220,7 @@ impl G17PUserRenderStorage {
                 "render-tvb-native-identity",
                 self.render_tvb.as_ref().map_or(true, |tvb| {
                     tvb.iova() == g17p_native_tvb_block_va(0).unwrap_or(0)
-                        && tvb.block_mappings.len() == G17P_PM_BLOCK_COUNT
+                        && tvb.block_count == G17P_PM_BLOCK_COUNT
                 }),
             ),
             (
@@ -13008,6 +13106,7 @@ impl G17ResourceOwner {
             "G17P render channel owner: process pid={}\n",
             owner_pid
         );
+        vm.clear_render_pool_mappings();
         let render_operand_aliases = self.stage_user_render_flist(vm)?;
         self.stage_render_uma_page_pool_descriptor()?;
         let parameter_page_list_vas = self.parameter_buffer_page_list_vas();
@@ -13038,10 +13137,30 @@ impl G17ResourceOwner {
             user_timestamp_aliases,
             command_context,
         )?;
-        storage.render_operand_aliases = render_operand_aliases;
+        for mapping in render_operand_aliases {
+            storage.render_operand_aliases.push(mapping, GFP_KERNEL)?;
+        }
+        let aliases = storage.take_persistent_client_mappings()?;
+        vm.install_render_pool_mappings(storage.render_pool_id(), aliases)?;
         self.stage_render_parameter_buffer_page_list(&mut storage)?;
         self.stage_render_parameter_buffer_descriptor(storage.parameter_buffer_descriptor()?)?;
         Ok(storage)
+    }
+
+    /// Prepare the incoming VM without changing the active execution root.
+    /// Mapping failure drops only its new aliases; prior clients remain live.
+    pub(crate) fn cache_render_vm_mappings(
+        &mut self, storage: &mut G17PUserRenderStorage, vm: &mmu::Vm,
+    ) -> Result {
+        if vm.render_pool_mappings_match(storage.render_pool_id()) {
+            return Ok(());
+        }
+        vm.clear_render_pool_mappings();
+        let mut aliases = storage.map_persistent_client_aliases(vm)?;
+        for mapping in self.stage_user_render_flist(vm)? {
+            aliases.push(mapping, GFP_KERNEL)?;
+        }
+        vm.install_render_pool_mappings(storage.render_pool_id(), aliases)
     }
 
     /// Upgrade an ordinary compute-capable client VM to the complete native
