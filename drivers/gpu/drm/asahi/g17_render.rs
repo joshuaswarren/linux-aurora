@@ -321,15 +321,9 @@ pub(crate) struct G17pRenderParameters {
     /// assembled from workload-derived USC pool limits. Their captured values
     /// are not architectural literals and must not become defaults.
     pub(crate) native_ta_registers: u32,
-    /// Hardware-derived high GPC performance-state map nibble for fragment
-    /// register 0x1c838.
-    ///
-    /// macOS samples SGX 0xe01480 bits 19:16 while initializing the
-    /// accelerator, retains the result in the 3D channel command, then emits
-    /// it here. Working Metal captures contain 1, 3, and 7, proving that this
-    /// is runtime hardware state rather than an N/layer constant. Linux caches
-    /// the nibble during its safe GPU-ID MMIO probe; render submission performs
-    /// no MMIO access.
+    /// Retained GPU-ID diagnostic snapshot, not the fragment parameter-buffer
+    /// owner. The old 0x1c838 use confused host descriptor +0x928 with a
+    /// different object's transient raw-command +0x928 field.
     pub(crate) gpc_perf_state_map: u32,
     /// Low nibble of SGX 0xe01480, copied by native 3D submit to tail +0x210c.
     pub(crate) gpc_perf_state_map_low: u32,
@@ -811,19 +805,15 @@ fn build_fragment_registers_full(
         RegisterWrite::new(0x160e0, p.fragment_lifecycle),
         RegisterWrite::new(0x01499, p.fragment_lifecycle),
         RegisterWrite::new(0x0a341, p.fragment_lifecycle),
-        // Hardware performance-state map, not a render geometry constant.
-        // macOS reads SGX 0xe01480 bits 19:16 during accelerator init, retains
-        // that nibble through the 3D channel command, and emits it here. Linux
-        // receives the value through GpuIdConfig; never read SGX at submission
-        // time because the cores may already be power-gated.
-        RegisterWrite::new(
-            0x1c838,
-            if p.native_ta_registers & 32 != 0 {
-                0
-            } else {
-                p.gpc_perf_state_map as u64
-            },
-        ),
+        // The fragment must use the same parameter-buffer owner as TA 1c830.
+        // Native TA::prepare stores its allocated HWPB ID at host +928; the
+        // same derived host descriptor is submitted through both channels.
+        // generate3DRegisterList reads that HOST field at 8a5c7cc. Its wrapper
+        // at 8a515d8 tail-calls with x1=raw command, x2=host descriptor: the
+        // unused channel argument in the mangled common-function name is NOT
+        // present in the optimized calling convention. Raw command +928 has
+        // a different producer and must not be used to infer this register.
+        RegisterWrite::new(0x1c838, p.ta_hardware_buffer_id as u64),
         RegisterWrite::new(0x1ca28, p.cycle),
         RegisterWrite::new(0x10211, p.work_stamp),
         RegisterWrite::new(0x10420, p.work_stamp),
@@ -2146,6 +2136,10 @@ mod tests {
             fragment.iter().find(|write| write.number == 0x14048).unwrap().value,
             5
         );
+        assert_eq!(
+            fragment.iter().find(|write| write.number == 0x1c838).unwrap().value,
+            7
+        );
     }
 
     #[test]
@@ -2171,7 +2165,7 @@ mod tests {
             (&tiling[..], 0x36c, 0x10209, parameters.work_stamp),
             (&tiling[..], 0x378, 0x1c9f0, parameters.work_stamp),
             (&tiling[..], 0x384, 0x14320, parameters.work_stamp),
-            (&fragment[..], 0x454, 0x1c838, 7u64),
+            (&fragment[..], 0x454, 0x1c838, 5u64),
             (&fragment[..], 0x46c, 0x10211, parameters.work_stamp),
             (&fragment[..], 0x478, 0x10420, parameters.work_stamp),
         ] {
@@ -2181,11 +2175,12 @@ mod tests {
     }
 
     #[test]
-    fn fragment_perf_map_register_and_tail_have_independent_sources() {
+    fn fragment_parameter_buffer_owner_is_independent_of_perf_map_and_tail() {
         let mut parameters = G17pRenderParameters::source_rsrc8();
         parameters.native_ta_registers = u32::MAX;
 
-        for (control, low, map) in [(0, 7, 3), (1, 3, 7)] {
+        for (control, low, map, id) in [(0, 7, 3, 0), (1, 3, 7, 5), (1, 0, 1, 3)] {
+            parameters.ta_hardware_buffer_id = id;
             parameters.gpc_perf_state_control = control;
             parameters.gpc_perf_state_map_low = low;
             parameters.gpc_perf_state_map = map;
@@ -2194,7 +2189,7 @@ mod tests {
                 .iter()
                 .find(|write| write.number == 0x1c838)
                 .unwrap();
-            assert_eq!(write.value, map as u64);
+            assert_eq!(write.value, id as u64);
 
             let mut descriptor = [0u8; FRAGMENT_DESCRIPTOR_SIZE];
             build_fragment_descriptor(
