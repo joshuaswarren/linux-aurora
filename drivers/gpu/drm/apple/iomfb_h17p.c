@@ -40,7 +40,12 @@ static const struct dcp_method_entry dcp_methods[dcpep_num_methods] = {
 	IOMFB_METHOD("A132", iomfbep_a132_backlight_service_matched),
 	IOMFB_METHOD("A401", dcpep_start_signal),
 	IOMFB_METHOD("A406", dcpep_swap_start),
-	IOMFB_METHOD("A407", dcpep_swap_submit),
+	/* swap_start moved A407 -> A406 on H17P, but swap_submit did NOT
+	 * move with it: macOS 25G83 issues A406 then A408 for every swap.
+	 * Across 20 traced boots (1579 swaps in the longest) A407 is never
+	 * called even once, and the A408 response is 0x0c bytes, matching
+	 * dcp_swap_submit_resp_h17p exactly. */
+	IOMFB_METHOD("A408", dcpep_swap_submit),
 	IOMFB_METHOD("A411", dcpep_set_display_device),
 	IOMFB_METHOD("A412", dcpep_is_main_display),
 	IOMFB_METHOD("A413", dcpep_set_digital_out_mode),
