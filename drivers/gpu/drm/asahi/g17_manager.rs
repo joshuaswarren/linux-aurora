@@ -217,6 +217,7 @@ struct G17PHardwareBufferIdAllocator {
     free: [u64; 2],
     stack: [u8; G17P_TA_HARDWARE_BUFFER_ID_COUNT],
     stack_len: usize,
+    next_parameter_buffer_token: u64,
 }
 
 impl G17PHardwareBufferIdAllocator {
@@ -230,6 +231,7 @@ impl G17PHardwareBufferIdAllocator {
             free: [u64::MAX, u64::MAX >> 1],
             stack,
             stack_len: G17P_TA_HARDWARE_BUFFER_ID_COUNT,
+            next_parameter_buffer_token: 0,
         }
     }
 
@@ -256,6 +258,27 @@ impl G17PHardwareBufferIdAllocator {
         let index = id as usize;
         self.free[index / 64] &= !(1u64 << (index % 64));
         Ok(id)
+    }
+
+    /// Acquire a new PB owner lease, not a render-ordinal-derived generation.
+    /// Native IDManager::alloc calls HWPB::prepareBufferResources(true) only
+    /// on the reference-count 0 -> 1 transition (8a66f24..8a66f6c). That
+    /// prepare uses a shared u64 counter, skipping -1 (8a741f0..8a7421c).
+    /// Our serialized allocator has no already-referenced-ID acquisition;
+    /// every successful allocation is that transition. Keep the counter
+    /// across releases and processor-stop recovery, independently of Scene,
+    /// queue ordinals and the separate FList generation namespace.
+    fn allocate_with_token(
+        &mut self,
+    ) -> core::result::Result<(u32, u64), G17PHardwareBufferIdError> {
+        let id = self.allocate()?;
+        let token = if self.next_parameter_buffer_token == u64::MAX {
+            0
+        } else {
+            self.next_parameter_buffer_token
+        };
+        self.next_parameter_buffer_token = token.wrapping_add(1);
+        Ok((id, token))
     }
 
     fn release(&mut self, id: u32) -> core::result::Result<(), G17PHardwareBufferIdError> {
@@ -294,7 +317,7 @@ pub(crate) struct G17PBootstrapUmaRelease {
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum G17PBootstrapUmaRequestState {
     Submitted,
-    Matched,
+    Ready,
     Published,
     Sent,
     Completed,
@@ -309,10 +332,10 @@ enum G17PBootstrapUmaLifecycleError {
     WrongPendingCount,
 }
 
-/// Host-owned opening Async-FList lifetime reconstructed from the shipping
-/// KEXT. The shared FList bytes live in `G17ResourceOwner`; this object models
-/// the independent host ownership that authorizes their final opcode-0x2e
-/// release. A raw firmware type-13 record is never sufficient by itself.
+/// One command-pair lease on a retained FList. Pool bytes outlive this lease.
+/// Native updateSubmitInfo increments pending command updates independently
+/// of optional async growth; final reference retirement emits one 0x2e using
+/// the command's captured generation (KEXT 8aa1804/8aa5340).
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 struct G17PBootstrapUmaLifecycle {
     sequence: u64,
@@ -320,7 +343,7 @@ struct G17PBootstrapUmaLifecycle {
     hardware_buffer_owned: bool,
     hardware_buffer_references: u32,
     pending_release_count: u32,
-    request: G17PBootstrapUmaCompletion,
+    request: Option<G17PBootstrapUmaCompletion>,
     state: G17PBootstrapUmaRequestState,
 }
 
@@ -336,17 +359,57 @@ impl G17PBootstrapUmaLifecycle {
             // until normal paired render completion, so type 13 is not the
             // point at which opcode 0x2e may be emitted.
             hardware_buffer_references: 4,
-            pending_release_count: 1,
-            request: G17PBootstrapUmaCompletion {
+            pending_release_count: 2,
+            request: Some(G17PBootstrapUmaCompletion {
                 stamp: G17P_BOOTSTRAP_UMA_STAMP,
                 hardware_buffer_id: G17P_BOOTSTRAP_UMA_HARDWARE_BUFFER_ID,
                 shared_control: g17_initdata::CONTROL_SHARED_ADDRESS,
                 operand_table: g17_initdata::CONTROL_OPERAND_TABLE_ADDRESS,
                 cookie: G17P_BOOTSTRAP_UMA_COOKIE,
                 count: G17P_BOOTSTRAP_UMA_COUNT,
-            },
+            }),
             state: G17PBootstrapUmaRequestState::Submitted,
         }
+    }
+
+    /// The current fixed pool has one cold grow request. Reacquiring the
+    /// unchanged pool creates command references, not another grow request.
+    /// B1 12278..12298 calls 1b230 from warm tag-15 even with install=0;
+    /// this rebinds the owner/generation invalidated by the preceding 0x2e.
+    fn acquire(
+        previous: Option<&Self>,
+        sequence: u64,
+    ) -> core::result::Result<Self, G17PBootstrapUmaLifecycleError> {
+        let Some(previous) = previous else {
+            return if sequence == G17P_BOOTSTRAP_UMA_SEQUENCE {
+                Ok(Self::new())
+            } else {
+                Err(G17PBootstrapUmaLifecycleError::WrongOwner)
+            };
+        };
+        if previous.state != G17PBootstrapUmaRequestState::Completed {
+            return Err(G17PBootstrapUmaLifecycleError::WrongPhase);
+        }
+        if previous.hardware_buffer_owned || previous.hardware_buffer_references != 0 {
+            return Err(G17PBootstrapUmaLifecycleError::WrongReferenceCount);
+        }
+        if previous.pending_release_count != 0 {
+            return Err(G17PBootstrapUmaLifecycleError::WrongPendingCount);
+        }
+        if previous.hardware_buffer_id != G17P_BOOTSTRAP_UMA_HARDWARE_BUFFER_ID
+            || previous.sequence.checked_add(1) != Some(sequence)
+        {
+            return Err(G17PBootstrapUmaLifecycleError::WrongOwner);
+        }
+        Ok(Self {
+            sequence,
+            hardware_buffer_id: previous.hardware_buffer_id,
+            hardware_buffer_owned: true,
+            hardware_buffer_references: 3, // prepare + TA + 3D; no pending grow
+            pending_release_count: 2,
+            request: None,
+            state: G17PBootstrapUmaRequestState::Submitted,
+        })
     }
 
     fn retire_prepare_reference(
@@ -354,11 +417,14 @@ impl G17PBootstrapUmaLifecycle {
     ) -> core::result::Result<(), G17PBootstrapUmaLifecycleError> {
         if self.state != G17PBootstrapUmaRequestState::Submitted
             || !self.hardware_buffer_owned
-            || self.hardware_buffer_references != 4
+            || self.hardware_buffer_references != if self.request.is_some() { 4 } else { 3 }
         {
             return Err(G17PBootstrapUmaLifecycleError::WrongPhase);
         }
-        self.hardware_buffer_references = 3;
+        self.hardware_buffer_references -= 1;
+        if self.request.is_none() {
+            self.state = G17PBootstrapUmaRequestState::Ready;
+        }
         Ok(())
     }
 
@@ -369,7 +435,7 @@ impl G17PBootstrapUmaLifecycle {
         if self.state != G17PBootstrapUmaRequestState::Submitted {
             return Err(G17PBootstrapUmaLifecycleError::WrongPhase);
         }
-        if completion != self.request {
+        if Some(completion) != self.request {
             return Err(G17PBootstrapUmaLifecycleError::WrongCompletion);
         }
         if !self.hardware_buffer_owned
@@ -385,14 +451,14 @@ impl G17PBootstrapUmaLifecycle {
         }
 
         self.hardware_buffer_references = 2;
-        self.state = G17PBootstrapUmaRequestState::Matched;
+        self.state = G17PBootstrapUmaRequestState::Ready;
         Ok(())
     }
 
     fn retire_render_references(
         &mut self,
     ) -> core::result::Result<G17PBootstrapUmaRelease, G17PBootstrapUmaLifecycleError> {
-        if self.state != G17PBootstrapUmaRequestState::Matched
+        if self.state != G17PBootstrapUmaRequestState::Ready
             || !self.hardware_buffer_owned
             || self.hardware_buffer_references != 2
         {
@@ -403,7 +469,7 @@ impl G17PBootstrapUmaLifecycle {
         }
         self.hardware_buffer_references = 0;
         self.hardware_buffer_owned = false;
-        self.pending_release_count -= 1;
+        self.pending_release_count = 0;
         Ok(G17PBootstrapUmaRelease {
             sequence: self.sequence,
             hardware_buffer_id: self.hardware_buffer_id,
@@ -411,7 +477,7 @@ impl G17PBootstrapUmaLifecycle {
     }
 
     fn pending_release(&self) -> Option<G17PBootstrapUmaRelease> {
-        (self.state == G17PBootstrapUmaRequestState::Matched
+        (self.state == G17PBootstrapUmaRequestState::Ready
             && self.hardware_buffer_references == 0)
         .then_some(
             G17PBootstrapUmaRelease {
@@ -905,6 +971,8 @@ pub(crate) struct G17PManagerConstruction {
     /// Native's per-workqueue `AGXUSCPrivMemFList::updateSubmitInfo` owner.
     /// A type-13 tuple is actionable only while this retained owner exists.
     bootstrap_uma: Option<G17PBootstrapUmaLifecycle>,
+    /// Captured before restaging; becomes the active lease at FList publication.
+    prepared_render_flist: Option<G17PBootstrapUmaLifecycle>,
     accepted_firmware_recovery_generation: u64,
     pending_primary_recovery: Option<(u64, u32)>,
     /// Tag-14 AddKicks held back until the firmware recovery/power-up closes.
@@ -1354,6 +1422,7 @@ impl G17PManagerConstruction {
                 render_hardware_buffer_ids: G17PHardwareBufferIdAllocator::new(),
                 render_sksm: None,
                 bootstrap_uma: None,
+                prepared_render_flist: None,
                 accepted_firmware_recovery_generation: 0,
                 pending_primary_recovery: None,
                 pending_add_kicks: None,
@@ -2070,16 +2139,22 @@ impl G17PManagerConstruction {
             .publish_primary_device_control_record(opcode, arg)
     }
 
-    /// Publish the one asynchronous USC FList update that native performs for
-    /// a cold workqueue. Every operand belongs to Linux; none is replayed from
-    /// a captured Metal allocation.
+    /// Activate this prepared pair's FList lease. Only the cold lease has a
+    /// pending async grow to publish; a warm pair becomes Ready without 0x20.
     pub(crate) fn publish_render_usc_freelist_request(
         &mut self,
     ) -> Result<Option<g17_resources::G17PDeviceControlPublication>> {
-        if self.bootstrap_uma.is_some() {
+        if self.render_storage.is_none() {
+            return Err(EINVAL);
+        }
+        let mut lifecycle = self.prepared_render_flist.ok_or(EIO)?;
+        lifecycle.retire_prepare_reference().map_err(|_| EIO)?;
+        if lifecycle.request.is_none() {
+            self.bootstrap_uma = Some(lifecycle);
+            self.prepared_render_flist = None;
             return Ok(None);
         }
-        if self.render_submission_ordinal != 0 || self.render_storage.is_none() {
+        if lifecycle.sequence != G17P_BOOTSTRAP_UMA_SEQUENCE {
             return Err(EINVAL);
         }
 
@@ -2097,14 +2172,11 @@ impl G17PManagerConstruction {
         )
         .map_err(|_| EINVAL)?;
 
-        let mut lifecycle = G17PBootstrapUmaLifecycle::new();
-        lifecycle
-            .retire_prepare_reference()
-            .map_err(|_| EIO)?;
         let publication = self
             .resources
             .publish_primary_device_control_raw(&record)?;
         self.bootstrap_uma = Some(lifecycle);
+        self.prepared_render_flist = None;
         Ok(Some(publication))
     }
 
@@ -2129,7 +2201,7 @@ impl G17PManagerConstruction {
     pub(crate) fn render_usc_freelist_grow_matched(&self) -> bool {
         self.bootstrap_uma
             .as_ref()
-            .is_some_and(|lifecycle| lifecycle.state == G17PBootstrapUmaRequestState::Matched)
+            .is_some_and(|lifecycle| lifecycle.state == G17PBootstrapUmaRequestState::Ready)
     }
 
     /// Retire the TA and 3D FList references after paired render completion.
@@ -2164,8 +2236,8 @@ impl G17PManagerConstruction {
         }
     }
 
-    /// Publish the exact release generated by the final native async-grow
-    /// reference drop. The caller still owns the EP-0x21 announcement.
+    /// Publish the release generated by this pair's final reference drop.
+    /// The caller still owns the EP-0x21 announcement.
     pub(crate) fn publish_render_usc_freelist_release(
         &mut self,
         release: G17PBootstrapUmaRelease,
@@ -2230,6 +2302,14 @@ impl G17PManagerConstruction {
 
     pub(crate) fn prepare_compute_runtime_class2(&mut self) -> Result {
         self.resources.prepare_compute_runtime_class2()
+    }
+
+    pub(crate) fn render_flist_owned(&self) -> bool {
+        self.resources.render_flist_owned()
+    }
+
+    pub(crate) fn stage_compute_flist_state(&mut self) -> Result {
+        self.resources.stage_compute_flist_state()
     }
 
     pub(crate) fn rewrite_compute_dispatch_record(&mut self) -> Result {
@@ -2483,6 +2563,7 @@ impl G17PManagerConstruction {
         self.render_context_aliases = None;
         self.render_sksm = None;
         self.bootstrap_uma = None;
+        self.prepared_render_flist = None;
         self.render_submission_ordinal = 0;
         self.render_auxiliary_timestamp = 0;
     }
@@ -2900,7 +2981,7 @@ impl G17PManagerConstruction {
             self.render_storage
                 .as_mut()
                 .ok_or(ENODEV)?
-                .stage_fragment_kick(fragment_stamp)
+                .stage_fragment_kick(ordinal, fragment_stamp)
                 .inspect_err(|error| {
                     dev_err!(
                         dev.as_ref(),
@@ -2982,9 +3063,9 @@ impl G17PManagerConstruction {
             return Err(EBUSY);
         }
         self.render_auxiliary_timestamp = G17P_NATIVE_RENDER_KICK_AUXILIARY;
-        let hardware_buffer_id = self
+        let (hardware_buffer_id, parameter_buffer_token) = self
             .render_hardware_buffer_ids
-            .allocate()
+            .allocate_with_token()
             .map_err(|_| EBUSY)?;
         self.render_hardware_buffer_id = Some(hardware_buffer_id);
         self.render_hardware_buffer_published = false;
@@ -3001,6 +3082,7 @@ impl G17PManagerConstruction {
             dev,
             vm,
             &command,
+            parameter_buffer_token,
             user_timestamps,
             user_timestamp_aliases,
             registers,
@@ -3018,6 +3100,7 @@ impl G17PManagerConstruction {
         dev: &AsahiDevice,
         vm: &mmu::Vm,
         command: &g17_uapi::TranslatedRenderCommand,
+        parameter_buffer_token: u64,
         user_timestamps: [u64; 4],
         user_timestamp_aliases: KVec<mmu::KernelMapping>,
         registers: &regs::Resources,
@@ -3034,13 +3117,28 @@ impl G17PManagerConstruction {
         }
         // Both render paths publish tag-16 when it is armed -- the SKSM
         // staging path through `stage_fragment_kick`, and the plain path
-        // through `stage_fragment` -- so the prefix follows the parameter
-        // alone. The tiling half goes through `build_g17p_late_tiling_bytes`
-        // in both cases and is already covered.
-        let published_prefix = g17_resources::g17p_render_published_prefix();
+        // through `stage_fragment`. The absolute prefix includes all earlier
+        // groups in the retained ring; it is not merely this group's 3/4
+        // items. The same target feeds both outer slots and the tracker.
+        let published_prefix =
+            g17_resources::g17p_render_published_prefix(self.render_submission_ordinal)?;
         if self.render_tracker.is_some() {
             return Err(EBUSY);
         }
+        // Check the previous release BEFORE touching any retained graph or
+        // pool bytes. Capture the same generation encoded in both tag-15s;
+        // paired completion increments the ordinal before FList retirement.
+        self.prepared_render_flist =
+            if *crate::module_parameters::g17p_render_usc_freelist.value() != 0 {
+                Some(G17PBootstrapUmaLifecycle::acquire(
+                    self.bootstrap_uma.as_ref(),
+                    u64::from(g17_submission::g17p_render_flist_generation(
+                        self.render_submission_ordinal,
+                    )),
+                ).map_err(|_| EBUSY)?)
+            } else {
+                None
+            };
         self.resources
             .stage_render_region_views()
             .map_err(|error| Self::render_stage_fail("stage-region-views", error))?;
@@ -3107,20 +3205,10 @@ impl G17PManagerConstruction {
                     self.render_submission_ordinal,
                 )
                 .map_err(|error| Self::render_stage_fail("restage-command", error))?;
-            self.resources
-                .stage_render_parameter_buffer_page_list(
-                    self.render_storage.as_mut().ok_or(ENODEV)?,
-                )
-                .map_err(|error| Self::render_stage_fail("stage-pb-page-list", error))?;
-            let pb_descriptor = self
-                .render_storage
-                .as_ref()
-                .ok_or(ENODEV)?
-                .parameter_buffer_descriptor()
-                .map_err(|error| Self::render_stage_fail("encode-pbdesc", error))?;
-            self.resources
-                .stage_render_parameter_buffer_descriptor(pb_descriptor)
-                .map_err(|error| Self::render_stage_fail("stage-pbdesc", error))?;
+            // The retained PM owner validates its unchanged PBDesc identity.
+            // Firmware owns the live page-list/PBDesc cursors; do not reset
+            // them to cold values when preparing another Scene. The cold
+            // new_user_render_storage path below still initializes them.
         } else {
             if self.render_submission_ordinal != 0 || self.render_bind.is_some() {
                 return Err(EIO);
@@ -3140,6 +3228,9 @@ impl G17PManagerConstruction {
         }
         {
             let storage = self.render_storage.as_mut().ok_or(ENODEV)?;
+            storage
+                .set_parameter_buffer_lease_token(parameter_buffer_token)
+                .map_err(|error| Self::render_stage_fail("set-pb-lease-token", error))?;
             if let Some(failed) = storage.first_unreachable(self.resources.uat(), vm) {
                 storage.log_reachability(dev, self.resources.uat(), vm);
                 dev_err!(
@@ -3755,7 +3846,12 @@ impl G17PManagerConstruction {
             label,
             self.render_hardware_buffer_id.unwrap_or(0),
         );
-        let selected_metric = self.resources.selected_parameter_metric();
+        let selected_metric = self
+            .render_storage
+            .as_ref()
+            .ok_or(ENODEV)
+            .and_then(|storage| storage.selected_scene_index())
+            .and_then(|scene| self.resources.selected_parameter_metric(scene));
         let dev = self.resources.dev().clone();
         match selected_metric {
             Ok(value) => dev_info!(
@@ -4200,11 +4296,13 @@ impl G17PManagerConstruction {
         self.render_storage
             .as_mut()
             .ok_or(ENODEV)?
-            .stage_fragment_kick(fragment_stamp)
+            .stage_fragment_kick(self.render_submission_ordinal, fragment_stamp)
             .map_err(|error| Self::render_stage_fail("split-fragment-addkicks", error))?;
         fence(Ordering::SeqCst);
         let state = self.render_storage.as_mut().ok_or(ENODEV)?.snapshot()?;
-        if state.fragment.write != g17_resources::g17p_render_published_prefix() {
+        if state.fragment.write
+            != g17_resources::g17p_render_published_prefix(self.render_submission_ordinal)?
+        {
             return Err(Self::render_stage_fail("split-fragment-inner-prefix", EINVAL));
         }
         self.resources
@@ -4316,7 +4414,8 @@ impl G17PManagerConstruction {
             .map_err(|_| Self::render_stage_fail("native-order-kick", EINVAL))?;
         fence(Ordering::SeqCst);
         let state = self.render_storage.as_mut().ok_or(ENODEV)?.snapshot()?;
-        if state.tiling.write != g17_resources::g17p_render_published_prefix() {
+        let published_prefix = g17_resources::g17p_render_published_prefix(ordinal)?;
+        if state.tiling.write != published_prefix {
             return Err(Self::render_stage_fail("native-tiling-inner-prefix", EINVAL));
         }
 
@@ -4330,7 +4429,7 @@ impl G17PManagerConstruction {
         let outer = self.resources.partial_opening_outer_counters()?;
         if !g17p_native_tiling_fully_visible(
             state.tiling.write,
-            g17_resources::g17p_render_published_prefix(),
+            published_prefix,
             outer[1][2],
             plan.next_producer,
         ) {
@@ -4440,8 +4539,8 @@ impl G17PManagerConstruction {
         // Say WHY the wait failed. Without this a render timeout is anonymous,
         // and the three stages it can stall in are indistinguishable:
         //
-        //   read  < 3            the firmware never consumed the item ring
-        //   done  < 3            consumed but never retired
+        //   read  < target       the firmware has not consumed this group
+        //   done  < target       consumed but not retired
         //   timestamps still 0   retired while the GPU wrote nothing -- the
         //                        exact shape the compute tag-16 bug had
         //
@@ -4453,11 +4552,15 @@ impl G17PManagerConstruction {
             .render_storage
             .as_mut()
             .and_then(|storage| storage.snapshot().ok());
+        let target =
+            g17_resources::g17p_render_published_prefix(self.render_submission_ordinal).ok();
         if let Some(state) = final_state {
             dev_err!(
                 self.resources.dev().as_ref(),
-                "G17P render: completion timed out after {} polls; prefix 3 tiling done/read/write {}/{}/{} fragment {}/{}/{} job-list-empty {} tiling-ts [{:#x},{:#x}] fragment-ts [{:#x},{:#x}]\n",
+                "G17P render: completion timed out after {} polls; ordinal {} target {:?} tiling done/read/write {}/{}/{} fragment {}/{}/{} job-list-empty {} tiling-ts [{:#x},{:#x}] fragment-ts [{:#x},{:#x}]\n",
                 polls,
+                self.render_submission_ordinal,
+                target,
                 state.tiling.done,
                 state.tiling.read,
                 state.tiling.write,
@@ -6472,19 +6575,19 @@ mod tests {
     fn bootstrap_async_flist_releases_only_after_type13_and_paired_render() {
         let mut lifecycle = G17PBootstrapUmaLifecycle::new();
         assert_eq!(
-            lifecycle.match_completion(lifecycle.request),
+            lifecycle.match_completion(lifecycle.request.unwrap()),
             Err(G17PBootstrapUmaLifecycleError::WrongReferenceCount)
         );
         lifecycle.retire_prepare_reference().unwrap();
-        lifecycle.match_completion(lifecycle.request).unwrap();
+        lifecycle.match_completion(lifecycle.request.unwrap()).unwrap();
         assert_eq!(lifecycle.hardware_buffer_references, 2);
-        assert_eq!(lifecycle.pending_release_count, 1);
+        assert_eq!(lifecycle.pending_release_count, 2);
         assert_eq!(lifecycle.pending_release(), None);
         let release = lifecycle.retire_render_references().unwrap();
         assert_eq!(
             release,
             G17PBootstrapUmaRelease {
-                sequence: 1,
+                sequence: 0,
                 hardware_buffer_id: 0,
             }
         );
@@ -6503,18 +6606,19 @@ mod tests {
     fn bootstrap_async_flist_rejects_raw_or_duplicate_type13_records() {
         let mut lifecycle = G17PBootstrapUmaLifecycle::new();
         lifecycle.retire_prepare_reference().unwrap();
+        let exact = lifecycle.request.unwrap();
         for wrong in [
             G17PBootstrapUmaCompletion {
-                cookie: lifecycle.request.cookie + 0x40,
-                ..lifecycle.request
+                cookie: exact.cookie + 0x40,
+                ..exact
             },
             G17PBootstrapUmaCompletion {
-                count: lifecycle.request.count - 1,
-                ..lifecycle.request
+                count: exact.count - 1,
+                ..exact
             },
             G17PBootstrapUmaCompletion {
                 hardware_buffer_id: 1,
-                ..lifecycle.request
+                ..exact
             },
         ] {
             assert_eq!(
@@ -6522,12 +6626,62 @@ mod tests {
                 Err(G17PBootstrapUmaLifecycleError::WrongCompletion)
             );
         }
-        let exact = lifecycle.request;
         lifecycle.match_completion(exact).unwrap();
         assert_eq!(
             lifecycle.match_completion(exact),
             Err(G17PBootstrapUmaLifecycleError::WrongPhase)
         );
+    }
+
+    #[test]
+    fn retained_flist_leases_grow_once_and_release_every_captured_generation() {
+        let mut previous = None;
+        let mut grows = 0;
+        let mut releases = 0;
+        for ordinal in 0..3 {
+            let sequence = u64::from(g17_submission::g17p_render_flist_generation(ordinal));
+            let mut lease = G17PBootstrapUmaLifecycle::acquire(previous.as_ref(), sequence).unwrap();
+            assert_eq!(lease.sequence, sequence);
+            assert_eq!(lease.pending_release_count, 2);
+            assert_eq!(lease.hardware_buffer_references, if ordinal == 0 { 4 } else { 3 });
+            assert_eq!(lease.retire_render_references(), Err(G17PBootstrapUmaLifecycleError::WrongPhase));
+            lease.retire_prepare_reference().unwrap();
+            if let Some(request) = lease.request {
+                grows += 1;
+                assert_eq!(lease.retire_render_references(), Err(G17PBootstrapUmaLifecycleError::WrongPhase));
+                lease.match_completion(request).unwrap();
+            }
+            assert_eq!(lease.state, G17PBootstrapUmaRequestState::Ready);
+            assert!(lease.retire_prepare_reference().is_err());
+            let release = lease.retire_render_references().unwrap();
+            releases += 1;
+            assert_eq!(release.sequence, sequence);
+            assert_eq!(release.hardware_buffer_id, G17P_BOOTSTRAP_UMA_HARDWARE_BUFFER_ID);
+            assert!(lease.retire_render_references().is_err());
+            assert!(G17PBootstrapUmaLifecycle::acquire(Some(&lease), sequence + 1).is_err());
+            assert!(lease.mark_completed().is_err());
+            assert!(lease.mark_published(G17PBootstrapUmaRelease { sequence: sequence + 1, ..release }).is_err());
+            lease.mark_published(release).unwrap();
+            assert!(G17PBootstrapUmaLifecycle::acquire(Some(&lease), sequence + 1).is_err());
+            lease.mark_sent().unwrap();
+            assert!(G17PBootstrapUmaLifecycle::acquire(Some(&lease), sequence + 1).is_err());
+            lease.mark_completed().unwrap();
+            assert!(lease.mark_completed().is_err());
+            assert!(lease.mark_published(release).is_err());
+            assert!(G17PBootstrapUmaLifecycle::acquire(Some(&lease), sequence).is_err());
+            assert!(G17PBootstrapUmaLifecycle::acquire(Some(&lease), sequence + 2).is_err());
+            previous = Some(lease);
+        }
+        assert_eq!((grows, releases), (1, 3));
+        assert!(G17PBootstrapUmaLifecycle::acquire(None, 1).is_err());
+        let mut wrong = previous.unwrap();
+        wrong.hardware_buffer_id += 1;
+        assert!(G17PBootstrapUmaLifecycle::acquire(Some(&wrong), 3).is_err());
+        let mut warm = G17PBootstrapUmaLifecycle::acquire(previous.as_ref(), 3).unwrap();
+        let stale = G17PBootstrapUmaLifecycle::new().request.unwrap();
+        assert_eq!(warm.match_completion(stale), Err(G17PBootstrapUmaLifecycleError::WrongCompletion));
+        warm.retire_prepare_reference().unwrap();
+        assert_eq!(warm.match_completion(stale), Err(G17PBootstrapUmaLifecycleError::WrongPhase));
     }
 
     fn decode_hex<const N: usize>(source: &[u8]) -> [u8; N] {

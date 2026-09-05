@@ -1115,6 +1115,9 @@ pub(crate) struct G17PColdOpeningOptionalAddresses {
     pub(crate) usc_freelist_hardware_buffer_id: u32,
     pub(crate) channel_control: u64,
     pub(crate) tiling_shared_object: u64,
+    /// HWPB owner lease token (HardwareBufferBase +0x68), not an ordinal.
+    /// Reacquiring the TA HardwareBufferID from zero references assigns it.
+    pub(crate) parameter_buffer_token: u64,
     /// PID of the process that owns the paired TA/3D channels. Native stores
     /// the same u32 in `_AGFIChannelState +0x44` and ConfigUpdate +0x5a.
     pub(crate) owner_pid: u32,
@@ -1651,6 +1654,7 @@ pub(crate) fn apply_g17p_cold_opening_optional(
     match stage {
         G17PColdOpeningStage::Tiling => {
             put_u64_le(out, 0x6e, addresses.tiling_shared_object);
+            put_u64_le(out, 0x76, addresses.parameter_buffer_token);
             // AGXTAChannelSKSM::submitBuffer copies descriptor +0x1248 here
             // with a 32-bit store. The same source feeds TA command +0x18,
             // register 0x1c830, PBState +0x0c, and the PBDesc ring; firmware
@@ -1763,9 +1767,9 @@ pub(crate) fn apply_g17p_retained_optional(
         G17P_NATIVE_RENDER_QOS_HARDWARE_BUFFER_ID as u16,
     );
     // TA +0x76 is not the submission ordinal. Native copies the u64 at
-    // AGXHardwareBufferBase +0x68 here. Leave the freshly initialized local
-    // token intact until that command-owned PB state is modeled explicitly;
-    // in particular, never let an unrelated ordinal overwrite +0x76/+0x7e.
+    // AGXHardwareBufferBase +0x68 here. The cold encoder above copies the
+    // captured PB owner lease token; leave it intact when refreshing queue
+    // generations. In particular, do not overwrite +0x76/+0x7e with ordinal.
     Ok(())
 }
 
@@ -5321,6 +5325,7 @@ mod tests {
             usc_freelist_hardware_buffer_id: 0,
             channel_control: 0x70_0200_c000,
             tiling_shared_object: 0x70_0201_0000,
+            parameter_buffer_token: 0,
             owner_pid: 0x15,
             ta_hardware_buffer_id: 0,
         };
@@ -5945,6 +5950,7 @@ mod tests {
             usc_freelist_hardware_buffer_id: 5,
             channel_control: 0x70_0200_c000,
             tiling_shared_object: 0x70_0201_0000,
+            parameter_buffer_token: 0,
             owner_pid: 0x625,
             ta_hardware_buffer_id: 7,
         };
@@ -5987,6 +5993,7 @@ mod tests {
             usc_freelist_hardware_buffer_id: 0,
             channel_control: 0x70_0200_c000,
             tiling_shared_object: 0x70_0201_0000,
+            parameter_buffer_token: 0,
             owner_pid: 0x15,
             ta_hardware_buffer_id: 0,
         };
