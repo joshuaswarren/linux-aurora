@@ -4849,11 +4849,20 @@ impl G17PManagerConstruction {
         {
             return Err(EINVAL);
         }
-        self.resources.cache_compute_vm_mappings(vm)?;
-        let sksm_entries = queue.storage.map_user_entry_alias(vm)?;
+        self.resources.cache_compute_vm_mappings(vm).inspect_err(|error| {
+            pr_info!("G17P compute VM: FList aliases failed {:?}\n", error);
+        })?;
+        let sksm_entries = queue.storage.map_user_entry_alias(vm).inspect_err(|error| {
+            pr_info!("G17P compute VM: canonical SKSM entry alias {:#x} failed {:?}\n",
+                queue.storage.entry_gpu_va(), error);
+        })?;
         let (completion_ordinal_0, completion_ordinal_2) =
-            self.resources.map_user_completion_aliases(vm)?;
-        let mappings = queue.compute.map_user_execution_state(vm)?;
+            self.resources.map_user_completion_aliases(vm).inspect_err(|error| {
+                pr_info!("G17P compute VM: completion aliases failed {:?}\n", error);
+            })?;
+        let mappings = queue.compute.map_user_execution_state(vm).inspect_err(|error| {
+            pr_info!("G17P compute VM: execution aliases failed {:?}\n", error);
+        })?;
         // Bracketed to localise the ordering hang: after a failed render the
         // next compute goes silent for tens of seconds here. slotalloc's
         // get_inner is documented "Blocks if no slots are free", and T8140
