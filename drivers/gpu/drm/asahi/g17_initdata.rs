@@ -1404,7 +1404,7 @@ pub(crate) const SECONDARY_SHARED_REGION_DELTA: u64 = 0x40000;
 pub(crate) enum InstanceRole {
     /// `gfx-asc`: scheduler, device control, and all work channels.
     Primary = 0,
-    /// `gfx1-asc`: control-only peer. Started *before* the primary.
+    /// `gfx1-asc`: control-only peer. Linux starts it after primary RTKit is ready.
     Secondary = 1,
 }
 
