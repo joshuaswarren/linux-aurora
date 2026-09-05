@@ -1050,18 +1050,6 @@ fn apply_g17p_add3_resource_table(raw: &mut [u8], buffers: [u64; 3]) -> Option<(
     Some(())
 }
 
-fn g17p_render_can_reset_job_list(
-    tiling: g17_completion::QueueIndices,
-    fragment: g17_completion::QueueIndices,
-    tiling_timestamps: [u64; 2],
-    fragment_timestamps: [u64; 2],
-) -> bool {
-    tiling.idle()
-        && fragment.idle()
-        && tiling_timestamps.iter().all(|value| *value != 0)
-        && fragment_timestamps.iter().all(|value| *value != 0)
-}
-
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum G17PDeferredOuterPublication {
     None,
@@ -2935,6 +2923,51 @@ impl G17PRenderItemPlan {
     }
 }
 
+/// One host increment of an EventControl's own submitted-kick counter.
+/// Native incrementSubmittedKicks (89fc2a0) adds to the u32 reached through
+/// host descriptor +1a8; it is not assigned from a global render ordinal.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+struct G17PEventControlKick {
+    slot_offset: usize,
+    next: u32,
+}
+
+impl G17PEventControlKick {
+    fn prepare(support: &[u8], record_index: usize) -> Option<Self> {
+        if record_index >= 35 {
+            return None;
+        }
+        let slot_offset = G17P_RENDER_POOL_A_SLOTS.checked_add(record_index.checked_mul(4)?)?;
+        let previous = u32::from_le_bytes(
+            support.get(slot_offset..slot_offset.checked_add(4)?)?.try_into().ok()?,
+        );
+        Some(Self { slot_offset, next: previous.wrapping_add(1) })
+    }
+
+    /// The serialized retained owner may reuse a record only after firmware
+    /// completed all its submitted kicks and unlinked it. Never clear the
+    /// firmware's +0xc completed count or +0x94 membership to manufacture this.
+    fn prepare_reuse(support: &[u8], support_va: u64, record_index: usize) -> Option<Self> {
+        let kick = Self::prepare(support, record_index)?;
+        let record_offset = G17P_RENDER_POOL_A.checked_add(record_index.checked_mul(0x100)?)?;
+        let record = support.get(record_offset..record_offset.checked_add(0x98)?)?;
+        let slot_va = u64::from_le_bytes(record.get(..8)?.try_into().ok()?);
+        let completed = u32::from_le_bytes(record.get(0x0c..0x10)?.try_into().ok()?);
+        let membership = u32::from_le_bytes(record.get(0x94..0x98)?.try_into().ok()?);
+        if slot_va != support_va.checked_add(kick.slot_offset as u64)?
+            || completed != kick.next.wrapping_sub(1)
+            || membership != 0
+        {
+            return None;
+        }
+        Some(kick)
+    }
+
+    fn apply(self, support: &mut [u8]) {
+        put_u32(support, self.slot_offset, self.next);
+    }
+}
+
 struct G17PLateTilingBytes {
     item_group: [u8; 32],
     items: G17PRenderItemPlan,
@@ -2942,6 +2975,7 @@ struct G17PLateTilingBytes {
     optional: [u8; g17_submission::G17P_COLD_OPENING_OPTIONAL_SIZE],
     event: [u8; g17_submission::G17P_COLD_OPENING_EVENT_SIZE],
     pool_a_slot_offset: usize,
+    pool_a_slot_value: u32,
     shared_inner_value: u32,
 }
 
@@ -2963,7 +2997,7 @@ impl G17PLateTilingBytes {
         graph[G17P_USER_TILING_EVENT..G17P_USER_TILING_EVENT + self.event.len()]
             .copy_from_slice(&self.event);
         put_u32(graph, G17P_USER_TILING_POINTERS + 0x40, self.items.final_end);
-        put_u32(support, self.pool_a_slot_offset, 2);
+        put_u32(support, self.pool_a_slot_offset, self.pool_a_slot_value);
         put_u32(
             support,
             G17P_RENDER_SHARED_CONTROL_INNER,
@@ -3009,7 +3043,7 @@ impl G17PLateTilingBytes {
     }
 
     fn apply_native_pool_transition(&self, support: &mut [u8]) {
-        put_u32(support, self.pool_a_slot_offset, 2);
+        put_u32(support, self.pool_a_slot_offset, self.pool_a_slot_value);
         put_u32(
             support,
             G17P_RENDER_SHARED_CONTROL_INNER,
@@ -3027,6 +3061,7 @@ fn build_g17p_late_tiling_bytes(
     entry_stamp: u32,
     tag16: bool,
     native_pool_a_first_record: bool,
+    pool_a_slot_value: u32,
 ) -> core::result::Result<G17PLateTilingBytes, g17_submission::SubmissionError> {
     let record_a = g17_submission::g17p_render_pool_a_record_index(
         submission_ordinal,
@@ -3042,6 +3077,9 @@ fn build_g17p_late_tiling_bytes(
         // Native cold record index 1 points at slot-page +0x04. There is no
         // additional reserved-word bias in this array.
         pool_a_slot_offset: G17P_RENDER_POOL_A_SLOTS + record_a * 4,
+        // Captured from this record's owned slot before publication. On its
+        // first use this is 2; after natural unlink and reuse it is 4, 6, ...
+        pool_a_slot_value,
         shared_inner_value: submission_ordinal
             .checked_add(1)
             .and_then(|value| value.checked_mul(2))
@@ -4477,8 +4515,72 @@ struct G17PParameterManagement {
     manager_generation: u64,
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+struct G17PPmSubmittedOperationPlan {
+    offset: usize,
+    next: u32,
+}
+
+fn prepare_g17p_pm_submitted_operation(
+    raw: &[u8],
+    offset: usize,
+) -> Option<G17PPmSubmittedOperationPlan> {
+    let bytes = raw.get(offset..offset.checked_add(4)?)?;
+    let previous = u32::from_le_bytes(bytes.try_into().ok()?);
+    Some(G17PPmSubmittedOperationPlan { offset, next: previous.wrapping_add(1) })
+}
+
+/// Prepared while the serialized manager owns this PM; consumed exactly once
+/// at the outer-publication boundary. The VMap borrow keeps the counter alive
+/// and excludes host restaging between its read and the infallible commit.
+#[cfg(not(test))]
+pub(crate) struct G17PPmSubmittedOperation<'a> {
+    vmap: kernel::drm::gem::shmem::VMapRef<'a, gem::AsahiObject, u8>,
+    size: usize,
+    plan: G17PPmSubmittedOperationPlan,
+}
+
+#[cfg(not(test))]
+impl G17PPmSubmittedOperation<'_> {
+    pub(crate) fn next(&self) -> u32 {
+        self.plan.next
+    }
+
+    pub(crate) fn commit(self) {
+        let raw = unsafe {
+            // SAFETY: preparation checked the complete counter range against
+            // this live VMap's object size, and the exclusive PM borrow remains
+            // held through this synchronous publication transaction.
+            core::slice::from_raw_parts_mut(self.vmap.as_mut_ptr(), self.size)
+        };
+        put_u32(raw, self.plan.offset, self.plan.next);
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 #[cfg(not(test))]
 impl G17PParameterManagement {
+    fn prepare_submitted_operation(&mut self) -> Result<G17PPmSubmittedOperation<'_>> {
+        // AGX3DCommandDescriptor::incrementPMSubmittedOperations (89d2428)
+        // increments manager+50's CPU counter; manager+60 supplies HWPB+64's
+        // firmware alias. Native calls it from submitBuffer before publishing
+        // the 3D command. B1 compares it to HWPB+4 before its idle PB flush.
+        // This is independent of PB lease tokens and Scene generations.
+        if self.layout.counter.checked_add(4).ok_or(EOVERFLOW)? > self.backing.logical_size {
+            return Err(ERANGE);
+        }
+        let offset = self.backing.object_offset.checked_add(self.layout.counter).ok_or(EOVERFLOW)?;
+        let size = self.backing.object.size();
+        let vmap = self.backing.object.vmap()?;
+        let raw = unsafe {
+            // SAFETY: vmap covers the complete owned object; preparation below
+            // checks the translated counter range before any byte is written.
+            core::slice::from_raw_parts(vmap.as_ptr(), size)
+        };
+        let plan = prepare_g17p_pm_submitted_operation(raw, offset).ok_or(ERANGE)?;
+        Ok(G17PPmSubmittedOperation { vmap, size, plan })
+    }
+
     fn new(
         dev: &AsahiDevice,
         uat: &mmu::Uat,
@@ -4979,6 +5081,15 @@ impl G17PUserRenderStorage {
         self.parameter_management
             .as_ref()
             .map(|pm| pm.pb_descriptor())
+            .transpose()
+    }
+
+    pub(crate) fn prepare_pm_submitted_operation(
+        &mut self,
+    ) -> Result<Option<G17PPmSubmittedOperation<'_>>> {
+        self.parameter_management
+            .as_mut()
+            .map(G17PParameterManagement::prepare_submitted_operation)
             .transpose()
     }
 
@@ -6372,6 +6483,9 @@ impl G17PUserRenderStorage {
         let support = unsafe {
             core::slice::from_raw_parts_mut(support.as_mut_ptr(), G17P_RENDER_SUPPORT_SIZE)
         };
+        let pool_a_kick =
+            G17PEventControlKick::prepare_reuse(support, support_va, record_a_index)
+                .ok_or(EBUSY)?;
         destination.copy_from_slice(source);
         let record_a = G17P_RENDER_POOL_A + record_a_index * 0x100;
         put_u32(
@@ -6380,11 +6494,7 @@ impl G17PUserRenderStorage {
             submission_ordinal + submission_ordinal / 2,
         );
         put_u32(support, record_a + 0x10, 0x50);
-        put_u32(
-            support,
-            G17P_RENDER_POOL_A_SLOTS + record_a_index * 4,
-            1,
-        );
+        pool_a_kick.apply(support);
         put_u32(
             support,
             G17P_RENDER_SHARED_CONTROL_INNER,
@@ -7312,10 +7422,11 @@ impl G17PUserRenderStorage {
     pub(crate) fn stage_fragment_completion_scratch(
         &mut self,
         current_timestamp: u64,
+        channel_payload: u8,
     ) -> Result<u64> {
         let value = g17_submission::encode_g17p_3d_completion_scratch(
             current_timestamp,
-            g17_submission::G17P_3D_COMPLETION_SCRATCH_PAYLOAD,
+            channel_payload,
         )
         .map_err(|_| EINVAL)?;
         self.descriptors.with_bytes_mut(|raw| {
@@ -7650,6 +7761,20 @@ impl G17PUserRenderStorage {
         entry_stamp: u32,
     ) -> Result<G17PLateTilingPublication> {
         let graph_va = self.graph.iova();
+        let record_a_index = g17_submission::g17p_render_pool_a_record_index(
+            submission_ordinal,
+            g17p_render_native_pool_a_first_record_enabled(),
+        );
+        let graph = self.graph.object.vmap()?.as_mut_ptr();
+        let support = self.support.object.vmap()?.as_mut_ptr();
+        let pool_a_kick = {
+            // SAFETY: the retained support owns this existing WC mapping;
+            // preparation reads only the selected, bounds-checked u32 slot.
+            let raw = unsafe {
+                core::slice::from_raw_parts(support, self.support.logical_size)
+            };
+            G17PEventControlKick::prepare(raw, record_a_index).ok_or(EINVAL)?
+        };
         let bytes = build_g17p_late_tiling_bytes(
             g17_submission::G17P_COLD_OPENING_TA_DESCRIPTOR_BASE,
             graph_va,
@@ -7659,6 +7784,7 @@ impl G17PUserRenderStorage {
             entry_stamp,
             g17p_render_tag16_enabled(),
             g17p_render_native_pool_a_first_record_enabled(),
+            pool_a_kick.next,
         )
         .map_err(|_| EINVAL)?;
 
@@ -7667,8 +7793,6 @@ impl G17PUserRenderStorage {
         {
             return Err(EINVAL);
         }
-        let graph = self.graph.object.vmap()?.as_mut_ptr();
-        let support = self.support.object.vmap()?.as_mut_ptr();
         Ok(G17PLateTilingPublication {
             graph,
             support,
@@ -7804,25 +7928,6 @@ impl G17PUserRenderStorage {
         Ok(state)
     }
 
-    /// Restore the shared intrusive-list head after both queues are idle and
-    /// both GPU stages have written their owned timestamps.
-    pub(crate) fn quiesce_completed_job_list(&mut self, state: G17PUserRenderQueueState) -> Result {
-        if !g17p_render_can_reset_job_list(
-            state.tiling,
-            state.fragment,
-            state.tiling_timestamps,
-            state.fragment_timestamps,
-        ) {
-            return Err(EBUSY);
-        }
-        let job_list = self.graph.iova() + Self::JOB_LIST as u64;
-        self.graph.with_bytes_mut(|raw| {
-            put_u64(raw, Self::JOB_LIST, 0);
-            put_u64(raw, Self::JOB_LIST + 0x08, job_list);
-            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-            Ok(())
-        })
-    }
 }
 
 #[cfg(not(test))]
@@ -13760,7 +13865,7 @@ impl G17ResourceOwner {
     /// Publish the first fragment/tiling outer-ring pair in the measured
     /// order. Queue records and their item rings must already contain the
     /// three-entry groups named by the supplied queue heads.
-    pub(crate) fn publish_partial_opening_pair<F>(
+    pub(crate) fn publish_partial_opening_pair<F, G>(
         &mut self,
         render_vm: Option<&mmu::Vm>,
         context_already_bound: bool,
@@ -13773,6 +13878,7 @@ impl G17ResourceOwner {
         tiling_queue_gpu_va: u64,
         tiling_queue_write_index: u32,
         first_submit: bool,
+        commit_submitted_operation: G,
         publish_late_tiling_state: F,
     ) -> Result<(
         g17_submission::PreparedG17PPartialOpeningWorkPair,
@@ -13780,6 +13886,7 @@ impl G17ResourceOwner {
     )>
     where
         F: FnOnce(),
+        G: FnOnce(),
     {
         if fragment_queue_gpu_va == 0
             || tiling_queue_gpu_va == 0
@@ -13928,6 +14035,10 @@ impl G17ResourceOwner {
                 .install_t8140_partial_opening_empty_high_roots()?;
             None
         };
+        // No fallible operation remains. Commit native PM usage exactly once
+        // before either outer producer can expose the corresponding command.
+        // A failed mapping, ring check or context bind above consumes no count.
+        commit_submitted_operation();
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         if !matches!(
             deferred_outer,
@@ -15453,6 +15564,7 @@ mod tests {
                     optional: [0; g17_submission::G17P_COLD_OPENING_OPTIONAL_SIZE],
                     event: [0; g17_submission::G17P_COLD_OPENING_EVENT_SIZE],
                     pool_a_slot_offset: 0,
+                    pool_a_slot_value: 2,
                     shared_inner_value: 2 * (ordinal + 1),
                 };
                 put_u32(&mut graph, G17P_USER_TILING_POINTERS, items.base);
@@ -15504,7 +15616,7 @@ mod tests {
         // An address-construction error occurs before any publication and
         // cannot change the early 3D-visible bytes.
         assert!(
-            build_g17p_late_tiling_bytes(descriptor, u64::MAX, addresses, 6, 0, 1, false, false)
+            build_g17p_late_tiling_bytes(descriptor, u64::MAX, addresses, 6, 0, 1, false, false, 2)
                 .is_err()
         );
         assert!(graph[G17P_USER_TILING_RING..G17P_USER_TILING_RING + 24]
@@ -15514,7 +15626,7 @@ mod tests {
         assert_eq!(get_u32(&support, G17P_RENDER_SHARED_CONTROL_INNER), 1);
 
         let late =
-            build_g17p_late_tiling_bytes(descriptor, graph_va, addresses, 6, 0, 1, false, false)
+            build_g17p_late_tiling_bytes(descriptor, graph_va, addresses, 6, 0, 1, false, false, 2)
                 .unwrap();
         late.apply(&mut graph, &mut support);
         assert_eq!(get_u64(&graph, G17P_USER_TILING_RING), descriptor);
@@ -15533,7 +15645,7 @@ mod tests {
         assert_eq!(get_u32(&support, G17P_RENDER_SHARED_CONTROL_INNER), 2);
 
         let retained =
-            build_g17p_late_tiling_bytes(descriptor, graph_va, addresses, 6, 1, 2, false, false)
+            build_g17p_late_tiling_bytes(descriptor, graph_va, addresses, 6, 1, 2, false, false, 2)
                 .unwrap();
         retained.apply(&mut graph, &mut support);
         assert_eq!(get_u32(&graph, G17P_USER_TILING_POINTERS + 0x40), 6);
@@ -15546,13 +15658,13 @@ mod tests {
         let mut native_support = vec![0u8; G17P_RENDER_SUPPORT_SIZE];
         put_u32(&mut native_support, G17P_RENDER_POOL_A_SLOTS + 4, 1);
         let native_first =
-            build_g17p_late_tiling_bytes(descriptor, graph_va, addresses, 6, 0, 1, false, true)
+            build_g17p_late_tiling_bytes(descriptor, graph_va, addresses, 6, 0, 1, false, true, 2)
                 .unwrap();
         native_first.apply(&mut graph, &mut native_support);
         assert_eq!(get_u32(&native_support, G17P_RENDER_POOL_A_SLOTS), 0);
         assert_eq!(get_u32(&native_support, G17P_RENDER_POOL_A_SLOTS + 4), 2);
         let native_retained =
-            build_g17p_late_tiling_bytes(descriptor, graph_va, addresses, 6, 1, 2, false, true)
+            build_g17p_late_tiling_bytes(descriptor, graph_va, addresses, 6, 1, 2, false, true, 2)
                 .unwrap();
         assert_eq!(native_retained.pool_a_slot_offset, retained.pool_a_slot_offset);
     }
@@ -15573,7 +15685,7 @@ mod tests {
             ta_hardware_buffer_id: 0,
         };
         let late =
-            build_g17p_late_tiling_bytes(descriptor, graph_va, addresses, 6, 0, 1, true, false)
+            build_g17p_late_tiling_bytes(descriptor, graph_va, addresses, 6, 0, 1, true, false, 2)
                 .unwrap();
         let mut graph = vec![0u8; G17P_RENDER_QUEUE_GRAPH_SIZE];
         let mut support = vec![0u8; G17P_RENDER_SUPPORT_SIZE];
@@ -15607,28 +15719,6 @@ mod tests {
         late.apply_native_pool_transition(&mut support);
         assert_eq!(get_u32(&support, G17P_RENDER_POOL_A_SLOTS), 2);
         assert_eq!(get_u32(&support, G17P_RENDER_SHARED_CONTROL_INNER), 2);
-    }
-
-    #[test]
-    fn retained_job_list_reset_requires_idle_queues_and_all_owned_timestamps() {
-        let idle = g17_completion::QueueIndices {
-            done: 3,
-            read: 3,
-            write: 3,
-        };
-        let active = g17_completion::QueueIndices {
-            done: 2,
-            read: 3,
-            write: 3,
-        };
-        assert!(g17p_render_can_reset_job_list(idle, idle, [1, 2], [3, 4]));
-        assert!(!g17p_render_can_reset_job_list(
-            active,
-            idle,
-            [1, 2],
-            [3, 4]
-        ));
-        assert!(!g17p_render_can_reset_job_list(idle, idle, [1, 0], [3, 4]));
     }
 
     #[test]

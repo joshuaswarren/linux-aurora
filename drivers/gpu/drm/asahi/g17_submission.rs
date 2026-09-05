@@ -2472,13 +2472,18 @@ pub(crate) const fn encode_kick_timestamp(timestamp: KickTimestamp) -> u64 {
     ((timestamp.stamp as u64) << KICK_STAMP_SHIFT) | timestamp.stamp_index as u64
 }
 
-/// G17P 3D-channel payload returned by
-/// `AGX3DChannel::getSKSMCompletionScratchRegPayload()`.
+/// Low-byte payload of the current serialized render's 3D channel counter.
 ///
-/// The native channel stores this byte at channel +0x1d4 and every captured
-/// G17P 3D submission returns one. It is a payload selector, not a QID and not
-/// an address-space tag.
-pub(crate) const G17P_3D_COMPLETION_SCRATCH_PAYLOAD: u8 = 1;
+/// `AGX3DChannelSKSM::submitBuffer` increments channel +0x1d4 as a u32
+/// (89d07bc..c4); `getSKSMCompletionScratchRegPayload` reads its low byte
+/// (8a515e4). Both valid cold captures carry payloads 1, 2, 3, not a constant
+/// selector. Our retained path publishes one 3D command per completed pair,
+/// so its ordinal determines that counter while this serialization holds.
+/// This byte wraps independently of the 40-bit SKSM timestamp; it is neither
+/// the queue ID nor an address-space tag.
+pub(crate) const fn g17p_serialized_render_scratch_payload(submission_ordinal: u32) -> u8 {
+    submission_ordinal.wrapping_add(1) as u8
+}
 
 /// Pack `AGX3DCommandDescriptor::getSKSMCompletionScratchRegValue()`.
 ///
@@ -6099,17 +6104,40 @@ mod tests {
         assert_eq!(
             encode_g17p_3d_completion_scratch(
                 0xf76,
-                G17P_3D_COMPLETION_SCRATCH_PAYLOAD,
+                1,
             ),
             Ok(0x0000_0100_0000_0f76),
         );
         assert_eq!(
             encode_g17p_3d_completion_scratch(
                 KICK_TS_MASK + 1,
-                G17P_3D_COMPLETION_SCRATCH_PAYLOAD,
+                1,
             ),
             Err(SubmissionError::KickTimestampOutOfRange),
         );
+    }
+
+    #[test]
+    fn g17p_serialized_render_scratch_payload_advances_and_wraps_independently() {
+        for (ordinal, timestamp, expected) in [
+            (0, 1, 0x0000_0100_0000_0001),
+            (1, 2, 0x0000_0200_0000_0002),
+            (2, 3, 0x0000_0300_0000_0003),
+            (254, 255, 0x0000_ff00_0000_00ff),
+            (255, 256, 0x0000_0000_0000_0100),
+            (256, 257, 0x0000_0100_0000_0101),
+            // A channel payload is not inferred from the physical queue's
+            // slot or timestamp: distinct valid values must remain distinct.
+            (1, 0x1234_5678_9a, 0x0000_0212_3456_789a),
+        ] {
+            assert_eq!(
+                encode_g17p_3d_completion_scratch(
+                    timestamp, g17p_serialized_render_scratch_payload(ordinal),
+                ),
+                Ok(expected),
+            );
+        }
+        assert_eq!(g17p_serialized_render_scratch_payload(u32::MAX), 0);
     }
 
     #[test]

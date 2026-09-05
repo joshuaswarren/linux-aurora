@@ -1359,6 +1359,7 @@ struct G17PRoleRtkitState {
     crashed: AtomicBool,
     runtime_events: AtomicU32,
     firmware_event_notifications: AtomicU32,
+    firmware_event_notifications_total: AtomicU32,
     event_worker_armed: AtomicBool,
     submission_phase: AtomicU32,
 }
@@ -1380,6 +1381,7 @@ impl G17PRoleRtkitState {
             crashed: AtomicBool::new(false),
             runtime_events: AtomicU32::new(0),
             firmware_event_notifications: AtomicU32::new(0),
+            firmware_event_notifications_total: AtomicU32::new(0),
             event_worker_armed: AtomicBool::new(false),
             submission_phase: AtomicU32::new(g17_manager::G17P_SUBMIT_PHASE_IDLE),
         }
@@ -1687,6 +1689,11 @@ impl rtkit::Buffer for G17PNoRtkitBuffer {
     }
 }
 
+/// Bound ingress diagnostics independently of the pending service counter.
+const fn g17p_notification_log_due(total: u32) -> bool {
+    total != 0 && (total <= 4 || total.is_power_of_two())
+}
+
 struct G17PRtkitOps;
 
 #[vtable]
@@ -1712,12 +1719,21 @@ impl rtkit::Operations for G17PRtkitOps {
                 .firmware_event_notifications
                 .fetch_add(1, Ordering::Relaxed)
                 .wrapping_add(1);
-            if count <= 4 || count.is_power_of_two() {
+            // The pending count is swapped to zero on every drain. Using it
+            // as the log budget prints every IRQ during a serviced storm.
+            // Keep ingress/dispatch untouched, but budget diagnostics over
+            // the complete RTKit role lifetime instead of each drain batch.
+            let total = data
+                .firmware_event_notifications_total
+                .fetch_add(1, Ordering::Relaxed)
+                .wrapping_add(1);
+            if g17p_notification_log_due(total) {
                 dev_info!(
                     data.dev.as_ref(),
-                    "G17P firmware-event notification role={} count={} submit-phase={}\n",
+                    "G17P firmware-event notification role={} pending={} total={} submit-phase={}\n",
                     data.processor.name(),
                     count,
+                    total,
                     data.submission_phase.load(Ordering::Acquire)
                 );
             }

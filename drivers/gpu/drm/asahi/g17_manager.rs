@@ -2055,6 +2055,7 @@ impl G17PManagerConstruction {
             tiling_queue,
             3,
             true,
+            || {},
             move || late_tiling.publish(),
         )?;
         if render_bind.is_some() {
@@ -2434,6 +2435,7 @@ impl G17PManagerConstruction {
             submission.tiling_queue_gpu_va,
             submission.tiling_queue_write_index,
             true,
+            || {},
             publish_late_tiling_state,
         )?;
         if render_bind.is_some() {
@@ -2894,6 +2896,7 @@ impl G17PManagerConstruction {
         Option<g17_resources::G17PLateTilingPublication>,
     )> {
         let ordinal = self.render_submission_ordinal;
+        let channel_payload = g17_submission::g17p_serialized_render_scratch_payload(ordinal);
         let fragment_command_timestamp = self
             .render_sksm
             .as_ref()
@@ -2904,7 +2907,7 @@ impl G17PManagerConstruction {
         let (fragment_queue, tiling_queue) = {
             let storage = self.render_storage.as_mut().ok_or(ENODEV)?;
             let scratch = storage
-                .stage_fragment_completion_scratch(fragment_command_timestamp)
+                .stage_fragment_completion_scratch(fragment_command_timestamp, channel_payload)
                 .inspect_err(|error| {
                     dev_err!(
                         dev.as_ref(),
@@ -2917,7 +2920,7 @@ impl G17PManagerConstruction {
                 "G17P render: 3D completion scratch={:#018x} timestamp={:#x} payload={}\n",
                 scratch,
                 fragment_command_timestamp,
-                g17_submission::G17P_3D_COMPLETION_SCRATCH_PAYLOAD,
+                channel_payload,
             );
             storage
                 .dump_submit_ready_fragment_descriptor(dev, ordinal)
@@ -3352,6 +3355,10 @@ impl G17PManagerConstruction {
                 tiling_qos,
             );
         }
+        let pm_submission = self.render_storage.as_mut().ok_or(ENODEV)?
+            .prepare_pm_submitted_operation()
+            .map_err(|error| Self::render_stage_fail("prepare-pm-submitted-operation", error))?;
+        let pm_submitted_count = pm_submission.as_ref().map(|operation| operation.next());
         let (prepared, render_bind) = self
             .resources
             .publish_partial_opening_pair(
@@ -3364,12 +3371,18 @@ impl G17PManagerConstruction {
                 published_prefix,
                 self.render_submission_ordinal == 0,
                 move || {
+                    if let Some(operation) = pm_submission {
+                        operation.commit();
+                    }
+                },
+                move || {
                     if let Some(publication) = late_tiling {
                         publication.publish();
                     }
                 },
             )
             .map_err(|error| Self::render_stage_fail("publish-partial-opening-pair", error))?;
+        dev_info!(dev.as_ref(), "G17P render PM: submitted-operations committed {:?}\n", pm_submitted_count);
         // The ID is now firmware/GPU-owned. Any later validation failure must
         // retain it until semantic completion or a stopped-CPU teardown.
         self.render_hardware_buffer_published = true;
@@ -4459,19 +4472,10 @@ impl G17PManagerConstruction {
         {
             fence(Ordering::Acquire);
             let state = self.render_storage.as_mut().ok_or(ENODEV)?.snapshot()?;
-            if !state.job_list_empty
-                && state.tiling.idle()
-                && state.fragment.idle()
-                && state.tiling_timestamps.iter().all(|value| *value != 0)
-                && state.fragment_timestamps.iter().all(|value| *value != 0)
-            {
-                self.render_storage
-                    .as_mut()
-                    .ok_or(ENODEV)?
-                    .quiesce_completed_job_list(state)?;
-                // Original loop used `continue`, i.e. re-poll without sleeping.
-                return Ok(G17PRenderPollOutcome::Retry);
-            }
+            // B1 unlinks EventControl only after its completed count reaches
+            // its own submitted-count slot (168d0, KTrace 0x10b/0x10d).
+            // Queue retirement and timestamps do not authorize host writes
+            // to this firmware-owned list. Keep polling until it is empty.
             let tracker = self.render_tracker.as_mut().ok_or(ENODEV)?;
             let completion = g17_completion::observe_paired_render_completion(
                 tracker.tiling_previous,
