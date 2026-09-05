@@ -2558,10 +2558,9 @@ impl G17PLiveRuntime {
             .is_some_and(|manager| manager.pending_primary_recovery().is_some())
     }
 
-    /// Announce native's one cold-workqueue USC FList update before any render
-    /// doorbell. Native does not expose the render queues while this FList is
-    /// busy: wait for both control-ring retirement and the matching type-13
-    /// grow completion before returning to work publication.
+    /// Acquire this pair's FList lease before any render doorbell. Only a
+    /// pending cold grow publishes 0x20 and waits for type 13; retained pairs
+    /// still acquire command references but return ready without a grow.
     fn publish_render_usc_freelist_request(&mut self) -> Result {
         if *module_parameters::g17p_render_usc_freelist.value() == 0 {
             return Ok(());
@@ -4772,6 +4771,17 @@ impl G17PLiveRuntime {
         if !self.test_stage.enables_compute_uapi() {
             return Err(ENOTSUPP);
         }
+        if !self.accepting_submissions {
+            return Err(ENOTSUPP);
+        }
+        // Render and compute currently share FList page/run backings. VM
+        // creation no longer overwrites a retained render pool. An actual
+        // workload switch must stop both firmware processors before reusing
+        // those bytes, including when the incoming compute VM is the same.
+        if self.manager.as_ref().ok_or(ENODEV)?.render_flist_owned() {
+            g17_lifecycle::recover_persistent_runtime(self)?;
+        }
+        self.manager.as_mut().ok_or(ENODEV)?.stage_compute_flist_state()?;
         // Allocate the compute graph on actual compute use, never as a
         // prerequisite for render. This is a no-op once a graph exists.
         self.ensure_compute_queue()?;
@@ -4899,6 +4909,7 @@ impl G17PLiveRuntime {
         // back with no queue: `boot_session` defers QID 4 to the event worker.
         // Put one back synchronously, or every clause below reads `None` and
         // the submit fails ENODEV for a reason that has nothing to do with it.
+        self.manager.as_mut().ok_or(ENODEV)?.stage_compute_flist_state()?;
         self.ensure_compute_queue()?;
         // The prepublication contract describes a pristine queue -- ordinal 0,
         // seed timestamp, nothing outstanding -- so it only applies to a first

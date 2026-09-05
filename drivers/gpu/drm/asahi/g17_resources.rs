@@ -1034,6 +1034,7 @@ fn g17p_cold_opening_optional_addresses(
             g17_initdata::PARTIAL_OPENING_FREELIST_HARDWARE_BUFFER_ID,
         channel_control: support + G17P_RENDER_CHANNEL_CONTROL as u64,
         tiling_shared_object,
+        parameter_buffer_token: 0,
         owner_pid,
         ta_hardware_buffer_id,
     }
@@ -2782,6 +2783,8 @@ pub(crate) struct G17PUserRenderStorage {
     /// Native's persistent GPU-only discard object at 0x1000180000.
     discard: Option<MappedObject>,
     parameter_management: Option<G17PParameterManagement>,
+    /// Captured by the TA HardwareBufferID lease allocator, not the submit ordinal.
+    parameter_buffer_token: u64,
     render_ta_status: Option<mmu::KernelMapping>,
     /// Stable client-root PDM mapping; dropped before its fixed high owner.
     fragment_status_low: mmu::KernelMapping,
@@ -2878,10 +2881,63 @@ fn decode_g17p_render_config_update(raw: &[u8]) -> Option<G17PRenderConfigUpdate
     })
 }
 
+/// One append-only group in the retained queue's advertised 0x500-item ring.
+/// Native QIDs 0/1 advance 0->3->6->9, retaining the same queue and ring.
+/// The existing 256-submission session bound fits even four-item groups, so
+/// this path never needs to rewind firmware-owned cursors or wrap a live ring.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+struct G17PRenderItemPlan {
+    base: u32,
+    count: u32,
+    prefix_end: u32,
+    final_end: u32,
+}
+
+impl G17PRenderItemPlan {
+    const CAPACITY: u32 = 0x500;
+
+    fn new(ordinal: u32, tag16: bool) -> Option<Self> {
+        Self::with_capacity(ordinal, tag16, Self::CAPACITY)
+    }
+
+    fn with_capacity(ordinal: u32, tag16: bool, capacity: u32) -> Option<Self> {
+        if ordinal >= G17P_RETAINED_RENDER_ORDINALS {
+            return None;
+        }
+        let count = if tag16 { 4u32 } else { 3u32 };
+        let base = ordinal.checked_mul(count)?;
+        let final_end = base.checked_add(count)?;
+        if final_end > capacity {
+            return None;
+        }
+        Some(Self { base, count, prefix_end: base.checked_add(2)?, final_end })
+    }
+
+    /// Copy only this group's requested item pointers. Check the complete
+    /// destination before changing any bytes; earlier groups stay intact.
+    fn copy_items(
+        self,
+        graph: &mut [u8],
+        ring_offset: usize,
+        first_item: u32,
+        items: &[u8],
+    ) -> Option<()> {
+        if items.len() % 8 != 0
+            || first_item.checked_add(u32::try_from(items.len() / 8).ok()?)? > self.count
+        {
+            return None;
+        }
+        let offset = usize::try_from(self.base.checked_add(first_item)?).ok()?.checked_mul(8)?;
+        let start = ring_offset.checked_add(offset)?;
+        let end = start.checked_add(items.len())?;
+        graph.get_mut(start..end)?.copy_from_slice(items);
+        Some(())
+    }
+}
+
 struct G17PLateTilingBytes {
     item_group: [u8; 32],
-    /// Ring items actually published: 3 without tag-16, 4 with it.
-    published_items: u32,
+    items: G17PRenderItemPlan,
     entry_signal: [u8; g17_submission::G17P_COMPUTE_OPTIONAL_EVENT_SIZE],
     optional: [u8; g17_submission::G17P_COLD_OPENING_OPTIONAL_SIZE],
     event: [u8; g17_submission::G17P_COLD_OPENING_EVENT_SIZE],
@@ -2891,10 +2947,13 @@ struct G17PLateTilingBytes {
 
 impl G17PLateTilingBytes {
     fn apply(&self, graph: &mut [u8], support: &mut [u8]) {
-        let items = self.published_items as usize * 8;
-        graph[G17P_USER_TILING_RING..G17P_USER_TILING_RING + items]
-            .copy_from_slice(&self.item_group[..items]);
-        if self.published_items > 3 {
+        let items = self.items.count as usize * 8;
+        // The plan is bounded by the advertised ring capacity and the caller
+        // acquired the complete graph before publishing either producer.
+        self.items
+            .copy_items(graph, G17P_USER_TILING_RING, 0, &self.item_group[..items])
+            .expect("bounded retained TA item ring");
+        if self.items.count > 3 {
             graph[G17P_USER_TILING_ENTRY_SIGNAL
                 ..G17P_USER_TILING_ENTRY_SIGNAL + self.entry_signal.len()]
                 .copy_from_slice(&self.entry_signal);
@@ -2903,7 +2962,7 @@ impl G17PLateTilingBytes {
             .copy_from_slice(&self.optional);
         graph[G17P_USER_TILING_EVENT..G17P_USER_TILING_EVENT + self.event.len()]
             .copy_from_slice(&self.event);
-        put_u32(graph, G17P_USER_TILING_POINTERS + 0x40, self.published_items);
+        put_u32(graph, G17P_USER_TILING_POINTERS + 0x40, self.items.final_end);
         put_u32(support, self.pool_a_slot_offset, 2);
         put_u32(
             support,
@@ -2917,22 +2976,24 @@ impl G17PLateTilingBytes {
     /// outer producer is still retained, so firmware cannot dispatch a
     /// half-group before the caller completes the transaction.
     fn apply_native_prefix(&self, graph: &mut [u8]) {
-        graph[G17P_USER_TILING_RING..G17P_USER_TILING_RING + 2 * 8]
-            .copy_from_slice(&self.item_group[..2 * 8]);
+        self.items
+            .copy_items(graph, G17P_USER_TILING_RING, 0, &self.item_group[..2 * 8])
+            .expect("bounded retained TA prefix");
         graph[G17P_USER_TILING_OPTIONAL..G17P_USER_TILING_OPTIONAL + self.optional.len()]
             .copy_from_slice(&self.optional);
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        put_u32(graph, G17P_USER_TILING_POINTERS + 0x40, 2);
+        put_u32(graph, G17P_USER_TILING_POINTERS + 0x40, self.items.prefix_end);
     }
 
     /// Publish tag-14 (and optional tag-16) after the TA SKSM entry exists.
     /// The Pool-A transition is intentionally separate: the exact native
     /// chronology advances it only after the TA outer producer is visible.
     fn apply_native_kick(&self, graph: &mut [u8]) {
-        let items = self.published_items as usize * 8;
-        graph[G17P_USER_TILING_RING + 2 * 8..G17P_USER_TILING_RING + items]
-            .copy_from_slice(&self.item_group[2 * 8..items]);
-        if self.published_items > 3 {
+        let items = self.items.count as usize * 8;
+        self.items
+            .copy_items(graph, G17P_USER_TILING_RING, 2, &self.item_group[2 * 8..items])
+            .expect("bounded retained TA kick");
+        if self.items.count > 3 {
             graph[G17P_USER_TILING_ENTRY_SIGNAL
                 ..G17P_USER_TILING_ENTRY_SIGNAL + self.entry_signal.len()]
                 .copy_from_slice(&self.entry_signal);
@@ -2943,7 +3004,7 @@ impl G17PLateTilingBytes {
         put_u32(
             graph,
             G17P_USER_TILING_POINTERS + 0x40,
-            self.published_items,
+            self.items.final_end,
         );
     }
 
@@ -2973,7 +3034,8 @@ fn build_g17p_late_tiling_bytes(
     );
     let mut bytes = G17PLateTilingBytes {
         item_group: [0; 32],
-        published_items: if tag16 { 4 } else { 3 },
+        items: G17PRenderItemPlan::new(submission_ordinal, tag16)
+            .ok_or(g17_submission::SubmissionError::PartialOpeningQueueHeadOutOfRange)?,
         entry_signal: [0; g17_submission::G17P_COMPUTE_OPTIONAL_EVENT_SIZE],
         optional: [0; g17_submission::G17P_COLD_OPENING_OPTIONAL_SIZE],
         event: [0; g17_submission::G17P_COLD_OPENING_EVENT_SIZE],
@@ -4171,6 +4233,62 @@ const G17P_PM_SCENE_SCRATCH_STRIDE: usize = 0x20;
 const G17P_PM_SCENE_SCRATCH_SIZE: usize = 0x8000;
 const G17P_PM_DISCARD_SIZE: usize = 0x8000;
 
+/// Native processRenderSetup advances its configured Scene ring. Reuse here
+/// is serialized behind the previous paired completion, including the shorter
+/// 36-slot scratch ring; it does not provide concurrent Scene ownership.
+fn g17p_render_scene_index(submission_ordinal: u32) -> usize {
+    ((u64::from(submission_ordinal) + G17P_PM_SELECTED_SCENE as u64)
+        % G17P_PM_SCENE_COUNT as u64) as usize
+}
+
+fn g17p_render_scene_registers(
+    scene: usize,
+    scene_scratch_va: u64,
+    metrics_low_va: u64,
+) -> Option<(u64, u64)> {
+    if scene >= G17P_PM_SCENE_COUNT || metrics_low_va & 3 != 0 {
+        return None;
+    }
+    let scratch = scene_scratch_va.checked_sub(G17P_RENDER_USER_BASE)?
+        .checked_add(((scene % G17P_PM_SCENE_SCRATCH_SLOT_COUNT)
+            * G17P_PM_SCENE_SCRATCH_STRIDE) as u64)?;
+    if scratch > u32::MAX as u64 || scratch & 0xf != 0 {
+        return None;
+    }
+    let metric = metrics_low_va.checked_add((scene * 4) as u64)?;
+    // AGXTA register producer8a59c78..cd0 derives1c910 from Scene+0.
+    let adjusted = metric.checked_add(if metric & (1u64 << 42) == 0 {
+        0x70_0000_0000
+    } else {
+        0
+    })?;
+    let encoded_metric = (adjusted & 0x7f_ffff_fffe)
+        | ((metric >> 3) & 0x80_0000_0000) | 1;
+    Some((scratch, encoded_metric))
+}
+
+/// Native loadPBDesc clears only the selected Scene's accumulated-use word;
+/// TA prepare stamps its manager generation, which changes on manager
+/// replacement, not on every render. Metrics and pool state remain FW-owned.
+fn prepare_g17p_retained_scene(
+    raw: &mut [u8],
+    layout: &G17PParameterManagementLayout,
+    scene: usize,
+    manager_generation: u64,
+) -> Result {
+    if scene >= G17P_PM_SCENE_COUNT {
+        return Err(EINVAL);
+    }
+    let at = layout.scene_states.checked_add(
+        scene.checked_mul(G17P_PM_SCENE_ENTRY_SIZE).ok_or(ERANGE)?,
+    ).ok_or(ERANGE)?;
+    let end = at.checked_add(G17P_PM_SCENE_ENTRY_SIZE).ok_or(ERANGE)?;
+    let selected = raw.get_mut(at..end).ok_or(ERANGE)?;
+    put_u32(selected, 0x48, 0);
+    put_u64(selected, 0x4c, manager_generation);
+    Ok(())
+}
+
 /// Firmware event type 7: the firmware asking the host to grow a buffer.
 const G17P_EVENT_GROW_REQUEST_TYPE: u32 = 7;
 
@@ -4355,6 +4473,8 @@ struct G17PParameterManagement {
     page_list_vas: [u64; 2],
     metrics_vas: [u64; 2],
     hardware_buffer_id: u32,
+    selected_scene: usize,
+    manager_generation: u64,
 }
 
 #[cfg(not(test))]
@@ -4407,13 +4527,46 @@ impl G17PParameterManagement {
             page_list_vas,
             metrics_vas,
             hardware_buffer_id: ta_hardware_buffer_id,
+            selected_scene: G17P_PM_SELECTED_SCENE,
+            manager_generation: G17P_PM_INITIAL_HWPB_MANAGER_GENERATION,
         })
+    }
+
+    fn prepare_retained_scene(
+        &mut self,
+        submission_ordinal: u32,
+        hardware_buffer_id: u32,
+        page_list_vas: [u64; 2],
+        render_layout: &G17PRenderStateLayout,
+    ) -> Result {
+        // This retained pool already owns its PBDesc slot and fixed TVB
+        // backing. A resize/new ID requires a real allocation/update lifetime,
+        // not rewriting the live table as if it were cold state.
+        if self.hardware_buffer_id != hardware_buffer_id
+            || self.page_list_vas != page_list_vas
+            || render_layout.tvb_blocks.checked_mul(G17P_PM_PAGES_PER_BLOCK)
+                != Some(self.page_count as usize)
+        {
+            return Err(ENOTSUPP);
+        }
+        let scene = g17p_render_scene_index(submission_ordinal);
+        self.backing.with_bytes_mut(|raw| {
+            prepare_g17p_retained_scene(raw, &self.layout, scene, self.manager_generation)
+        })?;
+        self.selected_scene = scene;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn scene_registers(&self, scene_scratch_va: u64) -> Result<(u64, u64)> {
+        g17p_render_scene_registers(self.selected_scene, scene_scratch_va, self.metrics_vas[1])
+            .ok_or(EINVAL)
     }
 
     fn selected_scene_va(&self) -> u64 {
         self.backing.iova()
             + self.layout.scene_states as u64
-            + (G17P_PM_SELECTED_SCENE * G17P_PM_SCENE_ENTRY_SIZE) as u64
+            + (self.selected_scene * G17P_PM_SCENE_ENTRY_SIZE) as u64
     }
 
     fn trailer_va(&self) -> u64 {
@@ -4510,13 +4663,11 @@ pub(crate) fn g17p_render_native_fragment_hwpb_enabled() -> bool {
     g17p_render_native_fragment_hwpb_mode() != 0
 }
 
-/// Ring items one render queue publishes per submission.
-pub(crate) fn g17p_render_published_prefix() -> u32 {
-    if g17p_render_tag16_enabled() {
-        4
-    } else {
-        3
-    }
+/// Absolute inner producer/outer queue-write target for this submission.
+pub(crate) fn g17p_render_published_prefix(submission_ordinal: u32) -> Result<u32> {
+    G17PRenderItemPlan::new(submission_ordinal, g17p_render_tag16_enabled())
+        .map(|items| items.final_end)
+        .ok_or(EINVAL)
 }
 
 fn render_build_fail(site: u32) -> kernel::error::Error {
@@ -5257,6 +5408,11 @@ impl G17PUserRenderStorage {
         translated.parameters.tilemap = render_user_aliases.tilemap_va();
         if let Some(pm) = parameter_management.as_ref() {
             translated.parameters.parameter_buffer = pm.selected_scene_va();
+            let (cycle, record_index) = pm.scene_registers(
+                scene_scratch.as_ref().map(MappedObject::iova).ok_or(EINVAL)?,
+            )?;
+            translated.parameters.cycle = cycle;
+            translated.parameters.record_index = record_index;
         }
         dev_info!(
             dev.as_ref(),
@@ -5873,6 +6029,7 @@ impl G17PUserRenderStorage {
             scene_scratch,
             discard,
             parameter_management,
+            parameter_buffer_token: 0,
             render_ta_status: Some(render_ta_status),
             fragment_status_low,
             fragment_status,
@@ -5933,15 +6090,8 @@ impl G17PUserRenderStorage {
             {
                 return Err(ERANGE);
             }
-            // PM/HWPB persistence and Scene rotation are not yet wired as one
-            // retained closure. Until they are, reset the retained backing at
-            // the same semantic-completion boundary where the old path
-            // replaced both TVB and PM, rather than pairing a fresh cold PM
-            // graph with stale binned contents from the prior submission.
-            tvb.with_bytes_mut(|raw| {
-                raw.fill(0);
-                Ok(())
-            })?;
+            // Native retains this pool and lets firmware recycle its pages.
+            // Clearing its contents would destroy retained PM-owned state.
         }
         let next_render_user_aliases = G17PRenderUserAliases::new(
             &mut next_render_state,
@@ -5962,26 +6112,14 @@ impl G17PUserRenderStorage {
         translated.parameters.context_base = G17P_RENDER_USER_BASE;
         translated.parameters.usc_flist_hardware_buffer_id =
             g17_initdata::PARTIAL_OPENING_FREELIST_HARDWARE_BUFFER_ID;
-        let next_parameter_management = if g17p_render_tvb_mode() >= 2 {
-            let metrics_vas = self
-                .parameter_management
-                .as_ref()
-                .ok_or(EIO)?
-                .metrics_vas;
-            Some(G17PParameterManagement::new(
-                dev,
-                uat,
-                parameter_page_list_vas,
-                metrics_vas,
-                self.render_tvb.as_ref().map(G17PRenderTvb::iova).ok_or(EIO)?,
-                self.scene_scratch.as_ref().map(MappedObject::iova).ok_or(EINVAL)?,
-                self.discard.as_ref().map(MappedObject::iova).ok_or(EINVAL)?,
+        if g17p_render_tvb_mode() >= 2 {
+            self.parameter_management.as_mut().ok_or(EIO)?.prepare_retained_scene(
+                submission_ordinal,
                 translated.parameters.ta_hardware_buffer_id,
+                parameter_page_list_vas,
                 &render_layout,
-            )?)
-        } else {
-            None
-        };
+            )?;
+        }
         translated.parameters.deflake_3 = next_render_user_aliases.deflake_va();
         translated.parameters.deflake_2 = translated.parameters.deflake_3 + 0x20;
         translated.parameters.deflake_1 = translated.parameters.deflake_3 + 0x2a0;
@@ -5996,8 +6134,19 @@ impl G17PUserRenderStorage {
         translated.parameters.aux_fb_page_count = G17P_RENDER_AUX_FB_PAGE_COUNT;
         translated.parameters.aux_fb_flags = g17p_aux_fb_flags(translated.flags);
         translated.parameters.tilemap = next_render_user_aliases.tilemap_va();
-        if let Some(pm) = next_parameter_management.as_ref() {
+        if let Some(pm) = self.parameter_management.as_ref() {
             translated.parameters.parameter_buffer = pm.selected_scene_va();
+            let (cycle, record_index) = pm.scene_registers(
+                self.scene_scratch.as_ref().map(MappedObject::iova).ok_or(EINVAL)?,
+            )?;
+            translated.parameters.cycle = cycle;
+            translated.parameters.record_index = record_index;
+            dev_info!(
+                dev.as_ref(),
+                "G17P retained PM: owner={:#x} scene-index={} scene={:#x} cycle={:#x} metric-register={:#x} manager-generation={} (pool and PBDesc preserved)\n",
+                pm.hwpb_state_va(), pm.selected_scene, pm.selected_scene_va(),
+                cycle, record_index, pm.manager_generation,
+            );
         }
         // NATIVE LAYOUT, macOS 26.6.2 2026-09-02 (recs3.txt, three passes,
         // byte-stable): a render pass owns ONE (start, end) pair, not one per
@@ -6082,7 +6231,7 @@ impl G17PUserRenderStorage {
         let record_b_index = submission_ordinal as usize % 79;
         let support_va = self.support.iova();
         let shared_object = if g17p_render_native_fragment_hwpb_enabled() {
-            next_parameter_management.as_ref().map_or(
+            self.parameter_management.as_ref().map_or(
                 support_va + G17P_RENDER_PACKED_SHARED as u64,
                 G17PParameterManagement::hwpb_state_va,
             )
@@ -6092,11 +6241,11 @@ impl G17PUserRenderStorage {
         let objects = g17_render::RenderDescriptorObjects {
             record_a: support_va + G17P_RENDER_POOL_A as u64 + (record_a_index * 0x100) as u64,
             shared: shared_object,
-            record_b: next_parameter_management.as_ref().map_or(
+            record_b: self.parameter_management.as_ref().map_or(
                 support_va + G17P_RENDER_POOL_B as u64 + (record_b_index * 0x80) as u64,
                 |pm| pm.selected_scene_va(),
             ),
-            zero: next_parameter_management
+            zero: self.parameter_management
                 .as_ref()
                 .map_or(support_va + G17P_RENDER_ZERO_SHARED as u64, |pm| {
                     pm.trailer_va()
@@ -6263,8 +6412,6 @@ impl G17PUserRenderStorage {
         self.render_layout = render_layout;
         let old_render_user_aliases =
             core::mem::replace(&mut self.render_user_aliases, next_render_user_aliases);
-        let old_parameter_management =
-            core::mem::replace(&mut self.parameter_management, next_parameter_management);
         let old_timestamps = core::mem::replace(&mut self.timestamps, next_timestamps);
         let old_aliases =
             core::mem::replace(&mut self.user_timestamp_aliases, user_timestamp_aliases);
@@ -6272,7 +6419,6 @@ impl G17PUserRenderStorage {
         self.ta_hardware_buffer_id = translated.parameters.ta_hardware_buffer_id;
         drop(old_aliases);
         drop(old_timestamps);
-        drop(old_parameter_management);
         drop(old_render_user_aliases);
         drop(old_render_state);
         Ok(())
@@ -6538,7 +6684,7 @@ impl G17PUserRenderStorage {
                 *value = u32_at(pm.layout.shared_control + 0x40 + index * 4)?;
             }
             let selected = pm.layout.scene_states
-                + G17P_PM_SELECTED_SCENE * G17P_PM_SCENE_ENTRY_SIZE;
+                + pm.selected_scene * G17P_PM_SCENE_ENTRY_SIZE;
             for (index, value) in selected_scene.iter_mut().enumerate() {
                 *value = u64_at(selected + index * 8)?;
             }
@@ -7063,13 +7209,27 @@ impl G17PUserRenderStorage {
         } else {
             support + G17P_RENDER_PACKED_SHARED as u64
         };
-        g17p_cold_opening_optional_addresses(
+        let mut addresses = g17p_cold_opening_optional_addresses(
             support,
             shared_object,
             self.ta_hardware_buffer_id,
             self.owner_pid,
             tiling,
-        )
+        );
+        addresses.parameter_buffer_token = self.parameter_buffer_token;
+        addresses
+    }
+
+    pub(crate) fn set_parameter_buffer_lease_token(&mut self, token: u64) -> Result {
+        if token == u64::MAX {
+            return Err(EINVAL);
+        }
+        self.parameter_buffer_token = token;
+        Ok(())
+    }
+
+    pub(crate) fn selected_scene_index(&self) -> Result<usize> {
+        self.parameter_management.as_ref().map(|pm| pm.selected_scene).ok_or(ENODEV)
     }
 
     pub(crate) fn stage_fragment(&mut self, submission_ordinal: u32) -> Result {
@@ -7081,14 +7241,16 @@ impl G17PUserRenderStorage {
         ];
         let optional_addresses = self.optional_addresses(false);
         let tag16 = g17p_render_tag16_enabled();
+        let plan = G17PRenderItemPlan::new(submission_ordinal, tag16).ok_or(EINVAL)?;
         // The stamp this path's tag-14 announces is `ordinal + 1`
         // (`apply_g17p_retained_event`), which is the 1 the firmware reported
         // in its 0x41 receipt. Tag-16 must name that same stamp.
         let entry_stamp = submission_ordinal.checked_add(1).ok_or(EINVAL)?;
         let entry_signal_va = graph_va + Self::FRAGMENT_ENTRY_SIGNAL as u64;
         self.graph.with_bytes_mut(|raw| {
+            let mut group = [0u8; 32];
             for (index, address) in items.iter().enumerate() {
-                put_u64(raw, Self::FRAGMENT_RING + index * 8, *address);
+                put_u64(&mut group, index * 8, *address);
             }
             g17_submission::apply_g17p_retained_optional(
                 g17_submission::G17PColdOpeningStage::Fragment,
@@ -7127,13 +7289,15 @@ impl G17PUserRenderStorage {
                             + g17_submission::G17P_COMPUTE_OPTIONAL_EVENT_SIZE],
                 )
                 .map_err(|_| EINVAL)?;
-                put_u64(raw, Self::FRAGMENT_RING + 3 * 8, entry_signal_va);
+                put_u64(&mut group, 3 * 8, entry_signal_va);
             }
+            plan.copy_items(raw, Self::FRAGMENT_RING, 0, &group[..plan.count as usize * 8])
+                .ok_or(EINVAL)?;
             core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
             put_u32(
                 raw,
                 Self::FRAGMENT_POINTERS + 0x40,
-                if tag16 { 4 } else { 3 },
+                plan.final_end,
             );
             Ok(())
         })
@@ -7371,7 +7535,8 @@ impl G17PUserRenderStorage {
 
     /// The first half of a 3D group: item 0 (the fragment command record) and
     /// item 1 (the tag-15 ConfigUpdate), with the queue's item producer left at
-    /// 2. Native's `AGX3DChannelSKSM::submitBuffer` publishes exactly these two
+    /// this group's base + 2. Native's `AGX3DChannelSKSM::submitBuffer`
+    /// publishes exactly these two
     /// pointers, then configures the QID and writes the KSM kick entry, and
     /// only then publishes the AddKicks that takes item 2 -- so the split is
     /// what lets the SKSM half sit where the captures put it.
@@ -7382,10 +7547,14 @@ impl G17PUserRenderStorage {
             graph_va + Self::FRAGMENT_OPTIONAL as u64,
         ];
         let optional_addresses = self.optional_addresses(false);
+        let plan = G17PRenderItemPlan::new(submission_ordinal, g17p_render_tag16_enabled())
+            .ok_or(EINVAL)?;
         self.graph.with_bytes_mut(|raw| {
+            let mut group = [0u8; 16];
             for (index, address) in items.iter().enumerate() {
-                put_u64(raw, Self::FRAGMENT_RING + index * 8, *address);
+                put_u64(&mut group, index * 8, *address);
             }
+            plan.copy_items(raw, Self::FRAGMENT_RING, 0, &group).ok_or(EINVAL)?;
             g17_submission::apply_g17p_retained_optional(
                 g17_submission::G17PColdOpeningStage::Fragment,
                 optional_addresses,
@@ -7399,20 +7568,26 @@ impl G17PUserRenderStorage {
                     ..Self::FRAGMENT_OPTIONAL + g17_submission::G17P_COLD_OPENING_OPTIONAL_SIZE],
             )
             .map_err(|_| EINVAL)?;
-            put_u32(raw, Self::FRAGMENT_POINTERS + 0x40, 2);
+            put_u32(raw, Self::FRAGMENT_POINTERS + 0x40, plan.prefix_end);
             Ok(())
         })
     }
 
     /// The second half of a 3D group: item 2 (the tag-14 AddKicks announcing
-    /// `entry_stamp`) and the item producer transition 2 -> 3.
-    pub(crate) fn stage_fragment_kick(&mut self, entry_stamp: u32) -> Result {
+    /// `entry_stamp`) and the item producer transition base+2 -> base+3/4.
+    pub(crate) fn stage_fragment_kick(
+        &mut self,
+        submission_ordinal: u32,
+        entry_stamp: u32,
+    ) -> Result {
         let graph_va = self.graph.iova();
         let event_va = graph_va + Self::FRAGMENT_EVENT as u64;
         let entry_signal_va = graph_va + Self::FRAGMENT_ENTRY_SIGNAL as u64;
         let tag16 = g17p_render_tag16_enabled();
+        let plan = G17PRenderItemPlan::new(submission_ordinal, tag16).ok_or(EINVAL)?;
         self.graph.with_bytes_mut(|raw| {
-            put_u64(raw, Self::FRAGMENT_RING + 2 * 8, event_va);
+            let mut group = [0u8; 16];
+            put_u64(&mut group, 0, event_va);
             g17_submission::apply_g17p_retained_event_with_stamp(
                 g17_submission::G17PColdOpeningStage::Fragment,
                 entry_stamp,
@@ -7442,13 +7617,15 @@ impl G17PUserRenderStorage {
                             + g17_submission::G17P_COMPUTE_OPTIONAL_EVENT_SIZE],
                 )
                 .map_err(|_| EINVAL)?;
-                put_u64(raw, Self::FRAGMENT_RING + 3 * 8, entry_signal_va);
+                put_u64(&mut group, 8, entry_signal_va);
             }
+            plan.copy_items(raw, Self::FRAGMENT_RING, 2, &group[..(plan.count - 2) as usize * 8])
+                .ok_or(EINVAL)?;
             core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
             put_u32(
                 raw,
                 Self::FRAGMENT_POINTERS + 0x40,
-                if tag16 { 4 } else { 3 },
+                plan.final_end,
             );
             Ok(())
         })
@@ -8086,6 +8263,13 @@ struct G17UatOwner {
 ///
 /// Role records contain addresses only. They cannot allocate a second UAT or
 /// map private objects behind the owner's back.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum G17PFListBackingOwner {
+    Opening,
+    Compute,
+    Render,
+}
+
 #[cfg(not(test))]
 #[allow(dead_code)]
 pub(crate) struct G17ResourceOwner {
@@ -8094,6 +8278,7 @@ pub(crate) struct G17ResourceOwner {
     resources: G17MappedResources,
     address_space: G17UatOwner,
     kernel_va_base: u64,
+    flist_backing_owner: G17PFListBackingOwner,
 }
 
 #[cfg(not(test))]
@@ -8206,9 +8391,12 @@ impl G17ResourceOwner {
     /// Read the real shared page-metrics object referenced by the PB
     /// descriptor. The per-submit render backing has an unused placeholder
     /// with the same shape, but firmware never consumes that copy.
-    pub(crate) fn selected_parameter_metric(&mut self) -> Result<u32> {
+    pub(crate) fn selected_parameter_metric(&mut self, scene: usize) -> Result<u32> {
+        if scene >= G17P_PM_SCENE_COUNT {
+            return Err(EINVAL);
+        }
         self.resources.parameter_metrics.with_bytes_mut(|bytes| {
-            let at = G17P_PM_SELECTED_SCENE * 4;
+            let at = scene * 4;
             let raw = bytes.get(at..at + 4).ok_or(ERANGE)?;
             Ok(u32::from_le_bytes(raw.try_into().map_err(|_| ERANGE)?))
         })
@@ -9357,6 +9545,7 @@ impl G17ResourceOwner {
             },
             address_space,
             kernel_va_base,
+            flist_backing_owner: G17PFListBackingOwner::Opening,
         })
     }
 
@@ -12056,6 +12245,7 @@ impl G17ResourceOwner {
     /// Every mapping and the UAT owner stay in place so existing DRM VMs keep
     /// their page-table identity and fixed driver aliases.
     pub(crate) fn reset_session_after_processor_stop(&mut self) -> Result {
+        self.flist_backing_owner = G17PFListBackingOwner::Opening;
         // The generic render status/descriptor aliases reuse these fixed VAs
         // on the next bootstrap. Both processors are already stopped here.
         self.resources.compute_runtime_state_mapping = None;
@@ -12759,11 +12949,14 @@ impl G17ResourceOwner {
         Ok(aliases)
     }
 
-    /// Restore the shared render shape on every render submission.  Compute
-    /// intentionally reuses these backings with a compact 21-run table and an
-    /// empty page list, so staging only when a retained render graph is first
-    /// allocated is not sufficient for compute -> render transitions.
+    /// Initialize once per retained pool, not once per command lease. Native
+    /// prepareBufferResources (8aa1bb8) gates populateInitialFirmwareState on
+    /// the FList's initialized bit. Replaying the cold 17-block list here would
+    /// discard the five-block grow and firmware-updated cursors on every pair.
     pub(crate) fn stage_render_flist_state(&mut self) -> Result {
+        if self.flist_backing_owner == G17PFListBackingOwner::Render {
+            return Ok(());
+        }
         self.resources
             .control_operand_page_lists
             .with_bytes_mut(|bytes| {
@@ -12793,6 +12986,49 @@ impl G17ResourceOwner {
                 Ok(())
             })?;
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        self.flist_backing_owner = G17PFListBackingOwner::Render;
+        Ok(())
+    }
+
+    pub(crate) fn render_flist_owned(&self) -> bool {
+        self.flist_backing_owner == G17PFListBackingOwner::Render
+    }
+
+    /// A compute session may initialize these shared backings only when no
+    /// render pool owns them. Runtime uses a stopped-session handoff for an
+    /// actual render -> compute switch; merely creating a VM is mapping-only.
+    pub(crate) fn stage_compute_flist_state(&mut self) -> Result {
+        match self.flist_backing_owner {
+            G17PFListBackingOwner::Render => return Err(EBUSY),
+            G17PFListBackingOwner::Compute => return Ok(()),
+            G17PFListBackingOwner::Opening => {}
+        }
+        self.resources
+            .partial_opening_control_shared
+            .with_bytes_mut(|bytes| {
+                g17_initdata::encode_compute_partial_opening_control_shared(bytes)
+                    .map_err(|_| EINVAL)
+            })?;
+        self.resources
+            .partial_opening_control_shared_inner
+            .with_bytes_mut(|bytes| {
+                bytes.fill(0);
+                Ok(())
+            })?;
+        self.resources
+            .control_operand_page_lists
+            .with_bytes_mut(|bytes| {
+                bytes.fill(0);
+                Ok(())
+            })?;
+        self.resources.control_operand_table.with_bytes_mut(|bytes| {
+            if !encode_g17p_compute_flist_runs(bytes) {
+                return Err(EINVAL);
+            }
+            Ok(())
+        })?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        self.flist_backing_owner = G17PFListBackingOwner::Compute;
         Ok(())
     }
 
@@ -13105,34 +13341,8 @@ impl G17ResourceOwner {
                 GFP_KERNEL,
             )?;
         }
-        if !bootstrap_vdm {
-            self.resources
-                .partial_opening_control_shared
-                .with_bytes_mut(|bytes| {
-                    g17_initdata::encode_compute_partial_opening_control_shared(bytes)
-                        .map_err(|_| EINVAL)
-                })?;
-            self.resources
-                .partial_opening_control_shared_inner
-                .with_bytes_mut(|bytes| {
-                    bytes.fill(0);
-                    Ok(())
-                })?;
-            self.resources
-                .control_operand_page_lists
-                .with_bytes_mut(|bytes| {
-                    // The proven compute opening starts with no populated UMA
-                    // page list. Render publishes its prepared pool separately.
-                    bytes.fill(0);
-                    Ok(())
-                })?;
-            self.resources.control_operand_table.with_bytes_mut(|bytes| {
-                if !encode_g17p_compute_flist_runs(bytes) {
-                    return Err(EINVAL);
-                }
-                Ok(())
-            })?;
-            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        if !bootstrap_vdm && !self.render_flist_owned() {
+            self.stage_compute_flist_state()?;
         }
         let table_mapping = match self.resources.control_operand_table.map_at(
             vm,
@@ -15164,6 +15374,114 @@ mod tests {
     }
 
     #[test]
+    fn retained_render_item_plan_matches_native_append_and_bounds() {
+        for tag16 in [false, true] {
+            let count = if tag16 { 4 } else { 3 };
+            for ordinal in [0, 1, 2, 255] {
+                let plan = G17PRenderItemPlan::new(ordinal, tag16).unwrap();
+                assert_eq!(plan.base, ordinal * count);
+                assert_eq!(plan.count, count);
+                assert_eq!(plan.prefix_end, ordinal * count + 2);
+                assert_eq!(plan.final_end, (ordinal + 1) * count);
+                assert!(plan.final_end <= G17PRenderItemPlan::CAPACITY);
+                assert_eq!(
+                    G17PRenderItemPlan::with_capacity(ordinal, tag16, plan.final_end),
+                    Some(plan),
+                );
+                assert!(G17PRenderItemPlan::with_capacity(
+                    ordinal, tag16, plan.final_end - 1,
+                ).is_none());
+            }
+            for ordinal in [256, u32::MAX] {
+                assert!(G17PRenderItemPlan::new(ordinal, tag16).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn retained_render_item_copies_preserve_prior_groups_and_firmware_cursors() {
+        for tag16 in [false, true] {
+            for ring_offset in [0x4000, 0x8000] {
+                let mut graph = vec![0xa5; 0xc000];
+                // Both firmware-owned pointer blocks lie outside item rings.
+                let pointer_blocks = graph[0x1000..0x1100].to_vec();
+                for ordinal in [0, 1, 2, 255] {
+                    let plan = G17PRenderItemPlan::new(ordinal, tag16).unwrap();
+                    let begin = ring_offset + plan.base as usize * 8;
+                    let end = ring_offset + plan.final_end as usize * 8;
+                    let prefix = graph[..begin].to_vec();
+                    let suffix = graph[end..].to_vec();
+                    let group = [ordinal as u8; 32];
+                    assert_eq!(plan.copy_items(&mut graph, ring_offset, 0, &group[..16]), Some(()));
+                    assert_eq!(
+                        plan.copy_items(&mut graph, ring_offset, 2, &group[16..plan.count as usize * 8]),
+                        Some(()),
+                    );
+                    assert_eq!(&graph[..begin], prefix);
+                    assert_eq!(&graph[end..], suffix);
+                    assert_eq!(&graph[begin..end], &group[..plan.count as usize * 8]);
+                    assert_eq!(&graph[0x1000..0x1100], pointer_blocks);
+                }
+            }
+        }
+        let plan = G17PRenderItemPlan::new(1, false).unwrap();
+        let mut short = [0xa5; 32];
+        let unchanged = short;
+        for (ring, item, payload) in [
+            (0, 0, &[0; 24][..]), // Complete destination does not fit.
+            (usize::MAX, 0, &[0; 8][..]),
+            (0, u32::MAX, &[0; 8][..]),
+            (0, 2, &[0; 16][..]), // Runs beyond this group's item count.
+            (0, 0, &[0; 7][..]),
+        ] {
+            assert_eq!(plan.copy_items(&mut short, ring, item, payload), None);
+            assert_eq!(short, unchanged);
+        }
+    }
+
+    #[test]
+    fn retained_tiling_phases_publish_absolute_producers() {
+        for tag16 in [false, true] {
+            let mut graph = vec![0xa5; 0xc000];
+            let mut support = vec![0u8; 0x40000];
+            for ordinal in [0, 1, 2, 255] {
+                let items = G17PRenderItemPlan::new(ordinal, tag16).unwrap();
+                let late = G17PLateTilingBytes {
+                    item_group: [ordinal as u8; 32],
+                    items,
+                    entry_signal: [0; g17_submission::G17P_COMPUTE_OPTIONAL_EVENT_SIZE],
+                    optional: [0; g17_submission::G17P_COLD_OPENING_OPTIONAL_SIZE],
+                    event: [0; g17_submission::G17P_COLD_OPENING_EVENT_SIZE],
+                    pool_a_slot_offset: 0,
+                    shared_inner_value: 2 * (ordinal + 1),
+                };
+                put_u32(&mut graph, G17P_USER_TILING_POINTERS, items.base);
+                put_u32(&mut graph, G17P_USER_TILING_POINTERS + 0x30, items.base);
+                put_u32(&mut graph, G17P_USER_TILING_POINTERS + 0x40, items.base);
+                let cursor_bytes = graph[G17P_USER_TILING_POINTERS..G17P_USER_TILING_POINTERS + 0x40].to_vec();
+                let begin = G17P_USER_TILING_RING + items.base as usize * 8;
+                let previous_items = graph[G17P_USER_TILING_RING..begin].to_vec();
+                let mut full = graph.clone();
+                late.apply(&mut full, &mut support);
+
+                late.apply_native_prefix(&mut graph);
+                assert_eq!(
+                    u32::from_le_bytes(graph[G17P_USER_TILING_POINTERS + 0x40..G17P_USER_TILING_POINTERS + 0x44].try_into().unwrap()),
+                    items.prefix_end,
+                );
+                late.apply_native_kick(&mut graph);
+                assert_eq!(
+                    u32::from_le_bytes(graph[G17P_USER_TILING_POINTERS + 0x40..G17P_USER_TILING_POINTERS + 0x44].try_into().unwrap()),
+                    items.final_end,
+                );
+                assert_eq!(graph, full, "split and paired publication must agree");
+                assert_eq!(&graph[G17P_USER_TILING_POINTERS..G17P_USER_TILING_POINTERS + 0x40], cursor_bytes);
+                assert_eq!(&graph[G17P_USER_TILING_RING..begin], previous_items);
+            }
+        }
+    }
+
+    #[test]
     fn user_render_late_tiling_changes_only_the_six_held_ranges() {
         let graph_va = 0x70_0100_0000;
         let descriptor = 0x70_0101_0000;
@@ -15174,6 +15492,7 @@ mod tests {
             usc_freelist_hardware_buffer_id: 0,
             channel_control: 0x70_0102_8000,
             tiling_shared_object: 0x70_0102_c000,
+            parameter_buffer_token: 0,
             owner_pid: 0x15,
             ta_hardware_buffer_id: 0,
         };
@@ -15217,6 +15536,9 @@ mod tests {
             build_g17p_late_tiling_bytes(descriptor, graph_va, addresses, 6, 1, 2, false, false)
                 .unwrap();
         retained.apply(&mut graph, &mut support);
+        assert_eq!(get_u32(&graph, G17P_USER_TILING_POINTERS + 0x40), 6);
+        assert_eq!(get_u64(&graph, G17P_USER_TILING_RING), descriptor);
+        assert_eq!(get_u64(&graph, G17P_USER_TILING_RING + 3 * 8), descriptor);
         assert_eq!(get_u32(&graph, G17P_USER_TILING_EVENT + 0x08), 0x202);
         assert_eq!(get_u32(&support, G17P_RENDER_POOL_A_SLOTS + 2 * 4), 2);
         assert_eq!(get_u32(&support, G17P_RENDER_SHARED_CONTROL_INNER), 4);
@@ -15246,6 +15568,7 @@ mod tests {
             usc_freelist_hardware_buffer_id: 0,
             channel_control: 0x70_0102_8000,
             tiling_shared_object: 0x70_0102_c000,
+            parameter_buffer_token: 0,
             owner_pid: 0x15,
             ta_hardware_buffer_id: 0,
         };
