@@ -248,11 +248,11 @@ kernel::module_platform_driver! {
         },
         g17p_render_mcache_hwsid: u32 {
             default: 24,
-            description: "Render MCache HWDSID. 24 (default) is the physical default selected by logical DSID 0x100 in the G17P kext and is present in both records of the valid cold class-0 3D aperture. 0 diagnostically suppresses active render MCache mappings. Values 1..255 pack validated UAPI fragment-write ranges into descriptor +0x6a0 and the matching fragment SKSM aperture. The native class-0 shape with 24 was tested on Neo without regression. Never use with absent fragment attachments.",
+            description: "Render MCache HWDSID. 24 (default) is the physical default selected by logical DSID 0x100 in the G17P kext and is present in both records of the valid cold class-0 3D aperture. 0 diagnostically suppresses active render MCache mappings. Values 1..255 pack validated UAPI fragment-write ranges into the matching fragment SKSM aperture; tables use descriptor +0x6a0 or owned page padding when the inline capacity is exceeded. The native class-0 shape with 24 was tested on Neo without regression. Never use with absent fragment attachments.",
         },
         g17p_render_mcache_mode: u32 {
             default: 1,
-            description: "Render MCache range topology. 1 (default) reproduces the valid cold class-0 two-range shape: driver-owned aux-FB with shift 2 at +0x6a0, then the single validated fragment attachment with shift 1 at +0x6b0. 0 emits one record per UAPI attachment. 2 requires exactly two validated UAPI ranges and emits them unchanged in native order with shifts 2/1. Modes 1/2 share one HWDSID/selector and publish fragment KSM index 0/count 2. No captured native VA is copied. Requires non-zero g17p_render_mcache_hwsid.",
+            description: "Render MCache range topology. 1 (default) emits driver-owned aux-FB with shift 2, then every validated fragment attachment with shift 1, preserving the qualified two-range shape for one attachment. 0 emits one record per UAPI attachment. 2 requires exactly two validated UAPI ranges and emits them unchanged in native order with shifts 2/1. Every entry shares one HWDSID/selector; fragment KSM index is 0 and count covers the complete table. No captured native VA is copied. Requires non-zero g17p_render_mcache_hwsid.",
         },
         g17p_render_mcache_selector: u32 {
             default: 64,

@@ -4170,8 +4170,130 @@ pub(crate) fn g17p_render_install(tiling: bool) -> u16 {
     }
 }
 
-/// Convert the validated UAPI fragment write ranges into the exact packed
-/// table produced by native `mcacheApertureBufferSetup`.
+/// The first embedded RCE trailer starts at +0x7a0. The native MCache
+/// table begins at +0x6a0 and may use only the intervening 16 entries.
+#[cfg(not(test))]
+const G17P_FRAGMENT_MCACHE_INLINE_END: usize = 0x7a0;
+/// KSM encodes an explicit 32-byte-aligned table pointer and count 1..64.
+/// Reserve the already mapped descriptor-page padding for the full UAPI
+/// domain (16 attachments plus the internal range). All descriptor fields
+/// end at 0x2240; Pool-A/B/shared objects live in the separate support BO.
+#[cfg(not(test))]
+const G17P_FRAGMENT_MCACHE_SPILL_OFFSET: usize = g17_render::FRAGMENT_DESCRIPTOR_SIZE;
+#[cfg(not(test))]
+const G17P_FRAGMENT_MCACHE_MAX_ENTRIES: usize = g17_uapi::UAPI_MAX_ATTACHMENTS + 1;
+#[cfg(not(test))]
+const G17P_FRAGMENT_MCACHE_SPILL_END: usize = G17P_FRAGMENT_MCACHE_SPILL_OFFSET
+    + G17P_FRAGMENT_MCACHE_MAX_ENTRIES * g17_render::G17P_MCACHE_MAPPING_SIZE;
+
+/// Convert validated fragment write ranges into the native MCache encoding.
+/// Stage the entire table before touching the descriptor so a bad later range
+/// cannot partially overwrite its predecessors or any RCE trailer.
+#[cfg(not(test))]
+#[allow(clippy::too_many_arguments)]
+fn encode_g17p_fragment_mcache(
+    attachments: &[g17_uapi::UapiAttachment],
+    fragment_internal_address: u64,
+    fragment_internal_size: u64,
+    descriptor_low: u64,
+    mcache_offset: usize,
+    hwsid: u32,
+    mode: u32,
+    selector: u32,
+    fragment: &mut [u8],
+) -> Result<Option<g17_submission::G17PClMcacheAperture>> {
+    if hwsid == 0 || attachments.is_empty() {
+        return Ok(None);
+    }
+    let hwsid = u8::try_from(hwsid).map_err(|_| EINVAL)?;
+    if mode > 2 || (mode == 2 && attachments.len() != 2)
+        || attachments.len() > g17_uapi::UAPI_MAX_ATTACHMENTS
+        || mcache_offset != g17_render::G17P_FRAGMENT_MCACHE_OFFSET
+    {
+        return Err(EINVAL);
+    }
+    // Native's MCache selector and the command descriptor context ID have
+    // distinct sources. Preserve the established compatibility default.
+    let selector = match selector {
+        64 => g17_submission::G17P_PARTIAL_OPENING_CONTEXT.render_root_slot,
+        value => u8::try_from(value)
+            .ok()
+            .filter(|value| *value <= 0x3f)
+            .ok_or(EINVAL)?,
+    };
+    let internal_count = if mode == 1 { 1 } else { 0 };
+    let count = attachments.len().checked_add(internal_count).ok_or(EOVERFLOW)?;
+    let table_size = count.checked_mul(g17_render::G17P_MCACHE_MAPPING_SIZE)
+        .ok_or(EOVERFLOW)?;
+    let inline_end = mcache_offset.checked_add(table_size).ok_or(EOVERFLOW)?;
+    let table_offset = if inline_end <= G17P_FRAGMENT_MCACHE_INLINE_END {
+        mcache_offset
+    } else {
+        // The command owns a full 16-KiB fragment page, including this padding.
+        // Relocating only the explicitly addressed table preserves every RCE
+        // byte and needs neither an extra allocation nor another cache flush.
+        G17P_FRAGMENT_MCACHE_SPILL_OFFSET
+    };
+    let table_end = table_offset.checked_add(table_size).ok_or(EOVERFLOW)?;
+    if count > G17P_FRAGMENT_MCACHE_MAX_ENTRIES || count > 0x40
+        || table_end > fragment.len()
+        || (table_offset == G17P_FRAGMENT_MCACHE_SPILL_OFFSET
+            && table_end > G17P_FRAGMENT_MCACHE_SPILL_END)
+    {
+        return Err(EINVAL);
+    }
+    let address = descriptor_low.checked_add(table_offset as u64).ok_or(EOVERFLOW)?;
+    let address_end = address.checked_add(table_size as u64).ok_or(EOVERFLOW)?;
+    // Same address domain/alignment as encode_g17p_cl_mcache. Validate before
+    // copying so its later pointer encoder cannot fail after a partial update.
+    if address & 0x1f != 0 || address_end > (1u64 << 43) {
+        return Err(EINVAL);
+    }
+    let aperture = g17_submission::G17PClMcacheAperture {
+        address,
+        index: 0,
+        count: u8::try_from(count).map_err(|_| EOVERFLOW)?,
+    };
+    let mut table = [0u8; G17P_FRAGMENT_MCACHE_MAX_ENTRIES * g17_render::G17P_MCACHE_MAPPING_SIZE];
+    let mut encode_range =
+        |index: usize, address: u64, size: u64, range_shift: u16| -> Result<()> {
+            if size == 0 {
+                return Err(EINVAL);
+            }
+            let start = address & !0x7f;
+            let end = address.checked_add(size)
+                .and_then(|value| value.checked_add(0x7f))
+                .map(|value| value & !0x7f)
+                .ok_or(EOVERFLOW)?;
+            let size_units = u32::try_from((end - start) >> 7).map_err(|_| EOVERFLOW)?;
+            let mapping = g17_render::encode_g17p_mcache_mapping(
+                g17_render::G17PMcacheMapping { address: start, size_units,
+                                              hwsid, selector, range_shift },
+            ).map_err(|_| EINVAL)?;
+            let offset = index * g17_render::G17P_MCACHE_MAPPING_SIZE;
+            table[offset..offset + mapping.len()].copy_from_slice(&mapping);
+            Ok(())
+        };
+    if mode == 1 {
+        // Preserve the qualified internal-range entry exactly, followed by
+        // every validated attachment (colour, depth/stencil or further MRTs).
+        encode_range(0, fragment_internal_address, fragment_internal_size, 2)?;
+    }
+    for (index, attachment) in attachments.iter().enumerate() {
+        // Diagnostic mode 2 retains its exact two-range 2/1 exponent policy.
+        let range_shift = if mode == 2 && index == 0 { 2 } else { 1 };
+        encode_range(internal_count + index, attachment.address, attachment.size, range_shift)?;
+    }
+    fragment[table_offset..table_end].copy_from_slice(&table[..table_size]);
+    pr_info!(
+        "G17P render MCache: hwsid={} selector={} mode={} internal={} attachments={} count={} table={:#x}\n",
+        hwsid, selector, mode, internal_count, attachments.len(), count, address,
+    );
+    Ok(Some(aperture))
+}
+
+/// Read module policy once; the shared encoder owns both cold and retained
+/// descriptor paths and preserves the qualified single-attachment encoding.
 #[cfg(not(test))]
 fn apply_g17p_fragment_mcache(
     attachments: &g17_uapi::UapiAttachmentList,
@@ -4181,124 +4303,13 @@ fn apply_g17p_fragment_mcache(
     mcache_offset: usize,
     fragment: &mut [u8],
 ) -> Result<Option<g17_submission::G17PClMcacheAperture>> {
-    let hwsid = *crate::module_parameters::g17p_render_mcache_hwsid.value();
-    if hwsid == 0 {
-        return Ok(None);
-    }
-    let hwsid = u8::try_from(hwsid).map_err(|_| EINVAL)?;
-    let attachments = attachments.as_slice();
-    if attachments.is_empty() {
-        return Ok(None);
-    }
-    let mode = *crate::module_parameters::g17p_render_mcache_mode.value();
-    if mode > 2
-        || (mode == 1 && attachments.len() != 1)
-        || (mode == 2 && attachments.len() != 2)
-    {
-        return Err(EINVAL);
-    }
-    // The kext takes this from host AGX3DCommandDescriptor +0x154 and encodes
-    // it verbatim.  It is not firmware descriptor +0x0c: native witnesses
-    // have descriptor context 1 but MCache selector 2 or 3.  Keep the bound
-    // root as the compatibility default while the host GART-ID allocator is
-    // absent, and allow the native candidate to be selected independently.
-    let selector = match *crate::module_parameters::g17p_render_mcache_selector.value() {
-        64 => g17_submission::G17P_PARTIAL_OPENING_CONTEXT.render_root_slot,
-        value => u8::try_from(value)
-            .ok()
-            .filter(|value| *value <= 0x3f)
-            .ok_or(EINVAL)?,
-    };
-    let internal_count = if mode == 1 { 1 } else { 0 };
-    let count = attachments
-        .len()
-        .checked_add(internal_count)
-        .ok_or(EOVERFLOW)?;
-    let table_size = count
-        .checked_mul(g17_render::G17P_MCACHE_MAPPING_SIZE)
-        .ok_or(EOVERFLOW)?;
-    let table_end = mcache_offset
-        .checked_add(table_size)
-        .ok_or(EOVERFLOW)?;
-    if table_end > fragment.len() {
-        return Err(EINVAL);
-    }
-
-    let mut encode_range =
-        |index: usize, address: u64, size: u64, range_shift: u16| -> Result<()> {
-            if size == 0 {
-                return Err(EINVAL);
-            }
-            let start = address & !0x7f;
-            let end = address
-                .checked_add(size)
-                .and_then(|value| value.checked_add(0x7f))
-                .map(|value| value & !0x7f)
-                .ok_or(EOVERFLOW)?;
-            let size_units = u32::try_from((end - start) >> 7).map_err(|_| EOVERFLOW)?;
-            let mapping = g17_render::encode_g17p_mcache_mapping(
-                g17_render::G17PMcacheMapping {
-                    address: start,
-                    size_units,
-                    hwsid,
-                    selector,
-                    range_shift,
-                },
-            )
-            .map_err(|_| EINVAL)?;
-            let offset = mcache_offset
-                + index * g17_render::G17P_MCACHE_MAPPING_SIZE;
-            fragment[offset..offset + mapping.len()].copy_from_slice(&mapping);
-            Ok(())
-        };
-
-    if mode == 1 {
-        // Native always puts a distinct class-2 internal/global write range
-        // before its class-1 attachment.  Its stable 0xeeee0000 capture is not
-        // mapped by Linux and must not be copied.  The fragment aux-FB arena is
-        // the closest safe diagnostic analogue: driver-owned, writable by the
-        // GPU, retained with this command, and already mapped in the same
-        // client root as the attachment.
-        encode_range(0, fragment_internal_address, fragment_internal_size, 2)?;
-        pr_info!(
-            "G17P render MCache: native-pair hwsid={} selector={} internal={:#x}+{:#x} attachment={:#x}+{:#x} count=2\n",
-            hwsid,
-            selector,
-            fragment_internal_address,
-            fragment_internal_size,
-            attachments[0].address,
-            attachments[0].size,
-        );
-    }
-    for (index, attachment) in attachments.iter().enumerate() {
-        // Mode 2 receives the two complete Linux writable resource spans in
-        // the same order as Metal's command write-range records. The native
-        // 2/1 values are computed sharing exponents, not resource classes.
-        let range_shift = if mode == 2 && index == 0 { 2 } else { 1 };
-        encode_range(
-            internal_count + index,
-            attachment.address,
-            attachment.size,
-            range_shift,
-        )?;
-    }
-    if mode == 2 {
-        pr_info!(
-            "G17P render MCache: writable-spans hwsid={} selector={} range0={:#x}+{:#x} shift=2 range1={:#x}+{:#x} shift=1 count=2\n",
-            hwsid,
-            selector,
-            attachments[0].address,
-            attachments[0].size,
-            attachments[1].address,
-            attachments[1].size,
-        );
-    }
-
-    Ok(Some(g17_submission::G17PClMcacheAperture {
-        address: descriptor_low + mcache_offset as u64,
-        index: 0,
-        count: u8::try_from(count).map_err(|_| EOVERFLOW)?,
-    }))
+    encode_g17p_fragment_mcache(
+        attachments.as_slice(), fragment_internal_address, fragment_internal_size,
+        descriptor_low, mcache_offset,
+        *crate::module_parameters::g17p_render_mcache_hwsid.value(),
+        *crate::module_parameters::g17p_render_mcache_mode.value(),
+        *crate::module_parameters::g17p_render_mcache_selector.value(), fragment,
+    )
 }
 
 /// Native G17P PM geometry, joined from `pmblocks-gfx.txt`, `pbdesc2.txt`, and
