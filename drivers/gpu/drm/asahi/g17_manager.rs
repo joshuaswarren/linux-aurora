@@ -12,6 +12,8 @@
 #[cfg(not(test))]
 use kernel::prelude::*;
 #[cfg(not(test))]
+use kernel::sync::Arc;
+#[cfg(not(test))]
 use kernel::time::{delay::fsleep, Delta};
 #[cfg(all(not(test), CONFIG_DEV_COREDUMP))]
 use crate::g17_trace_capture::{self as trace, TraceArchive};
@@ -1161,6 +1163,10 @@ pub(crate) struct G17PSksmQueue {
     configure_guard_event_stamp: u32,
     submission_ordinal: u32,
     b2_activation: g17_submission::G17PClB2ActivationState,
+    independent_context: bool,
+    completion_descriptor: u64,
+    completion_last_end: u64,
+    completion_stamp_armed: bool,
 }
 
 impl G17PSksmQueue {
@@ -1170,6 +1176,10 @@ impl G17PSksmQueue {
     /// firmware-side progress record it has to restore.
     pub(crate) fn queue_id(&self) -> u8 {
         self.queue_id
+    }
+    pub(crate) fn requires_first_install(&self) -> bool {
+        self.hardware_state == G17PSksmQueueHardwareState::PreparedMemory
+            && self.submission_ordinal == 0
     }
 
     /// `(submission ordinal, next kick stamp, item-ring producer)`.
@@ -1209,9 +1219,8 @@ pub(crate) struct G17PComputeSubmissionContext<'a> {
 pub(crate) struct G17PComputeUserBinding {
     mappings: g17_resources::G17PComputeUserMappings,
     _sksm_entries: mmu::KernelMapping,
-    _completion_ordinal_0: mmu::KernelMapping,
-    _completion_ordinal_2: mmu::KernelMapping,
-    _vm_bind: mmu::VmBind,
+    _vm_bind: Option<mmu::VmBind>,
+    _execution_context: Option<Arc<mmu::T8140ComputeExecutionContext>>,
 }
 
 #[cfg(not(test))]
@@ -1222,7 +1231,8 @@ impl G17PComputeUserBinding {
     /// fixed user VAs a second time, which would fail; a different VM has to
     /// go through a fresh bind.
     pub(crate) fn matches(&self, vm: &mmu::Vm) -> bool {
-        self._vm_bind.matches(vm)
+        self._vm_bind.as_ref().is_some_and(|bind| bind.matches(vm))
+            || self._execution_context.as_ref().is_some_and(|context| context.matches(vm))
     }
 
     /// The UAT binding this client's submissions run against.
@@ -1230,7 +1240,7 @@ impl G17PComputeUserBinding {
     /// Needed so every kick -- not just the one that created this binding --
     /// can re-prove that hardware contexts 2/3 still name this VM's root.
     pub(crate) fn vm_bind(&self) -> &mmu::VmBind {
-        &self._vm_bind
+        self._vm_bind.as_ref().expect("legacy binding required")
     }
 }
 
@@ -1255,8 +1265,7 @@ impl G17PComputeUserBinding {
 pub(crate) struct G17PQuarantinedComputeBinding {
     _mappings: g17_resources::G17PComputeUserMappings,
     _sksm_entries: mmu::KernelMapping,
-    _completion_ordinal_0: mmu::KernelMapping,
-    _completion_ordinal_2: mmu::KernelMapping,
+    _execution_context: Option<Arc<mmu::T8140ComputeExecutionContext>>,
 }
 
 #[cfg(not(test))]
@@ -1266,17 +1275,15 @@ impl G17PComputeUserBinding {
         let Self {
             mappings,
             _sksm_entries,
-            _completion_ordinal_0,
-            _completion_ordinal_2,
             _vm_bind,
+            _execution_context,
         } = self;
         // Explicit and load-bearing: this is what frees UAT slot 1.
         drop(_vm_bind);
         G17PQuarantinedComputeBinding {
             _mappings: mappings,
             _sksm_entries,
-            _completion_ordinal_0,
-            _completion_ordinal_2,
+            _execution_context,
         }
     }
 }
@@ -1547,6 +1554,12 @@ impl G17PManagerConstruction {
         &mut self,
     ) -> Result<g17_resources::G17PFirmwareDm1Slot0Snapshot> {
         self.resources.firmware_dm1_slot0_snapshot()
+    }
+
+    pub(crate) fn drain_firmware_event(
+        &mut self, role: g17_initdata::InstanceRole,
+    ) -> Result<Option<g17_resources::G17PPrimaryFirmwareEventRecord>> {
+        self.resources.drain_firmware_event(role)
     }
 
     pub(crate) fn drain_primary_firmware_event(
@@ -4856,10 +4869,6 @@ impl G17PManagerConstruction {
             pr_info!("G17P compute VM: canonical SKSM entry alias {:#x} failed {:?}\n",
                 queue.storage.entry_gpu_va(), error);
         })?;
-        let (completion_ordinal_0, completion_ordinal_2) =
-            self.resources.map_user_completion_aliases(vm).inspect_err(|error| {
-                pr_info!("G17P compute VM: completion aliases failed {:?}\n", error);
-            })?;
         let mappings = queue.compute.map_user_execution_state(vm).inspect_err(|error| {
             pr_info!("G17P compute VM: execution aliases failed {:?}\n", error);
         })?;
@@ -4984,10 +4993,56 @@ impl G17PManagerConstruction {
         Ok(G17PComputeUserBinding {
             mappings,
             _sksm_entries: sksm_entries,
-            _completion_ordinal_0: completion_ordinal_0,
-            _completion_ordinal_2: completion_ordinal_2,
-            _vm_bind: vm_bind,
+            _vm_bind: Some(vm_bind),
+            _execution_context: None,
         })
+    }
+
+    pub(crate) fn bind_independent_compute_user_vm(
+        &mut self, queue: &mut G17PSksmQueue, vm: &mmu::Vm,
+    ) -> Result<(G17PComputeUserBinding, Arc<mmu::T8140ComputeExecutionContext>)> {
+        self.resources.cache_compute_vm_mappings(vm)?;
+        let sksm_entries = queue.storage.map_user_entry_alias(vm)?;
+        let mappings = queue.compute.map_user_execution_state(vm)?;
+        let context = self.uat().allocate_t8140_compute_execution_context(vm)?;
+        let (high, low) = queue.compute.descriptor_gpu_vas(0);
+        if !mappings.all_reachable_from(vm) || mappings.descriptor_gpu_va(0) != low
+            || vm.translate_iova(low)? != self.uat().kernel_vm().translate_iova(high)?
+        { return Err(EFAULT); }
+        queue.independent_context = true;
+        Ok((G17PComputeUserBinding {
+            mappings, _sksm_entries: sksm_entries, _vm_bind: None,
+            _execution_context: Some(context.clone()),
+        }, context))
+    }
+
+    /// Completion identity and visibility belong to the queue, not the last
+    /// global publisher. Other QIDs may finish in either order. Never clear
+    /// their shared completion ring while another submission is outstanding.
+    pub(crate) fn poll_independent_compute_completion(
+        &mut self, queue: &mut G17PSksmQueue,
+    ) -> Result<Option<[u64; 2]>> {
+        if !queue.independent_context || queue.completion_descriptor == 0 { return Ok(None); }
+        let Some(timestamps) = self.resources.read_compute_completion(
+            queue.completion_descriptor, queue.completion_last_end,
+        )? else { return Ok(None); };
+        if timestamps[0] == timestamps[1] { return Err(EIO); }
+        if queue.completion_stamp_armed && queue.compute.read_compute_stamp()? == 0 {
+            return Err(EAGAIN);
+        }
+        if let Some(pair) = self.resources.read_compute_execution_interval(
+            queue.completion_descriptor, timestamps[1],
+        )? {
+            dev_info!(self.resources.dev().as_ref(),
+                "G17P async compute: GPU-INTERVAL qid={} descriptor={:#x} start={} end={}\n",
+                queue.queue_id, queue.completion_descriptor, pair[0], pair[1]);
+        }
+        queue.producer = g17_submission::complete_g17p_cl_kicks(queue.producer, 1)
+            .map_err(|_| EINVAL)?;
+        queue.completion_last_end = timestamps[1];
+        queue.completion_descriptor = 0;
+        queue.completion_stamp_armed = false;
+        Ok(Some(timestamps))
     }
 
     /// Hand out the QID for a freshly prepared compute graph.
@@ -5087,6 +5142,10 @@ impl G17PManagerConstruction {
             configure_guard_event_stamp: 0,
             submission_ordinal: 0,
             b2_activation: g17_submission::G17PClB2ActivationState::Pending,
+            independent_context: false,
+            completion_descriptor: 0,
+            completion_last_end: 0,
+            completion_stamp_armed: false,
         })
     }
 
@@ -5927,6 +5986,14 @@ impl G17PManagerConstruction {
         // binding, and any submission after another VM was created or
         // destroyed in between, previously reached the kick with nobody having
         // re-checked those two entries.
+        if let Some(execution) = binding._execution_context.as_ref() {
+            if context.context_id != execution.context_id() || !execution.is_current() {
+                return Err(EFAULT);
+            }
+            dev_info!(self.resources.dev().as_ref(),
+                "G17P independent compute root: qid={} context={} vm={} root={:#x}\n",
+                queue.queue_id, execution.context_id(), execution.vm_id(), execution.root());
+        } else {
         self.resources
             .uat()
             .ensure_t8140_compute_context_alias(binding.vm_bind())?;
@@ -5943,6 +6010,7 @@ impl G17PManagerConstruction {
                 roots[3].0,
                 roots[3].1,
             );
+        }
         }
         // Which chronology a command needs is a property of the *queue*, not
         // of the command's shape. A queue that has never been configured on
@@ -6240,7 +6308,18 @@ impl G17PManagerConstruction {
         queue: &mut G17PSksmQueue,
         descriptor: u64,
     ) -> Result {
-        let previous = self.resources.clear_compute_completion()?;
+        if queue.independent_context {
+            let count = queue.submission_ordinal.checked_add(1).ok_or(EOVERFLOW)?;
+            let [previous, completed] = queue.compute.publish_compute_submitted_count(count)?;
+            if queue.submission_ordinal < 2 {
+                dev_info!(self.resources.dev().as_ref(),
+                    "G17P compute TSQ: qid={} target={} previous={} completed={} before-publication\n",
+                    queue.queue_id, count, previous, completed);
+            }
+        }
+        let previous = if queue.independent_context { [0, 0] }
+            else { self.resources.clear_compute_completion()? };
+        queue.completion_descriptor = descriptor;
         self.last_published_descriptor = descriptor;
         // Arm the completion stamp as well. The KSM completion record is
         // produced by the KSM hardware block and consumed by the firmware at
@@ -6251,6 +6330,7 @@ impl G17PManagerConstruction {
         if *module_parameters::g17p_completion_stamp.value() != 0 {
             let discarded = queue.compute.arm_compute_stamp()?;
             self.compute_stamp_armed = true;
+            queue.completion_stamp_armed = true;
             if discarded != 0 && Self::compute_trace_enabled(queue.submission_ordinal) {
                 dev_info!(
                     self.resources.dev().as_ref(),

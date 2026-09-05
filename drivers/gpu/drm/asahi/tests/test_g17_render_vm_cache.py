@@ -7,6 +7,11 @@ a=s.index('struct VmDriverMappings {');b=s.index('/// Slot data for a',a)
 structs=s[a:b]
 a=s.index('    pub(crate) fn install_driver_mappings(');b=s.index('    /// Check that a byte range',a)
 methods=s[a:b]
+# Job ownership has its own production-source suite; this suite executes the
+# full unmap method with no outstanding jobs and keeps testing exact exclusions.
+a=methods.index('    pub(crate) fn retain_t8140_job(')
+b=methods.index('    /// Remove userspace mappings',a)
+methods=methods[:a]+methods[b:]
 preamble=r'''
 #![allow(dead_code)]
 use std::ops::{Range,Deref,DerefMut};
@@ -35,9 +40,10 @@ impl KernelMapping{fn iova_range(&self)->Range<u64>{self.range.clone()}}
 impl Drop for KernelMapping{fn drop(&mut self){assert!(!self.held.load(Ordering::SeqCst),"mapping destroyed under driver_mappings lock");self.drops.fetch_add(1,Ordering::SeqCst);}}
 '''
 vm=r'''
-struct Vm{driver_mappings:TestMutex<Option<VmDriverMappings>>,unmapped:StdMutex<Vec<Range<u64>>>}
+struct JobLifetime{active:usize,closed:bool,close_ranges:Option<(Range<u64>,Range<u64>)>}
+struct Vm{job_lifetime:TestMutex<JobLifetime>,driver_mappings:TestMutex<Option<VmDriverMappings>>,unmapped:StdMutex<Vec<Range<u64>>>}
 impl Vm{
-fn new()->Self{Self{driver_mappings:TestMutex{inner:StdMutex::new(None),held:Arc::new(AtomicBool::new(false))},unmapped:StdMutex::new(Vec::new())}}
+fn new()->Self{Self{job_lifetime:TestMutex{inner:StdMutex::new(JobLifetime{active:0,closed:false,close_ranges:None}),held:Arc::new(AtomicBool::new(false))},driver_mappings:TestMutex{inner:StdMutex::new(None),held:Arc::new(AtomicBool::new(false))},unmapped:StdMutex::new(Vec::new())}}
 fn mapping(&self,range:Range<u64>,drops:&Arc<AtomicUsize>)->KernelMapping{KernelMapping{range,held:self.driver_mappings.held.clone(),drops:drops.clone()}}
 fn unmap_range(&self,start:u64,size:u64)->Result{self.unmapped.lock().unwrap().push(start..start+size);Ok(())}
 '''

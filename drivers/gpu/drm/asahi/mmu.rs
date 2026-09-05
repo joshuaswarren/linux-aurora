@@ -1018,12 +1018,48 @@ pub(crate) struct Vm {
     dummy_obj: ARef<gem::Object>,
     binding: Arc<Mutex<VmBinding>>,
     driver_mappings: Arc<Mutex<Option<VmDriverMappings>>>,
+    job_lifetime: Arc<Mutex<T8140VmJobLifetime>>,
+    status: Arc<crate::g17_status::VmStatus>,
     /// User bindings which are eligible for native's restricted context-0
     /// view. This records backing identity only; it never changes context 0
     /// until the VM owns a render submission.
     t8140_native_context_bindings: Option<Arc<Mutex<T8140NativeContextBindings>>>,
 }
 no_debug!(Vm);
+
+struct T8140VmJobLifetime {
+    active: usize,
+    closed: bool,
+    close_ranges: Option<(Range<u64>, Range<u64>)>,
+    closed_objects: KVec<ARef<gem::Object>>,
+}
+
+/// GPU ownership outlives a DRM handle or file. Deferred user mappings retain
+/// their GEM backing until all accepted jobs retire; quarantined packets keep
+/// this guard until the processors have provably stopped.
+pub(crate) struct T8140VmJobGuard { vm: Vm }
+impl Drop for T8140VmJobGuard {
+    fn drop(&mut self) {
+        let (ranges, objects) = {
+            let mut state = self.vm.job_lifetime.lock();
+            state.active -= 1;
+            if state.active != 0 { return; }
+            (state.close_ranges.take(), core::mem::replace(&mut state.closed_objects, KVec::new()))
+        };
+        if let Some((user, kernel)) = ranges {
+            if self.vm.unmap_user_ranges(user, kernel).is_err() {
+                pr_err!("G17P VM job retirement: deferred user unmap failed\n");
+            }
+        }
+        for object in objects {
+            if self.vm.drop_mappings(&object).is_err() {
+                pr_err!("G17P VM job retirement: deferred GEM unmap failed\n");
+            }
+        }
+        self.vm.bo_deferred_cleanup();
+    }
+}
+
 
 struct T8140NativeContextBinding {
     gem: ARef<gem::Object>,
@@ -1209,26 +1245,59 @@ impl Clone for VmBind {
 /// allocator. This mirrors `AGXContextIDManager::alloc` plus
 /// `AGXSecureGart::registerContextID` without making an allocator ID a module
 /// parameter or letting a recycled page-table page confuse ownership.
-pub(crate) struct T8140AppContextLease {
+/// Root-table ownership is separate from the legacy slot-1 binding. The
+/// root lease drops before either enclosing VM owner, so PTE roots remain
+/// alive through ASID invalidation and allocator release.
+struct T8140ContextRootLease {
     inner: Arc<UatInner>,
-    _bind: VmBind,
     context_id: u8,
     low: u64,
     high: u64,
 }
+no_debug!(T8140ContextRootLease);
+
+pub(crate) struct T8140AppContextLease {
+    root: T8140ContextRootLease,
+    _bind: VmBind,
+}
 no_debug!(T8140AppContextLease);
 
 impl T8140AppContextLease {
-    pub(crate) fn context_id(&self) -> u32 {
-        u32::from(self.context_id)
-    }
-
+    pub(crate) fn context_id(&self) -> u32 { u32::from(self.root.context_id) }
     pub(crate) fn matches(&self, bind: &VmBind) -> bool {
         self._bind.matches(&bind.0) && self._bind.root() == bind.root()
     }
 }
 
-impl Drop for T8140AppContextLease {
+/// An independently rooted execution context owned by its submitted jobs.
+/// It never acquires or rewrites slot1: unrelated VMs can retain distinct
+/// roots concurrently. Clone an Arc of this lease into each immutable job;
+/// releasing a userspace queue must not release an in-flight job's context.
+/// Compute contexts use the populated firmware upper root, matching the
+/// existing context2/3 path. Render's restricted context0 views remain a
+/// separate ownership problem and do not use this API yet.
+pub(crate) struct T8140ComputeExecutionContext {
+    root: T8140ContextRootLease,
+    vm: Vm,
+}
+no_debug!(T8140ComputeExecutionContext);
+
+impl T8140ComputeExecutionContext {
+    pub(crate) fn context_id(&self) -> u32 { u32::from(self.root.context_id) }
+    pub(crate) fn vm(&self) -> &Vm { &self.vm }
+    pub(crate) fn root(&self) -> u64 { self.vm.ttb() }
+    pub(crate) fn vm_id(&self) -> u64 { self.vm.id }
+    pub(crate) fn matches(&self, vm: &Vm) -> bool { self.vm.id == vm.id && self.root() == vm.ttb() }
+    pub(crate) fn is_current(&self) -> bool {
+        let inner = self.root.inner.lock();
+        let slot = &inner.ttbs()[self.root.context_id as usize];
+        slot.ttb0.load(Ordering::Acquire) == self.root.low
+            && slot.ttb1.load(Ordering::Acquire) == self.root.high
+    }
+
+}
+
+impl Drop for T8140ContextRootLease {
     fn drop(&mut self) {
         let context_id = self.context_id as usize;
         let mut release = false;
@@ -1821,6 +1890,8 @@ impl HandoffFlush {
 }
 
 impl Vm {
+    pub(crate) fn status(&self) -> &Arc<crate::g17_status::VmStatus> { &self.status }
+
     /// Create a new virtual memory address space
     fn new(
         dev: &driver::AsahiDevice,
@@ -1901,6 +1972,10 @@ impl Vm {
             )?,
             binding,
             driver_mappings: Arc::pin_init(new_mutex!(None, "VmDriverMappings"), GFP_KERNEL)?,
+            status: Arc::new(crate::g17_status::VmStatus::new(), GFP_KERNEL)?,
+            job_lifetime: Arc::pin_init(new_mutex!(T8140VmJobLifetime {
+                active: 0, closed: false, close_ranges: None, closed_objects: KVec::new(),
+            }, "T8140VmJobLifetime"), GFP_KERNEL)?,
             t8140_native_context_bindings: if cfg == UatConfig::T8140 {
                 Some(Arc::pin_init(
                     new_mutex!(
@@ -2168,12 +2243,27 @@ impl Vm {
         })
     }
 
+    pub(crate) fn retain_t8140_job(&self) -> Result<T8140VmJobGuard> {
+        let mut state = self.job_lifetime.lock();
+        if state.closed { return Err(ENOENT); }
+        state.active = state.active.checked_add(1).ok_or(EOVERFLOW)?;
+        Ok(T8140VmJobGuard { vm: self.clone() })
+    }
+
     /// Remove userspace mappings while preserving VM-lifetime driver aliases.
     pub(crate) fn unmap_user_ranges(
         &self,
         user_range: Range<u64>,
         kernel_range: Range<u64>,
     ) -> Result {
+        {
+            let mut state = self.job_lifetime.lock();
+            state.closed = true;
+            if state.active != 0 {
+                state.close_ranges = Some((user_range, kernel_range));
+                return Ok(());
+            }
+        }
         let retained = self.driver_mappings.lock();
         let driver = retained.as_ref();
         let mut cursor = user_range.start;
@@ -2660,6 +2750,15 @@ impl Vm {
 
     /// Drop mappings for a given bo.
     pub(crate) fn drop_mappings(&self, gem: &gem::Object) -> Result {
+        {
+            let mut state = self.job_lifetime.lock();
+            if state.active != 0 {
+                if !state.closed_objects.iter().any(|object| core::ptr::eq(&**object, gem)) {
+                    state.closed_objects.push(gem.into(), GFP_KERNEL)?;
+                }
+                return Ok(());
+            }
+        }
         // Removing whole mappings only does unmaps, so no preallocated VAs
         let mut ctx = Default::default();
 
@@ -3874,12 +3973,60 @@ impl Uat {
             bind.0.id,
         );
         Ok(T8140AppContextLease {
-            inner: self.inner.clone(),
+            root: T8140ContextRootLease {
+                inner: self.inner.clone(), context_id: context_id as u8, low, high,
+            },
             _bind: bind.clone(),
-            context_id: context_id as u8,
-            low,
-            high,
         })
+    }
+
+    /// Reserve a free context without consulting the slot-1 allocator. A
+    /// context bit remains claimed until its root lease invalidates that ASID.
+    /// A failed allocation or root publication cannot expose a half-owned ID.
+    pub(crate) fn allocate_t8140_compute_execution_context(
+        &self, vm: &Vm,
+    ) -> Result<Arc<T8140ComputeExecutionContext>> {
+        if self.cfg != UatConfig::T8140 { return Err(EINVAL); }
+        {
+            let owner = vm.inner.exec_lock(None, false)?;
+            if owner.is_kernel || !core::ptr::eq(
+                Arc::as_ptr(&owner.uat_inner), Arc::as_ptr(&self.inner),
+            ) { return Err(EINVAL); }
+        }
+        let context_id = loop {
+            let used = self.inner.t8140_app_contexts.load(Ordering::Acquire);
+            let free = !used & T8140_APP_CONTEXT_AVAILABLE_MASK;
+            if free == 0 { return Err(ENOSPC); }
+            let index = free.trailing_zeros() as usize;
+            if self.inner.t8140_app_contexts.compare_exchange_weak(
+                used, used | (1u64 << index), Ordering::AcqRel, Ordering::Acquire,
+            ).is_ok() { break index; }
+        };
+        let low = t8140_tagged_root(vm.ttb(), context_id);
+        let high = t8140_tagged_root(self.kernel_vm.ttb(), context_id);
+        // Allocate every host owner before publishing either TTBAT half.
+        // Root-lease Drop handles allocation failure with an empty table.
+        let context = Arc::new(T8140ComputeExecutionContext {
+            root: T8140ContextRootLease {
+                inner: self.inner.clone(), context_id: context_id as u8, low, high,
+            },
+            vm: vm.clone(),
+        }, GFP_KERNEL)?;
+        {
+            let inner = self.inner.lock();
+            let ttbs = inner.ttbs();
+            // This ID is exclusively claimed. Never overwrite unexpected
+            // firmware/legacy ownership merely because the bitmap was clear.
+            if ttbs[context_id].ttb0.load(Ordering::Acquire) != 0
+                || ttbs[context_id].ttb1.load(Ordering::Acquire) != 0
+            { return Err(EBUSY); }
+            ttbs[context_id].ttb0.store(low, Ordering::Release);
+            ttbs[context_id].ttb1.store(high, Ordering::Release);
+        }
+        fence(Ordering::SeqCst);
+        mem::tlbi_asid(context_id as u8);
+        mem::sync();
+        Ok(context)
     }
 
     pub(crate) fn install_t8140_render_mcache_context_alias(
