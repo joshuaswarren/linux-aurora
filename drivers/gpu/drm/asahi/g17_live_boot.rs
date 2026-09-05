@@ -750,7 +750,12 @@ fn drain_primary_firmware_event_batch(
         blamed_recovery_records: 0,
         notification_count,
     };
-    while let Some(record) = manager.drain_primary_firmware_event()? {
+    let role = match state.processor {
+        G17PProcessor::Gfx => g17_initdata::InstanceRole::Primary,
+        G17PProcessor::Gfx1 => g17_initdata::InstanceRole::Secondary,
+    };
+    for _ in 0..g17_completion::G17P_FIRMWARE_EVENT_CAPACITY {
+        let Some(record) = manager.drain_firmware_event(role)? else { break; };
         let event_type = u32::from_le_bytes(record.raw[0..4].try_into().map_err(|_| EIO)?);
         match event_type {
             g17_completion::G17P_FIRMWARE_EVENT_RECOVERY_TYPE => {
@@ -2507,6 +2512,8 @@ pub(crate) struct G17PLiveRuntime {
     /// firmware pointer can only reach memory nothing else owns. They are
     /// released together once both CPUs stop, in `release_runtime_objects`.
     retired_queues: KVec<g17_manager::G17PSksmQueue>,
+    async_compute_queues: KVec<G17PAsyncComputeQueue>,
+    async_visibility_pending: bool,
     /// Bindings of clients whose submission was published and never seen to
     /// retire.
     ///
@@ -2565,7 +2572,9 @@ impl G17PLiveRuntime {
         }
         self.gfx_state.as_ref().is_some_and(|state| {
             state.firmware_event_notifications.load(Ordering::Acquire) != 0
-        }) || self.queue_setup_pending
+        }) || self.gfx1_state.as_ref().is_some_and(|state| {
+            state.firmware_event_notifications.load(Ordering::Acquire) != 0
+        }) || self.queue_setup_pending || self.async_visibility_pending
     }
 
     pub(crate) fn primary_recovery_pending(&self) -> bool {
@@ -2750,7 +2759,14 @@ impl G17PLiveRuntime {
                 signal.record(G17PComputeCompletion { timestamps });
             }
         }
-        let notifications_pending =
+        // Both RTKit roles notify the shared completion/event resources.
+        // Consume GFX1 ingress too; otherwise a coalesced secondary-only edge
+        // disappears when WorkItem1 is already running and no primary pending
+        // count asks it to run again.
+        let secondary_notifications = self.gfx1_state.as_ref().map_or(0, |secondary| {
+            secondary.firmware_event_notifications.load(Ordering::Acquire)
+        });
+        let notifications_pending = secondary_notifications != 0 ||
             state.firmware_event_notifications.load(Ordering::Acquire) != 0;
         let recovery_pending = self
             .manager
@@ -2785,6 +2801,20 @@ impl G17PLiveRuntime {
             } else {
                 Ok(())
             }
+        });
+        let result = result.and_then(|()| {
+            if let Some(secondary) = self.gfx1_state.as_ref().cloned() {
+                let batch = drain_primary_firmware_event_batch(&pdev,
+                    self.manager.as_mut().ok_or(ENODEV)?, &secondary, &signal)?;
+                if let Some(release) = batch.uma_release {
+                    self.service_render_usc_freelist_release(release)?;
+                }
+                if let Some(generation) = batch.recovery_generation {
+                    self.manager.as_mut().ok_or(ENODEV)?
+                        .queue_primary_recovery(generation, batch.recovery_records)?;
+                }
+            }
+            self.service_async_compute_completions()
         });
         if result.is_err() {
             state.crashed.store(true, Ordering::Release);
@@ -6319,6 +6349,8 @@ impl G17PLiveRuntime {
             compute_recycle_pending: false,
             compute_abandoned: false,
             retired_queues: KVec::new(),
+            async_compute_queues: KVec::new(),
+            async_visibility_pending: false,
             quarantined_bindings: KVec::new(),
             crash_recoveries: 0,
             compute_gate_suspect: false,
@@ -6466,6 +6498,8 @@ impl g17_lifecycle::PersistentRuntimeRecovery for G17PLiveRuntime {
         // client handoff retired can finally be freed: nothing in the
         // firmware can still dereference them.
         self.retired_queues.clear();
+        self.async_compute_queues.clear();
+        self.async_visibility_pending = false;
         // Both CPUs have stopped, so a quarantined client's page tables and
         // GEM objects can finally go too.
         self.quarantined_bindings.clear();
@@ -6570,6 +6604,8 @@ impl g17_lifecycle::PersistentRuntimeTeardown for G17PLiveRuntime {
         drop(self.compute_binding.take());
         drop(self.queue.take());
         self.retired_queues.clear();
+        self.async_compute_queues.clear();
+        self.async_visibility_pending = false;
         self.quarantined_bindings.clear();
         self.compute_owner = None;
         self.compute_recycle_pending = false;
@@ -6603,3 +6639,5 @@ impl Drop for G17PLiveRuntime {
         drop(self.pdev.take());
     }
 }
+
+include!("g17_async_compute.rs");

@@ -244,19 +244,47 @@ enum drm_asahi_feature {
 	 * userspace can speculate memory accesses more aggressively.
 	 */
 	DRM_ASAHI_FEATURE_SOFT_FAULTS = (1UL) << 0,
+
+	/** @DRM_ASAHI_FEATURE_VM_STATUS: GET_PARAMS VM_STATUS is supported. */
+	DRM_ASAHI_FEATURE_VM_STATUS = (1UL) << 1,
+};
+
+#define DRM_ASAHI_PARAM_GROUP_VM_STATUS 1
+
+/* GET_PARAMS group VM_STATUS is an in/out query on the calling file's VM.
+ * Set pointer to this structure and size to sizeof(structure).
+ * vm_id selects the VM; flags and pad must be zero. error is output only.
+ * error == 0 means no observed submission error; a negative Linux errno is
+ * sticky for this VM's lifetime. The first error is retained. Creating a new
+ * queue or successfully waiting another fence does not clear it.
+ * An execution-domain failure also marks other queried VMs lost when their
+ * hardware owner cannot progress. A query never recovers/resets firmware.
+ * The driver publishes an accepted job's failure before signaling its fence.
+ * Thus userspace must query after a successful DRM syncobj wait/poll before
+ * treating that fence as successful execution. Syncobj signal alone is not
+ * an execution-success indication.
+ * The feature bit is the availability contract; older kernels leave it zero.
+ * Kernel errors for invalid requests: EINVAL flags/pad/size, ENOENT foreign or
+ * missing vm_id, EFAULT inaccessible pointer. No output on invalid request.
+ */
+struct drm_asahi_vm_status {
+   __u32 vm_id;
+   __u32 flags;
+   __s32 error;
+   __u32 pad;
 };
 
 /**
  * struct drm_asahi_get_params - Arguments passed to DRM_IOCTL_ASAHI_GET_PARAMS
  */
 struct drm_asahi_get_params {
-	/** @param_group: Parameter group to fetch (MBZ) */
+	/** @param_group: 0 for global properties, 1 for VM status. */
 	__u32 param_group;
 
 	/** @pad: MBZ */
 	__u32 pad;
 
-	/** @pointer: User pointer to write parameter struct */
+	/** @pointer: User pointer to parameter struct (VM status is in/out). */
 	__u64 pointer;
 
 	/**

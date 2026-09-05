@@ -21,14 +21,14 @@ use crate::{
     alloc,
     driver::{AsahiDevRef, AsahiDevice},
     drm_gpu::{DrmGpu, DrmGpuParams},
-    file, g17_adt_j700, g17_live_boot, g17_render, g17_uapi, gem, gpu, hw, mmu, module_parameters,
+    file, g17_job, g17_adt_j700, g17_live_boot, g17_render, g17_uapi, gem, gpu, hw, mmu, module_parameters,
     pgtable, queue,
 };
 
 const T8140_USER_START: u64 = mmu::UAT_PGSZ as u64;
 const T8140_USER_TOP: u64 = 1 << 42;
 const T8140_UNKNOWN_PAGE: u64 = T8140_USER_TOP - 2 * mmu::UAT_PGSZ as u64;
-const T8140_TIMESTAMP_ALIAS_RANGE: Range<u64> = 0x70_0000_0000..0x71_0000_0000;
+const T8140_TIMESTAMP_ALIAS_RANGE: Range<u64> = 0x70_0800_0000..0x71_0000_0000;
 
 /// How long to wait for the firmware to report a compute submission complete.
 /// Generous relative to the ~170 GPU ticks a first add3 actually takes; this is
@@ -67,7 +67,7 @@ impl G17PRuntimeRef {
         }
     }
 
-    fn mutex(&self) -> &Mutex<g17_live_boot::G17PLiveRuntime> {
+    pub(crate) fn mutex(&self) -> &Mutex<g17_live_boot::G17PLiveRuntime> {
         // SAFETY: AsahiDriver owns the runtime Arc for the complete registered
         // DRM lifetime. DRM teardown prevents new callbacks before dropping
         // that platform-owned Arc.
@@ -124,6 +124,8 @@ pub(crate) struct G17PQueueRegistry {
     #[pin]
     lease_free: CondVar,
     live_queues: AtomicU32,
+    compute_readers: AtomicU32,
+    compute_faulted: AtomicU32,
 }
 
 impl G17PQueueRegistry {
@@ -133,9 +135,28 @@ impl G17PQueueRegistry {
                 lease <- new_mutex!(None, "G17PQueueRegistry::lease"),
                 lease_free <- new_condvar!("G17PQueueRegistry::lease_free"),
                 live_queues: AtomicU32::new(0),
+                compute_readers: AtomicU32::new(0),
+                compute_faulted: AtomicU32::new(0),
             }),
             GFP_KERNEL,
         )
+    }
+
+    /// Independent compute jobs share the compute side of the gate; legacy
+    /// render owns it exclusively until its context0 view routing is split.
+    /// This protects the qualified render path without serializing compute
+    /// queues against each other. The guard lives through exact retirement.
+    fn acquire_compute(self: &Arc<Self>, first_install: bool) -> Result<G17PComputeLeaseGuard> {
+        let mut held = self.lease.lock();
+        while held.is_some() || (first_install && self.compute_readers.load(Ordering::Acquire) != 0) {
+            if self.compute_faulted.load(Ordering::Acquire) != 0 { return Err(EIO); }
+            if self.lease_free.wait_interruptible(&mut held) { return Err(ERESTARTSYS); }
+        }
+        if self.compute_faulted.load(Ordering::Acquire) != 0 { return Err(EIO); }
+        self.compute_readers.fetch_add(1, Ordering::AcqRel);
+        if first_install { *held = Some(0); }
+        drop(held);
+        Ok(G17PComputeLeaseGuard { registry: self.clone(), exclusive: first_install })
     }
 
     /// Reserve one queue slot, or report a full device.
@@ -164,16 +185,37 @@ impl G17PQueueRegistry {
     /// Block until this client owns the hardware compute graph.
     fn acquire_lease(self: &Arc<Self>, id: u64) -> Result<G17PLeaseGuard> {
         let mut held = self.lease.lock();
-        while held.is_some() {
+        while held.is_some() || self.compute_readers.load(Ordering::Acquire) != 0 {
+            if self.compute_faulted.load(Ordering::Acquire) != 0 { return Err(EIO); }
             if self.lease_free.wait_interruptible(&mut held) {
                 return Err(ERESTARTSYS);
             }
         }
+        if self.compute_faulted.load(Ordering::Acquire) != 0 { return Err(EIO); }
         *held = Some(id);
         core::mem::drop(held);
         Ok(G17PLeaseGuard {
             registry: self.clone(),
         })
+    }
+}
+
+pub(crate) struct G17PComputeLeaseGuard { registry: Arc<G17PQueueRegistry>, exclusive: bool }
+impl G17PComputeLeaseGuard {
+    pub(crate) fn quarantine(&self) {
+        let held = self.registry.lease.lock();
+        self.registry.compute_faulted.store(1, Ordering::Release);
+        drop(held);
+        self.registry.lease_free.notify_all();
+    }
+}
+impl Drop for G17PComputeLeaseGuard {
+    fn drop(&mut self) {
+        let mut held = self.registry.lease.lock();
+        if self.exclusive { *held = None; }
+        self.registry.compute_readers.fetch_sub(1, Ordering::AcqRel);
+        drop(held);
+        self.registry.lease_free.notify_all();
     }
 }
 
@@ -232,6 +274,12 @@ impl DrmGpu for G17PDrmGpu {
         // machine was rebooted. Try once (bounded inside) to rebuild instead,
         // then answer with the state that leaves.
         self.runtime.mutex().lock().recover_crashed_session_once()
+    }
+
+    fn supports_vm_status(&self) -> bool { true }
+
+    fn submission_error(&self) -> i32 {
+        if self.registry.compute_faulted.load(Ordering::Acquire) != 0 { EIO.to_errno() } else { 0 }
     }
 
     fn update_globals(&self) {}
@@ -345,7 +393,7 @@ impl g17_uapi::GpuAddressSpace for UserAddressSpace<'_> {
 }
 
 #[derive(Default)]
-struct G17PSubmissionFence;
+pub(crate) struct G17PSubmissionFence;
 
 #[vtable]
 impl FenceOps for G17PSubmissionFence {
@@ -379,19 +427,18 @@ struct G17PQueue {
     user_range: Range<u64>,
     usc_exec_base: u64,
     fence_contexts: FenceContexts,
+    async_backend: Option<Arc<G17PAsyncQueueBackend>>,
+    async_scheduler: Option<g17_job::G17PJobScheduler<G17PAsyncQueueBackend>>,
     id: u64,
 }
 
 impl Drop for G17PQueue {
     fn drop(&mut self) {
-        // Take the lease first: another client may be inside `submit` right
-        // now, and the runtime state this releases is exactly what that submit
-        // is publishing against. A signal cannot be allowed to skip the
-        // release, so fall through and release anyway if the wait is broken --
-        // the runtime mutex still makes the release itself atomic.
-        let lease = self.registry.acquire_lease(self.id);
+        // Entity teardown handles pending scheduler jobs before the frontend
+        // reference goes away. Active hardware packets are retained by runtime.
+        drop(self.async_scheduler.take());
+        drop(self.async_backend.take());
         self.runtime.release_compute_owner(self.id);
-        core::mem::drop(lease);
         self.registry.release_queue();
     }
 }
@@ -401,9 +448,42 @@ enum G17PPendingCommand {
     Compute(g17_uapi::TranslatedComputeCommand),
 }
 
-struct TimestampDestination {
-    mapping: Arc<mmu::KernelMapping>,
-    offset: usize,
+type TimestampDestination = g17_job::TimestampDestination;
+
+pub(crate) struct G17PAsyncQueueBackend {
+    runtime: G17PRuntimeRef,
+    registry: Arc<G17PQueueRegistry>,
+    owner: u64,
+    hardware_queue: u8,
+    context: Arc<mmu::T8140ComputeExecutionContext>,
+}
+
+impl Drop for G17PAsyncQueueBackend {
+    fn drop(&mut self) { self.runtime.mutex().lock().release_async_compute_queue(self.owner); }
+}
+
+impl g17_job::G17PQueueBackend for G17PAsyncQueueBackend {
+    fn prepare(&self, _packet: &g17_job::G17PComputeJobPacket) -> Option<Fence> {
+        self.runtime.mutex().lock().async_compute_dependency(self.owner)
+    }
+    fn publish(&self, packet: Arc<g17_job::G17PComputeJobPacket>) -> Result<Fence> {
+        let hardware_fence = packet.completion()?.fence();
+        let first_install = self.runtime.mutex().lock().async_compute_needs_install(self.owner)?;
+        let lease = self.registry.acquire_compute(first_install)?;
+        self.runtime.mutex().lock().publish_async_compute(self.owner, packet, lease)?;
+        Ok(hardware_fence)
+    }
+    fn timed_out(&self, packet: Arc<g17_job::G17PComputeJobPacket>) -> kernel::drm::sched::Status {
+        self.runtime.mutex().lock().quarantine_async_compute(self.owner, packet.submission_id(), ETIMEDOUT);
+        kernel::drm::sched::Status::Nominal
+    }
+    fn cancel(&self, packet: Arc<g17_job::G17PComputeJobPacket>) {
+        let active = self.runtime.mutex().lock()
+            .quarantine_async_compute(self.owner, packet.submission_id(), ECANCELED);
+        if !active {
+            if let Ok(completion) = packet.completion() { completion.complete(Err(ECANCELED)); }
+        }
+    }
 }
 
 impl G17PQueue {
@@ -441,6 +521,8 @@ impl G17PQueue {
             user_range,
             usc_exec_base,
             fence_contexts: FenceContexts::new(1, QUEUE_NAME, QUEUE_CLASS_KEY)?,
+            async_backend: None,
+            async_scheduler: None,
             id,
         })
     }
@@ -514,6 +596,47 @@ impl G17PQueue {
                 raw.len(),
             );
         }
+    }
+
+    fn submit_compute_async(
+        &mut self, submission_id: u64, translated: g17_uapi::TranslatedComputeCommand,
+        mut syncs: KVec<file::SyncItem>, in_sync_count: usize,
+        objects: core::pin::Pin<&xarray::XArray<KBox<file::Object>>>,
+    ) -> Result {
+        self.runtime.mutex().lock().check_async_compute_submission()?;
+        let destinations = [
+            Self::timestamp_destination(objects, translated.timestamps.start)?,
+            Self::timestamp_destination(objects, translated.timestamps.end)?,
+        ];
+        let timestamps = self.owned_compute_timestamps()?;
+        let output = self.fence_contexts.new_fence(0, G17PSubmissionFence)?.into();
+        if self.async_scheduler.is_none() {
+            let (hardware_queue, context) = self.runtime.mutex().lock()
+                .prepare_async_compute_queue(self.id, &self.vm)?;
+            let backend = Arc::new(G17PAsyncQueueBackend {
+                runtime: self.runtime, registry: self.registry.clone(), owner: self.id,
+                hardware_queue, context,
+            }, GFP_KERNEL)?;
+            let scheduler = g17_job::G17PJobScheduler::new(&self.dev, backend.clone(), 1)?;
+            self.async_backend = Some(backend);
+            self.async_scheduler = Some(scheduler);
+        }
+        let backend = self.async_backend.as_ref().ok_or(EIO)?;
+        let packet = g17_job::G17PComputeJobPacket::new(
+            submission_id, backend.hardware_queue, backend.context.clone(), translated,
+            KVec::new(), KVec::new(),
+            Some(g17_job::G17PJobCompletion { fence: output, timestamps, destinations, status: self.vm.status().clone() }),
+            Some(self.vm.retain_t8140_job()?),
+        )?;
+        let mut dependencies = KVec::with_capacity(in_sync_count, GFP_KERNEL)?;
+        for sync in syncs.drain(0..in_sync_count) {
+            if let Some(fence) = sync.fence { dependencies.push(fence, GFP_KERNEL)?; }
+        }
+        let finished = self.async_scheduler.as_mut().ok_or(EIO)?.enqueue(packet, dependencies)?;
+        Self::install_output_fences(syncs.into_iter(), &finished);
+        pr_info!("G17P async submit: QUEUED submission {} owner={} qid={} context={}\n",
+            submission_id, self.id, backend.hardware_queue, backend.context.context_id());
+        Ok(())
     }
 
     /// Dump the render payload exactly as userspace supplied it, before any
@@ -1131,6 +1254,7 @@ impl queue::Queue for G17PQueue {
         cmdbuf_raw: &[u8],
         objects: core::pin::Pin<&xarray::XArray<KBox<file::Object>>>,
     ) -> Result {
+        if self.vm.status().get() != 0 { return Err(EIO); }
         pr_info!(
             "G17P submit: ENTER submission {} syncs={} in_sync={} cmdbuf_bytes={}\n",
             submission_id,
@@ -1267,6 +1391,10 @@ impl queue::Queue for G17PQueue {
                 G17PPendingCommand::Compute(_) => "compute",
             }
         );
+
+        if let G17PPendingCommand::Compute(translated) = pending {
+            return self.submit_compute_async(submission_id, translated, syncs, in_sync_count, objects);
+        }
 
         // Dependencies must become ready before reserving the physical
         // queues: their signalling submission may belong to another client.

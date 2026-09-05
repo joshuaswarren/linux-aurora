@@ -3471,6 +3471,27 @@ impl G17PComputeDescriptorStorage {
         self.support.iova() + G17P_COMPUTE_STAMP_SUPPORT_OFFSET
     }
 
+    /// Publish the number of kicks owned by this retained scheduler record.
+    /// Native AGXCommandDescriptor::incrementSubmittedKicks (89fc2a0) updates
+    /// this host-owned word before submission. B1 ProcessTimeStampQueue
+    /// (16a30..16a58) compares its own completed count against this target;
+    /// a target left at one defers the second completion until the batch
+    /// threshold (80), deadlocking a queue with one scheduler credit.
+    ///
+    /// The target is in an uncached firmware mapping. Do not rewrite the
+    /// firmware-owned record, its completed counter, or the final stamp.
+    /// A pre-publication retry writes the same absolute count, not another
+    /// increment. Logical VM/queue changes keep the physical queue ordinal.
+    pub(crate) fn publish_compute_submitted_count(&mut self, count: u32) -> Result<[u32; 2]> {
+        let base = self.support.iova();
+        let target = base + mmu::UAT_PGSZ as u64 + 4;
+        let previous = self.support.read_u32(target)?;
+        let completed = self.support.read_u32(base + 0x10c)?;
+        self.support.write_u32(target, count)?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        Ok([previous, completed])
+    }
+
     /// Zero the completion stamp before a submission is published.
     ///
     /// The compute descriptor's stamp pointer (`+0x0F40`) is exactly
@@ -10543,16 +10564,24 @@ impl G17ResourceOwner {
     pub(crate) fn drain_primary_firmware_event(
         &mut self,
     ) -> Result<Option<G17PPrimaryFirmwareEventRecord>> {
+        self.drain_firmware_event(InstanceRole::Primary)
+    }
+
+    pub(crate) fn drain_firmware_event(
+        &mut self, role: InstanceRole,
+    ) -> Result<Option<G17PPrimaryFirmwareEventRecord>> {
         let entry = g17_initdata::channel_table_entry_range(
             PRIMARY_FIRMWARE_EVENT_CHANNEL_INDEX,
         )
         .ok_or(EINVAL)?;
-        let main_config = self.handoff.primary.instance.main_config;
+        let (main_config, state_grid, status_a) = match role {
+            InstanceRole::Primary => (self.handoff.primary.instance.main_config,
+                self.handoff.primary.state_grid, self.handoff.primary.instance.status_a),
+            InstanceRole::Secondary => (self.handoff.secondary.instance.main_config,
+                self.handoff.secondary.state_grid, self.handoff.secondary.instance.status_a),
+        };
         let expected = g17_initdata::derive_channel_table(
-            InstanceRole::Primary,
-            self.handoff.primary.state_grid,
-            self.handoff.primary.instance.status_a,
-            main_config,
+            role, state_grid, status_a, main_config,
             self.handoff.shared.hw_data_bundle,
         )[PRIMARY_FIRMWARE_EVENT_CHANNEL_INDEX];
         let cursor_address = self.resources.shared_cluster.read_u64(
@@ -10579,8 +10608,8 @@ impl G17ResourceOwner {
         }
 
         core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
-        let consumer = self.resources.primary_state.read_u32(cursor_address)?;
-        let producer = self.resources.primary_state.read_u32(
+        let consumer = self.ktrace_object(role).read_u32(cursor_address)?;
+        let producer = self.ktrace_object(role).read_u32(
             cursor_address
                 .checked_add(g17_completion::G17P_FIRMWARE_EVENT_PRODUCER_OFFSET as u64)
                 .ok_or(EINVAL)?,
@@ -10608,13 +10637,13 @@ impl G17ResourceOwner {
             .checked_add(read.entry_offset as u64)
             .ok_or(EINVAL)?;
         let record_offset = record_address
-            .checked_sub(self.resources.primary_state.iova())
+            .checked_sub(self.ktrace_object(role).iova())
             .ok_or(EINVAL)? as usize;
         let record_end = record_offset
             .checked_add(g17_completion::G17P_FIRMWARE_EVENT_ENTRY_SIZE)
             .ok_or(EINVAL)?;
         let mut raw = [0u8; g17_completion::G17P_FIRMWARE_EVENT_ENTRY_SIZE];
-        self.resources.primary_state.with_bytes_mut(|bytes| {
+        self.ktrace_object(role).with_bytes_mut(|bytes| {
             raw.copy_from_slice(bytes.get(record_offset..record_end).ok_or(EINVAL)?);
             Ok(())
         })?;
@@ -10631,8 +10660,8 @@ impl G17ResourceOwner {
                     Ok(event) => {
                         dev_info!(
                             self.dev().as_ref(),
-                            "G17P firmware-event ring: stamp signal cursor={} producer={} masks=[{:#018x},{:#018x}] diagnostics={}\n",
-                            consumer,
+                            "G17P firmware-event ring role={:?}: stamp signal cursor={} producer={} masks=[{:#018x},{:#018x}] diagnostics={}\n",
+                            role, consumer,
                             producer,
                             event.masks[0],
                             event.masks[1],
@@ -10657,8 +10686,8 @@ impl G17ResourceOwner {
             };
             dev_err!(
                 self.dev().as_ref(),
-                "G17P firmware-event ring: record type={} cursor={} producer={} raw=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}] unmodelled ({:?}); consuming\n",
-                event_type,
+                "G17P firmware-event ring role={:?}: record type={} cursor={} producer={} raw=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}] unmodelled ({:?}); consuming\n",
+                role, event_type,
                 consumer,
                 producer,
                 raw_qword(0x00),
@@ -10684,8 +10713,7 @@ impl G17ResourceOwner {
         }
 
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        self.resources
-            .primary_state
+        self.ktrace_object(role)
             .write_u32(cursor_address, read.published_consumer)?;
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         Ok(Some(G17PPrimaryFirmwareEventRecord {
@@ -10965,6 +10993,36 @@ impl G17ResourceOwner {
             );
         }
         Ok(())
+    }
+
+    /// Return one coherent timestamp pair from the exact completed descriptor
+    /// record. The legacy retire API combines pair-A start with pair-B end;
+    /// that interval must never be used as proof of simultaneous execution.
+    /// Pair B is the pair copied to native's command timestamp destinations.
+    pub(crate) fn read_compute_execution_interval(
+        &mut self, expected_descriptor: u64, completed_end: u64,
+    ) -> Result<Option<[u64; 2]>> {
+        let object = &mut self.resources.completion_ordinal_0;
+        let stride = G17P_COMPUTE_COMPLETION_RECORD_SIZE;
+        let slots = core::cmp::min(object.logical_size / stride,
+            g17_initdata::G17P_KSM_COMPLETION_CAPACITY as usize);
+        object.with_bytes_mut(|bytes| {
+            for slot in 0..slots {
+                let offset = slot * stride;
+                let record = bytes.get(offset..offset + stride).ok_or(ERANGE)?;
+                let field = |at: usize| -> u64 {
+                    u64::from_le_bytes(record[at..at + 8].try_into().unwrap_or([0; 8]))
+                };
+                if field(0x30) & G17P_COMPUTE_COMPLETION_DESCRIPTOR_MASK != expected_descriptor
+                    || field(0x38) == 0 { continue; }
+                let start = field(0x20) & G17P_COMPUTE_COMPLETION_TIMESTAMP_MASK;
+                let end = field(0x28) & G17P_COMPUTE_COMPLETION_TIMESTAMP_MASK;
+                if end == completed_end && start != 0 && start < end {
+                    return Ok(Some([start, end]));
+                }
+            }
+            Ok(None)
+        })
     }
 
     pub(crate) fn read_compute_completion(
@@ -13372,7 +13430,7 @@ impl G17ResourceOwner {
             return Ok(());
         }
         vm.clear_compute_pool_mappings();
-        let mut mappings = KVec::with_capacity(24, GFP_KERNEL)?;
+        let mut mappings = KVec::with_capacity(26, GFP_KERNEL)?;
         mappings.push(self.resources.compute_operand_page_lists.as_mut().ok_or(EIO)?
             .map_at(vm, g17_initdata::COMPUTE_FLIST_PAGE_LIST_ADDRESS,
                 mmu::PROT_GPU_SHARED_RW)?, GFP_KERNEL)?;
@@ -13383,6 +13441,11 @@ impl G17ResourceOwner {
             mappings.push(buffer.map_at(vm, g17p_compute_operand_buffer_va(index).ok_or(EINVAL)?,
                 mmu::PROT_GPU_SHARED_RW)?, GFP_KERNEL)?;
         }
+        // Completion rings belong to the VM aperture, not to one queue.
+        // Multiple independent QIDs in the same VM must share these aliases.
+        let (completion0, completion2) = self.map_user_completion_aliases(vm)?;
+        mappings.push(completion0, GFP_KERNEL)?;
+        mappings.push(completion2, GFP_KERNEL)?;
         vm.install_compute_pool_mappings(pool_id, mappings)
     }
 

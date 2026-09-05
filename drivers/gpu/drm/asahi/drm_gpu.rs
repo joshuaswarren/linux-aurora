@@ -37,6 +37,9 @@ pub(crate) trait DrmGpu: Send + Sync {
     fn init(&self) -> Result;
     fn ids(&self) -> &gpu::SequenceIDs;
     fn is_crashed(&self) -> bool;
+    fn supports_vm_status(&self) -> bool { false }
+    /// Permanent submission-domain failure; querying must not reset firmware.
+    fn submission_error(&self) -> i32 { 0 }
     fn update_globals(&self);
     fn params(&self) -> Result<DrmGpuParams>;
     fn user_range(&self) -> Result<Range<u64>>;

@@ -27,6 +27,8 @@ mod g17_compute;
 mod g17_drm;
 mod g17_firmware;
 mod g17_initdata;
+mod g17_job;
+mod g17_status;
 mod g17_lifecycle;
 mod g17_live_boot;
 mod g17_manager;
@@ -123,8 +125,8 @@ kernel::module_platform_driver! {
             description: "Enable the GPU firmware log ring (main_config+0x250)",
         },
         g17p_fw_trace: u32 {
-            default: 0x203,
-            description: "Firmware trace class mask written to status_a+0x00 on BOTH roles before the initdata doorbell. Bit N enables trace channel N. Default 0x203 enables submission class0 and native progress-monitor classes1/9 during G17P bring-up. Non-zero also enables the KTrace drain (arming without draining makes the firmware busy-wait ~3ms once and then drop records); 0 disables it.",
+            default: 0,
+            description: "Optional firmware trace class mask at status_a+0x00 on both roles. Disabled by default for normal asynchronous execution: the trace rings require their own consumer and must not backpressure GPU completion. Nonzero is an explicit diagnostic mode; submission/progress classes are0/1/9.",
         },
         g17p_fw_ktrace_verbose: u32 {
             default: 1,

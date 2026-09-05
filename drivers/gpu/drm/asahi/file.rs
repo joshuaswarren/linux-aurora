@@ -282,6 +282,9 @@ impl File {
 
         let gpu = &device.gpu;
 
+        if data.param_group == crate::g17_status::PARAM_GROUP_VM_STATUS {
+            return Self::get_vm_status(device, data, file);
+        }
         if data.param_group != 0 || data.pad != 0 {
             cls_pr_debug!(Errors, "get_params: Invalid arguments\n");
             return Err(EINVAL);
@@ -319,6 +322,9 @@ impl File {
             gpu_hal_generation: facts.gpu_hal_generation,
         };
 
+        if gpu.supports_vm_status() {
+            params.features |= crate::g17_status::FEATURE_VM_STATUS;
+        }
         if *module_parameters::fault_control.value() == 0xb {
             params.features |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_SOFT_FAULTS as u64;
         }
@@ -334,6 +340,29 @@ impl File {
             core::slice::from_raw_parts(&params as *const _ as *const u8, size)
         })?;
 
+        Ok(0)
+    }
+
+    /// Status queries never enter firmware recovery or wait for a GPU job.
+    /// File-local lookup enforces VM ownership. Status survives queue teardown.
+    fn get_vm_status(device: &AsahiDevice, data: &uapi::drm_asahi_get_params,
+                     file: &DrmFile) -> Result<u32> {
+        use crate::g17_status::{decode_request, encode_response, VM_STATUS_SIZE};
+        if !device.gpu.supports_vm_status() { return Err(EINVAL); }
+        if data.pad != 0 || data.size < VM_STATUS_SIZE as u64 { return Err(EINVAL); }
+        let user = UserPtr::from_addr(data.pointer as _);
+        let mut bytes = [0u8; VM_STATUS_SIZE];
+        UserSlice::new(user, VM_STATUS_SIZE).reader().read_slice(&mut bytes)?;
+        let vm_id = decode_request(&bytes).ok_or(EINVAL)?;
+        let status = {
+            let vms = file.inner().vms();
+            let guard = vms.lock();
+            let vm = guard.get(vm_id as usize).ok_or(ENOENT)?;
+            vm.vm.status().clone()
+        };
+        status.record(device.gpu.submission_error());
+        let bytes = encode_response(vm_id, status.get());
+        UserSlice::new(user, VM_STATUS_SIZE).writer().write_slice(&bytes)?;
         Ok(0)
     }
 
