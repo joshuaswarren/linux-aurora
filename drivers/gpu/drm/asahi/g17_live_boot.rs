@@ -3645,23 +3645,6 @@ impl G17PLiveRuntime {
         Err(ETIMEDOUT)
     }
 
-    /// Do not destroy a live firmware session to service an unsupported VM
-    /// handoff. RUN-clear plus replacement RTKit owners does not establish the
-    /// shared GFX power-off boundary; measured retries time out before any
-    /// new render doorbell. Keep the old graph, mappings and admission intact
-    /// so its original owner can still submit. This is not multi-VM support.
-    fn check_retained_render_owner(&self, vm: &mmu::Vm) -> Result {
-        if self
-            .manager
-            .as_ref()
-            .ok_or(ENODEV)?
-            .retained_render_has_other_owner(vm)
-        {
-            return Err(ENOTSUPP);
-        }
-        Ok(())
-    }
-
     pub(crate) fn submit_translated_render(
         &mut self,
         vm: &mmu::Vm,
@@ -4808,14 +4791,11 @@ impl G17PLiveRuntime {
         if !self.accepting_submissions {
             return Err(ENOTSUPP);
         }
-        self.check_retained_render_owner(vm)?;
-        // Render and compute currently share FList page/run backings. VM
-        // creation no longer overwrites a retained render pool. An actual
-        // workload switch must stop both firmware processors before reusing
-        // those bytes, including when the incoming compute VM is the same.
-        if self.manager.as_ref().ok_or(ENODEV)?.render_flist_owned() {
-            g17_lifecycle::recover_persistent_runtime(self)?;
-        }
+        self.settle_open_recovery_before_publication()?;
+        // Compute owns disjoint FList/completion aliases. Release only the
+        // fully retired render context leases; the queues and grown render
+        // pool remain installed for the next render submission.
+        self.manager.as_mut().ok_or(ENODEV)?.release_retired_render_context()?;
         self.manager.as_mut().ok_or(ENODEV)?.stage_compute_flist_state()?;
         // Allocate the compute graph on actual compute use, never as a
         // prerequisite for render. This is a no-op once a graph exists.
@@ -4930,16 +4910,6 @@ impl G17PLiveRuntime {
         // Answering is also the only thing that closes a recovery: the host
         // writing 2 into status_b[0x4900] is what schedules the unhalt.
         self.settle_open_recovery_before_publication()?;
-        if !repeat_ready
-            && !rebind_ready
-            && self
-                .manager
-                .as_ref()
-                .ok_or(ENODEV)?
-                .retained_render_needs_recycle(vm)
-        {
-            g17_lifecycle::recover_persistent_runtime(self)?;
-        }
         // Any recovery above rebuilt the session, and a rebuilt session comes
         // back with no queue: `boot_session` defers QID 4 to the event worker.
         // Put one back synchronously, or every clause below reads `None` and

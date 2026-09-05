@@ -60,6 +60,17 @@ vm.clear_render_pool_mappings();assert_eq!(drops.load(Ordering::SeqCst),6);
 vm.unmapped.lock().unwrap().clear();assert_eq!(vm.unmap_user_ranges(0..256,64..80),Ok(()));assert_eq!(*vm.unmapped.lock().unwrap(),vec![0..16,32..64,80..192,224..256]);
 assert_eq!(vm.install_render_pool_mappings(8,vec![vm.mapping(128..144,&drops)]),Ok(()));assert!(vm.render_pool_mappings_match(8));
 drop(vm);assert_eq!(drops.load(Ordering::SeqCst),8);
+let vm=Vm::new();let drops=Arc::new(AtomicUsize::new(0));
+vm.install_driver_mappings(vec![],vec![]).unwrap();
+vm.install_render_pool_mappings(10,vec![vm.mapping(16..32,&drops)]).unwrap();
+vm.install_compute_pool_mappings(20,vec![vm.mapping(64..96,&drops)]).unwrap();
+assert!(vm.compute_pool_mappings_match(20));assert!(!vm.compute_pool_mappings_match(21));
+assert!(vm.driver_range_overlaps(80..81));
+vm.unmap_user_ranges(0..128,128..128).unwrap();
+assert_eq!(*vm.unmapped.lock().unwrap(),vec![0..16,32..64,96..128]);
+vm.clear_compute_pool_mappings();assert!(vm.render_pool_mappings_match(10));
+assert_eq!(drops.load(Ordering::SeqCst),1);vm.clear_compute_pool_mappings();
+drop(vm);assert_eq!(drops.load(Ordering::SeqCst),2);
 println!("PASS actual mmu cache source: install/duplicate/clear/generation, mapping drops outside lock, fixed+cached overlap and exact user-unmap exclusions");
 }
 '''

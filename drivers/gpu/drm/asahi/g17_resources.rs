@@ -218,9 +218,9 @@ const G17P_LAST_SUBMITTED_HW_TIMESTAMP_BUNDLE_OFFSET: usize =
 pub(crate) const G17P_CL_LOW_VA_START: u64 = 0x70_0000_0000;
 pub(crate) const G17P_CL_LOW_VA_END: u64 = 0x71_0000_0000;
 /// Dynamic queue, descriptor, and render state live above every native fixed
-/// low resource. The lower 32 MiB remain available for temporal bootstrap,
-/// readiness, B2 aliases, and the fixed completion-queue aliases.
-pub(crate) const G17P_CL_DYNAMIC_LOW_VA_START: u64 = 0x70_0200_0000;
+/// low resource. The lower 32 MiB retain native render/bootstrap coordinates;
+/// the next 32 MiB hold an independent compute pool and completion rings.
+pub(crate) const G17P_CL_DYNAMIC_LOW_VA_START: u64 = 0x70_0400_0000;
 /// Architectural base for compact user/GART pointers consumed by the TA.
 const G17P_RENDER_USER_BASE: u64 = 0x10_0000_0000;
 const G17P_RENDER_USER_END: u64 = 0x11_0000_0000;
@@ -432,6 +432,12 @@ fn g17p_control_operand_buffer_va(index: usize) -> Option<u64> {
         .checked_add(index as u64 * G17P_CONTROL_OPERAND_BUFFER_STRIDE as u64)
 }
 
+fn g17p_compute_operand_buffer_va(index: usize) -> Option<u64> {
+    if index >= 23 { return None; }
+    g17_initdata::COMPUTE_FLIST_BUFFER_BASE.checked_add(
+        index as u64 * G17P_CONTROL_OPERAND_BUFFER_STRIDE as u64)
+}
+
 fn encode_g17p_flist_runs(out: &mut [u8], block_count: usize) -> bool {
     if out.len() != G17P_CONTROL_OPERAND_TABLE_BACKING_SIZE {
         return false;
@@ -461,7 +467,7 @@ fn encode_g17p_compute_flist_runs(out: &mut [u8]) -> bool {
     }
     out.fill(0);
     for buffer_index in 0..g17_initdata::COMPUTE_READINESS_OPERAND_ENTRY_COUNT {
-        let Some(buffer_base) = g17p_control_operand_buffer_va(buffer_index) else {
+        let Some(buffer_base) = g17p_compute_operand_buffer_va(buffer_index) else {
             return false;
         };
         let offset = buffer_index * core::mem::size_of::<u64>();
@@ -530,20 +536,20 @@ fn map_compute_readiness_mappings(
     buffers: &mut KVec<RenderBackingObject>,
     vm: &mmu::Vm,
 ) -> Result<G17PComputeReadinessMappings> {
-    if buffers.len() != G17P_CONTROL_OPERAND_BUFFER_COUNT {
+    if buffers.len() != 23 {
         return Err(EINVAL);
     }
     let table = table
         .map_at(
             vm,
-            G17P_CONTROL_OPERAND_TABLE_VA,
+            g17_initdata::COMPUTE_FLIST_RUN_TABLE_ADDRESS,
             mmu::PROT_GPU_FW_SHARED_RW,
         )
         .inspect_err(|error| {
             dev_err!(
                 dev.as_ref(),
                 "G17P compute readiness: operand table map at {:#x}:{:#x} failed ({:?})\n",
-                G17P_CONTROL_OPERAND_TABLE_VA,
+                g17_initdata::COMPUTE_FLIST_RUN_TABLE_ADDRESS,
                 g17_initdata::CONTROL_OPERAND_TABLE_SIZE,
                 error,
             );
@@ -557,7 +563,7 @@ fn map_compute_readiness_mappings(
         .take(g17_initdata::COMPUTE_READINESS_OPERAND_ENTRY_COUNT)
         .enumerate()
     {
-        let address = g17p_control_operand_buffer_va(index).ok_or(EINVAL)?;
+        let address = g17p_compute_operand_buffer_va(index).ok_or(EINVAL)?;
         let mapping = buffer
             .map_at(vm, address, mmu::PROT_GPU_FW_SHARED_RW)
             .inspect_err(|error| {
@@ -2606,7 +2612,7 @@ impl G17PComputeUserMappings {
 impl G17PComputeReadinessMappings {
     fn all_reachable_from(&self, vm: &mmu::Vm) -> bool {
         self.buffers.len() == g17_initdata::COMPUTE_READINESS_OPERAND_ENTRY_COUNT
-            && self.table.iova() == G17P_CONTROL_OPERAND_TABLE_VA
+            && self.table.iova() == g17_initdata::COMPUTE_FLIST_RUN_TABLE_ADDRESS
             && vm.covers_range(
                 self.table.iova(),
                 self.table.size() as u64,
@@ -2614,7 +2620,7 @@ impl G17PComputeReadinessMappings {
                 true,
             )
             && self.buffers.iter().enumerate().all(|(index, mapping)| {
-                g17p_control_operand_buffer_va(index).is_some_and(|address| {
+                g17p_compute_operand_buffer_va(index).is_some_and(|address| {
                     mapping.iova() == address
                         && mapping.size() == G17P_CONTROL_OPERAND_BUFFER_SIZE
                         && vm.covers_range(address, mapping.size() as u64, true, true)
@@ -8515,6 +8521,13 @@ struct G17MappedResources {
     control_operand_page_lists: RenderBackingObject,
     control_operand_table: RenderBackingObject,
     control_operand_buffers: KVec<RenderBackingObject>,
+    // Allocated on actual compute use. Render retains its original pool,
+    // page-list, grow state and cached aliases throughout mode switches.
+    compute_operand_page_lists: Option<RenderBackingObject>,
+    compute_operand_table: Option<RenderBackingObject>,
+    compute_operand_buffers: KVec<RenderBackingObject>,
+    compute_flist_pool_id: u64,
+    compute_flist_initialized: bool,
     compute_runtime_support: MappedObject,
     compute_runtime_state: RenderBackingObject,
     compute_runtime_state_mapping: Option<mmu::KernelMapping>,
@@ -8545,7 +8558,6 @@ struct G17UatOwner {
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum G17PFListBackingOwner {
     Opening,
-    Compute,
     Render,
 }
 
@@ -9805,6 +9817,11 @@ impl G17ResourceOwner {
                 control_operand_page_lists,
                 control_operand_table,
                 control_operand_buffers,
+                compute_operand_page_lists: None,
+                compute_operand_table: None,
+                compute_operand_buffers: KVec::new(),
+                compute_flist_pool_id: 0,
+                compute_flist_initialized: false,
                 compute_runtime_support,
                 compute_runtime_state,
                 compute_runtime_state_mapping,
@@ -11929,11 +11946,12 @@ impl G17ResourceOwner {
     /// queues and outer slots, dropped the retained render graph, and restored
     /// the kernel context. Preserve the primary-index contents until then.
     pub(crate) fn prepare_compute_readiness_context1(&mut self) -> Result {
+        self.stage_compute_flist_state()?;
         if !self.control_counters()?.opening_retired() {
             return Err(EINVAL);
         }
         self.validate_compute_readiness_objects()?;
-        self.resources.control_operand_table.with_bytes_mut(|bytes| {
+        self.resources.compute_operand_table.as_mut().ok_or(EIO)?.with_bytes_mut(|bytes| {
             g17_initdata::encode_compute_readiness_operand_table(
                 g17p_control_operand_table_prefix(bytes).ok_or(EINVAL)?,
             )
@@ -11944,8 +11962,8 @@ impl G17ResourceOwner {
             let vm = self.address_space.uat.kernel_lower_vm();
             self.resources.compute_readiness_context1 = Some(map_compute_readiness_mappings(
                 &self.dev,
-                &mut self.resources.control_operand_table,
-                &mut self.resources.control_operand_buffers,
+                self.resources.compute_operand_table.as_mut().ok_or(EIO)?,
+                &mut self.resources.compute_operand_buffers,
                 vm,
             )?);
             mapped_now = true;
@@ -11999,21 +12017,21 @@ impl G17ResourceOwner {
         if !self.resources.compute_readiness_class3_support_active {
             return Err(EINVAL);
         }
-        self.resources.control_operand_table.with_bytes_mut(|bytes| {
+        self.resources.compute_operand_table.as_mut().ok_or(EIO)?.with_bytes_mut(|bytes| {
             g17_initdata::encode_compute_readiness_operand_table(
                 g17p_control_operand_table_prefix(bytes).ok_or(EINVAL)?,
             )
             .map_err(|_| EINVAL)
         })?;
         if !vm.covers_range(
-            G17P_CONTROL_OPERAND_TABLE_VA,
+            g17_initdata::COMPUTE_FLIST_RUN_TABLE_ADDRESS,
             g17_initdata::CONTROL_OPERAND_TABLE_SIZE as u64,
             true,
             true,
         ) || !all_ranges_covered(
             (0..g17_initdata::COMPUTE_READINESS_OPERAND_ENTRY_COUNT).map(|index| {
                 (
-                    g17p_control_operand_buffer_va(index).unwrap_or(0),
+                    g17p_compute_operand_buffer_va(index).unwrap_or(0),
                     G17P_CONTROL_OPERAND_BUFFER_SIZE as u64,
                 )
             }),
@@ -12027,12 +12045,13 @@ impl G17ResourceOwner {
     /// Restore the source-built class-1 closure before publishing live
     /// compute-control records.
     pub(crate) fn prepare_compute_runtime_class1(&mut self) -> Result {
+        self.stage_compute_flist_state()?;
         if !self.control_counters()?.opening_retired() {
             return Err(EINVAL);
         }
         // The mature compute tail uses the 22-entry table. It replaces the
         // first-partial 28-entry render table only after that group retires.
-        self.resources.control_operand_table.with_bytes_mut(|bytes| {
+        self.resources.compute_operand_table.as_mut().ok_or(EIO)?.with_bytes_mut(|bytes| {
             g17_initdata::encode_control_operand_table(
                 g17p_control_operand_table_prefix(bytes).ok_or(EINVAL)?,
             )
@@ -12072,22 +12091,22 @@ impl G17ResourceOwner {
                     g17_initdata::COMPUTE_RUNTIME_ZERO_BUFFER_1_ADDRESS,
                     mmu::PROT_GPU_FW_SHARED_RW,
                 )?;
-                let table = self.resources.control_operand_table.map_at(
+                let table = self.resources.compute_operand_table.as_mut().ok_or(EIO)?.map_at(
                     self.address_space.uat.kernel_lower_vm(),
-                    g17_initdata::CONTROL_OPERAND_TABLE_ADDRESS,
+                    g17_initdata::COMPUTE_FLIST_RUN_TABLE_ADDRESS,
                     mmu::PROT_GPU_FW_SHARED_RW,
                 )?;
                 let mut buffers = KVec::with_capacity(20, GFP_KERNEL)?;
                 for (index, buffer) in self
                     .resources
-                    .control_operand_buffers
+                    .compute_operand_buffers
                     .iter_mut()
                     .enumerate()
                 {
                     if index > 18 && index != 22 {
                         continue;
                     }
-                    let address = g17p_control_operand_buffer_va(index).ok_or(EINVAL)?;
+                    let address = g17p_compute_operand_buffer_va(index).ok_or(EINVAL)?;
                     buffers.push(
                         buffer.map_at(
                             self.address_space.uat.kernel_lower_vm(),
@@ -12122,7 +12141,7 @@ impl G17ResourceOwner {
             true,
             true,
         ) || !self.address_space.uat.kernel_lower_vm().covers_range(
-            g17_initdata::CONTROL_OPERAND_TABLE_ADDRESS,
+            g17_initdata::COMPUTE_FLIST_RUN_TABLE_ADDRESS,
             g17_initdata::CONTROL_OPERAND_TABLE_SIZE as u64,
             true,
             true,
@@ -12167,7 +12186,7 @@ impl G17ResourceOwner {
             })?;
         for (index, buffer) in self
             .resources
-            .control_operand_buffers
+            .compute_operand_buffers
             .iter_mut()
             .enumerate()
         {
@@ -12180,7 +12199,7 @@ impl G17ResourceOwner {
         }
         let page_list = self
             .resources
-            .control_operand_buffers
+            .compute_operand_buffers
             .iter_mut()
             .enumerate()
             .find(|(index, _)| *index == 22)
@@ -12448,7 +12467,7 @@ impl G17ResourceOwner {
         {
             return Err(EINVAL);
         }
-        self.resources.control_operand_table.with_bytes_mut(|bytes| {
+        self.resources.compute_operand_table.as_mut().ok_or(EIO)?.with_bytes_mut(|bytes| {
             bytes.fill(0);
             Ok(())
         })?;
@@ -12525,6 +12544,7 @@ impl G17ResourceOwner {
     /// their page-table identity and fixed driver aliases.
     pub(crate) fn reset_session_after_processor_stop(&mut self) -> Result {
         self.flist_backing_owner = G17PFListBackingOwner::Opening;
+        self.resources.compute_flist_initialized = false;
         // The generic render status/descriptor aliases reuse these fixed VAs
         // on the next bootstrap. Both processors are already stopped here.
         self.resources.compute_runtime_state_mapping = None;
@@ -13294,42 +13314,67 @@ impl G17ResourceOwner {
         self.flist_backing_owner == G17PFListBackingOwner::Render
     }
 
-    /// A compute session may initialize these shared backings only when no
-    /// render pool owns them. Runtime uses a stopped-session handoff for an
-    /// actual render -> compute switch; merely creating a VM is mapping-only.
+    /// Prepare the independent compute FList once. Native obtains both low
+    /// addresses from the resource objects (populateInitialFirmwareState
+    /// +0x14/+0x30); no render pool state or mapping is rewritten here.
     pub(crate) fn stage_compute_flist_state(&mut self) -> Result {
-        match self.flist_backing_owner {
-            G17PFListBackingOwner::Render => return Err(EBUSY),
-            G17PFListBackingOwner::Compute => return Ok(()),
-            G17PFListBackingOwner::Opening => {}
-        }
-        self.resources
-            .partial_opening_control_shared
-            .with_bytes_mut(|bytes| {
-                g17_initdata::encode_compute_partial_opening_control_shared(bytes)
-                    .map_err(|_| EINVAL)
-            })?;
-        self.resources
-            .partial_opening_control_shared_inner
-            .with_bytes_mut(|bytes| {
-                bytes.fill(0);
-                Ok(())
-            })?;
-        self.resources
-            .control_operand_page_lists
-            .with_bytes_mut(|bytes| {
-                bytes.fill(0);
-                Ok(())
-            })?;
-        self.resources.control_operand_table.with_bytes_mut(|bytes| {
-            if !encode_g17p_compute_flist_runs(bytes) {
-                return Err(EINVAL);
+        if self.resources.compute_operand_table.is_none() {
+            let pages = RenderBackingObject::new(&self.dev, G17P_CONTROL_OPERAND_PAGE_LIST_SIZE)?;
+            let table = RenderBackingObject::new(&self.dev, G17P_CONTROL_OPERAND_TABLE_BACKING_SIZE)?;
+            let mut buffers = KVec::with_capacity(23, GFP_KERNEL)?;
+            for _ in 0..23 {
+                buffers.push(RenderBackingObject::new(&self.dev,
+                    G17P_CONTROL_OPERAND_BUFFER_SIZE)?, GFP_KERNEL)?;
             }
+            let pool_id = u64::from(g17p_reserve_render_gid_group()?);
+            self.resources.compute_operand_page_lists = Some(pages);
+            self.resources.compute_operand_table = Some(table);
+            self.resources.compute_operand_buffers = buffers;
+            self.resources.compute_flist_pool_id = pool_id;
+        }
+        if self.resources.compute_flist_initialized {
+            return Ok(());
+        }
+        self.resources.partial_opening_control_shared.with_bytes_mut(|bytes| {
+            g17_initdata::encode_compute_partial_opening_control_shared(bytes)
+                .map_err(|_| EINVAL)
+        })?;
+        self.resources.partial_opening_control_shared_inner.with_bytes_mut(|bytes| {
+            bytes.fill(0);
             Ok(())
         })?;
+        self.resources.compute_operand_page_lists.as_mut().ok_or(EIO)?
+            .with_bytes_mut(|bytes| { bytes.fill(0); Ok(()) })?;
+        self.resources.compute_operand_table.as_mut().ok_or(EIO)?
+            .with_bytes_mut(|bytes| {
+                if encode_g17p_compute_flist_runs(bytes) { Ok(()) } else { Err(EINVAL) }
+            })?;
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        self.flist_backing_owner = G17PFListBackingOwner::Compute;
+        self.resources.compute_flist_initialized = true;
         Ok(())
+    }
+
+    /// Cache only driver-owned compute aliases on first use by this VM. The
+    /// disjoint aperture allows render aliases (including TVB) to stay mapped.
+    pub(crate) fn cache_compute_vm_mappings(&mut self, vm: &mmu::Vm) -> Result {
+        self.stage_compute_flist_state()?;
+        let pool_id = self.resources.compute_flist_pool_id;
+        if vm.compute_pool_mappings_match(pool_id) {
+            return Ok(());
+        }
+        vm.clear_compute_pool_mappings();
+        let mut mappings = KVec::with_capacity(24, GFP_KERNEL)?;
+        mappings.push(self.resources.compute_operand_page_lists.as_mut().ok_or(EIO)?
+            .map_at(vm, g17_initdata::COMPUTE_FLIST_PAGE_LIST_ADDRESS,
+                mmu::PROT_GPU_SHARED_RW)?, GFP_KERNEL)?;
+        mappings.push(self.resources.compute_operand_table.as_mut().ok_or(EIO)?
+            .map_at(vm, g17_initdata::COMPUTE_FLIST_RUN_TABLE_ADDRESS,
+                mmu::PROT_GPU_SHARED_RW)?, GFP_KERNEL)?;
+        for (index, buffer) in self.resources.compute_operand_buffers.iter_mut().take(22).enumerate() {
+            mappings.push(buffer.map_at(vm, g17p_compute_operand_buffer_va(index).ok_or(EINVAL)?,
+                mmu::PROT_GPU_SHARED_RW)?, GFP_KERNEL)?;
+        }
+        vm.install_compute_pool_mappings(pool_id, mappings)
     }
 
     /// Install every hardware-fixed low alias before the VM is exposed to
@@ -13640,9 +13685,6 @@ impl G17ResourceOwner {
                 map_bootstrap_vdm_at(&self.dev, vm)?,
                 GFP_KERNEL,
             )?;
-        }
-        if !bootstrap_vdm && !self.render_flist_owned() {
-            self.stage_compute_flist_state()?;
         }
         let table_mapping = match self.resources.control_operand_table.map_at(
             vm,

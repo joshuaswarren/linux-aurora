@@ -9,7 +9,7 @@ def method(marker):
     while d:
         d+=(s[e]=='{')-(s[e]=='}');e+=1
     return s[a:e]
-methods='\n'.join(method(m) for m in ['pub(crate) fn retained_render_has_other_owner(', 'pub(crate) fn handoff_retained_render_vm('])
+methods='\n'.join(method(m) for m in ['pub(crate) fn retained_render_has_other_owner(', 'pub(crate) fn handoff_retained_render_vm(', 'fn require_retired_render_owner(', 'pub(crate) fn release_retired_render_context('])
 source=r'''
 #![allow(dead_code,unused_variables)]
 use std::cell::RefCell;
@@ -125,6 +125,23 @@ source+=r'''
   assert_eq!(m.handoff_retained_render_vm(&Vm{id:2}),Err(EBUSY));
   assert!(m.resources.0.borrow().events.is_empty());assert_eq!(m.resources.0.borrow().root,0x10000);
  }
+}
+#[test]fn render_compute_render_retains_cache_and_queue_ordinal(){
+ let mut m=Manager::new();let ordinal=m.render_submission_ordinal;
+ m.release_retired_render_context().unwrap();
+ assert!(m.render_bind.is_none());assert!(m.render_context_aliases.is_none());
+ assert_eq!(m.resources.0.borrow().refs,0);
+ assert!(m.resources.0.borrow().cache.contains(&1));
+ let compute=m.resources.bind(&Vm{id:2}).unwrap();
+ assert_eq!(compute.root(),0x20000);drop(compute);
+ m.handoff_retained_render_vm(&Vm{id:1}).unwrap();m.expect_owner(1);
+ assert_eq!(m.render_submission_ordinal,ordinal);
+ assert_eq!(m.resources.0.borrow().events.iter().filter(|x|x.as_str()=="Cache1").count(),0);
+}
+#[test]fn unfinished_render_cannot_release_context_to_compute(){
+ let mut m=Manager::new();m.render_storage.as_mut().unwrap().snapshot.fragment.idle=false;
+ assert_eq!(m.release_retired_render_context(),Err(EBUSY));m.expect_owner(1);
+ assert!(m.resources.0.borrow().events.is_empty());
 }
 '''
 with tempfile.TemporaryDirectory() as d:

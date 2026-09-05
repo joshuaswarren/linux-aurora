@@ -280,6 +280,14 @@ pub(crate) const DEVICE_CONTROL_IDLE_POWER_OFF_ARG_POWER_ON: u32 = 0;
 /// sets the inhibit but the handler's `cbnz w8, 0x5238` then skips the
 /// power-on. Hence the pair: power on, then hold.
 pub(crate) const DEVICE_CONTROL_IDLE_POWER_OFF_ARG_INHIBIT: u32 = 1;
+/// Separate retained compute resources from the render pool. Native
+/// populateInitialFirmwareState (8aa258c) publishes resource-derived +0x14
+/// page-list and +0x30 run-list addresses; neither is firmware-fixed.
+pub(crate) const COMPUTE_FLIST_RELOCATION: u64 = 0x0200_0000;
+pub(crate) const COMPUTE_FLIST_PAGE_LIST_ADDRESS: u64 = 0x70_0000_0000 + COMPUTE_FLIST_RELOCATION;
+pub(crate) const COMPUTE_FLIST_RUN_TABLE_ADDRESS: u64 = CONTROL_OPERAND_TABLE_ADDRESS + COMPUTE_FLIST_RELOCATION;
+pub(crate) const COMPUTE_FLIST_BUFFER_BASE: u64 = CONTROL_OPERAND_BUFFER_BASE + COMPUTE_FLIST_RELOCATION;
+
 pub(crate) const COMPUTE_RUNTIME_CONTROL_RECORDS: usize = 65;
 pub(crate) const COMPUTE_RUNTIME_CONTROL_FINAL_COUNTER: u32 =
     CONTROL_OPENING_PRIMARY_PRODUCER + COMPUTE_RUNTIME_CONTROL_RECORDS as u32;
@@ -287,10 +295,10 @@ pub(crate) const COMPUTE_RUNTIME_CLASS1_RECORD_INDEX: usize = 54;
 pub(crate) const COMPUTE_RUNTIME_CLASS2_RECORD_INDEX: usize = 57;
 pub(crate) const COMPUTE_RUNTIME_SUPPORT_ADDRESS: u64 = 0xffff_fc20_c086_8000;
 pub(crate) const COMPUTE_RUNTIME_STATE_ADDRESS: u64 = 0xffff_fc20_0163_0000;
-pub(crate) const COMPUTE_RUNTIME_CLASS1_TABLE_ADDRESS: u64 = 0x70_01ad_8000;
-pub(crate) const COMPUTE_RUNTIME_PAGE_LIST_ADDRESS: u64 = 0x70_018d_0000;
-pub(crate) const COMPUTE_RUNTIME_ZERO_BUFFER_0_ADDRESS: u64 = 0x70_0000_0000;
-pub(crate) const COMPUTE_RUNTIME_ZERO_BUFFER_1_ADDRESS: u64 = 0x70_0010_8000;
+pub(crate) const COMPUTE_RUNTIME_CLASS1_TABLE_ADDRESS: u64 = 0x70_01ad_8000 + COMPUTE_FLIST_RELOCATION;
+pub(crate) const COMPUTE_RUNTIME_PAGE_LIST_ADDRESS: u64 = 0x70_018d_0000 + COMPUTE_FLIST_RELOCATION;
+pub(crate) const COMPUTE_RUNTIME_ZERO_BUFFER_0_ADDRESS: u64 = 0x70_0000_0000 + COMPUTE_FLIST_RELOCATION;
+pub(crate) const COMPUTE_RUNTIME_ZERO_BUFFER_1_ADDRESS: u64 = 0x70_0010_8000 + COMPUTE_FLIST_RELOCATION;
 pub(crate) const COMPUTE_RUNTIME_SUPPORT_SIZE: usize = 0x4000;
 pub(crate) const COMPUTE_RUNTIME_CLASS1_TABLE_SIZE: usize = 0x4000;
 pub(crate) const COMPUTE_RUNTIME_PAGE_LIST_SIZE: usize = 0xa800;
@@ -503,27 +511,27 @@ pub(crate) const CONTROL_OPERAND_ENTRY_COUNT: usize = 22;
 pub(crate) const CONTROL_OPERAND_ENTRY_STRIDE: usize = 0x40;
 pub(crate) const CONTROL_OPERAND_ENTRY_FLAG: u64 = 1 << 60;
 pub(crate) const COMPUTE_RUNTIME_BUFFER_ADDRESSES: [u64; 21] = [
-    0x70_0022_0000,
-    0x70_0032_8000,
-    0x70_0043_0000,
-    0x70_0053_8000,
-    0x70_0064_0000,
-    0x70_0074_8000,
-    0x70_0085_0000,
-    0x70_0095_8000,
-    0x70_00a6_0000,
-    0x70_00b6_8000,
-    0x70_00c7_0000,
-    0x70_00d7_8000,
-    0x70_00e8_0000,
-    0x70_00f8_8000,
-    0x70_0109_0000,
-    0x70_0119_8000,
-    0x70_012a_0000,
-    0x70_013a_8000,
+    0x70_0022_0000 + COMPUTE_FLIST_RELOCATION,
+    0x70_0032_8000 + COMPUTE_FLIST_RELOCATION,
+    0x70_0043_0000 + COMPUTE_FLIST_RELOCATION,
+    0x70_0053_8000 + COMPUTE_FLIST_RELOCATION,
+    0x70_0064_0000 + COMPUTE_FLIST_RELOCATION,
+    0x70_0074_8000 + COMPUTE_FLIST_RELOCATION,
+    0x70_0085_0000 + COMPUTE_FLIST_RELOCATION,
+    0x70_0095_8000 + COMPUTE_FLIST_RELOCATION,
+    0x70_00a6_0000 + COMPUTE_FLIST_RELOCATION,
+    0x70_00b6_8000 + COMPUTE_FLIST_RELOCATION,
+    0x70_00c7_0000 + COMPUTE_FLIST_RELOCATION,
+    0x70_00d7_8000 + COMPUTE_FLIST_RELOCATION,
+    0x70_00e8_0000 + COMPUTE_FLIST_RELOCATION,
+    0x70_00f8_8000 + COMPUTE_FLIST_RELOCATION,
+    0x70_0109_0000 + COMPUTE_FLIST_RELOCATION,
+    0x70_0119_8000 + COMPUTE_FLIST_RELOCATION,
+    0x70_012a_0000 + COMPUTE_FLIST_RELOCATION,
+    0x70_013a_8000 + COMPUTE_FLIST_RELOCATION,
     COMPUTE_RUNTIME_ZERO_BUFFER_0_ADDRESS,
     COMPUTE_RUNTIME_ZERO_BUFFER_1_ADDRESS,
-    0x70_014b_0000,
+    0x70_014b_0000 + COMPUTE_FLIST_RELOCATION,
 ];
 
 pub(crate) const fn control_opening_producer(role: InstanceRole) -> u32 {
@@ -616,7 +624,7 @@ pub(crate) fn encode_compute_readiness_record(
             1,
             35,
             COMPUTE_READINESS_CLASS1_SUPPORT_ADDRESS,
-            CONTROL_OPERAND_TABLE_ADDRESS,
+            COMPUTE_FLIST_RUN_TABLE_ADDRESS,
             0x440,
             0x20,
             1,
@@ -629,7 +637,7 @@ pub(crate) fn encode_compute_readiness_record(
             3,
             37,
             COMPUTE_READINESS_CLASS3_SUPPORT_ADDRESS,
-            CONTROL_OPERAND_TABLE_ADDRESS,
+            COMPUTE_FLIST_RUN_TABLE_ADDRESS,
             0x5c0,
             0x28,
             2,
@@ -657,11 +665,11 @@ fn encode_compute_readiness_support(
     put_u32(out, 0x00, class);
     put_u32(out, 0x08, active);
     put_u32(out, 0x10, class);
-    put_u32(out, 0x14, 0);
-    put_u64(out, 0x18, 0x0004_0000_0000_0070);
+    put_u64(out, 0x14, COMPUTE_FLIST_PAGE_LIST_ADDRESS);
+    put_u32(out, 0x1c, 0x4_0000);
     put_u64(out, 0x20, resource_class << 40);
     put_u64(out, 0x28, resource_class << 40);
-    put_u64(out, 0x30, CONTROL_OPERAND_TABLE_ADDRESS);
+    put_u64(out, 0x30, COMPUTE_FLIST_RUN_TABLE_ADDRESS);
     put_u32(out, 0x40, 4);
     put_u32(out, 0x48, cursor);
     put_u64(out, 0x4c, state);
@@ -731,7 +739,7 @@ pub(crate) fn encode_compute_readiness_operand_table(
     }
     out.fill(0);
     for index in 0..COMPUTE_READINESS_OPERAND_ENTRY_COUNT {
-        let address = CONTROL_OPERAND_BUFFER_BASE
+        let address = COMPUTE_FLIST_BUFFER_BASE
             .checked_add(index as u64 * CONTROL_OPERAND_BUFFER_STRIDE)
             .ok_or(InitdataError::AddressOutOfRange)?;
         put_u64(
@@ -837,7 +845,7 @@ pub(crate) fn encode_compute_runtime_control_record(
             2,
             56,
             COMPUTE_RUNTIME_SUPPORT_ADDRESS,
-            CONTROL_OPERAND_TABLE_ADDRESS,
+            COMPUTE_FLIST_RUN_TABLE_ADDRESS,
             0x5c0,
             0x28,
             0,
@@ -863,8 +871,8 @@ fn encode_compute_runtime_support(
     out.fill(0);
     put_u32(out, 0x00, control_class);
     put_u32(out, 0x10, control_class);
-    put_u32(out, 0x14, low_buffer as u32);
-    put_u64(out, 0x18, 0x0004_0000_0000_0070);
+    put_u64(out, 0x14, low_buffer);
+    put_u32(out, 0x1c, 0x4_0000);
     let resource = resource_class << 40;
     put_u64(out, 0x20, resource);
     put_u64(out, 0x28, resource);
@@ -893,7 +901,7 @@ pub(crate) fn encode_compute_runtime_class1_support(
 pub(crate) fn encode_compute_runtime_class2_support(
     out: &mut [u8],
 ) -> Result<(), InitdataError> {
-    encode_compute_runtime_support(out, 2, 0, CONTROL_OPERAND_TABLE_ADDRESS, 0x17, 0xb8, 3)
+    encode_compute_runtime_support(out, 2, COMPUTE_FLIST_PAGE_LIST_ADDRESS, COMPUTE_FLIST_RUN_TABLE_ADDRESS, 0x17, 0xb8, 3)
 }
 
 pub(crate) fn encode_compute_runtime_class1_table(
@@ -1059,12 +1067,13 @@ pub(crate) fn encode_compute_partial_opening_control_shared(
         (0x18, 0x0004_0000_0000_0070),
         (0x20, 0x0000_1900_0000_0000),
         (0x28, 0x0000_1900_0000_0000),
-        (0x30, CONTROL_OPERAND_TABLE_ADDRESS),
+        (0x30, COMPUTE_FLIST_RUN_TABLE_ADDRESS),
         (0x40, 0x0000_0000_0000_0004),
         (0x60, 0x0000_0000_0000_0003),
     ] {
         put_u64(out, offset, value);
     }
+    put_u64(out, 0x14, COMPUTE_FLIST_PAGE_LIST_ADDRESS);
     put_u32(
         out,
         CONTROL_SHARED_CURSOR_OFFSET,
@@ -1118,7 +1127,7 @@ pub(crate) fn encode_control_operand_table(out: &mut [u8]) -> Result<(), Initdat
     }
     out.fill(0);
     for index in 0..CONTROL_OPERAND_ENTRY_COUNT {
-        let address = CONTROL_OPERAND_BUFFER_BASE
+        let address = COMPUTE_FLIST_BUFFER_BASE
             .checked_add(index as u64 * CONTROL_OPERAND_BUFFER_STRIDE)
             .ok_or(InitdataError::AddressOutOfRange)?;
         put_u64(
@@ -1262,7 +1271,7 @@ pub(crate) const G17P_KSM_COMPLETION_ENTRY_SIZE: u32 = 0x40;
 pub(crate) const G17P_KSM_COMPLETION_BACKING_SIZE: usize =
     G17P_KSM_COMPLETION_CAPACITY as usize * G17P_KSM_COMPLETION_ENTRY_SIZE as usize;
 pub(crate) const G17P_KSM_COMPLETION_LOW_VAS: [u64; 2] =
-    [0x70_0184_8000, 0x70_0187_0000];
+    [0x70_03f0_0000, 0x70_03f2_8000];
 pub(crate) const G17P_KSM_COMPLETION_HIGH_BUNDLE_OFFSETS: [usize; 2] = [0x48000, 0x70000];
 const G17P_KSM_COMPLETION_TABLE_PREFIX_OFFSET: usize = 0x2610;
 const G17P_KSM_COMPLETION_TABLE_PREFIX: u32 = 0x100;
@@ -2847,6 +2856,64 @@ mod tests {
 
     const KERN: u64 = 0xffff_fc20_0000_0000;
 
+
+    fn native_compute_bytes(bytes: &[u8]) -> Vec<u8> {
+        let mut native = bytes.to_vec();
+        for offset in 0..bytes.len().saturating_sub(7) {
+            let value = get_u64(bytes, offset);
+            let address = value & !CONTROL_OPERAND_ENTRY_FLAG;
+            if (0x70_0200_0000..0x70_03ef_8000).contains(&address) {
+                put_u64(&mut native, offset, value - COMPUTE_FLIST_RELOCATION);
+            }
+        }
+        native
+    }
+    #[test]
+    fn compute_aperture_ranges_do_not_overlap_each_other_or_render() {
+        let mut ranges = vec![
+            (COMPUTE_FLIST_PAGE_LIST_ADDRESS, 0x20_0000),
+            (COMPUTE_FLIST_RUN_TABLE_ADDRESS, 0x1_0000),
+            (COMPUTE_RUNTIME_PAGE_LIST_ADDRESS, 0xc000),
+            (COMPUTE_RUNTIME_CLASS1_TABLE_ADDRESS, 0x4000),
+        ];
+        for i in 0..CONTROL_OPERAND_ENTRY_COUNT {
+            ranges.push((COMPUTE_FLIST_BUFFER_BASE + i as u64 * CONTROL_OPERAND_BUFFER_STRIDE,
+                         CONTROL_OPERAND_BUFFER_SIZE));
+        }
+        for base in G17P_KSM_COMPLETION_LOW_VAS {
+            ranges.push((base, G17P_KSM_COMPLETION_BACKING_SIZE as u64));
+        }
+        // Native mature kernel-low ZERO0/ZERO1 intentionally alias that
+        // mode's main backing, whereas ordinary client mappings retain its
+        // separate page-list. They are not additional overlapping mappings.
+        assert_eq!(COMPUTE_RUNTIME_ZERO_BUFFER_0_ADDRESS, COMPUTE_FLIST_PAGE_LIST_ADDRESS);
+        assert_eq!(COMPUTE_RUNTIME_ZERO_BUFFER_1_ADDRESS, COMPUTE_FLIST_PAGE_LIST_ADDRESS + 0x10_8000);
+        for (i, &(base, size)) in ranges.iter().enumerate() {
+            assert_eq!(base & 0x3fff, 0);
+            assert!(base >= 0x70_0200_0000 && base + size <= 0x70_0400_0000);
+            for &(other, other_size) in ranges.iter().skip(i + 1) {
+                assert!(base + size <= other || other + other_size <= base,
+                        "overlap: {base:#x}+{size:#x} with {other:#x}+{other_size:#x}");
+            }
+        }
+        assert_eq!(CONTROL_OPERAND_TABLE_ADDRESS, 0x70_0020_8000);
+        assert_eq!(CONTROL_OPERAND_BUFFER_BASE, 0x70_0022_0000);
+    }
+
+    #[test]
+    fn compute_support_uses_full_unaligned_page_pointer() {
+        for encode in [encode_compute_readiness_class1_support,
+                       encode_compute_readiness_class3_support,
+                       encode_compute_runtime_class2_support,
+                       encode_compute_partial_opening_control_shared] {
+            let mut bytes = vec![0xa5; 0x4000];
+            encode(&mut bytes).unwrap();
+            assert_eq!(get_u64(&bytes, 0x14), 0x70_0200_0000);
+            assert_eq!(get_u32(&bytes, 0x1c), 0x4_0000);
+            assert_eq!(get_u64(&bytes, 0x30), 0x70_0220_8000);
+        }
+    }
+
     fn shared() -> SharedAddresses {
         SharedAddresses {
             region_a: KERN + 0x1b_8000,
@@ -3176,7 +3243,7 @@ mod tests {
             .unwrap();
         }
         assert_eq!(tail.len(), 65 * 0x40);
-        assert_eq!(fnv1a64(&tail), 0x544f_a4b7_bc23_e65a);
+        assert_eq!(fnv1a64(&native_compute_bytes(&tail)), 0x544f_a4b7_bc23_e65a);
         assert_eq!(COMPUTE_RUNTIME_CONTROL_FINAL_COUNTER, 66);
 
         for (index, sequence) in [(0, 0), (53, 53), (55, 54), (56, 55), (58, 56), (64, 62)] {
@@ -3198,7 +3265,7 @@ mod tests {
                 COMPUTE_RUNTIME_CLASS2_RECORD_INDEX,
                 2,
                 56,
-                CONTROL_OPERAND_TABLE_ADDRESS,
+                COMPUTE_FLIST_RUN_TABLE_ADDRESS,
                 0x5c0,
                 0x28,
             ),
@@ -3313,8 +3380,8 @@ mod tests {
             assert_eq!(get_u32(record, 0x08), 0x3f);
             assert_eq!(get_u32(record, 0x0c), sequence);
             assert_eq!(get_u64(record, 0x14), support);
-            assert_eq!(get_u64(record, 0x1c), CONTROL_OPERAND_TABLE_ADDRESS);
-            assert_eq!(get_u64(record, 0x24), CONTROL_OPERAND_TABLE_ADDRESS + slot);
+            assert_eq!(get_u64(record, 0x1c), COMPUTE_FLIST_RUN_TABLE_ADDRESS);
+            assert_eq!(get_u64(record, 0x24), COMPUTE_FLIST_RUN_TABLE_ADDRESS + slot);
             assert_eq!(get_u32(record, 0x2c), count);
             assert_eq!(get_u32(record, 0x30), context);
             assert_eq!(get_u32(record, 0x34), 1);
@@ -3349,10 +3416,11 @@ mod tests {
             put_u32(&mut expected, 0x00, class);
             put_u32(&mut expected, 0x08, active);
             put_u32(&mut expected, 0x10, class);
-            put_u64(&mut expected, 0x18, 0x0004_0000_0000_0070);
+            put_u64(&mut expected, 0x14, COMPUTE_FLIST_PAGE_LIST_ADDRESS);
+            put_u32(&mut expected, 0x1c, 0x4_0000);
             put_u64(&mut expected, 0x20, resource_class << 40);
             put_u64(&mut expected, 0x28, resource_class << 40);
-            put_u64(&mut expected, 0x30, CONTROL_OPERAND_TABLE_ADDRESS);
+            put_u64(&mut expected, 0x30, COMPUTE_FLIST_RUN_TABLE_ADDRESS);
             put_u32(&mut expected, 0x40, 4);
             put_u32(&mut expected, 0x48, cursor);
             put_u64(&mut expected, 0x4c, state);
@@ -3405,7 +3473,7 @@ mod tests {
         for index in 0..COMPUTE_READINESS_OPERAND_ENTRY_COUNT {
             assert_eq!(
                 get_u64(&operand_table, index * CONTROL_OPERAND_ENTRY_STRIDE),
-                (CONTROL_OPERAND_BUFFER_BASE
+                (COMPUTE_FLIST_BUFFER_BASE
                     + index as u64 * CONTROL_OPERAND_BUFFER_STRIDE)
                     | CONTROL_OPERAND_ENTRY_FLAG,
             );
@@ -3426,28 +3494,28 @@ mod tests {
 
         let mut class1 = vec![0; COMPUTE_RUNTIME_SUPPORT_SIZE];
         encode_compute_runtime_class1_support(&mut class1).unwrap();
-        assert_eq!(fnv1a64(&class1), 0xb40b_a63a_16c1_937d);
+        assert_eq!(fnv1a64(&native_compute_bytes(&class1)), 0xb40b_a63a_16c1_937d);
         assert_eq!(get_u32(&class1, 0x00), 1);
-        assert_eq!(get_u32(&class1, 0x14), 0x018d_0000);
+        assert_eq!(get_u64(&class1, 0x14), COMPUTE_RUNTIME_PAGE_LIST_ADDRESS);
         assert_eq!(get_u64(&class1, 0x30), COMPUTE_RUNTIME_CLASS1_TABLE_ADDRESS);
         assert_eq!(get_u64(&class1, 0x4c), COMPUTE_RUNTIME_STATE_ADDRESS);
 
         let mut class2 = vec![0; COMPUTE_RUNTIME_SUPPORT_SIZE];
         encode_compute_runtime_class2_support(&mut class2).unwrap();
-        assert_eq!(fnv1a64(&class2), 0xdd12_cbe2_2d7c_3d50);
+        assert_eq!(fnv1a64(&native_compute_bytes(&class2)), 0xdd12_cbe2_2d7c_3d50);
         assert_eq!(get_u32(&class2, 0x00), 2);
-        assert_eq!(get_u64(&class2, 0x30), CONTROL_OPERAND_TABLE_ADDRESS);
+        assert_eq!(get_u64(&class2, 0x30), COMPUTE_FLIST_RUN_TABLE_ADDRESS);
 
         let mut table = vec![0; COMPUTE_RUNTIME_CLASS1_TABLE_SIZE];
         encode_compute_runtime_class1_table(&mut table).unwrap();
-        assert_eq!(fnv1a64(&table), 0xc820_66ed_9e50_6c41);
+        assert_eq!(fnv1a64(&native_compute_bytes(&table)), 0xc820_66ed_9e50_6c41);
         for (index, address) in COMPUTE_RUNTIME_BUFFER_ADDRESSES.into_iter().enumerate() {
             assert_eq!(get_u64(&table, index * 0x40), address | (1 << 60));
         }
 
         let mut inventory = vec![0; COMPUTE_RUNTIME_PAGE_LIST_SIZE];
         encode_compute_runtime_page_inventory(&mut inventory).unwrap();
-        assert_eq!(fnv1a64(&inventory), 0x9f78_e915_163a_cea5);
+        assert_eq!(fnv1a64(&native_compute_bytes(&inventory)), 0x9f78_e915_163a_cea5);
         assert_eq!(get_u64(&inventory, 0), COMPUTE_RUNTIME_BUFFER_ADDRESSES[0]);
         assert_eq!(
             get_u64(&inventory, inventory.len() - 8),
@@ -3506,10 +3574,10 @@ mod tests {
 
         assert_eq!(get_u64(&shared, 0x00), 1);
         assert_eq!(get_u32(&shared, 0x08), u32::MAX);
-        assert_eq!(get_u64(&shared, 0x10), 2);
+        assert_eq!(get_u32(&shared, 0x10), 2);
         assert_eq!(get_u64(&shared, 0x20), 0x0000_1900_0000_0000);
         assert_eq!(get_u64(&shared, 0x28), 0x0000_1900_0000_0000);
-        assert_eq!(get_u64(&shared, 0x30), CONTROL_OPERAND_TABLE_ADDRESS);
+        assert_eq!(get_u64(&shared, 0x30), COMPUTE_FLIST_RUN_TABLE_ADDRESS);
         assert_eq!(
             get_u32(&shared, CONTROL_SHARED_CURSOR_OFFSET),
             COMPUTE_PARTIAL_OPENING_CONTROL_SHARED_CURSOR_BEFORE
@@ -3550,7 +3618,7 @@ mod tests {
         assert_eq!(get_u64(&shared, 0x00), CONTROL_SHARED_INNER_ADDRESS);
         assert_eq!(get_u32(&shared, 0x08), 0);
         assert_eq!(get_u64(&shared, 0x10), 2);
-        assert_eq!(get_u64(&shared, 0x14), COMPUTE_RUNTIME_ZERO_BUFFER_0_ADDRESS);
+        assert_eq!(get_u64(&shared, 0x14), 0x70_0000_0000);
         assert_eq!(get_u64(&shared, 0x30), CONTROL_OPERAND_TABLE_ADDRESS);
         assert_eq!(get_u64(&shared, 0x4c), CONTROL_SHARED_INNER_ADDRESS);
         assert_eq!(get_u64(&shared, 0x60), 3);
@@ -3582,7 +3650,7 @@ mod tests {
             assert_eq!(
                 get_u64(&table, index * CONTROL_OPERAND_ENTRY_STRIDE),
                 CONTROL_OPERAND_ENTRY_FLAG
-                    | (CONTROL_OPERAND_BUFFER_BASE
+                    | (COMPUTE_FLIST_BUFFER_BASE
                         + index as u64 * CONTROL_OPERAND_BUFFER_STRIDE)
             );
         }

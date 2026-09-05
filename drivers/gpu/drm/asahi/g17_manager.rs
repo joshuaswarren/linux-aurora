@@ -2605,13 +2605,9 @@ impl G17PManagerConstruction {
         retained && !same_vm
     }
 
-    /// Switch the one physical render context between independently owned
-    /// client VMs. The installed queues and native PB/TVB identities remain
-    /// retained; only idle context-0 views and context-1 roots change.
-    pub(crate) fn handoff_retained_render_vm(&mut self, vm: &mmu::Vm) -> Result {
-        if self.render_storage.is_none() || !self.retained_render_has_other_owner(vm) {
-            return Ok(());
-        }
+    /// Actual paired completion and FList release authorize root ownership
+    /// changes. T8140's handoff page does not publish a live idle witness.
+    fn require_retired_render_owner(&mut self) -> Result {
         // Handoff.current_slot is a T8140 stand-in, not a firmware idle
         // witness. Use the actual paired retirement and FList acknowledgements.
         if self.render_tracker.is_some() || self.render_hardware_buffer_id.is_some()
@@ -2628,8 +2624,7 @@ impl G17PManagerConstruction {
                 return Err(EBUSY);
             }
         }
-        let storage = self.render_storage.as_mut().ok_or(ENODEV)?;
-        let snapshot = storage.snapshot()?;
+        let snapshot = self.render_storage.as_mut().ok_or(ENODEV)?.snapshot()?;
         if !snapshot.job_list_empty || !snapshot.tiling.idle() || !snapshot.fragment.idle() {
             return Err(EBUSY);
         }
@@ -2638,6 +2633,31 @@ impl G17PManagerConstruction {
         {
             return Err(EBUSY);
         }
+        Ok(())
+    }
+
+    /// Leave the completed physical render queues and all per-VM cached
+    /// mappings installed, but give the bind slot back for a compute client.
+    /// A subsequent render reattaches through the same ownerless transaction
+    /// used after a recoverable mapping failure; no queue ordinal is reset.
+    pub(crate) fn release_retired_render_context(&mut self) -> Result {
+        if self.render_storage.is_none() { return Ok(()); }
+        self.require_retired_render_owner()?;
+        self.render_context_aliases = None;
+        self.render_storage.as_mut().ok_or(ENODEV)?.release_client_context();
+        self.render_bind = None;
+        Ok(())
+    }
+
+    /// Switch the one physical render context between independently owned
+    /// client VMs. The installed queues and native PB/TVB identities remain
+    /// retained; only idle context-0 views and context-1 roots change.
+    pub(crate) fn handoff_retained_render_vm(&mut self, vm: &mmu::Vm) -> Result {
+        if self.render_storage.is_none() || !self.retained_render_has_other_owner(vm) {
+            return Ok(());
+        }
+        self.require_retired_render_owner()?;
+        let storage = self.render_storage.as_mut().ok_or(ENODEV)?;
         // A failed rollback may leave this retired graph temporarily unbound.
         // Keep that state attachable: a later healthy client can retry without
         // resetting firmware or losing the retained queue/pool bookkeeping.
@@ -4829,6 +4849,7 @@ impl G17PManagerConstruction {
         {
             return Err(EINVAL);
         }
+        self.resources.cache_compute_vm_mappings(vm)?;
         let sksm_entries = queue.storage.map_user_entry_alias(vm)?;
         let (completion_ordinal_0, completion_ordinal_2) =
             self.resources.map_user_completion_aliases(vm)?;
