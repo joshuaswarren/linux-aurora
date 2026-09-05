@@ -4,6 +4,7 @@ from pathlib import Path
 import re
 import subprocess
 import tempfile
+from g17_native_channel_test_support import native_channel_helpers
 
 source_dir = Path(__file__).resolve().parent.parent
 source = (source_dir / "g17_resources.rs").read_text()
@@ -43,7 +44,7 @@ body = "\n".join([
     "#![allow(dead_code)]",
     constant,
     constants,
-    "mod g17_submission {" + sizes + "}",
+    "mod g17_submission {" + sizes + native_channel_helpers(submission) + "}",
     "#[derive(Debug, Copy, Clone, PartialEq, Eq)]",
     block(r"^struct G17PRenderItemPlan\s*"),
     block(r"^impl G17PRenderItemPlan\s*"),
@@ -55,7 +56,7 @@ body = "\n".join([
     "#[test]",
     block(r"^    fn retained_render_item_copies_preserve_prior_groups_and_firmware_cursors\(\)\s*"),
     "#[test]",
-    block(r"^    fn retained_tiling_phases_publish_absolute_producers\(\)\s*"),
+    block(r"^    fn retained_tiling_phases_publish_modular_producers\(\)\s*"),
 ])
 with tempfile.TemporaryDirectory(prefix="g17-render-item-append-") as temp:
     binary = Path(temp) / "tests"

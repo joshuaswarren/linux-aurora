@@ -1334,6 +1334,35 @@ pub(crate) fn build_cold_opening_fragment_descriptor(
     Ok(())
 }
 
+/// Stage the TA's link to the physical fragment command, not its ring slot.
+///
+/// Native TA submit copies host +0x1528 as a low-40-bit qword at +0x7a8 and
+/// its bits 47:40 as two independent bytes at +0x7b0/+0x7b1 (8a99220..34).
+/// Host +0xe60 supplies the full packed qword at +0x8c6 (8a99414..1c).
+/// Its producer converts the TA channel timestamp, whereas +0x1528 converts
+/// the fragment channel timestamp (8aa9e30..aaa05c). Both carry the 3D channel
+/// payload. Preserve those distinct sources even when queue seeds coincide.
+/// Refresh from the actual retained producer immediately before publication;
+/// the payload counter wraps independently of the physical timestamp.
+pub(crate) fn apply_g17p_ta_linked_completion_scratch(
+    tiling_timestamp: u64,
+    fragment_timestamp: u64,
+    payload: u8,
+    raw: &mut [u8],
+) -> Result<(), RenderBuildError> {
+    if tiling_timestamp > 0xff_ffff_ffff || fragment_timestamp > 0xff_ffff_ffff {
+        return Err(RenderBuildError::ArithmeticOverflow);
+    }
+    if raw.len() < TA_DESCRIPTOR_SIZE {
+        return Err(RenderBuildError::BufferTooSmall);
+    }
+    put_u64(raw, 0x07a8, fragment_timestamp);
+    put_u8(raw, 0x07b0, payload);
+    put_u8(raw, 0x07b1, payload);
+    put_u64(raw, 0x08c6, tiling_timestamp | ((payload as u64) << 40));
+    Ok(())
+}
+
 /// Apply the queue-local fields that change as the canonical three-item group
 /// is refreshed in place. `descriptor_gpu_va` is the low VM address firmware
 /// uses for the descriptor's self pointers.
@@ -1351,7 +1380,9 @@ pub(crate) fn apply_g17p_retained_descriptor_fields(
     let item_number = submission_ordinal
         .checked_add(1)
         .ok_or(RenderBuildError::ArithmeticOverflow)?;
-    if item_number > 0xff {
+    // Tag-14 and the current dependency/event interface carry a 24-bit stamp.
+    // This is a representability limit, not an eight-bit ring-slot lifetime.
+    if item_number > 0x00ff_ffff {
         return Err(RenderBuildError::ArithmeticOverflow);
     }
     match kind {
@@ -1371,9 +1402,12 @@ pub(crate) fn apply_g17p_retained_descriptor_fields(
             // not the type-1 fragment descriptor's distinct QID-0 RCE field.
             put_u32(raw, 0x079c, u32::from(linked_fragment_queue_id));
             put_u32(raw, 0x07a0, item_number << 8);
-            put_u32(raw, 0x07a8, item_number);
-            put_u32(raw, 0x07b0, item_number | (item_number << 8));
-            put_u32(raw, 0x08b4, (item_number << 24) | 0xffff);
+            apply_g17p_ta_linked_completion_scratch(
+                u64::from(item_number), u64::from(item_number), item_number as u8, raw,
+            )?;
+            // Native writes a u32 at +0x8b6 (8a993f4). +0x8b4/+0x8b5
+            // belong to the preceding stamp pointer, not this event value.
+            put_u32(raw, 0x08b6, item_number << 8);
             // B1 indexes the registered scheduler-resource table with this
             // value while admitting the completed TA, then passes the full
             // word to FUN_15424(linked_3d_qid, ta_qid). It is the TA queue's
@@ -1390,7 +1424,6 @@ pub(crate) fn apply_g17p_retained_descriptor_fields(
                     0
                 },
             );
-            put_u32(raw, 0x08c4, item_number << 16);
             // Our priority-0/QID-0 path submits one TA per render. Native
             // QID 0 keeps this stamp-info force flag set for stamps 0x100,
             // 0x200 and 0x300 in all three valid boot captures. FUN_ab64
@@ -1402,8 +1435,9 @@ pub(crate) fn apply_g17p_retained_descriptor_fields(
             if queue_id == 0 && crate::g17_submission::G17P_NATIVE_RENDER_DOORBELL_PRIORITY == 0 {
                 put_u32(raw, 0x08c2, 1);
             }
-            put_u32(raw, 0x08c8, item_number << 24);
-            put_u32(raw, 0x08d4, submission_ordinal << 16);
+            // Native's host +0x1288 source is a u32 at +0x8d6 (8a990b8),
+            // immediately after the qword lifecycle field beginning +0x8ce.
+            put_u32(raw, 0x08d6, submission_ordinal);
             put_u64(raw, 0x0934, runtime_control);
             if cold_opening {
                 // Retain the one-buffer GTP size installed by the cold
