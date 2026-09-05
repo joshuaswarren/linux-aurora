@@ -949,7 +949,8 @@ pub(crate) struct G17PManagerConstruction {
     render_bind: Option<mmu::VmBind>,
     /// Native secure-GART view of the active render process resources in
     /// hardware context 0. It is installed only for the VM which owns the
-    /// retained render graph and released only after both firmware CPUs stop.
+    /// retained render graph. Replaced only after paired completion plus
+    /// FList release, or after both firmware CPUs stop.
     render_context_aliases: Option<mmu::T8140NativeContextAliases>,
     render_submission_ordinal: u32,
     /// Per-command host timestamp shared by the TA and 3D KSM entries. Native
@@ -2602,6 +2603,98 @@ impl G17PManagerConstruction {
             .map_or(true, |aliases| aliases.matches(vm));
         let same_vm = graph_same_vm && aliases_same_vm;
         retained && !same_vm
+    }
+
+    /// Switch the one physical render context between independently owned
+    /// client VMs. The installed queues and native PB/TVB identities remain
+    /// retained; only idle context-0 views and context-1 roots change.
+    pub(crate) fn handoff_retained_render_vm(&mut self, vm: &mmu::Vm) -> Result {
+        if self.render_storage.is_none() || !self.retained_render_has_other_owner(vm) {
+            return Ok(());
+        }
+        // Handoff.current_slot is a T8140 stand-in, not a firmware idle
+        // witness. Use the actual paired retirement and FList acknowledgements.
+        if self.render_tracker.is_some() || self.render_hardware_buffer_id.is_some()
+            || self.render_hardware_buffer_published || self.prepared_render_flist.is_some()
+            || self.render_submission_ordinal == 0
+        {
+            return Err(EBUSY);
+        }
+        if let Some(uma) = self.bootstrap_uma.as_ref() {
+            if uma.state != G17PBootstrapUmaRequestState::Completed
+                || uma.hardware_buffer_owned || uma.hardware_buffer_references != 0
+                || uma.pending_release_count != 0
+            {
+                return Err(EBUSY);
+            }
+        }
+        let storage = self.render_storage.as_mut().ok_or(ENODEV)?;
+        let snapshot = storage.snapshot()?;
+        if !snapshot.job_list_empty || !snapshot.tiling.idle() || !snapshot.fragment.idle() {
+            return Err(EBUSY);
+        }
+        if !self.resources.partial_opening_outer_counters()?.iter()
+            .all(|c| c[0] == c[2] && c[1] == c[2])
+        {
+            return Err(EBUSY);
+        }
+        // A failed rollback may leave this retired graph temporarily unbound.
+        // Keep that state attachable: a later healthy client can retry without
+        // resetting firmware or losing the retained queue/pool bookkeeping.
+        let old_vm = self.render_bind.as_ref().map(|binding| binding.vm().clone());
+        let old_root = self.render_bind.as_ref().map_or(0, |binding| binding.root());
+        // First-use allocation can fail without changing either active root.
+        // The cache owns only driver GEM aliases, never another client's BOs.
+        self.resources.cache_render_vm_mappings(storage, vm)?;
+
+        self.render_context_aliases = None;
+        let aliases = match self.resources.uat().install_t8140_native_context_aliases(vm) {
+            Ok(aliases) => aliases,
+            Err(error) => {
+                // All partial incoming aliases are RAII-owned by the helper.
+                // Restore A's restricted views while its original bind is live.
+                if let Some(old_vm) = old_vm.as_ref() {
+                    self.render_context_aliases = Some(
+                        self.resources.uat().install_t8140_native_context_aliases(old_vm)?);
+                }
+                return Err(error);
+            }
+        };
+        self.render_context_aliases = Some(aliases);
+
+        // App-context5+ holds a second VmBind. Both references must release
+        // before Uat.bind can replace the sole physical user slot (context1).
+        // It publishes the new TTBAT pair, TLBI-ASID1, and mem::sync before
+        // returning; native descriptor and tag15 context selectors stay1.
+        storage.release_client_context();
+        self.render_bind = None;
+        let incoming = self.resources.uat().bind(vm).and_then(|binding| {
+            let context = self.resources.uat().allocate_t8140_app_context(&binding)?;
+            Ok((binding, context))
+        });
+        let (binding, context) = match incoming {
+            Ok(incoming) => incoming,
+            Err(error) => {
+                self.render_context_aliases = None;
+                if let Some(old_vm) = old_vm.as_ref() {
+                    self.render_context_aliases = Some(
+                        self.resources.uat().install_t8140_native_context_aliases(old_vm)?);
+                    let binding = self.resources.uat().bind(old_vm)?;
+                    let context = self.resources.uat().allocate_t8140_app_context(&binding)?;
+                    storage.install_client_context(context);
+                    self.render_bind = Some(binding);
+                }
+                return Err(error);
+            }
+        };
+        let new_root = binding.root();
+        let vm_id = binding.vm_id();
+        storage.install_client_context(context);
+        self.render_bind = Some(binding);
+        dev_info!(self.resources.dev().as_ref(),
+            "G17P render VM handoff: context1 old-root={:#x} new-root={:#x} vm={} ordinal={} queues/PB retained; TLBI complete\n",
+            old_root, new_root, vm_id, self.render_submission_ordinal);
+        Ok(())
     }
 
     pub(crate) fn retained_render_needs_recycle(&self, vm: &mmu::Vm) -> bool {

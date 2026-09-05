@@ -22,8 +22,10 @@ methods = '\n'.join(function(manager, marker) for marker in [
     'pub(crate) fn retained_render_needs_recycle(',
 ])
 check = function(runtime, 'fn check_retained_render_owner(')
-for marker in ['pub(crate) fn submit_translated_render(',
-               'pub(crate) fn submit_translated_compute(']:
+render = function(runtime, 'pub(crate) fn submit_translated_render(')
+assert 'self.check_retained_render_owner(vm)?;' not in render
+assert render.index('handoff_retained_render_vm(vm)?;') < render.index('let recycle =')
+for marker in ['pub(crate) fn submit_translated_compute(']:
     body = function(runtime, marker)
     guard = body.index('self.check_retained_render_owner(vm)?;')
     assert guard < body.index('recover_persistent_runtime(self)?;')
@@ -101,4 +103,4 @@ with tempfile.TemporaryDirectory() as temp:
     subprocess.run(['rustc', '--edition=2021', '--test', str(path), '-o', str(exe)], check=True)
     for test in ['ownership_matrix_', 'rejected_new_vm_', 'missing_manager_']:
         subprocess.run([str(exe), test, '--nocapture'], check=True)
-print('PASS: actual manager/runtime ownership methods and both submission admission orderings')
+print('PASS: actual manager/runtime ownership methods and compute admission ordering; render uses actual VM handoff')

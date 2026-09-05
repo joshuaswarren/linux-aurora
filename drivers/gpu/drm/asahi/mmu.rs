@@ -1098,8 +1098,30 @@ impl Drop for T8140NativeContextAliases {
 struct VmDriverMappings {
     mappings: KVec<KernelMapping>,
     reserved_ranges: KVec<Range<u64>>,
+    render_pool: Option<VmRenderPoolMappings>,
 }
 no_debug!(VmDriverMappings);
+
+/// Cached aliases of one retained render pool in this VM. KernelMapping owns
+/// GpuVm<VmInner>, which has no back-reference to Vm::driver_mappings. Do not
+/// retain a Vm, VmBind or application-context lease here: those own the outer
+/// Vm and would make this cache keep itself alive.
+struct VmRenderPoolMappings {
+    pool_id: u64,
+    mappings: KVec<KernelMapping>,
+}
+no_debug!(VmRenderPoolMappings);
+
+impl VmDriverMappings {
+    fn iter_mappings(&self) -> impl Iterator<Item = &KernelMapping> {
+        Iterator::chain(
+            self.mappings.iter(),
+            self.render_pool
+                .iter()
+                .flat_map(|pool| pool.mappings.iter()),
+        )
+    }
+}
 
 fn any_range_overlaps<I>(target: Range<u64>, mut ranges: I) -> bool
 where
@@ -2047,15 +2069,60 @@ impl Vm {
         *retained = Some(VmDriverMappings {
             mappings,
             reserved_ranges,
+            render_pool: None,
         });
         Ok(())
+    }
+
+    /// Whether this VM already retains aliases of the exact render-pool
+    /// generation. The caller allocates pool IDs monotonically, never from a
+    /// recyclable GPU address, so a new firmware session cannot reuse stale
+    /// aliases merely because its backing landed at the same address.
+    pub(crate) fn render_pool_mappings_match(&self, pool_id: u64) -> bool {
+        pool_id != 0
+            && self.driver_mappings.lock().as_ref().is_some_and(|driver| {
+                driver
+                    .render_pool
+                    .as_ref()
+                    .is_some_and(|pool| pool.pool_id == pool_id)
+            })
+    }
+
+    /// Retain the first-use render aliases and exclude them from user unmaps.
+    /// Installation never replaces a live generation; callers must retire its
+    /// GPU work and explicitly clear it before installing a different pool.
+    pub(crate) fn install_render_pool_mappings(
+        &self,
+        pool_id: u64,
+        mappings: KVec<KernelMapping>,
+    ) -> Result {
+        if pool_id == 0 {
+            return Err(EINVAL);
+        }
+        let mut retained = self.driver_mappings.lock();
+        let driver = Option::as_mut(&mut *retained).ok_or(EINVAL)?;
+        if driver.render_pool.is_some() {
+            return Err(EBUSY);
+        }
+        driver.render_pool = Some(VmRenderPoolMappings { pool_id, mappings });
+        Ok(())
+    }
+
+    /// Release an obsolete pool after its GPU references have retired. Drop
+    /// outside driver_mappings: KernelMapping teardown takes the GPUVM lock.
+    pub(crate) fn clear_render_pool_mappings(&self) {
+        let previous = {
+            let mut retained = self.driver_mappings.lock();
+            Option::as_mut(&mut *retained).and_then(|driver| driver.render_pool.take())
+        };
+        drop(previous);
     }
 
     pub(crate) fn driver_range_overlaps(&self, range: Range<u64>) -> bool {
         self.driver_mappings.lock().as_ref().is_some_and(|driver| {
             any_range_overlaps(
                 range.clone(),
-                driver.mappings.iter().map(KernelMapping::iova_range),
+                driver.iter_mappings().map(KernelMapping::iova_range),
             ) || any_range_overlaps(range, driver.reserved_ranges.iter().cloned())
         })
     }
@@ -2079,7 +2146,7 @@ impl Vm {
             let mut next = user_range.end;
             let mut covering_end = cursor;
             if let Some(driver) = driver {
-                for mapping in driver.mappings.iter() {
+                for mapping in driver.iter_mappings() {
                     let range = mapping.iova_range();
                     if range.contains(&cursor) {
                         covering_end = covering_end.max(range.end);
