@@ -108,7 +108,8 @@ const G17P_MAX_COMPUTE_QUEUES: u32 = 128;
 
 /// Serializes the one hardware compute graph across DRM clients.
 ///
-/// Held for the whole of `submit`, including the doorbell wait -- which runs
+/// Held after input dependencies become ready, through GPU execution and
+/// output-fence publication, including the doorbell wait -- which runs
 /// with the runtime mutex released, so the runtime mutex alone does NOT keep
 /// two clients out of each other's submission. Also taken when a queue object
 /// is destroyed, so a release can never race a submit in flight.
@@ -601,6 +602,15 @@ impl G17PQueue {
             }
         }
         Ok(())
+    }
+
+    fn acquire_ready_lease(
+        &self, submission_id: u64, syncs: &[file::SyncItem],
+    ) -> Result<G17PLeaseGuard> {
+        Self::wait_input_fences(syncs)
+            .map_err(|error| Self::stage_fail(submission_id, "wait-input-fences", error))?;
+        self.registry.acquire_lease(self.id)
+            .map_err(|error| Self::stage_fail(submission_id, "acquire-lease", error))
     }
 
     fn timestamp_address(
@@ -1132,14 +1142,6 @@ impl queue::Queue for G17PQueue {
         if in_sync_count > syncs.len() {
             return Err(Self::stage_fail(submission_id, "sync-count", EINVAL));
         }
-        // One client at a time owns the hardware compute graph. Held across the
-        // whole submit, including the doorbell wait -- that wait runs with the
-        // runtime mutex released, so without this a second client could bind
-        // its own VM into UAT slot 1 while this submission is still in flight.
-        let _lease = self
-            .registry
-            .acquire_lease(self.id)
-            .map_err(|error| Self::stage_fail(submission_id, "acquire-lease", error))?;
         let address_space = UserAddressSpace {
             vm: &self.vm,
             range: self.user_range.clone(),
@@ -1266,8 +1268,11 @@ impl queue::Queue for G17PQueue {
             }
         );
 
-        Self::wait_input_fences(&syncs[..in_sync_count])
-            .map_err(|error| Self::stage_fail(submission_id, "wait-input-fences", error))?;
+        // Dependencies must become ready before reserving the physical
+        // queues: their signalling submission may belong to another client.
+        // The lease then spans timestamp publication, execution/doorbell waits
+        // and output-fence installation, including runtime-mutex release.
+        let _lease = self.acquire_ready_lease(submission_id, &syncs[..in_sync_count])?;
         let output_fence: UserFence<G17PSubmissionFence> = self
             .fence_contexts
             .new_fence(0, G17PSubmissionFence)
