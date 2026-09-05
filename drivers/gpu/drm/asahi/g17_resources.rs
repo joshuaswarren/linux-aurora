@@ -308,6 +308,20 @@ pub(crate) const G17P_RENDER_DESCRIPTOR_STORAGE_SIZE: usize = 0x8000;
 pub(crate) const G17P_RETAINED_RENDER_ORDINALS: u32 = 0x00ff_ffff;
 pub(crate) const G17P_RENDER_QUEUE_GRAPH_SIZE: usize = 0xc000;
 pub(crate) const G17P_RENDER_SUPPORT_SIZE: usize = 0x40000;
+
+/// Full RT/TVB scans are diagnostics, not part of render retirement. Keep
+/// failure/unknown checkpoints and the existing explicit diagnostic request,
+/// but avoid walking the entire retained pool on every successful submission.
+fn g17p_render_target_scan_due(
+    label: &str,
+    diagnostic_requested: bool,
+    status_read_failed: bool,
+) -> bool {
+    diagnostic_requested
+        || status_read_failed
+        || !matches!(label, "pre-doorbell" | "post-completion")
+}
+
 const G17P_PAGE_SIZE: usize = 0x4000;
 const G17P_RENDER_SECONDARY_INDEX: usize = 0x00000;
 const G17P_RENDER_POOL_A_SLOTS: usize = 0x04000;
@@ -6600,6 +6614,7 @@ impl G17PUserRenderStorage {
             }
             Ok(())
         });
+        let status_read_failed = ta_read.is_err() || fragment_read.is_err();
         match (ta_read, fragment_read) {
             (Ok(()), Ok(())) => {
                 dev_info!(
@@ -6622,11 +6637,17 @@ impl G17PUserRenderStorage {
                 fragment_error,
             ),
         }
-        self.log_render_target_state(dev, label);
+        if g17p_render_target_scan_due(
+            label,
+            *crate::module_parameters::g17p_dep_records.value() != 0,
+            status_read_failed,
+        ) {
+            self.log_render_target_state(dev, label);
+        }
     }
 
-    /// Dump the fixed-function render targets at every existing render
-    /// checkpoint.  These are the exact objects TA produces and 3D/dIPP
+    /// Dump the fixed-function render targets for diagnostic checkpoints.
+    /// These are the exact objects TA produces and 3D/dIPP
     /// consumes, so a one-boot failure can distinguish an untouched RT graph
     /// from a fragment-side decode failure without another instrumentation
     /// rebuild.
