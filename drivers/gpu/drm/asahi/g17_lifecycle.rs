@@ -173,15 +173,15 @@ pub(crate) fn recover_persistent_runtime<T: PersistentRuntimeRecovery>(
 }
 
 /// Decide whether the next render must start a fresh firmware session.
-/// Ordinal 255 is representable; 256 is the first value outside the retained
-/// optional-record ABI. A VM change also needs a cold session because the
-/// retained graph belongs to its original VM.
+/// Physical 256-slot SKSM/outer rings wrap without a session restart. The
+/// current event writer admits 24-bit stamps; retain that real width bound.
+/// A VM change still requires a cold session because the graph has an owner.
 pub(crate) const fn retained_render_requires_recycle(
     retained_graph: bool,
     same_vm: bool,
     next_ordinal: u32,
 ) -> bool {
-    retained_graph && (!same_vm || next_ordinal > u8::MAX as u32)
+    retained_graph && (!same_vm || next_ordinal >= 0x00ff_ffff)
 }
 
 /// Operations needed to dismantle a retained G17P runtime.
@@ -870,8 +870,12 @@ mod tests {
     }
 
     #[test]
-    fn ordinal_255_rebuilds_the_session_before_the_following_submit() {
-        let mut next_ordinal = 255;
+    fn physical_ring_wraps_do_not_rebuild_the_retained_session() {
+        for ordinal in [255, 256, 257, 426, 427, 999, 1000, 0x00ff_fffe] {
+            assert!(!retained_render_requires_recycle(true, true, ordinal));
+            assert!(retained_render_requires_recycle(true, false, ordinal));
+        }
+        let mut next_ordinal = 0x00ff_fffe;
         assert!(!retained_render_requires_recycle(true, true, next_ordinal));
         next_ordinal += 1;
         assert!(retained_render_requires_recycle(true, true, next_ordinal));

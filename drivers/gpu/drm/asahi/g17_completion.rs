@@ -444,6 +444,8 @@ pub(crate) enum CompletionDecodeError {
     QueueCounterOrder,
     QueueCounterRegression,
     PublishedPrefixBeyondWrite,
+    RenderWindow,
+    RenderCursorOutsideWindow,
     CompletionIrqSource,
     CompletionOrdinal,
     CompletionNotificationCount,
@@ -1350,9 +1352,140 @@ pub(crate) fn observe_paired_render_completion(
     })
 }
 
+/// One serialized render group's bounded window in the native modular ring.
+/// Anchor once at the previously idle producer, never at a new poll's cursor:
+/// otherwise a backward or stale observation could masquerade as a wrap.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct RenderQueueWindow {
+    base: u32,
+    count: u32,
+    capacity: u32,
+}
+
+impl RenderQueueWindow {
+    pub(crate) fn new(base: u32, count: u32, capacity: u32)
+        -> Result<Self, CompletionDecodeError>
+    {
+        if base >= capacity || !matches!(count, 3 | 4) || count >= capacity {
+            return Err(CompletionDecodeError::RenderWindow);
+        }
+        Ok(Self { base, count, capacity })
+    }
+
+    pub(crate) fn target(self) -> u32 {
+        ((u64::from(self.base) + u64::from(self.count)) % u64::from(self.capacity)) as u32
+    }
+
+    fn normalize(self, indices: QueueIndices) -> Result<QueueIndices, CompletionDecodeError> {
+        let distance = |value: u32| {
+            if value >= self.capacity {
+                return Err(CompletionDecodeError::RenderCursorOutsideWindow);
+            }
+            let distance = ((u64::from(value) + u64::from(self.capacity)
+                - u64::from(self.base)) % u64::from(self.capacity)) as u32;
+            if distance > self.count {
+                return Err(CompletionDecodeError::RenderCursorOutsideWindow);
+            }
+            Ok(distance)
+        };
+        Ok(QueueIndices {
+            done: distance(indices.done)?,
+            read: distance(indices.read)?,
+            write: distance(indices.write)?,
+        })
+    }
+}
+
+/// Render-only normalization: the generic observer and proven compute path
+/// retain their strict linear semantics. Reports retain raw native cursors.
+pub(crate) fn observe_paired_render_window(
+    window: RenderQueueWindow,
+    tiling_previous: QueueIndices,
+    tiling_current: QueueIndices,
+    fragment_previous: QueueIndices,
+    fragment_current: QueueIndices,
+    execution: RenderExecutionState,
+) -> Result<PairedRenderCompletion, CompletionDecodeError> {
+    let mut result = observe_paired_render_completion(
+        window.normalize(tiling_previous)?, window.normalize(tiling_current)?, window.count,
+        window.normalize(fragment_previous)?, window.normalize(fragment_current)?, window.count,
+        execution,
+    )?;
+    result.tiling.indices = tiling_current;
+    result.fragment.indices = fragment_current;
+    result.tiling.published_prefix = window.target();
+    result.fragment.published_prefix = window.target();
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn render_window_wrap_preserves_raw_report_and_execution_gates() {
+        let window = RenderQueueWindow::new(1278, 3, 1280).unwrap();
+        let previous = QueueIndices { done: 1278, read: 1278, write: 0 };
+        let current = QueueIndices { done: 1, read: 1, write: 1 };
+        let execution = RenderExecutionState {
+            job_list_empty: true, tiling_timestamps: [1, 2], fragment_timestamps: [1, 2],
+        };
+        assert_eq!(window.target(), 1);
+        let complete = observe_paired_render_window(
+            window, previous, current, previous, current, execution,
+        ).unwrap();
+        assert!(complete.complete && complete.idle);
+        assert_eq!(complete.tiling.indices, current);
+        assert_eq!(complete.fragment.published_prefix, 1);
+        for pending in [
+            RenderExecutionState { job_list_empty: false, ..execution },
+            RenderExecutionState { fragment_timestamps: [1, 0], ..execution },
+        ] {
+            assert!(!observe_paired_render_window(
+                window, previous, current, previous, current, pending,
+            ).unwrap().complete);
+        }
+        assert!(observe_compute_completion(previous, current, 1).is_err());
+    }
+
+    #[test]
+    fn render_window_rejects_stale_backward_and_out_of_window_cursors() {
+        let window = RenderQueueWindow::new(1278, 3, 1280).unwrap();
+        let previous = QueueIndices { done: 0, read: 0, write: 1 };
+        let execution = RenderExecutionState {
+            job_list_empty: true, tiling_timestamps: [1, 2], fragment_timestamps: [1, 2],
+        };
+        for done in [1277, 1279, 2, 1280, u32::MAX] {
+            let current = QueueIndices { done, read: 1, write: 1 };
+            assert!(observe_paired_render_window(
+                window, previous, current, previous, current, execution,
+            ).is_err(), "invalid done={done}");
+        }
+        for (base, count, capacity) in [(0, 3, 0), (0, 3, 3), (1280, 3, 1280),
+                                       (0, 2, 1280), (0, 5, 1280)] {
+            assert!(RenderQueueWindow::new(base, count, capacity).is_err());
+        }
+    }
+
+    #[test]
+    fn render_window_thousand_groups_for_both_native_profiles() {
+        let execution = RenderExecutionState {
+            job_list_empty: true, tiling_timestamps: [1, 2], fragment_timestamps: [1, 2],
+        };
+        for count in [3, 4] {
+            for ordinal in 0..1000 {
+                let base = ordinal * count % 1280;
+                let window = RenderQueueWindow::new(base, count, 1280).unwrap();
+                let start = QueueIndices { done: base, read: base, write: window.target() };
+                let done = QueueIndices {
+                    done: window.target(), read: window.target(), write: window.target(),
+                };
+                assert!(observe_paired_render_window(
+                    window, start, done, start, done, execution,
+                ).unwrap().complete);
+            }
+        }
+    }
 
     #[test]
     fn halted_gmmu_gate_requires_current_nonhost_reason3_report() {

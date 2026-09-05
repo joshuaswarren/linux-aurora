@@ -1705,7 +1705,10 @@ pub(crate) fn apply_g17p_retained_optional(
     context_id: u16,
     out: &mut [u8],
 ) -> Result<(), SubmissionError> {
-    if submission_ordinal > 0xff {
+    // The announced event stamp is ordinal + 1 on this serialized path and
+    // still has a 24-bit interface. Payload bytes are allowed to wrap; the
+    // retained owner generation below must not truncate with them.
+    if submission_ordinal >= 0x00ff_ffff {
         return Err(SubmissionError::PartialOpeningQueueHeadOutOfRange);
     }
     apply_g17p_cold_opening_optional(
@@ -1758,7 +1761,9 @@ pub(crate) fn apply_g17p_retained_optional(
     // shared helper below: changing this generation between registration and
     // the tag-15 kick makes B1 release and re-register the just-published USC
     // allocation before fragment engine service.
-    put_u16_le(out, 0x3e, g17p_render_flist_generation(submission_ordinal));
+    // The kext uses a qword store at 8a98c48; +0x46 begins the independent
+    // hardware-buffer ID and must remain untouched by this generation.
+    put_u64_le(out, 0x3e, g17p_render_flist_generation(submission_ordinal));
     // Keep the selected profile's HardwareBufferID identical in ConfigUpdate,
     // the QID-indexed QoS row, and the KSM dependency-control qword.
     put_u16_le(
@@ -1776,8 +1781,8 @@ pub(crate) fn apply_g17p_retained_optional(
 /// Host-owned equivalent of AGXUSCPrivMemFList +0xb0 for a retained render
 /// queue. Valid native cold records start at zero; each later retained restage
 /// advances the same generation once.
-pub(crate) const fn g17p_render_flist_generation(submission_ordinal: u32) -> u16 {
-    submission_ordinal as u16
+pub(crate) const fn g17p_render_flist_generation(submission_ordinal: u32) -> u64 {
+    submission_ordinal as u64
 }
 
 /// Refresh the canonical event record while retaining its physical address.

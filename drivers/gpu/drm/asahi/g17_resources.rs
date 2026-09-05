@@ -303,8 +303,9 @@ pub(crate) const G17P_COMPUTE_OPERAND_STATE_SIZE: usize = 0x14000;
 pub(crate) const G17P_COMPUTE_SUPPORT_SIZE: usize = 0xc000;
 pub(crate) const G17P_COMPUTE_QUEUE_GRAPH_SIZE: usize = g17_compute::COMPUTE_QUEUE_GRAPH_SIZE;
 pub(crate) const G17P_RENDER_DESCRIPTOR_STORAGE_SIZE: usize = 0x8000;
-/// Number of retained ordinals representable by the optional-record ABI.
-pub(crate) const G17P_RETAINED_RENDER_ORDINALS: u32 = 0x100;
+/// Exclusive ordinal bound of the current 24-bit event-stamp path. Physical
+/// ring slots and payload bytes wrap independently; they do not limit this.
+pub(crate) const G17P_RETAINED_RENDER_ORDINALS: u32 = 0x00ff_ffff;
 pub(crate) const G17P_RENDER_QUEUE_GRAPH_SIZE: usize = 0xc000;
 pub(crate) const G17P_RENDER_SUPPORT_SIZE: usize = 0x40000;
 const G17P_PAGE_SIZE: usize = 0x4000;
@@ -2869,16 +2870,16 @@ fn decode_g17p_render_config_update(raw: &[u8]) -> Option<G17PRenderConfigUpdate
     })
 }
 
-/// One append-only group in the retained queue's advertised 0x500-item ring.
-/// Native QIDs 0/1 advance 0->3->6->9, retaining the same queue and ring.
-/// The existing 256-submission session bound fits even four-item groups, so
-/// this path never needs to rewind firmware-owned cursors or wrap a live ring.
+/// One serialized group in the retained queue's advertised 0x500-item ring.
+/// Kext 89f5a98 advances modulo capacity and leaves one slot empty. Reserve
+/// the complete group before publication, including an end-of-ring straddle.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 struct G17PRenderItemPlan {
     base: u32,
     count: u32,
     prefix_end: u32,
     final_end: u32,
+    capacity: u32,
 }
 
 impl G17PRenderItemPlan {
@@ -2893,12 +2894,23 @@ impl G17PRenderItemPlan {
             return None;
         }
         let count = if tag16 { 4u32 } else { 3u32 };
-        let base = ordinal.checked_mul(count)?;
-        let final_end = base.checked_add(count)?;
-        if final_end > capacity {
+        if capacity <= count {
             return None;
         }
-        Some(Self { base, count, prefix_end: base.checked_add(2)?, final_end })
+        let base = (u64::from(ordinal) * u64::from(count) % u64::from(capacity)) as u32;
+        let mut producer = base;
+        let mut prefix_end = base;
+        for item in 0..count {
+            let next = g17_submission::prepare_g17p_channel_write(
+                g17_submission::G17ChannelAbiTarget::A18ProG17P,
+                producer, base, capacity,
+            ).ok()?;
+            producer = next.next_producer;
+            if item == 1 {
+                prefix_end = producer;
+            }
+        }
+        Some(Self { base, count, prefix_end, final_end: producer, capacity })
     }
 
     /// Copy only this group's requested item pointers. Check the complete
@@ -2915,10 +2927,17 @@ impl G17PRenderItemPlan {
         {
             return None;
         }
-        let offset = usize::try_from(self.base.checked_add(first_item)?).ok()?.checked_mul(8)?;
-        let start = ring_offset.checked_add(offset)?;
-        let end = start.checked_add(items.len())?;
-        graph.get_mut(start..end)?.copy_from_slice(items);
+        let ring_len = usize::try_from(self.capacity).ok()?.checked_mul(8)?;
+        let ring_end = ring_offset.checked_add(ring_len)?;
+        // Validate the whole advertised ring before either copy. A bad range
+        // cannot leave half a wrapped group behind.
+        let ring = graph.get_mut(ring_offset..ring_end)?;
+        let slot = ((u64::from(self.base) + u64::from(first_item))
+            % u64::from(self.capacity)) as usize;
+        let start = slot.checked_mul(8)?;
+        let first_len = items.len().min(ring_len.checked_sub(start)?);
+        ring[start..start + first_len].copy_from_slice(&items[..first_len]);
+        ring[..items.len() - first_len].copy_from_slice(&items[first_len..]);
         Some(())
     }
 }
@@ -4765,11 +4784,20 @@ pub(crate) fn g17p_render_native_fragment_hwpb_enabled() -> bool {
     g17p_render_native_fragment_hwpb_mode() != 0
 }
 
-/// Absolute inner producer/outer queue-write target for this submission.
+/// Modular inner producer/outer queue-write target for this submission.
 pub(crate) fn g17p_render_published_prefix(submission_ordinal: u32) -> Result<u32> {
     G17PRenderItemPlan::new(submission_ordinal, g17p_render_tag16_enabled())
         .map(|items| items.final_end)
         .ok_or(EINVAL)
+}
+
+pub(crate) fn g17p_render_completion_window(
+    submission_ordinal: u32,
+) -> Result<g17_completion::RenderQueueWindow> {
+    let items = G17PRenderItemPlan::new(submission_ordinal, g17p_render_tag16_enabled())
+        .ok_or(EINVAL)?;
+    g17_completion::RenderQueueWindow::new(items.base, items.count, items.capacity)
+        .map_err(|_| EINVAL)
 }
 
 fn render_build_fail(site: u32) -> kernel::error::Error {
@@ -6172,6 +6200,15 @@ impl G17PUserRenderStorage {
         if submission_ordinal == 0 || submission_ordinal >= G17P_RETAINED_RENDER_ORDINALS {
             return Err(EINVAL);
         }
+        let plan = G17PRenderItemPlan::new(submission_ordinal, g17p_render_tag16_enabled())
+            .ok_or(EINVAL)?;
+        core::sync::atomic::fence(Ordering::Acquire);
+        let previous = self.snapshot()?;
+        if !previous.job_list_empty || !previous.tiling.idle() || !previous.fragment.idle()
+            || previous.tiling.write != plan.base || previous.fragment.write != plan.base
+        {
+            return Err(EBUSY);
+        }
         let mut next_descriptors = MappedObject::new_wc(
             dev,
             uat,
@@ -7421,6 +7458,7 @@ impl G17PUserRenderStorage {
     /// retained-ring wrap from fabricating the timestamp independently.
     pub(crate) fn stage_fragment_completion_scratch(
         &mut self,
+        tiling_timestamp: u64,
         current_timestamp: u64,
         channel_payload: u8,
     ) -> Result<u64> {
@@ -7430,6 +7468,12 @@ impl G17PUserRenderStorage {
         )
         .map_err(|_| EINVAL)?;
         self.descriptors.with_bytes_mut(|raw| {
+            if raw.len() < 0x8000 {
+                return Err(EINVAL);
+            }
+            g17_render::apply_g17p_ta_linked_completion_scratch(
+                tiling_timestamp, current_timestamp, channel_payload, &mut raw[..0x4000],
+            ).map_err(|_| EINVAL)?;
             let fragment = raw.get_mut(0x4000..0x8000).ok_or(EINVAL)?;
             put_u64(fragment, 0x2160, value);
             core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
@@ -14669,7 +14713,7 @@ mod tests {
         assert_eq!(G17P_COMPUTE_OPERAND_STATE_SIZE, 0x14000);
         assert_eq!(G17P_COMPUTE_SUPPORT_SIZE, 0xc000);
         assert_eq!(G17P_COMPUTE_QUEUE_GRAPH_SIZE, 0x8000);
-        assert_eq!(G17P_RETAINED_RENDER_ORDINALS, 0x100);
+        assert_eq!(G17P_RETAINED_RENDER_ORDINALS, 0x00ff_ffff);
         assert_eq!(g17_initdata::T8140_REGISTER_WINDOWS.len(), 18);
         assert_eq!(g17_initdata::T8140_REGISTER_WINDOWS[0].slot, 0);
         assert_eq!(
@@ -15488,25 +15532,22 @@ mod tests {
     fn retained_render_item_plan_matches_native_append_and_bounds() {
         for tag16 in [false, true] {
             let count = if tag16 { 4 } else { 3 };
-            for ordinal in [0, 1, 2, 255] {
+            for ordinal in 0..1000 {
                 let plan = G17PRenderItemPlan::new(ordinal, tag16).unwrap();
-                assert_eq!(plan.base, ordinal * count);
+                assert_eq!(plan.base, ordinal * count % 1280);
                 assert_eq!(plan.count, count);
-                assert_eq!(plan.prefix_end, ordinal * count + 2);
-                assert_eq!(plan.final_end, (ordinal + 1) * count);
-                assert!(plan.final_end <= G17PRenderItemPlan::CAPACITY);
-                assert_eq!(
-                    G17PRenderItemPlan::with_capacity(ordinal, tag16, plan.final_end),
-                    Some(plan),
-                );
-                assert!(G17PRenderItemPlan::with_capacity(
-                    ordinal, tag16, plan.final_end - 1,
-                ).is_none());
+                assert_eq!(plan.prefix_end, (ordinal * count + 2) % 1280);
+                assert_eq!(plan.final_end, (ordinal + 1) * count % 1280);
+                for capacity in 0..=count {
+                    assert!(G17PRenderItemPlan::with_capacity(ordinal, tag16, capacity).is_none());
+                }
             }
-            for ordinal in [256, u32::MAX] {
+            for ordinal in [G17P_RETAINED_RENDER_ORDINALS, u32::MAX] {
                 assert!(G17PRenderItemPlan::new(ordinal, tag16).is_none());
             }
         }
+        let straddle = G17PRenderItemPlan::new(426, false).unwrap();
+        assert_eq!((straddle.base, straddle.prefix_end, straddle.final_end), (1278, 0, 1));
     }
 
     #[test]
@@ -15516,21 +15557,21 @@ mod tests {
                 let mut graph = vec![0xa5; 0xc000];
                 // Both firmware-owned pointer blocks lie outside item rings.
                 let pointer_blocks = graph[0x1000..0x1100].to_vec();
-                for ordinal in [0, 1, 2, 255] {
+                for ordinal in 0..1000 {
                     let plan = G17PRenderItemPlan::new(ordinal, tag16).unwrap();
-                    let begin = ring_offset + plan.base as usize * 8;
-                    let end = ring_offset + plan.final_end as usize * 8;
-                    let prefix = graph[..begin].to_vec();
-                    let suffix = graph[end..].to_vec();
+                    let mut expected = graph.clone();
                     let group = [ordinal as u8; 32];
+                    for item in 0..plan.count {
+                        let slot = (plan.base + item) % plan.capacity;
+                        let begin = ring_offset + slot as usize * 8;
+                        expected[begin..begin + 8].copy_from_slice(&group[item as usize * 8..item as usize * 8 + 8]);
+                    }
                     assert_eq!(plan.copy_items(&mut graph, ring_offset, 0, &group[..16]), Some(()));
                     assert_eq!(
                         plan.copy_items(&mut graph, ring_offset, 2, &group[16..plan.count as usize * 8]),
                         Some(()),
                     );
-                    assert_eq!(&graph[..begin], prefix);
-                    assert_eq!(&graph[end..], suffix);
-                    assert_eq!(&graph[begin..end], &group[..plan.count as usize * 8]);
+                    assert_eq!(graph, expected, "only reserved modular slots may change");
                     assert_eq!(&graph[0x1000..0x1100], pointer_blocks);
                 }
             }
@@ -15551,11 +15592,11 @@ mod tests {
     }
 
     #[test]
-    fn retained_tiling_phases_publish_absolute_producers() {
+    fn retained_tiling_phases_publish_modular_producers() {
         for tag16 in [false, true] {
             let mut graph = vec![0xa5; 0xc000];
             let mut support = vec![0u8; 0x40000];
-            for ordinal in [0, 1, 2, 255] {
+            for ordinal in [0, 1, 2, 255, 256, 319, 320, 426, 427, 639, 640, 999] {
                 let items = G17PRenderItemPlan::new(ordinal, tag16).unwrap();
                 let late = G17PLateTilingBytes {
                     item_group: [ordinal as u8; 32],
@@ -15571,8 +15612,6 @@ mod tests {
                 put_u32(&mut graph, G17P_USER_TILING_POINTERS + 0x30, items.base);
                 put_u32(&mut graph, G17P_USER_TILING_POINTERS + 0x40, items.base);
                 let cursor_bytes = graph[G17P_USER_TILING_POINTERS..G17P_USER_TILING_POINTERS + 0x40].to_vec();
-                let begin = G17P_USER_TILING_RING + items.base as usize * 8;
-                let previous_items = graph[G17P_USER_TILING_RING..begin].to_vec();
                 let mut full = graph.clone();
                 late.apply(&mut full, &mut support);
 
@@ -15588,7 +15627,6 @@ mod tests {
                 );
                 assert_eq!(graph, full, "split and paired publication must agree");
                 assert_eq!(&graph[G17P_USER_TILING_POINTERS..G17P_USER_TILING_POINTERS + 0x40], cursor_bytes);
-                assert_eq!(&graph[G17P_USER_TILING_RING..begin], previous_items);
             }
         }
     }

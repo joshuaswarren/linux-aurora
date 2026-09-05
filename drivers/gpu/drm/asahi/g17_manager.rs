@@ -2904,10 +2904,14 @@ impl G17PManagerConstruction {
             .fragment
             .producer
             .current_timestamp;
+        let tiling_command_timestamp = self.render_sksm.as_ref().ok_or(ENODEV)?
+            .tiling.producer.current_timestamp;
         let (fragment_queue, tiling_queue) = {
             let storage = self.render_storage.as_mut().ok_or(ENODEV)?;
             let scratch = storage
-                .stage_fragment_completion_scratch(fragment_command_timestamp, channel_payload)
+                .stage_fragment_completion_scratch(
+                    tiling_command_timestamp, fragment_command_timestamp, channel_payload,
+                )
                 .inspect_err(|error| {
                     dev_err!(
                         dev.as_ref(),
@@ -4477,13 +4481,16 @@ impl G17PManagerConstruction {
             // Queue retirement and timestamps do not authorize host writes
             // to this firmware-owned list. Keep polling until it is empty.
             let tracker = self.render_tracker.as_mut().ok_or(ENODEV)?;
-            let completion = g17_completion::observe_paired_render_completion(
+            let window = g17_resources::g17p_render_completion_window(self.render_submission_ordinal)?;
+            if window.target() != tracker.tiling_prefix || window.target() != tracker.fragment_prefix {
+                return Err(EINVAL);
+            }
+            let completion = g17_completion::observe_paired_render_window(
+                window,
                 tracker.tiling_previous,
                 state.tiling,
-                tracker.tiling_prefix,
                 tracker.fragment_previous,
                 state.fragment,
-                tracker.fragment_prefix,
                 g17_completion::RenderExecutionState {
                     job_list_empty: state.job_list_empty,
                     tiling_timestamps: state.tiling_timestamps,
@@ -4494,11 +4501,25 @@ impl G17PManagerConstruction {
             tracker.tiling_previous = state.tiling;
             tracker.fragment_previous = state.fragment;
             if completion.complete {
-                self.render_tracker = None;
-                let hardware_buffer_id = self.render_hardware_buffer_id.take().ok_or(EIO)?;
+                // Native TA/3D complete subtract completed kicks from queue
+                // +44. Prepare both results before mutating either queue;
+                // timestamps and previous-stamp history must never reset.
+                let retired_sksm = self.render_sksm.as_ref().map(|queues| {
+                    let ta = g17_submission::complete_g17p_cl_kicks(queues.tiling.producer, 1)?;
+                    let fragment = g17_submission::complete_g17p_cl_kicks(queues.fragment.producer, 1)?;
+                    Ok::<_, g17_submission::SubmissionError>((ta, fragment))
+                }).transpose().map_err(|_| EIO)?;
+                let next_ordinal = self.render_submission_ordinal.checked_add(1).ok_or(EOVERFLOW)?;
+                let hardware_buffer_id = self.render_hardware_buffer_id.ok_or(EIO)?;
                 self.render_hardware_buffer_ids
                     .release(hardware_buffer_id)
                     .map_err(|_| EIO)?;
+                if let (Some(queues), Some((ta, fragment))) = (self.render_sksm.as_mut(), retired_sksm) {
+                    queues.tiling.producer = ta;
+                    queues.fragment.producer = fragment;
+                }
+                self.render_hardware_buffer_id = None;
+                self.render_tracker = None;
                 self.render_hardware_buffer_published = false;
                 self.render_auxiliary_timestamp = 0;
                 dev_info!(
@@ -4506,10 +4527,7 @@ impl G17PManagerConstruction {
                     "G17P render: released TA HardwareBufferID {} at paired completion\n",
                     hardware_buffer_id,
                 );
-                self.render_submission_ordinal = self
-                    .render_submission_ordinal
-                    .checked_add(1)
-                    .ok_or(EOVERFLOW)?;
+                self.render_submission_ordinal = next_ordinal;
                 return Ok(G17PRenderPollOutcome::Complete(completion));
             }
         }

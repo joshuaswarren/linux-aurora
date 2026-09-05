@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import subprocess
 import tempfile
+from g17_native_channel_test_support import native_channel_helpers
 
 root = Path(__file__).resolve().parent.parent
 source = (root / "g17_resources.rs").read_text()
@@ -41,7 +42,7 @@ sizes = "\n".join(
 )
 body = "\n".join([
     "#![allow(dead_code)]", constants,
-    "mod g17_submission {", sizes,
+    "mod g17_submission {", sizes, native_channel_helpers(submission),
     block(r"^pub\(crate\) const fn g17p_render_pool_a_record_index\(", submission), "}",
     "#[derive(Debug, Copy, Clone, PartialEq, Eq)]",
     block(r"^struct G17PEventControlKick\s*"),
