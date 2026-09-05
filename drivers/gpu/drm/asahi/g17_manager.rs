@@ -2546,7 +2546,8 @@ impl G17PManagerConstruction {
         bo.map_range_into_range(
             self.resources.uat().kernel_vm(),
             range,
-            self.resources.uat().kernel_va_range()?,
+            g17_resources::g17p_dynamic_kernel_va_range(
+                self.resources.uat().kernel_va_range()?).ok_or(ERANGE)?,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_FW_SHARED_RW,
             false,
@@ -5075,6 +5076,7 @@ impl G17PManagerConstruction {
         dev: &AsahiDevice,
     ) -> Result<G17PSksmQueue> {
         let queue_id = self.allocate_compute_queue_id()?;
+        let result = (|| {
         const COMPLETION_SELECTOR: u8 = 2;
 
         let geometry = self.sksm_queue_geometry();
@@ -5147,6 +5149,11 @@ impl G17PManagerConstruction {
             completion_last_end: 0,
             completion_stamp_armed: false,
         })
+        })();
+        // No firmware publication occurs in this constructor. A failed host
+        // allocation must not consume the finite QID namespace permanently.
+        if result.is_err() { self.next_compute_queue_id = Some(queue_id); }
+        result
     }
 
     /// Perform the exact configureHardware four-store QID transaction once.

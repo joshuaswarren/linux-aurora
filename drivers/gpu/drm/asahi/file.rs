@@ -285,6 +285,15 @@ impl File {
         if data.param_group == crate::g17_status::PARAM_GROUP_VM_STATUS {
             return Self::get_vm_status(device, data, file);
         }
+        if data.param_group == crate::g17_queue_limits::PARAM_GROUP_QUEUE_LIMITS {
+            if data.pad != 0 || data.size < crate::g17_queue_limits::QUEUE_LIMITS_SIZE as u64 {
+                return Err(EINVAL);
+            }
+            let bytes = gpu.independent_queue_limits().ok_or(EINVAL)?;
+            UserSlice::new(UserPtr::from_addr(data.pointer as _), bytes.len())
+                .writer().write_slice(&bytes)?;
+            return Ok(0);
+        }
         if data.param_group != 0 || data.pad != 0 {
             cls_pr_debug!(Errors, "get_params: Invalid arguments\n");
             return Err(EINVAL);
@@ -324,6 +333,9 @@ impl File {
 
         if gpu.supports_vm_status() {
             params.features |= crate::g17_status::FEATURE_VM_STATUS;
+        }
+        if gpu.independent_queue_limits().is_some() {
+            params.features |= crate::g17_queue_limits::FEATURE_INDEPENDENT_QUEUES;
         }
         if *module_parameters::fault_control.value() == 0xb {
             params.features |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_SOFT_FAULTS as u64;

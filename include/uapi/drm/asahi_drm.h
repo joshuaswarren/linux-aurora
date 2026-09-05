@@ -247,9 +247,13 @@ enum drm_asahi_feature {
 
 	/** @DRM_ASAHI_FEATURE_VM_STATUS: GET_PARAMS VM_STATUS is supported. */
 	DRM_ASAHI_FEATURE_VM_STATUS = (1UL) << 1,
+
+	/** @DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES: QUEUE_LIMITS and reserved independent compute queues. */
+	DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES = (1UL) << 2,
 };
 
 #define DRM_ASAHI_PARAM_GROUP_VM_STATUS 1
+#define DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS 2
 
 /* GET_PARAMS group VM_STATUS is an in/out query on the calling file's VM.
  * Set pointer to this structure and size to sizeof(structure).
@@ -275,10 +279,31 @@ struct drm_asahi_vm_status {
 };
 
 /**
+ * struct drm_asahi_queue_limits - GET_PARAMS group2 output, feature bit2.
+ * @max_queues: Maximum independent DRM queues on the physical device. This is
+ * a hardware resource bound, shared by all files/VMs; it is not a promise that
+ * all slots are currently free. QUEUE_CREATE reserves a queue's hardware state
+ * and execution context, returning an allocation error if resources run out.
+ * @max_in_flight_per_queue: Hardware scheduler credits per queue. Software
+ * may enqueue additional jobs, which wait behind preceding work/dependencies.
+ * @flags: Reserved, zero.
+ * @pad: Reserved, zero.
+ *
+ * Independent compute execution is supported. Graphics work retains its own
+ * engine scheduling constraints. Query does not allocate or reset anything.
+ */
+struct drm_asahi_queue_limits {
+    __u32 max_queues;
+    __u32 max_in_flight_per_queue;
+    __u32 flags;
+    __u32 pad;
+};
+
+/**
  * struct drm_asahi_get_params - Arguments passed to DRM_IOCTL_ASAHI_GET_PARAMS
  */
 struct drm_asahi_get_params {
-	/** @param_group: 0 for global properties, 1 for VM status. */
+	/** @param_group: 0 global properties, 1 VM status, 2 queue limits. */
 	__u32 param_group;
 
 	/** @pad: MBZ */

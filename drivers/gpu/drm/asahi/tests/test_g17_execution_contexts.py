@@ -10,7 +10,8 @@ def block(marker):
 production='\n'.join(block(x) for x in [
  'struct T8140ContextRootLease {','pub(crate) struct T8140ComputeExecutionContext {',
  'impl T8140ComputeExecutionContext {','impl Drop for T8140ContextRootLease {'])
-method=block('    pub(crate) fn allocate_t8140_compute_execution_context(')
+method=block('    pub(crate) fn allocate_t8140_compute_execution_context(')+block('    pub(crate) fn allocate_t8140_app_context(')
+limits=(Path(__file__).resolve().parents[1]/'g17_queue_limits.rs').read_text().replace('//!','//')
 constants='\n'.join(re.search(r'const '+n+r': [^;]+;',s)[0] for n in [
  'T8140_APP_CONTEXT_START','T8140_APP_CONTEXT_RESERVED_MASK','T8140_APP_CONTEXT_AVAILABLE_MASK'])
 mock=r'''
@@ -26,6 +27,9 @@ impl<T>Arc<T>{fn new(v:T,_flags:u32)->Result<Self>{if FAIL_ALLOC.swap(false,Orde
 impl<T>Clone for Arc<T>{fn clone(&self)->Self{Self(self.0.clone())}}
 impl<T>Deref for Arc<T>{type Target=T;fn deref(&self)->&T{&self.0}}
 macro_rules! pr_err {($($t:tt)*)=>{}}
+macro_rules! dev_info {($($t:tt)*)=>{}}
+#[derive(Clone)]struct VmBind(Vm);impl VmBind{fn slot(&self)->u32{1}}
+struct T8140AppContextLease{root:T8140ContextRootLease,_bind:VmBind}
 struct TTBS{ttb0:AtomicU64,ttb1:AtomicU64}
 struct Handoff;
 impl Handoff{fn lock(&self){}fn unlock(&self){}fn current_slot(&self)->Option<u32>{None}}
@@ -43,6 +47,7 @@ struct Uat{cfg:UatConfig,inner:Arc<UatInner>,kernel_vm:Vm}
 fn t8140_tagged_root(root:u64,id:usize)->u64{root|1|((id as u64)<<48)}
 mod mem{use std::sync::Mutex;pub static TLBIS:Mutex<Vec<u8>>=Mutex::new(Vec::new());pub fn tlbi_asid(i:u8){TLBIS.lock().unwrap().push(i)}pub fn sync(){}}
 impl Uat{
+ fn install_t8140_app_context_alias(&self,b:&VmBind,id:usize)->Result<(u64,u64)>{let low=t8140_tagged_root(b.0.ttb(),id);let high=t8140_tagged_root(self.kernel_vm.ttb(),id);let state=self.inner.lock();state.ttbs()[id].ttb0.store(low,Ordering::Release);state.ttbs()[id].ttb1.store(high,Ordering::Release);Ok((low,high))}
  fn new()->Self{let inner=Arc::new(UatInner{state:Mutex::new(State{table:(0..64).map(|_|TTBS{ttb0:AtomicU64::new(0),ttb1:AtomicU64::new(0)}).collect()}),t8140_app_contexts:AtomicU64::new(31)},0).unwrap();let kernel_vm=Self::vm_in(&inner,0,0xff0000,true);Self{cfg:UatConfig::T8140,inner,kernel_vm}}
  fn vm_in(inner:&Arc<UatInner>,id:u64,root:u64,is_kernel:bool)->Vm{Vm{id,root,inner:Arc::new(GpuVm{owner:Mutex::new(VmOwner{is_kernel,uat_inner:inner.clone()})},0).unwrap()}}
  fn vm(&self,id:u64)->Vm{Self::vm_in(&self.inner,id,id*0x10000,false)}
@@ -67,7 +72,7 @@ tests=r'''
  let u=Uat::new();let vm=u.vm(1);FAIL_ALLOC.store(true,Ordering::Release);
  assert!(matches!(u.allocate_t8140_compute_execution_context(&vm),Err(12)));
  assert_eq!(u.inner.t8140_app_contexts.load(Ordering::Acquire),31);assert_eq!(u.roots(5),(0,0));
- let mut live=Vec::new();for id in 5..64{let c=u.allocate_t8140_compute_execution_context(&vm).unwrap();assert_eq!(c.context_id(),id);live.push(c);}
+ let mut live=Vec::new();for id in 5..63{let c=u.allocate_t8140_compute_execution_context(&vm).unwrap();assert_eq!(c.context_id(),id);live.push(c);}
  assert!(matches!(u.allocate_t8140_compute_execution_context(&vm),Err(ENOSPC)));
  drop(live);assert_eq!(u.inner.t8140_app_contexts.load(Ordering::Acquire),31);
 }
@@ -80,8 +85,13 @@ tests=r'''
  let next=u.allocate_t8140_compute_execution_context(&u.vm(2)).unwrap();assert_eq!(next.context_id(),6);
 }
 '''
+tests+=r'''
+#[test]fn full_compute_capacity_preserves_render_context_in_either_order(){
+ for render_first in [true,false]{let u=Uat::new();let vm=u.vm(1);let bind=VmBind(vm.clone());let mut render=if render_first{Some(u.allocate_t8140_app_context(&bind).unwrap())}else{None};let jobs:Vec<_>=(0..crate::g17_queue_limits::MAX_QUEUES).map(|_|u.allocate_t8140_compute_execution_context(&vm).unwrap()).collect();assert!(matches!(u.allocate_t8140_compute_execution_context(&vm),Err(ENOSPC)));if render.is_none(){render=Some(u.allocate_t8140_app_context(&bind).unwrap())}assert_eq!(render.as_ref().unwrap().root.context_id,63);drop(jobs);assert_ne!(u.roots(63),(0,0));drop(render);assert_eq!(u.inner.t8140_app_contexts.load(Ordering::Acquire),31);}
+}
+'''
 with tempfile.TemporaryDirectory() as d:
- f=Path(d)/'test.rs';f.write_text(mock+constants+production+'impl Uat{'+method+'}'+tests);exe=Path(d)/'test'
+ f=Path(d)/'test.rs';f.write_text(mock+'mod g17_queue_limits{'+limits+'}'+constants+production+'impl Uat{'+method+'}'+tests);exe=Path(d)/'test'
  subprocess.run(['rustc','--edition=2021','--test',str(f),'-o',str(exe)],check=True)
  subprocess.run([str(exe),'--test-threads=1'],check=True)
 print('PASS production execution-context allocation/drop: simultaneous isolated roots, outstanding reference lifetime, exhaustion, allocation rollback, foreign root protection')

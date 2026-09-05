@@ -28,7 +28,8 @@ use crate::{
 const T8140_USER_START: u64 = mmu::UAT_PGSZ as u64;
 const T8140_USER_TOP: u64 = 1 << 42;
 const T8140_UNKNOWN_PAGE: u64 = T8140_USER_TOP - 2 * mmu::UAT_PGSZ as u64;
-const T8140_TIMESTAMP_ALIAS_RANGE: Range<u64> = 0x70_0800_0000..0x71_0000_0000;
+const T8140_TIMESTAMP_ALIAS_RANGE: Range<u64> =
+    crate::g17_queue_limits::CLIENT_LOW_VA_START..0x71_0000_0000;
 
 /// How long to wait for the firmware to report a compute submission complete.
 /// Generous relative to the ~170 GPU ticks a first add3 actually takes; this is
@@ -104,7 +105,7 @@ impl G17PRuntimeRef {
 /// submitting client at a time. The cap exists so a client that leaks queue
 /// objects gets a clean `ENOSPC` from QUEUE_CREATE instead of exhausting
 /// kernel memory one prepared graph at a time.
-const G17P_MAX_COMPUTE_QUEUES: u32 = 128;
+const G17P_MAX_COMPUTE_QUEUES: u32 = crate::g17_queue_limits::MAX_QUEUES;
 
 /// Serializes the one hardware compute graph across DRM clients.
 ///
@@ -277,6 +278,9 @@ impl DrmGpu for G17PDrmGpu {
     }
 
     fn supports_vm_status(&self) -> bool { true }
+    fn independent_queue_limits(&self) -> Option<[u8; 16]> {
+        Some(crate::g17_queue_limits::encode_limits())
+    }
 
     fn submission_error(&self) -> i32 {
         if self.registry.compute_faulted.load(Ordering::Acquire) != 0 { EIO.to_errno() } else { 0 }
@@ -510,6 +514,18 @@ impl G17PQueue {
         }
         .validate()
         .map_err(|_| EINVAL)?;
+        let fence_contexts = FenceContexts::new(1, QUEUE_NAME, QUEUE_CLASS_KEY)?;
+        // Reserve all scarce hardware resources before QUEUE_CREATE succeeds.
+        // Allocation errors must not surface later as accepted-job device loss.
+        // Backend Drop gives an unpublished/idle reservation back on any later
+        // constructor failure, including scheduler or KBox allocation failure.
+        let (hardware_queue, context) = runtime.mutex().lock()
+            .prepare_async_compute_queue(id, &vm)?;
+        let backend = Arc::new(G17PAsyncQueueBackend {
+            runtime, registry: registry.clone(), owner: id, hardware_queue, context,
+        }, GFP_KERNEL)?;
+        let scheduler = g17_job::G17PJobScheduler::new(dev, backend.clone(),
+            crate::g17_queue_limits::MAX_IN_FLIGHT_PER_QUEUE)?;
         Ok(Self {
             dev: dev.into(),
             runtime,
@@ -520,9 +536,9 @@ impl G17PQueue {
             vm,
             user_range,
             usc_exec_base,
-            fence_contexts: FenceContexts::new(1, QUEUE_NAME, QUEUE_CLASS_KEY)?,
-            async_backend: None,
-            async_scheduler: None,
+            fence_contexts,
+            async_backend: Some(backend),
+            async_scheduler: Some(scheduler),
             id,
         })
     }
@@ -610,17 +626,6 @@ impl G17PQueue {
         ];
         let timestamps = self.owned_compute_timestamps()?;
         let output = self.fence_contexts.new_fence(0, G17PSubmissionFence)?.into();
-        if self.async_scheduler.is_none() {
-            let (hardware_queue, context) = self.runtime.mutex().lock()
-                .prepare_async_compute_queue(self.id, &self.vm)?;
-            let backend = Arc::new(G17PAsyncQueueBackend {
-                runtime: self.runtime, registry: self.registry.clone(), owner: self.id,
-                hardware_queue, context,
-            }, GFP_KERNEL)?;
-            let scheduler = g17_job::G17PJobScheduler::new(&self.dev, backend.clone(), 1)?;
-            self.async_backend = Some(backend);
-            self.async_scheduler = Some(scheduler);
-        }
         let backend = self.async_backend.as_ref().ok_or(EIO)?;
         let packet = g17_job::G17PComputeJobPacket::new(
             submission_id, backend.hardware_queue, backend.context.clone(), translated,
