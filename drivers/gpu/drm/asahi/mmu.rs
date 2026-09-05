@@ -1099,6 +1099,7 @@ struct VmDriverMappings {
     mappings: KVec<KernelMapping>,
     reserved_ranges: KVec<Range<u64>>,
     render_pool: Option<VmRenderPoolMappings>,
+    compute_pool: Option<VmRenderPoolMappings>,
 }
 no_debug!(VmDriverMappings);
 
@@ -1115,10 +1116,9 @@ no_debug!(VmRenderPoolMappings);
 impl VmDriverMappings {
     fn iter_mappings(&self) -> impl Iterator<Item = &KernelMapping> {
         Iterator::chain(
-            self.mappings.iter(),
-            self.render_pool
-                .iter()
-                .flat_map(|pool| pool.mappings.iter()),
+            Iterator::chain(self.mappings.iter(), self.compute_pool.iter()
+                .flat_map(|pool| pool.mappings.iter())),
+            self.render_pool.iter().flat_map(|pool| pool.mappings.iter()),
         )
     }
 }
@@ -2070,6 +2070,7 @@ impl Vm {
             mappings,
             reserved_ranges,
             render_pool: None,
+            compute_pool: None,
         });
         Ok(())
     }
@@ -2114,6 +2115,46 @@ impl Vm {
         let previous = {
             let mut retained = self.driver_mappings.lock();
             Option::as_mut(&mut *retained).and_then(|driver| driver.render_pool.take())
+        };
+        drop(previous);
+    }
+
+    pub(crate) fn compute_pool_mappings_match(&self, pool_id: u64) -> bool {
+        pool_id != 0
+            && self.driver_mappings.lock().as_ref().is_some_and(|driver| {
+                driver
+                    .compute_pool
+                    .as_ref()
+                    .is_some_and(|pool| pool.pool_id == pool_id)
+            })
+    }
+
+    /// Retain the first-use compute aliases and exclude them from user unmaps.
+    /// Installation never replaces a live generation; callers must retire its
+    /// GPU work and explicitly clear it before installing a different pool.
+    pub(crate) fn install_compute_pool_mappings(
+        &self,
+        pool_id: u64,
+        mappings: KVec<KernelMapping>,
+    ) -> Result {
+        if pool_id == 0 {
+            return Err(EINVAL);
+        }
+        let mut retained = self.driver_mappings.lock();
+        let driver = Option::as_mut(&mut *retained).ok_or(EINVAL)?;
+        if driver.compute_pool.is_some() {
+            return Err(EBUSY);
+        }
+        driver.compute_pool = Some(VmRenderPoolMappings { pool_id, mappings });
+        Ok(())
+    }
+
+    /// Release an obsolete pool after its GPU references have retired. Drop
+    /// outside driver_mappings: KernelMapping teardown takes the GPUVM lock.
+    pub(crate) fn clear_compute_pool_mappings(&self) {
+        let previous = {
+            let mut retained = self.driver_mappings.lock();
+            Option::as_mut(&mut *retained).and_then(|driver| driver.compute_pool.take())
         };
         drop(previous);
     }
