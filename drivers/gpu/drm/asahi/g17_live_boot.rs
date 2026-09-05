@@ -3645,6 +3645,23 @@ impl G17PLiveRuntime {
         Err(ETIMEDOUT)
     }
 
+    /// Do not destroy a live firmware session to service an unsupported VM
+    /// handoff. RUN-clear plus replacement RTKit owners does not establish the
+    /// shared GFX power-off boundary; measured retries time out before any
+    /// new render doorbell. Keep the old graph, mappings and admission intact
+    /// so its original owner can still submit. This is not multi-VM support.
+    fn check_retained_render_owner(&self, vm: &mmu::Vm) -> Result {
+        if self
+            .manager
+            .as_ref()
+            .ok_or(ENODEV)?
+            .retained_render_has_other_owner(vm)
+        {
+            return Err(ENOTSUPP);
+        }
+        Ok(())
+    }
+
     pub(crate) fn submit_translated_render(
         &mut self,
         vm: &mmu::Vm,
@@ -3655,6 +3672,7 @@ impl G17PLiveRuntime {
         if !self.accepting_submissions {
             return Err(ENOTSUPP);
         }
+        self.check_retained_render_owner(vm)?;
         let native_doorbell_mode =
             *module_parameters::g17p_render_native_doorbells.value();
         let native_doorbells = native_doorbell_mode != 0;
@@ -4790,6 +4808,7 @@ impl G17PLiveRuntime {
         if !self.accepting_submissions {
             return Err(ENOTSUPP);
         }
+        self.check_retained_render_owner(vm)?;
         // Render and compute currently share FList page/run backings. VM
         // creation no longer overwrites a retained render pool. An actual
         // workload switch must stop both firmware processors before reusing

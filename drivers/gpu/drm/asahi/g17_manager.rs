@@ -2585,7 +2585,9 @@ impl G17PManagerConstruction {
         Ok(())
     }
 
-    pub(crate) fn retained_render_needs_recycle(&self, vm: &mmu::Vm) -> bool {
+    /// The retained graph and global aliases must agree on the incoming VM.
+    /// A new client cannot safely reuse either owner's mappings.
+    pub(crate) fn retained_render_has_other_owner(&self, vm: &mmu::Vm) -> bool {
         let graph_retained = self.render_storage.is_some();
         let aliases_retained = self.render_context_aliases.is_some();
         let retained = graph_retained || aliases_retained;
@@ -2599,9 +2601,13 @@ impl G17PManagerConstruction {
             .as_ref()
             .map_or(true, |aliases| aliases.matches(vm));
         let same_vm = graph_same_vm && aliases_same_vm;
+        retained && !same_vm
+    }
+
+    pub(crate) fn retained_render_needs_recycle(&self, vm: &mmu::Vm) -> bool {
         g17_lifecycle::retained_render_requires_recycle(
-            retained,
-            same_vm,
+            self.render_storage.is_some() || self.render_context_aliases.is_some(),
+            !self.retained_render_has_other_owner(vm),
             self.render_submission_ordinal,
         )
     }
