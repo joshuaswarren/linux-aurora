@@ -78,7 +78,7 @@ struct DCP_FW_NAME(dcp_swap) {
 	 * dcp_surface_h17p = 0x22c, SWAP_SURFACES = 4 and no surf2 block leaves
 	 * exactly 0x122 here.  0x278 makes dcp_swap 0x6e0 and forces a
 	 * non-integer surface size, so it cannot be right. */
-	u8 h17p_tail[0x122];
+	u8 h17p_tail[0xda];
 #endif
 } __packed;
 
