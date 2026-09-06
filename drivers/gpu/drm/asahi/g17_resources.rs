@@ -923,15 +923,13 @@ fn positive_half_f32_bits(value: u32) -> Option<u32> {
     Some(((highest + 126) << 23) | (significand & 0x7f_ffff))
 }
 
-fn g17p_aux_fb_flags(_command_flags: u32) -> u64 {
-    // The working G17P Metal command writes 0xc001 both to register 0x15021
-    // and to the duplicated descriptor field at +0x1f40, including the
-    // depth/stencil-inactive triangle case.  Deriving bit 0 from the legacy
-    // DRM_ASAHI_RENDER_DBIAS_IS_INT flag changed that native value to 0xc000
-    // whenever userspace had no active depth-bias requirement.  Keep the
-    // generation-specific native default until the G17P producer of this
-    // whole field (rather than the older UAPI name) is fully recovered.
-    0xc001
+fn g17p_aux_fb_flags(command_flags: u32) -> u64 {
+    // The G17P kext copies this field from per-command segment data instead
+    // of supplying a generation-wide constant. Native Neon writes 0xc000;
+    // bit 18 is the integer-depth-bias selector and remains in bit 18. Bit 0
+    // is a separate small-known-primitive optimization which the UAPI does
+    // not describe, so leave it clear instead of enabling it universally.
+    0xc000 | u64::from(command_flags & G17P_RENDER_DBIAS_IS_INT)
 }
 
 fn encode_g17p_render_runtime_state(
@@ -15958,8 +15956,11 @@ mod tests {
         assert_eq!(layout.total_size, 0x20000);
         assert_eq!(G17P_RENDER_STATE_AUX_FB_SIZE, 0x8000);
         assert_eq!(G17P_RENDER_AUX_FB_PAGE_COUNT, 0x10_0000);
-        assert_eq!(g17p_aux_fb_flags(0), 0xc001);
-        assert_eq!(g17p_aux_fb_flags(G17P_RENDER_DBIAS_IS_INT), 0xc001);
+        assert_eq!(g17p_aux_fb_flags(0), 0xc000);
+        assert_eq!(
+            g17p_aux_fb_flags(G17P_RENDER_DBIAS_IS_INT),
+            0x4c000
+        );
 
         let mut runtime = vec![0xa5; layout.total_size];
         assert_eq!(
