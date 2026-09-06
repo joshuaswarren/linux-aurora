@@ -874,18 +874,70 @@ err_of_node_put:
 	return ret;
 }
 
+/*
+ * Count the "disp-*" entries in reg-names.
+ *
+ * The positional form below assumes the reg layout is [coproc, disp-0 ...],
+ * i.e. exactly one non-disp register, and derives the count as
+ * num_resources - 1.  That is wrong on H17P/T8140, whose layout is
+ * [coproc, disp-0 .. disp-4, iop-vbar]: the trailing iop-vbar inflates the
+ * count to 6 and the index loop then binds disp_registers[5] to iop-vbar.
+ * The inflated count also makes the "apple,bw-scratch" disp_reg check reject
+ * the device tree's (correct) value of 5, which fails the probe with
+ *   Unexpected disp_reg value in 'apple,bw-scratch': 5
+ *   failed to find display registers
+ *
+ * Returns a negative errno when reg-names is absent, so callers fall back.
+ */
+static int dcp_count_disp_regs(struct device *dev)
+{
+	int n = of_property_count_strings(dev->of_node, "reg-names");
+	const char *name;
+	int i, count = 0;
+
+	if (n <= 0)
+		return -EINVAL;
+
+	for (i = 0; i < n; ++i) {
+		if (of_property_read_string_index(dev->of_node, "reg-names", i,
+						  &name))
+			return -EINVAL;
+		if (!strncmp(name, "disp-", 5))
+			count++;
+	}
+
+	return count ? count : -EINVAL;
+}
+
 static int dcp_get_disp_regs(struct apple_dcp *dcp)
 {
 	struct platform_device *pdev = to_platform_device(dcp->dev);
-	int count = pdev->num_resources - 1;
+	int count = dcp_count_disp_regs(dcp->dev);
+	bool by_name = count > 0;
 	int i, ret;
+
+	/* Device trees without reg-names keep the historical positional form. */
+	if (!by_name)
+		count = pdev->num_resources - 1;
 
 	if (count <= 0 || count > MAX_DISP_REGISTERS)
 		return -EINVAL;
 
 	for (i = 0; i < count; ++i) {
-		dcp->disp_registers[i] =
-			platform_get_resource(pdev, IORESOURCE_MEM, 1 + i);
+		if (by_name) {
+			char name[8];
+
+			snprintf(name, sizeof(name), "disp-%d", i);
+			dcp->disp_registers[i] = platform_get_resource_byname(
+				pdev, IORESOURCE_MEM, name);
+		} else {
+			dcp->disp_registers[i] = platform_get_resource(
+				pdev, IORESOURCE_MEM, 1 + i);
+		}
+		if (!dcp->disp_registers[i]) {
+			dev_err(dcp->dev, "missing display register %d\n", i);
+			return -EINVAL;
+		}
 	}
 
 	/* load pmgr bandwidth scratch resource and offset */
