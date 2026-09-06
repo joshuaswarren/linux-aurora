@@ -346,7 +346,7 @@ pub(crate) const G17P_RENDER_DESCRIPTOR_STORAGE_SIZE: usize =
 /// Exclusive ordinal bound of the current 24-bit event-stamp path. Physical
 /// ring slots and payload bytes wrap independently; they do not limit this.
 pub(crate) const G17P_RETAINED_RENDER_ORDINALS: u32 = 0x00ff_ffff;
-pub(crate) const G17P_RENDER_QUEUE_GRAPH_SIZE: usize = 0xc000;
+pub(crate) const G17P_RENDER_QUEUE_GRAPH_SIZE: usize = 0x14000;
 pub(crate) const G17P_RENDER_SUPPORT_SIZE: usize = 0x40000;
 
 /// Full RT/TVB scans are diagnostics, not part of render retirement. Keep
@@ -466,6 +466,24 @@ fn g17p_render_3d_descriptor_low_va(submission_ordinal: u32) -> Option<u64> {
     G17P_BOOTSTRAP_3D_DESCRIPTOR_LOW_VA.checked_add(
         (g17p_render_descriptor_slot(submission_ordinal) * G17P_RENDER_3D_DESCRIPTOR_STRIDE) as u64,
     )
+}
+
+fn g17p_render_optional_offset(tiling: bool, submission_ordinal: u32) -> usize {
+    let base = if tiling {
+        G17P_USER_TILING_OPTIONAL
+    } else {
+        G17P_USER_FRAGMENT_OPTIONAL
+    };
+    base + g17p_render_descriptor_slot(submission_ordinal) * G17P_RENDER_OPTIONAL_STRIDE
+}
+
+fn g17p_render_event_offset(tiling: bool, submission_ordinal: u32) -> usize {
+    let base = if tiling {
+        G17P_USER_TILING_EVENT
+    } else {
+        G17P_USER_FRAGMENT_EVENT
+    };
+    base + g17p_render_descriptor_slot(submission_ordinal) * G17P_RENDER_EVENT_STRIDE
 }
 const G17P_BOOTSTRAP_DESCRIPTOR_ZERO_A_VA: u64 = 0xffff_fc20_001c_8000;
 const G17P_BOOTSTRAP_DESCRIPTOR_ZERO_B_VA: u64 = 0xffff_fc20_c07c_0000;
@@ -749,13 +767,16 @@ const G17P_RENDER_DBIAS_IS_INT: u32 = 1 << 18;
 const G17P_RENDER_QUEUE_RECORD_SIZE: usize = 0xc0;
 const G17P_RENDER_POINTER_BLOCK_SIZE: usize = 0x80;
 const G17P_USER_TILING_POINTERS: usize = 0x1000;
-const G17P_USER_TILING_OPTIONAL: usize = 0x3000;
-const G17P_USER_TILING_EVENT: usize = 0x3200;
+const G17P_RENDER_OPTIONAL_STRIDE: usize = 0x180;
+const G17P_RENDER_EVENT_STRIDE: usize = 0x80;
+const G17P_USER_TILING_OPTIONAL: usize = 0xc000;
+const G17P_USER_TILING_EVENT: usize = 0xf000;
+const G17P_USER_FRAGMENT_OPTIONAL: usize = 0x10000;
+const G17P_USER_FRAGMENT_EVENT: usize = 0x13000;
 /// Tag-16 (`selector 0x10`) entry-signal records, one per render queue.
 ///
-/// Free graph space: TILING_EVENT ends at 0x3240 and FRAGMENT_EVENT at 0x3640,
-/// with nothing else allocated before TILING_RING at 0x4000. Each record is
-/// `G17P_COMPUTE_OPTIONAL_EVENT_SIZE` (0x12) bytes.
+/// Tag-16 is a Linux diagnostic outside the native three-item group. Keep its
+/// two fixed records in the original free graph page.
 const G17P_USER_TILING_ENTRY_SIGNAL: usize = 0x3800;
 const G17P_USER_FRAGMENT_ENTRY_SIGNAL: usize = 0x3840;
 
@@ -3209,6 +3230,8 @@ struct G17PLateTilingBytes {
     entry_signal: [u8; g17_submission::G17P_COMPUTE_OPTIONAL_EVENT_SIZE],
     optional: [u8; g17_submission::G17P_COLD_OPENING_OPTIONAL_SIZE],
     event: [u8; g17_submission::G17P_COLD_OPENING_EVENT_SIZE],
+    optional_offset: usize,
+    event_offset: usize,
     pool_a_slot_offset: usize,
     pool_a_slot_value: u32,
     shared_inner_value: u32,
@@ -3227,9 +3250,9 @@ impl G17PLateTilingBytes {
                 ..G17P_USER_TILING_ENTRY_SIGNAL + self.entry_signal.len()]
                 .copy_from_slice(&self.entry_signal);
         }
-        graph[G17P_USER_TILING_OPTIONAL..G17P_USER_TILING_OPTIONAL + self.optional.len()]
+        graph[self.optional_offset..self.optional_offset + self.optional.len()]
             .copy_from_slice(&self.optional);
-        graph[G17P_USER_TILING_EVENT..G17P_USER_TILING_EVENT + self.event.len()]
+        graph[self.event_offset..self.event_offset + self.event.len()]
             .copy_from_slice(&self.event);
         put_u32(graph, G17P_USER_TILING_POINTERS + 0x40, self.items.final_end);
         put_u32(support, self.pool_a_slot_offset, self.pool_a_slot_value);
@@ -3248,7 +3271,7 @@ impl G17PLateTilingBytes {
         self.items
             .copy_items(graph, G17P_USER_TILING_RING, 0, &self.item_group[..2 * 8])
             .expect("bounded retained TA prefix");
-        graph[G17P_USER_TILING_OPTIONAL..G17P_USER_TILING_OPTIONAL + self.optional.len()]
+        graph[self.optional_offset..self.optional_offset + self.optional.len()]
             .copy_from_slice(&self.optional);
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         put_u32(graph, G17P_USER_TILING_POINTERS + 0x40, self.items.prefix_end);
@@ -3267,7 +3290,7 @@ impl G17PLateTilingBytes {
                 ..G17P_USER_TILING_ENTRY_SIGNAL + self.entry_signal.len()]
                 .copy_from_slice(&self.entry_signal);
         }
-        graph[G17P_USER_TILING_EVENT..G17P_USER_TILING_EVENT + self.event.len()]
+        graph[self.event_offset..self.event_offset + self.event.len()]
             .copy_from_slice(&self.event);
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         put_u32(
@@ -3302,6 +3325,8 @@ fn build_g17p_late_tiling_bytes(
         submission_ordinal,
         native_pool_a_first_record,
     );
+    let optional_offset = g17p_render_optional_offset(true, submission_ordinal);
+    let event_offset = g17p_render_event_offset(true, submission_ordinal);
     let mut bytes = G17PLateTilingBytes {
         item_group: [0; 32],
         items: G17PRenderItemPlan::new(submission_ordinal, tag16)
@@ -3309,6 +3334,8 @@ fn build_g17p_late_tiling_bytes(
         entry_signal: [0; g17_submission::G17P_COMPUTE_OPTIONAL_EVENT_SIZE],
         optional: [0; g17_submission::G17P_COLD_OPENING_OPTIONAL_SIZE],
         event: [0; g17_submission::G17P_COLD_OPENING_EVENT_SIZE],
+        optional_offset,
+        event_offset,
         // Native cold record index 1 points at slot-page +0x04. There is no
         // additional reserved-word bias in this array.
         pool_a_slot_offset: G17P_RENDER_POOL_A_SLOTS + record_a * 4,
@@ -3321,10 +3348,10 @@ fn build_g17p_late_tiling_bytes(
             .ok_or(g17_submission::SubmissionError::PartialOpeningQueueHeadOutOfRange)?,
     };
     let optional = graph
-        .checked_add(G17P_USER_TILING_OPTIONAL as u64)
+        .checked_add(optional_offset as u64)
         .ok_or(g17_submission::SubmissionError::PartialOpeningAddressOverflow)?;
     let event = graph
-        .checked_add(G17P_USER_TILING_EVENT as u64)
+        .checked_add(event_offset as u64)
         .ok_or(g17_submission::SubmissionError::PartialOpeningAddressOverflow)?;
     for (index, address) in [descriptor, optional, event].iter().enumerate() {
         put_u64(&mut bytes.item_group, index * 8, *address);
@@ -5349,9 +5376,6 @@ impl G17PUserRenderStorage {
     const TILING_POINTERS: usize = G17P_USER_TILING_POINTERS;
     const FRAGMENT_POINTERS: usize = 0x1080;
     const JOB_LIST: usize = 0x2000;
-    const FRAGMENT_OPTIONAL: usize = 0x30c0;
-    const TILING_EVENT: usize = G17P_USER_TILING_EVENT;
-    const FRAGMENT_EVENT: usize = 0x3600;
     const TILING_RING: usize = G17P_USER_TILING_RING;
     const FRAGMENT_RING: usize = 0x8000;
     const FRAGMENT_ENTRY_SIGNAL: usize = G17P_USER_FRAGMENT_ENTRY_SIGNAL;
@@ -5398,6 +5422,19 @@ impl G17PUserRenderStorage {
         } else {
             g17p_render_3d_descriptor_high_va(self.descriptor_ordinal).ok_or(EOVERFLOW)
         }
+    }
+
+    pub(crate) fn work_item_gpu_vas(&self, tiling: bool) -> Result<[u64; 3]> {
+        let graph = self.graph.iova();
+        Ok([
+            self.descriptor_high_va(tiling)?,
+            graph
+                .checked_add(g17p_render_optional_offset(tiling, self.descriptor_ordinal) as u64)
+                .ok_or(EOVERFLOW)?,
+            graph
+                .checked_add(g17p_render_event_offset(tiling, self.descriptor_ordinal) as u64)
+                .ok_or(EOVERFLOW)?,
+        ])
     }
 
     pub(crate) fn fragment_rce_base(&self) -> u64 {
@@ -7737,10 +7774,12 @@ impl G17PUserRenderStorage {
 
     pub(crate) fn stage_fragment(&mut self, submission_ordinal: u32) -> Result {
         let graph_va = self.graph.iova();
+        let optional_offset = g17p_render_optional_offset(false, submission_ordinal);
+        let event_offset = g17p_render_event_offset(false, submission_ordinal);
         let items = [
             g17p_render_3d_descriptor_high_va(submission_ordinal).ok_or(EOVERFLOW)?,
-            graph_va + Self::FRAGMENT_OPTIONAL as u64,
-            graph_va + Self::FRAGMENT_EVENT as u64,
+            graph_va + optional_offset as u64,
+            graph_va + event_offset as u64,
         ];
         let optional_addresses = self.optional_addresses(false);
         let tag16 = g17p_render_tag16_enabled();
@@ -7764,16 +7803,16 @@ impl G17PUserRenderStorage {
                 g17p_render_queue_id(true),
                 g17p_render_install(false),
                 g17p_render_descriptor_context_id(),
-                &mut raw[Self::FRAGMENT_OPTIONAL
-                    ..Self::FRAGMENT_OPTIONAL + g17_submission::G17P_COLD_OPENING_OPTIONAL_SIZE],
+                &mut raw[optional_offset
+                    ..optional_offset + g17_submission::G17P_COLD_OPENING_OPTIONAL_SIZE],
             )
             .map_err(|_| EINVAL)?;
             g17_submission::apply_g17p_retained_event(
                 g17_submission::G17PColdOpeningStage::Fragment,
                 submission_ordinal,
                 g17p_render_queue_id(false),
-                &mut raw[Self::FRAGMENT_EVENT
-                    ..Self::FRAGMENT_EVENT + g17_submission::G17P_COLD_OPENING_EVENT_SIZE],
+                &mut raw[event_offset
+                    ..event_offset + g17_submission::G17P_COLD_OPENING_EVENT_SIZE],
             )
             .map_err(|_| EINVAL)?;
             if tag16 {
@@ -8074,9 +8113,10 @@ impl G17PUserRenderStorage {
     /// what lets the SKSM half sit where the captures put it.
     pub(crate) fn stage_fragment_prefix(&mut self, submission_ordinal: u32) -> Result {
         let graph_va = self.graph.iova();
+        let optional_offset = g17p_render_optional_offset(false, submission_ordinal);
         let items = [
             g17p_render_3d_descriptor_high_va(submission_ordinal).ok_or(EOVERFLOW)?,
-            graph_va + Self::FRAGMENT_OPTIONAL as u64,
+            graph_va + optional_offset as u64,
         ];
         let optional_addresses = self.optional_addresses(false);
         let plan = G17PRenderItemPlan::new(submission_ordinal, g17p_render_tag16_enabled())
@@ -8096,8 +8136,8 @@ impl G17PUserRenderStorage {
                 g17p_render_queue_id(true),
                 g17p_render_install(false),
                 g17p_render_descriptor_context_id(),
-                &mut raw[Self::FRAGMENT_OPTIONAL
-                    ..Self::FRAGMENT_OPTIONAL + g17_submission::G17P_COLD_OPENING_OPTIONAL_SIZE],
+                &mut raw[optional_offset
+                    ..optional_offset + g17_submission::G17P_COLD_OPENING_OPTIONAL_SIZE],
             )
             .map_err(|_| EINVAL)?;
             put_u32(raw, Self::FRAGMENT_POINTERS + 0x40, plan.prefix_end);
@@ -8113,7 +8153,8 @@ impl G17PUserRenderStorage {
         entry_stamp: u32,
     ) -> Result {
         let graph_va = self.graph.iova();
-        let event_va = graph_va + Self::FRAGMENT_EVENT as u64;
+        let event_offset = g17p_render_event_offset(false, submission_ordinal);
+        let event_va = graph_va + event_offset as u64;
         let entry_signal_va = graph_va + Self::FRAGMENT_ENTRY_SIGNAL as u64;
         let tag16 = g17p_render_tag16_enabled();
         let plan = G17PRenderItemPlan::new(submission_ordinal, tag16).ok_or(EINVAL)?;
@@ -8124,8 +8165,8 @@ impl G17PUserRenderStorage {
                 g17_submission::G17PColdOpeningStage::Fragment,
                 entry_stamp,
                 g17p_render_queue_id(false),
-                &mut raw[Self::FRAGMENT_EVENT
-                    ..Self::FRAGMENT_EVENT + g17_submission::G17P_COLD_OPENING_EVENT_SIZE],
+                &mut raw[event_offset
+                    ..event_offset + g17_submission::G17P_COLD_OPENING_EVENT_SIZE],
             )
             .map_err(|_| EINVAL)?;
             if tag16 {
@@ -8209,7 +8250,7 @@ impl G17PUserRenderStorage {
         )
         .map_err(|_| EINVAL)?;
 
-        if Self::TILING_EVENT + bytes.event.len() > self.graph.logical_size
+        if bytes.event_offset + bytes.event.len() > self.graph.logical_size
             || G17P_RENDER_SHARED_CONTROL_INNER + 4 > self.support.logical_size
         {
             return Err(EINVAL);
@@ -8227,11 +8268,11 @@ impl G17PUserRenderStorage {
         &mut self,
     ) -> Result<G17PRenderConfigUpdateHeader> {
         let mut header = None;
+        let optional_offset = g17p_render_optional_offset(false, self.descriptor_ordinal);
         self.graph.with_bytes_mut(|raw| {
             header = decode_g17p_render_config_update(
-                raw.get(Self::FRAGMENT_OPTIONAL
-                    ..Self::FRAGMENT_OPTIONAL
-                        + g17_submission::G17P_COLD_OPENING_OPTIONAL_SIZE)
+                raw.get(optional_offset
+                    ..optional_offset + g17_submission::G17P_COLD_OPENING_OPTIONAL_SIZE)
                     .ok_or(EINVAL)?,
             );
             Ok(())
@@ -8243,11 +8284,11 @@ impl G17PUserRenderStorage {
         &mut self,
     ) -> Result<G17PRenderConfigUpdateHeader> {
         let mut header = None;
+        let optional_offset = g17p_render_optional_offset(true, self.descriptor_ordinal);
         self.graph.with_bytes_mut(|raw| {
             header = decode_g17p_render_config_update(
-                raw.get(G17P_USER_TILING_OPTIONAL
-                    ..G17P_USER_TILING_OPTIONAL
-                        + g17_submission::G17P_COLD_OPENING_OPTIONAL_SIZE)
+                raw.get(optional_offset
+                    ..optional_offset + g17_submission::G17P_COLD_OPENING_OPTIONAL_SIZE)
                     .ok_or(EINVAL)?,
             );
             Ok(())
@@ -15081,6 +15122,11 @@ mod tests {
             g17p_render_3d_descriptor_low_va(1),
             Some(G17P_BOOTSTRAP_3D_DESCRIPTOR_LOW_VA + 0x2240),
         );
+        assert_eq!(G17P_RENDER_QUEUE_GRAPH_SIZE, 0x14000);
+        assert_eq!(g17p_render_optional_offset(true, 1), 0xc180);
+        assert_eq!(g17p_render_event_offset(true, 1), 0xf080);
+        assert_eq!(g17p_render_optional_offset(false, 1), 0x10180);
+        assert_eq!(g17p_render_event_offset(false, 1), 0x13080);
         assert_eq!(g17p_render_descriptor_slot(32), 0);
     }
 
@@ -16206,7 +16252,7 @@ mod tests {
     #[test]
     fn retained_tiling_phases_publish_modular_producers() {
         for tag16 in [false, true] {
-            let mut graph = vec![0xa5; 0xc000];
+            let mut graph = vec![0xa5; 0x14000];
             let mut support = vec![0u8; 0x40000];
             for ordinal in [0, 1, 2, 255, 256, 319, 320, 426, 427, 639, 640, 999] {
                 let items = G17PRenderItemPlan::new(ordinal, tag16).unwrap();
@@ -16216,6 +16262,8 @@ mod tests {
                     entry_signal: [0; g17_submission::G17P_COMPUTE_OPTIONAL_EVENT_SIZE],
                     optional: [0; g17_submission::G17P_COLD_OPENING_OPTIONAL_SIZE],
                     event: [0; g17_submission::G17P_COLD_OPENING_EVENT_SIZE],
+                    optional_offset: 0xc000 + ordinal as usize % 32 * 0x180,
+                    event_offset: 0xf000 + ordinal as usize % 32 * 0x80,
                     pool_a_slot_offset: 0,
                     pool_a_slot_value: 2,
                     shared_inner_value: 2 * (ordinal + 1),
@@ -16301,7 +16349,19 @@ mod tests {
         assert_eq!(get_u32(&graph, G17P_USER_TILING_POINTERS + 0x40), 6);
         assert_eq!(get_u64(&graph, G17P_USER_TILING_RING), descriptor);
         assert_eq!(get_u64(&graph, G17P_USER_TILING_RING + 3 * 8), descriptor);
-        assert_eq!(get_u32(&graph, G17P_USER_TILING_EVENT + 0x08), 0x202);
+        assert_eq!(
+            get_u64(&graph, G17P_USER_TILING_RING + 4 * 8),
+            graph_va + g17p_render_optional_offset(true, 1) as u64,
+        );
+        assert_eq!(
+            get_u64(&graph, G17P_USER_TILING_RING + 5 * 8),
+            graph_va + g17p_render_event_offset(true, 1) as u64,
+        );
+        assert_eq!(
+            get_u32(&graph, g17p_render_event_offset(true, 1) + 0x08),
+            0x202,
+        );
+        assert_eq!(get_u32(&graph, G17P_USER_TILING_EVENT + 0x08), 0x102);
         assert_eq!(get_u32(&support, G17P_RENDER_POOL_A_SLOTS + 2 * 4), 2);
         assert_eq!(get_u32(&support, G17P_RENDER_SHARED_CONTROL_INNER), 4);
 
