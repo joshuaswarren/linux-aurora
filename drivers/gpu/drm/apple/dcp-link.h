@@ -26,7 +26,18 @@
 #define APPLE_DCP_LINK_STREAM_BUFFER_SIZE	0x008000
 #define APPLE_DCP_LINK_HEAP_OFFSET		0x080000
 #define APPLE_DCP_LINK_HEAP_SIZE		0x040000
-#define APPLE_DCP_LINK_RPC_ALIGNMENT		4
+/*
+ * Records are allocated on each channel's stack at
+ *   off_next = off_cur + align_up(12 + in_len + out_len, 0x40)
+ * Live macOS 25G83 traces confirm this for all 81915 RPC calls across two
+ * independent captures. Allocating at 4-byte alignment instead put every
+ * nested record where the firmware does not look, so its callbacks decoded as
+ * tag 0:
+ *   DCPLink callback tag 0x0 is invalid
+ *   DCPLink callback could not be decoded: -90
+ *   IOMFB: Could not find Provider service
+ */
+#define APPLE_DCP_LINK_RPC_ALIGNMENT		0x40
 #define APPLE_DCP_LINK_SHARED_VAR_MEMORY_SIZE	0x4000000
 
 #define APPLE_DCP_LINK_INIT_FLAG_64M		0x04000000
