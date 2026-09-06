@@ -918,8 +918,10 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 	for (int l = 0; l < SWAP_SURFACES; l++)
 		swap->surf_null[l] = true;
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
+#if DCP_FW_VER < DCP_FW_VERSION(26, 0, 0)
 	for (int l = 0; l < ARRAY_SIZE(swap->surf2_null); l++)
 		swap->surf2_null[l] = true;
+#endif
 	swap->unkU32Ptr_null = true;
 	swap->unkU32out_null = true;
 #endif
@@ -1293,8 +1295,10 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 	for (l = 0; l < SWAP_SURFACES; l++)
 		req->surf_null[l] = true;
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
+#if DCP_FW_VER < DCP_FW_VERSION(26, 0, 0)
 	for (l = 0; l < ARRAY_SIZE(req->surf2_null); l++)
 		req->surf2_null[l] = true;
+#endif
 	req->unkU32Ptr_null = true;
 	req->unkU32out_null = true;
 #endif
