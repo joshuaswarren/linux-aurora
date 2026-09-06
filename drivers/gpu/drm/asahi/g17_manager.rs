@@ -3202,6 +3202,13 @@ impl G17PManagerConstruction {
         if self.render_tracker.is_some() || self.render_hardware_buffer_id.is_some() {
             return Err(EBUSY);
         }
+        if g17_resources::g17p_render_tvb_mode() >= 2 {
+            let required=g17_resources::required_render_tvb_blocks(&command.parameters,self.num_clusters).ok_or(EINVAL)?;
+            if self.render_storage.as_ref().is_some_and(|storage| storage.tvb_capacity()<required) {
+                self.require_retired_render_owner()?;
+                self.resources.grow_render_tvb(self.render_storage.as_mut().ok_or(EIO)?,vm,required)?;
+            }
+        }
         self.render_auxiliary_timestamp = G17P_NATIVE_RENDER_KICK_AUXILIARY;
         let (hardware_buffer_id, parameter_buffer_token) = self
             .render_hardware_buffer_ids
@@ -3228,9 +3235,14 @@ impl G17PManagerConstruction {
             registers,
         );
         if result.is_err() && !self.render_hardware_buffer_published {
+            // acquire() stages a copy of the completed FList owner. Until
+            // outer publication it holds no firmware reference and must be
+            // cancelled with the HardwareBufferID reservation. Otherwise a
+            // fallible PM allocation leaves every later VM handoff EBUSY.
+            self.prepared_render_flist = None;
+            self.render_auxiliary_timestamp = 0;
             let id = self.render_hardware_buffer_id.take().ok_or(EIO)?;
             self.render_hardware_buffer_ids.release(id).map_err(|_| EIO)?;
-            self.render_auxiliary_timestamp = 0;
         }
         result
     }

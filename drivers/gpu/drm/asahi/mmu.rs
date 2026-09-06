@@ -1145,6 +1145,8 @@ no_debug!(VmDriverMappings);
 /// Vm and would make this cache keep itself alive.
 struct VmRenderPoolMappings {
     pool_id: u64,
+    /// Number of this pool's TVB blocks mapped in this VM (zero for compute).
+    tvb_blocks: usize,
     mappings: KVec<KernelMapping>,
 }
 no_debug!(VmRenderPoolMappings);
@@ -2170,6 +2172,7 @@ impl Vm {
     pub(crate) fn install_render_pool_mappings(
         &self,
         pool_id: u64,
+        tvb_blocks: usize,
         mappings: KVec<KernelMapping>,
     ) -> Result {
         if pool_id == 0 {
@@ -2180,7 +2183,39 @@ impl Vm {
         if driver.render_pool.is_some() {
             return Err(EBUSY);
         }
-        driver.render_pool = Some(VmRenderPoolMappings { pool_id, mappings });
+        driver.render_pool = Some(VmRenderPoolMappings { pool_id, tvb_blocks, mappings });
+        Ok(())
+    }
+
+    pub(crate) fn render_pool_tvb_blocks(&self, pool_id: u64) -> Option<usize> {
+        if pool_id == 0 { return None; }
+        self.driver_mappings.lock().as_ref()?.render_pool.as_ref()
+            .filter(|pool| pool.pool_id == pool_id).map(|pool| pool.tvb_blocks)
+    }
+
+    /// Append newly backed blocks without replacing any existing VM alias.
+    /// Both allocation and the expected-capacity check precede mutation. The
+    /// caller only publishes the enlarged PM pool after this succeeds.
+    pub(crate) fn append_render_pool_mappings(
+        &self, pool_id: u64, previous_blocks: usize, tvb_blocks: usize,
+        mappings: KVec<KernelMapping>,
+    ) -> Result {
+        if pool_id == 0 || tvb_blocks <= previous_blocks
+            || mappings.len() != tvb_blocks - previous_blocks { return Err(EINVAL); }
+        let mut retained = self.driver_mappings.lock();
+        let pool = Option::as_mut(&mut *retained).and_then(|driver| driver.render_pool.as_mut())
+            .filter(|pool| pool.pool_id == pool_id).ok_or(EINVAL)?;
+        if pool.tvb_blocks != previous_blocks { return Err(EBUSY); }
+        let added = mappings.len();
+        let length = pool.mappings.len().checked_add(added).ok_or(EOVERFLOW)?;
+        pool.mappings.reserve(added, GFP_KERNEL)?;
+        for (slot, mapping) in pool.mappings.spare_capacity_mut().iter_mut().zip(mappings) {
+            slot.write(mapping);
+        }
+        // SAFETY: reserve provided room for every element of the exact-size
+        // mapping vector, and the loop initialized those added slots once.
+        unsafe { pool.mappings.set_len(length); }
+        pool.tvb_blocks = tvb_blocks;
         Ok(())
     }
 
@@ -2220,7 +2255,7 @@ impl Vm {
         if driver.compute_pool.is_some() {
             return Err(EBUSY);
         }
-        driver.compute_pool = Some(VmRenderPoolMappings { pool_id, mappings });
+        driver.compute_pool = Some(VmRenderPoolMappings { pool_id, tvb_blocks: 0, mappings });
         Ok(())
     }
 

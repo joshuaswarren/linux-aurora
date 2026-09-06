@@ -268,8 +268,27 @@ const G17P_NATIVE_TVB_BLOCK_PAGE_IDS: [u32; 32] = [
     0xa4, 0xa9, 0xae, 0xb3, 0xb8, 0xbd, 0xc2, 0xc7,
 ];
 
+// The captured cold32 blocks are allocator results, not a hardware limit.
+// Keep them stable, then reserve a disjoint compact-GART arena for incremental
+// backing beyond the32-MiB command heap and the32..33-MiB render-state aliases.
+// Reserving virtual addresses does not allocate any parameter-buffer memory.
+const G17P_RENDER_TVB_GROWTH_START: u64 = G17P_RENDER_USER_BASE + 0x0400_0000;
+const G17P_RENDER_TVB_GROWTH_END: u64 = G17P_RENDER_TVB_GROWTH_START
+    + ((G17P_PM_MAX_OWNED_BLOCKS - G17P_PM_BLOCK_COUNT) * G17P_RENDER_TVB_BLOCK_STRIDE) as u64;
+
+fn g17p_tvb_block_page_id(index: usize) -> Option<u32> {
+    if let Some(page) = G17P_NATIVE_TVB_BLOCK_PAGE_IDS.get(index) {
+        return Some(*page);
+    }
+    if index >= G17P_PM_MAX_OWNED_BLOCKS { return None; }
+    let relative = G17P_RENDER_TVB_GROWTH_START.checked_sub(G17P_RENDER_USER_BASE)?
+        .checked_add(((index - G17P_PM_BLOCK_COUNT) as u64)
+            .checked_mul(G17P_RENDER_TVB_BLOCK_STRIDE as u64)?)?;
+    u32::try_from(relative.checked_div(G17P_PM_PAGE_SIZE as u64)?).ok()
+}
+
 fn g17p_native_tvb_block_va(index: usize) -> Option<u64> {
-    let page = u64::from(*G17P_NATIVE_TVB_BLOCK_PAGE_IDS.get(index)?);
+    let page = u64::from(g17p_tvb_block_page_id(index)?);
     G17P_RENDER_USER_BASE.checked_add(page.checked_mul(G17P_PM_PAGE_SIZE as u64)?)
 }
 
@@ -772,6 +791,12 @@ fn g17p_parameter_management_layout() -> Option<G17PParameterManagementLayout> {
 
 fn align_four(value: usize) -> Option<usize> {
     value.checked_add(3).map(|value| value & !3)
+}
+
+pub(crate) fn required_render_tvb_blocks(
+    parameters: &g17_render::G17pRenderParameters, num_clusters: u32,
+) -> Option<usize> {
+    g17p_render_state_layout(parameters,num_clusters).map(|layout| layout.tvb_blocks)
 }
 
 fn g17p_render_state_layout(
@@ -1749,10 +1774,25 @@ impl RenderBackingObject {
 /// plus an unmapped 0x8000 guard), while each data block is independently
 /// mapped at the exact page ID consumed by PB/TA hardware.
 #[cfg(not(test))]
+struct G17PRenderTvbExtension {
+    first_block: usize,
+    block_count: usize,
+    backing: RenderBackingObject,
+}
+
+#[cfg(not(test))]
+struct G17PRenderTvbGrowth {
+    extension: G17PRenderTvbExtension,
+    mappings: KVec<mmu::KernelMapping>,
+}
+
+#[cfg(not(test))]
 struct G17PRenderTvb {
     block_mappings: KVec<mmu::KernelMapping>,
     block_count: usize,
+    primary_block_count: usize,
     backing: RenderBackingObject,
+    extensions: KVec<G17PRenderTvbExtension>,
     logical_size: usize,
 }
 
@@ -1764,7 +1804,7 @@ impl G17PRenderTvb {
         render_layout: &G17PRenderStateLayout,
     ) -> Result<Self> {
         if render_layout.tvb_blocks == 0
-            || render_layout.tvb_blocks > G17P_NATIVE_TVB_BLOCK_PAGE_IDS.len()
+            || render_layout.tvb_blocks > G17P_PM_MAX_OWNED_BLOCKS
         {
             return Err(ERANGE);
         }
@@ -1837,27 +1877,77 @@ impl G17PRenderTvb {
         Ok(Self {
             block_mappings,
             block_count: render_layout.tvb_blocks,
+            primary_block_count: render_layout.tvb_blocks,
             backing,
+            extensions: KVec::new(),
             logical_size: render_layout.tvb_size,
         })
     }
 
-    /// Install only PTEs on first use by another VM. The live PB backing and
-    /// firmware-owned page lists/cursors remain exactly the same objects.
-    fn map_cached_blocks(&mut self, vm: &mmu::Vm) -> Result<KVec<mmu::KernelMapping>> {
-        let mut aliases = KVec::with_capacity(self.block_count, GFP_KERNEL)?;
-        for index in 0..self.block_count {
-            let start = index.checked_mul(G17P_RENDER_TVB_BLOCK_STRIDE).ok_or(EOVERFLOW)?;
-            let end = start.checked_add(G17P_RENDER_TVB_BLOCK_SIZE).ok_or(EOVERFLOW)?;
-            if end > self.backing.logical_size { return Err(ERANGE); }
+    fn block_backing(&mut self, index: usize) -> Result<(&mut RenderBackingObject, usize)> {
+        if index < self.primary_block_count { return Ok((&mut self.backing,index)); }
+        for extension in self.extensions.iter_mut() {
+            if index >= extension.first_block && index - extension.first_block < extension.block_count {
+                return Ok((&mut extension.backing,index-extension.first_block));
+            }
+        }
+        Err(EINVAL)
+    }
+
+    fn map_cached_blocks_from(&mut self, vm: &mmu::Vm, first: usize) -> Result<KVec<mmu::KernelMapping>> {
+        let count = self.block_count.checked_sub(first).ok_or(EINVAL)?;
+        let mut aliases = KVec::with_capacity(count,GFP_KERNEL)?;
+        for index in first..self.block_count {
             let address = g17p_native_tvb_block_va(index).ok_or(EINVAL)?;
-            aliases.push(self.backing.object.map_range_into_range(
-                vm, start..end,
-                address..address + G17P_RENDER_TVB_BLOCK_SIZE as u64,
-                G17P_PM_PAGE_SIZE as u64, mmu::PROT_GPU_SHARED_RW, false,
-            )?, GFP_KERNEL)?;
+            let (backing, relative) = self.block_backing(index)?;
+            let start = relative.checked_mul(G17P_RENDER_TVB_BLOCK_STRIDE).ok_or(EOVERFLOW)?;
+            let end = start.checked_add(G17P_RENDER_TVB_BLOCK_SIZE).ok_or(EOVERFLOW)?;
+            if end > backing.logical_size { return Err(ERANGE); }
+            aliases.push(backing.object.map_range_into_range(
+                vm,start..end,address..address+G17P_RENDER_TVB_BLOCK_SIZE as u64,
+                G17P_PM_PAGE_SIZE as u64,mmu::PROT_GPU_SHARED_RW,false,
+            )?,GFP_KERNEL)?;
         }
         Ok(aliases)
+    }
+
+    /// Install only PTEs on first use; preserve all physical pool blocks.
+    fn map_cached_blocks(&mut self, vm: &mmu::Vm) -> Result<KVec<mmu::KernelMapping>> {
+        self.map_cached_blocks_from(vm,0)
+    }
+
+    fn prepare_growth(&mut self, dev: &AsahiDevice, vm: &mmu::Vm, blocks: usize)
+        -> Result<Option<G17PRenderTvbGrowth>>
+    {
+        if blocks <= self.block_count { return Ok(None); }
+        if blocks > G17P_PM_MAX_OWNED_BLOCKS { return Err(ERANGE); }
+        let count = blocks - self.block_count;
+        let size = (count-1).checked_mul(G17P_RENDER_TVB_BLOCK_STRIDE)
+            .and_then(|size| size.checked_add(G17P_RENDER_TVB_BLOCK_SIZE)).ok_or(EOVERFLOW)?;
+        self.extensions.reserve(1,GFP_KERNEL)?;
+        let mut backing = RenderBackingObject::new(dev,size)?;
+        backing.with_bytes_mut(|bytes| {bytes.fill(0);Ok(())})?;
+        let mut mappings = KVec::with_capacity(count,GFP_KERNEL)?;
+        for relative in 0..count {
+            let index = self.block_count + relative;
+            let address = g17p_native_tvb_block_va(index).ok_or(EINVAL)?;
+            let start = relative.checked_mul(G17P_RENDER_TVB_BLOCK_STRIDE).ok_or(EOVERFLOW)?;
+            mappings.push(backing.object.map_range_into_range(
+                vm,start..start+G17P_RENDER_TVB_BLOCK_SIZE,
+                address..address+G17P_RENDER_TVB_BLOCK_SIZE as u64,
+                G17P_PM_PAGE_SIZE as u64,mmu::PROT_GPU_SHARED_RW,false,
+            )?,GFP_KERNEL)?;
+        }
+        Ok(Some(G17PRenderTvbGrowth {
+            extension:G17PRenderTvbExtension {first_block:self.block_count,block_count:count,backing},
+            mappings,
+        }))
+    }
+
+    fn with_block_bytes<R>(&mut self,index:usize,f:impl FnOnce(&mut [u8])->Result<R>) -> Result<R> {
+        let (backing,relative)=self.block_backing(index)?;
+        let start=relative.checked_mul(G17P_RENDER_TVB_BLOCK_STRIDE).ok_or(EOVERFLOW)?;
+        backing.with_bytes_mut(|raw| f(raw.get_mut(start..start+G17P_RENDER_TVB_BLOCK_SIZE).ok_or(ERANGE)?))
     }
 
     fn iova(&self) -> u64 {
@@ -1869,7 +1959,7 @@ impl G17PRenderTvb {
     }
 
     fn all_reachable_from(&self, vm: &mmu::Vm) -> bool {
-        self.block_count == G17P_NATIVE_TVB_BLOCK_PAGE_IDS.len()
+        self.block_count >= G17P_PM_BLOCK_COUNT && self.block_count <= G17P_PM_MAX_OWNED_BLOCKS
             && self.logical_size >= (self.block_count - 1) * G17P_RENDER_TVB_BLOCK_STRIDE + G17P_RENDER_TVB_BLOCK_SIZE
             && (0..self.block_count).all(|index| {
                 g17p_native_tvb_block_va(index).is_some_and(|address| {
@@ -4371,6 +4461,8 @@ const G17P_PM_PAGE_SIZE: usize = 0x8000;
 const G17P_PM_PAGES_PER_BLOCK: usize = 4;
 const G17P_PM_BLOCK_COUNT: usize = 32;
 const G17P_PM_MAX_BLOCKS: usize = 0xd1a;
+// Native createParameterBufferBlock keeps one block-ring slot empty.
+const G17P_PM_MAX_OWNED_BLOCKS: usize = G17P_PM_MAX_BLOCKS - 1;
 const G17P_PM_MAX_BLOCKS_NOMEMLESS: usize = 0x45e;
 
 const G17P_PM_HWPB_STATE_SIZE: usize = 0xc0;
@@ -4487,14 +4579,14 @@ fn encode_g17p_parameter_management(
 ) -> Result {
     if raw.len() < pm_layout.total_size
         || render_layout.tvb_blocks < G17P_PM_BLOCK_COUNT
-        || render_layout.tvb_blocks > G17P_PM_MAX_BLOCKS
+        || render_layout.tvb_blocks > G17P_PM_MAX_OWNED_BLOCKS
     {
         return Err(EINVAL);
     }
 
     raw.fill(0);
     if tvb_va != g17p_native_tvb_block_va(0).ok_or(EINVAL)?
-        || render_layout.tvb_blocks > G17P_NATIVE_TVB_BLOCK_PAGE_IDS.len()
+        || render_layout.tvb_blocks > G17P_PM_MAX_OWNED_BLOCKS
     {
         return Err(EINVAL);
     }
@@ -4518,7 +4610,7 @@ fn encode_g17p_parameter_management(
         // VA -- the two were conflated. With the segment retained this driver
         // published page-list=[0x200420, ...] (bit 21 set), naming pages in an
         // address class the parameter-buffer manager does not use.
-        let first_page = *G17P_NATIVE_TVB_BLOCK_PAGE_IDS.get(index).ok_or(EINVAL)?;
+        let first_page = g17p_tvb_block_page_id(index).ok_or(EINVAL)?;
         let block_va = g17p_native_tvb_block_va(index).ok_or(EINVAL)?;
         let block_end = block_va
             .checked_add(G17P_RENDER_TVB_BLOCK_SIZE as u64)
@@ -4773,10 +4865,11 @@ impl G17PParameterManagement {
         // This retained pool already owns its PBDesc slot and fixed TVB
         // backing. A resize/new ID requires a real allocation/update lifetime,
         // not rewriting the live table as if it were cold state.
-        if self.hardware_buffer_id != hardware_buffer_id
+        if render_layout.tvb_blocks < G17P_PM_BLOCK_COUNT
+            || self.hardware_buffer_id != hardware_buffer_id
             || self.page_list_vas != page_list_vas
             || render_layout.tvb_blocks.checked_mul(G17P_PM_PAGES_PER_BLOCK)
-                != Some(self.page_count as usize)
+                .is_none_or(|pages| pages > self.page_count as usize)
         {
             return Err(ENOTSUPP);
         }
@@ -6298,6 +6391,10 @@ impl G17PUserRenderStorage {
         })
     }
 
+    pub(crate) fn tvb_capacity(&self) -> usize {
+        self.render_tvb.as_ref().map_or(0, |tvb| tvb.block_count)
+    }
+
     pub(crate) fn render_pool_id(&self) -> u64 {
         // This checked, monotonic native GID reservation is unique to this
         // retained graph, even if its GPU addresses are reused after reset.
@@ -6404,7 +6501,7 @@ impl G17PUserRenderStorage {
         if g17p_render_tvb_enabled() {
             let tvb = self.render_tvb.as_mut().ok_or(EIO)?;
             if tvb.logical_size < render_layout.tvb_size
-                || render_layout.tvb_blocks != G17P_PM_BLOCK_COUNT
+                || render_layout.tvb_blocks > tvb.block_count
                 || !tvb.all_reachable_from(vm)
             {
                 return Err(ERANGE);
@@ -6863,28 +6960,24 @@ impl G17PUserRenderStorage {
         let tvb_nonzero = self.render_tvb.as_mut().map(|tvb| {
             let block_count = tvb.block_count;
             let size = block_count * G17P_RENDER_TVB_BLOCK_SIZE;
-            tvb.with_bytes_mut(|raw| {
-                let mut count = 0usize;
+            (|| -> Result<usize> {
+                let mut count=0usize;
                 for block in 0..block_count {
-                    let source = block
-                        .checked_mul(G17P_RENDER_TVB_BLOCK_STRIDE)
-                        .ok_or(EOVERFLOW)?;
-                    let bytes = raw
-                        .get(source..source + G17P_RENDER_TVB_BLOCK_SIZE)
-                        .ok_or(ERANGE)?;
-                    count += bytes.iter().filter(|byte| **byte != 0).count();
-                    if first == usize::MAX {
-                        if let Some(at) = bytes.iter().position(|byte| *byte != 0) {
-                            first = block * G17P_RENDER_TVB_BLOCK_SIZE + at;
-                            let start = at & !0xf;
-                            for (index, slot) in window.iter_mut().enumerate() {
-                                *slot = bytes.get(start + index).copied().unwrap_or(0);
+                    count+=tvb.with_block_bytes(block,|bytes| {
+                        if first==usize::MAX {
+                            if let Some(at)=bytes.iter().position(|byte| *byte!=0) {
+                                first=block*G17P_RENDER_TVB_BLOCK_SIZE+at;
+                                let start=at & !0xf;
+                                for (index,slot) in window.iter_mut().enumerate() {
+                                    *slot=bytes.get(start+index).copied().unwrap_or(0);
+                                }
                             }
                         }
-                    }
+                        Ok(bytes.iter().filter(|byte| **byte!=0).count())
+                    })?;
                 }
                 Ok(count)
-            })
+            })()
             .map(|count| (count, size))
             .unwrap_or((usize::MAX, size))
         });
@@ -7279,7 +7372,8 @@ impl G17PUserRenderStorage {
                 "render-tvb-native-identity",
                 self.render_tvb.as_ref().map_or(true, |tvb| {
                     tvb.iova() == g17p_native_tvb_block_va(0).unwrap_or(0)
-                        && tvb.block_count == G17P_PM_BLOCK_COUNT
+                        && tvb.block_count >= G17P_PM_BLOCK_COUNT
+                        && tvb.block_count <= G17P_PM_MAX_OWNED_BLOCKS
                 }),
             ),
             (
@@ -13251,7 +13345,8 @@ impl G17ResourceOwner {
             storage.render_operand_aliases.push(mapping, GFP_KERNEL)?;
         }
         let aliases = storage.take_persistent_client_mappings()?;
-        vm.install_render_pool_mappings(storage.render_pool_id(), aliases)?;
+        vm.install_render_pool_mappings(storage.render_pool_id(),
+            storage.render_tvb.as_ref().map_or(0, |tvb| tvb.block_count), aliases)?;
         self.stage_render_parameter_buffer_page_list(&mut storage)?;
         self.stage_render_parameter_buffer_descriptor(storage.parameter_buffer_descriptor()?)?;
         Ok(storage)
@@ -13259,18 +13354,111 @@ impl G17ResourceOwner {
 
     /// Prepare the incoming VM without changing the active execution root.
     /// Mapping failure drops only its new aliases; prior clients remain live.
+    /// Grow only at the manager's paired-retirement boundary. Every backing,
+    /// mapping and CPU view is prepared before publishing the enlarged native
+    /// PM inventory; a failed allocation leaves the previous capacity intact.
+    pub(crate) fn grow_render_tvb(
+        &mut self, storage: &mut G17PUserRenderStorage, vm: &mmu::Vm, blocks: usize,
+    ) -> Result {
+        let pool_id=storage.render_pool_id();
+        let tvb=storage.render_tvb.as_mut().ok_or(EINVAL)?;
+        let previous_blocks=tvb.block_count;
+        if blocks <= previous_blocks { return Ok(()); }
+        if vm.render_pool_tvb_blocks(pool_id) != Some(previous_blocks) || !tvb.all_reachable_from(vm) {
+            return Err(EFAULT);
+        }
+        let growth=tvb.prepare_growth(self.dev(),vm,blocks)?.ok_or(EINVAL)?;
+        let pm=storage.parameter_management.as_mut().ok_or(EIO)?;
+        let page_count=blocks.checked_mul(G17P_PM_PAGES_PER_BLOCK)
+            .and_then(|count| u32::try_from(count).ok()).ok_or(EOVERFLOW)?;
+        let logical_size=(blocks-1).checked_mul(G17P_RENDER_TVB_BLOCK_STRIDE)
+            .and_then(|size| size.checked_add(G17P_RENDER_TVB_BLOCK_SIZE)).ok_or(EOVERFLOW)?;
+        let mut page_ids=KVec::with_capacity(blocks,GFP_KERNEL)?;
+        for block in 0..blocks {
+            page_ids.push(g17p_tvb_block_page_id(block).ok_or(EINVAL)?,GFP_KERNEL)?;
+        }
+        let descriptor_offset=g17_submission::g17p_pbdesc_offset(pm.hardware_buffer_id);
+        let page_list_address=pm.page_list_low_va();
+        let pm_layout=pm.layout;
+        let page_list=&mut self.resources.partial_primary_index;
+        let descriptor=&mut self.resources.pb_descriptor_table;
+        pm.backing.with_bytes_mut(|pm_raw| {
+            page_list.with_bytes_mut(|page_raw| {
+                descriptor.with_bytes_mut(|desc_raw| {
+                    let descriptor_end=descriptor_offset.checked_add(g17_submission::G17P_PBDESC_ENTRY_SIZE).ok_or(EOVERFLOW)?;
+                    if pm_raw.len()<pm_layout.total_size || page_raw.len()<G17P_PM_PAGE_LIST_SIZE
+                        || descriptor_end>desc_raw.len() || tvb.extensions.len()==tvb.extensions.capacity()
+                    { return Err(ERANGE); }
+                    let mut previous=[0u32;4];
+                    for (word,value) in previous.iter_mut().enumerate() {
+                        let at=descriptor_offset+word*4;
+                        *value=u32::from_le_bytes(desc_raw[at..at+4].try_into().map_err(|_| EINVAL)?);
+                    }
+                    let encoded=g17_submission::encode_g17p_pbdesc(previous,page_list_address,page_count,
+                        g17_submission::G17PPbDescRingState::default());
+                    // This is the last fallible step. Alias allocation/count
+                    // checking completes before any firmware-visible write.
+                    vm.append_render_pool_mappings(pool_id,previous_blocks,blocks,growth.mappings)?;
+                    for (block,first) in page_ids.into_iter().enumerate() {
+                        put_u32(pm_raw,pm_layout.block_page_bases+block*8,first);
+                        for page in 0..G17P_PM_PAGES_PER_BLOCK {
+                            let at=(block*G17P_PM_PAGES_PER_BLOCK+page)*4;
+                            put_u32(pm_raw,pm_layout.page_list+at,first+page as u32);
+                            put_u32(page_raw,at,first+page as u32);
+                        }
+                    }
+                    // AGXParameterManagement::buildPageList,8a71908: rebuild
+                    // the available inventory/cursors without clearing Scene
+                    // entries, firmware timestamps or the retained blocks.
+                    let state=pm_layout.hwpb_state;
+                    put_u32(pm_raw,state+0x34,page_count);
+                    put_u32(pm_raw,state+0x3c,blocks as u32);
+                    put_u32(pm_raw,state+0x40,0);
+                    put_u32(pm_raw,state+0x54,page_count-1);
+                    // Native createParameterBufferBlock advances total;
+                    // commitStagedUpdates publishes the same committed end.
+                    // This retained owner never removes or reuses block-ring
+                    // slots, so the original firmware cursor remains intact.
+                    put_u32(pm_raw,pm_layout.shared_control,blocks as u32);
+                    put_u32(pm_raw,pm_layout.shared_control+4,blocks as u32);
+                    for (word,value) in encoded.into_iter().enumerate() {
+                        put_u32(desc_raw,descriptor_offset+word*4,value);
+                    }
+                    let length=tvb.extensions.len();
+                    tvb.extensions.spare_capacity_mut()[0].write(growth.extension);
+                    // SAFETY: prepare_growth reserved one extension entry;
+                    // this commit initialized that exact spare slot once.
+                    unsafe { tvb.extensions.set_len(length+1); }
+                    tvb.block_count=blocks;
+                    tvb.logical_size=logical_size;
+                    Ok(())
+                })
+            })
+        })?;
+        pm.page_count=page_count;
+        core::sync::atomic::fence(Ordering::SeqCst);
+        dev_info!(self.dev().as_ref(),"G17P render TVB grew: blocks {} -> {} pages={} retained-backing=true\n",
+            previous_blocks,blocks,page_count);
+        Ok(())
+    }
+
     pub(crate) fn cache_render_vm_mappings(
         &mut self, storage: &mut G17PUserRenderStorage, vm: &mmu::Vm,
     ) -> Result {
-        if vm.render_pool_mappings_match(storage.render_pool_id()) {
-            return Ok(());
+        if let Some(mapped_blocks)=vm.render_pool_tvb_blocks(storage.render_pool_id()) {
+            let blocks=storage.tvb_capacity();
+            if mapped_blocks==blocks { return Ok(()); }
+            let tvb=storage.render_tvb.as_mut().ok_or(EIO)?;
+            let aliases=tvb.map_cached_blocks_from(vm,mapped_blocks)?;
+            return vm.append_render_pool_mappings(storage.render_pool_id(),mapped_blocks,blocks,aliases);
         }
         vm.clear_render_pool_mappings();
         let mut aliases = storage.map_persistent_client_aliases(vm)?;
         for mapping in self.stage_user_render_flist(vm)? {
             aliases.push(mapping, GFP_KERNEL)?;
         }
-        vm.install_render_pool_mappings(storage.render_pool_id(), aliases)
+        vm.install_render_pool_mappings(storage.render_pool_id(),
+            storage.render_tvb.as_ref().map_or(0, |tvb| tvb.block_count), aliases)
     }
 
     /// Upgrade an ordinary compute-capable client VM to the complete native
@@ -13725,6 +13913,7 @@ impl G17ResourceOwner {
                 .ok_or(EOVERFLOW)?;
             reserved_ranges.push(start..end, GFP_KERNEL)?;
         }
+        reserved_ranges.push(G17P_RENDER_TVB_GROWTH_START..G17P_RENDER_TVB_GROWTH_END, GFP_KERNEL)?;
         reserved_ranges.push(G17P_RENDER_AUX_ALIAS_START..G17P_RENDER_AUX_ALIAS_END, GFP_KERNEL)?;
         reserved_ranges.push(
             self.resources.parameter_metrics_low_va
