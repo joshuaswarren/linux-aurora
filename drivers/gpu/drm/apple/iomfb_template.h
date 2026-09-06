@@ -31,6 +31,20 @@ struct DCP_FW_NAME(dcp_swap) {
 	u64 flags1;
 	u64 flags2;
 
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+	/*
+	 * H17P inserts 0x48 bytes between flags2 and the swap ID.  Live macOS
+	 * 25G83 traces put the value A406 returned as the swap id at +0x98, in
+	 * 1919 of 1919 swaps across two independent captures; at the pre-H17P
+	 * +0x50 it matches in 0 of 1919.  Every following field lines up once
+	 * this shift is applied: surf_ids +0x9c, src_rect +0xac, surf_flags
+	 * +0xec, dst_rect +0x10c, swap_enabled/completed +0x14c/+0x150,
+	 * bg_color +0x154.  The two u32s the firmware does keep in this gap
+	 * (at +0x50 and +0x78) are small counters we do not model yet.
+	 */
+	u8 h17p_pre_swap_id[0x48];
+#endif
+
 	u32 swap_id;
 
 	u32 surf_ids[SWAP_SURFACES];
@@ -64,7 +78,7 @@ struct DCP_FW_NAME(dcp_swap) {
 	 * dcp_surface_h17p = 0x22c, SWAP_SURFACES = 4 and no surf2 block leaves
 	 * exactly 0x122 here.  0x278 makes dcp_swap 0x6e0 and forces a
 	 * non-integer surface size, so it cannot be right. */
-	u8 h17p_tail[0x122];
+	u8 h17p_tail[0xda];
 #endif
 } __packed;
 
