@@ -1744,17 +1744,32 @@ static int dcp_count_disp_regs(struct device *dev)
 static int dcp_get_disp_regs(struct apple_dcp *dcp)
 {
 	struct platform_device *pdev = to_platform_device(dcp->dev);
-	char name[sizeof("disp-0")];
-	int count = 0;
+	int count = dcp_count_disp_regs(dcp->dev);
+	bool by_name = count > 0;
 	int i, ret;
 
-	for (i = 0; i < MAX_DISP_REGISTERS; ++i) {
-		snprintf(name, sizeof(name), "disp-%d", i);
-		dcp->disp_registers[i] =
-			platform_get_resource_byname(pdev, IORESOURCE_MEM, name);
-		if (!dcp->disp_registers[i])
-			break;
-		count++;
+	/* Device trees without reg-names keep the historical positional form. */
+	if (!by_name)
+		count = pdev->num_resources - 1;
+
+	if (count <= 0 || count > MAX_DISP_REGISTERS)
+		return -EINVAL;
+
+	for (i = 0; i < count; ++i) {
+		if (by_name) {
+			char name[8];
+
+			snprintf(name, sizeof(name), "disp-%d", i);
+			dcp->disp_registers[i] = platform_get_resource_byname(
+				pdev, IORESOURCE_MEM, name);
+		} else {
+			dcp->disp_registers[i] = platform_get_resource(
+				pdev, IORESOURCE_MEM, 1 + i);
+		}
+		if (!dcp->disp_registers[i]) {
+			dev_err(dcp->dev, "missing display register %d\n", i);
+			return -EINVAL;
+		}
 	}
 
 	if (!count)
