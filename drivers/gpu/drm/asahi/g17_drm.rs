@@ -433,6 +433,10 @@ struct G17PQueue {
     fence_contexts: FenceContexts,
     async_backend: Option<Arc<G17PAsyncQueueBackend>>,
     async_scheduler: Option<g17_job::G17PJobScheduler<G17PAsyncQueueBackend>>,
+    /// Most recent compute job submitted through this logical DRM queue.
+    /// Render still uses the synchronous G17P path, so it must explicitly
+    /// join the scheduler timeline before acquiring the render lease.
+    last_async_compute: Option<Fence>,
     id: u64,
 }
 
@@ -539,6 +543,7 @@ impl G17PQueue {
             fence_contexts,
             async_backend: Some(backend),
             async_scheduler: Some(scheduler),
+            last_async_compute: None,
             id,
         })
     }
@@ -639,6 +644,7 @@ impl G17PQueue {
         }
         let finished = self.async_scheduler.as_mut().ok_or(EIO)?.enqueue(packet, dependencies)?;
         Self::install_output_fences(syncs.into_iter(), &finished);
+        self.last_async_compute = Some(finished);
         pr_info!("G17P async submit: QUEUED submission {} owner={} qid={} context={}\n",
             submission_id, self.id, backend.hardware_queue, backend.context.context_id());
         Ok(())
@@ -739,6 +745,30 @@ impl G17PQueue {
             .map_err(|error| Self::stage_fail(submission_id, "wait-input-fences", error))?;
         self.registry.acquire_lease(self.id)
             .map_err(|error| Self::stage_fail(submission_id, "acquire-lease", error))
+    }
+
+    fn join_async_compute_timeline(&mut self, submission_id: u64) -> Result {
+        let Some(fence) = self.last_async_compute.as_ref() else {
+            return Ok(());
+        };
+        // SAFETY: the queue owns `fence` until this wait returns.
+        let ret = unsafe {
+            bindings::dma_fence_wait_timeout(
+                fence.raw(),
+                true,
+                kernel::task::MAX_SCHEDULE_TIMEOUT,
+            )
+        };
+        if ret < 0 {
+            return Err(Self::stage_fail(
+                submission_id,
+                "wait-queue-compute",
+                Error::from_errno(ret as i32),
+            ));
+        }
+        self.last_async_compute = None;
+        if self.vm.status().get() != 0 { return Err(EIO); }
+        Ok(())
     }
 
     fn timestamp_address(
@@ -1400,6 +1430,8 @@ impl queue::Queue for G17PQueue {
         if let G17PPendingCommand::Compute(translated) = pending {
             return self.submit_compute_async(submission_id, translated, syncs, in_sync_count, objects);
         }
+
+        self.join_async_compute_timeline(submission_id)?;
 
         // Dependencies must become ready before reserving the physical
         // queues: their signalling submission may belong to another client.
