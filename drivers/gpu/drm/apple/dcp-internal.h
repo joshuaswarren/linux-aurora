@@ -180,7 +180,6 @@ struct apple_dcp {
 
 	/* clock rate request by dcp in */
 	struct clk *clk;
-	struct reset_control *reset;
 	struct clk *clk_194;
 
 	/* DCP shared memory */
