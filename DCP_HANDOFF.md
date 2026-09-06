@@ -7,7 +7,8 @@ m1n1 `dcp-neo` (`aurora-silicon/m1n1@dcp-neo`) and macOS 25G83 traces.
 ## 1. What m1n1 hands over
 
 On T8140 m1n1 does **not** pass a live DCP session to Linux. `display_shutdown()`
-takes the "stopped" path (`src/display.c`):
+takes the "stopped" path (`src/display.c`). As of m1n1 `c8062429` the DCP node is
+left **available** to Linux at the end of this (see §3):
 
 1. Quiesce the inherited DCP without tearing down IPC.
 2. Drain the inherited crashlog.
@@ -52,31 +53,41 @@ When a DCPLink session was inherited, m1n1 additionally exports its mapping:
 A driver should read the state property and branch on it, rather than probing
 the hardware to guess what happened before it.
 
-## 3. Known blocker: the DCP node is disabled
+## 3. The DCP node used to be disabled — fixed in m1n1 c8062429
 
-In the `apple,dcp-asc-stopped` case m1n1 also calls
-`kboot_disable_stopped_dcp_nodes()`, which sets `status = "disabled"` on **both**
-the DCP node and its mailbox node in the FDT it hands Linux.
+Until m1n1 `c8062429`, the `apple,dcp-asc-stopped` case also called
+`kboot_disable_stopped_dcp_nodes()`, which marked **both** the DCP node and its
+mailbox unavailable in the FDT handed to Linux. Linux's OF core never creates a
+platform device for an unavailable node, so `apple-drm` was never probed and the
+stopped-handoff restart path below could not run at all. No driver-side change
+could compensate: the device simply did not exist.
 
-**Consequence: Linux never binds `apple-drm`.** The display driver cannot probe,
-so nothing below this line can be exercised on Neo as things stand.
+That call and its helper are now removed. Nothing else about the handoff changed
+— the ASC stop is still verified by readback and the inherited DART stream is
+still revoked, both failing closed — so no inherited state leaks into Linux. The
+driver is told what it inherited via `apple,dcp-asc-stopped` and decides for
+itself.
 
-This is deliberate and enforced by
-`tests/python/test_t8140_dcp_link_handoff_contract.py` on the m1n1 side, so
-changing it is a contract change, not a bug fix.
+**Verified on hardware** (J700, stage 2 `v1.6.0-263-gc8062429`):
 
-**Re-enabling the node may well be the whole fix.** This driver already handles
-the stopped handoff: `apple,dcp-asc-stopped` maps to
-`APPLE_DCP_COPROCESSOR_ASC_STOPPED_RESTART`, for which
-`apple_dcp_needs_fresh_boot()` is true, and there is a T8140-specific branch in
-`dcp_probe()` that reads the IOP VBAR and resolves it through the IOMMU before
-restarting the ASC. The `status = "disabled"` is what stops that code from ever
-running -- the OF core never creates the platform device, so no driver-side
-change can compensate.
+| | before | after |
+|---|---|---|
+| DCP node `status` | `fail` | `okay` |
+| platform device | did not exist | `412e00000.dcp` |
+| driver binding | impossible | `UNBOUND` |
 
-Until this is resolved, DCP driver work on J700 can only be validated by tracing
-macOS under the m1n1 hypervisor (see `MACOS_HV_AGX.md` in the m1n1 tree —
-DCP tracing rides along with `--agx-full`).
+It is `UNBOUND` rather than bound because `CONFIG_DRM_APPLE=m` and the module is
+not installed for the running kernel (`7.1.6-neo-g17p2`) — not because of
+anything in the handoff. Building and loading `apple_dcp` is the next step, and
+it is the first time this driver's stopped-handoff path will ever have run.
+
+All eight `/chosen` properties are visible to Linux after the change:
+`apple,dcp-asc-stopped`, `apple,dcp-rtkit-quiesced`, `apple,dcp-rtkit-idle`, and
+the five `apple,dcp-link-*` values.
+
+No regression from the change: the machine boots in ~75 s, `/dev/fb0` and
+simplefb are intact, and the only dmesg errors are the pre-existing
+`venc0_sys` power-state complaints.
 
 ## 4. macOS adopts the iBoot generation; it does not rebuild it
 
@@ -127,10 +138,11 @@ engages when no loader-handoff property is present and the coprocessor is still
 active.
 
 That is the higher-confidence route, but it is **not proven to be required**.
-The driver also implements a restart from the stopped state, and that path has
-never been exercised, because the node is disabled before it can be. Un-disable
-the node first and find out; only redesign the handoff if the restart genuinely
-fails.
+The driver also implements a restart from the stopped state. That path had never
+been exercised because the node was disabled before it could be; as of §3 the
+node is available and the platform device exists, so the experiment is now
+unblocked and simply needs the module loaded. Only redesign the handoff toward
+adoption if that restart genuinely fails.
 
 Note that `quiesced` being present is *not* what blocks adoption on real
 hardware — macOS boots fine with it set.
@@ -161,6 +173,12 @@ record carries **no `surf2` block**, and `dcp_swap_h17p` is `0x58a`
 
 ## 7. Status
 
-Everything in §6 is derived from captured traces and static RE and verified by
-compiling the struct definitions; **none of it has been exercised on hardware**,
-because of §3. Treat the first boot after §3 is resolved as bring-up.
+The m1n1 side of §3 is done and running on J700: the DCP node is available and
+the platform device exists.
+
+Everything in §6 — the swap ABI — is derived from captured traces and static RE
+and verified by compiling the struct definitions, but **has still never run on
+hardware**: the driver is not loaded yet (§3). The kernel currently on the
+machine, `7.1.6-neo-g17p2`, also predates that fix, so loading its `apple_dcp`
+would exercise the handoff but not the swap path. Treat the first probe as
+bring-up.
