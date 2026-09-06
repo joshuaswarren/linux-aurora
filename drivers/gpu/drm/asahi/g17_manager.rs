@@ -4687,12 +4687,12 @@ impl G17PManagerConstruction {
             tracker.tiling_previous = state.tiling;
             tracker.fragment_previous = state.fragment;
             if completion.complete {
-                // Publish exact GPU-written pairs while the completed job's
+                // Publish the exact GPU-written pass envelope while the completed job's
                 // VM binding, ordinal and QIDs are still owned.  This is
                 // observation only: it neither gates completion nor changes
                 // queue state.  Invalid retirement-only pairs are omitted.
-                if let Some([tiling_interval, fragment_interval]) =
-                    g17_completion::render_gpu_intervals(
+                if let Some(interval) =
+                    g17_completion::render_gpu_interval(
                         g17_completion::RenderExecutionState {
                             job_list_empty: state.job_list_empty,
                             tiling_timestamps: state.tiling_timestamps,
@@ -4712,16 +4712,14 @@ impl G17PManagerConstruction {
                         ));
                     dev_info!(
                         self.resources.dev().as_ref(),
-                        "G17P render: GPU-INTERVAL ordinal={} vm={} root={:#x} ta-qid={} ta-start={} ta-end={} fragment-qid={} fragment-start={} fragment-end={}\n",
+                        "G17P render: GPU-INTERVAL ordinal={} vm={} root={:#x} ta-qid={} fragment-qid={} start={} end={}\n",
                         self.render_submission_ordinal,
                         vm_id,
                         root,
                         tiling_qid,
-                        tiling_interval[0],
-                        tiling_interval[1],
                         fragment_qid,
-                        fragment_interval[0],
-                        fragment_interval[1],
+                        interval[0],
+                        interval[1],
                     );
                 }
                 // Native TA/3D complete subtract completed kicks from queue
