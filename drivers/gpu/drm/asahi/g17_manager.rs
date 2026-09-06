@@ -345,6 +345,7 @@ struct G17PBootstrapUmaLifecycle {
     hardware_buffer_owned: bool,
     hardware_buffer_references: u32,
     pending_release_count: u32,
+    release_producer_after: Option<u32>,
     request: Option<G17PBootstrapUmaCompletion>,
     state: G17PBootstrapUmaRequestState,
 }
@@ -362,6 +363,7 @@ impl G17PBootstrapUmaLifecycle {
             // point at which opcode 0x2e may be emitted.
             hardware_buffer_references: 4,
             pending_release_count: 2,
+            release_producer_after: None,
             request: Some(G17PBootstrapUmaCompletion {
                 stamp: G17P_BOOTSTRAP_UMA_STAMP,
                 hardware_buffer_id: G17P_BOOTSTRAP_UMA_HARDWARE_BUFFER_ID,
@@ -409,6 +411,7 @@ impl G17PBootstrapUmaLifecycle {
             hardware_buffer_owned: true,
             hardware_buffer_references: 3, // prepare + TA + 3D; no pending grow
             pending_release_count: 2,
+            release_producer_after: None,
             request: None,
             state: G17PBootstrapUmaRequestState::Submitted,
         })
@@ -500,24 +503,52 @@ impl G17PBootstrapUmaLifecycle {
         Ok(())
     }
 
-    fn mark_sent(&mut self) -> core::result::Result<(), G17PBootstrapUmaLifecycleError> {
-        if self.state != G17PBootstrapUmaRequestState::Published {
+    fn mark_sent(
+        &mut self,
+        producer_after: u32,
+    ) -> core::result::Result<(), G17PBootstrapUmaLifecycleError> {
+        if self.state != G17PBootstrapUmaRequestState::Published
+            || self.release_producer_after.is_some()
+        {
             return Err(G17PBootstrapUmaLifecycleError::WrongPhase);
         }
+        self.release_producer_after = Some(producer_after);
         self.state = G17PBootstrapUmaRequestState::Sent;
         Ok(())
     }
 
     fn release_sent(&self) -> bool {
         self.state == G17PBootstrapUmaRequestState::Sent
+            && self.release_producer_after.is_some()
     }
 
-    fn mark_completed(&mut self) -> core::result::Result<(), G17PBootstrapUmaLifecycleError> {
+    fn mark_completed(
+        &mut self,
+        producer_after: u32,
+    ) -> core::result::Result<(), G17PBootstrapUmaLifecycleError> {
+        if !self.release_sent() || self.release_producer_after != Some(producer_after) {
+            return Err(G17PBootstrapUmaLifecycleError::WrongPhase);
+        }
+        self.release_producer_after = None;
+        self.state = G17PBootstrapUmaRequestState::Completed;
+        Ok(())
+    }
+
+    fn observe_release_consumer(
+        &mut self,
+        consumer: u32,
+    ) -> core::result::Result<bool, G17PBootstrapUmaLifecycleError> {
+        let target = self
+            .release_producer_after
+            .ok_or(G17PBootstrapUmaLifecycleError::WrongPhase)?;
         if !self.release_sent() {
             return Err(G17PBootstrapUmaLifecycleError::WrongPhase);
         }
-        self.state = G17PBootstrapUmaRequestState::Completed;
-        Ok(())
+        if consumer != target {
+            return Ok(false);
+        }
+        self.mark_completed(target)?;
+        Ok(true)
     }
 }
 
@@ -2288,31 +2319,42 @@ impl G17PManagerConstruction {
         Ok(publication)
     }
 
-    pub(crate) fn mark_render_usc_freelist_release_sent(&mut self) -> Result {
+    pub(crate) fn mark_render_usc_freelist_release_sent(
+        &mut self,
+        producer_after: u32,
+    ) -> Result {
         self.bootstrap_uma
             .as_mut()
             .ok_or(EIO)?
-            .mark_sent()
+            .mark_sent(producer_after)
             .map_err(|_| EIO)
+    }
+
+    pub(crate) fn pending_render_usc_freelist_release_producer(&self) -> Option<u32> {
+        self.bootstrap_uma
+            .as_ref()
+            .filter(|lifecycle| lifecycle.release_sent())
+            .and_then(|lifecycle| lifecycle.release_producer_after)
     }
 
     /// Complete the lifecycle only once firmware's consumer reaches the
     /// release. If observation times out, the owner remains retained in Sent
-    /// state until the stopped-processor teardown boundary.
+    /// state until next-admission settlement or the stopped-processor teardown
+    /// boundary.
     pub(crate) fn complete_render_usc_freelist_release_if_consumed(
         &mut self,
         producer_after: u32,
     ) -> Result<bool> {
-        let counters = self.resources.control_counters()?;
-        if counters.primary[g17_initdata::CHANNEL_STATE_CONSUMER] != producer_after {
-            return Ok(false);
+        let lifecycle = self.bootstrap_uma.as_mut().ok_or(EIO)?;
+        if lifecycle.release_producer_after != Some(producer_after) {
+            return Err(EINVAL);
         }
-        self.bootstrap_uma
-            .as_mut()
-            .ok_or(EIO)?
-            .mark_completed()
-            .map_err(|_| EIO)?;
-        Ok(true)
+        let counters = self.resources.control_counters()?;
+        lifecycle
+            .observe_release_consumer(
+                counters.primary[g17_initdata::CHANNEL_STATE_CONSUMER],
+            )
+            .map_err(|_| EIO)
     }
 
     pub(crate) fn prepare_compute_runtime_class2(&mut self) -> Result {
@@ -6881,11 +6923,43 @@ mod tests {
         assert_eq!(lifecycle.pending_release_count, 0);
         assert_eq!(lifecycle.pending_release(), Some(release));
         lifecycle.mark_published(release).unwrap();
-        lifecycle.mark_sent().unwrap();
+        lifecycle.mark_sent(29).unwrap();
         assert_eq!(lifecycle.pending_release(), None);
         assert!(lifecycle.release_sent());
-        lifecycle.mark_completed().unwrap();
+        assert_eq!(lifecycle.release_producer_after, Some(29));
+        assert!(lifecycle.mark_completed(28).is_err());
+        lifecycle.mark_completed(29).unwrap();
         assert!(!lifecycle.release_sent());
+        assert_eq!(lifecycle.release_producer_after, None);
+    }
+
+    #[test]
+    fn bootstrap_async_flist_release_backpressure_tracks_exact_producer() {
+        fn sent_lifecycle(target: u32) -> G17PBootstrapUmaLifecycle {
+            let mut lifecycle = G17PBootstrapUmaLifecycle::new();
+            lifecycle.retire_prepare_reference().unwrap();
+            lifecycle
+                .match_completion(lifecycle.request.unwrap())
+                .unwrap();
+            let release = lifecycle.retire_render_references().unwrap();
+            lifecycle.mark_published(release).unwrap();
+            lifecycle.mark_sent(target).unwrap();
+            lifecycle
+        }
+
+        let mut delayed = sent_lifecycle(29);
+        assert_eq!(delayed.observe_release_consumer(28), Ok(false));
+        assert!(delayed.release_sent());
+        assert_eq!(delayed.observe_release_consumer(29), Ok(true));
+        assert_eq!(delayed.state, G17PBootstrapUmaRequestState::Completed);
+
+        let mut timed_out = sent_lifecycle(41);
+        for _ in 0..20 {
+            assert_eq!(timed_out.observe_release_consumer(40), Ok(false));
+        }
+        assert!(timed_out.release_sent());
+        assert_eq!(timed_out.release_producer_after, Some(41));
+        assert_eq!(timed_out.observe_release_consumer(41), Ok(true));
     }
 
     #[test]
@@ -6945,14 +7019,16 @@ mod tests {
             assert_eq!(release.hardware_buffer_id, G17P_BOOTSTRAP_UMA_HARDWARE_BUFFER_ID);
             assert!(lease.retire_render_references().is_err());
             assert!(G17PBootstrapUmaLifecycle::acquire(Some(&lease), sequence + 1).is_err());
-            assert!(lease.mark_completed().is_err());
+            assert!(lease.mark_completed(ordinal + 20).is_err());
             assert!(lease.mark_published(G17PBootstrapUmaRelease { sequence: sequence + 1, ..release }).is_err());
             lease.mark_published(release).unwrap();
             assert!(G17PBootstrapUmaLifecycle::acquire(Some(&lease), sequence + 1).is_err());
-            lease.mark_sent().unwrap();
+            let producer_after = ordinal + 20;
+            lease.mark_sent(producer_after).unwrap();
             assert!(G17PBootstrapUmaLifecycle::acquire(Some(&lease), sequence + 1).is_err());
-            lease.mark_completed().unwrap();
-            assert!(lease.mark_completed().is_err());
+            assert!(lease.mark_completed(producer_after + 1).is_err());
+            lease.mark_completed(producer_after).unwrap();
+            assert!(lease.mark_completed(producer_after).is_err());
             assert!(lease.mark_published(release).is_err());
             assert!(G17PBootstrapUmaLifecycle::acquire(Some(&lease), sequence).is_err());
             assert!(G17PBootstrapUmaLifecycle::acquire(Some(&lease), sequence + 2).is_err());
