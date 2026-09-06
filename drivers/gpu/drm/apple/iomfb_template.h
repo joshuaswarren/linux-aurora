@@ -76,8 +76,8 @@ struct DCP_FW_NAME(dcp_swap) {
 #if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
 	/* Sized from the wire: a captured A408 request is 0xe9c bytes, which with
 	 * dcp_surface_h17p = 0x22c, SWAP_SURFACES = 4 and no surf2 block leaves
-	 * exactly 0x122 here.  0x278 (the previous value) makes dcp_swap 0x6e0 and
-	 * forces a non-integer surface size, so it cannot be right. */
+	 * exactly 0x122 here.  0x278 makes dcp_swap 0x6e0 and forces a
+	 * non-integer surface size, so it cannot be right. */
 	u8 h17p_tail[0x122];
 #endif
 } __packed;
@@ -102,7 +102,7 @@ struct DCP_FW_NAME(dcp_swap_submit_req) {
 	u64 unk_u64_a[SWAP_SURFACES];
 /* H17P (26.x) carries no surf2 block: the trailing u8 null-flag run in a
  * captured A408 record is 8 bytes (swap_null + surf_null[4] + three tail
- * bools), where a surf2-bearing layout would add 5 or 6 more. */
+ * bools), where a surf2-bearing layout would add five or six more. */
 #if DCP_FW_VER < DCP_FW_VERSION(26, 0, 0)
 	struct DCP_FW_NAME(dcp_surface) surf2[5];
 	u64 surf2_iova[5];
