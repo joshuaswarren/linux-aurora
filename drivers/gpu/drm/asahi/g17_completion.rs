@@ -1310,8 +1310,9 @@ pub(crate) struct PairedRenderCompletion {
 /// Scheduler state for one paired TA/fragment job.
 ///
 /// Firmware queue retirement alone does not show that either GPU stage ran.
-/// A finished pair has left the intrusive job list and has both owned
-/// start/end timestamp words populated for each half. Optional UAPI
+/// A finished pair has left the intrusive job list and has the native
+/// pass-start/pass-end timestamp words populated. The stage arrays below are
+/// views of that pair, not independent per-engine intervals. Optional UAPI
 /// timestamp destinations are separate outputs and are not completion gates.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct RenderExecutionState {
@@ -1328,22 +1329,25 @@ impl RenderExecutionState {
     }
 }
 
-/// Return only complete, forward-moving timestamp pairs suitable for overlap
-/// evidence.  Queue retirement can populate an end stamp without GPU
-/// execution; zero, equal, or reversed pairs must never be published as an
-/// execution interval.
-pub(crate) const fn render_gpu_intervals(
+/// Return the native pass-wide GPU interval suitable for overlap evidence.
+///
+/// G17P publishes one pair for a render pass: TA owns the start word and 3D
+/// owns the end word.  `G17PUserRenderQueueState::snapshot` exposes those as
+/// `[start, start]` for TA and `[start, end]` for 3D because native does not
+/// give TA a separate end pointer.  Require that exact mirrored layout so a
+/// retirement-only or partially written record can never become telemetry.
+pub(crate) const fn render_gpu_interval(
     execution: RenderExecutionState,
-) -> Option<[[u64; 2]; 2]> {
-    let tiling = execution.tiling_timestamps;
-    let fragment = execution.fragment_timestamps;
+) -> Option<[u64; 2]> {
+    let start = execution.tiling_timestamps[0];
+    let end = execution.fragment_timestamps[1];
     if execution.job_list_empty
-        && tiling[0] != 0
-        && tiling[0] < tiling[1]
-        && fragment[0] != 0
-        && fragment[0] < fragment[1]
+        && start != 0
+        && execution.tiling_timestamps[1] == start
+        && execution.fragment_timestamps[0] == start
+        && start < end
     {
-        Some([tiling, fragment])
+        Some([start, end])
     } else {
         None
     }

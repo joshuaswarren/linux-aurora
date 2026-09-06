@@ -22,35 +22,36 @@ def block(source, marker):
 
 
 state = block(completion, "pub(crate) struct RenderExecutionState")
-validator = block(completion, "pub(crate) const fn render_gpu_intervals")
+validator = block(completion, "pub(crate) const fn render_gpu_interval")
 tests = r'''
 #[test]
-fn valid_pairs_preserve_engine_order() {
+fn valid_native_pair_preserves_pass_envelope() {
     let execution = RenderExecutionState {
         job_list_empty: true,
-        tiling_timestamps: [10, 30],
-        fragment_timestamps: [20, 40],
+        tiling_timestamps: [10, 10],
+        fragment_timestamps: [10, 40],
     };
-    assert_eq!(render_gpu_intervals(execution), Some([[10, 30], [20, 40]]));
+    assert_eq!(render_gpu_interval(execution), Some([10, 40]));
 }
 
 #[test]
-fn incomplete_or_nonmoving_pairs_never_publish() {
+fn incomplete_nonmoving_or_non_native_pairs_never_publish() {
     let good = RenderExecutionState {
         job_list_empty: true,
-        tiling_timestamps: [10, 20],
-        fragment_timestamps: [30, 40],
+        tiling_timestamps: [10, 10],
+        fragment_timestamps: [10, 40],
     };
-    assert_eq!(render_gpu_intervals(RenderExecutionState {
+    assert_eq!(render_gpu_interval(RenderExecutionState {
         job_list_empty: false, ..good
     }), None);
-    for pair in [[0, 20], [20, 20], [21, 20]] {
-        assert_eq!(render_gpu_intervals(RenderExecutionState {
-            tiling_timestamps: pair, ..good
-        }), None);
-        assert_eq!(render_gpu_intervals(RenderExecutionState {
-            fragment_timestamps: pair, ..good
-        }), None);
+    for execution in [
+        RenderExecutionState { tiling_timestamps: [0, 0], fragment_timestamps: [0, 40], ..good },
+        RenderExecutionState { tiling_timestamps: [10, 11], ..good },
+        RenderExecutionState { fragment_timestamps: [11, 40], ..good },
+        RenderExecutionState { fragment_timestamps: [10, 10], ..good },
+        RenderExecutionState { fragment_timestamps: [10, 9], ..good },
+    ] {
+        assert_eq!(render_gpu_interval(execution), None);
     }
 }
 '''
@@ -68,8 +69,8 @@ log = poll.index('"G17P render: GPU-INTERVAL')
 clear_tracker = poll.index("self.render_tracker = None")
 increment = poll.index("self.render_submission_ordinal = next_ordinal")
 assert log < clear_tracker < increment
-assert "render_gpu_intervals" in poll
+assert "render_gpu_interval" in poll
 assert "binding.vm_id()" in poll and "binding.root()" in poll
 assert "queues.tiling.queue_id" in poll and "queues.fragment.queue_id" in poll
 assert len(re.findall(r"GPU-INTERVAL", poll)) == 1
-print("PASS render GPU interval publication: exact forward pairs, invalid retirement rejection, VM/root/QID identity, pre-clear/pre-increment ordering")
+print("PASS render GPU interval publication: exact native pass envelope, invalid retirement rejection, VM/root/QID identity, pre-clear/pre-increment ordering")
