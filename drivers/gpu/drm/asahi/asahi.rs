@@ -85,6 +85,10 @@ kernel::module_platform_driver! {
             // permissions: 0o644,
             description: "Fully isolate GPU contexts (limits performance)",
         },
+        g17p_simplefb_iova: u64 {
+            default: 0,
+            description: "DIAGNOSTIC. Non-zero maps the exact active apple,simple-framebuffer boot aperture into every T8140 user VM at this GPU VA, uncached and read/write, so a bounded harness can make GPU stores visible without a DCP driver. The DT node, x8r8g8b8 geometry, no-map framebuffer reservation, page alignment and complete VA interval are all validated before any mapping; the alias is retained until VM destruction and excluded from ordinary user unbinds. This does not touch DCP or copy pixels. Use only while simpledrm owns the iBoot framebuffer. 0: off (default).",
+        },
         g17p_reg_dump: u32 {
             default: 0,
             description: "DIAGNOSTIC. Dump 0x100 bytes of the sgx register window at (value << 8), after the render doorbells, as 16 rows of four u32. For the pre-firmware hardware-state audit: the SKSM submit protocol, the initdata and the kext's one-time bring-up have all been shown byte-exact or equivalent to native, so the remaining variable is the GPU register state m1n1 and this driver leave behind, which initdata does not describe. Read-only, and placed in the post-doorbell window where the cores are powered -- an sgx read with the cores gated raises an asynchronous SError and panics the machine, which is why this is opt-in and 0x100-granular rather than an arbitrary address. Example: 0xe010 dumps the GPC block at 0xe01000. 0: off (default).",

@@ -46,8 +46,10 @@ use kernel::uaccess::{
     UserSlice, //
 };
 use kernel::{
+    c_str,
     dma_fence,
     drm,
+    of,
     uapi,
     xarray, //
 };
@@ -55,6 +57,108 @@ use kernel::{
 const DEBUG_CLASS: DebugFlags = DebugFlags::File;
 
 pub(crate) const MAX_COMMANDS_PER_SUBMISSION: u32 = 64;
+
+/// Resolve the exact visible iBoot framebuffer aperture from DT.
+///
+/// This deliberately accepts only the native Neo simplefb layout and requires
+/// it to be contained in a `no-map` reserved-memory framebuffer node. The
+/// returned size is the page-aligned visible image, never the larger DCP
+/// reservation. The last page may extend past the byte-exact simplefb aperture,
+/// but only when that complete page remains inside the no-map framebuffer
+/// reservation. No CPU mapping or display/DCP operation is performed here.
+fn t8140_simplefb_phys_range() -> Result<(usize, usize)> {
+    let chosen = of::chosen().ok_or(ENOENT)?;
+    let mut candidate = None;
+
+    for node in chosen.children() {
+        let compatible: KVec<u8> = match node.get_property(c_str!("compatible")) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if compatible.as_slice()
+            != b"apple,simple-framebuffer\0simple-framebuffer\0"
+        {
+            continue;
+        }
+        if candidate.is_some() {
+            return Err(EINVAL);
+        }
+
+        let reg: KVec<u64> = node.get_property(c_str!("reg"))?;
+        let width: u32 = node.get_property(c_str!("width"))?;
+        let height: u32 = node.get_property(c_str!("height"))?;
+        let stride: u32 = node.get_property(c_str!("stride"))?;
+        let format: KVec<u8> = node.get_property(c_str!("format"))?;
+        if reg.len() != 2
+            || format.as_slice() != b"x8r8g8b8\0"
+            || width == 0
+            || height == 0
+            || stride < width.checked_mul(4).ok_or(EOVERFLOW)?
+        {
+            return Err(EINVAL);
+        }
+
+        let visible = usize::try_from(stride)?
+            .checked_mul(usize::try_from(height)?)
+            .ok_or(EOVERFLOW)?;
+        let mapped = align(visible as u64, mmu::UAT_PGSZ as u64);
+        let base = usize::try_from(reg[0])?;
+        let size = usize::try_from(reg[1])?;
+        let mapped = usize::try_from(mapped)?;
+        if base & mmu::UAT_PGMSK != 0 || visible > size {
+            return Err(EINVAL);
+        }
+        candidate = Some((base, mapped));
+    }
+
+    let (base, mapped) = candidate.ok_or(ENOENT)?;
+    let root = of::root().ok_or(ENOENT)?;
+    let mut reserved = None;
+    for node in root.children() {
+        let name: KVec<u8> = match node.get_property(c_str!("name")) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if name.as_slice() == b"reserved-memory\0" {
+            if reserved.replace(node).is_some() {
+                return Err(EINVAL);
+            }
+        }
+    }
+    let reserved = reserved.ok_or(ENOENT)?;
+    let target_end = base.checked_add(mapped).ok_or(EOVERFLOW)?;
+    let mut covered = false;
+    for node in reserved.children() {
+        let compatible: KVec<u8> = match node.get_property(c_str!("compatible")) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let no_map: KVec<u8> = match node.get_property(c_str!("no-map")) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if compatible.as_slice() != b"framebuffer\0" || !no_map.is_empty() {
+            continue;
+        }
+        let reg: KVec<u64> = node.get_property(c_str!("reg"))?;
+        if reg.len() != 2 {
+            return Err(EINVAL);
+        }
+        let reserve_base = usize::try_from(reg[0])?;
+        let reserve_size = usize::try_from(reg[1])?;
+        let reserve_end = reserve_base.checked_add(reserve_size).ok_or(EOVERFLOW)?;
+        if reserve_base <= base && target_end <= reserve_end {
+            if covered {
+                return Err(EINVAL);
+            }
+            covered = true;
+        }
+    }
+    if !covered {
+        return Err(EINVAL);
+    }
+    Ok((base, mapped))
+}
 
 /// A client instance of an `mmu::Vm` address space.
 struct Vm {
@@ -408,6 +512,33 @@ impl File {
         let gpu = &device.gpu;
         let file_id = file.inner().id;
         let vm = gpu.new_vm(kernel_range.clone())?;
+
+        let simplefb_iova = *module_parameters::g17p_simplefb_iova.value();
+        if simplefb_iova != 0 {
+            if gpu.params()?.chip_id != 0x8140 {
+                return Err(ENOTSUPP);
+            }
+            let (simplefb_phys, simplefb_size) = t8140_simplefb_phys_range()?;
+            let simplefb_end = simplefb_iova
+                .checked_add(simplefb_size as u64)
+                .ok_or(EOVERFLOW)?;
+            let simplefb_range = simplefb_iova..simplefb_end;
+            if simplefb_iova & mmu::UAT_PGMSK as u64 != 0
+                || !user_range.is_superset(simplefb_range.clone())
+                || kernel_range.overlaps(simplefb_range.clone())
+                || vm.driver_range_overlaps(simplefb_range)
+            {
+                return Err(EINVAL);
+            }
+            vm.install_simplefb_mapping(simplefb_iova, simplefb_phys, simplefb_size)?;
+            dev_info!(
+                device,
+                "G17P simplefb: retained GPU alias {:#x}:{:#x} -> phys {:#x}\n",
+                simplefb_iova,
+                simplefb_size,
+                simplefb_phys,
+            );
+        }
 
         let vm_xa = file.inner().vms();
         let resv = vm_xa.lock().reserve_limit(1..=u32::MAX, GFP_KERNEL)?;
