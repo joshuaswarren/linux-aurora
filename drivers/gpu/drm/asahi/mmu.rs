@@ -1134,6 +1134,7 @@ impl Drop for T8140NativeContextAliases {
 struct VmDriverMappings {
     mappings: KVec<KernelMapping>,
     reserved_ranges: KVec<Range<u64>>,
+    simplefb: Option<KernelMapping>,
     render_pool: Option<VmRenderPoolMappings>,
     compute_pool: Option<VmRenderPoolMappings>,
 }
@@ -1154,8 +1155,10 @@ no_debug!(VmRenderPoolMappings);
 impl VmDriverMappings {
     fn iter_mappings(&self) -> impl Iterator<Item = &KernelMapping> {
         Iterator::chain(
-            Iterator::chain(self.mappings.iter(), self.compute_pool.iter()
-                .flat_map(|pool| pool.mappings.iter())),
+            Iterator::chain(
+                Iterator::chain(self.mappings.iter(), self.simplefb.iter()),
+                self.compute_pool.iter().flat_map(|pool| pool.mappings.iter()),
+            ),
             self.render_pool.iter().flat_map(|pool| pool.mappings.iter()),
         )
     }
@@ -2146,6 +2149,7 @@ impl Vm {
         *retained = Some(VmDriverMappings {
             mappings,
             reserved_ranges,
+            simplefb: None,
             render_pool: None,
             compute_pool: None,
         });
@@ -2341,6 +2345,38 @@ impl Vm {
             self.unmap_range(cursor, next - cursor)?;
             cursor = next;
         }
+        Ok(())
+    }
+
+    /// Install one VM-lifetime alias of the boot framebuffer aperture.
+    ///
+    /// The caller has already validated that the physical interval is the
+    /// exact DT-owned simplefb allocation and that the IOVA is inside the
+    /// usable user range. Keeping this separate from GEM prevents the no-map
+    /// carveout from ever being treated as ordinary `struct page` memory.
+    pub(crate) fn install_simplefb_mapping(
+        &self,
+        iova: u64,
+        phys: usize,
+        size: usize,
+    ) -> Result {
+        {
+            let retained = self.driver_mappings.lock();
+            let driver = retained.as_ref().ok_or(EINVAL)?;
+            if driver.simplefb.is_some() {
+                return Err(EBUSY);
+            }
+        }
+
+        let mapping = self.map_io(iova, phys, size, PROT_GPU_SHARED_RW)?;
+        let mut retained = self.driver_mappings.lock();
+        let driver = Option::as_mut(&mut *retained).ok_or(EINVAL)?;
+        if driver.simplefb.is_some() {
+            core::mem::drop(retained);
+            core::mem::drop(mapping);
+            return Err(EBUSY);
+        }
+        driver.simplefb = Some(mapping);
         Ok(())
     }
 
