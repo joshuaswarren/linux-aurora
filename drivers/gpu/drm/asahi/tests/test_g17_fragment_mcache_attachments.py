@@ -105,7 +105,9 @@ assert 'support_va + G17P_RENDER_PACKED_SHARED as u64' in resources
 assert 'support.with_bytes_mut' in resources
 assert 'let (tiling, fragment) = raw.split_at_mut(0x4000);' in resources
 assert 'raw[..FRAGMENT_DESCRIPTOR_SIZE].fill(0);' in render
-assert 'const G17P_RENDER_DESCRIPTOR_STORAGE_SIZE: usize = 0x8000;' in resources
+assert 'const G17P_RENDER_DESCRIPTOR_SLOT_COUNT: usize = 32;' in resources
+assert 'G17P_RENDER_TA_DESCRIPTOR_STRIDE * G17P_RENDER_DESCRIPTOR_SLOT_COUNT' in resources
+assert 'G17P_RENDER_3D_DESCRIPTOR_STRIDE * G17P_RENDER_DESCRIPTOR_SLOT_COUNT' in resources
 with tempfile.TemporaryDirectory(prefix='g17-mcache-attachments-') as tmp:
  test=Path(tmp)/'test.rs';test.write_text(unit+'\n'+constants+'\n'+encoder+'\n'+clencoder)
  exe=Path(tmp)/'test';subprocess.run(['rustc','--edition=2021','--test','-Awarnings',str(test),'-o',str(exe)],check=True)

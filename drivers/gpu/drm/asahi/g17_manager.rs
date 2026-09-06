@@ -2889,16 +2889,9 @@ impl G17PManagerConstruction {
         // pointers to an external allocation. Mode 4 remains an alias for the
         // old diagnostic command line, but emits this corrected native shape.
         let native_shaped = sksm_mode == 3 || sksm_mode == 4;
-        let descriptor_high = if tiling {
-            g17_submission::G17P_COLD_OPENING_TA_DESCRIPTOR_BASE
-        } else {
-            g17_submission::G17P_COLD_OPENING_3D_DESCRIPTOR_BASE
-        };
-        let descriptor_low = self
-            .render_storage
-            .as_ref()
-            .ok_or(ENODEV)?
-            .descriptor_low_va(tiling);
+        let storage = self.render_storage.as_ref().ok_or(ENODEV)?;
+        let descriptor_high = storage.descriptor_high_va(tiling)?;
+        let descriptor_low = storage.descriptor_low_va(tiling)?;
         // Native's descriptor MCache mappings and KSM aperture are distinct.
         // The working Metal render populates firmware descriptor +0x6a0 but
         // leaves host AGX3DCommandDescriptor +0xaa8 count zero, so bit58 and
@@ -2992,11 +2985,13 @@ impl G17PManagerConstruction {
         queue.producer.last_add_kicks_timestamp = stamp;
         dev_info!(
             dev.as_ref(),
-            "G17P render SKSM: {} qid {} entry_offset {:#x} entry_low {:#x} stamp {:#x} barriers {} mcache-ranges {} submission {}\n",
+            "G17P render SKSM: {} qid {} entry_offset {:#x} entry_low {:#x} descriptor=[{:#x},{:#x}] stamp {:#x} barriers {} mcache-ranges {} submission {}\n",
             if tiling { "TA" } else { "3D" },
             queue.queue_id,
             prepared.entry_offset,
             g17_resources::G17ResourceOwner::render_sksm_entry_low_va(tiling),
+            descriptor_high,
+            descriptor_low,
             stamp,
             barriers.len(),
             mcache.map_or(0, |value| value.count),
