@@ -748,8 +748,27 @@ static int dcp_create_piodma_iommu_dev(struct apple_dcp *dcp)
 				     "Failed to get piodma child DT node\n");
 
 	dcp->piodma = of_platform_device_create(node, NULL, dcp->dev);
-	if (!dcp->piodma)
-		return dev_err_probe(dcp->dev, -ENODEV, "Failed to create piodma pdev for %pOF\n", node);
+	if (!dcp->piodma) {
+		/*
+		 * of_platform_device_create() returns NULL when the node already
+		 * has a platform device, which happens whenever a previous bind
+		 * attempt created it and then failed further down (the caller's
+		 * later error paths do not destroy it).  Probe is retried - a
+		 * deferral, or a component re-bind - and would then fail here
+		 * forever with -ENODEV even though nothing is actually wrong.
+		 * Observed on J700 as:
+		 *   piodma: Adding to iommu group 4          <- first attempt
+		 *   Failed to create piodma pdev ... -ENODEV <- every retry
+		 * Adopt the existing device instead of giving up.
+		 */
+		dcp->piodma = of_find_device_by_node(node);
+		if (!dcp->piodma)
+			return dev_err_probe(dcp->dev, -ENODEV,
+					     "Failed to create piodma pdev for %pOF\n",
+					     node);
+		dev_info(dcp->dev, "reusing existing piodma pdev for %pOF\n",
+			 node);
+	}
 
 	ret = dma_set_mask_and_coherent(&dcp->piodma->dev, DMA_BIT_MASK(42));
 	if (ret)
