@@ -2713,11 +2713,12 @@ impl G17PLiveRuntime {
         self.manager
             .as_mut()
             .ok_or(ENODEV)?
-            .mark_render_usc_freelist_release_sent()?;
+            .mark_render_usc_freelist_release_sent(publication.producer_after)?;
 
         // Observation is bounded and non-gating, matching native's async
         // release. If firmware has not consumed it yet the lifecycle remains
-        // retained in Sent state until stopped-processor teardown.
+        // retained in Sent state for exact settlement at the next admission
+        // (or the stopped-processor teardown boundary).
         for _ in 0..20 {
             fence(Ordering::SeqCst);
             if self
@@ -2739,10 +2740,54 @@ impl G17PLiveRuntime {
         }
         dev_warn!(
             self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
-            "G17P render USC FList: release remains asynchronous at producer {}; retaining owner through processor stop\n",
+            "G17P render USC FList: release remains asynchronous at producer {}; retaining owner for later settlement\n",
             publication.producer_after,
         );
         Ok(())
+    }
+
+    /// A release that missed the short completion-path observation window is
+    /// ordinary control-ring backpressure, not a corrupt retained owner. Wait
+    /// for the exact published producer before acquiring the next command's
+    /// FList references. The same bounded 100ms retirement contract is used by
+    /// the synchronous opcode-0x20 path above.
+    fn settle_render_usc_freelist_release_before_submission(&mut self) -> Result {
+        let Some(target) = self
+            .manager
+            .as_ref()
+            .and_then(|manager| manager.pending_render_usc_freelist_release_producer())
+        else {
+            return Ok(());
+        };
+
+        for poll in 0..CONTROL_COUNTER_POLLS {
+            fence(Ordering::SeqCst);
+            if self
+                .manager
+                .as_mut()
+                .ok_or(ENODEV)?
+                .complete_render_usc_freelist_release_if_consumed(target)?
+            {
+                dev_info!(
+                    self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                    "G17P render USC FList: settled pending release producer {} before next submission after {}ms\n",
+                    target,
+                    poll,
+                );
+                return Ok(());
+            }
+            if self.is_crashed() {
+                return Err(EIO);
+            }
+            fsleep(Delta::from_millis(1));
+        }
+
+        dev_err!(
+            self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+            "G17P render USC FList: pending release producer {} did not retire before next submission\n",
+            target,
+        );
+        Err(ETIMEDOUT)
     }
 
     pub(crate) fn service_primary_firmware_events(&mut self) -> Result {
@@ -3701,6 +3746,9 @@ impl G17PLiveRuntime {
         if self.is_crashed() {
             g17_lifecycle::recover_persistent_runtime(self)?;
         }
+        // Settle an older asynchronous release before any recovery/control
+        // publication can advance the same ring past its exact target.
+        self.settle_render_usc_freelist_release_before_submission()?;
         // Never publish while a firmware recovery is open. The compute path
         // has done this since the recovery work; render never did, and the
         // firmware behaviour it guards against is exactly render's symptom:
