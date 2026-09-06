@@ -65,11 +65,14 @@ This is deliberate and enforced by
 `tests/python/test_t8140_dcp_link_handoff_contract.py` on the m1n1 side, so
 changing it is a contract change, not a bug fix.
 
-**But simply re-enabling the node is not the fix either.** See §4: a stopped or
-quiesced generation cannot be booted fresh, because the management endpoint
-silently refuses to send STARTEP below IOP state 4. Enabling the node without
-also preserving the generation would just move the failure from "driver never
-probes" to "firmware ignores us", with no error logged.
+**Re-enabling the node may well be the whole fix.** This driver already handles
+the stopped handoff: `apple,dcp-asc-stopped` maps to
+`APPLE_DCP_COPROCESSOR_ASC_STOPPED_RESTART`, for which
+`apple_dcp_needs_fresh_boot()` is true, and there is a T8140-specific branch in
+`dcp_probe()` that reads the IOP VBAR and resolves it through the IOMMU before
+restarting the ASC. The `status = "disabled"` is what stops that code from ever
+running -- the OF core never creates the platform device, so no driver-side
+change can compensate.
 
 Until this is resolved, DCP driver work on J700 can only be validated by tracing
 macOS under the m1n1 hypervisor (see `MACOS_HV_AGX.md` in the m1n1 tree —
@@ -98,7 +101,7 @@ Live traces agree: a captured macOS boot opens with a single `A401`
 (`start_signal`) and contains no RTKit HELLO/EPMAP or firmware-load traffic
 whatsoever. It attaches to a coprocessor that is already up.
 
-### Why a fresh boot is not an option
+### The STARTEP gate constrains macOS, not Linux
 
 `RTBuddyManagementEndpoint::setEndpointStatus` builds the STARTEP word and then:
 
@@ -106,22 +109,31 @@ whatsoever. It attaches to a coprocessor that is already up.
 ldr x8,[x0,#0x70] ; ldr w8,[x8,#0x158] ; cmp w8,#4 ; b.lt -> return 0
 ```
 
-It **returns without sending STARTEP, and logs nothing**, whenever the IOP state
-is below 4 — which is where a quiesced generation sits. This is the concrete
-reason a fresh RTKit HELLO/EPMAP boot cannot be forced, and the failure looks
-like "the firmware ignored us" rather than an error.
+It returns without sending STARTEP, and logs nothing, whenever the IOP state is
+below 4. **Scope this carefully:** that is macOS kext code, and it explains why
+*macOS* cannot be made to cold-boot a quiesced generation. Linux does not use
+RTBuddy — `apple-drm` has its own RTKit implementation and sends STARTEP itself,
+so this gate does not apply to it. Do not cite it as evidence that Linux cannot
+restart a stopped ASC.
 
 ### What this implies for m1n1
 
-The generation is the asset. m1n1's current path destroys it: it stops the ASC,
-revokes the DART stream, and disables the node. To match Apple's supported path
-m1n1 should instead hand Linux a **live** DCP and publish the adoption signal —
-`pre-loaded` and `running` on the DCP nub, carrying `remote-power-state` — and
-`apple-drm` should adopt it with the IOP state already at or above 4, skipping
-the firmware load and leaving the display fabric un-gated.
+Adoption is Apple's path, and it is the one known to work on this hardware:
+hand Linux a **live** DCP, publish `pre-loaded` and `running` on the DCP nub, and
+carry `remote-power-state`, so the driver attaches at IOP state >= 4 without a
+firmware load and without gating the display fabric. `apple-drm` already has the
+adoption mode for this (`adopt_running_coprocessor`, set only for T8140), which
+engages when no loader-handoff property is present and the coprocessor is still
+active.
+
+That is the higher-confidence route, but it is **not proven to be required**.
+The driver also implements a restart from the stopped state, and that path has
+never been exercised, because the node is disabled before it can be. Un-disable
+the node first and find out; only redesign the handoff if the restart genuinely
+fails.
 
 Note that `quiesced` being present is *not* what blocks adoption on real
-hardware — macOS boots fine with it set. Destroying the generation is.
+hardware — macOS boots fine with it set.
 
 ## 5. m1n1's own DCP access is a different protocol
 
