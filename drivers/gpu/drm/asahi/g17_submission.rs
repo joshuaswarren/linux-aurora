@@ -5964,33 +5964,35 @@ mod tests {
             owner_pid: 0x625,
             ta_hardware_buffer_id: 7,
         };
-        for (stage, context_id) in [
-            (G17PColdOpeningStage::Tiling, 6),
-            (G17PColdOpeningStage::Fragment, 6),
-        ] {
-            let mut optional = [0u8; G17P_COLD_OPENING_OPTIONAL_SIZE];
-            apply_g17p_retained_optional(
-                stage,
-                addresses,
-                0,
-                false,
-                0,
-                1,
-                context_id,
-                &mut optional,
-            )
-            .unwrap();
-            assert_eq!(get_u16_le(&optional, 0x32), context_id);
-            assert_eq!(get_u32_le(&optional, 0x46), 5);
-            assert_eq!(get_u32_le(&optional, 0x5a), 0x625);
-            assert_eq!(
-                get_u32_le(&optional, 0x7e),
-                if stage == G17PColdOpeningStage::Tiling {
-                    7
-                } else {
-                    u32::MAX
-                }
-            );
+        for context_id in [5, 62] {
+            for stage in [
+                G17PColdOpeningStage::Tiling,
+                G17PColdOpeningStage::Fragment,
+            ] {
+                let mut optional = [0u8; G17P_COLD_OPENING_OPTIONAL_SIZE];
+                apply_g17p_retained_optional(
+                    stage,
+                    addresses,
+                    0,
+                    false,
+                    0,
+                    1,
+                    context_id,
+                    &mut optional,
+                )
+                .unwrap();
+                assert_eq!(get_u16_le(&optional, 0x32), context_id);
+                assert_eq!(get_u32_le(&optional, 0x46), 5);
+                assert_eq!(get_u32_le(&optional, 0x5a), 0x625);
+                assert_eq!(
+                    get_u32_le(&optional, 0x7e),
+                    if stage == G17PColdOpeningStage::Tiling {
+                        7
+                    } else {
+                        u32::MAX
+                    }
+                );
+            }
         }
     }
 

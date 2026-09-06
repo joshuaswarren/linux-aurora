@@ -2014,6 +2014,7 @@ impl G17PManagerConstruction {
                 .new_user_render_storage(
                     dev,
                     &vm,
+                    1,
                     &command,
                     self.num_clusters,
                     [0; 4],
@@ -3235,6 +3236,7 @@ impl G17PManagerConstruction {
         &mut self,
         dev: &AsahiDevice,
         vm: &mmu::Vm,
+        descriptor_context_id: u16,
         command: &g17_uapi::TranslatedRenderCommand,
         user_timestamps: [u64; 4],
         user_timestamp_aliases: KVec<mmu::KernelMapping>,
@@ -3269,6 +3271,7 @@ impl G17PManagerConstruction {
         let result = self.begin_translated_render_with_hardware_buffer(
             dev,
             vm,
+            descriptor_context_id,
             &command,
             parameter_buffer_token,
             user_timestamps,
@@ -3292,6 +3295,7 @@ impl G17PManagerConstruction {
         &mut self,
         dev: &AsahiDevice,
         vm: &mmu::Vm,
+        descriptor_context_id: u16,
         command: &g17_uapi::TranslatedRenderCommand,
         parameter_buffer_token: u64,
         user_timestamps: [u64; 4],
@@ -3390,6 +3394,7 @@ impl G17PManagerConstruction {
                     dev,
                     self.resources.uat(),
                     vm,
+                    descriptor_context_id,
                     parameter_page_list_vas,
                     command,
                     self.num_clusters,
@@ -3411,6 +3416,7 @@ impl G17PManagerConstruction {
                     .new_user_render_storage(
                         dev,
                         vm,
+                        descriptor_context_id,
                         command,
                         self.num_clusters,
                         user_timestamps,

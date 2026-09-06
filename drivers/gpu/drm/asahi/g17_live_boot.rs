@@ -3723,6 +3723,7 @@ impl G17PLiveRuntime {
     pub(crate) fn submit_translated_render(
         &mut self,
         vm: &mmu::Vm,
+        descriptor_context_id: u16,
         command: &g17_uapi::TranslatedRenderCommand,
         timestamps: [u64; 4],
         timestamp_aliases: KVec<mmu::KernelMapping>,
@@ -3810,6 +3811,7 @@ impl G17PLiveRuntime {
             .begin_translated_render(
                 &drm,
                 vm,
+                descriptor_context_id,
                 command,
                 timestamps,
                 timestamp_aliases,
