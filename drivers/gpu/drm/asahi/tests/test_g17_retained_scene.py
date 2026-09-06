@@ -39,7 +39,7 @@ def constant(name):
 
 constants = [
     "G17P_RENDER_USER_BASE", "G17P_PM_PAGE_SIZE", "G17P_PM_PAGES_PER_BLOCK",
-    "G17P_PM_MAX_BLOCKS", "G17P_PM_HWPB_STATE_SIZE", "G17P_PM_PAGE_LIST_SIZE",
+    "G17P_PM_MAX_BLOCKS", "G17P_PM_BLOCK_COUNT", "G17P_PM_HWPB_STATE_SIZE", "G17P_PM_PAGE_LIST_SIZE",
     "G17P_PM_BLOCK_PAGE_BASE_TABLE_SIZE", "G17P_PM_SHARED_CONTROL_SIZE",
     "G17P_PM_COUNTER_SIZE", "G17P_PM_SCENE_COUNT", "G17P_PM_SCENE_ENTRY_SIZE",
     "G17P_PM_SCENE_TRAILER_SIZE", "G17P_PM_SCENE_ALLOCATION_SIZE",
@@ -240,6 +240,22 @@ fn retained_pool_restrictions_are_checked_before_mapping_or_state_changes() {
         assert_eq!(pm.selected_scene, 1);
         assert_eq!(pm.backing.bytes, before);
     }
+}
+
+#[test]
+fn grown_pool_capacity_is_reused_by_smaller_scenes() {
+    let mut pm = new_pm();
+    pm.page_count = 512;
+    for (ordinal, blocks) in [32, 64, 128, 32].into_iter().enumerate() {
+        assert_eq!(pm.prepare_retained_scene(ordinal as u32 + 1, 0,
+            pm.page_list_vas, &render_layout(blocks)), Ok(()));
+        assert_eq!(pm.page_count, 512);
+        assert_eq!(pm.pb_descriptor().unwrap().2, 512);
+    }
+    let before = pm.backing.bytes.clone();
+    assert_eq!(pm.prepare_retained_scene(5, 0, pm.page_list_vas,
+        &render_layout(129)), Err(ENOTSUPP));
+    assert_eq!(pm.backing.bytes, before);
 }
 
 #[test]
