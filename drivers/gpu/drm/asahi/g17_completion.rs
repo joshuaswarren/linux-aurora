@@ -1328,6 +1328,27 @@ impl RenderExecutionState {
     }
 }
 
+/// Return only complete, forward-moving timestamp pairs suitable for overlap
+/// evidence.  Queue retirement can populate an end stamp without GPU
+/// execution; zero, equal, or reversed pairs must never be published as an
+/// execution interval.
+pub(crate) const fn render_gpu_intervals(
+    execution: RenderExecutionState,
+) -> Option<[[u64; 2]; 2]> {
+    let tiling = execution.tiling_timestamps;
+    let fragment = execution.fragment_timestamps;
+    if execution.job_list_empty
+        && tiling[0] != 0
+        && tiling[0] < tiling[1]
+        && fragment[0] != 0
+        && fragment[0] < fragment[1]
+    {
+        Some([tiling, fragment])
+    } else {
+        None
+    }
+}
+
 pub(crate) fn observe_paired_render_completion(
     tiling_previous: QueueIndices,
     tiling_current: QueueIndices,

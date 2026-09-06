@@ -4646,6 +4646,43 @@ impl G17PManagerConstruction {
             tracker.tiling_previous = state.tiling;
             tracker.fragment_previous = state.fragment;
             if completion.complete {
+                // Publish exact GPU-written pairs while the completed job's
+                // VM binding, ordinal and QIDs are still owned.  This is
+                // observation only: it neither gates completion nor changes
+                // queue state.  Invalid retirement-only pairs are omitted.
+                if let Some([tiling_interval, fragment_interval]) =
+                    g17_completion::render_gpu_intervals(
+                        g17_completion::RenderExecutionState {
+                            job_list_empty: state.job_list_empty,
+                            tiling_timestamps: state.tiling_timestamps,
+                            fragment_timestamps: state.fragment_timestamps,
+                        },
+                    )
+                {
+                    let (vm_id, root) = self.render_bind.as_ref()
+                        .map_or((0, 0), |binding| (binding.vm_id(), binding.root()));
+                    let (tiling_qid, fragment_qid) = self.render_sksm.as_ref()
+                        .map_or((
+                            g17_resources::g17p_render_queue_id(true),
+                            g17_resources::g17p_render_queue_id(false),
+                        ), |queues| (
+                            u16::from(queues.tiling.queue_id),
+                            u16::from(queues.fragment.queue_id),
+                        ));
+                    dev_info!(
+                        self.resources.dev().as_ref(),
+                        "G17P render: GPU-INTERVAL ordinal={} vm={} root={:#x} ta-qid={} ta-start={} ta-end={} fragment-qid={} fragment-start={} fragment-end={}\n",
+                        self.render_submission_ordinal,
+                        vm_id,
+                        root,
+                        tiling_qid,
+                        tiling_interval[0],
+                        tiling_interval[1],
+                        fragment_qid,
+                        fragment_interval[0],
+                        fragment_interval[1],
+                    );
+                }
                 // Native TA/3D complete subtract completed kicks from queue
                 // +44. Prepare both results before mutating either queue;
                 // timestamps and previous-stamp history must never reset.
