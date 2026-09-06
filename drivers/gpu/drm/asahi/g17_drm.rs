@@ -1485,6 +1485,11 @@ impl queue::Queue for G17PQueue {
                     .lock()
                     .submit_translated_render(
                         &self.vm,
+                        self.async_backend
+                            .as_ref()
+                            .ok_or(EIO)?
+                            .context
+                            .context_id() as u16,
                         &translated,
                         timestamps,
                         timestamp_aliases,

@@ -2972,6 +2972,9 @@ pub(crate) struct G17PUserRenderStorage {
     /// second AGXContextIDManager allocation is a refcounted lookup of this
     /// same GART, not a second hardware context.
     _command_context: Option<mmu::T8140AppContextLease>,
+    /// Hardware context carried by this queue's submitted TA/3D descriptors.
+    /// Native allocates this independently of the command-GART context.
+    descriptor_context_id: u16,
     /// Render-only tail of the USC private-memory aperture.  Ordinary client
     /// VMs start with the 21-buffer compute closure; a render submission adds
     /// blocks 21..25 for the native 22-block initial pool plus four-block
@@ -4363,13 +4366,6 @@ pub(crate) const fn g17p_render_queue_id(tiling: bool) -> u16 {
     }
 }
 
-/// Hardware context encoded by native's cold qid0/qid1 render pair. The
-/// dynamic lease still retains ownership of Linux's duplicate alias, but the
-/// command and tag-15 fields name the architectural render root in slot 1.
-const fn g17p_render_descriptor_context_id() -> u16 {
-    g17_submission::G17P_PARTIAL_OPENING_CONTEXT.descriptor_context_id as u16
-}
-
 /// First-bind flag for a newly allocated render queue. Kext RE sources this
 /// from descriptor lifecycle state, not stage identity. Captured native 3D
 /// queues can carry zero because the queue already exists; Linux QIDs 0/1 are
@@ -5084,6 +5080,13 @@ fn render_build_fail(site: u32) -> kernel::error::Error {
 }
 
 impl G17PUserRenderStorage {
+    fn descriptor_context_valid(context_id: u16) -> bool {
+        context_id
+            == g17_submission::G17P_PARTIAL_OPENING_CONTEXT.descriptor_context_id as u16
+            || (u32::from(context_id) >= crate::g17_queue_limits::COMPUTE_CONTEXT_FIRST
+                && u32::from(context_id) < crate::g17_queue_limits::RENDER_APP_CONTEXT)
+    }
+
     /// First-stage raw capture of the retained host-authored render graph.
     /// Descriptor pages include the actual embedded RCE arrays. The separate
     /// fragment_rce diagnostic mirror is deliberately not substituted for them.
@@ -5091,10 +5094,9 @@ impl G17PUserRenderStorage {
         &mut self, archive: &mut TraceArchive<'_>, phase: TracePhase,
         phase_sequence: u64, job_stamp: u64, clock: &mut impl FnMut() -> u64,
     ) -> Result {
-        // The app-GART lease is an additional alias (currently slot 5), not
-        // the execution context encoded in this TA/3D pair. Manager retains
-        // the same client VM in native render slot 1 throughout this capture.
-        let context = u32::from(g17p_render_descriptor_context_id());
+        // The command-GART lease is independent of the queue execution
+        // context carried by this TA/3D pair. Both roots retain this VM.
+        let context = u32::from(self.descriptor_context_id);
         let mut meta = TraceMeta::new(TraceKind::RenderDescriptors, phase, phase_sequence);
         meta.role = 0;
         meta.context = 0;
@@ -5455,6 +5457,7 @@ impl G17PUserRenderStorage {
         user_timestamps: [u64; 4],
         user_timestamp_aliases: KVec<mmu::KernelMapping>,
         command_context: mmu::T8140AppContextLease,
+        descriptor_context_id: u16,
     ) -> Result<Self> {
         macro_rules! bootstrap_stage {
             ($name:literal, $expression:expr) => {
@@ -5473,7 +5476,10 @@ impl G17PUserRenderStorage {
             };
         }
 
-        let command_context_id = u32::from(g17p_render_descriptor_context_id());
+        if !Self::descriptor_context_valid(descriptor_context_id) {
+            return Err(EINVAL);
+        }
+        let command_context_id = u32::from(descriptor_context_id);
 
         // The render context peers ARE the two render queues' SKSM entry
         // regions: their low VAs are what the render tag-15 ConfigUpdate
@@ -6492,6 +6498,7 @@ impl G17PUserRenderStorage {
             owner_pid,
             lifecycle_predecessor,
             _command_context: Some(command_context),
+            descriptor_context_id,
         })
     }
 
@@ -6564,6 +6571,7 @@ impl G17PUserRenderStorage {
         dev: &AsahiDevice,
         uat: &mmu::Uat,
         vm: &mmu::Vm,
+        descriptor_context_id: u16,
         parameter_page_list_vas: [u64; 2],
         command: &g17_uapi::TranslatedRenderCommand,
         num_clusters: u32,
@@ -6572,6 +6580,9 @@ impl G17PUserRenderStorage {
         submission_ordinal: u32,
     ) -> Result {
         if submission_ordinal == 0 || submission_ordinal >= G17P_RETAINED_RENDER_ORDINALS {
+            return Err(EINVAL);
+        }
+        if !Self::descriptor_context_valid(descriptor_context_id) {
             return Err(EINVAL);
         }
         let plan = G17PRenderItemPlan::new(submission_ordinal, g17p_render_tag16_enabled())
@@ -6793,7 +6804,7 @@ impl G17PUserRenderStorage {
                 &translated.parameters,
                 tiling_objects,
                 g17_render::RenderDescriptorMetadata {
-                    context_id: u32::from(g17p_render_descriptor_context_id()),
+                    context_id: u32::from(descriptor_context_id),
                     submission_ordinal,
                     ta_hardware_buffer_id: translated.parameters.ta_hardware_buffer_id,
                     submit_sequence: submission_ordinal as u64 * 2 + 1,
@@ -6817,7 +6828,7 @@ impl G17PUserRenderStorage {
                 &translated.parameters,
                 objects,
                 g17_render::RenderDescriptorMetadata {
-                    context_id: u32::from(g17p_render_descriptor_context_id()),
+                    context_id: u32::from(descriptor_context_id),
                     submission_ordinal,
                     ta_hardware_buffer_id: 0,
                     submit_sequence: submission_ordinal as u64 * 2,
@@ -6953,6 +6964,7 @@ impl G17PUserRenderStorage {
         self.fragment_mcache = fragment_mcache;
         self.ta_hardware_buffer_id = translated.parameters.ta_hardware_buffer_id;
         self.descriptor_ordinal = submission_ordinal;
+        self.descriptor_context_id = descriptor_context_id;
         drop(old_aliases);
         drop(old_timestamps);
         drop(old_render_user_aliases);
@@ -7802,7 +7814,7 @@ impl G17PUserRenderStorage {
                 g17p_render_queue_id(false),
                 g17p_render_queue_id(true),
                 g17p_render_install(false),
-                g17p_render_descriptor_context_id(),
+                self.descriptor_context_id,
                 &mut raw[optional_offset
                     ..optional_offset + g17_submission::G17P_COLD_OPENING_OPTIONAL_SIZE],
             )
@@ -7908,7 +7920,7 @@ impl G17PUserRenderStorage {
             dev_info!(
                 dev.as_ref(),
                 "G17P 3d-desc submit-ready context={} ordinal={} low_va={:#x} bytes={:#x}\n",
-                g17p_render_descriptor_context_id(),
+                self.descriptor_context_id,
                 submission_ordinal,
                 descriptor_3d_low_va,
                 g17_render::FRAGMENT_DESCRIPTOR_SIZE,
@@ -8135,7 +8147,7 @@ impl G17PUserRenderStorage {
                 g17p_render_queue_id(false),
                 g17p_render_queue_id(true),
                 g17p_render_install(false),
-                g17p_render_descriptor_context_id(),
+                self.descriptor_context_id,
                 &mut raw[optional_offset
                     ..optional_offset + g17_submission::G17P_COLD_OPENING_OPTIONAL_SIZE],
             )
@@ -8241,7 +8253,7 @@ impl G17PUserRenderStorage {
             g17p_render_ta_descriptor_high_va(submission_ordinal).ok_or(EOVERFLOW)?,
             graph_va,
             self.optional_addresses(true),
-            g17p_render_descriptor_context_id(),
+            self.descriptor_context_id,
             submission_ordinal,
             entry_stamp,
             g17p_render_tag16_enabled(),
@@ -13439,6 +13451,7 @@ impl G17ResourceOwner {
         &mut self,
         dev: &AsahiDevice,
         vm: &mmu::Vm,
+        descriptor_context_id: u16,
         command: &g17_uapi::TranslatedRenderCommand,
         num_clusters: u32,
         user_timestamps: [u64; 4],
@@ -13467,9 +13480,9 @@ impl G17ResourceOwner {
             .allocate_t8140_app_context(&render_bind)?;
         dev_info!(
             dev.as_ref(),
-            "G17P render app-GART allocation: lease context {} encoded native context {} (vm {})\n",
+            "G17P render app-GART allocation: command context {} descriptor context {} (vm {})\n",
             command_context.context_id(),
-            g17p_render_descriptor_context_id(),
+            descriptor_context_id,
             render_bind.vm_id(),
         );
         let mut storage = G17PUserRenderStorage::new(
@@ -13486,6 +13499,7 @@ impl G17ResourceOwner {
             user_timestamps,
             user_timestamp_aliases,
             command_context,
+            descriptor_context_id,
         )?;
         for mapping in render_operand_aliases {
             storage.render_operand_aliases.push(mapping, GFP_KERNEL)?;

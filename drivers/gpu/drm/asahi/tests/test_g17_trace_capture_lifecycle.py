@@ -22,6 +22,7 @@ class CaptureLifecycle(unittest.TestCase):
     def setUpClass(cls):
         cls.live = (SOURCE / "g17_live_boot.rs").read_text()
         cls.manager = (SOURCE / "g17_manager.rs").read_text()
+        cls.drm = (SOURCE / "g17_drm.rs").read_text()
 
     def test_prepared_scan_precedes_flist_wake(self):
         body = function(self.live, "submit_translated_render")
@@ -67,13 +68,26 @@ class CaptureLifecycle(unittest.TestCase):
         source = (SOURCE / "g17_resources.rs").read_text()
         source = source[source.index("impl G17PUserRenderStorage {"):]
         body = function(source, "capture_owned_trace")
-        self.assertIn("let context = u32::from(g17p_render_descriptor_context_id())", body)
+        self.assertIn("let context = u32::from(self.descriptor_context_id)", body)
         self.assertNotIn("self._command_context.context_id()", body)
         for owner in ("deflake", "rt_memory", "tpc", "aux_fb"):
             self.assertIn("&self.render_user_aliases." + owner, body)
         self.assertIn("self.fragment_status_low.iova()", body)
         self.assertIn("&self.render_ta_status", body)
         self.assertIn("map(|pm| &mut pm.backing), 0)", body)
+
+    def test_render_submission_uses_the_logical_queue_execution_context(self):
+        body = function(self.drm, "submit")
+        call = body[body.index(".submit_translated_render("):]
+        self.assertRegex(call[:800], r"\.context\s*\.context_id\(\) as u16")
+        self.assertNotIn("RENDER_APP_CONTEXT", call[:800])
+
+        source = (SOURCE / "g17_resources.rs").read_text()
+        restage = function(source, "restage_command")
+        self.assertEqual(
+            restage.count("context_id: u32::from(descriptor_context_id)"), 2
+        )
+        self.assertIn("self.descriptor_context_id = descriptor_context_id", restage)
 
     def test_boot_capture_is_before_initdata_not_before_rtkit_boot(self):
         start = self.live.index("let mut manager = g17_manager::G17PManagerConstruction::new_with_uat(")
