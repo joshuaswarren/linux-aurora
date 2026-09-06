@@ -330,7 +330,19 @@ const G17P_COMPUTE_ADD3_RESOURCE_TABLE: usize = 0x14a0;
 pub(crate) const G17P_COMPUTE_OPERAND_STATE_SIZE: usize = 0x14000;
 pub(crate) const G17P_COMPUTE_SUPPORT_SIZE: usize = 0xc000;
 pub(crate) const G17P_COMPUTE_QUEUE_GRAPH_SIZE: usize = g17_compute::COMPUTE_QUEUE_GRAPH_SIZE;
-pub(crate) const G17P_RENDER_DESCRIPTOR_STORAGE_SIZE: usize = 0x8000;
+const G17P_RENDER_DESCRIPTOR_IMAGE_SIZE: usize = 0x8000;
+const G17P_RENDER_DESCRIPTOR_SLOT_COUNT: usize = 32;
+const G17P_RENDER_TA_DESCRIPTOR_STRIDE: usize = g17_render::TA_DESCRIPTOR_SIZE;
+const G17P_RENDER_3D_DESCRIPTOR_STRIDE: usize = g17_render::FRAGMENT_DESCRIPTOR_SIZE;
+const G17P_RENDER_TA_DESCRIPTOR_ARRAY_SIZE: usize =
+    (G17P_RENDER_TA_DESCRIPTOR_STRIDE * G17P_RENDER_DESCRIPTOR_SLOT_COUNT
+        + mmu::UAT_PGSZ - 1) & !(mmu::UAT_PGSZ - 1);
+const G17P_RENDER_3D_DESCRIPTOR_OFFSET: usize = G17P_RENDER_TA_DESCRIPTOR_ARRAY_SIZE;
+const G17P_RENDER_3D_DESCRIPTOR_ARRAY_SIZE: usize =
+    (G17P_RENDER_3D_DESCRIPTOR_STRIDE * G17P_RENDER_DESCRIPTOR_SLOT_COUNT
+        + mmu::UAT_PGSZ - 1) & !(mmu::UAT_PGSZ - 1);
+pub(crate) const G17P_RENDER_DESCRIPTOR_STORAGE_SIZE: usize =
+    G17P_RENDER_TA_DESCRIPTOR_ARRAY_SIZE + G17P_RENDER_3D_DESCRIPTOR_ARRAY_SIZE;
 /// Exclusive ordinal bound of the current 24-bit event-stamp path. Physical
 /// ring slots and payload bytes wrap independently; they do not limit this.
 pub(crate) const G17P_RETAINED_RENDER_ORDINALS: u32 = 0x00ff_ffff;
@@ -420,6 +432,41 @@ const G17P_COMPUTE_READINESS_CLASS3_PRIMARY_INDEX_OFFSET: usize =
         as usize;
 const G17P_BOOTSTRAP_TA_DESCRIPTOR_LOW_VA: u64 = 0x70_0000_0000;
 const G17P_BOOTSTRAP_3D_DESCRIPTOR_LOW_VA: u64 = 0x70_0009_8000;
+
+fn g17p_render_descriptor_slot(submission_ordinal: u32) -> usize {
+    submission_ordinal as usize % G17P_RENDER_DESCRIPTOR_SLOT_COUNT
+}
+
+fn g17p_render_ta_descriptor_offset(submission_ordinal: u32) -> usize {
+    g17p_render_descriptor_slot(submission_ordinal) * G17P_RENDER_TA_DESCRIPTOR_STRIDE
+}
+
+fn g17p_render_3d_descriptor_offset(submission_ordinal: u32) -> usize {
+    G17P_RENDER_3D_DESCRIPTOR_OFFSET
+        + g17p_render_descriptor_slot(submission_ordinal) * G17P_RENDER_3D_DESCRIPTOR_STRIDE
+}
+
+fn g17p_render_ta_descriptor_high_va(submission_ordinal: u32) -> Option<u64> {
+    g17_submission::G17P_COLD_OPENING_TA_DESCRIPTOR_BASE
+        .checked_add(g17p_render_ta_descriptor_offset(submission_ordinal) as u64)
+}
+
+fn g17p_render_3d_descriptor_high_va(submission_ordinal: u32) -> Option<u64> {
+    g17_submission::G17P_COLD_OPENING_3D_DESCRIPTOR_BASE.checked_add(
+        (g17p_render_descriptor_slot(submission_ordinal) * G17P_RENDER_3D_DESCRIPTOR_STRIDE) as u64,
+    )
+}
+
+fn g17p_render_ta_descriptor_low_va(submission_ordinal: u32) -> Option<u64> {
+    G17P_BOOTSTRAP_TA_DESCRIPTOR_LOW_VA
+        .checked_add(g17p_render_ta_descriptor_offset(submission_ordinal) as u64)
+}
+
+fn g17p_render_3d_descriptor_low_va(submission_ordinal: u32) -> Option<u64> {
+    G17P_BOOTSTRAP_3D_DESCRIPTOR_LOW_VA.checked_add(
+        (g17p_render_descriptor_slot(submission_ordinal) * G17P_RENDER_3D_DESCRIPTOR_STRIDE) as u64,
+    )
+}
 const G17P_BOOTSTRAP_DESCRIPTOR_ZERO_A_VA: u64 = 0xffff_fc20_001c_8000;
 const G17P_BOOTSTRAP_DESCRIPTOR_ZERO_B_VA: u64 = 0xffff_fc20_c07c_0000;
 /// Relocated 2026-08-31. The original `0xffff_fc20_0161_0000` is page 4 of the
@@ -2912,6 +2959,9 @@ pub(crate) struct G17PUserRenderStorage {
     /// every compute VM.
     render_operand_aliases: KVec<mmu::KernelMapping>,
     descriptors: MappedObject,
+    /// Native advances through descriptor arrays instead of rewriting the
+    /// command at the address firmware and RCE have already consumed.
+    descriptor_ordinal: u32,
     /// Entries-only diagnostic mirror of the descriptor-embedded 3D RCE
     /// programs. Native KSM never binds this incomplete mirror.
     fragment_rce: MappedObject,
@@ -5330,15 +5380,23 @@ impl G17PUserRenderStorage {
         self.tiling_mcache
     }
 
-    pub(crate) fn descriptor_low_va(&self, tiling: bool) -> u64 {
+    pub(crate) fn descriptor_low_va(&self, tiling: bool) -> Result<u64> {
         if tiling {
-            G17P_BOOTSTRAP_TA_DESCRIPTOR_LOW_VA
+            g17p_render_ta_descriptor_low_va(self.descriptor_ordinal).ok_or(EOVERFLOW)
         } else {
             // Valid cold native captures encode 0x7000098000+array-offset.
             // KSM fetches RCE arrays through context 0 (unit 0xd8), not the
             // command's client GART. An unrelated eager compute mapping used
             // to hide the missing mapping of the old client-only RCE VA.
-            self.descriptor_3d_low.iova()
+            g17p_render_3d_descriptor_low_va(self.descriptor_ordinal).ok_or(EOVERFLOW)
+        }
+    }
+
+    pub(crate) fn descriptor_high_va(&self, tiling: bool) -> Result<u64> {
+        if tiling {
+            g17p_render_ta_descriptor_high_va(self.descriptor_ordinal).ok_or(EOVERFLOW)
+        } else {
+            g17p_render_3d_descriptor_high_va(self.descriptor_ordinal).ok_or(EOVERFLOW)
         }
     }
 
@@ -5453,10 +5511,10 @@ impl G17PUserRenderStorage {
             "TA descriptor high alias",
             descriptors.object.map_range_into_range(
                 uat.kernel_vm(),
-                0..mmu::UAT_PGSZ,
+                0..G17P_RENDER_TA_DESCRIPTOR_ARRAY_SIZE,
                 g17_submission::G17P_COLD_OPENING_TA_DESCRIPTOR_BASE
                     ..g17_submission::G17P_COLD_OPENING_TA_DESCRIPTOR_BASE
-                        + mmu::UAT_PGSZ as u64,
+                        + G17P_RENDER_TA_DESCRIPTOR_ARRAY_SIZE as u64,
                 mmu::UAT_PGSZ as u64,
                 mmu::PROT_GPU_FW_SHARED_RW,
                 false,
@@ -5466,10 +5524,12 @@ impl G17PUserRenderStorage {
             "3D descriptor high alias",
             descriptors.object.map_range_into_range(
                 uat.kernel_vm(),
-                mmu::UAT_PGSZ..2 * mmu::UAT_PGSZ,
+                G17P_RENDER_3D_DESCRIPTOR_OFFSET
+                    ..G17P_RENDER_3D_DESCRIPTOR_OFFSET
+                        + G17P_RENDER_3D_DESCRIPTOR_ARRAY_SIZE,
                 g17_submission::G17P_COLD_OPENING_3D_DESCRIPTOR_BASE
                     ..g17_submission::G17P_COLD_OPENING_3D_DESCRIPTOR_BASE
-                        + mmu::UAT_PGSZ as u64,
+                        + G17P_RENDER_3D_DESCRIPTOR_ARRAY_SIZE as u64,
                 mmu::UAT_PGSZ as u64,
                 mmu::PROT_GPU_FW_SHARED_RW,
                 false,
@@ -5485,9 +5545,10 @@ impl G17PUserRenderStorage {
             "TA descriptor low alias",
             descriptors.object.map_range_into_range(
                 uat.kernel_lower_vm(),
-                0..mmu::UAT_PGSZ,
+                0..G17P_RENDER_TA_DESCRIPTOR_ARRAY_SIZE,
                 G17P_BOOTSTRAP_TA_DESCRIPTOR_LOW_VA
-                    ..G17P_BOOTSTRAP_TA_DESCRIPTOR_LOW_VA + mmu::UAT_PGSZ as u64,
+                    ..G17P_BOOTSTRAP_TA_DESCRIPTOR_LOW_VA
+                        + G17P_RENDER_TA_DESCRIPTOR_ARRAY_SIZE as u64,
                 mmu::UAT_PGSZ as u64,
                 mmu::PROT_GPU_SHARED_RO,
                 false,
@@ -5497,9 +5558,12 @@ impl G17PUserRenderStorage {
             "3D descriptor low alias",
             descriptors.object.map_range_into_range(
                 uat.kernel_lower_vm(),
-                mmu::UAT_PGSZ..2 * mmu::UAT_PGSZ,
+                G17P_RENDER_3D_DESCRIPTOR_OFFSET
+                    ..G17P_RENDER_3D_DESCRIPTOR_OFFSET
+                        + G17P_RENDER_3D_DESCRIPTOR_ARRAY_SIZE,
                 G17P_BOOTSTRAP_3D_DESCRIPTOR_LOW_VA
-                    ..G17P_BOOTSTRAP_3D_DESCRIPTOR_LOW_VA + mmu::UAT_PGSZ as u64,
+                    ..G17P_BOOTSTRAP_3D_DESCRIPTOR_LOW_VA
+                        + G17P_RENDER_3D_DESCRIPTOR_ARRAY_SIZE as u64,
                 mmu::UAT_PGSZ as u64,
                 mmu::PROT_GPU_SHARED_RO,
                 false,
@@ -6142,7 +6206,8 @@ impl G17PUserRenderStorage {
             "3D descriptor render-VM alias",
             descriptors.object.map_range_into_range(
                 vm,
-                mmu::UAT_PGSZ..2 * mmu::UAT_PGSZ,
+                G17P_RENDER_3D_DESCRIPTOR_OFFSET
+                    ..G17P_RENDER_3D_DESCRIPTOR_OFFSET + mmu::UAT_PGSZ,
                 g17p_cl_client_low_va_range(),
                 mmu::UAT_PGSZ as u64,
                 mmu::PROT_GPU_SHARED_RO,
@@ -6163,7 +6228,10 @@ impl G17PUserRenderStorage {
             g17_render::G17P_FRAGMENT_RCE_PROGRAM_STRIDE,
         );
         let (fragment_mcache, tiling_mcache) = bootstrap_stage!("descriptor encoding", descriptors.with_bytes_mut(|raw| {
-            let (tiling, fragment) = raw.split_at_mut(0x4000);
+            let (ta_array, fragment_array) = raw.split_at_mut(G17P_RENDER_3D_DESCRIPTOR_OFFSET);
+            let tiling = ta_array.get_mut(..g17_render::TA_DESCRIPTOR_SIZE).ok_or(ERANGE)?;
+            let fragment = fragment_array
+                .get_mut(..g17_render::FRAGMENT_DESCRIPTOR_SIZE).ok_or(ERANGE)?;
             g17_render::build_cold_opening_ta_descriptor(
                 &translated.parameters,
                 tiling_objects,
@@ -6357,6 +6425,7 @@ impl G17PUserRenderStorage {
         Ok(Self {
             render_operand_aliases,
             descriptors,
+            descriptor_ordinal: 0,
             fragment_rce,
             descriptor_ta_high,
             descriptor_3d_high,
@@ -6429,7 +6498,9 @@ impl G17PUserRenderStorage {
             vm, self.fragment_rce.iova(), mmu::PROT_GPU_SHARED_RO,
         )?, GFP_KERNEL)?;
         aliases.push(self.descriptors.object.map_range_into_range(
-            vm, mmu::UAT_PGSZ..2 * mmu::UAT_PGSZ,
+            vm,
+            G17P_RENDER_3D_DESCRIPTOR_OFFSET
+                ..G17P_RENDER_3D_DESCRIPTOR_OFFSET + mmu::UAT_PGSZ,
             self.descriptor_3d_render.iova()
                 ..self.descriptor_3d_render.iova() + self.descriptor_3d_render.size() as u64,
             mmu::UAT_PGSZ as u64, mmu::PROT_GPU_SHARED_RO, false,
@@ -6478,7 +6549,7 @@ impl G17PUserRenderStorage {
         let mut next_descriptors = MappedObject::new_wc(
             dev,
             uat,
-            G17P_RENDER_DESCRIPTOR_STORAGE_SIZE,
+            G17P_RENDER_DESCRIPTOR_IMAGE_SIZE,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
@@ -6674,7 +6745,10 @@ impl G17PUserRenderStorage {
             objects
         };
         let fragment_rce_va = self.fragment_rce.iova();
-        let descriptor_3d_rce_va = self.descriptor_3d_low.iova();
+        let descriptor_ta_rce_va =
+            g17p_render_ta_descriptor_low_va(submission_ordinal).ok_or(EOVERFLOW)?;
+        let descriptor_3d_rce_va =
+            g17p_render_3d_descriptor_low_va(submission_ordinal).ok_or(EOVERFLOW)?;
         let fragment_rce = &mut self.fragment_rce;
         let fragment_mcache = next_descriptors.with_bytes_mut(|raw| {
             let (tiling, fragment) = raw.split_at_mut(0x4000);
@@ -6692,7 +6766,7 @@ impl G17PUserRenderStorage {
             .map_err(|_| EINVAL)?;
             g17_render::apply_g17p_retained_descriptor_fields(
                 g17_render::RenderDescriptorKind::Tiling,
-                G17P_BOOTSTRAP_TA_DESCRIPTOR_LOW_VA,
+                descriptor_ta_rce_va,
                 g17_initdata::CONTROL_SHARED_ADDRESS,
                 g17p_render_queue_id(true) as u8,
                 g17p_render_queue_id(false) as u8,
@@ -6775,7 +6849,7 @@ impl G17PUserRenderStorage {
         let destination = self.descriptors.object.vmap()?;
         let support = self.support.object.vmap()?;
         let source = unsafe {
-            core::slice::from_raw_parts(source.as_ptr(), G17P_RENDER_DESCRIPTOR_STORAGE_SIZE)
+            core::slice::from_raw_parts(source.as_ptr(), G17P_RENDER_DESCRIPTOR_IMAGE_SIZE)
         };
         let destination = unsafe {
             core::slice::from_raw_parts_mut(
@@ -6789,7 +6863,18 @@ impl G17PUserRenderStorage {
         let pool_a_kick =
             G17PEventControlKick::prepare_reuse(support, support_va, record_a_index)
                 .ok_or(EBUSY)?;
-        destination.copy_from_slice(source);
+        let ta_offset = g17p_render_ta_descriptor_offset(submission_ordinal);
+        let fragment_offset = g17p_render_3d_descriptor_offset(submission_ordinal);
+        destination
+            .get_mut(ta_offset..ta_offset + g17_render::TA_DESCRIPTOR_SIZE)
+            .ok_or(ERANGE)?
+            .copy_from_slice(&source[..g17_render::TA_DESCRIPTOR_SIZE]);
+        destination
+            .get_mut(fragment_offset..fragment_offset + g17_render::FRAGMENT_DESCRIPTOR_SIZE)
+            .ok_or(ERANGE)?
+            .copy_from_slice(
+                &source[0x4000..0x4000 + g17_render::FRAGMENT_DESCRIPTOR_SIZE],
+            );
         let record_a = G17P_RENDER_POOL_A + record_a_index * 0x100;
         put_u32(
             support,
@@ -6830,6 +6915,7 @@ impl G17PUserRenderStorage {
             core::mem::replace(&mut self.user_timestamp_aliases, user_timestamp_aliases);
         self.fragment_mcache = fragment_mcache;
         self.ta_hardware_buffer_id = translated.parameters.ta_hardware_buffer_id;
+        self.descriptor_ordinal = submission_ordinal;
         drop(old_aliases);
         drop(old_timestamps);
         drop(old_render_user_aliases);
@@ -7393,7 +7479,7 @@ impl G17PUserRenderStorage {
                 "descriptor-ta-high-identity",
                 self.descriptor_ta_high.iova()
                     == g17_submission::G17P_COLD_OPENING_TA_DESCRIPTOR_BASE
-                    && self.descriptor_ta_high.size() == mmu::UAT_PGSZ,
+                    && self.descriptor_ta_high.size() == G17P_RENDER_TA_DESCRIPTOR_ARRAY_SIZE,
             ),
             (
                 "descriptor-ta-high-mapped",
@@ -7408,7 +7494,7 @@ impl G17PUserRenderStorage {
                 "descriptor-3d-high-identity",
                 self.descriptor_3d_high.iova()
                     == g17_submission::G17P_COLD_OPENING_3D_DESCRIPTOR_BASE
-                    && self.descriptor_3d_high.size() == mmu::UAT_PGSZ,
+                    && self.descriptor_3d_high.size() == G17P_RENDER_3D_DESCRIPTOR_ARRAY_SIZE,
             ),
             (
                 "descriptor-3d-high-mapped",
@@ -7422,7 +7508,7 @@ impl G17PUserRenderStorage {
             (
                 "descriptor-ta-low-identity",
                 self.descriptor_ta_low.iova() == G17P_BOOTSTRAP_TA_DESCRIPTOR_LOW_VA
-                    && self.descriptor_ta_low.size() == mmu::UAT_PGSZ,
+                    && self.descriptor_ta_low.size() == G17P_RENDER_TA_DESCRIPTOR_ARRAY_SIZE,
             ),
             (
                 "descriptor-ta-low-mapped",
@@ -7436,7 +7522,7 @@ impl G17PUserRenderStorage {
             (
                 "descriptor-3d-low-identity",
                 self.descriptor_3d_low.iova() == G17P_BOOTSTRAP_3D_DESCRIPTOR_LOW_VA
-                    && self.descriptor_3d_low.size() == mmu::UAT_PGSZ,
+                    && self.descriptor_3d_low.size() == G17P_RENDER_3D_DESCRIPTOR_ARRAY_SIZE,
             ),
             (
                 "descriptor-3d-low-mapped",
@@ -7652,7 +7738,7 @@ impl G17PUserRenderStorage {
     pub(crate) fn stage_fragment(&mut self, submission_ordinal: u32) -> Result {
         let graph_va = self.graph.iova();
         let items = [
-            g17_submission::G17P_COLD_OPENING_3D_DESCRIPTOR_BASE,
+            g17p_render_3d_descriptor_high_va(submission_ordinal).ok_or(EOVERFLOW)?,
             graph_va + Self::FRAGMENT_OPTIONAL as u64,
             graph_va + Self::FRAGMENT_EVENT as u64,
         ];
@@ -7737,14 +7823,19 @@ impl G17PUserRenderStorage {
             channel_payload,
         )
         .map_err(|_| EINVAL)?;
+        let ta_offset = g17p_render_ta_descriptor_offset(self.descriptor_ordinal);
+        let fragment_offset = g17p_render_3d_descriptor_offset(self.descriptor_ordinal);
         self.descriptors.with_bytes_mut(|raw| {
-            if raw.len() < 0x8000 {
-                return Err(EINVAL);
-            }
             g17_render::apply_g17p_ta_linked_completion_scratch(
-                tiling_timestamp, current_timestamp, channel_payload, &mut raw[..0x4000],
+                tiling_timestamp,
+                current_timestamp,
+                channel_payload,
+                raw.get_mut(ta_offset..ta_offset + g17_render::TA_DESCRIPTOR_SIZE)
+                    .ok_or(ERANGE)?,
             ).map_err(|_| EINVAL)?;
-            let fragment = raw.get_mut(0x4000..0x8000).ok_or(EINVAL)?;
+            let fragment = raw
+                .get_mut(fragment_offset..fragment_offset + g17_render::FRAGMENT_DESCRIPTOR_SIZE)
+                .ok_or(ERANGE)?;
             put_u64(fragment, 0x2160, value);
             core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
             Ok(())
@@ -7768,15 +7859,19 @@ impl G17PUserRenderStorage {
             return Ok(());
         }
 
-        let descriptor_3d_render_va = self.descriptor_3d_render.iova();
+        let descriptor_3d_low_va =
+            g17p_render_3d_descriptor_low_va(submission_ordinal).ok_or(EOVERFLOW)?;
+        let fragment_offset = g17p_render_3d_descriptor_offset(submission_ordinal);
         self.descriptors.with_bytes_mut(|raw| {
-            let fragment = raw.get(0x4000..0x8000).ok_or(EINVAL)?;
+            let fragment = raw
+                .get(fragment_offset..fragment_offset + g17_render::FRAGMENT_DESCRIPTOR_SIZE)
+                .ok_or(ERANGE)?;
             dev_info!(
                 dev.as_ref(),
                 "G17P 3d-desc submit-ready context={} ordinal={} low_va={:#x} bytes={:#x}\n",
                 g17p_render_descriptor_context_id(),
                 submission_ordinal,
-                descriptor_3d_render_va,
+                descriptor_3d_low_va,
                 g17_render::FRAGMENT_DESCRIPTOR_SIZE,
             );
             for (index, chunk) in fragment[..g17_render::FRAGMENT_DESCRIPTOR_SIZE]
@@ -7806,7 +7901,9 @@ impl G17PUserRenderStorage {
         rce_vm: &mmu::Vm,
     ) -> Result {
         let verbose = *crate::module_parameters::g17p_render_dump_descriptor.value() != 0;
-        let base = self.descriptor_3d_low.iova();
+        let base = g17p_render_3d_descriptor_low_va(self.descriptor_ordinal)
+            .ok_or(EOVERFLOW)?;
+        let fragment_offset = g17p_render_3d_descriptor_offset(self.descriptor_ordinal);
         let mut roots = [(0u64, 0u64); 4];
         rce_vm.context_roots(&mut roots)?;
         if verbose {
@@ -7834,7 +7931,7 @@ impl G17PUserRenderStorage {
             let mut cpu_bytes = [0u8; 16];
             self.descriptors.with_bytes_mut(|raw| {
                 cpu_bytes.copy_from_slice(
-                    raw.get(0x4000 + offset..0x4000 + offset + 16)
+                    raw.get(fragment_offset + offset..fragment_offset + offset + 16)
                         .ok_or(ERANGE)?,
                 );
                 Ok(())
@@ -7868,8 +7965,9 @@ impl G17PUserRenderStorage {
     /// retire while this word remains zero before and after, so it is not a
     /// reliable entry witness for B1's 3D activation routine.
     pub(crate) fn fragment_word_20f0(&mut self) -> Result<u32> {
+        let fragment_offset = g17p_render_3d_descriptor_offset(self.descriptor_ordinal);
         self.descriptors.with_bytes_mut(|raw| {
-            let offset = 0x4000usize.checked_add(0x20f0).ok_or(EOVERFLOW)?;
+            let offset = fragment_offset.checked_add(0x20f0).ok_or(EOVERFLOW)?;
             Ok(u32::from_le_bytes(
                 raw.get(offset..offset + 4)
                     .ok_or(ERANGE)?
@@ -7889,9 +7987,15 @@ impl G17PUserRenderStorage {
     /// stream header: reserved zero, stream pointer, and {0x42c bytes, 0x59
     /// records}. It is not a QID-0/slot-89 dependency.
     pub(crate) fn render_activation_coordinates(&mut self) -> Result<(u32, u64, u32, u64, u64)> {
+        let ta_offset = g17p_render_ta_descriptor_offset(self.descriptor_ordinal);
+        let fragment_offset = g17p_render_3d_descriptor_offset(self.descriptor_ordinal);
         self.descriptors.with_bytes_mut(|raw| {
-            let tiling = raw.get(0x0000..0x4000).ok_or(ERANGE)?;
-            let fragment = raw.get(0x4000..0x8000).ok_or(ERANGE)?;
+            let tiling = raw
+                .get(ta_offset..ta_offset + g17_render::TA_DESCRIPTOR_SIZE)
+                .ok_or(ERANGE)?;
+            let fragment = raw
+                .get(fragment_offset..fragment_offset + g17_render::FRAGMENT_DESCRIPTOR_SIZE)
+                .ok_or(ERANGE)?;
             let ta_qid = u32::from_le_bytes(
                 tiling
                     .get(0x079c..0x07a0)
@@ -7937,8 +8041,11 @@ impl G17PUserRenderStorage {
     /// visible. The resource-table and job-substate operands are firmware
     /// private; KTrace supplies the corresponding path witnesses.
     pub(crate) fn render_activation_gate_words(&mut self) -> Result<[u32; 5]> {
+        let ta_offset = g17p_render_ta_descriptor_offset(self.descriptor_ordinal);
         self.descriptors.with_bytes_mut(|raw| {
-            let tiling = raw.get(0x0000..0x4000).ok_or(ERANGE)?;
+            let tiling = raw
+                .get(ta_offset..ta_offset + g17_render::TA_DESCRIPTOR_SIZE)
+                .ok_or(ERANGE)?;
             let u32_at = |offset: usize| -> Result<u32> {
                 Ok(u32::from_le_bytes(
                     tiling
@@ -7968,7 +8075,7 @@ impl G17PUserRenderStorage {
     pub(crate) fn stage_fragment_prefix(&mut self, submission_ordinal: u32) -> Result {
         let graph_va = self.graph.iova();
         let items = [
-            g17_submission::G17P_COLD_OPENING_3D_DESCRIPTOR_BASE,
+            g17p_render_3d_descriptor_high_va(submission_ordinal).ok_or(EOVERFLOW)?,
             graph_va + Self::FRAGMENT_OPTIONAL as u64,
         ];
         let optional_addresses = self.optional_addresses(false);
@@ -8090,7 +8197,7 @@ impl G17PUserRenderStorage {
             G17PEventControlKick::prepare(raw, record_a_index).ok_or(EINVAL)?
         };
         let bytes = build_g17p_late_tiling_bytes(
-            g17_submission::G17P_COLD_OPENING_TA_DESCRIPTOR_BASE,
+            g17p_render_ta_descriptor_high_va(submission_ordinal).ok_or(EOVERFLOW)?,
             graph_va,
             self.optional_addresses(true),
             g17p_render_descriptor_context_id(),
@@ -14957,6 +15064,27 @@ mod tests {
     }
 
     #[test]
+    fn retained_descriptors_advance_through_native_stride_arrays() {
+        assert_eq!(G17P_RENDER_DESCRIPTOR_SLOT_COUNT, 32);
+        assert_eq!(G17P_RENDER_TA_DESCRIPTOR_ARRAY_SIZE, 0x14000);
+        assert_eq!(G17P_RENDER_3D_DESCRIPTOR_ARRAY_SIZE, 0x48000);
+        assert_eq!(G17P_RENDER_DESCRIPTOR_STORAGE_SIZE, 0x5c000);
+        assert_eq!(g17p_render_ta_descriptor_offset(0), 0);
+        assert_eq!(g17p_render_ta_descriptor_offset(1), 0x9c0);
+        assert_eq!(g17p_render_3d_descriptor_offset(0), 0x14000);
+        assert_eq!(g17p_render_3d_descriptor_offset(1), 0x16240);
+        assert_eq!(
+            g17p_render_ta_descriptor_high_va(1),
+            Some(g17_submission::G17P_COLD_OPENING_TA_DESCRIPTOR_BASE + 0x9c0),
+        );
+        assert_eq!(
+            g17p_render_3d_descriptor_low_va(1),
+            Some(G17P_BOOTSTRAP_3D_DESCRIPTOR_LOW_VA + 0x2240),
+        );
+        assert_eq!(g17p_render_descriptor_slot(32), 0);
+    }
+
+    #[test]
     fn g17p_parameter_management_matches_the_native_object_graph() {
         let pm = g17p_parameter_management_layout().unwrap();
         assert_eq!(G17P_PM_HWPB_STATE_SIZE, 0xc0);
@@ -15321,8 +15449,14 @@ mod tests {
 
         for (start, size) in [
             (G17P_CONTROL_DIRECTORY_VA, G17P_CONTROL_DIRECTORY_SIZE),
-            (G17P_BOOTSTRAP_TA_DESCRIPTOR_LOW_VA, G17P_PAGE_SIZE),
-            (G17P_BOOTSTRAP_3D_DESCRIPTOR_LOW_VA, G17P_PAGE_SIZE),
+            (
+                G17P_BOOTSTRAP_TA_DESCRIPTOR_LOW_VA,
+                G17P_RENDER_TA_DESCRIPTOR_ARRAY_SIZE,
+            ),
+            (
+                G17P_BOOTSTRAP_3D_DESCRIPTOR_LOW_VA,
+                G17P_RENDER_3D_DESCRIPTOR_ARRAY_SIZE,
+            ),
             (G17P_BOOTSTRAP_TA_CONTEXT_LOW_VA, G17P_BOOTSTRAP_CONTEXT_PEER_SIZE),
             (G17P_BOOTSTRAP_3D_CONTEXT_LOW_VA, G17P_BOOTSTRAP_CONTEXT_PEER_SIZE),
             (
