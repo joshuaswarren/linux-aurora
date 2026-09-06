@@ -15840,7 +15840,8 @@ mod tests {
         fn u64_at(raw: &[u8], offset: usize) -> u64 {
             u64::from_le_bytes(raw[offset..offset + 8].try_into().unwrap())
         }
-        let parameters = g17_render::G17pRenderParameters::source_rsrc8();
+        let mut parameters = g17_render::G17pRenderParameters::source_rsrc8();
+        parameters.aux_fb_flags = g17p_aux_fb_flags(0);
         let objects = g17_render::RenderDescriptorObjects {
             record_a: 0x70_0014_0000,
             shared: 0x70_0015_0000,
@@ -15886,6 +15887,16 @@ mod tests {
         assert_eq!(u32_at(&fragment, 0x458), 0);
         assert_eq!(u32_at(&fragment, 0x470), 0x100);
         assert_eq!(u32_at(&fragment, 0x47c), 0x100);
+        assert_eq!(u64_at(&fragment, 0x1f40), 0xc000);
+        assert_eq!(
+            g17_render::build_fragment_registers(&parameters)
+                .unwrap()
+                .iter()
+                .find(|write| write.number == 0x15021)
+                .unwrap()
+                .value,
+            0xc000
+        );
     }
 
     #[test]
