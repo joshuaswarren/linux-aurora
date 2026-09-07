@@ -11,7 +11,11 @@
 #include <linux/dma-mapping.h>
 #include <linux/firmware.h>
 #include <linux/gpio/consumer.h>
+#include <linux/gpio/driver.h>
 #include <linux/hid.h>
+#include <linux/ktime.h>
+#include <linux/mfd/macsmc.h>
+#include <linux/module.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/dockchannel.h>
@@ -92,20 +96,65 @@ struct dchid_init_hdr {
 #define DCHID_POWER_STATE_ON 2
 
 /*
- * J700's shipping MTP_SYS personality carries the host half of the multi-touch
- * power transition as
+ * J700's shipping MTP_SYS multi-touch personality carries the host half of the
+ * power transition as two AppleHIDTransport function sequences.
  *
- *   power-sequence[0].FunctionName        = function-afe-reset
- *   power-sequence[0].DisableFunctionType = High   DisableDelayUs = 50000
- *   power-sequence[0].EnableFunctionType  = Low    EnableDelayUs  = 0
+ * power-sequence is the legacy compact encoding: a NUL-terminated function name
+ * followed by enable-delay-ms, disable-delay-ms, enable-type and disable-type
+ * bytes.  J700 ships
  *
- * (AHTFunctionInfo::FunctionType is Low=0, High=1, Input=2, ...).  Both levels
- * are absolute line levels, so this driver drives the raw line and deliberately
- * does not consult the DT active-low flag.
+ *   66 75 6e 63 74 69 6f 6e 2d 61 66 65 2d 72 65 73 65 74 00 | 00 32 00 01
+ *   "function-afe-reset"                                       enable  Low,  0ms
+ *                                                              disable High, 50ms
+ *
+ * reset-sequence is the modern dictionary form and needs no field-order
+ * assumption at all:
+ *
+ *   FunctionName        = function-ipd-pwr-seq-control
+ *   EnableFunctionType  = Low   EnableDelayUs  = 100000
+ *   DisableFunctionType = High  DisableDelayUs = 0
+ *
+ * AHTFunctionInfo's legacy type table is Low=0, High=1, Input=2, AltFunc=3,
+ * Config0=4, Config1=5, Read=6.  The compact form's field order is confirmed
+ * against a machine whose ADT ships the same encoding: j493's touch-bar node has
+ *
+ *   function-display_power_enable \0 00 00 01 00
+ *   function-clock_32KHz_enable   \0 0a 00 03 00
+ *   function-reset                \0 01 01 01 00
+ *
+ * and only the enable-first order reads sensibly there, since it puts AltFunc on
+ * the enable half of a 32 kHz clock output and High on the release half of an
+ * active-low reset.  Applied to J700 that gives Low as the AFE's enable level,
+ * which is why this driver drives the raw line and deliberately does not consult
+ * the DT active-low flag - J700's line is not active low.
+ *
+ * AppleHIDTransportInterface runs power-sequence as its chip-power step and
+ * reset-sequence as its reset step, so despite the function names the AFE supply
+ * on J700 is the pcIO line (SMC gP13) and the AFE reset is the pmIP key.  Power
+ * on therefore raises the supply and then releases the reset, waiting the
+ * sequence's 100 ms before telling MTP the platform has changed; power off
+ * asserts the reset and then removes the supply, holding it for 50 ms.
  */
-#define DCHID_AFE_RESET_ASSERTED 1
-#define DCHID_AFE_RESET_RELEASED 0
-#define DCHID_AFE_RESET_HOLD_US 50000
+#define DCHID_AFE_RESET_ENABLE_LEVEL 0
+#define DCHID_AFE_RESET_ENABLE_DELAY_US 0
+#define DCHID_AFE_RESET_DISABLE_LEVEL 1
+#define DCHID_AFE_RESET_DISABLE_DELAY_US 50000
+
+#define SMC_KEY_IPD_PWR_SEQ SMC_KEY(pmIP)
+#define DCHID_IPD_RESET_ENABLE_VALUE 0
+#define DCHID_IPD_RESET_ENABLE_DELAY_US 100000
+#define DCHID_IPD_RESET_DISABLE_VALUE 1
+#define DCHID_IPD_RESET_DISABLE_DELAY_US 0
+
+static bool ipd_reset_sequence = true;
+module_param(ipd_reset_sequence, bool, 0644);
+MODULE_PARM_DESC(ipd_reset_sequence,
+		 "Run the J700 multi-touch reset-sequence (function-ipd-pwr-seq-control) during power transitions");
+
+static bool ipd_reset_write = true;
+module_param(ipd_reset_write, bool, 0644);
+MODULE_PARM_DESC(ipd_reset_write,
+		 "Write the pmIP SMC key as part of the reset-sequence; with 0 only its delay is applied");
 
 struct dchid_init_block_hdr {
 	u16 type;
@@ -194,8 +243,10 @@ struct dchid_iface {
 	char gpio_name[MAX_GPIO_NAME];
 	int gpio_id;
 
-	/* Host-owned AFE reset line (J700 function-afe-reset). */
+	/* Host-owned AFE supply line (J700 function-afe-reset). */
 	struct gpio_desc *afe_reset;
+	/* The SMC behind that line, which also owns the pmIP reset key. */
+	struct apple_smc *smc;
 
 	struct mutex out_mutex;
 	u32 out_flags;
@@ -399,6 +450,41 @@ static int dchid_enable_interface(struct dchid_iface *iface)
 	return dchid_comm_cmd(iface->dchid, msg, sizeof(msg));
 }
 
+/*
+ * Find the SMC that owns the AFE supply line.
+ *
+ * The reset half of the J700 contract is keyW('pmIP'), a plain SMC key rather
+ * than a GPIO, so there is no gpiod for it and no separate DT phandle to follow.
+ * Both functions live on the same controller by construction - the ADT gives
+ * them the same provider - so the SMC is reached through the gpiochip that
+ * supplied apple,afe-reset-gpios: its parent is the macsmc-gpio MFD child and
+ * that device's parent is the SMC itself.  The compatible is checked before the
+ * drvdata is trusted, so a DT that wires the line to some other controller fails
+ * closed instead of handing back a foreign pointer.
+ */
+static struct apple_smc *dchid_afe_smc(struct dchid_iface *iface)
+{
+	struct gpio_chip *gc;
+	struct device *smc_dev;
+
+	if (iface->smc)
+		return iface->smc;
+
+	if (!iface->afe_reset)
+		return NULL;
+
+	gc = gpiod_to_chip(iface->afe_reset);
+	if (!gc || !gc->parent || !gc->parent->parent)
+		return NULL;
+
+	smc_dev = gc->parent->parent;
+	if (!device_is_compatible(smc_dev, "apple,smc"))
+		return NULL;
+
+	iface->smc = dev_get_drvdata(smc_dev);
+	return iface->smc;
+}
+
 static bool dchid_uses_transactional_power(struct dchid_iface *iface)
 {
 	const char *firmware_name;
@@ -411,64 +497,132 @@ static bool dchid_uses_transactional_power(struct dchid_iface *iface)
 }
 
 /*
- * Run the host half of a multi-touch power transition.
+ * Run the power-sequence half of a multi-touch power transition.
  *
- * On J700 the AFE reset is not an MTP-requested GPIO: MTP sends no
- * INIT_GPIO_REQUEST for multi-touch and its firmware does not implement
- * CMD_ACK_GPIO_CMD, because the line is an SMC platform function
- * (function-afe-reset = pKW8('pcIO', 0x10000, 0x130000), i.e. SMC GPIO index
- * 0x13 / key gP13) that only the host can drive.  MTP's own HBPP bootloader
- * then attaches to the AFE while it sits in its post-reset bootloader window;
- * an AFE still running the image iBoot left in it is long past that window and
- * answers with "AFE Chip Boot Failure for HBPP[0]: No HINT_L".
+ * On J700 this line is not an MTP-requested GPIO: MTP sends no INIT_GPIO_REQUEST
+ * for multi-touch and its firmware does not implement CMD_ACK_GPIO_CMD, because
+ * the line is an SMC platform function - function-afe-reset is
+ * pKW8('pcIO', 0x10000, 0x130000), i.e. SMC GPIO index 0x13, key gP13 - that
+ * only the host can drive.  The index decode is the same one already qualified
+ * for this machine's MT7932: its function-reg_on is pKW8('pcIO', 0x800000,
+ * 0x80000) and works through smc_gpio line 8.
  *
- * macOS runs this in AppleHIDTransportInterface::setPowerGatedWillHas between
- * the will-change and has-changed messages: entering power state 0 runs the
- * Disable half of power-sequence[0] (drive High, then hold DisableDelayUs) and
- * entering power state 2 from state 0 runs the Enable half (drive Low,
- * EnableDelayUs is 0).  The separate reset-sequence[0]
- * (function-ipd-pwr-seq-control, an SMC 'pmIP' key) is only run on transitions
- * into and out of power state 3, which this driver never uses, so it is
- * deliberately not issued here.
+ * The levels and delays come from the shipping MTP_SYS personality documented
+ * above; both are absolute line levels, so the raw accessor is used and the DT
+ * active-low flag is deliberately not consulted.  The line is read back on both
+ * sides of the write so a boot log shows what the platform actually did rather
+ * than only what was asked for.
  */
-static int dchid_afe_power_sequence(struct dchid_iface *iface, int state)
+static int dchid_afe_power_sequence(struct dchid_iface *iface, bool enable)
 {
-	int level, ret;
-
-	switch (state) {
-	case DCHID_POWER_STATE_OFF:
-		level = DCHID_AFE_RESET_ASSERTED;
-		break;
-	case DCHID_POWER_STATE_ON:
-		level = DCHID_AFE_RESET_RELEASED;
-		break;
-	default:
-		return 0;
-	}
+	int level = enable ? DCHID_AFE_RESET_ENABLE_LEVEL
+			   : DCHID_AFE_RESET_DISABLE_LEVEL;
+	u32 delay_us = enable ? DCHID_AFE_RESET_ENABLE_DELAY_US
+			      : DCHID_AFE_RESET_DISABLE_DELAY_US;
+	int before, after, ret;
 
 	if (!iface->afe_reset) {
-		dev_err(iface->dchid->dev, "No AFE reset line for %s\n",
+		dev_err(iface->dchid->dev, "No AFE supply line for %s\n",
 			iface->name);
 		return -ENODEV;
 	}
 
+	before = gpiod_get_raw_value_cansleep(iface->afe_reset);
+
 	ret = gpiod_direction_output_raw(iface->afe_reset, level);
 	if (ret) {
 		dev_err(iface->dchid->dev,
-			"Failed to drive the %s AFE reset line to %d: %d\n",
+			"Failed to drive the %s AFE supply line to %d: %d\n",
 			iface->name, level, ret);
 		return ret;
 	}
 
-	dev_info(iface->dchid->dev,
-		 "AFE power sequence: %s state=%d afe-reset=%d hold_us=%u\n",
-		 iface->name, state, level,
-		 level == DCHID_AFE_RESET_ASSERTED ? DCHID_AFE_RESET_HOLD_US : 0);
+	after = gpiod_get_raw_value_cansleep(iface->afe_reset);
 
-	if (level == DCHID_AFE_RESET_ASSERTED)
-		fsleep(DCHID_AFE_RESET_HOLD_US);
+	dev_info(iface->dchid->dev,
+		 "AFE power sequence: %s enable=%d gP13=%d before=%d after=%d delay_us=%u\n",
+		 iface->name, enable, level, before, after, delay_us);
+
+	if (delay_us)
+		fsleep(delay_us);
 
 	return 0;
+}
+
+/*
+ * Run the reset-sequence half of a multi-touch power transition.
+ *
+ * function-ipd-pwr-seq-control is keyW('pmIP'), so it is an ordinary SMC key
+ * write rather than a GPIO operation.  Nothing in Linux has ever driven it, and
+ * without it the Cumulus AFE is left holding whatever reset state the boot chain
+ * gave it while MTP runs its HBPP bootload against it - which is exactly the
+ * "AFE Chip Boot Failure for HBPP[0]: No HINT_L" the firmware reports.
+ *
+ * The write is intentionally not fatal.  A boot that cannot reach the SMC still
+ * applies the sequence's delay and still produces MTP's verdict, and the log
+ * line below says precisely which of the two happened, so one boot distinguishes
+ * "the pmIP edge was missing" from "only the settle was missing".
+ */
+static void dchid_ipd_reset_sequence(struct dchid_iface *iface, bool enable)
+{
+	u8 value = enable ? DCHID_IPD_RESET_ENABLE_VALUE
+			  : DCHID_IPD_RESET_DISABLE_VALUE;
+	u32 delay_us = enable ? DCHID_IPD_RESET_ENABLE_DELAY_US
+			      : DCHID_IPD_RESET_DISABLE_DELAY_US;
+	int before = -1, after = -1, ret = 0;
+	const char *how = "no-smc";
+	struct apple_smc *smc;
+	u8 read_value;
+
+	if (!ipd_reset_sequence)
+		return;
+
+	smc = dchid_afe_smc(iface);
+	if (smc) {
+		if (!apple_smc_read_u8(smc, SMC_KEY_IPD_PWR_SEQ, &read_value))
+			before = read_value;
+
+		if (!ipd_reset_write) {
+			how = "read-only";
+		} else {
+			ret = apple_smc_write_u8(smc, SMC_KEY_IPD_PWR_SEQ, value);
+			how = ret ? "write-failed" : "written";
+			if (!apple_smc_read_u8(smc, SMC_KEY_IPD_PWR_SEQ,
+					       &read_value))
+				after = read_value;
+		}
+	}
+
+	dev_info(iface->dchid->dev,
+		 "IPD reset sequence: %s enable=%d pmIP=%s value=%u before=%d after=%d delay_us=%u ret=%d\n",
+		 iface->name, enable, how, value, before, after, delay_us, ret);
+
+	if (delay_us)
+		fsleep(delay_us);
+}
+
+/*
+ * AppleHIDTransportInterface runs power-sequence as its chip-power step and
+ * reset-sequence as its reset step, so the supply is raised before the reset is
+ * released and asserted again before the supply is removed.
+ */
+static int dchid_platform_power_sequence(struct dchid_iface *iface, int state)
+{
+	int ret;
+
+	switch (state) {
+	case DCHID_POWER_STATE_OFF:
+		dchid_ipd_reset_sequence(iface, false);
+		return dchid_afe_power_sequence(iface, false);
+	case DCHID_POWER_STATE_ON:
+		ret = dchid_afe_power_sequence(iface, true);
+		if (ret < 0)
+			return ret;
+		dchid_ipd_reset_sequence(iface, true);
+		return 0;
+	default:
+		return 0;
+	}
 }
 
 static int dchid_reset_interface(struct dchid_iface *iface, int state)
@@ -481,6 +635,7 @@ static int dchid_reset_interface(struct dchid_iface *iface, int state)
 		DCHID_POWER_PHASE_WILL_CHANGE,
 		0, 0, 0, 0,
 	};
+	ktime_t started, settled;
 	int ret;
 
 	if (!dchid_uses_transactional_power(iface))
@@ -492,18 +647,28 @@ static int dchid_reset_interface(struct dchid_iface *iface, int state)
 		return ret;
 
 	/*
-	 * The platform sequence belongs between the two phases: will-change lets
+	 * The platform sequences belong between the two phases: will-change lets
 	 * MTP quiesce the interface, the host then puts the AFE into the new
 	 * state, and has-changed tells MTP the platform is ready, which is when
-	 * it runs its own AFE bootload.
+	 * it runs its own AFE bootload.  How much settle actually elapsed before
+	 * that bootload is the whole question here, so it is measured rather
+	 * than assumed.
 	 */
-	ret = dchid_afe_power_sequence(iface, state);
+	started = ktime_get();
+	ret = dchid_platform_power_sequence(iface, state);
 	if (ret < 0)
 		return ret;
+	settled = ktime_get();
 
 	msg[4] = DCHID_POWER_PHASE_HAS_CHANGED;
+	ret = dchid_comm_cmd(iface->dchid, msg, sizeof(msg));
 
-	return dchid_comm_cmd(iface->dchid, msg, sizeof(msg));
+	dev_info(iface->dchid->dev,
+		 "Power transition %s state=%d: platform=%lldus has-changed=%lldus ret=%d\n",
+		 iface->name, state, ktime_us_delta(settled, started),
+		 ktime_us_delta(ktime_get(), settled), ret);
+
+	return ret;
 }
 
 static int dchid_send_firmware(struct dchid_iface *iface, void *firmware, size_t size)
@@ -609,7 +774,48 @@ static int dchid_request_gpio(struct dchid_iface *iface)
 }
 
 /*
- * Claim the host-owned AFE reset line described by the parent node's
+ * Report the platform state the boot chain handed over, before anything in Linux
+ * touches it.  At this point MTP still reports multi-touch as unpowered, so the
+ * values logged here are the inherited "off" state of both halves of the
+ * contract and say whether either write below actually changes anything.
+ */
+static void dchid_report_platform_state(struct dchid_iface *iface)
+{
+	struct apple_smc_key_info info;
+	struct apple_smc *smc;
+	u8 value;
+	int ret;
+
+	dev_info(iface->dchid->dev,
+		 "AFE supply line claimed for %s: direction=%d raw=%d\n",
+		 iface->name, gpiod_get_direction(iface->afe_reset),
+		 gpiod_get_raw_value_cansleep(iface->afe_reset));
+
+	smc = dchid_afe_smc(iface);
+	if (!smc) {
+		dev_warn(iface->dchid->dev,
+			 "No SMC behind the %s AFE supply line; the reset-sequence cannot run\n",
+			 iface->name);
+		return;
+	}
+
+	ret = apple_smc_get_key_info(smc, SMC_KEY_IPD_PWR_SEQ, &info);
+	if (ret) {
+		dev_warn(iface->dchid->dev,
+			 "SMC key pmIP is not present for %s: %d\n",
+			 iface->name, ret);
+		return;
+	}
+
+	ret = apple_smc_read_u8(smc, SMC_KEY_IPD_PWR_SEQ, &value);
+	dev_info(iface->dchid->dev,
+		 "IPD reset key pmIP for %s: type=%p4ch size=%u flags=0x%02x value=%d\n",
+		 iface->name, &info.type_code, info.size, info.flags,
+		 ret ? ret : value);
+}
+
+/*
+ * Claim the host-owned AFE supply line described by the parent node's
  * apple,afe-reset-gpios.  MTP never asks for it on J700, so it cannot come from
  * an INIT_GPIO_REQUEST the way it does on the STM platforms.  GPIOD_ASIS keeps
  * the line untouched until dchid_afe_power_sequence() drives it as part of a
@@ -631,6 +837,7 @@ static int dchid_request_afe_reset(struct dchid_iface *iface)
 	}
 
 	iface->afe_reset = gpio;
+	dchid_report_platform_state(iface);
 	return 0;
 }
 
