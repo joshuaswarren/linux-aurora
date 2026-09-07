@@ -23,6 +23,7 @@
 #include <linux/unaligned.h>
 #include <linux/of.h>
 #include "../hid-ids.h"
+#include "dockchannel-hid-protocol.h"
 
 #define START_TIMEOUT_MS 2000
 /*
@@ -124,8 +125,8 @@ struct dchid_init_hdr {
 #define CMD_QUERY_POWER 0x41
 #define CMD_RESET_DEVICE 0x42
 
-#define DCHID_POWER_FORM_PLAIN 1
-#define DCHID_POWER_FORM_PHASED 2
+#define DCHID_POWER_FORM_PLAIN DCHID_POWER_METHOD_1
+#define DCHID_POWER_FORM_PHASED DCHID_POWER_METHOD_2
 #define DCHID_POWER_PHASE_WILL_CHANGE 0
 #define DCHID_POWER_PHASE_HAS_CHANGED 1
 
@@ -133,9 +134,6 @@ struct dchid_init_hdr {
  * AHTPowerState ordinals, as used by AppleHIDTransportInterface::setPowerGated*
  * in the shipping macOS AppleHIDTransport kext: 0 off, 1 sleep, 2 on, 3 reset.
  */
-#define DCHID_POWER_STATE_OFF 0
-#define DCHID_POWER_STATE_ON 2
-
 /*
  * J700's shipping MTP_SYS multi-touch personality carries the host half of the
  * power transition as two AppleHIDTransport function sequences.
@@ -661,6 +659,7 @@ struct dchid_iface {
 	struct completion out_complete;
 
 	u32 keyboard_layout_id;
+	u32 power_method;
 };
 
 struct dockchannel_hid {
@@ -773,6 +772,10 @@ dchid_get_interface(struct dockchannel_hid *dchid, int index, const char *name)
 		dev_warn(dchid->dev, "No OF node for subdevice %s, ignoring.", name);
 		return NULL;
 	}
+
+	iface->power_method = DCHID_POWER_METHOD_1;
+	of_property_read_u32(iface->of_node, "apple,power-method",
+			     &iface->power_method);
 
 	dchid->ifaces[index] = iface;
 	return iface;
@@ -1028,8 +1031,33 @@ static u8 dchid_power_method(struct dchid_iface *iface)
 	    power_method == DCHID_POWER_FORM_PHASED)
 		return power_method;
 
-	return dchid_uses_transactional_power(iface) ?
-		DCHID_POWER_FORM_PHASED : DCHID_POWER_FORM_PLAIN;
+	return iface->power_method;
+}
+
+/*
+ * Hardware-proven J700 Power Method 2 start. The GPIO descriptor is active
+ * low, so use logical values: high asserts the line while firmware is staged,
+ * and low releases it between the two MTP notifications. This is one ON
+ * transition; no speculative OFF cycle or secondary SMC reset participates.
+ */
+static int dchid_power_method_2_start(struct dchid_iface *iface)
+{
+	u8 msg[DCHID_POWER_METHOD_2_CMD_SIZE];
+	int ret;
+
+	dchid_pm2_command(iface->index, false, msg);
+	ret = dchid_comm_cmd(iface->dchid, msg, sizeof(msg));
+	if (ret < 0)
+		return ret;
+
+	gpiod_set_value_cansleep(iface->afe_reset, 0);
+
+	dchid_pm2_command(iface->index, true, msg);
+	ret = dchid_comm_cmd(iface->dchid, msg, sizeof(msg));
+	if (ret < 0)
+		gpiod_set_value_cansleep(iface->afe_reset, 1);
+
+	return ret;
 }
 
 /*
@@ -1813,6 +1841,8 @@ static int dchid_await_handshake(struct dchid_iface *iface)
 
 static int dchid_start_interface(struct dchid_iface *iface)
 {
+	u8 method;
+	bool power_method_2;
 	void *fw;
 	size_t size;
 	int ret;
@@ -1841,20 +1871,41 @@ static int dchid_start_interface(struct dchid_iface *iface)
 		 iface->name, ++iface->start_attempts);
 
 	iface->starting = true;
+	method = dchid_power_method(iface);
+	power_method_2 = method == DCHID_POWER_METHOD_2;
+	if (method != DCHID_POWER_METHOD_1 && !power_method_2) {
+		dev_err(iface->dchid->dev,
+			"Unsupported power method %u for %s\n",
+			method, iface->name);
+		ret = -EINVAL;
+		goto err;
+	}
 
 	/* Look to see if we need firmware */
 	ret = dchid_get_firmware(iface, &fw, &size);
 	if (ret < 0)
 		goto err;
+	if (power_method_2 && (!fw || !size)) {
+		dev_err(iface->dchid->dev,
+			"Power method 2 for %s requires firmware\n",
+			iface->name);
+		ret = -EINVAL;
+		goto err;
+	}
 
 	/*
 	 * J700 owns the AFE reset itself instead of being asked for it, so the
 	 * line has to be claimed before the power transitions below.
 	 */
-	if (dchid_uses_transactional_power(iface)) {
+	if (power_method_2) {
 		ret = dchid_request_afe_reset(iface);
 		if (ret < 0)
 			goto err;
+
+		ret = gpiod_direction_output(iface->afe_reset, 1);
+		if (ret < 0)
+			goto err;
+		msleep(50);
 	}
 
 	/* If we need a GPIO, make sure we have it. */
@@ -1890,18 +1941,25 @@ static int dchid_start_interface(struct dchid_iface *iface)
 			goto err;
 		}
 
-		/* After loading firmware, multi-touch needs a reset */
-		dev_info(iface->dchid->dev, "Resetting %s\n", iface->name);
-		dchid_query_power_state(iface, "before-cycle");
-		ret = dchid_reset_interface(iface, DCHID_POWER_STATE_OFF, true);
-		if (ret < 0)
-			goto err;
-		ret = dchid_reset_interface(iface, DCHID_POWER_STATE_ON, true);
-		if (ret < 0)
-			goto err;
-		dchid_query_power_state(iface, "after-cycle");
-		dchid_power_request(iface, DCHID_POWER_STATE_ON);
-		dchid_query_power_state(iface, "after-request");
+		dev_info(iface->dchid->dev,
+			 "Resetting %s with power method %u\n",
+			 iface->name, method);
+		if (power_method_2) {
+			ret = dchid_power_method_2_start(iface);
+			if (ret < 0)
+				goto err;
+		} else {
+			ret = dchid_reset_interface(iface,
+						    DCHID_POWER_STATE_OFF,
+						    true);
+			if (ret < 0)
+				goto err;
+			ret = dchid_reset_interface(iface,
+						    DCHID_POWER_STATE_ON,
+						    true);
+			if (ret < 0)
+				goto err;
+		}
 	}
 
 	return 0;
