@@ -752,66 +752,76 @@ impl G17PQueue {
     /// unconditionally means one hardware run diagnoses any check, not just
     /// the one that happens to fire first.
     fn log_render_payload(submission_id: u64, payload: &g17_uapi::UapiRenderCommand) {
-        pr_info!(
-            "G17P render uapi[{}]: flags={:#x} {}x{} layers={} utile={}x{} samples={} sample_size={} tib_cfg={:#x}\n",
-            submission_id,
-            payload.flags,
-            payload.width,
-            payload.height,
-            payload.layers,
-            payload.utile_width,
-            payload.utile_height,
-            payload.samples,
-            payload.sample_size,
-            payload.ppp_control,
-        );
-        pr_info!(
-            "G17P render uapi[{}]: vdm={:#x} scissor={:#x} dbias={:#x} oclqry={:#x} sampler={:#x}/{} bgobjdepth={:#x} bgobjvals={:#x}\n",
-            submission_id,
-            payload.vdm_base,
-            payload.scissor_base,
-            payload.depth_bias_base,
-            payload.occlusion_query_base,
-            payload.sampler_heap,
-            payload.sampler_count,
-            payload.depth_clear,
-            payload.stencil_clear,
-        );
-        pr_info!(
-            "G17P render uapi[{}]: depth={:#x}/{:#x} stride={:#x}/{:#x} stencil={:#x}/{:#x} stride={:#x}/{:#x} zls={:#x}\n",
-            submission_id,
-            payload.depth.base,
-            payload.depth.compression_base,
-            payload.depth.stride,
-            payload.depth.compression_stride,
-            payload.stencil.base,
-            payload.stencil.compression_base,
-            payload.stencil.stride,
-            payload.stencil.compression_stride,
-            payload.zls_control,
-        );
-        pr_info!(
-            "G17P render uapi[{}]: bg={:#x}/{:#x} eot={:#x}/{:#x} pbg={:#x}/{:#x} peot={:#x}/{:#x}\n",
-            submission_id,
-            payload.background.usc,
-            payload.background.resource_spec,
-            payload.end_of_tile.usc,
-            payload.end_of_tile.resource_spec,
-            payload.partial_background.usc,
-            payload.partial_background.resource_spec,
-            payload.partial_end_of_tile.usc,
-            payload.partial_end_of_tile.resource_spec,
-        );
-        pr_info!(
-            "G17P render uapi[{}]: vhelper={:#x}/{:#x}/{:#x} fhelper={:#x}/{:#x}/{:#x}\n",
-            submission_id,
-            payload.vertex_helper.binary,
-            payload.vertex_helper.config,
-            payload.vertex_helper.data,
-            payload.fragment_helper.binary,
-            payload.fragment_helper.config,
-            payload.fragment_helper.data,
-        );
+        if crate::util::g17p_verbose() {
+            pr_info!(
+                "G17P render uapi[{}]: flags={:#x} {}x{} layers={} utile={}x{} samples={} sample_size={} tib_cfg={:#x}\n",
+                submission_id,
+                payload.flags,
+                payload.width,
+                payload.height,
+                payload.layers,
+                payload.utile_width,
+                payload.utile_height,
+                payload.samples,
+                payload.sample_size,
+                payload.ppp_control,
+            );
+        }
+        if crate::util::g17p_verbose() {
+            pr_info!(
+                "G17P render uapi[{}]: vdm={:#x} scissor={:#x} dbias={:#x} oclqry={:#x} sampler={:#x}/{} bgobjdepth={:#x} bgobjvals={:#x}\n",
+                submission_id,
+                payload.vdm_base,
+                payload.scissor_base,
+                payload.depth_bias_base,
+                payload.occlusion_query_base,
+                payload.sampler_heap,
+                payload.sampler_count,
+                payload.depth_clear,
+                payload.stencil_clear,
+            );
+        }
+        if crate::util::g17p_verbose() {
+            pr_info!(
+                "G17P render uapi[{}]: depth={:#x}/{:#x} stride={:#x}/{:#x} stencil={:#x}/{:#x} stride={:#x}/{:#x} zls={:#x}\n",
+                submission_id,
+                payload.depth.base,
+                payload.depth.compression_base,
+                payload.depth.stride,
+                payload.depth.compression_stride,
+                payload.stencil.base,
+                payload.stencil.compression_base,
+                payload.stencil.stride,
+                payload.stencil.compression_stride,
+                payload.zls_control,
+            );
+        }
+        if crate::util::g17p_verbose() {
+            pr_info!(
+                "G17P render uapi[{}]: bg={:#x}/{:#x} eot={:#x}/{:#x} pbg={:#x}/{:#x} peot={:#x}/{:#x}\n",
+                submission_id,
+                payload.background.usc,
+                payload.background.resource_spec,
+                payload.end_of_tile.usc,
+                payload.end_of_tile.resource_spec,
+                payload.partial_background.usc,
+                payload.partial_background.resource_spec,
+                payload.partial_end_of_tile.usc,
+                payload.partial_end_of_tile.resource_spec,
+            );
+        }
+        if crate::util::g17p_verbose() {
+            pr_info!(
+                "G17P render uapi[{}]: vhelper={:#x}/{:#x}/{:#x} fhelper={:#x}/{:#x}/{:#x}\n",
+                submission_id,
+                payload.vertex_helper.binary,
+                payload.vertex_helper.config,
+                payload.vertex_helper.data,
+                payload.fragment_helper.binary,
+                payload.fragment_helper.config,
+                payload.fragment_helper.data,
+            );
+        }
     }
 
     fn wait_input_fences(syncs: &[file::SyncItem]) -> Result {
@@ -1420,13 +1430,15 @@ impl queue::Queue for G17PQueue {
         objects: core::pin::Pin<&xarray::XArray<KBox<file::Object>>>,
     ) -> Result {
         if self.vm.status().get() != 0 { return Err(EIO); }
-        pr_info!(
-            "G17P submit: ENTER submission {} syncs={} in_sync={} cmdbuf_bytes={}\n",
-            submission_id,
-            syncs.len(),
-            in_sync_count,
-            cmdbuf_raw.len()
-        );
+        if crate::util::g17p_verbose() {
+            pr_info!(
+                "G17P submit: ENTER submission {} syncs={} in_sync={} cmdbuf_bytes={}\n",
+                submission_id,
+                syncs.len(),
+                in_sync_count,
+                cmdbuf_raw.len()
+            );
+        }
         Self::log_cmdbuf_headers(submission_id, cmdbuf_raw);
         if in_sync_count > syncs.len() {
             return Err(Self::stage_fail(submission_id, "sync-count", EINVAL));
@@ -1768,7 +1780,9 @@ impl queue::Queue for G17PQueue {
             }
         }
 
-        pr_info!("G17P submit: OK submission {}\n", submission_id);
+        if crate::util::g17p_verbose() {
+            pr_info!("G17P submit: OK submission {}\n", submission_id);
+        }
         publication.succeeded();
         core::mem::drop(publication);
         dev_dbg!(

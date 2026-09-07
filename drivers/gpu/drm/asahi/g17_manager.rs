@@ -3171,23 +3171,25 @@ impl G17PManagerConstruction {
         let stamp = prepared.current_timestamp;
         queue.producer = prepared.producer_after;
         queue.producer.last_add_kicks_timestamp = stamp;
-        dev_info!(
-            dev.as_ref(),
-            "G17P render SKSM: {} qid {} entry_offset {:#x} entry_low {:#x} descriptor=[{:#x},{:#x}] items=[{:#x},{:#x},{:#x}] stamp {:#x} barriers {} mcache-ranges {} submission {}\n",
-            if tiling { "TA" } else { "3D" },
-            queue.queue_id,
-            prepared.entry_offset,
-            storage.sksm_entry_low_va(tiling),
-            descriptor_high,
-            descriptor_low,
-            work_items[0],
-            work_items[1],
-            work_items[2],
-            stamp,
-            barriers.len(),
-            mcache.map_or(0, |value| value.count),
-            ordinal
-        );
+        if crate::util::g17p_verbose() {
+            dev_info!(
+                dev.as_ref(),
+                "G17P render SKSM: {} qid {} entry_offset {:#x} entry_low {:#x} descriptor=[{:#x},{:#x}] items=[{:#x},{:#x},{:#x}] stamp {:#x} barriers {} mcache-ranges {} submission {}\n",
+                if tiling { "TA" } else { "3D" },
+                queue.queue_id,
+                prepared.entry_offset,
+                storage.sksm_entry_low_va(tiling),
+                descriptor_high,
+                descriptor_low,
+                work_items[0],
+                work_items[1],
+                work_items[2],
+                stamp,
+                barriers.len(),
+                mcache.map_or(0, |value| value.count),
+                ordinal
+            );
+        }
         Ok(stamp)
     }
 
@@ -3238,13 +3240,15 @@ impl G17PManagerConstruction {
                         error
                     );
                 })?;
-            dev_info!(
-                dev.as_ref(),
-                "G17P render: 3D completion scratch={:#018x} timestamp={:#x} payload={}\n",
-                scratch,
-                fragment_command_timestamp,
-                channel_payload,
-            );
+            if crate::util::g17p_verbose() {
+                dev_info!(
+                    dev.as_ref(),
+                    "G17P render: 3D completion scratch={:#018x} timestamp={:#x} payload={}\n",
+                    scratch,
+                    fragment_command_timestamp,
+                    channel_payload,
+                );
+            }
             storage
                 .dump_submit_ready_fragment_descriptor(dev, ordinal)
                 .inspect_err(|error| {
@@ -3409,12 +3413,14 @@ impl G17PManagerConstruction {
 
         let mut command = *command;
         command.parameters.ta_hardware_buffer_id = hardware_buffer_id;
-        dev_info!(
-            dev.as_ref(),
-            "G17P render: allocated TA HardwareBufferID {} for ordinal {}\n",
-            hardware_buffer_id,
-            self.render_submission_ordinal,
-        );
+        if crate::util::g17p_verbose() {
+            dev_info!(
+                dev.as_ref(),
+                "G17P render: allocated TA HardwareBufferID {} for ordinal {}\n",
+                hardware_buffer_id,
+                self.render_submission_ordinal,
+            );
+        }
         let result = self.begin_translated_render_with_hardware_buffer(
             dev,
             vm,
@@ -3507,14 +3513,16 @@ impl G17PManagerConstruction {
         // Name the branch and its inputs so the two readings -- genuinely
         // retained, versus construction attempted and abandoned -- separate in
         // one run.
-        dev_info!(
-            self.resources.dev().as_ref(),
-            "G17P render storage path: retained={} ordinal={} bind={} tracker={}\n",
-            retained,
-            self.render_submission_ordinal,
-            self.render_bind.is_some(),
-            self.render_tracker.is_some(),
-        );
+        if crate::util::g17p_verbose() {
+            dev_info!(
+                self.resources.dev().as_ref(),
+                "G17P render storage path: retained={} ordinal={} bind={} tracker={}\n",
+                retained,
+                self.render_submission_ordinal,
+                self.render_bind.is_some(),
+                self.render_tracker.is_some(),
+            );
+        }
         if retained
             && !self
                 .render_bind
@@ -3649,47 +3657,51 @@ impl G17PManagerConstruction {
         let tiling_header = late_tiling
             .as_ref()
             .and_then(|publication| publication.config_update_header());
-        dev_info!(
-            dev.as_ref(),
-            "G17P render tag15: 3D selector {:#x} qid {} install {} dm {} gfx {} ctx {} flush-gen {:#x} flushid-index {} scheduler-state {:#x} +0x56 {} entry {:#x}/{:#x} pb={:#x}/{:#x}/id{}/bit{}\n",
-            fragment_header.selector,
-            fragment_header.queue_id,
-            fragment_header.install,
-            fragment_header.data_master,
-            fragment_header.graphics,
-            fragment_header.context_id,
-            fragment_header.flush_generation,
-            fragment_header.flushid_index,
-            fragment_header.scheduler_state,
-            fragment_header.field_56,
-            fragment_header.entry_low,
-            fragment_header.entry_high,
-            fragment_header.parameter_buffer_object,
-            fragment_header.parameter_buffer_token,
-            fragment_header.parameter_buffer_id,
-            fragment_header.parameter_buffer_bit,
-        );
-        if let Some(header) = tiling_header {
+        if crate::util::g17p_verbose() {
             dev_info!(
                 dev.as_ref(),
-                "G17P render tag15: TA selector {:#x} qid {} install {} dm {} gfx {} ctx {} flush-gen {:#x} flushid-index {} scheduler-state {:#x} +0x56 {} entry {:#x}/{:#x} pb={:#x}/{:#x}/id{}/bit{}\n",
-                header.selector,
-                header.queue_id,
-                header.install,
-                header.data_master,
-                header.graphics,
-                header.context_id,
-                header.flush_generation,
-                header.flushid_index,
-                header.scheduler_state,
-                header.field_56,
-                header.entry_low,
-                header.entry_high,
-                header.parameter_buffer_object,
-                header.parameter_buffer_token,
-                header.parameter_buffer_id,
-                header.parameter_buffer_bit,
+                "G17P render tag15: 3D selector {:#x} qid {} install {} dm {} gfx {} ctx {} flush-gen {:#x} flushid-index {} scheduler-state {:#x} +0x56 {} entry {:#x}/{:#x} pb={:#x}/{:#x}/id{}/bit{}\n",
+                fragment_header.selector,
+                fragment_header.queue_id,
+                fragment_header.install,
+                fragment_header.data_master,
+                fragment_header.graphics,
+                fragment_header.context_id,
+                fragment_header.flush_generation,
+                fragment_header.flushid_index,
+                fragment_header.scheduler_state,
+                fragment_header.field_56,
+                fragment_header.entry_low,
+                fragment_header.entry_high,
+                fragment_header.parameter_buffer_object,
+                fragment_header.parameter_buffer_token,
+                fragment_header.parameter_buffer_id,
+                fragment_header.parameter_buffer_bit,
             );
+        }
+        if let Some(header) = tiling_header {
+            if crate::util::g17p_verbose() {
+                dev_info!(
+                    dev.as_ref(),
+                    "G17P render tag15: TA selector {:#x} qid {} install {} dm {} gfx {} ctx {} flush-gen {:#x} flushid-index {} scheduler-state {:#x} +0x56 {} entry {:#x}/{:#x} pb={:#x}/{:#x}/id{}/bit{}\n",
+                    header.selector,
+                    header.queue_id,
+                    header.install,
+                    header.data_master,
+                    header.graphics,
+                    header.context_id,
+                    header.flush_generation,
+                    header.flushid_index,
+                    header.scheduler_state,
+                    header.field_56,
+                    header.entry_low,
+                    header.entry_high,
+                    header.parameter_buffer_object,
+                    header.parameter_buffer_token,
+                    header.parameter_buffer_id,
+                    header.parameter_buffer_bit,
+                );
+            }
         }
 
         // Native calls AGXQOSQueue::willSubmit before making the tag-15 item
@@ -3701,23 +3713,27 @@ impl G17PManagerConstruction {
             .resources
             .publish_render_qos_queue_record(fragment_header)
             .map_err(|error| Self::render_stage_fail("publish-fragment-qos", error))?;
-        dev_info!(
-            dev.as_ref(),
-            "G17P render QoS: 3D qid {} record {:?}\n",
-            fragment_header.queue_id,
-            fragment_qos,
-        );
+        if crate::util::g17p_verbose() {
+            dev_info!(
+                dev.as_ref(),
+                "G17P render QoS: 3D qid {} record {:?}\n",
+                fragment_header.queue_id,
+                fragment_qos,
+            );
+        }
         if let Some(header) = tiling_header {
             let tiling_qos = self
                 .resources
                 .publish_render_qos_queue_record(header)
                 .map_err(|error| Self::render_stage_fail("publish-tiling-qos", error))?;
-            dev_info!(
-                dev.as_ref(),
-                "G17P render QoS: TA qid {} record {:?}\n",
-                header.queue_id,
-                tiling_qos,
-            );
+            if crate::util::g17p_verbose() {
+                dev_info!(
+                    dev.as_ref(),
+                    "G17P render QoS: TA qid {} record {:?}\n",
+                    header.queue_id,
+                    tiling_qos,
+                );
+            }
         }
         let pm_submission = self.render_storage.as_mut().ok_or(ENODEV)?
             .prepare_pm_submitted_operation()
@@ -3751,15 +3767,19 @@ impl G17PManagerConstruction {
                 },
             )
             .map_err(|error| Self::render_stage_fail("publish-partial-opening-pair", error))?;
-        dev_info!(dev.as_ref(), "G17P render PM: submitted-operations committed {:?}\n", pm_submitted_count);
+        if crate::util::g17p_verbose() {
+            dev_info!(dev.as_ref(), "G17P render PM: submitted-operations committed {:?}\n", pm_submitted_count);
+        }
         // The ID is now firmware/GPU-owned. Any later validation failure must
         // retain it until semantic completion or a stopped-CPU teardown.
         self.render_hardware_buffer_published = true;
-        pr_info!(
-            "G17P render: outer publish OK, retained={} render_bind={}\n",
-            retained,
-            render_bind.is_some()
-        );
+        if crate::util::g17p_verbose() {
+            pr_info!(
+                "G17P render: outer publish OK, retained={} render_bind={}\n",
+                retained,
+                render_bind.is_some()
+            );
+        }
         if retained {
             if render_bind.is_some() {
                 return Err(Self::render_stage_fail("retained-bind-unexpected", EINVAL));
@@ -3773,18 +3793,20 @@ impl G17PManagerConstruction {
             });
         }
         let roots = self.resources.uat().t8140_compute_context_roots();
-        dev_info!(
-            dev.as_ref(),
-            "G17P render context roots pre-kick: ctx0=[{:#x},{:#x}] ctx1=[{:#x},{:#x}] ctx2=[{:#x},{:#x}] ctx3=[{:#x},{:#x}]\n",
-            roots[0].0,
-            roots[0].1,
-            roots[1].0,
-            roots[1].1,
-            roots[2].0,
-            roots[2].1,
-            roots[3].0,
-            roots[3].1,
-        );
+        if crate::util::g17p_verbose() {
+            dev_info!(
+                dev.as_ref(),
+                "G17P render context roots pre-kick: ctx0=[{:#x},{:#x}] ctx1=[{:#x},{:#x}] ctx2=[{:#x},{:#x}] ctx3=[{:#x},{:#x}]\n",
+                roots[0].0,
+                roots[0].1,
+                roots[1].0,
+                roots[1].1,
+                roots[2].0,
+                roots[2].1,
+                roots[3].0,
+                roots[3].1,
+            );
+        }
         // Prove the client regime reaches native's low view 0 before anything
         // is armed. gUPM's first fragment traffic writes 0x1e00..0x1f80
         // through this VM's own slot, and an unmapped write there is exactly
@@ -3812,14 +3834,16 @@ impl G17PManagerConstruction {
                 );
                 return Err(Self::render_stage_fail("client-null-view-mismatch", EFAULT));
             }
-            dev_info!(
-                dev.as_ref(),
-                "G17P render client null view: +{:#x} -> PA {:#x}, identical to canonical {:#x}+{:#x}\n",
-                offset,
-                client,
-                0x0010_0000_0000u64,
-                offset,
-            );
+            if crate::util::g17p_verbose() {
+                dev_info!(
+                    dev.as_ref(),
+                    "G17P render client null view: +{:#x} -> PA {:#x}, identical to canonical {:#x}+{:#x}\n",
+                    offset,
+                    client,
+                    0x0010_0000_0000u64,
+                    offset,
+                );
+            }
         }
         self.render_storage
             .as_mut()
@@ -3987,6 +4011,9 @@ impl G17PManagerConstruction {
     }
 
     pub(crate) fn log_render_status_pages(&mut self, label: &str) {
+        if !crate::util::g17p_verbose() {
+            return;
+        }
         if *crate::module_parameters::g17p_dep_records.value() != 0 {
             let dev = self.resources.dev().clone();
             {
@@ -4770,12 +4797,14 @@ impl G17PManagerConstruction {
             .resources
             .publish_render_qos_queue_record(tiling_header)
             .map_err(|error| Self::render_stage_fail("native-publish-tiling-qos", error))?;
-        dev_info!(
-            dev.as_ref(),
-            "G17P render QoS: delayed native TA qid {} record {:?}\n",
-            tiling_header.queue_id,
-            tiling_qos,
-        );
+        if crate::util::g17p_verbose() {
+            dev_info!(
+                dev.as_ref(),
+                "G17P render QoS: delayed native TA qid {} record {:?}\n",
+                tiling_header.queue_id,
+                tiling_qos,
+            );
+        }
 
         late_tiling.publish_native_prefix();
         order
@@ -4928,11 +4957,13 @@ impl G17PManagerConstruction {
                 self.render_tracker = None;
                 self.render_hardware_buffer_published = false;
                 self.render_auxiliary_timestamp = 0;
-                dev_info!(
-                    self.resources.dev().as_ref(),
-                    "G17P render: released TA HardwareBufferID {} at paired completion\n",
-                    hardware_buffer_id,
-                );
+                if crate::util::g17p_verbose() {
+                    dev_info!(
+                        self.resources.dev().as_ref(),
+                        "G17P render: released TA HardwareBufferID {} at paired completion\n",
+                        hardware_buffer_id,
+                    );
+                }
                 self.render_submission_ordinal = next_ordinal;
                 return Ok(G17PRenderPollOutcome::Complete(completion));
             }
@@ -5308,9 +5339,11 @@ impl G17PManagerConstruction {
         if let Some(pair) = self.resources.read_compute_execution_interval(
             queue.completion_descriptor, timestamps[1],
         )? {
-            dev_info!(self.resources.dev().as_ref(),
-                "G17P async compute: GPU-INTERVAL qid={} descriptor={:#x} start={} end={}\n",
-                queue.queue_id, queue.completion_descriptor, pair[0], pair[1]);
+            if crate::util::g17p_verbose() {
+                dev_info!(self.resources.dev().as_ref(),
+                    "G17P async compute: GPU-INTERVAL qid={} descriptor={:#x} start={} end={}\n",
+                    queue.queue_id, queue.completion_descriptor, pair[0], pair[1]);
+            }
         }
         queue.producer = g17_submission::complete_g17p_cl_kicks(queue.producer, 1)
             .map_err(|_| EINVAL)?;
@@ -6271,9 +6304,11 @@ impl G17PManagerConstruction {
             if context.context_id != execution.context_id() || !execution.is_current() {
                 return Err(EFAULT);
             }
-            dev_info!(self.resources.dev().as_ref(),
-                "G17P independent compute root: qid={} context={} vm={} root={:#x}\n",
-                queue.queue_id, execution.context_id(), execution.vm_id(), execution.root());
+            if crate::util::g17p_verbose() {
+                dev_info!(self.resources.dev().as_ref(),
+                    "G17P independent compute root: qid={} context={} vm={} root={:#x}\n",
+                    queue.queue_id, execution.context_id(), execution.vm_id(), execution.root());
+            }
         } else {
         self.resources
             .uat()
