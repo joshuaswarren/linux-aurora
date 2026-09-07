@@ -1360,6 +1360,9 @@ struct G17PRenderSksmQueue {
     /// True for the TA/tiling queue, false for the 3D/fragment queue. Selects
     /// which bootstrap context peer backs the entry ring.
     tiling: bool,
+    entry_low: u64,
+    entry_high: u64,
+    config: g17_submission::PreparedG17PSksmQueueConfig,
     producer: g17_submission::G17PClKickProducerState,
     /// Set only after the tag-15 install and complete outer group are visible
     /// to firmware. It never represents a host MMIO write.
@@ -3202,7 +3205,7 @@ impl G17PManagerConstruction {
     fn new_render_sksm_queues(
         &self,
         pair: g17_resources::G17PRenderQueuePair,
-        entry_low_vas: [u64; 2],
+        entry_vas: [(u64, u64); 2],
     ) -> Result<G17PRenderSksmQueues> {
         const RENDER_COMPLETION_SELECTOR: u8 =
             g17_submission::G17P_NATIVE_RENDER_DOORBELL_PRIORITY;
@@ -3215,7 +3218,7 @@ impl G17PManagerConstruction {
                 entry_gpu_va,
                 geometry,
             };
-            let _config = g17_submission::prepare_g17p_render_sksm_queue_config(
+            let config = g17_submission::prepare_g17p_render_sksm_queue_config(
                 routing,
                 data_master,
                 scratch,
@@ -3224,6 +3227,9 @@ impl G17PManagerConstruction {
             Ok(G17PRenderSksmQueue {
                 queue_id,
                 tiling,
+                entry_low: entry_gpu_va,
+                entry_high: if tiling { entry_vas[0].1 } else { entry_vas[1].1 },
+                config,
                 producer: geometry
                     .initial_producer_state(
                         queue_id,
@@ -3275,7 +3281,7 @@ impl G17PManagerConstruction {
                 pair.tiling as u8,
                 g17_submission::G17P_TA_DATA_MASTER,
                 true,
-                entry_low_vas[0],
+                entry_vas[0].0,
             )?,
             fragment: build(
                 pair.fragment as u8,
@@ -3284,7 +3290,7 @@ impl G17PManagerConstruction {
                     other => other,
                 },
                 false,
-                entry_low_vas[1],
+                entry_vas[1].0,
             )?,
         })
     }
@@ -3369,6 +3375,117 @@ impl G17PManagerConstruction {
             }
             (false, false) => Err(EINVAL),
         }
+    }
+
+    /// Prove that every independently authored queue-install surface names
+    /// the same physical queue before its first outer producer is published.
+    fn validate_render_queue_consistency(
+        &mut self,
+        dev: &AsahiDevice,
+        tiling: bool,
+        header: g17_resources::G17PRenderConfigUpdateHeader,
+        qos_record: [u8; 8],
+    ) -> Result {
+        let (scratch, queue_id, entry_low, entry_high, config, producer) = {
+            let queues = self.render_sksm.as_ref().ok_or(ENODEV)?;
+            let queue = if tiling {
+                &queues.tiling
+            } else {
+                &queues.fragment
+            };
+            (
+                queues.scratch,
+                queue.queue_id,
+                queue.entry_low,
+                queue.entry_high,
+                queue.config,
+                queue.producer,
+            )
+        };
+        let pair = self.render_storage.as_ref().ok_or(ENODEV)?.queue_pair();
+        let header_qid = u8::try_from(header.queue_id).map_err(|_| EINVAL)?;
+        // Native sources call queue +0x1c both the channel priority and the
+        // completion selector. It feeds tag-15 +0x1e, entry-header bits 59+
+        // and the SKSM routing payload. It is not a completion-ring ordinal:
+        // normal CL selector 2 is consumed from descriptor ordinal 0.
+        let queue_selector = u8::try_from(header.priority).map_err(|_| EINVAL)?;
+        let data_master = u8::try_from(header.data_master).map_err(|_| EINVAL)?;
+        let expected = g17_submission::prepare_g17p_render_sksm_queue_config(
+            g17_submission::G17PComputeQueueRouting {
+                queue_id: header_qid,
+                completion_selector: u32::from(queue_selector),
+                entry_gpu_va: header.entry_low,
+                geometry: producer.geometry,
+            },
+            u32::from(data_master),
+            scratch,
+        )
+        .map_err(|_| EINVAL)?;
+        let expected_data_master = if tiling {
+            g17_submission::G17P_TA_DATA_MASTER
+        } else {
+            g17_submission::G17P_3D_DATA_MASTER
+        };
+        let class_equal = qos_record[1] == producer.qos.class_40;
+        if header.selector != 0x0f
+            || header_qid != queue_id
+            || header_qid != producer.queue_id
+            || header.entry_low != entry_low
+            || header.entry_high != entry_high
+            || header.graphics != 1
+            || u32::from(data_master) != expected_data_master
+            || queue_selector != producer.completion_selector
+            || header.field_56 != u16::from(producer.qos.queue_byte_32)
+            || qos_record[0] != producer.qos.queue_byte_32
+            || config != expected
+        {
+            dev_err!(
+                dev.as_ref(),
+                "G17P render install split: stage={} qid={}/{}/{} dm={}/{} selector={}/{} entry={:#x}/{:#x} expected={:#x}/{:#x} hwid={}/{}/{} qos={:02x?}\n",
+                if tiling { "TA" } else { "3D" },
+                header.queue_id,
+                queue_id,
+                producer.queue_id,
+                header.data_master,
+                expected_data_master,
+                header.priority,
+                producer.completion_selector,
+                header.entry_low,
+                header.entry_high,
+                entry_low,
+                entry_high,
+                header.field_56,
+                producer.qos.queue_byte_32,
+                qos_record[0],
+                qos_record,
+            );
+            return Err(EINVAL);
+        }
+        if header.install != 0 && pair.slot() != 0 {
+            dev_info!(
+                dev.as_ref(),
+                "G17P render install consistent: stage={} qid={} dm={} selector={} entry={:#x}/{:#x} tag={:#x} payload={:#x} masks={:#x}/{:#x} context={} hwid={} pb={:#x}/id{}/bit{:#x} qos-class={} kick-class={} class-equal={}\n",
+                if tiling { "TA" } else { "3D" },
+                queue_id,
+                data_master,
+                queue_selector,
+                entry_low,
+                entry_high,
+                config.tag,
+                config.payload,
+                config.enable_pair.word0,
+                config.enable_pair.word1,
+                header.context_id,
+                header.field_56,
+                header.parameter_buffer_object,
+                header.parameter_buffer_id,
+                header.parameter_buffer_bit,
+                qos_record[1],
+                producer.qos.class_40,
+                class_equal,
+            );
+        }
+        Ok(())
     }
 
     /// Commit firmware ownership only after the complete inner and outer
@@ -4109,15 +4226,24 @@ impl G17PManagerConstruction {
             }
         }
         if render_sksm != 0 && self.render_sksm.is_none() {
-            let (pair, entry_low_vas) = {
+            let (pair, entry_vas) = {
                 let storage = self.render_storage.as_ref().ok_or(ENODEV)?;
                 (
                     storage.queue_pair(),
-                    [storage.sksm_entry_low_va(true), storage.sksm_entry_low_va(false)],
+                    [
+                        (
+                            storage.sksm_entry_low_va(true),
+                            storage.sksm_entry_high_va(true),
+                        ),
+                        (
+                            storage.sksm_entry_low_va(false),
+                            storage.sksm_entry_high_va(false),
+                        ),
+                    ],
                 )
             };
             self.render_sksm = Some(
-                self.new_render_sksm_queues(pair, entry_low_vas)
+                self.new_render_sksm_queues(pair, entry_vas)
                     .map_err(|error| Self::render_stage_fail("new-render-sksm-queues", error))?,
             );
         }
@@ -4229,6 +4355,12 @@ impl G17PManagerConstruction {
             .resources
             .publish_render_qos_queue_record(fragment_header)
             .map_err(|error| Self::render_stage_fail("publish-fragment-qos", error))?;
+        if render_sksm != 0 {
+            self.validate_render_queue_consistency(dev, false, fragment_header, fragment_qos)
+                .map_err(|error| {
+                    Self::render_stage_fail("validate-fragment-qid-consistency", error)
+                })?;
+        }
         if crate::util::g17p_verbose() {
             dev_info!(
                 dev.as_ref(),
@@ -4242,6 +4374,12 @@ impl G17PManagerConstruction {
                 .resources
                 .publish_render_qos_queue_record(header)
                 .map_err(|error| Self::render_stage_fail("publish-tiling-qos", error))?;
+            if render_sksm != 0 {
+                self.validate_render_queue_consistency(dev, true, header, tiling_qos)
+                    .map_err(|error| {
+                        Self::render_stage_fail("validate-tiling-qid-consistency", error)
+                    })?;
+            }
             if crate::util::g17p_verbose() {
                 dev_info!(
                     dev.as_ref(),
@@ -5344,6 +5482,10 @@ impl G17PManagerConstruction {
             .resources
             .publish_render_qos_queue_record(tiling_header)
             .map_err(|error| Self::render_stage_fail("native-publish-tiling-qos", error))?;
+        self.validate_render_queue_consistency(dev, true, tiling_header, tiling_qos)
+            .map_err(|error| {
+                Self::render_stage_fail("native-validate-tiling-qid-consistency", error)
+            })?;
         if crate::util::g17p_verbose() {
             dev_info!(
                 dev.as_ref(),
