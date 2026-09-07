@@ -1538,6 +1538,50 @@ mod tests {
     }
 
     #[test]
+    fn render_window_base_253_accepts_exact_target_256() {
+        let execution = RenderExecutionState {
+            job_list_empty: true,
+            tiling_timestamps: [11, 11],
+            fragment_timestamps: [11, 17],
+        };
+        for (base, target) in [(253, 256), (1021, 1024)] {
+            let window = RenderQueueWindow::new(base, 3, 1280).unwrap();
+            let previous = QueueIndices { done: base, read: base, write: base };
+            let completed = QueueIndices { done: target, read: target, write: target };
+            let completion = observe_paired_render_window(
+                window, previous, completed, previous, completed, execution,
+            ).unwrap();
+            assert_eq!(window.target(), target);
+            assert!(completion.complete && completion.idle);
+        }
+    }
+
+    #[test]
+    fn render_window_transient_invalid_snapshot_can_be_resampled_complete() {
+        let window = RenderQueueWindow::new(253, 3, 1280).unwrap();
+        let previous = QueueIndices { done: 253, read: 253, write: 253 };
+        // A split firmware publication can expose a cursor from outside this
+        // group's bounded window on the first edge-side observation.
+        let transient = QueueIndices { done: 257, read: 256, write: 256 };
+        let completed = QueueIndices { done: 256, read: 256, write: 256 };
+        let execution = RenderExecutionState {
+            job_list_empty: true,
+            tiling_timestamps: [23, 23],
+            fragment_timestamps: [23, 29],
+        };
+        assert_eq!(
+            observe_paired_render_window(
+                window, previous, transient, previous, completed, execution,
+            ),
+            Err(CompletionDecodeError::RenderCursorOutsideWindow),
+        );
+        let retry = observe_paired_render_window(
+            window, previous, completed, previous, completed, execution,
+        ).unwrap();
+        assert!(retry.complete && retry.idle);
+    }
+
+    #[test]
     fn render_window_rejects_stale_backward_and_out_of_window_cursors() {
         let window = RenderQueueWindow::new(1278, 3, 1280).unwrap();
         let previous = QueueIndices { done: 0, read: 0, write: 1 };
