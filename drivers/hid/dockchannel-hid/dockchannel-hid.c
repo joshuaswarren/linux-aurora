@@ -82,6 +82,7 @@ struct dchid_init_hdr {
 #define CMD_SEND_FIRMWARE 0x95
 #define CMD_ENABLE_INTERFACE 0xb4
 #define CMD_ACK_GPIO_CMD 0xa1
+#define CMD_INIT_SHARED_BUFFER 0x91
 #define CMD_POWER_REQUEST 0x41
 #define CMD_QUERY_POWER 0x42
 
@@ -194,7 +195,30 @@ MODULE_PARM_DESC(power_request,
 static bool enable_mtp_iface = true;
 module_param(enable_mtp_iface, bool, 0444);
 MODULE_PARM_DESC(enable_mtp_iface,
-		 "Enable the A18 \"mtp\" control interface that has no DT node");
+		 "Enable the A18 \"mtp\" control interface that has no DT node (read at enumeration: set it through modprobe.d or the kernel command line, not sysfs)");
+
+/*
+ * Off by default.  Registering a shared buffer is a state-changing operation
+ * that wedges the comm channel when MTP refuses it, so it is opted into for a
+ * single experiment rather than run on every boot.  A reboot always clears it.
+ */
+static bool shared_buffer;
+module_param(shared_buffer, bool, 0644);
+MODULE_PARM_DESC(shared_buffer,
+		 "Register a DRAM shared buffer with MTP (opcode 0x91) before uploading firmware");
+
+static unsigned int shared_buffer_size = 0x4000;
+module_param(shared_buffer_size, uint, 0644);
+MODULE_PARM_DESC(shared_buffer_size,
+		 "Size of the shared buffer registered with opcode 0x91");
+
+static int shared_buffer_unk1 = 2;
+module_param(shared_buffer_unk1, int, 0644);
+MODULE_PARM_DESC(shared_buffer_unk1, "Second byte of the opcode 0x91 message");
+
+static int shared_buffer_unk2;
+module_param(shared_buffer_unk2, int, 0644);
+MODULE_PARM_DESC(shared_buffer_unk2, "Third byte of the opcode 0x91 message");
 
 struct dchid_init_block_hdr {
 	u16 type;
@@ -312,6 +336,9 @@ struct dockchannel_hid {
 	struct dchid_iface *ifaces[MAX_INTERFACES];
 
 	u8 pkt_buf[MAX_PKT_SIZE];
+
+	/* DRAM shared buffer registered with MTP, if any. */
+	void *shmem;
 
 	/* Workqueue to asynchronously create HID devices */
 	struct workqueue_struct *new_iface_wq;
@@ -968,6 +995,66 @@ static void dchid_power_request(struct dchid_iface *iface, int state)
 		 iface->name, state, ret);
 }
 
+/*
+ * Register a DRAM shared buffer with MTP.
+ *
+ * The wire format is m1n1's InitBufMsg, decoded from a macOS trace: the same
+ * shape as CMD_SEND_FIRMWARE without its interface byte, fifteen bytes in all,
+ * which matches the "exactly 15 bytes" this firmware's comm_cr.c enforces.  MTP
+ * confirms a successful registration in its own log as
+ *
+ *   hal.c:170: Registering DRAM Shared Buffer #N. Addr=<addr>, Size=<size>
+ *
+ * with the address shifted right by four.
+ */
+static int dchid_register_shared_buffer(struct dchid_iface *iface)
+{
+	struct dockchannel_hid *dchid = iface->dchid;
+	struct {
+		u8 cmd;
+		u8 unk1;
+		u8 unk2;
+		u64 addr;
+		u32 size;
+	} __packed msg = {
+		.cmd = CMD_INIT_SHARED_BUFFER,
+		.unk1 = shared_buffer_unk1,
+		.unk2 = shared_buffer_unk2,
+		.size = shared_buffer_size,
+	};
+	dma_addr_t addr;
+	void *buf;
+	int ret;
+
+	BUILD_BUG_ON(sizeof(msg) != 15);
+
+	if (!shared_buffer || dchid->shmem)
+		return 0;
+
+	buf = dmam_alloc_coherent(dchid->dev, shared_buffer_size, &addr,
+				  GFP_KERNEL);
+	if (IS_ERR_OR_NULL(buf)) {
+		dev_err(dchid->dev, "Failed to allocate the %u-byte shared buffer\n",
+			shared_buffer_size);
+		return buf ? PTR_ERR(buf) : -ENOMEM;
+	}
+
+	msg.addr = addr;
+	wmb();
+
+	ret = dchid_comm_cmd(dchid, &msg, sizeof(msg));
+	dev_info(dchid->dev,
+		 "Shared buffer: iova=%pad size=%u unk=%d,%d ret=%d\n",
+		 &addr, shared_buffer_size, shared_buffer_unk1,
+		 shared_buffer_unk2, ret);
+
+	if (ret < 0)
+		return ret;
+
+	dchid->shmem = buf;
+	return 0;
+}
+
 static int dchid_start_interface(struct dchid_iface *iface)
 {
 	void *fw;
@@ -1013,6 +1100,14 @@ static int dchid_start_interface(struct dchid_iface *iface)
 
 	/* Only multi-touch has firmware */
 	if (fw && size) {
+
+		/*
+		 * The buffer registration is a transport-level operation, so it
+		 * goes in before the image the transport has to carry.
+		 */
+		ret = dchid_register_shared_buffer(iface);
+		if (ret < 0)
+			goto err;
 
 		/* Send firmware to the device */
 		dev_info(iface->dchid->dev, "Sending firmware for %s\n", iface->name);
