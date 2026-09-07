@@ -2953,16 +2953,16 @@ impl G17PManagerConstruction {
                             // `encodeKickEntry` obtains this byte from the
                             // queue's AGXQOSQueue HardwareBufferID. It must
                             // match both ConfigUpdate +0x56 and the qid*8
-                            // willSubmit record. Native allocates this ID
-                            // dynamically (captured values include 1, 2 and
-                            // 4); Linux reserves and publishes slot 2 in all
-                            // three places.
+                            // willSubmit record. Native gives each retained
+                            // TA/3D pair one ID (captured qid9/10 use 4 while
+                            // qid15/16 use 5), so use the bounded pair's
+                            // queue-owned ID while skipping compute's ID 1.
                             queue_byte_32: match *crate::module_parameters::g17p_render_kick_qos
                                 .value()
                             {
                                 1 if tiling => 1,
                                 2 => 1,
-                                _ => g17_submission::G17P_NATIVE_RENDER_QOS_HARDWARE_BUFFER_ID,
+                                _ => pair.qos_hardware_buffer_id(),
                             },
                             // G17P's stage wrappers select row 1 of the native
                             // 9x3 QoS table: TA=0x0c, 3D=0x18, CL=0x08. The
