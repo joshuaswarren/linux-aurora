@@ -559,6 +559,44 @@ impl UatPageTable {
         self.with_pages(iova_range, true, false, |_, _| Ok(()))
     }
 
+    /// Reserve every intermediate table required by a new leaf mapping and
+    /// prove that the complete destination span is empty before any leaf is
+    /// installed.  GPUVM and the driver's fixed-mapping allocator are
+    /// intentionally separate address managers, so neither allocator alone
+    /// can detect ownership held by the other one.  The page table is the
+    /// authoritative final arbiter.
+    pub(crate) fn prepare_map(&mut self, iova_range: Range<u64>) -> Result {
+        if iova_range.is_empty()
+            || (iova_range.start | iova_range.end) & UAT_PGMSK as u64 != 0
+        {
+            return Err(EINVAL);
+        }
+
+        let mut occupied = None;
+        self.with_pages(iova_range.clone(), false, false, |iova, ptes| {
+            for (index, pte) in ptes.iter().enumerate() {
+                let value = pte.load(Ordering::Acquire);
+                if value != 0 && occupied.is_none() {
+                    occupied = Some((iova + (index * UAT_PGSZ) as u64, value));
+                }
+            }
+            Ok(())
+        })?;
+        if let Some((iova, pte)) = occupied {
+            pr_err!(
+                "UATPageTable::prepare_map: Page at IOVA {:#x} is already owned (PTE: {:#x})\n",
+                iova,
+                pte
+            );
+            return Err(EBUSY);
+        }
+
+        // Do all fallible page-table allocation before installing any leaf.
+        // A failed allocation can leave empty intermediate tables behind, but
+        // it can never leave a partially visible object mapping.
+        self.alloc_pages(iova_range)
+    }
+
     /// Check that every page in an aligned range is mapped with the requested
     /// GPU permissions. Missing intermediate page tables are detected by the
     /// visited-page count because `with_pages` skips those holes.
@@ -676,16 +714,41 @@ impl UatPageTable {
 
         let pte_bits = self.pte_bits();
 
-        self.with_pages(iova_range, true, false, |iova, ptes| {
+        // Callers prepare the complete object range while holding the VM
+        // execution lock.  Do not allocate here: mapping one scatterlist run
+        // and then failing to allocate tables for a later run would create an
+        // ownerless partial mapping.
+        let expected = (iova_range.end - iova_range.start) >> UAT_PGBIT;
+        let mut visited = 0u64;
+        let mut occupied = None;
+        self.with_pages(iova_range.clone(), false, false, |iova, ptes| {
+            visited = visited.checked_add(ptes.len() as u64).ok_or(EOVERFLOW)?;
             for (idx, pte) in ptes.iter().enumerate() {
-                let ptev = pte.load(Ordering::Relaxed);
-                if ptev != 0 {
-                    pr_err!(
-                        "UATPageTable::map_pages: Page at IOVA {:#x} is mapped (PTE: {:#x})\n",
-                        iova + (idx * UAT_PGSZ) as u64,
-                        ptev
-                    );
+                let value = pte.load(Ordering::Acquire);
+                if value != 0 && occupied.is_none() {
+                    occupied = Some((iova + (idx * UAT_PGSZ) as u64, value));
                 }
+            }
+            Ok(())
+        })?;
+        if visited != expected {
+            pr_err!(
+                "UATPageTable::map_pages: destination tables were not prepared ({}/{} pages)\n",
+                visited,
+                expected
+            );
+            return Err(EFAULT);
+        }
+        if let Some((iova, pte)) = occupied {
+            pr_err!(
+                "UATPageTable::map_pages: refusing to overwrite owned page at IOVA {:#x} (PTE: {:#x})\n",
+                iova,
+                pte
+            );
+            return Err(EBUSY);
+        }
+        self.with_pages(iova_range, false, false, |_, ptes| {
+            for pte in ptes {
                 pte.store(phys | prot.as_pte() | pte_bits, Ordering::Relaxed);
                 if !one_page {
                     phys += UAT_PGSZ as PhysicalAddr;
@@ -701,7 +764,20 @@ impl UatPageTable {
             iova_range,
             prot
         );
-        self.with_pages(iova_range, true, false, |iova, ptes| {
+        // Preserve the established zero-length range semantics.  In
+        // particular, GPUVM can produce an empty remap hole when the retained
+        // prefix and suffix exactly cover the old VA.
+        if iova_range.is_empty() {
+            return Ok(());
+        }
+        if !self.covers_range(iova_range.clone(), false, false)? {
+            pr_err!(
+                "UATPageTable::reprot_pages: refusing partially unmapped range {:#x?}\n",
+                iova_range
+            );
+            return Err(EFAULT);
+        }
+        self.with_pages(iova_range, false, false, |iova, ptes| {
             for (idx, pte) in ptes.iter().enumerate() {
                 let ptev = pte.load(Ordering::Relaxed);
                 if ptev & PTE_TYPE_BITS != PTE_TYPE_LEAF_TABLE {
@@ -710,7 +786,7 @@ impl UatPageTable {
                         iova + (idx * UAT_PGSZ) as u64,
                         ptev
                     );
-                    continue;
+                    return Err(EFAULT);
                 }
                 pte.store((ptev & !UAT_PROT_BITS) | prot.as_pte(), Ordering::Relaxed);
             }
@@ -720,6 +796,19 @@ impl UatPageTable {
 
     pub(crate) fn unmap_pages(&mut self, iova_range: Range<u64>) -> Result {
         mod_pr_debug!("UATPageTable::unmap_pages: {:#x?}\n", iova_range);
+        // An empty GPUVM remap hole is a valid no-op, not evidence of a stale
+        // owner.  covers_range() intentionally reports empty ranges as false,
+        // so handle that case before the ownership preflight.
+        if iova_range.is_empty() {
+            return Ok(());
+        }
+        if !self.covers_range(iova_range.clone(), false, false)? {
+            pr_err!(
+                "UATPageTable::unmap_pages: refusing partially unmapped range {:#x?}\n",
+                iova_range
+            );
+            return Err(EFAULT);
+        }
         self.with_pages(iova_range, false, false, |iova, ptes| {
             for (idx, pte) in ptes.iter().enumerate() {
                 if pte.load(Ordering::Relaxed) & PTE_TYPE_LEAF_TABLE == 0 {
@@ -727,6 +816,7 @@ impl UatPageTable {
                         "UATPageTable::unmap_pages: Page at IOVA {:#x} already unmapped\n",
                         iova + (idx * UAT_PGSZ) as u64
                     );
+                    return Err(EFAULT);
                 }
                 pte.store(0, Ordering::Relaxed);
             }

@@ -522,6 +522,16 @@ pub(crate) const G17P_RENDER_3D_QUEUE_ID: u16 = 1;
 const G17P_RENDER_QUEUE_LOW_BASE: u64 = 0x70_0043_8000;
 const G17P_RENDER_QUEUE_HIGH_BASE: u64 = 0xffff_fc20_001d_8000;
 const G17P_RENDER_QUEUE_VA_STRIDE: u64 = 0x28_000;
+/// A process-rooted render cannot use native's context-0 queue coordinates:
+/// those addresses are inside render FList buffer 2 in the process root.
+/// Place the four bounded job-private queue peers in the exact gap after all
+/// 28 retained render FList buffers and before the relocated compute FList.
+/// Every pointer to these peers is authored from the resulting mapping, while
+/// the hardware-qualified bootstrap/context-0 pair remains at the native VAs.
+const G17P_RENDER_JOB_QUEUE_LOW_BASE: u64 = G17P_CONTROL_OPERAND_BUFFER_BASE
+    + (G17P_CONTROL_OPERAND_BUFFER_COUNT as u64 - 1)
+        * G17P_CONTROL_OPERAND_BUFFER_STRIDE as u64
+    + G17P_CONTROL_OPERAND_BUFFER_SIZE as u64;
 
 /// One bounded physical TA/3D queue pair.  The current render graph reserves
 /// records for QIDs 0..3 only; accepting a larger slot would make the
@@ -565,7 +575,7 @@ impl G17PRenderQueuePair {
     }
 
     const fn low_va(self, tiling: bool) -> u64 {
-        G17P_RENDER_QUEUE_LOW_BASE
+        G17P_RENDER_JOB_QUEUE_LOW_BASE
             + self.queue_id(tiling) as u64 * G17P_RENDER_QUEUE_VA_STRIDE
     }
 }
@@ -576,6 +586,12 @@ const _: () = assert!(
         != G17PRenderQueuePair::for_slot(1).unwrap().qos_hardware_buffer_id()
 );
 const _: () = assert!(G17PRenderQueuePair::for_slot(1).unwrap().qos_hardware_buffer_id() == 2);
+const _: () = assert!(G17P_RENDER_JOB_QUEUE_LOW_BASE == 0x70_01ef_8000);
+const _: () = assert!(
+    G17PRenderQueuePair::for_slot(1).unwrap().low_va(false)
+        + G17P_BOOTSTRAP_CONTEXT_PEER_SIZE as u64
+        <= g17_initdata::COMPUTE_FLIST_PAGE_LIST_ADDRESS
+);
 const _: () = assert!(
     G17PRenderQueuePair::for_slot(1).unwrap().record_offset(false)
         + G17P_RENDER_QUEUE_RECORD_SIZE
@@ -3058,7 +3074,8 @@ pub(crate) struct G17PUserRenderStorage {
     descriptor_3d_low: mmu::KernelMapping,
     /// Retained diagnostic client alias, unused by hardware encoding. KSM's
     /// RCE arrays, self trailers and MCache table pointer use descriptor_3d_low
-    /// in context 0. Keep this allocation for now to isolate the pointer fix
+    /// in the job's application GART. Keep this allocation for now to isolate
+    /// the pointer fix
     /// from allocator-layout changes; the MCache range contents still name
     /// the client execution context independently of the table's own address.
     descriptor_3d_render: G17PRenderClientAlias,
@@ -5291,11 +5308,11 @@ impl G17PUserRenderStorage {
             item.qid = u32::from(qid);
             self.descriptors.capture_trace_range(archive, item, offset, mmu::UAT_PGSZ, clock)?;
         }
-        // Preserve the existing alias identities too: RCE self pointers are
-        // low addresses, not addresses in the descriptor's high root.
+        // Preserve the job-root alias identities too: RCE self pointers are
+        // low application-GART addresses, not descriptor high-root addresses.
         for (offset, dva, qid, alias_context, instance) in [
-            (0, self.descriptor_ta_low.iova(), self.queue_pair.tiling, 0, 1),
-            (mmu::UAT_PGSZ, self.descriptor_3d_low.iova(), self.queue_pair.fragment, 0, 1),
+            (0, self.descriptor_ta_low.iova(), self.queue_pair.tiling, context, 1),
+            (mmu::UAT_PGSZ, self.descriptor_3d_low.iova(), self.queue_pair.fragment, context, 1),
             (mmu::UAT_PGSZ, self.descriptor_3d_render.iova(), self.queue_pair.fragment, context, 2),
         ] {
             let mut item = meta;
@@ -5337,6 +5354,8 @@ impl G17PUserRenderStorage {
         }
         let mut item = meta;
         item.kind = TraceKind::RenderState;
+        item.context = context;
+        item.root = trace::ROOT_CONTEXT_LOW;
         item.instance = 5;
         item.dva = self.render_state.iova() + G17P_RENDER_STATE_TA_STATUS as u64;
         self.render_state.capture_trace_range(
@@ -5757,12 +5776,10 @@ impl G17PUserRenderStorage {
             }
         };
 
-        // Queue items name the firmware-high descriptors, while descriptor
-        // self-pointers resolve through these one-page context-0 aliases.
-        // The output-positive first-partial path names the descriptors at
-        // exactly the native arena bases (TA 0xfffffc20c0018000, 3D
-        // 0xfffffc20c00b0000), so alias the two pages there and keep the
-        // context locators at their native, delta-zero values.
+        // Queue items name firmware-high descriptors, while descriptor self
+        // pointers resolve through this job's application GART. Native's
+        // context-0 descriptor coordinates overlap the process-root FList;
+        // allocate disjoint per-job low aliases and publish their actual VAs.
         let mut descriptors = bootstrap_stage!("descriptor allocation", MappedObject::new_wc(
             dev,
             uat,
@@ -5786,9 +5803,7 @@ impl G17PUserRenderStorage {
             descriptors.object.map_range_into_range(
                 vm,
                 0..G17P_RENDER_TA_DESCRIPTOR_ARRAY_SIZE,
-                G17P_BOOTSTRAP_TA_DESCRIPTOR_LOW_VA
-                    ..G17P_BOOTSTRAP_TA_DESCRIPTOR_LOW_VA
-                        + G17P_RENDER_TA_DESCRIPTOR_ARRAY_SIZE as u64,
+                g17p_cl_client_low_va_range(),
                 mmu::UAT_PGSZ as u64,
                 mmu::PROT_GPU_SHARED_RO,
                 false,
@@ -5801,9 +5816,7 @@ impl G17PUserRenderStorage {
                 G17P_RENDER_3D_DESCRIPTOR_OFFSET
                     ..G17P_RENDER_3D_DESCRIPTOR_OFFSET
                         + G17P_RENDER_3D_DESCRIPTOR_ARRAY_SIZE,
-                G17P_BOOTSTRAP_3D_DESCRIPTOR_LOW_VA
-                    ..G17P_BOOTSTRAP_3D_DESCRIPTOR_LOW_VA
-                        + G17P_RENDER_3D_DESCRIPTOR_ARRAY_SIZE as u64,
+                g17p_cl_client_low_va_range(),
                 mmu::UAT_PGSZ as u64,
                 mmu::PROT_GPU_SHARED_RO,
                 false,
@@ -6445,7 +6458,7 @@ impl G17PUserRenderStorage {
         let descriptor_3d_rce_va = descriptor_3d_low.iova();
         dev_info!(
             dev.as_ref(),
-            "G17P render RCE: context0 descriptor={:#x}, retained diagnostic client alias={:#x}; diagnostic entry mirrors={:#x}/{:#x}/{:#x}/{:#x} stride={:#x}\n",
+            "G17P render RCE: job descriptor={:#x}, retained diagnostic client alias={:#x}; diagnostic entry mirrors={:#x}/{:#x}/{:#x}/{:#x} stride={:#x}\n",
             descriptor_3d_rce_va,
             descriptor_3d_render_va,
             fragment_rce_va,
@@ -6469,7 +6482,7 @@ impl G17PUserRenderStorage {
                 .map_err(|error| render_build_fail_named(16, error))?;
             g17_render::apply_g17p_retained_descriptor_fields(
                 g17_render::RenderDescriptorKind::Tiling,
-                G17P_BOOTSTRAP_TA_DESCRIPTOR_LOW_VA,
+                descriptor_ta_low.iova(),
                 g17_initdata::CONTROL_SHARED_ADDRESS,
                 queue_pair.tiling as u8,
                 queue_pair.fragment as u8,
@@ -6589,7 +6602,7 @@ impl G17PUserRenderStorage {
         dev_info!(
             dev.as_ref(),
             "G17P render storage: TA self={:#x} context={:#x}/{:#x} tails={:#x}/{:#x}/{:#x}\n",
-            G17P_BOOTSTRAP_TA_DESCRIPTOR_LOW_VA,
+            descriptor_ta_low.iova(),
             ta_context_low.iova(),
             ta_context.iova(),
             G17P_BOOTSTRAP_DESCRIPTOR_ZERO_A_VA,
@@ -7555,11 +7568,11 @@ impl G17PUserRenderStorage {
         );
         dev_info!(
             dev.as_ref(),
-            "G17P render reach: ta_low(iova={:#x} want={:#x} covered={}) descriptors={:#x} graph={:#x} support={:#x} state={:#x}+{:#x} ts={:#x}\n",
+            "G17P render reach: ta_low(iova={:#x} arena={:#x} covered={}) descriptors={:#x} graph={:#x} support={:#x} state={:#x}+{:#x} ts={:#x}\n",
             self.descriptor_ta_low.iova(),
-            G17P_BOOTSTRAP_TA_DESCRIPTOR_LOW_VA,
+            G17P_CL_CLIENT_LOW_VA_START,
             vm.covers_range(self.descriptor_ta_low.iova(),
-                self.descriptor_ta_low.size() as u64, true, true),
+                self.descriptor_ta_low.size() as u64, true, false),
             layout.descriptors,
             layout.graph,
             layout.support,
@@ -7739,7 +7752,10 @@ impl G17PUserRenderStorage {
             ),
             (
                 "descriptor-ta-low-identity",
-                self.descriptor_ta_low.iova() == G17P_BOOTSTRAP_TA_DESCRIPTOR_LOW_VA
+                self.descriptor_ta_low.iova() >= G17P_CL_CLIENT_LOW_VA_START
+                    && self.descriptor_ta_low.iova()
+                        + self.descriptor_ta_low.size() as u64
+                        <= G17P_CL_LOW_VA_END
                     && self.descriptor_ta_low.size() == G17P_RENDER_TA_DESCRIPTOR_ARRAY_SIZE,
             ),
             (
@@ -7753,7 +7769,10 @@ impl G17PUserRenderStorage {
             ),
             (
                 "descriptor-3d-low-identity",
-                self.descriptor_3d_low.iova() == G17P_BOOTSTRAP_3D_DESCRIPTOR_LOW_VA
+                self.descriptor_3d_low.iova() >= G17P_CL_CLIENT_LOW_VA_START
+                    && self.descriptor_3d_low.iova()
+                        + self.descriptor_3d_low.size() as u64
+                        <= G17P_CL_LOW_VA_END
                     && self.descriptor_3d_low.size() == G17P_RENDER_3D_DESCRIPTOR_ARRAY_SIZE,
             ),
             (
@@ -7825,7 +7844,7 @@ impl G17PUserRenderStorage {
             ),
             (
                 "ta-status-page",
-                uat.kernel_vm().covers_range(
+                vm.covers_range(
                     self.render_state.iova() + G17P_RENDER_STATE_TA_STATUS as u64,
                     mmu::UAT_PGSZ as u64,
                     true,
@@ -17212,6 +17231,21 @@ mod tests {
         assert_eq!((second.tiling, second.fragment), (2, 3));
         assert_eq!(second.low_va(true) - first.low_va(true), 2 * G17P_RENDER_QUEUE_VA_STRIDE);
         assert_eq!(second.low_va(false) - first.low_va(false), 2 * G17P_RENDER_QUEUE_VA_STRIDE);
+        assert_eq!(first.low_va(true), G17P_RENDER_JOB_QUEUE_LOW_BASE);
+        assert_eq!(first.low_va(false), G17P_RENDER_JOB_QUEUE_LOW_BASE + G17P_RENDER_QUEUE_VA_STRIDE);
+        for pair in [first, second] {
+            for tiling in [true, false] {
+                let queue = pair.low_va(tiling)
+                    ..pair.low_va(tiling) + G17P_BOOTSTRAP_CONTEXT_PEER_SIZE as u64;
+                for index in 0..G17P_CONTROL_OPERAND_BUFFER_COUNT {
+                    let operand = g17p_control_operand_buffer_va(index).unwrap()
+                        ..g17p_control_operand_buffer_va(index).unwrap()
+                            + G17P_CONTROL_OPERAND_BUFFER_SIZE as u64;
+                    assert!(queue.end <= operand.start || operand.end <= queue.start);
+                }
+                assert!(queue.end <= g17_initdata::COMPUTE_FLIST_PAGE_LIST_ADDRESS);
+            }
+        }
         assert!(second.record_offset(false) + G17P_RENDER_QUEUE_RECORD_SIZE
             <= G17P_RENDER_QUEUE_GRAPH_SIZE);
         assert_eq!(G17PRenderQueuePair::for_slot(2), None);

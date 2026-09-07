@@ -712,6 +712,12 @@ impl gpuvm::DriverGpuVm for VmInner {
 
         let one_page = op.flags().contains(gpuvm::GpuVaFlags::REPEAT);
 
+        // GPUVM cannot see driver-owned KernelMappings.  Preflight the full
+        // object range in the authoritative page table and allocate every
+        // intermediate table before the first scatterlist leaf is written.
+        self.page_table
+            .prepare_map(op.addr()..op.addr().checked_add(op.range()).ok_or(EOVERFLOW)?)?;
+
         let mut do_map = |mut addr: usize, mut len: usize, offset: &mut usize| -> Result<bool> {
             if left == 0 {
                 return Ok(false);
@@ -950,6 +956,12 @@ impl VmInner {
     /// Map an `mm::Node` representing an mapping in VA space.
     fn map_node(&mut self, node: &mm::Node<(), KernelMappingInner>, prot: Prot) -> Result {
         let mut iova = node.start();
+        let mapping_end = iova
+            .checked_add(node.mapped_size as u64)
+            .ok_or(EOVERFLOW)?;
+        // The private fixed-mapping allocator cannot see GPUVM-owned leaves.
+        // Reserve the complete page-table walk before installing any SG run.
+        self.page_table.prepare_map(iova..mapping_end)?;
         let guard = node.bo.as_ref().ok_or(EINVAL)?.inner().inner.lock();
         let sgt = guard.sgt.as_ref().ok_or(EINVAL)?;
         let mut offset = node.offset;
@@ -2713,9 +2725,6 @@ impl Vm {
 
         let mut inner = self.inner.exec_lock(Some(gem), true)?;
 
-        // Preallocate the page tables, to fail early if we ENOMEM
-        inner.page_table.alloc_pages(addr..(addr + size))?;
-
         ctx.vm_bo = Some(vm_bo);
 
         if (addr | size | offset) & (UAT_PGMSK as u64) != 0 {
@@ -2790,6 +2799,14 @@ impl Vm {
             0,
         )?;
 
+        let prepared = inner
+            .page_table
+            .prepare_map(iova..iova.checked_add(size as u64).ok_or(EOVERFLOW)?);
+        if let Err(error) = prepared {
+            // Drop the VM lock before the reserved node and its owner refs.
+            core::mem::drop(inner);
+            return Err(error);
+        }
         let ret = inner.page_table.map_pages(
             iova..(iova + size as u64),
             phys as PhysicalAddr,
@@ -3240,11 +3257,11 @@ impl Uat {
         Ok(aliases)
     }
 
-    /// Materialize the complete SecureGart low-view closure in one submitted
-    /// job's own process root.  Unlike `install_t8140_native_context_aliases`,
-    /// this never mutates the singleton context-0 lower VM, so two distinct
-    /// application-GART contexts can retain different process resources at
-    /// the same low addresses concurrently.
+    /// Validate the complete SecureGart low-view closure in one submitted
+    /// job's own process root and materialize only the driver-reserved null
+    /// view. Unlike `install_t8140_native_context_aliases`, this never mutates
+    /// the singleton context-0 lower VM, so two distinct application-GART
+    /// contexts can retain different process resources concurrently.
     pub(crate) fn install_t8140_job_context_aliases(
         &self,
         source: &Vm,
@@ -3252,7 +3269,7 @@ impl Uat {
         if self.cfg != UatConfig::T8140 {
             return Err(EINVAL);
         }
-        let snapshot = {
+        let (source_generation, snapshot) = {
             let native_bindings = source
                 .t8140_native_context_bindings
                 .as_ref()
@@ -3273,14 +3290,24 @@ impl Uat {
                 })?;
                 snapshot.push((binding.gem.clone(), binding.object_offset), GFP_KERNEL)?;
             }
-            snapshot
+            (bindings.generation, snapshot)
         };
 
-        let mut mappings = KVec::new();
-        for (index, (gem, object_offset)) in snapshot.iter().enumerate() {
+        // Mesa already binds low views 1..6 from the same context BO.  Those
+        // GPUVM mappings are the process-GART owner and must never be covered
+        // by a second KernelMapping: the two allocators are independent, so a
+        // duplicate mapping used to overwrite Mesa's PTEs and later erase
+        // them when the duplicate owner dropped. Validate every existing low
+        // presentation page-for-page before adding the sole missing view 0.
+        for (index, (gem, object_offset)) in snapshot.iter().enumerate().skip(1) {
             let view = T8140_NATIVE_CONTEXT_VIEWS[index];
             if !source.covers_range(
                 view.source_address,
+                view.size as u64,
+                true,
+                view.requires_source_write,
+            ) || !source.covers_range(
+                view.context_address,
                 view.size as u64,
                 true,
                 view.requires_source_write,
@@ -3288,23 +3315,77 @@ impl Uat {
                 return Err(EFAULT);
             }
             let object_end = object_offset.checked_add(view.size).ok_or(EOVERFLOW)?;
-            let mapping = source.map_in_range(
-                &**gem,
-                *object_offset..object_end,
-                UAT_PGSZ as u64,
-                view.context_address..view.context_address + view.size as u64,
-                view.context_prot,
-                false,
-            )?;
-            let source_last = view.source_address + view.size as u64 - 1;
-            let low_last = view.context_address + view.size as u64 - 1;
-            if source.translate_iova(view.source_address)? != source.translate_iova(view.context_address)?
-                || source.translate_iova(source_last)? != source.translate_iova(low_last)?
-            {
+            if object_end > gem.size() {
+                return Err(ERANGE);
+            }
+            let mut offset = 0u64;
+            while offset < view.size as u64 {
+                let high = view.source_address.checked_add(offset).ok_or(EOVERFLOW)?;
+                let low = view.context_address.checked_add(offset).ok_or(EOVERFLOW)?;
+                if source.translate_iova(high)? != source.translate_iova(low)? {
+                    dev_err!(
+                        self.dev.as_ref(),
+                        "MMU: T8140 job context view {} backing mismatch at +{:#x}\n",
+                        index,
+                        offset,
+                    );
+                    return Err(EFAULT);
+                }
+                offset = offset.checked_add(UAT_PGSZ as u64).ok_or(EOVERFLOW)?;
+            }
+        }
+
+        let mut mappings = KVec::with_capacity(1, GFP_KERNEL)?;
+        let view = T8140_CLIENT_NULL_VIEW;
+        let (gem, object_offset) = snapshot.first().ok_or(EINVAL)?;
+        if !source.covers_range(
+            view.source_address,
+            view.size as u64,
+            true,
+            view.requires_source_write,
+        ) {
+            return Err(EFAULT);
+        }
+        let object_end = object_offset.checked_add(view.size).ok_or(EOVERFLOW)?;
+        if object_end > gem.size() {
+            return Err(ERANGE);
+        }
+        let mapping = source.map_in_range(
+            &**gem,
+            *object_offset..object_end,
+            UAT_PGSZ as u64,
+            view.context_address..view.context_address + view.size as u64,
+            view.context_prot,
+            false,
+        )?;
+        let mut offset = 0u64;
+        while offset < view.size as u64 {
+            let high = view.source_address.checked_add(offset).ok_or(EOVERFLOW)?;
+            let low = view.context_address.checked_add(offset).ok_or(EOVERFLOW)?;
+            if source.translate_iova(high)? != source.translate_iova(low)? {
                 return Err(EFAULT);
             }
-            mappings.push(mapping, GFP_KERNEL)?;
+            offset = offset.checked_add(UAT_PGSZ as u64).ok_or(EOVERFLOW)?;
         }
+        mappings.push(mapping, GFP_KERNEL)?;
+
+        if source
+            .t8140_native_context_bindings
+            .as_ref()
+            .ok_or(EINVAL)?
+            .lock()
+            .generation
+            != source_generation
+        {
+            return Err(EAGAIN);
+        }
+        dev_info!(
+            self.dev.as_ref(),
+            "MMU: T8140 job context reused {} GPUVM low views and installed only reserved null view for VM {} generation {}\n",
+            T8140_NATIVE_CONTEXT_VIEW_COUNT - 1,
+            source.id,
+            source_generation,
+        );
         Ok(mappings)
     }
 
@@ -4952,6 +5033,20 @@ mod tests {
         assert_eq!(window.start, 0);
         assert!(window.start < IOVA_USER_BASE);
         assert!(window.end > IOVA_USER_BASE);
+    }
+
+    #[test]
+    fn t8140_job_root_has_exactly_one_driver_owned_secure_gart_view() {
+        let null_end = T8140_CLIENT_NULL_VIEW.context_address
+            + T8140_CLIENT_NULL_VIEW.size as u64;
+        assert_eq!(T8140_NATIVE_CONTEXT_VIEWS[0].context_address, 0);
+        assert_eq!(T8140_NATIVE_CONTEXT_VIEWS[0].size, T8140_CLIENT_NULL_VIEW.size);
+        for view in T8140_NATIVE_CONTEXT_VIEWS.iter().skip(1) {
+            // These ranges are explicitly supplied by Mesa's GPUVM binds and
+            // must only be validated, never acquired by a KernelMapping.
+            assert!(null_end <= view.context_address);
+            assert!(view.context_address >= IOVA_USER_BASE);
+        }
     }
 
     #[test]
