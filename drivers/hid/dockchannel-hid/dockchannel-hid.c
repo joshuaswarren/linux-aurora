@@ -26,6 +26,12 @@
 
 #define COMMAND_TIMEOUT_MS 1000
 #define START_TIMEOUT_MS 2000
+/*
+ * Long enough to cover the handshake's own delay plus a comm command that goes
+ * unacknowledged, so a start that arrives early waits for the real answer
+ * instead of timing out on top of it.
+ */
+#define HANDSHAKE_TIMEOUT_MS 4000
 
 #define MAX_INTERFACES 16
 
@@ -218,15 +224,104 @@ module_param(max_start_attempts, int, 0644);
 MODULE_PARM_DESC(max_start_attempts,
 		 "How many times to attempt an interface start before giving up");
 
+/*
+ * macOS does not register the shared-memory FIFOs from the interface start
+ * path.  AppleHIDTransportProtocolSCMFIFO does it once, from handshakeGated, on
+ * the management interface, shortly after the transport's first read completes
+ * and before any HID interface has been started - and
+ * AppleHIDTransportProtocolSCMFIFO::handleBootload then refuses to run a CBOR
+ * bootload at all until that handshake has been recorded.  J700's node is
+ * bootloader-type = "CBOR", so it is not one of the FlatPack parts that skip
+ * the gate: on this machine the firmware upload is downstream of the
+ * registration, not the other way round.
+ *
+ * So the registration lives on its own timer here too: armed off the first
+ * DockChannel read completion, run on the comm interface, and awaited by the
+ * start path rather than performed by it.
+ */
 static bool shared_buffer;
-module_param(shared_buffer, bool, 0644);
+static int dchid_shared_buffer_set(const char *val, const struct kernel_param *kp);
+static const struct kernel_param_ops dchid_shared_buffer_ops = {
+	.flags = KERNEL_PARAM_OPS_FL_NOARG,
+	.set = dchid_shared_buffer_set,
+	.get = param_get_bool,
+};
+module_param_cb(shared_buffer, &dchid_shared_buffer_ops, &shared_buffer, 0644);
 MODULE_PARM_DESC(shared_buffer,
-		 "Register a DRAM shared buffer with MTP (opcode 0x91) before uploading firmware");
+		 "Register the DRAM shared-memory FIFOs with MTP (opcode 0x91) from the comm interface handshake; setting it at runtime runs the handshake immediately");
 
 static unsigned int shared_buffer_size = 0x4000;
 module_param(shared_buffer_size, uint, 0644);
 MODULE_PARM_DESC(shared_buffer_size,
-		 "Size of the shared buffer registered with opcode 0x91");
+		 "Size of each shared FIFO registered with opcode 0x91");
+
+static unsigned int shared_buffer_count = 1;
+module_param(shared_buffer_count, uint, 0644);
+MODULE_PARM_DESC(shared_buffer_count,
+		 "How many shared FIFOs to register with opcode 0x91");
+
+/*
+ * macOS's registration lands about 100 ms after the first read completion.
+ * Keep that as the default rather than firing immediately: MTP is still
+ * enumerating its own interfaces at that point, and the one thing measured
+ * about this message is that sending it twice takes the coprocessor down, so
+ * there is no second chance to spend on being early.
+ */
+static unsigned int shared_buffer_delay_ms = 100;
+module_param(shared_buffer_delay_ms, uint, 0644);
+MODULE_PARM_DESC(shared_buffer_delay_ms,
+		 "Delay from the first DockChannel read completion to the opcode 0x91 handshake");
+
+/*
+ * Once the FIFOs are registered MTP stops acknowledging comm commands over
+ * DockChannel, which is what it should do if the replies have moved into the
+ * ring.  Watch the ring headers so that can be read off real traffic instead of
+ * inferred from the silence; 0 disables the poll.
+ */
+static unsigned int shared_buffer_poll_ms = 500;
+module_param(shared_buffer_poll_ms, uint, 0644);
+MODULE_PARM_DESC(shared_buffer_poll_ms,
+		 "How often to log the shared FIFO headers once they are registered (0 disables)");
+
+/*
+ * macOS's handshake lands before any interface is *started*, which is a later
+ * event than an interface being enumerated and enabled: enabling is part of
+ * enumeration, bootloading is the start.  The distinction matters here because
+ * MTP stops acknowledging comm commands once a FIFO is registered, and the
+ * built-in keyboard's CMD_ENABLE_INTERFACE is a comm command - losing its ack
+ * costs the keyboard for the rest of the boot.  So by default the handshake
+ * also waits for the enumeration already in flight to drain.  Clear this to
+ * reproduce macOS's timing exactly, at the cost of that guarantee.
+ */
+static bool shared_buffer_after_enum = true;
+module_param(shared_buffer_after_enum, bool, 0644);
+MODULE_PARM_DESC(shared_buffer_after_enum,
+		 "Let interface enumeration drain before the opcode 0x91 handshake");
+
+/*
+ * MTP stopped acknowledging comm commands over DockChannel as soon as a FIFO
+ * was registered - including CMD_SEND_FIRMWARE, which had been acked reliably
+ * until then.  That is what a transport whose replies have moved into shared
+ * memory looks like from a host that is not draining it, so treat the silence
+ * as "reply not collected" rather than "command failed" and let the rest of the
+ * sequence run.  It only applies once a FIFO is actually registered, so nothing
+ * before the handshake can be masked by it.
+ */
+static bool shared_buffer_lossy_ack = true;
+module_param(shared_buffer_lossy_ack, bool, 0644);
+MODULE_PARM_DESC(shared_buffer_lossy_ack,
+		 "Once a shared FIFO is registered, treat an unanswered comm command as delivered rather than failed");
+
+/* Never poll faster than this, whatever the parameter says. */
+#define SHMEM_POLL_MIN_MS 50
+
+static unsigned int shmem_poll_interval(void)
+{
+	if (!shared_buffer_poll_ms)
+		return 0;
+
+	return max(shared_buffer_poll_ms, (unsigned int)SHMEM_POLL_MIN_MS);
+}
 
 static int shared_buffer_unk1;
 module_param(shared_buffer_unk1, int, 0644);
@@ -235,6 +330,22 @@ MODULE_PARM_DESC(shared_buffer_unk1, "Second byte of the opcode 0x91 message");
 static int shared_buffer_unk2;
 module_param(shared_buffer_unk2, int, 0644);
 MODULE_PARM_DESC(shared_buffer_unk2, "Third byte of the opcode 0x91 message");
+
+/*
+ * How many FIFOs the host is willing to hand MTP.  macOS's MemoryFIFOs
+ * property is an array, so the count is not structurally fixed at one; this is
+ * only the ceiling on what shared_buffer_count may ask for.
+ */
+#define MAX_SHARED_FIFOS 8
+
+struct dchid_shmem_fifo {
+	void *buf;
+	dma_addr_t addr;
+	unsigned int size;
+	u32 last_head;
+	u32 last_tail;
+	bool seen;
+};
 
 struct dchid_init_block_hdr {
 	u16 type;
@@ -360,9 +471,19 @@ struct dockchannel_hid {
 
 	u8 pkt_buf[MAX_PKT_SIZE];
 
-	/* DRAM shared buffer registered with MTP, if any. */
-	void *shmem;
-	unsigned int shmem_size;
+	/* DRAM shared FIFOs registered with MTP, if any. */
+	struct dchid_shmem_fifo fifos[MAX_SHARED_FIFOS];
+	unsigned int nr_fifos;
+
+	/*
+	 * The transport handshake: armed by the first DockChannel read
+	 * completion, run once on the comm interface, awaited by any interface
+	 * that has to bootload.
+	 */
+	struct delayed_work handshake_work;
+	struct completion handshake_done;
+	bool handshake_armed;
+	struct delayed_work shmem_poll_work;
 
 	/* Workqueue to asynchronously create HID devices */
 	struct workqueue_struct *new_iface_wq;
@@ -512,17 +633,34 @@ static int dchid_send(struct dchid_iface *iface, u32 flags, void *msg, size_t si
  * bytes of its data area whenever a command goes unanswered, so the framing can
  * be read off real traffic rather than guessed at.
  */
-static void dchid_dump_shmem(struct dockchannel_hid *dchid)
+static void dchid_dump_shmem(struct dockchannel_hid *dchid, bool only_on_change)
 {
-	u32 *hdr = dchid->shmem;
+	unsigned int i;
 
-	if (!dchid->shmem)
-		return;
+	for (i = 0; i < dchid->nr_fifos; i++) {
+		struct dchid_shmem_fifo *fifo = &dchid->fifos[i];
+		u32 *hdr = fifo->buf;
+		u32 head, tail;
 
-	dev_info(dchid->dev,
-		 "Shared FIFO: producer=%u consumer=%u capacity=%u data=%*ph\n",
-		 READ_ONCE(hdr[0]), READ_ONCE(hdr[1]), dchid->shmem_size - 8,
-		 64, (u8 *)dchid->shmem + 8);
+		if (!fifo->buf)
+			continue;
+
+		dma_rmb();
+		head = READ_ONCE(hdr[0]);
+		tail = READ_ONCE(hdr[1]);
+
+		if (only_on_change && fifo->seen &&
+		    head == fifo->last_head && tail == fifo->last_tail)
+			continue;
+
+		fifo->last_head = head;
+		fifo->last_tail = tail;
+		fifo->seen = true;
+
+		dev_info(dchid->dev,
+			 "Shared FIFO #%u: producer=%u consumer=%u capacity=%u data=%*ph\n",
+			 i, head, tail, fifo->size - 8, 64, (u8 *)fifo->buf + 8);
+	}
 }
 
 static int dchid_cmd(struct dchid_iface *iface, u32 type, u32 req,
@@ -547,7 +685,15 @@ static int dchid_cmd(struct dchid_iface *iface, u32 type, u32 req,
 	if (!wait_for_completion_timeout(&iface->out_complete, msecs_to_jiffies(COMMAND_TIMEOUT_MS))) {
 		dev_err(iface->dchid->dev, "output report 0x%x to iface  %d (%s) timed out\n",
 			report_id, iface->index, iface->name);
-		dchid_dump_shmem(iface->dchid);
+		dchid_dump_shmem(iface->dchid, false);
+		if (iface->dchid->nr_fifos && shared_buffer_lossy_ack) {
+			dev_info(iface->dchid->dev,
+				 "Report 0x%x unanswered with %u FIFO(s) registered, continuing\n",
+				 report_id, iface->dchid->nr_fifos);
+			iface->retcode = 0;
+			ret = 0;
+			goto done;
+		}
 		ret = -ETIMEDOUT;
 		goto done;
 	}
@@ -1061,7 +1207,7 @@ static void dchid_power_request(struct dchid_iface *iface, int state)
 }
 
 /*
- * Register a DRAM shared buffer with MTP.
+ * Register one DRAM shared FIFO with MTP.
  *
  * The wire format is m1n1's InitBufMsg, decoded from a macOS trace: the same
  * shape as CMD_SEND_FIRMWARE without its interface byte, fifteen bytes in all,
@@ -1070,16 +1216,19 @@ static void dchid_power_request(struct dchid_iface *iface, int state)
  *
  *   hal.c:170: Registering DRAM Shared Buffer #N. Addr=<addr>, Size=<size>
  *
- * with the address shifted right by four.
+ * Log the host's own IOVA next to it rather than assuming how that Addr is
+ * formatted: an earlier reading had it shifted right by four, and the two lines
+ * side by side settle it without another experiment.
  *
  * This is the transport half A18 MTP appears to want and this driver has never
  * spoken: its bootloader gives up on the AFE within one RTKit log slot, with no
  * measurable elapsed time and no bus traffic, which is a refused precondition
  * rather than a part that failed to answer.
  */
-static int dchid_register_shared_buffer(struct dchid_iface *iface)
+static int dchid_register_shared_fifo(struct dockchannel_hid *dchid,
+				      unsigned int index)
 {
-	struct dockchannel_hid *dchid = iface->dchid;
+	struct dchid_shmem_fifo *fifo = &dchid->fifos[index];
 	struct {
 		u8 cmd;
 		u8 unk1;
@@ -1098,13 +1247,10 @@ static int dchid_register_shared_buffer(struct dchid_iface *iface)
 
 	BUILD_BUG_ON(sizeof(msg) != 15);
 
-	if (!shared_buffer || dchid->shmem)
-		return 0;
-
 	buf = dmam_alloc_coherent(dchid->dev, shared_buffer_size, &addr,
 				  GFP_KERNEL);
 	if (IS_ERR_OR_NULL(buf)) {
-		dev_err(dchid->dev, "Failed to allocate the %u-byte shared buffer\n",
+		dev_err(dchid->dev, "Failed to allocate the %u-byte shared FIFO\n",
 			shared_buffer_size);
 		return buf ? PTR_ERR(buf) : -ENOMEM;
 	}
@@ -1124,28 +1270,166 @@ static int dchid_register_shared_buffer(struct dchid_iface *iface)
 	 * as it parses the message - it says so in its own log - but does not
 	 * acknowledge the command, so waiting for an ack that never comes used
 	 * to leave this unset and register a second buffer on the next attempt.
-	 * Registering twice takes the coprocessor down:
+	 * Registering the same FIFO twice takes the coprocessor down:
 	 *
 	 *   hal.c:170: Registering DRAM Shared Buffer #1. Addr=..., Size=16384
 	 *   RTKit: co-processor has crashed
 	 *   ESR = 0x96000044  FAR = 0x1010108eb80
 	 *
-	 * so this must happen exactly once for the life of the device.
+	 * so each index must go out exactly once for the life of the device.
 	 */
-	dchid->shmem = buf;
-	dchid->shmem_size = shared_buffer_size;
+	fifo->buf = buf;
+	fifo->addr = addr;
+	fifo->size = shared_buffer_size;
+	dchid->nr_fifos = index + 1;
 
 	ret = dchid_comm_cmd(dchid, &msg, sizeof(msg));
 	dev_info(dchid->dev,
-		 "Shared buffer: iova=%pad size=%u unk=%d,%d ret=%d\n",
-		 &addr, shared_buffer_size, shared_buffer_unk1,
+		 "Shared FIFO #%u: iova=%pad size=%u unk=%d,%d ret=%d\n",
+		 index, &addr, shared_buffer_size, shared_buffer_unk1,
 		 shared_buffer_unk2, ret);
 
 	/*
 	 * A missing acknowledgement is not a failure here: the registration has
 	 * demonstrably taken effect by the time the command times out, and
-	 * failing the start would only send us round again.
+	 * failing the handshake would only send us round again.
 	 */
+	return 0;
+}
+
+static void dchid_shmem_poll_work(struct work_struct *ws)
+{
+	struct dockchannel_hid *dchid =
+		container_of(to_delayed_work(ws), struct dockchannel_hid,
+			     shmem_poll_work);
+
+	dchid_dump_shmem(dchid, true);
+
+	if (shmem_poll_interval())
+		queue_delayed_work(dchid->comm->wq, &dchid->shmem_poll_work,
+				   msecs_to_jiffies(shmem_poll_interval()));
+}
+
+/*
+ * The transport handshake, as AppleHIDTransportProtocolSCMFIFO::handshakeGated
+ * performs it: the shared-memory FIFOs are handed to MTP once, on the
+ * management interface, before any HID interface has been started, and only
+ * then is an interface allowed to bootload.
+ */
+static void dchid_handshake_work(struct work_struct *ws)
+{
+	struct dockchannel_hid *dchid =
+		container_of(to_delayed_work(ws), struct dockchannel_hid,
+			     handshake_work);
+	unsigned int count = shared_buffer_count;
+	unsigned int i;
+
+	/*
+	 * Every interface that MTP has already announced has its
+	 * CMD_ENABLE_INTERFACE issued from new_iface_wq, so draining that queue
+	 * is what makes "the keyboard is already enabled" true rather than
+	 * likely.
+	 */
+	if (shared_buffer_after_enum)
+		flush_workqueue(dchid->new_iface_wq);
+
+	if (count > MAX_SHARED_FIFOS) {
+		dev_warn(dchid->dev, "Clamping shared_buffer_count %u to %u\n",
+			 count, MAX_SHARED_FIFOS);
+		count = MAX_SHARED_FIFOS;
+	}
+
+	dev_info(dchid->dev,
+		 "Transport handshake: registering %u shared FIFO(s) of %u bytes\n",
+		 count, shared_buffer_size);
+
+	for (i = 0; i < count; i++) {
+		int ret = dchid_register_shared_fifo(dchid, i);
+
+		if (ret < 0) {
+			dev_err(dchid->dev,
+				"Shared FIFO #%u registration failed: %d\n",
+				i, ret);
+			break;
+		}
+	}
+
+	complete_all(&dchid->handshake_done);
+	dchid_dump_shmem(dchid, false);
+
+	if (dchid->nr_fifos && shmem_poll_interval())
+		queue_delayed_work(dchid->comm->wq, &dchid->shmem_poll_work,
+				   msecs_to_jiffies(shmem_poll_interval()));
+}
+
+/*
+ * Arm the handshake off the first DockChannel read completion.  Called from the
+ * receive callback, so it must not sleep; the registration itself runs on the
+ * comm interface's own workqueue, which is also where the comm packet work
+ * runs, so the two cannot interleave.
+ */
+static void dchid_arm_handshake(struct dockchannel_hid *dchid, unsigned int delay_ms)
+{
+	if (!shared_buffer || dchid->handshake_armed)
+		return;
+
+	dchid->handshake_armed = true;
+	dev_info(dchid->dev, "Handshake armed, running in %u ms\n", delay_ms);
+	queue_delayed_work(dchid->comm->wq, &dchid->handshake_work,
+			   msecs_to_jiffies(delay_ms));
+}
+
+/*
+ * There is one MTP transport per machine and the handshake is a one-shot, so
+ * enabling the parameter after boot has to reach that transport to be worth
+ * anything.  Keeping the pointer here is what lets a run be armed deliberately,
+ * from a shell, against a machine whose built-in keyboard is known to be
+ * working at that moment - rather than only ever at boot, where there is
+ * nothing to compare against.
+ */
+static struct dockchannel_hid *dchid_transport;
+
+static int dchid_shared_buffer_set(const char *val, const struct kernel_param *kp)
+{
+	int ret = param_set_bool(val, kp);
+
+	if (ret)
+		return ret;
+
+	if (shared_buffer && dchid_transport && dchid_transport->comm)
+		dchid_arm_handshake(dchid_transport, 0);
+
+	return 0;
+}
+
+/*
+ * AppleHIDTransportProtocolSCMFIFO::handleBootload will not run a CBOR bootload
+ * before the handshake has been recorded, and J700 is a CBOR part.  Wait rather
+ * than register here: the registration is a one-shot, so an interface start
+ * must never be the thing that performs it.
+ */
+static int dchid_await_handshake(struct dchid_iface *iface)
+{
+	struct dockchannel_hid *dchid = iface->dchid;
+
+	if (!shared_buffer)
+		return 0;
+
+	if (!dchid->handshake_armed) {
+		dev_warn(dchid->dev,
+			 "Starting %s with no transport handshake armed\n",
+			 iface->name);
+		return 0;
+	}
+
+	if (!wait_for_completion_timeout(&dchid->handshake_done,
+					 msecs_to_jiffies(HANDSHAKE_TIMEOUT_MS))) {
+		dev_err(dchid->dev,
+			"Transport handshake did not complete, not bootloading %s\n",
+			iface->name);
+		return -ETIMEDOUT;
+	}
+
 	return 0;
 }
 
@@ -1212,10 +1496,11 @@ static int dchid_start_interface(struct dchid_iface *iface)
 	if (fw && size) {
 
 		/*
-		 * The buffer registration is a transport-level operation, so it
-		 * goes in before the image the transport has to carry.
+		 * The FIFO registration is a transport-level operation that
+		 * happens once, on the comm interface, well before this point.
+		 * All an interface start owes it is the wait.
 		 */
-		ret = dchid_register_shared_buffer(iface);
+		ret = dchid_await_handshake(iface);
 		if (ret < 0)
 			goto err;
 
@@ -1847,6 +2132,8 @@ static void dchid_handle_packet(void *cookie, size_t avail)
 	struct dchid_iface *iface;
 	u32 checksum;
 
+	dchid_arm_handshake(dchid, shared_buffer_delay_ms);
+
 	if (dockchannel_recv(dchid->dc, &hdr, sizeof(hdr)) != sizeof(hdr)) {
 		dev_err(dchid->dev, "Read failed (header)\n");
 		return;
@@ -1995,6 +2282,10 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 	if (!dchid->new_iface_wq)
 		return -ENOMEM;
 
+	init_completion(&dchid->handshake_done);
+	INIT_DELAYED_WORK(&dchid->handshake_work, dchid_handshake_work);
+	INIT_DELAYED_WORK(&dchid->shmem_poll_work, dchid_shmem_poll_work);
+
 	dchid->comm = dchid_get_interface(dchid, IFACE_COMM, "comm");
 	if (!dchid->comm) {
 		dev_err(dchid->dev, "Failed to initialize comm interface");
@@ -2016,6 +2307,7 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 	}
 
 	dev_info(dchid->dev, "Initialized, awaiting packets\n");
+	dchid_transport = dchid;
 	dockchannel_await(dchid->dc, dchid_handle_packet, dchid, sizeof(struct dchid_hdr));
 
 	return 0;
