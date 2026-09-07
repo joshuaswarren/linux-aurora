@@ -1021,6 +1021,15 @@ pub(crate) struct G17PManagerConstruction {
     /// Device-global FList generation. Queue-pair ordinals are per slot, but
     /// the shared USC pool accepts one monotonic owner sequence.
     next_render_flist_sequence: u64,
+    /// `render_pool_id()` of the storage the device-global parameter-buffer
+    /// loader currently points at, or 0 for none.
+    ///
+    /// The PB page-list page and the PBDesc table live at fixed native
+    /// addresses and are per-DEVICE, but each retained storage owns its own
+    /// parameter-management graph. Only one of them can be installed at a time,
+    /// so record which, and re-point the loader when a different owner
+    /// submits.
+    render_parameter_buffer_owner: u64,
     /// The manager's render methods operate on one selected state to keep the
     /// byte-critical publication code single-copy.  The other bounded slot is
     /// parked here while its independent queue pair executes.
@@ -1248,6 +1257,10 @@ struct G17PRenderSksmQueues {
     tiling: G17PRenderSksmQueue,
     fragment: G17PRenderSksmQueue,
 }
+
+/// How many times the device-global parameter-buffer loader has been handed
+/// from one client's retained storage to another's. Rate-limits its own log.
+static G17P_PARAMETER_BUFFER_RETARGETS: AtomicU32 = AtomicU32::new(0);
 
 /// Session-wide counters for the four decisive state-machine events.
 ///
@@ -1647,6 +1660,7 @@ impl G17PManagerConstruction {
                 bootstrap_uma: None,
                 prepared_render_flist: None,
                 next_render_flist_sequence: G17P_BOOTSTRAP_UMA_SEQUENCE,
+                render_parameter_buffer_owner: 0,
                 parked_render_slots: [None, None],
                 active_render_slot: 0,
                 accepted_firmware_recovery_generation: 0,
@@ -2832,6 +2846,7 @@ impl G17PManagerConstruction {
         self.render_submission_ordinal = 0;
         self.render_auxiliary_timestamp = 0;
         self.next_render_flist_sequence = G17P_BOOTSTRAP_UMA_SEQUENCE;
+        self.render_parameter_buffer_owner = 0;
         self.active_render_slot = 0;
     }
 
@@ -2915,6 +2930,97 @@ impl G17PManagerConstruction {
         dev_info!(self.resources.dev().as_ref(),
             "G17P render VM handoff: retired job-private graph vm={} root={:#x}; incoming VM builds a new root at ordinal {}, QID producer state retained\n",
             old_vm_id, old_root, self.render_submission_ordinal);
+        Ok(())
+    }
+
+    /// Rebuild a retained graph whose ring producer no longer matches the
+    /// ordinal, instead of refusing every later submission on it.
+    ///
+    /// A submission stages its items into the retained ring before the outer
+    /// publication and the tag-14/tag-15 that make them visible. A failure in
+    /// between advances `write` without advancing the ordinal, and from then on
+    /// `restage_command`'s admission guard refuses this client forever -- one
+    /// lost frame becomes a permanently dead context, which for the compositor
+    /// means a dead session.
+    ///
+    /// The repair is the cross-VM handoff's, because the situation is the same:
+    /// retire the job-private graph and let the next submission build a fresh
+    /// one, whose `rebase_empty_queue_cursors` puts its cursors where this
+    /// ordinal expects them while the physical QID producer stays monotonic.
+    /// It is gated on `require_retired_render_owner`, so it can never run while
+    /// the firmware still owns the previous group -- in that case the guard
+    /// still refuses, and now says so in full.
+    fn recycle_desynced_render_storage(&mut self) -> Result {
+        let ordinal = self.render_submission_ordinal;
+        let desynced = match self.render_storage.as_mut() {
+            Some(storage) => storage.restage_admission_desynced(ordinal)?,
+            None => return Ok(()),
+        };
+        if !desynced {
+            return Ok(());
+        }
+        // Exactly the evidence a cross-VM handoff requires before it may drop a
+        // job-private graph: no tracker, no HardwareBufferID, no staged FList,
+        // empty job list and two idle queues.
+        if self.require_retired_render_owner().is_err() {
+            return Ok(());
+        }
+        let cursors = self
+            .render_storage
+            .as_mut()
+            .ok_or(ENODEV)?
+            .restage_admission_cursors(ordinal)?;
+        let root = self.render_bind.as_ref().map_or(0, |binding| binding.root());
+        let vm_id = self.render_bind.as_ref().map_or(0, |binding| binding.vm_id());
+        self.render_storage.as_mut().ok_or(ENODEV)?.release_client_context();
+        self.render_bind = None;
+        self.render_context_aliases = None;
+        self.render_storage = None;
+        dev_warn!(
+            self.resources.dev().as_ref(),
+            "G17P render: retained graph desynced at ordinal {} (expected base {}, tiling write {}, fragment write {}) while both queues are idle; rebuilding it for vm {} root {:#x} instead of refusing the client\n",
+            ordinal,
+            cursors.0,
+            cursors.1,
+            cursors.2,
+            vm_id,
+            root,
+        );
+        Ok(())
+    }
+
+    /// Re-point the device-global parameter-buffer loader at the retained
+    /// storage that is about to submit.
+    ///
+    /// A no-op while the same storage keeps submitting, which is the whole of
+    /// the single-client path. It writes only when a different client's storage
+    /// takes over the loader, which previously only ever happened as a side
+    /// effect of rebuilding the graph in `new_user_render_storage`.
+    fn retarget_render_parameter_buffer(&mut self) -> Result {
+        // Without slot affinity every client alternation rebuilds the graph,
+        // and `new_user_render_storage` stamps the loader on the way through.
+        if *crate::module_parameters::g17p_render_slot_affinity.value() == 0 {
+            return Ok(());
+        }
+        let owner = self.render_storage.as_ref().ok_or(ENODEV)?.render_pool_id();
+        if owner == self.render_parameter_buffer_owner {
+            return Ok(());
+        }
+        let storage = self.render_storage.as_mut().ok_or(ENODEV)?;
+        self.resources.stage_render_parameter_buffer_view(storage)?;
+        let previous = self.render_parameter_buffer_owner;
+        self.render_parameter_buffer_owner = owner;
+        // Rate-limited: one alternating pair of clients would otherwise print
+        // this twice a frame, and a dockchannel console write costs about a
+        // millisecond -- enough to distort the timing this records.
+        if G17P_PARAMETER_BUFFER_RETARGETS.fetch_add(1, Ordering::Relaxed) < 8 {
+            dev_info!(
+                self.resources.dev().as_ref(),
+                "G17P render PM: device parameter-buffer loader retargeted from owner {:#x} to {:#x}\n",
+                previous,
+                owner,
+            );
+        }
         Ok(())
     }
 
@@ -3402,6 +3508,11 @@ impl G17PManagerConstruction {
         if self.render_tracker.is_some() || self.render_hardware_buffer_id.is_some() {
             return Err(EBUSY);
         }
+        // Before anything is allocated for this submission, deal with a graph
+        // whose ring producer has drifted ahead of the ordinal. Nothing this
+        // function does later can recover from it, and leaving it retires the
+        // client for good.
+        self.recycle_desynced_render_storage()?;
         if g17_resources::g17p_render_tvb_mode() >= 2 {
             let required=g17_resources::required_render_tvb_blocks(&command.parameters,self.num_clusters).ok_or(EINVAL)?;
             if self.render_storage.as_ref().is_some_and(|storage| storage.tvb_capacity()<required) {
@@ -3621,6 +3732,16 @@ impl G17PManagerConstruction {
             // Firmware owns the live page-list/PBDesc cursors; do not reset
             // them to cold values when preparing another Scene. The cold
             // new_user_render_storage path below still initializes them.
+            //
+            // The device-global PB loader, however, still points at whichever
+            // storage stamped it last. While every client alternation rebuilt
+            // its graph that was self-correcting; now that a client keeps its
+            // retained storage, the loader has to be re-pointed here or the
+            // second client runs its tiler against the first client's
+            // parameter page list. Nothing is written while the owner is
+            // unchanged, so the single-client steady state is untouched.
+            self.retarget_render_parameter_buffer()
+                .map_err(|error| Self::render_stage_fail("retarget-parameter-buffer", error))?;
         } else {
             if self.render_bind.is_some() {
                 return Err(EIO);
@@ -3662,6 +3783,11 @@ impl G17PManagerConstruction {
                     )
                     .map_err(|error| Self::render_stage_fail("restage-new-vm-command", error))?;
             }
+            // `new_user_render_storage` has just stamped the device-global PB
+            // loader from this fresh graph, so record it as the owner without
+            // repeating the write.
+            self.render_parameter_buffer_owner =
+                self.render_storage.as_ref().ok_or(ENODEV)?.render_pool_id();
         }
         {
             let storage = self.render_storage.as_mut().ok_or(ENODEV)?;

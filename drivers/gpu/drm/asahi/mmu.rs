@@ -1991,6 +1991,15 @@ impl HandoffFlush {
 impl Vm {
     pub(crate) fn status(&self) -> &Arc<crate::g17_status::VmStatus> { &self.status }
 
+    /// This VM's driver-assigned id.
+    ///
+    /// The retained render graph is owned by a VM, not by a logical DRM queue:
+    /// `render_bind.matches(vm)` is what decides whether a submission may
+    /// restage the retained storage or has to hand it off. Anything that wants
+    /// to keep a client on the storage it already built therefore has to key on
+    /// the same identity, which is this id.
+    pub(crate) fn id(&self) -> u64 { self.id }
+
     /// Create a new virtual memory address space
     fn new(
         dev: &driver::AsahiDevice,
