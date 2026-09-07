@@ -755,6 +755,15 @@ static int dchid_open(struct hid_device *hdev)
 
 		if (!wait_for_completion_timeout(&iface->ready, msecs_to_jiffies(START_TIMEOUT_MS))) {
 			dev_err(iface->dchid->dev, "iface %s start timed out\n", iface->name);
+			/*
+			 * Nothing else ever clears the latch that
+			 * dchid_start_interface() sets, so a single timed-out
+			 * start otherwise turns every later open into an
+			 * "already starting" refusal for the lifetime of the
+			 * boot.  Release it so the next open runs the start
+			 * sequence again.
+			 */
+			iface->starting = false;
 			return -ETIMEDOUT;
 		}
 	}
