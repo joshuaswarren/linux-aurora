@@ -391,26 +391,34 @@ impl G17PBootstrapUmaLifecycle {
                 Err(G17PBootstrapUmaLifecycleError::WrongOwner)
             };
         };
-        if previous.state != G17PBootstrapUmaRequestState::Completed {
-            return Err(G17PBootstrapUmaLifecycleError::WrongPhase);
-        }
-        if previous.hardware_buffer_owned || previous.hardware_buffer_references != 0 {
-            return Err(G17PBootstrapUmaLifecycleError::WrongReferenceCount);
-        }
-        if previous.pending_release_count != 0 {
-            return Err(G17PBootstrapUmaLifecycleError::WrongPendingCount);
-        }
         if previous.hardware_buffer_id != G17P_BOOTSTRAP_UMA_HARDWARE_BUFFER_ID
             || previous.sequence.checked_add(1) != Some(sequence)
         {
             return Err(G17PBootstrapUmaLifecycleError::WrongOwner);
         }
+        let overlapping = previous.state == G17PBootstrapUmaRequestState::Ready
+            && previous.hardware_buffer_owned
+            && previous.hardware_buffer_references >= 2
+            && previous.pending_release_count >= 2;
+        let reacquire = previous.state == G17PBootstrapUmaRequestState::Completed
+            && !previous.hardware_buffer_owned
+            && previous.hardware_buffer_references == 0
+            && previous.pending_release_count == 0;
+        if !overlapping && !reacquire {
+            return Err(G17PBootstrapUmaLifecycleError::WrongPhase);
+        }
         Ok(Self {
             sequence,
             hardware_buffer_id: previous.hardware_buffer_id,
             hardware_buffer_owned: true,
-            hardware_buffer_references: 3, // prepare + TA + 3D; no pending grow
-            pending_release_count: 2,
+            hardware_buffer_references: previous
+                .hardware_buffer_references
+                .checked_add(3)
+                .ok_or(G17PBootstrapUmaLifecycleError::WrongReferenceCount)?,
+            pending_release_count: previous
+                .pending_release_count
+                .checked_add(2)
+                .ok_or(G17PBootstrapUmaLifecycleError::WrongPendingCount)?,
             release_producer_after: None,
             request: None,
             state: G17PBootstrapUmaRequestState::Submitted,
@@ -422,7 +430,7 @@ impl G17PBootstrapUmaLifecycle {
     ) -> core::result::Result<(), G17PBootstrapUmaLifecycleError> {
         if self.state != G17PBootstrapUmaRequestState::Submitted
             || !self.hardware_buffer_owned
-            || self.hardware_buffer_references != if self.request.is_some() { 4 } else { 3 }
+            || self.hardware_buffer_references < if self.request.is_some() { 4 } else { 3 }
         {
             return Err(G17PBootstrapUmaLifecycleError::WrongPhase);
         }
@@ -462,23 +470,26 @@ impl G17PBootstrapUmaLifecycle {
 
     fn retire_render_references(
         &mut self,
-    ) -> core::result::Result<G17PBootstrapUmaRelease, G17PBootstrapUmaLifecycleError> {
+    ) -> core::result::Result<Option<G17PBootstrapUmaRelease>, G17PBootstrapUmaLifecycleError> {
         if self.state != G17PBootstrapUmaRequestState::Ready
             || !self.hardware_buffer_owned
-            || self.hardware_buffer_references != 2
+            || self.hardware_buffer_references < 2
         {
             return Err(G17PBootstrapUmaLifecycleError::WrongPhase);
         }
-        if self.pending_release_count == 0 {
+        if self.pending_release_count < 2 {
             return Err(G17PBootstrapUmaLifecycleError::WrongPendingCount);
         }
-        self.hardware_buffer_references = 0;
+        self.hardware_buffer_references -= 2;
+        self.pending_release_count -= 2;
+        if self.hardware_buffer_references != 0 {
+            return Ok(None);
+        }
         self.hardware_buffer_owned = false;
-        self.pending_release_count = 0;
-        Ok(G17PBootstrapUmaRelease {
+        Ok(Some(G17PBootstrapUmaRelease {
             sequence: self.sequence,
             hardware_buffer_id: self.hardware_buffer_id,
-        })
+        }))
     }
 
     fn pending_release(&self) -> Option<G17PBootstrapUmaRelease> {
@@ -979,7 +990,7 @@ pub(crate) struct G17PManagerConstruction {
     gpc_perf_state_control: u32,
     render_storage: Option<g17_resources::G17PUserRenderStorage>,
     render_tracker: Option<G17PPartialOpeningRenderTracker>,
-    render_bind: Option<mmu::VmBind>,
+    render_bind: Option<G17PRenderRootOwner>,
     /// Native secure-GART view of the active render process resources in
     /// hardware context 0. It is installed only for the VM which owns the
     /// retained render graph. Replaced only after paired completion plus
@@ -1007,6 +1018,14 @@ pub(crate) struct G17PManagerConstruction {
     bootstrap_uma: Option<G17PBootstrapUmaLifecycle>,
     /// Captured before restaging; becomes the active lease at FList publication.
     prepared_render_flist: Option<G17PBootstrapUmaLifecycle>,
+    /// Device-global FList generation. Queue-pair ordinals are per slot, but
+    /// the shared USC pool accepts one monotonic owner sequence.
+    next_render_flist_sequence: u64,
+    /// The manager's render methods operate on one selected state to keep the
+    /// byte-critical publication code single-copy.  The other bounded slot is
+    /// parked here while its independent queue pair executes.
+    parked_render_slots: [Option<G17PRenderSlotState>; 2],
+    active_render_slot: u8,
     accepted_firmware_recovery_generation: u64,
     pending_primary_recovery: Option<(u64, u32)>,
     /// Tag-14 AddKicks held back until the firmware recovery/power-up closes.
@@ -1046,6 +1065,73 @@ pub(crate) struct G17PManagerConstruction {
     /// warning is rate-limited rather than removed: a per-submission console
     /// write costs about a millisecond and would itself distort the timing.
     compute_stamp_misses: AtomicU32,
+}
+
+#[cfg(not(test))]
+#[derive(Default)]
+struct G17PRenderSlotState {
+    #[cfg(CONFIG_DEV_COREDUMP)]
+    trace_capture: Option<KBox<G17PTraceDump>>,
+    storage: Option<g17_resources::G17PUserRenderStorage>,
+    tracker: Option<G17PPartialOpeningRenderTracker>,
+    bind: Option<G17PRenderRootOwner>,
+    context_aliases: Option<mmu::T8140NativeContextAliases>,
+    submission_ordinal: u32,
+    auxiliary_timestamp: u64,
+    hardware_buffer_id: Option<u32>,
+    hardware_buffer_published: bool,
+    sksm: Option<G17PRenderSksmQueues>,
+}
+
+#[cfg(not(test))]
+enum G17PRenderRootOwner {
+    Bootstrap(mmu::VmBind),
+    Job(Arc<mmu::T8140ComputeExecutionContext>),
+}
+
+#[cfg(not(test))]
+impl G17PRenderRootOwner {
+    fn matches(&self, vm: &mmu::Vm) -> bool {
+        match self {
+            Self::Bootstrap(bind) => bind.matches(vm),
+            Self::Job(context) => context.matches(vm),
+        }
+    }
+
+    fn root(&self) -> u64 {
+        match self {
+            Self::Bootstrap(bind) => bind.root(),
+            Self::Job(context) => context.root(),
+        }
+    }
+
+    fn vm_id(&self) -> u64 {
+        match self {
+            Self::Bootstrap(bind) => bind.vm_id(),
+            Self::Job(context) => context.vm_id(),
+        }
+    }
+
+    fn vm(&self) -> &mmu::Vm {
+        match self {
+            Self::Bootstrap(bind) => bind.vm(),
+            Self::Job(context) => context.vm(),
+        }
+    }
+
+    fn bootstrap(&self) -> Option<&mmu::VmBind> {
+        match self { Self::Bootstrap(bind) => Some(bind), Self::Job(_) => None }
+    }
+}
+
+#[cfg(not(test))]
+impl G17PRenderSlotState {
+    fn scheduler_active(&self) -> bool {
+        self.storage.is_some()
+            || self.tracker.is_some()
+            || self.bind.is_some()
+            || self.submission_ordinal != 0
+    }
 }
 
 /// A preallocated evidence buffer, not a live mapping exposed to readers.
@@ -1378,6 +1464,70 @@ pub(crate) enum G17PRenderPollOutcome {
 }
 
 impl G17PManagerConstruction {
+    fn take_active_render_slot_state(&mut self) -> G17PRenderSlotState {
+        G17PRenderSlotState {
+            #[cfg(CONFIG_DEV_COREDUMP)]
+            trace_capture: self.trace_capture.take(),
+            storage: self.render_storage.take(),
+            tracker: self.render_tracker.take(),
+            bind: self.render_bind.take(),
+            context_aliases: self.render_context_aliases.take(),
+            submission_ordinal: core::mem::take(&mut self.render_submission_ordinal),
+            auxiliary_timestamp: core::mem::take(&mut self.render_auxiliary_timestamp),
+            hardware_buffer_id: self.render_hardware_buffer_id.take(),
+            hardware_buffer_published: core::mem::take(&mut self.render_hardware_buffer_published),
+            sksm: self.render_sksm.take(),
+        }
+    }
+
+    fn install_active_render_slot_state(&mut self, state: G17PRenderSlotState) {
+        #[cfg(CONFIG_DEV_COREDUMP)]
+        {
+            self.trace_capture = state.trace_capture;
+        }
+        self.render_storage = state.storage;
+        self.render_tracker = state.tracker;
+        self.render_bind = state.bind;
+        self.render_context_aliases = state.context_aliases;
+        self.render_submission_ordinal = state.submission_ordinal;
+        self.render_auxiliary_timestamp = state.auxiliary_timestamp;
+        self.render_hardware_buffer_id = state.hardware_buffer_id;
+        self.render_hardware_buffer_published = state.hardware_buffer_published;
+        self.render_sksm = state.sksm;
+    }
+
+    /// Select one of the two bounded render owners without altering any
+    /// firmware-visible bytes.  All state reachable by a submitted TA/3D pair
+    /// moves together; the global outer rings and HardwareBufferID allocator
+    /// remain shared and are still published under the runtime mutex.
+    pub(crate) fn select_render_slot(&mut self, slot: u8) -> Result {
+        if slot >= g17_resources::G17PRenderQueuePair::SLOT_COUNT {
+            return Err(EINVAL);
+        }
+        if self.active_render_slot == slot {
+            return Ok(());
+        }
+        let current_slot = self.active_render_slot as usize;
+        if self.parked_render_slots[current_slot].is_some() {
+            return Err(EIO);
+        }
+        let current = self.take_active_render_slot_state();
+        self.parked_render_slots[current_slot] = Some(current);
+        let incoming = self.parked_render_slots[slot as usize]
+            .take()
+            .unwrap_or_default();
+        self.install_active_render_slot_state(incoming);
+        self.active_render_slot = slot;
+        Ok(())
+    }
+
+    fn parked_render_scheduler_active(&self) -> bool {
+        self.parked_render_slots
+            .iter()
+            .flatten()
+            .any(G17PRenderSlotState::scheduler_active)
+    }
+
     pub(crate) fn new(
         dev: &AsahiDevice,
         soc: &'static agx3::SocConfig,
@@ -1462,6 +1612,9 @@ impl G17PManagerConstruction {
                 render_sksm: None,
                 bootstrap_uma: None,
                 prepared_render_flist: None,
+                next_render_flist_sequence: G17P_BOOTSTRAP_UMA_SEQUENCE,
+                parked_render_slots: [None, None],
+                active_render_slot: 0,
                 accepted_firmware_recovery_generation: 0,
                 pending_primary_recovery: None,
                 pending_add_kicks: None,
@@ -1855,6 +2008,7 @@ impl G17PManagerConstruction {
             || self.render_tracker.is_some()
             || self.render_bind.is_some()
             || self.render_submission_ordinal != 0
+            || self.parked_render_scheduler_active()
     }
 
     pub(crate) fn validate_empty_primary_firmware_recovery_scheduler(&self) -> Result {
@@ -1862,6 +2016,7 @@ impl G17PManagerConstruction {
             || self.render_tracker.is_some()
             || self.render_bind.is_some()
             || self.render_submission_ordinal != 0
+            || self.parked_render_scheduler_active()
         {
             dev_err!(
                 self.resources.dev().as_ref(),
@@ -2014,6 +2169,8 @@ impl G17PManagerConstruction {
                 .new_user_render_storage(
                     dev,
                     &vm,
+                    g17_resources::G17PRenderQueuePair::for_slot(0).ok_or(EINVAL)?,
+                    None,
                     1,
                     &command,
                     self.num_clusters,
@@ -2045,14 +2202,14 @@ impl G17PManagerConstruction {
         self.resources
             .uat()
             .install_t8140_partial_opening_shared_render_roots(&binding)?;
-        self.render_bind = Some(binding);
+        self.render_bind = Some(G17PRenderRootOwner::Bootstrap(binding));
         Ok(vm)
     }
 
     /// Apply the measured post-opening context split after primary
     /// control-done and before either first-work producer becomes visible.
     pub(crate) fn split_compute_bootstrap_render_contexts(&self) -> Result {
-        let binding = self.render_bind.as_ref().ok_or(ENODEV)?;
+        let binding = self.render_bind.as_ref().and_then(G17PRenderRootOwner::bootstrap).ok_or(ENODEV)?;
         self.resources
             .uat()
             .split_t8140_partial_opening_render_roots(binding)?;
@@ -2077,7 +2234,7 @@ impl G17PManagerConstruction {
             return Err(EBUSY);
         }
         if !self.resources.uat().t8140_first_work_render_context_ready(
-            self.render_bind.as_ref().ok_or(ENODEV)?,
+            self.render_bind.as_ref().and_then(G17PRenderRootOwner::bootstrap).ok_or(ENODEV)?,
         ) {
             return Err(EFAULT);
         }
@@ -2095,6 +2252,7 @@ impl G17PManagerConstruction {
         let (prepared, render_bind) = self.resources.publish_partial_opening_pair(
             None,
             true,
+            g17_resources::G17PRenderQueuePair::for_slot(0).ok_or(EINVAL)?,
             g17_resources::G17PDeferredOuterPublication::None,
             fragment_queue,
             3,
@@ -2197,6 +2355,7 @@ impl G17PManagerConstruction {
         let mut lifecycle = self.prepared_render_flist.ok_or(EIO)?;
         lifecycle.retire_prepare_reference().map_err(|_| EIO)?;
         if lifecycle.request.is_none() {
+            self.next_render_flist_sequence = lifecycle.sequence.checked_add(1).ok_or(EOVERFLOW)?;
             self.bootstrap_uma = Some(lifecycle);
             self.prepared_render_flist = None;
             return Ok(None);
@@ -2224,6 +2383,7 @@ impl G17PManagerConstruction {
             .publish_primary_device_control_raw(&record)?;
         self.bootstrap_uma = Some(lifecycle);
         self.prepared_render_flist = None;
+        self.next_render_flist_sequence = G17P_BOOTSTRAP_UMA_SEQUENCE + 1;
         Ok(Some(publication))
     }
 
@@ -2263,7 +2423,7 @@ impl G17PManagerConstruction {
         let references = lifecycle.hardware_buffer_references;
         let pending = lifecycle.pending_release_count;
         match lifecycle.retire_render_references() {
-            Ok(release) => Ok(Some(release)),
+            Ok(release) => Ok(release),
             Err(error) => {
                 // This used to collapse every lifecycle state into a bare EIO,
                 // which is what the render now fails with AFTER its paired
@@ -2411,10 +2571,10 @@ impl G17PManagerConstruction {
             && context.render_low_root_present_at_first_work
             && !context.source_firmware_high_root_table_resident;
         let roots_ready = match self.render_bind.as_ref() {
-            Some(binding) => self
+            Some(binding) => binding.bootstrap().is_some_and(|binding| self
                 .resources
                 .uat()
-                .t8140_partial_opening_shared_render_context_ready(binding),
+                .t8140_partial_opening_shared_render_context_ready(binding)),
             None => self
                 .resources
                 .uat()
@@ -2486,6 +2646,7 @@ impl G17PManagerConstruction {
         let (prepared, render_bind) = self.resources.publish_partial_opening_pair(
             None,
             false,
+            g17_resources::G17PRenderQueuePair::for_slot(0).ok_or(EINVAL)?,
             g17_resources::G17PDeferredOuterPublication::None,
             submission.fragment_queue_gpu_va,
             submission.fragment_queue_write_index,
@@ -2599,6 +2760,22 @@ impl G17PManagerConstruction {
 
     /// Release one stopped firmware session without replacing its UAT owner.
     pub(crate) fn release_runtime_objects_after_processor_stop(&mut self) {
+        for parked in &mut self.parked_render_slots {
+            let Some(mut state) = parked.take() else { continue };
+            if let Some(id) = state.hardware_buffer_id.take() {
+                if let Err(error) = self.render_hardware_buffer_ids.release(id) {
+                    dev_warn!(
+                        self.resources.dev().as_ref(),
+                        "G17P render: failed to release parked TA HardwareBufferID {} after processor stop ({:?})\n",
+                        id,
+                        error,
+                    );
+                }
+            }
+            // Both firmware CPUs are stopped; dropping the complete state now
+            // retracts its command root before any reachable mapping backing.
+            drop(state);
+        }
         if let Some(id) = self.render_hardware_buffer_id.take() {
             match self.render_hardware_buffer_ids.release(id) {
                 Ok(()) => dev_info!(
@@ -2626,6 +2803,8 @@ impl G17PManagerConstruction {
         self.prepared_render_flist = None;
         self.render_submission_ordinal = 0;
         self.render_auxiliary_timestamp = 0;
+        self.next_render_flist_sequence = G17P_BOOTSTRAP_UMA_SEQUENCE;
+        self.active_render_slot = 0;
     }
 
     /// Restore cold initdata in the existing mappings after both CPUs stop.
@@ -2634,6 +2813,7 @@ impl G17PManagerConstruction {
             || self.render_tracker.is_some()
             || self.render_storage.is_some()
             || self.render_context_aliases.is_some()
+            || self.parked_render_scheduler_active()
         {
             return Err(EBUSY);
         }
@@ -2673,23 +2853,19 @@ impl G17PManagerConstruction {
         {
             return Err(EBUSY);
         }
-        if let Some(uma) = self.bootstrap_uma.as_ref() {
-            if uma.state != G17PBootstrapUmaRequestState::Completed
-                || uma.hardware_buffer_owned || uma.hardware_buffer_references != 0
-                || uma.pending_release_count != 0
-            {
-                return Err(EBUSY);
-            }
-        }
+        // The USC FList is a device-global refcounted pool. Another slot may
+        // legitimately retain its references after this slot's TA/3D pair is
+        // complete; those references do not keep this job's graph or VM alive.
         let snapshot = self.render_storage.as_mut().ok_or(ENODEV)?.snapshot()?;
         if !snapshot.job_list_empty || !snapshot.tiling.idle() || !snapshot.fragment.idle() {
             return Err(EBUSY);
         }
-        if !self.resources.partial_opening_outer_counters()?.iter()
-            .all(|c| c[0] == c[2] && c[1] == c[2])
-        {
-            return Err(EBUSY);
-        }
+        // Do not require the device-global outer channels to be empty here.
+        // This selected slot's paired completion already proved that its two
+        // queue items were consumed and its job list is idle.  A later outer
+        // item may legitimately belong to the other independently rooted
+        // slot; using its live producer as an idle condition reintroduced the
+        // full render/render lease at every cross-VM handoff.
         Ok(())
     }
 
@@ -2706,71 +2882,24 @@ impl G17PManagerConstruction {
         Ok(())
     }
 
-    /// Switch the one physical render context between independently owned
-    /// client VMs. The installed queues and native PB/TVB identities remain
-    /// retained; only idle context-0 views and context-1 roots change.
+    /// Retire one VM's job-private graph before another VM constructs its own
+    /// graph on the already-installed physical QID pair.  Queue producer state
+    /// and the monotonically increasing submission ordinal stay retained; no
+    /// global context-0 mapping is repointed.
     pub(crate) fn handoff_retained_render_vm(&mut self, vm: &mmu::Vm) -> Result {
         if self.render_storage.is_none() || !self.retained_render_has_other_owner(vm) {
             return Ok(());
         }
         self.require_retired_render_owner()?;
-        let storage = self.render_storage.as_mut().ok_or(ENODEV)?;
-        // A failed rollback may leave this retired graph temporarily unbound.
-        // Keep that state attachable: a later healthy client can retry without
-        // resetting firmware or losing the retained queue/pool bookkeeping.
-        let old_vm = self.render_bind.as_ref().map(|binding| binding.vm().clone());
         let old_root = self.render_bind.as_ref().map_or(0, |binding| binding.root());
-        // First-use allocation can fail without changing either active root.
-        // The cache owns only driver GEM aliases, never another client's BOs.
-        self.resources.cache_render_vm_mappings(storage, vm)?;
-
-        self.render_context_aliases = None;
-        let aliases = match self.resources.uat().install_t8140_native_context_aliases(vm) {
-            Ok(aliases) => aliases,
-            Err(error) => {
-                // All partial incoming aliases are RAII-owned by the helper.
-                // Restore A's restricted views while its original bind is live.
-                if let Some(old_vm) = old_vm.as_ref() {
-                    self.render_context_aliases = Some(
-                        self.resources.uat().install_t8140_native_context_aliases(old_vm)?);
-                }
-                return Err(error);
-            }
-        };
-        self.render_context_aliases = Some(aliases);
-
-        // App-context5+ holds a second VmBind. Both references must release
-        // before Uat.bind can replace the sole physical user slot (context1).
-        // It publishes the new TTBAT pair, TLBI-ASID1, and mem::sync before
-        // returning; native descriptor and tag15 context selectors stay1.
-        storage.release_client_context();
+        let old_vm_id = self.render_bind.as_ref().map_or(0, |binding| binding.vm_id());
+        self.render_storage.as_mut().ok_or(ENODEV)?.release_client_context();
         self.render_bind = None;
-        let incoming = self.resources.uat().bind(vm).and_then(|binding| {
-            let context = self.resources.uat().allocate_t8140_app_context(&binding)?;
-            Ok((binding, context))
-        });
-        let (binding, context) = match incoming {
-            Ok(incoming) => incoming,
-            Err(error) => {
-                self.render_context_aliases = None;
-                if let Some(old_vm) = old_vm.as_ref() {
-                    self.render_context_aliases = Some(
-                        self.resources.uat().install_t8140_native_context_aliases(old_vm)?);
-                    let binding = self.resources.uat().bind(old_vm)?;
-                    let context = self.resources.uat().allocate_t8140_app_context(&binding)?;
-                    storage.install_client_context(context);
-                    self.render_bind = Some(binding);
-                }
-                return Err(error);
-            }
-        };
-        let new_root = binding.root();
-        let vm_id = binding.vm_id();
-        storage.install_client_context(context);
-        self.render_bind = Some(binding);
+        self.render_context_aliases = None;
+        self.render_storage = None;
         dev_info!(self.resources.dev().as_ref(),
-            "G17P render VM handoff: context1 old-root={:#x} new-root={:#x} vm={} ordinal={} queues/PB retained; TLBI complete\n",
-            old_root, new_root, vm_id, self.render_submission_ordinal);
+            "G17P render VM handoff: retired job-private graph vm={} root={:#x}; incoming VM builds a new root at ordinal {}, QID producer state retained\n",
+            old_vm_id, old_root, self.render_submission_ordinal);
         Ok(())
     }
 
@@ -2802,16 +2931,20 @@ impl G17PManagerConstruction {
         error
     }
 
-    fn new_render_sksm_queues(&self) -> Result<G17PRenderSksmQueues> {
+    fn new_render_sksm_queues(
+        &self,
+        pair: g17_resources::G17PRenderQueuePair,
+        entry_low_vas: [u64; 2],
+    ) -> Result<G17PRenderSksmQueues> {
         const RENDER_COMPLETION_SELECTOR: u8 =
             g17_submission::G17P_NATIVE_RENDER_DOORBELL_PRIORITY;
         let geometry = self.sksm_queue_geometry();
         let scratch = self.sksm_scratch();
-        let build = |queue_id: u8, data_master: u32, tiling: bool| -> Result<G17PRenderSksmQueue> {
+        let build = |queue_id: u8, data_master: u32, tiling: bool, entry_gpu_va: u64| -> Result<G17PRenderSksmQueue> {
             let routing = g17_submission::G17PComputeQueueRouting {
                 queue_id,
                 completion_selector: RENDER_COMPLETION_SELECTOR as u32,
-                entry_gpu_va: g17_resources::G17ResourceOwner::render_sksm_entry_low_va(tiling),
+                entry_gpu_va,
                 geometry,
             };
             let config = g17_submission::prepare_g17p_render_sksm_queue_config(
@@ -2873,17 +3006,19 @@ impl G17PManagerConstruction {
             scratch,
             uat_owner: self.uat().ttb_base(),
             tiling: build(
-                g17_resources::g17p_render_queue_id(true) as u8,
+                pair.tiling as u8,
                 g17_submission::G17P_TA_DATA_MASTER,
                 true,
+                entry_low_vas[0],
             )?,
             fragment: build(
-                g17_resources::g17p_render_queue_id(false) as u8,
+                pair.fragment as u8,
                 match *crate::module_parameters::g17p_render_3d_dm.value() {
                     0xff => g17_submission::G17P_3D_DATA_MASTER,
                     other => other,
                 },
                 false,
+                entry_low_vas[1],
             )?,
         })
     }
@@ -2965,7 +3100,7 @@ impl G17PManagerConstruction {
                 .map_err(|_| Self::render_stage_fail("sksm-command-state", EINVAL))?
         };
 
-        let resources = &mut self.resources;
+        let storage = self.render_storage.as_mut().ok_or(ENODEV)?;
         let queues = self.render_sksm.as_mut().ok_or(ENODEV)?;
         if queues.scratch != scratch || queues.uat_owner != uat_owner {
             let scratch_differs = queues.scratch != scratch;
@@ -3015,8 +3150,8 @@ impl G17PManagerConstruction {
                 .map_err(|error| Self::render_stage_fail("sksm-configure-queue", error))?;
             queue.registered = true;
         }
-        resources
-            .write_render_sksm_entry(
+        storage
+            .write_sksm_entry(
                 tiling,
                 prepared.entry_offset as usize,
                 prepared.zero_length as usize,
@@ -3033,7 +3168,7 @@ impl G17PManagerConstruction {
             if tiling { "TA" } else { "3D" },
             queue.queue_id,
             prepared.entry_offset,
-            g17_resources::G17ResourceOwner::render_sksm_entry_low_va(tiling),
+            storage.sksm_entry_low_va(tiling),
             descriptor_high,
             descriptor_low,
             work_items[0],
@@ -3236,12 +3371,15 @@ impl G17PManagerConstruction {
         &mut self,
         dev: &AsahiDevice,
         vm: &mmu::Vm,
-        descriptor_context_id: u16,
+        queue_pair: g17_resources::G17PRenderQueuePair,
+        execution_context: Arc<mmu::T8140ComputeExecutionContext>,
         command: &g17_uapi::TranslatedRenderCommand,
         user_timestamps: [u64; 4],
         user_timestamp_aliases: KVec<mmu::KernelMapping>,
         registers: &regs::Resources,
     ) -> Result<g17_submission::PreparedG17PPartialOpeningWorkPair> {
+        self.select_render_slot(queue_pair.slot())?;
+        let descriptor_context_id = execution_context.context_id() as u16;
         if self.render_tracker.is_some() || self.render_hardware_buffer_id.is_some() {
             return Err(EBUSY);
         }
@@ -3271,6 +3409,8 @@ impl G17PManagerConstruction {
         let result = self.begin_translated_render_with_hardware_buffer(
             dev,
             vm,
+            queue_pair,
+            execution_context,
             descriptor_context_id,
             &command,
             parameter_buffer_token,
@@ -3295,6 +3435,8 @@ impl G17PManagerConstruction {
         &mut self,
         dev: &AsahiDevice,
         vm: &mmu::Vm,
+        queue_pair: g17_resources::G17PRenderQueuePair,
+        execution_context: Arc<mmu::T8140ComputeExecutionContext>,
         descriptor_context_id: u16,
         command: &g17_uapi::TranslatedRenderCommand,
         parameter_buffer_token: u64,
@@ -3329,9 +3471,7 @@ impl G17PManagerConstruction {
             if *crate::module_parameters::g17p_render_usc_freelist.value() != 0 {
                 Some(G17PBootstrapUmaLifecycle::acquire(
                     self.bootstrap_uma.as_ref(),
-                    u64::from(g17_submission::g17p_render_flist_generation(
-                        self.render_submission_ordinal,
-                    )),
+                    self.next_render_flist_sequence,
                 ).map_err(|_| EBUSY)?)
             } else {
                 None
@@ -3342,23 +3482,12 @@ impl G17PManagerConstruction {
         self.resources
             .stage_render_flist_state()
             .map_err(|error| Self::render_stage_fail("stage-render-flist", error))?;
-        match self.render_context_aliases.as_ref() {
-            Some(aliases) if aliases.matches(vm) => {}
-            Some(_) => {
-                // submit_translated_render must have recycled the old retained
-                // graph before a different/rebound VM can reach this point.
-                return Err(Self::render_stage_fail("context0-alias-owner", EBUSY));
-            }
-            None => {
-                self.render_context_aliases = Some(
-                    self.resources
-                        .uat()
-                        .install_t8140_native_context_aliases(vm)
-                        .map_err(|error| {
-                            Self::render_stage_fail("context0-native-aliases", error)
-                        })?,
-                );
-            }
+        // The render storage owns the complete SecureGart low-view closure in
+        // its application-GART root.  User work must never repoint the global
+        // context-0 lower VM; that singleton was the fundamental cross-client
+        // exclusion and made a second independently rooted render impossible.
+        if self.render_context_aliases.is_some() {
+            return Err(Self::render_stage_fail("legacy-context0-alias-live", EBUSY));
         }
         let retained = self.render_storage.is_some();
         // Which construction path a render takes has never been logged, and a
@@ -3399,7 +3528,7 @@ impl G17PManagerConstruction {
                     command,
                     self.num_clusters,
                     user_timestamps,
-                    user_timestamp_aliases,
+                    Some(user_timestamp_aliases),
                     self.render_submission_ordinal,
                 )
                 .map_err(|error| Self::render_stage_fail("restage-command", error))?;
@@ -3408,7 +3537,7 @@ impl G17PManagerConstruction {
             // them to cold values when preparing another Scene. The cold
             // new_user_render_storage path below still initializes them.
         } else {
-            if self.render_submission_ordinal != 0 || self.render_bind.is_some() {
+            if self.render_bind.is_some() {
                 return Err(EIO);
             }
             self.render_storage = Some(
@@ -3416,6 +3545,8 @@ impl G17PManagerConstruction {
                     .new_user_render_storage(
                         dev,
                         vm,
+                        queue_pair,
+                        Some(execution_context.clone()),
                         descriptor_context_id,
                         command,
                         self.num_clusters,
@@ -3424,6 +3555,25 @@ impl G17PManagerConstruction {
                     )
                     .map_err(|error| Self::render_stage_fail("new-user-render-storage", error))?,
             );
+            if self.render_submission_ordinal != 0 {
+                let parameter_page_list_vas = self.resources.parameter_buffer_page_list_vas();
+                self.render_storage
+                    .as_mut()
+                    .ok_or(ENODEV)?
+                    .restage_command(
+                        dev,
+                        self.resources.uat(),
+                        vm,
+                        descriptor_context_id,
+                        parameter_page_list_vas,
+                        command,
+                        self.num_clusters,
+                        user_timestamps,
+                        None,
+                        self.render_submission_ordinal,
+                    )
+                    .map_err(|error| Self::render_stage_fail("restage-new-vm-command", error))?;
+            }
         }
         {
             let storage = self.render_storage.as_mut().ok_or(ENODEV)?;
@@ -3441,8 +3591,15 @@ impl G17PManagerConstruction {
             }
         }
         if render_sksm != 0 && self.render_sksm.is_none() {
+            let (pair, entry_low_vas) = {
+                let storage = self.render_storage.as_ref().ok_or(ENODEV)?;
+                (
+                    storage.queue_pair(),
+                    [storage.sksm_entry_low_va(true), storage.sksm_entry_low_va(false)],
+                )
+            };
             self.render_sksm = Some(
-                self.new_render_sksm_queues()
+                self.new_render_sksm_queues(pair, entry_low_vas)
                     .map_err(|error| Self::render_stage_fail("new-render-sksm-queues", error))?,
             );
         }
@@ -3558,8 +3715,9 @@ impl G17PManagerConstruction {
         let (prepared, render_bind) = self
             .resources
             .publish_partial_opening_pair(
-                if retained { None } else { Some(vm) },
-                retained,
+                None,
+                true,
+                queue_pair,
                 g17p_render_deferred_outer_mode(native_doorbell_mode, split_launch),
                 fragment_queue,
                 published_prefix,
@@ -3592,9 +3750,10 @@ impl G17PManagerConstruction {
                 return Err(Self::render_stage_fail("retained-bind-unexpected", EINVAL));
             }
         } else {
-            self.render_bind = Some(
-                render_bind.ok_or_else(|| Self::render_stage_fail("fresh-bind-missing", EINVAL))?,
-            );
+            if render_bind.is_some() {
+                return Err(Self::render_stage_fail("job-bind-unexpected", EINVAL));
+            }
+            self.render_bind = Some(G17PRenderRootOwner::Job(execution_context));
         }
         let roots = self.resources.uat().t8140_compute_context_roots();
         dev_info!(
@@ -3648,7 +3807,7 @@ impl G17PManagerConstruction {
         self.render_storage
             .as_mut()
             .ok_or(ENODEV)?
-            .audit_fragment_rce_mapping(dev, self.resources.uat().kernel_lower_vm())
+            .audit_fragment_rce_mapping(dev, vm)
             .map_err(|error| Self::render_stage_fail("fragment-rce-vm-audit", error))?;
         if g17p_native_fragment_first_mode(native_doorbell_mode) {
             fence(Ordering::Acquire);
@@ -3798,16 +3957,16 @@ impl G17PManagerConstruction {
             // is never released. Dump that window of the tiling record.
             storage.dump_descriptor_region(&dumpdev, "link-TA", label, 0x0780, 0x40);
         }
-        self.resources.dump_render_sksm_entry(true, label);
-        self.resources.dump_render_sksm_entry(false, label);
-        self.resources.log_render_sksm_entry(true, label, 0);
-        self.resources.log_render_sksm_entry(true, label, strides[0]);
-        self.resources
-            .log_render_sksm_entry(true, label, strides[0] + 0x120);
-        self.resources.log_render_sksm_entry(false, label, 0);
-        self.resources.log_render_sksm_entry(false, label, strides[1]);
-        self.resources
-            .log_render_sksm_entry(false, label, strides[1] + 0x120);
+        if let Some(storage) = self.render_storage.as_mut() {
+            storage.dump_sksm_entry(&dumpdev, true, label);
+            storage.dump_sksm_entry(&dumpdev, false, label);
+            storage.log_sksm_entry(&dumpdev, true, label, 0);
+            storage.log_sksm_entry(&dumpdev, true, label, strides[0]);
+            storage.log_sksm_entry(&dumpdev, true, label, strides[0] + 0x120);
+            storage.log_sksm_entry(&dumpdev, false, label, 0);
+            storage.log_sksm_entry(&dumpdev, false, label, strides[1]);
+            storage.log_sksm_entry(&dumpdev, false, label, strides[1] + 0x120);
+        }
     }
 
     pub(crate) fn log_render_status_pages(&mut self, label: &str) {
@@ -4708,11 +4867,14 @@ impl G17PManagerConstruction {
                 {
                     let (vm_id, root) = self.render_bind.as_ref()
                         .map_or((0, 0), |binding| (binding.vm_id(), binding.root()));
+                    let fallback_pair = self.render_storage
+                        .as_ref()
+                        .map(g17_resources::G17PUserRenderStorage::queue_pair)
+                        .unwrap_or(g17_resources::G17PRenderQueuePair::for_slot(
+                            self.active_render_slot,
+                        ).ok_or(EINVAL)?);
                     let (tiling_qid, fragment_qid) = self.render_sksm.as_ref()
-                        .map_or((
-                            g17_resources::g17p_render_queue_id(true),
-                            g17_resources::g17p_render_queue_id(false),
-                        ), |queues| (
+                        .map_or((fallback_pair.tiling, fallback_pair.fragment), |queues| (
                             u16::from(queues.tiling.queue_id),
                             u16::from(queues.fragment.queue_id),
                         ));
@@ -6915,7 +7077,7 @@ mod tests {
         assert_eq!(lifecycle.hardware_buffer_references, 2);
         assert_eq!(lifecycle.pending_release_count, 2);
         assert_eq!(lifecycle.pending_release(), None);
-        let release = lifecycle.retire_render_references().unwrap();
+        let release = lifecycle.retire_render_references().unwrap().unwrap();
         assert_eq!(
             release,
             G17PBootstrapUmaRelease {
@@ -6945,7 +7107,7 @@ mod tests {
             lifecycle
                 .match_completion(lifecycle.request.unwrap())
                 .unwrap();
-            let release = lifecycle.retire_render_references().unwrap();
+            let release = lifecycle.retire_render_references().unwrap().unwrap();
             lifecycle.mark_published(release).unwrap();
             lifecycle.mark_sent(target).unwrap();
             lifecycle
@@ -6998,6 +7160,24 @@ mod tests {
     }
 
     #[test]
+    fn shared_flist_holds_both_render_pairs_until_the_last_retirement() {
+        let mut first = G17PBootstrapUmaLifecycle::new();
+        first.retire_prepare_reference().unwrap();
+        first.match_completion(first.request.unwrap()).unwrap();
+        assert_eq!((first.hardware_buffer_references, first.pending_release_count), (2, 2));
+
+        let mut both = G17PBootstrapUmaLifecycle::acquire(Some(&first), 1).unwrap();
+        assert_eq!((both.hardware_buffer_references, both.pending_release_count), (5, 4));
+        both.retire_prepare_reference().unwrap();
+        assert_eq!((both.hardware_buffer_references, both.pending_release_count), (4, 4));
+        assert_eq!(both.retire_render_references().unwrap(), None);
+        assert_eq!((both.hardware_buffer_references, both.pending_release_count), (2, 2));
+        let release = both.retire_render_references().unwrap().unwrap();
+        assert_eq!(release.sequence, 1);
+        assert_eq!((both.hardware_buffer_references, both.pending_release_count), (0, 0));
+    }
+
+    #[test]
     fn retained_flist_leases_grow_once_and_release_every_captured_generation() {
         let mut previous = None;
         let mut grows = 0;
@@ -7017,7 +7197,7 @@ mod tests {
             }
             assert_eq!(lease.state, G17PBootstrapUmaRequestState::Ready);
             assert!(lease.retire_prepare_reference().is_err());
-            let release = lease.retire_render_references().unwrap();
+            let release = lease.retire_render_references().unwrap().unwrap();
             releases += 1;
             assert_eq!(release.sequence, sequence);
             assert_eq!(release.hardware_buffer_id, G17P_BOOTSTRAP_UMA_HARDWARE_BUFFER_ID);
