@@ -551,6 +551,15 @@ impl G17PRenderQueuePair {
 
     pub(crate) const fn slot(self) -> u8 { (self.tiling / 2) as u8 }
 
+    /// Queue-lifetime AGXQOSQueue HardwareBufferID. Native TA/3D partners
+    /// share one ID and independently retained pairs use different IDs.
+    /// QID4 compute already owns ID 1, so keep render pair 0 on its proven ID
+    /// 0 and allocate later pairs above the compute reservation.
+    pub(crate) const fn qos_hardware_buffer_id(self) -> u8 {
+        let slot = self.slot();
+        if slot == 0 { 0 } else { slot + 1 }
+    }
+
     const fn record_offset(self, tiling: bool) -> usize {
         self.queue_id(tiling) as usize * G17P_RENDER_QUEUE_RECORD_SIZE
     }
@@ -562,6 +571,11 @@ impl G17PRenderQueuePair {
 }
 
 const _: () = assert!(G17PRenderQueuePair::for_slot(1).unwrap().fragment == 3);
+const _: () = assert!(
+    G17PRenderQueuePair::for_slot(0).unwrap().qos_hardware_buffer_id()
+        != G17PRenderQueuePair::for_slot(1).unwrap().qos_hardware_buffer_id()
+);
+const _: () = assert!(G17PRenderQueuePair::for_slot(1).unwrap().qos_hardware_buffer_id() == 2);
 const _: () = assert!(
     G17PRenderQueuePair::for_slot(1).unwrap().record_offset(false)
         + G17P_RENDER_QUEUE_RECORD_SIZE
@@ -3447,6 +3461,7 @@ fn build_g17p_late_tiling_bytes(
         g17p_render_generation_bias_enabled(),
         queue_pair.tiling,
         queue_pair.fragment,
+        queue_pair.qos_hardware_buffer_id() as u16,
         g17p_render_install(true),
         ta_tag15_context_id,
         &mut bytes.optional,
@@ -7988,6 +8003,7 @@ impl G17PUserRenderStorage {
                 g17p_render_generation_bias_enabled(),
                 self.queue_pair.fragment,
                 self.queue_pair.tiling,
+                self.queue_pair.qos_hardware_buffer_id() as u16,
                 g17p_render_install(false),
                 self.descriptor_context_id,
                 &mut raw[optional_offset
@@ -8329,6 +8345,7 @@ impl G17PUserRenderStorage {
                 g17p_render_generation_bias_enabled(),
                 self.queue_pair.fragment,
                 self.queue_pair.tiling,
+                self.queue_pair.qos_hardware_buffer_id() as u16,
                 g17p_render_install(false),
                 self.descriptor_context_id,
                 &mut raw[optional_offset

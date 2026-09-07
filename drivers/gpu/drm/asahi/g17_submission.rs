@@ -1556,6 +1556,7 @@ pub(crate) fn apply_g17p_cold_opening_optional(
     addresses: G17PColdOpeningOptionalAddresses,
     queue_id: u16,
     partner_queue_id: u16,
+    qos_hardware_buffer_id: u16,
     install: u16,
     context_id: u16,
     out: &mut [u8],
@@ -1574,10 +1575,10 @@ pub(crate) fn apply_g17p_cold_opening_optional(
         put_u64_le(out, offset, address);
     }
     let fields: &[(usize, u16)] = match stage {
-        // +0x56 is the dynamically allocated AGXQOSQueue HardwareBufferID.
-        // Native captures contain 1, 2 and 4. Linux reserves slot 2 and must
-        // publish that same ID in ConfigUpdate, the qid*8 QoS record and the
-        // KSM dependency-control qword.
+        // +0x56 is the AGXQOSQueue HardwareBufferID. Native gives each
+        // retained TA/3D pair one ID (both stages share it), while different
+        // pairs carry different IDs. It must match both the qid*8 QoS record
+        // and the KSM dependency-control qword.
         // Byte-diffed against live ConfigUpdate records from two independent
         // Metal render passes on the target (macOS 2026-09-02,
         // `records-gfx.txt` and `everyobj-gfx.txt`):
@@ -1597,7 +1598,7 @@ pub(crate) fn apply_g17p_cold_opening_optional(
             (0x1e, G17P_NATIVE_RENDER_DOORBELL_PRIORITY as u16),
             (0x26, 1),
             (0x52, 1),
-            (0x56, G17P_NATIVE_RENDER_QOS_HARDWARE_BUFFER_ID as u16),
+            (0x56, qos_hardware_buffer_id),
             (0x5e, G17P_NATIVE_RENDER_POLICY),
             (0x62, 1),
             (0x66, 1),
@@ -1618,7 +1619,7 @@ pub(crate) fn apply_g17p_cold_opening_optional(
             (0x22, 1),
             (0x26, 1),
             (0x52, 1),
-            (0x56, G17P_NATIVE_RENDER_QOS_HARDWARE_BUFFER_ID as u16),
+            (0x56, qos_hardware_buffer_id),
             (0x5e, G17P_NATIVE_RENDER_POLICY),
             (0x62, 1),
             (0x66, 1),
@@ -1701,6 +1702,7 @@ pub(crate) fn apply_g17p_retained_optional(
     bias_generation: bool,
     queue_id: u16,
     partner_queue_id: u16,
+    qos_hardware_buffer_id: u16,
     install: u16,
     context_id: u16,
     out: &mut [u8],
@@ -1716,6 +1718,7 @@ pub(crate) fn apply_g17p_retained_optional(
         addresses,
         queue_id,
         partner_queue_id,
+        qos_hardware_buffer_id,
         install,
         context_id,
         out,
@@ -1764,13 +1767,9 @@ pub(crate) fn apply_g17p_retained_optional(
     // The kext uses a qword store at 8a98c48; +0x46 begins the independent
     // hardware-buffer ID and must remain untouched by this generation.
     put_u64_le(out, 0x3e, g17p_render_flist_generation(submission_ordinal));
-    // Keep the selected profile's HardwareBufferID identical in ConfigUpdate,
-    // the QID-indexed QoS row, and the KSM dependency-control qword.
-    put_u16_le(
-        out,
-        0x56,
-        G17P_NATIVE_RENDER_QOS_HARDWARE_BUFFER_ID as u16,
-    );
+    // Keep the pair-owned HardwareBufferID identical in ConfigUpdate, the
+    // QID-indexed QoS row, and the KSM dependency-control qword.
+    put_u16_le(out, 0x56, qos_hardware_buffer_id);
     // TA +0x76 is not the submission ordinal. Native copies the u64 at
     // AGXHardwareBufferBase +0x68 here. The cold encoder above copies the
     // captured PB owner lease token; leave it intact when refreshing queue
@@ -5342,7 +5341,16 @@ mod tests {
         let supplied = 0x70_0200_0000..0x70_0202_0000;
         for stage in [G17PColdOpeningStage::Tiling, G17PColdOpeningStage::Fragment] {
             let mut optional = [0u8; G17P_COLD_OPENING_OPTIONAL_SIZE];
-            apply_g17p_cold_opening_optional(stage, optional_addresses, 0, 0, 1, 1, &mut optional)
+            apply_g17p_cold_opening_optional(
+                stage,
+                optional_addresses,
+                0,
+                0,
+                0,
+                1,
+                1,
+                &mut optional,
+            )
                 .unwrap();
             assert_eq!(get_u32_le(&optional, 0), 0x0f);
             for offset in [0x08, 0x10, 0x36, 0x4a] {
@@ -5977,12 +5985,15 @@ mod tests {
                     false,
                     0,
                     1,
+                    5,
+                    1,
                     context_id,
                     &mut optional,
                 )
                 .unwrap();
                 assert_eq!(get_u16_le(&optional, 0x32), context_id);
                 assert_eq!(get_u32_le(&optional, 0x46), 5);
+                assert_eq!(get_u16_le(&optional, 0x56), 5);
                 assert_eq!(get_u32_le(&optional, 0x5a), 0x625);
                 assert_eq!(
                     get_u32_le(&optional, 0x7e),
@@ -6011,7 +6022,18 @@ mod tests {
         };
         for stage in [G17PColdOpeningStage::Tiling, G17PColdOpeningStage::Fragment] {
             let mut optional = [0u8; G17P_COLD_OPENING_OPTIONAL_SIZE];
-            apply_g17p_retained_optional(stage, addresses, 1, false, 0, 0, 1, 1, &mut optional)
+            apply_g17p_retained_optional(
+                stage,
+                addresses,
+                1,
+                false,
+                0,
+                0,
+                0,
+                1,
+                1,
+                &mut optional,
+            )
                 .unwrap();
             assert_eq!(get_u16_le(&optional, 0x1a), 0);
             assert_eq!(get_u16_le(&optional, 0x2a), 1);

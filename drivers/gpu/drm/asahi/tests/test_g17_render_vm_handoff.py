@@ -54,7 +54,14 @@ assert "g17p_render_queue_id(" not in outer
 late_tiling = function(resources, "fn build_g17p_late_tiling_bytes(")
 assert "queue_pair.tiling" in late_tiling
 assert "queue_pair.fragment" in late_tiling
+assert "queue_pair.qos_hardware_buffer_id()" in late_tiling
 assert "g17p_render_queue_id(" not in late_tiling
+
+stage_fragment = function(resources, "pub(crate) fn stage_fragment(")
+assert "self.queue_pair.qos_hardware_buffer_id()" in stage_fragment
+new_sksm = function(manager, "fn new_render_sksm_queues(")
+assert "pair.qos_hardware_buffer_id()" in new_sksm
+assert "G17P_NATIVE_RENDER_QOS_HARDWARE_BUFFER_ID" not in new_sksm
 
 submit = function(runtime, "pub(crate) fn submit_translated_render(")
 assert "select_render_slot(render_slot)?" in submit
