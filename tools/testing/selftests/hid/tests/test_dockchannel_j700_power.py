@@ -22,7 +22,7 @@ class J700PowerTest(unittest.TestCase):
         constants = "\n".join(
             line for line in source.splitlines()
             if re.match(
-                r"#define (CMD_RESET_INTERFACE|DCHID_POWER_|DCHID_AFE_|DCHID_IPD_)\w*\s",
+                r"#define (CMD_SET_POWER|DCHID_POWER_|DCHID_AFE_|DCHID_IPD_)\w*\s",
                 line,
             )
         )
@@ -67,6 +67,7 @@ static void dchid_test_log(const void *dev, const char *fmt, ...) {
 #define dev_warn(dev, ...) dchid_test_log(dev, __VA_ARGS__)
 static bool ipd_reset_sequence = true;
 static bool ipd_reset_write = true;
+static int power_method = -1;
 /* Defaults asserted against the personality constants in main(). */
 static int afe_enable_level = 0;
 static int afe_disable_level = 1;
@@ -139,6 +140,7 @@ static void reset_capture(void) {
     sent_count = 0; fail_at = -1; slept_us = 0; trace_len = 0; gpio_fail = 0;
     smc_present = 1; smc_fail = 0; smc_value = 1; afe_level = 1;
     ipd_reset_sequence = true; ipd_reset_write = true;
+    power_method = -1;
     afe_enable_level = 0; afe_disable_level = 1;
 }
 '''
@@ -155,7 +157,7 @@ int main(void) {
 
     /* Non-J700 platforms keep the legacy single-message form and no platform work. */
     reset_capture();
-    assert(dchid_reset_interface(&touch, 2) == 4);
+    assert(dchid_reset_interface(&touch, 2, true) == 4);
     assert(sent_count == 1 && sent_size[0] == 4 && slept_us == 0);
     assert(memcmp(sent[0], (u8[]){0x40, 1, 3, 2}, 4) == 0);
     assert(trace_len == 0);
@@ -167,7 +169,7 @@ int main(void) {
      * gP13 supply and holds it for the personality's 50 ms.
      */
     reset_capture();
-    assert(dchid_reset_interface(&touch, DCHID_POWER_STATE_OFF) == 9);
+    assert(dchid_reset_interface(&touch, DCHID_POWER_STATE_OFF, true) == 9);
     assert(sent_count == 2 && sent_size[0] == 9 && sent_size[1] == 9);
     assert(slept_us == DCHID_AFE_RESET_DISABLE_DELAY_US);
     assert(strcmp(trace, "wP1h") == 0);
@@ -179,7 +181,7 @@ int main(void) {
      * reset and waits the personality's 100 ms before has-changed.
      */
     reset_capture();
-    assert(dchid_reset_interface(&touch, DCHID_POWER_STATE_ON) == 9);
+    assert(dchid_reset_interface(&touch, DCHID_POWER_STATE_ON, true) == 9);
     assert(sent_count == 2);
     assert(slept_us == DCHID_IPD_RESET_ENABLE_DELAY_US);
     assert(strcmp(trace, "w0ph") == 0);
@@ -196,32 +198,32 @@ int main(void) {
 
     /* Inverting them swaps only the driven levels, not the order or the delays. */
     reset_capture(); afe_enable_level = 1; afe_disable_level = 0;
-    assert(dchid_reset_interface(&touch, DCHID_POWER_STATE_ON) == 9);
+    assert(dchid_reset_interface(&touch, DCHID_POWER_STATE_ON, true) == 9);
     assert(strcmp(trace, "w1ph") == 0);
     assert(slept_us == DCHID_IPD_RESET_ENABLE_DELAY_US);
     reset_capture(); afe_enable_level = 1; afe_disable_level = 0;
-    assert(dchid_reset_interface(&touch, DCHID_POWER_STATE_OFF) == 9);
+    assert(dchid_reset_interface(&touch, DCHID_POWER_STATE_OFF, true) == 9);
     assert(strcmp(trace, "wP0h") == 0);
     assert(slept_us == DCHID_AFE_RESET_DISABLE_DELAY_US);
 
     /* Out-of-range levels are clamped rather than passed through. */
     reset_capture(); afe_enable_level = 7;
-    assert(dchid_reset_interface(&touch, DCHID_POWER_STATE_ON) == 9);
+    assert(dchid_reset_interface(&touch, DCHID_POWER_STATE_ON, true) == 9);
     assert(strcmp(trace, "w1ph") == 0);
 
     /* A failed will-change never touches the platform. */
     reset_capture(); fail_at = 0;
-    assert(dchid_reset_interface(&touch, DCHID_POWER_STATE_OFF) == -5);
+    assert(dchid_reset_interface(&touch, DCHID_POWER_STATE_OFF, true) == -5);
     assert(sent_count == 1 && strcmp(trace, "w") == 0);
 
     /* A failed supply write aborts before has-changed. */
     reset_capture(); gpio_fail = 1;
-    assert(dchid_reset_interface(&touch, DCHID_POWER_STATE_ON) == -5);
+    assert(dchid_reset_interface(&touch, DCHID_POWER_STATE_ON, true) == -5);
     assert(sent_count == 1 && slept_us == 0 && strcmp(trace, "w") == 0);
 
     /* A missing supply line fails closed rather than half-completing. */
     reset_capture(); touch.afe_reset = NULL;
-    assert(dchid_reset_interface(&touch, DCHID_POWER_STATE_ON) == -ENODEV);
+    assert(dchid_reset_interface(&touch, DCHID_POWER_STATE_ON, true) == -ENODEV);
     assert(sent_count == 1 && strcmp(trace, "w") == 0);
     touch.afe_reset = afe;
 
@@ -230,38 +232,38 @@ int main(void) {
      * applies the reset-sequence delay, so the boot still yields MTP's verdict.
      */
     reset_capture(); smc_present = 0;
-    assert(dchid_reset_interface(&touch, DCHID_POWER_STATE_ON) == 9);
+    assert(dchid_reset_interface(&touch, DCHID_POWER_STATE_ON, true) == 9);
     assert(sent_count == 2 && slept_us == DCHID_IPD_RESET_ENABLE_DELAY_US);
     assert(strcmp(trace, "w0h") == 0);
 
     /* A failing SMC write is likewise reported but not fatal. */
     reset_capture(); smc_fail = 1;
-    assert(dchid_reset_interface(&touch, DCHID_POWER_STATE_ON) == 9);
+    assert(dchid_reset_interface(&touch, DCHID_POWER_STATE_ON, true) == 9);
     assert(sent_count == 2 && strcmp(trace, "w0h") == 0);
 
     /* ipd_reset_write=0 keeps the delay and drops only the key write. */
     reset_capture(); ipd_reset_write = false;
-    assert(dchid_reset_interface(&touch, DCHID_POWER_STATE_ON) == 9);
+    assert(dchid_reset_interface(&touch, DCHID_POWER_STATE_ON, true) == 9);
     assert(slept_us == DCHID_IPD_RESET_ENABLE_DELAY_US);
     assert(strcmp(trace, "w0h") == 0);
 
     /* ipd_reset_sequence=0 restores the supply-only behaviour exactly. */
     reset_capture(); ipd_reset_sequence = false;
-    assert(dchid_reset_interface(&touch, DCHID_POWER_STATE_ON) == 9);
+    assert(dchid_reset_interface(&touch, DCHID_POWER_STATE_ON, true) == 9);
     assert(slept_us == 0 && strcmp(trace, "w0h") == 0);
     reset_capture(); ipd_reset_sequence = false;
-    assert(dchid_reset_interface(&touch, DCHID_POWER_STATE_OFF) == 9);
+    assert(dchid_reset_interface(&touch, DCHID_POWER_STATE_OFF, true) == 9);
     assert(slept_us == DCHID_AFE_RESET_DISABLE_DELAY_US);
     assert(strcmp(trace, "w1h") == 0);
 
     /* Other firmware and other interfaces keep the legacy behaviour. */
     child.firmware = "apple/tpmtfw-other.bin"; reset_capture();
-    assert(dchid_reset_interface(&touch, 2) == 4);
+    assert(dchid_reset_interface(&touch, 2, true) == 4);
     assert(sent_count == 1 && sent_size[0] == 4 && trace_len == 0);
 
     child.firmware = "apple/tpmtfw-j700.bin";
     touch.name = "keyboard"; reset_capture();
-    assert(dchid_reset_interface(&touch, 2) == 4);
+    assert(dchid_reset_interface(&touch, 2, true) == 4);
     assert(sent_count == 1 && sent_size[0] == 4 && trace_len == 0);
     return 0;
 }
