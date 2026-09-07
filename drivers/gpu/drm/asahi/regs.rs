@@ -937,7 +937,7 @@ impl Resources {
         &self,
         pair: g17_submission::G17SksmOrderedWritePair,
         enable_pair: g17_submission::G17SksmOrderedWritePair,
-    ) -> Result {
+    ) -> Result<bool> {
         if !Self::g17p_sksm_pair_fits(pair)
             || !Self::g17p_sksm_pair_fits(enable_pair)
             || enable_pair.word0 | enable_pair.word1 == 0
@@ -956,12 +956,13 @@ impl Resources {
             );
             self.stash_deferred_sksm_pair(pair);
             self.stash_deferred_sksm_pair(enable_pair);
-            return Ok(());
+            return Ok(false);
         }
         let _guard = self.sksm_fifo.lock();
         let sgx = self.sgx.try_access().ok_or(ENODEV)?;
         Self::g17p_sksm_publish_locked(&sgx, pair)?;
-        Self::g17p_sksm_publish_locked(&sgx, enable_pair)
+        Self::g17p_sksm_publish_locked(&sgx, enable_pair)?;
+        Ok(true)
     }
 
     fn sgx_read32<const OFF: usize>(&self) -> u32 {

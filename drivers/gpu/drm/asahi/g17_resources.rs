@@ -6901,6 +6901,30 @@ impl G17PUserRenderStorage {
         self.render_root_slot
     }
 
+    /// Read the context IDs from the TA and 3D descriptors actually staged
+    /// for the current ordinal. This is deliberately a byte readback rather
+    /// than the host-side value passed to the builder: the former is what the
+    /// firmware consumes.
+    pub(crate) fn descriptor_context_ids(&mut self) -> Result<[u32; 2]> {
+        let ta = g17p_render_ta_descriptor_offset(self.descriptor_ordinal);
+        let fragment = g17p_render_3d_descriptor_offset(self.descriptor_ordinal);
+        let mut contexts = [0; 2];
+        self.descriptors.with_bytes_mut(|raw| {
+            for (context, base) in contexts.iter_mut().zip([ta, fragment]) {
+                let at = base.checked_add(0x0c).ok_or(EOVERFLOW)?;
+                *context = u32::from_le_bytes(
+                    raw.get(at..at + 4)
+                        .ok_or(ERANGE)?
+                        .try_into()
+                        .map_err(|_| ERANGE)?,
+                );
+            }
+            Ok(())
+        })?;
+        core::sync::atomic::fence(Ordering::Acquire);
+        Ok(contexts)
+    }
+
     pub(crate) fn tvb_capacity(&self) -> usize {
         self.render_tvb.as_ref().map_or(0, |tvb| tvb.block_count)
     }
