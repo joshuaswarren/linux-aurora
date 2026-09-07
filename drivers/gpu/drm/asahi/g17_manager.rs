@@ -5541,6 +5541,17 @@ impl G17PManagerConstruction {
                 state.fragment_timestamps[1],
             );
         }
+        // What the firmware keeps in the per-queue stamp lanes both pairs'
+        // records point at. A second pair whose lanes still read as the first
+        // pair's is the measured retire-without-executing shape.
+        if let Ok(lanes) = self.resources.render_stamp_lanes() {
+            dev_err!(
+                self.resources.dev().as_ref(),
+                "G17P render: stamp lanes at timeout A(qid0..3)={:#x?} B(qid0..3)={:#x?}\n",
+                lanes[0],
+                lanes[1],
+            );
+        }
         match self
             .render_storage
             .as_mut()
