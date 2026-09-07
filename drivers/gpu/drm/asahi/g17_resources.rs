@@ -3148,6 +3148,12 @@ pub(crate) struct G17PUserRenderStorage {
     parameter_management: Option<G17PParameterManagement>,
     /// Captured by the TA HardwareBufferID lease allocator, not the submit ordinal.
     parameter_buffer_token: u64,
+    /// USC FList generation the next staged group publishes at tag-15 `+0x3e`.
+    ///
+    /// The FList is one device-global pool. The manager sets this from the
+    /// FList lifecycle sequence the submission acquired; until it does, it is
+    /// the per-slot ordinal, which is the same number while one client renders.
+    flist_generation: u64,
     /// Stable client-root PDM mapping; dropped before its fixed high owner.
     fragment_status_low: G17PRenderClientAlias,
     /// Standalone native status page at 0xfffffc2001630000. Native maps this
@@ -3512,6 +3518,7 @@ fn build_g17p_late_tiling_bytes(
     optional_addresses: g17_submission::G17PColdOpeningOptionalAddresses,
     ta_tag15_context_id: u16,
     submission_ordinal: u32,
+    flist_generation: u64,
     entry_stamp: u32,
     tag16: bool,
     native_pool_a_first_record: bool,
@@ -3566,10 +3573,11 @@ fn build_g17p_late_tiling_bytes(
             &mut bytes.entry_signal,
         )?;
     }
-    g17_submission::apply_g17p_retained_optional(
+    g17_submission::apply_g17p_retained_optional_with_flist_generation(
         g17_submission::G17PColdOpeningStage::Tiling,
         optional_addresses,
         submission_ordinal,
+        flist_generation,
         g17p_render_generation_bias_enabled(),
         queue_pair.tiling,
         queue_pair.fragment,
@@ -6858,6 +6866,7 @@ impl G17PUserRenderStorage {
             discard,
             parameter_management,
             parameter_buffer_token: 0,
+            flist_generation: g17_submission::g17p_render_flist_generation(submission_ordinal),
             fragment_status_low: fragment_status_low_info,
             fragment_status,
             timestamps,
@@ -7600,6 +7609,7 @@ impl G17PUserRenderStorage {
         self.fragment_mcache = fragment_mcache;
         self.ta_hardware_buffer_id = translated.parameters.ta_hardware_buffer_id;
         self.descriptor_ordinal = submission_ordinal;
+        self.flist_generation = g17_submission::g17p_render_flist_generation(submission_ordinal);
         self.descriptor_context_id = descriptor_context_id;
         drop(old_aliases);
         drop(old_timestamps);
@@ -8429,6 +8439,22 @@ impl G17PUserRenderStorage {
         Ok(())
     }
 
+    /// Publish this device-global USC FList generation in the next staged
+    /// group's tag-15 records instead of the per-slot ordinal.
+    pub(crate) fn set_flist_generation(&mut self, generation: u64) {
+        self.flist_generation = generation;
+    }
+
+    /// The TA HardwareBufferID this storage's retained parameter-management
+    /// graph was encoded against, if it has one.
+    ///
+    /// The graph owns that PBDesc slot for its whole lifetime:
+    /// `prepare_retained_scene` refuses any other ID, so the manager must hand
+    /// this same ID to every submission on this storage.
+    pub(crate) fn retained_hardware_buffer_id(&self) -> Option<u32> {
+        self.parameter_management.as_ref().map(|pm| pm.hardware_buffer_id)
+    }
+
     pub(crate) fn selected_scene_index(&self) -> Result<usize> {
         self.parameter_management.as_ref().map(|pm| pm.selected_scene).ok_or(ENODEV)
     }
@@ -8446,6 +8472,7 @@ impl G17PUserRenderStorage {
             graph_va + event_offset as u64,
         ];
         let optional_addresses = self.optional_addresses(false);
+        let flist_generation = self.flist_generation;
         let tag16 = g17p_render_tag16_enabled();
         let plan = G17PRenderItemPlan::new(submission_ordinal, tag16).ok_or(EINVAL)?;
         // The stamp this path's tag-14 announces is `ordinal + 1`
@@ -8458,10 +8485,11 @@ impl G17PUserRenderStorage {
             for (index, address) in items.iter().enumerate() {
                 put_u64(&mut group, index * 8, *address);
             }
-            g17_submission::apply_g17p_retained_optional(
+            g17_submission::apply_g17p_retained_optional_with_flist_generation(
                 g17_submission::G17PColdOpeningStage::Fragment,
                 optional_addresses,
                 submission_ordinal,
+                flist_generation,
                 g17p_render_generation_bias_enabled(),
                 self.queue_pair.fragment,
                 self.queue_pair.tiling,
@@ -8792,6 +8820,7 @@ impl G17PUserRenderStorage {
             graph_va + optional_offset as u64,
         ];
         let optional_addresses = self.optional_addresses(false);
+        let flist_generation = self.flist_generation;
         let plan = G17PRenderItemPlan::new(submission_ordinal, g17p_render_tag16_enabled())
             .ok_or(EINVAL)?;
         self.graph.with_bytes_mut(|raw| {
@@ -8800,10 +8829,11 @@ impl G17PUserRenderStorage {
                 put_u64(&mut group, index * 8, *address);
             }
             plan.copy_items(raw, Self::FRAGMENT_RING, 0, &group).ok_or(EINVAL)?;
-            g17_submission::apply_g17p_retained_optional(
+            g17_submission::apply_g17p_retained_optional_with_flist_generation(
                 g17_submission::G17PColdOpeningStage::Fragment,
                 optional_addresses,
                 submission_ordinal,
+                flist_generation,
                 g17p_render_generation_bias_enabled(),
                 self.queue_pair.fragment,
                 self.queue_pair.tiling,
@@ -8921,6 +8951,7 @@ impl G17PUserRenderStorage {
             self.optional_addresses(true),
             self.descriptor_context_id,
             submission_ordinal,
+            self.flist_generation,
             entry_stamp,
             g17p_render_tag16_enabled(),
             g17p_render_native_pool_a_first_record_enabled(),
@@ -17041,7 +17072,7 @@ mod tests {
         // An address-construction error occurs before any publication and
         // cannot change the early 3D-visible bytes.
         assert!(
-            build_g17p_late_tiling_bytes(descriptor, u64::MAX, G17PRenderQueuePair::for_slot(0).unwrap(), addresses, 6, 0, 1, false, false, 2)
+            build_g17p_late_tiling_bytes(descriptor, u64::MAX, G17PRenderQueuePair::for_slot(0).unwrap(), addresses, 6, 0, 0, 1, false, false, 2)
                 .is_err()
         );
         assert!(graph[G17P_USER_TILING_RING..G17P_USER_TILING_RING + 24]
@@ -17051,7 +17082,7 @@ mod tests {
         assert_eq!(get_u32(&support, G17P_RENDER_SHARED_CONTROL_INNER), 1);
 
         let late =
-            build_g17p_late_tiling_bytes(descriptor, graph_va, G17PRenderQueuePair::for_slot(0).unwrap(), addresses, 6, 0, 1, false, false, 2)
+            build_g17p_late_tiling_bytes(descriptor, graph_va, G17PRenderQueuePair::for_slot(0).unwrap(), addresses, 6, 0, 0, 1, false, false, 2)
                 .unwrap();
         late.apply(&mut graph, &mut support);
         assert_eq!(get_u64(&graph, G17P_USER_TILING_RING), descriptor);
@@ -17076,6 +17107,7 @@ mod tests {
             addresses,
             6,
             0,
+            0,
             1,
             true,
             false,
@@ -17088,7 +17120,7 @@ mod tests {
         assert_eq!(get_u32(&second_pair.entry_signal, 0x04) & 0xffff, 2);
 
         let retained =
-            build_g17p_late_tiling_bytes(descriptor, graph_va, G17PRenderQueuePair::for_slot(0).unwrap(), addresses, 6, 1, 2, false, false, 2)
+            build_g17p_late_tiling_bytes(descriptor, graph_va, G17PRenderQueuePair::for_slot(0).unwrap(), addresses, 6, 1, 1, 2, false, false, 2)
                 .unwrap();
         retained.apply(&mut graph, &mut support);
         assert_eq!(get_u32(&graph, G17P_USER_TILING_POINTERS + 0x40), 6);
@@ -17113,13 +17145,13 @@ mod tests {
         let mut native_support = vec![0u8; G17P_RENDER_SUPPORT_SIZE];
         put_u32(&mut native_support, G17P_RENDER_POOL_A_SLOTS + 4, 1);
         let native_first =
-            build_g17p_late_tiling_bytes(descriptor, graph_va, G17PRenderQueuePair::for_slot(0).unwrap(), addresses, 6, 0, 1, false, true, 2)
+            build_g17p_late_tiling_bytes(descriptor, graph_va, G17PRenderQueuePair::for_slot(0).unwrap(), addresses, 6, 0, 0, 1, false, true, 2)
                 .unwrap();
         native_first.apply(&mut graph, &mut native_support);
         assert_eq!(get_u32(&native_support, G17P_RENDER_POOL_A_SLOTS), 0);
         assert_eq!(get_u32(&native_support, G17P_RENDER_POOL_A_SLOTS + 4), 2);
         let native_retained =
-            build_g17p_late_tiling_bytes(descriptor, graph_va, G17PRenderQueuePair::for_slot(0).unwrap(), addresses, 6, 1, 2, false, true, 2)
+            build_g17p_late_tiling_bytes(descriptor, graph_va, G17PRenderQueuePair::for_slot(0).unwrap(), addresses, 6, 1, 1, 2, false, true, 2)
                 .unwrap();
         assert_eq!(native_retained.pool_a_slot_offset, retained.pool_a_slot_offset);
     }
@@ -17140,7 +17172,7 @@ mod tests {
             ta_hardware_buffer_id: 0,
         };
         let late =
-            build_g17p_late_tiling_bytes(descriptor, graph_va, G17PRenderQueuePair::for_slot(0).unwrap(), addresses, 6, 0, 1, true, false, 2)
+            build_g17p_late_tiling_bytes(descriptor, graph_va, G17PRenderQueuePair::for_slot(0).unwrap(), addresses, 6, 0, 0, 1, true, false, 2)
                 .unwrap();
         let mut graph = vec![0u8; G17P_RENDER_QUEUE_GRAPH_SIZE];
         let mut support = vec![0u8; G17P_RENDER_SUPPORT_SIZE];

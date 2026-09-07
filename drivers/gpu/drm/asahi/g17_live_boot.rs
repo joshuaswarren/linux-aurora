@@ -3763,10 +3763,16 @@ impl G17PLiveRuntime {
         }
     }
 
+    /// Release a timed-out render.
+    ///
+    /// Returns `true` when the firmware had already retired the group without
+    /// executing it: the slot's host state has then been settled exactly as a
+    /// completion settles it and the slot stays usable. `false` means the
+    /// firmware may still own the group, which is left pinned as before.
     pub(crate) fn abandon_deferred_render(
         &mut self,
         render_slot: u8,
-    ) -> Result {
+    ) -> Result<bool> {
         self.manager
             .as_mut()
             .ok_or(ENODEV)?
@@ -3775,8 +3781,62 @@ impl G17PLiveRuntime {
             .as_mut()
             .ok_or(ENODEV)?
             .report_render_wait_timeout();
+        let retired = match self
+            .manager
+            .as_mut()
+            .ok_or(ENODEV)?
+            .retire_abandoned_render_if_firmware_retired()
+        {
+            Ok(retired) => retired,
+            Err(error) => {
+                if let Some(pdev) = self.pdev.as_ref() {
+                    dev_warn!(
+                        pdev.as_ref(),
+                        "G17P render: could not classify the timed-out group ({:?}); treating it as still owned by firmware\n",
+                        error
+                    );
+                }
+                false
+            }
+        };
+        if retired {
+            // The firmware is finished with the group: drain its notifications
+            // and retire the FList references the way a completion does, so the
+            // device-global FList refcount does not leak two references per
+            // abandoned render. Neither failure changes the slot's state.
+            let _ = self.service_firmware_events_inline();
+            match self
+                .manager
+                .as_mut()
+                .ok_or(ENODEV)?
+                .retire_render_usc_freelist_at_completion()
+            {
+                Ok(Some(release)) => {
+                    if let Err(error) = self.service_render_usc_freelist_release(release) {
+                        if let Some(pdev) = self.pdev.as_ref() {
+                            dev_warn!(
+                                pdev.as_ref(),
+                                "G17P render: FList release after a firmware-retired group failed ({:?})\n",
+                                error
+                            );
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    if let Some(pdev) = self.pdev.as_ref() {
+                        dev_warn!(
+                            pdev.as_ref(),
+                            "G17P render: FList retire after a firmware-retired group failed ({:?})\n",
+                            error
+                        );
+                    }
+                }
+            }
+            return Ok(true);
+        }
         self.abandon_render_submission_after_timeout();
-        Ok(())
+        Ok(false)
     }
 
     /// Wait only for the two TA-owned timestamps used by the split-launch
