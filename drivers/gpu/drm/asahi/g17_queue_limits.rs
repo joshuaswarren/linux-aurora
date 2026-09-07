@@ -31,9 +31,44 @@ pub(crate) const MAX_IN_FLIGHT_PER_QUEUE: u32 = 1;
 /// and auxiliary mappings; the remaining 3 GiB hold per-VM private aliases.
 pub(crate) const CLIENT_LOW_VA_START: u64 = 0x70_4000_0000;
 
+/// An ownerless graph may be rebound only while it is still host-prepared and
+/// has never been installed in firmware. Once installed, its QID routing is
+/// tied to the original execution context/root until a proven firmware
+/// reconfigure transaction exists.
+pub(crate) const fn reusable_uninstalled_compute_graph(
+    owner_free: bool,
+    active_free: bool,
+    quarantined: bool,
+    requires_first_install: bool,
+) -> bool {
+    owner_free && active_free && !quarantined && requires_first_install
+}
+
 pub(crate) fn encode_limits() -> [u8; QUEUE_LIMITS_SIZE] {
     let mut bytes = [0; QUEUE_LIMITS_SIZE];
     bytes[0..4].copy_from_slice(&MAX_QUEUES.to_ne_bytes());
     bytes[4..8].copy_from_slice(&MAX_IN_FLIGHT_PER_QUEUE.to_ne_bytes());
     bytes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn installed_graph_is_never_selected_for_cross_context_rebind() {
+        assert!(!reusable_uninstalled_compute_graph(true, true, false, false));
+    }
+
+    #[test]
+    fn unpublished_graph_can_be_rebound_after_idle_owner_close() {
+        assert!(reusable_uninstalled_compute_graph(true, true, false, true));
+    }
+
+    #[test]
+    fn active_owned_or_quarantined_graph_is_never_rebound() {
+        assert!(!reusable_uninstalled_compute_graph(false, true, false, true));
+        assert!(!reusable_uninstalled_compute_graph(true, false, false, true));
+        assert!(!reusable_uninstalled_compute_graph(true, true, true, true));
+    }
 }
