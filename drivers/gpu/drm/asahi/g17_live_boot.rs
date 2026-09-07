@@ -2543,6 +2543,12 @@ pub(crate) struct G17PLiveRuntime {
     /// Set by a publish that returned `Pending`; consumed by the finish step
     /// once the firmware has signalled.
     pending_compute: Option<(bool, mmu::KernelMapping)>,
+    /// Event-driven hardware fences for the two independently owned render
+    /// slots. Installed before the work doorbell and removed only by exact
+    /// retirement or the DRM scheduler's bounded timeout recovery.
+    pending_render: [Option<Arc<crate::g17_drm::G17PRenderCompletion>>;
+        g17_resources::G17PRenderQueuePair::SLOT_COUNT as usize],
+    render_fence_state: g17_completion::RenderFenceState,
 }
 
 impl G17PLiveRuntime {
@@ -2891,6 +2897,7 @@ impl G17PLiveRuntime {
                         .queue_primary_recovery(generation, batch.recovery_records)?;
                 }
             }
+            self.service_async_render_completions()?;
             self.service_async_compute_completions()
         });
         if result.is_err() {
@@ -3744,7 +3751,6 @@ impl G17PLiveRuntime {
             .poll_translated_render_completion()?;
         match outcome {
             g17_manager::G17PRenderPollOutcome::Complete(completion) => {
-                let _ = self.service_firmware_events_inline();
                 if let (Some(pdev), Some(manager)) = (self.pdev.as_ref(), self.manager.as_mut()) {
                     finish_g17p_render_trace(
                         pdev.as_ref(),
@@ -3769,21 +3775,85 @@ impl G17PLiveRuntime {
                 Ok(Some(completion))
             }
             g17_manager::G17PRenderPollOutcome::Retry => Ok(None),
-            g17_manager::G17PRenderPollOutcome::Pending => {
-                let _ = self.service_firmware_events_inline();
-                Ok(None)
-            }
+            g17_manager::G17PRenderPollOutcome::Pending => Ok(None),
         }
     }
 
-    /// Publish complete render QID registrations once the graphics-core
-    /// aperture becomes reachable. This deliberately excludes stale generic
-    /// SKSM traffic such as AddKicks and queue-disable writes.
-    pub(crate) fn replay_deferred_render_sksm_registrations(&self) -> Result<usize> {
-        self.registers
-            .as_ref()
-            .ok_or(ENODEV)?
-            .g17p_replay_deferred_sksm_registrations()
+    /// Retire any render whose firmware record became visible on this RTKit
+    /// event edge. Both slots are inspected so a later submission completing
+    /// first cannot strand the earlier slot, and taking the pending Arc makes
+    /// duplicate notifications idempotent.
+    fn service_async_render_completions(&mut self) -> Result {
+        for slot in 0..g17_resources::G17PRenderQueuePair::SLOT_COUNT {
+            if !self.render_fence_state.pending(slot) {
+                continue;
+            }
+            let mut completion = None;
+            // A completed firmware list can require one immediate quiesce
+            // pass before the paired retirement becomes observable.
+            for _ in 0..2 {
+                match self.poll_deferred_render_completion(slot)? {
+                    Some(observed) => {
+                        completion = Some(observed);
+                        break;
+                    }
+                    None => {}
+                }
+            }
+            if let Some(observed) = completion {
+                if self.render_fence_state.settle(slot) {
+                    let signal = self.pending_render[slot as usize]
+                        .take()
+                        .ok_or(EIO)?;
+                    signal.complete(Ok(observed));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn install_render_completion(
+        &mut self,
+        render_slot: u8,
+        completion: Arc<crate::g17_drm::G17PRenderCompletion>,
+    ) -> Result {
+        let pending = self.pending_render
+            .get_mut(render_slot as usize)
+            .ok_or(EINVAL)?;
+        if pending.is_some() || !self.render_fence_state.arm(render_slot) {
+            return Err(EBUSY);
+        }
+        *pending = Some(completion);
+        Ok(())
+    }
+
+    /// Bounded watchdog/cancel settlement. This is never the normal
+    /// completion path: ordinary retirement is driven by the RTKit event
+    /// worker above. The physical slot is quarantined by the caller before
+    /// this releases its lease.
+    pub(crate) fn timeout_deferred_render(
+        &mut self,
+        render_slot: u8,
+        submission_id: u64,
+        error: Error,
+    ) {
+        if self.render_fence_state.settle(render_slot) {
+            let Some(signal) = self.pending_render
+                .get_mut(render_slot as usize)
+                .and_then(Option::take) else { return; };
+            let retired = self.abandon_deferred_render(render_slot).unwrap_or(false);
+            if let Some(pdev) = self.pdev.as_ref() {
+                dev_err!(
+                    pdev.as_ref(),
+                    "G17P render: scheduler settled lost submission {} slot {} ({:?}, firmware-retired={})\n",
+                    submission_id,
+                    render_slot,
+                    error,
+                    retired,
+                );
+            }
+            signal.complete(Err(if retired { EIO } else { error }));
+        }
     }
 
     /// Release a timed-out render.
@@ -3919,6 +3989,7 @@ impl G17PLiveRuntime {
         command: &g17_uapi::TranslatedRenderCommand,
         timestamps: [u64; 4],
         timestamp_aliases: KVec<mmu::KernelMapping>,
+        completion: Arc<crate::g17_drm::G17PRenderCompletion>,
     ) -> Result {
         if !self.accepting_submissions {
             return Err(ENOTSUPP);
@@ -3992,6 +4063,9 @@ impl G17PLiveRuntime {
                 timestamp_aliases,
                 registers,
             )?;
+        // Arm the exact fence after the tracker has been reset for this group,
+        // but before any control or work doorbell can report its retirement.
+        self.install_render_completion(render_slot, completion)?;
         // Copy only before the FList wake and while both outers are deferred.
         // Never insert this scan between producer publication and doorbell.
         if let Some(manager) = self.manager.as_mut() {
@@ -5497,25 +5571,10 @@ impl G17PLiveRuntime {
                                     );
                                 }
                                 if *module_parameters::g17p_late_sksm.value() != 0 {
-                                    match registers.g17p_replay_deferred_sksm() {
-                                        Ok(issued) => dev_info!(
-                                            self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
-                                            "G17P SKSM replay issued {} pairs while powered\n",
-                                            issued
-                                        ),
-                                        Err(error) => dev_warn!(
-                                            self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
-                                            "G17P SKSM replay failed ({:?})\n",
-                                            error
-                                        ),
-                                    }
-                                    if let Err(error) = registers.g17p_probe_ksm_block() {
-                                        dev_warn!(
-                                            self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
-                                            "G17P post-replay KSM probe failed ({:?})\n",
-                                            error
-                                        );
-                                    }
+                                    dev_warn!(
+                                        self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                                        "G17P SKSM replay suppressed: queue registration must be firmware-mediated\n"
+                                    );
                                 }
                             }
                             Err(error) => dev_warn!(
@@ -6584,6 +6643,8 @@ impl G17PLiveRuntime {
             compute_gate_suspect: false,
             completion_signal: G17PCompletionSignal::new()?,
             pending_compute: None,
+            pending_render: [None, None],
+            render_fence_state: g17_completion::RenderFenceState::default(),
         })
     }
 
@@ -6719,6 +6780,10 @@ impl g17_lifecycle::PersistentRuntimeRecovery for G17PLiveRuntime {
 
     fn release_runtime_objects(&mut self) {
         drop(self.pending_compute.take());
+        for completion in self.pending_render.iter_mut().filter_map(Option::take) {
+            completion.complete(Err(EIO));
+        }
+        self.render_fence_state = g17_completion::RenderFenceState::default();
         drop(self.compute_timestamps.take());
         drop(self.compute_binding.take());
         drop(self.queue.take());
@@ -6806,6 +6871,7 @@ impl g17_lifecycle::PersistentRuntimeTeardown for G17PLiveRuntime {
         core::mem::forget(self.queue.take());
         core::mem::forget(core::mem::take(&mut self.retired_queues));
         core::mem::forget(core::mem::take(&mut self.quarantined_bindings));
+        core::mem::forget(core::mem::take(&mut self.pending_render));
         core::mem::forget(self.gfx1_rtkit.take());
         core::mem::forget(self.gfx1_state.take());
         core::mem::forget(self.gfx_rtkit.take());
@@ -6828,6 +6894,10 @@ impl g17_lifecycle::PersistentRuntimeTeardown for G17PLiveRuntime {
     }
 
     fn drop_queue(&mut self) {
+        for completion in self.pending_render.iter_mut().filter_map(Option::take) {
+            completion.complete(Err(EIO));
+        }
+        self.render_fence_state = g17_completion::RenderFenceState::default();
         drop(self.compute_timestamps.take());
         drop(self.compute_binding.take());
         drop(self.queue.take());

@@ -173,6 +173,84 @@ pub(crate) struct G17PJobScheduler<B: G17PQueueBackend> {
     backend: Arc<B>,
 }
 
+/// A render has already been published when this scheduler job runs.  The
+/// job exists to put its exact firmware-driven hardware fence under DRM's
+/// timeout and dependency machinery without polling in the submit ioctl.
+pub(crate) struct G17PRenderWatchPacket {
+    submission_id: u64,
+    render_slot: u8,
+    completion: Arc<crate::g17_drm::G17PRenderCompletion>,
+}
+
+impl G17PRenderWatchPacket {
+    pub(crate) fn new(
+        submission_id: u64,
+        render_slot: u8,
+        completion: Arc<crate::g17_drm::G17PRenderCompletion>,
+    ) -> Result<Arc<Self>> {
+        if submission_id == 0 || render_slot >= crate::g17_resources::G17PRenderQueuePair::SLOT_COUNT {
+            return Err(EINVAL);
+        }
+        Ok(Arc::new(Self { submission_id, render_slot, completion }, GFP_KERNEL)?)
+    }
+
+    pub(crate) fn submission_id(&self) -> u64 { self.submission_id }
+    pub(crate) fn render_slot(&self) -> u8 { self.render_slot }
+    pub(crate) fn fence(&self) -> Fence { self.completion.fence() }
+}
+
+pub(crate) trait G17PRenderWatchBackend: Send + Sync {
+    fn timed_out(&self, packet: Arc<G17PRenderWatchPacket>) -> sched::Status;
+    fn cancel(&self, packet: Arc<G17PRenderWatchPacket>);
+}
+
+pub(crate) struct G17PRenderWatchJob<B: G17PRenderWatchBackend> {
+    backend: Arc<B>,
+    packet: Arc<G17PRenderWatchPacket>,
+}
+
+impl<B: G17PRenderWatchBackend> sched::JobImpl for G17PRenderWatchJob<B> {
+    fn prepare(_job: &mut sched::Job<Self>) -> Option<Fence> { None }
+
+    fn run(job: &mut sched::Job<Self>) -> Result<Option<Fence>> {
+        Ok(Some(job.packet.fence()))
+    }
+
+    fn timed_out(job: &mut sched::Job<Self>) -> sched::Status {
+        job.backend.timed_out(job.packet.clone())
+    }
+
+    fn cancel(job: &mut sched::Job<Self>) {
+        job.backend.cancel(job.packet.clone());
+    }
+}
+
+pub(crate) struct G17PRenderWatchScheduler<B: G17PRenderWatchBackend> {
+    entity: sched::Entity<G17PRenderWatchJob<B>>,
+    _scheduler: sched::Scheduler<G17PRenderWatchJob<B>>,
+    backend: Arc<B>,
+}
+
+impl<B: G17PRenderWatchBackend> G17PRenderWatchScheduler<B> {
+    pub(crate) fn new(dev: &AsahiDevice, backend: Arc<B>) -> Result<Self> {
+        let scheduler = sched::Scheduler::new(
+            dev.as_ref(), 1, 1, 0, 2000, c_str!("asahi_g17p_render"),
+        )?;
+        let entity = sched::Entity::new(&scheduler, sched::Priority::Kernel)?;
+        Ok(Self { entity, _scheduler: scheduler, backend })
+    }
+
+    pub(crate) fn enqueue(&mut self, packet: Arc<G17PRenderWatchPacket>) -> Result<Fence> {
+        let job = self.entity.new_job(1, G17PRenderWatchJob {
+            backend: self.backend.clone(), packet,
+        })?;
+        let mut job = job.arm();
+        let finished = job.fences().finished();
+        job.push();
+        Ok(finished)
+    }
+}
+
 impl<B: G17PQueueBackend> G17PJobScheduler<B> {
     pub(crate) fn new(dev: &AsahiDevice, backend: Arc<B>, credits: u32) -> Result<Self> {
         if credits == 0 { return Err(EINVAL); }
