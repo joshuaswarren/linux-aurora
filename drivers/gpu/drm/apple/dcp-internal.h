@@ -26,6 +26,7 @@
 #define DCP_MAX_PLANES APPLE_DCP_MAX_SURFACES
 
 struct apple_dcp;
+
 struct apple_dcp_afkep;
 
 struct dcpav_service_epic;
@@ -80,6 +81,10 @@ struct dcp_channel {
 	u64 link_message[DCP_MAX_CALL_DEPTH];
 	u32 link_size[DCP_MAX_CALL_DEPTH];
 
+	/* Tag of each outstanding call, so a stall can name itself */
+	char tag[DCP_MAX_CALL_DEPTH][4];
+	unsigned long pushed_at[DCP_MAX_CALL_DEPTH];
+
 	/* Current depth of the call stack. Less than DCP_MAX_CALL_DEPTH */
 	u8 depth;
 	/* Already warned about busy channel */
@@ -125,6 +130,10 @@ struct apple_dcp {
 	struct device *dev;
 	struct platform_device *piodma;
 	struct iommu_domain *iommu_dom;
+	/* domain of the display-subsystem device, which owns the scanout stream */
+	struct iommu_domain *disp_iommu_dom;
+	/* the display-subsystem device, whose DMA domain the pipe scans out of */
+	struct device *disp_dev;
 	struct apple_rtkit *rtk;
 	struct apple_crtc *crtc;
 	struct apple_connector *connector;
@@ -235,6 +244,14 @@ struct apple_dcp {
 	/* Workqueue for sending vblank events when a dcp swap is not possible */
 	struct work_struct vblank_wq;
 
+	/* Names a command the firmware has stopped answering */
+	struct delayed_work stall_wq;
+	bool warned_stall;
+	bool dumped_crashlog;
+	/* the DCP crashlog region, so a stall can read the fresh record */
+	void *crashlog_buf;
+	size_t crashlog_size;
+
 	/* List of referenced drm_framebuffers which can be unreferenced
 	 * on the next successfully completed swap.
 	 */
@@ -290,5 +307,7 @@ int dcp_backlight_update(struct apple_dcp *dcp);
 bool dcp_has_panel(struct apple_dcp *dcp);
 
 #define DCP_AUDIO_MAX_CHANS 15
+
+void dcp_dump_crashlog(struct apple_dcp *dcp);
 
 #endif /* __APPLE_DCP_INTERNAL_H__ */

@@ -30,12 +30,15 @@
  * Records are allocated on each channel's stack at
  *   off_next = off_cur + align_up(12 + in_len + out_len, 0x40)
  * Live macOS 25G83 traces confirm this for all 81915 RPC calls across two
- * independent captures. Allocating at 4-byte alignment instead put every
- * nested record where the firmware does not look, so its callbacks decoded as
- * tag 0:
- *   DCPLink callback tag 0x0 is invalid
- *   DCPLink callback could not be decoded: -90
- *   IOMFB: Could not find Provider service
+ * independent captures -- which is the same rule dcp_packet_start() and
+ * DCP_PACKET_ALIGNMENT already implement in iomfb.c.
+ *
+ * H17P does NOT use a separate "link" transport: past the INIT/SetShmem
+ * handshake it speaks the ordinary IOMFB protocol, with the same six fixed
+ * channels (CMD 0x00000, OOBCMD 0x08000, ASYNC 0x40000, OOBASYNC 0x48000,
+ * CB 0x60000, OOBCB 0x68000) selected by the context field of the message.
+ * The constants below are kept only for the H17P method/callback tables and
+ * the rt_bandwidth reply; the transport itself lives in iomfb.c.
  */
 #define APPLE_DCP_LINK_RPC_ALIGNMENT		0x40
 #define APPLE_DCP_LINK_SHARED_VAR_MEMORY_SIZE	0x4000000

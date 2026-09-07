@@ -11,6 +11,11 @@
 /* Fixed size of shared memory between DCP and AP */
 #define DCP_SHMEM_SIZE 0x100000
 
+/* disp0 register window the H17P firmware asks for as map_reg index 5 */
+#define DCP_H17P_DISP0_REG_INDEX 5
+#define DCP_H17P_DISP0_REG_BASE  0x302800000ULL
+#define DCP_H17P_DISP0_REG_SIZE  0xbc000ULL
+
 /* DCP message contexts */
 enum dcp_context_id {
 	/* Callback */
@@ -154,6 +159,7 @@ enum dcpep_method {
 	dcpep_flush_supports_power,
 	dcpep_set_power_state,
 	dcpep_first_client_open,
+	dcpep_register_dfb_surface,
 	dcpep_set_parameter_dcp,
 	dcpep_enable_disable_video_power_savings,
 	dcpep_is_main_display,
@@ -164,8 +170,38 @@ enum dcpep_method {
 	iomfbep_last_client_close,
 	iomfbep_abort_swaps_dcp,
 	iomfbep_set_matrix,
+	/*
+	 * H17P start_hardware_boot (D121) issues these between
+	 * create_default_fb and setup_video_limits; macOS 25G83 traces show
+	 * A035/A034 feeding setup_default_fb_info and A104 pushing the
+	 * display's own geometry back at the firmware.
+	 */
+	dcpep_get_dfb_compression_info,
+	dcpep_get_dfb_info,
+	dcpep_get_dfb_layout,
+	dcpep_get_dfb_state,
+	dcpep_set_dfb_dimensions,
+	dcpep_commit_dfb_info,
+	dcpep_dfb_query,
+	dcpep_dfb_ready_query,
+	/*
+	 * The client-open sequence macOS runs before the first swap.  Names
+	 * are unknown; the wire signatures come from the 25G83 capture.
+	 */
+	dcpep_pipe_query_353,
+	dcpep_pipe_set_352,
+	dcpep_pipe_cfg_415,
+	dcpep_pipe_cfg_031,
+	dcpep_pipe_cfg_414,
+	dcpep_pipe_query_478,
+	dcpep_pipe_query_474,
+	dcpep_pipe_set_476,
+	dcpep_pipe_cfg_438,
+	dcpep_pipe_set_428,
 	dcpep_num_methods
 };
+
+void dcp_stall_check(struct work_struct *work);
 
 #define IOMFB_METHOD(tag, name) [name] = { #name, { tag[0], tag[1], tag[2], tag[3] } }
 
@@ -192,12 +228,6 @@ struct dcp_map_buf_req {
 	u8 buf_null;
 	u8 vaddr_null;
 	u8 dva_null;
-} __packed;
-
-struct dcp_map_buf_resp {
-	u64 vaddr;
-	u64 dva;
-	u32 ret;
 } __packed;
 
 struct dcp_unmap_buf_resp {
@@ -240,20 +270,6 @@ struct dcp_map_physical_resp {
 	u32 mem_desc_id;
 } __packed;
 
-struct dcp_swap_start_req {
-	u32 swap_id;
-	struct dcp_iouserclient client;
-	u8 swap_id_null;
-	u8 client_null;
-	u8 padding[2];
-} __packed;
-
-struct dcp_swap_start_resp {
-	u32 swap_id;
-	struct dcp_iouserclient client;
-	u32 ret;
-} __packed;
-
 struct dcp_get_uint_prop_req {
 	char obj[4];
 	char key[0x40];
@@ -280,13 +296,6 @@ struct iomfb_set_fx_prop_req {
 	char obj[4];
 	char key[0x40];
 	u32 value;
-} __packed;
-
-struct dcp_set_power_state_req {
-	u64 unklong;
-	u8 unkbool;
-	u8 unkint_null;
-	u8 padding[2];
 } __packed;
 
 struct dcp_set_power_state_resp {
