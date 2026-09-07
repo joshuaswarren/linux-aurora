@@ -31,6 +31,7 @@ use crate::{
     g17_boot,
     g17_drm,
     g17_firmware,
+    g17_lifecycle,
     g17_live_boot,
     g17_manager,
     g17_power_preflight,
