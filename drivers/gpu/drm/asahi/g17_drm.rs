@@ -1376,6 +1376,40 @@ impl G17PQueue {
     }
 }
 
+/// Publishes a synchronous submission's output fence exactly once, on every
+/// exit path.
+///
+/// Userspace waits on these syncobjs with no timeout, so an output syncobj left
+/// unsignalled does not degrade one frame -- it hangs the waiter forever. That
+/// is what turned a single failed render submission into a permanently wedged
+/// compositor: Zink's fence thread sat in `drm_syncobj_array_wait_timeout` and
+/// the session never rendered again. A submission that fails after its output
+/// syncobjs are known must therefore still publish a fence, carrying the error
+/// so the waiter learns the work will never complete.
+struct G17POutputFencePublication<'a> {
+    fence: &'a UserFence<G17PSubmissionFence>,
+    outputs: KVec<file::SyncItem>,
+    succeeded: bool,
+}
+
+impl G17POutputFencePublication<'_> {
+    /// Mark the submission complete. Anything else publishes an error fence.
+    fn succeeded(&mut self) {
+        self.succeeded = true;
+    }
+}
+
+impl Drop for G17POutputFencePublication<'_> {
+    fn drop(&mut self) {
+        if !self.succeeded {
+            self.fence.set_error(ECANCELED);
+        }
+        self.fence.signal();
+        let fence = Fence::from_fence(self.fence);
+        G17PQueue::install_output_fences(self.outputs.drain(..), &fence);
+    }
+}
+
 impl queue::Queue for G17PQueue {
     fn submit(
         &mut self,
@@ -1397,6 +1431,28 @@ impl queue::Queue for G17PQueue {
         if in_sync_count > syncs.len() {
             return Err(Self::stage_fail(submission_id, "sync-count", EINVAL));
         }
+        // Split the output syncobjs off immediately and hand them to a
+        // publication guard, so every failure from here on still publishes a
+        // fence. Arming this only after the queue lease was acquired left the
+        // whole class of "another client owns the render slot" failures
+        // publishing nothing, and a compositor that hit one waited on an
+        // unsignalled syncobj forever instead of losing a frame.
+        let mut deferred_outputs: KVec<file::SyncItem> = KVec::new();
+        for item in syncs.drain(in_sync_count..) {
+            deferred_outputs
+                .push(item, GFP_KERNEL)
+                .map_err(|_| Self::stage_fail(submission_id, "output-sync-list", ENOMEM))?;
+        }
+        let early_output_fence: UserFence<G17PSubmissionFence> = self
+            .fence_contexts
+            .new_fence(0, G17PSubmissionFence)
+            .map_err(|error| Self::stage_fail(submission_id, "new-fence", error))?
+            .into();
+        let mut publication = G17POutputFencePublication {
+            fence: &early_output_fence,
+            outputs: deferred_outputs,
+            succeeded: false,
+        };
         let address_space = UserAddressSpace {
             vm: &self.vm,
             range: self.user_range.clone(),
@@ -1534,11 +1590,6 @@ impl queue::Queue for G17PQueue {
         // The lease then spans timestamp publication, execution/doorbell waits
         // and output-fence installation, including runtime-mutex release.
         let lease = self.acquire_ready_lease(submission_id, &syncs[..in_sync_count])?;
-        let output_fence: UserFence<G17PSubmissionFence> = self
-            .fence_contexts
-            .new_fence(0, G17PSubmissionFence)
-            .map_err(|error| Self::stage_fail(submission_id, "new-fence", error))?
-            .into();
         match pending {
             G17PPendingCommand::Render(translated) => {
                 let mut timestamp_aliases = KVec::new();
@@ -1718,10 +1769,8 @@ impl queue::Queue for G17PQueue {
         }
 
         pr_info!("G17P submit: OK submission {}\n", submission_id);
-        output_fence.signal();
-        let fence = Fence::from_fence(&output_fence);
-        let outputs = syncs.drain(in_sync_count..);
-        Self::install_output_fences(outputs, &fence);
+        publication.succeeded();
+        core::mem::drop(publication);
         dev_dbg!(
             self.dev.as_ref(),
             "G17P queue {} completed synchronous submission {} (one hardware command)\n",
