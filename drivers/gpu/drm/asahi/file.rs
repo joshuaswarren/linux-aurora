@@ -736,15 +736,17 @@ impl File {
             // Vulkan faults on an unmapped USC exec window. Log every bind so we
             // can tell whether Mesa asks for that range and we drop it, or never
             // asks at all.
-            pr_info!(
-                "G17P bind: vm={} addr={:#x} range={:#x} offset={:#x} flags={:#x} handle={}\n",
-                data.vm_id,
-                bind.addr,
-                bind.range,
-                bind.offset,
-                bind.flags,
-                bind.handle,
-            );
+            if crate::util::g17p_verbose() {
+                pr_info!(
+                    "G17P bind: vm={} addr={:#x} range={:#x} offset={:#x} flags={:#x} handle={}\n",
+                    data.vm_id,
+                    bind.addr,
+                    bind.range,
+                    bind.offset,
+                    bind.flags,
+                    bind.handle,
+                );
+            }
             Self::do_gem_bind_unbind(vm_id, &bind, file)?;
         }
 

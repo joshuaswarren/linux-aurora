@@ -4664,10 +4664,12 @@ fn encode_g17p_fragment_mcache(
         encode_range(internal_count + index, attachment.address, attachment.size, range_shift)?;
     }
     fragment[table_offset..table_end].copy_from_slice(&table[..table_size]);
-    pr_info!(
-        "G17P render MCache: hwsid={} selector={} mode={} internal={} attachments={} count={} table={:#x}\n",
-        hwsid, selector, mode, internal_count, attachments.len(), count, address,
-    );
+    if crate::util::g17p_verbose() {
+        pr_info!(
+            "G17P render MCache: hwsid={} selector={} mode={} internal={} attachments={} count={} table={:#x}\n",
+            hwsid, selector, mode, internal_count, attachments.len(), count, address,
+        );
+    }
     Ok(Some(aperture))
 }
 
@@ -6200,20 +6202,24 @@ impl G17PUserRenderStorage {
             g17p_allocate_render_lifecycle_pair(lifecycle_predecessor)?;
         translated.parameters.fragment_lifecycle = fragment_lifecycle;
         translated.parameters.lifecycle = tiling_lifecycle;
-        dev_info!(
-            dev.as_ref(),
-            "G17P render lifecycle: predecessor={:#x} 3D current={:#x} TA current={:#x} ordinal=0\n",
-            lifecycle_predecessor,
-            fragment_lifecycle as u32,
-            tiling_lifecycle as u32,
-        );
+        if crate::util::g17p_verbose() {
+            dev_info!(
+                dev.as_ref(),
+                "G17P render lifecycle: predecessor={:#x} 3D current={:#x} TA current={:#x} ordinal=0\n",
+                lifecycle_predecessor,
+                fragment_lifecycle as u32,
+                tiling_lifecycle as u32,
+            );
+        }
         if *crate::module_parameters::g17p_render_eot_bind_zero.value() != 0 {
             translated.parameters.store_pipeline_bind = 0;
             translated.parameters.partial_store_pipeline_bind = 0;
-            dev_info!(
-                dev.as_ref(),
-                "G17P render EOT bind: forcing native-captured main/partial value 0\n",
-            );
+            if crate::util::g17p_verbose() {
+                dev_info!(
+                    dev.as_ref(),
+                    "G17P render EOT bind: forcing native-captured main/partial value 0\n",
+                );
+            }
         }
 
         for (address, size, need_read, need_write) in [
@@ -6481,11 +6487,13 @@ impl G17PUserRenderStorage {
                 Ok(()) => {
                     for chunk in 0..(stream.len() / 32) {
                         let base = chunk * 32;
-                        pr_info!(
-                            "G17P render vdm-stream +{:#05x}: {:02x?}\n",
-                            base,
-                            &stream[base..base + 32],
-                        );
+                        if crate::util::g17p_verbose() {
+                            pr_info!(
+                                "G17P render vdm-stream +{:#05x}: {:02x?}\n",
+                                base,
+                                &stream[base..base + 32],
+                            );
+                        }
                     }
                     for word in 0..(stream.len() / 8) {
                         let mut bytes = [0u8; 8];
@@ -7032,12 +7040,14 @@ impl G17PUserRenderStorage {
             )?;
             translated.parameters.cycle = cycle;
             translated.parameters.record_index = record_index;
-            dev_info!(
-                dev.as_ref(),
-                "G17P retained PM: owner={:#x} scene-index={} scene={:#x} cycle={:#x} metric-register={:#x} manager-generation={} (pool and PBDesc preserved)\n",
-                pm.hwpb_state_va(), pm.selected_scene, pm.selected_scene_va(),
-                cycle, record_index, pm.manager_generation,
-            );
+            if crate::util::g17p_verbose() {
+                dev_info!(
+                    dev.as_ref(),
+                    "G17P retained PM: owner={:#x} scene-index={} scene={:#x} cycle={:#x} metric-register={:#x} manager-generation={} (pool and PBDesc preserved)\n",
+                    pm.hwpb_state_va(), pm.selected_scene, pm.selected_scene_va(),
+                    cycle, record_index, pm.manager_generation,
+                );
+            }
         }
         // NATIVE LAYOUT, macOS 26.6.2 2026-09-02 (recs3.txt, three passes,
         // byte-stable): a render pass owns ONE (start, end) pair, not one per
@@ -7063,21 +7073,25 @@ impl G17PUserRenderStorage {
             g17p_allocate_render_lifecycle_pair(self.lifecycle_predecessor)?;
         translated.parameters.fragment_lifecycle = fragment_lifecycle;
         translated.parameters.lifecycle = tiling_lifecycle;
-        dev_info!(
-            dev.as_ref(),
-            "G17P render lifecycle: predecessor={:#x} 3D current={:#x} TA current={:#x} ordinal={}\n",
-            self.lifecycle_predecessor,
-            fragment_lifecycle as u32,
-            tiling_lifecycle as u32,
-            submission_ordinal,
-        );
+        if crate::util::g17p_verbose() {
+            dev_info!(
+                dev.as_ref(),
+                "G17P render lifecycle: predecessor={:#x} 3D current={:#x} TA current={:#x} ordinal={}\n",
+                self.lifecycle_predecessor,
+                fragment_lifecycle as u32,
+                tiling_lifecycle as u32,
+                submission_ordinal,
+            );
+        }
         if *crate::module_parameters::g17p_render_eot_bind_zero.value() != 0 {
             translated.parameters.store_pipeline_bind = 0;
             translated.parameters.partial_store_pipeline_bind = 0;
-            dev_info!(
-                dev.as_ref(),
-                "G17P render EOT bind: forcing native-captured main/partial value 0\n",
-            );
+            if crate::util::g17p_verbose() {
+                dev_info!(
+                    dev.as_ref(),
+                    "G17P render EOT bind: forcing native-captured main/partial value 0\n",
+                );
+            }
         }
 
         if !vm.covers_range(
@@ -7432,6 +7446,9 @@ impl G17PUserRenderStorage {
     /// back down. Going from all-zero to non-zero across the kick proves the
     /// firmware touched them.
     pub(crate) fn log_status_pages(&mut self, dev: &AsahiDevice, label: &str) {
+        if !crate::util::g17p_verbose() {
+            return;
+        }
         let mut ta = [0u32; 8];
         let mut fragment = [0u32; 8];
         let ta_read = self.render_state.with_bytes_mut(|raw| {
@@ -11027,6 +11044,9 @@ impl G17ResourceOwner {
     }
 
     pub(crate) fn dump_render_qos_regions(&mut self, label: &str) {
+        if !crate::util::g17p_verbose() {
+            return;
+        }
         const REGIONS: [(&str, usize, usize); 6] = [
             ("rows", 0x000, 0x40),
             ("cnt400", 0x400, 0x40),
@@ -11393,15 +11413,17 @@ impl G17ResourceOwner {
             g17_completion::G17P_FIRMWARE_EVENT_STAMP_TYPE => {
                 match g17_completion::decode_g17p_firmware_stamp_event(&raw) {
                     Ok(event) => {
-                        dev_info!(
-                            self.dev().as_ref(),
-                            "G17P firmware-event ring role={:?}: stamp signal cursor={} producer={} masks=[{:#018x},{:#018x}] diagnostics={}\n",
-                            role, consumer,
-                            producer,
-                            event.masks[0],
-                            event.masks[1],
-                            event.diagnostic_pair_count,
-                        );
+                        if crate::util::g17p_verbose() {
+                            dev_info!(
+                                self.dev().as_ref(),
+                                "G17P firmware-event ring role={:?}: stamp signal cursor={} producer={} masks=[{:#018x},{:#018x}] diagnostics={}\n",
+                                role, consumer,
+                                producer,
+                                event.masks[0],
+                                event.masks[1],
+                                event.diagnostic_pair_count,
+                            );
+                        }
                         Ok(())
                     }
                     Err(error) => Err(error),
@@ -13690,6 +13712,9 @@ impl G17ResourceOwner {
         label: &str,
         index: u32,
     ) {
+        if !crate::util::g17p_verbose() {
+            return;
+        }
         let offset = g17_submission::g17p_pbdesc_offset(index);
         let mut entry = [0u32; 4];
         let entry_read = self.resources.pb_descriptor_table.with_bytes_mut(|bytes| {
@@ -14623,17 +14648,19 @@ impl G17ResourceOwner {
         };
         mappings.push(table_mapping, GFP_KERNEL)?;
         if !bootstrap_vdm {
-            dev_info!(
-                self.dev.as_ref(),
-                "G17P VM: prepared FList visible before QID config main={:#x}+{:#x} runs={:#x}+{:#x} descriptor={:#x} aux={:#x} padded-count={:#x}\n",
-                G17P_CONTROL_DIRECTORY_VA,
-                G17P_CONTROL_OPERAND_PAGE_LIST_SIZE,
-                G17P_CONTROL_OPERAND_TABLE_VA,
-                G17P_CONTROL_OPERAND_TABLE_BACKING_SIZE,
-                g17_initdata::PARTIAL_OPENING_CONTROL_SHARED_ADDRESS,
-                g17_initdata::PARTIAL_OPENING_CONTROL_SHARED_INNER_ADDRESS,
-                g17_initdata::COMPUTE_PARTIAL_OPENING_CONTROL_SHARED_CURSOR_BEFORE
-            );
+            if crate::util::g17p_verbose() {
+                dev_info!(
+                    self.dev.as_ref(),
+                    "G17P VM: prepared FList visible before QID config main={:#x}+{:#x} runs={:#x}+{:#x} descriptor={:#x} aux={:#x} padded-count={:#x}\n",
+                    G17P_CONTROL_DIRECTORY_VA,
+                    G17P_CONTROL_OPERAND_PAGE_LIST_SIZE,
+                    G17P_CONTROL_OPERAND_TABLE_VA,
+                    G17P_CONTROL_OPERAND_TABLE_BACKING_SIZE,
+                    g17_initdata::PARTIAL_OPENING_CONTROL_SHARED_ADDRESS,
+                    g17_initdata::PARTIAL_OPENING_CONTROL_SHARED_INNER_ADDRESS,
+                    g17_initdata::COMPUTE_PARTIAL_OPENING_CONTROL_SHARED_CURSOR_BEFORE
+                );
+            }
         }
         for (index, buffer) in self
             .resources

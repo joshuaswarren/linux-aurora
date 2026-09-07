@@ -2600,18 +2600,20 @@ impl G17PLiveRuntime {
         };
         fence(Ordering::SeqCst);
         let announcement = g17_rtkit::encode_primary_device_control();
-        dev_info!(
-            self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
-            "G17P render USC FList: staged opcode={:#x} stamp={} slot={} record={:#x} producer {}->{} consumer={}; announcing {:#x}\n",
-            publication.opcode,
-            publication.arg,
-            publication.slot,
-            publication.record_address,
-            publication.producer_before,
-            publication.producer_after,
-            publication.consumer_before,
-            announcement,
-        );
+        if crate::util::g17p_verbose() {
+            dev_info!(
+                self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                "G17P render USC FList: staged opcode={:#x} stamp={} slot={} record={:#x} producer {}->{} consumer={}; announcing {:#x}\n",
+                publication.opcode,
+                publication.arg,
+                publication.slot,
+                publication.record_address,
+                publication.producer_before,
+                publication.producer_after,
+                publication.consumer_before,
+                announcement,
+            );
+        }
         Pin::new(self.gfx_rtkit.as_mut().ok_or(ENODEV)?)
             .send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, announcement)?;
 
@@ -2623,12 +2625,14 @@ impl G17PLiveRuntime {
         let mut control_retired = false;
         for poll in 0..CONTROL_COUNTER_POLLS {
             if counters.primary == [target; 3] {
-                dev_info!(
-                    self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
-                    "G17P render USC FList: control record retired before work after {}ms counters={:?}\n",
-                    poll,
-                    counters.primary,
-                );
+                if crate::util::g17p_verbose() {
+                    dev_info!(
+                        self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                        "G17P render USC FList: control record retired before work after {}ms counters={:?}\n",
+                        poll,
+                        counters.primary,
+                    );
+                }
                 control_retired = true;
                 break;
             }
@@ -2662,12 +2666,14 @@ impl G17PLiveRuntime {
                 .as_ref()
                 .is_some_and(|manager| manager.render_usc_freelist_grow_matched())
             {
-                dev_info!(
-                    self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
-                    "G17P render USC FList: type13 grow completed before work after {}ms serviced={}\n",
-                    poll,
-                    serviced,
-                );
+                if crate::util::g17p_verbose() {
+                    dev_info!(
+                        self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                        "G17P render USC FList: type13 grow completed before work after {}ms serviced={}\n",
+                        poll,
+                        serviced,
+                    );
+                }
                 return Ok(());
             }
             if self.is_crashed() {
@@ -2697,17 +2703,19 @@ impl G17PLiveRuntime {
             .publish_render_usc_freelist_release(release)?;
         fence(Ordering::SeqCst);
         let announcement = g17_rtkit::encode_primary_device_control();
-        dev_info!(
-            self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
-            "G17P render USC FList: staged release opcode={:#x} sequence={:#x} ID={} slot={} producer {}->{}; announcing {:#x}\n",
-            publication.opcode,
-            release.sequence,
-            release.hardware_buffer_id,
-            publication.slot,
-            publication.producer_before,
-            publication.producer_after,
-            announcement,
-        );
+        if crate::util::g17p_verbose() {
+            dev_info!(
+                self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                "G17P render USC FList: staged release opcode={:#x} sequence={:#x} ID={} slot={} producer {}->{}; announcing {:#x}\n",
+                publication.opcode,
+                release.sequence,
+                release.hardware_buffer_id,
+                publication.slot,
+                publication.producer_before,
+                publication.producer_after,
+                announcement,
+            );
+        }
         Pin::new(self.gfx_rtkit.as_mut().ok_or(ENODEV)?)
             .send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, announcement)?;
         self.manager
@@ -2729,11 +2737,13 @@ impl G17PLiveRuntime {
                     publication.producer_after,
                 )?
             {
-                dev_info!(
-                    self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
-                    "G17P render USC FList: release consumed at producer {}\n",
-                    publication.producer_after,
-                );
+                if crate::util::g17p_verbose() {
+                    dev_info!(
+                        self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                        "G17P render USC FList: release consumed at producer {}\n",
+                        publication.producer_after,
+                    );
+                }
                 return Ok(());
             }
             fsleep(Delta::from_micros(50));
@@ -2768,12 +2778,14 @@ impl G17PLiveRuntime {
                 .ok_or(ENODEV)?
                 .complete_render_usc_freelist_release_if_consumed(target)?
             {
-                dev_info!(
-                    self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
-                    "G17P render USC FList: settled pending release producer {} before next submission after {}ms\n",
-                    target,
-                    poll,
-                );
+                if crate::util::g17p_verbose() {
+                    dev_info!(
+                        self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
+                        "G17P render USC FList: settled pending release producer {} before next submission after {}ms\n",
+                        target,
+                        poll,
+                    );
+                }
                 return Ok(());
             }
             if self.is_crashed() {

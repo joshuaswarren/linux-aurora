@@ -353,6 +353,10 @@ kernel::module_platform_driver! {
             default: 0,
             description: "DIAGNOSTIC ONLY -- bitmask, write native's value into TA-descriptor fields where ours differs structurally at MATCHED 256x256 geometry. This is the first VALID TA comparison: earlier ones diffed a 32x32 render against native's 256x256 capture, so workload-dependent fields looked like bugs. 1: the three sites carrying 0x100 where native carries 0x500 (+0x370, +0x388, +0x8d0; the fragment descriptor carries the same pair at +0x470). 2: +0x018 = 3, which we never write at all. 4: register 0xd419's value 0x60 -> 0xa9. 8: +0x7d8 0x200 -> 6 and +0x798 6 -> 0xa. The tiler bins ~60 bytes of a 1.28 MB tile buffer while every input -- vertex shader, uniform ranges, root descriptor, vertex data, VDM stream and stream pointer -- is verified correct on hardware, so these are what remains that we demonstrably send differently. Not a fix; it identifies which field the empty tile buffer depends on.",
         },
+        g17p_verbose: u32 {
+            default: 0,
+            description: "Per-submission diagnostic dumps. The render path emits several dozen lines for every submission -- the QoS regions, both status pages, the PM/HWPB and PBDesc snapshots, the tag-15 and SKSM records and the context roots. That is the bring-up instrumentation this driver was written with, and at desktop frame rates it costs real time and buries every other message in the ring buffer within a few seconds. 0: only lifecycle and failures (default), 1: the full per-submission dumps.",
+        },
         g17p_render_usc_freelist: u32 {
             default: 1,
             description: "NATIVE-DERIVED FIRST-SUBMIT CONTROL. Before the first render doorbell, publish AGXUSCPrivMemFList::updateSubmitInfo as the exact 0x40-byte opcode-0x20 device-control record naming Linux-owned resources. A matching firmware type-13 record is accepted only while the retained owner is live; release uses opcode 0x2e. 0: diagnostic suppression, 1: publish the cold render FList (default).",
