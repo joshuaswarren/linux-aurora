@@ -24,14 +24,13 @@
 #include <linux/of.h>
 #include "../hid-ids.h"
 
-#define COMMAND_TIMEOUT_MS 1000
 #define START_TIMEOUT_MS 2000
 /*
- * Long enough to cover the handshake's own delay plus a comm command that goes
- * unacknowledged, so a start that arrives early waits for the real answer
- * instead of timing out on top of it.
+ * Long enough to cover the handshake's own delay plus every FIFO registration
+ * running out its full command timeout, so a start that arrives early waits for
+ * the real answer instead of timing out on top of it.
  */
-#define HANDSHAKE_TIMEOUT_MS 4000
+#define HANDSHAKE_TIMEOUT_MS 30000
 
 #define MAX_INTERFACES 16
 
@@ -255,6 +254,23 @@ module_param(shared_buffer_size, uint, 0644);
 MODULE_PARM_DESC(shared_buffer_size,
 		 "Size of each shared FIFO registered with opcode 0x91");
 
+/*
+ * macOS takes both the count and the size from the machine's own device tree,
+ * not from anything in the kext: AppleHIDTransportDevice unserialises the
+ * "Protocol Binary Config" OSData property off the transport nub, and
+ * cacheProtocolConfig() walks its "MemoryFifos" array, creating one read FIFO
+ * per element sized by that element's "ReadSize".  The count is simply the
+ * array's length and AppleHIDTransportDevice::newStaticConfig() is `return 0`,
+ * so there is no compiled-in fallback to copy - the numbers exist only on the
+ * device.  Until that property has been read off J700, both stay parameters,
+ * defaulting to the single 16 KiB FIFO that MTP has already accepted and
+ * echoed back.
+ *
+ * For scale, the only size-shaped constants the kext does carry are
+ * MaxReadSize / MaxWriteSize, both defaulting to 4096, and
+ * MaxSharedMemoryReportLength, 65536 - so a ring that has to carry a maximal
+ * shared-memory report would need to be four times the current default.
+ */
 static unsigned int shared_buffer_count = 1;
 module_param(shared_buffer_count, uint, 0644);
 MODULE_PARM_DESC(shared_buffer_count,
@@ -312,6 +328,24 @@ module_param(shared_buffer_lossy_ack, bool, 0644);
 MODULE_PARM_DESC(shared_buffer_lossy_ack,
 		 "Once a shared FIFO is registered, treat an unanswered comm command as delivered rather than failed");
 
+/*
+ * How long to wait for a control report to be answered.
+ *
+ * This used to be one second, which is not where macOS gives up:
+ * AppleHIDTransportProtocolSCMFIFO's ReportTimeoutMs defaults to 5000 and
+ * waitForControlComplete() sleeps on the command gate for that long.  The
+ * difference matters because of what a premature give-up does to this
+ * driver's sequence numbering - dchid_cmd() advances tx_seq when it returns,
+ * so an answer that arrives late is then rejected for a bad sequence, and so
+ * is every answer after it.  One command abandoned too early therefore looks
+ * exactly like the coprocessor having gone deaf, which is what was seen right
+ * after the first successful FIFO registration.
+ */
+static unsigned int command_timeout_ms = 5000;
+module_param(command_timeout_ms, uint, 0644);
+MODULE_PARM_DESC(command_timeout_ms,
+		 "How long to wait for a control report to be answered (macOS uses 5000)");
+
 /* Never poll faster than this, whatever the parameter says. */
 #define SHMEM_POLL_MIN_MS 50
 
@@ -323,13 +357,21 @@ static unsigned int shmem_poll_interval(void)
 	return max(shared_buffer_poll_ms, (unsigned int)SHMEM_POLL_MIN_MS);
 }
 
+/*
+ * handshakeGated builds bytes 0 and 1 with a single `strh` of 0x0091 and byte 2
+ * with `strb wzr`, so both of these are hard zeros on macOS for every FIFO it
+ * registers: the message carries no index, no direction and no interface
+ * number, and a FIFO is identified purely by the order it was registered in.
+ * They stay adjustable only because they are the cheapest thing to vary if a
+ * registration is ever refused.
+ */
 static int shared_buffer_unk1;
 module_param(shared_buffer_unk1, int, 0644);
-MODULE_PARM_DESC(shared_buffer_unk1, "Second byte of the opcode 0x91 message");
+MODULE_PARM_DESC(shared_buffer_unk1, "Second byte of the opcode 0x91 message (macOS sends 0)");
 
 static int shared_buffer_unk2;
 module_param(shared_buffer_unk2, int, 0644);
-MODULE_PARM_DESC(shared_buffer_unk2, "Third byte of the opcode 0x91 message");
+MODULE_PARM_DESC(shared_buffer_unk2, "Third byte of the opcode 0x91 message (macOS sends 0)");
 
 /*
  * How many FIFOs the host is willing to hand MTP.  macOS's MemoryFIFOs
@@ -630,8 +672,12 @@ static int dchid_send(struct dchid_iface *iface, u32 flags, void *msg, size_t si
  * Once a shared FIFO is registered, MTP stops acknowledging comm commands over
  * DockChannel, which is consistent with the replies moving into the ring the
  * host is then expected to drain.  Show the ring's head and tail and the first
- * bytes of its data area whenever a command goes unanswered, so the framing can
- * be read off real traffic rather than guessed at.
+ * bytes of its data area whenever a command goes unanswered.
+ *
+ * The layout is AIDCircularBufferShared's: the registered size is the whole
+ * allocation, the first eight bytes are two u32 indices, the payload starts at
+ * +8 and its capacity is size - 8.  Which of the two indices MTP moves is what
+ * these lines are here to show.
  */
 static void dchid_dump_shmem(struct dockchannel_hid *dchid, bool only_on_change)
 {
@@ -682,7 +728,8 @@ static int dchid_cmd(struct dchid_iface *iface, u32 type, u32 req,
 	if (ret < 0)
 		goto done;
 
-	if (!wait_for_completion_timeout(&iface->out_complete, msecs_to_jiffies(COMMAND_TIMEOUT_MS))) {
+	if (!wait_for_completion_timeout(&iface->out_complete,
+					 msecs_to_jiffies(command_timeout_ms))) {
 		dev_err(iface->dchid->dev, "output report 0x%x to iface  %d (%s) timed out\n",
 			report_id, iface->index, iface->name);
 		dchid_dump_shmem(iface->dchid, false);
@@ -1283,6 +1330,11 @@ static int dchid_register_shared_fifo(struct dockchannel_hid *dchid,
 	fifo->size = shared_buffer_size;
 	dchid->nr_fifos = index + 1;
 
+	/*
+	 * macOS sends this as a feature SET_REPORT with report ID 0x91 on the
+	 * management interface, which is what dchid_comm_cmd() is: feature
+	 * report, REQ_SET_REPORT, interface 0.
+	 */
 	ret = dchid_comm_cmd(dchid, &msg, sizeof(msg));
 	dev_info(dchid->dev,
 		 "Shared FIFO #%u: iova=%pad size=%u unk=%d,%d ret=%d\n",
