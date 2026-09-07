@@ -79,7 +79,10 @@ assert "select_render_slot(render_slot)?" in submit
 assert "if defer_completion" in submit
 wait = function(drm, "fn wait_render_slot(")
 assert ".poll_deferred_render_completion(render_slot)?" in wait
-assert wait.index(".poll_deferred_render_completion(render_slot)?") < wait.index("fsleep(Delta::from_millis(1))")
+# The sleep interval is now a backoff schedule rather than a flat
+# millisecond, but the property this asserts is unchanged: the poll runs
+# first, and the sleep that follows it is outside the runtime mutex.
+assert wait.index(".poll_deferred_render_completion(render_slot)?") < wait.index("fsleep(")
 
 # Job-root SecureGart setup must retain Mesa's six existing GPUVM low views.
 # Only the VM-lifetime-reserved null view is a driver-owned KernelMapping.
