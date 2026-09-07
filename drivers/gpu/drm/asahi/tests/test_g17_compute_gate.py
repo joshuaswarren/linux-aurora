@@ -8,6 +8,10 @@ def item(needle):
  while d:d+=(s[i]=='{')-(s[i]=='}');i+=1
  return s[a:i]
 methods='\n'.join(item(n) for n in ['    fn acquire_compute(', '    fn acquire_lease('])
+# The slot-count constant lives beside the state, not inside it, so extract
+# it too rather than re-declaring a copy that could drift.
+slots=s[s.index('const G17P_RENDER_SLOTS: usize ='):]
+slots=slots[:slots.index(';')+1]
 state='\n'.join(item(n) for n in ['struct G17PQueueLeaseState {','impl G17PQueueLeaseState {'])
 guards='\n'.join(item(n) for n in ['pub(crate) struct G17PComputeLeaseGuard {','impl G17PComputeLeaseGuard {','impl Drop for G17PComputeLeaseGuard {','struct G17PLeaseGuard {','impl G17PLeaseGuard {','impl Drop for G17PLeaseGuard {'])
 code=r'''
@@ -15,6 +19,7 @@ code=r'''
 use std::sync::{Arc,atomic::{AtomicU32,Ordering}};use std::ops::{Deref,DerefMut};use std::time::Duration;
 type Result<T=()>=std::result::Result<T,i32>;const EIO:i32=5;const EBUSY:i32=16;const ERESTARTSYS:i32=512;
 mod g17_resources { pub struct G17PRenderQueuePair; impl G17PRenderQueuePair { pub const SLOT_COUNT:u8=2; } }
+'''+slots+r'''
 struct Mutex<T>(std::sync::Mutex<T>);struct Guard<'a,T>(Option<std::sync::MutexGuard<'a,T>>);
 impl<T>Mutex<T>{fn lock(&self)->Guard<'_,T>{Guard(Some(self.0.lock().unwrap()))}}
 impl<T>Deref for Guard<'_,T>{type Target=T;fn deref(&self)->&T{self.0.as_ref().unwrap()}}

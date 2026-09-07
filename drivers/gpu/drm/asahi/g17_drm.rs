@@ -147,10 +147,36 @@ pub(crate) struct G17PQueueRegistry {
     compute_faulted: AtomicU32,
 }
 
+const G17P_RENDER_SLOTS: usize =
+    g17_resources::G17PRenderQueuePair::SLOT_COUNT as usize;
+
 #[derive(Default)]
 struct G17PQueueLeaseState {
     render_slots: u8,
     compute_install: bool,
+    /// VM that currently owns each render slot's retained storage, or 0 for a
+    /// slot no client has claimed yet.
+    ///
+    /// The `G17PUserRenderStorage` behind a slot -- its descriptors, render
+    /// state, TVB pool, parameter-management graph and application-GART root --
+    /// belongs to one VM. Handing the slot to a different VM forces
+    /// `handoff_retained_render_vm` to tear that whole graph down and rebuild
+    /// it in the incoming VM. Recording the owner lets a client come back to
+    /// the storage it already built instead of taking whichever slot happens to
+    /// be free, which is what made two concurrent clients rebuild each other's
+    /// graph on every alternation.
+    render_owner: [u64; G17P_RENDER_SLOTS],
+    /// Acquisition order, used to pick a victim when more clients render than
+    /// there are slots. Zero means never acquired.
+    render_epoch: [u64; G17P_RENDER_SLOTS],
+    /// Slots whose retained graph is known to be unusable: a render abandoned
+    /// after a completion timeout leaves firmware potentially still running the
+    /// group, and its host-side tracker set, so every later submission on that
+    /// slot fails. Retiring the slot costs concurrency; continuing to hand it
+    /// out costs the session, because each client that lands on it is told
+    /// EBUSY and reports VK_ERROR_DEVICE_LOST.
+    render_quarantined: u8,
+    epoch: u64,
 }
 
 impl G17PQueueLeaseState {
@@ -158,17 +184,72 @@ impl G17PQueueLeaseState {
         (1u8 << g17_resources::G17PRenderQueuePair::SLOT_COUNT) - 1
     }
 
-    fn acquire_render_slot(&mut self) -> Option<u8> {
-        let free = (!self.render_slots) & Self::render_mask();
-        if free == 0 { return None; }
-        let slot = free.trailing_zeros() as u8;
+    /// True once no render slot can ever be handed out again.
+    fn render_exhausted(&self) -> bool {
+        self.render_quarantined & Self::render_mask() == Self::render_mask()
+    }
+
+    fn take_render_slot(&mut self, slot: u8, owner: u64) -> u8 {
         self.render_slots |= 1u8 << slot;
-        Some(slot)
+        self.render_owner[slot as usize] = owner;
+        self.epoch = self.epoch.wrapping_add(1);
+        self.render_epoch[slot as usize] = self.epoch;
+        slot
+    }
+
+    /// Pick a render slot for `owner`, preferring the one holding its own
+    /// retained graph.
+    ///
+    /// Order: this owner's own slot, then a slot no client has claimed, then
+    /// the least recently used free slot. The last case is a real handoff and
+    /// is only reached when more clients render concurrently than there are
+    /// slots; it is still strictly better than failing, because the handoff
+    /// path works and an EBUSY does not.
+    fn acquire_render_slot(&mut self, owner: u64) -> Option<u8> {
+        let free = (!self.render_slots) & Self::render_mask() & !self.render_quarantined;
+        if free == 0 {
+            return None;
+        }
+        let usable = |slot: usize| free & (1u8 << slot) != 0;
+        if owner != 0 {
+            for slot in 0..G17P_RENDER_SLOTS {
+                if usable(slot) && self.render_owner[slot] == owner {
+                    return Some(self.take_render_slot(slot as u8, owner));
+                }
+            }
+        }
+        for slot in 0..G17P_RENDER_SLOTS {
+            if usable(slot) && self.render_owner[slot] == 0 {
+                return Some(self.take_render_slot(slot as u8, owner));
+            }
+        }
+        let victim = (0..G17P_RENDER_SLOTS)
+            .filter(|slot| usable(*slot))
+            .min_by_key(|slot| self.render_epoch[*slot])?;
+        Some(self.take_render_slot(victim as u8, owner))
     }
 
     fn release_render_slot(&mut self, slot: u8) {
         debug_assert!(slot < g17_resources::G17PRenderQueuePair::SLOT_COUNT);
         self.render_slots &= !(1u8 << slot);
+    }
+
+    /// Forget a departed client's claim, so a new client takes its slot before
+    /// it takes one still in use.
+    ///
+    /// Advisory only. Releasing early -- a VM with two logical queues loses its
+    /// claim when the first is destroyed -- costs nothing: the slot merely
+    /// becomes preferable to a stranger, and if the same VM comes back its
+    /// retained graph is still there, so it restages rather than rebuilds.
+    fn release_render_claim(&mut self, owner: u64) {
+        if owner == 0 {
+            return;
+        }
+        for slot in 0..G17P_RENDER_SLOTS {
+            if self.render_owner[slot] == owner {
+                self.render_owner[slot] = 0;
+            }
+        }
     }
 }
 
@@ -207,6 +288,12 @@ impl G17PQueueRegistry {
         Ok(G17PComputeLeaseGuard { registry: self.clone(), exclusive: first_install })
     }
 
+    /// Drop a departed client's render-slot claim.
+    fn release_render_claim(&self, owner: u64) {
+        let mut held = self.lease.lock();
+        held.release_render_claim(owner);
+    }
+
     /// Reserve one queue slot, or report a full device.
     fn reserve_queue(&self) -> Result {
         let mut live = self.live_queues.load(Ordering::Acquire);
@@ -230,22 +317,62 @@ impl G17PQueueRegistry {
         self.live_queues.fetch_sub(1, Ordering::AcqRel);
     }
 
-    /// Block until this client owns the hardware compute graph.
-    fn acquire_lease(self: &Arc<Self>, _id: u64) -> Result<G17PLeaseGuard> {
+    /// Block until this VM owns a render slot, preferring the slot that already
+    /// holds its retained graph.
+    ///
+    /// `owner` is the submitting VM's id, not the logical queue's: the retained
+    /// render storage is owned by a VM, so two queues of one client share a
+    /// slot instead of evicting each other. Waiting here is interruptible and
+    /// unbounded by design -- a client that has to wait loses latency, whereas
+    /// an EBUSY from this path reaches Mesa as VK_ERROR_DEVICE_LOST and takes
+    /// the client's whole context with it.
+    fn acquire_lease(self: &Arc<Self>, owner: u64) -> Result<G17PLeaseGuard> {
         let mut held = self.lease.lock();
-        while held.compute_install || held.render_slots == G17PQueueLeaseState::render_mask() {
-            if self.compute_faulted.load(Ordering::Acquire) != 0 { return Err(EIO); }
+        let slot = loop {
+            if self.compute_faulted.load(Ordering::Acquire) != 0 {
+                return Err(EIO);
+            }
+            // Every slot retired: no wait can ever succeed, so report the dead
+            // device instead of sleeping forever.
+            if held.render_exhausted() {
+                return Err(EIO);
+            }
+            if !held.compute_install {
+                if let Some(slot) = held.acquire_render_slot(owner) {
+                    break slot;
+                }
+            }
             if self.lease_free.wait_interruptible(&mut held) {
                 return Err(ERESTARTSYS);
             }
-        }
-        if self.compute_faulted.load(Ordering::Acquire) != 0 { return Err(EIO); }
-        let slot = held.acquire_render_slot().ok_or(EBUSY)?;
+        };
         core::mem::drop(held);
         Ok(G17PLeaseGuard {
             registry: self.clone(),
             slot,
         })
+    }
+
+    /// Retire one render slot whose retained graph can no longer be trusted.
+    ///
+    /// Called after a completion timeout has abandoned a submission. Nothing is
+    /// freed -- the firmware may still own the abandoned group -- but no client
+    /// is handed this slot again for the rest of the session.
+    fn quarantine_render_slot(&self, slot: u8) {
+        let mut held = self.lease.lock();
+        if held.render_quarantined & (1u8 << slot) != 0 {
+            return;
+        }
+        held.render_quarantined |= 1u8 << slot;
+        let remaining = (G17PQueueLeaseState::render_mask() & !held.render_quarantined)
+            .count_ones();
+        drop(held);
+        pr_warn!(
+            "G17P render: retiring slot {} after an abandoned submission; {} render slot(s) left\n",
+            slot,
+            remaining,
+        );
+        self.lease_free.notify_all();
     }
 }
 
@@ -517,6 +644,7 @@ impl Drop for G17PQueue {
             .release_async_compute_queue(self.id);
         drop(self.async_backend.take());
         self.runtime.release_compute_owner(self.id);
+        self.registry.release_render_claim(self.vm.id());
         self.registry.release_queue();
     }
 }
@@ -866,7 +994,16 @@ impl G17PQueue {
     ) -> Result<G17PLeaseGuard> {
         Self::wait_input_fences(syncs)
             .map_err(|error| Self::stage_fail(submission_id, "wait-input-fences", error))?;
-        self.registry.acquire_lease(self.id)
+        // Key the slot on the VM, not on this logical queue: the retained
+        // render graph belongs to the VM, so two queues of one client must
+        // share a slot rather than hand it off between themselves. Owner zero
+        // claims nothing, which is exactly the historical lowest-free policy.
+        let owner = if *module_parameters::g17p_render_slot_affinity.value() != 0 {
+            self.vm.id()
+        } else {
+            0
+        };
+        self.registry.acquire_lease(owner)
             .map_err(|error| Self::stage_fail(submission_id, "acquire-lease", error))
     }
 
@@ -1709,6 +1846,14 @@ impl queue::Queue for G17PQueue {
                 self.runtime
                     .wait_render_slot(lease.slot())
                     .map_err(|error| {
+                        // An abandoned render leaves the firmware potentially
+                        // still running the group and the slot's host tracker
+                        // set, so every later submission on this slot fails.
+                        // Retire it here rather than handing the same broken
+                        // slot to the next client.
+                        if error == ETIMEDOUT {
+                            self.registry.quarantine_render_slot(lease.slot());
+                        }
                         Self::stage_fail(submission_id, "wait-render-slot", error)
                     })?;
             }

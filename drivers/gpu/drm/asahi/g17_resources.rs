@@ -6932,6 +6932,20 @@ impl G17PUserRenderStorage {
             || previous.tiling.write != 0
             || previous.fragment.write != 0
         {
+            pr_err!(
+                "G17P render rebase: fresh graph is not empty; owner-pid={} qids={}/{} ordinal={} job-list-empty={} tiling done/read/write={}/{}/{} fragment done/read/write={}/{}/{} (required: job-list empty, both queues done==read==write==0)\n",
+                self.owner_pid,
+                self.queue_pair.tiling,
+                self.queue_pair.fragment,
+                submission_ordinal,
+                previous.job_list_empty,
+                previous.tiling.done,
+                previous.tiling.read,
+                previous.tiling.write,
+                previous.fragment.done,
+                previous.fragment.read,
+                previous.fragment.write,
+            );
             return Err(EBUSY);
         }
         self.graph.with_bytes_mut(|raw| {
@@ -6944,6 +6958,56 @@ impl G17PUserRenderStorage {
         })?;
         core::sync::atomic::fence(Ordering::SeqCst);
         Ok(())
+    }
+
+    /// True when a restage at `submission_ordinal` would be refused for a
+    /// HOST bookkeeping mismatch alone, with the firmware provably idle.
+    ///
+    /// `restage_command`'s guard tests two independent things at once: whether
+    /// the firmware is still running the previous group (job list, queue
+    /// idleness) and whether the host's ordinal still agrees with the ring
+    /// producer this graph has published. The second can drift on its own. A
+    /// submission stages its items into the ring -- advancing `write` -- before
+    /// the outer publication and the tag-14/tag-15 that make them visible; if
+    /// any step in between fails, the ordinal never advances while `write` has
+    /// moved on by one group. From then on every restage on this graph is
+    /// refused for a mismatch that has nothing to do with the GPU, so the
+    /// client is retired permanently by a single lost frame.
+    ///
+    /// Reported separately so the caller can rebuild the graph -- the same
+    /// thing a cross-VM handoff does, and equally safe here because the
+    /// condition includes an empty job list and two idle queues. It is never
+    /// true while the firmware still owns the previous group.
+    pub(crate) fn restage_admission_desynced(
+        &mut self,
+        submission_ordinal: u32,
+    ) -> Result<bool> {
+        if submission_ordinal == 0 || submission_ordinal >= G17P_RETAINED_RENDER_ORDINALS {
+            return Ok(false);
+        }
+        let Some(plan) =
+            G17PRenderItemPlan::new(submission_ordinal, g17p_render_tag16_enabled())
+        else {
+            return Ok(false);
+        };
+        core::sync::atomic::fence(Ordering::Acquire);
+        let previous = self.snapshot()?;
+        Ok(previous.job_list_empty
+            && previous.tiling.idle()
+            && previous.fragment.idle()
+            && (previous.tiling.write != plan.base || previous.fragment.write != plan.base))
+    }
+
+    /// Describe the drift for the log that reports it.
+    /// Tuple: (expected base, tiling write, fragment write).
+    pub(crate) fn restage_admission_cursors(
+        &mut self,
+        submission_ordinal: u32,
+    ) -> Result<(u32, u32, u32)> {
+        let plan = G17PRenderItemPlan::new(submission_ordinal, g17p_render_tag16_enabled())
+            .ok_or(EINVAL)?;
+        let previous = self.snapshot()?;
+        Ok((plan.base, previous.tiling.write, previous.fragment.write))
     }
 
     /// Refresh the canonical queue group's command-owned objects after the
@@ -6994,6 +7058,31 @@ impl G17PUserRenderStorage {
         if !previous.job_list_empty || !previous.tiling.idle() || !previous.fragment.idle()
             || previous.tiling.write != plan.base || previous.fragment.write != plan.base
         {
+            // This is the one place a render is refused because the PREVIOUS
+            // group on this retained storage has not finished. It used to
+            // return a bare EBUSY, which reaches Mesa as VK_ERROR_DEVICE_LOST
+            // and destroys the client's context -- so the one boot that
+            // reproduces it has to carry every input the guard tested, plus
+            // which owner's storage this is. Name the owner (its pid and queue
+            // pair), its ordinal, and each field with its actual value against
+            // what was required.
+            dev_err!(
+                dev.as_ref(),
+                "G17P render restage: previous group still owns this storage; owner-pid={} qids={}/{} ordinal={} base={} job-list-empty={} tiling done/read/write={}/{}/{} fragment done/read/write={}/{}/{} (required: job-list empty, both queues done==read==write, both writes == {})\n",
+                self.owner_pid,
+                self.queue_pair.tiling,
+                self.queue_pair.fragment,
+                submission_ordinal,
+                plan.base,
+                previous.job_list_empty,
+                previous.tiling.done,
+                previous.tiling.read,
+                previous.tiling.write,
+                previous.fragment.done,
+                previous.fragment.read,
+                previous.fragment.write,
+                plan.base,
+            );
             return Err(EBUSY);
         }
         let mut next_descriptors = restage_step!("descriptor allocation", MappedObject::new_wc(
@@ -13727,17 +13816,19 @@ impl G17ResourceOwner {
             Ok(())
         })?;
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        dev_info!(
-            self.dev().as_ref(),
-            "G17P render PM: PBDesc index={} page-list-address={:#x} pages={} raw={:08x?} reconstructed={:#x} published-table=[{:#x},{:#x}]\n",
-            index,
-            page_list_address,
-            page_count,
-            published,
-            g17_submission::g17p_pbdesc_reconstructed_address(page_list_address),
-            self.resources.pb_descriptor_table_low.iova(),
-            self.resources.pb_descriptor_table.iova(),
-        );
+        if crate::util::g17p_verbose() {
+            dev_info!(
+                self.dev().as_ref(),
+                "G17P render PM: PBDesc index={} page-list-address={:#x} pages={} raw={:08x?} reconstructed={:#x} published-table=[{:#x},{:#x}]\n",
+                index,
+                page_list_address,
+                page_count,
+                published,
+                g17_submission::g17p_pbdesc_reconstructed_address(page_list_address),
+                self.resources.pb_descriptor_table_low.iova(),
+                self.resources.pb_descriptor_table.iova(),
+            );
+        }
         Ok(())
     }
 
@@ -13824,6 +13915,28 @@ impl G17ResourceOwner {
         ]
     }
 
+    /// Point the device-global parameter-buffer loader at this storage's
+    /// parameter-management page list and PBDesc entry.
+    ///
+    /// `partial_primary_index` and the PBDesc table are mapped at fixed native
+    /// addresses in both the firmware VM and context 0, because `halLoadPBDesc`
+    /// publishes to one device-global PB loader whose faults the hardware
+    /// attributes to VM slot 0. They are therefore per-DEVICE, while every
+    /// `G17PUserRenderStorage` builds its own `G17PParameterManagement` with
+    /// its own page list -- so whichever storage stamped these objects last
+    /// owns them. Staging this only at storage construction was survivable
+    /// while every client alternation rebuilt the graph; once a client keeps
+    /// its retained storage across submissions, the loader has to be
+    /// re-pointed at the storage that is actually about to run.
+    pub(crate) fn stage_render_parameter_buffer_view(
+        &mut self,
+        storage: &mut G17PUserRenderStorage,
+    ) -> Result {
+        self.stage_render_parameter_buffer_page_list(storage)?;
+        let descriptor = storage.parameter_buffer_descriptor()?;
+        self.stage_render_parameter_buffer_descriptor(descriptor)
+    }
+
     pub(crate) fn stage_render_parameter_buffer_page_list(
         &mut self,
         storage: &mut G17PUserRenderStorage,
@@ -13844,13 +13957,15 @@ impl G17ResourceOwner {
             }
             Ok(())
         })?;
-        dev_info!(
-            self.dev().as_ref(),
-            "G17P render PM: staged native PB page-list aliases=[{:#x},{:#x}] first={:x?}\n",
-            self.resources.partial_primary_index.iova(),
-            g17_submission::G17P_PARTIAL_OPENING_PRIMARY_INDEX_GPU_VA,
-            first,
-        );
+        if crate::util::g17p_verbose() {
+            dev_info!(
+                self.dev().as_ref(),
+                "G17P render PM: staged native PB page-list aliases=[{:#x},{:#x}] first={:x?}\n",
+                self.resources.partial_primary_index.iova(),
+                g17_submission::G17P_PARTIAL_OPENING_PRIMARY_INDEX_GPU_VA,
+                first,
+            );
+        }
         Ok(())
     }
 

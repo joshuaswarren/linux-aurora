@@ -85,6 +85,10 @@ kernel::module_platform_driver! {
             // permissions: 0o644,
             description: "Fully isolate GPU contexts (limits performance)",
         },
+        g17p_render_slot_affinity: u32 {
+            default: 1,
+            description: "Keep each render client on the bounded render slot that already holds its retained graph. The G17PUserRenderStorage behind a slot -- descriptors, render state, TVB pool, parameter-management graph and application-GART root -- belongs to one VM, so handing a slot to a different VM makes handoff_retained_render_vm tear that graph down and rebuild it in the incoming VM. Taking whichever slot happened to be free therefore made two concurrent clients rebuild each other's graph on every alternation, and every restage in between was a chance to be refused with EBUSY, which Mesa reports as VK_ERROR_DEVICE_LOST. With affinity, a client returns to its own slot; a third client blocks in acquire_lease (interruptible) or, when a slot is genuinely free, takes the least recently used one through the existing handoff. This also decides whether the device-global parameter-buffer loader is re-pointed at the submitting client's graph, which is unnecessary while every alternation rebuilds it. 0: historical lowest-free-slot selection, 1: per-VM affinity (default).",
+        },
         g17p_simplefb_iova: u64 {
             default: 0,
             description: "DIAGNOSTIC. Non-zero maps the exact active apple,simple-framebuffer boot aperture into every T8140 user VM at this GPU VA, uncached and read/write, so a bounded harness can make GPU stores visible without a DCP driver. The DT node, x8r8g8b8 geometry, no-map framebuffer reservation, page alignment and complete VA interval are all validated before any mapping; the alias is retained until VM destruction and excluded from ordinary user unbinds. This does not touch DCP or copy pixels. Use only while simpledrm owns the iBoot framebuffer. 0: off (default).",
