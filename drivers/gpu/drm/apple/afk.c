@@ -162,9 +162,8 @@ static void afk_getbuf(struct apple_dcp_afkep *ep, u64 message)
 	u64 reply;
 
 	trace_afk_getbuf(ep, size, tag);
-	dev_info(ep->dcp->dev,
-		 "AFK[ep:%02x]: GETBUF raw %#llx size %#x tag %#x existing size %#lx\n",
-		 ep->endpoint, message, size, tag, ep->bfr_size);
+	dev_info(ep->dcp->dev, "AFK[ep:%02x]: getbuf size %#x tag %#x\n",
+		 ep->endpoint, size, tag);
 
 	if (ep->bfr) {
 		dev_err(ep->dcp->dev,
@@ -194,8 +193,7 @@ static void afk_init_rxtx(struct apple_dcp_afkep *ep, u64 message,
 	u32 base = FIELD_GET(INITRB_OFFSET, message) << BLOCK_SHIFT;
 	u32 size = FIELD_GET(INITRB_SIZE, message) << BLOCK_SHIFT;
 	u16 tag = FIELD_GET(INITRB_TAG, message);
-	u16 type = FIELD_GET(RBEP_TYPE, message);
-	u32 block_size, bufsz, end, header_size;
+	u32 bufsz, hdrsz, end;
 
 	if (tag != ep->bfr_tag) {
 		dev_err(ep->dcp->dev, "AFK[ep:%02x]: expected tag 0x%x but got 0x%x\n",
@@ -225,45 +223,18 @@ static void afk_init_rxtx(struct apple_dcp_afkep *ep, u64 message,
 	}
 
 	bfr->hdr = ep->bfr + base;
-	bufsz = le32_to_cpu(bfr->hdr->bufsz);
-	dev_info(ep->dcp->dev,
-		 "AFK[ep:%02x]: INITRB raw %#llx type %#x base %#x size %#x tag %#x allocation %#lx header bufsz %#x\n",
-		 ep->endpoint, message, type, base, size, tag, ep->bfr_size,
-		 bufsz);
+	bufsz = le32_to_cpu(*(__le32 *)bfr->hdr);	/* first word of block 0 */
+	hdrsz = size - bufsz;
+	if (bufsz >= size || hdrsz % AFK_RB_BLOCKS ||
+	    hdrsz / AFK_RB_BLOCKS < AFK_RB_BLOCK_MIN) {
+		dev_err(ep->dcp->dev,
+			"AFK[ep:%02x]: ring bufsz %#x with size %#x gives no valid header (base %#x, msg %#llx)\n",
+			ep->endpoint, bufsz, size, base, message);
+		return;
+	}
+	bfr->block = hdrsz / AFK_RB_BLOCKS;
 
-	if (bufsz >= size || (size - bufsz) % AFK_RING_BLOCK_COUNT) {
-		dev_err(ep->dcp->dev,
-			"AFK[ep:%02x]: invalid ring geometry: bufsz %#x size %#x\n",
-			ep->endpoint, bufsz, size);
-		return;
-	}
-	header_size = size - bufsz;
-	block_size = header_size / AFK_RING_BLOCK_COUNT;
-	if (block_size < AFK_RING_BLOCK_SIZE ||
-	    !IS_ALIGNED(block_size, AFK_RING_BLOCK_SIZE) ||
-	    (ep->dcp->fw_compat != DCP_FIRMWARE_H17P &&
-	     block_size != AFK_RING_BLOCK_SIZE)) {
-		dev_err(ep->dcp->dev,
-			"AFK[ep:%02x]: unsupported ring block size %#x (header %#x)\n",
-			ep->endpoint, block_size, header_size);
-		return;
-	}
-	header_size = size - bufsz;
-	block_size = header_size / AFK_RING_BLOCK_COUNT;
-	if (block_size < AFK_RING_BLOCK_SIZE ||
-	    !IS_ALIGNED(block_size, AFK_RING_BLOCK_SIZE) ||
-	    (ep->dcp->fw_compat != DCP_FIRMWARE_H17P &&
-	     block_size != AFK_RING_BLOCK_SIZE)) {
-		dev_err(ep->dcp->dev,
-			"AFK[ep:%02x]: unsupported ring block size %#x (header %#x)\n",
-			ep->endpoint, block_size, header_size);
-		return;
-	}
-	bfr->block = block;
-
-	bfr->rptr = (__le32 *)((u8 *)bfr->hdr + block_size);
-	bfr->wptr = (__le32 *)((u8 *)bfr->hdr + 2 * block_size);
-	bfr->buf = (u8 *)bfr->hdr + header_size;
+	bfr->buf = (u8 *)bfr->hdr + hdrsz;
 	bfr->bufsz = bufsz;
 	bfr->block_size = block_size;
 	bfr->ready = true;
@@ -734,218 +705,6 @@ too_small:
 		ep->endpoint, data_size);
 }
 
-static void afk_recv_handle_v2(struct apple_dcp_afkep *ep, u8 *data,
-			       size_t data_size)
-{
-	struct afk_v2_packet_hdr *packet = (void *)data;
-	struct afk_v2_message_hdr *message;
-	struct apple_epic_service *service;
-	size_t message_size, payload_size;
-	u16 channel;
-	u8 *payload;
-
-	if (data_size < sizeof(*packet) + sizeof(*message)) {
-		dev_err(ep->dcp->dev,
-			"AFK[ep:%02x]: AFKEPV2 packet too small: %#zx\n",
-			ep->endpoint, data_size);
-		return;
-	}
-
-	message_size = le32_to_cpu(packet->message_size);
-	if (message_size != data_size - sizeof(*packet)) {
-		dev_err(ep->dcp->dev,
-			"AFK[ep:%02x]: AFKEPV2 split packet unsupported: %#zx/%#zx\n",
-			ep->endpoint, data_size - sizeof(*packet), message_size);
-		return;
-	}
-
-	channel = le16_to_cpu(packet->interface_id);
-	message = (void *)(data + sizeof(*packet));
-	payload = (u8 *)(message + 1);
-	payload_size = message_size - sizeof(*message);
-	service = afk_epic_find_service(ep, channel);
-
-	switch (message->kind) {
-	case AFK_V2_REPORT:
-		if (message->opcode == AFK_V2_REPORT_PUBLISH) {
-			int ret;
-
-			if (service) {
-				dev_warn(ep->dcp->dev,
-					 "AFK[ep:%02x]: duplicate AFKEPV2 publish on channel %u\n",
-					 ep->endpoint, channel);
-				return;
-			}
-
-			afk_recv_handle_init(ep, channel, payload, payload_size);
-			service = afk_epic_find_service(ep, channel);
-			if (!service)
-				return;
-
-			/*
-			 * AFKEPV2 publishes an interface before the host consumes it.
-			 * Opening a matched interface is an empty report with opcode
-			 * 0x12 and the report flag set.
-			 */
-			ret = afk_send_epic(ep, channel, 0, EPIC_TYPE_NOTIFY,
-					    EPIC_CAT_REPORT, AFK_V2_REPORT_OPEN,
-					    NULL, 0);
-			if (ret)
-				dev_err(ep->dcp->dev,
-					"AFK[ep:%02x]: failed to open AFKEPV2 service on channel %u: %d\n",
-					ep->endpoint, channel, ret);
-			else
-				dev_info(ep->dcp->dev,
-					 "AFK[ep:%02x]: opened AFKEPV2 service on channel %u\n",
-					 ep->endpoint, channel);
-			return;
-		}
-
-		if (!service) {
-			dev_warn(ep->dcp->dev,
-				 "AFK[ep:%02x]: AFKEPV2 report %#x on disabled channel %u\n",
-				 ep->endpoint, message->opcode, channel);
-			return;
-		}
-
-		if (message->opcode == AFK_V2_REPORT_CLOSE ||
-		    message->opcode == AFK_V2_REPORT_TERMINATE) {
-			afk_recv_handle_teardown(ep, channel);
-			return;
-		}
-
-		if (!service->torndown && service->ops->report)
-			service->ops->report(service, message->opcode, payload,
-					     payload_size);
-		return;
-
-	case AFK_V2_COMMAND:
-		dev_dbg(ep->dcp->dev,
-			"AFK[ep:%02x]: AFKEPV2 command %#x id %#llx on channel %u\n",
-			ep->endpoint, message->opcode,
-			le64_to_cpu(message->id), channel);
-		return;
-
-	case AFK_V2_RESPONSE:
-		dev_dbg(ep->dcp->dev,
-			"AFK[ep:%02x]: AFKEPV2 response %#x id %#llx on channel %u\n",
-			ep->endpoint, message->opcode,
-			le64_to_cpu(message->id), channel);
-		return;
-
-	default:
-		dev_warn(ep->dcp->dev,
-			 "AFK[ep:%02x]: unknown AFKEPV2 message kind %#x on channel %u\n",
-			 ep->endpoint, message->kind, channel);
-	}
-}
-
-static void afk_recv_handle_v2(struct apple_dcp_afkep *ep, u8 *data,
-			       size_t data_size)
-{
-	struct afk_v2_packet_hdr *packet = (void *)data;
-	struct afk_v2_message_hdr *message;
-	struct apple_epic_service *service;
-	size_t message_size, payload_size;
-	u16 channel;
-	u8 *payload;
-
-	if (data_size < sizeof(*packet) + sizeof(*message)) {
-		dev_err(ep->dcp->dev,
-			"AFK[ep:%02x]: AFKEPV2 packet too small: %#zx\n",
-			ep->endpoint, data_size);
-		return;
-	}
-
-	message_size = le32_to_cpu(packet->message_size);
-	if (message_size != data_size - sizeof(*packet)) {
-		dev_err(ep->dcp->dev,
-			"AFK[ep:%02x]: AFKEPV2 split packet unsupported: %#zx/%#zx\n",
-			ep->endpoint, data_size - sizeof(*packet), message_size);
-		return;
-	}
-
-	channel = le16_to_cpu(packet->interface_id);
-	message = (void *)(data + sizeof(*packet));
-	payload = (u8 *)(message + 1);
-	payload_size = message_size - sizeof(*message);
-	service = afk_epic_find_service(ep, channel);
-
-	switch (message->kind) {
-	case AFK_V2_REPORT:
-		if (message->opcode == AFK_V2_REPORT_PUBLISH) {
-			int ret;
-
-			if (service) {
-				dev_warn(ep->dcp->dev,
-					 "AFK[ep:%02x]: duplicate AFKEPV2 publish on channel %u\n",
-					 ep->endpoint, channel);
-				return;
-			}
-
-			afk_recv_handle_init(ep, channel, payload, payload_size);
-			service = afk_epic_find_service(ep, channel);
-			if (!service)
-				return;
-
-			/*
-			 * AFKEPV2 publishes an interface before the host consumes it.
-			 * Opening a matched interface is an empty report with opcode
-			 * 0x12 and the report flag set.
-			 */
-			ret = afk_send_epic(ep, channel, 0, EPIC_TYPE_NOTIFY,
-					    EPIC_CAT_REPORT, AFK_V2_REPORT_OPEN,
-					    NULL, 0);
-			if (ret)
-				dev_err(ep->dcp->dev,
-					"AFK[ep:%02x]: failed to open AFKEPV2 service on channel %u: %d\n",
-					ep->endpoint, channel, ret);
-			else
-				dev_info(ep->dcp->dev,
-					 "AFK[ep:%02x]: opened AFKEPV2 service on channel %u\n",
-					 ep->endpoint, channel);
-			return;
-		}
-
-		if (!service) {
-			dev_warn(ep->dcp->dev,
-				 "AFK[ep:%02x]: AFKEPV2 report %#x on disabled channel %u\n",
-				 ep->endpoint, message->opcode, channel);
-			return;
-		}
-
-		if (message->opcode == AFK_V2_REPORT_CLOSE ||
-		    message->opcode == AFK_V2_REPORT_TERMINATE) {
-			afk_recv_handle_teardown(ep, channel);
-			return;
-		}
-
-		if (!service->torndown && service->ops->report)
-			service->ops->report(service, message->opcode, payload,
-					     payload_size);
-		return;
-
-	case AFK_V2_COMMAND:
-		dev_dbg(ep->dcp->dev,
-			"AFK[ep:%02x]: AFKEPV2 command %#x id %#llx on channel %u\n",
-			ep->endpoint, message->opcode,
-			le64_to_cpu(message->id), channel);
-		return;
-
-	case AFK_V2_RESPONSE:
-		dev_dbg(ep->dcp->dev,
-			"AFK[ep:%02x]: AFKEPV2 response %#x id %#llx on channel %u\n",
-			ep->endpoint, message->opcode,
-			le64_to_cpu(message->id), channel);
-		return;
-
-	default:
-		dev_warn(ep->dcp->dev,
-			 "AFK[ep:%02x]: unknown AFKEPV2 message kind %#x on channel %u\n",
-			 ep->endpoint, message->kind, channel);
-	}
-}
-
 static bool afk_recv(struct apple_dcp_afkep *ep)
 {
 	struct afk_qe *hdr;
@@ -960,8 +719,8 @@ static bool afk_recv(struct apple_dcp_afkep *ep)
 		return false;
 	}
 
-	rptr = le32_to_cpu(READ_ONCE(*ep->rxbfr.rptr));
-	wptr = le32_to_cpu(READ_ONCE(*ep->rxbfr.wptr));
+	rptr = le32_to_cpu(*afk_rb_rptr(&ep->rxbfr));
+	wptr = le32_to_cpu(*afk_rb_wptr(&ep->rxbfr));
 	trace_afk_recv_rwptr_pre(ep, rptr, wptr);
 
 	if (rptr == wptr)
@@ -1017,7 +776,7 @@ static bool afk_recv(struct apple_dcp_afkep *ep)
 			return false;
 		}
 
-		WRITE_ONCE(*ep->rxbfr.rptr, cpu_to_le32(rptr));
+		*afk_rb_rptr(&ep->rxbfr) = cpu_to_le32(rptr);
 	}
 
 	if (rptr + size + sizeof(*hdr) > ep->rxbfr.bufsz) {
@@ -1030,27 +789,15 @@ static bool afk_recv(struct apple_dcp_afkep *ep)
 	channel = le32_to_cpu(hdr->channel);
 	type = le32_to_cpu(hdr->type);
 
-	next_rptr = roundup(rptr + sizeof(*hdr) + size,
-			     ep->rxbfr.block_size);
-	if (WARN_ON(next_rptr > ep->rxbfr.bufsz))
-		next_rptr = 0;
-	if (next_rptr == ep->rxbfr.bufsz)
-		next_rptr = 0;
-	log_entry = ep->endpoint == SYSTEM_ENDPOINT && ep->rx_log_count < 16;
-	sequence = ep->rx_log_count;
-	if (log_entry) {
-		ep->rx_log_count++;
-		dev_info(ep->dcp->dev,
-			 "AFK[ep:%02x]: QE %u rptr %#x wptr %#x next %#x block %#x magic %#x size %#x channel %#x type %#x bytes %*phN\n",
-			 ep->endpoint, sequence, rptr, wptr, next_rptr,
-			 ep->rxbfr.block_size, magic, size, channel, type,
-			 min_t(u32, sizeof(*hdr) + size, 64), hdr);
-	}
-	rptr = next_rptr;
+	rptr = ALIGN(rptr + sizeof(*hdr) + size, ep->rxbfr.block);
+	if (WARN_ON(rptr > ep->rxbfr.bufsz))
+		rptr = 0;
+	if (rptr == ep->rxbfr.bufsz)
+		rptr = 0;
 
 	dma_mb();
 
-	WRITE_ONCE(*ep->rxbfr.rptr, cpu_to_le32(rptr));
+	*afk_rb_rptr(&ep->rxbfr) = cpu_to_le32(rptr);
 	trace_afk_recv_rwptr_post(ep, rptr, wptr);
 
 	/*
@@ -1174,9 +921,8 @@ int afk_send_epic(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 	spin_lock_irqsave(&ep->lock, flags);
 
 	dma_rmb();
-	rptr = le32_to_cpu(READ_ONCE(*ep->txbfr.rptr));
-	wptr = le32_to_cpu(READ_ONCE(*ep->txbfr.wptr));
-	old_wptr = wptr;
+	rptr = le32_to_cpu(*afk_rb_rptr(&ep->txbfr));
+	wptr = le32_to_cpu(*afk_rb_wptr(&ep->txbfr));
 	trace_afk_send_rwptr_pre(ep, rptr, wptr);
 	if (use_v2) {
 		if (channel > U16_MAX || payload_len > U32_MAX - sizeof(*v2_message)) {
@@ -1324,24 +1070,14 @@ int afk_send_epic(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 	if (payload_len)
 		memcpy(ep->txbfr.buf + wptr, payload, payload_len);
 	wptr += payload_len;
-	wptr = roundup(wptr, ep->txbfr.block_size);
+	wptr = ALIGN(wptr, ep->txbfr.block);
 	if (wptr == ep->txbfr.bufsz)
 		wptr = 0;
 	trace_afk_send_rwptr_post(ep, rptr, wptr);
 
-	dma_wmb();
-	WRITE_ONCE(*ep->txbfr.wptr, cpu_to_le32(wptr));
-	dma_wmb();
-	doorbell = FIELD_PREP(RBEP_TYPE, RBEP_SEND) |
-		   FIELD_PREP(SEND_WPTR, wptr);
-	entry = hdr2 ? hdr2 : hdr;
-	if (use_v2 && ecat == EPIC_CAT_REPORT &&
-	    stype == AFK_V2_REPORT_OPEN)
-		dev_info(ep->dcp->dev,
-			 "AFK[ep:%02x]: OPEN TX channel %u consumer %#x producer %#x->%#x doorbell %#llx bytes %*phN\n",
-			 ep->endpoint, channel, rptr, old_wptr, wptr, doorbell,
-			 (int)min_t(size_t, total_size, 64), entry);
-	afk_send(ep, doorbell);
+	*afk_rb_wptr(&ep->txbfr) = cpu_to_le32(wptr);
+	afk_send(ep, FIELD_PREP(RBEP_TYPE, RBEP_SEND) |
+			     FIELD_PREP(SEND_WPTR, wptr));
 	ret = 0;
 
 out:

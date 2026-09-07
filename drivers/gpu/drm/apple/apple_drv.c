@@ -463,7 +463,59 @@ static int apple_drm_init(struct device *dev)
 
 	dev_set_drvdata(dev, apple);
 
-	dev_info(dev, "DCP takeover: component bind begin\n");
+	/*
+	 * The display engine scans out through this device's IOMMU stream, but
+	 * apple-dart only programs a translation table when something actually
+	 * maps through the domain.  With nothing mapped the stream has no TTBR
+	 * at all and every scanout access faults ("SID:0 ... TTBR invalid"),
+	 * which is fatal on this SoC.  Touch the domain once here so it is
+	 * populated before the coprocessor starts driving the display.
+	 *
+	 * Skip it when the bootloader already left translations behind.  On a
+	 * locked DART the stream has a table from the start, and mapping
+	 * through the domain instead makes apple-dart install our *clone* of
+	 * the inherited L1 over the hardware's.  If the session the loader left
+	 * running happens to touch the carveout inside that window it takes
+	 * DART rejects and wedges, and the DCP then never answers INIT --
+	 * an intermittent "Failed to boot RTKit: -62" on roughly one boot in
+	 * three, always preceded by a write-protect burst on the carveout
+	 * within a millisecond of this prime.
+	 */
+	{
+		struct iommu_domain *dom = iommu_get_domain_for_dev(dev);
+		struct iommu_resv_region *entry;
+		bool inherited = false;
+		LIST_HEAD(regions);
+
+		if (!IS_ERR_OR_NULL(dom)) {
+			iommu_get_resv_regions(dev, &regions);
+			list_for_each_entry(entry, &regions, list)
+				if (entry->type == IOMMU_RESV_TRANSLATED)
+					inherited = true;
+			iommu_put_resv_regions(dev, &regions);
+		}
+
+		if (inherited) {
+			dev_info(dev,
+				 "display DMA domain has inherited translations; not priming\n");
+		} else {
+			dma_addr_t probe_dva;
+			void *probe = dma_alloc_coherent(dev, PAGE_SIZE,
+							 &probe_dva, GFP_KERNEL);
+
+			if (probe) {
+				dev_info(dev,
+					 "display DMA domain primed, dva %pad\n",
+					 &probe_dva);
+				dma_free_coherent(dev, PAGE_SIZE, probe,
+						  probe_dva);
+			} else {
+				dev_warn(dev,
+					 "could not prime the display DMA domain\n");
+			}
+		}
+	}
+
 	ret = component_bind_all(dev, apple);
 	if (ret)
 		return ret;

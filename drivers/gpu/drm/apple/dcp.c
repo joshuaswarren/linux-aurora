@@ -369,13 +369,10 @@ static void dcp_recv_msg(void *cookie, u8 endpoint, u64 message)
 			goto unbacked;
 		return;
 	case DISP0_ENDPOINT:
-		if (!dcp->ibootep) {
-			dev_warn_ratelimited(dcp->dev,
-				"dropping inherited iBoot endpoint message %#llx\n",
-				message);
-			return;
-		}
-		afk_receive_message(dcp->ibootep, message);
+		if (dcp->ibootep)
+			afk_receive_message(dcp->ibootep, message);
+		else
+			goto unbacked;
 		return;
 	case DPAVSERV_ENDPOINT:
 		if (dcp->dcpavservep)
@@ -397,8 +394,14 @@ unbacked:
 	dev_info_ratelimited(dcp->dev, "ep %#04x: %#llx\n", endpoint, message);
 }
 
-static bool dcp_rtk_report_adopted_crashlog(struct apple_dcp *dcp,
-					    struct apple_rtkit_shmem *bfr);
+/*
+ * Attach to the running DCP instead of restarting it.  Off by default until it
+ * is proven; the restart path is what has been exercised so far.
+ */
+static bool dcp_adopt_live;
+module_param_named(adopt_live, dcp_adopt_live, bool, 0444);
+MODULE_PARM_DESC(adopt_live,
+		 "attach to the loader's live DCP session without sending INIT");
 
 static void dcp_rtk_crashed(void *cookie, const void *crashlog, size_t crashlog_size)
 {
@@ -418,389 +421,31 @@ static void dcp_rtk_crashed(void *cookie, const void *crashlog, size_t crashlog_
 	complete(&dcp->start_done);
 }
 
-/*
- * RTBuddyCrashlogDecoder::_multiCrashlogFindFirstCrash() follows the record
- * whose 64-bit ID equals the CLGH header's 32-bit current ID. The selected
- * record can itself contain CLGH, so preserve the native recursive contract
- * while rejecting cycles and out-of-range offsets in a corrupt snapshot.
- */
-static bool dcp_rtk_select_crashlog(u8 *data, size_t data_size,
-				    size_t *log_offset, u32 *generation,
-				    u32 *depth)
+void dcp_dump_crashlog(struct apple_dcp *dcp)
 {
-	size_t offset = 0;
-	u32 selected_generation = 0;
-	u32 level;
+	const char *p = dcp->crashlog_buf;
+	size_t i, run = 0, printed = 0;
 
-	for (level = 0; level < DCP_RTKIT_CRASHLOG_MULTI_MAX_DEPTH; level++) {
-		struct dcp_rtkit_crashlog_multi_header *header;
-		struct dcp_rtkit_crashlog_multi_record *records;
-		size_t records_size, selected_offset = 0;
-		u32 count, current_id, version;
-		bool found = false;
-		u32 i;
-
-		if (data_size - offset < sizeof(*header))
-			return false;
-
-		header = (void *)(data + offset);
-		if (le32_to_cpu(header->fourcc) !=
-		    DCP_RTKIT_CRASHLOG_MULTI_HEADER)
-			break;
-
-		version = le32_to_cpu(header->version);
-		if (((version >> 8) & 0xff) !=
-		    DCP_RTKIT_CRASHLOG_MULTI_VERSION)
-			return false;
-
-		count = le32_to_cpu(header->record_count);
-		if (!count || check_mul_overflow((size_t)count,
-						 sizeof(*records), &records_size) ||
-		    records_size > data_size - offset - sizeof(*header))
-			return false;
-
-		current_id = le32_to_cpu(header->current_id);
-		records = (void *)(header + 1);
-		for (i = 0; i < count; i++) {
-			if (le64_to_cpu(records[i].id) != current_id)
-				continue;
-
-			selected_offset = le32_to_cpu(records[i].offset);
-			found = true;
-			break;
-		}
-
-		if (!found || selected_offset < sizeof(*header) ||
-		    selected_offset > data_size - offset ||
-		    data_size - offset - selected_offset <
-					      sizeof(struct dcp_rtkit_crashlog_header))
-			return false;
-
-		selected_generation = current_id;
-		offset += selected_offset;
-	}
-
-	if (level == DCP_RTKIT_CRASHLOG_MULTI_MAX_DEPTH ||
-	    data_size - offset < sizeof(struct dcp_rtkit_crashlog_header))
-		return false;
-
-	*log_offset = offset;
-	*generation = selected_generation;
-	*depth = level;
-	return true;
-}
-
-/* Decode the current record from the imported inherited EP1 crash buffer. */
-static bool dcp_rtk_report_adopted_crashlog(struct apple_dcp *dcp,
-					    struct apple_rtkit_shmem *bfr)
-{
-	struct dcp_rtkit_crashlog_header header;
-	size_t buffer_size, crash_size, log_offset, section_end, offset;
-	u32 generation, depth;
-	u8 *data;
-
-	if (!dcp->adopted_session || bfr != &dcp->rtk->crashlog_buffer ||
-	    !bfr->iomem || bfr->size < sizeof(header))
-		return false;
-
-	dma_rmb();
-	memcpy_fromio(&header, bfr->iomem, sizeof(header));
-	if (le32_to_cpu(header.fourcc) != DCP_RTKIT_CRASHLOG_HEADER &&
-	    le32_to_cpu(header.fourcc) != DCP_RTKIT_CRASHLOG_MULTI_HEADER)
-		return false;
-
-	buffer_size = le32_to_cpu(header.size);
-	if (buffer_size < sizeof(struct dcp_rtkit_crashlog_multi_header) ||
-	    buffer_size > bfr->size) {
-		dev_err(dcp->dev,
-			"inherited DCP crashlog has invalid size %#zx (buffer %#zx)\n",
-			buffer_size, bfr->size);
-		return false;
-	}
-
-	data = kmalloc(buffer_size, GFP_KERNEL);
-	if (!data) {
-		dev_err(dcp->dev,
-			"could not allocate %#zx-byte inherited DCP crashlog copy\n",
-			buffer_size);
-		return false;
-	}
-
-	memcpy_fromio(data, bfr->iomem, buffer_size);
-	if (!dcp_rtk_select_crashlog(data, buffer_size, &log_offset,
-				     &generation, &depth)) {
-		dev_err(dcp->dev,
-			"DCP25G83_A401_CRASHLOG_SELECT_FAILED header %32phN\n",
-			data);
-		kfree(data);
-		return false;
-	}
-	dev_info(dcp->dev,
-		 "DCP25G83_A401_CRASHLOG_GENERATION id %#x depth %u offset %#zx\n",
-		 generation, depth, log_offset);
-
-	memcpy(&header, data + log_offset, sizeof(header));
-	if (le32_to_cpu(header.fourcc) != DCP_RTKIT_CRASHLOG_HEADER ||
-	    ((le32_to_cpu(header.version) >> 8) & 0xff) !=
-						DCP_RTKIT_CRASHLOG_VERSION_V3) {
-		dev_err(dcp->dev,
-			"DCP25G83_A401_CRASHLOG_SELECTED_INVALID generation %#x depth %u offset %#zx header %32phN\n",
-			generation, depth, log_offset, data + log_offset);
-		kfree(data);
-		return false;
-	}
-
-	crash_size = le32_to_cpu(header.size);
-	if (crash_size < 2 * sizeof(header) ||
-	    crash_size > buffer_size - log_offset) {
-		dev_err(dcp->dev,
-			"DCP25G83_A401_CRASHLOG_SELECTED_SIZE generation %#x offset %#zx size %#zx remaining %#zx\n",
-			generation, log_offset, crash_size,
-			buffer_size - log_offset);
-		kfree(data);
-		return false;
-	}
-	if (le32_to_cpu(header.flags) & DCP_RTKIT_CRASHLOG_INCOMPLETE) {
-		dev_err(dcp->dev,
-			"DCP25G83_A401_CRASHLOG_INCOMPLETE generation %#x flags %#x\n",
-			generation, le32_to_cpu(header.flags));
-		kfree(data);
-		return false;
-	}
-
-	section_end = crash_size - sizeof(header);
-	if (memcmp(data + log_offset, data + log_offset + section_end,
-		   sizeof(header))) {
-		dev_err(dcp->dev,
-			"DCP25G83_A401_CRASHLOG_FOOTER_MISMATCH generation %#x offset %#zx footer %32phN\n",
-			generation, log_offset + section_end,
-			data + log_offset + section_end);
-		kfree(data);
-		return false;
-	}
-
-	dev_err(dcp->dev,
-		"inherited DCP crashlog generation %#x depth %u offset %#zx version %u size %#zx flags %#x\n",
-		generation, depth, log_offset,
-		le32_to_cpu(header.version), crash_size,
-		le32_to_cpu(header.flags));
-
-	for (offset = sizeof(header); offset < section_end;) {
-		u8 *section = data + log_offset + offset;
-		u32 fourcc, section_size;
-		size_t payload_size;
-		const char *text;
-
-		if (section_end - offset < 16) {
-			dev_err(dcp->dev,
-				"inherited DCP crashlog has truncated section header at %#zx\n",
-				offset);
-			goto invalid_sections;
-		}
-
-		fourcc = get_unaligned_le32(section);
-		section_size = get_unaligned_le32(section + 12);
-		if (section_size < 16 || section_size > section_end - offset) {
-			dev_err(dcp->dev,
-				"inherited DCP crashlog section %#x has invalid size %#x at %#zx\n",
-				fourcc, section_size, offset);
-			goto invalid_sections;
-		}
-
-		payload_size = section_size - 16;
-		if (fourcc == DCP_RTKIT_CRASHLOG_STR && payload_size > 4) {
-			u32 id = get_unaligned_le32(section + 16);
-			size_t text_size;
-
-			text = section + 20;
-			text_size = strnlen(text, payload_size - 4);
-			dev_err(dcp->dev, "DCP crash message %u: %.*s\n", id,
-				(int)min_t(size_t, text_size, SZ_4K), text);
-		} else if (fourcc == DCP_RTKIT_CRASHLOG_VERSION &&
-			   payload_size > 16) {
-			size_t text_size;
-
-			text = section + 32;
-			text_size = strnlen(text, payload_size - 16);
-			dev_err(dcp->dev, "DCP firmware version: %.*s\n",
-				(int)min_t(size_t, text_size, SZ_4K), text);
-		} else if (fourcc == DCP_RTKIT_CRASHLOG_REGS &&
-			   payload_size >= DCP_RTKIT_CRASHLOG_REGS_SIZE) {
-			u8 *regs = section + 16;
-			u32 regs_flags = get_unaligned_le32(regs);
-			u32 regs_size = get_unaligned_le32(regs + 4);
-
-			if (regs_size != DCP_RTKIT_CRASHLOG_REGS_BODY_SIZE ||
-			    (regs_flags & DCP_RTKIT_CRASHLOG_REGS_UNDECODABLE)) {
-				dev_err(dcp->dev,
-					"DCP25G83_A401_CRASHLOG_CRG8_INVALID flags %#x size %#x\n",
-					regs_flags, regs_size);
-			} else {
-				dev_err(dcp->dev,
-					"DCP25G83_A401_CRASHLOG_CRG8 pc %#llx sp %#llx psr %#llx far %#llx esr %#llx\n",
-					get_unaligned_le64(regs + DCP_RTKIT_CRASHLOG_REGS_PC),
-					get_unaligned_le64(regs + DCP_RTKIT_CRASHLOG_REGS_SP),
-					get_unaligned_le64(regs + DCP_RTKIT_CRASHLOG_REGS_PSR),
-					get_unaligned_le64(regs + DCP_RTKIT_CRASHLOG_REGS_FAR),
-					get_unaligned_le64(regs + DCP_RTKIT_CRASHLOG_REGS_ESR));
-			}
-		} else if (fourcc == DCP_RTKIT_CRASHLOG_REGS_CL4 &&
-			   section_size >= DCP_RTKIT_CRASHLOG_CL4_SECTION_SIZE) {
-			u8 *cl4 = section;
-			u32 cl4_flags = get_unaligned_le32(cl4 + DCP_RTKIT_CRASHLOG_CL4_FLAGS);
-			u32 cl4_size = get_unaligned_le32(cl4 + DCP_RTKIT_CRASHLOG_CL4_SIZE);
-
-			dev_info(dcp->dev,
-				 "DCP25G83_A401_CRASHLOG_CRL4_RAW head %16phN frame %64phN fault %32phN\n",
-				 cl4 + 0x10, cl4 + 0x100, cl4 + 0x350);
-			if (cl4_size != DCP_RTKIT_CRASHLOG_CL4_NOMINAL_SIZE ||
-			    (cl4_flags & DCP_RTKIT_CRASHLOG_REGS_UNDECODABLE)) {
-				dev_err(dcp->dev,
-					"DCP25G83_A401_CRASHLOG_CRL4_INVALID flags %#x size %#x\n",
-					cl4_flags, cl4_size);
-			} else {
-				dev_info(dcp->dev,
-					 "DCP25G83_A401_CRASHLOG_CRL4_GPRS x0_7 %64phN x8_15 %64phN x16_23 %64phN x24_29 %48phN\n",
-					 cl4 + 0x18, cl4 + 0x58, cl4 + 0x98,
-					 cl4 + 0xd8);
-				dev_err(dcp->dev,
-					"DCP25G83_A401_CRASHLOG_CRL4 lr %#llx pc %#llx sp %#llx psr %#llx fpsr %#llx fpcr %#llx tpidr_el0 %#llx esr %#llx far %#llx\n",
-					get_unaligned_le64(cl4 + DCP_RTKIT_CRASHLOG_CL4_LR),
-					get_unaligned_le64(cl4 + DCP_RTKIT_CRASHLOG_CL4_PC),
-					get_unaligned_le64(cl4 + DCP_RTKIT_CRASHLOG_CL4_SP),
-					get_unaligned_le64(cl4 + DCP_RTKIT_CRASHLOG_CL4_PSR),
-					get_unaligned_le64(cl4 + DCP_RTKIT_CRASHLOG_CL4_FPSR),
-					get_unaligned_le64(cl4 + DCP_RTKIT_CRASHLOG_CL4_FPCR),
-					get_unaligned_le64(cl4 + DCP_RTKIT_CRASHLOG_CL4_TPIDR_EL0),
-					get_unaligned_le64(cl4 + DCP_RTKIT_CRASHLOG_CL4_ESR),
-					get_unaligned_le64(cl4 + DCP_RTKIT_CRASHLOG_CL4_FAR));
-			}
-		} else if (fourcc == DCP_RTKIT_CRASHLOG_ASYNC) {
-			u32 version = get_unaligned_le32(section + 8);
-			u8 *payload = section + 0x10;
-
-			if (version != DCP_RTKIT_CRASHLOG_ASYNC_VERSION ||
-			    section_size != DCP_RTKIT_CRASHLOG_ASYNC_SECTION_SIZE) {
-				dev_err(dcp->dev,
-					"DCP25G83_A401_CRASHLOG_CASC_INVALID version %#x size %#x\n",
-					version, section_size);
-			} else {
-				dev_info(dcp->dev,
-					 "DCP25G83_A401_CRASHLOG_CASC_RAW payload %56phN\n",
-					 payload);
-				dev_err(dcp->dev,
-					"DCP25G83_A401_CRASHLOG_CASC l2c_sts %#llx l2c_adr %#llx l2c_inf %#llx lsu_sts %#llx fed_sts %#llx mmu_sts %#llx extra_25g83 %#llx\n",
-					get_unaligned_le64(payload + 0x00),
-					get_unaligned_le64(payload + 0x08),
-					get_unaligned_le64(payload + 0x10),
-					get_unaligned_le64(payload + 0x18),
-					get_unaligned_le64(payload + 0x20),
-					get_unaligned_le64(payload + 0x28),
-					get_unaligned_le64(payload + 0x30));
-			}
-		} else {
-			dev_info(dcp->dev,
-				 "inherited DCP crashlog section %#x size %#x\n",
-				 fourcc, section_size);
-		}
-
-		offset += section_size;
-	}
-
-	kfree(data);
-
-	if (!dcp->rtk->crashed) {
-		dcp->rtk->crashed = true;
-		dcp_rtk_crashed(dcp, NULL, 0);
-	}
-	return true;
-
-invalid_sections:
-	kfree(data);
-	return false;
-}
-
-void dcp_rtk_timeout_crashlog_snapshot(struct apple_dcp *dcp)
-{
-	struct apple_rtkit_shmem *bfr;
-	struct dcp_rtkit_crashlog_header header = {};
-	bool reported;
-
-	if (!dcp->adopted_session || dcp->fw_compat != DCP_FIRMWARE_H17P ||
-	    !dcp->rtk)
+	if (!p || dcp->dumped_crashlog)
 		return;
+	dcp->dumped_crashlog = true;
 
-	bfr = &dcp->rtk->crashlog_buffer;
-	if (!bfr->iomem || bfr->size < sizeof(header)) {
-		dev_info(dcp->dev,
-			 "DCP25G83_A401_CRASHLOG_TIMEOUT mapped 0 size %#zx reported 0\n",
-			 bfr->size);
-		return;
+	for (i = 0; i < dcp->crashlog_size && printed < 40; i++) {
+		char c = p[i];
+
+		if (c >= 0x20 && c < 0x7f) {
+			run++;
+			continue;
+		}
+		if (run >= 6) {
+			dev_err(dcp->dev, "crashlog: %.*s\n",
+				(int)min(run, (size_t)140), p + i - run);
+			printed++;
+		}
+		run = 0;
 	}
-
-	dma_rmb();
-	memcpy_fromio(&header, bfr->iomem, sizeof(header));
-	reported = dcp_rtk_report_adopted_crashlog(dcp, bfr);
-	dev_info(dcp->dev,
-		 "DCP25G83_A401_CRASHLOG_TIMEOUT mapped 1 size %#zx header %32phN reported %u\n",
-		 bfr->size, &header, reported);
-}
-
-static int dcp_rtk_import_adopted_crashlog(struct apple_dcp *dcp)
-{
-	struct apple_rtkit_shmem *bfr = &dcp->rtk->crashlog_buffer;
-	struct iommu_domain *domain = iommu_get_domain_for_dev(dcp->dev);
-	const u64 word = DCP_25G83_INHERITED_CRASHLOG_WORD;
-	u32 fw_version[3];
-	phys_addr_t phy_addr;
-	size_t offset;
-	int ret = -EINVAL;
-
-	if (dcp->fw_compat != DCP_FIRMWARE_H17P)
-		return 0;
-	if (of_property_count_u32_elems(dcp->dev->of_node,
-					"apple,firmware-version") !=
-					ARRAY_SIZE(fw_version) ||
-	    of_property_read_u32_array(dcp->dev->of_node,
-				       "apple,firmware-version", fw_version,
-				       ARRAY_SIZE(fw_version)) ||
-	    fw_version[0] != 26 || fw_version[1] != 6 || fw_version[2] != 2)
-		return -ENODEV;
-	if (bfr->size || bfr->iova || bfr->buffer || bfr->iomem)
-		return -EBUSY;
-	if (!domain)
-		return -ENOMEM;
-
-	bfr->size = FIELD_GET(GENMASK_ULL(51, 44), word) * SZ_4K;
-	bfr->iova = FIELD_GET(GENMASK_ULL(43, 0), word);
-	phy_addr = iommu_iova_to_phys(domain, bfr->iova);
-	if (!phy_addr)
-		goto err_clear;
-
-	for (offset = 0; offset < bfr->size; offset += SZ_16K) {
-		if (iommu_iova_to_phys(domain, bfr->iova + offset) !=
-		    phy_addr + offset)
-			goto err_clear;
-	}
-
-	/* Match RTBuddy's non-coherent firmware-buffer invalidation contract. */
-	bfr->iomem = ioremap_wc(phy_addr, bfr->size);
-	if (!bfr->iomem) {
-		ret = -ENOMEM;
-		goto err_clear;
-	}
-	bfr->is_mapped = true;
-
-	dev_info(dcp->dev,
-		 "DCP25G83_INHERITED_CRASHLOG_IMPORTED firmware %u.%u.%u word %#llx size %#zx DVA %pad PA %pa iomem %p; notification requires no reply\n",
-		 fw_version[0], fw_version[1], fw_version[2], word, bfr->size,
-		 &bfr->iova, &phy_addr, bfr->iomem);
-	return 0;
-
-err_clear:
-	bfr->iova = 0;
-	bfr->size = 0;
-	return ret;
+	if (!printed)
+		dev_err(dcp->dev, "crashlog: nothing printable\n");
 }
 
 static int dcp_rtk_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
@@ -852,38 +497,57 @@ static int dcp_rtk_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
 			  FIELD_PREP(GENMASK_ULL(51, 44), bfr->size >> 12) |
 			  FIELD_PREP(GENMASK_ULL(43, 0), bfr->iova);
 		dev_info(dcp->dev,
-			 "RTKit preallocated %s GETBUF %#llx size %#zx DVA %pad PA %pa iomem %p; Normal-NC firmware mapping\n",
-			 owner, request, bfr->size, &bfr->iova, &phy_addr,
-			 bfr->iomem);
-		dcp_rtk_report_adopted_crashlog(dcp, bfr);
+			 "shmem_setup: iova: %lx -> pa: %lx -> iomem: %lx size: %zx\n",
+			 (uintptr_t)bfr->iova, (uintptr_t)phy_addr,
+			 (uintptr_t)bfr->buffer, (size_t)bfr->size);
 
 		/*
-		 * A genuinely fresh bit-54-clear request preserves the supplied DVA
-		 * and uses bit 52 for 4-KiB units or bit 53 for 1-MiB units. The
-		 * adopted path imports the existing EP1 buffer before traffic, so its
-		 * same-shaped word is handled as a crash notification and never
-		 * reaches this reply.
+		 * The DCP hands us this region when it reports a crash on the
+		 * crashlog endpoint, which it does not advertise in its EPMAP,
+		 * so apple-rtkit only warns and never dumps it.  Dump the head
+		 * ourselves -- it is the only account of why the firmware died.
+		 *
+		 * Bounded hard: a few dozen strings, once per session.  An
+		 * unbounded dump drowns the 115200 console and hides the very
+		 * thing it is meant to show.
 		 */
-		if (bfr == &dcp->rtk->crashlog_buffer &&
-		    !dcp->adopted_session) {
-			u64 ack;
-			int ret;
+		/*
+		 * Remember the region rather than printing it here.  The DCP
+		 * publishes it at RTKit init and the contents are whatever
+		 * survived in DRAM from a previous life, so dumping it now
+		 * makes an inherited panic look like a fresh one.  It is read
+		 * from the stall watchdog instead, once a new record has
+		 * actually been written.
+		 */
+		if (bfr->size >= SZ_128K) {
+			dcp->crashlog_buf = bfr->buffer;
+			dcp->crashlog_size = bfr->size;
+		}
 
-			iomfb_d563_a2i_ep1_snapshot(dcp);
-			if (bfr->size < SZ_1M)
-				ack = BIT_ULL(52) |
-				      FIELD_PREP(GENMASK_ULL(51, 44),
-						 DIV_ROUND_UP(bfr->size, SZ_4K)) |
-				      FIELD_PREP(GENMASK_ULL(43, 0), bfr->iova);
-			else
-				ack = BIT_ULL(53) |
-				      FIELD_PREP(GENMASK_ULL(51, 44),
-						 DIV_ROUND_UP(bfr->size, SZ_1M)) |
-				      FIELD_PREP(GENMASK_ULL(43, 0), bfr->iova);
-			ret = dcp_send_message(dcp, DCP_RTKIT_EP_CRASHLOG, ack);
-			dev_info(dcp->dev,
-				 "DCP25G83_EP1_ACK_RESULT ack %#llx result %d\n",
-				 ack, ret);
+		if (0) {
+			const char *p = bfr->buffer;
+			size_t i, run = 0, printed = 0;
+
+			dcp->dumped_crashlog = true;
+			for (i = 0; i < bfr->size && printed < 24; i++) {
+				char c = p[i];
+
+				if (c >= 0x20 && c < 0x7f) {
+					run++;
+					continue;
+				}
+				if (run >= 5) {
+					dev_err(dcp->dev, "crashlog: %.*s\n",
+						(int)min(run, (size_t)120),
+						p + i - run);
+					printed++;
+				}
+				run = 0;
+			}
+			if (!printed)
+				dev_err(dcp->dev,
+					"crashlog: no printable records in %zx bytes\n",
+					(size_t)bfr->size);
 		}
 	} else {
 		bfr->buffer = dma_alloc_coherent(dcp->dev, bfr->size,
@@ -1876,27 +1540,128 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 	return DCP_FIRMWARE_UNKNOWN;
 }
 
-static void apple_dcp_stop_fresh_boot_cpu(struct apple_dcp *dcp)
+
+#define APPLE_PMGR_PS_ACTUAL	GENMASK(7, 4)
+#define APPLE_PMGR_PS_TARGET	GENMASK(3, 0)
+#define APPLE_PMGR_PS_ACTIVE	0xf
+
+/*
+ * Power up the "pmc" domain for the DCP.
+ *
+ * As soon as the AP acks the fifth D563 (pmgrConfigDispPerfState), the DCP's
+ * RTKPMGR_pmc_boost_disp_perf_state path reads the PMC idle register at
+ * physical 0x3028aa140.  That aperture belongs to the T8140 "pmc" power
+ * domain, which the ADT marks initially-on but which Linux leaves off because
+ * no device claims it.  The read then takes an L2C access fault and the
+ * coprocessor dies with a data abort -- silently, with no further mailbox
+ * traffic, immediately after the boot property storm, which looks exactly like
+ * a hang.  Turn the domain on before booting the firmware.
+ */
+static void dcp_enable_pmc_domain(struct apple_dcp *dcp)
 {
-	u32 control;
+	struct device_node *np;
+	const char *label;
+	u32 offset, val = 0;
+	int i;
 
-	if (!dcp->fresh_boot_cpu_started)
+	for_each_compatible_node(np, NULL, "apple,t8103-pmgr-pwrstate") {
+		struct regmap *regmap;
+
+		if (of_property_read_string(np, "label", &label) ||
+		    strcmp(label, "pmc"))
+			continue;
+
+		if (of_property_read_u32_index(np, "reg", 0, &offset)) {
+			dev_warn(dcp->dev, "pmc: no reg offset\n");
+			break;
+		}
+
+		regmap = syscon_node_to_regmap(np->parent);
+		if (IS_ERR(regmap)) {
+			dev_warn(dcp->dev, "pmc: no parent regmap: %ld\n",
+				 PTR_ERR(regmap));
+			break;
+		}
+
+		if (regmap_update_bits(regmap, offset, APPLE_PMGR_PS_TARGET,
+				       FIELD_PREP(APPLE_PMGR_PS_TARGET,
+						  APPLE_PMGR_PS_ACTIVE))) {
+			dev_warn(dcp->dev, "pmc: failed to request active\n");
+			break;
+		}
+
+		for (i = 0; i < 200; i++) {
+			if (regmap_read(regmap, offset, &val))
+				break;
+			if (FIELD_GET(APPLE_PMGR_PS_ACTUAL, val) ==
+			    APPLE_PMGR_PS_ACTIVE) {
+				dev_info(dcp->dev, "pmc domain on (%#x)\n", val);
+				of_node_put(np);
+				return;
+			}
+			udelay(10);
+		}
+		dev_warn(dcp->dev, "pmc domain did not activate (%#x)\n", val);
+		of_node_put(np);
 		return;
+	}
 
-	/* AppleASCWrapV6::_runCPU(false): clear RUN, reread, clear bit 5. */
-	control = readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
-	writel(apple_dcp_coprocessor_stop_first(control),
-	       dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
-	control = readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
-	writel(apple_dcp_coprocessor_stop_second(control),
-	       dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
-	control = readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
-	dcp->fresh_boot_cpu_started = false;
-	dcp->adopted_session = false;
-
-	dev_info(dcp->dev, "DCP takeover: display CPU stopped control=%#x\n",
-		 control);
+	dev_warn(dcp->dev, "pmc power domain not found\n");
 }
+
+/*
+ * Reset the display coprocessor's ASC core.
+ *
+ * Once Linux has driven a DCP session the firmware stops answering the
+ * management endpoint: it will not re-HELLO on INIT (it is already ON) and it
+ * will not acknowledge a power-state change either, so neither apple_rtkit_wake
+ * nor apple_rtkit_quiesce can recover it and the module could previously only
+ * be reloaded by rebooting the machine.
+ *
+ * CPU_CONTROL.RUN is a raw register in the ASC wrapper and needs no cooperation
+ * from the firmware, so clearing it stops the core no matter how wedged it is.
+ * The firmware image itself is left alone -- iBoot mapped it into the DCP's own
+ * DART and nothing here touches those mappings -- so setting RUN again restarts
+ * it from its reset vector and it comes back with a fresh HELLO.
+ */
+static int dcp_asc_restart(struct apple_dcp *dcp)
+{
+	u32 ctrl, status;
+	int i;
+
+	ctrl = readl_relaxed(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
+	writel_relaxed(ctrl & ~APPLE_DCP_COPROC_CPU_CONTROL_RUN,
+		       dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
+
+	/*
+	 * T8140 clears CPU_STATUS.RUNNING when the core halts but never sets
+	 * the STOPPED bit (status goes 0x6d -> 0x48), so gate on RUNNING going
+	 * away rather than on STOPPED appearing.
+	 */
+	for (i = 0; i < 500; i++) {
+		status = readl_relaxed(dcp->coproc_reg +
+				       APPLE_DCP_COPROC_CPU_STATUS);
+		if (!(status & APPLE_DCP_COPROC_CPU_STATUS_RUNNING) ||
+		    (status & APPLE_DCP_COPROC_CPU_STATUS_STOPPED))
+			break;
+		usleep_range(100, 200);
+	}
+	if (status & APPLE_DCP_COPROC_CPU_STATUS_RUNNING) {
+		dev_err(dcp->dev, "DCP ASC did not stop (status %#x)\n", status);
+		return -ETIMEDOUT;
+	}
+
+	dev_info(dcp->dev, "DCP ASC stopped (status %#x), restarting it\n",
+		 status);
+	usleep_range(1000, 2000);
+	writel_relaxed(ctrl | APPLE_DCP_COPROC_CPU_CONTROL_RUN,
+		       dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
+	return 0;
+}
+
+
+
+
 
 static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 {
@@ -1912,7 +1677,38 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	bool loader_quiesced;
 	int ret;
 
-	dcp->fresh_boot_cpu_started = false;
+	/*
+	 * The coprocessor scans out through the display-subsystem device's
+	 * IOMMU stream, not through piodma's, so buffers it asks us to map for
+	 * piodma must also be visible in that domain or the scanout faults.
+	 */
+	dcp->disp_dev = main;
+	dcp->disp_iommu_dom = main ? iommu_get_domain_for_dev(main) : NULL;
+	if (IS_ERR(dcp->disp_iommu_dom))
+		dcp->disp_iommu_dom = NULL;
+
+	/*
+	 * Give the scanout stream a landing page at the bottom of its window.
+	 *
+	 * m1n1 stops the DCP ASC before handing over, so unlike macOS -- which
+	 * adopts the generation iBoot left running -- our firmware comes up with
+	 * no active surface.  It enables the pipe anyway at the end of the boot
+	 * chain and fetches from a null base.  The DART rejects that, the reject
+	 * becomes an AXI error, and the coprocessor takes an NMI
+	 * (apiodma_irq_AxiErr) before we can drive a modeset.
+	 *
+	 * One zeroed page mapped at the base of the stream's own window turns
+	 * that fatal reject into a harmless read of zeros.  This only *adds* a
+	 * translation at an index the bootloader does not use; it never rewrites
+	 * an inherited one.
+	 */
+	/*
+	 * Deliberately do not add mappings here.  iommu_map() on this domain
+	 * makes apple-dart copy our *clone* of the inherited L1 over the
+	 * hardware's, so anything the live firmware has added to its own tables
+	 * since we cloned them vanishes underneath it and the coprocessor takes
+	 * an axi_rd_err NMI.  The bootloader's translations are left alone.
+	 */
 
 	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(42));
 	if (ret)
@@ -2043,14 +1839,15 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 
 	INIT_WORK(&dcp->vblank_wq, dcp_delayed_vblank);
 	INIT_DELAYED_WORK(&dcp->stall_wq, dcp_stall_check);
-	spin_lock_init(&dcp->callback_trace_lock);
-	dcp->callback_trace_count = 0;
 
 	dcp->swapped_out_fbs =
 		(struct list_head)LIST_HEAD_INIT(dcp->swapped_out_fbs);
 	spin_lock_init(&dcp->swapped_out_lock);
 
-	if (apple_dcp_needs_adoption(start_mode)) {
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P)
+		dcp_enable_pmc_domain(dcp);
+
+	if (start_mode == APPLE_DCP_COPROCESSOR_ADOPT_AND_RESTART) {
 		dev_info(dev,
 			 "adopting live inherited DCP session (control=%#x status=%#x)\n",
 			 cpu_ctrl, cpu_status);
@@ -2079,66 +1876,103 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	} else {
 		if (start_mode == APPLE_DCP_COPROCESSOR_QUIESCED_RESTART)
 			dev_info(dev, "restarting loader-quiesced DCP session\n");
-		dcp->rtk = devm_apple_rtkit_init(dev, dcp, "mbox", 0,
-						   &rtkit_ops);
-		if (IS_ERR(dcp->rtk)) {
-			ret = dev_err_probe(dev, PTR_ERR(dcp->rtk),
-					    "Failed to initialize RTKit\n");
-			dcp->rtk = NULL;
-			goto err_destroy_piodma;
+		if (dcp_adopt_live) {
+			dcp->adopting_session = true;
+			dcp->rtk = devm_apple_rtkit_init_adopted(dev, dcp,
+								 "mbox", 0,
+								 &rtkit_ops);
+			dcp->adopting_session = false;
+		} else {
+			dcp->rtk = devm_apple_rtkit_init(dev, dcp, "mbox", 0,
+							 &rtkit_ops);
 		}
+		if (IS_ERR(dcp->rtk))
+			return dev_err_probe(dev, PTR_ERR(dcp->rtk),
+					     "Failed to initialize RTKit\n");
 	}
 
-	if (dcp->adopted_session) {
-#ifdef MODULE
-		if (!dcp->adopted_session_module_pinned) {
-			__module_get(THIS_MODULE);
-			dcp->adopted_session_module_pinned = true;
-			dev_info(dev,
-				 "live inherited RTKit session pins appledrm until reset\n");
-		}
-#endif
-		dev_info(dev, "live inherited RTKit session adopted\n");
-		return 0;
-	}
+	if (dcp_adopt_live) {
+		/*
+		 * Attach to the session the loader left running instead of
+		 * re-initialising it.
+		 *
+		 * m1n1 hands the DCP over live and untouched -- it neither
+		 * stops the ASC nor quiesces RTKit; the "quiesced" property is
+		 * only there to steer this driver's code path.  So the
+		 * coprocessor already has a session, an endpoint map, and a
+		 * configured display pipe.  Poking CPU_CONTROL.RUN and sending
+		 * SET_IOP_PWR_STATE(INIT) at that makes the firmware tear its
+		 * IOMFB state down and come back with no scanout, which is the
+		 * state macOS is never in: its capture contains no wake, no
+		 * HELLO and no EPMAP, just A401 on an already-running IOP.
+		 */
+		dev_info(dev, "adopting the live DCP session without a restart\n");
+		ret = 0;
+	} else {
+		cpu_ctrl = readl_relaxed(dcp->coproc_reg +
+					 APPLE_DCP_COPROC_CPU_CONTROL);
+		writel_relaxed(cpu_ctrl | APPLE_DCP_COPROC_CPU_CONTROL_RUN,
+			       dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
 
-	/* RTKit initialization starts the mailbox and enables the outbox first. */
-	cpu_ctrl = readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
-	cpu_ctrl |= APPLE_DCP_COPROC_CPU_CONTROL_RUN;
-	writel(cpu_ctrl, dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
-	if (apple_dcp_needs_fresh_boot(start_mode))
-		dcp->fresh_boot_cpu_started = true;
-	cpu_ctrl = readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
-	if (apple_dcp_needs_fresh_boot(start_mode))
+		ret = apple_rtkit_wake(dcp->rtk);
+	}
+	if (ret && start_mode == APPLE_DCP_COPROCESSOR_QUIESCED_RESTART) {
+		/*
+		 * INIT went unanswered.  That happens when the session we found
+		 * is not the one the loader quiesced but one an earlier probe
+		 * of this driver already brought up: RTKit is ON, so it ignores
+		 * INIT and never sends HELLO.  Adopt that session, quiesce it
+		 * back to the state the loader would have left it in, and boot
+		 * it again.  Without this, a failed probe or a module reload
+		 * can only be recovered by rebooting the machine.
+		 */
 		dev_info(dev,
-			 "DCP takeover: display CPU start control=%#x status=%#x\n",
-			 cpu_ctrl,
-			 readl_relaxed(dcp->coproc_reg +
-				       APPLE_DCP_COPROC_CPU_STATUS));
+			 "DCP did not answer INIT; adopting the running session to restart it\n");
+		devm_apple_rtkit_free(dev, dcp->rtk);
+		dcp->rtk = NULL;
+		dcp->adopting_session = true;
+		dcp->rtk = devm_apple_rtkit_init_adopted(dev, dcp, "mbox", 0,
+							 &rtkit_ops);
+		if (IS_ERR(dcp->rtk)) {
+			dcp->adopting_session = false;
+			return dev_err_probe(dev, PTR_ERR(dcp->rtk),
+					     "Failed to adopt running RTKit\n");
+		}
 
-	ret = apple_rtkit_wake(dcp->rtk);
-	if (ret) {
-		if (apple_dcp_needs_fresh_boot(start_mode))
-			dev_err(dev,
-				"DCP takeover: RTKit boot stopped at control=%#x status=%#x\n",
-				readl_relaxed(dcp->coproc_reg +
-					      APPLE_DCP_COPROC_CPU_CONTROL),
-				readl_relaxed(dcp->coproc_reg +
-					      APPLE_DCP_COPROC_CPU_STATUS));
-		ret = dev_err_probe(dev, ret,
-				    "Failed to boot RTKit: %d\n", ret);
-		goto err_stop_cpu;
+		ret = apple_rtkit_quiesce(dcp->rtk);
+		dcp->adopting_session = false;
+		if (!ret)
+			ret = apple_rtkit_wake(dcp->rtk);
+
+		if (ret) {
+			/*
+			 * The firmware is not answering the mailbox at all.
+			 * Reset the ASC core itself and cold-boot it; that
+			 * needs no cooperation from the running firmware.
+			 */
+			dev_info(dev,
+				 "DCP will not quiesce (%d); resetting the ASC core\n",
+				 ret);
+			devm_apple_rtkit_free(dev, dcp->rtk);
+			dcp->rtk = NULL;
+			ret = dcp_asc_restart(dcp);
+			if (ret)
+				return dev_err_probe(dev, ret,
+						     "Failed to reset DCP ASC: %d\n",
+						     ret);
+
+			dcp->rtk = devm_apple_rtkit_init(dev, dcp, "mbox", 0,
+							 &rtkit_ops);
+			if (IS_ERR(dcp->rtk))
+				return dev_err_probe(dev, PTR_ERR(dcp->rtk),
+						     "Failed to re-init RTKit\n");
+
+			ret = apple_rtkit_wake(dcp->rtk);
+		}
 	}
-	if (apple_dcp_needs_fresh_boot(start_mode))
-		dev_info(dev, "DCP takeover: fresh RTKit boot complete\n");
-	return ret;
-
-err_stop_cpu:
-	apple_dcp_stop_fresh_boot_cpu(dcp);
-	devm_apple_rtkit_free(dev, dcp->rtk);
-	dcp->rtk = NULL;
-err_destroy_piodma:
-	dcp_destroy_piodma_iommu_dev(dcp);
+	if (ret)
+		return dev_err_probe(dev, ret,
+				     "Failed to boot RTKit: %d\n", ret);
 	return ret;
 }
 

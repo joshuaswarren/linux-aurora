@@ -84,6 +84,10 @@ struct dcp_channel {
 	u64 link_message[DCP_MAX_CALL_DEPTH];
 	u32 link_size[DCP_MAX_CALL_DEPTH];
 
+	/* Tag of each outstanding call, so a stall can name itself */
+	char tag[DCP_MAX_CALL_DEPTH][4];
+	unsigned long pushed_at[DCP_MAX_CALL_DEPTH];
+
 	/* Current depth of the call stack. Less than DCP_MAX_CALL_DEPTH */
 	u8 depth;
 	/* Already warned about busy channel */
@@ -145,8 +149,6 @@ struct apple_dcp {
 	struct iommu_domain *disp_iommu_dom;
 	/* the display-subsystem device, whose DMA domain the pipe scans out of */
 	struct device *disp_dev;
-	/* which of the nine cumulative A031 notify-client states to send next */
-	unsigned int a031_step;
 	struct apple_rtkit *rtk;
 	struct apple_crtc *crtc;
 	struct apple_connector *connector;

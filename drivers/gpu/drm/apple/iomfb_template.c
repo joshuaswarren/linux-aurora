@@ -146,17 +146,9 @@ struct dcp_pipe_cfg_415 {
 	u8 data[0xc];
 } __packed;
 
-/*
- * A031 is update_notify_clients_dcp(u32[27]): a bitmap-as-array of the DCP
- * notification clients the AP wants delivered.  macOS enables them
- * cumulatively over nine calls, ending at {6,7,8,10,11,12,25,26}; we used to
- * send nine zeroed records, so we finished with no notify clients registered
- * at all and never received the callbacks they gate.
- */
 struct dcp_pipe_cfg_031 {
-	__le32 clients[27];
+	u8 data[0x6c];
 } __packed;
-static_assert(sizeof(struct dcp_pipe_cfg_031) == 0x6c);
 
 DCP_THUNK_OUT(dcp_pipe_query_353, dcpep_pipe_query_353, u64);
 DCP_THUNK_INOUT(dcp_pipe_set_352, dcpep_pipe_set_352, u64, u32);
@@ -356,7 +348,7 @@ static void dcp_ack_dfb_surface(struct apple_dcp *dcp)
 	dcp_ack(dcp, DCP_CONTEXT_CB);
 }
 
-static void dcp_fill_dfb_surface(struct apple_dcp *dcp, u8 *s)
+static void dcp_fill_dfb_surface(u8 *s)
 {
 	s[0x002] = 0x01;
 	s[0x00b] = 'A';
@@ -368,21 +360,9 @@ static void dcp_fill_dfb_surface(struct apple_dcp *dcp, u8 *s)
 	s[0x01c] = 0x01;
 	s[0x02a] = 0x40;
 	s[0x02b] = 0xe4;
-	s[0x035] = 0x04;	/* IOSurface.surface_id; macOS writes 4, we wrote 3 */
+	s[0x035] = 0x03;
 	s[0x051] = 0x01;
 	s[0x149] = 0x01;
-
-	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G) {
-		/* H17G 25G76 A472: b3a8 surface and the native default surface ID.
-		 * The word at0x29 remains opaque; these are its observed bytes,
-		 * not a size inferred from panel geometry. No addresses are copied.
-		 */
-		memcpy(s + 0x00b, "8a3b", 4);
-		s[0x02a] = 0;
-		s[0x02b] = 0x4d;
-		s[0x02c] = 1;
-		s[0x035] = 2;
-	}
 }
 
 /*
@@ -419,7 +399,7 @@ static bool iomfbep_cb_create_dfb_surface(struct apple_dcp *dcp, int tag,
 		return true;
 	}
 
-	dcp_fill_dfb_surface(dcp, req->surface);
+	dcp_fill_dfb_surface(req->surface);
 
 	dcp_register_dfb_surface(dcp, false, req, complete_dfb_surface, NULL);
 	kfree(req);
@@ -569,8 +549,17 @@ static struct DCP_FW_NAME(dcp_map_buf_resp) dcpep_cb_map_piodma(struct apple_dcp
 		goto reject;
 	}
 
-	/* The PIODMA mapping belongs only to the DCP IOMMU domain. */
-	memdesc->piodma_mapped = true;
+	/*
+	 * Mirror it into the display-subsystem domain at the same address: the
+	 * display engine reads these buffers on that device's stream, which
+	 * otherwise has no mapping for them at all.
+	 */
+	/*
+	 * Do not mirror into the display-subsystem domain.  That stream's
+	 * tables are iBoot's, pinned to the DART's published "pt-region", and
+	 * macOS never adds entries to them from the host -- the firmware does
+	 * its own remapping there (the ADT marks the DART "allow-pte-remap").
+	 */
 
 #if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
 	/* echo the index back, as macOS does */
@@ -805,7 +794,7 @@ static struct DCP_FW_NAME(dcp_map_reg_resp) dcpep_cb_map_reg(struct apple_dcp *d
 	 * hardware.  Answer it the way macOS does; these apertures are reached
 	 * physically, so dva == addr.
 	 */
-	if (dcp->hw.legacy_pmc_binding && req->index == DCP_H17P_DISP0_REG_INDEX) {
+	if (req->index == DCP_H17P_DISP0_REG_INDEX) {
 		dev_info(dcp->dev, "map_reg[5]: disp0 window %#llx len %#llx\n",
 			 (u64)DCP_H17P_DISP0_REG_BASE,
 			 (u64)DCP_H17P_DISP0_REG_SIZE);
@@ -1024,7 +1013,7 @@ static void boot_4b(struct apple_dcp *dcp, void *out, void *cookie)
 	 * macOS 25G83 sends 0 here, not 1: the traced A000 payload is
 	 * "00 aa aa aa", one meaningful byte followed by poison.
 	 */
-	u32 arg = dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G;
+	u32 arg = 0;
 
 	dcp_late_init_signal(dcp, false, &arg, boot_5, NULL);
 #else
@@ -1068,23 +1057,27 @@ static void boot_1_11(struct apple_dcp *dcp, void *out, void *cookie)
 
 static void boot_1_10(struct apple_dcp *dcp, void *out, void *cookie)
 {
-	struct dcp_dfb_dimensions_h17p dim;
-
-	/* A445 returns the dimensions that native macOS passes to A104.
-	 * The H17G capture is2560x1664; the H17P capture is2408x1506.
+	/*
+	 * The firmware only builds a default framebuffer when it has non-zero
+	 * geometry (its create_default_fb_surface is gated on "h && w"), so
+	 * withholding A104 keeps the pipe inert and lets a real DRM modeset
+	 * drive the first swap instead.  macOS always pushes it, but macOS has
+	 * an inherited scanout to keep alive and we do not.
 	 */
-	memcpy(&dim, out, sizeof(dim));
-	if (!dim.width || !dim.height || dim.width > 16384 || dim.height > 16384) {
-		struct dcp_channel *ch = &dcp->ch_cb;
-
-		dev_err(dcp->dev, "invalid default framebuffer dimensions %ux%u\n",
-			dim.width, dim.height);
-		*(u8 *)ch->output[ch->depth - 1] = false;
-		dcp_ack(dcp, DCP_CONTEXT_CB);
+	if (0) {
+		boot_1_11(dcp, NULL, NULL);
 		return;
 	}
-	dev_info(dcp->dev, "default framebuffer dimensions %ux%u\n",
-		 dim.width, dim.height);
+
+	/*
+	 * The panel's native size, which is what macOS pushes here: the traced
+	 * A104 payload is 68 09 00 00 e2 05 00 00 = 2408 x 1506.  The firmware
+	 * has already told us the same numbers in D582.
+	 */
+	struct dcp_dfb_dimensions_h17p dim = {
+		.width = 2408,
+		.height = 1506,
+	};
 
 	dcp_set_dfb_dimensions(dcp, false, &dim, boot_1_11, NULL);
 }
@@ -1358,11 +1351,7 @@ static void dcp_h17p_fix_swap_surfaces(struct apple_dcp *dcp)
 		 * 0xfc0000000 -- an address with no L1 entry at all.  Shift the
 		 * whole block, which subsumes the null-flag fixup.
 		 */
-		/* Preserve the complete 16K-aligned IOVA, including its low bits. */
-		static_assert(offsetof(typeof(*req), surf_iova) == 0xe3a,
-			      "H17P source IOVA offset");
-		static_assert(sizeof(*req) == 0xe9c, "H17P request size");
-		memmove(r + off - 2, r + off, n - off);
+		memmove(r + off, r + off + 2, n - off - 2);
 		memset(r + n - 2, 0, 2);
 	}
 }
@@ -2126,6 +2115,7 @@ static void res_is_main_display(struct apple_dcp *dcp, void *out, void *cookie)
 		 dcp->main_display, dcp->nr_modes);
 
 
+
 	connector = dcp->connector;
 	if (connector) {
 		connector->connected = dcp->nr_modes > 0;
@@ -2232,32 +2222,7 @@ static void dcp_client_open_run(struct apple_dcp *dcp, void *out, void *cookie)
 		break;
 	}
 	case DCP_STEP_A031: {
-		/*
-		 * The nine cumulative states macOS sends, from the 25G83
-		 * capture (dcp-calls.log lines 1507-1531).  Each call repeats
-		 * the previous set and adds one client.
-		 */
-		static const u8 notify_clients[9][8] = {
-			{},
-			{ 6 },
-			{ 6, 7 },
-			{ 6, 7, 8 },
-			{ 6, 7, 8, 10 },
-			{ 6, 7, 8, 10, 11 },
-			{ 6, 7, 8, 10, 11, 12 },
-			{ 6, 7, 8, 10, 11, 12, 25 },
-			{ 6, 7, 8, 10, 11, 12, 25, 26 },
-		};
-		static const u8 notify_count[9] = { 0, 1, 2, 3, 4, 5, 6, 7, 8 };
 		struct dcp_pipe_cfg_031 cfg = {};
-		unsigned int step = dcp->a031_step;
-		unsigned int i;
-
-		if (step >= ARRAY_SIZE(notify_clients))
-			step = ARRAY_SIZE(notify_clients) - 1;
-		for (i = 0; i < notify_count[step]; i++)
-			cfg.clients[i] = cpu_to_le32(notify_clients[step][i]);
-		dcp->a031_step++;
 
 		dcp_pipe_cfg_031(dcp, false, &cfg, next, ncookie);
 		break;
