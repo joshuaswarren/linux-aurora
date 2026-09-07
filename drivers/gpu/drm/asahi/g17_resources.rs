@@ -3102,17 +3102,15 @@ pub(crate) struct G17PUserRenderStorage {
     /// second AGXContextIDManager allocation is a refcounted lookup of this
     /// same GART, not a second hardware context.
     _command_context: Option<G17PRenderCommandContext>,
-    /// Hardware context carried by this queue's submitted TA/3D descriptors.
-    /// Native allocates this independently of the command-GART context.
+    /// Application-GART context carried by this queue's submitted TA/3D
+    /// descriptors and tag-15 records. Native's qualified graph uses the same
+    /// context identity for these fields and for the VM binding.
     descriptor_context_id: u16,
     /// TTBAT context this render's VM is bound to (`VmBind::slot`).
     ///
-    /// Distinct from `descriptor_context_id`: the descriptors execute in the
-    /// queue's own application context, while the fragment MCache write-range
-    /// selector names the bound root. With one bindable context this was
-    /// always 1; with a bind pool a concurrent second client is elsewhere and
-    /// emitting the wrong one would point its write ranges at another
-    /// client's page tables.
+    /// This is deliberately the same identity as `descriptor_context_id`.
+    /// With one bindable context both were 1; with a bind pool a concurrent
+    /// client must carry its own slot through descriptors, tag 15, and MCache.
     render_root_slot: u8,
     /// Render-only tail of the USC private-memory aperture.  Ordinary client
     /// VMs start with the 21-buffer compute closure; a render submission adds
@@ -5322,14 +5320,15 @@ fn render_build_fail(site: u32) -> kernel::error::Error {
 
 impl G17PUserRenderStorage {
     fn descriptor_context_valid(context_id: u16) -> bool {
-        // A descriptor context is a queue execution context. The bind band and
-        // the render app context are owned by other allocators, so a
-        // descriptor naming one of them would be a cross-allocator collision,
-        // not a valid submission.
+        // Render descriptors and tag 15 carry the application-GART context
+        // which owns their VM. Native's qualified single-client path uses 1;
+        // additional concurrent clients use the dedicated bind band. Compute
+        // execution contexts are a separate namespace and must never leak
+        // into these render fields merely because both roots map one VM.
         context_id
             == g17_submission::G17P_PARTIAL_OPENING_CONTEXT.descriptor_context_id as u16
-            || (u32::from(context_id) >= crate::g17_queue_limits::COMPUTE_CONTEXT_FIRST
-                && u32::from(context_id) < crate::g17_queue_limits::BIND_CONTEXT_FIRST)
+            || (u32::from(context_id) >= crate::g17_queue_limits::BIND_CONTEXT_FIRST
+                && u32::from(context_id) < crate::g17_queue_limits::RENDER_APP_CONTEXT)
     }
 
     pub(crate) fn write_sksm_entry(
@@ -14286,12 +14285,16 @@ impl G17ResourceOwner {
         self.stage_render_uma_page_pool_descriptor()?;
         let parameter_page_list_vas = self.parameter_buffer_page_list_vas();
         let (command_context, render_root_slot) = if let Some(context) = execution_context {
-            if !context.matches(vm) || context.context_id() != u32::from(descriptor_context_id) {
+            let render_root_slot = render_root_slot.ok_or(EINVAL)?;
+            if !context.matches(vm)
+                || !context.is_current()
+                || u32::from(descriptor_context_id) != u32::from(render_root_slot)
+            {
                 return Err(EINVAL);
             }
             (
                 G17PRenderCommandContext::Job(context),
-                render_root_slot.ok_or(EINVAL)?,
+                render_root_slot,
             )
         } else {
             let render_bind = self.address_space.uat.bind(vm)?;

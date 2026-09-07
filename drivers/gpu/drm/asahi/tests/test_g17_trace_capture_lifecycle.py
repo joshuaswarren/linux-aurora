@@ -77,7 +77,7 @@ class CaptureLifecycle(unittest.TestCase):
         self.assertIn("self.render_state.capture_trace_range(", body)
         self.assertIn("map(|pm| &mut pm.backing), 0)", body)
 
-    def test_render_submission_uses_the_logical_queue_execution_context(self):
+    def test_render_submission_uses_the_bound_application_gart_context(self):
         # `submit` is now a thin wrapper that settles a lost client's
         # outstanding jobs; the submission body it guards is
         # `submit_guarded`.
@@ -90,7 +90,26 @@ class CaptureLifecycle(unittest.TestCase):
         owner = source[source.index("impl G17ResourceOwner {"):]
         constructor = function(owner, "new_user_render_storage")
         self.assertIn("context.matches(vm)", constructor)
-        self.assertIn("context.context_id()", constructor)
+        self.assertIn("context.is_current()", constructor)
+        self.assertIn(
+            "u32::from(descriptor_context_id) != u32::from(render_root_slot)",
+            constructor,
+        )
+        manager = (SOURCE / "g17_manager.rs").read_text()
+        begin = function(manager, "begin_translated_render_with_hardware_buffer")
+        self.assertIn(
+            "let descriptor_context_id = u16::from(render_root_slot)", begin
+        )
+        self.assertNotIn("execution_context.context_id() as u16", begin)
+        storage = source[source.index("impl G17PUserRenderStorage {"):]
+        valid = function(storage, "descriptor_context_valid")
+        self.assertIn("BIND_CONTEXT_FIRST", valid)
+        self.assertIn("RENDER_APP_CONTEXT", valid)
+        self.assertNotIn("COMPUTE_CONTEXT_FIRST", valid)
+        fragment = function(storage, "stage_fragment")
+        self.assertIn("self.descriptor_context_id", fragment)
+        late_ta = function(storage, "prepare_late_tiling_publication_with_stamp")
+        self.assertIn("self.descriptor_context_id", late_ta)
         restage = function(source, "restage_command")
         self.assertEqual(
             restage.count("context_id: u32::from(descriptor_context_id)"), 2
