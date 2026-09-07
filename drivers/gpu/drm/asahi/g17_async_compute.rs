@@ -39,7 +39,12 @@ impl G17PLiveRuntime {
         let manager = self.manager.as_mut().ok_or(ENODEV)?;
         manager.stage_compute_flist_state()?;
         let free = self.async_compute_queues.iter().position(|q|
-            q.owner.is_none() && q.active.is_none() && !q.quarantined);
+            crate::g17_queue_limits::reusable_uninstalled_compute_graph(
+                q.owner.is_none(),
+                q.active.is_none(),
+                q.quarantined,
+                q.queue.requires_first_install(),
+            ));
         let index = if let Some(index) = free { index } else {
             self.async_compute_queues.reserve(1, GFP_KERNEL)?;
             // Reuse the unsubmitted boot graph, preserving QID 4 as first queue.
