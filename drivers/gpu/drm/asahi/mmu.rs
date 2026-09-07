@@ -4445,6 +4445,32 @@ impl Uat {
         })
     }
 
+    /// Snapshot an arbitrary set of T8140 context-table entries.
+    ///
+    /// Concurrent render diagnosis needs to compare the opening context, the
+    /// QoS-requested context, the command descriptor context and the VM bind
+    /// context. Those are allocator results and cannot be represented by the
+    /// fixed ctx0..ctx3 snapshot above.
+    pub(crate) fn t8140_selected_context_roots(
+        &self,
+        contexts: [u8; 4],
+    ) -> Result<[(u64, u64); 4]> {
+        if self.cfg != UatConfig::T8140
+            || contexts.iter().any(|context| usize::from(*context) >= UAT_NUM_CTX)
+        {
+            return Err(EINVAL);
+        }
+        let inner = self.inner.lock();
+        let ttbs = inner.ttbs();
+        Ok(core::array::from_fn(|index| {
+            let slot = &ttbs[usize::from(contexts[index])];
+            (
+                slot.ttb0.load(Ordering::Acquire),
+                slot.ttb1.load(Ordering::Acquire),
+            )
+        }))
+    }
+
     /// Confirm the compute aliases are resident and name this binding.
     ///
     /// This also re-reads `ttbs[1]`: m1n1 warns that installing a context's

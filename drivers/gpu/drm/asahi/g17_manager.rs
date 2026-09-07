@@ -3294,6 +3294,59 @@ impl G17PManagerConstruction {
     /// caller has already published the group's command record and tag-15
     /// ConfigUpdate pointers, this configures the QID on the bridge once, then
     /// writes the kick entry body, and the caller publishes tag-14 afterwards.
+    fn log_render_context_route(&mut self, label: &'static str) -> Result {
+        let (pair, descriptor, tiling, fragment, root_slot, ctxdesc) = {
+            let storage = self.render_storage.as_mut().ok_or(ENODEV)?;
+            let pair = storage.queue_pair();
+            let descriptor = storage.descriptor_context_ids()?;
+            let tiling = storage.tiling_config_update_header()?;
+            let fragment = storage.fragment_config_update_header()?;
+            let root_slot = storage.render_root_slot();
+            let ctxdesc = storage.render_channel_control_prefix()?;
+            (pair, descriptor, tiling, fragment, root_slot, ctxdesc)
+        };
+        // Slot zero is already qualified and would add four lines to every
+        // boot. The unresolved route is the independently retained qid2/3
+        // pair, so keep this diagnostic bounded to that first installation.
+        if pair.slot() == 0 {
+            return Ok(());
+        }
+        let qos_context = u8::try_from(fragment.field_56).map_err(|_| EINVAL)?;
+        let descriptor_context = u8::try_from(fragment.context_id).map_err(|_| EINVAL)?;
+        let contexts = [1, qos_context, descriptor_context, root_slot];
+        let roots = self
+            .resources
+            .uat()
+            .t8140_selected_context_roots(contexts)?;
+        dev_info!(
+            self.resources.dev().as_ref(),
+            "G17P render route[{}]: qids={}/{} descriptor+0x0c={}/{} tag15+0x32={}/{} tag15+0x56={}/{} contexts(opening,qos,descriptor,bind)={:?} roots=[{:#x}/{:#x},{:#x}/{:#x},{:#x}/{:#x},{:#x}/{:#x}] fw-ctxdesc(slot={},ctx={},state={},bound={})\n",
+            label,
+            pair.tiling,
+            pair.fragment,
+            descriptor[0],
+            descriptor[1],
+            tiling.context_id,
+            fragment.context_id,
+            tiling.field_56,
+            fragment.field_56,
+            contexts,
+            roots[0].0,
+            roots[0].1,
+            roots[1].0,
+            roots[1].1,
+            roots[2].0,
+            roots[2].1,
+            roots[3].0,
+            roots[3].1,
+            ctxdesc[0],
+            ctxdesc[1],
+            ctxdesc[0x26],
+            ctxdesc[0x33],
+        );
+        Ok(())
+    }
+
     fn publish_render_sksm_group(
         &mut self,
         dev: &AsahiDevice,
@@ -3409,9 +3462,16 @@ impl G17PManagerConstruction {
         )
         .map_err(|_| Self::render_stage_fail("sksm-kick-entry", EINVAL))?;
         if !queue.registered {
-            registers
+            let issued = registers
                 .g17p_sksm_configure_queue(queue.configure_pair, queue.enable_pair)
                 .map_err(|error| Self::render_stage_fail("sksm-configure-queue", error))?;
+            dev_info!(
+                dev.as_ref(),
+                "G17P render QID registration: qid={} issued={} deferred={}\n",
+                queue.queue_id,
+                issued,
+                !issued,
+            );
             queue.registered = true;
         }
         storage
@@ -3558,9 +3618,23 @@ impl G17PManagerConstruction {
                     ta_queue_id
                 );
             }
+            let fragment_first_install = self
+                .render_sksm
+                .as_ref()
+                .is_some_and(|queues| !queues.fragment.registered);
+            if fragment_first_install {
+                if let Err(error) = self.log_render_context_route("before-3d-qid-install") {
+                    dev_warn!(dev.as_ref(), "G17P render route: pre-3D snapshot failed ({:?})\n", error);
+                }
+            }
             let fragment_stamp = self
                 .publish_render_sksm_group(dev, registers, false, fragment_queue, barrier_slice)
                 .map_err(|error| Self::render_stage_fail("sksm-publish-fragment", error))?;
+            if fragment_first_install {
+                if let Err(error) = self.log_render_context_route("after-3d-qid-install") {
+                    dev_warn!(dev.as_ref(), "G17P render route: post-3D snapshot failed ({:?})\n", error);
+                }
+            }
             let fragment_stamp = u32::try_from(fragment_stamp)
                 .map_err(|_| Self::render_stage_fail("sksm-fragment-stamp-width", EINVAL))?;
             self.render_storage
@@ -3610,9 +3684,23 @@ impl G17PManagerConstruction {
             );
             return Ok((fragment_queue, tiling_queue, previous, None));
         }
+        let tiling_first_install = self
+            .render_sksm
+            .as_ref()
+            .is_some_and(|queues| !queues.tiling.registered);
+        if tiling_first_install {
+            if let Err(error) = self.log_render_context_route("before-ta-qid-install") {
+                dev_warn!(dev.as_ref(), "G17P render route: pre-TA snapshot failed ({:?})\n", error);
+            }
+        }
         let tiling_stamp = self
             .publish_render_sksm_group(dev, registers, true, tiling_queue, &[])
             .map_err(|error| Self::render_stage_fail("sksm-publish-tiling", error))?;
+        if tiling_first_install {
+            if let Err(error) = self.log_render_context_route("after-ta-qid-install") {
+                dev_warn!(dev.as_ref(), "G17P render route: post-TA snapshot failed ({:?})\n", error);
+            }
+        }
         // The barrier the 3D kick already carries names this exact value.
         if tiling_stamp != ta_stamp {
             pr_info!(
