@@ -29,12 +29,7 @@
 
 #define MAX_INTERFACES 16
 
-/*
- * MTP's own _mgr_esd_recovery gives the AFE three attempts before it reports
- * "Failed to boot Cumulus in 3 recovery attempts. Giving up", so the host has
- * no reason to keep asking after that many either.
- */
-#define DCHID_MAX_START_ATTEMPTS 3
+
 
 /* Data + checksum */
 #define MAX_PKT_SIZE (0xffff + 4)
@@ -211,6 +206,18 @@ MODULE_PARM_DESC(enable_mtp_iface,
  * re-runs the start sequence, so it can be armed and fired without a reboot,
  * and a reboot always clears it.
  */
+/*
+ * MTP's own _mgr_esd_recovery gives the AFE three attempts before it reports
+ * "Failed to boot Cumulus in 3 recovery attempts. Giving up", so the host has
+ * no reason to keep asking after that many either.  Writable so that raising it
+ * re-arms a start that has already given up, which is how a changed parameter
+ * gets retried without a reboot.
+ */
+static int max_start_attempts = 3;
+module_param(max_start_attempts, int, 0644);
+MODULE_PARM_DESC(max_start_attempts,
+		 "How many times to attempt an interface start before giving up");
+
 static bool shared_buffer;
 module_param(shared_buffer, bool, 0644);
 MODULE_PARM_DESC(shared_buffer,
@@ -221,7 +228,7 @@ module_param(shared_buffer_size, uint, 0644);
 MODULE_PARM_DESC(shared_buffer_size,
 		 "Size of the shared buffer registered with opcode 0x91");
 
-static int shared_buffer_unk1 = 2;
+static int shared_buffer_unk1;
 module_param(shared_buffer_unk1, int, 0644);
 MODULE_PARM_DESC(shared_buffer_unk1, "Second byte of the opcode 0x91 message");
 
@@ -355,6 +362,7 @@ struct dockchannel_hid {
 
 	/* DRAM shared buffer registered with MTP, if any. */
 	void *shmem;
+	unsigned int shmem_size;
 
 	/* Workqueue to asynchronously create HID devices */
 	struct workqueue_struct *new_iface_wq;
@@ -497,6 +505,26 @@ static int dchid_send(struct dchid_iface *iface, u32 flags, void *msg, size_t si
 	return 0;
 }
 
+/*
+ * Once a shared FIFO is registered, MTP stops acknowledging comm commands over
+ * DockChannel, which is consistent with the replies moving into the ring the
+ * host is then expected to drain.  Show the ring's head and tail and the first
+ * bytes of its data area whenever a command goes unanswered, so the framing can
+ * be read off real traffic rather than guessed at.
+ */
+static void dchid_dump_shmem(struct dockchannel_hid *dchid)
+{
+	u32 *hdr = dchid->shmem;
+
+	if (!dchid->shmem)
+		return;
+
+	dev_info(dchid->dev,
+		 "Shared FIFO: producer=%u consumer=%u capacity=%u data=%*ph\n",
+		 READ_ONCE(hdr[0]), READ_ONCE(hdr[1]), dchid->shmem_size - 8,
+		 64, (u8 *)dchid->shmem + 8);
+}
+
 static int dchid_cmd(struct dchid_iface *iface, u32 type, u32 req,
 		     void *data, size_t size, void *resp_buf, size_t resp_size)
 {
@@ -519,6 +547,7 @@ static int dchid_cmd(struct dchid_iface *iface, u32 type, u32 req,
 	if (!wait_for_completion_timeout(&iface->out_complete, msecs_to_jiffies(COMMAND_TIMEOUT_MS))) {
 		dev_err(iface->dchid->dev, "output report 0x%x to iface  %d (%s) timed out\n",
 			report_id, iface->index, iface->name);
+		dchid_dump_shmem(iface->dchid);
 		ret = -ETIMEDOUT;
 		goto done;
 	}
@@ -1080,8 +1109,31 @@ static int dchid_register_shared_buffer(struct dchid_iface *iface)
 		return buf ? PTR_ERR(buf) : -ENOMEM;
 	}
 
+	/*
+	 * The buffer starts with the FIFO's own head and tail, which MTP reads
+	 * as soon as it owns the registration, so they have to be zero before
+	 * the address goes out.  dma_alloc_coherent() already zeroes, but say so
+	 * rather than depend on it.
+	 */
+	memset(buf, 0, sizeof(u32) * 2);
 	msg.addr = addr;
 	wmb();
+
+	/*
+	 * Claim it before sending, not after.  MTP registers the buffer as soon
+	 * as it parses the message - it says so in its own log - but does not
+	 * acknowledge the command, so waiting for an ack that never comes used
+	 * to leave this unset and register a second buffer on the next attempt.
+	 * Registering twice takes the coprocessor down:
+	 *
+	 *   hal.c:170: Registering DRAM Shared Buffer #1. Addr=..., Size=16384
+	 *   RTKit: co-processor has crashed
+	 *   ESR = 0x96000044  FAR = 0x1010108eb80
+	 *
+	 * so this must happen exactly once for the life of the device.
+	 */
+	dchid->shmem = buf;
+	dchid->shmem_size = shared_buffer_size;
 
 	ret = dchid_comm_cmd(dchid, &msg, sizeof(msg));
 	dev_info(dchid->dev,
@@ -1089,10 +1141,11 @@ static int dchid_register_shared_buffer(struct dchid_iface *iface)
 		 &addr, shared_buffer_size, shared_buffer_unk1,
 		 shared_buffer_unk2, ret);
 
-	if (ret < 0)
-		return ret;
-
-	dchid->shmem = buf;
+	/*
+	 * A missing acknowledgement is not a failure here: the registration has
+	 * demonstrably taken effect by the time the command times out, and
+	 * failing the start would only send us round again.
+	 */
 	return 0;
 }
 
@@ -1115,7 +1168,7 @@ static int dchid_start_interface(struct dchid_iface *iface)
 	 * as many attempts as MTP's own _mgr_esd_recovery gives the part before
 	 * it gives up, and then fail fast and quietly.
 	 */
-	if (iface->start_attempts >= DCHID_MAX_START_ATTEMPTS) {
+	if (iface->start_attempts >= max_start_attempts) {
 		dev_warn_once(iface->dchid->dev,
 			      "Interface %s failed to start %u times, not retrying\n",
 			      iface->name, iface->start_attempts);
