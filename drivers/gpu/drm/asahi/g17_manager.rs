@@ -1086,7 +1086,10 @@ struct G17PRenderSlotState {
 #[cfg(not(test))]
 enum G17PRenderRootOwner {
     Bootstrap(mmu::VmBind),
-    Job(Arc<mmu::T8140ComputeExecutionContext>),
+    Job {
+        context: Arc<mmu::T8140ComputeExecutionContext>,
+        flist_bind: mmu::VmBind,
+    },
 }
 
 #[cfg(not(test))]
@@ -1094,33 +1097,44 @@ impl G17PRenderRootOwner {
     fn matches(&self, vm: &mmu::Vm) -> bool {
         match self {
             Self::Bootstrap(bind) => bind.matches(vm),
-            Self::Job(context) => context.matches(vm),
+            Self::Job { context, flist_bind } => {
+                context.matches(vm) && flist_bind.matches(vm)
+            }
         }
     }
 
     fn root(&self) -> u64 {
         match self {
             Self::Bootstrap(bind) => bind.root(),
-            Self::Job(context) => context.root(),
+            Self::Job { context, flist_bind } => {
+                debug_assert_eq!(context.root(), flist_bind.root());
+                flist_bind.root()
+            }
         }
     }
 
     fn vm_id(&self) -> u64 {
         match self {
             Self::Bootstrap(bind) => bind.vm_id(),
-            Self::Job(context) => context.vm_id(),
+            Self::Job { context, flist_bind } => {
+                debug_assert_eq!(context.vm_id(), flist_bind.vm_id());
+                flist_bind.vm_id()
+            }
         }
     }
 
     fn vm(&self) -> &mmu::Vm {
         match self {
             Self::Bootstrap(bind) => bind.vm(),
-            Self::Job(context) => context.vm(),
+            Self::Job { context, flist_bind } => {
+                debug_assert!(context.matches(flist_bind.vm()));
+                flist_bind.vm()
+            }
         }
     }
 
     fn bootstrap(&self) -> Option<&mmu::VmBind> {
-        match self { Self::Bootstrap(bind) => Some(bind), Self::Job(_) => None }
+        match self { Self::Bootstrap(bind) => Some(bind), Self::Job { .. } => None }
     }
 }
 
@@ -3706,11 +3720,15 @@ impl G17PManagerConstruction {
             .prepare_pm_submitted_operation()
             .map_err(|error| Self::render_stage_fail("prepare-pm-submitted-operation", error))?;
         let pm_submitted_count = pm_submission.as_ref().map(|operation| operation.next());
+        // The TA/3D descriptors execute in their independently allocated
+        // application context, but the retained USC FList service still
+        // fetches its run table through the legacy application-GART slot.
+        // Keep the same VM rooted there for the lifetime of this render graph.
         let (prepared, render_bind) = self
             .resources
             .publish_partial_opening_pair(
-                None,
-                true,
+                if retained { None } else { Some(vm) },
+                retained,
                 queue_pair,
                 g17p_render_deferred_outer_mode(native_doorbell_mode, split_launch),
                 fragment_queue,
@@ -3744,10 +3762,12 @@ impl G17PManagerConstruction {
                 return Err(Self::render_stage_fail("retained-bind-unexpected", EINVAL));
             }
         } else {
-            if render_bind.is_some() {
-                return Err(Self::render_stage_fail("job-bind-unexpected", EINVAL));
-            }
-            self.render_bind = Some(G17PRenderRootOwner::Job(execution_context));
+            let flist_bind = render_bind
+                .ok_or_else(|| Self::render_stage_fail("job-flist-bind-missing", EINVAL))?;
+            self.render_bind = Some(G17PRenderRootOwner::Job {
+                context: execution_context,
+                flist_bind,
+            });
         }
         let roots = self.resources.uat().t8140_compute_context_roots();
         dev_info!(
