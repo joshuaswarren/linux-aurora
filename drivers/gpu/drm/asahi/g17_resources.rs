@@ -3243,6 +3243,7 @@ pub(crate) struct G17PRenderConfigUpdateHeader {
     pub(crate) entry_high: u64,
     pub(crate) queue_id: u16,
     pub(crate) install: u16,
+    pub(crate) priority: u16,
     pub(crate) data_master: u16,
     pub(crate) graphics: u16,
     pub(crate) context_id: u16,
@@ -3278,6 +3279,7 @@ fn decode_g17p_render_config_update(raw: &[u8]) -> Option<G17PRenderConfigUpdate
         entry_high: u64_at(0x10),
         queue_id: u16_at(0x18),
         install: u16_at(0x1a),
+        priority: u16_at(0x1e),
         data_master: u16_at(0x22),
         graphics: u16_at(0x26),
         context_id: u16_at(0x32),
@@ -5367,6 +5369,14 @@ impl G17PUserRenderStorage {
             self.ta_context_low.iova()
         } else {
             self.fragment_context_low.iova()
+        }
+    }
+
+    pub(crate) fn sksm_entry_high_va(&self, tiling: bool) -> u64 {
+        if tiling {
+            self.ta_context.iova()
+        } else {
+            self.fragment_context.iova()
         }
     }
 
@@ -17206,6 +17216,13 @@ mod tests {
         assert_eq!(get_u32(&second_pair.optional, 0x82) & 0xffff, 3);
         assert_eq!(get_u32(&second_pair.event, 0x04) & 0xffff, 2);
         assert_eq!(get_u32(&second_pair.entry_signal, 0x04) & 0xffff, 2);
+        let second_header = decode_g17p_render_config_update(&second_pair.optional).unwrap();
+        assert_eq!(second_header.selector, 0x0f);
+        assert_eq!(second_header.queue_id, 2);
+        assert_eq!(second_header.priority, 0);
+        assert_eq!(second_header.data_master, 0);
+        assert_eq!(second_header.field_56, 2);
+        assert_eq!(second_header.parameter_buffer_bit & 0xffff, 3);
 
         let retained =
             build_g17p_late_tiling_bytes(descriptor, graph_va, G17PRenderQueuePair::for_slot(0).unwrap(), addresses, 6, 1, 1, 2, false, false, 2)
