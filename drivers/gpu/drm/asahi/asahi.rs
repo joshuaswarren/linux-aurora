@@ -33,6 +33,7 @@ mod g17_queue_limits;
 mod g17_lifecycle;
 mod g17_live_boot;
 mod g17_manager;
+mod g17_perf;
 mod g17_power_preflight;
 mod g17_render;
 mod g17_resources;
@@ -356,6 +357,10 @@ kernel::module_platform_driver! {
         g17p_ta_oracle: u32 {
             default: 0,
             description: "DIAGNOSTIC ONLY -- bitmask, write native's value into TA-descriptor fields where ours differs structurally at MATCHED 256x256 geometry. This is the first VALID TA comparison: earlier ones diffed a 32x32 render against native's 256x256 capture, so workload-dependent fields looked like bugs. 1: the three sites carrying 0x100 where native carries 0x500 (+0x370, +0x388, +0x8d0; the fragment descriptor carries the same pair at +0x470). 2: +0x018 = 3, which we never write at all. 4: register 0xd419's value 0x60 -> 0xa9. 8: +0x7d8 0x200 -> 6 and +0x798 6 -> 0xa. The tiler bins ~60 bytes of a 1.28 MB tile buffer while every input -- vertex shader, uniform ranges, root descriptor, vertex data, VDM stream and stream pointer -- is verified correct on hardware, so these are what remains that we demonstrably send differently. Not a fix; it identifies which field the empty tile buffer depends on.",
+        },
+        g17p_perf_window: u32 {
+            default: 256,
+            description: "Submissions per throughput report. The driver has never reported how fast it is: the per-submission dumps are gated off by g17p_verbose (correctly -- they cost more than they measure), which left no number at all. This accumulates plain integer counters on the submit path -- one uncontended lock round trip, no allocation, no formatting -- and emits ONE line per window: renders and computes completed, submissions per second, average and worst host time inside the ioctl, the publish/wait split of that time, average completion polls, GPU busy time from the firmware's own pass envelope (TA stamps the start word, 3D the end word), GPU-interval occupancy, the share of wall time the client spends inside the ioctl, and the GPU tick rate DERIVED from the window rather than assumed. At 256 submissions and 60 frames per second that is one line every four seconds. 0: no accounting at all.",
         },
         g17p_verbose: u32 {
             default: 0,

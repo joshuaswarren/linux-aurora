@@ -14,7 +14,7 @@ use kernel::{
     prelude::*,
     static_lock_class,
     sync::{Arc, CondVar, Mutex},
-    time::{delay::fsleep, Delta},
+    time::{delay::fsleep, Delta, Instant, Monotonic},
     uapi, xarray,
 };
 
@@ -22,8 +22,8 @@ use crate::{
     alloc,
     driver::{AsahiDevRef, AsahiDevice},
     drm_gpu::{DrmGpu, DrmGpuParams},
-    file, g17_job, g17_adt_j700, g17_live_boot, g17_manager, g17_render, g17_resources, g17_uapi, gem, gpu, hw, mmu, module_parameters,
-    pgtable, queue,
+    file, g17_job, g17_adt_j700, g17_completion, g17_live_boot, g17_manager, g17_perf,
+    g17_render, g17_resources, g17_uapi, gem, gpu, hw, mmu, module_parameters, pgtable, queue,
 };
 
 const T8140_USER_START: u64 = mmu::UAT_PGSZ as u64;
@@ -97,20 +97,43 @@ impl G17PRuntimeRef {
         self.mutex().lock().release_compute_owner(owner);
     }
 
-    fn wait_render_slot(&self, render_slot: u8) -> Result {
+    /// Wait for one published render to complete, reporting what it cost.
+    ///
+    /// The poll count and the GPU pass envelope are observations of a
+    /// completion that has already been accepted: they are read out after the
+    /// `completion.complete` decision, never before it, so nothing here can
+    /// change whether a submission is considered finished.
+    fn wait_render_slot(&self, render_slot: u8) -> Result<G17PRenderWaitOutcome> {
+        let mut polls = 0u32;
         for _ in 0..g17_manager::G17PManagerConstruction::RENDER_COMPLETION_POLLS {
             let completion = self
                 .mutex()
                 .lock()
                 .poll_deferred_render_completion(render_slot)?;
+            polls = polls.saturating_add(1);
             if let Some(completion) = completion {
-                return if completion.complete { Ok(()) } else { Err(EIO) };
+                return if completion.complete {
+                    Ok(G17PRenderWaitOutcome {
+                        polls,
+                        gpu_interval: g17_completion::render_gpu_interval(completion.execution),
+                    })
+                } else {
+                    Err(EIO)
+                };
             }
             fsleep(Delta::from_millis(1));
         }
         self.mutex().lock().abandon_deferred_render(render_slot)?;
         Err(ETIMEDOUT)
     }
+}
+
+/// What one completed render wait observed.
+struct G17PRenderWaitOutcome {
+    /// Completion polls made, including the one that observed completion.
+    polls: u32,
+    /// The firmware's own pass envelope in GPU ticks, when it published one.
+    gpu_interval: Option<[u64; 2]>,
 }
 
 /// Ceiling on live DRM compute queue objects for this device.
@@ -145,6 +168,25 @@ pub(crate) struct G17PQueueRegistry {
     live_queues: AtomicU32,
     compute_readers: AtomicU32,
     compute_faulted: AtomicU32,
+    /// Device-wide throughput accounting.
+    ///
+    /// `lease` bounds render to two submissions in flight, so at most two
+    /// threads ever reach this mutex and each holds it for a handful of
+    /// integer updates -- no allocation, no formatting -- on a path that
+    /// already takes several locks. It is skipped entirely when
+    /// `g17p_perf_window` is 0.
+    #[pin]
+    perf: Mutex<G17PPerfState>,
+}
+
+/// The open reporting window and the instant it opened.
+///
+/// The kernel's `Instant` keeps its absolute nanoseconds `pub(crate)` to the
+/// `kernel` crate, so the opening instant is held here and only the elapsed
+/// span reaches `g17_perf`.
+struct G17PPerfState {
+    window: g17_perf::SubmitWindow,
+    opened: Instant<Monotonic>,
 }
 
 const G17P_RENDER_SLOTS: usize =
@@ -262,6 +304,13 @@ impl G17PQueueRegistry {
                 live_queues: AtomicU32::new(0),
                 compute_readers: AtomicU32::new(0),
                 compute_faulted: AtomicU32::new(0),
+                perf <- new_mutex!(
+                    G17PPerfState {
+                        window: g17_perf::SubmitWindow::default(),
+                        opened: Instant::<Monotonic>::now(),
+                    },
+                    "G17PQueueRegistry::perf"
+                ),
             }),
             GFP_KERNEL,
         )
@@ -292,6 +341,53 @@ impl G17PQueueRegistry {
     fn release_render_claim(&self, owner: u64) {
         let mut held = self.lease.lock();
         held.release_render_claim(owner);
+    }
+
+    /// Fold one finished render into the open window.
+    ///
+    /// Returns a report only on the submission that fills the window; the
+    /// caller prints it with this lock released.
+    fn record_render(&self, sample: g17_perf::RenderSample) -> Option<g17_perf::SubmitReport> {
+        let size = *module_parameters::g17p_perf_window.value();
+        if size == 0 {
+            return None;
+        }
+        let mut state = self.perf.lock();
+        if !state.window.is_open() {
+            state.window.open();
+            state.opened = Instant::<Monotonic>::now();
+        }
+        state.window.record_render(sample);
+        Self::close_full_window(&mut state, size)
+    }
+
+    /// Fold one queued asynchronous compute into the open window.
+    ///
+    /// Only the ioctl cost is recorded: the job has not run when the ioctl
+    /// returns, by design, so there is no GPU interval to attribute to it here.
+    fn record_compute(&self, ioctl_ns: u64) -> Option<g17_perf::SubmitReport> {
+        let size = *module_parameters::g17p_perf_window.value();
+        if size == 0 {
+            return None;
+        }
+        let mut state = self.perf.lock();
+        if !state.window.is_open() {
+            state.window.open();
+            state.opened = Instant::<Monotonic>::now();
+        }
+        state.window.record_compute(ioctl_ns);
+        Self::close_full_window(&mut state, size)
+    }
+
+    fn close_full_window(
+        state: &mut G17PPerfState,
+        size: u32,
+    ) -> Option<g17_perf::SubmitReport> {
+        if state.window.submissions() < size {
+            return None;
+        }
+        let wall_ns = state.opened.elapsed().as_nanos().max(0) as u64;
+        Some(state.window.close(wall_ns))
     }
 
     /// Reserve one queue slot, or report a full device.
@@ -771,6 +867,61 @@ impl G17PQueue {
         Ok(())
     }
 
+    /// Print one throughput window.
+    ///
+    /// This is the only line the submit path emits at steady state, and it
+    /// carries every number the driver can honestly report:
+    ///
+    /// * `renders`/`computes`/`gpu-intervals` -- what the window contained,
+    ///   and how many renders published a native pass envelope.
+    /// * `renders/s` -- end-to-end submission throughput.
+    /// * `ioctl`/`publish`/`wait` -- host microseconds per render, and the
+    ///   split between building and publishing the work and waiting for it.
+    /// * `gpu` -- the firmware's own pass envelope, converted with the 24 MHz
+    ///   rate this driver already reports through `DRM_IOCTL_ASAHI_GET_TIME`.
+    /// * `occupancy` -- GPU busy ticks over the tick span the window covered.
+    ///   Both terms are GPU-written, so no timebase enters this ratio.
+    /// * `ioctl-share` -- how much of wall time the client spent inside the
+    ///   ioctl. With a synchronous render wait this is the number that says
+    ///   how much throughput a client is losing to the driver.
+    /// * `tick-khz` -- the tick rate MEASURED from this window. It exists so a
+    ///   wrong timebase assumption is visible instead of silently scaling
+    ///   every microsecond above.
+    fn report_perf(&self, report: g17_perf::SubmitReport) {
+        dev_info!(
+            self.dev.as_ref(),
+            "G17P perf[{}]: renders={} computes={} gpu-intervals={} wall={}us renders/s={}.{:02} ioctl={}.{}us(max {}.{}us) publish={}.{}us wait={}.{}us polls={}.{} compute-ioctl={}.{}us gpu={}.{}us(max {}.{}us) occupancy={}.{}% ioctl-share={}.{}% tick-khz={}\n",
+            report.window_index,
+            report.renders,
+            report.computes,
+            report.intervals,
+            report.wall_us,
+            report.renders_per_s_x100 / 100,
+            report.renders_per_s_x100 % 100,
+            report.ioctl_avg_us_x10 / 10,
+            report.ioctl_avg_us_x10 % 10,
+            report.ioctl_max_us_x10 / 10,
+            report.ioctl_max_us_x10 % 10,
+            report.publish_avg_us_x10 / 10,
+            report.publish_avg_us_x10 % 10,
+            report.wait_avg_us_x10 / 10,
+            report.wait_avg_us_x10 % 10,
+            report.polls_avg_x10 / 10,
+            report.polls_avg_x10 % 10,
+            report.compute_avg_us_x10 / 10,
+            report.compute_avg_us_x10 % 10,
+            report.gpu_avg_us_x10 / 10,
+            report.gpu_avg_us_x10 % 10,
+            report.gpu_max_us_x10 / 10,
+            report.gpu_max_us_x10 % 10,
+            report.occupancy_pct_x10 / 10,
+            report.occupancy_pct_x10 % 10,
+            report.ioctl_pct_x10 / 10,
+            report.ioctl_pct_x10 % 10,
+            report.tick_khz,
+        );
+    }
+
     /// Name the UAPI check that refused a submission. Without this the ioctl
     /// only reports a bare EINVAL, and every validation in `g17_uapi` looks
     /// alike from userspace.
@@ -867,6 +1018,7 @@ impl G17PQueue {
         mut syncs: KVec<file::SyncItem>, in_sync_count: usize,
         objects: core::pin::Pin<&xarray::XArray<KBox<file::Object>>>,
         publication: &mut G17POutputFencePublication<'_>,
+        entered: Instant<Monotonic>,
     ) -> Result {
         self.ensure_async_compute_queue()?;
         self.runtime.mutex().lock().check_async_compute_submission()?;
@@ -895,6 +1047,12 @@ impl G17PQueue {
         if crate::util::g17p_verbose() {
             pr_info!("G17P async submit: QUEUED submission {} owner={} qid={} context={}\n",
                 submission_id, self.id, backend.hardware_queue, backend.context.context_id());
+        }
+        if let Some(report) = self
+            .registry
+            .record_compute(entered.elapsed().as_nanos().max(0) as u64)
+        {
+            self.report_perf(report);
         }
         Ok(())
     }
@@ -1669,6 +1827,9 @@ impl G17PQueue {
         cmdbuf_raw: &[u8],
         objects: core::pin::Pin<&xarray::XArray<KBox<file::Object>>>,
     ) -> Result {
+        // Taken before anything else so the reported ioctl cost is the whole
+        // ioctl, not just the part after validation.
+        let entered = Instant::<Monotonic>::now();
         if crate::util::g17p_verbose() {
             pr_info!(
                 "G17P submit: ENTER submission {} syncs={} in_sync={} cmdbuf_bytes={}\n",
@@ -1848,10 +2009,13 @@ impl G17PQueue {
                 in_sync_count,
                 objects,
                 &mut publication,
+                entered,
             );
         }
 
         self.join_async_compute_timeline(submission_id)?;
+        let mut sample = g17_perf::RenderSample::default();
+        let mut render_completed = false;
 
         // Dependencies must become ready before reserving the physical
         // queues: their signalling submission may belong to another client.
@@ -1897,6 +2061,7 @@ impl G17PQueue {
                         submission_id
                     );
                 }
+                let publish_started = Instant::<Monotonic>::now();
                 self.runtime
                     .mutex()
                     .lock()
@@ -1912,7 +2077,10 @@ impl G17PQueue {
                     .map_err(|error| {
                         Self::stage_fail(submission_id, "submit-translated-render", error)
                     })?;
-                self.runtime
+                sample.publish_ns = publish_started.elapsed().as_nanos().max(0) as u64;
+                let wait_started = Instant::<Monotonic>::now();
+                let outcome = self
+                    .runtime
                     .wait_render_slot(lease.slot())
                     .map_err(|error| {
                         // An abandoned render leaves the firmware potentially
@@ -1925,6 +2093,10 @@ impl G17PQueue {
                         }
                         Self::stage_fail(submission_id, "wait-render-slot", error)
                     })?;
+                sample.wait_ns = wait_started.elapsed().as_nanos().max(0) as u64;
+                sample.polls = outcome.polls;
+                sample.gpu_interval = outcome.gpu_interval;
+                render_completed = true;
             }
             G17PPendingCommand::Compute(translated) => {
                 let start = Self::timestamp_destination(objects, translated.timestamps.start)
@@ -2051,6 +2223,12 @@ impl G17PQueue {
         }
         publication.succeeded();
         core::mem::drop(publication);
+        if render_completed {
+            sample.ioctl_ns = entered.elapsed().as_nanos().max(0) as u64;
+            if let Some(report) = self.registry.record_render(sample) {
+                self.report_perf(report);
+            }
+        }
         dev_dbg!(
             self.dev.as_ref(),
             "G17P queue {} completed synchronous submission {} (one hardware command)\n",
