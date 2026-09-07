@@ -177,6 +177,7 @@ struct dchid_iface {
 
 	u32 keyboard_layout_id;
 	u32 power_method;
+	bool inherited_power_method_2;
 };
 
 struct dockchannel_hid {
@@ -213,6 +214,11 @@ static struct dchid_iface *
 dchid_get_interface(struct dockchannel_hid *dchid, int index, const char *name)
 {
 	struct dchid_iface *iface;
+	const char *firmware_name;
+	bool explicit_power_method;
+	bool j700_firmware;
+	bool multi_touch;
+	bool no_stm;
 
 	if (index >= MAX_INTERFACES) {
 		dev_err(dchid->dev, "Interface index %d out of range\n", index);
@@ -249,10 +255,23 @@ dchid_get_interface(struct dockchannel_hid *dchid, int index, const char *name)
 		return NULL;
 	}
 
-	iface->power_method = DCHID_POWER_METHOD_1;
-	of_property_read_u32(iface->of_node, "apple,power-method",
-			     &iface->power_method);
-	if (iface->power_method == DCHID_POWER_METHOD_2)
+	explicit_power_method = !of_property_read_u32(iface->of_node,
+						      "apple,power-method",
+						      &iface->power_method);
+	if (!explicit_power_method) {
+		no_stm = of_property_read_bool(dchid->dev->of_node, "apple,no-stm");
+		j700_firmware =
+			!of_property_read_string(iface->of_node, "firmware-name",
+						 &firmware_name) &&
+			!strcmp(firmware_name, "apple/tpmtfw-j700.bin");
+		multi_touch = !strcmp(name, "multi-touch");
+		iface->power_method = dchid_default_pm(no_stm, multi_touch, j700_firmware);
+		iface->inherited_power_method_2 =
+			iface->power_method == DCHID_POWER_METHOD_2;
+	}
+
+	if (iface->power_method == DCHID_POWER_METHOD_2 &&
+	    !iface->inherited_power_method_2)
 		strscpy(iface->gpio_name, "afe-reset", MAX_GPIO_NAME);
 
 	dchid->ifaces[index] = iface;
@@ -393,6 +412,24 @@ static int dchid_power_method_2_transition(struct dchid_iface *iface,
 	return dchid_comm_cmd(iface->dchid, msg, sizeof(msg));
 }
 
+static int dchid_inherited_pm2_transition(struct dchid_iface *iface, u8 state)
+{
+	u8 msg[DCHID_POWER_METHOD_2_CMD_SIZE];
+	int ret;
+
+	dchid_pm2_state_command(iface->index, state, false, msg);
+	ret = dchid_comm_cmd(iface->dchid, msg, sizeof(msg));
+	if (ret < 0)
+		return ret;
+
+	/* Match the J700 transaction that reached the Touch-ready event. */
+	if (state == DCHID_POWER_STATE_ON)
+		msleep(50);
+
+	dchid_pm2_state_command(iface->index, state, true, msg);
+	return dchid_comm_cmd(iface->dchid, msg, sizeof(msg));
+}
+
 static int dchid_send_firmware(struct dchid_iface *iface, void *firmware, size_t size)
 {
 	struct {
@@ -504,6 +541,7 @@ static int dchid_request_gpio(struct dchid_iface *iface,
 static int dchid_start_interface(struct dchid_iface *iface)
 {
 	bool power_method_2;
+	bool inherited_power_method_2;
 	void *fw;
 	size_t size;
 	int ret;
@@ -518,6 +556,7 @@ static int dchid_start_interface(struct dchid_iface *iface)
 	iface->starting = true;
 
 	power_method_2 = iface->power_method == DCHID_POWER_METHOD_2;
+	inherited_power_method_2 = iface->inherited_power_method_2;
 	if (iface->power_method != DCHID_POWER_METHOD_1 && !power_method_2) {
 		dev_err(iface->dchid->dev,
 			"Unsupported power method %u for %s\n",
@@ -535,16 +574,25 @@ static int dchid_start_interface(struct dchid_iface *iface)
 		goto err;
 	}
 
-	if (power_method_2 && (!fw || !size || !iface->gpio_name[0])) {
+	if (power_method_2 && (!fw || !size)) {
 		dev_err(iface->dchid->dev,
-			"Power method 2 for %s requires firmware and afe-reset\n",
+			"Power method 2 for %s requires firmware\n",
+			iface->name);
+		ret = -EINVAL;
+		goto err;
+	}
+	if (power_method_2 && !inherited_power_method_2 &&
+	    !iface->gpio_name[0]) {
+		dev_err(iface->dchid->dev,
+			"Explicit power method 2 for %s requires afe-reset\n",
 			iface->name);
 		ret = -EINVAL;
 		goto err;
 	}
 
 	/* Dynamic requests include ID zero; Power Method 2 uses afe-reset. */
-	if (iface->gpio_request_seen || power_method_2) {
+	if (!inherited_power_method_2 &&
+	    (iface->gpio_request_seen || power_method_2)) {
 		ret = dchid_request_gpio(iface, power_method_2 ?
 					 GPIOD_OUT_HIGH : GPIOD_OUT_LOW);
 		if (ret < 0)
@@ -572,16 +620,26 @@ static int dchid_start_interface(struct dchid_iface *iface)
 			 "Powering on %s with power method %u\n",
 			 iface->name, iface->power_method);
 		if (power_method_2) {
-			ret = dchid_power_method_2_transition(iface, false);
-			if (ret < 0)
-				goto err;
+			if (inherited_power_method_2) {
+				ret = dchid_inherited_pm2_transition(iface, DCHID_POWER_STATE_OFF);
+				if (ret < 0)
+					goto err;
 
-			gpiod_set_value_cansleep(iface->gpio, 0);
+				ret = dchid_inherited_pm2_transition(iface, DCHID_POWER_STATE_ON);
+				if (ret < 0)
+					goto err;
+			} else {
+				ret = dchid_power_method_2_transition(iface, false);
+				if (ret < 0)
+					goto err;
 
-			ret = dchid_power_method_2_transition(iface, true);
-			if (ret < 0) {
-				gpiod_set_value_cansleep(iface->gpio, 1);
-				goto err;
+				gpiod_set_value_cansleep(iface->gpio, 0);
+
+				ret = dchid_power_method_2_transition(iface, true);
+				if (ret < 0) {
+					gpiod_set_value_cansleep(iface->gpio, 1);
+					goto err;
+				}
 			}
 		} else {
 			ret = dchid_reset_interface(iface,
