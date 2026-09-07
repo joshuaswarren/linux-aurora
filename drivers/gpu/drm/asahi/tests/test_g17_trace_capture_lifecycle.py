@@ -78,7 +78,10 @@ class CaptureLifecycle(unittest.TestCase):
         self.assertIn("map(|pm| &mut pm.backing), 0)", body)
 
     def test_render_submission_uses_the_logical_queue_execution_context(self):
-        body = function(self.drm, "submit")
+        # `submit` is now a thin wrapper that settles a lost client's
+        # outstanding jobs; the submission body it guards is
+        # `submit_guarded`.
+        body = function(self.drm, "submit_guarded")
         call = body[body.index(".submit_translated_render("):]
         self.assertRegex(call[:800], r"\.context\s*\.clone\(\)")
         self.assertNotIn("RENDER_APP_CONTEXT", call[:800])

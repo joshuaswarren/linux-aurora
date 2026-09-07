@@ -198,6 +198,85 @@ impl G17PLiveRuntime {
         Ok(())
     }
 
+    /// Fail every outstanding job that belongs to one VM.
+    ///
+    /// A submission that fails terminally loses the client's device: Mesa turns
+    /// it into `VK_ERROR_DEVICE_LOST` and tears the context down. Work this VM
+    /// had ALREADY handed to the hardware is not covered by the submit ioctl's
+    /// output-fence guard -- that guard only promises a fence for the ioctl it
+    /// runs in -- and once the VM is dead nothing will ever complete it. Its
+    /// client then waits on that syncobj forever, which is how one refused
+    /// frame ends with gnome-shell alive but permanently stopped in
+    /// `drm_syncobj_array_wait_timeout`.
+    ///
+    /// Two invariants this must not break:
+    ///
+    ///  * The packet is NOT released. Firmware may still be executing it, and
+    ///    freeing its mappings and root under a live GPU turns a lost client
+    ///    into a DMA fault. The queue is quarantined and the packet stays
+    ///    retained, exactly as the completion-service and scheduler-timeout
+    ///    paths already do.
+    ///  * The error is recorded on the VM's sticky status BEFORE the fence
+    ///    signals. A DRM syncobj treats an error fence as signalled, so a
+    ///    waiter wakes and immediately asks why; if the status were still clean
+    ///    it would read the destination buffer as if the job had run.
+    ///
+    /// Jobs belonging to other VMs are untouched: they are independently
+    /// rooted, their client is healthy, and completing them here would be the
+    /// same "signalled but never executed" lie for someone else.
+    pub(crate) fn fail_outstanding_jobs_for_vm(
+        &mut self,
+        status: &Arc<crate::g17_status::VmStatus>,
+        error: Error,
+    ) -> usize {
+        // A completion may already be sitting in DRAM; take it rather than
+        // discarding a job the GPU actually finished.
+        let _ = self.service_async_compute_completions();
+        let mut failed = 0usize;
+        for index in 0..self.async_compute_queues.len() {
+            let identity = {
+                let q = &self.async_compute_queues[index];
+                if q.quarantined {
+                    None
+                } else {
+                    q.active.as_ref().and_then(|active| {
+                        let completion = active.packet.completion().ok()?;
+                        if !Arc::ptr_eq(&completion.status, status) {
+                            return None;
+                        }
+                        Some((
+                            active.packet.submission_id(),
+                            q.queue.queue_id(),
+                            active.packet.context().context_id(),
+                        ))
+                    })
+                }
+            };
+            let Some((submission, queue_id, context)) = identity else { continue };
+            {
+                let q = &mut self.async_compute_queues[index];
+                q.quarantined = true;
+                let Some(active) = q.active.as_ref() else { continue };
+                active._lease.quarantine();
+                if let Ok(completion) = active.packet.completion() {
+                    completion.complete(Err(error));
+                }
+            }
+            failed += 1;
+            if let Some(pdev) = &self.pdev {
+                dev_err!(
+                    pdev.as_ref(),
+                    "G17P async compute: FAILING submission={} qid={} context={} after its VM was lost ({:?})\n",
+                    submission,
+                    queue_id,
+                    context,
+                    error,
+                );
+            }
+        }
+        failed
+    }
+
     pub(crate) fn release_async_compute_queue(&mut self, owner: u64) {
         if let Some(q) = self.async_compute_queues.iter_mut().find(|q| q.owner == Some(owner)) {
             q.released = true;
