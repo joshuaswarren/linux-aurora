@@ -57,7 +57,8 @@ mod module_parameters {
         "SubmissionError", "G17PColdOpeningStage", "G17PColdOpeningOptionalAddresses"]],
     *[block(sub, n) for n in [
         "put_u16_le", "put_u32_le", "put_u64_le", "apply_g17p_cold_opening_optional",
-        "apply_g17p_retained_optional", "g17p_render_flist_generation",
+        "apply_g17p_retained_optional", "apply_g17p_retained_optional_with_flist_generation",
+        "g17p_render_flist_generation",
         "apply_g17p_cold_opening_event", "apply_g17p_retained_event_with_stamp"]],
     "}",
     r'''

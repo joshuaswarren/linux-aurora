@@ -45,6 +45,7 @@ body = "\n".join([
         "put_u16_le", "put_u32_le", "put_u64_le"]],
     *[block(submission, r"^pub\(crate\) (?:const )?fn " + name + r"\(") for name in [
         "apply_g17p_cold_opening_optional", "apply_g17p_retained_optional",
+        "apply_g17p_retained_optional_with_flist_generation",
         "g17p_render_flist_generation"]],
     r"""
 #[derive(Debug)] enum SubmissionError {

@@ -140,7 +140,13 @@ impl G17PRuntimeRef {
             }
             fsleep(Delta::from_micros(i64::from(schedule.next_delay_us())));
         }
-        self.mutex().lock().abandon_deferred_render(render_slot)?;
+        // A group the firmware retired without executing leaves a clean slot:
+        // fail this submission alone -- EIO settles this client -- rather than
+        // retiring the slot for the session, which is what ETIMEDOUT does.
+        let retired_by_firmware = self.mutex().lock().abandon_deferred_render(render_slot)?;
+        if retired_by_firmware {
+            return Err(EIO);
+        }
         Err(ETIMEDOUT)
     }
 }

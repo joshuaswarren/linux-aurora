@@ -1695,10 +1695,51 @@ pub(crate) fn apply_g17p_cold_opening_event(
 
 /// Refresh the canonical optional record for a later logical submission.
 /// The queue-context record itself remains in locator slot zero.
+///
+/// Publishes the per-slot ordinal as the FList generation at `+0x3e`, which
+/// is the same number as the device-global FList sequence for as long as one
+/// client renders. `apply_g17p_retained_optional_with_flist_generation` takes
+/// the device-global value explicitly.
 pub(crate) fn apply_g17p_retained_optional(
     stage: G17PColdOpeningStage,
     addresses: G17PColdOpeningOptionalAddresses,
     submission_ordinal: u32,
+    bias_generation: bool,
+    queue_id: u16,
+    partner_queue_id: u16,
+    qos_hardware_buffer_id: u16,
+    install: u16,
+    context_id: u16,
+    out: &mut [u8],
+) -> Result<(), SubmissionError> {
+    apply_g17p_retained_optional_with_flist_generation(
+        stage,
+        addresses,
+        submission_ordinal,
+        g17p_render_flist_generation(submission_ordinal),
+        bias_generation,
+        queue_id,
+        partner_queue_id,
+        qos_hardware_buffer_id,
+        install,
+        context_id,
+        out,
+    )
+}
+
+/// `apply_g17p_retained_optional` with the USC FList generation supplied by
+/// the caller.
+///
+/// The FList is one device-global pool, so its generation advances with every
+/// render on the device, while `submission_ordinal` counts only this slot's
+/// renders. With one client the two coincide; the moment a second slot
+/// publishes, its first tag-15 would otherwise announce generation 0 against a
+/// pool the firmware last saw at N.
+pub(crate) fn apply_g17p_retained_optional_with_flist_generation(
+    stage: G17PColdOpeningStage,
+    addresses: G17PColdOpeningOptionalAddresses,
+    submission_ordinal: u32,
+    flist_generation: u64,
     bias_generation: bool,
     queue_id: u16,
     partner_queue_id: u16,
@@ -1766,7 +1807,7 @@ pub(crate) fn apply_g17p_retained_optional(
     // allocation before fragment engine service.
     // The kext uses a qword store at 8a98c48; +0x46 begins the independent
     // hardware-buffer ID and must remain untouched by this generation.
-    put_u64_le(out, 0x3e, g17p_render_flist_generation(submission_ordinal));
+    put_u64_le(out, 0x3e, flist_generation);
     // Keep the pair-owned HardwareBufferID identical in ConfigUpdate, the
     // QID-indexed QoS row, and the KSM dependency-control qword.
     put_u16_le(out, 0x56, qos_hardware_buffer_id);

@@ -212,6 +212,18 @@ enum G17PHardwareBufferIdError {
     Exhausted,
     InvalidId,
     DoubleFree,
+    NotReserved,
+}
+
+/// `g17p_render_slot_globals` bit: the outer ring entry's "channel started"
+/// byte follows the device-global channels rather than the slot's ordinal.
+pub(crate) const G17P_RENDER_SLOT_GLOBAL_CHANNEL_STARTED: u32 = 1;
+/// `g17p_render_slot_globals` bit: tag-15 `+0x3e` publishes the device-global
+/// FList lifecycle sequence rather than the slot's ordinal.
+pub(crate) const G17P_RENDER_SLOT_GLOBAL_FLIST_GENERATION: u32 = 2;
+
+fn g17p_render_slot_globals() -> u32 {
+    *module_parameters::g17p_render_slot_globals.value()
 }
 
 #[derive(Debug, Clone)]
@@ -220,6 +232,13 @@ struct G17PHardwareBufferIdAllocator {
     stack: [u8; G17P_TA_HARDWARE_BUFFER_ID_COUNT],
     stack_len: usize,
     next_parameter_buffer_token: u64,
+    /// IDs owned by a live retained render storage. A storage's
+    /// parameter-management graph and PBDesc slot are encoded against one ID
+    /// for the storage's whole lifetime (`prepare_retained_scene` refuses any
+    /// other), so between that storage's submissions the ID is free but must
+    /// never be handed to a different owner: it leaves this set only when the
+    /// storage is dropped.
+    reserved: [u64; 2],
 }
 
 impl G17PHardwareBufferIdAllocator {
@@ -234,6 +253,7 @@ impl G17PHardwareBufferIdAllocator {
             stack,
             stack_len: G17P_TA_HARDWARE_BUFFER_ID_COUNT,
             next_parameter_buffer_token: 0,
+            reserved: [0; 2],
         }
     }
 
@@ -243,16 +263,56 @@ impl G17PHardwareBufferIdAllocator {
             && self.free[index / 64] & (1u64 << (index % 64)) != 0
     }
 
-    fn allocate(&mut self) -> core::result::Result<u32, G17PHardwareBufferIdError> {
-        let id = if self.stack_len != 0 {
+    fn is_reserved(&self, id: u32) -> bool {
+        let index = id as usize;
+        index < G17P_TA_HARDWARE_BUFFER_ID_COUNT
+            && self.reserved[index / 64] & (1u64 << (index % 64)) != 0
+    }
+
+    fn push_stack(&mut self, id: u32) {
+        if self.stack[..self.stack_len].contains(&(id as u8)) {
+            return;
+        }
+        if self.stack_len < self.stack.len() {
+            self.stack[self.stack_len] = id as u8;
+            self.stack_len += 1;
+        }
+    }
+
+    fn remove_from_stack(&mut self, id: u32) {
+        if let Some(at) = self.stack[..self.stack_len].iter().position(|entry| *entry == id as u8) {
+            self.stack.copy_within(at + 1..self.stack_len, at);
             self.stack_len -= 1;
-            self.stack[self.stack_len] as u32
-        } else if self.free[0] != 0 {
-            self.free[0].trailing_zeros()
-        } else if self.free[1] != 0 {
-            64 + self.free[1].trailing_zeros()
+        }
+    }
+
+    /// Hand out an ID no live storage owns, in native order.
+    fn allocate(&mut self) -> core::result::Result<u32, G17PHardwareBufferIdError> {
+        let mut popped = None;
+        while self.stack_len != 0 {
+            self.stack_len -= 1;
+            let candidate = self.stack[self.stack_len] as u32;
+            // A reserved ID is removed from the stack when reserved; skipping
+            // one here is defence in depth, never the normal path.
+            if !self.is_reserved(candidate) {
+                popped = Some(candidate);
+                break;
+            }
+        }
+        let id = if let Some(id) = popped {
+            id
         } else {
-            return Err(G17PHardwareBufferIdError::Exhausted);
+            let available = [
+                self.free[0] & !self.reserved[0],
+                self.free[1] & !self.reserved[1],
+            ];
+            if available[0] != 0 {
+                available[0].trailing_zeros()
+            } else if available[1] != 0 {
+                64 + available[1].trailing_zeros()
+            } else {
+                return Err(G17PHardwareBufferIdError::Exhausted);
+            }
         };
         if !self.is_free(id) {
             return Err(G17PHardwareBufferIdError::DoubleFree);
@@ -260,6 +320,64 @@ impl G17PHardwareBufferIdAllocator {
         let index = id as usize;
         self.free[index / 64] &= !(1u64 << (index % 64));
         Ok(id)
+    }
+
+    /// Mark `id` as owned by a live retained storage. Usually called while the
+    /// storage's first submission still holds the ID; tolerated at any time.
+    fn reserve(&mut self, id: u32) -> core::result::Result<(), G17PHardwareBufferIdError> {
+        let index = id as usize;
+        if index >= G17P_TA_HARDWARE_BUFFER_ID_COUNT {
+            return Err(G17PHardwareBufferIdError::InvalidId);
+        }
+        self.reserved[index / 64] |= 1u64 << (index % 64);
+        self.remove_from_stack(id);
+        Ok(())
+    }
+
+    /// End a storage's ownership of `id`. If no submission holds it, it goes
+    /// back on the free list for the next owner. A no-op for an unreserved ID.
+    fn unreserve(&mut self, id: u32) {
+        if !self.is_reserved(id) {
+            return;
+        }
+        let index = id as usize;
+        self.reserved[index / 64] &= !(1u64 << (index % 64));
+        if self.is_free(id) {
+            self.push_stack(id);
+        }
+    }
+
+    /// Take the ID a retained storage already owns for one more submission.
+    fn acquire_reserved(&mut self, id: u32) -> core::result::Result<u32, G17PHardwareBufferIdError> {
+        if !self.is_reserved(id) {
+            return Err(G17PHardwareBufferIdError::NotReserved);
+        }
+        if !self.is_free(id) {
+            return Err(G17PHardwareBufferIdError::DoubleFree);
+        }
+        let index = id as usize;
+        self.free[index / 64] &= !(1u64 << (index % 64));
+        Ok(id)
+    }
+
+    fn next_token(&mut self) -> u64 {
+        let token = if self.next_parameter_buffer_token == u64::MAX {
+            0
+        } else {
+            self.next_parameter_buffer_token
+        };
+        self.next_parameter_buffer_token = token.wrapping_add(1);
+        token
+    }
+
+    /// `acquire_reserved` plus a fresh PB owner lease token, exactly as
+    /// `allocate_with_token` pairs them for a fresh ID.
+    fn acquire_reserved_with_token(
+        &mut self,
+        id: u32,
+    ) -> core::result::Result<(u32, u64), G17PHardwareBufferIdError> {
+        let id = self.acquire_reserved(id)?;
+        Ok((id, self.next_token()))
     }
 
     /// Acquire a new PB owner lease, not a render-ordinal-derived generation.
@@ -274,15 +392,11 @@ impl G17PHardwareBufferIdAllocator {
         &mut self,
     ) -> core::result::Result<(u32, u64), G17PHardwareBufferIdError> {
         let id = self.allocate()?;
-        let token = if self.next_parameter_buffer_token == u64::MAX {
-            0
-        } else {
-            self.next_parameter_buffer_token
-        };
-        self.next_parameter_buffer_token = token.wrapping_add(1);
-        Ok((id, token))
+        Ok((id, self.next_token()))
     }
 
+    /// Return a submission's hold on `id`. A reserved ID stays with its
+    /// storage -- off the free list -- until that storage unreserves it.
     fn release(&mut self, id: u32) -> core::result::Result<(), G17PHardwareBufferIdError> {
         let index = id as usize;
         if index >= G17P_TA_HARDWARE_BUFFER_ID_COUNT {
@@ -292,9 +406,8 @@ impl G17PHardwareBufferIdAllocator {
             return Err(G17PHardwareBufferIdError::DoubleFree);
         }
         self.free[index / 64] |= 1u64 << (index % 64);
-        if self.stack_len < self.stack.len() {
-            self.stack[self.stack_len] = id as u8;
-            self.stack_len += 1;
+        if !self.is_reserved(id) {
+            self.push_stack(id);
         }
         Ok(())
     }
@@ -1010,6 +1123,11 @@ pub(crate) struct G17PManagerConstruction {
     /// a post-publication failure must retain it until the CPUs stop.
     render_hardware_buffer_published: bool,
     render_hardware_buffer_ids: G17PHardwareBufferIdAllocator,
+    /// Whether this firmware session has published a render on the
+    /// device-global outer data-master channels. The outer ring entry's
+    /// "channel started" byte describes those shared channels, not the slot
+    /// that happens to be submitting.
+    render_outer_channels_started: bool,
     /// The SKSM half of the render path: one KSM kick queue per render data
     /// master. Present only while `g17p_render_sksm` is armed.
     render_sksm: Option<G17PRenderSksmQueues>,
@@ -1656,6 +1774,7 @@ impl G17PManagerConstruction {
                 render_hardware_buffer_id: None,
                 render_hardware_buffer_published: false,
                 render_hardware_buffer_ids: G17PHardwareBufferIdAllocator::new(),
+                render_outer_channels_started: false,
                 render_sksm: None,
                 bootstrap_uma: None,
                 prepared_render_flist: None,
@@ -2345,6 +2464,7 @@ impl G17PManagerConstruction {
             if inner_retired && outer_retired {
                 self.render_tracker = None;
                 self.render_bind = None;
+                self.unreserve_render_storage_hardware_buffer_id();
                 self.render_storage = None;
                 self.render_sksm = None;
                 self.render_submission_ordinal = 0;
@@ -2814,6 +2934,13 @@ impl G17PManagerConstruction {
                     );
                 }
             }
+            if let Some(id) = state
+                .storage
+                .as_ref()
+                .and_then(g17_resources::G17PUserRenderStorage::retained_hardware_buffer_id)
+            {
+                self.render_hardware_buffer_ids.unreserve(id);
+            }
             // Both firmware CPUs are stopped; dropping the complete state now
             // retracts its command root before any reachable mapping backing.
             drop(state);
@@ -2834,8 +2961,10 @@ impl G17PManagerConstruction {
             }
         }
         self.render_hardware_buffer_published = false;
+        self.render_outer_channels_started = false;
         self.render_bind = None;
         self.render_tracker = None;
+        self.unreserve_render_storage_hardware_buffer_id();
         self.render_storage = None;
         // Both CPUs are stopped at this boundary. The alias owner's Drop
         // removes the context-0 leaves and invalidates ASIDs 0/1.
@@ -2926,6 +3055,7 @@ impl G17PManagerConstruction {
         self.render_storage.as_mut().ok_or(ENODEV)?.release_client_context();
         self.render_bind = None;
         self.render_context_aliases = None;
+        self.unreserve_render_storage_hardware_buffer_id();
         self.render_storage = None;
         dev_info!(self.resources.dev().as_ref(),
             "G17P render VM handoff: retired job-private graph vm={} root={:#x}; incoming VM builds a new root at ordinal {}, QID producer state retained\n",
@@ -2975,6 +3105,7 @@ impl G17PManagerConstruction {
         self.render_storage.as_mut().ok_or(ENODEV)?.release_client_context();
         self.render_bind = None;
         self.render_context_aliases = None;
+        self.unreserve_render_storage_hardware_buffer_id();
         self.render_storage = None;
         dev_warn!(
             self.resources.dev().as_ref(),
@@ -2987,6 +3118,18 @@ impl G17PManagerConstruction {
             root,
         );
         Ok(())
+    }
+
+    /// End the active slot's retained storage claim on its TA HardwareBufferID.
+    /// Call only where that storage is about to be dropped.
+    fn unreserve_render_storage_hardware_buffer_id(&mut self) {
+        if let Some(id) = self
+            .render_storage
+            .as_ref()
+            .and_then(g17_resources::G17PUserRenderStorage::retained_hardware_buffer_id)
+        {
+            self.render_hardware_buffer_ids.unreserve(id);
+        }
     }
 
     /// Re-point the device-global parameter-buffer loader at the retained
@@ -3521,10 +3664,32 @@ impl G17PManagerConstruction {
             }
         }
         self.render_auxiliary_timestamp = G17P_NATIVE_RENDER_KICK_AUXILIARY;
-        let (hardware_buffer_id, parameter_buffer_token) = self
-            .render_hardware_buffer_ids
-            .allocate_with_token()
-            .map_err(|_| EBUSY)?;
+        // The TA HardwareBufferID names this storage's PBDesc slot and its
+        // retained parameter-management graph was encoded against it, so it
+        // belongs to the storage for as long as the storage lives: a retained
+        // storage re-acquires its own reserved ID, and only a storage about to
+        // be built takes a fresh one.
+        //
+        // Allocating per submission handed out whichever ID the shared LIFO had
+        // on top, which is the same number only while a single client renders.
+        // As soon as another slot held an ID -- in flight, or pinned by an
+        // abandoned render -- the next restage here received a different ID
+        // and prepare_retained_scene refused it with ENOTSUPP, which reached
+        // the compositor as a lost device.
+        let retained_hardware_buffer_id = self
+            .render_storage
+            .as_ref()
+            .and_then(g17_resources::G17PUserRenderStorage::retained_hardware_buffer_id);
+        let (hardware_buffer_id, parameter_buffer_token) = match retained_hardware_buffer_id {
+            Some(id) => self
+                .render_hardware_buffer_ids
+                .acquire_reserved_with_token(id)
+                .map_err(|_| EBUSY)?,
+            None => self
+                .render_hardware_buffer_ids
+                .allocate_with_token()
+                .map_err(|_| EBUSY)?,
+        };
         self.render_hardware_buffer_id = Some(hardware_buffer_id);
         self.render_hardware_buffer_published = false;
 
@@ -3763,6 +3928,17 @@ impl G17PManagerConstruction {
                     )
                     .map_err(|error| Self::render_stage_fail("new-user-render-storage", error))?,
             );
+            // The fresh graph was encoded against this ID; keep the ID off the
+            // shared free list for as long as the storage lives.
+            if let Some(id) = self
+                .render_storage
+                .as_ref()
+                .and_then(g17_resources::G17PUserRenderStorage::retained_hardware_buffer_id)
+            {
+                self.render_hardware_buffer_ids
+                    .reserve(id)
+                    .map_err(|_| Self::render_stage_fail("reserve-hardware-buffer-id", EIO))?;
+            }
             if self.render_submission_ordinal != 0 {
                 let parameter_page_list_vas = self.resources.parameter_buffer_page_list_vas();
                 let storage = self.render_storage.as_mut().ok_or(ENODEV)?;
@@ -3794,6 +3970,18 @@ impl G17PManagerConstruction {
             storage
                 .set_parameter_buffer_lease_token(parameter_buffer_token)
                 .map_err(|error| Self::render_stage_fail("set-pb-lease-token", error))?;
+            if g17p_render_slot_globals() & G17P_RENDER_SLOT_GLOBAL_FLIST_GENERATION != 0 {
+                // tag-15 +0x3e is the USC FList generation, and the FList is
+                // one device-global pool: publish the lifecycle sequence this
+                // submission acquired, not the per-slot ordinal. The same
+                // number for a single client; a second slot's first render
+                // otherwise announces generation 0 against a pool the firmware
+                // last saw at N.
+                storage.set_flist_generation(self.prepared_render_flist.map_or(
+                    g17_submission::g17p_render_flist_generation(self.render_submission_ordinal),
+                    |lifecycle| lifecycle.sequence,
+                ));
+            }
             if let Some(failed) = storage.first_unreachable(self.resources.uat(), vm) {
                 storage.log_reachability(dev, self.resources.uat(), vm);
                 dev_err!(
@@ -3938,6 +4126,19 @@ impl G17PManagerConstruction {
         // application context, and this VM's own TTBAT context was bound at
         // the top of this function -- both before anything here is visible to
         // firmware. Publication itself no longer touches the context table.
+        //
+        // The outer ring entry's "channel started" byte (`!chan[0x3c]` in
+        // native's encodeAcceleratorRingCommand) describes the device-global
+        // data-master channels, which both render slots share. Derive it from
+        // whether this session has published on them, not from the slot's own
+        // ordinal: a second slot's first render used to announce a never-started
+        // channel that already carried the other slot's whole history.
+        let first_outer_submit =
+            if g17p_render_slot_globals() & G17P_RENDER_SLOT_GLOBAL_CHANNEL_STARTED != 0 {
+                !self.render_outer_channels_started
+            } else {
+                self.render_submission_ordinal == 0
+            };
         let prepared = self
             .resources
             .publish_partial_opening_pair(
@@ -3948,7 +4149,7 @@ impl G17PManagerConstruction {
                 published_prefix,
                 tiling_queue,
                 published_prefix,
-                self.render_submission_ordinal == 0,
+                first_outer_submit,
                 move || {
                     if let Some(operation) = pm_submission {
                         operation.commit();
@@ -3967,6 +4168,7 @@ impl G17PManagerConstruction {
         // The ID is now firmware/GPU-owned. Any later validation failure must
         // retain it until semantic completion or a stopped-CPU teardown.
         self.render_hardware_buffer_published = true;
+        self.render_outer_channels_started = true;
         if crate::util::g17p_verbose() {
             pr_info!(
                 "G17P render: outer publish OK, retained={} root-slot={}\n",
@@ -5206,6 +5408,92 @@ impl G17PManagerConstruction {
         }
         self.report_render_wait_timeout();
         Err(ETIMEDOUT)
+    }
+
+    /// After a render wait has expired: if the firmware has provably retired
+    /// this group without executing it, perform the host bookkeeping a paired
+    /// completion performs and report `true`; otherwise touch nothing and
+    /// report `false`.
+    ///
+    /// "Provably retired" is the firmware's own word on it: both queue cursors
+    /// at this group's published target, the job unlinked from the firmware's
+    /// completion list, and no pass timestamp. The tiler stamps the pass start
+    /// before any fragment work, so a retired, unlinked group with a zero start
+    /// is a group the GPU never ran -- the shape `g17p_zero_duration` names for
+    /// compute. The firmware owns nothing of such a group any more, so
+    /// quarantining the slot for the rest of the session and pinning its
+    /// HardwareBufferID bought nothing; the failing client is still told its
+    /// work did not run.
+    ///
+    /// A group the firmware still holds -- cursors short of the target, or the
+    /// job still linked -- is left exactly as the timeout found it.
+    pub(crate) fn retire_abandoned_render_if_firmware_retired(&mut self) -> Result<bool> {
+        if *module_parameters::g17p_render_nop_retire.value() == 0 {
+            return Ok(false);
+        }
+        fence(Ordering::Acquire);
+        let state = self.render_storage.as_mut().ok_or(ENODEV)?.snapshot()?;
+        let tracker = self.render_tracker.as_ref().ok_or(ENODEV)?;
+        let window =
+            g17_resources::g17p_render_completion_window(self.render_submission_ordinal)?;
+        if window.target() != tracker.tiling_prefix || window.target() != tracker.fragment_prefix {
+            return Err(EINVAL);
+        }
+        let execution = g17_completion::RenderExecutionState {
+            job_list_empty: state.job_list_empty,
+            tiling_timestamps: state.tiling_timestamps,
+            fragment_timestamps: state.fragment_timestamps,
+        };
+        let completion = g17_completion::observe_paired_render_window(
+            window,
+            tracker.tiling_previous,
+            state.tiling,
+            tracker.fragment_previous,
+            state.fragment,
+            execution,
+        )
+        .map_err(|_| EINVAL)?;
+        if !completion.retired || !state.job_list_empty || execution.observed() {
+            return Ok(false);
+        }
+        // Twin of the paired-completion transaction in
+        // `poll_translated_render_completion`; keep the two in step.
+        let retired_sksm = self.render_sksm.as_ref().map(|queues| {
+            let ta = g17_submission::complete_g17p_cl_kicks(queues.tiling.producer, 1)?;
+            let fragment = g17_submission::complete_g17p_cl_kicks(queues.fragment.producer, 1)?;
+            Ok::<_, g17_submission::SubmissionError>((ta, fragment))
+        }).transpose().map_err(|_| EIO)?;
+        let next_ordinal = self.render_submission_ordinal.checked_add(1).ok_or(EOVERFLOW)?;
+        let hardware_buffer_id = self.render_hardware_buffer_id.ok_or(EIO)?;
+        self.render_hardware_buffer_ids
+            .release(hardware_buffer_id)
+            .map_err(|_| EIO)?;
+        if let (Some(queues), Some((ta, fragment))) = (self.render_sksm.as_mut(), retired_sksm) {
+            queues.tiling.producer = ta;
+            queues.fragment.producer = fragment;
+        }
+        self.render_hardware_buffer_id = None;
+        self.render_tracker = None;
+        self.render_hardware_buffer_published = false;
+        self.render_auxiliary_timestamp = 0;
+        let ordinal = self.render_submission_ordinal;
+        self.render_submission_ordinal = next_ordinal;
+        let pair = self
+            .render_storage
+            .as_ref()
+            .map(g17_resources::G17PUserRenderStorage::queue_pair);
+        dev_warn!(
+            self.resources.dev().as_ref(),
+            "G17P render: firmware retired ordinal {} on slot {} (qids {:?}) without executing it -- tiling-ts [{:#x},{:#x}] fragment-ts [{:#x},{:#x}]; failing the submission and keeping the slot\n",
+            ordinal,
+            self.active_render_slot,
+            pair.map(|pair| (pair.tiling, pair.fragment)),
+            state.tiling_timestamps[0],
+            state.tiling_timestamps[1],
+            state.fragment_timestamps[0],
+            state.fragment_timestamps[1],
+        );
+        Ok(true)
     }
 
     /// Explain a render wait timeout. Split out with the poll body so both the
