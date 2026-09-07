@@ -38,15 +38,19 @@ state = '\n'.join(item(n) for n in [
 methods = '\n'.join(item(n) for n in [
     '    fn acquire_lease(',
     '    fn quarantine_render_slot(',
-    # The registry wrapper, not the lease-state method of the same name that
-    # `state` already carries.
-    '    fn release_render_claim(&self, owner: u64) {',
 ])
 guards = '\n'.join(item(n) for n in [
     'struct G17PLeaseGuard {',
     'impl G17PLeaseGuard {',
     'impl Drop for G17PLeaseGuard {',
 ])
+
+# Queue lifetime is shorter than VM lifetime: a client may create several
+# logical queues over the same VM. Clearing the VM's claim from any one queue's
+# Drop lets a stranger evict retained storage still owned by its siblings.
+queue_drop = item('impl Drop for G17PQueue {')
+assert 'release_render_claim' not in queue_drop, \
+    'destroying one logical queue clears the whole VM retained-storage claim'
 
 # The lease is what decides which retained graph a submission lands on, so the
 # real methods are compiled; everything below them is host-side scaffolding.
@@ -211,21 +215,20 @@ tests = r'''
  assert_eq!(r.acquire_lease(11).map(|l|l.slot()),Err(EIO));
 }
 
-/// A departed client's slot is taken before a live client's is stolen.
-#[test]fn a_departed_client_s_slot_is_preferred(){
+/// Destroying one logical queue must not erase its VM's retained ownership.
+/// A VM can own several queues, and queue destruction is not VM destruction.
+#[test]fn destroying_one_queue_does_not_forget_the_vm_s_storage(){
  let r=G17PQueueRegistry::new();
  let mut storage=RetainedStorage::default();
- let gone={let l=r.acquire_lease(11).unwrap();storage.submit(l.slot(),11);l.slot()};
- let live={let l=r.acquire_lease(22).unwrap();storage.submit(l.slot(),22);l.slot()};
- assert_ne!(gone,live);
- r.release_render_claim(11);
- let incoming=r.acquire_lease(33).unwrap();
- assert_eq!(incoming.slot(),gone,"a live client's slot was stolen instead");
- // The live client keeps rendering on its own graph throughout.
- drop(incoming);
- let again=r.acquire_lease(22).unwrap();
- assert_eq!(again.slot(),live);
- assert!(!storage.submit(again.slot(),22));
+ let owned={let l=r.acquire_lease(11).unwrap();storage.submit(l.slot(),11);l.slot()};
+ let other={let l=r.acquire_lease(22).unwrap();storage.submit(l.slot(),22);l.slot()};
+ assert_ne!(owned,other);
+ // A sibling logical queue from VM 11 returns after the first queue object was
+ // destroyed. The registry deliberately has no per-queue claim-release path:
+ // only an incoming VM taking the LRU free slot may replace the retained owner.
+ let sibling=r.acquire_lease(11).unwrap();
+ assert_eq!(sibling.slot(),owned);
+ assert!(!storage.submit(sibling.slot(),11));
 }
 
 /// Retiring a slot must wake a client already waiting for it, rather than
