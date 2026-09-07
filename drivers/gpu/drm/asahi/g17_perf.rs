@@ -38,6 +38,67 @@
 /// each window so a wrong constant is visible instead of silent.
 pub(crate) const NOMINAL_TICK_KHZ: u64 = 24_000;
 
+/// Backoff schedule for a completion poll loop.
+///
+/// The render wait used to sleep a flat `fsleep(Delta::from_millis(1))`
+/// between polls. On this kernel `fsleep` grants 25% slack
+/// (`max_slack_shift = 2`) and 1000 us is below `USLEEP_RANGE_UPPER_BOUND`
+/// (16000 us at `CONFIG_HZ=250`), so that call is `usleep_range(1000, 1250)`:
+/// every render paid a full millisecond or more of pure sleep *after* the GPU
+/// had already finished, and a submission could not be observed complete any
+/// sooner than that no matter how short the pass was.
+///
+/// Exponential backoff fixes both ends: the first poll after publication comes
+/// 20 us later, so a short pass is observed promptly, and a long pass settles
+/// back to the same 1 ms interval so a slow render costs no more CPU than it
+/// did before. The schedule is deliberately a plain state machine with no
+/// clock in it, so it can be unit-tested off-target.
+pub(crate) struct PollSchedule {
+    next_us: u32,
+    cap_us: u32,
+}
+
+impl PollSchedule {
+    /// First interval of the adaptive schedule, in microseconds.
+    ///
+    /// `fsleep` uses `udelay` -- a busy wait -- for 10 us and below, so
+    /// staying above that keeps every poll interval a real sleep. 20 us
+    /// becomes `usleep_range(20, 25)`.
+    pub(crate) const MIN_US: u32 = 20;
+    /// Ceiling of the adaptive schedule, in microseconds. Identical to the
+    /// interval the flat loop used, so a long wait costs what it always did.
+    pub(crate) const MAX_US: u32 = 1000;
+
+    /// `fixed_us == 0` selects the adaptive schedule. Any other value pins the
+    /// interval, which is how the old flat behaviour is restored for an A/B
+    /// measurement (`g17p_render_poll_us=1000`).
+    pub(crate) const fn new(fixed_us: u32) -> Self {
+        if fixed_us == 0 {
+            Self {
+                next_us: Self::MIN_US,
+                cap_us: Self::MAX_US,
+            }
+        } else {
+            Self {
+                next_us: fixed_us,
+                cap_us: fixed_us,
+            }
+        }
+    }
+
+    /// Interval to sleep before the next poll, doubling up to the cap.
+    pub(crate) fn next_delay_us(&mut self) -> u32 {
+        let delay = self.next_us;
+        let doubled = delay.saturating_mul(2);
+        self.next_us = if doubled > self.cap_us {
+            self.cap_us
+        } else {
+            doubled
+        };
+        delay
+    }
+}
+
 /// What one completed render submission cost.
 #[derive(Default, Copy, Clone)]
 pub(crate) struct RenderSample {
@@ -228,6 +289,20 @@ impl SubmitWindow {
 mod tests {
     use super::*;
 
+    #[test]
+    fn adaptive_schedule_doubles_from_twenty_to_one_thousand_and_stays() {
+        let mut schedule = PollSchedule::new(0);
+        let observed: [u32; 8] = core::array::from_fn(|_| schedule.next_delay_us());
+        assert_eq!(observed, [20, 40, 80, 160, 320, 640, 1000, 1000]);
+    }
+
+    #[test]
+    fn a_pinned_interval_never_changes() {
+        let mut schedule = PollSchedule::new(1000);
+        for _ in 0..8 {
+            assert_eq!(schedule.next_delay_us(), 1000);
+        }
+    }
 
     #[test]
     fn occupancy_and_tick_rate_come_out_of_the_gpu_timestamps() {

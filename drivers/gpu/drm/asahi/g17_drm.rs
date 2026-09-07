@@ -22,8 +22,8 @@ use crate::{
     alloc,
     driver::{AsahiDevRef, AsahiDevice},
     drm_gpu::{DrmGpu, DrmGpuParams},
-    file, g17_job, g17_adt_j700, g17_completion, g17_live_boot, g17_manager, g17_perf,
-    g17_render, g17_resources, g17_uapi, gem, gpu, hw, mmu, module_parameters, pgtable, queue,
+    file, g17_job, g17_adt_j700, g17_completion, g17_live_boot, g17_perf, g17_render,
+    g17_resources, g17_uapi, gem, gpu, hw, mmu, module_parameters, pgtable, queue,
 };
 
 const T8140_USER_START: u64 = mmu::UAT_PGSZ as u64;
@@ -99,13 +99,27 @@ impl G17PRuntimeRef {
 
     /// Wait for one published render to complete, reporting what it cost.
     ///
-    /// The poll count and the GPU pass envelope are observations of a
-    /// completion that has already been accepted: they are read out after the
-    /// `completion.complete` decision, never before it, so nothing here can
-    /// change whether a submission is considered finished.
+    /// The loop used to make a fixed 2000 iterations with a flat
+    /// `fsleep(Delta::from_millis(1))` between polls, which on this kernel is
+    /// `usleep_range(1000, 1250)`. A render that finished in 200 us was
+    /// therefore not observed complete for at least another millisecond, on
+    /// every frame. The backoff schedule starts at 20 us and doubles to the
+    /// same 1 ms ceiling, so a short pass is seen promptly and a long one
+    /// costs the same CPU it always did.
+    ///
+    /// The stuck-firmware bound is unchanged in intent and now stated
+    /// directly: the old loop's nominal bound was 2000 polls times 1 ms, and
+    /// `g17p_render_wait_ms` defaults to exactly that 2000 ms. Nothing about
+    /// the ordering changes -- this only alters WHEN the completion is
+    /// observed, never whether it must be.
     fn wait_render_slot(&self, render_slot: u8) -> Result<G17PRenderWaitOutcome> {
+        let mut schedule =
+            g17_perf::PollSchedule::new(*module_parameters::g17p_render_poll_us.value());
+        let deadline_ns =
+            i64::from(*module_parameters::g17p_render_wait_ms.value()).saturating_mul(1_000_000);
+        let started = Instant::<Monotonic>::now();
         let mut polls = 0u32;
-        for _ in 0..g17_manager::G17PManagerConstruction::RENDER_COMPLETION_POLLS {
+        loop {
             let completion = self
                 .mutex()
                 .lock()
@@ -121,7 +135,10 @@ impl G17PRuntimeRef {
                     Err(EIO)
                 };
             }
-            fsleep(Delta::from_millis(1));
+            if started.elapsed().as_nanos() >= deadline_ns {
+                break;
+            }
+            fsleep(Delta::from_micros(i64::from(schedule.next_delay_us())));
         }
         self.mutex().lock().abandon_deferred_render(render_slot)?;
         Err(ETIMEDOUT)

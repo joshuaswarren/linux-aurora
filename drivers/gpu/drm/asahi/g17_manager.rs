@@ -5167,17 +5167,41 @@ impl G17PManagerConstruction {
         Ok(G17PRenderPollOutcome::Pending)
     }
 
-    /// Number of polls the render wait makes, at 1ms each.
+    /// Nominal render wait bound, expressed the way it was originally written:
+    /// 2000 polls of one millisecond each.
+    ///
+    /// The waits are now deadline-driven (`g17p_render_wait_ms`, which
+    /// defaults to exactly this many milliseconds) because the poll interval
+    /// varies. The constant stays so the two cannot drift apart and so the
+    /// timeout report still names a poll budget.
     pub(crate) const RENDER_COMPLETION_POLLS: usize = 2000;
 
     pub(crate) fn wait_translated_render_completion(
         &mut self,
     ) -> Result<g17_completion::PairedRenderCompletion> {
-        for _ in 0..Self::RENDER_COMPLETION_POLLS {
+        let mut schedule = crate::g17_perf::PollSchedule::new(
+            *module_parameters::g17p_render_poll_us.value(),
+        );
+        let deadline_ns =
+            i64::from(*module_parameters::g17p_render_wait_ms.value()).saturating_mul(1_000_000);
+        let started = kernel::time::Instant::<kernel::time::Monotonic>::now();
+        loop {
             match self.poll_translated_render_completion()? {
                 G17PRenderPollOutcome::Complete(completion) => return Ok(completion),
-                G17PRenderPollOutcome::Retry => continue,
-                G17PRenderPollOutcome::Pending => fsleep(Delta::from_millis(1)),
+                // Re-poll immediately, do not sleep -- but still inside the
+                // deadline. Without the old fixed poll count, an outcome that
+                // never advances would spin this loop forever.
+                G17PRenderPollOutcome::Retry => {
+                    if started.elapsed().as_nanos() >= deadline_ns {
+                        break;
+                    }
+                }
+                G17PRenderPollOutcome::Pending => {
+                    if started.elapsed().as_nanos() >= deadline_ns {
+                        break;
+                    }
+                    fsleep(Delta::from_micros(i64::from(schedule.next_delay_us())));
+                }
             }
         }
         self.report_render_wait_timeout();

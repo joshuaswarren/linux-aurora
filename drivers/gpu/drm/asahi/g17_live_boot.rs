@@ -3603,7 +3603,16 @@ impl G17PLiveRuntime {
         }
         let mut serviced = 0u32;
         let mut service_failures = 0u32;
-        for _ in 0..g17_manager::G17PManagerConstruction::RENDER_COMPLETION_POLLS {
+        // Same schedule as the DRM-level wait: start at 20us so a short pass
+        // is observed promptly, settle at the 1ms interval this loop always
+        // used. The stuck-firmware bound is a wall-clock deadline instead of a
+        // poll count, so it no longer moves with the poll interval.
+        let mut schedule =
+            crate::g17_perf::PollSchedule::new(*module_parameters::g17p_render_poll_us.value());
+        let deadline_ns =
+            i64::from(*module_parameters::g17p_render_wait_ms.value()).saturating_mul(1_000_000);
+        let started = kernel::time::Instant::<kernel::time::Monotonic>::now();
+        loop {
             match self
                 .manager
                 .as_mut()
@@ -3656,7 +3665,16 @@ impl G17PLiveRuntime {
                     }
                     return Ok(completion);
                 }
-                g17_manager::G17PRenderPollOutcome::Retry => continue,
+                // "A completed job list was quiesced; re-poll immediately,
+                // do not sleep." The deadline still applies: with a poll count
+                // gone, an outcome that never advances would otherwise spin
+                // this loop forever inside the kernel.
+                g17_manager::G17PRenderPollOutcome::Retry => {
+                    if started.elapsed().as_nanos() >= deadline_ns {
+                        break;
+                    }
+                    continue;
+                }
                 g17_manager::G17PRenderPollOutcome::Pending => {}
             }
             match self.service_firmware_events_inline() {
@@ -3674,7 +3692,10 @@ impl G17PLiveRuntime {
                     service_failures += 1;
                 }
             }
-            fsleep(Delta::from_millis(1));
+            if started.elapsed().as_nanos() >= deadline_ns {
+                break;
+            }
+            fsleep(Delta::from_micros(i64::from(schedule.next_delay_us())));
         }
         if let Some(pdev) = self.pdev.as_ref() {
             dev_err!(
