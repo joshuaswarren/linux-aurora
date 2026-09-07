@@ -14,7 +14,7 @@ use kernel::{
     prelude::*,
     static_lock_class,
     sync::{Arc, CondVar, Mutex},
-    time::{delay::fsleep, Delta, Instant, Monotonic},
+    time::{Instant, Monotonic},
     uapi, xarray,
 };
 
@@ -97,78 +97,6 @@ impl G17PRuntimeRef {
         self.mutex().lock().release_compute_owner(owner);
     }
 
-    /// Wait for one published render to complete, reporting what it cost.
-    ///
-    /// The loop used to make a fixed 2000 iterations with a flat
-    /// `fsleep(Delta::from_millis(1))` between polls, which on this kernel is
-    /// `usleep_range(1000, 1250)`. A render that finished in 200 us was
-    /// therefore not observed complete for at least another millisecond, on
-    /// every frame. The backoff schedule starts at 20 us and doubles to the
-    /// same 1 ms ceiling, so a short pass is seen promptly and a long one
-    /// costs the same CPU it always did.
-    ///
-    /// The stuck-firmware bound is unchanged in intent and now stated
-    /// directly: the old loop's nominal bound was 2000 polls times 1 ms, and
-    /// `g17p_render_wait_ms` defaults to exactly that 2000 ms. Nothing about
-    /// the ordering changes -- this only alters WHEN the completion is
-    /// observed, never whether it must be.
-    fn wait_render_slot(&self, render_slot: u8) -> Result<G17PRenderWaitOutcome> {
-        let mut schedule =
-            g17_perf::PollSchedule::new(*module_parameters::g17p_render_poll_us.value());
-        let deadline_ns =
-            i64::from(*module_parameters::g17p_render_wait_ms.value()).saturating_mul(1_000_000);
-        let started = Instant::<Monotonic>::now();
-        let mut polls = 0u32;
-        let mut late_sksm_done = *module_parameters::g17p_late_sksm.value() == 0;
-        loop {
-            if !late_sksm_done {
-                match self
-                    .mutex()
-                    .lock()
-                    .replay_deferred_render_sksm_registrations()
-                {
-                    Ok(_) => late_sksm_done = true,
-                    Err(error) if error == EAGAIN => {}
-                    Err(error) => return Err(error),
-                }
-            }
-            let completion = self
-                .mutex()
-                .lock()
-                .poll_deferred_render_completion(render_slot)?;
-            polls = polls.saturating_add(1);
-            if let Some(completion) = completion {
-                return if completion.complete {
-                    Ok(G17PRenderWaitOutcome {
-                        polls,
-                        gpu_interval: g17_completion::render_gpu_interval(completion.execution),
-                    })
-                } else {
-                    Err(EIO)
-                };
-            }
-            if started.elapsed().as_nanos() >= deadline_ns {
-                break;
-            }
-            fsleep(Delta::from_micros(i64::from(schedule.next_delay_us())));
-        }
-        // A group the firmware retired without executing leaves a clean slot:
-        // fail this submission alone -- EIO settles this client -- rather than
-        // retiring the slot for the session, which is what ETIMEDOUT does.
-        let retired_by_firmware = self.mutex().lock().abandon_deferred_render(render_slot)?;
-        if retired_by_firmware {
-            return Err(EIO);
-        }
-        Err(ETIMEDOUT)
-    }
-}
-
-/// What one completed render wait observed.
-struct G17PRenderWaitOutcome {
-    /// Completion polls made, including the one that observed completion.
-    polls: u32,
-    /// The firmware's own pass envelope in GPU ticks, when it published one.
-    gpu_interval: Option<[u64; 2]>,
 }
 
 /// Ceiling on live DRM compute queue objects for this device.
@@ -509,6 +437,51 @@ struct G17PLeaseGuard {
     slot: u8,
 }
 
+/// Exact hardware completion for one published render.  The lease is owned by
+/// the completion packet, not the submit ioctl, so neither file close nor a
+/// fast return can hand the physical slot to another client before retirement.
+pub(crate) struct G17PRenderCompletion {
+    fence: UserFence<G17PSubmissionFence>,
+    status: Arc<crate::g17_status::VmStatus>,
+    _lease: G17PLeaseGuard,
+    signalled: AtomicU32,
+}
+
+impl G17PRenderCompletion {
+    fn new(
+        fence: UserFence<G17PSubmissionFence>,
+        status: Arc<crate::g17_status::VmStatus>,
+        lease: G17PLeaseGuard,
+    ) -> Result<Arc<Self>> {
+        Ok(Arc::new(Self {
+            fence,
+            status,
+            _lease: lease,
+            signalled: AtomicU32::new(0),
+        }, GFP_KERNEL)?)
+    }
+
+    pub(crate) fn fence(&self) -> Fence { Fence::from_fence(&self.fence) }
+
+    /// Signal at most once even when both RTKit roles report the same event.
+    pub(crate) fn complete(
+        &self,
+        result: Result<g17_completion::PairedRenderCompletion>,
+    ) {
+        if self.signalled.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return;
+        }
+        let result = result.and_then(|completion| {
+            if completion.complete { Ok(()) } else { Err(EIO) }
+        });
+        if let Err(error) = result {
+            self.status.record(error.to_errno());
+            self.fence.set_error(error);
+        }
+        self.fence.signal();
+    }
+}
+
 impl G17PLeaseGuard {
     fn slot(&self) -> u8 { self.slot }
 }
@@ -727,9 +700,10 @@ struct G17PQueue {
     context: Arc<mmu::T8140ComputeExecutionContext>,
     async_backend: Option<Arc<G17PAsyncQueueBackend>>,
     async_scheduler: Option<g17_job::G17PJobScheduler<G17PAsyncQueueBackend>>,
+    render_scheduler: g17_job::G17PRenderWatchScheduler<G17PRenderWatchBackend>,
     /// Most recent compute job submitted through this logical DRM queue.
-    /// Render still uses the synchronous G17P path, so it must explicitly
-    /// join the scheduler timeline before acquiring the render lease.
+    /// Render explicitly joins this timeline before acquiring its physical
+    /// slot; its own completion is event-driven after publication.
     last_async_compute: Option<Fence>,
     id: u64,
 }
@@ -753,6 +727,31 @@ impl Drop for G17PQueue {
         drop(self.async_backend.take());
         self.runtime.release_compute_owner(self.id);
         self.registry.release_queue();
+    }
+}
+
+pub(crate) struct G17PRenderWatchBackend {
+    runtime: G17PRuntimeRef,
+    registry: Arc<G17PQueueRegistry>,
+}
+
+impl g17_job::G17PRenderWatchBackend for G17PRenderWatchBackend {
+    fn timed_out(
+        &self,
+        packet: Arc<g17_job::G17PRenderWatchPacket>,
+    ) -> kernel::drm::sched::Status {
+        self.registry.quarantine_render_slot(packet.render_slot());
+        self.runtime.mutex().lock().timeout_deferred_render(
+            packet.render_slot(), packet.submission_id(), ETIMEDOUT,
+        );
+        kernel::drm::sched::Status::Nominal
+    }
+
+    fn cancel(&self, packet: Arc<g17_job::G17PRenderWatchPacket>) {
+        self.registry.quarantine_render_slot(packet.render_slot());
+        self.runtime.mutex().lock().timeout_deferred_render(
+            packet.render_slot(), packet.submission_id(), ECANCELED,
+        );
     }
 }
 
@@ -831,6 +830,13 @@ impl G17PQueue {
         // compute submit. The graph and scheduler are created atomically by
         // ensure_async_compute_queue on first compute use.
         let context = runtime.mutex().lock().prepare_queue_execution_context(&vm)?;
+        let render_backend = Arc::new(G17PRenderWatchBackend {
+            runtime,
+            registry: registry.clone(),
+        }, GFP_KERNEL)?;
+        let render_scheduler = g17_job::G17PRenderWatchScheduler::new(
+            dev, render_backend.clone(),
+        )?;
         Ok(Self {
             dev: dev.into(),
             runtime,
@@ -845,6 +851,7 @@ impl G17PQueue {
             context,
             async_backend: None,
             async_scheduler: None,
+            render_scheduler,
             last_async_compute: None,
             id,
         })
@@ -2026,7 +2033,6 @@ impl G17PQueue {
 
         self.join_async_compute_timeline(submission_id)?;
         let mut sample = g17_perf::RenderSample::default();
-        let mut render_completed = false;
 
         // Dependencies must become ready before reserving the physical
         // queues: their signalling submission may belong to another client.
@@ -2072,42 +2078,73 @@ impl G17PQueue {
                         submission_id
                     );
                 }
+                let render_slot = lease.slot();
+                let hardware_fence: UserFence<G17PSubmissionFence> = self
+                    .fence_contexts
+                    .new_fence(0, G17PSubmissionFence)
+                    .map_err(|error| Self::stage_fail(submission_id, "new-render-fence", error))?
+                    .into();
+                let completion = G17PRenderCompletion::new(
+                    hardware_fence,
+                    self.vm.status().clone(),
+                    lease,
+                )?;
                 let publish_started = Instant::<Monotonic>::now();
-                self.runtime
+                let submit = self.runtime
                     .mutex()
                     .lock()
                     .submit_translated_render(
                         &self.vm,
-                        lease.slot(),
+                        render_slot,
                         true,
                         self.context.clone(),
                         &translated,
                         timestamps,
                         timestamp_aliases,
-                    )
-                    .map_err(|error| {
-                        Self::stage_fail(submission_id, "submit-translated-render", error)
-                    })?;
+                        completion.clone(),
+                    );
                 sample.publish_ns = publish_started.elapsed().as_nanos().max(0) as u64;
-                let wait_started = Instant::<Monotonic>::now();
-                let outcome = self
-                    .runtime
-                    .wait_render_slot(lease.slot())
-                    .map_err(|error| {
-                        // An abandoned render leaves the firmware potentially
-                        // still running the group and the slot's host tracker
-                        // set, so every later submission on this slot fails.
-                        // Retire it here rather than handing the same broken
-                        // slot to the next client.
-                        if error == ETIMEDOUT {
-                            self.registry.quarantine_render_slot(lease.slot());
-                        }
-                        Self::stage_fail(submission_id, "wait-render-slot", error)
-                    })?;
-                sample.wait_ns = wait_started.elapsed().as_nanos().max(0) as u64;
-                sample.polls = outcome.polls;
-                sample.gpu_interval = outcome.gpu_interval;
-                render_completed = true;
+                if let Err(error) = submit {
+                    self.registry.quarantine_render_slot(render_slot);
+                    self.runtime.mutex().lock().timeout_deferred_render(
+                        render_slot, submission_id, error,
+                    );
+                    return Err(Self::stage_fail(
+                        submission_id, "submit-translated-render", error,
+                    ));
+                }
+                let packet = match g17_job::G17PRenderWatchPacket::new(
+                    submission_id, render_slot, completion,
+                ) {
+                    Ok(packet) => packet,
+                    Err(error) => {
+                        self.registry.quarantine_render_slot(render_slot);
+                        self.runtime.mutex().lock().timeout_deferred_render(
+                            render_slot, submission_id, error,
+                        );
+                        return Err(Self::stage_fail(
+                            submission_id, "allocate-render-watch", error,
+                        ));
+                    }
+                };
+                let finished = match self.render_scheduler.enqueue(packet) {
+                    Ok(fence) => fence,
+                    Err(error) => {
+                        self.registry.quarantine_render_slot(render_slot);
+                        self.runtime.mutex().lock().timeout_deferred_render(
+                            render_slot, submission_id, error,
+                        );
+                        return Err(Self::stage_fail(
+                            submission_id, "schedule-render-watch", error,
+                        ));
+                    }
+                };
+                publication.publish_async(&finished);
+                sample.ioctl_ns = entered.elapsed().as_nanos().max(0) as u64;
+                if let Some(report) = self.registry.record_render(sample) {
+                    self.report_perf(report);
+                }
+                return Ok(());
             }
             G17PPendingCommand::Compute(translated) => {
                 let start = Self::timestamp_destination(objects, translated.timestamps.start)
@@ -2234,12 +2271,6 @@ impl G17PQueue {
         }
         publication.succeeded();
         core::mem::drop(publication);
-        if render_completed {
-            sample.ioctl_ns = entered.elapsed().as_nanos().max(0) as u64;
-            if let Some(report) = self.registry.record_render(sample) {
-                self.report_perf(report);
-            }
-        }
         dev_dbg!(
             self.dev.as_ref(),
             "G17P queue {} completed synchronous submission {} (one hardware command)\n",

@@ -58,6 +58,41 @@ pub(crate) const G17P_FIRMWARE_EVENT_UMA_GROW_TYPE: u32 = 13;
 pub(crate) const D93AP_G17P_SGX_SOURCE_INDEX: u8 = 4;
 pub(crate) const D93AP_G17P_SGX_INTERRUPTS_VALID: u32 = 0xdf;
 
+/// Pure ownership state for event-driven render fences. A slot is settled by
+/// exactly one of firmware retirement or watchdog loss; a later duplicate or
+/// late event is ignored rather than signalling or releasing twice.
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RenderFenceState {
+    pending: u8,
+}
+
+impl RenderFenceState {
+    const fn bit(slot: u8) -> Option<u8> {
+        if slot < 8 { Some(1u8 << slot) } else { None }
+    }
+
+    pub(crate) fn arm(&mut self, slot: u8) -> bool {
+        let Some(bit) = Self::bit(slot) else { return false; };
+        if self.pending & bit != 0 { return false; }
+        self.pending |= bit;
+        true
+    }
+
+    pub(crate) const fn pending(&self, slot: u8) -> bool {
+        match Self::bit(slot) {
+            Some(bit) => self.pending & bit != 0,
+            None => false,
+        }
+    }
+
+    pub(crate) fn settle(&mut self, slot: u8) -> bool {
+        let Some(bit) = Self::bit(slot) else { return false; };
+        if self.pending & bit == 0 { return false; }
+        self.pending &= !bit;
+        true
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Firmware event ring -- channel-table entry 13, states[0]/states[1].
 //
@@ -1446,6 +1481,35 @@ pub(crate) fn observe_paired_render_window(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn render_fences_retire_out_of_order_once() {
+        let mut state = RenderFenceState::default();
+        assert!(state.arm(0));
+        assert!(state.arm(1));
+        assert!(state.settle(1));
+        assert!(state.pending(0));
+        assert!(!state.pending(1));
+        assert!(state.settle(0));
+    }
+
+    #[test]
+    fn duplicate_render_completion_is_ignored() {
+        let mut state = RenderFenceState::default();
+        assert!(state.arm(0));
+        assert!(state.settle(0));
+        assert!(!state.settle(0));
+    }
+
+    #[test]
+    fn lost_render_settlement_rejects_late_firmware_event() {
+        let mut state = RenderFenceState::default();
+        assert!(state.arm(1));
+        // The watchdog and firmware event share the same settlement gate.
+        assert!(state.settle(1));
+        assert!(!state.settle(1));
+        assert!(state.arm(1));
+    }
 
     #[test]
     fn render_window_wrap_preserves_raw_report_and_execution_gates() {
