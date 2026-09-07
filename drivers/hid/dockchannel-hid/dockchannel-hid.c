@@ -79,6 +79,12 @@ struct dchid_init_hdr {
 #define CMD_ENABLE_INTERFACE 0xb4
 #define CMD_ACK_GPIO_CMD 0xa1
 
+#define DCHID_POWER_METHOD_DIRECT 1
+#define DCHID_POWER_METHOD_TRANSACTIONAL 2
+#define DCHID_POWER_PHASE_WILL_CHANGE 0
+#define DCHID_POWER_PHASE_HAS_CHANGED 1
+#define DCHID_POWER_SETTLE_MS 50
+
 struct dchid_init_block_hdr {
 	u16 type;
 	u16 length;
@@ -368,9 +374,41 @@ static int dchid_enable_interface(struct dchid_iface *iface)
 	return dchid_comm_cmd(iface->dchid, msg, sizeof(msg));
 }
 
+static bool dchid_uses_transactional_power(struct dchid_iface *iface)
+{
+	const char *firmware_name;
+
+	return of_property_read_bool(iface->dchid->dev->of_node, "apple,no-stm") &&
+	       !strcmp(iface->name, "multi-touch") &&
+	       !of_property_read_string(iface->of_node, "firmware-name",
+					&firmware_name) &&
+	       !strcmp(firmware_name, "apple/tpmtfw-j700.bin");
+}
+
 static int dchid_reset_interface(struct dchid_iface *iface, int state)
 {
-	u8 msg[] = { CMD_RESET_INTERFACE, 1, iface->index, state };
+	u8 msg[] = {
+		CMD_RESET_INTERFACE,
+		DCHID_POWER_METHOD_DIRECT,
+		iface->index,
+		state,
+		DCHID_POWER_PHASE_WILL_CHANGE,
+		0, 0, 0, 0,
+	};
+	int ret;
+
+	if (!dchid_uses_transactional_power(iface))
+		return dchid_comm_cmd(iface->dchid, msg, 4);
+
+	msg[1] = DCHID_POWER_METHOD_TRANSACTIONAL;
+	ret = dchid_comm_cmd(iface->dchid, msg, sizeof(msg));
+	if (ret < 0)
+		return ret;
+
+	/* Match Apple's will-change / has-changed transaction ordering. */
+	if (state == 2)
+		msleep(DCHID_POWER_SETTLE_MS);
+	msg[4] = DCHID_POWER_PHASE_HAS_CHANGED;
 
 	return dchid_comm_cmd(iface->dchid, msg, sizeof(msg));
 }
@@ -486,10 +524,9 @@ static bool dchid_adopt_preinitialized_ipd_functions(struct dchid_iface *iface)
 	 * handoff.  Keep this adoption path deliberately narrower than the GPIO
 	 * fallback: an unknown interface or request must still fail closed.
 	 */
-	return of_property_read_bool(iface->dchid->dev->of_node, "apple,no-stm") &&
+	return dchid_uses_transactional_power(iface) &&
 	       of_property_read_bool(iface->of_node,
 				     "apple,adopt-preinitialized-ipd-functions") &&
-	       !strcmp(iface->name, "multi-touch") &&
 	       !strcmp(iface->gpio_name, "afe-reset");
 }
 
@@ -539,8 +576,12 @@ static int dchid_start_interface(struct dchid_iface *iface)
 
 		/* After loading firmware, multi-touch needs a reset */
 		dev_info(iface->dchid->dev, "Resetting %s\n", iface->name);
-		dchid_reset_interface(iface, 0);
-		dchid_reset_interface(iface, 2);
+		ret = dchid_reset_interface(iface, 0);
+		if (ret < 0)
+			goto err;
+		ret = dchid_reset_interface(iface, 2);
+		if (ret < 0)
+			goto err;
 	}
 
 	return 0;
