@@ -2869,19 +2869,6 @@ impl G17PManagerConstruction {
         Ok(())
     }
 
-    /// Leave the completed physical render queues and all per-VM cached
-    /// mappings installed, but give the bind slot back for a compute client.
-    /// A subsequent render reattaches through the same ownerless transaction
-    /// used after a recoverable mapping failure; no queue ordinal is reset.
-    pub(crate) fn release_retired_render_context(&mut self) -> Result {
-        if self.render_storage.is_none() { return Ok(()); }
-        self.require_retired_render_owner()?;
-        self.render_context_aliases = None;
-        self.render_storage.as_mut().ok_or(ENODEV)?.release_client_context();
-        self.render_bind = None;
-        Ok(())
-    }
-
     /// Retire one VM's job-private graph before another VM constructs its own
     /// graph on the already-installed physical QID pair.  Queue producer state
     /// and the monotonically increasing submission ordinal stay retained; no

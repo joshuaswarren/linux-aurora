@@ -83,7 +83,9 @@ impl G17PLiveRuntime {
     ) -> Result {
         if !self.accepting_submissions || self.is_crashed() { return Err(EIO); }
         self.settle_open_recovery_before_publication()?;
-        self.manager.as_mut().ok_or(ENODEV)?.release_retired_render_context()?;
+        // Render jobs now retain independent application-GART roots and
+        // job-private low views.  Compute QID4+ has no render context lease to
+        // reclaim, so publication may proceed while either render slot runs.
         if *module_parameters::g17p_power_wire.value() == 1 { self.wire_g17p_submit_gpu_power()?; }
         let index = self.async_compute_queues.iter().position(|q| q.owner == Some(owner)).ok_or(EINVAL)?;
         let q = &mut self.async_compute_queues[index];

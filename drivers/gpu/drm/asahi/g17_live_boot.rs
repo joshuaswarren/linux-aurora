@@ -3836,35 +3836,11 @@ impl G17PLiveRuntime {
         // A render that is admitted, armed on its pipe and never launched is
         // what that produces.
         self.settle_open_recovery_before_publication()?;
-        // Compute retains its client aliases and VmBind after retirement so
-        // repeated dispatches can reuse the installed QID4 graph.  Render's
-        // full FList view cannot coexist with those aliases: its block 21
-        // contains the two low completion-ring addresses.  Native solves this
-        // with workload-specific app-GART contexts.  Until Linux retains both
-        // roots concurrently, hand the *idle* compute graph back before
-        // building the render view.  The graph itself stays installed; only
-        // the completed client's mappings and UAT binding are released, and a
-        // later compute submission rebinds them through the already-proven
-        // steady-state handoff path.
-        if self.compute_binding.is_some() {
-            if self.pending_compute.is_some() || self.compute_abandoned {
-                return Err(EBUSY);
-            }
-            let installed = match (self.queue.as_ref(), self.manager.as_ref()) {
-                (Some(queue), Some(manager)) => manager.compute_queue_is_installed(queue),
-                _ => false,
-            };
-            if !installed {
-                return Err(EIO);
-            }
-            self.rebind_compute_queue()?;
-            if let Some(pdev) = self.pdev.as_ref() {
-                dev_info!(
-                    pdev.as_ref(),
-                    "G17P workload switch: released idle compute app-GART view before render; retained QID4 graph remains installed\n"
-                );
-            }
-        }
+        // The legacy synchronous compute path keeps its client resources in
+        // fixed contexts 2/3; this render owns a distinct application-GART
+        // context and embeds its complete low-view closure there.  They no
+        // longer alias, so neither an idle nor an in-flight QID4 binding is a
+        // reason to hand the compute graph back before render publication.
         self.manager.as_mut().ok_or(ENODEV)?.handoff_retained_render_vm(vm)?;
         let recycle = self
             .manager
@@ -4951,10 +4927,10 @@ impl G17PLiveRuntime {
             return Err(ENOTSUPP);
         }
         self.settle_open_recovery_before_publication()?;
-        // Compute owns disjoint FList/completion aliases. Release only the
-        // fully retired render context leases; the queues and grown render
-        // pool remain installed for the next render submission.
-        self.manager.as_mut().ok_or(ENODEV)?.release_retired_render_context()?;
+        // Compute owns disjoint QID4+ state and an independent application-
+        // GART root.  Render's two job-private roots may stay live; reclaiming
+        // either here would turn this publication back into a cross-engine
+        // scheduling barrier.
         self.manager.as_mut().ok_or(ENODEV)?.stage_compute_flist_state()?;
         // Allocate the compute graph on actual compute use, never as a
         // prerequisite for render. This is a no-op once a graph exists.
