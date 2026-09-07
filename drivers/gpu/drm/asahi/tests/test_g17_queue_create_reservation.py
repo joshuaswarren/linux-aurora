@@ -20,13 +20,14 @@ struct Arc<T>(std::sync::Arc<T>);impl<T>Arc<T>{fn new(v:T,_flags:u32)->Result<Se
 struct G17PQueueRegistry{live_queues:AtomicU32}
 #[derive(Clone)]struct AsahiDevice;type AsahiDevRef=AsahiDevice;impl From<&AsahiDevice> for AsahiDevice{fn from(d:&AsahiDevice)->Self{d.clone()}}
 mod mmu{#[derive(Clone)]pub struct Vm;pub struct T8140ComputeExecutionContext;}
+struct Fence;
 struct FenceContexts;impl FenceContexts{fn new(_n:u32,_name:&str,_key:u32)->Result<Self>{if FAIL_FENCE.swap(false,Ordering::SeqCst){Err(12)}else{Ok(Self)}}}
 const QUEUE_NAME:&str="queue";const QUEUE_CLASS_KEY:u32=0;const T8140_USER_START:u64=0x4000;const T8140_UNKNOWN_PAGE:u64=1<<42;
 mod g17_uapi{pub struct QueueUscWindow{pub base:u64,pub user_start:u64,pub user_end:u64}impl QueueUscWindow{pub fn validate(&self)->Result<(),()>{Ok(())}}}
 struct State{owners:Vec<u64>,released:Vec<u64>}
 #[derive(Clone,Copy)]struct G17PRuntimeRef(&'static Mutex<State>);
 impl G17PRuntimeRef{fn new()->Self{Self(Box::leak(Box::new(Mutex::new(State{owners:vec![],released:vec![]}))))}fn mutex(&self)->&Self{self}fn lock(&self)->Guard<'_>{Guard(self.0.lock().unwrap())}fn release_compute_owner(&self,_id:u64){}}
-struct Guard<'a>(MutexGuard<'a,State>);impl Guard<'_>{fn prepare_async_compute_queue(&mut self,id:u64,_vm:&mmu::Vm)->Result<(u8,Arc<mmu::T8140ComputeExecutionContext>)>{if FAIL_PREPARE.swap(false,Ordering::SeqCst){return Err(12)}assert!(!self.0.owners.contains(&id));self.0.owners.push(id);Ok((4,Arc::new(mmu::T8140ComputeExecutionContext,0)?))}fn release_async_compute_queue(&mut self,id:u64){let i=self.0.owners.iter().position(|x|*x==id).expect("only owned reservation can release");self.0.owners.remove(i);self.0.released.push(id)}}
+struct Guard<'a>(MutexGuard<'a,State>);impl Guard<'_>{fn prepare_async_compute_queue(&mut self,id:u64,_vm:&mmu::Vm)->Result<(u8,Arc<mmu::T8140ComputeExecutionContext>)>{if FAIL_PREPARE.swap(false,Ordering::SeqCst){return Err(12)}assert!(!self.0.owners.contains(&id));self.0.owners.push(id);Ok((4,Arc::new(mmu::T8140ComputeExecutionContext,0)?))}fn release_async_compute_queue(&mut self,id:u64){if let Some(i)=self.0.owners.iter().position(|x|*x==id){self.0.owners.remove(i);self.0.released.push(id)}}}
 mod g17_job{use super::*;pub struct G17PJobScheduler<T>(Arc<T>);impl<T>G17PJobScheduler<T>{pub fn new(_d:&AsahiDevice,b:Arc<T>,_credits:u32)->Result<Self>{if FAIL_SCHEDULER.swap(false,Ordering::SeqCst){Err(12)}else{Ok(Self(b))}}}}
 '''
 tests=r'''
