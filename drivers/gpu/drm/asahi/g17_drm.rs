@@ -687,30 +687,36 @@ impl G17PQueue {
             let size = u16::from_le_bytes([header[2], header[3]]);
             let vdm_barrier = u16::from_le_bytes([header[4], header[5]]);
             let cdm_barrier = u16::from_le_bytes([header[6], header[7]]);
-            pr_info!(
-                "G17P submit: submission {} cmd[{}] type={} size={} vdm_barrier={:#x} cdm_barrier={:#x} at offset {}\n",
-                submission_id,
-                index,
-                command_type,
-                size,
-                vdm_barrier,
-                cdm_barrier,
-                offset,
-            );
+            if crate::util::g17p_verbose() {
+                pr_info!(
+                    "G17P submit: submission {} cmd[{}] type={} size={} vdm_barrier={:#x} cdm_barrier={:#x} at offset {}\n",
+                    submission_id,
+                    index,
+                    command_type,
+                    size,
+                    vdm_barrier,
+                    cdm_barrier,
+                    offset,
+                );
+            }
             offset += g17_uapi::UAPI_COMMAND_HEADER_SIZE + size as usize;
             index += 1;
             if index > 8 {
-                pr_info!("G17P submit: submission {} cmd list truncated\n", submission_id);
+                if crate::util::g17p_verbose() {
+                    pr_info!("G17P submit: submission {} cmd list truncated\n", submission_id);
+                }
                 return;
             }
         }
         if offset != raw.len() {
-            pr_info!(
-                "G17P submit: submission {} cmd walk ended at {} of {} bytes (ragged)\n",
-                submission_id,
-                offset,
-                raw.len(),
-            );
+            if crate::util::g17p_verbose() {
+                pr_info!(
+                    "G17P submit: submission {} cmd walk ended at {} of {} bytes (ragged)\n",
+                    submission_id,
+                    offset,
+                    raw.len(),
+                );
+            }
         }
     }
 
@@ -1617,14 +1623,16 @@ impl queue::Queue for G17PQueue {
         let pending = pending.ok_or_else(|| {
             Self::stage_fail(submission_id, "no-hardware-command", EINVAL)
         })?;
-        pr_info!(
-            "G17P submit: submission {} translated as {}\n",
-            submission_id,
-            match pending {
-                G17PPendingCommand::Render(_) => "render",
-                G17PPendingCommand::Compute(_) => "compute",
-            }
-        );
+        if crate::util::g17p_verbose() {
+            pr_info!(
+                "G17P submit: submission {} translated as {}\n",
+                submission_id,
+                match pending {
+                    G17PPendingCommand::Render(_) => "render",
+                    G17PPendingCommand::Compute(_) => "compute",
+                }
+            );
+        }
 
         if let G17PPendingCommand::Compute(translated) = pending {
             return self.submit_compute_async(
@@ -1677,10 +1685,12 @@ impl queue::Queue for G17PQueue {
                     )
                     .map_err(|error| Self::stage_fail(submission_id, "ts-frag-end", error))?,
                 ];
-                pr_info!(
-                    "G17P submit: submission {} render timestamps resolved, entering manager publish\n",
-                    submission_id
-                );
+                if crate::util::g17p_verbose() {
+                    pr_info!(
+                        "G17P submit: submission {} render timestamps resolved, entering manager publish\n",
+                        submission_id
+                    );
+                }
                 self.runtime
                     .mutex()
                     .lock()
