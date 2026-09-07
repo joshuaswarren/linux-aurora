@@ -3168,6 +3168,21 @@ pub(crate) struct G17PUserRenderStorage {
     /// reservation. Every restaged command pair keeps this predecessor while
     /// receiving fresh, consecutive 3D/TA current IDs.
     lifecycle_predecessor: u32,
+    /// Retained staging image for the descriptor pair built by
+    /// `restage_command`.
+    ///
+    /// This buffer is pure scratch. Its GPU address is never written into a
+    /// descriptor, never published to firmware and never read by the RCE: the
+    /// function builds the TA and 3D records in it and then copies both into
+    /// the retained `descriptors` object, which is the storage the hardware
+    /// actually addresses. Allocating, mapping, zeroing and unmapping 32 KiB
+    /// of write-combining memory for that on every single submission is a page
+    /// table update, a TLB maintenance operation and a VA-allocator round trip
+    /// per frame, for a buffer whose contents are fully rewritten each time.
+    /// Retaining it and zeroing it in place is byte-for-byte the same input to
+    /// the descriptor builders -- `MappedObject::new_wc_in_range` zeroes a
+    /// fresh allocation with exactly the same `VMap::memset(0)`.
+    staging_descriptors: Option<MappedObject>,
 }
 
 #[cfg(not(test))]
@@ -5224,6 +5239,19 @@ pub(crate) fn g17p_render_tvb_enabled() -> bool {
     *crate::module_parameters::g17p_render_tvb.value() != 0
 }
 
+/// Whether the render descriptor staging image is retained between
+/// submissions instead of reallocated.
+///
+/// The staging image is scratch: `restage_command` builds the TA and 3D
+/// records in it and copies both into the retained descriptor storage, and its
+/// own GPU address is never written into a descriptor or published to
+/// firmware. Retaining it removes a 32 KiB allocate/map/zero/unmap round trip
+/// per submission and changes nothing the hardware observes; the retained
+/// buffer is zeroed before each use, exactly as a fresh allocation is.
+fn g17p_retain_staging() -> bool {
+    *crate::module_parameters::g17p_retain_staging.value() != 0
+}
+
 fn g17p_render_cycle_pointer(scene_scratch_va: u64) -> Result<u64> {
     scene_scratch_va
         .checked_sub(G17P_RENDER_USER_BASE)
@@ -6842,6 +6870,7 @@ impl G17PUserRenderStorage {
             _command_context: Some(command_context),
             descriptor_context_id,
             render_root_slot,
+            staging_descriptors: None,
         })
     }
 
@@ -7085,13 +7114,28 @@ impl G17PUserRenderStorage {
             );
             return Err(EBUSY);
         }
-        let mut next_descriptors = restage_step!("descriptor allocation", MappedObject::new_wc(
-            dev,
-            uat,
-            G17P_RENDER_DESCRIPTOR_IMAGE_SIZE,
-            mmu::UAT_PGSZ as u64,
-            mmu::PROT_GPU_FW_SHARED_RW,
-        ));
+        // The staging image is scratch whose address never leaves this
+        // function (see `staging_descriptors`). Take the retained one when
+        // there is one and zero it exactly as a fresh allocation is zeroed;
+        // otherwise allocate. It is handed back at the end of a successful
+        // restage, so an early error simply drops it and the next submission
+        // allocates again.
+        let mut next_descriptors = match self.staging_descriptors.take() {
+            Some(mut retained) if g17p_retain_staging() => {
+                restage_step!(
+                    "staging reset",
+                    retained.object.vmap().map(|mut view| view.memset(0))
+                );
+                retained
+            }
+            _ => restage_step!("descriptor allocation", MappedObject::new_wc(
+                dev,
+                uat,
+                G17P_RENDER_DESCRIPTOR_IMAGE_SIZE,
+                mmu::UAT_PGSZ as u64,
+                mmu::PROT_GPU_FW_SHARED_RW,
+            )),
+        };
         let render_layout =
             g17p_render_state_layout(&command.parameters, num_clusters).ok_or(EINVAL)?;
         let mut next_render_state = restage_step!("render-state allocation", MappedObject::new_wc_in_range(
@@ -7469,76 +7513,81 @@ impl G17PUserRenderStorage {
             )
         })?;
 
-        let source = next_descriptors.object.vmap()?;
-        let destination = self.descriptors.object.vmap()?;
-        let support = self.support.object.vmap()?;
-        let source = unsafe {
-            core::slice::from_raw_parts(source.as_ptr(), G17P_RENDER_DESCRIPTOR_IMAGE_SIZE)
-        };
-        let destination = unsafe {
-            core::slice::from_raw_parts_mut(
-                destination.as_mut_ptr(),
-                G17P_RENDER_DESCRIPTOR_STORAGE_SIZE,
-            )
-        };
-        let support = unsafe {
-            core::slice::from_raw_parts_mut(support.as_mut_ptr(), G17P_RENDER_SUPPORT_SIZE)
-        };
-        let pool_a_kick = match G17PEventControlKick::prepare_reuse(
-            support,
-            support_va,
-            record_a_index,
-        ) {
-            Some(kick) => kick,
-            None => {
-                // The record was reusable when it was selected above and the
-                // manager lock is held throughout, so this can only mean
-                // firmware relinked it underneath us. Report the exact fields.
-                if let Some((slot_va, want_slot_va, completed, want_completed, membership)) =
-                    G17PEventControlKick::reuse_fields(support, support_va, record_a_index)
-                {
-                    dev_err!(
-                        dev.as_ref(),
-                        "G17P render restage: selected pool-A record {} became unusable ordinal={} slot_va={:#x} expected={:#x} completed={} expected={} membership={:#x}\n",
-                        record_a_index,
-                        submission_ordinal,
-                        slot_va,
-                        want_slot_va,
-                        completed,
-                        want_completed,
-                        membership,
-                    );
+        // Confine the staging map to this block. The `VMapRef` borrows
+        // `next_descriptors` mutably for as long as it lives, and the retained
+        // staging image is handed back to `self` after the copy.
+        {
+            let source = next_descriptors.object.vmap()?;
+            let destination = self.descriptors.object.vmap()?;
+            let support = self.support.object.vmap()?;
+            let source = unsafe {
+                core::slice::from_raw_parts(source.as_ptr(), G17P_RENDER_DESCRIPTOR_IMAGE_SIZE)
+            };
+            let destination = unsafe {
+                core::slice::from_raw_parts_mut(
+                    destination.as_mut_ptr(),
+                    G17P_RENDER_DESCRIPTOR_STORAGE_SIZE,
+                )
+            };
+            let support = unsafe {
+                core::slice::from_raw_parts_mut(support.as_mut_ptr(), G17P_RENDER_SUPPORT_SIZE)
+            };
+            let pool_a_kick = match G17PEventControlKick::prepare_reuse(
+                support,
+                support_va,
+                record_a_index,
+            ) {
+                Some(kick) => kick,
+                None => {
+                    // The record was reusable when it was selected above and the
+                    // manager lock is held throughout, so this can only mean
+                    // firmware relinked it underneath us. Report the exact fields.
+                    if let Some((slot_va, want_slot_va, completed, want_completed, membership)) =
+                        G17PEventControlKick::reuse_fields(support, support_va, record_a_index)
+                    {
+                        dev_err!(
+                            dev.as_ref(),
+                            "G17P render restage: selected pool-A record {} became unusable ordinal={} slot_va={:#x} expected={:#x} completed={} expected={} membership={:#x}\n",
+                            record_a_index,
+                            submission_ordinal,
+                            slot_va,
+                            want_slot_va,
+                            completed,
+                            want_completed,
+                            membership,
+                        );
+                    }
+                    return Err(EBUSY);
                 }
-                return Err(EBUSY);
-            }
-        };
-        let ta_offset = g17p_render_ta_descriptor_offset(submission_ordinal);
-        let fragment_offset = g17p_render_3d_descriptor_offset(submission_ordinal);
-        destination
-            .get_mut(ta_offset..ta_offset + g17_render::TA_DESCRIPTOR_SIZE)
-            .ok_or(ERANGE)?
-            .copy_from_slice(&source[..g17_render::TA_DESCRIPTOR_SIZE]);
-        destination
-            .get_mut(fragment_offset..fragment_offset + g17_render::FRAGMENT_DESCRIPTOR_SIZE)
-            .ok_or(ERANGE)?
-            .copy_from_slice(
-                &source[0x4000..0x4000 + g17_render::FRAGMENT_DESCRIPTOR_SIZE],
+            };
+            let ta_offset = g17p_render_ta_descriptor_offset(submission_ordinal);
+            let fragment_offset = g17p_render_3d_descriptor_offset(submission_ordinal);
+            destination
+                .get_mut(ta_offset..ta_offset + g17_render::TA_DESCRIPTOR_SIZE)
+                .ok_or(ERANGE)?
+                .copy_from_slice(&source[..g17_render::TA_DESCRIPTOR_SIZE]);
+            destination
+                .get_mut(fragment_offset..fragment_offset + g17_render::FRAGMENT_DESCRIPTOR_SIZE)
+                .ok_or(ERANGE)?
+                .copy_from_slice(
+                    &source[0x4000..0x4000 + g17_render::FRAGMENT_DESCRIPTOR_SIZE],
+                );
+            let record_a = G17P_RENDER_POOL_A + record_a_index * 0x100;
+            put_u32(
+                support,
+                record_a + 0x08,
+                submission_ordinal + submission_ordinal / 2,
             );
-        let record_a = G17P_RENDER_POOL_A + record_a_index * 0x100;
-        put_u32(
-            support,
-            record_a + 0x08,
-            submission_ordinal + submission_ordinal / 2,
-        );
-        put_u32(support, record_a + 0x10, 0x50);
-        pool_a_kick.apply(support);
-        put_u32(
-            support,
-            G17P_RENDER_SHARED_CONTROL_INNER,
-            submission_ordinal * 2 + 1,
-        );
-        put_u32(support, G17P_RENDER_FLAG, submission_ordinal + 1);
-        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            put_u32(support, record_a + 0x10, 0x50);
+            pool_a_kick.apply(support);
+            put_u32(
+                support,
+                G17P_RENDER_SHARED_CONTROL_INNER,
+                submission_ordinal * 2 + 1,
+            );
+            put_u32(support, G17P_RENDER_FLAG, submission_ordinal + 1);
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        }
 
         let old_render_state = core::mem::replace(&mut self.render_state, next_render_state);
         self.render_layout = render_layout;
@@ -7556,6 +7605,9 @@ impl G17PUserRenderStorage {
         drop(old_timestamps);
         drop(old_render_user_aliases);
         drop(old_render_state);
+        if g17p_retain_staging() {
+            self.staging_descriptors = Some(next_descriptors);
+        }
         Ok(())
     }
 

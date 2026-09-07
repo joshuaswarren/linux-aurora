@@ -370,6 +370,10 @@ kernel::module_platform_driver! {
             default: 2000,
             description: "Deadline for the render completion wait, in milliseconds. This is the stuck-firmware backstop that was previously spelled as 2000 polls of one millisecond each. Expressing it as a deadline keeps the bound fixed while the poll interval varies. Raise it only to investigate a genuinely slow render; it is not a pacing knob.",
         },
+        g17p_retain_staging: u32 {
+            default: 1,
+            description: "Reuse one retained 32 KiB staging image for the render descriptor pair instead of allocating, mapping, zeroing, copying out and unmapping a fresh one on every submission. The staging image is pure scratch: its GPU address is never published to firmware and its bytes are copied into the retained descriptor storage before it is dropped, so retaining it changes no address the hardware sees. The retained buffer is zeroed before each use, exactly as a fresh allocation is. 0: allocate per submission, which is the pre-existing behaviour and the A/B control.",
+        },
         g17p_verbose: u32 {
             default: 0,
             description: "Per-submission diagnostic dumps. The render path emits several dozen lines for every submission -- the QoS regions, both status pages, the PM/HWPB and PBDesc snapshots, the tag-15 and SKSM records and the context roots. That is the bring-up instrumentation this driver was written with, and at desktop frame rates it costs real time and buries every other message in the ring buffer within a few seconds. 0: only lifecycle and failures (default), 1: the full per-submission dumps.",
