@@ -3322,6 +3322,10 @@ impl G17PRenderItemPlan {
     }
 }
 
+/// Reports the first Pool-A fallback once, so a healthy desktop does not log
+/// a line per frame while the condition stays visible.
+static G17P_POOL_A_FALLBACK_LOGGED: AtomicU32 = AtomicU32::new(0);
+
 /// One host increment of an EventControl's own submitted-kick counter.
 /// Native incrementSubmittedKicks (89fc2a0) adds to the u32 reached through
 /// host descriptor +1a8; it is not assigned from a global render ordinal.
@@ -3364,6 +3368,30 @@ impl G17PEventControlKick {
 
     fn apply(self, support: &mut [u8]) {
         put_u32(support, self.slot_offset, self.next);
+    }
+
+    /// Exact per-field reason a Pool-A record is not reusable. Returned in the
+    /// same order the reuse predicate tests them so one log line separates
+    /// "firmware still owns this record" from "host bookkeeping drifted".
+    /// Tuple: (slot_va, expected_slot_va, completed, expected_completed, membership).
+    fn reuse_fields(
+        support: &[u8],
+        support_va: u64,
+        record_index: usize,
+    ) -> Option<(u64, u64, u32, u32, u32)> {
+        let kick = Self::prepare(support, record_index)?;
+        let record_offset = G17P_RENDER_POOL_A.checked_add(record_index.checked_mul(0x100)?)?;
+        let record = support.get(record_offset..record_offset.checked_add(0x98)?)?;
+        let slot_va = u64::from_le_bytes(record.get(..8)?.try_into().ok()?);
+        let completed = u32::from_le_bytes(record.get(0x0c..0x10)?.try_into().ok()?);
+        let membership = u32::from_le_bytes(record.get(0x94..0x98)?.try_into().ok()?);
+        Some((
+            slot_va,
+            support_va.checked_add(kick.slot_offset as u64)?,
+            completed,
+            kick.next.wrapping_sub(1),
+            membership,
+        ))
     }
 }
 
@@ -7092,9 +7120,71 @@ impl G17PUserRenderStorage {
             Ok(())
         })?;
 
-        let record_a_index = (submission_ordinal as usize * 2) % 35;
-        let record_b_index = submission_ordinal as usize % 79;
+        // Pool-A record selection must be grounded in firmware state, not in the
+        // ordinal alone. A record is reusable only once firmware has completed
+        // every kick the host submitted on it and unlinked it. The cold-opening
+        // record is seeded with a submitted-kick count that firmware never
+        // completes against, so it is permanently ineligible; a fixed
+        // `ordinal * 2` map lands on it again every 35 ordinals and rejects an
+        // otherwise valid submission with EBUSY. Keep the native-preferred index
+        // when it is free and otherwise take the next reusable record, so
+        // asynchronous submission is preserved and EBUSY is reported only when
+        // firmware genuinely owns every record.
         let support_va = self.support.iova();
+        let record_a_index = {
+            let view = self.support.object.vmap()?;
+            let support_ro = unsafe {
+                core::slice::from_raw_parts(view.as_ptr(), G17P_RENDER_SUPPORT_SIZE)
+            };
+            let preferred = (submission_ordinal as usize * 2) % 35;
+            let selected = (0..35)
+                .map(|step| (preferred + step) % 35)
+                .find(|&index| {
+                    G17PEventControlKick::prepare_reuse(support_ro, support_va, index).is_some()
+                });
+            match selected {
+                Some(index) => {
+                    if index != preferred
+                        && G17P_POOL_A_FALLBACK_LOGGED
+                            .fetch_add(1, Ordering::Relaxed)
+                            == 0
+                    {
+                        dev_info!(
+                            dev.as_ref(),
+                            "G17P render restage: pool-A record {} is not reusable, using {} (ordinal={})\n",
+                            preferred,
+                            index,
+                            submission_ordinal,
+                        );
+                    }
+                    index
+                }
+                None => {
+                    let mut reusable: u64 = 0;
+                    for index in 0..35usize {
+                        if let Some((slot_va, want_slot_va, completed, want_completed, membership)) =
+                            G17PEventControlKick::reuse_fields(support_ro, support_va, index)
+                        {
+                            if slot_va == want_slot_va
+                                && completed == want_completed
+                                && membership == 0
+                            {
+                                reusable |= 1u64 << index;
+                            }
+                        }
+                    }
+                    dev_err!(
+                        dev.as_ref(),
+                        "G17P render restage: no reusable pool-A record, preferred={} mask={:#x} ordinal={}\n",
+                        preferred,
+                        reusable,
+                        submission_ordinal,
+                    );
+                    return Err(EBUSY);
+                }
+            }
+        };
+        let record_b_index = submission_ordinal as usize % 79;
         let shared_object = if g17p_render_native_fragment_hwpb_enabled() {
             self.parameter_management.as_ref().map_or(
                 support_va + G17P_RENDER_PACKED_SHARED as u64,
@@ -7254,9 +7344,34 @@ impl G17PUserRenderStorage {
         let support = unsafe {
             core::slice::from_raw_parts_mut(support.as_mut_ptr(), G17P_RENDER_SUPPORT_SIZE)
         };
-        let pool_a_kick =
-            G17PEventControlKick::prepare_reuse(support, support_va, record_a_index)
-                .ok_or(EBUSY)?;
+        let pool_a_kick = match G17PEventControlKick::prepare_reuse(
+            support,
+            support_va,
+            record_a_index,
+        ) {
+            Some(kick) => kick,
+            None => {
+                // The record was reusable when it was selected above and the
+                // manager lock is held throughout, so this can only mean
+                // firmware relinked it underneath us. Report the exact fields.
+                if let Some((slot_va, want_slot_va, completed, want_completed, membership)) =
+                    G17PEventControlKick::reuse_fields(support, support_va, record_a_index)
+                {
+                    dev_err!(
+                        dev.as_ref(),
+                        "G17P render restage: selected pool-A record {} became unusable ordinal={} slot_va={:#x} expected={:#x} completed={} expected={} membership={:#x}\n",
+                        record_a_index,
+                        submission_ordinal,
+                        slot_va,
+                        want_slot_va,
+                        completed,
+                        want_completed,
+                        membership,
+                    );
+                }
+                return Err(EBUSY);
+            }
+        };
         let ta_offset = g17p_render_ta_descriptor_offset(submission_ordinal);
         let fragment_offset = g17p_render_3d_descriptor_offset(submission_ordinal);
         destination
