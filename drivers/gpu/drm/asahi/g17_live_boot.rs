@@ -3763,6 +3763,16 @@ impl G17PLiveRuntime {
         }
     }
 
+    /// Publish complete render QID registrations once the graphics-core
+    /// aperture becomes reachable. This deliberately excludes stale generic
+    /// SKSM traffic such as AddKicks and queue-disable writes.
+    pub(crate) fn replay_deferred_render_sksm_registrations(&self) -> Result<usize> {
+        self.registers
+            .as_ref()
+            .ok_or(ENODEV)?
+            .g17p_replay_deferred_sksm_registrations()
+    }
+
     /// Release a timed-out render.
     ///
     /// Returns `true` when the firmware had already retired the group without

@@ -289,6 +289,10 @@ pub(crate) struct Resources {
     /// reachable from the AP while the cores are powered, and the driver has
     /// to publish the queue configuration before that happens.
     sksm_deferred: Pin<KBox<Mutex<G17PDeferredSksmWrites>>>,
+    /// Queue registrations are kept separately from transient AddKicks and
+    /// disable writes. A registration is an indivisible configure+enable
+    /// transaction and must never be silently displaced by stale traffic.
+    sksm_deferred_registrations: Pin<KBox<Mutex<G17PDeferredSksmRegistrations>>>,
 }
 
 pub(crate) struct G17PDeferredSksmWrites {
@@ -303,6 +307,27 @@ impl G17PDeferredSksmWrites {
             pairs: [None; 8],
             count: 0,
             replayed: false,
+        }
+    }
+}
+
+const G17P_MAX_DEFERRED_SKSM_REGISTRATIONS: usize = 8;
+
+#[derive(Debug, Copy, Clone)]
+struct G17PDeferredSksmRegistration {
+    configure_pair: g17_submission::G17SksmOrderedWritePair,
+    enable_pair: g17_submission::G17SksmOrderedWritePair,
+}
+
+struct G17PDeferredSksmRegistrations {
+    entries: [Option<G17PDeferredSksmRegistration>;
+        G17P_MAX_DEFERRED_SKSM_REGISTRATIONS],
+}
+
+impl G17PDeferredSksmRegistrations {
+    const fn new() -> Self {
+        Self {
+            entries: [None; G17P_MAX_DEFERRED_SKSM_REGISTRATIONS],
         }
     }
 }
@@ -552,6 +577,13 @@ impl Resources {
             new_mutex!(G17PDeferredSksmWrites::new(), "g17_sksm_deferred"),
             GFP_KERNEL,
         )?;
+        let sksm_deferred_registrations = KBox::pin_init(
+            new_mutex!(
+                G17PDeferredSksmRegistrations::new(),
+                "g17_sksm_deferred_registrations"
+            ),
+            GFP_KERNEL,
+        )?;
 
         Ok(Resources {
             // SAFETY: This device does DMA via the UAT IOMMU.
@@ -559,6 +591,7 @@ impl Resources {
             sgx: sgx_iomem,
             sksm_fifo,
             sksm_deferred,
+            sksm_deferred_registrations,
         })
     }
 
@@ -954,8 +987,7 @@ impl Resources {
                 pair.word0, pair.word0_offset, pair.word1, pair.word1_offset,
                 enable_pair.word0, enable_pair.word1
             );
-            self.stash_deferred_sksm_pair(pair);
-            self.stash_deferred_sksm_pair(enable_pair);
+            self.stash_deferred_sksm_registration(pair, enable_pair)?;
             return Ok(false);
         }
         let _guard = self.sksm_fifo.lock();
@@ -1049,6 +1081,75 @@ impl Resources {
             // would silently drop its own.
             deferred.replayed = false;
         }
+    }
+
+    fn stash_deferred_sksm_registration(
+        &self,
+        configure_pair: g17_submission::G17SksmOrderedWritePair,
+        enable_pair: g17_submission::G17SksmOrderedWritePair,
+    ) -> Result {
+        let mut deferred = self.sksm_deferred_registrations.lock();
+        if let Some(existing) = deferred.entries.iter_mut().find(|entry| {
+            entry.is_some_and(|registration| registration.configure_pair == configure_pair)
+        }) {
+            *existing = Some(G17PDeferredSksmRegistration {
+                configure_pair,
+                enable_pair,
+            });
+            return Ok(());
+        }
+        let Some(slot) = deferred.entries.iter_mut().find(|slot| slot.is_none()) else {
+            return Err(ENOSPC);
+        };
+        *slot = Some(G17PDeferredSksmRegistration {
+            configure_pair,
+            enable_pair,
+        });
+        Ok(())
+    }
+
+    /// Cancel a queue registration that never reached its enable write. This
+    /// keeps a lost/recycled client from becoming visible during a later
+    /// powered replay.
+    pub(crate) fn g17p_cancel_deferred_sksm_registration(
+        &self,
+        configure_pair: g17_submission::G17SksmOrderedWritePair,
+    ) -> bool {
+        let mut deferred = self.sksm_deferred_registrations.lock();
+        let Some(slot) = deferred.entries.iter_mut().find(|entry| {
+            entry.is_some_and(|registration| registration.configure_pair == configure_pair)
+        }) else {
+            return false;
+        };
+        *slot = None;
+        true
+    }
+
+    /// Replay only complete queue registrations after the graphics cores are
+    /// powered. Transient AddKicks/disable traffic stays in the older generic
+    /// diagnostic buffer and cannot consume or reorder registration slots.
+    /// An entry remains pending unless both its configure and enable pairs
+    /// have reached the port successfully.
+    pub(crate) fn g17p_replay_deferred_sksm_registrations(&self) -> Result<usize> {
+        if !self.g17p_sksm_port_powered() {
+            return Err(EAGAIN);
+        }
+
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let _fifo_guard = self.sksm_fifo.lock();
+        let mut deferred = self.sksm_deferred_registrations.lock();
+        let mut issued = 0usize;
+
+        for index in 0..deferred.entries.len() {
+            let Some(registration) = deferred.entries[index] else {
+                continue;
+            };
+            Self::g17p_sksm_publish_locked(&sgx, registration.configure_pair)?;
+            Self::g17p_sksm_publish_locked(&sgx, registration.enable_pair)?;
+            deferred.entries[index] = None;
+            issued += 1;
+        }
+        Ok(issued)
     }
 
     /// Replay every suppressed SKSM port write, once. The port lives in the
