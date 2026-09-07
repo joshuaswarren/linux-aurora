@@ -3565,10 +3565,11 @@ impl G17PManagerConstruction {
             );
             if self.render_submission_ordinal != 0 {
                 let parameter_page_list_vas = self.resources.parameter_buffer_page_list_vas();
-                self.render_storage
-                    .as_mut()
-                    .ok_or(ENODEV)?
-                    .restage_command(
+                let storage = self.render_storage.as_mut().ok_or(ENODEV)?;
+                storage
+                    .rebase_empty_queue_cursors(self.render_submission_ordinal)
+                    .map_err(|error| Self::render_stage_fail("rebase-new-vm-queue", error))?;
+                storage.restage_command(
                         dev,
                         self.resources.uat(),
                         vm,
