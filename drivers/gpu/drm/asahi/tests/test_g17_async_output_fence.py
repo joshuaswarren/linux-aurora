@@ -31,6 +31,13 @@ install = block('    fn install_output_fences(')
 guard_struct = block('struct G17POutputFencePublication<')
 guard_impl = block("impl G17POutputFencePublication<'_> {")
 guard_drop = block("impl Drop for G17POutputFencePublication<'_> {")
+render_completion = block("impl G17PRenderCompletion {")
+
+complete = render_completion[render_completion.index("pub(crate) fn complete"):]
+assert complete.index("compare_exchange(0, 1") < complete.index("self.fence.signal();"), \
+    'render completion does not reject duplicate firmware notifications'
+assert complete.index("drop(self.lease.lock().take());") < complete.index("self.fence.signal();"), \
+    'render completion wakes userspace before releasing its physical slot lease'
 
 # The submit path must hand the guard to the asynchronous compute path, and the
 # asynchronous path must publish through it only after the job is enqueued.
@@ -247,6 +254,6 @@ with tempfile.TemporaryDirectory() as d:
     assert result.returncode != 0, 'the pre-fix async path passed; the test proves nothing'
     assert 'before the queued job ran' in result.stdout, result.stdout + result.stderr
 
-print('PASS production output-fence publication: a queued compute publishes the '
-      'scheduler completion fence, a refused one publishes ECANCELED, a completed '
-      'render is unchanged; the pre-fix async path reproduces the early-signal failure')
+print('PASS production output-fence publication: queued work publishes the scheduler '
+      'completion fence; render releases its slot before wake and duplicate firmware '
+      'notifications signal once')

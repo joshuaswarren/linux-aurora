@@ -443,7 +443,7 @@ struct G17PLeaseGuard {
 pub(crate) struct G17PRenderCompletion {
     fence: UserFence<G17PSubmissionFence>,
     status: Arc<crate::g17_status::VmStatus>,
-    _lease: G17PLeaseGuard,
+    lease: Arc<Mutex<Option<G17PLeaseGuard>>>,
     signalled: AtomicU32,
 }
 
@@ -453,10 +453,14 @@ impl G17PRenderCompletion {
         status: Arc<crate::g17_status::VmStatus>,
         lease: G17PLeaseGuard,
     ) -> Result<Arc<Self>> {
+        let lease = Arc::pin_init(
+            new_mutex!(Some(lease), "G17PRenderCompletion::lease"),
+            GFP_KERNEL,
+        )?;
         Ok(Arc::new(Self {
             fence,
             status,
-            _lease: lease,
+            lease,
             signalled: AtomicU32::new(0),
         }, GFP_KERNEL)?)
     }
@@ -478,6 +482,12 @@ impl G17PRenderCompletion {
             self.status.record(error.to_errno());
             self.fence.set_error(error);
         }
+        // Release the physical slot before waking userspace. The scheduler
+        // intentionally retains this completion packet until its finished
+        // fence retires; tying lease Drop to packet Drop lets the woken client
+        // race ahead, take the other slot and collide with this VM's fixed
+        // render-state aliases.
+        drop(self.lease.lock().take());
         self.fence.signal();
     }
 }
