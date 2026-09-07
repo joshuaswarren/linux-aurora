@@ -3367,25 +3367,6 @@ impl G17PManagerConstruction {
         }
     }
 
-    /// Verify the bytes firmware will consume all name the VM's bound render
-    /// context. Native's one-context captures make these identities equal;
-    /// accepting a descriptor/tag-15 split would recreate the context-1 VDM
-    /// fault that this guard is intended to stop before outer publication.
-    fn validate_render_context_identity(
-        &mut self,
-        tiling: bool,
-        header: g17_resources::G17PRenderConfigUpdateHeader,
-    ) -> Result {
-        let storage = self.render_storage.as_mut().ok_or(ENODEV)?;
-        let expected = u32::from(storage.render_root_slot());
-        let descriptors = storage.descriptor_context_ids()?;
-        let descriptor = descriptors[if tiling { 0 } else { 1 }];
-        if descriptor != expected || u32::from(header.context_id) != expected {
-            return Err(EFAULT);
-        }
-        Ok(())
-    }
-
     /// Commit firmware ownership only after the complete inner and outer
     /// channel publication succeeded. This is intentionally infallible: once
     /// the producer is visible to firmware, host state must describe it.
@@ -3778,6 +3759,7 @@ impl G17PManagerConstruction {
         registers: &regs::Resources,
     ) -> Result<g17_submission::PreparedG17PPartialOpeningWorkPair> {
         self.select_render_slot(queue_pair.slot())?;
+        let descriptor_context_id = execution_context.context_id() as u16;
         if self.render_tracker.is_some() || self.render_hardware_buffer_id.is_some() {
             return Err(EBUSY);
         }
@@ -3838,6 +3820,7 @@ impl G17PManagerConstruction {
             vm,
             queue_pair,
             execution_context,
+            descriptor_context_id,
             &command,
             parameter_buffer_token,
             user_timestamps,
@@ -3863,6 +3846,7 @@ impl G17PManagerConstruction {
         vm: &mmu::Vm,
         queue_pair: g17_resources::G17PRenderQueuePair,
         execution_context: Arc<mmu::T8140ComputeExecutionContext>,
+        descriptor_context_id: u16,
         command: &g17_uapi::TranslatedRenderCommand,
         parameter_buffer_token: u64,
         user_timestamps: [u64; 4],
@@ -3951,14 +3935,6 @@ impl G17PManagerConstruction {
             )
             .map_err(|_| Self::render_stage_fail("render-root-slot-width", EIO))?
         };
-        // Native's single-client captures carry one application-GART context
-        // identity through the command descriptors and both tag-15 records.
-        // The bind pool made those fields follow the logical queue's separate
-        // compute context instead, while the render VM itself lived in this
-        // slot. That split routed a fresh qid2/3 graph back through opening
-        // context 1 and faulted its otherwise-mapped VDM stream. Keep render's
-        // firmware-visible context identity exactly slot-relative.
-        let descriptor_context_id = u16::from(render_root_slot);
         if let Some(bind) = fresh_root_bind.as_ref() {
             // Diagnostic override only: with an explicit selector of 2 or 3
             // the driver mirrors the bound roots into that TTBAT slot rather
@@ -4177,10 +4153,6 @@ impl G17PManagerConstruction {
             .as_ref()
             .and_then(|publication| publication.config_update_header());
         let (fragment_install, tiling_install) = if render_sksm != 0 {
-            self.validate_render_context_identity(false, fragment_header)
-                .map_err(|error| {
-                    Self::render_stage_fail("validate-fragment-context-identity", error)
-                })?;
             let fragment = self
                 .validate_render_firmware_install(false, fragment_header.install)
                 .map_err(|error| {
@@ -4188,9 +4160,6 @@ impl G17PManagerConstruction {
                 })?;
             let tiling = tiling_header
                 .map(|header| {
-                    self.validate_render_context_identity(true, header).map_err(|error| {
-                        Self::render_stage_fail("validate-tiling-context-identity", error)
-                    })?;
                     self.validate_render_firmware_install(true, header.install).map_err(|error| {
                         Self::render_stage_fail("validate-tiling-tag15-install", error)
                     })
@@ -5266,10 +5235,6 @@ impl G17PManagerConstruction {
             .ok_or(ENODEV)?
             .fragment_config_update_header()
             .map_err(|error| Self::render_stage_fail("split-decode-fragment-tag15", error))?;
-        self.validate_render_context_identity(false, fragment_header)
-            .map_err(|error| {
-                Self::render_stage_fail("split-validate-fragment-context", error)
-            })?;
         let fragment_install = self
             .validate_render_firmware_install(false, fragment_header.install)
             .map_err(|error| Self::render_stage_fail("split-validate-fragment-install", error))?;
@@ -5348,10 +5313,6 @@ impl G17PManagerConstruction {
         let tiling_header = late_tiling
             .config_update_header()
             .ok_or_else(|| Self::render_stage_fail("native-decode-tiling-tag15", EINVAL))?;
-        self.validate_render_context_identity(true, tiling_header)
-            .map_err(|error| {
-                Self::render_stage_fail("native-validate-tiling-context", error)
-            })?;
         let tiling_install = self
             .validate_render_firmware_install(true, tiling_header.install)
             .map_err(|error| Self::render_stage_fail("native-validate-tiling-install", error))?;
