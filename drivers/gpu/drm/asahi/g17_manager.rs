@@ -1738,14 +1738,18 @@ impl G17PManagerConstruction {
             .map_err(|_| EINVAL)?;
 
         #[cfg(CONFIG_DEV_COREDUMP)]
-        let trace_capture = match G17PTraceDump::new(&mut resources) {
-            Ok(capture) => Some(capture),
-            Err(error) => {
-                // Evidence collection must not turn memory pressure into a
-                // GPU execution failure. This absence is explicit in the log.
-                dev_warn!(dev.as_ref(), "G17P binary capture unavailable: {:?}\n", error);
-                None
+        let trace_capture = if *module_parameters::g17p_binary_capture.value() != 0 {
+            match G17PTraceDump::new(&mut resources) {
+                Ok(capture) => Some(capture),
+                Err(error) => {
+                    // Evidence collection must not turn memory pressure into a
+                    // GPU execution failure. This absence is explicit in the log.
+                    dev_warn!(dev.as_ref(), "G17P binary capture unavailable: {:?}\n", error);
+                    None
+                }
             }
+        } else {
+            None
         };
 
         // Keep the complete manager value off the probe task's stack.  The
@@ -5416,29 +5420,95 @@ impl G17PManagerConstruction {
     ) -> Result<G17PRenderPollOutcome> {
         {
             fence(Ordering::Acquire);
-            let state = self.render_storage.as_mut().ok_or(ENODEV)?.snapshot()?;
+            let mut state = self.render_storage.as_mut().ok_or(ENODEV)?.snapshot()?;
             // B1 unlinks EventControl only after its completed count reaches
             // its own submitted-count slot (168d0, KTrace 0x10b/0x10d).
             // Queue retirement and timestamps do not authorize host writes
             // to this firmware-owned list. Keep polling until it is empty.
-            let tracker = self.render_tracker.as_mut().ok_or(ENODEV)?;
+            let tracker = self.render_tracker.as_ref().ok_or(ENODEV)?;
             let window = g17_resources::g17p_render_completion_window(self.render_submission_ordinal)?;
             if window.target() != tracker.tiling_prefix || window.target() != tracker.fragment_prefix {
-                return Err(EINVAL);
+                dev_err!(
+                    self.resources.dev().as_ref(),
+                    "G17P render completion: ordinal {} window target {} disagrees with tracker TA/3D {}/{}\n",
+                    self.render_submission_ordinal,
+                    window.target(),
+                    tracker.tiling_prefix,
+                    tracker.fragment_prefix,
+                );
+                return Ok(G17PRenderPollOutcome::Retry);
             }
-            let completion = g17_completion::observe_paired_render_window(
-                window,
-                tracker.tiling_previous,
-                state.tiling,
-                tracker.fragment_previous,
-                state.fragment,
+            let tiling_previous = tracker.tiling_previous;
+            let fragment_previous = tracker.fragment_previous;
+            let execution = |state: &g17_resources::G17PUserRenderQueueState| {
                 g17_completion::RenderExecutionState {
                     job_list_empty: state.job_list_empty,
                     tiling_timestamps: state.tiling_timestamps,
                     fragment_timestamps: state.fragment_timestamps,
-                },
-            )
-            .map_err(|_| EINVAL)?;
+                }
+            };
+            let observe = |state: &g17_resources::G17PUserRenderQueueState| {
+                g17_completion::observe_paired_render_window(
+                    window,
+                    tiling_previous,
+                    state.tiling,
+                    fragment_previous,
+                    state.fragment,
+                    execution(state),
+                )
+            };
+            let completion = match observe(&state) {
+                Ok(completion) => completion,
+                Err(first_error) => {
+                    // The six producer/consumer words are firmware-owned and
+                    // sampled separately.  An event edge can therefore catch
+                    // one cache line before the paired line becomes visible.
+                    // Retry one immediate DRAM snapshot; this is bounded edge
+                    // handling, not a completion poll or a steady-state timer.
+                    fence(Ordering::Acquire);
+                    let retry = self
+                        .render_storage
+                        .as_mut()
+                        .ok_or(ENODEV)?
+                        .snapshot()?;
+                    match observe(&retry) {
+                        Ok(completion) => {
+                            state = retry;
+                            completion
+                        }
+                        Err(second_error) => {
+                            dev_err!(
+                                self.resources.dev().as_ref(),
+                                "G17P render completion: ordinal {} target {} rejected two snapshots ({:?}/{:?}); previous TA {}/{}/{} 3D {}/{}/{} first TA {}/{}/{} 3D {}/{}/{} retry TA {}/{}/{} 3D {}/{}/{}\n",
+                                self.render_submission_ordinal,
+                                window.target(),
+                                first_error,
+                                second_error,
+                                tiling_previous.done,
+                                tiling_previous.read,
+                                tiling_previous.write,
+                                fragment_previous.done,
+                                fragment_previous.read,
+                                fragment_previous.write,
+                                state.tiling.done,
+                                state.tiling.read,
+                                state.tiling.write,
+                                state.fragment.done,
+                                state.fragment.read,
+                                state.fragment.write,
+                                retry.tiling.done,
+                                retry.tiling.read,
+                                retry.tiling.write,
+                                retry.fragment.done,
+                                retry.fragment.read,
+                                retry.fragment.write,
+                            );
+                            return Ok(G17PRenderPollOutcome::Retry);
+                        }
+                    }
+                }
+            };
+            let tracker = self.render_tracker.as_mut().ok_or(ENODEV)?;
             tracker.tiling_previous = state.tiling;
             tracker.fragment_previous = state.fragment;
             if completion.complete {

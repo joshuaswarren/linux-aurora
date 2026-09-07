@@ -146,9 +146,13 @@ kernel::module_platform_driver! {
             default: 0,
             description: "Optional firmware trace class mask at status_a+0x00 on both roles. Disabled by default for normal asynchronous execution: the trace rings require their own consumer and must not backpressure GPU completion. Nonzero is an explicit diagnostic mode; submission/progress classes are0/1/9.",
         },
+        g17p_binary_capture: u32 {
+            default: 0,
+            description: "Allocate and export the first-render G17TRC01 binary capture through devcoredump. Disabled by default because the evidence arena is 12 MiB; fault crashlogs and ordinary failure diagnostics are unaffected. 1: explicit capture run.",
+        },
         g17p_fw_ktrace_verbose: u32 {
-            default: 1,
-            description: "Print every KTrace record instead of only the submission-path codes (0x41/0x46/0x4b/0x57/0x0a/0x0c/0x0e/0x20 and the 0x11c lost marker). Default 1 while G17P graphics bring-up needs the otherwise-hidden 0x1c/0x1f/0x60 admission-path witnesses.",
+            default: 0,
+            description: "Print every KTrace record instead of only the bounded submission-path codes. KTrace collection itself remains controlled by g17p_fw_trace and disabled by default; set this only for an explicit trace run.",
         },
         g17p_fw_ktrace_budget: u32 {
             default: 32,

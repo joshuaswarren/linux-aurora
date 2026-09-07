@@ -15,6 +15,7 @@ from pathlib import Path
 import subprocess, tempfile
 
 source = (Path(__file__).resolve().parents[1] / 'g17_drm.rs').read_text()
+live_source = (Path(__file__).resolve().parents[1] / 'g17_live_boot.rs').read_text()
 
 
 def block(marker):
@@ -38,6 +39,18 @@ assert complete.index("compare_exchange(0, 1") < complete.index("self.fence.sign
     'render completion does not reject duplicate firmware notifications'
 assert complete.index("drop(self.lease.lock().take());") < complete.index("self.fence.signal();"), \
     'render completion wakes userspace before releasing its physical slot lease'
+
+# The finite scheduler timeout is the only non-event completion fallback. It
+# must inspect final device state before consuming the once-only settlement
+# gate, so an early event at a stamp rollover cannot become device loss.
+timeout_start = live_source.index("    pub(crate) fn timeout_deferred_render(")
+timeout_end = live_source.index("    pub(crate) fn abandon_deferred_render(", timeout_start)
+timeout = live_source[timeout_start:timeout_end]
+assert timeout.index("self.poll_deferred_render_completion(render_slot)") \
+    < timeout.index("self.render_fence_state.settle(render_slot)"), \
+    'watchdog consumes the settlement gate before its final completion observation'
+assert "signal.complete(Ok(observed));" in timeout, \
+    'watchdog cannot salvage a completion that became visible after the event edge'
 
 # The submit path must hand the guard to the asynchronous compute path, and the
 # asynchronous path must publish through it only after the job is enqueued.

@@ -3837,6 +3837,42 @@ impl G17PLiveRuntime {
         submission_id: u64,
         error: Error,
     ) {
+        // A firmware event can precede visibility of the final paired queue
+        // cache lines. Recheck once at the scheduler's existing watchdog
+        // boundary before declaring the device lost. This is not a polling
+        // completion path: ordinary retirement remains event-driven, and the
+        // watchdog supplies the sole bounded lost-event fallback.
+        match self.poll_deferred_render_completion(render_slot) {
+            Ok(Some(observed)) => {
+                if self.render_fence_state.settle(render_slot) {
+                    let Some(signal) = self.pending_render
+                        .get_mut(render_slot as usize)
+                        .and_then(Option::take) else { return; };
+                    if let Some(pdev) = self.pdev.as_ref() {
+                        dev_warn!(
+                            pdev.as_ref(),
+                            "G17P render: watchdog recovered completed submission {} slot {} after an early firmware event\n",
+                            submission_id,
+                            render_slot,
+                        );
+                    }
+                    signal.complete(Ok(observed));
+                }
+                return;
+            }
+            Ok(None) => {}
+            Err(observe_error) => {
+                if let Some(pdev) = self.pdev.as_ref() {
+                    dev_warn!(
+                        pdev.as_ref(),
+                        "G17P render: final watchdog observation for submission {} slot {} failed ({:?})\n",
+                        submission_id,
+                        render_slot,
+                        observe_error,
+                    );
+                }
+            }
+        }
         if self.render_fence_state.settle(render_slot) {
             let Some(signal) = self.pending_render
                 .get_mut(render_slot as usize)
