@@ -807,6 +807,12 @@ impl G17PQueue {
     /// render vs compute vs attachment-set, sizes and barriers -- so a
     /// submission that dies before the parse loop is still identifiable.
     fn log_cmdbuf_headers(submission_id: u64, raw: &[u8]) {
+        // Every line inside is already gated, but the walk itself ran on every
+        // submission to produce nothing. Leave the whole thing out of the
+        // steady-state path.
+        if !crate::util::g17p_verbose() {
+            return;
+        }
         let mut offset = 0usize;
         let mut index = 0u32;
         while offset + g17_uapi::UAPI_COMMAND_HEADER_SIZE <= raw.len() {
@@ -886,8 +892,10 @@ impl G17PQueue {
         // the fence that signals when the GPU has actually run it.
         publication.publish_async(&finished);
         self.last_async_compute = Some(finished);
-        pr_info!("G17P async submit: QUEUED submission {} owner={} qid={} context={}\n",
-            submission_id, self.id, backend.hardware_queue, backend.context.context_id());
+        if crate::util::g17p_verbose() {
+            pr_info!("G17P async submit: QUEUED submission {} owner={} qid={} context={}\n",
+                submission_id, self.id, backend.hardware_queue, backend.context.context_id());
+        }
         Ok(())
     }
 
