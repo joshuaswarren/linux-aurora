@@ -499,7 +499,18 @@ impl Drop for G17PQueue {
     fn drop(&mut self) {
         // Entity teardown handles pending scheduler jobs before the frontend
         // reference goes away. Active hardware packets are retained by runtime.
+        //
+        // Do not leave async ownership release to G17PAsyncQueueBackend::drop:
+        // DRM scheduler teardown may retain that Arc past the file/queue close
+        // boundary.  An idle queue would then pin its QID and execution context
+        // even though no DRM file still owns the render node, forcing the next
+        // client onto a needlessly fresh hardware queue.  Release explicitly
+        // after the entity is torn down; the backend's later Drop is idempotent.
         drop(self.async_scheduler.take());
+        self.runtime
+            .mutex()
+            .lock()
+            .release_async_compute_queue(self.id);
         drop(self.async_backend.take());
         self.runtime.release_compute_owner(self.id);
         self.registry.release_queue();
