@@ -3081,8 +3081,10 @@ pub(crate) struct G17PUserRenderStorage {
     descriptor_3d_render: G17PRenderClientAlias,
     ta_context: MappedObject,
     ta_context_low: mmu::KernelMapping,
+    _ta_context_global: mmu::KernelMapping,
     fragment_context: MappedObject,
     fragment_context_low: mmu::KernelMapping,
+    _fragment_context_global: mmu::KernelMapping,
     graph: MappedObject,
     support: MappedObject,
     render_state: MappedObject,
@@ -5743,6 +5745,18 @@ impl G17PUserRenderStorage {
                 return Err(error);
             }
         };
+        // The SKSM queue consumer is a device-global requestor and reports
+        // these reads against context 0 even though the submitted TA command
+        // itself executes in the job's application context.  Retain both
+        // presentations of the same queue backing.
+        let ta_context_global = bootstrap_stage!(
+            "TA context global alias",
+            ta_context.map_alias_at(
+                uat.kernel_lower_vm(),
+                ta_context_low_va,
+                render_peer_prot,
+            )
+        );
         let mut fragment_context = bootstrap_stage!(
             "3D context allocation",
             MappedObject::new_wc(
@@ -5775,6 +5789,14 @@ impl G17PUserRenderStorage {
                 return Err(error);
             }
         };
+        let fragment_context_global = bootstrap_stage!(
+            "3D context global alias",
+            fragment_context.map_alias_at(
+                uat.kernel_lower_vm(),
+                fragment_context_low_va,
+                render_peer_prot,
+            )
+        );
 
         // Queue items name firmware-high descriptors, while descriptor self
         // pointers resolve through this job's application GART. Native's
@@ -6677,8 +6699,10 @@ impl G17PUserRenderStorage {
             descriptor_3d_render: descriptor_3d_render_info,
             ta_context,
             ta_context_low,
+            _ta_context_global: ta_context_global,
             fragment_context,
             fragment_context_low,
+            _fragment_context_global: fragment_context_global,
             graph,
             support,
             render_state,
