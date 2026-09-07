@@ -121,6 +121,17 @@ impl G17PRuntimeRef {
         let mut polls = 0u32;
         let mut late_sksm_done = *module_parameters::g17p_late_sksm.value() == 0;
         loop {
+            if !late_sksm_done {
+                match self
+                    .mutex()
+                    .lock()
+                    .replay_deferred_render_sksm_registrations()
+                {
+                    Ok(_) => late_sksm_done = true,
+                    Err(error) if error == EAGAIN => {}
+                    Err(error) => return Err(error),
+                }
+            }
             let completion = self
                 .mutex()
                 .lock()
@@ -135,27 +146,6 @@ impl G17PRuntimeRef {
                 } else {
                     Err(EIO)
                 };
-            }
-            // Render used to stash pre-power QID configuration forever: the
-            // late-SKSM diagnostic was reachable only from compute's polling
-            // path. When explicitly enabled, retry from this render poll; the
-            // register helper returns EAGAIN until the powered read-path
-            // predicate says the tag/data aperture is decoded.
-            if !late_sksm_done {
-                match self.mutex().lock().replay_deferred_render_sksm() {
-                    Ok(issued) => {
-                        pr_info!(
-                            "G17P render: late SKSM replay issued {} deferred pair(s)\n",
-                            issued,
-                        );
-                        late_sksm_done = true;
-                    }
-                    Err(error) if error == EAGAIN => {}
-                    Err(error) => {
-                        pr_warn!("G17P render: late SKSM replay failed ({:?})\n", error);
-                        late_sksm_done = true;
-                    }
-                }
             }
             if started.elapsed().as_nanos() >= deadline_ns {
                 break;

@@ -6102,7 +6102,8 @@ impl G17PManagerConstruction {
         );
 
         fence(Ordering::SeqCst);
-        registers.g17p_sksm_configure_queue(queue.configure_pair, queue.enable_pair)?;
+        let _issued =
+            registers.g17p_sksm_configure_queue(queue.configure_pair, queue.enable_pair)?;
         queue.hardware_state = G17PSksmQueueHardwareState::HardwareRegistered;
         Ok(())
     }
@@ -6121,6 +6122,10 @@ impl G17PManagerConstruction {
             return Ok(());
         }
 
+        if registers.g17p_cancel_deferred_sksm_registration(queue.configure_pair) {
+            queue.hardware_state = G17PSksmQueueHardwareState::PreparedMemory;
+            return Ok(());
+        }
         registers.g17p_sksm_publish_write_pair(queue.disable_pair)?;
         queue.hardware_state = G17PSksmQueueHardwareState::PreparedMemory;
         Ok(())
