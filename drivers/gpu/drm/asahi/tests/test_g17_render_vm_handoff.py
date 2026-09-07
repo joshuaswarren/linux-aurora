@@ -21,6 +21,7 @@ def function(source, marker):
 
 handoff = function(manager, "pub(crate) fn handoff_retained_render_vm(")
 assert handoff.index("self.require_retired_render_owner()?") < handoff.index("self.render_storage = None")
+assert handoff.index("self.render_bind = None") < handoff.index("self.render_storage = None")
 assert "install_t8140_native_context_aliases" not in handoff
 assert "incoming VM builds a new root" in handoff
 

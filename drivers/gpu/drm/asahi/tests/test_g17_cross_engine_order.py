@@ -2,7 +2,20 @@
 from pathlib import Path
 
 
-source = (Path(__file__).resolve().parents[1] / "g17_drm.rs").read_text()
+root = Path(__file__).resolve().parents[1]
+source = (root / "g17_drm.rs").read_text()
+live = (root / "g17_live_boot.rs").read_text()
+async_compute = (root / "g17_async_compute.rs").read_text()
+
+
+def function(text, marker):
+    start = text.index(marker)
+    pos = text.index("{", start) + 1
+    depth = 1
+    while depth:
+        depth += (text[pos] == "{") - (text[pos] == "}")
+        pos += 1
+    return text[start:pos]
 
 assert "last_async_compute: Option<Fence>" in source
 assert "self.last_async_compute = Some(finished);" in source
@@ -28,4 +41,9 @@ assert wait.index(".poll_deferred_render_completion(render_slot)?") < wait.index
 render_call = source[source.index(".submit_translated_render(", render_dispatch):]
 assert "lease.slot(),\n                        true," in render_call[:400]
 assert ".wait_render_slot(lease.slot())" in render_call[:1200]
+assert "release_retired_render_context" not in live
+assert "release_retired_render_context" not in async_compute
+live_render = function(live, "pub(crate) fn submit_translated_render(")
+assert "rebind_compute_queue" not in live_render
+assert "pending_compute.is_some()" not in live_render
 print("PASS: render joins its compute timeline, publishes by bounded slot, then polls with the runtime mutex released between observations")
