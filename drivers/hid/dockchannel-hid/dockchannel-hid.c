@@ -39,6 +39,12 @@
 /* Data + checksum */
 #define MAX_PKT_SIZE (0xffff + 4)
 
+/*
+ * Header byte 1 is macOS's messageType: createControlMessage stores 0x11 and
+ * createInputMessage 0x12, and parseNewBytes dispatches only those two.  Type 0
+ * is consumed, checksum-checked and dropped without complaint.
+ */
+#define DCHID_CHANNEL_NOP 0x00
 #define DCHID_CHANNEL_CMD 0x11
 #define DCHID_CHANNEL_REPORT 0x12
 
@@ -85,16 +91,33 @@ struct dchid_init_hdr {
 #define INIT_TERMINATOR		2
 #define INIT_PRODUCT_NAME	7
 
-#define CMD_RESET_INTERFACE 0x40
+/*
+ * Named from the macOS functions that build them, not from what this driver
+ * used to guess: 0x40 is setInterfacePower, 0x41 is getInterfacePower and 0x42
+ * is resetDevice.  0x42 in particular was being sent three times per start
+ * attempt under the name "query power".
+ */
+#define CMD_SET_POWER 0x40
 #define CMD_SEND_FIRMWARE 0x95
 #define CMD_ENABLE_INTERFACE 0xb4
 #define CMD_ACK_GPIO_CMD 0xa1
 #define CMD_INIT_SHARED_BUFFER 0x91
-#define CMD_POWER_REQUEST 0x41
-#define CMD_QUERY_POWER 0x42
+/*
+ * The first thing handshakeGated does, before it registers a single FIFO, is
+ * send this on the management interface: setSystemAwakeReport builds a two-byte
+ * feature report {0xC1, awake ? 2 : 1} at 0xfffffe000910f7f8.  This driver has
+ * never sent it.  Its failure is non-fatal in macOS, so it is not obviously a
+ * gate, but it is the one message that provably precedes a registration on a
+ * working host and is absent from ours.
+ */
+#define CMD_SYSTEM_AWAKE 0xc1
+#define DCHID_SYSTEM_ASLEEP 1
+#define DCHID_SYSTEM_AWAKE 2
+#define CMD_QUERY_POWER 0x41
+#define CMD_RESET_DEVICE 0x42
 
-#define DCHID_POWER_METHOD_DIRECT 1
-#define DCHID_POWER_METHOD_TRANSACTIONAL 2
+#define DCHID_POWER_FORM_PLAIN 1
+#define DCHID_POWER_FORM_PHASED 2
 #define DCHID_POWER_PHASE_WILL_CHANGE 0
 #define DCHID_POWER_PHASE_HAS_CHANGED 1
 
@@ -347,18 +370,26 @@ MODULE_PARM_DESC(command_timeout_ms,
 		 "How long to wait for a control report to be answered (macOS uses 5000)");
 
 /*
- * MTP answers a shared-FIFO registration 80us later with a well-formed but
- * completely empty packet - eight header bytes and a checksum, channel 0x00,
- * length 0 - which this driver recognised as neither of its two channels, tried
- * to parse an eight-byte sub-header out of, and threw away.  Meanwhile the
- * command that provoked it sat waiting for a reply it had already been sent.
+ * MTP sends a well-formed but completely empty packet 80us after a shared-FIFO
+ * registration - eight header bytes and a checksum, message type 0x00, length 0.
+ * It is tempting to read that as the registration's answer, and wrong:
+ * parseNewBytes tests the type byte against 0x11 and 0x12 and, for 0x00,
+ * branches straight to resetParser without dispatching and without logging an
+ * error.  A type-0 packet is a legal no-op on this transport, not a reply.
  *
- * So an unrecognised reply that arrives while a command is outstanding on that
- * interface is completed rather than discarded.  It is still logged in full,
- * because the point is to read the framing off real traffic, not to paper over
- * it: switch this off to see the raw packet without acting on it.
+ * What macOS does with it is the interesting part.  readCompletionAction calls
+ * drainSharedMemoryFifos() after every read, whatever arrived, so an empty
+ * packet is exactly what a coprocessor sends to say "look in the ring" on a
+ * transport with no dedicated doorbell.  Completing an outstanding command on
+ * one would be a false positive, so this defaults off; it stays available
+ * because proving what a bare packet does and does not carry is worth one boot.
  */
-static bool lenient_ack = true;
+static bool system_awake_report = true;
+module_param(system_awake_report, bool, 0644);
+MODULE_PARM_DESC(system_awake_report,
+		 "Send report 0xC1 {0xC1,2} before registering the shared FIFOs, as macOS does");
+
+static bool lenient_ack;
 module_param(lenient_ack, bool, 0644);
 MODULE_PARM_DESC(lenient_ack,
 		 "Complete an outstanding command on a reply whose framing this driver does not recognise");
@@ -389,6 +420,67 @@ MODULE_PARM_DESC(shared_buffer_probe,
 /* Multi-touch sensor dimensions; answered with no firmware loaded. */
 #define MT_REPORT_DIMENSIONS 0x64
 
+/*
+ * Byte 1 is not a property of the interface, it is a property of the operation.
+ * Read straight out of the message each macOS function builds:
+ *
+ *   setInterfacePower           0xfffffe000910d19c  mov w8,#0x140  -> 40 01
+ *   setInterfacePowerWillChange 0xfffffe000910d3cc  mov w8,#0x240  -> 40 02
+ *   setInterfacePowerHasChanged 0xfffffe000910d5d0  mov w8,#0x240  -> 40 02
+ *   getInterfacePower           0xfffffe000910d6a4  mov w8,#0x141  -> 41 01
+ *   resetDevice                 0xfffffe000910cfd8  mov w8,#0x142  -> 42 01
+ *
+ * So 2 belongs to the two-phase form of 0x40 and to nothing else: 0x41 and
+ * 0x42 are 1 unconditionally, on every machine, whatever the interface.  This
+ * parameter therefore only chooses the form of 0x40 - -1 lets the interface
+ * decide, 1 forces the plain four-byte set, 2 forces the two-phase bracket.
+ */
+static int power_method = -1;
+module_param(power_method, int, 0644);
+MODULE_PARM_DESC(power_method,
+		 "Form of opcode 0x40: -1 per interface, 1 plain set, 2 two-phase bracket");
+
+/*
+ * Opcode 0x42 is macOS's resetDevice, not a power query, and this driver has
+ * been sending it three times per start attempt in the belief that it was one.
+ * Keep it reachable, because it is part of the contract, but stop sending it by
+ * default until there is a reason to.
+ */
+static bool device_reset;
+module_param(device_reset, bool, 0644);
+MODULE_PARM_DESC(device_reset, "Send opcode 0x42, which resets the device");
+
+/*
+ * Run a transactional power transition on the multi-touch interface before the
+ * FIFO handshake.
+ *
+ * macOS's handshakeGated does not do this - it registers the FIFOs 100ms after
+ * the first read completion, before anything is powered - so this is not a
+ * fidelity fix but a test of the claim that MTP will not answer a registration
+ * until the interface has been through the transaction.  The two orderings
+ * cannot both be run in one boot, because the registration is a one-shot, so
+ * which one runs is a parameter.
+ */
+static bool handshake_power_transition;
+module_param(handshake_power_transition, bool, 0644);
+MODULE_PARM_DESC(handshake_power_transition,
+		 "Run a transactional power transition before registering the shared FIFOs");
+
+/*
+ * Whether that transition also drives the platform lines.
+ *
+ * OFF BY DEFAULT AND DELIBERATELY SO.  The gP13 supply and the pmIP reset are
+ * what produce "SCM peripheral device error ch 0" and "KBD set state 2 bailed"
+ * - the trackpad and the keyboard share the SCM bus, and MTP is not told to
+ * re-enumerate afterwards, so the keyboard stays down until a reboot.  With
+ * this clear the 0x40 transaction still runs end to end, MTP still sees
+ * will-change and has-changed, and nothing touches the bus the keyboard is on.
+ * Set it only for a boot where losing the keyboard is acceptable.
+ */
+static bool handshake_power_platform;
+module_param(handshake_power_platform, bool, 0644);
+MODULE_PARM_DESC(handshake_power_platform,
+		 "Let the pre-handshake power transition drive gP13 and pmIP (RISKS THE BUILT-IN KEYBOARD)");
 
 /* Never poll faster than this, whatever the parameter says. */
 #define SHMEM_POLL_MIN_MS 50
@@ -776,6 +868,9 @@ static void dchid_dump_packet(struct dockchannel_hid *dchid, struct dchid_hdr *h
 		 hdr->iface, hdr->pad, shown, (u8 *)body);
 }
 
+static int dchid_get_report_cmd(struct dchid_iface *iface, u8 reportnum,
+				void *buf, size_t len);
+
 static int dchid_cmd(struct dchid_iface *iface, u32 type, u32 req,
 		     void *data, size_t size, void *resp_buf, size_t resp_size)
 {
@@ -888,6 +983,16 @@ static bool dchid_uses_transactional_power(struct dchid_iface *iface)
 	       !strcmp(firmware_name, "apple/tpmtfw-j700.bin");
 }
 
+/* Which form of opcode 0x40 to use for this interface. */
+static u8 dchid_power_method(struct dchid_iface *iface)
+{
+	if (power_method == DCHID_POWER_FORM_PLAIN ||
+	    power_method == DCHID_POWER_FORM_PHASED)
+		return power_method;
+
+	return dchid_uses_transactional_power(iface) ?
+		DCHID_POWER_FORM_PHASED : DCHID_POWER_FORM_PLAIN;
+}
 
 /*
  * Run the power-sequence half of a multi-touch power transition.
@@ -1017,11 +1122,12 @@ static int dchid_platform_power_sequence(struct dchid_iface *iface, int state)
 	}
 }
 
-static int dchid_reset_interface(struct dchid_iface *iface, int state)
+static int dchid_reset_interface(struct dchid_iface *iface, int state,
+				 bool run_platform)
 {
 	u8 msg[] = {
-		CMD_RESET_INTERFACE,
-		DCHID_POWER_METHOD_DIRECT,
+		CMD_SET_POWER,
+		0,
 		iface->index,
 		state,
 		DCHID_POWER_PHASE_WILL_CHANGE,
@@ -1030,10 +1136,11 @@ static int dchid_reset_interface(struct dchid_iface *iface, int state)
 	ktime_t started, settled;
 	int ret;
 
-	if (!dchid_uses_transactional_power(iface))
+	msg[1] = dchid_power_method(iface);
+
+	if (msg[1] != DCHID_POWER_FORM_PHASED)
 		return dchid_comm_cmd(iface->dchid, msg, 4);
 
-	msg[1] = DCHID_POWER_METHOD_TRANSACTIONAL;
 	ret = dchid_comm_cmd(iface->dchid, msg, sizeof(msg));
 	if (ret < 0)
 		return ret;
@@ -1047,17 +1154,20 @@ static int dchid_reset_interface(struct dchid_iface *iface, int state)
 	 * than assumed.
 	 */
 	started = ktime_get();
-	ret = dchid_platform_power_sequence(iface, state);
-	if (ret < 0)
-		return ret;
+	if (run_platform) {
+		ret = dchid_platform_power_sequence(iface, state);
+		if (ret < 0)
+			return ret;
+	}
 	settled = ktime_get();
 
 	msg[4] = DCHID_POWER_PHASE_HAS_CHANGED;
 	ret = dchid_comm_cmd(iface->dchid, msg, sizeof(msg));
 
 	dev_info(iface->dchid->dev,
-		 "Power transition %s state=%d: platform=%lldus has-changed=%lldus ret=%d\n",
-		 iface->name, state, ktime_us_delta(settled, started),
+		 "Power transition %s state=%d: platform=%s %lldus has-changed=%lldus ret=%d\n",
+		 iface->name, state, run_platform ? "run" : "skipped",
+		 ktime_us_delta(settled, started),
 		 ktime_us_delta(ktime_get(), settled), ret);
 
 	return ret;
@@ -1279,7 +1389,7 @@ static bool dchid_adopt_preinitialized_ipd_functions(struct dchid_iface *iface)
  */
 static void dchid_query_power_state(struct dchid_iface *iface, const char *when)
 {
-	u8 msg[] = { CMD_QUERY_POWER, DCHID_POWER_METHOD_DIRECT, iface->index, 0 };
+	u8 msg[] = { CMD_QUERY_POWER, 1, iface->index, 0 };
 	u8 resp[16] = {};
 	int ret;
 
@@ -1289,7 +1399,20 @@ static void dchid_query_power_state(struct dchid_iface *iface, const char *when)
 	ret = dchid_cmd(iface->dchid->comm, HID_FEATURE_REPORT, REQ_SET_REPORT,
 			msg, sizeof(msg), resp, sizeof(resp));
 
-	dev_info(iface->dchid->dev, "Power query %s %s: ret=%d resp=%*ph\n",
+	dev_info(iface->dchid->dev,
+		 "Power query %s %s: set ret=%d resp=%*ph\n",
+		 iface->name, when, ret, (int)sizeof(resp), resp);
+
+	/*
+	 * getInterfacePower sets 0x41 and then reads the same report back; only
+	 * the read carries the answer.
+	 */
+	memset(resp, 0, sizeof(resp));
+	ret = dchid_get_report_cmd(iface->dchid->comm, CMD_QUERY_POWER,
+				   resp, sizeof(resp));
+
+	dev_info(iface->dchid->dev,
+		 "Power query %s %s: get ret=%d resp=%*ph\n",
 		 iface->name, when, ret, (int)sizeof(resp), resp);
 }
 
@@ -1306,8 +1429,8 @@ static void dchid_query_power_state(struct dchid_iface *iface, const char *when)
 static void dchid_power_request(struct dchid_iface *iface, int state)
 {
 	u8 msg[] = {
-		CMD_POWER_REQUEST,
-		DCHID_POWER_METHOD_DIRECT,
+		CMD_SET_POWER,
+		DCHID_POWER_FORM_PLAIN,
 		iface->index,
 		state,
 	};
@@ -1317,7 +1440,7 @@ static void dchid_power_request(struct dchid_iface *iface, int state)
 		return;
 
 	ret = dchid_comm_cmd(iface->dchid, msg, sizeof(msg));
-	dev_info(iface->dchid->dev, "Power request %s state=%d: ret=%d\n",
+	dev_info(iface->dchid->dev, "Power set %s state=%d: ret=%d\n",
 		 iface->name, state, ret);
 }
 
@@ -1430,9 +1553,6 @@ static void dchid_shmem_poll_work(struct work_struct *ws)
 				   msecs_to_jiffies(shmem_poll_interval()));
 }
 
-static int dchid_get_report_cmd(struct dchid_iface *iface, u8 reportnum,
-				void *buf, size_t len);
-
 static struct dchid_iface *dchid_find_iface(struct dockchannel_hid *dchid,
 					   const char *name)
 {
@@ -1465,6 +1585,60 @@ static void dchid_probe_command_channel(struct dockchannel_hid *dchid,
 }
 
 /*
+ * Put the multi-touch interface through a transactional power transition before
+ * the FIFO handshake.
+ *
+ * The transaction and the platform sequence are separable, and separating them
+ * is the point: will-change and has-changed are messages to MTP, while gP13 and
+ * pmIP are writes to a bus the built-in keyboard is also on.  Running the first
+ * without the second asks whether MTP wants to have been told about a power
+ * transition, without asking the keyboard to pay for the answer.
+ */
+static void dchid_handshake_power(struct dockchannel_hid *dchid)
+{
+	struct dchid_iface *iface;
+	int ret;
+
+	if (!handshake_power_transition)
+		return;
+
+	iface = dchid_find_iface(dchid, "multi-touch");
+	if (!iface) {
+		dev_warn(dchid->dev,
+			 "No multi-touch interface to power up before the handshake\n");
+		return;
+	}
+
+	if (handshake_power_platform) {
+		dev_warn(dchid->dev,
+			 "Pre-handshake transition will drive gP13 and pmIP; the built-in keyboard shares that bus and MTP is not told to re-enumerate\n");
+		ret = dchid_request_afe_reset(iface);
+		if (ret < 0) {
+			dev_err(dchid->dev,
+				"No AFE supply line, not running the platform sequence: %d\n",
+				ret);
+			return;
+		}
+	}
+
+	dchid_query_power_state(iface, "before transition");
+
+	ret = dchid_reset_interface(iface, DCHID_POWER_STATE_OFF,
+				    handshake_power_platform);
+	if (ret < 0)
+		dev_err(dchid->dev, "Pre-handshake power off failed: %d\n", ret);
+
+	ret = dchid_reset_interface(iface, DCHID_POWER_STATE_ON,
+				    handshake_power_platform);
+	if (ret < 0)
+		dev_err(dchid->dev, "Pre-handshake power on failed: %d\n", ret);
+
+	dchid_query_power_state(iface, "after transition");
+	dchid_power_request(iface, DCHID_POWER_STATE_ON);
+	dchid_query_power_state(iface, "after request");
+}
+
+/*
  * The transport handshake, as AppleHIDTransportProtocolSCMFIFO::handshakeGated
  * performs it: the shared-memory FIFOs are handed to MTP once, on the
  * management interface, before any HID interface has been started, and only
@@ -1494,6 +1668,14 @@ static void dchid_handshake_work(struct work_struct *ws)
 	}
 
 	dchid_probe_command_channel(dchid, "before handshake");
+	dchid_handshake_power(dchid);
+
+	if (system_awake_report) {
+		u8 msg[] = { CMD_SYSTEM_AWAKE, DCHID_SYSTEM_AWAKE };
+		int awake = dchid_comm_cmd(dchid, msg, sizeof(msg));
+
+		dev_info(dchid->dev, "System awake report: ret=%d\n", awake);
+	}
 
 	dev_info(dchid->dev,
 		 "Transport handshake: registering %u shared FIFO(s) of %u bytes\n",
@@ -1673,10 +1855,10 @@ static int dchid_start_interface(struct dchid_iface *iface)
 		/* After loading firmware, multi-touch needs a reset */
 		dev_info(iface->dchid->dev, "Resetting %s\n", iface->name);
 		dchid_query_power_state(iface, "before-cycle");
-		ret = dchid_reset_interface(iface, DCHID_POWER_STATE_OFF);
+		ret = dchid_reset_interface(iface, DCHID_POWER_STATE_OFF, true);
 		if (ret < 0)
 			goto err;
-		ret = dchid_reset_interface(iface, DCHID_POWER_STATE_ON);
+		ret = dchid_reset_interface(iface, DCHID_POWER_STATE_ON, true);
 		if (ret < 0)
 			goto err;
 		dchid_query_power_state(iface, "after-cycle");
@@ -2382,9 +2564,24 @@ static void dchid_handle_packet(void *cookie, size_t avail)
 			goto done;
 		case DCHID_CHANNEL_REPORT:
 			break;
+		case DCHID_CHANNEL_NOP:
+			/*
+			 * Not an error and not a reply.  On macOS every read
+			 * completion drains the shared FIFOs regardless of what
+			 * arrived, so this is the nearest thing the transport
+			 * has to a doorbell - which makes the state of the ring
+			 * at this instant the only sample worth having.
+			 */
+			dchid_dump_packet(dchid, &hdr, dchid->pkt_buf,
+					  "No-op packet");
+			dchid_dump_shmem(dchid, false);
+			if (lenient_ack && iface->out_report != -1)
+				dchid_complete_bare(iface, &hdr,
+						    "No-op taken as a reply");
+			goto done;
 		default:
 			dchid_dump_packet(dchid, &hdr, dchid->pkt_buf,
-					  "Unknown channel");
+					  "Unknown message type");
 			/*
 			 * An empty packet could as easily be a doorbell saying
 			 * the shared FIFOs have something in them as it could
