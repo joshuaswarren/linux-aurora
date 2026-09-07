@@ -1232,9 +1232,21 @@ fn apply_g17p_initial_command_pointer(
 /// opening. Descriptor-local pointer fields are installed separately by
 /// `apply_g17p_retained_descriptor_fields`; the 3D RCE mirrors are then
 /// replaced with their app-GART program addresses.
+///
+/// The four "descriptor zero" pointers are the records' per-stamp DVAs: one
+/// u32 lane per KSM stamp slot in the shared A (GPU and firmware) and B
+/// (firmware-private) pages, indexed by the record's OWN queue ID. Valid
+/// native captures place 3D queues 1/3/8/10 at +0x04/+0x0c/+0x20/+0x28 and
+/// the TA queue 9 -- queue 10's own pair partner -- at +0x24. The TA lane used
+/// to be written with no index at all, which is lane 0: right for TA QID 0,
+/// hence for every single-client render, and wrong for the second bounded
+/// pair, whose TA (QID 2) then named the live stamp lane of the first pair's
+/// tiler. Measured 2026-09-07: that pair's tiler was retired without executing
+/// on every submission while the first pair kept rendering.
 fn apply_g17p_generic_descriptor_tail(
     tiling: &mut [u8],
     fragment: &mut [u8],
+    tiling_queue_id: u16,
     fragment_queue_id: u16,
     ta_status_high: u64,
     fragment_status_low: u64,
@@ -1245,11 +1257,11 @@ fn apply_g17p_generic_descriptor_tail(
     fragment.get(0x2140..0x2150)?;
     fragment.get(0x21d7..0x21e7)?;
 
-    put_u64(tiling, 0x08a6, G17P_BOOTSTRAP_DESCRIPTOR_ZERO_A_VA);
-    put_u64(tiling, 0x08ae, G17P_BOOTSTRAP_DESCRIPTOR_ZERO_B_VA);
+    // QID-indexed u32 lanes, not one fixed fixture offset -- for BOTH records.
+    let tiling_lane = u64::from(tiling_queue_id).checked_mul(4)?;
+    put_u64(tiling, 0x08a6, G17P_BOOTSTRAP_DESCRIPTOR_ZERO_A_VA + tiling_lane);
+    put_u64(tiling, 0x08ae, G17P_BOOTSTRAP_DESCRIPTOR_ZERO_B_VA + tiling_lane);
     put_u64(tiling, 0x0945, ta_status_high);
-    // These are QID-indexed u32 lanes, not one fixed fixture offset. Valid
-    // native captures map QID 1/3/8/9 to +0x04/+0x0c/+0x20/+0x24.
     let queue_lane = u64::from(fragment_queue_id).checked_mul(4)?;
     put_u64(fragment, 0x2140, G17P_BOOTSTRAP_DESCRIPTOR_ZERO_A_VA + queue_lane);
     put_u64(fragment, 0x2148, G17P_BOOTSTRAP_DESCRIPTOR_ZERO_B_VA + queue_lane);
@@ -6709,6 +6721,7 @@ impl G17PUserRenderStorage {
             apply_g17p_generic_descriptor_tail(
                 tiling,
                 fragment,
+                queue_pair.tiling,
                 queue_pair.fragment,
                 render_state_va + G17P_RENDER_STATE_TA_STATUS as u64,
                 translated.parameters.fragment_status,
@@ -6778,9 +6791,9 @@ impl G17PUserRenderStorage {
             descriptor_ta_low.iova(),
             ta_context_low.iova(),
             ta_context.iova(),
-            G17P_BOOTSTRAP_DESCRIPTOR_ZERO_A_VA,
-            G17P_BOOTSTRAP_DESCRIPTOR_ZERO_B_VA,
-            G17P_BOOTSTRAP_TA_STATUS_VA
+            G17P_BOOTSTRAP_DESCRIPTOR_ZERO_A_VA + u64::from(queue_pair.tiling) * 4,
+            G17P_BOOTSTRAP_DESCRIPTOR_ZERO_B_VA + u64::from(queue_pair.tiling) * 4,
+            render_state_va + G17P_RENDER_STATE_TA_STATUS as u64
         );
         dev_info!(
             dev.as_ref(),
@@ -6788,9 +6801,9 @@ impl G17PUserRenderStorage {
             descriptor_3d_rce_va,
             fragment_context_low.iova(),
             fragment_context.iova(),
-            G17P_BOOTSTRAP_DESCRIPTOR_ZERO_A_VA + 4,
-            G17P_BOOTSTRAP_DESCRIPTOR_ZERO_B_VA + 4,
-            G17P_BOOTSTRAP_3D_STATUS_VA
+            G17P_BOOTSTRAP_DESCRIPTOR_ZERO_A_VA + u64::from(queue_pair.fragment) * 4,
+            G17P_BOOTSTRAP_DESCRIPTOR_ZERO_B_VA + u64::from(queue_pair.fragment) * 4,
+            fragment_status.iova()
         );
 
         let tiling_queue_offset = queue_pair.record_offset(true);
@@ -7500,6 +7513,7 @@ impl G17PUserRenderStorage {
             apply_g17p_generic_descriptor_tail(
                 tiling,
                 fragment,
+                self.queue_pair.tiling,
                 self.queue_pair.fragment,
                 render_state_va + G17P_RENDER_STATE_TA_STATUS as u64,
                 translated.parameters.fragment_status,
@@ -13991,6 +14005,35 @@ impl G17ResourceOwner {
         }
     }
 
+    /// Sample the first four per-queue stamp lanes of the shared "descriptor
+    /// zero" pages -- A (GPU and firmware) and B (firmware-private) -- that the
+    /// TA/3D records point at by their own QID. DRAM only, safe after a
+    /// timeout; QIDs 0/1 belong to render pair 0 and 2/3 to pair 1.
+    pub(crate) fn render_stamp_lanes(&mut self) -> Result<[[u32; 4]; 2]> {
+        let mut lanes = [[0u32; 4]; 2];
+        for (page, object) in [
+            &mut self.resources.bootstrap_descriptor_zero_a,
+            &mut self.resources.bootstrap_descriptor_zero_b,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            object.with_bytes_mut(|bytes| {
+                for (qid, lane) in lanes[page].iter_mut().enumerate() {
+                    *lane = u32::from_le_bytes(
+                        bytes
+                            .get(qid * 4..qid * 4 + 4)
+                            .ok_or(ERANGE)?
+                            .try_into()
+                            .map_err(|_| EINVAL)?,
+                    );
+                }
+                Ok(())
+            })?;
+        }
+        Ok(lanes)
+    }
+
     pub(crate) fn parameter_buffer_page_list_vas(&self) -> [u64; 2] {
         [
             self.resources.partial_primary_index.iova(),
@@ -16846,6 +16889,7 @@ mod tests {
             apply_g17p_generic_descriptor_tail(
                 &mut tiling,
                 &mut fragment,
+                0,
                 1,
                 G17P_BOOTSTRAP_TA_STATUS_VA,
                 G17P_RENDER_FRAGMENT_STATUS_VA,
@@ -16855,6 +16899,26 @@ mod tests {
         );
         assert_eq!(get_u64(&tiling, 0x08a6), G17P_BOOTSTRAP_DESCRIPTOR_ZERO_A_VA);
         assert_eq!(get_u64(&tiling, 0x08ae), G17P_BOOTSTRAP_DESCRIPTOR_ZERO_B_VA);
+        // The second bounded pair owns its own stamp lanes: TA QID 2 at +0x08,
+        // 3D QID 3 at +0x0c, disjoint from the first pair's +0x00/+0x04.
+        let mut second_tiling = [0u8; g17_render::TA_DESCRIPTOR_SIZE];
+        let mut second_fragment = [0u8; g17_render::FRAGMENT_DESCRIPTOR_SIZE];
+        assert_eq!(
+            apply_g17p_generic_descriptor_tail(
+                &mut second_tiling,
+                &mut second_fragment,
+                2,
+                3,
+                G17P_BOOTSTRAP_TA_STATUS_VA,
+                G17P_RENDER_FRAGMENT_STATUS_VA,
+                G17P_BOOTSTRAP_3D_STATUS_VA,
+            ),
+            Some(())
+        );
+        assert_eq!(get_u64(&second_tiling, 0x08a6), G17P_BOOTSTRAP_DESCRIPTOR_ZERO_A_VA + 0x08);
+        assert_eq!(get_u64(&second_tiling, 0x08ae), G17P_BOOTSTRAP_DESCRIPTOR_ZERO_B_VA + 0x08);
+        assert_eq!(get_u64(&second_fragment, 0x2140), G17P_BOOTSTRAP_DESCRIPTOR_ZERO_A_VA + 0x0c);
+        assert_eq!(get_u64(&second_fragment, 0x2148), G17P_BOOTSTRAP_DESCRIPTOR_ZERO_B_VA + 0x0c);
         assert_eq!(get_u64(&tiling, 0x0945), G17P_BOOTSTRAP_TA_STATUS_VA);
         assert_eq!(
             get_u64(&fragment, 0x2140),
