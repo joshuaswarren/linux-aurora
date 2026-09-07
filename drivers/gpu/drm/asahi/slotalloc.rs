@@ -122,6 +122,19 @@ struct SlotAllocatorInner<T: SlotItem> {
     get_count: u64,
     drop_count: u64,
     slot_limit: usize,
+    /// Hand out the lowest free slot index instead of the least recently
+    /// released one.
+    ///
+    /// The generic LRU exists to keep a returning user on the slot whose TLB
+    /// entries are still warm, and the `SlotToken` fast path already does
+    /// that. When a slot index *names a hardware resource* -- on T8140 each
+    /// UAT slot is one TTBAT context, and the render path encodes the bound
+    /// context into the fragment MCache selector -- LRU makes which context a
+    /// VM lands on depend on the whole allocation history. Lowest-first makes
+    /// the first binder deterministically take slot 0 (hardware context 1),
+    /// which is the context the measured first-partial opening contract pins
+    /// every one of its fields to.
+    lowest_first: bool,
 }
 
 /// A single slot allocator instance.
@@ -176,6 +189,7 @@ impl<T: SlotItem> SlotAllocator<T> {
             get_count: 0,
             drop_count: 0,
             slot_limit: usize::MAX,
+            lowest_first: false,
         };
 
         let alloc = Arc::pin_init(
@@ -204,11 +218,27 @@ impl<T: SlotItem> SlotAllocator<T> {
         inner.slot_limit = limit.unwrap_or(NonZeroUsize::MAX).get();
     }
 
-    /// Gets a fresh slot, optionally reusing a previous allocation if a `SlotToken` is provided.
-    ///
-    /// Blocks if no slots are free.
-    pub(crate) fn get(&self, token: Option<SlotToken>) -> Result<Guard<T>> {
-        self.get_inner(token, |_a, _b| Ok(()))
+    /// Select the lowest free slot rather than the least recently released
+    /// one. See [`SlotAllocatorInner::lowest_first`].
+    pub(crate) fn set_lowest_first(&self, lowest_first: bool) {
+        let mut inner = self.0.inner.lock();
+        inner.lowest_first = lowest_first;
+    }
+
+    /// Snapshot which slots are currently checked out, as a bitmap over slot
+    /// indices. Diagnostics only: the answer is stale the moment it returns.
+    pub(crate) fn busy_mask(&self) -> u64 {
+        let inner = self.0.inner.lock();
+        let mut mask = 0u64;
+        for (i, slot) in inner.slots.iter().enumerate() {
+            if i >= 64 {
+                break;
+            }
+            if slot.is_none() {
+                mask |= 1u64 << i;
+            }
+        }
+        mask
     }
 
     /// Gets a fresh slot, optionally reusing a previous allocation if a `SlotToken` is provided.
@@ -248,21 +278,26 @@ impl<T: SlotItem> SlotAllocator<T> {
         let mut first = true;
         let slot = loop {
             let mut oldest_time = u64::MAX;
-            let mut oldest_slot = 0u32;
+            let mut found: Option<u32> = None;
+            let lowest_first = inner.lowest_first;
 
             for (i, slot) in inner.slots.iter().enumerate() {
                 if i >= inner.slot_limit {
                     break;
                 }
                 if let Some(slot) = slot.as_ref() {
+                    if lowest_first {
+                        found = Some(i as u32);
+                        break;
+                    }
                     if slot.drop_time < oldest_time {
-                        oldest_slot = i as u32;
+                        found = Some(i as u32);
                         oldest_time = slot.drop_time;
                     }
                 }
             }
 
-            if oldest_time == u64::MAX {
+            if found.is_none() {
                 if first && inner.slot_limit == usize::MAX {
                     pr_warn!(
                         "{}: out of slots, blocking\n",
@@ -316,7 +351,7 @@ impl<T: SlotItem> SlotAllocator<T> {
                     return Err(ERESTARTSYS);
                 }
             } else {
-                break oldest_slot;
+                break found.expect("checked above");
             }
         };
 

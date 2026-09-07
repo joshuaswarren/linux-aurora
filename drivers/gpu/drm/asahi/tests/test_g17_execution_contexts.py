@@ -72,7 +72,9 @@ tests=r'''
  let u=Uat::new();let vm=u.vm(1);FAIL_ALLOC.store(true,Ordering::Release);
  assert!(matches!(u.allocate_t8140_compute_execution_context(&vm),Err(12)));
  assert_eq!(u.inner.t8140_app_contexts.load(Ordering::Acquire),31);assert_eq!(u.roots(5),(0,0));
- let mut live=Vec::new();for id in 5..63{let c=u.allocate_t8140_compute_execution_context(&vm).unwrap();assert_eq!(c.context_id(),id);live.push(c);}
+ let first=crate::g17_queue_limits::COMPUTE_CONTEXT_FIRST;let last=first+crate::g17_queue_limits::MAX_QUEUES;
+ assert_eq!(crate::g17_queue_limits::COMPUTE_CONTEXT_MASK&crate::g17_queue_limits::BIND_CONTEXT_MASK,0);
+ let mut live=Vec::new();for id in first..last{let c=u.allocate_t8140_compute_execution_context(&vm).unwrap();assert_eq!(c.context_id(),id);live.push(c);}
  assert!(matches!(u.allocate_t8140_compute_execution_context(&vm),Err(ENOSPC)));
  drop(live);assert_eq!(u.inner.t8140_app_contexts.load(Ordering::Acquire),31);
 }

@@ -1136,6 +1136,19 @@ impl G17PRenderRootOwner {
     fn bootstrap(&self) -> Option<&mmu::VmBind> {
         match self { Self::Bootstrap(bind) => Some(bind), Self::Job { .. } => None }
     }
+
+    /// TTBAT context this owner's VM is bound to.
+    ///
+    /// The fragment MCache write-range selector names it, so a retained graph
+    /// has to keep reporting the same value across every later submission on
+    /// it -- which the retained `VmBind` guarantees.
+    fn root_slot(&self) -> Result<u8> {
+        let slot = match self {
+            Self::Bootstrap(bind) => bind.slot(),
+            Self::Job { flist_bind, .. } => flist_bind.slot(),
+        };
+        u8::try_from(slot).map_err(|_| EIO)
+    }
 }
 
 #[cfg(not(test))]
@@ -2193,6 +2206,7 @@ impl G17PManagerConstruction {
                     g17_resources::G17PRenderQueuePair::for_slot(0).ok_or(EINVAL)?,
                     None,
                     1,
+                    None,
                     &command,
                     self.num_clusters,
                     [0; 4],
@@ -2271,8 +2285,7 @@ impl G17PManagerConstruction {
             let (fragment_queue, tiling_queue) = storage.queue_gpu_vas();
             (fragment_queue, tiling_queue, previous, late_tiling)
         };
-        let (prepared, render_bind) = self.resources.publish_partial_opening_pair(
-            None,
+        let prepared = self.resources.publish_partial_opening_pair(
             true,
             g17_resources::G17PRenderQueuePair::for_slot(0).ok_or(EINVAL)?,
             g17_resources::G17PDeferredOuterPublication::None,
@@ -2284,9 +2297,6 @@ impl G17PManagerConstruction {
             || {},
             move || late_tiling.publish(),
         )?;
-        if render_bind.is_some() {
-            return Err(EINVAL);
-        }
         self.render_tracker = Some(G17PPartialOpeningRenderTracker {
             tiling_previous: previous.tiling,
             fragment_previous: previous.fragment,
@@ -2665,8 +2675,7 @@ impl G17PManagerConstruction {
         if submission.fragment_queue_write_index != 3 || submission.tiling_queue_write_index != 3 {
             return Err(EINVAL);
         }
-        let (prepared, render_bind) = self.resources.publish_partial_opening_pair(
-            None,
+        let prepared = self.resources.publish_partial_opening_pair(
             false,
             g17_resources::G17PRenderQueuePair::for_slot(0).ok_or(EINVAL)?,
             g17_resources::G17PDeferredOuterPublication::None,
@@ -2678,9 +2687,6 @@ impl G17PManagerConstruction {
             || {},
             publish_late_tiling_state,
         )?;
-        if render_bind.is_some() {
-            return Err(EINVAL);
-        }
         if prepared.paired_doorbell != g17_submission::G17P_PARTIAL_OPENING_PAIRED_DOORBELL
             || prepared.paired_doorbell != 0x0083_0000_0000_0000
         {
@@ -3505,6 +3511,58 @@ impl G17PManagerConstruction {
             return Err(Self::render_stage_fail("legacy-context0-alias-live", EBUSY));
         }
         let retained = self.render_storage.is_some();
+        // Acquire this VM's TTBAT context BEFORE anything is encoded.
+        //
+        // Two reasons it cannot stay where it used to be, in the outer
+        // publish. The fragment MCache write-range selector names this
+        // context, so the 3D descriptor cannot be built until it is known.
+        // And a bind failure has to happen before any firmware-visible byte
+        // moves: it is the one failure a second concurrent client hits first.
+        //
+        // A retained graph keeps the binding it was built with; only a fresh
+        // graph takes a new one, and the local drops the slot again if any
+        // later step in this function fails.
+        let fresh_root_bind = if retained {
+            None
+        } else {
+            Some(
+                self.resources
+                    .uat()
+                    .bind(vm)
+                    .map_err(|error| Self::render_stage_fail("render-root-bind", error))?,
+            )
+        };
+        let render_root_slot = if retained {
+            self.render_bind
+                .as_ref()
+                .ok_or_else(|| Self::render_stage_fail("retained-render-root-missing", EBUSY))?
+                .root_slot()
+                .map_err(|error| Self::render_stage_fail("render-root-slot", error))?
+        } else {
+            u8::try_from(
+                fresh_root_bind
+                    .as_ref()
+                    .ok_or_else(|| Self::render_stage_fail("render-root-missing", EIO))?
+                    .slot(),
+            )
+            .map_err(|_| Self::render_stage_fail("render-root-slot-width", EIO))?
+        };
+        if let Some(bind) = fresh_root_bind.as_ref() {
+            // Diagnostic override only: with an explicit selector of 2 or 3
+            // the driver mirrors the bound roots into that TTBAT slot rather
+            // than emitting an unbacked selector.
+            let mcache_hwsid = *crate::module_parameters::g17p_render_mcache_hwsid.value();
+            let mcache_selector =
+                *crate::module_parameters::g17p_render_mcache_selector.value() as usize;
+            if mcache_hwsid != 0 && matches!(mcache_selector, 2 | 3) {
+                self.resources
+                    .uat()
+                    .install_t8140_render_mcache_context_alias(bind, mcache_selector)
+                    .map_err(|error| {
+                        Self::render_stage_fail("render-mcache-context-alias", error)
+                    })?;
+            }
+        }
         // Which construction path a render takes has never been logged, and a
         // cold boot was measured taking the RESTAGE branch on what should be a
         // first render (93cc292: neither log line inside new_user_render_storage
@@ -3516,11 +3574,12 @@ impl G17PManagerConstruction {
         if crate::util::g17p_verbose() {
             dev_info!(
                 self.resources.dev().as_ref(),
-                "G17P render storage path: retained={} ordinal={} bind={} tracker={}\n",
+                "G17P render storage path: retained={} ordinal={} bind={} tracker={} root-slot={}\n",
                 retained,
                 self.render_submission_ordinal,
                 self.render_bind.is_some(),
                 self.render_tracker.is_some(),
+                render_root_slot,
             );
         }
         if retained
@@ -3532,6 +3591,15 @@ impl G17PManagerConstruction {
             return Err(EBUSY);
         }
         if retained {
+            // The retained descriptors already encode the bound context as
+            // their MCache write-range selector. If those two ever disagreed,
+            // this client's fragment write ranges would be resolved against
+            // another client's page tables, so refuse instead of restaging.
+            if self.render_storage.as_ref().ok_or(ENODEV)?.render_root_slot()
+                != render_root_slot
+            {
+                return Err(Self::render_stage_fail("retained-root-slot-moved", EBUSY));
+            }
             let parameter_page_list_vas = self.resources.parameter_buffer_page_list_vas();
             self.render_storage
                 .as_mut()
@@ -3565,6 +3633,7 @@ impl G17PManagerConstruction {
                         queue_pair,
                         Some(execution_context.clone()),
                         descriptor_context_id,
+                        Some(render_root_slot),
                         command,
                         self.num_clusters,
                         user_timestamps,
@@ -3740,14 +3809,13 @@ impl G17PManagerConstruction {
             .map_err(|error| Self::render_stage_fail("prepare-pm-submitted-operation", error))?;
         let pm_submitted_count = pm_submission.as_ref().map(|operation| operation.next());
         // The TA/3D descriptors execute in their independently allocated
-        // application context, but the retained USC FList service still
-        // fetches its run table through the legacy application-GART slot.
-        // Keep the same VM rooted there for the lifetime of this render graph.
-        let (prepared, render_bind) = self
+        // application context, and this VM's own TTBAT context was bound at
+        // the top of this function -- both before anything here is visible to
+        // firmware. Publication itself no longer touches the context table.
+        let prepared = self
             .resources
             .publish_partial_opening_pair(
-                if retained { None } else { Some(vm) },
-                retained,
+                true,
                 queue_pair,
                 g17p_render_deferred_outer_mode(native_doorbell_mode, split_launch),
                 fragment_queue,
@@ -3775,17 +3843,17 @@ impl G17PManagerConstruction {
         self.render_hardware_buffer_published = true;
         if crate::util::g17p_verbose() {
             pr_info!(
-                "G17P render: outer publish OK, retained={} render_bind={}\n",
+                "G17P render: outer publish OK, retained={} root-slot={}\n",
                 retained,
-                render_bind.is_some()
+                render_root_slot,
             );
         }
         if retained {
-            if render_bind.is_some() {
+            if fresh_root_bind.is_some() {
                 return Err(Self::render_stage_fail("retained-bind-unexpected", EINVAL));
             }
         } else {
-            let flist_bind = render_bind
+            let flist_bind = fresh_root_bind
                 .ok_or_else(|| Self::render_stage_fail("job-flist-bind-missing", EINVAL))?;
             self.render_bind = Some(G17PRenderRootOwner::Job {
                 context: execution_context,
