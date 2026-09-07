@@ -2197,6 +2197,7 @@ impl G17PManagerConstruction {
                     self.num_clusters,
                     [0; 4],
                     KVec::new(),
+                    0,
                 )
                 .inspect_err(|error| {
                     dev_err!(
@@ -3560,6 +3561,7 @@ impl G17PManagerConstruction {
                         self.num_clusters,
                         user_timestamps,
                         user_timestamp_aliases,
+                        self.render_submission_ordinal,
                     )
                     .map_err(|error| Self::render_stage_fail("new-user-render-storage", error))?,
             );

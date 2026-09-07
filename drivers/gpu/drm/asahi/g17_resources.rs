@@ -5718,6 +5718,7 @@ impl G17PUserRenderStorage {
         user_timestamp_aliases: KVec<mmu::KernelMapping>,
         command_context: G17PRenderCommandContext,
         descriptor_context_id: u16,
+        submission_ordinal: u32,
     ) -> Result<Self> {
         macro_rules! bootstrap_stage {
             ($name:literal, $expression:expr) => {
@@ -5969,13 +5970,23 @@ impl G17PUserRenderStorage {
                 (G17P_RENDER_USER_ALIAS_END - G17P_RENDER_USER_ALIAS_START) as usize,
             ),
         );
+        // A retained physical queue can be handed to a fresh VM at a nonzero
+        // ordinal.  This constructor still builds the cold ordinal-0 image,
+        // which is immediately replaced by restage_command() in that case.
+        // Put the unused cold image in the opposite alternating slot so the
+        // real command can be mapped before the old image is released.
+        let bootstrap_alias_ordinal = if submission_ordinal == 0 {
+            0
+        } else {
+            submission_ordinal ^ 1
+        };
         let render_user_aliases = bootstrap_stage!(
             "compact render-state aliases",
             G17PRenderUserAliases::new(
                 &mut render_state,
                 vm,
                 &render_layout,
-                0,
+                bootstrap_alias_ordinal,
             )
         );
         // Both render bootstrap status pages land in the same high window the
@@ -6881,6 +6892,23 @@ impl G17PUserRenderStorage {
         user_timestamp_aliases: Option<KVec<mmu::KernelMapping>>,
         submission_ordinal: u32,
     ) -> Result {
+        macro_rules! restage_step {
+            ($name:literal, $expression:expr) => {
+                match $expression {
+                    Ok(value) => value,
+                    Err(error) => {
+                        dev_err!(
+                            dev.as_ref(),
+                            "G17P render restage: {} failed ({:?}) ordinal={}\n",
+                            $name,
+                            error,
+                            submission_ordinal,
+                        );
+                        return Err(error);
+                    }
+                }
+            };
+        }
         if submission_ordinal == 0 || submission_ordinal >= G17P_RETAINED_RENDER_ORDINALS {
             return Err(EINVAL);
         }
@@ -6896,16 +6924,16 @@ impl G17PUserRenderStorage {
         {
             return Err(EBUSY);
         }
-        let mut next_descriptors = MappedObject::new_wc(
+        let mut next_descriptors = restage_step!("descriptor allocation", MappedObject::new_wc(
             dev,
             uat,
             G17P_RENDER_DESCRIPTOR_IMAGE_SIZE,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
-        )?;
+        ));
         let render_layout =
             g17p_render_state_layout(&command.parameters, num_clusters).ok_or(EINVAL)?;
-        let mut next_render_state = MappedObject::new_wc_in_range(
+        let mut next_render_state = restage_step!("render-state allocation", MappedObject::new_wc_in_range(
             dev,
             vm,
             g17p_cl_client_low_va_range(),
@@ -6916,7 +6944,7 @@ impl G17PUserRenderStorage {
                 mmu::UAT_PGSZ as u64
             },
             mmu::PROT_GPU_FW_SHARED_RW,
-        )?;
+        ));
         if g17p_render_tvb_enabled() {
             let tvb = self.render_tvb.as_mut().ok_or(EIO)?;
             if tvb.logical_size < render_layout.tvb_size
@@ -6928,19 +6956,19 @@ impl G17PUserRenderStorage {
             // Native retains this pool and lets firmware recycle its pages.
             // Clearing its contents would destroy retained PM-owned state.
         }
-        let next_render_user_aliases = G17PRenderUserAliases::new(
+        let next_render_user_aliases = restage_step!("render-state aliases", G17PRenderUserAliases::new(
             &mut next_render_state,
             vm,
             &render_layout,
             submission_ordinal,
-        )?;
-        let next_timestamps = MappedObject::new_wc(
+        ));
+        let next_timestamps = restage_step!("timestamp allocation", MappedObject::new_wc(
             dev,
             uat,
             mmu::UAT_PGSZ,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
-        )?;
+        ));
         let render_state_va = next_render_state.iova();
         let timestamp_va = next_timestamps.iova();
         let mut translated = *command;
@@ -6948,12 +6976,12 @@ impl G17PUserRenderStorage {
         translated.parameters.usc_flist_hardware_buffer_id =
             g17_initdata::PARTIAL_OPENING_FREELIST_HARDWARE_BUFFER_ID;
         if g17p_render_tvb_mode() >= 2 {
-            self.parameter_management.as_mut().ok_or(EIO)?.prepare_retained_scene(
+            restage_step!("retained-scene preparation", self.parameter_management.as_mut().ok_or(EIO)?.prepare_retained_scene(
                 submission_ordinal,
                 translated.parameters.ta_hardware_buffer_id,
                 parameter_page_list_vas,
                 &render_layout,
-            )?;
+            ));
         }
         translated.parameters.deflake_3 = next_render_user_aliases.deflake_va();
         translated.parameters.deflake_2 = translated.parameters.deflake_3 + 0x20;
@@ -13786,6 +13814,7 @@ impl G17ResourceOwner {
         num_clusters: u32,
         user_timestamps: [u64; 4],
         user_timestamp_aliases: KVec<mmu::KernelMapping>,
+        submission_ordinal: u32,
     ) -> Result<G17PUserRenderStorage> {
         let parameter_metrics_vas = [
             self.resources.parameter_metrics.iova(),
@@ -13841,6 +13870,7 @@ impl G17ResourceOwner {
             user_timestamp_aliases,
             command_context,
             descriptor_context_id,
+            submission_ordinal,
         )?;
         for mapping in render_operand_aliases {
             storage.render_operand_aliases.push(mapping, GFP_KERNEL)?;
