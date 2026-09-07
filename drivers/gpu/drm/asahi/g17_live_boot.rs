@@ -860,16 +860,18 @@ fn drain_primary_firmware_event_batch(
                 let qword = |offset: usize| {
                     u64::from_le_bytes(record.raw[offset..offset + 8].try_into().unwrap_or([0; 8]))
                 };
-                dev_info!(
-                    pdev.as_ref(),
-                    "G17P completion record: head={:#x} {:#x} {:#x} cursor={}->{} producer={}\n",
-                    qword(0x00),
-                    qword(0x08),
-                    qword(0x10),
-                    record.consumer_before,
-                    record.consumer_published,
-                    record.producer_snapshot
-                );
+                if crate::util::g17p_verbose() {
+                    dev_info!(
+                        pdev.as_ref(),
+                        "G17P completion record: head={:#x} {:#x} {:#x} cursor={}->{} producer={}\n",
+                        qword(0x00),
+                        qword(0x08),
+                        qword(0x10),
+                        record.consumer_before,
+                        record.consumer_published,
+                        record.producer_snapshot
+                    );
+                }
                 batch.completion_records = batch.completion_records.saturating_add(1);
             }
             unknown => {
@@ -1733,14 +1735,16 @@ impl rtkit::Operations for G17PRtkitOps {
                 .fetch_add(1, Ordering::Relaxed)
                 .wrapping_add(1);
             if g17p_notification_log_due(total) {
-                dev_info!(
-                    data.dev.as_ref(),
-                    "G17P firmware-event notification role={} pending={} total={} submit-phase={}\n",
-                    data.processor.name(),
-                    count,
-                    total,
-                    data.submission_phase.load(Ordering::Acquire)
-                );
+                if crate::util::g17p_verbose() {
+                    dev_info!(
+                        data.dev.as_ref(),
+                        "G17P firmware-event notification role={} pending={} total={} submit-phase={}\n",
+                        data.processor.name(),
+                        count,
+                        total,
+                        data.submission_phase.load(Ordering::Acquire)
+                    );
+                }
             }
             // Queue on a notification from either role. The firmware raises
             // these on GFX1 for a compute submission targeting target1, and the
