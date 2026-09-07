@@ -29,6 +29,13 @@
 
 #define MAX_INTERFACES 16
 
+/*
+ * MTP's own _mgr_esd_recovery gives the AFE three attempts before it reports
+ * "Failed to boot Cumulus in 3 recovery attempts. Giving up", so the host has
+ * no reason to keep asking after that many either.
+ */
+#define DCHID_MAX_START_ATTEMPTS 3
+
 /* Data + checksum */
 #define MAX_PKT_SIZE (0xffff + 4)
 
@@ -199,8 +206,10 @@ MODULE_PARM_DESC(enable_mtp_iface,
 
 /*
  * Off by default.  Registering a shared buffer is a state-changing operation
- * that wedges the comm channel when MTP refuses it, so it is opted into for a
- * single experiment rather than run on every boot.  A reboot always clears it.
+ * that has previously wedged the comm channel, so it is opted into for a single
+ * experiment rather than run on every boot; re-opening the multi-touch node
+ * re-runs the start sequence, so it can be armed and fired without a reboot,
+ * and a reboot always clears it.
  */
 static bool shared_buffer;
 module_param(shared_buffer, bool, 0644);
@@ -306,6 +315,13 @@ struct dchid_iface {
 	struct gpio_desc *gpio;
 	char gpio_name[MAX_GPIO_NAME];
 	int gpio_id;
+
+	/* Firmware staged for this interface, allocated once and reused. */
+	void *fw;
+	size_t fw_size;
+	void *fw_dma_buf;
+	dma_addr_t fw_dma_addr;
+	unsigned int start_attempts;
 
 	/* Host-owned AFE supply line (J700 function-afe-reset). */
 	struct gpio_desc *afe_reset;
@@ -773,14 +789,25 @@ static int dchid_send_firmware(struct dchid_iface *iface, void *firmware, size_t
 		.iface = iface->index,
 		.size = size,
 	};
-	dma_addr_t addr;
-	void *buf = dmam_alloc_coherent(iface->dchid->dev, size, &addr, GFP_KERNEL);
+	/*
+	 * A start can be retried, so this buffer is allocated once and reused.
+	 * It used to be a fresh dmam_alloc_coherent() per attempt, which leaked
+	 * the whole image every time an interface failed to come up.
+	 */
+	if (!iface->fw_dma_buf) {
+		iface->fw_dma_buf = dmam_alloc_coherent(iface->dchid->dev, size,
+						        &iface->fw_dma_addr,
+						        GFP_KERNEL);
+		if (IS_ERR_OR_NULL(iface->fw_dma_buf)) {
+			void *err = iface->fw_dma_buf;
 
-	if (IS_ERR_OR_NULL(buf))
-		return buf ? PTR_ERR(buf) : -ENOMEM;
+			iface->fw_dma_buf = NULL;
+			return err ? PTR_ERR(err) : -ENOMEM;
+		}
+	}
 
-	msg.addr = addr;
-	memcpy(buf, firmware, size);
+	msg.addr = iface->fw_dma_addr;
+	memcpy(iface->fw_dma_buf, firmware, size);
 	wmb();
 
 	return dchid_comm_cmd(iface->dchid, &msg, sizeof(msg));
@@ -799,6 +826,13 @@ static int dchid_get_firmware(struct dchid_iface *iface, void **firmware, size_t
 		/* Firmware is only for some devices */
 		*firmware = NULL;
 		*size = 0;
+		return 0;
+	}
+
+	/* Already parsed by an earlier start attempt. */
+	if (iface->fw) {
+		*firmware = iface->fw;
+		*size = iface->fw_size;
 		return 0;
 	}
 
@@ -828,6 +862,8 @@ static int dchid_get_firmware(struct dchid_iface *iface, void **firmware, size_t
 	if (hdr->iface_offset)
 		fw_data[hdr->iface_offset] = iface->index;
 
+	iface->fw = fw_data;
+	iface->fw_size = hdr->data_length;
 	*firmware = fw_data;
 	*size = hdr->data_length;
 
@@ -1006,6 +1042,11 @@ static void dchid_power_request(struct dchid_iface *iface, int state)
  *   hal.c:170: Registering DRAM Shared Buffer #N. Addr=<addr>, Size=<size>
  *
  * with the address shifted right by four.
+ *
+ * This is the transport half A18 MTP appears to want and this driver has never
+ * spoken: its bootloader gives up on the AFE within one RTKit log slot, with no
+ * measurable elapsed time and no bus traffic, which is a refused precondition
+ * rather than a part that failed to answer.
  */
 static int dchid_register_shared_buffer(struct dchid_iface *iface)
 {
@@ -1066,7 +1107,23 @@ static int dchid_start_interface(struct dchid_iface *iface)
 		return -EINPROGRESS;
 	}
 
-	dev_info(iface->dchid->dev, "Starting interface %s\n", iface->name);
+	/*
+	 * A timed-out start releases the latch so it can be retried, but the
+	 * consumer of an input node reopens it as fast as it is refused, and
+	 * every attempt re-uploads the image and power-cycles the AFE - which
+	 * also disturbs the keyboard, since they share the SCM bus.  Stop after
+	 * as many attempts as MTP's own _mgr_esd_recovery gives the part before
+	 * it gives up, and then fail fast and quietly.
+	 */
+	if (iface->start_attempts >= DCHID_MAX_START_ATTEMPTS) {
+		dev_warn_once(iface->dchid->dev,
+			      "Interface %s failed to start %u times, not retrying\n",
+			      iface->name, iface->start_attempts);
+		return -EIO;
+	}
+
+	dev_info(iface->dchid->dev, "Starting interface %s (attempt %u)\n",
+		 iface->name, ++iface->start_attempts);
 
 	iface->starting = true;
 
@@ -1367,6 +1424,7 @@ static void dchid_handle_ready(struct dockchannel_hid *dchid, void *data, size_t
 	}
 
 	dev_info(dchid->dev, "Interface %s is now ready\n", iface->name);
+	iface->start_attempts = 0;
 	complete_all(&iface->ready);
 
 	/* When STM is ready, grab global device info */
