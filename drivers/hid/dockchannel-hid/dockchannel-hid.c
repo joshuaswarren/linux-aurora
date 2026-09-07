@@ -11,11 +11,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/firmware.h>
 #include <linux/gpio/consumer.h>
-#include <linux/gpio/driver.h>
 #include <linux/hid.h>
-#include <linux/ktime.h>
-#include <linux/mfd/macsmc.h>
-#include <linux/module.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/dockchannel.h>
@@ -25,44 +21,24 @@
 #include "../hid-ids.h"
 #include "dockchannel-hid-protocol.h"
 
+#define COMMAND_TIMEOUT_MS 1000
 #define START_TIMEOUT_MS 2000
-/*
- * Long enough to cover the handshake's own delay plus every FIFO registration
- * running out its full command timeout, so a start that arrives early waits for
- * the real answer instead of timing out on top of it.
- */
-#define HANDSHAKE_TIMEOUT_MS 30000
 
 #define MAX_INTERFACES 16
-
-
 
 /* Data + checksum */
 #define MAX_PKT_SIZE (0xffff + 4)
 
-/*
- * Header byte 1 is macOS's messageType: createControlMessage stores 0x11 and
- * createInputMessage 0x12, and parseNewBytes dispatches only those two.  Type 0
- * is consumed, checksum-checked and dropped without complaint.
- */
-#define DCHID_CHANNEL_NOP 0x00
 #define DCHID_CHANNEL_CMD 0x11
 #define DCHID_CHANNEL_REPORT 0x12
 
-/*
- * Named from AHTSCMMessage's accessors, each of which is a fixed offset into
- * this header: getMessageType reads byte 1, getTransferId byte 4,
- * getInterfaceNumber byte 5, getRetryCount byte 6 and getEventType byte 7.  The
- * last two were being carried as padding.
- */
 struct dchid_hdr {
 	u8 hdr_len;
 	u8 channel;
 	u16 length;
 	u8 seq;
 	u8 iface;
-	u8 retry;
-	u8 event;
+	u16 pad;
 } __packed;
 
 #define IFACE_COMM 0
@@ -99,457 +75,9 @@ struct dchid_init_hdr {
 #define INIT_TERMINATOR		2
 #define INIT_PRODUCT_NAME	7
 
-/*
- * Named from the macOS functions that build them, not from what this driver
- * used to guess: 0x40 is setInterfacePower, 0x41 is getInterfacePower and 0x42
- * is resetDevice.  0x42 in particular was being sent three times per start
- * attempt under the name "query power".
- */
-#define CMD_SET_POWER 0x40
 #define CMD_SEND_FIRMWARE 0x95
 #define CMD_ENABLE_INTERFACE 0xb4
 #define CMD_ACK_GPIO_CMD 0xa1
-#define CMD_INIT_SHARED_BUFFER 0x91
-/*
- * The first thing handshakeGated does, before it registers a single FIFO, is
- * send this on the management interface: setSystemAwakeReport builds a two-byte
- * feature report {0xC1, awake ? 2 : 1} at 0xfffffe000910f7f8.  This driver has
- * never sent it.  Its failure is non-fatal in macOS, so it is not obviously a
- * gate, but it is the one message that provably precedes a registration on a
- * working host and is absent from ours.
- */
-#define CMD_RELEASE_SHARED_BUFFER 0x96
-#define CMD_SYSTEM_AWAKE 0xc1
-#define DCHID_SYSTEM_ASLEEP 1
-#define DCHID_SYSTEM_AWAKE 2
-#define CMD_QUERY_POWER 0x41
-#define CMD_RESET_DEVICE 0x42
-
-#define DCHID_POWER_FORM_PLAIN DCHID_POWER_METHOD_1
-#define DCHID_POWER_FORM_PHASED DCHID_POWER_METHOD_2
-#define DCHID_POWER_PHASE_WILL_CHANGE 0
-#define DCHID_POWER_PHASE_HAS_CHANGED 1
-
-/*
- * AHTPowerState ordinals, as used by AppleHIDTransportInterface::setPowerGated*
- * in the shipping macOS AppleHIDTransport kext: 0 off, 1 sleep, 2 on, 3 reset.
- */
-/*
- * J700's shipping MTP_SYS multi-touch personality carries the host half of the
- * power transition as two AppleHIDTransport function sequences.
- *
- * power-sequence is the legacy compact encoding: a NUL-terminated function name
- * followed by enable-delay-ms, disable-delay-ms, enable-type and disable-type
- * bytes.  J700 ships
- *
- *   66 75 6e 63 74 69 6f 6e 2d 61 66 65 2d 72 65 73 65 74 00 | 00 32 00 01
- *   "function-afe-reset"                                       enable  Low,  0ms
- *                                                              disable High, 50ms
- *
- * reset-sequence is the modern dictionary form and needs no field-order
- * assumption at all:
- *
- *   FunctionName        = function-ipd-pwr-seq-control
- *   EnableFunctionType  = Low   EnableDelayUs  = 100000
- *   DisableFunctionType = High  DisableDelayUs = 0
- *
- * AHTFunctionInfo's legacy type table is Low=0, High=1, Input=2, AltFunc=3,
- * Config0=4, Config1=5, Read=6.  The compact form's field order is confirmed
- * against a machine whose ADT ships the same encoding: j493's touch-bar node has
- *
- *   function-display_power_enable \0 00 00 01 00
- *   function-clock_32KHz_enable   \0 0a 00 03 00
- *   function-reset                \0 01 01 01 00
- *
- * and only the enable-first order reads sensibly there, since it puts AltFunc on
- * the enable half of a 32 kHz clock output and High on the release half of an
- * active-low reset.  Applied to J700 that gives Low as the AFE's enable level,
- * which is why this driver drives the raw line and deliberately does not consult
- * the DT active-low flag - J700's line is not active low.
- *
- * AppleHIDTransportInterface runs power-sequence as its chip-power step and
- * reset-sequence as its reset step, so despite the function names the AFE supply
- * on J700 is the pcIO line (SMC gP13) and the AFE reset is the pmIP key.  Power
- * on therefore raises the supply and then releases the reset, waiting the
- * sequence's 100 ms before telling MTP the platform has changed; power off
- * asserts the reset and then removes the supply, holding it for 50 ms.
- */
-#define DCHID_AFE_RESET_ENABLE_LEVEL 0
-#define DCHID_AFE_RESET_ENABLE_DELAY_US 0
-#define DCHID_AFE_RESET_DISABLE_LEVEL 1
-#define DCHID_AFE_RESET_DISABLE_DELAY_US 50000
-
-#define SMC_KEY_IPD_PWR_SEQ SMC_KEY(pmIP)
-#define DCHID_IPD_RESET_ENABLE_VALUE 0
-#define DCHID_IPD_RESET_ENABLE_DELAY_US 100000
-#define DCHID_IPD_RESET_DISABLE_VALUE 1
-#define DCHID_IPD_RESET_DISABLE_DELAY_US 0
-
-static bool ipd_reset_sequence = true;
-module_param(ipd_reset_sequence, bool, 0644);
-MODULE_PARM_DESC(ipd_reset_sequence,
-		 "Run the J700 multi-touch reset-sequence (function-ipd-pwr-seq-control) during power transitions");
-
-static bool ipd_reset_write = true;
-module_param(ipd_reset_write, bool, 0644);
-MODULE_PARM_DESC(ipd_reset_write,
-		 "Write the pmIP SMC key as part of the reset-sequence; with 0 only its delay is applied");
-
-/*
- * The enable level is the one inference in the contract above that rests on
- * another machine's ADT rather than on J700's own bytes, and the boot chain
- * hands the line over at the disable level, so there is no inherited state to
- * check it against.  Keep both levels switchable so the polarity can be settled
- * by measurement: re-opening the multi-touch node re-runs the whole start
- * sequence, so both can be tried without rebuilding or rebooting.
- */
-static int afe_enable_level = DCHID_AFE_RESET_ENABLE_LEVEL;
-module_param(afe_enable_level, int, 0644);
-MODULE_PARM_DESC(afe_enable_level,
-		 "Raw gP13 level driven when the J700 AFE is powered on");
-
-static int afe_disable_level = DCHID_AFE_RESET_DISABLE_LEVEL;
-module_param(afe_disable_level, int, 0644);
-MODULE_PARM_DESC(afe_disable_level,
-		 "Raw gP13 level driven when the J700 AFE is powered off");
-
-static bool power_query = true;
-module_param(power_query, bool, 0644);
-MODULE_PARM_DESC(power_query,
-		 "Ask MTP for the multi-touch power state around the start sequence");
-
-/*
- * Read at interface enumeration, long before anything in userspace can change
- * it, so this one has to be set through modprobe.d or the kernel command line
- * rather than sysfs.
- */
-static bool power_request = true;
-module_param(power_request, bool, 0644);
-MODULE_PARM_DESC(power_request,
-		 "Send the 0x41 power request after the 0x40 transaction leaves the interface off");
-
-static bool enable_mtp_iface = true;
-module_param(enable_mtp_iface, bool, 0444);
-MODULE_PARM_DESC(enable_mtp_iface,
-		 "Enable the A18 \"mtp\" control interface that has no DT node (read at enumeration: set it through modprobe.d or the kernel command line, not sysfs)");
-
-/*
- * Off by default.  Registering a shared buffer is a state-changing operation
- * that has previously wedged the comm channel, so it is opted into for a single
- * experiment rather than run on every boot; re-opening the multi-touch node
- * re-runs the start sequence, so it can be armed and fired without a reboot,
- * and a reboot always clears it.
- */
-/*
- * MTP's own _mgr_esd_recovery gives the AFE three attempts before it reports
- * "Failed to boot Cumulus in 3 recovery attempts. Giving up", so the host has
- * no reason to keep asking after that many either.  Writable so that raising it
- * re-arms a start that has already given up, which is how a changed parameter
- * gets retried without a reboot.
- */
-static int max_start_attempts = 3;
-module_param(max_start_attempts, int, 0644);
-MODULE_PARM_DESC(max_start_attempts,
-		 "How many times to attempt an interface start before giving up");
-
-/*
- * macOS does not register the shared-memory FIFOs from the interface start
- * path.  AppleHIDTransportProtocolSCMFIFO does it once, from handshakeGated, on
- * the management interface, shortly after the transport's first read completes
- * and before any HID interface has been started - and
- * AppleHIDTransportProtocolSCMFIFO::handleBootload then refuses to run a CBOR
- * bootload at all until that handshake has been recorded.  J700's node is
- * bootloader-type = "CBOR", so it is not one of the FlatPack parts that skip
- * the gate: on this machine the firmware upload is downstream of the
- * registration, not the other way round.
- *
- * So the registration lives on its own timer here too: armed off the first
- * DockChannel read completion, run on the comm interface, and awaited by the
- * start path rather than performed by it.
- */
-static bool shared_buffer;
-static int dchid_shared_buffer_set(const char *val, const struct kernel_param *kp);
-static const struct kernel_param_ops dchid_shared_buffer_ops = {
-	.flags = KERNEL_PARAM_OPS_FL_NOARG,
-	.set = dchid_shared_buffer_set,
-	.get = param_get_bool,
-};
-module_param_cb(shared_buffer, &dchid_shared_buffer_ops, &shared_buffer, 0644);
-MODULE_PARM_DESC(shared_buffer,
-		 "Register the DRAM shared-memory FIFOs with MTP (opcode 0x91) from the comm interface handshake; setting it at runtime runs the handshake immediately");
-
-static unsigned int shared_buffer_size = 0x4000;
-module_param(shared_buffer_size, uint, 0644);
-MODULE_PARM_DESC(shared_buffer_size,
-		 "Size of each shared FIFO registered with opcode 0x91");
-
-/*
- * macOS takes both the count and the size from the machine's own device tree,
- * not from anything in the kext: AppleHIDTransportDevice unserialises the
- * "Protocol Binary Config" OSData property off the transport nub, and
- * cacheProtocolConfig() walks its "MemoryFifos" array, creating one read FIFO
- * per element sized by that element's "ReadSize".  The count is simply the
- * array's length and AppleHIDTransportDevice::newStaticConfig() is `return 0`,
- * so there is no compiled-in fallback to copy - the numbers exist only on the
- * device.  Until that property has been read off J700, both stay parameters,
- * defaulting to the single 16 KiB FIFO that MTP has already accepted and
- * echoed back.
- *
- * For scale, the only size-shaped constants the kext does carry are
- * MaxReadSize / MaxWriteSize, both defaulting to 4096, and
- * MaxSharedMemoryReportLength, 65536 - so a ring that has to carry a maximal
- * shared-memory report would need to be four times the current default.
- */
-static unsigned int shared_buffer_count = 1;
-module_param(shared_buffer_count, uint, 0644);
-MODULE_PARM_DESC(shared_buffer_count,
-		 "How many shared FIFOs to register with opcode 0x91");
-
-/*
- * macOS's registration lands about 100 ms after the first read completion.
- * Keep that as the default rather than firing immediately: MTP is still
- * enumerating its own interfaces at that point, and the one thing measured
- * about this message is that sending it twice takes the coprocessor down, so
- * there is no second chance to spend on being early.
- */
-static unsigned int shared_buffer_delay_ms = 100;
-module_param(shared_buffer_delay_ms, uint, 0644);
-MODULE_PARM_DESC(shared_buffer_delay_ms,
-		 "Delay from the first DockChannel read completion to the opcode 0x91 handshake");
-
-/*
- * Once the FIFOs are registered MTP stops acknowledging comm commands over
- * DockChannel, which is what it should do if the replies have moved into the
- * ring.  Watch the ring headers so that can be read off real traffic instead of
- * inferred from the silence; 0 disables the poll.
- */
-static unsigned int shared_buffer_poll_ms = 500;
-module_param(shared_buffer_poll_ms, uint, 0644);
-MODULE_PARM_DESC(shared_buffer_poll_ms,
-		 "How often to log the shared FIFO headers once they are registered (0 disables)");
-
-/*
- * macOS's handshake lands before any interface is *started*, which is a later
- * event than an interface being enumerated and enabled: enabling is part of
- * enumeration, bootloading is the start.  The distinction matters here because
- * MTP stops acknowledging comm commands once a FIFO is registered, and the
- * built-in keyboard's CMD_ENABLE_INTERFACE is a comm command - losing its ack
- * costs the keyboard for the rest of the boot.  So by default the handshake
- * also waits for the enumeration already in flight to drain.  Clear this to
- * reproduce macOS's timing exactly, at the cost of that guarantee.
- */
-static bool shared_buffer_after_enum = true;
-module_param(shared_buffer_after_enum, bool, 0644);
-MODULE_PARM_DESC(shared_buffer_after_enum,
-		 "Let interface enumeration drain before the opcode 0x91 handshake");
-
-/*
- * MTP stopped acknowledging comm commands over DockChannel as soon as a FIFO
- * was registered - including CMD_SEND_FIRMWARE, which had been acked reliably
- * until then.  That is what a transport whose replies have moved into shared
- * memory looks like from a host that is not draining it, so treat the silence
- * as "reply not collected" rather than "command failed" and let the rest of the
- * sequence run.  It only applies once a FIFO is actually registered, so nothing
- * before the handshake can be masked by it.
- */
-static bool shared_buffer_lossy_ack;
-module_param(shared_buffer_lossy_ack, bool, 0644);
-MODULE_PARM_DESC(shared_buffer_lossy_ack,
-		 "Once a shared FIFO is registered, treat an unanswered comm command as delivered rather than failed");
-
-/*
- * How long to wait for a control report to be answered.
- *
- * This used to be one second, which is not where macOS gives up:
- * AppleHIDTransportProtocolSCMFIFO's ReportTimeoutMs defaults to 5000 and
- * waitForControlComplete() sleeps on the command gate for that long.  The
- * difference matters because of what a premature give-up does to this
- * driver's sequence numbering - dchid_cmd() advances tx_seq when it returns,
- * so an answer that arrives late is then rejected for a bad sequence, and so
- * is every answer after it.  One command abandoned too early therefore looks
- * exactly like the coprocessor having gone deaf, which is what was seen right
- * after the first successful FIFO registration.
- */
-static unsigned int command_timeout_ms = 5000;
-module_param(command_timeout_ms, uint, 0644);
-MODULE_PARM_DESC(command_timeout_ms,
-		 "How long to wait for a control report to be answered (macOS uses 5000)");
-
-/*
- * MTP sends a well-formed but completely empty packet 80us after a shared-FIFO
- * registration - eight header bytes and a checksum, message type 0x00, length 0.
- * It is tempting to read that as the registration's answer, and wrong:
- * parseNewBytes tests the type byte against 0x11 and 0x12 and, for 0x00,
- * branches straight to resetParser without dispatching and without logging an
- * error.  A type-0 packet is a legal no-op on this transport, not a reply.
- *
- * What macOS does with it is the interesting part.  readCompletionAction calls
- * drainSharedMemoryFifos() after every read, whatever arrived, so an empty
- * packet is exactly what a coprocessor sends to say "look in the ring" on a
- * transport with no dedicated doorbell.  Completing an outstanding command on
- * one would be a false positive, so this defaults off; it stays available
- * because proving what a bare packet does and does not carry is worth one boot.
- */
-static bool system_awake_report = true;
-module_param(system_awake_report, bool, 0644);
-MODULE_PARM_DESC(system_awake_report,
-		 "Send report 0xC1 {0xC1,2} before registering the shared FIFOs, as macOS does");
-
-static bool lenient_ack;
-module_param(lenient_ack, bool, 0644);
-MODULE_PARM_DESC(lenient_ack,
-		 "Complete an outstanding command on a reply whose framing this driver does not recognise");
-
-/*
- * Dump every packet, not just the anomalies.  Off by default because the
- * report channel is busy once input is flowing.
- */
-static bool packet_trace;
-module_param(packet_trace, bool, 0644);
-MODULE_PARM_DESC(packet_trace, "Log the header and first bytes of every received packet");
-
-/*
- * Registering a FIFO looked like it had made MTP deaf, because the one command
- * sent afterwards also went unanswered.  One command is not evidence, and the
- * commands that answer without any firmware loaded are known: the multi-touch
- * interface serves a couple of dozen feature reports out of its base
- * personality, and report 0x64 returns the trackpad's dimensions.  Read one
- * before the handshake and the same one after it, so "the command channel
- * changed" and "that particular reply is framed differently" stop being the
- * same observation.
- */
-static bool shared_buffer_probe = true;
-module_param(shared_buffer_probe, bool, 0644);
-MODULE_PARM_DESC(shared_buffer_probe,
-		 "Read a known-good feature report either side of the handshake");
-
-/* Multi-touch sensor dimensions; answered with no firmware loaded. */
-#define MT_REPORT_DIMENSIONS 0x64
-
-/*
- * Byte 1 is not a property of the interface, it is a property of the operation.
- * Read straight out of the message each macOS function builds:
- *
- *   setInterfacePower           0xfffffe000910d19c  mov w8,#0x140  -> 40 01
- *   setInterfacePowerWillChange 0xfffffe000910d3cc  mov w8,#0x240  -> 40 02
- *   setInterfacePowerHasChanged 0xfffffe000910d5d0  mov w8,#0x240  -> 40 02
- *   getInterfacePower           0xfffffe000910d6a4  mov w8,#0x141  -> 41 01
- *   resetDevice                 0xfffffe000910cfd8  mov w8,#0x142  -> 42 01
- *
- * So 2 belongs to the two-phase form of 0x40 and to nothing else: 0x41 and
- * 0x42 are 1 unconditionally, on every machine, whatever the interface.  This
- * parameter therefore only chooses the form of 0x40 - -1 lets the interface
- * decide, 1 forces the plain four-byte set, 2 forces the two-phase bracket.
- */
-static int power_method = -1;
-module_param(power_method, int, 0644);
-MODULE_PARM_DESC(power_method,
-		 "Form of opcode 0x40: -1 per interface, 1 plain set, 2 two-phase bracket");
-
-/*
- * Opcode 0x42 is macOS's resetDevice, not a power query, and this driver has
- * been sending it three times per start attempt in the belief that it was one.
- * Keep it reachable, because it is part of the contract, but stop sending it by
- * default until there is a reason to.
- */
-static bool device_reset;
-module_param(device_reset, bool, 0644);
-MODULE_PARM_DESC(device_reset, "Send opcode 0x42, which resets the device");
-
-/*
- * Run a transactional power transition on the multi-touch interface before the
- * FIFO handshake.
- *
- * macOS's handshakeGated does not do this - it registers the FIFOs 100ms after
- * the first read completion, before anything is powered - so this is not a
- * fidelity fix but a test of the claim that MTP will not answer a registration
- * until the interface has been through the transaction.  The two orderings
- * cannot both be run in one boot, because the registration is a one-shot, so
- * which one runs is a parameter.
- */
-static bool handshake_power_transition;
-module_param(handshake_power_transition, bool, 0644);
-MODULE_PARM_DESC(handshake_power_transition,
-		 "Run a transactional power transition before registering the shared FIFOs");
-
-/*
- * Whether that transition also drives the platform lines.
- *
- * OFF BY DEFAULT AND DELIBERATELY SO.  The gP13 supply and the pmIP reset are
- * what produce "SCM peripheral device error ch 0" and "KBD set state 2 bailed"
- * - the trackpad and the keyboard share the SCM bus, and MTP is not told to
- * re-enumerate afterwards, so the keyboard stays down until a reboot.  With
- * this clear the 0x40 transaction still runs end to end, MTP still sees
- * will-change and has-changed, and nothing touches the bus the keyboard is on.
- * Set it only for a boot where losing the keyboard is acceptable.
- */
-static bool handshake_power_platform;
-module_param(handshake_power_platform, bool, 0644);
-MODULE_PARM_DESC(handshake_power_platform,
-		 "Let the pre-handshake power transition drive gP13 and pmIP (RISKS THE BUILT-IN KEYBOARD)");
-
-/* Never poll faster than this, whatever the parameter says. */
-#define SHMEM_POLL_MIN_MS 50
-
-static unsigned int shmem_poll_interval(void)
-{
-	if (!shared_buffer_poll_ms)
-		return 0;
-
-	return max(shared_buffer_poll_ms, (unsigned int)SHMEM_POLL_MIN_MS);
-}
-
-/*
- * handshakeGated builds bytes 0 and 1 with a single `strh` of 0x0091 and byte 2
- * with `strb wzr`, so both of these are hard zeros on macOS for every FIFO it
- * registers: the message carries no index, no direction and no interface
- * number, and a FIFO is identified purely by the order it was registered in.
- * They stay adjustable only because they are the cheapest thing to vary if a
- * registration is ever refused.
- */
-static int shared_buffer_unk1;
-module_param(shared_buffer_unk1, int, 0644);
-MODULE_PARM_DESC(shared_buffer_unk1, "Second byte of the opcode 0x91 message (macOS sends 0)");
-
-static int shared_buffer_unk2;
-module_param(shared_buffer_unk2, int, 0644);
-MODULE_PARM_DESC(shared_buffer_unk2, "Third byte of the opcode 0x91 message (macOS sends 0)");
-
-/*
- * How many FIFOs the host is willing to hand MTP.  macOS's MemoryFIFOs
- * property is an array, so the count is not structurally fixed at one; this is
- * only the ceiling on what shared_buffer_count may ask for.
- */
-#define MAX_SHARED_FIFOS 8
-
-struct dchid_shmem_fifo {
-	void *buf;
-	dma_addr_t addr;
-	unsigned int size;
-	u32 last_head;
-	u32 last_tail;
-	bool seen;
-};
-
-static size_t dchid_fifo_readable(u32 producer, u32 consumer, size_t capacity)
-{
-	if (producer >= capacity || consumer >= capacity)
-		return 0;
-
-	return producer >= consumer ? producer - consumer :
-		capacity - consumer + producer;
-}
-
-static void dchid_fifo_copy(void *dst, const void *src, size_t capacity,
-			    size_t offset, size_t length)
-{
-	u8 *out = dst;
-	const u8 *ring = src;
-	size_t first = min(length, capacity - offset);
-
-	memcpy(out, ring + offset, first);
-	memcpy(out + first, ring, length - first);
-}
 
 struct dchid_init_block_hdr {
 	u16 type;
@@ -637,18 +165,7 @@ struct dchid_iface {
 	struct gpio_desc *gpio;
 	char gpio_name[MAX_GPIO_NAME];
 	int gpio_id;
-
-	/* Firmware staged for this interface, allocated once and reused. */
-	void *fw;
-	size_t fw_size;
-	void *fw_dma_buf;
-	dma_addr_t fw_dma_addr;
-	unsigned int start_attempts;
-
-	/* Host-owned AFE supply line (J700 function-afe-reset). */
-	struct gpio_desc *afe_reset;
-	/* The SMC behind that line, which also owns the pmIP reset key. */
-	struct apple_smc *smc;
+	bool gpio_request_seen;
 
 	struct mutex out_mutex;
 	u32 out_flags;
@@ -675,27 +192,6 @@ struct dockchannel_hid {
 	struct dchid_iface *ifaces[MAX_INTERFACES];
 
 	u8 pkt_buf[MAX_PKT_SIZE];
-
-	/* DRAM shared FIFOs registered with MTP, if any. */
-	struct dchid_shmem_fifo fifos[MAX_SHARED_FIFOS];
-	unsigned int nr_fifos;
-
-	/*
-	 * The transport handshake: armed by the first DockChannel read
-	 * completion, run once on the comm interface, awaited by any interface
-	 * that has to bootload.
-	 */
-	struct delayed_work handshake_work;
-	struct completion handshake_done;
-	bool handshake_armed;
-	struct delayed_work shmem_poll_work;
-	/*
-	 * Its own queue, not the comm interface's.  A registration that waits
-	 * out its whole command timeout on the comm queue holds up every event
-	 * MTP sends while it waits - which is how the reply to that very
-	 * registration came to be logged five seconds after it arrived.
-	 */
-	struct workqueue_struct *aux_wq;
 
 	/* Workqueue to asynchronously create HID devices */
 	struct workqueue_struct *new_iface_wq;
@@ -749,26 +245,6 @@ dchid_get_interface(struct dockchannel_hid *dchid, int index, const char *name)
 
 	iface->of_node = of_get_child_by_name(dchid->dev->of_node, name);
 	if (!iface->of_node) {
-		/*
-		 * A18 MTP advertises a fourth interface named "mtp" alongside
-		 * comm, multi-touch and keyboard, and completes its own
-		 * enumeration for it ("MTP interface complete enumeration:
-		 * SENT").  No Apple laptop DT describes it, because no earlier
-		 * machine offers it, so this driver dropped it on the floor and
-		 * never sent it CMD_ENABLE_INTERFACE.  Keep it as a
-		 * control-only interface - no OF node, no HID device - so it
-		 * can at least be enabled.
-		 */
-		if (enable_mtp_iface &&
-		    of_property_read_bool(dchid->dev->of_node, "apple,no-stm") &&
-		    !strcmp(name, "mtp")) {
-			dev_info(dchid->dev,
-				 "Keeping control-only interface %s (no OF node)\n",
-				 name);
-			dchid->ifaces[index] = iface;
-			return iface;
-		}
-
 		dev_warn(dchid->dev, "No OF node for subdevice %s, ignoring.", name);
 		return NULL;
 	}
@@ -776,6 +252,8 @@ dchid_get_interface(struct dockchannel_hid *dchid, int index, const char *name)
 	iface->power_method = DCHID_POWER_METHOD_1;
 	of_property_read_u32(iface->of_node, "apple,power-method",
 			     &iface->power_method);
+	if (iface->power_method == DCHID_POWER_METHOD_2)
+		strscpy(iface->gpio_name, "afe-reset", MAX_GPIO_NAME);
 
 	dchid->ifaces[index] = iface;
 	return iface;
@@ -842,76 +320,6 @@ static int dchid_send(struct dchid_iface *iface, u32 flags, void *msg, size_t si
 	return 0;
 }
 
-/*
- * Once a shared FIFO is registered, MTP stops acknowledging comm commands over
- * DockChannel, which is consistent with the replies moving into the ring the
- * host is then expected to drain.  Show the ring's head and tail and the first
- * bytes of its data area whenever a command goes unanswered.
- *
- * The layout is AIDCircularBufferShared's: the registered size is the whole
- * allocation, the first eight bytes are two u32 indices, the payload starts at
- * +8 and its capacity is size - 8.  Which of the two indices MTP moves is what
- * these lines are here to show.
- */
-static void dchid_dump_shmem(struct dockchannel_hid *dchid, bool only_on_change)
-{
-	unsigned int i;
-
-	for (i = 0; i < dchid->nr_fifos; i++) {
-		struct dchid_shmem_fifo *fifo = &dchid->fifos[i];
-		u32 *hdr = fifo->buf;
-		u32 head, tail;
-
-		if (!fifo->buf)
-			continue;
-
-		dma_rmb();
-		head = READ_ONCE(hdr[0]);
-		tail = READ_ONCE(hdr[1]);
-
-		if (only_on_change && fifo->seen &&
-		    head == fifo->last_head && tail == fifo->last_tail)
-			continue;
-
-		fifo->last_head = head;
-		fifo->last_tail = tail;
-		fifo->seen = true;
-
-		/*
-		 * Dump from offset zero, not from the data area.  Which eight
-		 * bytes are the ring's indices is inferred rather than read -
-		 * AIDCircularBufferShared only proves that the payload starts
-		 * at +8 - so print the header and the start of the payload
-		 * together and let a real message be recognised wherever it
-		 * lands.  A control reply begins 08 11.
-		 */
-		dev_info(dchid->dev,
-			 "Shared FIFO #%u: head=%u tail=%u capacity=%u raw=%*ph\n",
-			 i, head, tail, fifo->size - 8,
-			 (int)min_t(unsigned int, fifo->size, 128),
-			 (u8 *)fifo->buf);
-	}
-}
-
-/*
- * Everything about a received packet that is cheap to print.  The outer header
- * is eight bytes and self-describing, so print it field by field rather than as
- * a hex blob, and follow it with as much of the body as is likely to matter.
- */
-static void dchid_dump_packet(struct dockchannel_hid *dchid, struct dchid_hdr *hdr,
-			      void *body, const char *why)
-{
-	unsigned int shown = min_t(unsigned int, hdr->length, 48);
-
-	dev_info(dchid->dev,
-		 "%s: hdr_len=%u type=0x%02x length=%u seq=%u iface=%u retry=%u event=0x%02x body=%*ph\n",
-		 why, hdr->hdr_len, hdr->channel, hdr->length, hdr->seq,
-		 hdr->iface, hdr->retry, hdr->event, shown, (u8 *)body);
-}
-
-static int dchid_get_report_cmd(struct dchid_iface *iface, u8 reportnum,
-				void *buf, size_t len);
-
 static int dchid_cmd(struct dchid_iface *iface, u32 type, u32 req,
 		     void *data, size_t size, void *resp_buf, size_t resp_size)
 {
@@ -931,19 +339,9 @@ static int dchid_cmd(struct dchid_iface *iface, u32 type, u32 req,
 	if (ret < 0)
 		goto done;
 
-	if (!wait_for_completion_timeout(&iface->out_complete,
-					 msecs_to_jiffies(command_timeout_ms))) {
+	if (!wait_for_completion_timeout(&iface->out_complete, msecs_to_jiffies(COMMAND_TIMEOUT_MS))) {
 		dev_err(iface->dchid->dev, "output report 0x%x to iface  %d (%s) timed out\n",
 			report_id, iface->index, iface->name);
-		dchid_dump_shmem(iface->dchid, false);
-		if (iface->dchid->nr_fifos && shared_buffer_lossy_ack) {
-			dev_info(iface->dchid->dev,
-				 "Report 0x%x unanswered with %u FIFO(s) registered, continuing\n",
-				 report_id, iface->dchid->nr_fifos);
-			iface->retcode = 0;
-			ret = 0;
-			goto done;
-		}
 		ret = -ETIMEDOUT;
 		goto done;
 	}
@@ -978,265 +376,23 @@ static int dchid_enable_interface(struct dchid_iface *iface)
 	return dchid_comm_cmd(iface->dchid, msg, sizeof(msg));
 }
 
-/*
- * Find the SMC that owns the AFE supply line.
- *
- * The reset half of the J700 contract is keyW('pmIP'), a plain SMC key rather
- * than a GPIO, so there is no gpiod for it and no separate DT phandle to follow.
- * Both functions live on the same controller by construction - the ADT gives
- * them the same provider - so the SMC is reached through the gpiochip that
- * supplied apple,afe-reset-gpios: its parent is the macsmc-gpio MFD child and
- * that device's parent is the SMC itself.  The compatible is checked before the
- * drvdata is trusted, so a DT that wires the line to some other controller fails
- * closed instead of handing back a foreign pointer.
- */
-static struct apple_smc *dchid_afe_smc(struct dchid_iface *iface)
-{
-	struct gpio_chip *gc;
-	struct device *smc_dev;
-
-	if (iface->smc)
-		return iface->smc;
-
-	if (!iface->afe_reset)
-		return NULL;
-
-	gc = gpiod_to_chip(iface->afe_reset);
-	if (!gc || !gc->parent || !gc->parent->parent)
-		return NULL;
-
-	smc_dev = gc->parent->parent;
-	if (!device_is_compatible(smc_dev, "apple,smc"))
-		return NULL;
-
-	iface->smc = dev_get_drvdata(smc_dev);
-	return iface->smc;
-}
-
-static bool dchid_uses_transactional_power(struct dchid_iface *iface)
-{
-	const char *firmware_name;
-
-	return of_property_read_bool(iface->dchid->dev->of_node, "apple,no-stm") &&
-	       !strcmp(iface->name, "multi-touch") &&
-	       !of_property_read_string(iface->of_node, "firmware-name",
-					&firmware_name) &&
-	       !strcmp(firmware_name, "apple/tpmtfw-j700.bin");
-}
-
-/* Which form of opcode 0x40 to use for this interface. */
-static u8 dchid_power_method(struct dchid_iface *iface)
-{
-	if (power_method == DCHID_POWER_FORM_PLAIN ||
-	    power_method == DCHID_POWER_FORM_PHASED)
-		return power_method;
-
-	return iface->power_method;
-}
-
-/*
- * Hardware-proven J700 Power Method 2 start. The GPIO descriptor is active
- * low, so use logical values: high asserts the line while firmware is staged,
- * and low releases it between the two MTP notifications. This is one ON
- * transition; no speculative OFF cycle or secondary SMC reset participates.
- */
-static int dchid_power_method_2_start(struct dchid_iface *iface)
-{
-	u8 msg[DCHID_POWER_METHOD_2_CMD_SIZE];
-	int ret;
-
-	dchid_pm2_command(iface->index, false, msg);
-	ret = dchid_comm_cmd(iface->dchid, msg, sizeof(msg));
-	if (ret < 0)
-		return ret;
-
-	gpiod_set_value_cansleep(iface->afe_reset, 0);
-
-	dchid_pm2_command(iface->index, true, msg);
-	ret = dchid_comm_cmd(iface->dchid, msg, sizeof(msg));
-	if (ret < 0)
-		gpiod_set_value_cansleep(iface->afe_reset, 1);
-
-	return ret;
-}
-
-/*
- * Run the power-sequence half of a multi-touch power transition.
- *
- * On J700 this line is not an MTP-requested GPIO: MTP sends no INIT_GPIO_REQUEST
- * for multi-touch and its firmware does not implement CMD_ACK_GPIO_CMD, because
- * the line is an SMC platform function - function-afe-reset is
- * pKW8('pcIO', 0x10000, 0x130000), i.e. SMC GPIO index 0x13, key gP13 - that
- * only the host can drive.  The index decode is the same one already qualified
- * for this machine's MT7932: its function-reg_on is pKW8('pcIO', 0x800000,
- * 0x80000) and works through smc_gpio line 8.
- *
- * The levels and delays come from the shipping MTP_SYS personality documented
- * above; both are absolute line levels, so the raw accessor is used and the DT
- * active-low flag is deliberately not consulted.  The line is read back on both
- * sides of the write so a boot log shows what the platform actually did rather
- * than only what was asked for.
- */
-static int dchid_afe_power_sequence(struct dchid_iface *iface, bool enable)
-{
-	int level = !!(enable ? afe_enable_level : afe_disable_level);
-	u32 delay_us = enable ? DCHID_AFE_RESET_ENABLE_DELAY_US
-			      : DCHID_AFE_RESET_DISABLE_DELAY_US;
-	int before, after, ret;
-
-	if (!iface->afe_reset) {
-		dev_err(iface->dchid->dev, "No AFE supply line for %s\n",
-			iface->name);
-		return -ENODEV;
-	}
-
-	before = gpiod_get_raw_value_cansleep(iface->afe_reset);
-
-	ret = gpiod_direction_output_raw(iface->afe_reset, level);
-	if (ret) {
-		dev_err(iface->dchid->dev,
-			"Failed to drive the %s AFE supply line to %d: %d\n",
-			iface->name, level, ret);
-		return ret;
-	}
-
-	after = gpiod_get_raw_value_cansleep(iface->afe_reset);
-
-	dev_info(iface->dchid->dev,
-		 "AFE power sequence: %s enable=%d gP13=%d before=%d after=%d delay_us=%u\n",
-		 iface->name, enable, level, before, after, delay_us);
-
-	if (delay_us)
-		fsleep(delay_us);
-
-	return 0;
-}
-
-/*
- * Run the reset-sequence half of a multi-touch power transition.
- *
- * function-ipd-pwr-seq-control is keyW('pmIP'), so it is an ordinary SMC key
- * write rather than a GPIO operation.  Nothing in Linux has ever driven it, and
- * without it the Cumulus AFE is left holding whatever reset state the boot chain
- * gave it while MTP runs its HBPP bootload against it - which is exactly the
- * "AFE Chip Boot Failure for HBPP[0]: No HINT_L" the firmware reports.
- *
- * The write is intentionally not fatal.  A boot that cannot reach the SMC still
- * applies the sequence's delay and still produces MTP's verdict, and the log
- * line below says precisely which of the two happened, so one boot distinguishes
- * "the pmIP edge was missing" from "only the settle was missing".
- */
-static void dchid_ipd_reset_sequence(struct dchid_iface *iface, bool enable)
-{
-	u8 value = enable ? DCHID_IPD_RESET_ENABLE_VALUE
-			  : DCHID_IPD_RESET_DISABLE_VALUE;
-	u32 delay_us = enable ? DCHID_IPD_RESET_ENABLE_DELAY_US
-			      : DCHID_IPD_RESET_DISABLE_DELAY_US;
-	int before = -1, after = -1, ret = 0;
-	const char *how = "no-smc";
-	struct apple_smc *smc;
-	u8 read_value;
-
-	if (!ipd_reset_sequence)
-		return;
-
-	smc = dchid_afe_smc(iface);
-	if (smc) {
-		if (!apple_smc_read_u8(smc, SMC_KEY_IPD_PWR_SEQ, &read_value))
-			before = read_value;
-
-		if (!ipd_reset_write) {
-			how = "read-only";
-		} else {
-			ret = apple_smc_write_u8(smc, SMC_KEY_IPD_PWR_SEQ, value);
-			how = ret ? "write-failed" : "written";
-			if (!apple_smc_read_u8(smc, SMC_KEY_IPD_PWR_SEQ,
-					       &read_value))
-				after = read_value;
-		}
-	}
-
-	dev_info(iface->dchid->dev,
-		 "IPD reset sequence: %s enable=%d pmIP=%s value=%u before=%d after=%d delay_us=%u ret=%d\n",
-		 iface->name, enable, how, value, before, after, delay_us, ret);
-
-	if (delay_us)
-		fsleep(delay_us);
-}
-
-/*
- * AppleHIDTransportInterface runs power-sequence as its chip-power step and
- * reset-sequence as its reset step, so the supply is raised before the reset is
- * released and asserted again before the supply is removed.
- */
-static int dchid_platform_power_sequence(struct dchid_iface *iface, int state)
-{
-	int ret;
-
-	switch (state) {
-	case DCHID_POWER_STATE_OFF:
-		dchid_ipd_reset_sequence(iface, false);
-		return dchid_afe_power_sequence(iface, false);
-	case DCHID_POWER_STATE_ON:
-		ret = dchid_afe_power_sequence(iface, true);
-		if (ret < 0)
-			return ret;
-		dchid_ipd_reset_sequence(iface, true);
-		return 0;
-	default:
-		return 0;
-	}
-}
-
-static int dchid_reset_interface(struct dchid_iface *iface, int state,
-				 bool run_platform)
+static int dchid_reset_interface(struct dchid_iface *iface, int state)
 {
 	u8 msg[] = {
-		CMD_SET_POWER,
-		0,
-		iface->index,
-		state,
-		DCHID_POWER_PHASE_WILL_CHANGE,
-		0, 0, 0, 0,
+		DCHID_CMD_RESET_INTERFACE, DCHID_POWER_METHOD_1,
+		iface->index, state,
 	};
-	ktime_t started, settled;
-	int ret;
 
-	msg[1] = dchid_power_method(iface);
+	return dchid_comm_cmd(iface->dchid, msg, sizeof(msg));
+}
 
-	if (msg[1] != DCHID_POWER_FORM_PHASED)
-		return dchid_comm_cmd(iface->dchid, msg, 4);
+static int dchid_power_method_2_transition(struct dchid_iface *iface,
+					   bool has_changed)
+{
+	u8 msg[DCHID_POWER_METHOD_2_CMD_SIZE];
 
-	ret = dchid_comm_cmd(iface->dchid, msg, sizeof(msg));
-	if (ret < 0)
-		return ret;
-
-	/*
-	 * The platform sequences belong between the two phases: will-change lets
-	 * MTP quiesce the interface, the host then puts the AFE into the new
-	 * state, and has-changed tells MTP the platform is ready, which is when
-	 * it runs its own AFE bootload.  How much settle actually elapsed before
-	 * that bootload is the whole question here, so it is measured rather
-	 * than assumed.
-	 */
-	started = ktime_get();
-	if (run_platform) {
-		ret = dchid_platform_power_sequence(iface, state);
-		if (ret < 0)
-			return ret;
-	}
-	settled = ktime_get();
-
-	msg[4] = DCHID_POWER_PHASE_HAS_CHANGED;
-	ret = dchid_comm_cmd(iface->dchid, msg, sizeof(msg));
-
-	dev_info(iface->dchid->dev,
-		 "Power transition %s state=%d: platform=%s %lldus has-changed=%lldus ret=%d\n",
-		 iface->name, state, run_platform ? "run" : "skipped",
-		 ktime_us_delta(settled, started),
-		 ktime_us_delta(ktime_get(), settled), ret);
-
-	return ret;
+	dchid_pm2_command(iface->index, has_changed, msg);
+	return dchid_comm_cmd(iface->dchid, msg, sizeof(msg));
 }
 
 static int dchid_send_firmware(struct dchid_iface *iface, void *firmware, size_t size)
@@ -1255,25 +411,14 @@ static int dchid_send_firmware(struct dchid_iface *iface, void *firmware, size_t
 		.iface = iface->index,
 		.size = size,
 	};
-	/*
-	 * A start can be retried, so this buffer is allocated once and reused.
-	 * It used to be a fresh dmam_alloc_coherent() per attempt, which leaked
-	 * the whole image every time an interface failed to come up.
-	 */
-	if (!iface->fw_dma_buf) {
-		iface->fw_dma_buf = dmam_alloc_coherent(iface->dchid->dev, size,
-						        &iface->fw_dma_addr,
-						        GFP_KERNEL);
-		if (IS_ERR_OR_NULL(iface->fw_dma_buf)) {
-			void *err = iface->fw_dma_buf;
+	dma_addr_t addr;
+	void *buf = dmam_alloc_coherent(iface->dchid->dev, size, &addr, GFP_KERNEL);
 
-			iface->fw_dma_buf = NULL;
-			return err ? PTR_ERR(err) : -ENOMEM;
-		}
-	}
+	if (IS_ERR_OR_NULL(buf))
+		return buf ? PTR_ERR(buf) : -ENOMEM;
 
-	msg.addr = iface->fw_dma_addr;
-	memcpy(iface->fw_dma_buf, firmware, size);
+	msg.addr = addr;
+	memcpy(buf, firmware, size);
 	wmb();
 
 	return dchid_comm_cmd(iface->dchid, &msg, sizeof(msg));
@@ -1292,13 +437,6 @@ static int dchid_get_firmware(struct dchid_iface *iface, void **firmware, size_t
 		/* Firmware is only for some devices */
 		*firmware = NULL;
 		*size = 0;
-		return 0;
-	}
-
-	/* Already parsed by an earlier start attempt. */
-	if (iface->fw) {
-		*firmware = iface->fw;
-		*size = iface->fw_size;
 		return 0;
 	}
 
@@ -1328,8 +466,6 @@ static int dchid_get_firmware(struct dchid_iface *iface, void **firmware, size_t
 	if (hdr->iface_offset)
 		fw_data[hdr->iface_offset] = iface->index;
 
-	iface->fw = fw_data;
-	iface->fw_size = hdr->data_length;
 	*firmware = fw_data;
 	*size = hdr->data_length;
 
@@ -1338,9 +474,11 @@ done:
 	return ret;
 }
 
-static int dchid_request_gpio(struct dchid_iface *iface)
+static int dchid_request_gpio(struct dchid_iface *iface,
+			      enum gpiod_flags flags)
 {
 	char prop_name[MAX_GPIO_NAME + 16];
+	int ret;
 
 	if (iface->gpio)
 		return 0;
@@ -1350,490 +488,16 @@ static int dchid_request_gpio(struct dchid_iface *iface)
 
 	snprintf(prop_name, sizeof(prop_name), "apple,%s", iface->gpio_name);
 
-	iface->gpio = devm_gpiod_get_index(iface->dchid->dev, prop_name, 0, GPIOD_OUT_LOW);
+	iface->gpio = devm_gpiod_get_index(iface->dchid->dev, prop_name, 0,
+					   flags);
 
 	if (IS_ERR_OR_NULL(iface->gpio)) {
-		dev_err(iface->dchid->dev, "Failed to request GPIO %s-gpios\n", prop_name);
-		iface->gpio = NULL;
-		return -1;
-	}
-
-	return 0;
-}
-
-/*
- * Report the platform state the boot chain handed over, before anything in Linux
- * touches it.  At this point MTP still reports multi-touch as unpowered, so the
- * values logged here are the inherited "off" state of both halves of the
- * contract and say whether either write below actually changes anything.
- */
-static void dchid_report_platform_state(struct dchid_iface *iface)
-{
-	struct apple_smc_key_info info;
-	struct apple_smc *smc;
-	u8 value;
-	int ret;
-
-	dev_info(iface->dchid->dev,
-		 "AFE supply line claimed for %s: direction=%d raw=%d\n",
-		 iface->name, gpiod_get_direction(iface->afe_reset),
-		 gpiod_get_raw_value_cansleep(iface->afe_reset));
-
-	smc = dchid_afe_smc(iface);
-	if (!smc) {
-		dev_warn(iface->dchid->dev,
-			 "No SMC behind the %s AFE supply line; the reset-sequence cannot run\n",
-			 iface->name);
-		return;
-	}
-
-	ret = apple_smc_get_key_info(smc, SMC_KEY_IPD_PWR_SEQ, &info);
-	if (ret) {
-		dev_warn(iface->dchid->dev,
-			 "SMC key pmIP is not present for %s: %d\n",
-			 iface->name, ret);
-		return;
-	}
-
-	ret = apple_smc_read_u8(smc, SMC_KEY_IPD_PWR_SEQ, &value);
-	dev_info(iface->dchid->dev,
-		 "IPD reset key pmIP for %s: type=%p4ch size=%u flags=0x%02x value=%d\n",
-		 iface->name, &info.type_code, info.size, info.flags,
-		 ret ? ret : value);
-}
-
-/*
- * Claim the host-owned AFE supply line described by the parent node's
- * apple,afe-reset-gpios.  MTP never asks for it on J700, so it cannot come from
- * an INIT_GPIO_REQUEST the way it does on the STM platforms.  GPIOD_ASIS keeps
- * the line untouched until dchid_afe_power_sequence() drives it as part of a
- * real power transition.
- */
-static int dchid_request_afe_reset(struct dchid_iface *iface)
-{
-	struct gpio_desc *gpio;
-
-	if (iface->afe_reset)
-		return 0;
-
-	gpio = devm_gpiod_get(iface->dchid->dev, "apple,afe-reset", GPIOD_ASIS);
-	if (IS_ERR(gpio)) {
+		ret = iface->gpio ? PTR_ERR(iface->gpio) : -ENODEV;
 		dev_err(iface->dchid->dev,
-			"Failed to request apple,afe-reset-gpios for %s: %ld\n",
-			iface->name, PTR_ERR(gpio));
-		return PTR_ERR(gpio);
-	}
-
-	iface->afe_reset = gpio;
-	dchid_report_platform_state(iface);
-	return 0;
-}
-
-static bool dchid_adopt_preinitialized_ipd_functions(struct dchid_iface *iface)
-{
-	/*
-	 * J700 no longer describes the trackpad reset as an SMC GPIO.  Its ADT
-	 * uses an eight-byte pcIO platform-key write plus a separate pmIP power
-	 * sequence, both of which iBoot has already applied before the live MTP
-	 * handoff.  Keep this adoption path deliberately narrower than the GPIO
-	 * fallback: an unknown interface or request must still fail closed.
-	 */
-	return dchid_uses_transactional_power(iface) &&
-	       of_property_read_bool(iface->of_node,
-				     "apple,adopt-preinitialized-ipd-functions") &&
-	       !strcmp(iface->gpio_name, "afe-reset");
-}
-
-/*
- * Ask MTP what power state it thinks the interface is in.
- *
- * Opcode 0x42 is the power query of the 0x41/0x42 pair this firmware exposes
- * for multi-touch; it echoes the request plus a state byte and was already
- * exercised on this machine without side effects.  It answers the one question
- * the driver otherwise cannot: our 0x40 transaction is acknowledged, but that
- * only proves MTP parsed it, not that MTP considers the interface powered.
- */
-static void dchid_query_power_state(struct dchid_iface *iface, const char *when)
-{
-	u8 msg[] = { CMD_QUERY_POWER, 1, iface->index, 0 };
-	u8 resp[16] = {};
-	int ret;
-
-	if (!power_query || !dchid_uses_transactional_power(iface))
-		return;
-
-	ret = dchid_cmd(iface->dchid->comm, HID_FEATURE_REPORT, REQ_SET_REPORT,
-			msg, sizeof(msg), resp, sizeof(resp));
-
-	dev_info(iface->dchid->dev,
-		 "Power query %s %s: set ret=%d resp=%*ph\n",
-		 iface->name, when, ret, (int)sizeof(resp), resp);
-
-	/*
-	 * getInterfacePower sets 0x41 and then reads the same report back; only
-	 * the read carries the answer.
-	 */
-	memset(resp, 0, sizeof(resp));
-	ret = dchid_get_report_cmd(iface->dchid->comm, CMD_QUERY_POWER,
-				   resp, sizeof(resp));
-
-	dev_info(iface->dchid->dev,
-		 "Power query %s %s: get ret=%d resp=%*ph\n",
-		 iface->name, when, ret, (int)sizeof(resp), resp);
-}
-
-/*
- * Ask MTP to power the interface on with the other half of its power pair.
- *
- * The 0x40 transaction is acknowledged, yet 0x42 reports the interface in the
- * same state before and after it, so being parsed is not the same as being
- * applied.  Opcode 0x41 is this firmware's "Power request", takes exactly four
- * bytes and exists only for multi-touch, and is the one power opcode the driver
- * has never sent.  A firmware that refuses it just returns an error, which is
- * logged next to the 0x42 result either way.
- */
-static void dchid_power_request(struct dchid_iface *iface, int state)
-{
-	u8 msg[] = {
-		CMD_SET_POWER,
-		DCHID_POWER_FORM_PLAIN,
-		iface->index,
-		state,
-	};
-	int ret;
-
-	if (!power_request || !dchid_uses_transactional_power(iface))
-		return;
-
-	ret = dchid_comm_cmd(iface->dchid, msg, sizeof(msg));
-	dev_info(iface->dchid->dev, "Power set %s state=%d: ret=%d\n",
-		 iface->name, state, ret);
-}
-
-/*
- * Register one DRAM shared FIFO with MTP.
- *
- * The wire format is m1n1's InitBufMsg, decoded from a macOS trace: the same
- * shape as CMD_SEND_FIRMWARE without its interface byte, fifteen bytes in all,
- * which matches the "exactly 15 bytes" this firmware's comm_cr.c enforces.  MTP
- * confirms a successful registration in its own log as
- *
- *   hal.c:170: Registering DRAM Shared Buffer #N. Addr=<addr>, Size=<size>
- *
- * Log the host's own IOVA next to it rather than assuming how that Addr is
- * formatted: an earlier reading had it shifted right by four, and the two lines
- * side by side settle it without another experiment.
- *
- * This is the transport half A18 MTP appears to want and this driver has never
- * spoken: its bootloader gives up on the AFE within one RTKit log slot, with no
- * measurable elapsed time and no bus traffic, which is a refused precondition
- * rather than a part that failed to answer.
- */
-static int dchid_register_shared_fifo(struct dockchannel_hid *dchid,
-				      unsigned int index)
-{
-	struct dchid_shmem_fifo *fifo = &dchid->fifos[index];
-	struct {
-		u8 cmd;
-		u8 unk1;
-		u8 unk2;
-		u64 addr;
-		u32 size;
-	} __packed msg = {
-		.cmd = CMD_INIT_SHARED_BUFFER,
-		.unk1 = shared_buffer_unk1,
-		.unk2 = shared_buffer_unk2,
-		.size = shared_buffer_size,
-	};
-	dma_addr_t addr;
-	void *buf;
-	int ret;
-
-	BUILD_BUG_ON(sizeof(msg) != 15);
-	if (shared_buffer_size < 9) {
-		dev_err(dchid->dev, "Shared FIFO size %u is smaller than its 8-byte header\n",
-			shared_buffer_size);
-		return -EINVAL;
-	}
-
-	buf = dmam_alloc_coherent(dchid->dev, shared_buffer_size, &addr,
-				  GFP_KERNEL);
-	if (IS_ERR_OR_NULL(buf)) {
-		dev_err(dchid->dev, "Failed to allocate the %u-byte shared FIFO\n",
-			shared_buffer_size);
-		return buf ? PTR_ERR(buf) : -ENOMEM;
-	}
-
-	/*
-	 * The buffer starts with the FIFO's own head and tail, which MTP reads
-	 * as soon as it owns the registration, so they have to be zero before
-	 * the address goes out.  dma_alloc_coherent() already zeroes, but say so
-	 * rather than depend on it.
-	 */
-	memset(buf, 0, sizeof(u32) * 2);
-	msg.addr = addr;
-	wmb();
-
-	/*
-	 * Claim it before sending, not after.  MTP registers the buffer as soon
-	 * as it parses the message - it says so in its own log - but does not
-	 * acknowledge the command, so waiting for an ack that never comes used
-	 * to leave this unset and register a second buffer on the next attempt.
-	 * Registering the same FIFO twice takes the coprocessor down:
-	 *
-	 *   hal.c:170: Registering DRAM Shared Buffer #1. Addr=..., Size=16384
-	 *   RTKit: co-processor has crashed
-	 *   ESR = 0x96000044  FAR = 0x1010108eb80
-	 *
-	 * so each index must go out exactly once for the life of the device.
-	 */
-	fifo->buf = buf;
-	fifo->addr = addr;
-	fifo->size = shared_buffer_size;
-	dchid->nr_fifos = index + 1;
-
-	/*
-	 * macOS sends this as a feature SET_REPORT with report ID 0x91 on the
-	 * management interface, which is what dchid_comm_cmd() is: feature
-	 * report, REQ_SET_REPORT, interface 0.
-	 */
-	ret = dchid_comm_cmd(dchid, &msg, sizeof(msg));
-	dev_info(dchid->dev,
-		 "Shared FIFO #%u: iova=%pad size=%u unk=%d,%d ret=%d\n",
-		 index, &addr, shared_buffer_size, shared_buffer_unk1,
-		 shared_buffer_unk2, ret);
-
-	return ret;
-}
-
-static void dchid_shmem_poll_work(struct work_struct *ws)
-{
-	struct dockchannel_hid *dchid =
-		container_of(to_delayed_work(ws), struct dockchannel_hid,
-			     shmem_poll_work);
-
-	dchid_dump_shmem(dchid, true);
-
-	if (shmem_poll_interval())
-		queue_delayed_work(dchid->aux_wq, &dchid->shmem_poll_work,
-				   msecs_to_jiffies(shmem_poll_interval()));
-}
-
-static struct dchid_iface *dchid_find_iface(struct dockchannel_hid *dchid,
-					   const char *name)
-{
-	int i;
-
-	for (i = 0; i < MAX_INTERFACES; i++)
-		if (dchid->ifaces[i] && !strcmp(dchid->ifaces[i]->name, name))
-			return dchid->ifaces[i];
-
-	return NULL;
-}
-
-static void dchid_probe_command_channel(struct dockchannel_hid *dchid,
-					const char *when)
-{
-	struct dchid_iface *iface;
-	u8 resp[24] = {};
-	int ret;
-
-	if (!shared_buffer_probe)
-		return;
-
-	iface = dchid_find_iface(dchid, "multi-touch");
-	if (!iface)
-		return;
-
-	ret = dchid_get_report_cmd(iface, MT_REPORT_DIMENSIONS, resp, sizeof(resp));
-	dev_info(dchid->dev, "Probe %s: report 0x%02x ret=%d resp=%*ph\n",
-		 when, MT_REPORT_DIMENSIONS, ret, (int)sizeof(resp), resp);
-}
-
-/*
- * Put the multi-touch interface through a transactional power transition before
- * the FIFO handshake.
- *
- * The transaction and the platform sequence are separable, and separating them
- * is the point: will-change and has-changed are messages to MTP, while gP13 and
- * pmIP are writes to a bus the built-in keyboard is also on.  Running the first
- * without the second asks whether MTP wants to have been told about a power
- * transition, without asking the keyboard to pay for the answer.
- */
-static void dchid_handshake_power(struct dockchannel_hid *dchid)
-{
-	struct dchid_iface *iface;
-	int ret;
-
-	if (!handshake_power_transition)
-		return;
-
-	iface = dchid_find_iface(dchid, "multi-touch");
-	if (!iface) {
-		dev_warn(dchid->dev,
-			 "No multi-touch interface to power up before the handshake\n");
-		return;
-	}
-
-	if (handshake_power_platform) {
-		dev_warn(dchid->dev,
-			 "Pre-handshake transition will drive gP13 and pmIP; the built-in keyboard shares that bus and MTP is not told to re-enumerate\n");
-		ret = dchid_request_afe_reset(iface);
-		if (ret < 0) {
-			dev_err(dchid->dev,
-				"No AFE supply line, not running the platform sequence: %d\n",
-				ret);
-			return;
-		}
-	}
-
-	dchid_query_power_state(iface, "before transition");
-
-	ret = dchid_reset_interface(iface, DCHID_POWER_STATE_OFF,
-				    handshake_power_platform);
-	if (ret < 0)
-		dev_err(dchid->dev, "Pre-handshake power off failed: %d\n", ret);
-
-	ret = dchid_reset_interface(iface, DCHID_POWER_STATE_ON,
-				    handshake_power_platform);
-	if (ret < 0)
-		dev_err(dchid->dev, "Pre-handshake power on failed: %d\n", ret);
-
-	dchid_query_power_state(iface, "after transition");
-	dchid_power_request(iface, DCHID_POWER_STATE_ON);
-	dchid_query_power_state(iface, "after request");
-}
-
-/*
- * The transport handshake, as AppleHIDTransportProtocolSCMFIFO::handshakeGated
- * performs it: the shared-memory FIFOs are handed to MTP once, on the
- * management interface, before any HID interface has been started, and only
- * then is an interface allowed to bootload.
- */
-static void dchid_handshake_work(struct work_struct *ws)
-{
-	struct dockchannel_hid *dchid =
-		container_of(to_delayed_work(ws), struct dockchannel_hid,
-			     handshake_work);
-	unsigned int count = shared_buffer_count;
-	unsigned int i;
-
-	/*
-	 * Every interface that MTP has already announced has its
-	 * CMD_ENABLE_INTERFACE issued from new_iface_wq, so draining that queue
-	 * is what makes "the keyboard is already enabled" true rather than
-	 * likely.
-	 */
-	if (shared_buffer_after_enum)
-		flush_workqueue(dchid->new_iface_wq);
-
-	if (count > MAX_SHARED_FIFOS) {
-		dev_warn(dchid->dev, "Clamping shared_buffer_count %u to %u\n",
-			 count, MAX_SHARED_FIFOS);
-		count = MAX_SHARED_FIFOS;
-	}
-
-	dchid_probe_command_channel(dchid, "before handshake");
-	dchid_handshake_power(dchid);
-
-	if (system_awake_report) {
-		u8 msg[] = { CMD_SYSTEM_AWAKE, DCHID_SYSTEM_AWAKE };
-		int awake = dchid_comm_cmd(dchid, msg, sizeof(msg));
-
-		dev_info(dchid->dev, "System awake report: ret=%d\n", awake);
-	}
-
-	dev_info(dchid->dev,
-		 "Transport handshake: registering %u shared FIFO(s) of %u bytes\n",
-		 count, shared_buffer_size);
-
-	for (i = 0; i < count; i++) {
-		int ret = dchid_register_shared_fifo(dchid, i);
-
-		if (ret < 0) {
-			dev_err(dchid->dev,
-				"Shared FIFO #%u registration failed: %d\n",
-				i, ret);
-			break;
-		}
-	}
-
-	complete_all(&dchid->handshake_done);
-	dchid_dump_shmem(dchid, false);
-	dchid_probe_command_channel(dchid, "after handshake");
-	dchid_dump_shmem(dchid, false);
-
-	if (dchid->nr_fifos && shmem_poll_interval())
-		queue_delayed_work(dchid->aux_wq, &dchid->shmem_poll_work,
-				   msecs_to_jiffies(shmem_poll_interval()));
-}
-
-/*
- * Arm the handshake off the first DockChannel read completion.  Called from the
- * receive callback, so it must not sleep; the registration itself runs on the
- * comm interface's own workqueue, which is also where the comm packet work
- * runs, so the two cannot interleave.
- */
-static void dchid_arm_handshake(struct dockchannel_hid *dchid, unsigned int delay_ms)
-{
-	if (!shared_buffer || dchid->handshake_armed || !dchid->aux_wq)
-		return;
-
-	dchid->handshake_armed = true;
-	dev_info(dchid->dev, "Handshake armed, running in %u ms\n", delay_ms);
-	queue_delayed_work(dchid->aux_wq, &dchid->handshake_work,
-			   msecs_to_jiffies(delay_ms));
-}
-
-/*
- * There is one MTP transport per machine and the handshake is a one-shot, so
- * enabling the parameter after boot has to reach that transport to be worth
- * anything.  Keeping the pointer here is what lets a run be armed deliberately,
- * from a shell, against a machine whose built-in keyboard is known to be
- * working at that moment - rather than only ever at boot, where there is
- * nothing to compare against.
- */
-static struct dockchannel_hid *dchid_transport;
-
-static int dchid_shared_buffer_set(const char *val, const struct kernel_param *kp)
-{
-	int ret = param_set_bool(val, kp);
-
-	if (ret)
+			"Failed to request GPIO %s-gpios: %d\n",
+			prop_name, ret);
+		iface->gpio = NULL;
 		return ret;
-
-	if (shared_buffer && dchid_transport && dchid_transport->aux_wq)
-		dchid_arm_handshake(dchid_transport, 0);
-
-	return 0;
-}
-
-/*
- * AppleHIDTransportProtocolSCMFIFO::handleBootload will not run a CBOR bootload
- * before the handshake has been recorded, and J700 is a CBOR part.  Wait rather
- * than register here: the registration is a one-shot, so an interface start
- * must never be the thing that performs it.
- */
-static int dchid_await_handshake(struct dchid_iface *iface)
-{
-	struct dockchannel_hid *dchid = iface->dchid;
-
-	if (!shared_buffer)
-		return 0;
-
-	if (!dchid->handshake_armed) {
-		dev_warn(dchid->dev,
-			 "Starting %s with no transport handshake armed\n",
-			 iface->name);
-		return 0;
-	}
-
-	if (!wait_for_completion_timeout(&dchid->handshake_done,
-					 msecs_to_jiffies(HANDSHAKE_TIMEOUT_MS))) {
-		dev_err(dchid->dev,
-			"Transport handshake did not complete, not bootloading %s\n",
-			iface->name);
-		return -ETIMEDOUT;
 	}
 
 	return 0;
@@ -1841,7 +505,6 @@ static int dchid_await_handshake(struct dchid_iface *iface)
 
 static int dchid_start_interface(struct dchid_iface *iface)
 {
-	u8 method;
 	bool power_method_2;
 	void *fw;
 	size_t size;
@@ -1852,86 +515,52 @@ static int dchid_start_interface(struct dchid_iface *iface)
 		return -EINPROGRESS;
 	}
 
-	/*
-	 * A timed-out start releases the latch so it can be retried, but the
-	 * consumer of an input node reopens it as fast as it is refused, and
-	 * every attempt re-uploads the image and power-cycles the AFE - which
-	 * also disturbs the keyboard, since they share the SCM bus.  Stop after
-	 * as many attempts as MTP's own _mgr_esd_recovery gives the part before
-	 * it gives up, and then fail fast and quietly.
-	 */
-	if (iface->start_attempts >= max_start_attempts) {
-		dev_warn_once(iface->dchid->dev,
-			      "Interface %s failed to start %u times, not retrying\n",
-			      iface->name, iface->start_attempts);
-		return -EIO;
-	}
-
-	dev_info(iface->dchid->dev, "Starting interface %s (attempt %u)\n",
-		 iface->name, ++iface->start_attempts);
+	dev_info(iface->dchid->dev, "Starting interface %s\n", iface->name);
 
 	iface->starting = true;
-	method = dchid_power_method(iface);
-	power_method_2 = method == DCHID_POWER_METHOD_2;
-	if (method != DCHID_POWER_METHOD_1 && !power_method_2) {
+
+	power_method_2 = iface->power_method == DCHID_POWER_METHOD_2;
+	if (iface->power_method != DCHID_POWER_METHOD_1 && !power_method_2) {
 		dev_err(iface->dchid->dev,
 			"Unsupported power method %u for %s\n",
-			method, iface->name);
+			iface->power_method, iface->name);
 		ret = -EINVAL;
 		goto err;
 	}
 
 	/* Look to see if we need firmware */
 	ret = dchid_get_firmware(iface, &fw, &size);
-	if (ret < 0)
-		goto err;
-	if (power_method_2 && (!fw || !size)) {
+	if (ret < 0) {
 		dev_err(iface->dchid->dev,
-			"Power method 2 for %s requires firmware\n",
+			"Failed to load firmware for %s: %d\n",
+			iface->name, ret);
+		goto err;
+	}
+
+	if (power_method_2 && (!fw || !size || !iface->gpio_name[0])) {
+		dev_err(iface->dchid->dev,
+			"Power method 2 for %s requires firmware and afe-reset\n",
 			iface->name);
 		ret = -EINVAL;
 		goto err;
 	}
 
-	/*
-	 * J700 owns the AFE reset itself instead of being asked for it, so the
-	 * line has to be claimed before the power transitions below.
-	 */
-	if (power_method_2) {
-		ret = dchid_request_afe_reset(iface);
+	/* Dynamic requests include ID zero; Power Method 2 uses afe-reset. */
+	if (iface->gpio_request_seen || power_method_2) {
+		ret = dchid_request_gpio(iface, power_method_2 ?
+					 GPIOD_OUT_HIGH : GPIOD_OUT_LOW);
 		if (ret < 0)
 			goto err;
 
-		ret = gpiod_direction_output(iface->afe_reset, 1);
-		if (ret < 0)
-			goto err;
-		msleep(50);
-	}
-
-	/* If we need a GPIO, make sure we have it. */
-	if (iface->gpio_id) {
-		if (dchid_adopt_preinitialized_ipd_functions(iface)) {
-			dev_info(iface->dchid->dev,
-				 "J700_MTP_IPD_ADOPT: interface=%s id=%u request=%s pcIO=live pmIP=live\n",
-				 iface->name, iface->gpio_id, iface->gpio_name);
-		} else {
-			ret = dchid_request_gpio(iface);
-			if (ret < 0)
-				goto err;
+		if (power_method_2) {
+			/* GPIO descriptors use logical values for active-low lines. */
+			gpiod_set_value_cansleep(iface->gpio, 1);
+			msleep(50);
 		}
 	}
 
 	/* Only multi-touch has firmware */
 	if (fw && size) {
-
-		/*
-		 * The FIFO registration is a transport-level operation that
-		 * happens once, on the comm interface, well before this point.
-		 * All an interface start owes it is the wait.
-		 */
-		ret = dchid_await_handshake(iface);
-		if (ret < 0)
-			goto err;
 
 		/* Send firmware to the device */
 		dev_info(iface->dchid->dev, "Sending firmware for %s\n", iface->name);
@@ -1943,20 +572,27 @@ static int dchid_start_interface(struct dchid_iface *iface)
 
 		dev_info(iface->dchid->dev,
 			 "Resetting %s with power method %u\n",
-			 iface->name, method);
+			 iface->name, iface->power_method);
 		if (power_method_2) {
-			ret = dchid_power_method_2_start(iface);
+			ret = dchid_power_method_2_transition(iface, false);
 			if (ret < 0)
 				goto err;
+
+			gpiod_set_value_cansleep(iface->gpio, 0);
+
+			ret = dchid_power_method_2_transition(iface, true);
+			if (ret < 0) {
+				gpiod_set_value_cansleep(iface->gpio, 1);
+				goto err;
+			}
 		} else {
 			ret = dchid_reset_interface(iface,
-						    DCHID_POWER_STATE_OFF,
-						    true);
+						    DCHID_POWER_STATE_OFF);
 			if (ret < 0)
 				goto err;
+
 			ret = dchid_reset_interface(iface,
-						    DCHID_POWER_STATE_ON,
-						    true);
+						    DCHID_POWER_STATE_ON);
 			if (ret < 0)
 				goto err;
 		}
@@ -2004,15 +640,6 @@ static int dchid_open(struct hid_device *hdev)
 
 		if (!wait_for_completion_timeout(&iface->ready, msecs_to_jiffies(START_TIMEOUT_MS))) {
 			dev_err(iface->dchid->dev, "iface %s start timed out\n", iface->name);
-			/*
-			 * Nothing else ever clears the latch that
-			 * dchid_start_interface() sets, so a single timed-out
-			 * start otherwise turns every later open into an
-			 * "already starting" refusal for the lifetime of the
-			 * boot.  Release it so the next open runs the start
-			 * sequence again.
-			 */
-			iface->starting = false;
 			return -ETIMEDOUT;
 		}
 	}
@@ -2198,7 +825,6 @@ static void dchid_handle_ready(struct dockchannel_hid *dchid, void *data, size_t
 	}
 
 	dev_info(dchid->dev, "Interface %s is now ready\n", iface->name);
-	iface->start_attempts = 0;
 	complete_all(&iface->ready);
 
 	/* When STM is ready, grab global device info */
@@ -2262,7 +888,7 @@ static void dchid_handle_init(struct dockchannel_hid *dchid, void *data, size_t 
 			if (sizeof(*req) > length)
 				break;
 
-			if (iface->gpio_id) {
+			if (iface->gpio_request_seen) {
 				dev_err(dchid->dev,
 					"Cannot request more than one GPIO per interface!\n");
 				break;
@@ -2270,9 +896,7 @@ static void dchid_handle_init(struct dockchannel_hid *dchid, void *data, size_t 
 
 			strscpy(iface->gpio_name, req->name, MAX_GPIO_NAME);
 			iface->gpio_id = req->id;
-			dev_info(dchid->dev,
-				 "Interface %s requested reset GPIO id=%u name=%s\n",
-				 iface->name, iface->gpio_id, iface->gpio_name);
+			iface->gpio_request_seen = true;
 			break;
 		}
 
@@ -2308,19 +932,6 @@ static void dchid_handle_init(struct dockchannel_hid *dchid, void *data, size_t 
 	if (hdr->more_packets)
 		return;
 
-	/*
-	 * A control-only interface has no HID descriptor and no OF node, so it
-	 * gets the enable message on its own rather than through the HID
-	 * device creation path.
-	 */
-	if (!iface->of_node) {
-		int ret = dchid_enable_interface(iface);
-
-		dev_info(dchid->dev, "Enabled control-only interface %s: %d\n",
-			 iface->name, ret);
-		return;
-	}
-
 	/* We need to enable STM first, since it'll give us the device IDs */
 	if (iface->dchid->id_ready || !strcmp(iface->name, "stm")) {
 		dchid_create_interface(iface);
@@ -2344,41 +955,14 @@ static void dchid_handle_gpio(struct dockchannel_hid *dchid, void *data, size_t 
 		goto err;
 	}
 
-	dev_info(dchid->dev, "GPIO command received: %s#%d cmd=%d\n",
-		 iface->name, cmd->gpio, cmd->cmd);
-
-	/*
-	 * J700's AFE reset is an eight-byte pcIO platform-key operation rather
-	 * than a conventional GPIO.  A dedicated diagnostic may acknowledge the
-	 * pulse without touching SMC so we can establish whether iBoot's inherited
-	 * IPD state is already sufficient.  This is deliberately gated by the same
-	 * exact interface contract as startup adoption and by a second DT opt-in;
-	 * it must never turn an unknown GPIO request into a successful no-op.
-	 */
-	if (dchid_adopt_preinitialized_ipd_functions(iface) &&
-	    of_property_read_bool(iface->of_node,
-				  "apple,ack-preinitialized-afe-pulse")) {
-		if (cmd->gpio != iface->gpio_id) {
-			dev_err(dchid->dev,
-				"Got adopted IPD command for bad GPIO %s#%d\n",
-				iface->name, cmd->gpio);
-			goto err;
-		}
-
-		if (cmd->cmd != 3) {
-			dev_err(dchid->dev,
-				"Unknown adopted IPD GPIO command %d\n", cmd->cmd);
-			goto err;
-		}
-
-		dev_info(dchid->dev,
-			 "J700_MTP_AFE_ACK_ONLY: interface=%s id=%u cmd=%u pcIO_writes=0\n",
-			 iface->name, iface->gpio_id, cmd->cmd);
-		retcode = 0;
-		goto ack;
+	if (!iface->gpio_request_seen) {
+		dev_err(dchid->dev,
+			"Got GPIO command without a request for %s\n",
+			iface->name);
+		goto err;
 	}
 
-	if (dchid_request_gpio(iface) < 0)
+	if (dchid_request_gpio(iface, GPIOD_OUT_LOW) < 0)
 		goto err;
 
 	if (!iface->gpio || cmd->gpio != iface->gpio_id) {
@@ -2390,42 +974,19 @@ static void dchid_handle_gpio(struct dockchannel_hid *dchid, void *data, size_t 
 	dev_info(dchid->dev, "GPIO command: %s#%d: %d\n", iface->name, cmd->gpio, cmd->cmd);
 
 	switch (cmd->cmd) {
-	case 3: {
-		u32 pulse_us = 10000;
-
-		/*
-		 * Older platforms never described the timing, so preserve their
-		 * historical 10-ms default.  J700's shipping MTP_SYS config gives
-		 * an exact 50-ms AFE disable delay and opts in through its interface
-		 * child instead of carrying another platform guess here.
-		 */
-		of_property_read_u32(iface->of_node, "apple,reset-pulse-us",
-				     &pulse_us);
-		if (!pulse_us || pulse_us > USEC_PER_SEC) {
-			dev_err(dchid->dev,
-				"Invalid reset pulse for %s: %u us\n",
-				iface->name, pulse_us);
-			break;
-		}
-
-		dev_info(dchid->dev,
-			 "GPIO pulse: %s#%d assert_us=%u\n",
-			 iface->name, cmd->gpio, pulse_us);
+	case 3:
+		/* Pulse.  */
 		gpiod_set_value_cansleep(iface->gpio, 1);
-		fsleep(pulse_us);
+		msleep(10); /* Random guess... */
 		gpiod_set_value_cansleep(iface->gpio, 0);
 		retcode = 0;
 		break;
-	}
 	default:
 		dev_err(dchid->dev, "Unknown GPIO command %d\n", cmd->cmd	);
 		break;
 	}
 
 err:
-	/* Keep the firmware-visible acknowledgement format identical on errors. */
-	;
-ack:
 	/* Ack it */
 	ack = kzalloc(sizeof(*ack) + length, GFP_KERNEL);
 	if (!ack)
@@ -2454,30 +1015,12 @@ static void dchid_handle_event(struct dockchannel_hid *dchid, void *data, size_t
 	case EVENT_GPIO_CMD:
 		dchid_handle_gpio(dchid, data, length);
 		break;
-	default:
-		/*
-		 * A18 MTP drives its own AFE recovery and logs "IPD power cycle
-		 * using reset request" before each retry.  If any part of that
-		 * is a request aimed at the host, it arrives here, and this
-		 * switch used to drop it without a trace.  Never stay silent
-		 * about an unhandled comm event again.
-		 */
-		dev_warn(dchid->dev, "Unhandled comm event 0x%02x (%zu bytes): %*ph\n",
-			 *p, length, (int)min(length, (size_t)32), data);
-		break;
 	}
 }
 
 static void dchid_handle_report(struct dchid_iface *iface, void *data, size_t length)
 {
 	struct dockchannel_hid *dchid = iface->dchid;
-
-	if (!iface->of_node) {
-		/* Control-only interface: log what it sends, do not route it. */
-		dev_info(dchid->dev, "Control interface %s report (%zu bytes): %*ph\n",
-			 iface->name, length, (int)min(length, (size_t)32), data);
-		return;
-	}
 
 	if (!iface->hid) {
 		dev_warn(dchid->dev, "Report received but %s is not initialized!\n", iface->name);
@@ -2498,24 +1041,11 @@ static void dchid_packet_work(struct work_struct *ws)
 	int type = FIELD_GET(FLAGS_GROUP, shdr->flags);
 	u8 *payload = work->data + sizeof(*shdr);
 
-	if (work->hdr.length < sizeof(*shdr) ||
-	    shdr->length > work->hdr.length - sizeof(*shdr)) {
-		dchid_dump_packet(dchid, &work->hdr, work->data,
-				  "Report with a bad sub header");
-		kfree(work);
+	if (shdr->length + sizeof(*shdr) > work->hdr.length) {
+		dev_err(dchid->dev, "Bad sub header length (%hu > %zu)\n",
+			shdr->length, work->hdr.length - sizeof(*shdr));
 		return;
 	}
-
-	/*
-	 * An input report of 0x96 on the management interface is the
-	 * coprocessor asking for a shared buffer back - releaseSharedMemory is
-	 * called on exactly that condition.  Nothing here can honour it yet;
-	 * say so rather than let it pass as an unknown event.
-	 */
-	if (work->hdr.iface == IFACE_COMM && shdr->length &&
-	    payload[0] == CMD_RELEASE_SHARED_BUFFER)
-		dev_warn(dchid->dev,
-			 "MTP asked for a shared buffer back (0x96), which is not implemented\n");
 
 	switch (type) {
 	case HID_INPUT_REPORT:
@@ -2532,68 +1062,12 @@ static void dchid_packet_work(struct work_struct *ws)
 	kfree(work);
 }
 
-/*
- * Complete whatever command is outstanding on this interface without looking at
- * a payload, because there is not one.  Everything that identifies the reply is
- * in the outer header, so log what it says next to what was expected and let
- * the caller see for itself whether they agree.
- */
-static void dchid_complete_bare(struct dchid_iface *iface, struct dchid_hdr *hdr,
-				const char *why)
-{
-	dev_info(iface->dchid->dev,
-		 "%s: completing report 0x%x on iface %d (%s), reply seq=%u expected %u\n",
-		 why, iface->out_report, iface->index, iface->name,
-		 hdr->seq, iface->tx_seq);
-
-	iface->resp_size = 0;
-	iface->out_report = -1;
-	iface->retcode = 0;
-	complete(&iface->out_complete);
-}
-
 static void dchid_handle_ack(struct dchid_iface *iface, struct dchid_hdr *hdr, void *data)
 {
 	struct dchid_subhdr *shdr = (void *)data;
 	u8 *payload = data + sizeof(*shdr);
 
-	/*
-	 * A reply with no room for a sub header used to underflow this
-	 * comparison and be reported as a nonsense length.  MTP sends exactly
-	 * such a reply - a zero-length one - to acknowledge a shared-FIFO
-	 * registration.
-	 */
-	if (hdr->length < sizeof(*shdr)) {
-		dchid_dump_packet(iface->dchid, hdr, data, "Reply with no sub header");
-		if (lenient_ack && iface->out_report != -1)
-			dchid_complete_bare(iface, hdr, "Bare reply");
-		else
-			dev_err(iface->dchid->dev,
-				"Reply too short for a sub header (%u < %zu)\n",
-				hdr->length, sizeof(*shdr));
-		return;
-	}
-
-	/*
-	 * getStatus reads byte 7 first: 0x80..0x85 is a transport error, any
-	 * other non-zero value is a plain failure, and only a zero there means
-	 * the sub-header's retcode is worth reading at all.
-	 */
-	if (hdr->event) {
-		dchid_dump_packet(iface->dchid, hdr, data, "Reply with an event");
-		dev_err(iface->dchid->dev,
-			"Report 0x%x on iface %d (%s) failed with event 0x%02x\n",
-			iface->out_report, iface->index, iface->name, hdr->event);
-		iface->resp_size = 0;
-		iface->out_report = -1;
-		iface->retcode = hdr->event >= 0x80 && hdr->event <= 0x85 ?
-			0xe0000001 : 0xe00002bc;
-		complete(&iface->out_complete);
-		return;
-	}
-
-	if (shdr->length > hdr->length - sizeof(*shdr)) {
-		dchid_dump_packet(iface->dchid, hdr, data, "Bad sub header length");
+	if (shdr->length + sizeof(*shdr) > hdr->length) {
 		dev_err(iface->dchid->dev, "Bad sub header length (%hu > %zu)\n",
 			shdr->length, hdr->length - sizeof(*shdr));
 		return;
@@ -2629,144 +1103,13 @@ static void dchid_handle_ack(struct dchid_iface *iface, struct dchid_hdr *hdr, v
 	complete(&iface->out_complete);
 }
 
-static void dchid_dispatch_packet(struct dockchannel_hid *dchid,
-				  struct dchid_hdr *hdr, void *data)
-{
-	struct dchid_iface *iface;
-	struct dchid_work *work;
-
-	if (hdr->iface >= MAX_INTERFACES) {
-		dchid_dump_packet(dchid, hdr, data, "Bad iface");
-		return;
-	}
-
-	iface = dchid->ifaces[hdr->iface];
-	if (!iface) {
-		dev_err(dchid->dev, "Received packet for uninitialized iface %d\n",
-			hdr->iface);
-		return;
-	}
-
-	if (packet_trace)
-		dchid_dump_packet(dchid, hdr, data, "Packet");
-
-	switch (hdr->channel) {
-	case DCHID_CHANNEL_CMD:
-		dchid_handle_ack(iface, hdr, data);
-		return;
-	case DCHID_CHANNEL_REPORT:
-		break;
-	case DCHID_CHANNEL_NOP:
-		/*
-		 * macOS consumes type zero without dispatching it.  Its read
-		 * completion then drains every shared FIFO, which the caller does
-		 * after this returns.
-		 */
-		if (packet_trace)
-			dchid_dump_packet(dchid, hdr, data, "No-op packet");
-		return;
-	default:
-		dchid_dump_packet(dchid, hdr, data, "Unknown message type");
-		return;
-	}
-
-	work = kzalloc(sizeof(*work) + hdr->length, GFP_KERNEL);
-	if (!work)
-		return;
-
-	work->hdr = *hdr;
-	work->iface = iface;
-	memcpy(work->data, data, hdr->length);
-	INIT_WORK(&work->work, dchid_packet_work);
-	queue_work(iface->wq, &work->work);
-}
-
-/*
- * AppleHIDTransportProtocolSCMFIFO drains every shared read FIFO after every
- * completed DockChannel read.  Each ring has two little-endian u32 indices,
- * followed by a byte ring of size total_size - 8.  MTP advances producer and
- * the host publishes consumer after it has copied a complete SCM message.
- */
-static void dchid_drain_shared_fifos(struct dockchannel_hid *dchid)
-{
-	unsigned int i;
-
-	for (i = 0; i < dchid->nr_fifos; i++) {
-		struct dchid_shmem_fifo *fifo = &dchid->fifos[i];
-		u32 *indices = fifo->buf;
-		u8 *ring = fifo->buf + 8;
-		size_t capacity = fifo->size - 8;
-
-		for (;;) {
-			struct dchid_hdr hdr;
-			u32 producer, consumer;
-			size_t available, packet_size;
-			u8 *packet;
-
-			dma_rmb();
-			producer = le32_to_cpu(READ_ONCE(indices[0]));
-			consumer = le32_to_cpu(READ_ONCE(indices[1]));
-			available = dchid_fifo_readable(producer, consumer,
-							 capacity);
-
-			if (producer >= capacity || consumer >= capacity) {
-				dev_err(dchid->dev,
-					"Shared FIFO #%u has invalid indices producer=%u consumer=%u capacity=%zu\n",
-					i, producer, consumer, capacity);
-				break;
-			}
-			if (available < sizeof(hdr) + sizeof(u32))
-				break;
-
-			dchid_fifo_copy(&hdr, ring, capacity, consumer,
-					 sizeof(hdr));
-			if (hdr.hdr_len != sizeof(hdr) || (hdr.length & 3)) {
-				dev_err(dchid->dev,
-					"Shared FIFO #%u has invalid SCM header length=%u body=%u\n",
-					i, hdr.hdr_len, hdr.length);
-				break;
-			}
-
-			packet_size = sizeof(hdr) + hdr.length + sizeof(u32);
-			if (packet_size >= capacity) {
-				dev_err(dchid->dev,
-					"Shared FIFO #%u packet size %zu exceeds capacity %zu\n",
-					i, packet_size, capacity);
-				break;
-			}
-			if (available < packet_size)
-				break;
-
-			packet = kmalloc(packet_size, GFP_KERNEL);
-			if (!packet)
-				break;
-			dchid_fifo_copy(packet, ring, capacity, consumer, packet_size);
-
-			if (dchid_checksum(packet, packet_size) != 0xffffffff) {
-				dev_err(dchid->dev,
-					"Shared FIFO #%u checksum mismatch\n", i);
-				kfree(packet);
-				break;
-			}
-
-			memcpy(&hdr, packet, sizeof(hdr));
-			dchid_dispatch_packet(dchid, &hdr, packet + sizeof(hdr));
-			kfree(packet);
-
-			consumer = (consumer + packet_size) % capacity;
-			dma_wmb();
-			WRITE_ONCE(indices[1], cpu_to_le32(consumer));
-		}
-	}
-}
-
 static void dchid_handle_packet(void *cookie, size_t avail)
 {
 	struct dockchannel_hid *dchid = cookie;
 	struct dchid_hdr hdr;
+	struct dchid_work *work;
+	struct dchid_iface *iface;
 	u32 checksum;
-
-	dchid_arm_handshake(dchid, shared_buffer_delay_ms);
 
 	if (dockchannel_recv(dchid->dc, &hdr, sizeof(hdr)) != sizeof(hdr)) {
 		dev_err(dchid->dev, "Read failed (header)\n");
@@ -2792,8 +1135,40 @@ static void dchid_handle_packet(void *cookie, size_t avail)
 		goto done;
 	}
 
-	dchid_dispatch_packet(dchid, &hdr, dchid->pkt_buf);
-	dchid_drain_shared_fifos(dchid);
+
+	if (hdr.iface >= MAX_INTERFACES) {
+		dev_err(dchid->dev, "Bad iface %d\n", hdr.iface);
+	}
+
+	iface = dchid->ifaces[hdr.iface];
+
+	if (!iface) {
+		dev_err(dchid->dev, "Received packet for uninitialized iface %d\n", hdr.iface);
+		goto done;
+	}
+
+	switch (hdr.channel) {
+		case DCHID_CHANNEL_CMD:
+			dchid_handle_ack(iface, &hdr, dchid->pkt_buf);
+			goto done;
+		case DCHID_CHANNEL_REPORT:
+			break;
+		default:
+			dev_warn(dchid->dev, "Unknown channel 0x%x, treating as report...\n",
+				 hdr.channel);
+			break;
+	}
+
+	work = kzalloc(sizeof(*work) + hdr.length, GFP_KERNEL);
+	if (!work)
+		return;
+
+	work->hdr = hdr;
+	work->iface = iface;
+	memcpy(work->data, dchid->pkt_buf, hdr.length);
+	INIT_WORK(&work->work, dchid_packet_work);
+
+	queue_work(iface->wq, &work->work);
 
 done:
 	dockchannel_await(dchid->dc, dchid_handle_packet, dchid, sizeof(struct dchid_hdr));
@@ -2818,6 +1193,11 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 	}
 
 	dchid->dev = dev;
+	/* Neo firmware has no STM interface from which to obtain identity. */
+	if (of_property_read_bool(dev->of_node, "apple,no-stm")) {
+		dchid->device_id.vendor_id = HOST_VENDOR_ID_APPLE;
+		dchid->id_ready = true;
+	}
 
 	/*
 	 * First make sure all the GPIOs are available, in cased we need to defer.
@@ -2884,36 +1264,13 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 	if (!dchid->new_iface_wq)
 		return -ENOMEM;
 
-	dchid->aux_wq = alloc_ordered_workqueue("dchid-aux", WQ_MEM_RECLAIM);
-	if (!dchid->aux_wq)
-		return -ENOMEM;
-
-	init_completion(&dchid->handshake_done);
-	INIT_DELAYED_WORK(&dchid->handshake_work, dchid_handshake_work);
-	INIT_DELAYED_WORK(&dchid->shmem_poll_work, dchid_shmem_poll_work);
-
 	dchid->comm = dchid_get_interface(dchid, IFACE_COMM, "comm");
 	if (!dchid->comm) {
 		dev_err(dchid->dev, "Failed to initialize comm interface");
 		return -EIO;
 	}
 
-	/*
-	 * M4-generation MTP firmware no longer advertises the STM interface that
-	 * older machines use to return the common HID identity.  Waiting for STM
-	 * in that topology leaves every real interface deferred forever.  The
-	 * per-interface descriptors are still delivered by MTP, so use the only
-	 * identity value needed to enumerate them and let the DT opt in to the
-	 * no-STM protocol variant.
-	 */
-	if (of_property_read_bool(dev->of_node, "apple,no-stm")) {
-		dchid->device_id.vendor_id = HOST_VENDOR_ID_APPLE;
-		dchid->id_ready = true;
-		dev_info(dev, "No STM interface; using fallback Apple HID identity\n");
-	}
-
 	dev_info(dchid->dev, "Initialized, awaiting packets\n");
-	dchid_transport = dchid;
 	dockchannel_await(dchid->dc, dchid_handle_packet, dchid, sizeof(struct dchid_hdr));
 
 	return 0;
