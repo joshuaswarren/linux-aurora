@@ -346,6 +346,50 @@ module_param(command_timeout_ms, uint, 0644);
 MODULE_PARM_DESC(command_timeout_ms,
 		 "How long to wait for a control report to be answered (macOS uses 5000)");
 
+/*
+ * MTP answers a shared-FIFO registration 80us later with a well-formed but
+ * completely empty packet - eight header bytes and a checksum, channel 0x00,
+ * length 0 - which this driver recognised as neither of its two channels, tried
+ * to parse an eight-byte sub-header out of, and threw away.  Meanwhile the
+ * command that provoked it sat waiting for a reply it had already been sent.
+ *
+ * So an unrecognised reply that arrives while a command is outstanding on that
+ * interface is completed rather than discarded.  It is still logged in full,
+ * because the point is to read the framing off real traffic, not to paper over
+ * it: switch this off to see the raw packet without acting on it.
+ */
+static bool lenient_ack = true;
+module_param(lenient_ack, bool, 0644);
+MODULE_PARM_DESC(lenient_ack,
+		 "Complete an outstanding command on a reply whose framing this driver does not recognise");
+
+/*
+ * Dump every packet, not just the anomalies.  Off by default because the
+ * report channel is busy once input is flowing.
+ */
+static bool packet_trace;
+module_param(packet_trace, bool, 0644);
+MODULE_PARM_DESC(packet_trace, "Log the header and first bytes of every received packet");
+
+/*
+ * Registering a FIFO looked like it had made MTP deaf, because the one command
+ * sent afterwards also went unanswered.  One command is not evidence, and the
+ * commands that answer without any firmware loaded are known: the multi-touch
+ * interface serves a couple of dozen feature reports out of its base
+ * personality, and report 0x64 returns the trackpad's dimensions.  Read one
+ * before the handshake and the same one after it, so "the command channel
+ * changed" and "that particular reply is framed differently" stop being the
+ * same observation.
+ */
+static bool shared_buffer_probe = true;
+module_param(shared_buffer_probe, bool, 0644);
+MODULE_PARM_DESC(shared_buffer_probe,
+		 "Read a known-good feature report either side of the handshake");
+
+/* Multi-touch sensor dimensions; answered with no firmware loaded. */
+#define MT_REPORT_DIMENSIONS 0x64
+
+
 /* Never poll faster than this, whatever the parameter says. */
 #define SHMEM_POLL_MIN_MS 50
 
@@ -526,6 +570,13 @@ struct dockchannel_hid {
 	struct completion handshake_done;
 	bool handshake_armed;
 	struct delayed_work shmem_poll_work;
+	/*
+	 * Its own queue, not the comm interface's.  A registration that waits
+	 * out its whole command timeout on the comm queue holds up every event
+	 * MTP sends while it waits - which is how the reply to that very
+	 * registration came to be logged five seconds after it arrived.
+	 */
+	struct workqueue_struct *aux_wq;
 
 	/* Workqueue to asynchronously create HID devices */
 	struct workqueue_struct *new_iface_wq;
@@ -709,6 +760,22 @@ static void dchid_dump_shmem(struct dockchannel_hid *dchid, bool only_on_change)
 	}
 }
 
+/*
+ * Everything about a received packet that is cheap to print.  The outer header
+ * is eight bytes and self-describing, so print it field by field rather than as
+ * a hex blob, and follow it with as much of the body as is likely to matter.
+ */
+static void dchid_dump_packet(struct dockchannel_hid *dchid, struct dchid_hdr *hdr,
+			      void *body, const char *why)
+{
+	unsigned int shown = min_t(unsigned int, hdr->length, 48);
+
+	dev_info(dchid->dev,
+		 "%s: hdr_len=%u channel=0x%02x length=%u seq=%u iface=%u pad=0x%04x body=%*ph\n",
+		 why, hdr->hdr_len, hdr->channel, hdr->length, hdr->seq,
+		 hdr->iface, hdr->pad, shown, (u8 *)body);
+}
+
 static int dchid_cmd(struct dchid_iface *iface, u32 type, u32 req,
 		     void *data, size_t size, void *resp_buf, size_t resp_size)
 {
@@ -820,6 +887,7 @@ static bool dchid_uses_transactional_power(struct dchid_iface *iface)
 					&firmware_name) &&
 	       !strcmp(firmware_name, "apple/tpmtfw-j700.bin");
 }
+
 
 /*
  * Run the power-sequence half of a multi-touch power transition.
@@ -1358,8 +1426,42 @@ static void dchid_shmem_poll_work(struct work_struct *ws)
 	dchid_dump_shmem(dchid, true);
 
 	if (shmem_poll_interval())
-		queue_delayed_work(dchid->comm->wq, &dchid->shmem_poll_work,
+		queue_delayed_work(dchid->aux_wq, &dchid->shmem_poll_work,
 				   msecs_to_jiffies(shmem_poll_interval()));
+}
+
+static int dchid_get_report_cmd(struct dchid_iface *iface, u8 reportnum,
+				void *buf, size_t len);
+
+static struct dchid_iface *dchid_find_iface(struct dockchannel_hid *dchid,
+					   const char *name)
+{
+	int i;
+
+	for (i = 0; i < MAX_INTERFACES; i++)
+		if (dchid->ifaces[i] && !strcmp(dchid->ifaces[i]->name, name))
+			return dchid->ifaces[i];
+
+	return NULL;
+}
+
+static void dchid_probe_command_channel(struct dockchannel_hid *dchid,
+					const char *when)
+{
+	struct dchid_iface *iface;
+	u8 resp[24] = {};
+	int ret;
+
+	if (!shared_buffer_probe)
+		return;
+
+	iface = dchid_find_iface(dchid, "multi-touch");
+	if (!iface)
+		return;
+
+	ret = dchid_get_report_cmd(iface, MT_REPORT_DIMENSIONS, resp, sizeof(resp));
+	dev_info(dchid->dev, "Probe %s: report 0x%02x ret=%d resp=%*ph\n",
+		 when, MT_REPORT_DIMENSIONS, ret, (int)sizeof(resp), resp);
 }
 
 /*
@@ -1391,6 +1493,8 @@ static void dchid_handshake_work(struct work_struct *ws)
 		count = MAX_SHARED_FIFOS;
 	}
 
+	dchid_probe_command_channel(dchid, "before handshake");
+
 	dev_info(dchid->dev,
 		 "Transport handshake: registering %u shared FIFO(s) of %u bytes\n",
 		 count, shared_buffer_size);
@@ -1408,9 +1512,11 @@ static void dchid_handshake_work(struct work_struct *ws)
 
 	complete_all(&dchid->handshake_done);
 	dchid_dump_shmem(dchid, false);
+	dchid_probe_command_channel(dchid, "after handshake");
+	dchid_dump_shmem(dchid, false);
 
 	if (dchid->nr_fifos && shmem_poll_interval())
-		queue_delayed_work(dchid->comm->wq, &dchid->shmem_poll_work,
+		queue_delayed_work(dchid->aux_wq, &dchid->shmem_poll_work,
 				   msecs_to_jiffies(shmem_poll_interval()));
 }
 
@@ -1422,12 +1528,12 @@ static void dchid_handshake_work(struct work_struct *ws)
  */
 static void dchid_arm_handshake(struct dockchannel_hid *dchid, unsigned int delay_ms)
 {
-	if (!shared_buffer || dchid->handshake_armed)
+	if (!shared_buffer || dchid->handshake_armed || !dchid->aux_wq)
 		return;
 
 	dchid->handshake_armed = true;
 	dev_info(dchid->dev, "Handshake armed, running in %u ms\n", delay_ms);
-	queue_delayed_work(dchid->comm->wq, &dchid->handshake_work,
+	queue_delayed_work(dchid->aux_wq, &dchid->handshake_work,
 			   msecs_to_jiffies(delay_ms));
 }
 
@@ -1448,7 +1554,7 @@ static int dchid_shared_buffer_set(const char *val, const struct kernel_param *k
 	if (ret)
 		return ret;
 
-	if (shared_buffer && dchid_transport && dchid_transport->comm)
+	if (shared_buffer && dchid_transport && dchid_transport->aux_wq)
 		dchid_arm_handshake(dchid_transport, 0);
 
 	return 0;
@@ -2114,9 +2220,11 @@ static void dchid_packet_work(struct work_struct *ws)
 	int type = FIELD_GET(FLAGS_GROUP, shdr->flags);
 	u8 *payload = work->data + sizeof(*shdr);
 
-	if (shdr->length + sizeof(*shdr) > work->hdr.length) {
-		dev_err(dchid->dev, "Bad sub header length (%hu > %zu)\n",
-			shdr->length, work->hdr.length - sizeof(*shdr));
+	if (work->hdr.length < sizeof(*shdr) ||
+	    shdr->length > work->hdr.length - sizeof(*shdr)) {
+		dchid_dump_packet(dchid, &work->hdr, work->data,
+				  "Report with a bad sub header");
+		kfree(work);
 		return;
 	}
 
@@ -2135,12 +2243,50 @@ static void dchid_packet_work(struct work_struct *ws)
 	kfree(work);
 }
 
+/*
+ * Complete whatever command is outstanding on this interface without looking at
+ * a payload, because there is not one.  Everything that identifies the reply is
+ * in the outer header, so log what it says next to what was expected and let
+ * the caller see for itself whether they agree.
+ */
+static void dchid_complete_bare(struct dchid_iface *iface, struct dchid_hdr *hdr,
+				const char *why)
+{
+	dev_info(iface->dchid->dev,
+		 "%s: completing report 0x%x on iface %d (%s), reply seq=%u expected %u\n",
+		 why, iface->out_report, iface->index, iface->name,
+		 hdr->seq, iface->tx_seq);
+
+	iface->resp_size = 0;
+	iface->out_report = -1;
+	iface->retcode = 0;
+	complete(&iface->out_complete);
+}
+
 static void dchid_handle_ack(struct dchid_iface *iface, struct dchid_hdr *hdr, void *data)
 {
 	struct dchid_subhdr *shdr = (void *)data;
 	u8 *payload = data + sizeof(*shdr);
 
-	if (shdr->length + sizeof(*shdr) > hdr->length) {
+	/*
+	 * A reply with no room for a sub header used to underflow this
+	 * comparison and be reported as a nonsense length.  MTP sends exactly
+	 * such a reply - a zero-length one - to acknowledge a shared-FIFO
+	 * registration.
+	 */
+	if (hdr->length < sizeof(*shdr)) {
+		dchid_dump_packet(iface->dchid, hdr, data, "Reply with no sub header");
+		if (lenient_ack && iface->out_report != -1)
+			dchid_complete_bare(iface, hdr, "Bare reply");
+		else
+			dev_err(iface->dchid->dev,
+				"Reply too short for a sub header (%u < %zu)\n",
+				hdr->length, sizeof(*shdr));
+		return;
+	}
+
+	if (shdr->length > hdr->length - sizeof(*shdr)) {
+		dchid_dump_packet(iface->dchid, hdr, data, "Bad sub header length");
 		dev_err(iface->dchid->dev, "Bad sub header length (%hu > %zu)\n",
 			shdr->length, hdr->length - sizeof(*shdr));
 		return;
@@ -2211,8 +2357,13 @@ static void dchid_handle_packet(void *cookie, size_t avail)
 	}
 
 
+	/*
+	 * This used to log and carry on, indexing the array with the very value
+	 * it had just rejected.
+	 */
 	if (hdr.iface >= MAX_INTERFACES) {
-		dev_err(dchid->dev, "Bad iface %d\n", hdr.iface);
+		dchid_dump_packet(dchid, &hdr, dchid->pkt_buf, "Bad iface");
+		goto done;
 	}
 
 	iface = dchid->ifaces[hdr.iface];
@@ -2222,6 +2373,9 @@ static void dchid_handle_packet(void *cookie, size_t avail)
 		goto done;
 	}
 
+	if (packet_trace)
+		dchid_dump_packet(dchid, &hdr, dchid->pkt_buf, "Packet");
+
 	switch (hdr.channel) {
 		case DCHID_CHANNEL_CMD:
 			dchid_handle_ack(iface, &hdr, dchid->pkt_buf);
@@ -2229,7 +2383,32 @@ static void dchid_handle_packet(void *cookie, size_t avail)
 		case DCHID_CHANNEL_REPORT:
 			break;
 		default:
-			dev_warn(dchid->dev, "Unknown channel 0x%x, treating as report...\n",
+			dchid_dump_packet(dchid, &hdr, dchid->pkt_buf,
+					  "Unknown channel");
+			/*
+			 * An empty packet could as easily be a doorbell saying
+			 * the shared FIFOs have something in them as it could
+			 * be a reply.  Read the ring at the instant it arrives,
+			 * which is the only sample that can tell those apart -
+			 * the one taken five seconds later cannot.
+			 */
+			dchid_dump_shmem(dchid, false);
+			/*
+			 * MTP answers a shared-FIFO registration on a channel
+			 * this driver has never seen, so an unrecognised packet
+			 * that turns up while a command is outstanding is far
+			 * more likely to be that command's answer than a report.
+			 * Handle it inline, on the receive path: routing it to
+			 * the interface workqueue put it behind whatever work
+			 * was already queued there, which is how a reply that
+			 * arrived in 80us came to be looked at five seconds late.
+			 */
+			if (lenient_ack && iface->out_report != -1) {
+				dchid_handle_ack(iface, &hdr, dchid->pkt_buf);
+				goto done;
+			}
+			dev_warn(dchid->dev,
+				 "Unknown channel 0x%x with nothing outstanding, treating as report\n",
 				 hdr.channel);
 			break;
 	}
@@ -2332,6 +2511,10 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 	}
 	dchid->new_iface_wq = alloc_workqueue("dchid-new", WQ_MEM_RECLAIM, 0);
 	if (!dchid->new_iface_wq)
+		return -ENOMEM;
+
+	dchid->aux_wq = alloc_ordered_workqueue("dchid-aux", WQ_MEM_RECLAIM);
+	if (!dchid->aux_wq)
 		return -ENOMEM;
 
 	init_completion(&dchid->handshake_done);
