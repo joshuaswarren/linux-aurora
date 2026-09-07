@@ -1429,7 +1429,6 @@ impl queue::Queue for G17PQueue {
         cmdbuf_raw: &[u8],
         objects: core::pin::Pin<&xarray::XArray<KBox<file::Object>>>,
     ) -> Result {
-        if self.vm.status().get() != 0 { return Err(EIO); }
         if crate::util::g17p_verbose() {
             pr_info!(
                 "G17P submit: ENTER submission {} syncs={} in_sync={} cmdbuf_bytes={}\n",
@@ -1465,6 +1464,14 @@ impl queue::Queue for G17PQueue {
             outputs: deferred_outputs,
             succeeded: false,
         };
+        // A VM that has already faulted rejects every later submission. That
+        // check used to run before any of the above, so a client whose VM died
+        // got EIO with no fence published at all and then waited forever on the
+        // syncobj it had just handed us. Keep the rejection, but make it
+        // publish like every other failure.
+        if self.vm.status().get() != 0 {
+            return Err(Self::stage_fail(submission_id, "vm-status", EIO));
+        }
         let address_space = UserAddressSpace {
             vm: &self.vm,
             range: self.user_range.clone(),
