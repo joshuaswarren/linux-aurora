@@ -17,7 +17,7 @@ config HID_DOCKCHANNEL_KUNIT_TEST
 	help
 	  Build tests for hardware-independent DockChannel HID protocol helpers.
 	  These verify command serialization without requiring Apple hardware.
-	  They cover the two-phase power transition used by J700 trackpads.
+	  They cover both plain and two-phase power transitions.
 	  If in doubt, say N.
 
 endmenu

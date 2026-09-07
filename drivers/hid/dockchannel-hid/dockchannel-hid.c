@@ -378,11 +378,9 @@ static int dchid_enable_interface(struct dchid_iface *iface)
 
 static int dchid_reset_interface(struct dchid_iface *iface, int state)
 {
-	u8 msg[] = {
-		DCHID_CMD_RESET_INTERFACE, DCHID_POWER_METHOD_1,
-		iface->index, state,
-	};
+	u8 msg[DCHID_POWER_METHOD_1_CMD_SIZE];
 
+	dchid_pm1_command(iface->index, state, msg);
 	return dchid_comm_cmd(iface->dchid, msg, sizeof(msg));
 }
 
@@ -571,7 +569,7 @@ static int dchid_start_interface(struct dchid_iface *iface)
 		}
 
 		dev_info(iface->dchid->dev,
-			 "Resetting %s with power method %u\n",
+			 "Powering on %s with power method %u\n",
 			 iface->name, iface->power_method);
 		if (power_method_2) {
 			ret = dchid_power_method_2_transition(iface, false);
@@ -586,11 +584,6 @@ static int dchid_start_interface(struct dchid_iface *iface)
 				goto err;
 			}
 		} else {
-			ret = dchid_reset_interface(iface,
-						    DCHID_POWER_STATE_OFF);
-			if (ret < 0)
-				goto err;
-
 			ret = dchid_reset_interface(iface,
 						    DCHID_POWER_STATE_ON);
 			if (ret < 0)
