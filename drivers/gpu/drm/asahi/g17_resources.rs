@@ -6828,6 +6828,44 @@ impl G17PUserRenderStorage {
         self._command_context = None;
     }
 
+    /// A cross-VM handoff builds a fresh queue graph while the physical QID
+    /// producer remains monotonic. Move the empty graph's three cursors to the
+    /// retained producer before staging the next group, so firmware never
+    /// walks the intentionally empty slots preceding that group.
+    pub(crate) fn rebase_empty_queue_cursors(
+        &mut self,
+        submission_ordinal: u32,
+    ) -> Result {
+        if submission_ordinal == 0 {
+            return Err(EINVAL);
+        }
+        let plan = G17PRenderItemPlan::new(
+            submission_ordinal,
+            g17p_render_tag16_enabled(),
+        )
+        .ok_or(EINVAL)?;
+        core::sync::atomic::fence(Ordering::Acquire);
+        let previous = self.snapshot()?;
+        if !previous.job_list_empty
+            || !previous.tiling.idle()
+            || !previous.fragment.idle()
+            || previous.tiling.write != 0
+            || previous.fragment.write != 0
+        {
+            return Err(EBUSY);
+        }
+        self.graph.with_bytes_mut(|raw| {
+            for pointers in [Self::TILING_POINTERS, Self::FRAGMENT_POINTERS] {
+                put_u32(raw, pointers, plan.base);
+                put_u32(raw, pointers + 0x30, plan.base);
+                put_u32(raw, pointers + 0x40, plan.base);
+            }
+            Ok(())
+        })?;
+        core::sync::atomic::fence(Ordering::SeqCst);
+        Ok(())
+    }
+
     /// Refresh the canonical queue group's command-owned objects after the
     /// previous group has reached semantic completion.
     pub(crate) fn restage_command(
