@@ -30,7 +30,11 @@ def item(needle):
 
 
 slots = s[s.index('const G17P_RENDER_SLOTS: usize ='):]
-slots = slots[:slots.index(';') + 1]
+slots = slots[:slots.index('const _: () = assert!(G17P_ACTIVE_RENDER_SLOTS > 0);')]
+# This test keeps qualifying the dormant two-pair affinity algorithm. The
+# production capacity test uses the real one-slot value in test_g17_compute_gate.py.
+slots = slots.replace('const G17P_ACTIVE_RENDER_SLOTS: usize = 1;',
+                      'const G17P_ACTIVE_RENDER_SLOTS: usize = 2;')
 state = '\n'.join(item(n) for n in [
     'struct G17PQueueLeaseState {',
     'impl G17PQueueLeaseState {',
@@ -257,5 +261,5 @@ with tempfile.TemporaryDirectory() as d:
     exe = d / 'affinity'
     subprocess.run(['rustc', '--edition=2021', '--test', str(f), '-o', str(exe)], check=True)
     subprocess.run([str(exe), '--test-threads=1'], check=True, timeout=60)
-print('PASS render slot affinity: two clients keep their own retained storage, '
-      'a third waits instead of failing, retired slots stay retired')
+print('PASS dormant two-pair affinity: clients keep retained storage, a third '
+      'waits instead of failing, and retired slots stay retired')
