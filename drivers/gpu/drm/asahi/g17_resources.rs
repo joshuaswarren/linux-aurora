@@ -304,6 +304,45 @@ fn g17p_cl_client_low_va_range() -> Range<u64> {
     G17P_CL_CLIENT_LOW_VA_START..G17P_CL_LOW_VA_END
 }
 
+#[cfg(not(test))]
+fn map_shared_render_descriptor_range(
+    object: &mut gem::ObjectRef,
+    client_vm: &mmu::Vm,
+    global_vm: &mmu::Vm,
+    object_range: Range<usize>,
+) -> Result<(mmu::KernelMapping, mmu::KernelMapping)> {
+    let mut search_start = G17P_CL_CLIENT_LOW_VA_START;
+    loop {
+        let client = object.map_range_into_range(
+            client_vm,
+            object_range.clone(),
+            search_start..G17P_CL_LOW_VA_END,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_SHARED_RO,
+            false,
+        )?;
+        let start = client.iova();
+        let end = start
+            .checked_add(object_range.len() as u64)
+            .ok_or(EOVERFLOW)?;
+        match object.map_range_into_range(
+            global_vm,
+            object_range.clone(),
+            start..end,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_SHARED_RO,
+            false,
+        ) {
+            Ok(global) => return Ok((client, global)),
+            Err(error) if error == ENOSPC && end < G17P_CL_LOW_VA_END => {
+                drop(client);
+                search_start = end;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 fn clear_g17p_last_submitted_hw_timestamps(bytes: &mut [u8]) -> bool {
     if bytes.len() < G17P_LAST_SUBMITTED_HW_TIMESTAMP_TABLE_SIZE {
         return false;
@@ -3071,7 +3110,9 @@ pub(crate) struct G17PUserRenderStorage {
     /// Job-private firmware-high descriptor storage. Queue items address the
     /// two subarrays through this object's canonical mapping.
     descriptor_ta_low: mmu::KernelMapping,
+    _descriptor_ta_global: mmu::KernelMapping,
     descriptor_3d_low: mmu::KernelMapping,
+    _descriptor_3d_global: mmu::KernelMapping,
     /// Retained diagnostic client alias, unused by hardware encoding. KSM's
     /// RCE arrays, self trailers and MCache table pointer use descriptor_3d_low
     /// in the job's application GART. Keep this allocation for now to isolate
@@ -5820,28 +5861,28 @@ impl G17PUserRenderStorage {
             descriptor_ta_high_va,
             descriptor_3d_high_va,
         );
-        let descriptor_ta_low = bootstrap_stage!(
-            "TA descriptor low alias",
-            descriptors.object.map_range_into_range(
+        // The launch requestor fetches descriptor self pointers through
+        // context 0 even though the engines consume the rest of the command
+        // through the application GART. Find a VA free in both roots, keeping
+        // each retained job disjoint in the shared domain.
+        let (descriptor_ta_low, descriptor_ta_global) = bootstrap_stage!(
+            "TA descriptor dual-root alias",
+            map_shared_render_descriptor_range(
+                &mut descriptors.object,
                 vm,
+                uat.kernel_lower_vm(),
                 0..G17P_RENDER_TA_DESCRIPTOR_ARRAY_SIZE,
-                g17p_cl_client_low_va_range(),
-                mmu::UAT_PGSZ as u64,
-                mmu::PROT_GPU_SHARED_RO,
-                false,
             )
         );
-        let descriptor_3d_low = bootstrap_stage!(
-            "3D descriptor low alias",
-            descriptors.object.map_range_into_range(
+        let (descriptor_3d_low, descriptor_3d_global) = bootstrap_stage!(
+            "3D descriptor dual-root alias",
+            map_shared_render_descriptor_range(
+                &mut descriptors.object,
                 vm,
+                uat.kernel_lower_vm(),
                 G17P_RENDER_3D_DESCRIPTOR_OFFSET
                     ..G17P_RENDER_3D_DESCRIPTOR_OFFSET
                         + G17P_RENDER_3D_DESCRIPTOR_ARRAY_SIZE,
-                g17p_cl_client_low_va_range(),
-                mmu::UAT_PGSZ as u64,
-                mmu::PROT_GPU_SHARED_RO,
-                false,
             )
         );
         let mut graph = bootstrap_stage!("queue allocation", MappedObject::new_wc(
@@ -6695,7 +6736,9 @@ impl G17PUserRenderStorage {
             descriptor_ordinal: 0,
             fragment_rce,
             descriptor_ta_low,
+            _descriptor_ta_global: descriptor_ta_global,
             descriptor_3d_low,
+            _descriptor_3d_global: descriptor_3d_global,
             descriptor_3d_render: descriptor_3d_render_info,
             ta_context,
             ta_context_low,
