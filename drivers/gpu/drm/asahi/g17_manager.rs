@@ -5274,20 +5274,21 @@ impl G17PManagerConstruction {
 
     pub(crate) fn bind_independent_compute_user_vm(
         &mut self, queue: &mut G17PSksmQueue, vm: &mmu::Vm,
-    ) -> Result<(G17PComputeUserBinding, Arc<mmu::T8140ComputeExecutionContext>)> {
+        context: Arc<mmu::T8140ComputeExecutionContext>,
+    ) -> Result<G17PComputeUserBinding> {
+        if !context.matches(vm) || !context.is_current() { return Err(EFAULT); }
         self.resources.cache_compute_vm_mappings(vm)?;
         let sksm_entries = queue.storage.map_user_entry_alias(vm)?;
         let mappings = queue.compute.map_user_execution_state(vm)?;
-        let context = self.uat().allocate_t8140_compute_execution_context(vm)?;
         let (high, low) = queue.compute.descriptor_gpu_vas(0);
         if !mappings.all_reachable_from(vm) || mappings.descriptor_gpu_va(0) != low
             || vm.translate_iova(low)? != self.uat().kernel_vm().translate_iova(high)?
         { return Err(EFAULT); }
         queue.independent_context = true;
-        Ok((G17PComputeUserBinding {
+        Ok(G17PComputeUserBinding {
             mappings, _sksm_entries: sksm_entries, _vm_bind: None,
             _execution_context: Some(context.clone()),
-        }, context))
+        })
     }
 
     /// Completion identity and visibility belong to the queue, not the last

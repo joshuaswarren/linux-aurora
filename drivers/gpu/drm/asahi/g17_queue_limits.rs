@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 //! Allocation contract for independent G17P queues.
-//! Every accepted DRM queue owns its scarce execution resources at creation.
+//! Every accepted DRM queue owns an execution context; hardware compute graphs
+//! are allocated lazily when that logical queue first submits compute.
 pub(crate) const FEATURE_INDEPENDENT_QUEUES: u64 = 1 << 2;
 pub(crate) const PARAM_GROUP_QUEUE_LIMITS: u32 = 2;
 pub(crate) const QUEUE_LIMITS_SIZE: usize = 16;
