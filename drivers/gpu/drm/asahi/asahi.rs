@@ -362,6 +362,14 @@ kernel::module_platform_driver! {
             default: 256,
             description: "Submissions per throughput report. The driver has never reported how fast it is: the per-submission dumps are gated off by g17p_verbose (correctly -- they cost more than they measure), which left no number at all. This accumulates plain integer counters on the submit path -- one uncontended lock round trip, no allocation, no formatting -- and emits ONE line per window: renders and computes completed, submissions per second, average and worst host time inside the ioctl, the publish/wait split of that time, average completion polls, GPU busy time from the firmware's own pass envelope (TA stamps the start word, 3D the end word), GPU-interval occupancy, the share of wall time the client spends inside the ioctl, and the GPU tick rate DERIVED from the window rather than assumed. At 256 submissions and 60 frames per second that is one line every four seconds. 0: no accounting at all.",
         },
+        g17p_render_poll_us: u32 {
+            default: 0,
+            description: "Fixed render completion poll interval in microseconds; 0 selects exponential backoff from 20us to 1000us. The wait used to sleep a flat fsleep(1ms) between polls; on this kernel fsleep grants 25% slack and 1000us is below USLEEP_RANGE_UPPER_BOUND (16000us at CONFIG_HZ=250), so that is usleep_range(1000, 1250) -- every render paid a full millisecond or more of sleep AFTER the GPU had finished, and no pass could be observed complete sooner than that however short it was. Backoff observes a short pass promptly and settles to the same 1ms interval for a long one, so a slow render costs no more CPU than before. Set 1000 to restore the old flat interval for an A/B measurement.",
+        },
+        g17p_render_wait_ms: u32 {
+            default: 2000,
+            description: "Deadline for the render completion wait, in milliseconds. This is the stuck-firmware backstop that was previously spelled as 2000 polls of one millisecond each. Expressing it as a deadline keeps the bound fixed while the poll interval varies. Raise it only to investigate a genuinely slow render; it is not a pacing knob.",
+        },
         g17p_verbose: u32 {
             default: 0,
             description: "Per-submission diagnostic dumps. The render path emits several dozen lines for every submission -- the QoS regions, both status pages, the PM/HWPB and PBDesc snapshots, the tag-15 and SKSM records and the context roots. That is the bring-up instrumentation this driver was written with, and at desktop frame rates it costs real time and buries every other message in the ring buffer within a few seconds. 0: only lifecycle and failures (default), 1: the full per-submission dumps.",
