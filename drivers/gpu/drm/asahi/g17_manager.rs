@@ -4992,17 +4992,19 @@ impl G17PManagerConstruction {
                             u16::from(queues.tiling.queue_id),
                             u16::from(queues.fragment.queue_id),
                         ));
-                    dev_info!(
-                        self.resources.dev().as_ref(),
-                        "G17P render: GPU-INTERVAL ordinal={} vm={} root={:#x} ta-qid={} fragment-qid={} start={} end={}\n",
-                        self.render_submission_ordinal,
-                        vm_id,
-                        root,
-                        tiling_qid,
-                        fragment_qid,
-                        interval[0],
-                        interval[1],
-                    );
+                    if crate::util::g17p_verbose() {
+                        dev_info!(
+                            self.resources.dev().as_ref(),
+                            "G17P render: GPU-INTERVAL ordinal={} vm={} root={:#x} ta-qid={} fragment-qid={} start={} end={}\n",
+                            self.render_submission_ordinal,
+                            vm_id,
+                            root,
+                            tiling_qid,
+                            fragment_qid,
+                            interval[0],
+                            interval[1],
+                        );
+                    }
                 }
                 // Native TA/3D complete subtract completed kicks from queue
                 // +44. Prepare both results before mutating either queue;
