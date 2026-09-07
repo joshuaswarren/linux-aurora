@@ -2546,6 +2546,19 @@ pub(crate) struct G17PLiveRuntime {
 }
 
 impl G17PLiveRuntime {
+    /// Close every path which can enqueue device-owning firmware work.
+    /// Platform unbind calls this before synchronously cancelling the work
+    /// items; runtime Drop then performs the firmware-visible teardown.
+    pub(crate) fn disarm_firmware_event_worker(&mut self) {
+        self.accepting_submissions = false;
+        if let Some(state) = self.gfx_state.as_ref() {
+            state.event_worker_armed.store(false, Ordering::Release);
+        }
+        if let Some(state) = self.gfx1_state.as_ref() {
+            state.event_worker_armed.store(false, Ordering::Release);
+        }
+    }
+
     pub(crate) fn arm_primary_firmware_event_worker(&self) -> Result {
         let state = self.gfx_state.as_ref().ok_or(ENODEV)?;
         state.event_worker_armed.store(true, Ordering::Release);

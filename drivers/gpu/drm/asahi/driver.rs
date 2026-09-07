@@ -3,7 +3,7 @@
 //! Top-level GPU driver implementation.
 
 use kernel::{
-    c_str,
+    bindings, c_str,
     device::Core,
     dma::{
         Device,
@@ -19,7 +19,7 @@ use kernel::{
         aref::ARef,
         Arc, //
     },
-    workqueue::{self, impl_has_work, new_work, Work, WorkItem}, //
+    workqueue::{self, HasWork, impl_has_work, new_work, Work, WorkItem}, //
 };
 
 use crate::{
@@ -117,6 +117,43 @@ pub(crate) fn queue_g17p_firmware_event_worker(dev: ARef<AsahiDevice>) {
 
 pub(crate) fn queue_g17p_recovery_worker(dev: ARef<AsahiDevice>) {
     let _ = workqueue::system_highpri().enqueue::<ARef<AsahiDevice>, 2>(dev);
+}
+
+struct G17PDriverUnbind<'a> {
+    runtime: &'a g17_drm::SharedG17PRuntime,
+    drm: ARef<AsahiDevice>,
+}
+
+impl g17_lifecycle::DriverUnbindQuiesce for G17PDriverUnbind<'_> {
+    fn disarm_ingress(&self) {
+        self.runtime.lock().disarm_firmware_event_worker();
+    }
+
+    fn cancel_event_work(&self) {
+        cancel_g17p_work::<1>(&self.drm);
+    }
+
+    fn cancel_recovery_work(&self) {
+        cancel_g17p_work::<2>(&self.drm);
+    }
+}
+
+fn cancel_g17p_work<const ID: u64>(dev: &AsahiDevice)
+where
+    AsahiDevice: HasWork<AsahiDevice, ID>,
+{
+    let dev_ptr = (dev as *const AsahiDevice).cast_mut();
+    // SAFETY: `dev` remains strongly referenced by the unbind owner for this
+    // whole call. The HasWork implementation returns its embedded work item,
+    // and cancel_work_sync waits until no callback owns that item.
+    let work = unsafe {
+        <AsahiDevice as HasWork<AsahiDevice, ID>>::raw_get_work(dev_ptr)
+    };
+    // SAFETY: `work` is the initialized embedded work item selected by ID.
+    let work = unsafe { Work::raw_get(work) };
+    // SAFETY: no callback can be newly queued after ingress was disarmed, and
+    // the strong `drm` reference keeps the containing object alive.
+    unsafe { bindings::cancel_work_sync(work) };
 }
 
 #[allow(dead_code)]
@@ -1001,5 +1038,16 @@ impl platform::Driver for AsahiDriver {
         Ok(Self {
             runtime: AsahiRuntime::Legacy(drm),
         })
+    }
+
+    fn unbind(_pdev: &platform::Device<Core>, this: Pin<&Self>) {
+        let AsahiRuntime::G17P(runtime) = &this.runtime else {
+            return;
+        };
+        let drm = match runtime.lock().drm_ref() {
+            Ok(drm) => drm,
+            Err(_) => return,
+        };
+        g17_lifecycle::quiesce_driver_unbind(&G17PDriverUnbind { runtime, drm });
     }
 }

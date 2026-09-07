@@ -201,6 +201,23 @@ pub(crate) fn teardown_persistent_runtime<T: PersistentRuntimeTeardown>(owner: &
     owner.drop_manager();
 }
 
+/// Operations which must complete before the platform-owned runtime is
+/// dropped.  RTKit callbacks and queued workers both retain a DRM-device
+/// reference, so ingress must close before either work item is cancelled.
+/// Otherwise a callback can requeue the item after cancellation and keep the
+/// module pinned after unbind.
+pub(crate) trait DriverUnbindQuiesce {
+    fn disarm_ingress(&self);
+    fn cancel_event_work(&self);
+    fn cancel_recovery_work(&self);
+}
+
+pub(crate) fn quiesce_driver_unbind<T: DriverUnbindQuiesce>(owner: &T) {
+    owner.disarm_ingress();
+    owner.cancel_event_work();
+    owner.cancel_recovery_work();
+}
+
 /// Start GFX then GFX1, run `body`, and stop GFX1 then GFX.
 ///
 /// Every path after GFX starts attempts its matching stop. A GFX1 start error
@@ -231,6 +248,52 @@ where
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+    enum UnbindEvent {
+        Disarm,
+        CancelEvent,
+        CancelRecovery,
+    }
+
+    struct MockUnbind {
+        armed: core::cell::Cell<bool>,
+        trace: RefCell<std::vec::Vec<UnbindEvent>>,
+    }
+
+    impl DriverUnbindQuiesce for MockUnbind {
+        fn disarm_ingress(&self) {
+            self.armed.set(false);
+            self.trace.borrow_mut().push(UnbindEvent::Disarm);
+        }
+
+        fn cancel_event_work(&self) {
+            assert!(!self.armed.get());
+            self.trace.borrow_mut().push(UnbindEvent::CancelEvent);
+        }
+
+        fn cancel_recovery_work(&self) {
+            assert!(!self.armed.get());
+            self.trace.borrow_mut().push(UnbindEvent::CancelRecovery);
+        }
+    }
+
+    #[test]
+    fn unbind_closes_ingress_before_cancelling_device_references() {
+        let owner = MockUnbind {
+            armed: core::cell::Cell::new(true),
+            trace: RefCell::new(std::vec::Vec::new()),
+        };
+        quiesce_driver_unbind(&owner);
+        assert_eq!(
+            *owner.trace.borrow(),
+            [
+                UnbindEvent::Disarm,
+                UnbindEvent::CancelEvent,
+                UnbindEvent::CancelRecovery,
+            ]
+        );
+    }
 
     #[derive(Debug, Copy, Clone, PartialEq, Eq)]
     enum Role {
