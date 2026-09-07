@@ -83,7 +83,29 @@ struct dchid_init_hdr {
 #define DCHID_POWER_METHOD_TRANSACTIONAL 2
 #define DCHID_POWER_PHASE_WILL_CHANGE 0
 #define DCHID_POWER_PHASE_HAS_CHANGED 1
-#define DCHID_POWER_SETTLE_MS 50
+
+/*
+ * AHTPowerState ordinals, as used by AppleHIDTransportInterface::setPowerGated*
+ * in the shipping macOS AppleHIDTransport kext: 0 off, 1 sleep, 2 on, 3 reset.
+ */
+#define DCHID_POWER_STATE_OFF 0
+#define DCHID_POWER_STATE_ON 2
+
+/*
+ * J700's shipping MTP_SYS personality carries the host half of the multi-touch
+ * power transition as
+ *
+ *   power-sequence[0].FunctionName        = function-afe-reset
+ *   power-sequence[0].DisableFunctionType = High   DisableDelayUs = 50000
+ *   power-sequence[0].EnableFunctionType  = Low    EnableDelayUs  = 0
+ *
+ * (AHTFunctionInfo::FunctionType is Low=0, High=1, Input=2, ...).  Both levels
+ * are absolute line levels, so this driver drives the raw line and deliberately
+ * does not consult the DT active-low flag.
+ */
+#define DCHID_AFE_RESET_ASSERTED 1
+#define DCHID_AFE_RESET_RELEASED 0
+#define DCHID_AFE_RESET_HOLD_US 50000
 
 struct dchid_init_block_hdr {
 	u16 type;
@@ -171,6 +193,9 @@ struct dchid_iface {
 	struct gpio_desc *gpio;
 	char gpio_name[MAX_GPIO_NAME];
 	int gpio_id;
+
+	/* Host-owned AFE reset line (J700 function-afe-reset). */
+	struct gpio_desc *afe_reset;
 
 	struct mutex out_mutex;
 	u32 out_flags;
@@ -385,6 +410,67 @@ static bool dchid_uses_transactional_power(struct dchid_iface *iface)
 	       !strcmp(firmware_name, "apple/tpmtfw-j700.bin");
 }
 
+/*
+ * Run the host half of a multi-touch power transition.
+ *
+ * On J700 the AFE reset is not an MTP-requested GPIO: MTP sends no
+ * INIT_GPIO_REQUEST for multi-touch and its firmware does not implement
+ * CMD_ACK_GPIO_CMD, because the line is an SMC platform function
+ * (function-afe-reset = pKW8('pcIO', 0x10000, 0x130000), i.e. SMC GPIO index
+ * 0x13 / key gP13) that only the host can drive.  MTP's own HBPP bootloader
+ * then attaches to the AFE while it sits in its post-reset bootloader window;
+ * an AFE still running the image iBoot left in it is long past that window and
+ * answers with "AFE Chip Boot Failure for HBPP[0]: No HINT_L".
+ *
+ * macOS runs this in AppleHIDTransportInterface::setPowerGatedWillHas between
+ * the will-change and has-changed messages: entering power state 0 runs the
+ * Disable half of power-sequence[0] (drive High, then hold DisableDelayUs) and
+ * entering power state 2 from state 0 runs the Enable half (drive Low,
+ * EnableDelayUs is 0).  The separate reset-sequence[0]
+ * (function-ipd-pwr-seq-control, an SMC 'pmIP' key) is only run on transitions
+ * into and out of power state 3, which this driver never uses, so it is
+ * deliberately not issued here.
+ */
+static int dchid_afe_power_sequence(struct dchid_iface *iface, int state)
+{
+	int level, ret;
+
+	switch (state) {
+	case DCHID_POWER_STATE_OFF:
+		level = DCHID_AFE_RESET_ASSERTED;
+		break;
+	case DCHID_POWER_STATE_ON:
+		level = DCHID_AFE_RESET_RELEASED;
+		break;
+	default:
+		return 0;
+	}
+
+	if (!iface->afe_reset) {
+		dev_err(iface->dchid->dev, "No AFE reset line for %s\n",
+			iface->name);
+		return -ENODEV;
+	}
+
+	ret = gpiod_direction_output_raw(iface->afe_reset, level);
+	if (ret) {
+		dev_err(iface->dchid->dev,
+			"Failed to drive the %s AFE reset line to %d: %d\n",
+			iface->name, level, ret);
+		return ret;
+	}
+
+	dev_info(iface->dchid->dev,
+		 "AFE power sequence: %s state=%d afe-reset=%d hold_us=%u\n",
+		 iface->name, state, level,
+		 level == DCHID_AFE_RESET_ASSERTED ? DCHID_AFE_RESET_HOLD_US : 0);
+
+	if (level == DCHID_AFE_RESET_ASSERTED)
+		fsleep(DCHID_AFE_RESET_HOLD_US);
+
+	return 0;
+}
+
 static int dchid_reset_interface(struct dchid_iface *iface, int state)
 {
 	u8 msg[] = {
@@ -405,9 +491,16 @@ static int dchid_reset_interface(struct dchid_iface *iface, int state)
 	if (ret < 0)
 		return ret;
 
-	/* Match Apple's will-change / has-changed transaction ordering. */
-	if (state == 2)
-		msleep(DCHID_POWER_SETTLE_MS);
+	/*
+	 * The platform sequence belongs between the two phases: will-change lets
+	 * MTP quiesce the interface, the host then puts the AFE into the new
+	 * state, and has-changed tells MTP the platform is ready, which is when
+	 * it runs its own AFE bootload.
+	 */
+	ret = dchid_afe_power_sequence(iface, state);
+	if (ret < 0)
+		return ret;
+
 	msg[4] = DCHID_POWER_PHASE_HAS_CHANGED;
 
 	return dchid_comm_cmd(iface->dchid, msg, sizeof(msg));
@@ -515,6 +608,32 @@ static int dchid_request_gpio(struct dchid_iface *iface)
 	return 0;
 }
 
+/*
+ * Claim the host-owned AFE reset line described by the parent node's
+ * apple,afe-reset-gpios.  MTP never asks for it on J700, so it cannot come from
+ * an INIT_GPIO_REQUEST the way it does on the STM platforms.  GPIOD_ASIS keeps
+ * the line untouched until dchid_afe_power_sequence() drives it as part of a
+ * real power transition.
+ */
+static int dchid_request_afe_reset(struct dchid_iface *iface)
+{
+	struct gpio_desc *gpio;
+
+	if (iface->afe_reset)
+		return 0;
+
+	gpio = devm_gpiod_get(iface->dchid->dev, "apple,afe-reset", GPIOD_ASIS);
+	if (IS_ERR(gpio)) {
+		dev_err(iface->dchid->dev,
+			"Failed to request apple,afe-reset-gpios for %s: %ld\n",
+			iface->name, PTR_ERR(gpio));
+		return PTR_ERR(gpio);
+	}
+
+	iface->afe_reset = gpio;
+	return 0;
+}
+
 static bool dchid_adopt_preinitialized_ipd_functions(struct dchid_iface *iface)
 {
 	/*
@@ -550,6 +669,16 @@ static int dchid_start_interface(struct dchid_iface *iface)
 	if (ret < 0)
 		goto err;
 
+	/*
+	 * J700 owns the AFE reset itself instead of being asked for it, so the
+	 * line has to be claimed before the power transitions below.
+	 */
+	if (dchid_uses_transactional_power(iface)) {
+		ret = dchid_request_afe_reset(iface);
+		if (ret < 0)
+			goto err;
+	}
+
 	/* If we need a GPIO, make sure we have it. */
 	if (iface->gpio_id) {
 		if (dchid_adopt_preinitialized_ipd_functions(iface)) {
@@ -576,10 +705,10 @@ static int dchid_start_interface(struct dchid_iface *iface)
 
 		/* After loading firmware, multi-touch needs a reset */
 		dev_info(iface->dchid->dev, "Resetting %s\n", iface->name);
-		ret = dchid_reset_interface(iface, 0);
+		ret = dchid_reset_interface(iface, DCHID_POWER_STATE_OFF);
 		if (ret < 0)
 			goto err;
-		ret = dchid_reset_interface(iface, 2);
+		ret = dchid_reset_interface(iface, DCHID_POWER_STATE_ON);
 		if (ret < 0)
 			goto err;
 	}
