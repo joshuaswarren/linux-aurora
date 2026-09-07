@@ -1360,9 +1360,9 @@ struct G17PRenderSksmQueue {
     /// True for the TA/tiling queue, false for the 3D/fragment queue. Selects
     /// which bootstrap context peer backs the entry ring.
     tiling: bool,
-    configure_pair: g17_submission::G17SksmOrderedWritePair,
-    enable_pair: g17_submission::G17SksmOrderedWritePair,
     producer: g17_submission::G17PClKickProducerState,
+    /// Set only after the tag-15 install and complete outer group are visible
+    /// to firmware. It never represents a host MMIO write.
     registered: bool,
 }
 
@@ -1408,9 +1408,9 @@ pub(crate) fn g17p_mark_counts() -> (u32, u32, u32, u32) {
 /// every proven run of this driver has used it.
 pub(crate) const G17P_COMPUTE_QUEUE_ID_BASE: u8 = 4;
 /// Last QID the allocator may hand out. `KICK_QID_MASK` is 127 and the
-/// firmware's KSM restore set has 128 slots. IDs 0..3 are reserved, 4 is the
-/// first compute queue, 5/6 are the retained render pair, and rebuilt compute
-/// graphs consume 7..127 exactly once. Exhaustion returns ENOSPC rather than
+/// firmware's KSM restore set has 128 slots. IDs 0..3 are the two bounded
+/// render pairs, 4 is the first compute queue, and additional compute graphs
+/// consume 5..127 exactly once. Exhaustion returns ENOSPC rather than
 /// reprogramming a queue still installed in the firmware.
 pub(crate) const G17P_COMPUTE_QUEUE_ID_LAST: u8 = 127;
 const _: () = assert!(G17P_COMPUTE_QUEUE_ID_BASE > 1);
@@ -3211,7 +3211,7 @@ impl G17PManagerConstruction {
                 entry_gpu_va,
                 geometry,
             };
-            let config = g17_submission::prepare_g17p_render_sksm_queue_config(
+            let _config = g17_submission::prepare_g17p_render_sksm_queue_config(
                 routing,
                 data_master,
                 scratch,
@@ -3220,8 +3220,6 @@ impl G17PManagerConstruction {
             Ok(G17PRenderSksmQueue {
                 queue_id,
                 tiling,
-                configure_pair: config.write_pair(),
-                enable_pair: config.enable_pair,
                 producer: geometry
                     .initial_producer_state(
                         queue_id,
@@ -3291,9 +3289,9 @@ impl G17PManagerConstruction {
     /// its tag-14 AddKicks must announce.
     ///
     /// Ordering mirrors `submit_translated_first_bind_channel` exactly: the
-    /// caller has already published the group's command record and tag-15
-    /// ConfigUpdate pointers, this configures the QID on the bridge once, then
-    /// writes the kick entry body, and the caller publishes tag-14 afterwards.
+    /// caller has already staged the group's command record and tag-15
+    /// ConfigUpdate pointer. This writes the kick entry body before the caller
+    /// publishes tag-14; tag 15 itself asks firmware to install a fresh QID.
     fn log_render_context_route(&mut self, label: &'static str) -> Result {
         let (pair, descriptor, tiling, fragment, root_slot, ctxdesc) = {
             let storage = self.render_storage.as_mut().ok_or(ENODEV)?;
@@ -3347,10 +3345,50 @@ impl G17PManagerConstruction {
         Ok(())
     }
 
+    /// Check that tag 15 describes the only legal firmware install transition.
+    /// A live queue may never be installed twice, while a fresh production
+    /// queue must carry the install bit. The explicit no-install module
+    /// parameter remains a diagnostic and deliberately leaves the queue fresh.
+    fn validate_render_firmware_install(&self, tiling: bool, install: u16) -> Result<bool> {
+        let queues = self.render_sksm.as_ref().ok_or(ENODEV)?;
+        let queue = if tiling {
+            &queues.tiling
+        } else {
+            &queues.fragment
+        };
+        match (queue.registered, install != 0) {
+            (false, true) => Ok(true),
+            (true, false) => Ok(false),
+            (true, true) => Err(EBUSY),
+            (false, false) if *crate::module_parameters::g17p_render_no_install.value() != 0 => {
+                Ok(false)
+            }
+            (false, false) => Err(EINVAL),
+        }
+    }
+
+    /// Commit firmware ownership only after the complete inner and outer
+    /// channel publication succeeded. This is intentionally infallible: once
+    /// the producer is visible to firmware, host state must describe it.
+    fn commit_render_firmware_install(&mut self, tiling: bool, install: bool) {
+        if !install {
+            return;
+        }
+        let queues = self
+            .render_sksm
+            .as_mut()
+            .expect("validated render firmware install has queue storage");
+        let queue = if tiling {
+            &mut queues.tiling
+        } else {
+            &mut queues.fragment
+        };
+        queue.registered = true;
+    }
+
     fn publish_render_sksm_group(
         &mut self,
         dev: &AsahiDevice,
-        registers: &regs::Resources,
         tiling: bool,
         queue_record_gpu_va: u64,
         barriers: &[g17_submission::G17PClBarrierDependency],
@@ -3461,19 +3499,6 @@ impl G17PManagerConstruction {
             },
         )
         .map_err(|_| Self::render_stage_fail("sksm-kick-entry", EINVAL))?;
-        if !queue.registered {
-            let issued = registers
-                .g17p_sksm_configure_queue(queue.configure_pair, queue.enable_pair)
-                .map_err(|error| Self::render_stage_fail("sksm-configure-queue", error))?;
-            dev_info!(
-                dev.as_ref(),
-                "G17P render QID registration: qid={} issued={} deferred={}\n",
-                queue.queue_id,
-                issued,
-                !issued,
-            );
-            queue.registered = true;
-        }
         storage
             .write_sksm_entry(
                 tiling,
@@ -3512,8 +3537,8 @@ impl G17PManagerConstruction {
     /// publication order the captures show:
     ///
     /// ```text
-    /// 3D record -> 3D tag-15 -> QID configure -> 3D kick entry -> 3D tag-14
-    /// TA record -> TA tag-15 -> QID configure -> TA kick entry -> TA tag-14
+    /// 3D record -> 3D tag-15 install -> 3D kick entry -> 3D tag-14
+    /// TA record -> TA tag-15 install -> TA kick entry -> TA tag-14
     /// ```
     ///
     /// The 3D kick carries the one explicit barrier every captured pass has:
@@ -3524,7 +3549,6 @@ impl G17PManagerConstruction {
     fn stage_render_groups_with_sksm(
         &mut self,
         dev: &AsahiDevice,
-        registers: &regs::Resources,
     ) -> Result<(
         u64,
         u64,
@@ -3628,7 +3652,7 @@ impl G17PManagerConstruction {
                 }
             }
             let fragment_stamp = self
-                .publish_render_sksm_group(dev, registers, false, fragment_queue, barrier_slice)
+                .publish_render_sksm_group(dev, false, fragment_queue, barrier_slice)
                 .map_err(|error| Self::render_stage_fail("sksm-publish-fragment", error))?;
             if fragment_first_install {
                 if let Err(error) = self.log_render_context_route("after-3d-qid-install") {
@@ -3694,7 +3718,7 @@ impl G17PManagerConstruction {
             }
         }
         let tiling_stamp = self
-            .publish_render_sksm_group(dev, registers, true, tiling_queue, &[])
+            .publish_render_sksm_group(dev, true, tiling_queue, &[])
             .map_err(|error| Self::render_stage_fail("sksm-publish-tiling", error))?;
         if tiling_first_install {
             if let Err(error) = self.log_render_context_route("after-ta-qid-install") {
@@ -3827,7 +3851,7 @@ impl G17PManagerConstruction {
         parameter_buffer_token: u64,
         user_timestamps: [u64; 4],
         user_timestamp_aliases: KVec<mmu::KernelMapping>,
-        registers: &regs::Resources,
+        _registers: &regs::Resources,
     ) -> Result<g17_submission::PreparedG17PPartialOpeningWorkPair> {
         let render_sksm = *crate::module_parameters::g17p_render_sksm.value();
         let native_doorbell_mode =
@@ -4094,7 +4118,7 @@ impl G17PManagerConstruction {
             );
         }
         let (fragment_queue, tiling_queue, previous, late_tiling) = if render_sksm != 0 {
-            self.stage_render_groups_with_sksm(dev, registers)
+            self.stage_render_groups_with_sksm(dev)
                 .map_err(|error| Self::render_stage_fail("stage-render-groups-sksm", error))?
         } else {
             let storage = self.render_storage.as_mut().ok_or(ENODEV)?;
@@ -4128,6 +4152,23 @@ impl G17PManagerConstruction {
         let tiling_header = late_tiling
             .as_ref()
             .and_then(|publication| publication.config_update_header());
+        let (fragment_install, tiling_install) = if render_sksm != 0 {
+            let fragment = self
+                .validate_render_firmware_install(false, fragment_header.install)
+                .map_err(|error| {
+                    Self::render_stage_fail("validate-fragment-tag15-install", error)
+                })?;
+            let tiling = tiling_header
+                .map(|header| {
+                    self.validate_render_firmware_install(true, header.install).map_err(|error| {
+                        Self::render_stage_fail("validate-tiling-tag15-install", error)
+                    })
+                })
+                .transpose()?;
+            (fragment, tiling)
+        } else {
+            (false, None)
+        };
         if crate::util::g17p_verbose() {
             dev_info!(
                 dev.as_ref(),
@@ -4250,6 +4291,10 @@ impl G17PManagerConstruction {
                 },
             )
             .map_err(|error| Self::render_stage_fail("publish-partial-opening-pair", error))?;
+        self.commit_render_firmware_install(false, fragment_install);
+        if let Some(install) = tiling_install {
+            self.commit_render_firmware_install(true, install);
+        }
         if crate::util::g17p_verbose() {
             dev_info!(dev.as_ref(), "G17P render PM: submitted-operations committed {:?}\n", pm_submitted_count);
         }
@@ -5137,7 +5182,7 @@ impl G17PManagerConstruction {
     pub(crate) fn publish_split_render_fragment_group(
         &mut self,
         dev: &AsahiDevice,
-        registers: &regs::Resources,
+        _registers: &regs::Resources,
         plan: &g17_submission::G17PPartialOpeningOuterSlotPlan,
     ) -> Result {
         if *crate::module_parameters::g17p_render_split_launch.value() == 0
@@ -5184,8 +5229,17 @@ impl G17PManagerConstruction {
             .ok_or(ENODEV)?
             .queue_gpu_vas()
             .0;
+        let fragment_header = self
+            .render_storage
+            .as_mut()
+            .ok_or(ENODEV)?
+            .fragment_config_update_header()
+            .map_err(|error| Self::render_stage_fail("split-decode-fragment-tag15", error))?;
+        let fragment_install = self
+            .validate_render_firmware_install(false, fragment_header.install)
+            .map_err(|error| Self::render_stage_fail("split-validate-fragment-install", error))?;
         let fragment_stamp = self
-            .publish_render_sksm_group(dev, registers, false, fragment_queue, barrier_slice)
+            .publish_render_sksm_group(dev, false, fragment_queue, barrier_slice)
             .map_err(|error| Self::render_stage_fail("split-sksm-publish-fragment", error))?;
         let fragment_stamp = u32::try_from(fragment_stamp)
             .map_err(|_| Self::render_stage_fail("split-sksm-fragment-stamp-width", EINVAL))?;
@@ -5203,7 +5257,9 @@ impl G17PManagerConstruction {
         }
         self.resources
             .publish_deferred_partial_opening_fragment(plan)
-            .map_err(|error| Self::render_stage_fail("split-fragment-outer", error))
+            .map_err(|error| Self::render_stage_fail("split-fragment-outer", error))?;
+        self.commit_render_firmware_install(false, fragment_install);
+        Ok(())
     }
 
     /// Complete the TA group retained by native render chronology modes 2/3.
@@ -5218,7 +5274,7 @@ impl G17PManagerConstruction {
     pub(crate) fn publish_native_render_tiling_group(
         &mut self,
         dev: &AsahiDevice,
-        registers: &regs::Resources,
+        _registers: &regs::Resources,
         plan: &g17_submission::G17PPartialOpeningOuterSlotPlan,
     ) -> Result {
         if !g17p_native_fragment_first_mode(
@@ -5257,6 +5313,9 @@ impl G17PManagerConstruction {
         let tiling_header = late_tiling
             .config_update_header()
             .ok_or_else(|| Self::render_stage_fail("native-decode-tiling-tag15", EINVAL))?;
+        let tiling_install = self
+            .validate_render_firmware_install(true, tiling_header.install)
+            .map_err(|error| Self::render_stage_fail("native-validate-tiling-install", error))?;
         dev_info!(
             dev.as_ref(),
             "G17P render native TA tag15: selector={:#x} entry=[{:#x},{:#x}] qid={} install={} dm={} graphics={} context={} generation={} flushid={} scheduler={:#x} field56={} pb=[{:#x},{:#x},id={},bit={}]\n",
@@ -5297,7 +5356,7 @@ impl G17PManagerConstruction {
         fence(Ordering::SeqCst);
 
         let tiling_stamp = self
-            .publish_render_sksm_group(dev, registers, true, tiling_queue, &[])
+            .publish_render_sksm_group(dev, true, tiling_queue, &[])
             .map_err(|error| Self::render_stage_fail("native-sksm-publish-tiling", error))?;
         if tiling_stamp != expected_stamp {
             return Err(Self::render_stage_fail("native-tiling-stamp-mismatch", EINVAL));
@@ -5339,6 +5398,7 @@ impl G17PManagerConstruction {
             .advance(G17PNativeRenderPublishPhase::PoolTransition)
             .map_err(|_| Self::render_stage_fail("native-order-pool", EINVAL))?;
         fence(Ordering::SeqCst);
+        self.commit_render_firmware_install(true, tiling_install);
         Ok(())
     }
 
@@ -5964,8 +6024,9 @@ impl G17PManagerConstruction {
     ///
     /// The first graph of a boot always gets `G17P_COMPUTE_QUEUE_ID_BASE` (4),
     /// which is the QID the captured native CL2 queue uses and the only one any
-    /// of this driver's proven runs have exercised. A rebuilt session advances
-    /// into the unused pool at QID 7; QIDs 0/1 are the retained TA/3D pair.
+    /// of this driver's proven runs have exercised. A fresh additional graph
+    /// advances into the unused pool at QID 5; QIDs 0..3 are the two retained
+    /// TA/3D pairs.
     ///
     /// Skips the two render QIDs and never wraps onto an installed queue.
     fn allocate_compute_queue_id(&mut self) -> Result<u8> {
@@ -5983,8 +6044,8 @@ impl G17PManagerConstruction {
     }
 
     /// Allocate and encode the native compute queue without touching the SKSM
-    /// hardware bridge. The dirty first direct submitBuffer registers the QID
-    /// after tag 15, once firmware startup is complete.
+    /// hardware bridge. The dirty first direct submitBuffer asks firmware to
+    /// install the QID through tag 15 once startup is complete.
     pub(crate) fn prepare_g17p_compute_queue(
         &mut self,
         dev: &AsahiDevice,
@@ -6070,20 +6131,21 @@ impl G17PManagerConstruction {
         result
     }
 
-    /// Perform the exact configureHardware four-store QID transaction once.
-    /// All queue memory and user mappings are visible before this makes QID 4
-    /// reachable from the SKSM hardware bridge.
-    pub(crate) fn register_prepared_compute_sksm_queue(
+    /// Prepare a queue for its firmware-mediated tag-15 installation.
+    ///
+    /// Native performs no host MMIO during steady-state rendering, and the
+    /// working QID4 path also succeeds with the AP SKSM aperture suppressed.
+    /// The queue therefore becomes installed only when its tag-15 group is
+    /// published to the firmware channel below, never from an AP port write.
+    fn prepare_compute_firmware_install(
         &self,
-        registers: &regs::Resources,
         queue: &mut G17PSksmQueue,
     ) -> Result {
         if queue.scratch != self.sksm_scratch() || queue.uat_owner != self.uat().ttb_base() {
             return Err(EINVAL);
         }
-        match queue.hardware_state {
-            G17PSksmQueueHardwareState::HardwareRegistered => return Ok(()),
-            G17PSksmQueueHardwareState::PreparedMemory => {}
+        if queue.hardware_state != G17PSksmQueueHardwareState::PreparedMemory {
+            return Err(EBUSY);
         }
         if queue.configure_guard_accelerator_stamp != queue.configure_guard_event_stamp {
             dev_err!(
@@ -6102,9 +6164,6 @@ impl G17PManagerConstruction {
         );
 
         fence(Ordering::SeqCst);
-        let _issued =
-            registers.g17p_sksm_configure_queue(queue.configure_pair, queue.enable_pair)?;
-        queue.hardware_state = G17PSksmQueueHardwareState::HardwareRegistered;
         Ok(())
     }
 
@@ -6204,7 +6263,7 @@ impl G17PManagerConstruction {
     /// command may drive it, not just the add3 probe.
     fn submit_translated_first_bind_channel(
         &mut self,
-        registers: &regs::Resources,
+        _registers: &regs::Resources,
         queue: &mut G17PSksmQueue,
         submission_phase: &AtomicU32,
         binding: &G17PComputeUserBinding,
@@ -6357,11 +6416,9 @@ impl G17PManagerConstruction {
             G17PSksmQueueHardwareState::PreparedMemory
         );
         // The single most diagnostic line for a client handoff. The tag-15
-        // queue-install flag must be published exactly ONCE per boot -- on the
-        // first client's first bind. A second occurrence means some path has
-        // handed the graph on by rebuilding it, and the firmware is being told
-        // to install a QID it already has, which reprograms a live KSMFE queue
-        // and leaves the submission published-but-never-completed.
+        // queue-install flag must be published exactly once for each fresh QID.
+        // Reusing an installed QID with another context would ask firmware to
+        // reprogram a live KSMFE queue and strand one of the two routes.
         dev_info!(
             self.resources.dev().as_ref(),
             "G17PMARK tag15-install i={} z={} r={} h={} qid={} flag={} (first-bind chronology; a second install on the SAME qid in one boot is the second-client bug)\n",
@@ -6422,14 +6479,13 @@ impl G17PManagerConstruction {
             .compute
             .publish_initial_config_update_pointer(group)?;
         submission_phase.store(G17P_SUBMIT_PHASE_TAG15, Ordering::Release);
-        // Native submitBuffer publishes tag 15 before the dirty queue's
-        // configureHardware vcall. The four QID stores must therefore occur
-        // here: after ConfigUpdate is visible, before the SKSM entry body.
-        self.register_prepared_compute_sksm_queue(registers, queue)?;
-        submission_phase.store(G17P_SUBMIT_PHASE_QID, Ordering::Release);
+        // Tag 15 carries the firmware-visible queue-install request. Prepare
+        // every mapping before the remainder of that group is published; no
+        // AP-side SKSM MMIO is valid on J700.
+        self.prepare_compute_firmware_install(queue)?;
         dev_info!(
             self.resources.dev().as_ref(),
-            "G17P submitBuffer/configureHardware: tag15 published, then QID 4 configured and enabled; writing first SKSM entry\n"
+            "G17P submitBuffer: tag15 firmware install published; writing first SKSM entry\n"
         );
         if g17p_compute_sksm_entry_enabled() {
             queue.storage.write_entry(
@@ -6517,6 +6573,10 @@ impl G17PManagerConstruction {
             .resources
             .publish_compute_channel(group.queue, group.write_index, queue.queue_id)?;
         submission_phase.store(G17P_SUBMIT_PHASE_CL2, Ordering::Release);
+        // The complete install group is now visible to firmware. From this
+        // point a retry must use the retained route; publishing another
+        // install for the same QID could reprogram a live queue.
+        queue.hardware_state = G17PSksmQueueHardwareState::HardwareRegistered;
         if lifecycle.notifications.activation != Some(prepared.doorbell) {
             return Err(EINVAL);
         }

@@ -4,8 +4,6 @@ import subprocess
 import tempfile
 
 root = Path(__file__).resolve().parents[1]
-regs = (root / "regs.rs").read_text()
-drm = (root / "g17_drm.rs").read_text()
 manager = (root / "g17_manager.rs").read_text()
 
 
@@ -23,155 +21,99 @@ def block(source: str, marker: str) -> str:
     raise AssertionError(f"unterminated block: {marker}")
 
 
-configure = block(regs, "pub(crate) fn g17p_sksm_configure_queue(")
-replay = block(regs, "pub(crate) fn g17p_replay_deferred_sksm_registrations(")
-cancel = block(regs, "pub(crate) fn g17p_cancel_deferred_sksm_registration(")
-wait = block(drm, "fn wait_render_slot(")
-render_install = block(manager, "if !queue.registered {")
-compute_install = block(manager, "pub(crate) fn register_prepared_compute_sksm_queue(")
-compute_uninstall = block(manager, "pub(crate) fn unregister_compute_sksm_queue(")
+compute = block(manager, "fn submit_translated_first_bind_channel(")
+render_entry = block(manager, "fn publish_render_sksm_group(")
+render_pair = block(manager, "fn begin_translated_render_with_hardware_buffer(")
+split_fragment = block(manager, "pub(crate) fn publish_split_render_fragment_group(")
+native_tiling = block(manager, "pub(crate) fn publish_native_render_tiling_group(")
 
-assert "sksm_deferred_registrations" in regs
-assert "stash_deferred_sksm_registration(pair, enable_pair)?" in configure
-assert "stash_deferred_sksm_pair" not in configure
-assert "return Err(ENOSPC)" in regs
-assert replay.index("g17p_sksm_port_powered") < replay.index("g17p_sksm_publish_locked")
-assert replay.index("registration.configure_pair") < replay.index("registration.enable_pair")
-assert replay.index("registration.enable_pair") < replay.index("deferred.entries[index] = None")
-assert "sksm_deferred.lock()" not in replay
-assert "*slot = None" in cancel
-assert wait.index("replay_deferred_render_sksm_registrations") < wait.index(
-    "poll_deferred_render_completion"
+# Production queue installation is transported only by tag 15 and the firmware
+# channel. The AP SKSM helpers may remain for teardown diagnostics, but no first
+# install path is allowed to call them.
+assert "g17p_sksm_configure_queue" not in compute
+assert "g17p_sksm_configure_queue" not in render_entry
+assert "g17p_sksm_publish_write_pair" not in compute
+assert "g17p_sksm_publish_write_pair" not in render_entry
+
+# Compute is not marked installed until the complete CL_2 outer publication is
+# visible. Mapping preparation and tag-15 publication both precede that point.
+assert compute.index("publish_initial_config_update_pointer") < compute.index(
+    "prepare_compute_firmware_install"
 )
-assert render_install.index("g17p_sksm_configure_queue") < render_install.index(
-    "queue.registered = true"
+assert compute.index("prepare_compute_firmware_install") < compute.index(
+    "publish_compute_channel"
 )
-assert compute_install.index("g17p_sksm_configure_queue") < compute_install.index(
-    "queue.hardware_state = G17PSksmQueueHardwareState::HardwareRegistered"
+assert compute.index("publish_compute_channel") < compute.index(
+    "G17PSksmQueueHardwareState::HardwareRegistered"
 )
-assert compute_uninstall.index("g17p_cancel_deferred_sksm_registration") < (
-    compute_uninstall.index("g17p_sksm_publish_write_pair")
+
+# Normal and deferred render chronologies validate tag-15 ownership before the
+# outer producer and commit it only after successful outer publication.
+assert render_pair.index("validate_render_firmware_install") < render_pair.index(
+    "publish_partial_opening_pair"
+)
+assert render_pair.index("publish_partial_opening_pair") < render_pair.index(
+    "commit_render_firmware_install"
+)
+assert split_fragment.index("validate_render_firmware_install") < split_fragment.index(
+    "publish_deferred_partial_opening_fragment"
+)
+assert split_fragment.index("publish_deferred_partial_opening_fragment") < split_fragment.index(
+    "commit_render_firmware_install"
+)
+assert native_tiling.index("validate_render_firmware_install") < native_tiling.index(
+    "publish_deferred_partial_opening_tiling"
+)
+assert native_tiling.index("publish_deferred_partial_opening_tiling") < native_tiling.index(
+    "commit_render_firmware_install"
 )
 
 model = r'''
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Registration { configure: u8, enable: u8 }
+enum Queue { Fresh, Installed }
 
-#[derive(Debug, PartialEq, Eq)]
-enum Error { Full, NotPowered, Write }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Error { MissingInstall, DuplicateInstall, OuterPublish }
 
-struct Pending {
-    entries: [Option<Registration>; 2],
-    generic: Vec<u8>,
-}
-
-impl Pending {
-    fn new() -> Self { Self { entries: [None; 2], generic: Vec::new() } }
-
-    fn stash(&mut self, registration: Registration) -> Result<(), Error> {
-        if let Some(existing) = self.entries.iter_mut().find(|entry| {
-            entry.is_some_and(|current| current.configure == registration.configure)
-        }) {
-            *existing = Some(registration);
-            return Ok(());
-        }
-        let slot = self.entries.iter_mut().find(|slot| slot.is_none()).ok_or(Error::Full)?;
-        *slot = Some(registration);
-        Ok(())
+fn publish(state: &mut Queue, install: bool, outer_succeeds: bool) -> Result<(), Error> {
+    match (*state, install) {
+        (Queue::Fresh, false) => return Err(Error::MissingInstall),
+        (Queue::Installed, true) => return Err(Error::DuplicateInstall),
+        _ => {}
     }
-
-    fn cancel(&mut self, configure: u8) -> bool {
-        let Some(slot) = self.entries.iter_mut().find(|entry| {
-            entry.is_some_and(|registration| registration.configure == configure)
-        }) else { return false };
-        *slot = None;
-        true
+    if !outer_succeeds {
+        return Err(Error::OuterPublish);
     }
-
-    fn replay(&mut self, writer: &mut Writer) -> Result<usize, Error> {
-        if !writer.powered { return Err(Error::NotPowered); }
-        let mut issued = 0;
-        for index in 0..self.entries.len() {
-            let Some(registration) = self.entries[index] else { continue };
-            writer.write(registration.configure)?;
-            writer.write(registration.enable)?;
-            self.entries[index] = None;
-            issued += 1;
-        }
-        Ok(issued)
+    if install {
+        *state = Queue::Installed;
     }
-}
-
-struct Writer { powered: bool, fail_at: Option<usize>, writes: Vec<u8> }
-impl Writer {
-    fn write(&mut self, value: u8) -> Result<(), Error> {
-        if self.fail_at == Some(self.writes.len()) { return Err(Error::Write); }
-        self.writes.push(value);
-        Ok(())
-    }
+    Ok(())
 }
 
 #[test]
-fn overflow_is_explicit_and_atomic() {
-    let mut pending = Pending::new();
-    pending.stash(Registration { configure: 1, enable: 2 }).unwrap();
-    pending.stash(Registration { configure: 3, enable: 4 }).unwrap();
-    assert_eq!(pending.stash(Registration { configure: 5, enable: 6 }), Err(Error::Full));
-    assert_eq!(pending.entries, [
-        Some(Registration { configure: 1, enable: 2 }),
-        Some(Registration { configure: 3, enable: 4 }),
-    ]);
+fn fresh_qid_is_installed_by_successful_tag15_group() {
+    let mut q = Queue::Fresh;
+    assert_eq!(publish(&mut q, true, true), Ok(()));
+    assert_eq!(q, Queue::Installed);
 }
 
 #[test]
-fn unpowered_replay_never_touches_the_port() {
-    let mut pending = Pending::new();
-    pending.stash(Registration { configure: 1, enable: 2 }).unwrap();
-    let mut writer = Writer { powered: false, fail_at: None, writes: Vec::new() };
-    assert_eq!(pending.replay(&mut writer), Err(Error::NotPowered));
-    assert!(writer.writes.is_empty());
-    assert!(pending.entries[0].is_some());
+fn failed_outer_publish_does_not_claim_firmware_install() {
+    let mut q = Queue::Fresh;
+    assert_eq!(publish(&mut q, true, false), Err(Error::OuterPublish));
+    assert_eq!(q, Queue::Fresh);
 }
 
 #[test]
-fn replay_is_ordered_and_excludes_generic_traffic() {
-    let mut pending = Pending::new();
-    pending.generic.extend([90, 91]);
-    pending.stash(Registration { configure: 1, enable: 2 }).unwrap();
-    pending.stash(Registration { configure: 3, enable: 4 }).unwrap();
-    let mut writer = Writer { powered: true, fail_at: None, writes: Vec::new() };
-    assert_eq!(pending.replay(&mut writer), Ok(2));
-    assert_eq!(writer.writes, [1, 2, 3, 4]);
-    assert_eq!(pending.generic, [90, 91]);
-    assert_eq!(pending.entries, [None, None]);
-}
+fn missing_and_duplicate_installs_fail_closed() {
+    let mut fresh = Queue::Fresh;
+    assert_eq!(publish(&mut fresh, false, true), Err(Error::MissingInstall));
+    assert_eq!(fresh, Queue::Fresh);
 
-#[test]
-fn failed_enable_keeps_the_complete_registration_pending() {
-    let mut pending = Pending::new();
-    pending.stash(Registration { configure: 1, enable: 2 }).unwrap();
-    let mut failing = Writer { powered: true, fail_at: Some(1), writes: Vec::new() };
-    assert_eq!(pending.replay(&mut failing), Err(Error::Write));
-    assert_eq!(failing.writes, [1]);
-    assert!(pending.entries[0].is_some());
-
-    let mut retry = Writer { powered: true, fail_at: None, writes: Vec::new() };
-    assert_eq!(pending.replay(&mut retry), Ok(1));
-    assert_eq!(retry.writes, [1, 2]);
-    assert!(pending.entries[0].is_none());
-}
-
-#[test]
-fn replacement_is_bounded_and_cancelled_work_never_replays() {
-    let mut pending = Pending::new();
-    pending.stash(Registration { configure: 1, enable: 2 }).unwrap();
-    pending.stash(Registration { configure: 1, enable: 7 }).unwrap();
-    assert_eq!(pending.entries, [Some(Registration { configure: 1, enable: 7 }), None]);
-    assert!(pending.cancel(1));
-    assert!(!pending.cancel(1));
-    let mut writer = Writer { powered: true, fail_at: None, writes: Vec::new() };
-    assert_eq!(pending.replay(&mut writer), Ok(0));
-    assert!(writer.writes.is_empty());
+    let mut installed = Queue::Installed;
+    assert_eq!(publish(&mut installed, true, true), Err(Error::DuplicateInstall));
+    assert_eq!(installed, Queue::Installed);
+    assert_eq!(publish(&mut installed, false, true), Ok(()));
 }
 '''
 
@@ -186,7 +128,6 @@ with tempfile.TemporaryDirectory() as directory:
     subprocess.run([str(binary), "--test-threads=1"], check=True)
 
 print(
-    "PASS deferred SKSM registrations: explicit atomic overflow, powered-only replay, "
-    "configure-before-enable ordering, generic traffic isolation, failure-safe retention, "
-    "deduplication and cancellation"
+    "PASS firmware-mediated SKSM install: no AP registration writes, tag-15-before-outer "
+    "ordering, post-publication ownership, failed-publication retention, and duplicate rejection"
 )
