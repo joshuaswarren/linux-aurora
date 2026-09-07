@@ -160,16 +160,10 @@ impl G17PLiveRuntime {
             "G17P async compute: PUBLISHED submission={} owner={} qid={} context={} root={:#x} outstanding={}\n",
             packet.submission_id(), owner, packet.hardware_queue_id(),
             packet.context().context_id(), packet.context().root(), outstanding);
-        // Firmware may notify before publishing the final stamp, and an
-        // interrupt coalesced with a running worker cannot enqueue it twice.
-        // Keep completion service armed while any hardware owner is active.
-        self.async_visibility_pending = true;
-        crate::driver::queue_g17p_firmware_event_worker(state.dev.clone());
         Ok(())
     }
 
     fn service_async_compute_completions(&mut self) -> Result {
-        self.async_visibility_pending = false;
         let manager = self.manager.as_mut().ok_or(ENODEV)?;
         for q in &mut self.async_compute_queues {
             if q.active.is_none() || q.quarantined { continue; }
@@ -186,8 +180,11 @@ impl G17PLiveRuntime {
                         q.binding = None; q.context = None; q.owner = None;
                     }
                 }
-                Ok(None) => { self.async_visibility_pending = true; },
-                Err(error) if error == EAGAIN => { self.async_visibility_pending = true; },
+                // An RTKit edge may precede the final descriptor/stamp cache
+                // lines. Leave the job armed; the scheduler's finite timeout
+                // performs one final DRAM observation before quarantine.
+                Ok(None) => {}
+                Err(error) if error == EAGAIN => {}
                 Err(error) => {
                     q.quarantined = true;
                     q.active.as_ref().ok_or(EIO)?._lease.quarantine();
@@ -195,11 +192,6 @@ impl G17PLiveRuntime {
                 }
             }
         }
-        // Poll only while there is accepted hardware work, with a sleep rather
-        // than a busy loop. This closes early/coalesced interrupt races without
-        // requiring another notification after the completion record or stamp.
-        // The scheduler's finite timeout ends service by quarantining the job.
-        if self.async_visibility_pending { fsleep(Delta::from_micros(250)); }
         Ok(())
     }
 

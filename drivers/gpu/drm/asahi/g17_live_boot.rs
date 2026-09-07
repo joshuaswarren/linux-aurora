@@ -2520,7 +2520,6 @@ pub(crate) struct G17PLiveRuntime {
     /// released together once both CPUs stop, in `release_runtime_objects`.
     retired_queues: KVec<g17_manager::G17PSksmQueue>,
     async_compute_queues: KVec<G17PAsyncComputeQueue>,
-    async_visibility_pending: bool,
     /// Bindings of clients whose submission was published and never seen to
     /// retire.
     ///
@@ -2600,7 +2599,7 @@ impl G17PLiveRuntime {
             state.firmware_event_notifications.load(Ordering::Acquire) != 0
         }) || self.gfx1_state.as_ref().is_some_and(|state| {
             state.firmware_event_notifications.load(Ordering::Acquire) != 0
-        }) || self.queue_setup_pending || self.async_visibility_pending
+        }) || self.queue_setup_pending
     }
 
     pub(crate) fn primary_recovery_pending(&self) -> bool {
@@ -6673,7 +6672,6 @@ impl G17PLiveRuntime {
             compute_abandoned: false,
             retired_queues: KVec::new(),
             async_compute_queues: KVec::new(),
-            async_visibility_pending: false,
             quarantined_bindings: KVec::new(),
             crash_recoveries: 0,
             compute_gate_suspect: false,
@@ -6828,7 +6826,6 @@ impl g17_lifecycle::PersistentRuntimeRecovery for G17PLiveRuntime {
         // firmware can still dereference them.
         self.retired_queues.clear();
         self.async_compute_queues.clear();
-        self.async_visibility_pending = false;
         // Both CPUs have stopped, so a quarantined client's page tables and
         // GEM objects can finally go too.
         self.quarantined_bindings.clear();
@@ -6939,7 +6936,6 @@ impl g17_lifecycle::PersistentRuntimeTeardown for G17PLiveRuntime {
         drop(self.queue.take());
         self.retired_queues.clear();
         self.async_compute_queues.clear();
-        self.async_visibility_pending = false;
         self.quarantined_bindings.clear();
         self.compute_owner = None;
         self.compute_recycle_pending = false;
