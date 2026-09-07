@@ -19,10 +19,20 @@ struct G17PAsyncComputeQueue {
 }
 
 impl G17PLiveRuntime {
+    pub(crate) fn prepare_queue_execution_context(
+        &mut self, vm: &mmu::Vm,
+    ) -> Result<Arc<mmu::T8140ComputeExecutionContext>> {
+        if !self.accepting_submissions || self.is_crashed() { return Err(EIO); }
+        self.manager.as_ref().ok_or(ENODEV)?
+            .uat().allocate_t8140_compute_execution_context(vm)
+    }
+
     pub(crate) fn prepare_async_compute_queue(
         &mut self, owner: u64, vm: &mmu::Vm,
+        context: Arc<mmu::T8140ComputeExecutionContext>,
     ) -> Result<(u8, Arc<mmu::T8140ComputeExecutionContext>)> {
         if !self.accepting_submissions || self.is_crashed() { return Err(EIO); }
+        if !context.matches(vm) || !context.is_current() { return Err(EFAULT); }
         if let Some(q) = self.async_compute_queues.iter().find(|q| q.owner == Some(owner)) {
             return Ok((q.queue.queue_id(), q.context.as_ref().ok_or(EIO)?.clone()));
         }
@@ -49,7 +59,9 @@ impl G17PLiveRuntime {
             index
         };
         let q = &mut self.async_compute_queues[index];
-        let (binding, context) = manager.bind_independent_compute_user_vm(&mut q.queue, vm)?;
+        let binding = manager.bind_independent_compute_user_vm(
+            &mut q.queue, vm, context.clone(),
+        )?;
         q.binding = Some(binding);
         q.context = Some(context.clone());
         q.owner = Some(owner);

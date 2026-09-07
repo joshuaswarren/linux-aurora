@@ -486,6 +486,10 @@ struct G17PQueue {
     user_range: Range<u64>,
     usc_exec_base: u64,
     fence_contexts: FenceContexts,
+    /// Per-logical-queue VM context. Render needs the context immediately,
+    /// but the hardware compute graph is deliberately allocated only if this
+    /// logical queue actually submits compute.
+    context: Arc<mmu::T8140ComputeExecutionContext>,
     async_backend: Option<Arc<G17PAsyncQueueBackend>>,
     async_scheduler: Option<g17_job::G17PJobScheduler<G17PAsyncQueueBackend>>,
     /// Most recent compute job submitted through this logical DRM queue.
@@ -585,17 +589,13 @@ impl G17PQueue {
         .validate()
         .map_err(|_| EINVAL)?;
         let fence_contexts = FenceContexts::new(1, QUEUE_NAME, QUEUE_CLASS_KEY)?;
-        // Reserve all scarce hardware resources before QUEUE_CREATE succeeds.
-        // Allocation errors must not surface later as accepted-job device loss.
-        // Backend Drop gives an unpublished/idle reservation back on any later
-        // constructor failure, including scheduler or KBox allocation failure.
-        let (hardware_queue, context) = runtime.mutex().lock()
-            .prepare_async_compute_queue(id, &vm)?;
-        let backend = Arc::new(G17PAsyncQueueBackend {
-            runtime, registry: registry.clone(), owner: id, hardware_queue, context,
-        }, GFP_KERNEL)?;
-        let scheduler = g17_job::G17PJobScheduler::new(dev, backend.clone(),
-            crate::g17_queue_limits::MAX_IN_FLIGHT_PER_QUEUE)?;
+        // Every logical queue owns a VM execution context, since render also
+        // names it. Do not allocate a hardware compute graph here: desktop
+        // stacks routinely create idle/render-only logical queues, and eager
+        // allocation made those queues consume QID4 before the first real
+        // compute submit. The graph and scheduler are created atomically by
+        // ensure_async_compute_queue on first compute use.
+        let context = runtime.mutex().lock().prepare_queue_execution_context(&vm)?;
         Ok(Self {
             dev: dev.into(),
             runtime,
@@ -607,11 +607,40 @@ impl G17PQueue {
             user_range,
             usc_exec_base,
             fence_contexts,
-            async_backend: Some(backend),
-            async_scheduler: Some(scheduler),
+            context,
+            async_backend: None,
+            async_scheduler: None,
             last_async_compute: None,
             id,
         })
+    }
+
+    fn ensure_async_compute_queue(&mut self) -> Result {
+        if self.async_backend.is_some() && self.async_scheduler.is_some() {
+            return Ok(());
+        }
+        if self.async_backend.is_some() || self.async_scheduler.is_some() {
+            return Err(EIO);
+        }
+
+        let (hardware_queue, context) = self.runtime.mutex().lock()
+            .prepare_async_compute_queue(self.id, &self.vm, self.context.clone())?;
+        let backend = Arc::new(G17PAsyncQueueBackend {
+            runtime: self.runtime,
+            registry: self.registry.clone(),
+            owner: self.id,
+            hardware_queue,
+            context,
+        }, GFP_KERNEL).inspect_err(|_| {
+            self.runtime.mutex().lock().release_async_compute_queue(self.id);
+        })?;
+        let scheduler = g17_job::G17PJobScheduler::new(
+            &self.dev, backend.clone(),
+            crate::g17_queue_limits::MAX_IN_FLIGHT_PER_QUEUE,
+        )?;
+        self.async_backend = Some(backend);
+        self.async_scheduler = Some(scheduler);
+        Ok(())
     }
 
     /// Name the UAPI check that refused a submission. Without this the ioctl
@@ -690,6 +719,7 @@ impl G17PQueue {
         mut syncs: KVec<file::SyncItem>, in_sync_count: usize,
         objects: core::pin::Pin<&xarray::XArray<KBox<file::Object>>>,
     ) -> Result {
+        self.ensure_async_compute_queue()?;
         self.runtime.mutex().lock().check_async_compute_submission()?;
         let destinations = [
             Self::timestamp_destination(objects, translated.timestamps.start)?,
@@ -1553,11 +1583,7 @@ impl queue::Queue for G17PQueue {
                         &self.vm,
                         lease.slot(),
                         true,
-                        self.async_backend
-                            .as_ref()
-                            .ok_or(EIO)?
-                            .context
-                            .clone(),
+                        self.context.clone(),
                         &translated,
                         timestamps,
                         timestamp_aliases,
