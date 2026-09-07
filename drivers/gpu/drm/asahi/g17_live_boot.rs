@@ -450,6 +450,9 @@ fn log_g17p_status_a(
     manager: &mut g17_manager::G17PManagerConstruction,
     checkpoint: &'static str,
 ) {
+    if !crate::util::g17p_verbose() {
+        return;
+    }
     match manager.status_a_snapshot() {
         Ok(snapshot) => dev_info!(
             dev,
@@ -4451,7 +4454,7 @@ impl G17PLiveRuntime {
                         Err(recovery_error) => Err(recovery_error),
                     };
                 }
-                if let Some(pdev) = self.pdev.as_ref() {
+                if let Some(pdev) = self.pdev.as_ref().filter(|_| crate::util::g17p_verbose()) {
                     dev_info!(
                         pdev.as_ref(),
                         "G17P render: deferred {} outer publication completed after USC FList retirement and initial doorbell sent\n",
