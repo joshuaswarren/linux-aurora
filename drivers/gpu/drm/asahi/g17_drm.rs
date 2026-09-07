@@ -714,10 +714,19 @@ impl G17PQueue {
         }
     }
 
+    /// Queue a compute command on this queue's DRM scheduler.
+    ///
+    /// `syncs` holds only the input syncobjs: `submit()` splits the outputs off
+    /// into `publication` before it knows whether the command is render or
+    /// compute. The scheduler's finished fence is therefore published through
+    /// that guard rather than installed from here, and only once the job is
+    /// actually enqueued -- every earlier failure leaves the guard armed so the
+    /// caller still learns the work will never run.
     fn submit_compute_async(
         &mut self, submission_id: u64, translated: g17_uapi::TranslatedComputeCommand,
         mut syncs: KVec<file::SyncItem>, in_sync_count: usize,
         objects: core::pin::Pin<&xarray::XArray<KBox<file::Object>>>,
+        publication: &mut G17POutputFencePublication<'_>,
     ) -> Result {
         self.ensure_async_compute_queue()?;
         self.runtime.mutex().lock().check_async_compute_submission()?;
@@ -739,7 +748,9 @@ impl G17PQueue {
             if let Some(fence) = sync.fence { dependencies.push(fence, GFP_KERNEL)?; }
         }
         let finished = self.async_scheduler.as_mut().ok_or(EIO)?.enqueue(packet, dependencies)?;
-        Self::install_output_fences(syncs.into_iter(), &finished);
+        // The job is queued and owns its completion from here: give userspace
+        // the fence that signals when the GPU has actually run it.
+        publication.publish_async(&finished);
         self.last_async_compute = Some(finished);
         pr_info!("G17P async submit: QUEUED submission {} owner={} qid={} context={}\n",
             submission_id, self.id, backend.hardware_queue, backend.context.context_id());
@@ -1407,6 +1418,23 @@ impl G17POutputFencePublication<'_> {
     fn succeeded(&mut self) {
         self.succeeded = true;
     }
+
+    /// Hand the output syncobjs to an asynchronous completion fence.
+    ///
+    /// An asynchronously scheduled submission has *not* run when the ioctl
+    /// returns, so neither of this guard's own answers is correct for it:
+    /// signalling success would tell userspace the GPU had finished work it
+    /// has not started, and the ECANCELED failure fence would claim work that
+    /// is queued and will run was thrown away. Both read as "signalled" to a
+    /// DRM syncobj wait, so either one lets the client observe the destination
+    /// buffer before the job that fills it has executed.
+    ///
+    /// Install the job's real completion fence instead, and disarm the guard:
+    /// from here the async job owns the promise made to userspace.
+    fn publish_async(&mut self, fence: &Fence) {
+        G17PQueue::install_output_fences(self.outputs.drain(..), fence);
+        self.succeeded = true;
+    }
 }
 
 impl Drop for G17POutputFencePublication<'_> {
@@ -1599,7 +1627,14 @@ impl queue::Queue for G17PQueue {
         );
 
         if let G17PPendingCommand::Compute(translated) = pending {
-            return self.submit_compute_async(submission_id, translated, syncs, in_sync_count, objects);
+            return self.submit_compute_async(
+                submission_id,
+                translated,
+                syncs,
+                in_sync_count,
+                objects,
+                &mut publication,
+            );
         }
 
         self.join_async_compute_timeline(submission_id)?;

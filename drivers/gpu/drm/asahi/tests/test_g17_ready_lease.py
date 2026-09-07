@@ -11,7 +11,10 @@ def method(marker):
 wait=method('fn wait_input_fences(');ready=method('fn acquire_ready_lease(')
 submit=source[source.index('impl queue::Queue for G17PQueue {'):]
 assert submit.index('parser\n            .finish()') < submit.index('self.acquire_ready_lease(')
-assert submit.index('self.acquire_ready_lease(') < submit.index('let output_fence:') < submit.index('match pending {\n            G17PPendingCommand::Render(translated) => {')
+assert submit.index('self.acquire_ready_lease(') < submit.index('match pending {\n            G17PPendingCommand::Render(translated) => {')
+# The output-fence guard is armed before anything can fail, so a rejected
+# submission still publishes rather than leaving a client waiting forever.
+assert submit.index('let mut publication = G17POutputFencePublication') < submit.index('let mut parser =')
 assert '.registry\n            .acquire_lease(' not in submit
 preamble=r'''
 #![allow(dead_code)]
