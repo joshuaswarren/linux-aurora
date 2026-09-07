@@ -48,6 +48,9 @@ body = "\n".join([
     block(r"^struct G17PEventControlKick\s*"),
     block(r"^impl G17PEventControlKick\s*"),
     "#[derive(Debug, Copy, Clone, PartialEq, Eq)]",
+    block(r"^pub\(crate\) struct G17PRenderEventControlState\s*"),
+    block(r"^impl G17PRenderEventControlState\s*"),
+    "#[derive(Debug, Copy, Clone, PartialEq, Eq)]",
     block(r"^struct G17PRenderItemPlan\s*"),
     block(r"^impl G17PRenderItemPlan\s*"),
     block(r"^struct G17PLateTilingBytes\s*"),
@@ -76,6 +79,8 @@ fn late(kick: G17PEventControlKick, ordinal: u32) -> G17PLateTilingBytes {
         entry_signal: [0; g17_submission::G17P_COMPUTE_OPTIONAL_EVENT_SIZE],
         optional: [0; g17_submission::G17P_COLD_OPENING_OPTIONAL_SIZE],
         event: [0; g17_submission::G17P_COLD_OPENING_EVENT_SIZE],
+        optional_offset: 0x1000,
+        event_offset: 0x2000,
         pool_a_slot_offset: kick.slot_offset, pool_a_slot_value: kick.next,
         shared_inner_value: 2 * (ordinal + 1),
     }
@@ -183,6 +188,18 @@ fn invalid_bounds_pointer_counts_or_membership_do_not_mutate() {
         bytes = saved;
     }
 }
+#[test]
+fn fence_requires_its_exact_completed_and_unlinked_event_control() {
+    let base = G17PRenderEventControlState {
+        record_index: 17, submitted: 8, completed: 7, membership: 1,
+    };
+    assert!(!base.unlinked());
+    assert!(!G17PRenderEventControlState { completed: 8, ..base }.unlinked());
+    assert!(!G17PRenderEventControlState { membership: 0, ..base }.unlinked());
+    assert!(G17PRenderEventControlState {
+        completed: 8, membership: 0, ..base
+    }.unlinked());
+}
 ''',
 ])
 with tempfile.TemporaryDirectory(prefix="g17-event-control-") as temp:
@@ -192,15 +209,20 @@ with tempfile.TemporaryDirectory(prefix="g17-event-control-") as temp:
     subprocess.run([str(binary)], check=True)
 
 restage = block(r"^    pub\(crate\) fn restage_command\(")
-assert "G17PEventControlKick::prepare_reuse(support, support_va, record_a_index)" in restage
-assert restage.index("G17PEventControlKick::prepare_reuse") < restage.index("destination.copy_from_slice")
+assert "G17PEventControlKick::prepare_reuse(" in restage
+assert restage.index("G17PEventControlKick::prepare_reuse") < restage.index(".copy_from_slice(&source")
 assert restage.count("pool_a_kick.apply(support);") == 1
 prepare = block(r"^    pub\(crate\) fn prepare_late_tiling_publication_with_stamp\(")
 assert prepare.count("G17PEventControlKick::prepare(raw, record_a_index)") == 1
 assert "pool_a_kick.next," in prepare
+assert "usize::from(self.pool_a_record_index)" in prepare
+assert "self.pool_a_submitted = pool_a_kick.next" in prepare
+assert "g17p_render_pool_a_record_index(" not in prepare
 assert "quiesce_completed_job_list" not in source + manager
 assert "g17p_render_can_reset_job_list" not in source + manager
 poll = block(r"^    pub\(crate\) fn poll_translated_render_completion\(", manager)
 assert "job_list_empty: state.job_list_empty" in poll
+assert "render_event_control_state" in poll
+assert "event_control.unlinked()" in poll
 assert "put_u" not in poll
 print("actual counter increments, captured publication, retained owner and firmware-unlink checks PASS")
