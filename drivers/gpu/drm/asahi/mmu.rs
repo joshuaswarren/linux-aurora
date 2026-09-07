@@ -3240,6 +3240,74 @@ impl Uat {
         Ok(aliases)
     }
 
+    /// Materialize the complete SecureGart low-view closure in one submitted
+    /// job's own process root.  Unlike `install_t8140_native_context_aliases`,
+    /// this never mutates the singleton context-0 lower VM, so two distinct
+    /// application-GART contexts can retain different process resources at
+    /// the same low addresses concurrently.
+    pub(crate) fn install_t8140_job_context_aliases(
+        &self,
+        source: &Vm,
+    ) -> Result<KVec<KernelMapping>> {
+        if self.cfg != UatConfig::T8140 {
+            return Err(EINVAL);
+        }
+        let snapshot = {
+            let native_bindings = source
+                .t8140_native_context_bindings
+                .as_ref()
+                .ok_or(EINVAL)?;
+            let bindings = native_bindings.lock();
+            let mut snapshot: KVec<(ARef<gem::Object>, usize)> = KVec::new();
+            for (index, view) in T8140_NATIVE_CONTEXT_VIEWS.iter().copied().enumerate() {
+                let binding = bindings.slots[index].as_ref().ok_or_else(|| {
+                    dev_err!(
+                        self.dev.as_ref(),
+                        "MMU: T8140 job context view {} source {:#x}+{:#x} -> {:#x} is not bound\n",
+                        index,
+                        view.source_address,
+                        view.size,
+                        view.context_address,
+                    );
+                    ENOENT
+                })?;
+                snapshot.push((binding.gem.clone(), binding.object_offset), GFP_KERNEL)?;
+            }
+            snapshot
+        };
+
+        let mut mappings = KVec::new();
+        for (index, (gem, object_offset)) in snapshot.iter().enumerate() {
+            let view = T8140_NATIVE_CONTEXT_VIEWS[index];
+            if !source.covers_range(
+                view.source_address,
+                view.size as u64,
+                true,
+                view.requires_source_write,
+            ) {
+                return Err(EFAULT);
+            }
+            let object_end = object_offset.checked_add(view.size).ok_or(EOVERFLOW)?;
+            let mapping = source.map_in_range(
+                &**gem,
+                *object_offset..object_end,
+                UAT_PGSZ as u64,
+                view.context_address..view.context_address + view.size as u64,
+                view.context_prot,
+                false,
+            )?;
+            let source_last = view.source_address + view.size as u64 - 1;
+            let low_last = view.context_address + view.size as u64 - 1;
+            if source.translate_iova(view.source_address)? != source.translate_iova(view.context_address)?
+                || source.translate_iova(source_last)? != source.translate_iova(low_last)?
+            {
+                return Err(EFAULT);
+            }
+            mappings.push(mapping, GFP_KERNEL)?;
+        }
+        Ok(mappings)
+    }
+
     /// Return a CPU wrapper and the preboot primary-low alias of the persistent
     /// T8140 PM page-metrics object. The firmware-high alias is added only
     /// after firmware has published its upper-root subtree.

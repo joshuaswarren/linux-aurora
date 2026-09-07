@@ -73,16 +73,21 @@ class CaptureLifecycle(unittest.TestCase):
         for owner in ("deflake", "rt_memory", "tpc", "aux_fb"):
             self.assertIn("&self.render_user_aliases." + owner, body)
         self.assertIn("self.fragment_status_low.iova()", body)
-        self.assertIn("&self.render_ta_status", body)
+        self.assertIn("G17P_RENDER_STATE_TA_STATUS", body)
+        self.assertIn("self.render_state.capture_trace_range(", body)
         self.assertIn("map(|pm| &mut pm.backing), 0)", body)
 
     def test_render_submission_uses_the_logical_queue_execution_context(self):
         body = function(self.drm, "submit")
         call = body[body.index(".submit_translated_render("):]
-        self.assertRegex(call[:800], r"\.context\s*\.context_id\(\) as u16")
+        self.assertRegex(call[:800], r"\.context\s*\.clone\(\)")
         self.assertNotIn("RENDER_APP_CONTEXT", call[:800])
 
         source = (SOURCE / "g17_resources.rs").read_text()
+        owner = source[source.index("impl G17ResourceOwner {"):]
+        constructor = function(owner, "new_user_render_storage")
+        self.assertIn("context.matches(vm)", constructor)
+        self.assertIn("context.context_id()", constructor)
         restage = function(source, "restage_command")
         self.assertEqual(
             restage.count("context_id: u32::from(descriptor_context_id)"), 2

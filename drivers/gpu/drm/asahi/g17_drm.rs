@@ -14,6 +14,7 @@ use kernel::{
     prelude::*,
     static_lock_class,
     sync::{Arc, CondVar, Mutex},
+    time::{delay::fsleep, Delta},
     uapi, xarray,
 };
 
@@ -21,7 +22,7 @@ use crate::{
     alloc,
     driver::{AsahiDevRef, AsahiDevice},
     drm_gpu::{DrmGpu, DrmGpuParams},
-    file, g17_job, g17_adt_j700, g17_live_boot, g17_render, g17_uapi, gem, gpu, hw, mmu, module_parameters,
+    file, g17_job, g17_adt_j700, g17_live_boot, g17_manager, g17_render, g17_resources, g17_uapi, gem, gpu, hw, mmu, module_parameters,
     pgtable, queue,
 };
 
@@ -95,6 +96,21 @@ impl G17PRuntimeRef {
     fn release_compute_owner(&self, owner: u64) {
         self.mutex().lock().release_compute_owner(owner);
     }
+
+    fn wait_render_slot(&self, render_slot: u8) -> Result {
+        for _ in 0..g17_manager::G17PManagerConstruction::RENDER_COMPLETION_POLLS {
+            let completion = self
+                .mutex()
+                .lock()
+                .poll_deferred_render_completion(render_slot)?;
+            if let Some(completion) = completion {
+                return if completion.complete { Ok(()) } else { Err(EIO) };
+            }
+            fsleep(Delta::from_millis(1));
+        }
+        self.mutex().lock().abandon_deferred_render(render_slot)?;
+        Err(ETIMEDOUT)
+    }
 }
 
 /// Ceiling on live DRM compute queue objects for this device.
@@ -119,9 +135,11 @@ const G17P_MAX_COMPUTE_QUEUES: u32 = crate::g17_queue_limits::MAX_QUEUES;
 /// steady-state path (which is the timing-sensitive one) is unchanged.
 #[pin_data]
 pub(crate) struct G17PQueueRegistry {
-    /// `Some(queue id)` while a client holds the compute graph.
+    /// Bounded physical ownership: two render pairs plus the one transient
+    /// exclusive phase used while installing a compute graph.  Steady-state
+    /// compute readers do not occupy either render slot.
     #[pin]
-    lease: Mutex<Option<u64>>,
+    lease: Mutex<G17PQueueLeaseState>,
     #[pin]
     lease_free: CondVar,
     live_queues: AtomicU32,
@@ -129,11 +147,36 @@ pub(crate) struct G17PQueueRegistry {
     compute_faulted: AtomicU32,
 }
 
+#[derive(Default)]
+struct G17PQueueLeaseState {
+    render_slots: u8,
+    compute_install: bool,
+}
+
+impl G17PQueueLeaseState {
+    const fn render_mask() -> u8 {
+        (1u8 << g17_resources::G17PRenderQueuePair::SLOT_COUNT) - 1
+    }
+
+    fn acquire_render_slot(&mut self) -> Option<u8> {
+        let free = (!self.render_slots) & Self::render_mask();
+        if free == 0 { return None; }
+        let slot = free.trailing_zeros() as u8;
+        self.render_slots |= 1u8 << slot;
+        Some(slot)
+    }
+
+    fn release_render_slot(&mut self, slot: u8) {
+        debug_assert!(slot < g17_resources::G17PRenderQueuePair::SLOT_COUNT);
+        self.render_slots &= !(1u8 << slot);
+    }
+}
+
 impl G17PQueueRegistry {
     fn new() -> Result<Arc<Self>> {
         Arc::pin_init(
             pin_init!(G17PQueueRegistry {
-                lease <- new_mutex!(None, "G17PQueueRegistry::lease"),
+                lease <- new_mutex!(G17PQueueLeaseState::default(), "G17PQueueRegistry::lease"),
                 lease_free <- new_condvar!("G17PQueueRegistry::lease_free"),
                 live_queues: AtomicU32::new(0),
                 compute_readers: AtomicU32::new(0),
@@ -149,13 +192,17 @@ impl G17PQueueRegistry {
     /// queues against each other. The guard lives through exact retirement.
     fn acquire_compute(self: &Arc<Self>, first_install: bool) -> Result<G17PComputeLeaseGuard> {
         let mut held = self.lease.lock();
-        while held.is_some() || (first_install && self.compute_readers.load(Ordering::Acquire) != 0) {
+        while held.compute_install
+            || (first_install
+                && (held.render_slots != 0
+                    || self.compute_readers.load(Ordering::Acquire) != 0))
+        {
             if self.compute_faulted.load(Ordering::Acquire) != 0 { return Err(EIO); }
             if self.lease_free.wait_interruptible(&mut held) { return Err(ERESTARTSYS); }
         }
         if self.compute_faulted.load(Ordering::Acquire) != 0 { return Err(EIO); }
         self.compute_readers.fetch_add(1, Ordering::AcqRel);
-        if first_install { *held = Some(0); }
+        if first_install { held.compute_install = true; }
         drop(held);
         Ok(G17PComputeLeaseGuard { registry: self.clone(), exclusive: first_install })
     }
@@ -184,19 +231,20 @@ impl G17PQueueRegistry {
     }
 
     /// Block until this client owns the hardware compute graph.
-    fn acquire_lease(self: &Arc<Self>, id: u64) -> Result<G17PLeaseGuard> {
+    fn acquire_lease(self: &Arc<Self>, _id: u64) -> Result<G17PLeaseGuard> {
         let mut held = self.lease.lock();
-        while held.is_some() || self.compute_readers.load(Ordering::Acquire) != 0 {
+        while held.compute_install || held.render_slots == G17PQueueLeaseState::render_mask() {
             if self.compute_faulted.load(Ordering::Acquire) != 0 { return Err(EIO); }
             if self.lease_free.wait_interruptible(&mut held) {
                 return Err(ERESTARTSYS);
             }
         }
         if self.compute_faulted.load(Ordering::Acquire) != 0 { return Err(EIO); }
-        *held = Some(id);
+        let slot = held.acquire_render_slot().ok_or(EBUSY)?;
         core::mem::drop(held);
         Ok(G17PLeaseGuard {
             registry: self.clone(),
+            slot,
         })
     }
 }
@@ -213,7 +261,7 @@ impl G17PComputeLeaseGuard {
 impl Drop for G17PComputeLeaseGuard {
     fn drop(&mut self) {
         let mut held = self.registry.lease.lock();
-        if self.exclusive { *held = None; }
+        if self.exclusive { held.compute_install = false; }
         self.registry.compute_readers.fetch_sub(1, Ordering::AcqRel);
         drop(held);
         self.registry.lease_free.notify_all();
@@ -223,11 +271,18 @@ impl Drop for G17PComputeLeaseGuard {
 /// Releases the compute lease and wakes the next waiting client.
 struct G17PLeaseGuard {
     registry: Arc<G17PQueueRegistry>,
+    slot: u8,
+}
+
+impl G17PLeaseGuard {
+    fn slot(&self) -> u8 { self.slot }
 }
 
 impl Drop for G17PLeaseGuard {
     fn drop(&mut self) {
-        *self.registry.lease.lock() = None;
+        let mut held = self.registry.lease.lock();
+        held.release_render_slot(self.slot);
+        drop(held);
         self.registry.lease_free.notify_all();
     }
 }
@@ -1437,7 +1492,7 @@ impl queue::Queue for G17PQueue {
         // queues: their signalling submission may belong to another client.
         // The lease then spans timestamp publication, execution/doorbell waits
         // and output-fence installation, including runtime-mutex release.
-        let _lease = self.acquire_ready_lease(submission_id, &syncs[..in_sync_count])?;
+        let lease = self.acquire_ready_lease(submission_id, &syncs[..in_sync_count])?;
         let output_fence: UserFence<G17PSubmissionFence> = self
             .fence_contexts
             .new_fence(0, G17PSubmissionFence)
@@ -1485,17 +1540,24 @@ impl queue::Queue for G17PQueue {
                     .lock()
                     .submit_translated_render(
                         &self.vm,
+                        lease.slot(),
+                        true,
                         self.async_backend
                             .as_ref()
                             .ok_or(EIO)?
                             .context
-                            .context_id() as u16,
+                            .clone(),
                         &translated,
                         timestamps,
                         timestamp_aliases,
                     )
                     .map_err(|error| {
                         Self::stage_fail(submission_id, "submit-translated-render", error)
+                    })?;
+                self.runtime
+                    .wait_render_slot(lease.slot())
+                    .map_err(|error| {
+                        Self::stage_fail(submission_id, "wait-render-slot", error)
                     })?;
             }
             G17PPendingCommand::Compute(translated) => {

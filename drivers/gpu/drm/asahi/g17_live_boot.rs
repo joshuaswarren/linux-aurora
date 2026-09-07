@@ -3672,6 +3672,73 @@ impl G17PLiveRuntime {
         Err(ETIMEDOUT)
     }
 
+    /// Poll one independently owned render slot while holding the runtime
+    /// mutex only for this bounded observation/service transaction.  The DRM
+    /// caller sleeps with the mutex released, allowing the other slot to
+    /// publish and allowing asynchronous compute retirement to proceed.
+    pub(crate) fn poll_deferred_render_completion(
+        &mut self,
+        render_slot: u8,
+    ) -> Result<Option<g17_completion::PairedRenderCompletion>> {
+        self.manager
+            .as_mut()
+            .ok_or(ENODEV)?
+            .select_render_slot(render_slot)?;
+        let outcome = self
+            .manager
+            .as_mut()
+            .ok_or(ENODEV)?
+            .poll_translated_render_completion()?;
+        match outcome {
+            g17_manager::G17PRenderPollOutcome::Complete(completion) => {
+                let _ = self.service_firmware_events_inline();
+                if let (Some(pdev), Some(manager)) = (self.pdev.as_ref(), self.manager.as_mut()) {
+                    finish_g17p_render_trace(
+                        pdev.as_ref(),
+                        manager,
+                        crate::g17_trace_capture::Phase::AfterPairRetirement,
+                    );
+                }
+                let release = self
+                    .manager
+                    .as_mut()
+                    .ok_or(ENODEV)?
+                    .retire_render_usc_freelist_at_completion()?;
+                if let Some(release) = release {
+                    self.service_render_usc_freelist_release(release)?;
+                }
+                if let (Some(pdev), Some(manager)) = (self.pdev.as_ref(), self.manager.as_mut()) {
+                    log_g17p_status_a(pdev.as_ref(), manager, "render-post-wait");
+                    probe_g17p_ktrace(pdev.as_ref(), manager, "render-post-wait");
+                    dump_g17p_firmware_log(pdev.as_ref(), manager, "render-post-wait");
+                    manager.log_render_status_pages("post-completion");
+                }
+                Ok(Some(completion))
+            }
+            g17_manager::G17PRenderPollOutcome::Retry => Ok(None),
+            g17_manager::G17PRenderPollOutcome::Pending => {
+                let _ = self.service_firmware_events_inline();
+                Ok(None)
+            }
+        }
+    }
+
+    pub(crate) fn abandon_deferred_render(
+        &mut self,
+        render_slot: u8,
+    ) -> Result {
+        self.manager
+            .as_mut()
+            .ok_or(ENODEV)?
+            .select_render_slot(render_slot)?;
+        self.manager
+            .as_mut()
+            .ok_or(ENODEV)?
+            .report_render_wait_timeout();
+        self.abandon_render_submission_after_timeout();
+        Ok(())
+    }
+
     /// Wait only for the two TA-owned timestamps used by the split-launch
     /// diagnostic. The sample path is retained DRAM; it performs no SGX MMIO,
     /// completion acknowledgement, recovery service, or fragment publication.
@@ -3723,7 +3790,9 @@ impl G17PLiveRuntime {
     pub(crate) fn submit_translated_render(
         &mut self,
         vm: &mmu::Vm,
-        descriptor_context_id: u16,
+        render_slot: u8,
+        defer_completion: bool,
+        execution_context: Arc<mmu::T8140ComputeExecutionContext>,
         command: &g17_uapi::TranslatedRenderCommand,
         timestamps: [u64; 4],
         timestamp_aliases: KVec<mmu::KernelMapping>,
@@ -3731,6 +3800,12 @@ impl G17PLiveRuntime {
         if !self.accepting_submissions {
             return Err(ENOTSUPP);
         }
+        let queue_pair = g17_resources::G17PRenderQueuePair::for_slot(render_slot)
+            .ok_or(EINVAL)?;
+        self.manager
+            .as_mut()
+            .ok_or(ENODEV)?
+            .select_render_slot(render_slot)?;
         let native_doorbell_mode =
             *module_parameters::g17p_render_native_doorbells.value();
         let native_doorbells = native_doorbell_mode != 0;
@@ -3811,7 +3886,8 @@ impl G17PLiveRuntime {
             .begin_translated_render(
                 &drm,
                 vm,
-                descriptor_context_id,
+                queue_pair,
+                execution_context,
                 command,
                 timestamps,
                 timestamp_aliases,
@@ -4009,9 +4085,9 @@ impl G17PLiveRuntime {
             if let Some(registers) = self.registers.as_ref() {
                 let both = *module_parameters::g17p_admit_arm.value() >= 2;
                 let mut queues = KVec::new();
-                queues.push(g17_resources::g17p_render_queue_id(true) as u8, GFP_KERNEL)?;
+                queues.push(queue_pair.tiling as u8, GFP_KERNEL)?;
                 if both {
-                    queues.push(g17_resources::g17p_render_queue_id(false) as u8, GFP_KERNEL)?;
+                    queues.push(queue_pair.fragment as u8, GFP_KERNEL)?;
                 }
                 for qid in queues {
                     match registers.g17p_arm_queue_admit(qid) {
@@ -4035,8 +4111,8 @@ impl G17PLiveRuntime {
         if *module_parameters::g17p_render_seed_ts.value() != 0 {
             if let Some(registers) = self.registers.as_ref() {
                 for qid in [
-                    g17_resources::g17p_render_queue_id(true) as u8,
-                    g17_resources::g17p_render_queue_id(false) as u8,
+                    queue_pair.tiling as u8,
+                    queue_pair.fragment as u8,
                 ] {
                     let seed =
                         u64::from(*module_parameters::g17p_render_seed_ts.value()) - 1;
@@ -4491,6 +4567,9 @@ impl G17PLiveRuntime {
             }
             // As for paired publication, enter the servicing wait before any
             // expensive host-memory dump of the now-live fragment resources.
+        }
+        if defer_completion {
+            return Ok(());
         }
         let completion = match self.wait_render_completion_servicing_events() {
             Ok(completion) => completion,

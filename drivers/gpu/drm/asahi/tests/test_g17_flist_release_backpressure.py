@@ -54,6 +54,7 @@ lease_part = "\n".join([
     *["#[test]\n" + block(manager, r"^    fn " + name + r"\(\)\s*") for name in [
         "bootstrap_async_flist_releases_only_after_type13_and_paired_render",
         "bootstrap_async_flist_release_backpressure_tracks_exact_producer",
+        "shared_flist_holds_both_render_pairs_until_the_last_retirement",
         "retained_flist_leases_grow_once_and_release_every_captured_generation",
     ]],
 ])
