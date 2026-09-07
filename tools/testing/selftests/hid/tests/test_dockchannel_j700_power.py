@@ -67,6 +67,9 @@ static void dchid_test_log(const void *dev, const char *fmt, ...) {
 #define dev_warn(dev, ...) dchid_test_log(dev, __VA_ARGS__)
 static bool ipd_reset_sequence = true;
 static bool ipd_reset_write = true;
+/* Defaults asserted against the personality constants in main(). */
+static int afe_enable_level = 0;
+static int afe_disable_level = 1;
 static unsigned char sent[4][16];
 static size_t sent_size[4];
 static int sent_count, fail_at = -1, slept_us;
@@ -136,6 +139,7 @@ static void reset_capture(void) {
     sent_count = 0; fail_at = -1; slept_us = 0; trace_len = 0; gpio_fail = 0;
     smc_present = 1; smc_fail = 0; smc_value = 1; afe_level = 1;
     ipd_reset_sequence = true; ipd_reset_write = true;
+    afe_enable_level = 0; afe_disable_level = 1;
 }
 '''
         cases = r'''
@@ -185,6 +189,25 @@ int main(void) {
     /* Both settles are the sequence's own delay, never an invented one. */
     assert(DCHID_AFE_RESET_ENABLE_DELAY_US == 0);
     assert(DCHID_IPD_RESET_DISABLE_DELAY_US == 0);
+
+    /* The switchable levels default to exactly what the personality decodes to. */
+    assert(afe_enable_level == DCHID_AFE_RESET_ENABLE_LEVEL);
+    assert(afe_disable_level == DCHID_AFE_RESET_DISABLE_LEVEL);
+
+    /* Inverting them swaps only the driven levels, not the order or the delays. */
+    reset_capture(); afe_enable_level = 1; afe_disable_level = 0;
+    assert(dchid_reset_interface(&touch, DCHID_POWER_STATE_ON) == 9);
+    assert(strcmp(trace, "w1ph") == 0);
+    assert(slept_us == DCHID_IPD_RESET_ENABLE_DELAY_US);
+    reset_capture(); afe_enable_level = 1; afe_disable_level = 0;
+    assert(dchid_reset_interface(&touch, DCHID_POWER_STATE_OFF) == 9);
+    assert(strcmp(trace, "wP0h") == 0);
+    assert(slept_us == DCHID_AFE_RESET_DISABLE_DELAY_US);
+
+    /* Out-of-range levels are clamped rather than passed through. */
+    reset_capture(); afe_enable_level = 7;
+    assert(dchid_reset_interface(&touch, DCHID_POWER_STATE_ON) == 9);
+    assert(strcmp(trace, "w1ph") == 0);
 
     /* A failed will-change never touches the platform. */
     reset_capture(); fail_at = 0;

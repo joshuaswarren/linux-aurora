@@ -82,6 +82,7 @@ struct dchid_init_hdr {
 #define CMD_SEND_FIRMWARE 0x95
 #define CMD_ENABLE_INTERFACE 0xb4
 #define CMD_ACK_GPIO_CMD 0xa1
+#define CMD_QUERY_POWER 0x42
 
 #define DCHID_POWER_METHOD_DIRECT 1
 #define DCHID_POWER_METHOD_TRANSACTIONAL 2
@@ -155,6 +156,39 @@ static bool ipd_reset_write = true;
 module_param(ipd_reset_write, bool, 0644);
 MODULE_PARM_DESC(ipd_reset_write,
 		 "Write the pmIP SMC key as part of the reset-sequence; with 0 only its delay is applied");
+
+/*
+ * The enable level is the one inference in the contract above that rests on
+ * another machine's ADT rather than on J700's own bytes, and the boot chain
+ * hands the line over at the disable level, so there is no inherited state to
+ * check it against.  Keep both levels switchable so the polarity can be settled
+ * by measurement: re-opening the multi-touch node re-runs the whole start
+ * sequence, so both can be tried without rebuilding or rebooting.
+ */
+static int afe_enable_level = DCHID_AFE_RESET_ENABLE_LEVEL;
+module_param(afe_enable_level, int, 0644);
+MODULE_PARM_DESC(afe_enable_level,
+		 "Raw gP13 level driven when the J700 AFE is powered on");
+
+static int afe_disable_level = DCHID_AFE_RESET_DISABLE_LEVEL;
+module_param(afe_disable_level, int, 0644);
+MODULE_PARM_DESC(afe_disable_level,
+		 "Raw gP13 level driven when the J700 AFE is powered off");
+
+static bool power_query = true;
+module_param(power_query, bool, 0644);
+MODULE_PARM_DESC(power_query,
+		 "Ask MTP for the multi-touch power state around the start sequence");
+
+/*
+ * Read at interface enumeration, long before anything in userspace can change
+ * it, so this one has to be set through modprobe.d or the kernel command line
+ * rather than sysfs.
+ */
+static bool enable_mtp_iface = true;
+module_param(enable_mtp_iface, bool, 0444);
+MODULE_PARM_DESC(enable_mtp_iface,
+		 "Enable the A18 \"mtp\" control interface that has no DT node");
 
 struct dchid_init_block_hdr {
 	u16 type;
@@ -325,6 +359,26 @@ dchid_get_interface(struct dockchannel_hid *dchid, int index, const char *name)
 
 	iface->of_node = of_get_child_by_name(dchid->dev->of_node, name);
 	if (!iface->of_node) {
+		/*
+		 * A18 MTP advertises a fourth interface named "mtp" alongside
+		 * comm, multi-touch and keyboard, and completes its own
+		 * enumeration for it ("MTP interface complete enumeration:
+		 * SENT").  No Apple laptop DT describes it, because no earlier
+		 * machine offers it, so this driver dropped it on the floor and
+		 * never sent it CMD_ENABLE_INTERFACE.  Keep it as a
+		 * control-only interface - no OF node, no HID device - so it
+		 * can at least be enabled.
+		 */
+		if (enable_mtp_iface &&
+		    of_property_read_bool(dchid->dev->of_node, "apple,no-stm") &&
+		    !strcmp(name, "mtp")) {
+			dev_info(dchid->dev,
+				 "Keeping control-only interface %s (no OF node)\n",
+				 name);
+			dchid->ifaces[index] = iface;
+			return iface;
+		}
+
 		dev_warn(dchid->dev, "No OF node for subdevice %s, ignoring.", name);
 		return NULL;
 	}
@@ -515,8 +569,7 @@ static bool dchid_uses_transactional_power(struct dchid_iface *iface)
  */
 static int dchid_afe_power_sequence(struct dchid_iface *iface, bool enable)
 {
-	int level = enable ? DCHID_AFE_RESET_ENABLE_LEVEL
-			   : DCHID_AFE_RESET_DISABLE_LEVEL;
+	int level = !!(enable ? afe_enable_level : afe_disable_level);
 	u32 delay_us = enable ? DCHID_AFE_RESET_ENABLE_DELAY_US
 			      : DCHID_AFE_RESET_DISABLE_DELAY_US;
 	int before, after, ret;
@@ -856,6 +909,31 @@ static bool dchid_adopt_preinitialized_ipd_functions(struct dchid_iface *iface)
 	       !strcmp(iface->gpio_name, "afe-reset");
 }
 
+/*
+ * Ask MTP what power state it thinks the interface is in.
+ *
+ * Opcode 0x42 is the power query of the 0x41/0x42 pair this firmware exposes
+ * for multi-touch; it echoes the request plus a state byte and was already
+ * exercised on this machine without side effects.  It answers the one question
+ * the driver otherwise cannot: our 0x40 transaction is acknowledged, but that
+ * only proves MTP parsed it, not that MTP considers the interface powered.
+ */
+static void dchid_query_power_state(struct dchid_iface *iface, const char *when)
+{
+	u8 msg[] = { CMD_QUERY_POWER, DCHID_POWER_METHOD_DIRECT, iface->index, 0 };
+	u8 resp[16] = {};
+	int ret;
+
+	if (!power_query || !dchid_uses_transactional_power(iface))
+		return;
+
+	ret = dchid_cmd(iface->dchid->comm, HID_FEATURE_REPORT, REQ_SET_REPORT,
+			msg, sizeof(msg), resp, sizeof(resp));
+
+	dev_info(iface->dchid->dev, "Power query %s %s: ret=%d resp=%*ph\n",
+		 iface->name, when, ret, (int)sizeof(resp), resp);
+}
+
 static int dchid_start_interface(struct dchid_iface *iface)
 {
 	void *fw;
@@ -912,12 +990,14 @@ static int dchid_start_interface(struct dchid_iface *iface)
 
 		/* After loading firmware, multi-touch needs a reset */
 		dev_info(iface->dchid->dev, "Resetting %s\n", iface->name);
+		dchid_query_power_state(iface, "before-cycle");
 		ret = dchid_reset_interface(iface, DCHID_POWER_STATE_OFF);
 		if (ret < 0)
 			goto err;
 		ret = dchid_reset_interface(iface, DCHID_POWER_STATE_ON);
 		if (ret < 0)
 			goto err;
+		dchid_query_power_state(iface, "after-cycle");
 	}
 
 	return 0;
@@ -1265,6 +1345,19 @@ static void dchid_handle_init(struct dockchannel_hid *dchid, void *data, size_t 
 	if (hdr->more_packets)
 		return;
 
+	/*
+	 * A control-only interface has no HID descriptor and no OF node, so it
+	 * gets the enable message on its own rather than through the HID
+	 * device creation path.
+	 */
+	if (!iface->of_node) {
+		int ret = dchid_enable_interface(iface);
+
+		dev_info(dchid->dev, "Enabled control-only interface %s: %d\n",
+			 iface->name, ret);
+		return;
+	}
+
 	/* We need to enable STM first, since it'll give us the device IDs */
 	if (iface->dchid->id_ready || !strcmp(iface->name, "stm")) {
 		dchid_create_interface(iface);
@@ -1398,12 +1491,30 @@ static void dchid_handle_event(struct dockchannel_hid *dchid, void *data, size_t
 	case EVENT_GPIO_CMD:
 		dchid_handle_gpio(dchid, data, length);
 		break;
+	default:
+		/*
+		 * A18 MTP drives its own AFE recovery and logs "IPD power cycle
+		 * using reset request" before each retry.  If any part of that
+		 * is a request aimed at the host, it arrives here, and this
+		 * switch used to drop it without a trace.  Never stay silent
+		 * about an unhandled comm event again.
+		 */
+		dev_warn(dchid->dev, "Unhandled comm event 0x%02x (%zu bytes): %*ph\n",
+			 *p, length, (int)min(length, (size_t)32), data);
+		break;
 	}
 }
 
 static void dchid_handle_report(struct dchid_iface *iface, void *data, size_t length)
 {
 	struct dockchannel_hid *dchid = iface->dchid;
+
+	if (!iface->of_node) {
+		/* Control-only interface: log what it sends, do not route it. */
+		dev_info(dchid->dev, "Control interface %s report (%zu bytes): %*ph\n",
+			 iface->name, length, (int)min(length, (size_t)32), data);
+		return;
+	}
 
 	if (!iface->hid) {
 		dev_warn(dchid->dev, "Report received but %s is not initialized!\n", iface->name);
