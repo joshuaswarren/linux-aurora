@@ -48,13 +48,20 @@
 #define DCHID_CHANNEL_CMD 0x11
 #define DCHID_CHANNEL_REPORT 0x12
 
+/*
+ * Named from AHTSCMMessage's accessors, each of which is a fixed offset into
+ * this header: getMessageType reads byte 1, getTransferId byte 4,
+ * getInterfaceNumber byte 5, getRetryCount byte 6 and getEventType byte 7.  The
+ * last two were being carried as padding.
+ */
 struct dchid_hdr {
 	u8 hdr_len;
 	u8 channel;
 	u16 length;
 	u8 seq;
 	u8 iface;
-	u16 pad;
+	u8 retry;
+	u8 event;
 } __packed;
 
 #define IFACE_COMM 0
@@ -110,6 +117,7 @@ struct dchid_init_hdr {
  * gate, but it is the one message that provably precedes a registration on a
  * working host and is absent from ours.
  */
+#define CMD_RELEASE_SHARED_BUFFER 0x96
 #define CMD_SYSTEM_AWAKE 0xc1
 #define DCHID_SYSTEM_ASLEEP 1
 #define DCHID_SYSTEM_AWAKE 2
@@ -846,9 +854,19 @@ static void dchid_dump_shmem(struct dockchannel_hid *dchid, bool only_on_change)
 		fifo->last_tail = tail;
 		fifo->seen = true;
 
+		/*
+		 * Dump from offset zero, not from the data area.  Which eight
+		 * bytes are the ring's indices is inferred rather than read -
+		 * AIDCircularBufferShared only proves that the payload starts
+		 * at +8 - so print the header and the start of the payload
+		 * together and let a real message be recognised wherever it
+		 * lands.  A control reply begins 08 11.
+		 */
 		dev_info(dchid->dev,
-			 "Shared FIFO #%u: producer=%u consumer=%u capacity=%u data=%*ph\n",
-			 i, head, tail, fifo->size - 8, 64, (u8 *)fifo->buf + 8);
+			 "Shared FIFO #%u: head=%u tail=%u capacity=%u raw=%*ph\n",
+			 i, head, tail, fifo->size - 8,
+			 (int)min_t(unsigned int, fifo->size, 128),
+			 (u8 *)fifo->buf);
 	}
 }
 
@@ -863,9 +881,9 @@ static void dchid_dump_packet(struct dockchannel_hid *dchid, struct dchid_hdr *h
 	unsigned int shown = min_t(unsigned int, hdr->length, 48);
 
 	dev_info(dchid->dev,
-		 "%s: hdr_len=%u channel=0x%02x length=%u seq=%u iface=%u pad=0x%04x body=%*ph\n",
+		 "%s: hdr_len=%u type=0x%02x length=%u seq=%u iface=%u retry=%u event=0x%02x body=%*ph\n",
 		 why, hdr->hdr_len, hdr->channel, hdr->length, hdr->seq,
-		 hdr->iface, hdr->pad, shown, (u8 *)body);
+		 hdr->iface, hdr->retry, hdr->event, shown, (u8 *)body);
 }
 
 static int dchid_get_report_cmd(struct dchid_iface *iface, u8 reportnum,
@@ -2410,6 +2428,17 @@ static void dchid_packet_work(struct work_struct *ws)
 		return;
 	}
 
+	/*
+	 * An input report of 0x96 on the management interface is the
+	 * coprocessor asking for a shared buffer back - releaseSharedMemory is
+	 * called on exactly that condition.  Nothing here can honour it yet;
+	 * say so rather than let it pass as an unknown event.
+	 */
+	if (work->hdr.iface == IFACE_COMM && shdr->length &&
+	    payload[0] == CMD_RELEASE_SHARED_BUFFER)
+		dev_warn(dchid->dev,
+			 "MTP asked for a shared buffer back (0x96), which is not implemented\n");
+
 	switch (type) {
 	case HID_INPUT_REPORT:
 		if (work->hdr.iface == IFACE_COMM)
@@ -2464,6 +2493,24 @@ static void dchid_handle_ack(struct dchid_iface *iface, struct dchid_hdr *hdr, v
 			dev_err(iface->dchid->dev,
 				"Reply too short for a sub header (%u < %zu)\n",
 				hdr->length, sizeof(*shdr));
+		return;
+	}
+
+	/*
+	 * getStatus reads byte 7 first: 0x80..0x85 is a transport error, any
+	 * other non-zero value is a plain failure, and only a zero there means
+	 * the sub-header's retcode is worth reading at all.
+	 */
+	if (hdr->event) {
+		dchid_dump_packet(iface->dchid, hdr, data, "Reply with an event");
+		dev_err(iface->dchid->dev,
+			"Report 0x%x on iface %d (%s) failed with event 0x%02x\n",
+			iface->out_report, iface->index, iface->name, hdr->event);
+		iface->resp_size = 0;
+		iface->out_report = -1;
+		iface->retcode = hdr->event >= 0x80 && hdr->event <= 0x85 ?
+			0xe0000001 : 0xe00002bc;
+		complete(&iface->out_complete);
 		return;
 	}
 
