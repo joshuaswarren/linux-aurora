@@ -11,6 +11,7 @@ code=r'''
 #![allow(dead_code,unused_variables)]
 type Result<T=()>=std::result::Result<T,i32>;const EINVAL:i32=22;const EIO:i32=5;const PRIMARY_FIRMWARE_EVENT_CHANNEL_INDEX:usize=13;
 macro_rules! dev_info{($($x:tt)*)=>{()}}macro_rules! dev_err{($($x:tt)*)=>{()}}
+mod util{pub fn g17p_verbose()->bool{false}}
 mod module_parameters{pub struct Param;impl Param{pub fn value(&self)->&u32{&0}}pub static g17p_fw_log:Param=Param;pub static g17p_progress_watchdog:Param=Param;pub static g17p_idle_selector:Param=Param;}
 '''+f'#[path="{p}/g17_initdata.rs"]mod g17_initdata;\n#[path="{p}/g17_completion.rs"]mod g17_completion;\n'+r'''
 use g17_initdata::InstanceRole;

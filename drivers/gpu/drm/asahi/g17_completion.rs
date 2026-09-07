@@ -1062,6 +1062,17 @@ impl G17PFirmwareStampEvent {
     }
 }
 
+/// Whether accumulated type-1 EventMachine QID bits cover one command's
+/// exact queue identity. Bits may arrive in separate records or batches;
+/// unrelated compute bits and duplicate records are harmless.
+pub(crate) const fn g17p_render_type1_complete(
+    observed: [u64; 2],
+    expected: [u64; 2],
+) -> bool {
+    observed[0] & expected[0] == expected[0]
+        && observed[1] & expected[1] == expected[1]
+}
+
 pub(crate) fn decode_g17p_firmware_stamp_event(
     raw: &[u8],
 ) -> Result<G17PFirmwareStampEvent, CompletionDecodeError> {
@@ -2107,6 +2118,19 @@ mod tests {
             decode_g17p_firmware_recovery_event(&event),
             Err(CompletionDecodeError::FirmwareEventType)
         );
+    }
+
+    #[test]
+    fn render_type1_requires_its_complete_qid_pair() {
+        let qid0_qid1 = [0x3, 0];
+        assert!(!g17p_render_type1_complete([0x10, 0], qid0_qid1));
+        assert!(!g17p_render_type1_complete([0x1, 0], qid0_qid1));
+        assert!(g17p_render_type1_complete([0x3, 0], qid0_qid1));
+        assert!(g17p_render_type1_complete([0x13, 0], qid0_qid1));
+
+        let qid63_qid64 = [1u64 << 63, 1];
+        assert!(!g17p_render_type1_complete([1u64 << 63, 0], qid63_qid64));
+        assert!(g17p_render_type1_complete(qid63_qid64, qid63_qid64));
     }
 
     #[test]

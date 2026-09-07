@@ -600,6 +600,19 @@ impl G17PRenderQueuePair {
 
     pub(crate) const fn slot(self) -> u8 { (self.tiling / 2) as u8 }
 
+    /// Type-1 firmware events report EventMachine stamp indices, the same
+    /// namespace as physical QIDs. A paired render is correlated only after
+    /// both of its queue bits have been observed.
+    pub(crate) const fn completion_masks(self) -> Option<[u64; 2]> {
+        if self.tiling >= 128 || self.fragment >= 128 {
+            return None;
+        }
+        let mut masks = [0u64; 2];
+        masks[self.tiling as usize / 64] |= 1u64 << (self.tiling as usize % 64);
+        masks[self.fragment as usize / 64] |= 1u64 << (self.fragment as usize % 64);
+        Some(masks)
+    }
+
     /// Queue-lifetime AGXQOSQueue HardwareBufferID. Native TA/3D partners
     /// share one ID and independently retained pairs use different IDs.
     /// QID4 compute already owns ID 1, so keep render pair 0 on its proven ID
@@ -3149,6 +3162,11 @@ pub(crate) struct G17PUserRenderStorage {
     _fragment_context_global: mmu::KernelMapping,
     graph: MappedObject,
     support: MappedObject,
+    /// EventControl record and exact submitted-kick target owned by the
+    /// currently published TA group. Queue cursors alone do not release this
+    /// storage; firmware must complete and unlink this same record.
+    pool_a_record_index: u8,
+    pool_a_submitted: u32,
     render_state: MappedObject,
     render_layout: G17PRenderStateLayout,
     render_tvb: Option<G17PRenderTvb>,
@@ -3377,6 +3395,20 @@ static G17P_POOL_A_FALLBACK_LOGGED: AtomicU32 = AtomicU32::new(0);
 struct G17PEventControlKick {
     slot_offset: usize,
     next: u32,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PRenderEventControlState {
+    pub(crate) record_index: u8,
+    pub(crate) submitted: u32,
+    pub(crate) completed: u32,
+    pub(crate) membership: u32,
+}
+
+impl G17PRenderEventControlState {
+    pub(crate) const fn unlinked(self) -> bool {
+        self.completed == self.submitted && self.membership == 0
+    }
 }
 
 impl G17PEventControlKick {
@@ -6881,6 +6913,11 @@ impl G17PUserRenderStorage {
             _fragment_context_global: fragment_context_global,
             graph,
             support,
+            pool_a_record_index: u8::try_from(pool_a_record_index)
+                .map_err(|_| render_build_fail(25))?,
+            // The selected cold slot starts at one and the late TA
+            // publication advances this command's own target to two.
+            pool_a_submitted: 2,
             render_state,
             render_layout,
             render_tvb,
@@ -6909,6 +6946,41 @@ impl G17PUserRenderStorage {
     /// TTBAT context this render's VM is bound to.
     pub(crate) fn render_root_slot(&self) -> u8 {
         self.render_root_slot
+    }
+
+    /// Read the exact EventControl record owned by the current TA command.
+    /// The matching firmware type-1 edge orders these host-DRAM fields; no
+    /// MMIO or periodic polling is needed to decide whether it is reusable.
+    pub(crate) fn render_event_control_state(&mut self) -> Result<G17PRenderEventControlState> {
+        let index = usize::from(self.pool_a_record_index);
+        let record = G17P_RENDER_POOL_A
+            .checked_add(index.checked_mul(0x100).ok_or(EOVERFLOW)?)
+            .ok_or(EOVERFLOW)?;
+        let mut completed = 0;
+        let mut membership = 0;
+        self.support.with_bytes_mut(|support| {
+            completed = u32::from_le_bytes(
+                support
+                    .get(record + 0x0c..record + 0x10)
+                    .ok_or(ERANGE)?
+                    .try_into()
+                    .map_err(|_| EINVAL)?,
+            );
+            membership = u32::from_le_bytes(
+                support
+                    .get(record + 0x94..record + 0x98)
+                    .ok_or(ERANGE)?
+                    .try_into()
+                    .map_err(|_| EINVAL)?,
+            );
+            Ok(())
+        })?;
+        Ok(G17PRenderEventControlState {
+            record_index: self.pool_a_record_index,
+            submitted: self.pool_a_submitted,
+            completed,
+            membership,
+        })
     }
 
     /// Read the context IDs from the TA and 3D descriptors actually staged
@@ -7400,15 +7472,27 @@ impl G17PUserRenderStorage {
                 }
                 None => {
                     let mut reusable: u64 = 0;
+                    let mut pointer_matches = 0u32;
+                    let mut completed_matches = 0u32;
+                    let mut membership_zero = 0u32;
+                    let mut first_mismatch = None;
                     for index in 0..35usize {
                         if let Some((slot_va, want_slot_va, completed, want_completed, membership)) =
                             G17PEventControlKick::reuse_fields(support_ro, support_va, index)
                         {
+                            pointer_matches += u32::from(slot_va == want_slot_va);
+                            completed_matches += u32::from(completed == want_completed);
+                            membership_zero += u32::from(membership == 0);
                             if slot_va == want_slot_va
                                 && completed == want_completed
                                 && membership == 0
                             {
                                 reusable |= 1u64 << index;
+                            } else if first_mismatch.is_none() {
+                                first_mismatch = Some((
+                                    index, slot_va, want_slot_va, completed,
+                                    want_completed, membership,
+                                ));
                             }
                         }
                     }
@@ -7419,6 +7503,23 @@ impl G17PUserRenderStorage {
                         reusable,
                         submission_ordinal,
                     );
+                    if let Some((index, slot_va, want_slot_va, completed,
+                        want_completed, membership)) = first_mismatch
+                    {
+                        dev_err!(
+                            dev.as_ref(),
+                            "G17P render restage: pool-A audit pointer-match={}/35 completed-match={}/35 membership-zero={}/35 first={} slot={:#x}/{:#x} completed={}/{} membership={:#x}\n",
+                            pointer_matches,
+                            completed_matches,
+                            membership_zero,
+                            index,
+                            slot_va,
+                            want_slot_va,
+                            completed,
+                            want_completed,
+                            membership,
+                        );
+                    }
                     return Err(EBUSY);
                 }
             }
@@ -7655,6 +7756,7 @@ impl G17PUserRenderStorage {
             core::mem::replace(&mut self.user_timestamp_aliases, aliases)
         });
         self.fragment_mcache = fragment_mcache;
+        self.pool_a_record_index = u8::try_from(record_a_index)?;
         self.ta_hardware_buffer_id = translated.parameters.ta_hardware_buffer_id;
         self.descriptor_ordinal = submission_ordinal;
         self.flist_generation = g17_submission::g17p_render_flist_generation(submission_ordinal);
@@ -8975,10 +9077,11 @@ impl G17PUserRenderStorage {
         entry_stamp: u32,
     ) -> Result<G17PLateTilingPublication> {
         let graph_va = self.graph.iova();
-        let record_a_index = g17_submission::g17p_render_pool_a_record_index(
-            submission_ordinal,
-            g17p_render_native_pool_a_first_record_enabled(),
-        );
+        // `restage_command` may have selected a reusable fallback instead of
+        // the ordinal-preferred record. Both descriptors already name that
+        // retained selection, so the late TA half must advance the same
+        // EventControl rather than recomputing the stale preferred index.
+        let record_a_index = usize::from(self.pool_a_record_index);
         let graph = self.graph.object.vmap()?.as_mut_ptr();
         let support = self.support.object.vmap()?.as_mut_ptr();
         let pool_a_kick = {
@@ -8989,7 +9092,7 @@ impl G17PUserRenderStorage {
             };
             G17PEventControlKick::prepare(raw, record_a_index).ok_or(EINVAL)?
         };
-        let bytes = build_g17p_late_tiling_bytes(
+        let mut bytes = build_g17p_late_tiling_bytes(
             self.descriptors
                 .iova()
                 .checked_add(g17p_render_ta_descriptor_offset(submission_ordinal) as u64)
@@ -9006,6 +9109,12 @@ impl G17PUserRenderStorage {
             pool_a_kick.next,
         )
         .map_err(|_| EINVAL)?;
+        bytes.pool_a_slot_offset = G17P_RENDER_POOL_A_SLOTS
+            .checked_add(record_a_index.checked_mul(4).ok_or(EOVERFLOW)?)
+            .ok_or(EOVERFLOW)?;
+        // This is the second descriptor's increment and therefore the final
+        // submitted target firmware must complete before unlinking the record.
+        self.pool_a_submitted = pool_a_kick.next;
 
         if bytes.event_offset + bytes.event.len() > self.graph.logical_size
             || G17P_RENDER_SHARED_CONTROL_INNER + 4 > self.support.logical_size

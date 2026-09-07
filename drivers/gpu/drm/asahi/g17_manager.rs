@@ -5651,9 +5651,31 @@ impl G17PManagerConstruction {
                 }
             };
             let tracker = self.render_tracker.as_mut().ok_or(ENODEV)?;
-            tracker.tiling_previous = state.tiling;
-            tracker.fragment_previous = state.fragment;
             if completion.complete {
+                // Queue retirement can become visible before the TA command's
+                // EventControl has reached its own submitted target and been
+                // unlinked. Releasing the fence at that intermediate state
+                // lets the next command consume another Pool-A record until
+                // all 35 appear busy. The matching type-1 edge is the wake;
+                // this is its single ordered host-DRAM validation.
+                let event_control = self
+                    .render_storage
+                    .as_mut()
+                    .ok_or(ENODEV)?
+                    .render_event_control_state()?;
+                if !event_control.unlinked() {
+                    if crate::util::g17p_verbose() {
+                        dev_info!(
+                            self.resources.dev().as_ref(),
+                            "G17P render completion: EventControl {} pending submitted={} completed={} membership={:#x}\n",
+                            event_control.record_index,
+                            event_control.submitted,
+                            event_control.completed,
+                            event_control.membership,
+                        );
+                    }
+                    return Ok(G17PRenderPollOutcome::Pending);
+                }
                 // Publish the exact GPU-written pass envelope while the completed job's
                 // VM binding, ordinal and QIDs are still owned.  This is
                 // observation only: it neither gates completion nor changes
@@ -5725,8 +5747,19 @@ impl G17PManagerConstruction {
                 self.render_submission_ordinal = next_ordinal;
                 return Ok(G17PRenderPollOutcome::Complete(completion));
             }
+            tracker.tiling_previous = state.tiling;
+            tracker.fragment_previous = state.fragment;
         }
         Ok(G17PRenderPollOutcome::Pending)
+    }
+
+    pub(crate) fn render_completion_masks(&self) -> Result<[u64; 2]> {
+        self.render_storage
+            .as_ref()
+            .ok_or(ENODEV)?
+            .queue_pair()
+            .completion_masks()
+            .ok_or(EINVAL)
     }
 
     /// Nominal render wait bound, expressed the way it was originally written:

@@ -726,6 +726,7 @@ struct G17PPrimaryFirmwareEventBatch {
     blamed_stamp: Option<i32>,
     unknown_records: u32,
     completion_records: u32,
+    completion_masks: [u64; 2],
     blamed_recovery_records: u32,
     notification_count: u32,
 }
@@ -750,6 +751,7 @@ fn drain_primary_firmware_event_batch(
         blamed_stamp: None,
         unknown_records: 0,
         completion_records: 0,
+        completion_masks: [0; 2],
         blamed_recovery_records: 0,
         notification_count,
     };
@@ -876,6 +878,10 @@ fn drain_primary_firmware_event_batch(
                     );
                 }
                 batch.completion_records = batch.completion_records.saturating_add(1);
+                let event = g17_completion::decode_g17p_firmware_stamp_event(&record.raw)
+                    .map_err(|_| EIO)?;
+                batch.completion_masks[0] |= event.masks[0];
+                batch.completion_masks[1] |= event.masks[1];
             }
             unknown => {
                 // Only recovery (type 4) and UMA-grow (type 13) were ever
@@ -1188,10 +1194,13 @@ fn settle_primary_empty_recovery(
     manager: &mut g17_manager::G17PManagerConstruction,
     state: &G17PRoleRtkitState,
     signal: &G17PCompletionSignal,
-) -> Result<Option<g17_manager::G17PBootstrapUmaRelease>> {
+) -> Result<(Option<g17_manager::G17PBootstrapUmaRelease>, [u64; 2])> {
     let mut uma_release = None;
+    let mut completion_masks = [0u64; 2];
     for _ in 0..g17_completion::G17P_FIRMWARE_EVENT_CAPACITY {
         let batch = drain_primary_firmware_event_batch(pdev, manager, state, &signal)?;
+        completion_masks[0] |= batch.completion_masks[0];
+        completion_masks[1] |= batch.completion_masks[1];
         if let Some(release) = batch.uma_release {
             if uma_release.replace(release).is_some() {
                 return Err(EIO);
@@ -1199,11 +1208,11 @@ fn settle_primary_empty_recovery(
         }
         if let Some(generation) = batch.recovery_generation {
             manager.queue_primary_recovery(generation, batch.recovery_records)?;
-            return Ok(uma_release);
+            return Ok((uma_release, completion_masks));
         }
         let handshake = manager.firmware_recovery_handshake_snapshot()?;
         if handshake.state == 0 {
-            return Ok(uma_release);
+            return Ok((uma_release, completion_masks));
         }
         if handshake.state == 1 {
             // Firmware publishes type4 before state 1, but the producer can
@@ -2547,6 +2556,11 @@ pub(crate) struct G17PLiveRuntime {
     /// retirement or the DRM scheduler's bounded timeout recovery.
     pending_render: [Option<Arc<crate::g17_drm::G17PRenderCompletion>>;
         g17_resources::G17PRenderQueuePair::SLOT_COUNT as usize],
+    /// Type-1 EventMachine QID bits observed since each slot was armed.
+    /// Cleared at arm/settlement so a compute-only or prior render event can
+    /// never retire the current fence.
+    render_event_masks: [[u64; 2];
+        g17_resources::G17PRenderQueuePair::SLOT_COUNT as usize],
     render_fence_state: g17_completion::RenderFenceState,
 }
 
@@ -2857,6 +2871,7 @@ impl G17PLiveRuntime {
             .pending_primary_recovery()
             .is_some();
         let mut uma_release = None;
+        let mut completion_masks = [0u64; 2];
         let result = if recovery_pending {
             Ok(())
         } else if self.queue_setup_pending && !notifications_pending {
@@ -2870,8 +2885,9 @@ impl G17PLiveRuntime {
         } else {
             let manager = self.manager.as_mut().ok_or(ENODEV)?;
             match settle_primary_empty_recovery(&pdev, manager, &state, &signal) {
-                Ok(release) => {
+                Ok((release, masks)) => {
                     uma_release = release;
+                    completion_masks = masks;
                     Ok(())
                 }
                 Err(error) => Err(error),
@@ -2888,6 +2904,8 @@ impl G17PLiveRuntime {
             if let Some(secondary) = self.gfx1_state.as_ref().cloned() {
                 let batch = drain_primary_firmware_event_batch(&pdev,
                     self.manager.as_mut().ok_or(ENODEV)?, &secondary, &signal)?;
+                completion_masks[0] |= batch.completion_masks[0];
+                completion_masks[1] |= batch.completion_masks[1];
                 if let Some(release) = batch.uma_release {
                     self.service_render_usc_freelist_release(release)?;
                 }
@@ -2896,7 +2914,7 @@ impl G17PLiveRuntime {
                         .queue_primary_recovery(generation, batch.recovery_records)?;
                 }
             }
-            self.service_async_render_completions()?;
+            self.service_async_render_completions(completion_masks)?;
             self.service_async_compute_completions()
         });
         if result.is_err() {
@@ -2925,6 +2943,12 @@ impl G17PLiveRuntime {
             let manager = self.manager.as_mut().ok_or(ENODEV)?;
             drain_primary_firmware_event_batch(&pdev, manager, &state, &signal)?
         };
+        for slot in 0..g17_resources::G17PRenderQueuePair::SLOT_COUNT as usize {
+            if self.pending_render[slot].is_some() {
+                self.render_event_masks[slot][0] |= batch.completion_masks[0];
+                self.render_event_masks[slot][1] |= batch.completion_masks[1];
+            }
+        }
         if let Some(release) = batch.uma_release {
             self.service_render_usc_freelist_release(release)?;
         }
@@ -2959,6 +2983,7 @@ impl G17PLiveRuntime {
                 .queue_primary_recovery(generation, batch.recovery_records)?;
             self.service_primary_recovery()?;
         }
+        self.service_async_render_completions([0; 2])?;
         Ok(batch.notification_count)
     }
 
@@ -3782,9 +3807,20 @@ impl G17PLiveRuntime {
     /// event edge. Both slots are inspected so a later submission completing
     /// first cannot strand the earlier slot, and taking the pending Arc makes
     /// duplicate notifications idempotent.
-    fn service_async_render_completions(&mut self) -> Result {
+    fn service_async_render_completions(&mut self, new_masks: [u64; 2]) -> Result {
         for slot in 0..g17_resources::G17PRenderQueuePair::SLOT_COUNT {
             if !self.render_fence_state.pending(slot) {
+                continue;
+            }
+            let observed = &mut self.render_event_masks[slot as usize];
+            observed[0] |= new_masks[0];
+            observed[1] |= new_masks[1];
+            let expected = {
+                let manager = self.manager.as_mut().ok_or(ENODEV)?;
+                manager.select_render_slot(slot)?;
+                manager.render_completion_masks()?
+            };
+            if !g17_completion::g17p_render_type1_complete(*observed, expected) {
                 continue;
             }
             let mut completion = None;
@@ -3801,6 +3837,7 @@ impl G17PLiveRuntime {
             }
             if let Some(observed) = completion {
                 if self.render_fence_state.settle(slot) {
+                    self.render_event_masks[slot as usize] = [0; 2];
                     let signal = self.pending_render[slot as usize]
                         .take()
                         .ok_or(EIO)?;
@@ -3822,6 +3859,7 @@ impl G17PLiveRuntime {
         if pending.is_some() || !self.render_fence_state.arm(render_slot) {
             return Err(EBUSY);
         }
+        self.render_event_masks[render_slot as usize] = [0; 2];
         *pending = Some(completion);
         Ok(())
     }
@@ -3844,6 +3882,7 @@ impl G17PLiveRuntime {
         match self.poll_deferred_render_completion(render_slot) {
             Ok(Some(observed)) => {
                 if self.render_fence_state.settle(render_slot) {
+                    self.render_event_masks[render_slot as usize] = [0; 2];
                     let Some(signal) = self.pending_render
                         .get_mut(render_slot as usize)
                         .and_then(Option::take) else { return; };
@@ -3873,6 +3912,7 @@ impl G17PLiveRuntime {
             }
         }
         if self.render_fence_state.settle(render_slot) {
+            self.render_event_masks[render_slot as usize] = [0; 2];
             let Some(signal) = self.pending_render
                 .get_mut(render_slot as usize)
                 .and_then(Option::take) else { return; };
@@ -6678,6 +6718,8 @@ impl G17PLiveRuntime {
             completion_signal: G17PCompletionSignal::new()?,
             pending_compute: None,
             pending_render: [None, None],
+            render_event_masks: [[0; 2];
+                g17_resources::G17PRenderQueuePair::SLOT_COUNT as usize],
             render_fence_state: g17_completion::RenderFenceState::default(),
         })
     }
@@ -6817,6 +6859,8 @@ impl g17_lifecycle::PersistentRuntimeRecovery for G17PLiveRuntime {
         for completion in self.pending_render.iter_mut().filter_map(Option::take) {
             completion.complete(Err(EIO));
         }
+        self.render_event_masks = [[0; 2];
+            g17_resources::G17PRenderQueuePair::SLOT_COUNT as usize];
         self.render_fence_state = g17_completion::RenderFenceState::default();
         drop(self.compute_timestamps.take());
         drop(self.compute_binding.take());
@@ -6930,6 +6974,8 @@ impl g17_lifecycle::PersistentRuntimeTeardown for G17PLiveRuntime {
         for completion in self.pending_render.iter_mut().filter_map(Option::take) {
             completion.complete(Err(EIO));
         }
+        self.render_event_masks = [[0; 2];
+            g17_resources::G17PRenderQueuePair::SLOT_COUNT as usize];
         self.render_fence_state = g17_completion::RenderFenceState::default();
         drop(self.compute_timestamps.take());
         drop(self.compute_binding.take());
