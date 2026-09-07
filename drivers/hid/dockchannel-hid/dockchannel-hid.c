@@ -82,6 +82,7 @@ struct dchid_init_hdr {
 #define CMD_SEND_FIRMWARE 0x95
 #define CMD_ENABLE_INTERFACE 0xb4
 #define CMD_ACK_GPIO_CMD 0xa1
+#define CMD_POWER_REQUEST 0x41
 #define CMD_QUERY_POWER 0x42
 
 #define DCHID_POWER_METHOD_DIRECT 1
@@ -185,6 +186,11 @@ MODULE_PARM_DESC(power_query,
  * it, so this one has to be set through modprobe.d or the kernel command line
  * rather than sysfs.
  */
+static bool power_request = true;
+module_param(power_request, bool, 0644);
+MODULE_PARM_DESC(power_request,
+		 "Send the 0x41 power request after the 0x40 transaction leaves the interface off");
+
 static bool enable_mtp_iface = true;
 module_param(enable_mtp_iface, bool, 0444);
 MODULE_PARM_DESC(enable_mtp_iface,
@@ -934,6 +940,34 @@ static void dchid_query_power_state(struct dchid_iface *iface, const char *when)
 		 iface->name, when, ret, (int)sizeof(resp), resp);
 }
 
+/*
+ * Ask MTP to power the interface on with the other half of its power pair.
+ *
+ * The 0x40 transaction is acknowledged, yet 0x42 reports the interface in the
+ * same state before and after it, so being parsed is not the same as being
+ * applied.  Opcode 0x41 is this firmware's "Power request", takes exactly four
+ * bytes and exists only for multi-touch, and is the one power opcode the driver
+ * has never sent.  A firmware that refuses it just returns an error, which is
+ * logged next to the 0x42 result either way.
+ */
+static void dchid_power_request(struct dchid_iface *iface, int state)
+{
+	u8 msg[] = {
+		CMD_POWER_REQUEST,
+		DCHID_POWER_METHOD_DIRECT,
+		iface->index,
+		state,
+	};
+	int ret;
+
+	if (!power_request || !dchid_uses_transactional_power(iface))
+		return;
+
+	ret = dchid_comm_cmd(iface->dchid, msg, sizeof(msg));
+	dev_info(iface->dchid->dev, "Power request %s state=%d: ret=%d\n",
+		 iface->name, state, ret);
+}
+
 static int dchid_start_interface(struct dchid_iface *iface)
 {
 	void *fw;
@@ -998,6 +1032,8 @@ static int dchid_start_interface(struct dchid_iface *iface)
 		if (ret < 0)
 			goto err;
 		dchid_query_power_state(iface, "after-cycle");
+		dchid_power_request(iface, DCHID_POWER_STATE_ON);
+		dchid_query_power_state(iface, "after-request");
 	}
 
 	return 0;
