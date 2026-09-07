@@ -121,9 +121,11 @@ const G17P_MAX_COMPUTE_QUEUES: u32 = crate::g17_queue_limits::MAX_QUEUES;
 /// steady-state path (which is the timing-sensitive one) is unchanged.
 #[pin_data]
 pub(crate) struct G17PQueueRegistry {
-    /// Bounded physical ownership: two render pairs plus the one transient
-    /// exclusive phase used while installing a compute graph.  Steady-state
-    /// compute readers do not occupy either render slot.
+    /// Bounded physical ownership: the qualified render pair plus the one
+    /// transient exclusive phase used while installing a compute graph.
+    /// Steady-state compute readers do not occupy the render slot. The second
+    /// render-pair implementation remains present but is not admitted until
+    /// its native QID allocation contract is qualified.
     #[pin]
     lease: Mutex<G17PQueueLeaseState>,
     #[pin]
@@ -133,8 +135,8 @@ pub(crate) struct G17PQueueRegistry {
     compute_faulted: AtomicU32,
     /// Device-wide throughput accounting.
     ///
-    /// `lease` bounds render to two submissions in flight, so at most two
-    /// threads ever reach this mutex and each holds it for a handful of
+    /// `lease` bounds render to the qualified physical capacity, so only one
+    /// thread currently reaches this mutex and holds it for a handful of
     /// integer updates -- no allocation, no formatting -- on a path that
     /// already takes several locks. It is skipped entirely when
     /// `g17p_perf_window` is 0.
@@ -154,6 +156,13 @@ struct G17PPerfState {
 
 const G17P_RENDER_SLOTS: usize =
     g17_resources::G17PRenderQueuePair::SLOT_COUNT as usize;
+/// Only qids 0/1 are hardware-qualified. Keep both physical-pair structures
+/// compiled so the native allocator can re-enable pair two without another
+/// architectural rewrite, but serialize every client through slot zero until
+/// that pair executes successfully on hardware.
+const G17P_ACTIVE_RENDER_SLOTS: usize = 1;
+const _: () = assert!(G17P_ACTIVE_RENDER_SLOTS > 0);
+const _: () = assert!(G17P_ACTIVE_RENDER_SLOTS <= G17P_RENDER_SLOTS);
 
 #[derive(Default)]
 struct G17PQueueLeaseState {
@@ -186,7 +195,7 @@ struct G17PQueueLeaseState {
 
 impl G17PQueueLeaseState {
     const fn render_mask() -> u8 {
-        (1u8 << g17_resources::G17PRenderQueuePair::SLOT_COUNT) - 1
+        (1u8 << G17P_ACTIVE_RENDER_SLOTS) - 1
     }
 
     /// True once no render slot can ever be handed out again.
