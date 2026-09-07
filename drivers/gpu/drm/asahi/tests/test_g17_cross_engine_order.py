@@ -28,12 +28,12 @@ lease = source.index(
     "let lease = self.acquire_ready_lease",
     render_dispatch,
 )
-output_fence = source.index(
-    "let output_fence: UserFence<G17PSubmissionFence>",
+render_arm = source.index(
+    "G17PPendingCommand::Render(translated) => {",
     lease,
 )
 
-assert render_dispatch < lease < output_fence
+assert render_dispatch < lease < render_arm
 
 wait = source[source.index("fn wait_render_slot("):source.index("/// Give the hardware", source.index("fn wait_render_slot(")) if "/// Give the hardware" in source[source.index("fn wait_render_slot("):] else source.index("impl Drop for G17PComputeLeaseGuard")]
 assert ".poll_deferred_render_completion(render_slot)?" in wait
@@ -41,6 +41,12 @@ assert wait.index(".poll_deferred_render_completion(render_slot)?") < wait.index
 render_call = source[source.index(".submit_translated_render(", render_dispatch):]
 assert "lease.slot(),\n                        true," in render_call[:400]
 assert ".wait_render_slot(lease.slot())" in render_call[:1200]
+# The opposite direction -- a compute copy that must observe a preceding render
+# -- is ordered only by the render path being synchronous: submit() must not
+# report success before wait_render_slot() has seen the pair retire.
+assert render_call.index(".wait_render_slot(lease.slot())") < render_call.index(
+    "publication.succeeded();"
+)
 assert "release_retired_render_context" not in live
 assert "release_retired_render_context" not in async_compute
 live_render = function(live, "pub(crate) fn submit_translated_render(")
