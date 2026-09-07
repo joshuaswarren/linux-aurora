@@ -127,6 +127,49 @@ const T8140_COMPUTE_CTXS: [usize; 2] = [2, 3];
 const T8140_APP_CONTEXT_START: usize = 5;
 const T8140_APP_CONTEXT_RESERVED_MASK: u64 = (1u64 << T8140_APP_CONTEXT_START) - 1;
 const T8140_APP_CONTEXT_AVAILABLE_MASK: u64 = !T8140_APP_CONTEXT_RESERVED_MASK;
+
+/// How many user VMs may hold a T8140 UAT binding at once.
+///
+/// A binding owns a hardware context outright, so this is the number of
+/// distinct client address spaces that can be rooted for execution at the same
+/// time. Slot 0 is the opening pair's context 1; the rest come from the
+/// reserved bind band in `g17_queue_limits`, which the application-GART and
+/// compute-execution allocators are masked out of.
+const T8140_BIND_SLOTS: usize =
+    1 + crate::g17_queue_limits::BIND_CONTEXT_COUNT as usize;
+
+/// Hardware context for one T8140 UAT bind slot, or `None` above the pool.
+///
+/// Slot 0 maps to context 1 so a single-client session is byte-identical to
+/// the measured first-partial opening: `render_root_slot == 1`,
+/// `render_context_id == 1`, and the ctx0/ctx1 root-phase machine below all
+/// still describe it. Contexts 0 (kernel), 2/3 (the compute kick's declared
+/// contexts) and 4 (accelerator-reserved) are never bind targets.
+const fn t8140_bind_context(slot: u32) -> Option<usize> {
+    if slot == 0 {
+        Some(1)
+    } else if (slot as usize) < T8140_BIND_SLOTS {
+        Some(crate::g17_queue_limits::BIND_CONTEXT_FIRST as usize + slot as usize - 1)
+    } else {
+        None
+    }
+}
+
+const _: () = {
+    // The bind band must not overlap anything else that owns a TTBAT entry.
+    assert!(
+        crate::g17_queue_limits::BIND_CONTEXT_MASK
+            & crate::g17_queue_limits::COMPUTE_CONTEXT_MASK
+            == 0
+    );
+    assert!(crate::g17_queue_limits::BIND_CONTEXT_MASK & T8140_APP_CONTEXT_RESERVED_MASK == 0);
+    assert!(
+        crate::g17_queue_limits::BIND_CONTEXT_MASK
+            & (1u64 << crate::g17_queue_limits::RENDER_APP_CONTEXT)
+            == 0
+    );
+    assert!(crate::g17_queue_limits::BIND_CONTEXT_FIRST as usize + 1 > T8140_APP_CONTEXT_START);
+};
 pub(crate) const T8140_PARAMETER_METRICS_LOW_VA: u64 = 0x0000_0010_0008_0000;
 pub(crate) const T8140_PARAMETER_METRICS_SIZE: usize = 0x8000;
 
@@ -659,6 +702,13 @@ struct VmBinding {
     active_users: usize,
     binding: Option<slotalloc::Guard<SlotInner>>,
     bind_token: Option<slotalloc::SlotToken>,
+    /// Hardware TTBAT context this VM's slot maps to.
+    ///
+    /// Sticky exactly like `bind_token`, and for the same reason: an unbound
+    /// VM still has to invalidate the ASID it last owned. It cannot be
+    /// recomputed from the token, because on T8140 slot index and hardware
+    /// context are no longer the same number.
+    bind_context: Option<u32>,
     ttb: u64,
 }
 
@@ -940,11 +990,7 @@ impl VmInner {
             // interim, and then it gets killed / drops its mappings without doing any
             // final rendering). Anything doing active maps/unmaps is probably also
             // rendering and therefore likely bound.
-            self.binding
-                .lock()
-                .bind_token
-                .as_ref()
-                .map(|token| token.last_slot() + UAT_USER_CTX_START as u32)
+            self.binding.lock().bind_context
         }
     }
 
@@ -1186,8 +1232,44 @@ where
 /// Slot data for a [`Vm`] slot (nothing, we only care about the indices).
 pub(crate) struct SlotInner();
 
+/// Which VM currently owns each UAT slot.
+///
+/// A bind failure is otherwise unattributable: the log says the pool is full
+/// and nothing says who filled it. The allocator clears an entry as the slot
+/// is returned, so this is exact rather than a last-seen record.
+pub(crate) struct SlotOwners {
+    vm_ids: [u64; UAT_USER_CTX],
+}
+
+impl SlotOwners {
+    fn new() -> Self {
+        Self {
+            vm_ids: [0; UAT_USER_CTX],
+        }
+    }
+
+    fn record_owner(&mut self, slot: u32, vm_id: u64) {
+        if let Some(entry) = self.vm_ids.get_mut(slot as usize) {
+            *entry = vm_id;
+        }
+    }
+
+    /// The owners of the T8140 bind pool only. Deliberately not the whole
+    /// 63-entry table: this runs on an error path, and the caller's frame is
+    /// on the submit stack.
+    fn snapshot(&self) -> [u64; T8140_BIND_SLOTS] {
+        core::array::from_fn(|slot| self.vm_ids.get(slot).copied().unwrap_or(0))
+    }
+}
+
 impl slotalloc::SlotItem for SlotInner {
-    type Data = ();
+    type Data = SlotOwners;
+
+    fn release(&mut self, data: &mut Self::Data, slot: u32) {
+        if let Some(entry) = data.vm_ids.get_mut(slot as usize) {
+            *entry = 0;
+        }
+    }
 }
 
 /// Represents a single user of a binding of a [`Vm`] to a slot.
@@ -1956,6 +2038,7 @@ impl Vm {
                 VmBinding {
                     binding: None,
                     bind_token: None,
+                    bind_context: None,
                     active_users: 0,
                     ttb: page_table.ttb(),
                 },
@@ -2892,8 +2975,16 @@ impl Drop for VmInner {
         );
 
         // Make sure this VM is not mapped to a TTB if it was
+        let bind_context = binding.bind_context.take();
         if let Some(token) = binding.bind_token.take() {
-            let idx = (token.last_slot() as usize) + UAT_USER_CTX_START;
+            // `bind_context` is the authority: on T8140 the slot index and the
+            // hardware context are different numbers, so the historical
+            // `slot + UAT_USER_CTX_START` is only the fallback for a token
+            // that predates a context ever being recorded.
+            let _ = &token;
+            let idx = bind_context
+                .map(|context| context as usize)
+                .unwrap_or_else(|| (token.last_slot() as usize) + UAT_USER_CTX_START);
             let ttb = self.ttb() | TTBR_VALID | (idx as u64) << TTBR_ASID_SHIFT;
 
             // The G17P compute path publishes this VM's root again at the
@@ -4028,8 +4119,13 @@ impl Uat {
             );
             return Ok(());
         }
-        // The aliases mirror the single bindable user context. Anything else
-        // means the caller changed the binding contract without changing this.
+        // Contexts 2/3 are the compute kick's DECLARED contexts, and the
+        // measured pairing publishes them as aliases of the opening context.
+        // A binding is no longer pinned to context 1, but this path is: it is
+        // the legacy synchronous compute submit, whose captured kick names
+        // context 2 next to an opening at context 1. A caller reaching here
+        // from a bind-band context would be a different submission shape and
+        // must not silently reuse this one.
         if bind.slot() != 1 {
             return Err(EINVAL);
         }
@@ -4096,10 +4192,14 @@ impl Uat {
         bind: &VmBind,
         context_id: usize,
     ) -> Result<(u64, u64)> {
+        // The alias target is either this binding's own hardware context, one
+        // of the two contexts a compute kick declares, or a dynamically
+        // allocated application-GART context. It is no longer "context 1 or
+        // above the reserved band", because a binding is no longer pinned to
+        // context 1.
         if self.cfg != UatConfig::T8140
-            || bind.slot() != 1
             || context_id >= UAT_NUM_CTX
-            || (context_id != 1
+            || (context_id != bind.slot() as usize
                 && !T8140_COMPUTE_CTXS.contains(&context_id)
                 && context_id < T8140_APP_CONTEXT_START)
         {
@@ -4150,7 +4250,7 @@ impl Uat {
         &self,
         bind: &VmBind,
     ) -> Result<T8140AppContextLease> {
-        if self.cfg != UatConfig::T8140 || bind.slot() != 1 {
+        if self.cfg != UatConfig::T8140 {
             return Err(EINVAL);
         }
 
@@ -4345,6 +4445,9 @@ impl Uat {
     /// context table, so that cannot happen here — but comparing all three
     /// entries against the same `ttb()` is the cheap proof of it.
     pub(crate) fn t8140_compute_context_alias_ready(&self, bind: &VmBind) -> bool {
+        // Paired with `install_t8140_compute_context_alias`: this readiness
+        // test reads `ttbs[1]` back verbatim, so it only describes a binding
+        // that actually sits at the opening context.
         if self.cfg != UatConfig::T8140 || bind.slot() != 1 {
             return false;
         }
@@ -4374,46 +4477,67 @@ impl Uat {
     }
 
     /// Binds a `Vm` to a slot, preferring the last used one.
+    ///
+    /// On T8140 a slot is a TTBAT context this VM owns outright, and the
+    /// number of them is [`T8140_BIND_SLOTS`], not one. Slot 0 is hardware
+    /// context 1, so the first binder still reproduces the measured
+    /// first-partial opening exactly -- `render_root_slot == 1`,
+    /// `render_context_id == 1`, the ctx0/ctx1 root-phase transitions below.
+    /// Later concurrent clients take a context from the reserved bind band
+    /// instead of waiting for the first one to go away; everything that names
+    /// the render root (the fragment MCache write-range selector) reads it
+    /// from [`VmBind::slot`] rather than assuming 1.
+    ///
+    /// Hardware context 2 is *not* a bind target. It is the context the
+    /// compute kick declares (`T8140_COMPUTE_CTXS`), published as an alias of
+    /// a binding's root by [`Uat::install_t8140_compute_context_alias`] rather
+    /// than by the slot allocator -- exactly as m1n1 publishes `CONTEXT = 2`
+    /// while keeping its own bootstrap context separate.
     pub(crate) fn bind(&self, vm: &Vm) -> Result<VmBind> {
         let mut binding = vm.binding.lock();
 
         if binding.binding.is_none() {
             assert_eq!(binding.active_users, 0);
 
-            // The T8140 first-partial contract has exactly one *bindable*
-            // user context: retained kernel context 0 plus user context 1.
-            // Every measured field of the opening keys off that pairing --
-            // `render_root_slot == 1`, `render_context_id == 1`,
-            // `descriptor_context_id == 1` -- and the root-phase machine in
-            // this file reads back `ttbs[0]`/`ttbs[1]` verbatim, so letting
-            // the generic LRU hand out a later allocator slot would silently
-            // move the render/descriptor context out from under all of it.
-            //
-            // Hardware context 2 is *not* nonexistent, which is what the
-            // previous wording claimed. It is the context the compute kick
-            // declares (`T8140_COMPUTE_CTXS`), and it is published as an alias
-            // of this binding's root by
-            // [`Uat::install_t8140_compute_context_alias`] rather than by the
-            // slot allocator -- exactly as m1n1 publishes `CONTEXT = 2` while
-            // keeping its own bootstrap context separate.
-            let single_user_slot = self.cfg == UatConfig::T8140
-                || *module_parameters::robust_isolation.value() != 0;
-
-            self.slots.set_limit(if single_user_slot {
+            let limit = if *module_parameters::robust_isolation.value() != 0 {
+                // Escape hatch: one bindable context, the pre-pool behaviour.
                 NonZeroUsize::new(1)
+            } else if self.cfg == UatConfig::T8140 {
+                NonZeroUsize::new(T8140_BIND_SLOTS)
             } else {
                 None
-            });
+            };
+            self.slots.set_limit(limit);
+            // A T8140 slot index names a hardware context, so which one a VM
+            // lands on must not depend on allocation history. See
+            // `SlotAllocatorInner::lowest_first`.
+            self.slots.set_lowest_first(self.cfg == UatConfig::T8140);
 
-            let slot = self.slots.get(binding.bind_token)?;
+            let vm_id = vm.id;
+            let slot = match self.slots.get_inner(binding.bind_token, |data, guard| {
+                data.record_owner(guard.slot(), vm_id);
+                Ok(())
+            }) {
+                Ok(slot) => slot,
+                Err(error) => {
+                    self.log_bind_context_owners(vm_id, error);
+                    return Err(error);
+                }
+            };
+            let idx = if self.cfg == UatConfig::T8140 {
+                match t8140_bind_context(slot.slot()) {
+                    Some(idx) => idx,
+                    None => {
+                        self.log_bind_context_owners(vm_id, EBUSY);
+                        return Err(EBUSY);
+                    }
+                }
+            } else {
+                (slot.slot() as usize) + UAT_USER_CTX_START
+            };
             if slot.changed() {
                 mod_pr_debug!("Vm Bind [{}]: bind_token={:?}\n", vm.id, slot.token(),);
-                let idx = (slot.slot() as usize) + UAT_USER_CTX_START;
                 let ttb = binding.ttb | TTBR_VALID | (idx as u64) << TTBR_ASID_SHIFT;
-
-                if self.cfg == UatConfig::T8140 && idx != 1 {
-                    return Err(EBUSY);
-                }
 
                 let uat_inner = self.inner.lock();
 
@@ -4485,14 +4609,61 @@ impl Uat {
             }
 
             binding.bind_token = Some(slot.token());
+            binding.bind_context = Some(idx as u32);
             binding.binding = Some(slot);
         }
 
         binding.active_users += 1;
 
-        let slot = binding.binding.as_ref().unwrap().slot() + UAT_USER_CTX_START as u32;
+        let slot = binding.bind_context.ok_or(EIO)?;
         mod_pr_debug!("MMU: slot {} active users {}\n", slot, binding.active_users);
         Ok(VmBind(vm.clone(), slot))
+    }
+
+    /// Report which UAT bind contexts are occupied and by which VM.
+    ///
+    /// Called on every failed bind. Without it the only evidence is
+    /// slotalloc's "out of slots with a limit of N", which names neither the
+    /// hardware contexts involved nor the clients holding them, and a bind
+    /// failure is the one error a second GPU client sees first.
+    fn log_bind_context_owners(&self, vm_id: u64, error: kernel::error::Error) {
+        let busy = self.slots.busy_mask();
+        let owners = self.slots.with_inner(|data| data.snapshot());
+        let inner = self.inner.lock();
+        let ttbs = inner.ttbs();
+        // The slot -> context mapping only means anything on T8140; every
+        // other configuration binds slot n at context n + 1 and has 63 of
+        // them, so there is nothing useful to enumerate.
+        let slots = if self.cfg == UatConfig::T8140 {
+            T8140_BIND_SLOTS as u32
+        } else {
+            0
+        };
+        for slot in 0..slots {
+            let Some(context) = t8140_bind_context(slot) else {
+                continue;
+            };
+            let state = if busy & (1u64 << slot) != 0 { "BUSY" } else { "free" };
+            let owner = owners.get(slot as usize).copied().unwrap_or(0);
+            dev_err!(
+                self.dev.as_ref(),
+                "MMU: bind slot {} -> hw context {}: {}, owner vm {}, ttb0={:#x} ttb1={:#x}\n",
+                slot,
+                context,
+                state,
+                owner,
+                ttbs[context].ttb0.load(Ordering::Acquire),
+                ttbs[context].ttb1.load(Ordering::Acquire),
+            );
+        }
+        core::mem::drop(inner);
+        dev_err!(
+            self.dev.as_ref(),
+            "MMU: vm {} could not acquire a UAT bind context ({:?}); app-GART contexts in use {:#x}\n",
+            vm_id,
+            error,
+            self.inner.t8140_app_contexts.load(Ordering::Acquire),
+        );
     }
 
     /// Creates a new `Vm` linked to this UAT.
@@ -4526,7 +4697,14 @@ impl Uat {
                     handoff_mode == HandoffMode::FirmwareDekker
                 ),
                 t8140_alias_owner: AtomicU64::new(0),
-                t8140_app_contexts: AtomicU64::new(T8140_APP_CONTEXT_RESERVED_MASK),
+                // Contexts 0..4 have fixed architectural meaning, and the
+                // bind band belongs to `Uat::bind`. Reserving the band here as
+                // well means the two allocators cannot collide even if the
+                // masks in `g17_queue_limits` are ever edited apart.
+                t8140_app_contexts: AtomicU64::new(
+                    T8140_APP_CONTEXT_RESERVED_MASK
+                        | crate::g17_queue_limits::BIND_CONTEXT_MASK,
+                ),
                 handoff_flush <- pin_init::pin_init_array_from_fn(|i| {
                     new_mutex!(HandoffFlush(&handoff.flush[i], handoff_mode), "handoff_flush")
                 }),
@@ -4874,7 +5052,7 @@ impl Uat {
             inner,
             slots: slotalloc::SlotAllocator::new(
                 UAT_USER_CTX as u32,
-                (),
+                SlotOwners::new(),
                 |_inner, _slot| Some(SlotInner()),
                 c_str!("Uat::SlotAllocator"),
                 static_lock_class!(),

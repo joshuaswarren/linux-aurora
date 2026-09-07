@@ -168,9 +168,16 @@ with tempfile.TemporaryDirectory(prefix="g17-pm-submitted-") as temp:
 publish = block(r"^    pub\(crate\) fn publish_partial_opening_pair<F, G>\(")
 assert publish.count("commit_submitted_operation();") == 1
 at = publish.index("commit_submitted_operation();")
-for earlier in ["object.vmap()?", "uat.bind(vm)?", "install_t8140_render_mcache_context_alias",
-                "install_t8140_partial_opening_empty_high_roots"]:
+for earlier in ["object.vmap()?", "install_t8140_partial_opening_empty_high_roots"]:
     assert publish.index(earlier) < at, earlier
+# The client root binding and its optional MCache alias moved OUT of this
+# routine: the fragment MCache write-range selector names the bound hardware
+# context, so the descriptor cannot be encoded until the bind has happened.
+# That makes the ordering requirement strictly stronger -- they now precede
+# the whole publication, not merely the committed count -- so assert it at the
+# manager instead of here, and assert they are gone from here.
+assert "uat.bind(vm)" not in publish
+assert "install_t8140_render_mcache_context_alias" not in publish
 assert "?" not in publish[at:], "fallible operation after committed count"
 assert "return Err" not in publish[at:]
 for later in ["state[fragment_producer_offset..", "publish_late_tiling_state();",
@@ -182,4 +189,15 @@ publish_at = manager.index(".publish_partial_opening_pair(", prepare)
 commit = manager.index("operation.commit();", publish_at)
 assert prepare < publish_at < commit
 assert manager.count("operation.commit();") == 1
+
+# The render root bind and the diagnostic MCache alias must both complete
+# before any descriptor is staged, which is before the outer publication and
+# therefore before the committed count.
+render_publish = manager.index(
+    "fn begin_translated_render_with_hardware_buffer")
+bind_at = manager.index(".bind(vm)", render_publish)
+alias_at = manager.index("install_t8140_render_mcache_context_alias", render_publish)
+storage_at = manager.index(".new_user_render_storage(", render_publish)
+outer_at = manager.index(".publish_partial_opening_pair(", render_publish)
+assert bind_at < alias_at < storage_at < outer_at
 print("PM submitted-operation transaction and actual publication ordering PASS")

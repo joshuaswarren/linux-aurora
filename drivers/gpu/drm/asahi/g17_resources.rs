@@ -3093,6 +3093,15 @@ pub(crate) struct G17PUserRenderStorage {
     /// Hardware context carried by this queue's submitted TA/3D descriptors.
     /// Native allocates this independently of the command-GART context.
     descriptor_context_id: u16,
+    /// TTBAT context this render's VM is bound to (`VmBind::slot`).
+    ///
+    /// Distinct from `descriptor_context_id`: the descriptors execute in the
+    /// queue's own application context, while the fragment MCache write-range
+    /// selector names the bound root. With one bindable context this was
+    /// always 1; with a bind pool a concurrent second client is elsewhere and
+    /// emitting the wrong one would point its write ranges at another
+    /// client's page tables.
+    render_root_slot: u8,
     /// Render-only tail of the USC private-memory aperture.  Ordinary client
     /// VMs start with the 21-buffer compute closure; a render submission adds
     /// blocks 21..25 for the native 22-block initial pool plus four-block
@@ -4579,6 +4588,7 @@ fn encode_g17p_fragment_mcache(
     hwsid: u32,
     mode: u32,
     selector: u32,
+    render_root_slot: u8,
     fragment: &mut [u8],
 ) -> Result<Option<g17_submission::G17PClMcacheAperture>> {
     if hwsid == 0 || attachments.is_empty() {
@@ -4592,9 +4602,18 @@ fn encode_g17p_fragment_mcache(
         return Err(EINVAL);
     }
     // Native's MCache selector and the command descriptor context ID have
-    // distinct sources. Preserve the established compatibility default.
+    // distinct sources. The default names the hardware context this render's
+    // VM is actually bound to. That used to be the constant 1 because there
+    // was exactly one bindable context; with a bind pool a second concurrent
+    // client sits somewhere else, and emitting 1 for it would resolve its
+    // fragment write ranges against ANOTHER client's page tables.
     let selector = match selector {
-        64 => g17_submission::G17P_PARTIAL_OPENING_CONTEXT.render_root_slot,
+        64 => {
+            if render_root_slot > 0x3f {
+                return Err(EINVAL);
+            }
+            render_root_slot
+        }
         value => u8::try_from(value)
             .ok()
             .filter(|value| *value <= 0x3f)
@@ -4682,6 +4701,7 @@ fn apply_g17p_fragment_mcache(
     fragment_internal_size: u64,
     descriptor_low: u64,
     mcache_offset: usize,
+    render_root_slot: u8,
     fragment: &mut [u8],
 ) -> Result<Option<g17_submission::G17PClMcacheAperture>> {
     encode_g17p_fragment_mcache(
@@ -4689,7 +4709,8 @@ fn apply_g17p_fragment_mcache(
         descriptor_low, mcache_offset,
         *crate::module_parameters::g17p_render_mcache_hwsid.value(),
         *crate::module_parameters::g17p_render_mcache_mode.value(),
-        *crate::module_parameters::g17p_render_mcache_selector.value(), fragment,
+        *crate::module_parameters::g17p_render_mcache_selector.value(),
+        render_root_slot, fragment,
     )
 }
 
@@ -5253,10 +5274,14 @@ fn render_build_fail(site: u32) -> kernel::error::Error {
 
 impl G17PUserRenderStorage {
     fn descriptor_context_valid(context_id: u16) -> bool {
+        // A descriptor context is a queue execution context. The bind band and
+        // the render app context are owned by other allocators, so a
+        // descriptor naming one of them would be a cross-allocator collision,
+        // not a valid submission.
         context_id
             == g17_submission::G17P_PARTIAL_OPENING_CONTEXT.descriptor_context_id as u16
             || (u32::from(context_id) >= crate::g17_queue_limits::COMPUTE_CONTEXT_FIRST
-                && u32::from(context_id) < crate::g17_queue_limits::RENDER_APP_CONTEXT)
+                && u32::from(context_id) < crate::g17_queue_limits::BIND_CONTEXT_FIRST)
     }
 
     pub(crate) fn write_sksm_entry(
@@ -5748,6 +5773,7 @@ impl G17PUserRenderStorage {
         user_timestamp_aliases: KVec<mmu::KernelMapping>,
         command_context: G17PRenderCommandContext,
         descriptor_context_id: u16,
+        render_root_slot: u8,
         submission_ordinal: u32,
     ) -> Result<Self> {
         macro_rules! bootstrap_stage {
@@ -6664,6 +6690,7 @@ impl G17PUserRenderStorage {
                 G17P_RENDER_STATE_AUX_FB_SIZE as u64,
                 descriptor_3d_rce_va,
                 g17_render::G17P_FRAGMENT_MCACHE_OFFSET,
+                render_root_slot,
                 fragment,
             )?;
             // The valid cold class-0 trace publishes the two-range aperture on
@@ -6814,7 +6841,13 @@ impl G17PUserRenderStorage {
             lifecycle_predecessor,
             _command_context: Some(command_context),
             descriptor_context_id,
+            render_root_slot,
         })
+    }
+
+    /// TTBAT context this render's VM is bound to.
+    pub(crate) fn render_root_slot(&self) -> u8 {
+        self.render_root_slot
     }
 
     pub(crate) fn tvb_capacity(&self) -> usize {
@@ -6951,6 +6984,9 @@ impl G17PUserRenderStorage {
         if !Self::descriptor_context_valid(descriptor_context_id) {
             return Err(EINVAL);
         }
+        // The retained graph keeps its VM's binding for its whole lifetime,
+        // so the bound root cannot move between submissions on it.
+        let render_root_slot = self.render_root_slot;
         let plan = G17PRenderItemPlan::new(submission_ordinal, g17p_render_tag16_enabled())
             .ok_or(EINVAL)?;
         core::sync::atomic::fence(Ordering::Acquire);
@@ -7339,6 +7375,7 @@ impl G17PUserRenderStorage {
                 G17P_RENDER_STATE_AUX_FB_SIZE as u64,
                 descriptor_3d_rce_va,
                 g17_render::G17P_FRAGMENT_MCACHE_OFFSET,
+                render_root_slot,
                 fragment,
             )
         })?;
@@ -13950,6 +13987,10 @@ impl G17ResourceOwner {
         queue_pair: G17PRenderQueuePair,
         execution_context: Option<Arc<mmu::T8140ComputeExecutionContext>>,
         descriptor_context_id: u16,
+        // TTBAT context the caller has already bound this VM to, for the
+        // ordinary job path. `None` is the driver-owned bootstrap render,
+        // which acquires its own binding below.
+        render_root_slot: Option<u8>,
         command: &g17_uapi::TranslatedRenderCommand,
         num_clusters: u32,
         user_timestamps: [u64; 4],
@@ -13979,22 +14020,30 @@ impl G17ResourceOwner {
         }
         self.stage_render_uma_page_pool_descriptor()?;
         let parameter_page_list_vas = self.parameter_buffer_page_list_vas();
-        let command_context = if let Some(context) = execution_context {
+        let (command_context, render_root_slot) = if let Some(context) = execution_context {
             if !context.matches(vm) || context.context_id() != u32::from(descriptor_context_id) {
                 return Err(EINVAL);
             }
-            G17PRenderCommandContext::Job(context)
+            (
+                G17PRenderCommandContext::Job(context),
+                render_root_slot.ok_or(EINVAL)?,
+            )
         } else {
             let render_bind = self.address_space.uat.bind(vm)?;
-            G17PRenderCommandContext::Bootstrap(
-                self.address_space.uat.allocate_t8140_app_context(&render_bind)?,
+            let slot = u8::try_from(render_bind.slot()).map_err(|_| EINVAL)?;
+            (
+                G17PRenderCommandContext::Bootstrap(
+                    self.address_space.uat.allocate_t8140_app_context(&render_bind)?,
+                ),
+                slot,
             )
         };
         dev_info!(
             dev.as_ref(),
-            "G17P render app-GART allocation: command context {} descriptor context {}\n",
+            "G17P render app-GART allocation: command context {} descriptor context {} root slot {}\n",
             command_context.context_id(),
             descriptor_context_id,
+            render_root_slot,
         );
         let mut storage = G17PUserRenderStorage::new(
             dev,
@@ -14010,6 +14059,7 @@ impl G17ResourceOwner {
             user_timestamp_aliases,
             command_context,
             descriptor_context_id,
+            render_root_slot,
             submission_ordinal,
         )?;
         for mapping in render_operand_aliases {
@@ -15050,7 +15100,6 @@ impl G17ResourceOwner {
     /// three-entry groups named by the supplied queue heads.
     pub(crate) fn publish_partial_opening_pair<F, G>(
         &mut self,
-        render_vm: Option<&mmu::Vm>,
         context_already_bound: bool,
         queue_pair: G17PRenderQueuePair,
         // This layer may retain exactly one OUTER producer. The manager owns
@@ -15064,18 +15113,12 @@ impl G17ResourceOwner {
         first_submit: bool,
         commit_submitted_operation: G,
         publish_late_tiling_state: F,
-    ) -> Result<(
-        g17_submission::PreparedG17PPartialOpeningWorkPair,
-        Option<mmu::VmBind>,
-    )>
+    ) -> Result<g17_submission::PreparedG17PPartialOpeningWorkPair>
     where
         F: FnOnce(),
         G: FnOnce(),
     {
-        if fragment_queue_gpu_va == 0
-            || tiling_queue_gpu_va == 0
-            || (render_vm.is_some() && context_already_bound)
-        {
+        if fragment_queue_gpu_va == 0 || tiling_queue_gpu_va == 0 {
             return Err(EINVAL);
         }
         let binding = self.partial_opening_binding();
@@ -15196,29 +15239,16 @@ impl G17ResourceOwner {
 
         shared[fragment_slot_offset..fragment_slot_offset + prepared.fragment.slot.len()]
             .copy_from_slice(&prepared.fragment.slot);
-        let render_bind = if let Some(vm) = render_vm {
-            let bind = self.address_space.uat.bind(vm)?;
-            // G17PUserRenderStorage owns two native-style dynamic app-GART
-            // leases already rooted against this binding. Do not overwrite a
-            // fixed context here: descriptor and tag-15 IDs come from those
-            // leases, exactly as AGXContextIDManager allocates them.
-            let mcache_hwsid = *crate::module_parameters::g17p_render_mcache_hwsid.value();
-            let mcache_selector =
-                *crate::module_parameters::g17p_render_mcache_selector.value() as usize;
-            if mcache_hwsid != 0 && matches!(mcache_selector, 2 | 3) {
-                self.address_space
-                    .uat
-                    .install_t8140_render_mcache_context_alias(&bind, mcache_selector)?;
-            }
-            Some(bind)
-        } else if context_already_bound {
-            None
-        } else {
+        // The render VM's own hardware context is acquired and held by the
+        // manager for the lifetime of the render graph, not here: the
+        // fragment MCache write-range selector names that context, so the
+        // descriptor cannot be encoded until it is known. This routine only
+        // still owns the cold empty-high-root transition of the opening.
+        if !context_already_bound {
             self.address_space
                 .uat
                 .install_t8140_partial_opening_empty_high_roots()?;
-            None
-        };
+        }
         // No fallible operation remains. Commit native PM usage exactly once
         // before either outer producer can expose the corresponding command.
         // A failed mapping, ring check or context bind above consumes no count.
@@ -15245,7 +15275,7 @@ impl G17ResourceOwner {
         }
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 
-        Ok((prepared, render_bind))
+        Ok(prepared)
     }
 
     /// Publish a render pair whose two complete outer slots were retained
