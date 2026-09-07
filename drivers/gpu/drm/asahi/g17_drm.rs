@@ -1592,7 +1592,68 @@ impl Drop for G17POutputFencePublication<'_> {
 }
 
 impl queue::Queue for G17PQueue {
+    /// Every synchronous submission funnels through here so that no exit path
+    /// can leave the client's own outstanding work unaccounted for.
+    ///
+    /// `submit_guarded` already promises an output fence for THIS ioctl on
+    /// every path. What it cannot promise is anything about work this client
+    /// handed the hardware earlier: once a failure is terminal the client's
+    /// device is lost, Mesa tears its context down, and the jobs already in
+    /// flight will never complete or signal. Settle them here.
     fn submit(
+        &mut self,
+        submission_id: u64,
+        syncs: KVec<file::SyncItem>,
+        in_sync_count: usize,
+        cmdbuf_raw: &[u8],
+        objects: core::pin::Pin<&xarray::XArray<KBox<file::Object>>>,
+    ) -> Result {
+        let result =
+            self.submit_guarded(submission_id, syncs, in_sync_count, cmdbuf_raw, objects);
+        if let Err(error) = result {
+            self.note_submission_failure(submission_id, error);
+        }
+        result
+    }
+}
+
+impl G17PQueue {
+    /// Settle a client whose submission failed terminally.
+    ///
+    /// Only failures that mean "this work will never run on this device" count.
+    /// Contention and rejection do not: an EBUSY from the render lease, an
+    /// interrupted wait, or a malformed command buffer all leave a perfectly
+    /// healthy VM, and recording a sticky error for one of those would retire a
+    /// client that merely lost a frame.
+    fn note_submission_failure(&mut self, submission_id: u64, error: Error) {
+        let lost = error == EIO
+            || error == ETIMEDOUT
+            || error == ENODEV
+            || self.vm.status().get() != 0;
+        if !lost {
+            return;
+        }
+        // Sticky first: a syncobj waiter woken by an error fence asks the VM
+        // status why, and must not find a clean one.
+        self.vm.status().record(error.to_errno());
+        let failed = self
+            .runtime
+            .mutex()
+            .lock()
+            .fail_outstanding_jobs_for_vm(self.vm.status(), error);
+        if failed != 0 {
+            dev_err!(
+                self.dev.as_ref(),
+                "G17P submit: submission {} lost the device ({:?}); failed {} outstanding job(s) on vm {}\n",
+                submission_id,
+                error,
+                failed,
+                self.vm.id(),
+            );
+        }
+    }
+
+    fn submit_guarded(
         &mut self,
         submission_id: u64,
         mut syncs: KVec<file::SyncItem>,

@@ -1218,16 +1218,6 @@ impl File {
 
         mod_dev_dbg!(
             device,
-            "[File {} Queue {}]: IOCTL: submit({}): Parsing syncs\n",
-            file.inner().id,
-            data.queue_id,
-            id
-        );
-        let syncs =
-            SyncItem::parse_array(file, data.syncs, data.in_sync_count, data.out_sync_count)?;
-
-        mod_dev_dbg!(
-            device,
             "[File {} Queue {}]: IOCTL: submit({}): Parsing commands\n",
             file.inner().id,
             data.queue_id,
@@ -1239,12 +1229,31 @@ impl File {
         // Copy the command buffer into the kernel. Because we need to iterate
         // the command buffer twice, we do this in one big copy_from_user to
         // avoid TOCTOU issues.
+        //
+        // This runs BEFORE the syncobjs are parsed on purpose. Once an output
+        // syncobj has been looked up, userspace is already waiting on it, and
+        // the driver owes it a fence on every path. `queue.submit()` guarantees
+        // that for itself; a failure between the lookup and the call would not,
+        // and a copy_from_user of a userspace-supplied pointer and length is
+        // exactly such a failure. Ordering the fallible copy first leaves no
+        // gap: after `parse_array` succeeds the only remaining step is the
+        // guarded submit.
         let reader = UserSlice::new(
             UserPtr::from_addr(data.cmdbuf as _),
             data.cmdbuf_size as usize,
         )
         .reader();
         reader.read_all(&mut vec, GFP_KERNEL)?;
+
+        mod_dev_dbg!(
+            device,
+            "[File {} Queue {}]: IOCTL: submit({}): Parsing syncs\n",
+            file.inner().id,
+            data.queue_id,
+            id
+        );
+        let syncs =
+            SyncItem::parse_array(file, data.syncs, data.in_sync_count, data.out_sync_count)?;
 
         let objects = file.inner().objects();
         let ret = queue
