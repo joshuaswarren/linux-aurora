@@ -119,6 +119,7 @@ impl G17PRuntimeRef {
             i64::from(*module_parameters::g17p_render_wait_ms.value()).saturating_mul(1_000_000);
         let started = Instant::<Monotonic>::now();
         let mut polls = 0u32;
+        let mut late_sksm_done = *module_parameters::g17p_late_sksm.value() == 0;
         loop {
             let completion = self
                 .mutex()
@@ -134,6 +135,27 @@ impl G17PRuntimeRef {
                 } else {
                     Err(EIO)
                 };
+            }
+            // Render used to stash pre-power QID configuration forever: the
+            // late-SKSM diagnostic was reachable only from compute's polling
+            // path. When explicitly enabled, retry from this render poll; the
+            // register helper returns EAGAIN until the powered read-path
+            // predicate says the tag/data aperture is decoded.
+            if !late_sksm_done {
+                match self.mutex().lock().replay_deferred_render_sksm() {
+                    Ok(issued) => {
+                        pr_info!(
+                            "G17P render: late SKSM replay issued {} deferred pair(s)\n",
+                            issued,
+                        );
+                        late_sksm_done = true;
+                    }
+                    Err(error) if error == EAGAIN => {}
+                    Err(error) => {
+                        pr_warn!("G17P render: late SKSM replay failed ({:?})\n", error);
+                        late_sksm_done = true;
+                    }
+                }
             }
             if started.elapsed().as_nanos() >= deadline_ns {
                 break;
@@ -299,23 +321,6 @@ impl G17PQueueLeaseState {
         self.render_slots &= !(1u8 << slot);
     }
 
-    /// Forget a departed client's claim, so a new client takes its slot before
-    /// it takes one still in use.
-    ///
-    /// Advisory only. Releasing early -- a VM with two logical queues loses its
-    /// claim when the first is destroyed -- costs nothing: the slot merely
-    /// becomes preferable to a stranger, and if the same VM comes back its
-    /// retained graph is still there, so it restages rather than rebuilds.
-    fn release_render_claim(&mut self, owner: u64) {
-        if owner == 0 {
-            return;
-        }
-        for slot in 0..G17P_RENDER_SLOTS {
-            if self.render_owner[slot] == owner {
-                self.render_owner[slot] = 0;
-            }
-        }
-    }
 }
 
 impl G17PQueueRegistry {
@@ -358,12 +363,6 @@ impl G17PQueueRegistry {
         if first_install { held.compute_install = true; }
         drop(held);
         Ok(G17PComputeLeaseGuard { registry: self.clone(), exclusive: first_install })
-    }
-
-    /// Drop a departed client's render-slot claim.
-    fn release_render_claim(&self, owner: u64) {
-        let mut held = self.lease.lock();
-        held.release_render_claim(owner);
     }
 
     /// Fold one finished render into the open window.
@@ -763,7 +762,6 @@ impl Drop for G17PQueue {
             .release_async_compute_queue(self.id);
         drop(self.async_backend.take());
         self.runtime.release_compute_owner(self.id);
-        self.registry.release_render_claim(self.vm.id());
         self.registry.release_queue();
     }
 }
