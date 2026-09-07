@@ -354,7 +354,7 @@ MODULE_PARM_DESC(shared_buffer_after_enum,
  * sequence run.  It only applies once a FIFO is actually registered, so nothing
  * before the handshake can be masked by it.
  */
-static bool shared_buffer_lossy_ack = true;
+static bool shared_buffer_lossy_ack;
 module_param(shared_buffer_lossy_ack, bool, 0644);
 MODULE_PARM_DESC(shared_buffer_lossy_ack,
 		 "Once a shared FIFO is registered, treat an unanswered comm command as delivered rather than failed");
@@ -532,6 +532,26 @@ struct dchid_shmem_fifo {
 	u32 last_tail;
 	bool seen;
 };
+
+static size_t dchid_fifo_readable(u32 producer, u32 consumer, size_t capacity)
+{
+	if (producer >= capacity || consumer >= capacity)
+		return 0;
+
+	return producer >= consumer ? producer - consumer :
+		capacity - consumer + producer;
+}
+
+static void dchid_fifo_copy(void *dst, const void *src, size_t capacity,
+			    size_t offset, size_t length)
+{
+	u8 *out = dst;
+	const u8 *ring = src;
+	size_t first = min(length, capacity - offset);
+
+	memcpy(out, ring + offset, first);
+	memcpy(out + first, ring, length - first);
+}
 
 struct dchid_init_block_hdr {
 	u16 type;
@@ -1502,6 +1522,11 @@ static int dchid_register_shared_fifo(struct dockchannel_hid *dchid,
 	int ret;
 
 	BUILD_BUG_ON(sizeof(msg) != 15);
+	if (shared_buffer_size < 9) {
+		dev_err(dchid->dev, "Shared FIFO size %u is smaller than its 8-byte header\n",
+			shared_buffer_size);
+		return -EINVAL;
+	}
 
 	buf = dmam_alloc_coherent(dchid->dev, shared_buffer_size, &addr,
 				  GFP_KERNEL);
@@ -1550,12 +1575,7 @@ static int dchid_register_shared_fifo(struct dockchannel_hid *dchid,
 		 index, &addr, shared_buffer_size, shared_buffer_unk1,
 		 shared_buffer_unk2, ret);
 
-	/*
-	 * A missing acknowledgement is not a failure here: the registration has
-	 * demonstrably taken effect by the time the command times out, and
-	 * failing the handshake would only send us round again.
-	 */
-	return 0;
+	return ret;
 }
 
 static void dchid_shmem_poll_work(struct work_struct *ws)
@@ -2551,12 +2571,141 @@ static void dchid_handle_ack(struct dchid_iface *iface, struct dchid_hdr *hdr, v
 	complete(&iface->out_complete);
 }
 
+static void dchid_dispatch_packet(struct dockchannel_hid *dchid,
+				  struct dchid_hdr *hdr, void *data)
+{
+	struct dchid_iface *iface;
+	struct dchid_work *work;
+
+	if (hdr->iface >= MAX_INTERFACES) {
+		dchid_dump_packet(dchid, hdr, data, "Bad iface");
+		return;
+	}
+
+	iface = dchid->ifaces[hdr->iface];
+	if (!iface) {
+		dev_err(dchid->dev, "Received packet for uninitialized iface %d\n",
+			hdr->iface);
+		return;
+	}
+
+	if (packet_trace)
+		dchid_dump_packet(dchid, hdr, data, "Packet");
+
+	switch (hdr->channel) {
+	case DCHID_CHANNEL_CMD:
+		dchid_handle_ack(iface, hdr, data);
+		return;
+	case DCHID_CHANNEL_REPORT:
+		break;
+	case DCHID_CHANNEL_NOP:
+		/*
+		 * macOS consumes type zero without dispatching it.  Its read
+		 * completion then drains every shared FIFO, which the caller does
+		 * after this returns.
+		 */
+		if (packet_trace)
+			dchid_dump_packet(dchid, hdr, data, "No-op packet");
+		return;
+	default:
+		dchid_dump_packet(dchid, hdr, data, "Unknown message type");
+		return;
+	}
+
+	work = kzalloc(sizeof(*work) + hdr->length, GFP_KERNEL);
+	if (!work)
+		return;
+
+	work->hdr = *hdr;
+	work->iface = iface;
+	memcpy(work->data, data, hdr->length);
+	INIT_WORK(&work->work, dchid_packet_work);
+	queue_work(iface->wq, &work->work);
+}
+
+/*
+ * AppleHIDTransportProtocolSCMFIFO drains every shared read FIFO after every
+ * completed DockChannel read.  Each ring has two little-endian u32 indices,
+ * followed by a byte ring of size total_size - 8.  MTP advances producer and
+ * the host publishes consumer after it has copied a complete SCM message.
+ */
+static void dchid_drain_shared_fifos(struct dockchannel_hid *dchid)
+{
+	unsigned int i;
+
+	for (i = 0; i < dchid->nr_fifos; i++) {
+		struct dchid_shmem_fifo *fifo = &dchid->fifos[i];
+		u32 *indices = fifo->buf;
+		u8 *ring = fifo->buf + 8;
+		size_t capacity = fifo->size - 8;
+
+		for (;;) {
+			struct dchid_hdr hdr;
+			u32 producer, consumer;
+			size_t available, packet_size;
+			u8 *packet;
+
+			dma_rmb();
+			producer = le32_to_cpu(READ_ONCE(indices[0]));
+			consumer = le32_to_cpu(READ_ONCE(indices[1]));
+			available = dchid_fifo_readable(producer, consumer,
+							 capacity);
+
+			if (producer >= capacity || consumer >= capacity) {
+				dev_err(dchid->dev,
+					"Shared FIFO #%u has invalid indices producer=%u consumer=%u capacity=%zu\n",
+					i, producer, consumer, capacity);
+				break;
+			}
+			if (available < sizeof(hdr) + sizeof(u32))
+				break;
+
+			dchid_fifo_copy(&hdr, ring, capacity, consumer,
+					 sizeof(hdr));
+			if (hdr.hdr_len != sizeof(hdr) || (hdr.length & 3)) {
+				dev_err(dchid->dev,
+					"Shared FIFO #%u has invalid SCM header length=%u body=%u\n",
+					i, hdr.hdr_len, hdr.length);
+				break;
+			}
+
+			packet_size = sizeof(hdr) + hdr.length + sizeof(u32);
+			if (packet_size >= capacity) {
+				dev_err(dchid->dev,
+					"Shared FIFO #%u packet size %zu exceeds capacity %zu\n",
+					i, packet_size, capacity);
+				break;
+			}
+			if (available < packet_size)
+				break;
+
+			packet = kmalloc(packet_size, GFP_KERNEL);
+			if (!packet)
+				break;
+			dchid_fifo_copy(packet, ring, capacity, consumer, packet_size);
+
+			if (dchid_checksum(packet, packet_size) != 0xffffffff) {
+				dev_err(dchid->dev,
+					"Shared FIFO #%u checksum mismatch\n", i);
+				kfree(packet);
+				break;
+			}
+
+			memcpy(&hdr, packet, sizeof(hdr));
+			dchid_dispatch_packet(dchid, &hdr, packet + sizeof(hdr));
+			kfree(packet);
+
+			consumer = (consumer + packet_size) % capacity;
+			dma_wmb();
+			WRITE_ONCE(indices[1], cpu_to_le32(consumer));
+		}
+	}
+}
+
 static void dchid_handle_packet(void *cookie, size_t avail)
 {
 	struct dockchannel_hid *dchid = cookie;
 	struct dchid_hdr hdr;
-	struct dchid_work *work;
-	struct dchid_iface *iface;
 	u32 checksum;
 
 	dchid_arm_handshake(dchid, shared_buffer_delay_ms);
@@ -2585,88 +2734,8 @@ static void dchid_handle_packet(void *cookie, size_t avail)
 		goto done;
 	}
 
-
-	/*
-	 * This used to log and carry on, indexing the array with the very value
-	 * it had just rejected.
-	 */
-	if (hdr.iface >= MAX_INTERFACES) {
-		dchid_dump_packet(dchid, &hdr, dchid->pkt_buf, "Bad iface");
-		goto done;
-	}
-
-	iface = dchid->ifaces[hdr.iface];
-
-	if (!iface) {
-		dev_err(dchid->dev, "Received packet for uninitialized iface %d\n", hdr.iface);
-		goto done;
-	}
-
-	if (packet_trace)
-		dchid_dump_packet(dchid, &hdr, dchid->pkt_buf, "Packet");
-
-	switch (hdr.channel) {
-		case DCHID_CHANNEL_CMD:
-			dchid_handle_ack(iface, &hdr, dchid->pkt_buf);
-			goto done;
-		case DCHID_CHANNEL_REPORT:
-			break;
-		case DCHID_CHANNEL_NOP:
-			/*
-			 * Not an error and not a reply.  On macOS every read
-			 * completion drains the shared FIFOs regardless of what
-			 * arrived, so this is the nearest thing the transport
-			 * has to a doorbell - which makes the state of the ring
-			 * at this instant the only sample worth having.
-			 */
-			dchid_dump_packet(dchid, &hdr, dchid->pkt_buf,
-					  "No-op packet");
-			dchid_dump_shmem(dchid, false);
-			if (lenient_ack && iface->out_report != -1)
-				dchid_complete_bare(iface, &hdr,
-						    "No-op taken as a reply");
-			goto done;
-		default:
-			dchid_dump_packet(dchid, &hdr, dchid->pkt_buf,
-					  "Unknown message type");
-			/*
-			 * An empty packet could as easily be a doorbell saying
-			 * the shared FIFOs have something in them as it could
-			 * be a reply.  Read the ring at the instant it arrives,
-			 * which is the only sample that can tell those apart -
-			 * the one taken five seconds later cannot.
-			 */
-			dchid_dump_shmem(dchid, false);
-			/*
-			 * MTP answers a shared-FIFO registration on a channel
-			 * this driver has never seen, so an unrecognised packet
-			 * that turns up while a command is outstanding is far
-			 * more likely to be that command's answer than a report.
-			 * Handle it inline, on the receive path: routing it to
-			 * the interface workqueue put it behind whatever work
-			 * was already queued there, which is how a reply that
-			 * arrived in 80us came to be looked at five seconds late.
-			 */
-			if (lenient_ack && iface->out_report != -1) {
-				dchid_handle_ack(iface, &hdr, dchid->pkt_buf);
-				goto done;
-			}
-			dev_warn(dchid->dev,
-				 "Unknown channel 0x%x with nothing outstanding, treating as report\n",
-				 hdr.channel);
-			break;
-	}
-
-	work = kzalloc(sizeof(*work) + hdr.length, GFP_KERNEL);
-	if (!work)
-		return;
-
-	work->hdr = hdr;
-	work->iface = iface;
-	memcpy(work->data, dchid->pkt_buf, hdr.length);
-	INIT_WORK(&work->work, dchid_packet_work);
-
-	queue_work(iface->wq, &work->work);
+	dchid_dispatch_packet(dchid, &hdr, dchid->pkt_buf);
+	dchid_drain_shared_fifos(dchid);
 
 done:
 	dockchannel_await(dchid->dc, dchid_handle_packet, dchid, sizeof(struct dchid_hdr));
