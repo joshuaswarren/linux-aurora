@@ -46,6 +46,15 @@ assert "G17PRenderQueuePair::SLOT_COUNT" in select
 assert "self.parked_render_slots[current_slot] = Some(current)" in select
 assert ".unwrap_or_default()" in select
 
+# The manager contains the active render owner and two complete parked state
+# images. It must be initialized directly in its KBox: building `Self` by
+# value grows the probe frame beyond the arm64 kernel stack once nested under
+# boot_initial_session.
+constructor = function(manager, "pub(crate) fn new_with_uat(")
+assert "KBox::init(" in constructor
+assert "try_init!(Self {" in constructor
+assert "KBox::new(\n            Self {" not in constructor
+
 outer = function(resources, "pub(crate) fn publish_partial_opening_pair<")
 assert "queue_pair.fragment as u8" in outer
 assert "queue_pair.tiling as u8" in outer

@@ -1590,8 +1590,15 @@ impl G17PManagerConstruction {
             }
         };
 
-        Ok(KBox::new(
-            Self {
+        // Keep the complete manager value off the probe task's stack.  The
+        // two-slot owner contains three render-state images (active plus two
+        // parked slots); constructing `Self` by value made rustc reserve
+        // 0x3a40 bytes in this function, on top of boot_initial_session's
+        // 0x890-byte caller frame.  That exceeds arm64's 16 KiB kernel stack
+        // before RTKit/initdata can return from module probe.  An in-place
+        // initializer writes every field directly into the final allocation.
+        KBox::init(
+            try_init!(Self {
                 resources,
                 #[cfg(CONFIG_DEV_COREDUMP)]
                 trace_capture,
@@ -1624,9 +1631,9 @@ impl G17PManagerConstruction {
                 compute_stamp_armed: false,
                 compute_stamp_waits: AtomicU32::new(0),
                 compute_stamp_misses: AtomicU32::new(0),
-            },
+            }),
             GFP_KERNEL,
-        )?)
+        )
     }
 
     /// Large prepared-source observation before FList and outer publication.
