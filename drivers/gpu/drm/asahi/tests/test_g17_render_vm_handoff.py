@@ -28,8 +28,8 @@ assert "self.render_bind.take().ok_or(EIO)?" in handoff
 assert "self.render_context_aliases.take()" in handoff
 assert "self.render_storage.take().ok_or(ENODEV)?" in handoff
 assert "release_client_context" not in handoff
-assert "completion_references_descriptor_range(&range)" in preserve
 assert ".push_within_capacity(previous)" in preserve
+assert "completion_references_descriptor_range" not in preserve
 assert "self.retired_render_handoff_graph = Some(retired)" in handoff
 assert "install_t8140_native_context_aliases" not in handoff
 assert "incoming VM builds a new root" in handoff

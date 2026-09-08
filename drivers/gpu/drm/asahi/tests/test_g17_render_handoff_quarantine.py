@@ -39,12 +39,10 @@ for owner in (
     assert owner in handoff
 assert "release_client_context" not in handoff
 assert "unreserve_render_storage_hardware_buffer_id" not in handoff
-assert "completion_references_descriptor_range(&range)" in preserve
 assert ".push_within_capacity(previous)" in preserve
+assert "completion_references_descriptor_range" not in preserve
 assert "self.retired_render_handoff_graph = Some(retired)" in handoff
-assert preserve.index("completion_references_descriptor_range(&range)") < preserve.index(
-    "Self::release_retired_handoff_graph("
-)
+assert "Self::release_retired_handoff_graph(" not in preserve
 
 release = function("fn release_retired_handoff_graph(")
 assert release.index("ids.unreserve(id)") < release.index("drop(retired)")
@@ -61,7 +59,6 @@ class Quarantine:
         self.retired = None
         self.completion_quarantine = []
         self.reserved = set()
-        self.referenced = set()
 
     def build(self, generation):
         assert generation not in self.reserved
@@ -73,25 +70,23 @@ class Quarantine:
         self.retired = self.active
         self.active = None
         if previous is not None:
-            if previous in self.referenced:
-                self.completion_quarantine.append(previous)
-            else:
-                self.reserved.remove(previous)
+            self.completion_quarantine.append(previous)
 
     def overwrite_completion(self, generation):
-        self.referenced.remove(generation)
-        if generation in self.completion_quarantine:
-            self.completion_quarantine.remove(generation)
-            self.reserved.remove(generation)
+        assert generation in self.completion_quarantine
+
+    def stop_processors(self):
+        self.active = None
+        self.retired = None
+        self.completion_quarantine.clear()
+        self.reserved.clear()
 
 
 state = Quarantine()
 state.build(1)
-state.referenced.add(1)
 state.handoff()
 assert state.retired == 1 and state.reserved == {1}
 state.build(2)
-state.referenced.add(2)
 assert state.reserved == {1, 2}
 state.handoff()
 assert state.retired == 2 and state.completion_quarantine == [1]
@@ -99,6 +94,8 @@ assert state.reserved == {1, 2}
 state.build(3)
 assert state.reserved == {1, 2, 3}
 state.overwrite_completion(1)
-assert state.reserved == {2, 3}
+assert state.reserved == {1, 2, 3}
+state.stop_processors()
+assert not state.reserved
 
-print("PASS completion-referenced retired-render graph quarantine and teardown ownership")
+print("PASS session-retained render graph quarantine and processor-stop teardown")
