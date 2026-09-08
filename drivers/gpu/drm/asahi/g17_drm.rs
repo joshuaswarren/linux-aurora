@@ -482,7 +482,23 @@ impl G17PRenderCompletion {
 
     pub(crate) fn fence(&self) -> Fence { Fence::from_fence(&self.fence) }
 
+    /// Report failure without claiming that firmware stopped using this job.
+    /// The runtime must retain this completion through queue retirement or
+    /// processor stop. In particular, an error fence is not an unmap witness.
+    pub(crate) fn fail_while_owned(&self, error: Error) {
+        if self.signalled.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return;
+        }
+        self.status.record(error.to_errno());
+        self.fence.set_error(error);
+        // Retain BOTH guards: dropping the lease here also lets a waiter
+        // reacquire this physical slot before quarantine is recorded.
+        self.fence.signal();
+    }
+
     /// Signal at most once even when both RTKit roles report the same event.
+    /// The caller must prove retirement, processor stop, or no publication.
+    /// Unresolved hardware failures must use `fail_while_owned` instead.
     pub(crate) fn complete(
         &self,
         result: Result<g17_completion::PairedRenderCompletion>,

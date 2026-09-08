@@ -68,10 +68,10 @@ assert "signal.complete(Ok(observed));" in timeout, \
     'watchdog cannot salvage a completion that became visible after the event edge'
 assert ") -> bool {" in timeout and "return !retired;" in timeout, \
     'watchdog does not report whether firmware still owns the slot'
-signal_error = timeout.index("signal.complete(Err(if retired { EIO } else { error }));")
+signal_error = timeout.index("signal.fail_while_owned(error);")
 quarantine = timeout.index("quarantined_render_completions", signal_error)
 assert signal_error < quarantine
-assert "if !retired" in timeout[signal_error:quarantine], \
+assert "if retired {\n                signal.complete(Err(EIO));\n            } else {" in timeout[:signal_error], \
     'lost render drops its VM guard without proving firmware retirement'
 
 # Runtime recovery may free an unresolved render's VM guard only after both

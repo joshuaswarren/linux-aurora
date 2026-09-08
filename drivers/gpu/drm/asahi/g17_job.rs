@@ -82,6 +82,20 @@ impl G17PJobCompletion {
 
     pub(crate) fn gpu_address(&self) -> u64 { self.timestamps.iova() }
     pub(crate) fn fence(&self) -> Fence { Fence::from_fence(&self.fence) }
+
+    /// Wake error waiters while retaining the VM-job pin in the quarantined
+    /// packet. Neither an error fence nor retaining an otherwise emptied Arc
+    /// proves that firmware has finished dereferencing userspace mappings.
+    pub(crate) fn fail_while_owned(&self, error: Error) {
+        if self.signalled.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return;
+        }
+        self.status.record(error.to_errno());
+        self.fence.set_error(error);
+        self.fence.signal();
+    }
+
+    /// Only for retired work, proven processor stop, or unsubmitted packets.
     pub(crate) fn complete(&self, result: Result<[u64; 2]>) {
         if self.signalled.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
             return;

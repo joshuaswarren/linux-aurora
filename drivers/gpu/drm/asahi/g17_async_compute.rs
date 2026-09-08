@@ -201,7 +201,7 @@ impl G17PLiveRuntime {
                 Err(error) => {
                     q.quarantined = true;
                     q.active.as_ref().ok_or(EIO)?._lease.quarantine();
-                    q.active.as_ref().ok_or(EIO)?.packet.completion()?.complete(Err(error));
+                    q.active.as_ref().ok_or(EIO)?.packet.completion()?.fail_while_owned(error);
                 }
             }
         }
@@ -269,7 +269,7 @@ impl G17PLiveRuntime {
                 let Some(active) = q.active.as_ref() else { continue };
                 active._lease.quarantine();
                 if let Ok(completion) = active.packet.completion() {
-                    completion.complete(Err(error));
+                    completion.fail_while_owned(error);
                 }
             }
             failed += 1;
@@ -315,7 +315,7 @@ impl G17PLiveRuntime {
                         if let Some(manager) = self.manager.as_mut() {
                             let _ = manager.dump_compute_completion_records("async-timeout");
                         }
-                        if let Ok(completion) = active.packet.completion() { completion.complete(Err(error)); }
+                        if let Ok(completion) = active.packet.completion() { completion.fail_while_owned(error); }
                     }
                     return true;
                 }
