@@ -47,11 +47,11 @@ tests+=r'''
  }
  assert!(arena.end-cursor>=0x4000000); // at least64MiB for render/runtime
  assert!(g17p_cl_client_low_va_range().end-g17p_cl_client_low_va_range().start>=0xc0000000);
- // 55, not 58: contexts 60..62 are reserved as the UAT bind band so more
- // than one client VM can be rooted for execution at a time.
- assert_eq!(crate::g17_queue_limits::MAX_QUEUES,55);
- assert_eq!(crate::g17_queue_limits::encode_limits()[..8],[55,0,0,0,1,0,0,0]);
- assert_eq!(crate::g17_queue_limits::BIND_CONTEXT_FIRST,60);
+ // Context 1 owns the global FList; every hardware-valid app-GART context
+ // 5..62 is available to a logical queue without a second bind selector.
+ assert_eq!(crate::g17_queue_limits::MAX_QUEUES,58);
+ assert_eq!(crate::g17_queue_limits::encode_limits()[..8],[58,0,0,0,1,0,0,0]);
+ assert_eq!(crate::g17_queue_limits::BIND_CONTEXT_FIRST,63);
  assert_eq!(crate::g17_queue_limits::COMPUTE_CONTEXT_MASK
   &crate::g17_queue_limits::BIND_CONTEXT_MASK,0);
  assert_eq!(crate::g17_queue_limits::BIND_CONTEXT_MASK

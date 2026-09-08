@@ -10318,6 +10318,10 @@ struct G17MappedResources {
     control_operand_page_lists: RenderBackingObject,
     control_operand_table: RenderBackingObject,
     control_operand_buffers: KVec<RenderBackingObject>,
+    /// Stable context-1 presentation of the device-global render FList.
+    /// Native firmware dereferences the operand-table cookie through context
+    /// 1 even when the command descriptor names another app-GART context.
+    render_global_flist_mappings: KVec<mmu::KernelMapping>,
     // Allocated on actual compute use. Render retains its original pool,
     // page-list, grow state and cached aliases throughout mode switches.
     compute_operand_page_lists: Option<RenderBackingObject>,
@@ -10961,6 +10965,47 @@ impl G17ResourceOwner {
             };
             control_operand_buffers.push(object, GFP_KERNEL)?;
         }
+        let render_global_vm = address_space.uat.t8140_render_global_vm()?;
+        let global_flist_mapping_count = 2usize
+            .checked_add(G17P_CONTROL_OPERAND_ACTIVE_BLOCK_COUNT)
+            .ok_or(EOVERFLOW)?;
+        let mut render_global_flist_mappings =
+            KVec::with_capacity(global_flist_mapping_count, GFP_KERNEL)?;
+        render_global_flist_mappings.push(
+            control_operand_page_lists.map_at(
+                render_global_vm,
+                G17P_CONTROL_DIRECTORY_VA,
+                mmu::PROT_GPU_SHARED_RW,
+            )?,
+            GFP_KERNEL,
+        )?;
+        render_global_flist_mappings.push(
+            control_operand_table.map_at(
+                render_global_vm,
+                G17P_CONTROL_OPERAND_TABLE_VA,
+                mmu::PROT_GPU_SHARED_RW,
+            )?,
+            GFP_KERNEL,
+        )?;
+        for (index, object) in control_operand_buffers
+            .iter_mut()
+            .take(G17P_CONTROL_OPERAND_ACTIVE_BLOCK_COUNT)
+            .enumerate()
+        {
+            render_global_flist_mappings.push(
+                object.map_at(
+                    render_global_vm,
+                    g17p_control_operand_buffer_va(index).ok_or(EINVAL)?,
+                    mmu::PROT_GPU_SHARED_RW,
+                )?,
+                GFP_KERNEL,
+            )?;
+        }
+        dev_info!(
+            dev.as_ref(),
+            "G17P resources: context-1 global FList closure mapped (directory, table, {} active buffers)\n",
+            G17P_CONTROL_OPERAND_ACTIVE_BLOCK_COUNT,
+        );
         dev_info!(
             dev.as_ref(),
             "G17P resources: prepared compute FList page lists at {:#x}+{:#x}, operand table at {:#x}+{:#x}, {} buffers at {:#x}\n",
@@ -11620,6 +11665,7 @@ impl G17ResourceOwner {
                 control_operand_page_lists,
                 control_operand_table,
                 control_operand_buffers,
+                render_global_flist_mappings,
                 compute_operand_page_lists: None,
                 compute_operand_table: None,
                 compute_operand_buffers: KVec::new(),

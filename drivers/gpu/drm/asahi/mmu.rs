@@ -128,23 +128,15 @@ const T8140_APP_CONTEXT_START: usize = 5;
 const T8140_APP_CONTEXT_RESERVED_MASK: u64 = (1u64 << T8140_APP_CONTEXT_START) - 1;
 const T8140_APP_CONTEXT_AVAILABLE_MASK: u64 = !T8140_APP_CONTEXT_RESERVED_MASK;
 
-/// How many user VMs may hold a T8140 UAT binding at once.
-///
-/// A binding owns a hardware context outright, so this is the number of
-/// distinct client address spaces that can be rooted for execution at the same
-/// time. Slot 0 is the opening pair's context 1; the rest come from the
-/// reserved bind band in `g17_queue_limits`, which the application-GART and
-/// compute-execution allocators are masked out of.
+/// Bootstrap-only T8140 UAT binding count. Ordinary jobs retain context 1 as
+/// the global FList root and use independently allocated app-GART contexts.
 const T8140_BIND_SLOTS: usize =
     1 + crate::g17_queue_limits::BIND_CONTEXT_COUNT as usize;
 
 /// Hardware context for one T8140 UAT bind slot, or `None` above the pool.
 ///
-/// Slot 0 maps to context 1 so a single-client session is byte-identical to
-/// the measured first-partial opening: `render_root_slot == 1`,
-/// `render_context_id == 1`, and the ctx0/ctx1 root-phase machine below all
-/// still describe it. Contexts 0 (kernel), 2/3 (the compute kick's declared
-/// contexts) and 4 (accelerator-reserved) are never bind targets.
+/// Slot 0 maps to context 1 for the measured driver-owned opening. No ordinary
+/// render or independent compute queue reaches this allocator.
 const fn t8140_bind_context(slot: u32) -> Option<usize> {
     if slot == 0 {
         Some(1)
@@ -1873,6 +1865,10 @@ pub(crate) struct Uat {
 
     kernel_vm: Vm,
     kernel_lower_vm: Vm,
+    /// Dedicated native context-1 root for the device-global FList/operand
+    /// closure. Context 0 has overlapping fixed KSM mappings, so sharing its
+    /// lower root cannot represent the render-only final operand block.
+    t8140_render_global_vm: Option<Vm>,
     _t8140_firmware_crash_buffers: Option<[KernelMapping; 2]>,
     t8140_firmware_crash_gems: Option<[ARef<gem::Object>; 2]>,
     _t8140_parameter_metrics_low: Option<KernelMapping>,
@@ -3205,6 +3201,13 @@ impl Uat {
         &self.kernel_lower_vm
     }
 
+    pub(crate) fn t8140_render_global_vm(&self) -> Result<&Vm> {
+        if self.cfg != UatConfig::T8140 {
+            return Err(EINVAL);
+        }
+        self.t8140_render_global_vm.as_ref().ok_or(EIO)
+    }
+
     /// Materialize native's required restricted process-context views in the
     /// retained lower root used by hardware context 0.
     ///
@@ -4181,26 +4184,28 @@ impl Uat {
         Ok(())
     }
 
-    /// Restore the retained context-1 low root after a completed driver-owned
-    /// bootstrap render VM drops. Firmware has retired both queues before this
-    /// transition, and subsequent user binds may replace slot 1 normally.
+    /// Install the retained device-global context-1 low root after a completed
+    /// driver-owned bootstrap render VM drops. Firmware has retired both
+    /// queues before this transition. Ordinary jobs keep context 1 stable and
+    /// execute their command data through separately allocated app-GART roots.
     pub(crate) fn restore_t8140_kernel_context_after_bootstrap_render(&self) -> Result {
         if self.cfg != UatConfig::T8140 {
             return Err(EINVAL);
         }
         let empty = self.t8140_empty_high_roots.as_ref().ok_or(EIO)?;
-        let low = self.kernel_lower_vm.ttb();
+        let context0_low = self.kernel_lower_vm.ttb();
+        let context1_low = self.t8140_render_global_vm()?.ttb();
         let inner = self.inner.lock();
         inner.handoff().lock();
         let ttbs = inner.ttbs();
         if self.t8140_context_phase.load(Ordering::Acquire) != T8140_CONTEXT_USER_OWNED
-            || ttbs[0].ttb0.load(Ordering::Acquire) != (low | TTBR_VALID)
+            || ttbs[0].ttb0.load(Ordering::Acquire) != (context0_low | TTBR_VALID)
         {
             inner.handoff().unlock();
             return Err(EIO);
         }
         ttbs[1].ttb0.store(
-            low | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT),
+            context1_low | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT),
             Ordering::Release,
         );
         ttbs[0]
@@ -4708,15 +4713,9 @@ impl Uat {
 
     /// Binds a `Vm` to a slot, preferring the last used one.
     ///
-    /// On T8140 a slot is a TTBAT context this VM owns outright, and the
-    /// number of them is [`T8140_BIND_SLOTS`], not one. Slot 0 is hardware
-    /// context 1, so the first binder still reproduces the measured
-    /// first-partial opening exactly -- `render_root_slot == 1`,
-    /// `render_context_id == 1`, the ctx0/ctx1 root-phase transitions below.
-    /// Later concurrent clients take a context from the reserved bind band
-    /// instead of waiting for the first one to go away; everything that names
-    /// the render root (the fragment MCache write-range selector) reads it
-    /// from [`VmBind::slot`] rather than assuming 1.
+    /// On T8140 this binding is reserved for the driver-owned opening at
+    /// context 1. After its retirement context 1 becomes the permanent global
+    /// FList root; ordinary queues use application-GART root leases instead.
     ///
     /// Hardware context 2 is *not* a bind target. It is the context the
     /// compute kick declares (`T8140_COMPUTE_CTXS`), published as an alias of
@@ -5262,12 +5261,26 @@ impl Uat {
         } else {
             None
         };
+        let t8140_render_global_vm = if cfg == UatConfig::T8140 {
+            Some(Vm::new(
+                dev,
+                inner.clone(),
+                IOVA_USER_BASE..uat_geometry(cfg)?.user_va_top(),
+                cfg,
+                None,
+                0x8140_1002,
+                false,
+            )?)
+        } else {
+            None
+        };
 
         let uat = Self {
             dev: dev.into(),
             cfg,
             kernel_vm,
             kernel_lower_vm,
+            t8140_render_global_vm,
             _t8140_firmware_crash_buffers: None,
             t8140_firmware_crash_gems: None,
             _t8140_parameter_metrics_low: None,
