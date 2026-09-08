@@ -3350,6 +3350,11 @@ pub(crate) struct G17PUserRenderStorage {
     /// even when it reuses an already-installed QID at a nonzero ordinal.
     /// Cleared only after the first pair using this graph completes.
     context_update_pending: bool,
+    /// Set when this complete graph is selected again after an A -> B -> A
+    /// VM handoff. Its compact DEFLAKE/AXFB leaves are deliberately still
+    /// installed in A's VM; the first restage must reuse that owned mapping
+    /// rather than trying to install another object at the same fixed VAs.
+    cached_reactivation_pending: bool,
     /// TTBAT context this render's VM is bound to (`VmBind::slot`).
     ///
     /// Distinct from `descriptor_context_id`: the descriptors execute in the
@@ -7377,6 +7382,7 @@ impl G17PUserRenderStorage {
             _command_context: Some(command_context),
             descriptor_context_id,
             context_update_pending: true,
+            cached_reactivation_pending: false,
             render_root_slot,
             staging_descriptors: None,
         })
@@ -7622,6 +7628,7 @@ impl G17PUserRenderStorage {
             Ok(())
         })?;
         self.context_update_pending = true;
+        self.cached_reactivation_pending = true;
         core::sync::atomic::fence(Ordering::SeqCst);
         Ok(())
     }
@@ -7786,18 +7793,48 @@ impl G17PUserRenderStorage {
             self.render_target_memory
                 .prepare_rt_slot(submission_ordinal, &render_layout)
         );
-        let mut next_render_state = restage_step!("render-state allocation", MappedObject::new_wc_in_range(
-            dev,
-            vm,
-            g17p_cl_client_low_va_range(),
-            render_layout.total_size,
-            if g17p_render_tvb_enabled() {
-                G17P_PM_PAGE_SIZE as u64
-            } else {
-                mmu::UAT_PGSZ as u64
-            },
-            mmu::PROT_GPU_FW_SHARED_RW,
-        ));
+        let reuse_cached_render_state = self.cached_reactivation_pending;
+        if reuse_cached_render_state
+            && (render_layout.total_size > self.render_state.logical_size
+                || render_layout.aux_fb != self.render_layout.aux_fb
+                || !self.render_user_aliases.all_reachable_from(vm))
+        {
+            dev_err!(
+                dev.as_ref(),
+                "G17P render restage: cached render-state layout is incompatible; old-size={:#x} new-size={:#x} old-aux={:#x} new-aux={:#x} aliases-reachable={} ordinal={}\n",
+                self.render_state.logical_size,
+                render_layout.total_size,
+                self.render_layout.aux_fb,
+                render_layout.aux_fb,
+                self.render_user_aliases.all_reachable_from(vm),
+                submission_ordinal,
+            );
+            return Err(ERANGE);
+        }
+        let mut next_render_generation = if reuse_cached_render_state {
+            None
+        } else {
+            let mut state = restage_step!("render-state allocation", MappedObject::new_wc_in_range(
+                dev,
+                vm,
+                g17p_cl_client_low_va_range(),
+                render_layout.total_size,
+                if g17p_render_tvb_enabled() {
+                    G17P_PM_PAGE_SIZE as u64
+                } else {
+                    mmu::UAT_PGSZ as u64
+                },
+                mmu::PROT_GPU_FW_SHARED_RW,
+            ));
+            let aliases = restage_step!("render-state aliases", G17PRenderUserAliases::new(
+                &mut state,
+                vm,
+                &render_layout,
+                self.queue_pair,
+                submission_ordinal,
+            ));
+            Some((state, aliases))
+        };
         if g17p_render_tvb_enabled() {
             let tvb = self.render_tvb.as_mut().ok_or(EIO)?;
             if tvb.logical_size < render_layout.tvb_size
@@ -7809,13 +7846,6 @@ impl G17PUserRenderStorage {
             // Native retains this pool and lets firmware recycle its pages.
             // Clearing its contents would destroy retained PM-owned state.
         }
-        let next_render_user_aliases = restage_step!("render-state aliases", G17PRenderUserAliases::new(
-            &mut next_render_state,
-            vm,
-            &render_layout,
-            self.queue_pair,
-            submission_ordinal,
-        ));
         let next_timestamps = restage_step!("timestamp allocation", MappedObject::new_wc(
             dev,
             uat,
@@ -7823,7 +7853,17 @@ impl G17PUserRenderStorage {
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
         ));
-        let render_state_va = next_render_state.iova();
+        let render_state_va = next_render_generation
+            .as_ref()
+            .map_or_else(|| self.render_state.iova(), |(state, _)| state.iova());
+        let deflake_va = next_render_generation.as_ref().map_or_else(
+            || self.render_user_aliases.deflake_va(),
+            |(_, aliases)| aliases.deflake_va(),
+        );
+        let aux_fb_va = next_render_generation.as_ref().map_or_else(
+            || self.render_user_aliases.aux_fb_va(),
+            |(_, aliases)| aliases.aux_fb_va(),
+        );
         let timestamp_va = next_timestamps.iova();
         let mut translated = *command;
         translated.parameters.context_base = G17P_RENDER_USER_BASE;
@@ -7837,7 +7877,7 @@ impl G17PUserRenderStorage {
                 &render_layout,
             ));
         }
-        translated.parameters.deflake_3 = next_render_user_aliases.deflake_va();
+        translated.parameters.deflake_3 = deflake_va;
         translated.parameters.deflake_2 = translated.parameters.deflake_3 + 0x20;
         translated.parameters.deflake_1 = translated.parameters.deflake_3 + 0x2a0;
         if let Some(scene_scratch_va) = self.scene_scratch.as_ref().map(MappedObject::iova) {
@@ -7847,7 +7887,7 @@ impl G17PUserRenderStorage {
         translated.parameters.fragment_status = self.fragment_status_low.iova();
         translated.parameters.heapmeta = render_target_heapmeta;
         translated.parameters.tpc = self.render_target_memory.tpc_va();
-        translated.parameters.aux_fb = next_render_user_aliases.aux_fb_va();
+        translated.parameters.aux_fb = aux_fb_va;
         translated.parameters.aux_fb_page_count = G17P_RENDER_AUX_FB_PAGE_COUNT;
         translated.parameters.aux_fb_flags = g17p_aux_fb_flags(translated.flags);
         translated.parameters.tilemap = render_target_tilemap;
@@ -7931,11 +7971,17 @@ impl G17PUserRenderStorage {
         {
             return Err(EFAULT);
         }
-        if !next_render_user_aliases.all_reachable_from(vm) {
+        if !next_render_generation.as_ref().map_or_else(
+            || self.render_user_aliases.all_reachable_from(vm),
+            |(_, aliases)| aliases.all_reachable_from(vm),
+        ) {
             return Err(EFAULT);
         }
         let status_flag = *crate::module_parameters::g17p_render_status_flag.value();
-        next_render_state.with_bytes_mut(|raw| {
+        let state = next_render_generation
+            .as_mut()
+            .map_or(&mut self.render_state, |(state, _)| state);
+        state.with_bytes_mut(|raw| {
             encode_g17p_render_runtime_state(
                 raw,
                 &render_layout,
@@ -8270,10 +8316,12 @@ impl G17PUserRenderStorage {
             core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         }
 
-        let old_render_state = core::mem::replace(&mut self.render_state, next_render_state);
         self.render_layout = render_layout;
-        let old_render_user_aliases =
-            core::mem::replace(&mut self.render_user_aliases, next_render_user_aliases);
+        let old_render_generation = next_render_generation.map(|(state, aliases)| {
+            let old_state = core::mem::replace(&mut self.render_state, state);
+            let old_aliases = core::mem::replace(&mut self.render_user_aliases, aliases);
+            (old_state, old_aliases)
+        });
         let old_timestamps = core::mem::replace(&mut self.timestamps, next_timestamps);
         let old_aliases = user_timestamp_aliases.map(|aliases| {
             core::mem::replace(&mut self.user_timestamp_aliases, aliases)
@@ -8286,20 +8334,18 @@ impl G17PUserRenderStorage {
         self.descriptor_context_id = descriptor_context_id;
         drop(old_aliases);
         drop(old_timestamps);
-        drop(old_render_user_aliases);
-        drop(old_render_state);
-        // The aliases above are replaced at fixed parity-selected VAs.  A
-        // render descriptor executes through its independently allocated
-        // application context, while KernelMapping::drop can invalidate only
-        // the VM's ordinary bind context.  Invalidate every TTBAT context
-        // rooted in this VM after the old leaves are removed and the new
-        // leaves are installed, before the caller publishes this descriptor.
+        drop(old_render_generation);
+        // A normal restage replaces aliases at fixed parity-selected VAs; a
+        // cached graph return keeps its already-owned aliases and backing.
+        // Invalidate every TTBAT context rooted in this VM after either
+        // transition and before the caller publishes this descriptor.
         // Otherwise the first reuse of a parity VA can observe the stale
         // invalid/old translation left by the cold staging generation.
         restage_step!(
             "application-context TLB invalidate",
             uat.flush_t8140_vm_contexts(vm)
         );
+        self.cached_reactivation_pending = false;
         if g17p_retain_staging() {
             self.staging_descriptors = Some(next_descriptors);
         }
