@@ -4164,21 +4164,38 @@ impl G17PLiveRuntime {
         // Disjoint field borrows: `registers` and `manager` are separate fields,
         // so a shared borrow of one alongside a mutable borrow of the other is
         // accepted. The SKSM half of a render submit needs both.
-        let registers = self.registers.as_ref().ok_or(ENODEV)?;
-        let prepared = self
-            .manager
-            .as_mut()
-            .ok_or(ENODEV)?
-            .begin_translated_render(
-                &drm,
-                vm,
-                queue_pair,
-                execution_context,
-                command,
-                timestamps,
-                timestamp_aliases,
-                registers,
-            )?;
+        let prepared = {
+            let registers = self.registers.as_ref().ok_or(ENODEV)?;
+            self.manager
+                .as_mut()
+                .ok_or(ENODEV)?
+                .begin_translated_render(
+                    &drm,
+                    vm,
+                    queue_pair,
+                    execution_context,
+                    command,
+                    timestamps,
+                    timestamp_aliases,
+                    registers,
+                )
+        };
+        // `ensurePoweredHardware(true)` is a scoped native prerequisite. The
+        // firmware's IdlePowerOff(1) record is our equivalent hold: keep it
+        // asserted across graph construction and direct KSMFE registration,
+        // then restore ordinary idle policy before any work doorbell.
+        if needs_direct_registration {
+            if let Err(error) = self.release_g17p_render_registration_power() {
+                if let Some(pdev) = self.pdev.as_ref() {
+                    dev_warn!(
+                        pdev.as_ref(),
+                        "G17P render registration: failed to release scoped power hold ({:?}); keeping the cores inhibited\n",
+                        error,
+                    );
+                }
+            }
+        }
+        let prepared = prepared?;
         // Arm the exact fence after the tracker has been reset for this group,
         // but before any control or work doorbell can report its retirement.
         self.install_render_completion(render_slot, completion)?;
@@ -4965,12 +4982,14 @@ impl G17PLiveRuntime {
     ///
     /// The GPU cores may nevertheless have independently entered firmware
     /// idle-off while the two processors remain alive. Linux has no IOGPU PM
-    /// callback to hold that gate across queue construction, so only in that
-    /// cold case publish the firmware-proven IdlePowerOff(0) power request and
-    /// synchronously observe both its channel-12 retirement and the powered
-    /// GPC aperture. This runs before render storage, QoS, tag-15, either
-    /// outer command, or a completion fence is staged; failure therefore
-    /// cannot expose a partially registered pair to firmware.
+    /// callback to hold that gate across queue construction, so publish the
+    /// firmware-proven IdlePowerOff(0) power request when necessary and then
+    /// an IdlePowerOff(1) inhibit record. The latter is the scoped equivalent
+    /// of native's retained power provider: it prevents the aperture from
+    /// disappearing between the preflight and the direct pair transaction.
+    /// Both records run before render storage, QoS, tag-15, either outer
+    /// command, or a completion fence is staged; failure therefore cannot
+    /// expose a partially registered pair to firmware.
     fn ensure_g17p_render_registration_power(&mut self) -> Result {
         let pdev = self.pdev.as_ref().cloned().ok_or(ENODEV)?;
         let providers_retained = self.cpus.is_some()
@@ -4991,22 +5010,71 @@ impl G17PLiveRuntime {
             );
             return Err(EIO);
         }
-        if self
-            .registers
-            .as_ref()
-            .ok_or(ENODEV)?
-            .g17p_sksm_configuration_port_powered()
-        {
-            return Ok(());
-        }
+        // A power-on record stores zero into the idle policy before raising
+        // the cores, while the following inhibit stores one but does not raise
+        // an already-idle core. Observe retirement separately from the final
+        // powered state and repeat the pair if the core happened to descend in
+        // that narrow interval. Once inhibit has retired while powered, the
+        // state cannot disappear under graph construction.
+        for attempt in 0..3 {
+            if !self
+                .registers
+                .as_ref()
+                .ok_or(ENODEV)?
+                .g17p_sksm_configuration_port_powered()
+            {
+                let publication = self.publish_g17p_render_registration_power_record(
+                    g17_initdata::DEVICE_CONTROL_IDLE_POWER_OFF_ARG_POWER_ON,
+                )?;
+                self.wait_g17p_render_registration_power_record(
+                    publication.producer_after,
+                    false,
+                    "power-on",
+                )?;
+            }
 
+            let hold = self.publish_g17p_render_registration_power_record(
+                g17_initdata::DEVICE_CONTROL_IDLE_POWER_OFF_ARG_INHIBIT,
+            )?;
+            self.wait_g17p_render_registration_power_record(
+                hold.producer_after,
+                false,
+                "idle-inhibit",
+            )?;
+            if self
+                .registers
+                .as_ref()
+                .ok_or(ENODEV)?
+                .g17p_sksm_configuration_port_powered()
+            {
+                dev_info!(
+                    pdev.as_ref(),
+                    "G17P render registration: scoped GPU power hold active through fresh pair construction (control target {}, attempt {})\n",
+                    hold.producer_after,
+                    attempt + 1,
+                );
+                return Ok(());
+            }
+        }
+        dev_err!(
+            pdev.as_ref(),
+            "G17P render registration: core did not remain powered after three ordered power-on/inhibit transactions; no pair publication attempted\n",
+        );
+        let _ = self.release_g17p_render_registration_power();
+        Err(EAGAIN)
+    }
+
+    fn publish_g17p_render_registration_power_record(
+        &mut self,
+        arg: u32,
+    ) -> Result<g17_resources::G17PDeviceControlPublication> {
         let publication = self
             .manager
             .as_mut()
             .ok_or(ENODEV)?
             .publish_primary_device_control_record(
                 g17_initdata::DEVICE_CONTROL_OPCODE_IDLE_POWER_OFF,
-                g17_initdata::DEVICE_CONTROL_IDLE_POWER_OFF_ARG_POWER_ON,
+                arg,
             )?;
         fence(Ordering::SeqCst);
         Pin::new(self.gfx_rtkit.as_mut().ok_or(ENODEV)?)
@@ -5014,6 +5082,16 @@ impl G17PLiveRuntime {
                 g17_rtkit::ENDPOINT_GFX_INTERRUPTS,
                 g17_rtkit::encode_primary_device_control(),
             )?;
+        Ok(publication)
+    }
+
+    fn wait_g17p_render_registration_power_record(
+        &mut self,
+        target: u32,
+        require_powered: bool,
+        label: &'static str,
+    ) -> Result {
+        let pdev = self.pdev.as_ref().cloned().ok_or(ENODEV)?;
 
         for elapsed_ms in 0..G17P_POWER_WIRE_POLLS {
             if self.is_crashed() {
@@ -5029,18 +5107,20 @@ impl G17PLiveRuntime {
                 .ok_or(ENODEV)?
                 .control_counters()?
                 .primary
-                == [publication.producer_after; 3];
+                == [target; 3];
             let powered = self
                 .registers
                 .as_ref()
                 .ok_or(ENODEV)?
                 .g17p_sksm_configuration_port_powered();
-            if retired && powered {
+            if retired && (!require_powered || powered) {
                 dev_info!(
                     pdev.as_ref(),
-                    "G17P render registration: cold GPC powered before pair construction after {}ms (control target {})\n",
+                    "G17P render registration: {} retired after {}ms (control target {}, powered={})\n",
+                    label,
                     elapsed_ms,
-                    publication.producer_after,
+                    target,
+                    powered,
                 );
                 return Ok(());
             }
@@ -5054,12 +5134,27 @@ impl G17PLiveRuntime {
             .g17p_sksm_configuration_port_powered();
         dev_err!(
             pdev.as_ref(),
-            "G17P render registration: pre-power did not complete before construction (target={} counters={:?} powered={}); no pair publication attempted\n",
-            publication.producer_after,
+            "G17P render registration: {} did not retire before construction (target={} counters={:?} powered={}); no pair publication attempted\n",
+            label,
+            target,
             counters.primary,
             powered,
         );
         Err(ETIMEDOUT)
+    }
+
+    fn release_g17p_render_registration_power(&mut self) -> Result {
+        let release = self.publish_g17p_render_registration_power_record(
+            g17_initdata::DEVICE_CONTROL_IDLE_POWER_OFF_ARG_POWER_ON,
+        )?;
+        // Arg zero restores the ordinary idle policy and idempotently requests
+        // power-on. Do not make an already prepared submission depend on the
+        // aperture remaining powered after its direct registration completed.
+        self.wait_g17p_render_registration_power_record(
+            release.producer_after,
+            false,
+            "idle-release",
+        )
     }
 
     /// Publish the host lever that releases KSM pause reason bit 1, then

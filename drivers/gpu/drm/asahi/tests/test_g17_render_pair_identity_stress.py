@@ -37,7 +37,9 @@ submit = block(
 )
 assert "G17PRenderQueuePair::for_slot(render_slot)" in submit
 assert ".fresh_render_pair_needs_direct_registration(queue_pair)" in submit
-assert ".begin_translated_render(\n                &drm,\n                vm,\n                queue_pair," in submit
+begin_call = submit.index(".begin_translated_render(")
+assert submit.index("&drm", begin_call) < submit.index("vm", begin_call)
+assert submit.index("vm", begin_call) < submit.index("queue_pair", begin_call)
 assert "self.install_render_completion(render_slot, completion)?" in submit
 
 begin = block(

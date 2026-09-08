@@ -4571,7 +4571,7 @@ impl G17PManagerConstruction {
         // A retained graph keeps the binding it was built with; only a fresh
         // graph takes a new one, and the local drops the slot again if any
         // later step in this function fails.
-        let fresh_root_bind = if retained {
+        let mut fresh_root_bind = if retained {
             None
         } else {
             Some(
@@ -4768,6 +4768,21 @@ impl G17PManagerConstruction {
             // repeating the write.
             self.render_parameter_buffer_owner =
                 self.render_storage.as_ref().ok_or(ENODEV)?.render_pool_id();
+        }
+        // A fresh storage and its application-GART root are one reusable
+        // graph. Install that ownership before the fallible direct secondary
+        // pair registration. If power disappears before the transaction, the
+        // outer pair is still unpublished, but the next submit can safely
+        // reuse this complete graph instead of finding storage without its
+        // root and returning EBUSY forever.
+        if !retained {
+            let flist_bind = fresh_root_bind
+                .take()
+                .ok_or_else(|| Self::render_stage_fail("job-flist-bind-missing", EINVAL))?;
+            self.render_bind = Some(G17PRenderRootOwner::Job {
+                context: execution_context.clone(),
+                flist_bind,
+            });
         }
         {
             let storage = self.render_storage.as_mut().ok_or(ENODEV)?;
@@ -5030,17 +5045,8 @@ impl G17PManagerConstruction {
                 render_root_slot,
             );
         }
-        if retained {
-            if fresh_root_bind.is_some() {
-                return Err(Self::render_stage_fail("retained-bind-unexpected", EINVAL));
-            }
-        } else {
-            let flist_bind = fresh_root_bind
-                .ok_or_else(|| Self::render_stage_fail("job-flist-bind-missing", EINVAL))?;
-            self.render_bind = Some(G17PRenderRootOwner::Job {
-                context: execution_context,
-                flist_bind,
-            });
+        if fresh_root_bind.is_some() {
+            return Err(Self::render_stage_fail("fresh-bind-unconsumed", EINVAL));
         }
         let roots = self.resources.uat().t8140_compute_context_roots();
         if crate::util::g17p_verbose() {
