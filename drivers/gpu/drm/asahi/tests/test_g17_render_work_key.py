@@ -15,8 +15,8 @@ allocator = manager[start:end]
 
 for required in [
     "render_command_buffer_states: G17PCommandBufferStateAllocator",
-    "render_command_buffer_state_pairs: [Option<[u32; 2]>; 2]",
-    "allocate_active_render_command_buffer_states()",
+    "render_command_buffer_state_pairs: [Option<u32>; 2]",
+    "allocate_active_render_command_buffer_state()",
     "release_active_render_command_buffer_states()?",
     "command_buffer_state_words",
 ]:
@@ -27,42 +27,42 @@ source = f"""
 {allocator}
 
 #[test]
-fn native_empty_sequence_is_consecutive_and_skips_excluded_state() {{
+fn native_empty_sequence_is_shared_by_the_pair_and_skips_excluded_state() {{
     let mut allocator = G17PCommandBufferStateAllocator::new();
-    for expected in (0u32..62).step_by(2) {{
-        let pair = allocator.allocate_pair().unwrap();
-        assert_eq!(pair, [expected, expected + 1]);
-        assert!(allocator.release_pair(pair));
+    for expected in 0u32..63 {{
+        let word = allocator.allocate_one().unwrap();
+        assert_eq!(word, expected);
+        assert!(allocator.release_one(word));
     }}
-    assert_eq!(allocator.allocate_pair(), Some([62, 64]));
-    assert!(allocator.release_pair([62, 64]));
+    assert_eq!(allocator.allocate_one(), Some(64));
+    assert!(allocator.release_one(64));
 
     let mut full = G17PCommandBufferStateAllocator::new();
-    for _ in 0..31 {{ assert!(full.allocate_pair().is_some()); }}
-    assert_eq!(full.allocate_pair(), None);
+    for _ in 0..63 {{ assert!(full.allocate_one().is_some()); }}
+    assert_eq!(full.allocate_one(), None);
 }}
 
 #[test]
 fn exact_completion_identity_prevents_aba_release() {{
     let mut allocator = G17PCommandBufferStateAllocator::new();
-    let old = allocator.allocate_pair().unwrap();
-    assert_eq!(old, [0, 1]);
-    assert!(allocator.release_pair(old));
+    let old = allocator.allocate_one().unwrap();
+    assert_eq!(old, 0);
+    assert!(allocator.release_one(old));
     allocator.next = 64;
-    let replacement = allocator.allocate_pair().unwrap();
-    assert_eq!(replacement, [64, 65]);
-    assert!(!allocator.release_pair(old));
-    assert!(allocator.release_pair(replacement));
+    let replacement = allocator.allocate_one().unwrap();
+    assert_eq!(replacement, 64);
+    assert!(!allocator.release_one(old));
+    assert!(allocator.release_one(replacement));
 }}
 
 #[test]
 fn full_words_wrap_but_low_six_state_identity_remains_valid() {{
     let mut allocator = G17PCommandBufferStateAllocator::new();
     allocator.next = u32::MAX - 1;
-    let pair = allocator.allocate_pair().unwrap();
-    assert_eq!(pair, [u32::MAX - 1, 0]);
-    assert_eq!(pair.map(|word| word & 63), [62, 0]);
-    assert!(allocator.release_pair(pair));
+    let word = allocator.allocate_one().unwrap();
+    assert_eq!(word, u32::MAX - 1);
+    assert_eq!(word & 63, 62);
+    assert!(allocator.release_one(word));
 }}
 """
 

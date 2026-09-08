@@ -1193,7 +1193,7 @@ struct VmDriverMappings {
     mappings: KVec<KernelMapping>,
     reserved_ranges: KVec<Range<u64>>,
     simplefb: Option<KernelMapping>,
-    render_pool: Option<VmRenderPoolMappings>,
+    render_pools: [Option<VmRenderPoolMappings>; 2],
     compute_pool: Option<VmRenderPoolMappings>,
 }
 no_debug!(VmDriverMappings);
@@ -1217,7 +1217,7 @@ impl VmDriverMappings {
                 Iterator::chain(self.mappings.iter(), self.simplefb.iter()),
                 self.compute_pool.iter().flat_map(|pool| pool.mappings.iter()),
             ),
-            self.render_pool.iter().flat_map(|pool| pool.mappings.iter()),
+            self.render_pools.iter().flatten().flat_map(|pool| pool.mappings.iter()),
         )
     }
 }
@@ -2254,9 +2254,30 @@ impl Vm {
             mappings,
             reserved_ranges,
             simplefb: None,
-            render_pool: None,
+            render_pools: [None, None],
             compute_pool: None,
         });
+        Ok(())
+    }
+
+    /// Add VM-wide aliases discovered lazily by the render path. These are
+    /// shared by every render pair and must not be owned by one pair's pool,
+    /// because clearing that pool while another pair is live would unmap them.
+    pub(crate) fn append_driver_mappings(&self, mappings: KVec<KernelMapping>) -> Result {
+        if mappings.is_empty() {
+            return Ok(());
+        }
+        let mut retained = self.driver_mappings.lock();
+        let driver = Option::as_mut(&mut *retained).ok_or(EINVAL)?;
+        let added = mappings.len();
+        let length = driver.mappings.len().checked_add(added).ok_or(EOVERFLOW)?;
+        driver.mappings.reserve(added, GFP_KERNEL)?;
+        for (slot, mapping) in driver.mappings.spare_capacity_mut().iter_mut().zip(mappings) {
+            slot.write(mapping);
+        }
+        // SAFETY: reserve provided room for every exact-size input element,
+        // and the loop initialized each added slot once.
+        unsafe { driver.mappings.set_len(length); }
         Ok(())
     }
 
@@ -2264,12 +2285,13 @@ impl Vm {
     /// generation. The caller allocates pool IDs monotonically, never from a
     /// recyclable GPU address, so a new firmware session cannot reuse stale
     /// aliases merely because its backing landed at the same address.
-    pub(crate) fn render_pool_mappings_match(&self, pool_id: u64) -> bool {
+    pub(crate) fn render_pool_mappings_match(&self, render_slot: u8, pool_id: u64) -> bool {
         pool_id != 0
             && self.driver_mappings.lock().as_ref().is_some_and(|driver| {
                 driver
-                    .render_pool
-                    .as_ref()
+                    .render_pools
+                    .get(render_slot as usize)
+                    .and_then(Option::as_ref)
                     .is_some_and(|pool| pool.pool_id == pool_id)
             })
     }
@@ -2279,25 +2301,27 @@ impl Vm {
     /// GPU work and explicitly clear it before installing a different pool.
     pub(crate) fn install_render_pool_mappings(
         &self,
+        render_slot: u8,
         pool_id: u64,
         tvb_blocks: usize,
         mappings: KVec<KernelMapping>,
     ) -> Result {
-        if pool_id == 0 {
+        if pool_id == 0 || render_slot as usize >= 2 {
             return Err(EINVAL);
         }
         let mut retained = self.driver_mappings.lock();
         let driver = Option::as_mut(&mut *retained).ok_or(EINVAL)?;
-        if driver.render_pool.is_some() {
+        let pool = driver.render_pools.get_mut(render_slot as usize).ok_or(EINVAL)?;
+        if pool.is_some() {
             return Err(EBUSY);
         }
-        driver.render_pool = Some(VmRenderPoolMappings { pool_id, tvb_blocks, mappings });
+        *pool = Some(VmRenderPoolMappings { pool_id, tvb_blocks, mappings });
         Ok(())
     }
 
-    pub(crate) fn render_pool_tvb_blocks(&self, pool_id: u64) -> Option<usize> {
+    pub(crate) fn render_pool_tvb_blocks(&self, render_slot: u8, pool_id: u64) -> Option<usize> {
         if pool_id == 0 { return None; }
-        self.driver_mappings.lock().as_ref()?.render_pool.as_ref()
+        self.driver_mappings.lock().as_ref()?.render_pools.get(render_slot as usize)?.as_ref()
             .filter(|pool| pool.pool_id == pool_id).map(|pool| pool.tvb_blocks)
     }
 
@@ -2305,13 +2329,15 @@ impl Vm {
     /// Both allocation and the expected-capacity check precede mutation. The
     /// caller only publishes the enlarged PM pool after this succeeds.
     pub(crate) fn append_render_pool_mappings(
-        &self, pool_id: u64, previous_blocks: usize, tvb_blocks: usize,
+        &self, render_slot: u8, pool_id: u64, previous_blocks: usize, tvb_blocks: usize,
         mappings: KVec<KernelMapping>,
     ) -> Result {
-        if pool_id == 0 || tvb_blocks <= previous_blocks
+        if pool_id == 0 || render_slot as usize >= 2 || tvb_blocks <= previous_blocks
             || mappings.len() != tvb_blocks - previous_blocks { return Err(EINVAL); }
         let mut retained = self.driver_mappings.lock();
-        let pool = Option::as_mut(&mut *retained).and_then(|driver| driver.render_pool.as_mut())
+        let pool = Option::as_mut(&mut *retained)
+            .and_then(|driver| driver.render_pools.get_mut(render_slot as usize))
+            .and_then(Option::as_mut)
             .filter(|pool| pool.pool_id == pool_id).ok_or(EINVAL)?;
         if pool.tvb_blocks != previous_blocks { return Err(EBUSY); }
         let added = mappings.len();
@@ -2329,10 +2355,12 @@ impl Vm {
 
     /// Release an obsolete pool after its GPU references have retired. Drop
     /// outside driver_mappings: KernelMapping teardown takes the GPUVM lock.
-    pub(crate) fn clear_render_pool_mappings(&self) {
+    pub(crate) fn clear_render_pool_mappings(&self, render_slot: u8) {
         let previous = {
             let mut retained = self.driver_mappings.lock();
-            Option::as_mut(&mut *retained).and_then(|driver| driver.render_pool.take())
+            Option::as_mut(&mut *retained)
+                .and_then(|driver| driver.render_pools.get_mut(render_slot as usize))
+                .and_then(Option::take)
         };
         drop(previous);
     }
