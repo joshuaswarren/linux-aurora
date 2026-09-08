@@ -4162,12 +4162,16 @@ impl G17PLiveRuntime {
         // context and embeds its complete low-view closure there.  They no
         // longer alias, so neither an idle nor an in-flight QID4 binding is a
         // reason to hand the compute graph back before render publication.
-        self.manager.as_mut().ok_or(ENODEV)?.handoff_retained_render_vm(vm)?;
+        let descriptor_context_id = execution_context.context_id() as u16;
+        self.manager
+            .as_mut()
+            .ok_or(ENODEV)?
+            .handoff_retained_render_vm(vm, descriptor_context_id)?;
         let recycle = self
             .manager
             .as_ref()
             .ok_or(ENODEV)?
-            .retained_render_needs_recycle(vm);
+            .retained_render_needs_recycle(vm, descriptor_context_id);
         if recycle {
             g17_lifecycle::recover_persistent_runtime(self)?;
         }

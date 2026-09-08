@@ -3189,23 +3189,48 @@ impl G17PManagerConstruction {
         Ok(())
     }
 
-    /// The retained graph and global aliases must agree on the incoming VM.
-    /// A new client cannot safely reuse either owner's mappings.
-    pub(crate) fn retained_render_has_other_owner(&self, vm: &mmu::Vm) -> bool {
+    fn retained_graph_matches_owner(
+        graph: &G17PRetiredRenderGraph,
+        vm: &mmu::Vm,
+        descriptor_context_id: u16,
+    ) -> bool {
+        graph.bind.matches(vm)
+            && graph.storage.descriptor_context_id() == descriptor_context_id
+            && vm.render_pool_mappings_match(
+                graph.storage.queue_pair().slot(),
+                graph.storage.render_pool_id(),
+            )
+    }
+
+    /// The retained graph and global aliases must agree on the incoming VM and
+    /// descriptor context. A VM can own several logical queues, but each queue
+    /// receives an independent application-GART context and cannot reuse a
+    /// sibling queue's encoded render graph.
+    pub(crate) fn retained_render_has_other_owner(
+        &self,
+        vm: &mmu::Vm,
+        descriptor_context_id: u16,
+    ) -> bool {
         let graph_retained = self.render_storage.is_some();
         let aliases_retained = self.render_context_aliases.is_some();
         let retained = graph_retained || aliases_retained;
-        let graph_same_vm = !graph_retained
-            || self
-                .render_bind
-                .as_ref()
-                .is_some_and(|binding| binding.matches(vm));
+        let graph_same_owner = !graph_retained
+            || self.render_bind.as_ref().is_some_and(|binding| {
+                binding.matches(vm)
+                    && self.render_storage.as_ref().is_some_and(|storage| {
+                        storage.descriptor_context_id() == descriptor_context_id
+                            && vm.render_pool_mappings_match(
+                                storage.queue_pair().slot(),
+                                storage.render_pool_id(),
+                            )
+                    })
+            });
         let aliases_same_vm = self
             .render_context_aliases
             .as_ref()
             .map_or(true, |aliases| aliases.matches(vm));
-        let same_vm = graph_same_vm && aliases_same_vm;
-        retained && !same_vm
+        let same_owner = graph_same_owner && aliases_same_vm;
+        retained && !same_owner
     }
 
     /// Actual paired completion and FList release authorize root ownership
@@ -3274,7 +3299,11 @@ impl G17PManagerConstruction {
         Ok(())
     }
 
-    pub(crate) fn handoff_retained_render_vm(&mut self, vm: &mmu::Vm) -> Result {
+    pub(crate) fn handoff_retained_render_vm(
+        &mut self,
+        vm: &mmu::Vm,
+        descriptor_context_id: u16,
+    ) -> Result {
         // A pre-publication failure can leave this slot with no selected graph
         // while its previous graphs remain safely cached. Search that cache
         // before treating the slot as genuinely empty: constructing over a
@@ -3286,13 +3315,15 @@ impl G17PManagerConstruction {
                 .retired_render_handoff_graph
                 .as_ref()
                 .is_some_and(|graph| {
-                    graph.bind.matches(vm) && graph.storage.queue_pair().slot() == pair_slot
+                    Self::retained_graph_matches_owner(graph, vm, descriptor_context_id)
+                        && graph.storage.queue_pair().slot() == pair_slot
                 });
             let cached_index = if cached_immediate {
                 None
             } else {
                 self.retired_render_handoff_graphs.iter().position(|graph| {
-                    graph.bind.matches(vm) && graph.storage.queue_pair().slot() == pair_slot
+                    Self::retained_graph_matches_owner(graph, vm, descriptor_context_id)
+                        && graph.storage.queue_pair().slot() == pair_slot
                 })
             };
             if !cached_immediate && cached_index.is_none() {
@@ -3339,7 +3370,7 @@ impl G17PManagerConstruction {
             );
             return Ok(());
         }
-        if !self.retained_render_has_other_owner(vm) {
+        if !self.retained_render_has_other_owner(vm, descriptor_context_id) {
             return Ok(());
         }
         self.require_retired_render_owner()?;
@@ -3358,14 +3389,17 @@ impl G17PManagerConstruction {
         let cached_immediate = self
             .retired_render_handoff_graph
             .as_ref()
-            .is_some_and(|graph| graph.bind.matches(vm));
+            .is_some_and(|graph| {
+                Self::retained_graph_matches_owner(graph, vm, descriptor_context_id)
+                    && graph.storage.queue_pair().slot() == self.active_render_slot
+            });
         let cached_index = if cached_immediate {
             None
         } else {
             self.retired_render_handoff_graphs
                 .iter()
                 .position(|graph| {
-                    graph.bind.matches(vm)
+                    Self::retained_graph_matches_owner(graph, vm, descriptor_context_id)
                         && graph.storage.queue_pair().slot() == self.active_render_slot
                 })
         };
@@ -3398,7 +3432,7 @@ impl G17PManagerConstruction {
                 .retired_render_handoff_graphs
                 .iter()
                 .position(|graph| {
-                    graph.bind.matches(vm)
+                    Self::retained_graph_matches_owner(graph, vm, descriptor_context_id)
                         && graph.storage.queue_pair().slot() == self.active_render_slot
                 })
                 .ok_or(EIO)?;
@@ -3857,10 +3891,14 @@ impl G17PManagerConstruction {
         Ok(())
     }
 
-    pub(crate) fn retained_render_needs_recycle(&self, vm: &mmu::Vm) -> bool {
+    pub(crate) fn retained_render_needs_recycle(
+        &self,
+        vm: &mmu::Vm,
+        descriptor_context_id: u16,
+    ) -> bool {
         g17_lifecycle::retained_render_requires_recycle(
             self.render_storage.is_some() || self.render_context_aliases.is_some(),
-            !self.retained_render_has_other_owner(vm),
+            !self.retained_render_has_other_owner(vm, descriptor_context_id),
             self.render_submission_ordinal,
         )
     }

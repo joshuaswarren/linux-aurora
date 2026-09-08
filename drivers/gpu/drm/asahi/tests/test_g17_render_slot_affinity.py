@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Two render clients must each keep their own retained storage.
+"""Two logical render queues must each keep their own retained storage.
 
 The retained `G17PUserRenderStorage` behind a render slot -- its descriptors,
 render state, TVB pool, parameter-management graph and application-GART root --
-belongs to one VM. Handing a slot to a different VM makes
+belongs to one descriptor context. Handing a slot to a different queue makes
 `handoff_retained_render_vm` tear that whole graph down and rebuild it for the
 incoming client, and every restage in between is a chance to be refused with
 EBUSY, which Mesa reports as VK_ERROR_DEVICE_LOST.
@@ -41,18 +41,32 @@ methods = '\n'.join(item(n) for n in [
     '    fn acquire_lease(',
     '    fn quarantine_render_slot(',
 ])
+ready_lease = item('    fn acquire_ready_lease(')
+assert 'self.id' in ready_lease
+assert 'self.vm.id()' not in ready_lease
 guards = '\n'.join(item(n) for n in [
     'struct G17PLeaseGuard {',
     'impl G17PLeaseGuard {',
     'impl Drop for G17PLeaseGuard {',
 ])
 
-# Queue lifetime is shorter than VM lifetime: a client may create several
-# logical queues over the same VM. Clearing the VM's claim from any one queue's
-# Drop lets a stranger evict retained storage still owned by its siblings.
+# Releasing a frame lease must preserve the queue's retained-slot affinity.
 queue_drop = item('impl Drop for G17PQueue {')
 assert 'release_render_claim' not in queue_drop, \
-    'destroying one logical queue clears the whole VM retained-storage claim'
+    'destroying one logical queue unexpectedly clears registry affinity'
+
+manager = (Path(__file__).resolve().parents[1] / 'g17_manager.rs').read_text()
+handoff_start = manager.index('pub(crate) fn handoff_retained_render_vm(')
+handoff_end = manager.index('    fn preserve_immediate_retired_render_graph(', handoff_start)
+handoff = manager[handoff_start:handoff_end]
+assert 'descriptor_context_id: u16' in handoff
+assert 'retained_graph_matches_owner(graph, vm, descriptor_context_id)' in handoff
+matcher_start = manager.index('fn retained_graph_matches_owner(')
+matcher_end = manager.index('    /// The retained graph and global aliases', matcher_start)
+matcher = manager[matcher_start:matcher_end]
+assert 'graph.bind.matches(vm)' in matcher
+assert 'graph.storage.descriptor_context_id() == descriptor_context_id' in matcher
+assert 'vm.render_pool_mappings_match(' in matcher
 
 # The lease is what decides which retained graph a submission lands on, so the
 # real methods are compiled; everything below them is host-side scaffolding.
@@ -92,7 +106,7 @@ impl G17PQueueRegistry{
 }
 '''+guards+r'''
 
-/// Which VM's retained render storage each slot currently holds. Zero means the
+/// Which logical queue's retained render storage each slot holds. Zero means the
 /// slot has never built one.
 #[derive(Default)]
 struct RetainedStorage{owner:[u64;G17P_RENDER_SLOTS],rebuilds:u32}
@@ -100,10 +114,10 @@ impl RetainedStorage{
  /// One submission. Returns true when the incoming VM had to take over another
  /// client's slot, which in the driver means the whole graph is destroyed and
  /// rebuilt in the incoming VM before this frame can be staged.
- fn submit(&mut self,slot:u8,vm:u64)->bool{
+ fn submit(&mut self,slot:u8,queue:u64)->bool{
   let previous=self.owner[slot as usize];
-  self.owner[slot as usize]=vm;
-  if previous!=0&&previous!=vm{self.rebuilds+=1;return true}
+  self.owner[slot as usize]=queue;
+  if previous!=0&&previous!=queue{self.rebuilds+=1;return true}
   false
  }
 }
@@ -126,10 +140,10 @@ tests = r'''
  let mut storage=RetainedStorage::default();
  let mut slots=Vec::new();
  for frame in 0..32u64{
-  let vm=if frame%2==0{11}else{22};
-  let lease=r.acquire_lease(vm).unwrap();
-  storage.submit(lease.slot(),vm);
-  slots.push((vm,lease.slot()));
+  let queue=if frame%2==0{11}else{22};
+  let lease=r.acquire_lease(queue).unwrap();
+  storage.submit(lease.slot(),queue);
+  slots.push((queue,lease.slot()));
   drop(lease);
  }
  // The first frame of each client claims a slot; after that nothing may move.
@@ -169,17 +183,13 @@ tests = r'''
  drop(b);drop(a);
 }
 
-/// A client with two logical queues shares one VM, so it must share one slot
-/// instead of evicting itself.
-#[test]fn one_vm_does_not_evict_itself(){
+/// Two queues in one VM own different descriptor contexts and therefore cannot
+/// share one retained graph while both physical pairs are available.
+#[test]fn one_vm_two_queues_do_not_share_a_graph(){
  let r=G17PQueueRegistry::new();
  let first=r.acquire_lease(11).unwrap();
- let slot=first.slot();
- drop(first);
- for _ in 0..8{
-  let again=r.acquire_lease(11).unwrap();
-  assert_eq!(again.slot(),slot);
- }
+ let second=r.acquire_lease(12).unwrap();
+ assert_ne!(first.slot(),second.slot());
 }
 
 /// More clients than slots still has to make progress. A third client blocks
@@ -217,20 +227,16 @@ tests = r'''
  assert_eq!(r.acquire_lease(11).map(|l|l.slot()),Err(EIO));
 }
 
-/// Destroying one logical queue must not erase its VM's retained ownership.
-/// A VM can own several queues, and queue destruction is not VM destruction.
-#[test]fn destroying_one_queue_does_not_forget_the_vm_s_storage(){
+/// Releasing a frame must not erase its queue's retained ownership.
+#[test]fn releasing_one_frame_does_not_forget_the_queue_s_storage(){
  let r=G17PQueueRegistry::new();
  let mut storage=RetainedStorage::default();
  let owned={let l=r.acquire_lease(11).unwrap();storage.submit(l.slot(),11);l.slot()};
  let other={let l=r.acquire_lease(22).unwrap();storage.submit(l.slot(),22);l.slot()};
  assert_ne!(owned,other);
- // A sibling logical queue from VM 11 returns after the first queue object was
- // destroyed. The registry deliberately has no per-queue claim-release path:
- // only an incoming VM taking the LRU free slot may replace the retained owner.
- let sibling=r.acquire_lease(11).unwrap();
- assert_eq!(sibling.slot(),owned);
- assert!(!storage.submit(sibling.slot(),11));
+ let next_frame=r.acquire_lease(11).unwrap();
+ assert_eq!(next_frame.slot(),owned);
+ assert!(!storage.submit(next_frame.slot(),11));
 }
 
 /// Retiring a slot must wake a client already waiting for it, rather than
