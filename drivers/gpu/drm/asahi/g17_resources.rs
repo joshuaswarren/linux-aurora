@@ -3283,7 +3283,7 @@ pub(crate) struct G17PRenderSksmBacking {
 
 #[cfg(not(test))]
 impl G17PRenderSksmBacking {
-    fn matches_queue_pair(&self, pair: G17PRenderQueuePair) -> bool {
+    pub(crate) fn matches_queue_pair(&self, pair: G17PRenderQueuePair) -> bool {
         self._ta_context_global.iova() == pair.low_va(true)
             && self._fragment_context_global.iova() == pair.low_va(false)
             && self.ta_context.iova() != 0
@@ -5659,6 +5659,23 @@ impl G17PUserRenderStorage {
         self.sksm_backing.take().ok_or(EIO)
     }
 
+    pub(crate) fn sksm_backing_detached(&self) -> bool { self.sksm_backing.is_none() }
+
+    pub(crate) fn claim_sksm_backing(
+        &mut self,
+        backing: &mut Option<G17PRenderSksmBacking>,
+    ) -> Result {
+        if self.sksm_backing.is_some()
+            || !backing
+                .as_ref()
+                .is_some_and(|backing| backing.matches_queue_pair(self.queue_pair))
+        {
+            return Err(EIO);
+        }
+        self.sksm_backing = backing.take();
+        Ok(())
+    }
+
     fn descriptor_context_valid(context_id: u16) -> bool {
         // A descriptor context is a queue execution context. The bind band and
         // the render app context are owned by other allocators, so a
@@ -7570,6 +7587,41 @@ impl G17PUserRenderStorage {
             }
             Ok(())
         })?;
+        core::sync::atomic::fence(Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Reactivate a completed graph cached across a VM handoff. Its private
+    /// ring may end at an older physical-QID prefix, but no job or queue item
+    /// remains live. Advance all three cursors together to the current shared
+    /// producer and require a fresh context update when this graph is selected
+    /// again; no mapping or descriptor backing is rebuilt.
+    pub(crate) fn prepare_cached_reactivation(
+        &mut self,
+        submission_ordinal: u32,
+    ) -> Result {
+        let plan = G17PRenderItemPlan::new(
+            submission_ordinal,
+            g17p_render_tag16_enabled(),
+        )
+        .ok_or(EINVAL)?;
+        core::sync::atomic::fence(Ordering::Acquire);
+        let previous = self.snapshot()?;
+        if !previous.job_list_empty
+            || !previous.tiling.idle()
+            || !previous.fragment.idle()
+        {
+            return Err(EBUSY);
+        }
+        self.graph.with_bytes_mut(|raw| {
+            for pointers in [Self::TILING_POINTERS, Self::FRAGMENT_POINTERS] {
+                put_u32(raw, pointers, plan.base);
+                put_u32(raw, pointers + 0x30, plan.base);
+                put_u32(raw, pointers + 0x40, plan.base);
+            }
+            Ok(())
+        })?;
+        self.context_update_pending = true;
         core::sync::atomic::fence(Ordering::SeqCst);
         Ok(())
     }

@@ -3263,55 +3263,130 @@ impl G17PManagerConstruction {
         if self.render_bind.is_none() {
             return Err(EIO);
         }
-        // A second handoff used to drop the first quarantined graph
-        // unconditionally. v15 captured the resulting ABA exactly: gen5's
-        // descriptor addresses and HardwareBufferID 3 were still present in
-        // completion records when gen8 reused both, immediately followed by a
-        // slot-1/DM1 recovery. Preserve every still-referenced generation.
-        if let Some(previous) = self.retired_render_handoff_graph.take() {
-            let range = match previous.storage.descriptor_high_range() {
-                Ok(range) => range,
-                Err(error) => {
-                    self.retired_render_handoff_graph = Some(previous);
-                    return Err(error);
-                }
-            };
-            let referenced = match self
-                .resources
-                .completion_references_descriptor_range(&range)
-            {
-                Ok(referenced) => referenced,
-                Err(error) => {
-                    self.retired_render_handoff_graph = Some(previous);
-                    return Err(error);
-                }
-            };
-            if referenced {
-                if let Err(error) = self
-                    .retired_render_handoff_graphs
-                    .push_within_capacity(previous)
-                {
-                    self.retired_render_handoff_graph = Some(error.0);
-                    return Err(ENOMEM);
-                }
-            } else {
-                Self::release_retired_handoff_graph(
-                    &mut self.render_hardware_buffer_ids,
-                    Some(previous),
-                );
+
+        // Find a complete graph this physical pair previously used for the
+        // incoming VM. Its fixed render-pool leaves are still owned by that VM;
+        // constructing another graph would first clear them and then remap new
+        // backing beneath firmware-visible descriptors. Reactivate the owner
+        // instead, advancing only its idle queue cursors to the shared QID
+        // producer.
+        let cached_immediate = self
+            .retired_render_handoff_graph
+            .as_ref()
+            .is_some_and(|graph| graph.bind.matches(vm));
+        let cached_index = if cached_immediate {
+            None
+        } else {
+            self.retired_render_handoff_graphs
+                .iter()
+                .position(|graph| {
+                    graph.bind.matches(vm)
+                        && graph.storage.queue_pair().slot() == self.active_render_slot
+                })
+        };
+        if cached_immediate {
+            let cached = self.retired_render_handoff_graph.as_mut().ok_or(EIO)?;
+            if !cached.storage.sksm_backing_detached() {
+                return Err(EIO);
             }
+            cached
+                .storage
+                .prepare_cached_reactivation(self.render_submission_ordinal)?;
+        } else if let Some(index) = cached_index {
+            let cached = self.retired_render_handoff_graphs.get_mut(index).ok_or(EIO)?;
+            if !cached.storage.sksm_backing_detached() {
+                return Err(EIO);
+            }
+            cached
+                .storage
+                .prepare_cached_reactivation(self.render_submission_ordinal)?;
+            self.preserve_immediate_retired_render_graph()?;
+        } else {
+            self.preserve_immediate_retired_render_graph()?;
         }
-        self.prune_unreferenced_retired_render_graphs()?;
         self.park_render_sksm_backing_for_graph_rebuild()?;
+
+        let mut cached = if cached_immediate {
+            self.retired_render_handoff_graph.take()
+        } else if cached_index.is_some() {
+            let index = self
+                .retired_render_handoff_graphs
+                .iter()
+                .position(|graph| {
+                    graph.bind.matches(vm)
+                        && graph.storage.queue_pair().slot() == self.active_render_slot
+                })
+                .ok_or(EIO)?;
+            Some(
+                self.retired_render_handoff_graphs
+                    .remove(index)
+                    .map_err(|_| EIO)?,
+            )
+        } else {
+            None
+        };
         let retired = G17PRetiredRenderGraph {
             bind: self.render_bind.take().ok_or(EIO)?,
             context_aliases: self.render_context_aliases.take(),
             storage: self.render_storage.take().ok_or(ENODEV)?,
         };
         self.retired_render_handoff_graph = Some(retired);
+        if let Some(mut cached) = cached.take() {
+            cached.storage.claim_sksm_backing(
+                &mut self.render_sksm.as_mut().ok_or(EIO)?.backing,
+            )?;
+            let cached_vm = cached.bind.vm_id();
+            self.render_bind = Some(cached.bind);
+            self.render_context_aliases = cached.context_aliases;
+            self.render_storage = Some(cached.storage);
+            self.prune_unreferenced_retired_render_graphs()?;
+            dev_info!(self.resources.dev().as_ref(),
+                "G17P render VM handoff: reactivated retained graph vm={} at ordinal {} without clearing its render-pool mappings\n",
+                cached_vm, self.render_submission_ordinal);
+            return Ok(());
+        }
+        self.prune_unreferenced_retired_render_graphs()?;
         dev_info!(self.resources.dev().as_ref(),
             "G17P render VM handoff: quarantined retired job-private graph vm={} root={:#x}; incoming VM builds a new root at ordinal {}, QID producer state retained\n",
             old_vm_id, old_root, self.render_submission_ordinal);
+        Ok(())
+    }
+
+    fn preserve_immediate_retired_render_graph(&mut self) -> Result {
+        let Some(previous) = self.retired_render_handoff_graph.take() else {
+            return Ok(());
+        };
+        let range = match previous.storage.descriptor_high_range() {
+            Ok(range) => range,
+            Err(error) => {
+                self.retired_render_handoff_graph = Some(previous);
+                return Err(error);
+            }
+        };
+        let referenced = match self
+            .resources
+            .completion_references_descriptor_range(&range)
+        {
+            Ok(referenced) => referenced,
+            Err(error) => {
+                self.retired_render_handoff_graph = Some(previous);
+                return Err(error);
+            }
+        };
+        if referenced {
+            if let Err(error) = self
+                .retired_render_handoff_graphs
+                .push_within_capacity(previous)
+            {
+                self.retired_render_handoff_graph = Some(error.0);
+                return Err(ENOMEM);
+            }
+        } else {
+            Self::release_retired_handoff_graph(
+                &mut self.render_hardware_buffer_ids,
+                Some(previous),
+            );
+        }
         Ok(())
     }
 

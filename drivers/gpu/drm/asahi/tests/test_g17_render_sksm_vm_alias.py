@@ -6,6 +6,7 @@ from pathlib import Path
 
 root = Path(__file__).resolve().parents[1]
 resources = (root / "g17_resources.rs").read_text()
+manager = (root / "g17_manager.rs").read_text()
 
 
 def function(marker):
@@ -34,6 +35,13 @@ storage = resources[
 prepare = function("fn prepare_render_sksm_vm_alias(")
 new = function_at(resources.index("    fn new(", resources.index("impl G17PUserRenderStorage")))
 finish = function("pub(crate) fn new_user_render_storage(")
+handoff_start = manager.index("pub(crate) fn handoff_retained_render_vm(")
+handoff_pos = manager.index("{", handoff_start) + 1
+handoff_depth = 1
+while handoff_depth:
+    handoff_depth += (manager[handoff_pos] == "{") - (manager[handoff_pos] == "}")
+    handoff_pos += 1
+handoff = manager[handoff_start:handoff_pos]
 
 assert "ta_context_low: G17PRenderClientAlias" in storage
 assert "fragment_context_low: G17PRenderClientAlias" in storage
@@ -46,6 +54,15 @@ assert new.count("prepare_render_sksm_vm_alias(") == 2
 assert "skSM_vm_aliases" not in resources  # typo guard
 assert finish.index("stage_render_parameter_buffer_descriptor") < finish.index(
     "vm.append_driver_mappings(storage.take_sksm_vm_aliases())?"
+)
+assert "prepare_cached_reactivation(self.render_submission_ordinal)?" in handoff
+assert "cached.storage.claim_sksm_backing(" in handoff
+assert handoff.index("cached.storage.claim_sksm_backing(") < handoff.index(
+    "self.render_storage = Some(cached.storage)"
+)
+assert "reactivated retained graph" in handoff
+assert handoff.index("reactivated retained graph") < handoff.index(
+    "incoming VM builds a new root"
 )
 
 
