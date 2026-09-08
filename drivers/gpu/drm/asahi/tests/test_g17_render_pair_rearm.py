@@ -39,16 +39,14 @@ assert "DEVICE_CONTROL_IDLE_POWER_OFF_ARG_INHIBIT" in ensure
 assert "wait_g17p_render_registration_power_record" in ensure
 assert "DEVICE_CONTROL_IDLE_POWER_OFF_ARG_POWER_ON" in release
 
-# Once a fresh storage exists, its UAT root is graph-owned even if the direct
-# registration precondition fails. The old ordering moved this owner only
-# after outer publication, leaving storage-without-root and poisoning the next
-# attempt with EBUSY.
+# Once a fresh storage exists, its application-GART context is graph-owned even
+# if direct registration fails. There is no separate legacy bind to lose.
 bind_install = construct.index("self.render_bind = Some(G17PRenderRootOwner::Job")
 direct = construct.index("self.configure_fresh_nonbootstrap_render_pair(")
 outer = construct.index(".publish_partial_opening_pair(")
 assert bind_install < direct < outer
 assert "execution_context.clone()" in construct[bind_install - 300 : bind_install + 300]
-assert "fresh-bind-unconsumed" in construct
+assert ".bind(vm)" not in construct
 
 
 class Pair:

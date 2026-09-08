@@ -1308,7 +1308,6 @@ enum G17PRenderRootOwner {
     Bootstrap(mmu::VmBind),
     Job {
         context: Arc<mmu::T8140ComputeExecutionContext>,
-        flist_bind: mmu::VmBind,
     },
 }
 
@@ -1317,39 +1316,28 @@ impl G17PRenderRootOwner {
     fn matches(&self, vm: &mmu::Vm) -> bool {
         match self {
             Self::Bootstrap(bind) => bind.matches(vm),
-            Self::Job { context, flist_bind } => {
-                context.matches(vm) && flist_bind.matches(vm)
-            }
+            Self::Job { context } => context.matches(vm),
         }
     }
 
     fn root(&self) -> u64 {
         match self {
             Self::Bootstrap(bind) => bind.root(),
-            Self::Job { context, flist_bind } => {
-                debug_assert_eq!(context.root(), flist_bind.root());
-                flist_bind.root()
-            }
+            Self::Job { context } => context.root(),
         }
     }
 
     fn vm_id(&self) -> u64 {
         match self {
             Self::Bootstrap(bind) => bind.vm_id(),
-            Self::Job { context, flist_bind } => {
-                debug_assert_eq!(context.vm_id(), flist_bind.vm_id());
-                flist_bind.vm_id()
-            }
+            Self::Job { context } => context.vm_id(),
         }
     }
 
     fn vm(&self) -> &mmu::Vm {
         match self {
             Self::Bootstrap(bind) => bind.vm(),
-            Self::Job { context, flist_bind } => {
-                debug_assert!(context.matches(flist_bind.vm()));
-                flist_bind.vm()
-            }
+            Self::Job { context } => context.vm(),
         }
     }
 
@@ -1357,15 +1345,15 @@ impl G17PRenderRootOwner {
         match self { Self::Bootstrap(bind) => Some(bind), Self::Job { .. } => None }
     }
 
-    /// TTBAT context this owner's VM is bound to.
+    /// TTBAT context which owns this graph's VM root.
     ///
-    /// The fragment MCache write-range selector names it, so a retained graph
-    /// has to keep reporting the same value across every later submission on
-    /// it -- which the retained `VmBind` guarantees.
+    /// Native uses one allocated application-GART identity in the command
+    /// descriptor, tag-15 context and MCache selector. The retained execution
+    /// context keeps that exact root/identity stable for the graph lifetime.
     fn root_slot(&self) -> Result<u8> {
         let slot = match self {
             Self::Bootstrap(bind) => bind.slot(),
-            Self::Job { flist_bind, .. } => flist_bind.slot(),
+            Self::Job { context } => context.context_id(),
         };
         u8::try_from(slot).map_err(|_| EIO)
     }
@@ -3260,7 +3248,71 @@ impl G17PManagerConstruction {
     }
 
     pub(crate) fn handoff_retained_render_vm(&mut self, vm: &mmu::Vm) -> Result {
-        if self.render_storage.is_none() || !self.retained_render_has_other_owner(vm) {
+        // A pre-publication failure can leave this slot with no selected graph
+        // while its previous graphs remain safely cached. Search that cache
+        // before treating the slot as genuinely empty: constructing over a
+        // cached graph's fixed RT-memory/TPC addresses in the same VM is an
+        // ownership collision and deterministically returns ENOSPC.
+        if self.render_storage.is_none() {
+            let pair_slot = self.active_render_slot;
+            let cached_immediate = self
+                .retired_render_handoff_graph
+                .as_ref()
+                .is_some_and(|graph| {
+                    graph.bind.matches(vm) && graph.storage.queue_pair().slot() == pair_slot
+                });
+            let cached_index = if cached_immediate {
+                None
+            } else {
+                self.retired_render_handoff_graphs.iter().position(|graph| {
+                    graph.bind.matches(vm) && graph.storage.queue_pair().slot() == pair_slot
+                })
+            };
+            if !cached_immediate && cached_index.is_none() {
+                return Ok(());
+            }
+            if cached_immediate {
+                self.retired_render_handoff_graph
+                    .as_mut()
+                    .ok_or(EIO)?
+                    .storage
+                    .prepare_cached_reactivation(self.render_submission_ordinal)?;
+            } else {
+                self.retired_render_handoff_graphs
+                    .get_mut(cached_index.ok_or(EIO)?)
+                    .ok_or(EIO)?
+                    .storage
+                    .prepare_cached_reactivation(self.render_submission_ordinal)?;
+                self.preserve_immediate_retired_render_graph()?;
+            }
+            let mut cached = if cached_immediate {
+                self.retired_render_handoff_graph.take().ok_or(EIO)?
+            } else {
+                self.retired_render_handoff_graphs
+                    .remove(cached_index.ok_or(EIO)?)
+                    .map_err(|_| EIO)?
+            };
+            if !cached.storage.sksm_backing_detached() {
+                return Err(EIO);
+            }
+            cached.storage.claim_sksm_backing(
+                &mut self.render_sksm.as_mut().ok_or(EIO)?.backing,
+            )?;
+            let cached_vm = cached.bind.vm_id();
+            self.render_bind = Some(cached.bind);
+            self.render_context_aliases = cached.context_aliases;
+            self.render_storage = Some(cached.storage);
+            self.prune_unreferenced_retired_render_graphs()?;
+            dev_info!(
+                self.resources.dev().as_ref(),
+                "G17P render VM handoff: restored cached graph vm={} into empty slot {} at ordinal {}\n",
+                cached_vm,
+                pair_slot,
+                self.render_submission_ordinal,
+            );
+            return Ok(());
+        }
+        if !self.retained_render_has_other_owner(vm) {
             return Ok(());
         }
         self.require_retired_render_owner()?;
@@ -4560,27 +4612,11 @@ impl G17PManagerConstruction {
             return Err(Self::render_stage_fail("legacy-context0-alias-live", EBUSY));
         }
         let retained = self.render_storage.is_some();
-        // Acquire this VM's TTBAT context BEFORE anything is encoded.
-        //
-        // Two reasons it cannot stay where it used to be, in the outer
-        // publish. The fragment MCache write-range selector names this
-        // context, so the 3D descriptor cannot be built until it is known.
-        // And a bind failure has to happen before any firmware-visible byte
-        // moves: it is the one failure a second concurrent client hits first.
-        //
-        // A retained graph keeps the binding it was built with; only a fresh
-        // graph takes a new one, and the local drops the slot again if any
-        // later step in this function fails.
-        let mut fresh_root_bind = if retained {
-            None
-        } else {
-            Some(
-                self.resources
-                    .uat()
-                    .bind(vm)
-                    .map_err(|error| Self::render_stage_fail("render-root-bind", error))?,
-            )
-        };
+        // Native's application-GART allocation is the root identity encoded
+        // in descriptor+0xc, tag15+0x32 and the MCache selector. The queue's
+        // execution-context lease already installed this VM in that TTBAT
+        // context, so taking a second legacy `VmBind` here wastes another
+        // selector and imposes an artificial four-client ceiling.
         let render_root_slot = if retained {
             self.render_bind
                 .as_ref()
@@ -4588,30 +4624,9 @@ impl G17PManagerConstruction {
                 .root_slot()
                 .map_err(|error| Self::render_stage_fail("render-root-slot", error))?
         } else {
-            u8::try_from(
-                fresh_root_bind
-                    .as_ref()
-                    .ok_or_else(|| Self::render_stage_fail("render-root-missing", EIO))?
-                    .slot(),
-            )
-            .map_err(|_| Self::render_stage_fail("render-root-slot-width", EIO))?
+            u8::try_from(execution_context.context_id())
+                .map_err(|_| Self::render_stage_fail("render-root-slot-width", EIO))?
         };
-        if let Some(bind) = fresh_root_bind.as_ref() {
-            // Diagnostic override only: with an explicit selector of 2 or 3
-            // the driver mirrors the bound roots into that TTBAT slot rather
-            // than emitting an unbacked selector.
-            let mcache_hwsid = *crate::module_parameters::g17p_render_mcache_hwsid.value();
-            let mcache_selector =
-                *crate::module_parameters::g17p_render_mcache_selector.value() as usize;
-            if mcache_hwsid != 0 && matches!(mcache_selector, 2 | 3) {
-                self.resources
-                    .uat()
-                    .install_t8140_render_mcache_context_alias(bind, mcache_selector)
-                    .map_err(|error| {
-                        Self::render_stage_fail("render-mcache-context-alias", error)
-                    })?;
-            }
-        }
         // Which construction path a render takes has never been logged, and a
         // cold boot was measured taking the RESTAGE branch on what should be a
         // first render (93cc292: neither log line inside new_user_render_storage
@@ -4776,12 +4791,8 @@ impl G17PManagerConstruction {
         // reuse this complete graph instead of finding storage without its
         // root and returning EBUSY forever.
         if !retained {
-            let flist_bind = fresh_root_bind
-                .take()
-                .ok_or_else(|| Self::render_stage_fail("job-flist-bind-missing", EINVAL))?;
             self.render_bind = Some(G17PRenderRootOwner::Job {
                 context: execution_context.clone(),
-                flist_bind,
             });
         }
         {
@@ -5044,9 +5055,6 @@ impl G17PManagerConstruction {
                 retained,
                 render_root_slot,
             );
-        }
-        if fresh_root_bind.is_some() {
-            return Err(Self::render_stage_fail("fresh-bind-unconsumed", EINVAL));
         }
         let roots = self.resources.uat().t8140_compute_context_roots();
         if crate::util::g17p_verbose() {
