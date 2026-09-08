@@ -952,7 +952,7 @@ impl File {
             return Err(EINVAL);
         }
 
-        vm.unmap_range(range.start, range.range())?;
+        vm.unmap_user_range(range.start, range.range())?;
         vm.untrack_t8140_native_context_range(range);
 
         vm.bo_deferred_cleanup();

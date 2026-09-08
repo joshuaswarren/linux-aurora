@@ -1090,22 +1090,26 @@ struct T8140VmJobLifetime {
 pub(crate) struct T8140VmJobGuard { vm: Vm }
 impl Drop for T8140VmJobGuard {
     fn drop(&mut self) {
-        let (ranges, objects) = {
-            let mut state = self.vm.job_lifetime.lock();
-            state.active -= 1;
-            if state.active != 0 { return; }
-            (state.close_ranges.take(), core::mem::replace(&mut state.closed_objects, KVec::new()))
-        };
+        let mut state = self.vm.job_lifetime.lock();
+        state.active -= 1;
+        if state.active != 0 { return; }
+        let ranges = state.close_ranges.take();
+        let objects = core::mem::replace(&mut state.closed_objects, KVec::new());
+        // Keep admission locked through the actual unmaps. Otherwise a new
+        // submit can acquire a job guard after active reaches zero but before
+        // these deferred leaves disappear, and then race its GPU access with
+        // teardown of the same mappings.
         if let Some((user, kernel)) = ranges {
-            if self.vm.unmap_user_ranges(user, kernel).is_err() {
+            if self.vm.unmap_user_ranges_now(user, kernel).is_err() {
                 pr_err!("G17P VM job retirement: deferred user unmap failed\n");
             }
         }
         for object in objects {
-            if self.vm.drop_mappings(&object).is_err() {
+            if self.vm.drop_mappings_now(&object).is_err() {
                 pr_err!("G17P VM job retirement: deferred GEM unmap failed\n");
             }
         }
+        core::mem::drop(state);
         self.vm.bo_deferred_cleanup();
     }
 }
@@ -2475,14 +2479,20 @@ impl Vm {
         user_range: Range<u64>,
         kernel_range: Range<u64>,
     ) -> Result {
-        {
-            let mut state = self.job_lifetime.lock();
-            state.closed = true;
-            if state.active != 0 {
-                state.close_ranges = Some((user_range, kernel_range));
-                return Ok(());
-            }
+        let mut state = self.job_lifetime.lock();
+        state.closed = true;
+        if state.active != 0 {
+            state.close_ranges = Some((user_range, kernel_range));
+            return Ok(());
         }
+        self.unmap_user_ranges_now(user_range, kernel_range)
+    }
+
+    fn unmap_user_ranges_now(
+        &self,
+        user_range: Range<u64>,
+        kernel_range: Range<u64>,
+    ) -> Result {
         let retained = self.driver_mappings.lock();
         let driver = retained.as_ref();
         let mut cursor = user_range.start;
@@ -2990,8 +3000,18 @@ impl Vm {
         Ok(KernelMapping(node))
     }
 
-    /// Unmap everything in an address range.
-    pub(crate) fn unmap_range(&self, iova: u64, size: u64) -> Result {
+    /// Unmap one userspace range only while no accepted job can still name it.
+    pub(crate) fn unmap_user_range(&self, iova: u64, size: u64) -> Result {
+        let _state = self.job_lifetime.lock();
+        if _state.active != 0 {
+            return Err(EBUSY);
+        }
+        self.unmap_range(iova, size)
+    }
+
+    /// Unmap everything in an address range. Callers must hold the job
+    /// lifetime lock or operate on driver-private mappings.
+    fn unmap_range(&self, iova: u64, size: u64) -> Result {
         // Unmapping a range can only do a single split, so just preallocate
         // the prev and next GpuVas
         let mut ctx = StepContext {
@@ -3008,15 +3028,17 @@ impl Vm {
 
     /// Drop mappings for a given bo.
     pub(crate) fn drop_mappings(&self, gem: &gem::Object) -> Result {
-        {
-            let mut state = self.job_lifetime.lock();
-            if state.active != 0 {
-                if !state.closed_objects.iter().any(|object| core::ptr::eq(&**object, gem)) {
-                    state.closed_objects.push(gem.into(), GFP_KERNEL)?;
-                }
-                return Ok(());
+        let mut state = self.job_lifetime.lock();
+        if state.active != 0 {
+            if !state.closed_objects.iter().any(|object| core::ptr::eq(&**object, gem)) {
+                state.closed_objects.push(gem.into(), GFP_KERNEL)?;
             }
+            return Ok(());
         }
+        self.drop_mappings_now(gem)
+    }
+
+    fn drop_mappings_now(&self, gem: &gem::Object) -> Result {
         // Removing whole mappings only does unmaps, so no preallocated VAs
         let mut ctx = Default::default();
 
