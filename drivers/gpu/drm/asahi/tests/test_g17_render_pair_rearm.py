@@ -23,16 +23,17 @@ ensure = function(runtime, "fn ensure_g17p_render_registration_power(")
 release = function(runtime, "fn release_g17p_render_registration_power(")
 construct = function(manager, "fn begin_translated_render_with_hardware_buffer(")
 
-# Native's provider hold spans graph construction and the direct KSMFE
-# transaction. It is released on both success and pre-publication failure,
-# before the work doorbell can make the prepared outer pair executable.
-assert submit.index("ensure_g17p_render_registration_power()?") < submit.index(
-    ".begin_translated_render("
-)
+# Native brackets configureHardware itself with ensurePoweredHardware(true).
+# CPU-only graph construction may precede the hold; the callback must run at
+# the direct KSMFE transaction boundary, and idle policy is restored before
+# the work doorbell can make the prepared outer pair executable.
 assert submit.index(".begin_translated_render(") < submit.index(
-    "release_g17p_render_registration_power()"
+    "ensure_g17p_render_registration_power(manager, &registers)?"
 )
-assert submit.index("release_g17p_render_registration_power()") < submit.index(
+assert submit.index("ensure_g17p_render_registration_power(manager, &registers)?") < submit.index(
+    "release_g17p_render_registration_power("
+)
+assert submit.index("release_g17p_render_registration_power(") < submit.index(
     "self.install_render_completion("
 )
 assert "DEVICE_CONTROL_IDLE_POWER_OFF_ARG_DISABLE_IDLE_AND_WAKE" in ensure
@@ -47,8 +48,10 @@ bind_install = construct.index("self.render_bind = Some(G17PRenderRootOwner::Job
 direct = construct.index("self.configure_fresh_nonbootstrap_render_pair(")
 outer = construct.index(".publish_partial_opening_pair(")
 assert bind_install < direct < outer
+power = construct.index("registration_power(self)")
+assert bind_install < power < direct < outer
+assert "Err(error) if error == EAGAIN => continue" in construct
 assert "execution_context.clone()" in construct[bind_install - 300 : bind_install + 300]
-assert "fresh-bind-unconsumed" in construct
 
 
 class Pair:
@@ -58,11 +61,13 @@ class Pair:
         self.registered = False
         self.outer_visible = False
 
-    def construct(self, vm: int, powered: bool) -> bool:
+    def stage(self, vm: int):
         if self.graph is None:
             self.graph = vm
             self.root = vm
         assert self.graph == vm and self.root == vm
+
+    def configure(self, powered: bool) -> bool:
         if not powered:
             assert not self.outer_visible
             return False
@@ -76,8 +81,11 @@ class Pair:
 # cannot convert the following compositor submit into permanent EBUSY.
 pair = Pair()
 for generation in range(64):
-    assert not pair.construct(5, powered=False)
-    assert pair.construct(5, powered=True)
+    pair.stage(5)
+    assert not pair.configure(powered=False)
+    # The retry reuses the same staged generation; it must not stage a second
+    # Scene or advance either SKSM producer again.
+    assert pair.configure(powered=True)
     pair.outer_visible = False
 assert pair.graph == pair.root == 5
 assert pair.registered

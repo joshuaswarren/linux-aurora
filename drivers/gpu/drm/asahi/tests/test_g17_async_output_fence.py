@@ -36,7 +36,7 @@ guard_drop = block("impl Drop for G17POutputFencePublication<'_> {")
 render_completion = block("impl G17PRenderCompletion {")
 
 render_completion_struct = block("pub(crate) struct G17PRenderCompletion {")
-assert "_vm_job: mmu::T8140VmJobGuard" in render_completion_struct, \
+assert "vm_job: Arc<Mutex<Option<mmu::T8140VmJobGuard>>>" in render_completion_struct, \
     'published render does not retain its VM mappings through completion'
 
 complete = render_completion[render_completion.index("pub(crate) fn complete"):]
@@ -58,6 +58,9 @@ assert compute_completion.index("compare_exchange(0, 1") \
 timeout_start = live_source.index("    pub(crate) fn timeout_deferred_render(")
 timeout_end = live_source.index("    pub(crate) fn abandon_deferred_render(", timeout_start)
 timeout = live_source[timeout_start:timeout_end]
+assert timeout.index("if !self.render_fence_state.pending(render_slot)") \
+    < timeout.index("self.poll_deferred_render_completion(render_slot)"), \
+    'pre-publication failures incorrectly enter the hardware watchdog path'
 assert timeout.index("self.poll_deferred_render_completion(render_slot)") \
     < timeout.index("self.render_fence_state.settle(render_slot)"), \
     'watchdog consumes the settlement gate before its final completion observation'

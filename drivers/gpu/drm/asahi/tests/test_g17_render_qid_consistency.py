@@ -83,9 +83,16 @@ submit = LIVE[
     LIVE.index("pub(crate) fn submit_translated_render("):
 ]
 submit = submit[:submit.index("fn ensure_g17p_render_registration_power(")]
-preflight = submit.index("self.ensure_g17p_render_registration_power()?")
 begin_call = submit.index(".begin_translated_render(")
-assert preflight < begin_call
+preflight = submit.index("self.ensure_g17p_render_registration_power(manager, &registers)?")
+assert begin_call < preflight
+
+# Power acquisition is invoked by the manager immediately before the direct
+# four-write transaction, after CPU-only graph/descriptor staging.
+assert begin.index("registration_power(self)") < begin.index(
+    "self.configure_fresh_nonbootstrap_render_pair("
+)
+assert "Err(error) if error == EAGAIN => continue" in begin
 
 power = LIVE[
     LIVE.index("fn ensure_g17p_render_registration_power("):

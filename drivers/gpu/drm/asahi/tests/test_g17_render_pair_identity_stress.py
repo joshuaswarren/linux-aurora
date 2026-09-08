@@ -36,10 +36,10 @@ submit = block(
     "fn ensure_g17p_render_registration_power(",
 )
 assert "G17PRenderQueuePair::for_slot(render_slot)" in submit
-assert ".fresh_render_pair_needs_direct_registration(queue_pair)" in submit
 begin_call = submit.index(".begin_translated_render(")
 assert submit.index("&drm", begin_call) < submit.index("vm", begin_call)
 assert submit.index("vm", begin_call) < submit.index("queue_pair", begin_call)
+assert "ensure_g17p_render_registration_power(manager, &registers)?" in submit
 assert "self.install_render_completion(render_slot, completion)?" in submit
 
 begin = block(
@@ -194,9 +194,6 @@ def build_graph(slot: int, owner: int, failure: str | None) -> bool:
     pages = vm_state(owner)
     assert pages.issuperset(range(1, 7))
     assert 0 not in pages, "driver attempted to double-map null view"
-    if failure == "prepower":
-        # The production pre-power gate runs before root/context/alias setup.
-        return False
     pages.add(0)
     map_events += 1
     if failure == "constructor":
@@ -209,6 +206,10 @@ def build_graph(slot: int, owner: int, failure: str | None) -> bool:
     graph_owner[slot] = owner
     graph_context[slot] = next_context
     next_context += 1
+    if failure == "prepower":
+        # A closed aperture is retried at the direct four-write transaction;
+        # the already staged graph is neither rebuilt nor exposed as failure.
+        assert graph_owner[slot] == owner
     return True
 
 
@@ -244,10 +245,10 @@ for cycle in range(4096):
             failure = "constructor"
         built = build_graph(slot, owner, failure)
         if not built:
-            # A pre-power/direct-config refusal happens before the completion
-            # fence is armed. A later constructor failure likewise owns only
-            # local mappings. Timeout classification must leave both slots and
-            # the other client's fence untouched.
+            # A constructor failure owns only local mappings. Transient power
+            # closure is retried internally and therefore never reaches here.
+            # Timeout classification must leave both slots and the other
+            # client's fence untouched.
             before = pending_fences.copy()
             assert pending_fences[slot] is None
             assert pending_fences == before
