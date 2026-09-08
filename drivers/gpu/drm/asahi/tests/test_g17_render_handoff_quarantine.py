@@ -20,9 +20,9 @@ def function(marker):
 graph = source[source.index("struct G17PRetiredRenderGraph {"):]
 graph = graph[:graph.index("}\n")]
 assert graph.index("bind: G17PRenderRootOwner") < graph.index(
-    "context_aliases: mmu::T8140NativeContextAliases"
+    "context_aliases: Option<mmu::T8140NativeContextAliases>"
 )
-assert graph.index("context_aliases: mmu::T8140NativeContextAliases") < graph.index(
+assert graph.index("context_aliases: Option<mmu::T8140NativeContextAliases>") < graph.index(
     "storage: g17_resources::G17PUserRenderStorage"
 )
 
@@ -32,7 +32,7 @@ assert handoff.index("self.require_retired_render_owner()?") < handoff.index(
 )
 for owner in (
     "self.render_bind.take().ok_or(EIO)?",
-    "self.render_context_aliases.take().ok_or(EIO)?",
+    "self.render_context_aliases.take()",
     "self.render_storage.take().ok_or(ENODEV)?",
 ):
     assert owner in handoff

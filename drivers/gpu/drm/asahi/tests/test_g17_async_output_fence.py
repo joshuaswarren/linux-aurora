@@ -51,6 +51,24 @@ assert timeout.index("self.poll_deferred_render_completion(render_slot)") \
     'watchdog consumes the settlement gate before its final completion observation'
 assert "signal.complete(Ok(observed));" in timeout, \
     'watchdog cannot salvage a completion that became visible after the event edge'
+assert ") -> bool {" in timeout and "return !retired;" in timeout, \
+    'watchdog does not report whether firmware still owns the slot'
+
+# Cancellation and submit-error cleanup must classify the final hardware state
+# before permanently retiring a physical slot. A successful one-frame process
+# can close while its already-completed watch job is still queued.
+watch = block("impl g17_job::G17PRenderWatchBackend for G17PRenderWatchBackend {")
+for marker in ("fn timed_out(", "fn cancel("):
+    body = watch[watch.index(marker):]
+    body = body[:body.index("\n    }", body.index("{"))]
+    assert body.index("timeout_deferred_render(") < body.index("quarantine_render_slot("), marker
+    assert "if quarantine" in body, marker
+
+render_submit_start = source.index("let submit = self.runtime")
+render_submit_end = source.index("publication.publish_async(&finished);", render_submit_start)
+render_submit = source[render_submit_start:render_submit_end]
+assert render_submit.count("if quarantine") == 3
+assert render_submit.count("timeout_deferred_render(") == 3
 
 # The submit path must hand the guard to the asynchronous compute path, and the
 # asynchronous path must publish through it only after the job is enqueued.

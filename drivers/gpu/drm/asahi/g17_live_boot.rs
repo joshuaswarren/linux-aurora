@@ -3866,14 +3866,15 @@ impl G17PLiveRuntime {
 
     /// Bounded watchdog/cancel settlement. This is never the normal
     /// completion path: ordinary retirement is driven by the RTKit event
-    /// worker above. The physical slot is quarantined by the caller before
-    /// this releases its lease.
+    /// worker above. Returns true only when the final observation cannot prove
+    /// the group completed or was retired, which tells the caller to
+    /// quarantine the physical slot after classification.
     pub(crate) fn timeout_deferred_render(
         &mut self,
         render_slot: u8,
         submission_id: u64,
         error: Error,
-    ) {
+    ) -> bool {
         // A firmware event can precede visibility of the final paired queue
         // cache lines. Recheck once at the scheduler's existing watchdog
         // boundary before declaring the device lost. This is not a polling
@@ -3885,7 +3886,7 @@ impl G17PLiveRuntime {
                     self.render_event_masks[render_slot as usize] = [0; 2];
                     let Some(signal) = self.pending_render
                         .get_mut(render_slot as usize)
-                        .and_then(Option::take) else { return; };
+                        .and_then(Option::take) else { return false; };
                     if let Some(pdev) = self.pdev.as_ref() {
                         dev_warn!(
                             pdev.as_ref(),
@@ -3896,7 +3897,7 @@ impl G17PLiveRuntime {
                     }
                     signal.complete(Ok(observed));
                 }
-                return;
+                return false;
             }
             Ok(None) => {}
             Err(observe_error) => {
@@ -3915,7 +3916,7 @@ impl G17PLiveRuntime {
             self.render_event_masks[render_slot as usize] = [0; 2];
             let Some(signal) = self.pending_render
                 .get_mut(render_slot as usize)
-                .and_then(Option::take) else { return; };
+                .and_then(Option::take) else { return false; };
             let retired = self.abandon_deferred_render(render_slot).unwrap_or(false);
             if let Some(pdev) = self.pdev.as_ref() {
                 dev_err!(
@@ -3928,7 +3929,9 @@ impl G17PLiveRuntime {
                 );
             }
             signal.complete(Err(if retired { EIO } else { error }));
+            return !retired;
         }
+        false
     }
 
     /// Release a timed-out render.

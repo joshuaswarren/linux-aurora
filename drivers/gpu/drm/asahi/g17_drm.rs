@@ -756,18 +756,22 @@ impl g17_job::G17PRenderWatchBackend for G17PRenderWatchBackend {
         &self,
         packet: Arc<g17_job::G17PRenderWatchPacket>,
     ) -> kernel::drm::sched::Status {
-        self.registry.quarantine_render_slot(packet.render_slot());
-        self.runtime.mutex().lock().timeout_deferred_render(
+        let quarantine = self.runtime.mutex().lock().timeout_deferred_render(
             packet.render_slot(), packet.submission_id(), ETIMEDOUT,
         );
+        if quarantine {
+            self.registry.quarantine_render_slot(packet.render_slot());
+        }
         kernel::drm::sched::Status::Nominal
     }
 
     fn cancel(&self, packet: Arc<g17_job::G17PRenderWatchPacket>) {
-        self.registry.quarantine_render_slot(packet.render_slot());
-        self.runtime.mutex().lock().timeout_deferred_render(
+        let quarantine = self.runtime.mutex().lock().timeout_deferred_render(
             packet.render_slot(), packet.submission_id(), ECANCELED,
         );
+        if quarantine {
+            self.registry.quarantine_render_slot(packet.render_slot());
+        }
     }
 }
 
@@ -2121,10 +2125,12 @@ impl G17PQueue {
                     );
                 sample.publish_ns = publish_started.elapsed().as_nanos().max(0) as u64;
                 if let Err(error) = submit {
-                    self.registry.quarantine_render_slot(render_slot);
-                    self.runtime.mutex().lock().timeout_deferred_render(
+                    let quarantine = self.runtime.mutex().lock().timeout_deferred_render(
                         render_slot, submission_id, error,
                     );
+                    if quarantine {
+                        self.registry.quarantine_render_slot(render_slot);
+                    }
                     return Err(Self::stage_fail(
                         submission_id, "submit-translated-render", error,
                     ));
@@ -2134,10 +2140,12 @@ impl G17PQueue {
                 ) {
                     Ok(packet) => packet,
                     Err(error) => {
-                        self.registry.quarantine_render_slot(render_slot);
-                        self.runtime.mutex().lock().timeout_deferred_render(
+                        let quarantine = self.runtime.mutex().lock().timeout_deferred_render(
                             render_slot, submission_id, error,
                         );
+                        if quarantine {
+                            self.registry.quarantine_render_slot(render_slot);
+                        }
                         return Err(Self::stage_fail(
                             submission_id, "allocate-render-watch", error,
                         ));
@@ -2146,10 +2154,12 @@ impl G17PQueue {
                 let finished = match self.render_scheduler.enqueue(packet) {
                     Ok(fence) => fence,
                     Err(error) => {
-                        self.registry.quarantine_render_slot(render_slot);
-                        self.runtime.mutex().lock().timeout_deferred_render(
+                        let quarantine = self.runtime.mutex().lock().timeout_deferred_render(
                             render_slot, submission_id, error,
                         );
+                        if quarantine {
+                            self.registry.quarantine_render_slot(render_slot);
+                        }
                         return Err(Self::stage_fail(
                             submission_id, "schedule-render-watch", error,
                         ));

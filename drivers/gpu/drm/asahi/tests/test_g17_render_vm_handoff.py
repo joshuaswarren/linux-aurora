@@ -24,7 +24,7 @@ def function(source, marker):
 handoff = function(manager, "pub(crate) fn handoff_retained_render_vm(")
 assert handoff.index("self.require_retired_render_owner()?") < handoff.index("G17PRetiredRenderGraph {")
 assert "self.render_bind.take().ok_or(EIO)?" in handoff
-assert "self.render_context_aliases.take().ok_or(EIO)?" in handoff
+assert "self.render_context_aliases.take()" in handoff
 assert "self.render_storage.take().ok_or(ENODEV)?" in handoff
 assert "release_client_context" not in handoff
 assert handoff.index("self.retired_render_handoff_graph.replace(retired)") < handoff.index(
@@ -36,9 +36,9 @@ assert "incoming VM builds a new root" in handoff
 retired_graph = manager[manager.index("struct G17PRetiredRenderGraph {"):]
 retired_graph = retired_graph[:retired_graph.index("}\n")]
 assert retired_graph.index("bind: G17PRenderRootOwner") < retired_graph.index(
-    "context_aliases: mmu::T8140NativeContextAliases"
+    "context_aliases: Option<mmu::T8140NativeContextAliases>"
 )
-assert retired_graph.index("context_aliases: mmu::T8140NativeContextAliases") < retired_graph.index(
+assert retired_graph.index("context_aliases: Option<mmu::T8140NativeContextAliases>") < retired_graph.index(
     "storage: g17_resources::G17PUserRenderStorage"
 )
 release_retired = function(manager, "fn release_retired_handoff_graph(")
