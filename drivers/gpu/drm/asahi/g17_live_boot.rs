@@ -1914,6 +1914,64 @@ struct G17PBootedSession {
     queue_setup_pending: bool,
 }
 
+struct G17PBootSessionConfig {
+    queue: Option<g17_manager::G17PSksmQueue>,
+    compute_uapi_enabled: bool,
+    queue_setup_pending: bool,
+}
+
+/// Every owner which becomes live once either ASC processor starts.
+///
+/// Failed boot paths pass this complete transaction to
+/// `rollback_failed_boot_session`.  It may be destroyed only after both CPU
+/// stops succeed; otherwise the entire graph is intentionally retained.
+struct G17PStartingSession {
+    cpus: g17_lifecycle::StartedCpuPair<G17PMailboxProvider>,
+    gfx_state: Arc<G17PRoleRtkitState>,
+    gfx_rtkit: rtkit::RtKit<G17PRtkitOps>,
+    gfx1_state: Arc<G17PRoleRtkitState>,
+    gfx1_rtkit: rtkit::RtKit<G17PRtkitOps>,
+}
+
+impl G17PStartingSession {
+    fn into_booted(self, config: G17PBootSessionConfig) -> G17PBootedSession {
+        G17PBootedSession {
+            cpus: self.cpus,
+            gfx_state: self.gfx_state,
+            gfx_rtkit: self.gfx_rtkit,
+            gfx1_state: self.gfx1_state,
+            gfx1_rtkit: self.gfx1_rtkit,
+            queue: config.queue,
+            compute_uapi_enabled: config.compute_uapi_enabled,
+            queue_setup_pending: config.queue_setup_pending,
+        }
+    }
+}
+
+impl g17_lifecycle::FailedBootSession for G17PStartingSession {
+    fn stop_cpu_pair(&mut self) -> bool {
+        self.cpus.stop().is_ok()
+    }
+
+    fn retain_firmware_owners(self) {
+        core::mem::forget(self);
+    }
+}
+
+fn rollback_starting_session(
+    pdev: &platform::Device,
+    session: G17PStartingSession,
+) -> bool {
+    let stopped = g17_lifecycle::rollback_failed_boot_session(session);
+    if !stopped {
+        dev_err!(
+            pdev.as_ref(),
+            "G17P boot rollback: CPU stop unproven; retaining every firmware owner\n"
+        );
+    }
+    stopped
+}
+
 fn wait_initdata_ack(state: &G17PRoleRtkitState) -> Result {
     for _ in 0..INITDATA_ACK_POLLS {
         if state.acked.load(Ordering::Acquire) {
@@ -1927,18 +1985,13 @@ fn wait_initdata_ack(state: &G17PRoleRtkitState) -> Result {
     Err(ETIMEDOUT)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn finish_boot_session(
     pdev: &platform::Device,
-    _drm: &ARef<AsahiDevice>,
     manager: &mut g17_manager::G17PManagerConstruction,
     test_stage: G17PTestStage,
-    cpus: g17_lifecycle::StartedCpuPair<G17PMailboxProvider>,
-    gfx_state: Arc<G17PRoleRtkitState>,
-    gfx_rtkit: rtkit::RtKit<G17PRtkitOps>,
-    gfx1_state: Arc<G17PRoleRtkitState>,
-    gfx1_rtkit: rtkit::RtKit<G17PRtkitOps>,
-) -> Result<G17PBootedSession> {
+    gfx_state: &G17PRoleRtkitState,
+    gfx1_state: &G17PRoleRtkitState,
+) -> Result<G17PBootSessionConfig> {
     let mut counters = manager.control_counters()?;
     // The single native 0x89 sent immediately after both initdata ACKs is both
     // powerTransitionEnd and the event that releases the opening control rings.
@@ -2004,12 +2057,7 @@ fn finish_boot_session(
             pdev.as_ref(),
             "G17P session: native control stage complete; no pre-user EP21 work/control message; QID4 remains untouched\n"
         );
-        return Ok(G17PBootedSession {
-            cpus,
-            gfx_state,
-            gfx_rtkit,
-            gfx1_state,
-            gfx1_rtkit,
+        return Ok(G17PBootSessionConfig {
             queue: None,
             compute_uapi_enabled: false,
             queue_setup_pending: false,
@@ -2031,12 +2079,7 @@ fn finish_boot_session(
         pdev.as_ref(),
         "G17P diagnostic: j700-dual-initdata-publication-v1 armed\n"
     );
-    Ok(G17PBootedSession {
-        cpus,
-        gfx_state,
-        gfx_rtkit,
-        gfx1_state,
-        gfx1_rtkit,
+    Ok(G17PBootSessionConfig {
         queue: None,
         compute_uapi_enabled: test_stage.enables_compute_uapi(),
         queue_setup_pending: test_stage.prepares_qid4_at_startup(),
@@ -2049,6 +2092,7 @@ fn boot_session(
     registers: &regs::Resources,
     manager: &mut g17_manager::G17PManagerConstruction,
     test_stage: G17PTestStage,
+    stop_unproven: &mut bool,
 ) -> Result<G17PBootedSession> {
     let gfx = G17PMailboxProvider::get(pdev.as_ref(), 0)?;
     let gfx_lifecycle = validate_provider(&gfx, GFX_PROVIDER)?;
@@ -2088,7 +2132,7 @@ fn boot_session(
     )?;
     let mut gfx_rtkit =
         rtkit::RtKit::<G17PRtkitOps>::new_g17p(drm.as_ref(), None, 0, gfx_state.clone())?;
-    let mut gfx1_rtkit =
+    let gfx1_rtkit =
         rtkit::RtKit::<G17PRtkitOps>::new_g17p(drm.as_ref(), None, 1, gfx1_state.clone())?;
     dev_info!(pdev.as_ref(), "G17P session: both RTKit receivers armed\n");
 
@@ -2118,7 +2162,8 @@ fn boot_session(
     // made of, and NOT a `wait_initdata_ack` timeout, whose budget is
     // INITDATA_ACK_POLLS (200) x 10ms = 2.0s. These markers say which step it
     // actually was, and on which role, without inferring it from arithmetic.
-    let cpus = g17_lifecycle::StartedCpuPair::start_staged(gfx, gfx1, || {
+    let mut cpus = g17_lifecycle::StartedCpuPair::new(gfx, gfx1);
+    let start_result = cpus.start_staged_in_place(|| {
         dev_info!(pdev.as_ref(), "G17P session: GFX processor started\n");
         let started = Instant::<Monotonic>::now();
         let result = Pin::new(&mut gfx_rtkit).boot();
@@ -2131,76 +2176,104 @@ fn boot_session(
         result?;
         dev_info!(pdev.as_ref(), "G17P session: GFX RTKit handshake complete\n");
         Ok(())
-    })?;
-    dev_info!(pdev.as_ref(), "G17P session: GFX1 processor started\n");
-    {
-        let started = Instant::<Monotonic>::now();
-        let result = Pin::new(&mut gfx1_rtkit).boot();
-        dev_info!(
-            pdev.as_ref(),
-            "G17PMARK rtkit-boot role=gfx1 ok={} took={}us\n",
-            result.is_ok(),
-            started.elapsed().as_micros_ceil(),
-        );
-        result?;
-    }
-    dev_info!(pdev.as_ref(), "G17P session: GFX1 RTKit handshake complete\n");
-
-    let root_snapshot = manager.uat().prepare_t8140_firmware_high_roots()?;
-    manager
-        .uat()
-        .confirm_t8140_primary_high_root(root_snapshot)?;
-    manager.uat().mirror_t8140_secondary_high_root()?;
-    registers.t8140_pre_initdata_clear()?;
-
-    Pin::new(&mut gfx_rtkit).start_endpoint(g17_rtkit::ENDPOINT_GFX_MESSAGES)?;
-    Pin::new(&mut gfx_rtkit).start_endpoint(g17_rtkit::ENDPOINT_GFX_INTERRUPTS)?;
-    Pin::new(&mut gfx1_rtkit).start_endpoint(g17_rtkit::ENDPOINT_GFX_MESSAGES)?;
-    Pin::new(&mut gfx1_rtkit).start_endpoint(g17_rtkit::ENDPOINT_GFX_INTERRUPTS)?;
-    Pin::new(&mut gfx_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_MESSAGES, gfx_init)?;
-    Pin::new(&mut gfx1_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_MESSAGES, gfx1_init)?;
-    dev_info!(
-        pdev.as_ref(),
-        "G17P session: primary and secondary initdata published\n"
-    );
-    {
-        let started = Instant::<Monotonic>::now();
-        let result = wait_initdata_ack(&gfx_state);
-        dev_info!(
-            pdev.as_ref(),
-            "G17PMARK initdata-ack role=gfx ok={} took={}us (budget 2000000us)\n",
-            result.is_ok(),
-            started.elapsed().as_micros_ceil(),
-        );
-        result?;
-    }
-    dev_info!(pdev.as_ref(), "G17P session: primary initdata ACK received\n");
-    {
-        let started = Instant::<Monotonic>::now();
-        let result = wait_initdata_ack(&gfx1_state);
-        dev_info!(
-            pdev.as_ref(),
-            "G17PMARK initdata-ack role=gfx1 ok={} took={}us\n",
-            result.is_ok(),
-            started.elapsed().as_micros_ceil(),
-        );
-        result?;
-    }
-    dev_info!(pdev.as_ref(), "G17P session: secondary initdata ACK received\n");
-
-    probe_g17p_ktrace(pdev.as_ref(), manager, "post-initdata-ack");
-
-    finish_boot_session(
-        pdev,
-        drm,
-        manager,
-        test_stage,
+    });
+    let mut session = G17PStartingSession {
         cpus,
         gfx_state,
         gfx_rtkit,
         gfx1_state,
         gfx1_rtkit,
-    )
+    };
+    if let Err(error) = start_result {
+        if !rollback_starting_session(pdev, session) {
+            *stop_unproven = true;
+        }
+        return Err(error);
+    }
+
+    let boot_result = (|| -> Result<G17PBootSessionConfig> {
+        dev_info!(pdev.as_ref(), "G17P session: GFX1 processor started\n");
+        {
+            let started = Instant::<Monotonic>::now();
+            let result = Pin::new(&mut session.gfx1_rtkit).boot();
+            dev_info!(
+                pdev.as_ref(),
+                "G17PMARK rtkit-boot role=gfx1 ok={} took={}us\n",
+                result.is_ok(),
+                started.elapsed().as_micros_ceil(),
+            );
+            result?;
+        }
+        dev_info!(pdev.as_ref(), "G17P session: GFX1 RTKit handshake complete\n");
+
+        let root_snapshot = manager.uat().prepare_t8140_firmware_high_roots()?;
+        manager
+            .uat()
+            .confirm_t8140_primary_high_root(root_snapshot)?;
+        manager.uat().mirror_t8140_secondary_high_root()?;
+        registers.t8140_pre_initdata_clear()?;
+
+        Pin::new(&mut session.gfx_rtkit)
+            .start_endpoint(g17_rtkit::ENDPOINT_GFX_MESSAGES)?;
+        Pin::new(&mut session.gfx_rtkit)
+            .start_endpoint(g17_rtkit::ENDPOINT_GFX_INTERRUPTS)?;
+        Pin::new(&mut session.gfx1_rtkit)
+            .start_endpoint(g17_rtkit::ENDPOINT_GFX_MESSAGES)?;
+        Pin::new(&mut session.gfx1_rtkit)
+            .start_endpoint(g17_rtkit::ENDPOINT_GFX_INTERRUPTS)?;
+        Pin::new(&mut session.gfx_rtkit)
+            .send_message(g17_rtkit::ENDPOINT_GFX_MESSAGES, gfx_init)?;
+        Pin::new(&mut session.gfx1_rtkit)
+            .send_message(g17_rtkit::ENDPOINT_GFX_MESSAGES, gfx1_init)?;
+        dev_info!(
+            pdev.as_ref(),
+            "G17P session: primary and secondary initdata published\n"
+        );
+        {
+            let started = Instant::<Monotonic>::now();
+            let result = wait_initdata_ack(&session.gfx_state);
+            dev_info!(
+                pdev.as_ref(),
+                "G17PMARK initdata-ack role=gfx ok={} took={}us (budget 2000000us)\n",
+                result.is_ok(),
+                started.elapsed().as_micros_ceil(),
+            );
+            result?;
+        }
+        dev_info!(pdev.as_ref(), "G17P session: primary initdata ACK received\n");
+        {
+            let started = Instant::<Monotonic>::now();
+            let result = wait_initdata_ack(&session.gfx1_state);
+            dev_info!(
+                pdev.as_ref(),
+                "G17PMARK initdata-ack role=gfx1 ok={} took={}us\n",
+                result.is_ok(),
+                started.elapsed().as_micros_ceil(),
+            );
+            result?;
+        }
+        dev_info!(pdev.as_ref(), "G17P session: secondary initdata ACK received\n");
+
+        probe_g17p_ktrace(pdev.as_ref(), manager, "post-initdata-ack");
+
+        finish_boot_session(
+            pdev,
+            manager,
+            test_stage,
+            &session.gfx_state,
+            &session.gfx1_state,
+        )
+    })();
+
+    match boot_result {
+        Ok(config) => Ok(session.into_booted(config)),
+        Err(error) => {
+            if !rollback_starting_session(pdev, session) {
+                *stop_unproven = true;
+            }
+            Err(error)
+        }
+    }
 }
 
 #[inline(never)]
@@ -2257,7 +2330,7 @@ fn boot_initial_session(
     )?;
     let mut gfx_rtkit =
         rtkit::RtKit::<G17PRtkitOps>::new_g17p(drm.as_ref(), None, 0, gfx_state.clone())?;
-    let mut gfx1_rtkit =
+    let gfx1_rtkit =
         rtkit::RtKit::<G17PRtkitOps>::new_g17p(drm.as_ref(), None, 1, gfx1_state.clone())?;
     dev_info!(pdev.as_ref(), "G17P session: both RTKit receivers armed\n");
 
@@ -2272,7 +2345,8 @@ fn boot_initial_session(
     // made of, and NOT a `wait_initdata_ack` timeout, whose budget is
     // INITDATA_ACK_POLLS (200) x 10ms = 2.0s. These markers say which step it
     // actually was, and on which role, without inferring it from arithmetic.
-    let cpus = g17_lifecycle::StartedCpuPair::start_staged(gfx, gfx1, || {
+    let mut cpus = g17_lifecycle::StartedCpuPair::new(gfx, gfx1);
+    let start_result = cpus.start_staged_in_place(|| {
         dev_info!(pdev.as_ref(), "G17P session: GFX processor started\n");
         let started = Instant::<Monotonic>::now();
         let result = Pin::new(&mut gfx_rtkit).boot();
@@ -2285,140 +2359,190 @@ fn boot_initial_session(
         result?;
         dev_info!(pdev.as_ref(), "G17P session: GFX RTKit handshake complete\n");
         Ok(())
-    })?;
+    });
+    let mut session = G17PStartingSession {
+        cpus,
+        gfx_state,
+        gfx_rtkit,
+        gfx1_state,
+        gfx1_rtkit,
+    };
+    if let Err(error) = start_result {
+        rollback_starting_session(pdev, session);
+        return Err(error);
+    }
+
     dev_info!(pdev.as_ref(), "G17P session: GFX1 processor started\n");
-    {
+    let gfx1_boot_result = {
         let started = Instant::<Monotonic>::now();
-        let result = Pin::new(&mut gfx1_rtkit).boot();
+        let result = Pin::new(&mut session.gfx1_rtkit).boot();
         dev_info!(
             pdev.as_ref(),
             "G17PMARK rtkit-boot role=gfx1 ok={} took={}us\n",
             result.is_ok(),
             started.elapsed().as_micros_ceil(),
         );
-        result?;
+        result
+    };
+    if let Err(error) = gfx1_boot_result {
+        rollback_starting_session(pdev, session);
+        return Err(error);
     }
     dev_info!(pdev.as_ref(), "G17P session: GFX1 RTKit handshake complete\n");
 
-    let root_snapshot = uat
+    let root_snapshot = match uat
         .as_ref()
-        .ok_or(EIO)?
-        .prepare_t8140_firmware_high_roots()?;
-    let mut manager = g17_manager::G17PManagerConstruction::new_with_uat(
-        drm,
-        soc,
-        g17_manager::T8140_G17P_PLATFORM_CONFIG,
-        num_clusters,
-        gpc_perf_state_map,
-        gpc_perf_state_map_low,
-        gpc_perf_state_control,
-        uat.take().ok_or(EIO)?,
-    )?;
-    manager
-        .uat()
-        .confirm_t8140_primary_high_root(root_snapshot)?;
-    manager.uat().mirror_t8140_secondary_high_root()?;
-    registers.t8140_pre_initdata_clear()?;
+        .ok_or(EIO)
+        .and_then(|uat| uat.prepare_t8140_firmware_high_roots())
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            rollback_starting_session(pdev, session);
+            return Err(error);
+        }
+    };
+    let manager_result = uat.take().ok_or(EIO).and_then(|uat| {
+        g17_manager::G17PManagerConstruction::new_with_uat(
+            drm,
+            soc,
+            g17_manager::T8140_G17P_PLATFORM_CONFIG,
+            num_clusters,
+            gpc_perf_state_map,
+            gpc_perf_state_map_low,
+            gpc_perf_state_control,
+            uat,
+        )
+    });
+    let mut manager = match manager_result {
+        Ok(manager) => manager,
+        Err(error) => {
+            rollback_starting_session(pdev, session);
+            return Err(error);
+        }
+    };
+    let boot_result = (|| -> Result<G17PBootSessionConfig> {
+        manager
+            .uat()
+            .confirm_t8140_primary_high_root(root_snapshot)?;
+        manager.uat().mirror_t8140_secondary_high_root()?;
+        registers.t8140_pre_initdata_clear()?;
 
-    let trace_mask = *module_parameters::g17p_fw_trace.value();
-    if trace_mask != 0 {
-        if let Err(error) = manager.arm_firmware_trace_classes(trace_mask) {
-            dev_warn!(
+        let trace_mask = *module_parameters::g17p_fw_trace.value();
+        if trace_mask != 0 {
+            if let Err(error) = manager.arm_firmware_trace_classes(trace_mask) {
+                dev_warn!(
+                    pdev.as_ref(),
+                    "G17P firmware trace arm failed ({:?})\n",
+                    error
+                );
+            }
+        }
+        let handoff = manager.handoff();
+        let gfx_init = g17_rtkit::encode_initdata_doorbell(handoff.primary.instance.root)
+            .map_err(|_| EINVAL)?;
+        let gfx1_init = g17_rtkit::encode_initdata_doorbell(handoff.secondary.instance.root)
+            .map_err(|_| EINVAL)?;
+        // Serialise the two roles' initdata handshakes, as native does. MEASURED
+        // on the m1n1 hv capture 20260904-001852Z: macOS completes role 0 entirely
+        // before it touches role 1's endpoints.
+        //
+        //     36.32ms role0 -> ep0  start ep 0x20
+        //     38.88ms role0 -> ep0  start ep 0x21
+        //     40.40ms role0 -> ep20 initdata
+        //     43.59ms role0 <- ep20 ACK           <-- role 0 complete
+        //     44.08ms role1 -> ep0  start ep 0x20 <-- role 1 only begins here
+        //     52.01ms role1 -> ep20 initdata
+        //     57.55ms role1 <- ep20 ACK
+        //
+        // This driver started all four endpoints, published both initdata blocks
+        // and only then waited for either ACK, so the secondary's endpoints came up
+        // while the primary was still mid-handshake.
+        Pin::new(&mut session.gfx_rtkit)
+            .start_endpoint(g17_rtkit::ENDPOINT_GFX_MESSAGES)?;
+        Pin::new(&mut session.gfx_rtkit)
+            .start_endpoint(g17_rtkit::ENDPOINT_GFX_INTERRUPTS)?;
+        Pin::new(&mut session.gfx_rtkit)
+            .send_message(g17_rtkit::ENDPOINT_GFX_MESSAGES, gfx_init)?;
+        dev_info!(
+            pdev.as_ref(),
+            "G17P session: primary and secondary initdata published\n"
+        );
+        {
+            let started = Instant::<Monotonic>::now();
+            let result = wait_initdata_ack(&session.gfx_state);
+            dev_info!(
                 pdev.as_ref(),
-                "G17P firmware trace arm failed ({:?})\n",
-                error
+                "G17PMARK initdata-ack role=gfx ok={} took={}us (budget 2000000us)\n",
+                result.is_ok(),
+                started.elapsed().as_micros_ceil(),
+            );
+            result?;
+        }
+        dev_info!(pdev.as_ref(), "G17P session: primary initdata ACK received\n");
+
+        // Only now bring up the secondary, per the native ordering above.
+        Pin::new(&mut session.gfx1_rtkit)
+            .start_endpoint(g17_rtkit::ENDPOINT_GFX_MESSAGES)?;
+        Pin::new(&mut session.gfx1_rtkit)
+            .start_endpoint(g17_rtkit::ENDPOINT_GFX_INTERRUPTS)?;
+        Pin::new(&mut session.gfx1_rtkit)
+            .send_message(g17_rtkit::ENDPOINT_GFX_MESSAGES, gfx1_init)?;
+        {
+            let started = Instant::<Monotonic>::now();
+            let result = wait_initdata_ack(&session.gfx1_state);
+            dev_info!(
+                pdev.as_ref(),
+                "G17PMARK initdata-ack role=gfx1 ok={} took={}us\n",
+                result.is_ok(),
+                started.elapsed().as_micros_ceil(),
+            );
+            result?;
+        }
+        dev_info!(pdev.as_ref(), "G17P session: secondary initdata ACK received\n");
+
+        // Close the GPU power-on transition, as AGXArmFirmware::powerTransitionEnd
+        // does. MEASURED on the m1n1 hv capture 20260904-001852Z: this is the LAST
+        // EP-0x21 message of native bring-up, one per role, immediately after the
+        // initdata handshake and long before the first work doorbell. The kext
+        // sends the bare tag with payload zero to both role objects. This driver
+        // never sent it, and the firmware has been admitting our queues without
+        // ever being told the power transition completed.
+        {
+            let note = g17_rtkit::encode_power_transition_end();
+            Pin::new(&mut session.gfx_rtkit)
+                .send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, note)?;
+            Pin::new(&mut session.gfx1_rtkit)
+                .send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, note)?;
+            dev_info!(
+                pdev.as_ref(),
+                "G17P session: power-transition-end {:#018x} sent to both roles\n",
+                note,
             );
         }
-    }
-    let handoff = manager.handoff();
-    let gfx_init =
-        g17_rtkit::encode_initdata_doorbell(handoff.primary.instance.root).map_err(|_| EINVAL)?;
-    let gfx1_init = g17_rtkit::encode_initdata_doorbell(handoff.secondary.instance.root)
-        .map_err(|_| EINVAL)?;
-    // Serialise the two roles' initdata handshakes, as native does. MEASURED
-    // on the m1n1 hv capture 20260904-001852Z: macOS completes role 0 entirely
-    // before it touches role 1's endpoints.
-    //
-    //     36.32ms role0 -> ep0  start ep 0x20
-    //     38.88ms role0 -> ep0  start ep 0x21
-    //     40.40ms role0 -> ep20 initdata
-    //     43.59ms role0 <- ep20 ACK           <-- role 0 complete
-    //     44.08ms role1 -> ep0  start ep 0x20 <-- role 1 only begins here
-    //     52.01ms role1 -> ep20 initdata
-    //     57.55ms role1 <- ep20 ACK
-    //
-    // This driver started all four endpoints, published both initdata blocks
-    // and only then waited for either ACK, so the secondary's endpoints came up
-    // while the primary was still mid-handshake.
-    Pin::new(&mut gfx_rtkit).start_endpoint(g17_rtkit::ENDPOINT_GFX_MESSAGES)?;
-    Pin::new(&mut gfx_rtkit).start_endpoint(g17_rtkit::ENDPOINT_GFX_INTERRUPTS)?;
-    Pin::new(&mut gfx_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_MESSAGES, gfx_init)?;
-    dev_info!(
-        pdev.as_ref(),
-        "G17P session: primary and secondary initdata published\n"
-    );
-    {
-        let started = Instant::<Monotonic>::now();
-        let result = wait_initdata_ack(&gfx_state);
-        dev_info!(
-            pdev.as_ref(),
-            "G17PMARK initdata-ack role=gfx ok={} took={}us (budget 2000000us)\n",
-            result.is_ok(),
-            started.elapsed().as_micros_ceil(),
-        );
-        result?;
-    }
-    dev_info!(pdev.as_ref(), "G17P session: primary initdata ACK received\n");
 
-    // Only now bring up the secondary, per the native ordering above.
-    Pin::new(&mut gfx1_rtkit).start_endpoint(g17_rtkit::ENDPOINT_GFX_MESSAGES)?;
-    Pin::new(&mut gfx1_rtkit).start_endpoint(g17_rtkit::ENDPOINT_GFX_INTERRUPTS)?;
-    Pin::new(&mut gfx1_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_MESSAGES, gfx1_init)?;
-    {
-        let started = Instant::<Monotonic>::now();
-        let result = wait_initdata_ack(&gfx1_state);
-        dev_info!(
-            pdev.as_ref(),
-            "G17PMARK initdata-ack role=gfx1 ok={} took={}us\n",
-            result.is_ok(),
-            started.elapsed().as_micros_ceil(),
-        );
-        result?;
+        probe_g17p_ktrace(pdev.as_ref(), &mut manager, "post-initdata-ack");
+
+        finish_boot_session(
+            pdev,
+            &mut manager,
+            test_stage,
+            &session.gfx_state,
+            &session.gfx1_state,
+        )
+    })();
+
+    match boot_result {
+        Ok(config) => Ok((manager, session.into_booted(config))),
+        Err(error) => {
+            if !rollback_starting_session(pdev, session) {
+                // The initdata roots are live and a stop failed. The manager
+                // owns every DMA object behind those roots, so it must outlive
+                // the unproven processors along with the starting session.
+                core::mem::forget(manager);
+            }
+            Err(error)
+        }
     }
-    dev_info!(pdev.as_ref(), "G17P session: secondary initdata ACK received\n");
-
-    // Close the GPU power-on transition, as AGXArmFirmware::powerTransitionEnd
-    // does. MEASURED on the m1n1 hv capture 20260904-001852Z: this is the LAST
-    // EP-0x21 message of native bring-up, one per role, immediately after the
-    // initdata handshake and long before the first work doorbell. The kext
-    // sends the bare tag with payload zero to both role objects. This driver
-    // never sent it, and the firmware has been admitting our queues without
-    // ever being told the power transition completed.
-    {
-        let note = g17_rtkit::encode_power_transition_end();
-        Pin::new(&mut gfx_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, note)?;
-        Pin::new(&mut gfx1_rtkit).send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, note)?;
-        dev_info!(
-            pdev.as_ref(),
-            "G17P session: power-transition-end {:#018x} sent to both roles\n",
-            note,
-        );
-    }
-
-    probe_g17p_ktrace(pdev.as_ref(), &mut manager, "post-initdata-ack");
-
-    let session = finish_boot_session(
-        pdev,
-        drm,
-        &mut manager,
-        test_stage,
-        cpus,
-        gfx_state,
-        gfx_rtkit,
-        gfx1_state,
-        gfx1_rtkit,
-    )?;
-    Ok((manager, session))
 }
 
 /// State retained for the full lifetime of an exact T8140 platform device.
@@ -2500,6 +2624,10 @@ pub(crate) struct G17PLiveRuntime {
     registers: Option<regs::Resources>,
     manager: Option<KBox<g17_manager::G17PManagerConstruction>>,
     cpus: Option<g17_lifecycle::StartedCpuPair<G17PMailboxProvider>>,
+    /// A failed session rebuild could not prove that its newly started CPU
+    /// pair stopped. That pair and its RTKit owners were intentionally leaked;
+    /// final teardown must therefore retain the shared manager/UAT as well.
+    boot_stop_unproven: bool,
     gfx_state: Option<Arc<G17PRoleRtkitState>>,
     gfx_rtkit: Option<rtkit::RtKit<G17PRtkitOps>>,
     gfx1_state: Option<Arc<G17PRoleRtkitState>>,
@@ -6943,6 +7071,15 @@ impl G17PLiveRuntime {
             "G17P diagnostic: scheduler-root-checkpoints-v1 armed\n"
         );
 
+        // Complete every fallible host-only allocation before either firmware
+        // processor starts. A `?` in the later struct literal would otherwise
+        // partially drop `manager` before `cpus`, violating the same stop-first
+        // rule enforced by normal runtime teardown.
+        let completion_signal = G17PCompletionSignal::new()?;
+        let quarantined_render_completions = KVec::with_capacity(
+            g17_resources::G17PRenderQueuePair::SLOT_COUNT as usize,
+            GFP_KERNEL,
+        )?;
         let pdev_ref: ARef<platform::Device> = pdev.into();
         let (manager, session) = match boot_initial_session(
             &pdev_ref,
@@ -6975,6 +7112,7 @@ impl G17PLiveRuntime {
             registers: Some(registers),
             manager: Some(manager),
             cpus: Some(session.cpus),
+            boot_stop_unproven: false,
             gfx_state: Some(session.gfx_state),
             gfx_rtkit: Some(session.gfx_rtkit),
             gfx1_state: Some(session.gfx1_state),
@@ -6999,13 +7137,10 @@ impl G17PLiveRuntime {
             quarantined_bindings: KVec::new(),
             crash_recoveries: 0,
             compute_gate_suspect: false,
-            completion_signal: G17PCompletionSignal::new()?,
+            completion_signal,
             pending_compute: None,
             pending_render: [None, None],
-            quarantined_render_completions: KVec::with_capacity(
-                g17_resources::G17PRenderQueuePair::SLOT_COUNT as usize,
-                GFP_KERNEL,
-            )?,
+            quarantined_render_completions,
             render_event_masks: [[0; 2];
                 g17_resources::G17PRenderQueuePair::SLOT_COUNT as usize],
             render_fence_state: g17_completion::RenderFenceState::default(),
@@ -7116,6 +7251,9 @@ impl g17_lifecycle::PersistentRuntimeRecovery for G17PLiveRuntime {
     }
 
     fn stop_cpu_pair(&mut self) -> Result {
+        if self.boot_stop_unproven {
+            return Err(EIO);
+        }
         match self.cpus.as_mut() {
             Some(cpus) => cpus.stop(),
             None => Ok(()),
@@ -7178,13 +7316,31 @@ impl g17_lifecycle::PersistentRuntimeRecovery for G17PLiveRuntime {
     }
 
     fn rebuild_session_in_place(&mut self) -> Result {
+        if self.boot_stop_unproven {
+            return Err(EIO);
+        }
         drop(self.cpus.take());
         let pdev = self.pdev.as_ref().ok_or(ENODEV)?.clone();
         let drm = self.drm.as_ref().ok_or(ENODEV)?.clone();
-        let registers = self.registers.as_ref().ok_or(ENODEV)?;
-        let manager = self.manager.as_mut().ok_or(ENODEV)?;
-        manager.reset_session_after_processor_stop()?;
-        let session = boot_session(&pdev, &drm, registers, manager, self.test_stage)?;
+        let (boot_result, stop_unproven) = {
+            let registers = self.registers.as_ref().ok_or(ENODEV)?;
+            let manager = self.manager.as_mut().ok_or(ENODEV)?;
+            manager.reset_session_after_processor_stop()?;
+            let mut stop_unproven = false;
+            let result = boot_session(
+                &pdev,
+                &drm,
+                registers,
+                manager,
+                self.test_stage,
+                &mut stop_unproven,
+            );
+            (result, stop_unproven)
+        };
+        if stop_unproven {
+            self.boot_stop_unproven = true;
+        }
+        let session = boot_result?;
         self.cpus = Some(session.cpus);
         self.gfx_state = Some(session.gfx_state);
         self.gfx_rtkit = Some(session.gfx_rtkit);
@@ -7206,6 +7362,15 @@ impl g17_lifecycle::PersistentRuntimeRecovery for G17PLiveRuntime {
 
 impl g17_lifecycle::PersistentRuntimeTeardown for G17PLiveRuntime {
     fn stop_cpu_pair(&mut self) -> bool {
+        if self.boot_stop_unproven {
+            if let Some(pdev) = self.pdev.as_ref() {
+                dev_err!(
+                    pdev.as_ref(),
+                    "G17P teardown: failed boot left a CPU stop unproven; retaining firmware-owned state\n"
+                );
+            }
+            return false;
+        }
         let result = match self.cpus.as_mut() {
             Some(cpus) => cpus.stop(),
             None => Ok(()),
