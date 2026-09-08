@@ -99,7 +99,9 @@ for prerequisite in (
     "g17p_sksm_configuration_port_powered()",
     "DEVICE_CONTROL_OPCODE_IDLE_POWER_OFF",
     "encode_primary_device_control()",
-    "[publication.producer_after; 3]",
+    "[target; 3]",
+    "DEVICE_CONTROL_IDLE_POWER_OFF_ARG_INHIBIT",
+    "release_g17p_render_registration_power",
     "Err(ETIMEDOUT)",
 ):
     assert prerequisite in power, prerequisite
