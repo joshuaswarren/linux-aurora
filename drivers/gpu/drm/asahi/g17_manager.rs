@@ -215,8 +215,8 @@ enum G17PHardwareBufferIdError {
     NotReserved,
 }
 
-/// `g17p_render_slot_globals` bit: the outer ring entry's "channel started"
-/// byte follows the device-global channels rather than the slot's ordinal.
+/// `g17p_render_slot_globals` bit: derive the outer ring entry's "channel
+/// started" byte from the selected native queue pair's retained channel state.
 pub(crate) const G17P_RENDER_SLOT_GLOBAL_CHANNEL_STARTED: u32 = 1;
 /// `g17p_render_slot_globals` bit: tag-15 `+0x3e` publishes the device-global
 /// FList lifecycle sequence rather than the slot's ordinal.
@@ -224,6 +224,10 @@ pub(crate) const G17P_RENDER_SLOT_GLOBAL_FLIST_GENERATION: u32 = 2;
 
 fn g17p_render_slot_globals() -> u32 {
     *module_parameters::g17p_render_slot_globals.value()
+}
+
+fn g17p_render_pair_first_outer_submit(started: &[bool; 2], slot: u8) -> Option<bool> {
+    started.get(usize::from(slot)).map(|started| !*started)
 }
 
 const G17P_COMMAND_BUFFER_STATE_COUNT: usize = 64;
@@ -1188,11 +1192,10 @@ pub(crate) struct G17PManagerConstruction {
     /// be executing and therefore keeps both event states unavailable.
     render_command_buffer_states: G17PCommandBufferStateAllocator,
     render_command_buffer_state_pairs: [Option<u32>; 2],
-    /// Whether this firmware session has published a render on the
-    /// device-global outer data-master channels. The outer ring entry's
-    /// "channel started" byte describes those shared channels, not the slot
-    /// that happens to be submitting.
-    render_outer_channels_started: bool,
+    /// Whether each native TA/3D channel pair has published in this firmware
+    /// session. `encodeAcceleratorRingCommand` reads this state from the
+    /// selected AGXChannel, so pair 1 starts independently of pair 0.
+    render_outer_channels_started: [bool; 2],
     /// The SKSM half of the render path: one KSM kick queue per render data
     /// master. Present only while `g17p_render_sksm` is armed.
     render_sksm: Option<G17PRenderSksmQueues>,
@@ -1896,7 +1899,7 @@ impl G17PManagerConstruction {
                 render_hardware_buffer_ids: G17PHardwareBufferIdAllocator::new(),
                 render_command_buffer_states: G17PCommandBufferStateAllocator::new(),
                 render_command_buffer_state_pairs: [None, None],
-                render_outer_channels_started: false,
+                render_outer_channels_started: [false, false],
                 render_sksm: None,
                 bootstrap_uma: None,
                 prepared_render_flist: None,
@@ -3101,7 +3104,7 @@ impl G17PManagerConstruction {
             }
         }
         self.render_hardware_buffer_published = false;
-        self.render_outer_channels_started = false;
+        self.render_outer_channels_started = [false, false];
         self.render_bind = None;
         self.render_tracker = None;
         self.unreserve_render_storage_hardware_buffer_id();
@@ -3656,7 +3659,8 @@ impl G17PManagerConstruction {
                 queue.producer,
             )
         };
-        let (pair, descriptor_context_id, descriptor_contexts, render_root_slot, pb_binding) = {
+        let (pair, descriptor_context_id, descriptor_contexts, render_root_slot, pb_binding,
+            context_update) = {
             let storage = self.render_storage.as_mut().ok_or(ENODEV)?;
             (
                 storage.queue_pair(),
@@ -3664,6 +3668,7 @@ impl G17PManagerConstruction {
                 storage.descriptor_context_ids()?,
                 storage.render_root_slot(),
                 storage.parameter_buffer_binding(),
+                storage.context_update_pending(),
             )
         };
         let header_qid = u8::try_from(header.queue_id).map_err(|_| EINVAL)?;
@@ -3709,6 +3714,7 @@ impl G17PManagerConstruction {
             || header.field_56 != u16::from(producer.qos.queue_byte_32)
             || qos_record[0] != producer.qos.queue_byte_32
             || !context_equal
+            || header.context_update != u16::from(context_update)
             || !pb_equal
             || config != expected
         {
@@ -3734,11 +3740,13 @@ impl G17PManagerConstruction {
             );
             dev_err!(
                 dev.as_ref(),
-                "G17P render binding split: stage={} context(tag/owner/descriptor)={}/{}/{} root-slot={} pb(object/token/id/partner)={:#x}/{:#x}/{}/{} expected={:#x}/{:#x}/{}/{}\n",
+                "G17P render binding split: stage={} context(tag/owner/descriptor)={}/{}/{} update={}/{} root-slot={} pb(object/token/id/partner)={:#x}/{:#x}/{}/{} expected={:#x}/{:#x}/{}/{}\n",
                 if tiling { "TA" } else { "3D" },
                 header.context_id,
                 descriptor_context_id,
                 descriptor_context,
+                header.context_update,
+                u16::from(context_update),
                 render_root_slot,
                 header.parameter_buffer_object,
                 header.parameter_buffer_token,
@@ -4796,14 +4804,16 @@ impl G17PManagerConstruction {
         // firmware. Publication itself no longer touches the context table.
         //
         // The outer ring entry's "channel started" byte (`!chan[0x3c]` in
-        // native's encodeAcceleratorRingCommand) describes the device-global
-        // data-master channels, which both render slots share. Derive it from
-        // whether this session has published on them, not from the slot's own
-        // ordinal: a second slot's first render used to announce a never-started
-        // channel that already carried the other slot's whole history.
+        // native's encodeAcceleratorRingCommand) belongs to the selected
+        // AGXChannel. A fresh QID2/3 pair therefore publishes `1` even after
+        // QID0/1 has run, while repeats on either pair publish `0`.
         let first_outer_submit =
             if g17p_render_slot_globals() & G17P_RENDER_SLOT_GLOBAL_CHANNEL_STARTED != 0 {
-                !self.render_outer_channels_started
+                g17p_render_pair_first_outer_submit(
+                    &self.render_outer_channels_started,
+                    queue_pair.slot(),
+                )
+                .ok_or(EINVAL)?
             } else {
                 self.render_submission_ordinal == 0
             };
@@ -4840,7 +4850,7 @@ impl G17PManagerConstruction {
         // The ID is now firmware/GPU-owned. Any later validation failure must
         // retain it until semantic completion or a stopped-CPU teardown.
         self.render_hardware_buffer_published = true;
-        self.render_outer_channels_started = true;
+        self.render_outer_channels_started[usize::from(queue_pair.slot())] = true;
         if crate::util::g17p_verbose() {
             pr_info!(
                 "G17P render: outer publish OK, retained={} root-slot={}\n",
@@ -6178,6 +6188,10 @@ impl G17PManagerConstruction {
                     queues.tiling.producer = ta;
                     queues.fragment.producer = fragment;
                 }
+                self.render_storage
+                    .as_mut()
+                    .ok_or(ENODEV)?
+                    .complete_context_update();
                 self.render_hardware_buffer_id = None;
                 self.render_tracker = None;
                 self.render_hardware_buffer_published = false;

@@ -1748,6 +1748,44 @@ pub(crate) fn apply_g17p_retained_optional_with_flist_generation(
     context_id: u16,
     out: &mut [u8],
 ) -> Result<(), SubmissionError> {
+    apply_g17p_retained_optional_with_flist_generation_and_context_update(
+        stage,
+        addresses,
+        submission_ordinal,
+        flist_generation,
+        bias_generation,
+        queue_id,
+        partner_queue_id,
+        qos_hardware_buffer_id,
+        install,
+        context_id,
+        submission_ordinal == 0,
+        out,
+    )
+}
+
+/// Retained ConfigUpdate with the GART-context branch supplied independently
+/// from queue installation and QoS setup.
+///
+/// Native derives +0x62 from the descriptor's GART allocation generation
+/// versus the channel's cached context. A graph rebuilt for another VM must
+/// therefore request the context update even when its physical QID is already
+/// installed and its global submission ordinal is nonzero. Conversely, a
+/// same-context restage must leave it clear.
+pub(crate) fn apply_g17p_retained_optional_with_flist_generation_and_context_update(
+    stage: G17PColdOpeningStage,
+    addresses: G17PColdOpeningOptionalAddresses,
+    submission_ordinal: u32,
+    flist_generation: u64,
+    bias_generation: bool,
+    queue_id: u16,
+    partner_queue_id: u16,
+    qos_hardware_buffer_id: u16,
+    install: u16,
+    context_id: u16,
+    context_update: bool,
+    out: &mut [u8],
+) -> Result<(), SubmissionError> {
     // The announced event stamp is ordinal + 1 on this serialized path and
     // still has a 24-bit interface. Payload bytes are allowed to wrap; the
     // retained owner generation below must not truncate with them.
@@ -1765,10 +1803,11 @@ pub(crate) fn apply_g17p_retained_optional_with_flist_generation(
         out,
     )?;
     if submission_ordinal != 0 {
-        for offset in [0x1a, 0x52, 0x62] {
+        for offset in [0x1a, 0x52] {
             put_u16_le(out, offset, 0);
         }
     }
+    put_u16_le(out, 0x62, u16::from(context_update));
     // +0x2a is read by the firmware as a whole u64 (`ldur x27, [x19, #42]` in
     // the tag-15 ConfigUpdate handler) and stored into its per-queue table at
     // `0xfffffc0000125df0 + qid * 8`. Every consumer of that table uses
@@ -6160,6 +6199,35 @@ mod tests {
         assert_eq!(pair.tiling.next_producer, 2);
         assert_eq!(get_u32_le(&pair.fragment.slot, 0x14), 0x0001_0003);
         assert_eq!(get_u32_le(&pair.tiling.slot, 0x14), 0x0000_0003);
+    }
+
+    #[test]
+    fn g17p_context_update_is_fresh_graph_state_not_global_ordinal_state() {
+        let addresses = G17PColdOpeningOptionalAddresses {
+            context_scratch: 0x70_0200_0000,
+            firmware_scratch: 0x70_0200_4000,
+            usc_priv_mem_flist: 0x70_0200_8000,
+            usc_freelist_hardware_buffer_id: 0,
+            channel_control: 0x70_0200_c000,
+            tiling_shared_object: 0x70_0201_0000,
+            parameter_buffer_token: 0,
+            owner_pid: 0x15,
+            ta_hardware_buffer_id: 0,
+        };
+        for stage in [G17PColdOpeningStage::Tiling, G17PColdOpeningStage::Fragment] {
+            for (ordinal, context_update) in [(0, true), (195, true), (196, false)] {
+                let mut optional = [0u8; G17P_COLD_OPENING_OPTIONAL_SIZE];
+                apply_g17p_retained_optional_with_flist_generation_and_context_update(
+                    stage, addresses, ordinal, 2022, false, 2, 3, 2, 0, 6,
+                    context_update, &mut optional,
+                )
+                .unwrap();
+                assert_eq!(get_u16_le(&optional, 0x1a), 0);
+                assert_eq!(get_u16_le(&optional, 0x52), if ordinal == 0 { 1 } else { 0 });
+                assert_eq!(get_u16_le(&optional, 0x62), u16::from(context_update));
+                assert_eq!(get_u16_le(&optional, 0x32), 6);
+            }
+        }
     }
 
     #[test]

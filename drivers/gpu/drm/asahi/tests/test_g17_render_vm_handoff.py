@@ -140,6 +140,10 @@ storage_new = function(storage_impl, "fn new(")
 assert storage_new.count("g17p_cl_client_low_va_range()") >= 3
 assert "G17P_BOOTSTRAP_TA_DESCRIPTOR_LOW_VA\n                    .." not in storage_new
 reachability = function(resources, "pub(crate) fn first_unreachable(")
+assert '"primary-index-page"' not in reachability
+assert '"pm-page-list"' in reachability
+assert "pm.page_list_low_va()" in reachability
+assert "g17p_render_page_list_va(self.queue_pair)" in reachability
 ta_status = reachability[reachability.index('"ta-status-page"'):]
 ta_status = ta_status[:ta_status.index('"3d-status-page"')]
 assert "vm.covers_range(" in ta_status

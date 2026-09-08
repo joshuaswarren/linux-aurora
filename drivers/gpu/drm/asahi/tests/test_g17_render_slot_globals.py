@@ -1,21 +1,12 @@
 #!/usr/bin/env python3
-"""Device-global render publication fields follow the device, not the slot.
+"""Render publication fields follow their native ownership domains.
 
-Two bounded render slots share the outer data-master channels and the USC
-FList. Two fields in a render's publication describe that shared state, and
-both were derived from the submitting slot's own ordinal:
+Two bounded render slots own distinct outer AGXChannel pairs but share the USC
+FList. The two fields therefore have different ownership domains:
 
-* the outer ring entry's channel-started byte (+0x17, native `!chan[0x3c]`),
-  passed as `first_submit = render_submission_ordinal == 0`;
+* the outer ring entry's channel-started byte (+0x17, native `!chan[0x3c]`)
+  follows the selected pair;
 * tag-15 +0x3e, the FList generation, written as the slot ordinal.
-
-With one client the slot ordinal and the device counters coincide, so both
-were correct for every qualified run. With per-VM slot affinity a second
-client's first render is the first time a slot ordinal of 0 meets a warm
-device: it claimed a never-started channel that carried the other slot's whole
-history and announced FList generation 0 against a pool the firmware last saw
-at N. Measured 2026-09-07 as the firmware NOP-retiring that render (tiler never
-stamped its start) and raising a stamp-blamed recovery on its TA queue.
 
 This compiles the real tag-15 optional encoder and pins the manager's sources
 for both fields.
@@ -49,15 +40,14 @@ def constant(name):
 # --- channel-started byte -----------------------------------------------------
 inner = block(manager, "begin_translated_render_with_hardware_buffer")
 assert "let first_outer_submit =" in inner
-assert "!self.render_outer_channels_started" in inner
+assert "g17p_render_pair_first_outer_submit(" in inner
+assert "queue_pair.slot()," in inner
 publish = inner[inner.index(".publish_partial_opening_pair("):inner.index("move || {", inner.index(".publish_partial_opening_pair("))]
 assert "first_outer_submit," in publish
-assert "self.render_submission_ordinal == 0" not in publish, \
-    "the shared channels' started byte is still derived from the slot ordinal"
 assert inner.index("self.render_hardware_buffer_published = true;") \
-    < inner.index("self.render_outer_channels_started = true;")
+    < inner.index("self.render_outer_channels_started[usize::from(queue_pair.slot())] = true;")
 stop = block(manager, "release_runtime_objects_after_processor_stop")
-assert "self.render_outer_channels_started = false;" in stop
+assert "self.render_outer_channels_started = [false, false];" in stop
 outer = block(sub, "prepare_g17p_partial_opening_work_pair")
 assert "let render_channel_started = !first_submit;" in outer
 
@@ -67,17 +57,42 @@ assert inner.index("set_parameter_buffer_lease_token(") < inner.index("set_flist
 assert "lifecycle.sequence" in inner[inner.index("set_flist_generation("):][:600]
 for name in ["stage_fragment", "stage_fragment_prefix"]:
     body = block(resources, name)
-    assert "apply_g17p_retained_optional_with_flist_generation(" in body, name
+    assert "apply_g17p_retained_optional_with_flist_generation_and_context_update(" in body, name
     assert "let flist_generation = self.flist_generation;" in body, name
 late = block(resources, "prepare_late_tiling_publication_with_stamp")
 assert "self.flist_generation," in late
 restage = block(resources, "restage_command")
 assert "self.flist_generation = g17_submission::g17p_render_flist_generation(submission_ordinal);" in restage
-assert "apply_g17p_retained_optional(" not in resources.replace("apply_g17p_retained_optional_with_flist_generation(", ""), \
+assert "apply_g17p_retained_optional(" not in resources.replace("apply_g17p_retained_optional_with_flist_generation_and_context_update(", ""), \
     "a tag-15 optional is still encoded without the device-global generation"
+
+# --- GART context update -----------------------------------------------------
+assert "context_update_pending: true," in resources
+for name in ["stage_fragment", "stage_fragment_prefix", "prepare_late_tiling_publication_with_stamp"]:
+    assert "self.context_update_pending" in block(resources, name), name
+consistency = block(manager, "validate_render_queue_consistency")
+assert "header.context_update != u16::from(context_update)" in consistency
+completion = block(manager, "poll_translated_render_completion")
+assert "complete_context_update()" in completion
 
 body = "\n".join([
     "#![allow(dead_code, non_upper_case_globals)]",
+    block(manager, "g17p_render_pair_first_outer_submit"),
+    "use g17_submission::*;",
+    block(sub, "put_u32_le"),
+    block(sub, "put_u64_le"),
+    r'''
+const G17P_PARTIAL_OPENING_OUTER_SLOT_SIZE: usize = 0x18;
+const G17P_PARTIAL_OPENING_OUTER_SLOT_COUNT: u32 = 0x100;
+const G17P_PARTIAL_OPENING_TILING_CHANNEL_TABLE_INDEX: u8 = 0;
+const G17P_PARTIAL_OPENING_FRAGMENT_CHANNEL_TABLE_INDEX: u8 = 1;
+const G17P_PARTIAL_OPENING_PAIRED_DOORBELL: u64 = 0x0083_0000_0000_0000;
+''',
+    "#[derive(Debug, Copy, Clone, PartialEq, Eq)]\n" + block(sub, "G17PPartialOpeningOuterChannelState"),
+    "#[derive(Debug, Copy, Clone, PartialEq, Eq)]\n" + block(sub, "G17PPartialOpeningOuterSlotPlan"),
+    "#[derive(Debug, Copy, Clone, PartialEq, Eq)]\n" + block(sub, "PreparedG17PPartialOpeningWorkPair"),
+    block(sub, "prepare_g17p_partial_opening_outer_slot"),
+    block(sub, "prepare_g17p_partial_opening_work_pair"),
     r'''
 mod module_parameters {
     pub struct Param(u32);
@@ -98,10 +113,10 @@ mod module_parameters {
     *[block(sub, n) for n in [
         "put_u16_le", "put_u32_le", "put_u64_le", "apply_g17p_cold_opening_optional",
         "apply_g17p_retained_optional", "apply_g17p_retained_optional_with_flist_generation",
+        "apply_g17p_retained_optional_with_flist_generation_and_context_update",
         "g17p_render_flist_generation"]],
     "}",
     r'''
-use g17_submission::*;
 fn u64_at(b: &[u8], at: usize) -> u64 { u64::from_le_bytes(b[at..at+8].try_into().unwrap()) }
 fn u32_at(b: &[u8], at: usize) -> u32 { u32::from_le_bytes(b[at..at+4].try_into().unwrap()) }
 fn addresses() -> G17PColdOpeningOptionalAddresses {
@@ -110,6 +125,55 @@ fn addresses() -> G17PColdOpeningOptionalAddresses {
         usc_freelist_hardware_buffer_id: 0x11223344, channel_control: 0x700010c000,
         tiling_shared_object: 0xfffffc20c0060000, parameter_buffer_token: 0x123456789abc,
         owner_pid: 0x5678, ta_hardware_buffer_id: 7 }
+}
+
+#[test]
+fn outer_channel_started_is_independent_for_both_native_pairs() {
+    let mut started = [false, false];
+    assert_eq!(g17p_render_pair_first_outer_submit(&started, 0), Some(true));
+    started[0] = true;
+    assert_eq!(g17p_render_pair_first_outer_submit(&started, 0), Some(false));
+    assert_eq!(g17p_render_pair_first_outer_submit(&started, 1), Some(true));
+    started[1] = true;
+    assert_eq!(g17p_render_pair_first_outer_submit(&started, 1), Some(false));
+    assert_eq!(g17p_render_pair_first_outer_submit(&started, 2), None);
+}
+
+#[test]
+fn secondary_pair_outer_slots_match_native_first_and_repeat_bytes() {
+    let fresh = prepare_g17p_partial_opening_work_pair(
+        G17PPartialOpeningOuterChannelState {
+            consumers: [0, 0], producer: 0,
+            queue_gpu_va: 0xffff_fc20_c000_0240, queue_write_index: 3,
+        },
+        G17PPartialOpeningOuterChannelState {
+            consumers: [0, 0], producer: 0,
+            queue_gpu_va: 0xffff_fc20_c000_0180, queue_write_index: 3,
+        },
+        3, 2, true,
+    ).unwrap();
+    assert_eq!(fresh.tiling.slot, [
+        0, 0, 0, 0, 0, 0, 0, 0, 0x80, 0x01, 0x00, 0xc0,
+        0x20, 0xfc, 0xff, 0xff, 0, 0, 0, 0, 3, 0, 2, 1,
+    ]);
+    assert_eq!(fresh.fragment.slot, [
+        0, 0, 0, 0, 0, 0, 0, 0, 0x40, 0x02, 0x00, 0xc0,
+        0x20, 0xfc, 0xff, 0xff, 1, 0, 0, 0, 3, 0, 3, 1,
+    ]);
+
+    let repeat = prepare_g17p_partial_opening_work_pair(
+        G17PPartialOpeningOuterChannelState {
+            consumers: [0, 0], producer: 1,
+            queue_gpu_va: 0xffff_fc20_c000_0240, queue_write_index: 6,
+        },
+        G17PPartialOpeningOuterChannelState {
+            consumers: [0, 0], producer: 1,
+            queue_gpu_va: 0xffff_fc20_c000_0180, queue_write_index: 6,
+        },
+        3, 2, false,
+    ).unwrap();
+    assert_eq!(&repeat.tiling.slot[0x14..], &[6, 0, 2, 0]);
+    assert_eq!(&repeat.fragment.slot[0x14..], &[6, 0, 3, 0]);
 }
 
 #[test]
@@ -150,6 +214,25 @@ fn the_second_slots_first_render_names_the_live_pool_generation() {
     apply_g17p_retained_optional(
         G17PColdOpeningStage::Tiling, addresses(), 0, false, 2, 3, 2, 1, 6, &mut old).unwrap();
     assert_eq!(u64_at(&old, 0x3e), 0, "the per-slot encoder regressed the pool to generation 0");
+}
+
+#[test]
+fn a_fresh_nonzero_ordinal_updates_context_then_retained_work_does_not() {
+    for stage in [G17PColdOpeningStage::Tiling, G17PColdOpeningStage::Fragment] {
+        let mut fresh = [0u8; G17P_COLD_OPENING_OPTIONAL_SIZE];
+        apply_g17p_retained_optional_with_flist_generation_and_context_update(
+            stage, addresses(), 195, 195, false, 2, 3, 2, 0, 6, true,
+            &mut fresh).unwrap();
+        assert_eq!(&fresh[0x1a..0x1c], &0u16.to_le_bytes());
+        assert_eq!(&fresh[0x52..0x54], &0u16.to_le_bytes());
+        assert_eq!(&fresh[0x62..0x64], &1u16.to_le_bytes());
+
+        let mut retained = [0u8; G17P_COLD_OPENING_OPTIONAL_SIZE];
+        apply_g17p_retained_optional_with_flist_generation_and_context_update(
+            stage, addresses(), 196, 196, false, 2, 3, 2, 0, 6, false,
+            &mut retained).unwrap();
+        assert_eq!(&retained[0x62..0x64], &0u16.to_le_bytes());
+    }
 }
 ''',
 ])
