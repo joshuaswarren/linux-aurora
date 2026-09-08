@@ -1178,6 +1178,10 @@ pub(crate) struct G17PManagerConstruction {
     /// has overwritten the descriptor pointer. Only stopping both processors
     /// proves that firmware can no longer name the context/root.
     retired_render_handoff_graphs: KVec<G17PRetiredRenderGraph>,
+    /// Descriptor contexts whose owning DRM queue has been destroyed after
+    /// its scheduler entity drained. A still-active graph is kept until its
+    /// next handoff; inactive graphs can be reclaimed immediately.
+    released_render_contexts: u64,
     render_submission_ordinal: u32,
     /// Per-command host timestamp shared by the TA and 3D KSM entries. Native
     /// prepares it once in the combined render descriptor, before either
@@ -1904,6 +1908,7 @@ impl G17PManagerConstruction {
                 render_context_aliases: None,
                 retired_render_handoff_graph: None,
                 retired_render_handoff_graphs,
+                released_render_contexts: 0,
                 render_submission_ordinal: 0,
                 render_auxiliary_timestamp: 0,
                 render_hardware_buffer_id: None,
@@ -3136,6 +3141,7 @@ impl G17PManagerConstruction {
                 Some(retired),
             );
         }
+        self.released_render_contexts = 0;
         self.render_sksm = None;
         self.bootstrap_uma = None;
         self.prepared_render_flist = None;
@@ -3356,6 +3362,14 @@ impl G17PManagerConstruction {
         let Some(previous) = self.retired_render_handoff_graph.take() else {
             return Ok(());
         };
+        let context = previous.storage.descriptor_context_id();
+        if context < 64 && self.released_render_contexts & (1u64 << context) != 0 {
+            Self::release_retired_handoff_graph(
+                &mut self.render_hardware_buffer_ids,
+                Some(previous),
+            );
+            return Ok(());
+        }
         if let Err(error) = self
             .retired_render_handoff_graphs
             .push_within_capacity(previous)
@@ -3364,6 +3378,46 @@ impl G17PManagerConstruction {
             return Err(ENOMEM);
         }
         Ok(())
+    }
+
+    /// Reclaim graphs belonging to a DRM queue after its scheduler entity has
+    /// drained. Native frees the work queue at this boundary; unlike finite
+    /// completion-ring eviction, queue destruction proves no new descriptor
+    /// from this context can be published. The currently selected graph is
+    /// marked and released by the next ordinary handoff, which preserves its
+    /// installed physical-QID backing until a replacement is ready.
+    pub(crate) fn release_render_context_owner(&mut self, context: u16) {
+        if context >= 64 { return; }
+        self.released_render_contexts |= 1u64 << context;
+        let matches = |graph: &G17PRetiredRenderGraph| {
+            graph.storage.descriptor_context_id() == context
+        };
+        if self.retired_render_handoff_graph.as_ref().is_some_and(matches) {
+            let graph = self.retired_render_handoff_graph.take();
+            Self::release_retired_handoff_graph(&mut self.render_hardware_buffer_ids, graph);
+        }
+        let mut index = 0;
+        while index < self.retired_render_handoff_graphs.len() {
+            if !matches(&self.retired_render_handoff_graphs[index]) {
+                index += 1;
+                continue;
+            }
+            if let Ok(graph) = self.retired_render_handoff_graphs.remove(index) {
+                Self::release_retired_handoff_graph(
+                    &mut self.render_hardware_buffer_ids,
+                    Some(graph),
+                );
+            }
+        }
+        for state in self.parked_render_slots.iter_mut().flatten() {
+            if state.retired_handoff_graph.as_ref().is_some_and(matches) {
+                let graph = state.retired_handoff_graph.take();
+                Self::release_retired_handoff_graph(
+                    &mut self.render_hardware_buffer_ids,
+                    graph,
+                );
+            }
+        }
     }
 
     fn prune_unreferenced_retired_render_graphs(&mut self) -> Result {
@@ -4350,6 +4404,9 @@ impl G17PManagerConstruction {
         let descriptor_context_id = execution_context.context_id() as u16;
         if !execution_context.matches(vm) || !execution_context.is_current() {
             return Err(EFAULT);
+        }
+        if descriptor_context_id < 64 {
+            self.released_render_contexts &= !(1u64 << descriptor_context_id);
         }
         if self.render_tracker.is_some() || self.render_hardware_buffer_id.is_some() {
             return Err(EBUSY);

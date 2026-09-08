@@ -716,7 +716,7 @@ struct G17PQueue {
     context: Arc<mmu::T8140ComputeExecutionContext>,
     async_backend: Option<Arc<G17PAsyncQueueBackend>>,
     async_scheduler: Option<g17_job::G17PJobScheduler<G17PAsyncQueueBackend>>,
-    render_scheduler: g17_job::G17PRenderWatchScheduler<G17PRenderWatchBackend>,
+    render_scheduler: Option<g17_job::G17PRenderWatchScheduler<G17PRenderWatchBackend>>,
     /// Most recent compute job submitted through this logical DRM queue.
     /// Render explicitly joins this timeline before acquiring its physical
     /// slot; its own completion is event-driven after publication.
@@ -735,7 +735,12 @@ impl Drop for G17PQueue {
         // even though no DRM file still owns the render node, forcing the next
         // client onto a needlessly fresh hardware queue.  Release explicitly
         // after the entity is torn down; the backend's later Drop is idempotent.
+        drop(self.render_scheduler.take());
         drop(self.async_scheduler.take());
+        self.runtime
+            .mutex()
+            .lock()
+            .release_render_owner(self.id, self.context.context_id() as u16);
         self.runtime
             .mutex()
             .lock()
@@ -871,7 +876,7 @@ impl G17PQueue {
             context,
             async_backend: None,
             async_scheduler: None,
-            render_scheduler,
+            render_scheduler: Some(render_scheduler),
             last_async_compute: None,
             id,
         })
@@ -2151,7 +2156,7 @@ impl G17PQueue {
                         ));
                     }
                 };
-                let finished = match self.render_scheduler.enqueue(packet) {
+                let finished = match self.render_scheduler.as_mut().ok_or(ENODEV)?.enqueue(packet) {
                     Ok(fence) => fence,
                     Err(error) => {
                         let quarantine = self.runtime.mutex().lock().timeout_deferred_render(
