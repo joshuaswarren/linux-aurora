@@ -1172,11 +1172,11 @@ pub(crate) struct G17PManagerConstruction {
     /// generation mapped so the incoming graph cannot immediately reuse and
     /// overwrite the same VA or PBDesc ID.
     retired_render_handoff_graph: Option<G17PRetiredRenderGraph>,
-    /// Older handoff generations whose descriptor back-references are still
-    /// present in the hardware completion rings. The immediately preceding
-    /// generation remains in `retired_render_handoff_graph`; when another VM
-    /// handoff displaces it, it moves here instead of being freed beneath an
-    /// observable firmware pointer.
+    /// Older VM/context graphs retained for the firmware-session lifetime.
+    /// Completion-ring records are not a release fence for the descriptor
+    /// context: GMMU can issue a late PM/page-list read after that finite ring
+    /// has overwritten the descriptor pointer. Only stopping both processors
+    /// proves that firmware can no longer name the context/root.
     retired_render_handoff_graphs: KVec<G17PRetiredRenderGraph>,
     render_submission_ordinal: u32,
     /// Per-command host timestamp shared by the TA and 3D KSM entries. Native
@@ -3356,62 +3356,21 @@ impl G17PManagerConstruction {
         let Some(previous) = self.retired_render_handoff_graph.take() else {
             return Ok(());
         };
-        let range = match previous.storage.descriptor_high_range() {
-            Ok(range) => range,
-            Err(error) => {
-                self.retired_render_handoff_graph = Some(previous);
-                return Err(error);
-            }
-        };
-        let referenced = match self
-            .resources
-            .completion_references_descriptor_range(&range)
+        if let Err(error) = self
+            .retired_render_handoff_graphs
+            .push_within_capacity(previous)
         {
-            Ok(referenced) => referenced,
-            Err(error) => {
-                self.retired_render_handoff_graph = Some(previous);
-                return Err(error);
-            }
-        };
-        if referenced {
-            if let Err(error) = self
-                .retired_render_handoff_graphs
-                .push_within_capacity(previous)
-            {
-                self.retired_render_handoff_graph = Some(error.0);
-                return Err(ENOMEM);
-            }
-        } else {
-            Self::release_retired_handoff_graph(
-                &mut self.render_hardware_buffer_ids,
-                Some(previous),
-            );
+            self.retired_render_handoff_graph = Some(error.0);
+            return Err(ENOMEM);
         }
         Ok(())
     }
 
     fn prune_unreferenced_retired_render_graphs(&mut self) -> Result {
-        let mut index = 0;
-        while index < self.retired_render_handoff_graphs.len() {
-            let range = self.retired_render_handoff_graphs[index]
-                .storage
-                .descriptor_high_range()?;
-            if self
-                .resources
-                .completion_references_descriptor_range(&range)?
-            {
-                index += 1;
-                continue;
-            }
-            let retired = self
-                .retired_render_handoff_graphs
-                .remove(index)
-                .map_err(|_| EIO)?;
-            Self::release_retired_handoff_graph(
-                &mut self.render_hardware_buffer_ids,
-                Some(retired),
-            );
-        }
+        // Deliberately no completion-ring pruning. That ring is a diagnostic
+        // history, not the native work-queue/descriptor event which owns the
+        // context. The bounded vector and HWPB allocator make exhaustion fail
+        // before publication; processor stop performs the only proven drain.
         Ok(())
     }
 

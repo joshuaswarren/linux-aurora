@@ -6,6 +6,7 @@ from pathlib import Path
 
 root = Path(__file__).resolve().parents[1]
 resources = (root / "g17_resources.rs").read_text()
+manager = (root / "g17_manager.rs").read_text()
 
 
 def function(marker):
@@ -18,12 +19,23 @@ def function(marker):
     return resources[start:pos]
 
 
+def manager_function(marker):
+    start = manager.index(marker)
+    pos = manager.index("{", start) + 1
+    depth = 1
+    while depth:
+        depth += (manager[pos] == "{") - (manager[pos] == "}")
+        pos += 1
+    return manager[start:pos]
+
+
 storage = resources[
     resources.index("pub(crate) struct G17PUserRenderStorage {") :
     resources.index("enum G17PRenderCommandContext")
 ]
 prepare = function("pub(crate) fn prepare_cached_reactivation(")
 restage = function("pub(crate) fn restage_command(")
+lookup = manager_function("fn render_bind_for_descriptor_context(")
 
 assert "cached_reactivation_pending: bool" in storage
 assert "self.cached_reactivation_pending = true" in prepare
@@ -36,6 +48,13 @@ assert "let mut next_render_generation = if reuse_cached_render_state" in restag
 assert "self.cached_reactivation_pending = false" in restage
 assert "const G17P_RENDER_STATE_AUX_FB: usize = G17P_RENDER_STATE_DYNAMIC" in resources
 assert "(scene_scratch, discard, tvb, after_aux_fb)" in resources
+for owner in (
+    "self.render_storage",
+    "retired_render_handoff_graph",
+    "retired_render_handoff_graphs",
+    "self.parked_render_slots",
+):
+    assert owner in lookup
 
 # Model the fixed-VA owner transition. A cached return keeps the exact alias
 # owner; a normal restage installs a new parity generation only after its old
@@ -68,6 +87,15 @@ state_layouts = {
     "small-again": (0x10000, 0x18000),
 }
 assert len(set(state_layouts.values())) == 1
+
+# Context identity, unlike the active slot, stays with each complete graph.
+# Lookup must continue to find both contexts after A -> B -> A and after the
+# finite completion history has wrapped.
+contexts = {6: "graph-a", 9: "graph-b"}
+active = 6
+for active in (9, 6, 9, 6):
+    assert contexts[6] == "graph-a"
+    assert contexts[9] == "graph-b"
 
 try:
     vm_a.install(va, "graph-a2")
