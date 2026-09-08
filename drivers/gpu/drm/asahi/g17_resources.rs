@@ -1008,6 +1008,11 @@ impl G17PRenderStorageVaLayout {
 const G17P_RENDER_STATE_DEFLAKE: usize = 0x04000;
 const G17P_RENDER_STATE_TA_STATUS: usize = 0x08000;
 const G17P_RENDER_STATE_DYNAMIC: usize = 0x10000;
+/// AXFB remains command-state owned, but TMAP/HMTA and TPC moved to their
+/// native retained render-target-memory owner. Keep the surviving state at a
+/// capacity-stable offset so a cached VM graph can reuse its exact mapping
+/// across small -> large -> small commands without remapping fixed aliases.
+const G17P_RENDER_STATE_AUX_FB: usize = G17P_RENDER_STATE_DYNAMIC;
 const G17P_RENDER_STATE_AUX_FB_SIZE: usize = 0x8000;
 const G17P_RENDER_AUX_FB_PAGE_COUNT: u64 = 0x10_0000;
 const G17P_RENDER_DBIAS_IS_INT: u32 = 1 << 18;
@@ -1205,7 +1210,12 @@ fn g17p_render_state_layout(
     let tilemap_span = tilemap_size.checked_add(0xfff)? & !0xfff;
     let heapmeta = tilemap.checked_add(tilemap_span)?;
     let tpc = page_align(heapmeta.checked_add(heapmeta_size)?)?;
-    let aux_fb = tpc.checked_add(page_align(tpc_size)?)?;
+    // TMAP/HMTA rotate in `G17PRenderTargetMemory::rt_memory` and TPC has its
+    // own stable object. They no longer occupy `render_state`; only their
+    // sizes and relative RT-record offsets remain in this layout. AXFB is the
+    // final region actually backed by render_state and therefore has one
+    // fixed offset/capacity for the graph's whole lifetime.
+    let aux_fb = G17P_RENDER_STATE_AUX_FB;
     let after_tilemap = tilemap.checked_add(page_align(tilemap_size)?)?;
     let after_aux_fb = aux_fb.checked_add(G17P_RENDER_STATE_AUX_FB_SIZE)?;
     let (pm_scene_scratch, pm_discard, tvb, total_size) = if g17p_render_tvb_enabled() {
@@ -1215,7 +1225,7 @@ fn g17p_render_state_layout(
         // TVB backing lives in a separate compact-GART allocation. Keep the
         // offset as the end of the render-state object, but do not duplicate
         // the potentially hundreds-of-megabytes TVB inside that object.
-        (scene_scratch, discard, tvb, tvb)
+        (scene_scratch, discard, tvb, after_aux_fb)
     } else {
         (after_aux_fb, after_aux_fb, after_aux_fb, after_aux_fb)
     };
@@ -17903,7 +17913,7 @@ mod tests {
     }
 
     #[test]
-    fn user_render_state_sizes_follow_the_legacy_scene_geometry() {
+    fn user_render_state_keeps_capacity_stable_across_scene_geometry() {
         let parameters = g17_render::G17pRenderParameters::source_rsrc8();
         let layout = g17p_render_state_layout(&parameters, 2).unwrap();
         assert_eq!(layout.tilemap, 0x10000);
@@ -17912,8 +17922,8 @@ mod tests {
         assert_eq!(layout.heapmeta_size, 0x200);
         assert_eq!(layout.tpc, 0x14000);
         assert_eq!(layout.tpc_size, 0x1000);
-        assert_eq!(layout.aux_fb, 0x18000);
-        assert_eq!(layout.total_size, 0x20000);
+        assert_eq!(layout.aux_fb, 0x10000);
+        assert_eq!(layout.total_size, 0x18000);
         assert_eq!(G17P_RENDER_STATE_AUX_FB_SIZE, 0x8000);
         assert_eq!(G17P_RENDER_AUX_FB_PAGE_COUNT, 0x10_0000);
         assert_eq!(g17p_aux_fb_flags(0), 0xc000);
@@ -17921,6 +17931,15 @@ mod tests {
             g17p_aux_fb_flags(G17P_RENDER_DBIAS_IS_INT),
             0x4c000
         );
+
+        let mut large_parameters = parameters;
+        large_parameters.width = 4096;
+        large_parameters.height = 4096;
+        let large = g17p_render_state_layout(&large_parameters, 2).unwrap();
+        assert!(large.tpc_size > layout.tpc_size);
+        assert!(large.tilemap_size > layout.tilemap_size);
+        assert_eq!(large.aux_fb, layout.aux_fb);
+        assert_eq!(large.total_size, layout.total_size);
 
         let mut runtime = vec![0xa5; layout.total_size];
         assert_eq!(
