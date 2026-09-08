@@ -1228,7 +1228,7 @@ struct G17PRetiredRenderGraph {
     // Rust drops fields in declaration order. Retract roots and their aliases
     // before releasing any storage reachable through them.
     bind: G17PRenderRootOwner,
-    context_aliases: mmu::T8140NativeContextAliases,
+    context_aliases: Option<mmu::T8140NativeContextAliases>,
     storage: g17_resources::G17PUserRenderStorage,
 }
 
@@ -3145,12 +3145,12 @@ impl G17PManagerConstruction {
         let old_root = self.render_bind.as_ref().map_or(0, |binding| binding.root());
         let old_vm_id = self.render_bind.as_ref().map_or(0, |binding| binding.vm_id());
         self.park_render_sksm_backing_for_graph_rebuild()?;
-        if self.render_bind.is_none() || self.render_context_aliases.is_none() {
+        if self.render_bind.is_none() {
             return Err(EIO);
         }
         let retired = G17PRetiredRenderGraph {
             bind: self.render_bind.take().ok_or(EIO)?,
-            context_aliases: self.render_context_aliases.take().ok_or(EIO)?,
+            context_aliases: self.render_context_aliases.take(),
             storage: self.render_storage.take().ok_or(ENODEV)?,
         };
         let previous = self.retired_render_handoff_graph.replace(retired);
