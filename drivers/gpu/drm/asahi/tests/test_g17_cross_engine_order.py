@@ -40,9 +40,12 @@ assert render.index("self.last_submission = Some(finished.clone());") < render.i
 )
 
 join = function(source, "    fn join_queue_timeline(")
-assert "dma_fence_wait_timeout" in join
-assert join.index("dma_fence_wait_timeout") < join.index("self.last_submission = None;")
-assert "MAX_SCHEDULE_TIMEOUT" in join
+assert "Self::wait_fence(fence)" in join
+assert join.index("Self::wait_fence(fence)") < join.index("self.last_submission = None;")
+wait = function(source, "    fn wait_fence(")
+assert "dma_fence_wait_timeout" in wait and "MAX_SCHEDULE_TIMEOUT" in wait
+assert wait.index("dma_fence_wait_timeout") < wait.index("dma_fence_get_status")
+assert "if status < 0" in wait, "a signalled error fence incorrectly satisfies queue order"
 
 # Host model of exactly the state transition above. A logical queue carries a
 # single cross-engine predecessor; a different logical queue has no dependency
