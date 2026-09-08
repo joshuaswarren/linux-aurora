@@ -5089,6 +5089,7 @@ fn prepare_g17p_retained_scene(
     layout: &G17PParameterManagementLayout,
     scene: usize,
     manager_generation: u64,
+    hardware_buffer_id: u32,
 ) -> Result {
     if scene >= G17P_PM_SCENE_COUNT {
         return Err(EINVAL);
@@ -5100,6 +5101,13 @@ fn prepare_g17p_retained_scene(
     let selected = raw.get_mut(at..end).ok_or(ERANGE)?;
     put_u32(selected, 0x48, 0);
     put_u64(selected, 0x4c, manager_generation);
+    // Native loadPBDesc copies the command's allocated HardwareBufferID into
+    // PBState +0x0c immediately before every submission.  This word is not a
+    // constructor invariant: firmware reuses the retained PBState and may
+    // leave other state there between commands.  Reassert the ID together
+    // with the Scene generation so the completion path cannot interpret a
+    // stale byte count as a PBDesc-table index.
+    put_u32(raw, layout.hwpb_state + 0x0c, hardware_buffer_id);
     Ok(())
 }
 
@@ -5460,7 +5468,13 @@ impl G17PParameterManagement {
         )
         .ok_or(EINVAL)?;
         self.backing.with_bytes_mut(|raw| {
-            prepare_g17p_retained_scene(raw, &self.layout, scene, self.manager_generation)
+            prepare_g17p_retained_scene(
+                raw,
+                &self.layout,
+                scene,
+                self.manager_generation,
+                hardware_buffer_id,
+            )
         })?;
         self.selected_scene = scene;
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
@@ -16722,10 +16736,15 @@ mod tests {
         assert_eq!(g17p_pm_manager_generation_plan(7), Ok((7, 8)));
         assert_eq!(g17p_pm_manager_generation_plan(0), Err(EINVAL));
         assert_eq!(g17p_pm_manager_generation_plan(u64::MAX), Err(EOVERFLOW));
+        // Firmware may overwrite PBState scratch between submissions. Native
+        // loadPBDesc restores the HardwareBufferID on every command, not only
+        // when constructing the retained manager.
+        put_u32(&mut raw, pm.hwpb_state + 0x0c, 0x38_0000);
         assert_eq!(
-            prepare_g17p_retained_scene(&mut raw, &pm, 0, 8),
+            prepare_g17p_retained_scene(&mut raw, &pm, 0, 8, 5),
             Ok(())
         );
+        assert_eq!(get_u32(&raw, pm.hwpb_state + 0x0c), 5);
         assert_eq!(get_u64(&raw, pm.scene_states + 0x4c), 8);
         assert_eq!(get_u64(&raw, pm.scene_states + 8), metrics_vas[0]);
     }
