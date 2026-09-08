@@ -5,13 +5,23 @@ r=p.parent/'mmu.rs'
 s=r.read_text()
 a=s.index('struct VmDriverMappings {');b=s.index('/// Slot data for a',a)
 structs=s[a:b]
-a=s.index('    pub(crate) fn install_driver_mappings(');b=s.index('    /// Check that a byte range',a)
-methods=s[a:b]
-# Job ownership has its own production-source suite; this suite executes the
-# full unmap method with no outstanding jobs and keeps testing exact exclusions.
-a=methods.index('    pub(crate) fn retain_t8140_job(')
-b=methods.index('    /// Remove userspace mappings',a)
-methods=methods[:a]+methods[b:]
+def function(source, marker):
+    start=source.index(marker);pos=source.index('{',start)+1;depth=1
+    while depth:
+        depth+=(source[pos]=='{')-(source[pos]=='}');pos+=1
+    return source[start:pos]
+methods='\n'.join(function(s, marker) for marker in [
+    '    pub(crate) fn install_driver_mappings(',
+    '    pub(crate) fn render_pool_mappings_match(',
+    '    pub(crate) fn install_render_pool_mappings(',
+    '    pub(crate) fn render_pool_tvb_blocks(',
+    '    pub(crate) fn clear_render_pool_mappings(',
+    '    pub(crate) fn compute_pool_mappings_match(',
+    '    pub(crate) fn install_compute_pool_mappings(',
+    '    pub(crate) fn clear_compute_pool_mappings(',
+    '    pub(crate) fn driver_range_overlaps(',
+    '    pub(crate) fn unmap_user_ranges(',
+])
 preamble=r'''
 #![allow(dead_code)]
 use std::ops::{Range,Deref,DerefMut};
@@ -51,24 +61,25 @@ tests=r'''
 fn main(){
 let drops=Arc::new(AtomicUsize::new(0));let vm=Vm::new();
 assert!(!vm.render_pool_mappings_match(1));vm.clear_render_pool_mappings();
-assert_eq!(vm.install_render_pool_mappings(1,vec![vm.mapping(96..112,&drops)]),Err(EINVAL));assert_eq!(drops.load(Ordering::SeqCst),1);
+assert_eq!(vm.install_render_pool_mappings(1,1,vec![vm.mapping(96..112,&drops)]),Err(EINVAL));assert_eq!(drops.load(Ordering::SeqCst),1);
 assert_eq!(vm.install_driver_mappings(vec![vm.mapping(16..32,&drops)],vec![192..224]),Ok(()));
-assert_eq!(vm.install_render_pool_mappings(0,vec![vm.mapping(96..112,&drops)]),Err(EINVAL));assert_eq!(drops.load(Ordering::SeqCst),2);
-assert_eq!(vm.install_render_pool_mappings(7,vec![vm.mapping(96..112,&drops),vm.mapping(160..176,&drops)]),Ok(()));
+assert_eq!(vm.install_render_pool_mappings(0,1,vec![vm.mapping(96..112,&drops)]),Err(EINVAL));assert_eq!(drops.load(Ordering::SeqCst),2);
+assert_eq!(vm.install_render_pool_mappings(7,2,vec![vm.mapping(96..112,&drops),vm.mapping(160..176,&drops)]),Ok(()));
 assert!(vm.render_pool_mappings_match(7));assert!(!vm.render_pool_mappings_match(0));assert!(!vm.render_pool_mappings_match(8));
-assert_eq!(vm.install_render_pool_mappings(7,vec![vm.mapping(128..144,&drops)]),Err(EBUSY));
-assert_eq!(vm.install_render_pool_mappings(8,vec![vm.mapping(128..144,&drops)]),Err(EBUSY));assert_eq!(drops.load(Ordering::SeqCst),4);
+assert_eq!(vm.render_pool_tvb_blocks(7),Some(2));
+assert_eq!(vm.install_render_pool_mappings(7,1,vec![vm.mapping(128..144,&drops)]),Err(EBUSY));
+assert_eq!(vm.install_render_pool_mappings(8,1,vec![vm.mapping(128..144,&drops)]),Err(EBUSY));assert_eq!(drops.load(Ordering::SeqCst),4);
 assert!(vm.driver_range_overlaps(20..21));assert!(vm.driver_range_overlaps(100..101));assert!(vm.driver_range_overlaps(168..169));assert!(vm.driver_range_overlaps(200..201));assert!(!vm.driver_range_overlaps(32..64));assert!(!vm.driver_range_overlaps(80..96));
 assert_eq!(vm.unmap_user_ranges(0..256,64..80),Ok(()));
 assert_eq!(*vm.unmapped.lock().unwrap(),vec![0..16,32..64,80..96,112..160,176..192,224..256]);
 vm.clear_render_pool_mappings();assert_eq!(drops.load(Ordering::SeqCst),6);assert!(!vm.render_pool_mappings_match(7));assert!(!vm.driver_range_overlaps(100..101));assert!(vm.driver_range_overlaps(20..21));assert!(vm.driver_range_overlaps(200..201));
 vm.clear_render_pool_mappings();assert_eq!(drops.load(Ordering::SeqCst),6);
 vm.unmapped.lock().unwrap().clear();assert_eq!(vm.unmap_user_ranges(0..256,64..80),Ok(()));assert_eq!(*vm.unmapped.lock().unwrap(),vec![0..16,32..64,80..192,224..256]);
-assert_eq!(vm.install_render_pool_mappings(8,vec![vm.mapping(128..144,&drops)]),Ok(()));assert!(vm.render_pool_mappings_match(8));
+assert_eq!(vm.install_render_pool_mappings(8,1,vec![vm.mapping(128..144,&drops)]),Ok(()));assert!(vm.render_pool_mappings_match(8));
 drop(vm);assert_eq!(drops.load(Ordering::SeqCst),8);
 let vm=Vm::new();let drops=Arc::new(AtomicUsize::new(0));
 vm.install_driver_mappings(vec![],vec![]).unwrap();
-vm.install_render_pool_mappings(10,vec![vm.mapping(16..32,&drops)]).unwrap();
+vm.install_render_pool_mappings(10,1,vec![vm.mapping(16..32,&drops)]).unwrap();
 vm.install_compute_pool_mappings(20,vec![vm.mapping(64..96,&drops)]).unwrap();
 assert!(vm.compute_pool_mappings_match(20));assert!(!vm.compute_pool_mappings_match(21));
 assert!(vm.driver_range_overlaps(80..81));
@@ -77,7 +88,18 @@ assert_eq!(*vm.unmapped.lock().unwrap(),vec![0..16,32..64,96..128]);
 vm.clear_compute_pool_mappings();assert!(vm.render_pool_mappings_match(10));
 assert_eq!(drops.load(Ordering::SeqCst),1);vm.clear_compute_pool_mappings();
 drop(vm);assert_eq!(drops.load(Ordering::SeqCst),2);
-println!("PASS actual mmu cache source: install/duplicate/clear/generation, mapping drops outside lock, fixed+cached overlap and exact user-unmap exclusions");
+let stress=Vm::new();let stress_drops=Arc::new(AtomicUsize::new(0));
+stress.install_driver_mappings(vec![],vec![]).unwrap();
+for generation in 1..=4096u64{
+ assert_eq!(stress.install_render_pool_mappings(generation,1,vec![stress.mapping(16..32,&stress_drops)]),Ok(()));
+ assert_eq!(stress.render_pool_tvb_blocks(generation),Some(1));
+ // Failed prepublication replacement owns only its temporary mapping.
+ assert_eq!(stress.install_render_pool_mappings(generation+1,1,vec![stress.mapping(32..48,&stress_drops)]),Err(EBUSY));
+ stress.clear_render_pool_mappings();stress.clear_render_pool_mappings();
+ assert!(!stress.render_pool_mappings_match(generation));
+}
+assert_eq!(stress_drops.load(Ordering::SeqCst),8192);
+println!("PASS actual mmu cache source: 4096 install/reject/clear owner cycles, mapping drops outside lock, fixed+cached overlap and exact user-unmap exclusions");
 }
 '''
 code=preamble+structs+vm+methods+'}\n'+tests

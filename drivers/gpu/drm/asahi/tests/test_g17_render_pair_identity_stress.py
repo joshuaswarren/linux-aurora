@@ -116,6 +116,12 @@ leases = 0
 epoch = 0
 pending_fences = [None] * SLOTS
 quarantined = [False] * SLOTS
+graph_owner = [None] * SLOTS
+graph_context = [None] * SLOTS
+vm_pages: dict[int, set[int]] = {}
+map_events = 0
+unmap_events = 0
+next_context = 1
 
 
 def acquire(owner: int) -> int:
@@ -157,6 +163,53 @@ def pair_identity(slot: int) -> dict[str, object]:
     }
 
 
+def vm_state(owner: int) -> set[int]:
+    # Views 1..6 are Mesa/GPUVM-owned. The driver validates them but must
+    # never map or unmap them as aliases; only reserved null view 0 is ours.
+    return vm_pages.setdefault(owner, set(range(1, 7)))
+
+
+def retire_graph(slot: int) -> None:
+    global unmap_events
+    previous = graph_owner[slot]
+    if previous is None:
+        assert graph_context[slot] is None
+        return
+    pages = vm_state(previous)
+    assert 0 in pages, "driver null view was already unmapped"
+    pages.remove(0)
+    unmap_events += 1
+    graph_owner[slot] = None
+    graph_context[slot] = None
+
+
+def build_graph(slot: int, owner: int, failure: str | None) -> bool:
+    global map_events, unmap_events, next_context
+    if graph_owner[slot] == owner:
+        assert failure is None
+        return True
+    retire_graph(slot)
+    pages = vm_state(owner)
+    assert pages.issuperset(range(1, 7))
+    assert 0 not in pages, "driver attempted to double-map null view"
+    if failure == "prepower":
+        # The production pre-power gate runs before root/context/alias setup.
+        return False
+    pages.add(0)
+    map_events += 1
+    if failure == "constructor":
+        # A failed local constructor owns exactly one temporary mapping; its
+        # destructor removes it once and never touches Mesa's low views.
+        assert 0 in pages
+        pages.remove(0)
+        unmap_events += 1
+        return False
+    graph_owner[slot] = owner
+    graph_context[slot] = next_context
+    next_context += 1
+    return True
+
+
 # More than 128x the descriptor ring and 16x the 8-bit control-ring capacity.
 # Seventeen owners force repeated LRU handoffs instead of merely returning to
 # two stable clients; every thirteenth submit exercises a prepublication error.
@@ -181,9 +234,17 @@ for cycle in range(4096):
         identities.append(identity)
 
         submission = cycle * 2 + index + 1
-        if submission % 13 == 0:
+        fresh = graph_owner[slot] != owner
+        failure = None
+        if fresh and submission % 13 == 0:
+            failure = "prepower"
+        elif fresh and submission % 29 == 0:
+            failure = "constructor"
+        built = build_graph(slot, owner, failure)
+        if not built:
             # A pre-power/direct-config refusal happens before the completion
-            # fence is armed. Timeout classification must leave both slots and
+            # fence is armed. A later constructor failure likewise owns only
+            # local mappings. Timeout classification must leave both slots and
             # the other client's fence untouched.
             before = pending_fences.copy()
             assert pending_fences[slot] is None
@@ -205,7 +266,17 @@ for cycle in range(4096):
 assert leases == 0
 assert pending_fences == [None, None]
 assert all(generation > 100 for generation in generations)
+for slot in range(SLOTS):
+    retire_graph(slot)
+for pages in vm_pages.values():
+    # File/GPUVM teardown owns the six user views after every job-private
+    # driver mapping and context has gone away.
+    assert pages == set(range(1, 7))
+    pages.clear()
+assert all(not pages for pages in vm_pages.values())
+assert map_events == unmap_events
 print(
     "PASS render pair identity stress: 8192 submissions/4096 overlaps, "
-    "17-owner LRU reuse, QID/QoS/outer/completion/fence identities coherent"
+    "17-owner LRU reuse, QID/QoS/outer/completion/fence identities coherent; "
+    f"{map_events} driver bind/unbind pairs without duplicate PTE ownership"
 )
