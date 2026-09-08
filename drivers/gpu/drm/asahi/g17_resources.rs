@@ -6131,6 +6131,19 @@ impl G17PUserRenderStorage {
         }
     }
 
+    /// Complete firmware-high descriptor allocation retained by this graph.
+    /// KSM completion records echo addresses inside this range. A graph may
+    /// not release its mappings or HardwareBufferID while such a back-reference
+    /// remains: a later allocation can otherwise reuse both identities and
+    /// turn the stale record into an indistinguishable ABA alias.
+    pub(crate) fn descriptor_high_range(&self) -> Result<Range<u64>> {
+        let start = self.descriptors.iova();
+        let end = start
+            .checked_add(self.descriptors.logical_size as u64)
+            .ok_or(EOVERFLOW)?;
+        Ok(start..end)
+    }
+
     pub(crate) fn work_item_gpu_vas(&self, tiling: bool) -> Result<[u64; 3]> {
         let graph = self.graph.iova();
         Ok([
@@ -12565,6 +12578,46 @@ impl G17ResourceOwner {
     pub(crate) fn dump_completion_records(&mut self, label: &'static str) -> Result {
         self.dump_completion_ordinal(label, 0)?;
         self.dump_completion_ordinal(label, 2)
+    }
+
+    /// Whether either hardware completion ring still names a descriptor in
+    /// `range`. Native retains a command descriptor's exact memory map until
+    /// work-queue pruning observes its event. Linux does not yet model that
+    /// private event object, but this KSM back-reference is an exact observable
+    /// lower bound: releasing a graph while it remains published is unsafe.
+    pub(crate) fn completion_references_descriptor_range(
+        &mut self,
+        range: &Range<u64>,
+    ) -> Result<bool> {
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        for ordinal in [0u8, 2u8] {
+            let object = if ordinal == 0 {
+                &mut self.resources.completion_ordinal_0
+            } else {
+                &mut self.resources.completion_ordinal_2
+            };
+            let stride = G17P_COMPUTE_COMPLETION_RECORD_SIZE;
+            let slots = object.logical_size / stride;
+            let mut referenced = false;
+            object.with_bytes_mut(|bytes| {
+                for slot in 0..slots {
+                    let at = slot.checked_mul(stride).ok_or(EOVERFLOW)?;
+                    let record = bytes.get(at..at + stride).ok_or(ERANGE)?;
+                    let descriptor = u64::from_le_bytes(
+                        record[0x30..0x38].try_into().map_err(|_| EINVAL)?,
+                    ) & G17P_COMPUTE_COMPLETION_DESCRIPTOR_MASK;
+                    if descriptor >= range.start && descriptor < range.end {
+                        referenced = true;
+                        break;
+                    }
+                }
+                Ok(())
+            })?;
+            if referenced {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn dump_completion_ordinal(&mut self, label: &'static str, ordinal: u8) -> Result {

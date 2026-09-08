@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One retired cross-VM graph stays alive through its successor's build."""
+"""Firmware-referenced cross-VM graphs stay alive through later handoffs."""
 
 from pathlib import Path
 
@@ -38,7 +38,10 @@ for owner in (
     assert owner in handoff
 assert "release_client_context" not in handoff
 assert "unreserve_render_storage_hardware_buffer_id" not in handoff
-assert handoff.index("self.retired_render_handoff_graph.replace(retired)") < handoff.index(
+assert "completion_references_descriptor_range(&range)" in handoff
+assert ".push_within_capacity(previous)" in handoff
+assert "self.retired_render_handoff_graph = Some(retired)" in handoff
+assert handoff.index("completion_references_descriptor_range(&range)") < handoff.index(
     "Self::release_retired_handoff_graph("
 )
 
@@ -48,13 +51,16 @@ assert release.index("ids.unreserve(id)") < release.index("drop(retired)")
 stop = function("pub(crate) fn release_runtime_objects_after_processor_stop(")
 assert "state.retired_handoff_graph.take()" in stop
 assert "self.retired_render_handoff_graph.take()" in stop
+assert "self.retired_render_handoff_graphs.pop()" in stop
 
 
 class Quarantine:
     def __init__(self):
         self.active = None
         self.retired = None
+        self.completion_quarantine = []
         self.reserved = set()
+        self.referenced = set()
 
     def build(self, generation):
         assert generation not in self.reserved
@@ -66,18 +72,32 @@ class Quarantine:
         self.retired = self.active
         self.active = None
         if previous is not None:
-            self.reserved.remove(previous)
+            if previous in self.referenced:
+                self.completion_quarantine.append(previous)
+            else:
+                self.reserved.remove(previous)
+
+    def overwrite_completion(self, generation):
+        self.referenced.remove(generation)
+        if generation in self.completion_quarantine:
+            self.completion_quarantine.remove(generation)
+            self.reserved.remove(generation)
 
 
 state = Quarantine()
 state.build(1)
+state.referenced.add(1)
 state.handoff()
 assert state.retired == 1 and state.reserved == {1}
 state.build(2)
+state.referenced.add(2)
 assert state.reserved == {1, 2}
 state.handoff()
-assert state.retired == 2 and state.reserved == {2}
+assert state.retired == 2 and state.completion_quarantine == [1]
+assert state.reserved == {1, 2}
 state.build(3)
+assert state.reserved == {1, 2, 3}
+state.overwrite_completion(1)
 assert state.reserved == {2, 3}
 
-print("PASS bounded retired-render graph quarantine and teardown ownership")
+print("PASS completion-referenced retired-render graph quarantine and teardown ownership")

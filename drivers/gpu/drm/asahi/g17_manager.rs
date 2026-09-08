@@ -1172,6 +1172,12 @@ pub(crate) struct G17PManagerConstruction {
     /// generation mapped so the incoming graph cannot immediately reuse and
     /// overwrite the same VA or PBDesc ID.
     retired_render_handoff_graph: Option<G17PRetiredRenderGraph>,
+    /// Older handoff generations whose descriptor back-references are still
+    /// present in the hardware completion rings. The immediately preceding
+    /// generation remains in `retired_render_handoff_graph`; when another VM
+    /// handoff displaces it, it moves here instead of being freed beneath an
+    /// observable firmware pointer.
+    retired_render_handoff_graphs: KVec<G17PRetiredRenderGraph>,
     render_submission_ordinal: u32,
     /// Per-command host timestamp shared by the TA and 3D KSM entries. Native
     /// prepares it once in the combined render descriptor, before either
@@ -1854,6 +1860,11 @@ impl G17PManagerConstruction {
         g17_resources::validate_handoff(resources.handoff()).map_err(|_| EINVAL)?;
         validate_resources(resource_observation(resources.handoff(), resources.uat()))
             .map_err(|_| EINVAL)?;
+        // One live storage can own each native HardwareBufferID. Reserve the
+        // entire bounded quarantine up front so a handoff never has to choose
+        // between dropping a firmware-visible graph and allocating memory.
+        let retired_render_handoff_graphs =
+            KVec::with_capacity(G17P_TA_HARDWARE_BUFFER_ID_COUNT, GFP_KERNEL)?;
 
         #[cfg(CONFIG_DEV_COREDUMP)]
         let trace_capture = if *module_parameters::g17p_binary_capture.value() != 0 {
@@ -1892,6 +1903,7 @@ impl G17PManagerConstruction {
                 render_bind: None,
                 render_context_aliases: None,
                 retired_render_handoff_graph: None,
+                retired_render_handoff_graphs,
                 render_submission_ordinal: 0,
                 render_auxiliary_timestamp: 0,
                 render_hardware_buffer_id: None,
@@ -2302,6 +2314,7 @@ impl G17PManagerConstruction {
             || self.render_tracker.is_some()
             || self.render_bind.is_some()
             || self.retired_render_handoff_graph.is_some()
+            || !self.retired_render_handoff_graphs.is_empty()
             || self.render_submission_ordinal != 0
             || self.parked_render_scheduler_active()
     }
@@ -2311,6 +2324,7 @@ impl G17PManagerConstruction {
             || self.render_tracker.is_some()
             || self.render_bind.is_some()
             || self.retired_render_handoff_graph.is_some()
+            || !self.retired_render_handoff_graphs.is_empty()
             || self.render_submission_ordinal != 0
             || self.parked_render_scheduler_active()
         {
@@ -3116,6 +3130,12 @@ impl G17PManagerConstruction {
             &mut self.render_hardware_buffer_ids,
             self.retired_render_handoff_graph.take(),
         );
+        while let Some(retired) = self.retired_render_handoff_graphs.pop() {
+            Self::release_retired_handoff_graph(
+                &mut self.render_hardware_buffer_ids,
+                Some(retired),
+            );
+        }
         self.render_sksm = None;
         self.bootstrap_uma = None;
         self.prepared_render_flist = None;
@@ -3137,6 +3157,7 @@ impl G17PManagerConstruction {
             || self.render_storage.is_some()
             || self.render_context_aliases.is_some()
             || self.retired_render_handoff_graph.is_some()
+            || !self.retired_render_handoff_graphs.is_empty()
             || self.parked_render_scheduler_active()
         {
             return Err(EBUSY);
@@ -3239,23 +3260,83 @@ impl G17PManagerConstruction {
         self.require_retired_render_owner()?;
         let old_root = self.render_bind.as_ref().map_or(0, |binding| binding.root());
         let old_vm_id = self.render_bind.as_ref().map_or(0, |binding| binding.vm_id());
-        self.park_render_sksm_backing_for_graph_rebuild()?;
         if self.render_bind.is_none() {
             return Err(EIO);
         }
+        // A second handoff used to drop the first quarantined graph
+        // unconditionally. v15 captured the resulting ABA exactly: gen5's
+        // descriptor addresses and HardwareBufferID 3 were still present in
+        // completion records when gen8 reused both, immediately followed by a
+        // slot-1/DM1 recovery. Preserve every still-referenced generation.
+        if let Some(previous) = self.retired_render_handoff_graph.take() {
+            let range = match previous.storage.descriptor_high_range() {
+                Ok(range) => range,
+                Err(error) => {
+                    self.retired_render_handoff_graph = Some(previous);
+                    return Err(error);
+                }
+            };
+            let referenced = match self
+                .resources
+                .completion_references_descriptor_range(&range)
+            {
+                Ok(referenced) => referenced,
+                Err(error) => {
+                    self.retired_render_handoff_graph = Some(previous);
+                    return Err(error);
+                }
+            };
+            if referenced {
+                if let Err(error) = self
+                    .retired_render_handoff_graphs
+                    .push_within_capacity(previous)
+                {
+                    self.retired_render_handoff_graph = Some(error.0);
+                    return Err(ENOMEM);
+                }
+            } else {
+                Self::release_retired_handoff_graph(
+                    &mut self.render_hardware_buffer_ids,
+                    Some(previous),
+                );
+            }
+        }
+        self.prune_unreferenced_retired_render_graphs()?;
+        self.park_render_sksm_backing_for_graph_rebuild()?;
         let retired = G17PRetiredRenderGraph {
             bind: self.render_bind.take().ok_or(EIO)?,
             context_aliases: self.render_context_aliases.take(),
             storage: self.render_storage.take().ok_or(ENODEV)?,
         };
-        let previous = self.retired_render_handoff_graph.replace(retired);
-        Self::release_retired_handoff_graph(
-            &mut self.render_hardware_buffer_ids,
-            previous,
-        );
+        self.retired_render_handoff_graph = Some(retired);
         dev_info!(self.resources.dev().as_ref(),
             "G17P render VM handoff: quarantined retired job-private graph vm={} root={:#x}; incoming VM builds a new root at ordinal {}, QID producer state retained\n",
             old_vm_id, old_root, self.render_submission_ordinal);
+        Ok(())
+    }
+
+    fn prune_unreferenced_retired_render_graphs(&mut self) -> Result {
+        let mut index = 0;
+        while index < self.retired_render_handoff_graphs.len() {
+            let range = self.retired_render_handoff_graphs[index]
+                .storage
+                .descriptor_high_range()?;
+            if self
+                .resources
+                .completion_references_descriptor_range(&range)?
+            {
+                index += 1;
+                continue;
+            }
+            let retired = self
+                .retired_render_handoff_graphs
+                .remove(index)
+                .map_err(|_| EIO)?;
+            Self::release_retired_handoff_graph(
+                &mut self.render_hardware_buffer_ids,
+                Some(retired),
+            );
+        }
         Ok(())
     }
 
@@ -5429,6 +5510,13 @@ impl G17PManagerConstruction {
             .filter(|graph| matches(&graph.storage))
         {
             return Some((&graph.bind, "active-quarantine"));
+        }
+        if let Some(graph) = self
+            .retired_render_handoff_graphs
+            .iter()
+            .find(|graph| matches(&graph.storage))
+        {
+            return Some((&graph.bind, "completion-quarantine"));
         }
         for state in self.parked_render_slots.iter().flatten() {
             if state.storage.as_ref().is_some_and(matches) {
