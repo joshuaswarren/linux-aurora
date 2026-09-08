@@ -818,6 +818,13 @@ impl g17_job::G17PQueueBackend for G17PAsyncQueueBackend {
             completion.complete(Err(EIO));
             return Err(EIO);
         }
+        // A dma_fence carrying an error is still signalled, so DRM sched has
+        // legitimately made this job runnable. It does not mean the GPU
+        // dependency succeeded. Consume every retained dependency status
+        // before taking a hardware lease or writing queue state.
+        for fence in packet.input_fences() {
+            G17PQueue::wait_fence(fence)?;
+        }
         let hardware_fence = completion.fence();
         let first_install = self.runtime.mutex().lock().async_compute_needs_install(self.owner)?;
         let lease = self.registry.acquire_compute(first_install)?;
@@ -1087,9 +1094,25 @@ impl G17PQueue {
         let timestamps = self.owned_compute_timestamps()?;
         let output = self.fence_contexts.new_fence(0, G17PSubmissionFence)?.into();
         let backend = self.async_backend.as_ref().ok_or(EIO)?;
+        // One extra dependency carries this logical queue's preceding render
+        // or compute completion. DRM entities serialize compute jobs with one
+        // another, but render publication uses a separate watch entity; the
+        // explicit fence is what preserves Vulkan queue order across engines.
+        let mut dependencies = KVec::with_capacity(in_sync_count + 1, GFP_KERNEL)?;
+        let mut checked_dependencies = KVec::with_capacity(in_sync_count + 1, GFP_KERNEL)?;
+        for sync in syncs.drain(0..in_sync_count) {
+            if let Some(fence) = sync.fence {
+                checked_dependencies.push(fence.clone(), GFP_KERNEL)?;
+                dependencies.push(fence, GFP_KERNEL)?;
+            }
+        }
+        if let Some(prior) = self.last_submission.as_ref() {
+            checked_dependencies.push(prior.clone(), GFP_KERNEL)?;
+            dependencies.push(prior.clone(), GFP_KERNEL)?;
+        }
         let packet = g17_job::G17PComputeJobPacket::new(
             submission_id, backend.hardware_queue, backend.context.clone(), translated,
-            KVec::new(), KVec::new(),
+            KVec::new(), KVec::new(), checked_dependencies,
             Some(g17_job::G17PJobCompletion {
                 fence: output,
                 timestamps,
@@ -1099,17 +1122,6 @@ impl G17PQueue {
             }),
             Some(vm_job),
         )?;
-        // One extra dependency carries this logical queue's preceding render
-        // or compute completion. DRM entities serialize compute jobs with one
-        // another, but render publication uses a separate watch entity; the
-        // explicit fence is what preserves Vulkan queue order across engines.
-        let mut dependencies = KVec::with_capacity(in_sync_count + 1, GFP_KERNEL)?;
-        for sync in syncs.drain(0..in_sync_count) {
-            if let Some(fence) = sync.fence { dependencies.push(fence, GFP_KERNEL)?; }
-        }
-        if let Some(prior) = self.last_submission.as_ref() {
-            dependencies.push(prior.clone(), GFP_KERNEL)?;
-        }
         let finished = self.async_scheduler.as_mut().ok_or(EIO)?.enqueue(packet, dependencies)?;
         // The job is queued and owns its completion from here: give userspace
         // the fence that signals when the GPU has actually run it.
