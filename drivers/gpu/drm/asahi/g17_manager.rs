@@ -1139,6 +1139,9 @@ pub(crate) struct G17PManagerConstruction {
     /// Device-global FList generation. Queue-pair ordinals are per slot, but
     /// the shared USC pool accepts one monotonic owner sequence.
     next_render_flist_sequence: u64,
+    /// Next HWPB-manager generation in this firmware session. A replacement
+    /// PM graph must never reuse its predecessor's Scene-owner generation.
+    next_render_pm_manager_generation: u64,
     /// `render_pool_id()` of the storage the device-global parameter-buffer
     /// loader currently points at, or 0 for none.
     ///
@@ -1792,6 +1795,8 @@ impl G17PManagerConstruction {
                 bootstrap_uma: None,
                 prepared_render_flist: None,
                 next_render_flist_sequence: G17P_BOOTSTRAP_UMA_SEQUENCE,
+                next_render_pm_manager_generation:
+                    g17_resources::G17P_PM_INITIAL_HWPB_MANAGER_GENERATION,
                 render_parameter_buffer_owner: 0,
                 parked_render_slots: [None, None],
                 active_render_slot: 0,
@@ -2345,6 +2350,7 @@ impl G17PManagerConstruction {
             return Err(EBUSY);
         }
         let mut no_retained_sksm_backing = None;
+        let pm_generation = self.prepare_render_pm_manager_generation()?;
         self.render_storage = Some(
             self.resources
                 .new_user_render_storage(
@@ -2359,6 +2365,7 @@ impl G17PManagerConstruction {
                     [0; 4],
                     KVec::new(),
                     0,
+                    pm_generation.map(|plan| plan.0),
                     &mut no_retained_sksm_backing,
                 )
                 .inspect_err(|error| {
@@ -2387,6 +2394,7 @@ impl G17PManagerConstruction {
             .uat()
             .install_t8140_partial_opening_shared_render_roots(&binding)?;
         self.render_bind = Some(G17PRenderRootOwner::Bootstrap(binding));
+        self.commit_render_pm_manager_generation(pm_generation)?;
         Ok(vm)
     }
 
@@ -2990,6 +2998,8 @@ impl G17PManagerConstruction {
         self.render_submission_ordinal = 0;
         self.render_auxiliary_timestamp = 0;
         self.next_render_flist_sequence = G17P_BOOTSTRAP_UMA_SEQUENCE;
+        self.next_render_pm_manager_generation =
+            g17_resources::G17P_PM_INITIAL_HWPB_MANAGER_GENERATION;
         self.render_parameter_buffer_owner = 0;
         self.active_render_slot = 0;
     }
@@ -3181,6 +3191,38 @@ impl G17PManagerConstruction {
             .and_then(g17_resources::G17PUserRenderStorage::retained_hardware_buffer_id)
         {
             self.render_hardware_buffer_ids.unreserve(id);
+        }
+    }
+
+    fn prepare_render_pm_manager_generation(&self) -> Result<Option<(u64, u64)>> {
+        if g17_resources::g17p_render_tvb_mode() < 2 {
+            return Ok(None);
+        }
+        Ok(Some(g17_resources::g17p_pm_manager_generation_plan(
+            self.next_render_pm_manager_generation,
+        )?))
+    }
+
+    /// Commit a prepared generation only after the replacement graph has
+    /// become retained manager state. Constructor failures leave the session
+    /// counter untouched and can retry the same never-published generation.
+    fn commit_render_pm_manager_generation(
+        &mut self,
+        plan: Option<(u64, u64)>,
+    ) -> Result {
+        let actual = self
+            .render_storage
+            .as_ref()
+            .ok_or(ENODEV)?
+            .parameter_manager_generation();
+        match (plan, actual) {
+            (None, None) => Ok(()),
+            (Some((current, next)), Some(actual))
+                if current == actual && current == self.next_render_pm_manager_generation => {
+                self.next_render_pm_manager_generation = next;
+                Ok(())
+            }
+            _ => Err(EIO),
         }
     }
 
@@ -4233,6 +4275,7 @@ impl G17PManagerConstruction {
                 .render_sksm
                 .as_mut()
                 .and_then(|queues| queues.backing.take());
+            let pm_generation = self.prepare_render_pm_manager_generation()?;
             let storage = self.resources.new_user_render_storage(
                 dev,
                 vm,
@@ -4245,6 +4288,7 @@ impl G17PManagerConstruction {
                 user_timestamps,
                 user_timestamp_aliases,
                 self.render_submission_ordinal,
+                pm_generation.map(|plan| plan.0),
                 &mut retained_sksm_backing,
             );
             self.render_storage = Some(match storage {
@@ -4262,6 +4306,8 @@ impl G17PManagerConstruction {
                     return Err(Self::render_stage_fail("new-user-render-storage", error));
                 }
             });
+            self.commit_render_pm_manager_generation(pm_generation)
+                .map_err(|error| Self::render_stage_fail("commit-pm-manager-generation", error))?;
             // The fresh graph was encoded against this ID; keep the ID off the
             // shared free list for as long as the storage lives.
             if let Some(id) = self
