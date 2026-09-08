@@ -49,5 +49,19 @@ for call in (
     assert begin.index(call) < outer, call
 
 assert "g17p_sksm_configure_queue" not in validator
+
+direct = block(
+    "fn configure_fresh_secondary_render_pair(",
+    "fn publish_render_sksm_group(",
+)
+for queue in ("fragment", "tiling"):
+    assert f"queues.{queue}.config.write_pair()" in direct
+    assert f"queues.{queue}.config.enable_pair" in direct
+assert "g17p_sksm_configure_powered_queue" in direct
+assert "if !fragment || !tiling" in direct
+assert "return Err(EAGAIN);" in direct
+
+direct_call = begin.index("self.configure_fresh_secondary_render_pair(")
+assert direct_call < begin.index("let pm_submission =") < outer
 assert "!execution_context.matches(vm) || !execution_context.is_current()" in MANAGER
 print("g17 render QID consistency validation: PASS")

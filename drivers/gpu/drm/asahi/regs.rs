@@ -997,6 +997,31 @@ impl Resources {
         Ok(true)
     }
 
+    /// Configure one queue only when the GPC is already live, independently
+    /// of the global SKSM-MMIO diagnostic. This is used to qualify native
+    /// direct registration for a secondary render pair without also changing
+    /// compute/AddKicks publication.
+    pub(crate) fn g17p_sksm_configure_powered_queue(
+        &self,
+        pair: g17_submission::G17SksmOrderedWritePair,
+        enable_pair: g17_submission::G17SksmOrderedWritePair,
+    ) -> Result<bool> {
+        if !Self::g17p_sksm_pair_fits(pair)
+            || !Self::g17p_sksm_pair_fits(enable_pair)
+            || enable_pair.word0 | enable_pair.word1 == 0
+        {
+            return Err(EINVAL);
+        }
+        if !self.g17p_sksm_port_powered() {
+            return Ok(false);
+        }
+        let _guard = self.sksm_fifo.lock();
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        Self::g17p_sksm_publish_locked(&sgx, pair)?;
+        Self::g17p_sksm_publish_locked(&sgx, enable_pair)?;
+        Ok(true)
+    }
+
     fn sgx_read32<const OFF: usize>(&self) -> u32 {
         if let Some(sgx) = self.sgx.try_access() {
             sgx.relaxed().try_read32(OFF).unwrap_or(0)

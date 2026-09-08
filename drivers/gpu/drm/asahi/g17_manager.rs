@@ -3682,6 +3682,64 @@ impl G17PManagerConstruction {
         queue.registered = true;
     }
 
+    /// Directly install both halves of a fresh secondary render pair while
+    /// the GPC is already powered by another live client.
+    ///
+    /// The cold qid0/1 pair is proven to install through its simultaneous
+    /// firmware tag-15 publication. A secondary pair is different: qid2 TA
+    /// executes, but its qid3 parent reaches DM1 without launching unless the
+    /// two native KSMFE routes already exist. Native configures both queue
+    /// objects before publishing either outer command. Keep this behind the
+    /// render-only direct-config opt-in until the cold power transition is
+    /// modeled,
+    /// and never expose a secondary pair after only one configuration landed.
+    fn configure_fresh_secondary_render_pair(
+        &self,
+        registers: &regs::Resources,
+        fragment_install: bool,
+        tiling_install: Option<bool>,
+    ) -> Result {
+        if *module_parameters::g17p_render_direct_config.value() == 0
+            || (!fragment_install && !tiling_install.unwrap_or(false))
+        {
+            return Ok(());
+        }
+        let queues = self.render_sksm.as_ref().ok_or(ENODEV)?;
+        let pair = self.render_storage.as_ref().ok_or(ENODEV)?.queue_pair();
+        if pair.slot() == 0 {
+            return Ok(());
+        }
+        if !fragment_install || tiling_install != Some(true) {
+            return Err(Self::render_stage_fail("secondary-pair-partial-install", EINVAL));
+        }
+        let fragment = registers.g17p_sksm_configure_powered_queue(
+            queues.fragment.config.write_pair(),
+            queues.fragment.config.enable_pair,
+        )?;
+        let tiling = registers.g17p_sksm_configure_powered_queue(
+            queues.tiling.config.write_pair(),
+            queues.tiling.config.enable_pair,
+        )?;
+        if !fragment || !tiling {
+            dev_err!(
+                self.resources.dev().as_ref(),
+                "G17P render: secondary pair {}/{} direct configuration did not fully issue (3D={}, TA={}); outer publication withheld\n",
+                pair.tiling,
+                pair.fragment,
+                fragment,
+                tiling,
+            );
+            return Err(EAGAIN);
+        }
+        dev_info!(
+            self.resources.dev().as_ref(),
+            "G17P render: secondary pair {}/{} directly configured before simultaneous outer publication\n",
+            pair.tiling,
+            pair.fragment,
+        );
+        Ok(())
+    }
+
     fn publish_render_sksm_group(
         &mut self,
         dev: &AsahiDevice,
@@ -4150,7 +4208,7 @@ impl G17PManagerConstruction {
         parameter_buffer_token: u64,
         user_timestamps: [u64; 4],
         user_timestamp_aliases: KVec<mmu::KernelMapping>,
-        _registers: &regs::Resources,
+        registers: &regs::Resources,
     ) -> Result<g17_submission::PreparedG17PPartialOpeningWorkPair> {
         let render_sksm = *crate::module_parameters::g17p_render_sksm.value();
         let native_doorbell_mode =
@@ -4587,6 +4645,12 @@ impl G17PManagerConstruction {
                 );
             }
         }
+        self.configure_fresh_secondary_render_pair(
+            registers,
+            fragment_install,
+            tiling_install,
+        )
+        .map_err(|error| Self::render_stage_fail("configure-secondary-render-pair", error))?;
         let pm_submission = self.render_storage.as_mut().ok_or(ENODEV)?
             .prepare_pm_submitted_operation()
             .map_err(|error| Self::render_stage_fail("prepare-pm-submitted-operation", error))?;
