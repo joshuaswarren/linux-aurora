@@ -267,17 +267,6 @@ impl G17PCommandBufferStateAllocator {
         None
     }
 
-    fn allocate_pair(&mut self) -> Option<[u32; 2]> {
-        let first = self.allocate_one()?;
-        match self.allocate_one() {
-            Some(second) => Some([first, second]),
-            None => {
-                let _ = self.release_one(first);
-                None
-            }
-        }
-    }
-
     fn release_one(&mut self, word: u32) -> bool {
         let state = (word as usize) & (G17P_COMMAND_BUFFER_STATE_COUNT - 1);
         if state == G17P_COMMAND_BUFFER_EXCLUDED_STATE || self.live[state] != Some(word) {
@@ -287,23 +276,6 @@ impl G17PCommandBufferStateAllocator {
         true
     }
 
-    fn release_pair(&mut self, words: [u32; 2]) -> bool {
-        // Validate both identities before mutating either slot. A stale
-        // completion must never release a wrapped replacement state.
-        let states = words.map(|word| {
-            (word as usize) & (G17P_COMMAND_BUFFER_STATE_COUNT - 1)
-        });
-        if states[0] == states[1]
-            || states.contains(&G17P_COMMAND_BUFFER_EXCLUDED_STATE)
-            || self.live[states[0]] != Some(words[0])
-            || self.live[states[1]] != Some(words[1])
-        {
-            return false;
-        }
-        self.live[states[0]] = None;
-        self.live[states[1]] = None;
-        true
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -1215,7 +1187,7 @@ pub(crate) struct G17PManagerConstruction {
     /// not move with the active-slot scratch fields: a parked slot may still
     /// be executing and therefore keeps both event states unavailable.
     render_command_buffer_states: G17PCommandBufferStateAllocator,
-    render_command_buffer_state_pairs: [Option<[u32; 2]>; 2],
+    render_command_buffer_state_pairs: [Option<u32>; 2],
     /// Whether this firmware session has published a render on the
     /// device-global outer data-master channels. The outer ring entry's
     /// "channel started" byte describes those shared channels, not the slot
@@ -1797,26 +1769,26 @@ impl G17PManagerConstruction {
         Ok(())
     }
 
-    fn allocate_active_render_command_buffer_states(&mut self) -> Result<[u32; 2]> {
+    fn allocate_active_render_command_buffer_state(&mut self) -> Result<u32> {
         let slot = self.active_render_slot as usize;
         if self.render_command_buffer_state_pairs[slot].is_some() {
             return Err(EBUSY);
         }
-        let words = self
+        let word = self
             .render_command_buffer_states
-            .allocate_pair()
+            .allocate_one()
             .ok_or(EBUSY)?;
-        self.render_command_buffer_state_pairs[slot] = Some(words);
-        Ok(words)
+        self.render_command_buffer_state_pairs[slot] = Some(word);
+        Ok(word)
     }
 
     fn release_active_render_command_buffer_states(&mut self) -> Result {
         let slot = self.active_render_slot as usize;
-        let words = self.render_command_buffer_state_pairs[slot]
+        let word = self.render_command_buffer_state_pairs[slot]
             .take()
             .ok_or(EIO)?;
-        if !self.render_command_buffer_states.release_pair(words) {
-            self.render_command_buffer_state_pairs[slot] = Some(words);
+        if !self.render_command_buffer_states.release_one(word) {
+            self.render_command_buffer_state_pairs[slot] = Some(word);
             return Err(EIO);
         }
         Ok(())
@@ -4300,8 +4272,8 @@ impl G17PManagerConstruction {
         };
         self.render_hardware_buffer_id = Some(hardware_buffer_id);
         self.render_hardware_buffer_published = false;
-        let command_buffer_state_words = match self.allocate_active_render_command_buffer_states() {
-            Ok(words) => words,
+        let command_buffer_state_word = match self.allocate_active_render_command_buffer_state() {
+            Ok(word) => word,
             Err(error) => {
                 self.render_hardware_buffer_id = None;
                 self.render_hardware_buffer_ids
@@ -4329,7 +4301,7 @@ impl G17PManagerConstruction {
             descriptor_context_id,
             &command,
             parameter_buffer_token,
-            command_buffer_state_words,
+            [command_buffer_state_word; 2],
             user_timestamps,
             user_timestamp_aliases,
             registers,
@@ -4497,7 +4469,11 @@ impl G17PManagerConstruction {
             {
                 return Err(Self::render_stage_fail("retained-root-slot-moved", EBUSY));
             }
-            let parameter_page_list_vas = self.resources.parameter_buffer_page_list_vas();
+            let parameter_page_list_vas = self
+                .render_storage
+                .as_ref()
+                .ok_or(ENODEV)?
+                .parameter_buffer_page_list_vas()?;
             self.render_storage
                 .as_mut()
                 .ok_or(ENODEV)?
@@ -4583,7 +4559,11 @@ impl G17PManagerConstruction {
                     .map_err(|_| Self::render_stage_fail("reserve-hardware-buffer-id", EIO))?;
             }
             if self.render_submission_ordinal != 0 {
-                let parameter_page_list_vas = self.resources.parameter_buffer_page_list_vas();
+                let parameter_page_list_vas = self
+                    .render_storage
+                    .as_ref()
+                    .ok_or(ENODEV)?
+                    .parameter_buffer_page_list_vas()?;
                 let storage = self.render_storage.as_mut().ok_or(ENODEV)?;
                 storage
                     .rebase_empty_queue_cursors(self.render_submission_ordinal)
@@ -8439,37 +8419,36 @@ mod tests {
     #[test]
     fn command_buffer_state_allocator_is_shared_monotonic_and_skips_63() {
         let mut allocator = G17PCommandBufferStateAllocator::new();
-        for expected in (0u32..62).step_by(2) {
-            let pair = allocator.allocate_pair().unwrap();
-            assert_eq!(pair, [expected, expected + 1]);
-            assert!(allocator.release_pair(pair));
+        for expected in 0u32..63 {
+            let word = allocator.allocate_one().unwrap();
+            assert_eq!(word, expected);
+            assert!(allocator.release_one(word));
         }
-        assert_eq!(allocator.allocate_pair(), Some([62, 64]));
-        assert!(allocator.release_pair([62, 64]));
+        assert_eq!(allocator.allocate_one(), Some(64));
+        assert!(allocator.release_one(64));
 
         allocator.next = 128;
-        let replacement = allocator.allocate_pair().unwrap();
-        assert_eq!(replacement, [128, 129]);
+        let replacement = allocator.allocate_one().unwrap();
+        assert_eq!(replacement, 128);
         // An ABA/stale completion cannot release the wrapped replacement.
-        assert!(!allocator.release_pair([0, 1]));
-        assert!(allocator.release_pair(replacement));
+        assert!(!allocator.release_one(0));
+        assert!(allocator.release_one(replacement));
 
         let mut full = G17PCommandBufferStateAllocator::new();
-        for _ in 0..31 {
-            assert!(full.allocate_pair().is_some());
+        for _ in 0..63 {
+            assert!(full.allocate_one().is_some());
         }
-        // One usable state remains, but a TA/3D reservation is atomic.
-        assert_eq!(full.allocate_pair(), None);
+        assert_eq!(full.allocate_one(), None);
     }
 
     #[test]
     fn command_buffer_state_allocator_preserves_full_u32_across_wrap() {
         let mut allocator = G17PCommandBufferStateAllocator::new();
         allocator.next = u32::MAX - 1;
-        let pair = allocator.allocate_pair().unwrap();
-        assert_eq!(pair, [u32::MAX - 1, 0]);
-        assert_eq!(pair.map(|word| word & 63), [62, 0]);
-        assert!(allocator.release_pair(pair));
+        let word = allocator.allocate_one().unwrap();
+        assert_eq!(word, u32::MAX - 1);
+        assert_eq!(word & 63, 62);
+        assert!(allocator.release_one(word));
     }
 
     #[test]

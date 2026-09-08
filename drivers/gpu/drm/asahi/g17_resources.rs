@@ -230,11 +230,13 @@ const G17P_CL_CLIENT_LOW_VA_START: u64 = crate::g17_queue_limits::CLIENT_LOW_VA_
 /// Architectural base for compact user/GART pointers consumed by the TA.
 const G17P_RENDER_USER_BASE: u64 = 0x10_0000_0000;
 const G17P_RENDER_USER_END: u64 = 0x11_0000_0000;
-/// Dedicated SecureGart scene-scratch object used by native parameter
+/// Dedicated 32-KiB SecureGart scene-scratch object used by native parameter
 /// management. Its compact form is 0x178000 and 3D reg 0x1ca28 receives
-/// compact+0x20 = 0x178020.
+/// compact+0x20 = 0x178020. This must cover the complete PM allocation, not
+/// only one 16-KiB UAT page: dPM owns the scratch object beyond the small
+/// host-authored table at its beginning.
 const G17P_RENDER_SCENE_SCRATCH_VA: u64 = G17P_RENDER_USER_BASE + 0x178_000;
-const G17P_RENDER_SCENE_SCRATCH_MAPPING_SIZE: usize = mmu::UAT_PGSZ;
+const G17P_RENDER_SCENE_SCRATCH_MAPPING_SIZE: usize = G17P_PM_SCENE_SCRATCH_SIZE;
 /// Persistent 32-KiB discard object consumed as compact pointer 0x180000 by
 /// HWPB +0x84. Native maps it GPU-only beside Scene scratch and keeps it
 /// across submissions; it is not part of the alternating render-state aliases.
@@ -243,6 +245,30 @@ const G17P_RENDER_DISCARD_VA: u64 = G17P_RENDER_USER_BASE + 0x180_000;
 /// cold 3D command uses context-base + 0x1a8000; it is not the firmware-low
 /// address of the backing render-state allocation.
 const G17P_RENDER_FRAGMENT_STATUS_VA: u64 = G17P_RENDER_USER_BASE + 0x1a_8000;
+/// Native leaves an 0x80000-byte fixed-resource window between independently
+/// live parameter-buffer managers. Pair 1's scene base is therefore the
+/// fault-witnessed 0x10001f8000, while pair 0 retains 0x1000178000.
+const G17P_RENDER_FIXED_PAIR_STRIDE: u64 = 0x8_0000;
+
+const fn g17p_render_pair_fixed_va(base: u64, pair: G17PRenderQueuePair) -> Option<u64> {
+    base.checked_add(pair.slot() as u64 * G17P_RENDER_FIXED_PAIR_STRIDE)
+}
+
+const fn g17p_render_scene_scratch_va(pair: G17PRenderQueuePair) -> Option<u64> {
+    g17p_render_pair_fixed_va(G17P_RENDER_SCENE_SCRATCH_VA, pair)
+}
+
+const fn g17p_render_discard_va(pair: G17PRenderQueuePair) -> Option<u64> {
+    g17p_render_pair_fixed_va(G17P_RENDER_DISCARD_VA, pair)
+}
+
+const fn g17p_render_page_list_va(pair: G17PRenderQueuePair) -> Option<u64> {
+    g17p_render_pair_fixed_va(g17_submission::G17P_PARTIAL_OPENING_PRIMARY_INDEX_GPU_VA, pair)
+}
+
+const fn g17p_render_fragment_status_va(pair: G17PRenderQueuePair) -> Option<u64> {
+    g17p_render_pair_fixed_va(G17P_RENDER_FRAGMENT_STATUS_VA, pair)
+}
 /// Driver-reserved client-root arena for compact aliases of render-state
 /// subranges. Every independently live render pair owns two alternating
 /// 512-KiB generations, so one pair can stage its next command without
@@ -284,6 +310,10 @@ const G17P_NATIVE_TVB_BLOCK_PAGE_IDS: [u32; 32] = [
 const G17P_RENDER_TVB_GROWTH_START: u64 = G17P_RENDER_USER_BASE + 0x0400_0000;
 const G17P_RENDER_TVB_GROWTH_END: u64 = G17P_RENDER_TVB_GROWTH_START
     + ((G17P_PM_MAX_OWNED_BLOCKS - G17P_PM_BLOCK_COUNT) * G17P_RENDER_TVB_BLOCK_STRIDE) as u64;
+/// A second live PM owner cannot remap the first owner's sparse block VAs.
+/// Give every nonzero render pair a complete disjoint compact-GART pool;
+/// 0x28000000 is larger than the maximum native 0xd19-block footprint.
+const G17P_RENDER_TVB_PAIR_STRIDE: u64 = 0x2800_0000;
 
 fn g17p_tvb_block_page_id(index: usize) -> Option<u32> {
     if let Some(page) = G17P_NATIVE_TVB_BLOCK_PAGE_IDS.get(index) {
@@ -299,6 +329,24 @@ fn g17p_tvb_block_page_id(index: usize) -> Option<u32> {
 fn g17p_native_tvb_block_va(index: usize) -> Option<u64> {
     let page = u64::from(g17p_tvb_block_page_id(index)?);
     G17P_RENDER_USER_BASE.checked_add(page.checked_mul(G17P_PM_PAGE_SIZE as u64)?)
+}
+
+fn g17p_render_tvb_block_va(pair: G17PRenderQueuePair, index: usize) -> Option<u64> {
+    if pair.slot() == 0 {
+        return g17p_native_tvb_block_va(index);
+    }
+    if index >= G17P_PM_MAX_OWNED_BLOCKS {
+        return None;
+    }
+    G17P_RENDER_TVB_GROWTH_START
+        .checked_add(pair.slot() as u64 * G17P_RENDER_TVB_PAIR_STRIDE)?
+        .checked_add(index as u64 * G17P_RENDER_TVB_BLOCK_STRIDE as u64)
+}
+
+fn g17p_render_tvb_page_id(pair: G17PRenderQueuePair, index: usize) -> Option<u32> {
+    let relative = g17p_render_tvb_block_va(pair, index)?
+        .checked_sub(G17P_RENDER_USER_BASE)?;
+    u32::try_from(relative.checked_div(G17P_PM_PAGE_SIZE as u64)?).ok()
 }
 
 #[cfg(not(test))]
@@ -2024,6 +2072,7 @@ struct G17PRenderTvbGrowth {
 
 #[cfg(not(test))]
 struct G17PRenderTvb {
+    queue_pair: G17PRenderQueuePair,
     block_mappings: KVec<mmu::KernelMapping>,
     block_count: usize,
     primary_block_count: usize,
@@ -2037,6 +2086,7 @@ impl G17PRenderTvb {
     fn new(
         dev: &AsahiDevice,
         vm: &mmu::Vm,
+        queue_pair: G17PRenderQueuePair,
         render_layout: &G17PRenderStateLayout,
     ) -> Result<Self> {
         if render_layout.tvb_blocks == 0
@@ -2062,7 +2112,7 @@ impl G17PRenderTvb {
                 return Err(ERANGE);
             }
 
-            let address = g17p_native_tvb_block_va(index).ok_or(EINVAL)?;
+            let address = g17p_render_tvb_block_va(queue_pair, index).ok_or(EINVAL)?;
             let address_end = address
                 .checked_add(G17P_RENDER_TVB_BLOCK_SIZE as u64)
                 .ok_or(EOVERFLOW)?;
@@ -2103,14 +2153,15 @@ impl G17PRenderTvb {
             dev.as_ref(),
             "G17P render TVB: native sparse blocks={} first={:#x} last={:#x} backing-size={:#x} backing-pa=[{:#x},{:#x}]\n",
             render_layout.tvb_blocks,
-            g17p_native_tvb_block_va(0).unwrap_or(0),
-            g17p_native_tvb_block_va(render_layout.tvb_blocks - 1).unwrap_or(0),
+            g17p_render_tvb_block_va(queue_pair, 0).unwrap_or(0),
+            g17p_render_tvb_block_va(queue_pair, render_layout.tvb_blocks - 1).unwrap_or(0),
             render_layout.tvb_size,
             first_pa,
             last_pa,
         );
 
         Ok(Self {
+            queue_pair,
             block_mappings,
             block_count: render_layout.tvb_blocks,
             primary_block_count: render_layout.tvb_blocks,
@@ -2134,7 +2185,7 @@ impl G17PRenderTvb {
         let count = self.block_count.checked_sub(first).ok_or(EINVAL)?;
         let mut aliases = KVec::with_capacity(count,GFP_KERNEL)?;
         for index in first..self.block_count {
-            let address = g17p_native_tvb_block_va(index).ok_or(EINVAL)?;
+            let address = g17p_render_tvb_block_va(self.queue_pair, index).ok_or(EINVAL)?;
             let (backing, relative) = self.block_backing(index)?;
             let start = relative.checked_mul(G17P_RENDER_TVB_BLOCK_STRIDE).ok_or(EOVERFLOW)?;
             let end = start.checked_add(G17P_RENDER_TVB_BLOCK_SIZE).ok_or(EOVERFLOW)?;
@@ -2166,7 +2217,7 @@ impl G17PRenderTvb {
         let mut mappings = KVec::with_capacity(count,GFP_KERNEL)?;
         for relative in 0..count {
             let index = self.block_count + relative;
-            let address = g17p_native_tvb_block_va(index).ok_or(EINVAL)?;
+            let address = g17p_render_tvb_block_va(self.queue_pair, index).ok_or(EINVAL)?;
             let start = relative.checked_mul(G17P_RENDER_TVB_BLOCK_STRIDE).ok_or(EOVERFLOW)?;
             mappings.push(backing.object.map_range_into_range(
                 vm,start..start+G17P_RENDER_TVB_BLOCK_SIZE,
@@ -2187,7 +2238,7 @@ impl G17PRenderTvb {
     }
 
     fn iova(&self) -> u64 {
-        g17p_native_tvb_block_va(0).unwrap_or(0)
+        g17p_render_tvb_block_va(self.queue_pair, 0).unwrap_or(0)
     }
 
     fn with_bytes_mut<R>(&mut self, f: impl FnOnce(&mut [u8]) -> Result<R>) -> Result<R> {
@@ -2198,7 +2249,7 @@ impl G17PRenderTvb {
         self.block_count >= G17P_PM_BLOCK_COUNT && self.block_count <= G17P_PM_MAX_OWNED_BLOCKS
             && self.logical_size >= (self.block_count - 1) * G17P_RENDER_TVB_BLOCK_STRIDE + G17P_RENDER_TVB_BLOCK_SIZE
             && (0..self.block_count).all(|index| {
-                g17p_native_tvb_block_va(index).is_some_and(|address| {
+                g17p_render_tvb_block_va(self.queue_pair, index).is_some_and(|address| {
                     let guard = address + G17P_RENDER_TVB_BLOCK_SIZE as u64;
                     vm.covers_range(
                             address,
@@ -4976,6 +5027,7 @@ pub(crate) fn g17p_render_native_pm_bytes() -> bool {
 fn encode_g17p_parameter_management(
     raw: &mut [u8],
     high_va: u64,
+    queue_pair: G17PRenderQueuePair,
     page_list_vas: [u64; 2],
     metrics_vas: [u64; 2],
     tvb_va: u64,
@@ -4995,7 +5047,7 @@ fn encode_g17p_parameter_management(
     }
 
     raw.fill(0);
-    if tvb_va != g17p_native_tvb_block_va(0).ok_or(EINVAL)?
+    if tvb_va != g17p_render_tvb_block_va(queue_pair, 0).ok_or(EINVAL)?
         || render_layout.tvb_blocks > G17P_PM_MAX_OWNED_BLOCKS
     {
         return Err(EINVAL);
@@ -5020,8 +5072,8 @@ fn encode_g17p_parameter_management(
         // VA -- the two were conflated. With the segment retained this driver
         // published page-list=[0x200420, ...] (bit 21 set), naming pages in an
         // address class the parameter-buffer manager does not use.
-        let first_page = g17p_tvb_block_page_id(index).ok_or(EINVAL)?;
-        let block_va = g17p_native_tvb_block_va(index).ok_or(EINVAL)?;
+        let first_page = g17p_render_tvb_page_id(queue_pair, index).ok_or(EINVAL)?;
+        let block_va = g17p_render_tvb_block_va(queue_pair, index).ok_or(EINVAL)?;
         let block_end = block_va
             .checked_add(G17P_RENDER_TVB_BLOCK_SIZE as u64)
             .ok_or(EINVAL)?;
@@ -5132,6 +5184,8 @@ fn encode_g17p_parameter_management(
 
 #[cfg(not(test))]
 struct G17PParameterManagement {
+    // Drop the client mapping before its source backing.
+    _page_list_low: mmu::KernelMapping,
     backing: MappedObject,
     layout: G17PParameterManagementLayout,
     page_count: u32,
@@ -5215,7 +5269,8 @@ impl G17PParameterManagement {
     fn new(
         dev: &AsahiDevice,
         uat: &mmu::Uat,
-        page_list_vas: [u64; 2],
+        vm: &mmu::Vm,
+        queue_pair: G17PRenderQueuePair,
         metrics_vas: [u64; 2],
         tvb_va: u64,
         scene_scratch_va: u64,
@@ -5240,10 +5295,25 @@ impl G17PParameterManagement {
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
         let high_va = backing.iova();
+        let page_list_size = page_align(G17P_PM_PAGE_LIST_SIZE).ok_or(EINVAL)?;
+        let page_list_low_va = g17p_render_page_list_va(queue_pair).ok_or(EINVAL)?;
+        let page_list_low = backing.object.map_range_into_range(
+            vm,
+            layout.page_list..layout.page_list.checked_add(page_list_size).ok_or(EOVERFLOW)?,
+            page_list_low_va..page_list_low_va.checked_add(page_list_size as u64).ok_or(EOVERFLOW)?,
+            G17P_PM_PAGE_SIZE as u64,
+            mmu::PROT_GPU_FW_SHARED_RW,
+            false,
+        )?;
+        let page_list_vas = [
+            high_va.checked_add(layout.page_list as u64).ok_or(EOVERFLOW)?,
+            page_list_low_va,
+        ];
         backing.with_bytes_mut(|raw| {
             encode_g17p_parameter_management(
                 raw,
                 high_va,
+                queue_pair,
                 page_list_vas,
                 firmware_metrics_vas,
                 tvb_va,
@@ -5257,6 +5327,7 @@ impl G17PParameterManagement {
         })?;
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         Ok(Self {
+            _page_list_low: page_list_low,
             backing,
             layout,
             page_count: (render_layout.tvb_blocks * G17P_PM_PAGES_PER_BLOCK) as u32,
@@ -5325,6 +5396,10 @@ impl G17PParameterManagement {
         self.page_list_vas[1]
     }
 
+    fn page_list_vas(&self) -> [u64; 2] {
+        self.page_list_vas
+    }
+
     fn page_metrics_cpu_va(&self) -> u64 {
         self.metrics_vas[1]
     }
@@ -5344,27 +5419,6 @@ impl G17PParameterManagement {
         ))
     }
 
-    fn copy_page_list_to(&mut self, target: &mut MappedObject) -> Result {
-        if target.logical_size < G17P_PM_PAGE_LIST_SIZE {
-            return Err(ERANGE);
-        }
-        let start = self.layout.page_list;
-        let end = start
-            .checked_add(G17P_PM_PAGE_LIST_SIZE)
-            .ok_or(EOVERFLOW)?;
-        self.backing.with_bytes_mut(|source| {
-            let page_list = source.get(start..end).ok_or(ERANGE)?;
-            target.with_bytes_mut(|destination| {
-                destination
-                    .get_mut(..G17P_PM_PAGE_LIST_SIZE)
-                    .ok_or(ERANGE)?
-                    .copy_from_slice(page_list);
-                Ok(())
-            })
-        })?;
-        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        Ok(())
-    }
 }
 
 /// 0: off. 1: reserve the storage only. 2: reserve, populate the block
@@ -5948,7 +6002,6 @@ impl G17PUserRenderStorage {
     fn new(
         dev: &AsahiDevice,
         uat: &mmu::Uat,
-        parameter_page_list_vas: [u64; 2],
         parameter_metrics_vas: [u64; 2],
         queue_pair: G17PRenderQueuePair,
         vm: &mmu::Vm,
@@ -6180,7 +6233,7 @@ impl G17PUserRenderStorage {
                 MappedObject::new_wc_at(
                     dev,
                     vm,
-                    G17P_RENDER_SCENE_SCRATCH_VA,
+                    g17p_render_scene_scratch_va(queue_pair).ok_or(EINVAL)?,
                     G17P_RENDER_SCENE_SCRATCH_MAPPING_SIZE,
                     mmu::PROT_GPU_SHARED_RW,
                 )
@@ -6194,7 +6247,7 @@ impl G17PUserRenderStorage {
                 MappedObject::new_wc_at(
                     dev,
                     vm,
-                    G17P_RENDER_DISCARD_VA,
+                    g17p_render_discard_va(queue_pair).ok_or(EINVAL)?,
                     G17P_PM_DISCARD_SIZE,
                     mmu::PROT_GPU_SHARED_RW,
                 )
@@ -6206,6 +6259,7 @@ impl G17PUserRenderStorage {
             Some(bootstrap_stage!("native sparse TVB allocation", G17PRenderTvb::new(
                 dev,
                 vm,
+                queue_pair,
                 &render_layout,
             )))
         } else {
@@ -6284,7 +6338,7 @@ impl G17PUserRenderStorage {
             "standalone 3D status client alias",
             fragment_status.map_alias_at(
                 vm,
-                G17P_RENDER_FRAGMENT_STATUS_VA,
+                g17p_render_fragment_status_va(queue_pair).ok_or(EINVAL)?,
                 mmu::PROT_GPU_SHARED_RW,
             )
         );
@@ -6330,12 +6384,11 @@ impl G17PUserRenderStorage {
             // is in something it POINTS AT. Log every address it binds.
             dev_info!(
                 dev.as_ref(),
-                "G17P parameter-management binds: tvb={:#x} scene_scratch={:#x} discard={:#x} pagelist=[{:#x},{:#x}] metrics=[{:#x},{:#x}] hwbuf={}\n",
+                "G17P parameter-management binds: tvb={:#x} scene_scratch={:#x} discard={:#x} page-list-low={:#x} metrics=[{:#x},{:#x}] hwbuf={}\n",
                 tvb_va,
                 scene_scratch_va,
                 discard_va,
-                parameter_page_list_vas[0],
-                parameter_page_list_vas[1],
+                g17p_render_page_list_va(queue_pair).unwrap_or(0),
                 parameter_metrics_vas[0],
                 parameter_metrics_vas[1],
                 translated.parameters.ta_hardware_buffer_id,
@@ -6345,7 +6398,8 @@ impl G17PUserRenderStorage {
                 G17PParameterManagement::new(
                     dev,
                     uat,
-                    parameter_page_list_vas,
+                    vm,
+                    queue_pair,
                     parameter_metrics_vas,
                     tvb_va,
                     scene_scratch_va,
@@ -7095,6 +7149,13 @@ impl G17PUserRenderStorage {
             addresses.parameter_buffer_token,
             addresses.ta_hardware_buffer_id,
         )
+    }
+
+    pub(crate) fn parameter_buffer_page_list_vas(&self) -> Result<[u64; 2]> {
+        self.parameter_management
+            .as_ref()
+            .map(G17PParameterManagement::page_list_vas)
+            .ok_or(EINVAL)
     }
 
     /// Read the exact EventControl record owned by the current TA command.
@@ -8263,7 +8324,7 @@ impl G17PUserRenderStorage {
             |address, size| vm.covers_range(address, size, true, true),
         ) && self.render_user_aliases.all_reachable_from(vm)
             && self.scene_scratch.as_ref().map_or(true, |scene| {
-                scene.iova() == G17P_RENDER_SCENE_SCRATCH_VA
+                scene.iova() == g17p_render_scene_scratch_va(self.queue_pair).unwrap_or(0)
                     && scene.logical_size == G17P_RENDER_SCENE_SCRATCH_MAPPING_SIZE
                     && vm.covers_range(
                         scene.iova(),
@@ -8273,7 +8334,7 @@ impl G17PUserRenderStorage {
                     )
             })
             && self.discard.as_ref().map_or(true, |discard| {
-                discard.iova() == G17P_RENDER_DISCARD_VA
+                discard.iova() == g17p_render_discard_va(self.queue_pair).unwrap_or(0)
                     && discard.logical_size == G17P_PM_DISCARD_SIZE
                     && vm.covers_range(
                         discard.iova(),
@@ -8349,13 +8410,13 @@ impl G17PUserRenderStorage {
             self.render_user_aliases.aux_fb_va(),
             self.render_tvb.as_ref().map_or(0, G17PRenderTvb::iova),
             self.render_tvb.as_ref().map_or(0, |_| {
-                g17p_native_tvb_block_va(G17P_PM_BLOCK_COUNT - 1).unwrap_or(0)
+                g17p_render_tvb_block_va(self.queue_pair, G17P_PM_BLOCK_COUNT - 1).unwrap_or(0)
             }),
             self.fragment_rce.iova(),
             self.descriptor_3d_render.iova(),
             self.render_user_aliases.all_reachable_from(vm)
                 && self.scene_scratch.as_ref().map_or(true, |scene| {
-                    scene.iova() == G17P_RENDER_SCENE_SCRATCH_VA
+                    scene.iova() == g17p_render_scene_scratch_va(self.queue_pair).unwrap_or(0)
                         && scene.logical_size == G17P_RENDER_SCENE_SCRATCH_MAPPING_SIZE
                         && vm.covers_range(
                             scene.iova(),
@@ -8365,7 +8426,7 @@ impl G17PUserRenderStorage {
                         )
                 })
                 && self.discard.as_ref().map_or(true, |discard| {
-                    discard.iova() == G17P_RENDER_DISCARD_VA
+                    discard.iova() == g17p_render_discard_va(self.queue_pair).unwrap_or(0)
                         && discard.logical_size == G17P_PM_DISCARD_SIZE
                         && vm.covers_range(
                             discard.iova(),
@@ -8436,7 +8497,8 @@ impl G17PUserRenderStorage {
                 "compact-render-state-aliases",
                 self.render_user_aliases.all_reachable_from(vm)
                     && self.scene_scratch.as_ref().map_or(true, |scene| {
-                        scene.iova() == G17P_RENDER_SCENE_SCRATCH_VA
+                        scene.iova()
+                            == g17p_render_scene_scratch_va(self.queue_pair).unwrap_or(0)
                             && scene.logical_size == G17P_RENDER_SCENE_SCRATCH_MAPPING_SIZE
                             && vm.covers_range(
                                 scene.iova(),
@@ -8446,7 +8508,7 @@ impl G17PUserRenderStorage {
                             )
                     })
                     && self.discard.as_ref().map_or(true, |discard| {
-                        discard.iova() == G17P_RENDER_DISCARD_VA
+                        discard.iova() == g17p_render_discard_va(self.queue_pair).unwrap_or(0)
                             && discard.logical_size == G17P_PM_DISCARD_SIZE
                             && vm.covers_range(
                                 discard.iova(),
@@ -8459,7 +8521,7 @@ impl G17PUserRenderStorage {
             (
                 "render-tvb-native-identity",
                 self.render_tvb.as_ref().map_or(true, |tvb| {
-                    tvb.iova() == g17p_native_tvb_block_va(0).unwrap_or(0)
+                    tvb.iova() == g17p_render_tvb_block_va(self.queue_pair, 0).unwrap_or(0)
                         && tvb.block_count >= G17P_PM_BLOCK_COUNT
                         && tvb.block_count <= G17P_PM_MAX_OWNED_BLOCKS
                 }),
@@ -8615,7 +8677,8 @@ impl G17PUserRenderStorage {
             (
                 "3d-status-page",
                 self.fragment_status.logical_size == mmu::UAT_PGSZ
-                    && self.fragment_status_low.iova() == G17P_RENDER_FRAGMENT_STATUS_VA
+                    && self.fragment_status_low.iova()
+                        == g17p_render_fragment_status_va(self.queue_pair).unwrap_or(0)
                     && self.fragment_status_low.size() == mmu::UAT_PGSZ
                     && uat.kernel_vm().covers_range(
                         self.fragment_status.iova(),
@@ -8624,7 +8687,7 @@ impl G17PUserRenderStorage {
                         false,
                     )
                     && vm.covers_range(
-                        G17P_RENDER_FRAGMENT_STATUS_VA,
+                        g17p_render_fragment_status_va(self.queue_pair).unwrap_or(0),
                         mmu::UAT_PGSZ as u64,
                         true,
                         true,
@@ -14336,26 +14399,14 @@ impl G17ResourceOwner {
         Ok(lanes)
     }
 
-    pub(crate) fn parameter_buffer_page_list_vas(&self) -> [u64; 2] {
-        [
-            self.resources.partial_primary_index.iova(),
-            self.resources.partial_primary_index_low.iova(),
-        ]
-    }
-
     /// Point the device-global parameter-buffer loader at this storage's
-    /// parameter-management page list and PBDesc entry.
+    /// PBDesc entry. The page list itself is a subrange of this storage's PM
+    /// backing with a pair-specific client alias; it is never copied through
+    /// the bootstrap primary-index object.
     ///
-    /// `partial_primary_index` and the PBDesc table are mapped at fixed native
-    /// addresses in both the firmware VM and context 0, because `halLoadPBDesc`
-    /// publishes to one device-global PB loader whose faults the hardware
-    /// attributes to VM slot 0. They are therefore per-DEVICE, while every
-    /// `G17PUserRenderStorage` builds its own `G17PParameterManagement` with
-    /// its own page list -- so whichever storage stamped these objects last
-    /// owns them. Staging this only at storage construction was survivable
-    /// while every client alternation rebuilt the graph; once a client keeps
-    /// its retained storage across submissions, the loader has to be
-    /// re-pointed at the storage that is actually about to run.
+    /// The PBDesc table is device-global, while every retained storage owns a
+    /// distinct descriptor slot and PM page-list mapping. Restage the selected
+    /// slot immediately before its queue pair runs.
     pub(crate) fn stage_render_parameter_buffer_view(
         &mut self,
         storage: &mut G17PUserRenderStorage,
@@ -14370,11 +14421,12 @@ impl G17ResourceOwner {
         storage: &mut G17PUserRenderStorage,
     ) -> Result {
         let pm = storage.parameter_management.as_mut().ok_or(EINVAL)?;
-        pm.copy_page_list_to(&mut self.resources.partial_primary_index)?;
+        let page_list_offset = pm.layout.page_list;
+        let page_list_vas = pm.page_list_vas;
         let mut first = [0u32; 8];
-        self.resources.partial_primary_index.with_bytes_mut(|bytes| {
+        pm.backing.with_bytes_mut(|bytes| {
             for (index, value) in first.iter_mut().enumerate() {
-                let offset = index * 4;
+                let offset = page_list_offset + index * 4;
                 *value = u32::from_le_bytes(
                     bytes
                         .get(offset..offset + 4)
@@ -14389,8 +14441,8 @@ impl G17ResourceOwner {
             dev_info!(
                 self.dev().as_ref(),
                 "G17P render PM: staged native PB page-list aliases=[{:#x},{:#x}] first={:x?}\n",
-                self.resources.partial_primary_index.iova(),
-                g17_submission::G17P_PARTIAL_OPENING_PRIMARY_INDEX_GPU_VA,
+                page_list_vas[0],
+                page_list_vas[1],
                 first,
             );
         }
@@ -14555,7 +14607,7 @@ impl G17ResourceOwner {
             "G17P render channel owner: process pid={}\n",
             owner_pid
         );
-        vm.clear_render_pool_mappings();
+        vm.clear_render_pool_mappings(queue_pair.slot());
         let mut render_operand_aliases = self.stage_user_render_flist(vm)?;
         let job_context_aliases = self
             .address_space
@@ -14564,8 +14616,8 @@ impl G17ResourceOwner {
         for mapping in job_context_aliases {
             render_operand_aliases.push(mapping, GFP_KERNEL)?;
         }
+        vm.append_driver_mappings(render_operand_aliases)?;
         self.stage_render_uma_page_pool_descriptor()?;
-        let parameter_page_list_vas = self.parameter_buffer_page_list_vas();
         let (command_context, render_root_slot) = if let Some(context) = execution_context {
             if !context.matches(vm) || context.context_id() != u32::from(descriptor_context_id) {
                 return Err(EINVAL);
@@ -14595,7 +14647,6 @@ impl G17ResourceOwner {
         let mut storage = G17PUserRenderStorage::new(
             dev,
             &self.address_space.uat,
-            parameter_page_list_vas,
             parameter_metrics_vas,
             queue_pair,
             vm,
@@ -14613,11 +14664,8 @@ impl G17ResourceOwner {
             retained_sksm_backing,
         )?;
         let finish = (|| -> Result {
-            for mapping in render_operand_aliases {
-                storage.render_operand_aliases.push(mapping, GFP_KERNEL)?;
-            }
             let aliases = storage.take_persistent_client_mappings()?;
-            vm.install_render_pool_mappings(storage.render_pool_id(),
+            vm.install_render_pool_mappings(queue_pair.slot(), storage.render_pool_id(),
                 storage.render_tvb.as_ref().map_or(0, |tvb| tvb.block_count), aliases)?;
             // The VM may already have executed compute or an earlier render
             // generation through its independently allocated descriptor
@@ -14647,10 +14695,11 @@ impl G17ResourceOwner {
         &mut self, storage: &mut G17PUserRenderStorage, vm: &mmu::Vm, blocks: usize,
     ) -> Result {
         let pool_id=storage.render_pool_id();
+        let render_slot=storage.queue_pair.slot();
         let tvb=storage.render_tvb.as_mut().ok_or(EINVAL)?;
         let previous_blocks=tvb.block_count;
         if blocks <= previous_blocks { return Ok(()); }
-        if vm.render_pool_tvb_blocks(pool_id) != Some(previous_blocks) || !tvb.all_reachable_from(vm) {
+        if vm.render_pool_tvb_blocks(render_slot, pool_id) != Some(previous_blocks) || !tvb.all_reachable_from(vm) {
             return Err(EFAULT);
         }
         let growth=tvb.prepare_growth(self.dev(),vm,blocks)?.ok_or(EINVAL)?;
@@ -14661,18 +14710,16 @@ impl G17ResourceOwner {
             .and_then(|size| size.checked_add(G17P_RENDER_TVB_BLOCK_SIZE)).ok_or(EOVERFLOW)?;
         let mut page_ids=KVec::with_capacity(blocks,GFP_KERNEL)?;
         for block in 0..blocks {
-            page_ids.push(g17p_tvb_block_page_id(block).ok_or(EINVAL)?,GFP_KERNEL)?;
+            page_ids.push(g17p_render_tvb_page_id(storage.queue_pair, block).ok_or(EINVAL)?,GFP_KERNEL)?;
         }
         let descriptor_offset=g17_submission::g17p_pbdesc_offset(pm.hardware_buffer_id);
         let page_list_address=pm.page_list_low_va();
         let pm_layout=pm.layout;
-        let page_list=&mut self.resources.partial_primary_index;
         let descriptor=&mut self.resources.pb_descriptor_table;
         pm.backing.with_bytes_mut(|pm_raw| {
-            page_list.with_bytes_mut(|page_raw| {
-                descriptor.with_bytes_mut(|desc_raw| {
+            descriptor.with_bytes_mut(|desc_raw| {
                     let descriptor_end=descriptor_offset.checked_add(g17_submission::G17P_PBDESC_ENTRY_SIZE).ok_or(EOVERFLOW)?;
-                    if pm_raw.len()<pm_layout.total_size || page_raw.len()<G17P_PM_PAGE_LIST_SIZE
+                    if pm_raw.len()<pm_layout.total_size
                         || descriptor_end>desc_raw.len() || tvb.extensions.len()==tvb.extensions.capacity()
                     { return Err(ERANGE); }
                     let mut previous=[0u32;4];
@@ -14684,13 +14731,12 @@ impl G17ResourceOwner {
                         g17_submission::G17PPbDescRingState::default());
                     // This is the last fallible step. Alias allocation/count
                     // checking completes before any firmware-visible write.
-                    vm.append_render_pool_mappings(pool_id,previous_blocks,blocks,growth.mappings)?;
+                    vm.append_render_pool_mappings(render_slot,pool_id,previous_blocks,blocks,growth.mappings)?;
                     for (block,first) in page_ids.into_iter().enumerate() {
                         put_u32(pm_raw,pm_layout.block_page_bases+block*8,first);
                         for page in 0..G17P_PM_PAGES_PER_BLOCK {
                             let at=(block*G17P_PM_PAGES_PER_BLOCK+page)*4;
                             put_u32(pm_raw,pm_layout.page_list+at,first+page as u32);
-                            put_u32(page_raw,at,first+page as u32);
                         }
                     }
                     // AGXParameterManagement::buildPageList,8a71908: rebuild
@@ -14718,7 +14764,6 @@ impl G17ResourceOwner {
                     tvb.block_count=blocks;
                     tvb.logical_size=logical_size;
                     Ok(())
-                })
             })
         })?;
         pm.page_count=page_count;
@@ -14731,19 +14776,18 @@ impl G17ResourceOwner {
     pub(crate) fn cache_render_vm_mappings(
         &mut self, storage: &mut G17PUserRenderStorage, vm: &mmu::Vm,
     ) -> Result {
-        if let Some(mapped_blocks)=vm.render_pool_tvb_blocks(storage.render_pool_id()) {
+        let render_slot = storage.queue_pair.slot();
+        if let Some(mapped_blocks)=vm.render_pool_tvb_blocks(render_slot, storage.render_pool_id()) {
             let blocks=storage.tvb_capacity();
             if mapped_blocks==blocks { return Ok(()); }
             let tvb=storage.render_tvb.as_mut().ok_or(EIO)?;
             let aliases=tvb.map_cached_blocks_from(vm,mapped_blocks)?;
-            return vm.append_render_pool_mappings(storage.render_pool_id(),mapped_blocks,blocks,aliases);
+            return vm.append_render_pool_mappings(render_slot,storage.render_pool_id(),mapped_blocks,blocks,aliases);
         }
-        vm.clear_render_pool_mappings();
-        let mut aliases = storage.map_persistent_client_aliases(vm)?;
-        for mapping in self.stage_user_render_flist(vm)? {
-            aliases.push(mapping, GFP_KERNEL)?;
-        }
-        vm.install_render_pool_mappings(storage.render_pool_id(),
+        vm.clear_render_pool_mappings(render_slot);
+        let aliases = storage.map_persistent_client_aliases(vm)?;
+        vm.append_driver_mappings(self.stage_user_render_flist(vm)?)?;
+        vm.install_render_pool_mappings(render_slot, storage.render_pool_id(),
             storage.render_tvb.as_ref().map_or(0, |tvb| tvb.block_count), aliases)
     }
 
@@ -15169,21 +15213,26 @@ impl G17ResourceOwner {
             GFP_KERNEL,
         )?;
         reserved_ranges.push(G17P_CL_LOW_VA_START..G17P_CL_LOW_VA_END, GFP_KERNEL)?;
-        reserved_ranges.push(
-            G17P_RENDER_SCENE_SCRATCH_VA
-                ..G17P_RENDER_SCENE_SCRATCH_VA
-                    + G17P_RENDER_SCENE_SCRATCH_MAPPING_SIZE as u64,
-            GFP_KERNEL,
-        )?;
-        reserved_ranges.push(
-            G17P_RENDER_DISCARD_VA..G17P_RENDER_DISCARD_VA + G17P_PM_DISCARD_SIZE as u64,
-            GFP_KERNEL,
-        )?;
-        reserved_ranges.push(
-            G17P_RENDER_FRAGMENT_STATUS_VA
-                ..G17P_RENDER_FRAGMENT_STATUS_VA + mmu::UAT_PGSZ as u64,
-            GFP_KERNEL,
-        )?;
+        for slot in 0..G17PRenderQueuePair::SLOT_COUNT {
+            let pair = G17PRenderQueuePair::for_slot(slot).ok_or(EINVAL)?;
+            let scene = g17p_render_scene_scratch_va(pair).ok_or(EINVAL)?;
+            let discard = g17p_render_discard_va(pair).ok_or(EINVAL)?;
+            let page_list = g17p_render_page_list_va(pair).ok_or(EINVAL)?;
+            let status = g17p_render_fragment_status_va(pair).ok_or(EINVAL)?;
+            reserved_ranges.push(
+                scene..scene + G17P_RENDER_SCENE_SCRATCH_MAPPING_SIZE as u64,
+                GFP_KERNEL,
+            )?;
+            reserved_ranges.push(
+                discard..discard + G17P_PM_DISCARD_SIZE as u64,
+                GFP_KERNEL,
+            )?;
+            reserved_ranges.push(
+                page_list..page_list + page_align(G17P_PM_PAGE_LIST_SIZE).ok_or(EINVAL)? as u64,
+                GFP_KERNEL,
+            )?;
+            reserved_ranges.push(status..status + mmu::UAT_PGSZ as u64, GFP_KERNEL)?;
+        }
         // Keep only the low-half render aperture driver-owned. Honeykrisp's VDM
         // command BO aliases descend from the top of this 4 GiB window, so
         // reserving the entire tail would reject valid userspace aliases such
@@ -15200,6 +15249,14 @@ impl G17ResourceOwner {
             reserved_ranges.push(start..end, GFP_KERNEL)?;
         }
         reserved_ranges.push(G17P_RENDER_TVB_GROWTH_START..G17P_RENDER_TVB_GROWTH_END, GFP_KERNEL)?;
+        for slot in 1..G17PRenderQueuePair::SLOT_COUNT {
+            let pair = G17PRenderQueuePair::for_slot(slot).ok_or(EINVAL)?;
+            let start = g17p_render_tvb_block_va(pair, 0).ok_or(EINVAL)?;
+            let end = g17p_render_tvb_block_va(pair, G17P_PM_MAX_OWNED_BLOCKS - 1)
+                .and_then(|address| address.checked_add(G17P_RENDER_TVB_BLOCK_STRIDE as u64))
+                .ok_or(EOVERFLOW)?;
+            reserved_ranges.push(start..end, GFP_KERNEL)?;
+        }
         reserved_ranges.push(G17P_RENDER_AUX_ALIAS_START..G17P_RENDER_AUX_ALIAS_END, GFP_KERNEL)?;
         reserved_ranges.push(
             self.resources.parameter_metrics_low_va
@@ -15307,24 +15364,10 @@ impl G17ResourceOwner {
             g17p_control_operand_buffer_va(18).ok_or(EINVAL)?
                 | g17_initdata::CONTROL_OPERAND_ENTRY_FLAG,
         );
-        mappings.push(
-            match self.resources.partial_primary_index.map_alias_at(
-                vm,
-                g17_submission::G17P_PARTIAL_OPENING_PRIMARY_INDEX_GPU_VA,
-                mmu::PROT_GPU_FW_SHARED_RW,
-            ) {
-                Ok(mapping) => mapping,
-                Err(error) => {
-                    dev_err!(
-                        self.dev.as_ref(),
-                        "G17P VM: primary-index alias failed ({:?})\n",
-                        error
-                    );
-                    return Err(error);
-                }
-            },
-            GFP_KERNEL,
-        )?;
+        // Each live render pair maps its own PM page list at a pair-specific
+        // compact VA while constructing G17PParameterManagement. Installing
+        // the device-global bootstrap page here would occupy pair 0's address
+        // before its real owner exists and would let pair 1 overwrite it.
         mappings.push(
             match self.resources.parameter_metrics.map_alias_at(
                 vm,
@@ -16303,6 +16346,7 @@ mod tests {
             encode_g17p_parameter_management(
                 &mut raw,
                 high,
+                G17PRenderQueuePair::for_slot(0).unwrap(),
                 page_list_vas,
                 firmware_metrics_vas,
                 tvb_va,
@@ -16434,7 +16478,8 @@ mod tests {
         assert_eq!(G17P_RENDER_USER_ALIAS_START, 0x10_0200_0000);
         assert_eq!(G17P_RENDER_USER_ALIAS_END, 0x10_0220_0000);
         assert_eq!(G17P_RENDER_SCENE_SCRATCH_VA, 0x10_0017_8000);
-        assert_eq!(G17P_RENDER_SCENE_SCRATCH_MAPPING_SIZE, 0x4000);
+        assert_eq!(G17P_RENDER_SCENE_SCRATCH_MAPPING_SIZE, 0x8000);
+        assert_eq!(G17P_RENDER_SCENE_SCRATCH_MAPPING_SIZE, G17P_PM_SCENE_SCRATCH_SIZE);
         assert_eq!(G17P_RENDER_DISCARD_VA, 0x10_0018_0000);
         assert_eq!(G17P_PM_DISCARD_SIZE, 0x8000);
         assert!(G17P_RENDER_SCENE_SCRATCH_VA < G17P_RENDER_FRAGMENT_STATUS_VA);
@@ -16458,6 +16503,17 @@ mod tests {
         assert_eq!(g17p_render_alias_slot(pair1, 0), Some(2));
         assert_eq!(g17p_render_alias_slot(pair1, 1), Some(3));
         assert_eq!(g17p_render_alias_slot(pair1, 2), Some(2));
+        assert_eq!(g17p_render_scene_scratch_va(pair0), Some(0x10_0017_8000));
+        assert_eq!(g17p_render_discard_va(pair0), Some(0x10_0018_0000));
+        assert_eq!(g17p_render_page_list_va(pair0), Some(0x10_0019_0000));
+        assert_eq!(g17p_render_fragment_status_va(pair0), Some(0x10_001a_8000));
+        assert_eq!(g17p_render_scene_scratch_va(pair1), Some(0x10_001f_8000));
+        assert_eq!(g17p_render_discard_va(pair1), Some(0x10_0020_0000));
+        assert_eq!(g17p_render_page_list_va(pair1), Some(0x10_0021_0000));
+        assert_eq!(g17p_render_fragment_status_va(pair1), Some(0x10_0022_8000));
+        assert!(g17p_render_scene_scratch_va(pair0).unwrap()
+            + G17P_RENDER_FIXED_PAIR_STRIDE
+            == g17p_render_scene_scratch_va(pair1).unwrap());
         assert_eq!(G17P_NATIVE_TVB_BLOCK_PAGE_IDS.len(), G17P_PM_BLOCK_COUNT);
         assert_eq!(G17P_NATIVE_TVB_BLOCK_PAGE_IDS[0], 0x11);
         assert_eq!(G17P_NATIVE_TVB_BLOCK_PAGE_IDS[5], 0x2a);
@@ -16467,6 +16523,15 @@ mod tests {
         assert_eq!(g17p_native_tvb_block_va(5), Some(0x10_0015_0000));
         assert_eq!(g17p_native_tvb_block_va(6), Some(0x10_0025_0000));
         assert_eq!(g17p_native_tvb_block_va(31), Some(0x10_0063_8000));
+        assert_eq!(g17p_render_tvb_block_va(pair0, 0), Some(0x10_0008_8000));
+        assert_eq!(g17p_render_tvb_block_va(pair1, 0), Some(0x10_2c00_0000));
+        let pair0_last = g17p_render_tvb_block_va(pair0, G17P_PM_MAX_OWNED_BLOCKS - 1)
+            .unwrap() + G17P_RENDER_TVB_BLOCK_STRIDE as u64;
+        let pair1_first = g17p_render_tvb_block_va(pair1, 0).unwrap();
+        let pair1_last = g17p_render_tvb_block_va(pair1, G17P_PM_MAX_OWNED_BLOCKS - 1)
+            .unwrap() + G17P_RENDER_TVB_BLOCK_STRIDE as u64;
+        assert!(pair0_last <= pair1_first);
+        assert!(pair1_last <= G17P_RENDER_USER_END);
         let fixed_ranges = [
             (mmu::T8140_PARAMETER_METRICS_LOW_VA, 0x8000u64),
             (G17P_RENDER_SCENE_SCRATCH_VA, G17P_RENDER_SCENE_SCRATCH_MAPPING_SIZE as u64),
