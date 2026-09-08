@@ -7002,6 +7002,22 @@ impl G17PUserRenderStorage {
         self.render_root_slot
     }
 
+    pub(crate) fn descriptor_context_id(&self) -> u16 {
+        self.descriptor_context_id
+    }
+
+    /// Expected TA parameter-buffer binding copied from the retained owner
+    /// into tag-15. These values are independent of the physical QID and must
+    /// survive a graph rebuild as one tuple.
+    pub(crate) fn parameter_buffer_binding(&self) -> (u64, u64, u32) {
+        let addresses = self.optional_addresses(true);
+        (
+            addresses.tiling_shared_object,
+            addresses.parameter_buffer_token,
+            addresses.ta_hardware_buffer_id,
+        )
+    }
+
     /// Read the exact EventControl record owned by the current TA command.
     /// The matching firmware type-1 edge orders these host-DRAM fields; no
     /// MMIO or periodic polling is needed to decide whether it is reusable.

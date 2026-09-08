@@ -26,6 +26,13 @@ for field in (
     "producer.queue_id",
     "producer.completion_selector",
     "producer.qos.queue_byte_32",
+    "descriptor_context_ids",
+    "header.context_id",
+    "parameter_buffer_binding",
+    "header.parameter_buffer_object",
+    "header.parameter_buffer_token",
+    "header.parameter_buffer_id",
+    "header.parameter_buffer_bit",
     "config != expected",
 ):
     assert field in validator, field
@@ -42,4 +49,5 @@ for call in (
     assert begin.index(call) < outer, call
 
 assert "g17p_sksm_configure_queue" not in validator
+assert "!execution_context.matches(vm) || !execution_context.is_current()" in MANAGER
 print("g17 render QID consistency validation: PASS")
