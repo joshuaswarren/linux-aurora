@@ -8,7 +8,10 @@ def method(marker):
  while depth:
   depth+=(source[e]=='{')-(source[e]=='}');e+=1
  return source[a:e]
-wait=method('fn wait_input_fences(');ready=method('fn acquire_ready_lease(')
+wait='\n'.join([
+ method('fn wait_fence('),
+ method('fn wait_input_fences('),
+]);ready=method('fn acquire_ready_lease(')
 submit=source[source.index('impl queue::Queue for G17PQueue {'):]
 assert submit.index('parser\n            .finish()') < submit.index('self.acquire_ready_lease(')
 assert submit.index('self.acquire_ready_lease(') < submit.index('match pending {\n            G17PPendingCommand::Render(translated) => {')
@@ -25,6 +28,7 @@ use std::thread;
 #[derive(Debug,PartialEq,Copy,Clone)]struct Error(i32);
 impl Error{fn from_errno(v:i32)->Self{Self(v)}}
 type Result<T=()> = core::result::Result<T,Error>;
+const ETIMEDOUT:Error=Error(-110);
 mod kernel{pub mod task{pub const MAX_SCHEDULE_TIMEOUT:i64=i64::MAX;}}
 struct FenceState { status:Mutex<i64>,changed:Condvar,entered:Arc<AtomicU32> }
 #[derive(Clone)]struct Fence(Arc<FenceState>);
@@ -41,6 +45,9 @@ mod bindings {
   let (status,timed)=f.changed.wait_timeout_while(status,super::Duration::from_secs(2),|s|*s==0).unwrap();
   if timed.timed_out()&&*status==0{-110}else{*status}
  }
+ pub(super) unsafe fn dma_fence_get_status(raw:*const super::FenceState)->i32 {
+  *unsafe{&*raw}.status.lock().unwrap() as i32
+ }
 }
 #[derive(Default)]struct Registry{held:Mutex<bool>,changed:Condvar,acquisitions:AtomicU32}
 struct G17PLeaseGuard{registry:Arc<Registry>}
@@ -54,8 +61,8 @@ impl Registry {
  }
 }
 impl Drop for G17PLeaseGuard{fn drop(&mut self){*self.registry.held.lock().unwrap()=false;self.registry.changed.notify_all();}}
-// The render slot is keyed on the submitting VM, not on the logical queue,
-// so a client with two queues stays on the storage it already built.
+// The retained graph is keyed on the logical queue because every queue owns a
+// distinct descriptor context, including when two queues share one VM.
 struct Vm(u64);impl Vm{fn id(&self)->u64{self.0}}
 // Affinity is switchable at runtime; owner zero is the historical policy.
 mod module_parameters{pub struct P(u32);impl P{pub fn value(&self)->&u32{&self.0}}

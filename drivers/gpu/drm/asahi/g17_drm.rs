@@ -165,14 +165,16 @@ const _: () = assert!(G17P_ACTIVE_RENDER_SLOTS <= G17P_RENDER_SLOTS);
 struct G17PQueueLeaseState {
     render_slots: u8,
     compute_install: bool,
-    /// VM that currently owns each render slot's retained storage, or 0 for a
+    /// Logical queue that owns each render slot's retained storage, or 0 for a
     /// slot no client has claimed yet.
     ///
     /// The `G17PUserRenderStorage` behind a slot -- its descriptors, render
     /// state, TVB pool, parameter-management graph and application-GART root --
-    /// belongs to one VM. Handing the slot to a different VM forces
+    /// belongs to one descriptor context. Every logical queue has its own
+    /// descriptor context even when several queues share one VM. Handing the
+    /// slot to a different queue forces
     /// `handoff_retained_render_vm` to tear that whole graph down and rebuild
-    /// it in the incoming VM. Recording the owner lets a client come back to
+    /// it for the incoming context. Recording the owner lets a queue come back to
     /// the storage it already built instead of taking whichever slot happens to
     /// be free, which is what made two concurrent clients rebuild each other's
     /// graph on every alternation.
@@ -359,12 +361,12 @@ impl G17PQueueRegistry {
         self.live_queues.fetch_sub(1, Ordering::AcqRel);
     }
 
-    /// Block until this VM owns a render slot, preferring the slot that already
+    /// Block until this logical queue owns a render slot, preferring the slot that already
     /// holds its retained graph.
     ///
-    /// `owner` is the submitting VM's id, not the logical queue's: the retained
-    /// render storage is owned by a VM, so two queues of one client share a
-    /// slot instead of evicting each other. Waiting here is interruptible and
+    /// `owner` is the logical queue id. Retained descriptors name that queue's
+    /// independently allocated application-GART descriptor context, so two
+    /// queues in one VM cannot share one graph. Waiting here is interruptible and
     /// unbounded by design -- a client that has to wait loses latency, whereas
     /// an EBUSY from this path reaches Mesa as VK_ERROR_DEVICE_LOST and takes
     /// the client's whole context with it.
@@ -1267,12 +1269,12 @@ impl G17PQueue {
     ) -> Result<G17PLeaseGuard> {
         Self::wait_input_fences(syncs)
             .map_err(|error| Self::stage_fail(submission_id, "wait-input-fences", error))?;
-        // Key the slot on the VM, not on this logical queue: the retained
-        // render graph belongs to the VM, so two queues of one client must
-        // share a slot rather than hand it off between themselves. Owner zero
-        // claims nothing, which is exactly the historical lowest-free policy.
+        // Key the slot on this logical queue, whose independently allocated
+        // descriptor context is encoded throughout the retained render graph.
+        // Sharing one VM does not make two queue contexts interchangeable.
+        // Owner zero claims nothing, which is the historical lowest-free policy.
         let owner = if *module_parameters::g17p_render_slot_affinity.value() != 0 {
-            self.vm.id()
+            self.id
         } else {
             0
         };

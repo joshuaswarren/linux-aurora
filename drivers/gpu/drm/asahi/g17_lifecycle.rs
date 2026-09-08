@@ -159,13 +159,14 @@ pub(crate) fn recover_persistent_runtime<T: PersistentRuntimeRecovery>(
 /// Decide whether the next render must start a fresh firmware session.
 /// Physical 256-slot SKSM/outer rings wrap without a session restart. The
 /// current event writer admits 24-bit stamps; retain that real width bound.
-/// A VM change still requires a cold session because the graph has an owner.
+/// A retained-graph owner change still requires a cold session if the normal
+/// graph-handoff path has not replaced it first.
 pub(crate) const fn retained_render_requires_recycle(
     retained_graph: bool,
-    same_vm: bool,
+    same_owner: bool,
     next_ordinal: u32,
 ) -> bool {
-    retained_graph && (!same_vm || next_ordinal >= 0x00ff_ffff)
+    retained_graph && (!same_owner || next_ordinal >= 0x00ff_ffff)
 }
 
 /// Operations needed to dismantle a retained G17P runtime.
