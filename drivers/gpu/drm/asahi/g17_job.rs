@@ -7,7 +7,7 @@
 //! owner per DRM queue and completion-driven retirement; the current shared
 //! QID0/1/4 runtime does not satisfy that contract.
 
-use core::sync::atomic::{fence, Ordering};
+use core::sync::atomic::{fence, AtomicU32, Ordering};
 use kernel::{c_str, dma_fence::{Fence, UserFence, RawDmaFence}, drm::sched, prelude::*, sync::Arc};
 use crate::{driver::AsahiDevice, g17_uapi, mmu};
 
@@ -47,12 +47,16 @@ pub(crate) struct G17PJobCompletion {
     pub(crate) fence: UserFence<crate::g17_drm::G17PSubmissionFence>,
     pub(crate) timestamps: mmu::KernelMapping,
     pub(crate) destinations: [Option<TimestampDestination>; 2],
+    pub(crate) signalled: AtomicU32,
 }
 
 impl G17PJobCompletion {
     pub(crate) fn gpu_address(&self) -> u64 { self.timestamps.iova() }
     pub(crate) fn fence(&self) -> Fence { Fence::from_fence(&self.fence) }
     pub(crate) fn complete(&self, result: Result<[u64; 2]>) {
+        if self.signalled.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return;
+        }
         let result = result.and_then(|timestamps| {
             for (destination, timestamp) in self.destinations.iter().zip(timestamps) {
                 if let Some(destination) = destination {

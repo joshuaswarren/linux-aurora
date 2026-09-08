@@ -51,7 +51,11 @@ for fallible in ('read_all(', 'copy_from_user', 'UserSlice::new('):
 # teardown.
 wrapper = item(drm, 'impl queue::Queue for G17PQueue {')
 assert 'self.submit_guarded(' in wrapper
-assert 'self.note_submission_failure(' in wrapper
+guarded = item(drm, '    fn submit_guarded(')
+assert 'self.note_submission_failure(' in guarded
+assert guarded.index('self.note_submission_failure(submission_id, error);') \
+    < guarded.index('publication.failed(error);'), \
+    'the output fence can wake before terminal VM state is recorded'
 
 note = item(drm, '    fn note_submission_failure(')
 sweep = item(async_compute, '    pub(crate) fn fail_outstanding_jobs_for_vm(')

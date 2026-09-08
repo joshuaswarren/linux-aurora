@@ -806,7 +806,16 @@ impl g17_job::G17PQueueBackend for G17PAsyncQueueBackend {
         self.runtime.mutex().lock().async_compute_dependency(self.owner)
     }
     fn publish(&self, packet: Arc<g17_job::G17PComputeJobPacket>) -> Result<Fence> {
-        let hardware_fence = packet.completion()?.fence();
+        let completion = packet.completion()?;
+        // Several compute jobs may already be queued behind one predecessor.
+        // If that predecessor failed, its scheduler fence wakes this job, but
+        // a signalled error dependency is still "ready" to DRM sched. Refuse
+        // the queued successor before acquiring a lease or publishing it.
+        if completion.status.get() != 0 {
+            completion.complete(Err(EIO));
+            return Err(EIO);
+        }
+        let hardware_fence = completion.fence();
         let first_install = self.runtime.mutex().lock().async_compute_needs_install(self.owner)?;
         let lease = self.registry.acquire_compute(first_install)?;
         self.runtime.mutex().lock().publish_async_compute(self.owner, packet, lease)?;
@@ -1077,7 +1086,13 @@ impl G17PQueue {
         let packet = g17_job::G17PComputeJobPacket::new(
             submission_id, backend.hardware_queue, backend.context.clone(), translated,
             KVec::new(), KVec::new(),
-            Some(g17_job::G17PJobCompletion { fence: output, timestamps, destinations, status: self.vm.status().clone() }),
+            Some(g17_job::G17PJobCompletion {
+                fence: output,
+                timestamps,
+                destinations,
+                status: self.vm.status().clone(),
+                signalled: AtomicU32::new(0),
+            }),
             Some(self.vm.retain_t8140_job()?),
         )?;
         // One extra dependency carries this logical queue's preceding render
@@ -1187,21 +1202,34 @@ impl G17PQueue {
         }
     }
 
+    fn wait_fence(fence: &Fence) -> Result {
+        // SAFETY: `fence.raw()` remains valid for both calls. The completed
+        // fence status must be consumed as well as its signal bit: an error
+        // fence counts as signalled, but it does not satisfy a GPU dependency.
+        let ret = unsafe {
+            bindings::dma_fence_wait_timeout(
+                fence.raw(),
+                true,
+                kernel::task::MAX_SCHEDULE_TIMEOUT,
+            )
+        };
+        if ret < 0 {
+            return Err(Error::from_errno(ret as i32));
+        }
+        if ret == 0 {
+            return Err(ETIMEDOUT);
+        }
+        let status = unsafe { bindings::dma_fence_get_status(fence.raw()) };
+        if status < 0 {
+            return Err(Error::from_errno(status));
+        }
+        Ok(())
+    }
+
     fn wait_input_fences(syncs: &[file::SyncItem]) -> Result {
         for sync in syncs {
-            let Some(fence) = sync.fence.as_ref() else {
-                continue;
-            };
-            // SAFETY: `fence.raw()` remains valid for the duration of this call.
-            let ret = unsafe {
-                bindings::dma_fence_wait_timeout(
-                    fence.raw(),
-                    true,
-                    kernel::task::MAX_SCHEDULE_TIMEOUT,
-                )
-            };
-            if ret < 0 {
-                return Err(Error::from_errno(ret as i32));
+            if let Some(fence) = sync.fence.as_ref() {
+                Self::wait_fence(fence)?;
             }
         }
         Ok(())
@@ -1229,21 +1257,8 @@ impl G17PQueue {
         let Some(fence) = self.last_submission.as_ref() else {
             return Ok(());
         };
-        // SAFETY: the queue owns `fence` until this wait returns.
-        let ret = unsafe {
-            bindings::dma_fence_wait_timeout(
-                fence.raw(),
-                true,
-                kernel::task::MAX_SCHEDULE_TIMEOUT,
-            )
-        };
-        if ret < 0 {
-            return Err(Self::stage_fail(
-                submission_id,
-                "wait-queue-timeline",
-                Error::from_errno(ret as i32),
-            ));
-        }
+        Self::wait_fence(fence)
+            .map_err(|error| Self::stage_fail(submission_id, "wait-queue-timeline", error))?;
         self.last_submission = None;
         if self.vm.status().get() != 0 { return Err(EIO); }
         Ok(())
@@ -1771,6 +1786,7 @@ impl G17PQueue {
 struct G17POutputFencePublication<'a> {
     fence: &'a UserFence<G17PSubmissionFence>,
     outputs: KVec<file::SyncItem>,
+    failure: Error,
     succeeded: bool,
 }
 
@@ -1778,6 +1794,11 @@ impl G17POutputFencePublication<'_> {
     /// Mark the submission complete. Anything else publishes an error fence.
     fn succeeded(&mut self) {
         self.succeeded = true;
+    }
+
+    /// Preserve the actual submit error in the fence userspace will wait on.
+    fn failed(&mut self, error: Error) {
+        self.failure = error;
     }
 
     /// Hand the output syncobjs to an asynchronous completion fence.
@@ -1801,11 +1822,11 @@ impl G17POutputFencePublication<'_> {
 impl Drop for G17POutputFencePublication<'_> {
     fn drop(&mut self) {
         if !self.succeeded {
-            self.fence.set_error(ECANCELED);
+            self.fence.set_error(self.failure);
         }
-        self.fence.signal();
         let fence = Fence::from_fence(self.fence);
         G17PQueue::install_output_fences(self.outputs.drain(..), &fence);
+        self.fence.signal();
     }
 }
 
@@ -1826,12 +1847,7 @@ impl queue::Queue for G17PQueue {
         cmdbuf_raw: &[u8],
         objects: core::pin::Pin<&xarray::XArray<KBox<file::Object>>>,
     ) -> Result {
-        let result =
-            self.submit_guarded(submission_id, syncs, in_sync_count, cmdbuf_raw, objects);
-        if let Err(error) = result {
-            self.note_submission_failure(submission_id, error);
-        }
-        result
+        self.submit_guarded(submission_id, syncs, in_sync_count, cmdbuf_raw, objects)
     }
 }
 
@@ -1907,7 +1923,7 @@ impl G17PQueue {
             .map_err(|error| Self::stage_fail(submission_id, "new-fence", error))?
             .into();
         let output_count = syncs.len() - in_sync_count;
-        let mut deferred_outputs: KVec<file::SyncItem> =
+        let deferred_outputs: KVec<file::SyncItem> =
             match KVec::with_capacity(output_count, GFP_KERNEL) {
                 Ok(outputs) => outputs,
                 Err(_) => {
@@ -1915,25 +1931,52 @@ impl G17PQueue {
                     // wait on them even when this bookkeeping allocation
                     // fails. Publish the fence directly from the original
                     // vector before returning the allocation error.
-                    early_output_fence.set_error(ECANCELED);
-                    early_output_fence.signal();
+                    early_output_fence.set_error(ENOMEM);
                     let fence = Fence::from_fence(&early_output_fence);
                     Self::install_output_fences(syncs.drain(in_sync_count..), &fence);
+                    early_output_fence.signal();
                     return Err(Self::stage_fail(
                         submission_id, "output-sync-list", ENOMEM,
                     ));
                 }
             };
-        for item in syncs.drain(in_sync_count..) {
-            deferred_outputs
-                .push_within_capacity(item)
-                .map_err(|_| Self::stage_fail(submission_id, "output-sync-capacity", EIO))?;
-        }
         let mut publication = G17POutputFencePublication {
             fence: &early_output_fence,
             outputs: deferred_outputs,
+            failure: ECANCELED,
             succeeded: false,
         };
+        while syncs.len() > in_sync_count {
+            // Removing the first output keeps timeline points in userspace
+            // order and, unlike a Drain iterator, leaves every later output
+            // reachable if the supposedly infallible capacity invariant is
+            // ever violated.
+            let item = match syncs.remove(in_sync_count) {
+                Ok(item) => item,
+                Err(_) => {
+                    let failure = Self::stage_fail(submission_id, "output-sync-index", EIO);
+                    publication.failed(failure);
+                    let fence = Fence::from_fence(&early_output_fence);
+                    Self::install_output_fences(syncs.drain(in_sync_count..), &fence);
+                    self.note_submission_failure(submission_id, failure);
+                    return Err(failure);
+                }
+            };
+            if let Err(error) = publication.outputs.push_within_capacity(item) {
+                let failure = Self::stage_fail(submission_id, "output-sync-capacity", EIO);
+                publication.failed(failure);
+                let fence = Fence::from_fence(&early_output_fence);
+                Self::install_output_fences(core::iter::once(error.0), &fence);
+                Self::install_output_fences(syncs.drain(in_sync_count..), &fence);
+                self.note_submission_failure(submission_id, failure);
+                return Err(failure);
+            }
+        }
+        // Keep the publication guard alive until the exact result is known.
+        // Terminal VM state and outstanding jobs must be settled before an
+        // error fence wakes userspace; wrapping the body also makes every `?`
+        // and explicit return obey that ordering without duplicating cleanup.
+        let result = (|| -> Result {
         // A VM that has already faulted rejects every later submission. That
         // check used to run before any of the above, so a client whose VM died
         // got EIO with no fence published at all and then waited forever on the
@@ -2334,7 +2377,6 @@ impl G17PQueue {
             pr_info!("G17P submit: OK submission {}\n", submission_id);
         }
         publication.succeeded();
-        core::mem::drop(publication);
         dev_dbg!(
             self.dev.as_ref(),
             "G17P queue {} completed synchronous submission {} (one hardware command)\n",
@@ -2342,5 +2384,11 @@ impl G17PQueue {
             submission_id
         );
         Ok(())
+        })();
+        if let Err(error) = result {
+            self.note_submission_failure(submission_id, error);
+            publication.failed(error);
+        }
+        result
     }
 }

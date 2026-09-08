@@ -16,6 +16,7 @@ import subprocess, tempfile
 
 source = (Path(__file__).resolve().parents[1] / 'g17_drm.rs').read_text()
 live_source = (Path(__file__).resolve().parents[1] / 'g17_live_boot.rs').read_text()
+job_source = (Path(__file__).resolve().parents[1] / 'g17_job.rs').read_text()
 
 
 def block(marker):
@@ -39,6 +40,13 @@ assert complete.index("compare_exchange(0, 1") < complete.index("self.fence.sign
     'render completion does not reject duplicate firmware notifications'
 assert complete.index("drop(self.lease.lock().take());") < complete.index("self.fence.signal();"), \
     'render completion wakes userspace before releasing its physical slot lease'
+
+compute_completion_start = job_source.index("impl G17PJobCompletion {")
+compute_completion_end = job_source.index("/// Everything a prepared compute", compute_completion_start)
+compute_completion = job_source[compute_completion_start:compute_completion_end]
+assert compute_completion.index("compare_exchange(0, 1") \
+    < compute_completion.index("self.fence.signal();"), \
+    'compute completion can copy timestamps or signal its fence more than once'
 
 # The finite scheduler timeout is the only non-event completion fallback. It
 # must inspect final device state before consuming the once-only settlement
@@ -81,6 +89,16 @@ enqueue = source.index('.enqueue(packet, dependencies)?;')
 assert enqueue < source.index('publication.publish_async(&finished);', enqueue), \
     'the completion fence is published before the job is enqueued'
 
+# A queue can contain successors before an earlier asynchronous job fails.
+# DRM considers the predecessor's signalled error fence ready, so the backend
+# must consult the VM status before it acquires hardware or publishes.
+backend = block("impl g17_job::G17PQueueBackend for G17PAsyncQueueBackend {")
+status_gate = backend.index("completion.status.get() != 0")
+assert status_gate < backend.index("self.registry.acquire_compute(")
+assert status_gate < backend.index("publish_async_compute(")
+assert backend.index("completion.complete(Err(EIO));", status_gate) \
+    < backend.index("return Err(EIO);", status_gate)
+
 # The output-list allocation itself used to sit before the publication guard.
 # ENOMEM there dropped already-resolved syncobjs with no fence installed. The
 # early fence must exist first, and that allocation failure must publish it
@@ -91,10 +109,22 @@ output_alloc = guarded.index('KVec::with_capacity(output_count')
 alloc_failure = guarded.index('Err(_) => {', output_alloc)
 alloc_return = guarded.index('return Err(Self::stage_fail(', alloc_failure)
 assert fence_create < output_alloc
-assert guarded.index('early_output_fence.set_error(ECANCELED);', alloc_failure) < alloc_return
-assert guarded.index('early_output_fence.signal();', alloc_failure) < alloc_return
-assert guarded.index('Self::install_output_fences(syncs.drain(in_sync_count..)', alloc_failure) < alloc_return
+assert guarded.index('early_output_fence.set_error(ENOMEM);', alloc_failure) < alloc_return
+install_early = guarded.index('Self::install_output_fences(syncs.drain(in_sync_count..)', alloc_failure)
+signal_early = guarded.index('early_output_fence.signal();', alloc_failure)
+assert install_early < signal_early < alloc_return
 assert '.push_within_capacity(item)' in guarded
+
+# Every fallible path after publication is armed runs inside one result scope.
+# The exact error and terminal VM state are committed before Drop can wake a
+# syncobj waiter.
+result_scope = guarded.index('let result = (|| -> Result {')
+note_failure = guarded.index('self.note_submission_failure(submission_id, error);', result_scope)
+record_error = guarded.index('publication.failed(error);', note_failure)
+assert result_scope < note_failure < record_error
+drop_body = guard_drop[guard_drop.index('fn drop'):]
+assert drop_body.index('install_output_fences(') < drop_body.index('self.fence.signal();'), \
+    'the error fence wakes before every output syncobj owns it'
 
 preamble = r'''
 #![allow(dead_code, unused_variables)]
@@ -105,6 +135,7 @@ use std::sync::{Arc, Mutex};
 #[derive(Debug, Copy, Clone, PartialEq)]
 struct Error(i32);
 const ECANCELED: Error = Error(125);
+const EIO: Error = Error(5);
 
 /// One dma_fence: unsignalled until whoever owns the work signals it.
 #[derive(Default)]
@@ -199,6 +230,7 @@ fn arm<'a>(
     G17POutputFencePublication {
         fence: early,
         outputs,
+        failure: ECANCELED,
         succeeded: false,
     }
 }
@@ -243,6 +275,21 @@ fn refused_compute_publishes_a_cancelled_fence() {
     let installed = syncobj.installed().expect("nothing published on failure");
     assert!(installed.is_signalled());
     assert_eq!(installed.error(), ECANCELED.0);
+}
+
+/// Once the caller knows the real failure, that errno—not a generic
+/// cancellation—must reach the output fence.
+#[test]
+fn failed_compute_publishes_the_exact_error() {
+    let syncobj = Syncobj::default();
+    let early = UserFence::<G17PSubmissionFence>::new();
+    {
+        let mut publication = arm(&early, vec![out_sync(&syncobj)]);
+        publication.failed(EIO);
+    }
+    let installed = syncobj.installed().expect("nothing published on failure");
+    assert!(installed.is_signalled());
+    assert_eq!(installed.error(), EIO.0);
 }
 
 /// The synchronous render path is unchanged: the work is done, so the ioctl's
