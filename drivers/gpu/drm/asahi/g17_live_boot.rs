@@ -1993,6 +1993,12 @@ fn finish_boot_session(
         return Err(EINVAL);
     }
     manager.validate_native_pre_user_roots()?;
+    if test_stage.enables_compute_uapi() {
+        // No bootstrap render runs in the production UAPI boot path. Activate
+        // the already-mapped context-1 global FList root explicitly before
+        // any client can publish its first render.
+        manager.activate_render_global_context()?;
+    }
     if !test_stage.configures_qid4() {
         dev_info!(
             pdev.as_ref(),

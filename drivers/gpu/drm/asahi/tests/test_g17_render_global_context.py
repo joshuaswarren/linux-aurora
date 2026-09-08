@@ -7,6 +7,7 @@ root = Path(__file__).resolve().parents[1]
 mmu = (root / "mmu.rs").read_text()
 resources = (root / "g17_resources.rs").read_text()
 manager = (root / "g17_manager.rs").read_text()
+live = (root / "g17_live_boot.rs").read_text()
 limits = (root / "g17_queue_limits.rs").read_text()
 
 
@@ -23,6 +24,17 @@ def function(source, marker):
 restore = function(mmu, "pub(crate) fn restore_t8140_kernel_context_after_bootstrap_render(")
 assert "let context1_low = self.t8140_render_global_vm()?.ttb()" in restore
 assert "context1_low | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT)" in restore
+
+activate = function(mmu, "pub(crate) fn activate_t8140_render_global_context(")
+assert "let global_low = self.t8140_render_global_vm()?.ttb()" in activate
+assert activate.index("ttbs[1].ttb0.store(") < activate.index("mem::tlbi_asid(1)")
+assert "T8140_CONTEXT_BOOTSTRAP_SOURCE_HIGH" in activate
+assert "T8140_CONTEXT_BOOTSTRAP_EMPTY_HIGH" in activate
+boot = function(live, "fn finish_boot_session(")
+assert boot.index("manager.validate_native_pre_user_roots()?") \
+    < boot.index("manager.activate_render_global_context()?")
+assert boot.index("manager.activate_render_global_context()?") \
+    < boot.index("render/compute UAPI ready")
 
 constructor = function(resources, "pub(crate) fn new_with_uat(")
 mapping = constructor[constructor.index("let render_global_vm ="):]
