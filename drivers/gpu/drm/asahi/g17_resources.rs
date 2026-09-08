@@ -3104,6 +3104,24 @@ impl G17PRenderUserAliases {
 }
 
 #[cfg(not(test))]
+pub(crate) struct G17PRenderSksmBacking {
+    ta_context: MappedObject,
+    _ta_context_global: mmu::KernelMapping,
+    fragment_context: MappedObject,
+    _fragment_context_global: mmu::KernelMapping,
+}
+
+#[cfg(not(test))]
+impl G17PRenderSksmBacking {
+    fn matches_queue_pair(&self, pair: G17PRenderQueuePair) -> bool {
+        self._ta_context_global.iova() == pair.low_va(true)
+            && self._fragment_context_global.iova() == pair.low_va(false)
+            && self.ta_context.iova() != 0
+            && self.fragment_context.iova() != 0
+    }
+}
+
+#[cfg(not(test))]
 pub(crate) struct G17PUserRenderStorage {
     /// Bounded physical queue ownership for this job.  Queue records, tag-15,
     /// tag-14, status lanes, and SKSM entry aliases all derive from this one
@@ -3154,12 +3172,12 @@ pub(crate) struct G17PUserRenderStorage {
     /// from allocator-layout changes; the MCache range contents still name
     /// the client execution context independently of the table's own address.
     descriptor_3d_render: G17PRenderClientAlias,
-    ta_context: MappedObject,
+    /// Per-QID SKSM entry rings and their device-global aliases.  The backing
+    /// address is hardware queue state, so it survives a client-VM handoff;
+    /// only the low alias below is replaced for the incoming VM.
+    sksm_backing: Option<G17PRenderSksmBacking>,
     ta_context_low: mmu::KernelMapping,
-    _ta_context_global: mmu::KernelMapping,
-    fragment_context: MappedObject,
     fragment_context_low: mmu::KernelMapping,
-    _fragment_context_global: mmu::KernelMapping,
     graph: MappedObject,
     support: MappedObject,
     /// EventControl record and exact submitted-kick target owned by the
@@ -5355,6 +5373,17 @@ fn render_build_fail(site: u32) -> kernel::error::Error {
 }
 
 impl G17PUserRenderStorage {
+    fn sksm_backing_mut(&mut self) -> Result<&mut G17PRenderSksmBacking> {
+        self.sksm_backing.as_mut().ok_or(EIO)
+    }
+
+    /// Detach only the queue-address-stable part of a retired graph.  The
+    /// per-VM low mappings stay with this storage and disappear before the
+    /// incoming VM maps the same addresses.
+    pub(crate) fn take_sksm_backing(&mut self) -> Result<G17PRenderSksmBacking> {
+        self.sksm_backing.take().ok_or(EIO)
+    }
+
     fn descriptor_context_valid(context_id: u16) -> bool {
         // A descriptor context is a queue execution context. The bind band and
         // the render app context are owned by other allocators, so a
@@ -5373,10 +5402,11 @@ impl G17PUserRenderStorage {
         zero_length: usize,
         body: &[u8],
     ) -> Result {
+        let backing = self.sksm_backing_mut()?;
         let object = if tiling {
-            &mut self.ta_context
+            &mut backing.ta_context
         } else {
-            &mut self.fragment_context
+            &mut backing.fragment_context
         };
         let end = offset.checked_add(zero_length).ok_or(EINVAL)?;
         if zero_length == 0
@@ -5405,15 +5435,13 @@ impl G17PUserRenderStorage {
     }
 
     pub(crate) fn sksm_entry_high_va(&self, tiling: bool) -> u64 {
-        if tiling {
-            self.ta_context.iova()
-        } else {
-            self.fragment_context.iova()
-        }
+        let Some(backing) = self.sksm_backing.as_ref() else { return 0 };
+        if tiling { backing.ta_context.iova() } else { backing.fragment_context.iova() }
     }
 
     pub(crate) fn dump_sksm_entry(&mut self, dev: &AsahiDevice, tiling: bool, label: &str) {
-        let object = if tiling { &mut self.ta_context } else { &mut self.fragment_context };
+        let Ok(backing) = self.sksm_backing_mut() else { return };
+        let object = if tiling { &mut backing.ta_context } else { &mut backing.fragment_context };
         let mut body = [0u8; 0x200];
         let Ok(vmap) = object.object.vmap() else { return };
         let bytes = unsafe {
@@ -5442,7 +5470,8 @@ impl G17PUserRenderStorage {
         label: &str,
         offset: usize,
     ) {
-        let object = if tiling { &mut self.ta_context } else { &mut self.fragment_context };
+        let Ok(backing) = self.sksm_backing_mut() else { return };
+        let object = if tiling { &mut backing.ta_context } else { &mut backing.fragment_context };
         let Ok(vmap) = object.object.vmap() else { return };
         let bytes = unsafe {
             // SAFETY: VMap spans the object and each word is bounds checked.
@@ -5865,6 +5894,7 @@ impl G17PUserRenderStorage {
         descriptor_context_id: u16,
         render_root_slot: u8,
         submission_ordinal: u32,
+        retained_sksm_backing: &mut Option<G17PRenderSksmBacking>,
     ) -> Result<Self> {
         macro_rules! bootstrap_stage {
             ($name:literal, $expression:expr) => {
@@ -5901,18 +5931,61 @@ impl G17PUserRenderStorage {
         } else {
             mmu::PROT_GPU_SHARED_RO
         };
-        let mut ta_context = bootstrap_stage!(
-            "TA context allocation",
-            MappedObject::new_wc(
-                dev,
-                uat,
-                G17P_BOOTSTRAP_CONTEXT_PEER_SIZE,
-                mmu::UAT_PGSZ as u64,
-                mmu::PROT_GPU_FW_SHARED_RW,
-            )
-        );
+        let reused_sksm_backing = retained_sksm_backing.is_some();
+        let mut allocated_sksm_backing = None;
+        if !reused_sksm_backing {
+            let mut ta_context = bootstrap_stage!(
+                "TA context allocation",
+                MappedObject::new_wc(
+                    dev,
+                    uat,
+                    G17P_BOOTSTRAP_CONTEXT_PEER_SIZE,
+                    mmu::UAT_PGSZ as u64,
+                    mmu::PROT_GPU_FW_SHARED_RW,
+                )
+            );
+            let ta_context_global = bootstrap_stage!(
+                "TA context global alias",
+                ta_context.map_alias_at(
+                    uat.kernel_lower_vm(),
+                    queue_pair.low_va(true),
+                    render_peer_prot,
+                )
+            );
+            let mut fragment_context = bootstrap_stage!(
+                "3D context allocation",
+                MappedObject::new_wc(
+                    dev,
+                    uat,
+                    G17P_BOOTSTRAP_CONTEXT_PEER_SIZE,
+                    mmu::UAT_PGSZ as u64,
+                    mmu::PROT_GPU_FW_SHARED_RW,
+                )
+            );
+            let fragment_context_global = bootstrap_stage!(
+                "3D context global alias",
+                fragment_context.map_alias_at(
+                    uat.kernel_lower_vm(),
+                    queue_pair.low_va(false),
+                    render_peer_prot,
+                )
+            );
+            allocated_sksm_backing = Some(G17PRenderSksmBacking {
+                ta_context,
+                _ta_context_global: ta_context_global,
+                fragment_context,
+                _fragment_context_global: fragment_context_global,
+            });
+        }
+        let sksm_backing = retained_sksm_backing
+            .as_mut()
+            .or(allocated_sksm_backing.as_mut())
+            .ok_or(EIO)?;
+        if !sksm_backing.matches_queue_pair(queue_pair) {
+            return Err(EFAULT);
+        }
         let ta_context_low_va = queue_pair.low_va(true);
-        let ta_context_low = match ta_context.map_alias_at(
+        let ta_context_low = match sksm_backing.ta_context.map_alias_at(
             vm,
             ta_context_low_va,
             render_peer_prot,
@@ -5933,30 +6006,8 @@ impl G17PUserRenderStorage {
                 return Err(error);
             }
         };
-        // The SKSM queue consumer is a device-global requestor and reports
-        // these reads against context 0 even though the submitted TA command
-        // itself executes in the job's application context.  Retain both
-        // presentations of the same queue backing.
-        let ta_context_global = bootstrap_stage!(
-            "TA context global alias",
-            ta_context.map_alias_at(
-                uat.kernel_lower_vm(),
-                ta_context_low_va,
-                render_peer_prot,
-            )
-        );
-        let mut fragment_context = bootstrap_stage!(
-            "3D context allocation",
-            MappedObject::new_wc(
-                dev,
-                uat,
-                G17P_BOOTSTRAP_CONTEXT_PEER_SIZE,
-                mmu::UAT_PGSZ as u64,
-                mmu::PROT_GPU_FW_SHARED_RW,
-            )
-        );
         let fragment_context_low_va = queue_pair.low_va(false);
-        let fragment_context_low = match fragment_context.map_alias_at(
+        let fragment_context_low = match sksm_backing.fragment_context.map_alias_at(
             vm,
             fragment_context_low_va,
             render_peer_prot,
@@ -5977,14 +6028,6 @@ impl G17PUserRenderStorage {
                 return Err(error);
             }
         };
-        let fragment_context_global = bootstrap_stage!(
-            "3D context global alias",
-            fragment_context.map_alias_at(
-                uat.kernel_lower_vm(),
-                fragment_context_low_va,
-                render_peer_prot,
-            )
-        );
 
         // Queue items name firmware-high descriptors, while descriptor self
         // pointers resolve through this job's application GART. Native's
@@ -6442,32 +6485,37 @@ impl G17PUserRenderStorage {
         // is zero until encodeKickEntry fills it. Leave it zero here too.
         let sksm_owns_entry_ring = *crate::module_parameters::g17p_render_sksm.value() != 0
             && *crate::module_parameters::g17p_render_slot_template.value() == 0;
-        bootstrap_stage!("TA queue context", ta_context.with_bytes_mut(|raw| {
-            raw.fill(0);
-            if sksm_owns_entry_ring {
-                return Ok(());
-            }
-            g17_submission::apply_g17p_cold_opening_queue_context(
-                g17_submission::G17PColdOpeningStage::Tiling,
-                descriptor_ta_high_va,
-                graph_va + queue_pair.record_offset(true) as u64,
-                &mut raw[..mmu::UAT_PGSZ],
-            )
-            .map_err(|_| render_build_fail(4))
-        }));
-        bootstrap_stage!("3D queue context", fragment_context.with_bytes_mut(|raw| {
-            raw.fill(0);
-            if sksm_owns_entry_ring {
-                return Ok(());
-            }
-            g17_submission::apply_g17p_cold_opening_queue_context(
-                g17_submission::G17PColdOpeningStage::Fragment,
-                descriptor_3d_high_va,
-                graph_va + queue_pair.record_offset(false) as u64,
-                &mut raw[..mmu::UAT_PGSZ],
-            )
-            .map_err(|_| render_build_fail(5))
-        }));
+        // A retained QID's KSMFE route still points at these exact rings.
+        // Never clear or re-template them during a VM handoff; only a newly
+        // allocated backing receives its cold image.
+        if !reused_sksm_backing {
+            bootstrap_stage!("TA queue context", sksm_backing.ta_context.with_bytes_mut(|raw| {
+                raw.fill(0);
+                if sksm_owns_entry_ring {
+                    return Ok(());
+                }
+                g17_submission::apply_g17p_cold_opening_queue_context(
+                    g17_submission::G17PColdOpeningStage::Tiling,
+                    descriptor_ta_high_va,
+                    graph_va + queue_pair.record_offset(true) as u64,
+                    &mut raw[..mmu::UAT_PGSZ],
+                )
+                .map_err(|_| render_build_fail(4))
+            }));
+            bootstrap_stage!("3D queue context", sksm_backing.fragment_context.with_bytes_mut(|raw| {
+                raw.fill(0);
+                if sksm_owns_entry_ring {
+                    return Ok(());
+                }
+                g17_submission::apply_g17p_cold_opening_queue_context(
+                    g17_submission::G17PColdOpeningStage::Fragment,
+                    descriptor_3d_high_va,
+                    graph_va + queue_pair.record_offset(false) as u64,
+                    &mut raw[..mmu::UAT_PGSZ],
+                )
+                .map_err(|_| render_build_fail(5))
+            }));
+        }
         let graph_addresses = g17_submission::G17PColdOpeningGraphAddresses {
             primary_index: g17_submission::G17P_PARTIAL_OPENING_PRIMARY_INDEX_FIRMWARE_GPU_VA,
             secondary_index: support_va + G17P_RENDER_SECONDARY_INDEX as u64,
@@ -6832,7 +6880,7 @@ impl G17PUserRenderStorage {
             "G17P render storage: TA self={:#x} context={:#x}/{:#x} tails={:#x}/{:#x}/{:#x}\n",
             descriptor_ta_low.iova(),
             ta_context_low.iova(),
-            ta_context.iova(),
+            sksm_backing.ta_context.iova(),
             G17P_BOOTSTRAP_DESCRIPTOR_ZERO_A_VA + u64::from(queue_pair.tiling) * 4,
             G17P_BOOTSTRAP_DESCRIPTOR_ZERO_B_VA + u64::from(queue_pair.tiling) * 4,
             render_state_va + G17P_RENDER_STATE_TA_STATUS as u64
@@ -6842,7 +6890,7 @@ impl G17PUserRenderStorage {
             "G17P render storage: 3D self={:#x} context={:#x}/{:#x} tails={:#x}/{:#x}/{:#x}\n",
             descriptor_3d_rce_va,
             fragment_context_low.iova(),
-            fragment_context.iova(),
+            sksm_backing.fragment_context.iova(),
             G17P_BOOTSTRAP_DESCRIPTOR_ZERO_A_VA + u64::from(queue_pair.fragment) * 4,
             G17P_BOOTSTRAP_DESCRIPTOR_ZERO_B_VA + u64::from(queue_pair.fragment) * 4,
             fragment_status.iova()
@@ -6894,6 +6942,16 @@ impl G17PUserRenderStorage {
         let mut render_operand_aliases = KVec::with_capacity(2, GFP_KERNEL)?;
         render_operand_aliases.push(descriptor_3d_render, GFP_KERNEL)?;
         render_operand_aliases.push(fragment_status_low, GFP_KERNEL)?;
+        let pool_a_record_index = u8::try_from(pool_a_record_index)
+            .map_err(|_| render_build_fail(25))?;
+        // This is the final ownership transition. Every fallible mapping and
+        // byte build above completed while a retained backing still lived in
+        // the caller's Option, so failure cannot destroy an installed QID's
+        // ring. Success moves that same backing into the replacement graph.
+        let sksm_backing = retained_sksm_backing
+            .take()
+            .or_else(|| allocated_sksm_backing.take())
+            .ok_or(EIO)?;
         Ok(Self {
             queue_pair,
             render_operand_aliases,
@@ -6905,16 +6963,12 @@ impl G17PUserRenderStorage {
             descriptor_3d_low,
             _descriptor_3d_global: descriptor_3d_global,
             descriptor_3d_render: descriptor_3d_render_info,
-            ta_context,
+            sksm_backing: Some(sksm_backing),
             ta_context_low,
-            _ta_context_global: ta_context_global,
-            fragment_context,
             fragment_context_low,
-            _fragment_context_global: fragment_context_global,
             graph,
             support,
-            pool_a_record_index: u8::try_from(pool_a_record_index)
-                .map_err(|_| render_build_fail(25))?,
+            pool_a_record_index,
             // The selected cold slot starts at one and the late TA
             // publication advances this command's own target to two.
             pool_a_submitted: 2,
@@ -8263,6 +8317,7 @@ impl G17PUserRenderStorage {
         uat: &mmu::Uat,
         vm: &mmu::Vm,
     ) -> Option<&'static str> {
+        let sksm_backing = self.sksm_backing.as_ref();
         let layout_ok = G17PRenderStorageVaLayout {
             descriptors: self.descriptors.iova(),
             graph: self.graph.iova(),
@@ -8405,12 +8460,14 @@ impl G17PUserRenderStorage {
             // only to the low alias below.
             (
                 "ta-context-high-mapped",
-                uat.kernel_vm().covers_range(
-                    self.ta_context.iova(),
-                    G17P_BOOTSTRAP_CONTEXT_PEER_SIZE as u64,
-                    false,
-                    false,
-                ),
+                sksm_backing.is_some_and(|backing| {
+                    uat.kernel_vm().covers_range(
+                        backing.ta_context.iova(),
+                        G17P_BOOTSTRAP_CONTEXT_PEER_SIZE as u64,
+                        false,
+                        false,
+                    )
+                }),
             ),
             (
                 "ta-context-low",
@@ -8427,12 +8484,14 @@ impl G17PUserRenderStorage {
             // the high alias and hardware reaches the low GPU-RW alias.
             (
                 "3d-context-high-mapped",
-                uat.kernel_vm().covers_range(
-                    self.fragment_context.iova(),
-                    G17P_BOOTSTRAP_CONTEXT_PEER_SIZE as u64,
-                    false,
-                    false,
-                ),
+                sksm_backing.is_some_and(|backing| {
+                    uat.kernel_vm().covers_range(
+                        backing.fragment_context.iova(),
+                        G17P_BOOTSTRAP_CONTEXT_PEER_SIZE as u64,
+                        false,
+                        false,
+                    )
+                }),
             ),
             (
                 "3d-context-low",
@@ -8561,6 +8620,7 @@ impl G17PUserRenderStorage {
         } else {
             support + G17P_RENDER_PACKED_SHARED as u64
         };
+        let high = self.sksm_entry_high_va(tiling);
         let mut addresses = g17p_cold_opening_optional_addresses(
             support,
             shared_object,
@@ -8571,11 +8631,7 @@ impl G17PUserRenderStorage {
             } else {
                 self.fragment_context_low.iova()
             },
-            if tiling {
-                self.ta_context.iova()
-            } else {
-                self.fragment_context.iova()
-            },
+            high,
         );
         addresses.parameter_buffer_token = self.parameter_buffer_token;
         addresses
@@ -14380,6 +14436,7 @@ impl G17ResourceOwner {
         user_timestamps: [u64; 4],
         user_timestamp_aliases: KVec<mmu::KernelMapping>,
         submission_ordinal: u32,
+        retained_sksm_backing: &mut Option<G17PRenderSksmBacking>,
     ) -> Result<G17PUserRenderStorage> {
         let parameter_metrics_vas = [
             self.resources.parameter_metrics.iova(),
@@ -14429,6 +14486,7 @@ impl G17ResourceOwner {
             descriptor_context_id,
             render_root_slot,
         );
+        let had_retained_sksm_backing = retained_sksm_backing.is_some();
         let mut storage = G17PUserRenderStorage::new(
             dev,
             &self.address_space.uat,
@@ -14445,15 +14503,25 @@ impl G17ResourceOwner {
             descriptor_context_id,
             render_root_slot,
             submission_ordinal,
+            retained_sksm_backing,
         )?;
-        for mapping in render_operand_aliases {
-            storage.render_operand_aliases.push(mapping, GFP_KERNEL)?;
+        let finish = (|| -> Result {
+            for mapping in render_operand_aliases {
+                storage.render_operand_aliases.push(mapping, GFP_KERNEL)?;
+            }
+            let aliases = storage.take_persistent_client_mappings()?;
+            vm.install_render_pool_mappings(storage.render_pool_id(),
+                storage.render_tvb.as_ref().map_or(0, |tvb| tvb.block_count), aliases)?;
+            self.stage_render_parameter_buffer_page_list(&mut storage)?;
+            self.stage_render_parameter_buffer_descriptor(storage.parameter_buffer_descriptor()?)?;
+            Ok(())
+        })();
+        if let Err(error) = finish {
+            if had_retained_sksm_backing {
+                *retained_sksm_backing = Some(storage.take_sksm_backing()?);
+            }
+            return Err(error);
         }
-        let aliases = storage.take_persistent_client_mappings()?;
-        vm.install_render_pool_mappings(storage.render_pool_id(),
-            storage.render_tvb.as_ref().map_or(0, |tvb| tvb.block_count), aliases)?;
-        self.stage_render_parameter_buffer_page_list(&mut storage)?;
-        self.stage_render_parameter_buffer_descriptor(storage.parameter_buffer_descriptor()?)?;
         Ok(storage)
     }
 

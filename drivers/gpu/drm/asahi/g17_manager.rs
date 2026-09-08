@@ -1377,6 +1377,10 @@ struct G17PRenderSksmQueues {
     uat_owner: u64,
     tiling: G17PRenderSksmQueue,
     fragment: G17PRenderSksmQueue,
+    /// Present only between retired client graphs. KSMFE retains these ring
+    /// addresses for the lifetime of the QID pair, so a handoff may replace
+    /// their client-low aliases but never their backing/global aliases.
+    backing: Option<g17_resources::G17PRenderSksmBacking>,
 }
 
 /// How many times the device-global parameter-buffer loader has been handed
@@ -2338,6 +2342,7 @@ impl G17PManagerConstruction {
         {
             return Err(EBUSY);
         }
+        let mut no_retained_sksm_backing = None;
         self.render_storage = Some(
             self.resources
                 .new_user_render_storage(
@@ -2352,6 +2357,7 @@ impl G17PManagerConstruction {
                     [0; 4],
                     KVec::new(),
                     0,
+                    &mut no_retained_sksm_backing,
                 )
                 .inspect_err(|error| {
                     dev_err!(
@@ -3052,6 +3058,41 @@ impl G17PManagerConstruction {
     /// graph on the already-installed physical QID pair.  Queue producer state
     /// and the monotonically increasing submission ordinal stay retained; no
     /// global context-0 mapping is repointed.
+    fn park_render_sksm_backing_for_graph_rebuild(&mut self) -> Result {
+        if self.render_sksm.is_none() {
+            return Ok(());
+        }
+        let expected = {
+            let queues = self.render_sksm.as_ref().ok_or(EIO)?;
+            if queues.backing.is_some() {
+                return Err(EIO);
+            }
+            [
+                (queues.tiling.entry_low, queues.tiling.entry_high),
+                (queues.fragment.entry_low, queues.fragment.entry_high),
+            ]
+        };
+        let actual = {
+            let storage = self.render_storage.as_ref().ok_or(EIO)?;
+            [
+                (storage.sksm_entry_low_va(true), storage.sksm_entry_high_va(true)),
+                (storage.sksm_entry_low_va(false), storage.sksm_entry_high_va(false)),
+            ]
+        };
+        if actual != expected {
+            dev_err!(
+                self.resources.dev().as_ref(),
+                "G17P render graph rebuild: refusing to detach mismatched SKSM backing actual={:#x?} expected={:#x?}\n",
+                actual,
+                expected,
+            );
+            return Err(EFAULT);
+        }
+        let backing = self.render_storage.as_mut().ok_or(EIO)?.take_sksm_backing()?;
+        self.render_sksm.as_mut().ok_or(EIO)?.backing = Some(backing);
+        Ok(())
+    }
+
     pub(crate) fn handoff_retained_render_vm(&mut self, vm: &mmu::Vm) -> Result {
         if self.render_storage.is_none() || !self.retained_render_has_other_owner(vm) {
             return Ok(());
@@ -3059,6 +3100,7 @@ impl G17PManagerConstruction {
         self.require_retired_render_owner()?;
         let old_root = self.render_bind.as_ref().map_or(0, |binding| binding.root());
         let old_vm_id = self.render_bind.as_ref().map_or(0, |binding| binding.vm_id());
+        self.park_render_sksm_backing_for_graph_rebuild()?;
         self.render_storage.as_mut().ok_or(ENODEV)?.release_client_context();
         self.render_bind = None;
         self.render_context_aliases = None;
@@ -3109,6 +3151,7 @@ impl G17PManagerConstruction {
             .restage_admission_cursors(ordinal)?;
         let root = self.render_bind.as_ref().map_or(0, |binding| binding.root());
         let vm_id = self.render_bind.as_ref().map_or(0, |binding| binding.vm_id());
+        self.park_render_sksm_backing_for_graph_rebuild()?;
         self.render_storage.as_mut().ok_or(ENODEV)?.release_client_context();
         self.render_bind = None;
         self.render_context_aliases = None;
@@ -3292,6 +3335,7 @@ impl G17PManagerConstruction {
                 false,
                 entry_vas[1].0,
             )?,
+            backing: None,
         })
     }
 
@@ -4144,23 +4188,39 @@ impl G17PManagerConstruction {
             if self.render_bind.is_some() {
                 return Err(EIO);
             }
-            self.render_storage = Some(
-                self.resources
-                    .new_user_render_storage(
-                        dev,
-                        vm,
-                        queue_pair,
-                        Some(execution_context.clone()),
-                        descriptor_context_id,
-                        Some(render_root_slot),
-                        command,
-                        self.num_clusters,
-                        user_timestamps,
-                        user_timestamp_aliases,
-                        self.render_submission_ordinal,
-                    )
-                    .map_err(|error| Self::render_stage_fail("new-user-render-storage", error))?,
+            let mut retained_sksm_backing = self
+                .render_sksm
+                .as_mut()
+                .and_then(|queues| queues.backing.take());
+            let storage = self.resources.new_user_render_storage(
+                dev,
+                vm,
+                queue_pair,
+                Some(execution_context.clone()),
+                descriptor_context_id,
+                Some(render_root_slot),
+                command,
+                self.num_clusters,
+                user_timestamps,
+                user_timestamp_aliases,
+                self.render_submission_ordinal,
+                &mut retained_sksm_backing,
             );
+            self.render_storage = Some(match storage {
+                Ok(storage) if retained_sksm_backing.is_none() => storage,
+                Ok(_) => return Err(Self::render_stage_fail(
+                    "new-user-render-sksm-backing-unclaimed", EIO,
+                )),
+                Err(error) => {
+                    if let Some(backing) = retained_sksm_backing.take() {
+                        let queues = self.render_sksm.as_mut().ok_or(EIO)?;
+                        if queues.backing.replace(backing).is_some() {
+                            return Err(EIO);
+                        }
+                    }
+                    return Err(Self::render_stage_fail("new-user-render-storage", error));
+                }
+            });
             // The fresh graph was encoded against this ID; keep the ID off the
             // shared free list for as long as the storage lives.
             if let Some(id) = self
