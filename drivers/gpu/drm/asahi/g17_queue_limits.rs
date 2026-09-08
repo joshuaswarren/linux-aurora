@@ -9,14 +9,21 @@ pub(crate) const TTBAT_CONTEXT_COUNT: u32 = 64;
 pub(crate) const COMPUTE_CONTEXT_FIRST: u32 = 5;
 /// The current exclusive renderer needs one duplicate app-context root.
 pub(crate) const RENDER_APP_CONTEXT: u32 = TTBAT_CONTEXT_COUNT - 1;
-/// Job render uses the same native application-GART context for its command
-/// descriptors, TTBAT root and MCache selector. Only the bootstrap opening
-/// still uses `Uat::bind` at context 1, so no second high-ID bind band exists.
-pub(crate) const BIND_CONTEXT_COUNT: u32 = 0;
-pub(crate) const BIND_CONTEXT_FIRST: u32 = RENDER_APP_CONTEXT;
-pub(crate) const BIND_CONTEXT_MASK: u64 = 0;
+/// Hardware contexts reserved for user VM *bindings* above the opening pair.
+///
+/// A bound VM owns a hardware context outright: `Uat::bind` publishes its low
+/// root there and the render path names that context as the fragment MCache
+/// write-range selector, so two clients cannot share one. Context 1 is the
+/// opening pair's and stays outside this band, which is why the first client
+/// still lands on exactly the measured first-partial context. These IDs are
+/// carved out of the compute execution band so the two allocators can never
+/// hand out the same context.
+pub(crate) const BIND_CONTEXT_COUNT: u32 = 3;
+pub(crate) const BIND_CONTEXT_FIRST: u32 = RENDER_APP_CONTEXT - BIND_CONTEXT_COUNT;
+pub(crate) const BIND_CONTEXT_MASK: u64 =
+    ((1u64 << RENDER_APP_CONTEXT) - 1) & !((1u64 << BIND_CONTEXT_FIRST) - 1);
 pub(crate) const COMPUTE_CONTEXT_MASK: u64 =
-    ((1u64 << RENDER_APP_CONTEXT) - 1) & !((1u64 << COMPUTE_CONTEXT_FIRST) - 1);
+    ((1u64 << BIND_CONTEXT_FIRST) - 1) & !((1u64 << COMPUTE_CONTEXT_FIRST) - 1);
 pub(crate) const MAX_QUEUES: u32 = COMPUTE_CONTEXT_MASK.count_ones();
 pub(crate) const MAX_IN_FLIGHT_PER_QUEUE: u32 = 1;
 /// One GiB boundary inside the existing four GiB runtime reservation. The

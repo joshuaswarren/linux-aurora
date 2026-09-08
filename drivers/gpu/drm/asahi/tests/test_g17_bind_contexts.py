@@ -112,18 +112,39 @@ fn bind(
 
 tests = r"""
 #[test]
-fn slot_zero_is_the_only_bootstrap_binding() {
+fn slot_zero_is_the_opening_context_and_the_band_is_disjoint() {
     assert_eq!(T8140_BIND_SLOTS, 1 + g17_queue_limits::BIND_CONTEXT_COUNT as usize);
-    assert_eq!(T8140_BIND_SLOTS, 1);
     assert_eq!(t8140_bind_context(0), Some(1));
+    for slot in 1..T8140_BIND_SLOTS as u32 {
+        let context = t8140_bind_context(slot).unwrap();
+        assert_eq!(context, g17_queue_limits::BIND_CONTEXT_FIRST as usize + slot as usize - 1);
+    }
     assert_eq!(t8140_bind_context(T8140_BIND_SLOTS as u32), None);
     assert_eq!(t8140_bind_context(63), None);
-    assert_eq!(g17_queue_limits::BIND_CONTEXT_MASK, 0);
-    assert_eq!(g17_queue_limits::MAX_QUEUES, 58);
+
+    // No bind context may collide with the kernel context, the two contexts a
+    // compute kick declares, the accelerator reservation, a compute execution
+    // context, or the render app context.
+    let mut seen = 0u64;
+    for slot in 0..T8140_BIND_SLOTS as u32 {
+        let context = t8140_bind_context(slot).unwrap();
+        assert!(context < UAT_NUM_CTX);
+        assert!(context != 0 && context != 4);
+        assert!(!T8140_COMPUTE_CTXS.contains(&context));
+        assert_ne!(context as u32, g17_queue_limits::RENDER_APP_CONTEXT);
+        assert_eq!(g17_queue_limits::COMPUTE_CONTEXT_MASK & (1u64 << context), 0);
+        assert_eq!(seen & (1u64 << context), 0, "duplicate context");
+        seen |= 1u64 << context;
+        // A selector is six bits wide in the fragment MCache record.
+        assert!(context <= 0x3f);
+    }
+    // Everything above context 1 must be reserved in the band mask, so the
+    // application-GART allocators can never hand the same ID out.
+    assert_eq!(seen & !2, g17_queue_limits::BIND_CONTEXT_MASK);
 }
 
 #[test]
-fn bootstrap_binding_recycles_context_one() {
+fn concurrent_clients_get_distinct_contexts_lowest_first() {
     let alloc = allocator(UAT_USER_CTX as u32);
     let mut held = Vec::new();
     for vm in 0..T8140_BIND_SLOTS as u64 {
@@ -131,8 +152,11 @@ fn bootstrap_binding_recycles_context_one() {
         assert_eq!(guard.slot() as u64, vm);
         held.push((guard, context));
     }
-    // The only legacy client is on the measured opening context.
+    // The first client is on the measured opening context, later ones are not.
     assert_eq!(held[0].1, 1);
+    for entry in &held[1..] {
+        assert!(entry.1 >= g17_queue_limits::BIND_CONTEXT_FIRST as usize);
+    }
     assert_eq!(alloc.busy_mask(), (1u64 << T8140_BIND_SLOTS) - 1);
     assert_eq!(
         alloc.with_inner(|data| data.snapshot()),
@@ -167,11 +191,18 @@ fn bootstrap_binding_recycles_context_one() {
 fn a_returning_client_keeps_its_own_context() {
     let alloc = allocator(UAT_USER_CTX as u32);
     let (first, first_context) = bind(&alloc, None, 1, false).unwrap();
-    let token = first.token();
+    let (second, second_context) = bind(&alloc, None, 2, false).unwrap();
+    let token = second.token();
+    assert_ne!(first_context, second_context);
+    drop(second);
+    // Slot 0 is still busy, so lowest-first alone would be no evidence. Free
+    // it too: the token must still win, because moving a live client's root
+    // to another hardware context would invalidate the MCache selector its
+    // retained descriptors already encode.
     drop(first);
-    let (again, again_context) = bind(&alloc, Some(token), 1, false).unwrap();
+    let (again, again_context) = bind(&alloc, Some(token), 2, false).unwrap();
     assert_eq!(again.slot(), token.last_slot());
-    assert_eq!(again_context, first_context);
+    assert_eq!(again_context, second_context);
     assert!(!again.changed());
 }
 
@@ -255,6 +286,9 @@ with tempfile.TemporaryDirectory(prefix="g17-bind-contexts-") as temp:
     subprocess.run([str(binary), "--test-threads=1"], check=True)
 
 print(
-    "PASS production T8140 bootstrap binding: context1 is exclusive/reusable, "
-    "job contexts own the full5..62 band, and non-T8140 allocators keep LRU"
+    "PASS production T8140 bind-context pool: slot 0 is the opening context 1, "
+    "the band is disjoint from the compute/app-GART/reserved contexts, concurrent "
+    "clients get distinct contexts, a released context is reusable immediately, a "
+    "returning client keeps its own, robust_isolation restores the single-context "
+    "behaviour, and non-T8140 allocators keep LRU"
 )
