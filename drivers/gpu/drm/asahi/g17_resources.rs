@@ -10526,6 +10526,12 @@ impl G17ResourceOwner {
             )
             .map_err(|_| EINVAL)
         })?;
+        pb_descriptor_table.with_bytes_mut(|pbdesc| {
+            uma_page_pool_descriptor_table.with_bytes_mut(|uma| {
+                g17_submission::apply_g17p_cl_b2_descriptor_tables(pbdesc, uma)
+                    .map_err(|_| EINVAL)
+            })
+        })?;
         // The compute firmware consumes these two objects through the fixed
         // context-0 low views published in primary main config. Keep the
         // low/high pairs on the same backing; copying their bytes into an
@@ -14286,6 +14292,16 @@ impl G17ResourceOwner {
                 )
                 .map_err(|_| EINVAL)
             })?;
+        {
+            let pbdesc = &mut self.resources.pb_descriptor_table;
+            let uma = &mut self.resources.uma_page_pool_descriptor_table;
+            pbdesc.with_bytes_mut(|pbdesc| {
+                uma.with_bytes_mut(|uma| {
+                    g17_submission::apply_g17p_cl_b2_descriptor_tables(pbdesc, uma)
+                        .map_err(|_| EINVAL)
+                })
+            })?;
+        }
         self.resources.completion_ordinal_0.with_bytes_mut(|bytes| {
             bytes.fill(0);
             Ok(())
@@ -16336,26 +16352,16 @@ impl G17ResourceOwner {
         Ok(())
     }
 
-    pub(crate) fn with_b2_pages_mut<R>(
+    pub(crate) fn with_b2_computed_mut<R>(
         &mut self,
-        f: impl FnOnce(&mut [u8], &mut [u8], &mut [u8]) -> Result<R>,
+        f: impl FnOnce(&mut [u8]) -> Result<R>,
     ) -> Result<R> {
         let computed = self.resources.partial_computed.object.vmap()?;
-        let region_1 = self.resources.pb_descriptor_table.object.vmap()?;
-        let region_2 = self.resources.uma_page_pool_descriptor_table.object.vmap()?;
         let computed = unsafe {
             // SAFETY: each VMap covers its complete 16 KiB object.
             core::slice::from_raw_parts_mut(computed.as_mut_ptr(), G17P_CL_B2_OBJECT_SIZE)
         };
-        let region_1 = unsafe {
-            // SAFETY: each VMap covers its complete 16 KiB object.
-            core::slice::from_raw_parts_mut(region_1.as_mut_ptr(), G17P_CL_B2_OBJECT_SIZE)
-        };
-        let region_2 = unsafe {
-            // SAFETY: each VMap covers its complete 16 KiB object.
-            core::slice::from_raw_parts_mut(region_2.as_mut_ptr(), G17P_CL_B2_OBJECT_SIZE)
-        };
-        f(computed, region_1, region_2)
+        f(computed)
     }
 }
 

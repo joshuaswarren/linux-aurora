@@ -3672,6 +3672,30 @@ pub(crate) fn apply_g17p_cl_b2_primary_state(
         return Err(SubmissionError::KickB2PrimaryStateBufferTooSmall);
     }
 
+    let activation = apply_g17p_cl_b2_computed_state(
+        activation,
+        computed,
+        channel_control_gpu_va,
+    )?;
+    apply_g17p_cl_b2_descriptor_tables(region_1, region_2)?;
+    Ok(activation)
+}
+
+/// Apply the queue-local half of B2 activation. The channel-control pointer
+/// changes with the compute work queue; the PBDesc and UMA tables do not.
+pub(crate) fn apply_g17p_cl_b2_computed_state(
+    activation: G17PClB2ActivationState,
+    computed: &mut [u8],
+    channel_control_gpu_va: u64,
+) -> Result<G17PClB2ActivationState, SubmissionError> {
+    if activation == G17PClB2ActivationState::Published {
+        return Err(SubmissionError::KickB2PrimaryStateAlreadyPublished);
+    }
+    let layout = G17P_CL_B2_PRIMARY_STATE_LAYOUT;
+    if computed.len() < layout.object_size {
+        return Err(SubmissionError::KickB2PrimaryStateBufferTooSmall);
+    }
+
     computed[0x000] = 0xff;
     computed[0x008] = 0xff;
     computed[0x010..0x012].copy_from_slice(&0x0f01u16.to_le_bytes());
@@ -3686,6 +3710,24 @@ pub(crate) fn apply_g17p_cl_b2_primary_state(
     put_u64_le(computed, 0xe20, 4);
     put_u64_le(computed, 0xe28, 4);
 
+    Ok(G17PClB2ActivationState::Published)
+}
+
+/// Apply the device-global descriptor-table half of B2 initialization.
+///
+/// Native performs this before client halLoadPBDesc/halLoadUMADesc updates.
+/// Reapplying these captured cold entries for every later compute queue would
+/// overwrite whichever live render owner currently holds PBDesc index 1 and
+/// UMA index 0.
+pub(crate) fn apply_g17p_cl_b2_descriptor_tables(
+    region_1: &mut [u8],
+    region_2: &mut [u8],
+) -> Result<(), SubmissionError> {
+    let layout = G17P_CL_B2_PRIMARY_STATE_LAYOUT;
+    if region_1.len() < layout.object_size || region_2.len() < layout.object_size {
+        return Err(SubmissionError::KickB2PrimaryStateBufferTooSmall);
+    }
+
     put_u64_le(region_1, 0x10, 0x0000_0080_0007_7000);
     put_u32_le(region_1, 0x18, 0x17);
     put_u32_le(region_1, 0x1c, 0x17);
@@ -3693,7 +3735,7 @@ pub(crate) fn apply_g17p_cl_b2_primary_state(
     put_u64_le(region_2, 0x00, 0x0800_0000_e000_0000);
     put_u64_le(region_2, 0x08, 0x0000_3d40_0000_3400);
     put_u64_le(region_2, 0x10, 0x0000_0000_0000_1d00);
-    Ok(G17PClB2ActivationState::Published)
+    Ok(())
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
