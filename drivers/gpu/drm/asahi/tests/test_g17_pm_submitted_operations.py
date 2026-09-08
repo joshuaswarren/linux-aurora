@@ -190,14 +190,17 @@ commit = manager.index("operation.commit();", publish_at)
 assert prepare < publish_at < commit
 assert manager.count("operation.commit();") == 1
 
-# The render root bind and the diagnostic MCache alias must both complete
-# before any descriptor is staged, which is before the outer publication and
-# therefore before the committed count.
+# Context 1's global FList root is installed at bootstrap retirement. Ordinary
+# render publication must not overwrite it with a client VmBind; the already
+# rooted execution context supplies descriptor/MCache identity before storage
+# construction and outer publication.
 render_publish = manager.index(
     "fn begin_translated_render_with_hardware_buffer")
-bind_at = manager.index(".bind(vm)", render_publish)
-alias_at = manager.index("install_t8140_render_mcache_context_alias", render_publish)
+render_body = manager[render_publish:]
 storage_at = manager.index(".new_user_render_storage(", render_publish)
 outer_at = manager.index(".publish_partial_opening_pair(", render_publish)
-assert bind_at < alias_at < storage_at < outer_at
+assert ".bind(vm)" not in render_body[:outer_at - render_publish]
+assert "install_t8140_render_mcache_context_alias" not in render_body[:outer_at - render_publish]
+context_at = manager.index("u8::try_from(execution_context.context_id())", render_publish)
+assert context_at < storage_at < outer_at
 print("PM submitted-operation transaction and actual publication ordering PASS")

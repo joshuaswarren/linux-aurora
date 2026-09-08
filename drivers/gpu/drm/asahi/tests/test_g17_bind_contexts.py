@@ -191,6 +191,14 @@ fn concurrent_clients_get_distinct_contexts_lowest_first() {
 fn a_returning_client_keeps_its_own_context() {
     let alloc = allocator(UAT_USER_CTX as u32);
     let (first, first_context) = bind(&alloc, None, 1, false).unwrap();
+    if T8140_BIND_SLOTS == 1 {
+        let token = first.token();
+        drop(first);
+        let (again, again_context) = bind(&alloc, Some(token), 1, false).unwrap();
+        assert_eq!((again.slot(), again_context), (0, first_context));
+        assert!(!again.changed());
+        return;
+    }
     let (second, second_context) = bind(&alloc, None, 2, false).unwrap();
     let token = second.token();
     assert_ne!(first_context, second_context);
@@ -286,9 +294,8 @@ with tempfile.TemporaryDirectory(prefix="g17-bind-contexts-") as temp:
     subprocess.run([str(binary), "--test-threads=1"], check=True)
 
 print(
-    "PASS production T8140 bind-context pool: slot 0 is the opening context 1, "
-    "the band is disjoint from the compute/app-GART/reserved contexts, concurrent "
-    "clients get distinct contexts, a released context is reusable immediately, a "
-    "returning client keeps its own, robust_isolation restores the single-context "
+    "PASS production T8140 bootstrap bind: slot 0 is opening context 1, ordinary "
+    "app-GART contexts are disjoint, release/reuse and token stability hold, "
+    "robust_isolation preserves the single-context "
     "behaviour, and non-T8140 allocators keep LRU"
 )
