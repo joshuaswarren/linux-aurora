@@ -963,17 +963,24 @@ fn g17p_pm_page_align(value: usize) -> Option<usize> {
 fn g17p_parameter_management_layout() -> Option<G17PParameterManagementLayout> {
     let hwpb_state = 0;
     let page_list = g17p_pm_page_align(G17P_PM_HWPB_STATE_SIZE)?;
-    let block_page_bases =
+    // Native leaves one table-sized object between the page list and shared
+    // control, but the table firmware actually consumes follows the complete
+    // Scene allocation.  Keeping the reserved middle object preserves every
+    // observed Scene/control address; placing the live table at +0x40000 also
+    // maps the exact address firmware derives from Scene allocation +0x8000.
+    let reserved_block_page_bases =
         page_list.checked_add(g17p_pm_page_align(G17P_PM_PAGE_LIST_SIZE)?)?;
-    let shared_control = block_page_bases
+    let shared_control = reserved_block_page_bases
         .checked_add(g17p_pm_page_align(G17P_PM_BLOCK_PAGE_BASE_TABLE_SIZE)?)?;
     let counter =
         shared_control.checked_add(g17p_pm_page_align(G17P_PM_SHARED_CONTROL_SIZE)?)?;
     let page_metrics = counter.checked_add(g17p_pm_page_align(G17P_PM_COUNTER_SIZE)?)?;
     let scene_states =
         page_metrics.checked_add(g17p_pm_page_align(G17P_PM_PAGE_METRICS_SIZE)?)?;
-    let total_size =
+    let block_page_bases =
         scene_states.checked_add(g17p_pm_page_align(G17P_PM_SCENE_ALLOCATION_SIZE)?)?;
+    let total_size = block_page_bases
+        .checked_add(g17p_pm_page_align(G17P_PM_BLOCK_PAGE_BASE_TABLE_SIZE)?)?;
     Some(G17PParameterManagementLayout {
         hwpb_state,
         page_list,
@@ -4854,12 +4861,25 @@ const G17P_PM_SCENE_SCRATCH_STRIDE: usize = 0x20;
 const G17P_PM_SCENE_SCRATCH_SIZE: usize = 0x8000;
 const G17P_PM_DISCARD_SIZE: usize = 0x8000;
 
-/// Native processRenderSetup advances its configured Scene ring. Reuse here
-/// is serialized behind the previous paired completion, including the shorter
-/// 36-slot scratch ring; it does not provide concurrent Scene ownership.
-fn g17p_render_scene_index(submission_ordinal: u32) -> usize {
-    ((u64::from(submission_ordinal) + G17P_PM_SELECTED_SCENE as u64)
-        % G17P_PM_SCENE_COUNT as u64) as usize
+/// Native processRenderSetup advances the Scene ring owned by one parameter
+/// buffer manager. Queue producer ordinals survive a VM handoff, while the PM
+/// manager and its Scene allocation do not, so the queue ordinal must first be
+/// rebased to the submission which created this manager. Reusing the queue's
+/// absolute ordinal directly makes a fresh manager skip from cold Scene1 to an
+/// arbitrary entry on its very first publication.
+///
+/// Reuse is serialized behind the previous paired completion, including the
+/// shorter 36-slot scratch ring; it does not provide concurrent Scene
+/// ownership.
+fn g17p_render_scene_index(
+    first_submission_ordinal: u32,
+    submission_ordinal: u32,
+) -> Option<usize> {
+    let local_ordinal = submission_ordinal.checked_sub(first_submission_ordinal)?;
+    Some(
+        ((u64::from(local_ordinal) + G17P_PM_SELECTED_SCENE as u64)
+            % G17P_PM_SCENE_COUNT as u64) as usize,
+    )
 }
 
 fn g17p_render_scene_registers(
@@ -5092,6 +5112,10 @@ struct G17PParameterManagement {
     page_list_vas: [u64; 2],
     metrics_vas: [u64; 2],
     hardware_buffer_id: u32,
+    /// Queue ordinal of the first submission encoded against this manager.
+    /// Scene selection is relative to this value, not to the retained queue's
+    /// session-global producer ordinal.
+    first_submission_ordinal: u32,
     selected_scene: usize,
     manager_generation: u64,
 }
@@ -5172,6 +5196,7 @@ impl G17PParameterManagement {
         discard_va: u64,
         ta_hardware_buffer_id: u32,
         manager_generation: u64,
+        first_submission_ordinal: u32,
         render_layout: &G17PRenderStateLayout,
     ) -> Result<Self> {
         let layout = g17p_parameter_management_layout().ok_or(EINVAL)?;
@@ -5212,6 +5237,7 @@ impl G17PParameterManagement {
             page_list_vas,
             metrics_vas,
             hardware_buffer_id: ta_hardware_buffer_id,
+            first_submission_ordinal,
             selected_scene: G17P_PM_SELECTED_SCENE,
             manager_generation,
         })
@@ -5235,7 +5261,11 @@ impl G17PParameterManagement {
         {
             return Err(ENOTSUPP);
         }
-        let scene = g17p_render_scene_index(submission_ordinal);
+        let scene = g17p_render_scene_index(
+            self.first_submission_ordinal,
+            submission_ordinal,
+        )
+        .ok_or(EINVAL)?;
         self.backing.with_bytes_mut(|raw| {
             prepare_g17p_retained_scene(raw, &self.layout, scene, self.manager_generation)
         })?;
@@ -6294,6 +6324,7 @@ impl G17PUserRenderStorage {
                     discard_va,
                     translated.parameters.ta_hardware_buffer_id,
                     manager_generation,
+                    submission_ordinal,
                     &render_layout,
                 )
             ))
@@ -16186,12 +16217,12 @@ mod tests {
         assert_eq!(G17P_PM_HWPB_STATE_SIZE, 0xc0);
         assert_eq!(pm.hwpb_state, 0);
         assert_eq!(pm.page_list, 0x8000);
-        assert_eq!(pm.block_page_bases, 0x18000);
+        assert_eq!(pm.block_page_bases, 0x40000);
         assert_eq!(pm.shared_control, 0x20000);
         assert_eq!(pm.counter, 0x28000);
         assert_eq!(pm.page_metrics, 0x30000);
         assert_eq!(pm.scene_states, 0x38000);
-        assert_eq!(pm.total_size, 0x40000);
+        assert_eq!(pm.total_size, 0x48000);
         assert_eq!(G17P_PM_PAGE_LIST_SIZE, 0xd1a0);
         assert_eq!(G17P_PM_BLOCK_PAGE_BASE_TABLE_SIZE, 0x68d0);
         assert_eq!(G17P_PM_SCENE_ALLOCATION_SIZE, 0x2840);
@@ -16316,12 +16347,20 @@ mod tests {
             .iter()
             .all(|byte| *byte == 0));
 
-        // The observed replacement was built at ordinal 2022. Scene0 is not
-        // reached until ordinal 2079, exactly where firmware dereferenced the
-        // replacement manager's metrics pointer and crashed when both manager
-        // incarnations had been stamped as generation 1.
-        assert_eq!(g17p_render_scene_index(2022), 23);
-        assert_eq!(g17p_render_scene_index(2079), 0);
+        // Scene ownership starts over when a replacement PM manager is built,
+        // even though the retained queue's producer ordinal does not. A fresh
+        // manager at either observed handoff ordinal therefore begins at
+        // Scene1. It reaches Scene0 only after 79 completed submissions of its
+        // own; the independent 36-slot scratch ring still wraps modulo 36 in
+        // g17p_render_scene_registers().
+        assert_eq!(g17p_render_scene_index(195, 195), Some(1));
+        assert_eq!(g17p_render_scene_index(195, 196), Some(2));
+        assert_eq!(g17p_render_scene_index(195, 274), Some(0));
+        assert_eq!(g17p_render_scene_index(195, 275), Some(1));
+        assert_eq!(g17p_render_scene_index(2022, 2022), Some(1));
+        assert_eq!(g17p_render_scene_index(2022, 2079), Some(58));
+        assert_eq!(g17p_render_scene_index(2022, 2101), Some(0));
+        assert_eq!(g17p_render_scene_index(2022, 2021), None);
         assert_eq!(g17p_pm_manager_generation_plan(1), Ok((1, 2)));
         assert_eq!(g17p_pm_manager_generation_plan(7), Ok((7, 8)));
         assert_eq!(g17p_pm_manager_generation_plan(0), Err(EINVAL));
