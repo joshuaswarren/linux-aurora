@@ -450,6 +450,7 @@ pub(crate) struct G17PRenderCompletion {
     fence: UserFence<G17PSubmissionFence>,
     status: Arc<crate::g17_status::VmStatus>,
     lease: Arc<Mutex<Option<G17PLeaseGuard>>>,
+    _vm_job: mmu::T8140VmJobGuard,
     signalled: AtomicU32,
 }
 
@@ -458,6 +459,7 @@ impl G17PRenderCompletion {
         fence: UserFence<G17PSubmissionFence>,
         status: Arc<crate::g17_status::VmStatus>,
         lease: G17PLeaseGuard,
+        vm_job: mmu::T8140VmJobGuard,
     ) -> Result<Arc<Self>> {
         let lease = Arc::pin_init(
             new_mutex!(Some(lease), "G17PRenderCompletion::lease"),
@@ -467,6 +469,7 @@ impl G17PRenderCompletion {
             fence,
             status,
             lease,
+            _vm_job: vm_job,
             signalled: AtomicU32::new(0),
         }, GFP_KERNEL)?)
     }
@@ -1072,6 +1075,7 @@ impl G17PQueue {
         mut syncs: KVec<file::SyncItem>, in_sync_count: usize,
         objects: core::pin::Pin<&xarray::XArray<KBox<file::Object>>>,
         publication: &mut G17POutputFencePublication<'_>,
+        vm_job: mmu::T8140VmJobGuard,
         entered: Instant<Monotonic>,
     ) -> Result {
         self.ensure_async_compute_queue()?;
@@ -1093,7 +1097,7 @@ impl G17PQueue {
                 status: self.vm.status().clone(),
                 signalled: AtomicU32::new(0),
             }),
-            Some(self.vm.retain_t8140_job()?),
+            Some(vm_job),
         )?;
         // One extra dependency carries this logical queue's preceding render
         // or compute completion. DRM entities serialize compute jobs with one
@@ -1985,6 +1989,10 @@ impl G17PQueue {
         if self.vm.status().get() != 0 {
             return Err(Self::stage_fail(submission_id, "vm-status", EIO));
         }
+        // Pin every userspace mapping before translating raw GPU addresses.
+        // GEM-handle close and VM teardown defer their unmaps behind this
+        // guard; a successfully published render/compute packet inherits it.
+        let vm_job = self.vm.retain_t8140_job()?;
         let address_space = UserAddressSpace {
             vm: &self.vm,
             range: self.user_range.clone(),
@@ -2121,6 +2129,7 @@ impl G17PQueue {
                 in_sync_count,
                 objects,
                 &mut publication,
+                vm_job,
                 entered,
             );
         }
@@ -2186,6 +2195,7 @@ impl G17PQueue {
                     hardware_fence,
                     self.vm.status().clone(),
                     lease,
+                    vm_job,
                 )?;
                 let publish_started = Instant::<Monotonic>::now();
                 let submit = self.runtime

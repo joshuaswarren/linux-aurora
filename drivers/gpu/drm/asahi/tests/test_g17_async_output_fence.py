@@ -35,6 +35,10 @@ guard_impl = block("impl G17POutputFencePublication<'_> {")
 guard_drop = block("impl Drop for G17POutputFencePublication<'_> {")
 render_completion = block("impl G17PRenderCompletion {")
 
+render_completion_struct = block("pub(crate) struct G17PRenderCompletion {")
+assert "_vm_job: mmu::T8140VmJobGuard" in render_completion_struct, \
+    'published render does not retain its VM mappings through completion'
+
 complete = render_completion[render_completion.index("pub(crate) fn complete"):]
 assert complete.index("compare_exchange(0, 1") < complete.index("self.fence.signal();"), \
     'render completion does not reject duplicate firmware notifications'
@@ -61,6 +65,24 @@ assert "signal.complete(Ok(observed));" in timeout, \
     'watchdog cannot salvage a completion that became visible after the event edge'
 assert ") -> bool {" in timeout and "return !retired;" in timeout, \
     'watchdog does not report whether firmware still owns the slot'
+signal_error = timeout.index("signal.complete(Err(if retired { EIO } else { error }));")
+quarantine = timeout.index("quarantined_render_completions", signal_error)
+assert signal_error < quarantine
+assert "if !retired" in timeout[signal_error:quarantine], \
+    'lost render drops its VM guard without proving firmware retirement'
+
+# Runtime recovery may free an unresolved render's VM guard only after both
+# processors stop. Failed CPU stop must intentionally retain it instead.
+recovery = live_source[live_source.index("impl g17_lifecycle::PersistentRuntimeRecovery"):
+                       live_source.index("impl g17_lifecycle::PersistentRuntimeTeardown")]
+assert recovery.index("fn stop_cpu_pair") < recovery.index("fn release_runtime_objects")
+release = recovery[recovery.index("fn release_runtime_objects"):]
+assert "self.quarantined_render_completions.clear();" in release
+teardown = live_source[live_source.index("impl g17_lifecycle::PersistentRuntimeTeardown"):]
+retain_failure = teardown[teardown.index("fn retain_after_stop_failure"):
+                          teardown.index("fn unregister_queue")]
+assert "core::mem::forget(core::mem::take(" in retain_failure
+assert "&mut self.quarantined_render_completions" in retain_failure
 
 # Cancellation and submit-error cleanup must classify the final hardware state
 # before permanently retiring a physical slot. A successful one-frame process

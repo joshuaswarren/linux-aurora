@@ -2563,6 +2563,10 @@ pub(crate) struct G17PLiveRuntime {
     /// retirement or the DRM scheduler's bounded timeout recovery.
     pending_render: [Option<Arc<crate::g17_drm::G17PRenderCompletion>>;
         g17_resources::G17PRenderQueuePair::SLOT_COUNT as usize],
+    /// Lost render packets whose firmware retirement was not proven. Their
+    /// VM job guards keep userspace mappings alive until both processors stop.
+    quarantined_render_completions:
+        KVec<Arc<crate::g17_drm::G17PRenderCompletion>>,
     /// Type-1 EventMachine QID bits observed since each slot was armed.
     /// Cleared at arm/settlement so a compute-only or prior render event can
     /// never retire the current fence.
@@ -3953,6 +3957,21 @@ impl G17PLiveRuntime {
                 );
             }
             signal.complete(Err(if retired { EIO } else { error }));
+            if !retired {
+                if let Err(error) = self
+                    .quarantined_render_completions
+                    .push_within_capacity(signal)
+                {
+                    // There can be at most one unresolved owner per
+                    // quarantined physical slot. If that invariant is ever
+                    // violated, intentionally leak rather than unmap memory
+                    // firmware may still dereference.
+                    core::mem::forget(error.0);
+                    pr_err!(
+                        "G17P render: completion quarantine exhausted; retaining VM mappings permanently\n"
+                    );
+                }
+            }
             return !retired;
         }
         false
@@ -6963,6 +6982,10 @@ impl G17PLiveRuntime {
             completion_signal: G17PCompletionSignal::new()?,
             pending_compute: None,
             pending_render: [None, None],
+            quarantined_render_completions: KVec::with_capacity(
+                g17_resources::G17PRenderQueuePair::SLOT_COUNT as usize,
+                GFP_KERNEL,
+            )?,
             render_event_masks: [[0; 2];
                 g17_resources::G17PRenderQueuePair::SLOT_COUNT as usize],
             render_fence_state: g17_completion::RenderFenceState::default(),
@@ -7104,6 +7127,7 @@ impl g17_lifecycle::PersistentRuntimeRecovery for G17PLiveRuntime {
         for completion in self.pending_render.iter_mut().filter_map(Option::take) {
             completion.complete(Err(EIO));
         }
+        self.quarantined_render_completions.clear();
         self.render_event_masks = [[0; 2];
             g17_resources::G17PRenderQueuePair::SLOT_COUNT as usize];
         self.render_fence_state = g17_completion::RenderFenceState::default();
@@ -7194,6 +7218,9 @@ impl g17_lifecycle::PersistentRuntimeTeardown for G17PLiveRuntime {
         core::mem::forget(core::mem::take(&mut self.retired_queues));
         core::mem::forget(core::mem::take(&mut self.quarantined_bindings));
         core::mem::forget(core::mem::take(&mut self.pending_render));
+        core::mem::forget(core::mem::take(
+            &mut self.quarantined_render_completions,
+        ));
         core::mem::forget(self.gfx1_rtkit.take());
         core::mem::forget(self.gfx1_state.take());
         core::mem::forget(self.gfx_rtkit.take());
@@ -7219,6 +7246,7 @@ impl g17_lifecycle::PersistentRuntimeTeardown for G17PLiveRuntime {
         for completion in self.pending_render.iter_mut().filter_map(Option::take) {
             completion.complete(Err(EIO));
         }
+        self.quarantined_render_completions.clear();
         self.render_event_masks = [[0; 2];
             g17_resources::G17PRenderQueuePair::SLOT_COUNT as usize];
         self.render_fence_state = g17_completion::RenderFenceState::default();
