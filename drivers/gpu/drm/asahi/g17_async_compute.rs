@@ -19,6 +19,20 @@ struct G17PAsyncComputeQueue {
 }
 
 impl G17PLiveRuntime {
+    /// Both firmware CPUs must have stopped before this is called. Queue
+    /// destruction alone cannot settle the scheduler's retained hardware
+    /// fences, and a later timeout cannot find a queue we have removed.
+    fn release_async_compute_after_processor_stop(&mut self) {
+        for q in &self.async_compute_queues {
+            if let Some(active) = &q.active {
+                if let Ok(completion) = active.packet.completion() {
+                    completion.complete(Err(EIO));
+                }
+            }
+        }
+        self.async_compute_queues.clear();
+    }
+
     pub(crate) fn prepare_queue_execution_context(
         &mut self, vm: &mmu::Vm,
     ) -> Result<Arc<mmu::T8140ComputeExecutionContext>> {

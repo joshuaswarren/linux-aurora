@@ -7158,7 +7158,7 @@ impl g17_lifecycle::PersistentRuntimeRecovery for G17PLiveRuntime {
         // client handoff retired can finally be freed: nothing in the
         // firmware can still dereference them.
         self.retired_queues.clear();
-        self.async_compute_queues.clear();
+        self.release_async_compute_after_processor_stop();
         // Both CPUs have stopped, so a quarantined client's page tables and
         // GEM objects can finally go too.
         self.quarantined_bindings.clear();
@@ -7232,10 +7232,12 @@ impl g17_lifecycle::PersistentRuntimeTeardown for G17PLiveRuntime {
 
     fn retain_after_stop_failure(&mut self) {
         self.accepting_submissions = false;
+        core::mem::forget(self.pending_compute.take());
         core::mem::forget(self.compute_timestamps.take());
         core::mem::forget(self.compute_binding.take());
         core::mem::forget(self.queue.take());
         core::mem::forget(core::mem::take(&mut self.retired_queues));
+        core::mem::forget(core::mem::take(&mut self.async_compute_queues));
         core::mem::forget(core::mem::take(&mut self.quarantined_bindings));
         core::mem::forget(core::mem::take(&mut self.pending_render));
         core::mem::forget(core::mem::take(
@@ -7274,7 +7276,7 @@ impl g17_lifecycle::PersistentRuntimeTeardown for G17PLiveRuntime {
         drop(self.compute_binding.take());
         drop(self.queue.take());
         self.retired_queues.clear();
-        self.async_compute_queues.clear();
+        self.release_async_compute_after_processor_stop();
         self.quarantined_bindings.clear();
         self.compute_owner = None;
         self.compute_recycle_pending = false;
