@@ -37,15 +37,15 @@ prepare = function("pub(crate) fn prepare_cached_reactivation(")
 restage = function("pub(crate) fn restage_command(")
 lookup = manager_function("fn render_bind_for_descriptor_context(")
 
-assert "cached_reactivation_pending: bool" in storage
-assert "self.cached_reactivation_pending = true" in prepare
-assert "let reuse_cached_render_state = self.cached_reactivation_pending" in restage
-assert "if reuse_cached_render_state" in restage
+assert "cached_reactivation_pending" not in storage
+assert "cached_reactivation_pending" not in prepare
 assert "render_layout.total_size > self.render_state.logical_size" in restage
 assert "render_layout.aux_fb != self.render_layout.aux_fb" in restage
 assert "!self.render_user_aliases.all_reachable_from(vm)" in restage
-assert "let mut next_render_generation = if reuse_cached_render_state" in restage
-assert "self.cached_reactivation_pending = false" in restage
+assert "G17PRenderUserAliases::new(" not in restage
+assert "MappedObject::new_wc_in_range(" not in restage
+assert "let render_state_va = self.render_state.iova()" in restage
+assert "self.render_state.with_bytes_mut(" in restage
 assert "const G17P_RENDER_STATE_AUX_FB: usize = G17P_RENDER_STATE_DYNAMIC" in resources
 assert "(scene_scratch, discard, tvb, after_aux_fb)" in resources
 for owner in (
@@ -56,10 +56,8 @@ for owner in (
 ):
     assert owner in lookup
 
-# Model the fixed-VA owner transition. A cached return keeps the exact alias
-# owner; a normal restage installs a new parity generation only after its old
-# one is retired. Re-adding A's address would collide, while using its retained
-# owner is idempotent.
+# Model the fixed-VA owner transition. Every graph installs its compact alias
+# once; all normal restages and cached returns reuse that exact owner.
 class Vm:
     def __init__(self):
         self.aliases = {}
@@ -76,8 +74,13 @@ vm_a, vm_b = Vm(), Vm()
 va = 0x1002050000
 vm_a.install(va, "graph-a")
 vm_b.install(va, "graph-b")
-vm_a.reuse(va, "graph-a")       # A -> B -> A
-vm_b.reuse(va, "graph-b")       # A -> B -> A -> B
+for submission in range(2200):
+    if submission & 1:
+        vm_b.reuse(va, "graph-b")
+    else:
+        vm_a.reuse(va, "graph-a")
+assert len(vm_a.aliases) == 1
+assert len(vm_b.aliases) == 1
 
 # Command geometry changes retained RT-memory requirements, but no longer the
 # compact command-state backing/alias identity.
@@ -104,4 +107,4 @@ except AssertionError:
 else:
     raise AssertionError("cached return incorrectly remapped its fixed alias")
 
-print("PASS A->B->A->B cached graph return reuses preserved render-state aliases")
+print("PASS 2200 alternating restages keep one graph-owned render-state alias per VM")
