@@ -14731,18 +14731,18 @@ impl G17ResourceOwner {
     pub(crate) fn stage_render_parameter_buffer_descriptor(
         &mut self,
         descriptor: Option<(u32, u64, u32)>,
-    ) -> Result {
+    ) -> Result<Option<(u32, [u32; 4])>> {
         let Some((index, page_list_address, page_count)) = descriptor else {
-            return Ok(());
+            return Ok(None);
         };
         let offset = g17_submission::g17p_pbdesc_offset(index);
+        let mut previous = [0u32; 4];
         let mut published = [0u32; 4];
         self.resources.pb_descriptor_table.with_bytes_mut(|bytes| {
             let end = offset.checked_add(g17_submission::G17P_PBDESC_ENTRY_SIZE).ok_or(EINVAL)?;
             if end > bytes.len() {
                 return Err(EINVAL);
             }
-            let mut previous = [0u32; 4];
             for (word, value) in previous.iter_mut().enumerate() {
                 let at = offset + word * 4;
                 *value = u32::from_le_bytes(bytes[at..at + 4].try_into().map_err(|_| EINVAL)?);
@@ -14774,6 +14774,31 @@ impl G17ResourceOwner {
                 self.resources.pb_descriptor_table.iova(),
             );
         }
+        Ok(Some((index, previous)))
+    }
+
+    fn restore_render_parameter_buffer_descriptor(
+        &mut self,
+        staged: Option<(u32, [u32; 4])>,
+    ) -> Result {
+        let Some((index, previous)) = staged else {
+            return Ok(());
+        };
+        let offset = g17_submission::g17p_pbdesc_offset(index);
+        self.resources.pb_descriptor_table.with_bytes_mut(|bytes| {
+            let end = offset
+                .checked_add(g17_submission::G17P_PBDESC_ENTRY_SIZE)
+                .ok_or(EINVAL)?;
+            if end > bytes.len() {
+                return Err(EINVAL);
+            }
+            for (word, value) in previous.into_iter().enumerate() {
+                let at = offset + word * 4;
+                bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            Ok(())
+        })?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
 
@@ -14896,7 +14921,8 @@ impl G17ResourceOwner {
     ) -> Result {
         self.stage_render_parameter_buffer_page_list(storage)?;
         let descriptor = storage.parameter_buffer_descriptor()?;
-        self.stage_render_parameter_buffer_descriptor(descriptor)
+        self.stage_render_parameter_buffer_descriptor(descriptor)?;
+        Ok(())
     }
 
     pub(crate) fn stage_render_parameter_buffer_page_list(
@@ -15146,6 +15172,7 @@ impl G17ResourceOwner {
             parameter_manager_generation,
             retained_sksm_backing,
         )?;
+        let mut staged_descriptor = None;
         let finish = (|| -> Result {
             let aliases = storage.take_persistent_client_mappings()?;
             vm.install_render_pool_mappings(queue_pair.slot(), storage.render_pool_id(),
@@ -15157,7 +15184,9 @@ impl G17ResourceOwner {
             // same root before any descriptor can name it.
             self.address_space.uat.flush_t8140_vm_contexts(vm)?;
             self.stage_render_parameter_buffer_page_list(&mut storage)?;
-            self.stage_render_parameter_buffer_descriptor(storage.parameter_buffer_descriptor()?)?;
+            staged_descriptor = self.stage_render_parameter_buffer_descriptor(
+                storage.parameter_buffer_descriptor()?,
+            )?;
             // Queue-context aliases belong to the installed physical QID and
             // this VM, not to the command-generation pool cleared on every
             // graph handoff. Commit them only after every other fallible stage
@@ -15167,6 +15196,14 @@ impl G17ResourceOwner {
             Ok(())
         })();
         if let Err(error) = finish {
+            // A constructor is not firmware-visible yet. Undo both global and
+            // VM-owned mutations in reverse publication order so a retry sees
+            // neither a PBDesc pointing at freed PM memory nor an occupied
+            // render-pool generation. The append above allocates before it
+            // consumes its mappings, so an append failure left no VM aliases.
+            let restore = self.restore_render_parameter_buffer_descriptor(staged_descriptor);
+            vm.clear_render_pool_mappings(queue_pair.slot());
+            restore?;
             if had_retained_sksm_backing {
                 *retained_sksm_backing = Some(storage.take_sksm_backing()?);
             }
