@@ -40,6 +40,7 @@ state = '\n'.join(item(n) for n in [
 methods = '\n'.join(item(n) for n in [
     '    fn acquire_lease(',
     '    fn quarantine_render_slot(',
+    '    fn rehabilitate_render_slot_after_processor_stop(',
 ])
 ready_lease = item('    fn acquire_ready_lease(')
 assert 'self.id' in ready_lease
@@ -255,6 +256,22 @@ tests = r'''
  assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(),Err(EIO));
  w.join().unwrap();
  drop(a);drop(b);
+}
+
+/// A proven processor stop discards the abandoned hardware graph. Clear its
+/// quarantine while its old completion still holds the lease, then make the
+/// slot available exactly when that lease drops.
+#[test]fn processor_stop_rehabilitates_a_quarantined_slot(){
+ let r=G17PQueueRegistry::new();
+ let a=r.acquire_lease(11).unwrap();
+ let b=r.acquire_lease(22).unwrap();
+ let slot=a.slot();
+ r.quarantine_render_slot(slot);
+ r.rehabilitate_render_slot_after_processor_stop(slot);
+ drop(a);
+ let recovered=r.acquire_lease(11).unwrap();
+ assert_eq!(recovered.slot(),slot);
+ drop(recovered);drop(b);
 }
 '''
 

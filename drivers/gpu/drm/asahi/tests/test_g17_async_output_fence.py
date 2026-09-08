@@ -66,11 +66,13 @@ assert timeout.index("self.poll_deferred_render_completion(render_slot)") \
     'watchdog consumes the settlement gate before its final completion observation'
 assert "signal.complete(Ok(observed));" in timeout, \
     'watchdog cannot salvage a completion that became visible after the event edge'
-assert ") -> bool {" in timeout and "return !retired;" in timeout, \
-    'watchdog does not report whether firmware still owns the slot'
+assert ") -> bool {" not in timeout and "return !retired;" not in timeout, \
+    'watchdog still delegates a late registry quarantine to its caller'
 signal_error = timeout.index("signal.fail_while_owned(error);")
 quarantine = timeout.index("quarantined_render_completions", signal_error)
 assert signal_error < quarantine
+assert "lease.registry.quarantine_render_slot(lease.slot);" in render_completion, \
+    'error fence can wake before its physical slot is quarantined'
 assert "if retired {\n                signal.complete(Err(EIO));\n            } else {" in timeout[:signal_error], \
     'lost render drops its VM guard without proving firmware retirement'
 
@@ -80,7 +82,7 @@ recovery = live_source[live_source.index("impl g17_lifecycle::PersistentRuntimeR
                        live_source.index("impl g17_lifecycle::PersistentRuntimeTeardown")]
 assert recovery.index("fn stop_cpu_pair") < recovery.index("fn release_runtime_objects")
 release = recovery[recovery.index("fn release_runtime_objects"):]
-assert "self.quarantined_render_completions.clear();" in release
+assert "self.release_quarantined_render_after_processor_stop();" in release
 teardown = live_source[live_source.index("impl g17_lifecycle::PersistentRuntimeTeardown"):]
 retain_failure = teardown[teardown.index("fn retain_after_stop_failure"):
                           teardown.index("fn unregister_queue")]
@@ -94,13 +96,15 @@ watch = block("impl g17_job::G17PRenderWatchBackend for G17PRenderWatchBackend {
 for marker in ("fn timed_out(", "fn cancel("):
     body = watch[watch.index(marker):]
     body = body[:body.index("\n    }", body.index("{"))]
-    assert body.index("timeout_deferred_render(") < body.index("quarantine_render_slot("), marker
-    assert "if quarantine" in body, marker
+    assert "timeout_deferred_render(" in body, marker
+    assert "quarantine_render_slot(" not in body, marker
+    assert "if quarantine" not in body, marker
 
 render_submit_start = source.index("let submit = self.runtime")
 render_submit_end = source.index("publication.publish_async(&finished);", render_submit_start)
 render_submit = source[render_submit_start:render_submit_end]
-assert render_submit.count("if quarantine") == 3
+assert "if quarantine" not in render_submit
+assert "quarantine_render_slot(" not in render_submit
 assert render_submit.count("timeout_deferred_render(") == 3
 
 # The submit path must hand the guard to the asynchronous compute path, and the

@@ -4026,24 +4026,34 @@ impl G17PLiveRuntime {
         Ok(())
     }
 
+    /// Release error-fence owners only after both processors are stopped.
+    /// Scheduler packets may retain their completion Arcs after the fence was
+    /// signalled, so clearing this vector alone is not an ownership boundary.
+    fn release_quarantined_render_after_processor_stop(&mut self) {
+        for completion in &self.quarantined_render_completions {
+            completion.release_after_processor_stop();
+        }
+        self.quarantined_render_completions.clear();
+    }
+
     /// Bounded watchdog/cancel settlement. This is never the normal
     /// completion path: ordinary retirement is driven by the RTKit event
-    /// worker above. Returns true only when the final observation cannot prove
-    /// the group completed or was retired, which tells the caller to
-    /// quarantine the physical slot after classification.
+    /// worker above. An unresolved completion quarantines its own physical
+    /// slot before signalling the error fence, so no later caller can race a
+    /// session rebuild by publishing that bit late.
     pub(crate) fn timeout_deferred_render(
         &mut self,
         render_slot: u8,
         submission_id: u64,
         error: Error,
-    ) -> bool {
+    ) {
         // Construction and direct-registration failures happen before a
         // completion owner is installed. They have no published work to
         // observe or abandon; probing the selected slot here manufactured an
         // ENODEV "final watchdog" warning and obscured the original EAGAIN or
         // EBUSY. Only an armed fence denotes a deferred render transaction.
         if !self.render_fence_state.pending(render_slot) {
-            return false;
+            return;
         }
         // A firmware event can precede visibility of the final paired queue
         // cache lines. Recheck once at the scheduler's existing watchdog
@@ -4056,7 +4066,7 @@ impl G17PLiveRuntime {
                     self.render_event_masks[render_slot as usize] = [0; 2];
                     let Some(signal) = self.pending_render
                         .get_mut(render_slot as usize)
-                        .and_then(Option::take) else { return false; };
+                        .and_then(Option::take) else { return; };
                     if let Some(pdev) = self.pdev.as_ref() {
                         dev_warn!(
                             pdev.as_ref(),
@@ -4067,7 +4077,7 @@ impl G17PLiveRuntime {
                     }
                     signal.complete(Ok(observed));
                 }
-                return false;
+                return;
             }
             Ok(None) => {}
             Err(observe_error) => {
@@ -4086,7 +4096,7 @@ impl G17PLiveRuntime {
             self.render_event_masks[render_slot as usize] = [0; 2];
             let Some(signal) = self.pending_render
                 .get_mut(render_slot as usize)
-                .and_then(Option::take) else { return false; };
+                .and_then(Option::take) else { return; };
             let retired = self.abandon_deferred_render(render_slot).unwrap_or(false);
             if let Some(pdev) = self.pdev.as_ref() {
                 dev_err!(
@@ -4116,9 +4126,7 @@ impl G17PLiveRuntime {
                     );
                 }
             }
-            return !retired;
         }
-        false
     }
 
     /// Release a timed-out render.
@@ -7285,7 +7293,7 @@ impl g17_lifecycle::PersistentRuntimeRecovery for G17PLiveRuntime {
         for completion in self.pending_render.iter_mut().filter_map(Option::take) {
             completion.complete(Err(EIO));
         }
-        self.quarantined_render_completions.clear();
+        self.release_quarantined_render_after_processor_stop();
         self.render_event_masks = [[0; 2];
             g17_resources::G17PRenderQueuePair::SLOT_COUNT as usize];
         self.render_fence_state = g17_completion::RenderFenceState::default();
@@ -7433,7 +7441,7 @@ impl g17_lifecycle::PersistentRuntimeTeardown for G17PLiveRuntime {
         for completion in self.pending_render.iter_mut().filter_map(Option::take) {
             completion.complete(Err(EIO));
         }
-        self.quarantined_render_completions.clear();
+        self.release_quarantined_render_after_processor_stop();
         self.render_event_masks = [[0; 2];
             g17_resources::G17PRenderQueuePair::SLOT_COUNT as usize];
         self.render_fence_state = g17_completion::RenderFenceState::default();
