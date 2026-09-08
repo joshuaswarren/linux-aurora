@@ -3320,6 +3320,29 @@ impl G17PManagerConstruction {
         )
     }
 
+    /// Whether the selected non-bootstrap render pair still needs its first
+    /// direct KSMFE registration.
+    ///
+    /// The bootstrap pair is installed by the firmware's proven cold tag-15
+    /// path. Every other EventMachine pair is generic: its exact QIDs come
+    /// from `queue_pair`, never from an odd/even calculation. Its first use
+    /// needs the native synchronous `configureHardware` step before either
+    /// outer command can be exposed.
+    pub(crate) fn fresh_render_pair_needs_direct_registration(
+        &self,
+        queue_pair: g17_resources::G17PRenderQueuePair,
+    ) -> bool {
+        if *crate::module_parameters::g17p_render_sksm.value() == 0
+            || queue_pair.slot() == 0
+            || self.active_render_slot != queue_pair.slot()
+        {
+            return false;
+        }
+        self.render_sksm.as_ref().map_or(true, |queues| {
+            !queues.fragment.registered || !queues.tiling.registered
+        })
+    }
+
     /// Prepare the two render KSM kick queues without touching the hardware
     /// bridge: QID 0 (TA, data master 0) and QID 1 (3D, data master 1).
     ///
@@ -3682,26 +3705,22 @@ impl G17PManagerConstruction {
         queue.registered = true;
     }
 
-    /// Directly install both halves of a fresh secondary render pair while
-    /// the GPC is already powered by another live client.
+    /// Directly install both halves of a fresh non-bootstrap render pair after
+    /// the live-boot owner has completed its retained-provider/GPC preflight.
     ///
     /// The cold qid0/1 pair is proven to install through its simultaneous
     /// firmware tag-15 publication. A secondary pair is different: qid2 TA
     /// executes, but its qid3 parent reaches DM1 without launching unless the
     /// two native KSMFE routes already exist. Native configures both queue
-    /// objects before publishing either outer command. Keep this behind the
-    /// render-only direct-config opt-in until the cold power transition is
-    /// modeled,
-    /// and never expose a secondary pair after only one configuration landed.
-    fn configure_fresh_secondary_render_pair(
+    /// objects before publishing either outer command. Never expose a fresh
+    /// pair after only one configuration landed.
+    fn configure_fresh_nonbootstrap_render_pair(
         &self,
         registers: &regs::Resources,
         fragment_install: bool,
         tiling_install: Option<bool>,
     ) -> Result {
-        if *module_parameters::g17p_render_direct_config.value() == 0
-            || (!fragment_install && !tiling_install.unwrap_or(false))
-        {
+        if !fragment_install && !tiling_install.unwrap_or(false) {
             return Ok(());
         }
         let queues = self.render_sksm.as_ref().ok_or(ENODEV)?;
@@ -3712,28 +3731,28 @@ impl G17PManagerConstruction {
         if !fragment_install || tiling_install != Some(true) {
             return Err(Self::render_stage_fail("secondary-pair-partial-install", EINVAL));
         }
-        let fragment = registers.g17p_sksm_configure_powered_queue(
-            queues.fragment.config.write_pair(),
-            queues.fragment.config.enable_pair,
+        let issued = registers.g17p_sksm_configure_powered_render_pair(
+            (
+                queues.fragment.config.write_pair(),
+                queues.fragment.config.enable_pair,
+            ),
+            (
+                queues.tiling.config.write_pair(),
+                queues.tiling.config.enable_pair,
+            ),
         )?;
-        let tiling = registers.g17p_sksm_configure_powered_queue(
-            queues.tiling.config.write_pair(),
-            queues.tiling.config.enable_pair,
-        )?;
-        if !fragment || !tiling {
+        if !issued {
             dev_err!(
                 self.resources.dev().as_ref(),
-                "G17P render: secondary pair {}/{} direct configuration did not fully issue (3D={}, TA={}); outer publication withheld\n",
+                "G17P render: pair {}/{} direct configuration did not issue while powered; outer publication withheld\n",
                 pair.tiling,
                 pair.fragment,
-                fragment,
-                tiling,
             );
             return Err(EAGAIN);
         }
         dev_info!(
             self.resources.dev().as_ref(),
-            "G17P render: secondary pair {}/{} directly configured before simultaneous outer publication\n",
+            "G17P render: pair {}/{} directly configured as one transaction before simultaneous outer publication\n",
             pair.tiling,
             pair.fragment,
         );
@@ -4645,7 +4664,7 @@ impl G17PManagerConstruction {
                 );
             }
         }
-        self.configure_fresh_secondary_render_pair(
+        self.configure_fresh_nonbootstrap_render_pair(
             registers,
             fragment_install,
             tiling_install,

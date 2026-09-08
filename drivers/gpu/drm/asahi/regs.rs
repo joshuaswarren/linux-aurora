@@ -926,6 +926,17 @@ impl Resources {
         })
     }
 
+    /// Whether the G17P KSMFE tag/data aperture is currently safe to touch.
+    ///
+    /// This is intentionally narrower than "both ASC processors are alive":
+    /// native `ensurePoweredHardware(true)` is a no-op while its retained
+    /// RTBuddy target is already state 1, but the GPU-core register aperture
+    /// can still have been idled independently.  A fresh queue registration
+    /// must satisfy both conditions before its first outer publication.
+    pub(crate) fn g17p_sksm_configuration_port_powered(&self) -> bool {
+        self.g17p_sksm_port_powered()
+    }
+
     /// Publish word 0 then word 1 through J700 resource 0 (`sgx`).
     ///
     /// The pair is checked completely before either write. The fixed-slot
@@ -997,28 +1008,43 @@ impl Resources {
         Ok(true)
     }
 
-    /// Configure one queue only when the GPC is already live, independently
-    /// of the global SKSM-MMIO diagnostic. This is used to qualify native
-    /// direct registration for a secondary render pair without also changing
-    /// compute/AddKicks publication.
-    pub(crate) fn g17p_sksm_configure_powered_queue(
+    /// Configure both halves of one fresh render pair as a single KSMFE
+    /// transaction.
+    ///
+    /// Native constructs both queues before publishing either channel.  Check
+    /// every word before taking the port lock, verify the powered aperture once
+    /// at the transaction boundary, then issue 3D followed by TA and both
+    /// valid masks without permitting another queue publication to interleave.
+    /// Returning `false` means no write was attempted; callers must withhold
+    /// both outer commands.
+    pub(crate) fn g17p_sksm_configure_powered_render_pair(
         &self,
-        pair: g17_submission::G17SksmOrderedWritePair,
-        enable_pair: g17_submission::G17SksmOrderedWritePair,
+        fragment: (
+            g17_submission::G17SksmOrderedWritePair,
+            g17_submission::G17SksmOrderedWritePair,
+        ),
+        tiling: (
+            g17_submission::G17SksmOrderedWritePair,
+            g17_submission::G17SksmOrderedWritePair,
+        ),
     ) -> Result<bool> {
-        if !Self::g17p_sksm_pair_fits(pair)
-            || !Self::g17p_sksm_pair_fits(enable_pair)
-            || enable_pair.word0 | enable_pair.word1 == 0
-        {
-            return Err(EINVAL);
+        for (configure, enable) in [fragment, tiling] {
+            if !Self::g17p_sksm_pair_fits(configure)
+                || !Self::g17p_sksm_pair_fits(enable)
+                || enable.word0 | enable.word1 == 0
+            {
+                return Err(EINVAL);
+            }
         }
         if !self.g17p_sksm_port_powered() {
             return Ok(false);
         }
         let _guard = self.sksm_fifo.lock();
         let sgx = self.sgx.try_access().ok_or(ENODEV)?;
-        Self::g17p_sksm_publish_locked(&sgx, pair)?;
-        Self::g17p_sksm_publish_locked(&sgx, enable_pair)?;
+        Self::g17p_sksm_publish_locked(&sgx, fragment.0)?;
+        Self::g17p_sksm_publish_locked(&sgx, fragment.1)?;
+        Self::g17p_sksm_publish_locked(&sgx, tiling.0)?;
+        Self::g17p_sksm_publish_locked(&sgx, tiling.1)?;
         Ok(true)
     }
 

@@ -4122,6 +4122,20 @@ impl G17PLiveRuntime {
         if recycle {
             g17_lifecycle::recover_persistent_runtime(self)?;
         }
+        // A recovery reconstructs the manager with slot 0 selected. Restore
+        // the caller's physical pair before asking whether this pair is fresh.
+        self.manager
+            .as_mut()
+            .ok_or(ENODEV)?
+            .select_render_slot(render_slot)?;
+        let needs_direct_registration = self
+            .manager
+            .as_ref()
+            .ok_or(ENODEV)?
+            .fresh_render_pair_needs_direct_registration(queue_pair);
+        if needs_direct_registration {
+            self.ensure_g17p_render_registration_power()?;
+        }
         let drm = self.drm.as_ref().ok_or(ENODEV)?.clone();
         // Disjoint field borrows: `registers` and `manager` are separate fields,
         // so a shared borrow of one alongside a mutable borrow of the other is
@@ -4913,6 +4927,115 @@ impl G17PLiveRuntime {
             SETTLE_POLLS
         );
         Err(EBUSY)
+    }
+
+    /// Establish the power prerequisites for direct registration of a fresh
+    /// non-bootstrap render pair.
+    ///
+    /// Native `ensurePoweredHardware(true)` first ensures that both retained
+    /// RTBuddy roles are at target 1. In this driver, ownership of the started
+    /// CPU pair, both live RTKit transports and both initdata ACKs is the same
+    /// retained-state witness. Usually that is all: if the GPC/KSMFE aperture
+    /// is already powered, no message is sent, matching the captured native
+    /// steady-state path.
+    ///
+    /// The GPU cores may nevertheless have independently entered firmware
+    /// idle-off while the two processors remain alive. Linux has no IOGPU PM
+    /// callback to hold that gate across queue construction, so only in that
+    /// cold case publish the firmware-proven IdlePowerOff(0) power request and
+    /// synchronously observe both its channel-12 retirement and the powered
+    /// GPC aperture. This runs before render storage, QoS, tag-15, either
+    /// outer command, or a completion fence is staged; failure therefore
+    /// cannot expose a partially registered pair to firmware.
+    fn ensure_g17p_render_registration_power(&mut self) -> Result {
+        let pdev = self.pdev.as_ref().cloned().ok_or(ENODEV)?;
+        let providers_retained = self.cpus.is_some()
+            && self.gfx_rtkit.is_some()
+            && self.gfx1_rtkit.is_some()
+            && self.gfx_state.as_ref().is_some_and(|state| {
+                state.acked.load(Ordering::Acquire)
+                    && !state.crashed.load(Ordering::Acquire)
+            })
+            && self.gfx1_state.as_ref().is_some_and(|state| {
+                state.acked.load(Ordering::Acquire)
+                    && !state.crashed.load(Ordering::Acquire)
+            });
+        if !providers_retained || !self.accepting_submissions {
+            dev_err!(
+                pdev.as_ref(),
+                "G17P render registration: retained GFX/GFX1 provider or RTKit prerequisite missing; no pair publication attempted\n",
+            );
+            return Err(EIO);
+        }
+        if self
+            .registers
+            .as_ref()
+            .ok_or(ENODEV)?
+            .g17p_sksm_configuration_port_powered()
+        {
+            return Ok(());
+        }
+
+        let publication = self
+            .manager
+            .as_mut()
+            .ok_or(ENODEV)?
+            .publish_primary_device_control_record(
+                g17_initdata::DEVICE_CONTROL_OPCODE_IDLE_POWER_OFF,
+                g17_initdata::DEVICE_CONTROL_IDLE_POWER_OFF_ARG_POWER_ON,
+            )?;
+        fence(Ordering::SeqCst);
+        Pin::new(self.gfx_rtkit.as_mut().ok_or(ENODEV)?)
+            .send_message(
+                g17_rtkit::ENDPOINT_GFX_INTERRUPTS,
+                g17_rtkit::encode_primary_device_control(),
+            )?;
+
+        for elapsed_ms in 0..G17P_POWER_WIRE_POLLS {
+            if self.is_crashed() {
+                return Err(EIO);
+            }
+            // Keep channel 12 single-producer until this exact target retires.
+            // Firmware-event servicing can publish an FList release record;
+            // doing that here would advance the same producer past `target`
+            // and destroy the exact retirement witness.
+            let retired = self
+                .manager
+                .as_mut()
+                .ok_or(ENODEV)?
+                .control_counters()?
+                .primary
+                == [publication.producer_after; 3];
+            let powered = self
+                .registers
+                .as_ref()
+                .ok_or(ENODEV)?
+                .g17p_sksm_configuration_port_powered();
+            if retired && powered {
+                dev_info!(
+                    pdev.as_ref(),
+                    "G17P render registration: cold GPC powered before pair construction after {}ms (control target {})\n",
+                    elapsed_ms,
+                    publication.producer_after,
+                );
+                return Ok(());
+            }
+            fsleep(Delta::from_millis(1));
+        }
+        let counters = self.manager.as_mut().ok_or(ENODEV)?.control_counters()?;
+        let powered = self
+            .registers
+            .as_ref()
+            .ok_or(ENODEV)?
+            .g17p_sksm_configuration_port_powered();
+        dev_err!(
+            pdev.as_ref(),
+            "G17P render registration: pre-power did not complete before construction (target={} counters={:?} powered={}); no pair publication attempted\n",
+            publication.producer_after,
+            counters.primary,
+            powered,
+        );
+        Err(ETIMEDOUT)
     }
 
     /// Publish the host lever that releases KSM pause reason bit 1, then
