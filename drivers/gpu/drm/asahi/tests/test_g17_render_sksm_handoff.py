@@ -76,6 +76,15 @@ def test_production_owns_and_transfers_the_hardware_visible_backing():
     assert "take_sksm_backing()?" in manager
     assert "new-user-render-sksm-backing-unclaimed" in manager
 
+    slot = manager[manager.index("struct G17PRenderSlotState {"):]
+    slot = slot[:slot.index("}\n")]
+    assert slot.index("bind: Option<G17PRenderRootOwner>") < slot.index(
+        "storage: Option<g17_resources::G17PUserRenderStorage>"
+    )
+    assert slot.index("context_aliases: Option<mmu::T8140NativeContextAliases>") < slot.index(
+        "sksm: Option<G17PRenderSksmQueues>"
+    )
+
 
 if __name__ == "__main__":
     tests = [value for name, value in sorted(globals().items()) if name.startswith("test_")]

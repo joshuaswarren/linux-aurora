@@ -1199,15 +1199,17 @@ pub(crate) struct G17PManagerConstruction {
 struct G17PRenderSlotState {
     #[cfg(CONFIG_DEV_COREDUMP)]
     trace_capture: Option<KBox<G17PTraceDump>>,
-    storage: Option<g17_resources::G17PUserRenderStorage>,
-    tracker: Option<G17PPartialOpeningRenderTracker>,
+    // Rust drops fields in declaration order. Retract both roots before any
+    // storage/SKSM backing reachable through them can be released.
     bind: Option<G17PRenderRootOwner>,
     context_aliases: Option<mmu::T8140NativeContextAliases>,
+    storage: Option<g17_resources::G17PUserRenderStorage>,
+    sksm: Option<G17PRenderSksmQueues>,
+    tracker: Option<G17PPartialOpeningRenderTracker>,
     submission_ordinal: u32,
     auxiliary_timestamp: u64,
     hardware_buffer_id: Option<u32>,
     hardware_buffer_published: bool,
-    sksm: Option<G17PRenderSksmQueues>,
 }
 
 #[cfg(not(test))]
@@ -3446,7 +3448,16 @@ impl G17PManagerConstruction {
                 queue.producer,
             )
         };
-        let pair = self.render_storage.as_ref().ok_or(ENODEV)?.queue_pair();
+        let (pair, descriptor_context_id, descriptor_contexts, render_root_slot, pb_binding) = {
+            let storage = self.render_storage.as_mut().ok_or(ENODEV)?;
+            (
+                storage.queue_pair(),
+                storage.descriptor_context_id(),
+                storage.descriptor_context_ids()?,
+                storage.render_root_slot(),
+                storage.parameter_buffer_binding(),
+            )
+        };
         let header_qid = u8::try_from(header.queue_id).map_err(|_| EINVAL)?;
         // Native sources call queue +0x1c both the channel priority and the
         // completion selector. It feeds tag-15 +0x1e, entry-header bits 59+
@@ -3471,6 +3482,14 @@ impl G17PManagerConstruction {
             g17_submission::G17P_3D_DATA_MASTER
         };
         let class_equal = qos_record[1] == producer.qos.class_40;
+        let descriptor_context = descriptor_contexts[usize::from(!tiling)];
+        let context_equal = header.context_id == descriptor_context_id
+            && u32::from(header.context_id) == descriptor_context;
+        let pb_equal = !tiling
+            || (header.parameter_buffer_object == pb_binding.0
+                && header.parameter_buffer_token == pb_binding.1
+                && header.parameter_buffer_id == pb_binding.2
+                && header.parameter_buffer_bit == u32::from(pair.fragment));
         if header.selector != 0x0f
             || header_qid != queue_id
             || header_qid != producer.queue_id
@@ -3481,6 +3500,8 @@ impl G17PManagerConstruction {
             || queue_selector != producer.completion_selector
             || header.field_56 != u16::from(producer.qos.queue_byte_32)
             || qos_record[0] != producer.qos.queue_byte_32
+            || !context_equal
+            || !pb_equal
             || config != expected
         {
             dev_err!(
@@ -3502,6 +3523,23 @@ impl G17PManagerConstruction {
                 producer.qos.queue_byte_32,
                 qos_record[0],
                 qos_record,
+            );
+            dev_err!(
+                dev.as_ref(),
+                "G17P render binding split: stage={} context(tag/owner/descriptor)={}/{}/{} root-slot={} pb(object/token/id/partner)={:#x}/{:#x}/{}/{} expected={:#x}/{:#x}/{}/{}\n",
+                if tiling { "TA" } else { "3D" },
+                header.context_id,
+                descriptor_context_id,
+                descriptor_context,
+                render_root_slot,
+                header.parameter_buffer_object,
+                header.parameter_buffer_token,
+                header.parameter_buffer_id,
+                header.parameter_buffer_bit,
+                pb_binding.0,
+                pb_binding.1,
+                pb_binding.2,
+                pair.fragment,
             );
             return Err(EINVAL);
         }
@@ -3925,6 +3963,9 @@ impl G17PManagerConstruction {
     ) -> Result<g17_submission::PreparedG17PPartialOpeningWorkPair> {
         self.select_render_slot(queue_pair.slot())?;
         let descriptor_context_id = execution_context.context_id() as u16;
+        if !execution_context.matches(vm) || !execution_context.is_current() {
+            return Err(EFAULT);
+        }
         if self.render_tracker.is_some() || self.render_hardware_buffer_id.is_some() {
             return Err(EBUSY);
         }
