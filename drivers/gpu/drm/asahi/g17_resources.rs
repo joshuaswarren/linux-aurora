@@ -4833,7 +4833,18 @@ const G17P_PM_SELECTED_SCENE: usize = 1;
 /// Cold `AGXHWParamBufferManager` generation. The kext increments the owner
 /// generation when it installs a new manager, then TA prepare stamps only the
 /// selected Scene at unaligned `+0x4c` before publishing the command.
-const G17P_PM_INITIAL_HWPB_MANAGER_GENERATION: u64 = 1;
+pub(crate) const G17P_PM_INITIAL_HWPB_MANAGER_GENERATION: u64 = 1;
+
+/// Reserve a non-zero HWPB-manager generation without mutating the session
+/// owner. The manager commits `next` only after the replacement storage has
+/// been constructed and retained, so a failed graph build can safely retry
+/// the same generation.
+pub(crate) fn g17p_pm_manager_generation_plan(current: u64) -> Result<(u64, u64)> {
+    if current == 0 {
+        return Err(EINVAL);
+    }
+    Ok((current, current.checked_add(1).ok_or(EOVERFLOW)?))
+}
 const G17P_PM_PAGE_METRICS_SIZE: usize = G17P_PM_SCENE_COUNT * 4;
 /// `DevicePMConfig` gives 36 reusable scene scratch slots. The complete valid
 /// Scene table proves a 0x20-byte stride, wrapping at slot 36; the selected
@@ -4925,10 +4936,12 @@ fn encode_g17p_parameter_management(
     scene_scratch_va: u64,
     discard_va: u64,
     ta_hardware_buffer_id: u32,
+    manager_generation: u64,
     render_layout: &G17PRenderStateLayout,
     pm_layout: &G17PParameterManagementLayout,
 ) -> Result {
-    if raw.len() < pm_layout.total_size
+    if manager_generation == 0
+        || raw.len() < pm_layout.total_size
         || render_layout.tvb_blocks < G17P_PM_BLOCK_COUNT
         || render_layout.tvb_blocks > G17P_PM_MAX_OWNED_BLOCKS
     {
@@ -5007,11 +5020,7 @@ fn encode_g17p_parameter_management(
     // blanket initialization would destroy native's lazy-generation model.
     let selected_scene = pm_layout.scene_states
         + G17P_PM_SELECTED_SCENE * G17P_PM_SCENE_ENTRY_SIZE;
-    put_u64(
-        raw,
-        selected_scene + 0x4c,
-        G17P_PM_INITIAL_HWPB_MANAGER_GENERATION,
-    );
+    put_u64(raw, selected_scene + 0x4c, manager_generation);
 
     // BlockControl { total, committed, firmware_cursor }, then Stats in the
     // second 0x40-byte half. Native reset leaves the Stats words zero and sets
@@ -5162,6 +5171,7 @@ impl G17PParameterManagement {
         scene_scratch_va: u64,
         discard_va: u64,
         ta_hardware_buffer_id: u32,
+        manager_generation: u64,
         render_layout: &G17PRenderStateLayout,
     ) -> Result<Self> {
         let layout = g17p_parameter_management_layout().ok_or(EINVAL)?;
@@ -5189,6 +5199,7 @@ impl G17PParameterManagement {
                 scene_scratch_va,
                 discard_va,
                 ta_hardware_buffer_id,
+                manager_generation,
                 render_layout,
                 &layout,
             )
@@ -5202,7 +5213,7 @@ impl G17PParameterManagement {
             metrics_vas,
             hardware_buffer_id: ta_hardware_buffer_id,
             selected_scene: G17P_PM_SELECTED_SCENE,
-            manager_generation: G17P_PM_INITIAL_HWPB_MANAGER_GENERATION,
+            manager_generation,
         })
     }
 
@@ -5894,6 +5905,7 @@ impl G17PUserRenderStorage {
         descriptor_context_id: u16,
         render_root_slot: u8,
         submission_ordinal: u32,
+        parameter_manager_generation: Option<u64>,
         retained_sksm_backing: &mut Option<G17PRenderSksmBacking>,
     ) -> Result<Self> {
         macro_rules! bootstrap_stage {
@@ -6241,6 +6253,7 @@ impl G17PUserRenderStorage {
         translated.parameters.usc_flist_hardware_buffer_id =
             g17_initdata::PARTIAL_OPENING_FREELIST_HARDWARE_BUFFER_ID;
         let parameter_management = if g17p_render_tvb_mode() >= 2 {
+            let manager_generation = parameter_manager_generation.ok_or(EINVAL)?;
             let scene_scratch_va = scene_scratch
                 .as_ref()
                 .map(MappedObject::iova)
@@ -6280,16 +6293,21 @@ impl G17PUserRenderStorage {
                     scene_scratch_va,
                     discard_va,
                     translated.parameters.ta_hardware_buffer_id,
+                    manager_generation,
                     &render_layout,
                 )
             ))
         } else {
+            if parameter_manager_generation.is_some() {
+                return Err(EINVAL);
+            }
             None
         };
         if let Some(pm) = parameter_management.as_ref() {
             dev_info!(
                 dev.as_ref(),
-                "G17P render PM: scene={:#x} trailer={:#x} hwpb={:#x} page-list-low={:#x} metrics-cpu={:#x}\n",
+                "G17P render PM: generation={} scene={:#x} trailer={:#x} hwpb={:#x} page-list-low={:#x} metrics-cpu={:#x}\n",
+                pm.manager_generation,
                 pm.selected_scene_va(),
                 pm.trailer_va(),
                 pm.hwpb_state_va(),
@@ -8675,6 +8693,10 @@ impl G17PUserRenderStorage {
     /// this same ID to every submission on this storage.
     pub(crate) fn retained_hardware_buffer_id(&self) -> Option<u32> {
         self.parameter_management.as_ref().map(|pm| pm.hardware_buffer_id)
+    }
+
+    pub(crate) fn parameter_manager_generation(&self) -> Option<u64> {
+        self.parameter_management.as_ref().map(|pm| pm.manager_generation)
     }
 
     pub(crate) fn selected_scene_index(&self) -> Result<usize> {
@@ -14452,6 +14474,7 @@ impl G17ResourceOwner {
         user_timestamps: [u64; 4],
         user_timestamp_aliases: KVec<mmu::KernelMapping>,
         submission_ordinal: u32,
+        parameter_manager_generation: Option<u64>,
         retained_sksm_backing: &mut Option<G17PRenderSksmBacking>,
     ) -> Result<G17PUserRenderStorage> {
         let parameter_metrics_vas = [
@@ -14519,6 +14542,7 @@ impl G17ResourceOwner {
             descriptor_context_id,
             render_root_slot,
             submission_ordinal,
+            parameter_manager_generation,
             retained_sksm_backing,
         )?;
         let finish = (|| -> Result {
@@ -16212,6 +16236,7 @@ mod tests {
                 scene_scratch_va,
                 discard_va,
                 5,
+                7,
                 &render,
                 &pm,
             ),
@@ -16280,7 +16305,7 @@ mod tests {
             high + pm.shared_control as u64 + 0x40
         );
         assert_eq!(G17P_PM_INITIAL_HWPB_MANAGER_GENERATION, 1);
-        assert_eq!(get_u64(&raw, selected + 0x4c), 1);
+        assert_eq!(get_u64(&raw, selected + 0x4c), 7);
         assert_eq!(get_u64(&raw, pm.scene_states + 0x4c), 0);
         assert_eq!(
             get_u64(&raw, pm.scene_states + 2 * G17P_PM_SCENE_ENTRY_SIZE + 0x4c),
@@ -16290,6 +16315,23 @@ mod tests {
         assert!(raw[trailer..trailer + G17P_PM_SCENE_TRAILER_SIZE]
             .iter()
             .all(|byte| *byte == 0));
+
+        // The observed replacement was built at ordinal 2022. Scene0 is not
+        // reached until ordinal 2079, exactly where firmware dereferenced the
+        // replacement manager's metrics pointer and crashed when both manager
+        // incarnations had been stamped as generation 1.
+        assert_eq!(g17p_render_scene_index(2022), 23);
+        assert_eq!(g17p_render_scene_index(2079), 0);
+        assert_eq!(g17p_pm_manager_generation_plan(1), Ok((1, 2)));
+        assert_eq!(g17p_pm_manager_generation_plan(7), Ok((7, 8)));
+        assert_eq!(g17p_pm_manager_generation_plan(0), Err(EINVAL));
+        assert_eq!(g17p_pm_manager_generation_plan(u64::MAX), Err(EOVERFLOW));
+        assert_eq!(
+            prepare_g17p_retained_scene(&mut raw, &pm, 0, 8),
+            Ok(())
+        );
+        assert_eq!(get_u64(&raw, pm.scene_states + 0x4c), 8);
+        assert_eq!(get_u64(&raw, pm.scene_states + 8), metrics_vas[0]);
     }
 
     #[test]
