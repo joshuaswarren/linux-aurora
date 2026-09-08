@@ -244,20 +244,27 @@ const G17P_RENDER_DISCARD_VA: u64 = G17P_RENDER_USER_BASE + 0x180_000;
 /// address of the backing render-state allocation.
 const G17P_RENDER_FRAGMENT_STATUS_VA: u64 = G17P_RENDER_USER_BASE + 0x1a_8000;
 /// Driver-reserved client-root arena for compact aliases of render-state
-/// subranges. Two alternating 512 KiB slots allow a new retained generation
-/// to be built completely before the old mappings are released.  The larger
-/// slots also keep the native RT-memory and TPC views separate and aligned.
+/// subranges. Every independently live render pair owns two alternating
+/// 512-KiB generations, so one pair can stage its next command without
+/// colliding with either its prior generation or the other in-flight pair.
+/// The larger slots also keep the native RT-memory and TPC views separate and
+/// aligned.
 const G17P_RENDER_USER_ALIAS_START: u64 = 0x10_0200_0000;
-const G17P_RENDER_USER_ALIAS_END: u64 = 0x10_0210_0000;
 const G17P_RENDER_USER_ALIAS_SLOT_SIZE: u64 = 0x8_0000;
+const G17P_RENDER_ALIAS_GENERATIONS_PER_PAIR: u64 = 2;
+const G17P_RENDER_USER_ALIAS_SLOT_COUNT: u64 =
+    G17PRenderQueuePair::SLOT_COUNT as u64 * G17P_RENDER_ALIAS_GENERATIONS_PER_PAIR;
+const G17P_RENDER_USER_ALIAS_END: u64 = G17P_RENDER_USER_ALIAS_START
+    + G17P_RENDER_USER_ALIAS_SLOT_COUNT * G17P_RENDER_USER_ALIAS_SLOT_SIZE;
 /// AXFB comes from the queue's ordinary user allocator on macOS, rather than
 /// the compact Buffer/Scene allocator used for tilemap, heap metadata and TPC.
-/// Preserve that separate upper user-GART address class with two retained
-/// 32-KiB slots.
+/// Preserve that separate upper user-GART address class with the same
+/// pair-and-generation ownership topology.
 const G17P_RENDER_AUX_ALIAS_START: u64 = 0x100_0200_0000;
 const G17P_RENDER_AUX_ALIAS_SLOT_SIZE: u64 = G17P_RENDER_STATE_AUX_FB_SIZE as u64;
 const G17P_RENDER_AUX_ALIAS_END: u64 =
-    G17P_RENDER_AUX_ALIAS_START + 2 * G17P_RENDER_AUX_ALIAS_SLOT_SIZE;
+    G17P_RENDER_AUX_ALIAS_START
+        + G17P_RENDER_USER_ALIAS_SLOT_COUNT * G17P_RENDER_AUX_ALIAS_SLOT_SIZE;
 /// Native cold parameter-buffer blocks are sparse compact-GART mappings. Each
 /// entry names the first of four 32-KiB pages in one 128-KiB block; adjacent
 /// blocks normally leave one guard page, while the 0x2a -> 0x4a jump preserves
@@ -629,6 +636,19 @@ impl G17PRenderQueuePair {
     const fn low_va(self, tiling: bool) -> u64 {
         G17P_RENDER_JOB_QUEUE_LOW_BASE
             + self.queue_id(tiling) as u64 * G17P_RENDER_QUEUE_VA_STRIDE
+    }
+}
+
+/// Compact aliases are private to both a physical queue pair and one of its
+/// two command generations. Submission parity alone aliases pair 0 and pair 1
+/// in the same VM, which is exactly the two-in-flight ENOSPC failure.
+const fn g17p_render_alias_slot(pair: G17PRenderQueuePair, submission_ordinal: u32) -> Option<u64> {
+    let slot = pair.slot() as u64 * G17P_RENDER_ALIAS_GENERATIONS_PER_PAIR
+        + (submission_ordinal as u64 & 1);
+    if slot < G17P_RENDER_USER_ALIAS_SLOT_COUNT {
+        Some(slot)
+    } else {
+        None
     }
 }
 
@@ -2981,10 +3001,12 @@ impl G17PRenderUserAliases {
         render_state: &mut MappedObject,
         vm: &mmu::Vm,
         render_layout: &G17PRenderStateLayout,
+        queue_pair: G17PRenderQueuePair,
         submission_ordinal: u32,
     ) -> Result<Self> {
+        let alias_slot = g17p_render_alias_slot(queue_pair, submission_ordinal).ok_or(EINVAL)?;
         let slot_base = G17P_RENDER_USER_ALIAS_START
-            + (submission_ordinal as u64 & 1) * G17P_RENDER_USER_ALIAS_SLOT_SIZE;
+            + alias_slot * G17P_RENDER_USER_ALIAS_SLOT_SIZE;
         let deflake_va = slot_base + Self::DEFLAKE_OFFSET;
         let deflake = render_state.object.map_range_into_range(
             vm,
@@ -3046,7 +3068,7 @@ impl G17PRenderUserAliases {
         )?;
 
         let aux_va = G17P_RENDER_AUX_ALIAS_START
-            + (submission_ordinal as u64 & 1) * G17P_RENDER_AUX_ALIAS_SLOT_SIZE;
+            + alias_slot * G17P_RENDER_AUX_ALIAS_SLOT_SIZE;
         let aux_fb = render_state.object.map_range_into_range(
             vm,
             render_layout.aux_fb
@@ -6222,6 +6244,7 @@ impl G17PUserRenderStorage {
                 &mut render_state,
                 vm,
                 &render_layout,
+                queue_pair,
                 bootstrap_alias_ordinal,
             )
         );
@@ -7420,6 +7443,7 @@ impl G17PUserRenderStorage {
             &mut next_render_state,
             vm,
             &render_layout,
+            self.queue_pair,
             submission_ordinal,
         ));
         let next_timestamps = restage_step!("timestamp allocation", MappedObject::new_wc(
@@ -16408,7 +16432,7 @@ mod tests {
         assert_eq!(G17P_CL_LOW_VA_START, 0x70_0000_0000);
         assert_eq!(G17P_CL_LOW_VA_END, 0x71_0000_0000);
         assert_eq!(G17P_RENDER_USER_ALIAS_START, 0x10_0200_0000);
-        assert_eq!(G17P_RENDER_USER_ALIAS_END, 0x10_0210_0000);
+        assert_eq!(G17P_RENDER_USER_ALIAS_END, 0x10_0220_0000);
         assert_eq!(G17P_RENDER_SCENE_SCRATCH_VA, 0x10_0017_8000);
         assert_eq!(G17P_RENDER_SCENE_SCRATCH_MAPPING_SIZE, 0x4000);
         assert_eq!(G17P_RENDER_DISCARD_VA, 0x10_0018_0000);
@@ -16418,9 +16442,22 @@ mod tests {
         assert!(G17P_RENDER_FRAGMENT_STATUS_VA < G17P_RENDER_USER_ALIAS_START);
         assert!(G17P_RENDER_USER_ALIAS_START >= G17P_RENDER_USER_BASE);
         assert!(
-            G17P_RENDER_USER_ALIAS_START + 2 * G17P_RENDER_USER_ALIAS_SLOT_SIZE
+            G17P_RENDER_USER_ALIAS_START
+                + G17PRenderQueuePair::SLOT_COUNT as u64
+                    * G17P_RENDER_ALIAS_GENERATIONS_PER_PAIR
+                    * G17P_RENDER_USER_ALIAS_SLOT_SIZE
                 <= G17P_RENDER_USER_ALIAS_END
         );
+        assert_eq!(G17P_RENDER_USER_ALIAS_SLOT_COUNT, 4);
+        assert_eq!(G17P_RENDER_AUX_ALIAS_END, 0x100_0202_0000);
+        let pair0 = G17PRenderQueuePair::for_slot(0).unwrap();
+        let pair1 = G17PRenderQueuePair::for_slot(1).unwrap();
+        assert_eq!(g17p_render_alias_slot(pair0, 0), Some(0));
+        assert_eq!(g17p_render_alias_slot(pair0, 1), Some(1));
+        assert_eq!(g17p_render_alias_slot(pair0, 2), Some(0));
+        assert_eq!(g17p_render_alias_slot(pair1, 0), Some(2));
+        assert_eq!(g17p_render_alias_slot(pair1, 1), Some(3));
+        assert_eq!(g17p_render_alias_slot(pair1, 2), Some(2));
         assert_eq!(G17P_NATIVE_TVB_BLOCK_PAGE_IDS.len(), G17P_PM_BLOCK_COUNT);
         assert_eq!(G17P_NATIVE_TVB_BLOCK_PAGE_IDS[0], 0x11);
         assert_eq!(G17P_NATIVE_TVB_BLOCK_PAGE_IDS[5], 0x2a);
