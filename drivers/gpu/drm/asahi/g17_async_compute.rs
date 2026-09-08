@@ -39,11 +39,12 @@ impl G17PLiveRuntime {
         let manager = self.manager.as_mut().ok_or(ENODEV)?;
         manager.stage_compute_flist_state()?;
         let free = self.async_compute_queues.iter().position(|q|
-            crate::g17_queue_limits::reusable_uninstalled_compute_graph(
+            crate::g17_queue_limits::reusable_idle_compute_graph(
                 q.owner.is_none(),
                 q.active.is_none(),
+                q.binding.is_none(),
+                q.context.is_none(),
                 q.quarantined,
-                q.queue.requires_first_install(),
             ));
         let index = if let Some(index) = free { index } else {
             self.async_compute_queues.reserve(1, GFP_KERNEL)?;
@@ -64,6 +65,7 @@ impl G17PLiveRuntime {
             index
         };
         let q = &mut self.async_compute_queues[index];
+        let reused_installed = !q.queue.requires_first_install();
         let binding = manager.bind_independent_compute_user_vm(
             &mut q.queue, vm, context.clone(),
         )?;
@@ -71,6 +73,17 @@ impl G17PLiveRuntime {
         q.context = Some(context.clone());
         q.owner = Some(owner);
         q.released = false;
+        if reused_installed {
+            if let Some(pdev) = self.pdev.as_ref() {
+                dev_info!(
+                    pdev.as_ref(),
+                    "G17P async compute: rebound retired installed graph qid={} owner={} context={} without reinstall\n",
+                    q.queue.queue_id(),
+                    owner,
+                    context.context_id(),
+                );
+            }
+        }
         Ok((q.queue.queue_id(), context))
     }
 

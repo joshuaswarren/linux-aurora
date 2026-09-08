@@ -31,17 +31,21 @@ pub(crate) const MAX_IN_FLIGHT_PER_QUEUE: u32 = 1;
 /// and auxiliary mappings; the remaining 3 GiB hold per-VM private aliases.
 pub(crate) const CLIENT_LOW_VA_START: u64 = 0x70_4000_0000;
 
-/// An ownerless graph may be rebound only while it is still host-prepared and
-/// has never been installed in firmware. Once installed, its QID routing is
-/// tied to the original execution context/root until a proven firmware
-/// reconfigure transaction exists.
-pub(crate) const fn reusable_uninstalled_compute_graph(
+/// An idle ownerless graph may be rebound without reinstalling its QID.
+///
+/// QID routing names the session-owned queue/descriptor backing. The client
+/// execution context and root live in the command descriptor and retained
+/// binding, so exact completion followed by dropping that binding leaves the
+/// installed graph reusable. This is the same retained-queue handoff the
+/// synchronous path already uses; reinstalling the QID is explicitly wrong.
+pub(crate) const fn reusable_idle_compute_graph(
     owner_free: bool,
     active_free: bool,
+    binding_free: bool,
+    context_free: bool,
     quarantined: bool,
-    requires_first_install: bool,
 ) -> bool {
-    owner_free && active_free && !quarantined && requires_first_install
+    owner_free && active_free && binding_free && context_free && !quarantined
 }
 
 pub(crate) fn encode_limits() -> [u8; QUEUE_LIMITS_SIZE] {
@@ -56,19 +60,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn installed_graph_is_never_selected_for_cross_context_rebind() {
-        assert!(!reusable_uninstalled_compute_graph(true, true, false, false));
-    }
-
-    #[test]
-    fn unpublished_graph_can_be_rebound_after_idle_owner_close() {
-        assert!(reusable_uninstalled_compute_graph(true, true, false, true));
+    fn idle_graph_can_be_rebound_after_exact_owner_retirement() {
+        assert!(reusable_idle_compute_graph(true, true, true, true, false));
     }
 
     #[test]
     fn active_owned_or_quarantined_graph_is_never_rebound() {
-        assert!(!reusable_uninstalled_compute_graph(false, true, false, true));
-        assert!(!reusable_uninstalled_compute_graph(true, false, false, true));
-        assert!(!reusable_uninstalled_compute_graph(true, true, true, true));
+        assert!(!reusable_idle_compute_graph(false, true, true, true, false));
+        assert!(!reusable_idle_compute_graph(true, false, true, true, false));
+        assert!(!reusable_idle_compute_graph(true, true, false, true, false));
+        assert!(!reusable_idle_compute_graph(true, true, true, false, false));
+        assert!(!reusable_idle_compute_graph(true, true, true, true, true));
     }
 }
