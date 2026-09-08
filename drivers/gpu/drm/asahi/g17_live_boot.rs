@@ -2628,6 +2628,10 @@ pub(crate) struct G17PLiveRuntime {
     /// pair stopped. That pair and its RTKit owners were intentionally leaked;
     /// final teardown must therefore retain the shared manager/UAT as well.
     boot_stop_unproven: bool,
+    /// A processor-stop recovery started but has not installed and resumed a
+    /// complete replacement session. Role state can be absent after a clean
+    /// boot failure, so it cannot by itself represent this offline state.
+    session_recovery_pending: bool,
     gfx_state: Option<Arc<G17PRoleRtkitState>>,
     gfx_rtkit: Option<rtkit::RtKit<G17PRtkitOps>>,
     gfx1_state: Option<Arc<G17PRoleRtkitState>>,
@@ -3187,13 +3191,15 @@ impl G17PLiveRuntime {
     }
 
     pub(crate) fn is_crashed(&self) -> bool {
-        self.gfx_state
-            .as_ref()
-            .is_some_and(|state| state.crashed.load(Ordering::Acquire))
-            || self
-                .gfx1_state
+        g17_lifecycle::persistent_session_needs_recovery(
+            self.session_recovery_pending,
+            self.gfx_state
                 .as_ref()
-                .is_some_and(|state| state.crashed.load(Ordering::Acquire))
+                .is_some_and(|state| state.crashed.load(Ordering::Acquire)),
+            self.gfx1_state
+                .as_ref()
+                .is_some_and(|state| state.crashed.load(Ordering::Acquire)),
+        )
     }
 
     /// Rebuild a crashed session so a NEW client can still open the device.
@@ -7121,6 +7127,7 @@ impl G17PLiveRuntime {
             manager: Some(manager),
             cpus: Some(session.cpus),
             boot_stop_unproven: false,
+            session_recovery_pending: false,
             gfx_state: Some(session.gfx_state),
             gfx_rtkit: Some(session.gfx_rtkit),
             gfx1_state: Some(session.gfx1_state),
@@ -7256,6 +7263,7 @@ impl g17_lifecycle::PersistentRuntimeRecovery for G17PLiveRuntime {
 
     fn pause_submissions(&mut self) {
         self.accepting_submissions = false;
+        self.session_recovery_pending = true;
     }
 
     fn stop_cpu_pair(&mut self) -> Result {
@@ -7365,6 +7373,7 @@ impl g17_lifecycle::PersistentRuntimeRecovery for G17PLiveRuntime {
         // graph. Render can be first after recovery; compute ensures its own
         // graph synchronously when submitted.
         self.accepting_submissions = self.test_stage.enables_compute_uapi();
+        self.session_recovery_pending = false;
     }
 }
 
