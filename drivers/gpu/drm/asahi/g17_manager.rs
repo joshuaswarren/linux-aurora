@@ -6952,12 +6952,10 @@ impl G17PManagerConstruction {
             let channel_control_gpu_va = queue.storage.channel_control_gpu_va();
             queue.b2_activation =
                 self.resources
-                    .with_b2_pages_mut(|computed, region_1, region_2| {
-                        g17_submission::apply_g17p_cl_b2_primary_state(
+                    .with_b2_computed_mut(|computed| {
+                        g17_submission::apply_g17p_cl_b2_computed_state(
                             queue.b2_activation,
                             computed,
-                            region_1,
-                            region_2,
                             channel_control_gpu_va,
                         )
                         .map_err(|_| EINVAL)
