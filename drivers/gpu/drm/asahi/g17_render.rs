@@ -1424,15 +1424,15 @@ pub(crate) fn apply_g17p_retained_descriptor_fields(
                     0
                 },
             );
-            // Our priority-0/QID-0 path submits one TA per render. Native
-            // QID 0 keeps this stamp-info force flag set for stamps 0x100,
-            // 0x200 and 0x300 in all three valid boot captures. FUN_ab64
-            // ORs it into Pool-A +0x20; FUN_168d0 then publishes the TA stamp
-            // even while the paired fragment keeps the batch incomplete.
-            // With zero here Linux deferred that stamp until recovery.
-            // Other native queues vary this flag per submission, so do not
-            // infer their batching policy from the initial QID-0 sequence.
-            if queue_id == 0 && crate::g17_submission::G17P_NATIVE_RENDER_DOORBELL_PRIORITY == 0 {
+            // This is a priority-zero channel policy, not a QID identity bit.
+            // Native's priority-zero TA keeps the stamp-info force flag set:
+            // FUN_ab64 ORs it into Pool-A +0x20 and FUN_168d0 publishes the
+            // TA stamp/handoff even while its paired fragment keeps the batch
+            // incomplete. Restricting it to QID 0 let a second independently
+            // allocated priority-zero pair execute TA on QID 2 but never
+            // release the fragment parent on QID 3. Higher-priority native
+            // queues carry their own batching policy and remain unaffected.
+            if crate::g17_submission::G17P_NATIVE_RENDER_DOORBELL_PRIORITY == 0 {
                 put_u32(raw, 0x08c2, 1);
             }
             // Native's host +0x1288 source is a u32 at +0x8d6 (8a990b8),
@@ -2244,13 +2244,15 @@ mod tests {
     }
 
     #[test]
-    fn priority_zero_ta_forces_stamp_on_cold_and_retained_submissions() {
+    fn priority_zero_ta_force_stamp_is_independent_of_physical_qid() {
         for (queue_id, ordinal, cold, expected) in [
             (0, 0, true, 1),
             (0, 1, false, 1),
             (0, 2, false, 1),
-            (5, 0, true, 0),
-            (5, 1, false, 0),
+            (2, 0, true, 1),
+            (2, 1, false, 1),
+            (5, 0, true, 1),
+            (5, 1, false, 1),
         ] {
             let mut tiling = [0u8; TA_DESCRIPTOR_SIZE];
             apply_g17p_retained_descriptor_fields(
