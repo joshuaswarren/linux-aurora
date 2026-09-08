@@ -285,6 +285,16 @@ const G17P_RENDER_USER_ALIAS_SLOT_COUNT: u64 =
     G17PRenderQueuePair::SLOT_COUNT as u64 * G17P_RENDER_ALIAS_GENERATIONS_PER_PAIR;
 const G17P_RENDER_USER_ALIAS_END: u64 = G17P_RENDER_USER_ALIAS_START
     + G17P_RENDER_USER_ALIAS_SLOT_COUNT * G17P_RENDER_USER_ALIAS_SLOT_SIZE;
+/// Native RTMemory+0x130..+0x290 contains four 0x58-byte event records. Keep
+/// four backing regions live so each record's TMAP/HMTA memory survives until
+/// three later channel-event completions have made that record reusable.
+const G17P_RENDER_RT_EVENT_RECORD_COUNT: usize = 4;
+const G17P_RENDER_RT_REGION_STRIDE: usize = 0x4_0000;
+const G17P_RENDER_RT_MEMORY_START: u64 = G17P_RENDER_USER_ALIAS_END;
+const G17P_RENDER_RT_MEMORY_PAIR_SIZE: usize =
+    G17P_RENDER_RT_EVENT_RECORD_COUNT * G17P_RENDER_RT_REGION_STRIDE;
+const G17P_RENDER_RT_MEMORY_END: u64 = G17P_RENDER_RT_MEMORY_START
+    + G17PRenderQueuePair::SLOT_COUNT as u64 * G17P_RENDER_RT_MEMORY_PAIR_SIZE as u64;
 /// AXFB comes from the queue's ordinary user allocator on macOS, rather than
 /// the compact Buffer/Scene allocator used for tilemap and heap metadata.
 /// Preserve that separate upper user-GART address class with the same
@@ -722,6 +732,22 @@ const fn g17p_render_tpc_va(pair: G17PRenderQueuePair) -> Option<u64> {
     } else {
         None
     }
+}
+
+const fn g17p_render_rt_memory_va(pair: G17PRenderQueuePair) -> Option<u64> {
+    if pair.slot() < G17PRenderQueuePair::SLOT_COUNT {
+        Some(
+            G17P_RENDER_RT_MEMORY_START
+                + pair.slot() as u64 * G17P_RENDER_RT_MEMORY_PAIR_SIZE as u64,
+        )
+    } else {
+        None
+    }
+}
+
+const fn g17p_render_rt_record_offset(submission_ordinal: u32) -> usize {
+    submission_ordinal as usize % G17P_RENDER_RT_EVENT_RECORD_COUNT
+        * G17P_RENDER_RT_REGION_STRIDE
 }
 
 const _: () = assert!(G17PRenderQueuePair::for_slot(1).unwrap().fragment == 3);
@@ -2357,26 +2383,121 @@ fn map_fixed_wc_object(
     }
 }
 
-/// Keep the comparatively large owning mapping out of
+#[cfg(not(test))]
+struct G17PRenderTargetMemory {
+    rt_memory: MappedObject,
+    tpc: MappedObject,
+    rt_slot_ordinals: [Option<u32>; G17P_RENDER_RT_EVENT_RECORD_COUNT],
+}
+
+#[cfg(not(test))]
+impl G17PRenderTargetMemory {
+    fn prepare_rt_slot(
+        &mut self,
+        submission_ordinal: u32,
+        layout: &G17PRenderStateLayout,
+    ) -> Result<(u64, u64)> {
+        let slot = submission_ordinal as usize % G17P_RENDER_RT_EVENT_RECORD_COUNT;
+        if self.rt_slot_ordinals[slot].is_some_and(|previous| {
+            submission_ordinal
+                .checked_sub(previous)
+                .is_none_or(|distance| {
+                    distance != 0 && distance < G17P_RENDER_RT_EVENT_RECORD_COUNT as u32
+                })
+        }) {
+            return Err(EBUSY);
+        }
+        let used = layout
+            .heapmeta
+            .checked_add(layout.heapmeta_size)
+            .and_then(|end| end.checked_sub(layout.tilemap))
+            .ok_or(EINVAL)?;
+        if used > G17P_RENDER_RT_REGION_STRIDE {
+            return Err(ERANGE);
+        }
+        let offset = g17p_render_rt_record_offset(submission_ordinal);
+        self.rt_memory.with_bytes_mut(|raw| {
+            raw.get_mut(offset..offset + G17P_RENDER_RT_REGION_STRIDE)
+                .ok_or(ERANGE)?
+                .fill(0);
+            Ok(())
+        })?;
+        self.rt_slot_ordinals[slot] = Some(submission_ordinal);
+        let tilemap = self
+            .rt_memory
+            .iova()
+            .checked_add(offset as u64)
+            .ok_or(EOVERFLOW)?;
+        let heapmeta = tilemap
+            .checked_add(
+                layout
+                    .heapmeta
+                    .checked_sub(layout.tilemap)
+                    .ok_or(EINVAL)? as u64,
+            )
+            .ok_or(EOVERFLOW)?;
+        Ok((tilemap, heapmeta))
+    }
+
+    fn tpc_va(&self) -> u64 {
+        self.tpc.iova()
+    }
+
+    fn tilemap_va(&self, submission_ordinal: u32) -> Result<u64> {
+        self.rt_memory
+            .iova()
+            .checked_add(g17p_render_rt_record_offset(submission_ordinal) as u64)
+            .ok_or(EOVERFLOW)
+    }
+
+    fn heapmeta_va(
+        &self,
+        submission_ordinal: u32,
+        layout: &G17PRenderStateLayout,
+    ) -> Result<u64> {
+        self.tilemap_va(submission_ordinal)?
+            .checked_add(
+                layout
+                    .heapmeta
+                    .checked_sub(layout.tilemap)
+                    .ok_or(EINVAL)? as u64,
+            )
+            .ok_or(EOVERFLOW)
+    }
+}
+
+/// Keep the comparatively large owning mappings out of
 /// `G17PUserRenderStorage::new`'s already deep construction frame. Descriptor
 /// dual-root collision retries can synchronously drop a temporary mapping and
 /// enter the page-table walker; retaining another full `MappedObject` local in
 /// that call chain exhausted the 32-KiB kernel stack on the second client.
 #[cfg(not(test))]
 #[inline(never)]
-fn new_g17p_render_target_tpc(
+fn new_g17p_render_target_memory(
     dev: &AsahiDevice,
     vm: &mmu::Vm,
     queue_pair: G17PRenderQueuePair,
-) -> Result<KBox<MappedObject>> {
-    Ok(KBox::new(
-        MappedObject::new_wc_at(
+) -> Result<KBox<G17PRenderTargetMemory>> {
+    let rt_memory = MappedObject::new_wc_at(
+        dev,
+        vm,
+        g17p_render_rt_memory_va(queue_pair).ok_or(EINVAL)?,
+        G17P_RENDER_RT_MEMORY_PAIR_SIZE,
+        mmu::PROT_GPU_FW_SHARED_RW,
+    )?;
+    let tpc = MappedObject::new_wc_at(
             dev,
             vm,
             g17p_render_tpc_va(queue_pair).ok_or(EINVAL)?,
             G17P_RENDER_TPC_CAPACITY,
             mmu::PROT_GPU_FW_SHARED_RW,
-        )?,
+        )?;
+    Ok(KBox::new(
+        G17PRenderTargetMemory {
+            rt_memory,
+            tpc,
+            rt_slot_ordinals: [None; G17P_RENDER_RT_EVENT_RECORD_COUNT],
+        },
         GFP_KERNEL,
     )?)
 }
@@ -3082,8 +3203,6 @@ impl G17PComputeReadinessMappings {
 #[cfg(not(test))]
 struct G17PRenderUserAliases {
     deflake: mmu::KernelMapping,
-    /// One compact Buffer/Scene view containing TMAP followed by HMTA.
-    rt_memory: mmu::KernelMapping,
     /// Queue-owned AXFB in the upper ordinary user-GART address class.
     aux_fb: mmu::KernelMapping,
 }
@@ -3091,7 +3210,6 @@ struct G17PRenderUserAliases {
 #[cfg(not(test))]
 impl G17PRenderUserAliases {
     const DEFLAKE_OFFSET: u64 = 0;
-    const RT_MEMORY_OFFSET: u64 = 0x1_8000;
 
     fn new(
         render_state: &mut MappedObject,
@@ -3113,34 +3231,6 @@ impl G17PRenderUserAliases {
             false,
         )?;
 
-        let rt_source_start = render_layout.tilemap;
-        let rt_source_end = page_align(
-            render_layout
-                .heapmeta
-                .checked_add(render_layout.heapmeta_size)
-                .ok_or(EOVERFLOW)?,
-        )
-        .ok_or(EOVERFLOW)?;
-        let rt_size = rt_source_end
-            .checked_sub(rt_source_start)
-            .ok_or(EINVAL)?;
-        if Self::RT_MEMORY_OFFSET
-            .checked_add(rt_size as u64)
-            .ok_or(EOVERFLOW)?
-            > G17P_RENDER_TPC_OFFSET
-        {
-            return Err(ERANGE);
-        }
-        let rt_va = slot_base + Self::RT_MEMORY_OFFSET;
-        let rt_memory = render_state.object.map_range_into_range(
-            vm,
-            rt_source_start..rt_source_end,
-            rt_va..rt_va + rt_size as u64,
-            mmu::UAT_PGSZ as u64,
-            mmu::PROT_GPU_FW_SHARED_RW,
-            false,
-        )?;
-
         let aux_va = G17P_RENDER_AUX_ALIAS_START
             + alias_slot * G17P_RENDER_AUX_ALIAS_SLOT_SIZE;
         let aux_fb = render_state.object.map_range_into_range(
@@ -3155,29 +3245,12 @@ impl G17PRenderUserAliases {
 
         Ok(Self {
             deflake,
-            rt_memory,
             aux_fb,
         })
     }
 
     fn deflake_va(&self) -> u64 {
         self.deflake.iova()
-    }
-
-    fn tilemap_va(&self) -> u64 {
-        self.rt_memory.iova()
-    }
-
-    fn heapmeta_va(&self, render_layout: &G17PRenderStateLayout) -> Result<u64> {
-        self.rt_memory
-            .iova()
-            .checked_add(
-                render_layout
-                    .heapmeta
-                    .checked_sub(render_layout.tilemap)
-                    .ok_or(EINVAL)? as u64,
-            )
-            .ok_or(EOVERFLOW)
     }
 
     fn aux_fb_va(&self) -> u64 {
@@ -3188,11 +3261,6 @@ impl G17PRenderUserAliases {
         vm.covers_range(
             self.deflake.iova(),
             self.deflake.size() as u64,
-            true,
-            true,
-        ) && vm.covers_range(
-            self.rt_memory.iova(),
-            self.rt_memory.size() as u64,
             true,
             true,
         ) && vm.covers_range(
@@ -3294,10 +3362,9 @@ pub(crate) struct G17PUserRenderStorage {
     render_layout: G17PRenderStateLayout,
     render_tvb: Option<G17PRenderTvb>,
     render_user_aliases: G17PRenderUserAliases,
-    /// Native's render-target-memory owner retains one TPC allocation and
-    /// mapping while capacity is sufficient. It is not command-generation
-    /// state and therefore does not alternate with `render_user_aliases`.
-    render_target_tpc: KBox<MappedObject>,
+    /// Native retains one render-target-memory owner. TMAP/HMTA rotate through
+    /// its four event-qualified records, while TPC has one stable mapping.
+    render_target_memory: KBox<G17PRenderTargetMemory>,
     /// Native's persistent, client-only scene scratch at 0x1000178000.
     scene_scratch: Option<MappedObject>,
     /// Native's persistent GPU-only discard object at 0x1000180000.
@@ -5704,10 +5771,9 @@ impl G17PUserRenderStorage {
         }
         // Follow the exact retained alias owners/constructor source offsets.
         // These compact addresses, not the generic backing allocation's DVA,
-        // are what the actual RCE arrays publish for TMAP/HMTA/AXFB.
+        // are what the actual RCE arrays publish for command-owned DEFLAKE/AXFB.
         for (instance, offset, mapping) in [
             (1, G17P_RENDER_STATE_DEFLAKE, &self.render_user_aliases.deflake),
-            (2, self.render_layout.tilemap, &self.render_user_aliases.rt_memory),
             (4, self.render_layout.aux_fb, &self.render_user_aliases.aux_fb),
         ] {
             let mut item = meta;
@@ -5718,13 +5784,41 @@ impl G17PUserRenderStorage {
             item.dva = mapping.iova();
             self.render_state.capture_trace_range(archive, item, offset, mapping.size(), clock)?;
         }
+        let rt_offset = g17p_render_rt_record_offset(self.descriptor_ordinal);
+        for (instance, offset, size, dva) in [
+            (
+                2,
+                rt_offset,
+                self.render_layout.tilemap_size,
+                self.render_target_memory.tilemap_va(self.descriptor_ordinal)?,
+            ),
+            (
+                6,
+                rt_offset
+                    + self.render_layout.heapmeta.checked_sub(self.render_layout.tilemap)
+                        .ok_or(EINVAL)?,
+                self.render_layout.heapmeta_size,
+                self.render_target_memory
+                    .heapmeta_va(self.descriptor_ordinal, &self.render_layout)?,
+            ),
+        ] {
+            let mut item = meta;
+            item.kind = TraceKind::RenderState;
+            item.context = context;
+            item.root = trace::ROOT_CONTEXT_LOW;
+            item.instance = instance;
+            item.dva = dva;
+            self.render_target_memory.rt_memory.capture_trace_range(
+                archive, item, offset, size, clock,
+            )?;
+        }
         let mut tpc_item = meta;
         tpc_item.kind = TraceKind::RenderState;
         tpc_item.context = context;
         tpc_item.root = trace::ROOT_CONTEXT_LOW;
         tpc_item.instance = 3;
-        tpc_item.dva = self.render_target_tpc.iova();
-        self.render_target_tpc.capture_trace_range(
+        tpc_item.dva = self.render_target_memory.tpc_va();
+        self.render_target_memory.tpc.capture_trace_range(
             archive,
             tpc_item,
             0,
@@ -6261,9 +6355,13 @@ impl G17PUserRenderStorage {
         {
             return Err(ERANGE);
         }
-        let render_target_tpc = bootstrap_stage!(
-            "persistent TPC allocation",
-            new_g17p_render_target_tpc(dev, vm, queue_pair)
+        let mut render_target_memory = bootstrap_stage!(
+            "persistent render-target-memory allocation",
+            new_g17p_render_target_memory(dev, vm, queue_pair)
+        );
+        let (render_target_tilemap, render_target_heapmeta) = bootstrap_stage!(
+            "render-target-memory record",
+            render_target_memory.prepare_rt_slot(submission_ordinal, &render_layout)
         );
         let mut render_state = bootstrap_stage!("state allocation", MappedObject::new_wc_in_range(
             dev,
@@ -6488,12 +6586,12 @@ impl G17PUserRenderStorage {
         }
         translated.parameters.ta_status = render_state_va + G17P_RENDER_STATE_TA_STATUS as u64;
         translated.parameters.fragment_status = fragment_status_low.iova();
-        translated.parameters.heapmeta = render_user_aliases.heapmeta_va(&render_layout)?;
-        translated.parameters.tpc = render_target_tpc.iova();
+        translated.parameters.heapmeta = render_target_heapmeta;
+        translated.parameters.tpc = render_target_memory.tpc_va();
         translated.parameters.aux_fb = render_user_aliases.aux_fb_va();
         translated.parameters.aux_fb_page_count = G17P_RENDER_AUX_FB_PAGE_COUNT;
         translated.parameters.aux_fb_flags = g17p_aux_fb_flags(translated.flags);
-        translated.parameters.tilemap = render_user_aliases.tilemap_va();
+        translated.parameters.tilemap = render_target_tilemap;
         if let Some(pm) = parameter_management.as_ref() {
             translated.parameters.parameter_buffer = pm.selected_scene_va();
             let (cycle, record_index) = pm.scene_registers(
@@ -7159,7 +7257,7 @@ impl G17PUserRenderStorage {
             render_layout,
             render_tvb,
             render_user_aliases,
-            render_target_tpc,
+            render_target_memory,
             scene_scratch,
             discard,
             parameter_management,
@@ -7538,10 +7636,15 @@ impl G17PUserRenderStorage {
         let render_layout =
             g17p_render_state_layout(&command.parameters, num_clusters).ok_or(EINVAL)?;
         if page_align(render_layout.tpc_size).ok_or(EOVERFLOW)?
-            > self.render_target_tpc.logical_size
+            > self.render_target_memory.tpc.logical_size
         {
             return Err(ERANGE);
         }
+        let (render_target_tilemap, render_target_heapmeta) = restage_step!(
+            "render-target-memory record",
+            self.render_target_memory
+                .prepare_rt_slot(submission_ordinal, &render_layout)
+        );
         let mut next_render_state = restage_step!("render-state allocation", MappedObject::new_wc_in_range(
             dev,
             vm,
@@ -7601,12 +7704,12 @@ impl G17PUserRenderStorage {
         }
         translated.parameters.ta_status = render_state_va + G17P_RENDER_STATE_TA_STATUS as u64;
         translated.parameters.fragment_status = self.fragment_status_low.iova();
-        translated.parameters.heapmeta = next_render_user_aliases.heapmeta_va(&render_layout)?;
-        translated.parameters.tpc = self.render_target_tpc.iova();
+        translated.parameters.heapmeta = render_target_heapmeta;
+        translated.parameters.tpc = self.render_target_memory.tpc_va();
         translated.parameters.aux_fb = next_render_user_aliases.aux_fb_va();
         translated.parameters.aux_fb_page_count = G17P_RENDER_AUX_FB_PAGE_COUNT;
         translated.parameters.aux_fb_flags = g17p_aux_fb_flags(translated.flags);
-        translated.parameters.tilemap = next_render_user_aliases.tilemap_va();
+        translated.parameters.tilemap = render_target_tilemap;
         if let Some(pm) = self.parameter_management.as_ref() {
             translated.parameters.parameter_buffer = pm.selected_scene_va();
             let (cycle, record_index) = pm.scene_registers(
@@ -8152,25 +8255,52 @@ impl G17PUserRenderStorage {
                 }
                 Ok(())
             };
-            copy_head(layout.tilemap, &mut tilemap)?;
-            copy_head(layout.heapmeta, &mut heapmeta)?;
             copy_head(layout.aux_fb, &mut axfb_head)?;
             copy_head(layout.aux_fb + 0x480, &mut axfb_480)?;
-            for (index, offset, size) in [
-                (0, layout.tilemap, layout.tilemap_size),
-                (1, layout.heapmeta, layout.heapmeta_size),
-                (3, layout.aux_fb, G17P_RENDER_STATE_AUX_FB_SIZE),
-            ] {
-                nonzero[index] = raw
-                    .get(offset..offset.checked_add(size).ok_or(EOVERFLOW)?)
+            nonzero[3] = raw
+                .get(
+                    layout.aux_fb
+                        ..layout
+                            .aux_fb
+                            .checked_add(G17P_RENDER_STATE_AUX_FB_SIZE)
+                            .ok_or(EOVERFLOW)?,
+                )
+                .ok_or(ERANGE)?
+                .iter()
+                .filter(|byte| **byte != 0)
+                .count();
+            Ok(())
+        });
+        let rt_offset = g17p_render_rt_record_offset(self.descriptor_ordinal);
+        let rt_read = self.render_target_memory.rt_memory.with_bytes_mut(|raw| {
+            let tilemap_start = rt_offset;
+            let heapmeta_start = rt_offset
+                .checked_add(layout.heapmeta.checked_sub(layout.tilemap).ok_or(EINVAL)?)
+                .ok_or(EOVERFLOW)?;
+            let mut read_region =
+                |start: usize, size: usize, out: &mut [u64; 8], count_index: usize| -> Result {
+                for (index, value) in out.iter_mut().enumerate() {
+                    let at = start.checked_add(index * 8).ok_or(EOVERFLOW)?;
+                    *value = u64::from_le_bytes(
+                        raw.get(at..at + 8)
+                            .ok_or(ERANGE)?
+                            .try_into()
+                            .map_err(|_| EINVAL)?,
+                    );
+                }
+                nonzero[count_index] = raw
+                    .get(start..start.checked_add(size).ok_or(EOVERFLOW)?)
                     .ok_or(ERANGE)?
                     .iter()
                     .filter(|byte| **byte != 0)
                     .count();
-            }
+                Ok(())
+            };
+            read_region(tilemap_start, layout.tilemap_size, &mut tilemap, 0)?;
+            read_region(heapmeta_start, layout.heapmeta_size, &mut heapmeta, 1)?;
             Ok(())
         });
-        let tpc_read = self.render_target_tpc.with_bytes_mut(|raw| {
+        let tpc_read = self.render_target_memory.tpc.with_bytes_mut(|raw| {
             for (index, value) in tpc.iter_mut().enumerate() {
                 let at = index.checked_mul(8).ok_or(EOVERFLOW)?;
                 *value = u64::from_le_bytes(
@@ -8188,10 +8318,10 @@ impl G17PUserRenderStorage {
                 .count();
             Ok(())
         });
-        let read = state_read.and(tpc_read);
-        // The tilemap/heapmeta heads above live in the command's render state;
-        // TPC lives in the persistent render-target-memory owner. The TILING
-        // VERTEX BUFFER is a separate object and was never
+        let read = state_read.and(rt_read).and(tpc_read);
+        // TMAP/HMTA rotate through the persistent render-target-memory ring;
+        // TPC lives in its separate stable mapping. The TILING VERTEX BUFFER
+        // is a separate object and was never
         // scanned, so "the tiler wrote nothing" could not be distinguished
         // from "the tiler wrote where we do not look" -- which matters,
         // because KTrace 0x43 reports status 3 (executed) for the TA and 4
@@ -8253,9 +8383,11 @@ impl G17PUserRenderStorage {
                     dev.as_ref(),
                     "G17P render RT[{}]: aliases tilemap={:#x} heapmeta={:#x} tpc={:#x} axfb={:#x} nonzero(T/H/P/A)={:?}\n",
                     label,
-                    self.render_user_aliases.tilemap_va(),
-                    self.render_user_aliases.heapmeta_va(&layout).unwrap_or(0),
-                    self.render_target_tpc.iova(),
+                    self.render_target_memory
+                        .tilemap_va(self.descriptor_ordinal).unwrap_or(0),
+                    self.render_target_memory
+                        .heapmeta_va(self.descriptor_ordinal, &layout).unwrap_or(0),
+                    self.render_target_memory.tpc_va(),
                     self.render_user_aliases.aux_fb_va(),
                     nonzero,
                 );
@@ -8497,8 +8629,9 @@ impl G17PUserRenderStorage {
             self.fragment_status.iova(),
             self.scene_scratch.as_ref().map_or(0, MappedObject::iova),
             self.discard.as_ref().map_or(0, MappedObject::iova),
-            self.render_user_aliases.tilemap_va(),
-            self.render_target_tpc.iova(),
+            self.render_target_memory
+                .tilemap_va(self.descriptor_ordinal).unwrap_or(0),
+            self.render_target_memory.tpc_va(),
             self.render_user_aliases.aux_fb_va(),
             self.render_tvb.as_ref().map_or(0, G17PRenderTvb::iova),
             self.render_tvb.as_ref().map_or(0, |_| {
@@ -8507,12 +8640,29 @@ impl G17PUserRenderStorage {
             self.fragment_rce.iova(),
             self.descriptor_3d_render.iova(),
             self.render_user_aliases.all_reachable_from(vm)
-                && (self.render_target_tpc.iova()
+                && (self.render_target_memory.tpc_va()
                     == g17p_render_tpc_va(self.queue_pair).unwrap_or(0))
-                && (self.render_target_tpc.logical_size >= self.render_layout.tpc_size)
+                && (self.render_target_memory.tpc.logical_size >= self.render_layout.tpc_size)
                 && vm.covers_range(
-                    self.render_target_tpc.iova(),
+                    self.render_target_memory.tpc_va(),
                     self.render_layout.tpc_size as u64,
+                    true,
+                    true,
+                )
+                && (self.render_target_memory.rt_memory.iova()
+                    == g17p_render_rt_memory_va(self.queue_pair).unwrap_or(0))
+                && vm.covers_range(
+                    self.render_target_memory
+                        .tilemap_va(self.descriptor_ordinal).unwrap_or(0),
+                    self.render_layout.tilemap_size as u64,
+                    true,
+                    true,
+                )
+                && vm.covers_range(
+                    self.render_target_memory
+                        .heapmeta_va(self.descriptor_ordinal, &self.render_layout)
+                        .unwrap_or(0),
+                    self.render_layout.heapmeta_size as u64,
                     true,
                     true,
                 )
@@ -15352,6 +15502,10 @@ impl G17ResourceOwner {
             G17P_RENDER_USER_ALIAS_START..G17P_RENDER_USER_ALIAS_END,
             GFP_KERNEL,
         )?;
+        reserved_ranges.push(
+            G17P_RENDER_RT_MEMORY_START..G17P_RENDER_RT_MEMORY_END,
+            GFP_KERNEL,
+        )?;
         for index in 0..G17P_NATIVE_TVB_BLOCK_PAGE_IDS.len() {
             let start = g17p_native_tvb_block_va(index).ok_or(EINVAL)?;
             let end = start
@@ -16588,6 +16742,11 @@ mod tests {
         assert_eq!(G17P_CL_LOW_VA_END, 0x71_0000_0000);
         assert_eq!(G17P_RENDER_USER_ALIAS_START, 0x10_0200_0000);
         assert_eq!(G17P_RENDER_USER_ALIAS_END, 0x10_0220_0000);
+        assert_eq!(G17P_RENDER_RT_EVENT_RECORD_COUNT, 4);
+        assert_eq!(G17P_RENDER_RT_REGION_STRIDE, 0x4_0000);
+        assert_eq!(G17P_RENDER_RT_MEMORY_START, 0x10_0220_0000);
+        assert_eq!(G17P_RENDER_RT_MEMORY_PAIR_SIZE, 0x10_0000);
+        assert_eq!(G17P_RENDER_RT_MEMORY_END, 0x10_0240_0000);
         assert_eq!(G17P_RENDER_SCENE_SCRATCH_VA, 0x10_0017_8000);
         assert_eq!(G17P_RENDER_SCENE_SCRATCH_MAPPING_SIZE, 0x8000);
         assert_eq!(G17P_RENDER_SCENE_SCRATCH_MAPPING_SIZE, G17P_PM_SCENE_SCRATCH_SIZE);
@@ -16614,6 +16773,11 @@ mod tests {
         assert_eq!(g17p_render_alias_slot(pair1, 0), Some(2));
         assert_eq!(g17p_render_alias_slot(pair1, 1), Some(3));
         assert_eq!(g17p_render_alias_slot(pair1, 2), Some(2));
+        assert_eq!(g17p_render_rt_memory_va(pair0), Some(0x10_0220_0000));
+        assert_eq!(g17p_render_rt_memory_va(pair1), Some(0x10_0230_0000));
+        assert_eq!(g17p_render_rt_record_offset(0), 0);
+        assert_eq!(g17p_render_rt_record_offset(3), 0xc_0000);
+        assert_eq!(g17p_render_rt_record_offset(4), 0);
         assert_eq!(g17p_render_scene_scratch_va(pair0), Some(0x10_0017_8000));
         assert_eq!(g17p_render_discard_va(pair0), Some(0x10_0018_0000));
         assert_eq!(g17p_render_page_list_va(pair0), Some(0x10_0019_0000));
