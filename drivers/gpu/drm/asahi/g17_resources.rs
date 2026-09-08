@@ -5058,6 +5058,107 @@ const G17P_PM_BLOCK_PAGE_BASE_TABLE_SIZE: usize =
 const G17P_PM_SHARED_CONTROL_SIZE: usize = 0x80;
 const G17P_PM_COUNTER_SIZE: usize = 4;
 
+// Circular BlockControl cursors. Native createParameterBufferBlock reads
+// total/+0 and firmware-read/+8, advances total modulo 0xd1a, and refuses to
+// collide with read. commitStagedUpdates publishes the staged total at +4.
+const G17P_PM_SHARED_TOTAL_CURSOR: usize = 0x00;
+const G17P_PM_SHARED_COMMITTED_CURSOR: usize = 0x04;
+const G17P_PM_SHARED_READ_CURSOR: usize = 0x08;
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+struct G17PPmControlCursors {
+    total: u32,
+    committed: u32,
+    read: u32,
+}
+
+fn g17p_pm_control_cursors(raw: &[u8], base: usize) -> Option<G17PPmControlCursors> {
+    let word = |offset: usize| {
+        let at = base.checked_add(offset)?;
+        Some(u32::from_le_bytes(
+            raw.get(at..at.checked_add(4)?)?.try_into().ok()?,
+        ))
+    };
+    Some(G17PPmControlCursors {
+        total: word(G17P_PM_SHARED_TOTAL_CURSOR)?,
+        committed: word(G17P_PM_SHARED_COMMITTED_CURSOR)?,
+        read: word(G17P_PM_SHARED_READ_CURSOR)?,
+    })
+}
+
+/// One validated bulk equivalent of native create/commit during TVB growth.
+///
+/// The physical allocation count is deliberately absent. These are circular
+/// ring cursors, so after firmware consumes a prefix the available inventory
+/// is `[read_cursor, target_cursor)`, not physical blocks `[0, count)`.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+struct G17PPmGrowthPlan {
+    read_cursor: usize,
+    producer_cursor: usize,
+    target_cursor: usize,
+    retained_blocks: usize,
+    added_blocks: usize,
+}
+
+impl G17PPmGrowthPlan {
+    fn available_blocks(&self) -> usize {
+        self.retained_blocks + self.added_blocks
+    }
+
+    fn available_slot(&self, ordinal: usize) -> Option<usize> {
+        if ordinal >= self.available_blocks() {
+            return None;
+        }
+        Some((self.read_cursor + ordinal) % G17P_PM_MAX_BLOCKS)
+    }
+
+    fn added_slot(&self, ordinal: usize) -> Option<usize> {
+        if ordinal >= self.added_blocks {
+            return None;
+        }
+        Some((self.producer_cursor + ordinal) % G17P_PM_MAX_BLOCKS)
+    }
+}
+
+fn g17p_pm_growth_plan(
+    read_cursor: u32,
+    committed_cursor: u32,
+    producer_cursor: u32,
+    added_blocks: usize,
+) -> Option<G17PPmGrowthPlan> {
+    let read_cursor = read_cursor as usize;
+    let committed_cursor = committed_cursor as usize;
+    let producer_cursor = producer_cursor as usize;
+    if added_blocks == 0
+        || read_cursor >= G17P_PM_MAX_BLOCKS
+        || committed_cursor >= G17P_PM_MAX_BLOCKS
+        || producer_cursor >= G17P_PM_MAX_BLOCKS
+        || committed_cursor != producer_cursor
+    {
+        return None;
+    }
+
+    let retained_blocks = if producer_cursor >= read_cursor {
+        producer_cursor - read_cursor
+    } else {
+        G17P_PM_MAX_BLOCKS - read_cursor + producer_cursor
+    };
+    let available_blocks = retained_blocks.checked_add(added_blocks)?;
+    // Native deliberately leaves one slot empty to distinguish full/empty.
+    if available_blocks >= G17P_PM_MAX_BLOCKS {
+        return None;
+    }
+    let target_cursor = producer_cursor.checked_add(added_blocks)? % G17P_PM_MAX_BLOCKS;
+
+    Some(G17PPmGrowthPlan {
+        read_cursor,
+        producer_cursor,
+        target_cursor,
+        retained_blocks,
+        added_blocks,
+    })
+}
+
 const G17P_PM_SCENE_COUNT: usize = 0x50;
 const G17P_PM_SCENE_ENTRY_SIZE: usize = 0x80;
 const G17P_PM_SCENE_TRAILER_SIZE: usize = 0x40;
@@ -15320,13 +15421,48 @@ impl G17ResourceOwner {
             .and_then(|count| u32::try_from(count).ok()).ok_or(EOVERFLOW)?;
         let logical_size=(blocks-1).checked_mul(G17P_RENDER_TVB_BLOCK_STRIDE)
             .and_then(|size| size.checked_add(G17P_RENDER_TVB_BLOCK_SIZE)).ok_or(EOVERFLOW)?;
-        let mut page_ids=KVec::with_capacity(blocks,GFP_KERNEL)?;
-        for block in 0..blocks {
-            page_ids.push(g17p_render_tvb_page_id(storage.queue_pair, block).ok_or(EINVAL)?,GFP_KERNEL)?;
+        let added_blocks=blocks.checked_sub(previous_blocks).ok_or(EINVAL)?;
+        let pm_layout=pm.layout;
+        let control=pm.backing.with_bytes_mut(|pm_raw| {
+            if pm_raw.len()<pm_layout.total_size { return Err(ERANGE); }
+            g17p_pm_control_cursors(pm_raw,pm_layout.shared_control).ok_or(ERANGE)
+        })?;
+        let ring=g17p_pm_growth_plan(control.read,control.committed,control.total,added_blocks)
+            .ok_or(EIO)?;
+        let available_pages=ring.available_blocks().checked_mul(G17P_PM_PAGES_PER_BLOCK)
+            .ok_or(EOVERFLOW)?;
+        let mut added_page_bases=KVec::with_capacity(added_blocks,GFP_KERNEL)?;
+        for added in 0..added_blocks {
+            let slot=ring.added_slot(added).ok_or(EIO)?;
+            let block=previous_blocks.checked_add(added).ok_or(EOVERFLOW)?;
+            let first=g17p_render_tvb_page_id(storage.queue_pair,block).ok_or(EINVAL)?;
+            first.checked_add((G17P_PM_PAGES_PER_BLOCK-1) as u32).ok_or(EOVERFLOW)?;
+            added_page_bases.push((slot,first),GFP_KERNEL)?;
         }
+        let mut rebuilt_page_list=KVec::with_capacity(available_pages,GFP_KERNEL)?;
+        pm.backing.with_bytes_mut(|pm_raw| {
+            if g17p_pm_control_cursors(pm_raw,pm_layout.shared_control)!=Some(control) {
+                return Err(EAGAIN);
+            }
+            for ordinal in 0..ring.available_blocks() {
+                let slot=ring.available_slot(ordinal).ok_or(EIO)?;
+                let first=if ordinal<ring.retained_blocks {
+                    let at=pm_layout.block_page_bases+slot*8;
+                    u32::from_le_bytes(pm_raw.get(at..at+4).ok_or(ERANGE)?
+                        .try_into().map_err(|_| ERANGE)?)
+                } else {
+                    let added=ordinal-ring.retained_blocks;
+                    added_page_bases[added].1
+                };
+                first.checked_add((G17P_PM_PAGES_PER_BLOCK-1) as u32).ok_or(EOVERFLOW)?;
+                for page in 0..G17P_PM_PAGES_PER_BLOCK {
+                    rebuilt_page_list.push(first+page as u32,GFP_KERNEL)?;
+                }
+            }
+            Ok(())
+        })?;
         let descriptor_offset=g17_submission::g17p_pbdesc_offset(pm.hardware_buffer_id);
         let page_list_address=pm.page_list_low_va();
-        let pm_layout=pm.layout;
         let descriptor=&mut self.resources.pb_descriptor_table;
         pm.backing.with_bytes_mut(|pm_raw| {
             descriptor.with_bytes_mut(|desc_raw| {
@@ -15334,37 +15470,46 @@ impl G17ResourceOwner {
                     if pm_raw.len()<pm_layout.total_size
                         || descriptor_end>desc_raw.len() || tvb.extensions.len()==tvb.extensions.capacity()
                     { return Err(ERANGE); }
+                    if g17p_pm_control_cursors(pm_raw,pm_layout.shared_control)!=Some(control) {
+                        return Err(EAGAIN);
+                    }
                     let mut previous=[0u32;4];
                     for (word,value) in previous.iter_mut().enumerate() {
                         let at=descriptor_offset+word*4;
                         *value=u32::from_le_bytes(desc_raw[at..at+4].try_into().map_err(|_| EINVAL)?);
                     }
+                    // buildPageList resets the host PBDesc ring state before
+                    // loadPBDesc. This growth-only reset is intentionally
+                    // distinct from an ordinary retained-owner switch.
                     let encoded=g17_submission::encode_g17p_pbdesc(previous,page_list_address,page_count,
                         g17_submission::G17PPbDescRingState::default());
                     // This is the last fallible step. Alias allocation/count
-                    // checking completes before any firmware-visible write.
+                    // and the complete circular page list are ready before
+                    // any firmware-visible write.
                     vm.append_render_pool_mappings(render_slot,pool_id,previous_blocks,blocks,growth.mappings)?;
-                    for (block,first) in page_ids.into_iter().enumerate() {
-                        put_u32(pm_raw,pm_layout.block_page_bases+block*8,first);
-                        for page in 0..G17P_PM_PAGES_PER_BLOCK {
-                            let at=(block*G17P_PM_PAGES_PER_BLOCK+page)*4;
-                            put_u32(pm_raw,pm_layout.page_list+at,first+page as u32);
-                        }
+                    for (slot,first) in added_page_bases.into_iter() {
+                        put_u32(pm_raw,pm_layout.block_page_bases+slot*8,first);
+                        put_u32(pm_raw,pm_layout.block_page_bases+slot*8+4,0);
                     }
-                    // AGXParameterManagement::buildPageList,8a71908: rebuild
-                    // the available inventory/cursors without clearing Scene
-                    // entries, firmware timestamps or the retained blocks.
+                    for (entry,value) in rebuilt_page_list.into_iter().enumerate() {
+                        put_u32(pm_raw,pm_layout.page_list+entry*4,value);
+                    }
+                    // buildPageList (25G83 0xfffffe0008a71908) walks the block
+                    // ring from shared +0x08 to the staged target, wrapping at
+                    // 0xd1a, then publishes those exact cursors at PBState
+                    // +0x40/+0x3c. It does not clear the unused page-list tail.
                     let state=pm_layout.hwpb_state;
                     put_u32(pm_raw,state+0x34,page_count);
-                    put_u32(pm_raw,state+0x3c,blocks as u32);
-                    put_u32(pm_raw,state+0x40,0);
+                    put_u32(pm_raw,state+0x3c,ring.target_cursor as u32);
+                    put_u32(pm_raw,state+0x40,ring.read_cursor as u32);
                     put_u32(pm_raw,state+0x54,page_count-1);
                     // Native createParameterBufferBlock advances total;
                     // commitStagedUpdates publishes the same committed end.
-                    // This retained owner never removes or reuses block-ring
-                    // slots, so the original firmware cursor remains intact.
-                    put_u32(pm_raw,pm_layout.shared_control,blocks as u32);
-                    put_u32(pm_raw,pm_layout.shared_control+4,blocks as u32);
+                    // Firmware alone owns +0x08, which remains unchanged.
+                    put_u32(pm_raw,pm_layout.shared_control+G17P_PM_SHARED_TOTAL_CURSOR,
+                        ring.target_cursor as u32);
+                    put_u32(pm_raw,pm_layout.shared_control+G17P_PM_SHARED_COMMITTED_CURSOR,
+                        ring.target_cursor as u32);
                     for (word,value) in encoded.into_iter().enumerate() {
                         put_u32(desc_raw,descriptor_offset+word*4,value);
                     }
