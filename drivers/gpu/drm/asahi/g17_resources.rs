@@ -7996,6 +7996,18 @@ impl G17PUserRenderStorage {
         drop(old_timestamps);
         drop(old_render_user_aliases);
         drop(old_render_state);
+        // The aliases above are replaced at fixed parity-selected VAs.  A
+        // render descriptor executes through its independently allocated
+        // application context, while KernelMapping::drop can invalidate only
+        // the VM's ordinary bind context.  Invalidate every TTBAT context
+        // rooted in this VM after the old leaves are removed and the new
+        // leaves are installed, before the caller publishes this descriptor.
+        // Otherwise the first reuse of a parity VA can observe the stale
+        // invalid/old translation left by the cold staging generation.
+        restage_step!(
+            "application-context TLB invalidate",
+            uat.flush_t8140_vm_contexts(vm)
+        );
         if g17p_retain_staging() {
             self.staging_descriptors = Some(next_descriptors);
         }

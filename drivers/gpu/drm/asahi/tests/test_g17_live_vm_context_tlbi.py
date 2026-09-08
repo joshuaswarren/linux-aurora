@@ -36,6 +36,47 @@ assert new_storage.index("self.address_space.uat.flush_t8140_vm_contexts(vm)?") 
     "self.stage_render_parameter_buffer_page_list(&mut storage)?"
 )
 
+restage = function(resources, "pub(crate) fn restage_command(")
+old_alias_drop = restage.index("drop(old_render_user_aliases);")
+old_state_drop = restage.index("drop(old_render_state);")
+restage_flush = restage.index("uat.flush_t8140_vm_contexts(vm)")
+assert old_alias_drop < restage_flush
+assert old_state_drop < restage_flush
+assert restage_flush < restage.index("self.staging_descriptors = Some(next_descriptors)")
+
+
+class ContextTlb:
+    def __init__(self):
+        self.cached = {}
+
+    def translate(self, context, page_table, va):
+        key = (context, va)
+        if key not in self.cached:
+            self.cached[key] = page_table.get(va)
+        return self.cached[key]
+
+    def flush(self, contexts):
+        self.cached = {
+            key: value for key, value in self.cached.items() if key[0] not in contexts
+        }
+
+
+# A cold fresh-storage image owns parity zero, then the first real odd ordinal
+# removes it.  The following even ordinal reuses exactly that VA.  Invalidating
+# only the bind context leaves the independently allocated render context with
+# its cached absent translation; matching-root invalidation exposes generation
+# two before its descriptor can be published.
+parity_even_tpc = 0x1002050000
+page_table = {parity_even_tpc: "cold"}
+tlb = ContextTlb()
+assert tlb.translate(9, page_table, parity_even_tpc) == "cold"
+del page_table[parity_even_tpc]
+tlb.flush({1})
+page_table[parity_even_tpc] = "ordinal-14"
+assert tlb.translate(9, page_table, parity_even_tpc) == "cold"
+tlb.flush({1, 9})
+assert tlb.translate(9, page_table, parity_even_tpc) == "ordinal-14"
+
 
 def contexts_for_root(entries, root):
     return [index for index, entry in enumerate(entries) if entry == (root, index)]
