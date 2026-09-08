@@ -6001,6 +6001,46 @@ mod tests {
     }
 
     #[test]
+    fn g17p_secondary_render_pair_matches_native_configure_words() {
+        let geometry = T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY;
+        let scratch = g17_manager::T8140_G17P_PLATFORM_CONFIG.sksm_scratch;
+        for (queue_id, data_master, entry, tag, payload, mask) in [
+            (
+                2,
+                G17P_TA_DATA_MASTER,
+                0x70_01f4_8000,
+                0x0000_1400_0002_1008,
+                0x1280_0070_01f4_8000,
+                0x4,
+            ),
+            (
+                3,
+                G17P_3D_DATA_MASTER,
+                0x70_01f7_0000,
+                0x0000_1c00_0002_1008,
+                0x2280_0070_01f7_0000,
+                0x8,
+            ),
+        ] {
+            let config = prepare_g17p_render_sksm_queue_config(
+                G17PComputeQueueRouting {
+                    queue_id,
+                    completion_selector: 0,
+                    entry_gpu_va: entry,
+                    geometry,
+                },
+                data_master,
+                scratch,
+            )
+            .unwrap();
+            assert_eq!(config.tag, tag);
+            assert_eq!(config.payload, payload);
+            assert_eq!(config.enable_pair.word0, 0);
+            assert_eq!(config.enable_pair.word1, mask);
+        }
+    }
+
+    #[test]
     fn g17p_render_config_update_carries_context_hardware_buffer_id_and_pid() {
         let addresses = G17PColdOpeningOptionalAddresses {
             context_scratch: 0x70_0200_0000,
