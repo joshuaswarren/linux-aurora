@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dead DRM queues reclaim drained render contexts without evicting live VMs."""
+"""Dead DRM queues leave a bounded graph that the next same-VM queue retargets."""
 
 from pathlib import Path
 
@@ -35,13 +35,13 @@ assert "install_active_render_slot_state(active)" in release
 assert "parked_render_slots.iter_mut().flatten()" in release
 assert "release_render_slot_context_owner" in release
 assert "state.retired_handoff_graph.take()" in release_slot
-assert "storage.take_sksm_backing()" in release_slot
-assert "backing = Some(backing)" in release_slot
-assert "let bind = state.bind.take()" in release_slot
-assert "let mut storage = state.storage.take()" in release_slot
-assert "storage.release_client_context()" in release_slot
 assert "snapshot.job_list_empty" in release_slot
 assert "quarantine_drained_render_graph" in release_slot
+assert "state.storage.take()" not in release_slot
+assert "state.bind.take()" not in release_slot
+handoff = function(manager, "pub(crate) fn handoff_retained_render_vm(")
+assert "same_vm_different_context" in handoff
+assert ".retarget_command_context(vm, execution_context.clone())" in handoff
 assert "released_render_contexts & (1u64 << context)" in preserve
 assert "manager.release_render_context_owner(context)" in runtime_release
 
@@ -55,9 +55,10 @@ class Slot:
     def release(self, context):
         if self.immediate == context:
             self.immediate = None
-        if self.active == context:
-            assert self.sksm
-            self.active = None
+
+    def retarget(self, context):
+        assert self.sksm
+        self.active = context
 
 
 class Owners:
@@ -68,14 +69,11 @@ class Owners:
 
     def create_and_destroy(self, context):
         slot = self.slots[context & 1]
-        slot.immediate = slot.active
         slot.active = context
-        if slot.immediate is not None:
-            self.retired.add(slot.immediate)
-        # Scheduler drain + queue destruction is the native workqueue-free
-        # boundary. It reclaims a matching selected graph immediately rather
-        # than relying on another future handoff to move it to `retired`.
+        # Scheduler drain leaves the completed physical graph intact. The next
+        # same-VM queue retargets its context without rebuilding fixed mappings.
         slot.release(context)
+        slot.retarget(context + 64)
         self.retired.discard(context)
         assert self.live == {5, 6}
 
@@ -85,17 +83,17 @@ for generation in range(32):
     owners.create_and_destroy(7 + generation % 4)
 assert owners.live == {5, 6}
 assert not owners.retired
-assert all(slot.active is None for slot in owners.slots)
+assert all(slot.active is not None for slot in owners.slots)
 
 # The exact leak seen on hardware was two selected plus two immediate graphs:
-# after all clients exited the UAT owner table still reported four BUSY roots.
-# Teardown must empty that topology without requiring a fifth handoff.
+# immediate graphs are reclaimed at their queue boundary while the two selected
+# physical-pair graphs remain bounded and reusable.
 leaked = Owners()
 leaked.slots[0].active, leaked.slots[0].immediate = 9, 7
 leaked.slots[1].active, leaked.slots[1].immediate = 10, 8
-for context in (7, 8, 9, 10):
+for context in (7, 8):
     for slot in leaked.slots:
         slot.release(context)
-assert all(slot.active is None and slot.immediate is None for slot in leaked.slots)
+assert all(slot.active is not None and slot.immediate is None for slot in leaked.slots)
 
-print("PASS 32 dead-client contexts and final 4-root topology reclaim at scheduler drain")
+print("PASS dead queues preserve two bounded graphs and same-VM contexts retarget in place")

@@ -7411,6 +7411,32 @@ impl G17PUserRenderStorage {
         self.descriptor_context_id
     }
 
+    /// Transfer an idle retained graph to another logical queue in the same
+    /// VM. The graph's fixed client mappings and parameter-management storage
+    /// belong to the VM, not to one queue context; rebuilding them at the same
+    /// addresses would collide with the still-retained firmware owner. The
+    /// command context, descriptor context, and MCache root selector are the
+    /// queue-owned pieces and are restaged before the next publication.
+    pub(crate) fn retarget_command_context(
+        &mut self,
+        vm: &mmu::Vm,
+        context: Arc<mmu::T8140ComputeExecutionContext>,
+    ) -> Result {
+        if !context.matches(vm) || !context.is_current() {
+            return Err(EFAULT);
+        }
+        let context_id = u16::try_from(context.context_id()).map_err(|_| EOVERFLOW)?;
+        if !Self::descriptor_context_valid(context_id) {
+            return Err(EINVAL);
+        }
+        let root_slot = u8::try_from(context.context_id()).map_err(|_| EOVERFLOW)?;
+        self._command_context = Some(G17PRenderCommandContext::Job(context));
+        self.descriptor_context_id = context_id;
+        self.render_root_slot = root_slot;
+        self.context_update_pending = true;
+        Ok(())
+    }
+
     pub(crate) fn complete_context_update(&mut self) {
         self.context_update_pending = false;
     }
