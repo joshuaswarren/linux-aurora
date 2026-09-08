@@ -666,7 +666,11 @@ fn log_g17p_halted_gmmu(
                     (snapshot.info_before >> 9) & 0xff,
                     (snapshot.info_before >> 17) & 0x3f,
                 );
-                manager.log_fault_address_candidates("halted-reason3", address_word);
+                manager.log_fault_address_candidates(
+                    "halted-reason3",
+                    address_word,
+                    ((snapshot.info_before >> 17) & 0x3f) as u8,
+                );
             } else {
                 dev_info!(
                     dev,
@@ -1014,12 +1018,15 @@ fn complete_primary_real_recovery(
         cause.host_recovery
     );
     if cause.fault_status != 0 && *module_parameters::g17p_fault_report.value() != 0 {
-        let mut faulting_addr_word = None;
+        let mut faulting_address = None;
         if let Some(registers) = registers {
             match registers.g17p_render_fault_irq_snapshot() {
                 Ok(Some(snapshot)) => {
                     if snapshot.fault_info & 1 != 0 {
-                        faulting_addr_word = Some(snapshot.fault_addr_word);
+                        faulting_address = Some((
+                            snapshot.fault_addr_word,
+                            ((snapshot.fault_info >> 17) & 0x3f) as u8,
+                        ));
                     }
                     dev_info!(
                     pdev.as_ref(),
@@ -1053,8 +1060,8 @@ fn complete_primary_real_recovery(
                 );
             }
         }
-        if let Some(addr_word) = faulting_addr_word {
-            manager.log_fault_address_candidates("recovery-state-1", addr_word);
+        if let Some((addr_word, vm_slot)) = faulting_address {
+            manager.log_fault_address_candidates("recovery-state-1", addr_word, vm_slot);
         }
     }
     if scheduler_active {
