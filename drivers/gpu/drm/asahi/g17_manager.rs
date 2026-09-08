@@ -3913,29 +3913,6 @@ impl G17PManagerConstruction {
         )
     }
 
-    /// Whether the selected non-bootstrap render pair still needs its first
-    /// direct KSMFE registration.
-    ///
-    /// The bootstrap pair is installed by the firmware's proven cold tag-15
-    /// path. Every other EventMachine pair is generic: its exact QIDs come
-    /// from `queue_pair`, never from an odd/even calculation. Its first use
-    /// needs the native synchronous `configureHardware` step before either
-    /// outer command can be exposed.
-    pub(crate) fn fresh_render_pair_needs_direct_registration(
-        &self,
-        queue_pair: g17_resources::G17PRenderQueuePair,
-    ) -> bool {
-        if *crate::module_parameters::g17p_render_sksm.value() == 0
-            || queue_pair.slot() == 0
-            || self.active_render_slot != queue_pair.slot()
-        {
-            return false;
-        }
-        self.render_sksm.as_ref().map_or(true, |queues| {
-            !queues.fragment.registered || !queues.tiling.registered
-        })
-    }
-
     /// Prepare the two render KSM kick queues without touching the hardware
     /// bridge: QID 0 (TA, data master 0) and QID 1 (3D, data master 1).
     ///
@@ -4728,6 +4705,7 @@ impl G17PManagerConstruction {
         user_timestamps: [u64; 4],
         user_timestamp_aliases: KVec<mmu::KernelMapping>,
         registers: &regs::Resources,
+        registration_power: &mut impl FnMut(&mut Self) -> Result,
     ) -> Result<g17_submission::PreparedG17PPartialOpeningWorkPair> {
         self.select_render_slot(queue_pair.slot())?;
         let descriptor_context_id = execution_context.context_id() as u16;
@@ -4814,6 +4792,7 @@ impl G17PManagerConstruction {
             user_timestamps,
             user_timestamp_aliases,
             registers,
+            registration_power,
         );
         if result.is_err() && !self.render_hardware_buffer_published {
             // acquire() stages a copy of the completed FList owner. Until
@@ -4842,6 +4821,7 @@ impl G17PManagerConstruction {
         user_timestamps: [u64; 4],
         user_timestamp_aliases: KVec<mmu::KernelMapping>,
         registers: &regs::Resources,
+        registration_power: &mut impl FnMut(&mut Self) -> Result,
     ) -> Result<g17_submission::PreparedG17PPartialOpeningWorkPair> {
         let render_sksm = *crate::module_parameters::g17p_render_sksm.value();
         let native_doorbell_mode =
@@ -5263,12 +5243,54 @@ impl G17PManagerConstruction {
                 );
             }
         }
-        self.configure_fresh_nonbootstrap_render_pair(
-            registers,
-            fragment_install,
-            tiling_install,
-        )
-        .map_err(|error| Self::render_stage_fail("configure-secondary-render-pair", error))?;
+        // Construction and validation above are CPU-only and can take several
+        // milliseconds on a dockchannel console.  Acquiring the powered KSMFE
+        // aperture before that work left a timing race: firmware could enter
+        // idle after the final power witness but before these four writes.
+        // Worse, an EAGAIN here returned after the command/SKSM producers had
+        // already been staged, so the userspace retry encountered a half-built
+        // ordinal-zero graph and poisoned this physical pair for every later
+        // client.  Native ensurePoweredHardware(true) brackets the actual
+        // configureHardware transaction.  Do the same: reacquire immediately
+        // at the transaction boundary and retry only the still-unpublished
+        // four-write registration, without restaging the command.
+        if queue_pair.slot() != 0 && (fragment_install || tiling_install.unwrap_or(false)) {
+            let mut configured = false;
+            for _ in 0..3 {
+                registration_power(self)
+                    .map_err(|error| Self::render_stage_fail(
+                        "power-secondary-render-pair", error,
+                    ))?;
+                match self.configure_fresh_nonbootstrap_render_pair(
+                    registers,
+                    fragment_install,
+                    tiling_install,
+                ) {
+                    Ok(()) => {
+                        configured = true;
+                        break;
+                    }
+                    Err(error) if error == EAGAIN => continue,
+                    Err(error) => return Err(Self::render_stage_fail(
+                        "configure-secondary-render-pair", error,
+                    )),
+                }
+            }
+            if !configured {
+                return Err(Self::render_stage_fail(
+                    "configure-secondary-render-pair", EAGAIN,
+                ));
+            }
+        } else {
+            self.configure_fresh_nonbootstrap_render_pair(
+                registers,
+                fragment_install,
+                tiling_install,
+            )
+            .map_err(|error| Self::render_stage_fail(
+                "configure-secondary-render-pair", error,
+            ))?;
+        }
         let pm_submission = self.render_storage.as_mut().ok_or(ENODEV)?
             .prepare_pm_submitted_operation()
             .map_err(|error| Self::render_stage_fail("prepare-pm-submitted-operation", error))?;

@@ -3909,6 +3909,14 @@ impl G17PLiveRuntime {
         submission_id: u64,
         error: Error,
     ) -> bool {
+        // Construction and direct-registration failures happen before a
+        // completion owner is installed. They have no published work to
+        // observe or abandon; probing the selected slot here manufactured an
+        // ENODEV "final watchdog" warning and obscured the original EAGAIN or
+        // EBUSY. Only an armed fence denotes a deferred render transaction.
+        if !self.render_fence_state.pending(render_slot) {
+            return false;
+        }
         // A firmware event can precede visibility of the final paired queue
         // cache lines. Recheck once at the scheduler's existing watchdog
         // boundary before declaring the device lost. This is not a polling
@@ -4181,41 +4189,40 @@ impl G17PLiveRuntime {
             .as_mut()
             .ok_or(ENODEV)?
             .select_render_slot(render_slot)?;
-        let needs_direct_registration = self
-            .manager
-            .as_ref()
-            .ok_or(ENODEV)?
-            .fresh_render_pair_needs_direct_registration(queue_pair);
-        if needs_direct_registration {
-            self.ensure_g17p_render_registration_power()?;
-        }
         let drm = self.drm.as_ref().ok_or(ENODEV)?.clone();
-        // Disjoint field borrows: `registers` and `manager` are separate fields,
-        // so a shared borrow of one alongside a mutable borrow of the other is
-        // accepted. The SKSM half of a render submit needs both.
-        let prepared = {
-            let registers = self.registers.as_ref().ok_or(ENODEV)?;
-            self.manager
-                .as_mut()
-                .ok_or(ENODEV)?
-                .begin_translated_render(
-                    &drm,
-                    vm,
-                    queue_pair,
-                    execution_context,
-                    command,
-                    timestamps,
-                    timestamp_aliases,
-                    registers,
-                )
-        };
+        // Temporarily own the manager and register aperture separately so the
+        // manager can ask the live runtime to perform ensurePoweredHardware at
+        // the exact configureHardware boundary.  The previous preamble did the
+        // power transaction before graph construction; verbose construction
+        // alone was long enough for firmware to close the aperture again.
+        let mut manager = self.manager.take().ok_or(ENODEV)?;
+        let registers = self.registers.take().ok_or(ENODEV)?;
+        let mut registration_powered = false;
+        let prepared = manager.begin_translated_render(
+            &drm,
+            vm,
+            queue_pair,
+            execution_context,
+            command,
+            timestamps,
+            timestamp_aliases,
+            &registers,
+            &mut |manager| {
+                registration_powered = false;
+                self.ensure_g17p_render_registration_power(manager, &registers)?;
+                registration_powered = true;
+                Ok(())
+            },
+        );
         // `ensurePoweredHardware(true)` is a scoped native prerequisite. The
-        // IdlePowerOff(0) disables firmware idle descent and is our scoped
-        // hold. Keep it asserted across graph construction and direct KSMFE
-        // registration, then restore ordinary idle policy before any work
+        // IdlePowerOff(0) disables firmware idle descent around the direct
+        // KSMFE registration. Restore ordinary idle policy before any work
         // doorbell.
-        if needs_direct_registration {
-            if let Err(error) = self.release_g17p_render_registration_power() {
+        if registration_powered {
+            if let Err(error) = self.release_g17p_render_registration_power(
+                &mut manager,
+                &registers,
+            ) {
                 if let Some(pdev) = self.pdev.as_ref() {
                     dev_warn!(
                         pdev.as_ref(),
@@ -4225,6 +4232,8 @@ impl G17PLiveRuntime {
                 }
             }
         }
+        self.manager = Some(manager);
+        self.registers = Some(registers);
         let prepared = prepared?;
         // Arm the exact fence after the tracker has been reset for this group,
         // but before any control or work doorbell can report its retirement.
@@ -5020,7 +5029,11 @@ impl G17PLiveRuntime {
     /// the closest firmware-level equivalent of native's retained power
     /// provider. The records run before render storage, QoS, tag-15, either
     /// outer command, or a completion fence is staged.
-    fn ensure_g17p_render_registration_power(&mut self) -> Result {
+    fn ensure_g17p_render_registration_power(
+        &mut self,
+        manager: &mut g17_manager::G17PManagerConstruction,
+        registers: &regs::Resources,
+    ) -> Result {
         let pdev = self.pdev.as_ref().cloned().ok_or(ENODEV)?;
         let providers_retained = self.cpus.is_some()
             && self.gfx_rtkit.is_some()
@@ -5042,15 +5055,14 @@ impl G17PLiveRuntime {
         }
         let acquire = (|| -> Result {
             for attempt in 0..3 {
-                let was_powered = self
-                    .registers
-                    .as_ref()
-                    .ok_or(ENODEV)?
-                    .g17p_sksm_configuration_port_powered();
+                let was_powered = registers.g17p_sksm_configuration_port_powered();
                 let wake = self.publish_g17p_render_registration_power_record(
+                    manager,
                     g17_initdata::DEVICE_CONTROL_IDLE_POWER_OFF_ARG_DISABLE_IDLE_AND_WAKE,
                 )?;
                 self.wait_g17p_render_registration_power_record(
+                    manager,
+                    registers,
                     wake.producer_after,
                     true,
                     "disable-idle-and-wake",
@@ -5062,9 +5074,12 @@ impl G17PLiveRuntime {
                 // powered steady-state path the first record is sufficient.
                 let hold_target = if !was_powered {
                     let hold = self.publish_g17p_render_registration_power_record(
+                        manager,
                         g17_initdata::DEVICE_CONTROL_IDLE_POWER_OFF_ARG_DISABLE_IDLE_AND_WAKE,
                     )?;
                     self.wait_g17p_render_registration_power_record(
+                        manager,
+                        registers,
                         hold.producer_after,
                         true,
                         "disable-idle-hold",
@@ -5073,12 +5088,7 @@ impl G17PLiveRuntime {
                 } else {
                     wake.producer_after
                 };
-                if self
-                    .registers
-                    .as_ref()
-                    .ok_or(ENODEV)?
-                    .g17p_sksm_configuration_port_powered()
-                {
+                if registers.g17p_sksm_configuration_port_powered() {
                     dev_info!(
                         pdev.as_ref(),
                         "G17P render registration: idle descent disabled through fresh pair construction (control target {}, attempt {})\n",
@@ -5098,20 +5108,17 @@ impl G17PLiveRuntime {
             // Balance a partial acquisition. Preserve the original error: the
             // release is best-effort because the control path itself may be
             // what failed.
-            let _ = self.release_g17p_render_registration_power();
+            let _ = self.release_g17p_render_registration_power(manager, registers);
         }
         acquire
     }
 
     fn publish_g17p_render_registration_power_record(
         &mut self,
+        manager: &mut g17_manager::G17PManagerConstruction,
         arg: u32,
     ) -> Result<g17_resources::G17PDeviceControlPublication> {
-        let publication = self
-            .manager
-            .as_mut()
-            .ok_or(ENODEV)?
-            .publish_primary_device_control_record(
+        let publication = manager.publish_primary_device_control_record(
                 g17_initdata::DEVICE_CONTROL_OPCODE_IDLE_POWER_OFF,
                 arg,
             )?;
@@ -5126,6 +5133,8 @@ impl G17PLiveRuntime {
 
     fn wait_g17p_render_registration_power_record(
         &mut self,
+        manager: &mut g17_manager::G17PManagerConstruction,
+        registers: &regs::Resources,
         target: u32,
         require_powered: bool,
         label: &'static str,
@@ -5140,18 +5149,8 @@ impl G17PLiveRuntime {
             // Firmware-event servicing can publish an FList release record;
             // doing that here would advance the same producer past `target`
             // and destroy the exact retirement witness.
-            let retired = self
-                .manager
-                .as_mut()
-                .ok_or(ENODEV)?
-                .control_counters()?
-                .primary
-                == [target; 3];
-            let powered = self
-                .registers
-                .as_ref()
-                .ok_or(ENODEV)?
-                .g17p_sksm_configuration_port_powered();
+            let retired = manager.control_counters()?.primary == [target; 3];
+            let powered = registers.g17p_sksm_configuration_port_powered();
             if retired && (!require_powered || powered) {
                 dev_info!(
                     pdev.as_ref(),
@@ -5165,12 +5164,8 @@ impl G17PLiveRuntime {
             }
             fsleep(Delta::from_millis(1));
         }
-        let counters = self.manager.as_mut().ok_or(ENODEV)?.control_counters()?;
-        let powered = self
-            .registers
-            .as_ref()
-            .ok_or(ENODEV)?
-            .g17p_sksm_configuration_port_powered();
+        let counters = manager.control_counters()?;
+        let powered = registers.g17p_sksm_configuration_port_powered();
         dev_err!(
             pdev.as_ref(),
             "G17P render registration: {} did not retire before construction (target={} counters={:?} powered={}); no pair publication attempted\n",
@@ -5182,14 +5177,21 @@ impl G17PLiveRuntime {
         Err(ETIMEDOUT)
     }
 
-    fn release_g17p_render_registration_power(&mut self) -> Result {
+    fn release_g17p_render_registration_power(
+        &mut self,
+        manager: &mut g17_manager::G17PManagerConstruction,
+        registers: &regs::Resources,
+    ) -> Result {
         let release = self.publish_g17p_render_registration_power_record(
+            manager,
             g17_initdata::DEVICE_CONTROL_IDLE_POWER_OFF_ARG_ENABLE_IDLE,
         )?;
         // Arg one restores the ordinary firmware idle policy. Do not make an
         // already prepared submission depend on the aperture remaining
         // powered after its direct registration completed.
         self.wait_g17p_render_registration_power_record(
+            manager,
+            registers,
             release.producer_after,
             false,
             "idle-release",
