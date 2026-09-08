@@ -37,7 +37,7 @@ impl Manager {
 '''+item(m,'    pub(crate) fn poll_independent_compute_completion(')+r'''
 }
 struct Completion{signals:AtomicUsize,error:AtomicUsize}
-impl Completion{fn complete(&self,r:Result<[u64;2]>){self.signals.fetch_add(1,Ordering::SeqCst);if r.is_err(){self.error.fetch_add(1,Ordering::SeqCst);}}}
+impl Completion{fn complete(&self,r:Result<[u64;2]>){self.signals.fetch_add(1,Ordering::SeqCst);if r.is_err(){self.error.fetch_add(1,Ordering::SeqCst);}}fn fail_while_owned(&self,e:Error){self.complete(Err(e));}}
 struct Packet{id:u64,completion:Arc<Completion>}
 impl Packet{fn submission_id(&self)->u64{self.id}fn completion(&self)->Result<&Completion>{Ok(&self.completion)}}
 struct Hold(Arc<AtomicUsize>);impl Hold{fn quarantine(&self){}}impl Drop for Hold{fn drop(&mut self){self.0.fetch_add(1,Ordering::SeqCst);}}

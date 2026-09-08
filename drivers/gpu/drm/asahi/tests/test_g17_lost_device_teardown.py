@@ -102,6 +102,7 @@ struct Completion{
  status_at_signal:RefCell<i32>,
 }
 impl Completion{
+ fn fail_while_owned(&self,error:Error){self.complete(Err(error));}
  fn complete(&self,result:Result){
   if let Err(error)=result{ self.status.record(error.to_errno()); }
   *self.status_at_signal.borrow_mut()=self.status.get();

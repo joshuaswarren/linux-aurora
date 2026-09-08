@@ -3970,8 +3970,10 @@ impl G17PLiveRuntime {
                     retired,
                 );
             }
-            signal.complete(Err(if retired { EIO } else { error }));
-            if !retired {
+            if retired {
+                signal.complete(Err(EIO));
+            } else {
+                signal.fail_while_owned(error);
                 if let Err(error) = self
                     .quarantined_render_completions
                     .push_within_capacity(signal)
