@@ -35,9 +35,9 @@ assert submit.index(".begin_translated_render(") < submit.index(
 assert submit.index("release_g17p_render_registration_power()") < submit.index(
     "self.install_render_completion("
 )
-assert "DEVICE_CONTROL_IDLE_POWER_OFF_ARG_INHIBIT" in ensure
+assert "DEVICE_CONTROL_IDLE_POWER_OFF_ARG_DISABLE_IDLE_AND_WAKE" in ensure
 assert "wait_g17p_render_registration_power_record" in ensure
-assert "DEVICE_CONTROL_IDLE_POWER_OFF_ARG_POWER_ON" in release
+assert "DEVICE_CONTROL_IDLE_POWER_OFF_ARG_ENABLE_IDLE" in release
 
 # Once a fresh storage exists, its UAT root is graph-owned even if the direct
 # registration precondition fails. The old ordering moved this owner only

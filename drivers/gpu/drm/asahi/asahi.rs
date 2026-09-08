@@ -205,7 +205,7 @@ kernel::module_platform_driver! {
         },
         g17p_power_hold: u32 {
             default: 0,
-            description: "After IdlePowerOff(0) powers the cores, publish a second device-control record with arg=1 to inhibit the firmware's idle power-down for the duration of the submit (1: on)",
+            description: "After IdlePowerOff(0) powers the cores, publish and announce a second arg=0 record so a cold configuration refresh cannot restore Region-C's idle-enable policy before the diagnostic submit (1: on)",
         },
         g17p_power_wire: u32 {
             default: 0,

@@ -4210,15 +4210,16 @@ impl G17PLiveRuntime {
                 )
         };
         // `ensurePoweredHardware(true)` is a scoped native prerequisite. The
-        // firmware's IdlePowerOff(1) record is our equivalent hold: keep it
-        // asserted across graph construction and direct KSMFE registration,
-        // then restore ordinary idle policy before any work doorbell.
+        // IdlePowerOff(0) disables firmware idle descent and is our scoped
+        // hold. Keep it asserted across graph construction and direct KSMFE
+        // registration, then restore ordinary idle policy before any work
+        // doorbell.
         if needs_direct_registration {
             if let Err(error) = self.release_g17p_render_registration_power() {
                 if let Some(pdev) = self.pdev.as_ref() {
                     dev_warn!(
                         pdev.as_ref(),
-                        "G17P render registration: failed to release scoped power hold ({:?}); keeping the cores inhibited\n",
+                        "G17P render registration: failed to restore ordinary idle policy ({:?}); idle descent remains disabled\n",
                         error,
                     );
                 }
@@ -5012,13 +5013,13 @@ impl G17PLiveRuntime {
     /// The GPU cores may nevertheless have independently entered firmware
     /// idle-off while the two processors remain alive. Linux has no IOGPU PM
     /// callback to hold that gate across queue construction, so publish the
-    /// firmware-proven IdlePowerOff(0) power request when necessary and then
-    /// an IdlePowerOff(1) inhibit record. The latter is the scoped equivalent
-    /// of native's retained power provider: it prevents the aperture from
-    /// disappearing between the preflight and the direct pair transaction.
-    /// Both records run before render storage, QoS, tag-15, either outer
-    /// command, or a completion fence is staged; failure therefore cannot
-    /// expose a partially registered pair to firmware.
+    /// firmware-proven IdlePowerOff(0) request and keep that zero policy in
+    /// force through the direct pair transaction. A cold wake can refresh the
+    /// policy from Region-C, whose native initial value enables idle descent,
+    /// so a second retired zero is required after the powered witness. This is
+    /// the closest firmware-level equivalent of native's retained power
+    /// provider. The records run before render storage, QoS, tag-15, either
+    /// outer command, or a completion fence is staged.
     fn ensure_g17p_render_registration_power(&mut self) -> Result {
         let pdev = self.pdev.as_ref().cloned().ok_or(ENODEV)?;
         let providers_retained = self.cpus.is_some()
@@ -5039,58 +5040,67 @@ impl G17PLiveRuntime {
             );
             return Err(EIO);
         }
-        // A power-on record stores zero into the idle policy before raising
-        // the cores, while the following inhibit stores one but does not raise
-        // an already-idle core. Observe retirement separately from the final
-        // powered state and repeat the pair if the core happened to descend in
-        // that narrow interval. Once inhibit has retired while powered, the
-        // state cannot disappear under graph construction.
-        for attempt in 0..3 {
-            if !self
-                .registers
-                .as_ref()
-                .ok_or(ENODEV)?
-                .g17p_sksm_configuration_port_powered()
-            {
-                let publication = self.publish_g17p_render_registration_power_record(
-                    g17_initdata::DEVICE_CONTROL_IDLE_POWER_OFF_ARG_POWER_ON,
+        let acquire = (|| -> Result {
+            for attempt in 0..3 {
+                let was_powered = self
+                    .registers
+                    .as_ref()
+                    .ok_or(ENODEV)?
+                    .g17p_sksm_configuration_port_powered();
+                let wake = self.publish_g17p_render_registration_power_record(
+                    g17_initdata::DEVICE_CONTROL_IDLE_POWER_OFF_ARG_DISABLE_IDLE_AND_WAKE,
                 )?;
                 self.wait_g17p_render_registration_power_record(
-                    publication.producer_after,
-                    false,
-                    "power-on",
+                    wake.producer_after,
+                    true,
+                    "disable-idle-and-wake",
                 )?;
-            }
 
-            let hold = self.publish_g17p_render_registration_power_record(
-                g17_initdata::DEVICE_CONTROL_IDLE_POWER_OFF_ARG_INHIBIT,
-            )?;
-            self.wait_g17p_render_registration_power_record(
-                hold.producer_after,
-                false,
-                "idle-inhibit",
-            )?;
-            if self
-                .registers
-                .as_ref()
-                .ok_or(ENODEV)?
-                .g17p_sksm_configuration_port_powered()
-            {
-                dev_info!(
-                    pdev.as_ref(),
-                    "G17P render registration: scoped GPU power hold active through fresh pair construction (control target {}, attempt {})\n",
-                    hold.producer_after,
-                    attempt + 1,
-                );
-                return Ok(());
+                // A cold wake runs the configuration refresh path, which may
+                // reload Region-C +0x30 after the opcode handler stored zero.
+                // Reassert zero only after the powered witness; on an already
+                // powered steady-state path the first record is sufficient.
+                let hold_target = if !was_powered {
+                    let hold = self.publish_g17p_render_registration_power_record(
+                        g17_initdata::DEVICE_CONTROL_IDLE_POWER_OFF_ARG_DISABLE_IDLE_AND_WAKE,
+                    )?;
+                    self.wait_g17p_render_registration_power_record(
+                        hold.producer_after,
+                        true,
+                        "disable-idle-hold",
+                    )?;
+                    hold.producer_after
+                } else {
+                    wake.producer_after
+                };
+                if self
+                    .registers
+                    .as_ref()
+                    .ok_or(ENODEV)?
+                    .g17p_sksm_configuration_port_powered()
+                {
+                    dev_info!(
+                        pdev.as_ref(),
+                        "G17P render registration: idle descent disabled through fresh pair construction (control target {}, attempt {})\n",
+                        hold_target,
+                        attempt + 1,
+                    );
+                    return Ok(());
+                }
             }
+            dev_err!(
+                pdev.as_ref(),
+                "G17P render registration: core did not remain powered with idle descent disabled; no pair publication attempted\n",
+            );
+            Err(EAGAIN)
+        })();
+        if acquire.is_err() {
+            // Balance a partial acquisition. Preserve the original error: the
+            // release is best-effort because the control path itself may be
+            // what failed.
+            let _ = self.release_g17p_render_registration_power();
         }
-        dev_err!(
-            pdev.as_ref(),
-            "G17P render registration: core did not remain powered after three ordered power-on/inhibit transactions; no pair publication attempted\n",
-        );
-        let _ = self.release_g17p_render_registration_power();
-        Err(EAGAIN)
+        acquire
     }
 
     fn publish_g17p_render_registration_power_record(
@@ -5174,11 +5184,11 @@ impl G17PLiveRuntime {
 
     fn release_g17p_render_registration_power(&mut self) -> Result {
         let release = self.publish_g17p_render_registration_power_record(
-            g17_initdata::DEVICE_CONTROL_IDLE_POWER_OFF_ARG_POWER_ON,
+            g17_initdata::DEVICE_CONTROL_IDLE_POWER_OFF_ARG_ENABLE_IDLE,
         )?;
-        // Arg zero restores the ordinary idle policy and idempotently requests
-        // power-on. Do not make an already prepared submission depend on the
-        // aperture remaining powered after its direct registration completed.
+        // Arg one restores the ordinary firmware idle policy. Do not make an
+        // already prepared submission depend on the aperture remaining
+        // powered after its direct registration completed.
         self.wait_g17p_render_registration_power_record(
             release.producer_after,
             false,
@@ -5221,8 +5231,8 @@ impl G17PLiveRuntime {
     /// This single fact explains three separate measured null results, which
     /// were each mistaken for a broken lever at the time:
     ///  * `g17p_power_wire=1` (preamble IdlePowerOff(0)) -- no effect;
-    ///  * `g17p_power_wire=1 g17p_power_hold=1` (the full record pair) -- no
-    ///    effect;
+    ///  * the old `g17p_power_wire=1 g17p_power_hold=1` implementation
+    ///    (`IdlePowerOff(0)` followed by `IdlePowerOff(1)`) -- no effect;
     ///  * `g17p_power_wire=2` (the record deferred until after the kick) -- no
     ///    effect.
     /// None of them failed. With the post-fault mask of `0xa` (bits 3|1) all
@@ -5307,7 +5317,7 @@ impl G17PLiveRuntime {
             .ok_or(ENODEV)?
             .publish_primary_device_control_record(
                 g17_initdata::DEVICE_CONTROL_OPCODE_IDLE_POWER_OFF,
-                g17_initdata::DEVICE_CONTROL_IDLE_POWER_OFF_ARG_POWER_ON,
+                g17_initdata::DEVICE_CONTROL_IDLE_POWER_OFF_ARG_DISABLE_IDLE_AND_WAKE,
             ) {
             Ok(publication) => publication,
             Err(error) => {
@@ -5343,13 +5353,9 @@ impl G17PLiveRuntime {
             );
             return Ok(());
         }
-        // The power-on above leaves `[0x177838]` at 0, which is one of the
-        // guards the scheduler's idle-off routine (`0x7ca0`) tests: each guard
-        // branches to `0x871c` = `mov w0,#1; ret` when set, an early return
-        // that skips the bit-1 acquire at `0x8228` -- i.e. skips closing the
-        // core power gate. So publish a second record with a non-zero arg to
-        // hold the gate open across the submit. It cannot be one record: the
-        // handler skips the power-on whenever the arg is non-zero.
+        // A zero policy already disables idle descent. If this diagnostic asks
+        // for an explicit hold, publish another zero after wake retirement so
+        // a cold configuration refresh cannot restore Region-C's default one.
         if *module_parameters::g17p_power_hold.value() != 0 {
             match self
                 .manager
@@ -5357,13 +5363,13 @@ impl G17PLiveRuntime {
                 .ok_or(ENODEV)?
                 .publish_primary_device_control_record(
                     g17_initdata::DEVICE_CONTROL_OPCODE_IDLE_POWER_OFF,
-                    g17_initdata::DEVICE_CONTROL_IDLE_POWER_OFF_ARG_INHIBIT,
+                    g17_initdata::DEVICE_CONTROL_IDLE_POWER_OFF_ARG_DISABLE_IDLE_AND_WAKE,
                 ) {
                 Ok(hold) => {
                     fence(Ordering::SeqCst);
                     dev_info!(
                         pdev.as_ref(),
-                        "G17P submit power: idle-off inhibit staged arg={} slot={} producer {}->{}\n",
+                        "G17P submit power: post-wake idle-disable staged arg={} slot={} producer {}->{}\n",
                         hold.arg,
                         hold.slot,
                         hold.producer_before,
@@ -5374,14 +5380,14 @@ impl G17PLiveRuntime {
                     {
                         dev_warn!(
                             pdev.as_ref(),
-                            "G17P submit power: inhibit announcement failed ({:?})\n",
+                            "G17P submit power: post-wake idle-disable announcement failed ({:?})\n",
                             error
                         );
                     }
                 }
                 Err(error) => dev_warn!(
                     pdev.as_ref(),
-                    "G17P submit power: idle-off inhibit not staged ({:?})\n",
+                    "G17P submit power: post-wake idle-disable not staged ({:?})\n",
                     error
                 ),
             }
