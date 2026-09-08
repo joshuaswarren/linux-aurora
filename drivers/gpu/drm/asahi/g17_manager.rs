@@ -3302,8 +3302,43 @@ impl G17PManagerConstruction {
     pub(crate) fn handoff_retained_render_vm(
         &mut self,
         vm: &mmu::Vm,
-        descriptor_context_id: u16,
+        execution_context: Arc<mmu::T8140ComputeExecutionContext>,
     ) -> Result {
+        let descriptor_context_id =
+            u16::try_from(execution_context.context_id()).map_err(|_| EOVERFLOW)?;
+        // Logical queues in one DRM VM receive independent descriptor
+        // contexts, but the retained RT/TVB/PM graph and all of its fixed
+        // client addresses belong to the VM. Once its previous pair is fully
+        // retired, retarget only the queue-owned context fields and preserve
+        // the graph. Rebuilding it in the same VM would collide with the
+        // firmware-retained mappings that deliberately survive queue close.
+        let same_vm_different_context = self.render_storage.as_ref().is_some_and(|storage| {
+            storage.descriptor_context_id() != descriptor_context_id
+                && self
+                    .render_bind
+                    .as_ref()
+                    .is_some_and(|binding| binding.matches(vm))
+                && storage.first_unreachable(self.resources.uat(), vm).is_none()
+        });
+        if same_vm_different_context {
+            self.require_retired_render_owner()?;
+            self.render_storage
+                .as_mut()
+                .ok_or(ENODEV)?
+                .retarget_command_context(vm, execution_context.clone())?;
+            self.render_bind = Some(G17PRenderRootOwner::Job {
+                context: execution_context,
+            });
+            self.render_context_aliases = None;
+            dev_info!(
+                self.resources.dev().as_ref(),
+                "G17P render owner handoff: retained VM {} graph on pair {} retargeted to descriptor context {}\n",
+                vm.id(),
+                self.active_render_slot,
+                descriptor_context_id,
+            );
+            return Ok(());
+        }
         // A pre-publication failure can leave this slot with no selected graph
         // while its previous graphs remain safely cached. Search that cache
         // before treating the slot as genuinely empty: constructing over a
@@ -3530,11 +3565,11 @@ impl G17PManagerConstruction {
 
         // G17PQueue::drop calls this only after destroying the render
         // scheduler entity. Therefore no packet carrying this context can
-        // still be pending. Keep the installed physical QID's SKSM backing in
-        // the slot, but retire every client-owned mapping/root now. Deferring
-        // this until another handoff leaked one active graph plus one
-        // immediate predecessor per physical pair when the final client went
-        // away.
+        // still be pending. Keep the complete idle graph on its physical pair:
+        // its fixed RT/TVB/PM mappings are VM-owned and cannot be rebuilt at
+        // the same addresses while the firmware-lifetime owner is retained.
+        // The next queue in this VM retargets the context fields in place; a
+        // different VM takes the ordinary graph-handoff path below.
         if !retired_witness
             || state.tracker.is_some()
             || state.hardware_buffer_id.is_some()
@@ -3550,39 +3585,14 @@ impl G17PManagerConstruction {
         if state.sksm.as_ref().ok_or(EIO)?.backing.is_some() {
             return Err(EIO);
         }
-        let bind = state.bind.take().ok_or(EIO)?;
-        let mut storage = state.storage.take().ok_or(EIO)?;
-        let backing = match storage.take_sksm_backing() {
-            Ok(backing) => backing,
-            Err(error) => {
-                state.bind = Some(bind);
-                state.storage = Some(storage);
-                return Err(error);
-            }
-        };
-        state.sksm.as_mut().ok_or(EIO)?.backing = Some(backing);
-        storage.release_client_context();
-        let graph = G17PRetiredRenderGraph {
-            bind,
-            context_aliases: state.context_aliases.take(),
-            storage,
-        };
-        Self::quarantine_drained_render_graph(
-            ids,
-            retired_parameter_managers,
-            retired_firmware_render_storages,
-            Some(graph),
-        );
         state.auxiliary_timestamp = 0;
         Ok(())
     }
 
-    /// Reclaim every graph belonging to a DRM queue after its scheduler
-    /// entity has drained. Native frees the work queue at this boundary;
-    /// unlike finite completion-ring eviction, queue destruction proves no
-    /// new descriptor from this context can be published. The queue-address
-    /// stable SKSM backing stays installed, while the firmware-high PM owner
-    /// follows the established processor-stop quarantine.
+    /// Mark every graph belonging to a DRM queue after its scheduler entity
+    /// has drained. Completed active graphs remain installed on their bounded
+    /// physical pairs and can be retargeted to the next queue in the same VM;
+    /// already-retired graphs still follow processor-stop quarantine.
     pub(crate) fn release_render_context_owner(&mut self, context: u16) {
         if context >= 64 { return; }
         self.released_render_contexts |= 1u64 << context;

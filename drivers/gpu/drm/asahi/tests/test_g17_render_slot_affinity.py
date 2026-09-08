@@ -59,7 +59,8 @@ manager = (Path(__file__).resolve().parents[1] / 'g17_manager.rs').read_text()
 handoff_start = manager.index('pub(crate) fn handoff_retained_render_vm(')
 handoff_end = manager.index('    fn preserve_immediate_retired_render_graph(', handoff_start)
 handoff = manager[handoff_start:handoff_end]
-assert 'descriptor_context_id: u16' in handoff
+assert 'execution_context: Arc<mmu::T8140ComputeExecutionContext>' in handoff
+assert 'u16::try_from(execution_context.context_id())' in handoff
 assert 'retained_graph_matches_owner(graph, vm, descriptor_context_id)' in handoff
 matcher_start = manager.index('fn retained_graph_matches_owner(')
 matcher_end = manager.index('    /// The retained graph and global aliases', matcher_start)

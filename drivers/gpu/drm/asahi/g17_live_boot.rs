@@ -4166,7 +4166,7 @@ impl G17PLiveRuntime {
         self.manager
             .as_mut()
             .ok_or(ENODEV)?
-            .handoff_retained_render_vm(vm, descriptor_context_id)?;
+            .handoff_retained_render_vm(vm, execution_context.clone())?;
         let recycle = self
             .manager
             .as_ref()
