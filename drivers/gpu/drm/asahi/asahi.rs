@@ -541,10 +541,5 @@ kernel::module_platform_driver! {
             // permissions: 0,
             description: "G17P SKSM port MMIO (0: suppressed, 1: enabled). Host writes to                           sgx+0x4090/0x4098 take an asynchronous SError on J700; the whole                           sgx 0x0..0x2ffff range is unreachable from the AP. Default off so                           the driver stays alive; set 1 only to re-test the port.",
         },
-        g17p_render_direct_config: u32 {
-            default: 0,
-            // permissions: 0,
-            description: "Require both queues of a fresh secondary G17P render pair to be directly configured while GPC is powered before publishing either outer command. This leaves compute/AddKicks MMIO suppressed. 0: firmware tag-15 installation only; 1: strict secondary-pair direct configuration.",
-        },
     },
 }
