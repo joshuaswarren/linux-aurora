@@ -2650,6 +2650,8 @@ F:	drivers/rtc/rtc-macsmc.c
 F:	drivers/soc/apple/*
 F:	drivers/spi/spi-apple.c
 F:	drivers/spmi/spmi-apple-controller.c
+F:	drivers/thermal/apple-pmp-thermal.c
+F:	drivers/thermal/apple-smc-cpu-thermal.c
 F:	drivers/usb/dwc3/dwc3-apple.c
 F:	drivers/usb/typec/tipd/spmi.c
 F:	drivers/video/backlight/apple_dwi_bl.c

@@ -30,6 +30,8 @@ typedef uint64_t u64;
 #define FIELD_PREP(m,v) (((u64)(v) << __builtin_ctzll(m)) & (m))
 struct cpufreq_frequency_table { unsigned int driver_data; };
 struct cpufreq_policy { void *driver_data; struct cpufreq_frequency_table *freq_table; };
+struct apple_smc_thermal_cpu;
+static void apple_smc_thermal_cpu_fault(struct apple_smc_thermal_cpu *cpu) { (void)cpu; }
 static u64 command, written;
 static unsigned int reads, writes, mode;
 static u64 sample(void) {
@@ -64,8 +66,13 @@ int main(void) {
     assert(written == (0xa550000000400102ULL | BIT(25)));
     assert(apple_soc_cpufreq_set_target(&policy, 0) == 0 && writes == 2);
     for (unsigned int state = 0; state <= 32; state++) {
-        if (state == 1 || state == 2) continue;
         reset(&p); table[0].driver_data = state;
+        if (state >= 1 && state <= 31) {
+            assert(apple_soc_cpufreq_set_target(&policy, 0) == 0);
+            assert(FIELD_GET(APPLE_DVFS_CMD_PS1, command) == state);
+            assert((command & ~31ULL) == 0xa550000000400100ULL);
+            continue;
+        }
         assert(apple_soc_cpufreq_set_target(&policy, 0) == -EINVAL);
         assert(reads == 0 && writes == 0);
     }
