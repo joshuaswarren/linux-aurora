@@ -90,6 +90,9 @@ impl G17PJobCompletion {
         if self.signalled.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
             return;
         }
+        if let Some(vm_job) = self.vm_job.lock().as_ref() {
+            vm_job.quarantine();
+        }
         self.status.record(error.to_errno());
         self.fence.set_error(error);
         self.fence.signal();
