@@ -2421,6 +2421,12 @@ impl G17PManagerConstruction {
         Ok(())
     }
 
+    pub(crate) fn activate_render_global_context(&self) -> Result {
+        self.resources
+            .uat()
+            .activate_t8140_render_global_context()
+    }
+
     pub(crate) fn control_opening_effect(
         &mut self,
     ) -> Result<g17_resources::G17PControlOpeningEffect> {

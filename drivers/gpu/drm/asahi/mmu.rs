@@ -3983,6 +3983,57 @@ impl Uat {
                 == (high[1] | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT))
     }
 
+    /// Activate the device-global render FList root before the first user
+    /// submission. The boot path has no driver-owned bootstrap render, so the
+    /// later bootstrap-retirement restore hook is not reached in the normal
+    /// UAPI stage; leaving context 1 on `kernel_lower_vm` makes gUPM's first
+    /// operand-table read fault at 0x7000208000.
+    pub(crate) fn activate_t8140_render_global_context(&self) -> Result {
+        if self.cfg != UatConfig::T8140 {
+            return Err(EINVAL);
+        }
+        let empty = self.t8140_empty_high_roots.as_ref().ok_or(EIO)?;
+        let kernel_low = self.kernel_lower_vm.ttb();
+        let global_low = self.t8140_render_global_vm()?.ttb();
+        let source_high = self.kernel_vm.ttb();
+        let phase = self.t8140_context_phase.load(Ordering::Acquire);
+        let expected_high = match phase {
+            T8140_CONTEXT_BOOTSTRAP_SOURCE_HIGH => source_high,
+            T8140_CONTEXT_BOOTSTRAP_EMPTY_HIGH => empty[1].ttb(),
+            _ => return Err(EBUSY),
+        };
+        let inner = self.inner.lock();
+        inner.handoff().lock();
+        let ttbs = inner.ttbs();
+        let ready = ttbs[0].ttb0.load(Ordering::Acquire) == (kernel_low | TTBR_VALID)
+            && ttbs[1].ttb0.load(Ordering::Acquire)
+                == (kernel_low | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT))
+            && ttbs[1].ttb1.load(Ordering::Acquire)
+                == (expected_high | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT));
+        if !ready {
+            inner.handoff().unlock();
+            return Err(EIO);
+        }
+        ttbs[1].ttb0.store(
+            global_low | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT),
+            Ordering::Release,
+        );
+        self.t8140_context_phase
+            .store(T8140_CONTEXT_USER_OWNED, Ordering::Release);
+        inner.handoff().unlock();
+        core::mem::drop(inner);
+
+        fence(Ordering::SeqCst);
+        mem::tlbi_asid(1);
+        mem::sync();
+        dev_info!(
+            self.dev.as_ref(),
+            "MMU: context 1 activated with global render FList root {:#x}\n",
+            global_low,
+        );
+        Ok(())
+    }
+
     /// Confirm the post-opening first-work split. Unlike a steady-state user
     /// bind, the driver-owned bootstrap graph still names firmware-high
     /// objects, so both active slots retain the populated source high root.
