@@ -3430,6 +3430,23 @@ impl G17PLiveRuntime {
         }
     }
 
+    /// Queue destruction runs after the render scheduler entity has drained,
+    /// so no submission carrying this descriptor context can remain pending.
+    /// Retire inactive graph/root owners now; a selected graph is marked for
+    /// release by its next ordinary VM handoff.
+    pub(crate) fn release_render_owner(&mut self, owner: u64, context: u16) {
+        let Some(manager) = self.manager.as_mut() else { return };
+        manager.release_render_context_owner(context);
+        if let Some(pdev) = self.pdev.as_ref() {
+            dev_info!(
+                pdev.as_ref(),
+                "G17P render: client queue {} released descriptor context {} after scheduler drain\n",
+                owner,
+                context,
+            );
+        }
+    }
+
     /// Make the hardware compute graph fit for a first bind by a new client.
     ///
     /// NOTE: both modes below re-run the FIRST-BIND chronology on the next
