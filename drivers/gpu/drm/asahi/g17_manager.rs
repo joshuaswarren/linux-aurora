@@ -1185,8 +1185,8 @@ pub(crate) struct G17PManagerConstruction {
     /// the first observed global drain for these references.
     retired_parameter_managers: KVec<g17_resources::G17PRetiredParameterManagement>,
     /// Descriptor contexts whose owning DRM queue has been destroyed after
-    /// its scheduler entity drained. A still-active graph is kept until its
-    /// next handoff; inactive graphs can be reclaimed immediately.
+    /// its scheduler entity drained. The bit also prevents a graph which was
+    /// concurrently moved into the retirement cache from escaping teardown.
     released_render_contexts: u64,
     render_submission_ordinal: u32,
     /// Per-command host timestamp shared by the TA and 3D KSM entries. Native
@@ -3458,12 +3458,85 @@ impl G17PManagerConstruction {
         Ok(())
     }
 
-    /// Reclaim graphs belonging to a DRM queue after its scheduler entity has
-    /// drained. Native frees the work queue at this boundary; unlike finite
-    /// completion-ring eviction, queue destruction proves no new descriptor
-    /// from this context can be published. The currently selected graph is
-    /// marked and released by the next ordinary handoff, which preserves its
-    /// installed physical-QID backing until a replacement is ready.
+    fn release_render_slot_context_owner(
+        ids: &mut G17PHardwareBufferIdAllocator,
+        retired_parameter_managers: &mut KVec<
+            g17_resources::G17PRetiredParameterManagement,
+        >,
+        state: &mut G17PRenderSlotState,
+        context: u16,
+        retired_witness: bool,
+    ) -> Result {
+        let matches = |graph: &G17PRetiredRenderGraph| {
+            graph.storage.descriptor_context_id() == context
+        };
+        if state.retired_handoff_graph.as_ref().is_some_and(matches) {
+            let graph = state.retired_handoff_graph.take();
+            Self::release_retired_handoff_graph(ids, retired_parameter_managers, graph);
+        }
+
+        if !state
+            .storage
+            .as_ref()
+            .is_some_and(|storage| storage.descriptor_context_id() == context)
+        {
+            return Ok(());
+        }
+
+        // G17PQueue::drop calls this only after destroying the render
+        // scheduler entity. Therefore no packet carrying this context can
+        // still be pending. Keep the installed physical QID's SKSM backing in
+        // the slot, but retire every client-owned mapping/root now. Deferring
+        // this until another handoff leaked one active graph plus one
+        // immediate predecessor per physical pair when the final client went
+        // away.
+        if !retired_witness
+            || state.tracker.is_some()
+            || state.hardware_buffer_id.is_some()
+            || state.hardware_buffer_published
+            || state.bind.is_none()
+        {
+            return Err(EBUSY);
+        }
+        let snapshot = state.storage.as_mut().ok_or(EIO)?.snapshot()?;
+        if !snapshot.job_list_empty || !snapshot.tiling.idle() || !snapshot.fragment.idle() {
+            return Err(EBUSY);
+        }
+        if state.sksm.as_ref().ok_or(EIO)?.backing.is_some() {
+            return Err(EIO);
+        }
+        let bind = state.bind.take().ok_or(EIO)?;
+        let mut storage = state.storage.take().ok_or(EIO)?;
+        let backing = match storage.take_sksm_backing() {
+            Ok(backing) => backing,
+            Err(error) => {
+                state.bind = Some(bind);
+                state.storage = Some(storage);
+                return Err(error);
+            }
+        };
+        state.sksm.as_mut().ok_or(EIO)?.backing = Some(backing);
+        storage.release_client_context();
+        let graph = G17PRetiredRenderGraph {
+            bind,
+            context_aliases: state.context_aliases.take(),
+            storage,
+        };
+        Self::release_retired_handoff_graph(
+            ids,
+            retired_parameter_managers,
+            Some(graph),
+        );
+        state.auxiliary_timestamp = 0;
+        Ok(())
+    }
+
+    /// Reclaim every graph belonging to a DRM queue after its scheduler
+    /// entity has drained. Native frees the work queue at this boundary;
+    /// unlike finite completion-ring eviction, queue destruction proves no
+    /// new descriptor from this context can be published. The queue-address
+    /// stable SKSM backing stays installed, while the firmware-high PM owner
+    /// follows the established processor-stop quarantine.
     pub(crate) fn release_render_context_owner(&mut self, context: u16) {
         if context >= 64 { return; }
         self.released_render_contexts |= 1u64 << context;
@@ -3492,15 +3565,43 @@ impl G17PManagerConstruction {
                 );
             }
         }
+
+        // Move the selected slot through the same helper as parked slots so
+        // there is only one ownership transaction to audit.
+        let active_matches = self
+            .render_storage
+            .as_ref()
+            .is_some_and(|storage| storage.descriptor_context_id() == context);
+        let active_retired = !active_matches || self.require_retired_render_owner().is_ok();
+        let mut active = self.take_active_render_slot_state();
+        let active_release = Self::release_render_slot_context_owner(
+            &mut self.render_hardware_buffer_ids,
+            &mut self.retired_parameter_managers,
+            &mut active,
+            context,
+            active_retired,
+        );
+        self.install_active_render_slot_state(active);
+
+        let mut release_error = active_release.err();
         for state in self.parked_render_slots.iter_mut().flatten() {
-            if state.retired_handoff_graph.as_ref().is_some_and(matches) {
-                let graph = state.retired_handoff_graph.take();
-                Self::release_retired_handoff_graph(
-                    &mut self.render_hardware_buffer_ids,
-                    &mut self.retired_parameter_managers,
-                    graph,
-                );
+            if let Err(error) = Self::release_render_slot_context_owner(
+                &mut self.render_hardware_buffer_ids,
+                &mut self.retired_parameter_managers,
+                state,
+                context,
+                true,
+            ) {
+                release_error = Some(error);
             }
+        }
+        if let Some(error) = release_error {
+            dev_err!(
+                self.resources.dev().as_ref(),
+                "G17P render: drained descriptor context {} still owns active scheduler state ({:?}); retaining its graph\n",
+                context,
+                error,
+            );
         }
     }
 
