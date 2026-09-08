@@ -5419,17 +5419,64 @@ impl G17PManagerConstruction {
     /// VM maps the page, and every mapped run within +/-1 MiB of it. A
     /// candidate that abuts or falls just outside a live run is the real
     /// address; one that lands in empty space at every scale is not.
-    pub(crate) fn log_fault_address_candidates(&mut self, label: &'static str, addr_word: u64) {
-        let Some(bind) = self.render_bind.as_ref() else {
+    fn render_bind_for_root_slot(
+        &self,
+        root_slot: u8,
+    ) -> Option<(&G17PRenderRootOwner, &'static str)> {
+        let matches = |bind: &G17PRenderRootOwner| {
+            matches!(bind.root_slot(), Ok(slot) if slot == root_slot)
+        };
+        if let Some(bind) = self.render_bind.as_ref().filter(|bind| matches(bind)) {
+            return Some((bind, "active"));
+        }
+        if let Some(graph) = self
+            .retired_render_handoff_graph
+            .as_ref()
+            .filter(|graph| matches(&graph.bind))
+        {
+            return Some((&graph.bind, "active-quarantine"));
+        }
+        for state in self.parked_render_slots.iter().flatten() {
+            if let Some(bind) = state.bind.as_ref().filter(|bind| matches(bind)) {
+                return Some((bind, "parked"));
+            }
+            if let Some(graph) = state
+                .retired_handoff_graph
+                .as_ref()
+                .filter(|graph| matches(&graph.bind))
+            {
+                return Some((&graph.bind, "parked-quarantine"));
+            }
+        }
+        None
+    }
+
+    pub(crate) fn log_fault_address_candidates(
+        &self,
+        label: &'static str,
+        addr_word: u64,
+        fault_vm_slot: u8,
+    ) {
+        let Some((bind, owner)) = self.render_bind_for_root_slot(fault_vm_slot) else {
             dev_info!(
                 self.resources.dev().as_ref(),
-                "G17P fault address[{}]: no retained render bind to walk\n",
+                "G17P fault address[{}]: no retained render bind for fault vm-slot {}\n",
                 label,
+                fault_vm_slot,
             );
             return;
         };
         let vm = bind.vm();
         let dev = self.resources.dev().clone();
+        dev_info!(
+            dev.as_ref(),
+            "G17P fault address[{}]: walking {} owner vm={} root={:#x} vm-slot={}\n",
+            label,
+            owner,
+            bind.vm_id(),
+            bind.root(),
+            fault_vm_slot,
+        );
         let candidates = [
             ("raw", addr_word),
             ("shift6", (addr_word & ((1u64 << 42) - 1)) << 6),
