@@ -5405,35 +5405,41 @@ impl G17PManagerConstruction {
     ///
     /// The G14X fault-address register is documented as VA >> 6, but that
     /// reading and the raw one cannot be told apart from a fault inside the
-    /// first page. Report both candidates against the client root: whether the
-    /// VM maps the page, and every mapped run within +/-1 MiB of it. A
+    /// first page. The GMMU report's VM slot is the descriptor/application
+    /// context, not the ordinary VM bind slot. Resolve the retained storage by
+    /// that exact context before walking its owner. Then report whether the
+    /// selected VM maps the page and every mapped run within +/-1 MiB of it. A
     /// candidate that abuts or falls just outside a live run is the real
     /// address; one that lands in empty space at every scale is not.
-    fn render_bind_for_root_slot(
+    fn render_bind_for_descriptor_context(
         &self,
-        root_slot: u8,
+        descriptor_context_id: u8,
     ) -> Option<(&G17PRenderRootOwner, &'static str)> {
-        let matches = |bind: &G17PRenderRootOwner| {
-            matches!(bind.root_slot(), Ok(slot) if slot == root_slot)
+        let matches = |storage: &g17_resources::G17PUserRenderStorage| {
+            storage.descriptor_context_id() == u16::from(descriptor_context_id)
         };
-        if let Some(bind) = self.render_bind.as_ref().filter(|bind| matches(bind)) {
-            return Some((bind, "active"));
+        if self.render_storage.as_ref().is_some_and(matches) {
+            if let Some(bind) = self.render_bind.as_ref() {
+                return Some((bind, "active"));
+            }
         }
         if let Some(graph) = self
             .retired_render_handoff_graph
             .as_ref()
-            .filter(|graph| matches(&graph.bind))
+            .filter(|graph| matches(&graph.storage))
         {
             return Some((&graph.bind, "active-quarantine"));
         }
         for state in self.parked_render_slots.iter().flatten() {
-            if let Some(bind) = state.bind.as_ref().filter(|bind| matches(bind)) {
-                return Some((bind, "parked"));
+            if state.storage.as_ref().is_some_and(matches) {
+                if let Some(bind) = state.bind.as_ref() {
+                    return Some((bind, "parked"));
+                }
             }
             if let Some(graph) = state
                 .retired_handoff_graph
                 .as_ref()
-                .filter(|graph| matches(&graph.bind))
+                .filter(|graph| matches(&graph.storage))
             {
                 return Some((&graph.bind, "parked-quarantine"));
             }
@@ -5447,10 +5453,10 @@ impl G17PManagerConstruction {
         addr_word: u64,
         fault_vm_slot: u8,
     ) {
-        let Some((bind, owner)) = self.render_bind_for_root_slot(fault_vm_slot) else {
+        let Some((bind, owner)) = self.render_bind_for_descriptor_context(fault_vm_slot) else {
             dev_info!(
                 self.resources.dev().as_ref(),
-                "G17P fault address[{}]: no retained render bind for fault vm-slot {}\n",
+                "G17P fault address[{}]: no retained render bind for descriptor context {}\n",
                 label,
                 fault_vm_slot,
             );

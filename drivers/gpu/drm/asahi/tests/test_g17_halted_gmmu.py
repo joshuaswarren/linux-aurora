@@ -27,7 +27,11 @@ assert "0xd918" not in method and "0x1_0a" not in method
 live = (root / "g17_live_boot.rs").read_text()
 assert "report.state, report.host_requested, report.reason" in live
 manager = (root / "g17_manager.rs").read_text()
-assert "render_bind_for_root_slot(fault_vm_slot)" in manager
+assert "render_bind_for_descriptor_context(fault_vm_slot)" in manager
+selector = manager[manager.index("fn render_bind_for_descriptor_context("):]
+selector = selector[:selector.index("\n    pub(crate) fn log_fault_address_candidates(")]
+assert "storage.descriptor_context_id() == u16::from(descriptor_context_id)" in selector
+assert ".root_slot()" not in selector
 assert "self.render_bind.as_ref().vm()" not in manager
 assert "snapshot.info_before >> 17" in live
 assert "snapshot.fault_info >> 17" in live
