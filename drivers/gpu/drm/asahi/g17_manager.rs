@@ -1178,6 +1178,12 @@ pub(crate) struct G17PManagerConstruction {
     /// has overwritten the descriptor pointer. Only stopping both processors
     /// proves that firmware can no longer name the context/root.
     retired_render_handoff_graphs: KVec<G17PRetiredRenderGraph>,
+    /// Firmware background PB maintenance retains manager pointers beyond the
+    /// command queue's paired completion and userspace queue destruction. Keep
+    /// only those firmware-high PM backings here; their client aliases and
+    /// VmBind owners are released with the graph. Both processors stopping is
+    /// the first observed global drain for these references.
+    retired_parameter_managers: KVec<g17_resources::G17PRetiredParameterManagement>,
     /// Descriptor contexts whose owning DRM queue has been destroyed after
     /// its scheduler entity drained. A still-active graph is kept until its
     /// next handoff; inactive graphs can be reclaimed immediately.
@@ -1869,6 +1875,8 @@ impl G17PManagerConstruction {
         // between dropping a firmware-visible graph and allocating memory.
         let retired_render_handoff_graphs =
             KVec::with_capacity(G17P_TA_HARDWARE_BUFFER_ID_COUNT, GFP_KERNEL)?;
+        let retired_parameter_managers =
+            KVec::with_capacity(G17P_TA_HARDWARE_BUFFER_ID_COUNT, GFP_KERNEL)?;
 
         #[cfg(CONFIG_DEV_COREDUMP)]
         let trace_capture = if *module_parameters::g17p_binary_capture.value() != 0 {
@@ -1908,6 +1916,7 @@ impl G17PManagerConstruction {
                 render_context_aliases: None,
                 retired_render_handoff_graph: None,
                 retired_render_handoff_graphs,
+                retired_parameter_managers,
                 released_render_contexts: 0,
                 render_submission_ordinal: 0,
                 render_auxiliary_timestamp: 0,
@@ -3101,6 +3110,7 @@ impl G17PManagerConstruction {
             }
             Self::release_retired_handoff_graph(
                 &mut self.render_hardware_buffer_ids,
+                &mut self.retired_parameter_managers,
                 state.retired_handoff_graph.take(),
             );
             // Both firmware CPUs are stopped; dropping the complete state now
@@ -3133,14 +3143,17 @@ impl G17PManagerConstruction {
         self.render_context_aliases = None;
         Self::release_retired_handoff_graph(
             &mut self.render_hardware_buffer_ids,
+            &mut self.retired_parameter_managers,
             self.retired_render_handoff_graph.take(),
         );
         while let Some(retired) = self.retired_render_handoff_graphs.pop() {
             Self::release_retired_handoff_graph(
                 &mut self.render_hardware_buffer_ids,
+                &mut self.retired_parameter_managers,
                 Some(retired),
             );
         }
+        self.retired_parameter_managers.clear();
         self.released_render_contexts = 0;
         self.render_sksm = None;
         self.bootstrap_uma = None;
@@ -3430,6 +3443,7 @@ impl G17PManagerConstruction {
         if context < 64 && self.released_render_contexts & (1u64 << context) != 0 {
             Self::release_retired_handoff_graph(
                 &mut self.render_hardware_buffer_ids,
+                &mut self.retired_parameter_managers,
                 Some(previous),
             );
             return Ok(());
@@ -3458,7 +3472,11 @@ impl G17PManagerConstruction {
         };
         if self.retired_render_handoff_graph.as_ref().is_some_and(matches) {
             let graph = self.retired_render_handoff_graph.take();
-            Self::release_retired_handoff_graph(&mut self.render_hardware_buffer_ids, graph);
+            Self::release_retired_handoff_graph(
+                &mut self.render_hardware_buffer_ids,
+                &mut self.retired_parameter_managers,
+                graph,
+            );
         }
         let mut index = 0;
         while index < self.retired_render_handoff_graphs.len() {
@@ -3469,6 +3487,7 @@ impl G17PManagerConstruction {
             if let Ok(graph) = self.retired_render_handoff_graphs.remove(index) {
                 Self::release_retired_handoff_graph(
                     &mut self.render_hardware_buffer_ids,
+                    &mut self.retired_parameter_managers,
                     Some(graph),
                 );
             }
@@ -3478,6 +3497,7 @@ impl G17PManagerConstruction {
                 let graph = state.retired_handoff_graph.take();
                 Self::release_retired_handoff_graph(
                     &mut self.render_hardware_buffer_ids,
+                    &mut self.retired_parameter_managers,
                     graph,
                 );
             }
@@ -3494,13 +3514,40 @@ impl G17PManagerConstruction {
 
     fn release_retired_handoff_graph(
         ids: &mut G17PHardwareBufferIdAllocator,
+        retired_parameter_managers: &mut KVec<
+            g17_resources::G17PRetiredParameterManagement,
+        >,
         retired: Option<G17PRetiredRenderGraph>,
     ) {
-        let Some(retired) = retired else { return };
+        let Some(mut retired) = retired else { return };
+        Self::quarantine_retired_parameter_management(
+            retired_parameter_managers,
+            retired.storage.take_retired_parameter_management(),
+        );
         if let Some(id) = retired.storage.retained_hardware_buffer_id() {
             ids.unreserve(id);
         }
         drop(retired);
+    }
+
+    fn quarantine_retired_parameter_management(
+        retired_parameter_managers: &mut KVec<
+            g17_resources::G17PRetiredParameterManagement,
+        >,
+        manager: Option<g17_resources::G17PRetiredParameterManagement>,
+    ) {
+        if let Some(manager) = manager {
+            if let Err(error) = retired_parameter_managers.push_within_capacity(manager) {
+                // Never free a firmware-reachable backing merely because the
+                // preallocated quarantine has reached its diagnostic bound.
+                // The mapping is intentionally leaked until module teardown;
+                // dropping it here reproduces the observed GFX PC 0x95f0 UAF.
+                core::mem::forget(error.0);
+                pr_err!(
+                    "G17P render: retired PM quarantine exhausted; retaining firmware backing permanently\n"
+                );
+            }
+        }
     }
 
     /// Rebuild a retained graph whose ring producer no longer matches the
@@ -3544,6 +3591,14 @@ impl G17PManagerConstruction {
         let vm_id = self.render_bind.as_ref().map_or(0, |binding| binding.vm_id());
         self.park_render_sksm_backing_for_graph_rebuild()?;
         self.render_storage.as_mut().ok_or(ENODEV)?.release_client_context();
+        let retired_manager = self
+            .render_storage
+            .as_mut()
+            .and_then(g17_resources::G17PUserRenderStorage::take_retired_parameter_management);
+        Self::quarantine_retired_parameter_management(
+            &mut self.retired_parameter_managers,
+            retired_manager,
+        );
         self.render_bind = None;
         self.render_context_aliases = None;
         self.unreserve_render_storage_hardware_buffer_id();

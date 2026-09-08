@@ -5358,6 +5358,16 @@ struct G17PParameterManagement {
     manager_generation: u64,
 }
 
+/// Firmware may retain a parameter-buffer manager pointer after the owning
+/// userspace queue has drained and its TA/3D pair has completed. Keep the
+/// opaque high mapping alive without retaining the client VM, bind context or
+/// fixed low aliases. The stopped-processor boundary is currently the first
+/// proven point at which these background firmware references are gone.
+#[cfg(not(test))]
+pub(crate) struct G17PRetiredParameterManagement {
+    _backing: MappedObject,
+}
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 struct G17PPmSubmittedOperationPlan {
     offset: usize,
@@ -7495,6 +7505,24 @@ impl G17PUserRenderStorage {
         // This checked, monotonic native GID reservation is unique to this
         // retained graph, even if its GPU addresses are reused after reset.
         u64::from(self.lifecycle_predecessor)
+    }
+
+    pub(crate) fn take_retired_parameter_management(
+        &mut self,
+    ) -> Option<G17PRetiredParameterManagement> {
+        self.parameter_management.take().map(|manager| {
+            // The client page-list presentation is rooted through the
+            // retiring VmBind and is not what the firmware crash named.
+            // Destructure the manager so that only its firmware-high backing
+            // survives; all scalar metadata and the low alias are released.
+            let G17PParameterManagement {
+                _page_list_low,
+                backing,
+                ..
+            } = manager;
+            drop(_page_list_low);
+            G17PRetiredParameterManagement { _backing: backing }
+        })
     }
 
     fn take_persistent_client_mappings(&mut self) -> Result<KVec<mmu::KernelMapping>> {
