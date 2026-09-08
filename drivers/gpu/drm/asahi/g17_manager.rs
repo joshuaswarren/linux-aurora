@@ -226,6 +226,86 @@ fn g17p_render_slot_globals() -> u32 {
     *module_parameters::g17p_render_slot_globals.value()
 }
 
+const G17P_COMMAND_BUFFER_STATE_COUNT: usize = 64;
+const G17P_COMMAND_BUFFER_EXCLUDED_STATE: usize = 63;
+
+/// Host mirror of the native AGXShared command-buffer-state allocator.
+///
+/// Native keeps a full u32 allocation sequence at Shared +0x180 and a
+/// 64-entry event array at +0x190. Candidate state is `sequence & 63`; state
+/// 63 is skipped, and a state whose prior event has not completed is scanned
+/// past under the Shared lock. The selected 36-object command-buffer ring is
+/// a separate object lifetime: its selected object merely records the full
+/// sequence word. Linux serializes this manager already, so exact live tags
+/// are sufficient to model event availability without another lock.
+#[derive(Debug, Clone)]
+struct G17PCommandBufferStateAllocator {
+    next: u32,
+    live: [Option<u32>; G17P_COMMAND_BUFFER_STATE_COUNT],
+}
+
+impl G17PCommandBufferStateAllocator {
+    const fn new() -> Self {
+        Self {
+            next: 0,
+            live: [None; G17P_COMMAND_BUFFER_STATE_COUNT],
+        }
+    }
+
+    fn allocate_one(&mut self) -> Option<u32> {
+        let mut candidate = self.next;
+        for _ in 0..G17P_COMMAND_BUFFER_STATE_COUNT {
+            let state = (candidate as usize) & (G17P_COMMAND_BUFFER_STATE_COUNT - 1);
+            if state != G17P_COMMAND_BUFFER_EXCLUDED_STATE && self.live[state].is_none() {
+                self.live[state] = Some(candidate);
+                self.next = candidate.wrapping_add(1);
+                return Some(candidate);
+            }
+            candidate = candidate.wrapping_add(1);
+            self.next = candidate;
+        }
+        None
+    }
+
+    fn allocate_pair(&mut self) -> Option<[u32; 2]> {
+        let first = self.allocate_one()?;
+        match self.allocate_one() {
+            Some(second) => Some([first, second]),
+            None => {
+                let _ = self.release_one(first);
+                None
+            }
+        }
+    }
+
+    fn release_one(&mut self, word: u32) -> bool {
+        let state = (word as usize) & (G17P_COMMAND_BUFFER_STATE_COUNT - 1);
+        if state == G17P_COMMAND_BUFFER_EXCLUDED_STATE || self.live[state] != Some(word) {
+            return false;
+        }
+        self.live[state] = None;
+        true
+    }
+
+    fn release_pair(&mut self, words: [u32; 2]) -> bool {
+        // Validate both identities before mutating either slot. A stale
+        // completion must never release a wrapped replacement state.
+        let states = words.map(|word| {
+            (word as usize) & (G17P_COMMAND_BUFFER_STATE_COUNT - 1)
+        });
+        if states[0] == states[1]
+            || states.contains(&G17P_COMMAND_BUFFER_EXCLUDED_STATE)
+            || self.live[states[0]] != Some(words[0])
+            || self.live[states[1]] != Some(words[1])
+        {
+            return false;
+        }
+        self.live[states[0]] = None;
+        self.live[states[1]] = None;
+        true
+    }
+}
+
 #[derive(Debug, Clone)]
 struct G17PHardwareBufferIdAllocator {
     free: [u64; 2],
@@ -1130,6 +1210,12 @@ pub(crate) struct G17PManagerConstruction {
     /// a post-publication failure must retain it until the CPUs stop.
     render_hardware_buffer_published: bool,
     render_hardware_buffer_ids: G17PHardwareBufferIdAllocator,
+    /// AGXShared/session-wide command-buffer state sequence and the exact
+    /// TA/3D pair held by each bounded live render owner. These identities do
+    /// not move with the active-slot scratch fields: a parked slot may still
+    /// be executing and therefore keeps both event states unavailable.
+    render_command_buffer_states: G17PCommandBufferStateAllocator,
+    render_command_buffer_state_pairs: [Option<[u32; 2]>; 2],
     /// Whether this firmware session has published a render on the
     /// device-global outer data-master channels. The outer ring entry's
     /// "channel started" byte describes those shared channels, not the slot
@@ -1711,6 +1797,31 @@ impl G17PManagerConstruction {
         Ok(())
     }
 
+    fn allocate_active_render_command_buffer_states(&mut self) -> Result<[u32; 2]> {
+        let slot = self.active_render_slot as usize;
+        if self.render_command_buffer_state_pairs[slot].is_some() {
+            return Err(EBUSY);
+        }
+        let words = self
+            .render_command_buffer_states
+            .allocate_pair()
+            .ok_or(EBUSY)?;
+        self.render_command_buffer_state_pairs[slot] = Some(words);
+        Ok(words)
+    }
+
+    fn release_active_render_command_buffer_states(&mut self) -> Result {
+        let slot = self.active_render_slot as usize;
+        let words = self.render_command_buffer_state_pairs[slot]
+            .take()
+            .ok_or(EIO)?;
+        if !self.render_command_buffer_states.release_pair(words) {
+            self.render_command_buffer_state_pairs[slot] = Some(words);
+            return Err(EIO);
+        }
+        Ok(())
+    }
+
     fn parked_render_scheduler_active(&self) -> bool {
         self.parked_render_slots
             .iter()
@@ -1811,6 +1922,8 @@ impl G17PManagerConstruction {
                 render_hardware_buffer_id: None,
                 render_hardware_buffer_published: false,
                 render_hardware_buffer_ids: G17PHardwareBufferIdAllocator::new(),
+                render_command_buffer_states: G17PCommandBufferStateAllocator::new(),
+                render_command_buffer_state_pairs: [None, None],
                 render_outer_channels_started: false,
                 render_sksm: None,
                 bootstrap_uma: None,
@@ -2385,6 +2498,11 @@ impl G17PManagerConstruction {
                     None,
                     &command,
                     self.num_clusters,
+                    // The driver-owned opening command has its own Shared
+                    // state owner. Its first TA/3D pair uses native tags 0/1;
+                    // user command buffers allocate from the session owner
+                    // below and are not advanced by this bootstrap object.
+                    [0, 1],
                     [0; 4],
                     KVec::new(),
                     0,
@@ -3032,6 +3150,8 @@ impl G17PManagerConstruction {
         self.next_render_pm_manager_generation =
             g17_resources::G17P_PM_INITIAL_HWPB_MANAGER_GENERATION;
         self.render_parameter_buffer_owner = 0;
+        self.render_command_buffer_states = G17PCommandBufferStateAllocator::new();
+        self.render_command_buffer_state_pairs = [None, None];
         self.active_render_slot = 0;
     }
 
@@ -4180,6 +4300,16 @@ impl G17PManagerConstruction {
         };
         self.render_hardware_buffer_id = Some(hardware_buffer_id);
         self.render_hardware_buffer_published = false;
+        let command_buffer_state_words = match self.allocate_active_render_command_buffer_states() {
+            Ok(words) => words,
+            Err(error) => {
+                self.render_hardware_buffer_id = None;
+                self.render_hardware_buffer_ids
+                    .release(hardware_buffer_id)
+                    .map_err(|_| EIO)?;
+                return Err(error);
+            }
+        };
 
         let mut command = *command;
         command.parameters.ta_hardware_buffer_id = hardware_buffer_id;
@@ -4199,6 +4329,7 @@ impl G17PManagerConstruction {
             descriptor_context_id,
             &command,
             parameter_buffer_token,
+            command_buffer_state_words,
             user_timestamps,
             user_timestamp_aliases,
             registers,
@@ -4210,6 +4341,7 @@ impl G17PManagerConstruction {
             // fallible PM allocation leaves every later VM handoff EBUSY.
             self.prepared_render_flist = None;
             self.render_auxiliary_timestamp = 0;
+            self.release_active_render_command_buffer_states()?;
             let id = self.render_hardware_buffer_id.take().ok_or(EIO)?;
             self.render_hardware_buffer_ids.release(id).map_err(|_| EIO)?;
         }
@@ -4225,6 +4357,7 @@ impl G17PManagerConstruction {
         descriptor_context_id: u16,
         command: &g17_uapi::TranslatedRenderCommand,
         parameter_buffer_token: u64,
+        command_buffer_state_words: [u32; 2],
         user_timestamps: [u64; 4],
         user_timestamp_aliases: KVec<mmu::KernelMapping>,
         registers: &regs::Resources,
@@ -4376,6 +4509,7 @@ impl G17PManagerConstruction {
                     parameter_page_list_vas,
                     command,
                     self.num_clusters,
+                    command_buffer_state_words,
                     user_timestamps,
                     Some(user_timestamp_aliases),
                     self.render_submission_ordinal,
@@ -4413,6 +4547,7 @@ impl G17PManagerConstruction {
                 Some(render_root_slot),
                 command,
                 self.num_clusters,
+                command_buffer_state_words,
                 user_timestamps,
                 user_timestamp_aliases,
                 self.render_submission_ordinal,
@@ -4461,6 +4596,7 @@ impl G17PManagerConstruction {
                         parameter_page_list_vas,
                         command,
                         self.num_clusters,
+                        command_buffer_state_words,
                         user_timestamps,
                         None,
                         self.render_submission_ordinal,
@@ -6010,6 +6146,7 @@ impl G17PManagerConstruction {
                 self.render_hardware_buffer_ids
                     .release(hardware_buffer_id)
                     .map_err(|_| EIO)?;
+                self.release_active_render_command_buffer_states()?;
                 if let (Some(queues), Some((ta, fragment))) = (self.render_sksm.as_mut(), retired_sksm) {
                     queues.tiling.producer = ta;
                     queues.fragment.producer = fragment;
@@ -6142,6 +6279,7 @@ impl G17PManagerConstruction {
         self.render_hardware_buffer_ids
             .release(hardware_buffer_id)
             .map_err(|_| EIO)?;
+        self.release_active_render_command_buffer_states()?;
         if let (Some(queues), Some((ta, fragment))) = (self.render_sksm.as_mut(), retired_sksm) {
             queues.tiling.producer = ta;
             queues.fragment.producer = fragment;
@@ -8249,6 +8387,42 @@ mod tests {
             allocator.release(G17P_TA_HARDWARE_BUFFER_ID_COUNT as u32),
             Err(G17PHardwareBufferIdError::InvalidId)
         );
+    }
+
+    #[test]
+    fn command_buffer_state_allocator_is_shared_monotonic_and_skips_63() {
+        let mut allocator = G17PCommandBufferStateAllocator::new();
+        for expected in (0u32..62).step_by(2) {
+            let pair = allocator.allocate_pair().unwrap();
+            assert_eq!(pair, [expected, expected + 1]);
+            assert!(allocator.release_pair(pair));
+        }
+        assert_eq!(allocator.allocate_pair(), Some([62, 64]));
+        assert!(allocator.release_pair([62, 64]));
+
+        allocator.next = 128;
+        let replacement = allocator.allocate_pair().unwrap();
+        assert_eq!(replacement, [128, 129]);
+        // An ABA/stale completion cannot release the wrapped replacement.
+        assert!(!allocator.release_pair([0, 1]));
+        assert!(allocator.release_pair(replacement));
+
+        let mut full = G17PCommandBufferStateAllocator::new();
+        for _ in 0..31 {
+            assert!(full.allocate_pair().is_some());
+        }
+        // One usable state remains, but a TA/3D reservation is atomic.
+        assert_eq!(full.allocate_pair(), None);
+    }
+
+    #[test]
+    fn command_buffer_state_allocator_preserves_full_u32_across_wrap() {
+        let mut allocator = G17PCommandBufferStateAllocator::new();
+        allocator.next = u32::MAX - 1;
+        let pair = allocator.allocate_pair().unwrap();
+        assert_eq!(pair, [u32::MAX - 1, 0]);
+        assert_eq!(pair.map(|word| word & 63), [62, 0]);
+        assert!(allocator.release_pair(pair));
     }
 
     #[test]
