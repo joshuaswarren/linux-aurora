@@ -55,11 +55,20 @@ inner = block(manager, r"^    fn begin_translated_render_with_hardware_buffer\("
 assert inner.index('"new-user-render-storage"') < inner.index(".reserve(id)"), \
     "a fresh storage's ID is not reserved for the storage's lifetime"
 
-for name in ["handoff_retained_render_vm", "recycle_desynced_render_storage",
+for name in ["recycle_desynced_render_storage",
              "release_runtime_objects_after_processor_stop"]:
     body = block(manager, r"^    (?:pub\(crate\) )?fn " + name + r"\(")
     assert "unreserve" in body, f"{name} drops a storage without returning its ID"
     assert body.index("unreserve") < body.rindex("self.render_storage = None"), name
+
+# A cross-VM handoff deliberately retains one completed generation and its
+# reserved ID. This prevents the incoming graph from immediately reusing the
+# same PBDesc slot; the previous quarantine is returned before it is dropped.
+handoff = block(manager, r"^    pub\(crate\) fn handoff_retained_render_vm\(")
+assert "self.retired_render_handoff_graph.replace(retired)" in handoff
+assert "unreserve_render_storage_hardware_buffer_id" not in handoff
+release_retired = block(manager, r"^    fn release_retired_handoff_graph\(")
+assert release_retired.index("ids.unreserve(id)") < release_retired.index("drop(retired)")
 
 # The identity gate stays: the fix satisfies it, it does not bypass it.
 scene = block(resources, r"^    fn prepare_retained_scene\(")
