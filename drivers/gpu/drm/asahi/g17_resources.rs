@@ -2057,6 +2057,7 @@ impl G17PRenderClientAlias {
     fn new(mapping: &mmu::KernelMapping) -> Self {
         Self { address: mapping.iova(), size: mapping.size() }
     }
+    fn from_range(address: u64, size: usize) -> Self { Self { address, size } }
     fn iova(&self) -> u64 { self.address }
     fn size(&self) -> usize { self.size }
 }
@@ -3290,6 +3291,46 @@ impl G17PRenderSksmBacking {
     }
 }
 
+/// Prepare one queue-context alias whose backing belongs to the installed
+/// physical QID, not to a command generation. A VM returning to that QID may
+/// already carry the exact mapping from an older descriptor graph. Reuse only
+/// a complete page-for-page physical match; a partial or foreign mapping is a
+/// real ownership error.
+#[cfg(not(test))]
+fn prepare_render_sksm_vm_alias(
+    uat: &mmu::Uat,
+    vm: &mmu::Vm,
+    object: &mut MappedObject,
+    address: u64,
+    prot: mmu::Prot,
+    requires_write: bool,
+) -> Result<(G17PRenderClientAlias, Option<mmu::KernelMapping>)> {
+    let size = G17P_BOOTSTRAP_CONTEXT_PEER_SIZE;
+    let mut existing_pages = 0usize;
+    let mut offset = 0u64;
+    while offset < size as u64 {
+        let low = address.checked_add(offset).ok_or(EOVERFLOW)?;
+        if vm.covers_range(low, mmu::UAT_PGSZ as u64, true, requires_write) {
+            existing_pages = existing_pages.checked_add(1).ok_or(EOVERFLOW)?;
+            let high = object.iova().checked_add(offset).ok_or(EOVERFLOW)?;
+            if vm.translate_iova(low)? != uat.kernel_vm().translate_iova(high)? {
+                return Err(EFAULT);
+            }
+        }
+        offset = offset.checked_add(mmu::UAT_PGSZ as u64).ok_or(EOVERFLOW)?;
+    }
+    let expected_pages = size / mmu::UAT_PGSZ;
+    if existing_pages != 0 {
+        if existing_pages != expected_pages {
+            return Err(EFAULT);
+        }
+        return Ok((G17PRenderClientAlias::from_range(address, size), None));
+    }
+    let mapping = object.map_alias_at(vm, address, prot)?;
+    let alias = G17PRenderClientAlias::new(&mapping);
+    Ok((alias, Some(mapping)))
+}
+
 #[cfg(not(test))]
 pub(crate) struct G17PUserRenderStorage {
     /// Bounded physical queue ownership for this job.  Queue records, tag-15,
@@ -3349,8 +3390,11 @@ pub(crate) struct G17PUserRenderStorage {
     /// address is hardware queue state, so it survives a client-VM handoff;
     /// only the low alias below is replaced for the incoming VM.
     sksm_backing: Option<G17PRenderSksmBacking>,
-    ta_context_low: mmu::KernelMapping,
-    fragment_context_low: mmu::KernelMapping,
+    ta_context_low: G17PRenderClientAlias,
+    fragment_context_low: G17PRenderClientAlias,
+    /// New queue-context aliases awaiting the final VM-lifetime ownership
+    /// transition. Empty when this VM already retained the exact pair.
+    sksm_vm_aliases: KVec<mmu::KernelMapping>,
     graph: MappedObject,
     support: MappedObject,
     /// EventControl record and exact submitted-kick target owned by the
@@ -6269,12 +6313,15 @@ impl G17PUserRenderStorage {
             return Err(EFAULT);
         }
         let ta_context_low_va = queue_pair.low_va(true);
-        let ta_context_low = match sksm_backing.ta_context.map_alias_at(
+        let (ta_context_low, ta_context_mapping) = match prepare_render_sksm_vm_alias(
+            uat,
             vm,
+            &mut sksm_backing.ta_context,
             ta_context_low_va,
             render_peer_prot,
+            *crate::module_parameters::g17p_render_sksm.value() != 0,
         ) {
-            Ok(mapping) => mapping,
+            Ok(alias) => alias,
             Err(error) => {
                 dev_err!(
                     dev.as_ref(),
@@ -6291,12 +6338,15 @@ impl G17PUserRenderStorage {
             }
         };
         let fragment_context_low_va = queue_pair.low_va(false);
-        let fragment_context_low = match sksm_backing.fragment_context.map_alias_at(
+        let (fragment_context_low, fragment_context_mapping) = match prepare_render_sksm_vm_alias(
+            uat,
             vm,
+            &mut sksm_backing.fragment_context,
             fragment_context_low_va,
             render_peer_prot,
+            *crate::module_parameters::g17p_render_sksm.value() != 0,
         ) {
-            Ok(mapping) => mapping,
+            Ok(alias) => alias,
             Err(error) => {
                 dev_err!(
                     dev.as_ref(),
@@ -7247,6 +7297,13 @@ impl G17PUserRenderStorage {
 
         let descriptor_3d_render_info = G17PRenderClientAlias::new(&descriptor_3d_render);
         let fragment_status_low_info = G17PRenderClientAlias::new(&fragment_status_low);
+        let mut sksm_vm_aliases = KVec::with_capacity(2, GFP_KERNEL)?;
+        if let Some(mapping) = ta_context_mapping {
+            sksm_vm_aliases.push(mapping, GFP_KERNEL)?;
+        }
+        if let Some(mapping) = fragment_context_mapping {
+            sksm_vm_aliases.push(mapping, GFP_KERNEL)?;
+        }
         let mut render_operand_aliases = KVec::with_capacity(2, GFP_KERNEL)?;
         render_operand_aliases.push(descriptor_3d_render, GFP_KERNEL)?;
         render_operand_aliases.push(fragment_status_low, GFP_KERNEL)?;
@@ -7274,6 +7331,7 @@ impl G17PUserRenderStorage {
             sksm_backing: Some(sksm_backing),
             ta_context_low,
             fragment_context_low,
+            sksm_vm_aliases,
             graph,
             support,
             pool_a_record_index,
@@ -7426,6 +7484,10 @@ impl G17PUserRenderStorage {
             }
         }
         Ok(aliases)
+    }
+
+    fn take_sksm_vm_aliases(&mut self) -> KVec<mmu::KernelMapping> {
+        core::mem::take(&mut self.sksm_vm_aliases)
     }
 
     fn map_persistent_client_aliases(&mut self, vm: &mmu::Vm) -> Result<KVec<mmu::KernelMapping>> {
@@ -15019,6 +15081,12 @@ impl G17ResourceOwner {
             self.address_space.uat.flush_t8140_vm_contexts(vm)?;
             self.stage_render_parameter_buffer_page_list(&mut storage)?;
             self.stage_render_parameter_buffer_descriptor(storage.parameter_buffer_descriptor()?)?;
+            // Queue-context aliases belong to the installed physical QID and
+            // this VM, not to the command-generation pool cleared on every
+            // graph handoff. Commit them only after every other fallible stage
+            // so a constructor failure cannot strand an alias whose high
+            // backing was never retained.
+            vm.append_driver_mappings(storage.take_sksm_vm_aliases())?;
             Ok(())
         })();
         if let Err(error) = finish {
