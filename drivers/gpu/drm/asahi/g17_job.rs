@@ -91,6 +91,10 @@ pub(crate) struct G17PComputeJobPacket {
     command: g17_uapi::TranslatedComputeCommand,
     command_images: KVec<G17PSealedCommand>,
     _retained_mappings: KVec<mmu::KernelMapping>,
+    /// DRM sched treats a signalled error fence as dependency-ready. Retain
+    /// the same fences until run_job so the backend can consume their status
+    /// before publishing any hardware-visible queue state.
+    input_fences: KVec<Fence>,
     completion: Option<G17PJobCompletion>,
     _vm_job: Option<mmu::T8140VmJobGuard>,
 }
@@ -103,6 +107,7 @@ impl G17PComputeJobPacket {
         command: g17_uapi::TranslatedComputeCommand,
         command_images: KVec<G17PSealedCommand>,
         retained_mappings: KVec<mmu::KernelMapping>,
+        input_fences: KVec<Fence>,
         completion: Option<G17PJobCompletion>,
         vm_job: Option<mmu::T8140VmJobGuard>,
     ) -> Result<Arc<Self>> {
@@ -110,7 +115,8 @@ impl G17PComputeJobPacket {
         { return Err(EINVAL); }
         Ok(Arc::new(Self {
             submission_id, hardware_queue_id, context, command, command_images,
-            _retained_mappings: retained_mappings, completion, _vm_job: vm_job,
+            _retained_mappings: retained_mappings, input_fences, completion,
+            _vm_job: vm_job,
         }, GFP_KERNEL)?)
     }
 
@@ -119,6 +125,7 @@ impl G17PComputeJobPacket {
     pub(crate) fn context(&self) -> &mmu::T8140ComputeExecutionContext { &self.context }
     pub(crate) fn command(&self) -> &g17_uapi::TranslatedComputeCommand { &self.command }
     pub(crate) fn command_images(&self) -> &[G17PSealedCommand] { &self.command_images }
+    pub(crate) fn input_fences(&self) -> &[Fence] { &self.input_fences }
     pub(crate) fn completion(&self) -> Result<&G17PJobCompletion> { self.completion.as_ref().ok_or(EINVAL) }
 }
 

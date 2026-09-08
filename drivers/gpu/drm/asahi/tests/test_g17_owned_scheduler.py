@@ -26,7 +26,13 @@ pub mod dma_fence{
  impl Fence{pub fn new()->Self{Self(Arc::new(AtomicBool::new(false)))}pub fn from_fence<T>(f:&UserFence<T>)->Self{f.0.clone()}pub fn done(&self)->bool{self.0.load(Ordering::Acquire)}pub fn signal(&self){self.0.store(true,Ordering::Release)}}
 }
 pub mod g17_status{pub struct VmStatus;impl VmStatus{pub fn record(&self,_e:i32){}}}
-pub mod g17_drm{pub struct G17PSubmissionFence;}
+pub mod g17_resources{pub struct G17PRenderQueuePair;impl G17PRenderQueuePair{pub const SLOT_COUNT:u8=2;}}
+pub mod g17_drm{
+ use crate::dma_fence::Fence;
+ pub struct G17PSubmissionFence;
+ pub struct G17PRenderCompletion(pub Fence);
+ impl G17PRenderCompletion{pub fn fence(&self)->Fence{self.0.clone()}}
+}
 pub mod driver{pub struct AsahiDevice;impl AsRef<()> for AsahiDevice{fn as_ref(&self)->&(){&()}}}
 pub mod g17_uapi{#[derive(Clone,Copy)]pub struct TranslatedComputeCommand{pub value:u64}}
 pub mod mmu{
@@ -75,7 +81,7 @@ tests=r'''
   let bytes=StdArc::new(Mutex::new(vec![0xa5;64]));let mut source=vec![id as u8;16];
   let sealed=G17PSealedCommand::new(mmu::KernelMapping{address:id*0x10000,bytes:bytes.clone(),drops:drops.clone()},&source).unwrap();
   source.fill(0xff);assert_eq!(&bytes.lock().unwrap()[..16],&[id as u8;16]);assert!(bytes.lock().unwrap()[16..].iter().all(|v|*v==0));
-  G17PComputeJobPacket::new(id,id as u8+4,context,g17_uapi::TranslatedComputeCommand{value:id},vec![sealed],vec![],None,None).unwrap()
+  G17PComputeJobPacket::new(id,id as u8+4,context,g17_uapi::TranslatedComputeCommand{value:id},vec![sealed],vec![],vec![],None,None).unwrap()
  }
  #[test]fn two_published_jobs_outlive_submitters_and_complete_out_of_order(){
   let d=StdArc::new(AtomicUsize::new(0));let r=StdArc::new(AtomicUsize::new(0));let b=Arc::new(Backend::default(),0).unwrap();
