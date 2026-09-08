@@ -58,6 +58,7 @@ mod module_parameters {
     *[block(sub, n) for n in [
         "put_u16_le", "put_u32_le", "put_u64_le", "apply_g17p_cold_opening_optional",
         "apply_g17p_retained_optional", "apply_g17p_retained_optional_with_flist_generation",
+        "apply_g17p_retained_optional_with_flist_generation_and_context_update",
         "g17p_render_flist_generation",
         "apply_g17p_cold_opening_event", "apply_g17p_retained_event_with_stamp"]],
     "}",
@@ -172,7 +173,7 @@ fn long_width_flist_generation_retains_all_counter_bits_and_neighbors() {
     for stage in [G17PColdOpeningStage::Tiling, G17PColdOpeningStage::Fragment] {
         for ordinal in [0, 1, 254, 255, 256, 999, 65535, 65536, 0x00fffffe] {
             let mut raw = [0xa5; G17P_COLD_OPENING_OPTIONAL_SIZE];
-            apply_g17p_retained_optional(stage, addresses(), ordinal, false, 0, 1, 1, 1, &mut raw).unwrap();
+            apply_g17p_retained_optional(stage, addresses(), ordinal, false, 0, 1, 1, 1, 1, &mut raw).unwrap();
             assert_eq!(u64_at(&raw, 0x3e), ordinal as u64);
             assert_eq!(u64_at(&raw, 0x36), addresses().usc_priv_mem_flist);
             assert_eq!(u32_at(&raw, 0x46), addresses().usc_freelist_hardware_buffer_id);
@@ -185,7 +186,7 @@ fn long_width_flist_generation_retains_all_counter_bits_and_neighbors() {
         for ordinal in [0x00ffffff, u32::MAX] {
             let mut raw = [0xa5; G17P_COLD_OPENING_OPTIONAL_SIZE];
             let before = raw;
-            assert!(apply_g17p_retained_optional(stage, addresses(), ordinal, false, 0, 1, 1, 1, &mut raw).is_err());
+            assert!(apply_g17p_retained_optional(stage, addresses(), ordinal, false, 0, 1, 1, 1, 1, &mut raw).is_err());
             assert_eq!(raw, before);
         }
     }

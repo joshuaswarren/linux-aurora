@@ -46,6 +46,7 @@ body = "\n".join([
     *[block(submission, r"^pub\(crate\) (?:const )?fn " + name + r"\(") for name in [
         "apply_g17p_cold_opening_optional", "apply_g17p_retained_optional",
         "apply_g17p_retained_optional_with_flist_generation",
+        "apply_g17p_retained_optional_with_flist_generation_and_context_update",
         "g17p_render_flist_generation"]],
     r"""
 #[derive(Debug)] enum SubmissionError {
@@ -115,21 +116,21 @@ fn addresses(token: u64) -> G17PColdOpeningOptionalAddresses {
 fn cold_wire_zero_is_preserved_and_only_ta_token_bytes_change() {
     let mut zero = [0xa5; G17P_COLD_OPENING_OPTIONAL_SIZE];
     apply_g17p_cold_opening_optional(
-        G17PColdOpeningStage::Tiling, addresses(0), 0, 1, 1, 1, &mut zero).unwrap();
+        G17PColdOpeningStage::Tiling, addresses(0), 0, 1, 1, 1, 1, &mut zero).unwrap();
     assert_eq!(&zero[0x76..0x7e], &[0; 8]);
     assert_eq!(&zero[0x6e..0x76], &0xfffffc20c0060000u64.to_le_bytes());
     assert_eq!(&zero[0x7e..0x82], &7u32.to_le_bytes());
     let token = 0x0123456789abcdef;
     let mut changed = [0xa5; G17P_COLD_OPENING_OPTIONAL_SIZE];
     apply_g17p_cold_opening_optional(
-        G17PColdOpeningStage::Tiling, addresses(token), 0, 1, 1, 1, &mut changed).unwrap();
+        G17PColdOpeningStage::Tiling, addresses(token), 0, 1, 1, 1, 1, &mut changed).unwrap();
     let mut expected = zero;
     expected[0x76..0x7e].copy_from_slice(&token.to_le_bytes());
     assert_eq!(changed, expected);
     apply_g17p_cold_opening_optional(
-        G17PColdOpeningStage::Fragment, addresses(0), 1, 0, 1, 1, &mut zero).unwrap();
+        G17PColdOpeningStage::Fragment, addresses(0), 1, 0, 1, 1, 1, &mut zero).unwrap();
     apply_g17p_cold_opening_optional(
-        G17PColdOpeningStage::Fragment, addresses(token), 1, 0, 1, 1, &mut changed).unwrap();
+        G17PColdOpeningStage::Fragment, addresses(token), 1, 0, 1, 1, 1, &mut changed).unwrap();
     assert_eq!(changed, zero);
     assert_eq!(&changed[0x76..0x86], &[0xff; 16]);
 }
@@ -141,7 +142,7 @@ fn retained_encoder_keeps_captured_token_independent_of_generations() {
         let mut raw = [0xa5; G17P_COLD_OPENING_OPTIONAL_SIZE];
         apply_g17p_retained_optional(
             G17PColdOpeningStage::Tiling, addresses(token), ordinal,
-            false, 0, 1, 1, 1, &mut raw).unwrap();
+            false, 0, 1, 1, 1, 1, &mut raw).unwrap();
         assert_eq!(&raw[0x76..0x7e], &token.to_le_bytes());
         assert_eq!(&raw[0x7e..0x82], &7u32.to_le_bytes());
         assert_eq!(&raw[0x3e..0x40], &(ordinal as u16).to_le_bytes());

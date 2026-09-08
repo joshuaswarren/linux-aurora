@@ -27,7 +27,7 @@ use core::cmp;
 
 use kernel::{
     addr::PhysicalAddr,
-    bindings::drm_gpuvm_flags_DRM_GPUVM_IMMEDIATE_MODE,
+    bindings::{self, drm_gpuvm_flags_DRM_GPUVM_IMMEDIATE_MODE},
     c_str,
     device,
     drm::{
@@ -1008,7 +1008,7 @@ impl VmInner {
         // The private fixed-mapping allocator cannot see GPUVM-owned leaves.
         // Reserve the complete page-table walk before installing any SG run.
         self.page_table.prepare_map(iova..mapping_end)?;
-        let guard = node.bo.as_ref().ok_or(EINVAL)?.inner().inner.lock();
+        let guard = node.bo.as_ref().ok_or(EINVAL)?.get()?.inner().inner.lock();
         let sgt = guard.sgt.as_ref().ok_or(EINVAL)?;
         let mut offset = node.offset;
         let mut left = node.mapped_size;
@@ -1445,13 +1445,65 @@ impl Drop for T8140ContextRootLease {
     }
 }
 
+/// A `drm_gpuvm_bo` reference owned by an Asahi fixed mapping.
+///
+/// Every Asahi GPUVM uses `DRM_GPUVM_IMMEDIATE_MODE`, so its GEM GPUVA list is
+/// protected by `drm_gem_object::gpuva.lock`, not `dma_resv`. The generic Rust
+/// `ARef<GpuVmBo>` destructor currently uses the latter. Fixed mappings are
+/// particularly likely to expose that mismatch because several aliases of one
+/// internal GEM can be created and retired concurrently.
+///
+/// Consume the Rust reference explicitly through DRM's immediate-mode
+/// deferred put. This takes the right lock and keeps both the GEM mutex and
+/// GPUVM alive until cleanup runs. Retaining the owner separately makes it
+/// safe to drain the deferred list after the put, including when this was the
+/// final BO reference.
+struct ImmediateGpuVmBoRef {
+    bo: Option<ARef<gpuvm::GpuVmBo<VmInner>>>,
+    owner: ARef<gpuvm::GpuVm<VmInner>>,
+}
+
+impl ImmediateGpuVmBoRef {
+    fn new(
+        bo: ARef<gpuvm::GpuVmBo<VmInner>>,
+        owner: ARef<gpuvm::GpuVm<VmInner>>,
+    ) -> Self {
+        Self {
+            bo: Some(bo),
+            owner,
+        }
+    }
+
+    fn get(&self) -> Result<&gpuvm::GpuVmBo<VmInner>> {
+        self.bo.as_deref().ok_or(EINVAL)
+    }
+}
+
+impl Drop for ImmediateGpuVmBoRef {
+    fn drop(&mut self) {
+        let Some(bo) = self.bo.take() else {
+            return;
+        };
+        let raw = ARef::into_raw(bo);
+        // SAFETY: `GpuVmBo` is `repr(C)` with `drm_gpuvm_bo` as its first
+        // field. `into_raw` transfers the live reference to this call, and
+        // every Asahi GPUVM is constructed with IMMEDIATE_MODE.
+        unsafe {
+            bindings::drm_gpuvm_bo_put_deferred(
+                raw.as_ptr().cast::<bindings::drm_gpuvm_bo>(),
+            );
+        }
+        self.owner.bo_deferred_cleanup();
+    }
+}
+
 /// Inner data required for an object mapping into a [`Vm`].
 pub(crate) struct KernelMappingInner {
     // Drop order matters:
-    // - Drop the GpuVmBo first, which resv locks its BO and drops a GpuVm reference
+    // - Deferred-put the GpuVmBo first under its immediate-mode GPUVA lock
     // - Drop the GEM BO next, since BO free can take the resv lock itself
     // - Drop the owner GpuVm last, since that again can take resv locks when the refcount drops to 0
-    bo: Option<ARef<gpuvm::GpuVmBo<VmInner>>>,
+    bo: Option<ImmediateGpuVmBoRef>,
     _gem: Option<ARef<gem::Object>>,
     owner: ARef<gpuvm::GpuVm<VmInner>>,
     uat_inner: Arc<UatInner>,
@@ -2699,6 +2751,7 @@ impl Vm {
             vm_bo_guard.sgt.replace(sgt);
         }
         core::mem::drop(vm_bo_guard);
+        let mut vm_bo = Some(ImmediateGpuVmBoRef::new(vm_bo, self.inner.clone()));
 
         let uat_inner = inner.uat_inner.clone();
         // Reserve the VA before attaching objects whose destructors take the
@@ -2730,7 +2783,7 @@ impl Vm {
         };
         {
             let node_inner = node.as_mut().inner_mut();
-            node_inner.bo = Some(vm_bo);
+            node_inner.bo = vm_bo.take();
             node_inner._gem = Some(gem.into());
         }
 
@@ -2762,6 +2815,7 @@ impl Vm {
             vm_bo_guard.sgt.replace(sgt);
         }
         core::mem::drop(vm_bo_guard);
+        let mut vm_bo = Some(ImmediateGpuVmBoRef::new(vm_bo, self.inner.clone()));
 
         let uat_inner = inner.uat_inner.clone();
         // See map_in_range(): keep dma_resv-owning references out of the
@@ -2789,7 +2843,7 @@ impl Vm {
         };
         {
             let node_inner = node.as_mut().inner_mut();
-            node_inner.bo = Some(vm_bo);
+            node_inner.bo = vm_bo.take();
             node_inner._gem = Some(gem.clone());
         }
 

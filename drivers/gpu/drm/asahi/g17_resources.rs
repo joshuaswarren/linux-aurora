@@ -3220,6 +3220,10 @@ pub(crate) struct G17PUserRenderStorage {
     /// Hardware context carried by this queue's submitted TA/3D descriptors.
     /// Native allocates this independently of the command-GART context.
     descriptor_context_id: u16,
+    /// A fresh graph must update the physical channel's cached GART context
+    /// even when it reuses an already-installed QID at a nonzero ordinal.
+    /// Cleared only after the first pair using this graph completes.
+    context_update_pending: bool,
     /// TTBAT context this render's VM is bound to (`VmBind::slot`).
     ///
     /// Distinct from `descriptor_context_id`: the descriptors execute in the
@@ -3371,6 +3375,7 @@ pub(crate) struct G17PRenderConfigUpdateHeader {
     pub(crate) flushid_index: u16,
     pub(crate) scheduler_state: u64,
     pub(crate) field_56: u16,
+    pub(crate) context_update: u16,
     pub(crate) parameter_buffer_object: u64,
     pub(crate) parameter_buffer_token: u64,
     pub(crate) parameter_buffer_id: u32,
@@ -3407,6 +3412,7 @@ fn decode_g17p_render_config_update(raw: &[u8]) -> Option<G17PRenderConfigUpdate
         flushid_index: u16_at(0x46),
         scheduler_state: u64_at(0x4a),
         field_56: u16_at(0x56),
+        context_update: u16_at(0x62),
         parameter_buffer_object: u64_at(0x6e),
         parameter_buffer_token: u64_at(0x76),
         parameter_buffer_id: u32_at(0x7e),
@@ -3671,6 +3677,7 @@ fn build_g17p_late_tiling_bytes(
     tag16: bool,
     native_pool_a_first_record: bool,
     pool_a_slot_value: u32,
+    context_update: bool,
 ) -> core::result::Result<G17PLateTilingBytes, g17_submission::SubmissionError> {
     let record_a = g17_submission::g17p_render_pool_a_record_index(
         submission_ordinal,
@@ -3721,7 +3728,7 @@ fn build_g17p_late_tiling_bytes(
             &mut bytes.entry_signal,
         )?;
     }
-    g17_submission::apply_g17p_retained_optional_with_flist_generation(
+    g17_submission::apply_g17p_retained_optional_with_flist_generation_and_context_update(
         g17_submission::G17PColdOpeningStage::Tiling,
         optional_addresses,
         submission_ordinal,
@@ -3732,6 +3739,7 @@ fn build_g17p_late_tiling_bytes(
         queue_pair.qos_hardware_buffer_id() as u16,
         g17p_render_install(true),
         ta_tag15_context_id,
+        context_update,
         &mut bytes.optional,
     )?;
     g17_submission::apply_g17p_retained_event_with_stamp(
@@ -7125,6 +7133,7 @@ impl G17PUserRenderStorage {
             lifecycle_predecessor,
             _command_context: Some(command_context),
             descriptor_context_id,
+            context_update_pending: true,
             render_root_slot,
             staging_descriptors: None,
         })
@@ -7137,6 +7146,14 @@ impl G17PUserRenderStorage {
 
     pub(crate) fn descriptor_context_id(&self) -> u16 {
         self.descriptor_context_id
+    }
+
+    pub(crate) fn complete_context_update(&mut self) {
+        self.context_update_pending = false;
+    }
+
+    pub(crate) fn context_update_pending(&self) -> bool {
+        self.context_update_pending
     }
 
     /// Expected TA parameter-buffer binding copied from the retained owner
@@ -8729,12 +8746,19 @@ impl G17PUserRenderStorage {
                 }),
             ),
             (
-                "primary-index-page",
-                vm.covers_range(
-                    g17_submission::G17P_PARTIAL_OPENING_PRIMARY_INDEX_GPU_VA,
-                    mmu::UAT_PGSZ as u64,
-                    true,
-                    true,
+                "pm-page-list",
+                self.parameter_management.as_ref().map_or(
+                    g17p_render_tvb_mode() < 2,
+                    |pm| {
+                        pm.page_list_low_va()
+                            == g17p_render_page_list_va(self.queue_pair).unwrap_or(0)
+                            && vm.covers_range(
+                                pm.page_list_low_va(),
+                                page_align(G17P_PM_PAGE_LIST_SIZE).unwrap_or(0) as u64,
+                                true,
+                                true,
+                            )
+                    },
                 ),
             ),
             (
@@ -8857,7 +8881,7 @@ impl G17PUserRenderStorage {
             for (index, address) in items.iter().enumerate() {
                 put_u64(&mut group, index * 8, *address);
             }
-            g17_submission::apply_g17p_retained_optional_with_flist_generation(
+            g17_submission::apply_g17p_retained_optional_with_flist_generation_and_context_update(
                 g17_submission::G17PColdOpeningStage::Fragment,
                 optional_addresses,
                 submission_ordinal,
@@ -8868,6 +8892,7 @@ impl G17PUserRenderStorage {
                 self.queue_pair.qos_hardware_buffer_id() as u16,
                 g17p_render_install(false),
                 self.descriptor_context_id,
+                self.context_update_pending,
                 &mut raw[optional_offset
                     ..optional_offset + g17_submission::G17P_COLD_OPENING_OPTIONAL_SIZE],
             )
@@ -9201,7 +9226,7 @@ impl G17PUserRenderStorage {
                 put_u64(&mut group, index * 8, *address);
             }
             plan.copy_items(raw, Self::FRAGMENT_RING, 0, &group).ok_or(EINVAL)?;
-            g17_submission::apply_g17p_retained_optional_with_flist_generation(
+            g17_submission::apply_g17p_retained_optional_with_flist_generation_and_context_update(
                 g17_submission::G17PColdOpeningStage::Fragment,
                 optional_addresses,
                 submission_ordinal,
@@ -9212,6 +9237,7 @@ impl G17PUserRenderStorage {
                 self.queue_pair.qos_hardware_buffer_id() as u16,
                 g17p_render_install(false),
                 self.descriptor_context_id,
+                self.context_update_pending,
                 &mut raw[optional_offset
                     ..optional_offset + g17_submission::G17P_COLD_OPENING_OPTIONAL_SIZE],
             )
@@ -9329,6 +9355,7 @@ impl G17PUserRenderStorage {
             g17p_render_tag16_enabled(),
             g17p_render_native_pool_a_first_record_enabled(),
             pool_a_kick.next,
+            self.context_update_pending,
         )
         .map_err(|_| EINVAL)?;
         bytes.pool_a_slot_offset = G17P_RENDER_POOL_A_SLOTS
@@ -17564,7 +17591,7 @@ mod tests {
         // An address-construction error occurs before any publication and
         // cannot change the early 3D-visible bytes.
         assert!(
-            build_g17p_late_tiling_bytes(descriptor, u64::MAX, G17PRenderQueuePair::for_slot(0).unwrap(), addresses, 6, 0, 0, 1, false, false, 2)
+            build_g17p_late_tiling_bytes(descriptor, u64::MAX, G17PRenderQueuePair::for_slot(0).unwrap(), addresses, 6, 0, 0, 1, false, false, 2, true)
                 .is_err()
         );
         assert!(graph[G17P_USER_TILING_RING..G17P_USER_TILING_RING + 24]
@@ -17574,7 +17601,7 @@ mod tests {
         assert_eq!(get_u32(&support, G17P_RENDER_SHARED_CONTROL_INNER), 1);
 
         let late =
-            build_g17p_late_tiling_bytes(descriptor, graph_va, G17PRenderQueuePair::for_slot(0).unwrap(), addresses, 6, 0, 0, 1, false, false, 2)
+            build_g17p_late_tiling_bytes(descriptor, graph_va, G17PRenderQueuePair::for_slot(0).unwrap(), addresses, 6, 0, 0, 1, false, false, 2, true)
                 .unwrap();
         late.apply(&mut graph, &mut support);
         assert_eq!(get_u64(&graph, G17P_USER_TILING_RING), descriptor);
@@ -17604,6 +17631,7 @@ mod tests {
             true,
             false,
             2,
+            true,
         )
         .unwrap();
         assert_eq!(get_u32(&second_pair.optional, 0x18) & 0xffff, 2);
@@ -17616,11 +17644,13 @@ mod tests {
         assert_eq!(second_header.priority, 0);
         assert_eq!(second_header.data_master, 0);
         assert_eq!(second_header.field_56, 2);
+        assert_eq!(second_header.context_update, 1);
         assert_eq!(second_header.parameter_buffer_bit & 0xffff, 3);
 
         let retained =
-            build_g17p_late_tiling_bytes(descriptor, graph_va, G17PRenderQueuePair::for_slot(0).unwrap(), addresses, 6, 1, 1, 2, false, false, 2)
+            build_g17p_late_tiling_bytes(descriptor, graph_va, G17PRenderQueuePair::for_slot(0).unwrap(), addresses, 6, 1, 1, 2, false, false, 2, false)
                 .unwrap();
+        assert_eq!(decode_g17p_render_config_update(&retained.optional).unwrap().context_update, 0);
         retained.apply(&mut graph, &mut support);
         assert_eq!(get_u32(&graph, G17P_USER_TILING_POINTERS + 0x40), 6);
         assert_eq!(get_u64(&graph, G17P_USER_TILING_RING), descriptor);
@@ -17644,13 +17674,13 @@ mod tests {
         let mut native_support = vec![0u8; G17P_RENDER_SUPPORT_SIZE];
         put_u32(&mut native_support, G17P_RENDER_POOL_A_SLOTS + 4, 1);
         let native_first =
-            build_g17p_late_tiling_bytes(descriptor, graph_va, G17PRenderQueuePair::for_slot(0).unwrap(), addresses, 6, 0, 0, 1, false, true, 2)
+            build_g17p_late_tiling_bytes(descriptor, graph_va, G17PRenderQueuePair::for_slot(0).unwrap(), addresses, 6, 0, 0, 1, false, true, 2, true)
                 .unwrap();
         native_first.apply(&mut graph, &mut native_support);
         assert_eq!(get_u32(&native_support, G17P_RENDER_POOL_A_SLOTS), 0);
         assert_eq!(get_u32(&native_support, G17P_RENDER_POOL_A_SLOTS + 4), 2);
         let native_retained =
-            build_g17p_late_tiling_bytes(descriptor, graph_va, G17PRenderQueuePair::for_slot(0).unwrap(), addresses, 6, 1, 1, 2, false, true, 2)
+            build_g17p_late_tiling_bytes(descriptor, graph_va, G17PRenderQueuePair::for_slot(0).unwrap(), addresses, 6, 1, 1, 2, false, true, 2, false)
                 .unwrap();
         assert_eq!(native_retained.pool_a_slot_offset, retained.pool_a_slot_offset);
     }
@@ -17671,7 +17701,7 @@ mod tests {
             ta_hardware_buffer_id: 0,
         };
         let late =
-            build_g17p_late_tiling_bytes(descriptor, graph_va, G17PRenderQueuePair::for_slot(0).unwrap(), addresses, 6, 0, 0, 1, true, false, 2)
+            build_g17p_late_tiling_bytes(descriptor, graph_va, G17PRenderQueuePair::for_slot(0).unwrap(), addresses, 6, 0, 0, 1, true, false, 2, true)
                 .unwrap();
         let mut graph = vec![0u8; G17P_RENDER_QUEUE_GRAPH_SIZE];
         let mut support = vec![0u8; G17P_RENDER_SUPPORT_SIZE];
