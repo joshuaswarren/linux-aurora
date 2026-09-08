@@ -47,7 +47,7 @@ assert "self.retired_render_handoff_graph = Some(retired)" in handoff
 # its firmware-high PM backing.
 released_check = "released_render_contexts & (1u64 << context) != 0"
 assert preserve.index(released_check) < preserve.index(
-    "Self::release_retired_handoff_graph("
+    "Self::quarantine_drained_render_graph("
 )
 
 release = function("fn release_retired_handoff_graph(")
@@ -57,6 +57,14 @@ stop = function("pub(crate) fn release_runtime_objects_after_processor_stop(")
 assert "state.retired_handoff_graph.take()" in stop
 assert "self.retired_render_handoff_graph.take()" in stop
 assert "self.retired_render_handoff_graphs.pop()" in stop
+assert "self.retired_firmware_render_storages.clear()" in stop
+
+drain = function("fn quarantine_drained_render_graph(")
+assert drain.index("storage.release_client_context()") < drain.index("drop(bind)")
+assert drain.index("drop(bind)") < drain.index(
+    "retired_firmware_render_storages.push_within_capacity(storage)"
+)
+assert "storage.take_retired_parameter_management()" in drain
 
 
 class Quarantine:
