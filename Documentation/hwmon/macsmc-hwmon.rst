@@ -69,3 +69,27 @@ tempX_input
 tempX_label
     Temperature sensor label
 
+J700 CPU thermal policy
+----------------------
+
+On J700, the optional ``apple,cpu-thermal-policy`` Devicetree property and
+``CONFIG_APPLE_SMC_CPU_THERMAL=y`` couple six selected SMC readings to the
+``apple-smc-selected`` thermal zone and both cpufreq cooling devices. Higher
+T8140 OPP policies install persistent minimum-frequency guards before their
+governors start, and cannot release them without a working provider, cooling
+bindings and three complete valid rounds. Disabling the zone or removing the
+provider retains those caps. Ordinary standalone hwmon reporting is unchanged.
+
+The selected keys are Te05, Te0S, Tp01, Tp05, Tp09 and Tp0D. Labels are key
+identities, not a recovered map of physical core hotspots. The policy starts
+cooling at 65 C and releases below 60 C. These are Linux operating choices,
+not Apple emergency thresholds. Retained firmware protection is not modified.
+
+One serialized sampler publishes a complete six-key round to both hwmon and
+thermal. Failed reads and host rounds at least 200 ms old return errors and
+retain minimum CPU caps. A separate worker detects a stalled sampler without
+waiting for its SMC lock. This bounds host transaction age, not sensor age:
+J700 load traces showed roughly one-second plateaus in successful replies.
+Faster polling cannot guarantee newer firmware samples or a hard thermal
+ceiling. Higher-state admission must therefore remain separately bounded and
+tested; complete table discovery alone is insufficient.
