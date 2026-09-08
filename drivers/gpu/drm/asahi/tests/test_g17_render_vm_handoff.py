@@ -95,12 +95,15 @@ assert "G17P_NATIVE_RENDER_QOS_HARDWARE_BUFFER_ID" not in new_sksm
 submit = function(runtime, "pub(crate) fn submit_translated_render(")
 assert "select_render_slot(render_slot)?" in submit
 assert "if defer_completion" in submit
-wait = function(drm, "fn wait_render_slot(")
-assert ".poll_deferred_render_completion(render_slot)?" in wait
-# The sleep interval is now a backoff schedule rather than a flat
-# millisecond, but the property this asserts is unchanged: the poll runs
-# first, and the sleep that follows it is outside the runtime mutex.
-assert wait.index(".poll_deferred_render_completion(render_slot)?") < wait.index("fsleep(")
+watch = function(drm, "impl g17_job::G17PRenderWatchBackend for G17PRenderWatchBackend")
+assert watch.count("packet.render_slot()") >= 4
+assert watch.count("timeout_deferred_render(") == 2
+assert "poll_deferred_render_completion" not in watch
+# Ordinary completion is event-driven with the runtime mutex released. Only
+# scheduler timeout/cancel enters the bounded final-observation path above.
+events = function(runtime, "fn service_async_render_completions(")
+assert "self.poll_deferred_render_completion(slot)?" in events
+assert "signal.complete(Ok(observed))" in events
 
 # Job-root SecureGart setup must retain Mesa's six existing GPUVM low views.
 # Only the VM-lifetime-reserved null view is a driver-owned KernelMapping.
@@ -134,7 +137,7 @@ assert "G17P_RENDER_JOB_QUEUE_LOW_BASE == 0x70_01ef_8000" in resources
 
 storage_impl = resources[resources.index("impl G17PUserRenderStorage {"):]
 storage_new = function(storage_impl, "fn new(")
-assert storage_new.count("g17p_cl_client_low_va_range()") >= 4
+assert storage_new.count("g17p_cl_client_low_va_range()") >= 3
 assert "G17P_BOOTSTRAP_TA_DESCRIPTOR_LOW_VA\n                    .." not in storage_new
 reachability = function(resources, "pub(crate) fn first_unreachable(")
 ta_status = reachability[reachability.index('"ta-status-page"'):]
@@ -142,4 +145,4 @@ ta_status = ta_status[:ta_status.index('"3d-status-page"')]
 assert "vm.covers_range(" in ta_status
 assert "uat.kernel_vm().covers_range(" not in ta_status
 
-print("PASS job-private VM handoff and complete two-slot owner parking; completion polls release the runtime mutex")
+print("PASS job-private VM handoff and complete two-slot owner parking; ordinary completion is event-driven")
