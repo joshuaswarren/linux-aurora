@@ -248,7 +248,6 @@ pub(crate) struct G17pRenderParameters {
     pub(crate) lifecycle: u64,
     /// Fragment event correlation written to 0x160e0/0x01499/0x0a341.
     pub(crate) fragment_lifecycle: u64,
-    pub(crate) work_stamp: u64,
     pub(crate) sampler_array: u64,
     pub(crate) sampler_count: u32,
     pub(crate) process_empty_tiles: bool,
@@ -390,7 +389,6 @@ impl G17pRenderParameters {
             record_index: 0x8_0005,
             lifecycle: 0,
             fragment_lifecycle: 0,
-            work_stamp: 0x100,
             sampler_array: 0,
             sampler_count: 0,
             process_empty_tiles: true,
@@ -537,6 +535,13 @@ fn vdm_user_offset(address: u64) -> Result<u64, RenderBuildError> {
 pub(crate) fn build_ta_registers(
     p: &G17pRenderParameters,
 ) -> Result<[RegisterWrite; TA_REGISTER_COUNT], RenderBuildError> {
+    build_ta_registers_for_work_key(p, render_work_key(1, 0))
+}
+
+fn build_ta_registers_for_work_key(
+    p: &G17pRenderParameters,
+    work_key: u64,
+) -> Result<[RegisterWrite; TA_REGISTER_COUNT], RenderBuildError> {
     let g = geometry(p)?;
     let tilemap = ta_resource_offset(p, p.tilemap)?;
     let heapmeta = ta_resource_offset(p, p.heapmeta)?;
@@ -646,9 +651,9 @@ pub(crate) fn build_ta_registers(
         RegisterWrite::new(0x1ca10, p.lifecycle),
         RegisterWrite::new(0x014a1, p.lifecycle),
         RegisterWrite::new(0x0a349, p.lifecycle),
-        RegisterWrite::new(0x10209, p.work_stamp),
-        RegisterWrite::new(0x1c9f0, p.work_stamp),
-        RegisterWrite::new(0x14320, p.work_stamp),
+        RegisterWrite::new(0x10209, work_key),
+        RegisterWrite::new(0x1c9f0, work_key),
+        RegisterWrite::new(0x14320, work_key),
         // AGXTACommandDescriptor::prepare receives the shared USC FList ID
         // through descriptor +0x1410. Optional GART/feature payloads are absent
         // in Linux, so the retained owner's ID is the complete value.
@@ -689,7 +694,7 @@ fn apply_g17p_ta_oracle(raw: &mut [u8]) {
 pub(crate) fn build_fragment_registers(
     p: &G17pRenderParameters,
 ) -> Result<[RegisterWrite; FRAGMENT_REGISTER_COUNT], RenderBuildError> {
-    build_fragment_registers_counted(p).map(|(regs, _)| regs)
+    build_fragment_registers_for_work_key(p, render_work_key(1, 1))
 }
 
 /// As `build_fragment_registers`, plus the live entry count. The count is
@@ -699,11 +704,15 @@ pub(crate) fn build_fragment_registers(
 pub(crate) fn build_fragment_registers_counted(
     p: &G17pRenderParameters,
 ) -> Result<([RegisterWrite; FRAGMENT_REGISTER_COUNT], usize), RenderBuildError> {
-    Ok((build_fragment_registers_full(p)?, FRAGMENT_REGISTER_COUNT))
+    Ok((
+        build_fragment_registers_for_work_key(p, render_work_key(1, 1))?,
+        FRAGMENT_REGISTER_COUNT,
+    ))
 }
 
-fn build_fragment_registers_full(
+fn build_fragment_registers_for_work_key(
     p: &G17pRenderParameters,
+    work_key: u64,
 ) -> Result<[RegisterWrite; FRAGMENT_REGISTER_COUNT], RenderBuildError> {
     let g = geometry(p)?;
     let tile_state = 0x3717f
@@ -815,8 +824,8 @@ fn build_fragment_registers_full(
         // a different producer and must not be used to infer this register.
         RegisterWrite::new(0x1c838, p.ta_hardware_buffer_id as u64),
         RegisterWrite::new(0x1ca28, p.cycle),
-        RegisterWrite::new(0x10211, p.work_stamp),
-        RegisterWrite::new(0x10420, p.work_stamp),
+        RegisterWrite::new(0x10211, work_key),
+        RegisterWrite::new(0x10420, work_key),
         // AGX3DCommandDescriptor::prepare receives this ID from the USC pool's
         // HardwareBufferIDManager and generate3DRegisterList ORs it with an
         // optional GART payload and feature bit. Linux currently has neither
@@ -999,6 +1008,11 @@ impl RenderDescriptorObjects {
 pub(crate) struct RenderDescriptorMetadata {
     pub(crate) context_id: u32,
     pub(crate) submission_ordinal: u32,
+    /// Monotonic state tag allocated by the command buffer's 36-entry state
+    /// ring. This is neither the selected ring index nor any QID/HWID. Native
+    /// retains the full word in the selected state object and places only its
+    /// low six bits in the stage work key.
+    pub(crate) command_buffer_state_word: u32,
     /// TA HardwareBufferID copied to firmware descriptor +0x18.
     ///
     /// Every working native descriptor corpus couples this field to register
@@ -1014,6 +1028,10 @@ impl RenderDescriptorMetadata {
         Self {
             context_id: 1,
             submission_ordinal: 0,
+            command_buffer_state_word: match kind {
+                RenderDescriptorKind::Tiling => 0,
+                RenderDescriptorKind::Fragment => 1,
+            },
             ta_hardware_buffer_id: 0,
             submit_sequence: match kind {
                 RenderDescriptorKind::Tiling => 1,
@@ -1021,6 +1039,14 @@ impl RenderDescriptorMetadata {
             },
         }
     }
+}
+
+/// Native's TA/3D register-list producer couples the command-buffer state tag
+/// to the descriptor's allocated application-GART context. The physical QID,
+/// QoS HardwareBufferID, descriptor-array slot and 36-entry state-ring index
+/// are independent namespaces and must not be substituted here.
+const fn render_work_key(context_id: u32, command_buffer_state_word: u32) -> u64 {
+    ((context_id as u64) << 8) | ((command_buffer_state_word & 0x3f) as u64)
 }
 
 fn descriptor_work_ordinal(ordinal: u32) -> u32 {
@@ -1078,7 +1104,10 @@ pub(crate) fn build_ta_descriptor(
         return Err(RenderBuildError::BufferTooSmall);
     }
     raw[..TA_DESCRIPTOR_SIZE].fill(0);
-    let registers = build_ta_registers(parameters)?;
+    let registers = build_ta_registers_for_work_key(
+        parameters,
+        render_work_key(metadata.context_id, metadata.command_buffer_state_word),
+    )?;
     write_common_descriptor(
         RenderDescriptorKind::Tiling,
         objects,
@@ -1129,11 +1158,13 @@ pub(crate) fn build_cold_opening_ta_descriptor(
     parameters: &G17pRenderParameters,
     objects: RenderDescriptorObjects,
     context_id: u32,
+    command_buffer_state_word: u32,
     ta_hardware_buffer_id: u32,
     raw: &mut [u8],
 ) -> Result<(), RenderBuildError> {
     let mut metadata = RenderDescriptorMetadata::source(RenderDescriptorKind::Tiling);
     metadata.context_id = context_id;
+    metadata.command_buffer_state_word = command_buffer_state_word;
     metadata.ta_hardware_buffer_id = ta_hardware_buffer_id;
     build_ta_descriptor(parameters, objects, metadata, raw)?;
     put_u16(raw, 0x38, 0x47);
@@ -1175,7 +1206,11 @@ pub(crate) fn build_fragment_descriptor(
     }
     raw[..FRAGMENT_DESCRIPTOR_SIZE].fill(0);
     let geometry = geometry(parameters)?;
-    let (registers, register_count) = build_fragment_registers_counted(parameters)?;
+    let registers = build_fragment_registers_for_work_key(
+        parameters,
+        render_work_key(metadata.context_id, metadata.command_buffer_state_word),
+    )?;
+    let register_count = FRAGMENT_REGISTER_COUNT;
     write_common_descriptor(
         RenderDescriptorKind::Fragment,
         objects,
@@ -1316,10 +1351,12 @@ pub(crate) fn build_cold_opening_fragment_descriptor(
     parameters: &G17pRenderParameters,
     objects: RenderDescriptorObjects,
     context_id: u32,
+    command_buffer_state_word: u32,
     raw: &mut [u8],
 ) -> Result<(), RenderBuildError> {
     let mut metadata = RenderDescriptorMetadata::source(RenderDescriptorKind::Fragment);
     metadata.context_id = context_id;
+    metadata.command_buffer_state_word = command_buffer_state_word;
     build_fragment_descriptor(parameters, objects, metadata, raw)?;
     put_u32(raw, 0x50, 1);
     put_u16(raw, 0x80, 0x56);
@@ -1872,6 +1909,7 @@ mod tests {
             RenderDescriptorMetadata {
                 context_id: 1,
                 submission_ordinal: 0,
+                command_buffer_state_word: 0,
                 ta_hardware_buffer_id: 0,
                 submit_sequence: 1,
             },
@@ -2080,7 +2118,7 @@ mod tests {
                     | if process_empty_tiles { 0x1_0000 } else { 0 };
                 let mut fragment = [0xa5u8; FRAGMENT_DESCRIPTOR_SIZE];
                 build_cold_opening_fragment_descriptor(
-                    &parameters, objects(), 1, &mut fragment,
+                    &parameters, objects(), 1, 1, &mut fragment,
                 )
                 .unwrap();
                 assert_eq!(fragment[0x2100], 0);
@@ -2106,8 +2144,9 @@ mod tests {
         let parameters = G17pRenderParameters::source_rsrc8();
         let mut tiling = [0u8; TA_DESCRIPTOR_SIZE];
         let mut fragment = [0u8; FRAGMENT_DESCRIPTOR_SIZE];
-        build_cold_opening_ta_descriptor(&parameters, objects(), 1, 0, &mut tiling).unwrap();
-        build_cold_opening_fragment_descriptor(&parameters, objects(), 1, &mut fragment).unwrap();
+        build_cold_opening_ta_descriptor(&parameters, objects(), 1, 0, 0, &mut tiling).unwrap();
+        build_cold_opening_fragment_descriptor(&parameters, objects(), 1, 1, &mut fragment)
+            .unwrap();
 
         assert_eq!(&tiling[0x38..0x3e], &[0x47, 0, 0x49, 0, 0x49, 0]);
         assert_eq!(tiling[0x789], 0x08);
@@ -2136,6 +2175,7 @@ mod tests {
             &parameters,
             objects(),
             1,
+            0,
             parameters.ta_hardware_buffer_id,
             &mut tiling,
         )
@@ -2177,35 +2217,42 @@ mod tests {
     }
 
     #[test]
-    fn common_descriptor_metadata_never_overwrites_encoded_register_values() {
+    fn descriptor_context_and_state_word_drive_every_native_work_key() {
         let mut parameters = G17pRenderParameters::source_rsrc8();
         parameters.ta_hardware_buffer_id = 5;
         parameters.gpc_perf_state_map = 7;
-        parameters.work_stamp = 0x5566_7788;
         let mut tiling = [0u8; TA_DESCRIPTOR_SIZE];
         let mut fragment = [0u8; FRAGMENT_DESCRIPTOR_SIZE];
-        let metadata = RenderDescriptorMetadata {
+        let tiling_metadata = RenderDescriptorMetadata {
             context_id: 9,
             submission_ordinal: 4,
+            command_buffer_state_word: 0x40,
             ta_hardware_buffer_id: parameters.ta_hardware_buffer_id,
             submit_sequence: 7,
         };
+        let fragment_metadata = RenderDescriptorMetadata {
+            command_buffer_state_word: 0x41,
+            ..tiling_metadata
+        };
 
-        build_ta_descriptor(&parameters, objects(), metadata, &mut tiling).unwrap();
-        build_fragment_descriptor(&parameters, objects(), metadata, &mut fragment).unwrap();
+        build_ta_descriptor(&parameters, objects(), tiling_metadata, &mut tiling).unwrap();
+        build_fragment_descriptor(&parameters, objects(), fragment_metadata, &mut fragment)
+            .unwrap();
 
         for (raw, offset, register, value) in [
             (&tiling[..], 0x300, 0x1c830, 5u64),
-            (&tiling[..], 0x36c, 0x10209, parameters.work_stamp),
-            (&tiling[..], 0x378, 0x1c9f0, parameters.work_stamp),
-            (&tiling[..], 0x384, 0x14320, parameters.work_stamp),
+            (&tiling[..], 0x36c, 0x10209, 0x900),
+            (&tiling[..], 0x378, 0x1c9f0, 0x900),
+            (&tiling[..], 0x384, 0x14320, 0x900),
             (&fragment[..], 0x454, 0x1c838, 5u64),
-            (&fragment[..], 0x46c, 0x10211, parameters.work_stamp),
-            (&fragment[..], 0x478, 0x10420, parameters.work_stamp),
+            (&fragment[..], 0x46c, 0x10211, 0x901),
+            (&fragment[..], 0x478, 0x10420, 0x901),
         ] {
             assert_eq!(get_u32(raw, offset), register);
             assert_eq!(get_u64(raw, offset + 4), value);
         }
+        assert_eq!(get_u32(&tiling, 0x0c), 9);
+        assert_eq!(get_u32(&fragment, 0x0c), 9);
     }
 
     #[test]
@@ -2291,6 +2338,7 @@ mod tests {
             RenderDescriptorMetadata {
                 context_id: 1,
                 submission_ordinal: 1,
+                command_buffer_state_word: 2,
                 ta_hardware_buffer_id: 0,
                 submit_sequence: 3,
             },
@@ -2303,6 +2351,7 @@ mod tests {
             RenderDescriptorMetadata {
                 context_id: 1,
                 submission_ordinal: 1,
+                command_buffer_state_word: 3,
                 ta_hardware_buffer_id: 0,
                 submit_sequence: 2,
             },

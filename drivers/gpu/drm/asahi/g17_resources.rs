@@ -1431,6 +1431,10 @@ fn g17p_cold_opening_metadata(
     g17_render::RenderDescriptorMetadata {
         context_id: 1,
         submission_ordinal: 0,
+        command_buffer_state_word: match kind {
+            g17_render::RenderDescriptorKind::Tiling => 0,
+            g17_render::RenderDescriptorKind::Fragment => 1,
+        },
         ta_hardware_buffer_id: 0,
         submit_sequence: match kind {
             g17_render::RenderDescriptorKind::Tiling => 1,
@@ -5934,6 +5938,7 @@ impl G17PUserRenderStorage {
         command_context: G17PRenderCommandContext,
         descriptor_context_id: u16,
         render_root_slot: u8,
+        command_buffer_state_words: [u32; 2],
         submission_ordinal: u32,
         parameter_manager_generation: Option<u64>,
         retained_sksm_backing: &mut Option<G17PRenderSksmBacking>,
@@ -6799,6 +6804,7 @@ impl G17PUserRenderStorage {
                 &translated.parameters,
                 tiling_objects,
                 command_context_id,
+                command_buffer_state_words[0],
                 translated.parameters.ta_hardware_buffer_id,
                 tiling,
             )
@@ -6819,6 +6825,7 @@ impl G17PUserRenderStorage {
                 &translated.parameters,
                 objects,
                 command_context_id,
+                command_buffer_state_words[1],
                 fragment,
             )
             .map_err(|error| render_build_fail_named(18, error))?;
@@ -7297,6 +7304,7 @@ impl G17PUserRenderStorage {
         parameter_page_list_vas: [u64; 2],
         command: &g17_uapi::TranslatedRenderCommand,
         num_clusters: u32,
+        command_buffer_state_words: [u32; 2],
         user_timestamps: [u64; 4],
         user_timestamp_aliases: Option<KVec<mmu::KernelMapping>>,
         submission_ordinal: u32,
@@ -7699,6 +7707,7 @@ impl G17PUserRenderStorage {
                 g17_render::RenderDescriptorMetadata {
                     context_id: u32::from(descriptor_context_id),
                     submission_ordinal,
+                    command_buffer_state_word: command_buffer_state_words[0],
                     ta_hardware_buffer_id: translated.parameters.ta_hardware_buffer_id,
                     submit_sequence: submission_ordinal as u64 * 2 + 1,
                 },
@@ -7723,6 +7732,7 @@ impl G17PUserRenderStorage {
                 g17_render::RenderDescriptorMetadata {
                     context_id: u32::from(descriptor_context_id),
                     submission_ordinal,
+                    command_buffer_state_word: command_buffer_state_words[1],
                     ta_hardware_buffer_id: 0,
                     submit_sequence: submission_ordinal as u64 * 2,
                 },
@@ -14502,6 +14512,7 @@ impl G17ResourceOwner {
         render_root_slot: Option<u8>,
         command: &g17_uapi::TranslatedRenderCommand,
         num_clusters: u32,
+        command_buffer_state_words: [u32; 2],
         user_timestamps: [u64; 4],
         user_timestamp_aliases: KVec<mmu::KernelMapping>,
         submission_ordinal: u32,
@@ -14572,6 +14583,7 @@ impl G17ResourceOwner {
             command_context,
             descriptor_context_id,
             render_root_slot,
+            command_buffer_state_words,
             submission_ordinal,
             parameter_manager_generation,
             retained_sksm_backing,
@@ -17178,8 +17190,8 @@ mod tests {
         assert_eq!(u64_at(&fragment, 0x30), objects.record_b);
         assert_eq!(u64_at(&fragment, 0x38), objects.zero);
         assert_eq!(u32_at(&fragment, 0x458), 0);
-        assert_eq!(u32_at(&fragment, 0x470), 0x100);
-        assert_eq!(u32_at(&fragment, 0x47c), 0x100);
+        assert_eq!(u32_at(&fragment, 0x470), 0x101);
+        assert_eq!(u32_at(&fragment, 0x47c), 0x101);
         assert_eq!(u64_at(&fragment, 0x1f40), 0xc000);
         assert_eq!(
             g17_render::build_fragment_registers(&parameters)
