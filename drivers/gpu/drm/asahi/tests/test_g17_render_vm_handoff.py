@@ -97,8 +97,9 @@ submit = function(runtime, "pub(crate) fn submit_translated_render(")
 assert "select_render_slot(render_slot)?" in submit
 assert "if defer_completion" in submit
 watch = function(drm, "impl g17_job::G17PRenderWatchBackend for G17PRenderWatchBackend")
-assert watch.count("packet.render_slot()") >= 4
+assert watch.count("packet.render_slot()") >= 2
 assert watch.count("timeout_deferred_render(") == 2
+assert "quarantine_render_slot(" not in watch
 assert "poll_deferred_render_completion" not in watch
 # Ordinary completion is event-driven with the runtime mutex released. Only
 # scheduler timeout/cancel enters the bounded final-observation path above.
@@ -127,7 +128,8 @@ assert "pte.store(phys" in map_pages
 assert map_pages.index("return Err(EBUSY)") < map_pages.index("pte.store(phys")
 unmap_pages = function(pgtable, "pub(crate) fn unmap_pages(")
 assert "if iova_range.is_empty()" in unmap_pages
-assert unmap_pages.index("if iova_range.is_empty()") < unmap_pages.index(".covers_range(")
+assert unmap_pages.index("if iova_range.is_empty()") < unmap_pages.index("let expected =")
+assert "complete_coverage(expected, visited, fully_mapped)" in unmap_pages
 
 # Process-root queue peers occupy the bounded gap between the render and
 # relocated-compute FLists, while context-0 keeps the native queue addresses.

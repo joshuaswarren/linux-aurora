@@ -418,6 +418,18 @@ impl G17PQueueRegistry {
         );
         self.lease_free.notify_all();
     }
+
+    /// Make one quarantined slot eligible after both firmware CPUs stop.
+    ///
+    /// The completion still owns its lease while this bit is cleared, so no
+    /// waiter can acquire the slot until that guard drops immediately after
+    /// this call. Both processors have relinquished the abandoned group, so it
+    /// can no longer justify a permanent capacity loss in the next session.
+    fn rehabilitate_render_slot_after_processor_stop(&self, slot: u8) {
+        debug_assert!(slot < g17_resources::G17PRenderQueuePair::SLOT_COUNT);
+        let mut held = self.lease.lock();
+        held.render_quarantined &= !(1u8 << slot);
+    }
 }
 
 pub(crate) struct G17PComputeLeaseGuard { registry: Arc<G17PQueueRegistry>, exclusive: bool }
@@ -492,6 +504,13 @@ impl G17PRenderCompletion {
         if let Some(vm_job) = self.vm_job.lock().as_ref() {
             vm_job.quarantine();
         }
+        // Publish the registry quarantine before waking userspace or dropping
+        // the runtime mutex. Recovery may stop the processors immediately
+        // after this failure; recording the bit here ensures its post-stop
+        // rehabilitation cannot race an older caller which marks it later.
+        if let Some(lease) = self.lease.lock().as_ref() {
+            lease.registry.quarantine_render_slot(lease.slot);
+        }
         self.status.record(error.to_errno());
         self.fence.set_error(error);
         // Retain BOTH guards: dropping the lease here also lets a waiter
@@ -530,6 +549,24 @@ impl G17PRenderCompletion {
         // mapping.
         drop(self.vm_job.lock().take());
         self.fence.signal();
+    }
+
+    /// Release guards retained by `fail_while_owned` after both ASCs stop.
+    ///
+    /// The output fence may already be signalled, so `complete` deliberately
+    /// returns early and cannot serve as this ownership boundary. Retire the VM
+    /// job before restoring the physical slot, then clear its quarantine while
+    /// the lease still excludes waiters; dropping the lease publishes both
+    /// changes and wakes them.
+    pub(crate) fn release_after_processor_stop(&self) {
+        drop(self.vm_job.lock().take());
+        let lease = self.lease.lock().take();
+        if let Some(lease) = lease.as_ref() {
+            lease
+                .registry
+                .rehabilitate_render_slot_after_processor_stop(lease.slot);
+        }
+        drop(lease);
     }
 }
 
@@ -790,7 +827,6 @@ impl Drop for G17PQueue {
 
 pub(crate) struct G17PRenderWatchBackend {
     runtime: G17PRuntimeRef,
-    registry: Arc<G17PQueueRegistry>,
 }
 
 impl g17_job::G17PRenderWatchBackend for G17PRenderWatchBackend {
@@ -798,22 +834,16 @@ impl g17_job::G17PRenderWatchBackend for G17PRenderWatchBackend {
         &self,
         packet: Arc<g17_job::G17PRenderWatchPacket>,
     ) -> kernel::drm::sched::Status {
-        let quarantine = self.runtime.mutex().lock().timeout_deferred_render(
+        self.runtime.mutex().lock().timeout_deferred_render(
             packet.render_slot(), packet.submission_id(), ETIMEDOUT,
         );
-        if quarantine {
-            self.registry.quarantine_render_slot(packet.render_slot());
-        }
         kernel::drm::sched::Status::Nominal
     }
 
     fn cancel(&self, packet: Arc<g17_job::G17PRenderWatchPacket>) {
-        let quarantine = self.runtime.mutex().lock().timeout_deferred_render(
+        self.runtime.mutex().lock().timeout_deferred_render(
             packet.render_slot(), packet.submission_id(), ECANCELED,
         );
-        if quarantine {
-            self.registry.quarantine_render_slot(packet.render_slot());
-        }
     }
 }
 
@@ -910,7 +940,6 @@ impl G17PQueue {
         let context = runtime.mutex().lock().prepare_queue_execution_context(&vm)?;
         let render_backend = Arc::new(G17PRenderWatchBackend {
             runtime,
-            registry: registry.clone(),
         }, GFP_KERNEL)?;
         let render_scheduler = g17_job::G17PRenderWatchScheduler::new(
             dev, render_backend.clone(),
@@ -2257,12 +2286,9 @@ impl G17PQueue {
                     );
                 sample.publish_ns = publish_started.elapsed().as_nanos().max(0) as u64;
                 if let Err(error) = submit {
-                    let quarantine = self.runtime.mutex().lock().timeout_deferred_render(
+                    self.runtime.mutex().lock().timeout_deferred_render(
                         render_slot, submission_id, error,
                     );
-                    if quarantine {
-                        self.registry.quarantine_render_slot(render_slot);
-                    }
                     return Err(Self::stage_fail(
                         submission_id, "submit-translated-render", error,
                     ));
@@ -2272,12 +2298,9 @@ impl G17PQueue {
                 ) {
                     Ok(packet) => packet,
                     Err(error) => {
-                        let quarantine = self.runtime.mutex().lock().timeout_deferred_render(
+                        self.runtime.mutex().lock().timeout_deferred_render(
                             render_slot, submission_id, error,
                         );
-                        if quarantine {
-                            self.registry.quarantine_render_slot(render_slot);
-                        }
                         return Err(Self::stage_fail(
                             submission_id, "allocate-render-watch", error,
                         ));
@@ -2286,12 +2309,9 @@ impl G17PQueue {
                 let finished = match self.render_scheduler.as_mut().ok_or(ENODEV)?.enqueue(packet) {
                     Ok(fence) => fence,
                     Err(error) => {
-                        let quarantine = self.runtime.mutex().lock().timeout_deferred_render(
+                        self.runtime.mutex().lock().timeout_deferred_render(
                             render_slot, submission_id, error,
                         );
-                        if quarantine {
-                            self.registry.quarantine_render_slot(render_slot);
-                        }
                         return Err(Self::stage_fail(
                             submission_id, "schedule-render-watch", error,
                         ));

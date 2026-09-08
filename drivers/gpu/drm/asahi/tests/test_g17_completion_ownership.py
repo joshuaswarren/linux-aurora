@@ -26,6 +26,10 @@ render_impl = item(drm, 'impl G17PRenderCompletion {')
 compute_impl = item(job, 'impl G17PJobCompletion {')
 timeout = item(live, '    pub(crate) fn timeout_deferred_render(')
 assert 'if retired {\n                signal.complete(Err(EIO));\n            } else {\n                signal.fail_while_owned(error);' in timeout
+release_quarantine = item(live, '    fn release_quarantined_render_after_processor_stop(')
+assert 'completion.release_after_processor_stop();' in release_quarantine
+for marker in ('    fn release_runtime_objects(', '    fn drop_queue('):
+    assert 'self.release_quarantined_render_after_processor_stop();' in item(live, marker)
 for marker in ('    fn service_async_compute_completions(',
                '    pub(crate) fn fail_outstanding_jobs_for_vm(',
                '    pub(crate) fn quarantine_async_compute('):
@@ -53,8 +57,13 @@ impl VmGuard {
  fn quarantine(&self){self.0.quarantined.store(true,Ordering::SeqCst);}
 }
 impl Drop for VmGuard {fn drop(&mut self){if self.0.active.fetch_sub(1,Ordering::SeqCst)==1 && self.0.closed.load(Ordering::SeqCst){self.0.unmapped.store(true,Ordering::SeqCst);}}}
-struct Lease(Arc<AtomicUsize>);
-impl Drop for Lease {fn drop(&mut self){self.0.fetch_add(1,Ordering::SeqCst);}}
+struct Registry(Arc<AtomicUsize>);
+impl Registry {
+ fn quarantine_render_slot(&self,_slot:u8){self.0.fetch_add(10,Ordering::SeqCst);}
+ fn rehabilitate_render_slot_after_processor_stop(&self,_slot:u8){self.0.fetch_add(100,Ordering::SeqCst);}
+}
+struct Lease {released:Arc<AtomicUsize>,registry:Registry,slot:u8}
+impl Drop for Lease {fn drop(&mut self){self.released.fetch_add(1,Ordering::SeqCst);}}
 #[derive(Default)] struct Status(AtomicI32);
 impl Status {fn record(&self,e:i32){let _=self.0.compare_exchange(0,e,Ordering::AcqRel,Ordering::Acquire);}}
 struct Fence {count:AtomicUsize,error:AtomicI32,status:Arc<Status>,status_at_signal:AtomicI32,active_at_signal:AtomicUsize,quarantined_at_signal:AtomicBool,memory:Arc<Memory>}
@@ -82,25 +91,27 @@ impl {name} {{
     else:
         source += item(impl, '    pub(crate) fn fail_while_owned(')
     source += item(impl, '    pub(crate) fn complete(')
+    if name == 'Render':
+        source += item(impl, '    pub(crate) fn release_after_processor_stop(')
     source += '\n}\n'
 
 source += r'''
 fn render(m:&Arc<Memory>,released:&Arc<AtomicUsize>)->Arc<Render>{
- let s=Arc::new(Status::default()); Arc::new(Render{fence:fence(&s,m),status:s,vm_job:Mutex(StdMutex::new(Some(VmGuard::new(m)))),signalled:AtomicU32::new(0),lease:Mutex(StdMutex::new(Some(Lease(released.clone()))))})
+ let s=Arc::new(Status::default()); Arc::new(Render{fence:fence(&s,m),status:s,vm_job:Mutex(StdMutex::new(Some(VmGuard::new(m)))),signalled:AtomicU32::new(0),lease:Mutex(StdMutex::new(Some(Lease{released:released.clone(),registry:Registry(released.clone()),slot:0})))})
 }
 fn compute(m:&Arc<Memory>)->Arc<Compute>{let s=Arc::new(Status::default());Arc::new(Compute{fence:fence(&s,m),status:s,vm_job:Mutex(StdMutex::new(Some(VmGuard::new(m)))),signalled:AtomicU32::new(0),destinations:[None,None]})}
 #[test] fn render_error_keeps_mapping_and_slot_through_file_and_scheduler_close(){
  let m=Arc::new(Memory::default());let released=Arc::new(AtomicUsize::new(0));
  let runtime=render(&m,&released);let scheduler=runtime.clone();
  m.close();runtime.fail_while_owned(EIO);drop(scheduler);
- assert!(!m.unmapped.load(Ordering::SeqCst));assert_eq!(released.load(Ordering::SeqCst),0);
+ assert!(!m.unmapped.load(Ordering::SeqCst));assert_eq!(released.load(Ordering::SeqCst),10);
  assert_eq!(runtime.fence.count.load(Ordering::SeqCst),1);
  assert_eq!(runtime.fence.status_at_signal.load(Ordering::SeqCst),-5);
  assert_eq!(runtime.fence.active_at_signal.load(Ordering::SeqCst),1);
  assert!(runtime.fence.quarantined_at_signal.load(Ordering::SeqCst));
  runtime.fail_while_owned(EIO);assert_eq!(runtime.fence.count.load(Ordering::SeqCst),1);
  // Runtime quarantine owner is dropped only after proven processor stop.
- drop(runtime);assert!(m.unmapped.load(Ordering::SeqCst));assert_eq!(released.load(Ordering::SeqCst),1);
+ drop(runtime);assert!(m.unmapped.load(Ordering::SeqCst));assert_eq!(released.load(Ordering::SeqCst),11);
 }
 #[test] fn compute_error_keeps_mapping_until_quarantine_owner_drops(){
  let m=Arc::new(Memory::default());let runtime=compute(&m);let scheduler=runtime.clone();
@@ -131,8 +142,16 @@ fn compute(m:&Arc<Memory>)->Arc<Compute>{let s=Arc::new(Status::default());Arc::
  let m=Arc::new(Memory::default());let released=Arc::new(AtomicUsize::new(0));let c=render(&m,&released);m.close();
  let mut threads=vec![];for _ in 0..8{let c=c.clone();threads.push(std::thread::spawn(move||c.fail_while_owned(EIO)));}
  for t in threads{t.join().unwrap();}assert_eq!(c.fence.count.load(Ordering::SeqCst),1);
- assert!(!m.unmapped.load(Ordering::SeqCst));assert_eq!(released.load(Ordering::SeqCst),0);
+ assert!(!m.unmapped.load(Ordering::SeqCst));assert_eq!(released.load(Ordering::SeqCst),10);
  drop(c);assert!(m.unmapped.load(Ordering::SeqCst));
+}
+#[test] fn processor_stop_releases_a_signalled_quarantine_despite_scheduler_refs(){
+ let m=Arc::new(Memory::default());let released=Arc::new(AtomicUsize::new(0));let runtime=render(&m,&released);let scheduler=runtime.clone();
+ m.close();runtime.fail_while_owned(EIO);assert!(!m.unmapped.load(Ordering::SeqCst));assert_eq!(released.load(Ordering::SeqCst),10);
+ runtime.release_after_processor_stop();
+ assert!(m.unmapped.load(Ordering::SeqCst));assert_eq!(released.load(Ordering::SeqCst),111,"quarantine, rehabilitate, then release exactly once");
+ runtime.release_after_processor_stop();assert_eq!(released.load(Ordering::SeqCst),111);
+ drop(runtime);drop(scheduler);assert_eq!(released.load(Ordering::SeqCst),111);
 }
 '''
 with tempfile.TemporaryDirectory() as tmp:
