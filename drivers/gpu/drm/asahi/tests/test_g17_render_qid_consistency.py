@@ -69,8 +69,8 @@ pair_transaction = REGS[
 ]
 pair_transaction = pair_transaction[:pair_transaction.index("fn sgx_read32")]
 ordered = [
-    "g17p_sksm_port_powered()",
     "self.sksm_fifo.lock()",
+    "g17p_sksm_port_powered()",
     "g17p_sksm_publish_locked(&sgx, fragment.0)",
     "g17p_sksm_publish_locked(&sgx, fragment.1)",
     "g17p_sksm_publish_locked(&sgx, tiling.0)",
@@ -100,7 +100,7 @@ for prerequisite in (
     "DEVICE_CONTROL_OPCODE_IDLE_POWER_OFF",
     "encode_primary_device_control()",
     "[target; 3]",
-    "DEVICE_CONTROL_IDLE_POWER_OFF_ARG_INHIBIT",
+    "DEVICE_CONTROL_IDLE_POWER_OFF_ARG_DISABLE_IDLE_AND_WAKE",
     "release_g17p_render_registration_power",
     "Err(ETIMEDOUT)",
 ):

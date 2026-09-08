@@ -268,18 +268,17 @@ pub(crate) const CONTROL_RING_INDEX_MASK: u32 = CONTROL_RING_ENTRIES as u32 - 1;
 /// SLEEP/NAP) -- and it is idempotent, because `0x21960` returns immediately
 /// when the powered latch is already set.
 pub(crate) const DEVICE_CONTROL_OPCODE_IDLE_POWER_OFF: u32 = 0x0a;
-/// The argument that means "disable idle power off, and power the cores on
-/// now". Any non-zero value only stores the enable word and returns.
-pub(crate) const DEVICE_CONTROL_IDLE_POWER_OFF_ARG_POWER_ON: u32 = 0;
-/// Non-zero inhibits the firmware's idle power-down. The scheduler idle-off
-/// routine `0x7ca0` reads `[0xfffffc0000177838]` as one of a chain of guards
-/// (b1 `0x8634`), each of which branches to `0x871c` = `mov w0,#1; ret` when
-/// set — an early return that skips the bit-1 acquire at `0x8228`, i.e. skips
-/// closing the GPU core power gate. `arg = 0` powers the cores on but leaves
-/// this permissive, so the cores are gated off again shortly after; `arg != 0`
-/// sets the inhibit but the handler's `cbnz w8, 0x5238` then skips the
-/// power-on. Hence the pair: power on, then hold.
-pub(crate) const DEVICE_CONTROL_IDLE_POWER_OFF_ARG_INHIBIT: u32 = 1;
+/// Disable ordinary idle power-off and request that the GPU cores wake now.
+///
+/// FW_PROVEN (25F80 B100, SHA256 83af9ae0...): opcode 0x0a stores this value
+/// in `[0xfffffc0000177838]` and calls the wake path only for zero. The
+/// scheduler's 0x20000000 idle event skips its descent while that policy word
+/// is zero. A cold wake may reload the word from Region-C +0x30, so callers
+/// which need a scoped hold must retire a second zero after the core is up.
+pub(crate) const DEVICE_CONTROL_IDLE_POWER_OFF_ARG_DISABLE_IDLE_AND_WAKE: u32 = 0;
+/// Restore the firmware's ordinary idle power-off policy. A non-zero value
+/// permits the scheduler idle event to descend; it is not a power hold.
+pub(crate) const DEVICE_CONTROL_IDLE_POWER_OFF_ARG_ENABLE_IDLE: u32 = 1;
 /// Separate retained compute resources from the render pool. Native
 /// populateInitialFirmwareState (8aa258c) publishes resource-derived +0x14
 /// page-list and +0x30 run-list addresses; neither is firmware-fixed.

@@ -1036,10 +1036,14 @@ impl Resources {
                 return Err(EINVAL);
             }
         }
+        let _guard = self.sksm_fifo.lock();
+        // Serialize the final power witness with the complete four-write
+        // transaction. Sampling before this lock left a window in which a
+        // concurrent queue publication could finish and firmware could close
+        // the aperture before the first configuration write.
         if !self.g17p_sksm_port_powered() {
             return Ok(false);
         }
-        let _guard = self.sksm_fifo.lock();
         let sgx = self.sgx.try_access().ok_or(ENODEV)?;
         Self::g17p_sksm_publish_locked(&sgx, fragment.0)?;
         Self::g17p_sksm_publish_locked(&sgx, fragment.1)?;
