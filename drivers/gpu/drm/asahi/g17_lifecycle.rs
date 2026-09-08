@@ -45,6 +45,40 @@ pub(crate) struct StartedCpuPair<P: AscCpuLifecycle> {
 }
 
 impl<P: AscCpuLifecycle> StartedCpuPair<P> {
+    /// Retain both provider handles before either processor is started.
+    ///
+    /// Boot paths which also own RTKit and firmware-visible memory use this
+    /// constructor with [`Self::start_staged_in_place`].  That lets their
+    /// outer transaction keep every related owner alive when a rollback stop
+    /// cannot be proven, instead of losing the providers inside a constructor
+    /// error.
+    pub(crate) fn new(gfx: P, gfx1: P) -> Self {
+        Self {
+            gfx,
+            gfx1,
+            gfx_running: false,
+            gfx1_running: false,
+        }
+    }
+
+    /// Start both CPUs while retaining the partially-started pair on error.
+    ///
+    /// The caller must invoke [`Self::stop`] on an error before releasing any
+    /// RTKit, queue, or translation owner.  A failed stop can then be handled
+    /// by retaining the complete outer boot transaction.
+    pub(crate) fn start_staged_in_place<F>(&mut self, gfx_ready: F) -> Result<(), P::Error>
+    where
+        F: FnOnce() -> Result<(), P::Error>,
+    {
+        debug_assert!(!self.gfx_running && !self.gfx1_running);
+        self.gfx.start_cpu()?;
+        self.gfx_running = true;
+        gfx_ready()?;
+        self.gfx1.start_cpu()?;
+        self.gfx1_running = true;
+        Ok(())
+    }
+
     /// Start both provider-owned CPUs and return their retained owner.
     pub(crate) fn start(gfx: P, gfx1: P) -> Result<Self, P::Error> {
         Self::start_staged(gfx, gfx1, || Ok(()))
@@ -63,22 +97,12 @@ impl<P: AscCpuLifecycle> StartedCpuPair<P> {
     where
         F: FnOnce() -> Result<(), P::Error>,
     {
-        gfx.start_cpu()?;
-        if let Err(err) = gfx_ready() {
-            let _ = gfx.stop_cpu();
+        let mut pair = Self::new(gfx, gfx1);
+        if let Err(err) = pair.start_staged_in_place(gfx_ready) {
+            let _ = pair.stop();
             return Err(err);
         }
-        if let Err(err) = gfx1.start_cpu() {
-            let _ = gfx.stop_cpu();
-            return Err(err);
-        }
-
-        Ok(Self {
-            gfx,
-            gfx1,
-            gfx_running: true,
-            gfx1_running: true,
-        })
+        Ok(pair)
     }
 
     /// Stop both processors and retain their provider handles.
@@ -112,6 +136,28 @@ impl<P: AscCpuLifecycle> StartedCpuPair<P> {
     /// inside this pair.
     pub(crate) fn gfx(&self) -> &P {
         &self.gfx
+    }
+}
+
+/// An in-progress firmware boot whose complete owner graph can be retained.
+pub(crate) trait FailedBootSession {
+    /// Stop every processor which the transaction successfully started.
+    fn stop_cpu_pair(&mut self) -> bool;
+    /// Deliberately retain every firmware-visible owner after an unproven stop.
+    fn retain_firmware_owners(self);
+}
+
+/// Roll back one failed firmware boot without exposing freed memory to an ASC.
+///
+/// A successful stop permits normal destruction.  If either stop fails, the
+/// transaction consumes itself through `retain_firmware_owners` so none of its
+/// RTKit, provider, or callback state can be freed under live firmware.
+pub(crate) fn rollback_failed_boot_session<T: FailedBootSession>(mut owner: T) -> bool {
+    if owner.stop_cpu_pair() {
+        true
+    } else {
+        owner.retain_firmware_owners();
+        false
     }
 }
 
@@ -314,6 +360,8 @@ mod tests {
         DropCpuPair,
         DropManager,
         RetainRuntime,
+        RetainBoot,
+        DropBoot,
         PauseSubmissions,
         StopCpuPair,
         DisableSksmQueue,
@@ -603,6 +651,45 @@ mod tests {
     }
 
     #[test]
+    fn staged_in_place_failure_keeps_primary_owned_for_outer_rollback() {
+        let state = State {
+            failure: None,
+            trace: RefCell::new(std::vec::Vec::new()),
+        };
+        let mut pair = StartedCpuPair::new(
+            MockCpu {
+                role: Role::Gfx,
+                state: &state,
+            },
+            MockCpu {
+                role: Role::Gfx1,
+                state: &state,
+            },
+        );
+
+        assert_eq!(
+            pair.start_staged_in_place(|| {
+                state.trace.borrow_mut().push(Event::Body);
+                Err(TestError::Body)
+            }),
+            Err(TestError::Body)
+        );
+        assert_eq!(
+            *state.trace.borrow(),
+            [Event::Start(Role::Gfx), Event::Body]
+        );
+        assert_eq!(pair.stop(), Ok(()));
+        assert_eq!(
+            *state.trace.borrow(),
+            [
+                Event::Start(Role::Gfx),
+                Event::Body,
+                Event::Stop(Role::Gfx),
+            ]
+        );
+    }
+
+    #[test]
     fn explicitly_stopped_pair_does_not_stop_twice_on_drop() {
         let state = State {
             failure: None,
@@ -770,6 +857,55 @@ mod tests {
         };
         teardown_persistent_runtime(&mut owner);
         assert_eq!(owner.trace, [Event::StopCpuPair, Event::RetainRuntime]);
+    }
+
+    struct MockFailedBoot<'a> {
+        trace: &'a RefCell<std::vec::Vec<Event>>,
+        stop_ok: bool,
+    }
+
+    impl Drop for MockFailedBoot<'_> {
+        fn drop(&mut self) {
+            self.trace.borrow_mut().push(Event::DropBoot);
+        }
+    }
+
+    impl FailedBootSession for MockFailedBoot<'_> {
+        fn stop_cpu_pair(&mut self) -> bool {
+            self.trace.borrow_mut().push(Event::StopCpuPair);
+            self.stop_ok
+        }
+
+        fn retain_firmware_owners(self) {
+            self.trace.borrow_mut().push(Event::RetainBoot);
+            core::mem::forget(self);
+        }
+    }
+
+    #[test]
+    fn failed_boot_drops_owners_only_after_a_proven_stop() {
+        let trace = RefCell::new(std::vec::Vec::new());
+        assert!(rollback_failed_boot_session(MockFailedBoot {
+            trace: &trace,
+            stop_ok: true,
+        }));
+        assert_eq!(
+            *trace.borrow(),
+            [Event::StopCpuPair, Event::DropBoot]
+        );
+    }
+
+    #[test]
+    fn failed_boot_retains_every_owner_when_stop_is_unproven() {
+        let trace = RefCell::new(std::vec::Vec::new());
+        assert!(!rollback_failed_boot_session(MockFailedBoot {
+            trace: &trace,
+            stop_ok: false,
+        }));
+        assert_eq!(
+            *trace.borrow(),
+            [Event::StopCpuPair, Event::RetainBoot]
+        );
     }
 
     struct MockRuntimeRecovery {
