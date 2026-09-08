@@ -27,6 +27,7 @@ assert graph.index("context_aliases: Option<mmu::T8140NativeContextAliases>") < 
 )
 
 handoff = function("pub(crate) fn handoff_retained_render_vm(")
+preserve = function("fn preserve_immediate_retired_render_graph(")
 assert handoff.index("self.require_retired_render_owner()?") < handoff.index(
     "G17PRetiredRenderGraph {"
 )
@@ -38,10 +39,10 @@ for owner in (
     assert owner in handoff
 assert "release_client_context" not in handoff
 assert "unreserve_render_storage_hardware_buffer_id" not in handoff
-assert "completion_references_descriptor_range(&range)" in handoff
-assert ".push_within_capacity(previous)" in handoff
+assert "completion_references_descriptor_range(&range)" in preserve
+assert ".push_within_capacity(previous)" in preserve
 assert "self.retired_render_handoff_graph = Some(retired)" in handoff
-assert handoff.index("completion_references_descriptor_range(&range)") < handoff.index(
+assert preserve.index("completion_references_descriptor_range(&range)") < preserve.index(
     "Self::release_retired_handoff_graph("
 )
 

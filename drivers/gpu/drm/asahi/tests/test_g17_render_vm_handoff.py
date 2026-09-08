@@ -22,13 +22,14 @@ def function(source, marker):
 
 
 handoff = function(manager, "pub(crate) fn handoff_retained_render_vm(")
+preserve = function(manager, "fn preserve_immediate_retired_render_graph(")
 assert handoff.index("self.require_retired_render_owner()?") < handoff.index("G17PRetiredRenderGraph {")
 assert "self.render_bind.take().ok_or(EIO)?" in handoff
 assert "self.render_context_aliases.take()" in handoff
 assert "self.render_storage.take().ok_or(ENODEV)?" in handoff
 assert "release_client_context" not in handoff
-assert "completion_references_descriptor_range(&range)" in handoff
-assert ".push_within_capacity(previous)" in handoff
+assert "completion_references_descriptor_range(&range)" in preserve
+assert ".push_within_capacity(previous)" in preserve
 assert "self.retired_render_handoff_graph = Some(retired)" in handoff
 assert "install_t8140_native_context_aliases" not in handoff
 assert "incoming VM builds a new root" in handoff

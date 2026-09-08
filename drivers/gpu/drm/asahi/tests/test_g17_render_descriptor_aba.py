@@ -20,14 +20,15 @@ def function(source, marker):
 
 
 handoff = function(manager, "pub(crate) fn handoff_retained_render_vm(")
+preserve = function(manager, "fn preserve_immediate_retired_render_graph(")
 scan = function(resources, "pub(crate) fn completion_references_descriptor_range(")
 prune = function(manager, "fn prune_unreferenced_retired_render_graphs(")
 stop = function(manager, "pub(crate) fn release_runtime_objects_after_processor_stop(")
 
-assert handoff.index("completion_references_descriptor_range(&range)") < handoff.index(
+assert preserve.index("completion_references_descriptor_range(&range)") < preserve.index(
     ".push_within_capacity(previous)"
 )
-assert handoff.index("self.prune_unreferenced_retired_render_graphs()?") < handoff.index(
+assert handoff.index("self.preserve_immediate_retired_render_graph()?") < handoff.index(
     "self.park_render_sksm_backing_for_graph_rebuild()?"
 )
 assert "G17P_TA_HARDWARE_BUFFER_ID_COUNT" in manager[
