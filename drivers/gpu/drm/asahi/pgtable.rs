@@ -802,7 +802,27 @@ impl UatPageTable {
         if iova_range.is_empty() {
             return Ok(());
         }
-        if !self.covers_range(iova_range.clone(), false, false)? {
+        // Keep the ownership preflight in this frame. `KernelMapping::drop`
+        // runs from deeply nested GPUVM constructor unwind paths, and calling
+        // the generic `covers_range` walker here stacked two independently
+        // large page-table traversal frames. A routine two-root descriptor
+        // allocation collision then overflowed the 32-KiB task stack before
+        // either walker touched a PTE. This is the same two-pass invariant as
+        // `covers_range`: count every expected leaf and reject any hole before
+        // the second pass clears a single entry, but without nesting walkers.
+        let expected = (iova_range.end - iova_range.start) >> UAT_PGBIT;
+        let mut visited = 0u64;
+        let mut fully_mapped = true;
+        self.with_pages(iova_range.clone(), false, false, |_, ptes| {
+            visited = visited.checked_add(ptes.len() as u64).ok_or(EOVERFLOW)?;
+            for pte in ptes {
+                if pte.load(Ordering::Acquire) & PTE_TYPE_BITS != PTE_TYPE_LEAF_TABLE {
+                    fully_mapped = false;
+                }
+            }
+            Ok(())
+        })?;
+        if !complete_coverage(expected, visited, fully_mapped) {
             pr_err!(
                 "UATPageTable::unmap_pages: refusing partially unmapped range {:#x?}\n",
                 iova_range
