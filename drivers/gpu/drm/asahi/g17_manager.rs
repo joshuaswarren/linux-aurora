@@ -1109,6 +1109,13 @@ pub(crate) struct G17PManagerConstruction {
     /// retained render graph. Replaced only after paired completion plus
     /// FList release, or after both firmware CPUs stop.
     render_context_aliases: Option<mmu::T8140NativeContextAliases>,
+    /// The immediately preceding cross-VM graph. Firmware retirement makes
+    /// its queue entries reusable, but native keeps workqueue objects alive
+    /// across process switches and may still dereference their job-private
+    /// graph after the host-visible EventControl unlink. Keep one complete
+    /// generation mapped so the incoming graph cannot immediately reuse and
+    /// overwrite the same VA or PBDesc ID.
+    retired_render_handoff_graph: Option<G17PRetiredRenderGraph>,
     render_submission_ordinal: u32,
     /// Per-command host timestamp shared by the TA and 3D KSM entries. Native
     /// prepares it once in the combined render descriptor, before either
@@ -1206,6 +1213,7 @@ struct G17PRenderSlotState {
     // storage/SKSM backing reachable through them can be released.
     bind: Option<G17PRenderRootOwner>,
     context_aliases: Option<mmu::T8140NativeContextAliases>,
+    retired_handoff_graph: Option<G17PRetiredRenderGraph>,
     storage: Option<g17_resources::G17PUserRenderStorage>,
     sksm: Option<G17PRenderSksmQueues>,
     tracker: Option<G17PPartialOpeningRenderTracker>,
@@ -1213,6 +1221,15 @@ struct G17PRenderSlotState {
     auxiliary_timestamp: u64,
     hardware_buffer_id: Option<u32>,
     hardware_buffer_published: bool,
+}
+
+#[cfg(not(test))]
+struct G17PRetiredRenderGraph {
+    // Rust drops fields in declaration order. Retract roots and their aliases
+    // before releasing any storage reachable through them.
+    bind: G17PRenderRootOwner,
+    context_aliases: mmu::T8140NativeContextAliases,
+    storage: g17_resources::G17PUserRenderStorage,
 }
 
 #[cfg(not(test))]
@@ -1289,6 +1306,7 @@ impl G17PRenderSlotState {
         self.storage.is_some()
             || self.tracker.is_some()
             || self.bind.is_some()
+            || self.retired_handoff_graph.is_some()
             || self.submission_ordinal != 0
     }
 }
@@ -1642,6 +1660,7 @@ impl G17PManagerConstruction {
             tracker: self.render_tracker.take(),
             bind: self.render_bind.take(),
             context_aliases: self.render_context_aliases.take(),
+            retired_handoff_graph: self.retired_render_handoff_graph.take(),
             submission_ordinal: core::mem::take(&mut self.render_submission_ordinal),
             auxiliary_timestamp: core::mem::take(&mut self.render_auxiliary_timestamp),
             hardware_buffer_id: self.render_hardware_buffer_id.take(),
@@ -1659,6 +1678,7 @@ impl G17PManagerConstruction {
         self.render_tracker = state.tracker;
         self.render_bind = state.bind;
         self.render_context_aliases = state.context_aliases;
+        self.retired_render_handoff_graph = state.retired_handoff_graph;
         self.render_submission_ordinal = state.submission_ordinal;
         self.render_auxiliary_timestamp = state.auxiliary_timestamp;
         self.render_hardware_buffer_id = state.hardware_buffer_id;
@@ -1785,6 +1805,7 @@ impl G17PManagerConstruction {
                 render_tracker: None,
                 render_bind: None,
                 render_context_aliases: None,
+                retired_render_handoff_graph: None,
                 render_submission_ordinal: 0,
                 render_auxiliary_timestamp: 0,
                 render_hardware_buffer_id: None,
@@ -2192,6 +2213,7 @@ impl G17PManagerConstruction {
         self.render_storage.is_some()
             || self.render_tracker.is_some()
             || self.render_bind.is_some()
+            || self.retired_render_handoff_graph.is_some()
             || self.render_submission_ordinal != 0
             || self.parked_render_scheduler_active()
     }
@@ -2200,6 +2222,7 @@ impl G17PManagerConstruction {
         if self.render_storage.is_some()
             || self.render_tracker.is_some()
             || self.render_bind.is_some()
+            || self.retired_render_handoff_graph.is_some()
             || self.render_submission_ordinal != 0
             || self.parked_render_scheduler_active()
         {
@@ -2964,6 +2987,10 @@ impl G17PManagerConstruction {
             {
                 self.render_hardware_buffer_ids.unreserve(id);
             }
+            Self::release_retired_handoff_graph(
+                &mut self.render_hardware_buffer_ids,
+                state.retired_handoff_graph.take(),
+            );
             // Both firmware CPUs are stopped; dropping the complete state now
             // retracts its command root before any reachable mapping backing.
             drop(state);
@@ -2992,6 +3019,10 @@ impl G17PManagerConstruction {
         // Both CPUs are stopped at this boundary. The alias owner's Drop
         // removes the context-0 leaves and invalidates ASIDs 0/1.
         self.render_context_aliases = None;
+        Self::release_retired_handoff_graph(
+            &mut self.render_hardware_buffer_ids,
+            self.retired_render_handoff_graph.take(),
+        );
         self.render_sksm = None;
         self.bootstrap_uma = None;
         self.prepared_render_flist = None;
@@ -3010,6 +3041,7 @@ impl G17PManagerConstruction {
             || self.render_tracker.is_some()
             || self.render_storage.is_some()
             || self.render_context_aliases.is_some()
+            || self.retired_render_handoff_graph.is_some()
             || self.parked_render_scheduler_active()
         {
             return Err(EBUSY);
@@ -3113,15 +3145,34 @@ impl G17PManagerConstruction {
         let old_root = self.render_bind.as_ref().map_or(0, |binding| binding.root());
         let old_vm_id = self.render_bind.as_ref().map_or(0, |binding| binding.vm_id());
         self.park_render_sksm_backing_for_graph_rebuild()?;
-        self.render_storage.as_mut().ok_or(ENODEV)?.release_client_context();
-        self.render_bind = None;
-        self.render_context_aliases = None;
-        self.unreserve_render_storage_hardware_buffer_id();
-        self.render_storage = None;
+        if self.render_bind.is_none() || self.render_context_aliases.is_none() {
+            return Err(EIO);
+        }
+        let retired = G17PRetiredRenderGraph {
+            bind: self.render_bind.take().ok_or(EIO)?,
+            context_aliases: self.render_context_aliases.take().ok_or(EIO)?,
+            storage: self.render_storage.take().ok_or(ENODEV)?,
+        };
+        let previous = self.retired_render_handoff_graph.replace(retired);
+        Self::release_retired_handoff_graph(
+            &mut self.render_hardware_buffer_ids,
+            previous,
+        );
         dev_info!(self.resources.dev().as_ref(),
-            "G17P render VM handoff: retired job-private graph vm={} root={:#x}; incoming VM builds a new root at ordinal {}, QID producer state retained\n",
+            "G17P render VM handoff: quarantined retired job-private graph vm={} root={:#x}; incoming VM builds a new root at ordinal {}, QID producer state retained\n",
             old_vm_id, old_root, self.render_submission_ordinal);
         Ok(())
+    }
+
+    fn release_retired_handoff_graph(
+        ids: &mut G17PHardwareBufferIdAllocator,
+        retired: Option<G17PRetiredRenderGraph>,
+    ) {
+        let Some(retired) = retired else { return };
+        if let Some(id) = retired.storage.retained_hardware_buffer_id() {
+            ids.unreserve(id);
+        }
+        drop(retired);
     }
 
     /// Rebuild a retained graph whose ring producer no longer matches the
