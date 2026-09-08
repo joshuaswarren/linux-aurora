@@ -717,10 +717,12 @@ struct G17PQueue {
     async_backend: Option<Arc<G17PAsyncQueueBackend>>,
     async_scheduler: Option<g17_job::G17PJobScheduler<G17PAsyncQueueBackend>>,
     render_scheduler: Option<g17_job::G17PRenderWatchScheduler<G17PRenderWatchBackend>>,
-    /// Most recent compute job submitted through this logical DRM queue.
-    /// Render explicitly joins this timeline before acquiring its physical
-    /// slot; its own completion is event-driven after publication.
-    last_async_compute: Option<Fence>,
+    /// Most recent job submitted through this logical DRM queue, regardless
+    /// of engine. Vulkan queue order crosses the render/compute boundary: a
+    /// compute following a render must not publish before the render retires,
+    /// just as a render following compute must not overtake it. Independent
+    /// logical queues retain their own timelines and can still overlap.
+    last_submission: Option<Fence>,
     id: u64,
 }
 
@@ -877,7 +879,7 @@ impl G17PQueue {
             async_backend: None,
             async_scheduler: None,
             render_scheduler: Some(render_scheduler),
-            last_async_compute: None,
+            last_submission: None,
             id,
         })
     }
@@ -1078,15 +1080,22 @@ impl G17PQueue {
             Some(g17_job::G17PJobCompletion { fence: output, timestamps, destinations, status: self.vm.status().clone() }),
             Some(self.vm.retain_t8140_job()?),
         )?;
-        let mut dependencies = KVec::with_capacity(in_sync_count, GFP_KERNEL)?;
+        // One extra dependency carries this logical queue's preceding render
+        // or compute completion. DRM entities serialize compute jobs with one
+        // another, but render publication uses a separate watch entity; the
+        // explicit fence is what preserves Vulkan queue order across engines.
+        let mut dependencies = KVec::with_capacity(in_sync_count + 1, GFP_KERNEL)?;
         for sync in syncs.drain(0..in_sync_count) {
             if let Some(fence) = sync.fence { dependencies.push(fence, GFP_KERNEL)?; }
+        }
+        if let Some(prior) = self.last_submission.as_ref() {
+            dependencies.push(prior.clone(), GFP_KERNEL)?;
         }
         let finished = self.async_scheduler.as_mut().ok_or(EIO)?.enqueue(packet, dependencies)?;
         // The job is queued and owns its completion from here: give userspace
         // the fence that signals when the GPU has actually run it.
+        self.last_submission = Some(finished.clone());
         publication.publish_async(&finished);
-        self.last_async_compute = Some(finished);
         if crate::util::g17p_verbose() {
             pr_info!("G17P async submit: QUEUED submission {} owner={} qid={} context={}\n",
                 submission_id, self.id, backend.hardware_queue, backend.context.context_id());
@@ -1216,8 +1225,8 @@ impl G17PQueue {
             .map_err(|error| Self::stage_fail(submission_id, "acquire-lease", error))
     }
 
-    fn join_async_compute_timeline(&mut self, submission_id: u64) -> Result {
-        let Some(fence) = self.last_async_compute.as_ref() else {
+    fn join_queue_timeline(&mut self, submission_id: u64) -> Result {
+        let Some(fence) = self.last_submission.as_ref() else {
             return Ok(());
         };
         // SAFETY: the queue owns `fence` until this wait returns.
@@ -1231,11 +1240,11 @@ impl G17PQueue {
         if ret < 0 {
             return Err(Self::stage_fail(
                 submission_id,
-                "wait-queue-compute",
+                "wait-queue-timeline",
                 Error::from_errno(ret as i32),
             ));
         }
-        self.last_async_compute = None;
+        self.last_submission = None;
         if self.vm.status().get() != 0 { return Err(EIO); }
         Ok(())
     }
@@ -1892,17 +1901,34 @@ impl G17PQueue {
         // whole class of "another client owns the render slot" failures
         // publishing nothing, and a compositor that hit one waited on an
         // unsignalled syncobj forever instead of losing a frame.
-        let mut deferred_outputs: KVec<file::SyncItem> = KVec::new();
-        for item in syncs.drain(in_sync_count..) {
-            deferred_outputs
-                .push(item, GFP_KERNEL)
-                .map_err(|_| Self::stage_fail(submission_id, "output-sync-list", ENOMEM))?;
-        }
         let early_output_fence: UserFence<G17PSubmissionFence> = self
             .fence_contexts
             .new_fence(0, G17PSubmissionFence)
             .map_err(|error| Self::stage_fail(submission_id, "new-fence", error))?
             .into();
+        let output_count = syncs.len() - in_sync_count;
+        let mut deferred_outputs: KVec<file::SyncItem> =
+            match KVec::with_capacity(output_count, GFP_KERNEL) {
+                Ok(outputs) => outputs,
+                Err(_) => {
+                    // Output syncobjs are already resolved and userspace may
+                    // wait on them even when this bookkeeping allocation
+                    // fails. Publish the fence directly from the original
+                    // vector before returning the allocation error.
+                    early_output_fence.set_error(ECANCELED);
+                    early_output_fence.signal();
+                    let fence = Fence::from_fence(&early_output_fence);
+                    Self::install_output_fences(syncs.drain(in_sync_count..), &fence);
+                    return Err(Self::stage_fail(
+                        submission_id, "output-sync-list", ENOMEM,
+                    ));
+                }
+            };
+        for item in syncs.drain(in_sync_count..) {
+            deferred_outputs
+                .push_within_capacity(item)
+                .map_err(|_| Self::stage_fail(submission_id, "output-sync-capacity", EIO))?;
+        }
         let mut publication = G17POutputFencePublication {
             fence: &early_output_fence,
             outputs: deferred_outputs,
@@ -2056,7 +2082,11 @@ impl G17PQueue {
             );
         }
 
-        self.join_async_compute_timeline(submission_id)?;
+        // Direct render publication cannot be placed behind a scheduler
+        // dependency, so join this queue's preceding render or compute fence
+        // before taking a physical render slot. Other logical queues remain
+        // independent and retain full render/render and render/compute overlap.
+        self.join_queue_timeline(submission_id)?;
         let mut sample = g17_perf::RenderSample::default();
 
         // Dependencies must become ready before reserving the physical
@@ -2170,6 +2200,9 @@ impl G17PQueue {
                         ));
                     }
                 };
+                // Record queue order before exposing the fence through an
+                // output syncobj. A woken peer may submit immediately.
+                self.last_submission = Some(finished.clone());
                 publication.publish_async(&finished);
                 sample.ioctl_ns = entered.elapsed().as_nanos().max(0) as u64;
                 if let Some(report) = self.registry.record_render(sample) {

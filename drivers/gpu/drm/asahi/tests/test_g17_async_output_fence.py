@@ -81,6 +81,21 @@ enqueue = source.index('.enqueue(packet, dependencies)?;')
 assert enqueue < source.index('publication.publish_async(&finished);', enqueue), \
     'the completion fence is published before the job is enqueued'
 
+# The output-list allocation itself used to sit before the publication guard.
+# ENOMEM there dropped already-resolved syncobjs with no fence installed. The
+# early fence must exist first, and that allocation failure must publish it
+# directly from the original sync list before returning.
+guarded = block('    fn submit_guarded(')
+fence_create = guarded.index('let early_output_fence:')
+output_alloc = guarded.index('KVec::with_capacity(output_count')
+alloc_failure = guarded.index('Err(_) => {', output_alloc)
+alloc_return = guarded.index('return Err(Self::stage_fail(', alloc_failure)
+assert fence_create < output_alloc
+assert guarded.index('early_output_fence.set_error(ECANCELED);', alloc_failure) < alloc_return
+assert guarded.index('early_output_fence.signal();', alloc_failure) < alloc_return
+assert guarded.index('Self::install_output_fences(syncs.drain(in_sync_count..)', alloc_failure) < alloc_return
+assert '.push_within_capacity(item)' in guarded
+
 preamble = r'''
 #![allow(dead_code, unused_variables)]
 use std::marker::PhantomData;
