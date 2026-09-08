@@ -3000,12 +3000,14 @@ impl Vm {
         Ok(KernelMapping(node))
     }
 
-    /// Unmap one userspace range only while no accepted job can still name it.
+    /// Unmap one explicitly released userspace range.
+    ///
+    /// DRM VM_BIND callers synchronize the range before unbinding it.  Do not
+    /// extend the VM-wide close guard to this operation: unrelated work in the
+    /// same VM may remain active, and rejecting the synchronized unbind would
+    /// prevent transient command aliases from ever being recycled under load.
+    /// GEM-handle and whole-VM teardown remain deferred by `job_lifetime`.
     pub(crate) fn unmap_user_range(&self, iova: u64, size: u64) -> Result {
-        let _state = self.job_lifetime.lock();
-        if _state.active != 0 {
-            return Err(EBUSY);
-        }
         self.unmap_range(iova, size)
     }
 
