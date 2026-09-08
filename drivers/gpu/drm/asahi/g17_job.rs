@@ -8,7 +8,14 @@
 //! QID0/1/4 runtime does not satisfy that contract.
 
 use core::sync::atomic::{fence, AtomicU32, Ordering};
-use kernel::{c_str, dma_fence::{Fence, UserFence, RawDmaFence}, drm::sched, prelude::*, sync::Arc};
+use kernel::{
+    c_str,
+    dma_fence::{Fence, RawDmaFence, UserFence},
+    drm::sched,
+    new_mutex,
+    prelude::*,
+    sync::{Arc, Mutex},
+};
 use crate::{driver::AsahiDevice, g17_uapi, mmu};
 
 /// Host-sealed bytes in a job-private command allocation. The builder consumes
@@ -44,13 +51,35 @@ pub(crate) struct TimestampDestination {
 
 pub(crate) struct G17PJobCompletion {
     pub(crate) status: Arc<crate::g17_status::VmStatus>,
-    pub(crate) fence: UserFence<crate::g17_drm::G17PSubmissionFence>,
-    pub(crate) timestamps: mmu::KernelMapping,
-    pub(crate) destinations: [Option<TimestampDestination>; 2],
-    pub(crate) signalled: AtomicU32,
+    fence: UserFence<crate::g17_drm::G17PSubmissionFence>,
+    timestamps: mmu::KernelMapping,
+    destinations: [Option<TimestampDestination>; 2],
+    vm_job: Arc<Mutex<Option<mmu::T8140VmJobGuard>>>,
+    signalled: AtomicU32,
 }
 
 impl G17PJobCompletion {
+    pub(crate) fn new(
+        fence: UserFence<crate::g17_drm::G17PSubmissionFence>,
+        timestamps: mmu::KernelMapping,
+        destinations: [Option<TimestampDestination>; 2],
+        status: Arc<crate::g17_status::VmStatus>,
+        vm_job: mmu::T8140VmJobGuard,
+    ) -> Result<Self> {
+        let vm_job = Arc::pin_init(
+            new_mutex!(Some(vm_job), "G17PJobCompletion::vm_job"),
+            GFP_KERNEL,
+        )?;
+        Ok(Self {
+            status,
+            fence,
+            timestamps,
+            destinations,
+            vm_job,
+            signalled: AtomicU32::new(0),
+        })
+    }
+
     pub(crate) fn gpu_address(&self) -> u64 { self.timestamps.iova() }
     pub(crate) fn fence(&self) -> Fence { Fence::from_fence(&self.fence) }
     pub(crate) fn complete(&self, result: Result<[u64; 2]>) {
@@ -76,6 +105,9 @@ impl G17PJobCompletion {
             self.status.record(error.to_errno());
             self.fence.set_error(error);
         }
+        // Match render completion: once this fence wakes userspace, every
+        // mapping named by the completed job must already be releasable.
+        drop(self.vm_job.lock().take());
         self.fence.signal();
     }
 }
@@ -96,7 +128,6 @@ pub(crate) struct G17PComputeJobPacket {
     /// before publishing any hardware-visible queue state.
     input_fences: KVec<Fence>,
     completion: Option<G17PJobCompletion>,
-    _vm_job: Option<mmu::T8140VmJobGuard>,
 }
 
 impl G17PComputeJobPacket {
@@ -109,14 +140,12 @@ impl G17PComputeJobPacket {
         retained_mappings: KVec<mmu::KernelMapping>,
         input_fences: KVec<Fence>,
         completion: Option<G17PJobCompletion>,
-        vm_job: Option<mmu::T8140VmJobGuard>,
     ) -> Result<Arc<Self>> {
         if submission_id == 0 || !(4..128).contains(&hardware_queue_id)
         { return Err(EINVAL); }
         Ok(Arc::new(Self {
             submission_id, hardware_queue_id, context, command, command_images,
             _retained_mappings: retained_mappings, input_fences, completion,
-            _vm_job: vm_job,
         }, GFP_KERNEL)?)
     }
 

@@ -450,7 +450,7 @@ pub(crate) struct G17PRenderCompletion {
     fence: UserFence<G17PSubmissionFence>,
     status: Arc<crate::g17_status::VmStatus>,
     lease: Arc<Mutex<Option<G17PLeaseGuard>>>,
-    _vm_job: mmu::T8140VmJobGuard,
+    vm_job: Arc<Mutex<Option<mmu::T8140VmJobGuard>>>,
     signalled: AtomicU32,
 }
 
@@ -465,11 +465,15 @@ impl G17PRenderCompletion {
             new_mutex!(Some(lease), "G17PRenderCompletion::lease"),
             GFP_KERNEL,
         )?;
+        let vm_job = Arc::pin_init(
+            new_mutex!(Some(vm_job), "G17PRenderCompletion::vm_job"),
+            GFP_KERNEL,
+        )?;
         Ok(Arc::new(Self {
             fence,
             status,
             lease,
-            _vm_job: vm_job,
+            vm_job,
             signalled: AtomicU32::new(0),
         }, GFP_KERNEL)?)
     }
@@ -497,6 +501,13 @@ impl G17PRenderCompletion {
         // race ahead, take the other slot and collide with this VM's fixed
         // render-state aliases.
         drop(self.lease.lock().take());
+        // A signalled output fence is userspace's permission to recycle BOs
+        // and unbind transient VDM aliases. Retire the VM-job guard first;
+        // leaving it in the scheduler-owned completion packet made those
+        // post-fence unbinds return EBUSY until an unrelated worker freed the
+        // packet, after which the already-recycled VA collided with the stale
+        // mapping.
+        drop(self.vm_job.lock().take());
         self.fence.signal();
     }
 }
@@ -1110,17 +1121,17 @@ impl G17PQueue {
             checked_dependencies.push(prior.clone(), GFP_KERNEL)?;
             dependencies.push(prior.clone(), GFP_KERNEL)?;
         }
+        let completion = g17_job::G17PJobCompletion::new(
+            output,
+            timestamps,
+            destinations,
+            self.vm.status().clone(),
+            vm_job,
+        )?;
         let packet = g17_job::G17PComputeJobPacket::new(
             submission_id, backend.hardware_queue, backend.context.clone(), translated,
             KVec::new(), KVec::new(), checked_dependencies,
-            Some(g17_job::G17PJobCompletion {
-                fence: output,
-                timestamps,
-                destinations,
-                status: self.vm.status().clone(),
-                signalled: AtomicU32::new(0),
-            }),
-            Some(vm_job),
+            Some(completion),
         )?;
         let finished = self.async_scheduler.as_mut().ok_or(EIO)?.enqueue(packet, dependencies)?;
         // The job is queued and owns its completion from here: give userspace
