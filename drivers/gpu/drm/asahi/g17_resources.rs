@@ -273,17 +273,20 @@ const fn g17p_render_fragment_status_va(pair: G17PRenderQueuePair) -> Option<u64
 /// subranges. Every independently live render pair owns two alternating
 /// 512-KiB generations, so one pair can stage its next command without
 /// colliding with either its prior generation or the other in-flight pair.
-/// The larger slots also keep the native RT-memory and TPC views separate and
-/// aligned.
+/// The larger slots keep command-owned RT-memory below the persistent TPC
+/// aperture and leave both views aligned.
 const G17P_RENDER_USER_ALIAS_START: u64 = 0x10_0200_0000;
 const G17P_RENDER_USER_ALIAS_SLOT_SIZE: u64 = 0x8_0000;
 const G17P_RENDER_ALIAS_GENERATIONS_PER_PAIR: u64 = 2;
+const G17P_RENDER_TPC_OFFSET: u64 = 0x5_0000;
+const G17P_RENDER_TPC_CAPACITY: usize =
+    (G17P_RENDER_USER_ALIAS_SLOT_SIZE - G17P_RENDER_TPC_OFFSET) as usize;
 const G17P_RENDER_USER_ALIAS_SLOT_COUNT: u64 =
     G17PRenderQueuePair::SLOT_COUNT as u64 * G17P_RENDER_ALIAS_GENERATIONS_PER_PAIR;
 const G17P_RENDER_USER_ALIAS_END: u64 = G17P_RENDER_USER_ALIAS_START
     + G17P_RENDER_USER_ALIAS_SLOT_COUNT * G17P_RENDER_USER_ALIAS_SLOT_SIZE;
 /// AXFB comes from the queue's ordinary user allocator on macOS, rather than
-/// the compact Buffer/Scene allocator used for tilemap, heap metadata and TPC.
+/// the compact Buffer/Scene allocator used for tilemap and heap metadata.
 /// Preserve that separate upper user-GART address class with the same
 /// pair-and-generation ownership topology.
 const G17P_RENDER_AUX_ALIAS_START: u64 = 0x100_0200_0000;
@@ -695,6 +698,21 @@ const fn g17p_render_alias_slot(pair: G17PRenderQueuePair, submission_ordinal: u
         + (submission_ordinal as u64 & 1);
     if slot < G17P_RENDER_USER_ALIAS_SLOT_COUNT {
         Some(slot)
+    } else {
+        None
+    }
+}
+
+/// Native retains the Tail Pointer Cache with its render-target-memory owner;
+/// command-buffer parity must not move or unmap it between submissions.
+const fn g17p_render_tpc_va(pair: G17PRenderQueuePair) -> Option<u64> {
+    let alias_slot = pair.slot() as u64 * G17P_RENDER_ALIAS_GENERATIONS_PER_PAIR;
+    if alias_slot < G17P_RENDER_USER_ALIAS_SLOT_COUNT {
+        Some(
+            G17P_RENDER_USER_ALIAS_START
+                + alias_slot * G17P_RENDER_USER_ALIAS_SLOT_SIZE
+                + G17P_RENDER_TPC_OFFSET,
+        )
     } else {
         None
     }
@@ -3036,8 +3054,6 @@ struct G17PRenderUserAliases {
     deflake: mmu::KernelMapping,
     /// One compact Buffer/Scene view containing TMAP followed by HMTA.
     rt_memory: mmu::KernelMapping,
-    /// Separate compact, firmware-writable Tail Pointer Cache view.
-    tpc: mmu::KernelMapping,
     /// Queue-owned AXFB in the upper ordinary user-GART address class.
     aux_fb: mmu::KernelMapping,
 }
@@ -3046,7 +3062,6 @@ struct G17PRenderUserAliases {
 impl G17PRenderUserAliases {
     const DEFLAKE_OFFSET: u64 = 0;
     const RT_MEMORY_OFFSET: u64 = 0x1_8000;
-    const TPC_OFFSET: u64 = 0x5_0000;
 
     fn new(
         render_state: &mut MappedObject,
@@ -3082,7 +3097,7 @@ impl G17PRenderUserAliases {
         if Self::RT_MEMORY_OFFSET
             .checked_add(rt_size as u64)
             .ok_or(EOVERFLOW)?
-            > Self::TPC_OFFSET
+            > G17P_RENDER_TPC_OFFSET
         {
             return Err(ERANGE);
         }
@@ -3091,28 +3106,6 @@ impl G17PRenderUserAliases {
             vm,
             rt_source_start..rt_source_end,
             rt_va..rt_va + rt_size as u64,
-            mmu::UAT_PGSZ as u64,
-            mmu::PROT_GPU_FW_SHARED_RW,
-            false,
-        )?;
-
-        let tpc_size = page_align(render_layout.tpc_size).ok_or(EOVERFLOW)?;
-        if Self::TPC_OFFSET
-            .checked_add(tpc_size as u64)
-            .ok_or(EOVERFLOW)?
-            > G17P_RENDER_USER_ALIAS_SLOT_SIZE
-        {
-            return Err(ERANGE);
-        }
-        let tpc_source_end = render_layout
-            .tpc
-            .checked_add(tpc_size)
-            .ok_or(EOVERFLOW)?;
-        let tpc_va = slot_base + Self::TPC_OFFSET;
-        let tpc = render_state.object.map_range_into_range(
-            vm,
-            render_layout.tpc..tpc_source_end,
-            tpc_va..tpc_va + tpc_size as u64,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
             false,
@@ -3133,7 +3126,6 @@ impl G17PRenderUserAliases {
         Ok(Self {
             deflake,
             rt_memory,
-            tpc,
             aux_fb,
         })
     }
@@ -3158,10 +3150,6 @@ impl G17PRenderUserAliases {
             .ok_or(EOVERFLOW)
     }
 
-    fn tpc_va(&self) -> u64 {
-        self.tpc.iova()
-    }
-
     fn aux_fb_va(&self) -> u64 {
         self.aux_fb.iova()
     }
@@ -3177,8 +3165,7 @@ impl G17PRenderUserAliases {
             self.rt_memory.size() as u64,
             true,
             true,
-        ) && vm.covers_range(self.tpc.iova(), self.tpc.size() as u64, true, true)
-            && vm.covers_range(
+        ) && vm.covers_range(
                 self.aux_fb.iova(),
                 self.aux_fb.size() as u64,
                 true,
@@ -3277,6 +3264,10 @@ pub(crate) struct G17PUserRenderStorage {
     render_layout: G17PRenderStateLayout,
     render_tvb: Option<G17PRenderTvb>,
     render_user_aliases: G17PRenderUserAliases,
+    /// Native's render-target-memory owner retains one TPC allocation and
+    /// mapping while capacity is sufficient. It is not command-generation
+    /// state and therefore does not alternate with `render_user_aliases`.
+    render_target_tpc: MappedObject,
     /// Native's persistent, client-only scene scratch at 0x1000178000.
     scene_scratch: Option<MappedObject>,
     /// Native's persistent GPU-only discard object at 0x1000180000.
@@ -5683,11 +5674,10 @@ impl G17PUserRenderStorage {
         }
         // Follow the exact retained alias owners/constructor source offsets.
         // These compact addresses, not the generic backing allocation's DVA,
-        // are what the actual RCE arrays publish for TMAP/HMTA/TPC/AXFB.
+        // are what the actual RCE arrays publish for TMAP/HMTA/AXFB.
         for (instance, offset, mapping) in [
             (1, G17P_RENDER_STATE_DEFLAKE, &self.render_user_aliases.deflake),
             (2, self.render_layout.tilemap, &self.render_user_aliases.rt_memory),
-            (3, self.render_layout.tpc, &self.render_user_aliases.tpc),
             (4, self.render_layout.aux_fb, &self.render_user_aliases.aux_fb),
         ] {
             let mut item = meta;
@@ -5698,6 +5688,19 @@ impl G17PUserRenderStorage {
             item.dva = mapping.iova();
             self.render_state.capture_trace_range(archive, item, offset, mapping.size(), clock)?;
         }
+        let mut tpc_item = meta;
+        tpc_item.kind = TraceKind::RenderState;
+        tpc_item.context = context;
+        tpc_item.root = trace::ROOT_CONTEXT_LOW;
+        tpc_item.instance = 3;
+        tpc_item.dva = self.render_target_tpc.iova();
+        self.render_target_tpc.capture_trace_range(
+            archive,
+            tpc_item,
+            0,
+            self.render_layout.tpc_size,
+            clock,
+        )?;
         let mut item = meta;
         item.kind = TraceKind::RenderState;
         item.context = context;
@@ -6223,6 +6226,21 @@ impl G17PUserRenderStorage {
             "state layout",
             g17p_render_state_layout(&command.parameters, num_clusters).ok_or_else(|| render_build_fail(1))
         );
+        if page_align(render_layout.tpc_size).ok_or(EOVERFLOW)?
+            > G17P_RENDER_TPC_CAPACITY
+        {
+            return Err(ERANGE);
+        }
+        let render_target_tpc = bootstrap_stage!(
+            "persistent TPC allocation",
+            MappedObject::new_wc_at(
+                dev,
+                vm,
+                g17p_render_tpc_va(queue_pair).ok_or(EINVAL)?,
+                G17P_RENDER_TPC_CAPACITY,
+                mmu::PROT_GPU_FW_SHARED_RW,
+            )
+        );
         let mut render_state = bootstrap_stage!("state allocation", MappedObject::new_wc_in_range(
             dev,
             vm,
@@ -6447,7 +6465,7 @@ impl G17PUserRenderStorage {
         translated.parameters.ta_status = render_state_va + G17P_RENDER_STATE_TA_STATUS as u64;
         translated.parameters.fragment_status = fragment_status_low.iova();
         translated.parameters.heapmeta = render_user_aliases.heapmeta_va(&render_layout)?;
-        translated.parameters.tpc = render_user_aliases.tpc_va();
+        translated.parameters.tpc = render_target_tpc.iova();
         translated.parameters.aux_fb = render_user_aliases.aux_fb_va();
         translated.parameters.aux_fb_page_count = G17P_RENDER_AUX_FB_PAGE_COUNT;
         translated.parameters.aux_fb_flags = g17p_aux_fb_flags(translated.flags);
@@ -7117,6 +7135,7 @@ impl G17PUserRenderStorage {
             render_layout,
             render_tvb,
             render_user_aliases,
+            render_target_tpc,
             scene_scratch,
             discard,
             parameter_management,
@@ -7494,6 +7513,11 @@ impl G17PUserRenderStorage {
         };
         let render_layout =
             g17p_render_state_layout(&command.parameters, num_clusters).ok_or(EINVAL)?;
+        if page_align(render_layout.tpc_size).ok_or(EOVERFLOW)?
+            > self.render_target_tpc.logical_size
+        {
+            return Err(ERANGE);
+        }
         let mut next_render_state = restage_step!("render-state allocation", MappedObject::new_wc_in_range(
             dev,
             vm,
@@ -7554,7 +7578,7 @@ impl G17PUserRenderStorage {
         translated.parameters.ta_status = render_state_va + G17P_RENDER_STATE_TA_STATUS as u64;
         translated.parameters.fragment_status = self.fragment_status_low.iova();
         translated.parameters.heapmeta = next_render_user_aliases.heapmeta_va(&render_layout)?;
-        translated.parameters.tpc = next_render_user_aliases.tpc_va();
+        translated.parameters.tpc = self.render_target_tpc.iova();
         translated.parameters.aux_fb = next_render_user_aliases.aux_fb_va();
         translated.parameters.aux_fb_page_count = G17P_RENDER_AUX_FB_PAGE_COUNT;
         translated.parameters.aux_fb_flags = g17p_aux_fb_flags(translated.flags);
@@ -8091,7 +8115,7 @@ impl G17PUserRenderStorage {
         let mut axfb_head = [0u64; 8];
         let mut axfb_480 = [0u64; 8];
         let mut nonzero = [0usize; 4];
-        let read = self.render_state.with_bytes_mut(|raw| {
+        let state_read = self.render_state.with_bytes_mut(|raw| {
             let copy_head = |offset: usize, out: &mut [u64; 8]| -> Result {
                 for (index, value) in out.iter_mut().enumerate() {
                     let at = offset.checked_add(index * 8).ok_or(EOVERFLOW)?;
@@ -8106,18 +8130,13 @@ impl G17PUserRenderStorage {
             };
             copy_head(layout.tilemap, &mut tilemap)?;
             copy_head(layout.heapmeta, &mut heapmeta)?;
-            copy_head(layout.tpc, &mut tpc)?;
             copy_head(layout.aux_fb, &mut axfb_head)?;
             copy_head(layout.aux_fb + 0x480, &mut axfb_480)?;
-            for (index, (offset, size)) in [
-                (layout.tilemap, layout.tilemap_size),
-                (layout.heapmeta, layout.heapmeta_size),
-                (layout.tpc, layout.tpc_size),
-                (layout.aux_fb, G17P_RENDER_STATE_AUX_FB_SIZE),
-            ]
-            .into_iter()
-            .enumerate()
-            {
+            for (index, offset, size) in [
+                (0, layout.tilemap, layout.tilemap_size),
+                (1, layout.heapmeta, layout.heapmeta_size),
+                (3, layout.aux_fb, G17P_RENDER_STATE_AUX_FB_SIZE),
+            ] {
                 nonzero[index] = raw
                     .get(offset..offset.checked_add(size).ok_or(EOVERFLOW)?)
                     .ok_or(ERANGE)?
@@ -8127,8 +8146,28 @@ impl G17PUserRenderStorage {
             }
             Ok(())
         });
-        // The tilemap/heapmeta/TPC heads above live in the driver-owned render
-        // state. The TILING VERTEX BUFFER is a separate object and was never
+        let tpc_read = self.render_target_tpc.with_bytes_mut(|raw| {
+            for (index, value) in tpc.iter_mut().enumerate() {
+                let at = index.checked_mul(8).ok_or(EOVERFLOW)?;
+                *value = u64::from_le_bytes(
+                    raw.get(at..at + 8)
+                        .ok_or(ERANGE)?
+                        .try_into()
+                        .map_err(|_| EINVAL)?,
+                );
+            }
+            nonzero[2] = raw
+                .get(..layout.tpc_size)
+                .ok_or(ERANGE)?
+                .iter()
+                .filter(|byte| **byte != 0)
+                .count();
+            Ok(())
+        });
+        let read = state_read.and(tpc_read);
+        // The tilemap/heapmeta heads above live in the command's render state;
+        // TPC lives in the persistent render-target-memory owner. The TILING
+        // VERTEX BUFFER is a separate object and was never
         // scanned, so "the tiler wrote nothing" could not be distinguished
         // from "the tiler wrote where we do not look" -- which matters,
         // because KTrace 0x43 reports status 3 (executed) for the TA and 4
@@ -8192,7 +8231,7 @@ impl G17PUserRenderStorage {
                     label,
                     self.render_user_aliases.tilemap_va(),
                     self.render_user_aliases.heapmeta_va(&layout).unwrap_or(0),
-                    self.render_user_aliases.tpc_va(),
+                    self.render_target_tpc.iova(),
                     self.render_user_aliases.aux_fb_va(),
                     nonzero,
                 );
@@ -8435,7 +8474,7 @@ impl G17PUserRenderStorage {
             self.scene_scratch.as_ref().map_or(0, MappedObject::iova),
             self.discard.as_ref().map_or(0, MappedObject::iova),
             self.render_user_aliases.tilemap_va(),
-            self.render_user_aliases.tpc_va(),
+            self.render_target_tpc.iova(),
             self.render_user_aliases.aux_fb_va(),
             self.render_tvb.as_ref().map_or(0, G17PRenderTvb::iova),
             self.render_tvb.as_ref().map_or(0, |_| {
@@ -8444,6 +8483,15 @@ impl G17PUserRenderStorage {
             self.fragment_rce.iova(),
             self.descriptor_3d_render.iova(),
             self.render_user_aliases.all_reachable_from(vm)
+                && (self.render_target_tpc.iova()
+                    == g17p_render_tpc_va(self.queue_pair).unwrap_or(0))
+                && (self.render_target_tpc.logical_size >= self.render_layout.tpc_size)
+                && vm.covers_range(
+                    self.render_target_tpc.iova(),
+                    self.render_layout.tpc_size as u64,
+                    true,
+                    true,
+                )
                 && self.scene_scratch.as_ref().map_or(true, |scene| {
                     scene.iova() == g17p_render_scene_scratch_va(self.queue_pair).unwrap_or(0)
                         && scene.logical_size == G17P_RENDER_SCENE_SCRATCH_MAPPING_SIZE
