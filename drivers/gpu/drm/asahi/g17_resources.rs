@@ -371,29 +371,35 @@ fn map_shared_render_descriptor_range(
 ) -> Result<(mmu::KernelMapping, mmu::KernelMapping)> {
     let mut search_start = G17P_CL_CLIENT_LOW_VA_START;
     loop {
-        let client = object.map_range_into_range(
-            client_vm,
+        // The global lower root is the contended side: every live job has a
+        // disjoint descriptor view there, while a new client VM is normally
+        // empty in this range. Allocate the global address first so its VA
+        // manager skips prior jobs directly. Mapping the client first made
+        // every global collision synchronously drop/unmap one temporary
+        // client mapping under the already deep render constructor.
+        let global = object.map_range_into_range(
+            global_vm,
             object_range.clone(),
             search_start..G17P_CL_LOW_VA_END,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_SHARED_RO,
             false,
         )?;
-        let start = client.iova();
+        let start = global.iova();
         let end = start
             .checked_add(object_range.len() as u64)
             .ok_or(EOVERFLOW)?;
         match object.map_range_into_range(
-            global_vm,
+            client_vm,
             object_range.clone(),
             start..end,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_SHARED_RO,
             false,
         ) {
-            Ok(global) => return Ok((client, global)),
+            Ok(client) => return Ok((client, global)),
             Err(error) if error == ENOSPC && end < G17P_CL_LOW_VA_END => {
-                drop(client);
+                drop(global);
                 search_start = end;
             }
             Err(error) => return Err(error),
@@ -2351,6 +2357,30 @@ fn map_fixed_wc_object(
     }
 }
 
+/// Keep the comparatively large owning mapping out of
+/// `G17PUserRenderStorage::new`'s already deep construction frame. Descriptor
+/// dual-root collision retries can synchronously drop a temporary mapping and
+/// enter the page-table walker; retaining another full `MappedObject` local in
+/// that call chain exhausted the 32-KiB kernel stack on the second client.
+#[cfg(not(test))]
+#[inline(never)]
+fn new_g17p_render_target_tpc(
+    dev: &AsahiDevice,
+    vm: &mmu::Vm,
+    queue_pair: G17PRenderQueuePair,
+) -> Result<KBox<MappedObject>> {
+    Ok(KBox::new(
+        MappedObject::new_wc_at(
+            dev,
+            vm,
+            g17p_render_tpc_va(queue_pair).ok_or(EINVAL)?,
+            G17P_RENDER_TPC_CAPACITY,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?,
+        GFP_KERNEL,
+    )?)
+}
+
 #[cfg(not(test))]
 impl MappedObject {
     fn new_wc_in_range(
@@ -3267,7 +3297,7 @@ pub(crate) struct G17PUserRenderStorage {
     /// Native's render-target-memory owner retains one TPC allocation and
     /// mapping while capacity is sufficient. It is not command-generation
     /// state and therefore does not alternate with `render_user_aliases`.
-    render_target_tpc: MappedObject,
+    render_target_tpc: KBox<MappedObject>,
     /// Native's persistent, client-only scene scratch at 0x1000178000.
     scene_scratch: Option<MappedObject>,
     /// Native's persistent GPU-only discard object at 0x1000180000.
@@ -6233,13 +6263,7 @@ impl G17PUserRenderStorage {
         }
         let render_target_tpc = bootstrap_stage!(
             "persistent TPC allocation",
-            MappedObject::new_wc_at(
-                dev,
-                vm,
-                g17p_render_tpc_va(queue_pair).ok_or(EINVAL)?,
-                G17P_RENDER_TPC_CAPACITY,
-                mmu::PROT_GPU_FW_SHARED_RW,
-            )
+            new_g17p_render_target_tpc(dev, vm, queue_pair)
         );
         let mut render_state = bootstrap_stage!("state allocation", MappedObject::new_wc_in_range(
             dev,

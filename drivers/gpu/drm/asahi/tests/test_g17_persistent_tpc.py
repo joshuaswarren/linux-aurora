@@ -25,9 +25,14 @@ constructor = block("    fn new(\n        dev: &AsahiDevice,", render_impl)
 restage = block("    pub(crate) fn restage_command(")
 
 assert "tpc:" not in aliases
-assert "render_target_tpc: MappedObject" in storage
+assert "render_target_tpc: KBox<MappedObject>" in storage
+heap_constructor = block("fn new_g17p_render_target_tpc(")
+assert "#[inline(never)]" in source[source.rfind("#[", 0, source.index("fn new_g17p_render_target_tpc(")):source.index("fn new_g17p_render_target_tpc(")]
+assert "KBox::new(" in heap_constructor
+assert "MappedObject::new_wc_at(" in heap_constructor
+assert "g17p_render_tpc_va(queue_pair)" in heap_constructor
 assert '"persistent TPC allocation"' in constructor
-assert "g17p_render_tpc_va(queue_pair)" in constructor
+assert "new_g17p_render_target_tpc(dev, vm, queue_pair)" in constructor
 assert "G17P_RENDER_TPC_CAPACITY" in constructor
 assert "translated.parameters.tpc = render_target_tpc.iova();" in constructor
 assert "translated.parameters.tpc = self.render_target_tpc.iova();" in restage
