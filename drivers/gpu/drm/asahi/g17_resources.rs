@@ -14979,22 +14979,36 @@ impl G17ResourceOwner {
         Ok(lanes)
     }
 
-    /// Point the device-global parameter-buffer loader at this storage's
-    /// PBDesc entry. The page list itself is a subrange of this storage's PM
-    /// backing with a pair-specific client alias; it is never copied through
-    /// the bootstrap primary-index object.
-    ///
-    /// The PBDesc table is device-global, while every retained storage owns a
-    /// distinct descriptor slot and PM page-list mapping. Restage the selected
-    /// slot immediately before its queue pair runs.
+    /// Validate a retained storage's indexed PBDesc entry on owner switches.
+    /// The table has one entry per HardwareBufferID, not a single current
+    /// descriptor to retarget. Firmware owns the live allocation cursors and
+    /// flags: running the cold initializer here destroys halStorePBDesc state.
     pub(crate) fn stage_render_parameter_buffer_view(
         &mut self,
         storage: &mut G17PUserRenderStorage,
     ) -> Result {
         self.stage_render_parameter_buffer_page_list(storage)?;
-        let descriptor = storage.parameter_buffer_descriptor()?;
-        self.stage_render_parameter_buffer_descriptor(descriptor)?;
-        Ok(())
+        let Some((index, page_list_address, page_count)) =
+            storage.parameter_buffer_descriptor()? else { return Ok(()); };
+        let offset = g17_submission::g17p_pbdesc_offset(index);
+        self.resources.pb_descriptor_table.with_bytes_mut(|bytes| {
+            let end = offset.checked_add(g17_submission::G17P_PBDESC_ENTRY_SIZE)
+                .ok_or(EINVAL)?;
+            if end > bytes.len() { return Err(EINVAL); }
+            let mut previous = [0u32; 4];
+            for (word, value) in previous.iter_mut().enumerate() {
+                let at = offset + word * 4;
+                *value = u32::from_le_bytes(bytes[at..at + 4].try_into().map_err(|_| EINVAL)?);
+            }
+            let expected = g17_submission::encode_g17p_pbdesc(
+                previous, page_list_address, page_count,
+                g17_submission::decode_g17p_pbdesc(previous),
+            );
+            // A different address/count means the retained identity was lost.
+            // Do not repair it while firmware may retain that other owner.
+            if previous != expected { return Err(EIO); }
+            Ok(())
+        })
     }
 
     pub(crate) fn stage_render_parameter_buffer_page_list(

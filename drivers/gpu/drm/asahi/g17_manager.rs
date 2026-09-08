@@ -3866,13 +3866,8 @@ impl G17PManagerConstruction {
         }
     }
 
-    /// Re-point the device-global parameter-buffer loader at the retained
-    /// storage that is about to submit.
-    ///
-    /// A no-op while the same storage keeps submitting, which is the whole of
-    /// the single-client path. It writes only when a different client's storage
-    /// takes over the loader, which previously only ever happened as a side
-    /// effect of rebuilding the graph in `new_user_render_storage`.
+    /// Validate the incoming retained storage's indexed PBDesc identity.
+    /// Owner switches must preserve the allocation state firmware left there.
     fn retarget_render_parameter_buffer(&mut self) -> Result {
         // Without slot affinity every client alternation rebuilds the graph,
         // and `new_user_render_storage` stamps the loader on the way through.
@@ -3893,7 +3888,7 @@ impl G17PManagerConstruction {
         if G17P_PARAMETER_BUFFER_RETARGETS.fetch_add(1, Ordering::Relaxed) < 8 {
             dev_info!(
                 self.resources.dev().as_ref(),
-                "G17P render PM: device parameter-buffer loader retargeted from owner {:#x} to {:#x}\n",
+                "G17P render PM: retained parameter-buffer owner validated from {:#x} to {:#x}\n",
                 previous,
                 owner,
             );
@@ -4948,13 +4943,9 @@ impl G17PManagerConstruction {
             // them to cold values when preparing another Scene. The cold
             // new_user_render_storage path below still initializes them.
             //
-            // The device-global PB loader, however, still points at whichever
-            // storage stamped it last. While every client alternation rebuilt
-            // its graph that was self-correcting; now that a client keeps its
-            // retained storage, the loader has to be re-pointed here or the
-            // second client runs its tiler against the first client's
-            // parameter page list. Nothing is written while the owner is
-            // unchanged, so the single-client steady state is untouched.
+            // Each owner has its own HardwareBufferID-indexed PBDesc. Check
+            // that identity when switching owners without rewriting firmware's
+            // live counters or flags with constructor defaults.
             self.retarget_render_parameter_buffer()
                 .map_err(|error| Self::render_stage_fail("retarget-parameter-buffer", error))?;
         } else {
