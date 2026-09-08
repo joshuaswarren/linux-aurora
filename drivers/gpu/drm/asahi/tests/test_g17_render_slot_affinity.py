@@ -31,10 +31,8 @@ def item(needle):
 
 slots = s[s.index('const G17P_RENDER_SLOTS: usize ='):]
 slots = slots[:slots.index('const _: () = assert!(G17P_ACTIVE_RENDER_SLOTS > 0);')]
-# This test keeps qualifying the dormant two-pair affinity algorithm. The
-# production capacity test uses the real one-slot value in test_g17_compute_gate.py.
-slots = slots.replace('const G17P_ACTIVE_RENDER_SLOTS: usize = 1;',
-                      'const G17P_ACTIVE_RENDER_SLOTS: usize = 2;')
+# Exercise the production two-pair capacity rather than a test-only rewrite.
+assert 'const G17P_ACTIVE_RENDER_SLOTS: usize = G17P_RENDER_SLOTS;' in slots
 state = '\n'.join(item(n) for n in [
     'struct G17PQueueLeaseState {',
     'impl G17PQueueLeaseState {',
