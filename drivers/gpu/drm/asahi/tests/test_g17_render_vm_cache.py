@@ -23,6 +23,7 @@ methods='\n'.join(function(s, marker) for marker in [
     '    pub(crate) fn clear_compute_pool_mappings(',
     '    pub(crate) fn driver_range_overlaps(',
     '    pub(crate) fn unmap_user_ranges(',
+    '    fn unmap_user_ranges_now(',
 ])
 # Kernel KVec::reserve carries an allocation flag and returns Result; adapt
 # that spelling to std::Vec while executing the otherwise exact methods.
