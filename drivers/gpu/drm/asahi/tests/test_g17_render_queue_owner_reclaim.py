@@ -41,7 +41,7 @@ assert "let bind = state.bind.take()" in release_slot
 assert "let mut storage = state.storage.take()" in release_slot
 assert "storage.release_client_context()" in release_slot
 assert "snapshot.job_list_empty" in release_slot
-assert "release_retired_handoff_graph" in release_slot
+assert "quarantine_drained_render_graph" in release_slot
 assert "released_render_contexts & (1u64 << context)" in preserve
 assert "manager.release_render_context_owner(context)" in runtime_release
 
