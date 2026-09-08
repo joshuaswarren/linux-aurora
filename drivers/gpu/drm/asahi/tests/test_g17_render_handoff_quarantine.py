@@ -42,7 +42,13 @@ assert "unreserve_render_storage_hardware_buffer_id" not in handoff
 assert ".push_within_capacity(previous)" in preserve
 assert "completion_references_descriptor_range" not in preserve
 assert "self.retired_render_handoff_graph = Some(retired)" in handoff
-assert "Self::release_retired_handoff_graph(" not in preserve
+# Live queues remain session-retained. Queue destruction is a stronger native
+# workqueue-free boundary and may release that exact context while preserving
+# its firmware-high PM backing.
+released_check = "released_render_contexts & (1u64 << context) != 0"
+assert preserve.index(released_check) < preserve.index(
+    "Self::release_retired_handoff_graph("
+)
 
 release = function("fn release_retired_handoff_graph(")
 assert release.index("ids.unreserve(id)") < release.index("drop(retired)")
