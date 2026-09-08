@@ -34,6 +34,8 @@ assert "render_layout.aux_fb != self.render_layout.aux_fb" in restage
 assert "!self.render_user_aliases.all_reachable_from(vm)" in restage
 assert "let mut next_render_generation = if reuse_cached_render_state" in restage
 assert "self.cached_reactivation_pending = false" in restage
+assert "const G17P_RENDER_STATE_AUX_FB: usize = G17P_RENDER_STATE_DYNAMIC" in resources
+assert "(scene_scratch, discard, tvb, after_aux_fb)" in resources
 
 # Model the fixed-VA owner transition. A cached return keeps the exact alias
 # owner; a normal restage installs a new parity generation only after its old
@@ -57,6 +59,15 @@ vm_a.install(va, "graph-a")
 vm_b.install(va, "graph-b")
 vm_a.reuse(va, "graph-a")       # A -> B -> A
 vm_b.reuse(va, "graph-b")       # A -> B -> A -> B
+
+# Command geometry changes retained RT-memory requirements, but no longer the
+# compact command-state backing/alias identity.
+state_layouts = {
+    "small": (0x10000, 0x18000),
+    "large": (0x10000, 0x18000),
+    "small-again": (0x10000, 0x18000),
+}
+assert len(set(state_layouts.values())) == 1
 
 try:
     vm_a.install(va, "graph-a2")
