@@ -3532,6 +3532,69 @@ impl Uat {
         if object_end > gem.size() {
             return Err(ERANGE);
         }
+        // The null view is VM-owned, not render-storage-owned. A single
+        // process may create another render queue while its first storage is
+        // still alive, in which case append_driver_mappings() already retains
+        // this exact alias. Never create a second KernelMapping over those
+        // leaves: map_in_range correctly rejects the overlap, and a duplicate
+        // owner would later erase the first storage's live mapping on Drop.
+        //
+        // Accept only the complete, physically identical presentation. A
+        // partial range or another backing at the reserved address remains a
+        // hard error rather than being mistaken for idempotent installation.
+        let mut existing_pages = 0usize;
+        let mut offset = 0u64;
+        while offset < view.size as u64 {
+            let high = view.source_address.checked_add(offset).ok_or(EOVERFLOW)?;
+            let low = view.context_address.checked_add(offset).ok_or(EOVERFLOW)?;
+            if source.covers_range(
+                low,
+                UAT_PGSZ as u64,
+                true,
+                view.requires_source_write,
+            ) {
+                existing_pages = existing_pages.checked_add(1).ok_or(EOVERFLOW)?;
+                if source.translate_iova(high)? != source.translate_iova(low)? {
+                    dev_err!(
+                        self.dev.as_ref(),
+                        "MMU: T8140 retained client null view backing mismatch at +{:#x}\n",
+                        offset,
+                    );
+                    return Err(EFAULT);
+                }
+            }
+            offset = offset.checked_add(UAT_PGSZ as u64).ok_or(EOVERFLOW)?;
+        }
+        let expected_pages = view.size / UAT_PGSZ;
+        if existing_pages != 0 {
+            if existing_pages != expected_pages {
+                dev_err!(
+                    self.dev.as_ref(),
+                    "MMU: T8140 retained client null view is only partially mapped ({}/{})\n",
+                    existing_pages,
+                    expected_pages,
+                );
+                return Err(EFAULT);
+            }
+            if source
+                .t8140_native_context_bindings
+                .as_ref()
+                .ok_or(EINVAL)?
+                .lock()
+                .generation
+                != source_generation
+            {
+                return Err(EAGAIN);
+            }
+            dev_info!(
+                self.dev.as_ref(),
+                "MMU: T8140 job context reused all {} GPUVM low views including retained null view for VM {} generation {}\n",
+                T8140_NATIVE_CONTEXT_VIEW_COUNT,
+                source.id,
+                source_generation,
+            );
+            return Ok(mappings);
+        }
         let mapping = source.map_in_range(
             &**gem,
             *object_offset..object_end,
