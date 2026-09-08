@@ -31,7 +31,7 @@ assert "self.vm.unmap_user_ranges_now" in guard
 assert "self.vm.drop_mappings_now" in guard
 assert "self.unmap_user_ranges_now" in unmap_users
 assert "self.drop_mappings_now" in drop_object
-assert "if _state.active != 0" in unmap_one and "Err(EBUSY)" in unmap_one
+assert "job_lifetime" not in unmap_one and "self.unmap_range" in unmap_one
 
 source = r'''
 #![allow(dead_code, unused_variables)]
@@ -147,14 +147,14 @@ fn deferred_cleanup_excludes_new_job_admission_until_unmap_finishes() {
 }
 
 #[test]
-fn explicit_unbind_rejects_live_job_and_succeeds_after_retirement() {
+fn synchronized_explicit_unbind_is_independent_of_unrelated_live_jobs() {
     let v=Vm::new();
     let job=v.retain_t8140_job().unwrap();
-    assert_eq!(v.unmap_user_range(0x1000,0x4000),Err(EBUSY));
-    assert_eq!(v.unmaps.load(Ordering::SeqCst),0);
-    drop(job);
     assert_eq!(v.unmap_user_range(0x1000,0x4000),Ok(()));
     assert_eq!(v.unmaps.load(Ordering::SeqCst),1);
+    drop(job);
+    assert_eq!(v.unmap_user_range(0x1000,0x4000),Ok(()));
+    assert_eq!(v.unmaps.load(Ordering::SeqCst),2);
 }
 
 #[test]
@@ -192,4 +192,4 @@ with tempfile.TemporaryDirectory() as d:
     subprocess.run(["rustc", "--edition=2021", "--test", str(f), "-o", str(exe)], check=True)
     subprocess.run([str(exe), "--test-threads=1"], check=True)
 
-print("PASS production VM job/close ownership: admission serialization, explicit unbind, multi-VM imports")
+print("PASS production VM job/close ownership: admission serialization, synchronized explicit unbind, multi-VM imports")
