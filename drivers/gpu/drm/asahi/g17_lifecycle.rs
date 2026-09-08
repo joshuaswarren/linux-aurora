@@ -202,6 +202,18 @@ pub(crate) fn recover_persistent_runtime<T: PersistentRuntimeRecovery>(
     Ok(())
 }
 
+/// A runtime stays unavailable until a started recovery fully resumes it.
+///
+/// A failed replacement boot can have no role-state objects left to carry a
+/// crash bit, so the explicit in-progress state is independently sufficient.
+pub(crate) const fn persistent_session_needs_recovery(
+    recovery_pending: bool,
+    gfx_crashed: bool,
+    gfx1_crashed: bool,
+) -> bool {
+    recovery_pending || gfx_crashed || gfx1_crashed
+}
+
 /// Decide whether the next render must start a fresh firmware session.
 /// Physical 256-slot SKSM/outer rings wrap without a session restart. The
 /// current event writer admits 24-bit stamps; retain that real width bound.
@@ -906,6 +918,18 @@ mod tests {
             *trace.borrow(),
             [Event::StopCpuPair, Event::RetainBoot]
         );
+    }
+
+    #[test]
+    fn failed_rebuild_without_role_state_still_requires_recovery() {
+        assert!(persistent_session_needs_recovery(true, false, false));
+    }
+
+    #[test]
+    fn only_a_fully_resumed_healthy_session_is_available() {
+        assert!(!persistent_session_needs_recovery(false, false, false));
+        assert!(persistent_session_needs_recovery(false, true, false));
+        assert!(persistent_session_needs_recovery(false, false, true));
     }
 
     struct MockRuntimeRecovery {

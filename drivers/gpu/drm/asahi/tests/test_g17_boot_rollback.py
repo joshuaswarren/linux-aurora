@@ -26,6 +26,8 @@ def item(text, marker, start=0):
 
 finish = item(live, "fn finish_boot_session(")
 rebuild = item(live, "    fn rebuild_session_in_place(")
+recovery = item(live, "impl g17_lifecycle::PersistentRuntimeRecovery for G17PLiveRuntime")
+is_crashed = item(live, "    pub(crate) fn is_crashed(")
 teardown = item(
     live,
     "    fn stop_cpu_pair(&mut self) -> bool {",
@@ -59,6 +61,15 @@ assert "core::mem::forget(manager);" in initial
 assert "&mut stop_unproven" in rebuild
 assert "self.boot_stop_unproven = true;" in rebuild
 assert teardown.index("if self.boot_stop_unproven") < teardown.index("self.cpus.as_mut()")
+
+# A cleanly stopped replacement boot can fail after its role states were
+# removed. Keep that state retryable even though neither role has a crash bit.
+pause = item(recovery, "    fn pause_submissions(")
+resume = item(recovery, "    fn resume_submissions(")
+assert "self.session_recovery_pending = true;" in pause
+assert "self.session_recovery_pending = false;" in resume
+assert "persistent_session_needs_recovery(" in is_crashed
+assert "self.session_recovery_pending" in is_crashed
 
 # No allocation failure may enter Rust's declaration-order partial drop after
 # a successful firmware boot. Both fallible host allocations precede it.
