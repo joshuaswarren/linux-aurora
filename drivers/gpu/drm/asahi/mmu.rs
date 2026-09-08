@@ -3489,6 +3489,56 @@ impl Uat {
         Ok(mappings)
     }
 
+    /// Invalidate every live T8140 context rooted in `vm` after adding or
+    /// replacing job-private aliases in its page tables.
+    ///
+    /// `KernelMapping` can infer only the ordinary bind context. Render jobs
+    /// execute through an independently allocated application context, so a
+    /// live VM can otherwise retain a negative or old translation there when
+    /// its render-pool generation is replaced. Match the installed TTBAT roots
+    /// instead of flushing every client or assuming a fixed context ID.
+    pub(crate) fn flush_t8140_vm_contexts(&self, vm: &Vm) -> Result<u64> {
+        if self.cfg != UatConfig::T8140 {
+            return Err(EINVAL);
+        }
+        let root = {
+            let owner = vm.inner.exec_lock(None, false)?;
+            if owner.is_kernel
+                || !core::ptr::eq(
+                    Arc::as_ptr(&owner.uat_inner),
+                    Arc::as_ptr(&self.inner),
+                )
+            {
+                return Err(EINVAL);
+            }
+            owner.page_table.ttb()
+        };
+        let contexts = {
+            let inner = self.inner.lock();
+            let ttbs = inner.ttbs();
+            let mut contexts = 0u64;
+            for context_id in 0..UAT_NUM_CTX {
+                if ttbs[context_id].ttb0.load(Ordering::Acquire)
+                    == t8140_tagged_root(root, context_id)
+                {
+                    contexts |= 1u64 << context_id;
+                }
+            }
+            contexts
+        };
+        if contexts == 0 {
+            return Err(ENOENT);
+        }
+        fence(Ordering::SeqCst);
+        for context_id in 0..UAT_NUM_CTX {
+            if contexts & (1u64 << context_id) != 0 {
+                mem::tlbi_asid(context_id as u8);
+            }
+        }
+        mem::sync();
+        Ok(contexts)
+    }
+
     /// Return a CPU wrapper and the preboot primary-low alias of the persistent
     /// T8140 PM page-metrics object. The firmware-high alias is added only
     /// after firmware has published its upper-root subtree.

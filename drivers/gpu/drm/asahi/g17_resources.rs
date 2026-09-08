@@ -14583,6 +14583,12 @@ impl G17ResourceOwner {
             let aliases = storage.take_persistent_client_mappings()?;
             vm.install_render_pool_mappings(storage.render_pool_id(),
                 storage.render_tvb.as_ref().map_or(0, |tvb| tvb.block_count), aliases)?;
+            // The VM may already have executed compute or an earlier render
+            // generation through its independently allocated descriptor
+            // context. Generic mapping teardown flushes only the bind context;
+            // publish this replacement to every TTBAT context carrying the
+            // same root before any descriptor can name it.
+            self.address_space.uat.flush_t8140_vm_contexts(vm)?;
             self.stage_render_parameter_buffer_page_list(&mut storage)?;
             self.stage_render_parameter_buffer_descriptor(storage.parameter_buffer_descriptor()?)?;
             Ok(())
