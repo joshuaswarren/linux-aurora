@@ -19,9 +19,11 @@ def item(needle):
 
 
 state = item("struct T8140VmJobLifetime {")
-guard = item("pub(crate) struct T8140VmJobGuard {") + "\n" + item(
-    "impl Drop for T8140VmJobGuard {"
-)
+guard = "\n".join([
+    item("pub(crate) struct T8140VmJobGuard {"),
+    item("impl T8140VmJobGuard {"),
+    item("impl Drop for T8140VmJobGuard {"),
+])
 retain = item("    pub(crate) fn retain_t8140_job(")
 unmap_users = item("    pub(crate) fn unmap_user_ranges(")
 unmap_one = item("    pub(crate) fn unmap_user_range(")
@@ -31,7 +33,9 @@ assert "self.vm.unmap_user_ranges_now" in guard
 assert "self.vm.drop_mappings_now" in guard
 assert "self.unmap_user_ranges_now" in unmap_users
 assert "self.drop_mappings_now" in drop_object
-assert "job_lifetime" not in unmap_one and "self.unmap_range" in unmap_one
+assert "state.active != 0 && state.quarantined" in unmap_one
+assert "state.deferred_unmaps.push" in unmap_one
+assert "self.unmap_range" in unmap_one
 
 source = r'''
 #![allow(dead_code, unused_variables)]
@@ -99,7 +103,8 @@ struct Vm {
     fn bo_deferred_cleanup(&self){}
     fn new()->Self { Self {
         job_lifetime:Arc::new(Mutex(std::sync::Mutex::new(T8140VmJobLifetime{
-            active:0,closed:false,close_ranges:None,closed_objects:KVec::new()
+            active:0,quarantined:false,closed:false,close_ranges:None,
+            deferred_unmaps:KVec::new(),closed_objects:KVec::new()
         }))),
         unmaps:Arc::new(AtomicUsize::new(0)),
         object_unmaps:Arc::new(AtomicUsize::new(0)),
@@ -158,6 +163,34 @@ fn synchronized_explicit_unbind_is_independent_of_unrelated_live_jobs() {
 }
 
 #[test]
+fn quarantined_job_defers_explicit_unbind_until_all_vm_jobs_retire() {
+    let v=Vm::new();
+    let lost=v.retain_t8140_job().unwrap();
+    let other=v.retain_t8140_job().unwrap();
+    lost.quarantine();
+    assert_eq!(v.unmap_user_range(0x5000,0x4000),Ok(()));
+    assert_eq!(v.unmap_user_range(0x5000,0x4000),Ok(()));
+    assert_eq!(v.unmaps.load(Ordering::SeqCst),0);
+    drop(other);
+    assert_eq!(v.unmaps.load(Ordering::SeqCst),0);
+    drop(lost);
+    assert_eq!(v.unmaps.load(Ordering::SeqCst),1,
+               "duplicate teardown requests coalesce at processor-stop retirement");
+}
+
+#[test]
+fn whole_vm_close_supersedes_queued_explicit_unmaps() {
+    let v=Vm::new();
+    let lost=v.retain_t8140_job().unwrap();
+    lost.quarantine();
+    assert_eq!(v.unmap_user_range(0x5000,0x4000),Ok(()));
+    v.unmap_user_ranges(0..0x10000,0x8000..0x9000).unwrap();
+    drop(lost);
+    assert_eq!(v.unmaps.load(Ordering::SeqCst),1,
+               "whole-VM teardown must not replay an overlapping range unmap");
+}
+
+#[test]
 fn imported_object_close_is_owned_independently_by_each_vm() {
     let object=gem::Object(11);
     let a=Vm::new();
@@ -192,4 +225,4 @@ with tempfile.TemporaryDirectory() as d:
     subprocess.run(["rustc", "--edition=2021", "--test", str(f), "-o", str(exe)], check=True)
     subprocess.run([str(exe), "--test-threads=1"], check=True)
 
-print("PASS production VM job/close ownership: admission serialization, synchronized explicit unbind, multi-VM imports")
+print("PASS production VM job ownership: healthy unbinds stay live; quarantined unbinds defer")

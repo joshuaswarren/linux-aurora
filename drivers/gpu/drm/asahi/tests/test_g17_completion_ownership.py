@@ -43,23 +43,26 @@ const EIO:Error=Error(-5); const EINVAL:Error=Error(-22);
 type Result<T=()> = std::result::Result<T,Error>;
 struct Mutex<T>(StdMutex<T>);
 impl<T> Mutex<T> {fn lock(&self)->std::sync::MutexGuard<'_,T>{self.0.lock().unwrap()}}
-#[derive(Default)] struct Memory {active:AtomicUsize,closed:AtomicBool,unmapped:AtomicBool}
+#[derive(Default)] struct Memory {active:AtomicUsize,closed:AtomicBool,unmapped:AtomicBool,quarantined:AtomicBool}
 impl Memory {
  fn close(&self) { self.closed.store(true,Ordering::SeqCst); if self.active.load(Ordering::SeqCst)==0 {self.unmapped.store(true,Ordering::SeqCst);} }
 }
 struct VmGuard(Arc<Memory>);
-impl VmGuard {fn new(m:&Arc<Memory>)->Self{m.active.fetch_add(1,Ordering::SeqCst);Self(m.clone())}}
+impl VmGuard {
+ fn new(m:&Arc<Memory>)->Self{m.active.fetch_add(1,Ordering::SeqCst);Self(m.clone())}
+ fn quarantine(&self){self.0.quarantined.store(true,Ordering::SeqCst);}
+}
 impl Drop for VmGuard {fn drop(&mut self){if self.0.active.fetch_sub(1,Ordering::SeqCst)==1 && self.0.closed.load(Ordering::SeqCst){self.0.unmapped.store(true,Ordering::SeqCst);}}}
 struct Lease(Arc<AtomicUsize>);
 impl Drop for Lease {fn drop(&mut self){self.0.fetch_add(1,Ordering::SeqCst);}}
 #[derive(Default)] struct Status(AtomicI32);
 impl Status {fn record(&self,e:i32){let _=self.0.compare_exchange(0,e,Ordering::AcqRel,Ordering::Acquire);}}
-struct Fence {count:AtomicUsize,error:AtomicI32,status:Arc<Status>,status_at_signal:AtomicI32,active_at_signal:AtomicUsize,memory:Arc<Memory>}
+struct Fence {count:AtomicUsize,error:AtomicI32,status:Arc<Status>,status_at_signal:AtomicI32,active_at_signal:AtomicUsize,quarantined_at_signal:AtomicBool,memory:Arc<Memory>}
 impl Fence {
  fn set_error(&self,e:Error){self.error.store(e.0,Ordering::SeqCst);}
- fn signal(&self){self.status_at_signal.store(self.status.0.load(Ordering::SeqCst),Ordering::SeqCst);self.active_at_signal.store(self.memory.active.load(Ordering::SeqCst),Ordering::SeqCst);self.count.fetch_add(1,Ordering::SeqCst);}
+ fn signal(&self){self.status_at_signal.store(self.status.0.load(Ordering::SeqCst),Ordering::SeqCst);self.active_at_signal.store(self.memory.active.load(Ordering::SeqCst),Ordering::SeqCst);self.quarantined_at_signal.store(self.memory.quarantined.load(Ordering::SeqCst),Ordering::SeqCst);self.count.fetch_add(1,Ordering::SeqCst);}
 }
-fn fence(status:&Arc<Status>,memory:&Arc<Memory>)->Fence {Fence{count:AtomicUsize::new(0),error:AtomicI32::new(0),status:status.clone(),status_at_signal:AtomicI32::new(0),active_at_signal:AtomicUsize::new(99),memory:memory.clone()}}
+fn fence(status:&Arc<Status>,memory:&Arc<Memory>)->Fence {Fence{count:AtomicUsize::new(0),error:AtomicI32::new(0),status:status.clone(),status_at_signal:AtomicI32::new(0),active_at_signal:AtomicUsize::new(99),quarantined_at_signal:AtomicBool::new(false),memory:memory.clone()}}
 mod g17_completion {pub struct PairedRenderCompletion {pub complete:bool}}
 struct Mapping;
 impl Mapping {fn with_cpu_bytes<F:FnOnce(&mut [u8])->Result>(&self,f:F)->Result{f(&mut [0;16])}}
@@ -94,6 +97,7 @@ fn compute(m:&Arc<Memory>)->Arc<Compute>{let s=Arc::new(Status::default());Arc::
  assert_eq!(runtime.fence.count.load(Ordering::SeqCst),1);
  assert_eq!(runtime.fence.status_at_signal.load(Ordering::SeqCst),-5);
  assert_eq!(runtime.fence.active_at_signal.load(Ordering::SeqCst),1);
+ assert!(runtime.fence.quarantined_at_signal.load(Ordering::SeqCst));
  runtime.fail_while_owned(EIO);assert_eq!(runtime.fence.count.load(Ordering::SeqCst),1);
  // Runtime quarantine owner is dropped only after proven processor stop.
  drop(runtime);assert!(m.unmapped.load(Ordering::SeqCst));assert_eq!(released.load(Ordering::SeqCst),1);
@@ -103,6 +107,7 @@ fn compute(m:&Arc<Memory>)->Arc<Compute>{let s=Arc::new(Status::default());Arc::
  runtime.fail_while_owned(EIO);m.close();drop(scheduler);
  assert!(!m.unmapped.load(Ordering::SeqCst));assert_eq!(runtime.fence.active_at_signal.load(Ordering::SeqCst),1);
  assert_eq!(runtime.fence.status_at_signal.load(Ordering::SeqCst),-5);
+ assert!(runtime.fence.quarantined_at_signal.load(Ordering::SeqCst));
  runtime.fail_while_owned(EIO);assert_eq!(runtime.fence.count.load(Ordering::SeqCst),1);
  drop(runtime);assert!(m.unmapped.load(Ordering::SeqCst));
 }

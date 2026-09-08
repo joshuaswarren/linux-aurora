@@ -1079,8 +1079,13 @@ no_debug!(Vm);
 
 struct T8140VmJobLifetime {
     active: usize,
+    /// At least one accepted job may still be dereferenced by firmware after
+    /// its error fence has signalled. Healthy synchronized VM_BIND unmaps stay
+    /// immediate; only this lost-VM state defers them to processor stop.
+    quarantined: bool,
     closed: bool,
     close_ranges: Option<(Range<u64>, Range<u64>)>,
+    deferred_unmaps: KVec<(u64, u64)>,
     closed_objects: KVec<ARef<gem::Object>>,
 }
 
@@ -1088,12 +1093,22 @@ struct T8140VmJobLifetime {
 /// their GEM backing until all accepted jobs retire; quarantined packets keep
 /// this guard until the processors have provably stopped.
 pub(crate) struct T8140VmJobGuard { vm: Vm }
+impl T8140VmJobGuard {
+    /// Mark this VM as retaining a packet whose firmware ownership was not
+    /// disproved. The sticky VM failure prevents new work; explicit unbinds
+    /// are held until the last job guard reaches the processor-stop drain.
+    pub(crate) fn quarantine(&self) {
+        self.vm.job_lifetime.lock().quarantined = true;
+    }
+}
 impl Drop for T8140VmJobGuard {
     fn drop(&mut self) {
         let mut state = self.vm.job_lifetime.lock();
         state.active -= 1;
         if state.active != 0 { return; }
+        state.quarantined = false;
         let ranges = state.close_ranges.take();
+        let deferred_unmaps = core::mem::replace(&mut state.deferred_unmaps, KVec::new());
         let objects = core::mem::replace(&mut state.closed_objects, KVec::new());
         // Keep admission locked through the actual unmaps. Otherwise a new
         // submit can acquire a job guard after active reaches zero but before
@@ -1102,6 +1117,12 @@ impl Drop for T8140VmJobGuard {
         if let Some((user, kernel)) = ranges {
             if self.vm.unmap_user_ranges_now(user, kernel).is_err() {
                 pr_err!("G17P VM job retirement: deferred user unmap failed\n");
+            }
+        } else {
+            for (iova, size) in deferred_unmaps {
+                if self.vm.unmap_range(iova, size).is_err() {
+                    pr_err!("G17P VM job retirement: deferred range unmap failed\n");
+                }
             }
         }
         for object in objects {
@@ -2135,7 +2156,9 @@ impl Vm {
             driver_mappings: Arc::pin_init(new_mutex!(None, "VmDriverMappings"), GFP_KERNEL)?,
             status: Arc::new(crate::g17_status::VmStatus::new(), GFP_KERNEL)?,
             job_lifetime: Arc::pin_init(new_mutex!(T8140VmJobLifetime {
-                active: 0, closed: false, close_ranges: None, closed_objects: KVec::new(),
+                active: 0, quarantined: false, closed: false,
+                close_ranges: None, deferred_unmaps: KVec::new(),
+                closed_objects: KVec::new(),
             }, "T8140VmJobLifetime"), GFP_KERNEL)?,
             t8140_native_context_bindings: if cfg == UatConfig::T8140 {
                 Some(Arc::pin_init(
@@ -3002,12 +3025,24 @@ impl Vm {
 
     /// Unmap one explicitly released userspace range.
     ///
-    /// DRM VM_BIND callers synchronize the range before unbinding it.  Do not
-    /// extend the VM-wide close guard to this operation: unrelated work in the
-    /// same VM may remain active, and rejecting the synchronized unbind would
-    /// prevent transient command aliases from ever being recycled under load.
-    /// GEM-handle and whole-VM teardown remain deferred by `job_lifetime`.
+    /// DRM VM_BIND callers synchronize healthy ranges before unbinding them,
+    /// so unrelated live work must not impose a VM-wide EBUSY gate. A job
+    /// which signalled an error while still firmware-owned is different:
+    /// userspace may immediately destroy its mappings, and those must remain
+    /// until the quarantined job guard is released after processor stop.
     pub(crate) fn unmap_user_range(&self, iova: u64, size: u64) -> Result {
+        let mut state = self.job_lifetime.lock();
+        if state.active != 0 && state.quarantined {
+            if !state
+                .deferred_unmaps
+                .iter()
+                .any(|range| *range == (iova, size))
+            {
+                state.deferred_unmaps.push((iova, size), GFP_KERNEL)?;
+            }
+            return Ok(());
+        }
+        core::mem::drop(state);
         self.unmap_range(iova, size)
     }
 
