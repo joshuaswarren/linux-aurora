@@ -89,6 +89,19 @@ const G17P_BOOTSTRAP_UMA_COUNT: u32 =
 // physical-counter sample used by retained compute submissions.
 const G17P_NATIVE_RENDER_KICK_AUXILIARY: u64 = 0x003f_ffff_ffff_ffff;
 
+// Honeykrisp splits its T8140 main allocation heap into read/write and
+// read-only sparse-shadow halves at bit 40. A PDM fault in the upper half is
+// ambiguous unless recovery also checks the corresponding lower allocation.
+const G17P_HONEYKRISP_SPARSE_RO_BIT: u64 = 1 << 40;
+
+const fn g17p_fault_sparse_ro_lower(address: u64) -> Option<u64> {
+    if address & G17P_HONEYKRISP_SPARSE_RO_BIT == 0 {
+        None
+    } else {
+        Some(address & !G17P_HONEYKRISP_SPARSE_RO_BIT)
+    }
+}
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum G17PNativeRenderPublishPhase {
     FragmentVisible,
@@ -6012,6 +6025,26 @@ impl G17PManagerConstruction {
                     error,
                 ),
             }
+        }
+
+        // One fault-only discriminator for Honeykrisp's sparse buffer layout:
+        // a mapped lower peer with an unmapped upper address means the shadow
+        // bind disappeared, while two unmapped peers point to a stale or
+        // malformed address. Keep this to one line; it is not submit logging.
+        let decoded = (addr_word << 6) & ((1u64 << 42) - 1);
+        if let Some(candidate) = g17p_fault_sparse_ro_lower(decoded) {
+            let page = candidate & !(mmu::UAT_PGSZ as u64 - 1);
+            let mapped = vm.covers_range(page, mmu::UAT_PGSZ as u64, true, false);
+            let translation = vm.translate_iova(candidate);
+            dev_info!(
+                dev.as_ref(),
+                "G17P fault address[{}]: Honeykrisp sparse-RO lower peer {:#x} page {:#x} mapped={} translate={:?}\n",
+                label,
+                candidate,
+                page,
+                mapped,
+                translation,
+            );
         }
 
         // The whole client root, so any decode of the address register can be
