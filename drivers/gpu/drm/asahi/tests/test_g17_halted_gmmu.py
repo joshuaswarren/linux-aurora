@@ -8,14 +8,18 @@ root = Path(__file__).resolve().parents[1]
 source = (root / "regs.rs").read_text()
 
 
-def extract(marker):
-    start = source.index(marker)
-    pos = source.index("{", start) + 1
+def extract_from(text, marker):
+    start = text.index(marker)
+    pos = text.index("{", start) + 1
     depth = 1
     while depth:
-        depth += (source[pos] == "{") - (source[pos] == "}")
+        depth += (text[pos] == "{") - (text[pos] == "}")
         pos += 1
-    return source[start:pos]
+    return text[start:pos]
+
+
+def extract(marker):
+    return extract_from(source, marker)
 
 
 method = extract("pub(crate) fn g17p_halted_gmmu_snapshot(")
@@ -28,6 +32,7 @@ live = (root / "g17_live_boot.rs").read_text()
 assert "report.state, report.host_requested, report.reason" in live
 manager = (root / "g17_manager.rs").read_text()
 assert "render_bind_for_descriptor_context(fault_vm_slot)" in manager
+shadow_peer = extract_from(manager, "const fn g17p_fault_sparse_ro_lower(")
 selector = manager[manager.index("fn render_bind_for_descriptor_context("):]
 selector = selector[:selector.index("\n    pub(crate) fn log_fault_address_candidates(")]
 assert "storage.descriptor_context_id() == u16::from(descriptor_context_id)" in selector
@@ -35,6 +40,8 @@ assert ".root_slot()" not in selector
 assert "self.render_bind.as_ref().vm()" not in manager
 assert "snapshot.info_before >> 17" in live
 assert "snapshot.fault_info >> 17" in live
+assert manager.count("Honeykrisp sparse-RO lower peer") == 1
+assert "g17p_fault_sparse_ro_lower(decoded)" in manager
 
 unit = r'''
 use std::cell::RefCell;
@@ -43,6 +50,7 @@ const ENODEV: i32 = 19;
 const T8140_HOST_IRQ_SUMMARY: usize = 0xe01000;
 const FAULT_INFO_G14X: usize = 0xd8c0;
 const FAULT_ADDR_G14X: usize = 0xd8c8;
+const G17P_HONEYKRISP_SPARSE_RO_BIT: u64 = 1 << 40;
 struct Mock { reads: RefCell<Vec<usize>>, gpc: u32, valid: bool, fail: usize }
 impl Mock {
     fn read(&self, offset: usize) -> Result<u64> {
@@ -91,7 +99,19 @@ fn each_read_error_stops_without_later_access() {
         assert_eq!(r.sgx.mmio.reads.borrow().len(), failure);
     }
 }
-'''
+#[test]
+fn sparse_ro_fault_maps_to_the_exact_lower_allocation_peer() {
+    assert_eq!(
+        g17p_fault_sparse_ro_lower(0x177bfef1f80),
+        Some(0x77bfef1f80),
+    );
+    assert_eq!(g17p_fault_sparse_ro_lower(0x77bfef1f80), None);
+    assert_eq!(
+        g17p_fault_sparse_ro_lower(G17P_HONEYKRISP_SPARSE_RO_BIT),
+        Some(0),
+    );
+}
+''' + shadow_peer
 with tempfile.TemporaryDirectory(prefix="g17-halted-gmmu-") as tmp:
     test = Path(tmp) / "test.rs"
     test.write_text(unit + fields + "\nimpl Resources {\n" + method + "\n}\n")
