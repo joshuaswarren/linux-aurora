@@ -684,6 +684,9 @@ struct VmInner {
     va_range: Range<u64>,
     page_table: UatPageTable,
     mm: mm::Allocator<(), KernelMappingInner>,
+    /// Normalized software mirror of GPUVM-owned user leaf ranges. Kernel
+    /// mappings use the separate `mm` allocator and never enter this list.
+    user_gpuva_ranges: KVec<Range<u64>>,
     uat_inner: Arc<UatInner>,
     binding: Arc<Mutex<VmBinding>>,
     id: u64,
@@ -735,6 +738,26 @@ struct StepContext {
     vm_bo: Option<ARef<gpuvm::GpuVmBo<VmInner>>>,
     prot: Prot,
 }
+
+/// All fallible per-map resources reserved before a VM_BIND batch starts
+/// changing visible GPU mappings.
+pub(crate) struct PreparedUserMap {
+    gem: ARef<gem::Object>,
+    ctx: StepContext,
+    addr: u64,
+    size: u64,
+    offset: u64,
+    single_page: bool,
+}
+no_debug!(PreparedUserMap);
+
+/// Split GPUVA nodes reserved before an unmap is committed.
+pub(crate) struct PreparedUserUnmap {
+    ctx: StepContext,
+    iova: u64,
+    size: u64,
+}
+no_debug!(PreparedUserUnmap);
 
 impl gpuvm::DriverGpuVm for VmInner {
     type Driver = driver::AsahiDriver;
@@ -856,6 +879,7 @@ impl gpuvm::DriverGpuVm for VmInner {
             );
             return Err(EINVAL);
         }
+        self.record_user_map(op.addr()..op.addr() + op.range())?;
         Ok(())
     }
     fn step_unmap(
@@ -864,6 +888,7 @@ impl gpuvm::DriverGpuVm for VmInner {
         _ctx: &mut Self::StepContext,
     ) -> Result {
         let va = op.va().expect("step_unmap: missing VA");
+        let va_range = va.addr()..va.addr() + va.range();
 
         mod_dev_dbg!(self.dev, "MMU: unmap: {:#x}:{:#x}\n", va.addr(), va.range());
 
@@ -886,6 +911,7 @@ impl gpuvm::DriverGpuVm for VmInner {
         if op.unmap_and_unlink_va_defer().is_none() {
             dev_err!(self.dev.as_ref(), "step_unmap: could not unlink gpuva");
         }
+        self.record_user_unmap(va_range)?;
         Ok(())
     }
     fn step_remap(
@@ -963,11 +989,64 @@ impl gpuvm::DriverGpuVm for VmInner {
             }
         }
 
+        self.record_user_unmap(unmap_start..unmap_end)?;
         Ok(())
     }
 }
 
 impl VmInner {
+    fn record_user_map(&mut self, mut range: Range<u64>) -> Result {
+        let mut index = 0usize;
+        while index < self.user_gpuva_ranges.len()
+            && self.user_gpuva_ranges[index].end < range.start
+        {
+            index += 1;
+        }
+        while index < self.user_gpuva_ranges.len()
+            && self.user_gpuva_ranges[index].start <= range.end
+        {
+            range.start = range.start.min(self.user_gpuva_ranges[index].start);
+            range.end = range.end.max(self.user_gpuva_ranges[index].end);
+            self.user_gpuva_ranges.remove(index).map_err(|_| EIO)?;
+        }
+        self.user_gpuva_ranges
+            .insert_within_capacity(index, range)
+            .map_err(|_| ENOMEM)
+    }
+
+    fn record_user_unmap(&mut self, range: Range<u64>) -> Result {
+        let mut index = 0usize;
+        while index < self.user_gpuva_ranges.len() {
+            let owned = self.user_gpuva_ranges[index].clone();
+            if owned.end <= range.start {
+                index += 1;
+                continue;
+            }
+            if owned.start >= range.end {
+                break;
+            }
+            if range.start <= owned.start && owned.end <= range.end {
+                self.user_gpuva_ranges.remove(index).map_err(|_| EIO)?;
+                continue;
+            }
+            if owned.start < range.start && range.end < owned.end {
+                self.user_gpuva_ranges[index].end = range.start;
+                self.user_gpuva_ranges
+                    .insert_within_capacity(index + 1, range.end..owned.end)
+                    .map_err(|_| ENOMEM)?;
+                break;
+            }
+            if owned.start < range.start {
+                self.user_gpuva_ranges[index].end = range.start;
+                index += 1;
+            } else {
+                self.user_gpuva_ranges[index].start = range.end;
+                break;
+            }
+        }
+        Ok(())
+    }
+
     /// Returns the slot index, if this VM is bound.
     fn slot(&self) -> Option<u32> {
         if self.is_kernel {
@@ -2147,6 +2226,7 @@ impl Vm {
                     is_kernel,
                     page_table,
                     mm,
+                    user_gpuva_ranges: KVec::new(),
                     uat_inner,
                     binding: binding_clone,
                     id,
@@ -2895,6 +2975,23 @@ impl Vm {
         prot: Prot,
         single_page: bool,
     ) -> Result {
+        let prepared = self.prepare_bind_object(
+            gem, addr, size, offset, prot, single_page,
+        )?;
+        self.bind_prepared_object(prepared)
+    }
+
+    /// Reserve the BO state, split nodes, scatterlist and page-table levels
+    /// needed by one userspace map without installing a leaf PTE.
+    pub(crate) fn prepare_bind_object(
+        &self,
+        gem: &gem::Object,
+        addr: u64,
+        size: u64,
+        offset: u64,
+        prot: Prot,
+        single_page: bool,
+    ) -> Result<PreparedUserMap> {
         // Mapping needs a complete context
         let mut ctx = StepContext {
             new_va: Some(gpuvm::GpuVa::<VmInner>::new(pin_init::default())?),
@@ -2941,20 +3038,87 @@ impl Vm {
             return Err(EINVAL);
         }
 
-        let (flags, gem_range) = if single_page {
-            (gpuvm::GpuVaFlags::REPEAT, UAT_PGSZ as u32)
-        } else {
-            (gpuvm::GpuVaFlags::NONE, 0u32)
-        };
-
         mod_dev_dbg!(
             inner.dev,
-            "MMU: sm_map: {:#x} [{:#x}] -> {:#x}\n",
+            "MMU: prepare sm_map: {:#x} [{:#x}] -> {:#x}\n",
             offset,
             size,
             addr
         );
-        inner.sm_map(&mut ctx, addr, size, offset, gem_range, flags)
+        // Unlike prepare_map(), this may cover GPUVA mappings which the
+        // subsequent split/merge operation will replace. It allocates only
+        // intermediate tables; no leaf is changed here.
+        inner.user_gpuva_ranges.reserve(1, GFP_KERNEL)?;
+        inner.page_table.alloc_pages(
+            addr..addr.checked_add(size).ok_or(EOVERFLOW)?
+        )?;
+        core::mem::drop(inner);
+
+        Ok(PreparedUserMap {
+            gem: gem.into(), ctx, addr, size, offset, single_page,
+        })
+    }
+
+    /// Check GPUVM/UAT ownership agreement over a future VM_BIND range.
+    pub(crate) fn preflight_user_bind_range(&self, range: Range<u64>) -> Result {
+        let mut inner = self.inner.exec_lock(None, false)?;
+        let mut gpuva_ranges = KVec::new();
+        for owned in &inner.user_gpuva_ranges {
+            let start = owned.start.max(range.start);
+            let end = owned.end.min(range.end);
+            if start < end {
+                gpuva_ranges.push(start..end, GFP_KERNEL)?;
+            }
+        }
+        if !inner.page_table.matches_gpuva_ranges(range, &gpuva_ranges)? {
+            return Err(EFAULT);
+        }
+        Ok(())
+    }
+
+    /// Reserve the one possible interval split per operation before a batch
+    /// starts. Callback-time registry updates are then allocation-free.
+    pub(crate) fn reserve_user_range_updates(&self, count: usize) -> Result {
+        let mut inner = self.inner.exec_lock(None, false)?;
+        inner.user_gpuva_ranges.reserve(count, GFP_KERNEL)?;
+        Ok(())
+    }
+
+    /// A failed VM may unbind for teardown, but it may not replace mappings
+    /// still reachable from retained firmware packets.
+    pub(crate) fn accepts_user_maps(&self) -> bool {
+        if self.status.get() != 0 { return false; }
+        let state = self.job_lifetime.lock();
+        state.active == 0 || !state.quarantined
+    }
+
+    /// Allocate every deferred-unmap entry a batch could need before it
+    /// changes a visible mapping.
+    pub(crate) fn reserve_deferred_user_unmaps(&self, count: usize) -> Result {
+        self.job_lifetime.lock().deferred_unmaps.reserve(count, GFP_KERNEL)?;
+        Ok(())
+    }
+
+    /// Commit a map whose fallible backing and page-table resources were
+    /// prepared before the containing VM_BIND batch began.
+    pub(crate) fn bind_prepared_object(&self, mut prepared: PreparedUserMap) -> Result {
+        let (flags, gem_range) = if prepared.single_page {
+            (gpuvm::GpuVaFlags::REPEAT, UAT_PGSZ as u32)
+        } else {
+            (gpuvm::GpuVaFlags::NONE, 0u32)
+        };
+        let mut inner = self.inner.exec_lock(Some(&prepared.gem), false)?;
+        mod_dev_dbg!(
+            inner.dev,
+            "MMU: sm_map: {:#x} [{:#x}] -> {:#x}\n",
+            prepared.offset,
+            prepared.size,
+            prepared.addr
+        );
+        inner.sm_map(
+            &mut prepared.ctx, prepared.addr, prepared.size, prepared.offset,
+            gem_range, flags,
+        )
     }
 
     /// Add a direct MMIO mapping to this Vm at a free address.
@@ -3031,6 +3195,18 @@ impl Vm {
     /// userspace may immediately destroy its mappings, and those must remain
     /// until the quarantined job guard is released after processor stop.
     pub(crate) fn unmap_user_range(&self, iova: u64, size: u64) -> Result {
+        let prepared = self.prepare_user_unmap(iova, size)?;
+        self.unmap_prepared_user_range(prepared)
+    }
+
+    /// Commit a preallocated user unmap, or enqueue it behind a quarantined
+    /// packet without discarding its retained backing.
+    pub(crate) fn unmap_prepared_user_range(
+        &self,
+        prepared: PreparedUserUnmap,
+    ) -> Result {
+        let iova = prepared.iova;
+        let size = prepared.size;
         let mut state = self.job_lifetime.lock();
         if state.active != 0 && state.quarantined {
             if !state
@@ -3043,24 +3219,48 @@ impl Vm {
             return Ok(());
         }
         core::mem::drop(state);
-        self.unmap_range(iova, size)
+        self.unmap_prepared_range(prepared)
     }
 
     /// Unmap everything in an address range. Callers must hold the job
     /// lifetime lock or operate on driver-private mappings.
     fn unmap_range(&self, iova: u64, size: u64) -> Result {
-        // Unmapping a range can only do a single split, so just preallocate
-        // the prev and next GpuVas
-        let mut ctx = StepContext {
-            prev_va: Some(gpuvm::GpuVa::<VmInner>::new(pin_init::default())?),
-            next_va: Some(gpuvm::GpuVa::<VmInner>::new(pin_init::default())?),
-            ..Default::default()
-        };
+        let prepared = self.prepare_user_unmap(iova, size)?;
+        self.unmap_prepared_range(prepared)
+    }
 
+    /// Reserve the at-most-two split nodes an unmap can require.
+    pub(crate) fn prepare_user_unmap(
+        &self,
+        iova: u64,
+        size: u64,
+    ) -> Result<PreparedUserUnmap> {
+        self.reserve_user_range_updates(1)?;
+        Ok(PreparedUserUnmap {
+            ctx: StepContext {
+                prev_va: Some(gpuvm::GpuVa::<VmInner>::new(pin_init::default())?),
+                next_va: Some(gpuvm::GpuVa::<VmInner>::new(pin_init::default())?),
+                ..Default::default()
+            },
+            iova,
+            size,
+        })
+    }
+
+    /// Commit an unmap using split nodes allocated during batch preflight.
+    pub(crate) fn unmap_prepared_range(
+        &self,
+        mut prepared: PreparedUserUnmap,
+    ) -> Result {
         let mut inner = self.inner.exec_lock(None, false)?;
 
-        mod_dev_dbg!(inner.dev, "MMU: sm_unmap: {:#x}:{:#x}\n", iova, size);
-        inner.sm_unmap(&mut ctx, iova, size)
+        mod_dev_dbg!(
+            inner.dev,
+            "MMU: sm_unmap: {:#x}:{:#x}\n",
+            prepared.iova,
+            prepared.size
+        );
+        inner.sm_unmap(&mut prepared.ctx, prepared.iova, prepared.size)
     }
 
     /// Drop mappings for a given bo.

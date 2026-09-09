@@ -37,6 +37,7 @@ use kernel::error::code::*;
 use kernel::new_mutex;
 use kernel::prelude::*;
 use kernel::sync::{
+    aref::ARef,
     Arc,
     Mutex, //
 };
@@ -169,11 +170,26 @@ struct Vm {
     /// The usable user VA range for this device's UAT geometry
     /// (`mmu::iova_user_usable_range`), captured at creation.
     user_range: Range<u64>,
+    /// Serialize VM_BIND preflight/commit and GEM-handle teardown.
+    bind_lock: Arc<Mutex<()>>,
     _dummy_mapping: mmu::KernelMapping,
+}
+
+enum PreparedGemBindOp {
+    Map {
+        op: uapi::drm_asahi_gem_bind_op,
+        bo: ARef<gem::Object>,
+        prepared: Option<mmu::PreparedUserMap>,
+    },
+    Unmap {
+        op: uapi::drm_asahi_gem_bind_op,
+        prepared: Option<mmu::PreparedUserUnmap>,
+    },
 }
 
 impl Drop for Vm {
     fn drop(&mut self) {
+        let _bind_guard = self.bind_lock.lock();
         if self
             .vm
             .unmap_user_ranges(self.user_range.clone(), self.kernel_range.clone())
@@ -603,6 +619,7 @@ impl File {
                 vm,
                 kernel_range,
                 user_range,
+                bind_lock: Arc::pin_init(new_mutex!((), "AsahiVmBind"), GFP_KERNEL)?,
                 _dummy_mapping: dummy_mapping,
             },
             GFP_KERNEL,
@@ -724,15 +741,16 @@ impl File {
         }
 
         let vm_id = data.vm_id.try_into()?;
-
+        let count = usize::try_from(data.num_binds)?;
+        let stride = usize::try_from(data.stride)?;
+        let size = stride.checked_mul(count).ok_or(EOVERFLOW)?;
         let mut vec = KVec::new();
-        let size = (data.stride * data.num_binds) as usize;
         let reader = UserSlice::new(UserPtr::from_addr(data.userptr as _), size).reader();
         reader.read_all(&mut vec, GFP_KERNEL)?;
         let mut reader = Reader::new(&vec);
-
-        for _i in 0..data.num_binds {
-            let bind: uapi::drm_asahi_gem_bind_op = reader.read_up_to(data.stride as usize)?;
+        let mut ops = KVec::with_capacity(count, GFP_KERNEL)?;
+        for _i in 0..count {
+            let bind: uapi::drm_asahi_gem_bind_op = reader.read_up_to(stride)?;
             // Vulkan faults on an unmapped USC exec window. Log every bind so we
             // can tell whether Mesa asks for that range and we drop it, or never
             // asks at all.
@@ -747,216 +765,127 @@ impl File {
                     bind.handle,
                 );
             }
-            Self::do_gem_bind_unbind(vm_id, &bind, file)?;
+            ops.push(bind, GFP_KERNEL)?;
         }
 
-        Ok(0)
-    }
-
-    pub(crate) fn do_gem_bind_unbind(
-        vm_id: usize,
-        data: &uapi::drm_asahi_gem_bind_op,
-        file: &DrmFile,
-    ) -> Result<u32> {
-        if (data.flags & uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_UNBIND) != 0 {
-            Self::do_gem_unbind(vm_id, data, file)
-        } else {
-            Self::do_gem_bind(vm_id, data, file)
-        }
-    }
-
-    pub(crate) fn do_gem_bind(
-        vm_id: usize,
-        data: &uapi::drm_asahi_gem_bind_op,
-        file: &DrmFile,
-    ) -> Result<u32> {
-        if (data.addr | data.range | data.offset) as usize & mmu::UAT_PGMSK != 0 {
-            cls_pr_debug!(
-                Errors,
-                "gem_bind: Addr/range/offset not page aligned: {:#x} {:#x}\n",
-                data.addr,
-                data.range
-            );
-            return Err(EINVAL); // Must be page aligned
-        }
-
-        if (data.flags
-            & !(uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_READ
-                | uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_WRITE
-                | uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_SINGLE_PAGE))
-            != 0
-        {
-            cls_pr_debug!(Errors, "gem_bind: Invalid flags {:#x}\n", data.flags);
-            return Err(EINVAL);
-        }
-
-        let single_page = data.flags & uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_SINGLE_PAGE != 0;
-
-        let bo = gem::Object::lookup_handle(file, data.handle)?;
-
-        let start = data.addr;
-        let end = data.addr.checked_add(data.range).ok_or(EINVAL)?;
-        let range = start..end;
-
-        let bo_accessed_size = if single_page {
-            mmu::UAT_PGMSK as u64
-        } else {
-            data.range
+        let (vm, kernel_range, user_range, bind_lock) = {
+            let vms_xa = file.inner().vms();
+            let guard = vms_xa.lock();
+            let guarded_vm = guard.get(vm_id).ok_or(ENOENT)?;
+            (
+                guarded_vm.vm.clone(),
+                guarded_vm.kernel_range.clone(),
+                guarded_vm.user_range.clone(),
+                guarded_vm.bind_lock.clone(),
+            )
         };
-        let end_off = data.offset.checked_add(bo_accessed_size).ok_or(EINVAL)?;
-        if end_off as usize > bo.size() {
-            return Err(EINVAL);
-        }
+        let _bind_guard = bind_lock.lock();
 
-        // The user range is per-device geometry, so this check moves below
-        // the VM lookup (which is where the range is stored).
-
-        let prot = if data.flags & uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_READ != 0 {
-            if data.flags & uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_WRITE != 0 {
-                mmu::PROT_GPU_SHARED_RW
-            } else {
-                mmu::PROT_GPU_SHARED_RO
+        // Validate and reserve all expected resources before changing a leaf.
+        // A bad upper sparse-shadow op cannot strand its lower partner.
+        let mut plans = KVec::with_capacity(count, GFP_KERNEL)?;
+        let mut unmap_count = 0usize;
+        vm.reserve_user_range_updates(count)?;
+        for op in ops {
+            if op.range == 0
+                || (op.addr | op.range | op.offset) & mmu::UAT_PGMSK as u64 != 0
+            {
+                return Err(EINVAL);
             }
-        } else if data.flags & uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_WRITE != 0 {
-            mmu::PROT_GPU_SHARED_WO
-        } else {
-            cls_pr_debug!(
-                Errors,
-                "gem_bind: Must specify read or write (flags: {:#x})\n",
-                data.flags
-            );
-            return Err(EINVAL); // Must specify one of DRM_ASAHI_BIND_{READ,WRITE}
-        };
+            let end = op.addr.checked_add(op.range).ok_or(EINVAL)?;
+            let range = op.addr..end;
+            if !user_range.is_superset(range.clone())
+                || kernel_range.overlaps(range.clone())
+                || vm.driver_range_overlaps(range.clone())
+            {
+                return Err(EINVAL);
+            }
+            vm.preflight_user_bind_range(range.clone())?;
 
-        let vms_xa = file.inner().vms();
-        let guard = vms_xa.lock();
-        let guarded_vm = guard.get(vm_id).ok_or(ENOENT)?;
+            if op.flags & uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_UNBIND != 0 {
+                if op.offset != 0
+                    || op.flags != uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_UNBIND
+                    || op.handle != 0
+                {
+                    return Err(EINVAL);
+                }
+                plans.push(PreparedGemBindOp::Unmap {
+                    op,
+                    prepared: Some(vm.prepare_user_unmap(op.addr, op.range)?),
+                }, GFP_KERNEL)?;
+                unmap_count += 1;
+                continue;
+            }
 
-        // Clone it immediately so we aren't holding the XArray lock
-        let vm = guarded_vm.vm.clone();
-        let kernel_range = guarded_vm.kernel_range.clone();
-        let user_range = guarded_vm.user_range.clone();
-        let _ = guarded_vm;
-        core::mem::drop(guard);
-
-        if !user_range.is_superset(range.clone()) {
-            cls_pr_debug!(
-                Errors,
-                "gem_bind: Invalid map range {:#x}..{:#x} (not contained in user range)\n",
-                start,
-                end
-            );
-            return Err(EINVAL); // Invalid map range
+            if !vm.accepts_user_maps() {
+                return Err(EIO);
+            }
+            if op.flags
+                & !(uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_READ
+                    | uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_WRITE
+                    | uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_SINGLE_PAGE)
+                != 0
+            {
+                return Err(EINVAL);
+            }
+            let read = op.flags & uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_READ != 0;
+            let write = op.flags & uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_WRITE != 0;
+            if !read && !write {
+                return Err(EINVAL);
+            }
+            let single_page =
+                op.flags & uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_SINGLE_PAGE != 0;
+            let bo = gem::Object::lookup_handle(file, op.handle)?;
+            let accessed_size = if single_page {
+                mmu::UAT_PGSZ as u64
+            } else {
+                op.range
+            };
+            let end_off = op.offset.checked_add(accessed_size).ok_or(EINVAL)?;
+            if end_off > u64::try_from(bo.size())? {
+                return Err(EINVAL);
+            }
+            vm.validate_t8140_native_context_binding(op.addr, op.range, single_page)?;
+            let prot = match (read, write) {
+                (true, true) => mmu::PROT_GPU_SHARED_RW,
+                (true, false) => mmu::PROT_GPU_SHARED_RO,
+                (false, true) => mmu::PROT_GPU_SHARED_WO,
+                (false, false) => unreachable!(),
+            };
+            let prepared = vm.prepare_bind_object(
+                &bo, op.addr, op.range, op.offset, prot, single_page,
+            )?;
+            plans.push(PreparedGemBindOp::Map {
+                op, bo, prepared: Some(prepared),
+            }, GFP_KERNEL)?;
         }
 
-        if kernel_range.overlaps(range.clone()) {
-            cls_pr_debug!(
-                Errors,
-                "gem_bind: Invalid map range {:#x}..{:#x} (intrudes in kernel range)\n",
-                start,
-                end
-            );
-            return Err(EINVAL);
-        }
-        if vm.driver_range_overlaps(range.clone()) {
-            cls_pr_debug!(
-                Errors,
-                "gem_bind: map range {:#x}..{:#x} overlaps a device-owned VA\n",
-                start,
-                end
-            );
-            return Err(EINVAL);
+        vm.reserve_deferred_user_unmaps(unmap_count)?;
+        for plan in plans.iter_mut() {
+            match plan {
+                PreparedGemBindOp::Map { prepared, .. } => {
+                    vm.bind_prepared_object(prepared.take().ok_or(EINVAL)?)?;
+                }
+                PreparedGemBindOp::Unmap { prepared, .. } => {
+                    vm.unmap_prepared_user_range(prepared.take().ok_or(EINVAL)?)?;
+                }
+            }
         }
 
-        vm.validate_t8140_native_context_binding(data.addr, data.range, single_page)?;
-        vm.bind_object(&bo, data.addr, data.range, data.offset, prot, single_page)?;
-        // G17P secure GART has a second, context-0 view for fixed resource
-        // subranges. Record backing identity here, but do not publish the
-        // global context-0 aliases until this VM owns a render submission.
-        vm.track_t8140_native_context_binding(
-            bo.clone(),
-            data.addr,
-            data.range,
-            data.offset,
-        )?;
-
+        // Replay registry changes only after the page-table batch commits.
+        for plan in &plans {
+            match plan {
+                PreparedGemBindOp::Map { op, bo, .. } => {
+                    vm.track_t8140_native_context_binding(
+                        bo.clone(), op.addr, op.range, op.offset,
+                    )?;
+                }
+                PreparedGemBindOp::Unmap { op, .. } => {
+                    vm.untrack_t8140_native_context_range(op.addr..op.addr + op.range);
+                }
+            }
+        }
         vm.bo_deferred_cleanup();
-
-        Ok(0)
-    }
-
-    pub(crate) fn do_gem_unbind(
-        vm_id: usize,
-        data: &uapi::drm_asahi_gem_bind_op,
-        file: &DrmFile,
-    ) -> Result<u32> {
-        if data.offset != 0
-            || data.flags != uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_UNBIND
-            || data.handle != 0
-        {
-            cls_pr_debug!(Errors, "gem_unbind: offset/flags/handle not zero\n");
-            return Err(EINVAL);
-        }
-
-        if (data.addr | data.range) as usize & mmu::UAT_PGMSK != 0 {
-            cls_pr_debug!(
-                Errors,
-                "gem_bind: Addr/range/offset not page aligned: {:#x} {:#x}\n",
-                data.addr,
-                data.range
-            );
-            return Err(EINVAL); // Must be page aligned
-        }
-
-        let start = data.addr;
-        let end = data.addr.checked_add(data.range).ok_or(EINVAL)?;
-        let range = start..end;
-
-        let vms_xa = file.inner().vms();
-        let guard = vms_xa.lock();
-        let guarded_vm = guard.get(vm_id).ok_or(ENOENT)?;
-
-        // Clone it immediately so we aren't holding the XArray lock
-        let vm = guarded_vm.vm.clone();
-        let kernel_range = guarded_vm.kernel_range.clone();
-        let user_range = guarded_vm.user_range.clone();
-        let _ = guarded_vm;
-        core::mem::drop(guard);
-
-        if !user_range.is_superset(range.clone()) {
-            cls_pr_debug!(
-                Errors,
-                "gem_bind: Invalid unmap range {:#x}..{:#x} (not contained in user range)\n",
-                start,
-                end
-            );
-            return Err(EINVAL); // Invalid map range
-        }
-
-        if kernel_range.overlaps(range.clone()) {
-            cls_pr_debug!(
-                Errors,
-                "gem_bind: Invalid unmap range {:#x}..{:#x} (intrudes in kernel range)\n",
-                start,
-                end
-            );
-            return Err(EINVAL);
-        }
-        if vm.driver_range_overlaps(range.clone()) {
-            cls_pr_debug!(
-                Errors,
-                "gem_unbind: range {:#x}..{:#x} overlaps a device-owned VA\n",
-                start,
-                end
-            );
-            return Err(EINVAL);
-        }
-
-        vm.unmap_user_range(range.start, range.range())?;
-        vm.untrack_t8140_native_context_range(range);
-
-        vm.bo_deferred_cleanup();
-
         Ok(0)
     }
 
@@ -971,7 +900,9 @@ impl File {
                     // Clone since we can't hold the xarray spinlock while
                     // calling drop_mappings()
                     let vm = file_vm.borrow().vm.clone();
+                    let bind_lock = file_vm.borrow().bind_lock.clone();
                     core::mem::drop(file_vm);
+                    let _bind_guard = bind_lock.lock();
                     vm.drop_mappings(bo)?;
                     vm.untrack_t8140_native_context_object(bo);
                     if idx == usize::MAX {
