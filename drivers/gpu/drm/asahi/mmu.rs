@@ -3051,12 +3051,10 @@ impl Vm {
         self.commit_prepared_user_bind_batch(&mut batch)
     }
 
-    /// Commit a fully prepared VM_BIND batch with the established interruptible
-    /// drm_exec path. All semantic checks, handles, callback nodes, scatterlists
-    /// and page-table levels have already been resolved, so an invalid later
-    /// operation cannot strand an earlier one. The generic Rust GPUVM API still
-    /// exposes one request object per drm_exec; true multi-object atomic lock
-    /// acquisition needs a separate kernel-crate API extension.
+    /// Commit a fully prepared VM_BIND batch after acquiring every involved BO
+    /// through one interruptible drm_exec transaction. All semantic checks,
+    /// handles, callback nodes, scatterlists and page-table levels have already
+    /// been resolved, so no fallible preparation remains after the lock.
     pub(crate) fn commit_prepared_user_bind_batch(
         &self,
         batch: &mut PreparedUserBindBatch,
@@ -3091,6 +3089,14 @@ impl Vm {
         }
         core::mem::drop(lifetime);
 
+        let mut objects = KVec::with_capacity(batch.ops.len(), GFP_KERNEL)?;
+        for op in &batch.ops {
+            if let PreparedUserBindOp::Map(map) = op {
+                objects.push(map.gem.clone(), GFP_KERNEL)?;
+            }
+        }
+        let mut inner = self.inner.exec_lock_array(&objects, true)?;
+        let mut object_index = 0usize;
         for op in &mut batch.ops {
             match op {
                 PreparedUserBindOp::Map(map) => {
@@ -3099,7 +3105,6 @@ impl Vm {
                     } else {
                         (gpuvm::GpuVaFlags::NONE, 0u32)
                     };
-                    let mut inner = self.inner.exec_lock(Some(&map.gem), true)?;
                     mod_dev_dbg!(
                         inner.dev,
                         "MMU: sm_map: {:#x} [{:#x}] -> {:#x}\n",
@@ -3107,7 +3112,8 @@ impl Vm {
                         map.size,
                         map.addr
                     );
-                    inner.sm_map(
+                    inner.sm_map_indexed(
+                        object_index,
                         &mut map.ctx,
                         map.addr,
                         map.size,
@@ -3115,9 +3121,9 @@ impl Vm {
                         gem_range,
                         flags,
                     )?;
+                    object_index += 1;
                 }
                 PreparedUserBindOp::Unmap(unmap) => {
-                    let mut inner = self.inner.exec_lock(None, true)?;
                     mod_dev_dbg!(
                         inner.dev,
                         "MMU: sm_unmap: {:#x}:{:#x}\n",

@@ -50,23 +50,27 @@ assert "matches_gpuva_ranges" not in MMU
 assert "matches_gpuva_ranges" not in PGTABLE
 assert "user_gpuva_ranges" not in MMU
 
-# The module-safe path preserves the established interruptible dma-resv waits.
-# It deliberately adds no outer mutex/lock order and never enters the removed
-# address-sized PTE oracle. A kernel-crate GPUVM extension is required before
-# multiple request objects can share one drm_exec guard.
-assert "exec_lock(Some(&map.gem), true)" in commit_batch
-assert "exec_lock(None, true)" in commit_batch
+# The core GPUVM array helper acquires every request BO in one interruptible
+# wound/wait transaction. No leaf callback runs before that one acquisition.
+GPUVM = (ROOT.parents[3] / "rust/kernel/drm/gpuvm.rs").read_text()
+lock_array = block(GPUVM, "    pub fn exec_lock_array")
+assert "DRM_EXEC_INTERRUPTIBLE_WAIT" in lock_array
+assert "DRM_EXEC_IGNORE_DUPLICATES" in lock_array
+assert "drm_gpuvm_exec_lock_array" in lock_array
+assert "exec_lock_array(&objects, true)" in commit_batch
+assert commit_batch.index("exec_lock_array(&objects, true)") < commit_batch.index(
+    "for op in &mut batch.ops"
+)
 assert "exec_lock(Some(&prepared.gem), false)" not in MMU
 assert "bind_lock" not in FILE
-assert "exec_lock_array" not in commit_batch
-assert "inner.sm_map(" in commit_batch
+assert "inner.sm_map_indexed(" in commit_batch
 assert "sm_unmap" in commit_batch
 
 
 # Executable failure-injection model. Whole-array semantic/resource
 # preparation fails before visible mutation. A signal during the first
 # interruptible dma-resv wait likewise leaves the VM untouched.
-def transact(leaves, ops, fail_prepare=None, interrupt_at_lock=None):
+def transact(leaves, ops, fail_prepare=None, interrupt_lock=False):
     prepared = []
     work = 0
     for index, op in enumerate(ops):
@@ -75,11 +79,13 @@ def transact(leaves, ops, fail_prepare=None, interrupt_at_lock=None):
             return False, leaves.copy(), work
         prepared.append(op)
 
+    work += 1
+    if interrupt_lock:
+        return False, leaves.copy(), work
+
     result = leaves.copy()
-    for index, (kind, start, size) in enumerate(prepared):
+    for kind, start, size in prepared:
         work += 1
-        if index == interrupt_at_lock:
-            return False, result, work
         if kind == "map":
             result[(start, start + size)] = kind
         else:
@@ -100,7 +106,7 @@ ops = [
 for fail_at in range(len(ops)):
     ok, leaves, _ = transact(initial, ops, fail_prepare=fail_at)
     assert not ok and leaves == initial
-ok, leaves, _ = transact(initial, ops, interrupt_at_lock=0)
+ok, leaves, _ = transact(initial, ops, interrupt_lock=True)
 assert not ok and leaves == initial
 ok, leaves, _ = transact(initial, ops)
 assert ok and (0x10000, 0x14000) not in leaves
@@ -117,7 +123,7 @@ for index in range(50_000):
     start = (rng.randrange(1, 1 << 24) << 14) & ((1 << 42) - 1)
     size = (1 << rng.randrange(14, 39)) & ~0x3FFF
     stress.append(("map" if index & 1 else "unmap", start, size))
-ok, _, work = transact({}, stress, interrupt_at_lock=0)
+ok, _, work = transact({}, stress, interrupt_lock=True)
 assert not ok
 assert work == len(stress) + 1
 
