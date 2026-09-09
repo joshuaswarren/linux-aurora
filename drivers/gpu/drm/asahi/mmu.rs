@@ -738,8 +738,9 @@ struct StepContext {
     prot: Prot,
 }
 
-/// All fallible per-map resources reserved before a VM_BIND batch starts
-/// changing visible GPU mappings.
+/// Per-map host resources reserved before a VM_BIND batch starts changing
+/// visible GPU mappings. Page-table allocation stays in the ordinary GPUVM
+/// commit callback, under its one interruptible dma-resv acquisition.
 pub(crate) struct PreparedUserMap {
     gem: ARef<gem::Object>,
     ctx: StepContext,
@@ -3052,8 +3053,8 @@ impl Vm {
         self.commit_prepared_user_bind_batch(&mut batch)
     }
 
-    /// Reserve the BO state, split nodes, scatterlist and page-table levels
-    /// needed by one userspace map without installing a leaf PTE.
+    /// Reserve the BO state, split nodes and scatterlist needed by one
+    /// userspace map without taking dma-resv or walking its address range.
     pub(crate) fn prepare_bind_object(
         &self,
         gem: &gem::Object,
@@ -3094,35 +3095,11 @@ impl Vm {
             core::mem::drop(vm_bo_guard);
         }
 
-        let mut inner = self.inner.exec_lock(Some(gem), true)?;
-
         ctx.vm_bo = Some(vm_bo);
 
         if (addr | size | offset) & (UAT_PGMSK as u64) != 0 {
-            dev_err!(
-                inner.dev.as_ref(),
-                "MMU: Map step {:#x} [{:#x}] -> {:#x} is not page-aligned\n",
-                offset,
-                size,
-                addr
-            );
             return Err(EINVAL);
         }
-
-        mod_dev_dbg!(
-            inner.dev,
-            "MMU: prepare sm_map: {:#x} [{:#x}] -> {:#x}\n",
-            offset,
-            size,
-            addr
-        );
-        // Unlike prepare_map(), this may cover GPUVA mappings which the
-        // subsequent split/merge operation will replace. It allocates only
-        // intermediate tables; no leaf is changed here.
-        inner.page_table.alloc_pages(
-            addr..addr.checked_add(size).ok_or(EOVERFLOW)?
-        )?;
-        core::mem::drop(inner);
 
         Ok(PreparedUserMap {
             gem: gem.into(), ctx, addr, size, offset, single_page,
@@ -3209,8 +3186,9 @@ impl Vm {
     /// interruptible drm_exec path. The currently deployed kernel's array
     /// helper rejects its documented zero-fence mode, so use the established
     /// one-object transaction until that core fix is part of the booted Image.
-    /// Preparation has already resolved every handle and allocated every
-    /// callback node/page-table level before this loop begins.
+    /// Preparation has already resolved every handle and allocated the host
+    /// callback state before this loop begins. Page-table allocation remains
+    /// inside `sm_map`, exactly as on the hardware-proven direct path.
     pub(crate) fn commit_prepared_user_bind_batch(
         &self,
         batch: &mut PreparedUserBindBatch,
