@@ -21,6 +21,7 @@ def block(source, marker):
 
 
 prepare = block(runtime, "    pub(crate) fn prepare_async_compute_queue(")
+matches = block(runtime, "    pub(crate) fn async_compute_queue_matches(")
 release = block(runtime, "    pub(crate) fn release_async_compute_queue(")
 service = block(runtime, "    fn service_async_compute_completions(")
 needs_install = block(runtime, "    pub(crate) fn async_compute_needs_install(")
@@ -32,6 +33,15 @@ assert "q.quarantined" in prepare
 selection = prepare[: prepare.index("let index =")]
 assert "requires_first_install" not in selection
 assert "without reinstall" in prepare
+assert "return Ok(false)" in matches
+for identity in [
+    "q.queue.queue_id() != hardware_queue",
+    "!Arc::ptr_eq(installed_context, context)",
+    "!context.is_current()",
+    "q.binding.is_none()",
+]:
+    assert identity in matches
+assert "q.released" in matches and "q.quarantined" in matches
 assert "owner_free && active_free && binding_free && context_free && !quarantined" in predicate
 assert "q.active.is_none() && !q.quarantined" in release
 assert release.index("q.released = true") < release.index("q.binding = None")
