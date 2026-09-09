@@ -806,9 +806,7 @@ impl File {
                 continue;
             }
 
-            if !vm.accepts_user_maps() {
-                return Err(EIO);
-            }
+            vm.wait_for_user_map_admission()?;
             if op.flags
                 & !(uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_READ
                     | uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_WRITE
