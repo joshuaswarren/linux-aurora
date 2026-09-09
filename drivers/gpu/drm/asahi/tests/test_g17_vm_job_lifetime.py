@@ -33,6 +33,7 @@ unmap_wrapper = item("    pub(crate) fn unmap_user_range(")
 unmap_one = item("    pub(crate) fn unmap_prepared_user_range(")
 defer_batch = item("    fn defer_blocked_user_bind_batch(")
 commit_batch = item("    pub(crate) fn commit_prepared_user_bind_batch(")
+enter_commit = item("    fn enter_user_mapping_commit(")
 drop_object = item("    pub(crate) fn drop_mappings(")
 
 assert "self.vm.unmap_user_ranges_now" in guard
@@ -50,9 +51,11 @@ assert quarantine.index("gate.blocked = true") < quarantine.index("while gate.co
 assert quarantine.index("while gate.commits != 0") < quarantine.index(
     "job_lifetime.lock().quarantined = true"
 )
-assert commit_batch.count("gate.blocked") == 2
-assert commit_batch.index("exec_lock_array(&objects, true)") < commit_batch.rindex(
-    "gate.blocked"
+assert commit_batch.count("gate.blocked") == 1
+assert "exec_lock_array" not in commit_batch
+assert "gate.blocked" in enter_commit
+assert commit_batch.index("exec_lock(Some(&map.gem), true)") < commit_batch.index(
+    "enter_user_mapping_commit"
 )
 assert commit_batch.index("core::mem::drop(inner)") < commit_batch.index(
     "core::mem::drop(commit)"

@@ -3191,10 +3191,26 @@ impl Vm {
         self.commit_prepared_user_bind_batch(&mut batch)
     }
 
-    /// Commit a fully prepared VM_BIND batch after acquiring every involved BO
-    /// through one interruptible drm_exec transaction. All semantic checks,
-    /// handles, callback nodes, scatterlists and page-table levels have already
-    /// been resolved, so no fallible preparation remains after the lock.
+    /// Enter one already-prepared leaf transaction after its interruptible
+    /// dma-resv acquisition. A concurrent lost-job quarantine closes this
+    /// gate and waits for the returned guard before publishing its fence.
+    fn enter_user_mapping_commit(&self) -> Result<Option<T8140VmMappingCommitGuard>> {
+        let mut gate = self.mapping_gate.state.lock();
+        if gate.blocked {
+            return Ok(None);
+        }
+        gate.commits = gate.commits.checked_add(1).ok_or(EOVERFLOW)?;
+        Ok(Some(T8140VmMappingCommitGuard {
+            gate: self.mapping_gate.clone(),
+        }))
+    }
+
+    /// Commit a fully prepared VM_BIND batch through the kernel ABI's
+    /// interruptible drm_exec path. The currently deployed kernel's array
+    /// helper rejects its documented zero-fence mode, so use the established
+    /// one-object transaction until that core fix is part of the booted Image.
+    /// Preparation has already resolved every handle and allocated every
+    /// callback node/page-table level before this loop begins.
     pub(crate) fn commit_prepared_user_bind_batch(
         &self,
         batch: &mut PreparedUserBindBatch,
@@ -3209,74 +3225,65 @@ impl Vm {
             }
         }
 
-        let mut objects = KVec::with_capacity(batch.ops.len(), GFP_KERNEL)?;
-        for op in &batch.ops {
-            if let PreparedUserBindOp::Map(map) = op {
-                objects.push(map.gem.clone(), GFP_KERNEL)?;
-            }
-        }
-        let mut inner = self.inner.exec_lock_array(&objects, true)?;
-        let commit = {
-            // This second check is load-bearing. Quarantine can begin while
-            // drm_gpuvm_exec_lock_array sleeps interruptibly; once this guard
-            // is counted, quarantine waits for the complete leaf transaction
-            // before it is allowed to signal the error fence.
-            let mut gate = self.mapping_gate.state.lock();
-            if gate.blocked {
-                core::mem::drop(inner);
-                return self.defer_blocked_user_bind_batch(batch);
-            }
-            gate.commits = gate.commits.checked_add(1).ok_or(EOVERFLOW)?;
-            T8140VmMappingCommitGuard {
-                gate: self.mapping_gate.clone(),
-            }
-        };
-        let mut object_index = 0usize;
-        let result = (|| {
-            for op in &mut batch.ops {
-                match op {
-                    PreparedUserBindOp::Map(map) => {
-                        let (flags, gem_range) = if map.single_page {
-                            (gpuvm::GpuVaFlags::REPEAT, UAT_PGSZ as u32)
-                        } else {
-                            (gpuvm::GpuVaFlags::NONE, 0u32)
-                        };
-                        mod_dev_dbg!(
-                            inner.dev,
-                            "MMU: sm_map: {:#x} [{:#x}] -> {:#x}\n",
-                            map.offset,
-                            map.size,
-                            map.addr
-                        );
-                        inner.sm_map_indexed(
-                            object_index,
-                            &mut map.ctx,
-                            map.addr,
-                            map.size,
-                            map.offset,
-                            gem_range,
-                            flags,
-                        )?;
-                        object_index += 1;
-                    }
-                    PreparedUserBindOp::Unmap(unmap) => {
-                        mod_dev_dbg!(
-                            inner.dev,
-                            "MMU: sm_unmap: {:#x}:{:#x}\n",
-                            unmap.iova,
-                            unmap.size
-                        );
-                        inner.sm_unmap(&mut unmap.ctx, unmap.iova, unmap.size)?;
-                    }
+        let mut admission_lost = false;
+        for op in &mut batch.ops {
+            let result = match op {
+                PreparedUserBindOp::Map(map) => {
+                    let mut inner = self.inner.exec_lock(Some(&map.gem), true)?;
+                    let Some(commit) = self.enter_user_mapping_commit()? else {
+                        core::mem::drop(inner);
+                        admission_lost = true;
+                        break;
+                    };
+                    let (flags, gem_range) = if map.single_page {
+                        (gpuvm::GpuVaFlags::REPEAT, UAT_PGSZ as u32)
+                    } else {
+                        (gpuvm::GpuVaFlags::NONE, 0u32)
+                    };
+                    mod_dev_dbg!(
+                        inner.dev,
+                        "MMU: sm_map: {:#x} [{:#x}] -> {:#x}\n",
+                        map.offset,
+                        map.size,
+                        map.addr
+                    );
+                    let result = inner.sm_map(
+                        &mut map.ctx,
+                        map.addr,
+                        map.size,
+                        map.offset,
+                        gem_range,
+                        flags,
+                    );
+                    core::mem::drop(inner);
+                    core::mem::drop(commit);
+                    result
                 }
-            }
-            Ok(())
-        })();
-        // Keep quarantine behind the reservation unlock as well as the leaf
-        // writes. This makes the error fence a complete transaction boundary.
-        core::mem::drop(inner);
-        core::mem::drop(commit);
-        result
+                PreparedUserBindOp::Unmap(unmap) => {
+                    let mut inner = self.inner.exec_lock(None, true)?;
+                    let Some(commit) = self.enter_user_mapping_commit()? else {
+                        core::mem::drop(inner);
+                        admission_lost = true;
+                        break;
+                    };
+                    mod_dev_dbg!(
+                        inner.dev,
+                        "MMU: sm_unmap: {:#x}:{:#x}\n",
+                        unmap.iova,
+                        unmap.size
+                    );
+                    let result = inner.sm_unmap(&mut unmap.ctx, unmap.iova, unmap.size);
+                    core::mem::drop(inner);
+                    core::mem::drop(commit);
+                    result
+                }
+            };
+            result?;
+        }
+        if admission_lost {
+            return self.defer_blocked_user_bind_batch(batch);
+        }
+        Ok(())
     }
 
     /// Add a direct MMIO mapping to this Vm at a free address.

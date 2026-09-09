@@ -26,6 +26,7 @@ def block(source: str, marker: str) -> str:
 vm_bind = block(FILE, "    pub(crate) fn vm_bind(")
 prepare_map = block(MMU, "    pub(crate) fn prepare_bind_object(")
 commit_batch = block(MMU, "    pub(crate) fn commit_prepared_user_bind_batch(")
+enter_commit = block(MMU, "    fn enter_user_mapping_commit(")
 
 # The whole userspace array is copied, validated, and prepared before commit.
 assert vm_bind.index("ops.push(bind") < vm_bind.index("for op in ops")
@@ -54,26 +55,55 @@ assert "user_gpuva_ranges" not in MMU
 # The core GPUVM array helper acquires every request BO in one interruptible
 # wound/wait transaction. No leaf callback runs before that one acquisition.
 GPUVM = (ROOT.parents[3] / "rust/kernel/drm/gpuvm.rs").read_text()
+GPUVM_C = (ROOT.parents[3] / "drivers/gpu/drm/drm_gpuvm.c").read_text()
 lock_array = block(GPUVM, "    pub fn exec_lock_array")
 assert "DRM_EXEC_INTERRUPTIBLE_WAIT" in lock_array
 assert "DRM_EXEC_IGNORE_DUPLICATES" in lock_array
 assert "drm_gpuvm_exec_lock_array" in lock_array
-assert "exec_lock_array(&objects, true)" in commit_batch
-assert commit_batch.index("exec_lock_array(&objects, true)") < commit_batch.index(
-    "for op in &mut batch.ops"
-)
+# VM_BIND does not attach reservation fences, so its array helper must follow
+# drm_gpuvm_prepare_vm()'s zero-fence contract and lock rather than asking
+# dma_resv_reserve_fences(..., 0), which warns and returns EINVAL.
+array_callback = block(GPUVM_C, "fn_lock_array(struct drm_gpuvm_exec *vm_exec)")
+assert "exec_prepare_obj(&vm_exec->exec" in array_callback
+assert "return drm_exec_prepare_array(" not in array_callback
+assert "exec_lock(Some(&map.gem), true)" in commit_batch
+assert "exec_lock(None, true)" in commit_batch
+assert "exec_lock_array" not in commit_batch
 assert "exec_lock(Some(&prepared.gem), false)" not in MMU
 assert "bind_lock" not in FILE
-assert "inner.sm_map_indexed(" in commit_batch
+assert "inner.sm_map(" in commit_batch
 assert "sm_unmap" in commit_batch
-assert commit_batch.count("gate.blocked") == 2
-assert "T8140VmMappingCommitGuard" in commit_batch
-assert commit_batch.index("exec_lock_array(&objects, true)") < commit_batch.rindex(
-    "gate.blocked"
+assert commit_batch.count("gate.blocked") == 1
+assert "enter_user_mapping_commit" in commit_batch
+assert "T8140VmMappingCommitGuard" in enter_commit
+assert "gate.blocked" in enter_commit
+assert commit_batch.index("exec_lock(Some(&map.gem), true)") < commit_batch.index(
+    "enter_user_mapping_commit"
 )
 assert commit_batch.index("core::mem::drop(inner)") < commit_batch.index(
     "core::mem::drop(commit)"
 )
+
+
+def lock_array_result(num_objects, num_fences, zero_aware):
+    """Exact return-value discriminator for the dma-resv zero-fence rule."""
+    for _ in range(num_objects):
+        if num_fences == 0 and not zero_aware:
+            return -22
+    return 0
+
+
+# The hardware regression was the smallest legal map: one object, no fences.
+# The former unconditional prepare-array path returns EINVAL before any GPU
+# work; the production callback now follows exec_prepare_obj's lock-only path.
+# The old module requested zero from a live kernel with the old callback and
+# failed exactly here. The new module reserves one harmless slot, while the
+# in-tree callback is also corrected for future zero-fence callers.
+assert lock_array_result(1, 0, zero_aware=False) == -22
+assert lock_array_result(1, 1, zero_aware=False) == 0
+assert lock_array_result(1, 0, zero_aware=True) == 0
+assert lock_array_result(4096, 0, zero_aware=True) == 0
+assert lock_array_result(8, 1, zero_aware=True) == 0
 
 
 # Executable failure-injection model. Whole-array semantic/resource
