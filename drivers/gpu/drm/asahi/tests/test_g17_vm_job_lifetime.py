@@ -26,16 +26,19 @@ guard = "\n".join([
 ])
 retain = item("    pub(crate) fn retain_t8140_job(")
 unmap_users = item("    pub(crate) fn unmap_user_ranges(")
-unmap_one = item("    pub(crate) fn unmap_user_range(")
+unmap_wrapper = item("    pub(crate) fn unmap_user_range(")
+unmap_one = item("    pub(crate) fn unmap_prepared_user_range(")
 drop_object = item("    pub(crate) fn drop_mappings(")
 
 assert "self.vm.unmap_user_ranges_now" in guard
 assert "self.vm.drop_mappings_now" in guard
 assert "self.unmap_user_ranges_now" in unmap_users
 assert "self.drop_mappings_now" in drop_object
+assert "self.prepare_user_unmap" in unmap_wrapper
+assert "self.unmap_prepared_user_range" in unmap_wrapper
 assert "state.active != 0 && state.quarantined" in unmap_one
 assert "state.deferred_unmaps.push" in unmap_one
-assert "self.unmap_range" in unmap_one
+assert "self.unmap_prepared_range" in unmap_one
 
 source = r'''
 #![allow(dead_code, unused_variables)]
@@ -55,6 +58,7 @@ impl<T>IntoIterator for KVec<T>{type Item=T;type IntoIter=std::vec::IntoIter<T>;
 struct Mutex<T>(std::sync::Mutex<T>);
 impl<T>Mutex<T>{fn lock(&self)->std::sync::MutexGuard<'_,T>{self.0.lock().unwrap()}}
 mod gem{#[derive(Clone)]pub struct Object(pub u64);}
+struct PreparedUserUnmap{iova:u64,size:u64}
 struct ARef<T>(Arc<T>);
 impl<T>Deref for ARef<T>{type Target=T;fn deref(&self)->&T{&self.0}}
 impl From<&gem::Object> for ARef<gem::Object>{fn from(v:&gem::Object)->Self{Self(Arc::new(v.clone()))}}
@@ -75,6 +79,13 @@ struct Vm {
     fn unmap_range(&self,_iova:u64,_size:u64)->Result {
         self.unmaps.fetch_add(1,Ordering::SeqCst);
         Ok(())
+    }
+    fn unmap_prepared_range(&self,_prepared:PreparedUserUnmap)->Result {
+        self.unmaps.fetch_add(1,Ordering::SeqCst);
+        Ok(())
+    }
+    fn unmap_user_range(&self,iova:u64,size:u64)->Result {
+        self.unmap_prepared_user_range(PreparedUserUnmap{iova,size})
     }
     fn drop_mappings_now(&self,_gem:&gem::Object)->Result {
         self.object_unmaps.fetch_add(1,Ordering::SeqCst);
