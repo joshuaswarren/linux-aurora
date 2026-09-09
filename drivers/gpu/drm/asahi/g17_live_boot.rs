@@ -4117,6 +4117,12 @@ impl G17PLiveRuntime {
             if retired {
                 signal.complete(Err(EIO));
             } else {
+                // The output fence is about to wake a client which may close
+                // every mapping this live group names. Quarantine retains the
+                // graph; this flag makes the required processor-stop boundary
+                // reachable from the next device query/submission instead of
+                // leaving the remaining clients permanently capacity-poisoned.
+                self.session_recovery_pending = true;
                 signal.fail_while_owned(error);
                 if let Err(error) = self
                     .quarantined_render_completions

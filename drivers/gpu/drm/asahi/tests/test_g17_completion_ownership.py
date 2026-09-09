@@ -25,7 +25,11 @@ compute = (root / 'g17_async_compute.rs').read_text()
 render_impl = item(drm, 'impl G17PRenderCompletion {')
 compute_impl = item(job, 'impl G17PJobCompletion {')
 timeout = item(live, '    pub(crate) fn timeout_deferred_render(')
-assert 'if retired {\n                signal.complete(Err(EIO));\n            } else {\n                signal.fail_while_owned(error);' in timeout
+assert 'if retired {\n                signal.complete(Err(EIO));\n            } else {' in timeout
+assert 'signal.fail_while_owned(error);' in timeout
+assert timeout.index('self.session_recovery_pending = true') < timeout.index(
+    'signal.fail_while_owned(error)'
+)
 release_quarantine = item(live, '    fn release_quarantined_render_after_processor_stop(')
 assert 'completion.release_after_processor_stop();' in release_quarantine
 for marker in ('    fn release_runtime_objects(', '    fn drop_queue('):
@@ -36,6 +40,9 @@ for marker in ('    fn service_async_compute_completions(',
     body = item(compute, marker)
     assert '.complete(Err(' not in body, marker
     assert '.fail_while_owned(error)' in body, marker
+    assert body.index('self.session_recovery_pending = true') < body.index(
+        '.fail_while_owned(error)'
+    ), marker
 
 source = r'''
 #![allow(dead_code)]
