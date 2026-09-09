@@ -25,7 +25,7 @@ def block(source, marker):
 prepare = block(runtime, "    pub(crate) fn prepare_async_compute_queue(")
 matches = block(runtime, "    pub(crate) fn async_compute_queue_matches(")
 release = block(runtime, "    pub(crate) fn release_async_compute_queue(")
-service = block(runtime, "    fn service_async_compute_completions(")
+service = block(runtime, "    fn service_async_compute_completions_matching(")
 needs_install = block(runtime, "    pub(crate) fn async_compute_needs_install(")
 predicate = block(limits, "pub(crate) const fn reusable_idle_compute_graph(")
 stop = block(manager, "    pub(crate) fn release_runtime_objects_after_processor_stop(")
