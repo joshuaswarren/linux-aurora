@@ -42,9 +42,9 @@ assert "unreserve_render_storage_hardware_buffer_id" not in handoff
 assert ".push_within_capacity(previous)" in preserve
 assert "completion_references_descriptor_range" not in preserve
 assert "self.retired_render_handoff_graph = Some(retired)" in handoff
-# Live queues remain session-retained. Queue destruction is a stronger native
-# workqueue-free boundary and may release that exact context while preserving
-# its firmware-high PM backing.
+# Queue destruction does not prove that firmware has stopped dereferencing the
+# completed descriptor through its application-GART context. Move a destroyed
+# queue's complete graph into the stopped-session quarantine.
 released_check = "released_render_contexts & (1u64 << context) != 0"
 assert preserve.index(released_check) < preserve.index(
     "Self::quarantine_drained_render_graph("
@@ -57,14 +57,18 @@ stop = function("pub(crate) fn release_runtime_objects_after_processor_stop(")
 assert "state.retired_handoff_graph.take()" in stop
 assert "self.retired_render_handoff_graph.take()" in stop
 assert "self.retired_render_handoff_graphs.pop()" in stop
-assert "self.retired_firmware_render_storages.clear()" in stop
+assert "self.retired_firmware_render_graphs.pop()" in stop
 
 drain = function("fn quarantine_drained_render_graph(")
-assert drain.index("storage.release_client_context()") < drain.index("drop(bind)")
-assert drain.index("drop(bind)") < drain.index(
-    "retired_firmware_render_storages.push_within_capacity(storage)"
-)
-assert "storage.take_retired_parameter_management()" in drain
+assert "retired_firmware_render_graphs.push_within_capacity(retired)" in drain
+for premature_release in (
+    "storage.release_client_context()",
+    "storage.take_retired_parameter_management()",
+    "ids.unreserve(id)",
+    "drop(bind)",
+    "drop(context_aliases)",
+):
+    assert premature_release not in drain
 
 
 class Quarantine:
