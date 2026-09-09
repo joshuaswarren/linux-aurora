@@ -1,0 +1,19 @@
+#!/bin/sh
+# Configure only the RAM-booted M5 test interface from udhcpc lease variables.
+set -eu
+[ "${interface:-}" = wlan0 ] || exit 1
+case "${1:-}" in
+    deconfig)
+        ip -4 address flush dev "$interface"
+        ;;
+    bound|renew)
+        ifconfig "$interface" "$ip" netmask "${subnet:-255.255.255.0}"
+        if [ -n "${router:-}" ]; then
+            ip route replace default via "${router%% *}" dev "$interface"
+        fi
+        : > /etc/resolv.conf
+        for server in ${dns:-}; do
+            printf 'nameserver %s\n' "$server" >> /etc/resolv.conf
+        done
+        ;;
+esac
