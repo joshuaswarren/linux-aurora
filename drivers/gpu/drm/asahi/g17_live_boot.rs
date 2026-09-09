@@ -3064,14 +3064,7 @@ impl G17PLiveRuntime {
                 }
             }
             self.service_async_render_completions(completion_masks)?;
-            if completion_masks == [0; 2] {
-                // Identity-less/unknown event batches retain the broad scan as
-                // a lost-edge fallback. Ordinary type-1 completions name their
-                // exact QIDs and take the targeted M1/M2-style route below.
-                self.service_async_compute_completions()
-            } else {
-                self.service_async_compute_completions_for_event(completion_masks)
-            }
+            self.service_async_compute_completion_masks(completion_masks)
         });
         if result.is_err() {
             state.crashed.store(true, Ordering::Release);
@@ -3099,12 +3092,19 @@ impl G17PLiveRuntime {
             let manager = self.manager.as_mut().ok_or(ENODEV)?;
             drain_primary_firmware_event_batch(&pdev, manager, &state, &signal)?
         };
+        let completion_masks = batch.completion_masks;
         for slot in 0..g17_resources::G17PRenderQueuePair::SLOT_COUNT as usize {
             if self.pending_render[slot].is_some() {
-                self.render_event_masks[slot][0] |= batch.completion_masks[0];
-                self.render_event_masks[slot][1] |= batch.completion_masks[1];
+                self.render_event_masks[slot][0] |= completion_masks[0];
+                self.render_event_masks[slot][1] |= completion_masks[1];
             }
         }
+        // This path owns the runtime mutex and has consumed the primary event
+        // records plus their notification count. Route compute completions
+        // here as well; the ordinary worker cannot rediscover this edge after
+        // the inline drain returns. Do this before any other fallible service
+        // or diagnostic recovery early-return so a mixed batch loses no QID.
+        self.service_async_compute_completion_masks(completion_masks)?;
         if let Some(release) = batch.uma_release {
             self.service_render_usc_freelist_release(release)?;
         }

@@ -236,6 +236,17 @@ impl G17PLiveRuntime {
         self.service_async_compute_completions_matching(Some(masks))
     }
 
+    /// Dispatch one drained firmware-event batch. A zero mask has no QID
+    /// identity, so it deliberately retains the broad lost-edge/watchdog
+    /// observation used before event routing was introduced.
+    fn service_async_compute_completion_masks(&mut self, masks: [u64; 2]) -> Result {
+        if masks == [0; 2] {
+            self.service_async_compute_completions()
+        } else {
+            self.service_async_compute_completions_for_event(masks)
+        }
+    }
+
     /// Full-scan fallback for a final watchdog observation or an event batch
     /// whose record did not carry a usable QID mask. These paths deliberately
     /// preserve the old lost/coalesced-edge recovery behaviour.
