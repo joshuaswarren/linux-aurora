@@ -64,7 +64,12 @@ assert failed_submit.index("self.vm.status().record") < failed_submit.index(
     ".fail_outstanding_jobs_for_vm("
 )
 failed_jobs = block(ASYNC, "    pub(crate) fn fail_outstanding_jobs_for_vm(")
-assert "active = None" not in failed_jobs and ".fail_while_owned(error)" in failed_jobs
+assert "fail_outstanding_jobs_for_vm_after_compute_observation" in failed_jobs
+failed_jobs_after_observation = block(
+    ASYNC, "    fn fail_outstanding_jobs_for_vm_after_compute_observation("
+)
+assert "active = None" not in failed_jobs_after_observation and \
+    ".fail_while_owned(error)" in failed_jobs_after_observation
 release_compute = block(ASYNC, "    pub(crate) fn release_async_compute_queue(")
 assert "q.active.is_none() && !q.quarantined" in release_compute
 stop_compute = block(ASYNC, "    fn release_async_compute_after_processor_stop(")

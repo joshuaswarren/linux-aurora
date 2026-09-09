@@ -34,8 +34,10 @@ release_quarantine = item(live, '    fn release_quarantined_render_after_process
 assert 'completion.release_after_processor_stop();' in release_quarantine
 for marker in ('    fn release_runtime_objects(', '    fn drop_queue('):
     assert 'self.release_quarantined_render_after_processor_stop();' in item(live, marker)
+vm_sweep = item(compute, '    pub(crate) fn fail_outstanding_jobs_for_vm(')
+assert 'self.fail_outstanding_jobs_for_vm_after_compute_observation(status, error)' in vm_sweep
 for marker in ('    fn service_async_compute_completions_matching(',
-               '    pub(crate) fn fail_outstanding_jobs_for_vm(',
+               '    fn fail_outstanding_jobs_for_vm_after_compute_observation(',
                '    pub(crate) fn quarantine_async_compute('):
     body = item(compute, marker)
     assert '.complete(Err(' not in body, marker

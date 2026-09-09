@@ -72,19 +72,22 @@ impl Manager {
  fn dump_compute_completion_records(&mut self,_label:&str)->Result{Ok(())}
 '''+manager_batch+r'''
 }
-struct Completion{signals:AtomicUsize,error:AtomicUsize}
+mod g17_status { pub struct VmStatus; }
+struct Completion{signals:AtomicUsize,error:AtomicUsize,status:Arc<g17_status::VmStatus>}
 impl Completion{fn complete(&self,r:Result<[u64;2]>){self.signals.fetch_add(1,Ordering::SeqCst);if r.is_err(){self.error.fetch_add(1,Ordering::SeqCst);}}fn fail_while_owned(&self,e:Error){self.complete(Err(e));}}
 struct Packet{id:u64,completion:Arc<Completion>}
 impl Packet{fn submission_id(&self)->u64{self.id}fn completion(&self)->Result<&Completion>{Ok(&self.completion)}}
 struct Hold(Arc<AtomicUsize>);impl Hold{fn quarantine(&self){}}impl Drop for Hold{fn drop(&mut self){self.0.fetch_add(1,Ordering::SeqCst);}}
 struct Active{packet:Packet,_lease:Hold}
-struct Queue{owner:Option<u64>,queue:G17PSksmQueue,binding:Option<Hold>,context:Option<Hold>,active:Option<Active>,released:bool,quarantined:bool}
+struct Queue{owner:Option<u64>,queue:G17PSksmQueue,binding:Option<Hold>,context:Option<Hold>,active:Option<Active>,released:bool,quarantined:bool,terminal_fanout:Option<(Arc<g17_status::VmStatus>,Error)>}
 struct G17PLiveRuntime{pdev:Option<()>,manager:Option<Manager>,async_compute_queues:Vec<Queue>,session_recovery_pending:bool}
 '''+mask_helper+r'''
 impl G17PLiveRuntime {
+ fn fail_outstanding_jobs_for_vm_after_compute_observation(&mut self,_status:&Arc<g17_status::VmStatus>,_error:Error)->usize{0}
+ fn fail_outstanding_jobs_for_vm(&mut self,_status:&Arc<g17_status::VmStatus>,_error:Error)->usize{0}
 '''+methods+r'''
 }
-fn q(owner:u64,descriptor:u64,d:&Arc<AtomicUsize>)->(Queue,Arc<Completion>){let c=Arc::new(Completion{signals:AtomicUsize::new(0),error:AtomicUsize::new(0)});(Queue{owner:Some(owner),queue:G17PSksmQueue{queue_id:owner as u8,independent_context:true,completion_descriptor:descriptor,completion_last_end:0,completion_stamp_armed:true,compute:Stamp(0),producer:1},binding:Some(Hold(d.clone())),context:Some(Hold(d.clone())),active:Some(Active{packet:Packet{id:owner,completion:c.clone()},_lease:Hold(d.clone())}),released:false,quarantined:false},c)}
+fn q(owner:u64,descriptor:u64,d:&Arc<AtomicUsize>)->(Queue,Arc<Completion>){let c=Arc::new(Completion{signals:AtomicUsize::new(0),error:AtomicUsize::new(0),status:Arc::new(g17_status::VmStatus)});(Queue{owner:Some(owner),queue:G17PSksmQueue{queue_id:owner as u8,independent_context:true,completion_descriptor:descriptor,completion_last_end:0,completion_stamp_armed:true,compute:Stamp(0),producer:1},binding:Some(Hold(d.clone())),context:Some(Hold(d.clone())),active:Some(Active{packet:Packet{id:owner,completion:c.clone()},_lease:Hold(d.clone())}),released:false,quarantined:false,terminal_fanout:None},c)}
 #[test]fn out_of_order_requires_matching_descriptor_and_final_visibility(){
  let drops=Arc::new(AtomicUsize::new(0));let(a,ca)=q(1,0x100,&drops);let(b,cb)=q(2,0x200,&drops);
  let mut r=G17PLiveRuntime{pdev:None,manager:Some(manager(vec![(2,0x200,[10,20])])),async_compute_queues:vec![a,b],session_recovery_pending:false};
