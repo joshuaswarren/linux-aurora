@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0
+dtb-$(CONFIG_ARCH_APPLE) += t8142-j813.dtb
+dtb-$(CONFIG_ARCH_APPLE) += t8142-j813-wifi.dtb
 dtb-$(CONFIG_ARCH_APPLE) += t8132-j604.dtb
 dtb-$(CONFIG_ARCH_APPLE) += t8132-j623.dtb
 dtb-$(CONFIG_ARCH_APPLE) += t8132-j624.dtb
