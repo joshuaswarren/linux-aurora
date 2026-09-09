@@ -69,6 +69,10 @@ struct Manager {
     render_hardware_buffer_id: Option<u32>, render_hardware_buffer_ids: Ids,
 }
 impl Manager {
+    fn release_active_render_command_buffer_states(&mut self) -> Result {
+        Ok(())
+    }
+
     fn actual_retirement_transaction(&mut self) -> Result {
 ''',
     transaction,

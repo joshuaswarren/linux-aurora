@@ -73,7 +73,9 @@ for name in ["stage_fragment", "stage_fragment_prefix", "prepare_late_tiling_pub
 consistency = block(manager, "validate_render_queue_consistency")
 assert "header.context_update != u16::from(context_update)" in consistency
 completion = block(manager, "poll_translated_render_completion")
-assert "complete_context_update()" in completion
+assert "complete_render_context_update_retirement()?" in completion
+context_retirement = block(manager, "complete_render_context_update_retirement")
+assert "complete_context_update()" in context_retirement
 
 body = "\n".join([
     "#![allow(dead_code, non_upper_case_globals)]",
