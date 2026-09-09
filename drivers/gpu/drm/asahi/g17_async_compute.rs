@@ -244,6 +244,10 @@ impl G17PLiveRuntime {
                 Ok(None) => {}
                 Err(error) if error == EAGAIN => {}
                 Err(error) => {
+                    // This queue is still firmware-owned and cannot be made
+                    // reusable from an error fence. Make the proven
+                    // processor-stop recovery reachable by the next client.
+                    self.session_recovery_pending = true;
                     q.quarantined = true;
                     q.active.as_ref().ok_or(EIO)?._lease.quarantine();
                     q.active.as_ref().ok_or(EIO)?.packet.completion()?.fail_while_owned(error);
@@ -309,6 +313,7 @@ impl G17PLiveRuntime {
             };
             let Some((submission, queue_id, context)) = identity else { continue };
             {
+                self.session_recovery_pending = true;
                 let q = &mut self.async_compute_queues[index];
                 q.quarantined = true;
                 let Some(active) = q.active.as_ref() else { continue };
@@ -350,6 +355,7 @@ impl G17PLiveRuntime {
             if let Some(active) = &q.active {
                 if active.packet.submission_id() == submission {
                     if !q.quarantined {
+                        self.session_recovery_pending = true;
                         q.quarantined = true;
                         active._lease.quarantine();
                         if let Some(pdev) = &self.pdev {

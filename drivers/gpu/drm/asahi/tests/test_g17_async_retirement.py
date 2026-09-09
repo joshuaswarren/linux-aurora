@@ -43,42 +43,42 @@ impl Packet{fn submission_id(&self)->u64{self.id}fn completion(&self)->Result<&C
 struct Hold(Arc<AtomicUsize>);impl Hold{fn quarantine(&self){}}impl Drop for Hold{fn drop(&mut self){self.0.fetch_add(1,Ordering::SeqCst);}}
 struct Active{packet:Packet,_lease:Hold}
 struct Queue{owner:Option<u64>,queue:G17PSksmQueue,binding:Option<Hold>,context:Option<Hold>,active:Option<Active>,released:bool,quarantined:bool}
-struct G17PLiveRuntime{pdev:Option<()>,manager:Option<Manager>,async_compute_queues:Vec<Queue>}
+struct G17PLiveRuntime{pdev:Option<()>,manager:Option<Manager>,async_compute_queues:Vec<Queue>,session_recovery_pending:bool}
 impl G17PLiveRuntime {
 '''+methods+r'''
 }
 fn q(owner:u64,descriptor:u64,d:&Arc<AtomicUsize>)->(Queue,Arc<Completion>){let c=Arc::new(Completion{signals:AtomicUsize::new(0),error:AtomicUsize::new(0)});(Queue{owner:Some(owner),queue:G17PSksmQueue{independent_context:true,completion_descriptor:descriptor,completion_last_end:0,completion_stamp_armed:true,compute:Stamp(0),producer:1},binding:Some(Hold(d.clone())),context:Some(Hold(d.clone())),active:Some(Active{packet:Packet{id:owner,completion:c.clone()},_lease:Hold(d.clone())}),released:false,quarantined:false},c)}
 #[test]fn out_of_order_requires_matching_descriptor_and_final_visibility(){
  let drops=Arc::new(AtomicUsize::new(0));let(a,ca)=q(1,0x100,&drops);let(b,cb)=q(2,0x200,&drops);
- let mut r=G17PLiveRuntime{pdev:None,manager:Some(Manager{resources:Resources{records:vec![(0x200,[10,20])]}}),async_compute_queues:vec![a,b]};
+ let mut r=G17PLiveRuntime{pdev:None,manager:Some(Manager{resources:Resources{records:vec![(0x200,[10,20])]}}),async_compute_queues:vec![a,b],session_recovery_pending:false};
  r.service_async_compute_completions().unwrap();assert_eq!(ca.signals.load(Ordering::SeqCst),0);assert_eq!(cb.signals.load(Ordering::SeqCst),0);assert_eq!(drops.load(Ordering::SeqCst),0);
  r.async_compute_queues[1].queue.compute.0=7;r.service_async_compute_completions().unwrap();assert_eq!(cb.signals.load(Ordering::SeqCst),1);assert_eq!(ca.signals.load(Ordering::SeqCst),0);assert_eq!(r.async_compute_queues[1].queue.producer,0);assert_eq!(drops.load(Ordering::SeqCst),1);
  r.service_async_compute_completions().unwrap();assert_eq!(cb.signals.load(Ordering::SeqCst),1);
  r.manager.as_mut().unwrap().resources.records.push((0x100,[5,25]));r.async_compute_queues[0].queue.compute.0=8;r.service_async_compute_completions().unwrap();assert_eq!(ca.signals.load(Ordering::SeqCst),1);assert_eq!(drops.load(Ordering::SeqCst),2);
 }
 #[test]fn close_during_execution_defers_context_and_mapping_release(){
- let d=Arc::new(AtomicUsize::new(0));let(q,c)=q(1,0x100,&d);let mut r=G17PLiveRuntime{pdev:None,manager:Some(Manager{resources:Resources{records:vec![]}}),async_compute_queues:vec![q]};
+ let d=Arc::new(AtomicUsize::new(0));let(q,c)=q(1,0x100,&d);let mut r=G17PLiveRuntime{pdev:None,manager:Some(Manager{resources:Resources{records:vec![]}}),async_compute_queues:vec![q],session_recovery_pending:false};
  r.release_async_compute_queue(1);assert_eq!(d.load(Ordering::SeqCst),0);assert_eq!(r.async_compute_queues[0].owner,Some(1));
  r.manager.as_mut().unwrap().resources.records.push((0x100,[2,3]));r.async_compute_queues[0].queue.compute.0=1;r.service_async_compute_completions().unwrap();assert_eq!(c.signals.load(Ordering::SeqCst),1);assert_eq!(d.load(Ordering::SeqCst),3);assert_eq!(r.async_compute_queues[0].owner,None);
 }
 #[test]fn timeout_and_zero_duration_quarantine_until_proven_stop(){
- let d=Arc::new(AtomicUsize::new(0));let(a,ca)=q(1,0x100,&d);let(b,cb)=q(2,0x200,&d);let mut r=G17PLiveRuntime{pdev:None,manager:Some(Manager{resources:Resources{records:vec![(0x200,[8,8])]}}),async_compute_queues:vec![a,b]};
+ let d=Arc::new(AtomicUsize::new(0));let(a,ca)=q(1,0x100,&d);let(b,cb)=q(2,0x200,&d);let mut r=G17PLiveRuntime{pdev:None,manager:Some(Manager{resources:Resources{records:vec![(0x200,[8,8])]}}),async_compute_queues:vec![a,b],session_recovery_pending:false};
  r.quarantine_async_compute(1,999,110);assert_eq!(ca.signals.load(Ordering::SeqCst),0);r.quarantine_async_compute(1,1,110);r.quarantine_async_compute(1,1,110);assert_eq!(ca.error.load(Ordering::SeqCst),1);
- r.service_async_compute_completions().unwrap();assert_eq!(cb.error.load(Ordering::SeqCst),1);r.release_async_compute_queue(1);r.release_async_compute_queue(2);assert_eq!(d.load(Ordering::SeqCst),0);assert!(r.async_compute_queues.iter().all(|q|q.active.is_some()&&q.quarantined));
+ r.service_async_compute_completions().unwrap();assert_eq!(cb.error.load(Ordering::SeqCst),1);assert!(r.session_recovery_pending);r.release_async_compute_queue(1);r.release_async_compute_queue(2);assert_eq!(d.load(Ordering::SeqCst),0);assert!(r.async_compute_queues.iter().all(|q|q.active.is_some()&&q.quarantined));
  r.async_compute_queues.clear();assert_eq!(d.load(Ordering::SeqCst),6);
 }
 '''
 source += r'''
 #[test]fn early_notification_remains_armed_until_later_record(){
- let d=Arc::new(AtomicUsize::new(0));let(q,c)=q(1,0x100,&d);let mut r=G17PLiveRuntime{pdev:None,manager:Some(Manager{resources:Resources{records:vec![]}}),async_compute_queues:vec![q]};
+ let d=Arc::new(AtomicUsize::new(0));let(q,c)=q(1,0x100,&d);let mut r=G17PLiveRuntime{pdev:None,manager:Some(Manager{resources:Resources{records:vec![]}}),async_compute_queues:vec![q],session_recovery_pending:false};
  r.service_async_compute_completions().unwrap();assert_eq!(c.signals.load(Ordering::SeqCst),0);
  r.manager.as_mut().unwrap().resources.records.push((0x100,[2,8]));r.async_compute_queues[0].queue.compute.0=1;
  r.service_async_compute_completions().unwrap();assert_eq!(c.signals.load(Ordering::SeqCst),1);
 }
 #[test]fn timeout_retires_already_completed_work_without_quarantine(){
- let d=Arc::new(AtomicUsize::new(0));let(q,c)=q(1,0x100,&d);let mut r=G17PLiveRuntime{pdev:None,manager:Some(Manager{resources:Resources{records:vec![(0x100,[2,8])]}}),async_compute_queues:vec![q]};
+ let d=Arc::new(AtomicUsize::new(0));let(q,c)=q(1,0x100,&d);let mut r=G17PLiveRuntime{pdev:None,manager:Some(Manager{resources:Resources{records:vec![(0x100,[2,8])]}}),async_compute_queues:vec![q],session_recovery_pending:false};
  r.async_compute_queues[0].queue.compute.0=1;
- assert!(!r.quarantine_async_compute(1,1,110));assert!(!r.async_compute_queues[0].quarantined);assert_eq!(c.signals.load(Ordering::SeqCst),1);assert_eq!(c.error.load(Ordering::SeqCst),0);
+ assert!(!r.quarantine_async_compute(1,1,110));assert!(!r.async_compute_queues[0].quarantined);assert!(!r.session_recovery_pending);assert_eq!(c.signals.load(Ordering::SeqCst),1);assert_eq!(c.error.load(Ordering::SeqCst),0);
 }
 '''
 with tempfile.TemporaryDirectory() as d:
