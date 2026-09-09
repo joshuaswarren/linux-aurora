@@ -30,11 +30,14 @@ def block(source, marker):
 # combined contract under independent process/VM/queue lifetimes.
 commit = block(MMU, "    pub(crate) fn commit_prepared_user_bind_batch(")
 enter_commit = block(MMU, "    fn enter_user_mapping_commit(")
+defer_blocked = block(MMU, "    fn defer_blocked_user_bind_batch(")
 assert "exec_lock_array" not in commit
 assert commit.index("exec_lock(Some(&map.gem), true)") < commit.index(
     "enter_user_mapping_commit"
 )
 assert "gate.blocked" in enter_commit
+assert "mapping_gate.state.lock()" in defer_blocked
+assert commit.count("defer_blocked_user_bind_batch(batch)?") == 2
 assert "core::mem::drop(inner)" in commit and "core::mem::drop(commit)" in commit
 quarantine = block(MMU, "    pub(crate) fn quarantine(")
 assert quarantine.index("gate.blocked = true") < quarantine.index(

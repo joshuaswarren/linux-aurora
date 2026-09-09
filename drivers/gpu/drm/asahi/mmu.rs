@@ -3123,12 +3123,19 @@ impl Vm {
 
     /// Settle a batch which lost mapping admission while it was waiting for
     /// dma-resv. Maps are refused; teardown unmaps are retained behind the
-    /// firmware-owned job. The caller holds the mapping gate, making this
-    /// append atomic with the last job guard's drain/reopen decision.
+    /// firmware-owned job. Returns false if the last job finished and reopened
+    /// admission before this recheck, in which case the caller may retry.
+    ///
+    /// The mapping gate stays held through deferred-unmap insertion, making
+    /// the append atomic with the last job guard's drain/reopen decision.
     fn defer_blocked_user_bind_batch(
         &self,
         batch: &PreparedUserBindBatch,
-    ) -> Result {
+    ) -> Result<bool> {
+        let gate = self.mapping_gate.state.lock();
+        if !gate.blocked {
+            return Ok(false);
+        }
         let mut lifetime = self.job_lifetime.lock();
         if lifetime.closed {
             return Err(ENOENT);
@@ -3157,7 +3164,7 @@ impl Vm {
                     .push((unmap.iova, unmap.size), GFP_KERNEL)?;
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Commit a map whose fallible backing and page-table resources were
@@ -3196,70 +3203,74 @@ impl Vm {
         // Avoid a reservation wait when quarantine/close was already visible.
         // Keep the gate held through deferred-unmap insertion so the last job
         // guard cannot reopen admission between observation and append.
-        {
-            let gate = self.mapping_gate.state.lock();
-            if gate.blocked {
-                return self.defer_blocked_user_bind_batch(batch);
-            }
+        if self.defer_blocked_user_bind_batch(batch)? {
+            return Ok(());
         }
 
-        let mut admission_lost = false;
-        for op in &mut batch.ops {
-            let result = match op {
-                PreparedUserBindOp::Map(map) => {
-                    let mut inner = self.inner.exec_lock(Some(&map.gem), true)?;
-                    let Some(commit) = self.enter_user_mapping_commit()? else {
+        let mut index = 0usize;
+        while index < batch.ops.len() {
+            let mut admission_lost = false;
+            let result = (|| -> Result {
+                match &mut batch.ops[index] {
+                    PreparedUserBindOp::Map(map) => {
+                        let mut inner = self.inner.exec_lock(Some(&map.gem), true)?;
+                        let Some(commit) = self.enter_user_mapping_commit()? else {
+                            core::mem::drop(inner);
+                            admission_lost = true;
+                            return Ok(());
+                        };
+                        let (flags, gem_range) = if map.single_page {
+                            (gpuvm::GpuVaFlags::REPEAT, UAT_PGSZ as u32)
+                        } else {
+                            (gpuvm::GpuVaFlags::NONE, 0u32)
+                        };
+                        mod_dev_dbg!(
+                            inner.dev,
+                            "MMU: sm_map: {:#x} [{:#x}] -> {:#x}\n",
+                            map.offset,
+                            map.size,
+                            map.addr
+                        );
+                        let result = inner.sm_map(
+                            &mut map.ctx,
+                            map.addr,
+                            map.size,
+                            map.offset,
+                            gem_range,
+                            flags,
+                        );
                         core::mem::drop(inner);
-                        admission_lost = true;
-                        break;
-                    };
-                    let (flags, gem_range) = if map.single_page {
-                        (gpuvm::GpuVaFlags::REPEAT, UAT_PGSZ as u32)
-                    } else {
-                        (gpuvm::GpuVaFlags::NONE, 0u32)
-                    };
-                    mod_dev_dbg!(
-                        inner.dev,
-                        "MMU: sm_map: {:#x} [{:#x}] -> {:#x}\n",
-                        map.offset,
-                        map.size,
-                        map.addr
-                    );
-                    let result = inner.sm_map(
-                        &mut map.ctx,
-                        map.addr,
-                        map.size,
-                        map.offset,
-                        gem_range,
-                        flags,
-                    );
-                    core::mem::drop(inner);
-                    core::mem::drop(commit);
-                    result
-                }
-                PreparedUserBindOp::Unmap(unmap) => {
-                    let mut inner = self.inner.exec_lock(None, true)?;
-                    let Some(commit) = self.enter_user_mapping_commit()? else {
+                        core::mem::drop(commit);
+                        result
+                    }
+                    PreparedUserBindOp::Unmap(unmap) => {
+                        let mut inner = self.inner.exec_lock(None, true)?;
+                        let Some(commit) = self.enter_user_mapping_commit()? else {
+                            core::mem::drop(inner);
+                            admission_lost = true;
+                            return Ok(());
+                        };
+                        mod_dev_dbg!(
+                            inner.dev,
+                            "MMU: sm_unmap: {:#x}:{:#x}\n",
+                            unmap.iova,
+                            unmap.size
+                        );
+                        let result = inner.sm_unmap(&mut unmap.ctx, unmap.iova, unmap.size);
                         core::mem::drop(inner);
-                        admission_lost = true;
-                        break;
-                    };
-                    mod_dev_dbg!(
-                        inner.dev,
-                        "MMU: sm_unmap: {:#x}:{:#x}\n",
-                        unmap.iova,
-                        unmap.size
-                    );
-                    let result = inner.sm_unmap(&mut unmap.ctx, unmap.iova, unmap.size);
-                    core::mem::drop(inner);
-                    core::mem::drop(commit);
-                    result
+                        core::mem::drop(commit);
+                        result
+                    }
                 }
-            };
+            })();
+            if admission_lost {
+                if self.defer_blocked_user_bind_batch(batch)? {
+                    return Ok(());
+                }
+                continue;
+            }
             result?;
-        }
-        if admission_lost {
-            return self.defer_blocked_user_bind_batch(batch);
+            index += 1;
         }
         Ok(())
     }
