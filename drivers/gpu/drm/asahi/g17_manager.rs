@@ -1197,11 +1197,13 @@ pub(crate) struct G17PManagerConstruction {
     /// VmBind owners are released with the graph. Both processors stopping is
     /// the first observed global drain for these references.
     retired_parameter_managers: KVec<g17_resources::G17PRetiredParameterManagement>,
-    /// Firmware may dereference a completed descriptor's support allocation
-    /// after userspace queue destruction. Keep the rootless storage mapped
-    /// until processor stop, but release both TTBAT root leases immediately
-    /// so dead clients cannot exhaust execution or MCache selectors.
-    retired_firmware_render_storages: KVec<g17_resources::G17PUserRenderStorage>,
+    /// Firmware may dereference a completed descriptor after userspace queue
+    /// destruction. Keep the complete graph -- descriptor root, native
+    /// context aliases, storage, and HWPB reservation -- until both processors
+    /// stop. Retaining only the backing leaves a late context-qualified read
+    /// with no valid TTBAT root and turns safe quarantine into a poisoned
+    /// unbind.
+    retired_firmware_render_graphs: KVec<G17PRetiredRenderGraph>,
     /// Descriptor contexts whose owning DRM queue has been destroyed after
     /// its scheduler entity drained. The bit also prevents a graph which was
     /// concurrently moved into the retirement cache from escaping teardown.
@@ -1882,7 +1884,7 @@ impl G17PManagerConstruction {
             KVec::with_capacity(G17P_TA_HARDWARE_BUFFER_ID_COUNT, GFP_KERNEL)?;
         let retired_parameter_managers =
             KVec::with_capacity(G17P_TA_HARDWARE_BUFFER_ID_COUNT, GFP_KERNEL)?;
-        let retired_firmware_render_storages =
+        let retired_firmware_render_graphs =
             KVec::with_capacity(G17P_TA_HARDWARE_BUFFER_ID_COUNT, GFP_KERNEL)?;
 
         #[cfg(CONFIG_DEV_COREDUMP)]
@@ -1924,7 +1926,7 @@ impl G17PManagerConstruction {
                 retired_render_handoff_graph: None,
                 retired_render_handoff_graphs,
                 retired_parameter_managers,
-                retired_firmware_render_storages,
+                retired_firmware_render_graphs,
                 released_render_contexts: 0,
                 render_submission_ordinal: 0,
                 render_auxiliary_timestamp: 0,
@@ -3167,8 +3169,14 @@ impl G17PManagerConstruction {
                 Some(retired),
             );
         }
+        while let Some(retired) = self.retired_firmware_render_graphs.pop() {
+            Self::release_retired_handoff_graph(
+                &mut self.render_hardware_buffer_ids,
+                &mut self.retired_parameter_managers,
+                Some(retired),
+            );
+        }
         self.retired_parameter_managers.clear();
-        self.retired_firmware_render_storages.clear();
         self.released_render_contexts = 0;
         self.render_sksm = None;
         self.bootstrap_uma = None;
@@ -3540,9 +3548,7 @@ impl G17PManagerConstruction {
         let context = previous.storage.descriptor_context_id();
         if context < 64 && self.released_render_contexts & (1u64 << context) != 0 {
             Self::quarantine_drained_render_graph(
-                &mut self.render_hardware_buffer_ids,
-                &mut self.retired_parameter_managers,
-                &mut self.retired_firmware_render_storages,
+                &mut self.retired_firmware_render_graphs,
                 Some(previous),
             );
             return Ok(());
@@ -3558,13 +3564,7 @@ impl G17PManagerConstruction {
     }
 
     fn release_render_slot_context_owner(
-        ids: &mut G17PHardwareBufferIdAllocator,
-        retired_parameter_managers: &mut KVec<
-            g17_resources::G17PRetiredParameterManagement,
-        >,
-        retired_firmware_render_storages: &mut KVec<
-            g17_resources::G17PUserRenderStorage,
-        >,
+        retired_firmware_render_graphs: &mut KVec<G17PRetiredRenderGraph>,
         state: &mut G17PRenderSlotState,
         context: u16,
         retired_witness: bool,
@@ -3575,9 +3575,7 @@ impl G17PManagerConstruction {
         if state.retired_handoff_graph.as_ref().is_some_and(matches) {
             let graph = state.retired_handoff_graph.take();
             Self::quarantine_drained_render_graph(
-                ids,
-                retired_parameter_managers,
-                retired_firmware_render_storages,
+                retired_firmware_render_graphs,
                 graph,
             );
         }
@@ -3629,9 +3627,7 @@ impl G17PManagerConstruction {
         if self.retired_render_handoff_graph.as_ref().is_some_and(matches) {
             let graph = self.retired_render_handoff_graph.take();
             Self::quarantine_drained_render_graph(
-                &mut self.render_hardware_buffer_ids,
-                &mut self.retired_parameter_managers,
-                &mut self.retired_firmware_render_storages,
+                &mut self.retired_firmware_render_graphs,
                 graph,
             );
         }
@@ -3643,9 +3639,7 @@ impl G17PManagerConstruction {
             }
             if let Ok(graph) = self.retired_render_handoff_graphs.remove(index) {
                 Self::quarantine_drained_render_graph(
-                    &mut self.render_hardware_buffer_ids,
-                    &mut self.retired_parameter_managers,
-                    &mut self.retired_firmware_render_storages,
+                    &mut self.retired_firmware_render_graphs,
                     Some(graph),
                 );
             }
@@ -3660,9 +3654,7 @@ impl G17PManagerConstruction {
         let active_retired = !active_matches || self.require_retired_render_owner().is_ok();
         let mut active = self.take_active_render_slot_state();
         let active_release = Self::release_render_slot_context_owner(
-            &mut self.render_hardware_buffer_ids,
-            &mut self.retired_parameter_managers,
-            &mut self.retired_firmware_render_storages,
+            &mut self.retired_firmware_render_graphs,
             &mut active,
             context,
             active_retired,
@@ -3672,9 +3664,7 @@ impl G17PManagerConstruction {
         let mut release_error = active_release.err();
         for state in self.parked_render_slots.iter_mut().flatten() {
             if let Err(error) = Self::release_render_slot_context_owner(
-                &mut self.render_hardware_buffer_ids,
-                &mut self.retired_parameter_managers,
-                &mut self.retired_firmware_render_storages,
+                &mut self.retired_firmware_render_graphs,
                 state,
                 context,
                 true,
@@ -3718,47 +3708,24 @@ impl G17PManagerConstruction {
         drop(retired);
     }
 
-    /// Queue destruction is a root/context retirement boundary, not a full
-    /// firmware-memory retirement boundary. v18o proved the distinction: the
-    /// next process crashed GFX at an address inside the first process's
-    /// completed render-support allocation after the whole graph was dropped.
-    /// Remove both roots and the command-context lease, retain the remaining
-    /// mapping owners until processor stop, and keep PM in its narrower
-    /// native-grounded quarantine.
+    /// Queue destruction is neither a root nor a firmware-memory retirement
+    /// boundary for an already-retired handoff graph. v18o proved that firmware
+    /// can dereference a completed graph after its userspace owner is gone.
+    /// Such a read is context-qualified, so retaining only the backing while
+    /// retracting its TTBAT root is still a use-after-unbind. Keep the complete
+    /// retired graph until both processors stop.
     fn quarantine_drained_render_graph(
-        ids: &mut G17PHardwareBufferIdAllocator,
-        retired_parameter_managers: &mut KVec<
-            g17_resources::G17PRetiredParameterManagement,
-        >,
-        retired_firmware_render_storages: &mut KVec<
-            g17_resources::G17PUserRenderStorage,
-        >,
+        retired_firmware_render_graphs: &mut KVec<G17PRetiredRenderGraph>,
         retired: Option<G17PRetiredRenderGraph>,
     ) {
         let Some(retired) = retired else { return };
-        let G17PRetiredRenderGraph {
-            bind,
-            context_aliases,
-            mut storage,
-        } = retired;
-        Self::quarantine_retired_parameter_management(
-            retired_parameter_managers,
-            storage.take_retired_parameter_management(),
-        );
-        if let Some(id) = storage.retained_hardware_buffer_id() {
-            ids.unreserve(id);
-        }
-        storage.release_client_context();
-        // Load-bearing order: root leases disappear before the storage loses
-        // any mapping through which firmware could still name it.
-        drop(bind);
-        drop(context_aliases);
-        if let Err(error) = retired_firmware_render_storages.push_within_capacity(storage) {
-            // A firmware-visible mapping must never become a use-after-free
-            // because a diagnostic/session quarantine reached its bound.
+        if let Err(error) = retired_firmware_render_graphs.push_within_capacity(retired) {
+            // A firmware-visible graph must never become a use-after-free or
+            // use-after-unbind because the session quarantine reached its
+            // diagnostic bound.
             core::mem::forget(error.0);
             pr_err!(
-                "G17P render: retired firmware-storage quarantine exhausted; retaining mapping permanently\n"
+                "G17P render: retired firmware-graph quarantine exhausted; retaining graph permanently\n"
             );
         }
     }
