@@ -43,11 +43,14 @@ assert vm_bind.index("vm.reserve_deferred_user_unmaps") < vm_bind.index(
     "commit_prepared_user_bind_batch"
 )
 
-# Preparation reserves callback nodes, BO scatterlists, and page-table levels
-# without installing a leaf. There is no address-sized PTE validation walk.
-for token in ("new_va:", "prev_va:", "next_va:", "owned_sg_table", "alloc_pages"):
+# Preparation reserves callback nodes and BO scatterlists without taking a
+# second dma-resv lock or walking the requested VA span. Intermediate table
+# allocation stays in the ordinary step_map callback at commit time.
+for token in ("new_va:", "prev_va:", "next_va:", "owned_sg_table"):
     assert token in prepare_map
 assert "sm_map(" not in prepare_map
+assert "exec_lock" not in prepare_map
+assert "alloc_pages" not in prepare_map
 assert "matches_gpuva_ranges" not in MMU
 assert "matches_gpuva_ranges" not in PGTABLE
 assert "user_gpuva_ranges" not in MMU

@@ -773,8 +773,8 @@ impl File {
             )
         };
 
-        // Validate and reserve all expected resources before the established
-        // interruptible per-operation drm_exec commit path begins.
+        // Validate every operation and resolve every handle before the
+        // established interruptible per-operation drm_exec commit path begins.
         let mut plans = KVec::with_capacity(count, GFP_KERNEL)?;
         let mut batch = mmu::PreparedUserBindBatch::new(count)?;
         let mut unmap_count = 0usize;
