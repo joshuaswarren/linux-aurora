@@ -20,6 +20,7 @@ manager_batch='\n'.join(item(m,n) for n in [
  '    pub(crate) fn poll_staged_independent_compute_completion('])
 methods='\n'.join(item(r,n) for n in [
  '    fn service_async_compute_completions_for_event(',
+ '    fn service_async_compute_completion_masks(',
  '    fn service_async_compute_completions(',
  '    fn service_async_compute_completions_matching(',
  '    pub(crate) fn release_async_compute_queue(',
@@ -30,8 +31,17 @@ assert 'queue_g17p_firmware_event_worker' not in publish
 assert 'fsleep(' not in service
 assert 'async_visibility_pending' not in service
 dispatch=item(l, '    pub(crate) fn service_primary_firmware_events(')
-assert 'if completion_masks == [0; 2]' in dispatch
-assert 'self.service_async_compute_completions_for_event(completion_masks)' in dispatch
+assert 'self.service_async_compute_completion_masks(completion_masks)' in dispatch
+inline=item(l, '    fn service_firmware_events_inline(')
+drain=item(l, 'fn drain_primary_firmware_event_batch(')
+assert '.firmware_event_notifications\n        .swap(0, Ordering::AcqRel)' in drain
+inline_dispatch=inline.index('self.service_async_compute_completion_masks(completion_masks)?')
+assert inline.index('drain_primary_firmware_event_batch(') < inline_dispatch
+assert inline.index('let completion_masks = batch.completion_masks;') < inline_dispatch
+assert inline_dispatch < inline.index('if let Some(release) = batch.uma_release')
+assert inline_dispatch < inline.index('if let Some(generation) = batch.recovery_generation')
+assert dispatch.count('self.service_async_compute_completion_masks(completion_masks)') == 1
+assert inline.count('self.service_async_compute_completion_masks(completion_masks)') == 1
 quarantine = item(r, '    pub(crate) fn quarantine_async_compute(')
 assert quarantine.index('self.service_async_compute_completions()') < quarantine.index('q.quarantined = true')
 source=r'''
@@ -113,6 +123,13 @@ fn qid_mask(qid:u8)->[u64;2]{let mut mask=[0;2];mask[qid as usize/64]|=1u64<<(qi
  assert_eq!(SCANS.with(|p|p.get()),1);assert_eq!(ca.signals.load(Ordering::SeqCst),0);assert_eq!(cb.signals.load(Ordering::SeqCst),1);
  r.service_async_compute_completions_for_event(qid_mask(4)).unwrap();assert_eq!(ca.signals.load(Ordering::SeqCst),1);
  assert!(!g17p_async_completion_mask_contains([u64::MAX;2],200));
+}
+#[test]fn shared_worker_and_inline_dispatch_keep_targeted_and_zero_mask_fallback(){
+ let d=Arc::new(AtomicUsize::new(0));let(a,ca)=q(4,0x400,&d);let(b,cb)=q(65,0x650,&d);
+ let mut r=G17PLiveRuntime{pdev:None,manager:Some(manager(vec![(4,0x400,[2,8]),(65,0x650,[3,9])])),async_compute_queues:vec![a,b],session_recovery_pending:false};
+ r.async_compute_queues[0].queue.compute.0=1;r.async_compute_queues[1].queue.compute.0=1;
+ SCANS.with(|p|p.set(0));r.service_async_compute_completion_masks(qid_mask(65)).unwrap();assert_eq!(SCANS.with(|p|p.get()),1);assert_eq!(ca.signals.load(Ordering::SeqCst),0);assert_eq!(cb.signals.load(Ordering::SeqCst),1);
+ r.service_async_compute_completion_masks([0;2]).unwrap();assert_eq!(SCANS.with(|p|p.get()),2);assert_eq!(ca.signals.load(Ordering::SeqCst),1);
 }
 #[test]fn coalesced_two_client_event_retires_both_and_visibility_retry_stays_armed(){
  let d=Arc::new(AtomicUsize::new(0));let(a,ca)=q(4,0x400,&d);let(b,cb)=q(5,0x500,&d);
