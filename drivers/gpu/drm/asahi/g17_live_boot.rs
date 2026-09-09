@@ -3064,7 +3064,14 @@ impl G17PLiveRuntime {
                 }
             }
             self.service_async_render_completions(completion_masks)?;
-            self.service_async_compute_completions()
+            if completion_masks == [0; 2] {
+                // Identity-less/unknown event batches retain the broad scan as
+                // a lost-edge fallback. Ordinary type-1 completions name their
+                // exact QIDs and take the targeted M1/M2-style route below.
+                self.service_async_compute_completions()
+            } else {
+                self.service_async_compute_completions_for_event(completion_masks)
+            }
         });
         if result.is_err() {
             state.crashed.store(true, Ordering::Release);

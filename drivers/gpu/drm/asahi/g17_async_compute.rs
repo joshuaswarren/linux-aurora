@@ -18,6 +18,17 @@ struct G17PAsyncComputeQueue {
     quarantined: bool,
 }
 
+/// Type-1 firmware events identify completed stamp/QID slots in a 128-bit
+/// mask. Keep that identity through dispatch instead of scanning every active
+/// queue and its complete 0x800-entry completion ring for one queue's edge.
+const fn g17p_async_completion_mask_contains(masks: [u64; 2], queue_id: u8) -> bool {
+    if queue_id >= 128 {
+        return false;
+    }
+    let word = queue_id as usize / 64;
+    masks[word] & (1u64 << (queue_id as usize % 64)) != 0
+}
+
 impl G17PLiveRuntime {
     /// Both firmware CPUs must have stopped before this is called. Queue
     /// destruction alone cannot settle the scheduler's retained hardware
@@ -221,10 +232,29 @@ impl G17PLiveRuntime {
         Ok(())
     }
 
+    fn service_async_compute_completions_for_event(&mut self, masks: [u64; 2]) -> Result {
+        self.service_async_compute_completions_matching(Some(masks))
+    }
+
+    /// Full-scan fallback for a final watchdog observation or an event batch
+    /// whose record did not carry a usable QID mask. These paths deliberately
+    /// preserve the old lost/coalesced-edge recovery behaviour.
     fn service_async_compute_completions(&mut self) -> Result {
+        self.service_async_compute_completions_matching(None)
+    }
+
+    fn service_async_compute_completions_matching(
+        &mut self,
+        masks: Option<[u64; 2]>,
+    ) -> Result {
         let manager = self.manager.as_mut().ok_or(ENODEV)?;
         for q in &mut self.async_compute_queues {
             if q.active.is_none() || q.quarantined { continue; }
+            if masks.is_some_and(|masks| {
+                !g17p_async_completion_mask_contains(masks, q.queue.queue_id())
+            }) {
+                continue;
+            }
             match manager.poll_independent_compute_completion(&mut q.queue) {
                 Ok(Some(timestamps)) => {
                     let active = q.active.take().ok_or(EIO)?;
