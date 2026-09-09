@@ -3106,12 +3106,43 @@ impl Vm {
         })
     }
 
-    /// A failed VM may unbind for teardown, but it may not replace mappings
-    /// still reachable from retained firmware packets.
-    pub(crate) fn accepts_user_maps(&self) -> bool {
-        if self.status.get() != 0 { return false; }
-        let state = self.job_lifetime.lock();
-        !state.draining && (state.active == 0 || !state.quarantined)
+    /// Wait for healthy retirement before preparing a userspace map. This
+    /// runs before taking dma-resv locks, which the retirement drain needs.
+    /// A failed or quarantined VM still cannot replace firmware-owned maps.
+    pub(crate) fn wait_for_user_map_admission(&self) -> Result {
+        let mut gate = self.mapping_gate.state.lock();
+        let mut waited = false;
+        loop {
+            let state = self.job_lifetime.lock();
+            let status = self.status.get();
+            if status != 0 || state.closed || gate.blocked
+                || (state.active != 0 && state.quarantined)
+            {
+                pr_info!(
+                    "G17P VM map admission refused: vm={} status={} blocked={} active={} quarantined={} draining={} closed={}\n",
+                    self.id, status, gate.blocked, state.active,
+                    state.quarantined, state.draining, state.closed
+                );
+                return Err(if state.closed { ENOENT } else { EIO });
+            }
+            if !state.draining {
+                return Ok(());
+            }
+            if !waited {
+                pr_info!(
+                    "G17P VM map admission waiting for retirement: vm={} status={} blocked={} active={} quarantined={} draining={} closed={}\n",
+                    self.id, status, gate.blocked, state.active,
+                    state.quarantined, state.draining, state.closed
+                );
+                waited = true;
+            }
+            core::mem::drop(state);
+            // Drop gate atomically with sleeping. The drain clears draining
+            // under gate -> lifetime and then notifies this condition.
+            if self.mapping_gate.idle.wait_interruptible(&mut gate) {
+                return Err(ERESTARTSYS);
+            }
+        }
     }
 
     /// Allocate every deferred-unmap entry a batch could need before it

@@ -2,6 +2,7 @@
 """Exercise production G17P VM job admission and deferred-unmap ownership."""
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 
 s = (Path(__file__).resolve().parents[1] / "mmu.rs").read_text()
@@ -28,6 +29,17 @@ guard = "\n".join([
 ])
 quarantine = item("    pub(crate) fn quarantine(")
 retain = item("    pub(crate) fn retain_t8140_job(")
+# Also accept the previous predicate so this harness can reproduce its fatal
+# EIO during an otherwise healthy retirement, without modeling the predicate.
+if "pub(crate) fn wait_for_user_map_admission(" in s:
+    admit_map = item("    pub(crate) fn wait_for_user_map_admission(")
+else:
+    admit_map = item("    pub(crate) fn accepts_user_maps(") + """
+    fn wait_for_user_map_admission(&self) -> Result {
+        if self.accepts_user_maps() { Ok(()) } else { Err(EIO) }
+    }
+"""
+
 unmap_users = item("    pub(crate) fn unmap_user_ranges(")
 unmap_wrapper = item("    pub(crate) fn unmap_user_range(")
 unmap_one = item("    pub(crate) fn unmap_prepared_user_range(")
@@ -66,15 +78,17 @@ assert commit_batch.index("core::mem::drop(inner)") < commit_batch.index(
 source = r'''
 #![allow(dead_code, unused_variables)]
 use std::ops::{Deref, DerefMut, Range};
-use std::sync::{Arc, Condvar as StdCondvar, atomic::{AtomicBool, AtomicUsize, Ordering}};
+use std::sync::{Arc, Condvar as StdCondvar, atomic::{AtomicBool, AtomicUsize, AtomicI32, Ordering}};
 type Error=i32;
 type Result<T=()>=std::result::Result<T,Error>;
 const ENOENT:i32=2;
 const EBUSY:i32=16;
 const EIO:i32=5;
+const ERESTARTSYS:i32=512;
 const EOVERFLOW:i32=75;
 const GFP_KERNEL:u32=0;
 macro_rules! pr_err{($($t:tt)*)=>{()}}
+macro_rules! pr_info{($($t:tt)*)=>{()}}
 struct KVec<T>(Vec<T>);
 impl<T>KVec<T>{fn new()->Self{Self(vec![])} fn push(&mut self,v:T,_f:u32)->Result{self.0.push(v);Ok(())}}
 impl<T>Deref for KVec<T>{type Target=Vec<T>;fn deref(&self)->&Vec<T>{&self.0}}
@@ -84,11 +98,16 @@ struct Guard<'a,T>(Option<std::sync::MutexGuard<'a,T>>);
 impl<T>Deref for Guard<'_,T>{type Target=T;fn deref(&self)->&T{self.0.as_deref().unwrap()}}
 impl<T>DerefMut for Guard<'_,T>{fn deref_mut(&mut self)->&mut T{self.0.as_deref_mut().unwrap()}}
 impl<T>Mutex<T>{fn lock(&self)->Guard<'_,T>{Guard(Some(self.0.lock().unwrap()))}}
-struct CondVar(StdCondvar);
+struct CondVar(StdCondvar, AtomicBool);
 impl CondVar {
     fn wait<T>(&self,guard:&mut Guard<'_,T>) {
         let held=guard.0.take().unwrap();
         guard.0=Some(self.0.wait(held).unwrap());
+    }
+    fn wait_interruptible<T>(&self,guard:&mut Guard<'_,T>)->bool {
+        if self.1.load(Ordering::SeqCst) { return true; }
+        self.wait(guard);
+        self.1.load(Ordering::SeqCst)
     }
     fn notify_all(&self) { self.0.notify_all(); }
 }
@@ -97,8 +116,12 @@ struct PreparedUserUnmap{iova:u64,size:u64}
 struct ARef<T>(Arc<T>);
 impl<T>Deref for ARef<T>{type Target=T;fn deref(&self)->&T{&self.0}}
 impl From<&gem::Object> for ARef<gem::Object>{fn from(v:&gem::Object)->Self{Self(Arc::new(v.clone()))}}
+struct VmStatus(AtomicI32);
+impl VmStatus { fn get(&self)->i32 { self.0.load(Ordering::SeqCst) } }
 #[derive(Clone)]
 struct Vm {
+    id:u64,
+    status:Arc<VmStatus>,
     job_lifetime:Arc<Mutex<T8140VmJobLifetime>>,
     mapping_gate:Arc<T8140VmMappingGate>,
     unmaps:Arc<AtomicUsize>,
@@ -106,7 +129,7 @@ struct Vm {
     block_cleanup:Arc<AtomicBool>,
     cleanup_gate:Arc<(std::sync::Mutex<(bool,bool)>,StdCondvar)>,
 }
-''' + state + "\n" + gate_state + "\n" + gate_type + "\n" + guard + "\nimpl Vm {\n" + retain + "\n" + unmap_users + "\n" + drop_object + r'''
+''' + state + "\n" + gate_state + "\n" + gate_type + "\n" + guard + "\nimpl Vm {\n" + retain + "\n" + admit_map + "\n" + unmap_users + "\n" + drop_object + r'''
     fn unmap_user_ranges_now(&self,_user:Range<u64>,_kernel:Range<u64>)->Result {
         self.unmaps.fetch_add(1,Ordering::SeqCst);
         self.maybe_block_cleanup();
@@ -160,6 +183,8 @@ struct Vm {
     }
     fn bo_deferred_cleanup(&self){}
     fn new()->Self { Self {
+        id:42,
+        status:Arc::new(VmStatus(AtomicI32::new(0))),
         job_lifetime:Arc::new(Mutex(std::sync::Mutex::new(T8140VmJobLifetime{
             active:0,quarantined:false,draining:false,closed:false,close_ranges:None,
             deferred_unmaps:KVec::new(),closed_objects:KVec::new()
@@ -168,7 +193,7 @@ struct Vm {
             state:Mutex(std::sync::Mutex::new(T8140VmMappingGateState{
                 blocked:false,commits:0,
             })),
-            idle:CondVar(StdCondvar::new()),
+            idle:CondVar(StdCondvar::new(),AtomicBool::new(false)),
         }),
         unmaps:Arc::new(AtomicUsize::new(0)),
         object_unmaps:Arc::new(AtomicUsize::new(0)),
@@ -280,6 +305,75 @@ fn overflow_and_idle_file_close_do_not_create_unowned_job() {
     assert_eq!(v.unmaps.load(Ordering::SeqCst),1);
     assert!(v.retain_t8140_job().is_err());
 }
+#[test]
+fn healthy_retirement_waits_for_import_instead_of_returning_eio() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let v=Vm::new();
+    let job=v.retain_t8140_job().unwrap();
+    v.drop_mappings(&gem::Object(12)).unwrap();
+    v.block_cleanup.store(true,Ordering::SeqCst);
+    let retire=std::thread::spawn(move || drop(job));
+    v.wait_cleanup_entered();
+    assert!(v.job_lifetime.lock().draining);
+    let contender=v.clone();
+    let (tx,rx)=mpsc::channel();
+    let importer=std::thread::spawn(move || tx.send(contender.wait_for_user_map_admission()).unwrap());
+    let early=rx.recv_timeout(Duration::from_millis(50));
+    // Release cleanup even when checking the old implementation, so a failed
+    // assertion does not leave a test worker parked on the fixture condition.
+    v.release_cleanup();
+    retire.join().unwrap();
+    assert!(early.is_err(),"healthy retirement must wait, not return {early:?}");
+    assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(),Ok(()));
+    importer.join().unwrap();
+}
+
+#[test]
+fn failed_closed_and_quarantined_imports_remain_rejected() {
+    for case in 0..5 {
+        let v=Vm::new();
+        match case {
+            0=>v.status.0.store(-5,Ordering::SeqCst),
+            1=>v.mapping_gate.state.lock().blocked=true,
+            2=>{let mut s=v.job_lifetime.lock();s.active=1;s.quarantined=true;},
+            3=>v.job_lifetime.lock().closed=true,
+            4=>{v.status.0.store(-5,Ordering::SeqCst);v.job_lifetime.lock().draining=true;},
+            _=>unreachable!(),
+        }
+        assert_eq!(v.wait_for_user_map_admission(),Err(if case==3 {ENOENT}else{EIO}));
+    }
+    let v=Vm::new();v.job_lifetime.lock().active=1;
+    assert_eq!(v.wait_for_user_map_admission(),Ok(()));
+}
+
+#[test]
+fn interrupted_retirement_wait_releases_both_locks() {
+    let v=Vm::new();
+    v.job_lifetime.lock().draining=true;
+    v.mapping_gate.idle.1.store(true,Ordering::SeqCst);
+    assert_eq!(v.wait_for_user_map_admission(),Err(ERESTARTSYS));
+    assert!(v.job_lifetime.0.try_lock().is_ok());
+    assert!(v.mapping_gate.state.0.try_lock().is_ok());
+}
+
+#[test]
+fn import_rechecks_failure_after_retirement_wakeup() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let v=Vm::new();let job=v.retain_t8140_job().unwrap();
+    v.drop_mappings(&gem::Object(13)).unwrap();
+    v.block_cleanup.store(true,Ordering::SeqCst);
+    let retire=std::thread::spawn(move || drop(job));v.wait_cleanup_entered();
+    let contender=v.clone();let(tx,rx)=mpsc::channel();
+    let importer=std::thread::spawn(move ||tx.send(contender.wait_for_user_map_admission()).unwrap());
+    let early=rx.recv_timeout(Duration::from_millis(50));
+    v.status.0.store(-5,Ordering::SeqCst);v.release_cleanup();retire.join().unwrap();
+    assert!(early.is_err());
+    assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(),Err(EIO));
+    importer.join().unwrap();
+}
+
 '''
 
 with tempfile.TemporaryDirectory() as d:
@@ -287,6 +381,6 @@ with tempfile.TemporaryDirectory() as d:
     f.write_text(source)
     exe = Path(d) / "test"
     subprocess.run(["rustc", "--edition=2021", "--test", str(f), "-o", str(exe)], check=True)
-    subprocess.run([str(exe), "--test-threads=1"], check=True)
+    subprocess.run([str(exe), "--test-threads=1", *sys.argv[1:]], check=True)
 
 print("PASS production VM job ownership: healthy unbinds stay live; quarantined unbinds defer")
