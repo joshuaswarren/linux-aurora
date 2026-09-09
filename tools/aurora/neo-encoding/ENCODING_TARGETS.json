@@ -1,0 +1,334 @@
+{
+  "target": "Neo T8140",
+  "evidence_date": "2026-09-09",
+  "targets": [
+    {
+      "target": "H.264",
+      "status": "Linux validated",
+      "evidence": [
+        "artifacts/ave-video-qualified-20260908"
+      ],
+      "note": ""
+    },
+    {
+      "target": "HEVC Main",
+      "status": "Linux validated",
+      "evidence": [
+        "artifacts/ave-video-qualified-20260908"
+      ],
+      "note": ""
+    },
+    {
+      "target": "ProRes 422",
+      "status": "Linux validated",
+      "evidence": [
+        "artifacts/prores-all-profiles-qualified-20260909"
+      ],
+      "note": "8-bit packed source; 4444/XQ alpha opaque. High-precision variable alpha is separate."
+    },
+    {
+      "target": "ProRes HQ",
+      "status": "Linux validated",
+      "evidence": [
+        "artifacts/prores-all-profiles-qualified-20260909"
+      ],
+      "note": "8-bit packed source; 4444/XQ alpha opaque. High-precision variable alpha is separate."
+    },
+    {
+      "target": "ProRes LT",
+      "status": "Linux validated",
+      "evidence": [
+        "artifacts/prores-all-profiles-qualified-20260909"
+      ],
+      "note": "8-bit packed source; 4444/XQ alpha opaque. High-precision variable alpha is separate."
+    },
+    {
+      "target": "ProRes Proxy",
+      "status": "Linux validated",
+      "evidence": [
+        "artifacts/prores-all-profiles-qualified-20260909"
+      ],
+      "note": "8-bit packed source; 4444/XQ alpha opaque. High-precision variable alpha is separate."
+    },
+    {
+      "target": "ProRes 4444",
+      "status": "Linux validated",
+      "evidence": [
+        "artifacts/prores-all-profiles-qualified-20260909"
+      ],
+      "note": "8-bit packed source; 4444/XQ alpha opaque. High-precision variable alpha is separate."
+    },
+    {
+      "target": "ProRes 4444 XQ",
+      "status": "Linux validated",
+      "evidence": [
+        "artifacts/prores-all-profiles-qualified-20260909"
+      ],
+      "note": "8-bit packed source; 4444/XQ alpha opaque. High-precision variable alpha is separate."
+    },
+    {
+      "target": "JPEG",
+      "status": "Linux validated",
+      "evidence": [
+        "artifacts/jpeg-mjpeg-qualified-20260909"
+      ],
+      "note": "320x240 Baseline, 8-bit 4:2:0; one frame and 60 changing frames."
+    },
+    {
+      "target": "Motion JPEG",
+      "status": "Linux validated",
+      "evidence": [
+        "artifacts/jpeg-mjpeg-qualified-20260909"
+      ],
+      "note": "320x240 Baseline, 8-bit 4:2:0; one frame and 60 changing frames."
+    },
+    {
+      "target": "HEVC Main10",
+      "status": "Linux validated",
+      "evidence": [
+        "artifacts/hevc-precision-qualified-20260909"
+      ],
+      "note": "Real 10-bit source. Linux sequence forces keyframes; inter-frame scheduling is not qualified."
+    },
+    {
+      "target": "HEVC Main42210",
+      "status": "Linux validated",
+      "evidence": [
+        "artifacts/hevc-precision-qualified-20260909"
+      ],
+      "note": "Real 10-bit source. Linux sequence forces keyframes; inter-frame scheduling is not qualified."
+    },
+    {
+      "target": "ProRes 4444 alpha / 12-bit input",
+      "status": "Linux validated",
+      "evidence": [
+        "artifacts/prores-alpha-precision-qualified-20260909"
+      ],
+      "note": "Real 12-bit color; all 16 alpha bits preserved through independent decode, one frame and 60 changing frames."
+    },
+    {
+      "target": "ProRes 4444 XQ alpha / 12-bit input",
+      "status": "Linux validated",
+      "evidence": [
+        "artifacts/prores-alpha-precision-qualified-20260909"
+      ],
+      "note": "Real 12-bit color; all 16 alpha bits preserved through independent decode, one frame and 60 changing frames."
+    },
+    {
+      "target": "HEVC alpha",
+      "status": "hardware advertised",
+      "evidence": [
+        "artifacts/coverage-reference-20260909/guest/hevc-alpha"
+      ],
+      "note": "PreserveAlphaChannel rejected. Corrected EncodesAlpha/readback probe is prepared but blocked by macOS reference boot failures; no native qualification."
+    },
+    {
+      "target": "HEVC depth",
+      "status": "Linux validated",
+      "evidence": [
+        "artifacts/hevc-auxiliary-qualified-20260909"
+      ],
+      "note": "Native AVE: one reference-matched frame and 60 changing smooth depth frames. Float32 through half-float/L010 into 10-bit monochrome HEVC; independent decoders agree. Worst relative error 3.30 percent. Row-wrap discontinuity stress failed the 5 percent gate and is archived separately."
+    },
+    {
+      "target": "HEVC disparity",
+      "status": "Linux validated",
+      "evidence": [
+        "artifacts/hevc-auxiliary-qualified-20260909"
+      ],
+      "note": "Native AVE: one reference-matched frame and 60 changing smooth disparity frames. Float32 through half-float/L010 into 10-bit monochrome HEVC; independent decoders agree. Worst relative error 3.79 percent. Forced keyframes; lossy, not arbitrary float32 precision preservation."
+    },
+    {
+      "target": "MV-HEVC",
+      "status": "reference validated",
+      "evidence": [
+        "artifacts/mvhevc-reference-validation-20260909"
+      ],
+      "note": "Two independently decoded, distinct views. Larger native AVE pool passed baseline regressions, but complete multi-layer command/input capture is blocked by macOS reference boot failures."
+    },
+    {
+      "target": "Audio AAC-LC",
+      "status": "candidate",
+      "evidence": [
+        "artifacts/audio-hardware-explicit-20260909",
+        "artifacts/auxiliary-reference-20260909/guest/audio"
+      ],
+      "note": "No hardware-advertised implementation in the Neo inventory. AAC hardware selection also accepted a nonexistent manufacturer, so conversion is not hardware proof."
+    },
+    {
+      "target": "Audio aace",
+      "status": "candidate",
+      "evidence": [
+        "artifacts/audio-hardware-explicit-20260909",
+        "artifacts/auxiliary-reference-20260909/guest/audio"
+      ],
+      "note": "No hardware-advertised implementation in the Neo inventory. AAC hardware selection also accepted a nonexistent manufacturer, so conversion is not hardware proof."
+    },
+    {
+      "target": "Audio aacf",
+      "status": "candidate",
+      "evidence": [
+        "artifacts/audio-hardware-explicit-20260909",
+        "artifacts/auxiliary-reference-20260909/guest/audio"
+      ],
+      "note": "No hardware-advertised implementation in the Neo inventory. AAC hardware selection also accepted a nonexistent manufacturer, so conversion is not hardware proof."
+    },
+    {
+      "target": "Audio aacg",
+      "status": "candidate",
+      "evidence": [
+        "artifacts/audio-hardware-explicit-20260909",
+        "artifacts/auxiliary-reference-20260909/guest/audio"
+      ],
+      "note": "No hardware-advertised implementation in the Neo inventory. AAC hardware selection also accepted a nonexistent manufacturer, so conversion is not hardware proof."
+    },
+    {
+      "target": "Audio aach",
+      "status": "candidate",
+      "evidence": [
+        "artifacts/audio-hardware-explicit-20260909",
+        "artifacts/auxiliary-reference-20260909/guest/audio"
+      ],
+      "note": "No hardware-advertised implementation in the Neo inventory. AAC hardware selection also accepted a nonexistent manufacturer, so conversion is not hardware proof."
+    },
+    {
+      "target": "Audio aacl",
+      "status": "candidate",
+      "evidence": [
+        "artifacts/audio-hardware-explicit-20260909",
+        "artifacts/auxiliary-reference-20260909/guest/audio"
+      ],
+      "note": "No hardware-advertised implementation in the Neo inventory. AAC hardware selection also accepted a nonexistent manufacturer, so conversion is not hardware proof."
+    },
+    {
+      "target": "Audio aacp",
+      "status": "candidate",
+      "evidence": [
+        "artifacts/audio-hardware-explicit-20260909",
+        "artifacts/auxiliary-reference-20260909/guest/audio"
+      ],
+      "note": "No hardware-advertised implementation in the Neo inventory. AAC hardware selection also accepted a nonexistent manufacturer, so conversion is not hardware proof."
+    },
+    {
+      "target": "Audio alac",
+      "status": "candidate",
+      "evidence": [
+        "artifacts/audio-hardware-explicit-20260909",
+        "artifacts/auxiliary-reference-20260909/guest/audio"
+      ],
+      "note": "No hardware-advertised implementation in the Neo inventory. AAC hardware selection also accepted a nonexistent manufacturer, so conversion is not hardware proof."
+    },
+    {
+      "target": "Audio alaw",
+      "status": "candidate",
+      "evidence": [
+        "artifacts/audio-hardware-explicit-20260909",
+        "artifacts/auxiliary-reference-20260909/guest/audio"
+      ],
+      "note": "No hardware-advertised implementation in the Neo inventory. AAC hardware selection also accepted a nonexistent manufacturer, so conversion is not hardware proof."
+    },
+    {
+      "target": "Audio APAC",
+      "status": "candidate",
+      "evidence": [
+        "artifacts/audio-hardware-explicit-20260909",
+        "artifacts/auxiliary-reference-20260909/guest/audio"
+      ],
+      "note": "No hardware-advertised implementation in the Neo inventory. AAC hardware selection also accepted a nonexistent manufacturer, so conversion is not hardware proof."
+    },
+    {
+      "target": "Audio flac",
+      "status": "candidate",
+      "evidence": [
+        "artifacts/audio-hardware-explicit-20260909",
+        "artifacts/auxiliary-reference-20260909/guest/audio"
+      ],
+      "note": "No hardware-advertised implementation in the Neo inventory. AAC hardware selection also accepted a nonexistent manufacturer, so conversion is not hardware proof."
+    },
+    {
+      "target": "Audio ilbc",
+      "status": "candidate",
+      "evidence": [
+        "artifacts/audio-hardware-explicit-20260909",
+        "artifacts/auxiliary-reference-20260909/guest/audio"
+      ],
+      "note": "No hardware-advertised implementation in the Neo inventory. AAC hardware selection also accepted a nonexistent manufacturer, so conversion is not hardware proof."
+    },
+    {
+      "target": "Audio ima4",
+      "status": "candidate",
+      "evidence": [
+        "artifacts/audio-hardware-explicit-20260909",
+        "artifacts/auxiliary-reference-20260909/guest/audio"
+      ],
+      "note": "No hardware-advertised implementation in the Neo inventory. AAC hardware selection also accepted a nonexistent manufacturer, so conversion is not hardware proof."
+    },
+    {
+      "target": "Audio lpcm",
+      "status": "candidate",
+      "evidence": [
+        "artifacts/audio-hardware-explicit-20260909",
+        "artifacts/auxiliary-reference-20260909/guest/audio"
+      ],
+      "note": "No hardware-advertised implementation in the Neo inventory. AAC hardware selection also accepted a nonexistent manufacturer, so conversion is not hardware proof."
+    },
+    {
+      "target": "Audio opus",
+      "status": "candidate",
+      "evidence": [
+        "artifacts/audio-hardware-explicit-20260909",
+        "artifacts/auxiliary-reference-20260909/guest/audio"
+      ],
+      "note": "No hardware-advertised implementation in the Neo inventory. AAC hardware selection also accepted a nonexistent manufacturer, so conversion is not hardware proof."
+    },
+    {
+      "target": "Audio ulaw",
+      "status": "candidate",
+      "evidence": [
+        "artifacts/audio-hardware-explicit-20260909",
+        "artifacts/auxiliary-reference-20260909/guest/audio"
+      ],
+      "note": "No hardware-advertised implementation in the Neo inventory. AAC hardware selection also accepted a nonexistent manufacturer, so conversion is not hardware proof."
+    },
+    {
+      "target": "ProRes RAW",
+      "status": "candidate",
+      "evidence": [
+        "A18_ENCODING_TARGET_AUDIT.md"
+      ],
+      "note": "Outside implementation commitments until new hardware evidence appears."
+    },
+    {
+      "target": "ProRes RAW HQ",
+      "status": "candidate",
+      "evidence": [
+        "A18_ENCODING_TARGET_AUDIT.md"
+      ],
+      "note": "Outside implementation commitments until new hardware evidence appears."
+    },
+    {
+      "target": "AV1",
+      "status": "candidate",
+      "evidence": [
+        "A18_ENCODING_TARGET_AUDIT.md"
+      ],
+      "note": "Outside implementation commitments until new hardware evidence appears."
+    },
+    {
+      "target": "VP8",
+      "status": "candidate",
+      "evidence": [
+        "A18_ENCODING_TARGET_AUDIT.md"
+      ],
+      "note": "Outside implementation commitments until new hardware evidence appears."
+    },
+    {
+      "target": "VP9",
+      "status": "candidate",
+      "evidence": [
+        "A18_ENCODING_TARGET_AUDIT.md"
+      ],
+      "note": "Outside implementation commitments until new hardware evidence appears."
+    }
+  ]
+}
