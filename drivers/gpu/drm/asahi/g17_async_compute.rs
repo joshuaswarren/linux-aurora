@@ -248,6 +248,21 @@ impl G17PLiveRuntime {
         masks: Option<[u64; 2]>,
     ) -> Result {
         let manager = self.manager.as_mut().ok_or(ENODEV)?;
+        manager.begin_independent_compute_completion_batch();
+        let mut requested = false;
+        for q in &self.async_compute_queues {
+            if q.active.is_none() || q.quarantined { continue; }
+            if masks.is_some_and(|masks| {
+                !g17p_async_completion_mask_contains(masks, q.queue.queue_id())
+            }) {
+                continue;
+            }
+            requested |= manager.stage_independent_compute_completion(&q.queue)?;
+        }
+        if !requested {
+            return Ok(());
+        }
+        manager.scan_independent_compute_completion_batch()?;
         for q in &mut self.async_compute_queues {
             if q.active.is_none() || q.quarantined { continue; }
             if masks.is_some_and(|masks| {
@@ -255,7 +270,7 @@ impl G17PLiveRuntime {
             }) {
                 continue;
             }
-            match manager.poll_independent_compute_completion(&mut q.queue) {
+            match manager.poll_staged_independent_compute_completion(&mut q.queue) {
                 Ok(Some(timestamps)) => {
                     let active = q.active.take().ok_or(EIO)?;
                     dev_info!(self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),

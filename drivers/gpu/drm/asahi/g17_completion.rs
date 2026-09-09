@@ -465,6 +465,15 @@ const KSM_TIMESTAMP_MASK: u64 = 0x00ff_ffff_ffff;
 const KSM_QID_MASK: u8 = 0x7f;
 const KSM_PARENT_MASK: u64 = 0x003f_ffff_ffff_ffff;
 
+/// Extract the EventMachine QID from a KSM completion control word.
+///
+/// Keep this independent of the stricter full-record decoder: the shared
+/// completion ring retains partially overwritten and old records, which a
+/// batch scan must be able to skip without treating them as transport errors.
+pub(crate) const fn g17p_ksm_completion_queue_id(control: u64) -> u8 {
+    ((control >> 9) as u8) & KSM_QID_MASK
+}
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum CompletionDecodeError {
     RecordSize,
@@ -780,7 +789,7 @@ pub(crate) fn decode_ksm_completion_entry(
     Ok(G17pKsmCompletionEntry {
         completion_selector,
         command_type,
-        queue_id: ((control >> 9) as u8) & KSM_QID_MASK,
+        queue_id: g17p_ksm_completion_queue_id(control),
         timestamp: timestamp & KSM_TIMESTAMP_MASK,
         word_08: get_u64(raw, 0x08),
         payload: [get_u64(raw, 0x10), get_u64(raw, 0x18)],

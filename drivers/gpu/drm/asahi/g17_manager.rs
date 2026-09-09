@@ -1284,6 +1284,10 @@ pub(crate) struct G17PManagerConstruction {
     /// left behind by submission N is indistinguishable from submission N+1's
     /// and every later wait would be satisfied instantly by stale data.
     last_completion_end: u64,
+    /// Preallocated per-QID index for one shared completion-ring observation.
+    /// Kept in the heap-resident manager so event service neither allocates
+    /// under the runtime mutex nor consumes several KiB of kernel stack.
+    compute_completion_batch: g17_resources::G17PComputeCompletionBatch,
     /// Set once a submission has zeroed the queue's completion stamp, so a
     /// retire knows the word is meaningful. Cleared only by rebuilding the
     /// manager.
@@ -1973,6 +1977,7 @@ impl G17PManagerConstruction {
                 last_published_descriptor: 0,
                 next_compute_queue_id: Some(G17P_COMPUTE_QUEUE_ID_BASE),
                 last_completion_end: 0,
+                compute_completion_batch: g17_resources::G17PComputeCompletionBatch::new(),
                 compute_stamp_armed: false,
                 compute_stamp_waits: AtomicU32::new(0),
                 compute_stamp_misses: AtomicU32::new(0),
@@ -7322,23 +7327,57 @@ impl G17PManagerConstruction {
         })
     }
 
-    /// Completion identity and visibility belong to the queue, not the last
-    /// global publisher. Other QIDs may finish in either order. Never clear
-    /// their shared completion ring while another submission is outstanding.
-    pub(crate) fn poll_independent_compute_completion(
-        &mut self, queue: &mut G17PSksmQueue,
+    /// Start one shared-ring transaction. All target queues are staged before
+    /// the ring is read, so a coalesced event incurs one DRAM walk regardless
+    /// of how many clients completed in the batch.
+    pub(crate) fn begin_independent_compute_completion_batch(&mut self) {
+        self.compute_completion_batch.clear();
+    }
+
+    pub(crate) fn stage_independent_compute_completion(
+        &mut self,
+        queue: &G17PSksmQueue,
+    ) -> Result<bool> {
+        if !queue.independent_context || queue.completion_descriptor == 0 {
+            return Ok(false);
+        }
+        self.compute_completion_batch.request(
+            queue.queue_id,
+            queue.completion_descriptor,
+            queue.completion_last_end,
+        )?;
+        Ok(true)
+    }
+
+    pub(crate) fn scan_independent_compute_completion_batch(&mut self) -> Result {
+        self.resources
+            .scan_compute_completion_batch(&mut self.compute_completion_batch)
+    }
+
+    /// Consume this queue's record from the single acquired batch snapshot.
+    /// Completion identity and visibility remain queue-local: the snapshot is
+    /// only an index, and retirement still validates the exact descriptor,
+    /// monotonic end timestamp, and final queue stamp before releasing owners.
+    pub(crate) fn poll_staged_independent_compute_completion(
+        &mut self,
+        queue: &mut G17PSksmQueue,
     ) -> Result<Option<[u64; 2]>> {
-        if !queue.independent_context || queue.completion_descriptor == 0 { return Ok(None); }
-        let Some(timestamps) = self.resources.read_compute_completion(
-            queue.completion_descriptor, queue.completion_last_end,
-        )? else { return Ok(None); };
+        if !queue.independent_context || queue.completion_descriptor == 0 {
+            return Ok(None);
+        }
+        let Some(candidate) = self.compute_completion_batch.take(
+            queue.queue_id,
+            queue.completion_descriptor,
+            queue.completion_last_end,
+        )? else {
+            return Ok(None);
+        };
+        let timestamps = candidate.timestamps;
         if timestamps[0] == timestamps[1] { return Err(EIO); }
         if queue.completion_stamp_armed && queue.compute.read_compute_stamp()? == 0 {
             return Err(EAGAIN);
         }
-        if let Some(pair) = self.resources.read_compute_execution_interval(
-            queue.completion_descriptor, timestamps[1],
-        )? {
+        if let Some(pair) = candidate.interval {
             if crate::util::g17p_verbose() {
                 dev_info!(self.resources.dev().as_ref(),
                     "G17P async compute: GPU-INTERVAL qid={} descriptor={:#x} start={} end={}\n",

@@ -156,6 +156,139 @@ const G17P_COMPUTE_COMPLETION_TIMESTAMP_MASK: u64 = 0x003f_ffff_ffff_ffff;
 /// and x26, x22, #0xfffffffffffffffe ; the firmware masks bit 0 off
 /// ```
 const G17P_COMPUTE_COMPLETION_DESCRIPTOR_MASK: u64 = !1u64;
+
+const G17P_COMPUTE_COMPLETION_QID_COUNT: usize = 128;
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PComputeCompletionCandidate {
+    /// Pair-A start and pair-B end, preserving the existing compute UAPI ABI.
+    pub(crate) timestamps: [u64; 2],
+    /// Coherent pair-B interval used only for execution-time diagnostics.
+    pub(crate) interval: Option<[u64; 2]>,
+}
+
+#[derive(Debug, Copy, Clone)]
+struct G17PComputeCompletionBatchSlot {
+    expected_descriptor: u64,
+    last_consumed_end: u64,
+    pair_a_start: u64,
+    pair_b_start: u64,
+    pair_b_end: u64,
+}
+
+impl G17PComputeCompletionBatchSlot {
+    const EMPTY: Self = Self {
+        expected_descriptor: 0,
+        last_consumed_end: 0,
+        pair_a_start: 0,
+        pair_b_start: 0,
+        pair_b_end: 0,
+    };
+}
+
+/// Heap-resident scratch index for one completion-service transaction.
+///
+/// The manager owns this table so an IRQ never allocates and never places a
+/// 5-KiB descriptor index on the kernel stack. Requests are keyed by physical
+/// QID; the shared completion ring is then decoded once and the newest exact
+/// descriptor record for each requested queue is retained.
+pub(crate) struct G17PComputeCompletionBatch {
+    slots: [G17PComputeCompletionBatchSlot; G17P_COMPUTE_COMPLETION_QID_COUNT],
+}
+
+impl G17PComputeCompletionBatch {
+    pub(crate) const fn new() -> Self {
+        Self {
+            slots: [G17PComputeCompletionBatchSlot::EMPTY;
+                G17P_COMPUTE_COMPLETION_QID_COUNT],
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.slots.fill(G17PComputeCompletionBatchSlot::EMPTY);
+    }
+
+    pub(crate) fn request(
+        &mut self,
+        queue_id: u8,
+        expected_descriptor: u64,
+        last_consumed_end: u64,
+    ) -> Result {
+        if expected_descriptor == 0 {
+            return Err(EINVAL);
+        }
+        let slot = self.slots.get_mut(usize::from(queue_id)).ok_or(EINVAL)?;
+        if slot.expected_descriptor != 0 {
+            return Err(EBUSY);
+        }
+        *slot = G17PComputeCompletionBatchSlot {
+            expected_descriptor,
+            last_consumed_end,
+            ..G17PComputeCompletionBatchSlot::EMPTY
+        };
+        Ok(())
+    }
+
+    fn fold_record(&mut self, record: &[u8]) -> Result {
+        if record.len() != G17P_COMPUTE_COMPLETION_RECORD_SIZE {
+            return Err(EINVAL);
+        }
+        let field = |at: usize| -> Result<u64> {
+            Ok(u64::from_le_bytes(
+                record.get(at..at + 8).ok_or(ERANGE)?
+                    .try_into().map_err(|_| EINVAL)?,
+            ))
+        };
+        let queue_id = g17_completion::g17p_ksm_completion_queue_id(field(0x00)?);
+        let slot = self.slots.get_mut(usize::from(queue_id)).ok_or(EINVAL)?;
+        if slot.expected_descriptor == 0 {
+            return Ok(());
+        }
+        let descriptor = field(0x30)? & G17P_COMPUTE_COMPLETION_DESCRIPTOR_MASK;
+        if descriptor != slot.expected_descriptor || field(0x38)? == 0 {
+            return Ok(());
+        }
+        let pair_a_start = field(0x10)? & G17P_COMPUTE_COMPLETION_TIMESTAMP_MASK;
+        let pair_b_start = field(0x20)? & G17P_COMPUTE_COMPLETION_TIMESTAMP_MASK;
+        let pair_b_end = field(0x28)? & G17P_COMPUTE_COMPLETION_TIMESTAMP_MASK;
+        if pair_a_start == 0
+            || pair_b_end <= slot.last_consumed_end
+            || (slot.pair_b_end != 0 && pair_b_end <= slot.pair_b_end)
+        {
+            return Ok(());
+        }
+        slot.pair_a_start = pair_a_start;
+        slot.pair_b_start = pair_b_start;
+        slot.pair_b_end = pair_b_end;
+        Ok(())
+    }
+
+    pub(crate) fn take(
+        &mut self,
+        queue_id: u8,
+        expected_descriptor: u64,
+        last_consumed_end: u64,
+    ) -> Result<Option<G17PComputeCompletionCandidate>> {
+        let slot = self.slots.get_mut(usize::from(queue_id)).ok_or(EINVAL)?;
+        if slot.expected_descriptor != expected_descriptor
+            || slot.last_consumed_end != last_consumed_end
+        {
+            return Err(EIO);
+        }
+        let captured = *slot;
+        *slot = G17PComputeCompletionBatchSlot::EMPTY;
+        if captured.pair_b_end == 0 {
+            return Ok(None);
+        }
+        let interval = (captured.pair_b_start != 0
+            && captured.pair_b_start < captured.pair_b_end)
+            .then_some([captured.pair_b_start, captured.pair_b_end]);
+        Ok(Some(G17PComputeCompletionCandidate {
+            timestamps: [captured.pair_a_start, captured.pair_b_end],
+            interval,
+        }))
+    }
+}
 /// Offset of the compute completion stamp inside the queue support object.
 ///
 /// This is the word the selector-3 descriptor names at `+0x0F40`, i.e. what
@@ -13106,6 +13239,31 @@ impl G17ResourceOwner {
                 }
             }
             Ok(None)
+        })
+    }
+
+    /// Decode the shared completion ring once for every QID requested by one
+    /// service transaction. Type-1 events provide the exact QID set; the
+    /// explicit acquire also makes the identity-less/watchdog fallback a
+    /// standalone ordered observation before any queue owner is released.
+    pub(crate) fn scan_compute_completion_batch(
+        &mut self,
+        batch: &mut G17PComputeCompletionBatch,
+    ) -> Result {
+        let object = &mut self.resources.completion_ordinal_0;
+        let stride = G17P_COMPUTE_COMPLETION_RECORD_SIZE;
+        let slots = core::cmp::min(
+            object.logical_size / stride,
+            g17_initdata::G17P_KSM_COMPLETION_CAPACITY as usize,
+        );
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        object.with_bytes_mut(|bytes| {
+            for slot in 0..slots {
+                let offset = slot.checked_mul(stride).ok_or(EOVERFLOW)?;
+                let end = offset.checked_add(stride).ok_or(EOVERFLOW)?;
+                batch.fold_record(bytes.get(offset..end).ok_or(ERANGE)?)?;
+            }
+            Ok(())
         })
     }
 
