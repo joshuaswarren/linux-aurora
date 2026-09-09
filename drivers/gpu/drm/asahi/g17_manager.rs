@@ -1173,6 +1173,13 @@ pub(crate) struct G17PManagerConstruction {
     render_storage: Option<g17_resources::G17PUserRenderStorage>,
     render_tracker: Option<G17PPartialOpeningRenderTracker>,
     render_bind: Option<G17PRenderRootOwner>,
+    /// Root replaced by an in-place same-VM context update. The replacement
+    /// descriptor is not a release witness until the pair carrying that update
+    /// completes and its EventControl record is unlinked.
+    render_context_retirement: Option<G17PRenderContextRetirement>,
+    /// Number of successfully completed context-update groups on each physical
+    /// render pair. Retired graphs name the next epoch as their release fence.
+    render_context_epochs: [u64; 2],
     /// Native secure-GART view of the active render process resources in
     /// hardware context 0. It is installed only for the VM which owns the
     /// retained render graph. Replaced only after paired completion plus
@@ -1185,11 +1192,10 @@ pub(crate) struct G17PManagerConstruction {
     /// generation mapped so the incoming graph cannot immediately reuse and
     /// overwrite the same VA or PBDesc ID.
     retired_render_handoff_graph: Option<G17PRetiredRenderGraph>,
-    /// Older VM/context graphs retained for the firmware-session lifetime.
-    /// Completion-ring records are not a release fence for the descriptor
-    /// context: GMMU can issue a late PM/page-list read after that finite ring
-    /// has overwritten the descriptor pointer. Only stopping both processors
-    /// proves that firmware can no longer name the context/root.
+    /// Older VM/context graphs retained past ordinary completion. A finite
+    /// completion-ring overwrite is not a release fence; a dead owner's graph
+    /// is reclaimed only after a later context-update group on the same
+    /// physical pair reaches paired completion and EventControl unlink.
     retired_render_handoff_graphs: KVec<G17PRetiredRenderGraph>,
     /// Firmware background PB maintenance retains manager pointers beyond the
     /// command queue's paired completion and userspace queue destruction. Keep
@@ -1197,13 +1203,6 @@ pub(crate) struct G17PManagerConstruction {
     /// VmBind owners are released with the graph. Both processors stopping is
     /// the first observed global drain for these references.
     retired_parameter_managers: KVec<g17_resources::G17PRetiredParameterManagement>,
-    /// Firmware may dereference a completed descriptor after userspace queue
-    /// destruction. Keep the complete graph -- descriptor root, native
-    /// context aliases, storage, and HWPB reservation -- until both processors
-    /// stop. Retaining only the backing leaves a late context-qualified read
-    /// with no valid TTBAT root and turns safe quarantine into a poisoned
-    /// unbind.
-    retired_firmware_render_graphs: KVec<G17PRetiredRenderGraph>,
     /// Descriptor contexts whose owning DRM queue has been destroyed after
     /// its scheduler entity drained. The bit also prevents a graph which was
     /// concurrently moved into the retirement cache from escaping teardown.
@@ -1309,6 +1308,7 @@ struct G17PRenderSlotState {
     // Rust drops fields in declaration order. Retract both roots before any
     // storage/SKSM backing reachable through them can be released.
     bind: Option<G17PRenderRootOwner>,
+    context_retirement: Option<G17PRenderContextRetirement>,
     context_aliases: Option<mmu::T8140NativeContextAliases>,
     retired_handoff_graph: Option<G17PRetiredRenderGraph>,
     storage: Option<g17_resources::G17PUserRenderStorage>,
@@ -1327,6 +1327,19 @@ struct G17PRetiredRenderGraph {
     bind: G17PRenderRootOwner,
     context_aliases: Option<mmu::T8140NativeContextAliases>,
     storage: g17_resources::G17PUserRenderStorage,
+    /// A later group on this physical pair must publish and complete a context
+    /// update before this graph's context, mappings, and HWPB ID can be reused.
+    retire_after_context_epoch: u64,
+}
+
+#[cfg(not(test))]
+struct G17PRenderContextRetirement {
+    /// One Arc here keeps the replaced TTBAT root installed. The storage's old
+    /// command-context Arc may be replaced immediately because this owner
+    /// remains until the superseding group completes.
+    bind: G17PRenderRootOwner,
+    _context_aliases: Option<mmu::T8140NativeContextAliases>,
+    retire_after_context_epoch: u64,
 }
 
 #[cfg(not(test))]
@@ -1390,6 +1403,7 @@ impl G17PRenderSlotState {
         self.storage.is_some()
             || self.tracker.is_some()
             || self.bind.is_some()
+            || self.context_retirement.is_some()
             || self.retired_handoff_graph.is_some()
             || self.submission_ordinal != 0
     }
@@ -1736,6 +1750,14 @@ pub(crate) enum G17PRenderPollOutcome {
 }
 
 impl G17PManagerConstruction {
+    fn next_render_context_epoch(&self, slot: u8) -> Result<u64> {
+        self.render_context_epochs
+            .get(usize::from(slot))
+            .ok_or(EINVAL)?
+            .checked_add(1)
+            .ok_or(EOVERFLOW)
+    }
+
     fn take_active_render_slot_state(&mut self) -> G17PRenderSlotState {
         G17PRenderSlotState {
             #[cfg(CONFIG_DEV_COREDUMP)]
@@ -1743,6 +1765,7 @@ impl G17PManagerConstruction {
             storage: self.render_storage.take(),
             tracker: self.render_tracker.take(),
             bind: self.render_bind.take(),
+            context_retirement: self.render_context_retirement.take(),
             context_aliases: self.render_context_aliases.take(),
             retired_handoff_graph: self.retired_render_handoff_graph.take(),
             submission_ordinal: core::mem::take(&mut self.render_submission_ordinal),
@@ -1761,6 +1784,7 @@ impl G17PManagerConstruction {
         self.render_storage = state.storage;
         self.render_tracker = state.tracker;
         self.render_bind = state.bind;
+        self.render_context_retirement = state.context_retirement;
         self.render_context_aliases = state.context_aliases;
         self.retired_render_handoff_graph = state.retired_handoff_graph;
         self.render_submission_ordinal = state.submission_ordinal;
@@ -1884,9 +1908,6 @@ impl G17PManagerConstruction {
             KVec::with_capacity(G17P_TA_HARDWARE_BUFFER_ID_COUNT, GFP_KERNEL)?;
         let retired_parameter_managers =
             KVec::with_capacity(G17P_TA_HARDWARE_BUFFER_ID_COUNT, GFP_KERNEL)?;
-        let retired_firmware_render_graphs =
-            KVec::with_capacity(G17P_TA_HARDWARE_BUFFER_ID_COUNT, GFP_KERNEL)?;
-
         #[cfg(CONFIG_DEV_COREDUMP)]
         let trace_capture = if *module_parameters::g17p_binary_capture.value() != 0 {
             match G17PTraceDump::new(&mut resources) {
@@ -1922,11 +1943,12 @@ impl G17PManagerConstruction {
                 render_storage: None,
                 render_tracker: None,
                 render_bind: None,
+                render_context_retirement: None,
+                render_context_epochs: [0; 2],
                 render_context_aliases: None,
                 retired_render_handoff_graph: None,
                 retired_render_handoff_graphs,
                 retired_parameter_managers,
-                retired_firmware_render_graphs,
                 released_render_contexts: 0,
                 render_submission_ordinal: 0,
                 render_auxiliary_timestamp: 0,
@@ -2337,6 +2359,7 @@ impl G17PManagerConstruction {
         self.render_storage.is_some()
             || self.render_tracker.is_some()
             || self.render_bind.is_some()
+            || self.render_context_retirement.is_some()
             || self.retired_render_handoff_graph.is_some()
             || !self.retired_render_handoff_graphs.is_empty()
             || self.render_submission_ordinal != 0
@@ -2347,6 +2370,7 @@ impl G17PManagerConstruction {
         if self.render_storage.is_some()
             || self.render_tracker.is_some()
             || self.render_bind.is_some()
+            || self.render_context_retirement.is_some()
             || self.retired_render_handoff_graph.is_some()
             || !self.retired_render_handoff_graphs.is_empty()
             || self.render_submission_ordinal != 0
@@ -3150,6 +3174,8 @@ impl G17PManagerConstruction {
         }
         self.render_hardware_buffer_published = false;
         self.render_outer_channels_started = [false, false];
+        self.render_context_retirement = None;
+        self.render_context_epochs = [0; 2];
         self.render_bind = None;
         self.render_tracker = None;
         self.unreserve_render_storage_hardware_buffer_id();
@@ -3163,13 +3189,6 @@ impl G17PManagerConstruction {
             self.retired_render_handoff_graph.take(),
         );
         while let Some(retired) = self.retired_render_handoff_graphs.pop() {
-            Self::release_retired_handoff_graph(
-                &mut self.render_hardware_buffer_ids,
-                &mut self.retired_parameter_managers,
-                Some(retired),
-            );
-        }
-        while let Some(retired) = self.retired_firmware_render_graphs.pop() {
             Self::release_retired_handoff_graph(
                 &mut self.render_hardware_buffer_ids,
                 &mut self.retired_parameter_managers,
@@ -3212,6 +3231,7 @@ impl G17PManagerConstruction {
             || self.render_tracker.is_some()
             || self.render_storage.is_some()
             || self.render_context_aliases.is_some()
+            || self.render_context_retirement.is_some()
             || self.retired_render_handoff_graph.is_some()
             || !self.retired_render_handoff_graphs.is_empty()
             || self.parked_render_scheduler_active()
@@ -3357,20 +3377,46 @@ impl G17PManagerConstruction {
         });
         if same_vm_different_context {
             self.require_retired_render_owner()?;
+            let context_update_pending = self
+                .render_storage
+                .as_ref()
+                .ok_or(ENODEV)?
+                .context_update_pending();
+            // A failed pre-publication retarget may be replaced by another
+            // queue without accumulating roots: the currently selected context
+            // was never acknowledged by firmware, while the first replaced
+            // (firmware-visible) root remains owned here. Once a context update
+            // completed, however, no retirement owner may still be pending.
+            if self.render_context_retirement.is_some() && !context_update_pending {
+                return Err(EIO);
+            }
+            let retire_after_context_epoch =
+                self.next_render_context_epoch(self.active_render_slot)?;
             self.render_storage
                 .as_mut()
                 .ok_or(ENODEV)?
                 .retarget_command_context(vm, execution_context.clone())?;
-            self.render_bind = Some(G17PRenderRootOwner::Job {
-                context: execution_context,
-            });
-            self.render_context_aliases = None;
+            let previous_bind = self
+                .render_bind
+                .replace(G17PRenderRootOwner::Job {
+                    context: execution_context,
+                })
+                .ok_or(EIO)?;
+            let previous_context_aliases = self.render_context_aliases.take();
+            if self.render_context_retirement.is_none() {
+                self.render_context_retirement = Some(G17PRenderContextRetirement {
+                    bind: previous_bind,
+                    _context_aliases: previous_context_aliases,
+                    retire_after_context_epoch,
+                });
+            }
             dev_info!(
                 self.resources.dev().as_ref(),
-                "G17P render owner handoff: retained VM {} graph on pair {} retargeted to descriptor context {}\n",
+                "G17P render owner handoff: retained VM {} graph on pair {} retargeted to descriptor context {}; prior root held through context epoch {}\n",
                 vm.id(),
                 self.active_render_slot,
                 descriptor_context_id,
+                retire_after_context_epoch,
             );
             return Ok(());
         }
@@ -3514,10 +3560,13 @@ impl G17PManagerConstruction {
         } else {
             None
         };
+        let retire_after_context_epoch =
+            self.next_render_context_epoch(self.active_render_slot)?;
         let retired = G17PRetiredRenderGraph {
             bind: self.render_bind.take().ok_or(EIO)?,
             context_aliases: self.render_context_aliases.take(),
             storage: self.render_storage.take().ok_or(ENODEV)?,
+            retire_after_context_epoch,
         };
         self.retired_render_handoff_graph = Some(retired);
         if let Some(mut cached) = cached.take() {
@@ -3545,10 +3594,13 @@ impl G17PManagerConstruction {
         let Some(previous) = self.retired_render_handoff_graph.take() else {
             return Ok(());
         };
-        let context = previous.storage.descriptor_context_id();
-        if context < 64 && self.released_render_contexts & (1u64 << context) != 0 {
-            Self::quarantine_drained_render_graph(
-                &mut self.retired_firmware_render_graphs,
+        if Self::retired_render_graph_reclaimable(
+            self.render_context_epochs,
+            self.released_render_contexts,
+            &previous,
+        ) {
+            Self::release_superseded_render_graph(
+                &mut self.render_hardware_buffer_ids,
                 Some(previous),
             );
             return Ok(());
@@ -3564,22 +3616,10 @@ impl G17PManagerConstruction {
     }
 
     fn release_render_slot_context_owner(
-        retired_firmware_render_graphs: &mut KVec<G17PRetiredRenderGraph>,
         state: &mut G17PRenderSlotState,
         context: u16,
         retired_witness: bool,
     ) -> Result {
-        let matches = |graph: &G17PRetiredRenderGraph| {
-            graph.storage.descriptor_context_id() == context
-        };
-        if state.retired_handoff_graph.as_ref().is_some_and(matches) {
-            let graph = state.retired_handoff_graph.take();
-            Self::quarantine_drained_render_graph(
-                retired_firmware_render_graphs,
-                graph,
-            );
-        }
-
         if !state
             .storage
             .as_ref()
@@ -3617,33 +3657,11 @@ impl G17PManagerConstruction {
     /// Mark every graph belonging to a DRM queue after its scheduler entity
     /// has drained. Completed active graphs remain installed on their bounded
     /// physical pairs and can be retargeted to the next queue in the same VM;
-    /// already-retired graphs still follow processor-stop quarantine.
+    /// an already-retired graph remains whole until a later context-update
+    /// group on its physical pair reaches paired completion.
     pub(crate) fn release_render_context_owner(&mut self, context: u16) {
         if context >= 64 { return; }
         self.released_render_contexts |= 1u64 << context;
-        let matches = |graph: &G17PRetiredRenderGraph| {
-            graph.storage.descriptor_context_id() == context
-        };
-        if self.retired_render_handoff_graph.as_ref().is_some_and(matches) {
-            let graph = self.retired_render_handoff_graph.take();
-            Self::quarantine_drained_render_graph(
-                &mut self.retired_firmware_render_graphs,
-                graph,
-            );
-        }
-        let mut index = 0;
-        while index < self.retired_render_handoff_graphs.len() {
-            if !matches(&self.retired_render_handoff_graphs[index]) {
-                index += 1;
-                continue;
-            }
-            if let Ok(graph) = self.retired_render_handoff_graphs.remove(index) {
-                Self::quarantine_drained_render_graph(
-                    &mut self.retired_firmware_render_graphs,
-                    Some(graph),
-                );
-            }
-        }
 
         // Move the selected slot through the same helper as parked slots so
         // there is only one ownership transaction to audit.
@@ -3654,7 +3672,6 @@ impl G17PManagerConstruction {
         let active_retired = !active_matches || self.require_retired_render_owner().is_ok();
         let mut active = self.take_active_render_slot_state();
         let active_release = Self::release_render_slot_context_owner(
-            &mut self.retired_firmware_render_graphs,
             &mut active,
             context,
             active_retired,
@@ -3664,7 +3681,6 @@ impl G17PManagerConstruction {
         let mut release_error = active_release.err();
         for state in self.parked_render_slots.iter_mut().flatten() {
             if let Err(error) = Self::release_render_slot_context_owner(
-                &mut self.retired_firmware_render_graphs,
                 state,
                 context,
                 true,
@@ -3680,13 +3696,133 @@ impl G17PManagerConstruction {
                 error,
             );
         }
+        self.reclaim_released_superseded_render_graphs();
+    }
+
+    fn retired_render_graph_reclaimable(
+        completed_epochs: [u64; 2],
+        released_contexts: u64,
+        graph: &G17PRetiredRenderGraph,
+    ) -> bool {
+        let context = graph.storage.descriptor_context_id();
+        let slot = usize::from(graph.storage.queue_pair().slot());
+        context < 64
+            && released_contexts & (1u64 << context) != 0
+            && completed_epochs
+                .get(slot)
+                .is_some_and(|epoch| *epoch >= graph.retire_after_context_epoch)
+    }
+
+    /// Drop a graph only after a later context-update group on the same
+    /// physical pair completed and unlinked its EventControl. Unlike ordinary
+    /// command completion, that is a positive firmware witness that both queue
+    /// records now name the successor context. PM storage may drop with the
+    /// graph; keeping it in the processor-stop quarantine would turn bounded
+    /// client churn into a permanent memory leak.
+    fn release_superseded_render_graph(
+        ids: &mut G17PHardwareBufferIdAllocator,
+        retired: Option<G17PRetiredRenderGraph>,
+    ) {
+        let Some(retired) = retired else { return };
+        if let Some(id) = retired.storage.retained_hardware_buffer_id() {
+            ids.unreserve(id);
+        }
+        drop(retired);
+    }
+
+    fn reclaim_released_superseded_render_graphs(&mut self) {
+        let epochs = self.render_context_epochs;
+        let released = self.released_render_contexts;
+        if self
+            .retired_render_handoff_graph
+            .as_ref()
+            .is_some_and(|graph| {
+                Self::retired_render_graph_reclaimable(epochs, released, graph)
+            })
+        {
+            let graph = self.retired_render_handoff_graph.take();
+            Self::release_superseded_render_graph(
+                &mut self.render_hardware_buffer_ids,
+                graph,
+            );
+        }
+
+        let mut index = 0;
+        while index < self.retired_render_handoff_graphs.len() {
+            if !Self::retired_render_graph_reclaimable(
+                epochs,
+                released,
+                &self.retired_render_handoff_graphs[index],
+            ) {
+                index += 1;
+                continue;
+            }
+            if let Ok(graph) = self.retired_render_handoff_graphs.remove(index) {
+                Self::release_superseded_render_graph(
+                    &mut self.render_hardware_buffer_ids,
+                    Some(graph),
+                );
+            }
+        }
+
+        for slot in 0..self.parked_render_slots.len() {
+            let reclaim = self.parked_render_slots[slot]
+                .as_ref()
+                .and_then(|state| state.retired_handoff_graph.as_ref())
+                .is_some_and(|graph| {
+                    Self::retired_render_graph_reclaimable(epochs, released, graph)
+                });
+            if reclaim {
+                let graph = self.parked_render_slots[slot]
+                    .as_mut()
+                    .and_then(|state| state.retired_handoff_graph.take());
+                Self::release_superseded_render_graph(
+                    &mut self.render_hardware_buffer_ids,
+                    graph,
+                );
+            }
+        }
+    }
+
+    /// Commit one per-pair context-supersession epoch. This runs only after the
+    /// normal executed paired-completion path has also observed EventControl
+    /// unlink; an abandoned/unexecuted group deliberately does not advance it.
+    fn complete_render_context_update_retirement(&mut self) -> Result {
+        let context_update = self
+            .render_storage
+            .as_ref()
+            .ok_or(ENODEV)?
+            .context_update_pending();
+        if !context_update {
+            if self.render_context_retirement.is_some() {
+                return Err(EIO);
+            }
+            return Ok(());
+        }
+        let slot = usize::from(self.active_render_slot);
+        let next = self.next_render_context_epoch(self.active_render_slot)?;
+        if self
+            .render_context_retirement
+            .as_ref()
+            .is_some_and(|retirement| retirement.retire_after_context_epoch != next)
+        {
+            return Err(EIO);
+        }
+        self.render_storage
+            .as_mut()
+            .ok_or(ENODEV)?
+            .complete_context_update();
+        self.render_context_epochs[slot] = next;
+        self.render_context_retirement = None;
+        self.reclaim_released_superseded_render_graphs();
+        Ok(())
     }
 
     fn prune_unreferenced_retired_render_graphs(&mut self) -> Result {
         // Deliberately no completion-ring pruning. That ring is a diagnostic
         // history, not the native work-queue/descriptor event which owns the
-        // context. The bounded vector and HWPB allocator make exhaustion fail
-        // before publication; processor stop performs the only proven drain.
+        // context. Reclamation is instead driven by the later context-update
+        // epoch committed at paired completion and EventControl unlink.
         Ok(())
     }
 
@@ -3706,28 +3842,6 @@ impl G17PManagerConstruction {
             ids.unreserve(id);
         }
         drop(retired);
-    }
-
-    /// Queue destruction is neither a root nor a firmware-memory retirement
-    /// boundary for an already-retired handoff graph. v18o proved that firmware
-    /// can dereference a completed graph after its userspace owner is gone.
-    /// Such a read is context-qualified, so retaining only the backing while
-    /// retracting its TTBAT root is still a use-after-unbind. Keep the complete
-    /// retired graph until both processors stop.
-    fn quarantine_drained_render_graph(
-        retired_firmware_render_graphs: &mut KVec<G17PRetiredRenderGraph>,
-        retired: Option<G17PRetiredRenderGraph>,
-    ) {
-        let Some(retired) = retired else { return };
-        if let Err(error) = retired_firmware_render_graphs.push_within_capacity(retired) {
-            // A firmware-visible graph must never become a use-after-free or
-            // use-after-unbind because the session quarantine reached its
-            // diagnostic bound.
-            core::mem::forget(error.0);
-            pr_err!(
-                "G17P render: retired firmware-graph quarantine exhausted; retaining graph permanently\n"
-            );
-        }
     }
 
     fn quarantine_retired_parameter_management(
@@ -5893,6 +6007,11 @@ impl G17PManagerConstruction {
                 return Some((bind, "active"));
             }
         }
+        if let Some(retirement) = self.render_context_retirement.as_ref().filter(|retirement| {
+            retirement.bind.root_slot().ok() == Some(descriptor_context_id)
+        }) {
+            return Some((&retirement.bind, "active-context-retirement"));
+        }
         if let Some(graph) = self
             .retired_render_handoff_graph
             .as_ref()
@@ -5919,6 +6038,11 @@ impl G17PManagerConstruction {
                 .filter(|graph| matches(&graph.storage))
             {
                 return Some((&graph.bind, "parked-quarantine"));
+            }
+            if let Some(retirement) = state.context_retirement.as_ref().filter(|retirement| {
+                retirement.bind.root_slot().ok() == Some(descriptor_context_id)
+            }) {
+                return Some((&retirement.bind, "parked-context-retirement"));
             }
         }
         None
@@ -6673,6 +6797,11 @@ impl G17PManagerConstruction {
                         );
                     }
                 }
+                // Validate and commit the context-retirement epoch before the
+                // ordinary occupancy transaction starts mutating allocator
+                // state. Every fallible retirement precondition is therefore
+                // checked before an HWPB lease or queue producer is changed.
+                self.complete_render_context_update_retirement()?;
                 // Native TA/3D complete subtract completed kicks from queue
                 // +44. Prepare both results before mutating either queue;
                 // timestamps and previous-stamp history must never reset.
@@ -6691,10 +6820,6 @@ impl G17PManagerConstruction {
                     queues.tiling.producer = ta;
                     queues.fragment.producer = fragment;
                 }
-                self.render_storage
-                    .as_mut()
-                    .ok_or(ENODEV)?
-                    .complete_context_update();
                 self.render_hardware_buffer_id = None;
                 self.render_tracker = None;
                 self.render_hardware_buffer_published = false;
