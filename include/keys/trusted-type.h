@@ -83,8 +83,10 @@ struct trusted_key_source {
 
 extern struct key_type key_type_trusted;
 
-#ifdef CONFIG_TRUSTED_KEYS_DEBUG
-extern bool trusted_debug;
+int register_trusted_key_source(struct trusted_key_source *src);
+void unregister_trusted_key_source(struct trusted_key_source *src);
+
+#define TRUSTED_DEBUG 0
 
 static inline void dump_payload(struct trusted_key_payload *p)
 {
