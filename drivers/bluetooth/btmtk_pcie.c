@@ -19,6 +19,7 @@
 #include <linux/timer.h>
 #include <linux/unaligned.h>
 #include <linux/wait.h>
+#include <linux/workqueue.h>
 
 #include <net/bluetooth/bluetooth.h>
 #include <net/bluetooth/hci_core.h>
@@ -221,6 +222,7 @@ struct btmtk_pcie_dev {
 	struct mutex sleep_lock; /* Serialize wake and system-power transitions. */
 	wait_queue_head_t ipc_wait;
 	struct timer_list ipc_timer;
+	struct work_struct firmware_work;
 	struct hci_dev *hdev;
 	u8 ipc_state;
 	u8 remote_status;
@@ -244,6 +246,15 @@ struct btmtk_pcie_dev {
 	bool system_suspended;
 	bool stopping;
 };
+
+/* Gate 4 normally waits synchronously for the Bluetooth image response.  On
+ * J700 macOS starts both halves of the shared Sunrise package concurrently;
+ * this diagnostic mode schedules gate 4 before the WLAN driver binds so the
+ * package can reach its joint post-boot state instead of serializing two
+ * mutually dependent firmware starts.
+ */
+static bool shared;
+module_param(shared, bool, 0444);
 
 static bool probe_remap;
 module_param(probe_remap, bool, 0444);
@@ -2002,6 +2013,27 @@ static int btmtk_pcie_read_chip_id(struct btmtk_pcie_dev *bdev, u32 *chip_id)
 	return 0;
 }
 
+static void btmtk_pcie_firmware_work(struct work_struct *work)
+{
+	struct btmtk_pcie_dev *bdev =
+		container_of(work, struct btmtk_pcie_dev, firmware_work);
+	int err;
+
+	if (READ_ONCE(bdev->stopping))
+		return;
+	err = btmtk_pcie_activate_firmware(bdev);
+	if (err) {
+		dev_err(&bdev->pdev->dev,
+			"J700_MT793B_SHARED_PACKAGE_FAIL: stage=firmware-activation ret=%d\n",
+			err);
+		if (apple_attach)
+			btmtk_pcie_quiesce(bdev);
+	} else {
+		dev_info(&bdev->pdev->dev,
+			 "J700_MT793B_SHARED_PACKAGE_PASS: firmware_active=1 concurrent_wlan=1\n");
+	}
+}
+
 static int btmtk_pcie_probe(struct pci_dev *pdev,
 			    const struct pci_device_id *id)
 {
@@ -2049,6 +2081,7 @@ static int btmtk_pcie_probe(struct pci_dev *pdev,
 	mutex_init(&bdev->sleep_lock);
 	init_waitqueue_head(&bdev->ipc_wait);
 	timer_setup(&bdev->ipc_timer, btmtk_pcie_ipc_timer, 0);
+	INIT_WORK(&bdev->firmware_work, btmtk_pcie_firmware_work);
 	pci_set_drvdata(pdev, bdev);
 
 	pci_read_config_word(pdev, PCI_COMMAND, &command);
@@ -2091,6 +2124,11 @@ static int btmtk_pcie_probe(struct pci_dev *pdev,
 	if (load_radio_config && !enable_hci) {
 		dev_err(&pdev->dev,
 			"J700_MT793B_PCIE_GATE_FAIL: stage=radio-config-prerequisite require_hci=1\n");
+		return -EINVAL;
+	}
+	if (shared && gate != 4) {
+		dev_err(&pdev->dev,
+			"J700_MT793B_PCIE_GATE_FAIL: stage=shared-prerequisite require_gate=4\n");
 		return -EINVAL;
 	}
 
@@ -2207,6 +2245,12 @@ static int btmtk_pcie_probe(struct pci_dev *pdev,
 			return 0;
 	}
 	if (activate_firmware) {
+		if (shared) {
+			schedule_work(&bdev->firmware_work);
+			dev_info(&pdev->dev,
+				 "J700_MT793B_SHARED_PACKAGE_BEGIN: gate=4 async=1 wlan_can_bind=1\n");
+			return 0;
+		}
 		err = btmtk_pcie_activate_firmware(bdev);
 		if (err) {
 			dev_err(&pdev->dev,
@@ -2256,6 +2300,7 @@ static void btmtk_pcie_remove(struct pci_dev *pdev)
 	struct hci_dev *hdev;
 
 	if (bdev) {
+		cancel_work_sync(&bdev->firmware_work);
 		/* Keep transport live through HCI unregister, as Sunrise does. */
 		hdev = btmtk_pcie_detach_hci(bdev);
 		btmtk_pcie_quiesce(bdev);

@@ -20,33 +20,46 @@ struct dcp_h17p_swap_info_request {
 	u8 padding[3];
 } __packed;
 
+struct dcp_h17p_read_edt_string_reply {
+	u8 value[0x40];
+	__le32 count;
+	u8 ret;
+	u8 padding[3];
+} __packed;
+
 static_assert(sizeof(struct dcp_h17p_hotplug_request) == 0x58);
 static_assert(sizeof(struct dcp_h17p_swap_info_request) == 0xe4);
+static_assert(sizeof(struct dcp_h17p_read_edt_string_reply) == 0x48);
 
 static const struct dcp_method_entry dcp_methods[dcpep_num_methods] = {
 	IOMFB_METHOD("A000", dcpep_late_init_signal),
 	IOMFB_METHOD("A024", dcpep_setup_video_limits),
-	IOMFB_METHOD("A136", iomfbep_a131_pmu_service_matched),
-	IOMFB_METHOD("A137", iomfbep_a132_backlight_service_matched),
 	IOMFB_METHOD("A389", dcpep_set_create_dfb),
-	IOMFB_METHOD("A390", iomfbep_a358_vi_set_temperature_hint),
+	IOMFB_METHOD("A386", iomfbep_a358_vi_set_temperature_hint),
+	IOMFB_METHOD("A131", iomfbep_a131_pmu_service_matched),
+	IOMFB_METHOD("A132", iomfbep_a132_backlight_service_matched),
 	IOMFB_METHOD("A401", dcpep_start_signal),
 	IOMFB_METHOD("A406", dcpep_swap_start),
-	IOMFB_METHOD("A407", dcpep_swap_submit),
+	/* swap_start moved A407 -> A406 on H17P, but swap_submit did NOT
+	 * move with it: macOS 25G83 issues A406 then A408 for every swap.
+	 * Across 20 traced boots (1579 swaps in the longest) A407 is never
+	 * called even once, and the A408 response is 0x0c bytes, matching
+	 * dcp_swap_submit_resp_h17p exactly. */
+	IOMFB_METHOD("A408", dcpep_swap_submit),
 	IOMFB_METHOD("A411", dcpep_set_display_device),
 	IOMFB_METHOD("A412", dcpep_is_main_display),
 	IOMFB_METHOD("A413", dcpep_set_digital_out_mode),
 	IOMFB_METHOD("A423", iomfbep_set_matrix),
 	IOMFB_METHOD("A427", iomfbep_get_color_remap_mode),
-	IOMFB_METHOD("A449", dcpep_set_parameter_dcp),
-	IOMFB_METHOD("A453", dcpep_create_default_fb),
-	IOMFB_METHOD("A457", dcpep_enable_disable_video_power_savings),
-	IOMFB_METHOD("A465", dcpep_first_client_open),
-	IOMFB_METHOD("A466", iomfbep_last_client_close),
-	IOMFB_METHOD("A474", dcpep_set_display_refresh_properties),
-	IOMFB_METHOD("A477", dcpep_flush_supports_power),
-	IOMFB_METHOD("A478", iomfbep_abort_swaps_dcp),
-	IOMFB_METHOD("A483", dcpep_set_power_state),
+	IOMFB_METHOD("A442", dcpep_set_parameter_dcp),
+	IOMFB_METHOD("A446", dcpep_create_default_fb),
+	IOMFB_METHOD("A450", dcpep_enable_disable_video_power_savings),
+	IOMFB_METHOD("A457", dcpep_first_client_open),
+	IOMFB_METHOD("A458", iomfbep_last_client_close),
+	IOMFB_METHOD("A465", dcpep_set_display_refresh_properties),
+	IOMFB_METHOD("A468", dcpep_flush_supports_power),
+	IOMFB_METHOD("A469", iomfbep_abort_swaps_dcp),
+	IOMFB_METHOD("A473", dcpep_set_power_state),
 };
 
 #define DCP_FW h17p
@@ -95,6 +108,30 @@ static bool trampoline_get_frequency_h17p(struct apple_dcp *dcp, int tag,
 	return true;
 }
 
+static struct dcp_get_uint_prop_resp
+dcpep_cb_get_uint_prop_h17p(struct apple_dcp *dcp, struct dcp_get_uint_prop_req *request)
+{
+	struct dcp_get_uint_prop_resp reply;
+
+	if (memcmp(request->obj, "SUMP", sizeof(request->obj)) ||
+	    strncmp(request->key, "Temperature", sizeof(request->key)))
+		return dcpep_cb_get_uint_prop(dcp, request);
+
+	reply = (struct dcp_get_uint_prop_resp) {
+		.value = 3029,
+		.ret = true,
+	};
+	dev_info(dcp->dev,
+		 "DCP25G83_SUMP_TEMPERATURE_REPLY value %llu ret %u\n",
+		 reply.value, reply.ret);
+
+	return reply;
+}
+
+TRAMPOLINE_INOUT(trampoline_get_uint_prop_h17p,
+		 dcpep_cb_get_uint_prop_h17p,
+		 struct dcp_get_uint_prop_req, struct dcp_get_uint_prop_resp);
+
 static bool trampoline_hotplug_h17p(struct apple_dcp *dcp, int tag,
 				    void *out, void *in)
 {
@@ -117,41 +154,73 @@ static bool trampoline_swap_info_h17p(struct apple_dcp *dcp, int tag,
 	return true;
 }
 
-static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
+static bool trampoline_core_analytics_h17p(struct apple_dcp *dcp, int tag,
+					    void *out, void *in)
+{
+	/* The AP does not consume DCP's analytics dictionary. */
+	trace_iomfb_callback(dcp, tag, __func__);
+	memset(out, 0, 0x1004);
+	return true;
+}
+
+static bool trampoline_read_edt_string_h17p(struct apple_dcp *dcp, int tag,
+					     void *out, void *in)
+{
+	struct dcp_h17p_read_edt_string_reply *reply = out;
+
+	trace_iomfb_callback(dcp, tag, __func__);
+	memset(reply, 0, sizeof(*reply));
+	return true;
+}
+
+static const iomfb_cb_handler cb_handlers_c3[IOMFB_MAX_CB] = {
 	[0] = trampoline_true, /* did_boot_signal */
 	[1] = trampoline_true, /* did_power_on_signal */
 	[2] = trampoline_nop, /* will_power_off_signal */
 	[3] = trampoline_rt_bandwidth_h17p,
 	[6] = trampoline_set_frame_sync_props,
-	[100] = iomfbep_cb_match_pmu_service,
+	[100] = dcp_link_defer_service_match, /* match_pmu_service */
 	[101] = trampoline_zero, /* get_display_default_stride */
 	[102] = trampoline_nop, /* set_number_property */
 	[103] = trampoline_nop, /* trigger_user_cal_loader */
 	[104] = trampoline_nop, /* set_boolean_property */
+	/*
+	 * The c3 firmware sends D108..D113 as boolean creates during start().
+	 * These slots and shapes are preserved from the 25G83 wire capture;
+	 * answering D112 false made start() never complete.
+	 */
 	[107] = trampoline_true, /* create_provider_service */
 	[108] = trampoline_true, /* create_product_service */
-	[109] = trampoline_true, /* create_pmu_service */
+	[109] = trampoline_true, /* create_PMU_service */
 	[110] = trampoline_true, /* create_iomfb_service */
-	[111] = trampoline_create_backlight_service,
+	[111] = trampoline_true, /* create_backlight_service */
 	[112] = trampoline_true, /* create_nvram_service */
-	[114] = trampoline_get_tiling_state,
-	[115] = trampoline_false, /* set_tiling_state */
-	[120] = dcpep_cb_boot_1,
-	[121] = trampoline_false, /* is_dark_boot */
-	[122] = trampoline_false, /* is_waking_from_hibernate */
-	[124] = trampoline_read_edt_data,
-	[126] = trampoline_prop_start,
-	[127] = trampoline_prop_chunk,
-	[128] = trampoline_prop_end,
-	[129] = trampoline_allocate_bandwidth,
+	[113] = trampoline_true, /* create-shaped boolean (native D113 region) */
+	[114] = trampoline_core_analytics_h17p,
+	[115] = trampoline_get_tiling_state,
+	[116] = trampoline_false, /* set_tiling_state */
+	[117] = trampoline_nop, /* set_idle_caching_state_ap */
+	[118] = trampoline_zero, /* upload_trace_start */
+	[119] = trampoline_zero, /* upload_trace_chunk */
+	[120] = trampoline_zero, /* upload_trace_end */
+	[121] = dcpep_cb_boot_1,
+	[122] = trampoline_false, /* is_dark_boot */
+	[123] = trampoline_false, /* is_waking_from_hibernate */
+	[124] = trampoline_zero, /* detect_fastsim */
+	[125] = trampoline_read_edt_data,
+	[126] = trampoline_read_edt_string_h17p,
+	[127] = trampoline_prop_start,
+	[128] = trampoline_prop_chunk,
+	[129] = trampoline_prop_end,
+	[130] = trampoline_allocate_bandwidth,
 	[201] = trampoline_map_piodma,
 	[202] = trampoline_unmap_piodma,
-	[206] = iomfbep_cb_match_pmu_service_2,
-	[207] = iomfbep_cb_match_backlight_service,
+	[206] = dcp_link_defer_service_match, /* match_pmu_service_2 */
+	[207] = dcp_link_defer_service_match, /* match_backlight_service */
 	[208] = trampoline_nop, /* update_backlight_factor_prop */
 	[209] = trampoline_get_time,
 	[300] = trampoline_pr_publish,
-	[401] = trampoline_get_uint_prop,
+	[401] = trampoline_get_uint_prop_h17p,
 	[404] = trampoline_nop, /* set_uint_prop */
 	[406] = trampoline_set_fx_prop,
 	[408] = trampoline_get_frequency_h17p,
@@ -186,7 +255,14 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 
 void iomfb_start_h17p(struct apple_dcp *dcp)
 {
-	dcp->cb_handlers = cb_handlers;
+	if (dcp->link_abi != APPLE_DCP_LINK_ABI_C3) {
+		dev_err(dcp->dev, "refusing unknown H17P DCPLink ABI %#x\n",
+			dcp->link_abi);
+		return;
+	}
+
+	dcp->cb_handlers = cb_handlers_c3;
+	dev_info(dcp->dev, "DCP25G83_SUMP_TEMPERATURE_3029 armed\n");
 	dcp_start_signal(dcp, false, dcp_started, NULL);
 }
 

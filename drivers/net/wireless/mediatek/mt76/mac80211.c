@@ -432,6 +432,7 @@ mt76_phy_init(struct mt76_phy *phy, struct ieee80211_hw *hw)
 	INIT_LIST_HEAD(&phy->tx_list);
 	spin_lock_init(&phy->tx_lock);
 	INIT_DELAYED_WORK(&phy->roc_work, mt76_roc_complete_work);
+	skb_queue_head_init(&phy->scan_pending);
 
 	if ((void *)phy != hw->priv)
 		return 0;
@@ -609,6 +610,7 @@ void mt76_unregister_phy(struct mt76_phy *phy)
 		mt76_led_cleanup(phy);
 	mt76_tx_status_check(dev, true);
 	ieee80211_unregister_hw(phy->hw);
+	skb_queue_purge(&phy->scan_pending);
 	dev->phys[phy->band_idx] = NULL;
 }
 EXPORT_SYMBOL_GPL(mt76_unregister_phy);
@@ -814,6 +816,8 @@ int mt76_register_device(struct mt76_dev *dev, bool vht,
 	mt76_check_sband(&dev->phy, &phy->sband_2g, NL80211_BAND_2GHZ);
 	mt76_check_sband(&dev->phy, &phy->sband_5g, NL80211_BAND_5GHZ);
 	mt76_check_sband(&dev->phy, &phy->sband_6g, NL80211_BAND_6GHZ);
+	if (dev->custom_regd)
+		wiphy_apply_custom_regulatory(hw->wiphy, dev->custom_regd);
 
 	if (IS_ENABLED(CONFIG_MT76_LEDS)) {
 		ret = mt76_led_init(phy);
@@ -845,6 +849,7 @@ void mt76_unregister_device(struct mt76_dev *dev)
 	mt76_tx_status_check(dev, true);
 	mt76_wcid_cleanup(dev, &dev->global_wcid);
 	ieee80211_unregister_hw(hw);
+	skb_queue_purge(&dev->phy.scan_pending);
 }
 EXPORT_SYMBOL_GPL(mt76_unregister_device);
 

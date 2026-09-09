@@ -2711,7 +2711,7 @@ static void __exit samsung_serial_exit(void)
 	s3c24xx_serial_unregister_console();
 }
 
-module_init(samsung_serial_init);
+subsys_initcall(samsung_serial_init);
 module_exit(samsung_serial_exit);
 
 #ifdef CONFIG_SERIAL_SAMSUNG_CONSOLE

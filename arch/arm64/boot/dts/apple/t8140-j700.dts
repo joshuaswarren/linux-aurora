@@ -192,6 +192,36 @@
 
 &pinctrl_ap {
 	status = "okay";
+
+	/*
+	 * Fail-closed speaker amplifier gate.  Exact J700 ADT
+	 * /arm-io/iop-audio-controller/audio-speaker function-reset is
+	 * GPIO pin 105 with descriptor 0x00010001.  In 25G76,
+	 * AppleMAX98360Amp::SetMuteControl(1) reaches
+	 * AppleARMGPIOFunction::callFunction(), which drives this pin low;
+	 * unmute drives it high.  Reserve it as a physical-low hog so Linux
+	 * cannot emit speaker output while AOP/LSM/CPMS protection is absent.
+	 * This node intentionally provides no runtime unmute interface.
+	 */
+	j700_speaker_amp_enable_hog: speaker-amp-enable-hog {
+		gpio-hog;
+		gpios = <105 GPIO_ACTIVE_HIGH>;
+		output-low;
+		line-name = "j700-speaker-amp-enable";
+	};
+};
+
+&smc_mbox {
+	status = "okay";
+};
+
+&smc {
+	status = "okay";
+
+	/* T8140 has no described SMC NVMEM provider; restart does not need it. */
+	reboot {
+		compatible = "apple,smc-reboot";
+	};
 };
 
 &qspi {
@@ -410,6 +440,11 @@
 
 &smc {
 	status = "okay";
+
+	/* T8140 has no described SMC NVMEM provider; restart does not need it. */
+	reboot {
+		compatible = "apple,smc-reboot";
+	};
 };
 
 /*

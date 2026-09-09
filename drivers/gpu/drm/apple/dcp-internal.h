@@ -140,6 +140,7 @@ struct apple_dcp {
 	void __iomem *iop_vbar_reg;
 	bool fresh_boot_cpu_started;
 	bool adopted_session;
+	bool adopted_session_module_pinned;
 
 	/* DCP has crashed */
 	bool crashed;
@@ -162,9 +163,23 @@ struct apple_dcp {
 	bool shmem_inherited;
 	u32 link_top[2][APPLE_DCP_LINK_STREAMS_PER_SIDE];
 	u16 link_version;
+	enum apple_dcp_link_abi link_abi;
 	u32 link_firmware_hash;
+	u64 link_init_message;
+	u16 link_rx_log_count;
+	u16 link_reply_log_count;
+	u32 link_d563_a2i_before[5];
+	u32 link_d563_a2i_after[5];
+	u8 link_d563_a2i_count;
+	bool link_d563_a2i_ep1_observed;
+	/* Serializes firmware type0 with the inherited-session timed INIT. */
+	struct mutex link_init_lock;
 	enum apple_dcp_link_state link_state;
 	bool link_endpoint_started;
+	struct work_struct link_service_match_work;
+	unsigned long link_service_match_state;
+	__le32 *link_service_match_output;
+	int link_service_match_callback_tag;
 
 	/* Display registers mappable to the DCP */
 	struct resource *disp_registers[MAX_DISP_REGISTERS];
@@ -290,6 +305,8 @@ struct apple_dcp {
 };
 
 void dcp_drm_crtc_page_flip(struct apple_dcp *dcp, ktime_t now);
+void iomfb_link_timeout_snapshot(struct apple_dcp *dcp);
+void iomfb_d563_a2i_ep1_snapshot(struct apple_dcp *dcp);
 
 int dcp_backlight_register(struct apple_dcp *dcp);
 int dcp_backlight_update(struct apple_dcp *dcp);

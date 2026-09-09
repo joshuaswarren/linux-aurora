@@ -5,6 +5,7 @@
 #include <linux/etherdevice.h>
 #include <linux/timekeeping.h>
 #include "mt7921.h"
+#include "mt7932_mcu_lab.h"
 #include "../dma.h"
 #include "../mt76_connac2_mac.h"
 #include "mcu.h"
@@ -14,6 +15,11 @@
 #define MT_WTBL_TXRX_RATE_G2		12
 
 #define MT_WTBL_AC0_CTT_OFFSET		20
+
+static bool mt7932_native_rx_trace;
+module_param_named(j700_native_rx_trace, mt7932_native_rx_trace, bool, 0600);
+MODULE_PARM_DESC(j700_native_rx_trace,
+		 "trace J700 native RX3 descriptors and parser results");
 
 bool mt7921_mac_wtbl_update(struct mt792x_dev *dev, int idx, u32 mask)
 {
@@ -266,6 +272,11 @@ mt7921_mac_fill_rx(struct mt792x_dev *dev, struct sk_buff *skb)
 		fc = cpu_to_le16(FIELD_GET(MT_RXD6_FRAME_CONTROL, v0));
 		seq_ctrl = FIELD_GET(MT_RXD8_SEQ_CTRL, v2);
 		qos_ctl = FIELD_GET(MT_RXD8_QOS_CTL, v2);
+		if (is_mt7932(&dev->mt76) && ieee80211_is_auth(fc))
+			dev_info(dev->mt76.dev,
+				 "J700_MT7932_AUTH_RX_RAW: rxd=%08x/%08x/%08x/%08x/%08x frame_control=0x%04x wlan_idx=%u unicast=%u\n",
+				 rxd0, rxd1, rxd2, rxd3, rxd4,
+				 le16_to_cpu(fc), idx, unicast);
 
 		rxd += 4;
 		if ((u8 *)rxd - skb->data >= skb->len)
@@ -420,6 +431,12 @@ mt7921_mac_fill_rx(struct mt792x_dev *dev, struct sk_buff *skb)
 
 		hdr = mt76_skb_get_hdr(skb);
 		fc = hdr->frame_control;
+		if (is_mt7932(&dev->mt76) && ieee80211_is_auth(fc))
+			dev_info(dev->mt76.dev,
+				 "J700_MT7932_AUTH_RX_DELIVER: bytes=%u frame_control=0x%04x wlan_idx=%u status_wcid=%u flags=0x%x\n",
+				 skb->len, le16_to_cpu(fc), idx,
+				 status->wcid ? status->wcid->idx : 0xffff,
+				 status->flag);
 		if (ieee80211_is_data_qos(fc)) {
 			seq_ctrl = le16_to_cpu(hdr->seq_ctrl);
 			qos_ctl = *ieee80211_get_qos_ctl(hdr);
@@ -433,12 +450,13 @@ mt7921_mac_fill_rx(struct mt792x_dev *dev, struct sk_buff *skb)
 	if (rxv && mode >= MT_PHY_TYPE_HE_SU && !(status->flag & RX_FLAG_8023))
 		mt76_connac2_mac_decode_he_radiotap(&dev->mt76, skb, rxv, mode);
 
+	status->retry = ieee80211_has_retry(fc);
+	status->seqno = IEEE80211_SEQ_TO_SN(seq_ctrl);
+	status->qos_ctl = qos_ctl;
 	if (!status->wcid || !ieee80211_is_data_qos(fc))
 		return 0;
 
 	status->aggr = unicast && !ieee80211_is_qos_nullfunc(fc);
-	status->seqno = IEEE80211_SEQ_TO_SN(seq_ctrl);
-	status->qos_ctl = qos_ctl;
 
 	return 0;
 }
@@ -456,6 +474,20 @@ void mt7921_mac_add_txs(struct mt792x_dev *dev, void *data)
 
 	wcidx = le32_get_bits(txs_data[2], MT_TXS2_WCID);
 	pid = le32_get_bits(txs_data[3], MT_TXS3_PID);
+	if (is_mt7932(&dev->mt76) && wcidx == 1)
+		dev_info(dev->mt76.dev,
+			 "J700_MT7932_AUTH_TX_STATUS: wcid=%u pid=%u ack_timeout=%u rts_timeout=%u queue_timeout=%u txop_timeout=%u ba_error=%u txs=%08x/%08x/%08x/%08x/%08x/%08x/%08x/%08x\n",
+			 wcidx, pid,
+			 !!(le32_to_cpu(txs_data[0]) & MT_TXS0_ACK_TIMEOUT),
+			 !!(le32_to_cpu(txs_data[0]) & MT_TXS0_RTS_TIMEOUT),
+			 !!(le32_to_cpu(txs_data[0]) & MT_TXS0_QUEUE_TIMEOUT),
+			 !!(le32_to_cpu(txs_data[0]) & MT_TXS0_TXOP_TIMEOUT),
+			 !!(le32_to_cpu(txs_data[0]) & MT_TXS0_BA_ERROR),
+			 le32_to_cpu(txs_data[0]),
+			 le32_to_cpu(txs_data[1]), le32_to_cpu(txs_data[2]),
+			 le32_to_cpu(txs_data[3]), le32_to_cpu(txs_data[4]),
+			 le32_to_cpu(txs_data[5]), le32_to_cpu(txs_data[6]),
+			 le32_to_cpu(txs_data[7]));
 
 	if (pid < MT_PACKET_ID_FIRST)
 		return;
@@ -468,6 +500,19 @@ void mt7921_mac_add_txs(struct mt792x_dev *dev, void *data)
 	wcid = mt76_wcid_ptr(dev, wcidx);
 	if (!wcid)
 		goto out;
+	if (wcid->tx_info & MT_WCID_TX_INFO_J700_FULLMAC)
+		dev_info(dev->mt76.dev,
+			 "J700_MT7932_FULLMAC_TX_STATUS: wcid=%u pid=%u ack_timeout=%u rts_timeout=%u queue_timeout=%u txop_timeout=%u ba_error=%u txs=%08x/%08x/%08x/%08x/%08x/%08x/%08x/%08x\n",
+			 wcidx, pid,
+			 !!(le32_to_cpu(txs_data[0]) & MT_TXS0_ACK_TIMEOUT),
+			 !!(le32_to_cpu(txs_data[0]) & MT_TXS0_RTS_TIMEOUT),
+			 !!(le32_to_cpu(txs_data[0]) & MT_TXS0_QUEUE_TIMEOUT),
+			 !!(le32_to_cpu(txs_data[0]) & MT_TXS0_TXOP_TIMEOUT),
+			 !!(le32_to_cpu(txs_data[0]) & MT_TXS0_BA_ERROR),
+			 le32_to_cpu(txs_data[0]), le32_to_cpu(txs_data[1]),
+			 le32_to_cpu(txs_data[2]), le32_to_cpu(txs_data[3]),
+			 le32_to_cpu(txs_data[4]), le32_to_cpu(txs_data[5]),
+			 le32_to_cpu(txs_data[6]), le32_to_cpu(txs_data[7]));
 
 	mlink = container_of(wcid, struct mt792x_link_sta, wcid);
 
@@ -483,6 +528,93 @@ out:
 
 static void mt7921_mac_tx_free(struct mt792x_dev *dev, void *data, int len)
 {
+	/* Apple 25G83 retains MediaTek's versioned MSDU-report ABI.  MT7932 has
+	 * emitted version 3 in current traffic, and the static handler supports
+	 * versions 0 through 3.  Treating every report as one generic Connac2
+	 * layout reads the wrong token field and exhausts mt76's TXWI pool under
+	 * sustained traffic.
+	 */
+	if (is_mt7932(&dev->mt76)) {
+		struct mt76_connac_tx_free *free = data;
+		void *payload = data + sizeof(*free);
+		struct mt76_dev *mdev = &dev->mt76;
+		struct mt76_txwi_cache *txwi;
+		struct sk_buff *skb, *tmp;
+		LIST_HEAD(free_list);
+		void *end = data + len;
+		bool wake = false;
+		u16 total, done = 0, word_idx = 0;
+		u8 version;
+
+		mt76_queue_tx_cleanup(dev, dev->mphy.q_tx[MT_TXQ_PSD], false);
+		mt76_queue_tx_cleanup(dev, dev->mphy.q_tx[MT_TXQ_BE], false);
+		if (WARN_ON_ONCE(len < sizeof(*free)))
+			return;
+
+		version = FIELD_GET(GENMASK(18, 16), le32_to_cpu(free->txd));
+		if (WARN_ON_ONCE(version > 3))
+			return;
+		total = version == 3 ?
+			FIELD_GET(GENMASK(9, 0), le16_to_cpu(free->ctrl)) :
+			FIELD_GET(GENMASK(6, 0), le16_to_cpu(free->ctrl));
+		while (done < total) {
+			u32 raw = 0, msdu;
+
+			switch (version) {
+			case 0:
+				if (WARN_ON_ONCE(payload +
+						 (word_idx + 1) * sizeof(__le16) > end))
+					return;
+				msdu = le16_to_cpu(((__le16 *)payload)[word_idx++]);
+				break;
+			case 1:
+			case 2:
+				if (WARN_ON_ONCE(payload +
+						 (word_idx + 1) * sizeof(__le32) > end))
+					return;
+				raw = le32_to_cpu(((__le32 *)payload)[word_idx++]);
+				msdu = version == 1 ? raw & 0xffff : raw & 0x7fff;
+				break;
+			case 3:
+				if (WARN_ON_ONCE(payload +
+						 (word_idx + 1) * sizeof(__le32) > end))
+					return;
+				raw = le32_to_cpu(((__le32 *)payload)[word_idx++]);
+				/* A version-3 pair/WCID word is metadata, not an
+				 * MSDU completion, and therefore does not advance done.
+				 */
+				if (raw & BIT(31))
+					continue;
+				msdu = (raw >> 16) & 0x7fff;
+				break;
+			default:
+				return;
+			}
+
+			done++;
+			txwi = mt76_token_release(mdev, msdu, &wake);
+			dev_info_ratelimited(mdev->dev,
+				"J700_MT7932_TX_FREE_VERSIONED: version=%u msdu=%u found=%u done=%u/%u tokens_live=%u\n",
+				version, msdu, !!txwi, done, total,
+				READ_ONCE(mdev->token_count));
+			if (txwi)
+				mt76_connac2_txwi_free(mdev, txwi, NULL,
+						       &free_list);
+		}
+
+		if (wake)
+			mt76_set_tx_blocked(mdev, false);
+		list_for_each_entry_safe(skb, tmp, &free_list, list) {
+			skb_list_del_init(skb);
+			napi_consume_skb(skb, 1);
+		}
+		rcu_read_lock();
+		mt7921_mac_sta_poll(dev);
+		rcu_read_unlock();
+		mt76_worker_schedule(&mdev->tx_worker);
+		return;
+	}
+
 	struct mt76_connac_tx_free *free = data;
 	__le32 *tx_info = (__le32 *)(data + sizeof(*free));
 	struct mt76_dev *mdev = &dev->mt76;
@@ -528,6 +660,12 @@ static void mt7921_mac_tx_free(struct mt792x_dev *dev, void *data, int len)
 
 		msdu = FIELD_GET(MT_TX_FREE_MSDU_ID, info);
 		stat = FIELD_GET(MT_TX_FREE_STATUS, info);
+		if (wcid &&
+		    (wcid->tx_info & MT_WCID_TX_INFO_J700_FULLMAC))
+			dev_info_ratelimited(dev->mt76.dev,
+				 "J700_MT7932_FULLMAC_TX_FREE: wcid=%u msdu=%u status=%u attempts=%u\n",
+				 wcid->idx, msdu, stat,
+				 (u32)FIELD_GET(MT_TX_FREE_COUNT, info));
 
 		if (wcid) {
 			u32 count = FIELD_GET(MT_TX_FREE_COUNT, info);
@@ -587,13 +725,37 @@ void mt7921_queue_rx_skb(struct mt76_dev *mdev, enum mt76_rxq_id q,
 			 struct sk_buff *skb, u32 *info)
 {
 	struct mt792x_dev *dev = container_of(mdev, struct mt792x_dev, mt76);
+	struct mt76_connac2_mcu_rxd *mcu_rxd;
 	__le32 *rxd = (__le32 *)skb->data;
 	__le32 *end = (__le32 *)&skb->data[skb->len];
 	enum rx_pkt_type type;
 	u16 flag;
+	int ret;
 
 	type = le32_get_bits(rxd[0], MT_RXD0_PKT_TYPE);
 	flag = le32_get_bits(rxd[0], MT_RXD0_PKT_FLAG);
+	if (is_mt7932(mdev) &&
+	    test_bit(MT76_STATE_MCU_RUNNING, &dev->mphy.state))
+		dev_dbg_ratelimited(mdev->dev,
+				 "J700_MT7932_RUNTIME_RX_INGRESS: q=%u type=%u flag=0x%x len=%u dw0=0x%08x dw1=0x%08x\n",
+				 q, type, flag, skb->len, le32_to_cpu(rxd[0]),
+				 skb->len >= 8 ? le32_to_cpu(rxd[1]) : 0);
+	if (is_mt7932(mdev) &&
+	    (q == MT_RXQ_BAND1 || q == MT_RXQ_BAND1_WA))
+		dev_dbg_ratelimited(mdev->dev,
+				 "J700_MT7932_AUX_RX_INGRESS: q=%u type=%u flag=0x%x len=%u\n",
+				 q, type, flag, skb->len);
+	if (is_mt7932(mdev) && mt7932_native_rx_trace &&
+	    (q == MT_RXQ_BAND1 || q == MT_RXQ_BAND2) &&
+	    skb->len >= 8 * sizeof(*rxd) &&
+	    (type == PKT_TYPE_NORMAL || type == PKT_TYPE_NORMAL_MCU))
+		dev_info(mdev->dev,
+			 "J700_MT7932_NATIVE_RX_DESCRIPTOR: q=%u type=%u flag=0x%x len=%u dw=%08x/%08x/%08x/%08x/%08x/%08x/%08x/%08x\n",
+			 q, type, flag, skb->len,
+			 le32_to_cpu(rxd[0]), le32_to_cpu(rxd[1]),
+			 le32_to_cpu(rxd[2]), le32_to_cpu(rxd[3]),
+			 le32_to_cpu(rxd[4]), le32_to_cpu(rxd[5]),
+			 le32_to_cpu(rxd[6]), le32_to_cpu(rxd[7]));
 
 	if (type == PKT_TYPE_RX_EVENT && flag == 0x1)
 		type = PKT_TYPE_NORMAL_MCU;
@@ -608,6 +770,27 @@ void mt7921_queue_rx_skb(struct mt76_dev *mdev, enum mt76_rxq_id q,
 		napi_consume_skb(skb, 1);
 		break;
 	case PKT_TYPE_RX_EVENT:
+		/* Run225 restores these masks after each of the five download-config
+		 * responses and before it advances RX ring 0. Track the serialized
+		 * RAM download-config request itself instead of guessing an absolute
+		 * sequence range; the preceding OTP transcript may shift it.
+		 * Keep this in the event path so the following DMA refill observes
+		 * the same ordering, without replaying it for every MCU event.
+		 */
+		mcu_rxd = (void *)skb->data;
+		if (is_mt7932(mdev) && q == MT_RXQ_MCU &&
+		    READ_ONCE(mdev->mcu.mt7932_ram_download_active) &&
+		    skb->len >= sizeof(*mcu_rxd) && mcu_rxd->eid == 1 &&
+		    mcu_rxd->option == 0 &&
+		    mcu_rxd->ext_eid == 1) {
+			__mt76_wr(mdev, MT7932_HOST_INT_ENA, 0);
+			__mt76_wr(mdev, MT_WFDMA0_HOST_INT_STA,
+				  MT7932_HOST_INT_ACK);
+			mt76_set_irq_mask(mdev, MT7932_HOST_INT_ENA, 0,
+					  MT7932_HOST_INT_MASK);
+			__mt76_wr(mdev, MT_MCU2HOST_SW_INT_ENA,
+				  MT7932_MCU2HOST_SW_INT_MASK);
+		}
 		mt7921_mcu_rx_event(dev, skb);
 		break;
 	case PKT_TYPE_TXS:
@@ -617,10 +800,33 @@ void mt7921_queue_rx_skb(struct mt76_dev *mdev, enum mt76_rxq_id q,
 		break;
 	case PKT_TYPE_NORMAL_MCU:
 	case PKT_TYPE_NORMAL:
-		if (!mt7921_mac_fill_rx(dev, skb)) {
+		ret = mt7921_mac_fill_rx(dev, skb);
+		if (!ret) {
+			struct mt76_rx_status *status = (void *)skb->cb;
+
+			if (is_mt7932(mdev) && mt7932_native_rx_trace &&
+			    (status->flag & RX_FLAG_8023))
+				dev_info(mdev->dev,
+					 "J700_MT7932_FULLMAC_RX_DESCRIPTOR: q=%u wcid=%u seq=%u qos=0x%02x aggr=%u retry=%u amsdu=%u first=%u last=%u timestamp=0x%08x flags=0x%x signal=%d chains=0x%x chain=%d,%d rate=%u encoding=%u nss=%u bw=%u len=%u\n",
+					 q, status->wcid ? status->wcid->idx : 0xffff,
+					 status->seqno, status->qos_ctl, status->aggr,
+					 status->retry,
+					 status->amsdu, status->first_amsdu,
+					 status->last_amsdu, status->timestamp,
+					 status->flag, status->signal, status->chains,
+					 status->chain_signal[0], status->chain_signal[1],
+					 status->rate_idx, status->encoding,
+					 status->nss, status->bw, skb->len);
+			if (mt7932_mcu_lab_fullmac_rx(dev, skb))
+				return;
 			mt76_rx(&dev->mt76, q, skb);
 			return;
 		}
+		if (is_mt7932(mdev) && mt7932_native_rx_trace &&
+		    (q == MT_RXQ_BAND1 || q == MT_RXQ_BAND2))
+			dev_info(mdev->dev,
+				 "J700_MT7932_NATIVE_RX_DROP: q=%u parser_ret=%d type=%u flag=0x%x len=%u\n",
+				 q, ret, type, flag, skb->len);
 		fallthrough;
 	default:
 		dev_kfree_skb(skb);
@@ -671,6 +877,8 @@ void mt7921_mac_reset_work(struct work_struct *work)
 	cancel_delayed_work_sync(&dev->mphy.mac_work);
 	cancel_delayed_work_sync(&pm->ps_work);
 	cancel_work_sync(&pm->wake_work);
+	if (is_mt7932(&dev->mt76))
+		mt7932_mcu_lab_reset_prepare(dev);
 
 	for (i = 0; i < 10; i++) {
 		mutex_lock(&dev->mt76.mutex);
@@ -685,6 +893,10 @@ void mt7921_mac_reset_work(struct work_struct *work)
 
 	if (i == 10)
 		dev_err(dev->mt76.dev, "chip reset failed\n");
+	else if (is_mt7932(&dev->mt76))
+		dev_info(dev->mt76.dev,
+			 "J700_MT7932_MAC_RESET_PASS: attempts=%d firmware=%s\n",
+			 i + 1, dev->mt76.hw->wiphy->fw_version);
 
 	if (test_and_clear_bit(MT76_HW_SCANNING, &dev->mphy.state)) {
 		struct cfg80211_scan_info info = {
