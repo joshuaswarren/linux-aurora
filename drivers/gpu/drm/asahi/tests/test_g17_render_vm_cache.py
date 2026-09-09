@@ -57,9 +57,13 @@ impl Drop for KernelMapping{fn drop(&mut self){assert!(!self.held.load(Ordering:
 '''
 vm=r'''
 struct JobLifetime{active:usize,closed:bool,close_ranges:Option<(Range<u64>,Range<u64>)>}
-struct Vm{job_lifetime:TestMutex<JobLifetime>,driver_mappings:TestMutex<Option<VmDriverMappings>>,unmapped:StdMutex<Vec<Range<u64>>>}
+struct MappingGateState{blocked:bool,commits:usize}
+struct Idle;
+impl Idle{fn wait<T>(&self,_guard:&mut TestGuard<'_,T>){unreachable!()}fn notify_all(&self){}}
+struct MappingGate{state:TestMutex<MappingGateState>,idle:Idle}
+struct Vm{job_lifetime:TestMutex<JobLifetime>,mapping_gate:MappingGate,driver_mappings:TestMutex<Option<VmDriverMappings>>,unmapped:StdMutex<Vec<Range<u64>>>}
 impl Vm{
-fn new()->Self{Self{job_lifetime:TestMutex{inner:StdMutex::new(JobLifetime{active:0,closed:false,close_ranges:None}),held:Arc::new(AtomicBool::new(false))},driver_mappings:TestMutex{inner:StdMutex::new(None),held:Arc::new(AtomicBool::new(false))},unmapped:StdMutex::new(Vec::new())}}
+fn new()->Self{Self{job_lifetime:TestMutex{inner:StdMutex::new(JobLifetime{active:0,closed:false,close_ranges:None}),held:Arc::new(AtomicBool::new(false))},mapping_gate:MappingGate{state:TestMutex{inner:StdMutex::new(MappingGateState{blocked:false,commits:0}),held:Arc::new(AtomicBool::new(false))},idle:Idle},driver_mappings:TestMutex{inner:StdMutex::new(None),held:Arc::new(AtomicBool::new(false))},unmapped:StdMutex::new(Vec::new())}}
 fn mapping(&self,range:Range<u64>,drops:&Arc<AtomicUsize>)->KernelMapping{KernelMapping{range,held:self.driver_mappings.held.clone(),drops:drops.clone()}}
 fn unmap_range(&self,start:u64,size:u64)->Result{self.unmapped.lock().unwrap().push(start..start+size);Ok(())}
 '''
