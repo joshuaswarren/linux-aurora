@@ -1,0 +1,22 @@
+#!/bin/sh
+mount -t devtmpfs devtmpfs /dev
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t tmpfs tmpfs /tmp
+mkdir -p /run
+mount -t tmpfs tmpfs /run
+if [ -d /sys/kernel/debug ]; then
+    mount -t debugfs debugfs /sys/kernel/debug
+fi
+echo
+echo "AURORA_J813_LINUX_INITRAMFS_READY"
+uname -a
+printf 'Model: '; tr -d '\000' < /proc/device-tree/model; echo
+cat /proc/cmdline
+head -n 5 /proc/meminfo
+echo "RAM-only initramfs. No disks mounted."
+# Keep PID 1 alive if an interactive shell or test command exits.
+while :; do
+    setsid cttyhack /bin/sh
+    echo "Test shell exited; restarting the RAM console."
+done
