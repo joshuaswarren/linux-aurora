@@ -976,12 +976,25 @@ impl G17PQueue {
     }
 
     fn ensure_async_compute_queue(&mut self) -> Result {
-        if self.async_backend.is_some() && self.async_scheduler.is_some() {
-            return Ok(());
+        match (&self.async_backend, &self.async_scheduler) {
+            (Some(backend), Some(_)) => {
+                if self.runtime.mutex().lock().async_compute_queue_matches(
+                    self.id, backend.hardware_queue, &backend.context,
+                )? {
+                    return Ok(());
+                }
+            }
+            (None, None) => {}
+            _ => return Err(EIO),
         }
-        if self.async_backend.is_some() || self.async_scheduler.is_some() {
-            return Err(EIO);
-        }
+
+        // Processor-stop recovery removes every runtime graph after settling
+        // its active fence. Drop the now-stale entity first so any jobs queued
+        // behind that fence are cancelled before a new graph is published.
+        // Backend Drop is harmless here: the runtime just proved this owner is
+        // absent. Keep the same teardown ordering as G17PQueue::drop.
+        drop(self.async_scheduler.take());
+        drop(self.async_backend.take());
 
         let (hardware_queue, context) = self.runtime.mutex().lock()
             .prepare_async_compute_queue(self.id, &self.vm, self.context.clone())?;

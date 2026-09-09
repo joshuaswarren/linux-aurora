@@ -103,6 +103,35 @@ impl G17PLiveRuntime {
         Ok((q.queue.queue_id(), context))
     }
 
+    /// Validate the frontend's cached scheduler/backend against the runtime
+    /// graph it names. A successful processor-stop recovery drops every
+    /// firmware-owned graph, but logical DRM queues can survive that boundary.
+    /// In that case an absent owner means the frontend must create a fresh
+    /// graph before its next compute submission.
+    ///
+    /// An owner that still exists but names different hardware state is not a
+    /// recovery case: tearing it down here could release another live graph.
+    /// Treat that as an internal ownership error instead.
+    pub(crate) fn async_compute_queue_matches(
+        &self, owner: u64, hardware_queue: u8,
+        context: &Arc<mmu::T8140ComputeExecutionContext>,
+    ) -> Result<bool> {
+        let Some(q) = self.async_compute_queues.iter().find(|q| q.owner == Some(owner)) else {
+            return Ok(false);
+        };
+        let installed_context = q.context.as_ref().ok_or(EIO)?;
+        if q.released
+            || q.quarantined
+            || q.binding.is_none()
+            || q.queue.queue_id() != hardware_queue
+            || !Arc::ptr_eq(installed_context, context)
+            || !context.is_current()
+        {
+            return Err(EIO);
+        }
+        Ok(true)
+    }
+
     /// A signaled error fence is still signaled to DRM syncobj waiters. Surface
     /// device failure at the next submit instead of accepting work whose
     /// hardware owner is quarantined and can never make queue progress.
