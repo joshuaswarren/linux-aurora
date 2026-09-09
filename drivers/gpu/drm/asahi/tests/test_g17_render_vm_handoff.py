@@ -104,8 +104,10 @@ assert "poll_deferred_render_completion" not in watch
 # Ordinary completion is event-driven with the runtime mutex released. Only
 # scheduler timeout/cancel enters the bounded final-observation path above.
 events = function(runtime, "fn service_async_render_completions(")
+settle = function(runtime, "fn settle_deferred_render_completion(")
 assert "self.poll_deferred_render_completion(slot)?" in events
-assert "signal.complete(Ok(observed))" in events
+assert "self.settle_deferred_render_completion(slot, observed)?" in events
+assert "signal.complete(Ok(observed))" in settle
 
 # Job-root SecureGart setup must retain Mesa's six existing GPUVM low views.
 # Only the VM-lifetime-reserved null view is a driver-owned KernelMapping.

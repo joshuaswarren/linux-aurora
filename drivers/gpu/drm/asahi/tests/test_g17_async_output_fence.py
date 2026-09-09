@@ -29,6 +29,16 @@ def block(marker):
     return source[a:e]
 
 
+def live_block(marker):
+    a = live_source.index(marker)
+    e = live_source.index('{', a) + 1
+    depth = 1
+    while depth:
+        depth += (live_source[e] == '{') - (live_source[e] == '}')
+        e += 1
+    return live_source[a:e]
+
+
 install = block('    fn install_output_fences(')
 guard_struct = block('struct G17POutputFencePublication<')
 guard_impl = block("impl G17POutputFencePublication<'_> {")
@@ -58,14 +68,21 @@ assert compute_completion.index("compare_exchange(0, 1") \
 timeout_start = live_source.index("    pub(crate) fn timeout_deferred_render(")
 timeout_end = live_source.index("    pub(crate) fn abandon_deferred_render(", timeout_start)
 timeout = live_source[timeout_start:timeout_end]
+settle_render = live_block("    fn settle_deferred_render_completion(")
 assert timeout.index("if !self.render_fence_state.pending(render_slot)") \
     < timeout.index("self.poll_deferred_render_completion(render_slot)"), \
     'pre-publication failures incorrectly enter the hardware watchdog path'
 assert timeout.index("self.poll_deferred_render_completion(render_slot)") \
-    < timeout.index("self.render_fence_state.settle(render_slot)"), \
+    < timeout.index("self.settle_deferred_render_completion(render_slot, observed)"), \
     'watchdog consumes the settlement gate before its final completion observation'
-assert "signal.complete(Ok(observed));" in timeout, \
+assert "signal.complete(Ok(observed));" in settle_render, \
     'watchdog cannot salvage a completion that became visible after the event edge'
+assert settle_render.index("signal.complete(Ok(observed));") \
+    < settle_render.index("retire_render_usc_freelist_at_completion()"), \
+    'fallible retained cleanup can suppress a proven render completion'
+assert settle_render.index("retire_render_usc_freelist_at_completion()") \
+    < settle_render.index("recover_persistent_runtime(self)"), \
+    'failed retained cleanup can be reused without a processor-stop boundary'
 assert ") -> bool {" not in timeout and "return !retired;" not in timeout, \
     'watchdog still delegates a late registry quarantine to its caller'
 signal_error = timeout.index("signal.fail_while_owned(error);")

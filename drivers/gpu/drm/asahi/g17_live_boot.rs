@@ -3966,14 +3966,6 @@ impl G17PLiveRuntime {
                         crate::g17_trace_capture::Phase::AfterPairRetirement,
                     );
                 }
-                let release = self
-                    .manager
-                    .as_mut()
-                    .ok_or(ENODEV)?
-                    .retire_render_usc_freelist_at_completion()?;
-                if let Some(release) = release {
-                    self.service_render_usc_freelist_release(release)?;
-                }
                 if let (Some(pdev), Some(manager)) = (self.pdev.as_ref(), self.manager.as_mut()) {
                     log_g17p_status_a(pdev.as_ref(), manager, "render-post-wait");
                     probe_g17p_ktrace(pdev.as_ref(), manager, "render-post-wait");
@@ -3985,6 +3977,57 @@ impl G17PLiveRuntime {
             g17_manager::G17PRenderPollOutcome::Retry => Ok(None),
             g17_manager::G17PRenderPollOutcome::Pending => Ok(None),
         }
+    }
+
+    /// Publish the exact render fence before fallible device-global cleanup.
+    ///
+    /// `poll_translated_render_completion` has already committed the paired
+    /// queue retirement: it clears the manager tracker, returns the HWPB ID,
+    /// advances the ordinal, and proves EventControl unlinked.  A subsequent
+    /// FList release error therefore cannot be retried as a render completion.
+    /// Keeping the fence armed until after that cleanup made a GPU-successful
+    /// job wait for the two-second scheduler watchdog and then fail as EIO.
+    /// FList storage is driver-owned and remains retained by the manager, so
+    /// signal the truthful completion first; if cleanup fails, stop both
+    /// processors and rebuild before another submission can reuse that state.
+    fn settle_deferred_render_completion(
+        &mut self,
+        render_slot: u8,
+        observed: g17_completion::PairedRenderCompletion,
+    ) -> Result<bool> {
+        let index = usize::from(render_slot);
+        if self.pending_render.get(index).and_then(Option::as_ref).is_none() {
+            return Err(EIO);
+        }
+        if !self.render_fence_state.settle(render_slot) {
+            return Ok(false);
+        }
+        self.render_event_masks[index] = [0; 2];
+        let signal = self.pending_render[index].take().ok_or(EIO)?;
+        signal.complete(Ok(observed));
+
+        let cleanup = (|| -> Result {
+            let release = self
+                .manager
+                .as_mut()
+                .ok_or(ENODEV)?
+                .retire_render_usc_freelist_at_completion()?;
+            if let Some(release) = release {
+                self.service_render_usc_freelist_release(release)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = cleanup {
+            if let Some(pdev) = self.pdev.as_ref() {
+                dev_err!(
+                    pdev.as_ref(),
+                    "G17P render: paired completion signalled, but retained FList cleanup failed ({:?}); rebuilding before reuse\n",
+                    error,
+                );
+            }
+            g17_lifecycle::recover_persistent_runtime(self)?;
+        }
+        Ok(true)
     }
 
     /// Retire any render whose firmware record became visible on this RTKit
@@ -4020,13 +4063,7 @@ impl G17PLiveRuntime {
                 }
             }
             if let Some(observed) = completion {
-                if self.render_fence_state.settle(slot) {
-                    self.render_event_masks[slot as usize] = [0; 2];
-                    let signal = self.pending_render[slot as usize]
-                        .take()
-                        .ok_or(EIO)?;
-                    signal.complete(Ok(observed));
-                }
+                self.settle_deferred_render_completion(slot, observed)?;
             }
         }
         Ok(())
@@ -4084,20 +4121,29 @@ impl G17PLiveRuntime {
         // watchdog supplies the sole bounded lost-event fallback.
         match self.poll_deferred_render_completion(render_slot) {
             Ok(Some(observed)) => {
-                if self.render_fence_state.settle(render_slot) {
-                    self.render_event_masks[render_slot as usize] = [0; 2];
-                    let Some(signal) = self.pending_render
-                        .get_mut(render_slot as usize)
-                        .and_then(Option::take) else { return; };
-                    if let Some(pdev) = self.pdev.as_ref() {
-                        dev_warn!(
-                            pdev.as_ref(),
-                            "G17P render: watchdog recovered completed submission {} slot {} after an early firmware event\n",
-                            submission_id,
-                            render_slot,
-                        );
+                match self.settle_deferred_render_completion(render_slot, observed) {
+                    Ok(true) => {
+                        if let Some(pdev) = self.pdev.as_ref() {
+                            dev_warn!(
+                                pdev.as_ref(),
+                                "G17P render: watchdog recovered completed submission {} slot {} after an early firmware event\n",
+                                submission_id,
+                                render_slot,
+                            );
+                        }
                     }
-                    signal.complete(Ok(observed));
+                    Ok(false) => {}
+                    Err(cleanup_error) => {
+                        if let Some(pdev) = self.pdev.as_ref() {
+                            dev_err!(
+                                pdev.as_ref(),
+                                "G17P render: completed submission {} slot {} could not settle retained cleanup ({:?})\n",
+                                submission_id,
+                                render_slot,
+                                cleanup_error,
+                            );
+                        }
+                    }
                 }
                 return;
             }
