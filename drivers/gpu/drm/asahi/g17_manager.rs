@@ -3182,6 +3182,20 @@ impl G17PManagerConstruction {
         self.render_command_buffer_states = G17PCommandBufferStateAllocator::new();
         self.render_command_buffer_state_pairs = [None, None];
         self.active_render_slot = 0;
+        // Every compute graph and the boot graph have been dropped after both
+        // processors stopped. Their QIDs are no longer installed in firmware,
+        // so the replacement session owns a fresh namespace. Leaving this at
+        // its previous high-water mark exhausted QID 127 after enough bounded
+        // recoveries even though no hardware graph survived any of them.
+        self.next_compute_queue_id = Some(G17P_COMPUTE_QUEUE_ID_BASE);
+        // These values name the stopped session's descriptor and deferred
+        // AddKicks record. Replaying either against the replacement boot graph
+        // can acknowledge or kick the wrong QID even when that QID number was
+        // legitimately reused above.
+        self.pending_add_kicks = None;
+        self.last_published_descriptor = 0;
+        self.last_completion_end = 0;
+        self.compute_stamp_armed = false;
     }
 
     /// Restore cold initdata in the existing mappings after both CPUs stop.

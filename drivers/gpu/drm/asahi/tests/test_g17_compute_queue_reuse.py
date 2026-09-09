@@ -8,6 +8,8 @@ from pathlib import Path
 root = Path(__file__).resolve().parents[1]
 runtime = (root / "g17_async_compute.rs").read_text()
 limits = (root / "g17_queue_limits.rs").read_text()
+manager = (root / "g17_manager.rs").read_text()
+live = (root / "g17_live_boot.rs").read_text()
 
 
 def block(source, marker):
@@ -26,6 +28,8 @@ release = block(runtime, "    pub(crate) fn release_async_compute_queue(")
 service = block(runtime, "    fn service_async_compute_completions(")
 needs_install = block(runtime, "    pub(crate) fn async_compute_needs_install(")
 predicate = block(limits, "pub(crate) const fn reusable_idle_compute_graph(")
+stop = block(manager, "    pub(crate) fn release_runtime_objects_after_processor_stop(")
+runtime_stop = block(live, "    fn release_runtime_objects(&mut self)")
 
 for field in ["q.owner.is_none()", "q.active.is_none()", "q.binding.is_none()", "q.context.is_none()"]:
     assert field in prepare
@@ -48,6 +52,17 @@ assert release.index("q.released = true") < release.index("q.binding = None")
 assert service.index("q.active.take()") < service.index("if q.released")
 assert "q.binding = None; q.context = None; q.owner = None" in service
 assert "q.queue.requires_first_install()" in needs_install
+assert "self.next_compute_queue_id = Some(G17P_COMPUTE_QUEUE_ID_BASE)" in stop
+for stale_session_field in [
+    "self.pending_add_kicks = None",
+    "self.last_published_descriptor = 0",
+    "self.last_completion_end = 0",
+    "self.compute_stamp_armed = false",
+]:
+    assert stale_session_field in stop
+assert runtime_stop.index("self.release_async_compute_after_processor_stop()") < runtime_stop.index(
+    "manager.release_runtime_objects_after_processor_stop()"
+)
 
 
 @dataclass
@@ -93,6 +108,10 @@ class Pool:
             graph.installed = True
             graph.installs += 1
         return graph, needs_first_install
+
+    def processor_stop(self):
+        self.graphs.clear()
+        self.next_qid = 4
 
     @staticmethod
     def submit(graph):
@@ -175,4 +194,13 @@ replacement, install = pool.bind(1_000_000, 6)
 assert replacement is not faulted and not install
 assert replacement.qid != faulted.qid
 
-print("PASS compute graph reuse: 10k serial + 2k x 55 overlap waves, one install/QID, close-active and quarantine safe")
+# Processor stop destroys every firmware-installed graph, so each rebuilt
+# session starts at QID4 instead of consuming the finite namespace forever.
+pool = Pool()
+for generation in range(1_000):
+    graph, install = pool.bind(generation, 5)
+    assert graph.qid == 4 and install
+    pool.processor_stop()
+assert pool.next_qid == 4 and not pool.graphs
+
+print("PASS compute graph reuse: 10k serial + 2k x 55 overlap waves + 1k stopped sessions; QID ownership and capacity remain bounded")

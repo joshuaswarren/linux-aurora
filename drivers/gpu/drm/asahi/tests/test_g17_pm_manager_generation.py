@@ -43,7 +43,7 @@ assert submit.index("self.render_storage = Some(match storage") < submit.index(
 commit = body(
     MANAGER,
     "fn commit_render_pm_manager_generation(",
-    "/// Re-point the device-global parameter-buffer loader",
+    "/// Validate the incoming retained storage's indexed PBDesc identity.",
 )
 assert "current == actual && current == self.next_render_pm_manager_generation" in commit
 assert commit.index("current == actual") < commit.index(
