@@ -170,8 +170,6 @@ struct Vm {
     /// The usable user VA range for this device's UAT geometry
     /// (`mmu::iova_user_usable_range`), captured at creation.
     user_range: Range<u64>,
-    /// Serialize VM_BIND preflight/commit and GEM-handle teardown.
-    bind_lock: Arc<Mutex<()>>,
     _dummy_mapping: mmu::KernelMapping,
 }
 
@@ -179,17 +177,14 @@ enum PreparedGemBindOp {
     Map {
         op: uapi::drm_asahi_gem_bind_op,
         bo: ARef<gem::Object>,
-        prepared: Option<mmu::PreparedUserMap>,
     },
     Unmap {
         op: uapi::drm_asahi_gem_bind_op,
-        prepared: Option<mmu::PreparedUserUnmap>,
     },
 }
 
 impl Drop for Vm {
     fn drop(&mut self) {
-        let _bind_guard = self.bind_lock.lock();
         if self
             .vm
             .unmap_user_ranges(self.user_range.clone(), self.kernel_range.clone())
@@ -619,7 +614,6 @@ impl File {
                 vm,
                 kernel_range,
                 user_range,
-                bind_lock: Arc::pin_init(new_mutex!((), "AsahiVmBind"), GFP_KERNEL)?,
                 _dummy_mapping: dummy_mapping,
             },
             GFP_KERNEL,
@@ -768,7 +762,7 @@ impl File {
             ops.push(bind, GFP_KERNEL)?;
         }
 
-        let (vm, kernel_range, user_range, bind_lock) = {
+        let (vm, kernel_range, user_range) = {
             let vms_xa = file.inner().vms();
             let guard = vms_xa.lock();
             let guarded_vm = guard.get(vm_id).ok_or(ENOENT)?;
@@ -776,16 +770,14 @@ impl File {
                 guarded_vm.vm.clone(),
                 guarded_vm.kernel_range.clone(),
                 guarded_vm.user_range.clone(),
-                guarded_vm.bind_lock.clone(),
             )
         };
-        let _bind_guard = bind_lock.lock();
 
-        // Validate and reserve all expected resources before changing a leaf.
-        // A bad upper sparse-shadow op cannot strand its lower partner.
+        // Validate and reserve all expected resources before the established
+        // interruptible per-operation drm_exec commit path begins.
         let mut plans = KVec::with_capacity(count, GFP_KERNEL)?;
+        let mut batch = mmu::PreparedUserBindBatch::new(count)?;
         let mut unmap_count = 0usize;
-        vm.reserve_user_range_updates(count)?;
         for op in ops {
             if op.range == 0
                 || (op.addr | op.range | op.offset) & mmu::UAT_PGMSK as u64 != 0
@@ -800,8 +792,6 @@ impl File {
             {
                 return Err(EINVAL);
             }
-            vm.preflight_user_bind_range(range.clone())?;
-
             if op.flags & uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_UNBIND != 0 {
                 if op.offset != 0
                     || op.flags != uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_UNBIND
@@ -809,10 +799,9 @@ impl File {
                 {
                     return Err(EINVAL);
                 }
-                plans.push(PreparedGemBindOp::Unmap {
-                    op,
-                    prepared: Some(vm.prepare_user_unmap(op.addr, op.range)?),
-                }, GFP_KERNEL)?;
+                let prepared = vm.prepare_user_unmap(op.addr, op.range)?;
+                batch.push_unmap(prepared)?;
+                plans.push(PreparedGemBindOp::Unmap { op }, GFP_KERNEL)?;
                 unmap_count += 1;
                 continue;
             }
@@ -855,22 +844,12 @@ impl File {
             let prepared = vm.prepare_bind_object(
                 &bo, op.addr, op.range, op.offset, prot, single_page,
             )?;
-            plans.push(PreparedGemBindOp::Map {
-                op, bo, prepared: Some(prepared),
-            }, GFP_KERNEL)?;
+            batch.push_map(prepared)?;
+            plans.push(PreparedGemBindOp::Map { op, bo }, GFP_KERNEL)?;
         }
 
         vm.reserve_deferred_user_unmaps(unmap_count)?;
-        for plan in plans.iter_mut() {
-            match plan {
-                PreparedGemBindOp::Map { prepared, .. } => {
-                    vm.bind_prepared_object(prepared.take().ok_or(EINVAL)?)?;
-                }
-                PreparedGemBindOp::Unmap { prepared, .. } => {
-                    vm.unmap_prepared_user_range(prepared.take().ok_or(EINVAL)?)?;
-                }
-            }
-        }
+        vm.commit_prepared_user_bind_batch(&mut batch)?;
 
         // Replay registry changes only after the page-table batch commits.
         for plan in &plans {
@@ -900,9 +879,7 @@ impl File {
                     // Clone since we can't hold the xarray spinlock while
                     // calling drop_mappings()
                     let vm = file_vm.borrow().vm.clone();
-                    let bind_lock = file_vm.borrow().bind_lock.clone();
                     core::mem::drop(file_vm);
-                    let _bind_guard = bind_lock.lock();
                     vm.drop_mappings(bo)?;
                     vm.untrack_t8140_native_context_object(bo);
                     if idx == usize::MAX {
