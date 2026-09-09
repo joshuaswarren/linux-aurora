@@ -37,8 +37,26 @@ for marker in ('    fn release_runtime_objects(', '    fn drop_queue('):
     body = item(live, marker)
     assert 'self.release_async_compute_after_processor_stop();' in body
     assert 'self.async_compute_queues.clear()' not in body
+    assert body.index('completion.complete(Err(EIO));') < body.index(
+        'completion.release_after_processor_stop();'
+    )
 recovery = item(lifecycle, 'pub(crate) fn recover_persistent_runtime<')
-assert recovery.index('owner.stop_cpu_pair()?') < recovery.index('owner.release_runtime_objects()')
+assert recovery.index('owner.stop_cpu_pair()') < recovery.index('owner.release_runtime_objects()')
+assert recovery.index('owner.fail_outstanding_jobs_while_owned()') < recovery.index(
+    'return Err(error)'
+)
+assert recovery.index('let disable_result = owner.disable_sksm_queue();') < recovery.index(
+    'owner.release_runtime_objects()'
+)
+assert recovery.index('owner.release_runtime_objects()') < recovery.index('disable_result?')
+failed_stop = item(live, '    fn fail_outstanding_jobs_while_owned(')
+assert 'self.pending_render.iter().flatten()' in failed_stop
+assert 'for queue in &mut self.async_compute_queues' in failed_stop
+assert failed_stop.count('fail_while_owned(EIO)') == 2
+assert 'queue.quarantined = true;' in failed_stop
+assert 'active._lease.quarantine();' in failed_stop
+for premature_release in ('.take()', 'release_after_processor_stop', '= None'):
+    assert premature_release not in failed_stop
 teardown = item(lifecycle, 'pub(crate) fn teardown_persistent_runtime<')
 assert 'owner.retain_after_stop_failure();\n        return;' in teardown
 assert teardown.index('owner.stop_cpu_pair()') < teardown.index('owner.drop_queue()')

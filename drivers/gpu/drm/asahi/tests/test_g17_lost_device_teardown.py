@@ -132,6 +132,7 @@ struct G17PLiveRuntime{
  async_compute_queues:Vec<G17PAsyncComputeQueue>,
  pdev:Option<Pdev>,
  serviced:u32,
+ session_recovery_pending:bool,
 }
 impl G17PLiveRuntime{
  fn service_async_compute_completions(&mut self)->Result{self.serviced+=1;Ok(())}
@@ -177,7 +178,8 @@ fn runtime(owners:&[Arc<crate::g17_status::VmStatus>])->(G17PLiveRuntime,Vec<Arc
    quarantined:false,
   });
  }
- (G17PLiveRuntime{async_compute_queues:queues,pdev:Some(Pdev),serviced:0},leases)
+ (G17PLiveRuntime{async_compute_queues:queues,pdev:Some(Pdev),serviced:0,
+   session_recovery_pending:false},leases)
 }
 
 #[test]fn only_the_lost_vm_s_jobs_are_failed(){

@@ -176,6 +176,9 @@ pub(crate) trait PersistentRuntimeRecovery {
 
     fn pause_submissions(&mut self);
     fn stop_cpu_pair(&mut self) -> Result<(), Self::Error>;
+    /// Wake every accepted job with an error while retaining all firmware-
+    /// visible ownership. Used only when processor stop cannot be proven.
+    fn fail_outstanding_jobs_while_owned(&mut self);
     fn drop_gfx1_rtkit(&mut self);
     fn drop_gfx_rtkit(&mut self);
     /// Disable the hardware-visible SKSM queue while retaining its storage.
@@ -192,11 +195,22 @@ pub(crate) fn recover_persistent_runtime<T: PersistentRuntimeRecovery>(
     owner: &mut T,
 ) -> Result<(), T::Error> {
     owner.pause_submissions();
-    owner.stop_cpu_pair()?;
+    if let Err(error) = owner.stop_cpu_pair() {
+        // A failed stop is not permission to release mappings, but it also
+        // must not leave userspace waiting forever. Implementations signal
+        // error fences while retaining the complete hardware owner graph.
+        owner.fail_outstanding_jobs_while_owned();
+        return Err(error);
+    }
     owner.drop_gfx1_rtkit();
     owner.drop_gfx_rtkit();
-    owner.disable_sksm_queue()?;
+    // Both processors are stopped, so pending fences and their owner graphs
+    // can be settled even when the best-effort SKSM unregister step fails.
+    // Returning before this release stranded every accepted fence and made a
+    // retry hit the same stale queue forever.
+    let disable_result = owner.disable_sksm_queue();
     owner.release_runtime_objects();
+    disable_result?;
     owner.rebuild_session_in_place()?;
     owner.resume_submissions();
     Ok(())
@@ -376,6 +390,7 @@ mod tests {
         DropBoot,
         PauseSubmissions,
         StopCpuPair,
+        FailOutstandingJobs,
         DisableSksmQueue,
         ReleaseRuntimeObjects,
         RebuildSessionInPlace,
@@ -954,6 +969,10 @@ mod tests {
             }
         }
 
+        fn fail_outstanding_jobs_while_owned(&mut self) {
+            self.trace.push(Event::FailOutstandingJobs);
+        }
+
         fn drop_gfx1_rtkit(&mut self) {
             self.trace.push(Event::DropGfx1Rtkit);
         }
@@ -1025,7 +1044,14 @@ mod tests {
             recover_persistent_runtime(&mut owner),
             Err(TestError::StopPair)
         );
-        assert_eq!(owner.trace, [Event::PauseSubmissions, Event::StopCpuPair]);
+        assert_eq!(
+            owner.trace,
+            [
+                Event::PauseSubmissions,
+                Event::StopCpuPair,
+                Event::FailOutstandingJobs,
+            ]
+        );
     }
 
     #[test]
@@ -1054,7 +1080,7 @@ mod tests {
     }
 
     #[test]
-    fn sksm_disable_error_keeps_queue_and_graph_storage_alive() {
+    fn sksm_disable_error_still_settles_stopped_runtime_objects() {
         let mut owner = MockRuntimeRecovery {
             failure: Some(Failure::DisableSksm),
             trace: std::vec::Vec::new(),
@@ -1072,8 +1098,140 @@ mod tests {
                 Event::DropGfx1Rtkit,
                 Event::DropGfxRtkit,
                 Event::DisableSksmQueue,
+                Event::ReleaseRuntimeObjects,
             ]
         );
+    }
+
+    #[derive(Debug, Copy, Clone)]
+    struct RecoveryFenceOwner {
+        signals: u32,
+        retained: bool,
+    }
+
+    struct RepeatedFenceRecovery {
+        jobs: [RecoveryFenceOwner; 2],
+        stop_failures: u32,
+        disable_failures: u32,
+        processors_stopped: bool,
+        release_calls: u32,
+        rebuild_calls: u32,
+        resumed: bool,
+    }
+
+    impl RepeatedFenceRecovery {
+        fn new(stop_failures: u32, disable_failures: u32) -> Self {
+            Self {
+                jobs: [RecoveryFenceOwner {
+                    signals: 0,
+                    retained: true,
+                }; 2],
+                stop_failures,
+                disable_failures,
+                processors_stopped: false,
+                release_calls: 0,
+                rebuild_calls: 0,
+                resumed: false,
+            }
+        }
+
+        fn signal_once(job: &mut RecoveryFenceOwner) {
+            if job.signals == 0 {
+                job.signals = 1;
+            }
+        }
+    }
+
+    impl PersistentRuntimeRecovery for RepeatedFenceRecovery {
+        type Error = TestError;
+
+        fn pause_submissions(&mut self) {
+            self.resumed = false;
+        }
+
+        fn stop_cpu_pair(&mut self) -> Result<(), Self::Error> {
+            if self.stop_failures != 0 {
+                self.stop_failures -= 1;
+                return Err(TestError::StopPair);
+            }
+            self.processors_stopped = true;
+            Ok(())
+        }
+
+        fn fail_outstanding_jobs_while_owned(&mut self) {
+            for job in &mut self.jobs {
+                assert!(job.retained);
+                Self::signal_once(job);
+            }
+        }
+
+        fn drop_gfx1_rtkit(&mut self) {}
+        fn drop_gfx_rtkit(&mut self) {}
+
+        fn disable_sksm_queue(&mut self) -> Result<(), Self::Error> {
+            assert!(self.processors_stopped);
+            if self.disable_failures != 0 {
+                self.disable_failures -= 1;
+                Err(TestError::DisableSksm)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn release_runtime_objects(&mut self) {
+            assert!(self.processors_stopped);
+            self.release_calls += 1;
+            for job in &mut self.jobs {
+                Self::signal_once(job);
+                job.retained = false;
+            }
+        }
+
+        fn rebuild_session_in_place(&mut self) -> Result<(), Self::Error> {
+            assert!(self.processors_stopped);
+            self.rebuild_calls += 1;
+            self.processors_stopped = false;
+            Ok(())
+        }
+
+        fn resume_submissions(&mut self) {
+            self.resumed = true;
+        }
+    }
+
+    #[test]
+    fn failed_stop_signals_two_clients_once_but_retains_their_hardware_owners() {
+        let mut owner = RepeatedFenceRecovery::new(1, 0);
+        assert_eq!(recover_persistent_runtime(&mut owner), Err(TestError::StopPair));
+        assert!(owner.jobs.iter().all(|job| job.signals == 1 && job.retained));
+        assert_eq!(owner.release_calls, 0);
+
+        // A later successful stop releases both owners without signalling
+        // either fence a second time, then rebuilds and resumes normally.
+        assert_eq!(recover_persistent_runtime(&mut owner), Ok(()));
+        assert!(owner.jobs.iter().all(|job| job.signals == 1 && !job.retained));
+        assert_eq!(owner.release_calls, 1);
+        assert_eq!(owner.rebuild_calls, 1);
+        assert!(owner.resumed);
+    }
+
+    #[test]
+    fn disable_failure_releases_two_clients_and_a_retry_rebuilds() {
+        let mut owner = RepeatedFenceRecovery::new(0, 1);
+        assert_eq!(
+            recover_persistent_runtime(&mut owner),
+            Err(TestError::DisableSksm)
+        );
+        assert!(owner.jobs.iter().all(|job| job.signals == 1 && !job.retained));
+        assert_eq!(owner.release_calls, 1);
+        assert_eq!(owner.rebuild_calls, 0);
+        assert!(!owner.resumed);
+
+        assert_eq!(recover_persistent_runtime(&mut owner), Ok(()));
+        assert!(owner.jobs.iter().all(|job| job.signals == 1 && !job.retained));
+        assert_eq!(owner.release_calls, 2);
+        assert_eq!(owner.rebuild_calls, 1);
+        assert!(owner.resumed);
     }
 
     #[test]
