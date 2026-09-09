@@ -3183,6 +3183,15 @@ impl G17PLiveRuntime {
                 );
             }
         }
+        // The batch drain deliberately stops at type 4 so restartWorkQueue can
+        // release both native command gates before the next record is read.
+        // Its notification count was already swapped to zero, however, and a
+        // type-1/type-13 record may already follow type 4 in the same producer
+        // snapshot.  Schedule one continuation after every successful actual
+        // recovery; queue_work coalescing makes a concurrent fresh IRQ share
+        // this pass, while an empty ring costs one bounded drain.  Keeping the
+        // continuation here covers both the workqueue and inline callers.
+        crate::driver::queue_g17p_firmware_event_worker(state.dev.clone());
         result
     }
 
