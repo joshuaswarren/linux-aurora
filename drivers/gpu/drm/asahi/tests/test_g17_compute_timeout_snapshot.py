@@ -28,12 +28,14 @@ diagnostic = block(manager, "    pub(crate) fn log_async_compute_timeout(")
 assert "queue.completion_descriptor" in diagnostic
 assert "registers" not in diagnostic and "fsleep" not in diagnostic
 assert "snapshot_initial_channel_group" not in diagnostic  # fixed slot zero is wrong
+assert "compute_b2_channel_control" in diagnostic
+assert "qos_queue_record" in diagnostic
 assert diagnostic.index("read_compute_ring_state") < diagnostic.index("dev_err!")
 
 source = r'''
 #![allow(dead_code)]
 type Result<T=()> = std::result::Result<T,i32>;
-const EINVAL:i32=22;const ERANGE:i32=34;
+const EINVAL:i32=22;const ERANGE:i32=34;const EOVERFLOW:i32=75;
 mod mmu { pub const UAT_PGSZ:usize=0x4000; }
 '''
 submission_source = (root / "g17_submission.rs").read_text()
@@ -50,8 +52,11 @@ impl Bytes {
  fn iova(&self)->u64{self.base}
  fn with_bytes_mut<T>(&mut self,f:impl FnOnce(&mut[u8])->Result<T>)->Result<T>{f(&mut self.raw)}
  fn read_u32(&self,va:u64)->Result<u32>{let at=va.checked_sub(self.base).ok_or(ERANGE)? as usize;Ok(u32::from_le_bytes(self.raw.get(at..at+4).ok_or(ERANGE)?.try_into().unwrap()))}
+ fn read_u64(&mut self,va:u64)->Result<u64>{let at=va.checked_sub(self.base).ok_or(ERANGE)? as usize;Ok(u64::from_le_bytes(self.raw.get(at..at+8).ok_or(ERANGE)?.try_into().unwrap()))}
 }
 struct Storage{descriptors:Bytes,descriptors_high:Bytes,support:Bytes,queue_graph:Bytes,entries:Bytes,ring_reclaimed:u32,ring_reclaimed_total:u64}
+struct OwnerResources{partial_computed:Bytes}
+struct Owner{resources:OwnerResources}
 '''
 for name in ["G17PComputeSubmissionSnapshot", "G17PComputeRingState"]:
     source += "#[derive(Debug,Copy,Clone)]\n" + block(resources, "pub(crate) struct " + name)
@@ -60,6 +65,7 @@ source += "impl Storage {\n" + "\n".join(block(resources, marker) for marker in 
     "    pub(crate) fn read_compute_stamp(",
     "    pub(crate) fn snapshot_compute_entry(",
     "    pub(crate) fn read_compute_ring_state("]) + "}\n"
+source += "impl Owner {\n" + block(resources, "    pub(crate) fn compute_b2_channel_control(") + "}\n"
 source += r'''
 fn put32(b:&mut[u8],at:usize,v:u32){b[at..at+4].copy_from_slice(&v.to_le_bytes());}
 fn put64(b:&mut[u8],at:usize,v:u64){b[at..at+8].copy_from_slice(&v.to_le_bytes());}
@@ -117,6 +123,14 @@ fn storage(qid:u32)->Storage {
  assert_eq!(s.entries,before);
  assert!(s.snapshot_compute_entry(0x300).is_err());
  assert!(s.snapshot_compute_entry(usize::MAX).is_err());
+}
+#[test]fn b2_channel_control_read_is_bounded_and_does_not_mutate(){
+ let mut b=Bytes{base:0x1000,raw:vec![0;0x1000]};put64(&mut b.raw,0x808,0xdeadbeef);
+ let before=b.clone();let mut o=Owner{resources:OwnerResources{partial_computed:b}};
+ assert_eq!(o.compute_b2_channel_control().unwrap(),0xdeadbeef);
+ assert_eq!(o.resources.partial_computed,before);
+ let mut o=Owner{resources:OwnerResources{partial_computed:Bytes{base:u64::MAX-0x807,raw:vec![0;0x1000]}}};
+ assert_eq!(o.compute_b2_channel_control(),Err(EOVERFLOW));
 }
 '''
 with tempfile.TemporaryDirectory() as temp:

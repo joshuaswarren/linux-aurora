@@ -8487,6 +8487,10 @@ impl G17PManagerConstruction {
             Ok(self.uat().t8140_selected_context_roots([context; 4])?[0])
         })();
         let control = queue.storage.snapshot_channel_control_prefix();
+        let b2_channel_control = self.resources.compute_b2_channel_control();
+        let expected_channel_control = queue.storage.channel_control_gpu_va();
+        let qos_rows = [4u8, 5, 6, 7]
+            .map(|qid| (qid, self.resources.qos_queue_record(qid)));
         let entry = (|| -> Result<_> {
             if !queue.producer.previous_valid { return Err(EINVAL); }
             let last = g17_submission::prepare_kick_submission(
@@ -8508,6 +8512,9 @@ impl G17PManagerConstruction {
             "G17P async-timeout submission: {:x?} descriptor-context-ttbat={:x?}\n", submission, roots);
         dev_err!(self.resources.dev().as_ref(),
             "G17P async-timeout channel-control: {:x?}\n", control);
+        dev_err!(self.resources.dev().as_ref(),
+            "G17P async-timeout B2 channel-control(actual,expected): ({:x?},{:#x}) QoS rows(qid,result)={:x?}\n",
+            b2_channel_control, expected_channel_control, qos_rows);
         dev_err!(self.resources.dev().as_ref(),
             "G17P async-timeout last-host-entry(offset,words): {:x?}\n", entry);
     }

@@ -16936,6 +16936,21 @@ impl G17ResourceOwner {
         };
         f(computed)
     }
+
+    /// Read the queue-local channel-control pointer currently staged in the
+    /// device-global B2 object.  Timeout diagnostics use this to distinguish
+    /// a missed B2 retarget from a queue that stalled after the retarget.
+    /// Host DRAM only: the read neither follows the pointer nor touches SGX.
+    pub(crate) fn compute_b2_channel_control(&mut self) -> Result<u64> {
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        let address = self
+            .resources
+            .partial_computed
+            .iova()
+            .checked_add(0x808)
+            .ok_or(EOVERFLOW)?;
+        self.resources.partial_computed.read_u64(address)
+    }
 }
 
 #[cfg(test)]
