@@ -27,7 +27,9 @@ impl G17PLiveRuntime {
             if let Some(active) = &q.active {
                 if let Ok(completion) = active.packet.completion() {
                     completion.complete(Err(EIO));
+                    completion.release_after_processor_stop();
                 }
+                active._lease.rehabilitate_after_processor_stop();
             }
         }
         self.async_compute_queues.clear();

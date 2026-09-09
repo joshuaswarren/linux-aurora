@@ -24,6 +24,15 @@ def item(text, marker):
 
 retain = item(live, '    fn retain_after_stop_failure(')
 release = item(compute, '    fn release_async_compute_after_processor_stop(')
+assert release.index('completion.complete(Err(EIO))') < release.index(
+    'completion.release_after_processor_stop()'
+)
+assert release.index('completion.release_after_processor_stop()') < release.index(
+    'active._lease.rehabilitate_after_processor_stop()'
+)
+assert release.index('active._lease.rehabilitate_after_processor_stop()') < release.index(
+    'self.async_compute_queues.clear()'
+)
 for marker in ('    fn release_runtime_objects(', '    fn drop_queue('):
     body = item(live, marker)
     assert 'self.release_async_compute_after_processor_stop();' in body
@@ -54,9 +63,10 @@ use std::sync::{Arc,atomic::{AtomicUsize,Ordering}};
 const EIO:Error=Error;
 type Result<T=()> = std::result::Result<T,Error>;
 struct Probe(Arc<AtomicUsize>);
+impl Probe {fn rehabilitate_after_processor_stop(&self){}}
 impl Drop for Probe {fn drop(&mut self){self.0.fetch_add(1,Ordering::SeqCst);}}
 struct Completion {signals:AtomicUsize}
-impl Completion {fn complete(&self,_:Result){let _=self.signals.compare_exchange(0,1,Ordering::SeqCst,Ordering::SeqCst);}}
+impl Completion {fn complete(&self,_:Result){let _=self.signals.compare_exchange(0,1,Ordering::SeqCst,Ordering::SeqCst);}fn release_after_processor_stop(&self){}}
 struct Packet {completion:Arc<Completion>,_mapping:Probe}
 impl Packet {fn completion(&self)->Result<&Completion>{Ok(&self.completion)}}
 struct Active {packet:Arc<Packet>,_lease:Probe}

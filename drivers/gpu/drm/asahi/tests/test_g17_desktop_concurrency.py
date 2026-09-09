@@ -64,6 +64,16 @@ failed_jobs = block(ASYNC, "    pub(crate) fn fail_outstanding_jobs_for_vm(")
 assert "active = None" not in failed_jobs and ".fail_while_owned(error)" in failed_jobs
 release_compute = block(ASYNC, "    pub(crate) fn release_async_compute_queue(")
 assert "q.active.is_none() && !q.quarantined" in release_compute
+stop_compute = block(ASYNC, "    fn release_async_compute_after_processor_stop(")
+assert stop_compute.index("completion.complete(Err(EIO))") < stop_compute.index(
+    "completion.release_after_processor_stop()"
+)
+assert stop_compute.index("completion.release_after_processor_stop()") < stop_compute.index(
+    "active._lease.rehabilitate_after_processor_stop()"
+)
+assert stop_compute.index("rehabilitate_after_processor_stop") < stop_compute.index(
+    "self.async_compute_queues.clear()"
+)
 
 pair = block(RESOURCES, "impl G17PRenderQueuePair")
 assert "let tiling = slot as u16 * 2" in pair

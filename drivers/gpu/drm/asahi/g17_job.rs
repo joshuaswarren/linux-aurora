@@ -127,6 +127,14 @@ impl G17PJobCompletion {
         drop(self.vm_job.lock().take());
         self.fence.signal();
     }
+
+    /// Release the VM pin of an already-signalled error completion after both
+    /// firmware processors stop. `complete` deliberately returns early after
+    /// `fail_while_owned`, while DRM sched may retain the packet Arc beyond
+    /// that fence; processor stop is the independent ownership witness.
+    pub(crate) fn release_after_processor_stop(&self) {
+        drop(self.vm_job.lock().take());
+    }
 }
 
 /// Everything a prepared compute submission needs remains owned until its
