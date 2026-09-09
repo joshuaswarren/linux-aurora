@@ -3,6 +3,7 @@
 
 from pathlib import Path
 import random
+import threading
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -65,6 +66,14 @@ assert "exec_lock(Some(&prepared.gem), false)" not in MMU
 assert "bind_lock" not in FILE
 assert "inner.sm_map_indexed(" in commit_batch
 assert "sm_unmap" in commit_batch
+assert commit_batch.count("gate.blocked") == 2
+assert "T8140VmMappingCommitGuard" in commit_batch
+assert commit_batch.index("exec_lock_array(&objects, true)") < commit_batch.rindex(
+    "gate.blocked"
+)
+assert commit_batch.index("core::mem::drop(inner)") < commit_batch.index(
+    "core::mem::drop(commit)"
+)
 
 
 # Executable failure-injection model. Whole-array semantic/resource
@@ -126,5 +135,118 @@ for index in range(50_000):
 ok, _, work = transact({}, stress, interrupt_lock=True)
 assert not ok
 assert work == len(stress) + 1
+
+
+# Exact race model for the two post-preflight orderings. Quarantine closes the
+# gate before an error fence can wake teardown; a binder which slept on
+# dma-resv must recheck after waking, while a commit already inside the gate
+# must finish before quarantine is allowed to publish failure.
+class MappingGate:
+    def __init__(self):
+        self.cv = threading.Condition()
+        self.blocked = False
+        self.commits = 0
+
+    def enter(self):
+        with self.cv:
+            if self.blocked:
+                return False
+            self.commits += 1
+            return True
+
+    def leave(self):
+        with self.cv:
+            self.commits -= 1
+            self.cv.notify_all()
+
+    def quarantine(self):
+        with self.cv:
+            self.blocked = True
+            while self.commits:
+                self.cv.wait()
+
+
+# Negative control: the former one-check path commits after its reservation
+# wait even though quarantine has already published the error boundary.
+old_resv_entered = threading.Event()
+old_resv_released = threading.Event()
+old_mutated = threading.Event()
+
+
+def old_bind_after_resv():
+    assert not old_gate.blocked
+    old_resv_entered.set()
+    old_resv_released.wait()
+    old_mutated.set()
+
+
+old_gate = MappingGate()
+old_binder = threading.Thread(target=old_bind_after_resv)
+old_binder.start()
+old_resv_entered.wait()
+old_gate.quarantine()
+old_resv_released.set()
+old_binder.join()
+assert old_mutated.is_set(), "negative control did not reproduce post-quarantine mutation"
+
+
+# Binder passed the cheap first check, then slept in drm_exec. Quarantine wins;
+# the second check rejects the leaf update after dma-resv wakes.
+gate = MappingGate()
+resv_entered = threading.Event()
+resv_released = threading.Event()
+mutated = threading.Event()
+
+
+def bind_after_resv():
+    assert not gate.blocked
+    resv_entered.set()
+    resv_released.wait()
+    if not gate.enter():
+        return
+    mutated.set()
+    gate.leave()
+
+
+binder = threading.Thread(target=bind_after_resv)
+binder.start()
+resv_entered.wait()
+gate.quarantine()
+error_fence_signalled = True
+resv_released.set()
+binder.join()
+assert error_fence_signalled and not mutated.is_set()
+
+
+# Binder entered the short prepared commit first. Quarantine must not return
+# (and therefore cannot signal its error fence) until that transaction leaves.
+gate = MappingGate()
+commit_entered = threading.Event()
+finish_commit = threading.Event()
+quarantine_returned = threading.Event()
+
+
+def active_commit():
+    assert gate.enter()
+    commit_entered.set()
+    finish_commit.wait()
+    gate.leave()
+
+
+def quarantine_during_commit():
+    gate.quarantine()
+    quarantine_returned.set()
+
+
+binder = threading.Thread(target=active_commit)
+binder.start()
+commit_entered.wait()
+quarantine = threading.Thread(target=quarantine_during_commit)
+quarantine.start()
+assert not quarantine_returned.wait(0.05)
+finish_commit.set()
+binder.join()
+quarantine.join()
+assert quarantine_returned.is_set()
 
 print("PASS bounded VM_BIND preflight and interruptible dma-resv regression model")

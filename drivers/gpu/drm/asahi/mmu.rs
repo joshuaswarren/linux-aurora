@@ -37,6 +37,7 @@ use kernel::{
     },
     error::Result,
     io,
+    new_condvar,
     new_mutex,
     page::Page,
     prelude::*,
@@ -48,6 +49,7 @@ use kernel::{
             Guard, //
         },
         Arc,
+        CondVar,
         Mutex, //
     },
     time::{
@@ -1117,6 +1119,7 @@ pub(crate) struct Vm {
     binding: Arc<Mutex<VmBinding>>,
     driver_mappings: Arc<Mutex<Option<VmDriverMappings>>>,
     job_lifetime: Arc<Mutex<T8140VmJobLifetime>>,
+    mapping_gate: Arc<T8140VmMappingGate>,
     status: Arc<crate::g17_status::VmStatus>,
     /// User bindings which are eligible for native's restricted context-0
     /// view. This records backing identity only; it never changes context 0
@@ -1131,10 +1134,45 @@ struct T8140VmJobLifetime {
     /// its error fence has signalled. Healthy synchronized VM_BIND unmaps stay
     /// immediate; only this lost-VM state defers them to processor stop.
     quarantined: bool,
+    /// The final job guard is applying deferred close/unmap work. New jobs
+    /// cannot enter until that teardown is complete.
+    draining: bool,
     closed: bool,
     close_ranges: Option<(Range<u64>, Range<u64>)>,
     deferred_unmaps: KVec<(u64, u64)>,
     closed_objects: KVec<ARef<gem::Object>>,
+}
+
+struct T8140VmMappingGateState {
+    blocked: bool,
+    commits: usize,
+}
+
+/// Serializes only the already-prepared leaf commit against lost-job
+/// quarantine.  In particular, this is acquired after drm_exec has locked the
+/// batch's BOs, so it neither expands dma-resv lock ordering into VM_BIND
+/// preparation nor turns an interruptible reservation wait into a deadlock.
+#[pin_data]
+struct T8140VmMappingGate {
+    #[pin]
+    state: Mutex<T8140VmMappingGateState>,
+    #[pin]
+    idle: CondVar,
+}
+
+struct T8140VmMappingCommitGuard {
+    gate: Arc<T8140VmMappingGate>,
+}
+
+impl Drop for T8140VmMappingCommitGuard {
+    fn drop(&mut self) {
+        let mut state = self.gate.state.lock();
+        debug_assert!(state.commits != 0);
+        state.commits -= 1;
+        if state.commits == 0 {
+            self.gate.idle.notify_all();
+        }
+    }
 }
 
 /// GPU ownership outlives a DRM handle or file. Deferred user mappings retain
@@ -1146,6 +1184,15 @@ impl T8140VmJobGuard {
     /// disproved. The sticky VM failure prevents new work; explicit unbinds
     /// are held until the last job guard reaches the processor-stop drain.
     pub(crate) fn quarantine(&self) {
+        // Close admission before publishing the error fence. A VM_BIND which
+        // already owns its dma-resv transaction finishes first; one which was
+        // sleeping on that interruptible acquisition observes `blocked` after
+        // it wakes and cannot mutate a firmware-owned mapping.
+        let mut gate = self.vm.mapping_gate.state.lock();
+        gate.blocked = true;
+        while gate.commits != 0 {
+            self.vm.mapping_gate.idle.wait(&mut gate);
+        }
         self.vm.job_lifetime.lock().quarantined = true;
     }
 }
@@ -1154,31 +1201,56 @@ impl Drop for T8140VmJobGuard {
         let mut state = self.vm.job_lifetime.lock();
         state.active -= 1;
         if state.active != 0 { return; }
-        state.quarantined = false;
-        let ranges = state.close_ranges.take();
-        let deferred_unmaps = core::mem::replace(&mut state.deferred_unmaps, KVec::new());
-        let objects = core::mem::replace(&mut state.closed_objects, KVec::new());
-        // Keep admission locked through the actual unmaps. Otherwise a new
-        // submit can acquire a job guard after active reaches zero but before
-        // these deferred leaves disappear, and then race its GPU access with
-        // teardown of the same mappings.
-        if let Some((user, kernel)) = ranges {
-            if self.vm.unmap_user_ranges_now(user, kernel).is_err() {
-                pr_err!("G17P VM job retirement: deferred user unmap failed\n");
-            }
-        } else {
-            for (iova, size) in deferred_unmaps {
-                if self.vm.unmap_range(iova, size).is_err() {
-                    pr_err!("G17P VM job retirement: deferred range unmap failed\n");
+        state.draining = true;
+        // Keep admission blocked, but do not hold the lifetime mutex while
+        // taking dma-resv locks. A VM_BIND may already own those locks and be
+        // waiting to append its now-blocked unmap under this mutex.
+        loop {
+            let ranges = state.close_ranges.take();
+            let deferred_unmaps =
+                core::mem::replace(&mut state.deferred_unmaps, KVec::new());
+            let objects = core::mem::replace(&mut state.closed_objects, KVec::new());
+            core::mem::drop(state);
+
+            if let Some((user, kernel)) = ranges {
+                if self.vm.unmap_user_ranges_now(user, kernel).is_err() {
+                    pr_err!("G17P VM job retirement: deferred user unmap failed\n");
+                }
+            } else {
+                for (iova, size) in deferred_unmaps {
+                    if self.vm.unmap_range(iova, size).is_err() {
+                        pr_err!("G17P VM job retirement: deferred range unmap failed\n");
+                    }
                 }
             }
-        }
-        for object in objects {
-            if self.vm.drop_mappings_now(&object).is_err() {
-                pr_err!("G17P VM job retirement: deferred GEM unmap failed\n");
+            for object in objects {
+                if self.vm.drop_mappings_now(&object).is_err() {
+                    pr_err!("G17P VM job retirement: deferred GEM unmap failed\n");
+                }
             }
+
+            // Pair with quarantine(): gate -> lifetime is the only nested
+            // order. A blocked unbind holds the same gate while appending, so
+            // observing an empty set here is an atomic reopen boundary.
+            let mut gate = self.vm.mapping_gate.state.lock();
+            state = self.vm.job_lifetime.lock();
+            if state.close_ranges.is_some()
+                || !state.deferred_unmaps.is_empty()
+                || !state.closed_objects.is_empty()
+            {
+                core::mem::drop(gate);
+                continue;
+            }
+            state.quarantined = false;
+            state.draining = false;
+            if !state.closed {
+                gate.blocked = false;
+            }
+            core::mem::drop(state);
+            core::mem::drop(gate);
+            self.vm.mapping_gate.idle.notify_all();
+            break;
         }
-        core::mem::drop(state);
         self.vm.bo_deferred_cleanup();
     }
 }
@@ -2204,10 +2276,20 @@ impl Vm {
             driver_mappings: Arc::pin_init(new_mutex!(None, "VmDriverMappings"), GFP_KERNEL)?,
             status: Arc::new(crate::g17_status::VmStatus::new(), GFP_KERNEL)?,
             job_lifetime: Arc::pin_init(new_mutex!(T8140VmJobLifetime {
-                active: 0, quarantined: false, closed: false,
+                active: 0, quarantined: false, draining: false, closed: false,
                 close_ranges: None, deferred_unmaps: KVec::new(),
                 closed_objects: KVec::new(),
             }, "T8140VmJobLifetime"), GFP_KERNEL)?,
+            mapping_gate: Arc::pin_init(
+                pin_init!(T8140VmMappingGate {
+                    state <- new_mutex!(T8140VmMappingGateState {
+                        blocked: false,
+                        commits: 0,
+                    }, "T8140VmMappingGate"),
+                    idle <- new_condvar!("T8140VmMappingGate::idle"),
+                }),
+                GFP_KERNEL,
+            )?,
             t8140_native_context_bindings: if cfg == UatConfig::T8140 {
                 Some(Arc::pin_init(
                     new_mutex!(
@@ -2538,10 +2620,19 @@ impl Vm {
     }
 
     pub(crate) fn retain_t8140_job(&self) -> Result<T8140VmJobGuard> {
-        let mut state = self.job_lifetime.lock();
-        if state.closed { return Err(ENOENT); }
-        state.active = state.active.checked_add(1).ok_or(EOVERFLOW)?;
-        Ok(T8140VmJobGuard { vm: self.clone() })
+        let mut gate = self.mapping_gate.state.lock();
+        loop {
+            let mut state = self.job_lifetime.lock();
+            if state.closed { return Err(ENOENT); }
+            if gate.blocked { return Err(EIO); }
+            if state.draining {
+                core::mem::drop(state);
+                self.mapping_gate.idle.wait(&mut gate);
+                continue;
+            }
+            state.active = state.active.checked_add(1).ok_or(EOVERFLOW)?;
+            return Ok(T8140VmJobGuard { vm: self.clone() });
+        }
     }
 
     /// Remove userspace mappings while preserving VM-lifetime driver aliases.
@@ -2550,12 +2641,22 @@ impl Vm {
         user_range: Range<u64>,
         kernel_range: Range<u64>,
     ) -> Result {
+        // VM destruction permanently closes this gate. Wait for an already
+        // prepared leaf transaction before deciding whether the final unmap is
+        // immediate or belongs to the last job guard.
+        let mut gate = self.mapping_gate.state.lock();
+        gate.blocked = true;
+        while gate.commits != 0 {
+            self.mapping_gate.idle.wait(&mut gate);
+        }
         let mut state = self.job_lifetime.lock();
         state.closed = true;
         if state.active != 0 {
             state.close_ranges = Some((user_range, kernel_range));
             return Ok(());
         }
+        core::mem::drop(state);
+        core::mem::drop(gate);
         self.unmap_user_ranges_now(user_range, kernel_range)
     }
 
@@ -3033,13 +3134,52 @@ impl Vm {
     pub(crate) fn accepts_user_maps(&self) -> bool {
         if self.status.get() != 0 { return false; }
         let state = self.job_lifetime.lock();
-        state.active == 0 || !state.quarantined
+        !state.draining && (state.active == 0 || !state.quarantined)
     }
 
     /// Allocate every deferred-unmap entry a batch could need before it
     /// changes a visible mapping.
     pub(crate) fn reserve_deferred_user_unmaps(&self, count: usize) -> Result {
         self.job_lifetime.lock().deferred_unmaps.reserve(count, GFP_KERNEL)?;
+        Ok(())
+    }
+
+    /// Settle a batch which lost mapping admission while it was waiting for
+    /// dma-resv. Maps are refused; teardown unmaps are retained behind the
+    /// firmware-owned job. The caller holds the mapping gate, making this
+    /// append atomic with the last job guard's drain/reopen decision.
+    fn defer_blocked_user_bind_batch(
+        &self,
+        batch: &PreparedUserBindBatch,
+    ) -> Result {
+        let mut lifetime = self.job_lifetime.lock();
+        if lifetime.closed {
+            return Err(ENOENT);
+        }
+        if batch
+            .ops
+            .iter()
+            .any(|op| matches!(op, PreparedUserBindOp::Map(_)))
+        {
+            return Err(EIO);
+        }
+        if !lifetime.quarantined {
+            return Err(EBUSY);
+        }
+        for op in &batch.ops {
+            let PreparedUserBindOp::Unmap(unmap) = op else {
+                continue;
+            };
+            if !lifetime
+                .deferred_unmaps
+                .iter()
+                .any(|range| *range == (unmap.iova, unmap.size))
+            {
+                lifetime
+                    .deferred_unmaps
+                    .push((unmap.iova, unmap.size), GFP_KERNEL)?;
+            }
+        }
         Ok(())
     }
 
@@ -3059,35 +3199,15 @@ impl Vm {
         &self,
         batch: &mut PreparedUserBindBatch,
     ) -> Result {
-        // A failed VM can still receive teardown unmaps. Keep the entire
-        // unmap-only batch behind the retained job guard instead of changing
-        // just its first range. New maps were rejected by accepts_user_maps().
-        let mut lifetime = self.job_lifetime.lock();
-        if lifetime.active != 0 && lifetime.quarantined {
-            if batch
-                .ops
-                .iter()
-                .any(|op| matches!(op, PreparedUserBindOp::Map(_)))
-            {
-                return Err(EIO);
+        // Avoid a reservation wait when quarantine/close was already visible.
+        // Keep the gate held through deferred-unmap insertion so the last job
+        // guard cannot reopen admission between observation and append.
+        {
+            let gate = self.mapping_gate.state.lock();
+            if gate.blocked {
+                return self.defer_blocked_user_bind_batch(batch);
             }
-            for op in &batch.ops {
-                let PreparedUserBindOp::Unmap(unmap) = op else {
-                    continue;
-                };
-                if !lifetime
-                    .deferred_unmaps
-                    .iter()
-                    .any(|range| *range == (unmap.iova, unmap.size))
-                {
-                    lifetime
-                        .deferred_unmaps
-                        .push((unmap.iova, unmap.size), GFP_KERNEL)?;
-                }
-            }
-            return Ok(());
         }
-        core::mem::drop(lifetime);
 
         let mut objects = KVec::with_capacity(batch.ops.len(), GFP_KERNEL)?;
         for op in &batch.ops {
@@ -3096,45 +3216,67 @@ impl Vm {
             }
         }
         let mut inner = self.inner.exec_lock_array(&objects, true)?;
+        let commit = {
+            // This second check is load-bearing. Quarantine can begin while
+            // drm_gpuvm_exec_lock_array sleeps interruptibly; once this guard
+            // is counted, quarantine waits for the complete leaf transaction
+            // before it is allowed to signal the error fence.
+            let mut gate = self.mapping_gate.state.lock();
+            if gate.blocked {
+                core::mem::drop(inner);
+                return self.defer_blocked_user_bind_batch(batch);
+            }
+            gate.commits = gate.commits.checked_add(1).ok_or(EOVERFLOW)?;
+            T8140VmMappingCommitGuard {
+                gate: self.mapping_gate.clone(),
+            }
+        };
         let mut object_index = 0usize;
-        for op in &mut batch.ops {
-            match op {
-                PreparedUserBindOp::Map(map) => {
-                    let (flags, gem_range) = if map.single_page {
-                        (gpuvm::GpuVaFlags::REPEAT, UAT_PGSZ as u32)
-                    } else {
-                        (gpuvm::GpuVaFlags::NONE, 0u32)
-                    };
-                    mod_dev_dbg!(
-                        inner.dev,
-                        "MMU: sm_map: {:#x} [{:#x}] -> {:#x}\n",
-                        map.offset,
-                        map.size,
-                        map.addr
-                    );
-                    inner.sm_map_indexed(
-                        object_index,
-                        &mut map.ctx,
-                        map.addr,
-                        map.size,
-                        map.offset,
-                        gem_range,
-                        flags,
-                    )?;
-                    object_index += 1;
-                }
-                PreparedUserBindOp::Unmap(unmap) => {
-                    mod_dev_dbg!(
-                        inner.dev,
-                        "MMU: sm_unmap: {:#x}:{:#x}\n",
-                        unmap.iova,
-                        unmap.size
-                    );
-                    inner.sm_unmap(&mut unmap.ctx, unmap.iova, unmap.size)?;
+        let result = (|| {
+            for op in &mut batch.ops {
+                match op {
+                    PreparedUserBindOp::Map(map) => {
+                        let (flags, gem_range) = if map.single_page {
+                            (gpuvm::GpuVaFlags::REPEAT, UAT_PGSZ as u32)
+                        } else {
+                            (gpuvm::GpuVaFlags::NONE, 0u32)
+                        };
+                        mod_dev_dbg!(
+                            inner.dev,
+                            "MMU: sm_map: {:#x} [{:#x}] -> {:#x}\n",
+                            map.offset,
+                            map.size,
+                            map.addr
+                        );
+                        inner.sm_map_indexed(
+                            object_index,
+                            &mut map.ctx,
+                            map.addr,
+                            map.size,
+                            map.offset,
+                            gem_range,
+                            flags,
+                        )?;
+                        object_index += 1;
+                    }
+                    PreparedUserBindOp::Unmap(unmap) => {
+                        mod_dev_dbg!(
+                            inner.dev,
+                            "MMU: sm_unmap: {:#x}:{:#x}\n",
+                            unmap.iova,
+                            unmap.size
+                        );
+                        inner.sm_unmap(&mut unmap.ctx, unmap.iova, unmap.size)?;
+                    }
                 }
             }
-        }
-        Ok(())
+            Ok(())
+        })();
+        // Keep quarantine behind the reservation unlock as well as the leaf
+        // writes. This makes the error fence a complete transaction boundary.
+        core::mem::drop(inner);
+        core::mem::drop(commit);
+        result
     }
 
     /// Add a direct MMIO mapping to this Vm at a free address.
@@ -3221,21 +3363,9 @@ impl Vm {
         &self,
         prepared: PreparedUserUnmap,
     ) -> Result {
-        let iova = prepared.iova;
-        let size = prepared.size;
-        let mut state = self.job_lifetime.lock();
-        if state.active != 0 && state.quarantined {
-            if !state
-                .deferred_unmaps
-                .iter()
-                .any(|range| *range == (iova, size))
-            {
-                state.deferred_unmaps.push((iova, size), GFP_KERNEL)?;
-            }
-            return Ok(());
-        }
-        core::mem::drop(state);
-        self.unmap_prepared_range(prepared)
+        let mut batch = PreparedUserBindBatch::new(1)?;
+        batch.push_unmap(prepared)?;
+        self.commit_prepared_user_bind_batch(&mut batch)
     }
 
     /// Unmap everything in an address range. Callers must hold the job
