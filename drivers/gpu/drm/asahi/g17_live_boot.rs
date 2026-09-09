@@ -7282,6 +7282,27 @@ impl g17_lifecycle::PersistentRuntimeRecovery for G17PLiveRuntime {
         }
     }
 
+    fn fail_outstanding_jobs_while_owned(&mut self) {
+        // A failed processor stop is not a retirement witness. Signal every
+        // accepted fence so syncobj waiters observe device loss, but leave the
+        // completion packets, VM pins, render-slot leases, roots, and mappings
+        // in their runtime owners for a later successful stop or final leak-
+        // safe teardown.
+        for completion in self.pending_render.iter().flatten() {
+            completion.fail_while_owned(EIO);
+        }
+        for queue in &mut self.async_compute_queues {
+            let Some(active) = queue.active.as_ref() else {
+                continue;
+            };
+            queue.quarantined = true;
+            active._lease.quarantine();
+            if let Ok(completion) = active.packet.completion() {
+                completion.fail_while_owned(EIO);
+            }
+        }
+    }
+
     fn drop_gfx1_rtkit(&mut self) {
         drop(self.gfx1_rtkit.take());
         drop(self.gfx1_state.take());
@@ -7306,6 +7327,10 @@ impl g17_lifecycle::PersistentRuntimeRecovery for G17PLiveRuntime {
         drop(self.pending_compute.take());
         for completion in self.pending_render.iter_mut().filter_map(Option::take) {
             completion.complete(Err(EIO));
+            // `complete` is exact-once and deliberately keeps guards when an
+            // earlier failed-stop attempt already signalled the fence. This
+            // successful stop is the independent release witness.
+            completion.release_after_processor_stop();
         }
         self.release_quarantined_render_after_processor_stop();
         self.render_event_masks = [[0; 2];
@@ -7455,6 +7480,7 @@ impl g17_lifecycle::PersistentRuntimeTeardown for G17PLiveRuntime {
     fn drop_queue(&mut self) {
         for completion in self.pending_render.iter_mut().filter_map(Option::take) {
             completion.complete(Err(EIO));
+            completion.release_after_processor_stop();
         }
         self.release_quarantined_render_after_processor_stop();
         self.render_event_masks = [[0; 2];
