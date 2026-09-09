@@ -27,6 +27,7 @@ vm_bind = block(FILE, "    pub(crate) fn vm_bind(")
 prepare_map = block(MMU, "    pub(crate) fn prepare_bind_object(")
 commit_batch = block(MMU, "    pub(crate) fn commit_prepared_user_bind_batch(")
 enter_commit = block(MMU, "    fn enter_user_mapping_commit(")
+defer_blocked = block(MMU, "    fn defer_blocked_user_bind_batch(")
 
 # The whole userspace array is copied, validated, and prepared before commit.
 assert vm_bind.index("ops.push(bind") < vm_bind.index("for op in ops")
@@ -76,10 +77,17 @@ assert "exec_lock(Some(&prepared.gem), false)" not in MMU
 assert "bind_lock" not in FILE
 assert "inner.sm_map(" in commit_batch
 assert "sm_unmap" in commit_batch
-assert commit_batch.count("gate.blocked") == 1
 assert "enter_user_mapping_commit" in commit_batch
+assert commit_batch.count("defer_blocked_user_bind_batch(batch)?") == 2
 assert "T8140VmMappingCommitGuard" in enter_commit
 assert "gate.blocked" in enter_commit
+assert defer_blocked.index("mapping_gate.state.lock()") < defer_blocked.index(
+    "job_lifetime.lock()"
+)
+assert "if !gate.blocked" in defer_blocked and "return Ok(false)" in defer_blocked
+assert defer_blocked.index("job_lifetime.lock()") < defer_blocked.index(
+    ".push((unmap.iova, unmap.size), GFP_KERNEL)"
+)
 assert commit_batch.index("exec_lock(Some(&map.gem), true)") < commit_batch.index(
     "enter_user_mapping_commit"
 )
@@ -198,6 +206,18 @@ class MappingGate:
             while self.commits:
                 self.cv.wait()
 
+    def reopen(self):
+        with self.cv:
+            self.blocked = False
+            self.cv.notify_all()
+
+    def defer_or_retry(self, deferred, item):
+        with self.cv:
+            if not self.blocked:
+                return False
+            deferred.append(item)
+            return True
+
 
 # Negative control: the former one-check path commits after its reservation
 # wait even though quarantine has already published the error boundary.
@@ -249,6 +269,28 @@ error_fence_signalled = True
 resv_released.set()
 binder.join()
 assert error_fence_signalled and not mutated.is_set()
+
+
+# Negative control for the former post-lock path: `enter` observed blocked,
+# then the final job reopened admission before the caller appended its unmap.
+# Treating that reopened state as a hard EBUSY loses a valid teardown request.
+gate = MappingGate()
+gate.quarantine()
+assert not gate.enter()
+gate.reopen()
+old_result = "EBUSY"
+assert old_result == "EBUSY"
+
+# Production rechecks under the same gate used by the drain. A reopened gate
+# means retry this exact operation; a still-blocked gate owns the deferred
+# insertion until the drain can observe it.
+deferred = []
+assert not gate.defer_or_retry(deferred, (0x5000, 0x4000))
+assert gate.enter()
+gate.leave()
+gate.quarantine()
+assert gate.defer_or_retry(deferred, (0x5000, 0x4000))
+assert deferred == [(0x5000, 0x4000)]
 
 
 # Binder entered the short prepared commit first. Quarantine must not return

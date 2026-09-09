@@ -51,9 +51,11 @@ assert quarantine.index("gate.blocked = true") < quarantine.index("while gate.co
 assert quarantine.index("while gate.commits != 0") < quarantine.index(
     "job_lifetime.lock().quarantined = true"
 )
-assert commit_batch.count("gate.blocked") == 1
 assert "exec_lock_array" not in commit_batch
 assert "gate.blocked" in enter_commit
+assert "mapping_gate.state.lock()" in defer_batch
+assert "if !gate.blocked" in defer_batch and "return Ok(false)" in defer_batch
+assert commit_batch.count("defer_blocked_user_bind_batch(batch)?") == 2
 assert commit_batch.index("exec_lock(Some(&map.gem), true)") < commit_batch.index(
     "enter_user_mapping_commit"
 )
