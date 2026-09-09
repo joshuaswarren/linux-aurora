@@ -440,6 +440,17 @@ impl G17PComputeLeaseGuard {
         drop(held);
         self.registry.lease_free.notify_all();
     }
+
+    /// Clear the device-wide admission poison only after both firmware
+    /// processors stop. The runtime still owns this guard at that boundary,
+    /// so the registry cannot lose the recovery transition when the active
+    /// queue graph is dropped immediately afterward.
+    pub(crate) fn rehabilitate_after_processor_stop(&self) {
+        let held = self.registry.lease.lock();
+        self.registry.compute_faulted.store(0, Ordering::Release);
+        drop(held);
+        self.registry.lease_free.notify_all();
+    }
 }
 impl Drop for G17PComputeLeaseGuard {
     fn drop(&mut self) {

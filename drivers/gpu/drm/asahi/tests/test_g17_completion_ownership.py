@@ -91,8 +91,7 @@ impl {name} {{
     else:
         source += item(impl, '    pub(crate) fn fail_while_owned(')
     source += item(impl, '    pub(crate) fn complete(')
-    if name == 'Render':
-        source += item(impl, '    pub(crate) fn release_after_processor_stop(')
+    source += item(impl, '    pub(crate) fn release_after_processor_stop(')
     source += '\n}\n'
 
 source += r'''
@@ -137,6 +136,12 @@ fn compute(m:&Arc<Memory>)->Arc<Compute>{let s=Arc::new(Status::default());Arc::
 #[test] fn retired_compute_releases_before_signal(){
  let m=Arc::new(Memory::default());let c=compute(&m);m.close();c.complete(Ok([1,2]));
  assert!(m.unmapped.load(Ordering::SeqCst));assert_eq!(c.fence.active_at_signal.load(Ordering::SeqCst),0);
+}
+#[test] fn stopped_compute_error_releases_vm_pin_despite_scheduler_arc(){
+ let m=Arc::new(Memory::default());let runtime=compute(&m);let scheduler=runtime.clone();
+ m.close();runtime.fail_while_owned(EIO);assert!(!m.unmapped.load(Ordering::SeqCst));
+ runtime.release_after_processor_stop();assert!(m.unmapped.load(Ordering::SeqCst));
+ runtime.release_after_processor_stop();drop(runtime);drop(scheduler);
 }
 #[test] fn competing_error_notifications_keep_ownership_and_signal_once(){
  let m=Arc::new(Memory::default());let released=Arc::new(AtomicUsize::new(0));let c=render(&m,&released);m.close();

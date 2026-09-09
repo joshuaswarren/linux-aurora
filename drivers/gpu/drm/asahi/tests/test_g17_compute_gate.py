@@ -43,6 +43,13 @@ impl G17PQueueRegistry{fn new()->Arc<Self>{Arc::new(Self{lease:Mutex(std::sync::
 #[test]fn quarantine_wakes_render_waiter_without_releasing_live_slots(){
  let r=G17PQueueRegistry::new();let q=r.acquire_compute(false).unwrap();let _a=r.acquire_lease(7).unwrap();let _b=r.acquire_lease(8).unwrap();let(tx,rx)=std::sync::mpsc::channel();let rr=r.clone();let w=std::thread::spawn(move||{tx.send(rr.acquire_lease(9).err()).unwrap();});assert!(rx.recv_timeout(Duration::from_millis(20)).is_err());q.quarantine();assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(),Some(EIO));assert_eq!(r.lease.lock().render_slots,3);w.join().unwrap();drop(q);
 }
+#[test]fn processor_stop_clears_compute_poison_before_the_old_lease_drops(){
+ let r=G17PQueueRegistry::new();let q=r.acquire_compute(false).unwrap();q.quarantine();
+ assert_eq!(r.acquire_compute(false).err(),Some(EIO));
+ q.rehabilitate_after_processor_stop();drop(q);
+ let recovered=r.acquire_compute(false).unwrap();drop(recovered);
+ let render=r.acquire_lease(7).unwrap();drop(render);
+}
 '''
 with tempfile.TemporaryDirectory() as d:
  f=Path(d)/'test.rs';f.write_text(code);exe=Path(d)/'test';subprocess.run(['rustc','--edition=2021','--test',str(f),'-o',str(exe)],check=True);subprocess.run([str(exe),'--test-threads=1'],check=True,timeout=10)
