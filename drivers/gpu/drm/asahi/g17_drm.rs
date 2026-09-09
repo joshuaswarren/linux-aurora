@@ -505,12 +505,23 @@ impl G17PRenderCompletion {
 
     pub(crate) fn fence(&self) -> Fence { Fence::from_fence(&self.fence) }
 
+    pub(crate) fn belongs_to_vm(
+        &self,
+        status: &Arc<crate::g17_status::VmStatus>,
+    ) -> bool {
+        Arc::ptr_eq(&self.status, status)
+    }
+
+    pub(crate) fn vm_status(&self) -> Arc<crate::g17_status::VmStatus> {
+        self.status.clone()
+    }
+
     /// Report failure without claiming that firmware stopped using this job.
     /// The runtime must retain this completion through queue retirement or
     /// processor stop. In particular, an error fence is not an unmap witness.
-    pub(crate) fn fail_while_owned(&self, error: Error) {
+    pub(crate) fn fail_while_owned(&self, error: Error) -> bool {
         if self.signalled.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
-            return;
+            return false;
         }
         if let Some(vm_job) = self.vm_job.lock().as_ref() {
             vm_job.quarantine();
@@ -527,6 +538,7 @@ impl G17PRenderCompletion {
         // Retain BOTH guards: dropping the lease here also lets a waiter
         // reacquire this physical slot before quarantine is recorded.
         self.fence.signal();
+        true
     }
 
     /// Signal at most once even when both RTKit roles report the same event.
@@ -882,27 +894,43 @@ impl g17_job::G17PQueueBackend for G17PAsyncQueueBackend {
         self.runtime.mutex().lock().async_compute_dependency(self.owner)
     }
     fn publish(&self, packet: Arc<g17_job::G17PComputeJobPacket>) -> Result<Fence> {
-        let completion = packet.completion()?;
-        // Several compute jobs may already be queued behind one predecessor.
-        // If that predecessor failed, its scheduler fence wakes this job, but
-        // a signalled error dependency is still "ready" to DRM sched. Refuse
-        // the queued successor before acquiring a lease or publishing it.
-        if completion.status.get() != 0 {
-            completion.complete(Err(EIO));
-            return Err(EIO);
+        let status = packet.completion()?.status.clone();
+        let result = (|| -> Result<Fence> {
+            let completion = packet.completion()?;
+            // Several compute jobs may already be queued behind one predecessor.
+            // If that predecessor failed, its scheduler fence wakes this job, but
+            // a signalled error dependency is still "ready" to DRM sched. Refuse
+            // the queued successor before acquiring a lease or publishing it.
+            if completion.status.get() != 0 {
+                completion.complete(Err(EIO));
+                return Err(EIO);
+            }
+            // A dma_fence carrying an error is still signalled, so DRM sched has
+            // legitimately made this job runnable. It does not mean the GPU
+            // dependency succeeded. Consume every retained dependency status
+            // before taking a hardware lease or writing queue state.
+            for fence in packet.input_fences() {
+                G17PQueue::wait_fence(fence)?;
+            }
+            let hardware_fence = completion.fence();
+            let first_install = self.runtime.mutex().lock().async_compute_needs_install(self.owner)?;
+            let lease = self.registry.acquire_compute(first_install)?;
+            self.runtime.mutex().lock().publish_async_compute(self.owner, packet, lease)?;
+            Ok(hardware_fence)
+        })();
+        if let Err(error) = result.as_ref() {
+            let lost = *error == EIO
+                || *error == ETIMEDOUT
+                || *error == ENODEV
+                || status.get() != 0;
+            if lost {
+                self.runtime
+                    .mutex()
+                    .lock()
+                    .fail_outstanding_jobs_for_vm(&status, *error);
+            }
         }
-        // A dma_fence carrying an error is still signalled, so DRM sched has
-        // legitimately made this job runnable. It does not mean the GPU
-        // dependency succeeded. Consume every retained dependency status
-        // before taking a hardware lease or writing queue state.
-        for fence in packet.input_fences() {
-            G17PQueue::wait_fence(fence)?;
-        }
-        let hardware_fence = completion.fence();
-        let first_install = self.runtime.mutex().lock().async_compute_needs_install(self.owner)?;
-        let lease = self.registry.acquire_compute(first_install)?;
-        self.runtime.mutex().lock().publish_async_compute(self.owner, packet, lease)?;
-        Ok(hardware_fence)
+        result
     }
     fn timed_out(&self, packet: Arc<g17_job::G17PComputeJobPacket>) -> kernel::drm::sched::Status {
         self.runtime.mutex().lock().quarantine_async_compute(self.owner, packet.submission_id(), ETIMEDOUT);

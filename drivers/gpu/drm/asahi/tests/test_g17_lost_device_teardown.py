@@ -23,6 +23,7 @@ import subprocess, tempfile
 SOURCE = Path(__file__).resolve().parents[1]
 drm = (SOURCE / 'g17_drm.rs').read_text()
 async_compute = (SOURCE / 'g17_async_compute.rs').read_text()
+live = (SOURCE / 'g17_live_boot.rs').read_text()
 file_rs = (SOURCE / 'file.rs').read_text()
 
 
@@ -59,9 +60,36 @@ assert guarded.index('self.note_submission_failure(submission_id, error);') \
 
 note = item(drm, '    fn note_submission_failure(')
 sweep = item(async_compute, '    pub(crate) fn fail_outstanding_jobs_for_vm(')
+sweep_after_observation = item(
+    async_compute, '    fn fail_outstanding_jobs_for_vm_after_compute_observation(')
+completion_service = item(async_compute, '    fn service_async_compute_completions_matching(')
+quarantine_compute = item(async_compute, '    pub(crate) fn quarantine_async_compute(')
+timeout_render = item(live, '    pub(crate) fn timeout_deferred_render(')
+publish_compute = item(drm, '    fn publish(&self, packet: Arc<g17_job::G17PComputeJobPacket>)')
 # The packet stays retained: firmware may still be executing it.
-assert 'active = None' not in sweep and '.take()' not in sweep, \
+assert 'active = None' not in sweep_after_observation and \
+    '.active.take()' not in sweep_after_observation, \
     'the sweep releases a packet the firmware may still own'
+assert 'pending_render' in sweep_after_observation and \
+    'belongs_to_vm(status)' in sweep_after_observation, \
+    'terminal VM settlement does not cover outstanding renders'
+assert completion_service.index('completion.fail_while_owned(error)') < \
+    completion_service.index('q.terminal_fanout = Some((') < \
+    completion_service.index('// Finish the acquired batch before failing peers.') < \
+    completion_service.index(
+        'self.fail_outstanding_jobs_for_vm_after_compute_observation('), \
+    'completion-poll failure fanout runs before the acquired batch is drained'
+assert quarantine_compute.index('completion.fail_while_owned(error)') < \
+    quarantine_compute.index('self.fail_outstanding_jobs_for_vm(&status, error)'), \
+    'a terminal compute timeout does not fan out to its VM peers'
+assert timeout_render.index('signal.fail_while_owned(error)') < \
+    timeout_render.index('self.fail_outstanding_jobs_for_vm(&status, error)'), \
+    'a terminal render timeout does not fan out to its VM peers'
+assert '.fail_outstanding_jobs_for_vm(&status, *error)' in publish_compute, \
+    'a scheduler-time compute publication failure strands prior VM work'
+assert publish_compute.index('if lost {') < \
+    publish_compute.index('.fail_outstanding_jobs_for_vm(&status, *error)'), \
+    'a recoverable compute publication refusal poisons the VM'
 
 preamble = r'''
 #![allow(dead_code)]
@@ -102,8 +130,12 @@ struct Completion{
  status_at_signal:RefCell<i32>,
 }
 impl Completion{
- fn fail_while_owned(&self,error:Error){self.complete(Err(error));}
+ fn belongs_to_vm(&self,status:&Arc<crate::g17_status::VmStatus>)->bool{Arc::ptr_eq(&self.status,status)}
+ fn fail_while_owned(&self,error:Error)->bool{
+  if self.signalled.borrow().is_some(){return false;}self.complete(Err(error));true
+ }
  fn complete(&self,result:Result){
+  if self.signalled.borrow().is_some(){return;}
   if let Err(error)=result{ self.status.record(error.to_errno()); }
   *self.status_at_signal.borrow_mut()=self.status.get();
   *self.signalled.borrow_mut()=Some(result.err().map(|e|e.to_errno()).unwrap_or(0));
@@ -124,6 +156,10 @@ struct G17PAsyncComputeActive{packet:Arc<Packet>,_lease:Lease}
 struct Queue(u8);
 impl Queue{fn queue_id(&self)->u8{self.0}}
 struct G17PAsyncComputeQueue{queue:Queue,active:Option<G17PAsyncComputeActive>,quarantined:bool}
+mod g17_resources{
+ pub struct G17PRenderQueuePair;
+ impl G17PRenderQueuePair{pub const SLOT_COUNT:u8=2;}
+}
 struct Pdev;
 impl Pdev{fn as_ref(&self)->&Self{self}}
 #[derive(Default)]
@@ -132,10 +168,20 @@ struct G17PLiveRuntime{
  async_compute_queues:Vec<G17PAsyncComputeQueue>,
  pdev:Option<Pdev>,
  serviced:u32,
+ render_observations:u32,
+ render_completed:[bool;2],
+ pending_render:[Option<Completion>;2],
  session_recovery_pending:bool,
 }
 impl G17PLiveRuntime{
  fn service_async_compute_completions(&mut self)->Result{self.serviced+=1;Ok(())}
+ fn poll_deferred_render_completion(&mut self,slot:u8)->Result<Option<u8>>{
+  self.render_observations+=1;Ok(self.render_completed[slot as usize].then_some(slot))
+ }
+ fn settle_deferred_render_completion(&mut self,slot:u8,_observed:u8)->Result<bool>{
+  if let Some(completion)=self.pending_render[slot as usize].take(){completion.complete(Ok(()));}
+  Ok(true)
+ }
 '''
 
 harness = r'''
@@ -179,7 +225,12 @@ fn runtime(owners:&[Arc<crate::g17_status::VmStatus>])->(G17PLiveRuntime,Vec<Arc
   });
  }
  (G17PLiveRuntime{async_compute_queues:queues,pdev:Some(Pdev),serviced:0,
+   render_observations:0,render_completed:[false;2],pending_render:[None,None],
    session_recovery_pending:false},leases)
+}
+
+fn completion(status:Arc<crate::g17_status::VmStatus>)->Completion{
+ Completion{status,signalled:RefCell::new(None),status_at_signal:RefCell::new(0)}
 }
 
 #[test]fn only_the_lost_vm_s_jobs_are_failed(){
@@ -196,6 +247,53 @@ fn runtime(owners:&[Arc<crate::g17_status::VmStatus>])->(G17PLiveRuntime,Vec<Arc
  assert_eq!(healthy.get(),0,"a healthy client's VM was retired");
  // Nothing is released: the firmware may still be running these packets.
  assert!(rt.async_compute_queues.iter().all(|q|q.active.is_some()));
+}
+
+#[test]fn one_terminal_failure_settles_same_vm_render_and_compute_only(){
+ let lost=Arc::new(crate::g17_status::VmStatus::new());
+ let healthy=Arc::new(crate::g17_status::VmStatus::new());
+ let (mut rt,leases)=runtime(&[lost.clone(),healthy.clone()]);
+ rt.pending_render=[Some(completion(lost.clone())),Some(completion(healthy.clone()))];
+ assert_eq!(rt.fail_outstanding_jobs_for_vm(&lost,ETIMEDOUT),2);
+ assert_eq!(*rt.pending_render[0].as_ref().unwrap().signalled.borrow(),Some(ETIMEDOUT.to_errno()));
+ assert_eq!(*rt.pending_render[1].as_ref().unwrap().signalled.borrow(),None);
+ assert_eq!(leases[0].load(Ordering::SeqCst),1);
+ assert_eq!(leases[1].load(Ordering::SeqCst),0);
+ assert_eq!(healthy.get(),0,"the peer VM was poisoned");
+ assert!(rt.session_recovery_pending);
+ assert_eq!(rt.fail_outstanding_jobs_for_vm(&lost,EIO),0,"same owners failed twice");
+}
+
+#[test]fn compute_poll_failure_settles_same_vm_peers_without_a_second_ring_scan(){
+ let lost=Arc::new(crate::g17_status::VmStatus::new());
+ let healthy=Arc::new(crate::g17_status::VmStatus::new());
+ let (mut rt,leases)=runtime(&[lost.clone(),lost.clone(),healthy.clone()]);
+ rt.pending_render=[Some(completion(lost.clone())),Some(completion(healthy.clone()))];
+ {
+  let failed=&mut rt.async_compute_queues[0];
+  failed.quarantined=true;
+  let active=failed.active.as_ref().unwrap();
+  active._lease.quarantine();
+  active.packet.completion().unwrap().fail_while_owned(EIO);
+ }
+ assert_eq!(rt.fail_outstanding_jobs_for_vm_after_compute_observation(&lost,EIO),2);
+ assert_eq!(rt.serviced,0,"poll-error fanout rescanned the compute completion ring");
+ assert_eq!(rt.async_compute_queues.iter().map(|q|q.quarantined).collect::<Vec<_>>(),
+  vec![true,true,false]);
+ assert_eq!(leases.iter().map(|l|l.load(Ordering::SeqCst)).collect::<Vec<_>>(),vec![1,1,0]);
+ assert_eq!(*rt.pending_render[0].as_ref().unwrap().signalled.borrow(),Some(EIO.to_errno()));
+ assert_eq!(*rt.pending_render[1].as_ref().unwrap().signalled.borrow(),None);
+ assert_eq!(healthy.get(),0,"the completion-poll failure poisoned a peer VM");
+}
+
+#[test]fn render_completion_visible_at_terminal_boundary_wins(){
+ let lost=Arc::new(crate::g17_status::VmStatus::new());
+ let (mut rt,_)=runtime(&[]);
+ rt.pending_render[0]=Some(completion(lost.clone()));
+ rt.render_completed[0]=true;
+ assert_eq!(rt.fail_outstanding_jobs_for_vm(&lost,EIO),0);
+ assert!(rt.pending_render[0].is_none());
+ assert_eq!(rt.render_observations,1);
 }
 
 #[test]fn a_woken_waiter_can_always_see_why(){
@@ -264,7 +362,7 @@ fn queue(status:Arc<crate::g17_status::VmStatus>,jobs:&[Arc<crate::g17_status::V
 }
 '''
 
-code = preamble + sweep + harness + note_impl + tests
+code = preamble + sweep_after_observation + sweep + harness + note_impl + tests
 with tempfile.TemporaryDirectory() as d:
     d = Path(d)
     f = d / 'teardown.rs'

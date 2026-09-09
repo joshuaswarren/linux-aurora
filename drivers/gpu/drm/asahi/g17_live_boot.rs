@@ -4176,6 +4176,7 @@ impl G17PLiveRuntime {
                     retired,
                 );
             }
+            let status = signal.vm_status();
             if retired {
                 signal.complete(Err(EIO));
             } else {
@@ -4200,6 +4201,7 @@ impl G17PLiveRuntime {
                     );
                 }
             }
+            self.fail_outstanding_jobs_for_vm(&status, error);
         }
     }
 
