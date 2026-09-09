@@ -65,7 +65,7 @@ for name in ["recycle_desynced_render_storage",
 # reserved ID. This prevents the incoming graph from immediately reusing the
 # same PBDesc slot; the previous quarantine is returned before it is dropped.
 handoff = block(manager, r"^    pub\(crate\) fn handoff_retained_render_vm\(")
-assert "self.retired_render_handoff_graph.replace(retired)" in handoff
+assert "self.retired_render_handoff_graph = Some(retired)" in handoff
 assert "unreserve_render_storage_hardware_buffer_id" not in handoff
 release_retired = block(manager, r"^    fn release_retired_handoff_graph\(")
 assert release_retired.index("ids.unreserve(id)") < release_retired.index("drop(retired)")
@@ -91,12 +91,12 @@ assert "retire_abandoned_render_if_firmware_retired()" in abandon
 assert "retire_render_usc_freelist_at_completion()" in abandon
 assert abandon.index("retire_abandoned_render_if_firmware_retired()") \
     < abandon.index("abandon_render_submission_after_timeout()")
-wait = block(drm, r"^    fn wait_render_slot\(")
-assert "abandon_deferred_render(render_slot)?" in wait
-assert wait.index("return Err(EIO)") < wait.index("Err(ETIMEDOUT)")
-submit = block(drm, r"^    fn submit_guarded\(")
-assert "if error == ETIMEDOUT" in submit and "quarantine_render_slot(lease.slot())" in submit, \
-    "only a group the firmware still holds may retire the slot"
+timeout = block(runtime, r"^    pub\(crate\) fn timeout_deferred_render\(")
+assert "abandon_deferred_render(render_slot).unwrap_or(false)" in timeout
+assert timeout.index("if retired") < timeout.index("signal.complete(Err(EIO))")
+assert timeout.index("signal.complete(Err(EIO))") < timeout.index("signal.fail_while_owned(error)")
+assert "quarantined_render_completions" in timeout, \
+    "only an unretired group may retain and quarantine its physical slot"
 
 # --- the allocator itself ----------------------------------------------------
 derive = "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\n"
