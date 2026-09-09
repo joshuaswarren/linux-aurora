@@ -360,10 +360,17 @@ impl G17PLiveRuntime {
                         active._lease.quarantine();
                         if let Some(pdev) = &self.pdev {
                             dev_err!(pdev.as_ref(),
-                                "G17P async compute: QUARANTINE submission={} qid={} context={} error={:?}\n",
-                                submission, q.queue.queue_id(), active.packet.context().context_id(), error);
+                                "G17P async compute: QUARANTINE submission={} owner={} qid={} context={} vm={} root={:#x} root-current={} global-phase={:?} error={:?}\n",
+                                submission, owner, q.queue.queue_id(), active.packet.context().context_id(),
+                                active.packet.context().vm_id(), active.packet.context().root(),
+                                active.packet.context().is_current(),
+                                self.gfx_state.as_ref().map(|s| s.submission_phase.load(Ordering::Acquire)), error);
                         }
                         if let Some(manager) = self.manager.as_mut() {
+                            // Sample the actual retained owner, not the legacy
+                            // boot queue. Do this before the completion dump's
+                            // console output delays the cursor observation.
+                            manager.log_async_compute_timeout(&mut q.queue);
                             let _ = manager.dump_compute_completion_records("async-timeout");
                         }
                         if let Ok(completion) = active.packet.completion() { completion.fail_while_owned(error); }

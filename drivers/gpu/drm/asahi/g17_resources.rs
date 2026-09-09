@@ -3107,6 +3107,26 @@ pub(crate) struct G17PComputeRingState {
     pub(crate) reclaimed_total: u64,
 }
 
+/// Retained DRAM bytes for the selected submission, not descriptor slot zero.
+#[cfg(not(test))]
+#[derive(Debug, Copy, Clone)]
+pub(crate) struct G17PComputeSubmissionSnapshot {
+    pub(crate) descriptor: u64,
+    pub(crate) selector: u32,
+    pub(crate) context: u32,
+    pub(crate) grid: u32,
+    pub(crate) work_key: Option<u64>,
+    pub(crate) scheduler_record: u64,
+    pub(crate) stamp_pointer: u64,
+    pub(crate) stamp_value: u32,
+    /// Current target, completed count, and final visibility stamp.
+    pub(crate) tsq: [u32; 3],
+    /// Fixed retained command windows; may be reclaimed after consumption.
+    pub(crate) tag15: [u64; 12],
+    pub(crate) tag16: [u64; 3],
+    pub(crate) tag14: [u64; 8],
+}
+
 #[cfg(not(test))]
 #[cfg(not(test))]
 #[derive(Debug, Copy, Clone)]
@@ -4292,6 +4312,65 @@ impl G17PComputeDescriptorStorage {
                     .map_err(|_| ERANGE)?,
             ))
         })
+    }
+
+    /// Never follows a pointer supplied by firmware. The expected high VA
+    /// must select an aligned slot inside this queue's retained descriptor BO.
+    /// Reads can race firmware progress, but perform no publication or writes.
+    pub(crate) fn snapshot_compute_submission(
+        &mut self,
+        descriptor: u64,
+    ) -> Result<G17PComputeSubmissionSnapshot> {
+        let offset = usize::try_from(descriptor.checked_sub(self.descriptors_high.iova())
+            .ok_or(ERANGE)?).map_err(|_| ERANGE)?;
+        if offset % G17P_COMPUTE_DESCRIPTOR_SLOT_SIZE != 0 {
+            return Err(EINVAL);
+        }
+        let end = offset.checked_add(G17P_COMPUTE_DESCRIPTOR_SLOT_SIZE).ok_or(ERANGE)?;
+        let read_u32 = |raw: &[u8], at: usize| -> Result<u32> {
+            Ok(u32::from_le_bytes(raw.get(at..at + 4).ok_or(ERANGE)?
+                .try_into().map_err(|_| ERANGE)?))
+        };
+        let read_u64 = |raw: &[u8], at: usize| -> Result<u64> {
+            Ok(u64::from_le_bytes(raw.get(at..at + 8).ok_or(ERANGE)?
+                .try_into().map_err(|_| ERANGE)?))
+        };
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        let mut snapshot = self.descriptors.with_bytes_mut(|bytes| {
+            let raw = bytes.get(offset..end).ok_or(ERANGE)?;
+            let mut work_key = None;
+            // The Linux builder emits forty 12-byte primary RCE entries at
+            // +0x40. Report the encoded 0x10201 value, not a reconstructed key.
+            for index in 0..g17_compute::COMPUTE_REGISTER_COUNT {
+                let at = 0x40 + index * 12;
+                if read_u32(raw, at)? == 0x10201 {
+                    work_key = Some(read_u64(raw, at + 4)?);
+                }
+            }
+            Ok(G17PComputeSubmissionSnapshot {
+                descriptor, selector: read_u32(raw, 0)?, context: read_u32(raw, 0x0c)?,
+                grid: read_u32(raw, 0xf54)?, work_key,
+                scheduler_record: read_u64(raw, 0x10)?,
+                stamp_pointer: read_u64(raw, 0xf40)?, stamp_value: read_u32(raw, 0xf50)?,
+                tsq: [0; 3], tag15: [0; 12], tag16: [0; 3], tag14: [0; 8],
+            })
+        })?;
+        let base = self.support.iova();
+        snapshot.tsq = [self.support.read_u32(base + mmu::UAT_PGSZ as u64 + 4)?,
+            self.support.read_u32(base + 0x10c)?, self.read_compute_stamp()?];
+        self.queue_graph.with_bytes_mut(|raw| {
+            for (index, word) in snapshot.tag15.iter_mut().enumerate() {
+                *word = read_u64(raw, g17_compute::COMPUTE_OPTIONAL + index * 8)?;
+            }
+            for (index, word) in snapshot.tag16.iter_mut().enumerate() {
+                *word = read_u64(raw, g17_compute::COMPUTE_EVENT + index * 8)?;
+            }
+            for (index, word) in snapshot.tag14.iter_mut().enumerate() {
+                *word = read_u64(raw, g17_compute::COMPUTE_ADD_KICKS + index * 8)?;
+            }
+            Ok(())
+        })?;
+        Ok(snapshot)
     }
 
     /// Read the item-ring cursors and the first eight slots.
@@ -10349,6 +10428,20 @@ impl G17PClRuntimeStorage {
     /// on the path that provably completes. If compute's entries are also
     /// unchanged across a successful submit, then "unchanged" says nothing
     /// about consumption and the render reading is void.
+    pub(crate) fn snapshot_compute_entry(&mut self, offset: usize) -> Result<[u64; 48]> {
+        let end = offset.checked_add(g17_submission::G17P_CL_KICK_ENTRY_SIZE).ok_or(ERANGE)?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        self.entries.with_bytes_mut(|bytes| {
+            let raw = bytes.get(offset..end).ok_or(ERANGE)?;
+            let mut words = [0; 48];
+            for (index, word) in words.iter_mut().enumerate() {
+                *word = u64::from_le_bytes(raw[index * 8..index * 8 + 8]
+                    .try_into().map_err(|_| ERANGE)?);
+            }
+            Ok(words)
+        })
+    }
+
     pub(crate) fn log_entry(&mut self, label: &str, dev: &AsahiDevice, offset: usize) {
         let mut words = [0u32; 12];
         let mut ok = false;

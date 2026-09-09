@@ -32,7 +32,9 @@ impl Resources{fn read_compute_execution_interval(&mut self,d:u64,end:u64)->Resu
 struct Stamp(u64);impl Stamp{fn read_compute_stamp(&self)->Result<u64>{Ok(self.0)}}
 struct G17PSksmQueue{independent_context:bool,completion_descriptor:u64,completion_last_end:u64,completion_stamp_armed:bool,compute:Stamp,producer:u32}
 struct Manager{resources:Resources}
+thread_local! { static TIMEOUTS: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) }; }
 impl Manager {
+ fn log_async_compute_timeout(&mut self,q:&mut G17PSksmQueue){TIMEOUTS.with(|t|t.borrow_mut().push(q.completion_descriptor));}
  fn dump_compute_completion_records(&mut self,_label:&str)->Result{Ok(())}
 '''+item(m,'    pub(crate) fn poll_independent_compute_completion(')+r'''
 }
@@ -79,6 +81,19 @@ source += r'''
  let d=Arc::new(AtomicUsize::new(0));let(q,c)=q(1,0x100,&d);let mut r=G17PLiveRuntime{pdev:None,manager:Some(Manager{resources:Resources{records:vec![(0x100,[2,8])]}}),async_compute_queues:vec![q],session_recovery_pending:false};
  r.async_compute_queues[0].queue.compute.0=1;
  assert!(!r.quarantine_async_compute(1,1,110));assert!(!r.async_compute_queues[0].quarantined);assert!(!r.session_recovery_pending);assert_eq!(c.signals.load(Ordering::SeqCst),1);assert_eq!(c.error.load(Ordering::SeqCst),0);
+}
+#[test]fn timeout_diagnostics_select_exact_owner_once_after_last_retirement_attempt(){
+ TIMEOUTS.with(|t|t.borrow_mut().clear());
+ let d=Arc::new(AtomicUsize::new(0));let(a,_)=q(4,0x400,&d);let(b,_)=q(7,0x700,&d);
+ let mut r=G17PLiveRuntime{pdev:None,manager:Some(Manager{resources:Resources{records:vec![(0x400,[2,8])]}}),async_compute_queues:vec![a,b],session_recovery_pending:false};
+ r.async_compute_queues[0].queue.compute.0=1;
+ assert!(!r.quarantine_async_compute(7,4,110)); // stale/foreign submission
+ assert!(!r.quarantine_async_compute(4,4,110)); // successful final DRAM poll
+ assert!(r.quarantine_async_compute(7,7,110));
+ assert!(r.quarantine_async_compute(7,7,110)); // duplicate timer, no second dump
+ TIMEOUTS.with(|t|assert_eq!(*t.borrow(),vec![0x700]));
+ assert_eq!(d.load(Ordering::SeqCst),1); // only the completed QID4 packet dropped
+ assert!(r.async_compute_queues[1].active.is_some());
 }
 '''
 with tempfile.TemporaryDirectory() as d:

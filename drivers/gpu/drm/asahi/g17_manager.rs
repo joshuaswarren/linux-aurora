@@ -8473,6 +8473,45 @@ impl G17PManagerConstruction {
         );
     }
 
+    /// Bounded, read-only timeout evidence for the retained asynchronous owner.
+    /// The shared outer slot is the most recent publication, not necessarily
+    /// this queue's slot. Samples are sequential DRAM observations, not an
+    /// atomic hardware snapshot; no firmware pause or MMIO is attempted.
+    pub(crate) fn log_async_compute_timeout(&mut self, queue: &mut G17PSksmQueue) {
+        let ring = queue.compute.read_compute_ring_state();
+        let outer = self.resources.snapshot_compute_channel();
+        let submission = queue.compute.snapshot_compute_submission(queue.completion_descriptor);
+        let roots = (|| -> Result<(u64, u64)> {
+            let decoded = submission.as_ref().map_err(|error| *error)?;
+            let context = u8::try_from(decoded.context).map_err(|_| EINVAL)?;
+            Ok(self.uat().t8140_selected_context_roots([context; 4])?[0])
+        })();
+        let control = queue.storage.snapshot_channel_control_prefix();
+        let entry = (|| -> Result<_> {
+            if !queue.producer.previous_valid { return Err(EINVAL); }
+            let last = g17_submission::prepare_kick_submission(
+                queue.producer.previous_timestamp, queue.queue_id,
+                queue.producer.geometry.stamp_count(), queue.producer.geometry.entry_stride(),
+            ).map_err(|_| EINVAL)?;
+            Ok((last.entry_offset,
+                queue.storage.snapshot_compute_entry(last.entry_offset as usize)?))
+        })();
+        dev_err!(self.resources.dev().as_ref(),
+            "G17P async-timeout owner: qid={} descriptor={:#x} ordinal={} producer={:?} direct={:?} hardware={:?}\n",
+            queue.queue_id, queue.completion_descriptor, queue.submission_ordinal,
+            queue.producer, queue.direct_lifecycle, queue.hardware_state);
+        dev_err!(self.resources.dev().as_ref(),
+            "G17P async-timeout ring: {:x?}\n", ring);
+        dev_err!(self.resources.dev().as_ref(),
+            "G17P async-timeout outer-latest-not-owner: {:x?}\n", outer);
+        dev_err!(self.resources.dev().as_ref(),
+            "G17P async-timeout submission: {:x?} descriptor-context-ttbat={:x?}\n", submission, roots);
+        dev_err!(self.resources.dev().as_ref(),
+            "G17P async-timeout channel-control: {:x?}\n", control);
+        dev_err!(self.resources.dev().as_ref(),
+            "G17P async-timeout last-host-entry(offset,words): {:x?}\n", entry);
+    }
+
     /// Whether the noisy per-submission traces should be emitted.
     ///
     /// A 400-deep run emits thousands of lines and overflows the kernel ring
