@@ -108,9 +108,34 @@ SPTM global root reported by the current boot receipt; its firmware mappings
 do not appear in the ordinary per-context TTBR pairs.
 
 `m5-metal-reference.m` verifies compute results and rendered pixels through
-three fresh Metal command queues. Fifteen macOS runs each passed 3,072 exact
+three fresh Metal command queues. Twenty-four macOS runs each passed 3,072 exact
 compute values and 12,288 RGBA pixels. This is a macOS reference, not evidence
 that Linux submission, rendering or DCP works.
+
+The bounded SKSM observer now follows the selected command's actual UAT
+context, CDM stream, pipeline and explicitly requested shader/data pages.
+An optional one-shot hook at the matching retained CL descriptor's completion
+captures those pages again. Four controlled captures each show 1,024 output
+sentinels before submission and 1,024 exact results at the matching callback;
+the input remains unchanged. All captured objects matched on two reads.
+The observer never reads device memory and retains a two-MiB read budget.
+
+The controlled channel item ring contains the register program (selector 3),
+queue configuration (tag 15), then SKSM kick (tag 14). Its producer was 2
+before tag-14 publication; the consumer and producer were 3 at completion.
+M5 builds tag 15 inline in `AGXCLChannelSKSM::submitBuffer`; observing the
+separate generic configuration function missed that path. The production
+`m5_channel.rs` writer matches all 134 configuration bytes, independently
+taking queue fields, descriptor flags and the scheduler pointer from their
+native owners. Remaining event/owner values are opaque inputs. Disabled event
+sentinels also follow the native branch. First-bind execution remains untested.
+
+`verify-m5-channel.py` checks that byte match against a private capture.
+`test-m5-sksm-capture.py` checks capture guards, filtered submissions and
+matching-descriptor completion. The global-root and per-context walkers stay
+separate; neither substitutes a guessed page table. The sampled completion
+ring was zero before and at the host callback. Its routing and consumption
+timing remain unknown; no completion-ring ABI is claimed from that observation.
 
 ## Source construction and M5 differences
 
