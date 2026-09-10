@@ -394,14 +394,6 @@ unbacked:
 	dev_info_ratelimited(dcp->dev, "ep %#04x: %#llx\n", endpoint, message);
 }
 
-/*
- * Attach to the running DCP instead of restarting it.  Off by default until it
- * is proven; the restart path is what has been exercised so far.
- */
-static bool dcp_adopt_live;
-module_param_named(adopt_live, dcp_adopt_live, bool, 0444);
-MODULE_PARM_DESC(adopt_live,
-		 "attach to the loader's live DCP session without sending INIT");
 
 static void dcp_rtk_crashed(void *cookie, const void *crashlog, size_t crashlog_size)
 {
@@ -1876,7 +1868,7 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	} else {
 		if (start_mode == APPLE_DCP_COPROCESSOR_QUIESCED_RESTART)
 			dev_info(dev, "restarting loader-quiesced DCP session\n");
-		if (dcp_adopt_live) {
+		if (dcp->hw.adopt_live_session) {
 			dcp->adopting_session = true;
 			dcp->rtk = devm_apple_rtkit_init_adopted(dev, dcp,
 								 "mbox", 0,
@@ -1891,20 +1883,11 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 					     "Failed to initialize RTKit\n");
 	}
 
-	if (dcp_adopt_live) {
+	if (dcp->hw.adopt_live_session) {
 		/*
-		 * Attach to the session the loader left running instead of
-		 * re-initialising it.
-		 *
-		 * m1n1 hands the DCP over live and untouched -- it neither
-		 * stops the ASC nor quiesces RTKit; the "quiesced" property is
-		 * only there to steer this driver's code path.  So the
-		 * coprocessor already has a session, an endpoint map, and a
-		 * configured display pipe.  Poking CPU_CONTROL.RUN and sending
-		 * SET_IOP_PWR_STATE(INIT) at that makes the firmware tear its
-		 * IOMFB state down and come back with no scanout, which is the
-		 * state macOS is never in: its capture contains no wake, no
-		 * HELLO and no EPMAP, just A401 on an already-running IOP.
+		 * The adopted RTKit instance must already have a usable endpoint
+		 * map.  Without one, apple_rtkit_start_ep() reaches no service and
+		 * probe eventually times out waiting for DCP readiness.
 		 */
 		dev_info(dev, "adopting the live DCP session without a restart\n");
 		ret = 0;
@@ -2262,6 +2245,11 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t8112 = {
 static const struct apple_dcp_hw_data apple_dcp_hw_t8140 = {
 	.num_dptx_ports = 0,
 	.adopt_running_coprocessor = true,
+	/*
+	 * Keep adopt_live_session disabled until apple-rtkit can recover the
+	 * loader's endpoint map.  An adopted instance without that map cannot
+	 * start DCP services.
+	 */
 };
 
 static const struct apple_dcp_hw_data apple_dcp_hw_dcp = {

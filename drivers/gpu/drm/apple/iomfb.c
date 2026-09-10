@@ -36,7 +36,15 @@
 #include "trace.h"
 
 
-u32 dcp_clamshell_state;   /* A476 set_dcp_clamshellstate; 0 = lid open */
+/*
+ * A476 payload.  macOS sends 1 (dcp-calls.log line 1648); we sent 0 on the
+ * theory that A476 is set_dcp_clamshellstate and 1 meant "lid shut".  That
+ * attribution is unverified -- A476's shape (in 4, out 0) equally fits
+ * set_has_frame_swap_function(bool) -- and the black panel it appeared to fix
+ * was really the surf_iova misalignment, so the evidence for 0 was
+ * coincidental.  Follow the capture.
+ */
+u32 dcp_clamshell_state = 1;
 module_param_named(clamshell_state, dcp_clamshell_state, uint, 0644);
 
 bool dcp_send_modeset;   /* macOS never issues A413 */
@@ -79,7 +87,7 @@ static unsigned int dcp_extra_eps;
 module_param_named(extra_eps, dcp_extra_eps, uint, 0644);
 MODULE_PARM_DESC(extra_eps, "bitmask of extra endpoints to start, bit n = 0x20+n");
 
-void dcp_start_extra_eps(struct apple_dcp *dcp)
+static void dcp_start_extra_eps(struct apple_dcp *dcp)
 {
 	unsigned int n;
 

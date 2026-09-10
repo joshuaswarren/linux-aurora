@@ -146,9 +146,17 @@ struct dcp_pipe_cfg_415 {
 	u8 data[0xc];
 } __packed;
 
+/*
+ * A031 is update_notify_clients_dcp(u32[27]): a bitmap-as-array of the DCP
+ * notification clients the AP wants delivered.  macOS enables them
+ * cumulatively over nine calls, ending at {6,7,8,10,11,12,25,26}; we used to
+ * send nine zeroed records, so we finished with no notify clients registered
+ * at all and never received the callbacks they gate.
+ */
 struct dcp_pipe_cfg_031 {
-	u8 data[0x6c];
+	__le32 clients[27];
 } __packed;
+static_assert(sizeof(struct dcp_pipe_cfg_031) == 0x6c);
 
 DCP_THUNK_OUT(dcp_pipe_query_353, dcpep_pipe_query_353, u64);
 DCP_THUNK_INOUT(dcp_pipe_set_352, dcpep_pipe_set_352, u64, u32);
@@ -360,7 +368,7 @@ static void dcp_fill_dfb_surface(u8 *s)
 	s[0x01c] = 0x01;
 	s[0x02a] = 0x40;
 	s[0x02b] = 0xe4;
-	s[0x035] = 0x03;
+	s[0x035] = 0x04;	/* IOSurface.surface_id; macOS writes 4, we wrote 3 */
 	s[0x051] = 0x01;
 	s[0x149] = 0x01;
 }
@@ -549,17 +557,8 @@ static struct DCP_FW_NAME(dcp_map_buf_resp) dcpep_cb_map_piodma(struct apple_dcp
 		goto reject;
 	}
 
-	/*
-	 * Mirror it into the display-subsystem domain at the same address: the
-	 * display engine reads these buffers on that device's stream, which
-	 * otherwise has no mapping for them at all.
-	 */
-	/*
-	 * Do not mirror into the display-subsystem domain.  That stream's
-	 * tables are iBoot's, pinned to the DART's published "pt-region", and
-	 * macOS never adds entries to them from the host -- the firmware does
-	 * its own remapping there (the ADT marks the DART "allow-pte-remap").
-	 */
+	/* The PIODMA mapping belongs only to the DCP IOMMU domain. */
+	memdesc->piodma_mapped = true;
 
 #if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
 	/* echo the index back, as macOS does */
@@ -1351,7 +1350,11 @@ static void dcp_h17p_fix_swap_surfaces(struct apple_dcp *dcp)
 		 * 0xfc0000000 -- an address with no L1 entry at all.  Shift the
 		 * whole block, which subsumes the null-flag fixup.
 		 */
-		memmove(r + off, r + off + 2, n - off - 2);
+		/* Preserve the complete 16K-aligned IOVA, including its low bits. */
+		static_assert(offsetof(typeof(*req), surf_iova) == 0xe3a,
+			      "H17P source IOVA offset");
+		static_assert(sizeof(*req) == 0xe9c, "H17P request size");
+		memmove(r + off - 2, r + off, n - off);
 		memset(r + n - 2, 0, 2);
 	}
 }
@@ -2222,7 +2225,32 @@ static void dcp_client_open_run(struct apple_dcp *dcp, void *out, void *cookie)
 		break;
 	}
 	case DCP_STEP_A031: {
+		/*
+		 * The nine cumulative states macOS sends, from the 25G83
+		 * capture (dcp-calls.log lines 1507-1531).  Each call repeats
+		 * the previous set and adds one client.
+		 */
+		static const u8 notify_clients[9][8] = {
+			{},
+			{ 6 },
+			{ 6, 7 },
+			{ 6, 7, 8 },
+			{ 6, 7, 8, 10 },
+			{ 6, 7, 8, 10, 11 },
+			{ 6, 7, 8, 10, 11, 12 },
+			{ 6, 7, 8, 10, 11, 12, 25 },
+			{ 6, 7, 8, 10, 11, 12, 25, 26 },
+		};
+		static const u8 notify_count[9] = { 0, 1, 2, 3, 4, 5, 6, 7, 8 };
 		struct dcp_pipe_cfg_031 cfg = {};
+		unsigned int step = dcp->a031_step;
+		unsigned int i;
+
+		if (step >= ARRAY_SIZE(notify_clients))
+			step = ARRAY_SIZE(notify_clients) - 1;
+		for (i = 0; i < notify_count[step]; i++)
+			cfg.clients[i] = cpu_to_le32(notify_clients[step][i]);
+		dcp->a031_step++;
 
 		dcp_pipe_cfg_031(dcp, false, &cfg, next, ncookie);
 		break;

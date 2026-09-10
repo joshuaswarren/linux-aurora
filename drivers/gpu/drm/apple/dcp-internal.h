@@ -138,6 +138,12 @@ enum dcp_iomfb_method_profile {
 struct apple_dcp_hw_data {
 	u32 num_dptx_ports;
 	bool adopt_running_coprocessor;
+	/*
+	 * Attach to an existing RTKit session instead of restarting it.  This
+	 * requires the endpoint map to be recovered before the DCP services are
+	 * started; no current platform enables it.
+	 */
+	bool adopt_live_session;
 };
 
 /* TODO: move IOMFB members to its own struct */
@@ -149,6 +155,8 @@ struct apple_dcp {
 	struct iommu_domain *disp_iommu_dom;
 	/* the display-subsystem device, whose DMA domain the pipe scans out of */
 	struct device *disp_dev;
+	/* which of the nine cumulative A031 notify-client states to send next */
+	unsigned int a031_step;
 	struct apple_rtkit *rtk;
 	struct apple_crtc *crtc;
 	struct apple_connector *connector;
