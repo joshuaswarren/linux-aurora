@@ -180,3 +180,14 @@ mod tests {
         assert!(reader.is_empty());
     }
 }
+
+/// Whether the per-submission diagnostic dumps are enabled.
+///
+/// These dumps are bring-up instrumentation: several dozen lines per
+/// submission. Leaving them unconditional costs measurable time at desktop
+/// frame rates and wraps the kernel ring buffer fast enough to lose the
+/// failure that is actually being diagnosed.
+#[inline]
+pub(crate) fn g17p_verbose() -> bool {
+    *crate::module_parameters::g17p_verbose.value() != 0
+}

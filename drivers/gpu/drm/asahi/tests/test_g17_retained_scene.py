@@ -32,7 +32,8 @@ def block(pattern):
 
 
 def constant(name):
-    match = re.search(r"^const " + name + r": .*?;", source, re.M | re.S)
+    match = re.search(r"^(?:pub\(crate\) )?const " + name + r": .*?;", source,
+                      re.M | re.S)
     assert match, name
     return match.group()
 
@@ -98,7 +99,7 @@ fn patterned(size: usize) -> Vec<u8> {
 fn render_layout(blocks: usize) -> G17PRenderStateLayout {
     G17PRenderStateLayout { tvb_blocks: blocks, ..Default::default() }
 }
-fn new_pm() -> G17PParameterManagement {
+fn new_pm_at(first_submission_ordinal: u32) -> G17PParameterManagement {
     let layout = g17p_parameter_management_layout().unwrap();
     G17PParameterManagement {
         backing: MappedObject {
@@ -107,10 +108,12 @@ fn new_pm() -> G17PParameterManagement {
         },
         layout, page_count: 128, page_list_vas: [0xffff_fc20_0010_0000, 0x70_0247_8000],
         metrics_vas: [0xffff_fc20_001f_0000, METRICS], hardware_buffer_id: 0,
+        first_submission_ordinal,
         selected_scene: G17P_PM_SELECTED_SCENE,
         manager_generation: G17P_PM_INITIAL_HWPB_MANAGER_GENERATION,
     }
 }
+fn new_pm() -> G17PParameterManagement { new_pm_at(0) }
 fn assert_only_scene_write(before: &[u8], after: &[u8], at: usize, generation: u64) {
     assert_eq!(before.len(), after.len());
     assert_eq!(&after[..at + 0x48], &before[..at + 0x48]);
@@ -120,25 +123,53 @@ fn assert_only_scene_write(before: &[u8], after: &[u8], at: usize, generation: u
 }
 
 #[test]
+fn live_block_table_follows_the_complete_scene_allocation() {
+    let layout = g17p_parameter_management_layout().unwrap();
+    assert_eq!(layout.page_list, 0x8000);
+    assert_eq!(layout.shared_control, 0x20000);
+    assert_eq!(layout.page_metrics, 0x30000);
+    assert_eq!(layout.scene_states, 0x38000);
+    assert_eq!(layout.scene_states + G17P_PM_SCENE_ALLOCATION_SIZE, 0x3a840);
+    assert_eq!(layout.block_page_bases, 0x40000);
+    assert_eq!(layout.total_size, 0x48000);
+}
+
+#[test]
 fn all_scene_and_scratch_positions_match_native_ring_selection() {
     assert_eq!((G17P_PM_SCENE_COUNT, G17P_PM_SCENE_SCRATCH_SLOT_COUNT), (80, 36));
     for ordinal in 0..=255u32 {
-        let scene = g17p_render_scene_index(ordinal);
+        let scene = g17p_render_scene_index(0, ordinal).unwrap();
         assert_eq!(scene, (ordinal as usize + 1) % 80);
         assert_eq!(g17p_render_scene_registers(scene, SCRATCH, METRICS),
                    Some((0x178000 + (scene % 36) as u64 * 0x20,
                          0x80001 + scene as u64 * 4)));
     }
-    assert_eq!(g17p_render_scene_index(u32::MAX), 16);
+    assert_eq!(g17p_render_scene_index(0, u32::MAX), Some(16));
     for (ordinal, cycle, metric) in [(0, 0x178020, 0x80005),
                                     (1, 0x178040, 0x80009),
                                     (2, 0x178060, 0x8000d)] {
-        assert_eq!(g17p_render_scene_registers(g17p_render_scene_index(ordinal), SCRATCH, METRICS),
+        assert_eq!(g17p_render_scene_registers(g17p_render_scene_index(0, ordinal).unwrap(), SCRATCH, METRICS),
                    Some((cycle, metric)));
     }
     assert_eq!(g17p_render_scene_registers(36, SCRATCH, METRICS).unwrap().0, 0x178000);
-    assert_eq!(g17p_render_scene_index(79), 0);
-    assert_eq!(g17p_render_scene_index(80), 1);
+    assert_eq!(g17p_render_scene_index(0, 79), Some(0));
+    assert_eq!(g17p_render_scene_index(0, 80), Some(1));
+}
+
+#[test]
+fn replacement_managers_rebase_the_retained_queue_ordinal() {
+    for first in [195, 2022] {
+        let mut pm = new_pm_at(first);
+        pm.prepare_retained_scene(first, 0, pm.page_list_vas, &render_layout(32)).unwrap();
+        assert_eq!(pm.selected_scene, 1);
+        pm.prepare_retained_scene(first + 1, 0, pm.page_list_vas, &render_layout(32)).unwrap();
+        assert_eq!(pm.selected_scene, 2);
+        pm.prepare_retained_scene(first + 79, 0, pm.page_list_vas, &render_layout(32)).unwrap();
+        assert_eq!(pm.selected_scene, 0);
+        assert_eq!(pm.prepare_retained_scene(first - 1, 0, pm.page_list_vas,
+                                             &render_layout(32)), Err(EINVAL));
+        assert_eq!(pm.selected_scene, 0);
+    }
 }
 
 #[test]
@@ -205,7 +236,7 @@ fn retained_method_keeps_pool_identity_and_runtime_contents_over_three_scene_wra
     for ordinal in 1..=255 {
         let before = pm.backing.bytes.clone();
         pm.prepare_retained_scene(ordinal, 0, pm.page_list_vas, &render_layout(32)).unwrap();
-        let scene = g17p_render_scene_index(ordinal);
+        let scene = g17p_render_scene_index(0, ordinal).unwrap();
         assert_eq!(pm.selected_scene, scene);
         assert_eq!(pm.selected_scene_va(), initial_hwpb + pm.layout.scene_states as u64 + scene as u64 * 0x80);
         assert_eq!(pm.pb_descriptor().unwrap(), initial_pb);

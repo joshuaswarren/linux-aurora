@@ -22,10 +22,28 @@ def function(source, marker):
 
 
 handoff = function(manager, "pub(crate) fn handoff_retained_render_vm(")
-assert handoff.index("self.require_retired_render_owner()?") < handoff.index("self.render_storage = None")
-assert handoff.index("self.render_bind = None") < handoff.index("self.render_storage = None")
+preserve = function(manager, "fn preserve_immediate_retired_render_graph(")
+assert handoff.index("self.require_retired_render_owner()?") < handoff.index("G17PRetiredRenderGraph {")
+assert "self.render_bind.take().ok_or(EIO)?" in handoff
+assert "self.render_context_aliases.take()" in handoff
+assert "self.render_storage.take().ok_or(ENODEV)?" in handoff
+assert "release_client_context" not in handoff
+assert ".push_within_capacity(previous)" in preserve
+assert "completion_references_descriptor_range" not in preserve
+assert "self.retired_render_handoff_graph = Some(retired)" in handoff
 assert "install_t8140_native_context_aliases" not in handoff
 assert "incoming VM builds a new root" in handoff
+
+retired_graph = manager[manager.index("struct G17PRetiredRenderGraph {"):]
+retired_graph = retired_graph[:retired_graph.index("}\n")]
+assert retired_graph.index("bind: G17PRenderRootOwner") < retired_graph.index(
+    "context_aliases: Option<mmu::T8140NativeContextAliases>"
+)
+assert retired_graph.index("context_aliases: Option<mmu::T8140NativeContextAliases>") < retired_graph.index(
+    "storage: g17_resources::G17PUserRenderStorage"
+)
+release_retired = function(manager, "fn release_retired_handoff_graph(")
+assert release_retired.index("ids.unreserve(id)") < release_retired.index("drop(retired)")
 
 retired = function(manager, "fn require_retired_render_owner(")
 assert "snapshot.job_list_empty" in retired
@@ -37,6 +55,7 @@ take = function(manager, "fn take_active_render_slot_state(")
 install = function(manager, "fn install_active_render_slot_state(")
 for owner in (
     "render_storage", "render_tracker", "render_bind", "render_context_aliases",
+    "retired_handoff_graph",
     "render_submission_ordinal", "render_auxiliary_timestamp",
     "render_hardware_buffer_id", "render_hardware_buffer_published", "render_sksm",
 ):
@@ -77,9 +96,18 @@ assert "G17P_NATIVE_RENDER_QOS_HARDWARE_BUFFER_ID" not in new_sksm
 submit = function(runtime, "pub(crate) fn submit_translated_render(")
 assert "select_render_slot(render_slot)?" in submit
 assert "if defer_completion" in submit
-wait = function(drm, "fn wait_render_slot(")
-assert ".poll_deferred_render_completion(render_slot)?" in wait
-assert wait.index(".poll_deferred_render_completion(render_slot)?") < wait.index("fsleep(Delta::from_millis(1))")
+watch = function(drm, "impl g17_job::G17PRenderWatchBackend for G17PRenderWatchBackend")
+assert watch.count("packet.render_slot()") >= 2
+assert watch.count("timeout_deferred_render(") == 2
+assert "quarantine_render_slot(" not in watch
+assert "poll_deferred_render_completion" not in watch
+# Ordinary completion is event-driven with the runtime mutex released. Only
+# scheduler timeout/cancel enters the bounded final-observation path above.
+events = function(runtime, "fn service_async_render_completions(")
+settle = function(runtime, "fn settle_deferred_render_completion(")
+assert "self.poll_deferred_render_completion(slot)?" in events
+assert "self.settle_deferred_render_completion(slot, observed)?" in events
+assert "signal.complete(Ok(observed))" in settle
 
 # Job-root SecureGart setup must retain Mesa's six existing GPUVM low views.
 # Only the VM-lifetime-reserved null view is a driver-owned KernelMapping.
@@ -102,7 +130,8 @@ assert "pte.store(phys" in map_pages
 assert map_pages.index("return Err(EBUSY)") < map_pages.index("pte.store(phys")
 unmap_pages = function(pgtable, "pub(crate) fn unmap_pages(")
 assert "if iova_range.is_empty()" in unmap_pages
-assert unmap_pages.index("if iova_range.is_empty()") < unmap_pages.index(".covers_range(")
+assert unmap_pages.index("if iova_range.is_empty()") < unmap_pages.index("let expected =")
+assert "complete_coverage(expected, visited, fully_mapped)" in unmap_pages
 
 # Process-root queue peers occupy the bounded gap between the render and
 # relocated-compute FLists, while context-0 keeps the native queue addresses.
@@ -113,12 +142,16 @@ assert "G17P_RENDER_JOB_QUEUE_LOW_BASE == 0x70_01ef_8000" in resources
 
 storage_impl = resources[resources.index("impl G17PUserRenderStorage {"):]
 storage_new = function(storage_impl, "fn new(")
-assert storage_new.count("g17p_cl_client_low_va_range()") >= 4
+assert storage_new.count("g17p_cl_client_low_va_range()") >= 3
 assert "G17P_BOOTSTRAP_TA_DESCRIPTOR_LOW_VA\n                    .." not in storage_new
 reachability = function(resources, "pub(crate) fn first_unreachable(")
+assert '"primary-index-page"' not in reachability
+assert '"pm-page-list"' in reachability
+assert "pm.page_list_low_va()" in reachability
+assert "g17p_render_page_list_va(self.queue_pair)" in reachability
 ta_status = reachability[reachability.index('"ta-status-page"'):]
 ta_status = ta_status[:ta_status.index('"3d-status-page"')]
 assert "vm.covers_range(" in ta_status
 assert "uat.kernel_vm().covers_range(" not in ta_status
 
-print("PASS job-private VM handoff and complete two-slot owner parking; completion polls release the runtime mutex")
+print("PASS job-private VM handoff and complete two-slot owner parking; ordinary completion is event-driven")

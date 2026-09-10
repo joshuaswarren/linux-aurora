@@ -33,6 +33,7 @@ mod g17_queue_limits;
 mod g17_lifecycle;
 mod g17_live_boot;
 mod g17_manager;
+mod g17_perf;
 mod g17_power_preflight;
 mod g17_render;
 mod g17_resources;
@@ -85,6 +86,18 @@ kernel::module_platform_driver! {
             // permissions: 0o644,
             description: "Fully isolate GPU contexts (limits performance)",
         },
+        g17p_render_slot_affinity: u32 {
+            default: 1,
+            description: "Keep each render client on the bounded render slot that already holds its retained graph. The G17PUserRenderStorage behind a slot -- descriptors, render state, TVB pool, parameter-management graph and application-GART root -- belongs to one VM, so handing a slot to a different VM makes handoff_retained_render_vm tear that graph down and rebuild it in the incoming VM. Taking whichever slot happened to be free therefore made two concurrent clients rebuild each other's graph on every alternation, and every restage in between was a chance to be refused with EBUSY, which Mesa reports as VK_ERROR_DEVICE_LOST. With affinity, a client returns to its own slot; a third client blocks in acquire_lease (interruptible) or, when a slot is genuinely free, takes the least recently used one through the existing handoff. This also decides whether the device-global parameter-buffer loader is re-pointed at the submitting client's graph, which is unnecessary while every alternation rebuilds it. 0: historical lowest-free-slot selection, 1: per-VM affinity (default).",
+        },
+        g17p_render_slot_globals: u32 {
+            default: 3,
+            description: "Bitmask. Which render publication fields that describe DEVICE-GLOBAL firmware state are derived from that state instead of from the submitting slot's own ordinal. Two bounded render slots share the outer data-master channels and the USC FList, and with per-VM slot affinity a second client's first render is the first time a slot-ordinal of 0 meets a warm device. bit0 (1): the outer ring entry's channel-started byte (+0x17, native !chan[0x3c]) says whether this session has published a render on the shared channels, instead of claiming a never-started channel whenever a slot's ordinal is 0. bit1 (2): tag-15 +0x3e, the FList generation, publishes the device-global FList lifecycle sequence this submission acquired instead of the slot ordinal, so a second slot does not announce generation 0 against a pool the firmware last saw at N. Both are byte-identical to the previous behaviour while a single client renders. 0 restores per-slot derivation; bisect 0, 1, 2, 3. Default 3.",
+        },
+        g17p_render_nop_retire: u32 {
+            default: 1,
+            description: "What to do when a render wait expires while the firmware has PROVABLY retired the group without executing it: both queue cursors at the published target, the job unlinked from the firmware completion list, and a zero pass-start timestamp (the tiler stamps the start before any fragment work). 1 (default): perform the host bookkeeping a paired completion performs -- producers, HardwareBufferID, tracker, ordinal, FList references -- fail that one submission with EIO and keep the slot; the firmware owns nothing of the group any more, so nothing is freed under it. 0: previous behaviour -- ETIMEDOUT, the slot quarantined for the rest of the session and its HardwareBufferID pinned. Only a group the firmware still holds (cursors short of the target, job still linked) is quarantined in either mode.",
+        },
         g17p_simplefb_iova: u64 {
             default: 0,
             description: "DIAGNOSTIC. Non-zero maps the exact active apple,simple-framebuffer boot aperture into every T8140 user VM at this GPU VA, uncached and read/write, so a bounded harness can make GPU stores visible without a DCP driver. The DT node, x8r8g8b8 geometry, no-map framebuffer reservation, page alignment and complete VA interval are all validated before any mapping; the alias is retained until VM destruction and excluded from ordinary user unbinds. This does not touch DCP or copy pixels. Use only while simpledrm owns the iBoot framebuffer. 0: off (default).",
@@ -133,9 +146,13 @@ kernel::module_platform_driver! {
             default: 0,
             description: "Optional firmware trace class mask at status_a+0x00 on both roles. Disabled by default for normal asynchronous execution: the trace rings require their own consumer and must not backpressure GPU completion. Nonzero is an explicit diagnostic mode; submission/progress classes are0/1/9.",
         },
+        g17p_binary_capture: u32 {
+            default: 0,
+            description: "Allocate and export the first-render G17TRC01 binary capture through devcoredump. Disabled by default because the evidence arena is 12 MiB; fault crashlogs and ordinary failure diagnostics are unaffected. 1: explicit capture run.",
+        },
         g17p_fw_ktrace_verbose: u32 {
-            default: 1,
-            description: "Print every KTrace record instead of only the submission-path codes (0x41/0x46/0x4b/0x57/0x0a/0x0c/0x0e/0x20 and the 0x11c lost marker). Default 1 while G17P graphics bring-up needs the otherwise-hidden 0x1c/0x1f/0x60 admission-path witnesses.",
+            default: 0,
+            description: "Print every KTrace record instead of only the bounded submission-path codes. KTrace collection itself remains controlled by g17p_fw_trace and disabled by default; set this only for an explicit trace run.",
         },
         g17p_fw_ktrace_budget: u32 {
             default: 32,
@@ -188,7 +205,7 @@ kernel::module_platform_driver! {
         },
         g17p_power_hold: u32 {
             default: 0,
-            description: "After IdlePowerOff(0) powers the cores, publish a second device-control record with arg=1 to inhibit the firmware's idle power-down for the duration of the submit (1: on)",
+            description: "After IdlePowerOff(0) powers the cores, publish and announce a second arg=0 record so a cold configuration refresh cannot restore Region-C's idle-enable policy before the diagnostic submit (1: on)",
         },
         g17p_power_wire: u32 {
             default: 0,
@@ -352,6 +369,26 @@ kernel::module_platform_driver! {
         g17p_ta_oracle: u32 {
             default: 0,
             description: "DIAGNOSTIC ONLY -- bitmask, write native's value into TA-descriptor fields where ours differs structurally at MATCHED 256x256 geometry. This is the first VALID TA comparison: earlier ones diffed a 32x32 render against native's 256x256 capture, so workload-dependent fields looked like bugs. 1: the three sites carrying 0x100 where native carries 0x500 (+0x370, +0x388, +0x8d0; the fragment descriptor carries the same pair at +0x470). 2: +0x018 = 3, which we never write at all. 4: register 0xd419's value 0x60 -> 0xa9. 8: +0x7d8 0x200 -> 6 and +0x798 6 -> 0xa. The tiler bins ~60 bytes of a 1.28 MB tile buffer while every input -- vertex shader, uniform ranges, root descriptor, vertex data, VDM stream and stream pointer -- is verified correct on hardware, so these are what remains that we demonstrably send differently. Not a fix; it identifies which field the empty tile buffer depends on.",
+        },
+        g17p_perf_window: u32 {
+            default: 256,
+            description: "Submissions per throughput report. The driver has never reported how fast it is: the per-submission dumps are gated off by g17p_verbose (correctly -- they cost more than they measure), which left no number at all. This accumulates plain integer counters on the submit path -- one uncontended lock round trip, no allocation, no formatting -- and emits ONE line per window: renders and computes completed, submissions per second, average and worst host time inside the ioctl, the publish/wait split of that time, average completion polls, GPU busy time from the firmware's own pass envelope (TA stamps the start word, 3D the end word), GPU-interval occupancy, the share of wall time the client spends inside the ioctl, and the GPU tick rate DERIVED from the window rather than assumed. At 256 submissions and 60 frames per second that is one line every four seconds. 0: no accounting at all.",
+        },
+        g17p_render_poll_us: u32 {
+            default: 0,
+            description: "Fixed render completion poll interval in microseconds; 0 selects exponential backoff from 20us to 1000us. The wait used to sleep a flat fsleep(1ms) between polls; on this kernel fsleep grants 25% slack and 1000us is below USLEEP_RANGE_UPPER_BOUND (16000us at CONFIG_HZ=250), so that is usleep_range(1000, 1250) -- every render paid a full millisecond or more of sleep AFTER the GPU had finished, and no pass could be observed complete sooner than that however short it was. Backoff observes a short pass promptly and settles to the same 1ms interval for a long one, so a slow render costs no more CPU than before. Set 1000 to restore the old flat interval for an A/B measurement.",
+        },
+        g17p_render_wait_ms: u32 {
+            default: 2000,
+            description: "Deadline for the render completion wait, in milliseconds. This is the stuck-firmware backstop that was previously spelled as 2000 polls of one millisecond each. Expressing it as a deadline keeps the bound fixed while the poll interval varies. Raise it only to investigate a genuinely slow render; it is not a pacing knob.",
+        },
+        g17p_retain_staging: u32 {
+            default: 1,
+            description: "Reuse one retained 32 KiB staging image for the render descriptor pair instead of allocating, mapping, zeroing, copying out and unmapping a fresh one on every submission. The staging image is pure scratch: its GPU address is never published to firmware and its bytes are copied into the retained descriptor storage before it is dropped, so retaining it changes no address the hardware sees. The retained buffer is zeroed before each use, exactly as a fresh allocation is. 0: allocate per submission, which is the pre-existing behaviour and the A/B control.",
+        },
+        g17p_verbose: u32 {
+            default: 0,
+            description: "Per-submission diagnostic dumps. The render path emits several dozen lines for every submission -- the QoS regions, both status pages, the PM/HWPB and PBDesc snapshots, the tag-15 and SKSM records and the context roots. That is the bring-up instrumentation this driver was written with, and at desktop frame rates it costs real time and buries every other message in the ring buffer within a few seconds. 0: only lifecycle and failures (default), 1: the full per-submission dumps.",
         },
         g17p_render_usc_freelist: u32 {
             default: 1,

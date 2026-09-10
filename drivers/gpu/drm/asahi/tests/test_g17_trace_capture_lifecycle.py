@@ -23,6 +23,19 @@ class CaptureLifecycle(unittest.TestCase):
         cls.live = (SOURCE / "g17_live_boot.rs").read_text()
         cls.manager = (SOURCE / "g17_manager.rs").read_text()
         cls.drm = (SOURCE / "g17_drm.rs").read_text()
+        cls.parameters = (SOURCE / "asahi.rs").read_text()
+
+    def test_binary_capture_is_explicit_and_default_off(self):
+        parameter = self.parameters[self.parameters.index("g17p_binary_capture: u32"):]
+        self.assertRegex(parameter[:300], r"default:\s*0,")
+        constructor = function(self.manager, "new_with_uat")
+        self.assertLess(
+            constructor.index("g17p_binary_capture.value()"),
+            constructor.index("G17PTraceDump::new"),
+        )
+
+        ktrace = self.parameters[self.parameters.index("g17p_fw_ktrace_verbose: u32"):]
+        self.assertRegex(ktrace[:300], r"default:\s*0,")
 
     def test_prepared_scan_precedes_flist_wake(self):
         body = function(self.live, "submit_translated_render")
@@ -78,7 +91,10 @@ class CaptureLifecycle(unittest.TestCase):
         self.assertIn("map(|pm| &mut pm.backing), 0)", body)
 
     def test_render_submission_uses_the_logical_queue_execution_context(self):
-        body = function(self.drm, "submit")
+        # `submit` is now a thin wrapper that settles a lost client's
+        # outstanding jobs; the submission body it guards is
+        # `submit_guarded`.
+        body = function(self.drm, "submit_guarded")
         call = body[body.index(".submit_translated_render("):]
         self.assertRegex(call[:800], r"\.context\s*\.clone\(\)")
         self.assertNotIn("RENDER_APP_CONTEXT", call[:800])

@@ -16,20 +16,64 @@ struct G17PAsyncComputeQueue {
     active: Option<G17PAsyncComputeActive>,
     released: bool,
     quarantined: bool,
+    terminal_fanout: Option<(Arc<crate::g17_status::VmStatus>, Error)>,
+}
+
+/// Type-1 firmware events identify completed stamp/QID slots in a 128-bit
+/// mask. Keep that identity through dispatch instead of scanning every active
+/// queue and its complete 0x800-entry completion ring for one queue's edge.
+const fn g17p_async_completion_mask_contains(masks: [u64; 2], queue_id: u8) -> bool {
+    if queue_id >= 128 {
+        return false;
+    }
+    let word = queue_id as usize / 64;
+    masks[word] & (1u64 << (queue_id as usize % 64)) != 0
 }
 
 impl G17PLiveRuntime {
+    /// Both firmware CPUs must have stopped before this is called. Queue
+    /// destruction alone cannot settle the scheduler's retained hardware
+    /// fences, and a later timeout cannot find a queue we have removed.
+    fn release_async_compute_after_processor_stop(&mut self) {
+        for q in &self.async_compute_queues {
+            if let Some(active) = &q.active {
+                if let Ok(completion) = active.packet.completion() {
+                    completion.complete(Err(EIO));
+                    completion.release_after_processor_stop();
+                }
+                active._lease.rehabilitate_after_processor_stop();
+            }
+        }
+        self.async_compute_queues.clear();
+    }
+
+    pub(crate) fn prepare_queue_execution_context(
+        &mut self, vm: &mmu::Vm,
+    ) -> Result<Arc<mmu::T8140ComputeExecutionContext>> {
+        if !self.accepting_submissions || self.is_crashed() { return Err(EIO); }
+        self.manager.as_ref().ok_or(ENODEV)?
+            .uat().allocate_t8140_compute_execution_context(vm)
+    }
+
     pub(crate) fn prepare_async_compute_queue(
         &mut self, owner: u64, vm: &mmu::Vm,
+        context: Arc<mmu::T8140ComputeExecutionContext>,
     ) -> Result<(u8, Arc<mmu::T8140ComputeExecutionContext>)> {
         if !self.accepting_submissions || self.is_crashed() { return Err(EIO); }
+        if !context.matches(vm) || !context.is_current() { return Err(EFAULT); }
         if let Some(q) = self.async_compute_queues.iter().find(|q| q.owner == Some(owner)) {
             return Ok((q.queue.queue_id(), q.context.as_ref().ok_or(EIO)?.clone()));
         }
         let manager = self.manager.as_mut().ok_or(ENODEV)?;
         manager.stage_compute_flist_state()?;
         let free = self.async_compute_queues.iter().position(|q|
-            q.owner.is_none() && q.active.is_none() && !q.quarantined);
+            crate::g17_queue_limits::reusable_idle_compute_graph(
+                q.owner.is_none(),
+                q.active.is_none(),
+                q.binding.is_none(),
+                q.context.is_none(),
+                q.quarantined,
+            ));
         let index = if let Some(index) = free { index } else {
             self.async_compute_queues.reserve(1, GFP_KERNEL)?;
             // Reuse the unsubmitted boot graph, preserving QID 4 as first queue.
@@ -44,17 +88,60 @@ impl G17PLiveRuntime {
             let index = self.async_compute_queues.len();
             self.async_compute_queues.push(G17PAsyncComputeQueue {
                 owner: None, queue, binding: None, context: None, active: None,
-                released: false, quarantined: false,
+                released: false, quarantined: false, terminal_fanout: None,
             }, GFP_KERNEL)?;
             index
         };
         let q = &mut self.async_compute_queues[index];
-        let (binding, context) = manager.bind_independent_compute_user_vm(&mut q.queue, vm)?;
+        let reused_installed = !q.queue.requires_first_install();
+        let binding = manager.bind_independent_compute_user_vm(
+            &mut q.queue, vm, context.clone(),
+        )?;
         q.binding = Some(binding);
         q.context = Some(context.clone());
         q.owner = Some(owner);
         q.released = false;
+        if reused_installed {
+            if let Some(pdev) = self.pdev.as_ref() {
+                dev_info!(
+                    pdev.as_ref(),
+                    "G17P async compute: rebound retired installed graph qid={} owner={} context={} without reinstall\n",
+                    q.queue.queue_id(),
+                    owner,
+                    context.context_id(),
+                );
+            }
+        }
         Ok((q.queue.queue_id(), context))
+    }
+
+    /// Validate the frontend's cached scheduler/backend against the runtime
+    /// graph it names. A successful processor-stop recovery drops every
+    /// firmware-owned graph, but logical DRM queues can survive that boundary.
+    /// In that case an absent owner means the frontend must create a fresh
+    /// graph before its next compute submission.
+    ///
+    /// An owner that still exists but names different hardware state is not a
+    /// recovery case: tearing it down here could release another live graph.
+    /// Treat that as an internal ownership error instead.
+    pub(crate) fn async_compute_queue_matches(
+        &self, owner: u64, hardware_queue: u8,
+        context: &Arc<mmu::T8140ComputeExecutionContext>,
+    ) -> Result<bool> {
+        let Some(q) = self.async_compute_queues.iter().find(|q| q.owner == Some(owner)) else {
+            return Ok(false);
+        };
+        let installed_context = q.context.as_ref().ok_or(EIO)?;
+        if q.released
+            || q.quarantined
+            || q.binding.is_none()
+            || q.queue.queue_id() != hardware_queue
+            || !Arc::ptr_eq(installed_context, context)
+            || !context.is_current()
+        {
+            return Err(EIO);
+        }
+        Ok(true)
     }
 
     /// A signaled error fence is still signaled to DRM syncobj waiters. Surface
@@ -143,47 +230,237 @@ impl G17PLiveRuntime {
             "G17P async compute: PUBLISHED submission={} owner={} qid={} context={} root={:#x} outstanding={}\n",
             packet.submission_id(), owner, packet.hardware_queue_id(),
             packet.context().context_id(), packet.context().root(), outstanding);
-        // Firmware may notify before publishing the final stamp, and an
-        // interrupt coalesced with a running worker cannot enqueue it twice.
-        // Keep completion service armed while any hardware owner is active.
-        self.async_visibility_pending = true;
-        crate::driver::queue_g17p_firmware_event_worker(state.dev.clone());
         Ok(())
     }
 
+    fn service_async_compute_completions_for_event(&mut self, masks: [u64; 2]) -> Result {
+        self.service_async_compute_completions_matching(Some(masks))
+    }
+
+    /// Dispatch one drained firmware-event batch. A zero mask has no QID
+    /// identity, so it deliberately retains the broad lost-edge/watchdog
+    /// observation used before event routing was introduced.
+    fn service_async_compute_completion_masks(&mut self, masks: [u64; 2]) -> Result {
+        if masks == [0; 2] {
+            self.service_async_compute_completions()
+        } else {
+            self.service_async_compute_completions_for_event(masks)
+        }
+    }
+
+    /// Full-scan fallback for a final watchdog observation or an event batch
+    /// whose record did not carry a usable QID mask. These paths deliberately
+    /// preserve the old lost/coalesced-edge recovery behaviour.
     fn service_async_compute_completions(&mut self) -> Result {
-        self.async_visibility_pending = false;
+        self.service_async_compute_completions_matching(None)
+    }
+
+    fn service_async_compute_completions_matching(
+        &mut self,
+        masks: Option<[u64; 2]>,
+    ) -> Result {
         let manager = self.manager.as_mut().ok_or(ENODEV)?;
+        manager.begin_independent_compute_completion_batch();
+        let mut requested = false;
+        for q in &self.async_compute_queues {
+            if q.active.is_none() || q.quarantined { continue; }
+            if masks.is_some_and(|masks| {
+                !g17p_async_completion_mask_contains(masks, q.queue.queue_id())
+            }) {
+                continue;
+            }
+            requested |= manager.stage_independent_compute_completion(&q.queue)?;
+        }
+        if !requested {
+            return Ok(());
+        }
+        manager.scan_independent_compute_completion_batch()?;
         for q in &mut self.async_compute_queues {
             if q.active.is_none() || q.quarantined { continue; }
-            match manager.poll_independent_compute_completion(&mut q.queue) {
+            if masks.is_some_and(|masks| {
+                !g17p_async_completion_mask_contains(masks, q.queue.queue_id())
+            }) {
+                continue;
+            }
+            match manager.poll_staged_independent_compute_completion(&mut q.queue) {
                 Ok(Some(timestamps)) => {
                     let active = q.active.take().ok_or(EIO)?;
-                    dev_info!(self.pdev.as_ref().ok_or(ENODEV)?.as_ref(),
-                        "G17P async compute: COMPLETED submission={} qid={} context={} start={} end={}\n",
-                        active.packet.submission_id(), q.queue.queue_id(),
-                        active.packet.context().context_id(), timestamps[0], timestamps[1]);
+                    if let Some(pdev) = self.pdev.as_ref() {
+                        dev_info!(pdev.as_ref(),
+                            "G17P async compute: COMPLETED submission={} qid={} context={} start={} end={}\n",
+                            active.packet.submission_id(), q.queue.queue_id(),
+                            active.packet.context().context_id(), timestamps[0], timestamps[1]);
+                    }
                     active.packet.completion()?.complete(Ok(timestamps));
                     drop(active);
                     if q.released {
                         q.binding = None; q.context = None; q.owner = None;
                     }
                 }
-                Ok(None) => { self.async_visibility_pending = true; },
-                Err(error) if error == EAGAIN => { self.async_visibility_pending = true; },
+                // An RTKit edge may precede the final descriptor/stamp cache
+                // lines. Leave the job armed; the scheduler's finite timeout
+                // performs one final DRAM observation before quarantine.
+                Ok(None) => {}
+                Err(error) if error == EAGAIN => {}
                 Err(error) => {
+                    // This queue is still firmware-owned and cannot be made
+                    // reusable from an error fence. Make the proven
+                    // processor-stop recovery reachable by the next client.
+                    self.session_recovery_pending = true;
                     q.quarantined = true;
                     q.active.as_ref().ok_or(EIO)?._lease.quarantine();
-                    q.active.as_ref().ok_or(EIO)?.packet.completion()?.complete(Err(error));
+                    let completion = q.active.as_ref().ok_or(EIO)?.packet.completion()?;
+                    completion.fail_while_owned(error);
+                    q.terminal_fanout = Some((completion.status.clone(), error));
                 }
             }
         }
-        // Poll only while there is accepted hardware work, with a sleep rather
-        // than a busy loop. This closes early/coalesced interrupt races without
-        // requiring another notification after the completion record or stamp.
-        // The scheduler's finite timeout ends service by quarantining the job.
-        if self.async_visibility_pending { fsleep(Delta::from_micros(250)); }
+        // Finish the acquired batch before failing peers. A later queue may
+        // have a valid completion in this same snapshot, and proven success
+        // must win over another queue's terminal observation. Per-queue slots
+        // retain every failed VM identity without allocation or a QID cap.
+        for index in 0..self.async_compute_queues.len() {
+            let pending = {
+                let q = &mut self.async_compute_queues[index];
+                let Some(pending) = q.terminal_fanout.take() else { continue; };
+                pending
+            };
+            self.fail_outstanding_jobs_for_vm_after_compute_observation(&pending.0, pending.1);
+        }
         Ok(())
+    }
+
+    /// Settle one VM after its compute completion state was already observed.
+    /// This split lets the completion dispatcher fan out a poll failure after
+    /// releasing the manager borrow, without recursion or a second ring scan.
+    fn fail_outstanding_jobs_for_vm_after_compute_observation(
+        &mut self,
+        status: &Arc<crate::g17_status::VmStatus>,
+        error: Error,
+    ) -> usize {
+        for slot in 0..g17_resources::G17PRenderQueuePair::SLOT_COUNT {
+            let matches = self.pending_render[slot as usize]
+                .as_ref()
+                .is_some_and(|completion| completion.belongs_to_vm(status));
+            if !matches {
+                continue;
+            }
+            if let Ok(Some(observed)) = self.poll_deferred_render_completion(slot) {
+                let _ = self.settle_deferred_render_completion(slot, observed);
+            }
+        }
+
+        let mut failed = 0usize;
+        for slot in 0..g17_resources::G17PRenderQueuePair::SLOT_COUNT {
+            let matches = self.pending_render[slot as usize]
+                .as_ref()
+                .is_some_and(|completion| completion.belongs_to_vm(status));
+            if !matches {
+                continue;
+            }
+            self.session_recovery_pending = true;
+            let newly_failed = self.pending_render[slot as usize]
+                .as_ref()
+                .is_some_and(|completion| completion.fail_while_owned(error));
+            if !newly_failed {
+                continue;
+            }
+            failed += 1;
+            if let Some(pdev) = &self.pdev {
+                dev_err!(
+                    pdev.as_ref(),
+                    "G17P render: FAILING slot={} after its VM was lost ({:?})\n",
+                    slot,
+                    error,
+                );
+            }
+        }
+
+        for index in 0..self.async_compute_queues.len() {
+            let identity = {
+                let q = &self.async_compute_queues[index];
+                if q.quarantined {
+                    None
+                } else {
+                    q.active.as_ref().and_then(|active| {
+                        let completion = active.packet.completion().ok()?;
+                        if !Arc::ptr_eq(&completion.status, status) {
+                            return None;
+                        }
+                        Some((
+                            active.packet.submission_id(),
+                            q.queue.queue_id(),
+                            active.packet.context().context_id(),
+                        ))
+                    })
+                }
+            };
+            let Some((submission, queue_id, context)) = identity else { continue };
+            {
+                self.session_recovery_pending = true;
+                let q = &mut self.async_compute_queues[index];
+                q.quarantined = true;
+                let Some(active) = q.active.as_ref() else { continue };
+                active._lease.quarantine();
+                if let Ok(completion) = active.packet.completion() {
+                    completion.fail_while_owned(error);
+                }
+            }
+            failed += 1;
+            if let Some(pdev) = &self.pdev {
+                dev_err!(
+                    pdev.as_ref(),
+                    "G17P async compute: FAILING submission={} qid={} context={} after its VM was lost ({:?})\n",
+                    submission,
+                    queue_id,
+                    context,
+                    error,
+                );
+            }
+        }
+        failed
+    }
+
+    /// Fail every outstanding render or compute job that belongs to one VM.
+    ///
+    /// A submission that fails terminally loses the client's device: Mesa turns
+    /// it into `VK_ERROR_DEVICE_LOST` and tears the context down. Work this VM
+    /// had ALREADY handed to the hardware is not covered by the submit ioctl's
+    /// output-fence guard -- that guard only promises a fence for the ioctl it
+    /// runs in -- and once the VM is dead nothing will ever complete it. Its
+    /// client then waits on that syncobj forever, which is how one refused
+    /// frame ends with gnome-shell alive but permanently stopped in
+    /// `drm_syncobj_array_wait_timeout`.
+    ///
+    /// Two invariants this must not break:
+    ///
+    ///  * The packet is NOT released. Firmware may still be executing it, and
+    ///    freeing its mappings and root under a live GPU turns a lost client
+    ///    into a DMA fault. The queue is quarantined and the packet stays
+    ///    retained, exactly as the completion-service and scheduler-timeout
+    ///    paths already do.
+    ///  * The error is recorded on the VM's sticky status BEFORE the fence
+    ///    signals. A DRM syncobj treats an error fence as signalled, so a
+    ///    waiter wakes and immediately asks why; if the status were still clean
+    ///    it would read the destination buffer as if the job had run.
+    ///
+    /// Jobs belonging to other VMs are untouched: they are independently
+    /// rooted, their client is healthy, and completing them here would be the
+    /// same "signalled but never executed" lie for someone else.
+    pub(crate) fn fail_outstanding_jobs_for_vm(
+        &mut self,
+        status: &Arc<crate::g17_status::VmStatus>,
+        error: Error,
+    ) -> usize {
+        // Sticky first: both completion kinds publish a signalled error fence,
+        // and the woken client must already be able to observe why its VM died.
+        status.record(error.to_errno());
+
+        // A completion may already be sitting in DRAM; take it rather than
+        // discarding a job the GPU actually finished. Render and compute have
+        // independent completion stores, so observe both before the sweep.
+        let _ = self.service_async_compute_completions();
+        self.fail_outstanding_jobs_for_vm_after_compute_observation(status, error)
     }
 
     pub(crate) fn release_async_compute_queue(&mut self, owner: u64) {
@@ -200,26 +477,42 @@ impl G17PLiveRuntime {
         // race from a job whose completion really is absent. Never throw away
         // a proven successful hardware completion merely because a timer ran.
         let _ = self.service_async_compute_completions();
+        let mut matched = false;
+        let mut terminal_status = None;
         if let Some(q) = self.async_compute_queues.iter_mut().find(|q| q.owner == Some(owner)) {
             if let Some(active) = &q.active {
                 if active.packet.submission_id() == submission {
+                    matched = true;
                     if !q.quarantined {
+                        self.session_recovery_pending = true;
                         q.quarantined = true;
                         active._lease.quarantine();
                         if let Some(pdev) = &self.pdev {
                             dev_err!(pdev.as_ref(),
-                                "G17P async compute: QUARANTINE submission={} qid={} context={} error={:?}\n",
-                                submission, q.queue.queue_id(), active.packet.context().context_id(), error);
+                                "G17P async compute: QUARANTINE submission={} owner={} qid={} context={} vm={} root={:#x} root-current={} global-phase={:?} error={:?}\n",
+                                submission, owner, q.queue.queue_id(), active.packet.context().context_id(),
+                                active.packet.context().vm_id(), active.packet.context().root(),
+                                active.packet.context().is_current(),
+                                self.gfx_state.as_ref().map(|s| s.submission_phase.load(Ordering::Acquire)), error);
                         }
                         if let Some(manager) = self.manager.as_mut() {
+                            // Sample the actual retained owner, not the legacy
+                            // boot queue. Do this before the completion dump's
+                            // console output delays the cursor observation.
+                            manager.log_async_compute_timeout(&mut q.queue);
                             let _ = manager.dump_compute_completion_records("async-timeout");
                         }
-                        if let Ok(completion) = active.packet.completion() { completion.complete(Err(error)); }
+                        if let Ok(completion) = active.packet.completion() {
+                            terminal_status = Some(completion.status.clone());
+                            completion.fail_while_owned(error);
+                        }
                     }
-                    return true;
                 }
             }
         }
-        false
+        if let Some(status) = terminal_status {
+            self.fail_outstanding_jobs_for_vm(&status, error);
+        }
+        matched
     }
 }
