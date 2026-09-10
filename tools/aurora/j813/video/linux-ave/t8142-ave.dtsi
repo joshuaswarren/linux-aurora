@@ -1,0 +1,94 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* J813 AVE supplement, measured from its live ADT and macOS capture.
+ * Only the encoder's physical power domains are exposed here. The virtual
+ * AFISOCNI0/AFINS parents have no PMGR state registers to program.
+ */
+&{/soc} {
+	pmgr_ave: power-management@380700000 {
+		compatible = "apple,t8142-pmgr", "apple,pmgr", "syscon", "simple-mfd";
+		reg = <3 0x80700000 0 0x14000>;
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		ps_venc_sys: power-controller@298 {
+			compatible = "apple,t8142-pmgr-pwrstate", "apple,pmgr-pwrstate";
+			reg = <0x298 4>;
+			#power-domain-cells = <0>;
+			#reset-cells = <0>;
+			label = "venc_sys";
+		};
+		ps_venc_dma: power-controller@8000 {
+			compatible = "apple,t8142-pmgr-pwrstate", "apple,pmgr-pwrstate";
+			reg = <0x8000 4>;
+			#power-domain-cells = <0>;
+			#reset-cells = <0>;
+			label = "venc_dma";
+			power-domains = <&ps_venc_sys>;
+		};
+		ps_venc_pipe4: power-controller@8008 {
+			compatible = "apple,t8142-pmgr-pwrstate", "apple,pmgr-pwrstate";
+			reg = <0x8008 4>;
+			#power-domain-cells = <0>;
+			#reset-cells = <0>;
+			label = "venc_pipe4";
+			power-domains = <&ps_venc_dma>;
+		};
+		ps_venc_pipe5: power-controller@8010 {
+			compatible = "apple,t8142-pmgr-pwrstate", "apple,pmgr-pwrstate";
+			reg = <0x8010 4>;
+			#power-domain-cells = <0>;
+			#reset-cells = <0>;
+			label = "venc_pipe5";
+			power-domains = <&ps_venc_dma>;
+		};
+		ps_venc_me0: power-controller@8018 {
+			compatible = "apple,t8142-pmgr-pwrstate", "apple,pmgr-pwrstate";
+			reg = <0x8018 4>;
+			#power-domain-cells = <0>;
+			#reset-cells = <0>;
+			label = "venc_me0";
+			power-domains = <&ps_venc_dma>;
+		};
+		ps_venc_me1: power-controller@8020 {
+			compatible = "apple,t8142-pmgr-pwrstate", "apple,pmgr-pwrstate";
+			reg = <0x8020 4>;
+			#power-domain-cells = <0>;
+			#reset-cells = <0>;
+			label = "venc_me1";
+			power-domains = <&ps_venc_me0>;
+		};
+	};
+
+	ave_dart0: iommu@281080000 {
+		compatible = "apple,t8142-dart", "apple,t8110-dart";
+		reg = <2 0x81080000 0 0xc000>;
+		interrupts = <AIC_IRQ 1096 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_venc_sys>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x00004000 0 0x0fffc000>;
+	};
+	ave_dart1: iommu@2810a0000 {
+		compatible = "apple,t8142-dart", "apple,t8110-dart";
+		reg = <2 0x810a0000 0 0xc000>;
+		interrupts = <AIC_IRQ 1096 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_venc_sys>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x00004000 0 0x0fffc000>;
+	};
+	ave: video-codec@281100000 {
+		compatible = "apple,t8142-ave";
+		reg = <2 0x81100000 0 0x45c000>,
+		      <2 0x81050000 0 0x4000>,
+		      <2 0x81800000 0 0x800000>;
+		reg-names = "codec", "mailbox", "coproc";
+		interrupts = <AIC_IRQ 1099 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1093 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1092 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1095 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1094 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_venc_dma>, <&ps_venc_pipe4>,
+			       <&ps_venc_pipe5>, <&ps_venc_me0>, <&ps_venc_me1>;
+		power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1";
+		iommus = <&ave_dart0 0>, <&ave_dart1 0>;
+	};
+};
