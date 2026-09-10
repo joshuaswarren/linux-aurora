@@ -58,6 +58,41 @@ pub(crate) const G17P_FIRMWARE_EVENT_UMA_GROW_TYPE: u32 = 13;
 pub(crate) const D93AP_G17P_SGX_SOURCE_INDEX: u8 = 4;
 pub(crate) const D93AP_G17P_SGX_INTERRUPTS_VALID: u32 = 0xdf;
 
+/// Pure ownership state for event-driven render fences. A slot is settled by
+/// exactly one of firmware retirement or watchdog loss; a later duplicate or
+/// late event is ignored rather than signalling or releasing twice.
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RenderFenceState {
+    pending: u8,
+}
+
+impl RenderFenceState {
+    const fn bit(slot: u8) -> Option<u8> {
+        if slot < 8 { Some(1u8 << slot) } else { None }
+    }
+
+    pub(crate) fn arm(&mut self, slot: u8) -> bool {
+        let Some(bit) = Self::bit(slot) else { return false; };
+        if self.pending & bit != 0 { return false; }
+        self.pending |= bit;
+        true
+    }
+
+    pub(crate) const fn pending(&self, slot: u8) -> bool {
+        match Self::bit(slot) {
+            Some(bit) => self.pending & bit != 0,
+            None => false,
+        }
+    }
+
+    pub(crate) fn settle(&mut self, slot: u8) -> bool {
+        let Some(bit) = Self::bit(slot) else { return false; };
+        if self.pending & bit == 0 { return false; }
+        self.pending &= !bit;
+        true
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Firmware event ring -- channel-table entry 13, states[0]/states[1].
 //
@@ -430,6 +465,15 @@ const KSM_TIMESTAMP_MASK: u64 = 0x00ff_ffff_ffff;
 const KSM_QID_MASK: u8 = 0x7f;
 const KSM_PARENT_MASK: u64 = 0x003f_ffff_ffff_ffff;
 
+/// Extract the EventMachine QID from a KSM completion control word.
+///
+/// Keep this independent of the stricter full-record decoder: the shared
+/// completion ring retains partially overwritten and old records, which a
+/// batch scan must be able to skip without treating them as transport errors.
+pub(crate) const fn g17p_ksm_completion_queue_id(control: u64) -> u8 {
+    ((control >> 9) as u8) & KSM_QID_MASK
+}
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum CompletionDecodeError {
     RecordSize,
@@ -745,7 +789,7 @@ pub(crate) fn decode_ksm_completion_entry(
     Ok(G17pKsmCompletionEntry {
         completion_selector,
         command_type,
-        queue_id: ((control >> 9) as u8) & KSM_QID_MASK,
+        queue_id: g17p_ksm_completion_queue_id(control),
         timestamp: timestamp & KSM_TIMESTAMP_MASK,
         word_08: get_u64(raw, 0x08),
         payload: [get_u64(raw, 0x10), get_u64(raw, 0x18)],
@@ -1025,6 +1069,17 @@ impl G17PFirmwareStampEvent {
         let bit = stamp_index as usize % 64;
         self.masks[word] & (1u64 << bit) != 0
     }
+}
+
+/// Whether accumulated type-1 EventMachine QID bits cover one command's
+/// exact queue identity. Bits may arrive in separate records or batches;
+/// unrelated compute bits and duplicate records are harmless.
+pub(crate) const fn g17p_render_type1_complete(
+    observed: [u64; 2],
+    expected: [u64; 2],
+) -> bool {
+    observed[0] & expected[0] == expected[0]
+        && observed[1] & expected[1] == expected[1]
 }
 
 pub(crate) fn decode_g17p_firmware_stamp_event(
@@ -1448,6 +1503,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn render_fences_retire_out_of_order_once() {
+        let mut state = RenderFenceState::default();
+        assert!(state.arm(0));
+        assert!(state.arm(1));
+        assert!(state.settle(1));
+        assert!(state.pending(0));
+        assert!(!state.pending(1));
+        assert!(state.settle(0));
+    }
+
+    #[test]
+    fn duplicate_render_completion_is_ignored() {
+        let mut state = RenderFenceState::default();
+        assert!(state.arm(0));
+        assert!(state.settle(0));
+        assert!(!state.settle(0));
+    }
+
+    #[test]
+    fn lost_render_settlement_rejects_late_firmware_event() {
+        let mut state = RenderFenceState::default();
+        assert!(state.arm(1));
+        // The watchdog and firmware event share the same settlement gate.
+        assert!(state.settle(1));
+        assert!(!state.settle(1));
+        assert!(state.arm(1));
+    }
+
+    #[test]
     fn render_window_wrap_preserves_raw_report_and_execution_gates() {
         let window = RenderQueueWindow::new(1278, 3, 1280).unwrap();
         let previous = QueueIndices { done: 1278, read: 1278, write: 0 };
@@ -1471,6 +1555,50 @@ mod tests {
             ).unwrap().complete);
         }
         assert!(observe_compute_completion(previous, current, 1).is_err());
+    }
+
+    #[test]
+    fn render_window_base_253_accepts_exact_target_256() {
+        let execution = RenderExecutionState {
+            job_list_empty: true,
+            tiling_timestamps: [11, 11],
+            fragment_timestamps: [11, 17],
+        };
+        for (base, target) in [(253, 256), (1021, 1024)] {
+            let window = RenderQueueWindow::new(base, 3, 1280).unwrap();
+            let previous = QueueIndices { done: base, read: base, write: base };
+            let completed = QueueIndices { done: target, read: target, write: target };
+            let completion = observe_paired_render_window(
+                window, previous, completed, previous, completed, execution,
+            ).unwrap();
+            assert_eq!(window.target(), target);
+            assert!(completion.complete && completion.idle);
+        }
+    }
+
+    #[test]
+    fn render_window_transient_invalid_snapshot_can_be_resampled_complete() {
+        let window = RenderQueueWindow::new(253, 3, 1280).unwrap();
+        let previous = QueueIndices { done: 253, read: 253, write: 253 };
+        // A split firmware publication can expose a cursor from outside this
+        // group's bounded window on the first edge-side observation.
+        let transient = QueueIndices { done: 257, read: 256, write: 256 };
+        let completed = QueueIndices { done: 256, read: 256, write: 256 };
+        let execution = RenderExecutionState {
+            job_list_empty: true,
+            tiling_timestamps: [23, 23],
+            fragment_timestamps: [23, 29],
+        };
+        assert_eq!(
+            observe_paired_render_window(
+                window, previous, transient, previous, completed, execution,
+            ),
+            Err(CompletionDecodeError::RenderCursorOutsideWindow),
+        );
+        let retry = observe_paired_render_window(
+            window, previous, completed, previous, completed, execution,
+        ).unwrap();
+        assert!(retry.complete && retry.idle);
     }
 
     #[test]
@@ -1999,6 +2127,19 @@ mod tests {
             decode_g17p_firmware_recovery_event(&event),
             Err(CompletionDecodeError::FirmwareEventType)
         );
+    }
+
+    #[test]
+    fn render_type1_requires_its_complete_qid_pair() {
+        let qid0_qid1 = [0x3, 0];
+        assert!(!g17p_render_type1_complete([0x10, 0], qid0_qid1));
+        assert!(!g17p_render_type1_complete([0x1, 0], qid0_qid1));
+        assert!(g17p_render_type1_complete([0x3, 0], qid0_qid1));
+        assert!(g17p_render_type1_complete([0x13, 0], qid0_qid1));
+
+        let qid63_qid64 = [1u64 << 63, 1];
+        assert!(!g17p_render_type1_complete([1u64 << 63, 0], qid63_qid64));
+        assert!(g17p_render_type1_complete(qid63_qid64, qid63_qid64));
     }
 
     #[test]

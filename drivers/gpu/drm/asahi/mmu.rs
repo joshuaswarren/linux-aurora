@@ -27,7 +27,7 @@ use core::cmp;
 
 use kernel::{
     addr::PhysicalAddr,
-    bindings::drm_gpuvm_flags_DRM_GPUVM_IMMEDIATE_MODE,
+    bindings::{self, drm_gpuvm_flags_DRM_GPUVM_IMMEDIATE_MODE},
     c_str,
     device,
     drm::{
@@ -37,6 +37,7 @@ use kernel::{
     },
     error::Result,
     io,
+    new_condvar,
     new_mutex,
     page::Page,
     prelude::*,
@@ -48,6 +49,7 @@ use kernel::{
             Guard, //
         },
         Arc,
+        CondVar,
         Mutex, //
     },
     time::{
@@ -127,6 +129,41 @@ const T8140_COMPUTE_CTXS: [usize; 2] = [2, 3];
 const T8140_APP_CONTEXT_START: usize = 5;
 const T8140_APP_CONTEXT_RESERVED_MASK: u64 = (1u64 << T8140_APP_CONTEXT_START) - 1;
 const T8140_APP_CONTEXT_AVAILABLE_MASK: u64 = !T8140_APP_CONTEXT_RESERVED_MASK;
+
+/// Bootstrap-only T8140 UAT binding count. Ordinary jobs retain context 1 as
+/// the global FList root and use independently allocated app-GART contexts.
+const T8140_BIND_SLOTS: usize =
+    1 + crate::g17_queue_limits::BIND_CONTEXT_COUNT as usize;
+
+/// Hardware context for one T8140 UAT bind slot, or `None` above the pool.
+///
+/// Slot 0 maps to context 1 for the measured driver-owned opening. No ordinary
+/// render or independent compute queue reaches this allocator.
+const fn t8140_bind_context(slot: u32) -> Option<usize> {
+    if slot == 0 {
+        Some(1)
+    } else if (slot as usize) < T8140_BIND_SLOTS {
+        Some(crate::g17_queue_limits::BIND_CONTEXT_FIRST as usize + slot as usize - 1)
+    } else {
+        None
+    }
+}
+
+const _: () = {
+    // The bind band must not overlap anything else that owns a TTBAT entry.
+    assert!(
+        crate::g17_queue_limits::BIND_CONTEXT_MASK
+            & crate::g17_queue_limits::COMPUTE_CONTEXT_MASK
+            == 0
+    );
+    assert!(crate::g17_queue_limits::BIND_CONTEXT_MASK & T8140_APP_CONTEXT_RESERVED_MASK == 0);
+    assert!(
+        crate::g17_queue_limits::BIND_CONTEXT_MASK
+            & (1u64 << crate::g17_queue_limits::RENDER_APP_CONTEXT)
+            == 0
+    );
+    assert!(crate::g17_queue_limits::BIND_CONTEXT_FIRST as usize + 1 > T8140_APP_CONTEXT_START);
+};
 pub(crate) const T8140_PARAMETER_METRICS_LOW_VA: u64 = 0x0000_0010_0008_0000;
 pub(crate) const T8140_PARAMETER_METRICS_SIZE: usize = 0x8000;
 
@@ -659,6 +696,13 @@ struct VmBinding {
     active_users: usize,
     binding: Option<slotalloc::Guard<SlotInner>>,
     bind_token: Option<slotalloc::SlotToken>,
+    /// Hardware TTBAT context this VM's slot maps to.
+    ///
+    /// Sticky exactly like `bind_token`, and for the same reason: an unbound
+    /// VM still has to invalidate the ASID it last owned. It cannot be
+    /// recomputed from the token, because on T8140 slot index and hardware
+    /// context are no longer the same number.
+    bind_context: Option<u32>,
     ttb: u64,
 }
 
@@ -692,6 +736,56 @@ struct StepContext {
     next_va: Option<Pin<KBox<gpuvm::GpuVa<VmInner>>>>,
     vm_bo: Option<ARef<gpuvm::GpuVmBo<VmInner>>>,
     prot: Prot,
+}
+
+/// Per-map host resources reserved before a VM_BIND batch starts changing
+/// visible GPU mappings. Page-table allocation stays in the ordinary GPUVM
+/// commit callback, under its one interruptible dma-resv acquisition.
+pub(crate) struct PreparedUserMap {
+    gem: ARef<gem::Object>,
+    ctx: StepContext,
+    addr: u64,
+    size: u64,
+    offset: u64,
+    single_page: bool,
+}
+no_debug!(PreparedUserMap);
+
+/// Split GPUVA nodes reserved before an unmap is committed.
+pub(crate) struct PreparedUserUnmap {
+    ctx: StepContext,
+    iova: u64,
+    size: u64,
+}
+no_debug!(PreparedUserUnmap);
+
+pub(crate) enum PreparedUserBindOp {
+    Map(PreparedUserMap),
+    Unmap(PreparedUserUnmap),
+}
+no_debug!(PreparedUserBindOp);
+
+pub(crate) struct PreparedUserBindBatch {
+    ops: KVec<PreparedUserBindOp>,
+}
+no_debug!(PreparedUserBindBatch);
+
+impl PreparedUserBindBatch {
+    pub(crate) fn new(capacity: usize) -> Result<Self> {
+        Ok(Self {
+            ops: KVec::with_capacity(capacity, GFP_KERNEL)?,
+        })
+    }
+
+    pub(crate) fn push_map(&mut self, map: PreparedUserMap) -> Result {
+        Ok(self.ops.push(PreparedUserBindOp::Map(map), GFP_KERNEL)?)
+    }
+
+    pub(crate) fn push_unmap(&mut self, unmap: PreparedUserUnmap) -> Result {
+        Ok(self
+            .ops
+            .push(PreparedUserBindOp::Unmap(unmap), GFP_KERNEL)?)
+    }
 }
 
 impl gpuvm::DriverGpuVm for VmInner {
@@ -822,7 +916,6 @@ impl gpuvm::DriverGpuVm for VmInner {
         _ctx: &mut Self::StepContext,
     ) -> Result {
         let va = op.va().expect("step_unmap: missing VA");
-
         mod_dev_dbg!(self.dev, "MMU: unmap: {:#x}:{:#x}\n", va.addr(), va.range());
 
         self.page_table
@@ -940,11 +1033,7 @@ impl VmInner {
             // interim, and then it gets killed / drops its mappings without doing any
             // final rendering). Anything doing active maps/unmaps is probably also
             // rendering and therefore likely bound.
-            self.binding
-                .lock()
-                .bind_token
-                .as_ref()
-                .map(|token| token.last_slot() + UAT_USER_CTX_START as u32)
+            self.binding.lock().bind_context
         }
     }
 
@@ -962,7 +1051,7 @@ impl VmInner {
         // The private fixed-mapping allocator cannot see GPUVM-owned leaves.
         // Reserve the complete page-table walk before installing any SG run.
         self.page_table.prepare_map(iova..mapping_end)?;
-        let guard = node.bo.as_ref().ok_or(EINVAL)?.inner().inner.lock();
+        let guard = node.bo.as_ref().ok_or(EINVAL)?.get()?.inner().inner.lock();
         let sgt = guard.sgt.as_ref().ok_or(EINVAL)?;
         let mut offset = node.offset;
         let mut left = node.mapped_size;
@@ -1031,6 +1120,7 @@ pub(crate) struct Vm {
     binding: Arc<Mutex<VmBinding>>,
     driver_mappings: Arc<Mutex<Option<VmDriverMappings>>>,
     job_lifetime: Arc<Mutex<T8140VmJobLifetime>>,
+    mapping_gate: Arc<T8140VmMappingGate>,
     status: Arc<crate::g17_status::VmStatus>,
     /// User bindings which are eligible for native's restricted context-0
     /// view. This records backing identity only; it never changes context 0
@@ -1041,32 +1131,126 @@ no_debug!(Vm);
 
 struct T8140VmJobLifetime {
     active: usize,
+    /// At least one accepted job may still be dereferenced by firmware after
+    /// its error fence has signalled. Healthy synchronized VM_BIND unmaps stay
+    /// immediate; only this lost-VM state defers them to processor stop.
+    quarantined: bool,
+    /// The final job guard is applying deferred close/unmap work. New jobs
+    /// cannot enter until that teardown is complete.
+    draining: bool,
     closed: bool,
     close_ranges: Option<(Range<u64>, Range<u64>)>,
+    deferred_unmaps: KVec<(u64, u64)>,
     closed_objects: KVec<ARef<gem::Object>>,
+}
+
+struct T8140VmMappingGateState {
+    blocked: bool,
+    commits: usize,
+}
+
+/// Serializes only the already-prepared leaf commit against lost-job
+/// quarantine.  In particular, this is acquired after drm_exec has locked the
+/// batch's BOs, so it neither expands dma-resv lock ordering into VM_BIND
+/// preparation nor turns an interruptible reservation wait into a deadlock.
+#[pin_data]
+struct T8140VmMappingGate {
+    #[pin]
+    state: Mutex<T8140VmMappingGateState>,
+    #[pin]
+    idle: CondVar,
+}
+
+struct T8140VmMappingCommitGuard {
+    gate: Arc<T8140VmMappingGate>,
+}
+
+impl Drop for T8140VmMappingCommitGuard {
+    fn drop(&mut self) {
+        let mut state = self.gate.state.lock();
+        debug_assert!(state.commits != 0);
+        state.commits -= 1;
+        if state.commits == 0 {
+            self.gate.idle.notify_all();
+        }
+    }
 }
 
 /// GPU ownership outlives a DRM handle or file. Deferred user mappings retain
 /// their GEM backing until all accepted jobs retire; quarantined packets keep
 /// this guard until the processors have provably stopped.
 pub(crate) struct T8140VmJobGuard { vm: Vm }
+impl T8140VmJobGuard {
+    /// Mark this VM as retaining a packet whose firmware ownership was not
+    /// disproved. The sticky VM failure prevents new work; explicit unbinds
+    /// are held until the last job guard reaches the processor-stop drain.
+    pub(crate) fn quarantine(&self) {
+        // Close admission before publishing the error fence. A VM_BIND which
+        // already owns its dma-resv transaction finishes first; one which was
+        // sleeping on that interruptible acquisition observes `blocked` after
+        // it wakes and cannot mutate a firmware-owned mapping.
+        let mut gate = self.vm.mapping_gate.state.lock();
+        gate.blocked = true;
+        while gate.commits != 0 {
+            self.vm.mapping_gate.idle.wait(&mut gate);
+        }
+        self.vm.job_lifetime.lock().quarantined = true;
+    }
+}
 impl Drop for T8140VmJobGuard {
     fn drop(&mut self) {
-        let (ranges, objects) = {
-            let mut state = self.vm.job_lifetime.lock();
-            state.active -= 1;
-            if state.active != 0 { return; }
-            (state.close_ranges.take(), core::mem::replace(&mut state.closed_objects, KVec::new()))
-        };
-        if let Some((user, kernel)) = ranges {
-            if self.vm.unmap_user_ranges(user, kernel).is_err() {
-                pr_err!("G17P VM job retirement: deferred user unmap failed\n");
+        let mut state = self.vm.job_lifetime.lock();
+        state.active -= 1;
+        if state.active != 0 { return; }
+        state.draining = true;
+        // Keep admission blocked, but do not hold the lifetime mutex while
+        // taking dma-resv locks. A VM_BIND may already own those locks and be
+        // waiting to append its now-blocked unmap under this mutex.
+        loop {
+            let ranges = state.close_ranges.take();
+            let deferred_unmaps =
+                core::mem::replace(&mut state.deferred_unmaps, KVec::new());
+            let objects = core::mem::replace(&mut state.closed_objects, KVec::new());
+            core::mem::drop(state);
+
+            if let Some((user, kernel)) = ranges {
+                if self.vm.unmap_user_ranges_now(user, kernel).is_err() {
+                    pr_err!("G17P VM job retirement: deferred user unmap failed\n");
+                }
+            } else {
+                for (iova, size) in deferred_unmaps {
+                    if self.vm.unmap_range(iova, size).is_err() {
+                        pr_err!("G17P VM job retirement: deferred range unmap failed\n");
+                    }
+                }
             }
-        }
-        for object in objects {
-            if self.vm.drop_mappings(&object).is_err() {
-                pr_err!("G17P VM job retirement: deferred GEM unmap failed\n");
+            for object in objects {
+                if self.vm.drop_mappings_now(&object).is_err() {
+                    pr_err!("G17P VM job retirement: deferred GEM unmap failed\n");
+                }
             }
+
+            // Pair with quarantine(): gate -> lifetime is the only nested
+            // order. A blocked unbind holds the same gate while appending, so
+            // observing an empty set here is an atomic reopen boundary.
+            let mut gate = self.vm.mapping_gate.state.lock();
+            state = self.vm.job_lifetime.lock();
+            if state.close_ranges.is_some()
+                || !state.deferred_unmaps.is_empty()
+                || !state.closed_objects.is_empty()
+            {
+                core::mem::drop(gate);
+                continue;
+            }
+            state.quarantined = false;
+            state.draining = false;
+            if !state.closed {
+                gate.blocked = false;
+            }
+            core::mem::drop(state);
+            core::mem::drop(gate);
+            self.vm.mapping_gate.idle.notify_all();
+            break;
         }
         self.vm.bo_deferred_cleanup();
     }
@@ -1147,7 +1331,7 @@ struct VmDriverMappings {
     mappings: KVec<KernelMapping>,
     reserved_ranges: KVec<Range<u64>>,
     simplefb: Option<KernelMapping>,
-    render_pool: Option<VmRenderPoolMappings>,
+    render_pools: [Option<VmRenderPoolMappings>; 2],
     compute_pool: Option<VmRenderPoolMappings>,
 }
 no_debug!(VmDriverMappings);
@@ -1171,7 +1355,7 @@ impl VmDriverMappings {
                 Iterator::chain(self.mappings.iter(), self.simplefb.iter()),
                 self.compute_pool.iter().flat_map(|pool| pool.mappings.iter()),
             ),
-            self.render_pool.iter().flat_map(|pool| pool.mappings.iter()),
+            self.render_pools.iter().flatten().flat_map(|pool| pool.mappings.iter()),
         )
     }
 }
@@ -1186,8 +1370,44 @@ where
 /// Slot data for a [`Vm`] slot (nothing, we only care about the indices).
 pub(crate) struct SlotInner();
 
+/// Which VM currently owns each UAT slot.
+///
+/// A bind failure is otherwise unattributable: the log says the pool is full
+/// and nothing says who filled it. The allocator clears an entry as the slot
+/// is returned, so this is exact rather than a last-seen record.
+pub(crate) struct SlotOwners {
+    vm_ids: [u64; UAT_USER_CTX],
+}
+
+impl SlotOwners {
+    fn new() -> Self {
+        Self {
+            vm_ids: [0; UAT_USER_CTX],
+        }
+    }
+
+    fn record_owner(&mut self, slot: u32, vm_id: u64) {
+        if let Some(entry) = self.vm_ids.get_mut(slot as usize) {
+            *entry = vm_id;
+        }
+    }
+
+    /// The owners of the T8140 bind pool only. Deliberately not the whole
+    /// 63-entry table: this runs on an error path, and the caller's frame is
+    /// on the submit stack.
+    fn snapshot(&self) -> [u64; T8140_BIND_SLOTS] {
+        core::array::from_fn(|slot| self.vm_ids.get(slot).copied().unwrap_or(0))
+    }
+}
+
 impl slotalloc::SlotItem for SlotInner {
-    type Data = ();
+    type Data = SlotOwners;
+
+    fn release(&mut self, data: &mut Self::Data, slot: u32) {
+        if let Some(entry) = data.vm_ids.get_mut(slot as usize) {
+            *entry = 0;
+        }
+    }
 }
 
 /// Represents a single user of a binding of a [`Vm`] to a slot.
@@ -1363,13 +1583,65 @@ impl Drop for T8140ContextRootLease {
     }
 }
 
+/// A `drm_gpuvm_bo` reference owned by an Asahi fixed mapping.
+///
+/// Every Asahi GPUVM uses `DRM_GPUVM_IMMEDIATE_MODE`, so its GEM GPUVA list is
+/// protected by `drm_gem_object::gpuva.lock`, not `dma_resv`. The generic Rust
+/// `ARef<GpuVmBo>` destructor currently uses the latter. Fixed mappings are
+/// particularly likely to expose that mismatch because several aliases of one
+/// internal GEM can be created and retired concurrently.
+///
+/// Consume the Rust reference explicitly through DRM's immediate-mode
+/// deferred put. This takes the right lock and keeps both the GEM mutex and
+/// GPUVM alive until cleanup runs. Retaining the owner separately makes it
+/// safe to drain the deferred list after the put, including when this was the
+/// final BO reference.
+struct ImmediateGpuVmBoRef {
+    bo: Option<ARef<gpuvm::GpuVmBo<VmInner>>>,
+    owner: ARef<gpuvm::GpuVm<VmInner>>,
+}
+
+impl ImmediateGpuVmBoRef {
+    fn new(
+        bo: ARef<gpuvm::GpuVmBo<VmInner>>,
+        owner: ARef<gpuvm::GpuVm<VmInner>>,
+    ) -> Self {
+        Self {
+            bo: Some(bo),
+            owner,
+        }
+    }
+
+    fn get(&self) -> Result<&gpuvm::GpuVmBo<VmInner>> {
+        self.bo.as_deref().ok_or(EINVAL)
+    }
+}
+
+impl Drop for ImmediateGpuVmBoRef {
+    fn drop(&mut self) {
+        let Some(bo) = self.bo.take() else {
+            return;
+        };
+        let raw = ARef::into_raw(bo);
+        // SAFETY: `GpuVmBo` is `repr(C)` with `drm_gpuvm_bo` as its first
+        // field. `into_raw` transfers the live reference to this call, and
+        // every Asahi GPUVM is constructed with IMMEDIATE_MODE.
+        unsafe {
+            bindings::drm_gpuvm_bo_put_deferred(
+                raw.as_ptr().cast::<bindings::drm_gpuvm_bo>(),
+            );
+        }
+        self.owner.bo_deferred_cleanup();
+    }
+}
+
 /// Inner data required for an object mapping into a [`Vm`].
 pub(crate) struct KernelMappingInner {
     // Drop order matters:
-    // - Drop the GpuVmBo first, which resv locks its BO and drops a GpuVm reference
+    // - Deferred-put the GpuVmBo first under its immediate-mode GPUVA lock
     // - Drop the GEM BO next, since BO free can take the resv lock itself
     // - Drop the owner GpuVm last, since that again can take resv locks when the refcount drops to 0
-    bo: Option<ARef<gpuvm::GpuVmBo<VmInner>>>,
+    bo: Option<ImmediateGpuVmBoRef>,
     _gem: Option<ARef<gem::Object>>,
     owner: ARef<gpuvm::GpuVm<VmInner>>,
     uat_inner: Arc<UatInner>,
@@ -1739,6 +2011,10 @@ pub(crate) struct Uat {
 
     kernel_vm: Vm,
     kernel_lower_vm: Vm,
+    /// Dedicated native context-1 root for the device-global FList/operand
+    /// closure. Context 0 has overlapping fixed KSM mappings, so sharing its
+    /// lower root cannot represent the render-only final operand block.
+    t8140_render_global_vm: Option<Vm>,
     _t8140_firmware_crash_buffers: Option<[KernelMapping; 2]>,
     t8140_firmware_crash_gems: Option<[ARef<gem::Object>; 2]>,
     _t8140_parameter_metrics_low: Option<KernelMapping>,
@@ -1909,6 +2185,15 @@ impl HandoffFlush {
 impl Vm {
     pub(crate) fn status(&self) -> &Arc<crate::g17_status::VmStatus> { &self.status }
 
+    /// This VM's driver-assigned id.
+    ///
+    /// The retained render graph is owned by a VM, not by a logical DRM queue:
+    /// `render_bind.matches(vm)` is what decides whether a submission may
+    /// restage the retained storage or has to hand it off. Anything that wants
+    /// to keep a client on the storage it already built therefore has to key on
+    /// the same identity, which is this id.
+    pub(crate) fn id(&self) -> u64 { self.id }
+
     /// Create a new virtual memory address space
     fn new(
         dev: &driver::AsahiDevice,
@@ -1956,6 +2241,7 @@ impl Vm {
                 VmBinding {
                     binding: None,
                     bind_token: None,
+                    bind_context: None,
                     active_users: 0,
                     ttb: page_table.ttb(),
                 },
@@ -1991,8 +2277,20 @@ impl Vm {
             driver_mappings: Arc::pin_init(new_mutex!(None, "VmDriverMappings"), GFP_KERNEL)?,
             status: Arc::new(crate::g17_status::VmStatus::new(), GFP_KERNEL)?,
             job_lifetime: Arc::pin_init(new_mutex!(T8140VmJobLifetime {
-                active: 0, closed: false, close_ranges: None, closed_objects: KVec::new(),
+                active: 0, quarantined: false, draining: false, closed: false,
+                close_ranges: None, deferred_unmaps: KVec::new(),
+                closed_objects: KVec::new(),
             }, "T8140VmJobLifetime"), GFP_KERNEL)?,
+            mapping_gate: Arc::pin_init(
+                pin_init!(T8140VmMappingGate {
+                    state <- new_mutex!(T8140VmMappingGateState {
+                        blocked: false,
+                        commits: 0,
+                    }, "T8140VmMappingGate"),
+                    idle <- new_condvar!("T8140VmMappingGate::idle"),
+                }),
+                GFP_KERNEL,
+            )?,
             t8140_native_context_bindings: if cfg == UatConfig::T8140 {
                 Some(Arc::pin_init(
                     new_mutex!(
@@ -2162,9 +2460,30 @@ impl Vm {
             mappings,
             reserved_ranges,
             simplefb: None,
-            render_pool: None,
+            render_pools: [None, None],
             compute_pool: None,
         });
+        Ok(())
+    }
+
+    /// Add VM-wide aliases discovered lazily by the render path. These are
+    /// shared by every render pair and must not be owned by one pair's pool,
+    /// because clearing that pool while another pair is live would unmap them.
+    pub(crate) fn append_driver_mappings(&self, mappings: KVec<KernelMapping>) -> Result {
+        if mappings.is_empty() {
+            return Ok(());
+        }
+        let mut retained = self.driver_mappings.lock();
+        let driver = Option::as_mut(&mut *retained).ok_or(EINVAL)?;
+        let added = mappings.len();
+        let length = driver.mappings.len().checked_add(added).ok_or(EOVERFLOW)?;
+        driver.mappings.reserve(added, GFP_KERNEL)?;
+        for (slot, mapping) in driver.mappings.spare_capacity_mut().iter_mut().zip(mappings) {
+            slot.write(mapping);
+        }
+        // SAFETY: reserve provided room for every exact-size input element,
+        // and the loop initialized each added slot once.
+        unsafe { driver.mappings.set_len(length); }
         Ok(())
     }
 
@@ -2172,12 +2491,13 @@ impl Vm {
     /// generation. The caller allocates pool IDs monotonically, never from a
     /// recyclable GPU address, so a new firmware session cannot reuse stale
     /// aliases merely because its backing landed at the same address.
-    pub(crate) fn render_pool_mappings_match(&self, pool_id: u64) -> bool {
+    pub(crate) fn render_pool_mappings_match(&self, render_slot: u8, pool_id: u64) -> bool {
         pool_id != 0
             && self.driver_mappings.lock().as_ref().is_some_and(|driver| {
                 driver
-                    .render_pool
-                    .as_ref()
+                    .render_pools
+                    .get(render_slot as usize)
+                    .and_then(Option::as_ref)
                     .is_some_and(|pool| pool.pool_id == pool_id)
             })
     }
@@ -2187,25 +2507,27 @@ impl Vm {
     /// GPU work and explicitly clear it before installing a different pool.
     pub(crate) fn install_render_pool_mappings(
         &self,
+        render_slot: u8,
         pool_id: u64,
         tvb_blocks: usize,
         mappings: KVec<KernelMapping>,
     ) -> Result {
-        if pool_id == 0 {
+        if pool_id == 0 || render_slot as usize >= 2 {
             return Err(EINVAL);
         }
         let mut retained = self.driver_mappings.lock();
         let driver = Option::as_mut(&mut *retained).ok_or(EINVAL)?;
-        if driver.render_pool.is_some() {
+        let pool = driver.render_pools.get_mut(render_slot as usize).ok_or(EINVAL)?;
+        if pool.is_some() {
             return Err(EBUSY);
         }
-        driver.render_pool = Some(VmRenderPoolMappings { pool_id, tvb_blocks, mappings });
+        *pool = Some(VmRenderPoolMappings { pool_id, tvb_blocks, mappings });
         Ok(())
     }
 
-    pub(crate) fn render_pool_tvb_blocks(&self, pool_id: u64) -> Option<usize> {
+    pub(crate) fn render_pool_tvb_blocks(&self, render_slot: u8, pool_id: u64) -> Option<usize> {
         if pool_id == 0 { return None; }
-        self.driver_mappings.lock().as_ref()?.render_pool.as_ref()
+        self.driver_mappings.lock().as_ref()?.render_pools.get(render_slot as usize)?.as_ref()
             .filter(|pool| pool.pool_id == pool_id).map(|pool| pool.tvb_blocks)
     }
 
@@ -2213,13 +2535,15 @@ impl Vm {
     /// Both allocation and the expected-capacity check precede mutation. The
     /// caller only publishes the enlarged PM pool after this succeeds.
     pub(crate) fn append_render_pool_mappings(
-        &self, pool_id: u64, previous_blocks: usize, tvb_blocks: usize,
+        &self, render_slot: u8, pool_id: u64, previous_blocks: usize, tvb_blocks: usize,
         mappings: KVec<KernelMapping>,
     ) -> Result {
-        if pool_id == 0 || tvb_blocks <= previous_blocks
+        if pool_id == 0 || render_slot as usize >= 2 || tvb_blocks <= previous_blocks
             || mappings.len() != tvb_blocks - previous_blocks { return Err(EINVAL); }
         let mut retained = self.driver_mappings.lock();
-        let pool = Option::as_mut(&mut *retained).and_then(|driver| driver.render_pool.as_mut())
+        let pool = Option::as_mut(&mut *retained)
+            .and_then(|driver| driver.render_pools.get_mut(render_slot as usize))
+            .and_then(Option::as_mut)
             .filter(|pool| pool.pool_id == pool_id).ok_or(EINVAL)?;
         if pool.tvb_blocks != previous_blocks { return Err(EBUSY); }
         let added = mappings.len();
@@ -2237,10 +2561,12 @@ impl Vm {
 
     /// Release an obsolete pool after its GPU references have retired. Drop
     /// outside driver_mappings: KernelMapping teardown takes the GPUVM lock.
-    pub(crate) fn clear_render_pool_mappings(&self) {
+    pub(crate) fn clear_render_pool_mappings(&self, render_slot: u8) {
         let previous = {
             let mut retained = self.driver_mappings.lock();
-            Option::as_mut(&mut *retained).and_then(|driver| driver.render_pool.take())
+            Option::as_mut(&mut *retained)
+                .and_then(|driver| driver.render_pools.get_mut(render_slot as usize))
+                .and_then(Option::take)
         };
         drop(previous);
     }
@@ -2295,10 +2621,19 @@ impl Vm {
     }
 
     pub(crate) fn retain_t8140_job(&self) -> Result<T8140VmJobGuard> {
-        let mut state = self.job_lifetime.lock();
-        if state.closed { return Err(ENOENT); }
-        state.active = state.active.checked_add(1).ok_or(EOVERFLOW)?;
-        Ok(T8140VmJobGuard { vm: self.clone() })
+        let mut gate = self.mapping_gate.state.lock();
+        loop {
+            let mut state = self.job_lifetime.lock();
+            if state.closed { return Err(ENOENT); }
+            if gate.blocked { return Err(EIO); }
+            if state.draining {
+                core::mem::drop(state);
+                self.mapping_gate.idle.wait(&mut gate);
+                continue;
+            }
+            state.active = state.active.checked_add(1).ok_or(EOVERFLOW)?;
+            return Ok(T8140VmJobGuard { vm: self.clone() });
+        }
     }
 
     /// Remove userspace mappings while preserving VM-lifetime driver aliases.
@@ -2307,14 +2642,30 @@ impl Vm {
         user_range: Range<u64>,
         kernel_range: Range<u64>,
     ) -> Result {
-        {
-            let mut state = self.job_lifetime.lock();
-            state.closed = true;
-            if state.active != 0 {
-                state.close_ranges = Some((user_range, kernel_range));
-                return Ok(());
-            }
+        // VM destruction permanently closes this gate. Wait for an already
+        // prepared leaf transaction before deciding whether the final unmap is
+        // immediate or belongs to the last job guard.
+        let mut gate = self.mapping_gate.state.lock();
+        gate.blocked = true;
+        while gate.commits != 0 {
+            self.mapping_gate.idle.wait(&mut gate);
         }
+        let mut state = self.job_lifetime.lock();
+        state.closed = true;
+        if state.active != 0 {
+            state.close_ranges = Some((user_range, kernel_range));
+            return Ok(());
+        }
+        core::mem::drop(state);
+        core::mem::drop(gate);
+        self.unmap_user_ranges_now(user_range, kernel_range)
+    }
+
+    fn unmap_user_ranges_now(
+        &self,
+        user_range: Range<u64>,
+        kernel_range: Range<u64>,
+    ) -> Result {
         let retained = self.driver_mappings.lock();
         let driver = retained.as_ref();
         let mut cursor = user_range.start;
@@ -2579,6 +2930,7 @@ impl Vm {
             vm_bo_guard.sgt.replace(sgt);
         }
         core::mem::drop(vm_bo_guard);
+        let mut vm_bo = Some(ImmediateGpuVmBoRef::new(vm_bo, self.inner.clone()));
 
         let uat_inner = inner.uat_inner.clone();
         // Reserve the VA before attaching objects whose destructors take the
@@ -2610,7 +2962,7 @@ impl Vm {
         };
         {
             let node_inner = node.as_mut().inner_mut();
-            node_inner.bo = Some(vm_bo);
+            node_inner.bo = vm_bo.take();
             node_inner._gem = Some(gem.into());
         }
 
@@ -2642,6 +2994,7 @@ impl Vm {
             vm_bo_guard.sgt.replace(sgt);
         }
         core::mem::drop(vm_bo_guard);
+        let mut vm_bo = Some(ImmediateGpuVmBoRef::new(vm_bo, self.inner.clone()));
 
         let uat_inner = inner.uat_inner.clone();
         // See map_in_range(): keep dma_resv-owning references out of the
@@ -2669,7 +3022,7 @@ impl Vm {
         };
         {
             let node_inner = node.as_mut().inner_mut();
-            node_inner.bo = Some(vm_bo);
+            node_inner.bo = vm_bo.take();
             node_inner._gem = Some(gem.clone());
         }
 
@@ -2692,6 +3045,25 @@ impl Vm {
         prot: Prot,
         single_page: bool,
     ) -> Result {
+        let prepared = self.prepare_bind_object(
+            gem, addr, size, offset, prot, single_page,
+        )?;
+        let mut batch = PreparedUserBindBatch::new(1)?;
+        batch.push_map(prepared)?;
+        self.commit_prepared_user_bind_batch(&mut batch)
+    }
+
+    /// Reserve the BO state, split nodes and scatterlist needed by one
+    /// userspace map without taking dma-resv or walking its address range.
+    pub(crate) fn prepare_bind_object(
+        &self,
+        gem: &gem::Object,
+        addr: u64,
+        size: u64,
+        offset: u64,
+        prot: Prot,
+        single_page: bool,
+    ) -> Result<PreparedUserMap> {
         // Mapping needs a complete context
         let mut ctx = StepContext {
             new_va: Some(gpuvm::GpuVa::<VmInner>::new(pin_init::default())?),
@@ -2723,35 +3095,215 @@ impl Vm {
             core::mem::drop(vm_bo_guard);
         }
 
-        let mut inner = self.inner.exec_lock(Some(gem), true)?;
-
         ctx.vm_bo = Some(vm_bo);
 
         if (addr | size | offset) & (UAT_PGMSK as u64) != 0 {
-            dev_err!(
-                inner.dev.as_ref(),
-                "MMU: Map step {:#x} [{:#x}] -> {:#x} is not page-aligned\n",
-                offset,
-                size,
-                addr
-            );
             return Err(EINVAL);
         }
 
-        let (flags, gem_range) = if single_page {
-            (gpuvm::GpuVaFlags::REPEAT, UAT_PGSZ as u32)
-        } else {
-            (gpuvm::GpuVaFlags::NONE, 0u32)
-        };
+        Ok(PreparedUserMap {
+            gem: gem.into(), ctx, addr, size, offset, single_page,
+        })
+    }
 
-        mod_dev_dbg!(
-            inner.dev,
-            "MMU: sm_map: {:#x} [{:#x}] -> {:#x}\n",
-            offset,
-            size,
-            addr
-        );
-        inner.sm_map(&mut ctx, addr, size, offset, gem_range, flags)
+    /// Wait for healthy retirement before preparing a userspace map. This
+    /// runs before taking dma-resv locks, which the retirement drain needs.
+    /// A failed or quarantined VM still cannot replace firmware-owned maps.
+    pub(crate) fn wait_for_user_map_admission(&self) -> Result {
+        let mut gate = self.mapping_gate.state.lock();
+        let mut waited = false;
+        loop {
+            let state = self.job_lifetime.lock();
+            let status = self.status.get();
+            if status != 0 || state.closed || gate.blocked
+                || (state.active != 0 && state.quarantined)
+            {
+                pr_info!(
+                    "G17P VM map admission refused: vm={} status={} blocked={} active={} quarantined={} draining={} closed={}\n",
+                    self.id, status, gate.blocked, state.active,
+                    state.quarantined, state.draining, state.closed
+                );
+                return Err(if state.closed { ENOENT } else { EIO });
+            }
+            if !state.draining {
+                return Ok(());
+            }
+            if !waited {
+                pr_info!(
+                    "G17P VM map admission waiting for retirement: vm={} status={} blocked={} active={} quarantined={} draining={} closed={}\n",
+                    self.id, status, gate.blocked, state.active,
+                    state.quarantined, state.draining, state.closed
+                );
+                waited = true;
+            }
+            core::mem::drop(state);
+            // Drop gate atomically with sleeping. The drain clears draining
+            // under gate -> lifetime and then notifies this condition.
+            if self.mapping_gate.idle.wait_interruptible(&mut gate) {
+                return Err(ERESTARTSYS);
+            }
+        }
+    }
+
+    /// Allocate every deferred-unmap entry a batch could need before it
+    /// changes a visible mapping.
+    pub(crate) fn reserve_deferred_user_unmaps(&self, count: usize) -> Result {
+        self.job_lifetime.lock().deferred_unmaps.reserve(count, GFP_KERNEL)?;
+        Ok(())
+    }
+
+    /// Settle a batch which lost mapping admission while it was waiting for
+    /// dma-resv. Maps are refused; teardown unmaps are retained behind the
+    /// firmware-owned job. Returns false if the last job finished and reopened
+    /// admission before this recheck, in which case the caller may retry.
+    ///
+    /// The mapping gate stays held through deferred-unmap insertion, making
+    /// the append atomic with the last job guard's drain/reopen decision.
+    fn defer_blocked_user_bind_batch(
+        &self,
+        batch: &PreparedUserBindBatch,
+    ) -> Result<bool> {
+        let gate = self.mapping_gate.state.lock();
+        if !gate.blocked {
+            return Ok(false);
+        }
+        let mut lifetime = self.job_lifetime.lock();
+        if lifetime.closed {
+            return Err(ENOENT);
+        }
+        if batch
+            .ops
+            .iter()
+            .any(|op| matches!(op, PreparedUserBindOp::Map(_)))
+        {
+            return Err(EIO);
+        }
+        if !lifetime.quarantined {
+            return Err(EBUSY);
+        }
+        for op in &batch.ops {
+            let PreparedUserBindOp::Unmap(unmap) = op else {
+                continue;
+            };
+            if !lifetime
+                .deferred_unmaps
+                .iter()
+                .any(|range| *range == (unmap.iova, unmap.size))
+            {
+                lifetime
+                    .deferred_unmaps
+                    .push((unmap.iova, unmap.size), GFP_KERNEL)?;
+            }
+        }
+        Ok(true)
+    }
+
+    /// Commit a map whose fallible backing and page-table resources were
+    /// prepared before the containing VM_BIND batch began.
+    pub(crate) fn bind_prepared_object(&self, prepared: PreparedUserMap) -> Result {
+        let mut batch = PreparedUserBindBatch::new(1)?;
+        batch.push_map(prepared)?;
+        self.commit_prepared_user_bind_batch(&mut batch)
+    }
+
+    /// Enter one already-prepared leaf transaction after its interruptible
+    /// dma-resv acquisition. A concurrent lost-job quarantine closes this
+    /// gate and waits for the returned guard before publishing its fence.
+    fn enter_user_mapping_commit(&self) -> Result<Option<T8140VmMappingCommitGuard>> {
+        let mut gate = self.mapping_gate.state.lock();
+        if gate.blocked {
+            return Ok(None);
+        }
+        gate.commits = gate.commits.checked_add(1).ok_or(EOVERFLOW)?;
+        Ok(Some(T8140VmMappingCommitGuard {
+            gate: self.mapping_gate.clone(),
+        }))
+    }
+
+    /// Commit a fully prepared VM_BIND batch through the kernel ABI's
+    /// interruptible drm_exec path. The currently deployed kernel's array
+    /// helper rejects its documented zero-fence mode, so use the established
+    /// one-object transaction until that core fix is part of the booted Image.
+    /// Preparation has already resolved every handle and allocated the host
+    /// callback state before this loop begins. Page-table allocation remains
+    /// inside `sm_map`, exactly as on the hardware-proven direct path.
+    pub(crate) fn commit_prepared_user_bind_batch(
+        &self,
+        batch: &mut PreparedUserBindBatch,
+    ) -> Result {
+        // Avoid a reservation wait when quarantine/close was already visible.
+        // Keep the gate held through deferred-unmap insertion so the last job
+        // guard cannot reopen admission between observation and append.
+        if self.defer_blocked_user_bind_batch(batch)? {
+            return Ok(());
+        }
+
+        let mut index = 0usize;
+        while index < batch.ops.len() {
+            let mut admission_lost = false;
+            let result = (|| -> Result {
+                match &mut batch.ops[index] {
+                    PreparedUserBindOp::Map(map) => {
+                        let mut inner = self.inner.exec_lock(Some(&map.gem), true)?;
+                        let Some(commit) = self.enter_user_mapping_commit()? else {
+                            core::mem::drop(inner);
+                            admission_lost = true;
+                            return Ok(());
+                        };
+                        let (flags, gem_range) = if map.single_page {
+                            (gpuvm::GpuVaFlags::REPEAT, UAT_PGSZ as u32)
+                        } else {
+                            (gpuvm::GpuVaFlags::NONE, 0u32)
+                        };
+                        mod_dev_dbg!(
+                            inner.dev,
+                            "MMU: sm_map: {:#x} [{:#x}] -> {:#x}\n",
+                            map.offset,
+                            map.size,
+                            map.addr
+                        );
+                        let result = inner.sm_map(
+                            &mut map.ctx,
+                            map.addr,
+                            map.size,
+                            map.offset,
+                            gem_range,
+                            flags,
+                        );
+                        core::mem::drop(inner);
+                        core::mem::drop(commit);
+                        result
+                    }
+                    PreparedUserBindOp::Unmap(unmap) => {
+                        let mut inner = self.inner.exec_lock(None, true)?;
+                        let Some(commit) = self.enter_user_mapping_commit()? else {
+                            core::mem::drop(inner);
+                            admission_lost = true;
+                            return Ok(());
+                        };
+                        mod_dev_dbg!(
+                            inner.dev,
+                            "MMU: sm_unmap: {:#x}:{:#x}\n",
+                            unmap.iova,
+                            unmap.size
+                        );
+                        let result = inner.sm_unmap(&mut unmap.ctx, unmap.iova, unmap.size);
+                        core::mem::drop(inner);
+                        core::mem::drop(commit);
+                        result
+                    }
+                }
+            })();
+            if admission_lost {
+                if self.defer_blocked_user_bind_batch(batch)? {
+                    return Ok(());
+                }
+                continue;
+            }
+            result?;
+            index += 1;
+        }
+        Ok(())
     }
 
     /// Add a direct MMIO mapping to this Vm at a free address.
@@ -2820,33 +3372,81 @@ impl Vm {
         Ok(KernelMapping(node))
     }
 
-    /// Unmap everything in an address range.
-    pub(crate) fn unmap_range(&self, iova: u64, size: u64) -> Result {
-        // Unmapping a range can only do a single split, so just preallocate
-        // the prev and next GpuVas
-        let mut ctx = StepContext {
-            prev_va: Some(gpuvm::GpuVa::<VmInner>::new(pin_init::default())?),
-            next_va: Some(gpuvm::GpuVa::<VmInner>::new(pin_init::default())?),
-            ..Default::default()
-        };
+    /// Unmap one explicitly released userspace range.
+    ///
+    /// DRM VM_BIND callers synchronize healthy ranges before unbinding them,
+    /// so unrelated live work must not impose a VM-wide EBUSY gate. A job
+    /// which signalled an error while still firmware-owned is different:
+    /// userspace may immediately destroy its mappings, and those must remain
+    /// until the quarantined job guard is released after processor stop.
+    pub(crate) fn unmap_user_range(&self, iova: u64, size: u64) -> Result {
+        let prepared = self.prepare_user_unmap(iova, size)?;
+        self.unmap_prepared_user_range(prepared)
+    }
 
+    /// Commit a preallocated user unmap, or enqueue it behind a quarantined
+    /// packet without discarding its retained backing.
+    pub(crate) fn unmap_prepared_user_range(
+        &self,
+        prepared: PreparedUserUnmap,
+    ) -> Result {
+        let mut batch = PreparedUserBindBatch::new(1)?;
+        batch.push_unmap(prepared)?;
+        self.commit_prepared_user_bind_batch(&mut batch)
+    }
+
+    /// Unmap everything in an address range. Callers must hold the job
+    /// lifetime lock or operate on driver-private mappings.
+    fn unmap_range(&self, iova: u64, size: u64) -> Result {
+        let prepared = self.prepare_user_unmap(iova, size)?;
+        self.unmap_prepared_range(prepared)
+    }
+
+    /// Reserve the at-most-two split nodes an unmap can require.
+    pub(crate) fn prepare_user_unmap(
+        &self,
+        iova: u64,
+        size: u64,
+    ) -> Result<PreparedUserUnmap> {
+        Ok(PreparedUserUnmap {
+            ctx: StepContext {
+                prev_va: Some(gpuvm::GpuVa::<VmInner>::new(pin_init::default())?),
+                next_va: Some(gpuvm::GpuVa::<VmInner>::new(pin_init::default())?),
+                ..Default::default()
+            },
+            iova,
+            size,
+        })
+    }
+
+    /// Commit an unmap using split nodes allocated during batch preflight.
+    pub(crate) fn unmap_prepared_range(
+        &self,
+        mut prepared: PreparedUserUnmap,
+    ) -> Result {
         let mut inner = self.inner.exec_lock(None, false)?;
-
-        mod_dev_dbg!(inner.dev, "MMU: sm_unmap: {:#x}:{:#x}\n", iova, size);
-        inner.sm_unmap(&mut ctx, iova, size)
+        mod_dev_dbg!(
+            inner.dev,
+            "MMU: sm_unmap: {:#x}:{:#x}\n",
+            prepared.iova,
+            prepared.size
+        );
+        inner.sm_unmap(&mut prepared.ctx, prepared.iova, prepared.size)
     }
 
     /// Drop mappings for a given bo.
     pub(crate) fn drop_mappings(&self, gem: &gem::Object) -> Result {
-        {
-            let mut state = self.job_lifetime.lock();
-            if state.active != 0 {
-                if !state.closed_objects.iter().any(|object| core::ptr::eq(&**object, gem)) {
-                    state.closed_objects.push(gem.into(), GFP_KERNEL)?;
-                }
-                return Ok(());
+        let mut state = self.job_lifetime.lock();
+        if state.active != 0 {
+            if !state.closed_objects.iter().any(|object| core::ptr::eq(&**object, gem)) {
+                state.closed_objects.push(gem.into(), GFP_KERNEL)?;
             }
+            return Ok(());
         }
+        self.drop_mappings_now(gem)
+    }
+
+    fn drop_mappings_now(&self, gem: &gem::Object) -> Result {
         // Removing whole mappings only does unmaps, so no preallocated VAs
         let mut ctx = Default::default();
 
@@ -2892,8 +3492,16 @@ impl Drop for VmInner {
         );
 
         // Make sure this VM is not mapped to a TTB if it was
+        let bind_context = binding.bind_context.take();
         if let Some(token) = binding.bind_token.take() {
-            let idx = (token.last_slot() as usize) + UAT_USER_CTX_START;
+            // `bind_context` is the authority: on T8140 the slot index and the
+            // hardware context are different numbers, so the historical
+            // `slot + UAT_USER_CTX_START` is only the fallback for a token
+            // that predates a context ever being recorded.
+            let _ = &token;
+            let idx = bind_context
+                .map(|context| context as usize)
+                .unwrap_or_else(|| (token.last_slot() as usize) + UAT_USER_CTX_START);
             let ttb = self.ttb() | TTBR_VALID | (idx as u64) << TTBR_ASID_SHIFT;
 
             // The G17P compute path publishes this VM's root again at the
@@ -3021,6 +3629,13 @@ impl Uat {
     /// Returns a reference to the local kernel (lower half) `Vm`
     pub(crate) fn kernel_lower_vm(&self) -> &Vm {
         &self.kernel_lower_vm
+    }
+
+    pub(crate) fn t8140_render_global_vm(&self) -> Result<&Vm> {
+        if self.cfg != UatConfig::T8140 {
+            return Err(EINVAL);
+        }
+        self.t8140_render_global_vm.as_ref().ok_or(EIO)
     }
 
     /// Materialize native's required restricted process-context views in the
@@ -3350,6 +3965,69 @@ impl Uat {
         if object_end > gem.size() {
             return Err(ERANGE);
         }
+        // The null view is VM-owned, not render-storage-owned. A single
+        // process may create another render queue while its first storage is
+        // still alive, in which case append_driver_mappings() already retains
+        // this exact alias. Never create a second KernelMapping over those
+        // leaves: map_in_range correctly rejects the overlap, and a duplicate
+        // owner would later erase the first storage's live mapping on Drop.
+        //
+        // Accept only the complete, physically identical presentation. A
+        // partial range or another backing at the reserved address remains a
+        // hard error rather than being mistaken for idempotent installation.
+        let mut existing_pages = 0usize;
+        let mut offset = 0u64;
+        while offset < view.size as u64 {
+            let high = view.source_address.checked_add(offset).ok_or(EOVERFLOW)?;
+            let low = view.context_address.checked_add(offset).ok_or(EOVERFLOW)?;
+            if source.covers_range(
+                low,
+                UAT_PGSZ as u64,
+                true,
+                view.requires_source_write,
+            ) {
+                existing_pages = existing_pages.checked_add(1).ok_or(EOVERFLOW)?;
+                if source.translate_iova(high)? != source.translate_iova(low)? {
+                    dev_err!(
+                        self.dev.as_ref(),
+                        "MMU: T8140 retained client null view backing mismatch at +{:#x}\n",
+                        offset,
+                    );
+                    return Err(EFAULT);
+                }
+            }
+            offset = offset.checked_add(UAT_PGSZ as u64).ok_or(EOVERFLOW)?;
+        }
+        let expected_pages = view.size / UAT_PGSZ;
+        if existing_pages != 0 {
+            if existing_pages != expected_pages {
+                dev_err!(
+                    self.dev.as_ref(),
+                    "MMU: T8140 retained client null view is only partially mapped ({}/{})\n",
+                    existing_pages,
+                    expected_pages,
+                );
+                return Err(EFAULT);
+            }
+            if source
+                .t8140_native_context_bindings
+                .as_ref()
+                .ok_or(EINVAL)?
+                .lock()
+                .generation
+                != source_generation
+            {
+                return Err(EAGAIN);
+            }
+            dev_info!(
+                self.dev.as_ref(),
+                "MMU: T8140 job context reused all {} GPUVM low views including retained null view for VM {} generation {}\n",
+                T8140_NATIVE_CONTEXT_VIEW_COUNT,
+                source.id,
+                source_generation,
+            );
+            return Ok(mappings);
+        }
         let mapping = source.map_in_range(
             &**gem,
             *object_offset..object_end,
@@ -3387,6 +4065,56 @@ impl Uat {
             source_generation,
         );
         Ok(mappings)
+    }
+
+    /// Invalidate every live T8140 context rooted in `vm` after adding or
+    /// replacing job-private aliases in its page tables.
+    ///
+    /// `KernelMapping` can infer only the ordinary bind context. Render jobs
+    /// execute through an independently allocated application context, so a
+    /// live VM can otherwise retain a negative or old translation there when
+    /// its render-pool generation is replaced. Match the installed TTBAT roots
+    /// instead of flushing every client or assuming a fixed context ID.
+    pub(crate) fn flush_t8140_vm_contexts(&self, vm: &Vm) -> Result<u64> {
+        if self.cfg != UatConfig::T8140 {
+            return Err(EINVAL);
+        }
+        let root = {
+            let owner = vm.inner.exec_lock(None, false)?;
+            if owner.is_kernel
+                || !core::ptr::eq(
+                    Arc::as_ptr(&owner.uat_inner),
+                    Arc::as_ptr(&self.inner),
+                )
+            {
+                return Err(EINVAL);
+            }
+            owner.page_table.ttb()
+        };
+        let contexts = {
+            let inner = self.inner.lock();
+            let ttbs = inner.ttbs();
+            let mut contexts = 0u64;
+            for context_id in 0..UAT_NUM_CTX {
+                if ttbs[context_id].ttb0.load(Ordering::Acquire)
+                    == t8140_tagged_root(root, context_id)
+                {
+                    contexts |= 1u64 << context_id;
+                }
+            }
+            contexts
+        };
+        if contexts == 0 {
+            return Err(ENOENT);
+        }
+        fence(Ordering::SeqCst);
+        for context_id in 0..UAT_NUM_CTX {
+            if contexts & (1u64 << context_id) != 0 {
+                mem::tlbi_asid(context_id as u8);
+            }
+        }
+        mem::sync();
+        Ok(contexts)
     }
 
     /// Return a CPU wrapper and the preboot primary-low alias of the persistent
@@ -3663,6 +4391,57 @@ impl Uat {
                 == (high[1] | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT))
     }
 
+    /// Activate the device-global render FList root before the first user
+    /// submission. The boot path has no driver-owned bootstrap render, so the
+    /// later bootstrap-retirement restore hook is not reached in the normal
+    /// UAPI stage; leaving context 1 on `kernel_lower_vm` makes gUPM's first
+    /// operand-table read fault at 0x7000208000.
+    pub(crate) fn activate_t8140_render_global_context(&self) -> Result {
+        if self.cfg != UatConfig::T8140 {
+            return Err(EINVAL);
+        }
+        let empty = self.t8140_empty_high_roots.as_ref().ok_or(EIO)?;
+        let kernel_low = self.kernel_lower_vm.ttb();
+        let global_low = self.t8140_render_global_vm()?.ttb();
+        let source_high = self.kernel_vm.ttb();
+        let phase = self.t8140_context_phase.load(Ordering::Acquire);
+        let expected_high = match phase {
+            T8140_CONTEXT_BOOTSTRAP_SOURCE_HIGH => source_high,
+            T8140_CONTEXT_BOOTSTRAP_EMPTY_HIGH => empty[1].ttb(),
+            _ => return Err(EBUSY),
+        };
+        let inner = self.inner.lock();
+        inner.handoff().lock();
+        let ttbs = inner.ttbs();
+        let ready = ttbs[0].ttb0.load(Ordering::Acquire) == (kernel_low | TTBR_VALID)
+            && ttbs[1].ttb0.load(Ordering::Acquire)
+                == (kernel_low | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT))
+            && ttbs[1].ttb1.load(Ordering::Acquire)
+                == (expected_high | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT));
+        if !ready {
+            inner.handoff().unlock();
+            return Err(EIO);
+        }
+        ttbs[1].ttb0.store(
+            global_low | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT),
+            Ordering::Release,
+        );
+        self.t8140_context_phase
+            .store(T8140_CONTEXT_USER_OWNED, Ordering::Release);
+        inner.handoff().unlock();
+        core::mem::drop(inner);
+
+        fence(Ordering::SeqCst);
+        mem::tlbi_asid(1);
+        mem::sync();
+        dev_info!(
+            self.dev.as_ref(),
+            "MMU: context 1 activated with global render FList root {:#x}\n",
+            global_low,
+        );
+        Ok(())
+    }
+
     /// Confirm the post-opening first-work split. Unlike a steady-state user
     /// bind, the driver-owned bootstrap graph still names firmware-high
     /// objects, so both active slots retain the populated source high root.
@@ -3886,26 +4665,28 @@ impl Uat {
         Ok(())
     }
 
-    /// Restore the retained context-1 low root after a completed driver-owned
-    /// bootstrap render VM drops. Firmware has retired both queues before this
-    /// transition, and subsequent user binds may replace slot 1 normally.
+    /// Install the retained device-global context-1 low root after a completed
+    /// driver-owned bootstrap render VM drops. Firmware has retired both
+    /// queues before this transition. Ordinary jobs keep context 1 stable and
+    /// execute their command data through separately allocated app-GART roots.
     pub(crate) fn restore_t8140_kernel_context_after_bootstrap_render(&self) -> Result {
         if self.cfg != UatConfig::T8140 {
             return Err(EINVAL);
         }
         let empty = self.t8140_empty_high_roots.as_ref().ok_or(EIO)?;
-        let low = self.kernel_lower_vm.ttb();
+        let context0_low = self.kernel_lower_vm.ttb();
+        let context1_low = self.t8140_render_global_vm()?.ttb();
         let inner = self.inner.lock();
         inner.handoff().lock();
         let ttbs = inner.ttbs();
         if self.t8140_context_phase.load(Ordering::Acquire) != T8140_CONTEXT_USER_OWNED
-            || ttbs[0].ttb0.load(Ordering::Acquire) != (low | TTBR_VALID)
+            || ttbs[0].ttb0.load(Ordering::Acquire) != (context0_low | TTBR_VALID)
         {
             inner.handoff().unlock();
             return Err(EIO);
         }
         ttbs[1].ttb0.store(
-            low | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT),
+            context1_low | TTBR_VALID | (1u64 << TTBR_ASID_SHIFT),
             Ordering::Release,
         );
         ttbs[0]
@@ -4028,8 +4809,13 @@ impl Uat {
             );
             return Ok(());
         }
-        // The aliases mirror the single bindable user context. Anything else
-        // means the caller changed the binding contract without changing this.
+        // Contexts 2/3 are the compute kick's DECLARED contexts, and the
+        // measured pairing publishes them as aliases of the opening context.
+        // A binding is no longer pinned to context 1, but this path is: it is
+        // the legacy synchronous compute submit, whose captured kick names
+        // context 2 next to an opening at context 1. A caller reaching here
+        // from a bind-band context would be a different submission shape and
+        // must not silently reuse this one.
         if bind.slot() != 1 {
             return Err(EINVAL);
         }
@@ -4096,10 +4882,14 @@ impl Uat {
         bind: &VmBind,
         context_id: usize,
     ) -> Result<(u64, u64)> {
+        // The alias target is either this binding's own hardware context, one
+        // of the two contexts a compute kick declares, or a dynamically
+        // allocated application-GART context. It is no longer "context 1 or
+        // above the reserved band", because a binding is no longer pinned to
+        // context 1.
         if self.cfg != UatConfig::T8140
-            || bind.slot() != 1
             || context_id >= UAT_NUM_CTX
-            || (context_id != 1
+            || (context_id != bind.slot() as usize
                 && !T8140_COMPUTE_CTXS.contains(&context_id)
                 && context_id < T8140_APP_CONTEXT_START)
         {
@@ -4150,7 +4940,7 @@ impl Uat {
         &self,
         bind: &VmBind,
     ) -> Result<T8140AppContextLease> {
-        if self.cfg != UatConfig::T8140 || bind.slot() != 1 {
+        if self.cfg != UatConfig::T8140 {
             return Err(EINVAL);
         }
 
@@ -4336,6 +5126,32 @@ impl Uat {
         })
     }
 
+    /// Snapshot an arbitrary set of T8140 context-table entries.
+    ///
+    /// Concurrent render diagnosis needs to compare the opening context, the
+    /// QoS-requested context, the command descriptor context and the VM bind
+    /// context. Those are allocator results and cannot be represented by the
+    /// fixed ctx0..ctx3 snapshot above.
+    pub(crate) fn t8140_selected_context_roots(
+        &self,
+        contexts: [u8; 4],
+    ) -> Result<[(u64, u64); 4]> {
+        if self.cfg != UatConfig::T8140
+            || contexts.iter().any(|context| usize::from(*context) >= UAT_NUM_CTX)
+        {
+            return Err(EINVAL);
+        }
+        let inner = self.inner.lock();
+        let ttbs = inner.ttbs();
+        Ok(core::array::from_fn(|index| {
+            let slot = &ttbs[usize::from(contexts[index])];
+            (
+                slot.ttb0.load(Ordering::Acquire),
+                slot.ttb1.load(Ordering::Acquire),
+            )
+        }))
+    }
+
     /// Confirm the compute aliases are resident and name this binding.
     ///
     /// This also re-reads `ttbs[1]`: m1n1 warns that installing a context's
@@ -4345,6 +5161,9 @@ impl Uat {
     /// context table, so that cannot happen here — but comparing all three
     /// entries against the same `ttb()` is the cheap proof of it.
     pub(crate) fn t8140_compute_context_alias_ready(&self, bind: &VmBind) -> bool {
+        // Paired with `install_t8140_compute_context_alias`: this readiness
+        // test reads `ttbs[1]` back verbatim, so it only describes a binding
+        // that actually sits at the opening context.
         if self.cfg != UatConfig::T8140 || bind.slot() != 1 {
             return false;
         }
@@ -4374,46 +5193,61 @@ impl Uat {
     }
 
     /// Binds a `Vm` to a slot, preferring the last used one.
+    ///
+    /// On T8140 this binding is reserved for the driver-owned opening at
+    /// context 1. After its retirement context 1 becomes the permanent global
+    /// FList root; ordinary queues use application-GART root leases instead.
+    ///
+    /// Hardware context 2 is *not* a bind target. It is the context the
+    /// compute kick declares (`T8140_COMPUTE_CTXS`), published as an alias of
+    /// a binding's root by [`Uat::install_t8140_compute_context_alias`] rather
+    /// than by the slot allocator -- exactly as m1n1 publishes `CONTEXT = 2`
+    /// while keeping its own bootstrap context separate.
     pub(crate) fn bind(&self, vm: &Vm) -> Result<VmBind> {
         let mut binding = vm.binding.lock();
 
         if binding.binding.is_none() {
             assert_eq!(binding.active_users, 0);
 
-            // The T8140 first-partial contract has exactly one *bindable*
-            // user context: retained kernel context 0 plus user context 1.
-            // Every measured field of the opening keys off that pairing --
-            // `render_root_slot == 1`, `render_context_id == 1`,
-            // `descriptor_context_id == 1` -- and the root-phase machine in
-            // this file reads back `ttbs[0]`/`ttbs[1]` verbatim, so letting
-            // the generic LRU hand out a later allocator slot would silently
-            // move the render/descriptor context out from under all of it.
-            //
-            // Hardware context 2 is *not* nonexistent, which is what the
-            // previous wording claimed. It is the context the compute kick
-            // declares (`T8140_COMPUTE_CTXS`), and it is published as an alias
-            // of this binding's root by
-            // [`Uat::install_t8140_compute_context_alias`] rather than by the
-            // slot allocator -- exactly as m1n1 publishes `CONTEXT = 2` while
-            // keeping its own bootstrap context separate.
-            let single_user_slot = self.cfg == UatConfig::T8140
-                || *module_parameters::robust_isolation.value() != 0;
-
-            self.slots.set_limit(if single_user_slot {
+            let limit = if *module_parameters::robust_isolation.value() != 0 {
+                // Escape hatch: one bindable context, the pre-pool behaviour.
                 NonZeroUsize::new(1)
+            } else if self.cfg == UatConfig::T8140 {
+                NonZeroUsize::new(T8140_BIND_SLOTS)
             } else {
                 None
-            });
+            };
+            self.slots.set_limit(limit);
+            // A T8140 slot index names a hardware context, so which one a VM
+            // lands on must not depend on allocation history. See
+            // `SlotAllocatorInner::lowest_first`.
+            self.slots.set_lowest_first(self.cfg == UatConfig::T8140);
 
-            let slot = self.slots.get(binding.bind_token)?;
+            let vm_id = vm.id;
+            let slot = match self.slots.get_inner(binding.bind_token, |data, guard| {
+                data.record_owner(guard.slot(), vm_id);
+                Ok(())
+            }) {
+                Ok(slot) => slot,
+                Err(error) => {
+                    self.log_bind_context_owners(vm_id, error);
+                    return Err(error);
+                }
+            };
+            let idx = if self.cfg == UatConfig::T8140 {
+                match t8140_bind_context(slot.slot()) {
+                    Some(idx) => idx,
+                    None => {
+                        self.log_bind_context_owners(vm_id, EBUSY);
+                        return Err(EBUSY);
+                    }
+                }
+            } else {
+                (slot.slot() as usize) + UAT_USER_CTX_START
+            };
             if slot.changed() {
                 mod_pr_debug!("Vm Bind [{}]: bind_token={:?}\n", vm.id, slot.token(),);
-                let idx = (slot.slot() as usize) + UAT_USER_CTX_START;
                 let ttb = binding.ttb | TTBR_VALID | (idx as u64) << TTBR_ASID_SHIFT;
-
-                if self.cfg == UatConfig::T8140 && idx != 1 {
-                    return Err(EBUSY);
-                }
 
                 let uat_inner = self.inner.lock();
 
@@ -4485,14 +5319,61 @@ impl Uat {
             }
 
             binding.bind_token = Some(slot.token());
+            binding.bind_context = Some(idx as u32);
             binding.binding = Some(slot);
         }
 
         binding.active_users += 1;
 
-        let slot = binding.binding.as_ref().unwrap().slot() + UAT_USER_CTX_START as u32;
+        let slot = binding.bind_context.ok_or(EIO)?;
         mod_pr_debug!("MMU: slot {} active users {}\n", slot, binding.active_users);
         Ok(VmBind(vm.clone(), slot))
+    }
+
+    /// Report which UAT bind contexts are occupied and by which VM.
+    ///
+    /// Called on every failed bind. Without it the only evidence is
+    /// slotalloc's "out of slots with a limit of N", which names neither the
+    /// hardware contexts involved nor the clients holding them, and a bind
+    /// failure is the one error a second GPU client sees first.
+    fn log_bind_context_owners(&self, vm_id: u64, error: kernel::error::Error) {
+        let busy = self.slots.busy_mask();
+        let owners = self.slots.with_inner(|data| data.snapshot());
+        let inner = self.inner.lock();
+        let ttbs = inner.ttbs();
+        // The slot -> context mapping only means anything on T8140; every
+        // other configuration binds slot n at context n + 1 and has 63 of
+        // them, so there is nothing useful to enumerate.
+        let slots = if self.cfg == UatConfig::T8140 {
+            T8140_BIND_SLOTS as u32
+        } else {
+            0
+        };
+        for slot in 0..slots {
+            let Some(context) = t8140_bind_context(slot) else {
+                continue;
+            };
+            let state = if busy & (1u64 << slot) != 0 { "BUSY" } else { "free" };
+            let owner = owners.get(slot as usize).copied().unwrap_or(0);
+            dev_err!(
+                self.dev.as_ref(),
+                "MMU: bind slot {} -> hw context {}: {}, owner vm {}, ttb0={:#x} ttb1={:#x}\n",
+                slot,
+                context,
+                state,
+                owner,
+                ttbs[context].ttb0.load(Ordering::Acquire),
+                ttbs[context].ttb1.load(Ordering::Acquire),
+            );
+        }
+        core::mem::drop(inner);
+        dev_err!(
+            self.dev.as_ref(),
+            "MMU: vm {} could not acquire a UAT bind context ({:?}); app-GART contexts in use {:#x}\n",
+            vm_id,
+            error,
+            self.inner.t8140_app_contexts.load(Ordering::Acquire),
+        );
     }
 
     /// Creates a new `Vm` linked to this UAT.
@@ -4526,7 +5407,14 @@ impl Uat {
                     handoff_mode == HandoffMode::FirmwareDekker
                 ),
                 t8140_alias_owner: AtomicU64::new(0),
-                t8140_app_contexts: AtomicU64::new(T8140_APP_CONTEXT_RESERVED_MASK),
+                // Contexts 0..4 have fixed architectural meaning, and the
+                // bind band belongs to `Uat::bind`. Reserving the band here as
+                // well means the two allocators cannot collide even if the
+                // masks in `g17_queue_limits` are ever edited apart.
+                t8140_app_contexts: AtomicU64::new(
+                    T8140_APP_CONTEXT_RESERVED_MASK
+                        | crate::g17_queue_limits::BIND_CONTEXT_MASK,
+                ),
                 handoff_flush <- pin_init::pin_init_array_from_fn(|i| {
                     new_mutex!(HandoffFlush(&handoff.flush[i], handoff_mode), "handoff_flush")
                 }),
@@ -4854,12 +5742,26 @@ impl Uat {
         } else {
             None
         };
+        let t8140_render_global_vm = if cfg == UatConfig::T8140 {
+            Some(Vm::new(
+                dev,
+                inner.clone(),
+                IOVA_USER_BASE..uat_geometry(cfg)?.user_va_top(),
+                cfg,
+                None,
+                0x8140_1002,
+                false,
+            )?)
+        } else {
+            None
+        };
 
         let uat = Self {
             dev: dev.into(),
             cfg,
             kernel_vm,
             kernel_lower_vm,
+            t8140_render_global_vm,
             _t8140_firmware_crash_buffers: None,
             t8140_firmware_crash_gems: None,
             _t8140_parameter_metrics_low: None,
@@ -4874,7 +5776,7 @@ impl Uat {
             inner,
             slots: slotalloc::SlotAllocator::new(
                 UAT_USER_CTX as u32,
-                (),
+                SlotOwners::new(),
                 |_inner, _slot| Some(SlotInner()),
                 c_str!("Uat::SlotAllocator"),
                 static_lock_class!(),

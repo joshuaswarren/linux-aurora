@@ -26,7 +26,7 @@ mod g17_submission { pub const G17P_NATIVE_RENDER_DOORBELL_PRIORITY: u32 = 0; }
 '''
 names = [
     "shared_usc_flist_id_drives_both_stage_registers_independently_of_pm_id",
-    "common_descriptor_metadata_never_overwrites_encoded_register_values",
+    "descriptor_context_and_state_word_drive_every_native_work_key",
     "fragment_parameter_buffer_owner_is_independent_of_perf_map_and_tail",
 ]
 with tempfile.TemporaryDirectory(prefix="g17-fragment-pb-owner-") as tmp:

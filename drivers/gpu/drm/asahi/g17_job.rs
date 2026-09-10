@@ -7,8 +7,15 @@
 //! owner per DRM queue and completion-driven retirement; the current shared
 //! QID0/1/4 runtime does not satisfy that contract.
 
-use core::sync::atomic::{fence, Ordering};
-use kernel::{c_str, dma_fence::{Fence, UserFence, RawDmaFence}, drm::sched, prelude::*, sync::Arc};
+use core::sync::atomic::{fence, AtomicU32, Ordering};
+use kernel::{
+    c_str,
+    dma_fence::{Fence, RawDmaFence, UserFence},
+    drm::sched,
+    new_mutex,
+    prelude::*,
+    sync::{Arc, Mutex},
+};
 use crate::{driver::AsahiDevice, g17_uapi, mmu};
 
 /// Host-sealed bytes in a job-private command allocation. The builder consumes
@@ -44,15 +51,58 @@ pub(crate) struct TimestampDestination {
 
 pub(crate) struct G17PJobCompletion {
     pub(crate) status: Arc<crate::g17_status::VmStatus>,
-    pub(crate) fence: UserFence<crate::g17_drm::G17PSubmissionFence>,
-    pub(crate) timestamps: mmu::KernelMapping,
-    pub(crate) destinations: [Option<TimestampDestination>; 2],
+    fence: UserFence<crate::g17_drm::G17PSubmissionFence>,
+    timestamps: mmu::KernelMapping,
+    destinations: [Option<TimestampDestination>; 2],
+    vm_job: Arc<Mutex<Option<mmu::T8140VmJobGuard>>>,
+    signalled: AtomicU32,
 }
 
 impl G17PJobCompletion {
+    pub(crate) fn new(
+        fence: UserFence<crate::g17_drm::G17PSubmissionFence>,
+        timestamps: mmu::KernelMapping,
+        destinations: [Option<TimestampDestination>; 2],
+        status: Arc<crate::g17_status::VmStatus>,
+        vm_job: mmu::T8140VmJobGuard,
+    ) -> Result<Self> {
+        let vm_job = Arc::pin_init(
+            new_mutex!(Some(vm_job), "G17PJobCompletion::vm_job"),
+            GFP_KERNEL,
+        )?;
+        Ok(Self {
+            status,
+            fence,
+            timestamps,
+            destinations,
+            vm_job,
+            signalled: AtomicU32::new(0),
+        })
+    }
+
     pub(crate) fn gpu_address(&self) -> u64 { self.timestamps.iova() }
     pub(crate) fn fence(&self) -> Fence { Fence::from_fence(&self.fence) }
+
+    /// Wake error waiters while retaining the VM-job pin in the quarantined
+    /// packet. Neither an error fence nor retaining an otherwise emptied Arc
+    /// proves that firmware has finished dereferencing userspace mappings.
+    pub(crate) fn fail_while_owned(&self, error: Error) {
+        if self.signalled.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return;
+        }
+        if let Some(vm_job) = self.vm_job.lock().as_ref() {
+            vm_job.quarantine();
+        }
+        self.status.record(error.to_errno());
+        self.fence.set_error(error);
+        self.fence.signal();
+    }
+
+    /// Only for retired work, proven processor stop, or unsubmitted packets.
     pub(crate) fn complete(&self, result: Result<[u64; 2]>) {
+        if self.signalled.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return;
+        }
         let result = result.and_then(|timestamps| {
             for (destination, timestamp) in self.destinations.iter().zip(timestamps) {
                 if let Some(destination) = destination {
@@ -72,7 +122,18 @@ impl G17PJobCompletion {
             self.status.record(error.to_errno());
             self.fence.set_error(error);
         }
+        // Match render completion: once this fence wakes userspace, every
+        // mapping named by the completed job must already be releasable.
+        drop(self.vm_job.lock().take());
         self.fence.signal();
+    }
+
+    /// Release the VM pin of an already-signalled error completion after both
+    /// firmware processors stop. `complete` deliberately returns early after
+    /// `fail_while_owned`, while DRM sched may retain the packet Arc beyond
+    /// that fence; processor stop is the independent ownership witness.
+    pub(crate) fn release_after_processor_stop(&self) {
+        drop(self.vm_job.lock().take());
     }
 }
 
@@ -87,8 +148,11 @@ pub(crate) struct G17PComputeJobPacket {
     command: g17_uapi::TranslatedComputeCommand,
     command_images: KVec<G17PSealedCommand>,
     _retained_mappings: KVec<mmu::KernelMapping>,
+    /// DRM sched treats a signalled error fence as dependency-ready. Retain
+    /// the same fences until run_job so the backend can consume their status
+    /// before publishing any hardware-visible queue state.
+    input_fences: KVec<Fence>,
     completion: Option<G17PJobCompletion>,
-    _vm_job: Option<mmu::T8140VmJobGuard>,
 }
 
 impl G17PComputeJobPacket {
@@ -99,14 +163,14 @@ impl G17PComputeJobPacket {
         command: g17_uapi::TranslatedComputeCommand,
         command_images: KVec<G17PSealedCommand>,
         retained_mappings: KVec<mmu::KernelMapping>,
+        input_fences: KVec<Fence>,
         completion: Option<G17PJobCompletion>,
-        vm_job: Option<mmu::T8140VmJobGuard>,
     ) -> Result<Arc<Self>> {
         if submission_id == 0 || !(4..128).contains(&hardware_queue_id)
         { return Err(EINVAL); }
         Ok(Arc::new(Self {
             submission_id, hardware_queue_id, context, command, command_images,
-            _retained_mappings: retained_mappings, completion, _vm_job: vm_job,
+            _retained_mappings: retained_mappings, input_fences, completion,
         }, GFP_KERNEL)?)
     }
 
@@ -115,6 +179,7 @@ impl G17PComputeJobPacket {
     pub(crate) fn context(&self) -> &mmu::T8140ComputeExecutionContext { &self.context }
     pub(crate) fn command(&self) -> &g17_uapi::TranslatedComputeCommand { &self.command }
     pub(crate) fn command_images(&self) -> &[G17PSealedCommand] { &self.command_images }
+    pub(crate) fn input_fences(&self) -> &[Fence] { &self.input_fences }
     pub(crate) fn completion(&self) -> Result<&G17PJobCompletion> { self.completion.as_ref().ok_or(EINVAL) }
 }
 
@@ -171,6 +236,84 @@ pub(crate) struct G17PJobScheduler<B: G17PQueueBackend> {
     entity: sched::Entity<G17PScheduledJob<B>>,
     _scheduler: sched::Scheduler<G17PScheduledJob<B>>,
     backend: Arc<B>,
+}
+
+/// A render has already been published when this scheduler job runs.  The
+/// job exists to put its exact firmware-driven hardware fence under DRM's
+/// timeout and dependency machinery without polling in the submit ioctl.
+pub(crate) struct G17PRenderWatchPacket {
+    submission_id: u64,
+    render_slot: u8,
+    completion: Arc<crate::g17_drm::G17PRenderCompletion>,
+}
+
+impl G17PRenderWatchPacket {
+    pub(crate) fn new(
+        submission_id: u64,
+        render_slot: u8,
+        completion: Arc<crate::g17_drm::G17PRenderCompletion>,
+    ) -> Result<Arc<Self>> {
+        if submission_id == 0 || render_slot >= crate::g17_resources::G17PRenderQueuePair::SLOT_COUNT {
+            return Err(EINVAL);
+        }
+        Ok(Arc::new(Self { submission_id, render_slot, completion }, GFP_KERNEL)?)
+    }
+
+    pub(crate) fn submission_id(&self) -> u64 { self.submission_id }
+    pub(crate) fn render_slot(&self) -> u8 { self.render_slot }
+    pub(crate) fn fence(&self) -> Fence { self.completion.fence() }
+}
+
+pub(crate) trait G17PRenderWatchBackend: Send + Sync {
+    fn timed_out(&self, packet: Arc<G17PRenderWatchPacket>) -> sched::Status;
+    fn cancel(&self, packet: Arc<G17PRenderWatchPacket>);
+}
+
+pub(crate) struct G17PRenderWatchJob<B: G17PRenderWatchBackend> {
+    backend: Arc<B>,
+    packet: Arc<G17PRenderWatchPacket>,
+}
+
+impl<B: G17PRenderWatchBackend> sched::JobImpl for G17PRenderWatchJob<B> {
+    fn prepare(_job: &mut sched::Job<Self>) -> Option<Fence> { None }
+
+    fn run(job: &mut sched::Job<Self>) -> Result<Option<Fence>> {
+        Ok(Some(job.packet.fence()))
+    }
+
+    fn timed_out(job: &mut sched::Job<Self>) -> sched::Status {
+        job.backend.timed_out(job.packet.clone())
+    }
+
+    fn cancel(job: &mut sched::Job<Self>) {
+        job.backend.cancel(job.packet.clone());
+    }
+}
+
+pub(crate) struct G17PRenderWatchScheduler<B: G17PRenderWatchBackend> {
+    entity: sched::Entity<G17PRenderWatchJob<B>>,
+    _scheduler: sched::Scheduler<G17PRenderWatchJob<B>>,
+    backend: Arc<B>,
+}
+
+impl<B: G17PRenderWatchBackend> G17PRenderWatchScheduler<B> {
+    pub(crate) fn new(dev: &AsahiDevice, backend: Arc<B>) -> Result<Self> {
+        let scheduler = sched::Scheduler::new(
+            dev.as_ref(), 1, 1, 0, 2000, c_str!("asahi_g17p_render"),
+        )?;
+        let entity = sched::Entity::new(&scheduler, sched::Priority::Kernel)?;
+        Ok(Self { entity, _scheduler: scheduler, backend })
+    }
+
+    pub(crate) fn enqueue(&mut self, packet: Arc<G17PRenderWatchPacket>) -> Result<Fence> {
+        let job = self.entity.new_job(1, G17PRenderWatchJob {
+            backend: self.backend.clone(), packet,
+        })?;
+        let mut job = job.arm();
+        let finished = job.fences().finished();
+        job.push();
+        Ok(finished)
+    }
 }
 
 impl<B: G17PQueueBackend> G17PJobScheduler<B> {

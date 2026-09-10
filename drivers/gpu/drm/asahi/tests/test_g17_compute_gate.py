@@ -8,6 +8,10 @@ def item(needle):
  while d:d+=(s[i]=='{')-(s[i]=='}');i+=1
  return s[a:i]
 methods='\n'.join(item(n) for n in ['    fn acquire_compute(', '    fn acquire_lease('])
+# The slot-count constant lives beside the state, not inside it, so extract
+# it too rather than re-declaring a copy that could drift.
+slots=s[s.index('const G17P_RENDER_SLOTS: usize ='):]
+slots=slots[:slots.index('const _: () = assert!(G17P_ACTIVE_RENDER_SLOTS > 0);')]
 state='\n'.join(item(n) for n in ['struct G17PQueueLeaseState {','impl G17PQueueLeaseState {'])
 guards='\n'.join(item(n) for n in ['pub(crate) struct G17PComputeLeaseGuard {','impl G17PComputeLeaseGuard {','impl Drop for G17PComputeLeaseGuard {','struct G17PLeaseGuard {','impl G17PLeaseGuard {','impl Drop for G17PLeaseGuard {'])
 code=r'''
@@ -15,6 +19,7 @@ code=r'''
 use std::sync::{Arc,atomic::{AtomicU32,Ordering}};use std::ops::{Deref,DerefMut};use std::time::Duration;
 type Result<T=()>=std::result::Result<T,i32>;const EIO:i32=5;const EBUSY:i32=16;const ERESTARTSYS:i32=512;
 mod g17_resources { pub struct G17PRenderQueuePair; impl G17PRenderQueuePair { pub const SLOT_COUNT:u8=2; } }
+'''+slots+r'''
 struct Mutex<T>(std::sync::Mutex<T>);struct Guard<'a,T>(Option<std::sync::MutexGuard<'a,T>>);
 impl<T>Mutex<T>{fn lock(&self)->Guard<'_,T>{Guard(Some(self.0.lock().unwrap()))}}
 impl<T>Deref for Guard<'_,T>{type Target=T;fn deref(&self)->&T{self.0.as_ref().unwrap()}}
@@ -32,13 +37,20 @@ impl G17PQueueRegistry{fn new()->Arc<Self>{Arc::new(Self{lease:Mutex(std::sync::
  let r=G17PQueueRegistry::new();let old=r.acquire_compute(false).unwrap();let(tx,rx)=std::sync::mpsc::channel();let(release,wait)=std::sync::mpsc::channel();let rr=r.clone();let worker=std::thread::spawn(move||{let install=rr.acquire_compute(true).unwrap();tx.send(()).unwrap();wait.recv_timeout(Duration::from_secs(1)).unwrap();drop(install);});
  assert!(rx.recv_timeout(Duration::from_millis(20)).is_err());drop(old);rx.recv_timeout(Duration::from_secs(1)).unwrap();assert!(r.lease.lock().compute_install);let(tx,rx)=std::sync::mpsc::channel();let rr=r.clone();let next=std::thread::spawn(move||{let _job=rr.acquire_compute(false).unwrap();tx.send(()).unwrap();});assert!(rx.recv_timeout(Duration::from_millis(20)).is_err());release.send(()).unwrap();rx.recv_timeout(Duration::from_secs(1)).unwrap();worker.join().unwrap();next.join().unwrap();
 }
-#[test]fn steady_compute_and_two_render_slots_overlap_with_bounded_backpressure(){
- let r=G17PQueueRegistry::new();let q=r.acquire_compute(false).unwrap();let a=r.acquire_lease(7).unwrap();let b=r.acquire_lease(8).unwrap();assert_eq!((a.slot(),b.slot()),(0,1));let(tx,rx)=std::sync::mpsc::channel();let rr=r.clone();let w=std::thread::spawn(move||{let c=rr.acquire_lease(9).unwrap();tx.send(c.slot()).unwrap();});assert!(rx.recv_timeout(Duration::from_millis(20)).is_err());drop(a);assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(),0);w.join().unwrap();drop(b);drop(q);
+#[test]fn steady_compute_overlaps_two_renders_while_third_render_waits(){
+ let r=G17PQueueRegistry::new();let q=r.acquire_compute(false).unwrap();let a=r.acquire_lease(7).unwrap();assert_eq!(a.slot(),0);let b=r.acquire_lease(8).unwrap();assert_eq!(b.slot(),1);let(tx,rx)=std::sync::mpsc::channel();let rr=r.clone();let w=std::thread::spawn(move||{let c=rr.acquire_lease(9).unwrap();tx.send(c.slot()).unwrap();});assert!(rx.recv_timeout(Duration::from_millis(20)).is_err());drop(a);assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(),0);w.join().unwrap();drop(b);drop(q);
 }
 #[test]fn quarantine_wakes_render_waiter_without_releasing_live_slots(){
  let r=G17PQueueRegistry::new();let q=r.acquire_compute(false).unwrap();let _a=r.acquire_lease(7).unwrap();let _b=r.acquire_lease(8).unwrap();let(tx,rx)=std::sync::mpsc::channel();let rr=r.clone();let w=std::thread::spawn(move||{tx.send(rr.acquire_lease(9).err()).unwrap();});assert!(rx.recv_timeout(Duration::from_millis(20)).is_err());q.quarantine();assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(),Some(EIO));assert_eq!(r.lease.lock().render_slots,3);w.join().unwrap();drop(q);
 }
+#[test]fn processor_stop_clears_compute_poison_before_the_old_lease_drops(){
+ let r=G17PQueueRegistry::new();let q=r.acquire_compute(false).unwrap();q.quarantine();
+ assert_eq!(r.acquire_compute(false).err(),Some(EIO));
+ q.rehabilitate_after_processor_stop();drop(q);
+ let recovered=r.acquire_compute(false).unwrap();drop(recovered);
+ let render=r.acquire_lease(7).unwrap();drop(render);
+}
 '''
 with tempfile.TemporaryDirectory() as d:
  f=Path(d)/'test.rs';f.write_text(code);exe=Path(d)/'test';subprocess.run(['rustc','--edition=2021','--test',str(f),'-o',str(exe)],check=True);subprocess.run([str(exe),'--test-threads=1'],check=True,timeout=10)
-print('PASS bounded queue gate with host threads: retained compute overlap, two render slots, quiescent install, hard backpressure and fault wake')
+print('PASS bounded queue gate with host threads: retained compute overlap, two render pairs, bounded backpressure and fault wake')

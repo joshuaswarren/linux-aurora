@@ -8,6 +8,7 @@
 #include <linux/device.h>
 #include <linux/ioport.h>
 #include <linux/mutex.h>
+#include <linux/spinlock.h>
 #include <linux/mux/consumer.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
@@ -26,6 +27,7 @@
 #define DCP_MAX_PLANES APPLE_DCP_MAX_SURFACES
 
 struct apple_dcp;
+
 struct apple_dcp_afkep;
 
 struct dcpav_service_epic;
@@ -65,6 +67,8 @@ struct dcp_mem_descriptor {
 	dma_addr_t dva;
 	struct sg_table map;
 	u64 reg;
+	/* live iommu mappings installed by dcpep_cb_map_piodma() */
+	bool piodma_mapped;
 };
 
 /* Limit on call stack depth (arbitrary). Some nesting is required */
@@ -80,6 +84,10 @@ struct dcp_channel {
 	u64 link_message[DCP_MAX_CALL_DEPTH];
 	u32 link_size[DCP_MAX_CALL_DEPTH];
 
+	/* Tag of each outstanding call, so a stall can name itself */
+	char tag[DCP_MAX_CALL_DEPTH][4];
+	unsigned long pushed_at[DCP_MAX_CALL_DEPTH];
+
 	/* Current depth of the call stack. Less than DCP_MAX_CALL_DEPTH */
 	u8 depth;
 	/* Already warned about busy channel */
@@ -89,7 +97,14 @@ struct dcp_channel {
 struct dcp_fb_reference {
 	struct list_head head;
 	struct drm_framebuffer *fb;
+	/*
+	 * Id of the swap that unbinds @fb, i.e. the one that puts its
+	 * replacement on screen.  Only meaningful once @armed is set: the
+	 * firmware assigns the id in the swap_start reply, which happens after
+	 * the atomic commit that displaced @fb has already queued this entry.
+	 */
 	u32 swap_id;
+	bool armed;
 };
 
 #define MAX_NOTCH_HEIGHT 160
@@ -118,6 +133,12 @@ struct dcp_panel {
 struct apple_dcp_hw_data {
 	u32 num_dptx_ports;
 	bool adopt_running_coprocessor;
+	/*
+	 * Attach to an existing RTKit session instead of restarting it.  This
+	 * requires the endpoint map to be recovered before the DCP services are
+	 * started; no current platform enables it.
+	 */
+	bool adopt_live_session;
 };
 
 /* TODO: move IOMFB members to its own struct */
@@ -125,6 +146,12 @@ struct apple_dcp {
 	struct device *dev;
 	struct platform_device *piodma;
 	struct iommu_domain *iommu_dom;
+	/* domain of the display-subsystem device, which owns the scanout stream */
+	struct iommu_domain *disp_iommu_dom;
+	/* the display-subsystem device, whose DMA domain the pipe scans out of */
+	struct device *disp_dev;
+	/* which of the nine cumulative A031 notify-client states to send next */
+	unsigned int a031_step;
 	struct apple_rtkit *rtk;
 	struct apple_crtc *crtc;
 	struct apple_connector *connector;
@@ -136,11 +163,6 @@ struct apple_dcp {
 
 	/* Coprocessor control register */
 	void __iomem *coproc_reg;
-	/* Locked firmware entry point supplied by iBoot. */
-	void __iomem *iop_vbar_reg;
-	bool fresh_boot_cpu_started;
-	bool adopted_session;
-	bool adopted_session_module_pinned;
 
 	/* DCP has crashed */
 	bool crashed;
@@ -160,26 +182,10 @@ struct apple_dcp {
 	/* DCP shared memory */
 	void *shmem;
 	dma_addr_t shmem_iova;
-	bool shmem_inherited;
 	u32 link_top[2][APPLE_DCP_LINK_STREAMS_PER_SIDE];
 	u16 link_version;
-	enum apple_dcp_link_abi link_abi;
 	u32 link_firmware_hash;
-	u64 link_init_message;
-	u16 link_rx_log_count;
-	u16 link_reply_log_count;
-	u32 link_d563_a2i_before[5];
-	u32 link_d563_a2i_after[5];
-	u8 link_d563_a2i_count;
-	bool link_d563_a2i_ep1_observed;
-	/* Serializes firmware type0 with the inherited-session timed INIT. */
-	struct mutex link_init_lock;
-	enum apple_dcp_link_state link_state;
-	bool link_endpoint_started;
-	struct work_struct link_service_match_work;
-	unsigned long link_service_match_state;
-	__le32 *link_service_match_output;
-	int link_service_match_callback_tag;
+	bool link_ready;
 
 	/* Display registers mappable to the DCP */
 	struct resource *disp_registers[MAX_DISP_REGISTERS];
@@ -218,6 +224,8 @@ struct apple_dcp {
 
 	/* swap id of the last completed swap */
 	u32 last_swap_id;
+	/* last_swap_id is only meaningful after the first swap completes */
+	bool have_swap_complete;
 	ktime_t swap_start;
 
 	/* Current display mode */
@@ -256,10 +264,24 @@ struct apple_dcp {
 	/* Workqueue for sending vblank events when a dcp swap is not possible */
 	struct work_struct vblank_wq;
 
+	/* Names a command the firmware has stopped answering */
+	struct delayed_work stall_wq;
+	bool warned_stall;
+	bool dumped_crashlog;
+	/* the DCP crashlog region, so a stall can read the fresh record */
+	void *crashlog_buf;
+	size_t crashlog_size;
+
 	/* List of referenced drm_framebuffers which can be unreferenced
 	 * on the next successfully completed swap.
 	 */
 	struct list_head swapped_out_fbs;
+	/*
+	 * swapped_out_fbs is appended to from the DRM atomic commit thread
+	 * (dcp_flush -> .atomic_flush) and armed/drained from the RTKit
+	 * workqueue that runs the DCP callbacks.  Two different threads.
+	 */
+	spinlock_t swapped_out_lock;
 
 	struct dcp_brightness brightness;
 	/* Workqueue for updating the initial brightness */
@@ -305,13 +327,13 @@ struct apple_dcp {
 };
 
 void dcp_drm_crtc_page_flip(struct apple_dcp *dcp, ktime_t now);
-void iomfb_link_timeout_snapshot(struct apple_dcp *dcp);
-void iomfb_d563_a2i_ep1_snapshot(struct apple_dcp *dcp);
 
 int dcp_backlight_register(struct apple_dcp *dcp);
 int dcp_backlight_update(struct apple_dcp *dcp);
 bool dcp_has_panel(struct apple_dcp *dcp);
 
 #define DCP_AUDIO_MAX_CHANS 15
+
+void dcp_dump_crashlog(struct apple_dcp *dcp);
 
 #endif /* __APPLE_DCP_INTERNAL_H__ */

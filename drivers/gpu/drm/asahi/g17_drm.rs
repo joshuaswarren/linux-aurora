@@ -14,7 +14,7 @@ use kernel::{
     prelude::*,
     static_lock_class,
     sync::{Arc, CondVar, Mutex},
-    time::{delay::fsleep, Delta},
+    time::{Instant, Monotonic},
     uapi, xarray,
 };
 
@@ -22,8 +22,8 @@ use crate::{
     alloc,
     driver::{AsahiDevRef, AsahiDevice},
     drm_gpu::{DrmGpu, DrmGpuParams},
-    file, g17_job, g17_adt_j700, g17_live_boot, g17_manager, g17_render, g17_resources, g17_uapi, gem, gpu, hw, mmu, module_parameters,
-    pgtable, queue,
+    file, g17_job, g17_adt_j700, g17_completion, g17_live_boot, g17_perf, g17_render,
+    g17_resources, g17_uapi, gem, gpu, hw, mmu, module_parameters, pgtable, queue,
 };
 
 const T8140_USER_START: u64 = mmu::UAT_PGSZ as u64;
@@ -97,20 +97,6 @@ impl G17PRuntimeRef {
         self.mutex().lock().release_compute_owner(owner);
     }
 
-    fn wait_render_slot(&self, render_slot: u8) -> Result {
-        for _ in 0..g17_manager::G17PManagerConstruction::RENDER_COMPLETION_POLLS {
-            let completion = self
-                .mutex()
-                .lock()
-                .poll_deferred_render_completion(render_slot)?;
-            if let Some(completion) = completion {
-                return if completion.complete { Ok(()) } else { Err(EIO) };
-            }
-            fsleep(Delta::from_millis(1));
-        }
-        self.mutex().lock().abandon_deferred_render(render_slot)?;
-        Err(ETIMEDOUT)
-    }
 }
 
 /// Ceiling on live DRM compute queue objects for this device.
@@ -135,9 +121,9 @@ const G17P_MAX_COMPUTE_QUEUES: u32 = crate::g17_queue_limits::MAX_QUEUES;
 /// steady-state path (which is the timing-sensitive one) is unchanged.
 #[pin_data]
 pub(crate) struct G17PQueueRegistry {
-    /// Bounded physical ownership: two render pairs plus the one transient
-    /// exclusive phase used while installing a compute graph.  Steady-state
-    /// compute readers do not occupy either render slot.
+    /// Bounded physical ownership: two retained render pairs plus the one
+    /// transient exclusive phase used while installing a compute graph.
+    /// Steady-state compute readers do not occupy either render slot.
     #[pin]
     lease: Mutex<G17PQueueLeaseState>,
     #[pin]
@@ -145,31 +131,122 @@ pub(crate) struct G17PQueueRegistry {
     live_queues: AtomicU32,
     compute_readers: AtomicU32,
     compute_faulted: AtomicU32,
+    /// Device-wide throughput accounting.
+    ///
+    /// `lease` bounds render to two physical pairs, so at most two threads
+    /// reach this mutex and each holds it for a handful of
+    /// integer updates -- no allocation, no formatting -- on a path that
+    /// already takes several locks. It is skipped entirely when
+    /// `g17p_perf_window` is 0.
+    #[pin]
+    perf: Mutex<G17PPerfState>,
 }
+
+/// The open reporting window and the instant it opened.
+///
+/// The kernel's `Instant` keeps its absolute nanoseconds `pub(crate)` to the
+/// `kernel` crate, so the opening instant is held here and only the elapsed
+/// span reaches `g17_perf`.
+struct G17PPerfState {
+    window: g17_perf::SubmitWindow,
+    opened: Instant<Monotonic>,
+}
+
+const G17P_RENDER_SLOTS: usize =
+    g17_resources::G17PRenderQueuePair::SLOT_COUNT as usize;
+/// QIDs 0/1 and 2/3 are independently retained physical queue pairs. Every
+/// firmware-visible queue, stamp, QoS and completion field is derived from the
+/// selected pair; the shared FList and outer-channel state remain device-wide.
+const G17P_ACTIVE_RENDER_SLOTS: usize = G17P_RENDER_SLOTS;
+const _: () = assert!(G17P_ACTIVE_RENDER_SLOTS > 0);
+const _: () = assert!(G17P_ACTIVE_RENDER_SLOTS <= G17P_RENDER_SLOTS);
 
 #[derive(Default)]
 struct G17PQueueLeaseState {
     render_slots: u8,
     compute_install: bool,
+    /// Logical queue that owns each render slot's retained storage, or 0 for a
+    /// slot no client has claimed yet.
+    ///
+    /// The `G17PUserRenderStorage` behind a slot -- its descriptors, render
+    /// state, TVB pool, parameter-management graph and application-GART root --
+    /// belongs to one descriptor context. Every logical queue has its own
+    /// descriptor context even when several queues share one VM. Handing the
+    /// slot to a different queue forces
+    /// `handoff_retained_render_vm` to tear that whole graph down and rebuild
+    /// it for the incoming context. Recording the owner lets a queue come back to
+    /// the storage it already built instead of taking whichever slot happens to
+    /// be free, which is what made two concurrent clients rebuild each other's
+    /// graph on every alternation.
+    render_owner: [u64; G17P_RENDER_SLOTS],
+    /// Acquisition order, used to pick a victim when more clients render than
+    /// there are slots. Zero means never acquired.
+    render_epoch: [u64; G17P_RENDER_SLOTS],
+    /// Slots whose retained graph is known to be unusable: a render abandoned
+    /// after a completion timeout leaves firmware potentially still running the
+    /// group, and its host-side tracker set, so every later submission on that
+    /// slot fails. Retiring the slot costs concurrency; continuing to hand it
+    /// out costs the session, because each client that lands on it is told
+    /// EBUSY and reports VK_ERROR_DEVICE_LOST.
+    render_quarantined: u8,
+    epoch: u64,
 }
 
 impl G17PQueueLeaseState {
     const fn render_mask() -> u8 {
-        (1u8 << g17_resources::G17PRenderQueuePair::SLOT_COUNT) - 1
+        (1u8 << G17P_ACTIVE_RENDER_SLOTS) - 1
     }
 
-    fn acquire_render_slot(&mut self) -> Option<u8> {
-        let free = (!self.render_slots) & Self::render_mask();
-        if free == 0 { return None; }
-        let slot = free.trailing_zeros() as u8;
+    /// True once no render slot can ever be handed out again.
+    fn render_exhausted(&self) -> bool {
+        self.render_quarantined & Self::render_mask() == Self::render_mask()
+    }
+
+    fn take_render_slot(&mut self, slot: u8, owner: u64) -> u8 {
         self.render_slots |= 1u8 << slot;
-        Some(slot)
+        self.render_owner[slot as usize] = owner;
+        self.epoch = self.epoch.wrapping_add(1);
+        self.render_epoch[slot as usize] = self.epoch;
+        slot
+    }
+
+    /// Pick a render slot for `owner`, preferring the one holding its own
+    /// retained graph.
+    ///
+    /// Order: this owner's own slot, then a slot no client has claimed, then
+    /// the least recently used free slot. The last case is a real handoff and
+    /// is only reached when more clients render concurrently than there are
+    /// slots; it is still strictly better than failing, because the handoff
+    /// path works and an EBUSY does not.
+    fn acquire_render_slot(&mut self, owner: u64) -> Option<u8> {
+        let free = (!self.render_slots) & Self::render_mask() & !self.render_quarantined;
+        if free == 0 {
+            return None;
+        }
+        let usable = |slot: usize| free & (1u8 << slot) != 0;
+        if owner != 0 {
+            for slot in 0..G17P_RENDER_SLOTS {
+                if usable(slot) && self.render_owner[slot] == owner {
+                    return Some(self.take_render_slot(slot as u8, owner));
+                }
+            }
+        }
+        for slot in 0..G17P_RENDER_SLOTS {
+            if usable(slot) && self.render_owner[slot] == 0 {
+                return Some(self.take_render_slot(slot as u8, owner));
+            }
+        }
+        let victim = (0..G17P_RENDER_SLOTS)
+            .filter(|slot| usable(*slot))
+            .min_by_key(|slot| self.render_epoch[*slot])?;
+        Some(self.take_render_slot(victim as u8, owner))
     }
 
     fn release_render_slot(&mut self, slot: u8) {
         debug_assert!(slot < g17_resources::G17PRenderQueuePair::SLOT_COUNT);
         self.render_slots &= !(1u8 << slot);
     }
+
 }
 
 impl G17PQueueRegistry {
@@ -181,6 +258,13 @@ impl G17PQueueRegistry {
                 live_queues: AtomicU32::new(0),
                 compute_readers: AtomicU32::new(0),
                 compute_faulted: AtomicU32::new(0),
+                perf <- new_mutex!(
+                    G17PPerfState {
+                        window: g17_perf::SubmitWindow::default(),
+                        opened: Instant::<Monotonic>::now(),
+                    },
+                    "G17PQueueRegistry::perf"
+                ),
             }),
             GFP_KERNEL,
         )
@@ -207,6 +291,53 @@ impl G17PQueueRegistry {
         Ok(G17PComputeLeaseGuard { registry: self.clone(), exclusive: first_install })
     }
 
+    /// Fold one finished render into the open window.
+    ///
+    /// Returns a report only on the submission that fills the window; the
+    /// caller prints it with this lock released.
+    fn record_render(&self, sample: g17_perf::RenderSample) -> Option<g17_perf::SubmitReport> {
+        let size = *module_parameters::g17p_perf_window.value();
+        if size == 0 {
+            return None;
+        }
+        let mut state = self.perf.lock();
+        if !state.window.is_open() {
+            state.window.open();
+            state.opened = Instant::<Monotonic>::now();
+        }
+        state.window.record_render(sample);
+        Self::close_full_window(&mut state, size)
+    }
+
+    /// Fold one queued asynchronous compute into the open window.
+    ///
+    /// Only the ioctl cost is recorded: the job has not run when the ioctl
+    /// returns, by design, so there is no GPU interval to attribute to it here.
+    fn record_compute(&self, ioctl_ns: u64) -> Option<g17_perf::SubmitReport> {
+        let size = *module_parameters::g17p_perf_window.value();
+        if size == 0 {
+            return None;
+        }
+        let mut state = self.perf.lock();
+        if !state.window.is_open() {
+            state.window.open();
+            state.opened = Instant::<Monotonic>::now();
+        }
+        state.window.record_compute(ioctl_ns);
+        Self::close_full_window(&mut state, size)
+    }
+
+    fn close_full_window(
+        state: &mut G17PPerfState,
+        size: u32,
+    ) -> Option<g17_perf::SubmitReport> {
+        if state.window.submissions() < size {
+            return None;
+        }
+        let wall_ns = state.opened.elapsed().as_nanos().max(0) as u64;
+        Some(state.window.close(wall_ns))
+    }
+
     /// Reserve one queue slot, or report a full device.
     fn reserve_queue(&self) -> Result {
         let mut live = self.live_queues.load(Ordering::Acquire);
@@ -230,22 +361,74 @@ impl G17PQueueRegistry {
         self.live_queues.fetch_sub(1, Ordering::AcqRel);
     }
 
-    /// Block until this client owns the hardware compute graph.
-    fn acquire_lease(self: &Arc<Self>, _id: u64) -> Result<G17PLeaseGuard> {
+    /// Block until this logical queue owns a render slot, preferring the slot that already
+    /// holds its retained graph.
+    ///
+    /// `owner` is the logical queue id. Retained descriptors name that queue's
+    /// independently allocated application-GART descriptor context, so two
+    /// queues in one VM cannot share one graph. Waiting here is interruptible and
+    /// unbounded by design -- a client that has to wait loses latency, whereas
+    /// an EBUSY from this path reaches Mesa as VK_ERROR_DEVICE_LOST and takes
+    /// the client's whole context with it.
+    fn acquire_lease(self: &Arc<Self>, owner: u64) -> Result<G17PLeaseGuard> {
         let mut held = self.lease.lock();
-        while held.compute_install || held.render_slots == G17PQueueLeaseState::render_mask() {
-            if self.compute_faulted.load(Ordering::Acquire) != 0 { return Err(EIO); }
+        let slot = loop {
+            if self.compute_faulted.load(Ordering::Acquire) != 0 {
+                return Err(EIO);
+            }
+            // Every slot retired: no wait can ever succeed, so report the dead
+            // device instead of sleeping forever.
+            if held.render_exhausted() {
+                return Err(EIO);
+            }
+            if !held.compute_install {
+                if let Some(slot) = held.acquire_render_slot(owner) {
+                    break slot;
+                }
+            }
             if self.lease_free.wait_interruptible(&mut held) {
                 return Err(ERESTARTSYS);
             }
-        }
-        if self.compute_faulted.load(Ordering::Acquire) != 0 { return Err(EIO); }
-        let slot = held.acquire_render_slot().ok_or(EBUSY)?;
+        };
         core::mem::drop(held);
         Ok(G17PLeaseGuard {
             registry: self.clone(),
             slot,
         })
+    }
+
+    /// Retire one render slot whose retained graph can no longer be trusted.
+    ///
+    /// Called after a completion timeout has abandoned a submission. Nothing is
+    /// freed -- the firmware may still own the abandoned group -- but no client
+    /// is handed this slot again for the rest of the session.
+    fn quarantine_render_slot(&self, slot: u8) {
+        let mut held = self.lease.lock();
+        if held.render_quarantined & (1u8 << slot) != 0 {
+            return;
+        }
+        held.render_quarantined |= 1u8 << slot;
+        let remaining = (G17PQueueLeaseState::render_mask() & !held.render_quarantined)
+            .count_ones();
+        drop(held);
+        pr_warn!(
+            "G17P render: retiring slot {} after an abandoned submission; {} render slot(s) left\n",
+            slot,
+            remaining,
+        );
+        self.lease_free.notify_all();
+    }
+
+    /// Make one quarantined slot eligible after both firmware CPUs stop.
+    ///
+    /// The completion still owns its lease while this bit is cleared, so no
+    /// waiter can acquire the slot until that guard drops immediately after
+    /// this call. Both processors have relinquished the abandoned group, so it
+    /// can no longer justify a permanent capacity loss in the next session.
+    fn rehabilitate_render_slot_after_processor_stop(&self, slot: u8) {
+        debug_assert!(slot < g17_resources::G17PRenderQueuePair::SLOT_COUNT);
+        let mut held = self.lease.lock();
+        held.render_quarantined &= !(1u8 << slot);
     }
 }
 
@@ -254,6 +437,17 @@ impl G17PComputeLeaseGuard {
     pub(crate) fn quarantine(&self) {
         let held = self.registry.lease.lock();
         self.registry.compute_faulted.store(1, Ordering::Release);
+        drop(held);
+        self.registry.lease_free.notify_all();
+    }
+
+    /// Clear the device-wide admission poison only after both firmware
+    /// processors stop. The runtime still owns this guard at that boundary,
+    /// so the registry cannot lose the recovery transition when the active
+    /// queue graph is dropped immediately afterward.
+    pub(crate) fn rehabilitate_after_processor_stop(&self) {
+        let held = self.registry.lease.lock();
+        self.registry.compute_faulted.store(0, Ordering::Release);
         drop(held);
         self.registry.lease_free.notify_all();
     }
@@ -272,6 +466,131 @@ impl Drop for G17PComputeLeaseGuard {
 struct G17PLeaseGuard {
     registry: Arc<G17PQueueRegistry>,
     slot: u8,
+}
+
+/// Exact hardware completion for one published render.  The lease is owned by
+/// the completion packet, not the submit ioctl, so neither file close nor a
+/// fast return can hand the physical slot to another client before retirement.
+pub(crate) struct G17PRenderCompletion {
+    fence: UserFence<G17PSubmissionFence>,
+    status: Arc<crate::g17_status::VmStatus>,
+    lease: Arc<Mutex<Option<G17PLeaseGuard>>>,
+    vm_job: Arc<Mutex<Option<mmu::T8140VmJobGuard>>>,
+    signalled: AtomicU32,
+}
+
+impl G17PRenderCompletion {
+    fn new(
+        fence: UserFence<G17PSubmissionFence>,
+        status: Arc<crate::g17_status::VmStatus>,
+        lease: G17PLeaseGuard,
+        vm_job: mmu::T8140VmJobGuard,
+    ) -> Result<Arc<Self>> {
+        let lease = Arc::pin_init(
+            new_mutex!(Some(lease), "G17PRenderCompletion::lease"),
+            GFP_KERNEL,
+        )?;
+        let vm_job = Arc::pin_init(
+            new_mutex!(Some(vm_job), "G17PRenderCompletion::vm_job"),
+            GFP_KERNEL,
+        )?;
+        Ok(Arc::new(Self {
+            fence,
+            status,
+            lease,
+            vm_job,
+            signalled: AtomicU32::new(0),
+        }, GFP_KERNEL)?)
+    }
+
+    pub(crate) fn fence(&self) -> Fence { Fence::from_fence(&self.fence) }
+
+    pub(crate) fn belongs_to_vm(
+        &self,
+        status: &Arc<crate::g17_status::VmStatus>,
+    ) -> bool {
+        Arc::ptr_eq(&self.status, status)
+    }
+
+    pub(crate) fn vm_status(&self) -> Arc<crate::g17_status::VmStatus> {
+        self.status.clone()
+    }
+
+    /// Report failure without claiming that firmware stopped using this job.
+    /// The runtime must retain this completion through queue retirement or
+    /// processor stop. In particular, an error fence is not an unmap witness.
+    pub(crate) fn fail_while_owned(&self, error: Error) -> bool {
+        if self.signalled.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return false;
+        }
+        if let Some(vm_job) = self.vm_job.lock().as_ref() {
+            vm_job.quarantine();
+        }
+        // Publish the registry quarantine before waking userspace or dropping
+        // the runtime mutex. Recovery may stop the processors immediately
+        // after this failure; recording the bit here ensures its post-stop
+        // rehabilitation cannot race an older caller which marks it later.
+        if let Some(lease) = self.lease.lock().as_ref() {
+            lease.registry.quarantine_render_slot(lease.slot);
+        }
+        self.status.record(error.to_errno());
+        self.fence.set_error(error);
+        // Retain BOTH guards: dropping the lease here also lets a waiter
+        // reacquire this physical slot before quarantine is recorded.
+        self.fence.signal();
+        true
+    }
+
+    /// Signal at most once even when both RTKit roles report the same event.
+    /// The caller must prove retirement, processor stop, or no publication.
+    /// Unresolved hardware failures must use `fail_while_owned` instead.
+    pub(crate) fn complete(
+        &self,
+        result: Result<g17_completion::PairedRenderCompletion>,
+    ) {
+        if self.signalled.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return;
+        }
+        let result = result.and_then(|completion| {
+            if completion.complete { Ok(()) } else { Err(EIO) }
+        });
+        if let Err(error) = result {
+            self.status.record(error.to_errno());
+            self.fence.set_error(error);
+        }
+        // Release the physical slot before waking userspace. The scheduler
+        // intentionally retains this completion packet until its finished
+        // fence retires; tying lease Drop to packet Drop lets the woken client
+        // race ahead, take the other slot and collide with this VM's fixed
+        // render-state aliases.
+        drop(self.lease.lock().take());
+        // A signalled output fence is userspace's permission to recycle BOs
+        // and unbind transient VDM aliases. Retire the VM-job guard first;
+        // leaving it in the scheduler-owned completion packet made those
+        // post-fence unbinds return EBUSY until an unrelated worker freed the
+        // packet, after which the already-recycled VA collided with the stale
+        // mapping.
+        drop(self.vm_job.lock().take());
+        self.fence.signal();
+    }
+
+    /// Release guards retained by `fail_while_owned` after both ASCs stop.
+    ///
+    /// The output fence may already be signalled, so `complete` deliberately
+    /// returns early and cannot serve as this ownership boundary. Retire the VM
+    /// job before restoring the physical slot, then clear its quarantine while
+    /// the lease still excludes waiters; dropping the lease publishes both
+    /// changes and wakes them.
+    pub(crate) fn release_after_processor_stop(&self) {
+        drop(self.vm_job.lock().take());
+        let lease = self.lease.lock().take();
+        if let Some(lease) = lease.as_ref() {
+            lease
+                .registry
+                .rehabilitate_render_slot_after_processor_stop(lease.slot);
+        }
+        drop(lease);
+    }
 }
 
 impl G17PLeaseGuard {
@@ -486,12 +805,19 @@ struct G17PQueue {
     user_range: Range<u64>,
     usc_exec_base: u64,
     fence_contexts: FenceContexts,
+    /// Per-logical-queue VM context. Render needs the context immediately,
+    /// but the hardware compute graph is deliberately allocated only if this
+    /// logical queue actually submits compute.
+    context: Arc<mmu::T8140ComputeExecutionContext>,
     async_backend: Option<Arc<G17PAsyncQueueBackend>>,
     async_scheduler: Option<g17_job::G17PJobScheduler<G17PAsyncQueueBackend>>,
-    /// Most recent compute job submitted through this logical DRM queue.
-    /// Render still uses the synchronous G17P path, so it must explicitly
-    /// join the scheduler timeline before acquiring the render lease.
-    last_async_compute: Option<Fence>,
+    render_scheduler: Option<g17_job::G17PRenderWatchScheduler<G17PRenderWatchBackend>>,
+    /// Most recent job submitted through this logical DRM queue, regardless
+    /// of engine. Vulkan queue order crosses the render/compute boundary: a
+    /// compute following a render must not publish before the render retires,
+    /// just as a render following compute must not overtake it. Independent
+    /// logical queues retain their own timelines and can still overlap.
+    last_submission: Option<Fence>,
     id: u64,
 }
 
@@ -499,10 +825,48 @@ impl Drop for G17PQueue {
     fn drop(&mut self) {
         // Entity teardown handles pending scheduler jobs before the frontend
         // reference goes away. Active hardware packets are retained by runtime.
+        //
+        // Do not leave async ownership release to G17PAsyncQueueBackend::drop:
+        // DRM scheduler teardown may retain that Arc past the file/queue close
+        // boundary.  An idle queue would then pin its QID and execution context
+        // even though no DRM file still owns the render node, forcing the next
+        // client onto a needlessly fresh hardware queue.  Release explicitly
+        // after the entity is torn down; the backend's later Drop is idempotent.
+        drop(self.render_scheduler.take());
         drop(self.async_scheduler.take());
+        self.runtime
+            .mutex()
+            .lock()
+            .release_render_owner(self.id, self.context.context_id() as u16);
+        self.runtime
+            .mutex()
+            .lock()
+            .release_async_compute_queue(self.id);
         drop(self.async_backend.take());
         self.runtime.release_compute_owner(self.id);
         self.registry.release_queue();
+    }
+}
+
+pub(crate) struct G17PRenderWatchBackend {
+    runtime: G17PRuntimeRef,
+}
+
+impl g17_job::G17PRenderWatchBackend for G17PRenderWatchBackend {
+    fn timed_out(
+        &self,
+        packet: Arc<g17_job::G17PRenderWatchPacket>,
+    ) -> kernel::drm::sched::Status {
+        self.runtime.mutex().lock().timeout_deferred_render(
+            packet.render_slot(), packet.submission_id(), ETIMEDOUT,
+        );
+        kernel::drm::sched::Status::Nominal
+    }
+
+    fn cancel(&self, packet: Arc<g17_job::G17PRenderWatchPacket>) {
+        self.runtime.mutex().lock().timeout_deferred_render(
+            packet.render_slot(), packet.submission_id(), ECANCELED,
+        );
     }
 }
 
@@ -530,11 +894,43 @@ impl g17_job::G17PQueueBackend for G17PAsyncQueueBackend {
         self.runtime.mutex().lock().async_compute_dependency(self.owner)
     }
     fn publish(&self, packet: Arc<g17_job::G17PComputeJobPacket>) -> Result<Fence> {
-        let hardware_fence = packet.completion()?.fence();
-        let first_install = self.runtime.mutex().lock().async_compute_needs_install(self.owner)?;
-        let lease = self.registry.acquire_compute(first_install)?;
-        self.runtime.mutex().lock().publish_async_compute(self.owner, packet, lease)?;
-        Ok(hardware_fence)
+        let status = packet.completion()?.status.clone();
+        let result = (|| -> Result<Fence> {
+            let completion = packet.completion()?;
+            // Several compute jobs may already be queued behind one predecessor.
+            // If that predecessor failed, its scheduler fence wakes this job, but
+            // a signalled error dependency is still "ready" to DRM sched. Refuse
+            // the queued successor before acquiring a lease or publishing it.
+            if completion.status.get() != 0 {
+                completion.complete(Err(EIO));
+                return Err(EIO);
+            }
+            // A dma_fence carrying an error is still signalled, so DRM sched has
+            // legitimately made this job runnable. It does not mean the GPU
+            // dependency succeeded. Consume every retained dependency status
+            // before taking a hardware lease or writing queue state.
+            for fence in packet.input_fences() {
+                G17PQueue::wait_fence(fence)?;
+            }
+            let hardware_fence = completion.fence();
+            let first_install = self.runtime.mutex().lock().async_compute_needs_install(self.owner)?;
+            let lease = self.registry.acquire_compute(first_install)?;
+            self.runtime.mutex().lock().publish_async_compute(self.owner, packet, lease)?;
+            Ok(hardware_fence)
+        })();
+        if let Err(error) = result.as_ref() {
+            let lost = *error == EIO
+                || *error == ETIMEDOUT
+                || *error == ENODEV
+                || status.get() != 0;
+            if lost {
+                self.runtime
+                    .mutex()
+                    .lock()
+                    .fail_outstanding_jobs_for_vm(&status, *error);
+            }
+        }
+        result
     }
     fn timed_out(&self, packet: Arc<g17_job::G17PComputeJobPacket>) -> kernel::drm::sched::Status {
         self.runtime.mutex().lock().quarantine_async_compute(self.owner, packet.submission_id(), ETIMEDOUT);
@@ -574,17 +970,19 @@ impl G17PQueue {
         .validate()
         .map_err(|_| EINVAL)?;
         let fence_contexts = FenceContexts::new(1, QUEUE_NAME, QUEUE_CLASS_KEY)?;
-        // Reserve all scarce hardware resources before QUEUE_CREATE succeeds.
-        // Allocation errors must not surface later as accepted-job device loss.
-        // Backend Drop gives an unpublished/idle reservation back on any later
-        // constructor failure, including scheduler or KBox allocation failure.
-        let (hardware_queue, context) = runtime.mutex().lock()
-            .prepare_async_compute_queue(id, &vm)?;
-        let backend = Arc::new(G17PAsyncQueueBackend {
-            runtime, registry: registry.clone(), owner: id, hardware_queue, context,
+        // Every logical queue owns a VM execution context, since render also
+        // names it. Do not allocate a hardware compute graph here: desktop
+        // stacks routinely create idle/render-only logical queues, and eager
+        // allocation made those queues consume QID4 before the first real
+        // compute submit. The graph and scheduler are created atomically by
+        // ensure_async_compute_queue on first compute use.
+        let context = runtime.mutex().lock().prepare_queue_execution_context(&vm)?;
+        let render_backend = Arc::new(G17PRenderWatchBackend {
+            runtime,
         }, GFP_KERNEL)?;
-        let scheduler = g17_job::G17PJobScheduler::new(dev, backend.clone(),
-            crate::g17_queue_limits::MAX_IN_FLIGHT_PER_QUEUE)?;
+        let render_scheduler = g17_job::G17PRenderWatchScheduler::new(
+            dev, render_backend.clone(),
+        )?;
         Ok(Self {
             dev: dev.into(),
             runtime,
@@ -596,11 +994,109 @@ impl G17PQueue {
             user_range,
             usc_exec_base,
             fence_contexts,
-            async_backend: Some(backend),
-            async_scheduler: Some(scheduler),
-            last_async_compute: None,
+            context,
+            async_backend: None,
+            async_scheduler: None,
+            render_scheduler: Some(render_scheduler),
+            last_submission: None,
             id,
         })
+    }
+
+    fn ensure_async_compute_queue(&mut self) -> Result {
+        match (&self.async_backend, &self.async_scheduler) {
+            (Some(backend), Some(_)) => {
+                if self.runtime.mutex().lock().async_compute_queue_matches(
+                    self.id, backend.hardware_queue, &backend.context,
+                )? {
+                    return Ok(());
+                }
+            }
+            (None, None) => {}
+            _ => return Err(EIO),
+        }
+
+        // Processor-stop recovery removes every runtime graph after settling
+        // its active fence. Drop the now-stale entity first so any jobs queued
+        // behind that fence are cancelled before a new graph is published.
+        // Backend Drop is harmless here: the runtime just proved this owner is
+        // absent. Keep the same teardown ordering as G17PQueue::drop.
+        drop(self.async_scheduler.take());
+        drop(self.async_backend.take());
+
+        let (hardware_queue, context) = self.runtime.mutex().lock()
+            .prepare_async_compute_queue(self.id, &self.vm, self.context.clone())?;
+        let backend = Arc::new(G17PAsyncQueueBackend {
+            runtime: self.runtime,
+            registry: self.registry.clone(),
+            owner: self.id,
+            hardware_queue,
+            context,
+        }, GFP_KERNEL).inspect_err(|_| {
+            self.runtime.mutex().lock().release_async_compute_queue(self.id);
+        })?;
+        let scheduler = g17_job::G17PJobScheduler::new(
+            &self.dev, backend.clone(),
+            crate::g17_queue_limits::MAX_IN_FLIGHT_PER_QUEUE,
+        )?;
+        self.async_backend = Some(backend);
+        self.async_scheduler = Some(scheduler);
+        Ok(())
+    }
+
+    /// Print one throughput window.
+    ///
+    /// This is the only line the submit path emits at steady state, and it
+    /// carries every number the driver can honestly report:
+    ///
+    /// * `renders`/`computes`/`gpu-intervals` -- what the window contained,
+    ///   and how many renders published a native pass envelope.
+    /// * `renders/s` -- end-to-end submission throughput.
+    /// * `ioctl`/`publish`/`wait` -- host microseconds per render, and the
+    ///   split between building and publishing the work and waiting for it.
+    /// * `gpu` -- the firmware's own pass envelope, converted with the 24 MHz
+    ///   rate this driver already reports through `DRM_IOCTL_ASAHI_GET_TIME`.
+    /// * `occupancy` -- GPU busy ticks over the tick span the window covered.
+    ///   Both terms are GPU-written, so no timebase enters this ratio.
+    /// * `ioctl-share` -- how much of wall time the client spent inside the
+    ///   ioctl. With a synchronous render wait this is the number that says
+    ///   how much throughput a client is losing to the driver.
+    /// * `tick-khz` -- the tick rate MEASURED from this window. It exists so a
+    ///   wrong timebase assumption is visible instead of silently scaling
+    ///   every microsecond above.
+    fn report_perf(&self, report: g17_perf::SubmitReport) {
+        dev_info!(
+            self.dev.as_ref(),
+            "G17P perf[{}]: renders={} computes={} gpu-intervals={} wall={}us renders/s={}.{:02} ioctl={}.{}us(max {}.{}us) publish={}.{}us wait={}.{}us polls={}.{} compute-ioctl={}.{}us gpu={}.{}us(max {}.{}us) occupancy={}.{}% ioctl-share={}.{}% tick-khz={}\n",
+            report.window_index,
+            report.renders,
+            report.computes,
+            report.intervals,
+            report.wall_us,
+            report.renders_per_s_x100 / 100,
+            report.renders_per_s_x100 % 100,
+            report.ioctl_avg_us_x10 / 10,
+            report.ioctl_avg_us_x10 % 10,
+            report.ioctl_max_us_x10 / 10,
+            report.ioctl_max_us_x10 % 10,
+            report.publish_avg_us_x10 / 10,
+            report.publish_avg_us_x10 % 10,
+            report.wait_avg_us_x10 / 10,
+            report.wait_avg_us_x10 % 10,
+            report.polls_avg_x10 / 10,
+            report.polls_avg_x10 % 10,
+            report.compute_avg_us_x10 / 10,
+            report.compute_avg_us_x10 % 10,
+            report.gpu_avg_us_x10 / 10,
+            report.gpu_avg_us_x10 % 10,
+            report.gpu_max_us_x10 / 10,
+            report.gpu_max_us_x10 % 10,
+            report.occupancy_pct_x10 / 10,
+            report.occupancy_pct_x10 % 10,
+            report.ioctl_pct_x10 / 10,
+            report.ioctl_pct_x10 % 10,
+            report.tick_khz,
+        );
     }
 
     /// Name the UAPI check that refused a submission. Without this the ioctl
@@ -639,6 +1135,12 @@ impl G17PQueue {
     /// render vs compute vs attachment-set, sizes and barriers -- so a
     /// submission that dies before the parse loop is still identifiable.
     fn log_cmdbuf_headers(submission_id: u64, raw: &[u8]) {
+        // Every line inside is already gated, but the walk itself ran on every
+        // submission to produce nothing. Leave the whole thing out of the
+        // steady-state path.
+        if !crate::util::g17p_verbose() {
+            return;
+        }
         let mut offset = 0usize;
         let mut index = 0u32;
         while offset + g17_uapi::UAPI_COMMAND_HEADER_SIZE <= raw.len() {
@@ -647,38 +1149,56 @@ impl G17PQueue {
             let size = u16::from_le_bytes([header[2], header[3]]);
             let vdm_barrier = u16::from_le_bytes([header[4], header[5]]);
             let cdm_barrier = u16::from_le_bytes([header[6], header[7]]);
-            pr_info!(
-                "G17P submit: submission {} cmd[{}] type={} size={} vdm_barrier={:#x} cdm_barrier={:#x} at offset {}\n",
-                submission_id,
-                index,
-                command_type,
-                size,
-                vdm_barrier,
-                cdm_barrier,
-                offset,
-            );
+            if crate::util::g17p_verbose() {
+                pr_info!(
+                    "G17P submit: submission {} cmd[{}] type={} size={} vdm_barrier={:#x} cdm_barrier={:#x} at offset {}\n",
+                    submission_id,
+                    index,
+                    command_type,
+                    size,
+                    vdm_barrier,
+                    cdm_barrier,
+                    offset,
+                );
+            }
             offset += g17_uapi::UAPI_COMMAND_HEADER_SIZE + size as usize;
             index += 1;
             if index > 8 {
-                pr_info!("G17P submit: submission {} cmd list truncated\n", submission_id);
+                if crate::util::g17p_verbose() {
+                    pr_info!("G17P submit: submission {} cmd list truncated\n", submission_id);
+                }
                 return;
             }
         }
         if offset != raw.len() {
-            pr_info!(
-                "G17P submit: submission {} cmd walk ended at {} of {} bytes (ragged)\n",
-                submission_id,
-                offset,
-                raw.len(),
-            );
+            if crate::util::g17p_verbose() {
+                pr_info!(
+                    "G17P submit: submission {} cmd walk ended at {} of {} bytes (ragged)\n",
+                    submission_id,
+                    offset,
+                    raw.len(),
+                );
+            }
         }
     }
 
+    /// Queue a compute command on this queue's DRM scheduler.
+    ///
+    /// `syncs` holds only the input syncobjs: `submit()` splits the outputs off
+    /// into `publication` before it knows whether the command is render or
+    /// compute. The scheduler's finished fence is therefore published through
+    /// that guard rather than installed from here, and only once the job is
+    /// actually enqueued -- every earlier failure leaves the guard armed so the
+    /// caller still learns the work will never run.
     fn submit_compute_async(
         &mut self, submission_id: u64, translated: g17_uapi::TranslatedComputeCommand,
         mut syncs: KVec<file::SyncItem>, in_sync_count: usize,
         objects: core::pin::Pin<&xarray::XArray<KBox<file::Object>>>,
+        publication: &mut G17POutputFencePublication<'_>,
+        vm_job: mmu::T8140VmJobGuard,
+        entered: Instant<Monotonic>,
     ) -> Result {
+        self.ensure_async_compute_queue()?;
         self.runtime.mutex().lock().check_async_compute_submission()?;
         let destinations = [
             Self::timestamp_destination(objects, translated.timestamps.start)?,
@@ -687,21 +1207,49 @@ impl G17PQueue {
         let timestamps = self.owned_compute_timestamps()?;
         let output = self.fence_contexts.new_fence(0, G17PSubmissionFence)?.into();
         let backend = self.async_backend.as_ref().ok_or(EIO)?;
+        // One extra dependency carries this logical queue's preceding render
+        // or compute completion. DRM entities serialize compute jobs with one
+        // another, but render publication uses a separate watch entity; the
+        // explicit fence is what preserves Vulkan queue order across engines.
+        let mut dependencies = KVec::with_capacity(in_sync_count + 1, GFP_KERNEL)?;
+        let mut checked_dependencies = KVec::with_capacity(in_sync_count + 1, GFP_KERNEL)?;
+        for sync in syncs.drain(0..in_sync_count) {
+            if let Some(fence) = sync.fence {
+                checked_dependencies.push(fence.clone(), GFP_KERNEL)?;
+                dependencies.push(fence, GFP_KERNEL)?;
+            }
+        }
+        if let Some(prior) = self.last_submission.as_ref() {
+            checked_dependencies.push(prior.clone(), GFP_KERNEL)?;
+            dependencies.push(prior.clone(), GFP_KERNEL)?;
+        }
+        let completion = g17_job::G17PJobCompletion::new(
+            output,
+            timestamps,
+            destinations,
+            self.vm.status().clone(),
+            vm_job,
+        )?;
         let packet = g17_job::G17PComputeJobPacket::new(
             submission_id, backend.hardware_queue, backend.context.clone(), translated,
-            KVec::new(), KVec::new(),
-            Some(g17_job::G17PJobCompletion { fence: output, timestamps, destinations, status: self.vm.status().clone() }),
-            Some(self.vm.retain_t8140_job()?),
+            KVec::new(), KVec::new(), checked_dependencies,
+            Some(completion),
         )?;
-        let mut dependencies = KVec::with_capacity(in_sync_count, GFP_KERNEL)?;
-        for sync in syncs.drain(0..in_sync_count) {
-            if let Some(fence) = sync.fence { dependencies.push(fence, GFP_KERNEL)?; }
-        }
         let finished = self.async_scheduler.as_mut().ok_or(EIO)?.enqueue(packet, dependencies)?;
-        Self::install_output_fences(syncs.into_iter(), &finished);
-        self.last_async_compute = Some(finished);
-        pr_info!("G17P async submit: QUEUED submission {} owner={} qid={} context={}\n",
-            submission_id, self.id, backend.hardware_queue, backend.context.context_id());
+        // The job is queued and owns its completion from here: give userspace
+        // the fence that signals when the GPU has actually run it.
+        self.last_submission = Some(finished.clone());
+        publication.publish_async(&finished);
+        if crate::util::g17p_verbose() {
+            pr_info!("G17P async submit: QUEUED submission {} owner={} qid={} context={}\n",
+                submission_id, self.id, backend.hardware_queue, backend.context.context_id());
+        }
+        if let Some(report) = self
+            .registry
+            .record_compute(entered.elapsed().as_nanos().max(0) as u64)
+        {
+            self.report_perf(report);
+        }
         Ok(())
     }
 
@@ -711,83 +1259,106 @@ impl G17PQueue {
     /// unconditionally means one hardware run diagnoses any check, not just
     /// the one that happens to fire first.
     fn log_render_payload(submission_id: u64, payload: &g17_uapi::UapiRenderCommand) {
-        pr_info!(
-            "G17P render uapi[{}]: flags={:#x} {}x{} layers={} utile={}x{} samples={} sample_size={} tib_cfg={:#x}\n",
-            submission_id,
-            payload.flags,
-            payload.width,
-            payload.height,
-            payload.layers,
-            payload.utile_width,
-            payload.utile_height,
-            payload.samples,
-            payload.sample_size,
-            payload.ppp_control,
-        );
-        pr_info!(
-            "G17P render uapi[{}]: vdm={:#x} scissor={:#x} dbias={:#x} oclqry={:#x} sampler={:#x}/{} bgobjdepth={:#x} bgobjvals={:#x}\n",
-            submission_id,
-            payload.vdm_base,
-            payload.scissor_base,
-            payload.depth_bias_base,
-            payload.occlusion_query_base,
-            payload.sampler_heap,
-            payload.sampler_count,
-            payload.depth_clear,
-            payload.stencil_clear,
-        );
-        pr_info!(
-            "G17P render uapi[{}]: depth={:#x}/{:#x} stride={:#x}/{:#x} stencil={:#x}/{:#x} stride={:#x}/{:#x} zls={:#x}\n",
-            submission_id,
-            payload.depth.base,
-            payload.depth.compression_base,
-            payload.depth.stride,
-            payload.depth.compression_stride,
-            payload.stencil.base,
-            payload.stencil.compression_base,
-            payload.stencil.stride,
-            payload.stencil.compression_stride,
-            payload.zls_control,
-        );
-        pr_info!(
-            "G17P render uapi[{}]: bg={:#x}/{:#x} eot={:#x}/{:#x} pbg={:#x}/{:#x} peot={:#x}/{:#x}\n",
-            submission_id,
-            payload.background.usc,
-            payload.background.resource_spec,
-            payload.end_of_tile.usc,
-            payload.end_of_tile.resource_spec,
-            payload.partial_background.usc,
-            payload.partial_background.resource_spec,
-            payload.partial_end_of_tile.usc,
-            payload.partial_end_of_tile.resource_spec,
-        );
-        pr_info!(
-            "G17P render uapi[{}]: vhelper={:#x}/{:#x}/{:#x} fhelper={:#x}/{:#x}/{:#x}\n",
-            submission_id,
-            payload.vertex_helper.binary,
-            payload.vertex_helper.config,
-            payload.vertex_helper.data,
-            payload.fragment_helper.binary,
-            payload.fragment_helper.config,
-            payload.fragment_helper.data,
-        );
+        if crate::util::g17p_verbose() {
+            pr_info!(
+                "G17P render uapi[{}]: flags={:#x} {}x{} layers={} utile={}x{} samples={} sample_size={} tib_cfg={:#x}\n",
+                submission_id,
+                payload.flags,
+                payload.width,
+                payload.height,
+                payload.layers,
+                payload.utile_width,
+                payload.utile_height,
+                payload.samples,
+                payload.sample_size,
+                payload.ppp_control,
+            );
+        }
+        if crate::util::g17p_verbose() {
+            pr_info!(
+                "G17P render uapi[{}]: vdm={:#x} scissor={:#x} dbias={:#x} oclqry={:#x} sampler={:#x}/{} bgobjdepth={:#x} bgobjvals={:#x}\n",
+                submission_id,
+                payload.vdm_base,
+                payload.scissor_base,
+                payload.depth_bias_base,
+                payload.occlusion_query_base,
+                payload.sampler_heap,
+                payload.sampler_count,
+                payload.depth_clear,
+                payload.stencil_clear,
+            );
+        }
+        if crate::util::g17p_verbose() {
+            pr_info!(
+                "G17P render uapi[{}]: depth={:#x}/{:#x} stride={:#x}/{:#x} stencil={:#x}/{:#x} stride={:#x}/{:#x} zls={:#x}\n",
+                submission_id,
+                payload.depth.base,
+                payload.depth.compression_base,
+                payload.depth.stride,
+                payload.depth.compression_stride,
+                payload.stencil.base,
+                payload.stencil.compression_base,
+                payload.stencil.stride,
+                payload.stencil.compression_stride,
+                payload.zls_control,
+            );
+        }
+        if crate::util::g17p_verbose() {
+            pr_info!(
+                "G17P render uapi[{}]: bg={:#x}/{:#x} eot={:#x}/{:#x} pbg={:#x}/{:#x} peot={:#x}/{:#x}\n",
+                submission_id,
+                payload.background.usc,
+                payload.background.resource_spec,
+                payload.end_of_tile.usc,
+                payload.end_of_tile.resource_spec,
+                payload.partial_background.usc,
+                payload.partial_background.resource_spec,
+                payload.partial_end_of_tile.usc,
+                payload.partial_end_of_tile.resource_spec,
+            );
+        }
+        if crate::util::g17p_verbose() {
+            pr_info!(
+                "G17P render uapi[{}]: vhelper={:#x}/{:#x}/{:#x} fhelper={:#x}/{:#x}/{:#x}\n",
+                submission_id,
+                payload.vertex_helper.binary,
+                payload.vertex_helper.config,
+                payload.vertex_helper.data,
+                payload.fragment_helper.binary,
+                payload.fragment_helper.config,
+                payload.fragment_helper.data,
+            );
+        }
+    }
+
+    fn wait_fence(fence: &Fence) -> Result {
+        // SAFETY: `fence.raw()` remains valid for both calls. The completed
+        // fence status must be consumed as well as its signal bit: an error
+        // fence counts as signalled, but it does not satisfy a GPU dependency.
+        let ret = unsafe {
+            bindings::dma_fence_wait_timeout(
+                fence.raw(),
+                true,
+                kernel::task::MAX_SCHEDULE_TIMEOUT,
+            )
+        };
+        if ret < 0 {
+            return Err(Error::from_errno(ret as i32));
+        }
+        if ret == 0 {
+            return Err(ETIMEDOUT);
+        }
+        let status = unsafe { bindings::dma_fence_get_status(fence.raw()) };
+        if status < 0 {
+            return Err(Error::from_errno(status));
+        }
+        Ok(())
     }
 
     fn wait_input_fences(syncs: &[file::SyncItem]) -> Result {
         for sync in syncs {
-            let Some(fence) = sync.fence.as_ref() else {
-                continue;
-            };
-            // SAFETY: `fence.raw()` remains valid for the duration of this call.
-            let ret = unsafe {
-                bindings::dma_fence_wait_timeout(
-                    fence.raw(),
-                    true,
-                    kernel::task::MAX_SCHEDULE_TIMEOUT,
-                )
-            };
-            if ret < 0 {
-                return Err(Error::from_errno(ret as i32));
+            if let Some(fence) = sync.fence.as_ref() {
+                Self::wait_fence(fence)?;
             }
         }
         Ok(())
@@ -798,30 +1369,26 @@ impl G17PQueue {
     ) -> Result<G17PLeaseGuard> {
         Self::wait_input_fences(syncs)
             .map_err(|error| Self::stage_fail(submission_id, "wait-input-fences", error))?;
-        self.registry.acquire_lease(self.id)
+        // Key the slot on this logical queue, whose independently allocated
+        // descriptor context is encoded throughout the retained render graph.
+        // Sharing one VM does not make two queue contexts interchangeable.
+        // Owner zero claims nothing, which is the historical lowest-free policy.
+        let owner = if *module_parameters::g17p_render_slot_affinity.value() != 0 {
+            self.id
+        } else {
+            0
+        };
+        self.registry.acquire_lease(owner)
             .map_err(|error| Self::stage_fail(submission_id, "acquire-lease", error))
     }
 
-    fn join_async_compute_timeline(&mut self, submission_id: u64) -> Result {
-        let Some(fence) = self.last_async_compute.as_ref() else {
+    fn join_queue_timeline(&mut self, submission_id: u64) -> Result {
+        let Some(fence) = self.last_submission.as_ref() else {
             return Ok(());
         };
-        // SAFETY: the queue owns `fence` until this wait returns.
-        let ret = unsafe {
-            bindings::dma_fence_wait_timeout(
-                fence.raw(),
-                true,
-                kernel::task::MAX_SCHEDULE_TIMEOUT,
-            )
-        };
-        if ret < 0 {
-            return Err(Self::stage_fail(
-                submission_id,
-                "wait-queue-compute",
-                Error::from_errno(ret as i32),
-            ));
-        }
-        self.last_async_compute = None;
+        Self::wait_fence(fence)
+            .map_err(|error| Self::stage_fail(submission_id, "wait-queue-timeline", error))?;
+        self.last_submission = None;
         if self.vm.status().get() != 0 { return Err(EIO); }
         Ok(())
     }
@@ -1335,8 +1902,121 @@ impl G17PQueue {
     }
 }
 
+/// Publishes a synchronous submission's output fence exactly once, on every
+/// exit path.
+///
+/// Userspace waits on these syncobjs with no timeout, so an output syncobj left
+/// unsignalled does not degrade one frame -- it hangs the waiter forever. That
+/// is what turned a single failed render submission into a permanently wedged
+/// compositor: Zink's fence thread sat in `drm_syncobj_array_wait_timeout` and
+/// the session never rendered again. A submission that fails after its output
+/// syncobjs are known must therefore still publish a fence, carrying the error
+/// so the waiter learns the work will never complete.
+struct G17POutputFencePublication<'a> {
+    fence: &'a UserFence<G17PSubmissionFence>,
+    outputs: KVec<file::SyncItem>,
+    failure: Error,
+    succeeded: bool,
+}
+
+impl G17POutputFencePublication<'_> {
+    /// Mark the submission complete. Anything else publishes an error fence.
+    fn succeeded(&mut self) {
+        self.succeeded = true;
+    }
+
+    /// Preserve the actual submit error in the fence userspace will wait on.
+    fn failed(&mut self, error: Error) {
+        self.failure = error;
+    }
+
+    /// Hand the output syncobjs to an asynchronous completion fence.
+    ///
+    /// An asynchronously scheduled submission has *not* run when the ioctl
+    /// returns, so neither of this guard's own answers is correct for it:
+    /// signalling success would tell userspace the GPU had finished work it
+    /// has not started, and the ECANCELED failure fence would claim work that
+    /// is queued and will run was thrown away. Both read as "signalled" to a
+    /// DRM syncobj wait, so either one lets the client observe the destination
+    /// buffer before the job that fills it has executed.
+    ///
+    /// Install the job's real completion fence instead, and disarm the guard:
+    /// from here the async job owns the promise made to userspace.
+    fn publish_async(&mut self, fence: &Fence) {
+        G17PQueue::install_output_fences(self.outputs.drain(..), fence);
+        self.succeeded = true;
+    }
+}
+
+impl Drop for G17POutputFencePublication<'_> {
+    fn drop(&mut self) {
+        if !self.succeeded {
+            self.fence.set_error(self.failure);
+        }
+        let fence = Fence::from_fence(self.fence);
+        G17PQueue::install_output_fences(self.outputs.drain(..), &fence);
+        self.fence.signal();
+    }
+}
+
 impl queue::Queue for G17PQueue {
+    /// Every synchronous submission funnels through here so that no exit path
+    /// can leave the client's own outstanding work unaccounted for.
+    ///
+    /// `submit_guarded` already promises an output fence for THIS ioctl on
+    /// every path. What it cannot promise is anything about work this client
+    /// handed the hardware earlier: once a failure is terminal the client's
+    /// device is lost, Mesa tears its context down, and the jobs already in
+    /// flight will never complete or signal. Settle them here.
     fn submit(
+        &mut self,
+        submission_id: u64,
+        syncs: KVec<file::SyncItem>,
+        in_sync_count: usize,
+        cmdbuf_raw: &[u8],
+        objects: core::pin::Pin<&xarray::XArray<KBox<file::Object>>>,
+    ) -> Result {
+        self.submit_guarded(submission_id, syncs, in_sync_count, cmdbuf_raw, objects)
+    }
+}
+
+impl G17PQueue {
+    /// Settle a client whose submission failed terminally.
+    ///
+    /// Only failures that mean "this work will never run on this device" count.
+    /// Contention and rejection do not: an EBUSY from the render lease, an
+    /// interrupted wait, or a malformed command buffer all leave a perfectly
+    /// healthy VM, and recording a sticky error for one of those would retire a
+    /// client that merely lost a frame.
+    fn note_submission_failure(&mut self, submission_id: u64, error: Error) {
+        let lost = error == EIO
+            || error == ETIMEDOUT
+            || error == ENODEV
+            || self.vm.status().get() != 0;
+        if !lost {
+            return;
+        }
+        // Sticky first: a syncobj waiter woken by an error fence asks the VM
+        // status why, and must not find a clean one.
+        self.vm.status().record(error.to_errno());
+        let failed = self
+            .runtime
+            .mutex()
+            .lock()
+            .fail_outstanding_jobs_for_vm(self.vm.status(), error);
+        if failed != 0 {
+            dev_err!(
+                self.dev.as_ref(),
+                "G17P submit: submission {} lost the device ({:?}); failed {} outstanding job(s) on vm {}\n",
+                submission_id,
+                error,
+                failed,
+                self.vm.id(),
+            );
+        }
+    }
+
+    fn submit_guarded(
         &mut self,
         submission_id: u64,
         mut syncs: KVec<file::SyncItem>,
@@ -1344,18 +2024,100 @@ impl queue::Queue for G17PQueue {
         cmdbuf_raw: &[u8],
         objects: core::pin::Pin<&xarray::XArray<KBox<file::Object>>>,
     ) -> Result {
-        if self.vm.status().get() != 0 { return Err(EIO); }
-        pr_info!(
-            "G17P submit: ENTER submission {} syncs={} in_sync={} cmdbuf_bytes={}\n",
-            submission_id,
-            syncs.len(),
-            in_sync_count,
-            cmdbuf_raw.len()
-        );
+        // Taken before anything else so the reported ioctl cost is the whole
+        // ioctl, not just the part after validation.
+        let entered = Instant::<Monotonic>::now();
+        if crate::util::g17p_verbose() {
+            pr_info!(
+                "G17P submit: ENTER submission {} syncs={} in_sync={} cmdbuf_bytes={}\n",
+                submission_id,
+                syncs.len(),
+                in_sync_count,
+                cmdbuf_raw.len()
+            );
+        }
         Self::log_cmdbuf_headers(submission_id, cmdbuf_raw);
         if in_sync_count > syncs.len() {
             return Err(Self::stage_fail(submission_id, "sync-count", EINVAL));
         }
+        // Split the output syncobjs off immediately and hand them to a
+        // publication guard, so every failure from here on still publishes a
+        // fence. Arming this only after the queue lease was acquired left the
+        // whole class of "another client owns the render slot" failures
+        // publishing nothing, and a compositor that hit one waited on an
+        // unsignalled syncobj forever instead of losing a frame.
+        let early_output_fence: UserFence<G17PSubmissionFence> = self
+            .fence_contexts
+            .new_fence(0, G17PSubmissionFence)
+            .map_err(|error| Self::stage_fail(submission_id, "new-fence", error))?
+            .into();
+        let output_count = syncs.len() - in_sync_count;
+        let deferred_outputs: KVec<file::SyncItem> =
+            match KVec::with_capacity(output_count, GFP_KERNEL) {
+                Ok(outputs) => outputs,
+                Err(_) => {
+                    // Output syncobjs are already resolved and userspace may
+                    // wait on them even when this bookkeeping allocation
+                    // fails. Publish the fence directly from the original
+                    // vector before returning the allocation error.
+                    early_output_fence.set_error(ENOMEM);
+                    let fence = Fence::from_fence(&early_output_fence);
+                    Self::install_output_fences(syncs.drain(in_sync_count..), &fence);
+                    early_output_fence.signal();
+                    return Err(Self::stage_fail(
+                        submission_id, "output-sync-list", ENOMEM,
+                    ));
+                }
+            };
+        let mut publication = G17POutputFencePublication {
+            fence: &early_output_fence,
+            outputs: deferred_outputs,
+            failure: ECANCELED,
+            succeeded: false,
+        };
+        while syncs.len() > in_sync_count {
+            // Removing the first output keeps timeline points in userspace
+            // order and, unlike a Drain iterator, leaves every later output
+            // reachable if the supposedly infallible capacity invariant is
+            // ever violated.
+            let item = match syncs.remove(in_sync_count) {
+                Ok(item) => item,
+                Err(_) => {
+                    let failure = Self::stage_fail(submission_id, "output-sync-index", EIO);
+                    publication.failed(failure);
+                    let fence = Fence::from_fence(&early_output_fence);
+                    Self::install_output_fences(syncs.drain(in_sync_count..), &fence);
+                    self.note_submission_failure(submission_id, failure);
+                    return Err(failure);
+                }
+            };
+            if let Err(error) = publication.outputs.push_within_capacity(item) {
+                let failure = Self::stage_fail(submission_id, "output-sync-capacity", EIO);
+                publication.failed(failure);
+                let fence = Fence::from_fence(&early_output_fence);
+                Self::install_output_fences(core::iter::once(error.0), &fence);
+                Self::install_output_fences(syncs.drain(in_sync_count..), &fence);
+                self.note_submission_failure(submission_id, failure);
+                return Err(failure);
+            }
+        }
+        // Keep the publication guard alive until the exact result is known.
+        // Terminal VM state and outstanding jobs must be settled before an
+        // error fence wakes userspace; wrapping the body also makes every `?`
+        // and explicit return obey that ordering without duplicating cleanup.
+        let result = (|| -> Result {
+        // A VM that has already faulted rejects every later submission. That
+        // check used to run before any of the above, so a client whose VM died
+        // got EIO with no fence published at all and then waited forever on the
+        // syncobj it had just handed us. Keep the rejection, but make it
+        // publish like every other failure.
+        if self.vm.status().get() != 0 {
+            return Err(Self::stage_fail(submission_id, "vm-status", EIO));
+        }
+        // Pin every userspace mapping before translating raw GPU addresses.
+        // GEM-handle close and VM teardown defer their unmaps behind this
+        // guard; a successfully published render/compute packet inherits it.
+        let vm_job = self.vm.retain_t8140_job()?;
         let address_space = UserAddressSpace {
             vm: &self.vm,
             range: self.user_range.clone(),
@@ -1473,31 +2235,42 @@ impl queue::Queue for G17PQueue {
         let pending = pending.ok_or_else(|| {
             Self::stage_fail(submission_id, "no-hardware-command", EINVAL)
         })?;
-        pr_info!(
-            "G17P submit: submission {} translated as {}\n",
-            submission_id,
-            match pending {
-                G17PPendingCommand::Render(_) => "render",
-                G17PPendingCommand::Compute(_) => "compute",
-            }
-        );
-
-        if let G17PPendingCommand::Compute(translated) = pending {
-            return self.submit_compute_async(submission_id, translated, syncs, in_sync_count, objects);
+        if crate::util::g17p_verbose() {
+            pr_info!(
+                "G17P submit: submission {} translated as {}\n",
+                submission_id,
+                match pending {
+                    G17PPendingCommand::Render(_) => "render",
+                    G17PPendingCommand::Compute(_) => "compute",
+                }
+            );
         }
 
-        self.join_async_compute_timeline(submission_id)?;
+        if let G17PPendingCommand::Compute(translated) = pending {
+            return self.submit_compute_async(
+                submission_id,
+                translated,
+                syncs,
+                in_sync_count,
+                objects,
+                &mut publication,
+                vm_job,
+                entered,
+            );
+        }
+
+        // Direct render publication cannot be placed behind a scheduler
+        // dependency, so join this queue's preceding render or compute fence
+        // before taking a physical render slot. Other logical queues remain
+        // independent and retain full render/render and render/compute overlap.
+        self.join_queue_timeline(submission_id)?;
+        let mut sample = g17_perf::RenderSample::default();
 
         // Dependencies must become ready before reserving the physical
         // queues: their signalling submission may belong to another client.
         // The lease then spans timestamp publication, execution/doorbell waits
         // and output-fence installation, including runtime-mutex release.
         let lease = self.acquire_ready_lease(submission_id, &syncs[..in_sync_count])?;
-        let output_fence: UserFence<G17PSubmissionFence> = self
-            .fence_contexts
-            .new_fence(0, G17PSubmissionFence)
-            .map_err(|error| Self::stage_fail(submission_id, "new-fence", error))?
-            .into();
         match pending {
             G17PPendingCommand::Render(translated) => {
                 let mut timestamp_aliases = KVec::new();
@@ -1531,34 +2304,80 @@ impl queue::Queue for G17PQueue {
                     )
                     .map_err(|error| Self::stage_fail(submission_id, "ts-frag-end", error))?,
                 ];
-                pr_info!(
-                    "G17P submit: submission {} render timestamps resolved, entering manager publish\n",
-                    submission_id
-                );
-                self.runtime
+                if crate::util::g17p_verbose() {
+                    pr_info!(
+                        "G17P submit: submission {} render timestamps resolved, entering manager publish\n",
+                        submission_id
+                    );
+                }
+                let render_slot = lease.slot();
+                let hardware_fence: UserFence<G17PSubmissionFence> = self
+                    .fence_contexts
+                    .new_fence(0, G17PSubmissionFence)
+                    .map_err(|error| Self::stage_fail(submission_id, "new-render-fence", error))?
+                    .into();
+                let completion = G17PRenderCompletion::new(
+                    hardware_fence,
+                    self.vm.status().clone(),
+                    lease,
+                    vm_job,
+                )?;
+                let publish_started = Instant::<Monotonic>::now();
+                let submit = self.runtime
                     .mutex()
                     .lock()
                     .submit_translated_render(
                         &self.vm,
-                        lease.slot(),
+                        render_slot,
                         true,
-                        self.async_backend
-                            .as_ref()
-                            .ok_or(EIO)?
-                            .context
-                            .clone(),
+                        self.context.clone(),
                         &translated,
                         timestamps,
                         timestamp_aliases,
-                    )
-                    .map_err(|error| {
-                        Self::stage_fail(submission_id, "submit-translated-render", error)
-                    })?;
-                self.runtime
-                    .wait_render_slot(lease.slot())
-                    .map_err(|error| {
-                        Self::stage_fail(submission_id, "wait-render-slot", error)
-                    })?;
+                        completion.clone(),
+                    );
+                sample.publish_ns = publish_started.elapsed().as_nanos().max(0) as u64;
+                if let Err(error) = submit {
+                    self.runtime.mutex().lock().timeout_deferred_render(
+                        render_slot, submission_id, error,
+                    );
+                    return Err(Self::stage_fail(
+                        submission_id, "submit-translated-render", error,
+                    ));
+                }
+                let packet = match g17_job::G17PRenderWatchPacket::new(
+                    submission_id, render_slot, completion,
+                ) {
+                    Ok(packet) => packet,
+                    Err(error) => {
+                        self.runtime.mutex().lock().timeout_deferred_render(
+                            render_slot, submission_id, error,
+                        );
+                        return Err(Self::stage_fail(
+                            submission_id, "allocate-render-watch", error,
+                        ));
+                    }
+                };
+                let finished = match self.render_scheduler.as_mut().ok_or(ENODEV)?.enqueue(packet) {
+                    Ok(fence) => fence,
+                    Err(error) => {
+                        self.runtime.mutex().lock().timeout_deferred_render(
+                            render_slot, submission_id, error,
+                        );
+                        return Err(Self::stage_fail(
+                            submission_id, "schedule-render-watch", error,
+                        ));
+                    }
+                };
+                // Record queue order before exposing the fence through an
+                // output syncobj. A woken peer may submit immediately.
+                self.last_submission = Some(finished.clone());
+                publication.publish_async(&finished);
+                sample.ioctl_ns = entered.elapsed().as_nanos().max(0) as u64;
+                if let Some(report) = self.registry.record_render(sample) {
+                    self.report_perf(report);
+                }
+                return Ok(());
             }
             G17PPendingCommand::Compute(translated) => {
                 let start = Self::timestamp_destination(objects, translated.timestamps.start)
@@ -1680,11 +2499,10 @@ impl queue::Queue for G17PQueue {
             }
         }
 
-        pr_info!("G17P submit: OK submission {}\n", submission_id);
-        output_fence.signal();
-        let fence = Fence::from_fence(&output_fence);
-        let outputs = syncs.drain(in_sync_count..);
-        Self::install_output_fences(outputs, &fence);
+        if crate::util::g17p_verbose() {
+            pr_info!("G17P submit: OK submission {}\n", submission_id);
+        }
+        publication.succeeded();
         dev_dbg!(
             self.dev.as_ref(),
             "G17P queue {} completed synchronous submission {} (one hardware command)\n",
@@ -1692,5 +2510,11 @@ impl queue::Queue for G17PQueue {
             submission_id
         );
         Ok(())
+        })();
+        if let Err(error) = result {
+            self.note_submission_failure(submission_id, error);
+            publication.failed(error);
+        }
+        result
     }
 }

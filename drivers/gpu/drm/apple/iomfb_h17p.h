@@ -13,8 +13,6 @@
 
 static_assert(sizeof(struct dcp_swap_h17p) == 0x58a);
 static_assert(sizeof(struct dcp_surface_h17p) == 0x22c);
-/* 0xe9c is the request size H17P actually receives; see the trace
- * cross-check in the DCP RE package. */
 static_assert(sizeof(struct dcp_swap_submit_req_h17p) == 0xe9c);
 static_assert(sizeof(struct dcp_swap_submit_resp_h17p) == 0x0c);
 

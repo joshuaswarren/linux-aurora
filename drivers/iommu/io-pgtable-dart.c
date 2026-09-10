@@ -326,7 +326,7 @@ static size_t dart_unmap_pages(struct io_pgtable_ops *ops, unsigned long iova,
 			break;
 
 		/* clear pte */
-		*ptep = 0;
+		WRITE_ONCE(*ptep, 0);
 
 		if (!iommu_iotlb_gather_queued(gather))
 			io_pgtable_tlb_add_page(&data->iop, gather,
@@ -335,6 +335,14 @@ static size_t dart_unmap_pages(struct io_pgtable_ops *ops, unsigned long iova,
 		ptep++;
 		i++;
 	}
+
+	/*
+	 * Mirror the wmb() dart_map_pages() ends with.  Clearing a leaf with a
+	 * plain store and then handing the iova to the TLB-flush path left no
+	 * ordering between the invalidated PTE and the flush that is supposed
+	 * to publish it.
+	 */
+	wmb();
 
 	return i * pgsize;
 }

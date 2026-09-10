@@ -1695,6 +1695,11 @@ pub(crate) fn apply_g17p_cold_opening_event(
 
 /// Refresh the canonical optional record for a later logical submission.
 /// The queue-context record itself remains in locator slot zero.
+///
+/// Publishes the per-slot ordinal as the FList generation at `+0x3e`, which
+/// is the same number as the device-global FList sequence for as long as one
+/// client renders. `apply_g17p_retained_optional_with_flist_generation` takes
+/// the device-global value explicitly.
 pub(crate) fn apply_g17p_retained_optional(
     stage: G17PColdOpeningStage,
     addresses: G17PColdOpeningOptionalAddresses,
@@ -1705,6 +1710,80 @@ pub(crate) fn apply_g17p_retained_optional(
     qos_hardware_buffer_id: u16,
     install: u16,
     context_id: u16,
+    out: &mut [u8],
+) -> Result<(), SubmissionError> {
+    apply_g17p_retained_optional_with_flist_generation(
+        stage,
+        addresses,
+        submission_ordinal,
+        g17p_render_flist_generation(submission_ordinal),
+        bias_generation,
+        queue_id,
+        partner_queue_id,
+        qos_hardware_buffer_id,
+        install,
+        context_id,
+        out,
+    )
+}
+
+/// `apply_g17p_retained_optional` with the USC FList generation supplied by
+/// the caller.
+///
+/// The FList is one device-global pool, so its generation advances with every
+/// render on the device, while `submission_ordinal` counts only this slot's
+/// renders. With one client the two coincide; the moment a second slot
+/// publishes, its first tag-15 would otherwise announce generation 0 against a
+/// pool the firmware last saw at N.
+pub(crate) fn apply_g17p_retained_optional_with_flist_generation(
+    stage: G17PColdOpeningStage,
+    addresses: G17PColdOpeningOptionalAddresses,
+    submission_ordinal: u32,
+    flist_generation: u64,
+    bias_generation: bool,
+    queue_id: u16,
+    partner_queue_id: u16,
+    qos_hardware_buffer_id: u16,
+    install: u16,
+    context_id: u16,
+    out: &mut [u8],
+) -> Result<(), SubmissionError> {
+    apply_g17p_retained_optional_with_flist_generation_and_context_update(
+        stage,
+        addresses,
+        submission_ordinal,
+        flist_generation,
+        bias_generation,
+        queue_id,
+        partner_queue_id,
+        qos_hardware_buffer_id,
+        install,
+        context_id,
+        submission_ordinal == 0,
+        out,
+    )
+}
+
+/// Retained ConfigUpdate with the GART-context branch supplied independently
+/// from queue installation and QoS setup.
+///
+/// Native derives +0x62 from the descriptor's GART allocation generation
+/// versus the channel's cached context. A graph rebuilt for another VM must
+/// therefore request the context update even when its physical QID is already
+/// installed and its global submission ordinal is nonzero. Conversely, a
+/// same-context restage must leave it clear.
+pub(crate) fn apply_g17p_retained_optional_with_flist_generation_and_context_update(
+    stage: G17PColdOpeningStage,
+    addresses: G17PColdOpeningOptionalAddresses,
+    submission_ordinal: u32,
+    flist_generation: u64,
+    bias_generation: bool,
+    queue_id: u16,
+    partner_queue_id: u16,
+    qos_hardware_buffer_id: u16,
+    install: u16,
+    context_id: u16,
+    context_update: bool,
     out: &mut [u8],
 ) -> Result<(), SubmissionError> {
     // The announced event stamp is ordinal + 1 on this serialized path and
@@ -1724,10 +1803,11 @@ pub(crate) fn apply_g17p_retained_optional(
         out,
     )?;
     if submission_ordinal != 0 {
-        for offset in [0x1a, 0x52, 0x62] {
+        for offset in [0x1a, 0x52] {
             put_u16_le(out, offset, 0);
         }
     }
+    put_u16_le(out, 0x62, u16::from(context_update));
     // +0x2a is read by the firmware as a whole u64 (`ldur x27, [x19, #42]` in
     // the tag-15 ConfigUpdate handler) and stored into its per-queue table at
     // `0xfffffc0000125df0 + qid * 8`. Every consumer of that table uses
@@ -1766,7 +1846,7 @@ pub(crate) fn apply_g17p_retained_optional(
     // allocation before fragment engine service.
     // The kext uses a qword store at 8a98c48; +0x46 begins the independent
     // hardware-buffer ID and must remain untouched by this generation.
-    put_u64_le(out, 0x3e, g17p_render_flist_generation(submission_ordinal));
+    put_u64_le(out, 0x3e, flist_generation);
     // Keep the pair-owned HardwareBufferID identical in ConfigUpdate, the
     // QID-indexed QoS row, and the KSM dependency-control qword.
     put_u16_le(out, 0x56, qos_hardware_buffer_id);
@@ -3592,6 +3672,30 @@ pub(crate) fn apply_g17p_cl_b2_primary_state(
         return Err(SubmissionError::KickB2PrimaryStateBufferTooSmall);
     }
 
+    let activation = apply_g17p_cl_b2_computed_state(
+        activation,
+        computed,
+        channel_control_gpu_va,
+    )?;
+    apply_g17p_cl_b2_descriptor_tables(region_1, region_2)?;
+    Ok(activation)
+}
+
+/// Apply the queue-local half of B2 activation. The channel-control pointer
+/// changes with the compute work queue; the PBDesc and UMA tables do not.
+pub(crate) fn apply_g17p_cl_b2_computed_state(
+    activation: G17PClB2ActivationState,
+    computed: &mut [u8],
+    channel_control_gpu_va: u64,
+) -> Result<G17PClB2ActivationState, SubmissionError> {
+    if activation == G17PClB2ActivationState::Published {
+        return Err(SubmissionError::KickB2PrimaryStateAlreadyPublished);
+    }
+    let layout = G17P_CL_B2_PRIMARY_STATE_LAYOUT;
+    if computed.len() < layout.object_size {
+        return Err(SubmissionError::KickB2PrimaryStateBufferTooSmall);
+    }
+
     computed[0x000] = 0xff;
     computed[0x008] = 0xff;
     computed[0x010..0x012].copy_from_slice(&0x0f01u16.to_le_bytes());
@@ -3606,6 +3710,24 @@ pub(crate) fn apply_g17p_cl_b2_primary_state(
     put_u64_le(computed, 0xe20, 4);
     put_u64_le(computed, 0xe28, 4);
 
+    Ok(G17PClB2ActivationState::Published)
+}
+
+/// Apply the device-global descriptor-table half of B2 initialization.
+///
+/// Native performs this before client halLoadPBDesc/halLoadUMADesc updates.
+/// Reapplying these captured cold entries for every later compute queue would
+/// overwrite whichever live render owner currently holds PBDesc index 1 and
+/// UMA index 0.
+pub(crate) fn apply_g17p_cl_b2_descriptor_tables(
+    region_1: &mut [u8],
+    region_2: &mut [u8],
+) -> Result<(), SubmissionError> {
+    let layout = G17P_CL_B2_PRIMARY_STATE_LAYOUT;
+    if region_1.len() < layout.object_size || region_2.len() < layout.object_size {
+        return Err(SubmissionError::KickB2PrimaryStateBufferTooSmall);
+    }
+
     put_u64_le(region_1, 0x10, 0x0000_0080_0007_7000);
     put_u32_le(region_1, 0x18, 0x17);
     put_u32_le(region_1, 0x1c, 0x17);
@@ -3613,7 +3735,7 @@ pub(crate) fn apply_g17p_cl_b2_primary_state(
     put_u64_le(region_2, 0x00, 0x0800_0000_e000_0000);
     put_u64_le(region_2, 0x08, 0x0000_3d40_0000_3400);
     put_u64_le(region_2, 0x10, 0x0000_0000_0000_1d00);
-    Ok(G17PClB2ActivationState::Published)
+    Ok(())
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -5960,6 +6082,46 @@ mod tests {
     }
 
     #[test]
+    fn g17p_secondary_render_pair_matches_native_configure_words() {
+        let geometry = T8140_G17P_HAL200_SKSM_QUEUE_GEOMETRY;
+        let scratch = g17_manager::T8140_G17P_PLATFORM_CONFIG.sksm_scratch;
+        for (queue_id, data_master, entry, tag, payload, mask) in [
+            (
+                2,
+                G17P_TA_DATA_MASTER,
+                0x70_01f4_8000,
+                0x0000_1400_0002_1008,
+                0x1280_0070_01f4_8000,
+                0x4,
+            ),
+            (
+                3,
+                G17P_3D_DATA_MASTER,
+                0x70_01f7_0000,
+                0x0000_1c00_0002_1008,
+                0x2280_0070_01f7_0000,
+                0x8,
+            ),
+        ] {
+            let config = prepare_g17p_render_sksm_queue_config(
+                G17PComputeQueueRouting {
+                    queue_id,
+                    completion_selector: 0,
+                    entry_gpu_va: entry,
+                    geometry,
+                },
+                data_master,
+                scratch,
+            )
+            .unwrap();
+            assert_eq!(config.tag, tag);
+            assert_eq!(config.payload, payload);
+            assert_eq!(config.enable_pair.word0, 0);
+            assert_eq!(config.enable_pair.word1, mask);
+        }
+    }
+
+    #[test]
     fn g17p_render_config_update_carries_context_hardware_buffer_id_and_pid() {
         let addresses = G17PColdOpeningOptionalAddresses {
             context_scratch: 0x70_0200_0000,
@@ -6079,6 +6241,35 @@ mod tests {
         assert_eq!(pair.tiling.next_producer, 2);
         assert_eq!(get_u32_le(&pair.fragment.slot, 0x14), 0x0001_0003);
         assert_eq!(get_u32_le(&pair.tiling.slot, 0x14), 0x0000_0003);
+    }
+
+    #[test]
+    fn g17p_context_update_is_fresh_graph_state_not_global_ordinal_state() {
+        let addresses = G17PColdOpeningOptionalAddresses {
+            context_scratch: 0x70_0200_0000,
+            firmware_scratch: 0x70_0200_4000,
+            usc_priv_mem_flist: 0x70_0200_8000,
+            usc_freelist_hardware_buffer_id: 0,
+            channel_control: 0x70_0200_c000,
+            tiling_shared_object: 0x70_0201_0000,
+            parameter_buffer_token: 0,
+            owner_pid: 0x15,
+            ta_hardware_buffer_id: 0,
+        };
+        for stage in [G17PColdOpeningStage::Tiling, G17PColdOpeningStage::Fragment] {
+            for (ordinal, context_update) in [(0, true), (195, true), (196, false)] {
+                let mut optional = [0u8; G17P_COLD_OPENING_OPTIONAL_SIZE];
+                apply_g17p_retained_optional_with_flist_generation_and_context_update(
+                    stage, addresses, ordinal, 2022, false, 2, 3, 2, 0, 6,
+                    context_update, &mut optional,
+                )
+                .unwrap();
+                assert_eq!(get_u16_le(&optional, 0x1a), 0);
+                assert_eq!(get_u16_le(&optional, 0x52), if ordinal == 0 { 1 } else { 0 });
+                assert_eq!(get_u16_le(&optional, 0x62), u16::from(context_update));
+                assert_eq!(get_u16_le(&optional, 0x32), 6);
+            }
+        }
     }
 
     #[test]
