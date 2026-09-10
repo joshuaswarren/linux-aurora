@@ -11,7 +11,7 @@ from m1n1.agx.g17p_trace import G17PUATReader
 class M5GPUCapture:
     VERSION = 0x0c8aa322039e04c0
     PAGE_SIZE = 0x4000
-    MAX_CAPTURE = 0x100000
+    MAX_CAPTURE = 0x400000
 
     def __init__(self, read_phys, dram, global_root):
         self.read_phys = read_phys
@@ -50,7 +50,7 @@ class M5GPUCapture:
             raise ValueError('Expected an M5 initialization doorbell')
         output = Path(output)
         output.mkdir(mode=0o700, parents=True, exist_ok=False)
-        objects, total = [], 0
+        objects, unmapped_views, total = [], [], 0
 
         def save(label, pointer, size):
             nonlocal total
@@ -110,6 +110,32 @@ class M5GPUCapture:
                 raise ValueError('M5 primary status object extent changed')
             save('status-b', status_b, 0xeb00)
             save('status-config', status_b + 0xe440, 0x6a8)
+            # Bounded mapped-DRAM observations of the external ownership
+            # graph. These are capture views, not inferred allocation sizes.
+            # Every leaf still goes through _read_dram and is read twice.
+            state_grid = word(main, 0x20) - 0xc0
+            if status_b != state_grid + 0x340:
+                raise ValueError('M5 primary channel/status relationship changed')
+            save('private-cluster-view', state_grid, 0x178000)
+            for label, offset in (('sentinel-page', 0x2d0),
+                                  ('pb-descriptor-page', 0x2e0),
+                                  ('uma-descriptor-page', 0x2f0)):
+                # Native can publish these future descriptor addresses
+                # before creating their mappings. Preserve that distinction
+                # instead of substituting zero pages or aborting the graph.
+                pointer = word(main, offset)
+                try:
+                    self.walker.translate(0, pointer)
+                except RuntimeError as error:
+                    unmapped_views.append(dict(label=label, pointer=hex(pointer),
+                                               reason=str(error)))
+                else:
+                    save(label, pointer, 0x4000)
+            status = (output / 'status-b.bin').read_bytes()
+            fwctl = word(status, 0x48e0)
+            if word(status, 0x48e8) != fwctl + 0x40:
+                raise ValueError('M5 firmware control state/ring relationship changed')
+            save('fwctl-page', fwctl, 0x4000)
         else:
             for i, offset in enumerate((0xb8, 0xc0)):
                 if word(root, offset):
@@ -120,6 +146,7 @@ class M5GPUCapture:
         manifest = dict(format='aurora-m5-gpu-init-v1', role=role, phase=phase,
                         version=hex(self.VERSION), uat_virtual_address_bits=43,
                         firmware_pointer_masked_to_40_bits=False, total_bytes=total,
-                        objects=objects, linux_runtime_admitted=False)
+                        objects=objects, unmapped_views=unmapped_views,
+                        linux_runtime_admitted=False)
         (output / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
         return manifest

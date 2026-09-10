@@ -3631,6 +3631,13 @@ impl Uat {
         &self.kernel_lower_vm
     }
 
+    /// A memory-layout consumer must not confuse identical root geometry
+    /// with target admission. This checks identity only; it does not create
+    /// an M5 UAT or authorize an absent firmware handoff protocol.
+    pub(crate) fn is_t8142_geometry(&self) -> bool {
+        self.cfg.chip_id == 0x8142 && self.cfg.ias == 42 && self.cfg.oas == 42
+    }
+
     pub(crate) fn t8140_render_global_vm(&self) -> Result<&Vm> {
         if self.cfg != UatConfig::T8140 {
             return Err(EINVAL);

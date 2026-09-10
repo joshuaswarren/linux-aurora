@@ -46,6 +46,10 @@ use core::{
 
 use g17_initdata::{InstanceAddresses, InstanceRole, SharedAddresses};
 
+#[cfg(not(test))]
+#[path = "m5_resources.rs"]
+pub(crate) mod m5;
+
 /// Linux counterpart of IOGPUFamily's `___globalObjectIDCounter`.
 ///
 /// The native render path uses this one counter for userspace GID-group

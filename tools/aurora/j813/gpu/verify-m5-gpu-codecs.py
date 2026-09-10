@@ -10,6 +10,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import re
 import struct
 import subprocess
 import tempfile
@@ -76,9 +77,12 @@ def main():
     parser.add_argument('preinit', type=Path)
     parser.add_argument('kext', type=Path)
     parser.add_argument('--linux', type=Path, required=True)
+    parser.add_argument('--owner-snapshot', type=Path,
+                        help='Runtime owner/PTE manifest from snapshot-m5-gpu-owners.py')
     args = parser.parse_args()
     driver = (args.linux / 'drivers/gpu/drm/asahi').resolve()
     captures = []
+    ram_attributes_checked = 0
     for role in ('gfx-asc', 'gfx1-asc'):
         directory = args.preinit / role
         manifest = json.loads((directory / 'manifest.json').read_text())
@@ -88,6 +92,18 @@ def main():
             data = (directory / entry['file']).read_bytes()
             if len(data) != entry['size'] or hashlib.sha256(data).hexdigest() != entry['sha256']:
                 raise ValueError('Capture integrity check failed')
+            # These firmware views deliberately differ from their GPU-low
+            # aliases. Preserve native cacheability and read/write access.
+            label = entry['label']
+            if label in ('root', 'region-a', 'region-c'):
+                expected_attrs = 0x8000000000044b  # Firmware RO, uncached.
+            elif label in ('main-config', 'shared-cluster', 'aon-ptd') or label.startswith('completion-'):
+                expected_attrs = 0xc0000000000443  # Firmware RW, cached.
+            else:
+                expected_attrs = 0xc000000000044b  # Firmware RW, uncached.
+            if entry['walk'][-1][1] & ~(((1 << 42) - 1) & ~0x3fff) != expected_attrs:
+                raise ValueError('M5 RAM PTE attributes changed: ' + label)
+            ram_attributes_checked += 1
         captures.append(directory.resolve())
 
     # This body has no calls, branches, PAC operations or PC-relative operands.
@@ -110,6 +126,45 @@ def main():
                  'G17_UNCACHED_CHANNEL_RESET_LAYOUT'):
         start = source.index('pub(crate) const ' + name + ':')
         items.append(source[start:source.index(';', start) + 1])
+    mapping_checks = ''
+    mapping_count = 0
+    alias_count = 0
+    if args.owner_snapshot:
+        mapping_manifest = json.loads(args.owner_snapshot.read_text())
+        if mapping_manifest['device_memory_read'] is not False:
+            raise ValueError('Expected page-table-only I/O evidence')
+        rows = [r for r in mapping_manifest['records'] if r['label'] == 'register-page']
+        if len(rows) != 80 or len({r['slot'] for r in rows}) != 22:
+            raise ValueError('Expected all 58 M5 I/O pages and 22 following guards')
+        for row in rows:
+            va = int(row['pointer'], 16)
+            mapping_checks += ('{ let w = M5_25G76_REGISTER_WINDOWS.iter().find(|w| w.slot == '
+                               + str(row['slot']) + ').unwrap();\n'
+                               'let (physical, base, span) = w.mapped_pages().unwrap();\n')
+            if row['following_guard']:
+                if 'unmapped' not in row or 'physical' in row:
+                    raise ValueError('Native M5 I/O following guard is mapped')
+                mapping_checks += f'let _ = physical; assert_eq!(base + span, {va:#x}); }}\n'
+            else:
+                pa = int(row['physical'], 16)
+                pte = row['walk'][-1][1]
+                attrs = pte & ~(((1 << 42) - 1) & ~0x3fff)
+                mapping_checks += (f'assert!(({va:#x}) >= base && ({va:#x}) < base + span);\n'
+                                   f'assert_eq!(physical + ({va:#x} - base), {pa:#x});\n'
+                                   f'assert_eq!(if w.flag == 2 {{ 0xc0000000000447u64 }} '
+                                   f'else {{ 0x80000000000447u64 }}, {attrs:#x}); }}\n')
+        mapping_count = len(rows)
+        aliases = [r for r in mapping_manifest['records'] if r['label'] == 'alias-page']
+        if aliases:
+            if len(aliases) != 34 or len({r['owner'] for r in aliases}) != 6:
+                raise ValueError('Expected all pages of the six M5 low/high alias pairs')
+            for row in aliases:
+                if row.get('physical') is None or row['physical'] != row['high_physical']:
+                    raise ValueError('M5 low/high aliases do not share the same backing')
+                attrs = row['walk'][-1][1] & ~(((1 << 42) - 1) & ~0x3fff)
+                if attrs != 0xc0000000000c8b:
+                    raise ValueError('M5 GPU-low alias cacheability/access changed')
+            alias_count = len(aliases)
     harness = '''
 #![allow(dead_code, non_upper_case_globals)]
 mod module_parameters {
@@ -125,6 +180,7 @@ fn word(b: &[u8], at: usize) -> u64 { u64::from_le_bytes(b[at..at+8].try_into().
 fn main() {
     use initdata::*;
     use submission::*;
+    MAPPING_CHECKS
     let args: Vec<String> = std::env::args().collect();
     for (index, directory) in args[1..3].iter().enumerate() {
         let p = std::path::Path::new(directory);
@@ -184,9 +240,28 @@ fn main() {
             let secondary_extra = std::fs::read(std::path::Path::new(&args[2])
                 .join("secondary-extra-0.bin")).unwrap();
             assert_eq!(&status[0xe440..0xe4c0], &secondary_extra);
+            if p.join("private-cluster-view.bin").exists() {
+                let mut native = std::fs::read(p.join("private-cluster-view.bin")).unwrap();
+                native[0x340 + 0xeab0..0x340 + 0xeac4].fill(0);
+                // GFX1 root+a8 -> global16f4e0 (text211bc). Its own
+                // initialization writes statusA+10/+14 at23588/23604,
+                // before a later primary capture. These eight bytes are
+                // firmware state; both start zero in the pre-GFX1 record.
+                native[0xc3110..0xc3118].fill(0);
+                let mut private = vec![0xa5; M5_25G76_PRIVATE_CLUSTER_SIZE];
+                encode_m5_25g76_private_cluster(word(&status, PRIMARY_STATUS_B_FWCTL_STATE),
+                    &mut private).unwrap();
+                assert!(private == native, "M5 private arena differs at {:?}",
+                    private.iter().zip(&native).position(|(a, b)| a != b));
+                let before = private.clone();
+                assert_eq!(encode_m5_25g76_private_cluster(u64::MAX - 8, &mut private),
+                    Err(InitdataError::AddressOutOfRange));
+                assert_eq!(private, before);
+            }
         }
         for name in ["region-a.bin", "qos.bin", "completion-0.bin", "completion-1.bin",
-                     "completion-2.bin", "completion-3.bin"] {
+                     "completion-2.bin", "completion-3.bin", "pb-descriptor-page.bin",
+                     "uma-descriptor-page.bin", "fwctl-page.bin"] {
             let zeroed = p.join(name);
             // Earlier captures did not include the completion/QoS backing.
             if zeroed.exists() {
@@ -246,6 +321,39 @@ fn main() {
         encode_main_config_for_profile(RootProfile::J813G17G25G76, role, &shared,
             &instance, &channels, if index == 0 {Some(&views)} else {None}, &mut rebuilt_main).unwrap();
         assert_eq!(rebuilt_main, main, "M5 main configuration differs from pre-handoff capture");
+        let grid = if index == 0 { channels[0].states[0] - 0xc0 }
+                   else { channels[12].states[0] - 0x300 };
+        assert_eq!(derive_channel_table(role, grid, instance.status_a,
+                   instance.main_config, shared.hw_data_bundle), channels,
+                   "M5 channel addresses differ from the allocation relationships");
+        // Rebuild both roles into a fresh shared allocation. This also checks
+        // the unmodeled gaps and the twelve initially empty work rings.
+        let mut cluster = vec![0; NATIVE_SHARED_CLUSTER_SIZE];
+        encode_m5_25g76_hw_data(aliases, word(&hardware, 0x26ac),
+            &mut cluster[..M5_25G76_HW_DATA_SIZE]).unwrap();
+        encode_m5_25g76_bundle_policy(bindings, &mut cluster).unwrap();
+        for (peer_index, peer_directory) in args[1..3].iter().enumerate() {
+            let peer_path = std::path::Path::new(peer_directory);
+            let peer_root = std::fs::read(peer_path.join("root.bin")).unwrap();
+            let peer_main = std::fs::read(peer_path.join("main-config.bin")).unwrap();
+            let peer_role = if peer_index == 0 { InstanceRole::Primary } else { InstanceRole::Secondary };
+            let peer = InstanceAddresses { root: instance.root - index as u64 * 0x8000 + peer_index as u64 * 0x8000,
+                main_config: word(&peer_root, 0x18), status_a: word(&peer_root, 0xa8),
+                status_b: word(&peer_root, 0xb0), secondary_extras: if peer_index == 0 { [0, 0] }
+                    else { [word(&peer_root, 0xb8), word(&peer_root, 0xc0)] } };
+            let peer_grid = if peer_index == 0 { word(&peer_main, 0x20) - 0xc0 }
+                            else { word(&peer_main, 0x1a0) - 0x300 };
+            let peer_channels = derive_channel_table(peer_role, peer_grid, peer.status_a,
+                peer.main_config, shared.hw_data_bundle);
+            let peer_views = PrimaryRegionViews { sentinel_high: word(&peer_main, 0x2d0),
+                alias_high: [word(&peer_main, 0x2e0), word(&peer_main, 0x2f0)] };
+            let offset = (peer.main_config - shared.hw_data_bundle) as usize;
+            encode_main_config_for_profile(RootProfile::J813G17G25G76, peer_role, &shared,
+                &peer, &peer_channels, if peer_index == 0 { Some(&peer_views) } else { None },
+                &mut cluster[offset..offset + MAIN_CONFIG_SIZE]).unwrap();
+        }
+        assert!(cluster == hardware, "M5 complete shared allocation differs at {:?}",
+            cluster.iter().zip(&hardware).position(|(a, b)| a != b));
         let mut encoded = vec![0; raw.len()];
         encode_root_for_profile(RootProfile::J813G17G25G76, role, &shared, &instance, &mut encoded).unwrap();
         assert_eq!(encoded, raw, "M5 root differs from the actual pre-handoff capture");
@@ -268,12 +376,19 @@ fn main() {
         println!();
     }
 }
-'''.replace('INITDATA_PATH', json.dumps(str(driver / 'g17_initdata.rs'))).replace('SUBMISSION_ITEMS', '\n'.join(items))
+'''.replace('INITDATA_PATH', json.dumps(str(driver / 'g17_initdata.rs'))).replace('SUBMISSION_ITEMS', '\n'.join(items)).replace('MAPPING_CHECKS', mapping_checks)
     with tempfile.TemporaryDirectory(prefix='m5-gpu-codecs-') as temporary:
         temporary = Path(temporary)
         (temporary / 'main.rs').write_text(harness)
         subprocess.run(['rustc', '--edition=2021', str(temporary / 'main.rs'), '-o', str(temporary / 'verify')], check=True)
-        result = subprocess.run([str(temporary / 'verify'), *map(str, captures)], capture_output=True, text=True, check=True)
+        result = subprocess.run([str(temporary / 'verify'), *map(str, captures)], capture_output=True, text=True)
+        if result.returncode:
+            raise ValueError('Production codec comparison failed: ' + result.stderr[:3000])
+        subprocess.run(['rustc', '--edition=2021', '--test', str(temporary / 'main.rs'),
+                        '-o', str(temporary / 'unit-tests')], check=True)
+        unit_result = subprocess.run([str(temporary / 'unit-tests'), '--quiet'],
+                                     capture_output=True, text=True, check=True)
+        host_tests = int(re.search(r'test result: ok\. (\d+) passed;', unit_result.stdout)[1])
     lines = result.stdout.splitlines()
     if len(lines) != 32:
         raise ValueError('Missing reset comparison cases')
@@ -287,6 +402,12 @@ fn main() {
         assert actual[0xc0:] == uncached[:0x64], 'Uncached stores differ from M5 host instructions'
         assert uncached[0x64:] == bytes([0x5a]) * (0x80 - 0x64)
     print(json.dumps(dict(roots_matched=2, main_configs_matched=2, hardware_data_blocks_matched=2,
+                         full_shared_clusters_matched=2,
+                         private_arenas_matched=sum((p / 'private-cluster-view.bin').exists() for p in captures),
+                         native_io_pages_and_guards_matched=mapping_count,
+                         ram_object_pte_attributes_matched=ram_attributes_checked,
+                         native_low_high_alias_pages_matched=alias_count,
+                         production_initdata_unit_tests_passed=host_tests,
                          bundle_policy_blocks_matched=2, native_allocation_sizes_verified=7,
                          region_c_blocks_matched=2, status_a_blocks_matched=2,
                          secondary_extra_1_blocks_matched=1,

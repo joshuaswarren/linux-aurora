@@ -82,7 +82,7 @@ SPTM global root reported by the current boot receipt; its firmware mappings
 do not appear in the ordinary per-context TTBR pairs.
 
 `m5-metal-reference.m` verifies compute results and rendered pixels through
-three fresh Metal command queues. Six macOS runs each passed 3,072 exact
+three fresh Metal command queues. Seven macOS runs each passed 3,072 exact
 compute values and 12,288 RGBA pixels. This is a macOS reference, not evidence
 that Linux submission, rendering or DCP works.
 
@@ -96,13 +96,39 @@ images independently compare that value. The existing Neo runtime continues
 to use `0x0c8aa322039604c0` and rejects the M5 version.
 
 `verify-m5-gpu-codecs.py` rebuilds the configuration objects and all 53
-register-table slots against three independent cold-boot captures. It checks
+register-table slots against independent cold-boot captures. It checks
 the seven native allocation sizes in the pinned host binary, validates
 pointer rebinding and rejects overlapping backing before modifying output.
 It also emulates the exact pinned
 M5 host reset routine with synthetic allocations and compares its output
 against the Linux channel codec across 32 cases. All comparisons pass.
 The driver/module build passes; these codecs are not wired into an M5 runtime.
+
+`drivers/gpu/drm/asahi/m5_resources.rs` now constructs and retains the M5
+initialization memory: both roots, the complete shared/private arenas, four
+completion queues, six physical alias pairs, policy backing and the 22 I/O
+windows. Firmware pointers are authored from owned allocations. Native
+cacheability and permissions are preserved, including read-only register
+windows and the 64 KiB extent of slot 39. The two measured control openings
+are initialized; subsequent compute/render descriptors are not submitted.
+The constructor requires an M5 UAT and has not been exercised on Linux
+hardware. It neither opens the UAT lifecycle gate nor starts a processor.
+
+The latest complete cold capture matches both 160 KiB shared clusters and
+the 0x178000 private arena, after excluding only independently identified
+firmware-written fields. GFX1 stores status A+0x10/+0x14 through global
+0x16f4e0 at firmware text+0x23588/+0x23604. These counters begin at zero;
+they can already be populated when primary initialization follows GFX1.
+PB/UMA descriptor pages and firmware-control storage are initially zero.
+The blank sentinel at primary main+0x2d0 is initially unmapped, becoming
+zero-backed later; it must not be confused with those descriptor tables.
+
+`snapshot-m5-gpu-owners.py` walks page tables without reading device memory.
+Its latest snapshot verifies all 58 I/O pages and 22 following guard pages,
+plus 34 pages of low/high aliases sharing identical physical backing.
+Pass its manifest to `verify-m5-gpu-codecs.py --owner-snapshot PATH` to
+check these relationships alongside the codecs and 38 production unit tests.
+Raw page tables, captures and firmware binaries remain private.
 
 The M5 profile handles these differences explicitly:
 
