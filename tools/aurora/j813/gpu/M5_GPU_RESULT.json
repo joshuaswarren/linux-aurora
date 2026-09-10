@@ -29,6 +29,7 @@
     "runtime_admitted": false
   },
   "regression": {
+    "scope": "Initial v9 peripheral regression; not repeated during the initdata-only boot",
     "wifi_dhcp": true,
     "wifi_ping_target": "8.8.8.8",
     "wifi_ping_sent": 5,
@@ -65,7 +66,7 @@
     "ram_object_pte_attributes_matched": 33,
     "production_initdata_unit_tests_passed": 38,
     "retained_m5_memory_constructor_implemented": true,
-    "memory_constructor_exercised_on_linux_hardware": false,
+    "memory_constructor_exercised_on_linux_hardware": true,
     "root_version": "0x0c8aa322039e04c0",
     "roots_matched_to_capture": 2,
     "main_configs_matched_to_capture": 2,
@@ -87,7 +88,8 @@
     "cross_target_version_rejections": 4,
     "kernel_build_passed": true,
     "ram_boot_retested_after_codec_changes": true,
-    "runtime_wired": false
+    "runtime_wired": true,
+    "runtime_scope": "Explicit M5 initdata-only transaction; no DRM registration or GPU jobs"
   },
   "linux_rtkit": {
     "hello_epmap_roles_passed": 2,
@@ -97,8 +99,27 @@
     "native_start_order": ["GFX1", "GFX"],
     "full_management_boot_qualified": true,
     "full_management_roles_running_without_crash": 2,
-    "initdata_submitted": false,
+    "initdata_submitted": true,
     "owners_pinned_until_reboot": true
+  },
+  "linux_initdata": {
+    "fresh_ram_boots_passed": 1,
+    "firmware_profile_required": "M5-RTKit-3255.160.4.release",
+    "uboot_dram_bank_limit": 32,
+    "m1n1_memory_banks_preserved": 8,
+    "reserved_root_tables_accessible": true,
+    "both_private_firmware_roots_preserved": true,
+    "shared_l2_preserved": true,
+    "retained_graph_constructed": true,
+    "role_ack_order": ["GFX1", "GFX"],
+    "ack_message": "0x0009000000000000",
+    "roles_acknowledged": 2,
+    "probe_microseconds": 52972,
+    "firmware_crashes_observed": 0,
+    "stop_requests_succeeded": 2,
+    "module_pinned_until_reboot": true,
+    "gpu_jobs_submitted": 0,
+    "firmware_cache_flush_qualified": false
   },
   "render_node": false,
   "gpu_compute_qualified": false,

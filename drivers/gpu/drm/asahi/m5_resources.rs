@@ -14,6 +14,7 @@ use super::MappedObject;
 use crate::{driver::AsahiDevice, g17_initdata as init, mmu};
 use core::sync::atomic::{fence, Ordering};
 use kernel::prelude::*;
+use kernel::sync::Arc;
 
 const KERNEL_BASE: u64 = 0xffff_fc20_0000_0000;
 const PRIVATE_BASE: u64 = KERNEL_BASE + 0x2_0000;
@@ -41,17 +42,18 @@ pub(crate) struct M5FirmwareMemory {
     completions: KVec<MappedObject>,
     aliases: KVec<mmu::KernelMapping>,
     registers: KVec<mmu::KernelMapping>,
-    uat: KBox<mmu::Uat>,
+    uat: Arc<mmu::Uat>,
 }
 
 impl M5FirmwareMemory {
     /// All fallible preparation happens before publication. The caller must
-    /// pass a freshly prepared M5 UAT with both processors stopped. There is
-    /// deliberately no fallback to the Neo runtime or its tuning profile.
+    /// pass a prepared M5 UAT while both processors await initdata. The
+    /// caller retains its own Arc until both CPUs stop, including when this
+    /// unpublished graph fails construction. There is no Neo tuning fallback.
     #[inline(never)]
     pub(crate) fn new_with_uat(
         dev: &AsahiDevice,
-        uat: KBox<mmu::Uat>,
+        uat: Arc<mmu::Uat>,
         boot_timestamp: u64,
     ) -> Result<Self> {
         if !uat.is_t8142_geometry() {
@@ -191,5 +193,9 @@ impl M5FirmwareMemory {
         fence(Ordering::SeqCst);
         Ok(Self { primary_root, secondary_root, shared, private, region_a, region_c, fwctl, aon, qos,
                   pbdesc, uma, completions, aliases, registers, uat })
+    }
+
+    pub(crate) fn root(&self, secondary: bool) -> u64 {
+        if secondary { self.secondary_root.iova() } else { self.primary_root.iova() }
     }
 }

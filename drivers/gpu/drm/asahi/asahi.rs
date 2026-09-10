@@ -76,21 +76,9 @@ kernel::module_platform_driver! {
     description: "AGX GPU driver for Apple silicon SoCs",
     license: "Dual MIT/GPL",
     params: {
-        m5_fw_trace: u32 {
-            default: 0,
-            description: "M5 primary trace classes: power bit 0, submission bit 1, recovery classifier bit 9",
-        },
         m5_initdata_test: u32 {
             default: 0,
-            description: "M5 fresh RAM boot: 1=initdata ACKs, 2=openings, 3=queue, 4=scheduler, 5=context, 6=one compute, 7=setup without kick, 8=request stop after admission, 9=live status, 10=live firmware monitors, 11=compute triangle, 12=TA/fragment triangle; 1..12 request stop; 13=retained session, 14=experimental DRM first-job adapter",
-        },
-        m5_graphics_frames: u32 {
-            default: 1,
-            description: "Number of sequential mode12 renders on a fresh RAM boot (1..64); reset pixels between completed frames",
-        },
-        m5_graphics_context: u32 {
-            default: 3,
-            description: "Application root slot for the mode12 regression (3..63); ordinary application queues allocate their own slots",
+            description: "M5-only fresh RAM boot: test both initdata ACKs, then stop processors; no DRM registration",
         },
         debug_flags: u64 {
             default: 0,

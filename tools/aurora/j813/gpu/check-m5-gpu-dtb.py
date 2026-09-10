@@ -64,7 +64,8 @@ def check(base_path, candidate_path):
     assert after[words(candidate[gpu]['power-domains'])[0]] == pmgr + '/power-controller@110'
     assert after[words(candidate[pmgr + '/power-controller@110']['power-domains'])[0]] == pmgr + '/power-controller@0'
     assert [after[p] for p in words(candidate[gpu]['memory-region'])] == [
-        '/reserved-memory/' + n for n in ('uat-ttbs', 'uat-pagetables', 'uat-handoff')]
+        '/reserved-memory/' + n for n in ('uat-ttbs', 'uat-pagetables', 'uat-handoff',
+                                          'uat-l2-pagetables', 'gfx-data', 'gfx1-data')]
     assert [after[p] for p in words(candidate[gpu]['mboxes'])] == [
         '/soc/mailbox@582600000', '/soc/mailbox@582e00000']
     for asc, vbar, irqs, role in [(0x82600000, 0x82050000, (1123, 1126), 'GFX'),
