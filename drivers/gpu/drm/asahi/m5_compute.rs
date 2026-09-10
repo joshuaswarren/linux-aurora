@@ -12,11 +12,111 @@
 
 pub(crate) const M5_COMPUTE_REGISTER_COUNT: usize = 40;
 pub(crate) const M5_COMPUTE_REGISTER_BYTES: usize = 12 * M5_COMPUTE_REGISTER_COUNT;
+/// Measured descriptor prefix, not a claim about the host allocation size.
+pub(crate) const M5_COMPUTE_DESCRIPTOR_BYTES: usize = 0x1000;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum M5ComputeError {
     AddressOverflow,
     BufferTooSmall,
+    CdmTerminatorBeforeStream,
+}
+
+/// Retained objects and per-command state for the measured simple CL path.
+/// Samplers, user timestamps, indirect dispatch and extra spill modes are not
+/// part of this profile. Pointer ownership belongs to the runtime caller.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct M5ComputeDescriptor {
+    pub(crate) registers: M5ComputeParameters,
+    pub(crate) submit_sequence: u64,
+    /// Host descriptor +0x188, copied to native command +0x10.
+    pub(crate) scheduler_record: u64,
+    pub(crate) descriptor_low_alias: u64,
+    pub(crate) cdm_terminator: u64,
+    pub(crate) dispatch_stamps: [u64; 2],
+    pub(crate) event_machine_stamp: u32,
+    pub(crate) queue_id: u32,
+    pub(crate) queue_ordinal: u32,
+    pub(crate) has_event: bool,
+    pub(crate) submission_index: u32,
+    pub(crate) status: [u64; 2],
+    pub(crate) shared_control: u64,
+    pub(crate) shared_control_enabled: bool,
+    /// Sixteen bytes copied by the native host from the event machine's
+    /// +0x70 record. Their bit meanings are not all qualified; keep opaque.
+    pub(crate) event_metadata: [u8; 16],
+    pub(crate) zero_page: u64,
+    /// Host descriptor +0x148; not a fixed target constant.
+    pub(crate) owner_id: u8,
+    /// Full host descriptor +0x140. Register context packing uses only its
+    /// low byte; the descriptor copy at +0xf70 must retain all 32 bits.
+    pub(crate) descriptor_work_ordinal: u32,
+}
+
+/// Encode all 4096 bytes of the native simple-compute descriptor prefix.
+/// The register arrays and their aliases are generated from owned inputs.
+/// This function performs no allocation, cache operation or publication.
+pub(crate) fn encode_m5_compute_descriptor(
+    p: M5ComputeDescriptor,
+    raw: &mut [u8],
+) -> Result<(), M5ComputeError> {
+    if raw.len() < M5_COMPUTE_DESCRIPTOR_BYTES {
+        return Err(M5ComputeError::BufferTooSmall);
+    }
+    if p.cdm_terminator < p.registers.cdm_base {
+        return Err(M5ComputeError::CdmTerminatorBeforeStream);
+    }
+    let registers = build_m5_compute_registers(p.registers)?;
+    let primary_alias = add(p.descriptor_low_alias, 0x40)?;
+    let secondary_alias = add(p.descriptor_low_alias, 0x760)?;
+    let secondary = [
+        (0x10099u32, add(p.registers.operand_state_base, 5)?),
+        (0x10091, add(p.registers.operand_state_base, 0xf000)?),
+        (0x0a5c1, add(p.registers.operand_state_base, 0xf405)?),
+        (0x0a5c9, add(p.registers.operand_state_base, 0x1e400)?),
+    ];
+    let raw = &mut raw[..M5_COMPUTE_DESCRIPTOR_BYTES];
+    raw.fill(0);
+    for (offset, value) in [
+        (0x00, 3u32), (0x0c, u32::from(p.registers.context_id)),
+        (0x748, 0x01e0_0028), (0xe68, 0x0030_0004),
+        (0xf20, (p.registers.dispatch_identity >> 32) as u32),
+        (0xf28, u32::MAX), (0xf50, p.event_machine_stamp),
+        (0xf54, p.queue_id), (0xf58, p.queue_ordinal),
+        (0xf5c, u32::from(p.has_event)), (0xf60, p.submission_index),
+        (0xf70, p.descriptor_work_ordinal),
+    ] {
+        raw[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    for (offset, value) in [
+        (4, p.submit_sequence), (0x10, p.scheduler_record),
+        (0x740, primary_alias), (0xe60, secondary_alias),
+        (0xed8, p.registers.preempt_base), (0xee0, p.cdm_terminator),
+        (0xf08, 0x0000_0001_5402_4201),
+        (0xf40, p.dispatch_stamps[0]), (0xf48, p.dispatch_stamps[1]),
+        (0xf68, p.registers.dispatch_identity & 0xffff_ffff),
+        (0xf7c, p.status[0]), (0xf84, p.status[1]),
+        (0xfb2, p.shared_control), (0xfcb, p.zero_page),
+    ] {
+        raw[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    for (index, count) in [37u16, 39, 39, 40].into_iter().enumerate() {
+        raw[0x18 + index * 2..0x1a + index * 2].copy_from_slice(&count.to_le_bytes());
+    }
+    for (index, register) in registers.into_iter().enumerate() {
+        let offset = 0x40 + index * 12;
+        raw[offset..offset + 4].copy_from_slice(&register.number.to_le_bytes());
+        raw[offset + 4..offset + 12].copy_from_slice(&register.value.to_le_bytes());
+    }
+    for (index, (number, value)) in secondary.into_iter().enumerate() {
+        let offset = 0x760 + index * 12;
+        raw[offset..offset + 4].copy_from_slice(&number.to_le_bytes());
+        raw[offset + 4..offset + 12].copy_from_slice(&value.to_le_bytes());
+    }
+    raw[0xfba] = u8::from(p.shared_control_enabled);
+    raw[0xfbb..0xfcb].copy_from_slice(&p.event_metadata);
+    raw[0xfd3] = p.owner_id;
+    Ok(())
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -228,5 +328,33 @@ mod tests {
         let mut output = [0xa5; M5_COMPUTE_REGISTER_BYTES + 16];
         encode_m5_compute_registers(parameters(), &mut output).unwrap();
         assert_eq!(&output[M5_COMPUTE_REGISTER_BYTES..], &[0xa5; 16]);
+    }
+
+    #[test]
+    fn descriptor_preserves_full_ordinal_and_rejects_before_writing() {
+        let registers = parameters();
+        let p = M5ComputeDescriptor {
+            registers, submit_sequence: 0, scheduler_record: 0xfffffc2001000000,
+            descriptor_low_alias: 0x7000400000,
+            cdm_terminator: registers.cdm_base + 0x2c,
+            dispatch_stamps: [0xfffffc2002000000, 0xfffffc2002000004],
+            event_machine_stamp: 0x123400, queue_id: 11, queue_ordinal: 0,
+            has_event: false, submission_index: 0x1234,
+            status: [0xfffffc2003000000, 0xfffffc2003000008],
+            shared_control: 0xfffffc2004000000, shared_control_enabled: true,
+            event_metadata: [0x7e; 16], zero_page: 0xfffffc2005000000,
+            owner_id: 31, descriptor_work_ordinal: 0x123456c3,
+        };
+        let mut output = [0xa5; M5_COMPUTE_DESCRIPTOR_BYTES + 16];
+        encode_m5_compute_descriptor(p, &mut output).unwrap();
+        assert_eq!(&output[0xf70..0xf74], &0x123456c3u32.to_le_bytes());
+        assert_eq!(&output[0xfbb..0xfcb], &[0x7e; 16]);
+        assert_eq!(&output[M5_COMPUTE_DESCRIPTOR_BYTES..], &[0xa5; 16]);
+        for invalid in [M5ComputeDescriptor { descriptor_low_alias: u64::MAX, ..p },
+                        M5ComputeDescriptor { cdm_terminator: registers.cdm_base - 1, ..p }] {
+            output.fill(0xa5);
+            assert!(encode_m5_compute_descriptor(invalid, &mut output).is_err());
+            assert_eq!(output, [0xa5; M5_COMPUTE_DESCRIPTOR_BYTES + 16]);
+        }
     }
 }

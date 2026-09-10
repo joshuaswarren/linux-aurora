@@ -27,6 +27,8 @@ def find_source():
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('captures', nargs='+', type=Path)
 parser.add_argument('--source', type=Path)
+parser.add_argument('--descriptor', action='store_true',
+                    help='Compare the complete measured 4096-byte descriptor prefix')
 args = parser.parse_args()
 source = (args.source or find_source()).resolve()
 
@@ -38,7 +40,7 @@ with tempfile.TemporaryDirectory(prefix='m5-native-registers-') as temporary:
 use m5_compute::*;
 fn main() {
     let a: Vec<u64> = std::env::args().skip(1).map(|s| u64::from_str_radix(&s, 16).unwrap()).collect();
-    assert_eq!(a.len(), 12);
+    assert!(a.len() == 12 || a.len() == 46);
     let p = M5ComputeParameters {
         preempt_base: a[0], cdm_base: a[1], dispatch_identity: a[2],
         context_id: u8::try_from(a[3]).unwrap(), work_ordinal: u8::try_from(a[4]).unwrap(),
@@ -46,9 +48,28 @@ fn main() {
         descriptor_control_530: a[8], descriptor_control_538: a[9],
         descriptor_flag_60a: a[10] != 0, descriptor_flag_60b: a[11] != 0,
     };
-    let mut bytes = [0; M5_COMPUTE_REGISTER_BYTES];
-    encode_m5_compute_registers(p, &mut bytes).unwrap();
-    std::io::stdout().write_all(&bytes).unwrap();
+    if a.len() == 12 {
+        let mut bytes = [0; M5_COMPUTE_REGISTER_BYTES];
+        encode_m5_compute_registers(p, &mut bytes).unwrap();
+        std::io::stdout().write_all(&bytes).unwrap();
+    } else {
+        let mut event_metadata = [0u8; 16];
+        for i in 0..16 { event_metadata[i] = u8::try_from(a[29+i]).unwrap(); }
+        let descriptor = M5ComputeDescriptor {
+            registers: p, submit_sequence: a[12], scheduler_record: a[13],
+            descriptor_low_alias: a[14], cdm_terminator: a[15],
+            dispatch_stamps: [a[16], a[17]],
+            event_machine_stamp: u32::try_from(a[18]).unwrap(),
+            queue_id: u32::try_from(a[19]).unwrap(), queue_ordinal: u32::try_from(a[20]).unwrap(),
+            has_event: a[21] != 0, submission_index: u32::try_from(a[22]).unwrap(),
+            status: [a[23], a[24]], shared_control: a[25], shared_control_enabled: a[26] != 0,
+            zero_page: a[27], owner_id: u8::try_from(a[28]).unwrap(), event_metadata,
+            descriptor_work_ordinal: u32::try_from(a[45]).unwrap(),
+        };
+        let mut bytes = [0; M5_COMPUTE_DESCRIPTOR_BYTES];
+        encode_m5_compute_descriptor(descriptor, &mut bytes).unwrap();
+        std::io::stdout().write_all(&bytes).unwrap();
+    }
 }
 ''' % json.dumps(str(source)))
     binary = directory / 'verify'
@@ -96,10 +117,31 @@ fn main() {
                         int(mode & ~0x80 == 0x14c08a60), int(bool(mode & 0x80))]
             control_source = 'legacy-register-values'
         values.extend(controls)
+        if args.descriptor:
+            if not descriptor_objects or len(data) < 0x1000:
+                raise ValueError('Full comparison needs a host descriptor and 4096 native bytes')
+            q = lambda blob, offset: struct.unpack_from('<Q', blob, offset)[0]
+            w = lambda blob, offset: struct.unpack_from('<I', blob, offset)[0]
+            # Scheduler pointer, CDM end, event-presence flag, status pointers,
+            # shared-control enable and owner ID have independent host inputs.
+            # Remaining retained addresses/opaque event data are native inputs.
+            values.extend([q(data, 4), q(raw, 0x188), q(data, 0x740) - 0x40,
+                           q(raw, 0x4c0), q(data, 0xf40), q(data, 0xf48),
+                           w(data, 0xf50), manifest['queue_id'], w(data, 0xf58),
+                           int(w(raw, 0x48) != 0), w(data, 0xf60),
+                           q(raw, 0x1a0), q(raw, 0x1a8), q(raw, 0x798),
+                           raw[0x7c4] & 1, q(data, 0xfcb), raw[0x148],
+                           *data[0xfbb:0xfcb], w(raw, 0x140)])
+            expected = data[:0x1000]
         result = subprocess.run([str(binary), *[format(x, 'x') for x in values]],
                                 check=True, capture_output=True).stdout
         if result != expected:
+            if args.descriptor:
+                bad = [hex(i) for i, (a, b) in enumerate(zip(result, expected)) if a != b]
+                raise ValueError('Production M5 descriptor differs at byte offsets: ' + str(bad))
             bad = [i for i in range(40) if result[i * 12:(i + 1) * 12] != expected[i * 12:(i + 1) * 12]]
             raise ValueError('Production M5 register writer differs at indices: ' + str(bad))
-        print('M5_NATIVE_REGISTER_MATCH', capture.name, 'registers=40 bytes=480 controls=' + control_source)
+        print('M5_NATIVE_DESCRIPTOR_MATCH' if args.descriptor else 'M5_NATIVE_REGISTER_MATCH',
+              capture.name, 'registers=40 bytes=' + ('4096' if args.descriptor else '480'),
+              'controls=' + control_source)
 print('LINUX_GPU_EXECUTION_QUALIFIED=false')

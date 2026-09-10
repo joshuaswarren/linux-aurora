@@ -108,14 +108,14 @@ SPTM global root reported by the current boot receipt; its firmware mappings
 do not appear in the ordinary per-context TTBR pairs.
 
 `m5-metal-reference.m` verifies compute results and rendered pixels through
-three fresh Metal command queues. Twenty-four macOS runs each passed 3,072 exact
+three fresh Metal command queues. Twenty-seven macOS runs each passed 3,072 exact
 compute values and 12,288 RGBA pixels. This is a macOS reference, not evidence
 that Linux submission, rendering or DCP works.
 
 The bounded SKSM observer now follows the selected command's actual UAT
 context, CDM stream, pipeline and explicitly requested shader/data pages.
 An optional one-shot hook at the matching retained CL descriptor's completion
-captures those pages again. Four controlled captures each show 1,024 output
+captures those pages again. Six controlled captures each show 1,024 output
 sentinels before submission and 1,024 exact results at the matching callback;
 the input remains unchanged. All captured objects matched on two reads.
 The observer never reads device memory and retains a two-MiB read budget.
@@ -136,6 +136,22 @@ matching-descriptor completion. The global-root and per-context walkers stay
 separate; neither substitutes a guessed page table. The sampled completion
 ring was zero before and at the host callback. Its routing and consumption
 timing remain unknown; no completion-ring ABI is claimed from that observation.
+
+The full 4096-byte simple-compute descriptor prefix now matches ten native
+captures, including two contexts and independent host descriptor controls.
+This covers both register arrays, low aliases, completion-stamp addresses,
+status pointers and the native opaque event metadata. In particular, the
+32-bit work ordinal at `+0xf70` is distinct from the low byte packed into
+register context words; truncating it fails the background-queue captures.
+Run `verify-m5-compute-registers.py --descriptor CAPTURE...` to reproduce the
+comparison. This is the measured simple-compute profile, not an allocation
+size claim or qualification of indirect dispatch and sampler variants.
+
+A matching-completion capture also shows exactly one 24-byte outer CL entry
+published and consumed in priority 2: the cached queue pointer, data master 2,
+head 3, queue ID and start flag match the controlled job. The firmware's own
+tag-15 install branch retains the queue aliases and programs SKSM hardware.
+Linux queue installation and job execution still require a retained runtime.
 
 ## Source construction and M5 differences
 
