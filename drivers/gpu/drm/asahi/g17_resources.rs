@@ -1904,6 +1904,12 @@ pub(crate) struct G17PReportDrainStats {
     /// Count of type-4 `kAGFIFirmwareEventTypeGPURestart` records seen: the
     /// firmware halted and is asking the host to run the restart handshake.
     pub(crate) restart_requests: u32,
+    /// Non-zero history records read immediately before the producer cursor.
+    pub(crate) history_records: u32,
+    /// Type-7 grow requests found in that bounded history window.
+    pub(crate) history_grow_requests: u32,
+    /// Type-4 recovery requests found in that bounded history window.
+    pub(crate) history_restart_requests: u32,
     /// Set when a cursor was outside `G17P_EVENT_CAPACITY`.
     pub(crate) cursor_out_of_range: bool,
 }
@@ -13732,11 +13738,11 @@ impl G17ResourceOwner {
         // producer regardless of the cursor, so a stalled render can be read
         // after the fact.
         {
-            let capacity = g17_completion::G17P_EVENT_CAPACITY;
             let size = g17_completion::G17P_EVENT_ENTRY_SIZE;
-            let history = if capacity < 8 { capacity } else { 8 };
-            for back in (1..=history).rev() {
-                let slot = (producer + capacity - back) & (capacity - 1);
+            let history = g17_completion::g17p_report_history_count(print_budget);
+            for index in 0..history {
+                let slot = g17_completion::g17p_report_history_slot(producer, history, index)
+                    .ok_or(EINVAL)?;
                 let record_address = ring
                     .checked_add((slot as usize * size) as u64)
                     .ok_or(EINVAL)?;
@@ -13758,12 +13764,22 @@ impl G17ResourceOwner {
                 if raw.iter().all(|byte| *byte == 0) {
                     continue;
                 }
+                let event_type = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+                stats.history_records = stats.history_records.saturating_add(1);
+                if event_type == G17P_EVENT_GROW_REQUEST_TYPE {
+                    stats.history_grow_requests = stats.history_grow_requests.saturating_add(1);
+                }
+                if event_type == g17_completion::G17P_FIRMWARE_EVENT_RECOVERY_TYPE {
+                    stats.history_restart_requests =
+                        stats.history_restart_requests.saturating_add(1);
+                }
                 dev_info!(
                     self.dev().as_ref(),
-                    "G17P report[{}] history slot {} type={:#04x}: {:02x?}\n",
+                    "G17P report[{}] history slot {} type={} ({}): {:02x?}\n",
                     role_name,
                     slot,
-                    raw[0],
+                    event_type,
+                    g17_completion::g17p_firmware_event_name(event_type),
                     &raw[..],
                 );
             }

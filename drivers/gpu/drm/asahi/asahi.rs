@@ -414,6 +414,10 @@ kernel::module_platform_driver! {
             default: 0,
             description: "Maximum event-ring records logged per drain call (0: unlimited). Records over budget are still counted.",
         },
+        g17p_recovery_snapshot: u32 {
+            default: 0,
+            description: "Recovery-only G17P diagnostic. While firmware is already halted at the pre-ACK state, log the selected hardware slot's common c020 state and c078 key for DM0 or DM1; retain the eight additional native progress reads only for DM1. Also read, without advancing, up to eight channel-13 firmware-event records immediately preceding the producer so a type-7 GrowTilingBuffer request can be ordered against the type-4 restart. 0: off (default); non-zero: enabled. The successful submission path is unchanged.",
+        },
         // 2026-09-01 follow-up: descriptor +0x789=0x10 was also hardware-null
         // (same fault-free TA timeout and recovery as the 0x08 baseline).
         g17p_render_native_regs: u32 {

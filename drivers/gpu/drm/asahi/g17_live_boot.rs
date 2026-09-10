@@ -78,6 +78,16 @@ const G17P_CRASHLOG_MAX_BYTES: usize = 256 * 1024;
 /// window, not a handshake: the firmware's own core-power sequencer
 /// (`0x20a70`) budgets `0xe10` timebase ticks for its `sgx+0x2_11d0` poll.
 const G17P_POWER_WIRE_POLLS: usize = 20;
+/// Separate budget for the GPU cores actually reaching the powered state.
+///
+/// Record retirement is a firmware acknowledgement and lands in a couple of
+/// milliseconds; the powered witness is driven by the core power sequencer,
+/// which is slower and slower still while another client is rendering. Sharing
+/// one 20ms budget meant a wake whose record had demonstrably retired
+/// (counters == target) was reported as a timeout because the sequencer had
+/// not finished yet -- measured on G17P with a compositor and a browser both
+/// submitting, where the very next record observed powered=true 1ms later.
+const G17P_POWER_WIRE_POWERED_POLLS: usize = 250;
 const G17P_RTKIT_UAT_DVA_MASK: u64 = (1u64 << 40) - 1;
 
 /// Module-local, read-only view of one existing ASCWrap mailbox provider.
@@ -383,17 +393,13 @@ fn probe_g17p_ktrace(
 /// G17P path has never read it, so a request would sit in DRAM unanswered
 /// while the tiler waited. DRAM only -- no sgx MMIO, so it is safe at both
 /// checkpoints including the timeout, where the cores have powered back down.
-fn probe_g17p_reports(
+fn probe_g17p_reports_with_mode(
     dev: &kernel::device::Device,
     manager: &mut g17_manager::G17PManagerConstruction,
     checkpoint: &'static str,
+    advance: bool,
+    budget: u32,
 ) {
-    let mode = *module_parameters::g17p_report_drain.value();
-    if mode == 0 {
-        return;
-    }
-    let advance = mode >= 2;
-    let budget = *module_parameters::g17p_report_drain_budget.value();
     for role in [
         g17_initdata::InstanceRole::Primary,
         g17_initdata::InstanceRole::Secondary,
@@ -419,7 +425,7 @@ fn probe_g17p_reports(
         match manager.drain_report_ring(role, advance, budget) {
             Ok(stats) => dev_info!(
                 dev,
-                "G17P report ring checkpoint={} role={} producer={} consumer={} pending={} read={} printed={} undecoded={} grow-requests={} restart-requests={} out-of-range={} advanced={} fwlog-write={}\n",
+                "G17P report ring checkpoint={} role={} producer={} consumer={} pending={} read={} printed={} undecoded={} grow-requests={} restart-requests={} history-records={} history-grow-requests={} history-restart-requests={} out-of-range={} advanced={} fwlog-write={}\n",
                 checkpoint,
                 role_name,
                 stats.producer,
@@ -430,6 +436,9 @@ fn probe_g17p_reports(
                 stats.skipped,
                 stats.grow_requests,
                 stats.restart_requests,
+                stats.history_records,
+                stats.history_grow_requests,
+                stats.history_restart_requests,
                 stats.cursor_out_of_range,
                 advance,
                 stats.fwlog_write
@@ -443,6 +452,36 @@ fn probe_g17p_reports(
             ),
         }
     }
+}
+
+fn probe_g17p_reports(
+    dev: &kernel::device::Device,
+    manager: &mut g17_manager::G17PManagerConstruction,
+    checkpoint: &'static str,
+) {
+    let mode = *module_parameters::g17p_report_drain.value();
+    if mode == 0 {
+        return;
+    }
+    probe_g17p_reports_with_mode(
+        dev,
+        manager,
+        checkpoint,
+        mode >= 2,
+        *module_parameters::g17p_report_drain_budget.value(),
+    );
+}
+
+/// Recovery-only report-ring history. Unlike the checkpoint diagnostic this
+/// never runs on a successful submission and never advances either consumer.
+fn probe_g17p_recovery_report_history(
+    dev: &kernel::device::Device,
+    manager: &mut g17_manager::G17PManagerConstruction,
+) {
+    if *module_parameters::g17p_recovery_snapshot.value() == 0 {
+        return;
+    }
+    probe_g17p_reports_with_mode(dev, manager, "recovery-pre-ack-history", false, 8);
 }
 
 fn log_g17p_status_a(
@@ -564,19 +603,22 @@ fn log_g17p_fault_report(
 
 /// A narrowly scoped, already-halted slot discriminator. Failure to observe
 /// it must never prevent the host acknowledgement that resumes recovery.
-fn log_g17p_halted_dm1_slot0(
+fn log_g17p_halted_slot0(
     dev: &kernel::device::Device,
     manager: &mut g17_manager::G17PManagerConstruction,
     registers: Option<&regs::Resources>,
     expected_epoch: u64,
 ) {
+    if *module_parameters::g17p_recovery_snapshot.value() == 0 {
+        return;
+    }
     let Some(registers) = registers else { return };
     let selected = match (
         manager.firmware_recovery_handshake_snapshot(),
         manager.firmware_fault_report_snapshot(),
     ) {
         (Ok(handshake), Ok(report)) => {
-            g17_completion::G17PHaltedSlot0Gate {
+            let gate = g17_completion::G17PHaltedSlot0Gate {
                 handshake_state: handshake.state,
                 epoch: handshake.epoch,
                 expected_epoch,
@@ -586,20 +628,24 @@ fn log_g17p_halted_dm1_slot0(
                 slot: report.slot,
                 data_master_present: report.data_master_present,
                 data_master: report.data_master,
-            }.allows_sample()
+            };
+            if gate.allows_generic_sample() {
+                Some((report.data_master, gate.allows_dm1_progress_sample()))
+            } else {
+                None
+            }
         }
-        _ => false,
+        _ => None,
     };
-    if !selected {
-        return;
-    }
-    match registers.g17p_halted_slot0_snapshot() {
+    let Some((data_master, read_dm1_progress)) = selected else { return };
+    match registers.g17p_halted_slot0_snapshot(read_dm1_progress) {
         Ok(Some(snapshot)) => {
             let stable = snapshot.state_before == snapshot.state_after;
             dev_info!(
                 dev,
-                "G17P halted DM1 slot0 epoch={} gpc={:#x} c020-before={:#018x} c078={:#018x} c020-after={:#018x} stable={} progress-selector={} selector={} key-qid={} key-stamp={:#x}\n",
+                "G17P halted slot0 epoch={} data-master={} gpc={:#x} c020-before={:#018x} c078={:#018x} c020-after={:#018x} stable={} progress-selector={} selector={} key-qid={} key-stamp={:#x}\n",
                 expected_epoch,
+                data_master,
                 snapshot.gpc_state,
                 snapshot.state_before,
                 snapshot.key,
@@ -610,21 +656,25 @@ fn log_g17p_halted_dm1_slot0(
                 (snapshot.key >> 40) & 0x7f,
                 snapshot.key & 0xff_ffff_ffff,
             );
-            if let Some(selector) = g17_completion::g17p_dm1_monitor_selector_index(snapshot.state_before) {
-                dev_info!(
-                    dev,
-                    "G17P halted DM1 selected-progress epoch={} selector-index={} c020-stable={} count={}/8 errno={} regs=1668/13020/15150/15388/15390/15510/15518/a068 raw={:016x?}\n",
-                    expected_epoch,
-                    selector,
-                    stable,
-                    snapshot.progress_count,
-                    snapshot.progress_errno,
-                    &snapshot.progress[..snapshot.progress_count],
-                );
+            if read_dm1_progress {
+                if let Some(selector) =
+                    g17_completion::g17p_dm1_monitor_selector_index(snapshot.state_before)
+                {
+                    dev_info!(
+                        dev,
+                        "G17P halted DM1 selected-progress epoch={} selector-index={} c020-stable={} count={}/8 errno={} regs=1668/13020/15150/15388/15390/15510/15518/a068 raw={:016x?}\n",
+                        expected_epoch,
+                        selector,
+                        stable,
+                        snapshot.progress_count,
+                        snapshot.progress_errno,
+                        &snapshot.progress[..snapshot.progress_count],
+                    );
+                }
             }
         }
-        Ok(None) => dev_info!(dev, "G17P halted DM1 slot0: GPC off; no low-SGX access\n"),
-        Err(error) => dev_warn!(dev, "G17P halted DM1 slot0: read failed ({:?}); continuing recovery\n", error),
+        Ok(None) => dev_info!(dev, "G17P halted slot0: GPC off; no low-SGX access\n"),
+        Err(error) => dev_warn!(dev, "G17P halted slot0: read failed ({:?}); continuing recovery\n", error),
     }
 }
 
@@ -727,7 +777,7 @@ struct G17PPrimaryFirmwareEventBatch {
     recovery_generation: Option<u64>,
     recovery_records: u32,
     uma_release: Option<g17_manager::G17PBootstrapUmaRelease>,
-    blamed_stamp: Option<i32>,
+    blamed_stamp: Option<u8>,
     unknown_records: u32,
     completion_records: u32,
     completion_masks: [u64; 2],
@@ -796,7 +846,11 @@ fn drain_primary_firmware_event_batch(
                     );
                     batch.blamed_recovery_records =
                         batch.blamed_recovery_records.saturating_add(1);
-                    batch.blamed_stamp = Some(recovery.stamp_index);
+                    let stamp = u8::try_from(recovery.stamp_index).map_err(|_| EIO)?;
+                    if stamp >= 128 {
+                        return Err(EIO);
+                    }
+                    batch.blamed_stamp = Some(stamp);
                 }
                 dev_info!(
                     pdev.as_ref(),
@@ -1002,7 +1056,8 @@ fn complete_primary_real_recovery(
     // firmware is halted at state 1, before the host's 1 -> 2 acknowledge.
     // Match that exact window below, guarded by the always-on GPC state.
     log_g17p_fault_report(pdev.as_ref(), manager, "recovery-blamed-cause");
-    log_g17p_halted_dm1_slot0(pdev.as_ref(), manager, registers, handshake.epoch);
+    probe_g17p_recovery_report_history(pdev.as_ref(), manager);
+    log_g17p_halted_slot0(pdev.as_ref(), manager, registers, handshake.epoch);
     log_g17p_halted_gmmu(pdev.as_ref(), manager, registers, handshake.epoch);
     let cause = manager.primary_firmware_recovery_cause_snapshot()?;
     dev_info!(
@@ -1214,7 +1269,11 @@ fn settle_primary_empty_recovery(
             }
         }
         if let Some(generation) = batch.recovery_generation {
-            manager.queue_primary_recovery(generation, batch.recovery_records)?;
+            manager.queue_primary_recovery(
+                generation,
+                batch.recovery_records,
+                batch.blamed_stamp,
+            )?;
             return Ok((uma_release, completion_masks));
         }
         let handshake = manager.firmware_recovery_handshake_snapshot()?;
@@ -3060,7 +3119,11 @@ impl G17PLiveRuntime {
                 }
                 if let Some(generation) = batch.recovery_generation {
                     self.manager.as_mut().ok_or(ENODEV)?
-                        .queue_primary_recovery(generation, batch.recovery_records)?;
+                        .queue_primary_recovery(
+                            generation,
+                            batch.recovery_records,
+                            batch.blamed_stamp,
+                        )?;
                 }
             }
             self.service_async_render_completions(completion_masks)?;
@@ -3136,7 +3199,11 @@ impl G17PLiveRuntime {
             self.manager
                 .as_mut()
                 .ok_or(ENODEV)?
-                .queue_primary_recovery(generation, batch.recovery_records)?;
+                .queue_primary_recovery(
+                    generation,
+                    batch.recovery_records,
+                    batch.blamed_stamp,
+                )?;
             self.service_primary_recovery()?;
         }
         self.service_async_render_completions([0; 2])?;
@@ -3155,7 +3222,7 @@ impl G17PLiveRuntime {
         self.log_recovery_alignment("pre-recovery");
         let registers = self.registers.as_ref();
         let manager = self.manager.as_mut().ok_or(ENODEV)?;
-        let Some((generation, records)) = manager.pending_primary_recovery() else {
+        let Some((generation, records, blamed_stamp)) = manager.pending_primary_recovery() else {
             return Ok(());
         };
         let result = complete_primary_real_recovery(
@@ -3166,10 +3233,15 @@ impl G17PLiveRuntime {
             generation,
             records,
         )
-        .and_then(|()| manager.complete_pending_primary_recovery(generation, records));
+        .and_then(|()| {
+            manager.complete_pending_primary_recovery(generation, records, blamed_stamp)
+        });
         if result.is_err() {
             state.crashed.store(true, Ordering::Release);
             return result;
+        }
+        if let Some(stamp) = blamed_stamp {
+            self.settle_render_blamed_by_recovery(stamp, EIO);
         }
         self.log_recovery_alignment("post-recovery");
         // Realign before the next kick. Continuity across a recovery is exactly
@@ -4106,6 +4178,49 @@ impl G17PLiveRuntime {
         submission_id: u64,
         error: Error,
     ) {
+        self.settle_failed_deferred_render(
+            render_slot,
+            Some(submission_id),
+            None,
+            error,
+        );
+    }
+
+    /// Settle the render named by a firmware type-4 recovery record.
+    ///
+    /// Type-1 event masks and type-4 `stamp_index` use the same 128-bit
+    /// EventMachine QID namespace. A recovery naming TA/3D QID 0/1 therefore
+    /// belongs only to physical render slot 0, while QID 2/3 belongs only to
+    /// slot 1. Do this after the firmware reaches state 0: at that point a
+    /// final DRAM observation can either salvage an actual completion or
+    /// classify the rejected group without waiting for the scheduler's
+    /// unrelated two-second watchdog.
+    fn settle_render_blamed_by_recovery(&mut self, stamp: u8, error: Error) {
+        for slot in 0..g17_resources::G17PRenderQueuePair::SLOT_COUNT {
+            let Some(pair) = g17_resources::G17PRenderQueuePair::for_slot(slot) else {
+                continue;
+            };
+            if stamp != pair.tiling as u8 && stamp != pair.fragment as u8 {
+                continue;
+            }
+            if !self.render_fence_state.pending(slot) {
+                return;
+            }
+            self.settle_failed_deferred_render(slot, None, Some(stamp), error);
+            return;
+        }
+    }
+
+    /// Exact-once settlement shared by the watchdog and a firmware-blamed
+    /// recovery. The optional identities affect diagnostics only; ownership,
+    /// final completion observation, VM status, and fence order are identical.
+    fn settle_failed_deferred_render(
+        &mut self,
+        render_slot: u8,
+        submission_id: Option<u64>,
+        blamed_stamp: Option<u8>,
+        error: Error,
+    ) {
         // Construction and direct-registration failures happen before a
         // completion owner is installed. They have no published work to
         // observe or abandon; probing the selected slot here manufactured an
@@ -4124,12 +4239,21 @@ impl G17PLiveRuntime {
                 match self.settle_deferred_render_completion(render_slot, observed) {
                     Ok(true) => {
                         if let Some(pdev) = self.pdev.as_ref() {
-                            dev_warn!(
-                                pdev.as_ref(),
-                                "G17P render: watchdog recovered completed submission {} slot {} after an early firmware event\n",
-                                submission_id,
-                                render_slot,
-                            );
+                            if let Some(submission_id) = submission_id {
+                                dev_warn!(
+                                    pdev.as_ref(),
+                                    "G17P render: watchdog recovered completed submission {} slot {} after an early firmware event\n",
+                                    submission_id,
+                                    render_slot,
+                                );
+                            } else {
+                                dev_warn!(
+                                    pdev.as_ref(),
+                                    "G17P render: recovery stamp {:?} raced a completed slot {}\n",
+                                    blamed_stamp,
+                                    render_slot,
+                                );
+                            }
                         }
                     }
                     Ok(false) => {}
@@ -4137,7 +4261,7 @@ impl G17PLiveRuntime {
                         if let Some(pdev) = self.pdev.as_ref() {
                             dev_err!(
                                 pdev.as_ref(),
-                                "G17P render: completed submission {} slot {} could not settle retained cleanup ({:?})\n",
+                                "G17P render: completed submission {:?} slot {} could not settle retained cleanup ({:?})\n",
                                 submission_id,
                                 render_slot,
                                 cleanup_error,
@@ -4152,8 +4276,9 @@ impl G17PLiveRuntime {
                 if let Some(pdev) = self.pdev.as_ref() {
                     dev_warn!(
                         pdev.as_ref(),
-                        "G17P render: final watchdog observation for submission {} slot {} failed ({:?})\n",
+                        "G17P render: final failure observation for submission {:?} recovery-stamp {:?} slot {} failed ({:?})\n",
                         submission_id,
+                        blamed_stamp,
                         render_slot,
                         observe_error,
                     );
@@ -4165,12 +4290,15 @@ impl G17PLiveRuntime {
             let Some(signal) = self.pending_render
                 .get_mut(render_slot as usize)
                 .and_then(Option::take) else { return; };
-            let retired = self.abandon_deferred_render(render_slot).unwrap_or(false);
+            let retired = self
+                .retire_failed_deferred_render(render_slot, submission_id.is_some())
+                .unwrap_or(false);
             if let Some(pdev) = self.pdev.as_ref() {
                 dev_err!(
                     pdev.as_ref(),
-                    "G17P render: scheduler settled lost submission {} slot {} ({:?}, firmware-retired={})\n",
+                    "G17P render: settled lost submission {:?} recovery-stamp {:?} slot {} ({:?}, firmware-retired={})\n",
                     submission_id,
+                    blamed_stamp,
                     render_slot,
                     error,
                     retired,
@@ -4215,14 +4343,24 @@ impl G17PLiveRuntime {
         &mut self,
         render_slot: u8,
     ) -> Result<bool> {
+        self.retire_failed_deferred_render(render_slot, true)
+    }
+
+    fn retire_failed_deferred_render(
+        &mut self,
+        render_slot: u8,
+        timed_out: bool,
+    ) -> Result<bool> {
         self.manager
             .as_mut()
             .ok_or(ENODEV)?
             .select_render_slot(render_slot)?;
-        self.manager
-            .as_mut()
-            .ok_or(ENODEV)?
-            .report_render_wait_timeout();
+        if timed_out {
+            self.manager
+                .as_mut()
+                .ok_or(ENODEV)?
+                .report_render_wait_timeout();
+        }
         let retired = match self
             .manager
             .as_mut()
@@ -4277,7 +4415,9 @@ impl G17PLiveRuntime {
             }
             return Ok(true);
         }
-        self.abandon_render_submission_after_timeout();
+        if timed_out {
+            self.abandon_render_submission_after_timeout();
+        }
         Ok(false)
     }
 
@@ -5355,26 +5495,42 @@ impl G17PLiveRuntime {
     ) -> Result {
         let pdev = self.pdev.as_ref().cloned().ok_or(ENODEV)?;
 
-        for elapsed_ms in 0..G17P_POWER_WIRE_POLLS {
+        // Two independent events, so two independent budgets. The record must
+        // retire within G17P_POWER_WIRE_POLLS; only once it has does the power
+        // sequencer get its own, longer window. Charging the sequencer's
+        // latency against the retirement budget failed wakes whose record had
+        // already retired.
+        let mut retired_at: Option<usize> = None;
+        for elapsed_ms in 0..(G17P_POWER_WIRE_POLLS + G17P_POWER_WIRE_POWERED_POLLS) {
             if self.is_crashed() {
                 return Err(EIO);
             }
-            // Keep channel 12 single-producer until this exact target retires.
-            // Firmware-event servicing can publish an FList release record;
-            // doing that here would advance the same producer past `target`
-            // and destroy the exact retirement witness.
-            let retired = manager.control_counters()?.primary == [target; 3];
-            let powered = registers.g17p_sksm_configuration_port_powered();
-            if retired && (!require_powered || powered) {
-                dev_info!(
-                    pdev.as_ref(),
-                    "G17P render registration: {} retired after {}ms (control target {}, powered={})\n",
-                    label,
-                    elapsed_ms,
-                    target,
-                    powered,
-                );
-                return Ok(());
+            if retired_at.is_none() {
+                // Keep channel 12 single-producer until this exact target
+                // retires. Firmware-event servicing can publish an FList
+                // release record; doing that here would advance the same
+                // producer past `target` and destroy the exact retirement
+                // witness.
+                if manager.control_counters()?.primary == [target; 3] {
+                    retired_at = Some(elapsed_ms);
+                } else if elapsed_ms + 1 >= G17P_POWER_WIRE_POLLS {
+                    break;
+                }
+            }
+            if let Some(retired_ms) = retired_at {
+                let powered = registers.g17p_sksm_configuration_port_powered();
+                if !require_powered || powered {
+                    dev_info!(
+                        pdev.as_ref(),
+                        "G17P render registration: {} retired after {}ms, powered after {}ms (control target {}, powered={})\n",
+                        label,
+                        retired_ms,
+                        elapsed_ms,
+                        target,
+                        powered,
+                    );
+                    return Ok(());
+                }
             }
             fsleep(Delta::from_millis(1));
         }
@@ -5382,10 +5538,11 @@ impl G17PLiveRuntime {
         let powered = registers.g17p_sksm_configuration_port_powered();
         dev_err!(
             pdev.as_ref(),
-            "G17P render registration: {} did not retire before construction (target={} counters={:?} powered={}); no pair publication attempted\n",
+            "G17P render registration: {} timed out (target={} counters={:?} retired={:?} powered={}); no pair publication attempted\n",
             label,
             target,
             counters.primary,
+            retired_at,
             powered,
         );
         Err(ETIMEDOUT)

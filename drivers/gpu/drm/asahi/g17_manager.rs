@@ -1260,7 +1260,11 @@ pub(crate) struct G17PManagerConstruction {
     parked_render_slots: [Option<G17PRenderSlotState>; 2],
     active_render_slot: u8,
     accepted_firmware_recovery_generation: u64,
-    pending_primary_recovery: Option<(u64, u32)>,
+    /// Coalesced firmware recovery: host generation, record count, and the
+    /// exact EventMachine stamp/QID blamed by type 4 when one was supplied.
+    /// Keep the blame with the deferred recovery work so the worker can settle
+    /// the affected output fence after the firmware's final clear.
+    pending_primary_recovery: Option<(u64, u32, Option<u8>)>,
     /// Tag-14 AddKicks held back until the firmware recovery/power-up closes.
     pending_add_kicks: Option<[u8; g17_submission::G17P_KSM_ADD_KICKS_COMMAND_SIZE]>,
     /// Descriptor address published by the most recent compute submission.
@@ -2113,15 +2117,19 @@ impl G17PManagerConstruction {
         &mut self,
         generation: u64,
         records: u32,
+        blamed_stamp: Option<u8>,
     ) -> Result {
         if records == 0 || self.pending_primary_recovery.is_some() {
             return Err(EBUSY);
         }
-        self.pending_primary_recovery = Some((generation, records));
+        if blamed_stamp.is_some_and(|stamp| stamp >= 128) {
+            return Err(EINVAL);
+        }
+        self.pending_primary_recovery = Some((generation, records, blamed_stamp));
         Ok(())
     }
 
-    pub(crate) fn pending_primary_recovery(&self) -> Option<(u64, u32)> {
+    pub(crate) fn pending_primary_recovery(&self) -> Option<(u64, u32, Option<u8>)> {
         self.pending_primary_recovery
     }
 
@@ -2129,8 +2137,9 @@ impl G17PManagerConstruction {
         &mut self,
         generation: u64,
         records: u32,
+        blamed_stamp: Option<u8>,
     ) -> Result {
-        if self.pending_primary_recovery != Some((generation, records)) {
+        if self.pending_primary_recovery != Some((generation, records, blamed_stamp)) {
             return Err(EINVAL);
         }
         self.pending_primary_recovery = None;
