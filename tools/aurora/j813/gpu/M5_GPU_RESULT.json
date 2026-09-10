@@ -1,0 +1,44 @@
+{
+  "date": "2026-09-10",
+  "target": "J813 / T8142 / M5",
+  "kernel": "7.1.6-aurora-j813-gpu-v9",
+  "gpu_identity": {
+    "generation": "G17",
+    "variant": "G",
+    "revision": "C0",
+    "dies": 1,
+    "clusters": 1,
+    "active_cores": 10,
+    "uat_input_bits": 42,
+    "uat_output_bits": 42,
+    "registers": ["0b022000", "000b0800", "0011010a", "00040404", "01320311", "10030302"]
+  },
+  "firmware": {
+    "capture": "Two matching pre-Linux DRAM reads per segment",
+    "rtkit_version": "3255.160.4.release",
+    "gfx_text_sha256": "3e18b07b5b1d11c8d8b855cb9a31c9aebce1e8fc5fe859465767d1a6e4f847b0",
+    "gfx1_text_sha256": "58eb5cb3a093d5529368f90d79cb41a9dc6177f19eaf586e0fea5cf3089f6c3c",
+    "boot_local_reservations": 6,
+    "runtime_admitted": false
+  },
+  "regression": {
+    "wifi_dhcp": true,
+    "wifi_ping_target": "8.8.8.8",
+    "wifi_ping_sent": 5,
+    "wifi_ping_received": 5,
+    "bluetooth_initialized": true,
+    "bluetooth_tx_errors": 0,
+    "bluetooth_rx_errors": 0,
+    "bluetooth_pairing_audio_retested": false,
+    "keyboard_registered": true,
+    "trackpad_registered": true,
+    "physical_input_retested": false,
+    "encoding_retested_on_v9": false
+  },
+  "render_node": false,
+  "gpu_compute_qualified": false,
+  "gpu_rendering_qualified": false,
+  "gpu_power_gating_qualified": false,
+  "dcp_qualified": false,
+  "resident_stage1_modified": false
+}

@@ -24,16 +24,17 @@ print('TARGET_CONFIRMED J813 Mac17,3 T8142', flush=True)
 if '--gpu-inventory' in sys.argv:
     runpy.run_path(str(root / 'inspect-gpu-topology.py'))['capture_gpu_topology'](u, root / 'logs')
 
-selected = [name for name in ('wifi', 'bluetooth', 'desktop', 'input', 'video', 'video-v4l2') if '--' + name in sys.argv]
+selected = [name for name in ('wifi', 'bluetooth', 'desktop', 'input', 'video', 'video-v4l2', 'gpu') if '--' + name in sys.argv]
 if len(selected) > 1:
-    raise ValueError('Select one payload: --wifi, --bluetooth, --desktop, --input, --video or --video-v4l2')
+    raise ValueError('Select one payload: --wifi, --bluetooth, --desktop, --input, --video, --video-v4l2 or --gpu')
 flavor = selected[0] if selected else None
-video = flavor in ('video', 'video-v4l2')
+gpu = flavor == 'gpu'
+video = flavor in ('video', 'video-v4l2', 'gpu')
 input_enabled = flavor == 'input' or video
 wifi = flavor is not None
 artifacts = root / 'artifacts'
 if flavor:
-    artifacts /= ('video/v4l2' if flavor == 'video-v4l2' else
+    artifacts /= ('gpu/native' if gpu else 'video/v4l2' if flavor == 'video-v4l2' else
                   'video/native' if video else 'desktop' if flavor == 'input' else flavor)
 kernel = (artifacts / 'Image').read_bytes()
 initrd = (artifacts / 'initramfs.cpio.gz').read_bytes()
@@ -43,6 +44,8 @@ if (b'mtp@394600000\0' in dtb) != input_enabled:
     raise ValueError('The MTP device tree requires --input or --video and scoped DAPF preparation')
 if (b'apple,t8142-ave\0' in dtb) != video:
     raise ValueError('The M5 encoder DT requires --video and firmware preflight')
+if (b'apple,agx-t8142\0' in dtb) != gpu:
+    raise ValueError('The M5 GPU DT requires --gpu and boot-local resource preflight')
 uboot = (root / 'u-boot/u-boot-nodtb.bin').read_bytes()
 
 if video:
@@ -51,6 +54,10 @@ if video:
     # AVE; it must not be used as though it were MTP's single DAPF bank.
     runpy.run_path(str(root / 'video/ave-boot-preflight.py'))['prepare_ave_firmware'](
         u, p, iface, root / 'logs' / ('m5-ave-native-firmware-' + str(time.time_ns())))
+
+if gpu:
+    runpy.run_path(str(root / 'gpu/gpu-boot-preflight.py'))['prepare_gpu'](
+        u, iface, root / 'logs' / ('m5-gpu-native-firmware-' + str(time.time_ns())))
 
 kernel_addr = u.memalign(2 * 1024 * 1024, 64 * 1024 * 1024)
 initrd_addr = u.memalign(65536, len(initrd))
