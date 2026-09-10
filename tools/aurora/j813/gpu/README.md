@@ -25,6 +25,11 @@ is evidence of GPU rendering.
   preserved. The probe completed in 52,972 microseconds with no observed
   firmware crash. Stop requests succeeded and the module remains pinned
   until reboot. No GPU job was submitted.
+- A further fresh boot repeated both acknowledgments, then sent the single
+  native `0x89` power-transition-end note to GFX followed by GFX1. Both
+  control queues advanced from `[0, 0, 1]` to `[1, 1, 1]`, consuming their
+  measured opening records. The complete probe took 63,184 microseconds
+  with no observed firmware crash. This still submits no GPU job.
 - U-Boot's default four-bank limit had discarded GPU page-table and DATA
   reservations. `apple_m1_defconfig` now uses `CONFIG_NR_DRAM_BANKS=32`,
   matching m1n1's limit. Linux retains all eight handed-off banks and can
@@ -184,6 +189,12 @@ GFX1's root before GFX's root and waits for each exact acknowledgment. It
 requests both CPU stops afterward and retains ownership until reboot,
 including on failures after firmware start. Do not unload it, load the C
 RTKit probe alongside it, or restart either processor in that boot.
+
+For the next bounded stage, use `modprobe asahi m5_initdata_test=2` on a
+fresh boot of the same payload. After both acknowledgments it sends one
+native power-transition-end message to GFX, then GFX1, and checks both
+control queues consumed their opening records. It adds no queue records
+or GPU commands and retains the same stop-and-pin lifecycle.
 
 The firmware handoff page is observed to remain zero in macOS. The M5-only
 no-peer handoff path has now passed initialization; it does not establish

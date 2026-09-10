@@ -103,7 +103,7 @@
     "owners_pinned_until_reboot": true
   },
   "linux_initdata": {
-    "fresh_ram_boots_passed": 1,
+    "fresh_ram_boots_passed": 2,
     "firmware_profile_required": "M5-RTKit-3255.160.4.release",
     "uboot_dram_bank_limit": 32,
     "m1n1_memory_banks_preserved": 8,
@@ -120,6 +120,17 @@
     "module_pinned_until_reboot": true,
     "gpu_jobs_submitted": 0,
     "firmware_cache_flush_qualified": false
+  },
+  "linux_control_opening": {
+    "fresh_ram_boots_passed": 1,
+    "power_transition_end_order": ["GFX", "GFX1"],
+    "power_transition_end_message": "0x0089000000000000",
+    "messages_per_role": 1,
+    "before": [[0, 0, 1], [0, 0, 1]],
+    "after": [[1, 1, 1], [1, 1, 1]],
+    "probe_microseconds": 63184,
+    "firmware_crashes_observed": 0,
+    "gpu_jobs_submitted": 0
   },
   "render_node": false,
   "gpu_compute_qualified": false,

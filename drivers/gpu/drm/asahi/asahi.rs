@@ -78,7 +78,7 @@ kernel::module_platform_driver! {
     params: {
         m5_initdata_test: u32 {
             default: 0,
-            description: "M5-only fresh RAM boot: test both initdata ACKs, then stop processors; no DRM registration",
+            description: "M5 fresh RAM boot: 1=initdata ACKs, 2=also retire native control openings; then stop, no DRM",
         },
         debug_flags: u64 {
             default: 0,
