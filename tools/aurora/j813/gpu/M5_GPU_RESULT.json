@@ -113,8 +113,9 @@
     "kernel_build_passed": true,
     "first_bind_execution_qualified": false,
     "queue_install_qualified": true,
+    "scheduler_bind_qualified": true,
     "runtime_wired": true,
-    "runtime_scope": "Tag-15 queue install only; scheduler and context updates disabled",
+    "runtime_scope": "Tag-15 queue install and scheduler bind; context and event updates disabled",
     "linux_gpu_execution_qualified": false
   },
   "source_codecs": {
@@ -216,6 +217,24 @@
     "owners_pinned_until_reboot": true,
     "console_log_sha256": "eb246f44f3026efc167fd2cd3ec268ab7299db898b95b3efe437d1d3fead4072",
     "boot_log_sha256": "1ea0720bc2002f71358a7459bb02e32a3ad62497ffb4dbae7cfdbf220c512b20"
+  },
+  "linux_sksm_scheduler_bind": {
+    "fresh_ram_boots_passed": 1,
+    "module_parameter": "m5_initdata_test=4",
+    "queue_id": 11,
+    "scheduler_update": true,
+    "context_update": false,
+    "event_attached": false,
+    "firmware_pointer_control_header_bitmap_before": ["0x0", "0xffff", "0x0"],
+    "firmware_pointer_control_header_bitmap_after": ["0xfffffc20c0007200", "0x2040000", "0x800"],
+    "outer_after": [1, 1, 1],
+    "inner_after": [1, 1, 1],
+    "gpu_jobs_submitted": 0,
+    "firmware_crashes_observed": 0,
+    "stop_requests_succeeded": 2,
+    "owners_pinned_until_reboot": true,
+    "console_log_sha256": "fe524e734e9eb20afb30836d5f273f765d1e457418bb091116579bd4764d3872",
+    "boot_log_sha256": "d47baed809134671cedc339132e105218fbb5af2eae63053fe10599cf60f73d9"
   },
   "render_node": false,
   "gpu_compute_qualified": false,

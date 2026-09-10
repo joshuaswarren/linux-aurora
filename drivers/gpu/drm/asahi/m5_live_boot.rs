@@ -105,7 +105,7 @@ impl M5Session {
         unsafe { core::arch::asm!("mrs {value}, cntvct_el0", value = out(reg) timestamp,
             options(nomem, nostack, preserves_flags)); }
         self.memory = Some(M5FirmwareMemory::new_with_uat(
-            &self.dev, self.uat.clone(), timestamp, probe_kind >= 3)?);
+            &self.dev, self.uat.clone(), timestamp, probe_kind)?);
         self.uat.confirm_t8140_primary_high_root(roots)?;
         self.uat.mirror_t8140_secondary_high_root()?;
         dev_info!(self.dev.as_ref(), "M5_INIT retained memory graph mapped\n");
@@ -174,6 +174,7 @@ impl M5Session {
     fn install_queue_probe(&mut self) -> Result {
         let memory = self.memory.as_mut().ok_or(EIO)?;
         dev_info!(self.dev.as_ref(), "M5_QUEUE before tag15-only {:?}\n", memory.queue_probe_status()?);
+        dev_info!(self.dev.as_ref(), "M5_QUEUE scheduler before {:x?}\n", memory.scheduler_probe_status()?);
         memory.publish_queue_probe()?;
         // Native M5 encodes CL_2 as 2 | (2 << 2), on GFX endpoint 0x21.
         Pin::new(&mut self.roles[0].rtkit).send_message(0x21, 0x0083_0000_0000_000a)?;
@@ -183,15 +184,19 @@ impl M5Session {
                 return Err(EIO);
             }
             let (outer, inner, slot) = memory.queue_probe_status()?;
+            let scheduler = memory.scheduler_probe_status()?;
             if outer == [1; 3] && inner == [1; 3]
-                && M5FirmwareMemory::queue_probe_installed(slot) {
+                && M5FirmwareMemory::queue_probe_installed(slot)
+                && M5FirmwareMemory::scheduler_probe_bound(scheduler) {
                 dev_info!(self.dev.as_ref(), "M5_QUEUE installed qid11 outer={:?} inner={:?} slot={:x?}; no kicks\n",
                     outer, inner, slot);
+                dev_info!(self.dev.as_ref(), "M5_QUEUE scheduler bound {:x?}\n", scheduler);
                 return Ok(());
             }
             fsleep(Delta::from_millis(1));
         }
         dev_err!(self.dev.as_ref(), "M5_QUEUE install timeout {:?}\n", memory.queue_probe_status()?);
+        dev_err!(self.dev.as_ref(), "M5_QUEUE scheduler timeout {:x?}\n", memory.scheduler_probe_status()?);
         Err(ETIMEDOUT)
     }
 }

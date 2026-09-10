@@ -59,7 +59,7 @@ impl M5FirmwareMemory {
         dev: &AsahiDevice,
         uat: Arc<mmu::Uat>,
         boot_timestamp: u64,
-        prepare_queue_probe: bool,
+        probe_kind: u32,
     ) -> Result<Self> {
         if !uat.is_t8142_geometry() {
             return Err(ENODEV);
@@ -195,8 +195,8 @@ impl M5FirmwareMemory {
         // Writes to all CPU WC mappings precede any future handoff. Only
         // the two measured control openings are present; work rings and
         // later compute/render descriptors remain unsubmitted.
-        let queue_probe = if prepare_queue_probe {
-            Some(M5QueueProbe::new(dev, &uat)?)
+        let queue_probe = if probe_kind >= 3 {
+            Some(M5QueueProbe::new(dev, &uat, probe_kind >= 4)?)
         } else {
             None
         };
@@ -245,6 +245,9 @@ impl M5FirmwareMemory {
         if outer != [0; 3] || inner != [0, 0, 1] || slot != [0; 5] {
             return Err(EBUSY);
         }
+        if let Some(status) = self.scheduler_probe_status()? {
+            if status != [0, 0xffff, 0] { return Err(EBUSY); }
+        }
         let address = self.queue_probe.as_ref().ok_or(EINVAL)?.queue_address();
         self.shared.with_bytes_mut(|out| {
             // Hardware capture: main row8 ring=shared+0x19dc0, 256*24B.
@@ -268,5 +271,13 @@ impl M5FirmwareMemory {
 
     pub(crate) fn queue_probe_installed(slot: [u64; 5]) -> bool {
         M5QueueProbe::is_installed(slot)
+    }
+
+    pub(crate) fn scheduler_probe_status(&mut self) -> Result<Option<[u64; 3]>> {
+        self.queue_probe.as_mut().ok_or(EINVAL)?.scheduler_status()
+    }
+
+    pub(crate) fn scheduler_probe_bound(status: Option<[u64; 3]>) -> bool {
+        M5QueueProbe::scheduler_bound(status)
     }
 }
