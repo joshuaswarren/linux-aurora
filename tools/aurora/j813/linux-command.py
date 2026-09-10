@@ -14,6 +14,8 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('command')
 parser.add_argument('--timeout', type=float, default=30)
 args = parser.parse_args()
+if len(args.command.encode()) > 900:
+    parser.error('Command exceeds the console line budget; upload a script instead')
 token = secrets.token_hex(8)
 end = 'J813_COMMAND_' + token
 with serial.Serial('/dev/cu.kis-01100000-ch-0', 1500000, timeout=0.2) as port:

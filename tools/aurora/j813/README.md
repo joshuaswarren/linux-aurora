@@ -4,10 +4,16 @@ The primary driver is `drivers/net/wireless/apple/centauri/` on
 `linux-aurora/j813`. All companion repositories also use `j813`; see
 [source locations and setup](SOURCE-REVISIONS.md).
 
+**September 10, 2026:** [N1 Bluetooth](N1-BLUETOOTH.md) has hardware proof of
+pairing, encrypted reconnection and AVDTP endpoint discovery. The
+[desktop campaign](DESKTOP.md) now boots SimpleDRM with working Wi-Fi and
+Bluetooth; full XFCE startup, physical input, GPU acceleration and audio
+playback remain unqualified. All payloads are RAM loaded.
+
 **September 9, 2026: N1 Wi-Fi completes DHCP and bidirectional traffic.**
 A macOS m1n1 trace exposed missing TX packet-preparation value 4; a Linux
 0/4/0 crossover proved the fix. A fresh RAM boot with the normal TX queue
-received 192.168.68.62/22, passed router and incoming host pings, resolved DNS
+received a DHCP lease, passed router and incoming host pings, resolved DNS
 and downloaded an HTTP page. One initial external ping was lost; the
 follow-up passed 10/10. See [packet evidence](N1-DATA-RINGS.md) and
 [current limitations](N1-PROGRESS.md). The running target remains in native
