@@ -29,12 +29,12 @@ def install():
                 actual = self.proxy.gzdec(address, compressed_length, destination, len(data))
                 if actual != len(data):
                     raise RuntimeError(f'KIS decompression length {actual} != {len(data)}')
-                # A single 15-MiB frame-table read exhausted the KIS receive
-                # window near its end. Bound each transaction while hashing
-                # every returned byte, just as for the kernel upload chunks.
+                # Large reads can exhaust the KIS receive window: a 1-MiB
+                # transaction also truncated during Bluetooth image checking.
+                # Keep transactions at 256 KiB while still hashing every byte.
                 readback_digest = hashlib.sha256()
-                for offset in range(0, len(data), 1024 * 1024):
-                    size = min(1024 * 1024, len(data) - offset)
+                for offset in range(0, len(data), 256 * 1024):
+                    size = min(256 * 1024, len(data) - offset)
                     chunk = self.iface.readmem(destination + offset, size)
                     if len(chunk) != size:
                         raise RuntimeError(f'KIS short readback at {destination + offset:#x}')

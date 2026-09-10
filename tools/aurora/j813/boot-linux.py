@@ -22,9 +22,12 @@ u = ProxyUtils(p)
 assert u.adt.model == 'Mac17,3'
 print('TARGET_CONFIRMED J813 Mac17,3 T8142', flush=True)
 
-artifacts = root / ('artifacts/wifi' if '--wifi' in sys.argv else 'artifacts')
-kernel = (artifacts / 'Image').read_bytes()
-initrd = (artifacts / 'initramfs.cpio.gz').read_bytes()
+wifi = '--wifi' in sys.argv or '--bluetooth' in sys.argv
+artifacts = root / ('artifacts/wifi' if wifi else 'artifacts')
+kernel_path = root / 'artifacts/bluetooth/Image' if '--bluetooth' in sys.argv else artifacts / 'Image'
+kernel = kernel_path.read_bytes()
+initrd_path = root / 'artifacts/bluetooth/initramfs.cpio.gz' if '--bluetooth' in sys.argv else artifacts / 'initramfs.cpio.gz'
+initrd = initrd_path.read_bytes()
 dtb = (artifacts / 't8142-j813.dtb').read_bytes()
 uboot = (root / 'u-boot/u-boot-nodtb.bin').read_bytes()
 
@@ -53,7 +56,7 @@ p.kboot_set_uboot('baudrate', '1500000')
 p.kboot_set_uboot('stdin', 'serial')
 # Keep the initial bring-up on the already-running boot CPU. m1n1 prunes the
 # cold CPU nodes and leaves the boot CPU selected by MPIDR.
-if '--wifi' in sys.argv:
+if wifi:
     runpy.run_path(str(root / 'prepare-n1-pcie.py'), init_globals={'p': p, 'u': u, 'iface': iface})
 result = p.kboot_prepare_dt(dtb_addr)
 if result:
