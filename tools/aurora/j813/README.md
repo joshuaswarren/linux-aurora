@@ -6,9 +6,13 @@ The primary driver is `drivers/net/wireless/apple/centauri/` on
 
 **September 10, 2026:** [N1 Bluetooth](N1-BLUETOOTH.md) has hardware proof of
 pairing, encrypted reconnection and AVDTP endpoint discovery. The
-[desktop campaign](DESKTOP.md) now boots SimpleDRM with working Wi-Fi and
-Bluetooth; full XFCE startup, physical input, GPU acceleration and audio
-playback remain unqualified. All payloads are RAM loaded.
+[desktop campaign](DESKTOP.md) now runs XFCE with a working terminal, Wi-Fi,
+and native Bluetooth startup. [Built-in input](INPUT.md) is hardware-verified:
+the combined v7 desktop recorded physical events from both the keyboard and
+trackpad through Xorg/libinput. Fastfetch, a live Wi-Fi ping demo, and btop
+are displayed on the M5. The U-Boot J813 guard preserves a cold MTP start for
+Linux. GPU acceleration, Bluetooth audio playback, and full trackpad gesture
+quality remain unqualified. All payloads are RAM loaded.
 
 **September 9, 2026: N1 Wi-Fi completes DHCP and bidirectional traffic.**
 A macOS m1n1 trace exposed missing TX packet-preparation value 4; a Linux

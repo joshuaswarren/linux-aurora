@@ -28,7 +28,9 @@ def capture_gpu_topology(u, output):
 
     result = {'model': u.adt.model, 'source': 'live m1n1 ADT; no MMIO accesses', 'nodes': {}}
     for path in ('/arm-io/sgx', '/arm-io/gfx-asc', '/arm-io/gfx1-asc',
-                 '/arm-io/pmgr', '/arm-io/dart-gfx', '/arm-io/dart-gfx1'):
+                 '/arm-io/pmgr', '/arm-io/dart-gfx', '/arm-io/dart-gfx1',
+                 '/arm-io/aic', '/arm-io/uart0', '/arm-io/mtp',
+                 '/arm-io/dart-mtp', '/arm-io/dockchannel-mtp'):
         try:
             node = u.adt[path]
         except KeyError:
@@ -36,7 +38,8 @@ def capture_gpu_topology(u, output):
             continue
         entry = {'present': True, 'property_names': sorted(node._properties)}
         if 'reg' in node._properties:
-            entry['physical_regs'] = [{'address': hex(a), 'size': hex(s)}
+            entry['raw_regs'] = plain(node.reg)
+            entry['translated_regs'] = [{'address': hex(a), 'size': hex(s)}
                                       for a, s in (node.get_reg(i) for i in range(len(node.reg)))]
         entry['properties'] = {key: plain(node._properties[key]) for key in selected
                                if key in node._properties}
