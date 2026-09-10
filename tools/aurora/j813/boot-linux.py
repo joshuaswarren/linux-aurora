@@ -21,14 +21,21 @@ bootstrap_port(iface, p)
 u = ProxyUtils(p)
 assert u.adt.model == 'Mac17,3'
 print('TARGET_CONFIRMED J813 Mac17,3 T8142', flush=True)
+if '--gpu-inventory' in sys.argv:
+    runpy.run_path(str(root / 'inspect-gpu-topology.py'))['capture_gpu_topology'](u, root / 'logs')
 
-wifi = '--wifi' in sys.argv or '--bluetooth' in sys.argv
-artifacts = root / ('artifacts/wifi' if wifi else 'artifacts')
-kernel_path = root / 'artifacts/bluetooth/Image' if '--bluetooth' in sys.argv else artifacts / 'Image'
-kernel = kernel_path.read_bytes()
-initrd_path = root / 'artifacts/bluetooth/initramfs.cpio.gz' if '--bluetooth' in sys.argv else artifacts / 'initramfs.cpio.gz'
-initrd = initrd_path.read_bytes()
-dtb = (artifacts / 't8142-j813.dtb').read_bytes()
+selected = [name for name in ('wifi', 'bluetooth', 'desktop') if '--' + name in sys.argv]
+if len(selected) > 1:
+    raise ValueError('Select one payload: --wifi, --bluetooth or --desktop')
+flavor = selected[0] if selected else None
+wifi = flavor is not None
+artifacts = root / 'artifacts'
+if flavor:
+    artifacts /= flavor
+kernel = (artifacts / 'Image').read_bytes()
+initrd = (artifacts / 'initramfs.cpio.gz').read_bytes()
+dtb_dir = root / 'artifacts/wifi' if flavor == 'bluetooth' else artifacts
+dtb = (dtb_dir / 't8142-j813.dtb').read_bytes()
 uboot = (root / 'u-boot/u-boot-nodtb.bin').read_bytes()
 
 kernel_addr = u.memalign(2 * 1024 * 1024, 64 * 1024 * 1024)
@@ -47,6 +54,10 @@ for label, address, data in [('Image', kernel_addr, kernel),
 bootargs = ('earlycon=dockchannel,0x38812c000 console=tty0 console=ttyDC0 '
             'keep_bootcon ignore_loglevel loglevel=8 initcall_debug '
             'maxcpus=1 nokaslr rdinit=/init panic=0')
+if flavor == 'desktop':
+    # Ask DRM fbdev for the conventional 32-bpp desktop surface. SimpleDRM
+    # converts its shadow buffer into the firmware's native 10-bit RGB layout.
+    bootargs += ' video=2560x1664-32'
 p.kboot_set_chosen('bootargs', bootargs)
 p.kboot_set_chosen('stdout-path', 'serial0:1500000n8')
 p.kboot_set_initrd(initrd_addr, len(initrd))
@@ -81,6 +92,9 @@ while time.monotonic() < deadline:
     captured.extend(chunk)
     if not sent and b'AURORA_J813_LINUX_INITRAMFS_READY' in captured and b'# ' in captured[-256:]:
         time.sleep(0.5)
+        if flavor == 'desktop':
+            now = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())
+            iface.dev.write(f"date -u -s '{now}'\n".encode())
         iface.dev.write(b"echo AURORA_NATIVE_VERIFY_BEGIN; uname -a; cat /sys/devices/system/cpu/online; cat /proc/uptime; sleep 2; cat /proc/uptime; cat /proc/meminfo | head -5; echo AURORA_NATIVE_VERIFY_DONE\n")
         sent = True
     if sent and b'\nAURORA_NATIVE_VERIFY_DONE\r\n' in captured:
