@@ -1197,6 +1197,22 @@ int apple_rtkit_quiesce(struct apple_rtkit *rtk)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_quiesce);
 
+int apple_rtkit_poweroff_adopted(struct apple_rtkit *rtk)
+{
+	int ret;
+
+	if (!rtk->adopted || rtk->epmap_only)
+		return -EINVAL;
+
+	/* Do not retire inherited buffers until the IOP acknowledges OFF. */
+	ret = apple_rtkit_set_iop_power_state(rtk, APPLE_RTKIT_PWR_STATE_OFF);
+	if (ret)
+		return ret;
+
+	return apple_rtkit_reinit(rtk);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_poweroff_adopted);
+
 int apple_rtkit_wake(struct apple_rtkit *rtk)
 {
 	u64 msg;
