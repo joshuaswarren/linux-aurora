@@ -8,12 +8,15 @@ root = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(root / "m1n1/proxyclient"))
 from m1n1.proxy import Serial
 
+mode = int(sys.argv[1]) if len(sys.argv) == 2 else 3
+if len(sys.argv) > 2 or mode not in (3, 4):
+    raise ValueError("Expected probe mode 3 (queue install) or 4 (scheduler bind)")
 command = (
     "echo M5_QUEUE_PROBE_BEGIN; "
     "if grep -q apple,j813 /proc/device-tree/compatible "
     "&& [ $(uname -r) = 7.1.6-aurora-j813-gpu-v9 ] "
     "&& [ ! -d /sys/module/asahi ]; then "
-    "modprobe asahi m5_initdata_test=3; echo M5_QUEUE_PROBE_RETURN=$?; "
+    f"modprobe asahi m5_initdata_test={mode}; echo M5_QUEUE_PROBE_RETURN=$?; "
     "dmesg | tail -180; "
     "else echo M5_QUEUE_PROBE_WRONG_TARGET_OR_ALREADY_LOADED; fi; "
     "echo M5_QUEUE_PROBE_DONE\n"
@@ -35,6 +38,8 @@ with Serial("/dev/cu.kis-01100000-ch-0", 115200, timeout=0.2) as port:
         raise RuntimeError("M5 probe did not return within 60 seconds; retain its owners")
 required = [b"M5_QUEUE installed qid11", b"\nM5_QUEUE_PROBE_RETURN=0\r\n",
             b"M5_INIT transaction result=Ok(())", b"M5_INIT stop requests=Ok(())"]
+if mode == 4:
+    required.append(b"M5_QUEUE scheduler bound Some(")
 if any(marker not in captured for marker in required):
     raise RuntimeError("Queue installation was not verified; inspect the retained log")
 print("M5_QUEUE_INSTALL_HARDWARE_VERIFIED")

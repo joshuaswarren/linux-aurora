@@ -4,7 +4,8 @@ The native Linux candidate identifies the physical T8142 GPU as
 **G17G revision C0, one die, one cluster, ten active cores**. Both M5 GPU
 firmware processors now complete RTKit startup and acknowledge Linux-owned
 initialization data in the native RAM-boot experiment. Linux also registers
-an owned SKSM compute queue and verifies the firmware's retained record.
+an owned SKSM compute queue, binds its scheduler control, and verifies the
+firmware's retained records.
 It does not yet
 execute GPU work or expose a render node. DCP presentation is a later,
 independent qualification; neither a software desktop nor encoder success
@@ -19,6 +20,12 @@ is evidence of GPU rendering.
   verifies both aliases, priority 2 and compute data master 2. The probe
   submitted no kick, shader, scheduler binding or context update. Both
   firmware stop requests succeeded and all owners remain pinned.
+- Another fresh RAM boot with `m5_initdata_test=4` additionally bound the
+  owned scheduler control. Its firmware pointer/header/queue bitmap changed
+  from `[0, ffff, 0]` to `[fffffc20c0007200, 2040000, 800]`: both scheduler
+  slots allocated as zero, state 4, priority 2, and queue-11 bit set. Both
+  rings again completed and both firmware stop requests succeeded. This
+  still submits no shader and does not attach a user context or event.
 - A fresh RAM boot with the exact T8142 ASCWrap-v6 providers completed both
   roles' HELLO/EPMAP exchanges: protocol 12, endpoints 0, 1, 32 and 33.
   Each provider delivered three receive interrupts through AIC3. GFX1 was
@@ -138,7 +145,8 @@ separate generic configuration function missed that path. The production
 taking queue fields, descriptor flags and the scheduler pointer from their
 native owners. Remaining event/owner values are opaque inputs. Disabled event
 sentinels also follow the native branch. Queue installation now passes on
-Linux; scheduler/context first-bind execution remains untested.
+Linux, followed by scheduler first-bind. User-context and event attachment
+remain untested.
 
 `verify-m5-channel.py` checks that byte match against a private capture.
 `test-m5-sksm-capture.py` checks capture guards, filtered submissions and
@@ -257,6 +265,13 @@ and requires both consumed counters and the firmware-owned queue record.
 Reserved firmware DATA uses its normal WB RAM mapping with read-only cache
 invalidation before observation; a WC alias of System RAM is invalid.
 The same stop-and-pin lifecycle applies. This test submits no GPU job.
+
+Mode 4 additionally sets `update_scheduler=true`. The firmware must store
+the owned control pointer at its queue-indexed table, allocate the control's
+two slot IDs, set state 4 and mark queue 11 in the control's bitmap. Run
+`run-m5-queue-install-probe.py 4` after a fresh RAM boot. This qualified stage
+still disables context updates and the optional event machine; it submits
+no register program or SKSM kick.
 
 The firmware handoff page is observed to remain zero in macOS. The M5-only
 no-peer handoff path has now passed initialization; it does not establish

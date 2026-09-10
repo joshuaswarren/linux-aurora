@@ -35,8 +35,8 @@ pub(crate) struct M5ChannelConfig {
     pub(crate) ring_high: u64,
     pub(crate) queue_id: u8,
     pub(crate) priority: u8,
-    /// Native descriptor +0x181 bit 0. First-bind semantics still require
-    /// M5 firmware/runtime validation; an already-installed capture has 0.
+    /// Native descriptor +0x181 bit 0. Mode 3 validates the first queue
+    /// installation on M5; an already-installed native capture has 0.
     pub(crate) install_queue: bool,
     /// Native descriptor +0x144, independently matched to the UAT context.
     pub(crate) gpu_context: u8,

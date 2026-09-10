@@ -19,6 +19,8 @@ const CONFIG: usize = 0xa800;
 // GFX RTKit-3255.160.4 has TEXT at +0 and DATA at +0x4c000.
 // Its tag-15 handler 0x122a4..0x12434 installs qid*0x28 at +0x127430.
 const FIRMWARE_SLOT: usize = 0x127430 - 0x4c000 + QUEUE_ID as usize * 0x28;
+// Tag-15 scheduler binding stores its control pointer at 0x1257e0 + qid*8.
+const FIRMWARE_SCHEDULER: usize = 0x1257e0 - 0x4c000 + QUEUE_ID as usize * 8;
 
 struct FirmwareDataView {
     map: io::mem::Mem,
@@ -35,10 +37,11 @@ pub(super) struct M5QueueProbe {
     entry: MappedObject,
     graph: MappedObject,
     firmware: FirmwareDataView,
+    bind_scheduler: bool,
 }
 
 impl M5QueueProbe {
-    pub(super) fn new(dev: &AsahiDevice, uat: &mmu::Uat) -> Result<Self> {
+    pub(super) fn new(dev: &AsahiDevice, uat: &mmu::Uat, bind_scheduler: bool) -> Result<Self> {
         if !uat.is_t8142_geometry() {
             return Err(ENODEV);
         }
@@ -58,9 +61,9 @@ impl M5QueueProbe {
             ring_low: ENTRY_LOW, ring_high: ENTRY_HIGH, queue_id: QUEUE_ID, priority: 2,
             install_queue: true, gpu_context: 3, event: None,
             channel_control: GRAPH_BASE + CONTROL as u64,
-            // Only the firmware queue-install branch is exercised. No user
-            // context, scheduler owner, event machine or shader is activated.
-            update_scheduler: false, scheduler_index: 0, channel_stamp_index: 0,
+            // Mode 4 additionally binds the owned scheduler control. Neither
+            // mode attaches a user context, event machine or shader.
+            update_scheduler: bind_scheduler, scheduler_index: 0, channel_stamp_index: 0,
             update_context: false, owner_context: 0, extended_command: false,
         }).map_err(|_| EINVAL)?;
         graph.with_bytes_mut(|out| {
@@ -84,7 +87,7 @@ impl M5QueueProbe {
             out[JOB_LIST + 8..JOB_LIST + 16]
                 .copy_from_slice(&(GRAPH_BASE + JOB_LIST as u64).to_le_bytes());
             // Native M5 scheduler-control initial view. It is retained but
-            // not attached by the tag-15-only probe (update_scheduler=false).
+            // attached only by the explicit mode-4 scheduler experiment.
             out[CONTROL..CONTROL + 2].fill(0xff);
             out[CONTROL + 5] = 1;
             out[CONTROL + 0x26] = 2;
@@ -99,7 +102,8 @@ impl M5QueueProbe {
         if resource.size() != 0x134000 || resource.start() < 0x100_0000_0000
             || resource.start() & 0x3fff != 0
             || resource.start().checked_add(resource.size()).ok_or(EOVERFLOW)? > 0x104_0000_0000
-            || FIRMWARE_SLOT + 0x28 > resource.size() as usize {
+            || FIRMWARE_SLOT + 0x28 > resource.size() as usize
+            || FIRMWARE_SCHEDULER + 8 > resource.size() as usize {
             return Err(EINVAL);
         }
         let ctr: u64;
@@ -114,10 +118,11 @@ impl M5QueueProbe {
         // checked above and by the caller. WB matches the System RAM linear
         // mapping; creating a WC alias of that RAM would be invalid. The host
         // never writes this firmware-owned extent. Each observation invalidates
-        // the covering cache lines before reading the 40-byte queue slot.
+        // the covering cache lines before reading the queue/scheduler slots.
         let map = unsafe { io::mem::Mem::try_new(resource, io::mem::MemFlag::WB.into()) }?;
         fence(Ordering::SeqCst);
-        Ok(Self { entry_alias, entry, graph, firmware: FirmwareDataView { map, cache_line } })
+        Ok(Self { entry_alias, entry, graph, firmware: FirmwareDataView { map, cache_line },
+            bind_scheduler })
     }
 
     pub(super) fn queue_address(&self) -> u64 {
@@ -130,10 +135,11 @@ impl M5QueueProbe {
             self.graph.read_u32(GRAPH_BASE + POINTERS as u64 + 0x40)?])
     }
 
-    pub(super) fn firmware_slot(&self) -> [u64; 5] {
+    fn firmware_words<const N: usize>(&self, offset: usize) -> [u64; N] {
+        // The only callers use the two constructor-checked table extents.
         let line = self.firmware.cache_line;
-        let start = FIRMWARE_SLOT & !(line - 1);
-        let end = (FIRMWARE_SLOT + 0x28 + line - 1) & !(line - 1);
+        let start = offset & !(line - 1);
+        let end = (offset + N * 8 + line - 1) & !(line - 1);
         for offset in (start..end).step_by(line) {
             // SAFETY: Both covering lines are wholly inside the aligned,
             // retained firmware-owned DATA extent. No host code writes that
@@ -145,15 +151,35 @@ impl M5QueueProbe {
         }
         // SAFETY: Wait for the preceding invalidations before volatile reads.
         unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
-        let mut out = [0; 5];
+        let mut out = [0; N];
         for (index, value) in out.iter_mut().enumerate() {
             // SAFETY: The constructor bounds-checks the entire aligned slot
             // inside this retained reserved-RAM mapping. Firmware is its writer.
             *value = unsafe { core::ptr::read_volatile(
-                self.firmware.map.ptr().add(FIRMWARE_SLOT + index * 8).cast::<u64>()) };
+                self.firmware.map.ptr().add(offset + index * 8).cast::<u64>()) };
         }
         fence(Ordering::Acquire);
         out
+    }
+
+    pub(super) fn firmware_slot(&self) -> [u64; 5] {
+        self.firmware_words::<5>(FIRMWARE_SLOT)
+    }
+
+    pub(super) fn scheduler_status(&mut self) -> Result<Option<[u64; 3]>> {
+        if !self.bind_scheduler { return Ok(None); }
+        Ok(Some([self.firmware_words::<1>(FIRMWARE_SCHEDULER)[0],
+            u64::from(self.graph.read_u32(GRAPH_BASE + CONTROL as u64)?),
+            self.graph.read_u64(GRAPH_BASE + CONTROL as u64 + 0x12)?]))
+    }
+
+    pub(super) fn scheduler_bound(status: Option<[u64; 3]>) -> bool {
+        match status {
+            None => true,
+            Some([pointer, header, bitmap]) => pointer == GRAPH_BASE + CONTROL as u64
+                && header & 0xff != 0xff && (header >> 8) & 0xff != 0xff
+                && (header >> 16) & 0xff == 4 && bitmap == 1u64 << QUEUE_ID,
+        }
     }
 
     pub(super) fn is_installed(slot: [u64; 5]) -> bool {
