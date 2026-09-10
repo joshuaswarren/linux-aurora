@@ -973,7 +973,7 @@ impl platform::Driver for AsahiDriver {
                 });
             }
             ProbeConfig::Agx3Diagnostic(soc) if soc.chip_id == 0x8142
-                && *crate::module_parameters::m5_initdata_test.value() == 1 => {
+                && matches!(*crate::module_parameters::m5_initdata_test.value(), 1 | 2) => {
                 return Ok(Self { runtime: AsahiRuntime::M5(probe_t8142_initdata(pdev)?) });
             }
             ProbeConfig::Agx3Diagnostic(soc) => return Err(refuse_agx3_probe(pdev, soc)),

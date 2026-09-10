@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-// Built and checked now; reached only after the separate M5 UAT gate opens.
 #![allow(dead_code)]
 
 //! Retained RAM for the J813 G17G/25G76 initialization graph.
@@ -197,5 +196,26 @@ impl M5FirmwareMemory {
 
     pub(crate) fn root(&self, secondary: bool) -> u64 {
         if secondary { self.secondary_root.iova() } else { self.primary_root.iova() }
+    }
+
+    /// Read the actual shared control state, not a detached host copy. The
+    /// offsets and three pointers per role are checked by the M5 capture
+    /// verifier against both native main objects and the private arena.
+    pub(crate) fn control_counters(&mut self) -> Result<[[u32; 3]; 2]> {
+        self.private.with_bytes_mut(|bytes| {
+            let mut counters = [[0; 3]; 2];
+            for (role, grid) in [0usize, 0x1770c0].into_iter().enumerate() {
+                let base = grid + init::WORK_STATE_GRID_OFFSETS[init::CONTROL_CHANNEL_INDEX];
+                for (index, value) in counters[role].iter_mut().enumerate() {
+                    let offset = base + index * init::CHANNEL_STATE_SPACING;
+                    let word = bytes.get(offset..offset + 4).ok_or(EINVAL)?;
+                    // SAFETY: arena and native counter offsets are u32 aligned;
+                    // this bounded WC mapping is retained while firmware runs.
+                    *value = unsafe { core::ptr::read_volatile(word.as_ptr().cast::<u32>()) };
+                }
+            }
+            fence(Ordering::Acquire);
+            Ok(counters)
+        })
     }
 }

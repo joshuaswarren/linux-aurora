@@ -89,7 +89,7 @@ impl M5Session {
         failure.map_or(Ok(()), Err)
     }
 
-    fn initialize(&mut self) -> Result {
+    fn initialize(&mut self, release_openings: bool) -> Result {
         for index in [1, 0] {
             let role = &mut self.roles[index];
             role.provider.start_cpu()?;
@@ -137,7 +137,35 @@ impl M5Session {
         if self.roles.iter().any(|role| role.state.crashed.load(Ordering::Acquire)) {
             return Err(EIO);
         }
+        if release_openings {
+            self.retire_openings()?;
+        }
         Ok(())
+    }
+
+    fn retire_openings(&mut self) -> Result {
+        let mut counters = self.memory.as_mut().ok_or(EIO)?.control_counters()?;
+        dev_info!(self.dev.as_ref(), "M5_OPEN before power-transition-end {:?}\n", counters);
+        // M5's own cold trace sends one 0x89 to GFX, then GFX1 (events
+        // 167/171), immediately after the two initdata ACKs. No other control
+        // record or work item is published in this bounded experiment.
+        for index in [0, 1] {
+            Pin::new(&mut self.roles[index].rtkit)
+                .send_message(0x21, g17_rtkit::encode_power_transition_end())?;
+        }
+        for _ in 0..1000 {
+            if self.roles.iter().any(|role| role.state.crashed.load(Ordering::Acquire)) {
+                return Err(EIO);
+            }
+            counters = self.memory.as_mut().ok_or(EIO)?.control_counters()?;
+            if counters == [[1; 3]; 2] {
+                dev_info!(self.dev.as_ref(), "M5_OPEN both native control openings retired {:?}\n", counters);
+                return Ok(());
+            }
+            fsleep(Delta::from_millis(1));
+        }
+        dev_err!(self.dev.as_ref(), "M5_OPEN control openings did not retire {:?}\n", counters);
+        Err(ETIMEDOUT)
     }
 }
 
@@ -181,7 +209,7 @@ impl M5Runtime {
         // Keep callback code resident even if a failed stop retains owners.
         // This explicit RAM-boot experiment is released by reboot only.
         unsafe { kernel::bindings::__module_get(crate::THIS_MODULE.as_ptr()); }
-        let result = session.initialize();
+        let result = session.initialize(*crate::module_parameters::m5_initdata_test.value() == 2);
         dev_info!(pdev.as_ref(), "M5_INIT transaction result={:?}; no GPU jobs submitted\n", result);
         let stopped = session.stop_cpus();
         dev_info!(pdev.as_ref(), "M5_INIT stop requests={:?}; owners retained\n", stopped);
