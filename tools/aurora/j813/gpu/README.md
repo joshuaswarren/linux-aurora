@@ -10,8 +10,10 @@ is evidence of GPU rendering.
 
 - Linux `7.1.6-aurora-j813-gpu-v9`, Asahi diagnostic module loaded explicitly.
 - GPU ID words: `0b022000 000b0800 0011010a 00040404 01320311 10030302`.
-- M5 identity selects 42-bit UAT input and output addresses; the Neo runtime
-  cannot be enabled by substituting its 43-bit G17P configuration.
+- The M5 ADT selects a 43-bit virtual address (42 bits per root plus one
+  root-select bit), matching the Neo's geometry. The diagnostic driver's
+  42-bit input-root field is not a different virtual-address width. Output
+  addresses are 42 bits. G17G firmware/runtime admission is still separate.
 - Both GFX roles' loaded TEXT and DATA were captured twice, with matching
   reads, before Linux. Both report `RTKit-3255.160.4.release`.
 - Six boot-local UAT/firmware DATA reservations are passed through m1n1.
@@ -66,4 +68,49 @@ asynchronous callbacks only record supplied events; they issue no nested
 proxy requests. It does not use the Neo init-data decoder or override the M5
 firmware version. Raw traces and firmware binaries remain local.
 
-The initial GPU tracer is prepared but not yet hardware-qualified.
+Both firmware roles were captured successfully before publishing their
+initialization descriptors on a cold boot of macOS 25G76. Every object matched
+on two reads, and both roles' complete 0x28000-byte shared clusters were
+identical. `--capture-init` temporarily makes only each INBOX0 payload write
+synchronous, captures the referenced DRAM, then removes that override before
+INBOX1 publication. Raw captures stay private.
+
+The actual endpoint-0x20 initialization messages have type 0x81. Endpoint 1
+is the RTKit crashlog buffer. Firmware pointers retain their 43-bit address,
+including the global-root selector. The working macOS guest uses the separate
+SPTM global root reported by the current boot receipt; its firmware mappings
+do not appear in the ordinary per-context TTBR pairs.
+
+`m5-metal-reference.m` verifies compute results and rendered pixels through
+three fresh Metal command queues. Four macOS runs each passed 3,072 exact
+compute values and 12,288 RGBA pixels. This is a macOS reference, not evidence
+that Linux submission, rendering or DCP works.
+
+## Source construction and M5 differences
+
+Linux now has an explicit J813/25G76 root serializer and register-map
+serializer. The root version is `0x0c8aa322039e04c0`; both loaded firmware
+images independently compare that value. The existing Neo runtime continues
+to use `0x0c8aa322039604c0` and rejects the M5 version.
+
+`verify-m5-gpu-codecs.py` rebuilds both roots and all 53 register-table slots
+against the private pre-handoff captures. It also emulates the exact pinned
+M5 host reset routine with synthetic allocations and compares its output
+against the Linux channel codec across 32 cases. All comparisons pass.
+The driver/module build passes; these codecs are not wired into an M5 runtime.
+
+Two differences require explicit handling:
+
+- The live M5 host resets a 192-byte cached channel record, moving fields to
+  +0x44, +0x48 and unaligned +0x9c. The older shared 128-byte reset is unsuitable.
+- Register slot 39 carries distinct size fields, 0x10000 and 0x8000. The older
+  serializer duplicated a single size and cannot reproduce this table.
+
+The M5 driver contains HAL300/SKSM queue classes. During the passing reference
+workload, the primary ASC emitted endpoint-0x21/type-0x83 work doorbells,
+including three `0x8300000000000a` compute kicks. The observed CPU FIFO at
+SGX+0x4090/+0x4098 stayed quiet. This establishes a workload mailbox path;
+it does not prove every M5 workload uses the same transport or that the Linux
+path is interchangeable. Neo's HAL200 runtime remains a useful reference.
+Full hardware-data construction, firmware ownership, M5 submission and
+completion remain open.

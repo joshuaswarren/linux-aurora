@@ -9,7 +9,9 @@
     "dies": 1,
     "clusters": 1,
     "active_cores": 10,
-    "uat_input_bits": 42,
+    "uat_input_bits_per_root": 42,
+    "uat_virtual_address_bits": 43,
+    "uat_root_select_bit": 42,
     "uat_output_bits": 42,
     "registers": ["0b022000", "000b0800", "0011010a", "00040404", "01320311", "10030302"]
   },
@@ -34,6 +36,30 @@
     "trackpad_registered": true,
     "physical_input_retested": false,
     "encoding_retested_on_v9": false
+  },
+  "macos_reference": {
+    "build": "25G76",
+    "cold_boot_preinit_capture": true,
+    "roles_captured": 2,
+    "double_reads_match": true,
+    "shared_cluster_bytes": 163840,
+    "shared_clusters_identical": true,
+    "metal_runs_passed": 4,
+    "command_queues_per_run": 3,
+    "compute_values_per_run": 3072,
+    "render_pixels_per_run": 12288,
+    "linux_gpu_proven": false
+  },
+  "source_codecs": {
+    "root_version": "0x0c8aa322039e04c0",
+    "roots_matched_to_capture": 2,
+    "register_slots_matched_to_capture": 53,
+    "cached_channel_reset_bytes": 192,
+    "reset_cases_matched_to_host_instructions": 32,
+    "cross_target_version_rejections": 4,
+    "kernel_build_passed": true,
+    "ram_boot_retested_after_codec_changes": false,
+    "runtime_wired": false
   },
   "render_node": false,
   "gpu_compute_qualified": false,

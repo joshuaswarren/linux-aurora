@@ -683,7 +683,8 @@ pub(crate) const fn g17_channel_descriptor_offset(
 pub(crate) const G17_HOST_CHANNEL_STATE_RESET_SIZE: usize = 0x80;
 /// Last byte touched by the G17 host's uncached-channel reset stores.
 pub(crate) const G17_UNCACHED_CHANNEL_RESET_WRITE_EXTENT: usize = 0x64;
-/// All three in-scope host families use the identical reset layout.
+/// The older pinned host builds share this reset layout. The live M5 25G76
+/// driver instead resets 0xc0 bytes; see `encode_m5_25g76_channel_state_reset`.
 pub(crate) const G17_HOST_CHANNEL_RESET_TARGETS_CONFIRMED: bool = true;
 
 /// Offsets written after the host clears `_AGFIChannelState`.
@@ -786,6 +787,41 @@ pub(crate) fn encode_g17_host_channel_state_reset(
     put_u32_le(&mut raw, layout.word_44, values.word_44);
     put_u32_le(&mut raw, layout.zero_58, 0);
     put_u64_le(&mut raw, layout.gpu_va_70, values.gpu_va_70);
+    raw
+}
+
+/// M5 G17G / macOS 25G76 resets six pairs of 128-bit vectors, covering 0xc0
+/// bytes. Its firmware consumes through +0xa7. The common 0x80-byte reset
+/// would omit the moved fields and the firmware-visible tail.
+pub(crate) const M5_25G76_CHANNEL_STATE_RESET_SIZE: usize = 0xc0;
+pub(crate) const M5_25G76_CHANNEL_FIRMWARE_READ_EXTENT: usize = 0xa8;
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct M5ChannelStateResetValues {
+    pub(crate) uncached_state: u64,
+    pub(crate) command_pointer_ring: u64,
+    pub(crate) gpu_va_10: u64,
+    pub(crate) word_48: u32,
+    /// Opaque host field +0xf8 copied to the unaligned firmware field +0x9c.
+    pub(crate) gpu_va_9c: u64,
+}
+
+/// Exact reset stores from M5 AGXChannel::resetChannelState at
+/// 0xfffffe000897d36c..0xfffffe000897d410 (AGXG17G 353.14, 25G76).
+/// Uncached stores are separately shared with apply_g17_uncached_channel_reset.
+/// This codec alone does not admit M5 submission or a Linux GPU runtime.
+pub(crate) fn encode_m5_25g76_channel_state_reset(
+    values: M5ChannelStateResetValues,
+) -> [u8; M5_25G76_CHANNEL_STATE_RESET_SIZE] {
+    let mut raw = [0u8; M5_25G76_CHANNEL_STATE_RESET_SIZE];
+    put_u64_le(&mut raw, 0x00, values.uncached_state);
+    put_u64_le(&mut raw, 0x08, values.command_pointer_ring);
+    put_u64_le(&mut raw, 0x10, values.gpu_va_10);
+    put_u32_le(&mut raw, 0x24, u32::MAX);
+    put_u32_le(&mut raw, 0x28, 4);
+    put_u32_le(&mut raw, 0x44, u32::MAX);
+    put_u32_le(&mut raw, 0x48, values.word_48);
+    put_u64_le(&mut raw, 0x9c, values.gpu_va_9c);
     raw
 }
 

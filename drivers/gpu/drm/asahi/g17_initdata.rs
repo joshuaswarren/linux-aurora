@@ -151,6 +151,26 @@ pub(crate) const INITDATA_VERSION: [u16; 4] = [0x04c0, 0x0396, 0xa322, 0x0c8a];
 /// The same tuple as the little-endian u64 the firmware compares in one go.
 pub(crate) const INITDATA_VERSION_WORD: u64 = 0x0c8a_a322_0396_04c0;
 
+/// Target/build-specific root encoding. This is a serialization choice, not
+/// permission to start firmware or reuse the other target's hardware tables.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum RootProfile {
+    J700G17P,
+    /// J813 Mac17,3 / 25G76, RTKit-3255.160.4.release. Both roots were captured
+    /// before INBOX1 publication. Independently confirmed by the loaded GFX
+    /// version comparison at +0x1fa5c and GFX1 at +0x21140.
+    J813G17G25G76,
+}
+
+impl RootProfile {
+    pub(crate) const fn version_word(self) -> u64 {
+        match self {
+            Self::J700G17P => INITDATA_VERSION_WORD,
+            Self::J813G17G25G76 => 0x0c8a_a322_039e_04c0,
+        }
+    }
+}
+
 // --- Address representability --------------------------------------------------
 
 // The endpoint-0x20 doorbell carries the root address in a 44-bit field; the
@@ -1495,6 +1515,75 @@ pub(crate) struct RegisterWindow {
     pub(crate) flag: u32,
 }
 
+/// M5 25G76 descriptor fields +0x10 and +0x14 are independent. In slot 39
+/// native publishes 0x10000 and 0x8000 respectively. The older RegisterWindow
+/// encoder duplicates one size and must not serialize this target's table.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct M5RegisterWindow {
+    pub(crate) slot: usize,
+    pub(crate) phys: u64,
+    pub(crate) device_va: u64,
+    pub(crate) size_10: u32,
+    pub(crate) size_14: u32,
+    pub(crate) unk_18: u64,
+    pub(crate) flag: u32,
+}
+
+/// Source-constructed register descriptors from both identical pre-handoff
+/// J813/25G76 captures. These are firmware virtual mappings, not a request to
+/// access or power the devices. No runtime currently consumes this profile.
+pub(crate) const M5_25G76_REGISTER_WINDOWS: [M5RegisterWindow; 22] = {
+    const fn w(slot: usize, phys: u64, va: u64, size_10: u32, size_14: u32,
+               unk_18: u64, flag: u32) -> M5RegisterWindow {
+        M5RegisterWindow { slot, phys, device_va: 0xffff_fc21_8000_0000 + va,
+                           size_10, size_14, unk_18, flag }
+    }
+    [
+        w(0,  0x381014000, 0x000000, 0x04000, 0x04000, 0, 2),
+        w(3,  0x220104000, 0x008000, 0x18000, 0x18000, 0, 2),
+        w(8,  0x3a1350000, 0x028000, 0x04000, 0x04000, 0, 2),
+        w(9,  0x3803d0000, 0x030000, 0x04000, 0x04000, 0, 2),
+        w(10, 0x3803c0000, 0x038000, 0x04000, 0x04000, 0, 0),
+        w(12, 0x42165c000, 0x040000, 0x04000, 0x04000, 0, 2),
+        w(14, 0x380280000, 0x048000, 0x08000, 0x08000, 0, 0),
+        w(15, 0x38c840000, 0x058000, 0x24000, 0x24000, 0, 2),
+        w(17, 0x580000000, 0x080000, 0x21400, 0x21400, 0, 2),
+        w(22, 0x581000000, 0x0a8000, 0x08000, 0x08000, 0, 2),
+        w(24, 0x580ec0000, 0x0b8000, 0x10000, 0x10000, 0, 2),
+        w(26, 0x580d04000, 0x0d0000, 0x08000, 0x08000, 0xd04000, 2),
+        w(27, 0x580d0d000, 0x0e1000, 0x01000, 0x01000, 0xd0d000, 2),
+        w(28, 0x580d50000, 0x0e8000, 0x10000, 0x10000, 0xd50000, 2),
+        w(29, 0x580d10000, 0x100000, 0x04000, 0x04000, 0xd10000, 2),
+        w(31, 0x580d40000, 0x108000, 0x04000, 0x04000, 0xd40000, 2),
+        w(32, 0x580d60000, 0x110000, 0x08000, 0x08000, 0xd60000, 2),
+        w(35, 0x580e00000, 0x120000, 0x04000, 0x04000, 0xe00000, 2),
+        w(39, 0x580e08000, 0x128000, 0x10000, 0x08000, 0, 2),
+        w(41, 0x580e33800, 0x143800, 0x04000, 0x04000, 0, 2),
+        w(42, 0x580e35000, 0x151000, 0x04000, 0x04000, 0, 2),
+        w(50, 0x580014400, 0x160400, 0x00400, 0x00400, 0x14400, 0),
+    ]
+};
+
+pub(crate) fn encode_m5_25g76_register_map(out: &mut [u8]) -> Result<(), InitdataError> {
+    if out.len() != HW_REGISTER_MAP_SLOTS * HW_REGISTER_MAP_ENTRY_SIZE {
+        return Err(InitdataError::BufferSize);
+    }
+    out.fill(0);
+    for window in M5_25G76_REGISTER_WINDOWS {
+        let base = window.slot * HW_REGISTER_MAP_ENTRY_SIZE;
+        put_u64(out, base, window.phys);
+        put_u64(out, base + 8, window.device_va);
+        put_u32(out, base + 0x10, window.size_10);
+        put_u32(out, base + 0x14, window.size_14);
+        put_u64(out, base + 0x18, window.unk_18);
+        put_u32(out, base + 0x20, window.flag);
+    }
+    for slot in [2, 5, 6, 7, 30, 33, 34, 37, 38, 40, 43, 46, 47, 48, 49, 52] {
+        put_u32(out, slot * HW_REGISTER_MAP_ENTRY_SIZE + 0x20, 2);
+    }
+    Ok(())
+}
+
 /// T8140 register windows mapped into the firmware MMIO aperture.
 pub(crate) const T8140_REGISTER_WINDOWS: [RegisterWindow; 18] = [
     RegisterWindow {
@@ -1785,6 +1874,18 @@ pub(crate) fn encode_root(
     inst: &InstanceAddresses,
     out: &mut [u8],
 ) -> Result<(), InitdataError> {
+    encode_root_for_profile(RootProfile::J700G17P, role, shared, inst, out)
+}
+
+/// Encode the common root layout with an explicitly selected firmware build.
+/// The existing runtime continues to call the J700-only wrapper above.
+pub(crate) fn encode_root_for_profile(
+    profile: RootProfile,
+    role: InstanceRole,
+    shared: &SharedAddresses,
+    inst: &InstanceAddresses,
+    out: &mut [u8],
+) -> Result<(), InitdataError> {
     if out.len() != root_size(role) {
         return Err(InitdataError::BufferSize);
     }
@@ -1792,9 +1893,7 @@ pub(crate) fn encode_root(
     validate_instance(role, inst)?;
 
     out.fill(0);
-    for (index, word) in INITDATA_VERSION.iter().enumerate() {
-        put_u16(out, ROOT_VERSION + index * 2, *word);
-    }
+    put_u64(out, ROOT_VERSION, profile.version_word());
     put_u64(out, ROOT_REGION_A, shared.region_a);
     // ROOT_ZERO_10 deliberately left zero.
     put_u64(out, ROOT_MAIN_CONFIG, inst.main_config);
@@ -2410,10 +2509,17 @@ pub(crate) fn validate_shared_region_bases(
 /// must write 1 there regardless. Passing this does not mean the rest of the
 /// descriptor is complete.
 pub(crate) fn check_firmware_root_gates(root: &[u8]) -> Result<(), InitdataError> {
+    check_firmware_root_gates_for_profile(RootProfile::J700G17P, root)
+}
+
+pub(crate) fn check_firmware_root_gates_for_profile(
+    profile: RootProfile,
+    root: &[u8],
+) -> Result<(), InitdataError> {
     if root.len() != ROOT_SIZE_PRIMARY && root.len() != ROOT_SIZE_SECONDARY {
         return Err(InitdataError::BufferSize);
     }
-    if get_u64(root, ROOT_VERSION) != INITDATA_VERSION_WORD {
+    if get_u64(root, ROOT_VERSION) != profile.version_word() {
         return Err(InitdataError::InterfaceMismatch);
     }
     if get_u32(root, ROOT_CONSTANT_2C) == 0 {

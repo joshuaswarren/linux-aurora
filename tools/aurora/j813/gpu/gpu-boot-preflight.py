@@ -65,6 +65,10 @@ def inspect_adt(adt):
     regions = {name: tuple(int(node.getprop(name + suffix)) for suffix in ('-base', '-size'))
                for name in REGIONS}
     chosen = adt['/chosen']
+    if int(adt['/defaults'].getprop('uat-vaddr-size')) != 43:
+        raise ValueError('M5 total UAT virtual-address width changed')
+    if int(node.getprop('agx-address-space-mgmt-mode')) != 1:
+        raise ValueError('M5 UAT address-space management mode changed')
     dram = (int(chosen.getprop('dram-base')), int(chosen.getprop('dram-size')))
     validate_regions(regions, dram)
     segments = []
@@ -103,7 +107,8 @@ def prepare_gpu(u, iface, output):
         with os.fdopen(fd, 'wb') as stream:
             stream.write(payload)
     manifest = dict(source='Two matching pre-Linux KIS DRAM reads; no GPU MMIO',
-                    firmware_runtime_admitted=False, regions=regions, segments=segments)
+                    firmware_runtime_admitted=False, uat_virtual_address_bits=43,
+                    uat_root_select_bit=42, regions=regions, segments=segments)
     fd = os.open(output / 'manifest.json', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, 'w') as stream:
         json.dump(manifest, stream, indent=2)

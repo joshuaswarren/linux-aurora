@@ -11,7 +11,8 @@ def capture_gpu_topology(u, output):
     selected = ('compatible', 'interrupts', 'interrupts-valid', 'clock-gates',
                 'power-gates', 'clock-id', 'gpu-count', 'gpu-core-count',
                 'gpu-core-mask', 'gpu-gen', 'gfx-handoff', 'gfx-shared-region',
-                'gpu-region', 'ps-regs', 'ps-groups')
+                'gpu-region', 'ps-regs', 'ps-groups', 'uat-vaddr-size',
+                'agx-address-space-mgmt-mode')
     selected += tuple(prefix + suffix for prefix in (
         'gpu-region', 'gfx-shared-region', 'gfx-shared-l2-region',
         'gfx-handoff', 'gfx-data', 'gfx1-data') for suffix in ('-base', '-size'))
@@ -30,7 +31,7 @@ def capture_gpu_topology(u, output):
         return {'type': type(value).__name__}
 
     result = {'model': u.adt.model, 'source': 'live m1n1 ADT; no MMIO accesses', 'nodes': {}}
-    for path in ('/arm-io/sgx', '/arm-io/gfx-asc', '/arm-io/gfx1-asc',
+    for path in ('/defaults', '/arm-io/sgx', '/arm-io/gfx-asc', '/arm-io/gfx1-asc',
                  '/arm-io/pmgr', '/arm-io/dart-gfx', '/arm-io/dart-gfx1',
                  '/arm-io/aic', '/arm-io/uart0', '/arm-io/mtp',
                  '/arm-io/dart-mtp', '/arm-io/dockchannel-mtp'):
