@@ -263,6 +263,10 @@ count at +6, queue priority at +8, old stamp at +9, and CL data master 2 at
 +0x11. Thus an SKSM workload can publish its kick notification through a
 firmware channel; the mailbox path alone does not imply classic compute.
 The KSM queue priority is separate from the outer work-channel priority.
+`m5-metal-reference` optionally reports its input/output GPU buffer addresses
+to stderr when `M5_TRACE_BUFFERS` is set, for private payload correlation.
+Build this reference on the controller and copy it to the guest; compiling
+inside one traced guest triggered an XNU page-table refcount panic.
 
 `trace-m5-sksm-submit.py` captures one such submission on an existing paused
 M5 hypervisor owner. It checks native instruction bytes, bounds CPU reads to

@@ -63,6 +63,14 @@ int main(void)
                 id<MTLBuffer> input = [device newBufferWithLength:4096 options:MTLResourceStorageModeShared];
                 id<MTLBuffer> output = [device newBufferWithLength:4096 options:MTLResourceStorageModeShared];
                 if (!queue || !input || !output) return 6;
+                if (getenv("M5_TRACE_BUFFERS")) {
+                    // Private reference metadata for correlating a captured
+                    // native GPU payload with this test's actual resources.
+                    fprintf(stderr, "M5_TRACE_BUFFERS round=%u input=%#llx output=%#llx bytes=4096\n",
+                            round, (unsigned long long)input.gpuAddress,
+                            (unsigned long long)output.gpuAddress);
+                    fflush(stderr);
+                }
                 for (unsigned i = 0; i < 1024; i++) {
                     ((uint32_t *)input.contents)[i] = i * 7u + round;
                     ((uint32_t *)output.contents)[i] = 0xdeadbeef;
