@@ -246,6 +246,8 @@ int mt76_connac_mcu_set_channel_domain(struct mt76_phy *phy)
 	n_max_channels = phy->sband_2g.sband.n_channels +
 			 phy->sband_5g.sband.n_channels +
 			 phy->sband_6g.sband.n_channels;
+	if (is_mt7932(dev) && !memcmp(dev->alpha2, "US", 2))
+		n_max_channels = max(n_max_channels, 20);
 	len = sizeof(hdr) + n_max_channels * sizeof(channel);
 
 	skb = mt76_mcu_msg_alloc(dev, NULL, len);
@@ -253,6 +255,33 @@ int mt76_connac_mcu_set_channel_domain(struct mt76_phy *phy)
 		return -ENOMEM;
 
 	skb_reserve(skb, sizeof(hdr));
+
+	if (is_mt7932(dev) && !memcmp(dev->alpha2, "US", 2)) {
+		/* The initial J700 US profile is fixed at 20 MHz and 10 dBm.
+		 * Manufacture policy runs before mt76 allocates its supported bands;
+		 * publish the same bounded set both before and after registration.
+		 */
+		static const u8 us_5ghz[] = { 36, 40, 44, 48, 149, 153, 157, 161, 165 };
+
+		hdr.bw_2g = 1;
+		hdr.bw_5g = 1;
+		hdr.bw_6g = 1;
+		channel.pad = 0;
+		channel.flags = cpu_to_le32(IEEE80211_CHAN_NO_HT40PLUS |
+			IEEE80211_CHAN_NO_HT40MINUS | IEEE80211_CHAN_NO_80MHZ |
+			IEEE80211_CHAN_NO_160MHZ);
+		for (i = 1; i <= 11; i++) {
+			channel.hw_value = cpu_to_le16(i);
+			skb_put_data(skb, &channel, sizeof(channel));
+			n_2ch++;
+		}
+		for (i = 0; i < ARRAY_SIZE(us_5ghz); i++) {
+			channel.hw_value = cpu_to_le16(us_5ghz[i]);
+			skb_put_data(skb, &channel, sizeof(channel));
+			n_5ch++;
+		}
+		goto finish;
+	}
 
 	for (i = 0; i < phy->sband_2g.sband.n_channels; i++) {
 		chan = &phy->sband_2g.sband.channels[i];
@@ -291,6 +320,7 @@ int mt76_connac_mcu_set_channel_domain(struct mt76_phy *phy)
 		n_6ch++;
 	}
 
+finish:
 	BUILD_BUG_ON(sizeof(dev->alpha2) > sizeof(hdr.alpha2));
 	memcpy(hdr.alpha2, dev->alpha2, sizeof(dev->alpha2));
 	hdr.n_2ch = n_2ch;

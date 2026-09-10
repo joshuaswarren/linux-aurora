@@ -11,6 +11,61 @@
 #include "../mt76_connac2_mac.h"
 #include "mcu.h"
 
+static char mt7932_j700_country[3] = "AU";
+module_param_string(j700_country, mt7932_j700_country,
+		    sizeof(mt7932_j700_country), 0444);
+MODULE_PARM_DESC(j700_country, "J700 qualified policy selection: AU or US (20 MHz bring-up)");
+
+bool mt7932_j700_us(void)
+{
+	return !strcmp(mt7932_j700_country, "US");
+}
+
+/* Initial US profile: signed wireless-regdb 389b9b702cf9, intersected
+ * with the pinned J700 tables and a 10 dBm / 20 MHz bring-up ceiling.
+ * No DFS, upper U-NII-4, or 6 GHz operation is qualified here.
+ */
+static const struct ieee80211_regdomain mt7932_j700_us_regdom = {
+	.alpha2 = "US",
+	.n_reg_rules = 3,
+	.reg_rules = {
+		REG_RULE(2402, 2472, 20, 0, 10, 0),
+		REG_RULE(5170, 5250, 20, 0, 10, 0),
+		REG_RULE(5735, 5835, 20, 0, 10, 0),
+	},
+};
+
+static int mt7932_j700_verify_us_regdom(struct mt792x_dev *dev)
+{
+	struct wiphy *wiphy = dev->mt76.hw->wiphy;
+	unsigned int enabled[NUM_NL80211_BANDS] = {};
+	int band, i;
+
+	for (band = 0; band < NUM_NL80211_BANDS; band++) {
+		struct ieee80211_supported_band *sband = wiphy->bands[band];
+
+		if (!sband)
+			continue;
+		for (i = 0; i < sband->n_channels; i++) {
+			struct ieee80211_channel *ch = &sband->channels[i];
+
+			if (ch->flags & IEEE80211_CHAN_DISABLED)
+				continue;
+			enabled[band]++;
+			if (ch->max_reg_power > 10 ||
+			    !(ch->flags & IEEE80211_CHAN_NO_HT40PLUS) ||
+			    !(ch->flags & IEEE80211_CHAN_NO_HT40MINUS))
+				return -EINVAL;
+		}
+	}
+	if (enabled[NL80211_BAND_2GHZ] != 11 ||
+	    enabled[NL80211_BAND_5GHZ] != 9 || enabled[NL80211_BAND_6GHZ])
+		return -EINVAL;
+	dev_info(dev->mt76.dev,
+		 "J700_MT7932_US_REGDOM_PASS: channels=11+9 width=20 max_power=10dBm 6g=disabled\n");
+	return 0;
+}
+
 /* The minimal bring-up root has no regulatory.db, so cfg80211 otherwise
  * leaves every 6 GHz channel disabled under country 00 even though firmware
  * already runs the measured AU policy.  This conservative fallback is
@@ -211,6 +266,40 @@ mt7921_regd_notifier(struct wiphy *wiphy,
 	struct mt792x_dev *dev = mt792x_hw_dev(hw);
 	struct mt76_connac_pm *pm = &dev->pm;
 
+	/* This fixed bring-up profile must never be relabelled by a country IE
+	 * or a userspace hint while its country-specific power file is loaded.
+	 */
+	if (is_mt7932(&dev->mt76) && mt7932_j700_us()) {
+		int band, i;
+
+		/* reg_notifier already runs under regulatory locks. Only narrow the
+		 * channel state here; applying a new custom domain would recurse.
+		 */
+		for (band = 0; band < NUM_NL80211_BANDS; band++) {
+			struct ieee80211_supported_band *sband = wiphy->bands[band];
+
+			if (!sband)
+				continue;
+			for (i = 0; i < sband->n_channels; i++) {
+				struct ieee80211_channel *ch = &sband->channels[i];
+				int f = ch->center_freq;
+				bool allowed = (f >= 2412 && f <= 2462) ||
+					(f >= 5180 && f <= 5240 && !(f % 20)) ||
+					(f >= 5745 && f <= 5825 && !((f - 5745) % 20));
+
+				if (!allowed)
+					ch->flags |= IEEE80211_CHAN_DISABLED;
+				ch->flags |= IEEE80211_CHAN_NO_HT40PLUS |
+					IEEE80211_CHAN_NO_HT40MINUS |
+					IEEE80211_CHAN_NO_80MHZ | IEEE80211_CHAN_NO_160MHZ;
+				ch->max_reg_power = min(ch->max_reg_power, 10);
+				ch->max_power = min(ch->max_power, 10);
+			}
+		}
+		memcpy(dev->mt76.alpha2, "US", 2);
+		return;
+	}
+
 	memcpy(dev->mt76.alpha2, request->alpha2, sizeof(dev->mt76.alpha2));
 	dev->mt76.region = request->dfs_region;
 	dev->country_ie_env = request->country_ie_env;
@@ -273,9 +362,10 @@ static int mt7921_post_firmware_init(struct mt792x_dev *dev)
 		 * including Apple's mode-3 EFUSE selection.  Do not add the generic
 		 * mode-0 query/ack packet here between pre-cal and WCAL ordinal 135.
 		 */
-		memcpy(dev->mt76.alpha2, "AU", sizeof(dev->mt76.alpha2));
+		memcpy(dev->mt76.alpha2, mt7932_j700_country, sizeof(dev->mt76.alpha2));
 		dev_info(dev->mt76.dev,
-			 "J700_MT7932_COUNTRY_PIN: alpha2=AU host-policy=1 firmware-phases=XZ-pre-cal,AU-update source=25G83-live-capture\n");
+			 "J700_MT7932_COUNTRY_PIN: alpha2=%s host-policy=1 pre-cal=XZ\n",
+			 mt7932_j700_country);
 	} else {
 		ret = mt7921_mcu_set_eeprom(dev);
 		if (ret) {
@@ -438,7 +528,8 @@ static int mt7921_init_work_run(struct mt792x_dev *dev)
 		return ret;
 	}
 	if (is_mt7932(&dev->mt76)) {
-		ret = mt7932_j700_verify_au_regdom(dev);
+		ret = mt7932_j700_us() ? mt7932_j700_verify_us_regdom(dev) :
+			mt7932_j700_verify_au_regdom(dev);
 		if (ret)
 			return ret;
 		dev_info(dev->mt76.dev,
@@ -545,10 +636,19 @@ int mt7921_register_device(struct mt792x_dev *dev)
 	if (ret)
 		return ret;
 	if (is_mt7932(&dev->mt76)) {
+		if (strcmp(mt7932_j700_country, "AU") && !mt7932_j700_us())
+			return -EINVAL;
+		if (mt7932_j700_us() && mt7932_replay_au_policy)
+			return -EINVAL;
 		hw->wiphy->regulatory_flags |= REGULATORY_CUSTOM_REG;
-		dev->mt76.custom_regd = &mt7932_j700_au_regdom;
+		if (mt7932_j700_us())
+			hw->wiphy->regulatory_flags |= REGULATORY_STRICT_REG |
+				REGULATORY_COUNTRY_IE_IGNORE;
+		dev->mt76.custom_regd = mt7932_j700_us() ?
+			&mt7932_j700_us_regdom : &mt7932_j700_au_regdom;
 		dev_info(dev->mt76.dev,
-			 "J700_MT7932_AU_REGDOM_STAGED: source=25G83-IZUBA-db-a61e0b70 channels=6g1-93 max_eirp=14dBm mode=VLP root-regdb=absent\n");
+			 "J700_MT7932_REGDOM_STAGED: country=%s mode=%s\n",
+			 mt7932_j700_country, mt7932_j700_us() ? "20MHz-no-6g" : "VLP");
 	}
 	if (is_mt7932(&dev->mt76) && mt7932_mcu_lab_private_vif_enabled()) {
 		ieee80211_hw_set(hw, NO_AUTO_VIF);
