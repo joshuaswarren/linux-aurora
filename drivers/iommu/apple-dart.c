@@ -121,6 +121,7 @@
 #define DART_T8110_TLB_CMD_OP           GENMASK(10, 8)
 #define DART_T8110_TLB_CMD_OP_FLUSH_ALL 0
 #define DART_T8110_TLB_CMD_OP_FLUSH_SID 1
+#define DART_T8110_TLB_CMD_OP_FLUSH_UNLOCK 4
 #define DART_T8110_TLB_CMD_STREAM       GENMASK(7, 0)
 #define DART_T8110_TLB_CMD_V2           BIT(15)
 #define DART_T8110_TLB_CMD_RANGE        BIT(14)
@@ -184,6 +185,8 @@
 #define DART_T8110_UNPROTECT 0x204
 #define DART_T8110_PROTECT_LOCK 0x208
 #define DART_T8110_PROTECT_TTBR_TCR BIT(0)
+#define DART_T8110_DIAG_LOCK 0x210
+#define DART_T8110_DIAG_LOCK_ON_ERR BIT(1)
 
 #define DART_T8110_ENABLE_STREAMS  0xc00
 #define DART_T8110_DISABLE_STREAMS 0xc20
@@ -866,9 +869,26 @@ static void apple_dart_hw_enable_global_streams(struct apple_dart *dart)
 	}
 }
 
+static int apple_dart_t8110_v2_unlock(struct apple_dart *dart)
+{
+	struct apple_dart_stream_map stream_map = { .dart = dart };
+
+	if (!(readl(dart->regs + DART_T8110_DIAG_LOCK) & DART_T8110_DIAG_LOCK_ON_ERR))
+		return 0;
+
+	/* gen3dart_clear_exception follows bitmap acknowledgement with the
+	 * global FLUSH_UNLOCK command when lock-on-error is configured.
+	 */
+	__set_bit(0, stream_map.sidmap);
+	return apple_dart_t8110_hw_tlb_command_range(&stream_map,
+					    DART_T8110_TLB_CMD_OP_FLUSH_UNLOCK,
+					    false, 0, 0);
+}
+
 static int apple_dart_hw_reset(struct apple_dart *dart)
 {
 	struct apple_dart_stream_map stream_map;
+	int ret;
 
 	stream_map.dart = dart;
 	bitmap_zero(stream_map.sidmap, DART_MAX_STREAMS);
@@ -878,25 +898,17 @@ static int apple_dart_hw_reset(struct apple_dart *dart)
 
 	apple_dart_hw_enable_global_streams(dart);
 
-	/* Clear any pending errors before the interrupt is unmasked. */
+	/* Clear pending records using the v2 SID bitmap before unmasking. */
 	if (dart->hw->type == DART_T8110 && dart->version >= 0x0202) {
-		unsigned int sid;
-
-		/*
-		 * AppleT8110DART reads the exception record before its detail
-		 * registers and never writes the record back. Preserve that order.
-		 */
-		for (sid = 0; sid < dart->num_streams; sid++) {
-			if (!readl(dart->regs + DART_T8110_EXCEPTION(sid)))
-				continue;
-
-			readl(dart->regs + DART_T8110_EXCEPTION_ADDR_LO(sid));
-			readl(dart->regs + DART_T8110_EXCEPTION_ADDR_HI(sid));
-		}
-
+		apple_dart_drain_stale_exceptions(dart);
 		if (dart->version >= 0x0203)
-			readl(dart->regs + DART_T8110_BLOCK_ERROR);
-	} else {
+			writel(readl(dart->regs + DART_T8110_BLOCK_ERROR) &
+			       DART_T8110_BLOCK_ERROR_MASK,
+			       dart->regs + DART_T8110_BLOCK_ERROR);
+		ret = apple_dart_t8110_v2_unlock(dart);
+		if (ret)
+			return ret;
+	} else
 		writel(readl(dart->regs + dart->hw->error),
 		       dart->regs + dart->hw->error);
 	}
@@ -1965,9 +1977,13 @@ static irqreturn_t apple_dart_t8110_v2_irq(int irq, void *dev)
 			dev_err_ratelimited(dart->dev,
 					    "block exception: status:0x%08x\n",
 					    block_error);
+			writel(block_error & DART_T8110_BLOCK_ERROR_MASK,
+			       dart->regs + DART_T8110_BLOCK_ERROR);
 			ret = IRQ_HANDLED;
 		}
 	}
+	if (ret == IRQ_HANDLED)
+		apple_dart_t8110_v2_unlock(dart);
 
 	return ret;
 }
