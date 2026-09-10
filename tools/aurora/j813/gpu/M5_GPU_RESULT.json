@@ -51,10 +51,11 @@
     "shared_cluster_bytes": 163840,
     "shared_clusters_identical": true,
     "cold_boots_compared": 4,
-    "metal_runs_passed": 10,
+    "metal_runs_passed": 12,
     "command_queues_per_run": 3,
     "compute_values_per_run": 3072,
     "render_pixels_per_run": 12288,
+    "optional_buffer_address_reporting_qualified": true,
     "linux_gpu_proven": false
   },
   "macos_sksm_submission": {
