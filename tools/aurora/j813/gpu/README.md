@@ -235,7 +235,8 @@ The M5 profile handles these differences explicitly:
   The native AON PTD allocation is 0xe4 bytes. Its measured contents match
   both roles on the third cold boot and remain unchanged after Metal work;
   Linux must allocate and retain the backing through firmware shutdown.
-- The measured M5 CPU start and initdata order is GFX1 then GFX. GFX1 takes root+0xb8 as its
+- Native captures include both GFX1-first and GFX-first initialization.
+  The qualified Linux sequence starts GFX1 then GFX. GFX1 takes root+0xb8 as its
   shared configuration and writes +0x670/+0x678/+0x680 after startup. These
   must begin at zero. A later primary capture can already contain secondary
   runtime state, despite preceding the primary's own root handoff.
@@ -247,12 +248,33 @@ physical SGX 0x580000000 and register slot 39 maps to 0x580e08000. The value
 at hardware-header +0x28 is unmapped in the global and sampled context views;
 it must not be treated as an observed MMIO mapping.
 
-The M5 driver contains HAL300/SKSM queue classes. During the passing reference
+The M5 driver uses HAL300/SKSM queue classes. During the passing reference
 workload, the primary ASC emitted endpoint-0x21/type-0x83 work doorbells,
 including three `0x8300000000000a` compute kicks. The observed CPU FIFO at
 SGX+0x4090/+0x4098 stayed quiet. This establishes a workload mailbox path;
 it does not prove every M5 workload uses the same transport or that the Linux
 path is interchangeable. Neo's HAL200 runtime remains a useful reference.
-The remaining channel graph, M5
-submission and completion remain open. The latest Neo reference also still
+
+A hardware breakpoint in the exact 25G76
+`AGXCLChannelSKSM::submitBuffer` captured a native CL tag-14 add-kicks record,
+its retained host queue, and a stable 128 KiB kick ring. The queue has 256
+entries with a 0x200-byte stride. The host writes tag 14 at +0, QID at +4,
+count at +6, queue priority at +8, old stamp at +9, and CL data master 2 at
++0x11. Thus an SKSM workload can publish its kick notification through a
+firmware channel; the mailbox path alone does not imply classic compute.
+The KSM queue priority is separate from the outer work-channel priority.
+
+`trace-m5-sksm-submit.py` captures one such submission on an existing paused
+M5 hypervisor owner. It checks native instruction bytes, bounds CPU reads to
+DRAM, and reads the ring through the retained firmware alias and the recorded
+SPTM global root. The saved CPU ring view can be unmapped at publication.
+The helper removes its breakpoint on capture or failure and supports bounded
+queue filters. `test-m5-sksm-capture.py` checks its mapping, profile, geometry,
+EL0/EL1 translation and filter guards without hardware. Payload-page views
+are observations, not a qualified command decoder. Raw captures stay private.
+
+Metal reference runs alongside this capture passed 3,072 compute values and
+12,288 pixels across three queues. The captured queue has not yet been tied
+to a particular test command; background macOS compute is also present.
+Linux M5 job submission and completion remain open. The latest Neo reference also still
 has a first-draw GPU fault in Xorg; neither target is yet DCP-only.
