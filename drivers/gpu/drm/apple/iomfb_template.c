@@ -1783,8 +1783,18 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 	/* increase refcount to ensure the receiver has a reference */
 	kref_get(&poff_cookie->refcount);
 
-	iomfb_abort_swaps_dcp(dcp, false, &abort_req,
-				aborted_swaps_dcp_poff, poff_cookie);
+	/*
+	 * The H17P tags for abort_swaps and last_client_close are unknown. The
+	 * old placeholders send A478 and A466; A478 is a different live method,
+	 * while A466 makes the firmware NMI. A473 is the captured H17P power
+	 * method and must run out-of-band, so go to it directly after the clear
+	 * swap has retired.
+	 */
+	if (DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER)
+		last_client_closed_poff(dcp, NULL, poff_cookie);
+	else
+		iomfb_abort_swaps_dcp(dcp, false, &abort_req,
+					aborted_swaps_dcp_poff, poff_cookie);
 	ret = wait_for_completion_timeout(&poff_cookie->done,
 					  msecs_to_jiffies(1000));
 
@@ -1833,8 +1843,11 @@ void DCP_FW_NAME(iomfb_sleep)(struct apple_dcp *dcp)
 	/* increase refcount to ensure the receiver has a reference */
 	kref_get(&cookie->refcount);
 
-	iomfb_abort_swaps_dcp(dcp, false, &req, aborted_swaps_dcp_sleep,
-				cookie);
+	if (DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER)
+		last_client_closed_sleep(dcp, NULL, cookie);
+	else
+		iomfb_abort_swaps_dcp(dcp, false, &req,
+					aborted_swaps_dcp_sleep, cookie);
 	ret = wait_for_completion_timeout(&cookie->done,
 					  msecs_to_jiffies(1000));
 

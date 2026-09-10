@@ -83,15 +83,14 @@ static const struct dcp_method_entry dcp_methods[dcpep_num_methods] = {
 	IOMFB_METHOD("A201", dcpep_rtp_set_int),             /* (0x8, 0x4) PropRelay::setInt(RuntimeProperty, u32) */
 	IOMFB_METHOD("A450", dcpep_enable_disable_video_power_savings), /* init_1 position, in = u32 0 */
 	IOMFB_METHOD("A457", dcpep_first_client_open), /* init_2, between A450 and A412; (0,0) */
-	/* UNRESOLVED: A466 is never called by macOS.  No capture contains a
-	 * client teardown, so the real tag is unknown (the shift model suggests
-	 * A458/A459).  Left as-is; only reached on teardown. */
+	/*
+	 * No H17P capture contains client teardown, so these two tags remain
+	 * unknown. Power transitions bypass both slots and issue A473 directly.
+	 */
 	IOMFB_METHOD("A466", iomfbep_last_client_close),
 	IOMFB_METHOD("A465", dcpep_set_display_refresh_properties), /* while it is in flight the DCP calls back D561 with displayMinRefreshInterval */
 	IOMFB_METHOD("A468", dcpep_flush_supports_power), /* immediately follows setup_video_limits inside D121, in = 01 */
-	/* UNRESOLVED: A478 is a live (0,0x4) method, so this entry would hand it
-	 * a 0x14-byte record.  The real abort_swaps tag is unknown (probably
-	 * A469); no capture aborts a swap.  Only reached on teardown. */
+	/* A478 is a different live method; this placeholder must not be called. */
 	IOMFB_METHOD("A478", iomfbep_abort_swaps_dcp),
 	IOMFB_METHOD("A473", dcpep_set_power_state), /* the only OOBCMD call in the capture, matching this method's oob=true; out 0x8 */
 	IOMFB_METHOD("A472", dcpep_register_dfb_surface), /* default FB surface, nested in D582 */
