@@ -156,6 +156,7 @@ struct dchid_iface {
 	uint8_t tx_seq;
 	bool deferred;
 	bool starting;
+	bool startup_failed;
 	bool open;
 	struct completion ready;
 
@@ -430,6 +431,57 @@ static int dchid_inherited_pm2_transition(struct dchid_iface *iface, u8 state)
 	return dchid_comm_cmd(iface->dchid, msg, sizeof(msg));
 }
 
+static bool dchid_j700_power_v2(struct dchid_iface *iface)
+{
+	return of_machine_is_compatible("apple,j700") &&
+	       iface->index == 1 && !strcmp(iface->name, "multi-touch");
+}
+
+static int dchid_j700_set_power(struct dchid_iface *iface, u8 state)
+{
+	struct {
+		u8 command;
+		u8 version;
+		u8 iface;
+		u8 state;
+		u8 did_change;
+		__le32 status;
+	} __packed msg = {
+		.command = DCHID_CMD_RESET_INTERFACE,
+		.version = 2,
+		.iface = iface->index,
+		.state = state,
+	};
+	int ret;
+
+	/*
+	 * J700 MTP_SYS selects PowerMethod=2. Its comm firmware accepts only
+	 * nine-byte v2 reports: will-change, platform function, has-changed.
+	 * The pinned power-sequence uses physical High for 50 ms on power-off
+	 * and Low with no delay on power-on. Use raw levels for this platform
+	 * function, independent of the legacy DT's active-low GPIO flag.
+	 * macsmc-gpio maps it to pKW8(pcIO, 0x10000, 0x130000).
+	 */
+	if (state != 0 && state != 2)
+		return -EINVAL;
+
+	ret = dchid_comm_cmd(iface->dchid, &msg, sizeof(msg));
+	if (ret < 0)
+		return ret;
+
+	ret = gpiod_set_raw_value_cansleep(iface->gpio, state == 0);
+	if (ret < 0)
+		return ret;
+	if (state == 0)
+		fsleep(50000);
+
+	msg.did_change = 1;
+	ret = dchid_comm_cmd(iface->dchid, &msg, sizeof(msg));
+	dev_info(iface->dchid->dev, "J700 MTP power-v2 state=%u result=%d\n",
+		 state, ret);
+	return ret;
+}
+
 static int dchid_send_firmware(struct dchid_iface *iface, void *firmware, size_t size)
 {
 	struct {
@@ -546,6 +598,9 @@ static int dchid_start_interface(struct dchid_iface *iface)
 	size_t size;
 	int ret;
 
+	if (iface->startup_failed)
+		return -EIO;
+
 	if (iface->starting) {
 		dev_warn(iface->dchid->dev, "Interface %s is already starting", iface->name);
 		return -EINPROGRESS;
@@ -590,8 +645,19 @@ static int dchid_start_interface(struct dchid_iface *iface)
 		goto err;
 	}
 
+	if (dchid_j700_power_v2(iface) && !iface->gpio) {
+		/* Do not toggle the line before the will-change notification. */
+		iface->gpio = devm_gpiod_get_index(iface->dchid->dev,
+						 "apple,afe-reset", 0, GPIOD_ASIS);
+		if (IS_ERR(iface->gpio)) {
+			ret = PTR_ERR(iface->gpio);
+			iface->gpio = NULL;
+			goto err;
+		}
+	}
+
 	/* Dynamic requests include ID zero; Power Method 2 uses afe-reset. */
-	if (!inherited_power_method_2 &&
+	if (!dchid_j700_power_v2(iface) && !inherited_power_method_2 &&
 	    (iface->gpio_request_seen || power_method_2)) {
 		ret = dchid_request_gpio(iface, power_method_2 ?
 					 GPIOD_OUT_HIGH : GPIOD_OUT_LOW);
@@ -608,6 +674,9 @@ static int dchid_start_interface(struct dchid_iface *iface)
 	/* Only multi-touch has firmware */
 	if (fw && size) {
 
+		if (dchid_j700_power_v2(iface))
+			iface->startup_failed = true;
+
 		/* Send firmware to the device */
 		dev_info(iface->dchid->dev, "Sending firmware for %s\n", iface->name);
 		ret = dchid_send_firmware(iface, fw, size);
@@ -619,7 +688,14 @@ static int dchid_start_interface(struct dchid_iface *iface)
 		dev_info(iface->dchid->dev,
 			 "Powering on %s with power method %u\n",
 			 iface->name, iface->power_method);
-		if (power_method_2) {
+		if (dchid_j700_power_v2(iface)) {
+			ret = dchid_j700_set_power(iface, DCHID_POWER_STATE_OFF);
+			if (ret < 0)
+				goto err;
+			ret = dchid_j700_set_power(iface, DCHID_POWER_STATE_ON);
+			if (ret < 0)
+				goto err;
+		} else if (power_method_2) {
 			if (inherited_power_method_2) {
 				ret = dchid_inherited_pm2_transition(iface, DCHID_POWER_STATE_OFF);
 				if (ret < 0)
@@ -696,6 +772,7 @@ static int dchid_open(struct hid_device *hdev)
 	}
 
 	iface->open = true;
+	iface->startup_failed = false;
 	return 0;
 }
 
