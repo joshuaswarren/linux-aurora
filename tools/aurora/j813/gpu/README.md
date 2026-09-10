@@ -108,7 +108,7 @@ SPTM global root reported by the current boot receipt; its firmware mappings
 do not appear in the ordinary per-context TTBR pairs.
 
 `m5-metal-reference.m` verifies compute results and rendered pixels through
-three fresh Metal command queues. Eight macOS runs each passed 3,072 exact
+three fresh Metal command queues. Fifteen macOS runs each passed 3,072 exact
 compute values and 12,288 RGBA pixels. This is a macOS reference, not evidence
 that Linux submission, rendering or DCP works.
 
@@ -267,6 +267,25 @@ The KSM queue priority is separate from the outer work-channel priority.
 to stderr when `M5_TRACE_BUFFERS` is set, for private payload correlation.
 Build this reference on the controller and copy it to the guest; compiling
 inside one traced guest triggered an XNU page-table refcount panic.
+
+`m5_compute.rs` encodes the measured 40-write M5 compute register program.
+Three captured programs match all 480 bytes. One capture additionally saves
+the native host descriptor and verifies its control inputs independently:
+registers 0xd4a1 and 0xa599 depend on descriptor +0x530/+0x538, and 0x1a458
+depends on +0x60a/+0x60b flags. These controls vary between workloads; they
+are not fixed M5 properties. M5 also uses larger operand-state offsets.
+`verify-m5-compute-registers.py` labels older captures whose control inputs
+must be recovered from encoded output rather than a separate descriptor.
+
+`m5_sksm.rs` constructs the complete 512-byte HAL300 entry, including the
+two-bit dependency types at +0x180 and the M5 header's additional flag.
+It checks queue capacity, generation wrap, packed addresses and dependency
+bounds before producing a result. `verify-m5-sksm.py` matches four native
+entries byte-for-byte, their packed 21-byte tag-14 records, and the separately
+captured producer stamp/count. Variable command operands come from captures;
+this validates serialization, not shader execution or Linux queue ownership.
+The runtime must still construct command backing, register the queue,
+publish in native order and process completion before submitting Linux work.
 
 `trace-m5-sksm-submit.py` captures one such submission on an existing paused
 M5 hypervisor owner. It checks native instruction bytes, bounds CPU reads to

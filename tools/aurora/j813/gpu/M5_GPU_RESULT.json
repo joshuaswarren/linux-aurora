@@ -51,7 +51,7 @@
     "shared_cluster_bytes": 163840,
     "shared_clusters_identical": true,
     "cold_boots_compared": 4,
-    "metal_runs_passed": 12,
+    "metal_runs_passed": 15,
     "command_queues_per_run": 3,
     "compute_values_per_run": 3072,
     "render_pixels_per_run": 12288,
@@ -71,8 +71,23 @@
     "ring_read_through_firmware_global_alias": true,
     "cpu_ring_view_unmapped_at_capture": true,
     "capture_tied_to_specific_metal_command": false,
-    "host_capture_tests_passed": 4,
+    "host_capture_tests_passed": 5,
     "linux_submission_qualified": false
+  },
+  "source_compute_codecs": {
+    "register_programs_matched": 3,
+    "register_count": 40,
+    "register_bytes": 480,
+    "independent_native_descriptor_control_captures": 1,
+    "legacy_captures_with_controls_derived_from_output": 2,
+    "sksm_entries_matched": 4,
+    "sksm_entry_bytes": 512,
+    "m5_dependency_types_offset": 384,
+    "tag14_records_matched": 4,
+    "native_producer_transitions_matched": 4,
+    "unit_tests_passed": 7,
+    "runtime_wired": false,
+    "linux_gpu_execution_qualified": false
   },
   "source_codecs": {
     "full_shared_cluster_bytes_matched": 163840,

@@ -2,7 +2,7 @@
 
 #![cfg_attr(not(test), allow(dead_code))]
 
-//! T8142/25G76 HAL300 SKSM entry and tag-14 serialization.
+//! T8142/25G76 HAL300 SKSM compute entry and tag-14 serialization.
 //!
 //! The M5 host clears 0x200 bytes and writes two-bit dependency types at
 //! +0x180. Neo's 0x180-byte entry cannot represent this data. These pure
@@ -12,15 +12,6 @@
 
 pub(crate) const M5_SKSM_ENTRY_BYTES: usize = 0x200;
 pub(crate) const M5_SKSM_ENTRY_COUNT: u32 = 256;
-
-/// Logical channel selector measured in native TA, 3D and CL tag-14 records.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-#[repr(u32)]
-pub(crate) enum M5DataMaster {
-    Tiling = 0,
-    Fragment = 1,
-    Compute = 2,
-}
 const STAMP_MASK: u64 = (1 << 40) - 1;
 const PACKED_ADDRESS_MASK: u64 = (1 << 38) - 1;
 
@@ -238,23 +229,6 @@ pub(crate) fn encode_m5_sksm_add_kicks(
     first_stamp: u64,
     count: u16,
 ) -> Result<[u8; 21], M5SksmError> {
-    encode_m5_sksm_add_kicks_for(
-        M5DataMaster::Compute,
-        queue_id,
-        priority,
-        first_stamp,
-        count,
-    )
-}
-
-/// Encode a retained queue's stage explicitly; graphics never uses CL's DM2.
-pub(crate) fn encode_m5_sksm_add_kicks_for(
-    data_master: M5DataMaster,
-    queue_id: u8,
-    priority: u8,
-    first_stamp: u64,
-    count: u16,
-) -> Result<[u8; 21], M5SksmError> {
     check_queue(queue_id, priority, first_stamp)?;
     if count == 0 || count > 256 {
         return Err(M5SksmError::AddCount);
@@ -265,35 +239,13 @@ pub(crate) fn encode_m5_sksm_add_kicks_for(
     bytes[6..8].copy_from_slice(&count.to_le_bytes());
     bytes[8] = priority;
     bytes[9..17].copy_from_slice(&first_stamp.to_le_bytes());
-    bytes[17..21].copy_from_slice(&(data_master as u32).to_le_bytes());
+    bytes[17..21].copy_from_slice(&2u32.to_le_bytes());
     Ok(bytes)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn native_graphics_add_kicks_records_match_both_stages() {
-        let ta = [
-            14, 0, 0, 0, 10, 0, 1, 0, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        ];
-        let fragment = [
-            14, 0, 0, 0, 11, 0, 1, 0, 2, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
-        ];
-        assert_eq!(
-            encode_m5_sksm_add_kicks_for(M5DataMaster::Tiling, 10, 2, 3, 1).unwrap(),
-            ta
-        );
-        assert_eq!(
-            encode_m5_sksm_add_kicks_for(M5DataMaster::Fragment, 11, 2, 3, 1).unwrap(),
-            fragment
-        );
-        assert_eq!(
-            encode_m5_sksm_add_kicks(11, 2, 3, 1).unwrap(),
-            encode_m5_sksm_add_kicks_for(M5DataMaster::Compute, 11, 2, 3, 1).unwrap()
-        );
-    }
 
     fn queue() -> M5SksmQueue {
         M5SksmQueue {
