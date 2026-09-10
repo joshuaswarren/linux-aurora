@@ -17,6 +17,7 @@ from unittest.mock import patch
 SCRIPT = Path(__file__).with_name('trace-m5-sksm-submit.py')
 PC = 0xfffffe0008984fc0
 COMPLETE_PC = 0xfffffe00089855b0
+POOL_PC = 0xfffffe00089a766c
 BASE = 0x10000000000
 COMMAND, QUEUE, RING = (0xfffffe0010000000 + x for x in (0x1000, 0x2000, 0x10000))
 DESCRIPTOR = COMMAND + 0x2000
@@ -31,6 +32,7 @@ class FakeHV:
         self.memory = bytearray(0x80000)
         self.memory[:8] = bytes.fromhex('811642f9700240f9') if not bad_code else bytes(8)
         self.memory[8:16] = bytes.fromhex('f30300aa080840f9')
+        self.memory[16:24] = bytes.fromhex('390040b928f77ed3')
         self.gpu_views, self.context_views = {}, {}
         struct.pack_into('<IHHBQI', self.memory, 0x1000, 14, 4, 1, 2, 1, 2)
         struct.pack_into('<III', self.memory, 0x200c, 4, 256, stride)
@@ -67,6 +69,8 @@ class FakeHV:
         return bytes(self.context_views[(context, address, size)])
 
     def translate(self, address, *_):
+        if POOL_PC <= address < POOL_PC + 8:
+            return BASE + 16 + address - POOL_PC
         if PC <= address < PC + 8:
             return BASE + address - PC
         if COMPLETE_PC <= address < COMPLETE_PC + 8:
@@ -119,6 +123,57 @@ class CaptureTests(unittest.TestCase):
                     self.assertTrue(descriptor['stable'])
                     raw = (path.parent / descriptor['file']).read_bytes()
                     self.assertEqual(struct.unpack_from('<QQ', raw, 0x530), (0x54b, 0xf5))
+
+    def test_pool_control_capture_and_submission_disarm(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hv = FakeHV(directory)
+            hv.ctx.regs[1] = COMMAND + 0x100
+            hv.ctx.elr = POOL_PC
+            struct.pack_into('<I', hv.memory, 0x1100, 0x20)
+            struct.pack_into('<Q', hv.memory, 0x1114, 0xfffffc2012340000)
+            with patch.dict(os.environ, M5_GPU_TRACE_DIR=directory,
+                            M5_SKSM_CAPTURE_POOL='1'), contextlib.redirect_stdout(io.StringIO()):
+                state = self.run_script(hv)
+                self.assertEqual(hv.breakpoints, [PC, POOL_PC])
+                self.assertTrue(state['_m5_pool_control'](hv.ctx))
+                self.assertEqual((hv.ctx.elr, hv.ctx.regs[25]), (POOL_PC + 4, 0x20))
+                hv.ctx.elr = PC
+                self.assertTrue(state['_m5_sksm_submit'](hv.ctx))
+                self.assertEqual(hv.breakpoints, [])
+            path, = Path(directory).glob('sksm-submit-*/manifest.json')
+            observed, = json.loads(path.read_text())['prior_pool_controls']
+            self.assertTrue(observed['command_stable'])
+            self.assertTrue(observed['event_stable'])
+            self.assertEqual((Path(directory) / observed['directory'] / 'command.bin').read_bytes()[:4],
+                             struct.pack('<I', 0x20))
+
+    def test_grow_views_preserve_instruction_when_one_context_is_unmapped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hv = FakeHV(directory)
+            hv.ctx.regs[1], hv.ctx.elr = COMMAND + 0x100, POOL_PC
+            event_address, table, grow, page_list = 0xfffffc2050000000, 0x7000408000, 0x7000408380, 0x7000000000
+            struct.pack_into('<I', hv.memory, 0x1100, 0x20)
+            struct.pack_into('<QQQI', hv.memory, 0x1114, event_address, table, grow, 0x20)
+            struct.pack_into('<I', hv.memory, 0x1104, 3)
+            event = bytearray(0x70)
+            struct.pack_into('<Q', event, 0x14, page_list)
+            hv.gpu_views[event_address] = event
+            for address, length in [(table, 0x1000), (grow, 0x100), (page_list, 0x100)]:
+                hv.context_views[(3, address, length)] = bytes([length // 0x100]) * length
+            with patch.dict(os.environ, M5_GPU_TRACE_DIR=directory,
+                            M5_SKSM_CAPTURE_POOL='1', M5_SKSM_CAPTURE_POOL_GROW='1'), contextlib.redirect_stdout(io.StringIO()):
+                state = self.run_script(hv)
+                self.assertTrue(state['_m5_pool_control'](hv.ctx))
+            self.assertEqual((hv.ctx.elr, hv.ctx.regs[25]), (POOL_PC + 4, 0x20))
+            path, = Path(directory).glob('pool-control-*/manifest.json')
+            record = json.loads(path.read_text())
+            self.assertNotIn('event_error', record)
+            views = record['before_pool_views']
+            self.assertEqual(len(views), 6)
+            self.assertTrue(all('error' in view for view in views if view['gpu_context'] == 0))
+            self.assertTrue(all(view['stable'] for view in views if view['gpu_context'] == 3))
+            self.assertEqual((path.parent / 'grow-records-context3.bin').read_bytes(), bytes([1]) * 0x100)
+            self.assertEqual(hv.breakpoints, [PC, POOL_PC])
 
     def test_unmapped_descriptor_does_not_invalidate_the_ring(self):
         with tempfile.TemporaryDirectory() as directory:

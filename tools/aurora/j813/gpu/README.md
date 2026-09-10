@@ -6,22 +6,43 @@ firmware processors now complete RTKit startup and acknowledge Linux-owned
 initialization data in the native RAM-boot experiment. Linux also registers
 an owned SKSM compute queue, binds its scheduler control, and verifies the
 firmware's retained records.
-An isolated execution context and six owned diagnostic program pages also
-survive this transaction, with all input values and output sentinels unchanged.
-It does not yet
-execute GPU work or expose a render node. DCP presentation is a later,
+An isolated execution context, program pages and initial compute pool now
+support a first SKSM kick. Both command queues retire and firmware accounts
+for the kick, but no completion or shader result follows. It does not yet
+execute verified GPU work or expose a render node. DCP presentation is a later,
 independent qualification; neither a software desktop nor encoder success
 is evidence of GPU rendering.
 
 ## Hardware evidence, 2026-09-10
 
+- Two fresh RAM boots with `m5_initdata_test=6` submitted one SKSM compute
+  kick after the previous queue, scheduler and context checks passed. Outer
+  counters reached `[2, 2, 2]`, inner counters `[4, 4, 4]`, and the firmware's
+  added-kick counter reached one. No firmware crash was observed. The second
+  run waited 10,000 polls: completion cursor stayed zero and all 1,024 output
+  sentinels remained untouched. Both firmware stop requests succeeded.
+  The runner intentionally reports failure until exact shader output exists.
+- The owned 4-MiB page directory and 32-byte M5 UMA slot were verified against
+  a completed native Metal capture, then read back from the stopped Linux
+  probe. All 7,168 initial addresses and all descriptor words matched. M5's
+  UMA packing differs from Neo's. Initial directory construction belongs to
+  the host; an opcode-20 growth request is not used for initial registration.
+- Native startup observations retain the same initial reserved-DATA status
+  values during working macOS GPU operation. Those snapshots cannot prove
+  an unpowered GPU. The Linux probe logs later state transitions without
+  using these values as a power-readiness gate or modifying firmware DATA.
+- `verify-m5-pool-capture.py CAPTURE --self-test` verifies the native descriptor,
+  initial directory, allocation bounds and guards; it rejects the earlier
+  empty-directory and Neo-packing mistakes. `capture-m5-linux-compute-state.py`
+  reads the stopped probe's retained RAM through its live page tables. Its
+  physical reads are limited to System RAM and measured GPU reservations.
 - A fresh RAM boot with `m5_initdata_test=5` additionally prepared context 3
   with an independently allocated lower root and empty upper root, both
   tagged with ASID 3. After both initialization acknowledgments, control
   openings, queue registration and scheduler binding, the root pair remained
   current and all 1,024 inputs and output sentinels remained unchanged.
   Both stop requests succeeded. This verifies host preparation and retention;
-  shader execution through that context remains untested.
+  this mode submits no shader. Mode 6's execution failure is described above.
 - A fresh RAM boot with `m5_initdata_test=3` registered SKSM queue 11 using
   one tag-15 configuration. The outer and inner counters each advanced to
   `[1, 1, 1]`; the firmware DATA record changed from zero to
@@ -81,7 +102,7 @@ is evidence of GPU rendering.
 
 The M5 initdata transaction requires the exact captured firmware profile.
 It owns the UAT and both firmware roles independently of the Neo manager.
-GPU submission, completion and a registered DRM runtime remain open.
+GPU execution, completion and a registered DRM runtime remain open.
 
 ## Reproducible diagnostic candidate
 
@@ -168,8 +189,8 @@ separate generic configuration function missed that path. The production
 taking queue fields, descriptor flags and the scheduler pointer from their
 native owners. Remaining event/owner values are opaque inputs. Disabled event
 sentinels also follow the native branch. Queue installation now passes on
-Linux, followed by scheduler first-bind. User-context and event attachment
-remain untested.
+Linux, followed by scheduler first-bind. Mode 6 exercises context and event
+updates, but their effect on successful shader execution remains unqualified.
 
 `verify-m5-channel.py` checks that byte match against a private capture.
 `test-m5-sksm-capture.py` checks capture guards, filtered submissions and
@@ -296,6 +317,14 @@ two slot IDs, set state 4 and mark queue 11 in the control's bitmap. Run
 still disables context updates and the optional event machine; it submits
 no register program or SKSM kick.
 
+Mode 6 constructs the retained initial pool and issues one controlled SKSM
+compute kick. Run `run-m5-queue-install-probe.py 6` after a fresh RAM boot.
+It requires all 1,024 exact results, unchanged inputs and retired command
+queues, so the current stalled hardware result exits with failure. Do not
+restart or unload this retained session. Capture its RAM with
+`capture-m5-linux-compute-state.py INVENTORY_JSON OUTPUT_DIRECTORY` before
+rebooting; `M1N1_DIR` may select the host's M5-capable proxyclient tree.
+
 The firmware handoff page is observed to remain zero in macOS. The M5-only
 no-peer handoff path has now passed initialization; it does not establish
 working cache flushes, power management, command submission or rendering.
@@ -384,8 +413,9 @@ bounds before producing a result. `verify-m5-sksm.py` matches four native
 entries byte-for-byte, their packed 21-byte tag-14 records, and the separately
 captured producer stamp/count. Variable command operands come from captures;
 this validates serialization, not shader execution or Linux queue ownership.
-The runtime must still construct command backing, bind its scheduler/context,
-publish in native order and process completion before submitting Linux work.
+The diagnostic runtime now constructs owned backing, binds its scheduler and
+context, and publishes in native order. Hardware execution and completion
+remain the next qualification boundary.
 
 `trace-m5-sksm-submit.py` captures one such submission on an existing paused
 M5 hypervisor owner. It checks native instruction bytes, bounds CPU reads to
@@ -396,8 +426,9 @@ queue filters. `test-m5-sksm-capture.py` checks its mapping, profile, geometry,
 EL0/EL1 translation and filter guards without hardware. Payload-page views
 are observations, not a qualified command decoder. Raw captures stay private.
 
-Metal reference runs alongside this capture passed 3,072 compute values and
-12,288 pixels across three queues. The captured queue has not yet been tied
-to a particular test command; background macOS compute is also present.
-Linux M5 job submission and completion remain open. The latest Neo reference also still
-has a first-draw GPU fault in Xorg; neither target is yet DCP-only.
+Controlled Metal references pass 3,072 compute values and 12,288 pixels across
+three queues. Selected captures now include the program bytes and the same
+descriptor's verified output at completion; background macOS work is filtered.
+Linux M5 command submission reaches firmware accounting, but shader execution
+and hardware completion remain unproven. Neither GPU rendering nor DCP has
+been qualified on this M5 candidate.

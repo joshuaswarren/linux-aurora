@@ -5,14 +5,20 @@ use super::MappedObject;
 use crate::{driver::AsahiDevice, m5_compute_program as program, mmu};
 use kernel::prelude::*;
 
+#[path = "m5_compute_job.rs"]
+mod compute_job;
+pub(super) use compute_job::{DESCRIPTOR_HIGH, DESCRIPTOR_LOW, EVENT};
+use compute_job::M5ComputeJob;
+
 pub(super) struct M5ProgramMemory {
     // Retract the roots before releasing any page mappings.
     context: mmu::M5ExecutionContext,
     pages: KVec<MappedObject>,
+    job: Option<M5ComputeJob>,
 }
 
 impl M5ProgramMemory {
-    pub(super) fn new(dev: &AsahiDevice, uat: &mmu::Uat) -> Result<Self> {
+    pub(super) fn new(dev: &AsahiDevice, uat: &mmu::Uat, with_job: bool) -> Result<Self> {
         let mut context = uat.new_t8142_execution_context()?;
         let mut pages = KVec::new();
         for (address, kind) in [
@@ -30,8 +36,42 @@ impl M5ProgramMemory {
             context.vm().translate_iova(address)?;
             pages.push(page, GFP_KERNEL)?;
         }
+        let job = if with_job { Some(M5ComputeJob::new(dev, uat, context.vm())?) } else { None };
         context.publish()?;
-        Ok(Self { context, pages })
+        Ok(Self { context, pages, job })
+    }
+
+    pub(super) fn uma_descriptor(&self) -> Result<[u64; 4]> {
+        Ok(self.job.as_ref().ok_or(EINVAL)?.uma_descriptor())
+    }
+
+    pub(super) fn pool_state(&mut self) -> Result<[u64; 5]> {
+        self.job.as_mut().ok_or(EINVAL)?.pool_state()
+    }
+
+    pub(super) fn pool_ready(state: [u64; 5]) -> bool { M5ComputeJob::pool_ready(state) }
+
+    pub(super) fn progress(&mut self) -> Result<[u32; 5]> {
+        self.job.as_mut().ok_or(EINVAL)?.progress()
+    }
+
+    pub(super) fn result(&mut self) -> Result<program::ComputeResult> {
+        self.pages[4].with_bytes_mut(|bytes| {
+            let mut result = program::ComputeResult {
+                inputs_changed: 0, outputs_wrong: 0, outputs_untouched: 0,
+            };
+            for index in 0..program::ELEMENTS {
+                // SAFETY: these two aligned 1024-word spans are inside the
+                // retained 16-KiB WC mapping. Firmware may update output.
+                let read = |base: usize| unsafe { core::ptr::read_volatile(
+                    bytes.as_ptr().add(base + index * 4).cast::<u32>()) };
+                result.inputs_changed += usize::from(read(program::INPUT_OFFSET) != index as u32 * 7);
+                let value = read(program::OUTPUT_OFFSET);
+                result.outputs_wrong += usize::from(value != index as u32 * 21 + 5);
+                result.outputs_untouched += usize::from(value == program::SENTINEL);
+            }
+            Ok(result)
+        })
     }
 
     pub(super) fn validate_unsubmitted(&mut self) -> Result<[u64; 2]> {

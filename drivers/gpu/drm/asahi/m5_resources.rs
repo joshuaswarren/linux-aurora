@@ -92,8 +92,8 @@ impl M5FirmwareMemory {
         let region_a = fixed(KERNEL_BASE + 0x1b_8000, init::REGION_A_SIZE, mmu::PROT_FW_SHARED_RO)?;
         let mut region_c = fixed(KERNEL_BASE + 0x1a_0000, init::REGION_C_SIZE, mmu::PROT_FW_SHARED_RO)?;
         let fwctl = fixed(FWCTL_BASE, 0x4000, mmu::PROT_FW_SHARED_RW)?;
-        // These two tables already have zero-backed mappings at handoff.
-        // Their populated runtime descriptors belong to a later stage.
+        // These two tables have zero-backed mappings at handoff. Mode6
+        // prepares its own UMA slot before any compute publication.
         let mut pbdesc = fixed(PBDESC_BASE, 0x4000, mmu::PROT_FW_SHARED_RW)?;
         let mut uma = fixed(UMA_BASE, 0x4000, mmu::PROT_FW_SHARED_RW)?;
         let mut aliases = KVec::new();
@@ -205,10 +205,19 @@ impl M5FirmwareMemory {
             None
         };
         let program = if probe_kind >= 5 {
-            Some(M5ProgramMemory::new(dev, &uat)?)
+            Some(M5ProgramMemory::new(dev, &uat, probe_kind >= 6)?)
         } else {
             None
         };
+        if probe_kind >= 6 {
+            let descriptor = program.as_ref().ok_or(EINVAL)?.uma_descriptor()?;
+            uma.with_bytes_mut(|out| {
+                for (index, word) in descriptor.into_iter().enumerate() {
+                    out[index * 8..index * 8 + 8].copy_from_slice(&word.to_le_bytes());
+                }
+                Ok(())
+            })?;
+        }
         fence(Ordering::SeqCst);
         Ok(Self { primary_root, secondary_root, shared, private, region_a, region_c, fwctl, aon, qos,
                   pbdesc, uma, completions, aliases, registers, queue_probe, program, uat })
@@ -216,6 +225,71 @@ impl M5FirmwareMemory {
 
     pub(crate) fn validate_program_context(&mut self) -> Result<[u64; 2]> {
         self.program.as_mut().ok_or(EINVAL)?.validate_unsubmitted()
+    }
+
+    pub(crate) fn power_status(&self) -> Result<[u32; 3]> {
+        Ok(self.queue_probe.as_ref().ok_or(EINVAL)?.power_status())
+    }
+
+    pub(crate) fn publish_idle_wake(&mut self) -> Result {
+        if self.control_counters()? != [[1; 3]; 2] { return Err(EBUSY); }
+        self.shared.with_bytes_mut(|out| {
+            let record = &mut out[0x1eac0..0x1eb00];
+            if record.iter().any(|x| *x != 0) { return Err(EBUSY); }
+            record[..4].copy_from_slice(&0x0au32.to_le_bytes());
+            Ok(())
+        })?;
+        fence(Ordering::SeqCst);
+        let producer = init::WORK_STATE_GRID_OFFSETS[init::CONTROL_CHANNEL_INDEX]
+            + 2 * init::CHANNEL_STATE_SPACING;
+        self.private.write_u32(PRIVATE_BASE + producer as u64, 2)?;
+        fence(Ordering::SeqCst);
+        Ok(())
+    }
+
+    pub(crate) fn compute_pool_state(&mut self) -> Result<[u64; 5]> {
+        self.program.as_mut().ok_or(EINVAL)?.pool_state()
+    }
+
+    pub(crate) fn compute_pool_ready(state: [u64; 5]) -> bool {
+        M5ProgramMemory::pool_ready(state)
+    }
+
+    pub(crate) fn compute_result(&mut self) -> Result<crate::m5_compute_program::ComputeResult> {
+        self.program.as_mut().ok_or(EINVAL)?.result()
+    }
+
+    pub(crate) fn compute_progress(&mut self) -> Result<[u32; 5]> {
+        self.program.as_mut().ok_or(EINVAL)?.progress()
+    }
+
+    pub(crate) fn compute_observations(&mut self) -> Result<([u64; 4], [u64; 4], u32)> {
+        let firmware = self.queue_probe.as_ref().ok_or(EINVAL)?.compute_observations();
+        let uma = [self.uma.read_u64(UMA_BASE)?, self.uma.read_u64(UMA_BASE + 8)?,
+                   self.uma.read_u64(UMA_BASE + 16)?, self.uma.read_u64(UMA_BASE + 24)?];
+        let completion_cursor = self.shared.read_u32(SHARED_BASE + 0x2614 + 2 * 0x20 + 0x1c)?;
+        Ok((firmware, uma, completion_cursor))
+    }
+
+    pub(crate) fn publish_compute_job(&mut self) -> Result {
+        let (outer, inner, _) = self.queue_probe_status()?;
+        if outer != [1; 3] || inner != [1; 3] { return Err(EBUSY); }
+        let address = self.queue_probe.as_ref().ok_or(EINVAL)?.queue_address();
+        self.queue_probe.as_mut().ok_or(EINVAL)?.prepare_compute_job()?;
+        self.shared.with_bytes_mut(|out| {
+            let record = &mut out[0x19dd8..0x19df0];
+            if record.iter().any(|x| *x != 0) { return Err(EBUSY); }
+            record[8..16].copy_from_slice(&address.to_le_bytes());
+            record[16..20].copy_from_slice(&2u32.to_le_bytes());
+            record[20..22].copy_from_slice(&4u16.to_le_bytes());
+            record[22] = 11;
+            record[23] = 1;
+            Ok(())
+        })?;
+        fence(Ordering::SeqCst);
+        self.private.write_u32(PRIVATE_BASE + 0x260, 2)?;
+        fence(Ordering::SeqCst);
+        Ok(())
     }
 
     pub(crate) fn root(&self, secondary: bool) -> u64 {

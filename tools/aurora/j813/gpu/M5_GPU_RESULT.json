@@ -104,7 +104,7 @@
     "tag14_records_matched": 4,
     "native_producer_transitions_matched": 4,
     "unit_tests_passed": 8,
-    "runtime_wired": false,
+    "runtime_wired": true,
     "linux_gpu_execution_qualified": false
   },
   "source_channel_codec": {
@@ -118,7 +118,7 @@
     "queue_install_qualified": true,
     "scheduler_bind_qualified": true,
     "runtime_wired": true,
-    "runtime_scope": "Tag-15 queue install and scheduler bind; context and event updates disabled",
+    "runtime_scope": "Explicit mode6 queue, scheduler, context and event setup followed by one SKSM kick; no verified shader completion",
     "linux_gpu_execution_qualified": false
   },
   "source_codecs": {
@@ -153,7 +153,7 @@
     "kernel_build_passed": true,
     "ram_boot_retested_after_codec_changes": true,
     "runtime_wired": true,
-    "runtime_scope": "Explicit M5 initdata, control opening and queue-install transactions; no DRM registration or GPU jobs"
+    "runtime_scope": "Explicit M5 diagnostics through one SKSM compute kick; no DRM registration or verified GPU execution"
   },
   "linux_program_context": {
     "fresh_ram_boots_passed": 1,
@@ -264,6 +264,30 @@
     "owners_pinned_until_reboot": true,
     "console_log_sha256": "fe524e734e9eb20afb30836d5f273f765d1e457418bb091116579bd4764d3872",
     "boot_log_sha256": "d47baed809134671cedc339132e105218fbb5af2eae63053fe10599cf60f73d9"
+  },
+  "linux_initial_compute_probe": {
+    "module_parameter": "m5_initdata_test=6",
+    "fresh_ram_boots_observed": 2,
+    "queue_id": 11,
+    "context_id": 3,
+    "sksm_kicks_submitted_per_boot": 1,
+    "firmware_added_kick_count": 1,
+    "outer_after": [2, 2, 2],
+    "inner_after": [4, 4, 4],
+    "directory_allocation_bytes": 4194304,
+    "initial_page_addresses_matched_to_native": 7168,
+    "m5_uma_slot_bytes": 32,
+    "uma_and_directory_match_stopped_linux_readback": true,
+    "initial_growth_request_submitted": false,
+    "maximum_poll_iterations": 10000,
+    "completion_cursor_after": 0,
+    "unchanged_inputs": 1024,
+    "untouched_output_sentinels": 1024,
+    "firmware_crashes_observed": 0,
+    "stop_requests_succeeded_per_boot": 2,
+    "owners_pinned_until_reboot": true,
+    "shader_execution_qualified": false,
+    "remaining_issue": "Kick accepted by firmware but no hardware completion or shader output"
   },
   "render_node": false,
   "gpu_compute_qualified": false,

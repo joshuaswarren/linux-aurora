@@ -3,6 +3,7 @@
 
 use super::{MappedObject, KERNEL_BASE};
 use crate::{driver::AsahiDevice, g17_submission, m5_channel, mmu};
+use crate::m5_sksm;
 use core::sync::atomic::{fence, Ordering};
 use kernel::{c_str, io, prelude::*};
 
@@ -103,7 +104,8 @@ impl M5QueueProbe {
             || resource.start() & 0x3fff != 0
             || resource.start().checked_add(resource.size()).ok_or(EOVERFLOW)? > 0x104_0000_0000
             || FIRMWARE_SLOT + 0x28 > resource.size() as usize
-            || FIRMWARE_SCHEDULER + 8 > resource.size() as usize {
+            || FIRMWARE_SCHEDULER + 8 > resource.size() as usize
+            || 0x178458 - 0x4c000 + 8 > resource.size() as usize {
             return Err(EINVAL);
         }
         let ctr: u64;
@@ -129,6 +131,54 @@ impl M5QueueProbe {
         GRAPH_BASE + QUEUE_OFFSET as u64
     }
 
+    pub(super) fn prepare_compute_job(&mut self) -> Result {
+        use super::program_memory::{DESCRIPTOR_HIGH, DESCRIPTOR_LOW, EVENT};
+        if self.inner_counters()? != [1; 3] { return Err(EBUSY); }
+        let entry = m5_sksm::prepare_m5_sksm_entry(m5_sksm::M5SksmQueue {
+            id: QUEUE_ID, priority: 2, current_stamp: 1, submitted: 0, previous_stamp: None,
+        }, m5_sksm::M5SksmOperands {
+            barriers: &[], first_predecessor: 0, implicit_dependency_type: 1,
+            mcache: None, flag_bit1: false, flag_bit61: false, flag_bit63: false,
+            payload: [DESCRIPTOR_HIGH, self.queue_address()],
+            qos_byte_32: 3, qos_class_40: 8, qos_word_48: 0xffff,
+            event_mask: [0, 0, 8, 0], rce_kind: 0,
+            rce: [m5_sksm::M5SksmRce { address: DESCRIPTOR_LOW + 0x40, tag: 37 },
+                  m5_sksm::M5SksmRce { address: DESCRIPTOR_LOW + 0x760, tag: 4 },
+                  m5_sksm::M5SksmRce { address: 0, tag: 0 },
+                  m5_sksm::M5SksmRce { address: 0, tag: 0 }],
+            auxiliary: 0x3f_ffff_ffff_ffff,
+        }).map_err(|_| EINVAL)?;
+        let config = m5_channel::encode_m5_channel_config(m5_channel::M5ChannelConfig {
+            ring_low: ENTRY_LOW, ring_high: ENTRY_HIGH, queue_id: QUEUE_ID, priority: 2,
+            install_queue: false, gpu_context: 3,
+            event: Some(m5_channel::M5ChannelEvent { address: EVENT, timestamp: 1, index: 0 }),
+            channel_control: GRAPH_BASE + CONTROL as u64,
+            update_scheduler: false, scheduler_index: 0, channel_stamp_index: 0,
+            update_context: true, owner_context: 1, extended_command: false,
+        }).map_err(|_| EINVAL)?;
+        let kick = m5_sksm::encode_m5_sksm_add_kicks(QUEUE_ID, 2, 1, 1).map_err(|_| EINVAL)?;
+        self.entry.with_bytes_mut(|out| {
+            let range = &mut out[entry.offset as usize..entry.offset as usize + entry.bytes.len()];
+            if range.iter().any(|x| *x != 0) { return Err(EBUSY); }
+            range.copy_from_slice(&entry.bytes);
+            Ok(())
+        })?;
+        self.graph.with_bytes_mut(|out| {
+            out[CONFIG + 0x100..CONFIG + 0x100 + config.len()].copy_from_slice(&config);
+            out[CONFIG + 0x200..CONFIG + 0x200 + kick.len()].copy_from_slice(&kick);
+            for (index, address) in [DESCRIPTOR_HIGH,
+                GRAPH_BASE + CONFIG as u64 + 0x100, GRAPH_BASE + CONFIG as u64 + 0x200]
+                .into_iter().enumerate() {
+                out[ITEMS + (index + 1) * 8..ITEMS + (index + 2) * 8]
+                    .copy_from_slice(&address.to_le_bytes());
+            }
+            Ok(())
+        })?;
+        fence(Ordering::SeqCst);
+        self.graph.write_u32(GRAPH_BASE + POINTERS as u64 + 0x40, 4)?;
+        Ok(())
+    }
+
     pub(super) fn inner_counters(&mut self) -> Result<[u32; 3]> {
         Ok([self.graph.read_u32(GRAPH_BASE + POINTERS as u64)?,
             self.graph.read_u32(GRAPH_BASE + POINTERS as u64 + 0x30)?,
@@ -136,7 +186,7 @@ impl M5QueueProbe {
     }
 
     fn firmware_words<const N: usize>(&self, offset: usize) -> [u64; N] {
-        // The only callers use the two constructor-checked table extents.
+        // Callers use constructor-checked table and power-state extents.
         let line = self.firmware.cache_line;
         let start = offset & !(line - 1);
         let end = (offset + N * 8 + line - 1) & !(line - 1);
@@ -164,6 +214,21 @@ impl M5QueueProbe {
 
     pub(super) fn firmware_slot(&self) -> [u64; 5] {
         self.firmware_words::<5>(FIRMWARE_SLOT)
+    }
+
+    pub(super) fn power_status(&self) -> [u32; 3] {
+        // Exact 25G76 reserved DATA observations. These may differ from
+        // firmware-private cached state and cannot establish power readiness.
+        [self.firmware_words::<1>(0x128868 - 0x4c000)[0] as u32,
+         self.firmware_words::<1>(0x1773e8 - 0x4c000)[0] as u32,
+         self.firmware_words::<1>(0x177a28 - 0x4c000)[0] as u32]
+    }
+
+    pub(super) fn compute_observations(&self) -> [u64; 4] {
+        [self.firmware_words::<1>(0x125be8 - 0x4c000)[0],
+         self.firmware_words::<1>(0x128868 - 0x4c000)[0],
+         self.firmware_words::<1>(0x1773e8 - 0x4c000)[0],
+         self.firmware_words::<1>(0x178458 - 0x4c000)[0]]
     }
 
     pub(super) fn scheduler_status(&mut self) -> Result<Option<[u64; 3]>> {

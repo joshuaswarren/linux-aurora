@@ -26,9 +26,6 @@ const POOL_BYTES: usize = 0x20_0000;
 const POOL_STRIDE: u64 = 0x20_8000;
 const DIRECTORY_ENTRIES: usize = 0x80000;
 const POOL_PAGES: usize = POOL_COUNT * POOL_BYTES / 0x1000;
-// The sole probe owns hardware UMA slot zero. The register program and
-// shared-control record must select that same populated slot.
-const PRIVATE_POOL_HW_ID: u32 = 0;
 
 pub(super) struct M5ComputeJob {
     descriptor_alias: mmu::KernelMapping,
@@ -99,7 +96,7 @@ impl M5ComputeJob {
             // Both native pre-submit owner captures retain an enabled link.
             out[0x6000..0x6004].copy_from_slice(&1u32.to_le_bytes());
             let event = &mut out[0x5000..0x5070];
-            for (offset, value) in [(0, 1u32), (8, PRIVATE_POOL_HW_ID), (0x10, 2), (0x1c, 0x80000),
+            for (offset, value) in [(0, 1u32), (0x10, 2), (0x1c, 0x80000),
                 (0x24, 0x1c00), (0x2c, 0x1c00), (0x40, 4), (0x48, 0x70),
                 (0x5c, 1), (0x60, 2)] {
                 event[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
@@ -117,7 +114,7 @@ impl M5ComputeJob {
                     preempt_base: program::PREEMPT_PAGE, cdm_base: program::STREAM_PAGE,
                     dispatch_identity: 0x0000_0001_0000_0001, context_id: 3, work_ordinal: 0,
                     robustness: program::ROBUSTNESS_PAGE, operand_state_base: OPERAND,
-                    private_pool_hw_id: u64::from(PRIVATE_POOL_HW_ID), descriptor_control_530: 0x54b,
+                    execution_gate: 2, descriptor_control_530: 0x54b,
                     descriptor_control_538: 0xf5, descriptor_flag_60a: false,
                     descriptor_flag_60b: false,
                 },
@@ -153,7 +150,7 @@ impl M5ComputeJob {
     }
 
     pub(super) fn pool_ready(state: [u64; 5]) -> bool {
-        state[0] == u64::from(PRIVATE_POOL_HW_ID) && state[1] == 1 && state[2] == 1
+        state[0] == 0 && state[1] == 1 && state[2] == 1
             && state[3] == POOL_BASE
             && state[4] == POOL_BASE + (POOL_COUNT - 1) as u64 * POOL_STRIDE + 0x1ff000
     }
