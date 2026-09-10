@@ -9,8 +9,8 @@ sys.path.insert(0, str(root / "m1n1/proxyclient"))
 from m1n1.proxy import Serial
 
 mode = int(sys.argv[1]) if len(sys.argv) == 2 else 3
-if len(sys.argv) > 2 or mode not in (3, 4, 5):
-    raise ValueError("Expected mode 3 (queue), 4 (scheduler) or 5 (program context)")
+if len(sys.argv) > 2 or mode not in (3, 4, 5, 6):
+    raise ValueError("Expected mode 3 (queue), 4 (scheduler), 5 (context) or 6 (compute)")
 command = (
     "echo M5_QUEUE_PROBE_BEGIN; "
     "if grep -q apple,j813 /proc/device-tree/compatible "
@@ -42,6 +42,8 @@ if mode >= 4:
     required.append(b"M5_QUEUE scheduler bound Some(")
 if mode >= 5:
     required.append(b"M5_CONTEXT prepared id3 roots=")
+if mode >= 6:
+    required.append(b"M5_COMPUTE verified 1024 exact outputs, inputs unchanged, queues retired;")
 if any(marker not in captured for marker in required):
     raise RuntimeError("Queue installation was not verified; inspect the retained log")
 print("M5_QUEUE_INSTALL_HARDWARE_VERIFIED")

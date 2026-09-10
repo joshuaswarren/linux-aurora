@@ -29,6 +29,10 @@ _m5_sksm_dram_end = _m5_sksm_dram_base + int(hv.u.adt['/chosen'].dram_size)
 _m5_sksm_output = Path(os.environ['M5_GPU_TRACE_DIR'])
 _m5_sksm_read_bytes = 0
 _m5_sksm_hits = 0
+_m5_pool_control_pc = 0xfffffe00089a766c
+_m5_pool_control_armed = False
+_m5_pool_control_hits = 0
+_m5_pool_control_observations = []
 _m5_sksm_priority_text = os.environ.get('M5_SKSM_CAPTURE_PRIORITY')
 _m5_sksm_priority = int(_m5_sksm_priority_text) if _m5_sksm_priority_text is not None else None
 _m5_sksm_exclude = {int(x, 0) for x in os.environ.get('M5_SKSM_EXCLUDE_QIDS', '').split(',') if x}
@@ -93,7 +97,7 @@ if (int(hv.ctx.spsr) & 0xf) >> 2:
 
 
 def _m5_sksm_submit(ctx):
-    global _m5_sksm_hits
+    global _m5_sksm_hits, _m5_pool_control_armed
     _m5_sksm_hits += 1
     filter_error = None
     try:
@@ -117,12 +121,17 @@ def _m5_sksm_submit(ctx):
         filter_error = error
     # Remove first so even output-directory or read failures remain one-shot.
     hv.remove_hw_bp(_m5_sksm_pc)
+    if _m5_pool_control_armed:
+        hv.remove_hw_bp(_m5_pool_control_pc)
+        _m5_pool_control_armed = False
     directory = _m5_sksm_output / ('sksm-submit-' + str(time.time_ns()))
     directory.mkdir(mode=0o700)
     manifest = dict(phase='host-tag14-before-channel-publication',
                     pc=hex(int(ctx.elr)), objects=[], device_memory_read=False,
                     requested_priority=_m5_sksm_priority, observed_submissions=_m5_sksm_hits,
                     excluded_queue_ids=sorted(_m5_sksm_exclude), observations=_m5_sksm_observations)
+    if _m5_pool_control_observations:
+        manifest['prior_pool_controls'] = _m5_pool_control_observations
 
     def save(label, address, size, gpu=False, context=None, physical=False):
         if physical:
@@ -292,6 +301,68 @@ def _m5_sksm_submit(ctx):
                         roots = save('compute-context-roots', region + gpu_context * 16,
                                      16, physical=True)
                         manifest['compute_context_roots'] = [hex(x) for x in struct.unpack('<QQ', roots)]
+                        if os.environ.get('M5_SKSM_CAPTURE_POOL') == '1':
+                            # The controlled M5 profile's private-memory pool.
+                            # Capture metadata prefixes (not allocation sizes)
+                            # and both ends of each retained 2-MiB data block.
+                            pool = []
+                            for name, address, length in [
+                                    ('directory', 0x7000000000, 0x10000),
+                                    ('freelist', 0x7000408000, 0x4000),
+                                    ('operand-state', registers[0xa5c1] - 5, 0x20000)]:
+                                info = dict(label=name, address=hex(address))
+                                try:
+                                    save('compute-pool-' + name, address, length,
+                                         gpu=True, context=gpu_context)
+                                    info['size'] = length
+                                except (RuntimeError, ValueError) as error:
+                                    info['error'] = str(error)
+                                pool.append(info)
+                            for block in range(14):
+                                base = 0x7000448000 + block * 0x208000
+                                for side, address in [('head', base), ('tail', base + 0x200000 - 32)]:
+                                    info = dict(label='block-%d-%s' % (block, side), address=hex(address))
+                                    try:
+                                        save('compute-pool-' + info['label'], address, 32,
+                                             gpu=True, context=gpu_context)
+                                        info['mapping'] = _m5_sksm_gpu.mapping(address, 32, gpu_context, region)
+                                    except (RuntimeError, ValueError) as error:
+                                        info['error'] = str(error)
+                                    pool.append(info)
+                            for role in ('gfx-asc', 'gfx1-asc'):
+                                main = (_m5_sksm_output / 'preinit' / role / 'main-config.bin').read_bytes()
+                                hardware, = struct.unpack_from('<Q', main)
+                                main_offset = 0x1e5c0 if role == 'gfx-asc' else 0x22a80
+                                save('compute-pool-' + role + '-control-ring',
+                                     hardware + main_offset + 0x4c0, 0x4000, gpu=True)
+                            shared_control, = struct.unpack_from('<Q', payload, 0xfb2)
+                            event_state = save('compute-pool-event-state', shared_control, 0x70, gpu=True)
+                            # M5 halLoadUMADesc uses a 32-byte hardware-ID slot.
+                            # Preserve the live slot before interpreting its
+                            # fields; Neo uses a different packed layout.
+                            buffer_id, = struct.unpack_from('<I', event_state, 8)
+                            if buffer_id >= 512:
+                                raise ValueError('M5 pool hardware ID exceeds the retained UMA page')
+                            primary = (_m5_sksm_output / 'preinit/gfx-asc/main-config.bin').read_bytes()
+                            uma_low, uma_high = struct.unpack_from('<QQ', primary, 0x2e8)
+                            manifest['compute_pool_uma'] = dict(buffer_id=buffer_id,
+                                high=hex(uma_high), low=hex(uma_low))
+                            save('compute-pool-uma-slot', uma_high + buffer_id * 32, 32, gpu=True)
+                            alternate_low, alternate_high = struct.unpack_from('<QQ', primary, 0x2d8)
+                            manifest['compute_pool_pb_table'] = dict(buffer_id=buffer_id,
+                                high=hex(alternate_high), low=hex(alternate_low))
+                            save('compute-pool-pb-slot', alternate_high + buffer_id * 32, 32, gpu=True)
+                            directory_address, = struct.unpack_from('<Q', event_state, 0x14)
+                            manifest['compute_pool_directory_edges'] = []
+                            for offset in (0xffff, 0x10000, 0x3fffff, 0x400000, 0x404000):
+                                edge = dict(offset=hex(offset))
+                                try:
+                                    edge['mapping'] = _m5_sksm_gpu.mapping(
+                                        directory_address + offset, 1, gpu_context, region)
+                                except (RuntimeError, ValueError) as error:
+                                    edge['error'] = str(error)
+                                manifest['compute_pool_directory_edges'].append(edge)
+                            manifest['compute_pool'] = pool
                         if os.environ.get('M5_SKSM_CAPTURE_OWNERS') == '1':
                             # Firmware compute setup follows +fb2 even when
                             # +f5c is zero. Capture the actual retained owners,
@@ -487,4 +558,87 @@ def _m5_sksm_submit(ctx):
 
 
 hv.add_hw_bp(_m5_sksm_pc, hook=_m5_sksm_submit)
+if os.environ.get('M5_SKSM_CAPTURE_POOL') == '1':
+    def _m5_pool_control(ctx):
+        global _m5_pool_control_armed, _m5_pool_control_hits, _m5_sksm_read_bytes
+        try:
+            if _m5_sksm_read_cpu(_m5_pool_control_pc, 8) != bytes.fromhex('390040b928f77ed3'):
+                raise ValueError('M5 pool-control site differs from pinned 25G76 code')
+            _m5_pool_control_hits += 1
+            address = int(ctx.regs[1])
+            opcode, = struct.unpack('<I', _m5_sksm_read_cpu(address, 4))
+            if opcode == 0x20:
+                directory = _m5_sksm_output / ('pool-control-' + str(time.time_ns()))
+                directory.mkdir(mode=0o700)
+                first, second = _m5_sksm_read_cpu(address, 64), _m5_sksm_read_cpu(address, 64)
+                (directory / 'command.bin').write_bytes(first)
+                record = dict(directory=directory.name, command_stable=first == second,
+                              command_sha256=hashlib.sha256(first).hexdigest(),
+                              native_instruction_bytes_checked=True, device_memory_read=False)
+                pointer, = struct.unpack_from('<Q', first, 0x14)
+                record['shared_control'] = hex(pointer)
+                try:
+                    before = _m5_sksm_read_gpu(pointer, 0x70)
+                    repeat = _m5_sksm_read_gpu(pointer, 0x70)
+                    (directory / 'event-before.bin').write_bytes(before)
+                    record['event_stable'] = before == repeat
+                    if (os.environ.get('M5_SKSM_CAPTURE_POOL_GROW') == '1'
+                            and len(_m5_pool_control_observations) < 2):
+                        # A post-submit FList cannot establish its initial
+                        # directory or the separately appended grow records.
+                        # Capture both candidate address spaces before the
+                        # native control record is published, without MMIO.
+                        table, grow = struct.unpack_from('<QQ', first, 0x1c)
+                        count, = struct.unpack_from('<I', first, 0x2c)
+                        page_list, = struct.unpack_from('<Q', before, 0x14)
+                        if not 0 < count <= 0x200:
+                            raise ValueError('M5 grow capture count outside bounded profile')
+                        views = []
+                        context_word, = struct.unpack_from('<I', first, 4)
+                        if context_word > 63:
+                            raise ValueError('M5 control context outside bounded profile')
+                        record['control_word_04'] = context_word
+                        for gpu_context in dict.fromkeys((0, context_word)):
+                            for label, target, length in (
+                                    ('freelist-prefix', table, 0x1000),
+                                    ('grow-records', grow, count * 8),
+                                    ('directory-prefix', page_list, 0x100)):
+                                view = dict(label=label, address=hex(target),
+                                            size=length, gpu_context=gpu_context)
+                                try:
+                                    samples = []
+                                    for _ in range(2):
+                                        if _m5_sksm_read_bytes + length > 2 * 1024 * 1024:
+                                            raise ValueError('M5 SKSM capture exceeds its DRAM read budget')
+                                        _m5_sksm_read_bytes += length
+                                        samples.append(_m5_sksm_gpu.read_context(target, length,
+                                            gpu_context, int(hv.u.adt['/arm-io/sgx'].gpu_region_base)))
+                                    name = '%s-context%d.bin' % (label, gpu_context)
+                                    (directory / name).write_bytes(samples[0])
+                                    view.update(file=name, stable=samples[0] == samples[1],
+                                                sha256=hashlib.sha256(samples[0]).hexdigest())
+                                except (RuntimeError, ValueError) as error:
+                                    view['error'] = str(error)
+                                views.append(view)
+                        record['before_pool_views'] = views
+                except (RuntimeError, ValueError) as error:
+                    record['event_error'] = str(error)
+                (directory / 'manifest.json').write_text(json.dumps(record, indent=2) + '\n')
+                _m5_pool_control_observations.append(record)
+                print('M5_POOL_CONTROL_CAPTURED', directory.name)
+            if _m5_pool_control_hits >= 512 or len(_m5_pool_control_observations) >= 8:
+                hv.remove_hw_bp(_m5_pool_control_pc)
+                _m5_pool_control_armed = False
+            # The pinned instruction is LDR W25,[X1]. Advance its exact effect
+            # to avoid the carrier's repeated-trap path while this hook stays.
+            ctx.regs[25] = opcode
+            ctx.elr += 4
+        except Exception as error:
+            hv.remove_hw_bp(_m5_pool_control_pc)
+            _m5_pool_control_armed = False
+            print('M5_POOL_CONTROL_CAPTURE_FAILED', repr(error))
+        return True
+
+    hv.add_hw_bp(_m5_pool_control_pc, hook=_m5_pool_control)
+    _m5_pool_control_armed = True
 print('M5_SKSM_SUBMIT_ARMED: one native compute kick queue, bounded DRAM only')

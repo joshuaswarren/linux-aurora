@@ -147,7 +147,71 @@ impl M5Session {
             let roots = self.memory.as_mut().ok_or(EIO)?.validate_program_context()?;
             dev_info!(self.dev.as_ref(), "M5_CONTEXT prepared id3 roots={:x?}; six pages, 1024 untouched outputs, no kicks\n", roots);
         }
+        if probe_kind >= 6 {
+            self.submit_compute()?;
+        }
         Ok(())
+    }
+
+    fn submit_compute(&mut self) -> Result {
+        let memory = self.memory.as_mut().ok_or(EIO)?;
+        dev_info!(self.dev.as_ref(), "M5_POWER before wake {:x?}\n", memory.power_status()?);
+        // Retire the idle-policy request. Reserved DATA snapshots retain
+        // pause2/powerflags4 during successful native GPU work as well;
+        // those observations do not establish whether the GPU is awake.
+        memory.publish_idle_wake()?;
+        Pin::new(&mut self.roles[0].rtkit).send_message(0x21, 0x0084_0000_0000_0011)?;
+        let mut awake = false;
+        for _ in 0..1000 {
+            if self.roles.iter().any(|role| role.state.crashed.load(Ordering::Acquire)) {
+                dev_err!(self.dev.as_ref(), "M5_POWER firmware crash {:x?}\n", memory.power_status()?);
+                return Err(EIO);
+            }
+            let state = memory.power_status()?;
+            if memory.control_counters()? == [[2; 3], [1; 3]] {
+                dev_info!(self.dev.as_ref(), "M5_POWER idle policy retired; DATA observation {:x?}\n", state);
+                awake = true;
+                break;
+            }
+            fsleep(Delta::from_millis(1));
+        }
+        if !awake {
+            dev_err!(self.dev.as_ref(), "M5_POWER wake timeout counters={:?} state={:x?}\n",
+                memory.control_counters()?, memory.power_status()?);
+            return Err(ETIMEDOUT);
+        }
+        let state = memory.compute_pool_state()?;
+        if !M5FirmwareMemory::compute_pool_ready(state) {
+            dev_err!(self.dev.as_ref(), "M5_POOL host preparation invalid {:x?}\n", state);
+            return Err(EIO);
+        }
+        dev_info!(self.dev.as_ref(), "M5_POOL host directory and UMA slot prepared {:x?}; no growth request\n", state);
+        memory.publish_compute_job()?;
+        Pin::new(&mut self.roles[0].rtkit).send_message(0x21, 0x0083_0000_0000_000a)?;
+        dev_info!(self.dev.as_ref(), "M5_COMPUTE first SKSM kick submitted qid11 stamp1 context3\n");
+        for poll in 0..10000 {
+            if self.roles.iter().any(|role| role.state.crashed.load(Ordering::Acquire)) { break; }
+            if [0, 100, 1000, 5000].contains(&poll) {
+                dev_info!(self.dev.as_ref(), "M5_COMPUTE poll={} firmware/UMA/completion={:x?}\n",
+                    poll, memory.compute_observations()?);
+            }
+            let result = memory.compute_result()?;
+            if result.inputs_changed != 0 { break; }
+            let (outer, inner, _) = memory.queue_probe_status()?;
+            if result.outputs_wrong == 0 && outer == [2; 3] && inner == [4; 3] {
+                dev_info!(self.dev.as_ref(), "M5_COMPUTE verified 1024 exact outputs, inputs unchanged, queues retired; progress={:x?}\n",
+                    memory.compute_progress()?);
+                return Ok(());
+            }
+            fsleep(Delta::from_millis(1));
+        }
+        let result = memory.compute_result()?;
+        dev_err!(self.dev.as_ref(), "M5_COMPUTE final firmware/UMA/completion={:x?}\n",
+            memory.compute_observations()?);
+        dev_err!(self.dev.as_ref(), "M5_COMPUTE failed inputs_changed={} outputs_wrong={} untouched={} queues={:?} progress={:x?}\n",
+            result.inputs_changed, result.outputs_wrong, result.outputs_untouched,
+            memory.queue_probe_status()?, memory.compute_progress()?);
+        Err(EIO)
     }
 
     fn retire_openings(&mut self) -> Result {
@@ -246,7 +310,8 @@ impl M5Runtime {
         // This explicit RAM-boot experiment is released by reboot only.
         unsafe { kernel::bindings::__module_get(crate::THIS_MODULE.as_ptr()); }
         let result = session.initialize(*crate::module_parameters::m5_initdata_test.value());
-        dev_info!(pdev.as_ref(), "M5_INIT transaction result={:?}; no GPU jobs submitted\n", result);
+        dev_info!(pdev.as_ref(), "M5_INIT transaction result={:?}; requested probe mode={}\n",
+            result, *crate::module_parameters::m5_initdata_test.value());
         let stopped = session.stop_cpus();
         dev_info!(pdev.as_ref(), "M5_INIT stop requests={:?}; owners retained\n", stopped);
         Ok(Self { session: Some(session) })

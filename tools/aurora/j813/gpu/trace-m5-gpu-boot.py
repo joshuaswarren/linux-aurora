@@ -115,10 +115,37 @@ if os.environ.get('M5_GPU_CAPTURE_INIT') == '1':
         (int(hv.u.adt['/chosen'].dram_base), int(hv.u.adt['/chosen'].dram_size)),
         int(recorded_roots[0], 16))
     init_seen = set()
+    startup_capture = None
+    startup_init_word = None
+    startup_hits = 0
+    if os.environ.get('M5_GPU_CAPTURE_STARTUP') == '1':
+        from m5_startup_capture import M5StartupCapture
+        sgx = hv.u.adt['/arm-io/sgx']
+        startup_capture = M5StartupCapture(hv.iface.readmem,
+            (int(hv.u.adt['/chosen'].dram_base), int(hv.u.adt['/chosen'].dram_size)),
+            int(recorded_roots[0], 16), (int(sgx.gfx_data_base), int(sgx.gfx_data_size)))
 
     def init_callback(role, ident):
         def record(event):
+            global startup_init_word, startup_hits
             word = int(event.data)
+            if role == 'gfx-asc' and startup_capture is not None and role in init_seen:
+                startup_hits += 1
+                try:
+                    if (word >> 48) & 0xff in (0x83, 0x84):
+                        if hv.ctx is None:
+                            raise RuntimeError('Startup capture must execute synchronously')
+                        manifest = startup_capture.capture_startup(startup_init_word, word,
+                            output / 'startup' / ('publication-%02d' % startup_capture.events))
+                        emit('STARTUP_CAPTURE', ordinal=manifest['ordinal'],
+                             state=manifest.get('firmware_state'), error=manifest.get('error'))
+                except Exception as error:
+                    emit('STARTUP_CAPTURE_FAILED', error=repr(error))
+                    hv.clear_tracers(ident)
+                finally:
+                    if startup_hits >= 512 or startup_capture.events >= startup_capture.MAX_EVENTS:
+                        hv.clear_tracers(ident)
+                return
             if (word >> 48) & 0xff != 0x81 or role in init_seen:
                 return
             init_seen.add(role)
@@ -128,6 +155,8 @@ if os.environ.get('M5_GPU_CAPTURE_INIT') == '1':
                 emit('INIT_CAPTURE_BEGIN', role=role, word0=hex(word))
                 manifest = init_capture.capture(role, word, output / 'preinit' / role,
                                                 'before-INBOX1-publication')
+                if role == 'gfx-asc':
+                    startup_init_word = word
                 emit('INIT_CAPTURE_COMPLETE', role=role, bytes=manifest['total_bytes'],
                      objects=len(manifest['objects']))
             except Exception as error:
@@ -135,7 +164,8 @@ if os.environ.get('M5_GPU_CAPTURE_INIT') == '1':
             finally:
                 # This is a synchronous handler: removing this override is
                 # safe. The existing asynchronous ASC tracer stays installed.
-                hv.clear_tracers(ident)
+                if role != 'gfx-asc' or startup_capture is None or startup_init_word is None:
+                    hv.clear_tracers(ident)
         return record
 
     for role, base in [('gfx-asc', 0x582600000), ('gfx1-asc', 0x582e00000)]:
