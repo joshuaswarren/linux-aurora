@@ -82,29 +82,58 @@ SPTM global root reported by the current boot receipt; its firmware mappings
 do not appear in the ordinary per-context TTBR pairs.
 
 `m5-metal-reference.m` verifies compute results and rendered pixels through
-three fresh Metal command queues. Four macOS runs each passed 3,072 exact
+three fresh Metal command queues. Six macOS runs each passed 3,072 exact
 compute values and 12,288 RGBA pixels. This is a macOS reference, not evidence
 that Linux submission, rendering or DCP works.
 
 ## Source construction and M5 differences
 
-Linux now has an explicit J813/25G76 root serializer and register-map
-serializer. The root version is `0x0c8aa322039e04c0`; both loaded firmware
+Linux now has explicit J813/25G76 serializers for both roots and main objects,
+the complete hardware-data block, four completion queue descriptors, the
+shared policy allocations, region C and primary/secondary status objects.
+The root version is `0x0c8aa322039e04c0`; both loaded firmware
 images independently compare that value. The existing Neo runtime continues
 to use `0x0c8aa322039604c0` and rejects the M5 version.
 
-`verify-m5-gpu-codecs.py` rebuilds both roots and all 53 register-table slots
-against the private pre-handoff captures. It also emulates the exact pinned
+`verify-m5-gpu-codecs.py` rebuilds the configuration objects and all 53
+register-table slots against three independent cold-boot captures. It checks
+the seven native allocation sizes in the pinned host binary, validates
+pointer rebinding and rejects overlapping backing before modifying output.
+It also emulates the exact pinned
 M5 host reset routine with synthetic allocations and compares its output
 against the Linux channel codec across 32 cases. All comparisons pass.
 The driver/module build passes; these codecs are not wired into an M5 runtime.
 
-Two differences require explicit handling:
+The M5 profile handles these differences explicitly:
 
 - The live M5 host resets a 192-byte cached channel record, moving fields to
   +0x44, +0x48 and unaligned +0x9c. The older shared 128-byte reset is unsuitable.
 - Register slot 39 carries distinct size fields, 0x10000 and 0x8000. The older
   serializer duplicated a single size and cannot reproduce this table.
+- M5 requires four 128 KiB completion backings, including ordinals 1 and 3.
+  The two-role capture found all four, and the 0xe40-byte QoS backing, zero
+  before the respective initialization messages.
+- Primary main-config fields +0x32c/+0x344 and secondary +0x300 differ.
+  Region C contains different platform values and a pair moved by 0x20.
+- Native allocation descriptors establish the hardware block size as 0x2708
+  and the six following sizes as 0xc18, 0x1048, 0xe10, 0x6a30, 0x68 and 0x800.
+  Applying the native 64-byte rounding places the next allocation at +0xc500.
+- Shared policy +0xb75c is the host's `mach_absolute_time()` value; +0x8ed8
+  and +0xb6a0 are caller-owned state/AON PTD pointers. None is a static value.
+  The native AON PTD allocation is 0xe4 bytes. Its measured contents match
+  both roles on the third cold boot and remain unchanged after Metal work;
+  Linux must allocate and retain the backing through firmware shutdown.
+- The firmware roles can start in either order. GFX1 takes root+0xb8 as its
+  shared configuration and writes +0x670/+0x678/+0x680 after startup. These
+  must begin at zero. A later primary capture can already contain secondary
+  runtime state, despite preceding the primary's own root handoff.
+
+The measured ten-core J813 policy is target-specific. Its opaque calibration
+words have not been generalized to other M5 machines or derived from ADT.
+Read-only page-table walks verified firmware VA 0xfffffc2180080000 maps to
+physical SGX 0x580000000 and register slot 39 maps to 0x580e08000. The value
+at hardware-header +0x28 is unmapped in the global and sampled context views;
+it must not be treated as an observed MMIO mapping.
 
 The M5 driver contains HAL300/SKSM queue classes. During the passing reference
 workload, the primary ASC emitted endpoint-0x21/type-0x83 work doorbells,
@@ -112,5 +141,6 @@ including three `0x8300000000000a` compute kicks. The observed CPU FIFO at
 SGX+0x4090/+0x4098 stayed quiet. This establishes a workload mailbox path;
 it does not prove every M5 workload uses the same transport or that the Linux
 path is interchangeable. Neo's HAL200 runtime remains a useful reference.
-Full hardware-data construction, firmware ownership, M5 submission and
-completion remain open.
+Firmware ownership, the remaining channel graph, M5
+submission and completion remain open. The latest Neo reference also still
+has a first-draw GPU fault in Xorg; neither target is yet DCP-only.

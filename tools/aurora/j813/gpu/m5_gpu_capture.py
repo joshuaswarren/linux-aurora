@@ -82,7 +82,25 @@ class M5GPUCapture:
         if role == 'gfx-asc':
             if [word(main, 0x254 + i * 8) - hardware for i in range(5)] != [0x2740, 0x3380, 0x4400, 0xbc80, 0xbd00]:
                 raise ValueError('M5 hardware bundle views changed')
-        save('shared-cluster', hardware, 0x28000)
+        cluster = save('shared-cluster', hardware, 0x28000)
+        if struct.unpack_from('<I', cluster, 0xe90)[0] != 0x8142:
+            raise ValueError('Hardware-data chip identity differs from M5')
+        # M5 provisions four completion queues, including ordinals 1 and 3
+        # which the older Neo profile leaves absent. The native descriptors
+        # independently specify 0x800 entries of 0x40 bytes each.
+        for ordinal in range(4):
+            offset = 0x2614 + ordinal * 0x20
+            low, high, count, entry_size, recorded_ordinal = struct.unpack_from('<QQIIQ', cluster, offset)
+            if count != 0x800 or entry_size != 0x40 or recorded_ordinal != ordinal or not low:
+                raise ValueError('M5 completion queue descriptor changed')
+            save('completion-' + str(ordinal), high, count * entry_size)
+        # 25G76 AGXQOSManager::init allocates and clears exactly 0xe40 bytes
+        # (host native VAs 0xfffffe0008a0d748 and 0xfffffe0008a0d934).
+        save('qos', word(cluster, 0x26ac), 0xe40)
+        # AGXFirmware::allocFirmwareData descriptor __const 0x71398d8:
+        # AON PTD is 0xe4 bytes. AGXArmFirmware::initPowerAndPerformanceData
+        # stores its GPU address at policy+0x6460 (cluster+0xb6a0).
+        save('aon-ptd', word(cluster, 0xb6a0), 0xe4)
         save('region-a', word(root, 8), 0x4000)
         save('region-c', word(root, 0x20), 0x1000)
         save('status-a', word(root, 0xa8), 0x80)
@@ -91,10 +109,14 @@ class M5GPUCapture:
             if word(root, 0xa8) - status_b != 0xeb00:
                 raise ValueError('M5 primary status object extent changed')
             save('status-b', status_b, 0xeb00)
+            save('status-config', status_b + 0xe440, 0x6a8)
         else:
             for i, offset in enumerate((0xb8, 0xc0)):
                 if word(root, offset):
                     save('secondary-extra-' + str(i), word(root, offset), 0x80)
+            # Secondary +0xb8 aliases the primary's independent config
+            # allocation. Its descriptor size is 0x6a8, rounded to 0x6c0.
+            save('status-config', word(root, 0xb8), 0x6a8)
         manifest = dict(format='aurora-m5-gpu-init-v1', role=role, phase=phase,
                         version=hex(self.VERSION), uat_virtual_address_bits=43,
                         firmware_pointer_masked_to_40_bits=False, total_bytes=total,
