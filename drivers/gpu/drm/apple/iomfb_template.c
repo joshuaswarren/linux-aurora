@@ -146,9 +146,17 @@ struct dcp_pipe_cfg_415 {
 	u8 data[0xc];
 } __packed;
 
+/*
+ * A031 is update_notify_clients_dcp(u32[27]): a bitmap-as-array of the DCP
+ * notification clients the AP wants delivered.  macOS enables them
+ * cumulatively over nine calls, ending at {6,7,8,10,11,12,25,26}; we used to
+ * send nine zeroed records, so we finished with no notify clients registered
+ * at all and never received the callbacks they gate.
+ */
 struct dcp_pipe_cfg_031 {
-	u8 data[0x6c];
+	__le32 clients[27];
 } __packed;
+static_assert(sizeof(struct dcp_pipe_cfg_031) == 0x6c);
 
 DCP_THUNK_OUT(dcp_pipe_query_353, dcpep_pipe_query_353, u64);
 DCP_THUNK_INOUT(dcp_pipe_set_352, dcpep_pipe_set_352, u64, u32);
@@ -210,14 +218,86 @@ static u32 dcpep_cb_zero(struct apple_dcp *dcp)
 	return 0;
 }
 
+/*
+ * Bind every framebuffer displaced by the commit that produced this swap to
+ * that swap's id.
+ *
+ * The id only exists once the firmware answers swap_start, after the atomic
+ * commit has queued its entries, so they are queued unarmed and stamped here.
+ * Swap-start requests are serialized by the DCP command stack.
+ */
+static void dcp_arm_swapped_out_fbs(struct apple_dcp *dcp, u32 swap_id)
+{
+	struct dcp_fb_reference *entry;
+	unsigned long flags;
+
+	spin_lock_irqsave(&dcp->swapped_out_lock, flags);
+	list_for_each_entry(entry, &dcp->swapped_out_fbs, head) {
+		if (entry->armed)
+			continue;
+		entry->swap_id = swap_id;
+		entry->armed = true;
+	}
+	spin_unlock_irqrestore(&dcp->swapped_out_lock, flags);
+}
+
+/*
+ * Drop framebuffers whose unbinding swap has completed.
+ *
+ * Entries must be keyed to the swap that unbinds them, rather than the last
+ * swap that happened to have completed when the atomic commit ran.  A later
+ * successful completion also retires entries whose own completion was lost;
+ * the signed difference keeps that comparison valid across a 32-bit wrap.
+ */
+static void dcp_release_swapped_out_fbs(struct apple_dcp *dcp)
+{
+	struct dcp_fb_reference *entry, *tmp;
+	unsigned long flags;
+	LIST_HEAD(done);
+
+	/*
+	 * last_swap_id / have_swap_complete are only ever touched by the RTKit
+	 * worker, which is also the only caller of this function, so the lock
+	 * is here for the list alone.
+	 */
+	spin_lock_irqsave(&dcp->swapped_out_lock, flags);
+	while (!list_empty(&dcp->swapped_out_fbs)) {
+		entry = list_first_entry(&dcp->swapped_out_fbs,
+					 struct dcp_fb_reference, head);
+
+		/* Newest entries; their swap has not been started yet. */
+		if (!entry->armed)
+			break;
+		/* last_swap_id is 0 from kzalloc until a swap really lands. */
+		if (!dcp->have_swap_complete)
+			break;
+		/* Hold the old framebuffer for one additional completed swap. */
+		if ((s32)(dcp->last_swap_id - entry->swap_id) <= 0)
+			break;
+
+		list_move_tail(&entry->head, &done);
+	}
+	spin_unlock_irqrestore(&dcp->swapped_out_lock, flags);
+
+	/* drm_framebuffer_put() can sleep, so never call it under the lock. */
+	list_for_each_entry_safe(entry, tmp, &done, head) {
+		if (entry->fb)
+			drm_framebuffer_put(entry->fb);
+		list_del(&entry->head);
+		kfree(entry);
+	}
+}
+
 static void dcpep_cb_swap_complete(struct apple_dcp *dcp,
 				   struct DCP_FW_NAME(dc_swap_complete_resp) *resp)
 {
 	ktime_t now = ktime_get();
 	trace_iomfb_swap_complete(dcp, resp->swap_id);
 	dcp->last_swap_id = resp->swap_id;
+	dcp->have_swap_complete = true;
 
 	dcp_drm_crtc_page_flip(dcp, now);
+	dcp_release_swapped_out_fbs(dcp);
 	if (dcp->crc_enabled) {
 		u32 crc32 = 0;
 		drm_crtc_add_crc_entry(&dcp->crtc->base, true, resp->swap_id, &crc32);
@@ -288,7 +368,7 @@ static void dcp_fill_dfb_surface(u8 *s)
 	s[0x01c] = 0x01;
 	s[0x02a] = 0x40;
 	s[0x02b] = 0xe4;
-	s[0x035] = 0x03;
+	s[0x035] = 0x04;	/* IOSurface.surface_id; macOS writes 4, we wrote 3 */
 	s[0x051] = 0x01;
 	s[0x149] = 0x01;
 }
@@ -477,17 +557,8 @@ static struct DCP_FW_NAME(dcp_map_buf_resp) dcpep_cb_map_piodma(struct apple_dcp
 		goto reject;
 	}
 
-	/*
-	 * Mirror it into the display-subsystem domain at the same address: the
-	 * display engine reads these buffers on that device's stream, which
-	 * otherwise has no mapping for them at all.
-	 */
-	/*
-	 * Do not mirror into the display-subsystem domain.  That stream's
-	 * tables are iBoot's, pinned to the DART's published "pt-region", and
-	 * macOS never adds entries to them from the host -- the firmware does
-	 * its own remapping there (the ADT marks the DART "allow-pte-remap").
-	 */
+	/* The PIODMA mapping belongs only to the DCP IOMMU domain. */
+	memdesc->piodma_mapped = true;
 
 #if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
 	/* echo the index back, as macOS does */
@@ -548,6 +619,7 @@ static void dcpep_cb_unmap_piodma(struct apple_dcp *dcp,
 	 *       full pages
 	 */
 	iommu_unmap(dcp->iommu_dom, memdesc->dva, ALIGN(memdesc->size, SZ_16K));
+	memdesc->piodma_mapped = false;
 }
 
 /*
@@ -579,6 +651,7 @@ dcpep_cb_allocate_buffer(struct apple_dcp *dcp,
 
 	memdesc = &dcp->memdesc[id];
 
+	memdesc->piodma_mapped = false;
 	memdesc->size = resp.dva_size;
 	/* HACK: align size to 16K since the iommu API only maps full pages */
 	size = ALIGN(resp.dva_size, SZ_16K);
@@ -623,6 +696,22 @@ static u8 dcpep_cb_release_mem_desc(struct apple_dcp *dcp, u32 *mem_desc_id)
 
 	memdesc = &dcp->memdesc[id];
 	size = ALIGN(memdesc->size, SZ_16K);
+
+	/*
+	 * Tear down any translation still standing before the pages go back to
+	 * the allocator.  The firmware is expected to unmap piodma first, but
+	 * if it releases a descriptor without doing so we would hand the pages
+	 * back while the DART still resolves them -- the display engine would
+	 * then read whoever owns them next.
+	 */
+	if (memdesc->piodma_mapped) {
+		dev_warn(dcp->dev,
+			 "releasing buffer %u while still mapped for piodma; unmapping first\n",
+			 id);
+		iommu_unmap(dcp->iommu_dom, memdesc->dva, size);
+		memdesc->piodma_mapped = false;
+	}
+
 	if (memdesc->buf) {
 		dma_free_coherent(dcp->dev, size, memdesc->buf, memdesc->dva);
 		memdesc->buf = NULL;
@@ -1261,7 +1350,11 @@ static void dcp_h17p_fix_swap_surfaces(struct apple_dcp *dcp)
 		 * 0xfc0000000 -- an address with no L1 entry at all.  Shift the
 		 * whole block, which subsumes the null-flag fixup.
 		 */
-		memmove(r + off, r + off + 2, n - off - 2);
+		/* Preserve the complete 16K-aligned IOVA, including its low bits. */
+		static_assert(offsetof(typeof(*req), surf_iova) == 0xe3a,
+			      "H17P source IOVA offset");
+		static_assert(sizeof(*req) == 0xe9c, "H17P request size");
+		memmove(r + off - 2, r + off, n - off);
 		memset(r + n - 2, 0, 2);
 	}
 }
@@ -1285,17 +1378,7 @@ static void dcp_swap_cleared(struct apple_dcp *dcp, void *data, void *cookie)
 		return;
 	}
 
-	while (!list_empty(&dcp->swapped_out_fbs)) {
-		struct dcp_fb_reference *entry;
-		entry = list_first_entry(&dcp->swapped_out_fbs,
-					 struct dcp_fb_reference, head);
-		if (entry->swap_id == dcp->last_swap_id)
-			break;
-		if (entry->fb)
-			drm_framebuffer_put(entry->fb);
-		list_del(&entry->head);
-		kfree(entry);
-	}
+	dcp_release_swapped_out_fbs(dcp);
 }
 
 static void dcp_swap_clear_started(struct apple_dcp *dcp, void *data,
@@ -1303,6 +1386,7 @@ static void dcp_swap_clear_started(struct apple_dcp *dcp, void *data,
 {
 	struct DCP_FW_NAME(dcp_swap_start_resp) *resp = data;
 	DCP_FW_UNION(dcp->swap).swap.swap_id = resp->swap_id;
+	dcp_arm_swapped_out_fbs(dcp, resp->swap_id);
 
 	if (cookie) {
 		struct dcp_swap_cookie *info = cookie;
@@ -1721,17 +1805,7 @@ static void dcp_swapped(struct apple_dcp *dcp, void *data, void *cookie)
 	}
 	dcp->swap_start = ktime_get();
 
-	while (!list_empty(&dcp->swapped_out_fbs)) {
-		struct dcp_fb_reference *entry;
-		entry = list_first_entry(&dcp->swapped_out_fbs,
-					 struct dcp_fb_reference, head);
-		if (entry->swap_id == dcp->last_swap_id)
-			break;
-		if (entry->fb)
-			drm_framebuffer_put(entry->fb);
-		list_del(&entry->head);
-		kfree(entry);
-	}
+	dcp_release_swapped_out_fbs(dcp);
 }
 
 static void dcp_swap_started(struct apple_dcp *dcp, void *data, void *cookie)
@@ -1739,6 +1813,7 @@ static void dcp_swap_started(struct apple_dcp *dcp, void *data, void *cookie)
 	struct DCP_FW_NAME(dcp_swap_start_resp) *resp = data;
 
 	DCP_FW_UNION(dcp->swap).swap.swap_id = resp->swap_id;
+	dcp_arm_swapped_out_fbs(dcp, resp->swap_id);
 
 	trace_iomfb_swap_submit(dcp, resp->swap_id);
 	dcp_h17p_fix_swap_surfaces(dcp);
@@ -1930,22 +2005,24 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		req->swap.swap_enabled |= BIT(l);
 
 		if (old_state->fb && new_state->fb != old_state->fb) {
-			/*
-			 * Race condition between a framebuffer unbind getting
-			 * swapped out and GEM unreferencing a framebuffer. If
-			 * we lose the race, the display gets IOVA faults and
-			 * the DCP crashes. We need to extend the lifetime of
-			 * the drm_framebuffer (and hence the GEM object) until
-			 * after we get a swap complete for the swap unbinding
-			 * it.
-			 */
+			/* Retain the old framebuffer until its replacement is stable. */
 			struct dcp_fb_reference *entry =
 				kzalloc(sizeof(*entry), GFP_KERNEL);
+			unsigned long flags;
+
 			if (entry) {
 				entry->fb = old_state->fb;
-				entry->swap_id = dcp->last_swap_id;
+				/*
+				 * Left unarmed: the id of the swap that
+				 * unbinds this framebuffer is not known until
+				 * the firmware answers swap_start.
+				 */
+				spin_lock_irqsave(&dcp->swapped_out_lock,
+						  flags);
 				list_add_tail(&entry->head,
 					      &dcp->swapped_out_fbs);
+				spin_unlock_irqrestore(&dcp->swapped_out_lock,
+						       flags);
 			}
 			drm_framebuffer_get(old_state->fb);
 		}
@@ -2145,7 +2222,32 @@ static void dcp_client_open_run(struct apple_dcp *dcp, void *out, void *cookie)
 		break;
 	}
 	case DCP_STEP_A031: {
+		/*
+		 * The nine cumulative states macOS sends, from the 25G83
+		 * capture (dcp-calls.log lines 1507-1531).  Each call repeats
+		 * the previous set and adds one client.
+		 */
+		static const u8 notify_clients[9][8] = {
+			{},
+			{ 6 },
+			{ 6, 7 },
+			{ 6, 7, 8 },
+			{ 6, 7, 8, 10 },
+			{ 6, 7, 8, 10, 11 },
+			{ 6, 7, 8, 10, 11, 12 },
+			{ 6, 7, 8, 10, 11, 12, 25 },
+			{ 6, 7, 8, 10, 11, 12, 25, 26 },
+		};
+		static const u8 notify_count[9] = { 0, 1, 2, 3, 4, 5, 6, 7, 8 };
 		struct dcp_pipe_cfg_031 cfg = {};
+		unsigned int step = dcp->a031_step;
+		unsigned int i;
+
+		if (step >= ARRAY_SIZE(notify_clients))
+			step = ARRAY_SIZE(notify_clients) - 1;
+		for (i = 0; i < notify_count[step]; i++)
+			cfg.clients[i] = cpu_to_le32(notify_clients[step][i]);
+		dcp->a031_step++;
 
 		dcp_pipe_cfg_031(dcp, false, &cfg, next, ncookie);
 		break;
