@@ -247,7 +247,7 @@ int __mt7921_start(struct mt792x_phy *phy)
 		 * second start left CID d7 live at TX17 DIDX in Cycle 479.
 		 */
 		if (!phy->dev->mt7932_6g_scan_policy_enabled) {
-			err = mt7932_mcu_set_6g_scan(phy->dev, true);
+			err = mt7932_mcu_set_6g_scan(phy->dev, !mt7932_j700_us());
 			if (err)
 				return err;
 			phy->dev->mt7932_6g_scan_policy_enabled = true;

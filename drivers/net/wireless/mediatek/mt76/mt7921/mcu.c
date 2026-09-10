@@ -7,6 +7,7 @@
 #include <linux/iommu.h>
 #include <linux/pci.h>
 #include <linux/unaligned.h>
+#include <crypto/sha2.h>
 #include "mt7921.h"
 #include "regd.h"
 #include "mcu.h"
@@ -1092,6 +1093,15 @@ EXPORT_SYMBOL_GPL(mt7932_mcu_set_6g_scan);
 #define MT7932_POWER_TRANSCRIPT_NAME \
 	"mediatek/j700-mt7932-au-vlp-power-transcript.bin"
 MODULE_FIRMWARE(MT7932_POWER_TRANSCRIPT_NAME);
+#define MT7932_US_POWER_TRANSCRIPT_NAME \
+	"mediatek/j700-mt7932-us-20mhz-power-transcript.bin"
+MODULE_FIRMWARE(MT7932_US_POWER_TRANSCRIPT_NAME);
+
+static const char *mt7932_power_transcript_name(void)
+{
+	return mt7932_j700_us() ? MT7932_US_POWER_TRANSCRIPT_NAME :
+		MT7932_POWER_TRANSCRIPT_NAME;
+}
 #define MT7932_POWER_TRANSCRIPT_VERSION	1
 #define MT7932_POWER_TRANSCRIPT_RECORDS	48
 #define MT7932_POWER_TRANSCRIPT_PACKETS	42
@@ -2060,6 +2070,8 @@ release_firmware:
 
 int mt7932_mcu_load_live_start_phase(struct mt792x_dev *dev, u8 phase)
 {
+	if (mt7932_j700_us() && phase != MT7932_LIVE_PHASE_PRE_CAL)
+		return -EOPNOTSUPP;
 	return __mt7932_mcu_load_live_start_phase(dev, phase, false);
 }
 EXPORT_SYMBOL_GPL(mt7932_mcu_load_live_start_phase);
@@ -2164,6 +2176,27 @@ static int mt7932_validate_power_transcript(const struct firmware *fw)
 
 	return offset == fw->size && packets == MT7932_POWER_TRANSCRIPT_PACKETS ?
 	       0 : -EINVAL;
+}
+
+static int mt7932_validate_selected_power(const struct firmware *fw)
+{
+	/* Private US bring-up profile generated from the pinned 25G76 tables.
+	 * Bind the complete packet stream to its reviewed configuration before
+	 * any command is submitted. A country label alone is not sufficient.
+	 */
+	static const u8 us_sha256[SHA256_DIGEST_SIZE] = {
+		0xd5, 0x5d, 0xa4, 0xdf, 0x27, 0xd6, 0x68, 0x0d,
+		0x80, 0x53, 0x75, 0xc5, 0x03, 0x9f, 0x89, 0xb9,
+		0xdd, 0x99, 0x7c, 0xb2, 0xda, 0xbf, 0x31, 0xb4,
+		0xe3, 0x2d, 0xca, 0xcf, 0x61, 0x0d, 0x04, 0x6a,
+	};
+	u8 digest[SHA256_DIGEST_SIZE];
+	int ret = mt7932_validate_power_transcript(fw);
+
+	if (ret || !mt7932_j700_us())
+		return ret;
+	sha256(fw->data, fw->size, digest);
+	return memcmp(digest, us_sha256, sizeof(digest)) ? -EKEYREJECTED : 0;
 }
 
 #define MT7932_CUSTOMER_CFG_BATCHES	16
@@ -2317,15 +2350,15 @@ int mt7932_mcu_load_power_transcript(struct mt792x_dev *dev)
 		return -EOPNOTSUPP;
 	BUILD_BUG_ON(ARRAY_SIZE(group_end) != ARRAY_SIZE(group_name));
 
-	ret = request_firmware(&fw, MT7932_POWER_TRANSCRIPT_NAME,
+	ret = request_firmware(&fw, mt7932_power_transcript_name(),
 			       dev->mt76.dev);
 	if (ret)
 		return ret;
-	ret = mt7932_validate_power_transcript(fw);
+	ret = mt7932_validate_selected_power(fw);
 	if (ret) {
 		dev_err(dev->mt76.dev,
 			"J700_MT7932_POWER_TRANSCRIPT_REJECT: source=%s bytes=%zu ret=%d\n",
-			MT7932_POWER_TRANSCRIPT_NAME, fw->size, ret);
+			mt7932_power_transcript_name(), fw->size, ret);
 		goto release_firmware;
 	}
 
@@ -2385,8 +2418,10 @@ int mt7932_mcu_load_power_transcript(struct mt792x_dev *dev)
 		goto release_firmware;
 	}
 	dev_info(dev->mt76.dev,
-		 "J700_MT7932_POWER_TRANSCRIPT_PASS: country=AU mode6g=VLP packets=42 cid5d=28 cid95=14 source=%s bytes=%zu\n",
-		 MT7932_POWER_TRANSCRIPT_NAME, fw->size);
+		 "J700_MT7932_POWER_TRANSCRIPT_PASS: country=%s mode6g=%s packets=42 cid5d=28 cid95=14 source=%s bytes=%zu\n",
+		 mt7932_j700_us() ? "US" : "AU",
+		 mt7932_j700_us() ? "disabled" : "VLP",
+		 mt7932_power_transcript_name(), fw->size);
 
 release_firmware:
 	release_firmware(fw);
@@ -2412,11 +2447,11 @@ int mt7932_mcu_load_assoc_power(struct mt792x_dev *dev, u32 *command_out)
 	BUILD_BUG_ON(ARRAY_SIZE(expected_name) !=
 		     ARRAY_SIZE(expected_selector));
 
-	ret = request_firmware(&fw, MT7932_POWER_TRANSCRIPT_NAME,
+	ret = request_firmware(&fw, mt7932_power_transcript_name(),
 			       dev->mt76.dev);
 	if (ret)
 		return ret;
-	ret = mt7932_validate_power_transcript(fw);
+	ret = mt7932_validate_selected_power(fw);
 	if (ret)
 		goto release;
 
@@ -2451,7 +2486,8 @@ int mt7932_mcu_load_assoc_power(struct mt792x_dev *dev, u32 *command_out)
 		if (slot == ARRAY_SIZE(expected_name))
 			continue;
 		if (seen & BIT(slot) || data_len != 1020 || data[0] != 3 ||
-		    data[1] != 0x2a || get_unaligned_le16(data + 2) != data_len ||
+		    data[1] != (mt7932_j700_us() ? 0x0a : 0x2a) ||
+		    get_unaligned_le16(data + 2) != data_len ||
 		    data[4] != 8 || data[5] != 3 ||
 		    data[44] != expected_selector[slot]) {
 			ret = -EINVAL;
@@ -2470,7 +2506,9 @@ int mt7932_mcu_load_assoc_power(struct mt792x_dev *dev, u32 *command_out)
 	if (command_out)
 		*command_out = command;
 	dev_info(dev->mt76.dev,
-		 "J700_MT7932_FULLMAC_ASSOC_POWER_TYPED: country=AU mode6g=VLP pages=2 selectors=02,0f entries=8,8 source=audited-board-power-container\n");
+		 "J700_MT7932_FULLMAC_ASSOC_POWER_TYPED: country=%s mode6g=%s pages=2 selectors=02,0f entries=8,8 source=audited-board-power-container\n",
+		 mt7932_j700_us() ? "US" : "AU",
+		 mt7932_j700_us() ? "disabled" : "VLP");
 	ret = 0;
 
 release:

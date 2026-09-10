@@ -3,6 +3,7 @@ config MT7921_COMMON
 	tristate
 	select MT792x_LIB
 	select WANT_DEV_COREDUMP
+	select CRYPTO_LIB_SHA256
 
 config MT7921E
 	tristate "MediaTek MT7921E (PCIe) support"
