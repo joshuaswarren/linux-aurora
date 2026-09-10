@@ -52,6 +52,22 @@ class WalkerTests(unittest.TestCase):
             self.capture.read(self.pointer, 8)
         self.assertNotIn(self.page, self.accesses)
 
+    def test_context_table_is_selected_without_global_fallback(self):
+        region = self.low
+        self.memory[region] = bytearray(0x4000)
+        struct.pack_into('<Q', self.memory[region], 3 * 16 + 8, self.root | 1)
+        self.assertEqual(self.capture.read_context(self.pointer, 8, 3, region), b'M5-root!')
+        self.assertEqual(self.accesses[0], region + 3 * 16 + 8)
+        with self.assertRaisesRegex(RuntimeError, 'unmapped'):
+            self.capture.read_context(self.pointer, 8, 2, region)
+        self.accesses.clear()
+        with self.assertRaisesRegex(ValueError, 'Invalid M5 context'):
+            self.capture.read_context(self.pointer, 8, 256, region)
+        self.assertEqual(self.accesses, [])
+        with self.assertRaisesRegex(ValueError, 'non-DRAM'):
+            self.capture.read_context(self.pointer, 8, 3, 0x580000000)
+        self.assertEqual(self.accesses, [])
+
 
 if __name__ == '__main__':
     unittest.main()

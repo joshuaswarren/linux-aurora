@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 """Compare M5 production entry/tag-14 codecs with private native captures.
 
-Variable command operands come from captured entries. Independently captured
+Variable command operands come from captured entries or host descriptors. Independently captured
 tag-14 and host queue state supply QID, priority, current and next stamp.
 This checks byte layout and state transitions, not Linux GPU execution.
 """
@@ -117,11 +117,25 @@ fn main() {
                        cache & 63, ((cache >> 54) & 63) + 1])
         for dep in deps[:-1]:
             values.extend(dep)
+        operand_source = 'legacy-entry-values'
+        if any(x['label'] == 'host-cl-descriptor-view' for x in manifest['objects']):
+            descriptor = load_object(capture, manifest, 'host-cl-descriptor-view')
+            # HAL300 encodeCLKickEntry supplies these independent descriptor
+            # fields to encodeKickEntry; do not derive them from its output.
+            values[6:9] = [descriptor[x] & 1 for x in (0x4c, 0x5b8, 0x5b9)]
+            values[18] = struct.unpack_from('<I', descriptor, 0x5c0)[0] & 3
+            for i in range(4):
+                values[19+i*2] = word(descriptor, 0x5c8+i*16)
+                values[20+i*2] = struct.unpack_from('<H', descriptor, 0x5d0+i*16)[0] & 127
+            address, index, cache_count = struct.unpack_from('<QII', descriptor, 0x740)
+            values[28:32] = [int(cache_count != 0), address, index & 63, cache_count]
+            operand_source = 'native-descriptor-flags-rce-mcache'
         result = subprocess.run([str(binary), *[format(x, 'x') for x in values]],
                                 capture_output=True, check=True).stdout
         expected = entry + tag + queue[0x48:0x50] + queue[0x44:0x48]
         if result != expected:
             offsets = [hex(i) for i, (a, b) in enumerate(zip(result, expected)) if a != b]
             raise ValueError('M5 SKSM production mismatch at ' + str(offsets))
-        print('M5_NATIVE_SKSM_MATCH', capture.name, 'entry=512 tag14=21 producer=12 dependency_types=matched')
+        print('M5_NATIVE_SKSM_MATCH', capture.name,
+              'entry=512 tag14=21 producer=12 dependency_types=matched operands=' + operand_source)
 print('LINUX_GPU_EXECUTION_QUALIFIED=false')

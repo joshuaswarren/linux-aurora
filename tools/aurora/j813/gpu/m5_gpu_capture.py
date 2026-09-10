@@ -45,6 +45,15 @@ class M5GPUCapture:
             raise ValueError('Invalid GPU capture extent')
         return self.walker.read(pointer, size)
 
+    def read_context(self, pointer, size, context, gpu_region):
+        """Read a command's recorded context, retaining every DRAM guard."""
+        if not 0 <= context < 256 or not 0 < size <= self.MAX_CAPTURE:
+            raise ValueError('Invalid M5 context capture request')
+        # The root pair is in the ADT's existing iBoot-owned gpu-region table.
+        # Only the firmware-global view uses the separate SPTM root receipt.
+        reader = G17PUATReader(self._read_dram, gpu_region)
+        return reader.read(pointer, size, context=context)
+
     def capture(self, role, init_message, output, phase):
         if role not in ('gfx-asc', 'gfx1-asc') or (init_message >> 48) & 0xff != 0x81:
             raise ValueError('Expected an M5 initialization doorbell')
