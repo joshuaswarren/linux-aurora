@@ -143,6 +143,10 @@ impl M5Session {
         if probe_kind >= 3 {
             self.install_queue_probe()?;
         }
+        if probe_kind >= 5 {
+            let roots = self.memory.as_mut().ok_or(EIO)?.validate_program_context()?;
+            dev_info!(self.dev.as_ref(), "M5_CONTEXT prepared id3 roots={:x?}; six pages, 1024 untouched outputs, no kicks\n", roots);
+        }
         Ok(())
     }
 

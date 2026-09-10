@@ -89,6 +89,10 @@ use pin_init;
 
 const DEBUG_CLASS: DebugFlags = DebugFlags::Mmu;
 
+#[path = "m5_context.rs"]
+mod m5_context;
+pub(crate) use m5_context::M5ExecutionContext;
+
 /// PPL magic number for the handoff region
 const PPL_MAGIC: u64 = 0x4b1d000000000002;
 

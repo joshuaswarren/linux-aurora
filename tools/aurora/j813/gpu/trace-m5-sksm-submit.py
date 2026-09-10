@@ -105,6 +105,12 @@ def _m5_sksm_submit(ctx):
         if (probe_qid in _m5_sksm_exclude or
                 (_m5_sksm_priority is not None and probe_priority != _m5_sksm_priority)):
             if _m5_sksm_hits < 1024:
+                # On this M5 carrier, returning at the filtered breakpoint
+                # repeatedly traps the same PC/stamp instead of progressing.
+                # Preserve the verified instruction's exact effect: LDR X1,
+                # [X20,#0x428]. This read is still restricted to guest DRAM.
+                ctx.regs[1], = struct.unpack('<Q', _m5_sksm_read_cpu(int(ctx.regs[20]) + 0x428, 8))
+                ctx.elr += 4
                 return True
             raise ValueError('M5 SKSM selected queue not seen within 1024 submissions')
     except Exception as error:
@@ -286,11 +292,96 @@ def _m5_sksm_submit(ctx):
                         roots = save('compute-context-roots', region + gpu_context * 16,
                                      16, physical=True)
                         manifest['compute_context_roots'] = [hex(x) for x in struct.unpack('<QQ', roots)]
+                        if os.environ.get('M5_SKSM_CAPTURE_OWNERS') == '1':
+                            # Firmware compute setup follows +fb2 even when
+                            # +f5c is zero. Capture the actual retained owners,
+                            # not a guessed "no event" null-pointer variant.
+                            if len(payload) < 0x1000:
+                                raise ValueError('M5 owner capture needs the full descriptor prefix')
+                            save('compute-root-table-prefix', region, 64, physical=True)
+                            save('compute-global-root-page', int(_m5_sksm_roots[0], 16),
+                                 0x4000, physical=True)
+                            owners = []
+                            aliases = []
+
+                            def alias_view(name, address, length, selected_context=None):
+                                info = dict(label=name, address=hex(address), context=selected_context)
+                                try:
+                                    first = _m5_sksm_gpu.mapping(address, length, selected_context, region)
+                                    data = save('compute-alias-' + name, address, length,
+                                                gpu=True, context=selected_context)
+                                    second = _m5_sksm_gpu.mapping(address, length, selected_context, region)
+                                    info.update(mapping=first, mapping_stable=first == second)
+                                    aliases.append(info)
+                                    return data
+                                except (RuntimeError, ValueError) as error:
+                                    info['error'] = str(error)
+                                    aliases.append(info)
+                                    return None
+
+                            descriptor_low, = struct.unpack_from('<Q', payload, 0x740)
+                            for name, address, length in [
+                                    ('descriptor', descriptor_low - 0x40, 0x1000),
+                                    ('operand', registers[0xa5c1] - 5, 0x4000),
+                                    ('queue', gpu_ring, 0x4000)]:
+                                for selected_context in (0, gpu_context):
+                                    alias_view(name + '-ctx' + str(selected_context),
+                                               address, length, selected_context)
+                            alias_view('descriptor-global', pointer, 0x1000)
+                            alias_view('queue-global', firmware_ring, 0x4000)
+                            for name, offset, length in [
+                                    ('event-state', 0xfb2, 0x1000),
+                                    ('zero-page', 0xfcb, 0x4000),
+                                    ('dispatch-a', 0xf40, 0x40),
+                                    ('dispatch-b', 0xf48, 0x40),
+                                    ('status-a', 0xf7c, 0x40),
+                                    ('status-b', 0xf84, 0x40)]:
+                                pointer, = struct.unpack_from('<Q', payload, offset)
+                                info = dict(label=name, pointer=hex(pointer))
+                                if pointer:
+                                    address = pointer if name in ('event-state', 'zero-page') else pointer & ~0x3f
+                                    try:
+                                        data = save('compute-owner-' + name, address, length, gpu=True)
+                                        info.update(address=hex(address), size=length)
+                                        if name == 'event-state':
+                                            info['prefix_qwords'] = [hex(x) for x in struct.unpack_from('<16Q', data)]
+                                            event_low, = struct.unpack_from('<Q', data, 0x30)
+                                            event_high, = struct.unpack_from('<Q', data, 0x4c)
+                                            if event_low:
+                                                for selected_context in (0, gpu_context):
+                                                    alias_view('event-link-ctx' + str(selected_context),
+                                                               event_low, 0x4000, selected_context)
+                                            if event_high:
+                                                alias_view('event-link-global', event_high, 0x4000)
+                                                alias_view('event-ring-global', event_high + 0x4000, 0x4000)
+                                                alias_view('event-zero-global', event_high + 0x8000, 0x4000)
+                                            if event_low >= 0x4000:
+                                                alias_view('event-header-ctx' + str(gpu_context),
+                                                           event_low - 0x4000, 0x4000, gpu_context)
+                                                alias_view('event-zero-ctx' + str(gpu_context),
+                                                           event_low + 0x4000, 0x4000, gpu_context)
+                                    except (RuntimeError, ValueError) as error:
+                                        info['error'] = str(error)
+                                owners.append(info)
+                            for root_index, tagged in enumerate(struct.unpack('<QQ', roots)):
+                                try:
+                                    save('compute-root-page-' + str(root_index),
+                                         tagged & ((1 << 42) - 1) & ~0x3fff,
+                                         0x4000, physical=True)
+                                except (RuntimeError, ValueError) as error:
+                                    owners.append(dict(label='root-' + str(root_index), error=str(error)))
+                            manifest['compute_owners'] = owners
+                            manifest['compute_aliases'] = aliases
                         context_state, = struct.unpack_from('<Q', payload, 0x10)
                         if context_state:
                             try:
-                                save('compute-context-state', context_state,
+                                state = save('compute-context-state', context_state,
                                      min(0x4000, 0x4000 - (context_state & 0x3fff)), gpu=True)
+                                if os.environ.get('M5_SKSM_CAPTURE_OWNERS') == '1':
+                                    count_pointer, = struct.unpack_from('<Q', state)
+                                    if count_pointer:
+                                        save('compute-owner-submitted-count', count_pointer & ~0x3f,
+                                             0x40, gpu=True)
                             except (RuntimeError, ValueError) as error:
                                 manifest['compute_context_state_error'] = str(error)
                         manifest['context_views'] = []
@@ -345,6 +436,10 @@ def _m5_sksm_submit(ctx):
                 nonlocal completion_hits
                 completion_hits += 1
                 if int(completion_ctx.regs[0]) != descriptor_address and completion_hits < 64:
+                    # Pinned first instruction is MOV X19,X0. Preserve its
+                    # effect while advancing past this filtered callback.
+                    completion_ctx.regs[19] = int(completion_ctx.regs[0])
+                    completion_ctx.elr += 4
                     return True
                 hv.remove_hw_bp(completion_pc)
                 try:

@@ -162,12 +162,16 @@ class CaptureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             hv = FakeHV(directory)
             hv.memory[0x1008] = 0
+            struct.pack_into('<Q', hv.memory, 0x3428, 0x123456789abcdef0)
             with patch.dict(os.environ, M5_GPU_TRACE_DIR=directory, M5_SKSM_CAPTURE_PRIORITY='2'), contextlib.redirect_stdout(io.StringIO()):
                 self.run_script(hv)
                 self.assertTrue(hv.hook(hv.ctx))
+                self.assertEqual(hv.ctx.elr, PC + 4)
+                self.assertEqual(hv.ctx.regs[1], 0x123456789abcdef0)
                 self.assertEqual(hv.breakpoints, [PC])
                 self.assertEqual(list(Path(directory).glob('sksm-submit-*')), [])
                 hv.memory[0x1008] = 2
+                hv.ctx.elr = PC
                 self.assertTrue(hv.hook(hv.ctx))
             self.assertEqual(hv.breakpoints, [])
             path, = Path(directory).glob('sksm-submit-*/manifest.json')
@@ -214,6 +218,9 @@ class CaptureTests(unittest.TestCase):
                 hv.ctx.regs[0] = DESCRIPTOR + 16
                 self.assertTrue(hv.hook(hv.ctx))
                 self.assertEqual(hv.breakpoints, [COMPLETE_PC])
+                self.assertEqual(hv.ctx.elr, COMPLETE_PC + 4)
+                self.assertEqual(hv.ctx.regs[19], DESCRIPTOR + 16)
+                hv.ctx.elr = COMPLETE_PC
                 hv.ctx.regs[0] = DESCRIPTOR
                 hv.context_views[view] = b'POST'
                 struct.pack_into('<I', hv.gpu_views[pointers_address], 0x20, 1)
