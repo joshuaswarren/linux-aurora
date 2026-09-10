@@ -1655,6 +1655,29 @@ static int dcp_asc_restart(struct apple_dcp *dcp)
 
 
 
+static int dcp_restart_inherited_session(struct apple_dcp *dcp)
+{
+	int ret;
+
+	if (dcp->fw_compat != DCP_FIRMWARE_H17P)
+		return apple_rtkit_quiesce(dcp->rtk);
+
+	/*
+	 * J700's inherited DCP rejects AP QUIESCED. The dcp-neo m1n1
+	 * bring-up established IOP OFF and its exact state-zero ACK instead
+	 * (4a927cdcae729f1b12b2173117e7f96b3271dca9). OFF is not a normal
+	 * sleep state: stop and restart the ASC before negotiating a new
+	 * RTKit session. Never reset a session whose OFF request timed out.
+	 */
+	ret = apple_rtkit_poweroff_adopted(dcp->rtk);
+	if (ret)
+		return dev_err_probe(dcp->dev, ret,
+				     "Inherited DCP IOP OFF not acknowledged\n");
+
+	dev_info(dcp->dev, "inherited DCP acknowledged IOP OFF\n");
+	return dcp_asc_restart(dcp);
+}
+
 static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 {
 	struct device_node *panel_np;
@@ -1854,6 +1877,7 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 			goto err_destroy_piodma;
 		}
 
+		ret = dcp_restart_inherited_session(dcp);
 		dcp->adopting_session = false;
 		dcp->adopted_session = true;
 		ret = dcp_rtk_import_adopted_crashlog(dcp);
@@ -1922,8 +1946,10 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 					     "Failed to adopt running RTKit\n");
 		}
 
-		ret = apple_rtkit_quiesce(dcp->rtk);
+		ret = dcp_restart_inherited_session(dcp);
 		dcp->adopting_session = false;
+		if (ret && dcp->fw_compat == DCP_FIRMWARE_H17P)
+			return ret;
 		if (!ret)
 			ret = apple_rtkit_wake(dcp->rtk);
 

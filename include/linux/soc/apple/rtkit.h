@@ -185,6 +185,14 @@ int apple_rtkit_adopt_running(struct apple_rtkit *rtk);
 int apple_rtkit_quiesce(struct apple_rtkit *rtk);
 
 /*
+ * Power off an adopted session through IOP OFF without an AP transition.
+ * The caller must have established that this sequence is valid for its
+ * firmware, and must supply any device-specific reset needed before boot.
+ * This is not a replacement for the normal quiesce or shutdown protocol.
+ */
+int apple_rtkit_poweroff_adopted(struct apple_rtkit *rtk);
+
+/*
  * Wake the co-processor up from hibernation mode.
  */
 int apple_rtkit_wake(struct apple_rtkit *rtk);
