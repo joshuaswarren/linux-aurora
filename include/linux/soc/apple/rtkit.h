@@ -185,7 +185,8 @@ int apple_rtkit_adopt_running(struct apple_rtkit *rtk);
 int apple_rtkit_quiesce(struct apple_rtkit *rtk);
 
 /*
- * Power off an adopted session through IOP OFF without an AP transition.
+ * Power off an adopted session through IOP OFF without an AP transition,
+ * waiting for both the power acknowledgement and the H17P idle notification.
  * The caller must have established that this sequence is valid for its
  * firmware, and must supply any device-specific reset needed before boot.
  * This is not a replacement for the normal quiesce or shutdown protocol.

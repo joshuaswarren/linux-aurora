@@ -40,6 +40,7 @@ enum {
 	APPLE_RTKIT_MGMT_EPMAP_REPLY = 8,
 	APPLE_RTKIT_MGMT_SET_AP_PWR_STATE = 0xb,
 	APPLE_RTKIT_MGMT_SET_AP_PWR_STATE_ACK = 0xb,
+	APPLE_RTKIT_MGMT_IOP_IDLE = 0xc,
 };
 
 #define APPLE_RTKIT_MGMT_HELLO_MINVER GENMASK_ULL(15, 0)
@@ -312,6 +313,13 @@ static void apple_rtkit_management_rx_ap_pwr_ack(struct apple_rtkit *rtk,
 static void apple_rtkit_management_rx(struct apple_rtkit *rtk, u64 msg)
 {
 	u8 type = FIELD_GET(APPLE_RTKIT_MGMT_TYPE, msg);
+
+	/* H17P sends this separate idle fence after acknowledging IOP OFF. */
+	if (type == APPLE_RTKIT_MGMT_IOP_IDLE &&
+	    READ_ONCE(rtk->awaiting_iop_idle) && !(msg & ~APPLE_RTKIT_MGMT_TYPE)) {
+		complete_all(&rtk->iop_idle_completion);
+		return;
+	}
 
 	if (rtk->epmap_only && type != APPLE_RTKIT_MGMT_HELLO &&
 	    type != APPLE_RTKIT_MGMT_EPMAP) {
@@ -851,6 +859,7 @@ static struct apple_rtkit *__apple_rtkit_init(
 	init_completion(&rtk->epmap_completion);
 	init_completion(&rtk->iop_pwr_ack_completion);
 	init_completion(&rtk->ap_pwr_ack_completion);
+	init_completion(&rtk->iop_idle_completion);
 
 	bitmap_zero(rtk->endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
 	bitmap_zero(rtk->discovery_endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
@@ -964,6 +973,7 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk)
 	rtk->syslog_n_entries = 0;
 	rtk->syslog_msg_size = 0;
 	rtk->adopted = false;
+	WRITE_ONCE(rtk->awaiting_iop_idle, false);
 
 	bitmap_zero(rtk->endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
 	bitmap_zero(rtk->discovery_endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
@@ -1204,11 +1214,21 @@ int apple_rtkit_poweroff_adopted(struct apple_rtkit *rtk)
 	if (!rtk->adopted || rtk->epmap_only)
 		return -EINVAL;
 
-	/* Do not retire inherited buffers until the IOP acknowledges OFF. */
+	/*
+	 * Native H17P RTBuddy waits for the separate type-0xc idle notification
+	 * after its power transition. An OFF ACK alone does not establish that
+	 * the firmware has finished retiring its work and can be stopped.
+	 */
+	reinit_completion(&rtk->iop_idle_completion);
+	WRITE_ONCE(rtk->awaiting_iop_idle, true);
 	ret = apple_rtkit_set_iop_power_state(rtk, APPLE_RTKIT_PWR_STATE_OFF);
+	if (!ret)
+		ret = apple_rtkit_wait_for_completion(&rtk->iop_idle_completion);
+	WRITE_ONCE(rtk->awaiting_iop_idle, false);
 	if (ret)
 		return ret;
 
+	dev_info(rtk->dev, "RTKit: inherited IOP OFF and idle acknowledged\n");
 	return apple_rtkit_reinit(rtk);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_poweroff_adopted);

@@ -32,6 +32,7 @@ struct apple_rtkit {
 	struct completion epmap_completion;
 	struct completion iop_pwr_ack_completion;
 	struct completion ap_pwr_ack_completion;
+	struct completion iop_idle_completion;
 
 	int boot_result;
 	int version;
@@ -44,6 +45,7 @@ struct apple_rtkit {
 	unsigned int ap_power_state;
 	bool crashed;
 	bool adopted;
+	bool awaiting_iop_idle;
 	bool epmap_only;
 	bool firmware_owned_crashlog;
 	bool crashlog_endpoint_started;
