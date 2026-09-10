@@ -11,7 +11,10 @@ def capture_gpu_topology(u, output):
     selected = ('compatible', 'interrupts', 'interrupts-valid', 'clock-gates',
                 'power-gates', 'clock-id', 'gpu-count', 'gpu-core-count',
                 'gpu-core-mask', 'gpu-gen', 'gfx-handoff', 'gfx-shared-region',
-                'gpu-region', 'ps-regs')
+                'gpu-region', 'ps-regs', 'ps-groups')
+    selected += tuple(prefix + suffix for prefix in (
+        'gpu-region', 'gfx-shared-region', 'gfx-shared-l2-region',
+        'gfx-handoff', 'gfx-data', 'gfx1-data') for suffix in ('-base', '-size'))
 
     def plain(value):
         if isinstance(value, (str, int, float, bool)) or value is None:
@@ -45,7 +48,15 @@ def capture_gpu_topology(u, output):
                                if key in node._properties}
         if path.endswith('/pmgr') and 'devices' in node._properties:
             entry['gpu_devices'] = [plain(d) for d in node._properties['devices']
-                                    if str(d.get('name', '')).startswith(('GFX', 'SGX'))]
+                                    if str(d.get('name', '')).startswith(('GFX', 'SGX', 'GPX'))]
+            u.adt.pmgr_init()
+            entry['gpu_power_registers'] = [
+                {'name': d.name, 'id': u.adt.pmgr_dev_get_id(d),
+                 'parents': list(u.adt.pmgr_dev_get_parents(d)),
+                 'address': hex(u.adt.pmgr_dev_get_addr(d)),
+                 'block': [hex(x) for x in u.adt.pmgr_dev_get_block(d)]}
+                for d in node.devices if str(d.name).startswith(('GFX', 'SGX', 'GPX'))
+                and not d.flags.no_ps]
         result['nodes'][path] = entry
     name = 'gpu-topology-live-' + time.strftime('%Y%m%dT%H%M%SZ', time.gmtime()) + '.json'
     path = Path(output) / name
