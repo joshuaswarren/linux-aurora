@@ -1572,6 +1572,26 @@ pub(crate) struct M5RegisterWindow {
     pub(crate) flag: u32,
 }
 
+impl M5RegisterWindow {
+    /// Actual M5 PTE walks cover size_10 rounded to 16 KiB, including the
+    /// four pages of slot 39. size_14 is independently serialized firmware
+    /// metadata and must not truncate that mapping to two pages.
+    pub(crate) fn mapped_pages(&self) -> Result<(u64, u64, u64), InitdataError> {
+        let mask = UAT_PAGE_SIZE as u64 - 1;
+        if self.size_10 == 0 || self.phys & mask != self.device_va & mask {
+            return Err(InitdataError::RegisterWindow);
+        }
+        let physical = self.phys & !mask;
+        let virtual_address = self.device_va & !mask;
+        let end = self.device_va.checked_add(self.size_10 as u64)
+            .and_then(|value| value.checked_add(mask))
+            .ok_or(InitdataError::AddressOutOfRange)? & !mask;
+        let span = end.checked_sub(virtual_address).ok_or(InitdataError::AddressOutOfRange)?;
+        physical.checked_add(span).ok_or(InitdataError::AddressOutOfRange)?;
+        Ok((physical, virtual_address, span))
+    }
+}
+
 /// Source-constructed register descriptors from both identical pre-handoff
 /// J813/25G76 captures. These are firmware virtual mappings, not a request to
 /// access or power the devices. No runtime currently consumes this profile.
@@ -1705,6 +1725,37 @@ pub(crate) fn encode_m5_25g76_primary_status_b(
     Ok(())
 }
 
+
+/// Shared private arena observed before primary initialization on J813.
+/// The status and secondary-grid pointers name overlapping views of this
+/// one backing. This extent is a measured mapped arena, not a claim about
+/// the sizes of the native host's individual suballocations.
+pub(crate) const M5_25G76_PRIVATE_CLUSTER_SIZE: usize = 0x178000;
+
+pub(crate) fn encode_m5_25g76_private_cluster(
+    fwctl_state: u64,
+    out: &mut [u8],
+) -> Result<(), InitdataError> {
+    if out.len() != M5_25G76_PRIVATE_CLUSTER_SIZE {
+        return Err(InitdataError::BufferSize);
+    }
+    required_address(fwctl_state)?;
+    let fwctl_ring = fwctl_state.checked_add(0x40).ok_or(InitdataError::AddressOutOfRange)?;
+    required_address(fwctl_ring)?;
+    out.fill(0);
+    encode_m5_25g76_primary_status_b(fwctl_state, fwctl_ring, &mut out[0x340..0xee40])?;
+    for offset in [0xee40, 0xc3100] {
+        encode_status_block(&mut out[offset..offset + STATUS_BLOCK_SIZE])?;
+    }
+    encode_secondary_root_extra_1_for_profile(RootProfile::J813G17G25G76,
+        &mut out[0x177400..0x177480])?;
+    // The main-config encoders carry one measured opening record (0x16 /
+    // 0x2a). Publish exactly one producer entry for each control channel.
+    // All work-channel and report counters remain zero.
+    put_u32(out, 0x320, 1);
+    put_u32(out, 0x1773e0, 1);
+    Ok(())
+}
 
 /// Caller-owned bindings in the power/performance policy allocation.
 /// The host stores mach_absolute_time() at policy+0x651c. Supply the live
