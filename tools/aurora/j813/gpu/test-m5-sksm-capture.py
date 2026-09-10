@@ -91,7 +91,8 @@ class FakeHV:
 
 class CaptureTests(unittest.TestCase):
     def run_script(self, hv):
-        factory = lambda *_: SimpleNamespace(read=hv.gpu_read, read_context=hv.read_context)
+        factory = lambda *_: SimpleNamespace(read=hv.gpu_read, read_context=hv.read_context,
+                                            _read_dram=hv.read)
         with patch.dict(sys.modules, m5_gpu_capture=SimpleNamespace(M5GPUCapture=factory)):
             return runpy.run_path(str(SCRIPT), init_globals={'hv': hv})
 
@@ -175,8 +176,10 @@ class CaptureTests(unittest.TestCase):
     def test_completion_tracks_the_original_descriptor_and_removes_hook(self):
         with tempfile.TemporaryDirectory() as directory:
             hv = FakeHV(directory, stride=0x200)
-            payload_address = 0xfffffc2040000000
-            payload = bytearray(0x4000)
+            # The native allocation may leave only 0x140 bytes in its first
+            # page. The observer must still read the 4096-byte descriptor prefix.
+            payload_address = 0xfffffc2040003ec0
+            payload = bytearray(0x1000)
             struct.pack_into('<I', payload, 0, 3)
             struct.pack_into('<4H', payload, 0x18, 37, 39, 39, 40)
             for i, (number, value) in enumerate([(0x10201, 0x300), (0x1a420, 0x100000b0000),

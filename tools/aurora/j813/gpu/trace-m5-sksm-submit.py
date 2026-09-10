@@ -118,8 +118,15 @@ def _m5_sksm_submit(ctx):
                     requested_priority=_m5_sksm_priority, observed_submissions=_m5_sksm_hits,
                     excluded_queue_ids=sorted(_m5_sksm_exclude), observations=_m5_sksm_observations)
 
-    def save(label, address, size, gpu=False, context=None):
-        if context is not None:
+    def save(label, address, size, gpu=False, context=None, physical=False):
+        if physical:
+            def read(pointer, length):
+                global _m5_sksm_read_bytes
+                if length <= 0 or _m5_sksm_read_bytes + length > 2 * 1024 * 1024:
+                    raise ValueError('M5 SKSM capture exceeds its DRAM read budget')
+                _m5_sksm_read_bytes += length
+                return _m5_sksm_gpu._read_dram(pointer, length)
+        elif context is not None:
             def read(pointer, length):
                 global _m5_sksm_read_bytes
                 if length <= 0 or _m5_sksm_read_bytes + length > 2 * 1024 * 1024:
@@ -133,7 +140,8 @@ def _m5_sksm_submit(ctx):
         second = read(address, size)
         name = label + '.bin'
         (directory / name).write_bytes(first)
-        item = dict(label=label, address=hex(address), address_space='GPU' if gpu else 'CPU',
+        item = dict(label=label, address=hex(address),
+                    address_space='physical-DRAM' if physical else ('GPU' if gpu else 'CPU'),
                     size=size, file=name,
                     sha256=hashlib.sha256(first).hexdigest(), stable=first == second)
         if context is not None:
@@ -172,6 +180,16 @@ def _m5_sksm_submit(ctx):
                         gpu_ring=hex(gpu_ring), cpu_ring=hex(cpu_ring),
                         firmware_ring=hex(firmware_ring))
         completion_view = None
+        outer_views = []
+        if os.environ.get('M5_SKSM_CAPTURE_OUTER') == '1':
+            main = (_m5_sksm_output / 'preinit/gfx-asc/main-config.bin').read_bytes()
+            grid, = struct.unpack_from('<Q', main, 0x20)
+            outer_views.append(('outer-state-grid', grid - 0xc0, 0x340))
+            for index in (2, 5, 8, 11):
+                address, = struct.unpack_from('<Q', main, 0x20 + index * 0x20 + 24)
+                outer_views.append(('outer-cl-ring-' + str(index), address, 0x1800))
+            for label, address, extent in outer_views:
+                save(label + '-before', address, extent, gpu=True)
         if os.environ.get('M5_SKSM_CAPTURE_COMPLETION') == '1':
             hardware = (_m5_sksm_output / 'preinit/gfx-asc/shared-cluster.bin').read_bytes()
             low, high, capacity, entry_size, ordinal = struct.unpack_from(
@@ -225,7 +243,10 @@ def _m5_sksm_submit(ctx):
                 continue
             view = dict(index=index, pointer=hex(pointer))
             try:
-                size = 0x4000 - (pointer & 0x3fff)
+                # A valid register program can cross a 16-KiB boundary.
+                # Follow both mapped pages through the same guarded walker.
+                minimum = 0x1000 if index == 0 else 0xc0
+                size = max(minimum, 0x4000 - (pointer & 0x3fff))
                 payload = save('payload-view-' + str(index), pointer, size, gpu=True)
                 view['size'] = size
                 if index == 1 and len(payload) >= 0xc0:
@@ -261,6 +282,17 @@ def _m5_sksm_submit(ctx):
                             raise ValueError('M5 CL context word exceeds the measured profile')
                         gpu_context = context_word >> 8
                         manifest['compute_context'] = gpu_context
+                        region = int(hv.u.adt['/arm-io/sgx'].gpu_region_base)
+                        roots = save('compute-context-roots', region + gpu_context * 16,
+                                     16, physical=True)
+                        manifest['compute_context_roots'] = [hex(x) for x in struct.unpack('<QQ', roots)]
+                        context_state, = struct.unpack_from('<Q', payload, 0x10)
+                        if context_state:
+                            try:
+                                save('compute-context-state', context_state,
+                                     min(0x4000, 0x4000 - (context_state & 0x3fff)), gpu=True)
+                            except (RuntimeError, ValueError) as error:
+                                manifest['compute_context_state_error'] = str(error)
                         manifest['context_views'] = []
                         for name, address in [('cdm', registers[0x1a420]),
                                               ('preempt', registers[0x1a510]),
@@ -321,6 +353,8 @@ def _m5_sksm_submit(ctx):
                     if _m5_sksm_read_cpu(completion_pc, 8) != bytes.fromhex('f30300aa080840f9'):
                         raise ValueError('M5 completion site differs from pinned native code')
                     save('completed-host-cl-descriptor', descriptor_address, 0x800)
+                    for label, address, extent in outer_views:
+                        save(label + '-after', address, extent, gpu=True)
                     if completion_view is not None:
                         save('completion-queue-after', *completion_view, gpu=True)
                     for label, address, extent in channel_views:
