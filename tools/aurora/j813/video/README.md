@@ -10,16 +10,23 @@ gray and gradient inputs were absent from the macOS reference capture.
 The final boot also passed Wi-Fi DHCP and five pings through wlan0,
 Bluetooth's 90-command startup with no transport errors, keyboard/trackpad
 registration and XFCE startup. See `M5_NATIVE_RESULT.json` for the results.
-This is an experimental fixed-profile debugfs encoder. General V4L2/FFmpeg
-hardware-encoder integration, HEVC, higher resolutions and sustained video
-throughput are not yet qualified. GPU rendering is independent of AVE.
+The initial experimental encoder used debugfs. The new
+[V4L2 front end](V4L2.md) supports stock FFmpeg's `h264_v4l2m2m` and OBS's
+built-in FFmpeg output through `/dev/video0`, including ordinary desktop-user
+access and direct MPEG-TS timestamps. This remains a fixed 320x240/1 fps,
+all-IDR profile. Configurable encoding, HEVC, higher resolutions and sustained
+video throughput are not yet qualified. GPU rendering is independent of AVE.
 
-OBS Studio recording is now also qualified through the dedicated
+The earlier OBS Studio recording was qualified through the dedicated
 [`m5_ave_h264` adapter](obs/README.md): a ten-second MKV at 320x240/1 fps
 preserved the hardware's H.264 packets exactly and independently decoded
 at 51.4–54.3 dB PSNR against actual OBS input. This all-IDR test uses AVE
 for encoding and llvmpipe for OBS compositing; it does not qualify normal
 video frame rates or larger resolutions.
+
+The V4L2 path removes that custom encoder and userspace broker. Its OBS test
+helper only creates a synthetic scene and starts/stops recording. See
+`M5_V4L2_RESULT.json` for hardware results, regressions and explicit limits.
 
 ## Native Linux experiment
 

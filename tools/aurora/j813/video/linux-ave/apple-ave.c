@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* T8142 AVE bring-up: resources, firmware negotiation and IPC transport.
- * Experimental root-only command interface. No registered encoder yet.
+ * Fixed-profile experimental V4L2 encoder with root-only firmware setup.
  */
 #include <linux/debugfs.h>
 #include <linux/crc32.h>
@@ -83,6 +83,8 @@ struct apple_ave {
 	u32 ipc_reply[4], channel_bytes, extra_bytes;
 	const char *phase;
 	bool ipc_ready, command_failed;
+	bool encoder_owned;
+	struct ave_video *video;
 	struct ave_channel channel[2];
 	u32 commands, replies, transport_acks;
 	u8 response[SZ_64K];
@@ -97,6 +99,14 @@ struct apple_ave {
 
 static int ave_alloc_buffer(struct apple_ave *ave, struct ave_buffer *buf, size_t size);
 #include "apple-ave-ipc.h"
+#if IS_ENABLED(CONFIG_VIDEO_DEV) && IS_ENABLED(CONFIG_V4L2_MEM2MEM_DEV)
+#include "apple-ave-v4l2.h"
+#else
+/* Preserve the original debugfs-only build for kernels without media. */
+static int ave_video_register(struct apple_ave *ave) { return 0; }
+static void ave_video_unregister(struct apple_ave *ave) { }
+static void ave_video_status(struct apple_ave *ave, struct seq_file *s) { }
+#endif
 
 /* Cold-boot hello only. A successful response still needs the remaining IPC
  * negotiation. Keep the module, PM reference and DMA buffers pinned until a
@@ -352,8 +362,9 @@ static int ave_status_show(struct seq_file *s, void *unused)
 	seq_printf(s, "state=%s\nfirmware_start_requested=%u\nstart_result=%d\n",
 		   ave->start_requested ? (ave->start_result ? "startup-failed" : "ipc-ready") :
 		   "firmware-mapped", ave->start_requested, ave->start_result);
-	seq_printf(s, "hardware_dma_tested=%u\nencoder_registered=0\nphase=%s\n",
-		   ave->ipc_ready, ave->phase ?: "not-started");
+	seq_printf(s, "hardware_dma_tested=%u\nencoder_registered=%u\nencoder_owned=%u\nphase=%s\n",
+		   ave->ipc_ready, !!ave->video, ave->encoder_owned,
+		   ave->phase ?: "not-started");
 	seq_printf(s, "ipc_ready=%u\nipc_fw_base=%#llx\nchannel_bytes=%#x\nextra_bytes=%#x\n",
 		   ave->ipc_ready, ave->ipc_fw_base, ave->channel_bytes, ave->extra_bytes);
 	seq_printf(s, "commands=%u\nreplies=%u\ntransport_acks=%u\ncommand_failed=%u\nresponse_bytes=%zu\n",
@@ -391,6 +402,7 @@ static int ave_status_show(struct seq_file *s, void *unused)
 			seq_printf(s, "scratch%u=%#x\n", i, ave->scratch[i]);
 	}
 	seq_printf(s, "resources_pinned_until_reboot=%u\n", ave->start_requested);
+	ave_video_status(ave, s);
 	mutex_unlock(&ave->lock);
 	return 0;
 }
@@ -466,6 +478,11 @@ static int apple_ave_probe(struct platform_device *pdev)
 	debugfs_create_file("ave-command", 0600, ave->debugfs, ave, &ave_command_fops);
 	debugfs_create_file("ave-poll", 0200, ave->debugfs, ave, &ave_poll_fops);
 	debugfs_create_file("ave-arena", 0600, ave->debugfs, ave, &ave_arena_fops);
+	ret = ave_video_register(ave);
+	if (ret) {
+		debugfs_remove_recursive(ave->debugfs);
+		goto free_buffers;
+	}
 	ave->ipc_blob.data = ave->ipc.cpu;
 	ave->ipc_blob.size = ave->ipc.size;
 	debugfs_create_blob("ave-ipc-memory", 0400, ave->debugfs, &ave->ipc_blob);
@@ -497,6 +514,7 @@ static void apple_ave_remove(struct platform_device *pdev)
 {
 	struct apple_ave *ave = platform_get_drvdata(pdev);
 
+	ave_video_unregister(ave);
 	debugfs_remove_recursive(ave->debugfs);
 	ave_free_buffer(ave, &ave->heap);
 	ave_free_buffer(ave, &ave->log);
