@@ -40,6 +40,20 @@ class WalkerTests(unittest.TestCase):
             self.capture.read(self.pointer & ((1 << 40) - 1), 8)
         self.assertEqual(self.accesses, [])
 
+    def test_mapping_walk_retains_physical_identity_across_page_boundary(self):
+        other = self.page + 0x8000
+        struct.pack_into('<Q', self.memory[self.l3], 0x6b * 8, other | 3)
+        views = self.capture.mapping(self.pointer + 0x3ff0, 0x30)
+        self.assertEqual([(x['physical'], x['size']) for x in views],
+                         [(hex(self.page + 0x3ff0), 0x10), (hex(other), 0x20)])
+        self.assertTrue(all(len(x['walk']) == 4 for x in views))
+        # Mapping descriptions read only the tables, never the payload.
+        self.assertNotIn(self.page, self.accesses)
+        self.assertNotIn(other, self.accesses)
+        struct.pack_into('<Q', self.memory[self.l3], 0x6b * 8, 0x580000003)
+        with self.assertRaisesRegex(ValueError, 'non-DRAM'):
+            self.capture.mapping(self.pointer + 0x3ff0, 0x30)
+
     def test_invalid_mapping_cannot_reach_mmio(self):
         struct.pack_into('<Q', self.memory[self.l3], 0x6a * 8, 0x580000003)
         with self.assertRaisesRegex(ValueError, 'non-DRAM'):
@@ -67,6 +81,7 @@ class WalkerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'non-DRAM'):
             self.capture.read_context(self.pointer, 8, 3, 0x580000000)
         self.assertEqual(self.accesses, [])
+
 
 
 if __name__ == '__main__':

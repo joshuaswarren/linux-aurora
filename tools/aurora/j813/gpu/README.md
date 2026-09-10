@@ -6,6 +6,8 @@ firmware processors now complete RTKit startup and acknowledge Linux-owned
 initialization data in the native RAM-boot experiment. Linux also registers
 an owned SKSM compute queue, binds its scheduler control, and verifies the
 firmware's retained records.
+An isolated execution context and six owned diagnostic program pages also
+survive this transaction, with all input values and output sentinels unchanged.
 It does not yet
 execute GPU work or expose a render node. DCP presentation is a later,
 independent qualification; neither a software desktop nor encoder success
@@ -13,6 +15,13 @@ is evidence of GPU rendering.
 
 ## Hardware evidence, 2026-09-10
 
+- A fresh RAM boot with `m5_initdata_test=5` additionally prepared context 3
+  with an independently allocated lower root and empty upper root, both
+  tagged with ASID 3. After both initialization acknowledgments, control
+  openings, queue registration and scheduler binding, the root pair remained
+  current and all 1,024 inputs and output sentinels remained unchanged.
+  Both stop requests succeeded. This verifies host preparation and retention;
+  shader execution through that context remains untested.
 - A fresh RAM boot with `m5_initdata_test=3` registered SKSM queue 11 using
   one tag-15 configuration. The outer and inner counters each advanced to
   `[1, 1, 1]`; the firmware DATA record changed from zero to
@@ -124,17 +133,31 @@ SPTM global root reported by the current boot receipt; its firmware mappings
 do not appear in the ordinary per-context TTBR pairs.
 
 `m5-metal-reference.m` verifies compute results and rendered pixels through
-three fresh Metal command queues. Twenty-seven macOS runs each passed 3,072 exact
+three fresh Metal command queues. Thirty-two macOS runs each passed 3,072 exact
 compute values and 12,288 RGBA pixels. This is a macOS reference, not evidence
 that Linux submission, rendering or DCP works.
 
 The bounded SKSM observer now follows the selected command's actual UAT
 context, CDM stream, pipeline and explicitly requested shader/data pages.
 An optional one-shot hook at the matching retained CL descriptor's completion
-captures those pages again. Six controlled captures each show 1,024 output
+captures those pages again. Nine controlled captures each show 1,024 output
 sentinels before submission and 1,024 exact results at the matching callback;
 the input remains unchanged. All captured objects matched on two reads.
 The observer never reads device memory and retains a two-MiB read budget.
+
+The optional owner capture records physical page walks as well as contents.
+M5's native compute context 3 has an empty upper root. The descriptor and SKSM
+ring's lower aliases in context 0 match their firmware-global physical pages;
+those same addresses in context 3 have different backing. Event-state links
+also have guard pages and distinct allocations. Linux must retain separate
+owners instead of treating these virtual addresses as interchangeable.
+
+`m5_compute_program.rs` constructs the controlled shader, pipeline, CDM stream,
+arguments, input/output and robustness pages. `verify-m5-compute-program.py`
+compares the defined regions against the private native captures and validates
+completed results using the production checker. All nine completed captures
+match. This does not establish that every command dependency is covered or
+that Linux can execute the shader.
 
 The controlled channel item ring contains the register program (selector 3),
 queue configuration (tag 15), then SKSM kick (tag 14). Its producer was 2

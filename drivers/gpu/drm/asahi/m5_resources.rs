@@ -18,6 +18,9 @@ use kernel::sync::Arc;
 #[path = "m5_queue_probe.rs"]
 mod queue_probe;
 use queue_probe::M5QueueProbe;
+#[path = "m5_program_memory.rs"]
+mod program_memory;
+use program_memory::M5ProgramMemory;
 
 const KERNEL_BASE: u64 = 0xffff_fc20_0000_0000;
 const PRIVATE_BASE: u64 = KERNEL_BASE + 0x2_0000;
@@ -46,6 +49,7 @@ pub(crate) struct M5FirmwareMemory {
     aliases: KVec<mmu::KernelMapping>,
     registers: KVec<mmu::KernelMapping>,
     queue_probe: Option<M5QueueProbe>,
+    program: Option<M5ProgramMemory>,
     uat: Arc<mmu::Uat>,
 }
 
@@ -200,9 +204,18 @@ impl M5FirmwareMemory {
         } else {
             None
         };
+        let program = if probe_kind >= 5 {
+            Some(M5ProgramMemory::new(dev, &uat)?)
+        } else {
+            None
+        };
         fence(Ordering::SeqCst);
         Ok(Self { primary_root, secondary_root, shared, private, region_a, region_c, fwctl, aon, qos,
-                  pbdesc, uma, completions, aliases, registers, queue_probe, uat })
+                  pbdesc, uma, completions, aliases, registers, queue_probe, program, uat })
+    }
+
+    pub(crate) fn validate_program_context(&mut self) -> Result<[u64; 2]> {
+        self.program.as_mut().ok_or(EINVAL)?.validate_unsubmitted()
     }
 
     pub(crate) fn root(&self, secondary: bool) -> u64 {

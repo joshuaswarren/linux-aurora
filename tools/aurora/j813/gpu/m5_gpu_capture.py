@@ -54,6 +54,26 @@ class M5GPUCapture:
         reader = G17PUATReader(self._read_dram, gpu_region)
         return reader.read(pointer, size, context=context)
 
+    def mapping(self, pointer, size, context=None, gpu_region=None):
+        """Record bounded DRAM translations, without reading mapped data."""
+        if not 0 < size <= self.MAX_CAPTURE:
+            raise ValueError('Invalid M5 mapping extent')
+        if context is not None and (not 0 <= context < 256 or gpu_region is None):
+            raise ValueError('Invalid M5 mapping context')
+        reader = self.walker if context is None else G17PUATReader(self._read_dram, gpu_region)
+        result = []
+        offset = 0
+        while offset < size:
+            address = pointer + offset
+            length = min(size - offset, self.PAGE_SIZE - (address & (self.PAGE_SIZE - 1)))
+            physical, walk = reader.translate(context or 0, address)
+            if not self.low <= physical < physical + length <= self.high:
+                raise ValueError('M5 mapping attempted a non-DRAM view')
+            result.append(dict(address=hex(address), physical=hex(physical), size=length,
+                               walk=[[hex(slot), hex(entry)] for slot, entry in walk]))
+            offset += length
+        return result
+
     def capture(self, role, init_message, output, phase):
         if role not in ('gfx-asc', 'gfx1-asc') or (init_message >> 48) & 0xff != 0x81:
             raise ValueError('Expected an M5 initialization doorbell')

@@ -50,6 +50,7 @@ mod initdata;
 mod mem;
 mod m5_channel;
 mod m5_compute;
+mod m5_compute_program;
 mod m5_sksm;
 mod microseq;
 mod mmu;
@@ -72,7 +73,7 @@ kernel::module_platform_driver! {
     params: {
         m5_initdata_test: u32 {
             default: 0,
-            description: "M5 fresh RAM boot: 1=initdata ACKs, 2=control openings, 3=queue install, 4=scheduler bind; then stop, no DRM",
+            description: "M5 fresh RAM boot: 1=initdata ACKs, 2=control openings, 3=queue install, 4=scheduler bind, 5=program context; then stop, no DRM",
         },
         debug_flags: u64 {
             default: 0,

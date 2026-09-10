@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 //! Controlled M5 compute program from our compiled Metal reference.
 //!
-//! Native replay qualifies the first 1 KiB of the shader page; its 64-byte
-//! body alone is insufficient. Native captures also agree on the 132-byte
-//! Ioto pipeline and direct 1024-thread stream. These fixed VAs are a
-//! diagnostic profile;
+//! Seven native captures agree on the shader, 132-byte Ioto pipeline and
+//! direct 1024-thread stream. These fixed VAs are a diagnostic profile;
 //! callers must back them with owned mappings in the submitted M5 context.
 //! This module neither installs mappings nor publishes work.
 
@@ -22,58 +20,11 @@ pub(crate) const ROBUSTNESS_PAGE: u64 = 0x10_0001_8000;
 pub(crate) const INPUT_OFFSET: usize = 0xd00;
 pub(crate) const OUTPUT_OFFSET: usize = 0x1d00;
 
-#[path = "m5_triangle_program.rs"]
-mod triangle;
-pub(crate) const CONSTANTS_PAGE: u64 = triangle::CONSTANTS_PAGE;
-
-pub(crate) fn expected_output(index: usize, triangle: bool) -> u32 {
-    if !triangle { return index as u32 * 21 + 5; }
-    let x = (index % 32) as i32;
-    let y = (index / 32) as i32;
-    if y >= 4 && y < 28 && (2*x-31).abs() <= y-4 {
-        0xffff_0000 | ((y as u32 * 8) << 8) | (x as u32 * 8)
-    } else {
-        0xff18_1818
-    }
-}
-
-// Native replay proves the 64-byte body alone produces no output. The
-// preceding program setup is required: preserving this first 1 KiB and
-// zeroing the remaining page verifies all 1024 replacement results.
-// Full-page SHA256: 32f033d1c45c805abc61f7fa1a805847ac648ddc0377a7a6f0f1450ea07d15f8
-const SHADER: [u32; 256] = [
-    0x00000340, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006,
-    0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006,
-    0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006,
-    0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006,
-    0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006,
-    0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006,
-    0x0e33005e, 0x00000000, 0x00060000, 0x00060006, 0x0e31405e, 0x00000000, 0x00060000, 0x00060006,
-    0x0e31005e, 0x00000000, 0x00060000, 0x00060006, 0x0e1b405e, 0x00000000, 0x00060000, 0x00060006,
-    0x0e1b005e, 0x00000000, 0x00060000, 0x00060006, 0x0e19405e, 0x00000000, 0x00060000, 0x00060006,
-    0x0e19005e, 0x00000000, 0x00060000, 0x00060006, 0x0e13405e, 0x00000000, 0x00060000, 0x00060006,
-    0x0e13005e, 0x00000000, 0x00060000, 0x00060006, 0x0e11405e, 0x00000000, 0x00060000, 0x00060006,
-    0x0f100007, 0x00270000, 0x00200004, 0x00060aa5, 0x0f100007, 0x00270000, 0x00200004, 0x00060aa5,
-    0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006,
-    0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006,
-    0x0e33005e, 0x00000000, 0x00060000, 0x00060006, 0x0e31405e, 0x00000000, 0x00060000, 0x00060006,
-    0x0e31005e, 0x00000000, 0x00060000, 0x00060006, 0x0e1b405e, 0x00000000, 0x00060000, 0x00060006,
-    0x0e1b005e, 0x00000000, 0x00060000, 0x00060006, 0x0e19405e, 0x00000000, 0x00060000, 0x00060006,
-    0x0e19005e, 0x00000000, 0x00060000, 0x00060006, 0x0e13405e, 0x00000000, 0x00060000, 0x00060006,
-    0x0e13005e, 0x00000000, 0x00060000, 0x00060006, 0x0e11405e, 0x00000000, 0x00060000, 0x00060006,
-    0x0f100007, 0x00270000, 0x00200004, 0x00060aa5, 0x0f100007, 0x00270000, 0x00200004, 0x00060aa5,
-    0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006,
-    0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006,
-    0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006,
-    0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006,
-    0x000000c0, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x02070023, 0x02a02042, 0x0000000e, 0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006,
-    0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006, 0x00060006,
-    0x0610a01c, 0x0203000f, 0xc0102218, 0x00800041, 0x002f0000, 0x00291a04, 0x802802a3, 0x01270024,
-    0x00253a04, 0x802002a3, 0x040f0021, 0x06010203, 0x000e4010, 0x00000000, 0x00000000, 0x00000000,
+const SHADER: [u32; 16] = [
+    0x0610a01c, 0x0203000f, 0xc0102218, 0x00800041,
+    0x002f0000, 0x00291a04, 0x802802a3, 0x01270024,
+    0x00253a04, 0x802002a3, 0x040f0021, 0x06010203,
+    0x000e4010, 0, 0, 0,
 ];
 const PIPELINE: [u32; 33] = [
     0x0002a02c, 0x00700812, 0x0002803c, 0x00000004,
@@ -92,23 +43,15 @@ const STREAM: [u32; 12] = [
 ];
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub(crate) enum PageKind { Shader, Pipeline, Stream, Preempt, Buffers, Robustness, Constants }
+pub(crate) enum PageKind { Shader, Pipeline, Stream, Preempt, Buffers, Robustness }
 
 /// Construct one complete owned page; reject the wrong extent before writing.
 pub(crate) fn initialize_page(kind: PageKind, page: &mut [u8]) -> Result<(), ()> {
-    initialize_page_for(kind, page, false)
-}
-
-pub(crate) fn initialize_page_for(kind: PageKind, page: &mut [u8], triangle: bool) -> Result<(), ()> {
     if page.len() != PAGE_BYTES { return Err(()); }
     page.fill(0);
     let (offset, words): (usize, &[u32]) = match kind {
-        PageKind::Shader => (0, if triangle { &triangle::SHADER } else { &SHADER }),
-        PageKind::Pipeline => (0, if triangle { &triangle::PIPELINE } else { &PIPELINE }),
-        PageKind::Constants => {
-            if !triangle { return Err(()); }
-            (0, &triangle::CONSTANTS)
-        }
+        PageKind::Shader => (0x3c0, &SHADER),
+        PageKind::Pipeline => (0, &PIPELINE),
         PageKind::Stream => (0, &STREAM),
         PageKind::Preempt => {
             // Ioto's first LDIMM pair selects PREEMPT_PAGE + 0x14a0.
