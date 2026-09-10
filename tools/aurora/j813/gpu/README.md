@@ -1,13 +1,25 @@
 # M5 / J813 GPU bring-up
 
-The native Linux diagnostic candidate identifies the physical T8142 GPU as
-**G17G revision C0, one die, one cluster, ten active cores**. It does not yet
+The native Linux candidate identifies the physical T8142 GPU as
+**G17G revision C0, one die, one cluster, ten active cores**. Both M5 GPU
+firmware processors now complete RTKit discovery and full management startup
+in Linux.
+It does not yet
 execute GPU work or expose a render node. DCP presentation is a later,
 independent qualification; neither a software desktop nor encoder success
 is evidence of GPU rendering.
 
 ## Hardware evidence, 2026-09-10
 
+- A fresh RAM boot with the exact T8142 ASCWrap-v6 providers completed both
+  roles' HELLO/EPMAP exchanges: protocol 12, endpoints 0, 1, 32 and 33.
+  Each provider delivered three receive interrupts through AIC3. GFX1 was
+  started before GFX, matching the native M5 trace. Both stop requests
+  returned success; owners remain pinned until reboot.
+- A second fresh RAM boot completed full RTKit startup for both processors:
+  each reported running, no crash, and GPU endpoints 0x20/0x21 available.
+  The firmware DATA reservations and native crash-buffer locations were
+  retained. No initialization descriptor or GPU command was submitted.
 - Linux `7.1.6-aurora-j813-gpu-v9`, Asahi diagnostic module loaded explicitly.
 - GPU ID words: `0b022000 000b0800 0011010a 00040404 01320311 10030302`.
 - The M5 ADT selects a 43-bit virtual address (42 bits per root plus one
@@ -28,8 +40,8 @@ is evidence of GPU rendering.
   hardware-rendered frame, or DCP acceptance from this candidate.
 
 The firmware capture identifies an observed build; it does not grant runtime
-admission. G17G firmware initialization, both ASC lifecycle paths, UAT
-ownership, submission and completion still need M5-specific implementation.
+admission. G17G initialization-data acknowledgement, UAT ownership,
+submission and completion still need M5-specific runtime integration.
 The existing source admits the Neo's G17P runtime only.
 
 ## Reproducible diagnostic candidate
@@ -82,7 +94,7 @@ SPTM global root reported by the current boot receipt; its firmware mappings
 do not appear in the ordinary per-context TTBR pairs.
 
 `m5-metal-reference.m` verifies compute results and rendered pixels through
-three fresh Metal command queues. Seven macOS runs each passed 3,072 exact
+three fresh Metal command queues. Eight macOS runs each passed 3,072 exact
 compute values and 12,288 RGBA pixels. This is a macOS reference, not evidence
 that Linux submission, rendering or DCP works.
 
@@ -113,6 +125,39 @@ windows and the 64 KiB extent of slot 39. The two measured control openings
 are initialized; subsequent compute/render descriptors are not submitted.
 The constructor requires an M5 UAT and has not been exercised on Linux
 hardware. It neither opens the UAT lifecycle gate nor starts a processor.
+
+The native UAT inspection now reads both role-private roots, their shared L2,
+TTBAT, global root and handoff through their existing EL2 mappings. The
+generic non-cacheable alias does not cover every reservation; an alias
+translation fault does not establish physical access protection. The entire
+16 KiB handoff page remained zero before and after a verified Metal workload.
+This observation does not yet qualify Linux handoff or cache-flush behavior.
+
+## Linux firmware transport experiment
+
+`linux-rtkit-probe/` is an explicitly loaded external module for fresh RAM
+boots. It validates both M5 providers and DATA reservations, arms both RTKit
+receivers, then starts GFX1 and GFX. Its default mode answers only HELLO and
+EPMAP. `full_boot=1` completed the complete RTKit management startup in a
+separate cold test. Neither mode submits initdata or GPU jobs.
+After a CPU start, owners and the module remain pinned until reboot.
+
+Run `build-m5-rtkit-probe.sh` in the J813 Lima builder against the candidate
+kernel, then use
+`build-m5-rtkit-probe-payload.sh` and
+`boot-linux.py --gpu --gpu-rtkit-probe --gpu-inventory`.
+The separate payload enables only the two mailbox nodes; it preserves the
+base diagnostic payload and leaves Asahi automatic loading disabled.
+Load the probe manually from the native Linux shell after verifying the
+current-boot firmware capture. Never load it alongside Asahi.
+
+`m5_firmware_identity.py` identifies the observed 3255.160.4 loaded TEXT pair.
+Only the exact eight-byte values of the STKG and PACE boot TLVs vary across
+the compared boots. Their offsets, tags and lengths remain in the hash,
+along with every executable byte. `verify-m5-firmware-identity.py` checks
+private captures and rejects code, metadata tag/length, tail and role changes.
+The transport payload's preflight requires this identity; ordinary read-only
+inventory can still capture an unknown build without granting runtime use.
 
 The latest complete cold capture matches both 160 KiB shared clusters and
 the 0x178000 private arena, after excluding only independently identified
