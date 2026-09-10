@@ -1,4 +1,4 @@
-# J813 Wi-Fi source locations
+# J813 Linux source locations
 
 The primary driver and workbench now live together on
 [linux-aurora/j813](https://github.com/aurora-silicon/linux-aurora/tree/j813).
@@ -11,7 +11,7 @@ All repositories use the single `j813` branch for this work.
 | J813 device trees and AIC3 changes | This branch; kernel bring-up baseline c8f85bcfb039 |
 | Native Linux m1n1 | [m1n1-aurora/j813](https://github.com/aurora-silicon/m1n1-aurora/tree/j813), repository root; qualified source be543d9e |
 | macOS tracing carrier | [m1n1-aurora/j813](https://github.com/aurora-silicon/m1n1-aurora/tree/j813/experiments/j813/macos-trace), `experiments/j813/macos-trace/`; qualified source dc702bf6 |
-| U-Boot | [u-boot/j813](https://github.com/aurora-silicon/u-boot/tree/j813), 49b1cdbb911 |
+| U-Boot | [u-boot/j813](https://github.com/aurora-silicon/u-boot/tree/j813), b0430a0846b; leaves J813 MTP cold for Linux |
 
 ## Reproducing the lab workbench
 

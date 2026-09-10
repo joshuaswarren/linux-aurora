@@ -1041,7 +1041,7 @@ static int apple_rtkit_set_iop_power_state(struct apple_rtkit *rtk,
 	return 0;
 }
 
-int apple_rtkit_boot(struct apple_rtkit *rtk)
+static int apple_rtkit_boot_common(struct apple_rtkit *rtk, bool early_ap_power)
 {
 	int ret;
 
@@ -1060,12 +1060,25 @@ int apple_rtkit_boot(struct apple_rtkit *rtk)
 	if (rtk->boot_result)
 		return rtk->boot_result;
 
+	/* Some helpers wait for AP=ON before acknowledging their own ON state. */
+	if (early_ap_power) {
+		ret = apple_rtkit_set_ap_power_state(rtk, APPLE_RTKIT_PWR_STATE_ON);
+		if (ret)
+			return ret;
+	}
+
 	dev_dbg(rtk->dev, "RTKit: waiting for IOP power state ACK\n");
 	ret = apple_rtkit_wait_for_completion(&rtk->iop_pwr_ack_completion);
 	if (ret)
 		return ret;
 
-	return apple_rtkit_set_ap_power_state(rtk, APPLE_RTKIT_PWR_STATE_ON);
+	return early_ap_power ? 0 :
+		apple_rtkit_set_ap_power_state(rtk, APPLE_RTKIT_PWR_STATE_ON);
+}
+
+int apple_rtkit_boot(struct apple_rtkit *rtk)
+{
+	return apple_rtkit_boot_common(rtk, false);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_boot);
 
@@ -1197,7 +1210,7 @@ int apple_rtkit_quiesce(struct apple_rtkit *rtk)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_quiesce);
 
-int apple_rtkit_wake(struct apple_rtkit *rtk)
+static int apple_rtkit_wake_common(struct apple_rtkit *rtk, bool early_ap_power)
 {
 	u64 msg;
 	int ret;
@@ -1220,9 +1233,20 @@ int apple_rtkit_wake(struct apple_rtkit *rtk)
 	if (ret)
 		return ret;
 
-	return apple_rtkit_boot(rtk);
+	return apple_rtkit_boot_common(rtk, early_ap_power);
+}
+
+int apple_rtkit_wake(struct apple_rtkit *rtk)
+{
+	return apple_rtkit_wake_common(rtk, false);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_wake);
+
+int apple_rtkit_wake_early_ap(struct apple_rtkit *rtk)
+{
+	return apple_rtkit_wake_common(rtk, true);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_wake_early_ap);
 
 void apple_rtkit_free(struct apple_rtkit *rtk)
 {

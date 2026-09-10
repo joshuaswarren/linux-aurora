@@ -23,7 +23,20 @@ still matches a diagnostic probe; only T8140/G17P enters its working runtime.
 The M5 requires its own topology, firmware lifecycle and GPU submission proof.
 No J700 identity or firmware has been substituted for it.
 
-## Desktop kernels booted; full XFCE session still failing
+## Desktop and input status
+
+Desktop-v3 resolved the black-screen session failure and showed XFCE panels,
+icons and a terminal. Native physical keyboard events are now proven in v5,
+and trackpad firmware startup and physical events are proven in v6. The root
+cause and Windows-reference comparison are recorded in [INPUT.md](INPUT.md).
+Desktop-v7 combines the dedicated Apple keyboard/trackpad drivers. Xorg uses
+both through libinput; a physical test in the running desktop recorded 15,403
+trackpad and 483 keyboard events. All four XFCE components remain running,
+and a framebuffer capture shows panels, icons and a working terminal shell.
+The same boot passed 5/5 and then 3/3 external pings; Bluetooth startup retains
+90 commands/events with zero TX/RX errors. Rendering remains software-only.
+Occasional discarded touch jumps are recorded; motion quality, gestures and
+palm rejection still need qualification.
 
 The first candidate keeps the firmware framebuffer and the single boot CPU.
 The old kernel registered simplefb but had `CONFIG_FB_DEVICE` disabled, so
@@ -47,9 +60,11 @@ private firmware-containing boot images and must not be exposed over HTTP.
 
 `build-desktop-kernel.sh` uses a separate case-sensitive source/build pair in
 the M5 VM. Source is archived from the local integration commit; the current
-Bluetooth driver is an explicit, hashed overlay. It builds
-`7.1.6-aurora-j813-desktop-v2`. Both Image/DTB/module builds passed with W=1; 538
-warnings are in existing core code, and none are in Centauri/Bluetooth.
+Bluetooth driver is an explicit, hashed overlay. The default builds desktop-v3;
+the `input` flavor builds desktop-v7 with MTP/RTKit source overlays and checks
+all required driver options. Image, DTB and module builds passed with W=1.
+The initial full build's warnings were in existing core code; the later input
+builds reported no warnings in the changed drivers.
 The first stable-address build missed `linux/hex.h`; that include was added
 and the complete rebuild passed. Do not use the earlier failed build result.
 
@@ -67,7 +82,7 @@ modes. Hardware readback verified the same identity after reboot. It is retained
 in private `logs/adapter-private-info-20260910.log`; the paired key remains only
 in the private successful pairing capture. Do not print or publish either.
 
-The desktop-v1 candidate has now booted with complete payload readback and a
+The initial desktop-v1 candidate booted with complete payload readback and a
 verified serial shell. It exposes `/dev/fb0`, format x2r10g10b10, 2560x1664,
 stride 10240. Wi-Fi reinitialized and passed 5/5 Google pings. Bluetooth native
 startup and HostAwake succeeded with the saved adapter address and zero errors.
@@ -79,13 +94,119 @@ pairing capture and can restore its exact key into RAM BlueZ storage without
 printing it; it also saves the diagnostic address module option in that RAM
 root. This is restored test state, not standalone persistent bond storage.
 
-`start-desktop.sh` launches Xorg/XFCE in a chroot while preserving the running
-network and kernel instances. Built-in keyboard/trackpad wiring and visual
-desktop proof are still pending. The console's interactive line length is
+`start-desktop.sh` launches Xorg in a chroot and XFCE in a private mount
+namespace while preserving the running network and kernel instances. See the
+v3 proof and current input status below. The console's interactive line length is
 bounded: an oversized setup command was truncated before execution, then the
 continuation prompt was canceled. `start-n1-desktop.sh` now carries that setup
 as a verified uploaded file. `linux-command.py` rejects commands over 900 bytes
 before opening serial; the rejection path was tested without hardware access.
+
+## Desktop-v3 fixes and hardware proof
+
+The black-screen failure is resolved in desktop-v3. The kernel enables
+`CONFIG_SYSCTL` and `CONFIG_PROC_SYSCTL`; the launcher gives `/run/user` and
+`/run/dbus` mode 0755, preserves the private 0700 user directory, and creates
+the standard root-owned 01777 ICE socket directory. The original console's
+private umask had prevented the user session from traversing those parents.
+
+Linux rejects a new user namespace from a chroot (`current_chrooted()`), which
+also blocked the image-loader sandbox. `desktop-root-exec.sh` creates a private
+mount namespace, pivots only that namespace to the RAM root, and detaches its
+old root. A real unprivileged user-namespace test passed on the M5. The serial
+console and radio processes remain in their original namespace. The image
+loader sandbox remains enabled.
+
+Desktop-v3 booted with complete payload readback, completed DHCP and 5/5 pings,
+and transferred the clean root with a matching SHA256. The session, window
+manager, panel and desktop remained running past the 20-second startup check.
+A verified framebuffer download shows panels, icons and the launcher at
+2560x1664. `xfce4-terminal` also launched; another 3/3 external pings passed.
+The black wallpaper is the current default, not a failed session. Rendering
+is software-only and no physical input is present in this v3 device tree.
+
+Evidence: `logs/desktop-v3-{boot,network,display-proof,app-diagnosis}-20260910.log`
+and `logs/desktop-v3-frame-20260910.png`. The green XFCE milestone post delivered
+HTTP 204; see `logs/standup-xfce-working-20260910{,-receipt}.json`.
+
+## Input candidate
+
+The v7 terminal test exposed a missing devpts mount. The launcher now mounts
+devpts before binding `/dev` and creating the private desktop namespace, and
+checks unprivileged PTY allocation. The equivalent live fix passed on v7 and
+the framebuffer shows an interactive shell. The corrected launcher is in
+the repacked private RAM image; that repack has not required a kernel change.
+
+`show-desktop-demo.sh` opens Fastfetch, live N1 Wi-Fi pings and btop as the
+desktop user. Install `fastfetch btop` in the RAM root first and permit that
+user's group to use ICMP echo sockets (`1000 1000` in
+`/proc/sys/net/ipv4/ping_group_range`). Copy the script into
+`/desktop/usr/local/bin/j813-desktop-demo`, make it executable, and launch it
+through `j813-desktop-root-exec` as `aurora` with the existing DISPLAY,
+XAUTHORITY and runtime-directory environment. The Wi-Fi ping binds explicitly
+to `wlan0`; no traffic is simulated. Fastfetch reports software rendering
+explicitly. Packages were installed over the M5's Wi-Fi, and all three windows
+were inspected in a SHA-verified framebuffer capture. The original clean root
+archive remains unchanged, so future boots need the demo packages installed.
+
+The live kernel reports online, present and possible CPU masks all as `0`.
+btop correctly shows one CPU: this minimal boot prunes stopped CPU nodes and
+uses `maxcpus=1`. Showing every M5 core requires a separate native SMP boot
+qualification, not a btop setting. The demo labels the measured online count.
+The Wi-Fi driver does not yet implement `iw link` signal/bitrate statistics;
+the demo labels those unavailable while displaying actual live ping replies.
+
+The btop demo uses one full-height CPU chart, block glyphs and one-second
+updates. Initially the CPU graph was nearly flat because measured utilization
+was only 0.33%, not because CPU accounting had stopped. A bounded 20-second
+real workload produced 100% measured utilization and a visible chart spike;
+the workload then exited. The demo retains the normal 0-100% scale and does
+not manufacture background load. Evidence is in
+`logs/btop-cpu-{investigation,load-proof,recovery}-20260910.log` and
+`logs/M5-btop-CPU-load-20260910.png`.
+
+Evidence: `logs/desktop-v7-showcase-20260910.png` and
+`logs/desktop-v7-demo-ping-permission-20260910.log`.
+
+`build-desktop-kernel.sh input` layers `desktop-input.config` and the separate
+`t8142-j813-input.dts` onto the Wi-Fi/desktop foundation. It enables the mailbox,
+RTKit helper and DockChannel HID modules, including their `CONFIG_PM`
+dependency, without changing the qualified Wi-Fi-only DTB. The source builds
+with W=1 and required-option checks. The first v4 bundle reached the controller
+startup failure described below; the cold-start fix and physical event proof
+are recorded in [INPUT.md](INPUT.md).
+
+MTP resources were checked against the live ADT alongside the already-proven
+AIC and UART addresses. The MTP ASC is at 0x394600000, DART at 0x394800000,
+DockChannel IRQ at 0x394b14000, and channel-1 config/data at
+0x394b30000/0x394b34000. The mapper uses stream 0. The separate 1 MiB firmware
+window at 0x394c00000 is consistent with the captured iBoot segment ranges and
+prior J813 MTP handoff. Trackpad firmware/power sequencing remains a separate
+step; no J700 firmware, GPIO mapping or device identity is substituted.
+
+The v4 mailbox bound and exchanged RTKit protocol-v12 messages, proving native
+interrupt-driven communication. MTP then crashed during initialization with a
+reported PC 0x102a73c / ESR 0x96000004 and helper timeout -62; Linux remained
+responsive. No repeat firmware submission was attempted in that boot.
+
+The user pointed back to the already-working J813 Windows input path. Comparison
+with `AuroraSilicon/drivers/AppleMtpHid` and m1n1's `src/mtp_handoff.c` found
+three missing details: scoped MTP DAPF initialization, the low 32..288 MiB IOVA
+pool, and AP=ON announced before waiting for IOP=ON. The next v5 candidate
+includes all three and the STM child required to obtain the real HID identity.
+The RTKit early-AP entry point is selected only by the J813 MTP helper; existing
+callers retain their ordering. V5 still failed until the J813 U-Boot guard
+removed the earlier boot/shutdown cycle; cold Linux startup and physical
+keyboard events then passed. Use `boot-linux.py --input`, which checks the MTP/DART addresses and
+prepares only that DAPF block. `--desktop` rejects an MTP-bearing DTB.
+
+The user reports that M5 keyboard and pointer input already worked through AIC3
+in the Windows driver work. Treat those source and hardware results as the
+primary J813 reference. J700 contributes desktop and shared-driver lessons,
+not substitute firmware, GPIO values or identities.
+
+The initramfs repacker now includes only modules for its own kernel release;
+saved v1/v2/v3 bundles and module directories remain available outside it.
 
 ## Coordination and reporting
 
