@@ -47,7 +47,7 @@ MODULE_PARM_DESC(skip_hw_init,
 #define APPLE_PIODMA_ENGINE_IOVA_HIGH	BIT_ULL(40)
 
 #define PIODMA_CFG			0x000
-#define  PIODMA_CFG_ENABLE		BIT(0)
+#define  PIODMA_CFG_DISABLE		BIT(0)
 #define PIODMA_IRQ_STATUS		0x004
 #define  PIODMA_IRQ_COMMAND_COMPLETE	(BIT(6) | BIT(0))
 #define PIODMA_IRQ_ENABLE		0x008
@@ -137,7 +137,11 @@ struct apple_pcie_piodma {
 	u64 commands;
 	u64 reads;
 	u64 writes;
+	bool initialized;
+	bool faulted;
 };
+
+static void apple_piodma_hw_init(struct apple_pcie_piodma *piodma);
 
 static void apple_piodma_rmw(void __iomem *base, u32 offset,
 			     u32 mask, u32 value)
@@ -273,6 +277,32 @@ static int apple_piodma_submit(struct apple_pcie_piodma *piodma,
 		return -ERANGE;
 
 	raw_spin_lock(&piodma->lock);
+	if (piodma->faulted) {
+		ret = -EIO;
+		goto out_unlock;
+	}
+	if (!piodma->initialized) {
+		/* Link setup runs after the supplier probe but before config
+		 * scanning. Initialize once here, after that setup. Never reset
+		 * or replay a command on an engine which has already failed.
+		 */
+		dev_info(piodma->dev,
+			 "J700_APCIE_PIODMA_BEFORE_FIRST_COMMAND: cfg=%08x irq_enable=%08x aperture1_hi=%08x\n",
+			 readl(piodma->engine + PIODMA_CFG),
+			 readl(piodma->engine + PIODMA_IRQ_ENABLE),
+			 readl(piodma->engine + PIODMA_REG_F4));
+		if (!skip_hw_init)
+			apple_piodma_hw_init(piodma);
+		piodma->initialized = true;
+	}
+	if (readl(piodma->engine + PIODMA_CFG) != 0 ||
+	    readl(piodma->engine + PIODMA_IRQ_ENABLE) != 0x3ff ||
+	    readl(piodma->engine + PIODMA_REG_F4) != 1) {
+		dev_err(piodma->dev,
+			"PIODMA configuration lost before submission; DMA blocked\n");
+		ret = -EIO;
+		goto out_unlock;
+	}
 
 	memset(packet, 0, APPLE_PIODMA_PACKET_BYTES);
 	memset(completion, 0, APPLE_PIODMA_PACKET_BYTES);
@@ -359,6 +389,7 @@ static int apple_piodma_submit(struct apple_pcie_piodma *piodma,
 
 out_unlock:
 	if (ret) {
+		piodma->faulted = true;
 		fail_command = readl_relaxed(piodma->engine + PIODMA_COMMAND);
 		fail_fifo = readl_relaxed(piodma->engine + PIODMA_FIFO_STATUS);
 		fail_irq = readl_relaxed(piodma->engine + PIODMA_IRQ_STATUS);
@@ -391,10 +422,11 @@ static void apple_piodma_hw_init(struct apple_pcie_piodma *piodma)
 	apple_piodma_rmw(piodma->engine, PIODMA_TUNE_1C, GENMASK(18, 0), 0x1fbf0);
 	apple_piodma_rmw(piodma->engine, PIODMA_TUNE_20, GENMASK(18, 0), 0x1fbf0);
 
-	/* Run274 records a second unconditional CFG write after the tunables,
-	 * followed by interleaved low/high register-bank pairs.
+	/* Pinned J700 25G76 enableGated() clears CFG bit 0; disableGated()
+	 * sets it. This is a stop bit, not an enable bit. Clear it before
+	 * programming the aperture banks and leave it clear for submissions.
 	 */
-	writel_relaxed(readl_relaxed(piodma->engine + PIODMA_CFG) & ~BIT(1),
+	writel_relaxed(readl_relaxed(piodma->engine + PIODMA_CFG) & ~PIODMA_CFG_DISABLE,
 		       piodma->engine + PIODMA_CFG);
 	writel_relaxed(0, piodma->engine + PIODMA_REG_24);
 	writel_relaxed(0, piodma->engine + PIODMA_REG_F0);
@@ -412,11 +444,20 @@ static void apple_piodma_hw_init(struct apple_pcie_piodma *piodma)
 	writel_relaxed(0, piodma->engine + PIODMA_REG_108);
 	writel_relaxed(0, piodma->engine + PIODMA_REG_40);
 	writel_relaxed(0, piodma->engine + PIODMA_REG_10C);
-	apple_piodma_rmw(piodma->engine, PIODMA_CFG,
-			 PIODMA_CFG_ENABLE, PIODMA_CFG_ENABLE);
+	dev_info(piodma->dev,
+		 "J700_APCIE_PIODMA_APERTURES: cfg=%08x bank0=%08x/%08x bank1=%08x/%08x bank2=%08x/%08x bank3=%08x/%08x\n",
+		 readl(piodma->engine + PIODMA_CFG),
+		 readl(piodma->engine + PIODMA_REG_24),
+		 readl(piodma->engine + PIODMA_REG_F0),
+		 readl(piodma->engine + PIODMA_REG_28),
+		 readl(piodma->engine + PIODMA_REG_F4),
+		 readl(piodma->engine + PIODMA_REG_2C),
+		 readl(piodma->engine + PIODMA_REG_F8),
+		 readl(piodma->engine + PIODMA_REG_30),
+		 readl(piodma->engine + PIODMA_REG_FC));
 	wmb();
 	dev_info(piodma->dev,
-		 "J700_APCIE_PIODMA_HW_INIT_PASS: cfg=0x%08x enabled=1\n",
+		 "J700_APCIE_PIODMA_HW_INIT_PASS: cfg=0x%08x stop=0\n",
 		 readl_relaxed(piodma->engine + PIODMA_CFG));
 }
 
@@ -666,11 +707,9 @@ static int apple_piodma_probe(struct platform_device *pdev)
 					       piodma);
 	if (ret)
 		return ret;
-	if (!skip_hw_init)
-		apple_piodma_hw_init(piodma);
-	else
-		dev_info(dev,
-			 "J700_APCIE_PIODMA_HW_INIT_SKIPPED: domain=unmanaged sid=17 diagnostic=1\n");
+	dev_info(dev,
+		 "J700_APCIE_PIODMA_HW_INIT_DEFERRED: until=first-config-access skip=%u\n",
+		 skip_hw_init);
 	ret = apple_piodma_setup_unmanaged_domain(piodma);
 	if (ret)
 		return dev_err_probe(dev, ret,
