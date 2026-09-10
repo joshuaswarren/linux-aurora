@@ -14,6 +14,13 @@ This is an experimental fixed-profile debugfs encoder. General V4L2/FFmpeg
 hardware-encoder integration, HEVC, higher resolutions and sustained video
 throughput are not yet qualified. GPU rendering is independent of AVE.
 
+OBS Studio recording is now also qualified through the dedicated
+[`m5_ave_h264` adapter](obs/README.md): a ten-second MKV at 320x240/1 fps
+preserved the hardware's H.264 packets exactly and independently decoded
+at 51.4–54.3 dB PSNR against actual OBS input. This all-IDR test uses AVE
+for encoding and llvmpipe for OBS compositing; it does not qualify normal
+video frame rates or larger resolutions.
+
 ## Native Linux experiment
 
 `linux-ave/` contains the M5-specific module and device-tree supplement.

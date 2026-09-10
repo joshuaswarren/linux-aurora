@@ -1,0 +1,79 @@
+{
+  "date": "2026-09-10",
+  "passed": true,
+  "hardware": "Apple M5 / J813",
+  "kernel": "7.1.6-aurora-j813-desktop-v7",
+  "application": "OBS Studio 32.1.0",
+  "encoder": "m5_ave_h264",
+  "video_encoding": "Native M5 AVE hardware through experimental debugfs broker",
+  "obs_compositing": "llvmpipe",
+  "source": "Animated OBS color sources; actual OBS NV12 input",
+  "profile": {
+    "codec": "H.264",
+    "width": 320,
+    "height": 240,
+    "frames_per_second": 1,
+    "pixel_format": "NV12",
+    "container": "Matroska",
+    "all_idr": true,
+    "new_firmware_session_per_frame": true
+  },
+  "successful_recordings": 3,
+  "per_recording": {
+    "duration_seconds": 10,
+    "recorded_frames": 10,
+    "broker_encoded_obs_frames": 11,
+    "separate_hardware_warmup_frames": 1,
+    "firmware_commands": 72,
+    "input_dma_readback_verified": true,
+    "all_recorded_idr_slices_match_hardware_bytes": true,
+    "independent_ffmpeg_cpu_decode_passed": true,
+    "timestamps_match_obs_input": true,
+    "all_firmware_sessions_closed": true,
+    "command_failed": false
+  },
+  "final_recording": {
+    "sha256": "1e7d61a5d404b746957e6ce2724a96a2aeeae10c6c5a30aff5e28011dbfce266",
+    "distinct_recorded_input_images": 6,
+    "per_frame_psnr_db": [
+      53.67068279279057,
+      51.405415663039555,
+      53.93333943403548,
+      53.93333943403548,
+      53.93333943403548,
+      51.47032249107756,
+      51.47032249107756,
+      54.324138262099446,
+      54.324138262099446,
+      52.25792378028465
+    ]
+  },
+  "earlier_recording_sha256": [
+    "d5b254345076a4073cf6d3aa6001121bfaef2e4cacbd3d26aa2cdb85f7f00a1e",
+    "a61fdcc2455ddc9f174a45dd8a479595eb1fd00a5a314f9fa3b3145ec626b975"
+  ],
+  "final_regression_checks": {
+    "wifi_ping_transmitted": 5,
+    "wifi_ping_received": 5,
+    "bluetooth_controller_running": true,
+    "bluetooth_commands": 90,
+    "bluetooth_events": 90,
+    "bluetooth_tx_errors": 0,
+    "bluetooth_rx_errors": 0,
+    "bluetooth_pairing_or_audio_retested": false,
+    "keyboard_and_trackpad_registered": true,
+    "xfce_session_running": true,
+    "ave_commands": 235,
+    "ave_replies": 235,
+    "ave_command_failed": false
+  },
+  "qualification_limits": [
+    "Only the fixed 320x240 NV12 1 fps all-IDR profile is qualified",
+    "No normal-rate or higher-resolution video qualification",
+    "No general V4L2 encoder integration, HEVC or streaming qualification",
+    "OBS compositing remains software-rendered; this is not GPU acceleration proof",
+    "Desktop/window capture untested; the current fbdev session lacks XComposite",
+    "OBS reports delayed synthetic-source cleanup after recording; sources are destroyed at canvas shutdown",
+    "AVE buffers and module remain pinned until reboot"
+  ]
+}
