@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import runpy
 import struct
 
 REGIONS = ('gpu-region', 'gfx-shared-region', 'gfx-shared-l2-region',
@@ -89,7 +90,7 @@ def inspect_adt(adt):
     return regions, segments
 
 
-def prepare_gpu(u, iface, output):
+def prepare_gpu(u, iface, output, require_known_firmware=False):
     regions, segments = inspect_adt(u.adt)
     # The four loaded firmware segments sit below usable Linux RAM on M5.
     # Reserve DATA explicitly as well, and refuse a changed boot layout.
@@ -102,6 +103,10 @@ def prepare_gpu(u, iface, output):
         if len(payload) != segment['size'] or payload != iface.readmem(segment['base'], segment['size']):
             raise ValueError('Short or unstable GPU firmware capture')
         segment['sha256'] = hashlib.sha256(payload).hexdigest()
+        if require_known_firmware and segment['name'] == 'text':
+            qualify = runpy.run_path(str(Path(__file__).with_name(
+                'm5_firmware_identity.py')))['qualify_text']
+            segment['identity'] = qualify(segment['role'], payload)
         path = output / (segment['role'] + '-' + segment['name'] + '.bin')
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, 'wb') as stream:

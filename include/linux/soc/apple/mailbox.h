@@ -38,11 +38,11 @@ enum apple_mbox_ascwrap_v6_role {
  * @wrapper_size: size of the provider's ASCWrap window
  * @iop_vbar_start: CPU physical base of the provider's IOP VBAR window
  * @iop_vbar_size: size of the provider's IOP VBAR window
- * @missing: remaining provider lifecycle work; zero for T8140
+ * @missing: remaining provider lifecycle work; zero for T8140 and T8142
  *
  * The apple-mailbox provider owns both mappings.  Consumers request CPU
  * transitions through the provider and never map either resource themselves.
- * T8140 has a complete matching start and stop transform.  AppleA7IOP's
+ * T8140 and T8142 have a matching start and stop transform. AppleA7IOP's
  * resetState() only updates software state and performs no reset MMIO.
  */
 struct apple_mbox_ascwrap_v6_lifecycle {
