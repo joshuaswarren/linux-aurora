@@ -1627,6 +1627,311 @@ pub(crate) fn encode_m5_25g76_register_map(out: &mut [u8]) -> Result<(), Initdat
     Ok(())
 }
 
+pub(crate) const M5_25G76_HW_DATA_SIZE: usize = 0x2708;
+
+/// Native sharedDataDescriptor sizes loaded at AGXFirmware::allocFirmwareData
+/// +0x8b8 onwards from 25G76 __const 0xfffffe0007139820. The allocator rounds
+/// each next object to 64 bytes. These are independent allocations, not the
+/// overlapping views used while investigating T8140.
+pub(crate) const M5_25G76_SHARED_ALLOCATIONS: [(usize, usize); 7] = [
+    (0x0000, 0x2708), (0x2740, 0x0c18), (0x3380, 0x1048),
+    (0x4400, 0x0e10), (0x5240, 0x6a30), (0xbc80, 0x0068),
+    (0xbd00, 0x0800),
+];
+pub(crate) const M5_25G76_SHARED_PREFIX_SIZE: usize = 0xc500;
+pub(crate) const M5_25G76_AON_PTD_SIZE: usize = 0xe4;
+
+/// J813/25G76 AON PTD backing, captured twice before each role's handoff and
+/// unchanged after a passing Metal workload. The three recorded words are
+/// scoped to this platform's telemetry description; they are not generic
+/// M5 constants. The allocation and GPU binding must remain caller-owned.
+pub(crate) fn encode_m5_25g76_aon_ptd(out: &mut [u8]) -> Result<(), InitdataError> {
+    if out.len() != M5_25G76_AON_PTD_SIZE {
+        return Err(InitdataError::BufferSize);
+    }
+    out.fill(0);
+    put_u32(out, 0, 0x6730_5452);
+    put_u32(out, 4, 0x001d_0001);
+    put_u32(out, 8, 0x0000_1401);
+    Ok(())
+}
+
+/// Native independent primary status/config allocation sizes, from the
+/// 25G76 descriptors at 0xfffffe0007139880 / 0xfffffe0007139888.
+pub(crate) const M5_25G76_STATUS_CONFIG_SIZE: usize = 0x6a8;
+const M5_25G76_STATUS_CONFIG_WORDS: &[(usize, u32)] = &[
+    (0x010, 0x0000001f), (0x014, 0x3e0a3d71), (0x018, 0x401ae148),
+    (0x01c, 0x00000028), (0x020, 0x00000001), (0x0c8, 0x00002af8),
+    (0x0cc, 0x00001f40), (0x0d8, 0x41980000), (0x0dc, 0x3d0f5c28),
+    (0x0f0, 0x000026ac), (0x0f4, 0x000000c8), (0x108, 0x42c80000),
+    (0x10c, 0x43c80000), (0x110, 0x000000c8), (0x128, 0x00000001),
+    (0x12c, 0x00005eb0), (0x130, 0x3e800000), (0x134, 0x3f99999a),
+    (0x158, 0x0000000e), (0x1c0, 0x00000001), (0x1c4, 0x00000001),
+    (0x1c8, 0x00000002), (0x1cc, 0x00000001), (0x1d0, 0x00000001),
+    (0x1d4, 0x00000001), (0x1d8, 0x00000001), (0x588, 0x00000001),
+    (0x58c, 0x0000000a), (0x590, 0x00000dac), (0x594, 0x000003e8),
+    (0x598, 0x00000bb8), (0x59c, 0x000002bc), (0x5cc, 0x00000001),
+    (0x5d0, 0x00000004), (0x5dc, 0x00001f40), (0x5e0, 0x000000c8),
+    (0x5e4, 0x00000fa0), (0x5e8, 0x0000012c), (0x5ec, 0x000007d0),
+    (0x5f0, 0x0000012c), (0x5f4, 0x000003e8), (0x5f8, 0x0000012c),
+    (0x600, 0x00000001), (0x604, 0x41700000), (0x608, 0x40a00000),
+    (0x60c, 0x00000020), (0x610, 0x000004b0), (0x620, 0x0000044c),
+];
+
+/// Build the primary status object before either firmware role is started.
+/// Secondary root+0xb8 aliases status+0xe440. GFX1 copies that pointer to
+/// firmware global 0x176248 at text+0x211d4 and later writes config+0x670,
+/// +0x678 and +0x680 at text+0x1af94..0x1afc4. Those are firmware-owned
+/// runtime state, not platform constants, and must start at zero even when
+/// a primary pre-handoff capture (taken after secondary startup) has values.
+pub(crate) fn encode_m5_25g76_primary_status_b(
+    fwctl_state: u64,
+    fwctl_ring: u64,
+    out: &mut [u8],
+) -> Result<(), InitdataError> {
+    if out.len() != PRIMARY_STATUS_B_OBJECT_SIZE {
+        return Err(InitdataError::BufferSize);
+    }
+    required_address(fwctl_state)?;
+    required_address(fwctl_ring)?;
+    out.fill(0);
+    encode_status_block(&mut out[..STATUS_BLOCK_SIZE])?;
+    put_u64(out, PRIMARY_STATUS_B_FWCTL_STATE, fwctl_state);
+    put_u64(out, PRIMARY_STATUS_B_FWCTL_RING, fwctl_ring);
+    put_u32(out, PRIMARY_STATUS_B_CONFIG_HEADER, 1);
+    for &(offset, value) in M5_25G76_STATUS_CONFIG_WORDS {
+        put_u32(out, PRIMARY_STATUS_B_CONFIG_OFFSET + offset, value);
+    }
+    Ok(())
+}
+
+
+/// Caller-owned bindings in the power/performance policy allocation.
+/// The host stores mach_absolute_time() at policy+0x651c. Supply the live
+/// platform counter in its native timebase, never a captured timestamp.
+#[derive(Clone, Copy)]
+pub(crate) struct M5PolicyBindings {
+    pub state: u64,
+    pub aon_ptd: u64,
+    pub boot_timestamp: u64,
+}
+
+/// Pre-handoff J813/25G76 scalars, identical across two cold boots after
+/// removing owned pointers and the native boot timestamp. The repeated
+/// 512-entry u16 table is encoded separately. Calibration fields whose
+/// meanings remain unknown are scoped to this measured ten-core target.
+const M5_25G76_POLICY_WORDS: &[(usize, u32)] = &[
+    (0x3d98, 0xffffffff), (0x3db0, 0xffffffff), (0x5244, 0x00030d40),
+    (0x5248, 0x00030d40), (0x5250, 0x00000004), (0x5254, 0x3f800000),
+    (0x526c, 0x00000001), (0x5270, 0x00000001), (0x5280, 0x00000064),
+    (0x5284, 0x00000001), (0x5288, 0x000004b0), (0x5290, 0x00000064),
+    (0x52a0, 0x00000004), (0x52a4, 0x3f800000), (0x52ac, 0x00000001),
+    (0x52b0, 0x00000001), (0x52c0, 0x00000064), (0x52c4, 0x00000001),
+    (0x52c8, 0x000004b0), (0x52d0, 0x00000064), (0x5300, 0x3f828f5c),
+    (0x5304, 0x3f828f5c), (0x5308, 0x3f828f5c), (0x530c, 0x3f828f5c),
+    (0x5310, 0x3f828f5c), (0x5314, 0x3f828f5c), (0x5318, 0x3f828f5c),
+    (0x531c, 0x3f828f5c), (0x5320, 0x3f828f5c), (0x5324, 0x3f828f5c),
+    (0x5328, 0x3f828f5c), (0x532c, 0x3f828f5c), (0x5330, 0x3f828f5c),
+    (0x5bf8, 0x00000271), (0x5c04, 0x3f7f2e9f), (0x5c0c, 0x3b516154),
+    (0x5c14, 0x3ca59586), (0x5c20, 0x46bd6000), (0x5c24, 0x40a90fe4),
+    (0x5c2c, 0xbd4ac5b4), (0x5c30, 0x00000028), (0x5c34, 0x000004b0),
+    (0x5c38, 0x000004b0), (0x5c44, 0x00005eb0), (0x5c78, 0x000004b0),
+    (0x5cb0, 0x00000008), (0x5cbc, 0x3f000000), (0x5cc4, 0x3f000000),
+    (0x5ccc, 0x3f99999a), (0x5cd8, 0x47800000), (0x5cdc, 0x3e800000),
+    (0x5ce8, 0x00000028), (0x5cec, 0x000004b0), (0x5cfc, 0x00005eb0),
+    (0x5d08, 0x00000010), (0x5d10, 0x0005dc00), (0x5d68, 0x0000004a),
+    (0x5d70, 0x0000005a), (0x5d74, 0x00000032), (0x5d78, 0x00000006),
+    (0x5d80, 0x00000006), (0x5d84, 0x00000001), (0x5d8c, 0x3f4ccccd),
+    (0x5d90, 0x3f7eb852), (0x5d94, 0x3e4ccccd), (0x5d98, 0x3ba3d70a),
+    (0x5d9c, 0x3f144b3c), (0x5da0, 0x3f144b3c), (0x5da8, 0x42be0000),
+    (0x5dac, 0x4029eb85), (0x5db0, 0x4029eb85), (0x5db4, 0x4139435e),
+    (0x5db8, 0x00000064), (0x5dbc, 0x000004b0), (0x5dc0, 0x00000064),
+    (0x5dcc, 0x0000004a), (0x5dd4, 0x00000001), (0x5e00, 0x00000064),
+    (0x5e20, 0x00000401), (0x5e24, 0x00006400), (0x5e2c, 0x001f4000),
+    (0x5e30, 0x0000c800), (0x5e34, 0x000fa000), (0x5e38, 0x00012c00),
+    (0x5e3c, 0x0007d000), (0x5e40, 0x00012c00), (0x5e44, 0x0003e800),
+    (0x5e48, 0x00012c00), (0x5e4c, 0x00000100), (0x5ea4, 0x00000001),
+    (0x5ed0, 0x00000001), (0x74d8, 0x47800000), (0x74dc, 0x42200000),
+    (0x74e0, 0x44960000), (0x74e4, 0x0000062a), (0x74f8, 0x00000028),
+    (0x7500, 0x42c80000), (0x7504, 0x000004b0), (0x750c, 0x3f4ccccd),
+    (0x7510, 0x3e4ccccd), (0x7550, 0xdcdcfbfa), (0x7558, 0x00001f40),
+    (0x7560, 0x00000004), (0x7574, 0x3f800000), (0x757c, 0x3d0f5c28),
+    (0x7588, 0x47800000), (0x758c, 0x41980000), (0x7598, 0x00000028),
+    (0x759c, 0x000004b0), (0x75a0, 0x000004b0), (0x75ac, 0x00002af8),
+    (0x75e0, 0x000004b0), (0x77f8, 0x00000002), (0x77fc, 0x42000006),
+    (0x7a10, 0xb8520000), (0x7a14, 0x00003f7e), (0x7a18, 0xd70a0000),
+    (0x7a1c, 0x00003ba3), (0x7a24, 0x000043c8), (0x7a30, 0x00004780),
+    (0x7a34, 0x000042c8), (0x7a3c, 0x0384bac8), (0x7a40, 0x03e80000),
+    (0x7a44, 0x03e80000), (0x7a4c, 0x80000000), (0x7a50, 0x26ac453b),
+    (0x7a84, 0x03e80000), (0x7aa0, 0x00c80000), (0x7b58, 0x000004b0),
+    (0x7b6c, 0x00000001), (0x7ba0, 0x00000101), (0x7ba4, 0x00000200),
+    (0x7bbc, 0x00023f00), (0x7bc0, 0x00000100), (0x7bc4, 0x00000100),
+    (0x7bdc, 0x00024000), (0x7be0, 0x00000100), (0x7be4, 0x00000100),
+    (0x7bfc, 0x00024100), (0x7c48, 0x00000001), (0x7c50, 0x00005eb0),
+    (0x7c54, 0x00005eb0), (0x7c58, 0x00005eb0), (0x7c68, 0x3f800000),
+    (0x7c6c, 0x00000004), (0x7c70, 0x00000008), (0x7c74, 0x0002ee00),
+    (0x7d44, 0x0000007c), (0x7d50, 0x3f77bdef), (0x7d58, 0x3d042108),
+    (0x7d60, 0x3e0a3d71), (0x7d6c, 0x47800000), (0x7d70, 0x401ae148),
+    (0x7d7c, 0x00000028), (0x7d80, 0x000004b0), (0x7d84, 0x000004b0),
+    (0x7d8c, 0x46bd6000), (0x7d90, 0x00005eb0), (0x7d9c, 0x000000f8),
+    (0x7da4, 0x005ad200), (0x7dc4, 0x000004b0), (0x7e04, 0x00000001),
+    (0x7ed4, 0x00000032), (0x7ed8, 0x00000001), (0x7ee0, 0x3f638e39),
+    (0x7ee4, 0x3f2aaaab), (0x7ee8, 0x3de38e39), (0x7eec, 0x3eaaaaab),
+    (0x7ef0, 0xbecccccd), (0x7ef4, 0xbf4ccccd), (0x7efc, 0x47800000),
+    (0x7f00, 0xc0a00000), (0x7f04, 0xc0a00000), (0x7f0c, 0x00000064),
+    (0x7f10, 0x000004b0), (0x7f14, 0x00000064), (0x7f1c, 0x45fa0000),
+    (0x7f20, 0x00000578), (0x7f28, 0x0000000e), (0x7f2c, 0x00000048),
+    (0x7f30, 0x00000018), (0x7f34, 0x001a5e00), (0x7f3c, 0x0008ca00),
+    (0x7f48, 0x47800000), (0x7f70, 0x00001f40), (0x7f74, 0x00000004),
+    (0x7f78, 0x000009c4), (0x7f7c, 0x00000258), (0x7f80, 0x00000002),
+    (0x7f84, 0x00000004), (0x7f88, 0x00000032), (0x7fb8, 0x47800000),
+    (0x7fc8, 0x00000028), (0x7fcc, 0x000004b0), (0x8098, 0x00000001),
+    (0x80ac, 0x0000000a), (0x80b8, 0x00000001), (0x8174, 0xac000000),
+    (0x8178, 0xe800000d), (0x817c, 0xb8000003), (0x8180, 0xb000000b),
+    (0x8184, 0xb0000004), (0x8188, 0xbc000004), (0x818c, 0x20000002),
+    (0x8198, 0x00000001), (0x81b4, 0x00000004), (0x81c0, 0x3f780000),
+    (0x81c8, 0x3d000000), (0x81d0, 0x40a00000), (0x81dc, 0x47800000),
+    (0x81e0, 0x41700000), (0x81ec, 0x0000044c), (0x81f0, 0x000004b0),
+    (0x81f4, 0x000004b0), (0x8200, 0x000004b0), (0x8234, 0x000004b0),
+    (0x827c, 0x00000064), (0x8290, 0xdcdcfbfa), (0x8298, 0x0000007d),
+    (0x829c, 0x00000001), (0x8ee0, 0xdcdcfbfb), (0x8ee8, 0x00000001),
+    (0xaeec, 0x41c80000), (0xaef0, 0x41c80000), (0xb6a8, 0x67305452),
+    (0xb6e8, 0x00000001), (0xb728, 0x5243464c), (0xb72c, 0x4758464c),
+    (0xb738, 0x47584c50), (0xb748, 0x00000001), (0xb7a8, 0x00000001),
+    (0xb7b4, 0x42b73333), (0xb7f4, 0x449b8000), (0xb834, 0x42bc0000),
+    (0xb8e0, 0x0000186a),
+];
+
+/// Initialize the six allocations following M5 hardware-data. Preserve the
+/// hardware block and subsequent channel resources. No firmware is started.
+pub(crate) fn encode_m5_25g76_bundle_policy(
+    bindings: M5PolicyBindings,
+    out: &mut [u8],
+) -> Result<(), InitdataError> {
+    if out.len() < M5_25G76_SHARED_PREFIX_SIZE {
+        return Err(InitdataError::BufferSize);
+    }
+    required_address(bindings.state)?;
+    required_address(bindings.aon_ptd)?;
+    let state_end = bindings.state.checked_add(STATUS_BLOCK_SIZE as u64)
+        .ok_or(InitdataError::AddressOutOfRange)?;
+    let aon_end = bindings.aon_ptd.checked_add(M5_25G76_AON_PTD_SIZE as u64)
+        .ok_or(InitdataError::AddressOutOfRange)?;
+    required_address(state_end - 1)?;
+    required_address(aon_end - 1)?;
+    if bindings.state < aon_end && bindings.aon_ptd < state_end {
+        return Err(InitdataError::PairAliasedObject);
+    }
+    out[0x2740..M5_25G76_SHARED_PREFIX_SIZE].fill(0);
+    for &(offset, value) in M5_25G76_POLICY_WORDS {
+        put_u32(out, offset, value);
+    }
+    for index in 0..512 {
+        put_u16(out, 0x6ed7 + index * 2, 0x7fff);
+    }
+    put_u64(out, 0x8ed8, bindings.state);
+    put_u64(out, 0xb6a0, bindings.aon_ptd);
+    put_u64(out, 0xb75c, bindings.boot_timestamp);
+    Ok(())
+}
+
+
+/// Recorded platform words outside the explicit register, performance and
+/// owned-pointer fields. Meanings not yet derived are deliberately kept as
+/// target-scoped measured values. Never insert runtime completion counters
+/// or captured allocation addresses here. Reference hardware-data SHA-256:
+/// 6f9ac0c4664f898a0ddb4e5df9ad160a23c1b52d3fd750750779cbdebe446be9.
+const M5_25G76_HW_PLATFORM_WORDS: &[(usize, u32)] = &[
+    (0x0004, 0x0000006f), (0x0008, 0xffc00000), (0x0014, 0x00000010),
+    (0x001c, 0x00000010), (0x0020, 0xffff8000), (0x0024, 0x000002ff),
+    (0x0028, 0x81400000), (0x002c, 0xfffffc21), (0x00e0, 0x00002008),
+    (0x00e8, 0x20080000), (0x00f4, 0x00002008), (0x00f8, 0x000024cb),
+    (0x00fc, 0xc98a2cfa), (0x0100, 0xf4f624cb), (0x0104, 0x1877e917),
+    (0x0108, 0x38d924cb), (0x010c, 0xbdab0000), (0x02d8, 0xfff82000),
+    (0x02dc, 0xd32d2cdb), (0x02e0, 0xf5002000), (0x02e4, 0x21dae926),
+    (0x02e8, 0x38b62000), (0x02ec, 0xc7420008), (0x03e0, 0x00007fe0),
+    (0x03e8, 0x7fe00000), (0x03f4, 0x00007fe0), (0x03f8, 0x00008000),
+    (0x0400, 0x80000000), (0x040c, 0x00008000), (0x05d8, 0x4b232645),
+    (0x05dc, 0x00000e98), (0x05e0, 0xd5a2ea5f), (0x05e4, 0x40003fff),
+    (0x05e8, 0xca5e4000), (0x05ec, 0x4000f5a2), (0x0e90, 0x00008142),
+    (0x0e94, 0x00000002), (0x0ea0, 0x00000001), (0x0ea4, 0x00000001),
+    (0x0eb8, 0x00000001), (0x0ec0, 0x00000001), (0x0ec8, 0x00000001),
+    (0x0ed0, 0x00005dc0), (0x0ed4, 0x00000001), (0x0ed8, 0x00000008),
+    (0x0ee0, 0x00000001), (0x0ee4, 0x00000001), (0x0ee8, 0x00000001),
+    (0x0f04, 0x0000001f), (0x0f24, 0x07800004), (0x0f28, 0x00000006),
+    (0x0f34, 0x00000001), (0x0f38, 0x00000001), (0x0f4c, 0x00000031),
+    (0x0f6c, 0x00000001), (0x0f88, 0x0000000a), (0x0f8c, 0x00000001),
+    (0x0fac, 0x00000001), (0x0fb8, 0x00000020), (0x0fbc, 0x00000005),
+    (0x0fc0, 0x0000000a), (0x0fc4, 0x0000000c), (0x2544, 0x00000004),
+    (0x2548, 0x00000006), (0x254c, 0x00000003), (0x2550, 0x00000007),
+    (0x2554, 0x00000007), (0x2568, 0x0000000a), (0x2570, 0x00000001),
+    (0x258c, 0x00180000), (0x2594, 0x00000001), (0x2598, 0x00000001),
+    (0x259c, 0x00000001), (0x25a4, 0x00000001), (0x25a8, 0x00000001),
+    (0x25ac, 0x00000001), (0x25b4, 0xffffffff), (0x25b8, 0xffffffff),
+    (0x25bc, 0xffffffff), (0x25c0, 0xffffffff), (0x25c4, 0xffffffff),
+    (0x25c8, 0xffffffff), (0x25cc, 0xffffffff), (0x25d0, 0xffffffff),
+    (0x25d4, 0xffffffff), (0x25d8, 0xffffffff), (0x25dc, 0xffffffff),
+    (0x25e0, 0xffffffff), (0x25f4, 0x00000001), (0x2600, 0x00000001),
+    (0x2608, 0x00000001), (0x2610, 0x00000100), (0x26b4, 0x00000001),
+    (0x26b8, 0x00000001), (0x26e0, 0x000003e8), (0x26e8, 0x00000001),
+];
+
+/// Reconstruct the M5 reference hardware-data block with caller-owned queue
+/// and QoS bindings. Performance values are measured on the ten-core J813
+/// reference, not derived from ADT and not a generic M5 power configuration.
+/// Both pre-handoff firmware roles supplied identical reference bytes.
+/// This encoder grants no runtime admission and performs no MMIO accesses.
+pub(crate) fn encode_m5_25g76_hw_data(
+    aliases: [G17PKsmCompletionAliases; M5_25G76_COMPLETION_QUEUE_COUNT],
+    qos_high: u64,
+    out: &mut [u8],
+) -> Result<(), InitdataError> {
+    if out.len() != M5_25G76_HW_DATA_SIZE {
+        return Err(InitdataError::BufferSize);
+    }
+    required_address(qos_high)?;
+    let qos_end = qos_high.checked_add(0xe40).ok_or(InitdataError::AddressOutOfRange)?;
+    required_address(qos_end - 1)?;
+    let mut completion = [0; 0x80];
+    encode_m5_25g76_completion_table(aliases, &mut completion)?;
+    for alias in aliases {
+        if qos_high < alias.high + M5_25G76_COMPLETION_BACKING_SIZE as u64
+            && alias.high < qos_end {
+            return Err(InitdataError::PairAliasedObject);
+        }
+    }
+
+    out.fill(0);
+    for &(offset, value) in M5_25G76_HW_PLATFORM_WORDS {
+        put_u32(out, offset, value);
+    }
+    encode_m5_25g76_register_map(&mut out[0x640..0xe88])?;
+    out[0x2614..0x2694].copy_from_slice(&completion);
+    put_u64(out, 0x26ac, qos_high);
+
+    // Native includes index zero plus twelve operating points. Each voltage
+    // occupies all sixteen lanes of its 0x40-byte state row.
+    const FREQUENCY: [u32; 13] = [0, 338, 486, 636, 796, 888, 988, 1084, 1182, 1278, 1374, 1470, 1578];
+    const CORE_VOLTAGE: [u32; 13] = [125, 615, 630, 660, 705, 735, 755, 800, 830, 865, 905, 945, 1010];
+    const MEMORY_VOLTAGE: [u32; 13] = [770, 770, 770, 770, 770, 770, 770, 800, 830, 865, 905, 945, 1010];
+    const RELATIVE_A: [u32; 13] = [0, 17, 23, 30, 42, 50, 58, 71, 82, 85, 89, 93, 100];
+    const RELATIVE_B: [u32; 13] = [0, 0, 11, 24, 36, 44, 52, 60, 68, 75, 83, 91, 100];
+    for index in 0..13 {
+        put_u32(out, 0xfc8 + index * 4, FREQUENCY[index]);
+        put_u32(out, 0x1848 + index * 4, 0x3f828f5c);
+        put_u32(out, 0x18c8 + index * 4, RELATIVE_A[index]);
+        put_u32(out, 0x1908 + index * 4, RELATIVE_B[index]);
+        for lane in 0..16 {
+            put_u32(out, 0x1008 + index * 0x40 + lane * 4, CORE_VOLTAGE[index]);
+            put_u32(out, 0x1408 + index * 0x40 + lane * 4, MEMORY_VOLTAGE[index]);
+        }
+    }
+    for index in 0..16 {
+        put_u32(out, 0x19c8 + index * 4, index as u32);
+    }
+    Ok(())
+}
+
 /// T8140 register windows mapped into the firmware MMIO aperture.
 pub(crate) const T8140_REGISTER_WINDOWS: [RegisterWindow; 18] = [
     RegisterWindow {

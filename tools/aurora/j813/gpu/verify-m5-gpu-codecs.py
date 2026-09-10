@@ -96,6 +96,11 @@ def main():
     code_hash = hashlib.sha256(code).hexdigest()
     if code_hash != 'fb321b76a31d693b3c0ebbeb3a93963e3c0f587be0176e20484833946ce74148':
         raise ValueError('M5 25G76 host reset routine differs from the inspected code')
+    native_sizes = struct.unpack('<7Q', read_va(args.kext.read_bytes(), 0xfffffe0007139820, 56))
+    if native_sizes != (0x2708, 0xc18, 0x1048, 0xe10, 0x6a30, 0x68, 0x800):
+        raise ValueError('M5 shared allocation descriptor sizes changed')
+    if struct.unpack('<2Q', read_va(args.kext.read_bytes(), 0xfffffe0007139880, 16)) != (0xe440, 0x6a8):
+        raise ValueError('M5 status/config allocation sizes changed')
     source = (driver / 'g17_submission.rs').read_text()
     items = [rust_item(source, n) for n in ('put_u32_le', 'put_u64_le',
               'encode_m5_25g76_channel_state_reset', 'apply_g17_uncached_channel_reset')]
@@ -126,17 +131,121 @@ fn main() {
         let raw = std::fs::read(p.join("root.bin")).unwrap();
         let main = std::fs::read(p.join("main-config.bin")).unwrap();
         let hardware = std::fs::read(p.join("shared-cluster.bin")).unwrap();
+        if p.join("aon-ptd.bin").exists() {
+            let mut aon = vec![0xa5; M5_25G76_AON_PTD_SIZE];
+            encode_m5_25g76_aon_ptd(&mut aon).unwrap();
+            assert_eq!(aon, std::fs::read(p.join("aon-ptd.bin")).unwrap());
+        }
+        let mut next = 0usize;
+        for (offset, size) in M5_25G76_SHARED_ALLOCATIONS {
+            assert_eq!(offset, next);
+            next = (offset + size + 63) & !63;
+        }
+        assert_eq!(next, M5_25G76_SHARED_PREFIX_SIZE);
+        let bindings = M5PolicyBindings { state: word(&hardware, 0x8ed8),
+            aon_ptd: word(&hardware, 0xb6a0), boot_timestamp: word(&hardware, 0xb75c) };
+        let mut policy = vec![0xa5; hardware.len()];
+        encode_m5_25g76_bundle_policy(bindings, &mut policy).unwrap();
+        assert_eq!(&policy[0x2740..M5_25G76_SHARED_PREFIX_SIZE],
+                   &hardware[0x2740..M5_25G76_SHARED_PREFIX_SIZE]);
+        assert!(policy[..0x2740].iter().all(|&v| v == 0xa5));
+        assert!(policy[M5_25G76_SHARED_PREFIX_SIZE..].iter().all(|&v| v == 0xa5));
+        let policy_before = policy.clone();
+        let collision = M5PolicyBindings { aon_ptd: bindings.state + 0x40, ..bindings };
+        assert_eq!(encode_m5_25g76_bundle_policy(collision, &mut policy),
+                   Err(InitdataError::PairAliasedObject));
+        assert_eq!(policy, policy_before);
+        let relocated = M5PolicyBindings { state: 0xfffffc2008000000,
+            aon_ptd: 0xfffffc2009000000, boot_timestamp: 0x1234567890 };
+        encode_m5_25g76_bundle_policy(relocated, &mut policy).unwrap();
+        assert_eq!(word(&policy, 0x8ed8), relocated.state);
+        assert_eq!(word(&policy, 0xb6a0), relocated.aon_ptd);
+        assert_eq!(word(&policy, 0xb75c), relocated.boot_timestamp);
+        let mut region_c = vec![0; REGION_C_SIZE];
+        encode_region_c_for_profile(RootProfile::J813G17G25G76, &mut region_c).unwrap();
+        assert_eq!(region_c, std::fs::read(p.join("region-c.bin")).unwrap(),
+                   "M5 region C differs from pre-handoff capture");
+        let mut status_a = vec![0; STATUS_BLOCK_SIZE];
+        encode_status_block(&mut status_a).unwrap();
+        assert_eq!(status_a, std::fs::read(p.join("status-a.bin")).unwrap());
+        if index == 1 {
+            let mut extra = vec![0; STATUS_BLOCK_SIZE];
+            encode_secondary_root_extra_1_for_profile(RootProfile::J813G17G25G76, &mut extra).unwrap();
+            assert_eq!(extra, std::fs::read(p.join("secondary-extra-1.bin")).unwrap());
+        } else {
+            let mut native_status = std::fs::read(p.join("status-b.bin")).unwrap();
+            let mut status = vec![0xa5; PRIMARY_STATUS_B_OBJECT_SIZE];
+            encode_m5_25g76_primary_status_b(word(&native_status, PRIMARY_STATUS_B_FWCTL_STATE),
+                word(&native_status, PRIMARY_STATUS_B_FWCTL_RING), &mut status).unwrap();
+            // GFX1 writes these after its own handoff. A primary capture can
+            // occur later, so compare only the pre-start host-owned state.
+            native_status[0xeab0..0xeac4].fill(0);
+            assert_eq!(status, native_status);
+            let secondary_extra = std::fs::read(std::path::Path::new(&args[2])
+                .join("secondary-extra-0.bin")).unwrap();
+            assert_eq!(&status[0xe440..0xe4c0], &secondary_extra);
+        }
+        for name in ["region-a.bin", "qos.bin", "completion-0.bin", "completion-1.bin",
+                     "completion-2.bin", "completion-3.bin"] {
+            let zeroed = p.join(name);
+            // Earlier captures did not include the completion/QoS backing.
+            if zeroed.exists() {
+                assert!(std::fs::read(zeroed).unwrap().iter().all(|&v| v == 0),
+                        "M5 pre-handoff backing was not zero-initialized: {name}");
+            }
+        }
         let mut registers = vec![0; HW_REGISTER_MAP_SLOTS * HW_REGISTER_MAP_ENTRY_SIZE];
         encode_m5_25g76_register_map(&mut registers).unwrap();
         assert_eq!(&registers, &hardware[HW_REGISTER_MAP_OFFSET..HW_REGISTER_MAP_OFFSET + registers.len()],
                    "M5 register table differs from pre-handoff hardware evidence");
         assert_eq!(encode_m5_25g76_register_map(&mut registers[..0x100]), Err(InitdataError::BufferSize));
+        let mut aliases = [G17PKsmCompletionAliases {low: 0, high: 0}; 4];
+        for (i, alias) in aliases.iter_mut().enumerate() {
+            *alias = G17PKsmCompletionAliases { low: word(&hardware,0x2614+i*32),
+                                             high: word(&hardware,0x261c+i*32) };
+        }
+        let mut completion = [0xa5; 0x80];
+        encode_m5_25g76_completion_table(aliases, &mut completion).unwrap();
+        assert_eq!(&completion, &hardware[0x2614..0x2694]);
+        let mut overlapping = aliases;
+        overlapping[3].high = overlapping[0].high + 0x4000;
+        let before = completion;
+        assert_eq!(encode_m5_25g76_completion_table(overlapping, &mut completion),
+                   Err(InitdataError::PairAliasedObject));
+        assert_eq!(completion, before, "invalid aliases partially rewrote the table");
+        let mut overflowing = aliases;
+        overflowing[3].high = u64::MAX - 0x4000;
+        assert_eq!(encode_m5_25g76_completion_table(overflowing, &mut completion),
+                   Err(InitdataError::AddressOutOfRange));
+        assert_eq!(completion, before);
+        let mut rebuilt_hardware = vec![0; M5_25G76_HW_DATA_SIZE];
+        encode_m5_25g76_hw_data(aliases, word(&hardware,0x26ac), &mut rebuilt_hardware).unwrap();
+        assert_eq!(rebuilt_hardware, hardware[..M5_25G76_HW_DATA_SIZE],
+                   "M5 hardware-data differs from pre-handoff capture");
+        let hardware_before = rebuilt_hardware.clone();
+        assert_eq!(encode_m5_25g76_hw_data(aliases, aliases[0].high, &mut rebuilt_hardware),
+                   Err(InitdataError::PairAliasedObject));
+        assert_eq!(rebuilt_hardware, hardware_before);
         let role = if index == 0 { InstanceRole::Primary } else { InstanceRole::Secondary };
         let shared = SharedAddresses { region_a: word(&raw, 8), region_c: word(&raw, 0x20),
             hw_data_bundle: word(&main, 0), hw_data_bundle_alloc: 0x28000 };
         let instance = InstanceAddresses { root: 0xfffffc20001a8000 + index as u64 * 0x8000,
             main_config: word(&raw, 0x18), status_a: word(&raw, 0xa8), status_b: word(&raw, 0xb0),
             secondary_extras: if index == 0 { [0, 0] } else { [word(&raw,0xb8), word(&raw,0xc0)] } };
+        let mut channels = [ChannelEntry::EMPTY; CHANNEL_TABLE_ENTRIES];
+        for (i, channel) in channels.iter_mut().enumerate() {
+            let offset = 0x20 + i * 32;
+            *channel = ChannelEntry {
+                states: [word(&main,offset), word(&main,offset+8), word(&main,offset+16)],
+                ring: word(&main,offset+24),
+            };
+        }
+        let views = PrimaryRegionViews { sentinel_high: word(&main,0x2d0),
+            alias_high: [word(&main,0x2e0),word(&main,0x2f0)] };
+        let mut rebuilt_main = vec![0; MAIN_CONFIG_SIZE];
+        encode_main_config_for_profile(RootProfile::J813G17G25G76, role, &shared,
+            &instance, &channels, if index == 0 {Some(&views)} else {None}, &mut rebuilt_main).unwrap();
+        assert_eq!(rebuilt_main, main, "M5 main configuration differs from pre-handoff capture");
         let mut encoded = vec![0; raw.len()];
         encode_root_for_profile(RootProfile::J813G17G25G76, role, &shared, &instance, &mut encoded).unwrap();
         assert_eq!(encoded, raw, "M5 root differs from the actual pre-handoff capture");
@@ -177,7 +286,13 @@ fn main() {
         assert actual[:0xc0] == cached, 'Linux reset differs from emulated M5 host instructions'
         assert actual[0xc0:] == uncached[:0x64], 'Uncached stores differ from M5 host instructions'
         assert uncached[0x64:] == bytes([0x5a]) * (0x80 - 0x64)
-    print(json.dumps(dict(roots_matched=2, register_table_slots_matched=53,
+    print(json.dumps(dict(roots_matched=2, main_configs_matched=2, hardware_data_blocks_matched=2,
+                         bundle_policy_blocks_matched=2, native_allocation_sizes_verified=7,
+                         region_c_blocks_matched=2, status_a_blocks_matched=2,
+                         secondary_extra_1_blocks_matched=1,
+                         primary_status_host_fields_matched=1, secondary_extra_0_alias_matched=1,
+                         aon_ptd_blocks_matched=sum((p / 'aon-ptd.bin').exists() for p in captures),
+                         completion_queue_descriptors_matched=4, register_table_slots_matched=53,
                          register_table_captures_matched=2, cross_target_version_rejections=4,
                          reset_cases_matched=32, m5_cached_record_bytes=0xc0,
                          host_reset_code_sha256=code_hash, linux_runtime_admitted=False), indent=2))
