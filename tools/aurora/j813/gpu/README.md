@@ -3,13 +3,22 @@
 The native Linux candidate identifies the physical T8142 GPU as
 **G17G revision C0, one die, one cluster, ten active cores**. Both M5 GPU
 firmware processors now complete RTKit startup and acknowledge Linux-owned
-initialization data in the native RAM-boot experiment. It does not yet
+initialization data in the native RAM-boot experiment. Linux also registers
+an owned SKSM compute queue and verifies the firmware's retained record.
+It does not yet
 execute GPU work or expose a render node. DCP presentation is a later,
 independent qualification; neither a software desktop nor encoder success
 is evidence of GPU rendering.
 
 ## Hardware evidence, 2026-09-10
 
+- A fresh RAM boot with `m5_initdata_test=3` registered SKSM queue 11 using
+  one tag-15 configuration. The outer and inner counters each advanced to
+  `[1, 1, 1]`; the firmware DATA record changed from zero to
+  `[1, fffffc2000390000, 70005f0000, 400000000, 2]`. This independently
+  verifies both aliases, priority 2 and compute data master 2. The probe
+  submitted no kick, shader, scheduler binding or context update. Both
+  firmware stop requests succeeded and all owners remain pinned.
 - A fresh RAM boot with the exact T8142 ASCWrap-v6 providers completed both
   roles' HELLO/EPMAP exchanges: protocol 12, endpoints 0, 1, 32 and 33.
   Each provider delivered three receive interrupts through AIC3. GFX1 was
@@ -128,7 +137,8 @@ separate generic configuration function missed that path. The production
 `m5_channel.rs` writer matches all 134 configuration bytes, independently
 taking queue fields, descriptor flags and the scheduler pointer from their
 native owners. Remaining event/owner values are opaque inputs. Disabled event
-sentinels also follow the native branch. First-bind execution remains untested.
+sentinels also follow the native branch. Queue installation now passes on
+Linux; scheduler/context first-bind execution remains untested.
 
 `verify-m5-channel.py` checks that byte match against a private capture.
 `test-m5-sksm-capture.py` checks capture guards, filtered submissions and
@@ -151,7 +161,8 @@ A matching-completion capture also shows exactly one 24-byte outer CL entry
 published and consumed in priority 2: the cached queue pointer, data master 2,
 head 3, queue ID and start flag match the controlled job. The firmware's own
 tag-15 install branch retains the queue aliases and programs SKSM hardware.
-Linux queue installation and job execution still require a retained runtime.
+The retained Linux mode-3 experiment now exercises that queue-install branch.
+Job execution and completion handling remain unqualified.
 
 ## Source construction and M5 differences
 
@@ -236,6 +247,16 @@ fresh boot of the same payload. After both acknowledgments it sends one
 native power-transition-end message to GFX, then GFX1, and checks both
 control queues consumed their opening records. It adds no queue records
 or GPU commands and retains the same stop-and-pin lifecycle.
+
+For the queue-install stage, use `modprobe asahi m5_initdata_test=3` on a
+fresh boot. It constructs all owned queue backing before publishing initdata,
+then retires the control openings and publishes one tag-15 record through
+CL priority 2 with doorbell `0x008300000000000a`. Scheduler and context
+updates are disabled. `run-m5-queue-install-probe.py` captures the console
+and requires both consumed counters and the firmware-owned queue record.
+Reserved firmware DATA uses its normal WB RAM mapping with read-only cache
+invalidation before observation; a WC alias of System RAM is invalid.
+The same stop-and-pin lifecycle applies. This test submits no GPU job.
 
 The firmware handoff page is observed to remain zero in macOS. The M5-only
 no-peer handoff path has now passed initialization; it does not establish
@@ -325,7 +346,7 @@ bounds before producing a result. `verify-m5-sksm.py` matches four native
 entries byte-for-byte, their packed 21-byte tag-14 records, and the separately
 captured producer stamp/count. Variable command operands come from captures;
 this validates serialization, not shader execution or Linux queue ownership.
-The runtime must still construct command backing, register the queue,
+The runtime must still construct command backing, bind its scheduler/context,
 publish in native order and process completion before submitting Linux work.
 
 `trace-m5-sksm-submit.py` captures one such submission on an existing paused
