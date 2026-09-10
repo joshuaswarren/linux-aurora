@@ -51,11 +51,27 @@
     "shared_cluster_bytes": 163840,
     "shared_clusters_identical": true,
     "cold_boots_compared": 4,
-    "metal_runs_passed": 8,
+    "metal_runs_passed": 10,
     "command_queues_per_run": 3,
     "compute_values_per_run": 3072,
     "render_pixels_per_run": 12288,
     "linux_gpu_proven": false
+  },
+  "macos_sksm_submission": {
+    "build": "25G76",
+    "capture_site": "AGXCLChannelSKSM::submitBuffer before tag-14 publication",
+    "native_instruction_bytes_checked": true,
+    "tag14_data_master": 2,
+    "host_queue_bytes": 176,
+    "kick_ring_bytes": 131072,
+    "kick_entry_count": 256,
+    "kick_entry_stride": 512,
+    "all_object_double_reads_match": true,
+    "ring_read_through_firmware_global_alias": true,
+    "cpu_ring_view_unmapped_at_capture": true,
+    "capture_tied_to_specific_metal_command": false,
+    "host_capture_tests_passed": 4,
+    "linux_submission_qualified": false
   },
   "source_codecs": {
     "full_shared_cluster_bytes_matched": 163840,
