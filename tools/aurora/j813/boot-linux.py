@@ -30,6 +30,9 @@ if len(selected) > 1:
 flavor = selected[0] if selected else None
 gpu = flavor == 'gpu'
 gpu_rtkit_probe = '--gpu-rtkit-probe' in sys.argv
+gpu_initdata = '--gpu-initdata' in sys.argv
+if gpu_initdata and (not gpu or gpu_rtkit_probe):
+    raise ValueError('--gpu-initdata requires --gpu and excludes --gpu-rtkit-probe')
 if gpu_rtkit_probe and not gpu:
     raise ValueError('--gpu-rtkit-probe requires --gpu')
 video = flavor in ('video', 'video-v4l2', 'gpu')
@@ -39,7 +42,7 @@ artifacts = root / 'artifacts'
 if flavor:
     artifacts /= ('gpu/native' if gpu else 'video/v4l2' if flavor == 'video-v4l2' else
                   'video/native' if video else 'desktop' if flavor == 'input' else flavor)
-if gpu_rtkit_probe:
+if gpu_rtkit_probe or gpu_initdata:
     artifacts /= 'rtkit-probe'
 kernel = (artifacts / 'Image').read_bytes()
 initrd = (artifacts / 'initramfs.cpio.gz').read_bytes()
@@ -63,7 +66,9 @@ if video:
 if gpu:
     runpy.run_path(str(root / 'gpu/gpu-boot-preflight.py'))['prepare_gpu'](
         u, iface, root / 'logs' / ('m5-gpu-native-firmware-' + str(time.time_ns())),
-        require_known_firmware=gpu_rtkit_probe)
+        require_known_firmware=gpu_rtkit_probe or gpu_initdata)
+    if gpu_initdata:
+        p.kboot_set_chosen('aurora,m5-gpu-firmware-profile', 'M5-RTKit-3255.160.4.release')
 
 kernel_addr = u.memalign(2 * 1024 * 1024, 64 * 1024 * 1024)
 initrd_addr = u.memalign(65536, len(initrd))

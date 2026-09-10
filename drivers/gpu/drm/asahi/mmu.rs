@@ -384,6 +384,10 @@ pub(crate) enum HandoffMode {
     /// Constructed by the T8140 resource owner before either role receives an
     /// init-data root.
     AbsentStandinT8140,
+    /// M5 25G76 bring-up mode. Native snapshots before/after exact GPU work
+    /// leave the entire handoff page zero. The explicit M5 startup path
+    /// tests this no-peer policy; it does not enable userspace or flushing.
+    NoPeerT8142,
 }
 
 const T8140_SECONDARY_SHARED_ROOT_DELTA: u64 = 0x40000;
@@ -584,6 +588,12 @@ impl UatConfig {
         ias: 42,
         oas: 42,
     };
+
+    const T8142: Self = Self { chip_id: 0x8142, ias: 42, oas: 42 };
+
+    fn has_g17_private_roots(self) -> bool {
+        self == Self::T8140 || self == Self::T8142
+    }
 }
 
 fn uat_geometry(cfg: UatConfig) -> Result<UatGeometry> {
@@ -2016,6 +2026,7 @@ pub(crate) struct Uat {
     /// lower root cannot represent the render-only final operand block.
     t8140_render_global_vm: Option<Vm>,
     _t8140_firmware_crash_buffers: Option<[KernelMapping; 2]>,
+    _t8142_firmware_crash_views: Option<[KernelMapping; 2]>,
     t8140_firmware_crash_gems: Option<[ARef<gem::Object>; 2]>,
     _t8140_parameter_metrics_low: Option<KernelMapping>,
     t8140_parameter_metrics_gem: Option<ARef<gem::Object>>,
@@ -2096,6 +2107,13 @@ impl Handoff {
     /// firmware never writes its half (hardware-verified), so the AP
     /// publishes its own state and proceeds without a peer.
     fn init(&self, mode: HandoffMode) -> Result {
+        if mode == HandoffMode::NoPeerT8142
+            && (self.magic_fw.load(Ordering::Acquire) != 0
+                || self.lock_fw.load(Ordering::Acquire) != 0)
+        {
+            pr_err!("M5 handoff: unexpected firmware peer; refusing no-peer mode\n");
+            return Err(ENODEV);
+        }
         self.magic_ap.store(PPL_MAGIC, Ordering::Relaxed);
         self.cur_slot.store(0, Ordering::Relaxed);
         self.unk3.store(0, Ordering::Relaxed);
@@ -2169,7 +2187,7 @@ impl HandoffFlush {
         // it, so the state legitimately remains where begin_flush left it.
         let expected = match self.1 {
             HandoffMode::FirmwareDekker => 2,
-            HandoffMode::AbsentStandinT8140 => 1,
+            HandoffMode::AbsentStandinT8140 | HandoffMode::NoPeerT8142 => 1,
         };
         if state != expected {
             pr_err!(
@@ -4213,7 +4231,7 @@ impl Uat {
     pub(crate) fn prepare_t8140_firmware_high_roots(
         &self,
     ) -> Result<T8140PrimaryRootSnapshot> {
-        if self.cfg != UatConfig::T8140 {
+        if !self.cfg.has_g17_private_roots() {
             return Err(EINVAL);
         }
         let primary_phys = self.kernel_vm.ttb();
@@ -4231,7 +4249,6 @@ impl Uat {
                 )
             };
             primary_entries.copy_from_slice(&entries[..T8140_FIRMWARE_SHARED_ROOT_ENTRIES]);
-            clear_stale_host_root_entries(entries);
             Ok(())
         })?;
         secondary.with_pointer_into_page(0, UAT_PGSZ, |pointer| {
@@ -4242,6 +4259,26 @@ impl Uat {
                 )
             };
             secondary_entries.copy_from_slice(&entries[..T8140_FIRMWARE_SHARED_ROOT_ENTRIES]);
+            Ok(())
+        })?;
+        if self.cfg == UatConfig::T8142 {
+            let node = self.dev.as_ref().of_node().ok_or(EINVAL)?;
+            let shared_l2 = node.reserved_mem_region_to_resource_byname(c_str!("shared-l2"))?;
+            let mask = ((1u64 << self.cfg.oas) - 1) & !(UAT_PGMSK as u64);
+            if shared_l2.size() != UAT_PGSZ as u64
+                || Iterator::chain(primary_entries.iter(), secondary_entries.iter()).any(|pte| pte & 3 != 3)
+                || primary_entries[2] & mask != shared_l2.start()
+                || secondary_entries[2] & mask != shared_l2.start()
+                || primary_entries[0] & mask == secondary_entries[0] & mask
+            {
+                dev_err!(self.dev.as_ref(), "M5 firmware-private roots/shared L2 do not match the native topology\n");
+                return Err(EIO);
+            }
+        }
+        primary.with_pointer_into_page(0, UAT_PGSZ, |pointer| {
+            let entries = unsafe { core::slice::from_raw_parts_mut(
+                pointer as *mut u64, UAT_PGSZ / core::mem::size_of::<u64>()) };
+            clear_stale_host_root_entries(entries);
             Ok(())
         })?;
         fence(Ordering::SeqCst);
@@ -4269,7 +4306,7 @@ impl Uat {
         &self,
         snapshot: T8140PrimaryRootSnapshot,
     ) -> Result {
-        if self.cfg != UatConfig::T8140 {
+        if !self.cfg.has_g17_private_roots() {
             return Err(EINVAL);
         }
         let primary_phys = self.kernel_vm.ttb();
@@ -4304,7 +4341,7 @@ impl Uat {
     /// Mirror host-visible upper-root entries into GFX1's private top table.
     /// Entries 0 and 1 remain owned by that firmware instance.
     pub(crate) fn mirror_t8140_secondary_high_root(&self) -> Result<usize> {
-        if self.cfg != UatConfig::T8140 {
+        if !self.cfg.has_g17_private_roots() {
             return Err(EINVAL);
         }
         let primary_phys = self.kernel_vm.ttb();
@@ -5467,6 +5504,39 @@ impl Uat {
         Ok(uat)
     }
 
+    /// M5-only initialization experiment. The caller validates the loaded
+    /// firmware profile and retains this UAT across both CPU lifetimes.
+    /// No Neo context allocator, metrics page or runtime manager is selected.
+    pub(crate) fn new_t8142(dev: &driver::AsahiDevice) -> Result<Self> {
+        let node = dev.as_ref().of_node().ok_or(EINVAL)?;
+        let mut physical = [0u64; 2];
+        for (index, (name, size)) in [
+            (c_str!("gfx-data"), 0x134000),
+            (c_str!("gfx1-data"), 0x130000),
+        ].into_iter().enumerate() {
+            let region = node.reserved_mem_region_to_resource_byname(name)?;
+            if region.start() < 0x100_0000_0000 || region.size() != size
+                || region.start() & UAT_PGMSK as u64 != 0
+                || region.start().checked_add(region.size()).ok_or(EOVERFLOW)? > 0x104_0000_0000
+            {
+                return Err(EINVAL);
+            }
+            physical[index] = region.start() + 0xa0000;
+        }
+        if physical[0] + 0x8000 > physical[1] {
+            return Err(EINVAL);
+        }
+        let mut uat = Self::new_with_config(dev, UatConfig::T8142, false,
+            HandoffMode::NoPeerT8142)?;
+        // Native EP1 requests name the already reserved firmware DATA plus
+        // 0xa0000. Keep that same backing when replacing context 0; do not
+        // allocate an unrelated buffer for a firmware-owned DVA.
+        let map = |pa: u64| uat.kernel_lower_vm.map_io(
+            pa & ((1u64 << 40) - 1), pa.try_into()?, 0x8000, PROT_FW_SHARED_RW);
+        uat._t8142_firmware_crash_views = Some([map(physical[0])?, map(physical[1])?]);
+        Ok(uat)
+    }
+
     /// Back the two nonzero EP1 crash-buffer requests before either firmware
     /// processor starts. m1n1 treats these DVAs as preallocated context-0
     /// mappings and only echoes the request; Linux must provide the same
@@ -5691,6 +5761,11 @@ impl Uat {
                     return Err(ENODEV);
                 }
             }
+            HandoffMode::NoPeerT8142 => {
+                if cfg != UatConfig::T8142 {
+                    return Err(ENODEV);
+                }
+            }
         }
 
         let inner = Self::make_inner(dev, handoff_mode)?;
@@ -5700,7 +5775,7 @@ impl Uat {
         let ttb1 = res.start();
         let ttb1size: usize = res.size().try_into()?;
 
-        let required_pagetables_size = if cfg == UatConfig::T8140 {
+        let required_pagetables_size = if cfg.has_g17_private_roots() {
             T8140_SECONDARY_SHARED_ROOT_DELTA as usize + UAT_PGSZ
         } else {
             PAGETABLES_SIZE
@@ -5770,10 +5845,11 @@ impl Uat {
             kernel_lower_vm,
             t8140_render_global_vm,
             _t8140_firmware_crash_buffers: None,
+            _t8142_firmware_crash_views: None,
             t8140_firmware_crash_gems: None,
             _t8140_parameter_metrics_low: None,
             t8140_parameter_metrics_gem: None,
-            t8140_secondary_ttb1: if cfg == UatConfig::T8140 {
+            t8140_secondary_ttb1: if cfg.has_g17_private_roots() {
                 Some(ttb1 + T8140_SECONDARY_SHARED_ROOT_DELTA)
             } else {
                 None

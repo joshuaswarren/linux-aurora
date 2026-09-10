@@ -48,8 +48,10 @@
 		reg = <5 0x82600000 0 0x88000>, <5 0x80000000 0 0x4000000>;
 		reg-names = "asc", "sgx";
 		power-domains = <&ps_gfx>;
-		memory-region = <&uat_ttbs>, <&uat_pagetables>, <&uat_handoff>;
-		memory-region-names = "ttbs", "pagetables", "handoff";
+		memory-region = <&uat_ttbs>, <&uat_pagetables>, <&uat_handoff>,
+				<&uat_l2_pagetables>, <&gfx_data>, <&gfx1_data>;
+		memory-region-names = "ttbs", "pagetables", "handoff", "shared-l2",
+				      "gfx-data", "gfx1-data";
 		mboxes = <&gfx_asc>, <&gfx1_asc>;
 	};
 

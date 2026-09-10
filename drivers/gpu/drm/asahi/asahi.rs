@@ -66,6 +66,10 @@ kernel::module_platform_driver! {
     description: "AGX GPU driver for Apple silicon SoCs",
     license: "Dual MIT/GPL",
     params: {
+        m5_initdata_test: u32 {
+            default: 0,
+            description: "M5-only fresh RAM boot: test both initdata ACKs, then stop processors; no DRM registration",
+        },
         debug_flags: u64 {
             default: 0,
             // permissions: 0o644,

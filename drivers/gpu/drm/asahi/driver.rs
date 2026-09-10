@@ -161,6 +161,7 @@ where
 enum AsahiRuntime {
     Legacy(ARef<drm::Device<AsahiDriver>>),
     G17P(g17_drm::SharedG17PRuntime),
+    M5(g17_live_boot::m5::M5Runtime),
 }
 
 pub(crate) struct AsahiDriver {
@@ -418,6 +419,31 @@ fn probe_t8140_runtime(
     (*drm).gpu.init()?;
     drm::driver::Registration::new_foreign_owned(&drm, pdev.as_ref(), 0)?;
     Ok(runtime)
+}
+
+fn probe_t8142_initdata(pdev: &platform::Device<Core>) -> Result<g17_live_boot::m5::M5Runtime> {
+    // The RAM loader supplies this receipt only after checking both loaded
+    // TEXT images against the exact M5 profile, including all instructions.
+    let chosen = of::chosen().ok_or(ENODEV)?;
+    let profile: KVec<u8> = chosen.get_property(c_str!("aurora,m5-gpu-firmware-profile"))?;
+    if profile.as_slice() != b"M5-RTKit-3255.160.4.release\0" {
+        return Err(ENODEV);
+    }
+    let registers = regs::Resources::new(pdev)?;
+    let observed = registers.get_gpu_id()?;
+    if observed.gpu_gen != hw::GpuGen::G17 || observed.gpu_variant != hw::GpuVariant::G
+        || observed.num_dies != 1 || observed.total_active_cores != 10
+    {
+        return Err(ENODEV);
+    }
+    unsafe { pdev.dma_set_mask_and_coherent(DmaMask::try_new(42)?)? };
+    // This device is deliberately unregistered. The DRM release path does
+    // not drop its uninitialized data slot; no callback reads that slot.
+    let uninit = unsafe {
+        pin_init::pin_init_from_closure::<AsahiData, kernel::error::Error>(|_slot| Ok(()))
+    };
+    let drm: ARef<AsahiDevice> = drm::device::Device::new(pdev.as_ref(), uninit)?;
+    g17_live_boot::m5::M5Runtime::start(pdev, drm, registers)
 }
 
 /// Identify an AGX3 target as far as read-only evidence allows, then refuse.
@@ -945,6 +971,10 @@ impl platform::Driver for AsahiDriver {
                 return Ok(Self {
                     runtime: AsahiRuntime::G17P(runtime),
                 });
+            }
+            ProbeConfig::Agx3Diagnostic(soc) if soc.chip_id == 0x8142
+                && *crate::module_parameters::m5_initdata_test.value() == 1 => {
+                return Ok(Self { runtime: AsahiRuntime::M5(probe_t8142_initdata(pdev)?) });
             }
             ProbeConfig::Agx3Diagnostic(soc) => return Err(refuse_agx3_probe(pdev, soc)),
         };

@@ -2,9 +2,8 @@
 
 The native Linux candidate identifies the physical T8142 GPU as
 **G17G revision C0, one die, one cluster, ten active cores**. Both M5 GPU
-firmware processors now complete RTKit discovery and full management startup
-in Linux.
-It does not yet
+firmware processors now complete RTKit startup and acknowledge Linux-owned
+initialization data in the native RAM-boot experiment. It does not yet
 execute GPU work or expose a render node. DCP presentation is a later,
 independent qualification; neither a software desktop nor encoder success
 is evidence of GPU rendering.
@@ -20,6 +19,17 @@ is evidence of GPU rendering.
   each reported running, no crash, and GPU endpoints 0x20/0x21 available.
   The firmware DATA reservations and native crash-buffer locations were
   retained. No initialization descriptor or GPU command was submitted.
+- A subsequent cold RAM boot built the complete M5-owned initialization
+  graph and received the exact `0x0009000000000000` acknowledgment from
+  GFX1, then GFX. Both private firmware roots and their shared L2 were
+  preserved. The probe completed in 52,972 microseconds with no observed
+  firmware crash. Stop requests succeeded and the module remains pinned
+  until reboot. No GPU job was submitted.
+- U-Boot's default four-bank limit had discarded GPU page-table and DATA
+  reservations. `apple_m1_defconfig` now uses `CONFIG_NR_DRAM_BANKS=32`,
+  matching m1n1's limit. Linux retains all eight handed-off banks and can
+  borrow the reserved root pages. This does not widen RAM over other
+  reserved regions such as the framebuffer.
 - Linux `7.1.6-aurora-j813-gpu-v9`, Asahi diagnostic module loaded explicitly.
 - GPU ID words: `0b022000 000b0800 0011010a 00040404 01320311 10030302`.
 - The M5 ADT selects a 43-bit virtual address (42 bits per root plus one
@@ -39,10 +49,9 @@ is evidence of GPU rendering.
 - Only simpleDRM `card0` exists. There is no `renderD128`, compute result,
   hardware-rendered frame, or DCP acceptance from this candidate.
 
-The firmware capture identifies an observed build; it does not grant runtime
-admission. G17G initialization-data acknowledgement, UAT ownership,
-submission and completion still need M5-specific runtime integration.
-The existing source admits the Neo's G17P runtime only.
+The M5 initdata transaction requires the exact captured firmware profile.
+It owns the UAT and both firmware roles independently of the Neo manager.
+GPU submission, completion and a registered DRM runtime remain open.
 
 ## Reproducible diagnostic candidate
 
@@ -114,7 +123,8 @@ pointer rebinding and rejects overlapping backing before modifying output.
 It also emulates the exact pinned
 M5 host reset routine with synthetic allocations and compares its output
 against the Linux channel codec across 32 cases. All comparisons pass.
-The driver/module build passes; these codecs are not wired into an M5 runtime.
+The driver/module build passes; the explicit M5 initdata transaction now uses
+these codecs and has received both firmware acknowledgments in Linux.
 
 `drivers/gpu/drm/asahi/m5_resources.rs` now constructs and retains the M5
 initialization memory: both roots, the complete shared/private arenas, four
@@ -123,8 +133,9 @@ windows. Firmware pointers are authored from owned allocations. Native
 cacheability and permissions are preserved, including read-only register
 windows and the 64 KiB extent of slot 39. The two measured control openings
 are initialized; subsequent compute/render descriptors are not submitted.
-The constructor requires an M5 UAT and has not been exercised on Linux
-hardware. It neither opens the UAT lifecycle gate nor starts a processor.
+The constructor requires an M5 UAT and has been exercised on Linux hardware.
+`m5_live_boot.rs` retains that UAT, the memory graph and both RTKit owners.
+This validates initialization only, not GPU jobs or cache-flush behavior.
 
 The native UAT inspection now reads both role-private roots, their shared L2,
 TTBAT, global root and handoff through their existing EL2 mappings. The
@@ -158,6 +169,25 @@ along with every executable byte. `verify-m5-firmware-identity.py` checks
 private captures and rejects code, metadata tag/length, tail and role changes.
 The transport payload's preflight requires this identity; ordinary read-only
 inventory can still capture an unknown build without granting runtime use.
+
+## Linux initialization-data experiment
+
+Build the candidate kernel/payload and the separate provider-enabled payload
+above, using the J813 U-Boot with `CONFIG_NR_DRAM_BANKS=32`. From a fresh
+RAM chainload, run `boot-linux.py --gpu --gpu-initdata --gpu-inventory`, then
+`modprobe asahi m5_initdata_test=1` in the native shell. The loader verifies
+both loaded firmware TEXT images and places the exact profile receipt in
+`/chosen`; the driver checks it before touching GPU resources.
+
+This mode starts GFX1 then GFX, builds and retains the M5 graph, submits
+GFX1's root before GFX's root and waits for each exact acknowledgment. It
+requests both CPU stops afterward and retains ownership until reboot,
+including on failures after firmware start. Do not unload it, load the C
+RTKit probe alongside it, or restart either processor in that boot.
+
+The firmware handoff page is observed to remain zero in macOS. The M5-only
+no-peer handoff path has now passed initialization; it does not establish
+working cache flushes, power management, command submission or rendering.
 
 The latest complete cold capture matches both 160 KiB shared clusters and
 the 0x178000 private arena, after excluding only independently identified
@@ -194,7 +224,7 @@ The M5 profile handles these differences explicitly:
   The native AON PTD allocation is 0xe4 bytes. Its measured contents match
   both roles on the third cold boot and remain unchanged after Metal work;
   Linux must allocate and retain the backing through firmware shutdown.
-- The firmware roles can start in either order. GFX1 takes root+0xb8 as its
+- The measured M5 CPU start and initdata order is GFX1 then GFX. GFX1 takes root+0xb8 as its
   shared configuration and writes +0x670/+0x678/+0x680 after startup. These
   must begin at zero. A later primary capture can already contain secondary
   runtime state, despite preceding the primary's own root handoff.
@@ -212,6 +242,6 @@ including three `0x8300000000000a` compute kicks. The observed CPU FIFO at
 SGX+0x4090/+0x4098 stayed quiet. This establishes a workload mailbox path;
 it does not prove every M5 workload uses the same transport or that the Linux
 path is interchangeable. Neo's HAL200 runtime remains a useful reference.
-Firmware ownership, the remaining channel graph, M5
+The remaining channel graph, M5
 submission and completion remain open. The latest Neo reference also still
 has a first-draw GPU fault in Xorg; neither target is yet DCP-only.

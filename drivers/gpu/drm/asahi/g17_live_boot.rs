@@ -21,6 +21,9 @@
 
 #![allow(dead_code)]
 
+#[path = "m5_live_boot.rs"]
+pub(crate) mod m5;
+
 use core::{
     mem::MaybeUninit,
     sync::atomic::{fence, AtomicBool, AtomicU32, Ordering},
