@@ -1638,11 +1638,7 @@ fn settle_primary_empty_recovery(
             }
         }
         if let Some(generation) = batch.recovery_generation {
-            // Coalesce rather than refuse: one firmware restart request can be
-            // observed more than once (a second drain pass here, or the gfx1
-            // ring in the same worker pass), and the caller turns the bare
-            // EBUSY into a permanently crashed session.
-            manager.queue_or_coalesce_primary_recovery(
+            manager.queue_primary_recovery(
                 generation,
                 batch.recovery_records,
                 batch.blamed_stamp,
@@ -3539,25 +3535,12 @@ impl G17PLiveRuntime {
                         .map_err(step("gfx1-render-usc-freelist-release"))?;
                 }
                 if let Some(generation) = batch.recovery_generation {
-                    // The firmware raises ONE restart request and both roles can
-                    // see it, so this is routinely the same request the gfx ring
-                    // queued a few lines ago. `queue_primary_recovery` answers
-                    // that with EBUSY, and EBUSY here killed the session.
-                    let queued = self.manager.as_mut().ok_or(("no-manager", ENODEV))?
-                        .queue_or_coalesce_primary_recovery(
+                    self.manager.as_mut().ok_or(ENODEV)?
+                        .queue_primary_recovery(
                             generation,
                             batch.recovery_records,
                             batch.blamed_stamp,
-                        )
-                        .map_err(step("queue-gfx1-recovery"))?;
-                    if !queued {
-                        dev_info!(
-                            pdev.as_ref(),
-                            "G17P recovery: gfx1 type4 generation={} records={} folded into the request the gfx ring already queued\n",
-                            generation,
-                            batch.recovery_records,
-                        );
-                    }
+                        )?;
                 }
             }
             self.service_async_render_completions(completion_masks)
@@ -3641,7 +3624,7 @@ impl G17PLiveRuntime {
             self.manager
                 .as_mut()
                 .ok_or(ENODEV)?
-                .queue_or_coalesce_primary_recovery(
+                .queue_primary_recovery(
                     generation,
                     batch.recovery_records,
                     batch.blamed_stamp,
@@ -3675,22 +3658,13 @@ impl G17PLiveRuntime {
             generation,
             records,
         )
-        .map_err(|error| ("complete-real-recovery", error))
         .and_then(|()| {
-            manager
-                .complete_pending_primary_recovery(generation, records, blamed_stamp)
-                .map_err(|error| ("complete-pending-recovery", error))
+            manager.complete_pending_primary_recovery(generation, records, blamed_stamp)
         });
-        let result = match result {
-            Ok(()) => Ok(()),
-            Err((reason, error)) => {
-                // Same permanent-deafness transition as the event worker, and
-                // this one also skips the event-drain re-arm at the end of this
-                // function.
-                note_state_crashed(&pdev, &state, reason, error, Some(generation));
-                return Err(error);
-            }
-        };
+        if result.is_err() {
+            state.crashed.store(true, Ordering::Release);
+            return result;
+        }
         if let Some(stamp) = blamed_stamp {
             self.settle_render_blamed_by_recovery(stamp, EIO);
         }
@@ -4996,24 +4970,12 @@ impl G17PLiveRuntime {
             .as_mut()
             .ok_or(ENODEV)?
             .select_render_slot(render_slot)?;
-        // Run the classifier on BOTH settle paths.
-        //
-        // It was gated on `timed_out`, which is `submission_id.is_some()`, and
-        // the recovery-blamed path passes `None` -- so the one route that
-        // actually kills the desktop was the one route that produced no
-        // explanation at all. Measured on the 236s soak wedge: `settled lost
-        // submission None recovery-stamp Some(0) ... firmware-retired=false`
-        // with no render state logged anywhere in the boot. The body is a plain
-        // read of driver-allocated DRAM plus one line, and it makes no claim
-        // about why the settle happened, so it is correct on either path.
-        self.manager
-            .as_mut()
-            .ok_or(ENODEV)?
-            .report_render_wait_timeout(if timed_out {
-                "inline-wait-expired"
-            } else {
-                "recovery-blamed"
-            });
+        if timed_out {
+            self.manager
+                .as_mut()
+                .ok_or(ENODEV)?
+                .report_render_wait_timeout();
+        }
         let retired = match self
             .manager
             .as_mut()
