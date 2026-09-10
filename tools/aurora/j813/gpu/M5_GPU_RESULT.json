@@ -29,7 +29,7 @@
     "runtime_admitted": false
   },
   "regression": {
-    "scope": "Initial v9 peripheral regression; not repeated during the initdata-only boot",
+    "scope": "Initial v9 peripheral regression; not repeated during the queue-install boot",
     "wifi_dhcp": true,
     "wifi_ping_target": "8.8.8.8",
     "wifi_ping_sent": 5,
@@ -112,7 +112,9 @@
     "unit_tests_passed": 3,
     "kernel_build_passed": true,
     "first_bind_execution_qualified": false,
-    "runtime_wired": false,
+    "queue_install_qualified": true,
+    "runtime_wired": true,
+    "runtime_scope": "Tag-15 queue install only; scheduler and context updates disabled",
     "linux_gpu_execution_qualified": false
   },
   "source_codecs": {
@@ -147,7 +149,7 @@
     "kernel_build_passed": true,
     "ram_boot_retested_after_codec_changes": true,
     "runtime_wired": true,
-    "runtime_scope": "Explicit M5 initdata-only transaction; no DRM registration or GPU jobs"
+    "runtime_scope": "Explicit M5 initdata, control opening and queue-install transactions; no DRM registration or GPU jobs"
   },
   "linux_rtkit": {
     "hello_epmap_roles_passed": 2,
@@ -189,6 +191,31 @@
     "probe_microseconds": 63184,
     "firmware_crashes_observed": 0,
     "gpu_jobs_submitted": 0
+  },
+  "linux_sksm_queue_install": {
+    "fresh_ram_boots_passed": 1,
+    "module_parameter": "m5_initdata_test=3",
+    "queue_id": 11,
+    "priority": 2,
+    "data_master": 2,
+    "tag15_records_submitted": 1,
+    "doorbell_endpoint": "0x21",
+    "doorbell_message": "0x008300000000000a",
+    "outer_before": [0, 0, 0],
+    "inner_before": [0, 0, 1],
+    "outer_after": [1, 1, 1],
+    "inner_after": [1, 1, 1],
+    "firmware_slot_before": [0, 0, 0, 0, 0],
+    "firmware_slot_after": ["0x1", "0xfffffc2000390000", "0x70005f0000", "0x400000000", "0x2"],
+    "firmware_data_host_mapping": "WB with read-only cache invalidation",
+    "scheduler_update": false,
+    "context_update": false,
+    "gpu_jobs_submitted": 0,
+    "firmware_crashes_observed": 0,
+    "stop_requests_succeeded": 2,
+    "owners_pinned_until_reboot": true,
+    "console_log_sha256": "eb246f44f3026efc167fd2cd3ec268ab7299db898b95b3efe437d1d3fead4072",
+    "boot_log_sha256": "1ea0720bc2002f71358a7459bb02e32a3ad62497ffb4dbae7cfdbf220c512b20"
   },
   "render_node": false,
   "gpu_compute_qualified": false,

@@ -89,7 +89,7 @@ impl M5Session {
         failure.map_or(Ok(()), Err)
     }
 
-    fn initialize(&mut self, release_openings: bool) -> Result {
+    fn initialize(&mut self, probe_kind: u32) -> Result {
         for index in [1, 0] {
             let role = &mut self.roles[index];
             role.provider.start_cpu()?;
@@ -105,7 +105,7 @@ impl M5Session {
         unsafe { core::arch::asm!("mrs {value}, cntvct_el0", value = out(reg) timestamp,
             options(nomem, nostack, preserves_flags)); }
         self.memory = Some(M5FirmwareMemory::new_with_uat(
-            &self.dev, self.uat.clone(), timestamp)?);
+            &self.dev, self.uat.clone(), timestamp, probe_kind >= 3)?);
         self.uat.confirm_t8140_primary_high_root(roots)?;
         self.uat.mirror_t8140_secondary_high_root()?;
         dev_info!(self.dev.as_ref(), "M5_INIT retained memory graph mapped\n");
@@ -137,8 +137,11 @@ impl M5Session {
         if self.roles.iter().any(|role| role.state.crashed.load(Ordering::Acquire)) {
             return Err(EIO);
         }
-        if release_openings {
+        if probe_kind >= 2 {
             self.retire_openings()?;
+        }
+        if probe_kind >= 3 {
+            self.install_queue_probe()?;
         }
         Ok(())
     }
@@ -165,6 +168,30 @@ impl M5Session {
             fsleep(Delta::from_millis(1));
         }
         dev_err!(self.dev.as_ref(), "M5_OPEN control openings did not retire {:?}\n", counters);
+        Err(ETIMEDOUT)
+    }
+
+    fn install_queue_probe(&mut self) -> Result {
+        let memory = self.memory.as_mut().ok_or(EIO)?;
+        dev_info!(self.dev.as_ref(), "M5_QUEUE before tag15-only {:?}\n", memory.queue_probe_status()?);
+        memory.publish_queue_probe()?;
+        // Native M5 encodes CL_2 as 2 | (2 << 2), on GFX endpoint 0x21.
+        Pin::new(&mut self.roles[0].rtkit).send_message(0x21, 0x0083_0000_0000_000a)?;
+        for _ in 0..1000 {
+            if self.roles.iter().any(|role| role.state.crashed.load(Ordering::Acquire)) {
+                dev_err!(self.dev.as_ref(), "M5_QUEUE firmware crash after {:?}\n", memory.queue_probe_status()?);
+                return Err(EIO);
+            }
+            let (outer, inner, slot) = memory.queue_probe_status()?;
+            if outer == [1; 3] && inner == [1; 3]
+                && M5FirmwareMemory::queue_probe_installed(slot) {
+                dev_info!(self.dev.as_ref(), "M5_QUEUE installed qid11 outer={:?} inner={:?} slot={:x?}; no kicks\n",
+                    outer, inner, slot);
+                return Ok(());
+            }
+            fsleep(Delta::from_millis(1));
+        }
+        dev_err!(self.dev.as_ref(), "M5_QUEUE install timeout {:?}\n", memory.queue_probe_status()?);
         Err(ETIMEDOUT)
     }
 }
@@ -209,7 +236,7 @@ impl M5Runtime {
         // Keep callback code resident even if a failed stop retains owners.
         // This explicit RAM-boot experiment is released by reboot only.
         unsafe { kernel::bindings::__module_get(crate::THIS_MODULE.as_ptr()); }
-        let result = session.initialize(*crate::module_parameters::m5_initdata_test.value() == 2);
+        let result = session.initialize(*crate::module_parameters::m5_initdata_test.value());
         dev_info!(pdev.as_ref(), "M5_INIT transaction result={:?}; no GPU jobs submitted\n", result);
         let stopped = session.stop_cpus();
         dev_info!(pdev.as_ref(), "M5_INIT stop requests={:?}; owners retained\n", stopped);

@@ -15,6 +15,10 @@ use core::sync::atomic::{fence, Ordering};
 use kernel::prelude::*;
 use kernel::sync::Arc;
 
+#[path = "m5_queue_probe.rs"]
+mod queue_probe;
+use queue_probe::M5QueueProbe;
+
 const KERNEL_BASE: u64 = 0xffff_fc20_0000_0000;
 const PRIVATE_BASE: u64 = KERNEL_BASE + 0x2_0000;
 const ROOTS_BASE: u64 = KERNEL_BASE + 0x1a_8000;
@@ -41,6 +45,7 @@ pub(crate) struct M5FirmwareMemory {
     completions: KVec<MappedObject>,
     aliases: KVec<mmu::KernelMapping>,
     registers: KVec<mmu::KernelMapping>,
+    queue_probe: Option<M5QueueProbe>,
     uat: Arc<mmu::Uat>,
 }
 
@@ -54,6 +59,7 @@ impl M5FirmwareMemory {
         dev: &AsahiDevice,
         uat: Arc<mmu::Uat>,
         boot_timestamp: u64,
+        prepare_queue_probe: bool,
     ) -> Result<Self> {
         if !uat.is_t8142_geometry() {
             return Err(ENODEV);
@@ -189,9 +195,14 @@ impl M5FirmwareMemory {
         // Writes to all CPU WC mappings precede any future handoff. Only
         // the two measured control openings are present; work rings and
         // later compute/render descriptors remain unsubmitted.
+        let queue_probe = if prepare_queue_probe {
+            Some(M5QueueProbe::new(dev, &uat)?)
+        } else {
+            None
+        };
         fence(Ordering::SeqCst);
         Ok(Self { primary_root, secondary_root, shared, private, region_a, region_c, fwctl, aon, qos,
-                  pbdesc, uma, completions, aliases, registers, uat })
+                  pbdesc, uma, completions, aliases, registers, queue_probe, uat })
     }
 
     pub(crate) fn root(&self, secondary: bool) -> u64 {
@@ -217,5 +228,45 @@ impl M5FirmwareMemory {
             fence(Ordering::Acquire);
             Ok(counters)
         })
+    }
+
+    pub(crate) fn queue_probe_status(&mut self) -> Result<([u32; 3], [u32; 3], [u64; 5])> {
+        let outer = [self.private.read_u32(PRIVATE_BASE + 0x240)?,
+                     self.private.read_u32(PRIVATE_BASE + 0x250)?,
+                     self.private.read_u32(PRIVATE_BASE + 0x260)?];
+        let probe = self.queue_probe.as_mut().ok_or(EINVAL)?;
+        Ok((outer, probe.inner_counters()?, probe.firmware_slot()))
+    }
+
+    /// Publish exactly one tag-15 configuration through the observed CL_2
+    /// outer slot. All referenced memory was prepared before initdata ACKs.
+    pub(crate) fn publish_queue_probe(&mut self) -> Result {
+        let (outer, inner, slot) = self.queue_probe_status()?;
+        if outer != [0; 3] || inner != [0, 0, 1] || slot != [0; 5] {
+            return Err(EBUSY);
+        }
+        let address = self.queue_probe.as_ref().ok_or(EINVAL)?.queue_address();
+        self.shared.with_bytes_mut(|out| {
+            // Hardware capture: main row8 ring=shared+0x19dc0, 256*24B.
+            let record = &mut out[0x19dc0..0x19dd8];
+            if record.iter().any(|byte| *byte != 0) {
+                return Err(EBUSY);
+            }
+            record[8..16].copy_from_slice(&address.to_le_bytes());
+            record[16..20].copy_from_slice(&2u32.to_le_bytes());
+            record[20..22].copy_from_slice(&1u16.to_le_bytes());
+            record[22] = 11;
+            record[23] = 1;
+            Ok(())
+        })?;
+        // Record/backing writes precede the sole producer publication.
+        fence(Ordering::SeqCst);
+        self.private.write_u32(PRIVATE_BASE + 0x260, 1)?;
+        fence(Ordering::SeqCst);
+        Ok(())
+    }
+
+    pub(crate) fn queue_probe_installed(slot: [u64; 5]) -> bool {
+        M5QueueProbe::is_installed(slot)
     }
 }
