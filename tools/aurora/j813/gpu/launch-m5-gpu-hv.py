@@ -14,6 +14,8 @@ root = Path(__file__).resolve().parent.parent
 hvroot = root / 'hv'
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('output', type=Path)
+parser.add_argument('--capture-init', action='store_true',
+                    help='Capture each firmware graph before its initialization doorbell is published')
 args = parser.parse_args()
 os.umask(0o077)
 output = args.output.resolve()
@@ -45,6 +47,7 @@ os.environ.update({
     'M5_ISOLATE_CAMERA': '1', 'M5_SKIP_CPU_ENERGY_RESTORE': '1',
     'M5_NVME_CQ_DEPTH_64': '1', 'J700_HV_QUIET_BOOT': '1',
     'M5_GPU_TRACE_DIR': str(output),
+    'M5_GPU_CAPTURE_INIT': '1' if args.capture_init else '0',
     'M5_N1_TRACE': '1', 'M5_SEP_TRACE': '1', 'M5_PMP_TRACE': '0',
     'M5_PMGR_TRACE': '0', 'M5_CLPC_SAMPLER_SHADOW': '0',
 })
