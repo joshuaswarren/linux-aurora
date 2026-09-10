@@ -31,8 +31,39 @@ Port inputs
 All listed MMIO addresses include ADT bus-range translation. They are static
 firmware evidence, not observed live register behavior.
 
-Work order
-----------
+Offline integration and validation
+----------------------------------
+
+The Apple platform binding now recognizes the evidenced board identity
+``apple,j873g``, ``apple,t8152``, ``apple,arm-platform``. This names the platform;
+it does not enable devices or claim that an older SoC fallback is compatible.
+The updated binding passes ``dt-doc-validate``.
+
+Run the firmware-to-driver audit from this kernel checkout::
+
+  ../.venv/bin/python tools/testing/selftests/arm64/apple/j873_firmware_audit.py \
+    ../AuroraSilicon/targets/j873/topology-26A428.json
+
+It checks the 525-node inventory, including unique indices for same-name
+siblings, critical translated register windows, compatible strings, and all
+12 CPU descriptors. It reports the current AIC, DART and power-domain driver
+match tables. A match-table observation is not proof of hardware support.
+First validate the underlying firmware with AuroraSilicon's inspector.
+
+AppleT8152PMGR driver analysis establishes separate PMGR2 device and service
+namespaces and a PMS-mediated service-control path. AppleGen3DART delegates
+translation changes to SPTM; SPTM analysis identifies different SID/TTBR and
+TLBI handling. ASCWrap-v8 uses postoffice mailboxes. Adding T8152 aliases to
+the M5 power, DART or ASC drivers would therefore skip necessary port work.
+
+The sibling m1n1 branch provides an opt-in J873g diagnostic which builds and
+runs in an instruction harness with synthetic CPU/UART inputs. That result
+validates software control flow only. Linux CPU ``reg`` properties must use
+measured MPIDR affinity fields, not the static ADT's logical CPU IDs. In
+particular, do not reuse J813's measured performance-core affinity-2 bit.
+
+Remaining work order
+--------------------
 
 1. Determine bindings and support for PMGR2 service control, gen3 DART, and
    ASC v8. Keep J813 behavior unchanged.
@@ -41,7 +72,9 @@ Work order
 3. When hardware is available, validate console and interrupts, then power
    control, DMA isolation, storage, USB, networking, and display in stages.
 
-No J873 DTS has been enabled yet and no kernel or hardware test is claimed.
+No J873 boot DTS has been enabled and no full kernel or hardware test is claimed.
+The event aperture, live CPU affinities, timer routing, memory reservations,
+and power ownership are prerequisites to a usable first-boot device tree.
 The current macOS host filesystem is case-insensitive and produces 13 upstream
 case-collision modifications on a fresh Linux checkout. Those files are not
 J873 changes; use a case-sensitive filesystem for a full kernel build.
