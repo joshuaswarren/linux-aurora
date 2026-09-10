@@ -322,7 +322,9 @@ config APPLE_DART_KUNIT_TEST
 	default KUNIT_ALL_TESTS
 	help
 	  Tests the T8110 DART v2 exception contract and locked page-table
-	  handoff. These tests do not access DART hardware.
+	  handoff. The suite covers pending-bit decoding, exception records,
+	  acknowledgements, and inherited table publication. These tests do
+	  not access DART hardware.
 
 config S390_IOMMU
 	def_bool y if S390 && PCI
