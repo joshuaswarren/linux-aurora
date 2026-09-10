@@ -1,0 +1,7 @@
+--- a/drivers/gpu/drm/asahi/g17_drm.rs
++++ b/drivers/gpu/drm/asahi/g17_drm.rs
+@@ -160 +160,3 @@
+-const G17P_ACTIVE_RENDER_SLOTS: usize = G17P_RENDER_SLOTS;
++// Diagnostic: isolate the observed slot-1 completion timeout on J700.
++// Keep the bounded ownership/recycling machinery and use only QIDs 0/1.
++const G17P_ACTIVE_RENDER_SLOTS: usize = 1;
