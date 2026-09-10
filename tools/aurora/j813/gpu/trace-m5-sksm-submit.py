@@ -153,6 +153,13 @@ def _m5_sksm_submit(ctx):
                         entry_count=entries, entry_stride=stride,
                         gpu_ring=hex(gpu_ring), cpu_ring=hex(cpu_ring),
                         firmware_ring=hex(firmware_ring))
+        # x20 is the retained AGXCLCommandDescriptor at this pinned site.
+        # Capture a bounded view, including the native register generator's
+        # inputs at +0x530/+0x538/+0x60a/+0x60b. This is not a sizeof claim.
+        try:
+            save('host-cl-descriptor-view', int(ctx.regs[20]), 0x800)
+        except (RuntimeError, ValueError) as error:
+            manifest['host_descriptor_error'] = str(error)
         entry_offset = (stamp & 255) * stride
         manifest['payload_views'] = []
         # encodeKickEntry copies the payload's two GPU pointers to +0x10/+0x18

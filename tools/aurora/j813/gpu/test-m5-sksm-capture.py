@@ -18,6 +18,7 @@ SCRIPT = Path(__file__).with_name('trace-m5-sksm-submit.py')
 PC = 0xfffffe0008984fc0
 BASE = 0x10000000000
 COMMAND, QUEUE, RING = (0xfffffe0010000000 + x for x in (0x1000, 0x2000, 0x10000))
+DESCRIPTOR = COMMAND + 0x2000
 
 
 class ADT(dict):
@@ -38,6 +39,8 @@ class FakeHV:
         self.invalid_ring = invalid_ring
         self.ctx = SimpleNamespace(elr=PC, regs=[0] * 31, spsr=5)
         self.ctx.regs[2], self.ctx.regs[24] = COMMAND, QUEUE
+        self.ctx.regs[20] = DESCRIPTOR
+        struct.pack_into('<QQ', self.memory, 0x3530, 0x54b, 0xf5)
         self.started = True
         self.u = SimpleNamespace(adt=ADT({'/chosen': SimpleNamespace(
             chip_id=0x8142, dram_base=BASE, dram_size=len(self.memory))}))
@@ -97,6 +100,24 @@ class CaptureTests(unittest.TestCase):
                     self.assertNotIn('error', result)
                     self.assertEqual((result['entry_count'], result['entry_stride'], result['priority']), (256, 0x180, 2))
                     self.assertEqual((path.parent / 'kick-ring.bin').read_bytes()[0x180:0x184], b'SKSM')
+                    descriptor = next(x for x in result['objects'] if x['label'] == 'host-cl-descriptor-view')
+                    self.assertTrue(descriptor['stable'])
+                    raw = (path.parent / descriptor['file']).read_bytes()
+                    self.assertEqual(struct.unpack_from('<QQ', raw, 0x530), (0x54b, 0xf5))
+
+    def test_unmapped_descriptor_does_not_invalidate_the_ring(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hv = FakeHV(directory)
+            hv.ctx.regs[20] = 0x580004000
+            with patch.dict(os.environ, M5_GPU_TRACE_DIR=directory), contextlib.redirect_stdout(io.StringIO()):
+                self.run_script(hv)
+                self.assertTrue(hv.hook(hv.ctx))
+            path, = Path(directory).glob('sksm-submit-*/manifest.json')
+            result = json.loads(path.read_text())
+            self.assertNotIn('error', result)
+            self.assertIn('outside DRAM', result['host_descriptor_error'])
+            self.assertTrue(all(BASE <= address < BASE + 0x80000 for address, _ in hv.reads))
+            self.assertEqual(hv.breakpoints, [])
 
     def test_wrong_code_never_arms(self):
         with tempfile.TemporaryDirectory() as directory:

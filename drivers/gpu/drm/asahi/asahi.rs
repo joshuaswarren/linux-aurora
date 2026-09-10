@@ -47,6 +47,8 @@ mod hw;
 mod identity;
 mod initdata;
 mod mem;
+mod m5_compute;
+mod m5_sksm;
 mod microseq;
 mod mmu;
 mod object;
