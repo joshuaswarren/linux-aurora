@@ -148,8 +148,9 @@ static int mt_publish_policy(struct mt7932 *m, const struct mt7932_reg_snapshot 
 	/* Native SETs have no response/atomic policy-commit event. Command
 	 * submission is not misrepresented as firmware readback or an ACK.
 	 */
-	dev_info(&m->pdev->dev, "REGULATORY_POLICY_SUBMITTED: %c%c channels=%u (native no-response SETs)\n",
-		 reg->alpha2[0], reg->alpha2[1], (reg->length - 12) / 8);
+	dev_info(&m->pdev->dev, "REGULATORY_POLICY_SUBMITTED: %c%c firmware=%c%c channels=%u (native no-response SETs)\n",
+		 reg->alpha2[0], reg->alpha2[1], reg->domain[0], reg->domain[1],
+		 (reg->length - 12) / 8);
 	return 0;
 }
 
@@ -260,12 +261,16 @@ static void mt_startup_work(struct work_struct *work)
 		    (m->startup_started && !READ_ONCE(m->rf_ready)))
 			ret = -EIO;
 		if (!ret) {
-			scnprintf(path, sizeof(path), "mediatek/mt7932/policy/%c%c.bin",
-				 reg.alpha2[0], reg.alpha2[1]);
+			if (!memcmp(reg.alpha2, "00", 2))
+				scnprintf(path, sizeof(path),
+					  "mediatek/mt7932/policy/world-XZ.bin");
+			else
+				scnprintf(path, sizeof(path), "mediatek/mt7932/policy/%c%c.bin",
+					  reg.alpha2[0], reg.alpha2[1]);
 			ret = request_firmware_direct(&file, path, &m->pdev->dev);
 		}
 		if (!ret)
-			ret = mt7932_policy_parse(&policy, file->data, file->size, reg.alpha2);
+			ret = mt7932_policy_parse(&policy, file->data, file->size, reg.domain);
 		mutex_lock(&m->command_mutex);
 		if (generation != READ_ONCE(m->reg_generation))
 			goto next;
@@ -288,8 +293,9 @@ static void mt_startup_work(struct work_struct *work)
 				 reg.alpha2[0], reg.alpha2[1], generation, ret,
 				 m->policy_failed || m->link_failed);
 		else
-			dev_info(&m->pdev->dev, "REGULATORY_READY: %c%c generation=%u current=%u\n",
-				 reg.alpha2[0], reg.alpha2[1], generation, !m->reg_pending);
+			dev_info(&m->pdev->dev, "REGULATORY_READY: %c%c firmware=%c%c generation=%u current=%u\n",
+				 reg.alpha2[0], reg.alpha2[1], reg.domain[0], reg.domain[1],
+				 generation, !m->reg_pending);
 next:
 		mutex_unlock(&m->command_mutex);
 		if (file)
@@ -315,6 +321,13 @@ static void mt_regulatory_notify(struct wiphy *wiphy, struct regulatory_request 
 	      !memcmp(reg.alpha2, "00", 2)))
 		reg.error = -EOPNOTSUPP;
 	memcpy(reg.domain, reg.alpha2, 2);
+	/* Stock database-present startup resolves the absent 00 row to XZ.
+	 * Keep Linux's world channel restrictions and requested identity; only
+	 * the firmware country/domain and original power package use XZ.
+	 * Never fall back for an arbitrary unsupported explicit country.
+	 */
+	if (!memcmp(reg.alpha2, "00", 2))
+		memcpy(reg.domain, "XZ", 2);
 	reg.domain[4] = reg.domain[5] = 1; /* native 20 MHz selectors */
 	for (i = 0; i < 17; i++) {
 		struct ieee80211_channel *channel = i < 13 ? &m->channels[i] : &m->channels5[i - 13];
@@ -394,6 +407,11 @@ int mt_register_regulatory_gate(struct mt7932 *m)
 	m->wiphy->max_scan_ssids = 1;
 	m->wiphy->max_scan_ie_len = 600;
 	m->wiphy->reg_notifier = mt_regulatory_notify;
+	/* World roaming may relax NO_IR after observing an AP beacon without
+	 * changing alpha2. Request the callback so firmware's CID0f domain is
+	 * updated through the same idle/scan fence as other regulatory changes.
+	 */
+	m->wiphy->flags |= WIPHY_FLAG_CHANNEL_CHANGE_ON_BEACON;
 	/* The native fullmac path applies policy at idle, not seamlessly inside
 	 * an association. Keep the existing explicit user/core-country model:
 	 * accepting this STA's AP hint then disconnecting to apply it would make

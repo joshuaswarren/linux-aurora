@@ -198,6 +198,23 @@ int main(int argc,char **argv) {
  assert(mt7932_scan_options(scan,NULL,0,ies,599)<0);
  ies[1]=255;assert(mt7932_scan_options(scan,NULL,0,ies,4)<0);
  assert(mt7932_scan_options(scan,(const u8*)"TEST",33,NULL,0)<0);
+ /* Passive mode is explicit, cannot become directed via options, and
+  * retains the native dwell/tail and validated caller IE carriage.
+  */
+ const u8 passive_ies[]={0x7f,1,0};
+ assert(mt7932_scan_body(scan,sizeof(scan),1,channels,13)>0);
+ mt7932_scan_passive(scan);
+ assert(!scan[2]&&!scan[3]&&!scan[4]&&!scan[5]&&scan[6]==0x12);
+ assert(get_unaligned_le16(scan+0x9a)==40&&get_unaligned_le16(scan+0x33c)==40);
+ assert(get_unaligned_le32(scan+0x4b8)==0x1800&&get_unaligned_le32(scan+0x4bc)==45);
+ assert(get_unaligned_le16(scan+0x4c2)==110&&get_unaligned_le16(scan+0x4ca)==110);
+ assert(mt7932_scan_options(scan,(const u8*)"TEST",4,NULL,0)==-EINVAL);
+ assert(!mt7932_scan_options(scan,NULL,0,passive_ies,sizeof(passive_ies)));
+ assert(get_unaligned_le16(scan+0xe0)==sizeof(passive_ies));
+ assert(!memcmp(scan+0xe2,passive_ies,sizeof(passive_ies)));
+ for(unsigned i=8;i<152;i++)assert(!scan[i]);
+ for(unsigned i=0x458;i<0x464;i++)assert(!scan[i]);
+ assert(!scan[2]&&!scan[3]&&!scan[4]&&!scan[5]);
  u8 out[8192],payload[12]={0},packet[40]={0};
  struct mt7932_event e;
  put_unaligned_le32(0x70010204,payload+4);

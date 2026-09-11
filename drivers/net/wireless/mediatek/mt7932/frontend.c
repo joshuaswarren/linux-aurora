@@ -135,26 +135,44 @@ int mt_scan_quiesce(struct mt7932 *m)
 	return READ_ONCE(m->retired_scan_seq) ? -EBUSY : 0;
 }
 
-/* command_mutex held: one RF-band batch at a time, with matching EID0d
- * completion before the next batch. No mixed-band firmware request.
+/* command_mutex held: one RF-band/type batch at a time, with matching EID0d
+ * completion before the next batch. A request without SSIDs is passive;
+ * active requests must also listen passively on NO_IR channels.
  */
 static int mt_scan_submit_next(struct mt7932 *m)
 {
 	struct cfg80211_scan_request *request = m->scan_request;
+	const struct cfg80211_ssid *ssid = NULL;
 	u8 body[0x4d4], channels[13];
 	unsigned int count = 0, i;
 	unsigned long flags;
+	bool passive = false;
 	int ret;
 
-	while (!count && ++m->scan_band <= 2)
-		for (i = 0; i < request->n_channels; i++)
-			if (mt7932_channel_band(request->channels[i]->hw_value) == m->scan_band) {
-				if (count == ARRAY_SIZE(channels))
-					return -EINVAL;
-				channels[count++] = request->channels[i]->hw_value;
-			}
+	/* 2GHz active/passive, then 5GHz active/passive. Never put a NO_IR
+	 * channel in a firmware request which can emit probe requests.
+	 */
+	while (!count && ++m->scan_batch <= 4) {
+		m->scan_band = (m->scan_batch + 1) / 2;
+		passive = !(m->scan_batch & 1);
+		for (i = 0; i < request->n_channels; i++) {
+			struct ieee80211_channel *channel = request->channels[i];
+			bool listen = !request->n_ssids ||
+				      (channel->flags & IEEE80211_CHAN_NO_IR);
+
+			if (mt7932_channel_band(channel->hw_value) != m->scan_band ||
+			    listen != passive)
+				continue;
+			if (channel->flags & (IEEE80211_CHAN_DISABLED | IEEE80211_CHAN_NO_20MHZ) ||
+			    count == ARRAY_SIZE(channels))
+				return -EINVAL;
+			channels[count++] = channel->hw_value;
+		}
+	}
 	if (!count)
 		return 1;
+	if (!passive && request->n_ssids)
+		ssid = &request->ssids[0];
 	spin_lock_irqsave(&m->response_lock, flags);
 	if (m->scan_aborted || !mt_rf_allowed(m) || m->disconnecting ||
 	    (m->scan_home_channel && !m->connected)) {
@@ -166,17 +184,21 @@ static int mt_scan_submit_next(struct mt7932 *m)
 	reinit_completion(&m->scan_done);
 	spin_unlock_irqrestore(&m->response_lock, flags);
 	ret = mt7932_scan_body(body, sizeof(body), m->scan_seq, channels, count);
+	if (ret >= 0 && passive)
+		mt7932_scan_passive(body);
 	if (ret >= 0)
 		ret = mt7932_scan_home(body, m->scan_home_channel);
 	if (ret >= 0)
-		ret = mt7932_scan_options(body, request->n_ssids ? request->ssids[0].ssid : NULL,
-			request->n_ssids ? request->ssids[0].ssid_len : 0, request->ie, request->ie_len);
+		ret = mt7932_scan_options(body, ssid ? ssid->ssid : NULL,
+					  ssid ? ssid->ssid_len : 0,
+					  request->ie, request->ie_len);
 	if (ret >= 0) {
 		schedule_delayed_work(&m->scan_timeout_work, msecs_to_jiffies(60000));
 		ret = mt_request(m, 3, true, true, false, body, sizeof(body));
 	}
 	if (!ret)
-		dev_info(&m->pdev->dev, "SCAN_SUBMITTED: seq=%u band=%u channels=%u\n", m->scan_seq, m->scan_band, count);
+		dev_info(&m->pdev->dev, "SCAN_SUBMITTED: seq=%u band=%u channels=%u passive=%u\n",
+			 m->scan_seq, m->scan_band, count, passive);
 	return ret;
 }
 
@@ -295,7 +317,7 @@ int mt_scan(struct wiphy *wiphy, struct cfg80211_scan_request *request)
 		if (!mt7932_channel_band(channel->hw_value) ||
 		    (channel->band != NL80211_BAND_2GHZ &&
 		     channel->band != NL80211_BAND_5GHZ) ||
-		    channel->flags & (IEEE80211_CHAN_DISABLED | IEEE80211_CHAN_NO_IR | IEEE80211_CHAN_NO_20MHZ))
+		    channel->flags & (IEEE80211_CHAN_DISABLED | IEEE80211_CHAN_NO_20MHZ))
 			return -EINVAL;
 	}
 	mutex_lock(&m->command_mutex);
@@ -306,6 +328,7 @@ int mt_scan(struct wiphy *wiphy, struct cfg80211_scan_request *request)
 		goto out;
 	}
 	m->scan_band = 0;
+	m->scan_batch = 0;
 	m->scan_home_channel = m->connected ? m->connect_channel : 0;
 	m->scan_request = request;
 	m->scan_finished = m->scan_aborted = false;

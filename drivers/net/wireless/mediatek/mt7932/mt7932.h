@@ -83,7 +83,7 @@ struct mt7932 {
 	struct ieee80211_channel channels[13];
 	struct ieee80211_channel channels5[4];
 	struct ieee80211_supported_band band5;
-	u8 scan_band;
+	u8 scan_band, scan_batch;
 	struct ieee80211_rate rates[12];
 	struct work_struct startup_work;
 	struct mutex command_mutex;

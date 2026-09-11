@@ -16,6 +16,9 @@ struct mt7932_policy {
 };
 
 struct mt7932_reg_snapshot {
+	/* Requested cfg80211 country; domain carries the selected firmware
+	 * profile. Stock unknown-country startup uses XZ while Linux stays 00.
+	 */
 	u8 alpha2[2];
 	u8 domain[148];
 	u16 length;
@@ -59,12 +62,27 @@ static inline int mt7932_policy_parse(struct mt7932_policy *out,
 		if (i >= 1 && i <= 9) {
 			unsigned int count = i == 2 || i == 9 ? 5 : 8;
 
+			/* The stock fallback includes power data for channel 14.
+			 * This is not channel permission: our cfg80211/CID0f lists
+			 * still exclude it, and the driver cannot scan or join it.
+			 */
+			if (i == 2 && !memcmp(alpha2, "XZ", 2))
+				count = 6;
 			if (p[0] != 3 || p[1] != 0x0a || p[4] != count ||
 			    p[5] != (i <= 2 ? 1 : 2) ||
 			    p[6] != (i == 2 || i == 9) || p[7] ||
 			    memcmp(p + 8, alpha2, 2) || p[10] || p[11] ||
 			    n != 44 + count * 122)
 				return -EINVAL;
+			if (!memcmp(alpha2, "XZ", 2)) {
+				unsigned int j;
+
+				for (j = 0; i <= 2 && j < count; j++)
+					if (p[44 + j * 122] != (i - 1) * 8 + j + 1)
+						return -EINVAL;
+				if (i > 1 && memcmp(p + 12, out->table[1] + 12, 32))
+					return -EINVAL;
+			}
 		} else {
 			static const u16 lengths[] = {532, 144, 58, 265};
 			static const u8 types[] = {5, 1, 4, 2};
