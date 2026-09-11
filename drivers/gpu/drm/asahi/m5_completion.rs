@@ -20,12 +20,17 @@ impl M5GraphicsCompletion {
     /// This diagnostic owns qids 10/11 and event stamp 0x100 on a fresh boot.
     /// Queue retirement and framebuffer verification remain separate gates.
     pub(crate) fn pair_complete(self, list_address: u64) -> bool {
+        self.pair_complete_at(list_address, 0x100)
+    }
+
+    pub(crate) fn pair_complete_at(self, list_address: u64, stamp: u32) -> bool {
         list_address != 0
+            && stamp != 0 && stamp & 0xff == 0
             && self.submitted == 2
             && self.completed == self.submitted
             && self.linked == 0
             && self.list == [0, list_address]
-            && self.stamps == [0x100; 2]
+            && self.stamps == [stamp; 2]
             && self.signalled & 0xc00 == 0xc00
     }
 }
@@ -77,5 +82,16 @@ mod tests {
         assert!(!M5GraphicsCompletion { list: [0, LIST + 8], ..finished() }.pair_complete(LIST));
         assert!(!M5GraphicsCompletion { linked: 1, ..finished() }.pair_complete(LIST));
         assert!(!finished().pair_complete(0));
+    }
+
+    #[test]
+    fn previous_frame_signals_cannot_complete_a_new_frame() {
+        assert!(!finished().pair_complete_at(LIST, 0x200));
+        assert!(M5GraphicsCompletion { stamps: [0x200; 2], ..finished() }
+            .pair_complete_at(LIST, 0x200));
+        assert!(!M5GraphicsCompletion { stamps: [0; 2], ..finished() }
+            .pair_complete_at(LIST, 0));
+        assert!(!M5GraphicsCompletion { stamps: [0x101; 2], ..finished() }
+            .pair_complete_at(LIST, 0x101));
     }
 }

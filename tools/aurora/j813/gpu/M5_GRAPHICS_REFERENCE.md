@@ -2,9 +2,10 @@
 
 The 2026-09-11 native macOS 25G76 reference captures a 256x256 triangle on
 Apple M5 through both TA and fragment SKSM queues. This is a reference for
-the Linux graphics implementation. Linux has a verified compute triangle;
-Linux vertex/fragment rendering, Mesa admission and DCP presentation remain
-unqualified.
+the Linux graphics implementation. Linux now has verified compute and
+TA/fragment triangles, including three consecutive TA/fragment renders with
+fresh output and completion stamps. Mesa admission and DCP presentation
+remain unqualified. The sections below record the successive bring-up stages.
 
 ## Completed native ownership capture
 
@@ -60,7 +61,8 @@ The graphics memory owner can create firmware aliases of its existing
 user pages before context publication. It verifies matching physical
 translations and returns the alias owners to the eventual job. This
 supports shared PM page lists and scene counters without allocating a
-second unrelated backing store. Runtime graphics submission remains absent.
+second unrelated backing store. Runtime graphics submission was still absent
+at this codec stage; the later hardware qualifications are recorded below.
 
 `drivers/gpu/drm/asahi/m5_render.rs` now constructs the M5 main and partial
 register programs from shared render resources and explicit M5 controls.
@@ -328,3 +330,43 @@ rendering, general Mesa/OpenGL submission and DCP/XFCE remain unverified.
 Use `--after-graphics-draw --graphics-shared-list` with the retained RAM
 reader for this layout. Omitting the second flag preserves the earlier
 draw's capture addresses.
+
+## Consecutive Linux frames
+
+The 2026-09-11 repeat test completed three TA/fragment pairs in one context.
+Before frames 2 and 3, Linux erased and read back all 65,536 output pixels.
+Each frame produced 18,432 foreground and 47,104 background pixels, with
+zero unexpected or untouched pixels and zero incorrect checked pixels.
+Both queues retired after each pair; the scheduler unlinked and the shared
+list became empty. Firmware advanced the two software stamps through
+`0x100`, `0x200`, and `0x300`, with fresh completion event bits for each pair.
+Mode12 returned `Ok(())` and both firmware stop requests succeeded.
+
+The repeat path appends fresh queue and SKSM entries, restores only retired
+descriptor/scene records, and preserves the context and PB/USC allocation
+owners. It retains old software stamps until firmware writes the next
+generation. This test does not qualify ring wrap, concurrent clients or
+arbitrary shaders: only three sequential generations of the controlled draw
+have been tested, although the diagnostic accepts 1..64 frames.
+
+The first repeat candidate overflowed the kernel stack during setup, before
+any draw. The corrected implementation allocates the retained firmware graph
+on the heap and completes base allocation before graphics construction.
+It separates the descriptor builders and stores scene templates on the heap.
+The boot initialization frame decreased from 5,264 to 288 bytes; hardware
+then completed all three draws. Eleven descriptor tests pass with the change.
+
+The final retained capture contains 30 objects from 200 physical pages,
+with no failed objects. Independent verification checks all 65,536 pixels,
+the empty shared list, scheduler total/completed `2/2`, both retired inner
+queues at position 10 and both stamps `0x300`. Its framebuffer is an exact
+match for the native-reference SHA256 above. The verifier rejects this
+capture when asked to qualify frame 1.
+
+Run `run-m5-queue-install-probe.py 12 --frames 3` with the qualified trace mask
+`M5_FW_TRACE=0x203` after a fresh diagnostic boot. Capture with
+`--after-graphics-draw --graphics-shared-list`, then verify with
+`verify-m5-linux-graphics.py --require-completion --frame 3 CAPTURE OUTPUT.png`.
+The final capture proves frame 3; the ordered driver log and output-reset
+checks establish the preceding draws. Mesa/OpenGL and DCP remain separate
+unverified integration steps.

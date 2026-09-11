@@ -411,6 +411,7 @@ fn put_u64(raw: &mut [u8], offset: usize, value: u64) {
 
 /// Construct the M5 TA record's common layout and all register programs.
 /// Runtime ownership/completion fields must be populated before publication.
+#[inline(never)]
 pub(crate) fn build_ta_descriptor_base(
     p: &G17pRenderParameters,
     controls: &M5RenderControls,
@@ -439,6 +440,7 @@ pub(crate) fn build_ta_descriptor_base(
 
 /// Construct the M5 fragment record, including all three partial programs.
 /// The shared encoder is pure and does not apply Neo diagnostic overrides.
+#[inline(never)]
 pub(crate) fn build_fragment_descriptor_base(
     p: &G17pRenderParameters,
     controls: &M5RenderControls,

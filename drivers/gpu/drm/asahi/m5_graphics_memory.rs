@@ -200,4 +200,16 @@ impl M5GraphicsMemory {
         }
         Ok(result)
     }
+
+    /// The parent must first verify both queues, stamps and scheduler unlink.
+    /// Keep the published context and its allocations; only erase its output.
+    pub(super) fn reset_completed_output(&mut self) -> Result {
+        for page_index in 0..bundle::PIXEL_PAGES {
+            self.pages[self.output_first + page_index].with_bytes_mut(|bytes| {
+                bytes.fill(0xa5);
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
 }
