@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Verify and display captured Linux TA/fragment pixels without synthesizing them.
 
-This qualifies the controlled offscreen draw, not completion bookkeeping,
-Mesa/OpenGL or DCP. The PNG contains only captured GPU bytes, enlarged by
-an integer factor when requested.
+This qualifies the controlled offscreen draw. --require-completion also
+checks the shared job list, current stamps and firmware notification.
+Mesa/OpenGL and DCP are separate. The PNG contains only captured GPU bytes,
+enlarged by an integer factor when requested.
 """
 import argparse
 import hashlib
@@ -58,7 +59,57 @@ def read_capture(directory):
     item, rgba = objects['graphics-pixels']
     if item['context'] != 3 or int(item['address'], 16) != PIXEL_ADDRESS:
         raise ValueError('Captured pixels are not the owned graphics output')
-    return rgba, len(objects)
+    return rgba, objects
+
+
+def verify_completion(objects):
+    expected = {
+        'graphics-queues': (0xfffffc20c0000000, 0x1c000),
+        'graphics-completion-list': (0xfffffc20c0020000, 0x4000),
+        'graphics-scheduler': (0xfffffc20c1008000, 0x400),
+        'graphics-submitted-total': (0xfffffc20c1080000, 0x4000),
+        'graphics-stamps-a': (0xfffffc20c1084000, 0x4000),
+        'gfx-event-records': (0xfffffc200002f100, 0x4800),
+    }
+    data = {}
+    for label, (address, size) in expected.items():
+        if label not in objects:
+            raise ValueError('Missing completion evidence: ' + label)
+        item, raw = objects[label]
+        if item['context'] != 0 or int(item['address'], 16) != address or len(raw) != size:
+            raise ValueError('Unexpected completion object: ' + label)
+        data[label] = raw
+    u32 = lambda raw, off: struct.unpack_from('<I', raw, off)[0]
+    u64 = lambda raw, off: struct.unpack_from('<Q', raw, off)[0]
+    root = expected['graphics-completion-list'][0]
+    listing = data['graphics-completion-list']
+    if (u64(listing, 0), u64(listing, 8)) != (0, root):
+        raise ValueError('Graphics completion list is not empty')
+    queues = data['graphics-queues']
+    for qid, pointers in ((10, 0x4000), (11, 0xc000)):
+        if u64(queues, qid * 0xc0 + 0x10) != root:
+            raise ValueError('Graphics stages do not share the completion list')
+        if [u32(queues, pointers + off) for off in (0, 0x30, 0x40)] != [4, 4, 4]:
+            raise ValueError('Graphics command queue has not retired')
+    scheduler = data['graphics-scheduler']
+    if (u64(scheduler, 0) != expected['graphics-submitted-total'][0]
+            or u32(data['graphics-submitted-total'], 0) != 2
+            or u32(scheduler, 0xc) != 2
+            or any(u32(scheduler, off) for off in (0x14, 0x18, 0x1c, 0x28, 0x4c, 0x70, 0x94))):
+        raise ValueError('Graphics scheduler is still pending or linked')
+    if [u32(data['graphics-stamps-a'], qid * 4) for qid in (10, 11)] != [0x100, 0x100]:
+        raise ValueError('Both current software stamps are required')
+    mask = 0
+    events = data['gfx-event-records']
+    for off in range(0, len(events), 0x48):
+        kind = u32(events, off)
+        if kind == 4:
+            raise ValueError('Firmware recovery event invalidates completion')
+        if kind == 1:
+            mask |= u64(events, off + 4) | (u64(events, off + 12) << 64)
+    if mask & 0xc00 != 0xc00:
+        raise ValueError('Both firmware completion notifications are required')
+    return True
 
 
 def png(rgba, scale):
@@ -85,19 +136,22 @@ def main():
     parser.add_argument('capture', type=Path)
     parser.add_argument('output', type=Path)
     parser.add_argument('--scale', type=int, choices=(1, 2), default=2)
+    parser.add_argument('--require-completion', action='store_true',
+                        help='Reject captures without complete paired-render ownership evidence')
     args = parser.parse_args()
     rgba, objects = read_capture(args.capture)
     foreground = verify_pixels(rgba)
     digest = hashlib.sha256(rgba).hexdigest()
     if digest != NATIVE_REFERENCE_SHA256:
         raise ValueError('Linux pixels differ from the qualified native macOS reference')
+    completion = verify_completion(objects) if args.require_completion else False
     args.output.write_bytes(png(rgba, args.scale))
     report = dict(graphics_pixels_verified=True, pixels=WIDTH * HEIGHT,
                   foreground=foreground, background=WIDTH * HEIGHT - foreground,
                   rgba_sha256=digest, native_reference_exact_match=True,
-                  captured_objects=objects, source_size=[WIDTH, HEIGHT],
+                  captured_objects=len(objects), source_size=[WIDTH, HEIGHT],
                   image_size=[WIDTH * args.scale, HEIGHT * args.scale],
-                  completion_bookkeeping_qualified=False,
+                  completion_bookkeeping_qualified=completion,
                   mesa_glxgears_verified=False, dcp_verified=False)
     args.output.with_suffix('.json').write_text(json.dumps(report, indent=2) + '\n')
     print(json.dumps(report))

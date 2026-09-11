@@ -245,11 +245,12 @@ stopped before drawing because that guard still expected the compute value.
 
 Mode 12 now verifies installation before publishing the user context and
 draw commands. The draw adds two more records to the shared outer ring and
-three commands to each inner queue. Completion requires outer counters
-`[4,4,4]`, both inner counters `[4,4,4]`, zero pending commands and the
-expected pixel result. The pending-command bookkeeping check remains
-unqualified. Do not unload the module or retry firmware startup within a
-retained failed boot.
+three commands to each inner queue. Queue retirement requires outer counters
+`[4,4,4]` and both inner counters `[4,4,4]`. The original zero-pending check
+was incorrect: firmware compares completed stages against a host-owned
+submitted total. The completion-list correction below additionally checks
+the scheduler, host stamps and firmware notifications. Do not unload the
+module or retry firmware startup within a retained failed boot.
 
 ## Verified Linux TA/fragment framebuffer
 
@@ -274,7 +275,56 @@ equations. Its PNG uses captured bytes with 2x integer enlargement; it does
 not render a substitute triangle. Truncated input, changed colors and wrong
 geometry are rejected, and the PNG round trip preserves every source pixel.
 
-Linux compute and this controlled TA/fragment draw are hardware-proven.
-Completion accounting, a general Mesa/OpenGL workload and DCP presentation
-in XFCE remain unfinished. The image is an offscreen GPU framebuffer, not
-evidence of DCP scanout or an accelerated desktop.
+This first controlled TA/fragment draw established correct pixels while
+completion accounting remained unqualified. The correction and its later
+hardware result follow below. The image is an offscreen GPU framebuffer;
+DCP scanout and an accelerated desktop require separate verification.
+
+## Shared graphics completion list
+
+Both retained native channels have the same `channel+0x10` job-list pointer,
+`0xfffffc2000000048`. Linux initially allocated one list per channel. The
+TA stage linked the shared scheduler into its list, then the fragment stage
+checked a different, empty list. The retained scheduler consequently held
+both completed stages (`+0xc == 2`) but stayed linked (`+0x94 == 1`), with
+both software stamps zero.
+
+Pinned 25G76 GFX firmware SHA256
+`40f8c4eccadff17ee02b8f3afb480f2e0980a6a3d32f88f69fb32f864e247b0e`
+establishes the ownership: `0x17c00` skips relinking a scheduler already on
+a list; `0x17544..0x17568` compares completed stages with the submitted
+total; `0x1763c..0x1765c` unlinks a finished scheduler. The total is not
+decremented. `0x17a68` and `0x17ae0` write each stage's first stamp pointer,
+then `0x17b98` publishes the accumulated stamp-event mask. The second stamp
+pointer remains an observation, not an independently required signal.
+
+Linux gives both channels one uncached list at
+`0xfffffc20c0020000`. Host-visible submitted totals and stamps are uncached
+at `0xfffffc20c1080000`, `+0x4000`, and `+0x8000`, separate from cached
+descriptors. Completion requires total/completed `2/2`, scheduler unlinked,
+an empty list with its own tail sentinel, current software stamps `0x100`
+for qids10/11, and both primary-firmware event bits. Queue retirement and
+correct framebuffer pixels are still required.
+
+The 2026-09-11 hardware run passed these gates and returned `Ok(())` from
+mode12. Firmware emitted the scheduler-unlink traces `0x10b`/`0x10d`, TA
+and fragment stamp traces `0xa`/`0xc`, and a primary type1 event mask `0xc00`.
+The final state was submitted/completed `2/2`, linked `0`, empty list,
+software stamps `[0x100,0x100]`, and retired outer/inner queues. Both firmware
+stop requests then succeeded. The second stamp words remained zero, as the
+completion handler's first-pointer stores predicted.
+
+A retained capture of 30 objects through 200 physical pages independently
+confirmed the cleared scheduler/list, both current stamps, both firmware
+notification bits and all 65,536 expected pixels. Its framebuffer SHA256
+is the same native-reference hash above. `verify-m5-linux-graphics.py
+--require-completion CAPTURE_DIR OUTPUT.png` rejects missing stage signals,
+stale stamps, a linked scheduler, nonretired queues and recovery records;
+it also rejects the earlier correctly rendered but stranded capture.
+
+This qualifies completion for one controlled offscreen pair. Repeated
+rendering, general Mesa/OpenGL submission and DCP/XFCE remain unverified.
+
+Use `--after-graphics-draw --graphics-shared-list` with the retained RAM
+reader for this layout. Omitting the second flag preserves the earlier
+draw's capture addresses.

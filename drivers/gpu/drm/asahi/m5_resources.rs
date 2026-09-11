@@ -64,6 +64,7 @@ pub(crate) struct M5FirmwareMemory {
     trace_printed: [u32; 2],
     compute_kick_observed: bool,
     compute_dispatch_returned: bool,
+    graphics_stamp_flags: u128,
     uat: Arc<mmu::Uat>,
 }
 
@@ -266,7 +267,8 @@ impl M5FirmwareMemory {
         Ok(Self { primary_root, secondary_root, shared, private, region_a, region_c, fwctl, aon, qos,
                   pbdesc, uma, completions, aliases, registers, queue_probe, program, graphics,
                   report_counts: [[0; 2]; 2], trace_printed: [0; 2],
-                  compute_kick_observed: false, compute_dispatch_returned: false, uat })
+                  compute_kick_observed: false, compute_dispatch_returned: false,
+                  graphics_stamp_flags: 0, uat })
     }
 
     /// Drain M5 report channels using the native producer contracts.
@@ -300,6 +302,10 @@ impl M5FirmwareMemory {
                         dev_info!(dev.as_ref(), "M5_EVENT role={} ordinal={} type={} payload={:x?}\n",
                             role, count, word(0), [qword(4), qword(12), qword(20), qword(28), qword(36)]);
                         recovery |= word(0) == 4;
+                        if role == 0 && word(0) == 1 {
+                            self.graphics_stamp_flags |= u128::from(qword(4))
+                                | (u128::from(qword(12)) << 64);
+                        }
                     } else {
                         let args = [qword(12), qword(20), qword(28), qword(36)];
                         // This one-shot diagnostic owns qid11/stamp1. The
@@ -366,6 +372,23 @@ impl M5FirmwareMemory {
         self.graphics.as_mut().ok_or(EINVAL)?.0.result()
     }
 
+    pub(crate) fn graphics_completion(&mut self) -> Result<crate::m5_completion::M5GraphicsCompletion> {
+        let (job, queues) = self.graphics.as_mut().ok_or(EINVAL)?;
+        let progress = job.progress()?;
+        let scheduler = job.scheduler_status()?;
+        Ok(crate::m5_completion::M5GraphicsCompletion {
+            submitted: progress[0], completed: scheduler[0], linked: scheduler[1],
+            list: queues.completion_list()?, stamps: [progress[1], progress[3]],
+            signalled: self.graphics_stamp_flags,
+        })
+    }
+
+    pub(crate) fn graphics_pair_complete(
+        completion: crate::m5_completion::M5GraphicsCompletion,
+    ) -> bool {
+        completion.pair_complete(graphics_queues::JOB_LIST)
+    }
+
     pub(crate) fn graphics_installation_status(&mut self) -> Result<([[u64; 5]; 2], [u64; 2], [u64; 2])> {
         self.graphics.as_mut().ok_or(EINVAL)?.1.installation_status()
     }
@@ -390,6 +413,7 @@ impl M5FirmwareMemory {
             || progress != [2, 0, 0, 0, 0] { return Err(EBUSY); }
         let (job, queues) = self.graphics.as_mut().ok_or(EINVAL)?;
         if !queues.installed()? { return Err(EBUSY); }
+        self.graphics_stamp_flags = 0;
         job.publish_context()?;
         queues.publish_draw()?;
         self.publish_graphics_records(2, 4)
