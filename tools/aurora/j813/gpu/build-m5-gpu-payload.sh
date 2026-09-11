@@ -44,6 +44,12 @@ if [[ -f "$task_graphics_bundle" ]]; then
     install -Dm600 "$task_graphics_bundle" \
         "$task_ramfs/lib/firmware/asahi/m5-25g76-graphics.bin"
 fi
+# The mode14 application-ABI smoke test never publishes a GPU command.
+cc -static -Os -s -Wall -Wextra -Werror -D__user= \
+    -I "$task_root/linux/include/uapi/drm" \
+    "$task_root/linux/tools/aurora/j813/m5-drm-smoke.c" \
+    -o "$task_out/m5-drm-smoke"
+install -Dm755 "$task_out/m5-drm-smoke" "$task_ramfs/usr/local/bin/m5-drm-smoke"
 (cd "$task_ramfs"; find . -print0 | cpio --null -o --format=newc --owner=0:0 2>/dev/null | gzip -9) \
     >"$task_out/initramfs.cpio.gz"
 (cd "$task_out"; sha256sum Image t8142-j813.dtb kernel.config apple-ave.ko initramfs.cpio.gz > boot-SHA256SUMS)

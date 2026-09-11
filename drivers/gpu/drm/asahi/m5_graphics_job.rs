@@ -236,6 +236,8 @@ impl M5GraphicsJob {
 
     pub(super) fn publish_context(&mut self) -> Result { self.program.publish() }
 
+    pub(super) fn quarantine(&self) { self.program.quarantine(); }
+
     pub(super) fn progress(&mut self) -> Result<[u32; 5]> {
         Ok([self.signals.read_u32(SIGNALS_HIGH + SUBMITTED as u64)?,
             self.signals.read_u32(SIGNALS_HIGH + STAMPS_A as u64 + QUEUE_IDS[0] as u64 * 4)?,
@@ -299,7 +301,7 @@ fn put64(out: &mut [u8], offset: usize, value: u64) {
 
 /// Addresses are the bounded native-program bundle's user ABI. Kernel
 /// objects and hardware IDs above are freshly owned by this job.
-fn triangle_parameters() -> (g17_render::G17pRenderParameters, m5_render::M5RenderControls) {
+pub(super) fn triangle_parameters() -> (g17_render::G17pRenderParameters, m5_render::M5RenderControls) {
     let mut p = g17_render::G17pRenderParameters::source_rsrc8();
     p.aux_fb = 0x10000288000;
     p.aux_fb_flags = 0x10c001;

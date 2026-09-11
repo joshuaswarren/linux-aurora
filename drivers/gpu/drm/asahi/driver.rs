@@ -162,6 +162,7 @@ enum AsahiRuntime {
     Legacy(ARef<drm::Device<AsahiDriver>>),
     G17P(g17_drm::SharedG17PRuntime),
     M5(g17_live_boot::m5::M5Runtime),
+    M5Drm(crate::m5_drm::SharedM5Runtime),
 }
 
 pub(crate) struct AsahiDriver {
@@ -421,7 +422,8 @@ fn probe_t8140_runtime(
     Ok(runtime)
 }
 
-fn probe_t8142_initdata(pdev: &platform::Device<Core>) -> Result<g17_live_boot::m5::M5Runtime> {
+fn prepare_t8142_device(pdev: &platform::Device<Core>)
+    -> Result<(ARef<AsahiDevice>, regs::Resources, hw::GpuIdConfig)> {
     // The RAM loader supplies this receipt only after checking both loaded
     // TEXT images against the exact M5 profile, including all instructions.
     let chosen = of::chosen().ok_or(ENODEV)?;
@@ -443,7 +445,38 @@ fn probe_t8142_initdata(pdev: &platform::Device<Core>) -> Result<g17_live_boot::
         pin_init::pin_init_from_closure::<AsahiData, kernel::error::Error>(|_slot| Ok(()))
     };
     let drm: ARef<AsahiDevice> = drm::device::Device::new(pdev.as_ref(), uninit)?;
-    g17_live_boot::m5::M5Runtime::start(pdev, drm, registers)
+    Ok((drm, registers, observed))
+}
+
+fn probe_t8142_initdata(pdev: &platform::Device<Core>) -> Result<g17_live_boot::m5::M5Runtime> {
+    let (drm, registers, _) = prepare_t8142_device(pdev)?;
+    if *crate::module_parameters::m5_initdata_test.value() == 13 {
+        g17_live_boot::m5::M5Runtime::start_application(pdev, drm, registers)
+    } else {
+        g17_live_boot::m5::M5Runtime::start(pdev, drm, registers)
+    }
+}
+
+fn probe_t8142_runtime(pdev: &platform::Device<Core>) -> Result<crate::m5_drm::SharedM5Runtime> {
+    let (drm, registers, observed) = prepare_t8142_device(pdev)?;
+    let runtime = g17_live_boot::m5::M5Runtime::start_application(pdev, drm.clone(), registers)?;
+    let runtime = Arc::pin_init(new_mutex!(runtime), GFP_KERNEL)?;
+    let gpu: Arc<dyn drm_gpu::DrmGpu> = Arc::new(
+        crate::m5_drm::M5DrmGpu::new(runtime.clone(), observed), GFP_KERNEL)?;
+    let data = try_pin_init!(AsahiData {
+        gpu, pdev: pdev.into(), resources: None, g17_runtime: None,
+        g17_event_work <- new_work!("AsahiData::g17_event_work"),
+        g17_recovery_work <- new_work!("AsahiData::g17_recovery_work"),
+    });
+    let ptr: *const AsahiData = &raw const **drm;
+    // SAFETY: prepare_t8142_device leaves this data slot uninitialized. This
+    // is its sole initialization, before registration exposes file operations.
+    unsafe { data.__pinned_init(ptr as *mut AsahiData)?; }
+    (*drm).gpu.init()?;
+    drm::driver::Registration::new_foreign_owned(&drm, pdev.as_ref(), 0)?;
+    dev_info!(pdev.as_ref(),
+        "M5_DRM registered experimental first-job render adapter; general Mesa rendering unqualified\n");
+    Ok(runtime)
 }
 
 /// Identify an AGX3 target as far as read-only evidence allows, then refuse.
@@ -973,7 +1006,11 @@ impl platform::Driver for AsahiDriver {
                 });
             }
             ProbeConfig::Agx3Diagnostic(soc) if soc.chip_id == 0x8142
-                && matches!(*crate::module_parameters::m5_initdata_test.value(), 1..=12) => {
+                && *crate::module_parameters::m5_initdata_test.value() == 14 => {
+                return Ok(Self { runtime: AsahiRuntime::M5Drm(probe_t8142_runtime(pdev)?) });
+            }
+            ProbeConfig::Agx3Diagnostic(soc) if soc.chip_id == 0x8142
+                && matches!(*crate::module_parameters::m5_initdata_test.value(), 1..=13) => {
                 return Ok(Self { runtime: AsahiRuntime::M5(probe_t8142_initdata(pdev)?) });
             }
             ProbeConfig::Agx3Diagnostic(soc) => return Err(refuse_agx3_probe(pdev, soc)),
