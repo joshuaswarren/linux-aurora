@@ -7,12 +7,25 @@ initialization data in the native RAM-boot experiment. Linux also registers
 an owned SKSM compute queue, binds its scheduler control, and verifies the
 firmware's retained records.
 An isolated execution context, corrected shader setup and owned compute pool
-now execute one verified SKSM compute job under Linux: all 1,024 outputs match,
+now execute verified SKSM compute programs under Linux: all 1,024 outputs match,
 inputs remain unchanged, and both command queues retire without a reported
 GPU restart. Register `0x14028` must select the populated UMA pool slot; the
 earlier probe owned slot 0 but incorrectly selected slot 2.
 This is a bounded fixed-program diagnostic. It does not expose a render node
-or qualify general shader compilation, graphics rendering or DCP presentation.
+or qualify general shader compilation, vertex/fragment rendering or DCP presentation.
+
+## Linux compute triangle, 2026-09-11
+
+A fresh mode11 RAM boot rendered a 32x32 colored triangle using a compute
+shader. An independent edge-equation check of retained GPU memory verified
+all 1,024 pixels, including 288 triangle pixels and 736 background pixels.
+All inputs remained unchanged, command queues retired, and both firmware stop
+requests succeeded. The retained shader, pipeline and constants match the
+compiled profile. The original arithmetic program remains selectable.
+
+The test image was posted to Discord. It enlarges each GPU pixel 16 times
+without filtering; it is not a 512x512 GPU render or a DCP screenshot.
+See `M5_TRIANGLE_REFERENCE.md` for reproduction and evidence.
 
 ## First Linux compute, 2026-09-11
 

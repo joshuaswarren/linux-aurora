@@ -77,7 +77,7 @@ kernel::module_platform_driver! {
         },
         m5_initdata_test: u32 {
             default: 0,
-            description: "M5 fresh RAM boot: 1=initdata ACKs, 2=openings, 3=queue, 4=scheduler, 5=context, 6=one compute, 7=setup without kick, 8=request stop after admission, 9=live status, 10=live firmware monitors; then request stop, no DRM",
+            description: "M5 fresh RAM boot: 1=initdata ACKs, 2=openings, 3=queue, 4=scheduler, 5=context, 6=one compute, 7=setup without kick, 8=request stop after admission, 9=live status, 10=live firmware monitors, 11=compute triangle; then request stop, no DRM",
         },
         debug_flags: u64 {
             default: 0,

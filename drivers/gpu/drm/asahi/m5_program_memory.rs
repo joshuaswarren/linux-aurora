@@ -15,10 +15,11 @@ pub(super) struct M5ProgramMemory {
     context: mmu::M5ExecutionContext,
     pages: KVec<MappedObject>,
     job: Option<M5ComputeJob>,
+    triangle: bool,
 }
 
 impl M5ProgramMemory {
-    pub(super) fn new(dev: &AsahiDevice, uat: &mmu::Uat, with_job: bool) -> Result<Self> {
+    pub(super) fn new(dev: &AsahiDevice, uat: &mmu::Uat, with_job: bool, triangle: bool) -> Result<Self> {
         let mut context = uat.new_t8142_execution_context()?;
         let mut pages = KVec::new();
         for (address, kind) in [
@@ -39,14 +40,22 @@ impl M5ProgramMemory {
             };
             let mut page = MappedObject::new_wc_at(dev, context.vm(), address,
                 program::PAGE_BYTES, protection)?;
-            page.with_bytes_mut(|out| program::initialize_page(kind, out).map_err(|_| EINVAL))?;
+            page.with_bytes_mut(|out| program::initialize_page_for(kind, out, triangle).map_err(|_| EINVAL))?;
             // Validate each installed leaf before publishing the root pair.
             context.vm().translate_iova(address)?;
             pages.push(page, GFP_KERNEL)?;
         }
+        if triangle {
+            let mut constants = MappedObject::new_wc_at(dev, context.vm(), program::CONSTANTS_PAGE,
+                program::PAGE_BYTES, mmu::PROT_GPU_SHARED_RO)?;
+            constants.with_bytes_mut(|out| program::initialize_page_for(
+                program::PageKind::Constants, out, true).map_err(|_| EINVAL))?;
+            context.vm().translate_iova(program::CONSTANTS_PAGE)?;
+            pages.push(constants, GFP_KERNEL)?;
+        }
         let job = if with_job { Some(M5ComputeJob::new(dev, uat, context.vm())?) } else { None };
         context.publish()?;
-        Ok(Self { context, pages, job })
+        Ok(Self { context, pages, job, triangle })
     }
 
     pub(super) fn uma_descriptor(&self) -> Result<[u64; 4]> {
@@ -64,6 +73,7 @@ impl M5ProgramMemory {
     }
 
     pub(super) fn result(&mut self) -> Result<program::ComputeResult> {
+        let triangle = self.triangle;
         self.pages[4].with_bytes_mut(|bytes| {
             let mut result = program::ComputeResult {
                 inputs_changed: 0, outputs_wrong: 0, outputs_untouched: 0,
@@ -75,7 +85,7 @@ impl M5ProgramMemory {
                     bytes.as_ptr().add(base + index * 4).cast::<u32>()) };
                 result.inputs_changed += usize::from(read(program::INPUT_OFFSET) != index as u32 * 7);
                 let value = read(program::OUTPUT_OFFSET);
-                result.outputs_wrong += usize::from(value != index as u32 * 21 + 5);
+                result.outputs_wrong += usize::from(value != program::expected_output(index, triangle));
                 result.outputs_untouched += usize::from(value == program::SENTINEL);
             }
             Ok(result)
@@ -83,7 +93,7 @@ impl M5ProgramMemory {
     }
 
     pub(super) fn validate_unsubmitted(&mut self) -> Result<[u64; 2]> {
-        if !self.context.is_current() || self.pages.len() != 6 {
+        if !self.context.is_current() || self.pages.len() != 6 + usize::from(self.triangle) {
             return Err(EFAULT);
         }
         let result = self.pages[4].with_bytes_mut(|out| {

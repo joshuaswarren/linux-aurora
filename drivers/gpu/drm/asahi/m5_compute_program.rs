@@ -22,6 +22,21 @@ pub(crate) const ROBUSTNESS_PAGE: u64 = 0x10_0001_8000;
 pub(crate) const INPUT_OFFSET: usize = 0xd00;
 pub(crate) const OUTPUT_OFFSET: usize = 0x1d00;
 
+#[path = "m5_triangle_program.rs"]
+mod triangle;
+pub(crate) const CONSTANTS_PAGE: u64 = triangle::CONSTANTS_PAGE;
+
+pub(crate) fn expected_output(index: usize, triangle: bool) -> u32 {
+    if !triangle { return index as u32 * 21 + 5; }
+    let x = (index % 32) as i32;
+    let y = (index / 32) as i32;
+    if y >= 4 && y < 28 && (2*x-31).abs() <= y-4 {
+        0xffff_0000 | ((y as u32 * 8) << 8) | (x as u32 * 8)
+    } else {
+        0xff18_1818
+    }
+}
+
 // Native replay proves the 64-byte body alone produces no output. The
 // preceding program setup is required: preserving this first 1 KiB and
 // zeroing the remaining page verifies all 1024 replacement results.
@@ -77,15 +92,23 @@ const STREAM: [u32; 12] = [
 ];
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub(crate) enum PageKind { Shader, Pipeline, Stream, Preempt, Buffers, Robustness }
+pub(crate) enum PageKind { Shader, Pipeline, Stream, Preempt, Buffers, Robustness, Constants }
 
 /// Construct one complete owned page; reject the wrong extent before writing.
 pub(crate) fn initialize_page(kind: PageKind, page: &mut [u8]) -> Result<(), ()> {
+    initialize_page_for(kind, page, false)
+}
+
+pub(crate) fn initialize_page_for(kind: PageKind, page: &mut [u8], triangle: bool) -> Result<(), ()> {
     if page.len() != PAGE_BYTES { return Err(()); }
     page.fill(0);
     let (offset, words): (usize, &[u32]) = match kind {
-        PageKind::Shader => (0, &SHADER),
-        PageKind::Pipeline => (0, &PIPELINE),
+        PageKind::Shader => (0, if triangle { &triangle::SHADER } else { &SHADER }),
+        PageKind::Pipeline => (0, if triangle { &triangle::PIPELINE } else { &PIPELINE }),
+        PageKind::Constants => {
+            if !triangle { return Err(()); }
+            (0, &triangle::CONSTANTS)
+        }
         PageKind::Stream => (0, &STREAM),
         PageKind::Preempt => {
             // Ioto's first LDIMM pair selects PREEMPT_PAGE + 0x14a0.

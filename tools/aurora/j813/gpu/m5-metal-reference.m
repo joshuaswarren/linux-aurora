@@ -46,7 +46,8 @@ int main(void)
             if (strlen(expectedOption) != 1 || (expectedOption[0] != '5' && expectedOption[0] != '6')) return 12;
             expectedAdd = (unsigned)(expectedOption[0] - '0');
         }
-        BOOL computeOnly = getenv("M5_REFERENCE_COMPUTE_ONLY") != NULL;
+        BOOL triangle = getenv("M5_REFERENCE_TRIANGLE") != NULL;
+        BOOL computeOnly = triangle || getenv("M5_REFERENCE_COMPUTE_ONLY") != NULL;
         unsigned rounds = computeOnly ? 1 : 3;
         NSString *source = [NSString stringWithFormat:@"#include <metal_stdlib>\nusing namespace metal;\n"
             "kernel void calculate(device const uint *in [[buffer(0)]], "
@@ -56,6 +57,13 @@ int main(void)
             " const float2 p[3] = {float2(-1,-1), float2(3,-1), float2(-1,3)};"
             " return float4(p[i],0,1); }\n"
             "fragment float4 color() { return float4(0.25,0.5,0.75,1.0); }\n", shaderAdd];
+        if (triangle) {
+            NSString *oldBody = [NSString stringWithFormat:@"out[i] = in[i] * 3u + %uu;", shaderAdd];
+            source = [source stringByReplacingOccurrencesOfString:oldBody withString:
+                @"uint p=in[i]/7u; int x=int(p&31u), y=int(p>>5);"
+                 " bool inside=y>=4 && y<28 && abs(2*x-31)<=y-4;"
+                 " out[i]=inside ? (0xffff0000u | (uint(y*8)<<8) | uint(x*8)) : 0xff181818u;"];
+        }
         NSError *error = nil;
         id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&error];
         if (!library) {
@@ -100,9 +108,23 @@ int main(void)
                 [encoder dispatchThreads:MTLSizeMake(1024, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(MIN(64, compute.maxTotalThreadsPerThreadgroup), 1, 1)];
                 [encoder endEncoding];
+                if (getenv("M5_REFERENCE_WAIT_STDIN")) {
+                    fprintf(stderr,"M5_REFERENCE_READY\n"); fflush(stderr);
+                    if (getchar() != '\n') return 13;
+                }
                 if (!finish(command, timings)) return 7;
-                for (unsigned i = 0; i < 1024; i++)
-                    if (((uint32_t *)output.contents)[i] != (i * 7u + round) * 3u + expectedAdd) return 8;
+                for (unsigned i = 0; i < 1024; i++) {
+                    int x=i%32, y=i/32;
+                    BOOL covered = y>=4 && y<28 && abs(2*x-31)<=y-4;
+                    uint32_t expected = triangle ? (covered ? 0xffff0000u | ((uint32_t)y*8<<8) | (uint32_t)x*8 : 0xff181818u)
+                                                : (i*7u+round)*3u+expectedAdd;
+                    if (((uint32_t *)output.contents)[i] != expected) return 8;
+                    if (((uint32_t *)input.contents)[i] != i*7u+round) return 14;
+                }
+                if (triangle) {
+                    NSData *image = [NSData dataWithBytes:output.contents length:4096];
+                    if (![image writeToFile:@"/tmp/m5-compute-triangle-reference.rgba" atomically:YES]) return 15;
+                }
                 if (computeOnly) continue;
 
                 MTLTextureDescriptor *textureDescriptor = [MTLTextureDescriptor
@@ -132,6 +154,7 @@ int main(void)
         NSDictionary *result = @{@"platform": @"macOS reference", @"gpu": device.name,
             @"queues": @(rounds), @"compute_values_verified": @(1024 * rounds),
             @"shader_add": @(shaderAdd), @"expected_add": @(expectedAdd),
+            @"compute_triangle": @(triangle),
             @"render_pixels_verified": @(computeOnly ? 0 : 4096 * rounds), @"command_gpu_ms": timings,
             @"linux_gpu_proven": @NO, @"dcp_presentation_tested": @NO};
         NSData *data = [NSJSONSerialization dataWithJSONObject:result options:NSJSONWritingPrettyPrinted error:nil];

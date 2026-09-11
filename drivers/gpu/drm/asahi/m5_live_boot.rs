@@ -150,12 +150,15 @@ impl M5Session {
         }
         if probe_kind >= 5 {
             let roots = self.memory.as_mut().ok_or(EIO)?.validate_program_context()?;
-            dev_info!(self.dev.as_ref(), "M5_CONTEXT prepared id3 roots={:x?}; six pages, 1024 untouched outputs, no kicks\n", roots);
+            let triangle = probe_kind == 11;
+            let page_count = if triangle { 7 } else { 6 };
+            dev_info!(self.dev.as_ref(), "M5_CONTEXT prepared id3 roots={:x?}; pages={} triangle={} 1024 untouched outputs, no kicks\n",
+                roots, page_count, triangle);
         }
         if probe_kind >= 6 {
             self.retire_idle_policy()?;
             self.submit_compute(probe_kind != 7, probe_kind == 8, probe_kind >= 9,
-                                probe_kind == 10)?;
+                                probe_kind >= 10)?;
         }
         Ok(())
     }
