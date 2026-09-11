@@ -43,6 +43,8 @@ parser.add_argument('--graphics-usc-pool', action='store_true',
                     help='Capture relocated graphics USC addresses and unmapped guard-page walks')
 parser.add_argument('--graphics-parameter-buffer', action='store_true',
                     help='Capture the dynamic parameter-buffer directory and firmware aliases')
+parser.add_argument('--graphics-render-targets', action='store_true',
+                    help='Capture VM-owned tile/viewport/status/auxiliary resources')
 parser.add_argument('--context', type=int, choices=range(3, 64), default=3,
                     help='Application root slot used by the mode12 graphics draw')
 args = parser.parse_args()
@@ -52,6 +54,8 @@ if args.graphics_usc_pool and not args.after_graphics_draw:
     parser.error('--graphics-usc-pool requires --after-graphics-draw')
 if args.graphics_parameter_buffer and not args.after_graphics_draw:
     parser.error('--graphics-parameter-buffer requires --after-graphics-draw')
+if args.graphics_render_targets and not args.after_graphics_draw:
+    parser.error('--graphics-render-targets requires --after-graphics-draw')
 if args.context != 3 and not args.after_graphics_draw:
     parser.error('--context requires --after-graphics-draw')
 if args.triangle and not (args.after_success or args.after_live_snapshot):
@@ -186,6 +190,36 @@ with Serial('/dev/cu.kis-01100000-ch-0', 115200, timeout=0.2) as port:
             item['error'] = str(error)
         manifest['objects'].append(item)
 
+    def compact_span(base, size):
+        if base & 0x7fff or size <= 0 or size & 0x3fff or not (
+                0x1000000000 <= base < base + size + 0x8000 <= 0x1100000000):
+            raise ValueError('Resource span escaped the compact arena')
+        pages = []
+        for offset in range(0, size, 0x4000):
+            physical, walk = walker.translate(args.context, base + offset)
+            pages.append(dict(address=hex(base + offset), physical=hex(physical),
+                walk=[[hex(a), hex(e)] for a, e in walk]))
+        guards = []
+        for address in (base + size, base + size + 0x4000):
+            walk = []
+            def guard_read(physical, length):
+                raw = read_phys(physical, length)
+                if length != 8:
+                    raise ValueError('Unexpected compact guard read size')
+                walk.append([hex(physical), hex(int.from_bytes(raw, 'little'))])
+                return raw
+            guard_walker = G17PUATReader(read_phys, props['gpu-region-base'],
+                read_root=guard_read, read_table=guard_read)
+            try:
+                guard_walker.translate(args.context, address)
+            except RuntimeError as error:
+                if not str(error).startswith('unmapped G17P UAT address '):
+                    raise
+            else:
+                raise RuntimeError('Compact resource guard acquired a mapping')
+            guards.append(dict(address=hex(address), walk=walk))
+        return dict(address=hex(base), size=size, context=args.context, pages=pages, guards=guards)
+
     try:
         save('context-root-table', props['gpu-region-base'], 0x400)
         save('primary-status-b', 0xfffffc2000020340, 0x5000, 0)
@@ -264,36 +298,28 @@ with Serial('/dev/cu.kis-01100000-ch-0', 115200, timeout=0.2) as port:
             spans = [(base, 0x80000) for base in blocks] + [
                 (page_list, 0x1c000), (metrics & ~0x3fff, 0x4000),
                 (scene_base, 0x4000), (discard, 0x8000)]
-            manifest['graphics_pb_spans'] = []
-            for base, size in spans:
-                if base & 0x7fff or not 0x1000000000 <= base < base + size + 0x8000 <= 0x1100000000:
-                    raise ValueError('Parameter-buffer span escaped the compact arena')
-                pages = []
-                for offset in range(0, size, 0x4000):
-                    physical, walk = walker.translate(args.context, base + offset)
-                    pages.append(dict(address=hex(base + offset), physical=hex(physical),
-                        walk=[[hex(a), hex(e)] for a, e in walk]))
-                guards = []
-                for address in (base + size, base + size + 0x4000):
-                    walk = []
-                    def guard_read(physical, length):
-                        raw = read_phys(physical, length)
-                        if length != 8:
-                            raise ValueError('Unexpected parameter-buffer guard read size')
-                        walk.append([hex(physical), hex(int.from_bytes(raw, 'little'))])
-                        return raw
-                    guard_walker = G17PUATReader(read_phys, props['gpu-region-base'],
-                        read_root=guard_read, read_table=guard_read)
-                    try:
-                        guard_walker.translate(args.context, address)
-                    except RuntimeError as error:
-                        if not str(error).startswith('unmapped G17P UAT address '):
-                            raise
-                    else:
-                        raise RuntimeError('Parameter-buffer guard acquired a mapping')
-                    guards.append(dict(address=hex(address), walk=walk))
-                manifest['graphics_pb_spans'].append(dict(address=hex(base), size=size,
-                    context=args.context, pages=pages, guards=guards))
+            manifest['graphics_pb_spans'] = [compact_span(base, size) for base, size in spans]
+        if args.graphics_render_targets:
+            ta = walker.read(0xfffffc20c1000000, 0x3000, context=0)
+            fragment = walker.read(0xfffffc20c1004000, 0x3000, context=0)
+            ta_regs = dict(struct.unpack_from('<IQ', ta, 0x60 + i * 12) for i in range(82))
+            frag_regs = dict(struct.unpack_from('<IQ', fragment, 0xa0 + i * 12) for i in range(90))
+            if frag_regs[0x15211] != (256 << 32) | 256:
+                raise ValueError('Render-target capture expects the 256x256 reference')
+            base = 0x1000000000
+            targets = [
+                ('tilemap', base + ta_regs[0x1c039], 0x4000, 0x1200),
+                ('tpc', base + ta_regs[0x1c0a1], 0x4000, 0x100),
+                ('deflake', base + (ta_regs[0x1c950] & 0xffffffff), 0x4000, 0x1000),
+                ('ta-status', ta_regs[0x14318] & ~1, 0x4000, 0x100),
+                ('fragment-status', frag_regs[0x14080] & ~1, 0x4000, 0x100),
+                ('auxiliary', frag_regs[0x16461], 0x8000, 0x800)]
+            manifest['graphics_target_spans'] = []
+            for name, address, size, prefix in targets:
+                span = compact_span(address, size)
+                span['label'] = 'graphics-target-' + name
+                manifest['graphics_target_spans'].append(span)
+                save(span['label'], address, prefix, args.context)
         if args.graphics_usc_pool:
             state = walker.read(0xfffffc20c101c000, 0x70, context=0)
             directory = struct.unpack_from('<Q', state, 0x14)[0]

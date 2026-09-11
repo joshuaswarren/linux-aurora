@@ -56,6 +56,7 @@ mod m5_render;
 mod m5_completion;
 mod m5_sksm;
 mod m5_vm;
+mod m5_render_target;
 mod microseq;
 mod mmu;
 mod object;

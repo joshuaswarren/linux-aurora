@@ -28,6 +28,8 @@ mod graphics_memory;
 mod graphics_usc;
 #[path = "m5_parameter_buffer.rs"]
 mod parameter_buffer;
+#[path = "m5_target_memory.rs"]
+mod target_memory;
 #[path = "m5_graphics_job.rs"]
 mod graphics_job;
 #[path = "m5_graphics_queues.rs"]
