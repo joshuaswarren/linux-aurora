@@ -406,3 +406,49 @@ This proves the new context plumbing for the controlled native-program draw.
 It does not qualify concurrent clients, dynamic map/unmap invalidation under
 load, general Mesa submissions, glxgears or DCP/XFCE. Those remain separate
 application-runtime and presentation work.
+
+## USC allocation in the application reservation
+
+The graphics USC directory, freelist and all nineteen 2 MiB blocks now use
+free addresses within the VM_CREATE driver reservation. Firmware pointers,
+directory entries and UMA records are derived from the owning mappings.
+Each directory/block reserves two unmapped 16 KiB guard pages in the same
+allocator node; the freelist reserves one. A later allocation cannot consume
+those gaps. Existing callers requesting zero or one guard page retain their
+previous reservation sizes.
+
+The diagnostic graphics VM now reserves the upper 32 GiB below the usable
+42-bit VA limit, matching Mesa's VM_CREATE policy. Its captured application
+program pages retain their original VAs outside that interval. The 2026-09-11
+hardware run placed the USC directory at `0x3f7ffff8000`, the freelist at
+`0x3f800400000`, and all 38 MiB of block backing within
+`[0x3f7ffff8000, 0x3ffffff8000)`. Three consecutive context4 draws produced
+exact pixels, fresh stamps and retired queues. Both stop requests succeeded.
+
+A complete retained capture independently verifies all 65,536 pixels,
+frame3 completion, directory/UMA agreement, nineteen nonoverlapping blocks
+within the reservation, and page-table walks ending in invalid entries for
+all 41 guard pages. It contains 32 objects read through 233 physical pages,
+with no failed objects or device-memory reads. The module is 3,832,368 bytes,
+SHA256 `b00b842e29975bfc6bfaf3927221a9ce7853ab0e65e6ac39b5f76f5000193a03`.
+
+The post-draw UMA free-ring cursors advance while their distance remains
+9,728 units. The retained cursor pair was consumer `0x8d0`, producer `0x2ed0`;
+earlier successful fixed-address captures show the same distance with
+different cursor values. The directory entry just after the initial
+population can therefore contain a returned owned unit. Construction-time
+zero cursors and a zero sentinel are not post-draw invariants. The verifier
+checks the returned population and rejects foreign returned addresses.
+
+Use `--graphics-usc-pool` on the retained-state reader and
+`--require-usc-pool` on the pixel/completion verifier. Eleven synthetic fault
+tests cover stale UMA pointers, missing units, malformed directories,
+foreign return addresses, out-of-reservation storage, mapped guards,
+foreign roots, broken walks and missing guard evidence. The earlier
+fixed-address capture is rejected by the relocated-pool gate.
+
+One initial serial read had malformed Base64 and its capture was rejected.
+A complete reread of the same retained state passed; the GPU was not rerun.
+This result qualifies dynamic USC allocation for the controlled native
+program. Other private render resources, persistent application runtime,
+DRM submission/fences, general Mesa rendering and DCP/XFCE remain unfinished.

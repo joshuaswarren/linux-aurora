@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import re
+import struct
 import sys
 import time
 
@@ -38,11 +39,15 @@ phase_args.add_argument('--after-graphics-draw', action='store_true',
                     help='Capture mode12 pixels after retired graphics commands and firmware stop requests')
 parser.add_argument('--graphics-shared-list', action='store_true',
                     help='Use the shared completion-list and uncached stamp layout for mode12')
+parser.add_argument('--graphics-usc-pool', action='store_true',
+                    help='Capture relocated graphics USC addresses and unmapped guard-page walks')
 parser.add_argument('--context', type=int, choices=range(3, 64), default=3,
                     help='Application root slot used by the mode12 graphics draw')
 args = parser.parse_args()
 if args.graphics_shared_list and not args.after_graphics_draw:
     parser.error('--graphics-shared-list requires --after-graphics-draw')
+if args.graphics_usc_pool and not args.after_graphics_draw:
+    parser.error('--graphics-usc-pool requires --after-graphics-draw')
 if args.context != 3 and not args.after_graphics_draw:
     parser.error('--context requires --after-graphics-draw')
 if args.triangle and not (args.after_success or args.after_live_snapshot):
@@ -232,6 +237,41 @@ with Serial('/dev/cu.kis-01100000-ch-0', 115200, timeout=0.2) as port:
                           ('graphics-submitted-total', 0xfffffc20c1080000, 0x4000, 0)]
         for label, address, size, context in views:
             save(label, address, size, context)
+        if args.graphics_usc_pool:
+            state = walker.read(0xfffffc20c101c000, 0x70, context=0)
+            directory = struct.unpack_from('<Q', state, 0x14)[0]
+            freelist = struct.unpack_from('<Q', state, 0x30)[0]
+            # Bound the private capture to the pool size actually allocated
+            # by this candidate, never an untrusted firmware length.
+            units = 19 * 512
+            save('graphics-usc-directory', directory, units * 8 + 8, args.context)
+            save('graphics-usc-free-blocks', freelist, 0x4000, args.context)
+            entries = struct.unpack('<%dQ' % (units + 1),
+                walker.read(directory, units * 8 + 8, context=args.context))
+            guards = [directory + 0x400000, directory + 0x404000, freelist + 0x4000]
+            for block in range(19):
+                base = entries[block * 512]
+                guards.extend((base + 0x200000, base + 0x204000))
+            manifest['graphics_usc_guards'] = []
+            for address in guards:
+                walk = []
+                def read_guard_entry(physical, length):
+                    raw = read_phys(physical, length)
+                    if length != 8:
+                        raise ValueError('Unexpected guard walk read size')
+                    walk.append([hex(physical), hex(int.from_bytes(raw, 'little'))])
+                    return raw
+                guard_walker = G17PUATReader(read_phys, props['gpu-region-base'],
+                    read_root=read_guard_entry, read_table=read_guard_entry)
+                try:
+                    guard_walker.translate(args.context, address)
+                except RuntimeError as error:
+                    if not str(error).startswith('unmapped G17P UAT address '):
+                        raise
+                else:
+                    raise RuntimeError('Graphics USC guard page acquired a mapping')
+                manifest['graphics_usc_guards'].append(dict(
+                    address=hex(address), context=args.context, walk=walk))
         if args.triangle:
             save('program-constants', 0x10000018000, 0x4000, 3)
         for ordinal in range(4):
@@ -244,3 +284,5 @@ with Serial('/dev/cu.kis-01100000-ch-0', 115200, timeout=0.2) as port:
 errors = [x['label'] for x in manifest['objects'] if 'error' in x]
 print(json.dumps(dict(objects=len(manifest['objects']), physical_pages_read=len(cache),
                       failed_objects=errors, device_memory_read=False)))
+if errors:
+    raise SystemExit(1)
