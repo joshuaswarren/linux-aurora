@@ -15,6 +15,7 @@ check: neo-composited-cursor
 
 install: neo-composited-cursor
 	install -D -m 755 neo-composited-cursor $(DESTDIR)$(PREFIX)/bin/neo-composited-cursor
+	install -D -m 755 neo-kwin-device-loss-recovery.py $(DESTDIR)$(PREFIX)/bin/neo-kwin-device-loss-recovery
 
 clean:
 	rm -f neo-composited-cursor

@@ -68,3 +68,39 @@ an 8 ms pointer poll; compositor latency still applies to its movement.
 
 Host artifacts, runtime hashes, scanout samples and captures are kept in the
 private workspace at `neo-linux/artifacts/agx3-ba7aee4-20260911/`.
+
+## Recovering KWin after GPU device loss
+
+`neo-kwin-device-loss-recovery.py` watches the user journal for explicit
+`VK_ERROR_DEVICE_LOST` errors from the current KWin process. It restarts only
+`plasma-kwin_x11.service`; old process messages and unrelated application
+errors cannot trigger recovery. Recovery is limited to three restarts per
+minute. The helper refuses to run on hardware other than J700/T8140.
+
+The companion KWin drop-in bounds shutdown to five seconds. The tested Zink
+runtime can loop while destroying its context after device loss, so a normal
+service restart otherwise waits for the default 90-second stop timeout.
+The existing desktop applications stay running while KWin is replaced.
+
+After `make install`, install the user units and drop-in:
+
+```sh
+install -D -m 644 neo-kwin-device-loss-recovery.service \
+  "$HOME/.config/systemd/user/neo-kwin-device-loss-recovery.service"
+install -D -m 644 60-neo-kwin-device-loss.conf \
+  "$HOME/.config/systemd/user/plasma-kwin_x11.service.d/60-neo-kwin-device-loss.conf"
+systemctl --user daemon-reload
+systemctl --user enable --now neo-kwin-device-loss-recovery.service
+```
+
+Use this with the Mesa J700 device-loss WSI/syncobj fix. That fix rejects
+presentation after device loss and makes pending fence waits notice loss,
+instead of waiting forever for a semaphore payload. Runtime selection remains
+part of the target's Mesa configuration. The recovery service handles the
+remaining KWin case where presentation stops after loss even though D-Bus
+still answers. The cause of the initial GPU job failure remains unresolved.
+
+The live qualification uses a temporary, process-local ioctl interceptor to
+return one submit EIO before work reaches the kernel. The interceptor is not
+part of the installed recovery service. Evidence and exact runtime hashes
+are retained in `neo-linux/artifacts/kwin-freeze-20260911/`.
