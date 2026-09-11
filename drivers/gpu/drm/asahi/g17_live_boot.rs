@@ -153,12 +153,15 @@ fn snapshot_g17p_firmware_data(pdev: &platform::Device) -> Option<G17PFirmwareDa
             return None;
         }
     }
-    let gfx = crate::pgtable::UatPageTable::copy_firmware_physical_range(
+    // The invalidating read, for the same reason the drift count uses it: the
+    // baseline has to come from DRAM, not from whatever the AP happens to be
+    // holding for these physical addresses after iBoot placed the image.
+    let gfx = crate::pgtable::UatPageTable::copy_live_firmware_physical_range(
         G17P_GFX_FIRMWARE_IMAGE.data_phys,
         G17P_GFX_FIRMWARE_IMAGE.data_size,
     )
     .ok()?;
-    let gfx1 = crate::pgtable::UatPageTable::copy_firmware_physical_range(
+    let gfx1 = crate::pgtable::UatPageTable::copy_live_firmware_physical_range(
         G17P_GFX1_FIRMWARE_IMAGE.data_phys,
         G17P_GFX1_FIRMWARE_IMAGE.data_size,
     )
@@ -175,9 +178,17 @@ fn snapshot_g17p_firmware_data(pdev: &platform::Device) -> Option<G17PFirmwareDa
 }
 
 /// How many bytes of a role's live `__DATA` differ from its pristine copy.
+///
+/// Read through the cache-invalidating path, not the plain one. The probe-time
+/// snapshot pulled all of `__DATA` into the AP's PIPT caches as clean lines,
+/// and the firmware writes its globals over a path that does not reliably
+/// invalidate them, so a plain write-back read here can hand back the pristine
+/// bytes this is trying to compare against and report drift=0 for a segment
+/// the firmware has been scribbling on for minutes. Reporting zero drift is
+/// the one wrong answer that would retire the whole hypothesis.
 #[cfg(CONFIG_DEV_COREDUMP)]
 fn count_g17p_firmware_data_drift(image: &G17PFirmwareImage, pristine: &[u8]) -> Result<usize> {
-    let live = crate::pgtable::UatPageTable::copy_firmware_physical_range(
+    let live = crate::pgtable::UatPageTable::copy_live_firmware_physical_range(
         image.data_phys,
         image.data_size,
     )?;
@@ -186,6 +197,57 @@ fn count_g17p_firmware_data_drift(image: &G17PFirmwareImage, pristine: &[u8]) ->
         .zip(pristine.iter())
         .filter(|(a, b)| a != b)
         .count())
+}
+
+/// Wait for both ASC wrappers to report idle after their CPUs were stopped.
+///
+/// `AppleASCWrapV6::stopCPU` clears RUN and then waits about 10 ms for
+/// `IDLE_STATUS & 3` before anything downstream gates the power domain. The
+/// Linux provider clears RUN and returns immediately, so a gate that follows
+/// can land while the block still has AXI traffic in flight -- which is what a
+/// GFX PMGR register latched BUSY with PS_ACTUAL=0, deaf to every later target
+/// write, looks like. Logs what each role actually reached either way, so the
+/// wait is a measurement and not just a delay.
+fn wait_for_g17p_asc_idle(pdev: &platform::Device, checkpoint: &'static str) {
+    const BUDGET_US: u64 = 10_000;
+    const STEP_US: u64 = 50;
+    for index in 0..2usize {
+        let Ok(provider) = G17PMailboxProvider::get(pdev.as_ref(), index) else {
+            continue;
+        };
+        let mut waited = 0u64;
+        let mut observed = 0u32;
+        let mut idle = false;
+        loop {
+            match provider.asc_snapshot() {
+                Ok(state) => {
+                    observed = state.idle_status;
+                    // AppleASCWrapV6::_isIdle is `(IDLE_STATUS & 3) != 0`.
+                    // Not `== 3`: bit 0 and bit 1 are separate idle witnesses
+                    // and either one alone means idle.
+                    if state.idle_status & 3 != 0 {
+                        idle = true;
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+            if waited >= BUDGET_US {
+                break;
+            }
+            fsleep(Delta::from_micros(STEP_US as i64));
+            waited += STEP_US;
+        }
+        dev_info!(
+            pdev.as_ref(),
+            "G17PMARK asc-idle role={} checkpoint={} idle={} waited_us={} idle_word={:#x}\n",
+            index,
+            checkpoint,
+            idle,
+            waited,
+            observed
+        );
+    }
 }
 
 /// Runtime-PM entry points the Rust `kernel` crate does not wrap.
@@ -3777,6 +3839,10 @@ impl G17PLiveRuntime {
             self.runtime_pm_armed = true;
         }
 
+        if *module_parameters::g17p_asc_teardown.value() & 1 != 0 {
+            wait_for_g17p_asc_idle(pdev, "pre-gate");
+        }
+
         // Both CPUs are stopped and both RTKit owners are gone, so each
         // mailbox has already dropped its runtime reference -- asynchronously.
         // Flush those before asking the domain down, or genpd counts them as
@@ -3800,7 +3866,22 @@ impl G17PLiveRuntime {
         // `pm_runtime_put_sync_suspend()`.
         // SAFETY: this driver's own device, runtime PM armed above.
         let off = unsafe { __pm_runtime_suspend(dev, RPM_GET_PUT) };
-        fsleep(Delta::from_millis(10));
+        // The GFX PMGR register latches BUSY (bit 11) across the power-down and
+        // clears it on its own some time later. `apple_pmgr_ps_set` rebuilds the
+        // value it writes from a fresh read and its clear-mask does not include
+        // BUSY, so an ON issued while BUSY is still set writes BUSY back -- and
+        // measured on J700 that write is ignored outright (requested TARGET=0xf,
+        // register unmoved at 0x0f002b00) and the domain stays dead for the rest
+        // of the boot. The same boot's control is the proof: an identical
+        // power-down at t=0.8s also left BUSY set, nothing wrote the register,
+        // and by the time probe issued its ON at t=16s BUSY had cleared and the
+        // ON succeeded. A fixed 10ms was simply losing that race. Waiting longer
+        // is a measurement of how long BUSY needs, not a fix; the fix belongs in
+        // pmgr-pwrstate.c, which should mask BUSY out of the written value and
+        // poll it clear before the ON the way it already polls it after.
+        fsleep(Delta::from_millis(
+            (*module_parameters::g17p_asc_gate_settle_ms.value()).clamp(1, 2000) as i64,
+        ));
         // `pm_runtime_resume_and_get()`.
         // SAFETY: as above.
         let on = unsafe { __pm_runtime_resume(dev, RPM_GET_PUT) };
@@ -3827,8 +3908,7 @@ impl G17PLiveRuntime {
     /// globals looks like. The drift count says whether that reading is right;
     /// the restore tests it.
     #[cfg(CONFIG_DEV_COREDUMP)]
-    fn report_and_restore_firmware_data(&self, pdev: &platform::Device) {
-        let restore = *module_parameters::g17p_asc_restart.value() >= 3;
+    fn report_and_restore_firmware_data(&self, pdev: &platform::Device, restore: bool) {
         let Some(snapshot) = self.firmware_data.as_ref() else {
             dev_warn!(
                 pdev.as_ref(),
@@ -3843,7 +3923,7 @@ impl G17PLiveRuntime {
             match count_g17p_firmware_data_drift(image, pristine) {
                 Ok(drift) => dev_info!(
                     pdev.as_ref(),
-                    "G17PMARK fw-drift role={} bytes_changed={} of {} at {:#x}\n",
+                    "G17PMARK fw-drift role={} bytes_changed={} of {} at {:#x} read=invalidated\n",
                     name,
                     drift,
                     image.data_size,
@@ -8297,17 +8377,27 @@ impl g17_lifecycle::PersistentRuntimeRecovery for G17PLiveRuntime {
         let pdev = self.pdev.as_ref().ok_or(ENODEV)?.clone();
         let drm = self.drm.as_ref().ok_or(ENODEV)?.clone();
         if *module_parameters::g17p_asc_restart.value() >= 2 {
-            if let Err(error) = self.cycle_gfx_power_domain(&pdev) {
-                dev_err!(
-                    pdev.as_ref(),
-                    "G17PMARK asc-powercycle failed ({:?}); continuing with the plain CPU_RUN restart\n",
-                    error
-                );
-            }
-            // After the gate and before either CPU is released: the processor
-            // is in reset and nothing else can be reading its globals.
+            let cycled = match self.cycle_gfx_power_domain(&pdev) {
+                Ok(()) => true,
+                Err(error) => {
+                    dev_err!(
+                        pdev.as_ref(),
+                        "G17PMARK asc-powercycle failed ({:?}); continuing with the plain CPU_RUN restart\n",
+                        error
+                    );
+                    false
+                }
+            };
+            // Only restore when the domain actually cycled. Clearing CPU_RUN is
+            // a gate on this ASCWrap v6, not a reset: if the gate failed the
+            // firmware may still be live, and writing 1.2MB into a running
+            // IOP's globals is not a diagnostic, it is corruption. Reporting
+            // drift is a pure read and stays unconditional.
             #[cfg(CONFIG_DEV_COREDUMP)]
-            self.report_and_restore_firmware_data(&pdev);
+            self.report_and_restore_firmware_data(
+                &pdev,
+                cycled && *module_parameters::g17p_asc_restart.value() >= 3,
+            );
         }
         let (boot_result, stop_unproven) = {
             let registers = self.registers.as_ref().ok_or(ENODEV)?;
