@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 //! Paired first-submission queues for the retained M5 graphics experiment.
 
-use super::{graphics_job::{M5GraphicsJob, PB_HARDWARE_ID, QUEUE_IDS}, graphics_usc, MappedObject};
+use super::{graphics_job::{M5GraphicsJob, PB_HARDWARE_ID, QUEUE_IDS}, graphics_usc,
+    queue_probe::FirmwareDataView, MappedObject};
 use crate::{driver::AsahiDevice, g17_submission, m5_channel, m5_sksm, mmu};
 use kernel::prelude::*;
 
@@ -18,6 +19,7 @@ pub(super) struct M5GraphicsQueues {
     aliases: KVec<mmu::KernelMapping>,
     entries: KVec<MappedObject>,
     graph: MappedObject,
+    firmware: FirmwareDataView,
 }
 
 impl M5GraphicsQueues {
@@ -68,12 +70,19 @@ impl M5GraphicsQueues {
                     .copy_from_slice(&prepared.bytes);
                 Ok(())
             })?;
+            let install = m5_channel::encode_m5_channel_config_for(m5_channel::M5ChannelConfig {
+                ring_low: low, ring_high: high, queue_id: id, priority: 2,
+                install_queue: true, gpu_context: 3, event: None,
+                channel_control: HIGH + CONTROL as u64, update_scheduler: true,
+                scheduler_index: 0, channel_stamp_index: stage as u32,
+                update_context: false, owner_context: 0, extended_command: false,
+            }, stage as u32, 2, None, None).map_err(|_| EINVAL)?;
             let config = m5_channel::encode_m5_channel_config_for(m5_channel::M5ChannelConfig {
                 ring_low: low, ring_high: high, queue_id: id, priority: 2,
-                install_queue: true, gpu_context: 3,
+                install_queue: false, gpu_context: 3,
                 event: Some(m5_channel::M5ChannelEvent { address: job.usc_control(),
                     timestamp: 1, index: graphics_usc::HARDWARE_ID }),
-                channel_control: HIGH + CONTROL as u64, update_scheduler: true,
+                channel_control: HIGH + CONTROL as u64, update_scheduler: false,
                 scheduler_index: 0, channel_stamp_index: stage as u32,
                 update_context: true, owner_context: 1, extended_command: false,
             }, stage as u32, 2, Some(0), if stage == 0 {
@@ -99,13 +108,17 @@ impl M5GraphicsQueues {
                 put32(out, pointers + 0x50, u32::MAX);
                 put32(out, pointers + 0x60, 0x500);
                 put64(out, list + 8, HIGH + list as u64);
-                out[CONFIG[stage]..CONFIG[stage] + config.len()].copy_from_slice(&config);
-                out[CONFIG[stage] + 0x100..CONFIG[stage] + 0x100 + kick.len()].copy_from_slice(&kick);
-                for (index, address) in [descriptor, HIGH + CONFIG[stage] as u64,
-                    HIGH + CONFIG[stage] as u64 + 0x100].into_iter().enumerate() {
+                out[CONFIG[stage]..CONFIG[stage] + install.len()].copy_from_slice(&install);
+                out[CONFIG[stage] + 0x100..CONFIG[stage] + 0x100 + config.len()].copy_from_slice(&config);
+                out[CONFIG[stage] + 0x200..CONFIG[stage] + 0x200 + kick.len()].copy_from_slice(&kick);
+                for (index, address) in [HIGH + CONFIG[stage] as u64, descriptor,
+                    HIGH + CONFIG[stage] as u64 + 0x100,
+                    HIGH + CONFIG[stage] as u64 + 0x200].into_iter().enumerate() {
                     put64(out, ITEMS[stage] + index * 8, address);
                 }
-                put32(out, pointers + 0x40, 3);
+                // Publish only installation. The draw stays beyond the producer
+                // until both firmware queue slots and scheduler bindings verify.
+                put32(out, pointers + 0x40, 1);
                 Ok(())
             })?;
             aliases.push(alias, GFP_KERNEL)?;
@@ -118,7 +131,7 @@ impl M5GraphicsQueues {
             out[CONTROL + 0x33] = 0xff;
             Ok(())
         })?;
-        Ok(Self { aliases, entries, graph })
+        Ok(Self { aliases, entries, graph, firmware: FirmwareDataView::new(dev)? })
     }
 
     pub(super) fn queue_address(stage: usize) -> Result<u64> {
@@ -133,6 +146,42 @@ impl M5GraphicsQueues {
             }
         }
         Ok(result)
+    }
+
+    pub(super) fn installation_status(&mut self) -> Result<([[u64; 5]; 2], [u64; 2], [u64; 2])> {
+        let mut slots = [[0; 5]; 2];
+        let mut pointers = [0; 2];
+        for stage in 0..2 {
+            (slots[stage], pointers[stage]) = self.firmware.queue_registration(QUEUE_IDS[stage])?;
+        }
+        Ok((slots, pointers, [u64::from(self.graph.read_u32(HIGH + CONTROL as u64)?),
+            self.graph.read_u64(HIGH + CONTROL as u64 + 0x12)?]))
+    }
+
+    pub(super) fn installed(&mut self) -> Result<bool> {
+        let (slots, pointers, control) = self.installation_status()?;
+        for stage in 0..2 {
+            let slot = slots[stage];
+            let offset = (stage * ENTRY_BYTES) as u64;
+            // GFX 0x12240/0x1241c copies tag15 +0x22 to slot +0x20:
+            // this word is the TA/fragment stage, not the outer channel.
+            if slot[0] & 1 == 0 || slot[1] != ENTRY_HIGH + offset
+                || slot[2] != ENTRY_LOW + offset || slot[3] != 4u64 << 32
+                || slot[4] as u32 != stage as u32 || pointers[stage] != HIGH + CONTROL as u64 {
+                return Ok(false);
+            }
+        }
+        Ok(control[0] & 0xff != 0xff && (control[0] >> 8) & 0xff != 0xff
+            && (control[0] >> 16) & 0xff == 4
+            && control[1] == ((1u64 << QUEUE_IDS[0]) | (1u64 << QUEUE_IDS[1])))
+    }
+
+    pub(super) fn publish_draw(&mut self) -> Result {
+        if self.counters()? != [[1; 3]; 2] || !self.installed()? { return Err(EBUSY); }
+        for pointers in POINTERS {
+            self.graph.write_u32(HIGH + pointers as u64 + 0x40, 4)?;
+        }
+        Ok(())
     }
 }
 

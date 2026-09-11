@@ -34,6 +34,8 @@ phase_args.add_argument('--after-live-snapshot', action='store_true',
                     help='Require mode9/10 live observations; capture the later retained RAM')
 phase_args.add_argument('--after-success', action='store_true',
                     help='Require exact compute output, retired queues and no GPU restart')
+phase_args.add_argument('--after-graphics-draw', action='store_true',
+                    help='Capture mode12 pixels after retired graphics commands and firmware stop requests')
 args = parser.parse_args()
 if args.triangle and not (args.after_success or args.after_live_snapshot):
     parser.error('--triangle requires --after-success or --after-live-snapshot')
@@ -46,12 +48,14 @@ reserved = [(props[name + '-base'], props[name + '-base'] + props[name + '-size'
             for name in ('gpu-region', 'gfx-shared-region', 'gfx-shared-l2-region',
                          'gfx-data', 'gfx1-data')]
 output_path.mkdir(mode=0o700, exist_ok=False)
-manifest = dict(phase=('Linux mode8 admission before recovery' if args.before_recovery
+manifest = dict(phase=('Linux TA/fragment pixels with completion bookkeeping unqualified' if args.after_graphics_draw
+                      else 'Linux mode8 admission before recovery' if args.before_recovery
                       else 'Linux mode7 setup before compute' if args.before_compute
                       else 'Linux verified compute completion' if args.after_success
                       else 'Linux live-status probe after compute' if args.after_live_snapshot
                       else 'Linux mode6 after compute') + ' after both firmware CPU stop requests',
-                device_memory_read=False, compute_triangle=args.triangle, objects=[])
+                device_memory_read=False, compute_triangle=args.triangle,
+                graphics_draw=args.after_graphics_draw, objects=[])
 cache = {}
 sequence = 0
 with Serial('/dev/cu.kis-01100000-ch-0', 115200, timeout=0.2) as port:
@@ -92,6 +96,13 @@ with Serial('/dev/cu.kis-01100000-ch-0', 115200, timeout=0.2) as port:
         "dmesg | grep -Eq 'requested probe mode=(9|10|11)$' "
         "&& dmesg | grep -q 'M5_LIVE_SNAPSHOT sample=3'"
         if args.after_live_snapshot else "dmesg | grep -q 'requested probe mode=6'"))))
+    if args.after_graphics_draw:
+        probe_gate = (
+            "dmesg | grep -q 'requested probe mode=12$' "
+            "&& dmesg | grep -q 'M5_GRAPHICS installed TA/fragment queues;' "
+            "&& dmesg | grep -Fq 'M5_GRAPHICS final outer/inner/completion=([4, 4, 4], [[4, 4, 4], [4, 4, 4]],' "
+            "&& dmesg | grep -Fq 'pixels=TriangleResult { foreground: 18432, background: 47104, unexpected: 0, untouched: 0, checked: 63234, wrong: 0 }' "
+            "&& ! dmesg | grep -q 'M5_GRAPHICS firmware requested GPU restart'")
     if args.triangle:
         probe_gate += " && dmesg | grep -q 'requested probe mode=11$' && dmesg | grep -q 'pages=7 triangle=true'"
     else:
@@ -174,7 +185,7 @@ with Serial('/dev/cu.kis-01100000-ch-0', 115200, timeout=0.2) as port:
             save(role + '-report-states', status, 0x300, 0)
             save(role + '-event-records', status + 0x2c0, 0x4800, 0)
             save(role + '-report-records', status + 0xa6ac0, 0x9000, 0)
-        for label, address, size, context in [
+        views = [
                 ('uma-slot0', 0xfffffc20015e8000, 32, 0),
                 ('event-state', 0xfffffc20c0405000, 0x70, 0),
                 ('event-link', 0xfffffc20c0406000, 64, 0),
@@ -190,13 +201,28 @@ with Serial('/dev/cu.kis-01100000-ch-0', 115200, timeout=0.2) as port:
                 ('program-stream', 0x100000b0000, 0x4000, 3),
                 ('program-preempt', 0x100000e0000, 0x4000, 3),
                 ('program-robustness', 0x1000018000, 0x4000, 3),
-                ('program-buffers', 0x1000001c000, 0x4000, 3)]:
+                ('program-buffers', 0x1000001c000, 0x4000, 3)]
+        if args.after_graphics_draw:
+            views = [
+                ('graphics-pixels', 0x10000058000, 0x40000, 3),
+                ('graphics-queues', 0xfffffc20c0000000, 0x1c000, 0),
+                ('graphics-ta', 0xfffffc20c1000000, 0x3000, 0),
+                ('graphics-fragment', 0xfffffc20c1004000, 0x3000, 0),
+                ('graphics-scheduler', 0xfffffc20c1008000, 0x400, 0),
+                ('graphics-pm-state', 0xfffffc20c100c000, 0x400, 0),
+                ('graphics-usc-state', 0xfffffc20c101c000, 0x400, 0),
+                ('graphics-stamps-a', 0xfffffc20c1028000, 0x4000, 0),
+                ('graphics-stamps-b', 0xfffffc20c102c000, 0x4000, 0),
+                ('graphics-pb-slot', 0xfffffc20015e0000, 16, 0),
+                ('graphics-uma-slot', 0xfffffc20015e8020, 32, 0)]
+        for label, address, size, context in views:
             save(label, address, size, context)
         if args.triangle:
             save('program-constants', 0x10000018000, 0x4000, 3)
         for ordinal in range(4):
             save('hardware-event-ring-%d' % ordinal,
-                 0xfffffc20c07e8000 + ordinal * 0x28000, 0x20000, 0)
+                 0xfffffc20c07e8000 + ordinal * 0x28000,
+                 0x4000 if args.after_graphics_draw else 0x20000, 0)
     finally:
         manifest['physical_pages_read'] = len(cache)
         (output_path / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')

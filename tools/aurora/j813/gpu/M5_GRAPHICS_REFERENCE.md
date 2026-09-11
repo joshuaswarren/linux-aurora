@@ -229,12 +229,52 @@ succeeded, and resource owners remain retained until reboot. The console
 runner correctly reported failure even though module insertion returned
 zero. This is a submission diagnostic, not a verified Linux graphics draw.
 
-The next experiment must separate initial queue installation from draw
-submission, following the qualified compute sequence. The current combined
-submission places the draw descriptor before its first installation command;
-whether that ordering explains the stall remains unproven. Do not unload
-the module or retry firmware startup within the retained failed boot.
+Separating initial installation from drawing did not resolve the legacy
+outer-channel stall: both firmware registration slots remained empty.
+Routing both stage-tagged command lists through the common CL_2 outer ring
+did resolve registration. Hardware consumed two outer records and retired
+one setup command on each inner queue. Both queue slots have the exact
+owned ring addresses and share the scheduler control, with header
+`0x02040000` and queue bitmap `0xc00`.
 
-Current milestones: Linux compute rendering and native macOS graphics
-capture are proven. Linux TA/fragment execution is in progress; Mesa/OpenGL
-and DCP presentation in XFCE remain unproven.
+The GFX firmware queue slot's final word is the stage, not priority:
+handler `0x12240` loads command `+0x22`, then `0x1241c` stores it at slot
+`+0x20`. The observed TA and fragment values are 0 and 1; compute uses 2.
+The Linux guard now checks each stage explicitly. The first routed run
+stopped before drawing because that guard still expected the compute value.
+
+Mode 12 now verifies installation before publishing the user context and
+draw commands. The draw adds two more records to the shared outer ring and
+three commands to each inner queue. Completion requires outer counters
+`[4,4,4]`, both inner counters `[4,4,4]`, zero pending commands and the
+expected pixel result. The pending-command bookkeeping check remains
+unqualified. Do not unload the module or retry firmware startup within a
+retained failed boot.
+
+## Verified Linux TA/fragment framebuffer
+
+The routed draw on 2026-09-11 produced the complete expected 256x256 GPU
+framebuffer: 18,432 foreground pixels, 47,104 background pixels, no untouched
+pixels and no incorrect pixels. Both command lists retired with counters
+`[4,4,4]`. TA and fragment dispatch/return traces were observed, with no GPU
+recovery. The kernel probe still reports `EIO` because its separate pending
+and stamp observations remain `[2,0,0,0,0]`; this is not a claim that the
+whole diagnostic or completion-accounting implementation passes.
+
+After both firmware stop requests, the bounded retained-RAM reader captured
+28 objects through 192 physical pages with no failed objects. The actual
+262,144 framebuffer bytes match the native macOS reference byte-for-byte:
+SHA256 `ce4e527e102b5e2f3f0585a6c045bc3eca14e5d225da0a8f3dc24b53f8c60a13`.
+
+`capture-m5-linux-compute-state.py --after-graphics-draw INVENTORY CAPTURE_DIR`
+requires the matching Linux mode12 result and retired command queues before
+reading RAM. `verify-m5-linux-graphics.py CAPTURE_DIR OUTPUT.png` checks every
+capture hash and independently verifies every pixel against triangle edge
+equations. Its PNG uses captured bytes with 2x integer enlargement; it does
+not render a substitute triangle. Truncated input, changed colors and wrong
+geometry are rejected, and the PNG round trip preserves every source pixel.
+
+Linux compute and this controlled TA/fragment draw are hardware-proven.
+Completion accounting, a general Mesa/OpenGL workload and DCP presentation
+in XFCE remain unfinished. The image is an offscreen GPU framebuffer, not
+evidence of DCP scanout or an accelerated desktop.

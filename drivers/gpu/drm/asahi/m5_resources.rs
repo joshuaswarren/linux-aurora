@@ -351,14 +351,12 @@ impl M5FirmwareMemory {
         Ok(self.queue_probe.as_ref().map(M5QueueProbe::power_status))
     }
 
-    pub(crate) fn graphics_status(&mut self) -> Result<([[u32; 3]; 2], [[u32; 3]; 2], [u32; 5])> {
-        let mut outer = [[0; 3]; 2];
-        for stage in 0..2 {
-            let base = init::WORK_STATE_GRID_OFFSETS[6 + stage];
-            for index in 0..3 {
-                outer[stage][index] = self.private.read_u32(PRIVATE_BASE
-                    + (base + index * init::CHANNEL_STATE_SPACING) as u64)?;
-            }
+    pub(crate) fn graphics_status(&mut self) -> Result<([u32; 3], [[u32; 3]; 2], [u32; 5])> {
+        let mut outer = [0; 3];
+        let base = init::WORK_STATE_GRID_OFFSETS[8];
+        for index in 0..3 {
+            outer[index] = self.private.read_u32(PRIVATE_BASE
+                + (base + index * init::CHANNEL_STATE_SPACING) as u64)?;
         }
         let (job, queues) = self.graphics.as_mut().ok_or(EINVAL)?;
         Ok((outer, queues.counters()?, job.progress()?))
@@ -368,36 +366,59 @@ impl M5FirmwareMemory {
         self.graphics.as_mut().ok_or(EINVAL)?.0.result()
     }
 
+    pub(crate) fn graphics_installation_status(&mut self) -> Result<([[u64; 5]; 2], [u64; 2], [u64; 2])> {
+        self.graphics.as_mut().ok_or(EINVAL)?.1.installation_status()
+    }
+
+    pub(crate) fn graphics_queues_installed(&mut self) -> Result<bool> {
+        self.graphics.as_mut().ok_or(EINVAL)?.1.installed()
+    }
+
+    pub(crate) fn publish_graphics_install(&mut self) -> Result {
+        let (outer, inner, progress) = self.graphics_status()?;
+        if outer != [0; 3] || inner != [[0, 0, 1]; 2]
+            || progress != [2, 0, 0, 0, 0] { return Err(EBUSY); }
+        if self.graphics_installation_status()? != ([[0; 5]; 2], [0; 2], [0xffff, 0]) {
+            return Err(EBUSY);
+        }
+        self.publish_graphics_records(0, 1)
+    }
+
     pub(crate) fn publish_graphics_job(&mut self) -> Result {
         let (outer, inner, progress) = self.graphics_status()?;
-        if outer != [[0; 3]; 2] || inner != [[0, 0, 3]; 2]
+        if outer != [2; 3] || inner != [[1; 3]; 2]
             || progress != [2, 0, 0, 0, 0] { return Err(EBUSY); }
-        self.graphics.as_mut().ok_or(EINVAL)?.0.publish_context()?;
+        let (job, queues) = self.graphics.as_mut().ok_or(EINVAL)?;
+        if !queues.installed()? { return Err(EBUSY); }
+        job.publish_context()?;
+        queues.publish_draw()?;
+        self.publish_graphics_records(2, 4)
+    }
+
+    fn publish_graphics_records(&mut self, outer_index: usize, inner_head: u16) -> Result {
         self.shared.with_bytes_mut(|out| {
             for stage in 0..2 {
-                let offset = init::WORK_RING_BUNDLE_OFFSETS[6 + stage];
+                let offset = init::WORK_RING_BUNDLE_OFFSETS[8] + (outer_index + stage) * 24;
                 if out[offset..offset + 24].iter().any(|byte| *byte != 0) {
                     return Err(EBUSY);
                 }
             }
             for stage in 0..2 {
-                let offset = init::WORK_RING_BUNDLE_OFFSETS[6 + stage];
+                let offset = init::WORK_RING_BUNDLE_OFFSETS[8] + (outer_index + stage) * 24;
                 let record = &mut out[offset..offset + 24];
                 let address = graphics_queues::M5GraphicsQueues::queue_address(stage)?;
                 record[8..16].copy_from_slice(&address.to_le_bytes());
                 record[16..20].copy_from_slice(&2u32.to_le_bytes());
-                record[20..22].copy_from_slice(&3u16.to_le_bytes());
+                record[20..22].copy_from_slice(&inner_head.to_le_bytes());
                 record[22] = graphics_job::QUEUE_IDS[stage];
                 record[23] = 1;
             }
             Ok(())
         })?;
         fence(Ordering::SeqCst);
-        for stage in 0..2 {
-            let producer = init::WORK_STATE_GRID_OFFSETS[6 + stage]
-                + 2 * init::CHANNEL_STATE_SPACING;
-            self.private.write_u32(PRIVATE_BASE + producer as u64, 1)?;
-        }
+        // Both stage-tagged SKSM queues travel through the CL_2 command ring.
+        let producer = init::WORK_STATE_GRID_OFFSETS[8] + 2 * init::CHANNEL_STATE_SPACING;
+        self.private.write_u32(PRIVATE_BASE + producer as u64, (outer_index + 2) as u32)?;
         fence(Ordering::SeqCst);
         Ok(())
     }
