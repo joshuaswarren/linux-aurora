@@ -16,7 +16,7 @@ FIELDS = [
     'gpx_before', 'gfx_before', 'counter_before', 'counter_after', 'frequency',
     'gpx_after', 'gfx_after', 'slot_before', 'slot_after',
     'queue_before', 'queue_after', 'requested_queue',
-    'slot_state_before', 'slot_progress', 'pipe_1688', 'pipe_a730',
+    'slot_state_before', 'slot_progress', 'pipe_1688', 'pipe_a730', 'pipe_a0a8',
     'slot_state_after', 'queue_enable', 'queue_stamp', 'queue_completed',
     'event0', 'event1', 'event2', 'event3',
     'mask_c0b0', 'mask_c0c8', 'mask_c0d8', 'active_c128',
@@ -86,6 +86,10 @@ def source():
     save('x17', 'pipe_index')
     port(0x1688, 'pipe_1688', 'x17')
     port(0xa730, 'pipe_a730', 'x17')
+    # Exact M5 DM2 table44990: selector a010, value3, register a0a8.
+    # Firmware7c68..7c94 packs the selector into the read tag; it does not
+    # write a010 here. Follow that path with the already qualified pipe.
+    port((1 << 43) | (3 << 40) | 0xa0a8, 'pipe_a0a8', 'x17')
     emit('no_slot:')
     port((1 << 43) | 0xc020, 'slot_state_after', 'x13')
     emit('cmp x14, x11', 'b.ne state_changed', 'orr x9, x9, #32', 'state_changed:', 'skip_slot:')
@@ -113,7 +117,7 @@ def decode(raw):
     values = dict(zip(FIELDS, struct.unpack('<' + 'Q' * len(FIELDS), raw)))
     flags = values['flags']
     powered = flags & 0x11 == 0x11
-    return dict(format_version=2, values={key: hex(value) for key, value in values.items()},
+    return dict(format_version=3, values={key: hex(value) for key, value in values.items()},
                 powered=powered, slot_view_valid=powered and bool(flags & 2),
                 queue_view_valid=powered and bool(flags & 4),
                 compute_monitor_valid=powered and flags & 0x2e == 0x2e,

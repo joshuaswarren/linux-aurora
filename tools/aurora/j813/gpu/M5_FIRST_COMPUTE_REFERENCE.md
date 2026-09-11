@@ -163,6 +163,44 @@ publication's queue again at the second publication; Metal may use a different
 hardware queue for that second command. All observations are sequential,
 not atomic. It refuses to replace another capture's breakpoint.
 
+## Additional DM2 progress monitor
+
+The exact firmware's table at `0x44990` contains the indexed monitor
+`[0xa010, 3, 0xa0a8, 0xa0a8, 0]`. Code `0x7c68..0x7c94` encodes its
+selector directly in the AP read tag:
+
+```text
+(pipe_index << 44) | (1 << 43) | (3 << 40) | 0xa0a8
+```
+
+No write to the selector register `0xa010` is needed. Both samplers now
+include this read after qualifying the compute pipe. Native format version 3
+names the result `pipe_a0a8`; extended Linux mode10 returns six values:
+`[slot_state, slot_progress, 0x1688, 0xa730, 0xa0a8, slot_state_after]`.
+
+A native sample on queue 10 / stamp 2, slot 6 / pipe 0 returned `0x5e80` from
+this monitor. Its 7.958-us observation passed all guards, and the workload
+subsequently verified 131,072 values. The private record is
+`logs/m5-native-first-active-hv-20260911/native-monitor-1789103902119094000/observations.json`.
+
+On Linux, the first four samples returned zero in 18/16/16/16 us, with six
+valid values, stable guards, and no recovery during the reads. The retained
+capture `logs/m5-downstream-linux-retained-20260911` has 33 objects over 243
+physical pages, no errors, and matching hashes. The actual retained shader,
+pipeline, and CDM bytes match the native reference at their declared offsets.
+
+Mode10 now attempts later observations at polls 32/64/128/256, in addition
+to its first four; mode9 retains four early observations. A fresh M5 run
+reached poll 32 before recovery. All five qualified samples still returned
+zero at `0xa0a8`. Later polls were not reached. Logs:
+`logs/m5-downstream-late-compute-20260911.log`.
+
+Both Linux runs left 1,024 output words untouched with unchanged inputs and
+eventual firmware recovery. This establishes a reproducible difference in
+the observed workload states, not a register meaning or a root cause: native
+uses a longer workload and different queue history. Do not infer a specific
+shader-fetch or memory fault from the monitor value alone.
+
 ## Stop requests do not qualify frozen captures
 
 An earlier mode8 attempt reached dispatch and incorrectly reported a frozen

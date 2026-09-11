@@ -256,7 +256,12 @@ impl M5Session {
                 break;
             }
             if self.roles.iter().any(|role| role.state.crashed.load(Ordering::Acquire)) { break; }
-            if live_snapshot && memory.compute_kick_observed() && live_snapshots < 4 {
+            // Retain the first four observations, then follow DM2 progress
+            // at polls32/64/128/256 before its watchdog expires. An early
+            // zero alone cannot distinguish a delayed launch from a stall.
+            let live_limit = if pipe_monitor { 8 } else { 4 };
+            if live_snapshot && memory.compute_kick_observed() && live_snapshots < live_limit
+                && (live_snapshots < 4 || poll >= (1 << (live_snapshots + 1))) {
                 let started = kernel::time::Instant::<kernel::time::Monotonic>::now();
                 let observed = self.registers.m5_live_sksm_state();
                 let monitor = if pipe_monitor { Some(self.registers.m5_live_compute_monitor()) }
