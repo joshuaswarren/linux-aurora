@@ -3207,8 +3207,18 @@ impl G17PLiveRuntime {
             self.service_async_render_completions(completion_masks)?;
             self.service_async_compute_completion_masks(completion_masks)
         });
-        if result.is_err() {
+        if let Err(error) = result {
+            // Setting `crashed` makes both service_primary_firmware_events and
+            // primary_firmware_event_pending return early forever, so from here
+            // on every RTKit doorbell runs a silent no-op and no completion,
+            // timeout or recovery is ever reported again. That transition was
+            // itself unlogged, which is why a wedged GPU produced an empty log.
             state.crashed.store(true, Ordering::Release);
+            dev_err!(
+                pdev.as_ref(),
+                "G17P event worker: firmware event service failed ({:?}); marking the session crashed -- completion, timeout and recovery reporting stop here\n",
+                error,
+            );
         }
         result
     }
@@ -3314,8 +3324,16 @@ impl G17PLiveRuntime {
         .and_then(|()| {
             manager.complete_pending_primary_recovery(generation, records, blamed_stamp)
         });
-        if result.is_err() {
+        if let Err(error) = result {
+            // Same permanent-deafness transition as above, and this one also
+            // skips the event-drain re-arm at the end of this function.
             state.crashed.store(true, Ordering::Release);
+            dev_err!(
+                pdev.as_ref(),
+                "G17P recovery: servicing generation {} failed ({:?}); marking the session crashed -- completion, timeout and recovery reporting stop here\n",
+                generation,
+                error,
+            );
             return result;
         }
         if let Some(stamp) = blamed_stamp {
@@ -4304,7 +4322,22 @@ impl G17PLiveRuntime {
         // observe or abandon; probing the selected slot here manufactured an
         // ENODEV "final watchdog" warning and obscured the original EAGAIN or
         // EBUSY. Only an armed fence denotes a deferred render transaction.
+        //
+        // This is also the path the scheduler watchdog takes after a
+        // firmware-blamed recovery has already settled the same slot. It
+        // returned silently, so the only externally visible timeout in the
+        // driver could fire and leave nothing at all in the log. Say so.
         if !self.render_fence_state.pending(render_slot) {
+            if let Some(pdev) = self.pdev.as_ref() {
+                dev_info!(
+                    pdev.as_ref(),
+                    "G17P render: settle skipped for submission {:?} recovery-stamp {:?} slot {} ({:?}); slot already settled\n",
+                    submission_id,
+                    blamed_stamp,
+                    render_slot,
+                    error,
+                );
+            }
             return;
         }
         // A firmware event can precede visibility of the final paired queue

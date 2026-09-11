@@ -3593,15 +3593,19 @@ impl G17PManagerConstruction {
             self.render_context_aliases = cached.context_aliases;
             self.render_storage = Some(cached.storage);
             self.prune_unreferenced_retired_render_graphs()?;
-            dev_info!(self.resources.dev().as_ref(),
-                "G17P render VM handoff: reactivated retained graph vm={} at ordinal {} without clearing its render-pool mappings\n",
-                cached_vm, self.render_submission_ordinal);
+            if crate::util::g17p_verbose() {
+                dev_info!(self.resources.dev().as_ref(),
+                    "G17P render VM handoff: reactivated retained graph vm={} at ordinal {} without clearing its render-pool mappings\n",
+                    cached_vm, self.render_submission_ordinal);
+            }
             return Ok(());
         }
         self.prune_unreferenced_retired_render_graphs()?;
-        dev_info!(self.resources.dev().as_ref(),
-            "G17P render VM handoff: quarantined retired job-private graph vm={} root={:#x}; incoming VM builds a new root at ordinal {}, QID producer state retained\n",
-            old_vm_id, old_root, self.render_submission_ordinal);
+        if crate::util::g17p_verbose() {
+            dev_info!(self.resources.dev().as_ref(),
+                "G17P render VM handoff: quarantined retired job-private graph vm={} root={:#x}; incoming VM builds a new root at ordinal {}, QID producer state retained\n",
+                old_vm_id, old_root, self.render_submission_ordinal);
+        }
         Ok(())
     }
 
