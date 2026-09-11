@@ -28,7 +28,19 @@ Its 46 objects have matching hashes. Queue 9 / stamp 4 completes the same
 descriptor successfully. Both controlled macOS runs verified 3,072 compute
 values and 12,288 rendered pixels across three queues.
 
-From the Linux source tree, set `NATIVE_CAPTURE` to either directory:
+A further fresh native boot captured the same queue and stamp as Linux's
+probe, queue 11 / stamp 1:
+
+```text
+j813-linux/logs/m5-native-monitor-reference-hv-20260911/sksm-submit-1789102307882731000
+```
+
+Its 46 objects include same-descriptor completion and six stable mapping
+profiles. All three comparison tools pass; the controlled workload again
+verifies 3,072 compute values and 12,288 pixels. This is a first-queue-job
+reference, not a fresh-GPU baseline: native graphics already ran.
+
+From the Linux source tree, set `NATIVE_CAPTURE` to a directory above:
 
 ```sh
 python3 tools/aurora/j813/gpu/verify-m5-sksm.py "$NATIVE_CAPTURE"
@@ -98,6 +110,59 @@ completion. Mode10 still leaves all 1,024 outputs untouched before recovery.
 Its retained RAM capture, `logs/m5-live-monitors-retained-20260911`, has
 33 objects / 243 physical pages, no errors and matching hashes.
 
+## Qualified native compute observation
+
+The native helper `m5_native_monitor.py` performs its reads in one short
+proxy call. It uses the existing hypervisor's reserved heap for code/results;
+no guest or firmware executable is patched. SGX stores are only read tags to
+AP port 9. It checks both power domains before low-SGX reads, follows the
+naturally selected slot, accepts only a single active pipe, and rechecks
+power, slot state, and bank selection afterward. Unread fields remain zero
+and must not be interpreted without their qualification flags.
+
+The tiny reference powers down before both publication/completion samples.
+`m5-metal-busy-reference.m` supplies two bounded native compute commands
+whose 131,072 output values are checked against CPU results. Its iteration
+count is bounded at 1,048,576. A fresh native boot supplied a valid 7.125-us
+observation while queue 9 / stamp 1 was executing, with unchanged power,
+slot and queue selections. Both commands subsequently completed and passed
+output verification, taking about 314.1 and 488.6 ms. Native graphics ran
+before this test; stamp 1 establishes the queue's first job, not a completely
+uninitialized GPU.
+
+Private observation: `logs/m5-native-first-active-hv-20260911/`
+`native-monitor-1789103518752966000/observations.json`.
+
+| Observation | Working native job | Stalled Linux mode10 |
+| --- | --- | --- |
+| Selected slot | 0 | 0 |
+| Slot state | `0x1000d` | `0x1000d` |
+| Slot progress | `0x90000000001` (queue 9, stamp 1) | `0xb0000000001` (queue 11, stamp 1) |
+| Pipe 0 register `0x1688` | 1 | 1 |
+| Pipe 0 register `0xa730` | 0 | 0 |
+| Own queue register `0x21008` | `0x31000070005a0001` | `0x31000070005f0001` |
+| Own queue register `0x21020` | 1 | 1 |
+| Own queue register `0x21028` | `0x8000000000` | `0x8000000000` |
+| Event producers | All four zero | All four zero |
+| Active compute slot mask | 1 | 1 |
+
+The queue IDs, ring bases, and owned pointers differ, as expected for separate
+allocations. The observed status values also occur during successful native
+execution; none by itself identifies the Linux failure.
+
+An earlier qualified sample on reused queue 11 / stamp 8 had `0x1688 = 3`
+and `0x21028 = 8`. The first-stamp result shows those are not required initial
+values. In particular, `0x8000000000` is not by itself evidence of a poisoned
+completion register. Do not seed it or force the progress monitor to 3.
+The reused-queue observation remains at `logs/m5-native-monitor-reference-hv-20260911/`
+`native-monitor-1789102801822738000/observations.json`.
+
+`trace-m5-native-monitor.py` observes at most two matching compute
+publications, with an overall 128-submission bound. It samples the first
+publication's queue again at the second publication; Metal may use a different
+hardware queue for that second command. All observations are sequential,
+not atomic. It refuses to replace another capture's breakpoint.
+
 ## Stop requests do not qualify frozen captures
 
 An earlier mode8 attempt reached dispatch and incorrectly reported a frozen
@@ -121,9 +186,15 @@ A successful M5 compute example beginning with fresh GPU initialization,
 including global setup, queue registration, initial completion state, memory
 mappings, one minimal job and its hardware completion, would isolate missing
 prerequisites. The current native witness supplies the job and program
-mappings; an equivalent successful early hardware-state comparison is still
-missing. An independent reference was requested in agents standup.
+mappings; the bounded workload now supplies a qualified first-stamp active
+sample. The observed queue and pipe admission state matches Linux after
+accounting for owned queue IDs and pointers. The next comparison must reach
+deeper into shader execution and memory access, while retaining a complete
+fresh-initialization reference as an independent way to find prerequisites.
+An independent reference was requested in agents standup.
 
-Kernel, modules and RAM payloads build. The 25 canonical capture tests pass.
+Kernel, modules and RAM payloads build. The 31 canonical capture tests pass,
+including six tests executing the native sampler's actual AArch64 code
+against synthetic power, bank-selection, and pipe-state changes.
 Linux GPU execution, accelerated rendering, and DCP presentation remain
 unqualified.

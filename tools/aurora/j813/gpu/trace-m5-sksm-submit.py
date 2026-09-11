@@ -5,7 +5,9 @@ Pinned 25G76 AGXCLChannelSKSM::submitBuffer, 0xfffffe0008984fc0:
 the preceding stores completed the tag-14 record at x2; x24 still holds
 the AGXKSMKickQueue. M5 encodeKickEntry uses queue+0x78 as its CPU ring,
 queue+0x14 as stride, and the low byte of queue+0x48 as entry index.
-All reads below translate guest CPU addresses and reject non-DRAM pages.
+Guest-memory reads translate CPU addresses and reject non-DRAM pages.
+M5_SKSM_CAPTURE_MMIO=1 additionally enables the guarded native sampler;
+its qualification flags distinguish valid observations from unread fields.
 """
 import hashlib
 import json
@@ -37,6 +39,12 @@ _m5_sksm_priority_text = os.environ.get('M5_SKSM_CAPTURE_PRIORITY')
 _m5_sksm_priority = int(_m5_sksm_priority_text) if _m5_sksm_priority_text is not None else None
 _m5_sksm_exclude = {int(x, 0) for x in os.environ.get('M5_SKSM_EXCLUDE_QIDS', '').split(',') if x}
 _m5_sksm_observations = []
+_m5_sksm_monitor = None
+if os.environ.get('M5_SKSM_CAPTURE_MMIO') == '1':
+    from m5_native_monitor import M5NativeMonitor
+    if getattr(hv, 'm5_native_monitor', None) is None:
+        hv.m5_native_monitor = M5NativeMonitor(hv)
+    _m5_sksm_monitor = hv.m5_native_monitor
 _m5_sksm_extra_views = json.loads(os.environ.get('M5_SKSM_CONTEXT_VIEWS', '[]'))
 if (not isinstance(_m5_sksm_extra_views, list) or len(_m5_sksm_extra_views) > 4
         or any(not isinstance(x, list) or len(x) != 2
@@ -127,7 +135,7 @@ def _m5_sksm_submit(ctx):
     directory = _m5_sksm_output / ('sksm-submit-' + str(time.time_ns()))
     directory.mkdir(mode=0o700)
     manifest = dict(phase='host-tag14-before-channel-publication',
-                    pc=hex(int(ctx.elr)), objects=[], device_memory_read=False,
+                    pc=hex(int(ctx.elr)), objects=[], device_memory_read=_m5_sksm_monitor is not None,
                     requested_priority=_m5_sksm_priority, observed_submissions=_m5_sksm_hits,
                     excluded_queue_ids=sorted(_m5_sksm_exclude), observations=_m5_sksm_observations)
     if _m5_pool_control_observations:
@@ -195,6 +203,10 @@ def _m5_sksm_submit(ctx):
         if filter_error:
             raise filter_error
         _m5_sksm_check_code()
+        if _m5_sksm_monitor is not None:
+            if probe_tag != 14 or probe_dm != 2 or not probe_count:
+                raise ValueError('M5 monitor requires a measured compute submission')
+            manifest['mmio_before_publication'] = _m5_sksm_monitor.capture(probe_qid)
         command = save('add-kicks-command', int(ctx.regs[2]), 0x15)
         tag, qid, count, priority, stamp, dm = struct.unpack('<IHHBQI', command)
         if tag != 14 or dm != 2 or not count:
@@ -540,6 +552,8 @@ def _m5_sksm_submit(ctx):
                         raise ValueError('Matching M5 descriptor did not complete within 64 callbacks')
                     if _m5_sksm_read_cpu(completion_pc, 8) != bytes.fromhex('f30300aa080840f9'):
                         raise ValueError('M5 completion site differs from pinned native code')
+                    if _m5_sksm_monitor is not None:
+                        manifest['mmio_at_completion'] = _m5_sksm_monitor.capture(qid)
                     save('completed-host-cl-descriptor', descriptor_address, 0x800)
                     for label, address, extent in outer_views:
                         save(label + '-after', address, extent, gpu=True)
@@ -663,4 +677,5 @@ if os.environ.get('M5_SKSM_CAPTURE_POOL') == '1':
 
     hv.add_hw_bp(_m5_pool_control_pc, hook=_m5_pool_control)
     _m5_pool_control_armed = True
-print('M5_SKSM_SUBMIT_ARMED: one native compute kick queue, bounded DRAM only')
+print('M5_SKSM_SUBMIT_ARMED: one native compute kick queue, bounded DRAM'
+      + (' and guarded MMIO observations' if _m5_sksm_monitor is not None else ' only'))
