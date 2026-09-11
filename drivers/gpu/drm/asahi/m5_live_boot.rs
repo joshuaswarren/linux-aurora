@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
-//! M5-specific initialization transaction. No G17P manager or DRM admission.
+//! M5-specific initialization and retained application submission session.
+//! DRM admission remains in the device adapter; no G17P manager is selected.
 
 use super::{validate_provider, ExpectedProvider, G17PAscwrapV6Role,
     G17PMailboxProvider, G17PNoRtkitBuffer};
@@ -450,10 +451,13 @@ impl M5Session {
 
 pub(crate) struct M5Runtime {
     session: Option<KBox<M5Session>>,
+    application: bool,
+    faulted: bool,
+    application_submitted: bool,
 }
 
 impl M5Runtime {
-    pub(crate) fn start(
+    fn prepare(
         pdev: &platform::Device<Core>,
         dev: ARef<AsahiDevice>,
         registers: regs::Resources,
@@ -478,7 +482,7 @@ impl M5Runtime {
                 dev.as_ref(), None, index, state.clone())?;
             Ok(M5Role { provider, rtkit, state, started: false })
         };
-        let mut session = KBox::new(M5Session {
+        let session = KBox::new(M5Session {
             roles: [make_role(0, gfx)?, make_role(1, gfx1)?],
             memory: None, uat, registers, dev,
         }, GFP_KERNEL)?;
@@ -488,6 +492,15 @@ impl M5Runtime {
         // Keep callback code resident even if a failed stop retains owners.
         // This explicit RAM-boot experiment is released by reboot only.
         unsafe { kernel::bindings::__module_get(crate::THIS_MODULE.as_ptr()); }
+        Ok(Self { session: Some(session), application: false, faulted: false,
+            application_submitted: false })
+    }
+
+    pub(crate) fn start(
+        pdev: &platform::Device<Core>, dev: ARef<AsahiDevice>, registers: regs::Resources,
+    ) -> Result<Self> {
+        let mut owner = Self::prepare(pdev, dev, registers)?;
+        let session = owner.session.as_mut().ok_or(EIO)?;
         let result = session.initialize(*crate::module_parameters::m5_initdata_test.value());
         dev_info!(pdev.as_ref(), "M5_INIT transaction result={:?}; requested probe mode={}\n",
             result, *crate::module_parameters::m5_initdata_test.value());
@@ -518,17 +531,121 @@ impl M5Runtime {
                     "M5_KSM admission snapshot rejected {:?}; quiescence unqualified, owners retained\n", error);
             }
         }
-        Ok(Self { session: Some(session) })
+        Ok(owner)
+    }
+
+    /// Boot without a native program or job graph and leave both processors
+    /// running for explicit application submissions. This does not register
+    /// a render node or claim that Mesa command translation is complete.
+    pub(crate) fn start_application(
+        pdev: &platform::Device<Core>, dev: ARef<AsahiDevice>, registers: regs::Resources,
+    ) -> Result<Self> {
+        // Periodic diagnostic traces need continuous draining. The eventual
+        // adapter's event worker is not armed here, so disable that producer
+        // before a session can idle between explicit submissions.
+        if *crate::module_parameters::m5_fw_trace.value() != 0 { return Err(EINVAL); }
+        let mut owner = Self::prepare(pdev, dev, registers)?;
+        owner.application = true;
+        let result = (|| {
+            let session = owner.session.as_mut().ok_or(EIO)?;
+            session.initialize(2)?;
+            session.retire_idle_policy()?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            owner.faulted = true;
+            return Err(error);
+        }
+        dev_info!(pdev.as_ref(),
+            "M5_APPLICATION session ready; both firmware CPUs retained, no native program or submission\n");
+        Ok(owner)
+    }
+
+    pub(crate) fn new_user_vm(&self, id: u64, kernel_range: core::ops::Range<u64>) -> Result<mmu::Vm> {
+        if !self.application || self.is_crashed() { return Err(ENODEV); }
+        crate::m5_vm::compact_range(&kernel_range).ok_or(EINVAL)?;
+        self.session.as_ref().ok_or(EIO)?.uat.new_vm(id, kernel_range)
+    }
+
+    pub(crate) fn is_crashed(&self) -> bool {
+        self.faulted || self.session.as_ref().is_none_or(|session|
+            session.roles.iter().any(|role| role.state.crashed.load(Ordering::Acquire)))
+    }
+
+    /// Reject new application work and retain every firmware-visible owner.
+    /// This is also used when a registered device is unbound with open files.
+    pub(crate) fn shutdown(&mut self) -> Result {
+        self.faulted = true;
+        let session = self.session.as_deref_mut().ok_or(EIO)?;
+        if let Some(memory) = &session.memory { memory.quarantine_graphics(); }
+        session.stop_cpus()
+    }
+
+    /// The adapter serializes this call and validates the translated command
+    /// plus every user mapping before entry. Return success only after paired
+    /// queue retirement, scheduler unlink, stamps and firmware notifications.
+    /// A failed published job retains and quarantines its VM until reboot.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn submit_application(
+        &mut self, vm: &mmu::Vm, parameters: crate::g17_render::G17pRenderParameters,
+        controls: crate::m5_render::M5RenderControls, clusters: u32,
+        usc_required: [u64; 2],
+    ) -> Result<crate::m5_completion::M5GraphicsCompletion> {
+        if !self.application || self.is_crashed() { return Err(ENODEV); }
+        // The fixed graph owns one first-job slot. Reuse requires explicit
+        // rebuilding of its descriptors and channel contexts, not pretending
+        // that a new application's work is the diagnostic's next frame.
+        if self.application_submitted { return Err(EBUSY); }
+        let session = self.session.as_deref_mut().ok_or(EIO)?;
+        session.memory.as_mut().ok_or(EIO)?.initialize_application_graphics(
+            &session.dev, vm, parameters, controls, clusters, usc_required)?;
+        // From installation onward, even a failed mailbox send can have made
+        // memory visible to firmware. Never unwind or recycle the job graph.
+        self.application_submitted = true;
+        let result = (|| {
+            session.install_graphics_queues()?;
+            let memory = session.memory.as_mut().ok_or(EIO)?;
+            memory.publish_graphics_job()?;
+            Pin::new(&mut session.roles[0].rtkit).send_message(0x21, 0x0083_0000_0000_000a)?;
+            for _ in 0..10000 {
+                if memory.drain_reports(&session.dev)?
+                    || session.roles.iter().any(|role| role.state.crashed.load(Ordering::Acquire)) {
+                    return Err(EIO);
+                }
+                let (outer, inner, _) = memory.graphics_status()?;
+                let completion = memory.graphics_completion()?;
+                if outer == [4; 3] && inner == [[4; 3]; 2]
+                    && M5FirmwareMemory::graphics_pair_complete(completion, 1) {
+                    return Ok(completion);
+                }
+                fsleep(Delta::from_millis(1));
+            }
+            Err(ETIMEDOUT)
+        })();
+        if let Err(error) = result {
+            self.faulted = true;
+            vm.status().record(error.to_errno());
+            if let Some(memory) = &session.memory { memory.quarantine_graphics(); }
+            // A successful stop request alone does not prove a halt. Keep
+            // the full session even after this best-effort stop succeeds.
+            let stopped = session.stop_cpus();
+            dev_err!(session.dev.as_ref(),
+                "M5_APPLICATION submission failed {:?}; stop={:?}; VM and firmware owners retained\n",
+                error, stopped);
+        }
+        result
     }
 }
 
 impl Drop for M5Runtime {
     fn drop(&mut self) {
         if let Some(mut session) = self.session.take() {
-            if session.stop_cpus().is_err() {
-                dev_err!(session.dev.as_ref(), "M5 stop failed; retaining the full session\n");
-                core::mem::forget(session);
-            }
+            if let Some(memory) = &session.memory { memory.quarantine_graphics(); }
+            let stopped = session.stop_cpus();
+            dev_info!(session.dev.as_ref(),
+                "M5 session release requested; stop={:?}; halt unqualified, owners retained until reboot\n",
+                stopped);
+            core::mem::forget(session);
         }
     }
 }

@@ -112,6 +112,14 @@ impl M5GraphicsMemory {
         &self.usc
     }
 
+    /// A stop request is not proof that hardware has released these mappings.
+    /// Close VM_BIND admission before any future error fence can wake userspace.
+    pub(super) fn quarantine(&self) {
+        if let Some(guard) = &self.user_mappings {
+            guard.quarantine();
+        }
+    }
+
     /// Alias existing owned user pages into the firmware VM. PM page lists
     /// and scene counters must share backing with their user GPU views.
     /// The returned mappings belong to the eventual retained job owner.

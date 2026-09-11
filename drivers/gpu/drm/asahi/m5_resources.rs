@@ -73,6 +73,14 @@ pub(crate) struct M5FirmwareMemory {
 }
 
 impl M5FirmwareMemory {
+    /// Internal defaults for the initial M5 render-state envelope. The DRM
+    /// translator replaces all program/input addresses, and owned target
+    /// allocation replaces private storage before any queue publication.
+    pub(crate) fn reference_render_profile() ->
+        (crate::g17_render::G17pRenderParameters, crate::m5_render::M5RenderControls) {
+        graphics_job::triangle_parameters()
+    }
+
     /// All fallible preparation happens before publication. The caller must
     /// pass a prepared M5 UAT while both processors await initdata. The
     /// caller retains its own Arc until both CPUs stop, including when this
@@ -276,6 +284,27 @@ impl M5FirmwareMemory {
     #[inline(never)]
     fn initialize_graphics(&mut self, dev: &AsahiDevice) -> Result {
         let job = graphics_job::M5GraphicsJob::new(dev, &self.uat)?;
+        self.attach_graphics(dev, job)
+    }
+
+    /// Prepare a first application job while retaining its actual VM. No
+    /// native program bundle or captured input/output pages are requested.
+    /// The caller has validated the command and all user mapping coverage.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn initialize_application_graphics(
+        &mut self, dev: &AsahiDevice, vm: &mmu::Vm,
+        parameters: crate::g17_render::G17pRenderParameters,
+        controls: crate::m5_render::M5RenderControls, clusters: u32,
+        usc_required: [u64; 2],
+    ) -> Result {
+        if self.graphics.is_some() { return Err(EBUSY); }
+        let job = graphics_job::M5GraphicsJob::from_vm(
+            dev, &self.uat, vm, parameters, controls, clusters, usc_required)?;
+        self.attach_graphics(dev, job)
+    }
+
+    fn attach_graphics(&mut self, dev: &AsahiDevice, job: graphics_job::M5GraphicsJob) -> Result {
+        if self.graphics.is_some() { return Err(EBUSY); }
         let queues = graphics_queues::M5GraphicsQueues::new(dev, &self.uat, &job)?;
         let pb = job.parameter_descriptor()?;
         self.pbdesc.with_bytes_mut(|out| {
@@ -295,6 +324,10 @@ impl M5FirmwareMemory {
         })?;
         self.graphics = Some((job, queues));
         Ok(())
+    }
+
+    pub(crate) fn quarantine_graphics(&self) {
+        if let Some((job, _)) = &self.graphics { job.quarantine(); }
     }
 
     /// Drain M5 report channels using the native producer contracts.
