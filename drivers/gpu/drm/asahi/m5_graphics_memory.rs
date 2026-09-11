@@ -6,6 +6,7 @@
 //! including after faults. Captured physical backing is never installed.
 
 use super::MappedObject;
+use super::graphics_usc::M5GraphicsUsc;
 use crate::{driver::AsahiDevice, m5_graphics_bundle as bundle, mmu};
 use kernel::{firmware::Firmware, prelude::*};
 
@@ -13,6 +14,7 @@ pub(super) struct M5GraphicsMemory {
     // Retract any published roots before dropping their mapping owners.
     context: mmu::M5ExecutionContext,
     pages: KVec<MappedObject>,
+    usc: M5GraphicsUsc,
     output_first: usize,
 }
 
@@ -55,9 +57,11 @@ impl M5GraphicsMemory {
             }
             pages.push(page, GFP_KERNEL)?;
         }
+        let usc = M5GraphicsUsc::new(dev, context.vm())?;
         Ok(Self {
             context,
             pages,
+            usc,
             output_first: output_first.ok_or(EINVAL)?,
         })
     }
@@ -69,6 +73,10 @@ impl M5GraphicsMemory {
 
     pub(super) fn roots(&self) -> [u64; 2] {
         self.context.roots()
+    }
+
+    pub(super) fn usc(&self) -> &M5GraphicsUsc {
+        &self.usc
     }
 
     /// Alias existing owned user pages into the firmware VM. PM page lists
@@ -133,6 +141,32 @@ impl M5GraphicsMemory {
             .find(|page| page.iova() == base)
             .ok_or(EFAULT)?;
         page.read_u32(address)
+    }
+
+    /// Reset owned PM outputs before exposing the context to either firmware.
+    pub(super) fn clear_pages(&mut self, address: u64, bytes: usize) -> Result {
+        if self.context.is_current() || bytes == 0 || bytes % bundle::PAGE_BYTES != 0
+            || address & (bundle::PAGE_BYTES as u64 - 1) != 0 {
+            return Err(EINVAL);
+        }
+        let end = address.checked_add(bytes as u64).ok_or(EOVERFLOW)?;
+        let count = self.pages.iter().filter(|p| p.iova() >= address && p.iova() < end).count();
+        if count != bytes / bundle::PAGE_BYTES { return Err(EFAULT); }
+        for page in self.pages.iter_mut().filter(|p| p.iova() >= address && p.iova() < end) {
+            page.with_bytes_mut(|out| { out.fill(0); Ok(()) })?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn write_word(&mut self, address: u64, value: u32) -> Result {
+        if self.context.is_current() || address & 3 != 0 { return Err(EINVAL); }
+        let base = address & !(bundle::PAGE_BYTES as u64 - 1);
+        let offset = (address - base) as usize;
+        let page = self.pages.iter_mut().find(|p| p.iova() == base).ok_or(EFAULT)?;
+        page.with_bytes_mut(|out| {
+            out[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            Ok(())
+        })
     }
 
     /// Call only after the complete TA/3D resource graph is prepared.

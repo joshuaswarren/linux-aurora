@@ -17,6 +17,24 @@ mod tests;
 pub(crate) const TA_REGISTER_COUNT: usize = 82;
 pub(crate) const FRAGMENT_REGISTER_COUNT: usize = 90;
 
+/// Initial M5 PB slot with fresh ring cursors. The owning job chooses the
+/// hardware slot separately and retains the page-list mapping.
+pub(crate) fn initial_parameter_buffer_descriptor(
+    page_list: u64,
+    page_count: u32,
+) -> Result<[u32; 4], M5RenderBuildError> {
+    if page_list == 0 || page_list >= (1u64 << 42) || page_list & 0x7f != 0
+        || page_count == 0 || page_count >= (1 << 22) {
+        return Err(M5RenderBuildError::OwnershipMismatch);
+    }
+    // 25G76 halLoadPBDesc, 89de844..89de8dc. The descriptor has four
+    // dwords; +0's low flags and both cursors start at zero. Native's
+    // untagged user address is translated into its PB segment encoding.
+    let segment = ((page_list + 0x70_0000_0000) & 0x70_0000_0000) >> 8;
+    Ok([((page_list >> 4) as u32) & !7,
+        (segment as u32 & 0xf000_0000) | page_count, 0, 0])
+}
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum M5RenderBuildError {
     Common(RenderBuildError),
