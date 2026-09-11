@@ -110,8 +110,20 @@ with Serial('/dev/cu.kis-01100000-ch-0', 115200, timeout=0.2) as port:
 
     try:
         save('context-root-table', props['gpu-region-base'], 0x400)
+        save('primary-status-b', 0xfffffc2000020340, 0x5000, 0)
+        save('recovery-records', 0xfffffc20001c0000, 0x80, 0)
+        # M5 0x5bb4/0x5bb8 reads the unaligned main+0x26c pointer,
+        # the fourth owned bundle view (shared+0xbc80), for classification.
+        save('recovery-classifier', 0xfffffc20c0793c80, 0x80, 0)
         for start, size in [(0x124000, 0xc000), (0x177000, 0x2000)]:
             save('gfx-data-%x' % start, props['gfx-data-base'] + start - 0x4c000, size)
+        # M5 GFX firmware 0x17e18 uses main+0x1e0 for a control block
+        # (consumer+0, producer+0x20) and main+0x1e8 for 512 x 0x48
+        # records. These are report-channel views of the owned status A.
+        for role, status in [('gfx', 0xfffffc200002ee40),
+                             ('gfx1', 0xfffffc20000e3100)]:
+            save(role + '-report-states', status, 0x300, 0)
+            save(role + '-report-records', status + 0xa6ac0, 0x9000, 0)
         for label, address, size, context in [
                 ('uma-slot0', 0xfffffc20015e8000, 32, 0),
                 ('event-state', 0xfffffc20c0405000, 0x70, 0),

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Run the retained mode-3 probe after boot-linux.py releases the M5 console."""
+"""Run a retained mode-3..6 probe after boot-linux.py releases the M5 console."""
 from pathlib import Path
+import os
 import sys
 import time
 
@@ -11,12 +12,15 @@ from m1n1.proxy import Serial
 mode = int(sys.argv[1]) if len(sys.argv) == 2 else 3
 if len(sys.argv) > 2 or mode not in (3, 4, 5, 6):
     raise ValueError("Expected mode 3 (queue), 4 (scheduler), 5 (context) or 6 (compute)")
+trace_mask = int(os.environ.get('M5_FW_TRACE', '0'), 0)
+if trace_mask < 0 or trace_mask & ~0x203:
+    raise ValueError('M5_FW_TRACE accepts only power, submission and recovery bits (0x203)')
 command = (
     "echo M5_QUEUE_PROBE_BEGIN; "
     "if grep -q apple,j813 /proc/device-tree/compatible "
     "&& [ $(uname -r) = 7.1.6-aurora-j813-gpu-v9 ] "
     "&& [ ! -d /sys/module/asahi ]; then "
-    f"modprobe asahi m5_initdata_test={mode}; echo M5_QUEUE_PROBE_RETURN=$?; "
+    f"modprobe asahi m5_initdata_test={mode} m5_fw_trace={trace_mask}; echo M5_QUEUE_PROBE_RETURN=$?; "
     "dmesg | tail -180; "
     "else echo M5_QUEUE_PROBE_WRONG_TARGET_OR_ALREADY_LOADED; fi; "
     "echo M5_QUEUE_PROBE_DONE\n"
@@ -45,5 +49,7 @@ if mode >= 5:
 if mode >= 6:
     required.append(b"M5_COMPUTE verified 1024 exact outputs, inputs unchanged, queues retired;")
 if any(marker not in captured for marker in required):
-    raise RuntimeError("Queue installation was not verified; inspect the retained log")
+    if b"M5_COMPUTE firmware requested GPU restart" in captured:
+        raise RuntimeError("M5 compute triggered a GPU restart; inspect the retained reports")
+    raise RuntimeError(f"M5 mode-{mode} probe was not verified; inspect the retained log")
 print("M5_QUEUE_INSTALL_HARDWARE_VERIFIED")

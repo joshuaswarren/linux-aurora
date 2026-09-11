@@ -2157,6 +2157,50 @@ impl Resources {
         Ok(())
     }
 
+    /// Match the measured M5 native AP setup before starting firmware CPUs.
+    ///
+    /// The broad 25G76 AP trace writes 0x30001 at physical 0x580e90000;
+    /// Linux's prior stopped probe reads 0x30000. This diagnostic accepts
+    /// only those two observed states and changes only bit zero. The bit's
+    /// precise hardware role remains unqualified; do not generalize it.
+    pub(crate) fn m5_match_pmgr_boot_control(&self) -> Result {
+        const OFFSET: usize = 0xe90000;
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let res = sgx.relaxed();
+        let before = res.try_read32(OFFSET)?;
+        if before != 0x30000 && before != 0x30001 {
+            dev_err!(self.dev.as_ref(), "M5_INIT unexpected PMGR control {:#x}\n", before);
+            return Err(EIO);
+        }
+        res.try_write32(before | 1, OFFSET)?;
+        let after = res.try_read32(OFFSET)?;
+        dev_info!(self.dev.as_ref(), "M5_INIT native PMGR control: {:#x} -> {:#x}\n",
+            before, after);
+        if after != 0x30001 {
+            return Err(EIO);
+        }
+        Ok(())
+    }
+
+    /// M5: arm Fender dynamic gating before either role's initdata.
+    ///
+    /// Native 25G76 AGXG17G masks with 0xfffffff9 at 0xfffffe00089e0408.
+    /// The M5 AP write trace records zero at SGX+0xd06030 before the first
+    /// GFX1 initialization publication. Preserve unrelated register bits.
+    pub(crate) fn m5_pre_initdata_clear(&self) -> Result {
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let res = sgx.relaxed();
+        let before = res.try_read32(T8140_FENDER_DYNAMIC_GATING)?;
+        res.try_write32(before & !0x6, T8140_FENDER_DYNAMIC_GATING)?;
+        let after = res.try_read32(T8140_FENDER_DYNAMIC_GATING)?;
+        dev_info!(self.dev.as_ref(), "M5_INIT Fender dynamic gating: {:#x} -> {:#x}\n",
+            before, after);
+        if after & 0x6 != 0 {
+            return Err(EIO);
+        }
+        Ok(())
+    }
+
     /// T8140: enable dynamic Fender gating before initdata.
     ///
     /// Native preserves every unrelated bit and clears only bits 1 and 2

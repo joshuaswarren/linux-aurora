@@ -8,13 +8,38 @@ an owned SKSM compute queue, binds its scheduler control, and verifies the
 firmware's retained records.
 An isolated execution context, program pages and initial compute pool now
 support a first SKSM kick. Both command queues retire and firmware accounts
-for the kick, but no completion or shader result follows. It does not yet
+for the kick, then a GPU restart report appears with no completion or
+shader result. It does not yet
 execute verified GPU work or expose a render node. DCP presentation is a later,
 independent qualification; neither a software desktop nor encoder success
 is evidence of GPU rendering.
 
 ## Hardware evidence, 2026-09-10
 
+- Follow-up tests on September 11 confirmed a primary type-4 GPU restart
+  report after the compute kick, first in retained RAM and then in a live
+  report-ring drain. The report names affected stamp index 11; status B
+  records reason 0, hardware summary 1 and recovery epoch/state 1. The
+  exact fault source remains unresolved. No recovery acknowledgment is
+  sent, and both firmware CPU stop requests succeed. The earlier absence
+  of a firmware CPU crash did not establish an absence of a GPU fault.
+- Primary M5 firmware tracing is hardware-qualified through status-A `+0`.
+  The `m5_fw_trace` parameter selects decoded classes in the owned host
+  field before initdata publication. A value of `3` produced native queue,
+  kick and recovery-transition records. Report consumers advance within
+  their measured ring bounds; ordinary processing-loop brackets do not
+  consume the print budget. Stopped RAM identifies data master 2, slot 0
+  in the recovery classifier. See `M5_FENDER_SETUP.md` for exact evidence.
+- Trace mask `0x203` additionally verifies the firmware's stalled-work
+  classification. Guarded reads with both firmware CPUs stopped confirm
+  hardware slot 0 contains the owned command and queue pointers, with
+  state `0x1000d` and queue-11 stamp 1. The optional queue-selector read
+  restores its previous value. These results establish hardware admission;
+  all shader output sentinels still remain untouched.
+- A native macOS AP trace identified two missing setup writes. Fresh Linux
+  tests verified Fender bits 1 and 2 cleared (`0x6` to `0x0`) and PMGR
+  control matched (`0x30000` to `0x30001`). Both firmware roles and the
+  queue still initialized, but these changes did not produce shader output.
 - Two fresh RAM boots with `m5_initdata_test=6` submitted one SKSM compute
   kick after the previous queue, scheduler and context checks passed. Outer
   counters reached `[2, 2, 2]`, inner counters `[4, 4, 4]`, and the firmware's
