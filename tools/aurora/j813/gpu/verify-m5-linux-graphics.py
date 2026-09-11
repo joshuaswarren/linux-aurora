@@ -41,7 +41,7 @@ def verify_pixels(rgba):
     return foreground
 
 
-def read_capture(directory):
+def read_capture(directory, context=3):
     manifest = json.loads((directory / 'manifest.json').read_text())
     if (manifest.get('graphics_draw') is not True
             or manifest.get('device_memory_read') is not False
@@ -57,8 +57,17 @@ def read_capture(directory):
             raise ValueError('Capture object changed: ' + item['label'])
         objects[item['label']] = (item, data)
     item, rgba = objects['graphics-pixels']
-    if item['context'] != 3 or int(item['address'], 16) != PIXEL_ADDRESS:
+    if not 3 <= context < 64 or item['context'] != context or int(item['address'], 16) != PIXEL_ADDRESS:
         raise ValueError('Captured pixels are not the owned graphics output')
+    _, roots = objects['context-root-table']
+    low, high = struct.unpack_from('<QQ', roots, context * 16)
+    if (low >> 48 != context or high >> 48 != context or not low & 1
+            or not high & 1 or (low & 0x0000ffffffffc000) == (high & 0x0000ffffffffc000)):
+        raise ValueError('Application root pair is not distinct and tagged for the requested context')
+    for label in ('graphics-ta', 'graphics-fragment'):
+        _, descriptor = objects[label]
+        if struct.unpack_from('<I', descriptor, 0xc)[0] != context:
+            raise ValueError('Graphics descriptor targets a different application context')
     return rgba, objects
 
 
@@ -142,10 +151,11 @@ def main():
                         help='Reject captures without complete paired-render ownership evidence')
     parser.add_argument('--frame', type=int, choices=range(1, 65), default=1,
                         help='Expected final frame generation; earlier frames require separate log evidence')
+    parser.add_argument('--context', type=int, choices=range(3, 64), default=3)
     args = parser.parse_args()
     if args.frame != 1 and not args.require_completion:
         parser.error('--frame requires --require-completion')
-    rgba, objects = read_capture(args.capture)
+    rgba, objects = read_capture(args.capture, args.context)
     foreground = verify_pixels(rgba)
     digest = hashlib.sha256(rgba).hexdigest()
     if digest != NATIVE_REFERENCE_SHA256:
@@ -159,6 +169,7 @@ def main():
                   image_size=[WIDTH * args.scale, HEIGHT * args.scale],
                   completion_bookkeeping_qualified=completion,
                   completion_frame=args.frame if completion else None,
+                  application_context=args.context,
                   mesa_glxgears_verified=False, dcp_verified=False)
     args.output.with_suffix('.json').write_text(json.dumps(report, indent=2) + '\n')
     print(json.dumps(report))

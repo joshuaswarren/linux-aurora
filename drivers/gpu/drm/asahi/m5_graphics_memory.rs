@@ -30,7 +30,9 @@ impl M5GraphicsMemory {
         uat: &mmu::Uat,
         reference: &bundle::GraphicsBundle<'_>,
     ) -> Result<Self> {
-        let context = uat.new_t8142_execution_context()?;
+        let id = *crate::module_parameters::m5_graphics_context.value();
+        if !(3..64).contains(&id) { return Err(EINVAL); }
+        let context = uat.new_t8142_graphics_execution_context(id as u8)?;
         let mut pages = KVec::new();
         let mut output_first = None;
         for index in 0..reference.page_count() {
@@ -58,6 +60,8 @@ impl M5GraphicsMemory {
             pages.push(page, GFP_KERNEL)?;
         }
         let usc = M5GraphicsUsc::new(dev, context.vm())?;
+        dev_info!(dev.as_ref(), "M5_GRAPHICS_CONTEXT id={} roots={:x?}; mappings owned\n",
+            context.context_id(), context.roots());
         Ok(Self {
             context,
             pages,
@@ -70,6 +74,8 @@ impl M5GraphicsMemory {
     pub(super) fn vm(&self) -> &mmu::Vm {
         self.context.vm()
     }
+
+    pub(super) fn context_id(&self) -> u8 { self.context.context_id() }
 
     pub(super) fn roots(&self) -> [u64; 2] {
         self.context.roots()

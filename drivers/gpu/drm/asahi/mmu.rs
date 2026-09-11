@@ -905,6 +905,8 @@ impl gpuvm::DriverGpuVm for VmInner {
 
         let gpuva = ctx.new_va.take().expect("Multiple step_map calls");
 
+        self.flush_m5_app_range(op.addr(), op.range() as usize);
+
         if op
             .map_and_link_va(
                 self,
@@ -934,6 +936,8 @@ impl gpuvm::DriverGpuVm for VmInner {
 
         self.page_table
             .unmap_pages(va.addr()..(va.addr() + va.range()))?;
+
+        self.flush_m5_app_range(va.addr(), va.range() as usize);
 
         if let Some(asid) = self.slot() {
             fence(Ordering::SeqCst);
@@ -988,6 +992,8 @@ impl gpuvm::DriverGpuVm for VmInner {
         let unmap_range = unmap_end - unmap_start;
 
         self.page_table.unmap_pages(unmap_start..unmap_end)?;
+
+        self.flush_m5_app_range(unmap_start, unmap_range as usize);
 
         if let Some(asid) = self.slot() {
             fence(Ordering::SeqCst);
@@ -1121,6 +1127,7 @@ impl VmInner {
             iova += len as u64;
             left -= len;
         }
+        self.flush_m5_app_range(node.start(), node.mapped_size);
         Ok(())
     }
 }
@@ -1129,6 +1136,7 @@ impl VmInner {
 #[derive(Clone)]
 pub(crate) struct Vm {
     id: u64,
+    kernel_range: Range<u64>,
     inner: ARef<gpuvm::GpuVm<VmInner>>,
     dummy_obj: ARef<gem::Object>,
     binding: Arc<Mutex<VmBinding>>,
@@ -1933,6 +1941,8 @@ impl Drop for KernelMapping {
             );
         }
 
+        owner.flush_m5_app_range(self.iova(), self.size());
+
         if let Some(asid) = owner.slot() {
             fence(Ordering::SeqCst);
             mem::tlbi_range(asid as u8, self.iova() as usize, self.size());
@@ -1993,6 +2003,9 @@ struct UatInner {
     /// claimed before their TTBAT roots become visible and released only
     /// after lease teardown invalidates the corresponding ASID.
     t8140_app_contexts: AtomicU64,
+    /// M5 application root leases. Contexts 0..2 belong to firmware and its
+    /// opening transaction; application queues claim contexts 3..63.
+    t8142_app_contexts: AtomicU64,
     #[pin]
     shared: Mutex<UatShared>,
     #[pin]
@@ -2216,6 +2229,9 @@ impl Vm {
     /// the same identity, which is this id.
     pub(crate) fn id(&self) -> u64 { self.id }
 
+    /// Application VA interval reserved by VM_CREATE for driver allocations.
+    pub(crate) fn kernel_range(&self) -> Range<u64> { self.kernel_range.clone() }
+
     /// Create a new virtual memory address space
     fn new(
         dev: &driver::AsahiDevice,
@@ -2275,6 +2291,7 @@ impl Vm {
         let binding_clone = binding.clone();
         Ok(Vm {
             id,
+            kernel_range: kernel_range.clone(),
             dummy_obj: dummy_obj.gem.clone(),
             inner: gpuvm::GpuVm::new(
                 c_str!("Asahi::GpuVm"),
@@ -5252,6 +5269,12 @@ impl Uat {
     /// than by the slot allocator -- exactly as m1n1 publishes `CONTEXT = 2`
     /// while keeping its own bootstrap context separate.
     pub(crate) fn bind(&self, vm: &Vm) -> Result<VmBind> {
+        // M5 application slots require a private empty upper root and a
+        // retained M5ExecutionContext. The legacy slot allocator must not
+        // overwrite a slot claimed by that independent lease allocator.
+        if self.cfg == UatConfig::T8142 {
+            return Err(ENOTSUPP);
+        }
         let mut binding = vm.binding.lock();
 
         if binding.binding.is_none() {
@@ -5455,6 +5478,7 @@ impl Uat {
                     handoff_mode == HandoffMode::FirmwareDekker
                 ),
                 t8140_alias_owner: AtomicU64::new(0),
+                t8142_app_contexts: AtomicU64::new(0b111),
                 // Contexts 0..4 have fixed architectural meaning, and the
                 // bind band belongs to `Uat::bind`. Reserving the band here as
                 // well means the two allocators cannot collide even if the
