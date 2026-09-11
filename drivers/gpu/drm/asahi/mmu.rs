@@ -4251,7 +4251,16 @@ impl Uat {
             owner.page_table.ttb()
         };
         let inner = self.inner.lock();
-        Ok(context_mask_for_root(root, inner.ttbs()))
+        let ttbs = inner.ttbs();
+        let mut contexts = 0u64;
+        for context_id in 0..UAT_NUM_CTX {
+            if ttbs[context_id].ttb0.load(Ordering::Acquire)
+                == t8140_tagged_root(root, context_id)
+            {
+                contexts |= 1u64 << context_id;
+            }
+        }
+        Ok(contexts)
     }
 
     /// `ENOENT` unless some TTBAT context holds `vm`'s root.

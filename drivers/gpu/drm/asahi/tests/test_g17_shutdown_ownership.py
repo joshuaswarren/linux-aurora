@@ -65,10 +65,6 @@ assert teardown.index('owner.stop_cpu_pair()') < teardown.index('owner.drop_queu
 # its failed-stop lifetime, rather than silently escaping the retention test.
 fields = re.findall(r'^    (\w+):', item(live, 'pub(crate) struct G17PLiveRuntime {'), re.M)
 host_only = set('completion_indices render_tracker test_stage accepting_submissions queue_setup_pending compute_owner compute_recycle_pending compute_abandoned crash_recoveries compute_gate_suspect completion_signal render_event_masks render_fence_state boot_stop_unproven session_recovery_pending runtime_pm_armed'.split())
-# These are ordinary host-owned byte copies, never published as DMA owners.
-snapshot = item(live, 'struct G17PFirmwareDataSnapshot {')
-assert re.findall(r'^    (\w+): KVVec<u8>,', snapshot, re.M) == ['gfx', 'gfx1']
-host_only.add('firmware_data')
 options = 'pdev drm registers manager cpus gfx_state gfx_rtkit gfx1_state gfx1_rtkit queue compute_binding compute_timestamps pending_compute'.split()
 vectors = 'retired_queues quarantined_bindings pending_render quarantined_render_completions'.split()
 assert set(fields) == host_only | set(options) | set(vectors) | {'async_compute_queues'}, set(fields)

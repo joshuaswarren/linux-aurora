@@ -2144,6 +2144,60 @@ impl G17PManagerConstruction {
         Ok(())
     }
 
+    /// Queue a firmware restart request, or fold it into the one already
+    /// pending.
+    ///
+    /// The firmware raises ONE restart request, and both RTKit roles can
+    /// observe it: `service_primary_firmware_events` drains the gfx ring and
+    /// then, in the same pass and unconditionally, the gfx1 ring. A type-4 on
+    /// the second ring therefore meets a request the first ring already
+    /// queued, and the bare `queue_primary_recovery` answers that with EBUSY.
+    /// Every caller propagates it with `?` into a chain whose only error
+    /// handler sets `crashed`, so a duplicate view of a single recovery -- the
+    /// normal dual-role case, not a fault -- permanently deafened the session.
+    ///
+    /// Coalescing is what the surrounding code already does with duplicate
+    /// type-4 records inside ONE ring (`recovery_records` counts them and the
+    /// accepted generation advances once), so doing it across the two rings is
+    /// the same rule, not a new one. Returns whether a new request was queued.
+    pub(crate) fn queue_or_coalesce_primary_recovery(
+        &mut self,
+        generation: u64,
+        records: u32,
+        blamed_stamp: Option<u8>,
+    ) -> Result<bool> {
+        if let Some((pending_generation, pending_records, pending_stamp)) =
+            self.pending_primary_recovery
+        {
+            // A pending request for a DIFFERENT generation is a real disagreement
+            // about how many restarts the firmware asked for, and must not be
+            // silently merged.
+            if pending_generation != generation {
+                dev_err!(
+                    self.resources.dev().as_ref(),
+                    "G17P recovery: type-4 generation {} arrived while generation {} is still pending\n",
+                    generation,
+                    pending_generation
+                );
+                return Err(EBUSY);
+            }
+            self.pending_primary_recovery = Some((
+                generation,
+                pending_records.saturating_add(records),
+                pending_stamp.or(blamed_stamp),
+            ));
+            return Ok(false);
+        }
+        self.queue_primary_recovery(generation, records, blamed_stamp)?;
+        Ok(true)
+    }
+
+    /// The host generation the next type-4 record must name. Records naming an
+    /// older generation are duplicates of a restart already serviced.
+    pub(crate) fn accepted_firmware_recovery_generation(&self) -> u64 {
+        self.accepted_firmware_recovery_generation
+    }
+
     pub(crate) fn pending_primary_recovery(&self) -> Option<(u64, u32, Option<u8>)> {
         self.pending_primary_recovery
     }
