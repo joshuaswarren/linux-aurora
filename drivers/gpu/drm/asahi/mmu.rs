@@ -2959,7 +2959,30 @@ impl Vm {
         prot: Prot,
         guard: bool,
     ) -> Result<KernelMapping> {
-        let size = object_range.range();
+        self.map_in_range_with_guards(
+            gem, object_range, alignment, range, prot, usize::from(guard),
+        )
+    }
+
+    /// Reserve trailing unmapped pages in the same allocator node as the
+    /// mapping. The complete reservation survives until the mapping is
+    /// dropped; a later driver allocation cannot fill a hardware guard gap.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn map_in_range_with_guards(
+        &self,
+        gem: &gem::Object,
+        object_range: Range<usize>,
+        alignment: u64,
+        range: Range<u64>,
+        prot: Prot,
+        guard_pages: usize,
+    ) -> Result<KernelMapping> {
+        let size = object_range.end.checked_sub(object_range.start).ok_or(EINVAL)?;
+        if size == 0 || object_range.end > gem.size() {
+            return Err(EINVAL);
+        }
+        let reserved = guard_pages.checked_mul(UAT_PGSZ)
+            .and_then(|guard| size.checked_add(guard)).ok_or(EOVERFLOW)?;
         let sgt = gem.owned_sg_table()?;
         let mut inner = self.inner.exec_lock(Some(gem), false)?;
         let vm_bo = self.inner.obtain_bo(gem)?;
@@ -2985,7 +3008,7 @@ impl Vm {
                 offset: object_range.start,
                 mapped_size: size,
             },
-            (size + if guard { UAT_PGSZ } else { 0 }) as u64, // Add guard page
+            reserved as u64,
             alignment,
             0,
             range.start,

@@ -2652,6 +2652,27 @@ fn new_g17p_render_target_memory(
 
 #[cfg(not(test))]
 impl MappedObject {
+    fn new_wc_in_range_with_guards(
+        dev: &AsahiDevice,
+        vm: &mmu::Vm,
+        range: Range<u64>,
+        size: usize,
+        alignment: u64,
+        prot: mmu::Prot,
+        guard_pages: usize,
+    ) -> Result<Self> {
+        let mut object = gem::new_kernel_object_wc(dev, size)?;
+        object.vmap()?.memset(0);
+        let mapping = vm.map_in_range_with_guards(
+            &object.gem, 0..object.size(), alignment, range, prot, guard_pages,
+        )?;
+        let iova = mapping.iova();
+        Ok(Self {
+            mapping: Some(mapping), object, iova, object_offset: 0,
+            logical_size: size, cpu_wc: true,
+        })
+    }
+
     fn new_wc_in_range(
         dev: &AsahiDevice,
         vm: &mmu::Vm,

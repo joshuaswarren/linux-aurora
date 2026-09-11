@@ -69,7 +69,11 @@ impl Uat {
         if !(3..UAT_NUM_CTX as u8).contains(&context) {
             return Err(EINVAL);
         }
-        let range = IOVA_USER_BASE..uat_geometry(self.cfg)?.user_va_top();
+        // Match the VM_CREATE reservation used by Mesa: driver allocations
+        // live in the upper 32 GiB, while shaders and application buffers
+        // retain their own addresses below that reservation.
+        let end = uat_geometry(self.cfg)?.user_va_top() - 2 * UAT_PGSZ as u64;
+        let range = (end - (32u64 << 30))..end;
         let vm = self.new_vm(0x8142_0000 + context as u64, range)?;
         self.prepare_t8142_execution_context_mask(&vm, 1u64 << context)
     }
