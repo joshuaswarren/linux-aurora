@@ -14,6 +14,9 @@ use kernel::{firmware::Firmware, prelude::*};
 pub(super) struct M5GraphicsMemory {
     // Retract any published roots before dropping their mapping owners.
     context: mmu::M5ExecutionContext,
+    // Keep user mappings and GEM backing across handle close/VM teardown.
+    // This guard's bookkeeping is generation-neutral despite its old name.
+    user_mappings: Option<mmu::T8140VmJobGuard>,
     pages: KVec<MappedObject>,
     usc: M5GraphicsUsc,
     output_first: Option<usize>,
@@ -25,9 +28,10 @@ impl M5GraphicsMemory {
     /// program firmware or captured pages are requested by this constructor.
     pub(super) fn from_vm(dev: &AsahiDevice, uat: &mmu::Uat, vm: &mmu::Vm) -> Result<Self> {
         crate::m5_vm::compact_range(&vm.kernel_range()).ok_or(EINVAL)?;
+        let user_mappings = vm.retain_t8140_job()?;
         let context = uat.prepare_t8142_execution_context(vm)?;
         let usc = M5GraphicsUsc::new_application(dev, context.vm())?;
-        Ok(Self { context, pages: KVec::new(), usc, output_first: None })
+        Ok(Self { context, user_mappings: Some(user_mappings), pages: KVec::new(), usc, output_first: None })
     }
 
     /// Return an owning allocation in the compact TA resource arena. The
@@ -86,6 +90,7 @@ impl M5GraphicsMemory {
             context.context_id(), context.roots());
         Ok(Self {
             context,
+            user_mappings: None,
             pages,
             usc,
             output_first: Some(output_first.ok_or(EINVAL)?),

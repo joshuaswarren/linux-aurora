@@ -259,6 +259,82 @@ def verify_parameter_buffer(objects, manifest, context):
                 unmapped_guard_pages=14, firmware_aliases_verified=True)
 
 
+def verify_render_targets(objects, manifest, context):
+    ta = objects['graphics-ta'][1]
+    fragment = objects['graphics-fragment'][1]
+    tr = dict(struct.unpack_from('<IQ', ta, 0x60 + i * 12) for i in range(82))
+    fr = dict(struct.unpack_from('<IQ', fragment, 0xa0 + i * 12) for i in range(90))
+    if fr[0x15211] != (256 << 32) | 256:
+        raise ValueError('Render-target evidence is not the qualified geometry')
+    base = 0x1000000000
+    target = base + tr[0x1c039]
+    deflake = base + (tr[0x1c950] & 0xffffffff)
+    expected = [
+        ('tilemap', target, 0x4000, 0x1200),
+        ('tpc', base + tr[0x1c0a1], 0x4000, 0x100),
+        ('deflake', deflake, 0x4000, 0x1000),
+        ('ta-status', tr[0x14318] & ~1, 0x4000, 0x100),
+        ('fragment-status', fr[0x14080] & ~1, 0x4000, 0x100),
+        ('auxiliary', fr[0x16461], 0x8000, 0x800)]
+    if (base + tr[0x1c9c8] != target or fr[0x16098] != target + 0x1000
+            or base + tr[0x1c079] != fr[0x16098]
+            or base + tr[0x10111] != deflake + 0x340
+            or base + tr[0x10119] != deflake + 0x40
+            or base + tr[0x1c880] != deflake + 0x340
+            or fr[0x16090] != fr[0x16461]):
+        raise ValueError('Render descriptors disagree about owned target addresses')
+    proofs = manifest.get('graphics_target_spans', [])
+    if len(proofs) != len(expected):
+        raise ValueError('Missing render-target mapping evidence')
+    occupied, physical_pages, result = [], [], {}
+    for (name, address, size, prefix), proof in zip(expected, proofs):
+        label = 'graphics-target-' + name
+        item, raw = objects[label]
+        if (item['context'] != context or int(item['address'], 16) != address or len(raw) != prefix
+                or proof.get('label') != label or int(proof['address'], 16) != address
+                or proof['size'] != size or proof['context'] != context):
+            raise ValueError('Render-target capture describes a different allocation')
+        limit = address + size + 0x8000
+        if address & 0x7fff or not base <= address < limit <= base + (1 << 32):
+            raise ValueError('Render target escaped the compact driver arena')
+        if len(proof['pages']) != size // 0x4000 or len(proof['guards']) != 2:
+            raise ValueError('Missing render-target page or guard evidence')
+        if item['first_mapping']['physical'] != proof['pages'][0]['physical']:
+            raise ValueError('Render-target capture and mapping disagree')
+        verify_mapping_walk(objects, context, address, item['first_mapping']['walk'],
+                            int(item['first_mapping']['physical'], 16))
+        for i, page in enumerate(proof['pages']):
+            if int(page['address'], 16) != address + i * 0x4000:
+                raise ValueError('Render-target page proof describes a different address')
+            physical = int(page['physical'], 16)
+            verify_mapping_walk(objects, context, address + i * 0x4000, page['walk'], physical)
+            physical_pages.append(physical)
+        for i, guard in enumerate(proof['guards']):
+            at = address + size + i * 0x4000
+            if int(guard['address'], 16) != at:
+                raise ValueError('Render-target guard proof describes a different address')
+            verify_mapping_walk(objects, context, at, guard['walk'])
+        occupied.append((address, limit))
+        result[name] = hex(address)
+    # The independent PB evidence anchors the neighboring compact objects.
+    # No target may consume a PB page or its unmapped guard space.
+    for proof in manifest.get('graphics_pb_spans', []):
+        at = int(proof['address'], 16)
+        occupied.append((at, at + proof['size'] + 0x8000))
+        physical_pages.extend(int(p['physical'], 16) for p in proof['pages'])
+    ordered = sorted(occupied)
+    if any(a[1] > b[0] for a, b in zip(ordered, ordered[1:])) or len(set(physical_pages)) != len(physical_pages):
+        raise ValueError('Render targets overlap or share private backing')
+    viewport = objects['graphics-target-deflake'][1]
+    for off, value in [(0x9c0, 0x3000), (0x9c4, 0x80000007), (0x9c8, 7),
+                       (0x9d0, 0x43000000), (0x9d4, 0x43000000),
+                       (0x9d8, 0x43000000), (0x9dc, 0xc3000000), (0x9e4, 0x3f800000)]:
+        if struct.unpack_from('<I', viewport, off)[0] != value:
+            raise ValueError('M5 viewport state differs from the generated reference')
+    return dict(addresses=result, unmapped_guard_pages=12, mapped_pages=7,
+                m5_viewport_verified=True)
+
+
 def verify_completion(objects, frame=1):
     if not 1 <= frame <= 64:
         raise ValueError('Expected a graphics frame in 1..64')
@@ -346,6 +422,8 @@ def main():
                         help='Expected driver allocation contract; application excludes the compact 4 GiB arena')
     parser.add_argument('--require-parameter-buffer', action='store_true',
                         help='Require VM-owned parameter-buffer blocks, aliases and guards')
+    parser.add_argument('--require-render-targets', action='store_true',
+                        help='Require VM-owned render targets and the generated M5 viewport state')
     args = parser.parse_args()
     if args.frame != 1 and not args.require_completion:
         parser.error('--frame requires --require-completion')
@@ -360,6 +438,8 @@ def main():
         args.reservation_profile) if args.require_usc_pool else None
     parameter_buffer = verify_parameter_buffer(objects,
         json.loads((args.capture / 'manifest.json').read_text()), args.context) if args.require_parameter_buffer else None
+    render_targets = verify_render_targets(objects,
+        json.loads((args.capture / 'manifest.json').read_text()), args.context) if args.require_render_targets else None
     args.output.write_bytes(png(rgba, args.scale))
     report = dict(graphics_pixels_verified=True, pixels=WIDTH * HEIGHT,
                   foreground=foreground, background=WIDTH * HEIGHT - foreground,
@@ -371,6 +451,7 @@ def main():
                   application_context=args.context,
                   usc_pool=usc_pool,
                   parameter_buffer=parameter_buffer,
+                  render_targets=render_targets,
                   mesa_glxgears_verified=False, dcp_verified=False)
     args.output.with_suffix('.json').write_text(json.dumps(report, indent=2) + '\n')
     print(json.dumps(report))

@@ -5,6 +5,7 @@
 
 use super::{graphics_memory::M5GraphicsMemory, graphics_usc, MappedObject};
 use super::parameter_buffer::{M5ParameterBuffer, BLOCK_BYTES, PAGE_LIST_BYTES, PAGE_COUNT};
+use super::target_memory::M5TargetMemory;
 use crate::{driver::AsahiDevice, g17_render, m5_render, mmu};
 use kernel::prelude::*;
 
@@ -38,6 +39,7 @@ pub(super) struct M5GraphicsJob {
     // The first owner's context retracts its roots before page release.
     program: M5GraphicsMemory,
     parameter_buffer: M5ParameterBuffer,
+    target_memory: M5TargetMemory,
     aliases: KVec<mmu::KernelMapping>,
     graph_alias: mmu::KernelMapping,
     graph: MappedObject,
@@ -50,7 +52,45 @@ pub(super) struct M5GraphicsJob {
 impl M5GraphicsJob {
     pub(super) fn new(dev: &AsahiDevice, uat: &mmu::Uat) -> Result<Self> {
         let program = M5GraphicsMemory::load(dev, uat)?;
+        let (parameters, controls) = triangle_parameters();
+        Self::from_memory(dev, uat, program, parameters, controls, 1, [0x7d4000, 0x934000])
+    }
+
+    /// Build a job from the submitting VM and translated application state.
+    /// No captured program is loaded; the caller supplies stage controls and
+    /// USC requirements derived for its program. Submission remains explicit.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn from_vm(
+        dev: &AsahiDevice, uat: &mmu::Uat, vm: &mmu::Vm,
+        parameters: g17_render::G17pRenderParameters, controls: m5_render::M5RenderControls,
+        clusters: u32, usc_required: [u64; 2],
+    ) -> Result<Self> {
+        let program = M5GraphicsMemory::from_vm(dev, uat, vm)?;
+        Self::from_memory(dev, uat, program, parameters, controls, clusters, usc_required)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_memory(
+        dev: &AsahiDevice, uat: &mmu::Uat, program: M5GraphicsMemory,
+        mut p: g17_render::G17pRenderParameters, controls: m5_render::M5RenderControls,
+        clusters: u32, usc_required: [u64; 2],
+    ) -> Result<Self> {
+        // The current parameter pool has the witnessed 256x256 capacity.
+        // Do not silently accept larger application geometry until pool
+        // sizing/growth is implemented, even though target sizes are derived.
+        if p.width > 256 || p.height > 256 || p.layers != 1 || clusters != 1 {
+            return Err(ENOTSUPP);
+        }
         let mut parameter_buffer = M5ParameterBuffer::new_reference(dev, &program)?;
+        let target_memory = M5TargetMemory::new(dev, &program, &p, clusters)?;
+        target_memory.apply(&mut p);
+        p.cycle = parameter_buffer.scene_cycle();
+        p.ta_hardware_buffer_id = PB_HARDWARE_ID;
+        p.usc_flist_hardware_buffer_id = graphics_usc::HARDWARE_ID;
+        p.ta_timestamp_start = HIGH + TIMESTAMPS as u64;
+        p.ta_timestamp_end = p.ta_timestamp_start + 8;
+        p.fragment_timestamp_start = p.ta_timestamp_start;
+        p.fragment_timestamp_end = p.ta_timestamp_end;
         let mut graph = MappedObject::new_wc_at(dev, uat.kernel_vm(), HIGH,
             BYTES, mmu::PROT_FW_PRIV_RW)?;
         // Native submitted totals and host-visible stamps are uncached in
@@ -105,8 +145,6 @@ impl M5GraphicsJob {
             program.usc().encode_initial_owner(HIGH + USC_INNER as u64,
                 &mut out[USC..USC + 0x70])?;
 
-            let (mut p, controls) = triangle_parameters();
-            p.cycle = parameter_buffer.scene_cycle();
             let objects = g17_render::RenderDescriptorObjects {
                 record_a: HIGH + SCHEDULER as u64,
                 shared: HIGH + PM as u64,
@@ -127,13 +165,13 @@ impl M5GraphicsJob {
                 .map_err(|_| EINVAL)?;
             let (ta, fragment) = out.split_at_mut(FRAGMENT);
             let ta_usc = m5_render::M5RenderUscState {
-                control: HIGH + USC as u64, required_bytes: 0x7d4000,
+                control: HIGH + USC as u64, required_bytes: usc_required[0],
                 allocated_bytes: graphics_usc::CAPACITY_BYTES,
                 statistics: HIGH + USC_STATISTICS as u64,
             };
             m5_render::apply_usc_submission_state(ta, fragment, ta_usc,
                 m5_render::M5RenderUscState {
-                    required_bytes: 0x934000, statistics: ta_usc.statistics + 0x40, ..ta_usc
+                    required_bytes: usc_required[1], statistics: ta_usc.statistics + 0x40, ..ta_usc
                 }).map_err(|_| EINVAL)?;
             // This bounded first submission owns hardware stamp1 in each
             // queue and event-machine timestamp0x100. Do not import native
@@ -172,7 +210,7 @@ impl M5GraphicsJob {
             scene_template.extend_from_slice(&out[SCENES + 0x80..SCENES + 0x100], GFP_KERNEL)?;
             Ok(())
         })?;
-        Ok(Self { program, parameter_buffer, aliases, graph_alias, graph, signals,
+        Ok(Self { program, parameter_buffer, target_memory, aliases, graph_alias, graph, signals,
             descriptor_template, scene_template, generation: 1 })
     }
 
