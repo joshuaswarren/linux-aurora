@@ -24,6 +24,10 @@ use program_memory::M5ProgramMemory;
 
 #[path = "m5_graphics_memory.rs"]
 mod graphics_memory;
+#[path = "m5_graphics_usc.rs"]
+mod graphics_usc;
+#[path = "m5_graphics_job.rs"]
+mod graphics_job;
 
 const KERNEL_BASE: u64 = 0xffff_fc20_0000_0000;
 const PRIVATE_BASE: u64 = KERNEL_BASE + 0x2_0000;

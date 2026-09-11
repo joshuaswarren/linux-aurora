@@ -30,6 +30,17 @@ fn read_u32(raw: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(raw[offset..offset + 4].try_into().unwrap())
 }
 
+#[test]
+fn initial_parameter_buffer_slot_matches_native_ta_publication() {
+    // Native 25G76 first TA: 48 parameter pages, no cursor progress and no
+    // enable bit in dword 0. Verified stable in the live hardware table.
+    assert_eq!(initial_parameter_buffer_descriptor(0x10_0023_8000, 48),
+        Ok([0x23800, 0x30, 0, 0]));
+    assert!(initial_parameter_buffer_descriptor(0x10_0023_8001, 48).is_err());
+    assert!(initial_parameter_buffer_descriptor(0x10_0023_8000, 1 << 22).is_err());
+    assert!(initial_parameter_buffer_descriptor(0xffff_fc20_c100_0000, 48).is_err());
+}
+
 fn check_program(raw: &[u8], offset: usize, expected: &[(u32, u64)]) {
     for (index, (number, value)) in expected.iter().enumerate() {
         assert_eq!(read_u32(raw, offset + index * 12), *number);

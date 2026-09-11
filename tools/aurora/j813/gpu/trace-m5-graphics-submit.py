@@ -153,10 +153,24 @@ def _m5_graphics_submit(ctx):
             if pointer: attempt(label,pointer,extent)
         # These are bounded views of native-owned descriptor references,
         # without asserting that the Neo descriptor layout applies to M5.
+        header_views = {}
         for offset in ([0x10,0x20,0x28,0x30] if dm==0 else [0x20,0x28,0x30,0x38]):
             pointer, = struct.unpack_from('<Q',raw,offset)
-            if pointer: attempt('header-ref-%x'%offset,pointer,min(0x1000,0x4000-(pointer&0x3fff)))
+            if pointer:
+                header_views[offset] = attempt('header-ref-%x'%offset,pointer,
+                    min(0x1000,0x4000-(pointer&0x3fff)))
+        if dm == 0 and os.environ.get('M5_GRAPHICS_CAPTURE_PB_TABLE') == '1':
+            hardware_id, = struct.unpack_from('<I', raw, 0x18)
+            if hardware_id >= 1024:
+                raise ValueError('M5 PB descriptor index exceeds the owned table extent')
+            manifest['pb_hardware_id'] = hardware_id
+            save('pb-hardware-descriptor', 0xfffffc20015e0000 + hardware_id * 16, 16)
         if os.environ.get('M5_GRAPHICS_CAPTURE_COMPLETION') == '1':
+            scheduler = header_views.get(0x10 if dm == 0 else 0x20)
+            if scheduler:
+                counter, = struct.unpack_from('<Q', scheduler, 0)
+                if counter:
+                    attempt('completion-scheduler-counter', counter, 64)
             # allocatePagesEnd derives the first scalar from USC pool sizes.
             # It is not the low alias of the adjacent statistics pointer.
             size_offset, statistics_offset = (0x93d, 0x945) if dm == 0 else (0x21d7, 0x21df)
