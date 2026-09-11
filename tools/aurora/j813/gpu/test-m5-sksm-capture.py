@@ -81,6 +81,11 @@ class FakeHV:
             return BASE + address - (COMMAND - 0x1000)
         return 0
 
+    def mapping(self, address, size, context, region):
+        self.read_context(address, size, context, region)
+        return [dict(address=hex(address), physical=hex(BASE + 0x70000), size=size,
+                     walk=[[hex(BASE + 0x100), hex(0xc0000000000c8b)]])]
+
     def read(self, address, size):
         self.reads.append((address, size))
         return bytes(self.memory[address - BASE:address - BASE + size])
@@ -96,7 +101,7 @@ class FakeHV:
 class CaptureTests(unittest.TestCase):
     def run_script(self, hv):
         factory = lambda *_: SimpleNamespace(read=hv.gpu_read, read_context=hv.read_context,
-                                            _read_dram=hv.read)
+                                            _read_dram=hv.read, mapping=hv.mapping)
         with patch.dict(sys.modules, m5_gpu_capture=SimpleNamespace(M5GPUCapture=factory)):
             return runpy.run_path(str(SCRIPT), init_globals={'hv': hv})
 
@@ -287,6 +292,10 @@ class CaptureTests(unittest.TestCase):
             self.assertEqual(result['completion']['observed_callbacks'], 2)
             self.assertEqual((path.parent / 'compute-extra-0.bin').read_bytes(), b'PRE!')
             self.assertEqual((path.parent / 'completed-extra-0.bin').read_bytes(), b'POST')
+            for label in ('compute-extra-0', 'completed-extra-0'):
+                item = next(x for x in result['objects'] if x['label'] == label)
+                self.assertTrue(item['mapping_stable'])
+                self.assertEqual(item['mapping'], hv.mapping(view[1], view[2], view[0], BASE))
             self.assertEqual(struct.unpack_from('<I', (path.parent / 'channel-pointers-before.bin').read_bytes(), 0x20)[0], 0)
             self.assertEqual(struct.unpack_from('<I', (path.parent / 'channel-pointers-after.bin').read_bytes(), 0x20)[0], 1)
 

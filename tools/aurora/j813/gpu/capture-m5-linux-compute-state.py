@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""Read retained M5 compute RAM after the bounded probe stopped both CPUs.
+"""Read retained M5 compute RAM after the bounded probe requested CPU stops.
 
 Never reads MMIO. Physical pages must belong to Linux System RAM or one of
 this boot's measured GPU reserved-RAM ranges. Results are physical-memory
@@ -24,8 +24,13 @@ from m1n1.agx.g17p_trace import G17PUATReader
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('inventory', type=Path)
 parser.add_argument('output', type=Path)
-parser.add_argument('--before-compute', action='store_true',
+phase_args = parser.add_mutually_exclusive_group()
+phase_args.add_argument('--before-compute', action='store_true',
                     help='Require successful mode7 setup with its SKSM kick unpublished')
+phase_args.add_argument('--before-recovery', action='store_true',
+                    help='Require mode8 admission frozen after the kick and before recovery')
+phase_args.add_argument('--after-live-snapshot', action='store_true',
+                    help='Require mode9/10 live observations; capture the later retained RAM')
 args = parser.parse_args()
 inventory_path, output_path = args.inventory, args.output
 inventory = json.loads(inventory_path.read_text())
@@ -36,7 +41,9 @@ reserved = [(props[name + '-base'], props[name + '-base'] + props[name + '-size'
             for name in ('gpu-region', 'gfx-shared-region', 'gfx-shared-l2-region',
                          'gfx-data', 'gfx1-data')]
 output_path.mkdir(mode=0o700, exist_ok=False)
-manifest = dict(phase=('Linux mode7 setup before compute' if args.before_compute
+manifest = dict(phase=('Linux mode8 admission before recovery' if args.before_recovery
+                      else 'Linux mode7 setup before compute' if args.before_compute
+                      else 'Linux live-status probe after compute' if args.after_live_snapshot
                       else 'Linux mode6 after compute') + ' after both firmware CPU stop requests',
                 device_memory_read=False, objects=[])
 cache = {}
@@ -64,7 +71,16 @@ with Serial('/dev/cu.kis-01100000-ch-0', 115200, timeout=0.2) as port:
         "&& dmesg | grep -q '1024 untouched outputs, SKSM kick unpublished' "
         "&& ! dmesg | grep -q 'M5_COMPUTE first SKSM kick submitted' "
         "&& ! dmesg | grep -q 'requested probe mode=6'"
-        if args.before_compute else "dmesg | grep -q 'requested probe mode=6'")
+        if args.before_compute else (
+        "dmesg | grep -q 'requested probe mode=8' "
+        "&& dmesg | grep -q 'M5_INIT transaction result=Ok(())' "
+        "&& dmesg | grep -q 'M5_KSM quiescent admission snapshot;' "
+        "&& dmesg | grep -Fq 'id=0x41 args=[b, 1, 2, 1]' "
+        "&& ! dmesg | grep -q 'M5_COMPUTE firmware requested GPU restart'"
+        if args.before_recovery else (
+        "dmesg | grep -Eq 'requested probe mode=(9|10)$' "
+        "&& dmesg | grep -q 'M5_LIVE_SNAPSHOT sample=3'"
+        if args.after_live_snapshot else "dmesg | grep -q 'requested probe mode=6'")))
     identity = command("grep -q apple,j813 /proc/device-tree/compatible "
         "&& [ $(uname -r) = 7.1.6-aurora-j813-gpu-v9 ] "
         "&& [ -d /sys/module/asahi ] "
@@ -126,6 +142,9 @@ with Serial('/dev/cu.kis-01100000-ch-0', 115200, timeout=0.2) as port:
     try:
         save('context-root-table', props['gpu-region-base'], 0x400)
         save('primary-status-b', 0xfffffc2000020340, 0x5000, 0)
+        # The M5 hardware-event reader consumes all four records. Native
+        # compute uses ordinal 0, so the old ordinal-2 prefix is insufficient.
+        save('hardware-event-state', 0xfffffc20c0788000 + 0x2614, 0x80, 0)
         save('recovery-records', 0xfffffc20001c0000, 0x80, 0)
         # M5 0x5bb4/0x5bb8 reads the unaligned main+0x26c pointer,
         # the fourth owned bundle view (shared+0xbc80), for classification.
@@ -138,6 +157,7 @@ with Serial('/dev/cu.kis-01100000-ch-0', 115200, timeout=0.2) as port:
         for role, status in [('gfx', 0xfffffc200002ee40),
                              ('gfx1', 0xfffffc20000e3100)]:
             save(role + '-report-states', status, 0x300, 0)
+            save(role + '-event-records', status + 0x2c0, 0x4800, 0)
             save(role + '-report-records', status + 0xa6ac0, 0x9000, 0)
         for label, address, size, context in [
                 ('uma-slot0', 0xfffffc20015e8000, 32, 0),
@@ -150,8 +170,16 @@ with Serial('/dev/cu.kis-01100000-ch-0', 115200, timeout=0.2) as port:
                 ('sksm-entry1', 0xfffffc2000390200, 512, 0),
                 ('completion-prefix', 0xfffffc20c0838000, 0x100, 0),
                 ('directory-prefix', 0x7000000000, 0x10000, 3),
+                ('program-shader', 0x10000000000, 0x4000, 3),
+                ('program-pipeline', 0x10000090000, 0x4000, 3),
+                ('program-stream', 0x100000b0000, 0x4000, 3),
+                ('program-preempt', 0x100000e0000, 0x4000, 3),
+                ('program-robustness', 0x1000018000, 0x4000, 3),
                 ('program-buffers', 0x1000001c000, 0x4000, 3)]:
             save(label, address, size, context)
+        for ordinal in range(4):
+            save('hardware-event-ring-%d' % ordinal,
+                 0xfffffc20c07e8000 + ordinal * 0x28000, 0x20000, 0)
     finally:
         manifest['physical_pages_read'] = len(cache)
         (output_path / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')

@@ -52,6 +52,8 @@ pub(crate) struct M5FirmwareMemory {
     program: Option<M5ProgramMemory>,
     report_counts: [[u32; 2]; 2],
     trace_printed: [u32; 2],
+    compute_kick_observed: bool,
+    compute_dispatch_returned: bool,
     uat: Arc<mmu::Uat>,
 }
 
@@ -232,7 +234,8 @@ impl M5FirmwareMemory {
         fence(Ordering::SeqCst);
         Ok(Self { primary_root, secondary_root, shared, private, region_a, region_c, fwctl, aon, qos,
                   pbdesc, uma, completions, aliases, registers, queue_probe, program,
-                  report_counts: [[0; 2]; 2], trace_printed: [0; 2], uat })
+                  report_counts: [[0; 2]; 2], trace_printed: [0; 2],
+                  compute_kick_observed: false, compute_dispatch_returned: false, uat })
     }
 
     /// Drain M5 report channels using the native producer contracts.
@@ -268,6 +271,21 @@ impl M5FirmwareMemory {
                         recovery |= word(0) == 4;
                     } else {
                         let args = [qword(12), qword(20), qword(28), qword(36)];
+                        // This one-shot diagnostic owns qid11/stamp1. The
+                        // exact M5 trace point precedes the hardware kick;
+                        // the admission probe also requires its later callback
+                        // return trace. Firmware-private counters can be cached.
+                        if role == 0 && word(0) == 5 && word(44) == 0x41
+                            && args == [11, 1, 2, 1] {
+                            self.compute_kick_observed = true;
+                        }
+                        // 0x26aa4 invokes the pending-work callback, which
+                        // dispatches tag14 and writes SGX+0x21018 at0x11f5c.
+                        // 0x26ac4 emits 0x130 only after that callback returns.
+                        if role == 0 && self.compute_kick_observed && word(0) == 5
+                            && word(44) == 0x130 && args == [4, 0, 0, 0] {
+                            self.compute_dispatch_returned = true;
+                        }
                         // Exact M5 0x24eb4/0x26754 emit zero-argument
                         // processing-loop brackets. Count and consume them
                         // without spending the diagnostic print budget.
@@ -286,6 +304,10 @@ impl M5FirmwareMemory {
             }
         }
         Ok(recovery)
+    }
+
+    pub(crate) fn compute_kick_observed(&self) -> bool {
+        self.compute_kick_observed && self.compute_dispatch_returned
     }
 
     pub(crate) fn validate_program_context(&mut self) -> Result<[u64; 2]> {
@@ -328,12 +350,19 @@ impl M5FirmwareMemory {
         self.program.as_mut().ok_or(EINVAL)?.progress()
     }
 
-    pub(crate) fn compute_observations(&mut self) -> Result<([u64; 4], [u64; 4], u32)> {
+    pub(crate) fn compute_observations(&mut self) -> Result<([u64; 4], [u64; 4], [u32; 4])> {
         let firmware = self.queue_probe.as_ref().ok_or(EINVAL)?.compute_observations();
         let uma = [self.uma.read_u64(UMA_BASE)?, self.uma.read_u64(UMA_BASE + 8)?,
                    self.uma.read_u64(UMA_BASE + 16)?, self.uma.read_u64(UMA_BASE + 24)?];
-        let completion_cursor = self.shared.read_u32(SHARED_BASE + 0x2614 + 2 * 0x20 + 0x1c)?;
-        Ok((firmware, uma, completion_cursor))
+        // Native M5 compute events were observed on ordinal 0. Firmware
+        // processes all four records in order 1, 3, 0, 2; retain every cursor
+        // instead of assuming the older compute path's ordinal 2.
+        let mut completion_cursors = [0; init::M5_25G76_COMPLETION_QUEUE_COUNT];
+        for (ordinal, cursor) in completion_cursors.iter_mut().enumerate() {
+            *cursor = self.shared.read_u32(
+                SHARED_BASE + 0x2614 + ordinal as u64 * 0x20 + 0x1c)?;
+        }
+        Ok((firmware, uma, completion_cursors))
     }
 
     pub(crate) fn publish_compute_job(&mut self, submit_kick: bool) -> Result {

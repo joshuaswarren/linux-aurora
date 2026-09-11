@@ -151,6 +151,14 @@ def _m5_sksm_submit(ctx):
                     int(hv.u.adt['/arm-io/sgx'].gpu_region_base))
         else:
             read = _m5_sksm_read_gpu if gpu else _m5_sksm_read_cpu
+        mapping_before = None
+        mapping_error = None
+        if context is not None:
+            try:
+                mapping_before = _m5_sksm_gpu.mapping(address, size, context,
+                    int(hv.u.adt['/arm-io/sgx'].gpu_region_base))
+            except (RuntimeError, ValueError) as error:
+                mapping_error = str(error)
         first = read(address, size)
         second = read(address, size)
         name = label + '.bin'
@@ -161,6 +169,20 @@ def _m5_sksm_submit(ctx):
                     sha256=hashlib.sha256(first).hexdigest(), stable=first == second)
         if context is not None:
             item['gpu_context'] = context
+            # Equal bytes alone do not qualify the GPU translation. Retain
+            # the actual page-table walk on both sides of the data reads.
+            if mapping_before is not None:
+                item['mapping'] = mapping_before
+                try:
+                    mapping_after = _m5_sksm_gpu.mapping(address, size, context,
+                        int(hv.u.adt['/arm-io/sgx'].gpu_region_base))
+                    item['mapping_stable'] = mapping_before == mapping_after
+                    if not item['mapping_stable']:
+                        item['mapping_after'] = mapping_after
+                except (RuntimeError, ValueError) as error:
+                    mapping_error = str(error)
+            if mapping_error is not None:
+                item.update(mapping_stable=False, mapping_error=mapping_error)
         if first != second:
             second_name = label + '-second.bin'
             (directory / second_name).write_bytes(second)

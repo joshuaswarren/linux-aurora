@@ -98,6 +98,9 @@ if trace_state is not None and trace_state.get('input_restored'):
     if trace_result['firmware_restore_verified']:
         hv.m5_native_trace_input = None
 for trace_label, trace_address, trace_size in [
+        # Both callers of firmware 0xe2e8 pass HW-data+0x2614: four
+        # 32-byte hardware-event reader records in order 1, 3, 0, 2.
+        ('hardware-event-state', trace_qword(trace_main, 0) + 0x2614, 0x80),
         ('states-before', trace_status, 0x300),
         ('records', trace_status + 0xa6ac0, 512 * 72),
         ('states-after', trace_status, 0x300)]:

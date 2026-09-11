@@ -225,11 +225,14 @@ remains unchanged. No firmware DATA, executable code, queue contents or
 mailbox payload is modified.
 
 Setting that input after startup did not update the firmware's cached flags.
-Exact firmware dispatch entries 0x12 and 0x26 branch to 0x37d4, which sets
+Exact firmware opcodes 0x16 and 0x2a branch to 0x37d4, which sets
 DATA+0x1779f8 and calls the configuration-copy routine at 0x3068. Other
 control paths also invoke it. The routine copies status-A+0 to
 DATA+0x1779fc and clears the refresh gate at 0x3310. Ordinary work submission
 does not necessarily refresh these settings.
+The dispatcher subtracts 4 before indexing its table at 0x5ab4; table
+indices 0x12 and 0x26 must not be used as wire opcodes. Likewise indices
+0x27, 0x29 and 0x2b refer to opcodes 0x2b, 0x2d and 0x2f respectively.
 
 On a fresh 25G76 boot, the pre-publication write read back as 0x201 and a
 later paused-owner observation verified firmware flags 0x201. Both firmware

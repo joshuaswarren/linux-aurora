@@ -27,6 +27,7 @@ class NativeTraceTests(unittest.TestCase):
         preinit.mkdir(parents=True)
         self.root_pointer = 0xfffffc20001a8000
         self.main_pointer = 0xfffffc2000020000
+        self.hardware_pointer = 0xfffffc2000008000
         self.status_pointer = 0xfffffc200002ee40
         self.physical = 0x1000002ee40
         self.flags = 0
@@ -37,6 +38,7 @@ class NativeTraceTests(unittest.TestCase):
         struct.pack_into('<Q', self.root, 0x18, self.main_pointer)
         struct.pack_into('<Q', self.root, 0xa8, self.status_pointer)
         self.main = bytearray(0x600)
+        struct.pack_into('<Q', self.main, 0, self.hardware_pointer)
         struct.pack_into('<QQ', self.main, 0x1e0,
                          self.status_pointer + 0x240, self.status_pointer + 0xa6ac0)
         self.status = bytearray(0x300)
@@ -56,6 +58,7 @@ class NativeTraceTests(unittest.TestCase):
             def read(self, address, size):
                 regions = [(owner.root_pointer, owner.root),
                            (owner.main_pointer, owner.main),
+                           (owner.hardware_pointer + 0x2614, bytes(0x80)),
                            (owner.status_pointer, owner.status),
                            (owner.status_pointer + 0xa6ac0, bytes(512 * 72))]
                 for base, data in regions:

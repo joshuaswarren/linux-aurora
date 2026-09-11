@@ -29,8 +29,16 @@ impl M5ProgramMemory {
             (program::BUFFER_PAGE, program::PageKind::Buffers),
             (program::ROBUSTNESS_PAGE, program::PageKind::Robustness),
         ] {
+            // Native 25G76 context walks distinguish the shader and CDM
+            // stream (leaf attributes 0x80000000000c8b) from writable data
+            // (0xc0000000000c8b). CPU initialization uses the separate WC
+            // mapping; GPU write permission is not required for these pages.
+            let protection = match kind {
+                program::PageKind::Shader | program::PageKind::Stream => mmu::PROT_GPU_SHARED_RO,
+                _ => mmu::PROT_GPU_SHARED_RW,
+            };
             let mut page = MappedObject::new_wc_at(dev, context.vm(), address,
-                program::PAGE_BYTES, mmu::PROT_GPU_SHARED_RW)?;
+                program::PAGE_BYTES, protection)?;
             page.with_bytes_mut(|out| program::initialize_page(kind, out).map_err(|_| EINVAL))?;
             // Validate each installed leaf before publishing the root pair.
             context.vm().translate_iova(address)?;
