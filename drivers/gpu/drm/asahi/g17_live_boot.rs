@@ -22,6 +22,7 @@
 #![allow(dead_code)]
 
 use core::{
+    ffi::{c_int, c_uint},
     mem::MaybeUninit,
     sync::atomic::{fence, AtomicBool, AtomicU32, Ordering},
 };
@@ -89,6 +90,26 @@ const G17P_POWER_WIRE_POLLS: usize = 20;
 /// submitting, where the very next record observed powered=true 1ms later.
 const G17P_POWER_WIRE_POWERED_POLLS: usize = 250;
 const G17P_RTKIT_UAT_DVA_MASK: u64 = (1u64 << 40) - 1;
+
+/// Runtime-PM entry points the Rust `kernel` crate does not wrap.
+///
+/// All of these are `EXPORT_SYMBOL_GPL` in `drivers/base/power/runtime.c`.
+/// The inline helpers drivers normally call -- `pm_runtime_set_active`,
+/// `pm_runtime_get_sync`, `pm_runtime_put_sync_suspend`,
+/// `pm_runtime_resume_and_get` -- are exactly the compositions spelled out at
+/// each call site below, so nothing is invented here.
+extern "C" {
+    fn devm_pm_runtime_enable(dev: *mut bindings::device) -> c_int;
+    fn __pm_runtime_set_status(dev: *mut bindings::device, status: c_uint) -> c_int;
+    fn __pm_runtime_suspend(dev: *mut bindings::device, rpmflags: c_int) -> c_int;
+    fn __pm_runtime_resume(dev: *mut bindings::device, rpmflags: c_int) -> c_int;
+    fn pm_runtime_barrier(dev: *mut bindings::device) -> c_int;
+}
+
+/// `RPM_GET_PUT` from `include/linux/pm_runtime.h`.
+const RPM_GET_PUT: c_int = 0x04;
+/// `RPM_ACTIVE` from `enum rpm_status`.
+const RPM_ACTIVE: c_uint = 0;
 
 /// Module-local, read-only view of one existing ASCWrap mailbox provider.
 ///
@@ -165,6 +186,79 @@ impl G17PMailboxProvider {
         to_result(unsafe { bindings::apple_mbox_ascwrap_v6_stop_cpu(self.mbox) })
     }
 
+    /// The registers that decide whether a restarted ASC will re-run its
+    /// RTKit handshake.
+    ///
+    /// `apple_rtkit_boot()` is passive: it waits for the IOP to volunteer a
+    /// HELLO and never pokes it. A rebuild therefore depends entirely on the
+    /// ASC actually restarting from its reset vector when `CPU_RUN` is set
+    /// again. Nothing in the driver has ever looked at whether it does, so
+    /// read the deciding state rather than infer it from the timeout.
+    /// The provider's own `struct device`, which is what carries the runtime-PM
+    /// reference that keeps the shared `gfx` power domain up.
+    fn provider_device(&self) -> *mut bindings::device {
+        // SAFETY: the device link established by `get()` keeps the provider
+        // and therefore this pointer valid for this consumer's lifetime.
+        unsafe { (*self.mbox).dev }
+    }
+
+    /// A second handle on the same provider, for diagnostics that must read
+    /// ASC state while the lifecycle owner holds the real one.
+    ///
+    /// `get()` established a device link that keeps the provider alive for the
+    /// consumer's whole bound lifetime, and this type owns nothing else, so an
+    /// alias cannot outlive what it points at.
+    fn diagnostic_alias(&self) -> Self {
+        Self { mbox: self.mbox }
+    }
+
+    fn asc_snapshot(&self) -> Result<G17PAscSnapshot> {
+        /// ASCWrap v6 CPU control/status pair, from the provider's own
+        /// `APPLE_ASCWRAP_V6_CPU_CONTROL`.
+        const CPU_CONTROL: usize = 0x44;
+        const CPU_STATUS: usize = 0x48;
+        const CPU_WINDOW: usize = CPU_STATUS + core::mem::size_of::<u32>();
+        /// The mailbox block starts at wrapper + 0x8000; its first word is the
+        /// wrapper idle status `_isIdle` reads, and the two FIFO control words
+        /// follow at the standard ASC offsets.
+        const IDLE_STATUS: usize = 0x0;
+        const A2I_CONTROL: usize = 0x110;
+        const I2A_CONTROL: usize = 0x114;
+        const MBOX_WINDOW: usize = I2A_CONTROL + core::mem::size_of::<u32>();
+        /// The IOP reset vector lives in its own eight-byte window.
+        const VBAR_WINDOW: usize = 0x8;
+
+        // SAFETY: the provider owns all three mappings and the device link
+        // established by apple_mbox_get() keeps them valid for this consumer.
+        let (wrapper, regs, vbar) = unsafe {
+            (
+                (*self.mbox).wrapper_regs as usize,
+                (*self.mbox).regs as usize,
+                (*self.mbox).iop_vbar_regs as usize,
+            )
+        };
+        if wrapper == 0 || regs == 0 || vbar == 0 {
+            return Err(ENODEV);
+        }
+        let cpu_raw = MmioRaw::<CPU_WINDOW>::new(wrapper, CPU_WINDOW)?;
+        let mbox_raw = MmioRaw::<MBOX_WINDOW>::new(regs, MBOX_WINDOW)?;
+        let vbar_raw = MmioRaw::<VBAR_WINDOW>::new(vbar, VBAR_WINDOW)?;
+        // SAFETY: each window covers exactly the relaxed reads issued below.
+        let cpu = unsafe { Mmio::from_raw(&cpu_raw) };
+        // SAFETY: as above.
+        let mailbox = unsafe { Mmio::from_raw(&mbox_raw) };
+        // SAFETY: as above.
+        let iop_vbar = unsafe { Mmio::from_raw(&vbar_raw) };
+        Ok(G17PAscSnapshot {
+            cpu_control: cpu.relaxed().read32(CPU_CONTROL),
+            cpu_status: cpu.relaxed().read32(CPU_STATUS),
+            idle_status: mailbox.relaxed().read32(IDLE_STATUS),
+            iorvbar: iop_vbar.relaxed().read64(0),
+            a2i_control: mailbox.relaxed().read32(A2I_CONTROL),
+            i2a_control: mailbox.relaxed().read32(I2A_CONTROL),
+        })
+    }
+
     fn a2i_control(&self) -> Result<u32> {
         const A2I_CONTROL: usize = 0x110;
         const CONTROL_WINDOW_SIZE: usize = A2I_CONTROL + core::mem::size_of::<u32>();
@@ -189,6 +283,53 @@ impl G17PMailboxProvider {
 unsafe impl Send for G17PMailboxProvider {}
 // SAFETY: as above; concurrent snapshots do not change either FIFO.
 unsafe impl Sync for G17PMailboxProvider {}
+
+/// One read of the ASC state a restart depends on.
+#[derive(Debug, Copy, Clone, Default)]
+struct G17PAscSnapshot {
+    cpu_control: u32,
+    cpu_status: u32,
+    idle_status: u32,
+    iorvbar: u64,
+    a2i_control: u32,
+    i2a_control: u32,
+}
+
+/// Report the deciding ASC state at one named point of a start or restart.
+///
+/// `run` is `CPU_CONTROL` bit 4, the only bit this driver has ever written.
+/// `iorvbar` is the reset vector with its valid bit in bit 0: a zero here
+/// after a restart means the ASC has nowhere to boot from, which no amount of
+/// waiting for HELLO can fix.
+fn log_g17p_asc_state(
+    dev: &kernel::device::Device,
+    provider: &G17PMailboxProvider,
+    role: &'static str,
+    checkpoint: &'static str,
+) {
+    match provider.asc_snapshot() {
+        Ok(state) => dev_info!(
+            dev,
+            "G17PMARK asc-state role={} checkpoint={} cpu_control={:#x} run={} cpu_status={:#x} idle_word={:#x} iorvbar={:#x} a2i={:#x} i2a={:#x}\n",
+            role,
+            checkpoint,
+            state.cpu_control,
+            (state.cpu_control >> 4) & 1,
+            state.cpu_status,
+            state.idle_status,
+            state.iorvbar,
+            state.a2i_control,
+            state.i2a_control,
+        ),
+        Err(error) => dev_warn!(
+            dev,
+            "G17PMARK asc-state role={} checkpoint={} unavailable ({:?})\n",
+            role,
+            checkpoint,
+            error
+        ),
+    }
+}
 
 fn log_g17p_a2i_control(
     dev: &kernel::device::Device,
@@ -2243,6 +2384,14 @@ fn boot_session(
         return Err(ENOTSUPP);
     }
     dev_info!(pdev.as_ref(), "G17P session: providers ready\n");
+    // Read what a restart actually depends on, at the point it is decided.
+    // The failing rebuild reports only a 1.00s ETIME out of apple_rtkit_boot,
+    // which is the same log line whether the ASC restarted and said nothing,
+    // never restarted at all, or restarted with no reset vector to run.
+    let gfx_diag = gfx.diagnostic_alias();
+    let gfx1_diag = gfx1.diagnostic_alias();
+    log_g17p_asc_state(pdev.as_ref(), &gfx_diag, "gfx", "rebuild-entry");
+    log_g17p_asc_state(pdev.as_ref(), &gfx1_diag, "gfx1", "rebuild-entry");
 
     let firmware_contexts = manager.uat().firmware_context_table_reader();
     #[cfg(CONFIG_DEV_COREDUMP)]
@@ -2300,13 +2449,28 @@ fn boot_session(
     // INITDATA_ACK_POLLS (200) x 10ms = 2.0s. These markers say which step it
     // actually was, and on which role, without inferring it from arithmetic.
     let mut cpus = g17_lifecycle::StartedCpuPair::new(gfx, gfx1);
+    // `apple_rtkit_boot` is PASSIVE: it waits for the IOP to volunteer a
+    // HELLO and never pokes it. m1n1's `rtkit_boot_internal` and Linux's own
+    // `apple_rtkit_wake` both send SET_IOP_PWR_STATE(INIT) straight after
+    // starting the CPU, with the comment that it "can be sent unconditionally
+    // to wake up a possibly sleeping IOP". A cold ASC coming out of reset
+    // volunteers HELLO, which is why the probe path works; nothing establishes
+    // that an ASC whose RUN bit was merely toggled does the same.
+    let restart_mode = *module_parameters::g17p_asc_restart.value();
     let start_result = cpus.start_staged_in_place(|| {
         dev_info!(pdev.as_ref(), "G17P session: GFX processor started\n");
+        log_g17p_asc_state(pdev.as_ref(), &gfx_diag, "gfx", "post-cpu-run");
         let started = Instant::<Monotonic>::now();
-        let result = Pin::new(&mut gfx_rtkit).boot();
+        let result = if restart_mode == 0 {
+            Pin::new(&mut gfx_rtkit).boot()
+        } else {
+            Pin::new(&mut gfx_rtkit).wake()
+        };
+        log_g17p_asc_state(pdev.as_ref(), &gfx_diag, "gfx", "post-rtkit-boot");
         dev_info!(
             pdev.as_ref(),
-            "G17PMARK rtkit-boot role=gfx ok={} took={}us -- ~1000000us means apple_rtkit_boot timed out on the IOP HELLO/EPMAP, i.e. the restarted ASC never re-ran its RTKit handshake\n",
+            "G17PMARK rtkit-boot role=gfx restart_mode={} ok={} took={}us -- ~1000000us means the wait timed out on the IOP HELLO/EPMAP, i.e. the restarted ASC never re-ran its RTKit handshake\n",
+            restart_mode,
             result.is_ok(),
             started.elapsed().as_micros_ceil(),
         );
@@ -2769,6 +2933,10 @@ pub(crate) struct G17PLiveRuntime {
     /// complete replacement session. Role state can be absent after a clean
     /// boot failure, so it cannot by itself represent this offline state.
     session_recovery_pending: bool,
+    /// This driver has taken over runtime PM for its own device so that the
+    /// shared `gfx` power domain can be gated deliberately. Armed at most
+    /// once, lazily, and only when a restart mode asks for it.
+    runtime_pm_armed: bool,
     gfx_state: Option<Arc<G17PRoleRtkitState>>,
     gfx_rtkit: Option<rtkit::RtKit<G17PRtkitOps>>,
     gfx1_state: Option<Arc<G17PRoleRtkitState>>,
@@ -3384,6 +3552,94 @@ impl G17PLiveRuntime {
                 .as_ref()
                 .is_some_and(|state| state.crashed.load(Ordering::Acquire)),
         )
+    }
+
+    /// Power-gate the whole GFX domain and bring it back, so both ASCs
+    /// restart from their reset vectors.
+    ///
+    /// `482600000.gpu` sits in the same `gfx` genpd as both ASCWrap mailbox
+    /// providers. This driver has never called into runtime PM at all, and
+    /// `genpd_power_off()` counts every device that is not
+    /// `pm_runtime_suspended()` -- which a device whose runtime PM was never
+    /// enabled never is -- so while asahi is bound the domain is pinned on.
+    /// That is why a session rebuild's entire hardware effect is one
+    /// `CPU_RUN` write, and why the following `apple_rtkit_boot` waits a
+    /// second for a HELLO that a processor which was never reset has no
+    /// reason to send.
+    ///
+    /// The boot log shows what a genuine gate does instead. The value the
+    /// PMGR driver reads back immediately before asahi's own probe turns the
+    /// domain on is `0x0f002300`: `PS_TARGET` and `PS_ACTUAL` both zero with
+    /// `WAS_PWRGATED` and `WAS_CLKGATED` set. The ASC that comes out of that
+    /// gate volunteers HELLO in about 1.2 ms, with no firmware upload and no
+    /// reset-vector write from Linux. So the restart primitive works; the
+    /// driver simply never invokes it after probe.
+    fn cycle_gfx_power_domain(&mut self, pdev: &platform::Device) -> Result {
+        let dev = pdev.as_ref().as_raw();
+        if !self.runtime_pm_armed {
+            // Publish that the device is on BEFORE enabling runtime PM.
+            // Enabling first would leave it reading as suspended, and the next
+            // mailbox suspend would then gate the domain under a live driver.
+            // SAFETY: runtime PM is still disabled for this device, which is
+            // the documented precondition for `pm_runtime_set_active()`.
+            let set_active = unsafe { __pm_runtime_set_status(dev, RPM_ACTIVE) };
+            // SAFETY: `dev` is this driver's own bound device; the devres
+            // action keeps the enable balanced across unbind.
+            let enable = unsafe { devm_pm_runtime_enable(dev) };
+            // `pm_runtime_get_sync()`: the reference that keeps the domain up
+            // outside a deliberate cycle.
+            // SAFETY: as above.
+            let get = unsafe { __pm_runtime_resume(dev, RPM_GET_PUT) };
+            dev_info!(
+                pdev.as_ref(),
+                "G17PMARK asc-powercycle arm set_active={} enable={} get={}\n",
+                set_active,
+                enable,
+                get
+            );
+            if set_active < 0 || enable < 0 || get < 0 {
+                return Err(EIO);
+            }
+            self.runtime_pm_armed = true;
+        }
+
+        // Both CPUs are stopped and both RTKit owners are gone, so each
+        // mailbox has already dropped its runtime reference -- asynchronously.
+        // Flush those before asking the domain down, or genpd counts them as
+        // still active and refuses the whole gate.
+        for index in 0..2usize {
+            let provider = G17PMailboxProvider::get(pdev.as_ref(), index)?;
+            // SAFETY: the provider owns this device for as long as the device
+            // link taken by `get()` is held.
+            let barrier = unsafe { pm_runtime_barrier(provider.provider_device()) };
+            dev_info!(
+                pdev.as_ref(),
+                "G17PMARK asc-powercycle mailbox{} barrier={}\n",
+                index,
+                barrier
+            );
+        }
+
+        // Nothing below may touch ASC or SGX MMIO: the aperture is gone while
+        // the domain is gated, and a read would take an external abort. The
+        // PMGR provider logs the transition itself, which is the witness.
+        // `pm_runtime_put_sync_suspend()`.
+        // SAFETY: this driver's own device, runtime PM armed above.
+        let off = unsafe { __pm_runtime_suspend(dev, RPM_GET_PUT) };
+        fsleep(Delta::from_millis(10));
+        // `pm_runtime_resume_and_get()`.
+        // SAFETY: as above.
+        let on = unsafe { __pm_runtime_resume(dev, RPM_GET_PUT) };
+        dev_info!(
+            pdev.as_ref(),
+            "G17PMARK asc-powercycle gate off_rc={} on_rc={} -- a GFX PMGR set-target pair either side of this line is the proof the domain actually cycled\n",
+            off,
+            on
+        );
+        if on < 0 {
+            return Err(EIO);
+        }
+        Ok(())
     }
 
     /// Rebuild a crashed session so a NEW client can still open the device.
@@ -7466,6 +7722,7 @@ impl G17PLiveRuntime {
             cpus: Some(session.cpus),
             boot_stop_unproven: false,
             session_recovery_pending: false,
+            runtime_pm_armed: false,
             gfx_state: Some(session.gfx_state),
             gfx_rtkit: Some(session.gfx_rtkit),
             gfx1_state: Some(session.gfx1_state),
@@ -7608,10 +7865,25 @@ impl g17_lifecycle::PersistentRuntimeRecovery for G17PLiveRuntime {
         if self.boot_stop_unproven {
             return Err(EIO);
         }
-        match self.cpus.as_mut() {
+        // Bracket the stop with the ASC state it is supposed to change. All a
+        // stop writes is CPU_CONTROL: RUN cleared, reread, bit 5 cleared. If
+        // CPU_STATUS and the reset vector are unchanged either side of it, the
+        // processor was gated, not reset, and the later HELLO wait is waiting
+        // for a handshake that was never re-armed.
+        let pdev = self.pdev.as_ref().cloned();
+        if let (Some(pdev), Some(cpus)) = (pdev.as_ref(), self.cpus.as_ref()) {
+            log_g17p_asc_state(pdev.as_ref(), cpus.gfx(), "gfx", "pre-cpu-stop");
+            log_g17p_asc_state(pdev.as_ref(), cpus.gfx1(), "gfx1", "pre-cpu-stop");
+        }
+        let result = match self.cpus.as_mut() {
             Some(cpus) => cpus.stop(),
             None => Ok(()),
+        };
+        if let (Some(pdev), Some(cpus)) = (pdev.as_ref(), self.cpus.as_ref()) {
+            log_g17p_asc_state(pdev.as_ref(), cpus.gfx(), "gfx", "post-cpu-stop");
+            log_g17p_asc_state(pdev.as_ref(), cpus.gfx1(), "gfx1", "post-cpu-stop");
         }
+        result
     }
 
     fn fail_outstanding_jobs_while_owned(&mut self) {
@@ -7701,6 +7973,15 @@ impl g17_lifecycle::PersistentRuntimeRecovery for G17PLiveRuntime {
         drop(self.cpus.take());
         let pdev = self.pdev.as_ref().ok_or(ENODEV)?.clone();
         let drm = self.drm.as_ref().ok_or(ENODEV)?.clone();
+        if *module_parameters::g17p_asc_restart.value() >= 2 {
+            if let Err(error) = self.cycle_gfx_power_domain(&pdev) {
+                dev_err!(
+                    pdev.as_ref(),
+                    "G17PMARK asc-powercycle failed ({:?}); continuing with the plain CPU_RUN restart\n",
+                    error
+                );
+            }
+        }
         let (boot_result, stop_unproven) = {
             let registers = self.registers.as_ref().ok_or(ENODEV)?;
             let manager = self.manager.as_mut().ok_or(ENODEV)?;
