@@ -86,6 +86,12 @@ int main(int argc, const char **argv)
             @"linux_gpu_proven":@NO, @"dcp_presentation_tested":@NO};
         NSData *json=[NSJSONSerialization dataWithJSONObject:result options:NSJSONWritingPrettyPrinted error:nil];
         fwrite(json.bytes,1,json.length,stdout); putchar('\n');
+        if (getenv("M5_TRIANGLE_HOLD_AFTER")) {
+            NSArray *retained=@[device,library,pipeline,pixels,texture,queue,command,pass,encoder];
+            fprintf(stderr,"M5_TRIANGLE_COMPLETED_RETAINED\n"); fflush(stderr); fflush(stdout);
+            if (getchar()!='\n') return 13;
+            if (retained.count!=9) return 14;
+        }
         return 0;
     }
 }
