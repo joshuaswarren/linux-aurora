@@ -3548,12 +3548,18 @@ impl G17PLiveRuntime {
             self.service_async_compute_completion_masks(completion_masks)
                 .map_err(step("async-compute-completions"))
         });
-        match result {
-            Ok(()) => Ok(()),
-            Err((reason, error)) => {
-                note_state_crashed(&pdev, &state, reason, error, None);
-                Err(error)
-            }
+        if let Err(error) = result {
+            // Setting `crashed` makes both service_primary_firmware_events and
+            // primary_firmware_event_pending return early forever, so from here
+            // on every RTKit doorbell runs a silent no-op and no completion,
+            // timeout or recovery is ever reported again. That transition was
+            // itself unlogged, which is why a wedged GPU produced an empty log.
+            state.crashed.store(true, Ordering::Release);
+            dev_err!(
+                pdev.as_ref(),
+                "G17P event worker: firmware event service failed ({:?}); marking the session crashed -- completion, timeout and recovery reporting stop here\n",
+                error,
+            );
         }
     }
 
@@ -3661,8 +3667,16 @@ impl G17PLiveRuntime {
         .and_then(|()| {
             manager.complete_pending_primary_recovery(generation, records, blamed_stamp)
         });
-        if result.is_err() {
+        if let Err(error) = result {
+            // Same permanent-deafness transition as above, and this one also
+            // skips the event-drain re-arm at the end of this function.
             state.crashed.store(true, Ordering::Release);
+            dev_err!(
+                pdev.as_ref(),
+                "G17P recovery: servicing generation {} failed ({:?}); marking the session crashed -- completion, timeout and recovery reporting stop here\n",
+                generation,
+                error,
+            );
             return result;
         }
         if let Some(stamp) = blamed_stamp {
