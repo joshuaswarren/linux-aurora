@@ -5,7 +5,10 @@
 //! and per-stage controls follow the native 25G76 M5 reference. This codec is
 //! not a claim that Linux TA/3D submission or presentation is qualified.
 
-use super::g17_render::{self, G17pRenderParameters, RegisterWrite, RenderBuildError};
+use super::g17_render::{
+    self, G17pRenderParameters, RegisterWrite, RenderBuildError, RenderDescriptorMetadata,
+    RenderDescriptorObjects,
+};
 
 #[cfg(test)]
 #[path = "m5_render_test.rs"]
@@ -21,6 +24,8 @@ pub(crate) enum M5RenderBuildError {
     TileCountOutOfRange,
     OverlappingTileFlags,
     DispatchBitAlreadySet,
+    InvalidContext,
+    OwnershipMismatch,
 }
 
 impl From<RenderBuildError> for M5RenderBuildError {
@@ -286,4 +291,119 @@ pub(crate) fn build_partial_load_registers(
     controls: &M5RenderControls,
 ) -> Result<[RegisterWrite; 12], M5RenderBuildError> {
     partial_registers(&g17_render::partial_load_registers(p), 0x15309, controls)
+}
+
+fn work_key(
+    p: &G17pRenderParameters,
+    metadata: RenderDescriptorMetadata,
+) -> Result<u64, M5RenderBuildError> {
+    if metadata.context_id == 0 || metadata.context_id > 255 {
+        return Err(M5RenderBuildError::InvalidContext);
+    }
+    if metadata.ta_hardware_buffer_id != p.ta_hardware_buffer_id {
+        return Err(M5RenderBuildError::OwnershipMismatch);
+    }
+    metadata
+        .submission_ordinal
+        .checked_add(metadata.submission_ordinal / 2)
+        .ok_or(M5RenderBuildError::Common(
+            RenderBuildError::ArithmeticOverflow,
+        ))?;
+    Ok(((metadata.context_id as u64) << 8) | (metadata.command_buffer_state_word & 0x3f) as u64)
+}
+
+fn alias_offset(alias: u64, offset: u64) -> Result<u64, M5RenderBuildError> {
+    alias.checked_add(offset).ok_or(M5RenderBuildError::Common(
+        RenderBuildError::ArithmeticOverflow,
+    ))
+}
+
+fn put_u16(raw: &mut [u8], offset: usize, value: u16) {
+    raw[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_u32(raw: &mut [u8], offset: usize, value: u32) {
+    raw[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_u64(raw: &mut [u8], offset: usize, value: u64) {
+    raw[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+/// Construct the M5 TA record's common layout and all register programs.
+/// Runtime ownership/completion fields must be populated before publication.
+pub(crate) fn build_ta_descriptor_base(
+    p: &G17pRenderParameters,
+    controls: &M5RenderControls,
+    objects: RenderDescriptorObjects,
+    metadata: RenderDescriptorMetadata,
+    low_alias: u64,
+    raw: &mut [u8],
+) -> Result<(), M5RenderBuildError> {
+    let mut controls = *controls;
+    controls.ta.work_key = work_key(p, metadata)?;
+    let program = alias_offset(low_alias, 0x60)?;
+    alias_offset(low_alias, g17_render::TA_DESCRIPTOR_SIZE as u64)?;
+    let registers = build_ta_registers(p, &controls)?;
+    g17_render::build_ta_descriptor_base(p, objects, metadata, &registers, raw)?;
+    // Native boundaries: main work ends before the final a739/deflake/dispatch.
+    for (offset, count) in [
+        (0x38, TA_REGISTER_COUNT - 3),
+        (0x3a, TA_REGISTER_COUNT),
+        (0x3c, TA_REGISTER_COUNT),
+    ] {
+        put_u16(raw, offset, count as u16);
+    }
+    put_u64(raw, 0x760, program);
+    Ok(())
+}
+
+/// Construct the M5 fragment record, including all three partial programs.
+/// The shared encoder is pure and does not apply Neo diagnostic overrides.
+pub(crate) fn build_fragment_descriptor_base(
+    p: &G17pRenderParameters,
+    controls: &M5RenderControls,
+    objects: RenderDescriptorObjects,
+    metadata: RenderDescriptorMetadata,
+    low_alias: u64,
+    raw: &mut [u8],
+) -> Result<(), M5RenderBuildError> {
+    let mut controls = *controls;
+    controls.fragment.work_key = work_key(p, metadata)?;
+    alias_offset(low_alias, g17_render::FRAGMENT_DESCRIPTOR_SIZE as u64)?;
+    let main = build_fragment_registers(p, &controls)?;
+    let store = build_partial_store_registers(p, &controls)?;
+    let resume = build_partial_resume_registers(p, &controls)?;
+    let load = build_partial_load_registers(p, &controls)?;
+    g17_render::build_fragment_descriptor_base(
+        p,
+        objects,
+        metadata,
+        g17_render::G17pFragmentRegisters {
+            main: &main,
+            store: &store,
+            resume: &resume,
+            load: &load,
+        },
+        raw,
+    )?;
+    put_u32(raw, 0x50, 1);
+    put_u32(raw, 0x90, 1);
+    for (offset, count) in [
+        (0x80, FRAGMENT_REGISTER_COUNT - 3),
+        (0x82, FRAGMENT_REGISTER_COUNT - 1),
+        (0x84, FRAGMENT_REGISTER_COUNT - 1),
+        (0x88, FRAGMENT_REGISTER_COUNT),
+    ] {
+        put_u16(raw, offset, count as u16);
+    }
+    for (offset, target) in [
+        (0x7a0, 0xa0),
+        (0xec0, 0x7c0),
+        (0x15e0, 0xee0),
+        (0x1d00, 0x1600),
+    ] {
+        put_u64(raw, offset, alias_offset(low_alias, target)?);
+    }
+    Ok(())
 }
