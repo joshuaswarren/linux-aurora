@@ -1,5 +1,9 @@
 # DCP handoff: m1n1 stage 2 -> Linux (J700 / T8140 / H17P)
 
+> Historical investigation: the unbound-driver state and proposed next steps
+> below predate the working native DCP/KWin desktop. See [J700.md](J700.md)
+> for the 2026-09-11 checkpoint and remaining display-resume limitation.
+
 What m1n1 does to the display coprocessor before it boots Linux, what it tells
 Linux about it, and what `apple-drm` has to do with that. Written against
 m1n1 `dcp-neo` (`aurora-silicon/m1n1@dcp-neo`) and macOS 25G83 traces.
