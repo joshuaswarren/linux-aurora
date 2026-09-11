@@ -25,7 +25,17 @@ pub(super) struct M5GraphicsUsc {
 
 impl M5GraphicsUsc {
     pub(super) fn new(dev: &AsahiDevice, vm: &mmu::Vm) -> Result<Self> {
-        let range = vm.kernel_range();
+        Self::new_in_range(dev, vm, vm.kernel_range())
+    }
+
+    pub(super) fn new_application(dev: &AsahiDevice, vm: &mmu::Vm) -> Result<Self> {
+        let range = crate::m5_vm::auxiliary_range(&vm.kernel_range()).ok_or(EINVAL)?;
+        Self::new_in_range(dev, vm, range)
+    }
+
+    fn new_in_range(
+        dev: &AsahiDevice, vm: &mmu::Vm, range: core::ops::Range<u64>,
+    ) -> Result<Self> {
         let allocate = |size, guard_pages| MappedObject::new_wc_in_range_with_guards(
             dev, vm, range.clone(), size, 0x8000, mmu::PROT_GPU_SHARED_RW, guard_pages,
         );
