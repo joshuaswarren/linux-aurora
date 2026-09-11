@@ -1,12 +1,12 @@
-# M5 first-compute reference and remaining execution gap
+# M5 first verified Linux compute and native reference
 
-The native reference proves successful M5 compute and its submission encoding.
-Linux still stalls before producing output. The shader bytes, command encoding
-and six program-page mapping profiles now match the controlled native job.
-Controlled native replay now proves that the original 64-byte shader copy
-omitted required contents elsewhere in its page. A measured 1 KiB program
-image produces the intended result under native submission. Linux loads the
-corrected program but still reaches firmware recovery without output.
+The M5 now executes the controlled compute shader under native Linux. A fresh
+RAM boot with `m5_initdata_test=10` verified all 1,024 `out = in * 3 + 5`
+results, unchanged inputs and retired queues without a reported GPU restart.
+The corrected program includes the required first 1 KiB of shader setup,
+and register `0x14028` selects the same owned UMA pool as the populated table.
+This qualifies one fixed compute job, not a render node, general shader
+compilation, graphics rendering or DCP presentation.
 
 ## Controlled shader-page replay
 
@@ -37,11 +37,11 @@ isolated. This evidence does not prove Linux submission, GPU rendering, or
 DCP presentation. The native regression after restoration passed 3,072
 compute values and 12,288 rendered pixels.
 
-The rebuilt Linux mode10 probe still leaves all 1,024 output words untouched
+Before the pool-selection correction, the rebuilt Linux mode10 probe left all 1,024 output words untouched
 with unchanged inputs. Five stable downstream samples at polls 1, 2, 3, 4,
 and 32 retain `a0a8=0`, followed by a type4 recovery event for queue11. The
 shader-page correction is therefore necessary for the controlled native
-replay, but is not sufficient to fix the Linux submission/initialization gap.
+replay, but was not sufficient to fix the Linux submission/initialization gap.
 Evidence: `logs/m5-shader-prefix-linux-compute-20260911.log`.
 The retained Linux capture `logs/m5-shader-prefix-linux-retained-20260911`
 contains 33 objects over 243 physical pages, with no failed reads and all
@@ -80,6 +80,39 @@ Run the replay workload with `M5_REFERENCE_SHADER_ADD=6`,
 `M5_REFERENCE_EXPECT_ADD=5`, and `M5_REFERENCE_COMPUTE_ONLY=1`. Use
 `verify-m5-program-replay.py CAPTURE WORKLOAD_JSON` to qualify the result.
 The verifier reports native submission separately from Linux qualification.
+
+The optional `shader-prefix-linux-dispatch` variant also replaces the three
+copies of the dispatch identity and its two descriptor fields with Linux's
+`1/1` values. It preserves the native private-memory pool selection and
+checks that selection against the shared-control owner. Each identity field
+is restored separately, preserving unrelated completion writes. The native
+replay `sksm-submit-1789110487839751000` verified all 1,024 replacement `+5`
+results and all restoration readbacks. The subsequent native regression
+passed 3,072 compute values and 12,288 rendered pixels.
+
+## Private-memory pool selection
+
+Register `0x14028` selects the owned UMA pool hardware ID. Seven native
+captures with independent pool-owner records match this register to
+shared-control `+8`. Captures that also include the UMA slot verify its
+index and populated descriptor separately. All 30 captured host
+descriptors match their signed `+0x788` field; 25G76 `generateRegisterList`
+loads that field at `0x89e38dc` and emits the register at `0x89e3900..391c`.
+The value varies between submissions and is not a fixed execution control.
+
+Linux previously populated UMA slot 0 while emitting register value 2.
+The probe now uses the same owned ID for the shared-control record and
+register program. The pool verifier rejects a mismatched register selection,
+and the register verifier derives the expected value from the independent
+host descriptor. The corrected fresh Linux boot passed all 1,024 exact
+outputs, unchanged inputs and both retired queues. The transaction and
+both firmware CPU stop requests succeeded. Evidence is retained in
+`logs/m5-owned-pool-linux-compute-20260911.log` and
+`logs/m5-owned-pool-linux-retained-20260911`.
+The latter contains 33 objects over 243 physical pages, with no read errors
+and all hashes valid. Independent decoding of its retained buffer confirms
+all 1,024 exact outputs, all 1,024 original inputs and no output sentinels.
+Its register `0x14028` and shared-control pool ID are both zero.
 
 ## Verified native reference
 
@@ -128,7 +161,7 @@ python3 tools/aurora/j813/gpu/verify-m5-compute-program.py "$NATIVE_CAPTURE"
 The checks compare the production Rust serializers against a 512-byte SKSM
 entry, 21-byte tag14 command, 12-byte producer transition, 40 registers over
 480 bytes, and defined ranges of six program pages. The program check covers
-64 shader bytes, 132 pipeline bytes, 48 command-stream bytes, preemption,
+the 1 KiB shader image, 132 pipeline bytes, 48 command-stream bytes, preemption,
 robustness, input/output, and same-descriptor completion. When mapping
 receipts exist, it also checks all six page-table profiles.
 
@@ -148,9 +181,9 @@ Root attributes `0x3000000000001` and intermediate attributes `3` match too.
 A fresh Linux mode9 capture verifies the installed correction:
 `logs/m5-program-readonly-retained-20260911` contains 33 objects over 243
 physical 4 KiB pages, with no read errors and matching hashes. All six mapping
-profiles match native. The job still leaves all 1,024 output words untouched,
+profiles match native. That earlier job left all 1,024 output words untouched,
 with unchanged inputs and eventual firmware recovery. Matching permissions
-is therefore a measured correction, not a sufficient fix for execution.
+was therefore a measured correction, not a sufficient fix for execution.
 
 ## Early Linux state without a firmware halt
 
@@ -182,8 +215,8 @@ Slot progress uses the existing direct slot-zero view. The AP issues only
 read tags; no register-data, bank-selector, recovery-acknowledgment or
 firmware-private-state writes are made.
 
-These monitor values do not yet establish shader instruction start or
-completion. Mode10 still leaves all 1,024 outputs untouched before recovery.
+These monitor values alone do not establish shader instruction start or
+completion. That earlier mode10 run left all 1,024 outputs untouched before recovery.
 Its retained RAM capture, `logs/m5-live-monitors-retained-20260911`, has
 33 objects / 243 physical pages, no errors and matching hashes.
 
@@ -295,21 +328,14 @@ Retained physical RAM remains useful evidence, but is not automatically a
 view of firmware-private caches or the original stall state. Modes9/10 avoid
 relying on a halt predicate.
 
-## Remaining reference needed
+## Remaining graphics work
 
-A successful M5 compute example beginning with fresh GPU initialization,
-including global setup, queue registration, initial completion state, memory
-mappings, one minimal job and its hardware completion, would isolate missing
-prerequisites. The current native witness supplies the job and program
-mappings; the bounded workload now supplies a qualified first-stamp active
-sample. The observed queue and pipe admission state matches Linux after
-accounting for owned queue IDs and pointers. The next comparison must reach
-deeper into shader execution and memory access, while retaining a complete
-fresh-initialization reference as an independent way to find prerequisites.
-An independent reference was requested in agents standup.
+The fresh Linux compute result now supplies the previously missing minimal
+execution witness. Repeated jobs and completion handling, general shader
+compilation, graphics submission and render-node integration still need
+qualification before testing DCP presentation and XFCE/glxgears.
+The controlled native reference remains useful for each independent step.
 
-Kernel, modules and RAM payloads build. The 31 canonical capture tests pass,
-including six tests executing the native sampler's actual AArch64 code
-against synthetic power, bank-selection, and pipe-state changes.
-Linux GPU execution, accelerated rendering, and DCP presentation remain
-unqualified.
+Kernel, modules and RAM payloads build. The 48 canonical capture/replay
+tests and five Rust compute-codec tests pass. Linux execution is qualified
+for this one fixed compute job; accelerated rendering and DCP are not.

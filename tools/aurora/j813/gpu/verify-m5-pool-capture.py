@@ -20,6 +20,12 @@ def verify(manifest, blobs):
     require(len(state) == 0x70, 'Unexpected shared-control extent')
     directory, = struct.unpack_from('<Q', state, 0x14)
     hardware_id, = struct.unpack_from('<I', state, 8)
+    command = blobs['payload-view-0']
+    require(len(command) >= 0x220 and struct.unpack_from('<4H', command, 0x18) == (37, 39, 39, 40),
+            'Unexpected compute register profile')
+    register, selected_pool = struct.unpack_from('<IQ', command, 0x40 + 29 * 12)
+    require(register == 0x14028 and selected_pool == hardware_id,
+            'Compute register selects a different hardware pool')
     capacity, = struct.unpack_from('<I', state, 0x1c)
     counter_a, counter_b, empty, total = struct.unpack_from('<4I', state, 0x20)
     require(directory == 0x7000000000 and capacity == 0x80000,
@@ -55,7 +61,7 @@ def main():
     blobs = {}
     for item in manifest['objects']:
         if item['label'] not in ('compute-pool-event-state', 'compute-pool-uma-slot',
-                                 'compute-pool-directory'):
+                                 'compute-pool-directory', 'payload-view-0'):
             continue
         data = (args.capture / item['file']).read_bytes()
         require(item['stable'] and len(data) == item['size'], 'Unstable or short pool object')
@@ -77,6 +83,12 @@ def main():
         unguarded = json.loads(json.dumps(manifest))
         unguarded['compute_pool_directory_edges'][-1] = dict(offset='0x404000', mapping=[{}])
         mutations.append((unguarded, blobs))
+        wrong_pool = dict(blobs)
+        command = bytearray(blobs['payload-view-0'])
+        struct.pack_into('<Q', command, 0x40 + 29 * 12 + 4,
+                         struct.unpack_from('<I', blobs['compute-pool-event-state'], 8)[0] ^ 1)
+        wrong_pool['payload-view-0'] = bytes(command)
+        mutations.append((manifest, wrong_pool))
         for bad_manifest, bad_blobs in mutations:
             try:
                 verify(bad_manifest, bad_blobs)
@@ -85,7 +97,7 @@ def main():
             else:
                 raise RuntimeError('Invalid pool mutation was accepted')
     print(json.dumps(dict(initial_page_addresses_verified=7168,
-        directory_allocation_bytes=0x400000, m5_uma_slot_verified=True,
+        directory_allocation_bytes=0x400000, m5_uma_slot_verified=True, compute_pool_selection_verified=True,
         invalid_mutations_rejected=rejected, linux_execution_qualified=False)))
 
 

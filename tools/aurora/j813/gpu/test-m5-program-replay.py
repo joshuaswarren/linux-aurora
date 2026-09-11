@@ -22,17 +22,23 @@ class FakeGPU:
         self.fail_write = None
 
     def mapping(self, va, size, *_):
-        return [dict(address=hex(va), physical=hex(self.physical[va]), size=size,
-                     walk=[[hex(self.low + 0x100), hex(self.physical[va] | 0xc8b)]])]
+        pa = self.physical[va & ~(mod.PAGE - 1)] + va % mod.PAGE
+        return [dict(address=hex(va), physical=hex(pa), size=size,
+                     walk=[[hex(self.low + 0x100), hex(pa | 0xc8b)]])]
 
     def read_context(self, va, size, *_):
-        return bytes(self.data[self.physical[va]][:size])
+        offset = va % mod.PAGE
+        return bytes(self.data[self.physical[va - offset]][offset:offset + size])
+
+    read = read_context
 
     def write(self, pa, data):
         self.writes.append(pa)
-        self.data[pa][:] = data
+        offset = pa % mod.PAGE
+        target = self.data[pa - offset]
+        target[offset:offset + len(data)] = data
         if self.fail_write == len(self.writes):
-            self.data[pa][-1] ^= 1
+            target[offset + len(data) - 1] ^= 1
             raise IOError('simulated partial transport failure')
 
     def sync(self, pa, size):
@@ -176,6 +182,101 @@ class ReplayTests(unittest.TestCase):
         p.write_bytes(bytes(mod.PAGE))
         with self.assertRaisesRegex(ValueError, 'hash differs'):
             mod.load_capture(self.linux, 'program-shader', self.programs[0][1], False)
+
+    def dispatch_fixture(self):
+        address = 0xfffffc20c0420140
+        base = address & ~(mod.PAGE - 1)
+        pa = self.gpu.low + 0x800000
+        self.gpu.physical[base] = pa
+        self.gpu.data[pa] = bytearray(mod.PAGE)
+        native = bytearray(0x1000)
+        struct.pack_into('<I', native, 0, 3)
+        struct.pack_into('<I', native, 0xc, 3)
+        struct.pack_into('<4H', native, 0x18, 37, 39, 39, 40)
+        for i in range(40):
+            struct.pack_into('<IQ', native, 0x40 + i * 12, i, 0x100 + i)
+        struct.pack_into('<IQ', native, 0x40 + 29 * 12, 0x14028, 2)
+        state = 0xfffffc20c0460000
+        self.gpu.physical[state] = pa + mod.PAGE
+        self.gpu.data[pa + mod.PAGE] = bytearray(mod.PAGE)
+        struct.pack_into('<I', self.gpu.data[pa + mod.PAGE], 8, 2)
+        struct.pack_into('<Q', native, 0xfb2, state)
+        identity = 0x0208fd1b0308fd20
+        linux = bytearray(native)
+        for data, value in [(native, identity), (linux, 0x100000001)]:
+            for i, number in zip((23, 24, 25), (0x1a540, 0x14a9, 0xa351)):
+                struct.pack_into('<IQ', data, 0x40 + i * 12, number, value)
+            struct.pack_into('<I', data, 0xf20, value >> 32)
+            struct.pack_into('<Q', data, 0xf68, value & 0xffffffff)
+        self.gpu.data[pa][0x140:0x1140] = native
+        (self.linux / 'descriptor.bin').write_bytes(linux)
+        manifest = json.loads((self.linux / 'manifest.json').read_text())
+        manifest['objects'].append(dict(label='descriptor', file='descriptor.bin',
+                                       sha256=mod.digest(linux)))
+        (self.linux / 'manifest.json').write_text(json.dumps(manifest))
+        return address, pa, native, linux
+
+    def test_dispatch_variant_restores_only_identity_fields(self):
+        address, pa, native, linux = self.dispatch_fixture()
+        self.replay.prepare(self.native, self.linux, self.workload,
+            variant='shader-prefix-linux-dispatch', descriptor_address=address)
+        self.replay.apply()
+        self.assertEqual(self.gpu.read(address, 0x1000), linux)
+        # A completion write outside our fields must survive restoration.
+        self.gpu.data[pa][0x140 + 0xf50] = 0x77
+        self.replay.restore()
+        native[0xf50] = 0x77
+        self.assertEqual(self.gpu.read(address, 0x1000), native)
+        self.assertFalse(self.replay.active)
+        self.assertEqual(self.replay.receipt['descriptor_identity_fields'], 5)
+        self.assertEqual(len(self.gpu.writes), 16)
+
+    def test_dispatch_unrelated_register_difference_prevents_writes(self):
+        address, pa, _, _ = self.dispatch_fixture()
+        self.gpu.data[pa][0x140 + 0x44] ^= 1
+        with self.assertRaisesRegex(ValueError, 'unrelated register'):
+            self.replay.prepare(self.native, self.linux, self.workload,
+                variant='shader-prefix-linux-dispatch', descriptor_address=address)
+        self.assertEqual(self.gpu.writes, [])
+
+    def test_dispatch_preserves_native_pool_selection(self):
+        address, pa, _, _ = self.dispatch_fixture()
+        struct.pack_into('<Q', self.gpu.data[pa], 0x140 + 0x40 + 29 * 12 + 4, 0)
+        struct.pack_into('<I', self.gpu.data[pa + mod.PAGE], 8, 0)
+        self.replay.prepare(self.native, self.linux, self.workload,
+            variant='shader-prefix-linux-dispatch', descriptor_address=address)
+        self.replay.apply()
+        self.assertEqual(struct.unpack_from('<Q', self.gpu.read(address, 0x1000), 0x40 + 29 * 12 + 4)[0], 0)
+        self.replay.restore()
+        self.assertEqual(self.replay.receipt['preserved_native_private_pool_hw_id'], 0)
+
+    def test_dispatch_rejects_pool_owner_mismatch(self):
+        address, pa, _, _ = self.dispatch_fixture()
+        struct.pack_into('<I', self.gpu.data[pa + mod.PAGE], 8, 1)
+        with self.assertRaisesRegex(ValueError, 'disagrees with its native owner'):
+            self.replay.prepare(self.native, self.linux, self.workload,
+                variant='shader-prefix-linux-dispatch', descriptor_address=address)
+        self.assertEqual(self.gpu.writes, [])
+
+    def test_dispatch_disagreeing_identity_prevents_writes(self):
+        address, pa, _, _ = self.dispatch_fixture()
+        self.gpu.data[pa][0x140 + 0xf20] ^= 1
+        with self.assertRaisesRegex(ValueError, 'identity fields disagree'):
+            self.replay.prepare(self.native, self.linux, self.workload,
+                variant='shader-prefix-linux-dispatch', descriptor_address=address)
+        self.assertEqual(self.gpu.writes, [])
+
+    def test_partial_dispatch_write_restores_program_and_fields(self):
+        address, pa, native, _ = self.dispatch_fixture()
+        self.replay.prepare(self.native, self.linux, self.workload,
+            variant='shader-prefix-linux-dispatch', descriptor_address=address)
+        self.gpu.fail_write = 5
+        with self.assertRaisesRegex(IOError, 'partial transport'):
+            self.replay.apply()
+        self.assertFalse(self.replay.active)
+        self.assertEqual(self.gpu.read(address, 0x1000), native)
+        for original_pa, data in self.original.items():
+            self.assertEqual(self.gpu.data[original_pa], data)
 
 
 if __name__ == '__main__':

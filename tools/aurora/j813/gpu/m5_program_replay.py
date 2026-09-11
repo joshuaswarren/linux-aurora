@@ -3,8 +3,10 @@
 
 This is a diagnostic, not a GPU driver. The caller must stop the guest before
 publication, arm the matching completion hook, and restore before guest return.
-Only three pinned 16 KiB program pages may be changed. A separate +6 native
-capture pins their original contents; Linux's +5 pages provide the replacement.
+Three pinned 16 KiB program pages may be changed. An additional explicit
+dispatch variant changes only five identity fields in the captured descriptor.
+A separate +6 native capture pins the program contents; Linux's +5 pages
+provide the replacement. Every changed byte is restored through its journal.
 """
 import hashlib
 import json
@@ -67,26 +69,29 @@ class M5ProgramReplay:
         (self.output / 'program-replay.json').write_text(
             json.dumps(self.receipt, indent=2) + '\n')
 
-    def _mapping(self, address):
-        mapping = self.gpu.mapping(address, PAGE, self.context, self.gpu_region)
+    def _mapping(self, address, size=PAGE, context=3):
+        mapping = self.gpu.mapping(address, size, context, self.gpu_region)
         if (len(mapping) != 1 or int(mapping[0]['address'], 0) != address
-                or mapping[0]['size'] != PAGE):
-            raise ValueError('Replay requires one whole-page DRAM mapping')
+                or mapping[0]['size'] != size):
+            raise ValueError('Replay requires one bounded DRAM mapping')
         pa = int(mapping[0]['physical'], 0)
-        if pa % PAGE or not self.gpu.low <= pa < pa + PAGE <= self.gpu.high:
+        if (pa % PAGE != address % PAGE
+                or not self.gpu.low <= pa < pa + size <= self.gpu.high):
             raise ValueError('Replay physical page is unaligned or outside DRAM')
         return mapping, pa
 
-    def _read(self, address):
-        data = self.gpu.read_context(address, PAGE, self.context, self.gpu_region)
-        if len(data) != PAGE:
+    def _read(self, address, size=PAGE, context=3):
+        data = (self.gpu.read(address, size) if context is None else
+                self.gpu.read_context(address, size, context, self.gpu_region))
+        if len(data) != size:
             raise ValueError('Short replay program read')
         return data
 
-    def prepare(self, native, linux, workload, variant='linux-pages'):
+    def prepare(self, native, linux, workload, variant='linux-pages', descriptor_address=None):
         if self.pages or self.touched:
             raise ValueError('Replay is one-shot')
-        if variant not in ('linux-pages', 'shader-body-only', 'shader-record', 'shader-prefix'):
+        if variant not in ('linux-pages', 'shader-body-only', 'shader-record', 'shader-prefix',
+                           'shader-prefix-linux-dispatch'):
             raise ValueError('Unknown controlled replay variant')
         self.receipt['variant'] = variant
         result = json.loads(Path(workload).read_text())
@@ -112,13 +117,13 @@ class M5ProgramReplay:
                 replacement = original[:0x3c0] + replacement[0x3c0:0x400] + original[0x400:]
             elif name == 'shader' and variant == 'shader-record':
                 replacement = replacement[:0x340] + original[0x340:0x3c0] + replacement[0x3c0:]
-            elif name == 'shader' and variant == 'shader-prefix':
+            elif name == 'shader' and variant in ('shader-prefix', 'shader-prefix-linux-dispatch'):
                 replacement = original[:0x3c0] + replacement[0x3c0:]
             mapping, pa = self._mapping(address)
             if original != self._read(address) or mapping != self._mapping(address)[0]:
                 raise ValueError('Native program or translation differs from baseline: ' + name)
             self.pages.append(dict(name=name, address=address, pa=pa, mapping=mapping,
-                                   original=original, replacement=replacement))
+                                   original=original, replacement=replacement, size=PAGE, context=3))
         shader = self.pages[0]
         if shader['original'][0x3c0:0x400] == shader['replacement'][0x3c0:0x400]:
             raise ValueError('Replay must distinguish original and replacement shader bytes')
@@ -139,22 +144,86 @@ class M5ProgramReplay:
                        for p in self.pages for part in p['mapping'] for slot, _ in part['walk']}
         if len(set(physical)) != len(physical) or set(physical) & table_pages:
             raise ValueError('Replay program, resource or page-table pages alias')
+        if variant == 'shader-prefix-linux-dispatch':
+            self._prepare_dispatch(descriptor_address, linux, set(physical) | table_pages)
         for p in self.pages:
             (self.output / ('replay-original-' + p['name'] + '.bin')).write_bytes(p['original'])
             (self.output / ('replay-replacement-' + p['name'] + '.bin')).write_bytes(p['replacement'])
             self.receipt['pages'].append(dict(name=p['name'], address=hex(p['address']),
-                physical=hex(p['pa']), mapping=p['mapping'], size=PAGE,
+                physical=hex(p['pa']), mapping=p['mapping'], size=p['size'], context=p['context'],
                 original_sha256=digest(p['original']), replacement_sha256=digest(p['replacement'])))
         self.receipt['state'] = 'prepared'
         self._record()
 
+    def _prepare_dispatch(self, address, linux, protected_pages):
+        if not isinstance(address, int) or address < 0xffff_fc00_0000_0000:
+            raise ValueError('Dispatch replay requires the captured global descriptor')
+        original = self._read(address, 0x1000, None)
+        manifest = json.loads((Path(linux) / 'manifest.json').read_text())
+        matches = [o for o in manifest['objects'] if o['label'] == 'descriptor']
+        if len(matches) != 1:
+            raise ValueError('Dispatch replay requires one retained Linux descriptor')
+        item = matches[0]
+        path = (Path(linux) / item['file']).resolve()
+        if path.parent != Path(linux).resolve():
+            raise ValueError('Dispatch capture file escaped its directory')
+        candidate = path.read_bytes()
+        if len(candidate) != 0x1000 or digest(candidate) != item['sha256']:
+            raise ValueError('Dispatch capture hash differs')
+        offsets = [(0x40 + i * 12 + 4, 8) for i in (23, 24, 25)] + [(0xf20, 4), (0xf68, 8)]
+        for data in (original, candidate):
+            if (struct.unpack_from('<I', data)[0] != 3
+                    or struct.unpack_from('<I', data, 0xc)[0] != 3
+                    or struct.unpack_from('<4H', data, 0x18) != (37, 39, 39, 40)):
+                raise ValueError('Dispatch descriptor profile differs')
+            registers = [struct.unpack_from('<IQ', data, 0x40 + i * 12) for i in range(40)]
+            low = struct.unpack_from('<Q', data, 0xf68)[0]
+            if low > 0xffffffff:
+                raise ValueError('Dispatch low identity exceeds the measured field')
+            identity = struct.unpack_from('<I', data, 0xf20)[0] << 32 | low
+            if registers[23:26] != [(n, identity) for n in (0x1a540, 0x14a9, 0xa351)]:
+                raise ValueError('Dispatch identity fields disagree')
+        if struct.unpack_from('<Q', candidate, offsets[0][0])[0] != 0x100000001:
+            raise ValueError('Linux dispatch identity differs from the controlled probe')
+        # Register 0x14028 selects the owned UMA hardware pool, not an
+        # execution gate. Preserve it and independently check shared-control
+        # +8; native pool IDs vary across submissions and processes.
+        pools = [struct.unpack_from('<IQ', data, 0x40 + 29 * 12) for data in (original, candidate)]
+        if any(number != 0x14028 or not 0 <= value < 512 for number, value in pools):
+            raise ValueError('Dispatch private pool ID exceeds the measured UMA table')
+        state, = struct.unpack_from('<Q', original, 0xfb2)
+        pool_bytes = self._read(state + 8, 4, None)
+        if (struct.unpack('<I', pool_bytes)[0] != pools[0][1]
+                or self._read(state + 8, 4, None) != pool_bytes):
+            raise ValueError('Dispatch private pool ID disagrees with its native owner')
+        self.receipt['preserved_native_private_pool_hw_id'] = pools[0][1]
+        # All other non-identity register values and all register numbers agree.
+        masked = []
+        for data in (original, candidate):
+            registers = bytearray(data[0x40:0x220])
+            for offset, size in offsets[:3]:
+                registers[offset-0x40:offset-0x40+size] = bytes(size)
+            registers[29 * 12 + 4:30 * 12] = bytes(8)
+            masked.append(registers)
+        if masked[0] != masked[1]:
+            raise ValueError('Dispatch replay has an unrelated register difference')
+        for offset, size in offsets:
+            mapping, pa = self._mapping(address + offset, size, None)
+            tables = {int(slot, 0) & ~(PAGE - 1) for part in mapping for slot, _ in part['walk']}
+            if (pa & ~(PAGE - 1)) in protected_pages | tables:
+                raise ValueError('Dispatch fields alias a program, resource or page table')
+            self.pages.append(dict(name='dispatch-%x' % offset, address=address+offset,
+                pa=pa, mapping=mapping, size=size, context=None,
+                original=original[offset:offset+size], replacement=candidate[offset:offset+size]))
+        self.receipt.update(gpu_program_only=False, descriptor_identity_fields=5)
+
     def _write(self, page, data, phase):
         # The caller supplies cache maintenance for the normal cached alias;
         # writes use the carrier's qualified full-DRAM Normal-NC alias.
-        self.sync_phys(page['pa'], PAGE)
+        self.sync_phys(page['pa'] & ~(PAGE - 1), PAGE)
         self.write_phys(page['pa'], data)
-        self.sync_phys(page['pa'], PAGE)
-        if self._read(page['address']) != data:
+        self.sync_phys(page['pa'] & ~(PAGE - 1), PAGE)
+        if self._read(page['address'], page['size'], page['context']) != data:
             raise ValueError('Replay ' + phase + ' readback mismatch: ' + page['name'])
         self.receipt['writes'].append(dict(page=page['name'], phase=phase, verified=True))
 
@@ -164,7 +233,8 @@ class M5ProgramReplay:
         # Revalidate every page before the first write; partial preflight must
         # never modify the target. GPU submission has not yet been published.
         for p in self.pages:
-            if self._mapping(p['address'])[0] != p['mapping'] or self._read(p['address']) != p['original']:
+            if (self._mapping(p['address'], p['size'], p['context'])[0] != p['mapping']
+                    or self._read(p['address'], p['size'], p['context']) != p['original']):
                 raise ValueError('Replay pre-publication state changed')
         try:
             for p in self.pages:
@@ -184,7 +254,7 @@ class M5ProgramReplay:
         # A changed translation invalidates ownership. Halt for investigation
         # rather than writing a page that may have been recycled by the guest.
         for p in self.touched:
-            if self._mapping(p['address'])[0] != p['mapping']:
+            if self._mapping(p['address'], p['size'], p['context'])[0] != p['mapping']:
                 self.receipt['state'] = 'restore-blocked-mapping-changed'
                 self._record()
                 raise ValueError('Replay ownership changed before restoration')

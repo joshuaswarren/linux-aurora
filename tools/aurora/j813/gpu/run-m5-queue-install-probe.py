@@ -64,4 +64,5 @@ if any(marker not in captured for marker in required):
     raise RuntimeError(f"M5 mode-{mode} probe was not verified; inspect the retained log")
 print("M5_KSM_ADMISSION_HARDWARE_VERIFIED" if mode == 8
       else "M5_COMPUTE_SETUP_HARDWARE_VERIFIED" if mode == 7
+      else "M5_COMPUTE_HARDWARE_VERIFIED" if mode in (6, 9, 10)
       else "M5_QUEUE_INSTALL_HARDWARE_VERIFIED")
