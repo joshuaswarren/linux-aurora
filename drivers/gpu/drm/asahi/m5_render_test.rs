@@ -1,0 +1,427 @@
+// SPDX-License-Identifier: MIT
+//! Register-only fixture from the verified native 25G76 256x256 M5 triangle.
+//! No shader binaries, host descriptors or captured physical memory are embedded.
+use super::*;
+
+#[test]
+fn resource_ids_are_caller_owned_and_sign_extended() {
+    let (mut p, controls) = reference();
+    p.ta_hardware_buffer_id = 9;
+    p.usc_flist_hardware_buffer_id = 0xffff_fffe;
+    let ta = build_ta_registers(&p, &controls).unwrap();
+    let fragment = build_fragment_registers(&p, &controls).unwrap();
+    assert_eq!(value(&ta, 0x1c830), Ok(9));
+    assert_eq!(value(&fragment, 0x1c838), Ok(9));
+    assert_eq!(value(&ta, 0x14308), Ok(u64::MAX - 1));
+    assert_eq!(value(&fragment, 0x14048), Ok(u64::MAX - 1));
+}
+
+#[test]
+fn stage_controls_and_zero_ptc_fallback_are_independent() {
+    let (p, mut controls) = reference();
+    controls.ta.work_key = 0x400;
+    controls.fragment.work_key = 0x405;
+    controls.ta.ptc_max = 0;
+    controls.fragment.ptc_max = 0x81;
+    let ta = build_ta_registers(&p, &controls).unwrap();
+    let fragment = build_fragment_registers(&p, &controls).unwrap();
+    assert_eq!(value(&ta, 0x10209), Ok(0x400));
+    assert_eq!(value(&fragment, 0x10211), Ok(0x405));
+    assert_eq!(value(&ta, 0xa5a1), Ok(0x6000400020));
+    assert_eq!(value(&fragment, 0xa5a9), Ok(0x8100400020));
+}
+
+#[test]
+fn tile_fields_reject_overflow_and_overlapping_controls() {
+    let (mut p, mut controls) = reference();
+    p.width = 32769;
+    assert_eq!(
+        build_fragment_registers(&p, &controls),
+        Err(M5RenderBuildError::TileCountOutOfRange)
+    );
+    p.width = 256;
+    controls.fragment_tile_flags |= 1 << 42;
+    assert_eq!(
+        build_ta_registers(&p, &controls),
+        Err(M5RenderBuildError::OverlappingTileFlags)
+    );
+    controls.fragment_tile_flags &= !(1 << 42);
+    controls.ta_dispatch_control |= 1;
+    assert_eq!(
+        build_ta_registers(&p, &controls),
+        Err(M5RenderBuildError::DispatchBitAlreadySet)
+    );
+}
+
+#[test]
+fn rectangular_tile_fields_do_not_overlap() {
+    let (mut p, controls) = reference();
+    p.width = 1024;
+    p.height = 640;
+    let ta = build_ta_registers(&p, &controls).unwrap();
+    let fragment = build_fragment_registers(&p, &controls).unwrap();
+    assert_eq!(value(&ta, 0x1c069), Ok(0x804018));
+    assert_eq!(value(&ta, 0x1c071), Ok(0x804018));
+    assert_eq!(value(&ta, 0x1ca70), value(&ta, 0x1c069));
+    let state = value(&fragment, 0x16068).unwrap();
+    assert_eq!((state >> 42) & 0x3ff, 31);
+    assert_eq!((state >> 52) & 0x3ff, 19);
+    assert_eq!((state >> 38) & 0xf, 0xa);
+}
+
+fn reference() -> (G17pRenderParameters, M5RenderControls) {
+    let mut p = G17pRenderParameters::source_rsrc8();
+    p.aux_fb = 0x10000288000;
+    p.aux_fb_flags = 0x10c001;
+    p.aux_fb_page_count = 0x100000;
+    p.context_base = 0x1000000000;
+    p.cycle = 0x220040;
+    p.deflake_1 = 0x1000068340;
+    p.deflake_2 = 0x1000068040;
+    p.deflake_3 = 0x1000068000;
+    p.depth_aux_buffer = 0x0;
+    p.depth_aux_stride = 0x0;
+    p.depth_buffer = 0x0;
+    p.depth_clear_value_bits = 0x3f800000;
+    p.depth_dimensions = 0x0;
+    p.depth_flags = 0x0;
+    p.depth_stride = 0x0;
+    p.encoder = 0x1000018000;
+    p.fragment_lifecycle = 0x4089f4c0508e74c;
+    p.fragment_status = 0x1000258000;
+    p.heapmeta = 0x1000261000;
+    p.height = 0x100;
+    p.layers = 0x1;
+    p.lifecycle = 0x4089f4c0508e74d;
+    p.load_pipeline = 0x10000170200;
+    p.load_pipeline_bind = 0xffff800000000040;
+    p.merge_upper_x_bits = 0x3bddb3d9;
+    p.merge_upper_y_bits = 0x3bddb3d9;
+    p.multisample_control = 0x88;
+    p.occlusion_query_base = 0x0;
+    p.ppp_control = 0x202;
+    p.record_index = 0x80041;
+    p.stencil_aux_buffer = 0x0;
+    p.stencil_aux_stride = 0x0;
+    p.stencil_buffer = 0x0;
+    p.stencil_clear_value = 0x0;
+    p.stencil_stride = 0x0;
+    p.store_pipeline = 0x10000170400;
+    p.store_pipeline_bind = 0x0;
+    p.ta_hardware_buffer_id = 0x4;
+    p.ta_status = 0x1000078000;
+    p.tib_blocks = 0x0;
+    p.tile_config = 0x10280;
+    p.tilemap = 0x1000260000;
+    p.tpc = 0x1000288000;
+    p.usc_flist_hardware_buffer_id = 0x2;
+    p.utile_config = 0xa000;
+    p.utile_height = 0x20;
+    p.utile_width = 0x20;
+    p.width = 0x100;
+    p.absolute_pointers = false;
+    p.partial_store_pipeline_bind = 0;
+    p.partial_store_pipeline = 0x10000170400;
+    p.partial_load_pipeline_bind = 0xffff800000000040;
+    p.partial_load_pipeline = 0x10000170000;
+    let controls = M5RenderControls {
+        ta: M5RenderStageControls {
+            resource_flags: 0x4054b,
+            resource_control: 0x200000001,
+            ptc_max: 0xc6,
+            work_key: 0x300,
+        },
+        fragment: M5RenderStageControls {
+            resource_flags: 0x104054b,
+            resource_control: 0x200000001,
+            ptc_max: 0xce,
+            work_key: 0x300,
+        },
+        ta_tile_control: 0x10c08860,
+        ta_dispatch_control: 0x700,
+        fragment_raster_control: 0x200000ff0200,
+        fragment_tile_flags: 0x200003717f,
+        store_pipeline_2_bind: 0x0,
+        store_pipeline_2: 0x10000170400,
+        partial_store_pipeline_2_bind: 0,
+        partial_store_pipeline_2: 0x10000170400,
+        partial_tile_flags: 0x200000,
+    };
+    (p, controls)
+}
+
+const TA: [(u32, u64); 82] = [
+    (0x01748, 0x0000000000000001),
+    (0x10141, 0x0000000000000200),
+    (0x1c039, 0x0000000000260000),
+    (0x1c9c8, 0x0000000000260000),
+    (0x1c0a1, 0x0000000000288000),
+    (0x1c031, 0x8000000000261000),
+    (0x1c9c0, 0x8000000000261000),
+    (0x1c051, 0x003a0012006b0003),
+    (0x1c061, 0x0000000000000001),
+    (0x10149, 0x000000000000a000),
+    (0x10139, 0x0000000000000088),
+    (0x10111, 0x0000000000068340),
+    (0x1c9b0, 0x0000000000068340),
+    (0x10119, 0x0000000000068040),
+    (0x1c9b8, 0x0000000000068040),
+    (0x1c958, 0x0000000000000001),
+    (0x1c950, 0x0004000000068000),
+    (0x1c930, 0x0000000000000000),
+    (0x1c880, 0x0000000000018000),
+    (0x1c079, 0x0000000000261000),
+    (0x1c9d8, 0x0000000000261000),
+    (0x10151, 0x0000000000000000),
+    (0x1c199, 0x0000000000000000),
+    (0x1c1a1, 0x0000000000000000),
+    (0x1c1a9, 0x0000000000000000),
+    (0x1c1b1, 0x0000000000000000),
+    (0x1c1b9, 0x0000000000000000),
+    (0x0d499, 0x000000000004054b),
+    (0x0d419, 0x0000000200000001),
+    (0x0a5a1, 0x000000c600400020),
+    (0x1c8f8, 0x0000000010c08860),
+    (0x1c0b1, 0x0000000000000014),
+    (0x1c850, 0x0000000000000014),
+    (0x10131, 0x0000000000000088),
+    (0x10121, 0x0000000000000202),
+    (0x10129, 0x0000000000ff00ff),
+    (0x101b9, 0x0000000000007007),
+    (0x1c069, 0x000000000040200c),
+    (0x1c071, 0x000000000040200c),
+    (0x1c081, 0x0000000000000010),
+    (0x1c0a9, 0x0000000000000020),
+    (0x1ca50, 0x0000000000007007),
+    (0x1ca58, 0x000000000000a000),
+    (0x1ca60, 0x0000000000000200),
+    (0x1ca70, 0x000000000040200c),
+    (0x1ca78, 0x000000000040200c),
+    (0x1ca68, 0x0000000000000010),
+    (0x10171, 0x0000000000000100),
+    (0x10169, 0x0000000000008000),
+    (0x1c8e0, 0xffffffffffffffff),
+    (0x1c8e8, 0xffffffffffffffff),
+    (0x1c898, 0x0000000000000700),
+    (0x101e1, 0x000000000000001c),
+    (0x1c9e8, 0x0000000000000000),
+    (0x1a099, 0x0000000000000000),
+    (0x1a0a1, 0x0000000000000000),
+    (0x1a069, 0x0000000000000000),
+    (0x1a071, 0x0000000000000000),
+    (0x1a0c9, 0x0000000000000000),
+    (0x1a0d1, 0x0000000000000000),
+    (0x101c9, 0x0000000000000000),
+    (0x0d471, 0x0000000000000000),
+    (0x1a0f1, 0x0000000000000008),
+    (0x1a149, 0x0000000000000000),
+    (0x10799, 0x0000000000ff0000),
+    (0x1c830, 0x0000000000000004),
+    (0x1ca30, 0x0000000000220040),
+    (0x16c39, 0x0000000000220040),
+    (0x1c910, 0x0000000000080041),
+    (0x1ca10, 0x04089f4c0508e74d),
+    (0x014a1, 0x04089f4c0508e74d),
+    (0x0a349, 0x04089f4c0508e74d),
+    (0x0a739, 0x0000000000000000),
+    (0x10209, 0x0000000000000300),
+    (0x1c9f0, 0x0000000000000300),
+    (0x14320, 0x0000000000000300),
+    (0x14308, 0x0000000000000002),
+    (0x14318, 0x0000001000078001),
+    (0x01740, 0x0000000000000001),
+    (0x0a739, 0x0000000000000000),
+    (0x1c880, 0x0000000000068340),
+    (0x1c898, 0x0000000000000701),
+];
+
+const FRAGMENT: [(u32, u64); 90] = [
+    (0x01739, 0x0000000000000001),
+    (0x10009, 0x000000000000a000),
+    (0x15379, 0x0000000000000000),
+    (0x15381, 0x0000010000170400),
+    (0x153b1, 0x0000000000000000),
+    (0x153b9, 0x0000010000170400),
+    (0x15369, 0xffff800000000040),
+    (0x15371, 0x0000010000170200),
+    (0x15131, 0x000000003bddb3d9),
+    (0x15139, 0x000000003bddb3d9),
+    (0x100a1, 0x0000000000000000),
+    (0x15069, 0x0000000000000000),
+    (0x15071, 0x0000000000000000),
+    (0x16058, 0x0000000000000000),
+    (0x10019, 0x0000000000000088),
+    (0x16469, 0x0000000000040004),
+    (0x16030, 0x0000000000040004),
+    (0x16471, 0x0000000000007007),
+    (0x10791, 0x0000200000ff0200),
+    (0x16098, 0x0000001000261000),
+    (0x15021, 0x000000000010c001),
+    (0x15211, 0x0000010000000100),
+    (0x15049, 0x0000000000100000),
+    (0x10051, 0x0000000000000000),
+    (0x0d491, 0x000000000104054b),
+    (0x0d429, 0x0000000200000001),
+    (0x0a5a9, 0x000000ce00400020),
+    (0x15321, 0x0000000000000000),
+    (0x15301, 0x000000003f800000),
+    (0x15309, 0x0000000000000300),
+    (0x15311, 0x0000000000000000),
+    (0x15319, 0x0000000000000000),
+    (0x15349, 0x0000000004040404),
+    (0x15351, 0x0000000000000000),
+    (0x15329, 0x0000000000000000),
+    (0x15331, 0x0000000000000000),
+    (0x15339, 0x0000000000000000),
+    (0x15341, 0x0000000000000000),
+    (0x15231, 0x0000000000000000),
+    (0x15221, 0x0000000000000000),
+    (0x15239, 0x0000000000000000),
+    (0x15229, 0x0000000000000000),
+    (0x15401, 0x0000000000000000),
+    (0x15421, 0x0000000000000000),
+    (0x15409, 0x0000000000000000),
+    (0x15429, 0x0000000000000000),
+    (0x153c1, 0x0000000000000000),
+    (0x15411, 0x0000000000000000),
+    (0x153c9, 0x0000000000000000),
+    (0x15431, 0x0000000000000000),
+    (0x153d1, 0x0000000000000000),
+    (0x15419, 0x0000000000000000),
+    (0x153d9, 0x0000000000000000),
+    (0x15439, 0x0000000000000000),
+    (0x16429, 0x0000001000260000),
+    (0x16060, 0x0000001000261000),
+    (0x16431, 0x0000000050000000),
+    (0x10039, 0x0000000000010280),
+    (0x16020, 0x0000000000000000),
+    (0x16451, 0x0000000000000000),
+    (0x15359, 0x0000000000000000),
+    (0x16138, 0x0000000000008860),
+    (0x16461, 0x0000010000288000),
+    (0x16090, 0x0000010000288000),
+    (0x101e9, 0x000000000000001c),
+    (0x16068, 0x00701ea00003717f),
+    (0x1a0a9, 0x0000000000000000),
+    (0x1a0b1, 0x0000000000000000),
+    (0x1a079, 0x0000000000000000),
+    (0x1a081, 0x0000000000000000),
+    (0x1a0d9, 0x0000000000000000),
+    (0x1a0e1, 0x0000000000000000),
+    (0x101c1, 0x0000000000000000),
+    (0x0d469, 0x0000000000000000),
+    (0x1a0f9, 0x0000000000000008),
+    (0x1a151, 0x0000000000000000),
+    (0x160e0, 0x04089f4c0508e74c),
+    (0x01499, 0x04089f4c0508e74c),
+    (0x0a341, 0x04089f4c0508e74c),
+    (0x1c838, 0x0000000000000004),
+    (0x1ca28, 0x0000000000220040),
+    (0x0a741, 0x0000000000000000),
+    (0x10211, 0x0000000000000300),
+    (0x10420, 0x0000000000000300),
+    (0x14048, 0x0000000000000002),
+    (0x14080, 0x0000001000258001),
+    (0x01731, 0x0000000000000001),
+    (0x0a741, 0x0000000000000000),
+    (0x16020, 0x0000000000000001),
+    (0x16068, 0x0000000000040000),
+];
+
+#[test]
+fn native_m5_register_lists_match_every_write() {
+    let (p, controls) = reference();
+    let ta = build_ta_registers(&p, &controls).unwrap();
+    let fragment = build_fragment_registers(&p, &controls).unwrap();
+    let mut mismatches = 0;
+    for (stage, actual, expected) in [
+        ("TA", ta.as_slice(), TA.as_slice()),
+        ("fragment", fragment.as_slice(), FRAGMENT.as_slice()),
+    ] {
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            if (actual.number, actual.value) != *expected {
+                eprintln!(
+                    "{stage}[{index}] actual={:x}/{:x} native={:x}/{:x}",
+                    actual.number, actual.value, expected.0, expected.1
+                );
+                mismatches += 1;
+            }
+        }
+    }
+    assert_eq!(mismatches, 0);
+}
+
+const PARTIAL_STORE: [(u32, u64); 18] = [
+    (0x15379, 0x0000000000000000),
+    (0x15381, 0x0000010000170400),
+    (0x153b1, 0x0000000000000000),
+    (0x153b9, 0x0000010000170400),
+    (0x10039, 0x0000000000210280),
+    (0x15359, 0x0000000000000020),
+    (0x15331, 0x0000000000000000),
+    (0x153c9, 0x0000000000000000),
+    (0x15341, 0x0000000000000000),
+    (0x153d9, 0x0000000000000000),
+    (0x15421, 0x0000000000000000),
+    (0x15431, 0x0000000000000000),
+    (0x15429, 0x0000000000000000),
+    (0x15439, 0x0000000000000000),
+    (0x15221, 0x0000000000000000),
+    (0x15229, 0x0000000000000000),
+    (0x15319, 0x0000000000000000),
+    (0x15349, 0x0000000004040404),
+];
+
+const PARTIAL_RESUME: [(u32, u64); 25] = [
+    (0x15379, 0x0000000000000000),
+    (0x15381, 0x0000010000170400),
+    (0x153b1, 0x0000000000000000),
+    (0x153b9, 0x0000010000170400),
+    (0x15369, 0xffff800000000040),
+    (0x15371, 0x0000010000170000),
+    (0x10039, 0x0000000000200280),
+    (0x15359, 0x0000000000000020),
+    (0x15331, 0x0000000000000000),
+    (0x153c9, 0x0000000000000000),
+    (0x15341, 0x0000000000000000),
+    (0x153d9, 0x0000000000000000),
+    (0x15421, 0x0000000000000000),
+    (0x15431, 0x0000000000000000),
+    (0x15429, 0x0000000000000000),
+    (0x15439, 0x0000000000000000),
+    (0x15221, 0x0000000000000000),
+    (0x15229, 0x0000000000000000),
+    (0x15309, 0x0000000000000300),
+    (0x15329, 0x0000000000000000),
+    (0x153c1, 0x0000000000000000),
+    (0x15339, 0x0000000000000000),
+    (0x153d1, 0x0000000000000000),
+    (0x15319, 0x0000000000000000),
+    (0x15349, 0x0000000004040404),
+];
+
+const PARTIAL_LOAD: [(u32, u64); 12] = [
+    (0x15369, 0xffff800000000040),
+    (0x15371, 0x0000010000170000),
+    (0x10039, 0x0000000000200280),
+    (0x15309, 0x0000000000000300),
+    (0x153b1, 0x0000000000000000),
+    (0x153b9, 0x0000010000170400),
+    (0x15329, 0x0000000000000000),
+    (0x153c1, 0x0000000000000000),
+    (0x15339, 0x0000000000000000),
+    (0x153d1, 0x0000000000000000),
+    (0x15319, 0x0000000000000000),
+    (0x15349, 0x0000000004040404),
+];
+
+#[test]
+fn native_m5_partial_programs_match_every_write() {
+    let (p, controls) = reference();
+    let store = build_partial_store_registers(&p, &controls).unwrap();
+    let resume = build_partial_resume_registers(&p, &controls).unwrap();
+    let load = build_partial_load_registers(&p, &controls).unwrap();
+    assert_eq!(store.map(|r| (r.number, r.value)), PARTIAL_STORE);
+    assert_eq!(resume.map(|r| (r.number, r.value)), PARTIAL_RESUME);
+    assert_eq!(load.map(|r| (r.number, r.value)), PARTIAL_LOAD);
+}

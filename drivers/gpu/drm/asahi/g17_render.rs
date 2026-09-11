@@ -869,7 +869,7 @@ pub(crate) const fn g17p_render_lifecycle_pair(
     ))
 }
 
-fn partial_store_registers(
+pub(crate) fn partial_store_registers(
     p: &G17pRenderParameters,
 ) -> [RegisterWrite; PARTIAL_STORE_REGISTER_COUNT] {
     [
@@ -892,7 +892,7 @@ fn partial_store_registers(
     ]
 }
 
-fn partial_resume_registers(
+pub(crate) fn partial_resume_registers(
     p: &G17pRenderParameters,
 ) -> [RegisterWrite; PARTIAL_RESUME_REGISTER_COUNT] {
     [
@@ -922,7 +922,7 @@ fn partial_resume_registers(
     ]
 }
 
-fn partial_load_registers(
+pub(crate) fn partial_load_registers(
     p: &G17pRenderParameters,
 ) -> [RegisterWrite; PARTIAL_LOAD_REGISTER_COUNT] {
     [
