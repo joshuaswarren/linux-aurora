@@ -37,6 +37,13 @@ done
 # to modprobe, but the initramfs must not start it during automatic cold boot.
 mkdir -p "$task_ramfs/etc/modprobe.d"
 printf 'blacklist asahi\n' >"$task_ramfs/etc/modprobe.d/m5-gpu-diagnostic.conf"
+# Mode 12 uses the private, locally captured M5 graphics reference bundle.
+# Other diagnostic modes remain available without a graphics capture.
+task_graphics_bundle="$task_root/artifacts/gpu/m5-25g76-graphics.bin"
+if [[ -f "$task_graphics_bundle" ]]; then
+    install -Dm600 "$task_graphics_bundle" \
+        "$task_ramfs/lib/firmware/asahi/m5-25g76-graphics.bin"
+fi
 (cd "$task_ramfs"; find . -print0 | cpio --null -o --format=newc --owner=0:0 2>/dev/null | gzip -9) \
     >"$task_out/initramfs.cpio.gz"
 (cd "$task_out"; sha256sum Image t8142-j813.dtb kernel.config apple-ave.ko initramfs.cpio.gz > boot-SHA256SUMS)

@@ -28,6 +28,8 @@ mod graphics_memory;
 mod graphics_usc;
 #[path = "m5_graphics_job.rs"]
 mod graphics_job;
+#[path = "m5_graphics_queues.rs"]
+mod graphics_queues;
 
 const KERNEL_BASE: u64 = 0xffff_fc20_0000_0000;
 const PRIVATE_BASE: u64 = KERNEL_BASE + 0x2_0000;
@@ -57,6 +59,7 @@ pub(crate) struct M5FirmwareMemory {
     registers: KVec<mmu::KernelMapping>,
     queue_probe: Option<M5QueueProbe>,
     program: Option<M5ProgramMemory>,
+    graphics: Option<(graphics_job::M5GraphicsJob, graphics_queues::M5GraphicsQueues)>,
     report_counts: [[u32; 2]; 2],
     trace_printed: [u32; 2],
     compute_kick_observed: bool,
@@ -219,17 +222,17 @@ impl M5FirmwareMemory {
         // Writes to all CPU WC mappings precede any future handoff. Only
         // the two measured control openings are present; work rings and
         // later compute/render descriptors remain unsubmitted.
-        let queue_probe = if probe_kind >= 3 {
+        let queue_probe = if (3..=11).contains(&probe_kind) {
             Some(M5QueueProbe::new(dev, &uat, probe_kind >= 4)?)
         } else {
             None
         };
-        let program = if probe_kind >= 5 {
+        let program = if (5..=11).contains(&probe_kind) {
             Some(M5ProgramMemory::new(dev, &uat, probe_kind >= 6, probe_kind == 11)?)
         } else {
             None
         };
-        if probe_kind >= 6 {
+        if (6..=11).contains(&probe_kind) {
             let descriptor = program.as_ref().ok_or(EINVAL)?.uma_descriptor()?;
             uma.with_bytes_mut(|out| {
                 for (index, word) in descriptor.into_iter().enumerate() {
@@ -238,9 +241,30 @@ impl M5FirmwareMemory {
                 Ok(())
             })?;
         }
+        let graphics = if probe_kind == 12 {
+            let job = graphics_job::M5GraphicsJob::new(dev, &uat)?;
+            let queues = graphics_queues::M5GraphicsQueues::new(dev, &uat, &job)?;
+            let pb = job.parameter_descriptor()?;
+            pbdesc.with_bytes_mut(|out| {
+                let base = graphics_job::PB_HARDWARE_ID as usize * 16;
+                for (index, word) in pb.into_iter().enumerate() {
+                    out[base + index * 4..base + index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+                }
+                Ok(())
+            })?;
+            let usc = job.uma_descriptor();
+            uma.with_bytes_mut(|out| {
+                let base = graphics_usc::HARDWARE_ID as usize * 32;
+                for (index, word) in usc.into_iter().enumerate() {
+                    out[base + index * 8..base + index * 8 + 8].copy_from_slice(&word.to_le_bytes());
+                }
+                Ok(())
+            })?;
+            Some((job, queues))
+        } else { None };
         fence(Ordering::SeqCst);
         Ok(Self { primary_root, secondary_root, shared, private, region_a, region_c, fwctl, aon, qos,
-                  pbdesc, uma, completions, aliases, registers, queue_probe, program,
+                  pbdesc, uma, completions, aliases, registers, queue_probe, program, graphics,
                   report_counts: [[0; 2]; 2], trace_printed: [0; 2],
                   compute_kick_observed: false, compute_dispatch_returned: false, uat })
     }
@@ -321,8 +345,61 @@ impl M5FirmwareMemory {
         self.program.as_mut().ok_or(EINVAL)?.validate_unsubmitted()
     }
 
-    pub(crate) fn power_status(&self) -> Result<[u32; 3]> {
-        Ok(self.queue_probe.as_ref().ok_or(EINVAL)?.power_status())
+    pub(crate) fn power_status(&self) -> Result<Option<[u32; 3]>> {
+        // The graphics path has no compute-only DATA observer. Missing
+        // observation is explicit; idle-policy retirement uses real ACKs.
+        Ok(self.queue_probe.as_ref().map(M5QueueProbe::power_status))
+    }
+
+    pub(crate) fn graphics_status(&mut self) -> Result<([[u32; 3]; 2], [[u32; 3]; 2], [u32; 5])> {
+        let mut outer = [[0; 3]; 2];
+        for stage in 0..2 {
+            let base = init::WORK_STATE_GRID_OFFSETS[6 + stage];
+            for index in 0..3 {
+                outer[stage][index] = self.private.read_u32(PRIVATE_BASE
+                    + (base + index * init::CHANNEL_STATE_SPACING) as u64)?;
+            }
+        }
+        let (job, queues) = self.graphics.as_mut().ok_or(EINVAL)?;
+        Ok((outer, queues.counters()?, job.progress()?))
+    }
+
+    pub(crate) fn graphics_result(&mut self) -> Result<crate::m5_graphics_bundle::TriangleResult> {
+        self.graphics.as_mut().ok_or(EINVAL)?.0.result()
+    }
+
+    pub(crate) fn publish_graphics_job(&mut self) -> Result {
+        let (outer, inner, progress) = self.graphics_status()?;
+        if outer != [[0; 3]; 2] || inner != [[0, 0, 3]; 2]
+            || progress != [2, 0, 0, 0, 0] { return Err(EBUSY); }
+        self.graphics.as_mut().ok_or(EINVAL)?.0.publish_context()?;
+        self.shared.with_bytes_mut(|out| {
+            for stage in 0..2 {
+                let offset = init::WORK_RING_BUNDLE_OFFSETS[6 + stage];
+                if out[offset..offset + 24].iter().any(|byte| *byte != 0) {
+                    return Err(EBUSY);
+                }
+            }
+            for stage in 0..2 {
+                let offset = init::WORK_RING_BUNDLE_OFFSETS[6 + stage];
+                let record = &mut out[offset..offset + 24];
+                let address = graphics_queues::M5GraphicsQueues::queue_address(stage)?;
+                record[8..16].copy_from_slice(&address.to_le_bytes());
+                record[16..20].copy_from_slice(&2u32.to_le_bytes());
+                record[20..22].copy_from_slice(&3u16.to_le_bytes());
+                record[22] = graphics_job::QUEUE_IDS[stage];
+                record[23] = 1;
+            }
+            Ok(())
+        })?;
+        fence(Ordering::SeqCst);
+        for stage in 0..2 {
+            let producer = init::WORK_STATE_GRID_OFFSETS[6 + stage]
+                + 2 * init::CHANNEL_STATE_SPACING;
+            self.private.write_u32(PRIVATE_BASE + producer as u64, 1)?;
+        }
+        fence(Ordering::SeqCst);
+        Ok(())
     }
 
     pub(crate) fn publish_idle_wake(&mut self) -> Result {

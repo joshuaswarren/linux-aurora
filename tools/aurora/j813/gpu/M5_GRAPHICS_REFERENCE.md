@@ -211,3 +211,30 @@ resource byte, changed page-table byte, inconsistent leaf receipt, unstable
 context flag and a failed native pixel result. Raw host descriptors and
 resource dumps stay in private capture artifacts; they are not embedded
 as Linux addresses or published as a general-purpose graphics replay.
+
+## Linux graphics submission diagnostic
+
+Diagnostic mode 12 now constructs Linux-owned TA and fragment resources,
+paired priority-2 SKSM queues, a fragment dependency on the TA completion
+stamp, and shared context mappings. The RAM payload builder includes the
+private local `asahi/m5-25g76-graphics.bin` bundle when available. After a
+fresh GPU diagnostic boot has released its console, run
+`M5_FW_TRACE=0x203 python gpu/run-m5-queue-install-probe.py 12`.
+
+The first hardware run on 2026-09-11 consumed both outer queue records
+(`[[1,1,1],[1,1,1]]`), but neither inner queue advanced
+(`[[0,0,3],[0,0,3]]`). All 65,536 output pixels retained their sentinel
+value. The transaction returned `EIO`; both firmware stop requests
+succeeded, and resource owners remain retained until reboot. The console
+runner correctly reported failure even though module insertion returned
+zero. This is a submission diagnostic, not a verified Linux graphics draw.
+
+The next experiment must separate initial queue installation from draw
+submission, following the qualified compute sequence. The current combined
+submission places the draw descriptor before its first installation command;
+whether that ordering explains the stall remains unproven. Do not unload
+the module or retry firmware startup within the retained failed boot.
+
+Current milestones: Linux compute rendering and native macOS graphics
+capture are proven. Linux TA/fragment execution is in progress; Mesa/OpenGL
+and DCP presentation in XFCE remain unproven.
