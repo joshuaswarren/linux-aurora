@@ -70,7 +70,7 @@ struct M5Session {
     roles: [M5Role; 2],
     memory: Option<M5FirmwareMemory>,
     uat: Arc<mmu::Uat>,
-    _registers: regs::Resources,
+    registers: regs::Resources,
     dev: ARef<AsahiDevice>,
 }
 
@@ -90,6 +90,7 @@ impl M5Session {
     }
 
     fn initialize(&mut self, probe_kind: u32) -> Result {
+        self.registers.m5_match_pmgr_boot_control()?;
         for index in [1, 0] {
             let role = &mut self.roles[index];
             role.provider.start_cpu()?;
@@ -109,6 +110,7 @@ impl M5Session {
         self.uat.confirm_t8140_primary_high_root(roots)?;
         self.uat.mirror_t8140_secondary_high_root()?;
         dev_info!(self.dev.as_ref(), "M5_INIT retained memory graph mapped\n");
+        self.registers.m5_pre_initdata_clear()?;
 
         // M5's own trace publishes and ACKs GFX1 first (133/137), then GFX
         // (160/164). The Neo's opposite ordering is not used here.
@@ -121,6 +123,9 @@ impl M5Session {
             Pin::new(&mut role.rtkit).send_message(0x20, message)?;
             dev_info!(self.dev.as_ref(), "M5_INIT role={} published root={:#x}\n", index, address);
             for _ in 0..200 {
+                if self.memory.as_mut().ok_or(EIO)?.drain_reports(&self.dev)? {
+                    return Err(EIO);
+                }
                 if role.state.crashed.load(Ordering::Acquire) {
                     return Err(EIO);
                 }
@@ -163,6 +168,7 @@ impl M5Session {
         Pin::new(&mut self.roles[0].rtkit).send_message(0x21, 0x0084_0000_0000_0011)?;
         let mut awake = false;
         for _ in 0..1000 {
+            if memory.drain_reports(&self.dev)? { return Err(EIO); }
             if self.roles.iter().any(|role| role.state.crashed.load(Ordering::Acquire)) {
                 dev_err!(self.dev.as_ref(), "M5_POWER firmware crash {:x?}\n", memory.power_status()?);
                 return Err(EIO);
@@ -190,6 +196,10 @@ impl M5Session {
         Pin::new(&mut self.roles[0].rtkit).send_message(0x21, 0x0083_0000_0000_000a)?;
         dev_info!(self.dev.as_ref(), "M5_COMPUTE first SKSM kick submitted qid11 stamp1 context3\n");
         for poll in 0..10000 {
+            if memory.drain_reports(&self.dev)? {
+                dev_err!(self.dev.as_ref(), "M5_COMPUTE firmware requested GPU restart\n");
+                break;
+            }
             if self.roles.iter().any(|role| role.state.crashed.load(Ordering::Acquire)) { break; }
             if [0, 100, 1000, 5000].contains(&poll) {
                 dev_info!(self.dev.as_ref(), "M5_COMPUTE poll={} firmware/UMA/completion={:x?}\n",
@@ -205,6 +215,7 @@ impl M5Session {
             }
             fsleep(Delta::from_millis(1));
         }
+        for _ in 0..4 { memory.drain_reports(&self.dev)?; }
         let result = memory.compute_result()?;
         dev_err!(self.dev.as_ref(), "M5_COMPUTE final firmware/UMA/completion={:x?}\n",
             memory.compute_observations()?);
@@ -225,6 +236,9 @@ impl M5Session {
                 .send_message(0x21, g17_rtkit::encode_power_transition_end())?;
         }
         for _ in 0..1000 {
+            if self.memory.as_mut().ok_or(EIO)?.drain_reports(&self.dev)? {
+                return Err(EIO);
+            }
             if self.roles.iter().any(|role| role.state.crashed.load(Ordering::Acquire)) {
                 return Err(EIO);
             }
@@ -247,6 +261,7 @@ impl M5Session {
         // Native M5 encodes CL_2 as 2 | (2 << 2), on GFX endpoint 0x21.
         Pin::new(&mut self.roles[0].rtkit).send_message(0x21, 0x0083_0000_0000_000a)?;
         for _ in 0..1000 {
+            if memory.drain_reports(&self.dev)? { return Err(EIO); }
             if self.roles.iter().any(|role| role.state.crashed.load(Ordering::Acquire)) {
                 dev_err!(self.dev.as_ref(), "M5_QUEUE firmware crash after {:?}\n", memory.queue_probe_status()?);
                 return Err(EIO);
@@ -301,7 +316,7 @@ impl M5Runtime {
         };
         let mut session = KBox::new(M5Session {
             roles: [make_role(0, gfx)?, make_role(1, gfx1)?],
-            memory: None, uat, _registers: registers, dev,
+            memory: None, uat, registers, dev,
         }, GFP_KERNEL)?;
         // From this point every path returns the retained platform owner,
         // even when firmware rejects the graph. Failed probe unwinding must

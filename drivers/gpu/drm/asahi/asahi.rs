@@ -71,6 +71,10 @@ kernel::module_platform_driver! {
     description: "AGX GPU driver for Apple silicon SoCs",
     license: "Dual MIT/GPL",
     params: {
+        m5_fw_trace: u32 {
+            default: 0,
+            description: "M5 primary trace classes: power bit 0, submission bit 1, recovery classifier bit 9",
+        },
         m5_initdata_test: u32 {
             default: 0,
             description: "M5 fresh RAM boot: 1=initdata ACKs, 2=openings, 3=queue, 4=scheduler, 5=context, 6=one compute; then stop, no DRM",

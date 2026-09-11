@@ -100,6 +100,38 @@ for name, base in [('gfx-asc', 0x582050000), ('gfx1-asc', 0x582850000)]:
     emit('VECTOR_TRACE_ARMED', role=name, base=hex(base))
 
 
+host_gpu_write_tracers = []
+host_gpu_write_count = 0
+if os.environ.get('M5_GPU_TRACE_HOST_WRITES') == '1':
+    # Observe writes issued by the native AP driver, not GPU firmware CPU
+    # accesses. The existing ASC observers own the two mailbox apertures.
+    # No callback issues a proxy request or changes the hardware write.
+    if hv.adt['/arm-io/sgx'].get_reg(0) != (0x580000000, 0x4000000):
+        raise RuntimeError('M5 GPU aperture differs from the measured target')
+
+    def host_gpu_write(event):
+        global host_gpu_write_count
+        if host_gpu_write_count >= 20000:
+            return
+        host_gpu_write_count += 1
+        emit('HOST_GPU_WRITE', address=hex(event.addr),
+             width=1 << int(event.flags.WIDTH), value=hex(event.data),
+             cpu=int(event.flags.CPU), pc=hex(event.pc))
+        if host_gpu_write_count == 20000:
+            emit('HOST_GPU_WRITE_LIMIT', limit=20000)
+
+    for ordinal, (start, end) in enumerate([
+            (0x580000000, 0x582600000),
+            (0x582688000, 0x582e00000),
+            (0x582e88000, 0x584000000)]):
+        name = 'M5_HOST_GPU_WRITE_' + str(ordinal)
+        window = irange(start, end - start)
+        hv.add_tracer(window, name, TraceMode.ASYNC, write=host_gpu_write)
+        host_gpu_write_tracers.append((window, name))
+    emit('HOST_GPU_WRITE_TRACE_ARMED', max_records=20000,
+         excludes='GFX and GFX1 ASC mailbox apertures')
+
+
 if os.environ.get('M5_GPU_CAPTURE_INIT') == '1':
     # Only INBOX0 temporarily becomes synchronous. Its payload write occurs
     # before the INBOX1 publication, so the firmware cannot consume this

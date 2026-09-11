@@ -50,6 +50,8 @@ pub(crate) struct M5FirmwareMemory {
     registers: KVec<mmu::KernelMapping>,
     queue_probe: Option<M5QueueProbe>,
     program: Option<M5ProgramMemory>,
+    report_counts: [[u32; 2]; 2],
+    trace_printed: [u32; 2],
     uat: Arc<mmu::Uat>,
 }
 
@@ -162,6 +164,15 @@ impl M5FirmwareMemory {
         let views = init::PrimaryRegionViews {
             sentinel_high: SENTINEL_BASE, alias_high: [PBDESC_BASE, UMA_BASE],
         };
+        let trace_mask = *crate::module_parameters::m5_fw_trace.value();
+        if trace_mask & !0x203 != 0 { return Err(EINVAL); }
+        // Exact M5 GFX firmware 0x1fadc retains root+0xa8 (status A),
+        // then 0x3074..0x3088 copies status-A+0 into its trace flags.
+        // Bits 0 and 1 gate power/submission records; 0x6260 reads the
+        // NEXT byte and tests bit 1 (full-word bit 9) for recovery summary
+        // 0x909. Publish through the host field before either descriptor.
+        let native_trace = private.read_u32(primary.status_a)?;
+        private.write_u32(primary.status_a, native_trace | trace_mask)?;
         shared.with_bytes_mut(|out| {
             init::encode_m5_25g76_hw_data(completion_bindings, qos.iova(),
                 &mut out[..init::M5_25G76_HW_DATA_SIZE]).map_err(|_| EINVAL)?;
@@ -220,7 +231,61 @@ impl M5FirmwareMemory {
         }
         fence(Ordering::SeqCst);
         Ok(Self { primary_root, secondary_root, shared, private, region_a, region_c, fwctl, aon, qos,
-                  pbdesc, uma, completions, aliases, registers, queue_probe, program, uat })
+                  pbdesc, uma, completions, aliases, registers, queue_probe, program,
+                  report_counts: [[0; 2]; 2], trace_printed: [0; 2], uat })
+    }
+
+    /// Drain M5 report channels using the native producer contracts.
+    /// GFX 0x6ca8..0x6d18 emits 256 x 0x48 event records; 0x17e18
+    /// emits 512 x 0x48 trace records. In each cursor object the host owns
+    /// +0 and firmware owns +0x20. Copy before releasing each slot.
+    pub(crate) fn drain_reports(&mut self, dev: &AsahiDevice) -> Result<bool> {
+        let mut recovery = false;
+        for (role, status_offset) in [0xee40u64, 0xc3100].into_iter().enumerate() {
+            for (channel, (cursor_offset, ring_offset, capacity)) in
+                [(0x40u64, 0x2c0u64, 256u32), (0x240, 0xa6ac0, 512)]
+                    .into_iter().enumerate() {
+                let cursor = PRIVATE_BASE + status_offset + cursor_offset;
+                let ring = (status_offset + ring_offset) as usize;
+                for _ in 0..128 {
+                    let consumer = self.private.read_u32(cursor)?;
+                    let producer = self.private.read_u32(cursor + 0x20)?;
+                    if consumer >= capacity || producer >= capacity { return Err(EIO); }
+                    if consumer == producer { break; }
+                    fence(Ordering::Acquire);
+                    let offset = ring + consumer as usize * 0x48;
+                    let mut raw = [0u8; 0x48];
+                    self.private.with_bytes_mut(|bytes| {
+                        raw.copy_from_slice(bytes.get(offset..offset + 0x48).ok_or(EINVAL)?);
+                        Ok(())
+                    })?;
+                    let word = |off: usize| u32::from_le_bytes(raw[off..off + 4].try_into().unwrap());
+                    let qword = |off: usize| u64::from_le_bytes(raw[off..off + 8].try_into().unwrap());
+                    let count = self.report_counts[role][channel];
+                    if channel == 0 {
+                        dev_info!(dev.as_ref(), "M5_EVENT role={} ordinal={} type={} payload={:x?}\n",
+                            role, count, word(0), [qword(4), qword(12), qword(20), qword(28), qword(36)]);
+                        recovery |= word(0) == 4;
+                    } else {
+                        let args = [qword(12), qword(20), qword(28), qword(36)];
+                        // Exact M5 0x24eb4/0x26754 emit zero-argument
+                        // processing-loop brackets. Count and consume them
+                        // without spending the diagnostic print budget.
+                        let loop_marker = word(0) == 5 && args == [0; 4]
+                            && matches!(word(44) & 0x00ff_ffff, 0x105 | 0x106);
+                        if !loop_marker && self.trace_printed[role] < if role == 0 { 512 } else { 16 } {
+                            dev_info!(dev.as_ref(), "M5_TRACE role={} ordinal={} timestamp={} type={} id={:#x} args={:x?}\n",
+                                role, count, qword(4), word(0), word(44), args);
+                            self.trace_printed[role] += 1;
+                        }
+                    }
+                    self.report_counts[role][channel] = count.saturating_add(1);
+                    fence(Ordering::SeqCst);
+                    self.private.write_u32(cursor, (consumer + 1) % capacity)?;
+                }
+            }
+        }
+        Ok(recovery)
     }
 
     pub(crate) fn validate_program_context(&mut self) -> Result<[u64; 2]> {

@@ -18,6 +18,8 @@ parser.add_argument('--capture-init', action='store_true',
                     help='Capture each firmware graph before its initialization doorbell is published')
 parser.add_argument('--capture-startup', action='store_true',
                     help='Also capture the first 24 native GPU work/control publications')
+parser.add_argument('--trace-host-gpu-writes', action='store_true',
+                    help='Observe native CPU writes across the GPU aperture, excluding ASC mailboxes')
 args = parser.parse_args()
 os.umask(0o077)
 output = args.output.resolve()
@@ -51,6 +53,7 @@ os.environ.update({
     'M5_GPU_TRACE_DIR': str(output),
     'M5_GPU_CAPTURE_INIT': '1' if args.capture_init or args.capture_startup else '0',
     'M5_GPU_CAPTURE_STARTUP': '1' if args.capture_startup else '0',
+    'M5_GPU_TRACE_HOST_WRITES': '1' if args.trace_host_gpu_writes else '0',
     'M5_N1_TRACE': '1', 'M5_SEP_TRACE': '1', 'M5_PMP_TRACE': '0',
     'M5_PMGR_TRACE': '0', 'M5_CLPC_SAMPLER_SHADOW': '0',
 })
