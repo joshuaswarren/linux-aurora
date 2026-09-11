@@ -142,7 +142,10 @@ pub(crate) struct M5ComputeParameters {
     pub(crate) work_ordinal: u8,
     pub(crate) robustness: u64,
     pub(crate) operand_state_base: u64,
-    pub(crate) execution_gate: u64,
+    /// Owned UMA pool slot, copied from native host descriptor +0x788 by
+    /// 25G76 generateRegisterList at 0x89e38dc..0x89e391c. This must match
+    /// shared-control +8 and the populated hardware UMA descriptor slot.
+    pub(crate) private_pool_hw_id: u64,
     /// Native command descriptor +0x530, copied to register 0xd4a1.
     pub(crate) descriptor_control_530: u64,
     /// Descriptor +0x538; zero selects the native 0x60 default. The native
@@ -209,7 +212,7 @@ pub(crate) fn build_m5_compute_registers(
         M5ComputeRegister::new(0x0a731, 0),
         M5ComputeRegister::new(0x10201, context),
         M5ComputeRegister::new(0x10428, context),
-        M5ComputeRegister::new(0x14028, p.execution_gate),
+        M5ComputeRegister::new(0x14028, p.private_pool_hw_id),
         M5ComputeRegister::new(0x14070, p.robustness | 1),
         M5ComputeRegister::new(0x10229, add(p.operand_state_base, 0x1e800)?),
         M5ComputeRegister::new(0x140a8, add(p.operand_state_base, 0x1f000)?),
@@ -254,7 +257,7 @@ mod tests {
             work_ordinal: 0xc3,
             robustness: 0x1000,
             operand_state_base: 0x70_0400_0000,
-            execution_gate: 0,
+            private_pool_hw_id: 0,
             descriptor_control_530: 0x54b,
             descriptor_control_538: 0xf5,
             descriptor_flag_60a: false,

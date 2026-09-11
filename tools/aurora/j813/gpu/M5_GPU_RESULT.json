@@ -1,7 +1,40 @@
 {
-  "date": "2026-09-10",
+  "date": "2026-09-11",
   "target": "J813 / T8142 / M5",
   "kernel": "7.1.6-aurora-j813-gpu-v9",
+  "latest_linux_compute": {
+    "scope": "One fixed compute job on a fresh native Linux RAM boot; earlier stage-specific records below are historical",
+    "module_parameter": "m5_initdata_test=10",
+    "trace_mask": "0x203",
+    "fresh_ram_boots_verified": 1,
+    "queue_id": 11,
+    "context_id": 3,
+    "stamp": 1,
+    "shader_formula": "out[i] = in[i] * 3 + 5",
+    "shader_image_bytes": 1024,
+    "private_pool_hw_id": 0,
+    "compute_register_14028_matches_owned_pool": true,
+    "input_values_unchanged": 1024,
+    "exact_output_values_verified": 1024,
+    "output_sentinels_remaining": 0,
+    "outer_queues_retired": [2, 2, 2],
+    "inner_queues_retired": [4, 4, 4],
+    "gpu_restart_report_observed": false,
+    "transaction_succeeded": true,
+    "firmware_stop_requests_succeeded": 2,
+    "retained_ram_objects": 33,
+    "retained_physical_pages": 243,
+    "retained_read_errors": 0,
+    "retained_object_hashes_verified": true,
+    "outputs_independently_verified_from_retained_ram": true,
+    "asahi_module_sha256": "5ccefcfd4cab0f05a1dc519ea9a06b0acc66db1ab19557271e247a36e9ddb66f",
+    "console_log_sha256": "5ac31252c8fa87e0c477a74093a6852d72393837d6200c6fa0bbf2bbc2845dce",
+    "boot_log_sha256": "ec361716b6ab46cd3758d8cebf12d03aaf3556670c519515701a4eda7ee8c29d",
+    "shader_page_sha256": "32f033d1c45c805abc61f7fa1a805847ac648ddc0377a7a6f0f1450ea07d15f8",
+    "general_shader_compilation_qualified": false,
+    "render_node_exposed": false,
+    "dcp_presentation_qualified": false
+  },
   "gpu_identity": {
     "generation": "G17",
     "variant": "G",
@@ -118,8 +151,8 @@
     "queue_install_qualified": true,
     "scheduler_bind_qualified": true,
     "runtime_wired": true,
-    "runtime_scope": "Explicit mode6 queue, scheduler, context and event setup followed by one SKSM kick; no verified shader completion",
-    "linux_gpu_execution_qualified": false
+    "runtime_scope": "One verified fixed compute job through owned queue, scheduler, context and pool setup in mode10",
+    "linux_gpu_execution_qualified": true
   },
   "source_codecs": {
     "full_shared_cluster_bytes_matched": 163840,
@@ -153,7 +186,7 @@
     "kernel_build_passed": true,
     "ram_boot_retested_after_codec_changes": true,
     "runtime_wired": true,
-    "runtime_scope": "Explicit M5 diagnostics through one SKSM compute kick; no DRM registration or verified GPU execution"
+    "runtime_scope": "Explicit M5 diagnostics through one verified fixed SKSM compute job; no DRM registration"
   },
   "linux_program_context": {
     "fresh_ram_boots_passed": 1,
@@ -174,12 +207,14 @@
   "source_compute_program": {
     "native_captures_matched": 9,
     "native_completed_results_matched": 9,
-    "shader_bytes": 64,
+    "shader_body_bytes": 64,
+    "shader_image_bytes": 1024,
     "pipeline_bytes": 132,
     "cdm_bytes": 48,
     "kernel_build_passed": true,
     "full_dependency_closure_qualified": false,
-    "linux_execution_qualified": false
+    "linux_execution_qualified": true,
+    "qualification_scope": "The fixed first-compute program only"
   },
   "linux_rtkit": {
     "hello_epmap_roles_passed": 2,
@@ -345,7 +380,7 @@
     "shader_execution_qualified": false
   },
   "render_node": false,
-  "gpu_compute_qualified": false,
+  "gpu_compute_qualified": true,
   "gpu_rendering_qualified": false,
   "gpu_power_gating_qualified": false,
   "dcp_qualified": false,

@@ -31,6 +31,8 @@ phase_args.add_argument('--before-recovery', action='store_true',
                     help='Require mode8 admission frozen after the kick and before recovery')
 phase_args.add_argument('--after-live-snapshot', action='store_true',
                     help='Require mode9/10 live observations; capture the later retained RAM')
+phase_args.add_argument('--after-success', action='store_true',
+                    help='Require exact compute output, retired queues and no GPU restart')
 args = parser.parse_args()
 inventory_path, output_path = args.inventory, args.output
 inventory = json.loads(inventory_path.read_text())
@@ -43,6 +45,7 @@ reserved = [(props[name + '-base'], props[name + '-base'] + props[name + '-size'
 output_path.mkdir(mode=0o700, exist_ok=False)
 manifest = dict(phase=('Linux mode8 admission before recovery' if args.before_recovery
                       else 'Linux mode7 setup before compute' if args.before_compute
+                      else 'Linux verified compute completion' if args.after_success
                       else 'Linux live-status probe after compute' if args.after_live_snapshot
                       else 'Linux mode6 after compute') + ' after both firmware CPU stop requests',
                 device_memory_read=False, objects=[])
@@ -66,6 +69,11 @@ with Serial('/dev/cu.kis-01100000-ch-0', 115200, timeout=0.2) as port:
         raise RuntimeError('Stopped M5 RAM read timed out; leave target unchanged')
 
     probe_gate = (
+        "dmesg | grep -Eq 'requested probe mode=(6|9|10)$' "
+        "&& dmesg | grep -q 'M5_COMPUTE verified 1024 exact outputs, inputs unchanged, queues retired;' "
+        "&& dmesg | grep -q 'M5_INIT transaction result=Ok(())' "
+        "&& ! dmesg | grep -q 'M5_COMPUTE firmware requested GPU restart'"
+        if args.after_success else (
         "dmesg | grep -q 'requested probe mode=7' "
         "&& dmesg | grep -q 'M5_INIT transaction result=Ok(())' "
         "&& dmesg | grep -q '1024 untouched outputs, SKSM kick unpublished' "
@@ -80,7 +88,7 @@ with Serial('/dev/cu.kis-01100000-ch-0', 115200, timeout=0.2) as port:
         if args.before_recovery else (
         "dmesg | grep -Eq 'requested probe mode=(9|10)$' "
         "&& dmesg | grep -q 'M5_LIVE_SNAPSHOT sample=3'"
-        if args.after_live_snapshot else "dmesg | grep -q 'requested probe mode=6'")))
+        if args.after_live_snapshot else "dmesg | grep -q 'requested probe mode=6'"))))
     identity = command("grep -q apple,j813 /proc/device-tree/compatible "
         "&& [ $(uname -r) = 7.1.6-aurora-j813-gpu-v9 ] "
         "&& [ -d /sys/module/asahi ] "

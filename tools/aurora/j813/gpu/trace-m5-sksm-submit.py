@@ -64,7 +64,7 @@ if _m5_sksm_replay_config is not None:
             or any(not isinstance(_m5_sksm_replay_config[k], str)
                    or not Path(_m5_sksm_replay_config[k]).is_absolute()
                    for k in ('native', 'linux', 'workload'))
-            or _m5_sksm_replay_config.get('variant', 'linux-pages') not in ('linux-pages', 'shader-body-only', 'shader-record', 'shader-prefix')
+            or _m5_sksm_replay_config.get('variant', 'linux-pages') not in ('linux-pages', 'shader-body-only', 'shader-record', 'shader-prefix', 'shader-prefix-linux-dispatch')
             or not (_m5_sksm_replay_config.get('stamp', 1) == 'captured'
                     or (type(_m5_sksm_replay_config.get('stamp', 1)) is int
                         and 1 <= _m5_sksm_replay_config.get('stamp', 1) < 256))
@@ -607,7 +607,7 @@ def _m5_sksm_submit(ctx):
                     try:
                         replay.restore()
                         manifest['program_replay_state'] = replay.receipt['state']
-                        print('M5_PROGRAM_REPLAY_RESTORED: three original native program pages verified')
+                        print('M5_PROGRAM_REPLAY_RESTORED: all journaled native bytes verified')
                     except Exception as error:
                         manifest['program_replay_restore_error'] = str(error)
                         print('M5_PROGRAM_REPLAY_RESTORE_FAILED', repr(error))
@@ -634,7 +634,9 @@ def _m5_sksm_submit(ctx):
                     hv.p.dc_civac, manifest['compute_context'],
                     int(hv.u.adt['/arm-io/sgx'].gpu_region_base), directory)
                 hv.m5_program_replay = replay
-                replay.prepare(**{k: v for k, v in _m5_sksm_replay_config.items() if k != 'stamp'})
+                gpu_descriptor, = struct.unpack_from('<Q', ring, entry_offset + 0x10)
+                replay.prepare(descriptor_address=gpu_descriptor,
+                    **{k: v for k, v in _m5_sksm_replay_config.items() if k != 'stamp'})
                 replay.apply()
                 os.environ.pop('M5_SKSM_PROGRAM_REPLAY', None)
                 manifest.update(program_memory_written=True,

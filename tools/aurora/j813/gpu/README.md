@@ -6,15 +6,24 @@ firmware processors now complete RTKit startup and acknowledge Linux-owned
 initialization data in the native RAM-boot experiment. Linux also registers
 an owned SKSM compute queue, binds its scheduler control, and verifies the
 firmware's retained records.
-An isolated execution context, program pages and initial compute pool now
-support a first SKSM kick. Both command queues retire and firmware accounts
-for the kick, then a GPU restart report appears with no completion or
-shader result. It does not yet
-execute verified GPU work or expose a render node. DCP presentation is a later,
-independent qualification; neither a software desktop nor encoder success
-is evidence of GPU rendering.
+An isolated execution context, corrected shader setup and owned compute pool
+now execute one verified SKSM compute job under Linux: all 1,024 outputs match,
+inputs remain unchanged, and both command queues retire without a reported
+GPU restart. Register `0x14028` must select the populated UMA pool slot; the
+earlier probe owned slot 0 but incorrectly selected slot 2.
+This is a bounded fixed-program diagnostic. It does not expose a render node
+or qualify general shader compilation, graphics rendering or DCP presentation.
 
-## Hardware evidence, 2026-09-10
+## First Linux compute, 2026-09-11
+
+The fresh mode10 RAM boot passed the exact `out = in * 3 + 5` check, followed
+by successful firmware stop requests with all memory owners retained.
+Native replay independently verified the corrected shader image and Linux's
+dispatch identities. The pool verifier now rejects a register/owner mismatch,
+and 48 capture/replay tests plus five Rust codec tests pass.
+See `M5_FIRST_COMPUTE_REFERENCE.md` for the causal comparison and evidence.
+
+## Earlier hardware evidence, 2026-09-10 and 2026-09-11
 
 - A fresh RAM boot with `m5_initdata_test=7` retired compute descriptor
   tag 3 and channel configuration tag 15, leaving tag 14 unpublished.

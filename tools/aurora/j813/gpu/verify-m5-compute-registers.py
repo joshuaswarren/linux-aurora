@@ -44,7 +44,7 @@ fn main() {
     let p = M5ComputeParameters {
         preempt_base: a[0], cdm_base: a[1], dispatch_identity: a[2],
         context_id: u8::try_from(a[3]).unwrap(), work_ordinal: u8::try_from(a[4]).unwrap(),
-        robustness: a[5], operand_state_base: a[6], execution_gate: a[7],
+        robustness: a[5], operand_state_base: a[6], private_pool_hw_id: a[7],
         descriptor_control_530: a[8], descriptor_control_538: a[9],
         descriptor_flag_60a: a[10] != 0, descriptor_flag_60b: a[11] != 0,
     };
@@ -105,6 +105,12 @@ fn main() {
                     or hashlib.sha256(raw).hexdigest() != descriptor['sha256']):
                 raise ValueError('Native descriptor does not match its stable receipt')
             control_530, control_538 = struct.unpack_from('<QQ', raw, 0x530)
+            # Independent input for register 0x14028, rather than reading
+            # that register back as its own expected value.
+            hardware_id, = struct.unpack_from('<i', raw, 0x788)
+            if not 0 <= hardware_id < 512:
+                raise ValueError('Native private pool hardware ID is outside the UMA table')
+            values[7] = hardware_id
             controls = [control_530, control_538, raw[0x60a] & 1, raw[0x60b] & 1]
             control_source = 'native-descriptor'
         else:
