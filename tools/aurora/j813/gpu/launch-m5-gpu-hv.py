@@ -14,6 +14,8 @@ root = Path(__file__).resolve().parent.parent
 hvroot = root / 'hv'
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('output', type=Path)
+parser.add_argument('--carrier', choices=('32', '33'), default='32',
+                    help='Exact RAM carrier profile (33 tests the empty-PTE partial-update fix)')
 parser.add_argument('--capture-init', action='store_true',
                     help='Capture each firmware graph before its initialization doorbell is published')
 parser.add_argument('--capture-startup', action='store_true',
@@ -30,17 +32,24 @@ if args.native_fw_trace_mask and not (args.capture_init or args.capture_startup)
 os.umask(0o077)
 output = args.output.resolve()
 output.mkdir(mode=0o700)
+carriers = {
+    '32': (
+        '71d486a98638b238e1680200bd0d2da2748db19cd1f5a959cff4550289b098cd',
+        '870732cd794cff77848122bdc28aee246e1120640be3f355ad83432f948bf69d',
+        '93e7126a1ccaa35d93464a865b7f50084bbb8ed160fab514506d458477024f39'),
+    '33': (
+        'b60a077cf595693e5995df8b9bccdced3d4215f2f21fc80e6565c8d58d06665a',
+        '572855dd68f3582a216ced435bfb3156f4992e12a3325e86eee24d4e6606d929',
+        '406efb462ed05660152a5976de3f630e20f0a35d683c443c15f75342964decd1'),
+}
+carrier_bin, carrier_elf, carrier_raw_elf = carriers[args.carrier]
 expected = {
     'kernel/25G76__Mac17,3/kernelcache.release.Mac17,2_3_4':
         '43263b4f4b7cd29cb0cc487ba944b5bf0a8f3b24b8b1cad875b796d9af026189',
-    'artifacts/carrier-32/m1n1.bin':
-        '71d486a98638b238e1680200bd0d2da2748db19cd1f5a959cff4550289b098cd',
-    'artifacts/carrier-32/m1n1.elf':
-        '870732cd794cff77848122bdc28aee246e1120640be3f355ad83432f948bf69d',
-    'm1n1/build/m1n1.bin':
-        '71d486a98638b238e1680200bd0d2da2748db19cd1f5a959cff4550289b098cd',
-    'm1n1/build/m1n1-raw.elf':
-        '93e7126a1ccaa35d93464a865b7f50084bbb8ed160fab514506d458477024f39',
+    f'artifacts/carrier-{args.carrier}/m1n1.bin': carrier_bin,
+    f'artifacts/carrier-{args.carrier}/m1n1.elf': carrier_elf,
+    'm1n1/build/m1n1.bin': carrier_bin,
+    'm1n1/build/m1n1-raw.elf': carrier_raw_elf,
 }
 for name, digest in expected.items():
     if hashlib.sha256((hvroot / name).read_bytes()).hexdigest() != digest:
