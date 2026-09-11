@@ -6,6 +6,37 @@ the Linux graphics implementation. Linux has a verified compute triangle;
 Linux vertex/fragment rendering, Mesa admission and DCP presentation remain
 unqualified.
 
+## Linux register codec
+
+`drivers/gpu/drm/asahi/m5_render.rs` now constructs the M5 main and partial
+register programs from shared render resources and explicit M5 controls.
+Every register number, value and position matches the captured reference:
+82 TA writes, 90 fragment writes, and 18/25/12 partial store/resume/load
+writes (227 total). The kernel compiles with the module included.
+
+M5 adds a second store-pipeline pair to each fragment program. Its tiler
+block words differ from G17P: the reference boundaries 12, 8 and 4 encode
+as `0x40200c` in ten-bit fields. Native reads these words from host descriptor
+`+0x1208/+0x120c` for both the ordinary and shadow tiling registers. The
+descriptor copies them from user command `+0x108/+0x10c`. The wider packing
+model is checked for rectangular dimensions on the host; dimensions beyond
+the captured reference have not yet been qualified on M5 hardware.
+
+Resource IDs and per-stage keys are caller inputs. The USC FList identifier
+is sign extended as in the native generator. PTC maxima use the native zero
+fallback of `0x60`. Geometry fields reject overflow and overlapping flag
+inputs, and TA dispatch bit zero is supplied separately for the two phases.
+
+Run `python3 drivers/gpu/drm/asahi/tests/test_m5_render.py` for six tests,
+including the complete native register vectors and ownership/geometry cases.
+The shared memory-backed policy and render-counter tests also pass. Three
+older G17P full-suite expectations reproduce on the unmodified parent.
+
+The codec is not yet called by a Linux graphics submission. Descriptor
+construction, owned graphics buffers and scheduler submission are the next
+integration steps. The existing Linux compute-triangle proof remains the
+current GPU execution milestone.
+
 ## Hardware evidence
 
 The reference produced 18,432 foreground pixels, 47,104 background pixels and

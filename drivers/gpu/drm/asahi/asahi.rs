@@ -51,6 +51,7 @@ mod mem;
 mod m5_channel;
 mod m5_compute;
 mod m5_compute_program;
+mod m5_render;
 mod m5_sksm;
 mod microseq;
 mod mmu;
