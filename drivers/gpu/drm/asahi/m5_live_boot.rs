@@ -145,22 +145,64 @@ impl M5Session {
         if probe_kind >= 2 {
             self.retire_openings()?;
         }
-        if probe_kind >= 3 {
+        if (3..=11).contains(&probe_kind) {
             self.install_queue_probe()?;
         }
-        if probe_kind >= 5 {
+        if (5..=11).contains(&probe_kind) {
             let roots = self.memory.as_mut().ok_or(EIO)?.validate_program_context()?;
             let triangle = probe_kind == 11;
             let page_count = if triangle { 7 } else { 6 };
             dev_info!(self.dev.as_ref(), "M5_CONTEXT prepared id3 roots={:x?}; pages={} triangle={} 1024 untouched outputs, no kicks\n",
                 roots, page_count, triangle);
         }
-        if probe_kind >= 6 {
+        if probe_kind == 12 {
+            self.retire_idle_policy()?;
+            self.submit_graphics()?;
+        } else if probe_kind >= 6 {
             self.retire_idle_policy()?;
             self.submit_compute(probe_kind != 7, probe_kind == 8, probe_kind >= 9,
                                 probe_kind >= 10)?;
         }
         Ok(())
+    }
+
+    fn submit_graphics(&mut self) -> Result {
+        let memory = self.memory.as_mut().ok_or(EIO)?;
+        dev_info!(self.dev.as_ref(), "M5_GRAPHICS prepared outer/inner/completion={:x?}\n",
+            memory.graphics_status()?);
+        memory.publish_graphics_job()?;
+        // Native priority2 channels: fragment (1 | 2<<2), then TA (0 | 2<<2).
+        // Both complete entries and roots precede either notification.
+        for channel in [9u64, 8] {
+            Pin::new(&mut self.roles[0].rtkit).send_message(0x21,
+                0x0083_0000_0000_0000 | channel)?;
+        }
+        for poll in 0..10000 {
+            if memory.drain_reports(&self.dev)? {
+                dev_err!(self.dev.as_ref(), "M5_GRAPHICS firmware requested GPU restart\n");
+                break;
+            }
+            if self.roles.iter().any(|role| role.state.crashed.load(Ordering::Acquire)) { break; }
+            let status = memory.graphics_status()?;
+            if [0, 100, 1000, 5000].contains(&poll) {
+                dev_info!(self.dev.as_ref(), "M5_GRAPHICS poll={} outer/inner/completion={:x?}\n", poll, status);
+            }
+            if status.0 == [[1; 3]; 2] && status.1 == [[3; 3]; 2] && status.2[0] == 0 {
+                let result = memory.graphics_result()?;
+                if result.verified() {
+                    dev_info!(self.dev.as_ref(), "M5_GRAPHICS verified native-program TA/fragment pixels={:?}; both queues retired; completion={:x?}\n",
+                        result, status.2);
+                    return Ok(());
+                }
+                dev_err!(self.dev.as_ref(), "M5_GRAPHICS retired with incorrect pixels={:?}\n", result);
+                break;
+            }
+            fsleep(Delta::from_millis(1));
+        }
+        for _ in 0..4 { memory.drain_reports(&self.dev)?; }
+        dev_err!(self.dev.as_ref(), "M5_GRAPHICS final outer/inner/completion={:x?} pixels={:?}\n",
+            memory.graphics_status()?, memory.graphics_result()?);
+        Err(EIO)
     }
 
     fn retire_idle_policy(&mut self) -> Result {

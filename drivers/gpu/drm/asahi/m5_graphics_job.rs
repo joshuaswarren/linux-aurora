@@ -24,6 +24,8 @@ const USC_STATISTICS: usize = 0x24000;
 const SCENES: usize = 0x30000;
 const SCENE_ZERO: usize = SCENES + 80 * 0x80;
 const TIMESTAMPS: usize = 0x38000;
+const STAMPS_A: usize = 0x28000;
+const STAMPS_B: usize = 0x2c000;
 const PAGE_LIST_HIGH: u64 = HIGH + 0x40000;
 const METRICS_HIGH: u64 = HIGH + 0x60000;
 const PAGE_LIST: u64 = 0x10_0023_8000;
@@ -34,6 +36,7 @@ const BLOCK_BYTES: usize = 0x80000;
 const PAGE_LIST_BYTES: usize = 0x1c000;
 const PAGE_COUNT: u32 = 48;
 pub(super) const PB_HARDWARE_ID: u32 = 0;
+pub(super) const QUEUE_IDS: [u8; 2] = [10, 11];
 
 pub(super) struct M5GraphicsJob {
     // The first owner's context retracts its roots before page release.
@@ -141,6 +144,34 @@ impl M5GraphicsJob {
                 m5_render::M5RenderUscState {
                     required_bytes: 0x934000, statistics: ta_usc.statistics + 0x40, ..ta_usc
                 }).map_err(|_| EINVAL)?;
+            // This bounded first submission owns hardware stamp1 in each
+            // queue and event-machine timestamp0x100. Do not import native
+            // allocator history (the captured queues had stamps2/3).
+            put32(ta, 0x79c, QUEUE_IDS[1] as u32);
+            put64(ta, 0x7a0, 0x100);
+            put64(ta, 0x7a8, 1);
+            ta[0x7b0] = 1;
+            ta[0x7b1] = 1;
+            put64(ta, 0x8a6, HIGH + STAMPS_A as u64 + QUEUE_IDS[0] as u64 * 4);
+            put64(ta, 0x8ae, HIGH + STAMPS_B as u64 + QUEUE_IDS[0] as u64 * 4);
+            put32(ta, 0x8b6, 0x100);
+            put32(ta, 0x8ba, QUEUE_IDS[0] as u32);
+            put64(ta, 0x8c6, (1u64 << 40) | 1);
+            put64(fragment, 0x2140, HIGH + STAMPS_A as u64 + QUEUE_IDS[1] as u64 * 4);
+            put64(fragment, 0x2148, HIGH + STAMPS_B as u64 + QUEUE_IDS[1] as u64 * 4);
+            put32(fragment, 0x2150, 0x100);
+            put32(fragment, 0x2154, QUEUE_IDS[1] as u32);
+            put32(fragment, 0x215c, 0);
+            put64(fragment, 0x2160, (1u64 << 40) | 1);
+            // Fixed 256x256 reference controls independently observed in
+            // the successful 25G76 draw; these replace inherited Neo values.
+            ta[0x789] = 8;
+            ta[0x85f] = 7;
+            put32(ta, 0x892, 0);
+            ta[0x932] = 0;
+            put32(fragment, 0x1fb0, 8);
+            fragment[0x21cc] = 0;
+            fragment[0x222d] = 0;
             Ok(())
         })?;
         Ok(Self { program, aliases, graph_alias, graph })
@@ -153,6 +184,29 @@ impl M5GraphicsJob {
     pub(super) fn uma_descriptor(&self) -> [u64; 4] { self.program.usc().descriptor() }
 
     pub(super) fn roots(&self) -> [u64; 2] { self.program.roots() }
+
+    pub(super) fn descriptor_addresses(&self, stage: usize) -> Result<[u64; 2]> {
+        let offset = match stage { 0 => TA, 1 => FRAGMENT, _ => return Err(EINVAL) };
+        Ok([HIGH + offset as u64, LOW + offset as u64])
+    }
+
+    pub(super) fn usc_control(&self) -> u64 { HIGH + USC as u64 }
+
+    pub(super) fn parameter_state(&self) -> u64 { HIGH + PM as u64 }
+
+    pub(super) fn publish_context(&mut self) -> Result { self.program.publish() }
+
+    pub(super) fn progress(&mut self) -> Result<[u32; 5]> {
+        Ok([self.graph.read_u32(HIGH + SUBMITTED as u64)?,
+            self.graph.read_u32(HIGH + STAMPS_A as u64 + QUEUE_IDS[0] as u64 * 4)?,
+            self.graph.read_u32(HIGH + STAMPS_B as u64 + QUEUE_IDS[0] as u64 * 4)?,
+            self.graph.read_u32(HIGH + STAMPS_A as u64 + QUEUE_IDS[1] as u64 * 4)?,
+            self.graph.read_u32(HIGH + STAMPS_B as u64 + QUEUE_IDS[1] as u64 * 4)?])
+    }
+
+    pub(super) fn result(&mut self) -> Result<crate::m5_graphics_bundle::TriangleResult> {
+        self.program.result()
+    }
 }
 
 fn put32(out: &mut [u8], offset: usize, value: u32) {
