@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
-//! Linux-owned pages for the bounded M5 native-program graphics experiment.
+//! Retained M5 render VM and private storage, with an optional native test program.
 //!
 //! Allocation is separate from root publication and queue submission. A future
-//! job owner must keep this entire graph alive until both firmware CPUs stop,
-//! including after faults. Captured physical backing is never installed.
+//! job owner keeps this graph alive through queue completion. After a fault,
+//! ownership remains retained until both firmware CPUs stop. Captured physical
+//! backing is never installed.
 
 use super::MappedObject;
 use super::graphics_usc::M5GraphicsUsc;
@@ -15,10 +16,31 @@ pub(super) struct M5GraphicsMemory {
     context: mmu::M5ExecutionContext,
     pages: KVec<MappedObject>,
     usc: M5GraphicsUsc,
-    output_first: usize,
+    output_first: Option<usize>,
 }
 
 impl M5GraphicsMemory {
+    /// Keep the actual submitting VM and allocate only driver-owned storage.
+    /// Application shader/input/output mappings remain in that VM; no native
+    /// program firmware or captured pages are requested by this constructor.
+    pub(super) fn from_vm(dev: &AsahiDevice, uat: &mmu::Uat, vm: &mmu::Vm) -> Result<Self> {
+        crate::m5_vm::compact_range(&vm.kernel_range()).ok_or(EINVAL)?;
+        let context = uat.prepare_t8142_execution_context(vm)?;
+        let usc = M5GraphicsUsc::new_application(dev, context.vm())?;
+        Ok(Self { context, pages: KVec::new(), usc, output_first: None })
+    }
+
+    /// Return an owning allocation in the compact TA resource arena. The
+    /// render job retains it until completion or confirmed processor stop.
+    pub(super) fn allocate_compact(
+        &self, dev: &AsahiDevice, size: usize, alignment: u64, prot: mmu::Prot,
+    ) -> Result<MappedObject> {
+        let range = crate::m5_vm::compact_range(&self.vm().kernel_range()).ok_or(EINVAL)?;
+        MappedObject::new_wc_in_range_with_guards(
+            dev, self.vm(), range, size, alignment, prot, 2,
+        )
+    }
+
     pub(super) fn load(dev: &AsahiDevice, uat: &mmu::Uat) -> Result<Self> {
         let firmware = Firmware::request(c"asahi/m5-25g76-graphics.bin", dev.as_ref())?;
         let reference = bundle::GraphicsBundle::parse(firmware.data()).map_err(|_| EINVAL)?;
@@ -66,7 +88,7 @@ impl M5GraphicsMemory {
             context,
             pages,
             usc,
-            output_first: output_first.ok_or(EINVAL)?,
+            output_first: Some(output_first.ok_or(EINVAL)?),
         })
     }
 
@@ -187,9 +209,10 @@ impl M5GraphicsMemory {
     /// Read only after a stopped/unsubmitted graph or confirmed completion.
     /// Pixel success alone does not prove queue retirement or presentation.
     pub(super) fn result(&mut self) -> Result<bundle::TriangleResult> {
+        let first = self.output_first.ok_or(ENOTSUPP)?;
         let mut result = bundle::TriangleResult::default();
         for page_index in 0..bundle::PIXEL_PAGES {
-            self.pages[self.output_first + page_index].with_bytes_mut(|bytes| {
+            self.pages[first + page_index].with_bytes_mut(|bytes| {
                 for word in 0..bundle::PAGE_BYTES / 4 {
                     // SAFETY: word stays within this aligned, retained WC
                     // mapping. The GPU may have updated these output bytes.
@@ -210,8 +233,9 @@ impl M5GraphicsMemory {
     /// The parent must first verify both queues, stamps and scheduler unlink.
     /// Keep the published context and its allocations; only erase its output.
     pub(super) fn reset_completed_output(&mut self) -> Result {
+        let first = self.output_first.ok_or(ENOTSUPP)?;
         for page_index in 0..bundle::PIXEL_PAGES {
-            self.pages[self.output_first + page_index].with_bytes_mut(|bytes| {
+            self.pages[first + page_index].with_bytes_mut(|bytes| {
                 bytes.fill(0xa5);
                 Ok(())
             })?;
