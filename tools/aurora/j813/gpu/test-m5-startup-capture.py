@@ -112,6 +112,38 @@ class StartupTests(unittest.TestCase):
             self.assertIn('ring cursor', result['error'])
             self.assertFalse(result['device_memory_read'])
 
+    def test_cold_ta_ring_prefix_before_first_kick(self):
+        capture = Fixture()
+        queue_address = 0xfffffc20c0000000
+        pointers_address, items_address = queue_address + 0x4000, queue_address + 0x8000
+        config_address, kick_address = queue_address + 0x10000, queue_address + 0x14000
+        ring_address = queue_address + 0x18000
+        queue, pointers = bytearray(0xc0), bytearray(0x80)
+        struct.pack_into('<QQ', queue, 0, pointers_address, items_address)
+        struct.pack_into('<I', pointers, 0x40, 2)
+        struct.pack_into('<I', pointers, 0x60, 16)
+        config, kick = bytearray(0x1000), bytearray(0x1000)
+        struct.pack_into('<I', config, 0, 15)
+        struct.pack_into('<QQH', config, 8, 0x7000438000, ring_address, 0)
+        struct.pack_into('<IHHBQI', kick, 0, 14, 0, 1, 0, 1, 0)
+        # Only a 4-KiB view exists: a whole-ring read would be rejected.
+        ring = bytes(range(256)) * 16
+        capture.views.update({queue_address: queue, pointers_address: pointers,
+            items_address: struct.pack('<QQ', config_address, kick_address),
+            config_address: config, kick_address: kick, ring_address: ring})
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'first-ta'
+            result = capture.capture_startup(0x81000000000000 | capture.ROOT,
+                0x83000000000000, output)
+            work = result['channels'][1]['pending_work'][0]
+            self.assertNotIn('capture_error', work)
+            self.assertEqual(work['commands'][0]['sksm']['data_master'], 0)
+            self.assertEqual(work['commands'][1]['add_kicks']['stamp'], '0x1')
+            obj, = [x for x in result['objects'] if '-sksm-ring-' in x['label']]
+            self.assertEqual((output / obj['file']).read_bytes(), ring)
+            self.assertTrue(obj['stable'])
+            self.assertFalse(result['device_memory_read'])
+
 
 if __name__ == '__main__':
     unittest.main()
