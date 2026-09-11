@@ -52,6 +52,8 @@ class MonitorTests(unittest.TestCase):
                     data = 1
                 elif tags[-1] & ((1 << 44) - 1) == 0xa730:
                     data = 0
+                elif tags[-1] & ((1 << 44) - 1) == (1 << 43) | (3 << 40) | 0xa0a8:
+                    data = 0x55
                 else:
                     raise AssertionError('Unexpected AP read tag')
             uc.mem_write(address, int(data).to_bytes(size, 'little'))
@@ -78,9 +80,11 @@ class MonitorTests(unittest.TestCase):
         result, _, tags = self.run_helper()
         self.assertTrue(result['compute_monitor_valid'])
         self.assertTrue(result['queue_view_valid'])
-        self.assertEqual(tags, [(1 << 43) | 0xc020, 0x1688, 0xa730, (1 << 43) | 0xc020])
+        self.assertEqual(tags, [(1 << 43) | 0xc020, 0x1688, 0xa730,
+            (1 << 43) | (3 << 40) | 0xa0a8, (1 << 43) | 0xc020])
         self.assertEqual(result['values']['queue_completed'], '0x8000000000')
         self.assertEqual(result['values']['pipe_1688'], '0x1')
+        self.assertEqual(result['values']['pipe_a0a8'], '0x55')
 
     def test_other_selected_queue_is_not_read(self):
         result, reads, _ = self.run_helper(queue=12)
@@ -95,6 +99,7 @@ class MonitorTests(unittest.TestCase):
                 self.assertTrue(result['compute_monitor_valid'])
                 self.assertEqual(tags, [(slot << 44) | (1 << 43) | 0xc020,
                     (pipe << 44) | 0x1688, (pipe << 44) | 0xa730,
+                    (pipe << 44) | (1 << 43) | (3 << 40) | 0xa0a8,
                     (slot << 44) | (1 << 43) | 0xc020])
                 self.assertEqual(int(result['values']['pipe_index'], 16), pipe)
 
