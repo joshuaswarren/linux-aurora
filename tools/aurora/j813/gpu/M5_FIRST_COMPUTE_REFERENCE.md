@@ -3,6 +3,83 @@
 The native reference proves successful M5 compute and its submission encoding.
 Linux still stalls before producing output. The shader bytes, command encoding
 and six program-page mapping profiles now match the controlled native job.
+Controlled native replay now proves that the original 64-byte shader copy
+omitted required contents elsewhere in its page. A measured 1 KiB program
+image produces the intended result under native submission. Linux loads the
+corrected program but still reaches firmware recovery without output.
+
+## Controlled shader-page replay
+
+The replay workload compiles `out = in * 3 + 6`, while its replacement test
+checks `out = in * 3 + 5`. This distinguishes execution of the replacement
+from successful execution of the original shader. Both CPU checks and the
+same-descriptor completion capture verify all 1,024 output words.
+
+| Program contents installed before native publication | Result |
+| --- | --- |
+| Original native +6 program | 1,024 correct +6 values |
+| Original Linux pages: only the 64-byte shader body populated | 1,024 output sentinels untouched |
+| Linux body in the otherwise intact native shader page | 1,024 correct +5 values |
+| Native 128 bytes immediately before the body, plus Linux body | 1,024 output sentinels untouched |
+| First 1 KiB of the native page with Linux +5 body; remaining page zero | 1,024 correct +5 values |
+
+The pipeline and CDM pages already match Linux in full. Every replay
+preflights all three program pages, their DRAM translations, exact native
+contents, controlled input/output sentinels, and argument pointers. It
+journals the originals, verifies replacement readbacks, and restores all
+three pages at the matching completion before returning to the guest.
+Restoration failure keeps the guest paused. The replay is opt-in; ordinary
+SKSM capture remains read-only.
+
+The first 1 KiB is sufficient for this controlled native job. The exact
+instruction or data dependency within its preceding 960 bytes is not yet
+isolated. This evidence does not prove Linux submission, GPU rendering, or
+DCP presentation. The native regression after restoration passed 3,072
+compute values and 12,288 rendered pixels.
+
+The rebuilt Linux mode10 probe still leaves all 1,024 output words untouched
+with unchanged inputs. Five stable downstream samples at polls 1, 2, 3, 4,
+and 32 retain `a0a8=0`, followed by a type4 recovery event for queue11. The
+shader-page correction is therefore necessary for the controlled native
+replay, but is not sufficient to fix the Linux submission/initialization gap.
+Evidence: `logs/m5-shader-prefix-linux-compute-20260911.log`.
+The retained Linux capture `logs/m5-shader-prefix-linux-retained-20260911`
+contains 33 objects over 243 physical pages, with no failed reads and all
+hashes valid. Its complete shader page matches the successful native prefix
+replay byte for byte, SHA256
+`32f033d1c45c805abc61f7fa1a805847ac648ddc0377a7a6f0f1450ea07d15f8`.
+
+Private workbench evidence:
+
+```text
+Baseline: logs/m5-program-replay-native-hv-20260911/sksm-submit-1789106749735284000
+Original Linux pages: logs/m5-program-replay-fresh-hv-20260911/sksm-submit-1789107358396222000
+Body only: logs/m5-program-replay-fresh-hv-20260911/sksm-submit-1789107613428386000
+192-byte record: logs/m5-program-replay-fresh-hv-20260911/sksm-submit-1789107786651165000
+1 KiB prefix: logs/m5-program-replay-fresh-hv-20260911/sksm-submit-1789107880418593000
+Qualification: logs/m5-program-replay-shader-prefix-qualified-20260911.json
+Regression: logs/m5-program-replay-native-regression-20260911.json
+```
+
+`m5_compute_program.rs` now initializes the measured first 1 KiB at page
+offset zero. `verify-m5-compute-program.py` compares that full range, rather
+than accepting only the 64-byte body at offset `0x3c0`.
+
+To reproduce, build `m5-metal-reference.m` on macOS. Capture a successful
+`M5_REFERENCE_SHADER_ADD=6 M5_REFERENCE_COMPUTE_ONLY=1` run with extra views
+`[[0x10000000000,0x4000],[0x1000001c000,0x4000],[0x10000090000,0x4000]]`.
+Then explicitly set `M5_SKSM_PROGRAM_REPLAY` to a JSON object containing
+absolute `native`, `linux`, and `workload` paths, and the selected `variant`.
+The Linux source capture is the original 64-byte-body retained image; its
+three hashes are pinned in the replay helper for this controlled comparison.
+`stamp` defaults to 1. An explicit `"captured"` uses the observed queue stamp
+while preserving every exact program/context/buffer guard. Native queue IDs
+and stamps can be recycled between processes.
+
+Run the replay workload with `M5_REFERENCE_SHADER_ADD=6`,
+`M5_REFERENCE_EXPECT_ADD=5`, and `M5_REFERENCE_COMPUTE_ONLY=1`. Use
+`verify-m5-program-replay.py CAPTURE WORKLOAD_JSON` to qualify the result.
+The verifier reports native submission separately from Linux qualification.
 
 ## Verified native reference
 

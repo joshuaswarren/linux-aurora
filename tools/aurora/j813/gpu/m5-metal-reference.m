@@ -31,14 +31,31 @@ int main(void)
             fprintf(stderr, "M5 Metal device is unavailable\n");
             return 3;
         }
-        NSString *source = @"#include <metal_stdlib>\nusing namespace metal;\n"
+        // The opt-in replay experiment compiles +6 but expects the owned
+        // Linux program's +5 result after replacing GPU program pages.
+        // Defaults preserve the original three-queue reference workload.
+        unsigned shaderAdd = 5, expectedAdd = 5;
+        const char *shaderOption = getenv("M5_REFERENCE_SHADER_ADD");
+        const char *expectedOption = getenv("M5_REFERENCE_EXPECT_ADD");
+        if (shaderOption) {
+            if (strlen(shaderOption) != 1 || (shaderOption[0] != '5' && shaderOption[0] != '6')) return 12;
+            shaderAdd = (unsigned)(shaderOption[0] - '0');
+            expectedAdd = shaderAdd;
+        }
+        if (expectedOption) {
+            if (strlen(expectedOption) != 1 || (expectedOption[0] != '5' && expectedOption[0] != '6')) return 12;
+            expectedAdd = (unsigned)(expectedOption[0] - '0');
+        }
+        BOOL computeOnly = getenv("M5_REFERENCE_COMPUTE_ONLY") != NULL;
+        unsigned rounds = computeOnly ? 1 : 3;
+        NSString *source = [NSString stringWithFormat:@"#include <metal_stdlib>\nusing namespace metal;\n"
             "kernel void calculate(device const uint *in [[buffer(0)]], "
             "device uint *out [[buffer(1)]], uint i [[thread_position_in_grid]]) {"
-            " out[i] = in[i] * 3u + 5u; }\n"
+            " out[i] = in[i] * 3u + %uu; }\n"
             "vertex float4 triangle(uint i [[vertex_id]]) {"
             " const float2 p[3] = {float2(-1,-1), float2(3,-1), float2(-1,3)};"
             " return float4(p[i],0,1); }\n"
-            "fragment float4 color() { return float4(0.25,0.5,0.75,1.0); }\n";
+            "fragment float4 color() { return float4(0.25,0.5,0.75,1.0); }\n", shaderAdd];
         NSError *error = nil;
         id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&error];
         if (!library) {
@@ -57,7 +74,7 @@ int main(void)
             return 5;
         }
         NSMutableArray *timings = [NSMutableArray array];
-        for (unsigned round = 0; round < 3; round++) {
+        for (unsigned round = 0; round < rounds; round++) {
             @autoreleasepool {
                 id<MTLCommandQueue> queue = [device newCommandQueue];
                 id<MTLBuffer> input = [device newBufferWithLength:4096 options:MTLResourceStorageModeShared];
@@ -85,7 +102,8 @@ int main(void)
                 [encoder endEncoding];
                 if (!finish(command, timings)) return 7;
                 for (unsigned i = 0; i < 1024; i++)
-                    if (((uint32_t *)output.contents)[i] != (i * 7u + round) * 3u + 5u) return 8;
+                    if (((uint32_t *)output.contents)[i] != (i * 7u + round) * 3u + expectedAdd) return 8;
+                if (computeOnly) continue;
 
                 MTLTextureDescriptor *textureDescriptor = [MTLTextureDescriptor
                     texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:64 height:64 mipmapped:NO];
@@ -112,8 +130,9 @@ int main(void)
             }
         }
         NSDictionary *result = @{@"platform": @"macOS reference", @"gpu": device.name,
-            @"queues": @3, @"compute_values_verified": @3072,
-            @"render_pixels_verified": @12288, @"command_gpu_ms": timings,
+            @"queues": @(rounds), @"compute_values_verified": @(1024 * rounds),
+            @"shader_add": @(shaderAdd), @"expected_add": @(expectedAdd),
+            @"render_pixels_verified": @(computeOnly ? 0 : 4096 * rounds), @"command_gpu_ms": timings,
             @"linux_gpu_proven": @NO, @"dcp_presentation_tested": @NO};
         NSData *data = [NSJSONSerialization dataWithJSONObject:result options:NSJSONWritingPrettyPrinted error:nil];
         fwrite(data.bytes, 1, data.length, stdout);
