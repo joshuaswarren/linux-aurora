@@ -59,7 +59,12 @@ The current session's reporting contract is
 
 ## Current desktop follow-up
 
-The next user-requested campaign is to import the latest Neo GPU work and
-install an ARM64 Omarchy desktop in verified free space on the Neo. No Linux
-partition or persistent desktop installation has been created yet. Preserve
-macOS and the existing resident Stage 1 while preparing that installation.
+As of 2026-09-11, the Neo runs native KDE Plasma X11 with DCP scanout,
+KWin GPU compositing, GPU gears and Wi-Fi visible in the Networks panel.
+The [composited cursor helper](desktop/README.md) addresses the pointer gaps
+during redraws and restores the native cursor while Plasma is locked.
+
+See the repository's [J700 overview](../../../J700.md) for the qualified
+versions, source map and remaining Wi-Fi startup and DCP resume limitations.
+The host-side `neo-linux/HANDOFF.md` retains the deployment and recovery
+record. macOS and resident Stage 1 remain preserved.
