@@ -23,6 +23,11 @@ _m5_graphics_sites = {
     0xfffffe0008a24d30: ('ta', 0, 0xfb8, bytes.fromhex('81de47f9700240f9')),
     0xfffffe000895c5a4: ('fragment', 1, 0x458, bytes.fromhex('812e42f9700240f9')),
 }
+_m5_graphics_stages = set(os.environ.get('M5_GRAPHICS_CAPTURE_STAGES', 'ta,fragment').split(','))
+if not _m5_graphics_stages or not _m5_graphics_stages <= {'ta', 'fragment'}:
+    raise ValueError('Invalid graphics capture stages')
+_m5_graphics_sites = {pc: site for pc, site in _m5_graphics_sites.items()
+                      if site[0] in _m5_graphics_stages}
 _m5_graphics_output = Path(os.environ['M5_GPU_TRACE_DIR'])
 _m5_graphics_roots = re.findall(r'\buat_global_root_pa=(0x[0-9a-f]+)',
     (_m5_graphics_output / 'console.log').read_text())
@@ -151,6 +156,9 @@ def _m5_graphics_submit(ctx):
         for offset in ([0x10,0x20,0x28,0x30] if dm==0 else [0x20,0x28,0x30,0x38]):
             pointer, = struct.unpack_from('<Q',raw,offset)
             if pointer: attempt('header-ref-%x'%offset,pointer,min(0x1000,0x4000-(pointer&0x3fff)))
+        if os.environ.get('M5_GRAPHICS_CAPTURE_OWNERS') == '1':
+            from m5_graphics_owners import capture_owners
+            manifest['ownership'] = capture_owners(save, raw, channel_bytes, context, name)
         # Native program setup starts in these fixed context-relative pages
         # in our controlled reference process. Missing pages remain explicit.
         for address in [0x10000000000,0x1000001c000,0x10000090000]:

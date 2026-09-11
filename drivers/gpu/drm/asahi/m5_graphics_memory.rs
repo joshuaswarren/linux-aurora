@@ -71,6 +71,70 @@ impl M5GraphicsMemory {
         self.context.roots()
     }
 
+    /// Alias existing owned user pages into the firmware VM. PM page lists
+    /// and scene counters must share backing with their user GPU views.
+    /// The returned mappings belong to the eventual retained job owner.
+    pub(super) fn alias_kernel_pages(
+        &mut self,
+        uat: &mmu::Uat,
+        user_address: u64,
+        kernel_address: u64,
+        bytes: usize,
+    ) -> Result<KVec<mmu::KernelMapping>> {
+        if self.context.is_current() {
+            return Err(EBUSY);
+        }
+        if bytes == 0
+            || bytes > bundle::MAX_PAGES * bundle::PAGE_BYTES
+            || bytes % bundle::PAGE_BYTES != 0
+            || (user_address | kernel_address) & (bundle::PAGE_BYTES as u64 - 1) != 0
+        {
+            return Err(EINVAL);
+        }
+        user_address.checked_add(bytes as u64).ok_or(EOVERFLOW)?;
+        kernel_address.checked_add(bytes as u64).ok_or(EOVERFLOW)?;
+        let mut indices = KVec::new();
+        for offset in (0..bytes).step_by(bundle::PAGE_BYTES) {
+            let address = user_address + offset as u64;
+            let index = self
+                .pages
+                .iter()
+                .position(|page| page.iova() == address)
+                .ok_or(EFAULT)?;
+            indices.push(index, GFP_KERNEL)?;
+        }
+        let mut aliases = KVec::new();
+        for (ordinal, index) in indices.iter().enumerate() {
+            let high = kernel_address + (ordinal * bundle::PAGE_BYTES) as u64;
+            let alias =
+                self.pages[*index].map_alias_at(uat.kernel_vm(), high, mmu::PROT_FW_SHARED_RW)?;
+            if uat.kernel_vm().translate_iova(high)?
+                != self
+                    .context
+                    .vm()
+                    .translate_iova(self.pages[*index].iova())?
+            {
+                return Err(EFAULT);
+            }
+            aliases.push(alias, GFP_KERNEL)?;
+        }
+        Ok(aliases)
+    }
+
+    /// Read a word from a retained reference page while preparing its job.
+    pub(super) fn read_word(&mut self, address: u64) -> Result<u32> {
+        if address & 3 != 0 {
+            return Err(EINVAL);
+        }
+        let base = address & !(bundle::PAGE_BYTES as u64 - 1);
+        let page = self
+            .pages
+            .iter_mut()
+            .find(|page| page.iova() == base)
+            .ok_or(EFAULT)?;
+        page.read_u32(address)
+    }
+
     /// Call only after the complete TA/3D resource graph is prepared.
     pub(super) fn publish(&mut self) -> Result {
         self.context.publish()

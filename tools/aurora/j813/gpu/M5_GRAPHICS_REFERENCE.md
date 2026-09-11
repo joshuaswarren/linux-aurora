@@ -6,7 +6,61 @@ the Linux graphics implementation. Linux has a verified compute triangle;
 Linux vertex/fragment rendering, Mesa admission and DCP presentation remain
 unqualified.
 
+## Completed native ownership capture
+
+The narrowed fragment capture completed without capture errors on carrier33,
+and the same native command produced 18,432 foreground and 47,104 background
+pixels with zero unexpected pixels. The downloaded 262,144-byte RGBA image
+independently has exactly those two colors and counts. All 31 saved objects
+passed length, SHA-256, repeated-read stability and mapping-stability checks.
+
+The PM owner has three 512-KiB blocks, 48 allocation units of 32 KiB each,
+and a 112-KiB page list. Its high and user views contain identical page IDs.
+Block-list entries have an eight-byte stride: first IDs `0x11`, `0x22`,
+`0x33`, each followed by zero. The capacity fields are 1,650 blocks and
+26,400 allocation units, consistent with 16 units per block.
+
+The USC directory contains 9,728 consecutive 4-KiB allocation units in
+19 blocks of 2 MiB, with 32-KiB guards. Its first block is at user VA
+`0x7000420000`, while the directory and free-list views start at
+`0x7000000000` and `0x7000408000`. The earlier compute owner uses 14 blocks
+starting at `0x7000448000`; reusing those constants would overlap the
+graphics layout or supply the wrong pool size. The native hardware slot
+is 1 in this witness and must be replaced by a slot owned by the Linux job.
+
+The pre-submit PB descriptor row selected by hardware ID4 is still zero.
+This observation does not establish its later firmware publication protocol.
+After completion, one PM-related owner address was already unmapped even
+though the reference process was held. A process-level hold is insufficient
+to prove that every internal driver allocation remains alive; post-completion
+reads must check translations again. Linux job objects remain retained until
+their firmware lifetime is independently established.
+
 ## Linux register codec
+
+The channel configuration codec now matches both captured 134-byte TA and
+fragment tag-15 records byte-for-byte. Four channel tests and four SKSM
+tests pass. The AddKicks codec selects the stage explicitly, and the
+compute wrappers preserve their existing record format.
+
+Three independent channel fields matter: primary selector `+0x22` is
+0 for TA and 1 for fragment, secondary selector `+0x5e` is 2 for both, and
+the separate `+0x26/+0x2a` state update carries an enabled flag with value
+zero in this reference. The TA record also enables the second event tuple:
+PM state address, timestamp, hardware PB index and a separate manager ID.
+The native writer at `0xfffffe0008a249ac..0x8a249e4` obtains those last two
+words from TA descriptor `+0x1218` and PM manager `+0x79c` respectively.
+They must come from retained Linux owners when submission is implemented.
+
+`verify-m5-channel-config.py --source m5_channel.rs --ta TA_DIR
+--fragment FRAGMENT_DIR` checks stable hashed records against the actual
+Rust encoder. Its result is a codec qualification, not a graphics draw.
+
+The graphics memory owner can create firmware aliases of its existing
+user pages before context publication. It verifies matching physical
+translations and returns the alias owners to the eventual job. This
+supports shared PM page lists and scene counters without allocating a
+second unrelated backing store. Runtime graphics submission remains absent.
 
 `drivers/gpu/drm/asahi/m5_render.rs` now constructs the M5 main and partial
 register programs from shared render resources and explicit M5 controls.
@@ -137,6 +191,14 @@ only after `M5_TRIANGLE_READY`, excluding WindowServer queues 2 and 3.
 `M5_GRAPHICS_CAPTURE_CONTEXT=map` surveys translations without resource
 reads; `=1` performs the bounded resource capture. The selected context
 must match `M5_GRAPHICS_CONTEXT_ID` (default 3).
+
+`M5_GRAPHICS_CAPTURE_OWNERS=1` adds bounded channel configuration, PM and
+USC owner views. `M5_GRAPHICS_CAPTURE_STAGES=fragment` limits instrumentation
+to the fragment submission; the default remains `ta,fragment`. Use the
+narrow stage when a second TA pause would hold up an already-published
+fragment job. PM field `+0x7c` is not the block-table byte extent: requesting
+that many bytes reached an unmapped page. The capture now explicitly reads
+only the first mapped block-table page.
 
 `verify-m5-graphics-capture.py --ta TA_DIR --fragment FRAGMENT_DIR
 --native-result RESULT_JSON --output REPORT_JSON` verifies object hashes,
