@@ -3,6 +3,152 @@
 //! No shader binaries, host descriptors or captured physical memory are embedded.
 use super::*;
 
+fn objects() -> RenderDescriptorObjects {
+    RenderDescriptorObjects {
+        record_a: 0xffff_fc20_c040_4000,
+        shared: 0xffff_fc20_c040_5000,
+        record_b: 0xffff_fc20_c040_6000,
+        zero: 0xffff_fc20_c040_8000,
+    }
+}
+
+fn metadata(p: &G17pRenderParameters) -> RenderDescriptorMetadata {
+    RenderDescriptorMetadata {
+        context_id: 3,
+        submission_ordinal: 0,
+        command_buffer_state_word: 0,
+        ta_hardware_buffer_id: p.ta_hardware_buffer_id,
+        submit_sequence: 1,
+    }
+}
+
+fn read_u64(raw: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(raw[offset..offset + 8].try_into().unwrap())
+}
+
+fn read_u32(raw: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(raw[offset..offset + 4].try_into().unwrap())
+}
+
+fn check_program(raw: &[u8], offset: usize, expected: &[(u32, u64)]) {
+    for (index, (number, value)) in expected.iter().enumerate() {
+        assert_eq!(read_u32(raw, offset + index * 12), *number);
+        assert_eq!(read_u64(raw, offset + index * 12 + 4), *value);
+    }
+}
+
+#[test]
+fn descriptor_programs_counts_aliases_and_bounds_match_native_layout() {
+    let (p, controls) = reference();
+    let objects = objects();
+    let metadata = metadata(&p);
+    let ta_alias = 0x70_0040_0000;
+    let fragment_alias = 0x70_0040_4000;
+    let mut ta = [0xa5; g17_render::TA_DESCRIPTOR_SIZE + 64];
+    let mut fragment = [0xa5; g17_render::FRAGMENT_DESCRIPTOR_SIZE + 64];
+    build_ta_descriptor_base(&p, &controls, objects, metadata, ta_alias, &mut ta).unwrap();
+    build_fragment_descriptor_base(
+        &p,
+        &controls,
+        objects,
+        metadata,
+        fragment_alias,
+        &mut fragment,
+    )
+    .unwrap();
+    check_program(&ta, 0x60, &TA);
+    check_program(&fragment, 0xa0, &FRAGMENT);
+    check_program(&fragment, 0x7c0, &PARTIAL_STORE);
+    check_program(&fragment, 0xee0, &PARTIAL_RESUME);
+    check_program(&fragment, 0x1600, &PARTIAL_LOAD);
+    assert_eq!(&ta[0x38..0x3e], &[79, 0, 82, 0, 82, 0]);
+    assert_eq!(&fragment[0x80..0x86], &[87, 0, 89, 0, 89, 0]);
+    assert_eq!(&fragment[0x88..0x8a], &[90, 0]);
+    assert_eq!(read_u32(&ta, 0x768), 0x03d80052);
+    for (header, count) in [(0x7a8, 90), (0xec8, 18), (0x15e8, 25), (0x1d08, 12)] {
+        assert_eq!(read_u32(&fragment, header), ((count * 12) << 16) | count);
+    }
+    assert_eq!(read_u64(&ta, 0x760), ta_alias + 0x60);
+    for (header, offset) in [
+        (0x7a0, 0xa0),
+        (0xec0, 0x7c0),
+        (0x15e0, 0xee0),
+        (0x1d00, 0x1600),
+    ] {
+        assert_eq!(read_u64(&fragment, header), fragment_alias + offset);
+    }
+    assert_eq!(read_u64(&ta, 0x10), objects.record_a);
+    assert_eq!(read_u64(&fragment, 0x20), objects.record_a);
+    assert_eq!(read_u32(&ta, 0x18), p.ta_hardware_buffer_id);
+    assert!(ta[g17_render::TA_DESCRIPTOR_SIZE..]
+        .iter()
+        .all(|b| *b == 0xa5));
+    assert!(fragment[g17_render::FRAGMENT_DESCRIPTOR_SIZE..]
+        .iter()
+        .all(|b| *b == 0xa5));
+}
+
+#[test]
+fn descriptor_metadata_controls_register_identity() {
+    let (p, controls) = reference();
+    let mut metadata = metadata(&p);
+    metadata.context_id = 5;
+    metadata.command_buffer_state_word = 0x85;
+    let mut ta = [0; g17_render::TA_DESCRIPTOR_SIZE];
+    build_ta_descriptor_base(&p, &controls, objects(), metadata, 0x70_0040_0000, &mut ta).unwrap();
+    assert_eq!(read_u32(&ta, 0xc), 5);
+    for (index, (number, _)) in TA.iter().enumerate() {
+        if matches!(number, 0x10209 | 0x1c9f0 | 0x14320) {
+            assert_eq!(read_u64(&ta, 0x60 + index * 12 + 4), 0x505);
+        }
+    }
+}
+
+#[test]
+fn descriptor_rejects_wrong_owner_context_overflow_and_short_storage() {
+    let (p, controls) = reference();
+    let mut metadata = metadata(&p);
+    let mut raw = [0xa5; g17_render::TA_DESCRIPTOR_SIZE];
+    metadata.ta_hardware_buffer_id += 1;
+    assert_eq!(
+        build_ta_descriptor_base(&p, &controls, objects(), metadata, 0x70_0040_0000, &mut raw),
+        Err(M5RenderBuildError::OwnershipMismatch)
+    );
+    metadata.ta_hardware_buffer_id = p.ta_hardware_buffer_id;
+    metadata.context_id = 256;
+    assert_eq!(
+        build_ta_descriptor_base(&p, &controls, objects(), metadata, 0x70_0040_0000, &mut raw),
+        Err(M5RenderBuildError::InvalidContext)
+    );
+    metadata.context_id = 3;
+    assert_eq!(
+        build_ta_descriptor_base(&p, &controls, objects(), metadata, u64::MAX - 16, &mut raw),
+        Err(M5RenderBuildError::Common(
+            RenderBuildError::ArithmeticOverflow
+        ))
+    );
+    metadata.submission_ordinal = u32::MAX;
+    assert_eq!(
+        build_ta_descriptor_base(&p, &controls, objects(), metadata, 0x70_0040_0000, &mut raw),
+        Err(M5RenderBuildError::Common(
+            RenderBuildError::ArithmeticOverflow
+        ))
+    );
+    metadata.submission_ordinal = 0;
+    assert_eq!(
+        build_ta_descriptor_base(
+            &p,
+            &controls,
+            objects(),
+            metadata,
+            0x70_0040_0000,
+            &mut raw[..128]
+        ),
+        Err(M5RenderBuildError::Common(RenderBuildError::BufferTooSmall))
+    );
+    assert!(raw.iter().all(|b| *b == 0xa5));
+}
+
 #[test]
 fn resource_ids_are_caller_owned_and_sign_extended() {
     let (mut p, controls) = reference();

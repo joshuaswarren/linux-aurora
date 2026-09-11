@@ -22,6 +22,9 @@ use queue_probe::M5QueueProbe;
 mod program_memory;
 use program_memory::M5ProgramMemory;
 
+#[path = "m5_graphics_memory.rs"]
+mod graphics_memory;
+
 const KERNEL_BASE: u64 = 0xffff_fc20_0000_0000;
 const PRIVATE_BASE: u64 = KERNEL_BASE + 0x2_0000;
 const ROOTS_BASE: u64 = KERNEL_BASE + 0x1a_8000;

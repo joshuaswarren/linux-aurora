@@ -27,15 +27,51 @@ is sign extended as in the native generator. PTC maxima use the native zero
 fallback of `0x60`. Geometry fields reject overflow and overlapping flag
 inputs, and TA dispatch bit zero is supplied separately for the two phases.
 
-Run `python3 drivers/gpu/drm/asahi/tests/test_m5_render.py` for six tests,
-including the complete native register vectors and ownership/geometry cases.
+Run `python3 drivers/gpu/drm/asahi/tests/test_m5_render.py` for nine tests,
+each run with Neo diagnostic overrides disabled and fully enabled, including
+the complete native register vectors and descriptor ownership/geometry cases.
 The shared memory-backed policy and render-counter tests also pass. Three
 older G17P full-suite expectations reproduce on the unmodified parent.
 
-The codec is not yet called by a Linux graphics submission. Descriptor
-construction, owned graphics buffers and scheduler submission are the next
-integration steps. The existing Linux compute-triangle proof remains the
-current GPU execution milestone.
+The codec now builds TA/fragment descriptor bases with M5 register counts,
+partial-program offsets, checked self aliases and metadata-derived work keys.
+Shared G17P encoders keep their diagnostic overrides in the G17P wrappers.
+The refactor preserved successful generic/cold descriptor bytes across ten
+override masks, three dimensions, two PM settings and varied contexts,
+ordinals and state words. Runtime/completion tails remain unfinished; these
+bases must not be submitted as complete commands.
+
+## Private program resources and Linux ownership
+
+`build-m5-graphics-bundle.py --ta TA_DIR --fragment FRAGMENT_DIR
+--native-result RESULT_JSON --output PRIVATE_BUNDLE` verifies the capture,
+then packages only the 334 user GPU pages. The version-1 bundle preserves
+108 read-only and 226 writable mappings, including 16 untouched output
+pages. It contains no captured page tables or kernel command objects.
+An aligned-word audit rejects direct captured kernel/physical pointers;
+it does not prove absence of every possible packed or encoded pointer.
+The generated 5,477,664-byte blob stays private and outside Git.
+
+`m5_graphics_bundle.rs` validates the bounded format before allocation:
+256x256 geometry, context 3, two user windows, sorted unique addresses,
+permissions, exact record lengths, a transfer checksum and complete
+sentinel-filled output. `m5_graphics_memory.rs` copies accepted bytes into
+new Linux-owned WC allocations with corresponding GPU RO/RW permissions.
+The constructor leaves roots unpublished. Its firmware name is
+`asahi/m5-25g76-graphics.bin`; the Asahi Kconfig selects the Rust firmware
+loader abstraction. There is no runtime caller yet.
+
+Run `python3 drivers/gpu/drm/asahi/tests/test_m5_graphics_bundle.py` for five
+synthetic tests. Optional `--bundle PRIVATE_BUNDLE --native-rgba RGBA_FILE`
+checks the actual private package and the independent pixel checker against
+the native result. The reference passes with 18,432 foreground pixels,
+47,104 background pixels and zero errors among 63,234 off-edge checks.
+This validates the checker against native output, not Linux rendering.
+
+The kernel builds with these modules included. Completing M5-specific
+runtime fields, owned TA/USC pools, queue publication and retirement is next.
+The existing Linux compute-triangle proof remains the execution milestone;
+the new graphics mapping owner has not yet run on hardware.
 
 ## Hardware evidence
 
