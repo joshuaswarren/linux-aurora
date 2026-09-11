@@ -153,12 +153,13 @@ impl M5Session {
             dev_info!(self.dev.as_ref(), "M5_CONTEXT prepared id3 roots={:x?}; six pages, 1024 untouched outputs, no kicks\n", roots);
         }
         if probe_kind >= 6 {
-            self.submit_compute()?;
+            self.retire_idle_policy()?;
+            self.submit_compute(probe_kind == 6)?;
         }
         Ok(())
     }
 
-    fn submit_compute(&mut self) -> Result {
+    fn retire_idle_policy(&mut self) -> Result {
         let memory = self.memory.as_mut().ok_or(EIO)?;
         dev_info!(self.dev.as_ref(), "M5_POWER before wake {:x?}\n", memory.power_status()?);
         // Retire the idle-policy request. Reserved DATA snapshots retain
@@ -186,14 +187,40 @@ impl M5Session {
                 memory.control_counters()?, memory.power_status()?);
             return Err(ETIMEDOUT);
         }
+        Ok(())
+    }
+
+    fn submit_compute(&mut self, submit_kick: bool) -> Result {
+        let memory = self.memory.as_mut().ok_or(EIO)?;
         let state = memory.compute_pool_state()?;
         if !M5FirmwareMemory::compute_pool_ready(state) {
             dev_err!(self.dev.as_ref(), "M5_POOL host preparation invalid {:x?}\n", state);
             return Err(EIO);
         }
         dev_info!(self.dev.as_ref(), "M5_POOL host directory and UMA slot prepared {:x?}; no growth request\n", state);
-        memory.publish_compute_job()?;
+        memory.publish_compute_job(submit_kick)?;
         Pin::new(&mut self.roles[0].rtkit).send_message(0x21, 0x0083_0000_0000_000a)?;
+        if !submit_kick {
+            for _ in 0..1000 {
+                if memory.drain_reports(&self.dev)? { return Err(EIO); }
+                if self.roles.iter().any(|role| role.state.crashed.load(Ordering::Acquire)) {
+                    return Err(EIO);
+                }
+                let (outer, inner, _) = memory.queue_probe_status()?;
+                let result = memory.compute_result()?;
+                if result.inputs_changed != 0 || result.outputs_untouched != 1024 {
+                    return Err(EIO);
+                }
+                if outer == [2; 3] && inner == [3; 3] {
+                    dev_info!(self.dev.as_ref(), "M5_COMPUTE setup retired outer={:?} inner={:?}; 1024 untouched outputs, SKSM kick unpublished\n",
+                        outer, inner);
+                    return Ok(());
+                }
+                fsleep(Delta::from_millis(1));
+            }
+            dev_err!(self.dev.as_ref(), "M5_COMPUTE setup timeout queues={:?}\n", memory.queue_probe_status()?);
+            return Err(ETIMEDOUT);
+        }
         dev_info!(self.dev.as_ref(), "M5_COMPUTE first SKSM kick submitted qid11 stamp1 context3\n");
         for poll in 0..10000 {
             if memory.drain_reports(&self.dev)? {

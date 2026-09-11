@@ -336,17 +336,17 @@ impl M5FirmwareMemory {
         Ok((firmware, uma, completion_cursor))
     }
 
-    pub(crate) fn publish_compute_job(&mut self) -> Result {
+    pub(crate) fn publish_compute_job(&mut self, submit_kick: bool) -> Result {
         let (outer, inner, _) = self.queue_probe_status()?;
         if outer != [1; 3] || inner != [1; 3] { return Err(EBUSY); }
         let address = self.queue_probe.as_ref().ok_or(EINVAL)?.queue_address();
-        self.queue_probe.as_mut().ok_or(EINVAL)?.prepare_compute_job()?;
+        self.queue_probe.as_mut().ok_or(EINVAL)?.prepare_compute_job(submit_kick)?;
         self.shared.with_bytes_mut(|out| {
             let record = &mut out[0x19dd8..0x19df0];
             if record.iter().any(|x| *x != 0) { return Err(EBUSY); }
             record[8..16].copy_from_slice(&address.to_le_bytes());
             record[16..20].copy_from_slice(&2u32.to_le_bytes());
-            record[20..22].copy_from_slice(&4u16.to_le_bytes());
+            record[20..22].copy_from_slice(&(if submit_kick { 4u16 } else { 3 }).to_le_bytes());
             record[22] = 11;
             record[23] = 1;
             Ok(())

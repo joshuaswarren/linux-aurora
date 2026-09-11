@@ -131,7 +131,7 @@ impl M5QueueProbe {
         GRAPH_BASE + QUEUE_OFFSET as u64
     }
 
-    pub(super) fn prepare_compute_job(&mut self) -> Result {
+    pub(super) fn prepare_compute_job(&mut self, submit_kick: bool) -> Result {
         use super::program_memory::{DESCRIPTOR_HIGH, DESCRIPTOR_LOW, EVENT};
         if self.inner_counters()? != [1; 3] { return Err(EBUSY); }
         let entry = m5_sksm::prepare_m5_sksm_entry(m5_sksm::M5SksmQueue {
@@ -175,7 +175,10 @@ impl M5QueueProbe {
             Ok(())
         })?;
         fence(Ordering::SeqCst);
-        self.graph.write_u32(GRAPH_BASE + POINTERS as u64 + 0x40, 4)?;
+        // Mode7 retires descriptor/configuration only. The prepared SKSM
+        // entry stays unpublished because tag14 lies beyond this producer.
+        self.graph.write_u32(GRAPH_BASE + POINTERS as u64 + 0x40,
+            if submit_kick { 4 } else { 3 })?;
         Ok(())
     }
 
