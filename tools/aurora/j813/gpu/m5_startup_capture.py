@@ -110,8 +110,27 @@ class M5StartupCapture(M5GPUCapture):
                                     address = qword(raw, 0)
                                     length = min(0x1000, 0x4000 - (address & 0x3fff))
                                     command = save(label + f'-command-{slot}', address, length)
-                                    work['commands'].append(dict(slot=slot, address=hex(address),
-                                                                 tag=u32(command, 0)))
+                                    info = dict(slot=slot, address=hex(address), tag=u32(command, 0))
+                                    work['commands'].append(info)
+                                    if info['tag'] == 15 and len(command) >= 0x26:
+                                        ring_low, ring_high = qword(command, 8), qword(command, 0x10)
+                                        qid = struct.unpack_from('<H', command, 0x18)[0]
+                                        priority, data_master = u32(command, 0x1e), u32(command, 0x22)
+                                        if (not ring_high or ring_high & 0x3fff
+                                                or qid > 127 or priority > 3 or data_master > 2):
+                                            raise ValueError('Unexpected native SKSM configuration geometry')
+                                        info['sksm'] = dict(queue_id=qid, priority=priority,
+                                            data_master=data_master, ring_low=hex(ring_low),
+                                            ring_high=hex(ring_high), captured_prefix_bytes=0x1000)
+                                        # Capture the first page before the first doorbell,
+                                        # including a cold ring's first entries. Do not infer
+                                        # TA entry stride from the CL-only host breakpoint.
+                                        save(label + f'-sksm-ring-{slot}-prefix', ring_high, 0x1000)
+                                    elif info['tag'] == 14 and len(command) >= 21:
+                                        _, qid, count, priority, stamp, data_master = struct.unpack_from(
+                                            '<IHHBQI', command)
+                                        info['add_kicks'] = dict(queue_id=qid, count=count,
+                                            priority=priority, stamp=hex(stamp), data_master=data_master)
                             except (RuntimeError, ValueError) as error:
                                 work['capture_error'] = str(error)
                 channels.append(channel)

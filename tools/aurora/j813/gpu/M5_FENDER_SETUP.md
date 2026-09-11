@@ -188,5 +188,31 @@ Evidence: `logs/m5-prekick-setup-mode7-20260911.log`,
 `logs/m5-prekick-queue11-before-compute-20260911.log` and
 `logs/m5-prekick-setup-retained-20260911/manifest.json`.
 
+## Cold native SKSM entry
+
+The startup observer now captures the first 4 KiB of a tag-15 ring's
+firmware alias before mailbox publication, plus the matching tag-14
+metadata. A fresh macOS 25G76 boot captured 24 publications and three
+stable ring prefixes without errors, reading 1,106,904 bytes within the
+existing DRAM-only budget. The first work used queue 0, priority 2,
+data master 0, stamp 1. The only populated 512-byte region in its first
+ring snapshot starts at offset `0x200`.
+
+That entry contains header `0x1000000000000004`, no mcache, flag bits
+1/61/63 clear, dependency `(queue 0, stamp 0, type 1)`, RCE kind 0 and
+auxiliary `0x3fffffffffffff`. Linux's first compute entry has the same
+initial dependency and flag conventions for queue 11; its compute QoS
+and RCE payload remain separate from native tiling work. There is no
+evidence here for changing the initial stamp or dependency type.
+
+The same native boot then verified 3,072 compute values and 12,288 pixels
+across three Metal queues. This is a working native reference, not Linux
+execution. The startup sequence does not by itself prove that Linux must
+submit a tiling job before compute.
+
+Evidence: `logs/m5-cold-sksm-hv-20260911/startup/publication-01/manifest.json`
+and `logs/m5-cold-sksm-native-metal-result-20260911.json`. Five synthetic
+startup-observer tests pass, including the new bounded cold-ring capture.
+
 All 1,024 shader outputs remain untouched, completion stays zero, and
 both firmware stop requests succeed. Linux GPU execution remains open.
