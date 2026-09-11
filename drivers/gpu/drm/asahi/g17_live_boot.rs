@@ -94,162 +94,6 @@ const G17P_POWER_WIRE_POLLS: usize = 20;
 const G17P_POWER_WIRE_POWERED_POLLS: usize = 250;
 const G17P_RTKIT_UAT_DVA_MASK: u64 = (1u64 << 40) - 1;
 
-/// One role's iBoot-placed RTKit image, from the live J700 ADT.
-///
-/// `/arm-io/gfx-asc` and `/arm-io/gfx1-asc` each carry a `segment-ranges`
-/// property of 32-byte records `{u64 phys, u64 iova, u64 remap, u32 size,
-/// u32 flags}`. On T8140 there are two segments per role, `__TEXT;__DATA`,
-/// and `remap == phys`. Everything here is below the start of System RAM, so
-/// Linux never maps it and cannot corrupt it -- but the firmware writes its
-/// own `__DATA` the whole time it runs, and nothing puts it back.
-#[derive(Debug, Copy, Clone)]
-struct G17PFirmwareImage {
-    text_phys: u64,
-    data_phys: u64,
-    data_size: usize,
-}
-
-const G17P_GFX_FIRMWARE_IMAGE: G17PFirmwareImage = G17PFirmwareImage {
-    text_phys: 0x1_0000_974000,
-    data_phys: 0x1_0001_d7c000,
-    data_size: 0x13_4000,
-};
-
-const G17P_GFX1_FIRMWARE_IMAGE: G17PFirmwareImage = G17PFirmwareImage {
-    text_phys: 0x1_0000_9c0000,
-    data_phys: 0x1_0001_eb0000,
-    data_size: 0x12_c000,
-};
-
-/// Pristine `__DATA` for both roles, taken before either processor ever ran.
-#[cfg(CONFIG_DEV_COREDUMP)]
-struct G17PFirmwareDataSnapshot {
-    gfx: KVVec<u8>,
-    gfx1: KVVec<u8>,
-}
-
-/// Snapshot both roles' `__DATA` while it is still exactly as iBoot left it.
-///
-/// Refuses unless each role's live IORVBAR names precisely the `__TEXT` base
-/// this geometry expects, with its valid bit set. That reset vector is the one
-/// on-machine witness that the ADT-derived addresses describe THIS board, and
-/// it is read from the provider's own mapping, so a wrong table can never send
-/// a write somewhere it does not belong.
-#[cfg(CONFIG_DEV_COREDUMP)]
-fn snapshot_g17p_firmware_data(pdev: &platform::Device) -> Option<G17PFirmwareDataSnapshot> {
-    let images = [G17P_GFX_FIRMWARE_IMAGE, G17P_GFX1_FIRMWARE_IMAGE];
-    for (index, image) in images.iter().enumerate() {
-        let provider = G17PMailboxProvider::get(pdev.as_ref(), index).ok()?;
-        let observed = provider.asc_snapshot().ok()?;
-        let expected = image.text_phys | 1;
-        if observed.iorvbar != expected {
-            dev_warn!(
-                pdev.as_ref(),
-                "G17PMARK fw-snapshot role={} REFUSED: iorvbar={:#x} expected={:#x}; the pinned carveout geometry does not describe this board\n",
-                index,
-                observed.iorvbar,
-                expected
-            );
-            return None;
-        }
-    }
-    // The invalidating read, for the same reason the drift count uses it: the
-    // baseline has to come from DRAM, not from whatever the AP happens to be
-    // holding for these physical addresses after iBoot placed the image.
-    let gfx = crate::pgtable::UatPageTable::copy_live_firmware_physical_range(
-        G17P_GFX_FIRMWARE_IMAGE.data_phys,
-        G17P_GFX_FIRMWARE_IMAGE.data_size,
-    )
-    .ok()?;
-    let gfx1 = crate::pgtable::UatPageTable::copy_live_firmware_physical_range(
-        G17P_GFX1_FIRMWARE_IMAGE.data_phys,
-        G17P_GFX1_FIRMWARE_IMAGE.data_size,
-    )
-    .ok()?;
-    dev_info!(
-        pdev.as_ref(),
-        "G17PMARK fw-snapshot armed gfx __DATA {:#x}+{:#x} gfx1 __DATA {:#x}+{:#x}; both reset vectors match the pinned __TEXT bases\n",
-        G17P_GFX_FIRMWARE_IMAGE.data_phys,
-        G17P_GFX_FIRMWARE_IMAGE.data_size,
-        G17P_GFX1_FIRMWARE_IMAGE.data_phys,
-        G17P_GFX1_FIRMWARE_IMAGE.data_size,
-    );
-    Some(G17PFirmwareDataSnapshot { gfx, gfx1 })
-}
-
-/// How many bytes of a role's live `__DATA` differ from its pristine copy.
-///
-/// Read through the cache-invalidating path, not the plain one. The probe-time
-/// snapshot pulled all of `__DATA` into the AP's PIPT caches as clean lines,
-/// and the firmware writes its globals over a path that does not reliably
-/// invalidate them, so a plain write-back read here can hand back the pristine
-/// bytes this is trying to compare against and report drift=0 for a segment
-/// the firmware has been scribbling on for minutes. Reporting zero drift is
-/// the one wrong answer that would retire the whole hypothesis.
-#[cfg(CONFIG_DEV_COREDUMP)]
-fn count_g17p_firmware_data_drift(image: &G17PFirmwareImage, pristine: &[u8]) -> Result<usize> {
-    let live = crate::pgtable::UatPageTable::copy_live_firmware_physical_range(
-        image.data_phys,
-        image.data_size,
-    )?;
-    Ok(live
-        .iter()
-        .zip(pristine.iter())
-        .filter(|(a, b)| a != b)
-        .count())
-}
-
-/// Wait for both ASC wrappers to report idle after their CPUs were stopped.
-///
-/// `AppleASCWrapV6::stopCPU` clears RUN and then waits about 10 ms for
-/// `IDLE_STATUS & 3` before anything downstream gates the power domain. The
-/// Linux provider clears RUN and returns immediately, so a gate that follows
-/// can land while the block still has AXI traffic in flight -- which is what a
-/// GFX PMGR register latched BUSY with PS_ACTUAL=0, deaf to every later target
-/// write, looks like. Logs what each role actually reached either way, so the
-/// wait is a measurement and not just a delay.
-fn wait_for_g17p_asc_idle(pdev: &platform::Device, checkpoint: &'static str) {
-    const BUDGET_US: u64 = 10_000;
-    const STEP_US: u64 = 50;
-    for index in 0..2usize {
-        let Ok(provider) = G17PMailboxProvider::get(pdev.as_ref(), index) else {
-            continue;
-        };
-        let mut waited = 0u64;
-        let mut observed = 0u32;
-        let mut idle = false;
-        loop {
-            match provider.asc_snapshot() {
-                Ok(state) => {
-                    observed = state.idle_status;
-                    // AppleASCWrapV6::_isIdle is `(IDLE_STATUS & 3) != 0`.
-                    // Not `== 3`: bit 0 and bit 1 are separate idle witnesses
-                    // and either one alone means idle.
-                    if state.idle_status & 3 != 0 {
-                        idle = true;
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-            if waited >= BUDGET_US {
-                break;
-            }
-            fsleep(Delta::from_micros(STEP_US as i64));
-            waited += STEP_US;
-        }
-        dev_info!(
-            pdev.as_ref(),
-            "G17PMARK asc-idle role={} checkpoint={} idle={} waited_us={} idle_word={:#x}\n",
-            index,
-            checkpoint,
-            idle,
-            waited,
-            observed
-        );
-    }
-}
-
 /// Runtime-PM entry points the Rust `kernel` crate does not wrap.
 ///
 /// All of these are `EXPORT_SYMBOL_GPL` in `drivers/base/power/runtime.c`.
@@ -345,16 +189,77 @@ impl G17PMailboxProvider {
         to_result(unsafe { bindings::apple_mbox_ascwrap_v6_stop_cpu(self.mbox) })
     }
 
-    fn cpu_state(&self) -> Result<(u32, u32)> {
-        let mut control = 0;
-        let mut status = 0;
-        // SAFETY: the provider remains linked and owns the wrapper mapping;
-        // both output pointers refer to writable stack storage.
-        to_result(unsafe {
-            bindings::apple_mbox_ascwrap_v6_get_cpu_state(
-                self.mbox, &mut control, &mut status)
-        })?;
-        Ok((control, status))
+    /// The registers that decide whether a restarted ASC will re-run its
+    /// RTKit handshake.
+    ///
+    /// `apple_rtkit_boot()` is passive: it waits for the IOP to volunteer a
+    /// HELLO and never pokes it. A rebuild therefore depends entirely on the
+    /// ASC actually restarting from its reset vector when `CPU_RUN` is set
+    /// again. Nothing in the driver has ever looked at whether it does, so
+    /// read the deciding state rather than infer it from the timeout.
+    /// The provider's own `struct device`, which is what carries the runtime-PM
+    /// reference that keeps the shared `gfx` power domain up.
+    fn provider_device(&self) -> *mut bindings::device {
+        // SAFETY: the device link established by `get()` keeps the provider
+        // and therefore this pointer valid for this consumer's lifetime.
+        unsafe { (*self.mbox).dev }
+    }
+
+    /// A second handle on the same provider, for diagnostics that must read
+    /// ASC state while the lifecycle owner holds the real one.
+    ///
+    /// `get()` established a device link that keeps the provider alive for the
+    /// consumer's whole bound lifetime, and this type owns nothing else, so an
+    /// alias cannot outlive what it points at.
+    fn diagnostic_alias(&self) -> Self {
+        Self { mbox: self.mbox }
+    }
+
+    fn asc_snapshot(&self) -> Result<G17PAscSnapshot> {
+        /// ASCWrap v6 CPU control/status pair, from the provider's own
+        /// `APPLE_ASCWRAP_V6_CPU_CONTROL`.
+        const CPU_CONTROL: usize = 0x44;
+        const CPU_STATUS: usize = 0x48;
+        const CPU_WINDOW: usize = CPU_STATUS + core::mem::size_of::<u32>();
+        /// The mailbox block starts at wrapper + 0x8000; its first word is the
+        /// wrapper idle status `_isIdle` reads, and the two FIFO control words
+        /// follow at the standard ASC offsets.
+        const IDLE_STATUS: usize = 0x0;
+        const A2I_CONTROL: usize = 0x110;
+        const I2A_CONTROL: usize = 0x114;
+        const MBOX_WINDOW: usize = I2A_CONTROL + core::mem::size_of::<u32>();
+        /// The IOP reset vector lives in its own eight-byte window.
+        const VBAR_WINDOW: usize = 0x8;
+
+        // SAFETY: the provider owns all three mappings and the device link
+        // established by apple_mbox_get() keeps them valid for this consumer.
+        let (wrapper, regs, vbar) = unsafe {
+            (
+                (*self.mbox).wrapper_regs as usize,
+                (*self.mbox).regs as usize,
+                (*self.mbox).iop_vbar_regs as usize,
+            )
+        };
+        if wrapper == 0 || regs == 0 || vbar == 0 {
+            return Err(ENODEV);
+        }
+        let cpu_raw = MmioRaw::<CPU_WINDOW>::new(wrapper, CPU_WINDOW)?;
+        let mbox_raw = MmioRaw::<MBOX_WINDOW>::new(regs, MBOX_WINDOW)?;
+        let vbar_raw = MmioRaw::<VBAR_WINDOW>::new(vbar, VBAR_WINDOW)?;
+        // SAFETY: each window covers exactly the relaxed reads issued below.
+        let cpu = unsafe { Mmio::from_raw(&cpu_raw) };
+        // SAFETY: as above.
+        let mailbox = unsafe { Mmio::from_raw(&mbox_raw) };
+        // SAFETY: as above.
+        let iop_vbar = unsafe { Mmio::from_raw(&vbar_raw) };
+        Ok(G17PAscSnapshot {
+            cpu_control: cpu.relaxed().read32(CPU_CONTROL),
+            cpu_status: cpu.relaxed().read32(CPU_STATUS),
+            idle_status: mailbox.relaxed().read32(IDLE_STATUS),
+            iorvbar: iop_vbar.relaxed().read64(0),
+            a2i_control: mailbox.relaxed().read32(A2I_CONTROL),
+            i2a_control: mailbox.relaxed().read32(I2A_CONTROL),
+        })
     }
 
     fn a2i_control(&self) -> Result<u32> {
@@ -3087,11 +2992,6 @@ pub(crate) struct G17PLiveRuntime {
     /// shared `gfx` power domain can be gated deliberately. Armed at most
     /// once, lazily, and only when a restart mode asks for it.
     runtime_pm_armed: bool,
-    /// Both roles' firmware `__DATA` exactly as iBoot left it, taken before
-    /// either processor was ever started. `None` when the pinned carveout
-    /// geometry did not match this board's reset vectors.
-    #[cfg(CONFIG_DEV_COREDUMP)]
-    firmware_data: Option<G17PFirmwareDataSnapshot>,
     gfx_state: Option<Arc<G17PRoleRtkitState>>,
     gfx_rtkit: Option<rtkit::RtKit<G17PRtkitOps>>,
     gfx1_state: Option<Arc<G17PRoleRtkitState>>,
@@ -3778,10 +3678,6 @@ impl G17PLiveRuntime {
             self.runtime_pm_armed = true;
         }
 
-        if *module_parameters::g17p_asc_teardown.value() & 1 != 0 {
-            wait_for_g17p_asc_idle(pdev, "pre-gate");
-        }
-
         // Both CPUs are stopped and both RTKit owners are gone, so each
         // mailbox has already dropped its runtime reference -- asynchronously.
         // Flush those before asking the domain down, or genpd counts them as
@@ -3805,22 +3701,7 @@ impl G17PLiveRuntime {
         // `pm_runtime_put_sync_suspend()`.
         // SAFETY: this driver's own device, runtime PM armed above.
         let off = unsafe { __pm_runtime_suspend(dev, RPM_GET_PUT) };
-        // The GFX PMGR register latches BUSY (bit 11) across the power-down and
-        // clears it on its own some time later. `apple_pmgr_ps_set` rebuilds the
-        // value it writes from a fresh read and its clear-mask does not include
-        // BUSY, so an ON issued while BUSY is still set writes BUSY back -- and
-        // measured on J700 that write is ignored outright (requested TARGET=0xf,
-        // register unmoved at 0x0f002b00) and the domain stays dead for the rest
-        // of the boot. The same boot's control is the proof: an identical
-        // power-down at t=0.8s also left BUSY set, nothing wrote the register,
-        // and by the time probe issued its ON at t=16s BUSY had cleared and the
-        // ON succeeded. A fixed 10ms was simply losing that race. Waiting longer
-        // is a measurement of how long BUSY needs, not a fix; the fix belongs in
-        // pmgr-pwrstate.c, which should mask BUSY out of the written value and
-        // poll it clear before the ON the way it already polls it after.
-        fsleep(Delta::from_millis(
-            (*module_parameters::g17p_asc_gate_settle_ms.value()).clamp(1, 2000) as i64,
-        ));
+        fsleep(Delta::from_millis(10));
         // `pm_runtime_resume_and_get()`.
         // SAFETY: as above.
         let on = unsafe { __pm_runtime_resume(dev, RPM_GET_PUT) };
@@ -3834,62 +3715,6 @@ impl G17PLiveRuntime {
             return Err(EIO);
         }
         Ok(())
-    }
-
-    /// Say how far each role's firmware `__DATA` has drifted from the copy
-    /// iBoot left, and at restart mode 3 put it back.
-    ///
-    /// A power-cycled ASC re-enters at `IORVBAR`, which is the `__TEXT` base:
-    /// the code is pristine, but every global the previous firmware instance
-    /// wrote is still sitting in `__DATA`. Measured on J700, a restarted
-    /// processor does execute and then immediately sends on the crashlog
-    /// endpoint instead of HELLO, which is exactly what re-entering over dirty
-    /// globals looks like. The drift count says whether that reading is right;
-    /// the restore tests it.
-    #[cfg(CONFIG_DEV_COREDUMP)]
-    fn report_and_restore_firmware_data(&self, pdev: &platform::Device, restore: bool) {
-        let Some(snapshot) = self.firmware_data.as_ref() else {
-            dev_warn!(
-                pdev.as_ref(),
-                "G17PMARK fw-restore unavailable: no pristine __DATA snapshot was taken at probe\n"
-            );
-            return;
-        };
-        for (name, image, pristine) in [
-            ("gfx", &G17P_GFX_FIRMWARE_IMAGE, &snapshot.gfx),
-            ("gfx1", &G17P_GFX1_FIRMWARE_IMAGE, &snapshot.gfx1),
-        ] {
-            match count_g17p_firmware_data_drift(image, pristine) {
-                Ok(drift) => dev_info!(
-                    pdev.as_ref(),
-                    "G17PMARK fw-drift role={} bytes_changed={} of {} at {:#x} read=invalidated\n",
-                    name,
-                    drift,
-                    image.data_size,
-                    image.data_phys,
-                ),
-                Err(error) => dev_warn!(
-                    pdev.as_ref(),
-                    "G17PMARK fw-drift role={} unreadable ({:?})\n",
-                    name,
-                    error
-                ),
-            }
-            if restore {
-                let result = crate::pgtable::UatPageTable::restore_firmware_physical_range(
-                    image.data_phys,
-                    pristine,
-                );
-                dev_info!(
-                    pdev.as_ref(),
-                    "G17PMARK fw-restore role={} ok={} ({:#x}+{:#x})\n",
-                    name,
-                    result.is_ok(),
-                    image.data_phys,
-                    image.data_size,
-                );
-            }
-        }
     }
 
     /// Rebuild a crashed session so a NEW client can still open the device.
@@ -7997,8 +7822,6 @@ impl G17PLiveRuntime {
             boot_stop_unproven: false,
             session_recovery_pending: false,
             runtime_pm_armed: false,
-            #[cfg(CONFIG_DEV_COREDUMP)]
-            firmware_data,
             gfx_state: Some(session.gfx_state),
             gfx_rtkit: Some(session.gfx_rtkit),
             gfx1_state: Some(session.gfx1_state),
@@ -8316,27 +8139,13 @@ impl g17_lifecycle::PersistentRuntimeRecovery for G17PLiveRuntime {
         let pdev = self.pdev.as_ref().ok_or(ENODEV)?.clone();
         let drm = self.drm.as_ref().ok_or(ENODEV)?.clone();
         if *module_parameters::g17p_asc_restart.value() >= 2 {
-            let cycled = match self.cycle_gfx_power_domain(&pdev) {
-                Ok(()) => true,
-                Err(error) => {
-                    dev_err!(
-                        pdev.as_ref(),
-                        "G17PMARK asc-powercycle failed ({:?}); continuing with the plain CPU_RUN restart\n",
-                        error
-                    );
-                    false
-                }
-            };
-            // Only restore when the domain actually cycled. Clearing CPU_RUN is
-            // a gate on this ASCWrap v6, not a reset: if the gate failed the
-            // firmware may still be live, and writing 1.2MB into a running
-            // IOP's globals is not a diagnostic, it is corruption. Reporting
-            // drift is a pure read and stays unconditional.
-            #[cfg(CONFIG_DEV_COREDUMP)]
-            self.report_and_restore_firmware_data(
-                &pdev,
-                cycled && *module_parameters::g17p_asc_restart.value() >= 3,
-            );
+            if let Err(error) = self.cycle_gfx_power_domain(&pdev) {
+                dev_err!(
+                    pdev.as_ref(),
+                    "G17PMARK asc-powercycle failed ({:?}); continuing with the plain CPU_RUN restart\n",
+                    error
+                );
+            }
         }
         let (boot_result, stop_unproven) = {
             let registers = self.registers.as_ref().ok_or(ENODEV)?;
