@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""Observe one native M5 SKSM CL add-kicks record, without patching code.
+"""Observe native M5 SKSM submission, with an explicit program-replay mode.
 
 Pinned 25G76 AGXCLChannelSKSM::submitBuffer, 0xfffffe0008984fc0:
 the preceding stores completed the tag-14 record at x2; x24 still holds
@@ -8,6 +8,8 @@ queue+0x14 as stride, and the low byte of queue+0x48 as entry index.
 Guest-memory reads translate CPU addresses and reject non-DRAM pages.
 M5_SKSM_CAPTURE_MMIO=1 additionally enables the guarded native sampler;
 its qualification flags distinguish valid observations from unread fields.
+M5_SKSM_PROGRAM_REPLAY explicitly opts into a reversible, controlled native
+program-page experiment. Without that option this observer remains read-only.
 """
 import hashlib
 import json
@@ -54,6 +56,25 @@ if (not isinstance(_m5_sksm_extra_views, list) or len(_m5_sksm_extra_views) > 4
     raise ValueError('M5 extra context views require up to four [GPU VA, size] pairs')
 if _m5_sksm_priority is not None and _m5_sksm_priority not in range(4):
     raise ValueError('M5 SKSM priority must be in 0..3')
+_m5_sksm_replay_config = json.loads(os.environ.get('M5_SKSM_PROGRAM_REPLAY', 'null'))
+if _m5_sksm_replay_config is not None:
+    if (not isinstance(_m5_sksm_replay_config, dict)
+            or not {'native', 'linux', 'workload'} <= set(_m5_sksm_replay_config)
+            or set(_m5_sksm_replay_config) - {'native', 'linux', 'workload', 'variant', 'stamp'}
+            or any(not isinstance(_m5_sksm_replay_config[k], str)
+                   or not Path(_m5_sksm_replay_config[k]).is_absolute()
+                   for k in ('native', 'linux', 'workload'))
+            or _m5_sksm_replay_config.get('variant', 'linux-pages') not in ('linux-pages', 'shader-body-only', 'shader-record', 'shader-prefix')
+            or not (_m5_sksm_replay_config.get('stamp', 1) == 'captured'
+                    or (type(_m5_sksm_replay_config.get('stamp', 1)) is int
+                        and 1 <= _m5_sksm_replay_config.get('stamp', 1) < 256))
+            or _m5_sksm_priority != 2
+            or os.environ.get('M5_SKSM_CAPTURE_COMPLETION') != '1'
+            or _m5_sksm_extra_views != [[0x10000000000, 0x4000],
+                                       [0x1000001c000, 0x4000],
+                                       [0x10000090000, 0x4000]]
+            or getattr(getattr(hv, 'm5_program_replay', None), 'active', False)):
+        raise ValueError('Replay requires explicit capture paths, priority 2, all program views and completion')
 _m5_sksm_roots = re.findall(r'\buat_global_root_pa=(0x[0-9a-f]+)',
                            (_m5_sksm_output / 'console.log').read_text())
 if len(set(_m5_sksm_roots)) != 1:
@@ -138,6 +159,7 @@ def _m5_sksm_submit(ctx):
                     pc=hex(int(ctx.elr)), objects=[], device_memory_read=_m5_sksm_monitor is not None,
                     requested_priority=_m5_sksm_priority, observed_submissions=_m5_sksm_hits,
                     excluded_queue_ids=sorted(_m5_sksm_exclude), observations=_m5_sksm_observations)
+    replay = None
     if _m5_pool_control_observations:
         manifest['prior_pool_controls'] = _m5_pool_control_observations
 
@@ -547,11 +569,13 @@ def _m5_sksm_submit(ctx):
                     completion_ctx.elr += 4
                     return True
                 hv.remove_hw_bp(completion_pc)
+                matching_completed = False
                 try:
                     if int(completion_ctx.regs[0]) != descriptor_address:
                         raise ValueError('Matching M5 descriptor did not complete within 64 callbacks')
                     if _m5_sksm_read_cpu(completion_pc, 8) != bytes.fromhex('f30300aa080840f9'):
                         raise ValueError('M5 completion site differs from pinned native code')
+                    matching_completed = True
                     if _m5_sksm_monitor is not None:
                         manifest['mmio_at_completion'] = _m5_sksm_monitor.capture(qid)
                     save('completed-host-cl-descriptor', descriptor_address, 0x800)
@@ -579,18 +603,55 @@ def _m5_sksm_submit(ctx):
                 except Exception as error:
                     manifest['completion_error'] = str(error)
                     print('M5_SKSM_COMPLETION_CAPTURE_FAILED', repr(error))
+                if replay is not None and matching_completed:
+                    try:
+                        replay.restore()
+                        manifest['program_replay_state'] = replay.receipt['state']
+                        print('M5_PROGRAM_REPLAY_RESTORED: three original native program pages verified')
+                    except Exception as error:
+                        manifest['program_replay_restore_error'] = str(error)
+                        print('M5_PROGRAM_REPLAY_RESTORE_FAILED', repr(error))
                 manifest['bytes_read'] = _m5_sksm_read_bytes
                 (directory / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
-                return True
+                # A failed or unmatched restoration must leave the guest
+                # paused. The journal and hv.m5_program_replay remain available.
+                return replay is None or not replay.active
 
             hv.add_hw_bp(completion_pc, hook=completed)
+            if _m5_sksm_replay_config is not None:
+                expected_stamp = _m5_sksm_replay_config.get('stamp', 1)
+                # Queue IDs and stamps can be recycled independently of the
+                # process. Opt-in 'captured' uses the observed stamp while
+                # retaining every exact program, context and buffer guard.
+                if expected_stamp == 'captured':
+                    expected_stamp = stamp
+                if (stamp != expected_stamp or count != 1 or manifest.get('compute_context') != 3
+                        or _m5_sksm_read_cpu(completion_pc, 8) != bytes.fromhex('f30300aa080840f9')):
+                    raise ValueError('Replay requires a single controlled command at the explicit stamp and pinned completion')
+                from m5_program_replay import M5ProgramReplay
+                replay = M5ProgramReplay(_m5_sksm_gpu,
+                    lambda pa, data: hv.iface.writemem(pa | 0xa0000000000, data),
+                    hv.p.dc_civac, manifest['compute_context'],
+                    int(hv.u.adt['/arm-io/sgx'].gpu_region_base), directory)
+                hv.m5_program_replay = replay
+                replay.prepare(**{k: v for k, v in _m5_sksm_replay_config.items() if k != 'stamp'})
+                replay.apply()
+                os.environ.pop('M5_SKSM_PROGRAM_REPLAY', None)
+                manifest.update(program_memory_written=True,
+                                program_replay_state=replay.receipt['state'],
+                                program_replay_expected_stamp=hex(expected_stamp),
+                                program_replay_receipt='program-replay.json')
+                print('M5_PROGRAM_REPLAY_APPLIED: variant=%s, three program-page readbacks verified' %
+                      replay.receipt.get('variant', 'linux-pages'))
     except Exception as error:
         manifest['error'] = str(error)
         print('M5_SKSM_SUBMIT_CAPTURE_FAILED', repr(error))
     finally:
         manifest['bytes_read'] = _m5_sksm_read_bytes
         (directory / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
-    return True
+    # apply() rolls back any partial writes before publication. If restoration
+    # itself failed, stop here instead of publishing a partially modified job.
+    return replay is None or not replay.active or replay.receipt['state'] == 'applied'
 
 
 hv.add_hw_bp(_m5_sksm_pc, hook=_m5_sksm_submit)
@@ -678,4 +739,5 @@ if os.environ.get('M5_SKSM_CAPTURE_POOL') == '1':
     hv.add_hw_bp(_m5_pool_control_pc, hook=_m5_pool_control)
     _m5_pool_control_armed = True
 print('M5_SKSM_SUBMIT_ARMED: one native compute kick queue, bounded DRAM'
-      + (' and guarded MMIO observations' if _m5_sksm_monitor is not None else ' only'))
+      + (' and guarded MMIO observations' if _m5_sksm_monitor is not None else '')
+      + ('; CONTROLLED PROGRAM REPLAY ENABLED' if _m5_sksm_replay_config is not None else '; read-only'))

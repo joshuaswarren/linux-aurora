@@ -299,6 +299,86 @@ class CaptureTests(unittest.TestCase):
             self.assertEqual(struct.unpack_from('<I', (path.parent / 'channel-pointers-before.bin').read_bytes(), 0x20)[0], 0)
             self.assertEqual(struct.unpack_from('<I', (path.parent / 'channel-pointers-after.bin').read_bytes(), 0x20)[0], 1)
 
+    def test_replay_completion_restores_before_return_or_keeps_guest_paused(self):
+        for failure in (False, True):
+            with self.subTest(restore_failure=failure), tempfile.TemporaryDirectory() as directory:
+                hv = FakeHV(directory, stride=0x200)
+                payload_address = 0xfffffc2040000000
+                payload = bytearray(0x4000)
+                struct.pack_into('<I', payload, 0, 3)
+                struct.pack_into('<4H', payload, 0x18, 37, 39, 39, 40)
+                for i, (number, value) in enumerate([(0x10201, 0x300), (0x1a420, 0x100000b0000),
+                                                    (0x1a510, 0x100000e0000), (0x14070, 0x1000018001)]):
+                    struct.pack_into('<IQ', payload, 0x40+i*12, number, value)
+                struct.pack_into('<Q', hv.memory, 0x10210, payload_address)
+                hv.gpu_views[payload_address] = payload
+                channel_address, pointers_address = payload_address + 0x4000, payload_address + 0x8000
+                channel = bytearray(0x4000)
+                struct.pack_into('<Q', channel, 0, pointers_address)
+                struct.pack_into('<Q', hv.memory, 0x10218, channel_address)
+                hv.gpu_views[channel_address] = channel
+                hv.gpu_views[pointers_address] = bytearray(0x100)
+                completion_address = 0xfffffc2050000000
+                hv.gpu_views[completion_address] = bytearray(0x20000)
+                hardware = bytearray(0x28000)
+                struct.pack_into('<QQIIQ', hardware, 0x2614+2*32,
+                                 0x7001000000, completion_address, 0x800, 0x40, 2)
+                preinit = Path(directory) / 'preinit/gfx-asc'
+                preinit.mkdir(parents=True)
+                (preinit / 'shared-cluster.bin').write_bytes(hardware)
+                views = [[0x10000000000, 0x4000], [0x1000001c000, 0x4000], [0x10000090000, 0x4000]]
+                for address, size in views:
+                    hv.context_views[(3, address, size)] = bytes(size)
+                hv.p.dc_civac = lambda *_: None
+                events = []
+
+                class Replay:
+                    active = False
+                    receipt = {'state': 'unprepared'}
+
+                    def __init__(self, *_):
+                        pass
+
+                    def prepare(self, **_):
+                        events.append('prepare')
+
+                    def apply(self):
+                        self.active = True
+                        self.receipt = {'state': 'applied'}
+                        events.append('apply')
+
+                    def restore(self):
+                        events.append('restore')
+                        if failure:
+                            raise IOError('simulated restoration failure')
+                        self.active = False
+                        self.receipt = {'state': 'restored'}
+
+                options = dict(M5_GPU_TRACE_DIR=directory, M5_SKSM_CAPTURE_PRIORITY='2',
+                    M5_SKSM_CAPTURE_COMPLETION='1', M5_SKSM_CONTEXT_VIEWS=json.dumps(views),
+                    M5_SKSM_PROGRAM_REPLAY=json.dumps(dict(native='/native', linux='/linux', workload='/workload')))
+                with patch.dict(os.environ, options), contextlib.redirect_stdout(io.StringIO()), \
+                        patch.dict(sys.modules, m5_program_replay=SimpleNamespace(M5ProgramReplay=Replay)):
+                    self.run_script(hv)
+                    self.assertTrue(hv.hook(hv.ctx))
+                    captured, = Path(directory).glob('sksm-submit-*/manifest.json')
+                    self.assertEqual(events, ['prepare', 'apply'], captured.read_text())
+                    self.assertEqual(hv.breakpoints, [COMPLETE_PC])
+                    hv.ctx.elr, hv.ctx.regs[0] = COMPLETE_PC, DESCRIPTOR
+                    self.assertEqual(hv.hook(hv.ctx), not failure)
+                    self.assertEqual(events, ['prepare', 'apply', 'restore'])
+                    self.assertEqual(hv.m5_program_replay.active, failure)
+                    self.assertEqual(hv.breakpoints, [])
+
+    def test_replay_refuses_missing_completion_before_arming(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hv = FakeHV(directory)
+            with patch.dict(os.environ, M5_GPU_TRACE_DIR=directory,
+                            M5_SKSM_PROGRAM_REPLAY='{"native":"/native","linux":"/linux","workload":"/workload"}'):
+                with self.assertRaisesRegex(ValueError, 'Replay requires'):
+                    self.run_script(hv)
+            self.assertEqual(hv.breakpoints, [])
+
 
 if __name__ == '__main__':
     unittest.main()

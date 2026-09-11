@@ -63,7 +63,7 @@ fn main() {
     pages = [generated[48 + i * 0x4000:48 + (i + 1) * 0x4000] for i in range(6)]
     labels = ['compute-extra-0', 'compute-usc', 'compute-cdm',
               'compute-preempt', 'compute-extra-1', 'compute-robustness']
-    ranges = [(0x3c0, 0x400), (0, 132), (0, 48), (0, 0x4000),
+    ranges = [(0, 0x400), (0, 132), (0, 48), (0, 0x4000),
               (0xd00, 0x2d00), (0, 0x4000)]
     assert subprocess.check_output([str(executable), 'check'], input=pages[4]).strip() == b'0 1024 1024'
     completed = 0
@@ -101,5 +101,5 @@ fn main() {
             completed += 1
     print(json.dumps(dict(captures_matched=len(args.captures), completed_results_matched=completed,
                          mapping_profiles_matched=mapping_profiles,
-                         pages_per_capture=6, shader_bytes=64, pipeline_bytes=132,
+                         pages_per_capture=6, shader_bytes=1024, pipeline_bytes=132,
                          cdm_bytes=48, linux_execution_qualified=False)))
