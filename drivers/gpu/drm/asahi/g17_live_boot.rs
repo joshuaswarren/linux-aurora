@@ -94,6 +94,100 @@ const G17P_POWER_WIRE_POLLS: usize = 20;
 const G17P_POWER_WIRE_POWERED_POLLS: usize = 250;
 const G17P_RTKIT_UAT_DVA_MASK: u64 = (1u64 << 40) - 1;
 
+/// One role's iBoot-placed RTKit image, from the live J700 ADT.
+///
+/// `/arm-io/gfx-asc` and `/arm-io/gfx1-asc` each carry a `segment-ranges`
+/// property of 32-byte records `{u64 phys, u64 iova, u64 remap, u32 size,
+/// u32 flags}`. On T8140 there are two segments per role, `__TEXT;__DATA`,
+/// and `remap == phys`. Everything here is below the start of System RAM, so
+/// Linux never maps it and cannot corrupt it -- but the firmware writes its
+/// own `__DATA` the whole time it runs, and nothing puts it back.
+#[derive(Debug, Copy, Clone)]
+struct G17PFirmwareImage {
+    text_phys: u64,
+    data_phys: u64,
+    data_size: usize,
+}
+
+const G17P_GFX_FIRMWARE_IMAGE: G17PFirmwareImage = G17PFirmwareImage {
+    text_phys: 0x1_0000_974000,
+    data_phys: 0x1_0001_d7c000,
+    data_size: 0x13_4000,
+};
+
+const G17P_GFX1_FIRMWARE_IMAGE: G17PFirmwareImage = G17PFirmwareImage {
+    text_phys: 0x1_0000_9c0000,
+    data_phys: 0x1_0001_eb0000,
+    data_size: 0x12_c000,
+};
+
+/// Pristine `__DATA` for both roles, taken before either processor ever ran.
+#[cfg(CONFIG_DEV_COREDUMP)]
+struct G17PFirmwareDataSnapshot {
+    gfx: KVVec<u8>,
+    gfx1: KVVec<u8>,
+}
+
+/// Snapshot both roles' `__DATA` while it is still exactly as iBoot left it.
+///
+/// Refuses unless each role's live IORVBAR names precisely the `__TEXT` base
+/// this geometry expects, with its valid bit set. That reset vector is the one
+/// on-machine witness that the ADT-derived addresses describe THIS board, and
+/// it is read from the provider's own mapping, so a wrong table can never send
+/// a write somewhere it does not belong.
+#[cfg(CONFIG_DEV_COREDUMP)]
+fn snapshot_g17p_firmware_data(pdev: &platform::Device) -> Option<G17PFirmwareDataSnapshot> {
+    let images = [G17P_GFX_FIRMWARE_IMAGE, G17P_GFX1_FIRMWARE_IMAGE];
+    for (index, image) in images.iter().enumerate() {
+        let provider = G17PMailboxProvider::get(pdev.as_ref(), index).ok()?;
+        let observed = provider.asc_snapshot().ok()?;
+        let expected = image.text_phys | 1;
+        if observed.iorvbar != expected {
+            dev_warn!(
+                pdev.as_ref(),
+                "G17PMARK fw-snapshot role={} REFUSED: iorvbar={:#x} expected={:#x}; the pinned carveout geometry does not describe this board\n",
+                index,
+                observed.iorvbar,
+                expected
+            );
+            return None;
+        }
+    }
+    let gfx = crate::pgtable::UatPageTable::copy_firmware_physical_range(
+        G17P_GFX_FIRMWARE_IMAGE.data_phys,
+        G17P_GFX_FIRMWARE_IMAGE.data_size,
+    )
+    .ok()?;
+    let gfx1 = crate::pgtable::UatPageTable::copy_firmware_physical_range(
+        G17P_GFX1_FIRMWARE_IMAGE.data_phys,
+        G17P_GFX1_FIRMWARE_IMAGE.data_size,
+    )
+    .ok()?;
+    dev_info!(
+        pdev.as_ref(),
+        "G17PMARK fw-snapshot armed gfx __DATA {:#x}+{:#x} gfx1 __DATA {:#x}+{:#x}; both reset vectors match the pinned __TEXT bases\n",
+        G17P_GFX_FIRMWARE_IMAGE.data_phys,
+        G17P_GFX_FIRMWARE_IMAGE.data_size,
+        G17P_GFX1_FIRMWARE_IMAGE.data_phys,
+        G17P_GFX1_FIRMWARE_IMAGE.data_size,
+    );
+    Some(G17PFirmwareDataSnapshot { gfx, gfx1 })
+}
+
+/// How many bytes of a role's live `__DATA` differ from its pristine copy.
+#[cfg(CONFIG_DEV_COREDUMP)]
+fn count_g17p_firmware_data_drift(image: &G17PFirmwareImage, pristine: &[u8]) -> Result<usize> {
+    let live = crate::pgtable::UatPageTable::copy_firmware_physical_range(
+        image.data_phys,
+        image.data_size,
+    )?;
+    Ok(live
+        .iter()
+        .zip(pristine.iter())
+        .filter(|(a, b)| a != b)
+        .count())
+}
+
 /// Runtime-PM entry points the Rust `kernel` crate does not wrap.
 ///
 /// All of these are `EXPORT_SYMBOL_GPL` in `drivers/base/power/runtime.c`.
@@ -2992,6 +3086,11 @@ pub(crate) struct G17PLiveRuntime {
     /// shared `gfx` power domain can be gated deliberately. Armed at most
     /// once, lazily, and only when a restart mode asks for it.
     runtime_pm_armed: bool,
+    /// Both roles' firmware `__DATA` exactly as iBoot left it, taken before
+    /// either processor was ever started. `None` when the pinned carveout
+    /// geometry did not match this board's reset vectors.
+    #[cfg(CONFIG_DEV_COREDUMP)]
+    firmware_data: Option<G17PFirmwareDataSnapshot>,
     gfx_state: Option<Arc<G17PRoleRtkitState>>,
     gfx_rtkit: Option<rtkit::RtKit<G17PRtkitOps>>,
     gfx1_state: Option<Arc<G17PRoleRtkitState>>,
@@ -3715,6 +3814,63 @@ impl G17PLiveRuntime {
             return Err(EIO);
         }
         Ok(())
+    }
+
+    /// Say how far each role's firmware `__DATA` has drifted from the copy
+    /// iBoot left, and at restart mode 3 put it back.
+    ///
+    /// A power-cycled ASC re-enters at `IORVBAR`, which is the `__TEXT` base:
+    /// the code is pristine, but every global the previous firmware instance
+    /// wrote is still sitting in `__DATA`. Measured on J700, a restarted
+    /// processor does execute and then immediately sends on the crashlog
+    /// endpoint instead of HELLO, which is exactly what re-entering over dirty
+    /// globals looks like. The drift count says whether that reading is right;
+    /// the restore tests it.
+    #[cfg(CONFIG_DEV_COREDUMP)]
+    fn report_and_restore_firmware_data(&self, pdev: &platform::Device) {
+        let restore = *module_parameters::g17p_asc_restart.value() >= 3;
+        let Some(snapshot) = self.firmware_data.as_ref() else {
+            dev_warn!(
+                pdev.as_ref(),
+                "G17PMARK fw-restore unavailable: no pristine __DATA snapshot was taken at probe\n"
+            );
+            return;
+        };
+        for (name, image, pristine) in [
+            ("gfx", &G17P_GFX_FIRMWARE_IMAGE, &snapshot.gfx),
+            ("gfx1", &G17P_GFX1_FIRMWARE_IMAGE, &snapshot.gfx1),
+        ] {
+            match count_g17p_firmware_data_drift(image, pristine) {
+                Ok(drift) => dev_info!(
+                    pdev.as_ref(),
+                    "G17PMARK fw-drift role={} bytes_changed={} of {} at {:#x}\n",
+                    name,
+                    drift,
+                    image.data_size,
+                    image.data_phys,
+                ),
+                Err(error) => dev_warn!(
+                    pdev.as_ref(),
+                    "G17PMARK fw-drift role={} unreadable ({:?})\n",
+                    name,
+                    error
+                ),
+            }
+            if restore {
+                let result = crate::pgtable::UatPageTable::restore_firmware_physical_range(
+                    image.data_phys,
+                    pristine,
+                );
+                dev_info!(
+                    pdev.as_ref(),
+                    "G17PMARK fw-restore role={} ok={} ({:#x}+{:#x})\n",
+                    name,
+                    result.is_ok(),
+                    image.data_phys,
+                    image.data_size,
+                );
+            }
+        }
     }
 
     /// Rebuild a crashed session so a NEW client can still open the device.
@@ -7822,6 +7978,8 @@ impl G17PLiveRuntime {
             boot_stop_unproven: false,
             session_recovery_pending: false,
             runtime_pm_armed: false,
+            #[cfg(CONFIG_DEV_COREDUMP)]
+            firmware_data,
             gfx_state: Some(session.gfx_state),
             gfx_rtkit: Some(session.gfx_rtkit),
             gfx1_state: Some(session.gfx1_state),
@@ -8146,6 +8304,10 @@ impl g17_lifecycle::PersistentRuntimeRecovery for G17PLiveRuntime {
                     error
                 );
             }
+            // After the gate and before either CPU is released: the processor
+            // is in reset and nothing else can be reading its globals.
+            #[cfg(CONFIG_DEV_COREDUMP)]
+            self.report_and_restore_firmware_data(&pdev);
         }
         let (boot_result, stop_unproven) = {
             let registers = self.registers.as_ref().ok_or(ENODEV)?;
