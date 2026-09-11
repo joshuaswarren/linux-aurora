@@ -4,6 +4,7 @@
 use core::ops::Range;
 
 pub(crate) const DRIVER_BASE: u64 = 0x10_0000_0000;
+pub(crate) const DRIVER_END: u64 = DRIVER_BASE + (32u64 << 30);
 pub(crate) const COMPACT_END: u64 = DRIVER_BASE + (1u64 << 32);
 const DATA_START: u64 = 0x40_0000_0000;
 

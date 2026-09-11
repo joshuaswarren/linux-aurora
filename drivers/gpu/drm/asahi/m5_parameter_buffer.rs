@@ -87,32 +87,6 @@ impl M5ParameterBuffer {
         Ok(aliases)
     }
 
-    /// Map the retained pool into another application VM at the same compact
-    /// addresses with the original two-page guard reservations, so the
-    /// firmware's parameter-manager records keep naming valid pages after a
-    /// render client handoff.
-    pub(super) fn alias_into(&mut self, vm: &mmu::Vm) -> Result<KVec<mmu::KernelMapping>> {
-        let range = m5_vm::compact_range(&vm.kernel_range()).ok_or(EINVAL)?;
-        let mut aliases = KVec::new();
-        let alias = |object: &mut MappedObject, aliases: &mut KVec<mmu::KernelMapping>| -> Result {
-            let end = object.iova()
-                .checked_add((object.logical_size + 2 * mmu::UAT_PGSZ) as u64)
-                .ok_or(EOVERFLOW)?;
-            if object.iova() < range.start || end > range.end { return Err(ERANGE); }
-            let mapping = object.map_alias_at_with_guards(
-                vm, object.iova(), mmu::PROT_GPU_SHARED_RW, 2)?;
-            aliases.push(mapping, GFP_KERNEL)?;
-            Ok(())
-        };
-        for block in self.blocks.iter_mut() { alias(block, &mut aliases)?; }
-        alias(&mut self.page_list, &mut aliases)?;
-        alias(&mut self.metrics, &mut aliases)?;
-        alias(&mut self.scene_scratch, &mut aliases)?;
-        alias(&mut self.discard, &mut aliases)?;
-        self.validate(vm)?;
-        Ok(aliases)
-    }
-
     fn validate(&self, vm: &mmu::Vm) -> Result {
         let check = |object: &MappedObject| -> Result {
             let start = object.iova();

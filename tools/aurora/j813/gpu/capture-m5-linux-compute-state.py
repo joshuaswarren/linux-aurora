@@ -41,6 +41,8 @@ parser.add_argument('--graphics-shared-list', action='store_true',
                     help='Use the shared completion-list and uncached stamp layout for mode12')
 parser.add_argument('--graphics-usc-pool', action='store_true',
                     help='Capture relocated graphics USC addresses and unmapped guard-page walks')
+parser.add_argument('--graphics-parameter-buffer', action='store_true',
+                    help='Capture the dynamic parameter-buffer directory and firmware aliases')
 parser.add_argument('--context', type=int, choices=range(3, 64), default=3,
                     help='Application root slot used by the mode12 graphics draw')
 args = parser.parse_args()
@@ -48,6 +50,8 @@ if args.graphics_shared_list and not args.after_graphics_draw:
     parser.error('--graphics-shared-list requires --after-graphics-draw')
 if args.graphics_usc_pool and not args.after_graphics_draw:
     parser.error('--graphics-usc-pool requires --after-graphics-draw')
+if args.graphics_parameter_buffer and not args.after_graphics_draw:
+    parser.error('--graphics-parameter-buffer requires --after-graphics-draw')
 if args.context != 3 and not args.after_graphics_draw:
     parser.error('--context requires --after-graphics-draw')
 if args.triangle and not (args.after_success or args.after_live_snapshot):
@@ -237,6 +241,59 @@ with Serial('/dev/cu.kis-01100000-ch-0', 115200, timeout=0.2) as port:
                           ('graphics-submitted-total', 0xfffffc20c1080000, 0x4000, 0)]
         for label, address, size, context in views:
             save(label, address, size, context)
+        if args.graphics_parameter_buffer:
+            state = walker.read(0xfffffc20c100c000, 0x90, context=0)
+            scene = walker.read(0xfffffc20c1030080, 0x80, context=0)
+            page_list_high, page_list = struct.unpack_from('<QQ', state, 0x20)
+            block_table = struct.unpack_from('<Q', state, 0x44)[0]
+            metrics, metrics_high = struct.unpack_from('<QQ', scene, 0)
+            # Only the known 48-page/three-block profile is admitted here.
+            if struct.unpack_from('<I', state, 0x34)[0] != 48:
+                raise ValueError('Unexpected M5 parameter-buffer capacity')
+            save('graphics-pb-blocks', block_table, 24, 0)
+            save('graphics-pb-pages', page_list, 48 * 4, args.context)
+            save('graphics-pb-pages-firmware', page_list_high, 48 * 4, 0)
+            save('graphics-pb-scene', 0xfffffc20c1030080, 0x80, 0)
+            save('graphics-pb-metrics', metrics & ~0x3fff, 0x100, args.context)
+            save('graphics-pb-metrics-firmware', metrics_high & ~0x3fff, 0x100, 0)
+            raw_blocks = walker.read(block_table, 24, context=0)
+            blocks = [0x1000000000 + (struct.unpack_from('<I', raw_blocks, i * 8)[0] << 15)
+                      for i in range(3)]
+            scene_base = 0x1000000000 + struct.unpack_from('<Q', scene, 0x28)[0] - 0x40
+            discard = 0x1000000000 + struct.unpack_from('<Q', state, 0x84)[0]
+            spans = [(base, 0x80000) for base in blocks] + [
+                (page_list, 0x1c000), (metrics & ~0x3fff, 0x4000),
+                (scene_base, 0x4000), (discard, 0x8000)]
+            manifest['graphics_pb_spans'] = []
+            for base, size in spans:
+                if base & 0x7fff or not 0x1000000000 <= base < base + size + 0x8000 <= 0x1100000000:
+                    raise ValueError('Parameter-buffer span escaped the compact arena')
+                pages = []
+                for offset in range(0, size, 0x4000):
+                    physical, walk = walker.translate(args.context, base + offset)
+                    pages.append(dict(address=hex(base + offset), physical=hex(physical),
+                        walk=[[hex(a), hex(e)] for a, e in walk]))
+                guards = []
+                for address in (base + size, base + size + 0x4000):
+                    walk = []
+                    def guard_read(physical, length):
+                        raw = read_phys(physical, length)
+                        if length != 8:
+                            raise ValueError('Unexpected parameter-buffer guard read size')
+                        walk.append([hex(physical), hex(int.from_bytes(raw, 'little'))])
+                        return raw
+                    guard_walker = G17PUATReader(read_phys, props['gpu-region-base'],
+                        read_root=guard_read, read_table=guard_read)
+                    try:
+                        guard_walker.translate(args.context, address)
+                    except RuntimeError as error:
+                        if not str(error).startswith('unmapped G17P UAT address '):
+                            raise
+                    else:
+                        raise RuntimeError('Parameter-buffer guard acquired a mapping')
+                    guards.append(dict(address=hex(address), walk=walk))
+                manifest['graphics_pb_spans'].append(dict(address=hex(base), size=size,
+                    context=args.context, pages=pages, guards=guards))
         if args.graphics_usc_pool:
             state = walker.read(0xfffffc20c101c000, 0x70, context=0)
             directory = struct.unpack_from('<Q', state, 0x14)[0]

@@ -71,10 +71,13 @@ def read_capture(directory, context=3):
     return rgba, objects
 
 
-def verify_usc_pool(objects, manifest, context):
+def verify_usc_pool(objects, manifest, context, profile='upper'):
     """Check relocated USC records and the recorded invalid-PTE guard walks."""
     end = (1 << 42) - 0x8000
-    reserved = (end - (32 << 30), end)
+    if profile not in ('upper', 'application'):
+        raise ValueError('Unknown USC reservation profile')
+    reserved = ((end - (32 << 30), end) if profile == 'upper'
+                else (0x1100000000, 0x1800000000))
     units = 19 * 512
     state_item, state = objects['graphics-usc-state']
     slot_item, slot = objects['graphics-uma-slot']
@@ -150,6 +153,110 @@ def verify_usc_pool(objects, manifest, context):
     return dict(reserved_start=hex(reserved[0]), reserved_end=hex(reserved[1]),
                 directory=hex(directory), blocks=19, capacity_bytes=19 * 0x200000,
                 unmapped_guard_pages=len(guards))
+
+
+def verify_mapping_walk(objects, context, address, walk, physical=None):
+    root_item, roots = objects['context-root-table']
+    table = int(root_item['address'], 16) + context * 16
+    levels = ((42, 2), (36, 64), (25, 2048), (14, 2048))
+    if not 2 <= len(walk) <= 4 or (physical is not None and len(walk) != 4):
+        raise ValueError('Incomplete parameter-buffer mapping walk')
+    for level, (slot, value) in enumerate(walk):
+        slot, value = int(slot, 16), int(value, 16)
+        shift, count = levels[level]
+        index = (address >> shift) & (count - 1)
+        if slot != table + index * 8:
+            raise ValueError('Parameter-buffer walk follows a different page table')
+        if level == 0 and value != struct.unpack_from('<Q', roots, context * 16 + index * 8)[0]:
+            raise ValueError('Parameter-buffer walk has a different root')
+        if physical is None and level == len(walk) - 1:
+            if value & 1:
+                raise ValueError('Parameter-buffer guard is mapped')
+        elif not value & 1 or (level and value & 3 != 3):
+            raise ValueError('Parameter-buffer data page is unmapped')
+        table = value & 0x0000ffffffffc000
+    if physical is not None and table + (address & 0x3fff) != physical:
+        raise ValueError('Parameter-buffer physical mapping disagrees with its PTE')
+
+
+def verify_parameter_buffer(objects, manifest, context):
+    u32 = lambda raw, off: struct.unpack_from('<I', raw, off)[0]
+    u64 = lambda raw, off: struct.unpack_from('<Q', raw, off)[0]
+    def get(label, address, size, ctx):
+        item, raw = objects[label]
+        if item['context'] != ctx or int(item['address'], 16) != address or len(raw) != size:
+            raise ValueError('Unexpected parameter-buffer record: ' + label)
+        return raw
+    state = get('graphics-pm-state', 0xfffffc20c100c000, 0x400, 0)
+    scene = get('graphics-pb-scene', 0xfffffc20c1030080, 0x80, 0)
+    block_table = get('graphics-pb-blocks', u64(state, 0x44), 24, 0)
+    page_list, page_list_high = u64(state, 0x28), u64(state, 0x20)
+    slot = get('graphics-pb-slot', 0xfffffc20015e0000, 16, 0)
+    segment = (((page_list + 0x7000000000) & 0x7000000000) >> 8) & 0xf0000000
+    if ((u32(slot, 0) & ~7) != ((page_list >> 4) & 0xfffffff8)
+            or u32(slot, 4) != segment | 48 or u32(slot, 8) != u32(slot, 12)):
+        raise ValueError('Parameter-buffer descriptor has a different directory or active pages')
+    pages = get('graphics-pb-pages', page_list, 192, context)
+    if pages != get('graphics-pb-pages-firmware', page_list_high, 192, 0):
+        raise ValueError('Parameter-buffer firmware page-list bytes differ')
+    if (u32(state, 0x30), u32(state, 0x34), u32(state, 0x3c), u32(state, 0x58)) != (0x1c000, 48, 3, 0x80000):
+        raise ValueError('Parameter-buffer capacity differs from the qualified profile')
+    block_pages = [u32(block_table, i * 8) for i in range(3)]
+    expected_pages = {first + page for first in block_pages for page in range(16)}
+    if len(expected_pages) != 48 or set(struct.unpack('<48I', pages)) != expected_pages:
+        raise ValueError('Parameter-buffer page list does not name the owned blocks')
+    blocks = [0x1000000000 + (first << 15) for first in block_pages]
+    metrics, metrics_high = u64(scene, 0) - 0x40, u64(scene, 8) - 0x40
+    get('graphics-pb-metrics', metrics, 0x100, context)
+    get('graphics-pb-metrics-firmware', metrics_high, 0x100, 0)
+    for low_name, high_name in [('graphics-pb-pages', 'graphics-pb-pages-firmware'),
+                                ('graphics-pb-metrics', 'graphics-pb-metrics-firmware')]:
+        low, high = objects[low_name][0], objects[high_name][0]
+        if low['first_mapping']['physical'] != high['first_mapping']['physical']:
+            raise ValueError('Parameter-buffer alias uses different physical backing')
+        for item in (low, high):
+            mapping = item['first_mapping']
+            verify_mapping_walk(objects, item['context'], int(item['address'], 16),
+                                mapping['walk'], int(mapping['physical'], 16))
+    spans = [(base, 0x80000) for base in blocks] + [
+        (page_list, 0x1c000), (metrics, 0x4000),
+        (0x1000000000 + u64(scene, 0x28) - 0x40, 0x4000),
+        (0x1000000000 + u64(state, 0x84), 0x8000)]
+    proofs = manifest.get('graphics_pb_spans', [])
+    if len(proofs) != 7:
+        raise ValueError('Missing parameter-buffer mapping evidence')
+    occupied = []
+    for (base, size), proof in zip(spans, proofs):
+        limit = base + size + 0x8000
+        if base & 0x7fff or not 0x1000000000 <= base < limit <= 0x1100000000:
+            raise ValueError('Parameter-buffer storage escaped the compact driver arena')
+        if (int(proof['address'], 16), proof['size'], proof['context']) != (base, size, context):
+            raise ValueError('Parameter-buffer proof describes another allocation')
+        occupied.append((base, limit))
+        if len(proof['pages']) != size // 0x4000 or len(proof['guards']) != 2:
+            raise ValueError('Missing parameter-buffer page or guard evidence')
+        for label in ('graphics-pb-pages', 'graphics-pb-metrics'):
+            item = objects[label][0]
+            if int(item['address'], 16) == base and (
+                    int(item['first_mapping']['physical'], 16)
+                    != int(proof['pages'][0]['physical'], 16)):
+                raise ValueError('Parameter-buffer data capture and span mapping disagree')
+        for index, page in enumerate(proof['pages']):
+            address = base + index * 0x4000
+            if int(page['address'], 16) != address:
+                raise ValueError('Parameter-buffer page proof describes another address')
+            verify_mapping_walk(objects, context, address, page['walk'], int(page['physical'], 16))
+        for index, guard in enumerate(proof['guards']):
+            address = base + size + index * 0x4000
+            if int(guard['address'], 16) != address:
+                raise ValueError('Parameter-buffer guard proof describes another address')
+            verify_mapping_walk(objects, context, address, guard['walk'])
+    ordered = sorted(occupied)
+    if any(a[1] > b[0] for a, b in zip(ordered, ordered[1:])):
+        raise ValueError('Parameter-buffer allocations or guards overlap')
+    return dict(blocks=[hex(b) for b in blocks], page_list=hex(page_list),
+                capacity_bytes=3 * 0x80000, mapped_pages=sum(s // 0x4000 for _, s in spans),
+                unmapped_guard_pages=14, firmware_aliases_verified=True)
 
 
 def verify_completion(objects, frame=1):
@@ -235,6 +342,10 @@ def main():
     parser.add_argument('--context', type=int, choices=range(3, 64), default=3)
     parser.add_argument('--require-usc-pool', action='store_true',
                         help='Require relocated USC storage and unmapped guards in the driver VA reservation')
+    parser.add_argument('--reservation-profile', choices=('upper', 'application'), default='upper',
+                        help='Expected driver allocation contract; application excludes the compact 4 GiB arena')
+    parser.add_argument('--require-parameter-buffer', action='store_true',
+                        help='Require VM-owned parameter-buffer blocks, aliases and guards')
     args = parser.parse_args()
     if args.frame != 1 and not args.require_completion:
         parser.error('--frame requires --require-completion')
@@ -245,7 +356,10 @@ def main():
         raise ValueError('Linux pixels differ from the qualified native macOS reference')
     completion = verify_completion(objects, args.frame) if args.require_completion else False
     usc_pool = verify_usc_pool(objects,
-        json.loads((args.capture / 'manifest.json').read_text()), args.context) if args.require_usc_pool else None
+        json.loads((args.capture / 'manifest.json').read_text()), args.context,
+        args.reservation_profile) if args.require_usc_pool else None
+    parameter_buffer = verify_parameter_buffer(objects,
+        json.loads((args.capture / 'manifest.json').read_text()), args.context) if args.require_parameter_buffer else None
     args.output.write_bytes(png(rgba, args.scale))
     report = dict(graphics_pixels_verified=True, pixels=WIDTH * HEIGHT,
                   foreground=foreground, background=WIDTH * HEIGHT - foreground,
@@ -256,6 +370,7 @@ def main():
                   completion_frame=args.frame if completion else None,
                   application_context=args.context,
                   usc_pool=usc_pool,
+                  parameter_buffer=parameter_buffer,
                   mesa_glxgears_verified=False, dcp_verified=False)
     args.output.with_suffix('.json').write_text(json.dumps(report, indent=2) + '\n')
     print(json.dumps(report))
