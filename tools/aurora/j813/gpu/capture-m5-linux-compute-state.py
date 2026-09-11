@@ -24,6 +24,7 @@ from m1n1.agx.g17p_trace import G17PUATReader
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('inventory', type=Path)
 parser.add_argument('output', type=Path)
+parser.add_argument('--triangle', action='store_true', help='Require and capture the mode11 compute triangle')
 phase_args = parser.add_mutually_exclusive_group()
 phase_args.add_argument('--before-compute', action='store_true',
                     help='Require successful mode7 setup with its SKSM kick unpublished')
@@ -34,6 +35,8 @@ phase_args.add_argument('--after-live-snapshot', action='store_true',
 phase_args.add_argument('--after-success', action='store_true',
                     help='Require exact compute output, retired queues and no GPU restart')
 args = parser.parse_args()
+if args.triangle and not (args.after_success or args.after_live_snapshot):
+    parser.error('--triangle requires --after-success or --after-live-snapshot')
 inventory_path, output_path = args.inventory, args.output
 inventory = json.loads(inventory_path.read_text())
 if inventory['model'] != 'Mac17,3':
@@ -48,7 +51,7 @@ manifest = dict(phase=('Linux mode8 admission before recovery' if args.before_re
                       else 'Linux verified compute completion' if args.after_success
                       else 'Linux live-status probe after compute' if args.after_live_snapshot
                       else 'Linux mode6 after compute') + ' after both firmware CPU stop requests',
-                device_memory_read=False, objects=[])
+                device_memory_read=False, compute_triangle=args.triangle, objects=[])
 cache = {}
 sequence = 0
 with Serial('/dev/cu.kis-01100000-ch-0', 115200, timeout=0.2) as port:
@@ -69,7 +72,7 @@ with Serial('/dev/cu.kis-01100000-ch-0', 115200, timeout=0.2) as port:
         raise RuntimeError('Stopped M5 RAM read timed out; leave target unchanged')
 
     probe_gate = (
-        "dmesg | grep -Eq 'requested probe mode=(6|9|10)$' "
+        "dmesg | grep -Eq 'requested probe mode=(6|9|10|11)$' "
         "&& dmesg | grep -q 'M5_COMPUTE verified 1024 exact outputs, inputs unchanged, queues retired;' "
         "&& dmesg | grep -q 'M5_INIT transaction result=Ok(())' "
         "&& ! dmesg | grep -q 'M5_COMPUTE firmware requested GPU restart'"
@@ -86,9 +89,13 @@ with Serial('/dev/cu.kis-01100000-ch-0', 115200, timeout=0.2) as port:
         "&& dmesg | grep -Fq 'id=0x41 args=[b, 1, 2, 1]' "
         "&& ! dmesg | grep -q 'M5_COMPUTE firmware requested GPU restart'"
         if args.before_recovery else (
-        "dmesg | grep -Eq 'requested probe mode=(9|10)$' "
+        "dmesg | grep -Eq 'requested probe mode=(9|10|11)$' "
         "&& dmesg | grep -q 'M5_LIVE_SNAPSHOT sample=3'"
         if args.after_live_snapshot else "dmesg | grep -q 'requested probe mode=6'"))))
+    if args.triangle:
+        probe_gate += " && dmesg | grep -q 'requested probe mode=11$' && dmesg | grep -q 'pages=7 triangle=true'"
+    else:
+        probe_gate += " && ! dmesg | grep -q 'requested probe mode=11$'"
     identity = command("grep -q apple,j813 /proc/device-tree/compatible "
         "&& [ $(uname -r) = 7.1.6-aurora-j813-gpu-v9 ] "
         "&& [ -d /sys/module/asahi ] "
@@ -185,6 +192,8 @@ with Serial('/dev/cu.kis-01100000-ch-0', 115200, timeout=0.2) as port:
                 ('program-robustness', 0x1000018000, 0x4000, 3),
                 ('program-buffers', 0x1000001c000, 0x4000, 3)]:
             save(label, address, size, context)
+        if args.triangle:
+            save('program-constants', 0x10000018000, 0x4000, 3)
         for ordinal in range(4):
             save('hardware-event-ring-%d' % ordinal,
                  0xfffffc20c07e8000 + ordinal * 0x28000, 0x20000, 0)

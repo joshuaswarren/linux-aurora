@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a retained mode-3..10 probe after boot-linux.py releases the M5 console."""
+"""Run a retained mode-3..11 probe after boot-linux.py releases the M5 console."""
 from pathlib import Path
 import os
 import sys
@@ -10,13 +10,13 @@ sys.path.insert(0, str(root / "m1n1/proxyclient"))
 from m1n1.proxy import Serial
 
 mode = int(sys.argv[1]) if len(sys.argv) == 2 else 3
-if len(sys.argv) > 2 or mode not in (3, 4, 5, 6, 7, 8, 9, 10):
-    raise ValueError("Expected mode 3 (queue), 4 (scheduler), 5 (context), 6 (compute), 7 (setup without kick), 8 (stop request), 9 (live status) or 10 (firmware monitors)")
+if len(sys.argv) > 2 or mode not in (3, 4, 5, 6, 7, 8, 9, 10, 11):
+    raise ValueError("Expected mode 3 (queue), 4 (scheduler), 5 (context), 6 (compute), 7 (setup without kick), 8 (stop request), 9 (live status), 10 (firmware monitors) or 11 (compute triangle)")
 trace_mask = int(os.environ.get('M5_FW_TRACE', '0'), 0)
 if trace_mask < 0 or trace_mask & ~0x203:
     raise ValueError('M5_FW_TRACE accepts only power, submission and recovery bits (0x203)')
-if mode in (8, 9, 10) and trace_mask & 3 != 3:
-    raise ValueError('Modes8..10 require trace bits0 and1 for the kick and dispatch return')
+if mode in (8, 9, 10, 11) and trace_mask & 3 != 3:
+    raise ValueError('Modes8..11 require trace bits0 and1 for the kick and dispatch return')
 command = (
     "echo M5_QUEUE_PROBE_BEGIN; "
     "if grep -q apple,j813 /proc/device-tree/compatible "
@@ -48,8 +48,10 @@ if mode >= 4:
     required.append(b"M5_QUEUE scheduler bound Some(")
 if mode >= 5:
     required.append(b"M5_CONTEXT prepared id3 roots=")
-if mode in (6, 9, 10):
+if mode in (6, 9, 10, 11):
     required.append(b"M5_COMPUTE verified 1024 exact outputs, inputs unchanged, queues retired;")
+if mode == 11:
+    required.append(b"pages=7 triangle=true 1024 untouched outputs, no kicks")
 if mode == 7:
     required.append(b"M5_COMPUTE setup retired outer=[2, 2, 2] inner=[3, 3, 3]; 1024 untouched outputs, SKSM kick unpublished")
     if b'M5_COMPUTE first SKSM kick submitted' in captured:
@@ -62,7 +64,8 @@ if any(marker not in captured for marker in required):
     if b"M5_COMPUTE firmware requested GPU restart" in captured:
         raise RuntimeError("M5 compute triggered a GPU restart; inspect the retained reports")
     raise RuntimeError(f"M5 mode-{mode} probe was not verified; inspect the retained log")
-print("M5_KSM_ADMISSION_HARDWARE_VERIFIED" if mode == 8
+print("M5_COMPUTE_TRIANGLE_HARDWARE_VERIFIED" if mode == 11
+      else "M5_KSM_ADMISSION_HARDWARE_VERIFIED" if mode == 8
       else "M5_COMPUTE_SETUP_HARDWARE_VERIFIED" if mode == 7
       else "M5_COMPUTE_HARDWARE_VERIFIED" if mode in (6, 9, 10)
       else "M5_QUEUE_INSTALL_HARDWARE_VERIFIED")

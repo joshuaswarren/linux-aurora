@@ -218,7 +218,7 @@ impl M5FirmwareMemory {
             None
         };
         let program = if probe_kind >= 5 {
-            Some(M5ProgramMemory::new(dev, &uat, probe_kind >= 6)?)
+            Some(M5ProgramMemory::new(dev, &uat, probe_kind >= 6, probe_kind == 11)?)
         } else {
             None
         };
