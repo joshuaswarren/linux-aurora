@@ -1199,7 +1199,7 @@ impl G17PQueue {
         entered: Instant<Monotonic>,
     ) -> Result {
         self.ensure_async_compute_queue()?;
-        self.runtime.mutex().lock().check_async_compute_submission()?;
+        self.runtime.mutex().lock().check_async_compute_submission(self.id)?;
         let destinations = [
             Self::timestamp_destination(objects, translated.timestamps.start)?,
             Self::timestamp_destination(objects, translated.timestamps.end)?,

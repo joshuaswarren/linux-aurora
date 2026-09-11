@@ -3565,6 +3565,26 @@ impl Drop for VmInner {
                 }
             }
 
+            // Say which TTBAT entries this drop retracted.
+            //
+            // This is the only path that zeroes a context root without logging
+            // anything, and a zeroed root is not a quiet condition: a VM with no
+            // TTBAT context holding its root has no translation regime, so its
+            // kicks are accepted by firmware and silently never run -- which is
+            // the wedge, reported two seconds later as a completion timeout with
+            // no fault anywhere. Diagnosing one such wedge took four rounds and a
+            // live machine precisely because nothing here left a trace. One line
+            // per VM teardown that actually retracted something is cheap.
+            if inval || dropped_aliases.iter().any(|dropped| *dropped) {
+                pr_info!(
+                    "MMU: VM {} teardown retracted TTBAT roots: bind-slot {}={}, compute aliases {:?}\n",
+                    self.id,
+                    idx,
+                    inval,
+                    dropped_aliases,
+                );
+            }
+
             // In principle we dropped all the KernelMappings already, but we might as
             // well play it safe and invalidate the whole ASID.
             if inval {
@@ -4075,7 +4095,17 @@ impl Uat {
     /// live VM can otherwise retain a negative or old translation there when
     /// its render-pool generation is replaced. Match the installed TTBAT roots
     /// instead of flushing every client or assuming a fixed context ID.
-    pub(crate) fn flush_t8140_vm_contexts(&self, vm: &Vm) -> Result<u64> {
+    /// Which TTBAT contexts currently hold `vm`'s root, as a bitmask.
+    ///
+    /// Zero is not a benign answer: it means the GPU has no page tables for any
+    /// context a descriptor naming this VM could declare, so every submission
+    /// against it is undispatchable -- accepted, never executed, and never
+    /// completed. Reads only; mutates nothing.
+    ///
+    /// Split out of `flush_t8140_vm_contexts` so a caller can prove the
+    /// condition BEFORE it starts mutating the VM. See `new_user_render_storage`,
+    /// where the same lookup used to run several destructive steps too late.
+    pub(crate) fn t8140_vm_context_mask(&self, vm: &Vm) -> Result<u64> {
         if self.cfg != UatConfig::T8140 {
             return Err(EINVAL);
         }
@@ -4091,19 +4121,32 @@ impl Uat {
             }
             owner.page_table.ttb()
         };
-        let contexts = {
-            let inner = self.inner.lock();
-            let ttbs = inner.ttbs();
-            let mut contexts = 0u64;
-            for context_id in 0..UAT_NUM_CTX {
-                if ttbs[context_id].ttb0.load(Ordering::Acquire)
-                    == t8140_tagged_root(root, context_id)
-                {
-                    contexts |= 1u64 << context_id;
-                }
+        let inner = self.inner.lock();
+        let ttbs = inner.ttbs();
+        let mut contexts = 0u64;
+        for context_id in 0..UAT_NUM_CTX {
+            if ttbs[context_id].ttb0.load(Ordering::Acquire)
+                == t8140_tagged_root(root, context_id)
+            {
+                contexts |= 1u64 << context_id;
             }
-            contexts
-        };
+        }
+        Ok(contexts)
+    }
+
+    /// `ENOENT` unless some TTBAT context holds `vm`'s root.
+    ///
+    /// The cheap precondition form of `flush_t8140_vm_contexts`, for callers
+    /// that must not begin work they cannot finish.
+    pub(crate) fn require_t8140_vm_context(&self, vm: &Vm) -> Result {
+        if self.t8140_vm_context_mask(vm)? == 0 {
+            return Err(ENOENT);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn flush_t8140_vm_contexts(&self, vm: &Vm) -> Result<u64> {
+        let contexts = self.t8140_vm_context_mask(vm)?;
         if contexts == 0 {
             return Err(ENOENT);
         }

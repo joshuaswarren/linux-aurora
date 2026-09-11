@@ -21,7 +21,7 @@ use crate::g17_trace_capture::{self as trace, TraceArchive};
 use kernel::time::{ClockSource, Monotonic};
 
 #[cfg(not(test))]
-use core::sync::atomic::{fence, AtomicU32, Ordering};
+use core::sync::atomic::{fence, AtomicBool, AtomicU32, Ordering};
 
 #[cfg(not(test))]
 pub(crate) const G17P_SUBMIT_PHASE_IDLE: u32 = 0;
@@ -1525,6 +1525,9 @@ static G17P_PARAMETER_BUFFER_RETARGETS: AtomicU32 = AtomicU32::new(0);
 /// marker line means any single surviving line reconstructs the whole state
 /// machine: how many QIDs were installed, how many zero-duration retires were
 /// caught, how many sessions were rebuilt, how many handoffs retained.
+/// One `context/qos` control sample per boot, taken from a render that
+/// completed, so the wedge sample has something to be compared against.
+static RENDER_CONTEXT_WITNESS_LOGGED: AtomicBool = AtomicBool::new(false);
 pub(crate) static G17P_MARK_TAG15_INSTALLS: AtomicU32 = AtomicU32::new(0);
 pub(crate) static G17P_MARK_ZERO_DURATION: AtomicU32 = AtomicU32::new(0);
 pub(crate) static G17P_MARK_GATE_REBUILDS: AtomicU32 = AtomicU32::new(0);
@@ -1650,6 +1653,17 @@ impl G17PComputeUserBinding {
     ///
     /// Needed so every kick -- not just the one that created this binding --
     /// can re-prove that hardware contexts 2/3 still name this VM's root.
+    /// The hardware context this client's compute work actually runs in.
+    ///
+    /// The kick already declares it at `sgx+0x10428` as
+    /// `(context_id << 8) | work_ordinal`; this exposes the same value so the
+    /// tag-15 ConfigUpdate can declare it too instead of the constant 2.
+    pub(crate) fn declared_context_id(&self) -> Option<u16> {
+        self._execution_context
+            .as_ref()
+            .and_then(|context| u16::try_from(context.context_id()).ok())
+    }
+
     pub(crate) fn vm_bind(&self) -> &mmu::VmBind {
         self._vm_bind.as_ref().expect("legacy binding required")
     }
@@ -2128,6 +2142,60 @@ impl G17PManagerConstruction {
         }
         self.pending_primary_recovery = Some((generation, records, blamed_stamp));
         Ok(())
+    }
+
+    /// Queue a firmware restart request, or fold it into the one already
+    /// pending.
+    ///
+    /// The firmware raises ONE restart request, and both RTKit roles can
+    /// observe it: `service_primary_firmware_events` drains the gfx ring and
+    /// then, in the same pass and unconditionally, the gfx1 ring. A type-4 on
+    /// the second ring therefore meets a request the first ring already
+    /// queued, and the bare `queue_primary_recovery` answers that with EBUSY.
+    /// Every caller propagates it with `?` into a chain whose only error
+    /// handler sets `crashed`, so a duplicate view of a single recovery -- the
+    /// normal dual-role case, not a fault -- permanently deafened the session.
+    ///
+    /// Coalescing is what the surrounding code already does with duplicate
+    /// type-4 records inside ONE ring (`recovery_records` counts them and the
+    /// accepted generation advances once), so doing it across the two rings is
+    /// the same rule, not a new one. Returns whether a new request was queued.
+    pub(crate) fn queue_or_coalesce_primary_recovery(
+        &mut self,
+        generation: u64,
+        records: u32,
+        blamed_stamp: Option<u8>,
+    ) -> Result<bool> {
+        if let Some((pending_generation, pending_records, pending_stamp)) =
+            self.pending_primary_recovery
+        {
+            // A pending request for a DIFFERENT generation is a real disagreement
+            // about how many restarts the firmware asked for, and must not be
+            // silently merged.
+            if pending_generation != generation {
+                dev_err!(
+                    self.resources.dev().as_ref(),
+                    "G17P recovery: type-4 generation {} arrived while generation {} is still pending\n",
+                    generation,
+                    pending_generation
+                );
+                return Err(EBUSY);
+            }
+            self.pending_primary_recovery = Some((
+                generation,
+                pending_records.saturating_add(records),
+                pending_stamp.or(blamed_stamp),
+            ));
+            return Ok(false);
+        }
+        self.queue_primary_recovery(generation, records, blamed_stamp)?;
+        Ok(true)
+    }
+
+    /// The host generation the next type-4 record must name. Records naming an
+    /// older generation are duplicates of a restart already serviced.
+    pub(crate) fn accepted_firmware_recovery_generation(&self) -> u64 {
+        self.accepted_firmware_recovery_generation
     }
 
     pub(crate) fn pending_primary_recovery(&self) -> Option<(u64, u32, Option<u8>)> {
@@ -6851,6 +6919,23 @@ impl G17PManagerConstruction {
                     );
                 }
                 self.render_submission_ordinal = next_ordinal;
+                // One control sample per boot, from a render that DID complete.
+                //
+                // Every field of the `context/qos` line captured at a wedge --
+                // slot=255 ctx=255 prio=0 class=0 state=2 bound-slot=255 and an
+                // all-zero qid bitmap -- is byte-for-byte what
+                // `apply_g17p_cold_opening_channel_control` writes at cold
+                // opening (`0x0000_0100_0000_ffff` at +0x00, `0x0002_..` at
+                // +0x20, `0x0000_0000_ff00_0000` at +0x30, `fill(0)` elsewhere).
+                // So that line proves only that the record is UNTOUCHED, which
+                // is a different claim from "the context was lost", and without
+                // a healthy sample the two are indistinguishable. If this
+                // control prints the same constants, the firmware never writes
+                // this record and the diagnostic -- and the comment above it
+                // claiming it is "the exact host-safe witness" -- is wrong.
+                if !RENDER_CONTEXT_WITNESS_LOGGED.swap(true, Ordering::Relaxed) {
+                    self.log_render_context_witness("healthy-paired-completion");
+                }
                 return Ok(G17PRenderPollOutcome::Complete(completion));
             }
             tracker.tiling_previous = state.tiling;
@@ -6905,7 +6990,7 @@ impl G17PManagerConstruction {
                 }
             }
         }
-        self.report_render_wait_timeout();
+        self.report_render_wait_timeout("inline-wait-expired");
         Err(ETIMEDOUT)
     }
 
@@ -6926,7 +7011,18 @@ impl G17PManagerConstruction {
     ///
     /// A group the firmware still holds -- cursors short of the target, or the
     /// job still linked -- is left exactly as the timeout found it.
-    pub(crate) fn retire_abandoned_render_if_firmware_retired(&mut self) -> Result<bool> {
+    ///
+    /// `accept_executed` drops ONLY the `observed()` term -- see
+    /// `g17p_render_recovery_retire`. Both ownership proofs are retained in
+    /// every mode: `completion.retired` (cursors at the published target) and
+    /// `job_list_empty` (unlinked from the firmware completion list). Those two
+    /// are what make the bookkeeping below safe to perform; `observed()` only
+    /// ever described whether the GPU did any work, which does not bear on
+    /// whether the firmware still owns the group.
+    pub(crate) fn retire_abandoned_render_if_firmware_retired(
+        &mut self,
+        accept_executed: bool,
+    ) -> Result<bool> {
         if *module_parameters::g17p_render_nop_retire.value() == 0 {
             return Ok(false);
         }
@@ -6952,7 +7048,10 @@ impl G17PManagerConstruction {
             execution,
         )
         .map_err(|_| EINVAL)?;
-        if !completion.retired || !state.job_list_empty || execution.observed() {
+        if !completion.retired
+            || !state.job_list_empty
+            || (execution.observed() && !accept_executed)
+        {
             return Ok(false);
         }
         // Twin of the paired-completion transaction in
@@ -6984,10 +7083,11 @@ impl G17PManagerConstruction {
             .map(g17_resources::G17PUserRenderStorage::queue_pair);
         dev_warn!(
             self.resources.dev().as_ref(),
-            "G17P render: firmware retired ordinal {} on slot {} (qids {:?}) without executing it -- tiling-ts [{:#x},{:#x}] fragment-ts [{:#x},{:#x}]; failing the submission and keeping the slot\n",
+            "G17P render: firmware retired ordinal {} on slot {} (qids {:?}) [executed={}] -- tiling-ts [{:#x},{:#x}] fragment-ts [{:#x},{:#x}]; failing the submission and keeping the slot\n",
             ordinal,
             self.active_render_slot,
             pair.map(|pair| (pair.tiling, pair.fragment)),
+            execution.observed(),
             state.tiling_timestamps[0],
             state.tiling_timestamps[1],
             state.fragment_timestamps[0],
@@ -6998,7 +7098,7 @@ impl G17PManagerConstruction {
 
     /// Explain a render wait timeout. Split out with the poll body so both the
     /// plain and the event-servicing loops report identically.
-    pub(crate) fn report_render_wait_timeout(&mut self) {
+    pub(crate) fn report_render_wait_timeout(&mut self, reason: &'static str) {
         let polls = Self::RENDER_COMPLETION_POLLS;
         // The graph remains pinned because firmware may still own it. Runtime
         // teardown stops both provider CPUs before manager resources drop.
@@ -7024,7 +7124,8 @@ impl G17PManagerConstruction {
         if let Some(state) = final_state {
             dev_err!(
                 self.resources.dev().as_ref(),
-                "G17P render: completion timed out after {} polls; ordinal {} target {:?} tiling done/read/write {}/{}/{} fragment {}/{}/{} job-list-empty {} tiling-ts [{:#x},{:#x}] fragment-ts [{:#x},{:#x}]\n",
+                "G17P render: settle-reason {} (wait budget {} polls); ordinal {} target {:?} tiling done/read/write {}/{}/{} fragment {}/{}/{} job-list-empty {} job-list [first={:#x} last={:#x} head-va={:#x}] tiling-ts [{:#x},{:#x}] fragment-ts [{:#x},{:#x}]\n",
+                reason,
                 polls,
                 self.render_submission_ordinal,
                 target,
@@ -7035,11 +7136,70 @@ impl G17PManagerConstruction {
                 state.fragment.read,
                 state.fragment.write,
                 state.job_list_empty,
+                state.job_list[0],
+                state.job_list[1],
+                state.job_list_head_va,
                 state.tiling_timestamps[0],
                 state.tiling_timestamps[1],
                 state.fragment_timestamps[0],
                 state.fragment_timestamps[1],
             );
+        }
+        self.log_render_context_witness(reason);
+    }
+
+    /// The firmware-side view of this render's context binding, labelled.
+    ///
+    /// Split out of `report_render_wait_timeout` so it can also be taken once
+    /// from a render that COMPLETED. Every field the `context/qos` line prints
+    /// has a driver-written cold-opening default, so a wedge sample on its own
+    /// cannot distinguish "the firmware cleared this" from "the firmware never
+    /// wrote it" -- only a healthy sample can.
+    pub(crate) fn log_render_context_witness(&mut self, reason: &'static str) {
+        // The counter pair that decides whether the job gets unlinked at all.
+        //
+        // `poll_translated_render_completion` states the rule: "B1 unlinks
+        // EventControl only after its completed count reaches its own
+        // submitted-count slot". `unlinked()` is `completed == submitted &&
+        // membership == 0`, and an unlinked EventControl is what leaves the
+        // graph's job list empty -- so this pair is upstream of
+        // `job_list_empty`, which is in turn the only term that decides
+        // `firmware-retired`, which decides whether one client loses a frame or
+        // the whole session is marked crashed.
+        //
+        // It was sampled nowhere on the settle path and only under
+        // `g17p_verbose` on the Pending path, so the one number that explains
+        // the split was never in a wedge capture.
+        let reusable = self
+            .render_storage
+            .as_mut()
+            .ok_or(ENODEV)
+            .and_then(|storage| storage.pool_a_reusable_count());
+        match self
+            .render_storage
+            .as_mut()
+            .ok_or(ENODEV)
+            .and_then(|storage| storage.render_event_control_state())
+        {
+            Ok(event_control) => dev_err!(
+                self.resources.dev().as_ref(),
+                "G17P render event-control [{}]: record={} submitted={} slot-word={} completed={} lag={} membership={:#x} unlinked={} pool-a-reusable={:?}/35\n",
+                reason,
+                event_control.record_index,
+                event_control.submitted,
+                event_control.slot_word,
+                event_control.completed,
+                event_control.submitted.wrapping_sub(event_control.completed),
+                event_control.membership,
+                event_control.unlinked(),
+                reusable,
+            ),
+            Err(error) => dev_err!(
+                self.resources.dev().as_ref(),
+                "G17P render event-control [{}]: read failed ({:?})\n",
+                reason,
+                error,
+            ),
         }
         // What the firmware keeps in the per-queue stamp lanes both pairs'
         // records point at. A second pair whose lanes still read as the first
@@ -7047,7 +7207,8 @@ impl G17PManagerConstruction {
         if let Ok(lanes) = self.resources.render_stamp_lanes() {
             dev_err!(
                 self.resources.dev().as_ref(),
-                "G17P render: stamp lanes at timeout A(qid0..3)={:#x?} B(qid0..3)={:#x?}\n",
+                "G17P render: stamp lanes [{}] A(qid0..3)={:#x?} B(qid0..3)={:#x?}\n",
+                reason,
                 lanes[0],
                 lanes[1],
             );
@@ -7058,9 +7219,15 @@ impl G17PManagerConstruction {
             .ok_or(ENODEV)
             .and_then(|storage| storage.fragment_word_20f0())
         {
+            // Demoted to verbose: the healthy control proved it reads 0x0
+            // identically on a paired completion and on a recovery-blamed
+            // wedge, so it discriminates nothing and was pure noise on the
+            // settle path.
+            Ok(_) if !crate::util::g17p_verbose() => {}
             Ok(value) => dev_err!(
                 self.resources.dev().as_ref(),
-                "G17P render descriptor diagnostic: +0x20f0={:#010x} (not an activation witness)\n",
+                "G17P render descriptor diagnostic [{}]: +0x20f0={:#010x} (DEAD WITNESS -- reads 0x0 identically on a healthy paired completion and on a recovery-blamed wedge, so it discriminates nothing; kept only so nobody re-derives it, do not reason from it)\n",
+                reason,
                 value,
             ),
             Err(error) => dev_err!(
@@ -7100,7 +7267,8 @@ impl G17PManagerConstruction {
             ]);
             dev_err!(
                 self.resources.dev().as_ref(),
-                "G17P render context/qos: requested-slot={} ctxdesc(slot={},ctx={},prio={},class={},state={},bound-slot={}) qid-bitmap={:#018x}/{:#018x} qos-records TA(qid {})={:?} 3D(qid {})={:?}\n",
+                "G17P render context/qos [{}]: requested-slot={} ctxdesc(slot={},ctx={},prio={},class={},state={},bound-slot={}) qid-bitmap={:#018x}/{:#018x} qos-records TA(qid {})={:?} 3D(qid {})={:?}\n",
+                reason,
                 slot,
                 prefix[0],
                 prefix[1],
@@ -7379,15 +7547,46 @@ impl G17PManagerConstruction {
         if !queue.independent_context || queue.completion_descriptor == 0 {
             return Ok(None);
         }
-        let Some(candidate) = self.compute_completion_batch.take(
+        // Two different failures leave this function as a bare EIO, and the
+        // caller turns either one into `session-crashed
+        // reason=async-compute-completion-unclassifiable` -- terminal, because
+        // the rebuild it arms ends in rtkit-boot ETIME and ENODEV. They want
+        // opposite responses and the log could not tell them apart. Name them.
+        let candidate = match self.compute_completion_batch.take(
             queue.queue_id,
             queue.completion_descriptor,
             queue.completion_last_end,
-        )? else {
-            return Ok(None);
+        ) {
+            Ok(Some(candidate)) => candidate,
+            Ok(None) => return Ok(None),
+            Err(error) => {
+                // The batch slot is indexed by queue_id and was staged by
+                // `request()` with this queue's descriptor and last-consumed
+                // end. A mismatch means the slot's identity moved underneath
+                // us -- which a graph rebound to a new owner without reinstall
+                // can do, since the QID is retained across the handoff.
+                dev_err!(self.resources.dev().as_ref(),
+                    "G17P async compute: UNCLASSIFIABLE qid={} cause=batch-slot-identity descriptor={:#x} last-end={} ({:?})\n",
+                    queue.queue_id, queue.completion_descriptor,
+                    queue.completion_last_end, error);
+                return Err(error);
+            }
         };
         let timestamps = candidate.timestamps;
-        if timestamps[0] == timestamps[1] { return Err(EIO); }
+        if timestamps[0] == timestamps[1] {
+            // Retired without executing. This is the DOCUMENTED post-recovery
+            // outcome -- `g17p_zero_duration` says so in as many words: "every
+            // submission after a fault-blamed firmware recovery retires with
+            // duration 0" -- and that parameter's default 1 is "fail the
+            // submission ... but do NOT rebuild the firmware session". This
+            // path never consulted it and killed the device instead.
+            G17P_MARK_ZERO_DURATION.fetch_add(1, Ordering::Relaxed);
+            dev_err!(self.resources.dev().as_ref(),
+                "G17P async compute: UNCLASSIFIABLE qid={} cause=zero-duration descriptor={:#x} timestamps=[{},{}] -- retired without executing, the expected shape after a firmware recovery\n",
+                queue.queue_id, queue.completion_descriptor,
+                timestamps[0], timestamps[1]);
+            return Err(EIO);
+        }
         if queue.completion_stamp_armed && queue.compute.read_compute_stamp()? == 0 {
             return Err(EAGAIN);
         }
@@ -7825,6 +8024,7 @@ impl G17PManagerConstruction {
                 queue.storage.channel_control_gpu_va(),
                 queue.queue_id,
                 install_queue,
+                binding.declared_context_id(),
             )?;
         // Purely precompute the host-only sequence token and notification
         // predicates. Retained state is not committed until after the SKSM
@@ -8171,6 +8371,7 @@ impl G17PManagerConstruction {
             queue.storage.channel_control_gpu_va(),
             queue.queue_id,
             rewind,
+            binding.declared_context_id(),
         )?;
         // `queue_config_dirty` is already false here, so the lifecycle reports
         // no first-bind publications and -- because the channel identity is
@@ -8645,6 +8846,63 @@ impl G17PManagerConstruction {
             Ok((last.entry_offset,
                 queue.storage.snapshot_compute_entry(last.entry_offset as usize)?))
         })();
+        // The fork this whole class of wedge turns on, sampled at the moment
+        // it fails rather than inferred afterwards. Three outcomes, three
+        // different bugs, and until now the log could not tell them apart:
+        //
+        //   completed < ordinal   the firmware never retired the work -- a
+        //                         scheduling/dispatch failure, and the
+        //                         publication-time TSQ check should already
+        //                         have said so;
+        //   completed == ordinal, stamp == 0
+        //                         retired, but the completion stamp was never
+        //                         made visible -- the poller has been returning
+        //                         EAGAIN, which is swallowed silently;
+        //   completed == ordinal, stamp != 0
+        //                         retired and stamped, so the loss is in the
+        //                         completion RECORD: the poller has been
+        //                         returning Ok(None) because no record folded.
+        let counters = queue.compute.read_compute_submitted_counters();
+        let stamp_word = queue.compute.read_compute_stamp();
+        // The firmware's own dependency record for THIS queue.
+        //
+        // Every kick declares an implicit in-order self-dependency on its own
+        // previous stamp -- the encoder writes {own qid, converted_command
+        // _timestamp - 1} -- and the firmware's rule is: satisfied iff the
+        // record is valid (byte 0) and dep_stamp <= completed_stamp. So a queue
+        // reading `completed = target - 1` is exactly the arithmetic of one kick
+        // parked on a self-dependency that never resolved, which is also the
+        // render event-control class's signature (submitted=386 completed=385).
+        // Nothing has ever sampled this record at an async-compute timeout.
+        //
+        // Deliberately NOT gated on `g17p_dep_records`: that parameter is
+        // overloaded and also enables `log_render_sksm_entries`, a ~19 KB
+        // hexdump per call at pre-doorbell that has itself caused
+        // VK_ERROR_DEVICE_LOST. This is three words on a path that only runs
+        // when a submission has already timed out.
+        let dependency = {
+            let phys = G17P_GFX_PHYSICAL_DATA_BASE
+                + (G17P_DEPENDENCY_RECORD_LINK_BASE - G17P_GFX_LINK_DATA_BASE)
+                + u64::from(queue.queue_id) * G17P_DEPENDENCY_RECORD_STRIDE;
+            let valid = pgtable::LiveFirmwareU64Probe::new(phys)
+                .and_then(|p| p.observe_mask(u64::MAX, 1))
+                .map(|o| o.first);
+            let completed = pgtable::LiveFirmwareU64Probe::new(phys + 8)
+                .and_then(|p| p.observe_mask(u64::MAX, 1))
+                .map(|o| o.first);
+            (valid, completed)
+        };
+        dev_err!(self.resources.dev().as_ref(),
+            "G17P async-timeout dependency: qid={} record={:#x} valid-word={:x?} completed-stamp={:x?} -- a kick is satisfied iff valid and dep_stamp <= completed_stamp\n",
+            queue.queue_id,
+            G17P_DEPENDENCY_RECORD_LINK_BASE
+                + u64::from(queue.queue_id) * G17P_DEPENDENCY_RECORD_STRIDE,
+            dependency.0,
+            dependency.1);
+        dev_err!(self.resources.dev().as_ref(),
+            "G17P async-timeout retirement: qid={} ordinal={} counters(target,completed)={:x?} stamp-word={:x?} stamp-armed={} awaited-descriptor={:#x}\n",
+            queue.queue_id, queue.submission_ordinal, counters, stamp_word,
+            queue.completion_stamp_armed, queue.completion_descriptor);
         dev_err!(self.resources.dev().as_ref(),
             "G17P async-timeout owner: qid={} descriptor={:#x} ordinal={} producer={:?} direct={:?} hardware={:?}\n",
             queue.queue_id, queue.completion_descriptor, queue.submission_ordinal,
@@ -8729,10 +8987,65 @@ impl G17PManagerConstruction {
         if queue.independent_context {
             let count = queue.submission_ordinal.checked_add(1).ok_or(EOVERFLOW)?;
             let [previous, completed] = queue.compute.publish_compute_submitted_count(count)?;
-            if queue.submission_ordinal < 2 {
+            if queue.submission_ordinal < 4 {
+                // Four rather than two: the steady-state relationship between
+                // `completed` and the ordinal is what the violation test below
+                // rests on, and it is not observable from the first two
+                // publications alone.
                 dev_info!(self.resources.dev().as_ref(),
-                    "G17P compute TSQ: qid={} target={} previous={} completed={} before-publication\n",
-                    queue.queue_id, count, previous, completed);
+                    "G17P compute TSQ: qid={} ordinal={} target={} previous={} completed={} before-publication\n",
+                    queue.queue_id, queue.submission_ordinal, count, previous, completed);
+            }
+            // `MAX_IN_FLIGHT_PER_QUEUE` is 1, so publishing target
+            // `ordinal + 1` means the firmware must already have retired every
+            // earlier publication -- its completed counter should read exactly
+            // `ordinal`. When it lags, the previous submission was accepted and
+            // never executed, and stacking this one on top guarantees the
+            // client waits out a full scheduler timeout and then quarantines
+            // the queue. That wedge is otherwise only visible two seconds
+            // later, as an ETIMEDOUT with no fault anywhere.
+            //
+            // Measured against `ordinal`, NOT against `previous`: `previous` is
+            // the target word's prior contents, and first-bind staging seeds it
+            // to 1, so on a fresh queue it reads target=1 previous=1
+            // completed=0 -- which the first version of this test called a
+            // violation. Three fired on a green idle boot that never wedged.
+            // The firmware cannot have *stopped* retiring before it has retired
+            // anything, so ordinal 0 is excluded by construction rather than by
+            // a special case.
+            //
+            // Logged rather than refused: a refusal is the right end state but
+            // it has to be proven not to fire on a healthy boot first, and this
+            // line is what proves it.
+            // Two independent gates, both of which the fresh-queue case fails.
+            //
+            // `submission_ordinal > 0` is definitional: the field is written
+            // only at construction (0), at first bind, and by the steady
+            // advance -- never reset -- so `target == 1` means this queue has
+            // published nothing, and a queue that has published nothing cannot
+            // have stopped retiring. That alone explains all three fires on the
+            // green boot, including the late one: compute QIDs are handed out
+            // ascending and never reused, so 5, 6 and 7 arriving at t=19, t=20
+            // and t=224 are three new clients, not one queue stalling.
+            //
+            // `completion_last_end != 0` is the stronger witness and is what
+            // the check actually wants: that field is written only by a
+            // successful `poll_staged_independent_compute_completion`, so it is
+            // proof the firmware has retired at least once on THIS queue. The
+            // condition being tested is that it has stopped, which is not a
+            // statement anyone can make about a queue that never started.
+            if queue.submission_ordinal > 0
+                && queue.completion_last_end != 0
+                && completed != queue.submission_ordinal
+            {
+                dev_err!(self.resources.dev().as_ref(),
+                    "G17P compute TSQ: qid={} publishing target={} at ordinal={} while firmware completed={} (lag={}, previous={}) -- an earlier submission never retired; this publication will not complete\n",
+                    queue.queue_id,
+                    count,
+                    queue.submission_ordinal,
+                    completed,
+                    queue.submission_ordinal.saturating_sub(completed),
+                    previous);
             }
         }
         let previous = if queue.independent_context { [0, 0] }

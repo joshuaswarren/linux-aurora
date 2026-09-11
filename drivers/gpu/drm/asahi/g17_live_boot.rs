@@ -1138,6 +1138,9 @@ struct G17PPrimaryFirmwareEventBatch {
     completion_records: u32,
     completion_masks: [u64; 2],
     blamed_recovery_records: u32,
+    /// Type-4 records naming a generation the host has already serviced.
+    /// Counted and skipped, never a drain failure -- see the type-4 arm.
+    stale_recovery_records: u32,
     notification_count: u32,
 }
 
@@ -1163,6 +1166,7 @@ fn drain_primary_firmware_event_batch(
         completion_records: 0,
         completion_masks: [0; 2],
         blamed_recovery_records: 0,
+        stale_recovery_records: 0,
         notification_count,
     };
     let role = match state.processor {
@@ -1216,13 +1220,43 @@ fn drain_primary_firmware_event_batch(
                     record.consumer_published,
                     record.producer_snapshot
                 );
+                let accepted = manager.accepted_firmware_recovery_generation();
+                if recovery.generation < accepted {
+                    // A restart the host has ALREADY serviced. Both RTKit roles
+                    // see one firmware request, so the second ring's copy is
+                    // routinely read after `accept_empty_primary_firmware_recovery`
+                    // has advanced the host generation past it. Failing the
+                    // drain here was fatal twice over: the caller turns any
+                    // error into `crashed`, and aborting the batch strands every
+                    // later record in the ring -- the exact stall the
+                    // stamp-blamed arm above and the `unknown` arm below were
+                    // both already fixed for. Count it, skip the bookkeeping,
+                    // keep draining. There is no restart to service and both
+                    // command gates were released by the real one, so the
+                    // type-4 `break` does not apply either.
+                    batch.stale_recovery_records =
+                        batch.stale_recovery_records.saturating_add(1);
+                    if batch.stale_recovery_records <= 4 {
+                        dev_warn!(
+                            pdev.as_ref(),
+                            "G17P event worker: type4 generation={} is behind the accepted host generation {}; already serviced, skipping\n",
+                            recovery.generation,
+                            accepted
+                        );
+                    }
+                    continue;
+                }
                 if let Err(error) =
                     manager.validate_empty_primary_firmware_recovery(recovery.generation)
                 {
+                    // Ahead of the accepted generation: the host and the
+                    // firmware genuinely disagree about how many restarts have
+                    // been served, which is not something to drain past.
                     dev_err!(
                         pdev.as_ref(),
-                        "G17P event worker: type4 generation={} failed host-generation/empty-scheduler validation ({:?})\n",
+                        "G17P event worker: type4 generation={} is AHEAD of the accepted host generation {} ({:?})\n",
                         recovery.generation,
+                        accepted,
                         error
                     );
                     return Err(error);
@@ -1327,12 +1361,13 @@ fn drain_primary_firmware_event_batch(
             batch.unknown_records
         );
     }
-    if batch.recovery_records != 0 {
+    if batch.recovery_records != 0 || batch.stale_recovery_records != 0 {
         dev_info!(
             pdev.as_ref(),
-            "G17P event worker: notifications={} type4={} generation={:?}\n",
+            "G17P event worker: notifications={} type4={} stale-type4={} generation={:?}\n",
             batch.notification_count,
             batch.recovery_records,
+            batch.stale_recovery_records,
             batch.recovery_generation,
         );
     }
@@ -1644,7 +1679,11 @@ fn settle_primary_empty_recovery(
             }
         }
         if let Some(generation) = batch.recovery_generation {
-            manager.queue_primary_recovery(
+            // Coalesce rather than refuse: one firmware restart request can be
+            // observed more than once (a second drain pass here, or the gfx1
+            // ring in the same worker pass), and the caller turns the bare
+            // EBUSY into a permanently crashed session.
+            manager.queue_or_coalesce_primary_recovery(
                 generation,
                 batch.recovery_records,
                 batch.blamed_stamp,
@@ -3487,7 +3526,12 @@ impl G17PLiveRuntime {
             .is_some();
         let mut uma_release = None;
         let mut completion_masks = [0u64; 2];
-        let result = if recovery_pending {
+        // Every step below can end the session, and they all surface the same
+        // handful of errnos, so carry the step's name alongside the error. The
+        // crashed line is the last thing this role ever logs; an unattributed
+        // EIO there is not enough to tell eight different failures apart.
+        let step = |name: &'static str| move |error: Error| (name, error);
+        let result: core::result::Result<(), (&'static str, Error)> = if recovery_pending {
             Ok(())
         } else if self.queue_setup_pending && !notifications_pending {
             let result = self.ensure_compute_queue();
@@ -3496,8 +3540,9 @@ impl G17PLiveRuntime {
                 "G17P session: deferred SKSM QID 4 / selector 2 memory prepared after recovery-gate work; submissions={}\n",
                 self.accepting_submissions
             );
-            result
+            result.map_err(step("ensure-compute-queue"))
         } else {
+            // Not inside the labelled chain yet: this `?` leaves the function.
             let manager = self.manager.as_mut().ok_or(ENODEV)?;
             match settle_primary_empty_recovery(&pdev, manager, &state, &signal) {
                 Ok((release, masks)) => {
@@ -3505,12 +3550,13 @@ impl G17PLiveRuntime {
                     completion_masks = masks;
                     Ok(())
                 }
-                Err(error) => Err(error),
+                Err(error) => Err(("settle-primary-empty-recovery", error)),
             }
         };
         let result = result.and_then(|()| {
             if let Some(release) = uma_release {
                 self.service_render_usc_freelist_release(release)
+                    .map_err(step("render-usc-freelist-release"))
             } else {
                 Ok(())
             }
@@ -3518,38 +3564,48 @@ impl G17PLiveRuntime {
         let result = result.and_then(|()| {
             if let Some(secondary) = self.gfx1_state.as_ref().cloned() {
                 let batch = drain_primary_firmware_event_batch(&pdev,
-                    self.manager.as_mut().ok_or(ENODEV)?, &secondary, &signal)?;
+                    self.manager.as_mut().ok_or(("no-manager", ENODEV))?, &secondary, &signal)
+                    .map_err(step("drain-gfx1-event-ring"))?;
                 completion_masks[0] |= batch.completion_masks[0];
                 completion_masks[1] |= batch.completion_masks[1];
                 if let Some(release) = batch.uma_release {
-                    self.service_render_usc_freelist_release(release)?;
+                    self.service_render_usc_freelist_release(release)
+                        .map_err(step("gfx1-render-usc-freelist-release"))?;
                 }
                 if let Some(generation) = batch.recovery_generation {
-                    self.manager.as_mut().ok_or(ENODEV)?
-                        .queue_primary_recovery(
+                    // The firmware raises ONE restart request and both roles can
+                    // see it, so this is routinely the same request the gfx ring
+                    // queued a few lines ago. `queue_primary_recovery` answers
+                    // that with EBUSY, and EBUSY here killed the session.
+                    let queued = self.manager.as_mut().ok_or(("no-manager", ENODEV))?
+                        .queue_or_coalesce_primary_recovery(
                             generation,
                             batch.recovery_records,
                             batch.blamed_stamp,
-                        )?;
+                        )
+                        .map_err(step("queue-gfx1-recovery"))?;
+                    if !queued {
+                        dev_info!(
+                            pdev.as_ref(),
+                            "G17P recovery: gfx1 type4 generation={} records={} folded into the request the gfx ring already queued\n",
+                            generation,
+                            batch.recovery_records,
+                        );
+                    }
                 }
             }
-            self.service_async_render_completions(completion_masks)?;
+            self.service_async_render_completions(completion_masks)
+                .map_err(step("async-render-completions"))?;
             self.service_async_compute_completion_masks(completion_masks)
+                .map_err(step("async-compute-completions"))
         });
-        if let Err(error) = result {
-            // Setting `crashed` makes both service_primary_firmware_events and
-            // primary_firmware_event_pending return early forever, so from here
-            // on every RTKit doorbell runs a silent no-op and no completion,
-            // timeout or recovery is ever reported again. That transition was
-            // itself unlogged, which is why a wedged GPU produced an empty log.
-            state.crashed.store(true, Ordering::Release);
-            dev_err!(
-                pdev.as_ref(),
-                "G17P event worker: firmware event service failed ({:?}); marking the session crashed -- completion, timeout and recovery reporting stop here\n",
-                error,
-            );
+        match result {
+            Ok(()) => Ok(()),
+            Err((reason, error)) => {
+                note_state_crashed(&pdev, &state, reason, error, None);
+                Err(error)
+            }
         }
-        result
     }
 
     /// Service firmware events inline while a submission is in flight.
@@ -3616,7 +3672,7 @@ impl G17PLiveRuntime {
             self.manager
                 .as_mut()
                 .ok_or(ENODEV)?
-                .queue_primary_recovery(
+                .queue_or_coalesce_primary_recovery(
                     generation,
                     batch.recovery_records,
                     batch.blamed_stamp,
@@ -3650,21 +3706,22 @@ impl G17PLiveRuntime {
             generation,
             records,
         )
+        .map_err(|error| ("complete-real-recovery", error))
         .and_then(|()| {
-            manager.complete_pending_primary_recovery(generation, records, blamed_stamp)
+            manager
+                .complete_pending_primary_recovery(generation, records, blamed_stamp)
+                .map_err(|error| ("complete-pending-recovery", error))
         });
-        if let Err(error) = result {
-            // Same permanent-deafness transition as above, and this one also
-            // skips the event-drain re-arm at the end of this function.
-            state.crashed.store(true, Ordering::Release);
-            dev_err!(
-                pdev.as_ref(),
-                "G17P recovery: servicing generation {} failed ({:?}); marking the session crashed -- completion, timeout and recovery reporting stop here\n",
-                generation,
-                error,
-            );
-            return result;
-        }
+        let result = match result {
+            Ok(()) => Ok(()),
+            Err((reason, error)) => {
+                // Same permanent-deafness transition as the event worker, and
+                // this one also skips the event-drain re-arm at the end of this
+                // function.
+                note_state_crashed(&pdev, &state, reason, error, Some(generation));
+                return Err(error);
+            }
+        };
         if let Some(stamp) = blamed_stamp {
             self.settle_render_blamed_by_recovery(stamp, EIO);
         }
@@ -4596,7 +4653,7 @@ impl G17PLiveRuntime {
         self.manager
             .as_mut()
             .ok_or(ENODEV)?
-            .report_render_wait_timeout();
+            .report_render_wait_timeout("event-serviced-wait-expired");
         Err(ETIMEDOUT)
     }
 
@@ -4916,7 +4973,19 @@ impl G17PLiveRuntime {
                 // graph; this flag makes the required processor-stop boundary
                 // reachable from the next device query/submission instead of
                 // leaving the remaining clients permanently capacity-poisoned.
-                self.session_recovery_pending = true;
+                if *module_parameters::g17p_quarantine_scope.value() & 2 == 0 {
+                    note_session_recovery_pending(
+                        &mut self.session_recovery_pending,
+                        self.pdev.as_ref(),
+                        "render-submission-lost",
+                    );
+                } else if let Some(pdev) = self.pdev.as_ref() {
+                    dev_err!(
+                        pdev.as_ref(),
+                        "G17PMARK quarantine-scoped render slot {} -- the losing client's VM is still poisoned and the slot is retired, but the session stays up for every other client; render capacity is now reduced for the rest of this boot\n",
+                        render_slot,
+                    );
+                }
                 signal.fail_while_owned(error);
                 if let Err(error) = self
                     .quarantined_render_completions
@@ -4958,17 +5027,35 @@ impl G17PLiveRuntime {
             .as_mut()
             .ok_or(ENODEV)?
             .select_render_slot(render_slot)?;
-        if timed_out {
-            self.manager
-                .as_mut()
-                .ok_or(ENODEV)?
-                .report_render_wait_timeout();
-        }
+        // Run the classifier on BOTH settle paths.
+        //
+        // It was gated on `timed_out`, which is `submission_id.is_some()`, and
+        // the recovery-blamed path passes `None` -- so the one route that
+        // actually kills the desktop was the one route that produced no
+        // explanation at all. Measured on the 236s soak wedge: `settled lost
+        // submission None recovery-stamp Some(0) ... firmware-retired=false`
+        // with no render state logged anywhere in the boot. The body is a plain
+        // read of driver-allocated DRAM plus one line, and it makes no claim
+        // about why the settle happened, so it is correct on either path.
+        self.manager
+            .as_mut()
+            .ok_or(ENODEV)?
+            .report_render_wait_timeout(if timed_out {
+                "inline-wait-expired"
+            } else {
+                "recovery-blamed"
+            });
         let retired = match self
             .manager
             .as_mut()
             .ok_or(ENODEV)?
-            .retire_abandoned_render_if_firmware_retired()
+            // Only the recovery-blamed path may accept an executed group, and
+            // only under the probe. An inline wait that simply expired proves
+            // nothing about firmware ownership, so it keeps the strict rule.
+            .retire_abandoned_render_if_firmware_retired(
+                !timed_out
+                    && *module_parameters::g17p_render_recovery_retire.value() != 0,
+            )
         {
             Ok(retired) => retired,
             Err(error) => {
@@ -8097,12 +8184,78 @@ impl G17PLiveRuntime {
     }
 }
 
+/// Mark one RTKit role's session permanently crashed, naming the step that did
+/// it.
+///
+/// `crashed` makes `service_primary_firmware_events` and
+/// `primary_firmware_event_pending` return early forever, so every later
+/// doorbell is a silent no-op and no completion, timeout or recovery is ever
+/// reported again. That makes this transition the single most important line in
+/// the log, and it carried only an errno: the event chain has eight fallible
+/// steps that can all surface as EIO, so a wedge from a real firmware fault and
+/// a wedge from a duplicate recovery record read identically.
+///
+/// `reason=` matches `note_session_recovery_pending` deliberately, so one grep
+/// -- `G17PMARK session-crashed` -- finds every route into `is_crashed()`.
+fn note_state_crashed(
+    pdev: &ARef<platform::Device>,
+    state: &G17PRoleRtkitState,
+    reason: &'static str,
+    error: Error,
+    generation: Option<u64>,
+) {
+    let repeat = state.crashed.swap(true, Ordering::AcqRel);
+    dev_err!(
+        pdev.as_ref(),
+        "G17PMARK session-crashed reason={} role={} err={:?} generation={:?} repeat={} -- from here the event worker stops reporting completions, timeouts and recoveries\n",
+        reason,
+        state.processor.name(),
+        error,
+        generation,
+        repeat,
+    );
+}
+
+/// Raise `session_recovery_pending`, which is the third route into
+/// `is_crashed()` and the only one that was entirely silent.
+///
+/// Both writers set it in passing, and neither said anything: a client whose
+/// render was settled-lost, and the rebuild's own `pause_submissions`. From the
+/// write on, `is_crashed()` is true, every later submit takes the EIO refusal
+/// and the next device query triggers a session rebuild -- with nothing in the
+/// log naming the moment. A wedge with no fault report and a wedge from a real
+/// firmware fault therefore looked the same.
+///
+/// Logs the transition, not every write: the flag is set repeatedly inside
+/// per-slot loops and a line per write would bury the one that matters.
+pub(crate) fn note_session_recovery_pending(
+    pending: &mut bool,
+    pdev: Option<&ARef<platform::Device>>,
+    reason: &'static str,
+) {
+    if *pending {
+        return;
+    }
+    *pending = true;
+    if let Some(pdev) = pdev {
+        dev_err!(
+            pdev.as_ref(),
+            "G17PMARK session-crashed reason={} -- from here is_crashed() is true, the event worker stops reporting completions, timeouts and recoveries, and the next client open triggers a session rebuild\n",
+            reason,
+        );
+    }
+}
+
 impl g17_lifecycle::PersistentRuntimeRecovery for G17PLiveRuntime {
     type Error = Error;
 
     fn pause_submissions(&mut self) {
         self.accepting_submissions = false;
-        self.session_recovery_pending = true;
+        note_session_recovery_pending(
+            &mut self.session_recovery_pending,
+            self.pdev.as_ref(),
+            "pause-submissions-for-rebuild",
+        );
     }
 
     fn stop_cpu_pair(&mut self) -> Result {

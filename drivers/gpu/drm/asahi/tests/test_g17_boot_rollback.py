@@ -66,7 +66,10 @@ assert teardown.index("if self.boot_stop_unproven") < teardown.index("self.cpus.
 # removed. Keep that state retryable even though neither role has a crash bit.
 pause = item(recovery, "    fn pause_submissions(")
 resume = item(recovery, "    fn resume_submissions(")
-assert "self.session_recovery_pending = true;" in pause
+# Raised through the helper that logs the transition -- the flag is one of the
+# three routes into is_crashed() and was the only silent one.
+assert "note_session_recovery_pending(" in pause
+assert "&mut self.session_recovery_pending," in pause
 assert "self.session_recovery_pending = false;" in resume
 assert "persistent_session_needs_recovery(" in is_crashed
 assert "self.session_recovery_pending" in is_crashed

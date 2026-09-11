@@ -3674,6 +3674,18 @@ pub(crate) struct G17PUserRenderQueueState {
     pub(crate) tiling: g17_completion::QueueIndices,
     pub(crate) fragment: g17_completion::QueueIndices,
     pub(crate) job_list_empty: bool,
+    /// The raw job-list head, `[first, last]`.
+    ///
+    /// `job_list_empty` is `first == 0 && last == &head`, i.e. it needs BOTH
+    /// halves of a doubly-linked list head to read empty. A group the firmware
+    /// half-unlinked -- head cleared, tail left naming the stale node, or the
+    /// reverse -- reads non-empty while holding nothing, and the boolean alone
+    /// cannot tell that apart from a job the firmware genuinely still has
+    /// linked. Those two want opposite fixes, so keep the words.
+    pub(crate) job_list: [u64; 2],
+    /// The address `last` must hold for the list to be empty, so a reader does
+    /// not have to reconstruct `graph_va + JOB_LIST` to interpret the pair.
+    pub(crate) job_list_head_va: u64,
     pub(crate) tiling_timestamps: [u64; 2],
     pub(crate) fragment_timestamps: [u64; 2],
 }
@@ -3821,6 +3833,11 @@ impl G17PRenderItemPlan {
 /// a line per frame while the condition stays visible.
 static G17P_POOL_A_FALLBACK_LOGGED: AtomicU32 = AtomicU32::new(0);
 
+/// Highest number of consecutive unusable Pool-A records seen ahead of the
+/// preferred index. Rises only when records stop being reusable, so a rising
+/// value IS the burn, reported without waiting for a wedge.
+static G17P_POOL_A_MAX_SKIP: AtomicU32 = AtomicU32::new(0);
+
 /// One host increment of an EventControl's own submitted-kick counter.
 /// Native incrementSubmittedKicks (89fc2a0) adds to the u32 reached through
 /// host descriptor +1a8; it is not assigned from a global render ordinal.
@@ -3833,7 +3850,17 @@ struct G17PEventControlKick {
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct G17PRenderEventControlState {
     pub(crate) record_index: u8,
+    /// The HOST's mirror of the submitted-kick target (`pool_a_submitted`).
     pub(crate) submitted: u32,
+    /// The submitted-kick counter as it actually reads in shared memory, at
+    /// `G17P_RENDER_POOL_A_SLOTS + record_index * 4`.
+    ///
+    /// `unlinked()` compares a host-side Rust field against a firmware-written
+    /// word, so the two can drift with nothing to say so. Carry the shared word
+    /// as well: `submitted != slot_word` means the comparison is being made
+    /// against a stale mirror, which is a different bug from the firmware being
+    /// behind.
+    pub(crate) slot_word: u32,
     pub(crate) completed: u32,
     pub(crate) membership: u32,
 }
@@ -4345,6 +4372,19 @@ impl G17PComputeDescriptorStorage {
     /// firmware-owned record, its completed counter, or the final stamp.
     /// A pre-publication retry writes the same absolute count, not another
     /// increment. Logical VM/queue changes keep the physical queue ordinal.
+    /// Read the submitted-count target word and the firmware's completed
+    /// counter without publishing anything.
+    ///
+    /// The same two words `publish_compute_submitted_count` returns, so a
+    /// failure path can sample them at the moment of the timeout rather than
+    /// only at the next publication.
+    pub(crate) fn read_compute_submitted_counters(&mut self) -> Result<[u32; 2]> {
+        let base = self.support.iova();
+        let target = self.support.read_u32(base + mmu::UAT_PGSZ as u64 + 4)?;
+        let completed = self.support.read_u32(base + 0x10c)?;
+        Ok([target, completed])
+    }
+
     pub(crate) fn publish_compute_submitted_count(&mut self, count: u32) -> Result<[u32; 2]> {
         let base = self.support.iova();
         let target = base + mmu::UAT_PGSZ as u64 + 4;
@@ -4415,6 +4455,7 @@ impl G17PComputeDescriptorStorage {
         channel_control: u64,
         queue_id: u8,
         install_queue: bool,
+        context_id: Option<u16>,
     ) -> Result<g17_compute::ComputeChannelGroupAddresses> {
         let queue = self.queue_graph.iova();
         let graph_vmap = self.queue_graph.object.vmap()?;
@@ -4440,6 +4481,7 @@ impl G17PComputeDescriptorStorage {
             graph,
             queue_context,
             install_queue,
+            context_id,
         )
         .map_err(|_| EINVAL)?;
 
@@ -4679,6 +4721,7 @@ impl G17PComputeDescriptorStorage {
         channel_control: u64,
         queue_id: u8,
         rewind: bool,
+        context_id: Option<u16>,
     ) -> Result<g17_compute::ComputeChannelGroupAddresses> {
         let queue = self.queue_graph.iova();
         let optional = queue
@@ -4698,6 +4741,7 @@ impl G17PComputeDescriptorStorage {
                 // flag is clear -- which is also what every captured macOS
                 // steady-state submission sends.
                 false,
+                context_id,
             )
             .map_err(|_| EINVAL)
         })?;
@@ -7810,14 +7854,56 @@ impl G17PUserRenderStorage {
     /// Read the exact EventControl record owned by the current TA command.
     /// The matching firmware type-1 edge orders these host-DRAM fields; no
     /// MMIO or periodic polling is needed to decide whether it is reusable.
+    /// How many of the 35 Pool-A EventControl records are currently reusable.
+    ///
+    /// The burn question in one number. A record is reusable only while
+    /// `completed == submitted && membership == 0`; a render whose pair
+    /// half-completes leaves it short by one forever, and `prepare_reuse` then
+    /// refuses it for the rest of the boot.
+    ///
+    /// That refusal is invisible in the log as things stand. Selection SKIPS an
+    /// unusable record silently -- `(0..35).map(...).find(...)` -- the fallback
+    /// line is gated on `G17P_POOL_A_FALLBACK_LOGGED == 0` so it fires once per
+    /// boot and never again, the `became unusable` EBUSY needs a record to pass
+    /// selection and then fail at restage (a race, and rightly rare), and the
+    /// 35-way audit only runs when EVERY record is gone. So a boot can burn
+    /// records steadily and print nothing. Counting them on the witness path --
+    /// which only runs on a wedge, plus once on a healthy completion -- makes
+    /// the trend observable without adding a line per frame.
+    pub(crate) fn pool_a_reusable_count(&mut self) -> Result<u32> {
+        let support_va = self.support.iova();
+        let view = self.support.object.vmap()?;
+        let support_ro = unsafe {
+            // SAFETY: the VMap covers the complete support object; the reuse
+            // predicate bounds-checks every record it reads.
+            core::slice::from_raw_parts(view.as_ptr(), G17P_RENDER_SUPPORT_SIZE)
+        };
+        Ok((0..35usize)
+            .filter(|&index| {
+                G17PEventControlKick::prepare_reuse(support_ro, support_va, index).is_some()
+            })
+            .count() as u32)
+    }
+
     pub(crate) fn render_event_control_state(&mut self) -> Result<G17PRenderEventControlState> {
         let index = usize::from(self.pool_a_record_index);
         let record = G17P_RENDER_POOL_A
             .checked_add(index.checked_mul(0x100).ok_or(EOVERFLOW)?)
             .ok_or(EOVERFLOW)?;
+        let slot_offset = G17P_RENDER_POOL_A_SLOTS
+            .checked_add(index.checked_mul(4).ok_or(EOVERFLOW)?)
+            .ok_or(EOVERFLOW)?;
         let mut completed = 0;
         let mut membership = 0;
+        let mut slot_word = 0;
         self.support.with_bytes_mut(|support| {
+            slot_word = u32::from_le_bytes(
+                support
+                    .get(slot_offset..slot_offset + 4)
+                    .ok_or(ERANGE)?
+                    .try_into()
+                    .map_err(|_| EINVAL)?,
+            );
             completed = u32::from_le_bytes(
                 support
                     .get(record + 0x0c..record + 0x10)
@@ -7837,6 +7923,7 @@ impl G17PUserRenderStorage {
         Ok(G17PRenderEventControlState {
             record_index: self.pool_a_record_index,
             submitted: self.pool_a_submitted,
+            slot_word,
             completed,
             membership,
         })
@@ -8381,12 +8468,36 @@ impl G17PUserRenderStorage {
             };
             let preferred = (submission_ordinal as usize * 2) % 35;
             let selected = (0..35)
-                .map(|step| (preferred + step) % 35)
-                .find(|&index| {
+                .map(|step| (step, (preferred + step) % 35))
+                .find(|&(_, index)| {
                     G17PEventControlKick::prepare_reuse(support_ro, support_va, index).is_some()
                 });
             match selected {
-                Some(index) => {
+                Some((skipped, index)) => {
+                    // High-water mark of records skipped before a reusable one
+                    // was found, logged only when it GROWS.
+                    //
+                    // The once-per-boot fallback line below cannot show a trend,
+                    // and the 35-way audit only runs at total exhaustion, so a
+                    // boot that burns records steadily prints nothing until it
+                    // has burned all of them. `skipped` is free -- it is the
+                    // step the search stopped at -- and a monotonically rising
+                    // high-water mark is the burn happening, visible without
+                    // waiting for a wedge. Stable means no burn. Bounded at 35
+                    // lines per boot, and silent on a healthy machine.
+                    if skipped as u32
+                        > G17P_POOL_A_MAX_SKIP.fetch_max(skipped as u32, Ordering::Relaxed)
+                    {
+                        dev_info!(
+                            dev.as_ref(),
+                            "G17P render restage: pool-A skip high-water {} (preferred={} used={} ordinal={}) -- {} record(s) ahead of the preferred index are not reusable\n",
+                            skipped,
+                            preferred,
+                            index,
+                            submission_ordinal,
+                            skipped,
+                        );
+                    }
                     if index != preferred
                         && G17P_POOL_A_FALLBACK_LOGGED
                             .fetch_add(1, Ordering::Relaxed)
@@ -10224,6 +10335,8 @@ impl G17PUserRenderStorage {
                 write: 0,
             },
             job_list_empty: false,
+            job_list: [0; 2],
+            job_list_head_va: 0,
             tiling_timestamps: [0; 2],
             fragment_timestamps: [0; 2],
         };
@@ -10254,7 +10367,9 @@ impl G17PUserRenderStorage {
                     .try_into()
                     .map_err(|_| EINVAL)?,
             );
-            state.job_list_empty = first == 0 && last == graph_va + Self::JOB_LIST as u64;
+            state.job_list = [first, last];
+            state.job_list_head_va = graph_va + Self::JOB_LIST as u64;
+            state.job_list_empty = first == 0 && last == state.job_list_head_va;
             Ok(())
         })?;
         self.timestamps.with_bytes_mut(|raw| {
@@ -15582,6 +15697,37 @@ impl G17ResourceOwner {
             "G17P render channel owner: process pid={}\n",
             owner_pid
         );
+        // Nothing above this line has touched the VM. Prove the TTBAT lookup
+        // this constructor will need while that is still true.
+        //
+        // `flush_t8140_vm_contexts` used to be the first place the condition
+        // was tested, deep inside `finish` -- by which point the render pool
+        // had been cleared unconditionally and the job-context aliases had been
+        // appended to the VM. Its failure path cannot undo either: its idea of
+        // undoing the pool is to clear it a second time, and it removes no
+        // aliases. So a VM with no TTBAT context holding its root was left
+        // worse off by every attempt, and a client retrying went round that
+        // loop once per try.
+        //
+        // The lookup reads only, so running it here costs one scan of 64 words
+        // and turns the whole stage into a clean refusal.
+        if let Err(error) = self.address_space.uat.require_t8140_vm_context(vm) {
+            // Sticky, and deliberately recorded on the VM rather than returned
+            // alone: with no context holding this VM's root, every later
+            // submission against it is undispatchable -- the firmware accepts
+            // the kick, the GPU never runs it, no completion record is ever
+            // written, and the client waits out a full timeout before the
+            // session is quarantined. Failing those submissions honestly turns
+            // a desktop-wide wedge into one application failing to start.
+            vm.status().record(error.to_errno());
+            dev_err!(
+                dev.as_ref(),
+                "G17P render: VM {} has no TTBAT context holding its root ({:?}); refusing render storage before any mapping is touched, and failing this VM's later submissions\n",
+                vm.id(),
+                error,
+            );
+            return Err(error);
+        }
         vm.clear_render_pool_mappings(queue_pair.slot());
         let mut render_operand_aliases = self.stage_user_render_flist(vm)?;
         let job_context_aliases = self
@@ -15667,6 +15813,14 @@ impl G17ResourceOwner {
             // neither a PBDesc pointing at freed PM memory nor an occupied
             // render-pool generation. The append above allocates before it
             // consumes its mappings, so an append failure left no VM aliases.
+            //
+            // ENOENT here can now only mean the VM's root left the TTBAT table
+            // between the precondition above and this point, which is the same
+            // permanent condition and not something a retry can improve. Record
+            // it so this VM's later submissions fail instead of hanging.
+            if error == ENOENT {
+                vm.status().record(error.to_errno());
+            }
             let restore = self.restore_render_parameter_buffer_descriptor(staged_descriptor);
             vm.clear_render_pool_mappings(queue_pair.slot());
             restore?;
@@ -17936,6 +18090,7 @@ mod tests {
             &mut graph,
             &mut context,
             true,
+            None,
         )
         .unwrap();
         let actual = &graph
@@ -17983,6 +18138,7 @@ mod tests {
             &mut relocated_graph,
             &mut relocated_context,
             true,
+            None,
         )
         .unwrap();
         let relocated_actual = &relocated_graph
