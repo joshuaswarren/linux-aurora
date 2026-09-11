@@ -119,7 +119,12 @@ const PRIMARY_STATUS_B_RECOVERY_ZERO_1_OFFSET: u64 = 0x48c4;
 const PRIMARY_STATUS_B_RECOVERY_COMMAND_WORD_OFFSET: u64 = 0x48c8;
 const PRIMARY_STATUS_B_RECOVERY_RAW_48CC_OFFSET: u64 = 0x48cc;
 const PRIMARY_STATUS_B_RECOVERY_RAW_48D0_OFFSET: u64 = 0x48d0;
-const PRIMARY_STATUS_B_RECOVERY_FAULT_STATUS_OFFSET: u64 = 0x48d8;
+/// NOT an MMU fault status. B1 copies `(c0d8|c0b0|c0c8)` here, i.e. the
+/// hardware-SLOT fault mask that `FUN_5450` scans; the blamed slot in the
+/// fault report is its lowest set bit and `detected-source-count` is its
+/// population count. Three live samples agree: mask 0x1/slot 0, mask 0x2/
+/// slot 1, mask 0x3/slot 0 with source counts 1, 1 and 2.
+const PRIMARY_STATUS_B_RECOVERY_SLOT_MASK_OFFSET: u64 = 0x48d8;
 const PRIMARY_STATUS_B_RECOVERY_OBJECT_ACTIVE_OFFSET: u64 = 0x4910;
 const PRIMARY_FIRMWARE_EVENT_CHANNEL_INDEX: usize = 13;
 const SECONDARY_EXTRA_0_BEFORE_PRIMARY_STATUS_A: u64 = 0x6c0;
@@ -1835,31 +1840,50 @@ const DM1_WATCHDOG_VIEW_INDEX: usize = 1;
 const DM1_WATCHDOG_SLOT0_OFFSET: usize = 0xa40;
 const DM1_WATCHDOG_RECORD_SIZE: usize = 0x18;
 
+/// Records that fit between the array base and the end of bundle view 1.
+///
+/// `FUN_5450` blames `slot = <first set bit of the DM fault mask>`, which is
+/// **not** always 0. Reading only slot 0 reported an all-zero record for two
+/// different live faults whose blamed slots were 1 and 0 respectively, so the
+/// zeros said nothing about either fault. Size the scan from the view instead.
+pub(crate) const DM1_WATCHDOG_SLOT_COUNT: usize =
+    (g17_initdata::BUNDLE_VIEW_EXTENTS[DM1_WATCHDOG_VIEW_INDEX] - DM1_WATCHDOG_SLOT0_OFFSET)
+        / DM1_WATCHDOG_RECORD_SIZE;
+
 /// Validate the entire read against the expected host-owned view before
 /// following the serialized pointer. Reject overflow at either end.
-fn g17p_dm1_slot0_address(
+fn g17p_dm1_slot_address(
     view_pointer: u64,
     expected_view: u64,
     view_extent: usize,
+    slot: usize,
 ) -> Option<u64> {
-    let end = DM1_WATCHDOG_SLOT0_OFFSET.checked_add(DM1_WATCHDOG_RECORD_SIZE)?;
+    let base = DM1_WATCHDOG_SLOT0_OFFSET
+        .checked_add(slot.checked_mul(DM1_WATCHDOG_RECORD_SIZE)?)?;
+    let end = base.checked_add(DM1_WATCHDOG_RECORD_SIZE)?;
     if view_pointer != expected_view || end > view_extent {
         return None;
     }
     view_pointer.checked_add(end as u64)?;
-    view_pointer.checked_add(DM1_WATCHDOG_SLOT0_OFFSET as u64)
+    view_pointer.checked_add(base as u64)
 }
 
 /// Raw host-memory sample, not an atomic firmware snapshot. Only word 0
 /// (progress-monitor state) and the unaligned timestamp at +0x0c are named:
 /// B1 keeps its unchanged-sample counter elsewhere, not at record +0x08.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub(crate) struct G17PFirmwareDm1Slot0Snapshot {
+pub(crate) struct G17PFirmwareDm1SlotSnapshot {
+    pub(crate) slot: usize,
     pub(crate) address: u64,
     pub(crate) raw: [u32; 6],
 }
 
-impl G17PFirmwareDm1Slot0Snapshot {
+impl G17PFirmwareDm1SlotSnapshot {
+    /// True when every word is zero, i.e. the firmware never wrote this slot.
+    pub(crate) fn is_blank(&self) -> bool {
+        self.raw.iter().all(|word| *word == 0)
+    }
+
     pub(crate) fn state(&self) -> u32 {
         self.raw[0]
     }
@@ -1945,7 +1969,7 @@ pub(crate) struct G17PFirmwareRecoveryCauseSnapshot {
     pub(crate) command_word: u32,
     pub(crate) raw_48cc: u32,
     pub(crate) raw_48d0: u64,
-    pub(crate) fault_status: u64,
+    pub(crate) slot_mask: u64,
     pub(crate) host_recovery: u32,
 }
 
@@ -12659,9 +12683,13 @@ impl G17ResourceOwner {
     /// Sample DM1 hardware slot 0's progress record through the retained WC
     /// shared object. This does not read SGX registers or firmware-private
     /// cached memory, and it cannot follow a pointer outside bundle view 1.
-    pub(crate) fn firmware_dm1_slot0_snapshot(
+    pub(crate) fn firmware_dm1_slot_snapshot(
         &mut self,
-    ) -> Result<G17PFirmwareDm1Slot0Snapshot> {
+        slot: usize,
+    ) -> Result<G17PFirmwareDm1SlotSnapshot> {
+        if slot >= DM1_WATCHDOG_SLOT_COUNT {
+            return Err(EINVAL);
+        }
         let pointer_address = self
             .handoff
             .primary
@@ -12677,10 +12705,11 @@ impl G17ResourceOwner {
             .ok_or(EINVAL)?;
         core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
         let view_pointer = self.resources.shared_cluster.read_u64(pointer_address)?;
-        let address = g17p_dm1_slot0_address(
+        let address = g17p_dm1_slot_address(
             view_pointer,
             expected_view,
             g17_initdata::BUNDLE_VIEW_EXTENTS[DM1_WATCHDOG_VIEW_INDEX],
+            slot,
         )
         .ok_or(EINVAL)?;
         let mut raw = [0u32; 6];
@@ -12690,7 +12719,7 @@ impl G17ResourceOwner {
                 .shared_cluster
                 .read_u32(address.checked_add(index as u64 * 4).ok_or(EINVAL)?)?;
         }
-        Ok(G17PFirmwareDm1Slot0Snapshot { address, raw })
+        Ok(G17PFirmwareDm1SlotSnapshot { slot, address, raw })
     }
 
     pub(crate) fn firmware_recovery_handshake_snapshot(
@@ -12928,9 +12957,9 @@ impl G17ResourceOwner {
                 .checked_add(PRIMARY_STATUS_B_RECOVERY_RAW_48D0_OFFSET)
                 .ok_or(EINVAL)?,
         )?;
-        let fault_status = self.resources.primary_state.read_u64(
+        let slot_mask = self.resources.primary_state.read_u64(
             status_b
-                .checked_add(PRIMARY_STATUS_B_RECOVERY_FAULT_STATUS_OFFSET)
+                .checked_add(PRIMARY_STATUS_B_RECOVERY_SLOT_MASK_OFFSET)
                 .ok_or(EINVAL)?,
         )?;
         Ok(G17PFirmwareRecoveryCauseSnapshot {
@@ -12940,7 +12969,7 @@ impl G17ResourceOwner {
             command_word,
             raw_48cc,
             raw_48d0,
-            fault_status,
+            slot_mask,
             host_recovery,
         })
     }
@@ -14121,53 +14150,36 @@ impl G17ResourceOwner {
             entries[0], entries[1], entries[2], entries[3],
             entries[4], entries[5], entries[6], entries[7]
         );
-        // The block carries two 64-bit firmware VAs at +0x48e0 and +0x48e8,
-        // exactly 0x40 apart. Follow them: this is the most concrete lead on
-        // what the firmware is actually asking for.
-        for slot in [0x48e0u64, 0x48e8] {
-            let target = self.resources.primary_state.read_u64(
-                status_b.checked_add(slot).ok_or(EINVAL)?,
-            )?;
-            if target == 0 {
-                continue;
-            }
-            let mut words = [0u32; 16];
-            let mut ok = true;
-            for (i, word) in words.iter_mut().enumerate() {
-                match target
-                    .checked_add((i as u64).checked_mul(4).ok_or(EINVAL)?)
-                    .ok_or(EINVAL)
-                    .and_then(|a| self.resources.primary_state.read_u32(a))
-                {
-                    Ok(value) => *word = value,
-                    Err(_) => {
-                        ok = false;
-                        break;
-                    }
-                }
-            }
-            if !ok {
-                dev_info!(
-                    self.dev().as_ref(),
-                    "G17P recovery ptr +{:#06x} = {:#x}: unreadable\n",
-                    slot,
-                    target
-                );
-                continue;
-            }
+        // +0x48e0 and +0x48e8 are NOT firmware fault output and are not a
+        // lead. They are `PRIMARY_STATUS_B_FWCTL_STATE` / `..._FWCTL_RING`,
+        // which *this driver* writes at init via `encode_primary_status_b(
+        // fwctl.iova(), fwctl.iova() + CONTROL_RECORD_SIZE)`. They are the
+        // same two constants on every boot and every fault, and they read
+        // back "unreadable" only because the loop below probes them through
+        // `primary_state`, whose subview ends long before the fwctl object.
+        // Check them against what we published instead: a mismatch would mean
+        // the firmware moved our own pointers, which is worth knowing; equality
+        // is the expected, uninteresting answer.
+        let published_state = self.resources.fwctl.iova();
+        let published_ring = published_state
+            .checked_add(g17_initdata::CONTROL_RECORD_SIZE as u64)
+            .ok_or(EINVAL)?;
+        for (slot, published) in [
+            (g17_initdata::PRIMARY_STATUS_B_FWCTL_STATE as u64, published_state),
+            (g17_initdata::PRIMARY_STATUS_B_FWCTL_RING as u64, published_ring),
+        ] {
+            let found = self
+                .resources
+                .primary_state
+                .read_u64(status_b.checked_add(slot).ok_or(EINVAL)?)?;
+            let matches = found == published;
             dev_info!(
                 self.dev().as_ref(),
-                "G17P recovery ptr +{:#06x} = {:#x}: {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x}\n",
-                slot, target,
-                words[0], words[1], words[2], words[3],
-                words[4], words[5], words[6], words[7]
-            );
-            dev_info!(
-                self.dev().as_ref(),
-                "G17P recovery ptr +{:#06x} cont: {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x}\n",
+                "G17P recovery fwctl pointer +{:#06x} found={:#x} published={:#x} match={}\n",
                 slot,
-                words[8], words[9], words[10], words[11],
-                words[12], words[13], words[14], words[15]
+                found,
+                published,
+                matches,
             );
         }
         Ok(())
@@ -17134,23 +17146,28 @@ mod tests {
     #[test]
     fn dm1_watchdog_slot0_validates_pointer_identity_and_complete_extent() {
         let view = 0xffff_fc20_c078_b380;
-        assert_eq!(g17p_dm1_slot0_address(view, view, 0xc80), Some(view + 0xa40));
-        assert_eq!(g17p_dm1_slot0_address(view, view, 0xa58), Some(view + 0xa40));
-        assert_eq!(g17p_dm1_slot0_address(view, view, 0xa57), None);
-        assert_eq!(g17p_dm1_slot0_address(view + 4, view, 0xc80), None);
+        assert_eq!(g17p_dm1_slot_address(view, view, 0xc80, 0), Some(view + 0xa40));
+        assert_eq!(g17p_dm1_slot_address(view, view, 0xc80, 1), Some(view + 0xa58));
+        assert_eq!(g17p_dm1_slot_address(view, view, 0xc80, DM1_WATCHDOG_SLOT_COUNT - 1), Some(view + 0xc68));
+        assert_eq!(g17p_dm1_slot_address(view, view, 0xc80, DM1_WATCHDOG_SLOT_COUNT), None);
+        assert_eq!(DM1_WATCHDOG_SLOT_COUNT, 24);
+        assert_eq!(g17p_dm1_slot_address(view, view, 0xa58, 0), Some(view + 0xa40));
+        assert_eq!(g17p_dm1_slot_address(view, view, 0xa57, 0), None);
+        assert_eq!(g17p_dm1_slot_address(view + 4, view, 0xc80, 0), None);
     }
 
     #[test]
     fn dm1_watchdog_slot0_rejects_start_and_end_overflow() {
         let start_overflow = u64::MAX - 0xa3f;
-        assert_eq!(g17p_dm1_slot0_address(start_overflow, start_overflow, 0xc80), None);
+        assert_eq!(g17p_dm1_slot_address(start_overflow, start_overflow, 0xc80, 0), None);
         let end_overflow = u64::MAX - 0xa40;
-        assert_eq!(g17p_dm1_slot0_address(end_overflow, end_overflow, 0xc80), None);
+        assert_eq!(g17p_dm1_slot_address(end_overflow, end_overflow, 0xc80, 0), None);
     }
 
     #[test]
     fn dm1_watchdog_slot0_timestamp_uses_unaligned_words_three_and_four() {
-        let snapshot = G17PFirmwareDm1Slot0Snapshot {
+        let snapshot = G17PFirmwareDm1SlotSnapshot {
+            slot: 0,
             address: 0,
             raw: [2, 0x1111_1111, 0x2222_2222, 0x89ab_cdef, 0x0123_4567, 0x5555_5555],
         };

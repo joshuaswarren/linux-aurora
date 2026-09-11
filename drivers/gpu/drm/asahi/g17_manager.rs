@@ -2095,10 +2095,11 @@ impl G17PManagerConstruction {
         self.resources.firmware_fault_report_snapshot()
     }
 
-    pub(crate) fn firmware_dm1_slot0_snapshot(
+    pub(crate) fn firmware_dm1_slot_snapshot(
         &mut self,
-    ) -> Result<g17_resources::G17PFirmwareDm1Slot0Snapshot> {
-        self.resources.firmware_dm1_slot0_snapshot()
+        slot: usize,
+    ) -> Result<g17_resources::G17PFirmwareDm1SlotSnapshot> {
+        self.resources.firmware_dm1_slot_snapshot(slot)
     }
 
     pub(crate) fn drain_firmware_event(

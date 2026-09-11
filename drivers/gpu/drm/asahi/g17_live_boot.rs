@@ -556,6 +556,8 @@ fn log_g17p_fault_report(
     // This report is validated host-owned WC memory, not the diagnostic MMIO
     // fault bank. Keep it available with register probing disabled, especially
     // before recovery acknowledgement clears the firmware's blame fields.
+    let mut blamed_slot: Option<usize> = None;
+    let mut blamed_data_master: Option<u32> = None;
     match manager.firmware_fault_report_snapshot() {
         Ok(snapshot) => dev_info!(
             dev,
@@ -580,25 +582,82 @@ fn log_g17p_fault_report(
             error,
         ),
     }
+    if let Ok(snapshot) = manager.firmware_fault_report_snapshot() {
+        if snapshot.slot_present != 0 {
+            blamed_slot = Some(snapshot.slot as usize);
+        }
+        if snapshot.data_master_present != 0 {
+            blamed_data_master = Some(snapshot.data_master);
+        }
+    }
     // Keep this independent of the report read: failure of either bounded
     // host-memory diagnostic must not suppress the other or touch MMIO.
-    match manager.firmware_dm1_slot0_snapshot() {
-        Ok(snapshot) => dev_info!(
-            dev,
-            "G17P DM1 slot0 monitor checkpoint={} address={:#x} raw={:08x?} monitor-state={} monitor-timestamp={:#x}\n",
-            checkpoint,
-            snapshot.address,
-            snapshot.raw,
-            snapshot.state(),
-            snapshot.timestamp(),
-        ),
-        Err(error) => dev_warn!(
-            dev,
-            "G17P DM1 slot0 monitor checkpoint={} read failed ({:?})\n",
-            checkpoint,
-            error,
-        ),
+    //
+    // Slot 0 is NOT the blamed slot. `FUN_5450` blames the first set bit of
+    // the DM fault mask, and two live faults blamed slots 1 and 0. Reading
+    // only slot 0 printed an all-zero record for both and said nothing about
+    // either. Scan the whole array the view can hold, name every record the
+    // firmware actually wrote, and always print the blamed one.
+    let blamed = blamed_slot.filter(|slot| *slot < g17_resources::DM1_WATCHDOG_SLOT_COUNT);
+    let mut populated = 0u32;
+    let mut failures = 0u32;
+    for slot in 0..g17_resources::DM1_WATCHDOG_SLOT_COUNT {
+        match manager.firmware_dm1_slot_snapshot(slot) {
+            Ok(snapshot) => {
+                if snapshot.is_blank() {
+                    continue;
+                }
+                populated |= 1u32 << slot;
+                let blame_tag = match blamed == Some(slot) {
+                    true => " BLAMED",
+                    false => "",
+                };
+                dev_info!(
+                    dev,
+                    "G17P DM1 monitor checkpoint={} slot={}{} address={:#x} raw={:08x?} monitor-state={} monitor-timestamp={:#x}\n",
+                    checkpoint,
+                    slot,
+                    blame_tag,
+                    snapshot.address,
+                    snapshot.raw,
+                    snapshot.state(),
+                    snapshot.timestamp(),
+                );
+            }
+            Err(_) => failures = failures.saturating_add(1),
+        }
     }
+    // A blamed slot the firmware left blank is itself the result: it says the
+    // progress monitor never observed that slot, so the blame came from the
+    // fault mask alone. Print it explicitly rather than leaving it implied.
+    if let Some(slot) = blamed {
+        if populated & (1u32 << slot) == 0 {
+            dev_info!(
+                dev,
+                "G17P DM1 monitor checkpoint={} slot={} BLAMED but blank: firmware wrote no progress record for it\n",
+                checkpoint,
+                slot,
+            );
+        }
+    }
+    // The record array offset 0xa40 is DM1's. A blame naming any other data
+    // master is not described by these records at all, so say so instead of
+    // letting DM1 rows be read as evidence about it.
+    let dm_note = match blamed_data_master {
+        Some(1) | None => "",
+        Some(_) => " (records above are DM1's; the blamed data master is not DM1)",
+    };
+    dev_info!(
+        dev,
+        "G17P DM1 monitor checkpoint={} scanned={} populated-mask={:#x} unreadable={} blamed-slot={:?} blamed-data-master={:?}{}\n",
+        checkpoint,
+        g17_resources::DM1_WATCHDOG_SLOT_COUNT,
+        populated,
+        failures,
+        blamed_slot,
+        blamed_data_master,
+        dm_note,
+    );
 }
 
 /// A narrowly scoped, already-halted slot discriminator. Failure to observe
@@ -1060,19 +1119,38 @@ fn complete_primary_real_recovery(
     log_g17p_halted_slot0(pdev.as_ref(), manager, registers, handshake.epoch);
     log_g17p_halted_gmmu(pdev.as_ref(), manager, registers, handshake.epoch);
     let cause = manager.primary_firmware_recovery_cause_snapshot()?;
+    let slot_mask_population = cause.slot_mask.count_ones();
+    let lowest_blamed_slot = match cause.slot_mask {
+        0 => None,
+        mask => Some(mask.trailing_zeros()),
+    };
     dev_info!(
         pdev.as_ref(),
-        "G17P recovery cause: zero0={:#x} detected-source-count={} zero1={:#x} command-word={:#x} raw48cc={:#x} raw48d0={:#x} fault-status={:#x} host-recovery={}\n",
+        "G17P recovery cause: zero0={:#x} detected-source-count={} zero1={:#x} command-word={:#x} raw48cc={:#x} raw48d0={:#x} dm-slot-mask={:#x} (slots={} lowest={:?}) host-recovery={}\n",
         cause.zero_0,
         cause.detected_source_count,
         cause.zero_1,
         cause.command_word,
         cause.raw_48cc,
         cause.raw_48d0,
-        cause.fault_status,
+        cause.slot_mask,
+        slot_mask_population,
+        lowest_blamed_slot,
         cause.host_recovery
     );
-    if cause.fault_status != 0 && *module_parameters::g17p_fault_report.value() != 0 {
+    // `detected-source-count` must equal the mask population and the blamed
+    // slot must be its lowest set bit. When they disagree the mask is not the
+    // whole story for this fault, which is worth one line to know.
+    if slot_mask_population != cause.detected_source_count {
+        dev_warn!(
+            pdev.as_ref(),
+            "G17P recovery cause: source count {} does not match dm-slot-mask population {} ({:#x})\n",
+            cause.detected_source_count,
+            slot_mask_population,
+            cause.slot_mask,
+        );
+    }
+    if cause.slot_mask != 0 && *module_parameters::g17p_fault_report.value() != 0 {
         let mut faulting_address = None;
         if let Some(registers) = registers {
             match registers.g17p_render_fault_irq_snapshot() {
