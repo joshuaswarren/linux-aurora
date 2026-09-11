@@ -26,6 +26,7 @@ pub(crate) enum M5RenderBuildError {
     DispatchBitAlreadySet,
     InvalidContext,
     OwnershipMismatch,
+    InvalidUscState,
 }
 
 impl From<RenderBuildError> for M5RenderBuildError {
@@ -61,6 +62,66 @@ pub(crate) struct M5RenderControls {
     pub(crate) partial_store_pipeline_2_bind: u64,
     pub(crate) partial_store_pipeline_2: u64,
     pub(crate) partial_tile_flags: u64,
+}
+
+/// Per-submission USC private-memory accounting, separate from user status
+/// registers and queue completion stamps.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct M5RenderUscState {
+    pub(crate) control: u64,
+    /// AGXUMADataRec +0x50. Native allocatePagesEnd derives this from pool
+    /// sizes and 4-KiB allocation units; it is a byte count, not a GPU VA.
+    pub(crate) required_bytes: u64,
+    /// Capacity actually backed by this job's retained USC allocation pages.
+    pub(crate) allocated_bytes: u64,
+    /// A 64-byte slot in the firmware-visible statistics ring.
+    pub(crate) statistics: u64,
+}
+
+impl M5RenderUscState {
+    fn valid(self) -> bool {
+        let firmware_range = |address: u64, size: u64| {
+            address >= 0xffff_fc00_0000_0000
+                && address & 0x3f == 0
+                && address.checked_add(size).is_some()
+        };
+        firmware_range(self.control, 0x80)
+            && firmware_range(self.statistics, 0x40)
+            && self.required_bytes != 0
+            && self.required_bytes <= self.allocated_bytes
+            && self.allocated_bytes & 0xfff == 0
+    }
+}
+
+/// Fill the native USC fields only after the caller owns the pool and the
+/// statistics slot. Other runtime fields still need queue/link publication.
+/// Validate both stages before modifying either descriptor.
+pub(crate) fn apply_usc_submission_state(
+    ta: &mut [u8],
+    fragment: &mut [u8],
+    ta_state: M5RenderUscState,
+    fragment_state: M5RenderUscState,
+) -> Result<(), M5RenderBuildError> {
+    if ta.len() < g17_render::TA_DESCRIPTOR_SIZE
+        || fragment.len() < g17_render::FRAGMENT_DESCRIPTOR_SIZE
+    {
+        return Err(RenderBuildError::BufferTooSmall.into());
+    }
+    if !ta_state.valid() || !fragment_state.valid() {
+        return Err(M5RenderBuildError::InvalidUscState);
+    }
+    // 25G76 AGXTAChannelSKSM::submitBuffer: 8a244c4..8a244ec.
+    // AGX3DChannelSKSM::submitBuffer takes the corresponding value from
+    // host +0xba0 = AGXUMADataRec +0x50 at 895b70c..895b718.
+    for (raw, state, control, required, statistics) in [
+        (ta, ta_state, 0x934, 0x93d, 0x945),
+        (fragment, fragment_state, 0x21ce, 0x21d7, 0x21df),
+    ] {
+        put_u64(raw, control, state.control);
+        put_u64(raw, required, state.required_bytes);
+        put_u64(raw, statistics, state.statistics);
+    }
+    Ok(())
 }
 
 const EMPTY_REGISTER: RegisterWrite = RegisterWrite {

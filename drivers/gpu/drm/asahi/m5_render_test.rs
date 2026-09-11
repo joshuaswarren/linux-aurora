@@ -38,6 +38,62 @@ fn check_program(raw: &[u8], offset: usize, expected: &[(u32, u64)]) {
 }
 
 #[test]
+fn usc_native_accounting_is_a_size_and_a_separate_statistics_slot() {
+    // Independent 25G76 TA/fragment observations. The fragment scalar has no
+    // mapping in either context 0 or context 3; allocatePagesEnd produces
+    // them by byte-size arithmetic. They must never become user aliases.
+    let ta_state = M5RenderUscState {
+        control: 0xffff_fc20_c08a_8000,
+        required_bytes: 0x7d4000,
+        allocated_bytes: 0x2600000,
+        statistics: 0xffff_fc20_0170_8000,
+    };
+    let fragment_state = M5RenderUscState {
+        required_bytes: 0x934000,
+        statistics: 0xffff_fc20_0172_8000,
+        ..ta_state
+    };
+    let mut ta = [0xa5; g17_render::TA_DESCRIPTOR_SIZE];
+    let mut fragment = [0xa5; g17_render::FRAGMENT_DESCRIPTOR_SIZE];
+    apply_usc_submission_state(&mut ta, &mut fragment, ta_state, fragment_state).unwrap();
+    for (raw, offset, expected) in [
+        (&ta[..], 0x934, ta_state.control),
+        (&ta[..], 0x93d, 0x7d4000),
+        (&ta[..], 0x945, ta_state.statistics),
+        (&fragment[..], 0x21ce, fragment_state.control),
+        (&fragment[..], 0x21d7, 0x934000),
+        (&fragment[..], 0x21df, fragment_state.statistics),
+    ] {
+        assert_eq!(read_u64(raw, offset), expected);
+    }
+    // Preserve flags and the following fields, including the unaligned gap.
+    assert_eq!(ta[0x93c], 0xa5);
+    assert_eq!(fragment[0x21d6], 0xa5);
+    assert_eq!(ta[0x94d], 0xa5);
+    assert_eq!(fragment[0x21e7], 0xa5);
+
+    let before_ta = ta;
+    let before_fragment = fragment;
+    for bad in [
+        M5RenderUscState { required_bytes: 0, ..fragment_state },
+        M5RenderUscState { required_bytes: 0x2600001, ..fragment_state },
+        M5RenderUscState { required_bytes: 0x10_0025_8000, ..fragment_state },
+        M5RenderUscState { statistics: 0x934000, ..fragment_state },
+        M5RenderUscState { statistics: u64::MAX & !63, ..fragment_state },
+        M5RenderUscState { control: 0x70_0000_0000, ..fragment_state },
+    ] {
+        assert_eq!(apply_usc_submission_state(&mut ta, &mut fragment, ta_state, bad),
+            Err(M5RenderBuildError::InvalidUscState));
+        assert_eq!(ta, before_ta);
+        assert_eq!(fragment, before_fragment);
+    }
+    assert_eq!(apply_usc_submission_state(&mut ta, &mut fragment[..32], ta_state, fragment_state),
+        Err(M5RenderBuildError::Common(RenderBuildError::BufferTooSmall)));
+    assert_eq!(ta, before_ta);
+    assert_eq!(fragment, before_fragment);
+}
+
+#[test]
 fn descriptor_programs_counts_aliases_and_bounds_match_native_layout() {
     let (p, controls) = reference();
     let objects = objects();

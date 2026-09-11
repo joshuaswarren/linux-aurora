@@ -156,6 +156,29 @@ def _m5_graphics_submit(ctx):
         for offset in ([0x10,0x20,0x28,0x30] if dm==0 else [0x20,0x28,0x30,0x38]):
             pointer, = struct.unpack_from('<Q',raw,offset)
             if pointer: attempt('header-ref-%x'%offset,pointer,min(0x1000,0x4000-(pointer&0x3fff)))
+        if os.environ.get('M5_GRAPHICS_CAPTURE_COMPLETION') == '1':
+            # allocatePagesEnd derives the first scalar from USC pool sizes.
+            # It is not the low alias of the adjacent statistics pointer.
+            size_offset, statistics_offset = (0x93d, 0x945) if dm == 0 else (0x21d7, 0x21df)
+            required_bytes, = struct.unpack_from('<Q', raw, size_offset)
+            statistics, = struct.unpack_from('<Q', raw, statistics_offset)
+            manifest['usc_accounting'] = dict(required_bytes=required_bytes,
+                statistics=hex(statistics), size_offset=hex(size_offset),
+                statistics_offset=hex(statistics_offset))
+            # Retain a bounded opt-in reproduction of the former address
+            # hypothesis. Normal captures never dereference a byte count.
+            if required_bytes and os.environ.get('M5_GRAPHICS_PROBE_USC_SIZE_AS_ADDRESS') == '1':
+                for candidate_context in sorted({0, context}):
+                    attempt('completion-low-context-%d' % candidate_context,
+                        required_bytes, 64, context=candidate_context)
+            if statistics:
+                attempt('completion-high-global', statistics, 64)
+            offsets = ([0x8a6, 0x8ae, 0x8fe, 0x934] if dm == 0 else
+                [0x2140, 0x2148, 0x2198, 0x21ce])
+            for offset in offsets:
+                pointer, = struct.unpack_from('<Q', raw, offset)
+                if pointer:
+                    attempt('completion-tail-%x' % offset, pointer, 64)
         if os.environ.get('M5_GRAPHICS_CAPTURE_OWNERS') == '1':
             from m5_graphics_owners import capture_owners
             manifest['ownership'] = capture_owners(save, raw, channel_bytes, context, name)
