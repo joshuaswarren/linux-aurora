@@ -67,15 +67,28 @@ fn main() {
               (0xd00, 0x2d00), (0, 0x4000)]
     assert subprocess.check_output([str(executable), 'check'], input=pages[4]).strip() == b'0 1024 1024'
     completed = 0
+    mapping_profiles = 0
     for directory in args.captures:
         manifest = json.loads((directory / 'manifest.json').read_text())
         assert manifest['compute_context'] == 3
         objects = {item['label']: item for item in manifest['objects']}
+        has_mappings = any('mapping' in objects[label] for label in labels)
         for index, (label, (start, end)) in enumerate(zip(labels, ranges)):
             item = objects[label]
             assert item['stable'] and int(item['address'], 16) == addresses[index], label
             native = (directory / item['file']).read_bytes()
             assert pages[index][start:end] == native[start:end], (directory.name, label)
+            if has_mappings:
+                assert item.get('mapping_stable') is True, (directory.name, label, 'unstable mapping')
+                # Context3 roots/tables match; shader and CDM are GPU-RO,
+                # while pipeline, preemption, buffers and robustness are RW.
+                expected_leaf = 0x80000000000c8b if index in (0, 2) else 0xc0000000000c8b
+                physical_mask = ((1 << 42) - 1) & ~0x3fff
+                assert item['mapping'], label
+                for view in item['mapping']:
+                    attributes = [int(entry, 16) & ~physical_mask for _, entry in view['walk']]
+                    assert attributes == [0x3000000000001, 3, 3, expected_leaf], (directory.name, label, attributes)
+        mapping_profiles += int(has_mappings)
         if manifest.get('completion', {}).get('same_descriptor'):
             item = objects['completed-extra-1']
             assert item['stable']
@@ -87,5 +100,6 @@ fn main() {
             assert subprocess.check_output([str(executable), 'check'], input=changed).strip() == b'1 0 0'
             completed += 1
     print(json.dumps(dict(captures_matched=len(args.captures), completed_results_matched=completed,
+                         mapping_profiles_matched=mapping_profiles,
                          pages_per_capture=6, shader_bytes=64, pipeline_bytes=132,
                          cdm_bytes=48, linux_execution_qualified=False)))

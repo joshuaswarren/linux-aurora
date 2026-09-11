@@ -158,6 +158,18 @@ impl G17PMailboxProvider {
         to_result(unsafe { bindings::apple_mbox_ascwrap_v6_stop_cpu(self.mbox) })
     }
 
+    fn cpu_state(&self) -> Result<(u32, u32)> {
+        let mut control = 0;
+        let mut status = 0;
+        // SAFETY: the provider remains linked and owns the wrapper mapping;
+        // both output pointers refer to writable stack storage.
+        to_result(unsafe {
+            bindings::apple_mbox_ascwrap_v6_get_cpu_state(
+                self.mbox, &mut control, &mut status)
+        })?;
+        Ok((control, status))
+    }
+
     fn a2i_control(&self) -> Result<u32> {
         const A2I_CONTROL: usize = 0x110;
         const CONTROL_WINDOW_SIZE: usize = A2I_CONTROL + core::mem::size_of::<u32>();

@@ -52,6 +52,7 @@
 #define APPLE_ASCWRAP_V6_WRAPPER_SIZE 0x88000
 #define APPLE_ASCWRAP_V6_IOP_VBAR_SIZE 0x8
 #define APPLE_ASCWRAP_V6_CPU_CONTROL 0x44
+#define APPLE_ASCWRAP_V6_CPU_STATUS 0x48
 #define APPLE_ASCWRAP_V6_CPU_RUN BIT(4)
 #define APPLE_ASCWRAP_V6_CPU_STOP_SECOND_CLEAR BIT(5)
 
@@ -241,6 +242,29 @@ out_unlock:
 	return ret;
 }
 EXPORT_SYMBOL_GPL(apple_mbox_ascwrap_v6_stop_cpu);
+
+int apple_mbox_ascwrap_v6_get_cpu_state(struct apple_mbox *mbox,
+				     u32 *control, u32 *status)
+{
+	int ret = 0;
+
+	if (!mbox || !control || !status || !mbox->hw->is_ascwrap_v6 ||
+	    !mbox->wrapper_regs)
+		return -EOPNOTSUPP;
+
+	mutex_lock(&mbox->lifecycle_lock);
+	if (mbox->removing) {
+		ret = -ENODEV;
+	} else {
+		*control = readl((u8 __iomem *)mbox->wrapper_regs +
+				APPLE_ASCWRAP_V6_CPU_CONTROL);
+		*status = readl((u8 __iomem *)mbox->wrapper_regs +
+			       APPLE_ASCWRAP_V6_CPU_STATUS);
+	}
+	mutex_unlock(&mbox->lifecycle_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_mbox_ascwrap_v6_get_cpu_state);
 
 int apple_mbox_send(struct apple_mbox *mbox, const struct apple_mbox_msg msg,
 		    bool atomic)

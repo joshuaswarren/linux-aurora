@@ -204,6 +204,20 @@ impl AscwrapV6Provider {
         // SAFETY: the provider owns and synchronizes its wrapper mapping.
         to_result(unsafe { bindings::apple_mbox_ascwrap_v6_stop_cpu(self.mbox) })
     }
+
+    /// Read hardware CPU control and status through the serialized provider.
+    /// A completed stop request alone does not establish CPU quiescence.
+    pub fn cpu_state(&self) -> Result<(u32, u32)> {
+        let mut control = 0;
+        let mut status = 0;
+        // SAFETY: the provider pointer remains valid and both outputs refer
+        // to writable stack storage for the duration of the call.
+        to_result(unsafe {
+            bindings::apple_mbox_ascwrap_v6_get_cpu_state(
+                self.mbox, &mut control, &mut status)
+        })?;
+        Ok((control, status))
+    }
 }
 
 // SAFETY: provider state is internally synchronized by the C mailbox driver;

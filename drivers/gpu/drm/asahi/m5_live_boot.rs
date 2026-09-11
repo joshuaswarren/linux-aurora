@@ -154,7 +154,8 @@ impl M5Session {
         }
         if probe_kind >= 6 {
             self.retire_idle_policy()?;
-            self.submit_compute(probe_kind == 6)?;
+            self.submit_compute(probe_kind != 7, probe_kind == 8, probe_kind >= 9,
+                                probe_kind == 10)?;
         }
         Ok(())
     }
@@ -190,7 +191,12 @@ impl M5Session {
         Ok(())
     }
 
-    fn submit_compute(&mut self, submit_kick: bool) -> Result {
+    fn submit_compute(&mut self, submit_kick: bool, freeze_after_admission: bool,
+                      live_snapshot: bool, pipe_monitor: bool) -> Result {
+        if (freeze_after_admission || live_snapshot)
+            && *crate::module_parameters::m5_fw_trace.value() & 3 != 3 {
+            return Err(EINVAL);
+        }
         let memory = self.memory.as_mut().ok_or(EIO)?;
         let state = memory.compute_pool_state()?;
         if !M5FirmwareMemory::compute_pool_ready(state) {
@@ -222,12 +228,47 @@ impl M5Session {
             return Err(ETIMEDOUT);
         }
         dev_info!(self.dev.as_ref(), "M5_COMPUTE first SKSM kick submitted qid11 stamp1 context3\n");
+        if freeze_after_admission {
+            // Preserve the ordinary kick but return to the existing CPU-stop
+            // path after the kick trace and its command callback return trace.
+            // This checkpoint proves neither shader completion nor recovery.
+            for _ in 0..10 {
+                if memory.drain_reports(&self.dev)? { return Err(EIO); }
+                if self.roles.iter().any(|role| role.state.crashed.load(Ordering::Acquire)) {
+                    return Err(EIO);
+                }
+                let (outer, inner, _) = memory.queue_probe_status()?;
+                let result = memory.compute_result()?;
+                if result.inputs_changed != 0 { return Err(EIO); }
+                if memory.compute_kick_observed() {
+                    dev_info!(self.dev.as_ref(), "M5_KSM admission checkpoint outer={:?} inner={:?} outputs_wrong={} untouched={}\n",
+                        outer, inner, result.outputs_wrong, result.outputs_untouched);
+                    return Ok(());
+                }
+                fsleep(Delta::from_millis(1));
+            }
+            return Err(ETIMEDOUT);
+        }
+        let mut live_snapshots = 0;
         for poll in 0..10000 {
             if memory.drain_reports(&self.dev)? {
                 dev_err!(self.dev.as_ref(), "M5_COMPUTE firmware requested GPU restart\n");
                 break;
             }
             if self.roles.iter().any(|role| role.state.crashed.load(Ordering::Acquire)) { break; }
+            if live_snapshot && memory.compute_kick_observed() && live_snapshots < 4 {
+                let started = kernel::time::Instant::<kernel::time::Monotonic>::now();
+                let observed = self.registers.m5_live_sksm_state();
+                let monitor = if pipe_monitor { Some(self.registers.m5_live_compute_monitor()) }
+                              else { None };
+                let elapsed = started.elapsed().as_micros_ceil();
+                let recovery = memory.drain_reports(&self.dev)?;
+                dev_info!(self.dev.as_ref(),
+                    "M5_LIVE_SNAPSHOT sample={} poll={} took_us={} recovery_during_read={} state={:x?} monitor={:x?}\n",
+                    live_snapshots, poll, elapsed, recovery, observed, monitor);
+                live_snapshots += 1;
+                if recovery { break; }
+            }
             if [0, 100, 1000, 5000].contains(&poll) {
                 dev_info!(self.dev.as_ref(), "M5_COMPUTE poll={} firmware/UMA/completion={:x?}\n",
                     poll, memory.compute_observations()?);
@@ -356,6 +397,31 @@ impl M5Runtime {
             result, *crate::module_parameters::m5_initdata_test.value());
         let stopped = session.stop_cpus();
         dev_info!(pdev.as_ref(), "M5_INIT stop requests={:?}; owners retained\n", stopped);
+        if *crate::module_parameters::m5_initdata_test.value() == 8
+            && result.is_ok() && stopped.is_ok() {
+            // Observe stop status, but do not qualify a frozen snapshot:
+            // the exact M5 halt predicate remains unverified. Never unwind
+            // the retained owner on a diagnostic error.
+            let frozen: Result = (|| {
+                let session = &mut *session;
+                for (index, role) in session.roles.iter().enumerate() {
+                    let (control, status) = role.provider.cpu_state()?;
+                    dev_info!(pdev.as_ref(),
+                        "M5_KSM stop hardware role={} control={:#x} status={:#x}\n",
+                        index, control, status);
+                    // Conservative status mask only. Native _isIdle tests
+                    // status&3; neither predicate establishes a debug halt.
+                    if control & 0x30 != 0 || status & 0x23 != 0x22 {
+                        return Err(EBUSY);
+                    }
+                }
+                Err(ENOTSUPP)
+            })();
+            if let Err(error) = frozen {
+                dev_err!(pdev.as_ref(),
+                    "M5_KSM admission snapshot rejected {:?}; quiescence unqualified, owners retained\n", error);
+            }
+        }
         Ok(Self { session: Some(session) })
     }
 }
