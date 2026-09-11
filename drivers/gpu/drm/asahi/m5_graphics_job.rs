@@ -46,6 +46,9 @@ pub(super) struct M5GraphicsJob {
     graph_alias: mmu::KernelMapping,
     graph: MappedObject,
     signals: MappedObject,
+    descriptor_template: KVec<u8>,
+    scene_template: KVec<u8>,
+    generation: u32,
 }
 
 impl M5GraphicsJob {
@@ -181,7 +184,15 @@ impl M5GraphicsJob {
             fragment[0x222d] = 0;
             Ok(())
         })?;
-        Ok(Self { program, aliases, graph_alias, graph, signals })
+        let mut descriptor_template = KVec::new();
+        let mut scene_template = KVec::new();
+        graph.with_bytes_mut(|out| {
+            descriptor_template.extend_from_slice(&out[..SCHEDULER], GFP_KERNEL)?;
+            scene_template.extend_from_slice(&out[SCENES + 0x80..SCENES + 0x100], GFP_KERNEL)?;
+            Ok(())
+        })?;
+        Ok(Self { program, aliases, graph_alias, graph, signals,
+            descriptor_template, scene_template, generation: 1 })
     }
 
     pub(super) fn parameter_descriptor(&self) -> Result<[u32; 4]> {
@@ -215,6 +226,41 @@ impl M5GraphicsJob {
         // GFX cleans this 0xc8-byte object after unlinking the finished pair.
         Ok([self.graph.read_u32(HIGH + SCHEDULER as u64 + 0xc)?,
             self.graph.read_u32(HIGH + SCHEDULER as u64 + 0x94)?])
+    }
+
+    /// Rebuild only retired command/scene records; preserve live PB/USC pools.
+    /// The parent additionally verifies the shared list, queues and event mask.
+    pub(super) fn prepare_next_frame(&mut self, generation: u32) -> Result {
+        if generation != self.generation + 1 || generation > 64
+            || self.scheduler_status()? != [2, 0] {
+            return Err(EBUSY);
+        }
+        let progress = self.progress()?;
+        if progress[0] != 2 || progress[1] != self.generation * 0x100
+            || progress[3] != self.generation * 0x100 { return Err(EBUSY); }
+        self.program.reset_completed_output()?;
+        let erased = self.program.result()?;
+        if erased.untouched != 65536 { return Err(EIO); }
+        self.graph.with_bytes_mut(|out| {
+            out[..SCHEDULER].copy_from_slice(&self.descriptor_template);
+            out[SCHEDULER..SCHEDULER + 0xc8].fill(0);
+            put64(out, SCHEDULER, SIGNALS_HIGH + SUBMITTED as u64);
+            put32(out, SCHEDULER + 0x10, 0x50);
+            out[SCENES + 0x80..SCENES + 0x100].copy_from_slice(&self.scene_template);
+            out[TIMESTAMPS..TIMESTAMPS + 16].fill(0);
+            let stamp = generation * 0x100;
+            put64(out, TA + 0x7a0, stamp as u64);
+            put64(out, TA + 0x7a8, generation as u64);
+            put32(out, TA + 0x8b6, stamp);
+            put64(out, TA + 0x8c6, (1u64 << 40) | generation as u64);
+            put32(out, FRAGMENT + 0x2150, stamp);
+            put64(out, FRAGMENT + 0x2160, (1u64 << 40) | generation as u64);
+            Ok(())
+        })?;
+        // Leave previous stamps intact: they must be superseded by firmware,
+        // never host-written to the expected new completion value.
+        self.generation = generation;
+        Ok(())
     }
 
     pub(super) fn result(&mut self) -> Result<crate::m5_graphics_bundle::TriangleResult> {

@@ -2,6 +2,7 @@
 """Run a retained mode-3..12 probe after boot-linux.py releases the M5 console."""
 from pathlib import Path
 import os
+import argparse
 import sys
 import time
 
@@ -9,9 +10,14 @@ root = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(root / "m1n1/proxyclient"))
 from m1n1.proxy import Serial
 
-mode = int(sys.argv[1]) if len(sys.argv) == 2 else 3
-if len(sys.argv) > 2 or mode not in range(3, 13):
-    raise ValueError("Expected mode 3 (queue), 4 (scheduler), 5 (context), 6 (compute), 7 (setup without kick), 8 (stop request), 9 (live status), 10 (firmware monitors), 11 (compute triangle) or 12 (TA/fragment triangle)")
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('mode', type=int, choices=range(3, 13), nargs='?', default=3)
+parser.add_argument('--frames', type=int, choices=range(1, 65), default=1,
+                    help='Require this many completed mode12 renders with output resets')
+args = parser.parse_args()
+mode = args.mode
+if args.frames != 1 and mode != 12:
+    parser.error('--frames requires mode12')
 trace_mask = int(os.environ.get('M5_FW_TRACE', '0'), 0)
 if trace_mask < 0 or trace_mask & ~0x203:
     raise ValueError('M5_FW_TRACE accepts only power, submission and recovery bits (0x203)')
@@ -22,7 +28,7 @@ command = (
     "if grep -q apple,j813 /proc/device-tree/compatible "
     "&& [ $(uname -r) = 7.1.6-aurora-j813-gpu-v9 ] "
     "&& [ ! -d /sys/module/asahi ]; then "
-    f"modprobe asahi m5_initdata_test={mode} m5_fw_trace={trace_mask}; echo M5_QUEUE_PROBE_RETURN=$?; "
+    f"modprobe asahi m5_initdata_test={mode} m5_fw_trace={trace_mask} m5_graphics_frames={args.frames}; echo M5_QUEUE_PROBE_RETURN=$?; "
     "dmesg | tail -180; "
     "else echo M5_QUEUE_PROBE_WRONG_TARGET_OR_ALREADY_LOADED; fi; "
     "echo M5_QUEUE_PROBE_DONE\n"
@@ -59,6 +65,12 @@ if 5 <= mode <= 11:
     required.append(b"M5_CONTEXT prepared id3 roots=")
 if mode in (6, 9, 10, 11):
     required.append(b"M5_COMPUTE verified 1024 exact outputs, inputs unchanged, queues retired;")
+if mode == 12 and args.frames > 1:
+    required.append(f'M5_GRAPHICS_FRAMES_VERIFIED count={args.frames}'.encode())
+    for frame in range(1, args.frames + 1):
+        required.append(f'; frame={frame}/{args.frames}'.encode())
+        if frame > 1:
+            required.append(f'M5_GRAPHICS reset completed output before frame={frame} untouched=65536'.encode())
 if mode == 11:
     required.append(b"pages=7 triangle=true 1024 untouched outputs, no kicks")
 if mode == 7:

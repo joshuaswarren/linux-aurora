@@ -79,7 +79,24 @@ impl M5FirmwareMemory {
         uat: Arc<mmu::Uat>,
         boot_timestamp: u64,
         probe_kind: u32,
-    ) -> Result<Self> {
+    ) -> Result<KBox<Self>> {
+        // Finish the base allocator before entering the descriptor builders:
+        // their register-program temporaries must not share its stack frame.
+        let mut memory = Self::allocate_with_uat(dev, uat, boot_timestamp, probe_kind)?;
+        if probe_kind == 12 {
+            memory.initialize_graphics(dev)?;
+        }
+        fence(Ordering::SeqCst);
+        Ok(memory)
+    }
+
+    #[inline(never)]
+    fn allocate_with_uat(
+        dev: &AsahiDevice,
+        uat: Arc<mmu::Uat>,
+        boot_timestamp: u64,
+        probe_kind: u32,
+    ) -> Result<KBox<Self>> {
         if !uat.is_t8142_geometry() {
             return Err(ENODEV);
         }
@@ -242,33 +259,38 @@ impl M5FirmwareMemory {
                 Ok(())
             })?;
         }
-        let graphics = if probe_kind == 12 {
-            let job = graphics_job::M5GraphicsJob::new(dev, &uat)?;
-            let queues = graphics_queues::M5GraphicsQueues::new(dev, &uat, &job)?;
-            let pb = job.parameter_descriptor()?;
-            pbdesc.with_bytes_mut(|out| {
-                let base = graphics_job::PB_HARDWARE_ID as usize * 16;
-                for (index, word) in pb.into_iter().enumerate() {
-                    out[base + index * 4..base + index * 4 + 4].copy_from_slice(&word.to_le_bytes());
-                }
-                Ok(())
-            })?;
-            let usc = job.uma_descriptor();
-            uma.with_bytes_mut(|out| {
-                let base = graphics_usc::HARDWARE_ID as usize * 32;
-                for (index, word) in usc.into_iter().enumerate() {
-                    out[base + index * 8..base + index * 8 + 8].copy_from_slice(&word.to_le_bytes());
-                }
-                Ok(())
-            })?;
-            Some((job, queues))
-        } else { None };
         fence(Ordering::SeqCst);
-        Ok(Self { primary_root, secondary_root, shared, private, region_a, region_c, fwctl, aon, qos,
-                  pbdesc, uma, completions, aliases, registers, queue_probe, program, graphics,
+        // Keep the retained graph off the kernel stack, including
+        // construction and error-return temporaries in the boot caller.
+        KBox::init(try_init!(Self { primary_root, secondary_root, shared, private, region_a, region_c, fwctl, aon, qos,
+                  pbdesc, uma, completions, aliases, registers, queue_probe, program, graphics: None,
                   report_counts: [[0; 2]; 2], trace_printed: [0; 2],
                   compute_kick_observed: false, compute_dispatch_returned: false,
-                  graphics_stamp_flags: 0, uat })
+                  graphics_stamp_flags: 0, uat }), GFP_KERNEL)
+    }
+
+    #[inline(never)]
+    fn initialize_graphics(&mut self, dev: &AsahiDevice) -> Result {
+        let job = graphics_job::M5GraphicsJob::new(dev, &self.uat)?;
+        let queues = graphics_queues::M5GraphicsQueues::new(dev, &self.uat, &job)?;
+        let pb = job.parameter_descriptor()?;
+        self.pbdesc.with_bytes_mut(|out| {
+            let base = graphics_job::PB_HARDWARE_ID as usize * 16;
+            for (index, word) in pb.into_iter().enumerate() {
+                out[base + index * 4..base + index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+            }
+            Ok(())
+        })?;
+        let usc = job.uma_descriptor();
+        self.uma.with_bytes_mut(|out| {
+            let base = graphics_usc::HARDWARE_ID as usize * 32;
+            for (index, word) in usc.into_iter().enumerate() {
+                out[base + index * 8..base + index * 8 + 8].copy_from_slice(&word.to_le_bytes());
+            }
+            Ok(())
+        })?;
+        self.graphics = Some((job, queues));
+        Ok(())
     }
 
     /// Drain M5 report channels using the native producer contracts.
@@ -385,8 +407,10 @@ impl M5FirmwareMemory {
 
     pub(crate) fn graphics_pair_complete(
         completion: crate::m5_completion::M5GraphicsCompletion,
+        generation: u32,
     ) -> bool {
-        completion.pair_complete(graphics_queues::JOB_LIST)
+        (1..=64).contains(&generation)
+            && completion.pair_complete_at(graphics_queues::JOB_LIST, generation * 0x100)
     }
 
     pub(crate) fn graphics_installation_status(&mut self) -> Result<([[u64; 5]; 2], [u64; 2], [u64; 2])> {
@@ -417,6 +441,21 @@ impl M5FirmwareMemory {
         job.publish_context()?;
         queues.publish_draw()?;
         self.publish_graphics_records(2, 4)
+    }
+
+    pub(crate) fn publish_next_graphics_frame(&mut self, generation: u32) -> Result {
+        if !(2..=64).contains(&generation) { return Err(EINVAL); }
+        let previous = generation - 1;
+        let (outer, inner, _) = self.graphics_status()?;
+        if outer != [2 + previous * 2; 3] || inner != [[1 + previous * 3; 3]; 2]
+            || !Self::graphics_pair_complete(self.graphics_completion()?, previous) {
+            return Err(EBUSY);
+        }
+        let (job, queues) = self.graphics.as_mut().ok_or(EINVAL)?;
+        job.prepare_next_frame(generation)?;
+        queues.publish_next_draw(job, generation)?;
+        self.graphics_stamp_flags = 0;
+        self.publish_graphics_records(generation as usize * 2, (1 + generation * 3) as u16)
     }
 
     fn publish_graphics_records(&mut self, outer_index: usize, inner_head: u16) -> Result {

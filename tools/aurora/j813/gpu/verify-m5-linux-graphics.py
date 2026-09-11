@@ -62,7 +62,9 @@ def read_capture(directory):
     return rgba, objects
 
 
-def verify_completion(objects):
+def verify_completion(objects, frame=1):
+    if not 1 <= frame <= 64:
+        raise ValueError('Expected a graphics frame in 1..64')
     expected = {
         'graphics-queues': (0xfffffc20c0000000, 0x1c000),
         'graphics-completion-list': (0xfffffc20c0020000, 0x4000),
@@ -89,7 +91,7 @@ def verify_completion(objects):
     for qid, pointers in ((10, 0x4000), (11, 0xc000)):
         if u64(queues, qid * 0xc0 + 0x10) != root:
             raise ValueError('Graphics stages do not share the completion list')
-        if [u32(queues, pointers + off) for off in (0, 0x30, 0x40)] != [4, 4, 4]:
+        if [u32(queues, pointers + off) for off in (0, 0x30, 0x40)] != [1 + frame * 3] * 3:
             raise ValueError('Graphics command queue has not retired')
     scheduler = data['graphics-scheduler']
     if (u64(scheduler, 0) != expected['graphics-submitted-total'][0]
@@ -97,7 +99,7 @@ def verify_completion(objects):
             or u32(scheduler, 0xc) != 2
             or any(u32(scheduler, off) for off in (0x14, 0x18, 0x1c, 0x28, 0x4c, 0x70, 0x94))):
         raise ValueError('Graphics scheduler is still pending or linked')
-    if [u32(data['graphics-stamps-a'], qid * 4) for qid in (10, 11)] != [0x100, 0x100]:
+    if [u32(data['graphics-stamps-a'], qid * 4) for qid in (10, 11)] != [frame * 0x100] * 2:
         raise ValueError('Both current software stamps are required')
     mask = 0
     events = data['gfx-event-records']
@@ -138,13 +140,17 @@ def main():
     parser.add_argument('--scale', type=int, choices=(1, 2), default=2)
     parser.add_argument('--require-completion', action='store_true',
                         help='Reject captures without complete paired-render ownership evidence')
+    parser.add_argument('--frame', type=int, choices=range(1, 65), default=1,
+                        help='Expected final frame generation; earlier frames require separate log evidence')
     args = parser.parse_args()
+    if args.frame != 1 and not args.require_completion:
+        parser.error('--frame requires --require-completion')
     rgba, objects = read_capture(args.capture)
     foreground = verify_pixels(rgba)
     digest = hashlib.sha256(rgba).hexdigest()
     if digest != NATIVE_REFERENCE_SHA256:
         raise ValueError('Linux pixels differ from the qualified native macOS reference')
-    completion = verify_completion(objects) if args.require_completion else False
+    completion = verify_completion(objects, args.frame) if args.require_completion else False
     args.output.write_bytes(png(rgba, args.scale))
     report = dict(graphics_pixels_verified=True, pixels=WIDTH * HEIGHT,
                   foreground=foreground, background=WIDTH * HEIGHT - foreground,
@@ -152,6 +158,7 @@ def main():
                   captured_objects=len(objects), source_size=[WIDTH, HEIGHT],
                   image_size=[WIDTH * args.scale, HEIGHT * args.scale],
                   completion_bookkeeping_qualified=completion,
+                  completion_frame=args.frame if completion else None,
                   mesa_glxgears_verified=False, dcp_verified=False)
     args.output.with_suffix('.json').write_text(json.dumps(report, indent=2) + '\n')
     print(json.dumps(report))

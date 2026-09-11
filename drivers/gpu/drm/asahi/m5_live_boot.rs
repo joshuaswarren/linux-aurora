@@ -68,7 +68,7 @@ struct M5Role {
 
 struct M5Session {
     roles: [M5Role; 2],
-    memory: Option<M5FirmwareMemory>,
+    memory: Option<KBox<M5FirmwareMemory>>,
     uat: Arc<mmu::Uat>,
     registers: regs::Resources,
     dev: ARef<AsahiDevice>,
@@ -197,44 +197,58 @@ impl M5Session {
     }
 
     fn submit_graphics(&mut self) -> Result {
+        let frames = *crate::module_parameters::m5_graphics_frames.value();
+        if !(1..=64).contains(&frames) { return Err(EINVAL); }
         let memory = self.memory.as_mut().ok_or(EIO)?;
         dev_info!(self.dev.as_ref(), "M5_GRAPHICS prepared outer/inner/completion={:x?}\n",
             memory.graphics_status()?);
-        memory.publish_graphics_job()?;
-        // The outer CL_2 channel delivers both stage-tagged SKSM command lists.
-        // Both complete entries and roots precede the notification.
-        Pin::new(&mut self.roles[0].rtkit).send_message(0x21, 0x0083_0000_0000_000a)?;
-        for poll in 0..10000 {
-            if memory.drain_reports(&self.dev)? {
-                dev_err!(self.dev.as_ref(), "M5_GRAPHICS firmware requested GPU restart\n");
-                break;
+        for frame in 1..=frames {
+            if frame == 1 {
+                memory.publish_graphics_job()?;
+            } else {
+                memory.publish_next_graphics_frame(frame)?;
+                dev_info!(self.dev.as_ref(), "M5_GRAPHICS reset completed output before frame={} untouched=65536\n", frame);
             }
-            if self.roles.iter().any(|role| role.state.crashed.load(Ordering::Acquire)) { break; }
-            let status = memory.graphics_status()?;
-            let completion = memory.graphics_completion()?;
-            if [0, 100, 1000, 5000].contains(&poll) {
-                dev_info!(self.dev.as_ref(), "M5_GRAPHICS poll={} outer/inner/completion={:x?}\n", poll, status);
-                dev_info!(self.dev.as_ref(), "M5_GRAPHICS completion-owner={:x?}\n", completion);
-            }
-            if status.0 == [4; 3] && status.1 == [[4; 3]; 2]
-                && M5FirmwareMemory::graphics_pair_complete(completion) {
-                let result = memory.graphics_result()?;
-                if result.verified() {
-                    dev_info!(self.dev.as_ref(), "M5_GRAPHICS verified native-program TA/fragment pixels={:?}; both queues retired; completion={:x?}\n",
-                        result, completion);
-                    return Ok(());
+            // The shared outer transport follows complete descriptors/entries.
+            Pin::new(&mut self.roles[0].rtkit).send_message(0x21, 0x0083_0000_0000_000a)?;
+            let mut verified = false;
+            for poll in 0..10000 {
+                if memory.drain_reports(&self.dev)? {
+                    dev_err!(self.dev.as_ref(), "M5_GRAPHICS firmware requested GPU restart\n");
+                    break;
                 }
-                dev_err!(self.dev.as_ref(), "M5_GRAPHICS retired with incorrect pixels={:?}\n", result);
-                break;
+                if self.roles.iter().any(|role| role.state.crashed.load(Ordering::Acquire)) { break; }
+                let status = memory.graphics_status()?;
+                let completion = memory.graphics_completion()?;
+                if [0, 100, 1000, 5000].contains(&poll) {
+                    dev_info!(self.dev.as_ref(), "M5_GRAPHICS frame={} poll={} outer/inner/completion={:x?}\n", frame, poll, status);
+                    dev_info!(self.dev.as_ref(), "M5_GRAPHICS completion-owner={:x?}\n", completion);
+                }
+                if status.0 == [2 + frame * 2; 3] && status.1 == [[1 + frame * 3; 3]; 2]
+                    && M5FirmwareMemory::graphics_pair_complete(completion, frame) {
+                    let result = memory.graphics_result()?;
+                    if result.verified() {
+                        dev_info!(self.dev.as_ref(), "M5_GRAPHICS verified native-program TA/fragment pixels={:?}; both queues retired; completion={:x?}; frame={}/{}\n",
+                            result, completion, frame, frames);
+                        verified = true;
+                        break;
+                    }
+                    dev_err!(self.dev.as_ref(), "M5_GRAPHICS retired with incorrect pixels={:?}\n", result);
+                    break;
+                }
+                fsleep(Delta::from_millis(1));
             }
-            fsleep(Delta::from_millis(1));
+            if !verified {
+                for _ in 0..4 { memory.drain_reports(&self.dev)?; }
+                dev_err!(self.dev.as_ref(), "M5_GRAPHICS final outer/inner/completion={:x?} pixels={:?}\n",
+                    memory.graphics_status()?, memory.graphics_result()?);
+                dev_err!(self.dev.as_ref(), "M5_GRAPHICS final completion-owner={:x?}; frame={}/{}\n",
+                    memory.graphics_completion()?, frame, frames);
+                return Err(EIO);
+            }
         }
-        for _ in 0..4 { memory.drain_reports(&self.dev)?; }
-        dev_err!(self.dev.as_ref(), "M5_GRAPHICS final outer/inner/completion={:x?} pixels={:?}\n",
-            memory.graphics_status()?, memory.graphics_result()?);
-        dev_err!(self.dev.as_ref(), "M5_GRAPHICS final completion-owner={:x?}\n",
-            memory.graphics_completion()?);
-        Err(EIO)
+        dev_info!(self.dev.as_ref(), "M5_GRAPHICS_FRAMES_VERIFIED count={}\n", frames);
+        Ok(())
     }
 
     fn retire_idle_policy(&mut self) -> Result {

@@ -48,30 +48,10 @@ impl M5GraphicsQueues {
                     return Err(EFAULT);
                 }
             }
-            let [descriptor, descriptor_low] = job.descriptor_addresses(stage)?;
+            let [descriptor, _] = job.descriptor_addresses(stage)?;
             let dm = if stage == 0 { m5_sksm::M5DataMaster::Tiling }
                      else { m5_sksm::M5DataMaster::Fragment };
-            let barrier = [m5_sksm::M5SksmDependency { queue_id: QUEUE_IDS[0], stamp: 1, kind: 1 }];
-            let mut rce = [m5_sksm::M5SksmRce { address: 0, tag: 0 }; 4];
-            if stage == 0 {
-                rce[0] = m5_sksm::M5SksmRce { address: descriptor_low + 0x60, tag: 79 };
-            } else {
-                for (index, (offset, count)) in [(0xa0, 87), (0x7c0, 18),
-                    (0xee0, 25), (0x1600, 12)].into_iter().enumerate() {
-                    rce[index] = m5_sksm::M5SksmRce { address: descriptor_low + offset, tag: count };
-                }
-            }
-            let prepared = m5_sksm::prepare_m5_sksm_entry(m5_sksm::M5SksmQueue {
-                id, priority: 2, current_stamp: 1, submitted: 0, previous_stamp: None,
-            }, m5_sksm::M5SksmOperands {
-                barriers: if stage == 0 { &[] } else { &barrier }, first_predecessor: 0,
-                implicit_dependency_type: 1, mcache: None, flag_bit1: false,
-                flag_bit61: false, flag_bit63: false,
-                payload: [descriptor, Self::queue_address(stage)?],
-                qos_byte_32: 3, qos_class_40: if stage == 0 { 12 } else { 24 },
-                qos_word_48: 0xffff, event_mask: [0; 4], rce_kind: 0, rce,
-                auxiliary: 0x3f_ffff_ffff_ffff,
-            }).map_err(|_| EINVAL)?;
+            let prepared = Self::prepare_entry(job, stage, 1)?;
             entry.with_bytes_mut(|out| {
                 out[prepared.offset as usize..prepared.offset as usize + prepared.bytes.len()]
                     .copy_from_slice(&prepared.bytes);
@@ -141,6 +121,74 @@ impl M5GraphicsQueues {
 
     pub(super) fn queue_address(stage: usize) -> Result<u64> {
         Ok(HIGH + *QUEUE_IDS.get(stage).ok_or(EINVAL)? as u64 * 0xc0)
+    }
+
+    fn prepare_entry(job: &M5GraphicsJob, stage: usize, generation: u32)
+        -> Result<m5_sksm::PreparedM5SksmEntry> {
+        if !(1..=64).contains(&generation) { return Err(EINVAL); }
+        let id = *QUEUE_IDS.get(stage).ok_or(EINVAL)?;
+        let [descriptor, descriptor_low] = job.descriptor_addresses(stage)?;
+        let stamp = generation as u64;
+        let barrier = [m5_sksm::M5SksmDependency { queue_id: QUEUE_IDS[0], stamp, kind: 1 }];
+        let mut rce = [m5_sksm::M5SksmRce { address: 0, tag: 0 }; 4];
+        if stage == 0 {
+            rce[0] = m5_sksm::M5SksmRce { address: descriptor_low + 0x60, tag: 79 };
+        } else {
+            for (index, (offset, count)) in [(0xa0, 87), (0x7c0, 18),
+                (0xee0, 25), (0x1600, 12)].into_iter().enumerate() {
+                rce[index] = m5_sksm::M5SksmRce { address: descriptor_low + offset, tag: count };
+            }
+        }
+        m5_sksm::prepare_m5_sksm_entry(m5_sksm::M5SksmQueue {
+            id, priority: 2, current_stamp: stamp, submitted: 0,
+            previous_stamp: if generation == 1 { None } else { Some(stamp - 1) },
+        }, m5_sksm::M5SksmOperands {
+            barriers: if stage == 0 { &[] } else { &barrier }, first_predecessor: 0,
+            implicit_dependency_type: 1, mcache: None, flag_bit1: false,
+            flag_bit61: false, flag_bit63: false,
+            payload: [descriptor, Self::queue_address(stage)?],
+            qos_byte_32: 3, qos_class_40: if stage == 0 { 12 } else { 24 },
+            qos_word_48: 0xffff, event_mask: [0; 4], rce_kind: 0, rce,
+            auxiliary: 0x3f_ffff_ffff_ffff,
+        }).map_err(|_| EINVAL)
+    }
+
+    pub(super) fn publish_next_draw(&mut self, job: &M5GraphicsJob, generation: u32) -> Result {
+        if !(2..=64).contains(&generation) { return Err(EINVAL); }
+        let previous_head = 1 + (generation - 1) * 3;
+        if self.counters()? != [[previous_head; 3]; 2] || !self.installed()?
+            || self.completion_list()? != [0, JOB_LIST] { return Err(EBUSY); }
+        for stage in 0..2 {
+            let prepared = Self::prepare_entry(job, stage, generation)?;
+            self.entries[stage].with_bytes_mut(|out| {
+                let offset = prepared.offset as usize;
+                let slot = &mut out[offset..offset + prepared.bytes.len()];
+                if slot.iter().any(|byte| *byte != 0) { return Err(EBUSY); }
+                slot.copy_from_slice(&prepared.bytes);
+                Ok(())
+            })?;
+            let dm = if stage == 0 { m5_sksm::M5DataMaster::Tiling }
+                     else { m5_sksm::M5DataMaster::Fragment };
+            let kick = m5_sksm::encode_m5_sksm_add_kicks_for(dm, QUEUE_IDS[stage],
+                2, generation as u64, 1).map_err(|_| EINVAL)?;
+            self.graph.with_bytes_mut(|out| {
+                out[CONFIG[stage] + 0x200..CONFIG[stage] + 0x200 + kick.len()]
+                    .copy_from_slice(&kick);
+                let addresses = [job.descriptor_addresses(stage)?[0],
+                    HIGH + CONFIG[stage] as u64 + 0x100,
+                    HIGH + CONFIG[stage] as u64 + 0x200];
+                for (index, address) in addresses.into_iter().enumerate() {
+                    let offset = ITEMS[stage] + (previous_head as usize + index) * 8;
+                    if out[offset..offset + 8].iter().any(|byte| *byte != 0) { return Err(EBUSY); }
+                    put64(out, offset, address);
+                }
+                Ok(())
+            })?;
+        }
+        for pointers in POINTERS {
+            self.graph.write_u32(HIGH + pointers as u64 + 0x40, previous_head + 3)?;
+        }
+        Ok(())
     }
 
     pub(super) fn counters(&mut self) -> Result<[[u32; 3]; 2]> {
