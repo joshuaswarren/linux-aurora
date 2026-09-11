@@ -83,7 +83,7 @@ def _m5_graphics_submit(ctx):
 
     def save(label, address, size, space='GPU', context=None):
         global _m5_graphics_bytes
-        if not 0 < size <= 0x80000 or _m5_graphics_bytes + 2*size > 8*1024*1024:
+        if not 0 < size <= 0x80000 or _m5_graphics_bytes + 2*size > 16*1024*1024:
             raise ValueError('Graphics capture exceeds its bounded DRAM budget')
         _m5_graphics_bytes += size*2
         region = int(hv.u.adt['/arm-io/sgx'].gpu_region_base)
@@ -131,7 +131,9 @@ def _m5_graphics_submit(ctx):
         manifest.update(entry_count=entries,entry_stride=stride,
             firmware_ring=hex(firmware_ring),gpu_ring=hex(gpu_ring),cpu_ring=hex(cpu_ring))
         entry = save('kick-entry',firmware_ring+(stamp&255)*stride,stride)
-        attempt('host-command-descriptor',int(ctx.regs[20]),0x1100 if dm==0 else 0x800,'CPU')
+        # Native generators read through TA+0x1438 and fragment+0xb60.
+        # These bounded views include those inputs, not a sizeof claim.
+        attempt('host-command-descriptor',int(ctx.regs[20]),0x1800 if dm==0 else 0x1000,'CPU')
         descriptor,channel = struct.unpack_from('<QQ',entry,0x10)
         raw = save('work-descriptor',descriptor,0x3000)
         selector, = struct.unpack_from('<I',raw,0)
@@ -153,6 +155,55 @@ def _m5_graphics_submit(ctx):
         # in our controlled reference process. Missing pages remain explicit.
         for address in [0x10000000000,0x1000001c000,0x10000090000]:
             attempt('program-page-%x'%address,address,0x4000,context=context)
+        context_mode=os.environ.get('M5_GRAPHICS_CAPTURE_CONTEXT')
+        if dm==1 and context_mode in ('1','map'):
+            from m5_context_capture import survey_context
+            if context!=int(os.environ.get('M5_GRAPHICS_CONTEXT_ID','3')):
+                raise ValueError('Full context capture requires the selected reference context')
+            # The controlled workload's program/data window and corresponding
+            # GART aliases. No kernel/firmware root or general process scan.
+            windows=[(0x1000000000,0x1000000),(0x10000000000,0x1000000)]
+            region=int(hv.u.adt['/arm-io/sgx'].gpu_region_base)
+            if context_mode=='map':
+                parts=[]
+                for base,size in windows:
+                    for offset in range(0,size,0x400000):
+                        part,_tables=survey_context(_m5_graphics_gpu._read_dram,
+                            region,context,[(base+offset,0x400000)])
+                        parts.append(part)
+                if len({part['root_entry'] for part in parts})!=1:
+                    raise ValueError('Context root changed between map windows')
+                manifest['context_map']=dict(parts=parts,
+                    mapped_resource_reads=False,
+                    unique_resource_pages=len({m['physical'] for part in parts
+                        for m in part['mappings']}))
+                return True
+            # The table-only survey of the controlled 256x256 triangle found
+            # 334 distinct pages, all within the first 4 MiB of these windows.
+            # Bound resource capture to 384 pages (12 MiB for two data reads),
+            # with the existing 16 MiB aggregate data-view budget still active.
+            windows=[(0x1000000000,0x400000),(0x10000000000,0x400000)]
+            survey,tables=survey_context(_m5_graphics_gpu._read_dram,region,context,
+                windows,max_pages=384)
+            manifest['context_image']=survey
+            seen={}
+            for mapping in survey['mappings']:
+                pa=mapping['physical']
+                if pa not in seen:
+                    label='context-page-%03d'%len(seen)
+                    save(label,mapping['address'],0x4000,context=context)
+                    seen[pa]=label+'.bin'
+                mapping['file']=seen[pa]
+            for index,(pa,data) in enumerate(tables.items()):
+                filename='context-table-%02d.bin'%index
+                (directory/filename).write_bytes(data)
+                survey['tables'][index]['file']=filename
+                if _m5_graphics_gpu._read_dram(pa,0x4000)!=data:
+                    raise ValueError('Context table changed during resource capture')
+            root_now=_m5_graphics_gpu._read_dram(survey['root_slot'],8)
+            if struct.unpack('<Q',root_now)[0]!=survey['root_entry']:
+                raise ValueError('Context root changed during resource capture')
+            survey['stable_after_resource_reads']=True
     except (ValueError,RuntimeError) as error:
         manifest['error'] = str(error)
     finally:
