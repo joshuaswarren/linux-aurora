@@ -81,7 +81,7 @@ impl M5GraphicsMemory {
             }
             pages.push(page, GFP_KERNEL)?;
         }
-        let usc = M5GraphicsUsc::new(dev, context.vm())?;
+        let usc = M5GraphicsUsc::new_application(dev, context.vm())?;
         dev_info!(dev.as_ref(), "M5_GRAPHICS_CONTEXT id={} roots={:x?}; mappings owned\n",
             context.context_id(), context.roots());
         Ok(Self {

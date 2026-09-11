@@ -26,6 +26,8 @@ use program_memory::M5ProgramMemory;
 mod graphics_memory;
 #[path = "m5_graphics_usc.rs"]
 mod graphics_usc;
+#[path = "m5_parameter_buffer.rs"]
+mod parameter_buffer;
 #[path = "m5_graphics_job.rs"]
 mod graphics_job;
 #[path = "m5_graphics_queues.rs"]

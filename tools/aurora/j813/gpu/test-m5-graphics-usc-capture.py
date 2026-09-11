@@ -63,6 +63,23 @@ class UscCaptureTests(unittest.TestCase):
         self.assertEqual(result['unmapped_guard_pages'], 41)
         self.assertEqual(result['capacity_bytes'], 39845888)
 
+    def test_application_arena_accepts_auxiliary_storage(self):
+        objects, manifest = fixture(0x1100000000)
+        result = verify.verify_usc_pool(objects, manifest, 4, 'application')
+        self.assertEqual(result['reserved_start'], '0x1100000000')
+
+    def test_application_arena_rejects_compact_storage(self):
+        objects, manifest = fixture(0x1000000000)
+        with self.assertRaisesRegex(ValueError, 'reserved'):
+            verify.verify_usc_pool(objects, manifest, 4, 'application')
+
+    def test_reservation_profiles_do_not_silently_accept_each_other(self):
+        with self.assertRaisesRegex(ValueError, 'reserved'):
+            verify.verify_usc_pool(self.objects, self.manifest, 4, 'application')
+        objects, manifest = fixture(0x1100000000)
+        with self.assertRaisesRegex(ValueError, 'reserved'):
+            verify.verify_usc_pool(objects, manifest, 4)
+
     def test_stale_uma_pointer(self):
         item, data = self.objects['graphics-uma-slot']
         data = bytearray(data)

@@ -4,6 +4,7 @@
 //! retain this owner through completion, faults and firmware shutdown.
 
 use super::{graphics_memory::M5GraphicsMemory, graphics_usc, MappedObject};
+use super::parameter_buffer::{M5ParameterBuffer, BLOCK_BYTES, PAGE_LIST_BYTES, PAGE_COUNT};
 use crate::{driver::AsahiDevice, g17_render, m5_render, mmu};
 use kernel::prelude::*;
 
@@ -29,19 +30,14 @@ const STAMPS_A: usize = 0x4000;
 const STAMPS_B: usize = 0x8000;
 const PAGE_LIST_HIGH: u64 = HIGH + 0x40000;
 const METRICS_HIGH: u64 = HIGH + 0x60000;
-const PAGE_LIST: u64 = 0x10_0023_8000;
-const METRICS: u64 = 0x10_0008_0000;
 const USER_BASE: u64 = 0x10_0000_0000;
-const BLOCKS: [u64; 3] = [0x10_0008_8000, 0x10_0011_0000, 0x10_0019_8000];
-const BLOCK_BYTES: usize = 0x80000;
-const PAGE_LIST_BYTES: usize = 0x1c000;
-const PAGE_COUNT: u32 = 48;
 pub(super) const PB_HARDWARE_ID: u32 = 0;
 pub(super) const QUEUE_IDS: [u8; 2] = [10, 11];
 
 pub(super) struct M5GraphicsJob {
     // The first owner's context retracts its roots before page release.
     program: M5GraphicsMemory,
+    parameter_buffer: M5ParameterBuffer,
     aliases: KVec<mmu::KernelMapping>,
     graph_alias: mmu::KernelMapping,
     graph: MappedObject,
@@ -53,7 +49,8 @@ pub(super) struct M5GraphicsJob {
 
 impl M5GraphicsJob {
     pub(super) fn new(dev: &AsahiDevice, uat: &mmu::Uat) -> Result<Self> {
-        let mut program = M5GraphicsMemory::load(dev, uat)?;
+        let program = M5GraphicsMemory::load(dev, uat)?;
+        let mut parameter_buffer = M5ParameterBuffer::new_reference(dev, &program)?;
         let mut graph = MappedObject::new_wc_at(dev, uat.kernel_vm(), HIGH,
             BYTES, mmu::PROT_FW_PRIV_RW)?;
         // Native submitted totals and host-visible stamps are uncached in
@@ -69,34 +66,17 @@ impl M5GraphicsJob {
                 return Err(EFAULT);
             }
         }
-        // Discard captured allocator/output contents. The shader, pipeline
-        // and input data remain in separately owned program pages.
-        for address in BLOCKS {
-            program.clear_pages(address, BLOCK_BYTES)?;
-        }
-        for (address, bytes) in [(METRICS, 0x4000), (PAGE_LIST, PAGE_LIST_BYTES),
-            (USER_BASE + 0x220000, 0x4000), (USER_BASE + 0x228000, 0x8000)] {
-            program.clear_pages(address, bytes)?;
-        }
-        for (block, base) in BLOCKS.into_iter().enumerate() {
-            let first = ((base - USER_BASE) >> 15) as u32;
-            for page in 0..16 {
-                program.write_word(PAGE_LIST + ((block * 16 + page) * 4) as u64,
-                    first + page as u32)?;
-            }
-        }
-        let mut aliases = program.alias_kernel_pages(uat, PAGE_LIST,
-            PAGE_LIST_HIGH, PAGE_LIST_BYTES)?;
-        for alias in program.alias_kernel_pages(uat, METRICS, METRICS_HIGH, 0x4000)? {
-            aliases.push(alias, GFP_KERNEL)?;
-        }
+        let aliases = parameter_buffer.firmware_aliases(
+            uat, program.vm(), PAGE_LIST_HIGH, METRICS_HIGH,
+        )?;
+        let block_page_bases = parameter_buffer.block_page_bases()?;
         graph.with_bytes_mut(|out| {
             put64(out, SCHEDULER, SIGNALS_HIGH + SUBMITTED as u64);
             put32(out, SCHEDULER + 0x10, 0x50);
             // Two submitted stage records; firmware compares its completed
             // count with this total, then unlinks the scheduler.
-            for (block, base) in BLOCKS.into_iter().enumerate() {
-                put32(out, PM_BLOCKS + block * 8, ((base - USER_BASE) >> 15) as u32);
+            for (block, base) in block_page_bases.into_iter().enumerate() {
+                put32(out, PM_BLOCKS + block * 8, base);
             }
             put32(out, PM_SHARED, 3);
             put32(out, PM_SHARED + 4, 3);
@@ -107,25 +87,26 @@ impl M5GraphicsJob {
                 (0x58, BLOCK_BYTES as u32), (0x7c, 1650 * 16), (0x80, 550 * 16)] {
                 put32(out, PM + offset, value);
             }
-            for (offset, address) in [(0x20, PAGE_LIST_HIGH), (0x28, PAGE_LIST),
+            for (offset, address) in [(0x20, PAGE_LIST_HIGH), (0x28, parameter_buffer.page_list()),
                 (0x44, HIGH + PM_BLOCKS as u64), (0x4c, HIGH + PM_SHARED as u64),
-                (0x64, HIGH + PM_COUNTER as u64), (0x84, 0x228000)] {
+                (0x64, HIGH + PM_COUNTER as u64), (0x84, parameter_buffer.discard_offset())] {
                 put64(out, PM + offset, address);
             }
             // This sole job owns scene 1. M5 metrics use 64-byte spacing,
             // unlike Neo dwords. Other reserved scenes remain unassigned;
             // do not guess a scratch-ring wrap rule from a single draw.
             let selected_scene = SCENES + 0x80;
-            put64(out, selected_scene, METRICS + 0x40);
+            put64(out, selected_scene, parameter_buffer.metrics() + 0x40);
             put64(out, selected_scene + 8, METRICS_HIGH + 0x40);
-            put64(out, selected_scene + 0x28, 0x220040);
+            put64(out, selected_scene + 0x28, parameter_buffer.scene_cycle());
             put64(out, selected_scene + 0x40, HIGH + PM_SHARED as u64 + 0x40);
             put64(out, SCENES + 0x80 + 0x4c, 1);
             put32(out, USC_INNER, 1);
             program.usc().encode_initial_owner(HIGH + USC_INNER as u64,
                 &mut out[USC..USC + 0x70])?;
 
-            let (p, controls) = triangle_parameters();
+            let (mut p, controls) = triangle_parameters();
+            p.cycle = parameter_buffer.scene_cycle();
             let objects = g17_render::RenderDescriptorObjects {
                 record_a: HIGH + SCHEDULER as u64,
                 shared: HIGH + PM as u64,
@@ -191,12 +172,13 @@ impl M5GraphicsJob {
             scene_template.extend_from_slice(&out[SCENES + 0x80..SCENES + 0x100], GFP_KERNEL)?;
             Ok(())
         })?;
-        Ok(Self { program, aliases, graph_alias, graph, signals,
+        Ok(Self { program, parameter_buffer, aliases, graph_alias, graph, signals,
             descriptor_template, scene_template, generation: 1 })
     }
 
     pub(super) fn parameter_descriptor(&self) -> Result<[u32; 4]> {
-        m5_render::initial_parameter_buffer_descriptor(PAGE_LIST, PAGE_COUNT).map_err(|_| EINVAL)
+        m5_render::initial_parameter_buffer_descriptor(self.parameter_buffer.page_list(), PAGE_COUNT)
+            .map_err(|_| EINVAL)
     }
 
     pub(super) fn uma_descriptor(&self) -> [u64; 4] { self.program.usc().descriptor() }
