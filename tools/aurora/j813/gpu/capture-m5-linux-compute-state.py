@@ -6,6 +6,7 @@ Never reads MMIO. Physical pages must belong to Linux System RAM or one of
 this boot's measured GPU reserved-RAM ranges. Results are physical-memory
 observations, not claims about contents held in firmware-private caches.
 """
+import argparse
 import base64
 import hashlib
 import json
@@ -20,7 +21,13 @@ sys.path.insert(0, str(Path(os.environ.get('M1N1_DIR', root / 'hv/m1n1')) / 'pro
 from m1n1.proxy import Serial
 from m1n1.agx.g17p_trace import G17PUATReader
 
-inventory_path, output_path = map(Path, sys.argv[1:])
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('inventory', type=Path)
+parser.add_argument('output', type=Path)
+parser.add_argument('--before-compute', action='store_true',
+                    help='Require successful mode7 setup with its SKSM kick unpublished')
+args = parser.parse_args()
+inventory_path, output_path = args.inventory, args.output
 inventory = json.loads(inventory_path.read_text())
 if inventory['model'] != 'Mac17,3':
     raise ValueError('Expected this boot M5 inventory')
@@ -29,7 +36,8 @@ reserved = [(props[name + '-base'], props[name + '-base'] + props[name + '-size'
             for name in ('gpu-region', 'gfx-shared-region', 'gfx-shared-l2-region',
                          'gfx-data', 'gfx1-data')]
 output_path.mkdir(mode=0o700, exist_ok=False)
-manifest = dict(phase='Linux mode6 after both firmware CPU stop requests',
+manifest = dict(phase=('Linux mode7 setup before compute' if args.before_compute
+                      else 'Linux mode6 after compute') + ' after both firmware CPU stop requests',
                 device_memory_read=False, objects=[])
 cache = {}
 sequence = 0
@@ -50,10 +58,17 @@ with Serial('/dev/cu.kis-01100000-ch-0', 115200, timeout=0.2) as port:
                 return clean.split(('\n' + token + '_BEGIN\n').encode(), 1)[1].split(end, 1)[0]
         raise RuntimeError('Stopped M5 RAM read timed out; leave target unchanged')
 
+    probe_gate = (
+        "dmesg | grep -q 'requested probe mode=7' "
+        "&& dmesg | grep -q 'M5_INIT transaction result=Ok(())' "
+        "&& dmesg | grep -q '1024 untouched outputs, SKSM kick unpublished' "
+        "&& ! dmesg | grep -q 'M5_COMPUTE first SKSM kick submitted' "
+        "&& ! dmesg | grep -q 'requested probe mode=6'"
+        if args.before_compute else "dmesg | grep -q 'requested probe mode=6'")
     identity = command("grep -q apple,j813 /proc/device-tree/compatible "
         "&& [ $(uname -r) = 7.1.6-aurora-j813-gpu-v9 ] "
         "&& [ -d /sys/module/asahi ] "
-        "&& dmesg | grep -q 'requested probe mode=6' "
+        "&& " + probe_gate + " "
         "&& dmesg | grep -q 'M5_INIT stop requests=Ok(())' "
         "&& cat /proc/iomem")
     ram = []

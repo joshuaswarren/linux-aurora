@@ -16,6 +16,14 @@ is evidence of GPU rendering.
 
 ## Hardware evidence, 2026-09-10
 
+- A fresh RAM boot with `m5_initdata_test=7` retired compute descriptor
+  tag 3 and channel configuration tag 15, leaving tag 14 unpublished.
+  Outer counters reached `[2, 2, 2]`, inner counters `[3, 3, 3]`; inputs
+  were unchanged and all 1,024 outputs retained their sentinels. Both
+  firmware CPUs stopped successfully. A 21-object, 85-page RAM capture
+  matched the post-recovery descriptor, event state, scheduler and program
+  buffers. GFX remained powered down, so the guarded helper refused queue
+  MMIO. This verifies setup before SKSM execution, not a completed job.
 - Follow-up tests on September 11 confirmed a primary type-4 GPU restart
   report after the compute kick, first in retained RAM and then in a live
   report-ring drain. The report names affected stamp index 11; status B

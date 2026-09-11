@@ -154,5 +154,39 @@ an initial dependency error. A native first-kick capture independently
 uses stamp 1 and predecessor 0, so changing their generation without an
 earlier hardware read would not be justified.
 
+The native stamp-1 compute capture is the first job on that application
+queue, not the first work after GPU startup: its observation list includes
+queue 8 at stamps `0x4f6..0x4f9` before queue 10 at stamp 1. The separate
+startup capture's first work publication contains TA tags 0, 15 and 14;
+that first tag-14 record names queue 0, count 1, priority 0, stamp 1.
+Its SKSM dependency entry was not captured, so this does not establish a
+required priming job or justify a different initial stamp.
+
+Two no-kick mode-5 boots could not provide a powered queue-register
+baseline. The normal setup and a setup with the compute path's idle-policy
+request both stopped the ASC CPUs successfully, with GPX `0x1f0023ff`
+and GFX `0x1000230f`. The reader refused queue MMIO before any selector
+access. Retiring the idle-policy request does not establish powered GFX.
+Evidence: `logs/m5-queue11-before-compute-20260911.log` and
+`logs/m5-idle-policy-queue11-before-compute-20260911.log`.
+
+Mode 7 isolates a later boundary: it allocates the same job as mode 6,
+publishes descriptor tag 3 and channel configuration tag 15, but keeps
+tag 14 beyond the producer. On hardware, outer counters retired to
+`[2,2,2]`, inner counters to `[3,3,3]`, inputs remained unchanged and
+all 1,024 outputs retained their sentinels. Both firmware stop requests
+succeeded. GFX still reported `0x1000230f`; no queue MMIO was attempted.
+
+The RAM-only `--before-compute` capture read all 21 objects from 85 pages
+without errors. Compared with the mode-6 recovery capture, descriptor,
+event state/link, scheduler, completion prefix and program buffers are
+byte-identical. Inner counters differ only by 3 versus 4. This qualifies
+firmware setup immediately before the failing kick; it does not prove
+an initial hardware completion value or successful GPU execution.
+
+Evidence: `logs/m5-prekick-setup-mode7-20260911.log`,
+`logs/m5-prekick-queue11-before-compute-20260911.log` and
+`logs/m5-prekick-setup-retained-20260911/manifest.json`.
+
 All 1,024 shader outputs remain untouched, completion stays zero, and
 both firmware stop requests succeed. Linux GPU execution remains open.

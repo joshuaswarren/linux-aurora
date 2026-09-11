@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""Read fixed M5 KSM registers after a retained mode-6 recovery probe.
+"""Read fixed M5 KSM registers after a retained, stopped firmware probe.
 
 No recovery acknowledgments or resets. Both ASC CPUs must
 be stopped and the measured GPX/GFX power domains must still report ON.
 Offsets below come from M5 25G76 firmware, not the Neo diagnostic helper.
 --queue11 temporarily selects queue11 for reads and restores its predecessor.
+--queue11-before-compute reads only queue11 after successful mode7 setup.
 """
 import json
 from pathlib import Path
@@ -18,9 +19,10 @@ sys.path.insert(0, str(root / 'm1n1/proxyclient'))
 from m1n1.proxy import Serial
 
 sequence = 0
-if sys.argv[1:] not in ([], ['--queue11']):
-    raise ValueError('Only --queue11 is supported')
-select_queue = sys.argv[1:] == ['--queue11']
+if sys.argv[1:] not in ([], ['--queue11'], ['--queue11-before-compute']):
+    raise ValueError('Only --queue11 or --queue11-before-compute is supported')
+before_compute = sys.argv[1:] == ['--queue11-before-compute']
+select_queue = bool(sys.argv[1:])
 with Serial('/dev/cu.kis-01100000-ch-0', 115200, timeout=0.2) as port:
     def command(script):
         global sequence
@@ -40,15 +42,26 @@ with Serial('/dev/cu.kis-01100000-ch-0', 115200, timeout=0.2) as port:
                 return body.split((token + '_END\n').encode(), 1)[0].rstrip(b'\n')
         raise RuntimeError('M5 read timed out; retain the target and its owners')
 
+    probe_gate = (
+        "dmesg | grep -q 'requested probe mode=7' "
+        "&& dmesg | grep -q 'M5_INIT transaction result=Ok(())' "
+        "&& dmesg | grep -q 'M5_POWER idle policy retired' "
+        "&& dmesg | grep -q '1024 untouched outputs, SKSM kick unpublished' "
+        "&& ! dmesg | grep -q 'M5_COMPUTE first SKSM kick submitted' "
+        "&& ! dmesg | grep -q 'requested probe mode=6' "
+        "&& ! dmesg | grep -q 'M5_COMPUTE firmware requested GPU restart'"
+        if before_compute else
+        "dmesg | grep -q 'requested probe mode=6' "
+        "&& dmesg | grep -q 'M5_COMPUTE firmware requested GPU restart'")
     identity = command("grep -q apple,j813 /proc/device-tree/compatible "
         "&& [ $(uname -r) = 7.1.6-aurora-j813-gpu-v9 ] "
         "&& [ -d /sys/module/asahi ] "
-        "&& dmesg | grep -q 'requested probe mode=6' "
-        "&& dmesg | grep -q 'M5_COMPUTE firmware requested GPU restart' "
+        "&& " + probe_gate + " "
         "&& dmesg | grep -q 'M5_INIT stop requests=Ok(())' "
-        "&& echo M5_STOPPED_RECOVERY_VERIFIED")
-    if identity.strip() != b'M5_STOPPED_RECOVERY_VERIFIED':
-        raise RuntimeError('Expected the retained M5 mode-6 recovery probe')
+        "&& echo M5_STOPPED_PROBE_VERIFIED")
+    if identity.strip() != b'M5_STOPPED_PROBE_VERIFIED':
+        raise RuntimeError('Expected the retained M5 stopped probe matching the requested mode')
+    print('M5_QUEUE_PHASE=' + ('before-compute' if before_compute else 'after-recovery'), flush=True)
 
     def read_register(label, address, width):
         raw = command('devmem 0x%x %d' % (address, width)).strip()
@@ -68,7 +81,7 @@ with Serial('/dev/cu.kis-01100000-ch-0', 115200, timeout=0.2) as port:
             raise RuntimeError('GPU power domain is not fully ON')
     # Recovery code 0x6be8..0x6c00 leaves the selected slot and reads its
     # command pointers. Reject another slot rather than changing selection.
-    if read_register('selected-slot', 0x580010398, 32) != 0:
+    if not before_compute and read_register('selected-slot', 0x580010398, 32) != 0:
         raise RuntimeError('Expected the retained compute slot zero')
     for label, offset in [
             ('fault-mask-0', 0xc0b0), ('fault-mask-1', 0xc0c8),
@@ -76,7 +89,8 @@ with Serial('/dev/cu.kis-01100000-ch-0', 115200, timeout=0.2) as port:
             ('dm0-mask', 0xc160), ('dm1-mask', 0xc168), ('dm2-mask', 0xc170),
             ('command-pointer', 0xc0f0), ('queue-pointer', 0xc0f8),
             ('slot-state', 0xc020), ('slot-time', 0xc028), ('slot-progress', 0xc078)]:
-        read_register(label, 0x580000000 + offset, 64)
+        if not before_compute:
+            read_register(label, 0x580000000 + offset, 64)
     # M5 0x11f50 selects qid11 before adding the kick; 0x21790..0x217a0
     # reads queue enable/completion through the same selected-queue view.
     previous_queue = read_register('selected-queue', 0x5800103a8, 64)
@@ -104,6 +118,7 @@ with Serial('/dev/cu.kis-01100000-ch-0', 115200, timeout=0.2) as port:
         print('M5_QUEUE11_READ_SKIPPED: another queue is selected; selector unchanged')
     # M5 0x6744..0x67b8 scans banks0..7 with this selector and tests
     # fault-info bit0. Read only the bank it left selected, without a scan.
-    read_register('gmmu-selected-bank', 0x58000d800, 64)
-    read_register('gmmu-selected-fault-info', 0x58000d8c0, 64)
+    if not before_compute:
+        read_register('gmmu-selected-bank', 0x58000d800, 64)
+        read_register('gmmu-selected-fault-info', 0x58000d8c0, 64)
     print('M5_STOPPED_KSM_READ_COMPLETE')
