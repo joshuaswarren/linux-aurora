@@ -156,6 +156,7 @@ impl M5Session {
                 roots, page_count, triangle);
         }
         if probe_kind == 12 {
+            self.install_graphics_queues()?;
             self.retire_idle_policy()?;
             self.submit_graphics()?;
         } else if probe_kind >= 6 {
@@ -166,17 +167,43 @@ impl M5Session {
         Ok(())
     }
 
+    fn install_graphics_queues(&mut self) -> Result {
+        let memory = self.memory.as_mut().ok_or(EIO)?;
+        dev_info!(self.dev.as_ref(), "M5_GRAPHICS install before counters={:x?} registration={:x?}\n",
+            memory.graphics_status()?, memory.graphics_installation_status()?);
+        memory.publish_graphics_install()?;
+        Pin::new(&mut self.roles[0].rtkit).send_message(0x21, 0x0083_0000_0000_000a)?;
+        for poll in 0..1000 {
+            if memory.drain_reports(&self.dev)? { return Err(EIO); }
+            if self.roles.iter().any(|role| role.state.crashed.load(Ordering::Acquire)) {
+                return Err(EIO);
+            }
+            let (outer, inner, _) = memory.graphics_status()?;
+            if outer == [2; 3] && inner == [[1; 3]; 2]
+                && memory.graphics_queues_installed()? {
+                dev_info!(self.dev.as_ref(), "M5_GRAPHICS installed TA/fragment queues; registration={:x?}; no draws published\n",
+                    memory.graphics_installation_status()?);
+                return Ok(());
+            }
+            if [0, 100].contains(&poll) {
+                dev_info!(self.dev.as_ref(), "M5_GRAPHICS install poll={} counters={:x?} registration={:x?}\n",
+                    poll, memory.graphics_status()?, memory.graphics_installation_status()?);
+            }
+            fsleep(Delta::from_millis(1));
+        }
+        dev_err!(self.dev.as_ref(), "M5_GRAPHICS install timeout counters={:x?} registration={:x?}\n",
+            memory.graphics_status()?, memory.graphics_installation_status()?);
+        Err(ETIMEDOUT)
+    }
+
     fn submit_graphics(&mut self) -> Result {
         let memory = self.memory.as_mut().ok_or(EIO)?;
         dev_info!(self.dev.as_ref(), "M5_GRAPHICS prepared outer/inner/completion={:x?}\n",
             memory.graphics_status()?);
         memory.publish_graphics_job()?;
-        // Native priority2 channels: fragment (1 | 2<<2), then TA (0 | 2<<2).
-        // Both complete entries and roots precede either notification.
-        for channel in [9u64, 8] {
-            Pin::new(&mut self.roles[0].rtkit).send_message(0x21,
-                0x0083_0000_0000_0000 | channel)?;
-        }
+        // The outer CL_2 channel delivers both stage-tagged SKSM command lists.
+        // Both complete entries and roots precede the notification.
+        Pin::new(&mut self.roles[0].rtkit).send_message(0x21, 0x0083_0000_0000_000a)?;
         for poll in 0..10000 {
             if memory.drain_reports(&self.dev)? {
                 dev_err!(self.dev.as_ref(), "M5_GRAPHICS firmware requested GPU restart\n");
@@ -187,7 +214,7 @@ impl M5Session {
             if [0, 100, 1000, 5000].contains(&poll) {
                 dev_info!(self.dev.as_ref(), "M5_GRAPHICS poll={} outer/inner/completion={:x?}\n", poll, status);
             }
-            if status.0 == [[1; 3]; 2] && status.1 == [[3; 3]; 2] && status.2[0] == 0 {
+            if status.0 == [4; 3] && status.1 == [[4; 3]; 2] && status.2[0] == 0 {
                 let result = memory.graphics_result()?;
                 if result.verified() {
                     dev_info!(self.dev.as_ref(), "M5_GRAPHICS verified native-program TA/fragment pixels={:?}; both queues retired; completion={:x?}\n",

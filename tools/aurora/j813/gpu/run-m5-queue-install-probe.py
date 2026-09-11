@@ -45,7 +45,8 @@ with Serial("/dev/cu.kis-01100000-ch-0", 115200, timeout=0.2) as port:
 required = [b"\nM5_QUEUE_PROBE_RETURN=0\r\n",
             b"M5_INIT transaction result=Ok(())", b"M5_INIT stop requests=Ok(())"]
 if mode == 12:
-    required += [b"M5_GRAPHICS prepared outer/inner/completion=",
+    required += [b"M5_GRAPHICS installed TA/fragment queues; registration=",
+                 b"M5_GRAPHICS prepared outer/inner/completion=",
                  b"M5_GRAPHICS verified native-program TA/fragment pixels=",
                  b"both queues retired; completion="]
     if b'M5_GRAPHICS firmware requested GPU restart' in captured:

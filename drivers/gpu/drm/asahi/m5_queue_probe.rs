@@ -23,7 +23,7 @@ const FIRMWARE_SLOT: usize = 0x127430 - 0x4c000 + QUEUE_ID as usize * 0x28;
 // Tag-15 scheduler binding stores its control pointer at 0x1257e0 + qid*8.
 const FIRMWARE_SCHEDULER: usize = 0x1257e0 - 0x4c000 + QUEUE_ID as usize * 8;
 
-struct FirmwareDataView {
+pub(super) struct FirmwareDataView {
     map: io::mem::Mem,
     cache_line: usize,
 }
@@ -32,6 +32,63 @@ struct FirmwareDataView {
 unsafe impl Send for FirmwareDataView {}
 // SAFETY: Concurrent read-only volatile observations do not mutate host state.
 unsafe impl Sync for FirmwareDataView {}
+
+impl FirmwareDataView {
+    pub(super) fn new(dev: &AsahiDevice) -> Result<Self> {
+        let resource = dev.as_ref().of_node().ok_or(EINVAL)?
+            .reserved_mem_region_to_resource_byname(c_str!("gfx-data"))?;
+        if resource.size() != 0x134000 || resource.start() < 0x100_0000_0000
+            || resource.start() & 0x3fff != 0
+            || resource.start().checked_add(resource.size()).ok_or(EOVERFLOW)? > 0x104_0000_0000
+            || FIRMWARE_SLOT + 0x28 > resource.size() as usize
+            || FIRMWARE_SCHEDULER + 8 > resource.size() as usize
+            || 0x178458 - 0x4c000 + 8 > resource.size() as usize {
+            return Err(EINVAL);
+        }
+        let ctr: u64;
+        // SAFETY: CTR_EL0 is an architectural read-only cache geometry register.
+        unsafe { core::arch::asm!("mrs {ctr}, ctr_el0", ctr = out(reg) ctr,
+            options(nomem, nostack, preserves_flags)) };
+        let cache_line = 4usize << ((ctr >> 16) & 0xf);
+        if cache_line > 0x4000 { return Err(EINVAL); }
+        // SAFETY: WB matches reserved System RAM. The host never writes this
+        // extent; observations invalidate covering lines before volatile reads.
+        let map = unsafe { io::mem::Mem::try_new(resource, io::mem::MemFlag::WB.into()) }?;
+        fence(Ordering::SeqCst);
+        Ok(Self { map, cache_line })
+    }
+
+    fn words<const N: usize>(&self, offset: usize) -> [u64; N] {
+        // All callers use constructor-checked queue, scheduler or power extents.
+        let line = self.cache_line;
+        let start = offset & !(line - 1);
+        let end = (offset + N * 8 + line - 1) & !(line - 1);
+        for offset in (start..end).step_by(line) {
+            // SAFETY: Whole covering lines are inside the retained DATA view.
+            // The host never dirties them; do not clean stale data to firmware.
+            unsafe { core::arch::asm!("dc ivac, {addr}",
+                addr = in(reg) self.map.ptr().add(offset),
+                options(nostack, preserves_flags)) };
+        }
+        // SAFETY: Complete invalidations before volatile observations.
+        unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
+        let mut out = [0; N];
+        for (index, value) in out.iter_mut().enumerate() {
+            // SAFETY: The constructor bounds-checks every supported extent.
+            *value = unsafe { core::ptr::read_volatile(
+                self.map.ptr().add(offset + index * 8).cast::<u64>()) };
+        }
+        fence(Ordering::Acquire);
+        out
+    }
+
+    pub(super) fn queue_registration(&self, queue_id: u8) -> Result<([u64; 5], u64)> {
+        // The retained experiment owns only these two constructor-bounded slots.
+        if !matches!(queue_id, 10 | 11) { return Err(EINVAL); }
+        Ok((self.words::<5>(0x127430 - 0x4c000 + queue_id as usize * 0x28),
+            self.words::<1>(0x1257e0 - 0x4c000 + queue_id as usize * 8)[0]))
+    }
+}
 
 pub(super) struct M5QueueProbe {
     entry_alias: mmu::KernelMapping,
@@ -98,32 +155,7 @@ impl M5QueueProbe {
             out[POINTERS + 0x40..POINTERS + 0x44].copy_from_slice(&1u32.to_le_bytes());
             Ok(())
         })?;
-        let resource = dev.as_ref().of_node().ok_or(EINVAL)?
-            .reserved_mem_region_to_resource_byname(c_str!("gfx-data"))?;
-        if resource.size() != 0x134000 || resource.start() < 0x100_0000_0000
-            || resource.start() & 0x3fff != 0
-            || resource.start().checked_add(resource.size()).ok_or(EOVERFLOW)? > 0x104_0000_0000
-            || FIRMWARE_SLOT + 0x28 > resource.size() as usize
-            || FIRMWARE_SCHEDULER + 8 > resource.size() as usize
-            || 0x178458 - 0x4c000 + 8 > resource.size() as usize {
-            return Err(EINVAL);
-        }
-        let ctr: u64;
-        // SAFETY: CTR_EL0 is an architectural read-only cache geometry register.
-        unsafe { core::arch::asm!("mrs {ctr}, ctr_el0", ctr = out(reg) ctr,
-            options(nomem, nostack, preserves_flags)) };
-        let cache_line = 4usize << ((ctr >> 16) & 0xf);
-        if cache_line > 0x4000 {
-            return Err(EINVAL);
-        }
-        // SAFETY: The exact firmware profile and reserved DATA extent are
-        // checked above and by the caller. WB matches the System RAM linear
-        // mapping; creating a WC alias of that RAM would be invalid. The host
-        // never writes this firmware-owned extent. Each observation invalidates
-        // the covering cache lines before reading the queue/scheduler slots.
-        let map = unsafe { io::mem::Mem::try_new(resource, io::mem::MemFlag::WB.into()) }?;
-        fence(Ordering::SeqCst);
-        Ok(Self { entry_alias, entry, graph, firmware: FirmwareDataView { map, cache_line },
+        Ok(Self { entry_alias, entry, graph, firmware: FirmwareDataView::new(dev)?,
             bind_scheduler })
     }
 
@@ -189,30 +221,7 @@ impl M5QueueProbe {
     }
 
     fn firmware_words<const N: usize>(&self, offset: usize) -> [u64; N] {
-        // Callers use constructor-checked table and power-state extents.
-        let line = self.firmware.cache_line;
-        let start = offset & !(line - 1);
-        let end = (offset + N * 8 + line - 1) & !(line - 1);
-        for offset in (start..end).step_by(line) {
-            // SAFETY: Both covering lines are wholly inside the aligned,
-            // retained firmware-owned DATA extent. No host code writes that
-            // extent, so invalidation cannot discard dirty host data. Never
-            // clean stale CPU cache lines back over firmware updates.
-            unsafe { core::arch::asm!("dc ivac, {addr}",
-                addr = in(reg) self.firmware.map.ptr().add(offset),
-                options(nostack, preserves_flags)) };
-        }
-        // SAFETY: Wait for the preceding invalidations before volatile reads.
-        unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
-        let mut out = [0; N];
-        for (index, value) in out.iter_mut().enumerate() {
-            // SAFETY: The constructor bounds-checks the entire aligned slot
-            // inside this retained reserved-RAM mapping. Firmware is its writer.
-            *value = unsafe { core::ptr::read_volatile(
-                self.firmware.map.ptr().add(offset + index * 8).cast::<u64>()) };
-        }
-        fence(Ordering::Acquire);
-        out
+        self.firmware.words(offset)
     }
 
     pub(super) fn firmware_slot(&self) -> [u64; 5] {
