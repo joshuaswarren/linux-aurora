@@ -14,10 +14,14 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('mode', type=int, choices=range(3, 13), nargs='?', default=3)
 parser.add_argument('--frames', type=int, choices=range(1, 65), default=1,
                     help='Require this many completed mode12 renders with output resets')
+parser.add_argument('--context', type=int, choices=range(3, 64), default=3,
+                    help='Mode12 application context; verify descriptor and channel IDs follow the lease')
 args = parser.parse_args()
 mode = args.mode
 if args.frames != 1 and mode != 12:
     parser.error('--frames requires mode12')
+if args.context != 3 and mode != 12:
+    parser.error('--context requires mode12')
 trace_mask = int(os.environ.get('M5_FW_TRACE', '0'), 0)
 if trace_mask < 0 or trace_mask & ~0x203:
     raise ValueError('M5_FW_TRACE accepts only power, submission and recovery bits (0x203)')
@@ -28,7 +32,7 @@ command = (
     "if grep -q apple,j813 /proc/device-tree/compatible "
     "&& [ $(uname -r) = 7.1.6-aurora-j813-gpu-v9 ] "
     "&& [ ! -d /sys/module/asahi ]; then "
-    f"modprobe asahi m5_initdata_test={mode} m5_fw_trace={trace_mask} m5_graphics_frames={args.frames}; echo M5_QUEUE_PROBE_RETURN=$?; "
+    f"modprobe asahi m5_initdata_test={mode} m5_fw_trace={trace_mask} m5_graphics_frames={args.frames} m5_graphics_context={args.context}; echo M5_QUEUE_PROBE_RETURN=$?; "
     "dmesg | tail -180; "
     "else echo M5_QUEUE_PROBE_WRONG_TARGET_OR_ALREADY_LOADED; fi; "
     "echo M5_QUEUE_PROBE_DONE\n"
@@ -51,6 +55,7 @@ with Serial("/dev/cu.kis-01100000-ch-0", 115200, timeout=0.2) as port:
 required = [b"\nM5_QUEUE_PROBE_RETURN=0\r\n",
             b"M5_INIT transaction result=Ok(())", b"M5_INIT stop requests=Ok(())"]
 if mode == 12:
+    required.append(f'M5_GRAPHICS_CONTEXT id={args.context} roots='.encode())
     required += [b"M5_GRAPHICS installed TA/fragment queues; registration=",
                  b"M5_GRAPHICS prepared outer/inner/completion=",
                  b"M5_GRAPHICS verified native-program TA/fragment pixels=",

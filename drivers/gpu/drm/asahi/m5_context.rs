@@ -1,17 +1,35 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
-//! Exclusive context 3 for the bounded M5 compute experiment.
+//! Retained M5 application root leases, shared by render and compute queues.
 //!
 //! Native M5 compute has a private lower root and a distinct empty upper
 //! root. Its firmware-global root is not copied into the application slot.
-//! The boot session retains this owner until both processors stop, including
-//! on failure. This is not a general userspace context allocator.
+//! Firmware owns contexts 0..2. Application contexts are claimed before any
+//! root becomes visible, and the lease retains both VM roots. The submission
+//! owner must retain the lease until completion or confirmed processor stop.
 
 use super::*;
 
-const CONTEXT: usize = 3;
+struct M5ContextSlot {
+    inner: Arc<UatInner>,
+    context: usize,
+}
+
+impl Drop for M5ContextSlot {
+    fn drop(&mut self) {
+        // An unexpected published root is not ours to retract or recycle.
+        // Keep its bit quarantined rather than hand it to another client.
+        let inner = self.inner.lock();
+        let slot = &inner.ttbs()[self.context];
+        if slot.ttb0.load(Ordering::Acquire) == 0
+            && slot.ttb1.load(Ordering::Acquire) == 0 {
+            self.inner.t8142_app_contexts.fetch_and(
+                !(1u64 << self.context), Ordering::AcqRel);
+        }
+    }
+}
 
 pub(crate) struct M5ExecutionContext {
-    inner: Arc<UatInner>,
+    slot: M5ContextSlot,
     low: Vm,
     high: Vm,
     published: bool,
@@ -23,18 +41,86 @@ impl Uat {
             return Err(ENODEV);
         }
         let range = IOVA_USER_BASE..uat_geometry(self.cfg)?.user_va_top();
-        let low = self.new_vm(0x8142_0003, range.clone())?;
-        // No mapping API for this VM escapes the context owner.
-        let high = self.new_vm(0x8142_1003, range)?;
-        Ok(M5ExecutionContext { inner: self.inner.clone(), low, high, published: false })
+        let low = self.new_vm(0x8142_0003, range)?;
+        let context = self.prepare_t8142_execution_context(&low)?;
+        // The diagnostic compute queue still explicitly names context 3.
+        // Application queues call the VM-based constructor directly and use
+        // the returned context_id in every descriptor/channel record.
+        if context.context_id() != 3 {
+            return Err(EBUSY);
+        }
+        Ok(context)
+    }
+
+    /// Retain a DRM-created VM without copying its mappings into a diagnostic
+    /// address space. Publication remains explicit and happens after the job
+    /// has acquired all of its buffer and completion owners.
+    pub(crate) fn prepare_t8142_execution_context(
+        &self, vm: &Vm,
+    ) -> Result<M5ExecutionContext> {
+        self.prepare_t8142_execution_context_mask(vm, !0b111)
+    }
+
+    /// Select a slot for the native-program regression test. Ordinary DRM
+    /// queues use the allocator above and do not request a hardware ID.
+    pub(crate) fn new_t8142_graphics_execution_context(
+        &self, context: u8,
+    ) -> Result<M5ExecutionContext> {
+        if !(3..UAT_NUM_CTX as u8).contains(&context) {
+            return Err(EINVAL);
+        }
+        let range = IOVA_USER_BASE..uat_geometry(self.cfg)?.user_va_top();
+        let vm = self.new_vm(0x8142_0000 + context as u64, range)?;
+        self.prepare_t8142_execution_context_mask(&vm, 1u64 << context)
+    }
+
+    fn prepare_t8142_execution_context_mask(
+        &self, vm: &Vm, allowed: u64,
+    ) -> Result<M5ExecutionContext> {
+        if self.cfg != UatConfig::T8142 {
+            return Err(ENODEV);
+        }
+        {
+            let owner = vm.inner.exec_lock(None, false)?;
+            if owner.is_kernel || !core::ptr::eq(
+                Arc::as_ptr(&owner.uat_inner), Arc::as_ptr(&self.inner),
+            ) {
+                return Err(EINVAL);
+            }
+        }
+        let context = loop {
+            let used = self.inner.t8142_app_contexts.load(Ordering::Acquire);
+            let free = !used & allowed & !0b111u64;
+            if free == 0 {
+                return Err(ENOSPC);
+            }
+            let index = free.trailing_zeros() as usize;
+            if self.inner.t8142_app_contexts.compare_exchange_weak(
+                used, used | (1u64 << index), Ordering::AcqRel, Ordering::Acquire,
+            ).is_ok() {
+                break index;
+            }
+        };
+        // Construct the slot guard first so a failed private-root allocation
+        // returns its claim. This high VM is never exposed for mappings.
+        let slot = M5ContextSlot { inner: self.inner.clone(), context };
+        let range = IOVA_USER_BASE..uat_geometry(self.cfg)?.user_va_top();
+        let high = self.new_vm(0x8142_1000 + context as u64, range)?;
+        Ok(M5ExecutionContext { slot, low: vm.clone(), high, published: false })
     }
 }
 
 impl M5ExecutionContext {
     pub(crate) fn vm(&self) -> &Vm { &self.low }
 
+    pub(crate) fn context_id(&self) -> u8 { self.slot.context as u8 }
+
+    pub(crate) fn matches(&self, vm: &Vm) -> bool {
+        core::ptr::eq(&*self.low.inner, &*vm.inner)
+    }
+
     pub(crate) fn roots(&self) -> [u64; 2] {
-        let tag = (CONTEXT as u64) << TTBR_ASID_SHIFT | TTBR_VALID;
+        let tag = (self.slot.context as u64) << TTBR_ASID_SHIFT | TTBR_VALID;
         [self.low.ttb() | tag, self.high.ttb() | tag]
     }
 
@@ -44,8 +130,8 @@ impl M5ExecutionContext {
         if self.published { return Err(EBUSY); }
         let roots = self.roots();
         {
-            let inner = self.inner.lock();
-            let slot = &inner.ttbs()[CONTEXT];
+            let inner = self.slot.inner.lock();
+            let slot = &inner.ttbs()[self.slot.context];
             if slot.ttb0.load(Ordering::Acquire) != 0
                 || slot.ttb1.load(Ordering::Acquire) != 0 {
                 return Err(EBUSY);
@@ -55,7 +141,7 @@ impl M5ExecutionContext {
             self.published = true;
         }
         fence(Ordering::SeqCst);
-        mem::tlbi_asid(CONTEXT as u8);
+        mem::tlbi_asid(self.context_id());
         mem::sync();
         Ok(())
     }
@@ -63,8 +149,8 @@ impl M5ExecutionContext {
     pub(crate) fn is_current(&self) -> bool {
         if !self.published { return false; }
         let roots = self.roots();
-        let inner = self.inner.lock();
-        let slot = &inner.ttbs()[CONTEXT];
+        let inner = self.slot.inner.lock();
+        let slot = &inner.ttbs()[self.slot.context];
         slot.ttb0.load(Ordering::Acquire) == roots[0]
             && slot.ttb1.load(Ordering::Acquire) == roots[1]
     }
@@ -75,8 +161,8 @@ impl Drop for M5ExecutionContext {
         if !self.published { return; }
         let roots = self.roots();
         {
-            let inner = self.inner.lock();
-            let slot = &inner.ttbs()[CONTEXT];
+            let inner = self.slot.inner.lock();
+            let slot = &inner.ttbs()[self.slot.context];
             // Only our exact pair may be retracted. VM owners remain alive
             // through root invalidation and the final ASID synchronization.
             if slot.ttb0.load(Ordering::Acquire) == roots[0]
@@ -86,7 +172,46 @@ impl Drop for M5ExecutionContext {
             }
         }
         fence(Ordering::SeqCst);
-        mem::tlbi_asid(CONTEXT as u8);
+        mem::tlbi_asid(self.context_id());
         mem::sync();
+    }
+}
+
+impl VmInner {
+    /// M5 application roots are leased independently of the legacy binding
+    /// slot. Flush every currently published view of this VM after changing
+    /// its leaves, including cached negative translations after a new bind.
+    /// The VM exec lock is held by all callers; publication does its own full
+    /// ASID invalidation if it races this snapshot.
+    pub(super) fn flush_m5_app_range(&self, address: u64, size: usize) {
+        if self.is_kernel || size == 0 {
+            return;
+        }
+        let used = self.uat_inner.t8142_app_contexts.load(Ordering::Acquire) & !0b111;
+        if used == 0 {
+            return;
+        }
+        let root = self.page_table.ttb();
+        let contexts = {
+            let inner = self.uat_inner.lock();
+            let mut contexts = 0u64;
+            for context in 3..UAT_NUM_CTX {
+                let tagged = root | TTBR_VALID | (context as u64) << TTBR_ASID_SHIFT;
+                if used & (1u64 << context) != 0
+                    && inner.ttbs()[context].ttb0.load(Ordering::Acquire) == tagged {
+                    contexts |= 1u64 << context;
+                }
+            }
+            contexts
+        };
+        if contexts != 0 {
+            fence(Ordering::SeqCst);
+            for context in 3..UAT_NUM_CTX {
+                if contexts & (1u64 << context) != 0 {
+                    mem::tlbi_range(context as u8, address as usize, size);
+                }
+            }
+            mem::sync();
+        }
     }
 }

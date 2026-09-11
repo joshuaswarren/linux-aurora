@@ -59,14 +59,14 @@ impl M5GraphicsQueues {
             })?;
             let install = m5_channel::encode_m5_channel_config_for(m5_channel::M5ChannelConfig {
                 ring_low: low, ring_high: high, queue_id: id, priority: 2,
-                install_queue: true, gpu_context: 3, event: None,
+                install_queue: true, gpu_context: job.context_id(), event: None,
                 channel_control: HIGH + CONTROL as u64, update_scheduler: true,
                 scheduler_index: 0, channel_stamp_index: stage as u32,
                 update_context: false, owner_context: 0, extended_command: false,
             }, stage as u32, 2, None, None).map_err(|_| EINVAL)?;
             let config = m5_channel::encode_m5_channel_config_for(m5_channel::M5ChannelConfig {
                 ring_low: low, ring_high: high, queue_id: id, priority: 2,
-                install_queue: false, gpu_context: 3,
+                install_queue: false, gpu_context: job.context_id(),
                 event: Some(m5_channel::M5ChannelEvent { address: job.usc_control(),
                     timestamp: 1, index: graphics_usc::HARDWARE_ID }),
                 channel_control: HIGH + CONTROL as u64, update_scheduler: false,

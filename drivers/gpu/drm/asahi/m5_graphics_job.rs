@@ -133,7 +133,7 @@ impl M5GraphicsJob {
                 zero: HIGH + SCENE_ZERO as u64,
             };
             let metadata = g17_render::RenderDescriptorMetadata {
-                context_id: 3, submission_ordinal: 0, command_buffer_state_word: 0,
+                context_id: program.context_id() as u32, submission_ordinal: 0, command_buffer_state_word: 0,
                 ta_hardware_buffer_id: PB_HARDWARE_ID, submit_sequence: 1,
             };
             m5_render::build_ta_descriptor_base(&p, &controls, objects, metadata,
@@ -202,6 +202,8 @@ impl M5GraphicsJob {
     pub(super) fn uma_descriptor(&self) -> [u64; 4] { self.program.usc().descriptor() }
 
     pub(super) fn roots(&self) -> [u64; 2] { self.program.roots() }
+
+    pub(super) fn context_id(&self) -> u8 { self.program.context_id() }
 
     pub(super) fn descriptor_addresses(&self, stage: usize) -> Result<[u64; 2]> {
         let offset = match stage { 0 => TA, 1 => FRAGMENT, _ => return Err(EINVAL) };

@@ -370,3 +370,39 @@ Run `run-m5-queue-install-probe.py 12 --frames 3` with the qualified trace mask
 The final capture proves frame 3; the ordered driver log and output-reset
 checks establish the preceding draws. Mesa/OpenGL and DCP remain separate
 unverified integration steps.
+
+## Application context ownership
+
+M5 now leases application slots 3..63 independently of the legacy binding
+allocator. Each lease retains the submitting VM as its lower root and a
+distinct empty upper root. It claims the slot before allocating or publishing
+roots, rejects kernel or foreign VMs, and retracts only its exact root pair
+before invalidating the ASID and releasing the owners. The legacy allocator
+cannot overwrite M5 leases. Mapping changes invalidate every published M5
+context referring to that VM, including newly mapped pages whose missing
+translations may have been cached.
+
+The 2026-09-11 context-4 hardware test rendered three consecutive controlled
+triangles after a fresh RAM boot. Both stage descriptors and both queue
+configurations followed the selected context. Each frame retired both queues,
+unlinked the scheduler and advanced completion stamps through 0x100, 0x200
+and 0x300; output was erased and checked before the second and third draws.
+Both firmware stop requests succeeded.
+
+The independent retained-state verifier confirmed distinct valid lower/upper
+roots tagged with ASID4, context4 in both stage descriptors, all 65,536 exact
+pixels, and frame3 completion. The capture contains 30 objects from 200
+physical pages with no failed objects or device-memory reads. Its pixel hash
+matches the native reference above. Asking the verifier for context3 or
+context5 rejects this capture.
+
+Use `--context 4` with all three helpers: the mode12 probe, the retained RAM
+capture and the pixel/completion verifier. Ordinary application queues will
+allocate their slot automatically; selecting a fixed slot is a diagnostic
+option. The hardware-tested module SHA256 is
+`38997e20c241ebaf85cff306587f25e01c06419df0ceaf2db4bd33bcf68d346e`.
+
+This proves the new context plumbing for the controlled native-program draw.
+It does not qualify concurrent clients, dynamic map/unmap invalidation under
+load, general Mesa submissions, glxgears or DCP/XFCE. Those remain separate
+application-runtime and presentation work.

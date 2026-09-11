@@ -86,6 +86,10 @@ kernel::module_platform_driver! {
             default: 1,
             description: "Number of sequential mode12 renders on a fresh RAM boot (1..64); reset pixels between completed frames",
         },
+        m5_graphics_context: u32 {
+            default: 3,
+            description: "Application root slot for the mode12 regression (3..63); ordinary application queues allocate their own slots",
+        },
         debug_flags: u64 {
             default: 0,
             // permissions: 0o644,

@@ -958,7 +958,19 @@ impl gpuvm::DriverGpuVm for VmInner {
             .unmap_pages(va.addr()..(va.addr() + va.range()))?;
 
         self.flush_m5_app_range(va.addr(), va.range() as usize);
-        self.tlbi_live_contexts(va.addr(), va.range());
+
+        if let Some(asid) = self.slot() {
+            fence(Ordering::SeqCst);
+            mem::tlbi_range(asid as u8, va.addr() as usize, va.range() as usize);
+            mod_dev_dbg!(
+                self.dev,
+                "MMU: flush range: asid={:#x} start={:#x} len={:#x}\n",
+                asid,
+                va.addr(),
+                va.range(),
+            );
+            mem::sync();
+        }
 
         if op.unmap_and_unlink_va_defer().is_none() {
             dev_err!(self.dev.as_ref(), "step_unmap: could not unlink gpuva");
@@ -1002,7 +1014,19 @@ impl gpuvm::DriverGpuVm for VmInner {
         self.page_table.unmap_pages(unmap_start..unmap_end)?;
 
         self.flush_m5_app_range(unmap_start, unmap_range as usize);
-        self.tlbi_live_contexts(unmap_start, unmap_range);
+
+        if let Some(asid) = self.slot() {
+            fence(Ordering::SeqCst);
+            mem::tlbi_range(asid as u8, unmap_start as usize, unmap_range as usize);
+            mod_dev_dbg!(
+                self.dev,
+                "MMU: flush range: asid={:#x} start={:#x} len={:#x}\n",
+                asid,
+                unmap_start,
+                unmap_range,
+            );
+            mem::sync();
+        }
 
         if op.unmap().unmap_and_unlink_va_defer().is_none() {
             dev_err!(self.dev.as_ref(), "step_unmap: could not unlink gpuva");

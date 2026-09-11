@@ -38,9 +38,13 @@ phase_args.add_argument('--after-graphics-draw', action='store_true',
                     help='Capture mode12 pixels after retired graphics commands and firmware stop requests')
 parser.add_argument('--graphics-shared-list', action='store_true',
                     help='Use the shared completion-list and uncached stamp layout for mode12')
+parser.add_argument('--context', type=int, choices=range(3, 64), default=3,
+                    help='Application root slot used by the mode12 graphics draw')
 args = parser.parse_args()
 if args.graphics_shared_list and not args.after_graphics_draw:
     parser.error('--graphics-shared-list requires --after-graphics-draw')
+if args.context != 3 and not args.after_graphics_draw:
+    parser.error('--context requires --after-graphics-draw')
 if args.triangle and not (args.after_success or args.after_live_snapshot):
     parser.error('--triangle requires --after-success or --after-live-snapshot')
 inventory_path, output_path = args.inventory, args.output
@@ -61,7 +65,8 @@ manifest = dict(phase=('Linux TA/fragment shared completion state' if args.graph
                       else 'Linux mode6 after compute') + ' after both firmware CPU stop requests',
                 device_memory_read=False, compute_triangle=args.triangle,
                 graphics_draw=args.after_graphics_draw,
-                graphics_shared_list=args.graphics_shared_list, objects=[])
+                graphics_shared_list=args.graphics_shared_list,
+                graphics_context=args.context if args.after_graphics_draw else None, objects=[])
 cache = {}
 sequence = 0
 with Serial('/dev/cu.kis-01100000-ch-0', 115200, timeout=0.2) as port:
@@ -211,7 +216,7 @@ with Serial('/dev/cu.kis-01100000-ch-0', 115200, timeout=0.2) as port:
                 ('program-buffers', 0x1000001c000, 0x4000, 3)]
         if args.after_graphics_draw:
             views = [
-                ('graphics-pixels', 0x10000058000, 0x40000, 3),
+                ('graphics-pixels', 0x10000058000, 0x40000, args.context),
                 ('graphics-queues', 0xfffffc20c0000000, 0x1c000, 0),
                 ('graphics-ta', 0xfffffc20c1000000, 0x3000, 0),
                 ('graphics-fragment', 0xfffffc20c1004000, 0x3000, 0),
