@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import runpy
 import sys
 import time
 
@@ -19,6 +20,10 @@ if int(hv.u.adt['/chosen'].chip_id) != 0x8142 or hv.u.adt.model != 'Mac17,3':
     raise RuntimeError('M5 GPU boot tracer requires J813/T8142')
 if hv.started:
     raise RuntimeError('GPU startup trace must be installed before guest entry')
+native_fw_trace_mask = int(os.environ.get('M5_GPU_NATIVE_FW_TRACE_MASK', '0'), 0)
+if (native_fw_trace_mask < 0 or native_fw_trace_mask & ~0x203
+        or native_fw_trace_mask and os.environ.get('M5_GPU_CAPTURE_INIT') != '1'):
+    raise ValueError('Native firmware tracing requires init capture and bits within 0x203')
 
 output = Path(os.environ['M5_GPU_TRACE_DIR'])
 stream = (output / 'gpu-events.jsonl').open('x', buffering=1)
@@ -189,6 +194,18 @@ if os.environ.get('M5_GPU_CAPTURE_INIT') == '1':
                                                 'before-INBOX1-publication')
                 if role == 'gfx-asc':
                     startup_init_word = word
+                    if native_fw_trace_mask:
+                        # INBOX1 has not published this root to firmware yet.
+                        # Use the same guarded host-input writer and restoration
+                        # receipt as the paused-owner diagnostic. No ring entry,
+                        # firmware DATA, or mailbox payload is changed.
+                        runpy.run_path(str(Path(__file__).with_name('trace-m5-native-fw.py')),
+                            init_globals=dict(hv=hv, m5_native_trace_action='enable',
+                                              m5_native_trace_mask=native_fw_trace_mask))
+                        emit('NATIVE_FW_TRACE_INPUT', role=role,
+                             mask=hex(native_fw_trace_mask),
+                             phase='before-INBOX1-publication',
+                             firmware_adoption_verified=False)
                 emit('INIT_CAPTURE_COMPLETE', role=role, bytes=manifest['total_bytes'],
                      objects=len(manifest['objects']))
             except Exception as error:

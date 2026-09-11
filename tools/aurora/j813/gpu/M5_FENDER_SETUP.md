@@ -214,5 +214,60 @@ Evidence: `logs/m5-cold-sksm-hv-20260911/startup/publication-01/manifest.json`
 and `logs/m5-cold-sksm-native-metal-result-20260911.json`. Five synthetic
 startup-observer tests pass, including the new bounded cold-ring capture.
 
+## Native firmware event comparison
+
+`launch-m5-gpu-hv.py --capture-startup --native-fw-trace-mask 0x201`
+now sets only the primary status-A trace input before the native INBOX1
+initialization publication. The guarded writer verifies the current root,
+firmware profile, status/ring layout and DRAM translation, and retains an
+owner-local restoration receipt before writing. The read-only graph reader
+remains unchanged. No firmware DATA, executable code, queue contents or
+mailbox payload is modified.
+
+Setting that input after startup did not update the firmware's cached flags.
+Exact firmware dispatch entries 0x12 and 0x26 branch to 0x37d4, which sets
+DATA+0x1779f8 and calls the configuration-copy routine at 0x3068. Other
+control paths also invoke it. The routine copies status-A+0 to
+DATA+0x1779fc and clears the refresh gate at 0x3310. Ordinary work submission
+does not necessarily refresh these settings.
+
+On a fresh 25G76 boot, the pre-publication write read back as 0x201 and a
+later paused-owner observation verified firmware flags 0x201. Both firmware
+configuration captures and all 24 startup captures succeeded. The native
+Metal reference passed 3 queues, 3,072 compute values and 12,288 rendered
+pixels. A stable status/ring observation retained the following compute
+sequence among other native graphics traffic:
+
+```text
+0x41 [9, 3, 2, 1]
+0x47 [0, 0, 0, 1]
+0x43 [9, 3, 0x2000000000003, 0xfffffc20c00006c0]
+```
+
+The firmware event-reader path at 0xe6a4..0xe6dc checks the hardware word
+at SGX+0x21168+8*selector before emitting 0x47 at 0xe728. The packet parser
+emits 0x43 at 0xb86c. Event 0x48 appears later in the processing path at
+0xeaa8. The retained native snapshot contains all three event classes.
+Linux's failing run emits its kick `0x41 [b,1,2,1]` but none of 0x47,
+0x43 or 0x48 before recovery. This localizes the next investigation to
+producing/receiving the first SKSM hardware event; it does not yet establish
+whether submission, translation, hardware admission, or event delivery is
+the cause. It also does not establish whether earlier native tiling work
+is a prerequisite for the first compute job.
+
+`trace-m5-native-fw.py` can snapshot or restore through the existing paused
+owner. Restoring the host input to zero does not prove the cached firmware
+flags changed: this boot still observed 0x201 immediately afterward. The
+helper now retains its receipt until a later observation verifies both
+values restored. Six host tests cover write ownership, stale-root/device
+mapping rejection, existing-input protection, failed readback and deferred
+firmware restoration. The Metal reference passed again after host-input
+restoration. Linux shader execution and DCP presentation remain unproven.
+
+Evidence: `logs/m5-native-fw-power-hv-20260911/`, particularly
+`native-fw-trace-snapshot-1789093426297467000/manifest.json`, plus
+`logs/m5-native-fw-preinit-metal-result-20260911.json` and
+`logs/m5-native-fw-input-restored-metal-result-20260911.json`.
+
 All 1,024 shader outputs remain untouched, completion stays zero, and
 both firmware stop requests succeed. Linux GPU execution remains open.
