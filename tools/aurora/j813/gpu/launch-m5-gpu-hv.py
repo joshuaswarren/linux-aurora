@@ -20,7 +20,13 @@ parser.add_argument('--capture-startup', action='store_true',
                     help='Also capture the first 24 native GPU work/control publications')
 parser.add_argument('--trace-host-gpu-writes', action='store_true',
                     help='Observe native CPU writes across the GPU aperture, excluding ASC mailboxes')
+parser.add_argument('--native-fw-trace-mask', type=lambda value: int(value, 0), default=0,
+                    help='Set the primary host trace input before initialization (allowed bits: 0x203)')
 args = parser.parse_args()
+if args.native_fw_trace_mask < 0 or args.native_fw_trace_mask & ~0x203:
+    parser.error('--native-fw-trace-mask accepts only bits 0x203')
+if args.native_fw_trace_mask and not (args.capture_init or args.capture_startup):
+    parser.error('--native-fw-trace-mask requires --capture-init or --capture-startup')
 os.umask(0o077)
 output = args.output.resolve()
 output.mkdir(mode=0o700)
@@ -54,6 +60,7 @@ os.environ.update({
     'M5_GPU_CAPTURE_INIT': '1' if args.capture_init or args.capture_startup else '0',
     'M5_GPU_CAPTURE_STARTUP': '1' if args.capture_startup else '0',
     'M5_GPU_TRACE_HOST_WRITES': '1' if args.trace_host_gpu_writes else '0',
+    'M5_GPU_NATIVE_FW_TRACE_MASK': hex(args.native_fw_trace_mask),
     'M5_N1_TRACE': '1', 'M5_SEP_TRACE': '1', 'M5_PMP_TRACE': '0',
     'M5_PMGR_TRACE': '0', 'M5_CLPC_SAMPLER_SHADOW': '0',
 })
