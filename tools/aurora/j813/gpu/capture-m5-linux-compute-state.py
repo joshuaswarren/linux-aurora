@@ -36,7 +36,11 @@ phase_args.add_argument('--after-success', action='store_true',
                     help='Require exact compute output, retired queues and no GPU restart')
 phase_args.add_argument('--after-graphics-draw', action='store_true',
                     help='Capture mode12 pixels after retired graphics commands and firmware stop requests')
+parser.add_argument('--graphics-shared-list', action='store_true',
+                    help='Use the shared completion-list and uncached stamp layout for mode12')
 args = parser.parse_args()
+if args.graphics_shared_list and not args.after_graphics_draw:
+    parser.error('--graphics-shared-list requires --after-graphics-draw')
 if args.triangle and not (args.after_success or args.after_live_snapshot):
     parser.error('--triangle requires --after-success or --after-live-snapshot')
 inventory_path, output_path = args.inventory, args.output
@@ -48,14 +52,16 @@ reserved = [(props[name + '-base'], props[name + '-base'] + props[name + '-size'
             for name in ('gpu-region', 'gfx-shared-region', 'gfx-shared-l2-region',
                          'gfx-data', 'gfx1-data')]
 output_path.mkdir(mode=0o700, exist_ok=False)
-manifest = dict(phase=('Linux TA/fragment pixels with completion bookkeeping unqualified' if args.after_graphics_draw
+manifest = dict(phase=('Linux TA/fragment shared completion state' if args.graphics_shared_list
+                      else 'Linux TA/fragment pixels with completion bookkeeping unqualified' if args.after_graphics_draw
                       else 'Linux mode8 admission before recovery' if args.before_recovery
                       else 'Linux mode7 setup before compute' if args.before_compute
                       else 'Linux verified compute completion' if args.after_success
                       else 'Linux live-status probe after compute' if args.after_live_snapshot
                       else 'Linux mode6 after compute') + ' after both firmware CPU stop requests',
                 device_memory_read=False, compute_triangle=args.triangle,
-                graphics_draw=args.after_graphics_draw, objects=[])
+                graphics_draw=args.after_graphics_draw,
+                graphics_shared_list=args.graphics_shared_list, objects=[])
 cache = {}
 sequence = 0
 with Serial('/dev/cu.kis-01100000-ch-0', 115200, timeout=0.2) as port:
@@ -100,7 +106,8 @@ with Serial('/dev/cu.kis-01100000-ch-0', 115200, timeout=0.2) as port:
         probe_gate = (
             "dmesg | grep -q 'requested probe mode=12$' "
             "&& dmesg | grep -q 'M5_GRAPHICS installed TA/fragment queues;' "
-            "&& dmesg | grep -Fq 'M5_GRAPHICS final outer/inner/completion=([4, 4, 4], [[4, 4, 4], [4, 4, 4]],' "
+            "&& ( dmesg | grep -Fq 'M5_GRAPHICS final outer/inner/completion=([4, 4, 4], [[4, 4, 4], [4, 4, 4]],' "
+            "|| dmesg | grep -q 'M5_GRAPHICS verified native-program TA/fragment pixels=.*both queues retired;' ) "
             "&& dmesg | grep -Fq 'pixels=TriangleResult { foreground: 18432, background: 47104, unexpected: 0, untouched: 0, checked: 63234, wrong: 0 }' "
             "&& ! dmesg | grep -q 'M5_GRAPHICS firmware requested GPU restart'")
     if args.triangle:
@@ -211,10 +218,13 @@ with Serial('/dev/cu.kis-01100000-ch-0', 115200, timeout=0.2) as port:
                 ('graphics-scheduler', 0xfffffc20c1008000, 0x400, 0),
                 ('graphics-pm-state', 0xfffffc20c100c000, 0x400, 0),
                 ('graphics-usc-state', 0xfffffc20c101c000, 0x400, 0),
-                ('graphics-stamps-a', 0xfffffc20c1028000, 0x4000, 0),
-                ('graphics-stamps-b', 0xfffffc20c102c000, 0x4000, 0),
+                ('graphics-stamps-a', 0xfffffc20c1084000 if args.graphics_shared_list else 0xfffffc20c1028000, 0x4000, 0),
+                ('graphics-stamps-b', 0xfffffc20c1088000 if args.graphics_shared_list else 0xfffffc20c102c000, 0x4000, 0),
                 ('graphics-pb-slot', 0xfffffc20015e0000, 16, 0),
                 ('graphics-uma-slot', 0xfffffc20015e8020, 32, 0)]
+            if args.graphics_shared_list:
+                views += [('graphics-completion-list', 0xfffffc20c0020000, 0x4000, 0),
+                          ('graphics-submitted-total', 0xfffffc20c1080000, 0x4000, 0)]
         for label, address, size, context in views:
             save(label, address, size, context)
         if args.triangle:

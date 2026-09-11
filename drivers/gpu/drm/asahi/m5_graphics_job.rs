@@ -13,7 +13,8 @@ const BYTES: usize = 0x40000;
 const TA: usize = 0;
 const FRAGMENT: usize = 0x4000;
 const SCHEDULER: usize = 0x8000;
-const SUBMITTED: usize = 0x8100;
+const SIGNALS_HIGH: u64 = HIGH + 0x80000;
+const SUBMITTED: usize = 0;
 const PM: usize = 0xc000;
 const PM_SHARED: usize = 0x10000;
 const PM_COUNTER: usize = 0x14000;
@@ -24,8 +25,8 @@ const USC_STATISTICS: usize = 0x24000;
 const SCENES: usize = 0x30000;
 const SCENE_ZERO: usize = SCENES + 80 * 0x80;
 const TIMESTAMPS: usize = 0x38000;
-const STAMPS_A: usize = 0x28000;
-const STAMPS_B: usize = 0x2c000;
+const STAMPS_A: usize = 0x4000;
+const STAMPS_B: usize = 0x8000;
 const PAGE_LIST_HIGH: u64 = HIGH + 0x40000;
 const METRICS_HIGH: u64 = HIGH + 0x60000;
 const PAGE_LIST: u64 = 0x10_0023_8000;
@@ -44,6 +45,7 @@ pub(super) struct M5GraphicsJob {
     aliases: KVec<mmu::KernelMapping>,
     graph_alias: mmu::KernelMapping,
     graph: MappedObject,
+    signals: MappedObject,
 }
 
 impl M5GraphicsJob {
@@ -51,6 +53,11 @@ impl M5GraphicsJob {
         let mut program = M5GraphicsMemory::load(dev, uat)?;
         let mut graph = MappedObject::new_wc_at(dev, uat.kernel_vm(), HIGH,
             BYTES, mmu::PROT_FW_PRIV_RW)?;
+        // Native submitted totals and host-visible stamps are uncached in
+        // firmware. Keep them separate from the cached descriptor graph.
+        let mut signals = MappedObject::new_wc_at(dev, uat.kernel_vm(), SIGNALS_HIGH,
+            0xc000, mmu::PROT_FW_SHARED_RW)?;
+        signals.write_u32(SIGNALS_HIGH + SUBMITTED as u64, 2)?;
         let graph_alias = graph.map_alias_at(uat.kernel_lower_vm(), LOW,
             mmu::PROT_GPU_SHARED_RW)?;
         for offset in (0..BYTES).step_by(mmu::UAT_PGSZ) {
@@ -81,10 +88,10 @@ impl M5GraphicsJob {
             aliases.push(alias, GFP_KERNEL)?;
         }
         graph.with_bytes_mut(|out| {
-            put64(out, SCHEDULER, HIGH + SUBMITTED as u64);
+            put64(out, SCHEDULER, SIGNALS_HIGH + SUBMITTED as u64);
             put32(out, SCHEDULER + 0x10, 0x50);
-            // Fresh native TA snapshot observes two pending stage records.
-            put32(out, SUBMITTED, 2);
+            // Two submitted stage records; firmware compares its completed
+            // count with this total, then unlinks the scheduler.
             for (block, base) in BLOCKS.into_iter().enumerate() {
                 put32(out, PM_BLOCKS + block * 8, ((base - USER_BASE) >> 15) as u32);
             }
@@ -152,13 +159,13 @@ impl M5GraphicsJob {
             put64(ta, 0x7a8, 1);
             ta[0x7b0] = 1;
             ta[0x7b1] = 1;
-            put64(ta, 0x8a6, HIGH + STAMPS_A as u64 + QUEUE_IDS[0] as u64 * 4);
-            put64(ta, 0x8ae, HIGH + STAMPS_B as u64 + QUEUE_IDS[0] as u64 * 4);
+            put64(ta, 0x8a6, SIGNALS_HIGH + STAMPS_A as u64 + QUEUE_IDS[0] as u64 * 4);
+            put64(ta, 0x8ae, SIGNALS_HIGH + STAMPS_B as u64 + QUEUE_IDS[0] as u64 * 4);
             put32(ta, 0x8b6, 0x100);
             put32(ta, 0x8ba, QUEUE_IDS[0] as u32);
             put64(ta, 0x8c6, (1u64 << 40) | 1);
-            put64(fragment, 0x2140, HIGH + STAMPS_A as u64 + QUEUE_IDS[1] as u64 * 4);
-            put64(fragment, 0x2148, HIGH + STAMPS_B as u64 + QUEUE_IDS[1] as u64 * 4);
+            put64(fragment, 0x2140, SIGNALS_HIGH + STAMPS_A as u64 + QUEUE_IDS[1] as u64 * 4);
+            put64(fragment, 0x2148, SIGNALS_HIGH + STAMPS_B as u64 + QUEUE_IDS[1] as u64 * 4);
             put32(fragment, 0x2150, 0x100);
             put32(fragment, 0x2154, QUEUE_IDS[1] as u32);
             put32(fragment, 0x215c, 0);
@@ -174,7 +181,7 @@ impl M5GraphicsJob {
             fragment[0x222d] = 0;
             Ok(())
         })?;
-        Ok(Self { program, aliases, graph_alias, graph })
+        Ok(Self { program, aliases, graph_alias, graph, signals })
     }
 
     pub(super) fn parameter_descriptor(&self) -> Result<[u32; 4]> {
@@ -197,11 +204,17 @@ impl M5GraphicsJob {
     pub(super) fn publish_context(&mut self) -> Result { self.program.publish() }
 
     pub(super) fn progress(&mut self) -> Result<[u32; 5]> {
-        Ok([self.graph.read_u32(HIGH + SUBMITTED as u64)?,
-            self.graph.read_u32(HIGH + STAMPS_A as u64 + QUEUE_IDS[0] as u64 * 4)?,
-            self.graph.read_u32(HIGH + STAMPS_B as u64 + QUEUE_IDS[0] as u64 * 4)?,
-            self.graph.read_u32(HIGH + STAMPS_A as u64 + QUEUE_IDS[1] as u64 * 4)?,
-            self.graph.read_u32(HIGH + STAMPS_B as u64 + QUEUE_IDS[1] as u64 * 4)?])
+        Ok([self.signals.read_u32(SIGNALS_HIGH + SUBMITTED as u64)?,
+            self.signals.read_u32(SIGNALS_HIGH + STAMPS_A as u64 + QUEUE_IDS[0] as u64 * 4)?,
+            self.signals.read_u32(SIGNALS_HIGH + STAMPS_B as u64 + QUEUE_IDS[0] as u64 * 4)?,
+            self.signals.read_u32(SIGNALS_HIGH + STAMPS_A as u64 + QUEUE_IDS[1] as u64 * 4)?,
+            self.signals.read_u32(SIGNALS_HIGH + STAMPS_B as u64 + QUEUE_IDS[1] as u64 * 4)?])
+    }
+
+    pub(super) fn scheduler_status(&mut self) -> Result<[u32; 2]> {
+        // GFX cleans this 0xc8-byte object after unlinking the finished pair.
+        Ok([self.graph.read_u32(HIGH + SCHEDULER as u64 + 0xc)?,
+            self.graph.read_u32(HIGH + SCHEDULER as u64 + 0x94)?])
     }
 
     pub(super) fn result(&mut self) -> Result<crate::m5_graphics_bundle::TriangleResult> {

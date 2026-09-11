@@ -11,6 +11,9 @@ const ENTRY_HIGH: u64 = 0xffff_fc20_0039_0000;
 const ENTRY_LOW: u64 = 0x70_005f_0000;
 const ENTRY_BYTES: usize = 0x20000;
 const CONTROL: usize = 0x18000;
+// Native TA and fragment channel+0x10 both point to fffffc2000000048.
+// One scheduler belongs to one intrusive list even when two SKSM queues run it.
+pub(super) const JOB_LIST: u64 = HIGH + 0x20000;
 const POINTERS: [usize; 2] = [0x4000, 0xc000];
 const ITEMS: [usize; 2] = [0x8000, 0x10000];
 const CONFIG: [usize; 2] = [0xa800, 0x12800];
@@ -19,6 +22,7 @@ pub(super) struct M5GraphicsQueues {
     aliases: KVec<mmu::KernelMapping>,
     entries: KVec<MappedObject>,
     graph: MappedObject,
+    job_list: MappedObject,
     firmware: FirmwareDataView,
 }
 
@@ -26,6 +30,9 @@ impl M5GraphicsQueues {
     pub(super) fn new(dev: &AsahiDevice, uat: &mmu::Uat, job: &M5GraphicsJob) -> Result<Self> {
         let mut graph = MappedObject::new_wc_at(dev, uat.kernel_vm(), HIGH,
             0x20000, mmu::PROT_FW_PRIV_RW)?;
+        let mut job_list = MappedObject::new_wc_at(dev, uat.kernel_vm(), JOB_LIST,
+            0x4000, mmu::PROT_FW_SHARED_RW)?;
+        job_list.with_bytes_mut(|out| { put64(out, 8, JOB_LIST); Ok(()) })?;
         let mut entries = KVec::new();
         let mut aliases = KVec::new();
         for stage in 0..2 {
@@ -93,13 +100,12 @@ impl M5GraphicsQueues {
                 .map_err(|_| EINVAL)?;
             graph.with_bytes_mut(|out| {
                 let pointers = POINTERS[stage];
-                let list = pointers + 0x100;
                 let queue = id as usize * 0xc0;
                 let reset = g17_submission::encode_m5_25g76_channel_state_reset(
                     g17_submission::M5ChannelStateResetValues {
                         uncached_state: HIGH + pointers as u64,
                         command_pointer_ring: HIGH + ITEMS[stage] as u64,
-                        gpu_va_10: HIGH + list as u64, word_48: 0,
+                        gpu_va_10: JOB_LIST, word_48: 0,
                         gpu_va_9c: HIGH + CONTROL as u64,
                     });
                 out[queue..queue + 0xc0].copy_from_slice(&reset);
@@ -107,7 +113,6 @@ impl M5GraphicsQueues {
                 out[queue + 0x36..queue + 0x38].fill(0xff);
                 put32(out, pointers + 0x50, u32::MAX);
                 put32(out, pointers + 0x60, 0x500);
-                put64(out, list + 8, HIGH + list as u64);
                 out[CONFIG[stage]..CONFIG[stage] + install.len()].copy_from_slice(&install);
                 out[CONFIG[stage] + 0x100..CONFIG[stage] + 0x100 + config.len()].copy_from_slice(&config);
                 out[CONFIG[stage] + 0x200..CONFIG[stage] + 0x200 + kick.len()].copy_from_slice(&kick);
@@ -131,7 +136,7 @@ impl M5GraphicsQueues {
             out[CONTROL + 0x33] = 0xff;
             Ok(())
         })?;
-        Ok(Self { aliases, entries, graph, firmware: FirmwareDataView::new(dev)? })
+        Ok(Self { aliases, entries, graph, job_list, firmware: FirmwareDataView::new(dev)? })
     }
 
     pub(super) fn queue_address(stage: usize) -> Result<u64> {
@@ -146,6 +151,10 @@ impl M5GraphicsQueues {
             }
         }
         Ok(result)
+    }
+
+    pub(super) fn completion_list(&mut self) -> Result<[u64; 2]> {
+        Ok([self.job_list.read_u64(JOB_LIST)?, self.job_list.read_u64(JOB_LIST + 8)?])
     }
 
     pub(super) fn installation_status(&mut self) -> Result<([[u64; 5]; 2], [u64; 2], [u64; 2])> {

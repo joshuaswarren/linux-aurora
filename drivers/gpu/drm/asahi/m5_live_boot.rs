@@ -211,14 +211,17 @@ impl M5Session {
             }
             if self.roles.iter().any(|role| role.state.crashed.load(Ordering::Acquire)) { break; }
             let status = memory.graphics_status()?;
+            let completion = memory.graphics_completion()?;
             if [0, 100, 1000, 5000].contains(&poll) {
                 dev_info!(self.dev.as_ref(), "M5_GRAPHICS poll={} outer/inner/completion={:x?}\n", poll, status);
+                dev_info!(self.dev.as_ref(), "M5_GRAPHICS completion-owner={:x?}\n", completion);
             }
-            if status.0 == [4; 3] && status.1 == [[4; 3]; 2] && status.2[0] == 0 {
+            if status.0 == [4; 3] && status.1 == [[4; 3]; 2]
+                && M5FirmwareMemory::graphics_pair_complete(completion) {
                 let result = memory.graphics_result()?;
                 if result.verified() {
                     dev_info!(self.dev.as_ref(), "M5_GRAPHICS verified native-program TA/fragment pixels={:?}; both queues retired; completion={:x?}\n",
-                        result, status.2);
+                        result, completion);
                     return Ok(());
                 }
                 dev_err!(self.dev.as_ref(), "M5_GRAPHICS retired with incorrect pixels={:?}\n", result);
@@ -229,6 +232,8 @@ impl M5Session {
         for _ in 0..4 { memory.drain_reports(&self.dev)?; }
         dev_err!(self.dev.as_ref(), "M5_GRAPHICS final outer/inner/completion={:x?} pixels={:?}\n",
             memory.graphics_status()?, memory.graphics_result()?);
+        dev_err!(self.dev.as_ref(), "M5_GRAPHICS final completion-owner={:x?}\n",
+            memory.graphics_completion()?);
         Err(EIO)
     }
 

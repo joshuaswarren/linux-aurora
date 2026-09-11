@@ -53,6 +53,7 @@ mod m5_compute;
 mod m5_compute_program;
 mod m5_graphics_bundle;
 mod m5_render;
+mod m5_completion;
 mod m5_sksm;
 mod microseq;
 mod mmu;
