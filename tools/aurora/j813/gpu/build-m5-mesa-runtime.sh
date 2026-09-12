@@ -16,8 +16,9 @@ fi
 ninja -C "$task_build" -j8 \
     src/asahi/vulkan/libvulkan_asahi.so \
     src/gallium/targets/dri/libgallium-26.1.4.so \
+    src/gallium/targets/dril/libdril_dri.so \
     src/glx/libGLX_mesa.so.0.0.0 src/egl/libEGL_mesa.so.0.0.0 \
-    src/gbm/libgbm.so.1.0.0 \
+    src/gbm/libgbm.so.1.0.0 src/gbm/backends/dri/dri_gbm.so \
     src/asahi/lib/asahi-agx-m5-va src/asahi/lib/asahi-agx-va-runtime-hole
 meson test -C "$task_build" --no-rebuild --print-errorlogs \
     asahi-agx-m5-va asahi-agx-va-runtime-hole

@@ -38,6 +38,28 @@ respect exclusive ownership of the M5 proxy/console while it runs.
 
 ## Small Vulkan runtime
 
+For combined GPU/DCP work, build `build-m5-gpu-dcp-candidate.sh` in the isolated
+J813 builder and use `--candidate gpu-dcp-candidate --with-dcp`. This selects
+`t8142-j813-gpu-display.dts`, enables both GPU ASC providers, and loads
+`appledrm live_discovery=1` before Asahi. The runner requires the native
+2560x1664 connector mode before proceeding.
+
+This path requires the combined carrier built from m1n1 `j813` commit
+`c7a06d01ccb5ff35de1bb6fc3b327f78f69ac5f3`, binary SHA256
+`3eb341d34e923abe578de7e670ed948c84fcb6f50084a23dd132898fd3b4b409`.
+Both GPU and display preflights verify the combined carrier, physical
+reservations and DMA mappings. The qualified GPU-only carrier remains a
+separate artifact. The combined boot reached DCP, GPU and Vulkan recording
+readiness in 41.251 seconds, starting from resident m1n1; it excludes reboot
+time. A 65,536/65,536 exact-pixel render then passed with DCP initialized.
+
+For Xorg/GLX, `package-m5-mesa-runtime.py --output NEW_DIRECTORY` packages the
+full userspace build. It includes the DRI GBM backend and DRIL loader shim;
+the DRI entry-point symlinks must target `libdril_dri.so`, not libgallium.
+Set `GBM_BACKENDS_PATH=/opt/m5-mesa/lib/gbm` with the other Mesa overrides.
+The small Vulkan root below is still useful for submission tests and does not
+replace the full desktop root. See `M5_GLX_DCP_PROGRESS.md` for current limits.
+
 Package ABI-compatible inputs from the qualified Mesa and desktop archives:
 
 ```sh
