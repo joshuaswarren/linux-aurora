@@ -50,10 +50,17 @@ scaling (`1d1be0a58ab`). Five compiler core suites pass. The complete backend
 suite passes 296/298 tests; the two failures were reproduced on the unchanged
 baseline (U16 conversion domains and texture export retirement).
 
-The latest real gears probe reports zero geometry encoding refusals. Its next
-fragment failure is a halfword EQ-one compare selecting full-width results.
-Transformed vertex-program layouts are also still rejected. Native reference
-compilation is available for the comparison, but the encoder is not yet added.
+The latest real gears probe has no geometry or fragment instruction-encoding
+refusals. The EQ-one compare is implemented in `a9db953fdcc` and its 167 isel
+checks pass. `83dcceeeaa5` admits the native color vertex layouts (UVS8/9), with
+2815 VDM checks passing, and stops advertising unsupported M5 geometry and
+tessellation shaders. Zink then uses Gallium's triangle conversion for legacy
+quads instead of introducing an unsupported geometry pipeline.
+
+Gears now reaches ordinary indexed triangles. Its current PPP refusal is
+color1/depth1/stencil0, samples1, UVS9, coefficient bindings1/count4, and a full
+256x256 viewport/scissor. Native color/depth reference capture is next. The
+existing no-varying/no-depth PPP profile cannot represent this state.
 
 ## Current failures and remaining phases
 
@@ -119,6 +126,9 @@ target support, safe reusable queues/contexts, and sustained DCP presentation.
 - `logs/m5-dcp-live-power-state-20260912.log`: DCP power timeouts despite active
   DRM state and disabled DPMS after the failure.
 - `logs/m5-fast-loop-20260912-134643/`: recovery RAM boot completed in 49.781 s.
+- `logs/m5-gears-half-eq-one-result-20260912.log`: fragment compilation passes.
+- `logs/m5-gears-ordinary-result-20260912.log`: ordinary triangle draw reaches
+  the color/depth PPP state boundary, without transformed-draw errors.
 
 The complete desktop Mesa runtime before the gears compare/select addition is
 `m5-mesa-xorg-runtime-v2-20260912.tar.gz`, SHA256
