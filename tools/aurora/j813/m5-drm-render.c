@@ -38,6 +38,7 @@ static struct page pages[MAX_PAGES];
 static unsigned count;
 static uint64_t relocation = RELOCATE;
 static int all_reference_pages;
+static const char *generated_fragment;
 
 static void require(int ok, const char *what)
 {
@@ -204,8 +205,9 @@ static void check_pixels(const char *output)
 		require(p && p->cpu, "output page retained");
 		unsigned char *rgba = p->cpu + (address & (PAGE - 1));
 		require(fwrite(rgba, 1, 4, f) == 4, "save GPU output");
-		int fg = abs(rgba[0] - 64) <= 1 && abs(rgba[1] - 128) <= 1 &&
-			abs(rgba[2] - 191) <= 1 && rgba[3] >= 254;
+		int fg = abs(rgba[0] - (generated_fragment ? 191 : 64)) <= 1 &&
+            abs(rgba[1] - (generated_fragment ? 64 : 128)) <= 1 &&
+			abs(rgba[2] - (generated_fragment ? 128 : 191)) <= 1 && rgba[3] >= 254;
 		int bg = abs(rgba[0] - 16) <= 1 && abs(rgba[1] - 16) <= 1 &&
 			abs(rgba[2] - 16) <= 1 && rgba[3] >= 254;
 		foreground += fg; background += bg; unexpected += !fg && !bg;
@@ -229,12 +231,14 @@ int main(int argc, char **argv)
             relocation = 0;
         else if (!strcmp(argv[argc - 1], "--all-reference-pages"))
             all_reference_pages = 1;
+        else if (!strncmp(argv[argc - 1], "--generated-fragment=", 21))
+            generated_fragment = argv[argc - 1] + 21;
         else
             require(0, "unknown render diagnostic option");
         --argc;
     }
     require(argc == 2 || argc == 4,
-        "usage: m5-drm-render bundle [render-node output.rgba] [--native-va] [--all-reference-pages]");
+        "usage: m5-drm-render bundle [render-node output.rgba] [--native-va] [--all-reference-pages] [--generated-fragment=FILE]");
     /* Indirect resources have not all been decoded. Keep their captured
      * addresses intact instead of guessing which data words need relocation.
      * The exact bundle profile still restricts every mapping to its two
@@ -242,9 +246,24 @@ int main(int argc, char **argv)
      */
     require(!all_reference_pages || !relocation,
         "all reference pages require native virtual addresses");
+    require(!generated_fragment || (all_reference_pages && !relocation),
+        "generated fragment requires the qualified complete native-VA resource layout");
     printf("M5_DRM_RENDER_LAYOUT data=%" PRIx64 " relocation=%" PRIx64 "\n",
         SOURCE_BASE + relocation, relocation);
 	load_bundle(argv[1]);
+	if (generated_fragment) {
+        unsigned char shader[60];
+        FILE *f = fopen(generated_fragment, "rb");
+        require(f != NULL, "open Mesa-generated fragment");
+        require(fread(shader, 1, sizeof(shader), f) == sizeof(shader) &&
+                fgetc(f) == EOF && !ferror(f), "Mesa fragment must occupy the qualified 60-byte slot");
+        require(fclose(f) == 0, "close Mesa-generated fragment");
+        unsigned char *slot = source_range(USC_BASE + 0x3c0, sizeof(shader));
+        require(memcmp(slot, shader, sizeof(shader)) != 0,
+                "Mesa colour variant must differ from the captured shader");
+        memcpy(slot, shader, sizeof(shader));
+        puts("M5_DRM_MESA_FRAGMENT_INSTALLED bytes=60 expected_rgb=191,64,128");
+    }
 	relocate_vdm();
 	unsigned selected_pages = 0;
 	for (unsigned i = 0; i < count; ++i)
