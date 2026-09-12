@@ -1,0 +1,10 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Combine the separately qualified GPU and live DCP handoffs. Both preflight
+ * validators must pass before this RAM-only candidate may enter Linux. */
+#include "t8142-j813-display.dts"
+#include "../video/linux-ave/t8142-ave.dtsi"
+#include "t8142-gpu.dtsi"
+
+/* Match the qualified initdata payload: both firmware roles need providers. */
+&gfx_asc { status = "okay"; };
+&gfx1_asc { status = "okay"; };

@@ -53,9 +53,12 @@ if len(selected) > 1:
     raise ValueError('Select one RAM payload flavor')
 flavor = selected[0] if selected else None
 gpu = flavor == 'gpu'
-display = flavor in ('display', 'display-probe')
+gpu_display = '--gpu-display' in sys.argv
+display = flavor in ('display', 'display-probe') or gpu_display
 gpu_rtkit_probe = '--gpu-rtkit-probe' in sys.argv
 gpu_initdata = '--gpu-initdata' in sys.argv
+if gpu_display and (not gpu or not gpu_initdata):
+    raise ValueError('--gpu-display requires --gpu --gpu-initdata')
 if gpu_initdata and (not gpu or gpu_rtkit_probe):
     raise ValueError('--gpu-initdata requires --gpu and excludes --gpu-rtkit-probe')
 if gpu_rtkit_probe and not gpu:
@@ -164,9 +167,9 @@ if result:
     raise RuntimeError(f'Device-tree preparation failed: {result}')
 print('DEVICE_TREE_PREPARED', flush=True)
 if display:
-    display_helpers['verify_display_fdt'](u, p, display_before)
+    display_helpers['verify_display_fdt'](u, p, display_before, integrated_gpu=gpu_display)
 if gpu:
-    gpu_helpers['verify_gpu_fdt'](u, p)
+    gpu_helpers['verify_gpu_fdt'](u, p, combined_display=gpu_display)
 if '--prepare-only' in sys.argv:
     sys.exit(0)
 if source_usb:
