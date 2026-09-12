@@ -7,6 +7,7 @@ use super::{graphics_memory::M5GraphicsMemory, graphics_usc, MappedObject};
 use super::parameter_buffer::{M5ParameterBuffer, BLOCK_BYTES, PAGE_LIST_BYTES, PAGE_COUNT};
 use super::target_memory::M5TargetMemory;
 use crate::{driver::AsahiDevice, g17_render, m5_render, mmu};
+use crate::m5_completion::MAX_GRAPHICS_GENERATION;
 use kernel::prelude::*;
 
 const HIGH: u64 = 0xffff_fc20_c100_0000;
@@ -287,7 +288,7 @@ impl M5GraphicsJob {
     }
 
     fn rebuild_retired_frame(&mut self, generation: u32, clear_reference_output: bool) -> Result {
-        if generation != self.generation + 1 || generation > 64
+        if generation != self.generation + 1 || generation > MAX_GRAPHICS_GENERATION
             || self.scheduler_status()? != [2, 0] {
             return Err(EBUSY);
         }
@@ -323,7 +324,8 @@ impl M5GraphicsJob {
 
     /// Re-encode a retired application's descriptors without replaying its old
     /// command pointers. The current bounded queue retains one VM and target
-    /// shape; neither context replacement nor ring wrapping is admitted here.
+    /// shape. Ring storage can wrap only after complete retirement; the job
+    /// stamp keeps increasing and context replacement remains unsupported.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn prepare_application_frame(
         &mut self, vm: &mmu::Vm, mut p: g17_render::G17pRenderParameters,
@@ -333,7 +335,7 @@ impl M5GraphicsJob {
         if vm.id() != self.program.vm().id() || clusters != 1
             || [p.width, p.height, u32::from(p.layers), u32::from(p.utile_width),
                 u32::from(p.utile_height)] != self.target_shape
-            || generation != self.generation + 1 || generation > 64 {
+            || generation != self.generation + 1 || generation > MAX_GRAPHICS_GENERATION {
             return Err(ENOTSUPP);
         }
         self.target_memory.apply(&mut p);

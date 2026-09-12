@@ -13,11 +13,16 @@ if [[ ! -e "$task_build" ]]; then
     cp -a --reflink=auto "$HOME/j813-gpu-application-compute-build" "$task_build"
 fi
 for task_file in m5_application_compute.rs m5_completion.rs m5_drm.rs m5_queue_probe.rs \
-    m5_graphics_job.rs m5_resources.rs m5_live_boot.rs m5_render_test.rs g17_uapi.rs; do
-    cp "$task_root/linux/drivers/gpu/drm/asahi/$task_file" \
-        "$task_src/drivers/gpu/drm/asahi/$task_file"
+    m5_graphics_job.rs m5_graphics_queues.rs m5_resources.rs m5_live_boot.rs m5_render_test.rs g17_uapi.rs; do
+    cmp -s "$task_root/linux/drivers/gpu/drm/asahi/$task_file" \
+        "$task_src/drivers/gpu/drm/asahi/$task_file" ||
+        cp "$task_root/linux/drivers/gpu/drm/asahi/$task_file" \
+            "$task_src/drivers/gpu/drm/asahi/$task_file"
 done
-cp "$task_root"/linux/drivers/gpu/drm/apple/*.[ch] "$task_src/drivers/gpu/drm/apple/"
+for task_file in "$task_root"/linux/drivers/gpu/drm/apple/*.[ch]; do
+    task_destination="$task_src/drivers/gpu/drm/apple/$(basename "$task_file")"
+    cmp -s "$task_file" "$task_destination" || cp "$task_file" "$task_destination"
+done
 "$task_src/scripts/config" --file "$task_build/.config" \
     --module DRM_APPLE --enable BACKLIGHT_CLASS_DEVICE --enable DRM_APPLE_DEBUG \
     --enable APPLE_MAILBOX

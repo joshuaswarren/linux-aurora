@@ -7,6 +7,7 @@ use super::{validate_provider, ExpectedProvider, G17PAscwrapV6Role,
 use crate::{driver::AsahiDevice, g17_resources::m5::M5FirmwareMemory,
     g17_rtkit, mmu, regs};
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use crate::m5_completion::{graphics_pointer_head, MAX_GRAPHICS_GENERATION};
 use kernel::{device::Core, macros::vtable, platform, prelude::*,
     soc::apple::rtkit, sync::{aref::ARef, Arc}, time::{delay::fsleep, Delta}};
 
@@ -594,8 +595,8 @@ impl M5Runtime {
         usc_required: [u64; 2],
     ) -> Result<crate::m5_completion::M5GraphicsCompletion> {
         if !self.application || self.is_crashed() { return Err(ENODEV); }
-        // The bounded transport has no qualified ring-wrap path yet.
-        if self.application_generation >= 64 { return Err(EBUSY); }
+        // Reuse retired ring storage while keeping completion stamps unique.
+        if self.application_generation >= MAX_GRAPHICS_GENERATION { return Err(EBUSY); }
         let generation = self.application_generation + 1;
         let session = self.session.as_deref_mut().ok_or(EIO)?;
         if generation == 1 {
@@ -623,7 +624,7 @@ impl M5Runtime {
                 let (outer, inner, _) = memory.graphics_status()?;
                 let completion = memory.graphics_completion()?;
                 if outer == [memory.application_outer_head(); 3]
-                    && inner == [[1 + generation * 3; 3]; 2]
+                    && inner == [[graphics_pointer_head(generation); 3]; 2]
                     && M5FirmwareMemory::graphics_pair_complete(completion, generation) {
                     dev_info!(session.dev.as_ref(),
                         "M5_APPLICATION generation={} completed; both queues retired\n",

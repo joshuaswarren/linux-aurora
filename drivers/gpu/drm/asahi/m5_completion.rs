@@ -6,6 +6,15 @@
 //! not a firmware-decremented pending count. 0x17a68/0x17ae0 then write the
 //! first stamp pointer and 0x17b98 publishes the corresponding event mask.
 
+// The 32-bit completion value reserves its low byte. Stop before it wraps;
+// storage-ring wrap is independent of this monotonically increasing stamp.
+pub(crate) const MAX_GRAPHICS_GENERATION: u32 = 0x00ff_ffff;
+pub(crate) const GRAPHICS_POINTER_COUNT: u32 = 0x500;
+
+pub(crate) const fn graphics_pointer_head(generation: u32) -> u32 {
+    (1 + generation * 3) % GRAPHICS_POINTER_COUNT
+}
+
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
 pub(crate) struct M5GraphicsCompletion {
     pub(crate) submitted: u32,
@@ -113,6 +122,19 @@ mod tests {
             .pair_complete_at(LIST, 0));
         assert!(!M5GraphicsCompletion { stamps: [0x101; 2], ..finished() }
             .pair_complete_at(LIST, 0x101));
+    }
+
+    #[test]
+    fn ring_wrap_does_not_wrap_completion_identity() {
+        // Three records cross the 1280-entry pointer ring on frame427.
+        assert_eq!(graphics_pointer_head(426), 1279);
+        assert_eq!(graphics_pointer_head(427), 2);
+        assert_eq!(graphics_pointer_head(1280), 1);
+        for frame in [127, 128, 255, 256, 427, 1280, MAX_GRAPHICS_GENERATION] {
+            let current = M5GraphicsCompletion { stamps: [frame * 0x100; 2], ..finished() };
+            assert!(current.pair_complete_at(LIST, frame * 0x100));
+            assert!(!current.pair_complete_at(LIST, (frame - 1) * 0x100));
+        }
     }
 
     #[test]

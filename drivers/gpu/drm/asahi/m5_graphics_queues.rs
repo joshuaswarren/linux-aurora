@@ -4,6 +4,8 @@
 use super::{graphics_job::{M5GraphicsJob, PB_HARDWARE_ID, QUEUE_IDS}, graphics_usc,
     queue_probe::FirmwareDataView, MappedObject};
 use crate::{driver::AsahiDevice, g17_submission, m5_channel, m5_sksm, mmu};
+use crate::m5_completion::{graphics_pointer_head, GRAPHICS_POINTER_COUNT,
+    MAX_GRAPHICS_GENERATION};
 use kernel::prelude::*;
 
 const HIGH: u64 = 0xffff_fc20_c000_0000;
@@ -125,7 +127,7 @@ impl M5GraphicsQueues {
 
     fn prepare_entry(job: &M5GraphicsJob, stage: usize, generation: u32)
         -> Result<m5_sksm::PreparedM5SksmEntry> {
-        if !(1..=64).contains(&generation) { return Err(EINVAL); }
+        if !(1..=MAX_GRAPHICS_GENERATION).contains(&generation) { return Err(EINVAL); }
         let id = *QUEUE_IDS.get(stage).ok_or(EINVAL)?;
         let [descriptor, descriptor_low] = job.descriptor_addresses(stage)?;
         let stamp = generation as u64;
@@ -154,8 +156,8 @@ impl M5GraphicsQueues {
     }
 
     pub(super) fn publish_next_draw(&mut self, job: &M5GraphicsJob, generation: u32) -> Result {
-        if !(2..=64).contains(&generation) { return Err(EINVAL); }
-        let previous_head = 1 + (generation - 1) * 3;
+        if !(2..=MAX_GRAPHICS_GENERATION).contains(&generation) { return Err(EINVAL); }
+        let previous_head = graphics_pointer_head(generation - 1);
         if self.counters()? != [[previous_head; 3]; 2] || !self.installed()?
             || self.completion_list()? != [0, JOB_LIST] { return Err(EBUSY); }
         for stage in 0..2 {
@@ -163,7 +165,11 @@ impl M5GraphicsQueues {
             self.entries[stage].with_bytes_mut(|out| {
                 let offset = prepared.offset as usize;
                 let slot = &mut out[offset..offset + prepared.bytes.len()];
-                if slot.iter().any(|byte| *byte != 0) { return Err(EBUSY); }
+                // Every preceding job has retired, including the prior user
+                // of this 256-entry SKSM slot. Preserve the first-use check.
+                if generation < 256 && slot.iter().any(|byte| *byte != 0) {
+                    return Err(EBUSY);
+                }
                 slot.copy_from_slice(&prepared.bytes);
                 Ok(())
             })?;
@@ -178,15 +184,20 @@ impl M5GraphicsQueues {
                     HIGH + CONFIG[stage] as u64 + 0x100,
                     HIGH + CONFIG[stage] as u64 + 0x200];
                 for (index, address) in addresses.into_iter().enumerate() {
-                    let offset = ITEMS[stage] + (previous_head as usize + index) * 8;
-                    if out[offset..offset + 8].iter().any(|byte| *byte != 0) { return Err(EBUSY); }
+                    let absolute = 1 + (generation as usize - 1) * 3 + index;
+                    let offset = ITEMS[stage] + (absolute % GRAPHICS_POINTER_COUNT as usize) * 8;
+                    if absolute < GRAPHICS_POINTER_COUNT as usize
+                        && out[offset..offset + 8].iter().any(|byte| *byte != 0) {
+                        return Err(EBUSY);
+                    }
                     put64(out, offset, address);
                 }
                 Ok(())
             })?;
         }
         for pointers in POINTERS {
-            self.graph.write_u32(HIGH + pointers as u64 + 0x40, previous_head + 3)?;
+            self.graph.write_u32(HIGH + pointers as u64 + 0x40,
+                graphics_pointer_head(generation))?;
         }
         Ok(())
     }
