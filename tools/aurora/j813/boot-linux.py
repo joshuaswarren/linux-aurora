@@ -5,18 +5,42 @@ from pathlib import Path
 import runpy
 import sys
 import time
+import hashlib
+import plistlib
+import subprocess
 
 root = Path(__file__).resolve().parent
-os.environ['M1N1DEVICE'] = '/dev/cu.kis-01100000-ch-0'
+usb_args = [arg.split('=', 1)[1] for arg in sys.argv if arg.startswith('--j813-source-usb=')]
+if len(usb_args) > 1:
+    raise ValueError('Specify one M5 USB source')
+source_usb = usb_args[0] if usb_args else None
+if source_usb:
+    devices = plistlib.loads(subprocess.check_output(
+        ['ioreg', '-a', '-l', '-r', '-c', 'IOUSBHostDevice']))
+    ports = set()
+    def collect_ports(node):
+        if 'IOCalloutDevice' in node:
+            ports.add(node['IOCalloutDevice'])
+        for child in node.get('IORegistryEntryChildren', []):
+            collect_ports(child)
+    for node in devices:
+        if (node.get('locationID') == 0x01100000 and
+                node.get('idVendor') == 0x1209 and node.get('idProduct') == 0x316d):
+            collect_ports(node)
+    if source_usb not in ports:
+        raise RuntimeError('Source USB port is not the M5 RID1 m1n1 device')
+os.environ['M1N1DEVICE'] = source_usb or '/dev/cu.kis-01100000-ch-0'
 os.environ['M1N1TIMEOUT'] = '30'
 sys.path.insert(0, str(root / 'm1n1/proxyclient'))
-runpy.run_path(str(root / 'kis-transport.py'))['install']()
+if not source_usb:
+    runpy.run_path(str(root / 'kis-transport.py'))['install']()
 from m1n1.proxy import UartInterface, M1N1Proxy
 from m1n1.proxyutils import ProxyUtils, bootstrap_port
 
 iface = UartInterface()
 p = M1N1Proxy(iface)
 assert p.get_chipid() == 0x8142, 'Refusing non-M5 target'
+assert int(p.iodev_whoami()) in ((4, 5) if source_usb else (1,)), 'Wrong M5 transport'
 bootstrap_port(iface, p)
 u = ProxyUtils(p)
 assert u.adt.model == 'Mac17,3'
@@ -46,6 +70,14 @@ if flavor:
                   'video/native' if video else 'desktop' if flavor == 'input' else flavor)
 if gpu_rtkit_probe or gpu_initdata:
     artifacts /= 'rtkit-probe'
+candidate_args = [arg.split('=', 1)[1] for arg in sys.argv if arg.startswith('--gpu-candidate=')]
+if candidate_args:
+    if len(candidate_args) != 1 or not gpu_initdata:
+        raise ValueError('--gpu-candidate=NAME requires --gpu --gpu-initdata')
+    candidate = candidate_args[0]
+    if not candidate or candidate in ('.', '..') or Path(candidate).name != candidate:
+        raise ValueError('GPU candidate must name one directory under artifacts/gpu/native')
+    artifacts = root / 'artifacts/gpu/native' / candidate
 kernel = (artifacts / 'Image').read_bytes()
 initrd = (artifacts / 'initramfs.cpio.gz').read_bytes()
 dtb_dir = root / 'artifacts/wifi' if flavor == 'bluetooth' else artifacts
@@ -88,7 +120,14 @@ for label, address, data in [('Image', kernel_addr, kernel),
                              ('U-Boot', uboot_addr, uboot),
                              ('DTB', dtb_addr, dtb)]:
     print(f'LOAD {label} {address:#x} {len(data)} bytes', flush=True)
+    transfer_start = time.monotonic()
     u.compressed_writemem(address, data, True)
+    if source_usb:
+        digest = hashlib.sha256(iface.readmem(address, len(data))).hexdigest()
+        if digest != hashlib.sha256(data).hexdigest():
+            raise RuntimeError(f'M5 USB readback mismatch: {label}')
+        print(f'USB_READBACK_OK {label} sha256={digest}', flush=True)
+    print(f'LOAD_SECONDS {label} {time.monotonic() - transfer_start:.3f}', flush=True)
     p.dc_cvau(address, len(data))
     p.ic_ivau(address, len(data))
 
@@ -130,6 +169,25 @@ if gpu:
     gpu_helpers['verify_gpu_fdt'](u, p)
 if '--prepare-only' in sys.argv:
     sys.exit(0)
+if source_usb:
+    # Keep the fast upload transport separate from the console, which survives
+    # the U-Boot/Linux handoff only on KIS. The prepared RAM and kboot state
+    # remain owned by m1n1 while the scoped USB debug connection changes.
+    iface.dev.close()
+    runpy.run_path(str(root / 'hv/host_auth.py'))['run_scoped_vdm'](['debugusb'], check=True)
+    os.environ['M1N1DEVICE'] = '/dev/cu.kis-01100000-ch-0'
+    runpy.run_path(str(root / 'kis-transport.py'))['install']()
+    for attempt in range(50):
+        if Path(os.environ['M1N1DEVICE']).exists():
+            break
+        time.sleep(0.1)
+    iface = UartInterface()
+    p = M1N1Proxy(iface)
+    assert p.get_chipid() == 0x8142 and int(p.iodev_whoami()) == 1
+    bootstrap_port(iface, p)
+    u = ProxyUtils(p)
+    assert u.adt.model == 'Mac17,3'
+    print('M5_FAST_UPLOAD_KIS_HANDOFF_READY', flush=True)
 u.msr('DAIF', 0xc0)
 print('HANDOFF_TO_UBOOT', flush=True)
 p.kboot_boot(uboot_addr)
