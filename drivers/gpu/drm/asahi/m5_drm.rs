@@ -175,10 +175,16 @@ impl queue::Queue for M5Queue {
                 payload, vertex_attachments, fragment_attachments, ..
             } = command else { return Err(ENOTSUPP); };
             admit_reference_render(&payload)?;
+            g17_uapi::validate_m5_reference_depth(&payload, &address_space)
+                .map_err(|_| ENOTSUPP)?;
             let (parameters, mut controls) = M5FirmwareMemory::reference_render_profile();
-            let translated = g17_uapi::translate_render_command(payload,
+            let mut translated = g17_uapi::translate_render_command(payload,
                 vertex_attachments, fragment_attachments, self.window, &address_space,
                 g17_uapi::RenderInternalState { parameters }).map_err(|_| EINVAL)?;
+            // Native single-layer M5 ZLS does not encode an array stride.
+            // The full data/metadata ranges were validated above.
+            translated.parameters.depth_stride = 0;
+            translated.parameters.depth_aux_stride = 0;
             // M5's second store-program pair refers to the same EOT program
             // in the admitted native profile, with caller-owned program VAs.
             controls.store_pipeline_2 = translated.parameters.store_pipeline;
@@ -204,9 +210,8 @@ fn admit_reference_render(command: &g17_uapi::UapiRenderCommand) -> Result {
         command.fragment_timestamps.start, command.fragment_timestamps.end];
     if command.width != 256 || command.height != 256 || command.layers != 1
         || command.utile_width != 32 || command.utile_height != 32 || command.samples != 1
-        || command.depth.base != 0 || command.depth.compression_base != 0
         || command.stencil.base != 0 || command.stencil.compression_base != 0
-        || command.zls_control != 0 || command.sampler_heap != 0 || command.sampler_count != 0
+        || command.sampler_heap != 0 || command.sampler_count != 0
         || command.occlusion_query_base != 0
         || timestamps.iter().any(|timestamp| timestamp.handle != 0 || timestamp.offset != 0) {
         return Err(ENOTSUPP);

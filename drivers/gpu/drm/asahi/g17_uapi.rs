@@ -726,6 +726,45 @@ fn validate_zls<A: GpuAddressSpace>(
     Ok(())
 }
 
+/// Bounded M5 D32 clear/store envelope, alongside the original color-only
+/// profile. Native 25G76 supplies ff00ff dimensions and 80044 with compression;
+/// bits2/6 select compression, while bit19 stores the depth plane. Geometry,
+/// stencil absence, and application programs are checked by the M5 caller.
+pub(crate) fn validate_m5_reference_depth<A: GpuAddressSpace>(
+    command: &UapiRenderCommand,
+    address_space: &A,
+) -> Result<(), UapiTranslateError> {
+    let depth = command.depth;
+    if depth.base == 0 {
+        return if depth.compression_base == 0 && depth.stride == 0
+            && depth.compression_stride == 0 && command.zls_control == 0
+            && command.depth_dimensions == 0 {
+            Ok(())
+        } else {
+            Err(UapiTranslateError::ZlsFields)
+        };
+    }
+    let compressed = depth.compression_base != 0;
+    let expected_control = if compressed { 0x80044 } else { 0x80000 };
+    if command.width != 256 || command.height != 256 || command.layers != 1
+        || command.depth_dimensions != 0x00ff00ff
+        || command.zls_control != expected_control
+        || command.depth_clear != 0x3f800000
+        || depth.base & 0x3fff != 0 || depth.compression_base & 0x3fff != 0
+        || (depth.stride != 0 && depth.stride != 0x3c001)
+        || depth.compression_stride & 0x3fff != 0
+        || (!compressed && depth.compression_stride != 0) {
+        return Err(UapiTranslateError::ZlsFields);
+    }
+    // Validate the entire 256x256 D32 surface, not just its first byte.
+    require_range(address_space, depth.base, 0x40000, GpuAccess::ReadWrite)?;
+    if compressed {
+        require_range(address_space, depth.compression_base, 0x4000,
+            GpuAccess::ReadWrite)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn translate_render_command<A: GpuAddressSpace>(
     command: UapiRenderCommand,
     vertex_attachments: UapiAttachmentList,
@@ -1222,6 +1261,56 @@ mod tests {
             record_b: 0xffff_fc20_0158_0000,
             zero: 0xffff_fc20_0168_0000,
         }
+    }
+
+    #[test]
+    fn m5_d32_envelope_rejects_wrong_layout_and_incomplete_backing() {
+        let mut parser = UapiCommandParser::new(&RENDER_FIXTURE);
+        let ParsedHardwareCommand::Render { mut payload, .. } =
+            parser.next_hardware().unwrap().unwrap() else { panic!("not render") };
+        payload.width = 256;
+        payload.height = 256;
+        assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace), Ok(()));
+        payload.depth_dimensions = 0x00ff00ff;
+        assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace),
+            Err(UapiTranslateError::ZlsFields));
+        payload.depth.base = 0x10000;
+        payload.depth.stride = 0x3c001;
+        payload.zls_control = 0x80000;
+        payload.depth_clear = 0x3f800000;
+        assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace), Ok(()));
+        payload.depth.compression_base = 0x60000;
+        payload.zls_control = 0x80044;
+        assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace), Ok(()));
+        let valid = payload;
+        // The real gears command formerly used G17P's 15-bit dimensions.
+        payload.depth_dimensions = 0x007f80ff;
+        assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace),
+            Err(UapiTranslateError::ZlsFields));
+        payload = valid;
+        payload.depth.compression_base = 0;
+        assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace),
+            Err(UapiTranslateError::ZlsFields));
+        payload = valid;
+        payload.depth.base = 0x1fc000; // First byte mapped, remainder absent.
+        assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace),
+            Err(UapiTranslateError::AddressRange));
+        payload = valid;
+        payload.depth.compression_base = 0x200000;
+        assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace),
+            Err(UapiTranslateError::AddressRange));
+        payload = valid;
+        payload.zls_control |= 0x8000; // Load is outside the initial clear profile.
+        assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace),
+            Err(UapiTranslateError::ZlsFields));
+        payload = valid;
+        payload.layers = 2;
+        assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace),
+            Err(UapiTranslateError::ZlsFields));
+        payload = valid;
+        payload.depth_clear = 0;
+        assert_eq!(validate_m5_reference_depth(&payload, &TestAddressSpace),
+            Err(UapiTranslateError::ZlsFields));
     }
 
     #[test]
