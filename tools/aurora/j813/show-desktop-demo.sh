@@ -54,7 +54,7 @@ cpu_single_graph = true
 graph_symbol_cpu = "block"
 EOF
         fi
-        exec btop --config "$task_config"
+        exec btop --force-utf --config "$task_config"
         ;;
     '') ;;
     *) exit 2 ;;
