@@ -11,6 +11,7 @@
 
 use super::MappedObject;
 use crate::{driver::AsahiDevice, g17_initdata as init, mmu};
+use crate::m5_completion::{graphics_pointer_head, MAX_GRAPHICS_GENERATION};
 use core::sync::atomic::{fence, Ordering};
 use kernel::prelude::*;
 use kernel::sync::Arc;
@@ -451,7 +452,7 @@ impl M5FirmwareMemory {
         completion: crate::m5_completion::M5GraphicsCompletion,
         generation: u32,
     ) -> bool {
-        (1..=64).contains(&generation)
+        (1..=MAX_GRAPHICS_GENERATION).contains(&generation)
             && completion.pair_complete_at(graphics_queues::JOB_LIST, generation * 0x100)
     }
 
@@ -509,10 +510,11 @@ impl M5FirmwareMemory {
         controls: crate::m5_render::M5RenderControls, clusters: u32,
         usc_required: [u64; 2], generation: u32,
     ) -> Result {
-        if !(2..=64).contains(&generation) { return Err(EINVAL); }
+        if !(2..=MAX_GRAPHICS_GENERATION).contains(&generation) { return Err(EINVAL); }
         let previous = generation - 1;
         let (outer, inner, _) = self.graphics_status()?;
-        if outer != [self.application_outer_head; 3] || inner != [[1 + previous * 3; 3]; 2]
+        if outer != [self.application_outer_head; 3]
+            || inner != [[graphics_pointer_head(previous); 3]; 2]
             || !Self::graphics_pair_complete(self.graphics_completion()?, previous) {
             return Err(EBUSY);
         }
@@ -522,22 +524,20 @@ impl M5FirmwareMemory {
         queues.publish_next_draw(job, generation)?;
         self.graphics_stamp_flags = 0;
         self.publish_graphics_records(self.application_outer_head as usize,
-            (1 + generation * 3) as u16)
+            graphics_pointer_head(generation) as u16)
     }
 
     fn publish_graphics_records(&mut self, outer_index: usize, inner_head: u16) -> Result {
-        // 256 outer entries; do not wrap or replace a previously used slot.
-        if outer_index + 2 > 256 { return Err(EBUSY); }
+        // Only recycle storage after every outer consumer reaches the old
+        // producer. The application caller also requires paired retirement.
+        if outer_index >= 256 || self.graphics_status()?.0 != [outer_index as u32; 3] {
+            return Err(EBUSY);
+        }
         self.shared.with_bytes_mut(|out| {
             for stage in 0..2 {
-                let offset = init::WORK_RING_BUNDLE_OFFSETS[8] + (outer_index + stage) * 24;
-                if out[offset..offset + 24].iter().any(|byte| *byte != 0) {
-                    return Err(EBUSY);
-                }
-            }
-            for stage in 0..2 {
-                let offset = init::WORK_RING_BUNDLE_OFFSETS[8] + (outer_index + stage) * 24;
+                let offset = init::WORK_RING_BUNDLE_OFFSETS[8] + ((outer_index + stage) % 256) * 24;
                 let record = &mut out[offset..offset + 24];
+                record.fill(0);
                 let address = graphics_queues::M5GraphicsQueues::queue_address(stage)?;
                 record[8..16].copy_from_slice(&address.to_le_bytes());
                 record[16..20].copy_from_slice(&2u32.to_le_bytes());
@@ -550,8 +550,8 @@ impl M5FirmwareMemory {
         fence(Ordering::SeqCst);
         // Both stage-tagged SKSM queues travel through the CL_2 command ring.
         let producer = init::WORK_STATE_GRID_OFFSETS[8] + 2 * init::CHANNEL_STATE_SPACING;
-        self.private.write_u32(PRIVATE_BASE + producer as u64, (outer_index + 2) as u32)?;
-        self.application_outer_head = (outer_index + 2) as u32;
+        self.private.write_u32(PRIVATE_BASE + producer as u64, ((outer_index + 2) % 256) as u32)?;
+        self.application_outer_head = ((outer_index + 2) % 256) as u32;
         fence(Ordering::SeqCst);
         Ok(())
     }
