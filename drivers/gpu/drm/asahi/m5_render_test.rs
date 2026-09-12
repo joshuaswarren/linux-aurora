@@ -581,6 +581,38 @@ fn native_m5_register_lists_match_every_write() {
     assert_eq!(mismatches, 0);
 }
 
+#[test]
+fn native_m5_d32_clear_store_registers_match_color_depth_capture() {
+    // The 25G76 RGB-near/white-far reference passed LESS/write occlusion:
+    // 60928 independently checked output pixels, zero mismatches. Its depth
+    // allocation adds sixteen 16K data pages and one compression page.
+    let (mut p, controls) = reference();
+    p.depth_dimensions = 0x00ff00ff;
+    p.depth_flags = 0x80044;
+    p.depth_buffer = 0x100000c8000;
+    p.depth_aux_buffer = 0x10000108000;
+    let actual = build_fragment_registers(&p, &controls).unwrap();
+    let expected = [
+        (0x15321, 0x00ff00ff), (0x15301, 0x3f800000),
+        (0x15309, 0x300), (0x15311, 0), (0x15319, 0x80044),
+        (0x15329, 0x100000c8000), (0x15331, 0x100000c8000),
+        (0x15339, 0), (0x15341, 0), (0x15401, 0), (0x15421, 0),
+        (0x15409, 0), (0x15429, 0),
+        (0x153c1, 0x10000108000), (0x153c9, 0x10000108000),
+        (0x15411, 0), (0x15431, 0),
+    ];
+    for (register, native_value) in expected {
+        assert_eq!(value(&actual, register), Ok(native_value),
+            "native M5 depth register {register:#x}");
+    }
+    // Depth fields must not change the other state of the existing reference.
+    for (register, baseline) in actual.iter().zip(FRAGMENT) {
+        if !expected.iter().any(|(number, _)| *number == register.number) {
+            assert_eq!((register.number, register.value), baseline);
+        }
+    }
+}
+
 const PARTIAL_STORE: [(u32, u64); 18] = [
     (0x15379, 0x0000000000000000),
     (0x15381, 0x0000010000170400),

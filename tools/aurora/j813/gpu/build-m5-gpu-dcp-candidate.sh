@@ -13,7 +13,7 @@ if [[ ! -e "$task_build" ]]; then
     cp -a --reflink=auto "$HOME/j813-gpu-application-compute-build" "$task_build"
 fi
 for task_file in m5_application_compute.rs m5_completion.rs m5_drm.rs m5_queue_probe.rs \
-    m5_graphics_job.rs m5_resources.rs m5_live_boot.rs; do
+    m5_graphics_job.rs m5_resources.rs m5_live_boot.rs m5_render_test.rs g17_uapi.rs; do
     cp "$task_root/linux/drivers/gpu/drm/asahi/$task_file" \
         "$task_src/drivers/gpu/drm/asahi/$task_file"
 done
