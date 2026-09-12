@@ -1,0 +1,1 @@
+{"pipelines":{"render_pipelines":[{"vertex_function":"m5_color_vertex","fragment_function":"m5_color_fragment","color_attachments":[{"pixel_format":"RGBA8Unorm"}]},{"vertex_function":"m5_color_point_vertex","fragment_function":"m5_color_point_fragment","color_attachments":[{"pixel_format":"RGBA8Unorm"}]}]}}
