@@ -10,8 +10,9 @@
 - A linear GBM buffer registers with DCP using both its direct GEM handle and
   its imported DMA-BUF handle. `m5-gbm-dcp-smoke.c` tests this without GPU
   rendering or changing scanout.
-- The real 256x256 `glxgears` frontend creates a Zink context and reaches its
-  vertex shader compiler. All these Xorg/GLX probes set
+- The real 256x256 `glxgears` frontend creates a Zink context and now gets past
+  its geometry arithmetic encoding failures. Fragment compilation and graphics
+  pipeline state remain blocked. All these Xorg/GLX probes set
   `HK_M5_ABORT_BEFORE_IOCTL=1`; no moving GPU gears result is claimed.
 
 ## Fixes and validation
@@ -41,7 +42,44 @@ comparisons, exchanged alternatives and upper-register/wait fields. Compiler
 suites `agx3_alu_core`, `agx3_isel_core`, `agx3_select_core` pass. Hardware
 execution of these new shader forms remains unqualified.
 
+Subsequent native-backed compiler changes on Mesa `j813` cover saturation,
+halfword EQ-zero selection, population counts, full-width address addition
+lowered into carry arithmetic, and floating operations with native dependency
+waits and operand lifetimes. The latest change handles constant floating-point
+scaling (`1d1be0a58ab`). Five compiler core suites pass. The complete backend
+suite passes 296/298 tests; the two failures were reproduced on the unchanged
+baseline (U16 conversion domains and texture export retirement).
+
+The latest real gears probe reports zero geometry encoding refusals. Its next
+fragment failure is a halfword EQ-one compare selecting full-width results.
+Transformed vertex-program layouts are also still rejected. Native reference
+compilation is available for the comparison, but the encoder is not yet added.
+
 ## Current failures and remaining phases
+
+A later ShadowFB/XFCE boot also lost its physical display after a display power
+cycle. The first DCP power-on succeeded; shutdown then reported
+`setPowerState(0) timeout 1000 ms`, and the next power-on reported
+`wait for power timed out, connector will be broken`. The user confirmed a black
+panel even while Xorg screenshots contained a desktop and DRM reported an active
+CRTC. No application GPU command had been submitted in that boot. This is a
+separate observed failure from the earlier glamor DART fault below; a shared
+cause has not been established.
+
+Recovery starts Xorg with `-s 0 -dpms` and disables XFCE blanking. It also binds
+devpts into the desktop root after mounting it, so terminal PTYs are available.
+Disabling power saving avoids the failing path during bring-up; it does not
+qualify DCP suspend/resume. A RAM reboot is currently required after the DCP
+power command channel stops responding. After the 49.781-second recovery boot,
+the user confirmed the desktop was visible and the pointer moved. The terminal
+also opened successfully, including a PTY allocation as the desktop user.
+
+`start-m5-shadow-glx.sh` and `start-m5-shadow-xfce.sh` preserve this recovery
+configuration. They expect the existing J813 RAM workbench, `/desktop` with its
+shared `/dev`, `/proc`, `/sys` and `/run` mounts, and the matched desktop Mesa
+runtime. Start the X server once, then XFCE; the scripts reject duplicate
+instances. The X server keeps `HK_M5_ABORT_BEFORE_IOCTL=1`, and XFCE remains
+software rendered. They do not recover a DCP command channel already wedged.
 
 After several bounded Xorg probes, the next display run caused repeated DCP
 DART write-protection faults and lost the serial console. The submission gate
@@ -75,6 +113,12 @@ target support, safe reusable queues/contexts, and sustained DCP presentation.
 - `logs/m5-gears-fsel-tests-20260912.log`: three compiler suites pass.
 - `logs/m5-gears-fsel-probe-launch-20260912.log`: DCP fault onset; this run
   does not establish whether the updated gears shader passed on target.
+- `logs/m5-gears-scale-unique-boundaries-20260912.log`: fragment and pipeline
+  failures after the geometry arithmetic fixes.
+- `logs/m5-gears-scale-final-backend-tests-20260912.log`: 296/298 backend tests.
+- `logs/m5-dcp-live-power-state-20260912.log`: DCP power timeouts despite active
+  DRM state and disabled DPMS after the failure.
+- `logs/m5-fast-loop-20260912-134643/`: recovery RAM boot completed in 49.781 s.
 
 The complete desktop Mesa runtime before the gears compare/select addition is
 `m5-mesa-xorg-runtime-v2-20260912.tar.gz`, SHA256
