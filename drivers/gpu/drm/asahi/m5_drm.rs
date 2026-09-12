@@ -185,6 +185,10 @@ impl queue::Queue for M5Queue {
             // The full data/metadata ranges were validated above.
             translated.parameters.depth_stride = 0;
             translated.parameters.depth_aux_stride = 0;
+            // Native 25G76 indexed draws use 15021=0x10c000. The reference
+            // triangle's low bit causes fragment recovery with larger
+            // indexed overdraw, even after the tiling stage completes.
+            translated.parameters.aux_fb_flags = 0x10c000;
             // M5's second store-program pair refers to the same EOT program
             // in the admitted native profile, with caller-owned program VAs.
             controls.store_pipeline_2 = translated.parameters.store_pipeline;
