@@ -46,9 +46,10 @@ def prepare_display(u, p):
     return state
 
 
-def verify_display_fdt(u, p, before):
+def verify_display_fdt(u, p, before, integrated_gpu=False):
     """Read the exact prepared FDT, using symbols from the verified RAM image."""
-    build = ROOT / 'm1n1/build-j813-dcp'
+    build = (ROOT / 'hv/publish-j813/build-j813-dcp' if integrated_gpu else
+             ROOT / 'm1n1/build-j813-dcp')
     symbols = {}
     listing = subprocess.check_output(
         ['/opt/homebrew/opt/llvm/bin/llvm-nm', '--defined-only', str(build / 'm1n1-raw.elf')],
@@ -61,6 +62,10 @@ def verify_display_fdt(u, p, before):
     require(set(symbols) == {'_base', '_end', 'dt', 'kboot_prepare_dt'} and symbols['_base'] == 0,
             'Unexpected loader symbol layout')
     image = (build / 'm1n1.bin').read_bytes()
+    if integrated_gpu:
+        require(hashlib.sha256(image).hexdigest() ==
+                '3eb341d34e923abe578de7e670ed948c84fcb6f50084a23dd132898fd3b4b409',
+                'Integrated carrier differs from the pinned combined candidate')
     offset = symbols['kboot_prepare_dt']
     require(u.iface.readmem(u.base + offset, 64) == image[offset:offset + 64],
             'Running loader does not match the DCP candidate code')

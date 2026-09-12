@@ -42,13 +42,17 @@ def validate_exported_regions(tree, regions):
             raise ValueError('Prepared GPU memory-region points to the wrong reservation')
 
 
-def verify_gpu_fdt(u, p):
+def verify_gpu_fdt(u, p, combined_display=False):
     """Read the prepared FDT from the qualified GPU RAM carrier's dt symbol."""
     root = Path(__file__).resolve().parents[1]
-    build = root.parent / 'j813-m1n1-integrate/build'
+    build = (root / 'hv/publish-j813/build-j813-dcp' if combined_display else
+             root.parent / 'j813-m1n1-integrate/build')
     image = (build / 'm1n1.bin').read_bytes()
-    if hashlib.sha256(image).hexdigest() != '768edbffc67e30ac3bb608b8245a468ab1e20ca89eb740294db16cc46a2bc5cf':
-        raise ValueError('GPU carrier differs from the hardware-qualified image')
+    expected = ('3eb341d34e923abe578de7e670ed948c84fcb6f50084a23dd132898fd3b4b409'
+                if combined_display else
+                '768edbffc67e30ac3bb608b8245a468ab1e20ca89eb740294db16cc46a2bc5cf')
+    if hashlib.sha256(image).hexdigest() != expected:
+        raise ValueError('GPU carrier differs from the selected pinned image')
     listing = subprocess.check_output(['/opt/homebrew/opt/llvm/bin/llvm-nm',
         '--defined-only', str(build / 'm1n1-raw.elf')], text=True)
     symbols = {}
