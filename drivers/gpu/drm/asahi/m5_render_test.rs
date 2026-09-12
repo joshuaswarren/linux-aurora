@@ -31,6 +31,23 @@ fn read_u32(raw: &[u8], offset: usize) -> u32 {
 }
 
 #[test]
+fn parameter_metrics_follow_the_owned_scene_after_relocation() {
+    assert_eq!(parameter_buffer_metrics_record(0x10_0008_0040), Ok(0x80041));
+    // First application VM: the old native address falls in an unmapped
+    // PB guard. Hardware reported gPM_SP0 / Unmapped at 0x1000080040.
+    assert_eq!(parameter_buffer_metrics_record(0x10_001c_0040), Ok(0x1c0041));
+    let (mut p, controls) = reference();
+    p.record_index = parameter_buffer_metrics_record(0x10_001c_0040).unwrap();
+    let registers = build_ta_registers(&p, &controls).unwrap();
+    assert_eq!(registers.iter().find(|r| r.number == 0x1c910).unwrap().value,
+        0x1c0041);
+    assert_eq!(parameter_buffer_metrics_record(0x10_ffff_ffc0), Ok(0xffff_ffc1));
+    for address in [0x0f_ffff_ffc0, 0x11_0000_0000, 0x10_001c_0041, u64::MAX] {
+        assert!(parameter_buffer_metrics_record(address).is_err());
+    }
+}
+
+#[test]
 fn initial_parameter_buffer_slot_matches_native_ta_publication() {
     // Native 25G76 first TA: 48 parameter pages, no cursor progress and no
     // enable bit in dword 0. Verified stable in the live hardware table.

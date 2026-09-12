@@ -85,6 +85,10 @@ impl M5GraphicsJob {
         let target_memory = M5TargetMemory::new(dev, &program, &p, clusters)?;
         target_memory.apply(&mut p);
         p.cycle = parameter_buffer.scene_cycle();
+        // Keep the PM register and firmware scene descriptor on the same
+        // owned metrics slot. The captured address is unmapped in a new VM.
+        p.record_index = m5_render::parameter_buffer_metrics_record(
+            parameter_buffer.metrics() + 0x40).map_err(|_| EINVAL)?;
         p.ta_hardware_buffer_id = PB_HARDWARE_ID;
         p.usc_flist_hardware_buffer_id = graphics_usc::HARDWARE_ID;
         p.ta_timestamp_start = HIGH + TIMESTAMPS as u64;

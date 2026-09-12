@@ -17,6 +17,20 @@ mod tests;
 pub(crate) const TA_REGISTER_COUNT: usize = 82;
 pub(crate) const FRAGMENT_REGISTER_COUNT: usize = 90;
 
+/// Encode the TA parameter-manager metrics slot in the compact GART window.
+/// The native 25G76 slot at 0x1000080040 produces register 1c910 = 0x80041:
+/// the low bit enables the record; the remaining bits address its 64 bytes.
+pub(crate) fn parameter_buffer_metrics_record(
+    scene_metrics: u64,
+) -> Result<u64, M5RenderBuildError> {
+    let offset = scene_metrics.checked_sub(0x10_0000_0000)
+        .ok_or(M5RenderBuildError::OwnershipMismatch)?;
+    if offset >= (1u64 << 32) || offset & 0x3f != 0 {
+        return Err(M5RenderBuildError::OwnershipMismatch);
+    }
+    Ok(offset | 1)
+}
+
 /// Initial M5 PB slot with fresh ring cursors. The owning job chooses the
 /// hardware slot separately and retains the page-list mapping.
 pub(crate) fn initial_parameter_buffer_descriptor(
