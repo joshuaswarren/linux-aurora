@@ -21,18 +21,30 @@
 #define APPLE_DCP_LINK_LOCAL_STREAMS_OFFSET	0x078
 #define APPLE_DCP_LINK_REMOTE_STREAMS_OFFSET	0x218
 #define APPLE_DCP_LINK_RPC_MEMORY_SIZE		0x0c0000
-#define APPLE_DCP_LINK_RPC_PAGE_SIZE		0x004000
 #define APPLE_DCP_LINK_SIDE_MEMORY_SIZE		0x040000
 #define APPLE_DCP_LINK_STREAM_HALF_SIZE		0x020000
 #define APPLE_DCP_LINK_STREAM_BUFFER_SIZE	0x008000
 #define APPLE_DCP_LINK_HEAP_OFFSET		0x080000
 #define APPLE_DCP_LINK_HEAP_SIZE		0x040000
-#define APPLE_DCP_LINK_RPC_ALIGNMENT		4
+/*
+ * Records are allocated on each channel's stack at
+ *   off_next = off_cur + align_up(12 + in_len + out_len, 0x40)
+ * Live macOS 25G83 traces confirm this for all 81915 RPC calls across two
+ * independent captures -- which is the same rule dcp_packet_start() and
+ * DCP_PACKET_ALIGNMENT already implement in iomfb.c.
+ *
+ * H17P does NOT use a separate "link" transport: past the INIT/SetShmem
+ * handshake it speaks the ordinary IOMFB protocol, with the same six fixed
+ * channels (CMD 0x00000, OOBCMD 0x08000, ASYNC 0x40000, OOBASYNC 0x48000,
+ * CB 0x60000, OOBCB 0x68000) selected by the context field of the message.
+ * The constants below are kept only for the H17P method/callback tables and
+ * the rt_bandwidth reply; the transport itself lives in iomfb.c.
+ */
+#define APPLE_DCP_LINK_RPC_ALIGNMENT		0x40
 #define APPLE_DCP_LINK_SHARED_VAR_MEMORY_SIZE	0x4000000
 
 #define APPLE_DCP_LINK_INIT_FLAG_64M		0x04000000
 
-#define APPLE_DCP_LINK_MSG_FIRMWARE_INIT	0
 #define APPLE_DCP_LINK_MSG_READY		1
 #define APPLE_DCP_LINK_MSG_RPC			2
 #define APPLE_DCP_LINK_MSG_RPC_REPLY		0x42
@@ -49,77 +61,6 @@
 #define APPLE_DCP_LINK_CALL_D003		0x44303033
 #define APPLE_DCP_H17P_CLOCK_ID_154		0x154
 #define APPLE_DCP_H17P_CLOCK_ID_194		0x194
-
-enum apple_dcp_link_state {
-	APPLE_DCP_LINK_WAIT_READY,
-	APPLE_DCP_LINK_READY,
-};
-
-enum apple_dcp_link_handoff_phase {
-	APPLE_DCP_LINK_HANDOFF_NONE,
-	APPLE_DCP_LINK_HANDOFF_FIRMWARE_INIT,
-	APPLE_DCP_LINK_HANDOFF_READY,
-};
-
-enum apple_dcp_link_adopt_action {
-	APPLE_DCP_LINK_ADOPT_INVALID,
-	APPLE_DCP_LINK_ADOPT_START_ENDPOINT,
-	APPLE_DCP_LINK_ADOPT_SEND_INIT,
-	APPLE_DCP_LINK_ADOPT_START_IOMFB,
-};
-
-static inline bool
-apple_dcp_link_handoff_message_valid(enum apple_dcp_link_handoff_phase phase, u64 message)
-{
-	u8 type = message & GENMASK_ULL(1, 0);
-
-	if (phase == APPLE_DCP_LINK_HANDOFF_FIRMWARE_INIT)
-		return type == APPLE_DCP_LINK_MSG_FIRMWARE_INIT &&
-		       !(message & GENMASK_ULL(7, 6));
-	if (phase == APPLE_DCP_LINK_HANDOFF_READY)
-		return type == APPLE_DCP_LINK_MSG_READY;
-
-	return false;
-}
-
-static inline enum apple_dcp_link_adopt_action
-apple_dcp_link_adopt_decide(enum apple_dcp_link_handoff_phase phase,
-			    u64 message, bool descriptor_zero,
-			    bool descriptor_valid, bool streams_idle)
-{
-	if (!streams_idle)
-		return APPLE_DCP_LINK_ADOPT_INVALID;
-
-	switch (phase) {
-	case APPLE_DCP_LINK_HANDOFF_NONE:
-		return message == 0 && descriptor_zero ?
-			APPLE_DCP_LINK_ADOPT_START_ENDPOINT :
-			APPLE_DCP_LINK_ADOPT_INVALID;
-	case APPLE_DCP_LINK_HANDOFF_FIRMWARE_INIT:
-		return (descriptor_zero || descriptor_valid) &&
-		       apple_dcp_link_handoff_message_valid(phase, message) ?
-			APPLE_DCP_LINK_ADOPT_SEND_INIT :
-			APPLE_DCP_LINK_ADOPT_INVALID;
-	case APPLE_DCP_LINK_HANDOFF_READY:
-		return descriptor_valid &&
-		       apple_dcp_link_handoff_message_valid(phase, message) ?
-			APPLE_DCP_LINK_ADOPT_START_IOMFB :
-			APPLE_DCP_LINK_ADOPT_INVALID;
-	default:
-		return APPLE_DCP_LINK_ADOPT_INVALID;
-	}
-}
-
-static inline u16 apple_dcp_link_negotiate_version(u16 remote_version)
-{
-	return remote_version < APPLE_DCP_LINK_PROTOCOL_VERSION ?
-		remote_version : APPLE_DCP_LINK_PROTOCOL_VERSION;
-}
-
-enum apple_dcp_link_handshake_action {
-	APPLE_DCP_LINK_HANDSHAKE_NONE,
-	APPLE_DCP_LINK_HANDSHAKE_START_IOMFB,
-};
 
 enum apple_dcp_h17p_callback {
 	APPLE_DCP_H17P_CB_DID_BOOT = 0x44303030,
@@ -488,53 +429,6 @@ apple_dcp_link_init_desc_encode(struct apple_dcp_link_init_desc *desc,
 	desc->version = cpu_to_le32(APPLE_DCP_LINK_PROTOCOL_VERSION);
 }
 
-static inline bool
-apple_dcp_link_init_desc_valid(const struct apple_dcp_link_init_desc *desc)
-{
-	u64 shared_dva;
-	u32 flags;
-
-	if (!desc)
-		return false;
-
-	shared_dva = le64_to_cpu(desc->shared_dva);
-	flags = le32_to_cpu(desc->flags);
-
-	if (le32_to_cpu(desc->version) != APPLE_DCP_LINK_PROTOCOL_VERSION)
-		return false;
-	if (!shared_dva)
-		return flags == 0;
-
-	return flags == APPLE_DCP_LINK_INIT_FLAG_64M &&
-	       !(shared_dva & (APPLE_DCP_LINK_RPC_PAGE_SIZE - 1)) &&
-	       !(shared_dva & ~GENMASK_ULL(47, 0));
-}
-
-static inline bool
-apple_dcp_link_init_desc_zero(const struct apple_dcp_link_init_desc *desc)
-{
-	return desc && !le64_to_cpu(desc->shared_dva) &&
-	       !le32_to_cpu(desc->flags) && !le32_to_cpu(desc->version);
-}
-
-static inline bool
-apple_dcp_link_stream_memory_idle(const void *memory, size_t size)
-{
-	const u8 *bytes = memory;
-	size_t offset;
-
-	if (!memory || size < APPLE_DCP_LINK_RPC_MEMORY_SIZE)
-		return false;
-
-	for (offset = sizeof(struct apple_dcp_link_init_desc);
-	     offset < APPLE_DCP_LINK_RPC_MEMORY_SIZE; offset++) {
-		if (bytes[offset])
-			return false;
-	}
-
-	return true;
-}
-
 static inline int apple_dcp_link_init_message(u64 rpc_dva, u64 *message)
 {
 	if (!message)
@@ -546,26 +440,11 @@ static inline int apple_dcp_link_init_message(u64 rpc_dva, u64 *message)
 	return 0;
 }
 
-static inline enum apple_dcp_link_handshake_action
-apple_dcp_link_handshake_step(enum apple_dcp_link_state *state, u64 message)
+static inline u64 apple_dcp_link_ready_message(void)
 {
-	u8 type;
-
-	if (!state)
-		return APPLE_DCP_LINK_HANDSHAKE_NONE;
-
-	type = message & GENMASK_ULL(1, 0);
-	switch (type) {
-	case APPLE_DCP_LINK_MSG_FIRMWARE_INIT:
-		return APPLE_DCP_LINK_HANDSHAKE_NONE;
-	case APPLE_DCP_LINK_MSG_READY:
-		if (*state != APPLE_DCP_LINK_WAIT_READY)
-			return APPLE_DCP_LINK_HANDSHAKE_NONE;
-		*state = APPLE_DCP_LINK_READY;
-		return APPLE_DCP_LINK_HANDSHAKE_START_IOMFB;
-	default:
-		return APPLE_DCP_LINK_HANDSHAKE_NONE;
-	}
+	return FIELD_PREP(APPLE_DCP_LINK_MSG_VERSION,
+			  APPLE_DCP_LINK_PROTOCOL_VERSION) |
+	       APPLE_DCP_LINK_MSG_READY;
 }
 
 static inline int apple_dcp_link_ready_reply(u64 message, u16 *version,

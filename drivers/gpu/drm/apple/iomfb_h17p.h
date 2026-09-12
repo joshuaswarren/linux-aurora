@@ -11,9 +11,9 @@
 
 #include "iomfb_template.h"
 
-static_assert(sizeof(struct dcp_swap_h17p) == 0x6e0);
+static_assert(sizeof(struct dcp_swap_h17p) == 0x58a);
 static_assert(sizeof(struct dcp_surface_h17p) == 0x22c);
-static_assert(sizeof(struct dcp_swap_submit_req_h17p) == 0x1d30);
+static_assert(sizeof(struct dcp_swap_submit_req_h17p) == 0xe9c);
 static_assert(sizeof(struct dcp_swap_submit_resp_h17p) == 0x0c);
 
 #undef DCP_FW_VER
