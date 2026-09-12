@@ -24,11 +24,12 @@ print('TARGET_CONFIRMED J813 Mac17,3 T8142', flush=True)
 if '--gpu-inventory' in sys.argv:
     runpy.run_path(str(root / 'inspect-gpu-topology.py'))['capture_gpu_topology'](u, root / 'logs')
 
-selected = [name for name in ('wifi', 'bluetooth', 'desktop', 'input', 'video', 'video-v4l2', 'gpu') if '--' + name in sys.argv]
+selected = [name for name in ('wifi', 'bluetooth', 'desktop', 'input', 'video', 'video-v4l2', 'gpu', 'display', 'display-probe') if '--' + name in sys.argv]
 if len(selected) > 1:
-    raise ValueError('Select one payload: --wifi, --bluetooth, --desktop, --input, --video, --video-v4l2 or --gpu')
+    raise ValueError('Select one RAM payload flavor')
 flavor = selected[0] if selected else None
 gpu = flavor == 'gpu'
+display = flavor in ('display', 'display-probe')
 gpu_rtkit_probe = '--gpu-rtkit-probe' in sys.argv
 gpu_initdata = '--gpu-initdata' in sys.argv
 if gpu_initdata and (not gpu or gpu_rtkit_probe):
@@ -36,11 +37,12 @@ if gpu_initdata and (not gpu or gpu_rtkit_probe):
 if gpu_rtkit_probe and not gpu:
     raise ValueError('--gpu-rtkit-probe requires --gpu')
 video = flavor in ('video', 'video-v4l2', 'gpu')
-input_enabled = flavor == 'input' or video
+input_enabled = flavor == 'input' or video or display
 wifi = flavor is not None
 artifacts = root / 'artifacts'
 if flavor:
-    artifacts /= ('gpu/native' if gpu else 'video/v4l2' if flavor == 'video-v4l2' else
+    artifacts /= ('display/probe' if flavor == 'display-probe' else
+                  'gpu/native' if gpu else 'video/v4l2' if flavor == 'video-v4l2' else
                   'video/native' if video else 'desktop' if flavor == 'input' else flavor)
 if gpu_rtkit_probe or gpu_initdata:
     artifacts /= 'rtkit-probe'
@@ -54,7 +56,13 @@ if (b'apple,t8142-ave\0' in dtb) != video:
     raise ValueError('The M5 encoder DT requires --video and firmware preflight')
 if (b'apple,agx-t8142\0' in dtb) != gpu:
     raise ValueError('The M5 GPU DT requires --gpu and boot-local resource preflight')
+if (b'apple,t8142-dcp\0' in dtb) != display:
+    raise ValueError('The M5 DCP DT requires --display and live mapping preflight')
 uboot = (root / 'u-boot/u-boot-nodtb.bin').read_bytes()
+
+if display:
+    display_helpers = runpy.run_path(str(root / 'display/dcp-boot-preflight.py'))
+    display_before = display_helpers['prepare_display'](u, p)
 
 if video:
     # Keep this boot's preloaded AVE firmware and DAPF configuration intact.
@@ -115,6 +123,8 @@ result = p.kboot_prepare_dt(dtb_addr)
 if result:
     raise RuntimeError(f'Device-tree preparation failed: {result}')
 print('DEVICE_TREE_PREPARED', flush=True)
+if display:
+    display_helpers['verify_display_fdt'](u, p, display_before)
 if '--prepare-only' in sys.argv:
     sys.exit(0)
 u.msr('DAIF', 0xc0)
