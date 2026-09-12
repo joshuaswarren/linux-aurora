@@ -50,6 +50,9 @@ cc -static -Os -s -Wall -Wextra -Werror -D__user= \
     "$task_root/linux/tools/aurora/j813/m5-drm-smoke.c" \
     -o "$task_out/m5-drm-smoke"
 install -Dm755 "$task_out/m5-drm-smoke" "$task_ramfs/usr/local/bin/m5-drm-smoke"
+if [[ -x "$task_out/m5-drm-render" ]]; then
+    install -Dm755 "$task_out/m5-drm-render" "$task_ramfs/usr/local/bin/m5-drm-render"
+fi
 (cd "$task_ramfs"; find . -print0 | cpio --null -o --format=newc --owner=0:0 2>/dev/null | gzip -9) \
     >"$task_out/initramfs.cpio.gz"
 (cd "$task_out"; sha256sum Image t8142-j813.dtb kernel.config apple-ave.ko initramfs.cpio.gz > boot-SHA256SUMS)
