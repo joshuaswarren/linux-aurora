@@ -5745,14 +5745,16 @@ struct G17PParameterManagement {
     manager_generation: u64,
 }
 
-/// Firmware may retain a parameter-buffer manager pointer after the owning
-/// userspace queue has drained and its TA/3D pair has completed. Keep the
-/// opaque high mapping alive without retaining the client VM, bind context or
-/// fixed low aliases. The stopped-processor boundary is currently the first
-/// proven point at which these background firmware references are gone.
+/// Firmware may retain parameter-buffer manager and workqueue-support pointers
+/// after the owning userspace queue has drained and its TA/3D pair has
+/// completed. Keep those opaque high mappings alive without retaining the
+/// client VM, bind context or fixed low aliases. The stopped-processor boundary
+/// is currently the first proven point at which these background firmware
+/// references are gone.
 #[cfg(not(test))]
 pub(crate) struct G17PRetiredParameterManagement {
     _backing: MappedObject,
+    _support: Option<MappedObject>,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -7977,7 +7979,36 @@ impl G17PUserRenderStorage {
                 ..
             } = manager;
             drop(_page_list_low);
-            G17PRetiredParameterManagement { _backing: backing }
+            G17PRetiredParameterManagement {
+                _backing: backing,
+                _support: None,
+            }
+        })
+    }
+
+    /// Split the firmware-retained portion out of a graph whose client roots
+    /// have a positive context-update retirement witness. GFX PC 0x24144
+    /// faulted inside `support` after that witness, while the earlier PC 0x95f0
+    /// fault named the PM backing. Both therefore outlive the VM-facing graph.
+    pub(crate) fn into_retired_parameter_management(
+        self,
+    ) -> Option<G17PRetiredParameterManagement> {
+        let G17PUserRenderStorage {
+            support,
+            parameter_management,
+            ..
+        } = self;
+        parameter_management.map(|manager| {
+            let G17PParameterManagement {
+                _page_list_low,
+                backing,
+                ..
+            } = manager;
+            drop(_page_list_low);
+            G17PRetiredParameterManagement {
+                _backing: backing,
+                _support: Some(support),
+            }
         })
     }
 
@@ -15738,7 +15769,6 @@ impl G17ResourceOwner {
             render_operand_aliases.push(mapping, GFP_KERNEL)?;
         }
         vm.append_driver_mappings(render_operand_aliases)?;
-        self.stage_render_uma_page_pool_descriptor()?;
         let (command_context, render_root_slot) = if let Some(context) = execution_context {
             if !context.matches(vm) || context.context_id() != u32::from(descriptor_context_id) {
                 return Err(EINVAL);
@@ -16092,6 +16122,13 @@ impl G17ResourceOwner {
                 bytes[..8].copy_from_slice(&g17_initdata::CONTROL_SHARED_INNER_PRESENTED.to_le_bytes());
                 Ok(())
             })?;
+        // The UMA descriptor is live pool state, not per-client command
+        // state. Native pairs halLoadUMADesc with halStoreUMADesc so firmware
+        // updates to its counters survive later clients. Publish it only at
+        // the same cold-pool boundary as the FList objects above; replaying it
+        // from new_user_render_storage overwrote those live counters whenever
+        // another client first rendered.
+        self.stage_render_uma_page_pool_descriptor()?;
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         self.flist_backing_owner = G17PFListBackingOwner::Render;
         Ok(())

@@ -3688,6 +3688,7 @@ impl G17PManagerConstruction {
         ) {
             Self::release_superseded_render_graph(
                 &mut self.render_hardware_buffer_ids,
+                &mut self.retired_parameter_managers,
                 Some(previous),
             );
             return Ok(());
@@ -3803,18 +3804,39 @@ impl G17PManagerConstruction {
     /// Drop a graph only after a later context-update group on the same
     /// physical pair completed and unlinked its EventControl. Unlike ordinary
     /// command completion, that is a positive firmware witness that both queue
-    /// records now name the successor context. PM storage may drop with the
-    /// graph; keeping it in the processor-stop quarantine would turn bounded
-    /// client churn into a permanent memory leak.
+    /// records now name the successor context, so its VM roots and client
+    /// aliases may be reclaimed.
+    ///
+    /// Firmware background PB maintenance has a longer lifetime than those
+    /// queue records. The same high PM backing which release_retired_handoff_graph
+    /// preserves must therefore be detached here before the client graph is
+    /// dropped. Releasing those objects at the context epoch reproduced GFX
+    /// read faults at PC 0x95f0 (PM) and PC 0x24144 (support) under concurrent
+    /// full-resolution clients.
     fn release_superseded_render_graph(
         ids: &mut G17PHardwareBufferIdAllocator,
+        retired_parameter_managers: &mut KVec<
+            g17_resources::G17PRetiredParameterManagement,
+        >,
         retired: Option<G17PRetiredRenderGraph>,
     ) {
         let Some(retired) = retired else { return };
-        if let Some(id) = retired.storage.retained_hardware_buffer_id() {
+        let G17PRetiredRenderGraph {
+            bind,
+            context_aliases,
+            storage,
+            ..
+        } = retired;
+        let hardware_buffer_id = storage.retained_hardware_buffer_id();
+        Self::quarantine_retired_parameter_management(
+            retired_parameter_managers,
+            storage.into_retired_parameter_management(),
+        );
+        if let Some(id) = hardware_buffer_id {
             ids.unreserve(id);
         }
-        drop(retired);
+        drop(context_aliases);
+        drop(bind);
     }
 
     fn reclaim_released_superseded_render_graphs(&mut self) {
@@ -3830,6 +3852,7 @@ impl G17PManagerConstruction {
             let graph = self.retired_render_handoff_graph.take();
             Self::release_superseded_render_graph(
                 &mut self.render_hardware_buffer_ids,
+                &mut self.retired_parameter_managers,
                 graph,
             );
         }
@@ -3847,6 +3870,7 @@ impl G17PManagerConstruction {
             if let Ok(graph) = self.retired_render_handoff_graphs.remove(index) {
                 Self::release_superseded_render_graph(
                     &mut self.render_hardware_buffer_ids,
+                    &mut self.retired_parameter_managers,
                     Some(graph),
                 );
             }
@@ -3865,6 +3889,7 @@ impl G17PManagerConstruction {
                     .and_then(|state| state.retired_handoff_graph.take());
                 Self::release_superseded_render_graph(
                     &mut self.render_hardware_buffer_ids,
+                    &mut self.retired_parameter_managers,
                     graph,
                 );
             }
