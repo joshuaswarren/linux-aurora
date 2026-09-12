@@ -957,20 +957,7 @@ impl gpuvm::DriverGpuVm for VmInner {
         self.page_table
             .unmap_pages(va.addr()..(va.addr() + va.range()))?;
 
-        self.flush_m5_app_range(va.addr(), va.range() as usize);
-
-        if let Some(asid) = self.slot() {
-            fence(Ordering::SeqCst);
-            mem::tlbi_range(asid as u8, va.addr() as usize, va.range() as usize);
-            mod_dev_dbg!(
-                self.dev,
-                "MMU: flush range: asid={:#x} start={:#x} len={:#x}\n",
-                asid,
-                va.addr(),
-                va.range(),
-            );
-            mem::sync();
-        }
+        self.tlbi_live_contexts(va.addr(), va.range());
 
         if op.unmap_and_unlink_va_defer().is_none() {
             dev_err!(self.dev.as_ref(), "step_unmap: could not unlink gpuva");
@@ -1013,20 +1000,7 @@ impl gpuvm::DriverGpuVm for VmInner {
 
         self.page_table.unmap_pages(unmap_start..unmap_end)?;
 
-        self.flush_m5_app_range(unmap_start, unmap_range as usize);
-
-        if let Some(asid) = self.slot() {
-            fence(Ordering::SeqCst);
-            mem::tlbi_range(asid as u8, unmap_start as usize, unmap_range as usize);
-            mod_dev_dbg!(
-                self.dev,
-                "MMU: flush range: asid={:#x} start={:#x} len={:#x}\n",
-                asid,
-                unmap_start,
-                unmap_range,
-            );
-            mem::sync();
-        }
+        self.tlbi_live_contexts(unmap_start, unmap_range);
 
         if op.unmap().unmap_and_unlink_va_defer().is_none() {
             dev_err!(self.dev.as_ref(), "step_unmap: could not unlink gpuva");
@@ -4251,16 +4225,7 @@ impl Uat {
             owner.page_table.ttb()
         };
         let inner = self.inner.lock();
-        let ttbs = inner.ttbs();
-        let mut contexts = 0u64;
-        for context_id in 0..UAT_NUM_CTX {
-            if ttbs[context_id].ttb0.load(Ordering::Acquire)
-                == t8140_tagged_root(root, context_id)
-            {
-                contexts |= 1u64 << context_id;
-            }
-        }
-        Ok(contexts)
+        Ok(context_mask_for_root(root, inner.ttbs()))
     }
 
     /// `ENOENT` unless some TTBAT context holds `vm`'s root.
