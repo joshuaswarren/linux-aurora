@@ -24,13 +24,17 @@ def main():
     parser.add_argument('--carrier', required=True, type=Path)
     parser.add_argument('--candidate', required=True)
     parser.add_argument('--with-dcp', action='store_true',
-                        help='require the combined GPU/DCP DT and load both drivers')
+                        help='require the combined GPU/DCP DT and normally load both drivers')
+    parser.add_argument('--defer-dcp', action='store_true',
+                        help='keep the combined DT but defer DCP driver loading for offscreen GPU tests')
     parser.add_argument('--from-m1n1', action='store_true',
                         help='start at the resident m1n1 proxy instead of rebooting Linux')
     parser.add_argument('--server', help='optional HTTP URL of the runtime transfer directory')
     parser.add_argument('--runtime', help='runtime archive filename on the server')
     parser.add_argument('--runtime-sha256')
     args = parser.parse_args()
+    if args.defer_dcp and not args.with_dcp:
+        parser.error('--defer-dcp requires --with-dcp and its combined DT checks')
     root = args.workbench.resolve()
     carrier = args.carrier.resolve()
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', args.candidate):
@@ -117,11 +121,13 @@ def main():
         run('boot', [sys.executable, 'boot-linux.py', '--gpu', '--gpu-initdata',
                      '--gpu-inventory', '--gpu-candidate=' + args.candidate,
                      '--j813-source-usb=' + source] + (['--gpu-display'] if args.with_dcp else []))
-        if args.with_dcp:
+        if args.with_dcp and not args.defer_dcp:
             linux('dcp', 'set -e; modprobe appledrm live_discovery=1; '
                         'test -d /sys/module/appledrm; '
                         'grep -q "^2560x1664$" /sys/class/drm/card*-*/modes; '
                         'echo M5_DCP_NATIVE_MODE_READY')
+        elif args.defer_dcp:
+            print('M5_DCP_LOAD_DEFERRED: offscreen GPU tests only', flush=True)
         linux('gpu', 'set -e; modprobe asahi m5_initdata_test=14 m5_fw_trace=512; '
                      'test -c /dev/dri/renderD128; echo M5_GPU_DEVICE_READY')
         if runtime:

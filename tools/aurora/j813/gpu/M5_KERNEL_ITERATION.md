@@ -44,6 +44,14 @@ J813 builder and use `--candidate gpu-dcp-candidate --with-dcp`. This selects
 `appledrm live_discovery=1` before Asahi. The runner requires the native
 2560x1664 connector mode before proceeding.
 
+For offscreen GPU fault isolation, add `--defer-dcp` together with
+`--with-dcp`. The combined carrier, DT and DMA preflights still apply, but
+the runner defers loading `appledrm`. It prints `M5_DCP_LOAD_DEFERRED` and
+does not claim display readiness. This avoids an intermittent DCP startup
+stall blocking tests that only inspect GPU buffers. A hardware run restored
+the GPU and small Vulkan runtime in 45.038 seconds with DCP loading deferred.
+Remove this option for desktop and presentation qualification.
+
 This path requires the combined carrier built from m1n1 `j813` commit
 `c7a06d01ccb5ff35de1bb6fc3b327f78f69ac5f3`, binary SHA256
 `3eb341d34e923abe578de7e670ed948c84fcb6f50084a23dd132898fd3b4b409`.
