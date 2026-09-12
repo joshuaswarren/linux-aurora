@@ -453,7 +453,7 @@ pub(crate) struct M5Runtime {
     session: Option<KBox<M5Session>>,
     application: bool,
     faulted: bool,
-    application_submitted: bool,
+    application_generation: u32,
 }
 
 impl M5Runtime {
@@ -493,7 +493,7 @@ impl M5Runtime {
         // This explicit RAM-boot experiment is released by reboot only.
         unsafe { kernel::bindings::__module_get(crate::THIS_MODULE.as_ptr()); }
         Ok(Self { session: Some(session), application: false, faulted: false,
-            application_submitted: false })
+            application_generation: 0 })
     }
 
     pub(crate) fn start(
@@ -594,20 +594,26 @@ impl M5Runtime {
         usc_required: [u64; 2],
     ) -> Result<crate::m5_completion::M5GraphicsCompletion> {
         if !self.application || self.is_crashed() { return Err(ENODEV); }
-        // The fixed graph owns one first-job slot. Reuse requires explicit
-        // rebuilding of its descriptors and channel contexts, not pretending
-        // that a new application's work is the diagnostic's next frame.
-        if self.application_submitted { return Err(EBUSY); }
+        // The bounded transport has no qualified ring-wrap path yet.
+        if self.application_generation >= 64 { return Err(EBUSY); }
+        let generation = self.application_generation + 1;
         let session = self.session.as_deref_mut().ok_or(EIO)?;
-        session.memory.as_mut().ok_or(EIO)?.initialize_application_graphics(
-            &session.dev, vm, parameters, controls, clusters, usc_required)?;
+        if generation == 1 {
+            session.memory.as_mut().ok_or(EIO)?.initialize_application_graphics(
+                &session.dev, vm, parameters, controls, clusters, usc_required)?;
+        }
         // From installation onward, even a failed mailbox send can have made
         // memory visible to firmware. Never unwind or recycle the job graph.
-        self.application_submitted = true;
+        self.application_generation = generation;
         let result = (|| {
-            session.install_graphics_queues()?;
+            if generation == 1 { session.install_graphics_queues()?; }
             let memory = session.memory.as_mut().ok_or(EIO)?;
-            memory.publish_graphics_job()?;
+            if generation == 1 {
+                memory.publish_graphics_job()?;
+            } else {
+                memory.publish_next_application_job(vm, parameters, controls,
+                    clusters, usc_required, generation)?;
+            }
             Pin::new(&mut session.roles[0].rtkit).send_message(0x21, 0x0083_0000_0000_000a)?;
             for _ in 0..10000 {
                 if memory.drain_reports(&session.dev)?
@@ -616,8 +622,11 @@ impl M5Runtime {
                 }
                 let (outer, inner, _) = memory.graphics_status()?;
                 let completion = memory.graphics_completion()?;
-                if outer == [4; 3] && inner == [[4; 3]; 2]
-                    && M5FirmwareMemory::graphics_pair_complete(completion, 1) {
+                if outer == [2 + generation * 2; 3] && inner == [[1 + generation * 3; 3]; 2]
+                    && M5FirmwareMemory::graphics_pair_complete(completion, generation) {
+                    dev_info!(session.dev.as_ref(),
+                        "M5_APPLICATION generation={} completed; both queues retired\n",
+                        generation);
                     return Ok(completion);
                 }
                 fsleep(Delta::from_millis(1));
