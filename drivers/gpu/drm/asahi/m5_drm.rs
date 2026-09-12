@@ -69,7 +69,7 @@ impl DrmGpu for M5DrmGpu {
         priority: u32, usc_exec_base: u64) -> Result<KBox<dyn queue::Queue>> {
         if priority > 3 { return Err(EINVAL); }
         let window = g17_uapi::QueueUscWindow {
-            base: usc_exec_base, user_start: m5_vm::DATA_START, user_end: USER_END,
+            base: usc_exec_base, user_start: m5_vm::DRIVER_BASE, user_end: USER_END,
         };
         window.validate().map_err(|_| EINVAL)?;
         let queue = M5Queue {
@@ -114,13 +114,12 @@ impl Drop for OutputPublication {
 struct UserAddressSpace<'a> { vm: &'a mmu::Vm }
 impl g17_uapi::GpuAddressSpace for UserAddressSpace<'_> {
     fn covers(&self, address: u64, size: u64, access: g17_uapi::GpuAccess) -> bool {
-        let Some(end) = address.checked_add(size) else { return false; };
         let (read, write) = match access {
             g17_uapi::GpuAccess::Read => (true, false),
             g17_uapi::GpuAccess::Write => (false, true),
             g17_uapi::GpuAccess::ReadWrite => (true, true),
         };
-        size != 0 && address >= m5_vm::DATA_START && end <= USER_END
+        m5_vm::user_range_contains(&self.vm.kernel_range(), address, size, USER_END)
             && self.vm.covers_range(address, size, read, write)
     }
 }

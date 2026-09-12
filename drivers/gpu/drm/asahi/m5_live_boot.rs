@@ -540,10 +540,12 @@ impl M5Runtime {
     pub(crate) fn start_application(
         pdev: &platform::Device<Core>, dev: ARef<AsahiDevice>, registers: regs::Resources,
     ) -> Result<Self> {
-        // Periodic diagnostic traces need continuous draining. The eventual
-        // adapter's event worker is not armed here, so disable that producer
-        // before a session can idle between explicit submissions.
-        if *crate::module_parameters::m5_fw_trace.value() != 0 { return Err(EINVAL); }
+        // Periodic power/submission traces need continuous draining while
+        // the session idles. Recovery bit 9 emits only on a fault, which the
+        // synchronous submit loop drains before retaining a failed graph.
+        if *crate::module_parameters::m5_fw_trace.value() & !0x200 != 0 {
+            return Err(EINVAL);
+        }
         let mut owner = Self::prepare(pdev, dev, registers)?;
         owner.application = true;
         let result = (|| {
@@ -623,6 +625,12 @@ impl M5Runtime {
             Err(ETIMEDOUT)
         })();
         if let Err(error) = result {
+            if let Some(memory) = session.memory.as_mut() {
+                for _ in 0..4 { let _ = memory.drain_reports(&session.dev); }
+                dev_err!(session.dev.as_ref(),
+                    "M5_APPLICATION failed graph counters={:x?} completion={:x?}\n",
+                    memory.graphics_status(), memory.graphics_completion());
+            }
             self.faulted = true;
             vm.status().record(error.to_errno());
             if let Some(memory) = &session.memory { memory.quarantine_graphics(); }

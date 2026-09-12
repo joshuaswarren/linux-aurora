@@ -37,6 +37,10 @@ phase_args.add_argument('--after-success', action='store_true',
                     help='Require exact compute output, retired queues and no GPU restart')
 phase_args.add_argument('--after-graphics-draw', action='store_true',
                     help='Capture mode12 pixels after retired graphics commands and firmware stop requests')
+phase_args.add_argument('--after-application-failure', action='store_true',
+                    help='Capture the retained first mode14 application graph after failed submission and stop requests')
+parser.add_argument('--application-native-va', action='store_true',
+                    help='Capture command data from the application test with --native-va')
 parser.add_argument('--graphics-shared-list', action='store_true',
                     help='Use the shared completion-list and uncached stamp layout for mode12')
 parser.add_argument('--graphics-usc-pool', action='store_true',
@@ -48,15 +52,18 @@ parser.add_argument('--graphics-render-targets', action='store_true',
 parser.add_argument('--context', type=int, choices=range(3, 64), default=3,
                     help='Application root slot used by the mode12 graphics draw')
 args = parser.parse_args()
-if args.graphics_shared_list and not args.after_graphics_draw:
+graphics_capture = args.after_graphics_draw or args.after_application_failure
+if args.application_native_va and not args.after_application_failure:
+    parser.error('--application-native-va requires --after-application-failure')
+if args.graphics_shared_list and not graphics_capture:
     parser.error('--graphics-shared-list requires --after-graphics-draw')
-if args.graphics_usc_pool and not args.after_graphics_draw:
+if args.graphics_usc_pool and not graphics_capture:
     parser.error('--graphics-usc-pool requires --after-graphics-draw')
-if args.graphics_parameter_buffer and not args.after_graphics_draw:
+if args.graphics_parameter_buffer and not graphics_capture:
     parser.error('--graphics-parameter-buffer requires --after-graphics-draw')
-if args.graphics_render_targets and not args.after_graphics_draw:
+if args.graphics_render_targets and not graphics_capture:
     parser.error('--graphics-render-targets requires --after-graphics-draw')
-if args.context != 3 and not args.after_graphics_draw:
+if args.context != 3 and not graphics_capture:
     parser.error('--context requires --after-graphics-draw')
 if args.triangle and not (args.after_success or args.after_live_snapshot):
     parser.error('--triangle requires --after-success or --after-live-snapshot')
@@ -69,7 +76,8 @@ reserved = [(props[name + '-base'], props[name + '-base'] + props[name + '-size'
             for name in ('gpu-region', 'gfx-shared-region', 'gfx-shared-l2-region',
                          'gfx-data', 'gfx1-data')]
 output_path.mkdir(mode=0o700, exist_ok=False)
-manifest = dict(phase=('Linux TA/fragment shared completion state' if args.graphics_shared_list
+manifest = dict(phase=('Linux first application submission failure; rendering unproven' if args.after_application_failure
+                      else 'Linux TA/fragment shared completion state' if args.graphics_shared_list
                       else 'Linux TA/fragment pixels with completion bookkeeping unqualified' if args.after_graphics_draw
                       else 'Linux mode8 admission before recovery' if args.before_recovery
                       else 'Linux mode7 setup before compute' if args.before_compute
@@ -77,9 +85,10 @@ manifest = dict(phase=('Linux TA/fragment shared completion state' if args.graph
                       else 'Linux live-status probe after compute' if args.after_live_snapshot
                       else 'Linux mode6 after compute') + ' after both firmware CPU stop requests',
                 device_memory_read=False, compute_triangle=args.triangle,
-                graphics_draw=args.after_graphics_draw,
+                graphics_draw=graphics_capture, application_failure=args.after_application_failure,
+                application_native_va=args.application_native_va,
                 graphics_shared_list=args.graphics_shared_list,
-                graphics_context=args.context if args.after_graphics_draw else None, objects=[])
+                graphics_context=args.context if graphics_capture else None, objects=[])
 cache = {}
 sequence = 0
 with Serial('/dev/cu.kis-01100000-ch-0', 115200, timeout=0.2) as port:
@@ -132,11 +141,19 @@ with Serial('/dev/cu.kis-01100000-ch-0', 115200, timeout=0.2) as port:
         probe_gate += " && dmesg | grep -q 'requested probe mode=11$' && dmesg | grep -q 'pages=7 triangle=true'"
     else:
         probe_gate += " && ! dmesg | grep -q 'requested probe mode=11$'"
+    stop_gate = "dmesg | grep -q 'M5_INIT stop requests=Ok(())'"
+    if args.after_application_failure:
+        probe_gate = (
+            "dmesg | grep -q 'M5_APPLICATION session ready; both firmware CPUs retained' "
+            "&& dmesg | grep -q 'M5_DRM registered experimental first-job render adapter' "
+            "&& dmesg | grep -q 'M5_GRAPHICS installed TA/fragment queues;' "
+            "&& dmesg | grep -Fq 'M5_APPLICATION submission failed'")
+        stop_gate = "dmesg | grep -Fq 'stop=Ok(()); VM and firmware owners retained'"
     identity = command("grep -q apple,j813 /proc/device-tree/compatible "
         "&& [ $(uname -r) = 7.1.6-aurora-j813-gpu-v9 ] "
         "&& [ -d /sys/module/asahi ] "
         "&& " + probe_gate + " "
-        "&& dmesg | grep -q 'M5_INIT stop requests=Ok(())' "
+        "&& " + stop_gate + " "
         "&& cat /proc/iomem")
     ram = []
     for line in identity.decode().splitlines():
@@ -257,7 +274,7 @@ with Serial('/dev/cu.kis-01100000-ch-0', 115200, timeout=0.2) as port:
                 ('program-preempt', 0x100000e0000, 0x4000, 3),
                 ('program-robustness', 0x1000018000, 0x4000, 3),
                 ('program-buffers', 0x1000001c000, 0x4000, 3)]
-        if args.after_graphics_draw:
+        if graphics_capture:
             views = [
                 ('graphics-pixels', 0x10000058000, 0x40000, args.context),
                 ('graphics-queues', 0xfffffc20c0000000, 0x1c000, 0),
@@ -273,6 +290,10 @@ with Serial('/dev/cu.kis-01100000-ch-0', 115200, timeout=0.2) as port:
             if args.graphics_shared_list:
                 views += [('graphics-completion-list', 0xfffffc20c0020000, 0x4000, 0),
                           ('graphics-submitted-total', 0xfffffc20c1080000, 0x4000, 0)]
+            if args.after_application_failure:
+                application_base = 0x1000000000 if args.application_native_va else 0x4000000000
+                views += [('application-vdm', application_base + 0x18000, 0x100, args.context),
+                          ('application-ppp', application_base + 0x58000, 0x200, args.context)]
         for label, address, size, context in views:
             save(label, address, size, context)
         if args.graphics_parameter_buffer:
@@ -360,7 +381,7 @@ with Serial('/dev/cu.kis-01100000-ch-0', 115200, timeout=0.2) as port:
         for ordinal in range(4):
             save('hardware-event-ring-%d' % ordinal,
                  0xfffffc20c07e8000 + ordinal * 0x28000,
-                 0x4000 if args.after_graphics_draw else 0x20000, 0)
+                 0x4000 if graphics_capture else 0x20000, 0)
     finally:
         manifest['physical_pages_read'] = len(cache)
         (output_path / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')

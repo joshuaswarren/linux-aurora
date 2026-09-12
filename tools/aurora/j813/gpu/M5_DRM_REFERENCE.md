@@ -4,9 +4,10 @@ The experimental J813/T8142 adapter keeps both M5 firmware processors running
 and exposes an Asahi render node. It uses the M5 runtime and SKSM graphics
 submission path, with ordinary DRM VM, GEM, queue and syncobj interfaces.
 
-This is an application-integration boundary. General Mesa rendering, Vulkan,
-glxgears, DCP and accelerated XFCE are not qualified by registering the node or
-passing the ABI test below.
+The first application triangle is hardware-qualified with a captured native
+program. General Mesa rendering, Vulkan, glxgears and accelerated XFCE remain
+unfinished. Native DCP presentation and software XFCE were verified separately;
+the GPU and DCP still need integration in a single accelerated desktop.
 
 ## Runtime and current limits
 
@@ -19,8 +20,9 @@ The first application render is connected to the M5 job constructor and
 paired queue submission. It accepts one render command, 256x256, one layer,
 one sample and one cluster, without depth/stencil, samplers or timestamps.
 The remaining dispatch/resource controls still use the native reference
-profile. The application draw path is not yet hardware-qualified. Repeated
-application jobs and general render-state derivation remain unfinished.
+profile. Repeated application jobs and general render-state derivation remain
+unfinished. Recovery-only firmware tracing (`m5_fw_trace=512`) is supported;
+continuous trace producers remain rejected for this synchronous adapter.
 
 Input fences are waited outside the runtime lock. Once an output fence is
 allocated, the submission guard publishes binary and timeline outputs on
@@ -63,6 +65,36 @@ nine rejected submissions and eighteen correctly signalled error fences.
 CPU buffer contents survived the binding checks, and validation failures did
 not poison VM status. No GPU command was published by this test, and no panic
 or firmware restart appeared in its log.
+
+## First application triangle, 2026-09-12
+
+The userspace `m5-drm-render` test created a VM, GEM mappings, a queue and a
+syncobj, then submitted one TA/fragment draw through the DRM render interface.
+With `--native-va --all-reference-pages`, all 334 captured pages were mapped
+at their original addresses with their captured read/write permissions.
+The submit and completion-fence wait succeeded. All 65,536 pixels matched:
+18,432 foreground, 47,104 background, zero unexpected or incorrect pixels.
+No GPU restart or panic was reported. The 262,144-byte RGBA output SHA-256 is
+`ce4e527e102b5e2f3f0585a6c045bc3eca14e5d225da0a8f3dc24b53f8c60a13`, identical
+to the earlier kernel-driven reference triangle.
+
+The smaller 203-page native-address control had failed without changing any
+output pixels. The kernel and firmware were unchanged for the successful
+334-page control. This establishes missing resources in the reduced set as
+the blocker for that test; the exact necessary subset is not isolated yet.
+This does not qualify relocated commands or Mesa-generated shaders.
+
+A client may reserve the first 4 MiB of the compact address aperture for its
+own command buffers. The driver allocates its private resources after that
+prefix, and command validation still rejects overlap with the driver's arena.
+The test requires a fresh session: this adapter currently admits one draw.
+
+The boot helper now checks all six prepared GPU memory reservations against
+the live ADT, including the GPU's phandle bindings, before entering Linux.
+Its qualified carrier is identified by image hash; the older carrier that
+exports empty UAT reservations is unsuitable for this GPU profile.
+Native program bundles and hardware memory captures are private test inputs
+and are not distributed in this repository.
 
 Tested `asahi.ko` SHA-256:
 `757542f8f41ed668680b58e855dfe5ba2fc0606c9ce4bc51e36ebb2f490880ad`.

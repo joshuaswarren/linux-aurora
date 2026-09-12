@@ -72,7 +72,8 @@ if video:
         u, p, iface, root / 'logs' / ('m5-ave-native-firmware-' + str(time.time_ns())))
 
 if gpu:
-    runpy.run_path(str(root / 'gpu/gpu-boot-preflight.py'))['prepare_gpu'](
+    gpu_helpers = runpy.run_path(str(root / 'gpu/gpu-boot-preflight.py'))
+    gpu_helpers['prepare_gpu'](
         u, iface, root / 'logs' / ('m5-gpu-native-firmware-' + str(time.time_ns())),
         require_known_firmware=gpu_rtkit_probe or gpu_initdata)
     if gpu_initdata:
@@ -125,6 +126,8 @@ if result:
 print('DEVICE_TREE_PREPARED', flush=True)
 if display:
     display_helpers['verify_display_fdt'](u, p, display_before)
+if gpu:
+    gpu_helpers['verify_gpu_fdt'](u, p)
 if '--prepare-only' in sys.argv:
     sys.exit(0)
 u.msr('DAIF', 0xc0)
