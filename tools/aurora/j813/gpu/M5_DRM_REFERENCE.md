@@ -96,6 +96,28 @@ exports empty UAT reservations is unsuitable for this GPU profile.
 Native program bundles and hardware memory captures are private test inputs
 and are not distributed in this repository.
 
+## Mesa-generated fragment, 2026-09-12
+
+A fresh application session also rendered a different fragment colour
+compiled from NIR by Mesa's AGX3c backend. The exporter
+`agx3_graphics_compile_test --m5-export-flat-variant FILE` generates a
+60-byte shader for RGB (0.75, 0.25, 0.5), with two GPR halves, zero staging,
+and no push data, scratch or preamble. It uses no captured instruction bytes.
+Shader SHA-256:
+`fcde505b78e36ad58809d27fda50461615f45642afc92a338772b4264e9b9755`.
+
+The renderer's `--generated-fragment=FILE` option installs it at the existing
+fragment entry, retaining the qualified native-VA layout and all 334 pages.
+The GPU produced exactly 18,432 pixels of RGBA (191,64,128,255), 47,104 of
+(16,16,16,255), and zero incorrect pixels. Submission and fence wait succeeded
+without restart or panic. RGBA output SHA-256:
+`5e74e188b0e82cc3961282f8c7fd8e7223c345e780069b2f600b05466dbd0d08`.
+
+This qualifies a newly compiled fragment through the application interface.
+Vertex instructions, runtime programs, command state and resources still
+come from the reference bundle. Complete Mesa command generation, repeated
+application draws and OpenGL/Vulkan applications remain unqualified.
+
 Tested `asahi.ko` SHA-256:
 `757542f8f41ed668680b58e855dfe5ba2fc0606c9ce4bc51e36ebb2f490880ad`.
 The local evidence is `logs/m5-drm-smoke-mappings-20260911.log`. Successful

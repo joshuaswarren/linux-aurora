@@ -3,6 +3,7 @@
 from pathlib import Path
 import argparse
 import subprocess
+import shlex
 import sys
 import time
 
@@ -15,12 +16,18 @@ parser.add_argument("--native-va", action="store_true",
                     help="Keep captured command-data VAs in application-owned BOs")
 parser.add_argument("--all-reference-pages", action="store_true",
                     help="Include all captured resource pages; requires --native-va")
+parser.add_argument("--generated-fragment",
+                    help="Target path to the Mesa-generated flat colour variant")
 args = parser.parse_args()
 if args.all_reference_pages and not args.native_va:
     parser.error("--all-reference-pages requires --native-va")
+if args.generated_fragment and not (args.native_va and args.all_reference_pages):
+    parser.error("--generated-fragment requires --native-va --all-reference-pages")
 layout_option = " --native-va" if args.native_va else ""
 if args.all_reference_pages:
     layout_option += " --all-reference-pages"
+if args.generated_fragment:
+    layout_option += " " + shlex.quote("--generated-fragment=" + args.generated_fragment)
 
 device = "/dev/cu.kis-01100000-ch-0"
 owners = subprocess.run(["lsof", "-t", device, device.replace('/cu.', '/tty.')],
@@ -76,4 +83,8 @@ for marker in [b"Kernel panic", b"BUG:", b"firmware requested GPU restart",
                b"M5_APPLICATION submission failed"]:
     if marker in captured:
         raise RuntimeError(f"Unexpected M5 failure: {marker!r}")
+if args.generated_fragment:
+    if b"M5_DRM_MESA_FRAGMENT_INSTALLED bytes=60 expected_rgb=191,64,128" not in captured:
+        raise RuntimeError("Missing generated fragment installation evidence")
+    print("M5_DRM_MESA_FRAGMENT_TRIANGLE_HARDWARE_VERIFIED")
 print("M5_DRM_APPLICATION_TRIANGLE_HARDWARE_VERIFIED")
