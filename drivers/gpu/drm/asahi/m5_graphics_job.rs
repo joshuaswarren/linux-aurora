@@ -242,6 +242,17 @@ impl M5GraphicsJob {
 
     pub(super) fn context_id(&self) -> u8 { self.program.context_id() }
 
+    pub(super) fn owns_vm(&self, vm: &mmu::Vm) -> bool {
+        self.program.vm().id() == vm.id()
+    }
+
+    /// Compute shares this application's published roots and USC owner. Only
+    /// its operand/preemption storage is new; never replace the live UMA slot.
+    pub(super) fn allocate_compute_storage(&self, dev: &AsahiDevice, size: usize)
+        -> Result<MappedObject> {
+        self.program.allocate_compact(dev, size, 0x8000, mmu::PROT_GPU_SHARED_RW)
+    }
+
     pub(super) fn descriptor_addresses(&self, stage: usize) -> Result<[u64; 2]> {
         let offset = match stage { 0 => TA, 1 => FRAGMENT, _ => return Err(EINVAL) };
         Ok([HIGH + offset as u64, LOW + offset as u64])

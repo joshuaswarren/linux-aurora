@@ -40,8 +40,8 @@ impl FirmwareDataView {
         if resource.size() != 0x134000 || resource.start() < 0x100_0000_0000
             || resource.start() & 0x3fff != 0
             || resource.start().checked_add(resource.size()).ok_or(EOVERFLOW)? > 0x104_0000_0000
-            || FIRMWARE_SLOT + 0x28 > resource.size() as usize
-            || FIRMWARE_SCHEDULER + 8 > resource.size() as usize
+            || 0x127430 - 0x4c000 + 13 * 0x28 > resource.size() as usize
+            || 0x1257e0 - 0x4c000 + 13 * 8 > resource.size() as usize
             || 0x178458 - 0x4c000 + 8 > resource.size() as usize {
             return Err(EINVAL);
         }
@@ -83,8 +83,9 @@ impl FirmwareDataView {
     }
 
     pub(super) fn queue_registration(&self, queue_id: u8) -> Result<([u64; 5], u64)> {
-        // The retained experiment owns only these two constructor-bounded slots.
-        if !matches!(queue_id, 10 | 11) { return Err(EINVAL); }
+        // TA/fragment own 10/11; application compute owns 12. The constructor
+        // bounds both complete tables through the last admitted queue.
+        if !(10..=12).contains(&queue_id) { return Err(EINVAL); }
         Ok((self.words::<5>(0x127430 - 0x4c000 + queue_id as usize * 0x28),
             self.words::<1>(0x1257e0 - 0x4c000 + queue_id as usize * 8)[0]))
     }

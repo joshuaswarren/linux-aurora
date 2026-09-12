@@ -16,6 +16,26 @@ pub(crate) struct M5GraphicsCompletion {
     pub(crate) signalled: u128,
 }
 
+/// The same native scheduler retirement contract for one compute record.
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+pub(crate) struct M5ComputeCompletion {
+    pub(crate) submitted: u32,
+    pub(crate) completed: u32,
+    pub(crate) linked: u32,
+    pub(crate) list: [u64; 2],
+    pub(crate) stamp: u32,
+    pub(crate) signalled: u128,
+}
+
+impl M5ComputeCompletion {
+    pub(crate) fn complete_at(self, list_address: u64, queue_id: u8, stamp: u32) -> bool {
+        list_address != 0 && queue_id < 128 && stamp != 0 && stamp & 0xff == 0
+            && self.submitted == 1 && self.completed == 1 && self.linked == 0
+            && self.list == [0, list_address] && self.stamp == stamp
+            && self.signalled & (1u128 << queue_id) != 0
+    }
+}
+
 impl M5GraphicsCompletion {
     /// This diagnostic owns qids 10/11 and event stamp 0x100 on a fresh boot.
     /// Queue retirement and framebuffer verification remain separate gates.
@@ -93,5 +113,23 @@ mod tests {
             .pair_complete_at(LIST, 0));
         assert!(!M5GraphicsCompletion { stamps: [0x101; 2], ..finished() }
             .pair_complete_at(LIST, 0x101));
+    }
+
+    #[test]
+    fn compute_needs_its_own_retired_scheduler_stamp_and_notification() {
+        let done = M5ComputeCompletion { submitted: 1, completed: 1, linked: 0,
+            list: [0, LIST], stamp: 0x100, signalled: 1 << 12 };
+        assert!(done.complete_at(LIST, 12, 0x100));
+        for pending in [
+            M5ComputeCompletion { submitted: 0, ..done },
+            M5ComputeCompletion { completed: 0, ..done },
+            M5ComputeCompletion { linked: 1, ..done },
+            M5ComputeCompletion { list: [LIST + 8, LIST], ..done },
+            M5ComputeCompletion { stamp: 0, ..done },
+            M5ComputeCompletion { signalled: 0xc00, ..done },
+        ] { assert!(!pending.complete_at(LIST, 12, 0x100)); }
+        assert!(!done.complete_at(LIST, 12, 0x200));
+        assert!(!done.complete_at(LIST, 128, 0x100));
+        assert!(!done.complete_at(0, 12, 0x100));
     }
 }

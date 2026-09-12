@@ -16,26 +16,6 @@ const POINTERS: usize = 0x4000;
 const ITEMS: usize = 0x8000;
 const CONFIG: usize = 0xa000;
 const CONTROL: usize = 0xc000;
-
-/// Command pointers between ITEMS and CONFIG, eight bytes each. The channel
-/// state declares 0x500 like the graphics queues, but only this many entries
-/// are backed before the config blobs begin, so the head never wraps: a
-/// generation whose pointers would reach CONFIG is refused instead.
-const COMPUTE_POINTER_COUNT: u32 = ((CONFIG - ITEMS) / 8) as u32;
-
-/// Installation publishes one command pointer; every dispatch generation then
-/// appends the same three -- descriptor, channel config, kick -- so the
-/// producer head runs 1, 4, 7, ... exactly as graphics_pointer_head() does for
-/// queues 10/11.
-pub(super) const fn compute_pointer_head(generation: u32) -> u32 {
-    1 + generation * 3
-}
-
-/// Whether a dispatch generation's three pointers still fit below CONFIG.
-pub(super) const fn compute_generation_admitted(generation: u32) -> bool {
-    generation >= 1 && compute_pointer_head(generation) < COMPUTE_POINTER_COUNT
-}
-
 const LIST: u64 = GRAPH + 0x10000;
 const ENTRY: u64 = 0xffff_fc20_003d_0000;
 const ENTRY_LOW: u64 = 0x70_0063_0000;
@@ -87,16 +67,52 @@ impl M5ApplicationCompute {
         }
         let mut signals = MappedObject::new_wc_at(dev, uat.kernel_vm(), SIGNALS,
             0x4000, mmu::PROT_FW_SHARED_RW)?;
-        // The submitted count is the host's and stays put; firmware republishes
-        // the completed count into the scheduler record each generation.
         signals.write_u32(SIGNALS, 1)?;
-        Self::encode_descriptor(&mut descriptor, job, command, storage.iova(), 1)?;
+        descriptor.with_bytes_mut(|out| {
+            put64(out, 0x4000, SIGNALS);
+            put32(out, 0x4010, 0x50);
+            m5_compute::encode_m5_compute_descriptor(m5_compute::M5ComputeDescriptor {
+                registers: m5_compute::M5ComputeParameters {
+                    preempt_base: storage.iova() + 0x20000,
+                    cdm_base: command.control_stream_base,
+                    dispatch_identity: 0x0000_0001_0000_0001,
+                    context_id: job.context_id(), work_ordinal: 0,
+                    robustness: storage.iova() + 0x24000,
+                    operand_state_base: storage.iova(),
+                    private_pool_hw_id: u64::from(graphics_usc::HARDWARE_ID),
+                    descriptor_control_530: 0x54b, descriptor_control_538: 0xf5,
+                    descriptor_flag_60a: false, descriptor_flag_60b: false,
+                },
+                submit_sequence: 0, scheduler_record: SCHEDULER,
+                descriptor_low_alias: DESC_LOW,
+                cdm_terminator: command.control_stream_terminator,
+                dispatch_stamps: [SIGNALS + 0x40, SIGNALS + 0x80],
+                event_machine_stamp: 0x100, queue_id: u32::from(QUEUE_ID),
+                queue_ordinal: 0, has_event: false, submission_index: 1,
+                status: [SIGNALS + 0xc0, SIGNALS + 0xc8],
+                shared_control: job.usc_control(), shared_control_enabled: true,
+                event_metadata: [0; 16], zero_page: ZERO, owner_id: 1,
+                descriptor_work_ordinal: 0,
+            }, &mut out[..0x1000]).map_err(|_| EINVAL)
+        })?;
         let mut graph = MappedObject::new_wc_at(dev, uat.kernel_vm(), GRAPH,
             0x10000, mmu::PROT_FW_PRIV_RW)?;
         let mut list = MappedObject::new_wc_at(dev, uat.kernel_vm(), LIST,
             0x4000, mmu::PROT_FW_SHARED_RW)?;
         list.with_bytes_mut(|out| { put64(out, 8, LIST); Ok(()) })?;
-        let prepared = Self::prepare_entry(1)?;
+        let prepared = m5_sksm::prepare_m5_sksm_entry(m5_sksm::M5SksmQueue {
+            id: QUEUE_ID, priority: 2, current_stamp: 1, submitted: 0, previous_stamp: None,
+        }, m5_sksm::M5SksmOperands {
+            barriers: &[], first_predecessor: 0, implicit_dependency_type: 1,
+            mcache: None, flag_bit1: false, flag_bit61: false, flag_bit63: false,
+            payload: [DESC, Self::queue_address()], qos_byte_32: 3, qos_class_40: 8,
+            qos_word_48: 0xffff, event_mask: [0; 4], rce_kind: 0,
+            rce: [m5_sksm::M5SksmRce { address: DESC_LOW + 0x40, tag: 37 },
+                m5_sksm::M5SksmRce { address: DESC_LOW + 0x760, tag: 4 },
+                m5_sksm::M5SksmRce { address: 0, tag: 0 },
+                m5_sksm::M5SksmRce { address: 0, tag: 0 }],
+            auxiliary: 0x3f_ffff_ffff_ffff,
+        }).map_err(|_| EINVAL)?;
         entry.with_bytes_mut(|out| {
             let offset = prepared.offset as usize;
             out[offset..offset + prepared.bytes.len()].copy_from_slice(&prepared.bytes);
@@ -116,7 +132,8 @@ impl M5ApplicationCompute {
             }).map_err(|_| EINVAL);
         let install = configuration(true)?;
         let config = configuration(false)?;
-        let kick = Self::prepare_kick(1)?;
+        let kick = m5_sksm::encode_m5_sksm_add_kicks(QUEUE_ID, 2, 1, 1)
+            .map_err(|_| EINVAL)?;
         graph.with_bytes_mut(|out| {
             let reset = g17_submission::encode_m5_25g76_channel_state_reset(
                 g17_submission::M5ChannelStateResetValues {
@@ -149,108 +166,6 @@ impl M5ApplicationCompute {
 
     pub(super) fn queue_address() -> u64 { GRAPH + QUEUE_ID as u64 * 0xc0 }
 
-    /// Re-encode the whole descriptor for one dispatch generation. The
-    /// scheduler record is cleared and re-seeded exactly as
-    /// M5GraphicsJob::rebuild_retired_frame() does for queues 10/11: firmware
-    /// republishes the completed count into it, so a stale one would satisfy
-    /// the next generation's completion gate before the dispatch even ran.
-    fn encode_descriptor(descriptor: &mut MappedObject, job: &M5GraphicsJob,
-        command: &g17_uapi::TranslatedComputeCommand, storage: u64,
-        generation: u32) -> Result {
-        if !compute_generation_admitted(generation) { return Err(EINVAL); }
-        descriptor.with_bytes_mut(|out| {
-            out[0x4000..0x4000 + 0xc8].fill(0);
-            put64(out, 0x4000, SIGNALS);
-            put32(out, 0x4010, 0x50);
-            m5_compute::encode_m5_compute_descriptor(m5_compute::M5ComputeDescriptor {
-                registers: m5_compute::M5ComputeParameters {
-                    preempt_base: storage + 0x20000,
-                    cdm_base: command.control_stream_base,
-                    dispatch_identity: 0x0000_0001_0000_0001,
-                    context_id: job.context_id(), work_ordinal: 0,
-                    robustness: storage + 0x24000,
-                    operand_state_base: storage,
-                    private_pool_hw_id: u64::from(graphics_usc::HARDWARE_ID),
-                    descriptor_control_530: 0x54b, descriptor_control_538: 0xf5,
-                    descriptor_flag_60a: false, descriptor_flag_60b: false,
-                },
-                submit_sequence: 0, scheduler_record: SCHEDULER,
-                descriptor_low_alias: DESC_LOW,
-                cdm_terminator: command.control_stream_terminator,
-                dispatch_stamps: [SIGNALS + 0x40, SIGNALS + 0x80],
-                event_machine_stamp: generation * 0x100, queue_id: u32::from(QUEUE_ID),
-                queue_ordinal: 0, has_event: false, submission_index: generation,
-                status: [SIGNALS + 0xc0, SIGNALS + 0xc8],
-                shared_control: job.usc_control(), shared_control_enabled: true,
-                event_metadata: [0; 16], zero_page: ZERO, owner_id: 1,
-                descriptor_work_ordinal: 0,
-            }, &mut out[..0x1000]).map_err(|_| EINVAL)
-        })
-    }
-
-    fn prepare_entry(generation: u32) -> Result<m5_sksm::PreparedM5SksmEntry> {
-        if !compute_generation_admitted(generation) { return Err(EINVAL); }
-        let stamp = u64::from(generation);
-        m5_sksm::prepare_m5_sksm_entry(m5_sksm::M5SksmQueue {
-            id: QUEUE_ID, priority: 2, current_stamp: stamp, submitted: 0,
-            previous_stamp: if generation == 1 { None } else { Some(stamp - 1) },
-        }, m5_sksm::M5SksmOperands {
-            barriers: &[], first_predecessor: 0, implicit_dependency_type: 1,
-            mcache: None, flag_bit1: false, flag_bit61: false, flag_bit63: false,
-            payload: [DESC, Self::queue_address()], qos_byte_32: 3, qos_class_40: 8,
-            qos_word_48: 0xffff, event_mask: [0; 4], rce_kind: 0,
-            rce: [m5_sksm::M5SksmRce { address: DESC_LOW + 0x40, tag: 37 },
-                m5_sksm::M5SksmRce { address: DESC_LOW + 0x760, tag: 4 },
-                m5_sksm::M5SksmRce { address: 0, tag: 0 },
-                m5_sksm::M5SksmRce { address: 0, tag: 0 }],
-            auxiliary: 0x3f_ffff_ffff_ffff,
-        }).map_err(|_| EINVAL)
-    }
-
-    fn prepare_kick(generation: u32) -> Result<[u8; 21]> {
-        if !compute_generation_admitted(generation) { return Err(EINVAL); }
-        m5_sksm::encode_m5_sksm_add_kicks(QUEUE_ID, 2, u64::from(generation), 1)
-            .map_err(|_| EINVAL)
-    }
-
-    /// Stage a further dispatch on the installed queue. Nothing here is
-    /// published: the producer head moves only in publish_dispatch().
-    pub(super) fn prepare_next_dispatch(&mut self, job: &M5GraphicsJob,
-        command: &g17_uapi::TranslatedComputeCommand, generation: u32) -> Result {
-        if generation < 2 || !compute_generation_admitted(generation) { return Err(EINVAL); }
-        if self.counters()? != [compute_pointer_head(generation - 1); 3]
-            || !self.installed()? { return Err(EBUSY); }
-        Self::encode_descriptor(&mut self.descriptor, job, command,
-            self.storage.iova(), generation)?;
-        let prepared = Self::prepare_entry(generation)?;
-        self.entry.with_bytes_mut(|out| {
-            let offset = prepared.offset as usize;
-            let slot = &mut out[offset..offset + prepared.bytes.len()];
-            // Every preceding dispatch has retired, including the prior user
-            // of this 256-entry SKSM slot. Preserve the first-use check.
-            if generation < 256 && slot.iter().any(|byte| *byte != 0) {
-                return Err(EBUSY);
-            }
-            slot.copy_from_slice(&prepared.bytes);
-            Ok(())
-        })?;
-        let kick = Self::prepare_kick(generation)?;
-        self.graph.with_bytes_mut(|out| {
-            out[CONFIG + 0x200..CONFIG + 0x200 + kick.len()].copy_from_slice(&kick);
-            for (index, address) in [DESC, GRAPH + CONFIG as u64 + 0x100,
-                GRAPH + CONFIG as u64 + 0x200].into_iter().enumerate() {
-                let absolute = 1 + (generation as usize - 1) * 3 + index;
-                let offset = ITEMS + absolute * 8;
-                if out[offset..offset + 8].iter().any(|byte| *byte != 0) {
-                    return Err(EBUSY);
-                }
-                put64(out, offset, address);
-            }
-            Ok(())
-        })
-    }
-
-
     pub(super) fn counters(&mut self) -> Result<[u32; 3]> {
         let mut out = [0; 3];
         for (index, offset) in [0, 0x30, 0x40].into_iter().enumerate() {
@@ -270,12 +185,9 @@ impl M5ApplicationCompute {
             && (header >> 16) & 0xff == 4 && bitmap == 1u64 << QUEUE_ID)
     }
 
-    pub(super) fn publish_dispatch(&mut self, generation: u32) -> Result {
-        if !compute_generation_admitted(generation) { return Err(EINVAL); }
-        if self.counters()? != [compute_pointer_head(generation - 1); 3]
-            || !self.installed()? { return Err(EBUSY); }
-        self.graph.write_u32(GRAPH + POINTERS as u64 + 0x40,
-            compute_pointer_head(generation))
+    pub(super) fn publish_dispatch(&mut self) -> Result {
+        if self.counters()? != [1; 3] || !self.installed()? { return Err(EBUSY); }
+        self.graph.write_u32(GRAPH + POINTERS as u64 + 0x40, 4)
     }
 
     pub(super) fn completion(&mut self, signalled: u128)
@@ -289,11 +201,9 @@ impl M5ApplicationCompute {
         })
     }
 
-    pub(super) fn complete(&mut self, signalled: u128, generation: u32) -> Result<bool> {
-        if !compute_generation_admitted(generation) { return Err(EINVAL); }
-        Ok(self.counters()? == [compute_pointer_head(generation); 3]
-            && self.completion(signalled)?
-                .complete_at(LIST, QUEUE_ID, generation * 0x100))
+    pub(super) fn complete(&mut self, signalled: u128) -> Result<bool> {
+        Ok(self.counters()? == [4; 3]
+            && self.completion(signalled)?.complete_at(LIST, QUEUE_ID, 0x100))
     }
 }
 

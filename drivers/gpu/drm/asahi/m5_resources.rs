@@ -34,6 +34,8 @@ mod target_memory;
 mod graphics_job;
 #[path = "m5_graphics_queues.rs"]
 mod graphics_queues;
+#[path = "m5_application_compute.rs"]
+mod application_compute;
 
 const KERNEL_BASE: u64 = 0xffff_fc20_0000_0000;
 const PRIVATE_BASE: u64 = KERNEL_BASE + 0x2_0000;
@@ -64,6 +66,8 @@ pub(crate) struct M5FirmwareMemory {
     queue_probe: Option<M5QueueProbe>,
     program: Option<M5ProgramMemory>,
     graphics: Option<(graphics_job::M5GraphicsJob, graphics_queues::M5GraphicsQueues)>,
+    application_compute: Option<application_compute::M5ApplicationCompute>,
+    application_outer_head: u32,
     report_counts: [[u32; 2]; 2],
     trace_printed: [u32; 2],
     compute_kick_observed: bool,
@@ -278,7 +282,8 @@ impl M5FirmwareMemory {
                   pbdesc, uma, completions, aliases, registers, queue_probe, program, graphics: None,
                   report_counts: [[0; 2]; 2], trace_printed: [0; 2],
                   compute_kick_observed: false, compute_dispatch_returned: false,
-                  graphics_stamp_flags: 0, uat }), GFP_KERNEL)
+                  graphics_stamp_flags: 0, application_compute: None,
+                  application_outer_head: 0, uat }), GFP_KERNEL)
     }
 
     #[inline(never)]
@@ -507,7 +512,7 @@ impl M5FirmwareMemory {
         if !(2..=64).contains(&generation) { return Err(EINVAL); }
         let previous = generation - 1;
         let (outer, inner, _) = self.graphics_status()?;
-        if outer != [2 + previous * 2; 3] || inner != [[1 + previous * 3; 3]; 2]
+        if outer != [self.application_outer_head; 3] || inner != [[1 + previous * 3; 3]; 2]
             || !Self::graphics_pair_complete(self.graphics_completion()?, previous) {
             return Err(EBUSY);
         }
@@ -516,10 +521,13 @@ impl M5FirmwareMemory {
             usc_required, generation)?;
         queues.publish_next_draw(job, generation)?;
         self.graphics_stamp_flags = 0;
-        self.publish_graphics_records(generation as usize * 2, (1 + generation * 3) as u16)
+        self.publish_graphics_records(self.application_outer_head as usize,
+            (1 + generation * 3) as u16)
     }
 
     fn publish_graphics_records(&mut self, outer_index: usize, inner_head: u16) -> Result {
+        // 256 outer entries; do not wrap or replace a previously used slot.
+        if outer_index + 2 > 256 { return Err(EBUSY); }
         self.shared.with_bytes_mut(|out| {
             for stage in 0..2 {
                 let offset = init::WORK_RING_BUNDLE_OFFSETS[8] + (outer_index + stage) * 24;
@@ -543,8 +551,84 @@ impl M5FirmwareMemory {
         // Both stage-tagged SKSM queues travel through the CL_2 command ring.
         let producer = init::WORK_STATE_GRID_OFFSETS[8] + 2 * init::CHANNEL_STATE_SPACING;
         self.private.write_u32(PRIVATE_BASE + producer as u64, (outer_index + 2) as u32)?;
+        self.application_outer_head = (outer_index + 2) as u32;
         fence(Ordering::SeqCst);
         Ok(())
+    }
+
+    pub(crate) fn application_outer_head(&self) -> u32 { self.application_outer_head }
+
+    /// Initial admission is deliberately one compute job after retired graphics.
+    /// No private diagnostic context, queue 11, or replacement UMA is installed.
+    pub(crate) fn initialize_application_compute(&mut self, dev: &AsahiDevice,
+        vm: &mmu::Vm, command: &crate::g17_uapi::TranslatedComputeCommand,
+        graphics_generation: u32) -> Result {
+        if self.application_compute.is_some() || self.program.is_some()
+            || self.queue_probe.is_some() || self.application_outer_head + 2 > 256 {
+            return Err(ENOTSUPP);
+        }
+        let (outer, inner, _) = self.graphics_status()?;
+        if graphics_generation == 0 || outer != [self.application_outer_head; 3]
+            || inner != [[1 + graphics_generation * 3; 3]; 2]
+            || !Self::graphics_pair_complete(self.graphics_completion()?, graphics_generation) {
+            return Err(EBUSY);
+        }
+        let job = &self.graphics.as_ref().ok_or(EINVAL)?.0;
+        if !job.owns_vm(vm) { return Err(ENOTSUPP); }
+        self.application_compute = Some(application_compute::M5ApplicationCompute::new(
+            dev, &self.uat, job, command)?);
+        Ok(())
+    }
+
+    pub(crate) fn application_compute_installed(&mut self) -> Result<bool> {
+        let compute = self.application_compute.as_mut().ok_or(EINVAL)?;
+        Ok(compute.counters()? == [1; 3] && compute.installed()?)
+    }
+
+    pub(crate) fn publish_application_compute(&mut self, dispatch: bool) -> Result {
+        let (outer, _, _) = self.graphics_status()?;
+        if outer != [self.application_outer_head; 3] || self.application_outer_head >= 256 {
+            return Err(EBUSY);
+        }
+        let compute = self.application_compute.as_mut().ok_or(EINVAL)?;
+        if dispatch {
+            // Preserve the retired graphics notifications for later render reuse.
+            self.graphics_stamp_flags &= !(1u128 << application_compute::QUEUE_ID);
+            compute.publish_dispatch()?;
+        } else if compute.counters()? != [0, 0, 1] { return Err(EBUSY); }
+        let offset = init::WORK_RING_BUNDLE_OFFSETS[8]
+            + self.application_outer_head as usize * 24;
+        self.shared.with_bytes_mut(|out| {
+            let record = &mut out[offset..offset + 24];
+            if record.iter().any(|byte| *byte != 0) { return Err(EBUSY); }
+            record[8..16].copy_from_slice(
+                &application_compute::M5ApplicationCompute::queue_address().to_le_bytes());
+            record[16..20].copy_from_slice(&2u32.to_le_bytes());
+            record[20..22].copy_from_slice(&(if dispatch { 4u16 } else { 1 }).to_le_bytes());
+            record[22] = application_compute::QUEUE_ID;
+            record[23] = 1;
+            Ok(())
+        })?;
+        fence(Ordering::SeqCst);
+        let head = self.application_outer_head + 1;
+        let producer = init::WORK_STATE_GRID_OFFSETS[8] + 2 * init::CHANNEL_STATE_SPACING;
+        self.private.write_u32(PRIVATE_BASE + producer as u64, head)?;
+        self.application_outer_head = head;
+        fence(Ordering::SeqCst);
+        Ok(())
+    }
+
+    pub(crate) fn application_compute_complete(&mut self) -> Result<bool> {
+        let (outer, _, _) = self.graphics_status()?;
+        Ok(outer == [self.application_outer_head; 3]
+            && self.application_compute.as_mut().ok_or(EINVAL)?
+                .complete(self.graphics_stamp_flags)?)
+    }
+
+    pub(crate) fn application_compute_status(&mut self)
+        -> Result<([u32; 3], crate::m5_completion::M5ComputeCompletion)> {
+        let compute = self.application_compute.as_mut().ok_or(EINVAL)?;
+        Ok((compute.counters()?, compute.completion(self.graphics_stamp_flags)?))
     }
 
     pub(crate) fn publish_idle_wake(&mut self) -> Result {

@@ -161,6 +161,16 @@ impl queue::Queue for M5Queue {
             let command = parser.next_hardware().map_err(|_| EINVAL)?.ok_or(EINVAL)?;
             if parser.next_hardware().map_err(|_| EINVAL)?.is_some() { return Err(ENOTSUPP); }
             parser.finish().map_err(|_| EINVAL)?;
+            if let g17_uapi::ParsedHardwareCommand::Compute { payload, attachments, .. } = command {
+                let timestamps = [payload.timestamps.start, payload.timestamps.end];
+                if payload.flags != 0 || payload.sampler_heap != 0 || payload.sampler_count != 0
+                    || timestamps.iter().any(|t| t.handle != 0 || t.offset != 0) {
+                    return Err(ENOTSUPP);
+                }
+                let translated = g17_uapi::translate_compute_command(payload, attachments,
+                    self.window, &address_space).map_err(|_| EINVAL)?;
+                return self.runtime.lock().submit_application_compute(&self.vm, &translated);
+            }
             let g17_uapi::ParsedHardwareCommand::Render {
                 payload, vertex_attachments, fragment_attachments, ..
             } = command else { return Err(ENOTSUPP); };

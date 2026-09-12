@@ -622,7 +622,8 @@ impl M5Runtime {
                 }
                 let (outer, inner, _) = memory.graphics_status()?;
                 let completion = memory.graphics_completion()?;
-                if outer == [2 + generation * 2; 3] && inner == [[1 + generation * 3; 3]; 2]
+                if outer == [memory.application_outer_head(); 3]
+                    && inner == [[1 + generation * 3; 3]; 2]
                     && M5FirmwareMemory::graphics_pair_complete(completion, generation) {
                     dev_info!(session.dev.as_ref(),
                         "M5_APPLICATION generation={} completed; both queues retired\n",
@@ -649,6 +650,64 @@ impl M5Runtime {
             dev_err!(session.dev.as_ref(),
                 "M5_APPLICATION submission failed {:?}; stop={:?}; VM and firmware owners retained\n",
                 error, stopped);
+        }
+        result
+    }
+
+    /// Execute a first compute command in the already retained application VM.
+    /// Installation, dispatch and retirement are separate firmware transitions.
+    pub(crate) fn submit_application_compute(&mut self, vm: &mmu::Vm,
+        command: &crate::g17_uapi::TranslatedComputeCommand) -> Result {
+        if !self.application || self.is_crashed() || self.application_generation == 0 {
+            return Err(ENOTSUPP);
+        }
+        let session = self.session.as_deref_mut().ok_or(EIO)?;
+        session.memory.as_mut().ok_or(EIO)?.initialize_application_compute(
+            &session.dev, vm, command, self.application_generation)?;
+        // The owner is retained before the first publication. Even a failed
+        // mailbox send can follow firmware seeing the new producer.
+        let result = (|| {
+            let memory = session.memory.as_mut().ok_or(EIO)?;
+            for dispatch in [false, true] {
+                memory.publish_application_compute(dispatch)?;
+                Pin::new(&mut session.roles[0].rtkit)
+                    .send_message(0x21, 0x0083_0000_0000_000a)?;
+                let mut retired = false;
+                for _ in 0..if dispatch { 10000 } else { 1000 } {
+                    if memory.drain_reports(&session.dev)?
+                        || session.roles.iter().any(|role| role.state.crashed.load(Ordering::Acquire)) {
+                        return Err(EIO);
+                    }
+                    let (outer, _, _) = memory.graphics_status()?;
+                    if outer == [memory.application_outer_head(); 3]
+                        && if dispatch { memory.application_compute_complete()? }
+                            else { memory.application_compute_installed()? } {
+                        retired = true;
+                        break;
+                    }
+                    fsleep(Delta::from_millis(1));
+                }
+                if !retired { return Err(ETIMEDOUT); }
+                dev_info!(session.dev.as_ref(),
+                    "M5_APPLICATION_COMPUTE {} queue=12 outer={} status={:x?}\n",
+                    if dispatch { "completed" } else { "installed" },
+                    memory.application_outer_head(), memory.application_compute_status());
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.faulted = true;
+            vm.status().record(error.to_errno());
+            if let Some(memory) = session.memory.as_mut() {
+                for _ in 0..4 { let _ = memory.drain_reports(&session.dev); }
+                memory.quarantine_graphics();
+                dev_err!(session.dev.as_ref(),
+                    "M5_APPLICATION_COMPUTE failed {:?}; outer/graphics={:x?} compute={:x?}\n",
+                    error, memory.graphics_status(), memory.application_compute_status());
+            }
+            let stopped = session.stop_cpus();
+            dev_err!(session.dev.as_ref(),
+                "M5_APPLICATION_COMPUTE stop={:?}; VM and owners retained until reboot\n", stopped);
         }
         result
     }
