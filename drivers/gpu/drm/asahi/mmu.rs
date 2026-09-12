@@ -294,6 +294,16 @@ fn t8140_tagged_root(root: u64, slot: usize) -> u64 {
     root | TTBR_VALID | ((slot as u64) << TTBR_ASID_SHIFT)
 }
 
+fn context_mask_for_root(root: u64, ttbs: &[SlotTTBS; UAT_NUM_CTX]) -> u64 {
+    let mut contexts = 0u64;
+    for (context_id, ttb) in ttbs.iter().enumerate() {
+        if ttb.ttb0.load(Ordering::Acquire) == t8140_tagged_root(root, context_id) {
+            contexts |= 1u64 << context_id;
+        }
+    }
+    contexts
+}
+
 fn t8140_opening_render_layout(render_low: u64, source_high: u64) -> T8140RootLayout {
     T8140RootLayout {
         low: [
@@ -921,18 +931,7 @@ impl gpuvm::DriverGpuVm for VmInner {
         self.page_table
             .unmap_pages(va.addr()..(va.addr() + va.range()))?;
 
-        if let Some(asid) = self.slot() {
-            fence(Ordering::SeqCst);
-            mem::tlbi_range(asid as u8, va.addr() as usize, va.range() as usize);
-            mod_dev_dbg!(
-                self.dev,
-                "MMU: flush range: asid={:#x} start={:#x} len={:#x}\n",
-                asid,
-                va.addr(),
-                va.range(),
-            );
-            mem::sync();
-        }
+        self.tlbi_live_contexts(va.addr(), va.range());
 
         if op.unmap_and_unlink_va_defer().is_none() {
             dev_err!(self.dev.as_ref(), "step_unmap: could not unlink gpuva");
@@ -975,18 +974,7 @@ impl gpuvm::DriverGpuVm for VmInner {
 
         self.page_table.unmap_pages(unmap_start..unmap_end)?;
 
-        if let Some(asid) = self.slot() {
-            fence(Ordering::SeqCst);
-            mem::tlbi_range(asid as u8, unmap_start as usize, unmap_range as usize);
-            mod_dev_dbg!(
-                self.dev,
-                "MMU: flush range: asid={:#x} start={:#x} len={:#x}\n",
-                asid,
-                unmap_start,
-                unmap_range,
-            );
-            mem::sync();
-        }
+        self.tlbi_live_contexts(unmap_start, unmap_range);
 
         if op.unmap().unmap_and_unlink_va_defer().is_none() {
             dev_err!(self.dev.as_ref(), "step_unmap: could not unlink gpuva");
@@ -1040,6 +1028,29 @@ impl VmInner {
     /// Returns the translation table base for this Vm
     fn ttb(&self) -> u64 {
         self.page_table.ttb()
+    }
+
+    /// Invalidate this VM's changed range in every hardware context which
+    /// currently publishes its root. G17P compute uses independently leased
+    /// application contexts, so invalidating only the ordinary render slot
+    /// leaves stale executable translations live across a USC unbind/rebind.
+    fn tlbi_live_contexts(&self, addr: u64, size: u64) {
+        let contexts = {
+            let shared = self.uat_inner.lock();
+            context_mask_for_root(self.ttb(), shared.ttbs())
+        };
+
+        if contexts == 0 {
+            return;
+        }
+
+        fence(Ordering::SeqCst);
+        for context_id in 0..UAT_NUM_CTX {
+            if contexts & (1u64 << context_id) != 0 {
+                mem::tlbi_range(context_id as u8, addr as usize, size as usize);
+            }
+        }
+        mem::sync();
     }
 
     /// Map an `mm::Node` representing an mapping in VA space.
@@ -4122,16 +4133,7 @@ impl Uat {
             owner.page_table.ttb()
         };
         let inner = self.inner.lock();
-        let ttbs = inner.ttbs();
-        let mut contexts = 0u64;
-        for context_id in 0..UAT_NUM_CTX {
-            if ttbs[context_id].ttb0.load(Ordering::Acquire)
-                == t8140_tagged_root(root, context_id)
-            {
-                contexts |= 1u64 << context_id;
-            }
-        }
-        Ok(contexts)
+        Ok(context_mask_for_root(root, inner.ttbs()))
     }
 
     /// `ENOENT` unless some TTBAT context holds `vm`'s root.
@@ -5880,6 +5882,35 @@ impl Drop for Uat {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_mask_follows_every_published_copy_of_one_vm_root() {
+        let root = 0x101_abc0_0000;
+        let other = 0x101_def0_0000;
+        let ttbs = core::array::from_fn(|_| SlotTTBS {
+            ttb0: AtomicU64::new(0),
+            ttb1: AtomicU64::new(0),
+        });
+
+        for context in [1usize, 5, 17, 62] {
+            ttbs[context]
+                .ttb0
+                .store(t8140_tagged_root(root, context), Ordering::Relaxed);
+        }
+        ttbs[9]
+            .ttb0
+            .store(t8140_tagged_root(other, 9), Ordering::Relaxed);
+        /* A root tagged for the wrong ASID is not owned by this context. */
+        ttbs[23]
+            .ttb0
+            .store(t8140_tagged_root(root, 22), Ordering::Relaxed);
+
+        assert_eq!(
+            context_mask_for_root(root, &ttbs),
+            (1u64 << 1) | (1u64 << 5) | (1u64 << 17) | (1u64 << 62)
+        );
+        assert_eq!(context_mask_for_root(other, &ttbs), 1u64 << 9);
+    }
 
     #[test]
     fn g17p_fixed_pages_and_cl_arena_overlap_the_driver_ledger() {
