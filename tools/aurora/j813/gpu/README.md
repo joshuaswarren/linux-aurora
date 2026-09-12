@@ -1,5 +1,15 @@
 # M5 / J813 GPU bring-up
 
+## Indexed Vulkan rendering, 2026-09-12
+
+The M5 application path now passes a nine-frame sweep of 1 through 160
+full-screen indexed triangles, checking every pixel and both queue completions.
+Matching the native auxiliary-framebuffer control fixes the fragment recovery
+previously triggered at 64 triangles. See [M5_INDEXED_RENDERING.md](M5_INDEXED_RENDERING.md)
+for the controlled comparison and remaining qualification gates.
+
+## Earlier compute bring-up
+
 The native Linux candidate identifies the physical T8142 GPU as
 **G17G revision C0, one die, one cluster, ten active cores**. Both M5 GPU
 firmware processors now complete RTKit startup and acknowledge Linux-owned
