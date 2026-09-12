@@ -495,6 +495,30 @@ impl M5FirmwareMemory {
         self.publish_graphics_records(generation as usize * 2, (1 + generation * 3) as u16)
     }
 
+    /// Reuse only a fully retired pair, replacing its application descriptors
+    /// while preserving firmware-owned PB/USC state and the installed queues.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn publish_next_application_job(
+        &mut self, vm: &mmu::Vm,
+        parameters: crate::g17_render::G17pRenderParameters,
+        controls: crate::m5_render::M5RenderControls, clusters: u32,
+        usc_required: [u64; 2], generation: u32,
+    ) -> Result {
+        if !(2..=64).contains(&generation) { return Err(EINVAL); }
+        let previous = generation - 1;
+        let (outer, inner, _) = self.graphics_status()?;
+        if outer != [2 + previous * 2; 3] || inner != [[1 + previous * 3; 3]; 2]
+            || !Self::graphics_pair_complete(self.graphics_completion()?, previous) {
+            return Err(EBUSY);
+        }
+        let (job, queues) = self.graphics.as_mut().ok_or(EINVAL)?;
+        job.prepare_application_frame(vm, parameters, controls, clusters,
+            usc_required, generation)?;
+        queues.publish_next_draw(job, generation)?;
+        self.graphics_stamp_flags = 0;
+        self.publish_graphics_records(generation as usize * 2, (1 + generation * 3) as u16)
+    }
+
     fn publish_graphics_records(&mut self, outer_index: usize, inner_head: u16) -> Result {
         self.shared.with_bytes_mut(|out| {
             for stage in 0..2 {

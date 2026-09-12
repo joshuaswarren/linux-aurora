@@ -47,6 +47,7 @@ pub(super) struct M5GraphicsJob {
     descriptor_template: KVec<u8>,
     scene_template: KVec<u8>,
     generation: u32,
+    target_shape: [u32; 5],
 }
 
 impl M5GraphicsJob {
@@ -149,62 +150,7 @@ impl M5GraphicsJob {
             program.usc().encode_initial_owner(HIGH + USC_INNER as u64,
                 &mut out[USC..USC + 0x70])?;
 
-            let objects = g17_render::RenderDescriptorObjects {
-                record_a: HIGH + SCHEDULER as u64,
-                shared: HIGH + PM as u64,
-                record_b: HIGH + SCENES as u64 + 0x80,
-                zero: HIGH + SCENE_ZERO as u64,
-            };
-            let metadata = g17_render::RenderDescriptorMetadata {
-                context_id: program.context_id() as u32, submission_ordinal: 0, command_buffer_state_word: 0,
-                ta_hardware_buffer_id: PB_HARDWARE_ID, submit_sequence: 1,
-            };
-            m5_render::build_ta_descriptor_base(&p, &controls, objects, metadata,
-                LOW + TA as u64, &mut out[TA..TA + g17_render::TA_DESCRIPTOR_SIZE])
-                .map_err(|_| EINVAL)?;
-            m5_render::build_fragment_descriptor_base(&p, &controls, objects,
-                g17_render::RenderDescriptorMetadata { submit_sequence: 0, ..metadata },
-                LOW + FRAGMENT as u64,
-                &mut out[FRAGMENT..FRAGMENT + g17_render::FRAGMENT_DESCRIPTOR_SIZE])
-                .map_err(|_| EINVAL)?;
-            let (ta, fragment) = out.split_at_mut(FRAGMENT);
-            let ta_usc = m5_render::M5RenderUscState {
-                control: HIGH + USC as u64, required_bytes: usc_required[0],
-                allocated_bytes: graphics_usc::CAPACITY_BYTES,
-                statistics: HIGH + USC_STATISTICS as u64,
-            };
-            m5_render::apply_usc_submission_state(ta, fragment, ta_usc,
-                m5_render::M5RenderUscState {
-                    required_bytes: usc_required[1], statistics: ta_usc.statistics + 0x40, ..ta_usc
-                }).map_err(|_| EINVAL)?;
-            // This bounded first submission owns hardware stamp1 in each
-            // queue and event-machine timestamp0x100. Do not import native
-            // allocator history (the captured queues had stamps2/3).
-            put32(ta, 0x79c, QUEUE_IDS[1] as u32);
-            put64(ta, 0x7a0, 0x100);
-            put64(ta, 0x7a8, 1);
-            ta[0x7b0] = 1;
-            ta[0x7b1] = 1;
-            put64(ta, 0x8a6, SIGNALS_HIGH + STAMPS_A as u64 + QUEUE_IDS[0] as u64 * 4);
-            put64(ta, 0x8ae, SIGNALS_HIGH + STAMPS_B as u64 + QUEUE_IDS[0] as u64 * 4);
-            put32(ta, 0x8b6, 0x100);
-            put32(ta, 0x8ba, QUEUE_IDS[0] as u32);
-            put64(ta, 0x8c6, (1u64 << 40) | 1);
-            put64(fragment, 0x2140, SIGNALS_HIGH + STAMPS_A as u64 + QUEUE_IDS[1] as u64 * 4);
-            put64(fragment, 0x2148, SIGNALS_HIGH + STAMPS_B as u64 + QUEUE_IDS[1] as u64 * 4);
-            put32(fragment, 0x2150, 0x100);
-            put32(fragment, 0x2154, QUEUE_IDS[1] as u32);
-            put32(fragment, 0x215c, 0);
-            put64(fragment, 0x2160, (1u64 << 40) | 1);
-            // Fixed 256x256 reference controls independently observed in
-            // the successful 25G76 draw; these replace inherited Neo values.
-            ta[0x789] = 8;
-            ta[0x85f] = 7;
-            put32(ta, 0x892, 0);
-            ta[0x932] = 0;
-            put32(fragment, 0x1fb0, 8);
-            fragment[0x21cc] = 0;
-            fragment[0x222d] = 0;
+            Self::encode_descriptors(out, &p, &controls, program.context_id(), usc_required)?;
             Ok(())
         })?;
         let mut descriptor_template = KVec::new();
@@ -215,7 +161,74 @@ impl M5GraphicsJob {
             Ok(())
         })?;
         Ok(Self { program, parameter_buffer, target_memory, aliases, graph_alias, graph, signals,
-            descriptor_template, scene_template, generation: 1 })
+            descriptor_template, scene_template, generation: 1,
+            target_shape: [p.width, p.height, u32::from(p.layers),
+                u32::from(p.utile_width), u32::from(p.utile_height)] })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_descriptors(
+        out: &mut [u8], p: &g17_render::G17pRenderParameters,
+        controls: &m5_render::M5RenderControls, context_id: u8,
+        usc_required: [u64; 2],
+    ) -> Result {
+        let objects = g17_render::RenderDescriptorObjects {
+            record_a: HIGH + SCHEDULER as u64,
+            shared: HIGH + PM as u64,
+            record_b: HIGH + SCENES as u64 + 0x80,
+            zero: HIGH + SCENE_ZERO as u64,
+        };
+        let metadata = g17_render::RenderDescriptorMetadata {
+            context_id: context_id as u32, submission_ordinal: 0, command_buffer_state_word: 0,
+            ta_hardware_buffer_id: PB_HARDWARE_ID, submit_sequence: 1,
+        };
+        m5_render::build_ta_descriptor_base(p, controls, objects, metadata,
+            LOW + TA as u64, &mut out[TA..TA + g17_render::TA_DESCRIPTOR_SIZE])
+            .map_err(|_| EINVAL)?;
+        m5_render::build_fragment_descriptor_base(p, controls, objects,
+            g17_render::RenderDescriptorMetadata { submit_sequence: 0, ..metadata },
+            LOW + FRAGMENT as u64,
+            &mut out[FRAGMENT..FRAGMENT + g17_render::FRAGMENT_DESCRIPTOR_SIZE])
+            .map_err(|_| EINVAL)?;
+        let (ta, fragment) = out.split_at_mut(FRAGMENT);
+        let ta_usc = m5_render::M5RenderUscState {
+            control: HIGH + USC as u64, required_bytes: usc_required[0],
+            allocated_bytes: graphics_usc::CAPACITY_BYTES,
+            statistics: HIGH + USC_STATISTICS as u64,
+        };
+        m5_render::apply_usc_submission_state(ta, fragment, ta_usc,
+            m5_render::M5RenderUscState {
+                required_bytes: usc_required[1], statistics: ta_usc.statistics + 0x40, ..ta_usc
+            }).map_err(|_| EINVAL)?;
+        // This bounded first submission owns hardware stamp1 in each
+        // queue and event-machine timestamp0x100. Do not import native
+        // allocator history (the captured queues had stamps2/3).
+        put32(ta, 0x79c, QUEUE_IDS[1] as u32);
+        put64(ta, 0x7a0, 0x100);
+        put64(ta, 0x7a8, 1);
+        ta[0x7b0] = 1;
+        ta[0x7b1] = 1;
+        put64(ta, 0x8a6, SIGNALS_HIGH + STAMPS_A as u64 + QUEUE_IDS[0] as u64 * 4);
+        put64(ta, 0x8ae, SIGNALS_HIGH + STAMPS_B as u64 + QUEUE_IDS[0] as u64 * 4);
+        put32(ta, 0x8b6, 0x100);
+        put32(ta, 0x8ba, QUEUE_IDS[0] as u32);
+        put64(ta, 0x8c6, (1u64 << 40) | 1);
+        put64(fragment, 0x2140, SIGNALS_HIGH + STAMPS_A as u64 + QUEUE_IDS[1] as u64 * 4);
+        put64(fragment, 0x2148, SIGNALS_HIGH + STAMPS_B as u64 + QUEUE_IDS[1] as u64 * 4);
+        put32(fragment, 0x2150, 0x100);
+        put32(fragment, 0x2154, QUEUE_IDS[1] as u32);
+        put32(fragment, 0x215c, 0);
+        put64(fragment, 0x2160, (1u64 << 40) | 1);
+        // Fixed 256x256 reference controls independently observed in
+        // the successful 25G76 draw; these replace inherited Neo values.
+        ta[0x789] = 8;
+        ta[0x85f] = 7;
+        put32(ta, 0x892, 0);
+        ta[0x932] = 0;
+        put32(fragment, 0x1fb0, 8);
+        fragment[0x21cc] = 0;
+        fragment[0x222d] = 0;
+        Ok(())
     }
 
     pub(super) fn parameter_descriptor(&self) -> Result<[u32; 4]> {
@@ -259,6 +272,10 @@ impl M5GraphicsJob {
     /// Rebuild only retired command/scene records; preserve live PB/USC pools.
     /// The parent additionally verifies the shared list, queues and event mask.
     pub(super) fn prepare_next_frame(&mut self, generation: u32) -> Result {
+        self.rebuild_retired_frame(generation, true)
+    }
+
+    fn rebuild_retired_frame(&mut self, generation: u32, clear_reference_output: bool) -> Result {
         if generation != self.generation + 1 || generation > 64
             || self.scheduler_status()? != [2, 0] {
             return Err(EBUSY);
@@ -266,9 +283,11 @@ impl M5GraphicsJob {
         let progress = self.progress()?;
         if progress[0] != 2 || progress[1] != self.generation * 0x100
             || progress[3] != self.generation * 0x100 { return Err(EBUSY); }
-        self.program.reset_completed_output()?;
-        let erased = self.program.result()?;
-        if erased.untouched != 65536 { return Err(EIO); }
+        if clear_reference_output {
+            self.program.reset_completed_output()?;
+            let erased = self.program.result()?;
+            if erased.untouched != 65536 { return Err(EIO); }
+        }
         self.graph.with_bytes_mut(|out| {
             out[..SCHEDULER].copy_from_slice(&self.descriptor_template);
             out[SCHEDULER..SCHEDULER + 0xc8].fill(0);
@@ -289,6 +308,41 @@ impl M5GraphicsJob {
         // never host-written to the expected new completion value.
         self.generation = generation;
         Ok(())
+    }
+
+    /// Re-encode a retired application's descriptors without replaying its old
+    /// command pointers. The current bounded queue retains one VM and target
+    /// shape; neither context replacement nor ring wrapping is admitted here.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn prepare_application_frame(
+        &mut self, vm: &mmu::Vm, mut p: g17_render::G17pRenderParameters,
+        controls: m5_render::M5RenderControls, clusters: u32,
+        usc_required: [u64; 2], generation: u32,
+    ) -> Result {
+        if vm.id() != self.program.vm().id() || clusters != 1
+            || [p.width, p.height, u32::from(p.layers), u32::from(p.utile_width),
+                u32::from(p.utile_height)] != self.target_shape
+            || generation != self.generation + 1 || generation > 64 {
+            return Err(ENOTSUPP);
+        }
+        self.target_memory.apply(&mut p);
+        p.cycle = self.parameter_buffer.scene_cycle();
+        p.record_index = m5_render::parameter_buffer_metrics_record(
+            self.parameter_buffer.metrics() + 0x40).map_err(|_| EINVAL)?;
+        p.ta_hardware_buffer_id = PB_HARDWARE_ID;
+        p.usc_flist_hardware_buffer_id = graphics_usc::HARDWARE_ID;
+        p.ta_timestamp_start = HIGH + TIMESTAMPS as u64;
+        p.ta_timestamp_end = p.ta_timestamp_start + 8;
+        p.fragment_timestamp_start = p.ta_timestamp_start;
+        p.fragment_timestamp_end = p.ta_timestamp_end;
+        let mut descriptors = KVec::new();
+        descriptors.extend_from_slice(&self.descriptor_template, GFP_KERNEL)?;
+        Self::encode_descriptors(&mut descriptors, &p, &controls,
+            self.program.context_id(), usc_required)?;
+        self.descriptor_template = descriptors;
+        // The application owns its output. It must never be erased by the
+        // native diagnostic's sentinel/reset logic.
+        self.rebuild_retired_frame(generation, false)
     }
 
     pub(super) fn result(&mut self) -> Result<crate::m5_graphics_bundle::TriangleResult> {
