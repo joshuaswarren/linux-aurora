@@ -7,6 +7,7 @@
 #include <linux/irqflags.h>
 
 #include <asm/barrier.h>
+#include <asm/apple-idle.h>
 #include <asm/cpuidle.h>
 #include <asm/cpufeature.h>
 #include <asm/sysreg.h>
@@ -50,6 +51,10 @@ void __cpuidle cpu_do_idle(void)
 	arm_cpuidle_save_irq_context(&context);
 
 	if (likely(idle == ARM64_IDLE_WFI)) {
+		if (apple_m5_needs_wait_save()) {
+			apple_m5_cpu_wfi();
+			goto restore_context;
+		}
 		dsb(sy);
 		wfi();
 	} else if (idle == ARM64_IDLE_YIELD) {
@@ -57,6 +62,7 @@ void __cpuidle cpu_do_idle(void)
 		asm volatile("yield" ::: "memory");
 	}
 
+restore_context:
 	arm_cpuidle_restore_irq_context(&context);
 }
 

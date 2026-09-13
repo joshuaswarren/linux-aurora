@@ -14,6 +14,7 @@
 #include <linux/timex.h>
 
 #include <clocksource/arm_arch_timer.h>
+#include <asm/apple-idle.h>
 
 #define USECS_TO_CYCLES(time_usecs)			\
 	xloops_to_cycles((time_usecs) * 0x10C7UL)
@@ -44,6 +45,14 @@ void __delay(unsigned long cycles)
 
 	if (alternative_has_cap_unlikely(ARM64_HAS_WFXT)) {
 		u64 end = start + cycles;
+
+		/* WFIT can clear the M5 secondary's GPRs just like idle WFI. */
+		if (apple_m5_needs_wait_save()) {
+			do {
+				apple_m5_cpu_wfit(end);
+			} while ((__delay_cycles() - start) < cycles);
+			return;
+		}
 
 		/*
 		 * Start with WFIT. If an interrupt makes us resume
