@@ -182,9 +182,10 @@ impl queue::Queue for M5Queue {
             })?;
             g17_uapi::validate_m5_reference_depth(&payload, &address_space)
                 .map_err(|error| {
-                    pr_err!("M5 depth admission rejected {:?}: size={}x{} dimensions={:#x} control={:#x} stride={:#x} meta_stride={:#x}\n",
+                    pr_err!("M5 depth admission rejected {:?}: size={}x{} dimensions={:#x} control={:#x} stride={:#x} meta_stride={:#x} base={:#x} meta={:#x} clear={:#x}\n",
                         error, payload.width, payload.height, payload.depth_dimensions,
-                        payload.zls_control, payload.depth.stride, payload.depth.compression_stride);
+                        payload.zls_control, payload.depth.stride, payload.depth.compression_stride,
+                        payload.depth.base, payload.depth.compression_base, payload.depth_clear);
                     ENOTSUPP
                 })?;
             let (parameters, mut controls) = M5FirmwareMemory::reference_render_profile();

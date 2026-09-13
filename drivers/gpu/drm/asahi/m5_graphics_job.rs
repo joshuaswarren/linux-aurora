@@ -35,8 +35,8 @@ const METRICS_HIGH: u64 = HIGH + 0x60000;
 const USER_BASE: u64 = 0x10_0000_0000;
 pub(super) const PB_HARDWARE_ID: u32 = 0;
 pub(super) const QUEUE_IDS: [u8; 2] = [10, 11];
-// Bounded resize experiment. The PB remains the native 48-page pool;
-// arbitrary scene capacity and firmware-driven pool growth are separate.
+// Match Mesa's framebuffer dimensions; target allocations follow each size.
+// Parameter-pool growth for more complex scenes remains separate.
 use crate::g17_uapi::M5_MAX_RENDER_DIMENSION as MAX_APPLICATION_DIMENSION;
 
 pub(super) struct M5GraphicsJob {

@@ -36,7 +36,9 @@ pub(crate) const UAPI_COMPUTE_SIZE: usize = 64;
 pub(crate) const UAPI_ATTACHMENT_SIZE: usize = 24;
 pub(crate) const UAPI_MAX_ATTACHMENTS: usize = 16;
 pub(crate) const UAPI_MAX_HARDWARE_COMMANDS: u32 = 64;
-pub(crate) const M5_MAX_RENDER_DIMENSION: u32 = 1024;
+// Match the image/framebuffer limit advertised by Honeykrisp. Storage is
+// sized from each submission; this is a format limit, not a demo window cap.
+pub(crate) const M5_MAX_RENDER_DIMENSION: u32 = 16384;
 pub(crate) const UAPI_BARRIER_NONE: u16 = 0xffff;
 pub(crate) const USC_WINDOW_SIZE: u64 = 1 << 32;
 #[cfg(not(test))]
@@ -749,36 +751,44 @@ pub(crate) fn validate_m5_reference_depth<A: GpuAddressSpace>(
     let expected_control = if compressed { 0x80044 } else { 0x80000 };
     let width = u32::from(command.width);
     let height = u32::from(command.height);
-    if !(64..=M5_MAX_RENDER_DIMENSION).contains(&width)
-        || !(64..=M5_MAX_RENDER_DIMENSION).contains(&height)
-        || command.layers != 1 {
+    if !(1..=M5_MAX_RENDER_DIMENSION).contains(&width)
+        || !(1..=M5_MAX_RENDER_DIMENSION).contains(&height)
+        || command.layers != 1 || (compressed && (width < 16 || height < 16)) {
         return Err(UapiTranslateError::ZlsFields);
     }
-    // D32 uses 64x64 tiles, each occupying one 16KiB page. Compression
-    // metadata uses 8 bytes per 16x16 tile, with both axes padded to powers
-    // of two. This is the single-level, single-sample layout used by Mesa AIL.
-    let data_bytes = u64::from(width.div_ceil(64))
-        * u64::from(height.div_ceil(64)) * 0x4000;
-    let metadata_bytes = u64::from(width.next_power_of_two() / 16)
-        * u64::from(height.next_power_of_two() / 16) * 8;
-    let expected_stride = ((data_bytes / 0x4000 - 1) << 14) | 1;
+    // AIL uses full 64x64 D32 tiles while both axes fit a tile. If either
+    // axis is smaller, the level uses a power-of-two miptail, aligned to a
+    // 128-byte cacheline. Single-layer M5 surfaces are not page-padded.
+    let data_bytes = if width >= 64 && height >= 64 {
+        u64::from(width.div_ceil(64)) * u64::from(height.div_ceil(64)) * 0x4000
+    } else {
+        (u64::from(width.next_power_of_two())
+            * u64::from(height.next_power_of_two()) * 4).div_ceil(128) * 128
+    };
+    let metadata_bytes = (u64::from(width.next_power_of_two().div_ceil(16))
+        * u64::from(height.next_power_of_two().div_ceil(16)) * 8).div_ceil(128) * 128;
+    let expected_stride = if data_bytes >= 0x4000 && data_bytes & 0x3fff == 0 {
+        ((data_bytes / 0x4000 - 1) << 14) | 1
+    } else { 0 };
     let expected_metadata_stride = (metadata_bytes / 128 - 1) << 14;
     let dimensions = (width - 1) | ((height - 1) << 16);
     if command.depth_dimensions != dimensions
         || command.zls_control != expected_control
         || command.depth_clear != 0x3f800000
-        || depth.base & 0x3fff != 0 || depth.compression_base & 0x3fff != 0
+        // Image suballocations and small miptails use cacheline alignment;
+        // the backing VM pages remain independently validated below.
+        || depth.base & 0x7f != 0 || depth.compression_base & 0x7f != 0
         || (depth.stride != 0 && u64::from(depth.stride) != expected_stride)
         || (depth.compression_stride != 0
             && u64::from(depth.compression_stride) != expected_metadata_stride)
         || (!compressed && depth.compression_stride != 0) {
         return Err(UapiTranslateError::ZlsFields);
     }
-    // Validate the entire resized surface and all metadata pages before the
+    // Validate the entire resized surface and metadata before the
     // M5 caller removes the unused single-layer array stride fields.
     require_range(address_space, depth.base, data_bytes, GpuAccess::ReadWrite)?;
     if compressed {
-        require_range(address_space, depth.compression_base, metadata_bytes.div_ceil(0x4000) * 0x4000,
+        require_range(address_space, depth.compression_base, metadata_bytes,
             GpuAccess::ReadWrite)?;
     }
     Ok(())

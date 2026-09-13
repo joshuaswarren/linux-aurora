@@ -4,12 +4,41 @@ The experimental J813/T8142 adapter keeps both M5 firmware processors running
 and exposes an Asahi render node. It uses the M5 runtime and SKSM graphics
 submission path, with ordinary DRM VM, GEM, queue and syncobj interfaces.
 
-The first application triangle is hardware-qualified with a captured native
-program. General Mesa rendering, Vulkan, glxgears and accelerated XFCE remain
-unfinished. Native DCP presentation and software XFCE were verified separately;
-the GPU and DCP still need integration in a single accelerated desktop.
+GLX gears now renders repeatedly on the M5 GPU through Zink and Honeykrisp
+in a DCP-backed XFCE session. X11 presentation uses Mesa's software WSI and
+linear render targets; XFCE itself still uses CPU rendering. This qualifies
+the gears workload, not general Vulkan applications or an accelerated compositor.
 
-## Runtime and current limits
+## Resizable GLX gears, 2026-09-13
+
+The adapter accepts render dimensions from 1 through 16384 on either axis,
+matching Mesa's advertised image limit. D32 storage validation now handles
+small Morton layouts with 128-byte alignment as well as 64x64 tiled images.
+Single-layer depth attachments may use zero for the unused array stride;
+nonzero strides must match the computed layout. Compression remains disabled
+when either dimension is below 16. Mapping coverage and the existing render
+profile checks remain enforced.
+
+The hardware resize test passed 15 cases, including 1x1, 16x16, 1027x813,
+1920x1080, 3840x2160, 16384x1 and 1x16384, followed by 80 rapid resize requests
+and a return to 512x384. Each case retired GPU work; ordinary windows also
+had changing XGetImage pixels. One-pixel and very thin windows can legitimately
+contain only background, so those use completion checks rather than a motion
+assertion. This does not qualify every dimension pair or a 16384x16384 allocation.
+
+XFCE maximize (2560x1613), fullscreen (2560x1664), and restoration to maximized
+also passed with changing full-client captures and paired TA/fragment
+completions. The tests are `test-m5-gears-resize.py` and
+`test-m5-gears-window-states.py`; run with the desktop Python, DISPLAY=:0,
+the current gears PID file and a new output directory. They change the real
+window. The window-state test leaves it maximized.
+
+Private evidence archive SHA-256 values:
+
+- Resize: `77314841023810ffbe61bd1af8783062d5be7b496036e5a6644efd1763839956`
+- Window states: `f771df704d5021b5ef8ad6bc7cb5f350a5fcfab3fca3478c81d35f90d7a13a28`
+
+## Initial runtime and limits (historical)
 
 On the RAM candidate with the measured M5 firmware profile and providers,
 `modprobe asahi m5_initdata_test=14 m5_fw_trace=0` selects the adapter. Mode13
