@@ -11,6 +11,7 @@ import signal
 import subprocess
 import sys
 import time
+from m5_native_cts_validation import driver_errors, invalid_cases
 
 p = argparse.ArgumentParser(description=__doc__)
 p.add_argument('name')
@@ -159,7 +160,10 @@ report['unexpected_cases'] = (sorted(set(started_names) - set(expected_cases))
 report['results'] = dict(Counter(re.findall(r'<Result StatusCode="([^"]+)"', qpa)))
 report['cases_completed'] = sum(report['results'].values())
 report['renderer_strings'] = re.findall(r'^#sessionInfo renderer "([^"]+)"', qpa, re.M)
+report['driver_errors'] = driver_errors((out / 'stdout.log').read_text(errors='replace'))
+report['invalid_cases'] = sorted(invalid_cases(report['driver_errors'], started_names))
 report['passed'] = (report['returncode'] == 0 and report['provenance_verified']
+                    and not report['driver_errors']
                     and not report['timed_out'] and not report['thermal_aborted']
                     and report['cases_started'] > 0
                     and report['cases_started'] == report['cases_completed']
