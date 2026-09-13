@@ -699,6 +699,8 @@ static int dchid_open(struct hid_device *hdev)
 
 		if (!wait_for_completion_timeout(&iface->ready, msecs_to_jiffies(START_TIMEOUT_MS))) {
 			dev_err(iface->dchid->dev, "iface %s start timed out\n", iface->name);
+			/* A failed sensor boot must not poison every later open. */
+			iface->starting = false;
 			return -ETIMEDOUT;
 		}
 	}

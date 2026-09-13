@@ -6,6 +6,10 @@ grep -aq apple,j813 /proc/device-tree/compatible
 [ -c /dev/dri/renderD128 ]
 [ -x /desktop/usr/bin/glxgears ]
 ! pidof Xorg >/dev/null 2>&1
+# Start sensor firmware before Xorg's one-shot libinput device probe.
+sh /bin/j813-input-start
+cp /bin/j813-input-ready.py /run/j813-input-ready.py
+chroot /desktop /usr/bin/python3 /run/j813-input-ready.py
 kms_device=
 for node in /sys/class/drm/card[0-9]*; do
     [ -f "$node/dev" ] || continue

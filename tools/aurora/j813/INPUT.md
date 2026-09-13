@@ -99,7 +99,26 @@ private session namespace, and checks PTY allocation before Xorg starts.
 This userspace fix was applied to the running v7 and verified there, then
 included in the next RAM image; the kernel did not change.
 
-## Evidence
+## GPU desktop input regression, 2026-09-13
+
+A RAM boot reached XFCE with a stationary pointer. The MTP log showed an AFE
+sensor boot failure (`No HINT_L`), then a touch-ready timeout. The transport
+left its `starting` flag set after that timeout, so every subsequent open
+returned `EINPROGRESS`; an Xorg udev reprobe could not recover it.
+
+The timeout now clears `starting`, allowing a subsequent open to retry the
+firmware/power sequence. `input-ready.py` performs bounded opens of both input
+interfaces without reading events. The GPU shadow-Xorg launcher runs it
+before Xorg probes libinput devices and fails startup if input remains broken.
+The candidate builder copies the transport change and installs the helper.
+
+After rebuilding and RAM-booting, both interfaces opened successfully, Xorg
+registered the touchpad, and the user confirmed that the pointer moved while
+GPU-rendered gears rotated. This boot succeeded on its initial sensor start;
+recovery after an injected sensor failure has not been hardware-qualified.
+The underlying intermittent AFE boot failure remains under investigation.
+
+## Earlier evidence
 
 - `logs/mtp-preboot-comparison2-20260910.log`: successful direct m1n1 boot.
 - `logs/desktop-v5-cold-mtp-boot-20260910.log`: full RAM payload readback.
