@@ -187,6 +187,7 @@ bool bio_crypt_dun_is_contiguous(const struct bio_crypt_ctx *bc,
 	/* If the DUN wrapped through 0, don't treat it as contiguous. */
 	return carry == 0;
 }
+EXPORT_SYMBOL_GPL(bio_crypt_dun_is_contiguous);
 
 /*
  * Checks that two bio crypt contexts are compatible - i.e. that

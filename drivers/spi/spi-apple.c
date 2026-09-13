@@ -188,6 +188,7 @@ static void apple_spi_init(struct apple_spi *spi)
 	/* Disable delays */
 	reg_write(spi, APPLE_SPI_DELAY_PRE, 0);
 	reg_write(spi, APPLE_SPI_DELAY_POST, 0);
+	reg_write(spi, APPLE_SPI_DELAY_POST_CYCLES, 0);
 }
 
 static int apple_spi_prepare_message(struct spi_controller *ctlr, struct spi_message *msg)
