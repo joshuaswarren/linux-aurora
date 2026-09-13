@@ -23,6 +23,11 @@ for task_file in "$task_root"/linux/drivers/gpu/drm/apple/*.[ch]; do
     task_destination="$task_src/drivers/gpu/drm/apple/$(basename "$task_file")"
     cmp -s "$task_file" "$task_destination" || cp "$task_file" "$task_destination"
 done
+for task_file in dockchannel-hid.c dockchannel-hid-protocol.h; do
+    task_input_dir=drivers/hid/dockchannel-hid
+    cmp -s "$task_root/linux/$task_input_dir/$task_file" "$task_src/$task_input_dir/$task_file" ||
+        cp "$task_root/linux/$task_input_dir/$task_file" "$task_src/$task_input_dir/$task_file"
+done
 "$task_src/scripts/config" --file "$task_build/.config" \
     --module DRM_APPLE --enable BACKLIGHT_CLASS_DEVICE --enable DRM_APPLE_DEBUG \
     --enable APPLE_MAILBOX
@@ -60,6 +65,7 @@ done
 mkdir -p "$task_ramfs/etc/modprobe.d" "$task_ramfs/opt/j813"
 printf 'blacklist appledrm\nblacklist asahi\n' >"$task_ramfs/etc/modprobe.d/m5-gpu-dcp.conf"
 install -m644 "$task_root/desktop-dcp.conf" "$task_ramfs/opt/j813/desktop-dcp.conf"
+install -m644 "$task_root/linux/tools/aurora/j813/input-ready.py" "$task_ramfs/bin/j813-input-ready.py"
 (cd "$task_ramfs"; find . -print0 | cpio --null -o --format=newc --owner=0:0 2>/dev/null | gzip -9) \
     >"$task_out/initramfs.cpio.gz"
 (cd "$task_out"; sha256sum Image asahi.ko appledrm.ko kernel.config t8142-j813.dtb initramfs.cpio.gz > SHA256SUMS)
