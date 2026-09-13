@@ -30,3 +30,7 @@ This change closes the collection gap for future runs. It does not reconstruct
 the missing v25 records or retroactively certify their contents. The final
 hardware qualification still needs complete logs, native-driver provenance,
 unchanged CTS and all required cases/configurations.
+
+Physical v27 regression: 10,438 consecutive printk records, zero loss/errors,
+and all 5,207 GPU generations independently matched to submissions with both
+queues retired exactly once. See [retained evidence](M5_NATIVE_RASTER_STATE.md).
