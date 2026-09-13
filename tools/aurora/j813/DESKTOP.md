@@ -46,14 +46,15 @@ namespaces and the existing Wi-Fi/Bluetooth drivers. GPU acceleration remains
 a separate qualification step.
 
 `build-desktop-root.sh` prepares a clean signed Ubuntu 26.04 ARM64 XFCE root
-in `j813-builder`, with Xorg fbdev, BlueZ/Blueman, PulseAudio and SSH tools.
+in `j813-builder`, with Xorg fbdev, BlueZ/Blueman, PulseAudio, htop and SSH tools.
 It uses a fresh root, not Neo's installed user data. Its root account and
 `aurora` user have no configured password; SSH host keys and machine IDs are
 removed before archiving. The initial launch uses a private Xauthority cookie,
 disables network X11 listening, and runs XFCE as the unprivileged user.
 
-Root archive: `artifacts/desktop/desktop-root-v1.tar.gz`, 352767782 bytes,
-SHA256 `f6fbe2e086c7df6e194ef01f98d1208e8aaac3fe51af96547ab33c97850ddd6d`.
+Root archive rebuilt on 2026-09-13 with htop 3.4.1-5build2:
+`artifacts/desktop/desktop-root-v1.tar.gz`, 363318352 bytes,
+SHA256 `ada4e031949b4985bc8ee9abeac64faf3a28178a59f9ba7a1e0b624f72e202bc`.
 Package manifest and checksums are adjacent. Serve only this public root and
 its manifest from a dedicated transfer directory; the parent also holds
 private firmware-containing boot images and must not be exposed over HTTP.
