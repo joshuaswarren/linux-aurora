@@ -1,0 +1,1 @@
+{"pipelines":{"compute_pipelines":[{"compute_function":"m5_half_min_intrinsic"},{"compute_function":"m5_half_max_intrinsic"},{"compute_function":"m5_half_min_live"}]}}
