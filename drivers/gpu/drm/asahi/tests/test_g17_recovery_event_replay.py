@@ -29,8 +29,12 @@ assert drain.index("break;", type4) > drain.index("batch.recovery_generation = S
 replay = "crate::driver::queue_g17p_firmware_event_worker(state.dev.clone());"
 assert recovery.count(replay) == 1
 assert recovery.index("complete_pending_primary_recovery") < recovery.index(replay)
-assert recovery.index("if result.is_err()") < recovery.index(replay)
-assert recovery.index("return result;", recovery.index("if result.is_err()")) < recovery.index(replay)
+# The failure handler must come before the replay requeue and must leave the
+# function, so a failed recovery never re-arms the drain. Spelled as a match on
+# the (step, error) pair since the crashed transition began naming its step.
+fail = recovery.index("note_state_crashed(")
+assert fail < recovery.index(replay)
+assert recovery.index("return Err(error);", fail) < recovery.index(replay)
 
 # Model the exact work handoff: one notification can cover a type-4 record and
 # later records in the same producer snapshot. The type-4 consumer is advanced,

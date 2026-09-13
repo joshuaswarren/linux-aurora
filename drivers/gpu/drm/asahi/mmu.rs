@@ -294,6 +294,16 @@ fn t8140_tagged_root(root: u64, slot: usize) -> u64 {
     root | TTBR_VALID | ((slot as u64) << TTBR_ASID_SHIFT)
 }
 
+fn context_mask_for_root(root: u64, ttbs: &[SlotTTBS; UAT_NUM_CTX]) -> u64 {
+    let mut contexts = 0u64;
+    for (context_id, ttb) in ttbs.iter().enumerate() {
+        if ttb.ttb0.load(Ordering::Acquire) == t8140_tagged_root(root, context_id) {
+            contexts |= 1u64 << context_id;
+        }
+    }
+    contexts
+}
+
 fn t8140_opening_render_layout(render_low: u64, source_high: u64) -> T8140RootLayout {
     T8140RootLayout {
         low: [
@@ -908,6 +918,16 @@ impl gpuvm::DriverGpuVm for VmInner {
             );
             return Err(EINVAL);
         }
+
+        // A T8140 VM can already be published through one or more
+        // independently leased compute/render contexts when userspace adds a
+        // new mapping. Those contexts cache invalid translations too. The
+        // historical fixed-compute-context path happened to invalidate its
+        // ASID again at every submit, masking this omission; a real per-queue
+        // context instead kept the negative entry and faulted on the newly
+        // mapped scratch page. Invalidate only the changed range, in exactly
+        // the contexts which currently name this page-table root.
+        self.tlbi_live_contexts(op.addr(), op.range());
         Ok(())
     }
     fn step_unmap(
@@ -921,18 +941,7 @@ impl gpuvm::DriverGpuVm for VmInner {
         self.page_table
             .unmap_pages(va.addr()..(va.addr() + va.range()))?;
 
-        if let Some(asid) = self.slot() {
-            fence(Ordering::SeqCst);
-            mem::tlbi_range(asid as u8, va.addr() as usize, va.range() as usize);
-            mod_dev_dbg!(
-                self.dev,
-                "MMU: flush range: asid={:#x} start={:#x} len={:#x}\n",
-                asid,
-                va.addr(),
-                va.range(),
-            );
-            mem::sync();
-        }
+        self.tlbi_live_contexts(va.addr(), va.range());
 
         if op.unmap_and_unlink_va_defer().is_none() {
             dev_err!(self.dev.as_ref(), "step_unmap: could not unlink gpuva");
@@ -975,18 +984,7 @@ impl gpuvm::DriverGpuVm for VmInner {
 
         self.page_table.unmap_pages(unmap_start..unmap_end)?;
 
-        if let Some(asid) = self.slot() {
-            fence(Ordering::SeqCst);
-            mem::tlbi_range(asid as u8, unmap_start as usize, unmap_range as usize);
-            mod_dev_dbg!(
-                self.dev,
-                "MMU: flush range: asid={:#x} start={:#x} len={:#x}\n",
-                asid,
-                unmap_start,
-                unmap_range,
-            );
-            mem::sync();
-        }
+        self.tlbi_live_contexts(unmap_start, unmap_range);
 
         if op.unmap().unmap_and_unlink_va_defer().is_none() {
             dev_err!(self.dev.as_ref(), "step_unmap: could not unlink gpuva");
@@ -1040,6 +1038,29 @@ impl VmInner {
     /// Returns the translation table base for this Vm
     fn ttb(&self) -> u64 {
         self.page_table.ttb()
+    }
+
+    /// Invalidate this VM's changed range in every hardware context which
+    /// currently publishes its root. G17P compute uses independently leased
+    /// application contexts, so invalidating only the ordinary render slot
+    /// leaves stale executable translations live across a USC unbind/rebind.
+    fn tlbi_live_contexts(&self, addr: u64, size: u64) {
+        let contexts = {
+            let shared = self.uat_inner.lock();
+            context_mask_for_root(self.ttb(), shared.ttbs())
+        };
+
+        if contexts == 0 {
+            return;
+        }
+
+        fence(Ordering::SeqCst);
+        for context_id in 0..UAT_NUM_CTX {
+            if contexts & (1u64 << context_id) != 0 {
+                mem::tlbi_range(context_id as u8, addr as usize, size as usize);
+            }
+        }
+        mem::sync();
     }
 
     /// Map an `mm::Node` representing an mapping in VA space.
@@ -3565,6 +3586,26 @@ impl Drop for VmInner {
                 }
             }
 
+            // Say which TTBAT entries this drop retracted.
+            //
+            // This is the only path that zeroes a context root without logging
+            // anything, and a zeroed root is not a quiet condition: a VM with no
+            // TTBAT context holding its root has no translation regime, so its
+            // kicks are accepted by firmware and silently never run -- which is
+            // the wedge, reported two seconds later as a completion timeout with
+            // no fault anywhere. Diagnosing one such wedge took four rounds and a
+            // live machine precisely because nothing here left a trace. One line
+            // per VM teardown that actually retracted something is cheap.
+            if inval || dropped_aliases.iter().any(|dropped| *dropped) {
+                pr_info!(
+                    "MMU: VM {} teardown retracted TTBAT roots: bind-slot {}={}, compute aliases {:?}\n",
+                    self.id,
+                    idx,
+                    inval,
+                    dropped_aliases,
+                );
+            }
+
             // In principle we dropped all the KernelMappings already, but we might as
             // well play it safe and invalidate the whole ASID.
             if inval {
@@ -4075,7 +4116,17 @@ impl Uat {
     /// live VM can otherwise retain a negative or old translation there when
     /// its render-pool generation is replaced. Match the installed TTBAT roots
     /// instead of flushing every client or assuming a fixed context ID.
-    pub(crate) fn flush_t8140_vm_contexts(&self, vm: &Vm) -> Result<u64> {
+    /// Which TTBAT contexts currently hold `vm`'s root, as a bitmask.
+    ///
+    /// Zero is not a benign answer: it means the GPU has no page tables for any
+    /// context a descriptor naming this VM could declare, so every submission
+    /// against it is undispatchable -- accepted, never executed, and never
+    /// completed. Reads only; mutates nothing.
+    ///
+    /// Split out of `flush_t8140_vm_contexts` so a caller can prove the
+    /// condition BEFORE it starts mutating the VM. See `new_user_render_storage`,
+    /// where the same lookup used to run several destructive steps too late.
+    pub(crate) fn t8140_vm_context_mask(&self, vm: &Vm) -> Result<u64> {
         if self.cfg != UatConfig::T8140 {
             return Err(EINVAL);
         }
@@ -4091,19 +4142,23 @@ impl Uat {
             }
             owner.page_table.ttb()
         };
-        let contexts = {
-            let inner = self.inner.lock();
-            let ttbs = inner.ttbs();
-            let mut contexts = 0u64;
-            for context_id in 0..UAT_NUM_CTX {
-                if ttbs[context_id].ttb0.load(Ordering::Acquire)
-                    == t8140_tagged_root(root, context_id)
-                {
-                    contexts |= 1u64 << context_id;
-                }
-            }
-            contexts
-        };
+        let inner = self.inner.lock();
+        Ok(context_mask_for_root(root, inner.ttbs()))
+    }
+
+    /// `ENOENT` unless some TTBAT context holds `vm`'s root.
+    ///
+    /// The cheap precondition form of `flush_t8140_vm_contexts`, for callers
+    /// that must not begin work they cannot finish.
+    pub(crate) fn require_t8140_vm_context(&self, vm: &Vm) -> Result {
+        if self.t8140_vm_context_mask(vm)? == 0 {
+            return Err(ENOENT);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn flush_t8140_vm_contexts(&self, vm: &Vm) -> Result<u64> {
+        let contexts = self.t8140_vm_context_mask(vm)?;
         if contexts == 0 {
             return Err(ENOENT);
         }
@@ -5837,6 +5892,35 @@ impl Drop for Uat {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_mask_follows_every_published_copy_of_one_vm_root() {
+        let root = 0x101_abc0_0000;
+        let other = 0x101_def0_0000;
+        let ttbs = core::array::from_fn(|_| SlotTTBS {
+            ttb0: AtomicU64::new(0),
+            ttb1: AtomicU64::new(0),
+        });
+
+        for context in [1usize, 5, 17, 62] {
+            ttbs[context]
+                .ttb0
+                .store(t8140_tagged_root(root, context), Ordering::Relaxed);
+        }
+        ttbs[9]
+            .ttb0
+            .store(t8140_tagged_root(other, 9), Ordering::Relaxed);
+        /* A root tagged for the wrong ASID is not owned by this context. */
+        ttbs[23]
+            .ttb0
+            .store(t8140_tagged_root(root, 22), Ordering::Relaxed);
+
+        assert_eq!(
+            context_mask_for_root(root, &ttbs),
+            (1u64 << 1) | (1u64 << 5) | (1u64 << 17) | (1u64 << 62)
+        );
+        assert_eq!(context_mask_for_root(other, &ttbs), 1u64 << 9);
+    }
 
     #[test]
     fn g17p_fixed_pages_and_cl_arena_overlap_the_driver_ledger() {

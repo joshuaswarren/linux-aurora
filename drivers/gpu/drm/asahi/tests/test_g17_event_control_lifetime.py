@@ -190,9 +190,14 @@ fn invalid_bounds_pointer_counts_or_membership_do_not_mutate() {
 }
 #[test]
 fn fence_requires_its_exact_completed_and_unlinked_event_control() {
+    // `slot_word` is the submitted counter as it reads in SHARED memory;
+    // `submitted` is the driver's mirror of it. `unlinked()` deliberately does
+    // not consult slot_word -- it is carried so a capture can show whether the
+    // mirror drifted, which is a different bug from the firmware being behind.
     let base = G17PRenderEventControlState {
-        record_index: 17, submitted: 8, completed: 7, membership: 1,
+        record_index: 17, submitted: 8, slot_word: 8, completed: 7, membership: 1,
     };
+    assert!(!G17PRenderEventControlState { slot_word: 0, ..base }.unlinked());
     assert!(!base.unlinked());
     assert!(!G17PRenderEventControlState { completed: 8, ..base }.unlinked());
     assert!(!G17PRenderEventControlState { membership: 0, ..base }.unlinked());

@@ -1275,9 +1275,13 @@ impl Resources {
     }
 
     /// Caller must own the runtime mutex and have just verified the firmware
-    /// is stopped at the pre-ACK recovery handshake with DM1 slot0 blamed.
-    /// This is not an admission probe and must never run before that halt.
-    pub(crate) fn g17p_halted_slot0_snapshot(&self) -> Result<Option<G17PHaltedSlot0Snapshot>> {
+    /// is stopped at the pre-ACK recovery handshake with DM0 or DM1 slot0
+    /// selected. This is not an admission probe and must never run before
+    /// that halt. `read_dm1_progress` must only be true for a DM1 report.
+    pub(crate) fn g17p_halted_slot0_snapshot(
+        &self,
+        read_dm1_progress: bool,
+    ) -> Result<Option<G17PHaltedSlot0Snapshot>> {
         let sgx = self.sgx.try_access().ok_or(ENODEV)?;
         let _guard = self.sksm_fifo.lock();
         // The GPC summary is in the always-on range. A halted firmware need
@@ -1295,21 +1299,25 @@ impl Resources {
         let mut progress = [0u64; 8];
         let mut progress_count = 0;
         let mut progress_errno = 0;
-        if let Some(selector) = crate::g17_completion::g17p_dm1_monitor_selector_index(state_before) {
-            // These are the eight reads B1 FUN_6a20 performs for DM1, through
-            // the selected progress port. Do not write10400/10408 or touch
-            // any bank absent from the native sample table.
-            for (index, (register, flags)) in crate::g17_completion::G17P_DM1_MONITOR_READS
-                .iter().enumerate()
+        if read_dm1_progress {
+            if let Some(selector) =
+                crate::g17_completion::g17p_dm1_monitor_selector_index(state_before)
             {
-                match Self::g17p_sksm_port_read_locked(&sgx, *register, selector, *flags) {
-                    Ok(value) => {
-                        progress[index] = value;
-                        progress_count += 1;
-                    }
-                    Err(error) => {
-                        progress_errno = error.to_errno();
-                        break;
+                // These are the eight reads B1 FUN_6a20 performs for DM1,
+                // through the selected progress port. Do not write10400/10408
+                // or touch any bank absent from the native sample table.
+                for (index, (register, flags)) in crate::g17_completion::G17P_DM1_MONITOR_READS
+                    .iter().enumerate()
+                {
+                    match Self::g17p_sksm_port_read_locked(&sgx, *register, selector, *flags) {
+                        Ok(value) => {
+                            progress[index] = value;
+                            progress_count += 1;
+                        }
+                        Err(error) => {
+                            progress_errno = error.to_errno();
+                            break;
+                        }
                     }
                 }
             }

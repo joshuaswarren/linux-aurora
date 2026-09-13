@@ -48,9 +48,15 @@ for identity in [
 assert "q.released" in matches and "q.quarantined" in matches
 assert "owner_free && active_free && binding_free && context_free && !quarantined" in predicate
 assert "q.active.is_none() && !q.quarantined" in release
-assert release.index("q.released = true") < release.index("q.binding = None")
+# The claim is given up at close; the binding and context are NOT, because the
+# firmware still has the QID installed and sweeps its record pointer. They are
+# dropped at the rebind instead -- see
+# test_g17_async_release_retains_firmware_state.
+assert release.index("q.released = true") < release.index("q.owner = None")
+assert "q.binding = None" not in release
 assert service.index("q.active.take()") < service.index("if q.released")
-assert "q.binding = None; q.context = None; q.owner = None" in service
+assert "q.binding = None" not in service
+assert "q.binding.take()" in prepare and "q.context.take()" in prepare
 assert "q.queue.requires_first_install()" in needs_install
 assert "self.next_compute_queue_id = Some(G17P_COMPUTE_QUEUE_ID_BASE)" in stop
 for stale_session_field in [

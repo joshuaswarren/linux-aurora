@@ -54,6 +54,7 @@ pub(crate) const G17P_FIRMWARE_EVENT_COMPLETION_TYPE: u32 = 1;
 /// emit one, so it is the firmware's own account of which stamps moved.
 pub(crate) const G17P_FIRMWARE_EVENT_STAMP_TYPE: u32 = 1;
 pub(crate) const G17P_FIRMWARE_EVENT_RECOVERY_TYPE: u32 = 4;
+pub(crate) const G17P_FIRMWARE_EVENT_TVB_GROW_TYPE: u32 = 6;
 pub(crate) const G17P_FIRMWARE_EVENT_UMA_GROW_TYPE: u32 = 13;
 pub(crate) const D93AP_G17P_SGX_SOURCE_INDEX: u8 = 4;
 pub(crate) const D93AP_G17P_SGX_INTERRUPTS_VALID: u32 = 0xdf;
@@ -148,6 +149,31 @@ pub(crate) const G17P_EVENT_CAPACITY: u32 = G17P_FIRMWARE_EVENT_CAPACITY;
 /// 0x48 bytes per entry -- see the block comment above. Deliberately NOT
 /// `REPORT_ENTRY_SIZE`.
 pub(crate) const G17P_EVENT_ENTRY_SIZE: usize = G17P_FIRMWARE_EVENT_ENTRY_SIZE;
+pub(crate) const G17P_REPORT_HISTORY_MAX: u32 = 8;
+
+/// Bound a recovery-history request independently of the event-ring cursors.
+/// Budget zero retains the historical "unlimited" spelling, but recovery
+/// diagnostics still cap it at eight records.
+pub(crate) const fn g17p_report_history_count(print_budget: u32) -> u32 {
+    if print_budget == 0 || print_budget > G17P_REPORT_HISTORY_MAX {
+        G17P_REPORT_HISTORY_MAX
+    } else {
+        print_budget
+    }
+}
+
+/// Return history slots oldest-to-newest, including wrap at slot zero.
+pub(crate) const fn g17p_report_history_slot(
+    producer: u32,
+    count: u32,
+    index: u32,
+) -> Option<u32> {
+    if producer >= G17P_EVENT_CAPACITY || count > G17P_EVENT_CAPACITY || index >= count {
+        None
+    } else {
+        Some((producer + G17P_EVENT_CAPACITY - count + index) & (G17P_EVENT_CAPACITY - 1))
+    }
+}
 /// Firmware event type names, for logging. Type 4 is the one that matters:
 /// the firmware halted and is asking the host to run the restart handshake.
 pub(crate) fn g17p_firmware_event_name(event_type: u32) -> &'static str {
@@ -155,6 +181,7 @@ pub(crate) fn g17p_firmware_event_name(event_type: u32) -> &'static str {
         0 => "fault",
         1 => "stamp-flags",
         4 => "gpu-restart",
+        6 => "tvb-grow-request",
         7 => "uma-grow-request",
         8 => "channel-error",
         13 => "uma-async-grow-complete",
@@ -273,11 +300,19 @@ pub(crate) const fn g17p_halted_gmmu_sample_allowed(
 }
 
 impl G17PHaltedSlot0Gate {
-    pub(crate) const fn allows_sample(self) -> bool {
+    /// c020/c078 are common scheduler-slot records for both render data
+    /// masters.  They are safe to sample while either DM0 (TA) or DM1 (3D)
+    /// is explicitly selected by the halted firmware report.
+    pub(crate) const fn allows_generic_sample(self) -> bool {
         self.handshake_state == 1 && self.epoch == self.expected_epoch
             && self.report_state == 2 && self.host_requested == 0
             && self.slot_present == 1 && self.slot == 0
-            && self.data_master_present == 1 && self.data_master == 1
+            && self.data_master_present == 1 && self.data_master <= 1
+    }
+
+    /// B1's additional eight selected-progress reads are specific to DM1.
+    pub(crate) const fn allows_dm1_progress_sample(self) -> bool {
+        self.allows_generic_sample() && self.data_master == 1
     }
 }
 
@@ -501,6 +536,7 @@ pub(crate) enum CompletionDecodeError {
     FirmwareEventStampIndex,
     FirmwareEventStampMissing,
     FirmwareEventUmaPoolIndex,
+    FirmwareEventTvbRequest,
     FirmwareEventUmaAddress,
     CompletionOutstanding,
     CompletionRouteUnavailable,
@@ -1101,6 +1137,62 @@ pub(crate) fn decode_g17p_firmware_stamp_event(
     })
 }
 
+/// Synchronous parameter-buffer growth, decoded by the G17P kext at
+/// 0xfffffe0008a19488. The generation is packed at +0x14 in the event,
+/// but aligned at +0x18 in the DeviceControl opcode-8 reply.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G17PFirmwareTvbGrowEvent {
+    pub(crate) vm_slot: i32,
+    pub(crate) buffer_slot: u32,
+    pub(crate) counter: u32,
+    pub(crate) subpipe: u32,
+    pub(crate) halt_count: u64,
+}
+
+impl G17PFirmwareTvbGrowEvent {
+    pub(crate) fn decode(raw: &[u8]) -> Result<Self, CompletionDecodeError> {
+        if raw.len() != G17P_FIRMWARE_EVENT_ENTRY_SIZE {
+            return Err(CompletionDecodeError::RecordSize);
+        }
+        if get_u32(raw, 0) != G17P_FIRMWARE_EVENT_TVB_GROW_TYPE {
+            return Err(CompletionDecodeError::FirmwareEventType);
+        }
+        let event = Self {
+            vm_slot: get_u32(raw, 4) as i32,
+            buffer_slot: get_u32(raw, 8),
+            counter: get_u32(raw, 0x0c),
+            subpipe: get_u32(raw, 0x10),
+            halt_count: get_u64(raw, 0x14),
+        };
+        if event.vm_slot < -1 || event.buffer_slot >= 127 || event.subpipe >= 64 {
+            return Err(CompletionDecodeError::FirmwareEventTvbRequest);
+        }
+        Ok(event)
+    }
+
+    /// Native drops replies from an earlier reset instead of relabelling
+    /// them with the current generation. Match the owning VM before growing.
+    /// Event context -1 is explicitly accepted by the native `cmn w22,#1;
+    /// b.eq` at 0xfffffe0008a194d0..d4; lookup then uses only HardwareBufferID.
+    pub(crate) fn matches_owner(self, generation: u64, id: u32, context: u32) -> bool {
+        self.halt_count == generation && self.buffer_slot == id
+            && (self.vm_slot == -1 || self.vm_slot as u32 == context)
+    }
+
+    /// Called only after allocation/publication has determined `grew`.
+    /// Native allocateMemoryEvent copies these bytes verbatim to role 0.
+    pub(crate) fn reply(self, grew: bool) -> [u8; 0x40] {
+        let mut out = [0u8; 0x40];
+        for (index, word) in [8, u32::from(grew), self.buffer_slot,
+            self.vm_slot as u32, self.counter, self.subpipe].into_iter().enumerate()
+        {
+            out[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        out[0x18..0x20].copy_from_slice(&self.halt_count.to_le_bytes());
+        out
+    }
+}
+
 /// Firmware event type 4 (`kAGFIFirmwareEventTypeGPURestart`).
 ///
 /// Exact J700 A000 publishes the current recovery generation unaligned at
@@ -1677,7 +1769,11 @@ mod tests {
             report_state: 2, host_requested: 0, slot_present: 1, slot: 0,
             data_master_present: 1, data_master: 1,
         };
-        assert!(valid.allows_sample());
+        assert!(valid.allows_generic_sample());
+        assert!(valid.allows_dm1_progress_sample());
+        let dm0 = G17PHaltedSlot0Gate { data_master: 0, ..valid };
+        assert!(dm0.allows_generic_sample());
+        assert!(!dm0.allows_dm1_progress_sample());
         for wrong in [
             G17PHaltedSlot0Gate { handshake_state: 0, ..valid },
             G17PHaltedSlot0Gate { handshake_state: 2, ..valid },
@@ -1687,11 +1783,26 @@ mod tests {
             G17PHaltedSlot0Gate { slot_present: 0, ..valid },
             G17PHaltedSlot0Gate { slot: 1, ..valid },
             G17PHaltedSlot0Gate { data_master_present: 0, ..valid },
-            G17PHaltedSlot0Gate { data_master: 0, ..valid },
             G17PHaltedSlot0Gate { data_master: 2, ..valid },
         ] {
-            assert!(!wrong.allows_sample());
+            assert!(!wrong.allows_generic_sample());
+            assert!(!wrong.allows_dm1_progress_sample());
         }
+    }
+
+    #[test]
+    fn report_history_is_bounded_and_ordered_across_wrap() {
+        assert_eq!(g17p_report_history_count(0), 8);
+        assert_eq!(g17p_report_history_count(1), 1);
+        assert_eq!(g17p_report_history_count(8), 8);
+        assert_eq!(g17p_report_history_count(64), 8);
+        let count = g17p_report_history_count(8);
+        let slots: Vec<_> = (0..count)
+            .map(|index| g17p_report_history_slot(3, count, index).unwrap())
+            .collect();
+        assert_eq!(slots, [251, 252, 253, 254, 255, 0, 1, 2]);
+        assert_eq!(g17p_report_history_slot(G17P_EVENT_CAPACITY, count, 0), None);
+        assert_eq!(g17p_report_history_slot(3, count, count), None);
     }
 
     #[test]
