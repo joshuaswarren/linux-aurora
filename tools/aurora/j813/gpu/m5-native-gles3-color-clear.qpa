@@ -1,0 +1,402 @@
+#sessionInfo releaseName unknown
+#sessionInfo releaseId 0xcafebabe
+#sessionInfo targetName "Surfaceless"
+#sessionInfo logFormatVersion "0.3.4"
+#sessionInfo vendor "Mesa"
+#sessionInfo renderer "Apple M5 (G17G C0)"
+#sessionInfo commandLineParameters "--deqp-caselist-file=/run/m5-native-cts/gles3-color-clear-thermal-v13-20260913/caselist.txt --deqp-base-seed=1 --deqp-surface-type=pbuffer --deqp-surface-width=64 --deqp-surface-height=64 --deqp-gl-config-name=rgba8888d0s0ms0 --deqp-log-filename=/run/m5-native-cts/gles3-color-clear-thermal-v13-20260913/results.qpa --deqp-log-images=enable --deqp-watchdog=enable"
+
+#beginSession
+
+#beginTestCaseResult dEQP-GLES3.functional.color_clear.complex_rgb
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES3.functional.color_clear.complex_rgb" Version="0.3.4" CaseType="SelfValidate">
+ <ImageSet Name="Result" Description="Resulting framebuffer">
+  <Image Name="Result" Width="64" Height="64" Format="RGBA8888" CompressionMode="PNG" Description="Resulting framebuffer">
+   iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAACJ0lEQVR4nO2azysE
+   YRjHv5ijHJWDixRRSin5A9iS/Mppc3AQJwdtyUlylyJH4uTg4CLCxcWPQm5K3Bzk
+   pJxkCwfb7szs/HjnnZ35jp3nU9vM+77f932+PT3v7Mzs1jwNdf7ATk1ZT4kfAKse
+   45UgUziu6U1fx7GytlYvRPUgCWAbYGNozToB8K0xb04rWqRIBbANqDMUQLuprNRL
+   QFZB0+jQJ1sgeUgC2AbYSALYBtjE/zW4q6BZitxFEakAtgFP3gFMaczbUZemvgIk
+   AWwDbFKfAL2L4JXPeJ/WqhSkAjDLtmDiocLrdPhLk30foMlLAG00W8DpZUhCqcoK
+   aA6glYvgGPqLjYOoo20AaDB3dFmGux2mlH6le1QOMxXAklTAIV49BXnsayzb4jHW
+   ajq3VsCeTXmH6H+HlQqIPeLHcyB5bqG8rxfAkcrkN39J/AnITLoO3W9Z227leaMa
+   a9RfEnILrBQ+/5fUXwMkAWwDbCQBbANsJAFsA2ysN0J1TpJrj+mnzppDF/l8tvQn
+   yIRgWJ42HG47x2zt8VDhehL3Bib1W0ASwDbARhLANsBGEsA2wMZAjm3Bhdt41oj9
+   vmRY9QVSU6Q2ivgmYNDW/gwV7hJAe6gVKo1cAzBiark9xFQxhGeTbdP5cvzhbcgW
+   wIWp9U7zQcNAnm2BS+q3gCSAbYBN0l7RedBma38pzDl36V8snlkTUF84Dpg7J/4O
+   07Y1zgBgxqr5h/wC0uE4n6l4T0YAAAAASUVORK5CYII=
+</Image>
+</ImageSet>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">627669</Number>
+ <Result StatusCode="Pass">Pass</Result>
+</TestCaseResult>
+
+#endTestCaseResult
+
+#beginTestCaseResult dEQP-GLES3.functional.color_clear.complex_rgba
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES3.functional.color_clear.complex_rgba" Version="0.3.4" CaseType="SelfValidate">
+ <ImageSet Name="Result" Description="Resulting framebuffer">
+  <Image Name="Result" Width="64" Height="64" Format="RGBA8888" CompressionMode="PNG" Description="Resulting framebuffer">
+   iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAACUElEQVR4nO2ZzSsE
+   YRzHv8uTg2KL2hs5KOXlosSJbF5vSqIt5R9QypFSDnKRkqOilMTBSchlldUWF8nN
+   Qbvl4KBwoI1yWDs7O/vsszOzM/Ob3ef5lOb3PM9vnufr2/MyPRu4eTh/gZGl9KMb
+   u7366utMkApiBF91O+gB6jGZ974NXvE4WLBx3mQnY9nwHh1bxV84RpXJrisWewbU
+   vANPSP+VOUzUGAFGvRJChdAAX3BoIffz/zkDDAPjRfNfAYY3TsOiFvVp0Qbi+pQJ
+   pCwo8y9qE6QWQI0ygFoANX44Bb4BIISOMxf6bi2WoGYAGji1S1oU57RWFNLPAGUA
+   tQBqlAHUAqix/x3Q7qAKQoQG9AMX+nKnoT2Rfsw5KchrmO7MlxIWMVx8Loiy3b4C
+   M04xD2CNhop9XTzrpRIiTGyCtQn3ZdAh/TEovQHCJbBmKB+4KIQKSx9CEUN53UEh
+   AIBjTp2Va3FRPzwG1BJQBvjhTtB5wibzfsvBgGqL+Wb/+X9YrC5kcYQslXAqqD2A
+   WkBJRG28s5pblH4GKAOoBVAjvQEMJ+FYkZykFrU4NWyyiVu9rYu7dHG0QDdXAJoN
+   dfu8xMKwO2v5TlHPrc18WMTxkVO/4p4Qfy6BZe+GKu/vAB76i0zRZd4egGa/zgAP
+   kd4Ay0vg2QURlKgZQDj2j6Ct1isR7NarkQQECceWfgnIbUBiimwP+ABvnQ/Z6KnE
+   Xy7lngFQBigDqAw4Iho3D+lnANEpcJpTauNkTGNTiy8RcE2J9DNAGUAtgBplALUA
+   aqQ34A/unkN+o9MLYQAAAABJRU5ErkJggg==
+</Image>
+</ImageSet>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">462292</Number>
+ <Result StatusCode="Pass">Pass</Result>
+</TestCaseResult>
+
+#endTestCaseResult
+
+#beginTestCaseResult dEQP-GLES3.functional.color_clear.long_masked_rgb
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES3.functional.color_clear.long_masked_rgb" Version="0.3.4" CaseType="SelfValidate">
+ <ImageSet Name="Result" Description="Resulting framebuffer">
+  <Image Name="Result" Width="64" Height="64" Format="RGBA8888" CompressionMode="PNG" Description="Resulting framebuffer">
+   iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAACbUlEQVR4nGPs/37p
+   PwMakFFHF6EE2FLTMCRwlYHnN6rIX4ZncDYzgxQDQxRhU5io7KohB1iwCT65ycDA
+   EIwmOIV2jigiVYM1A8M2Ktk9mgKW4JJ5T5wB56jlkgECoylgoB1ALvBi0MYQ28yw
+   G6f8A4aFGOp7GE5RHgBGBFUIEWXOOoZ+Sp3CcBmJjc3D2MCIzwIjPgCGbBlALPiD
+   R66AYTQFMLD4iw60EyCAuCILCj5jCsXzkmfvaApgYPAfaDcMKBjxKWA0AAbaAQMN
+   RnwAsDDIZhKn0psCW7ZOp0AzBWAZAfl3oylgNABGA2CgHTDQYMQHwPDrDtuhUAz7
+   CCgfTQFVA2DpdixieqQYMAOLWCl5bhmQLCCJxN4IpUkKACqCEZ4FXoz0AKBSFsij
+   ghmdDIVIPPRSYjlhA4oZGLwYpBgYTkO43gybiLJ3xKeA0QAYaAcMNBjULUEso9+4
+   QToqjVVvCqYQnQKgjUT159H4GmTY6UqUqtEsQBdbXqLxCS0K6oTSj2jgFjRApyxA
+   ao+DjHYAAwMDA4MyEns3TlXIYMRngREfAPStBu2JVOdCBbveEqdskLYD0sjUR/rk
+   xYjPAqMBMNAOGGgw4gNgkBaCOUSqI3EJOxZj6RwAEkSqw7dqtBCPHCZoQGJ/xCI/
+   mgXoYw2h+RlyAfriutdI7FoM1TexmDBIywDywEoG0hc9DqsAIAg4MIVGywC62nYQ
+   StNiQITM9Z6DJwvII7GnkaF/CwH52diFR3wWGA2AgXbAQAMWhnmEFjGeIMKYb9Rw
+   y4CAEZ8CRnwAsEiizVo8ZxAfIKfQFnh4MDB4IPGbJkBoAHpBS4opZbaEAAAAAElF
+   TkSuQmCC
+</Image>
+</ImageSet>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">310059</Number>
+ <Result StatusCode="Pass">Pass</Result>
+</TestCaseResult>
+
+#endTestCaseResult
+
+#beginTestCaseResult dEQP-GLES3.functional.color_clear.long_masked_rgba
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES3.functional.color_clear.long_masked_rgba" Version="0.3.4" CaseType="SelfValidate">
+ <ImageSet Name="Result" Description="Resulting framebuffer">
+  <Image Name="Result" Width="64" Height="64" Format="RGBA8888" CompressionMode="PNG" Description="Resulting framebuffer">
+   iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAB/ElEQVR4nO2YL0gD
+   YRjGH/UrC1pmFk06MQnCnLA0hhiGySUFZYLVumJYEcFkUBE1TBDXnMUgWtRoUgwW
+   o9iGxSBo2B3szpve3b7vno29v7L33vvu+3483L9dz1BxfRAAxlBnEjblIgyQ7s89
+   +R2brKDPhEOdCQBAr7kFOgMJgC3ARgJgC7CRANgCbCQAtgAbCYAtwEYCYAuwkQDY
+   AmwkALYAGwmALcCm6wNQBau4pWrw6PozQAJgC7CRANgCbNQn24CMAsrXrt4VxYSE
+   cjcegIxVfoWYbxdA/tzaiDn3ZQEgDSyHmNcYcg94ZBuQ+XUJ6OAeQMrExFpZBNAQ
+   QKHpQP/ENcwRNX7PgIrPcXF02FNE6yWwqXOyiFAAXqx6hCnCQgF4tepIApj7qB67
+   e4la1vOd4w5Y07v6KYB3R8fIUyA8446tmRT29M5fAt72HR15EWILaKcUbLicAXZx
+   Aty49g031FN2cQZcNvRX7SL3/1pbQeWiQNslUPXoxTx67UbgAEZNWBDp+nuABMAW
+   YKPa46/btPVbi3xlhaWNaFbaiWaZoLT6GDzw6OVbnDNSuv4eIAGwBdhIAGwBNhIA
+   W4CNBMAWYKPg/PLjh1nrN9lk/3NoGwImPoomDMxpDJUZOAx0wPe2/7EXfy/t0ZsP
+   5KIDBeDIo7/i8/gFjS4UfgCryzCdJoq7UAAAAABJRU5ErkJggg==
+</Image>
+</ImageSet>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">331181</Number>
+ <Result StatusCode="Pass">Pass</Result>
+</TestCaseResult>
+
+#endTestCaseResult
+
+#beginTestCaseResult dEQP-GLES3.functional.color_clear.long_rgb
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES3.functional.color_clear.long_rgb" Version="0.3.4" CaseType="SelfValidate">
+ <ImageSet Name="Result" Description="Resulting framebuffer">
+  <Image Name="Result" Width="64" Height="64" Format="RGBA8888" CompressionMode="PNG" Description="Resulting framebuffer">
+   iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAAmklEQVR4nO3QQRHA
+   IADAMEADAjCFfylDRh5rFPQ6z77f+LGlA7QG6ACtATpAa4AO0BqgA7QG6ACtATpA
+   a4AO0BqgA7QG6ACtATpAa4AO0BqgA7QG6ACtATpAa4AO0BqgA7QG6ACtATpAa4AO
+   0BqgA7QG6ACtATpAa4AO0BqgA7QG6ACtATpAa4AO0BqgA7QG6ACtATpAa4AO0B6z
+   qwIIgXpffwAAAABJRU5ErkJggg==
+</Image>
+</ImageSet>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">300233</Number>
+ <Result StatusCode="Pass">Pass</Result>
+</TestCaseResult>
+
+#endTestCaseResult
+
+#beginTestCaseResult dEQP-GLES3.functional.color_clear.long_rgba
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES3.functional.color_clear.long_rgba" Version="0.3.4" CaseType="SelfValidate">
+ <ImageSet Name="Result" Description="Resulting framebuffer">
+  <Image Name="Result" Width="64" Height="64" Format="RGBA8888" CompressionMode="PNG" Description="Resulting framebuffer">
+   iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAAmklEQVR4nO3QQRHA
+   IADAMMALihCKhFlDRh5rFPQ679nf+LGlA7QG6ACtATpAa4AO0BqgA7QG6ACtATpA
+   a4AO0BqgA7QG6ACtATpAa4AO0BqgA7QG6ACtATpAa4AO0BqgA7QG6ACtATpAa4AO
+   0BqgA7QG6ACtATpAa4AO0BqgA7QG6ACtATpAa4AO0BqgA7QG6ACtATpAa4AO0B5N
+   FgJmnWG7ewAAAABJRU5ErkJggg==
+</Image>
+</ImageSet>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">307919</Number>
+ <Result StatusCode="Pass">Pass</Result>
+</TestCaseResult>
+
+#endTestCaseResult
+
+#beginTestCaseResult dEQP-GLES3.functional.color_clear.masked_rgb
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES3.functional.color_clear.masked_rgb" Version="0.3.4" CaseType="SelfValidate">
+ <ImageSet Name="Result" Description="Resulting framebuffer">
+  <Image Name="Result" Width="64" Height="64" Format="RGBA8888" CompressionMode="PNG" Description="Resulting framebuffer">
+   iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAAmUlEQVR4nO3QQRHA
+   IADAMEAuX4ziaMjIY42CXue+5xs/tnSA1gAdoDVAB2gN0AFaA3SA1gAdoDVAB2gN
+   0AFaA3SA1gAdoDVAB2gN0AFaA3SA1gAdoDVAB2gN0AFaA3SA1gAdoDVAB2gN0AFa
+   A3SA1gAdoDVAB2gN0AFaA3SA1gAdoDVAB2gN0AFaA3SA1gAdoDVAB2gN0AHaA/7W
+   Ayy61v0RAAAAAElFTkSuQmCC
+</Image>
+</ImageSet>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">375902</Number>
+ <Result StatusCode="Pass">Pass</Result>
+</TestCaseResult>
+
+#endTestCaseResult
+
+#beginTestCaseResult dEQP-GLES3.functional.color_clear.masked_rgba
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES3.functional.color_clear.masked_rgba" Version="0.3.4" CaseType="SelfValidate">
+ <ImageSet Name="Result" Description="Resulting framebuffer">
+  <Image Name="Result" Width="64" Height="64" Format="RGBA8888" CompressionMode="PNG" Description="Resulting framebuffer">
+   iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAAmklEQVR4nO3QQRHA
+   IADAMEAXyrDIe36QkccaBb3O+509fmzpAK0BOkBrgA7QGqADtAboAK0BOkBrgA7Q
+   GqADtAboAK0BOkBrgA7QGqADtAboAK0BOkBrgA7QGqADtAboAK0BOkBrgA7QGqAD
+   tAboAK0BOkBrgA7QGqADtAboAK0BOkBrgA7QGqADtAboAK0BOkBrgA7QGqADtAdq
+   pwLW2ns7sAAAAABJRU5ErkJggg==
+</Image>
+</ImageSet>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">375946</Number>
+ <Result StatusCode="Pass">Pass</Result>
+</TestCaseResult>
+
+#endTestCaseResult
+
+#beginTestCaseResult dEQP-GLES3.functional.color_clear.masked_scissored_rgb
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES3.functional.color_clear.masked_scissored_rgb" Version="0.3.4" CaseType="SelfValidate">
+ <ImageSet Name="Result" Description="Resulting framebuffer">
+  <Image Name="Result" Width="64" Height="64" Format="RGBA8888" CompressionMode="PNG" Description="Resulting framebuffer">
+   iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAABX0lEQVR4nO2ZvUoD
+   QRRGb2R6G58hkCqV2FmoBLTIQ9hZ2Qpa6mv4CuIPKSxtrYSA2FsLgr2Wsmx2nd07
+   7DHc71Rh52cPh9mwJKOtg/G3ZXGfN62NJ/8WfVjaXuNYGtDDwadz/U3jyIZz57Vn
+   TU7AH7y1D09axsKfgPAB0nH298vCf7fp78frlyP/fgUIfwIUgBagCR+Aew/Yxe5c
+   wR3gzq5q1+Z27t12MMI/AgpAC9AoAC1AEz5AMjuhHTLYdK4/axzRCegy+d0OV1yt
+   vwitnldlZvXfYh9t1EWnCOFPgALQAjQKQAvQpNPtnQ7TP2pX9s3MnkvpDM+/+mNk
+   aV+91k3ssvc9wz8CCkAL0CgALUCjALQAjQLQAjTJxgV2KbGHg9fbi+qFh/y14U+A
+   AtACNApAC9AoAC1AowC0AI0C0AI0CkAL0CgALUCjALQAjQLQAjQKQAvQKAAtQKMA
+   tADND65IG4zlY1eDAAAAAElFTkSuQmCC
+</Image>
+</ImageSet>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">383295</Number>
+ <Result StatusCode="Pass">Pass</Result>
+</TestCaseResult>
+
+#endTestCaseResult
+
+#beginTestCaseResult dEQP-GLES3.functional.color_clear.masked_scissored_rgba
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES3.functional.color_clear.masked_scissored_rgba" Version="0.3.4" CaseType="SelfValidate">
+ <ImageSet Name="Result" Description="Resulting framebuffer">
+  <Image Name="Result" Width="64" Height="64" Format="RGBA8888" CompressionMode="PNG" Description="Resulting framebuffer">
+   iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAA5klEQVR4nO3ZwQnC
+   QBgF4VX2Zg/eLcU6BMUGLChNWIp3QbAMKwhEQvzU/815ww7DIwSyeg6nR5vFcd7j
+   SzC0y9Sj6yU9foEE0AKaBNACmgTQApoE0AKa/pVfch+k/AISQAtoEkALaBJAC2gS
+   QAtoEkALaBJAC2gSQAtoygfo7/xG+kfKLyABtIAmAbSAJgG0gGZ93rSDlpBkAVpA
+   kwBaQFM+QAd3XsGdo5RfQAJoAY14B+zBnaOUX0ACaAFNAmgBTQJoAU0CaAFNAmgB
+   TQJoAU0CaAFN+QC9tda2t2mH77slVQzlF/ACc5cKMxI2Jn0AAAAASUVORK5CYII=
+</Image>
+</ImageSet>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">380583</Number>
+ <Result StatusCode="Pass">Pass</Result>
+</TestCaseResult>
+
+#endTestCaseResult
+
+#beginTestCaseResult dEQP-GLES3.functional.color_clear.multiple_rgb
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES3.functional.color_clear.multiple_rgb" Version="0.3.4" CaseType="SelfValidate">
+ <ImageSet Name="Result" Description="Resulting framebuffer">
+  <Image Name="Result" Width="64" Height="64" Format="RGBA8888" CompressionMode="PNG" Description="Resulting framebuffer">
+   iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAAmUlEQVR4nO3QQRHA
+   IADAMEA7ZnmgYcjIY42CXufd5xs/tnSA1gAdoDVAB2gN0AFaA3SA1gAdoDVAB2gN
+   0AFaA3SA1gAdoDVAB2gN0AFaA3SA1gAdoDVAB2gN0AFaA3SA1gAdoDVAB2gN0AFa
+   A3SA1gAdoDVAB2gN0AFaA3SA1gAdoDVAB2gN0AFaA3SA1gAdoDVAB2gN0AHaA2td
+   A9m+7cATAAAAAElFTkSuQmCC
+</Image>
+</ImageSet>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">371363</Number>
+ <Result StatusCode="Pass">Pass</Result>
+</TestCaseResult>
+
+#endTestCaseResult
+
+#beginTestCaseResult dEQP-GLES3.functional.color_clear.multiple_rgba
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES3.functional.color_clear.multiple_rgba" Version="0.3.4" CaseType="SelfValidate">
+ <ImageSet Name="Result" Description="Resulting framebuffer">
+  <Image Name="Result" Width="64" Height="64" Format="RGBA8888" CompressionMode="PNG" Description="Resulting framebuffer">
+   iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAAmklEQVR4nO3QQRHA
+   IADAMEAcenhhaiaRkccaBb3O/Z07fmzpAK0BOkBrgA7QGqADtAboAK0BOkBrgA7Q
+   GqADtAboAK0BOkBrgA7QGqADtAboAK0BOkBrgA7QGqADtAboAK0BOkBrgA7QGqAD
+   tAboAK0BOkBrgA7QGqADtAboAK0BOkBrgA7QGqADtAboAK0BOkBrgA7QGqADtAeJ
+   FgJX2iL1bgAAAABJRU5ErkJggg==
+</Image>
+</ImageSet>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">363897</Number>
+ <Result StatusCode="Pass">Pass</Result>
+</TestCaseResult>
+
+#endTestCaseResult
+
+#beginTestCaseResult dEQP-GLES3.functional.color_clear.scissored_rgb
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES3.functional.color_clear.scissored_rgb" Version="0.3.4" CaseType="SelfValidate">
+ <ImageSet Name="Result" Description="Resulting framebuffer">
+  <Image Name="Result" Width="64" Height="64" Format="RGBA8888" CompressionMode="PNG" Description="Resulting framebuffer">
+   iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAABQklEQVR4nO2Zr4oC
+   URhHVSyabQsWwWY1CqZlwaJNwVcQtPgGVkVhX8BgE7RYfRGT1WBRMSxr98+gd673
+   IN/vxJHLPRy+uTOMyX5t9J+4Yv31e30psdjMbq49w75+cFr3Kttu02ldyrPHx6EA
+   tACNAtACNApAC9AoAC1AYz5AmhbwRamydFpnfgIUgBag8XIGTFrfD39rn+Y+tojl
+   EIX5CVAAWoDm7hng+vnrEzE/AQpAC9AoAC1AowC0AM3d94C/4jm0B4b5CVAAWoDG
+   fIC3fxSdZhrv3iIW5idAAWgBGgWgBWgUgBagMR8g+L/DnUI29JaRmJ8ABaAFaIKf
+   AePNMfSWkZifAPMBvNwCuZ9urPW71dCHhhPmJ8B8gOBPgWpvEHrLSDQBnXyZdkAx
+   PwEKQAvQKAAtQKMAtACNAtACNOYDXAACRB1ARbeC4QAAAABJRU5ErkJggg==
+</Image>
+</ImageSet>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">392937</Number>
+ <Result StatusCode="Pass">Pass</Result>
+</TestCaseResult>
+
+#endTestCaseResult
+
+#beginTestCaseResult dEQP-GLES3.functional.color_clear.scissored_rgba
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES3.functional.color_clear.scissored_rgba" Version="0.3.4" CaseType="SelfValidate">
+ <ImageSet Name="Result" Description="Resulting framebuffer">
+  <Image Name="Result" Width="64" Height="64" Format="RGBA8888" CompressionMode="PNG" Description="Resulting framebuffer">
+   iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAABWUlEQVR4nO2bMUsC
+   cRiH70KRJqeWhoYgB3GTq6lFpCVcXfoAErrUN3BwFqQlaGkIXEPFoLFFihoDhxql
+   Rsc2J5dQ0/Pf/yne3zPJeXfvw8PLLadhJZP7DBzxcnp/tej76OAu72rWOuT6e2/T
+   z4n6zvX5rJNKx9tZf0ocG7QAjQLQAjSJVS+4bJQ34wwqPe2e3S5xXid6b8a5f1zM
+   b4AC0AI0CkAL0CgALUCjALQAjQLQAjQKQAvQKAAtQKMAtACNAtACNApAC9AoAC1A
+   owC0AI0C0AI0c98Ndnqj11nHR0HwJ37k4ArzG6AAtACNAtACNApAC9AoAC1AowC0
+   AE34UXw+cX3TwsWg8v3YOPV4uMy16a/9B9c+izC/AQpAC9CYD/ArD8H/hPkNUABa
+   gEYBaAEaBaAFaMwHCFvD5JHPgeXqYMvnvJ8wvwEr/2/QF+3aTdfHHPMbYD7ABKTv
+   JVho44+DAAAAAElFTkSuQmCC
+</Image>
+</ImageSet>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">411633</Number>
+ <Result StatusCode="Pass">Pass</Result>
+</TestCaseResult>
+
+#endTestCaseResult
+
+#beginTestCaseResult dEQP-GLES3.functional.color_clear.short_scissored_rgb
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES3.functional.color_clear.short_scissored_rgb" Version="0.3.4" CaseType="SelfValidate">
+ <ImageSet Name="Result" Description="Resulting framebuffer">
+  <Image Name="Result" Width="64" Height="64" Format="RGBA8888" CompressionMode="PNG" Description="Resulting framebuffer">
+   iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAA2UlEQVR4nO3YsQkC
+   QQBEURVjE0NDe7AEe7Eh7cXcxD4MTWxAC9BLDrkHN/PDhYXPZzbZ5Xl/ey+CWWkB
+   TQNoAU0DaAFNA2gBTQNoAU0DaAFNA2gBTQNoAU0DaAFNA2gBTQNoAU0DaAFNA2gB
+   TQNoAc1aC/yDy30z+m78AuIDzOIJnA6v0XfjF9AAWkDTAFpA0wBaQNMAWkDTAFpA
+   0wBaQNMAWkDTAFpA0wBaQBMfYPBT9Lh7TukxCdfH9ussfgHxAQafwK+5zJH4BTSA
+   FtA0gBbQNIAW0MQH+ADm8Aq38NQRTwAAAABJRU5ErkJggg==
+</Image>
+</ImageSet>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">524098</Number>
+ <Result StatusCode="Pass">Pass</Result>
+</TestCaseResult>
+
+#endTestCaseResult
+
+#beginTestCaseResult dEQP-GLES3.functional.color_clear.single_rgb
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES3.functional.color_clear.single_rgb" Version="0.3.4" CaseType="SelfValidate">
+ <ImageSet Name="Result" Description="Resulting framebuffer">
+  <Image Name="Result" Width="64" Height="64" Format="RGBA8888" CompressionMode="PNG" Description="Resulting framebuffer">
+   iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAAmklEQVR4nO3QQRHA
+   IADAMEAYH/w7wMuQkccaBb3Oc/c3fmzpAK0BOkBrgA7QGqADtAboAK0BOkBrgA7Q
+   GqADtAboAK0BOkBrgA7QGqADtAboAK0BOkBrgA7QGqADtAboAK0BOkBrgA7QGqAD
+   tAboAK0BOkBrgA7QGqADtAboAK0BOkBrgA7QGqADtAboAK0BOkBrgA7QGqADtAfq
+   WALc9WxuwQAAAABJRU5ErkJggg==
+</Image>
+</ImageSet>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">490785</Number>
+ <Result StatusCode="Pass">Pass</Result>
+</TestCaseResult>
+
+#endTestCaseResult
+
+#beginTestCaseResult dEQP-GLES3.functional.color_clear.single_rgba
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES3.functional.color_clear.single_rgba" Version="0.3.4" CaseType="SelfValidate">
+ <ImageSet Name="Result" Description="Resulting framebuffer">
+  <Image Name="Result" Width="64" Height="64" Format="RGBA8888" CompressionMode="PNG" Description="Resulting framebuffer">
+   iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAAmklEQVR4nO3QMRHA
+   IADAQGBgRBKiqxAZPzSvIJd5v33Gjy0doDVAB2gN0AFaA3SA1gAdoDVAB2gN0AFa
+   A3SA1gAdoDVAB2gN0AFaA3SA1gAdoDVAB2gN0AFaA3SA1gAdoDVAB2gN0AFaA3SA
+   1gAdoDVAB2gN0AFaA3SA1gAdoDVAB2gN0AFaA3SA1gAdoDVAB2gN0AFaA3SA9gCU
+   EwGEXpF0igAAAABJRU5ErkJggg==
+</Image>
+</ImageSet>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">496249</Number>
+ <Result StatusCode="Pass">Pass</Result>
+</TestCaseResult>
+
+#endTestCaseResult
+
+#beginTestCaseResult dEQP-GLES3.functional.color_clear.subclears_rgb
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES3.functional.color_clear.subclears_rgb" Version="0.3.4" CaseType="SelfValidate">
+ <ImageSet Name="Result" Description="Resulting framebuffer">
+  <Image Name="Result" Width="64" Height="64" Format="RGBA8888" CompressionMode="PNG" Description="Resulting framebuffer">
+   iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAAmklEQVR4nO3QQRHA
+   IADAMOCJFvx7QsWQkccaBb3Oc/c3fmzpAK0BOkBrgA7QGqADtAboAK0BOkBrgA7Q
+   GqADtAboAK0BOkBrgA7QGqADtAboAK0BOkBrgA7QGqADtAboAK0BOkBrgA7QGqAD
+   tAboAK0BOkBrgA7QGqADtAboAK0BOkBrgA7QGqADtAboAK0BOkBrgA7QGqADtAda
+   kAKeyF4O1gAAAABJRU5ErkJggg==
+</Image>
+</ImageSet>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">416749</Number>
+ <Result StatusCode="Pass">Pass</Result>
+</TestCaseResult>
+
+#endTestCaseResult
+
+#beginTestCaseResult dEQP-GLES3.functional.color_clear.subclears_rgba
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-GLES3.functional.color_clear.subclears_rgba" Version="0.3.4" CaseType="SelfValidate">
+ <ImageSet Name="Result" Description="Resulting framebuffer">
+  <Image Name="Result" Width="64" Height="64" Format="RGBA8888" CompressionMode="PNG" Description="Resulting framebuffer">
+   iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAAmklEQVR4nO3QQRHA
+   IADAMEAhEpCEr5lCRh5rFPQ693fP+LGlA7QG6ACtATpAa4AO0BqgA7QG6ACtATpA
+   a4AO0BqgA7QG6ACtATpAa4AO0BqgA7QG6ACtATpAa4AO0BqgA7QG6ACtATpAa4AO
+   0BqgA7QG6ACtATpAa4AO0BqgA7QG6ACtATpAa4AO0BqgA7QG6ACtATpAa4AO0B6W
+   hwKL9o+HKQAAAABJRU5ErkJggg==
+</Image>
+</ImageSet>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">403653</Number>
+ <Result StatusCode="Pass">Pass</Result>
+</TestCaseResult>
+
+#endTestCaseResult
+
+Run took 7.81 seconds
+
+#endSession
