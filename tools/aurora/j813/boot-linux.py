@@ -48,7 +48,7 @@ print('TARGET_CONFIRMED J813 Mac17,3 T8142', flush=True)
 if '--gpu-inventory' in sys.argv:
     runpy.run_path(str(root / 'inspect-gpu-topology.py'))['capture_gpu_topology'](u, root / 'logs')
 
-selected = [name for name in ('wifi', 'bluetooth', 'desktop', 'input', 'video', 'video-v4l2', 'gpu', 'display', 'display-probe') if '--' + name in sys.argv]
+selected = [name for name in ('cpu', 'wifi', 'bluetooth', 'desktop', 'input', 'video', 'video-v4l2', 'gpu', 'display', 'display-probe') if '--' + name in sys.argv]
 if len(selected) > 1:
     raise ValueError('Select one RAM payload flavor')
 flavor = selected[0] if selected else None
@@ -57,6 +57,11 @@ gpu_display = '--gpu-display' in sys.argv
 display = flavor in ('display', 'display-probe') or gpu_display
 gpu_rtkit_probe = '--gpu-rtkit-probe' in sys.argv
 gpu_initdata = '--gpu-initdata' in sys.argv
+smp = '--smp' in sys.argv
+idle_args = [arg.split('=', 1)[1] for arg in sys.argv if arg.startswith('--smp-idle=')]
+if idle_args and (not smp or len(idle_args) != 1 or idle_args[0] not in ('yield', 'wfi')):
+    raise ValueError('--smp-idle=yield|wfi requires --smp')
+smp_idle = idle_args[0] if idle_args else 'wfi'
 if gpu_display and (not gpu or not gpu_initdata):
     raise ValueError('--gpu-display requires --gpu --gpu-initdata')
 if gpu_initdata and (not gpu or gpu_rtkit_probe):
@@ -65,7 +70,7 @@ if gpu_rtkit_probe and not gpu:
     raise ValueError('--gpu-rtkit-probe requires --gpu')
 video = flavor in ('video', 'video-v4l2', 'gpu')
 input_enabled = flavor == 'input' or video or display
-wifi = flavor is not None
+wifi = flavor is not None and flavor != 'cpu'
 artifacts = root / 'artifacts'
 if flavor:
     artifacts /= ('display/probe' if flavor == 'display-probe' else
@@ -94,6 +99,29 @@ if (b'apple,agx-t8142\0' in dtb) != gpu:
 if (b'apple,t8142-dcp\0' in dtb) != display:
     raise ValueError('The M5 DCP DT requires --display and live mapping preflight')
 uboot = (root / 'u-boot/u-boot-nodtb.bin').read_bytes()
+
+def prepare_smp():
+    # Opt-in qualification on a freshly reset M5. Removing maxcpus alone is
+    # insufficient: kboot drops CPU nodes unless m1n1 has started their cores.
+    cpus = list(u.adt['/cpus'])
+    cpu_ids = sorted(int(node.cpu_id) for node in cpus)
+    boot_ids = [int(node.cpu_id) for node in cpus if node.state == 'running']
+    if cpu_ids != list(range(10)) or len(boot_ids) != 1:
+        raise RuntimeError('Unexpected J813 CPU topology')
+    secondary_ids = [cpu for cpu in cpu_ids if cpu != boot_ids[0]]
+    if any(p.smp_is_alive(cpu) for cpu in secondary_ids):
+        raise RuntimeError('--smp requires a fresh reset, not already released cores')
+    # These are command-state snapshots, not measured CPU clock rates. Do not
+    # write DVFS registers while qualifying the independent SMP handoff.
+    for label, base in [('E', 0x210e00000), ('P', 0x211e00000)]:
+        print(f'J813_CPU_PSTATE_COMMAND {label}={p.read64(base + 0x20020):#x}', flush=True)
+    print('J813_SMP_START_BEGIN', flush=True)
+    p.smp_start_secondaries()
+    alive = [cpu for cpu in secondary_ids if p.smp_is_alive(cpu)]
+    missing = [cpu for cpu in secondary_ids if cpu not in alive]
+    print(f'J813_SMP_BOOT_CPU={boot_ids[0]} SECONDARIES={alive} MISSING={missing}', flush=True)
+    if not alive:
+        raise RuntimeError('No M5 secondary cores started; refusing an SMP qualification boot')
 
 if display:
     display_helpers = runpy.run_path(str(root / 'display/dcp-boot-preflight.py'))
@@ -136,7 +164,13 @@ for label, address, data in [('Image', kernel_addr, kernel),
 
 bootargs = ('earlycon=dockchannel,0x38812c000 console=tty0 console=ttyDC0 '
             'keep_bootcon ignore_loglevel loglevel=8 initcall_debug '
-            'maxcpus=1 nokaslr rdinit=/init panic=0')
+            'nokaslr rdinit=/init panic=0')
+if not smp:
+    bootargs += ' maxcpus=1'
+else:
+    # The SMP kernel preserves M5 registers across WFI/WFIT. YIELD remains
+    # available only for diagnosing wait-related failures; it is not sleep.
+    bootargs += f' idle={smp_idle}'
 if flavor == 'desktop' or input_enabled:
     # Ask DRM fbdev for the conventional 32-bpp desktop surface. SimpleDRM
     # converts its shadow buffer into the firmware's native 10-bit RGB layout.
@@ -148,8 +182,8 @@ p.kboot_set_uboot('bootcmd', f'booti {kernel_addr:#x} {initrd_addr:#x}:{len(init
 p.kboot_set_uboot('bootdelay', '0')
 p.kboot_set_uboot('baudrate', '1500000')
 p.kboot_set_uboot('stdin', 'serial')
-# Keep the initial bring-up on the already-running boot CPU. m1n1 prunes the
-# cold CPU nodes and leaves the boot CPU selected by MPIDR.
+# Without --smp, m1n1 prunes cold CPUs and keeps the boot CPU selected by MPIDR.
+# With --smp, kboot verifies each live core's MPIDR and supplies its release slot.
 if wifi:
     runpy.run_path(str(root / 'prepare-n1-pcie.py'), init_globals={'p': p, 'u': u, 'iface': iface})
 if input_enabled:
@@ -162,6 +196,10 @@ if input_enabled:
     if result:
         raise RuntimeError(f'Scoped MTP DAPF setup failed: {result}')
     print('J813_MTP_DAPF_PREPARED', flush=True)
+if smp:
+    # Finish device preparation and uploads before releasing CPUs. In
+    # particular, do not park M5 secondaries throughout a long KIS transfer.
+    prepare_smp()
 result = p.kboot_prepare_dt(dtb_addr)
 if result:
     raise RuntimeError(f'Device-tree preparation failed: {result}')
@@ -199,6 +237,7 @@ deadline = time.monotonic() + 150
 captured = bytearray()
 verified = False
 sent = False
+panicked = False
 while time.monotonic() < deadline:
     chunk = iface.dev.read(65536)
     if not chunk:
@@ -206,6 +245,11 @@ while time.monotonic() < deadline:
     sys.stdout.buffer.write(chunk)
     sys.stdout.flush()
     captured.extend(chunk)
+    if not panicked and b'Kernel panic - not syncing:' in captured:
+        panicked = True
+        # Retain the panic tail, then release the console promptly so a known
+        # failed qualification does not consume the entire shell timeout.
+        deadline = min(deadline, time.monotonic() + 3)
     if not sent and b'AURORA_J813_LINUX_INITRAMFS_READY' in captured and b'# ' in captured[-256:]:
         time.sleep(0.5)
         if flavor == 'desktop' or input_enabled:
@@ -218,5 +262,7 @@ while time.monotonic() < deadline:
         break
 iface.dev.close()
 if not verified:
+    if panicked:
+        raise RuntimeError('Linux kernel panic; inspect captured console')
     raise RuntimeError('No verified Linux initramfs shell within 150 seconds; inspect captured console')
 print('\nNATIVE_LINUX_SHELL_VERIFIED', flush=True)
