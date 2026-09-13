@@ -19,19 +19,25 @@ def function(text, marker):
 
 
 take = function(resources, "    pub(crate) fn take_retired_parameter_management(")
+consume = function(resources, "    pub(crate) fn into_retired_parameter_management(")
 release = function(manager, "    fn release_retired_handoff_graph(")
+superseded = function(manager, "    fn release_superseded_render_graph(")
 quarantine = function(manager, "    fn quarantine_retired_parameter_management(")
 desync = function(manager, "    fn recycle_desynced_render_storage(")
 stop = function(manager, "    pub(crate) fn release_runtime_objects_after_processor_stop(")
 
 assert "self.parameter_management" in take and ".take()" in take
-assert take.index("drop(_page_list_low)") < take.index(
-    "G17PRetiredParameterManagement { _backing: backing }"
-)
+assert take.index("drop(_page_list_low)") < take.index("_support: None")
+assert "_support: None" in take
+assert consume.index("_support: Some(support)") > consume.index("drop(_page_list_low)")
 assert release.index("take_retired_parameter_management()") < release.index(
     "ids.unreserve(id)"
 )
 assert "quarantine_retired_parameter_management" in release
+assert superseded.index("into_retired_parameter_management()") < superseded.index(
+    "ids.unreserve(id)"
+)
+assert "quarantine_retired_parameter_management" in superseded
 assert "retired_parameter_managers.push_within_capacity(manager)" in quarantine
 assert "core::mem::forget(error.0)" in quarantine
 assert desync.index("take_retired_parameter_management") < desync.index(
