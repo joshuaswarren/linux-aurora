@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 #include "t8142-j813-wifi.dts"
+#include "t8142-j813-keyboard-backlight.dtsi"
 
 /* MTP resources checked against the live J813 ADT on 2026-09-10.
  * This separate bring-up payload retains the qualified Wi-Fi-only DTB.
