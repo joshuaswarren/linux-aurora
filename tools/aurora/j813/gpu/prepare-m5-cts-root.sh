@@ -11,9 +11,17 @@ grep -aq apple,j813 /proc/device-tree/compatible
 ! grep -q ' /desktop ' /proc/mounts
 mkdir -p /desktop
 mount -t tmpfs -o size=8G tmpfs /desktop
+mark_phase() {
+    read task_uptime task_idle < /proc/uptime
+    printf 'M5_ROOT_PHASE %s uptime_seconds=%s\n' "$1" "$task_uptime"
+}
+mark_phase download-start
 wget -T 20 -q "$server/$root_archive" -O /desktop/.root.tar.gz
+mark_phase download-complete
 printf '%s  /desktop/.root.tar.gz\n' "$root_sha256" | sha256sum -c -
+mark_phase archive-verified
 tar -xzf /desktop/.root.tar.gz -C /desktop
+mark_phase archive-extracted
 rm /desktop/.root.tar.gz
 for directory in dev proc sys run; do
     mkdir -p "/desktop/$directory"
@@ -33,3 +41,4 @@ chroot /desktop /usr/sbin/sshd -o PasswordAuthentication=no \
     -E /run/m5-native-sshd.log
 chroot /desktop ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
 echo M5_NATIVE_GLES3_ROOT_SSH_READY
+mark_phase ssh-ready
