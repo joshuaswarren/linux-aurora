@@ -6,6 +6,7 @@
 #include <linux/cpu.h>
 #include <linux/irqflags.h>
 
+#include <asm/apple-idle.h>
 #include <asm/barrier.h>
 #include <asm/apple-idle.h>
 #include <asm/cpuidle.h>
@@ -52,10 +53,14 @@ void __cpuidle cpu_do_idle(void)
 	arm_cpuidle_save_irq_context(&context);
 
 	if (likely(idle == ARM64_IDLE_WFI)) {
-		if (apple_m5_needs_wait_save()) {
-			/* WFI also loses SIMD state; the last task may still own it. */
+		if (apple_needs_wait_save()) {
+			/*
+			 * WFI also loses FPSIMD state on T8140 secondaries.
+			 * Invalidate the lazy CPU owner so userspace reloads it
+			 * even when the same task resumes on the same CPU.
+			 */
 			fpsimd_save_and_flush_cpu_state();
-			apple_m5_cpu_wfi();
+			apple_cpu_wfi();
 			goto restore_context;
 		}
 		dsb(sy);
