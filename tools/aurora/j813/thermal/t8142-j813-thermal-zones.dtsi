@@ -1,0 +1,825 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Conservative bring-up policy, not factory calibration. All listed SMC
+ * channels may limit both CPU clusters. No invented shutdown threshold.
+ */
+/ {
+	thermal-zones {
+		smc-tchp-thermal {
+			polling-delay = <2000>;
+			polling-delay-passive = <500>;
+			thermal-sensors = <&m5_smc_hwmon 0>;
+			trips {
+				m5_TCHP_passive: passive {
+					temperature = <75000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+			};
+			cooling-maps {
+				map-cpu {
+					trip = <&m5_TCHP_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+		smc-tcmb-thermal {
+			polling-delay = <2000>;
+			polling-delay-passive = <500>;
+			thermal-sensors = <&m5_smc_hwmon 1>;
+			trips {
+				m5_TCMb_passive: passive {
+					temperature = <75000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+			};
+			cooling-maps {
+				map-cpu {
+					trip = <&m5_TCMb_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+		smc-te04-thermal {
+			polling-delay = <2000>;
+			polling-delay-passive = <500>;
+			thermal-sensors = <&m5_smc_hwmon 2>;
+			trips {
+				m5_Te04_passive: passive {
+					temperature = <75000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+			};
+			cooling-maps {
+				map-cpu {
+					trip = <&m5_Te04_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+		smc-te08-thermal {
+			polling-delay = <2000>;
+			polling-delay-passive = <500>;
+			thermal-sensors = <&m5_smc_hwmon 3>;
+			trips {
+				m5_Te08_passive: passive {
+					temperature = <75000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+			};
+			cooling-maps {
+				map-cpu {
+					trip = <&m5_Te08_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+		smc-te0c-thermal {
+			polling-delay = <2000>;
+			polling-delay-passive = <500>;
+			thermal-sensors = <&m5_smc_hwmon 4>;
+			trips {
+				m5_Te0C_passive: passive {
+					temperature = <75000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+			};
+			cooling-maps {
+				map-cpu {
+					trip = <&m5_Te0C_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+		smc-te0r-thermal {
+			polling-delay = <2000>;
+			polling-delay-passive = <500>;
+			thermal-sensors = <&m5_smc_hwmon 5>;
+			trips {
+				m5_Te0R_passive: passive {
+					temperature = <75000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+			};
+			cooling-maps {
+				map-cpu {
+					trip = <&m5_Te0R_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+		smc-tp00-thermal {
+			polling-delay = <2000>;
+			polling-delay-passive = <500>;
+			thermal-sensors = <&m5_smc_hwmon 6>;
+			trips {
+				m5_Tp00_passive: passive {
+					temperature = <75000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+			};
+			cooling-maps {
+				map-cpu {
+					trip = <&m5_Tp00_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+		smc-tp04-thermal {
+			polling-delay = <2000>;
+			polling-delay-passive = <500>;
+			thermal-sensors = <&m5_smc_hwmon 7>;
+			trips {
+				m5_Tp04_passive: passive {
+					temperature = <75000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+			};
+			cooling-maps {
+				map-cpu {
+					trip = <&m5_Tp04_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+		smc-tp0c-thermal {
+			polling-delay = <2000>;
+			polling-delay-passive = <500>;
+			thermal-sensors = <&m5_smc_hwmon 8>;
+			trips {
+				m5_Tp0C_passive: passive {
+					temperature = <75000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+			};
+			cooling-maps {
+				map-cpu {
+					trip = <&m5_Tp0C_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+		smc-tp0g-thermal {
+			polling-delay = <2000>;
+			polling-delay-passive = <500>;
+			thermal-sensors = <&m5_smc_hwmon 9>;
+			trips {
+				m5_Tp0G_passive: passive {
+					temperature = <75000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+			};
+			cooling-maps {
+				map-cpu {
+					trip = <&m5_Tp0G_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+		smc-tp0o-thermal {
+			polling-delay = <2000>;
+			polling-delay-passive = <500>;
+			thermal-sensors = <&m5_smc_hwmon 10>;
+			trips {
+				m5_Tp0O_passive: passive {
+					temperature = <75000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+			};
+			cooling-maps {
+				map-cpu {
+					trip = <&m5_Tp0O_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+		smc-tp0r-thermal {
+			polling-delay = <2000>;
+			polling-delay-passive = <500>;
+			thermal-sensors = <&m5_smc_hwmon 11>;
+			trips {
+				m5_Tp0R_passive: passive {
+					temperature = <75000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+			};
+			cooling-maps {
+				map-cpu {
+					trip = <&m5_Tp0R_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+		smc-tp0x-thermal {
+			polling-delay = <2000>;
+			polling-delay-passive = <500>;
+			thermal-sensors = <&m5_smc_hwmon 12>;
+			trips {
+				m5_Tp0X_passive: passive {
+					temperature = <75000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+			};
+			cooling-maps {
+				map-cpu {
+					trip = <&m5_Tp0X_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+		smc-tp0a-thermal {
+			polling-delay = <2000>;
+			polling-delay-passive = <500>;
+			thermal-sensors = <&m5_smc_hwmon 13>;
+			trips {
+				m5_Tp0a_passive: passive {
+					temperature = <75000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+			};
+			cooling-maps {
+				map-cpu {
+					trip = <&m5_Tp0a_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+		smc-tp0p-thermal {
+			polling-delay = <2000>;
+			polling-delay-passive = <500>;
+			thermal-sensors = <&m5_smc_hwmon 14>;
+			trips {
+				m5_Tp0p_passive: passive {
+					temperature = <75000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+			};
+			cooling-maps {
+				map-cpu {
+					trip = <&m5_Tp0p_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+		smc-tp0u-thermal {
+			polling-delay = <2000>;
+			polling-delay-passive = <500>;
+			thermal-sensors = <&m5_smc_hwmon 15>;
+			trips {
+				m5_Tp0u_passive: passive {
+					temperature = <75000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+			};
+			cooling-maps {
+				map-cpu {
+					trip = <&m5_Tp0u_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+		smc-tp0y-thermal {
+			polling-delay = <2000>;
+			polling-delay-passive = <500>;
+			thermal-sensors = <&m5_smc_hwmon 16>;
+			trips {
+				m5_Tp0y_passive: passive {
+					temperature = <75000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+			};
+			cooling-maps {
+				map-cpu {
+					trip = <&m5_Tp0y_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+		smc-tp12-thermal {
+			polling-delay = <2000>;
+			polling-delay-passive = <500>;
+			thermal-sensors = <&m5_smc_hwmon 17>;
+			trips {
+				m5_Tp12_passive: passive {
+					temperature = <75000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+			};
+			cooling-maps {
+				map-cpu {
+					trip = <&m5_Tp12_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+		smc-tp16-thermal {
+			polling-delay = <2000>;
+			polling-delay-passive = <500>;
+			thermal-sensors = <&m5_smc_hwmon 18>;
+			trips {
+				m5_Tp16_passive: passive {
+					temperature = <75000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+			};
+			cooling-maps {
+				map-cpu {
+					trip = <&m5_Tp16_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+		smc-tp1e-thermal {
+			polling-delay = <2000>;
+			polling-delay-passive = <500>;
+			thermal-sensors = <&m5_smc_hwmon 19>;
+			trips {
+				m5_Tp1E_passive: passive {
+					temperature = <75000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+			};
+			cooling-maps {
+				map-cpu {
+					trip = <&m5_Tp1E_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+		smc-tg04-thermal {
+			polling-delay = <2000>;
+			polling-delay-passive = <500>;
+			thermal-sensors = <&m5_smc_hwmon 20>;
+			trips {
+				m5_Tg04_passive: passive {
+					temperature = <75000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+			};
+			cooling-maps {
+				map-cpu {
+					trip = <&m5_Tg04_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+		smc-tg0c-thermal {
+			polling-delay = <2000>;
+			polling-delay-passive = <500>;
+			thermal-sensors = <&m5_smc_hwmon 21>;
+			trips {
+				m5_Tg0C_passive: passive {
+					temperature = <75000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+			};
+			cooling-maps {
+				map-cpu {
+					trip = <&m5_Tg0C_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+		smc-tg0G-thermal {
+			polling-delay = <2000>;
+			polling-delay-passive = <500>;
+			thermal-sensors = <&m5_smc_hwmon 22>;
+			trips {
+				m5_Tg0G_passive: passive {
+					temperature = <75000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+			};
+			cooling-maps {
+				map-cpu {
+					trip = <&m5_Tg0G_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+		smc-tg0k-thermal {
+			polling-delay = <2000>;
+			polling-delay-passive = <500>;
+			thermal-sensors = <&m5_smc_hwmon 23>;
+			trips {
+				m5_Tg0K_passive: passive {
+					temperature = <75000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+			};
+			cooling-maps {
+				map-cpu {
+					trip = <&m5_Tg0K_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+		smc-tg0o-thermal {
+			polling-delay = <2000>;
+			polling-delay-passive = <500>;
+			thermal-sensors = <&m5_smc_hwmon 24>;
+			trips {
+				m5_Tg0O_passive: passive {
+					temperature = <75000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+			};
+			cooling-maps {
+				map-cpu {
+					trip = <&m5_Tg0O_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+		smc-tg0r-thermal {
+			polling-delay = <2000>;
+			polling-delay-passive = <500>;
+			thermal-sensors = <&m5_smc_hwmon 25>;
+			trips {
+				m5_Tg0R_passive: passive {
+					temperature = <75000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+			};
+			cooling-maps {
+				map-cpu {
+					trip = <&m5_Tg0R_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+		smc-tg0u-thermal {
+			polling-delay = <2000>;
+			polling-delay-passive = <500>;
+			thermal-sensors = <&m5_smc_hwmon 26>;
+			trips {
+				m5_Tg0U_passive: passive {
+					temperature = <75000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+			};
+			cooling-maps {
+				map-cpu {
+					trip = <&m5_Tg0U_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+		smc-tg0x-thermal {
+			polling-delay = <2000>;
+			polling-delay-passive = <500>;
+			thermal-sensors = <&m5_smc_hwmon 27>;
+			trips {
+				m5_Tg0X_passive: passive {
+					temperature = <75000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+			};
+			cooling-maps {
+				map-cpu {
+					trip = <&m5_Tg0X_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+		smc-tg0d-thermal {
+			polling-delay = <2000>;
+			polling-delay-passive = <500>;
+			thermal-sensors = <&m5_smc_hwmon 28>;
+			trips {
+				m5_Tg0d_passive: passive {
+					temperature = <75000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+			};
+			cooling-maps {
+				map-cpu {
+					trip = <&m5_Tg0d_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+		smc-tg0g-thermal {
+			polling-delay = <2000>;
+			polling-delay-passive = <500>;
+			thermal-sensors = <&m5_smc_hwmon 29>;
+			trips {
+				m5_Tg0g_passive: passive {
+					temperature = <75000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+			};
+			cooling-maps {
+				map-cpu {
+					trip = <&m5_Tg0g_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+		smc-tg0j-thermal {
+			polling-delay = <2000>;
+			polling-delay-passive = <500>;
+			thermal-sensors = <&m5_smc_hwmon 30>;
+			trips {
+				m5_Tg0j_passive: passive {
+					temperature = <75000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+			};
+			cooling-maps {
+				map-cpu {
+					trip = <&m5_Tg0j_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+		smc-tg0m-thermal {
+			polling-delay = <2000>;
+			polling-delay-passive = <500>;
+			thermal-sensors = <&m5_smc_hwmon 31>;
+			trips {
+				m5_Tg0m_passive: passive {
+					temperature = <75000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+			};
+			cooling-maps {
+				map-cpu {
+					trip = <&m5_Tg0m_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+		smc-tg0p-thermal {
+			polling-delay = <2000>;
+			polling-delay-passive = <500>;
+			thermal-sensors = <&m5_smc_hwmon 32>;
+			trips {
+				m5_Tg0p_passive: passive {
+					temperature = <75000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+			};
+			cooling-maps {
+				map-cpu {
+					trip = <&m5_Tg0p_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+		smc-tg12-thermal {
+			polling-delay = <2000>;
+			polling-delay-passive = <500>;
+			thermal-sensors = <&m5_smc_hwmon 33>;
+			trips {
+				m5_Tg12_passive: passive {
+					temperature = <75000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+			};
+			cooling-maps {
+				map-cpu {
+					trip = <&m5_Tg12_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+		smc-tg16-thermal {
+			polling-delay = <2000>;
+			polling-delay-passive = <500>;
+			thermal-sensors = <&m5_smc_hwmon 34>;
+			trips {
+				m5_Tg16_passive: passive {
+					temperature = <75000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+			};
+			cooling-maps {
+				map-cpu {
+					trip = <&m5_Tg16_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+		smc-tg1a-thermal {
+			polling-delay = <2000>;
+			polling-delay-passive = <500>;
+			thermal-sensors = <&m5_smc_hwmon 35>;
+			trips {
+				m5_Tg1A_passive: passive {
+					temperature = <75000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+			};
+			cooling-maps {
+				map-cpu {
+					trip = <&m5_Tg1A_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+		smc-tg1i-thermal {
+			polling-delay = <2000>;
+			polling-delay-passive = <500>;
+			thermal-sensors = <&m5_smc_hwmon 36>;
+			trips {
+				m5_Tg1I_passive: passive {
+					temperature = <75000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+			};
+			cooling-maps {
+				map-cpu {
+					trip = <&m5_Tg1I_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+		smc-tg1m-thermal {
+			polling-delay = <2000>;
+			polling-delay-passive = <500>;
+			thermal-sensors = <&m5_smc_hwmon 37>;
+			trips {
+				m5_Tg1M_passive: passive {
+					temperature = <75000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+			};
+			cooling-maps {
+				map-cpu {
+					trip = <&m5_Tg1M_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+		smc-tg1y-thermal {
+			polling-delay = <2000>;
+			polling-delay-passive = <500>;
+			thermal-sensors = <&m5_smc_hwmon 38>;
+			trips {
+				m5_Tg1Y_passive: passive {
+					temperature = <75000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+			};
+			cooling-maps {
+				map-cpu {
+					trip = <&m5_Tg1Y_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+		smc-tg1c-thermal {
+			polling-delay = <2000>;
+			polling-delay-passive = <500>;
+			thermal-sensors = <&m5_smc_hwmon 39>;
+			trips {
+				m5_Tg1c_passive: passive {
+					temperature = <75000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+			};
+			cooling-maps {
+				map-cpu {
+					trip = <&m5_Tg1c_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+		smc-tg1g-thermal {
+			polling-delay = <2000>;
+			polling-delay-passive = <500>;
+			thermal-sensors = <&m5_smc_hwmon 40>;
+			trips {
+				m5_Tg1g_passive: passive {
+					temperature = <75000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+			};
+			cooling-maps {
+				map-cpu {
+					trip = <&m5_Tg1g_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+		smc-tg1o-thermal {
+			polling-delay = <2000>;
+			polling-delay-passive = <500>;
+			thermal-sensors = <&m5_smc_hwmon 41>;
+			trips {
+				m5_Tg1o_passive: passive {
+					temperature = <75000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+			};
+			cooling-maps {
+				map-cpu {
+					trip = <&m5_Tg1o_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+		smc-tg1s-thermal {
+			polling-delay = <2000>;
+			polling-delay-passive = <500>;
+			thermal-sensors = <&m5_smc_hwmon 42>;
+			trips {
+				m5_Tg1s_passive: passive {
+					temperature = <75000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+			};
+			cooling-maps {
+				map-cpu {
+					trip = <&m5_Tg1s_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+	};
+};

@@ -8,8 +8,18 @@ export KBUILD_BUILD_USER=aurora KBUILD_BUILD_HOST=j813-builder
 task_root=/Users/mcruz/Developer/aurora-silicon/j813-linux
 task_src="$HOME/j813-desktop-kernel-source"
 task_build="$HOME/j813-thermal-build"
-task_out="$task_root/artifacts/thermal"
 task_tools="$task_root/linux/tools/aurora/j813/thermal"
+case "${1:-thermal}" in
+    thermal)
+        task_out="$task_root/artifacts/thermal"
+        task_dts=t8142-j813-thermal.dts
+        task_base="$task_root/artifacts/cpu/initramfs.cpio.gz" ;;
+    gpu)
+        task_out="$task_root/artifacts/gpu/native/gpu-thermal-candidate"
+        task_dts=t8142-j813-gpu-thermal.dts
+        task_base="$task_root/artifacts/gpu/native/rtkit-probe/initramfs.cpio.gz" ;;
+    *) echo 'Usage: build-candidate.sh [thermal|gpu]' >&2; exit 1 ;;
+esac
 if [[ ! -e "$task_build" ]]; then
     cp -a --reflink=auto "$HOME/j813-smp-diagnostic-build" "$task_build"
 fi
@@ -32,12 +42,12 @@ cp "$task_build/.config" "$task_out/kernel.config"
 clang -E -P -nostdinc -undef -D__DTS__ -x assembler-with-cpp \
     -I "$task_root/linux/scripts/dtc/include-prefixes" \
     -I "$task_root/linux/arch/arm64/boot/dts/apple" \
-    "$task_tools/t8142-j813-thermal.dts" -o "$task_out/t8142-j813-thermal.pp.dts"
+    "$task_tools/$task_dts" -o "$task_out/t8142-j813-thermal.pp.dts"
 "$task_build/scripts/dtc/dtc" -I dts -O dtb -o "$task_out/t8142-j813.dtb" \
     "$task_out/t8142-j813-thermal.pp.dts"
 task_ramfs=$(mktemp -d "$HOME/j813-thermal-initramfs.XXXXXX")
 trap 'rm -rf "$task_ramfs"' EXIT
-(cd "$task_ramfs"; gzip -dc "$task_root/artifacts/cpu/initramfs.cpio.gz" | cpio -idmu --quiet)
+(cd "$task_ramfs"; gzip -dc "$task_base" | cpio -idmu --quiet)
 make -C "$task_src" O="$task_build" INSTALL_MOD_PATH="$task_ramfs" modules_install
 depmod -b "$task_ramfs" "$task_release"
 mkdir -p "$task_ramfs/opt/j813"

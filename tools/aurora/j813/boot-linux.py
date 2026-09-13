@@ -19,8 +19,8 @@ for option in ('carrier-build', 'carrier-sha256'):
     if values:
         carrier_options[option.replace('-', '_')] = values[0]
 if carrier_options:
-    if len(carrier_options) != 2 or '--gpu-display' not in sys.argv:
-        raise ValueError('Carrier build and SHA256 require each other and --gpu-display')
+    if len(carrier_options) != 2 or not any(x in sys.argv for x in ('--gpu-display', '--gpu-thermal')):
+        raise ValueError('Carrier build and SHA256 require each other and --gpu-display or --gpu-thermal')
     carrier_image = Path(carrier_options['carrier_build']) / 'm1n1.bin'
     if hashlib.sha256(carrier_image.read_bytes()).hexdigest() != carrier_options['carrier_sha256']:
         raise ValueError('Selected carrier SHA256 mismatch')
@@ -62,7 +62,7 @@ print('TARGET_CONFIRMED J813 Mac17,3 T8142', flush=True)
 if '--gpu-inventory' in sys.argv:
     runpy.run_path(str(root / 'inspect-gpu-topology.py'))['capture_gpu_topology'](u, root / 'logs')
 
-selected = [name for name in ('cpu', 'wifi', 'bluetooth', 'desktop', 'input', 'video', 'video-v4l2', 'gpu', 'display', 'display-probe') if '--' + name in sys.argv]
+selected = [name for name in ('cpu', 'wifi', 'thermal', 'bluetooth', 'desktop', 'input', 'video', 'video-v4l2', 'gpu', 'display', 'display-probe') if '--' + name in sys.argv]
 if len(selected) > 1:
     raise ValueError('Select one RAM payload flavor')
 flavor = selected[0] if selected else None
@@ -71,6 +71,9 @@ gpu_display = '--gpu-display' in sys.argv
 display = flavor in ('display', 'display-probe') or gpu_display
 gpu_rtkit_probe = '--gpu-rtkit-probe' in sys.argv
 gpu_initdata = '--gpu-initdata' in sys.argv
+gpu_thermal = '--gpu-thermal' in sys.argv
+if gpu_thermal and (not gpu or not gpu_initdata or gpu_display):
+    raise ValueError('--gpu-thermal requires --gpu --gpu-initdata and excludes --gpu-display')
 smp = '--smp' in sys.argv
 idle_args = [arg.split('=', 1)[1] for arg in sys.argv if arg.startswith('--smp-idle=')]
 if idle_args and (not smp or len(idle_args) != 1 or idle_args[0] not in ('nop', 'yield', 'wfi')):
@@ -91,9 +94,9 @@ if gpu_initdata and (not gpu or gpu_rtkit_probe):
     raise ValueError('--gpu-initdata requires --gpu and excludes --gpu-rtkit-probe')
 if gpu_rtkit_probe and not gpu:
     raise ValueError('--gpu-rtkit-probe requires --gpu')
-video = flavor in ('video', 'video-v4l2', 'gpu')
+video = flavor in ('video', 'video-v4l2', 'gpu') and not gpu_thermal
 input_enabled = flavor == 'input' or video or display
-wifi = flavor is not None and flavor != 'cpu'
+wifi = flavor is not None and flavor not in ('cpu', 'thermal')
 artifacts = root / 'artifacts'
 if flavor:
     artifacts /= ('display/probe' if flavor == 'display-probe' else
@@ -124,6 +127,11 @@ if (b'apple,agx-t8142\0' in dtb) != gpu:
     raise ValueError('The M5 GPU DT requires --gpu and boot-local resource preflight')
 if (b'apple,t8142-dcp\0' in dtb) != display:
     raise ValueError('The M5 DCP DT requires --display and live mapping preflight')
+if flavor == 'thermal' or gpu_thermal:
+    if not smp or smp_boot_cpus != 1 or smp_idle != 'wfi' or not smp_no_wfxt:
+        raise ValueError('Thermal qualification requires --smp --smp-boot-cpus=1 --smp-idle=wfi --smp-no-wfxt')
+    if b'apple,t8142-smc\0' not in dtb or b'thermal-zones\0' not in dtb:
+        raise ValueError('Thermal payload must include the J813 SMC and thermal zones')
 uboot = (root / 'u-boot/u-boot-nodtb.bin').read_bytes()
 
 def prepare_smp():
@@ -171,7 +179,8 @@ if gpu:
 if wifi:
     # Fail before the large RAM transfer if the resident carrier cannot
     # initialize N1 or a previous proxy session still owns its SMC endpoint.
-    runpy.run_path(str(root / 'prepare-n1-pcie.py'), init_globals={'p': p, 'u': u, 'iface': iface})
+    runpy.run_path(str(root / 'prepare-n1-pcie.py'), init_globals={
+        'p': p, 'u': u, 'iface': iface, 'quiesce_smc_for_linux': gpu_thermal})
 
 kernel_addr = u.memalign(2 * 1024 * 1024, 64 * 1024 * 1024)
 initrd_addr = u.memalign(65536, len(initrd))

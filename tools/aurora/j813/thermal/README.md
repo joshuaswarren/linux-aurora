@@ -1,10 +1,11 @@
 # J813 thermal monitoring and CPU cooling
 
-This separate RAM image exposes 43 SMC temperature channels and thermal zones,
+These separate RAM images expose 43 SMC temperature channels and thermal zones,
 plus CPU frequency policies and cooling devices for the M5's E/P clusters.
-It leaves graphics workloads stopped. GPU, DCP, Wi-Fi and MTP are omitted from
-its device tree so their boot preparation cannot retain ownership of the SMC.
-The previously qualified desktop artifacts are not replaced.
+The minimal thermal image omits GPU, DCP, Wi-Fi and MTP. The headless GPU image
+adds GPU and Wi-Fi for offscreen GLES tests, with an explicit SMC handoff.
+Neither image starts a graphics workload during boot. The previously qualified
+desktop artifacts are not replaced.
 
 The thermal startup script loads `apple-soc-cpufreq`, caps each online cluster
 at its lowest advertised frequency, and loads `macsmc` and `macsmc-hwmon`.
@@ -55,6 +56,9 @@ frequency. That boot's initial readings were 36.2-44.8 C.
 On the existing `j813-builder` VM, run `build-candidate.sh`. It merges
 `../thermal.config` into the separate thermal kernel build, uses two build jobs,
 and packages `artifacts/thermal` from the minimal CPU initramfs.
+Pass `gpu` to package the headless GPU image at
+`artifacts/gpu/native/gpu-thermal-candidate`, including the qualified GPU
+firmware and N1 userspace from the existing GPU initramfs.
 
 On a freshly reset J813, chainload the guarded SMP carrier, then use the host
 boot helper:
@@ -68,12 +72,35 @@ The host helper checks J813/T8142 identity and requires one initial Linux CPU
 for this thermal image. The spin-table implementation cannot offline CPUs;
 do not try to reduce a CPU's hotplug target after bringing it online.
 
+The headless variant uses `--gpu --gpu-initdata --gpu-thermal
+--gpu-candidate=gpu-thermal-candidate`, the same one-CPU WFI options, and the
+explicit guarded carrier build/SHA256 pair. Boot verifies GPU firmware regions
+and quiesces the owned SMC RTKit session after N1 PCIe preparation. The SMC CPU
+remains running. Linux then performs its normal SMC handshake. A physical boot
+verified all 43 channels/zones, the low CPU cap, GPU render-node registration,
+and Wi-Fi association together.
+
+The unchanged v12 Mesa library then completed all 19 native GLES3 color-clear
+cases: 11 Pass and 8 Fail, exactly matching the previous per-case results.
+All 192 GPU queue pairs retired. The 5.164-second run reported real temperatures
+of 43.840-44.262 C, with no timeout, thermal abort, or kernel fault. The eight
+masked/complex failures still encounter the native opaque-draw profile limit.
+`gles3-color-clear-qualification.json` retains the report and QPA hash.
+
+The native CTS runner now requires 43 working SMC channels, bound cooling
+devices, and low CPU clock caps. It rejects polling idle and stops at a measured
+70 C by default, recording a thermal abort as failure. It samples temperatures
+before, during, and after execution; Khronos pixel expectations are unchanged.
+This is a test-run stop policy, not GPU DVFS or factory thermal calibration.
+
 ## Handoff constraints
 
-Wi-Fi preparation currently retains a Python SMC session, and the subsequent
-Linux SMC handshake timed out. A fresh boot with Linux as the first SMC client
-succeeded. Integrating thermal support with the desktop requires fixing that
-firmware handoff, then requalifying WFI with the full display and input stack.
+Wi-Fi preparation previously retained a Python SMC session, and the subsequent
+Linux SMC handshake timed out. The headless GPU path now closes that session
+with standard RTKit QUIESCED transitions before Linux takes over. It requires
+a freshly owned session and checks both acknowledgements and CPU RUN state.
+Desktop integration still requires WFI qualification with the display and input
+stack. The CPU-only and headless GPU results do not establish that integration.
 Do not resume the prior ten-core polling graphics image as a thermal solution.
 
 Reading SMC wrapper offset `0x48` caused an SError on this board. It is not a
