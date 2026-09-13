@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 from m5_native_cts_validation import driver_errors, invalid_cases
+from m5_kernel_capture import KernelCapture
 
 p = argparse.ArgumentParser(description=__doc__)
 p.add_argument('name')
@@ -104,10 +105,19 @@ except (OSError, ValueError, RuntimeError) as error:
     raise SystemExit(str(error))
 next_temperature_sample = time.monotonic() + 1
 paths = set()
+# Open before the child can submit work; preserve record sequence numbers so
+# a wrapping printk ring cannot silently produce incomplete qualification.
+try:
+    kernel_capture = KernelCapture(out / 'kernel-stream.log')
+except OSError as error:
+    report.update(kernel_capture={'complete': False, 'errors': [str(error)]}, passed=False)
+    (out / 'report.json').write_text(json.dumps(report, indent=2) + '\n')
+    raise SystemExit(str(error))
 with (out / 'stdout.log').open('w') as log:
     child = subprocess.Popen(command, cwd=cwd, stdout=log, stderr=subprocess.STDOUT,
                              start_new_session=True)
     while child.poll() is None:
+        kernel_capture.drain()
         try:
             maps = Path(f'/proc/{child.pid}/maps').read_text()
             paths.update(line.split()[-1] for line in maps.splitlines() if '/' in line)
@@ -143,6 +153,7 @@ with (out / 'stdout.log').open('w') as log:
             break
         time.sleep(0.01)
     report['returncode'] = child.wait()
+report['kernel_capture'] = kernel_capture.close()
 if not report['thermal_aborted']:
     try:
         temperature_sample()
@@ -162,8 +173,11 @@ report['cases_completed'] = sum(report['results'].values())
 report['renderer_strings'] = re.findall(r'^#sessionInfo renderer "([^"]+)"', qpa, re.M)
 report['driver_errors'] = driver_errors((out / 'stdout.log').read_text(errors='replace'))
 report['invalid_cases'] = sorted(invalid_cases(report['driver_errors'], started_names))
+if not report['kernel_capture']['complete']:
+    report['invalid_cases'] = sorted(set(started_names))
 report['passed'] = (report['returncode'] == 0 and report['provenance_verified']
                     and not report['driver_errors']
+                    and report['kernel_capture']['complete']
                     and not report['timed_out'] and not report['thermal_aborted']
                     and report['cases_started'] > 0
                     and report['cases_started'] == report['cases_completed']
