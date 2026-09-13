@@ -46,10 +46,8 @@ use core::{
 
 use g17_initdata::{InstanceAddresses, InstanceRole, SharedAddresses};
 
-/// Linux counterpart of IOGPUFamily's `___globalObjectIDCounter`.
-///
-/// The native render path uses this one counter for userspace GID-group
-/// reservations and for the kernel command IDs allocated after a reservation.
+/// Nonzero object IDs shared by pool owners and render commands.
+/// Keep IDs unique across retained graphs, clients and firmware resets.
 #[cfg(not(test))]
 static G17P_RENDER_GID_COUNTER: AtomicU32 = AtomicU32::new(1);
 
@@ -71,12 +69,16 @@ fn g17p_render_gid_add(delta: u32) -> Result<(u32, u32)> {
 }
 
 #[cfg(not(test))]
-fn g17p_reserve_render_gid_group() -> Result<u32> {
-    let (predecessor, _) = g17p_render_gid_add(g17_render::G17P_RENDER_GID_GROUP_STRIDE)?;
-    if predecessor == 0 {
+fn g17p_allocate_object_id() -> Result<u32> {
+    // Metal reserves 0x01000000 IDs for userspace allocation. Linux has no
+    // userspace GID allocator: a pool or lifecycle predecessor needs just one
+    // ID. Reserving the whole unused range here exhausts the 32-bit namespace
+    // after about 255 render graphs and permanently refuses new clients.
+    let (id, _) = g17p_render_gid_add(1)?;
+    if id == 0 {
         Err(EOVERFLOW)
     } else {
-        Ok(predecessor)
+        Ok(id)
     }
 }
 
@@ -7145,7 +7147,7 @@ impl G17PUserRenderStorage {
         translated.parameters.fragment_timestamp_end = timestamp_va + 8;
         translated.parameters.fragment_user_timestamp_start = user_timestamps[2];
         translated.parameters.fragment_user_timestamp_end = user_timestamps[3];
-        let lifecycle_predecessor = g17p_reserve_render_gid_group()?;
+        let lifecycle_predecessor = g17p_allocate_object_id()?;
         let (fragment_lifecycle, tiling_lifecycle) =
             g17p_allocate_render_lifecycle_pair(lifecycle_predecessor)?;
         translated.parameters.fragment_lifecycle = fragment_lifecycle;
@@ -7967,7 +7969,7 @@ impl G17PUserRenderStorage {
     }
 
     pub(crate) fn render_pool_id(&self) -> u64 {
-        // This checked, monotonic native GID reservation is unique to this
+        // This checked, monotonic object ID is unique to this
         // retained graph, even if its GPU addresses are reused after reset.
         u64::from(self.lifecycle_predecessor)
     }
@@ -16195,7 +16197,7 @@ impl G17ResourceOwner {
                 buffers.push(RenderBackingObject::new(&self.dev,
                     G17P_CONTROL_OPERAND_BUFFER_SIZE)?, GFP_KERNEL)?;
             }
-            let pool_id = u64::from(g17p_reserve_render_gid_group()?);
+            let pool_id = u64::from(g17p_allocate_object_id()?);
             self.resources.compute_operand_page_lists = Some(pages);
             self.resources.compute_operand_table = Some(table);
             self.resources.compute_operand_buffers = buffers;
