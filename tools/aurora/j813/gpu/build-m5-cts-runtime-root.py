@@ -12,7 +12,7 @@ from pathlib import Path
 import tarfile
 
 SOURCE_SHA256 = 'ada4e031949b4985bc8ee9abeac64faf3a28178a59f9ba7a1e0b624f72e202bc'
-COMMANDS = set('bash cat chmod chown chroot cp date df dmesg du env false find '
+COMMANDS = set('bash cat chmod chown chroot cp date df dmesg du env false find grep '
                'free gzip head id install kill ln ls mkdir mount mv nice pgrep '
                'pkill ps python3 python3.14 readlink rm rmdir scp sed sha256sum '
                'sh dash sleep sort ssh ssh-keygen stat tail tar tee timeout touch '

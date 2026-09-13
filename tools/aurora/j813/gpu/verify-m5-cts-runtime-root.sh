@@ -4,7 +4,7 @@ set -eu
 grep -aq apple,j813 /proc/device-tree/compatible
 root=/tmp/m5-cts-runtime-root
 test ! -e "$root"
-echo 'dad855c83b377654b64d23c2e705fac1a4a3ba5fb16cf792814d85713939a748  /run/m5-cts-runtime-root.tar.gz' | sha256sum -c -
+echo 'b516ad9186d06120bc09f3e5d9d29c89314364a055298f25344e934bedf33714  /run/m5-cts-runtime-root.tar.gz' | sha256sum -c -
 mkdir "$root"
 tar -xzf /run/m5-cts-runtime-root.tar.gz -C "$root" 2>/run/m5-cts-runtime-extract.log
 mkdir -p "$root/dev" "$root/proc" "$root/sys" "$root/opt" "$root/run/sshd" "$root/run/user/0"

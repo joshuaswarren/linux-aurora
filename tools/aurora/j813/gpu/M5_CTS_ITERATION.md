@@ -19,8 +19,10 @@ about 60 percent. Gzip headers are deterministic. The exact final digest is
 recorded by the build and pinned in the restore helper.
 
 Final runtime SHA256:
-`dad855c83b377654b64d23c2e705fac1a4a3ba5fb16cf792814d85713939a748`.
-Archive size: 146,636,814 bytes; unpacked files: 399,182,568 bytes.
+`b516ad9186d06120bc09f3e5d9d29c89314364a055298f25344e934bedf33714`.
+Archive size: 146,726,585 bytes; unpacked files: 399,381,592 bytes.
+This includes the original distribution's `grep`, required by target identity
+verification before the driver/CTS installer runs.
 
 Physical M5 qualification of the runtime contents establishes:
 
@@ -32,9 +34,19 @@ Physical M5 qualification of the runtime contents establishes:
   remains 503 after the rendering run.
 
 Enumeration is not a conformance pass. Rendering results reported in
-`M5_NATIVE_GLES3_ADDITIVE_BLEND.md` used the established full runtime. The
-next fresh boot must measure the end-to-end restore saving and recheck
-rendering in the reduced runtime.
+`M5_NATIVE_GLES3_ADDITIVE_BLEND.md` used the established full runtime.
+
+The v24 fresh boot measured 57.59 seconds from reduced-root download start
+to SSH ready: 19.38 seconds download, 5.71 seconds verification, 30.28 seconds
+extraction and 2.22 seconds SSH setup. These are target monotonic timestamps;
+the earlier full-root restore was not separately phase-timed. This boot used
+the preceding archive plus its missing original `grep` binary, transferred
+before testing. The final archive above includes that binary directly.
+
+The reduced-root run passes all 1,171 clear/default-framebuffer blend cases
+in 129.818 seconds with no compiler refusal or GPU fault. See
+`M5_NATIVE_GLES3_DEFAULT_BLEND.md` for retained hardware evidence. The
+compiler changes increase batch coverage without weakening test checks.
 
 The host restore uses this runtime for headless thermal testing and retains
 `--full-desktop-root` as an explicit fallback. The generic bootstrap accepts
