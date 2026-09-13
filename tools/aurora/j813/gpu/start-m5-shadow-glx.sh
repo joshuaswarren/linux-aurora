@@ -26,6 +26,12 @@ fi
 # /desktop/dev was bound before devpts existed; propagate the new mount.
 mkdir -p /desktop/dev/pts
 mount --bind /dev/pts /desktop/dev/pts
+# POSIX shared memory is needed by desktop applications and worker pools.
+# The rescue devtmpfs does not create or mount /dev/shm automatically.
+mkdir -p /desktop/dev/shm
+if ! awk '$2 == "/desktop/dev/shm" {found=1} END {exit !found}' /proc/mounts; then
+    mount -t tmpfs -o mode=1777,nosuid,nodev,size=256m shm /desktop/dev/shm
+fi
 chroot /desktop python3 -c 'import os, pty; a,b=pty.openpty(); os.close(a); os.close(b)'
 chroot /desktop /usr/bin/dbus-uuidgen --ensure
 if [ ! -S /run/dbus/system_bus_socket ]; then

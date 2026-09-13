@@ -46,10 +46,15 @@ def prepare_display(u, p):
     return state
 
 
-def verify_display_fdt(u, p, before, integrated_gpu=False):
+def verify_display_fdt(u, p, before, integrated_gpu=False,
+                       carrier_build=None, carrier_sha256=None):
     """Read the exact prepared FDT, using symbols from the verified RAM image."""
     build = (ROOT / 'hv/publish-j813/build-j813-dcp' if integrated_gpu else
              ROOT / 'm1n1/build-j813-dcp')
+    require((carrier_build is None) == (carrier_sha256 is None),
+            'Carrier build and SHA256 must be supplied together')
+    if carrier_build is not None:
+        build = Path(carrier_build)
     symbols = {}
     listing = subprocess.check_output(
         ['/opt/homebrew/opt/llvm/bin/llvm-nm', '--defined-only', str(build / 'm1n1-raw.elf')],
@@ -62,7 +67,10 @@ def verify_display_fdt(u, p, before, integrated_gpu=False):
     require(set(symbols) == {'_base', '_end', 'dt', 'kboot_prepare_dt'} and symbols['_base'] == 0,
             'Unexpected loader symbol layout')
     image = (build / 'm1n1.bin').read_bytes()
-    if integrated_gpu:
+    if carrier_build is not None:
+        require(hashlib.sha256(image).hexdigest() == carrier_sha256,
+                'Selected carrier SHA256 mismatch')
+    elif integrated_gpu:
         require(hashlib.sha256(image).hexdigest() ==
                 '3eb341d34e923abe578de7e670ed948c84fcb6f50084a23dd132898fd3b4b409',
                 'Integrated carrier differs from the pinned combined candidate')
