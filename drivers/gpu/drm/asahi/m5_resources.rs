@@ -505,7 +505,7 @@ impl M5FirmwareMemory {
     /// while preserving firmware-owned PB/USC state and the installed queues.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn publish_next_application_job(
-        &mut self, vm: &mmu::Vm,
+        &mut self, dev: &AsahiDevice, vm: &mmu::Vm,
         parameters: crate::g17_render::G17pRenderParameters,
         controls: crate::m5_render::M5RenderControls, clusters: u32,
         usc_required: [u64; 2], generation: u32,
@@ -519,7 +519,7 @@ impl M5FirmwareMemory {
             return Err(EBUSY);
         }
         let (job, queues) = self.graphics.as_mut().ok_or(EINVAL)?;
-        job.prepare_application_frame(vm, parameters, controls, clusters,
+        job.prepare_application_frame(dev, vm, parameters, controls, clusters,
             usc_required, generation)?;
         queues.publish_next_draw(job, generation)?;
         self.graphics_stamp_flags = 0;

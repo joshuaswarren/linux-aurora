@@ -35,6 +35,9 @@ const METRICS_HIGH: u64 = HIGH + 0x60000;
 const USER_BASE: u64 = 0x10_0000_0000;
 pub(super) const PB_HARDWARE_ID: u32 = 0;
 pub(super) const QUEUE_IDS: [u8; 2] = [10, 11];
+// Bounded resize experiment. The PB remains the native 48-page pool;
+// arbitrary scene capacity and firmware-driven pool growth are separate.
+use crate::g17_uapi::M5_MAX_RENDER_DIMENSION as MAX_APPLICATION_DIMENSION;
 
 pub(super) struct M5GraphicsJob {
     // The first owner's context retracts its roots before page release.
@@ -77,10 +80,9 @@ impl M5GraphicsJob {
         mut p: g17_render::G17pRenderParameters, controls: m5_render::M5RenderControls,
         clusters: u32, usc_required: [u64; 2],
     ) -> Result<Self> {
-        // The current parameter pool has the witnessed 256x256 capacity.
-        // Do not silently accept larger application geometry until pool
-        // sizing/growth is implemented, even though target sizes are derived.
-        if p.width > 256 || p.height > 256 || p.layers != 1 || clusters != 1 {
+        if !(1..=MAX_APPLICATION_DIMENSION).contains(&p.width)
+            || !(1..=MAX_APPLICATION_DIMENSION).contains(&p.height)
+            || p.layers != 1 || clusters != 1 {
             return Err(ENOTSUPP);
         }
         let mut parameter_buffer = M5ParameterBuffer::new_reference(dev, &program)?;
@@ -323,22 +325,33 @@ impl M5GraphicsJob {
     }
 
     /// Re-encode a retired application's descriptors without replaying its old
-    /// command pointers. The current bounded queue retains one VM and target
-    /// shape. Ring storage can wrap only after complete retirement; the job
+    /// command pointers. The current bounded queue retains one VM. Target
+    /// storage can change only after complete retirement; the job
     /// stamp keeps increasing and context replacement remains unsupported.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn prepare_application_frame(
-        &mut self, vm: &mmu::Vm, mut p: g17_render::G17pRenderParameters,
+        &mut self, dev: &AsahiDevice, vm: &mmu::Vm, mut p: g17_render::G17pRenderParameters,
         controls: m5_render::M5RenderControls, clusters: u32,
         usc_required: [u64; 2], generation: u32,
     ) -> Result {
         if vm.id() != self.program.vm().id() || clusters != 1
-            || [p.width, p.height, u32::from(p.layers), u32::from(p.utile_width),
-                u32::from(p.utile_height)] != self.target_shape
+            || !(1..=MAX_APPLICATION_DIMENSION).contains(&p.width)
+            || !(1..=MAX_APPLICATION_DIMENSION).contains(&p.height) || p.layers != 1
             || generation != self.generation + 1 || generation > MAX_GRAPHICS_GENERATION {
             return Err(ENOTSUPP);
         }
-        self.target_memory.apply(&mut p);
+        // Validate retirement before allocating or releasing any target pages.
+        // The caller additionally checks both queues, stamps and event bits.
+        let progress = self.progress()?;
+        if self.scheduler_status()? != [2, 0] || progress[0] != 2
+            || progress[1] != self.generation * 0x100
+            || progress[3] != self.generation * 0x100 { return Err(EBUSY); }
+        let shape = [p.width, p.height, u32::from(p.layers),
+            u32::from(p.utile_width), u32::from(p.utile_height)];
+        let replacement = if shape != self.target_shape {
+            Some(M5TargetMemory::new(dev, &self.program, &p, clusters)?)
+        } else { None };
+        replacement.as_ref().unwrap_or(&self.target_memory).apply(&mut p);
         p.cycle = self.parameter_buffer.scene_cycle();
         p.record_index = m5_render::parameter_buffer_metrics_record(
             self.parameter_buffer.metrics() + 0x40).map_err(|_| EINVAL)?;
@@ -355,7 +368,14 @@ impl M5GraphicsJob {
         self.descriptor_template = descriptors;
         // The application owns its output. It must never be erased by the
         // native diagnostic's sentinel/reset logic.
-        self.rebuild_retired_frame(generation, false)
+        self.rebuild_retired_frame(generation, false)?;
+        if let Some(target) = replacement {
+            dev_info!(dev.as_ref(), "M5_RENDER_TARGET_RESIZE generation={} old={:?} new={:?}\n",
+                generation, self.target_shape, shape);
+            self.target_memory = target;
+            self.target_shape = shape;
+        }
+        Ok(())
     }
 
     pub(super) fn result(&mut self) -> Result<crate::m5_graphics_bundle::TriangleResult> {

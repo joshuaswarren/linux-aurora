@@ -612,7 +612,7 @@ impl M5Runtime {
             if generation == 1 {
                 memory.publish_graphics_job()?;
             } else {
-                memory.publish_next_application_job(vm, parameters, controls,
+                memory.publish_next_application_job(&session.dev, vm, parameters, controls,
                     clusters, usc_required, generation)?;
             }
             Pin::new(&mut session.roles[0].rtkit).send_message(0x21, 0x0083_0000_0000_000a)?;
