@@ -918,6 +918,16 @@ impl gpuvm::DriverGpuVm for VmInner {
             );
             return Err(EINVAL);
         }
+
+        // A T8140 VM can already be published through one or more
+        // independently leased compute/render contexts when userspace adds a
+        // new mapping. Those contexts cache invalid translations too. The
+        // historical fixed-compute-context path happened to invalidate its
+        // ASID again at every submit, masking this omission; a real per-queue
+        // context instead kept the negative entry and faulted on the newly
+        // mapped scratch page. Invalidate only the changed range, in exactly
+        // the contexts which currently name this page-table root.
+        self.tlbi_live_contexts(op.addr(), op.range());
         Ok(())
     }
     fn step_unmap(
