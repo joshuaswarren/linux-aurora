@@ -2800,6 +2800,64 @@ impl G17PManagerConstruction {
             .publish_primary_device_control_record(opcode, arg)
     }
 
+    /// Grow the retained owner named by firmware, then publish its opcode-8
+    /// reply. Both parked and selected pairs can be executing. Keep selection
+    /// unchanged so event service cannot redirect the caller's render state.
+    /// The caller owns the primary DeviceControl doorbell.
+    pub(crate) fn service_render_tvb_grow(
+        &mut self,
+        request: g17_completion::G17PFirmwareTvbGrowEvent,
+    ) -> Result<bool> {
+        let generation = self.accepted_firmware_recovery_generation;
+        if request.halt_count != generation {
+            dev_warn!(self.resources.dev().as_ref(),
+                "G17P TVB grow: ignoring stale request slot={} generation={} current={}\n",
+                request.buffer_slot, request.halt_count, generation);
+            return Ok(false);
+        }
+        let grow_owner = |resources: &mut g17_resources::G17ResourceOwner,
+                          storage: Option<&mut g17_resources::G17PUserRenderStorage>,
+                          bind: Option<&G17PRenderRootOwner>,
+                          published: bool| -> Result<bool> {
+            let storage = storage.ok_or(ENOENT)?;
+            let bind = bind.ok_or(ENOENT)?;
+            let id = storage.retained_hardware_buffer_id().ok_or(ENOENT)?;
+            if !published || !request.matches_owner(generation, id, bind.root_slot()? as u32) {
+                return Err(EINVAL);
+            }
+            resources.grow_render_tvb_synchronously(storage, bind.vm())
+        };
+        let result = if self.render_hardware_buffer_id == Some(request.buffer_slot) {
+            grow_owner(&mut self.resources, self.render_storage.as_mut(),
+                self.render_bind.as_ref(), self.render_hardware_buffer_published)
+        } else if let Some(owner) = self.parked_render_slots.iter_mut().flatten()
+            .find(|owner| owner.hardware_buffer_id == Some(request.buffer_slot))
+        {
+            grow_owner(&mut self.resources, owner.storage.as_mut(), owner.bind.as_ref(),
+                owner.hardware_buffer_published)
+        } else {
+            Err(ENOENT)
+        };
+        // Failure is still a reply: claiming success or ignoring a current
+        // request would leave firmware with a fictitious inventory or no wake.
+        let grew = match result {
+            Ok(grew) => grew,
+            Err(error) => {
+                dev_warn!(self.resources.dev().as_ref(),
+                    "G17P TVB grow: slot={} context={} allocation failed ({:?})\n",
+                    request.buffer_slot, request.vm_slot, error);
+                false
+            }
+        };
+        let record = request.reply(grew);
+        self.resources.publish_primary_device_control_raw(&record)?;
+        dev_info!(self.resources.dev().as_ref(),
+            "G17P TVB grow: slot={} context={} counter={} subpipe={} generation={} grew={} ack=8\n",
+            request.buffer_slot, request.vm_slot, request.counter, request.subpipe,
+            request.halt_count, grew);
+        Ok(true)
+    }
+
     /// Activate this prepared pair's FList lease. Only the cold lease has a
     /// pending async grow to publish; a warm pair becomes Ready without 0x20.
     pub(crate) fn publish_render_usc_freelist_request(

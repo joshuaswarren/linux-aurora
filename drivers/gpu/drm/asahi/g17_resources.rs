@@ -5336,6 +5336,13 @@ const G17P_PM_MAX_BLOCKS: usize = 0xd1a;
 const G17P_PM_MAX_OWNED_BLOCKS: usize = G17P_PM_MAX_BLOCKS - 1;
 const G17P_PM_MAX_BLOCKS_NOMEMLESS: usize = 0x45e;
 
+/// Native growImmediately requests ten blocks, including a partial final
+/// increment at the allocation limit. Saturation also makes overflow inert.
+fn g17p_tvb_grow_target(current: usize, maximum: usize) -> usize {
+    current.saturating_add(10).min(maximum)
+}
+
+
 const G17P_PM_HWPB_STATE_SIZE: usize = 0xc0;
 const G17P_PM_PAGE_LIST_SIZE: usize =
     G17P_PM_MAX_BLOCKS * G17P_PM_PAGES_PER_BLOCK * core::mem::size_of::<u32>();
@@ -13030,6 +13037,9 @@ impl G17ResourceOwner {
                     Err(error) => Err(error),
                 }
             }
+            g17_completion::G17P_FIRMWARE_EVENT_TVB_GROW_TYPE => {
+                g17_completion::G17PFirmwareTvbGrowEvent::decode(&raw).map(|_| ())
+            }
             g17_completion::G17P_FIRMWARE_EVENT_RECOVERY_TYPE => {
                 g17_completion::decode_g17p_firmware_recovery_event(&raw).map(|_| ())
             }
@@ -15870,6 +15880,25 @@ impl G17ResourceOwner {
     pub(crate) fn grow_render_tvb(
         &mut self, storage: &mut G17PUserRenderStorage, vm: &mmu::Vm, blocks: usize,
     ) -> Result {
+        self.grow_render_tvb_inner(storage, vm, blocks, false)
+    }
+
+    /// Firmware event 6 suspends allocation until the new block inventory is
+    /// committed. PBDesc, PBState and the live page list remain firmware-owned.
+    pub(crate) fn grow_render_tvb_synchronously(
+        &mut self, storage: &mut G17PUserRenderStorage, vm: &mmu::Vm,
+    ) -> Result<bool> {
+        let before = storage.tvb_capacity();
+        let target = g17p_tvb_grow_target(before, G17P_PM_MAX_OWNED_BLOCKS);
+        if target <= before { return Ok(false); }
+        self.grow_render_tvb_inner(storage, vm, target, true)?;
+        Ok(storage.tvb_capacity() > before)
+    }
+
+    fn grow_render_tvb_inner(
+        &mut self, storage: &mut G17PUserRenderStorage, vm: &mmu::Vm, blocks: usize,
+        synchronous: bool,
+    ) -> Result {
         let pool_id=storage.render_pool_id();
         let render_slot=storage.queue_pair.slot();
         let tvb=storage.render_tvb.as_mut().ok_or(EINVAL)?;
@@ -15902,79 +15931,81 @@ impl G17ResourceOwner {
             first.checked_add((G17P_PM_PAGES_PER_BLOCK-1) as u32).ok_or(EOVERFLOW)?;
             added_page_bases.push((slot,first),GFP_KERNEL)?;
         }
-        let mut rebuilt_page_list=KVec::with_capacity(available_pages,GFP_KERNEL)?;
-        pm.backing.with_bytes_mut(|pm_raw| {
-            if g17p_pm_control_cursors(pm_raw,pm_layout.shared_control)!=Some(control) {
-                return Err(EAGAIN);
-            }
-            for ordinal in 0..ring.available_blocks() {
-                let slot=ring.available_slot(ordinal).ok_or(EIO)?;
-                let first=if ordinal<ring.retained_blocks {
-                    let at=pm_layout.block_page_bases+slot*8;
-                    u32::from_le_bytes(pm_raw.get(at..at+4).ok_or(ERANGE)?
-                        .try_into().map_err(|_| ERANGE)?)
-                } else {
-                    let added=ordinal-ring.retained_blocks;
-                    added_page_bases[added].1
-                };
-                first.checked_add((G17P_PM_PAGES_PER_BLOCK-1) as u32).ok_or(EOVERFLOW)?;
-                for page in 0..G17P_PM_PAGES_PER_BLOCK {
-                    rebuilt_page_list.push(first+page as u32,GFP_KERNEL)?;
+        let mut rebuilt_page_list=KVec::with_capacity(
+            if synchronous { 0 } else { available_pages },GFP_KERNEL)?;
+        if !synchronous {
+            pm.backing.with_bytes_mut(|pm_raw| {
+                if g17p_pm_control_cursors(pm_raw,pm_layout.shared_control)!=Some(control) {
+                    return Err(EAGAIN);
                 }
-            }
-            Ok(())
-        })?;
+                for ordinal in 0..ring.available_blocks() {
+                    let slot=ring.available_slot(ordinal).ok_or(EIO)?;
+                    let first=if ordinal<ring.retained_blocks {
+                        let at=pm_layout.block_page_bases+slot*8;
+                        u32::from_le_bytes(pm_raw.get(at..at+4).ok_or(ERANGE)?
+                            .try_into().map_err(|_| ERANGE)?)
+                    } else {
+                        let added=ordinal-ring.retained_blocks;
+                        added_page_bases[added].1
+                    };
+                    first.checked_add((G17P_PM_PAGES_PER_BLOCK-1) as u32).ok_or(EOVERFLOW)?;
+                    for page in 0..G17P_PM_PAGES_PER_BLOCK {
+                        rebuilt_page_list.push(first+page as u32,GFP_KERNEL)?;
+                    }
+                }
+                Ok(())
+            })?;
+        }
         let descriptor_offset=g17_submission::g17p_pbdesc_offset(pm.hardware_buffer_id);
         let page_list_address=pm.page_list_low_va();
         let descriptor=&mut self.resources.pb_descriptor_table;
         pm.backing.with_bytes_mut(|pm_raw| {
-            descriptor.with_bytes_mut(|desc_raw| {
-                    let descriptor_end=descriptor_offset.checked_add(g17_submission::G17P_PBDESC_ENTRY_SIZE).ok_or(EOVERFLOW)?;
+            let commit = |desc_raw: Option<&mut [u8]>| {
                     if pm_raw.len()<pm_layout.total_size
-                        || descriptor_end>desc_raw.len() || tvb.extensions.len()==tvb.extensions.capacity()
+                        || tvb.extensions.len()==tvb.extensions.capacity()
                     { return Err(ERANGE); }
                     if g17p_pm_control_cursors(pm_raw,pm_layout.shared_control)!=Some(control) {
                         return Err(EAGAIN);
                     }
-                    let mut previous=[0u32;4];
-                    for (word,value) in previous.iter_mut().enumerate() {
-                        let at=descriptor_offset+word*4;
-                        *value=u32::from_le_bytes(desc_raw[at..at+4].try_into().map_err(|_| EINVAL)?);
-                    }
-                    // buildPageList resets the host PBDesc ring state before
-                    // loadPBDesc. This growth-only reset is intentionally
-                    // distinct from an ordinary retained-owner switch.
-                    let encoded=g17_submission::encode_g17p_pbdesc(previous,page_list_address,page_count,
-                        g17_submission::G17PPbDescRingState::default());
-                    // This is the last fallible step. Alias allocation/count
-                    // and the complete circular page list are ready before
-                    // any firmware-visible write.
+                    // Only a retired scene may rebuild PBDesc. A synchronous
+                    // request leaves its current firmware-owned words alone.
+                    let descriptor_update = if let Some(desc_raw) = desc_raw {
+                        let descriptor_end=descriptor_offset.checked_add(g17_submission::G17P_PBDESC_ENTRY_SIZE).ok_or(EOVERFLOW)?;
+                        if descriptor_end>desc_raw.len() { return Err(ERANGE); }
+                        let mut previous=[0u32;4];
+                        for (word,value) in previous.iter_mut().enumerate() {
+                            let at=descriptor_offset+word*4;
+                            *value=u32::from_le_bytes(desc_raw[at..at+4].try_into().map_err(|_| EINVAL)?);
+                        }
+                        let encoded=g17_submission::encode_g17p_pbdesc(previous,page_list_address,page_count,
+                            g17_submission::G17PPbDescRingState::default());
+                        Some((desc_raw, encoded))
+                    } else {
+                        None
+                    };
+                    // This is the last fallible step. New aliases and the
+                    // chosen publication are ready before any visible write.
                     vm.append_render_pool_mappings(render_slot,pool_id,previous_blocks,blocks,growth.mappings)?;
                     for (slot,first) in added_page_bases.into_iter() {
                         put_u32(pm_raw,pm_layout.block_page_bases+slot*8,first);
                         put_u32(pm_raw,pm_layout.block_page_bases+slot*8+4,0);
                     }
-                    for (entry,value) in rebuilt_page_list.into_iter().enumerate() {
-                        put_u32(pm_raw,pm_layout.page_list+entry*4,value);
-                    }
-                    // buildPageList (25G83 0xfffffe0008a71908) walks the block
-                    // ring from shared +0x08 to the staged target, wrapping at
-                    // 0xd1a, then publishes those exact cursors at PBState
-                    // +0x40/+0x3c. It does not clear the unused page-list tail.
-                    let state=pm_layout.hwpb_state;
-                    put_u32(pm_raw,state+0x34,page_count);
-                    put_u32(pm_raw,state+0x3c,ring.target_cursor as u32);
-                    put_u32(pm_raw,state+0x40,ring.read_cursor as u32);
-                    put_u32(pm_raw,state+0x54,page_count-1);
-                    // Native createParameterBufferBlock advances total;
-                    // commitStagedUpdates publishes the same committed end.
-                    // Firmware alone owns +0x08, which remains unchanged.
-                    put_u32(pm_raw,pm_layout.shared_control+G17P_PM_SHARED_TOTAL_CURSOR,
-                        ring.target_cursor as u32);
-                    put_u32(pm_raw,pm_layout.shared_control+G17P_PM_SHARED_COMMITTED_CURSOR,
-                        ring.target_cursor as u32);
-                    for (word,value) in encoded.into_iter().enumerate() {
-                        put_u32(desc_raw,descriptor_offset+word*4,value);
+                    if let Some((desc_raw, encoded)) = descriptor_update {
+                        for (entry,value) in rebuilt_page_list.into_iter().enumerate() {
+                            put_u32(pm_raw,pm_layout.page_list+entry*4,value);
+                        }
+                        // buildPageList (25G83 0xfffffe0008a71908) walks the block
+                        // ring from shared +0x08 to the staged target, wrapping at
+                        // 0xd1a, then publishes those exact cursors at PBState
+                        // +0x40/+0x3c. It does not clear the unused page-list tail.
+                        let state=pm_layout.hwpb_state;
+                        put_u32(pm_raw,state+0x34,page_count);
+                        put_u32(pm_raw,state+0x3c,ring.target_cursor as u32);
+                        put_u32(pm_raw,state+0x40,ring.read_cursor as u32);
+                        put_u32(pm_raw,state+0x54,page_count-1);
+                        for (word,value) in encoded.into_iter().enumerate() {
+                            put_u32(desc_raw,descriptor_offset+word*4,value);
+                        }
                     }
                     let length=tvb.extensions.len();
                     tvb.extensions.spare_capacity_mut()[0].write(growth.extension);
@@ -15983,8 +16014,22 @@ impl G17ResourceOwner {
                     unsafe { tvb.extensions.set_len(length+1); }
                     tvb.block_count=blocks;
                     tvb.logical_size=logical_size;
+                    // Publish the completed block entries after their backing
+                    // and aliases have been retained. Firmware alone owns +8.
+                    put_u32(pm_raw,pm_layout.shared_control+G17P_PM_SHARED_TOTAL_CURSOR,
+                        ring.target_cursor as u32);
+                    core::sync::atomic::fence(Ordering::SeqCst);
+                    put_u32(pm_raw,pm_layout.shared_control+G17P_PM_SHARED_COMMITTED_CURSOR,
+                        ring.target_cursor as u32);
                     Ok(())
-            })
+            };
+            if synchronous {
+                // growImmediately does not load or map PBDesc. A missing
+                // descriptor CPU view must not prevent a live TVB allocation.
+                commit(None)
+            } else {
+                descriptor.with_bytes_mut(|desc_raw| commit(Some(desc_raw)))
+            }
         })?;
         pm.page_count=page_count;
         core::sync::atomic::fence(Ordering::SeqCst);

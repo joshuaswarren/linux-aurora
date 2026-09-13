@@ -1153,6 +1153,7 @@ fn drain_primary_firmware_event_batch(
     manager: &mut g17_manager::G17PManagerConstruction,
     state: &G17PRoleRtkitState,
     signal: &G17PCompletionSignal,
+    announce_device_control: &mut impl FnMut() -> Result,
 ) -> Result<G17PPrimaryFirmwareEventBatch> {
     let notification_count = state
         .firmware_event_notifications
@@ -1279,6 +1280,21 @@ fn drain_primary_firmware_event_batch(
                 // Do not consume the following ring record until that turn
                 // has fully returned and released both native command gates.
                 break;
+            }
+            g17_completion::G17P_FIRMWARE_EVENT_TVB_GROW_TYPE => {
+                let request = match g17_completion::G17PFirmwareTvbGrowEvent::decode(&record.raw) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        dev_warn!(pdev.as_ref(), "G17P TVB grow: malformed request ({:?})\n", error);
+                        // Native asserts here. Stop event service through the
+                        // caller's existing failure path; a malformed request
+                        // cannot safely identify an allocation or its reply.
+                        return Err(EIO);
+                    }
+                };
+                if manager.service_render_tvb_grow(request)? {
+                    announce_device_control()?;
+                }
             }
             g17_completion::G17P_FIRMWARE_EVENT_UMA_GROW_TYPE => {
                 let completion = validate_primary_bootstrap_uma_completion(pdev, &record)?;
@@ -1666,11 +1682,12 @@ fn settle_primary_empty_recovery(
     manager: &mut g17_manager::G17PManagerConstruction,
     state: &G17PRoleRtkitState,
     signal: &G17PCompletionSignal,
+    announce_device_control: &mut impl FnMut() -> Result,
 ) -> Result<(Option<g17_manager::G17PBootstrapUmaRelease>, [u64; 2])> {
     let mut uma_release = None;
     let mut completion_masks = [0u64; 2];
     for _ in 0..g17_completion::G17P_FIRMWARE_EVENT_CAPACITY {
-        let batch = drain_primary_firmware_event_batch(pdev, manager, state, &signal)?;
+        let batch = drain_primary_firmware_event_batch(pdev, manager, state, &signal, announce_device_control)?;
         completion_masks[0] |= batch.completion_masks[0];
         completion_masks[1] |= batch.completion_masks[1];
         if let Some(release) = batch.uma_release {
@@ -3544,7 +3561,10 @@ impl G17PLiveRuntime {
         } else {
             // Not inside the labelled chain yet: this `?` leaves the function.
             let manager = self.manager.as_mut().ok_or(ENODEV)?;
-            match settle_primary_empty_recovery(&pdev, manager, &state, &signal) {
+            let rtkit = self.gfx_rtkit.as_mut().ok_or(ENODEV)?;
+            let mut announce = || Pin::new(&mut *rtkit).send_message(
+                g17_rtkit::ENDPOINT_GFX_INTERRUPTS, g17_rtkit::encode_primary_device_control());
+            match settle_primary_empty_recovery(&pdev, manager, &state, &signal, &mut announce) {
                 Ok((release, masks)) => {
                     uma_release = release;
                     completion_masks = masks;
@@ -3563,8 +3583,12 @@ impl G17PLiveRuntime {
         });
         let result = result.and_then(|()| {
             if let Some(secondary) = self.gfx1_state.as_ref().cloned() {
+                let rtkit = self.gfx_rtkit.as_mut().ok_or(("no-gfx-rtkit", ENODEV))?;
+                let mut announce = || Pin::new(&mut *rtkit).send_message(
+                    g17_rtkit::ENDPOINT_GFX_INTERRUPTS, g17_rtkit::encode_primary_device_control());
                 let batch = drain_primary_firmware_event_batch(&pdev,
-                    self.manager.as_mut().ok_or(("no-manager", ENODEV))?, &secondary, &signal)
+                    self.manager.as_mut().ok_or(("no-manager", ENODEV))?, &secondary, &signal,
+                    &mut announce)
                     .map_err(step("drain-gfx1-event-ring"))?;
                 completion_masks[0] |= batch.completion_masks[0];
                 completion_masks[1] |= batch.completion_masks[1];
@@ -3626,7 +3650,10 @@ impl G17PLiveRuntime {
         let signal = self.completion_signal.clone();
         let batch = {
             let manager = self.manager.as_mut().ok_or(ENODEV)?;
-            drain_primary_firmware_event_batch(&pdev, manager, &state, &signal)?
+            let rtkit = self.gfx_rtkit.as_mut().ok_or(ENODEV)?;
+            let mut announce = || Pin::new(&mut *rtkit).send_message(
+                g17_rtkit::ENDPOINT_GFX_INTERRUPTS, g17_rtkit::encode_primary_device_control());
+            drain_primary_firmware_event_batch(&pdev, manager, &state, &signal, &mut announce)?
         };
         let completion_masks = batch.completion_masks;
         for slot in 0..g17_resources::G17PRenderQueuePair::SLOT_COUNT as usize {
