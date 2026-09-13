@@ -40,7 +40,7 @@ chroot "$task_root" apt-get update
 packages=(systemd-sysv udev dbus dbus-x11 xfce4 xfce4-terminal
     xserver-xorg-core xserver-xorg-video-fbdev xserver-xorg-input-libinput
     xinit x11-xserver-utils x11-utils xauth xfonts-base fonts-dejavu-core
-    mesa-utils xdotool bluez blueman pulseaudio pulseaudio-module-bluetooth
+    mesa-utils xdotool htop bluez blueman pulseaudio pulseaudio-module-bluetooth
     openssh-server iproute2 iputils-ping iw wpasupplicant kmod sudo ca-certificates)
 chroot "$task_root" env DEBIAN_FRONTEND=noninteractive \
     apt-get install -y --no-install-recommends "${packages[@]}"
