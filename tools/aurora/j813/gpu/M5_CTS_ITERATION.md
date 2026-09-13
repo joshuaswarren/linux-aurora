@@ -54,6 +54,12 @@ an archive basename and SHA256 and verifies the download before extraction.
 
 ## Remaining iteration limit
 
+The following v25 boot restores the corrected archive directly in 55.90
+seconds. Its larger native test batch finishes 2,323 cases in 313.970
+seconds (2,275 Pass / 48 Fail), while temperatures stay below 44.1 C. The
+final kernel ring has wrapped by then, so future larger runs must stream
+the kernel log during execution as well as retaining the final snapshot.
+
 The experimental graphics queue retains the first submitting VM and rejects
 context replacement. A different test process therefore still needs a fresh
 boot. Removing the VM check alone is not a valid fix: queue retirement,
