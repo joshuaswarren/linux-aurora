@@ -10,6 +10,20 @@ import plistlib
 import subprocess
 
 root = Path(__file__).resolve().parent
+carrier_options = {}
+for option in ('carrier-build', 'carrier-sha256'):
+    values = [arg.split('=', 1)[1] for arg in sys.argv
+              if arg.startswith('--' + option + '=')]
+    if len(values) > 1:
+        raise ValueError('Specify one ' + option)
+    if values:
+        carrier_options[option.replace('-', '_')] = values[0]
+if carrier_options:
+    if len(carrier_options) != 2 or '--gpu-display' not in sys.argv:
+        raise ValueError('Carrier build and SHA256 require each other and --gpu-display')
+    carrier_image = Path(carrier_options['carrier_build']) / 'm1n1.bin'
+    if hashlib.sha256(carrier_image.read_bytes()).hexdigest() != carrier_options['carrier_sha256']:
+        raise ValueError('Selected carrier SHA256 mismatch')
 usb_args = [arg.split('=', 1)[1] for arg in sys.argv if arg.startswith('--j813-source-usb=')]
 if len(usb_args) > 1:
     raise ValueError('Specify one M5 USB source')
@@ -59,9 +73,18 @@ gpu_rtkit_probe = '--gpu-rtkit-probe' in sys.argv
 gpu_initdata = '--gpu-initdata' in sys.argv
 smp = '--smp' in sys.argv
 idle_args = [arg.split('=', 1)[1] for arg in sys.argv if arg.startswith('--smp-idle=')]
-if idle_args and (not smp or len(idle_args) != 1 or idle_args[0] not in ('yield', 'wfi')):
-    raise ValueError('--smp-idle=yield|wfi requires --smp')
+if idle_args and (not smp or len(idle_args) != 1 or idle_args[0] not in ('nop', 'yield', 'wfi')):
+    raise ValueError('--smp-idle=nop|yield|wfi requires --smp')
 smp_idle = idle_args[0] if idle_args else 'wfi'
+smp_boot_args = [arg.split('=', 1)[1] for arg in sys.argv
+                 if arg.startswith('--smp-boot-cpus=')]
+if smp_boot_args and (not smp or len(smp_boot_args) != 1 or
+                      smp_boot_args[0] not in [str(n) for n in range(1, 11)]):
+    raise ValueError('--smp-boot-cpus=1..10 requires --smp')
+smp_boot_cpus = int(smp_boot_args[0]) if smp_boot_args else 10
+smp_no_wfxt = '--smp-no-wfxt' in sys.argv
+if smp_no_wfxt and not smp:
+    raise ValueError('--smp-no-wfxt requires --smp')
 if gpu_display and (not gpu or not gpu_initdata):
     raise ValueError('--gpu-display requires --gpu --gpu-initdata')
 if gpu_initdata and (not gpu or gpu_rtkit_probe):
@@ -87,6 +110,9 @@ if candidate_args:
         raise ValueError('GPU candidate must name one directory under artifacts/gpu/native')
     artifacts = root / 'artifacts/gpu/native' / candidate
 kernel = (artifacts / 'Image').read_bytes()
+if smp_boot_cpus != 10:
+    if 'CONFIG_HOTPLUG_CPU=y\n' not in (artifacts / 'kernel.config').read_text():
+        raise ValueError('Deferred CPU onlining requires CONFIG_HOTPLUG_CPU=y')
 initrd = (artifacts / 'initramfs.cpio.gz').read_bytes()
 dtb_dir = root / 'artifacts/wifi' if flavor == 'bluetooth' else artifacts
 dtb = (dtb_dir / 't8142-j813.dtb').read_bytes()
@@ -171,6 +197,22 @@ else:
     # The SMP kernel preserves M5 registers across WFI/WFIT. YIELD remains
     # available only for diagnosing wait-related failures; it is not sleep.
     bootargs += f' idle={smp_idle}'
+    if smp_boot_cpus != 10:
+        # Retain all ten DT CPU nodes for first-time onlining from userspace.
+        # The selected kernel must provide CONFIG_HOTPLUG_CPU for that test.
+        bootargs += f' maxcpus={smp_boot_cpus}'
+    if smp_no_wfxt:
+        # J700's qualified native SMP path also disables timed waits. Keeping
+        # this separate permits comparison with M5's protected WFIT path.
+        bootargs += ' arm64.nowfxt'
+if '--no-simpledrm' in sys.argv:
+    if not gpu_display:
+        raise ValueError('--no-simpledrm requires the native GPU/DCP display payload')
+    bootargs += ' initcall_blacklist=simpledrm_platform_driver_init'
+if '--smp-diagnostics' in sys.argv:
+    if not smp:
+        raise ValueError('--smp-diagnostics requires --smp')
+    bootargs += ' printk.time=1 oops=panic watchdog_thresh=5 workqueue.watchdog_thresh=10'
 if flavor == 'desktop' or input_enabled:
     # Ask DRM fbdev for the conventional 32-bpp desktop surface. SimpleDRM
     # converts its shadow buffer into the firmware's native 10-bit RGB layout.
@@ -205,9 +247,10 @@ if result:
     raise RuntimeError(f'Device-tree preparation failed: {result}')
 print('DEVICE_TREE_PREPARED', flush=True)
 if display:
-    display_helpers['verify_display_fdt'](u, p, display_before, integrated_gpu=gpu_display)
+    display_helpers['verify_display_fdt'](u, p, display_before,
+                                          integrated_gpu=gpu_display, **carrier_options)
 if gpu:
-    gpu_helpers['verify_gpu_fdt'](u, p, combined_display=gpu_display)
+    gpu_helpers['verify_gpu_fdt'](u, p, combined_display=gpu_display, **carrier_options)
 if '--prepare-only' in sys.argv:
     sys.exit(0)
 if source_usb:
