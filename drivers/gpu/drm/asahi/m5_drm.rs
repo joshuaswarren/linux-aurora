@@ -174,9 +174,19 @@ impl queue::Queue for M5Queue {
             let g17_uapi::ParsedHardwareCommand::Render {
                 payload, vertex_attachments, fragment_attachments, ..
             } = command else { return Err(ENOTSUPP); };
-            admit_reference_render(&payload)?;
+            admit_reference_render(&payload).map_err(|error| {
+                pr_err!("M5 render admission rejected size={}x{} layers={} utiles={}x{} samples={}\n",
+                    payload.width, payload.height, payload.layers,
+                    payload.utile_width, payload.utile_height, payload.samples);
+                error
+            })?;
             g17_uapi::validate_m5_reference_depth(&payload, &address_space)
-                .map_err(|_| ENOTSUPP)?;
+                .map_err(|error| {
+                    pr_err!("M5 depth admission rejected {:?}: size={}x{} dimensions={:#x} control={:#x} stride={:#x} meta_stride={:#x}\n",
+                        error, payload.width, payload.height, payload.depth_dimensions,
+                        payload.zls_control, payload.depth.stride, payload.depth.compression_stride);
+                    ENOTSUPP
+                })?;
             let (parameters, mut controls) = M5FirmwareMemory::reference_render_profile();
             let mut translated = g17_uapi::translate_render_command(payload,
                 vertex_attachments, fragment_attachments, self.window, &address_space,
@@ -212,7 +222,9 @@ impl queue::Queue for M5Queue {
 fn admit_reference_render(command: &g17_uapi::UapiRenderCommand) -> Result {
     let timestamps = [command.vertex_timestamps.start, command.vertex_timestamps.end,
         command.fragment_timestamps.start, command.fragment_timestamps.end];
-    if command.width != 256 || command.height != 256 || command.layers != 1
+    if !(1..=g17_uapi::M5_MAX_RENDER_DIMENSION).contains(&u32::from(command.width))
+        || !(1..=g17_uapi::M5_MAX_RENDER_DIMENSION).contains(&u32::from(command.height))
+        || command.layers != 1
         || command.utile_width != 32 || command.utile_height != 32 || command.samples != 1
         || command.stencil.base != 0 || command.stencil.compression_base != 0
         || command.sampler_heap != 0 || command.sampler_count != 0
