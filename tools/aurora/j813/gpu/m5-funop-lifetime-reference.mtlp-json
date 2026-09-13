@@ -1,0 +1,1 @@
+{"pipelines":{"compute_pipelines":[{"compute_function":"m5_log2_live"},{"compute_function":"m5_log2_dead"},{"compute_function":"m5_exp2_live"},{"compute_function":"m5_exp2_dead"},{"compute_function":"m5_floor_live"},{"compute_function":"m5_ceil_live"},{"compute_function":"m5_trunc_live"},{"compute_function":"m5_rint_live"}]}}
