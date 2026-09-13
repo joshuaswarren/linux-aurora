@@ -168,6 +168,11 @@ if gpu:
     if gpu_initdata:
         p.kboot_set_chosen('aurora,m5-gpu-firmware-profile', 'M5-RTKit-3255.160.4.release')
 
+if wifi:
+    # Fail before the large RAM transfer if the resident carrier cannot
+    # initialize N1 or a previous proxy session still owns its SMC endpoint.
+    runpy.run_path(str(root / 'prepare-n1-pcie.py'), init_globals={'p': p, 'u': u, 'iface': iface})
+
 kernel_addr = u.memalign(2 * 1024 * 1024, 64 * 1024 * 1024)
 initrd_addr = u.memalign(65536, len(initrd))
 uboot_addr = u.memalign(2 * 1024 * 1024, len(uboot))
@@ -226,8 +231,6 @@ p.kboot_set_uboot('baudrate', '1500000')
 p.kboot_set_uboot('stdin', 'serial')
 # Without --smp, m1n1 prunes cold CPUs and keeps the boot CPU selected by MPIDR.
 # With --smp, kboot verifies each live core's MPIDR and supplies its release slot.
-if wifi:
-    runpy.run_path(str(root / 'prepare-n1-pcie.py'), init_globals={'p': p, 'u': u, 'iface': iface})
 if input_enabled:
     # Match the scoped preparation in the hardware-qualified J813 MTP
     # handoff. Global DAPF initialization touches unrelated gated blocks.
