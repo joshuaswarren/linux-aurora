@@ -126,6 +126,14 @@ unchanged records within their valid lifetime. Measure command bytes and
 state uploads for unchanged draws versus one-state-at-a-time changes.
 Do not replace this with per-draw stream splits or blanket barriers.
 
+Follow-up: viewport and depth-bias/scissor records now follow their existing
+Gallium dirty bits and batch lifetime. A real draw-path regression checks
+nine state/batch transitions and the decoded raster values. Fragment-uniform
+changes emit nine PPP records instead of eleven. This is a partial A4
+correction; native program and graphics-record publication remain coarse.
+See [raster-state evidence](M5_NATIVE_RASTER_STATE.md) for the source/build
+checks and candidate hash. Physical regression is still pending.
+
 ### A5 — Evidence rejection missed explicit draw-admission failures (fixed here)
 
 The previous validator detected compiler refusals and “dropping work” but
