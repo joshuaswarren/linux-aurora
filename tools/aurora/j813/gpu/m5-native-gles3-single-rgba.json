@@ -1,0 +1,20 @@
+{
+  "experiment": "native Gallium M5 independent vertex exports and fragment inputs",
+  "mesa_commit": "57296534ef7",
+  "driver_sha256": "fe3fc8e42dcc497aa74240d8cdb28c58d23760a75424ec10ee1d36e4383e2a2f",
+  "cts_commit": "1942832354c96f0de379f491519734256fbd4f9d",
+  "case": "dEQP-GLES3.functional.color_clear.single_rgba",
+  "config": "rgba8888d0s0ms0",
+  "surface": [64, 64],
+  "hardware_result": "Pass",
+  "iterations": 30,
+  "submissions_completed": 30,
+  "submissions_with_draws": 29,
+  "native_provenance_verified": true,
+  "renderer": "Apple M5 (G17G C0)",
+  "driver_errors": 0,
+  "test_source_changed": false,
+  "pixel_expectations_changed": false,
+  "evidence": "m5-native-gles3-single-rgba.qpa",
+  "qualification": "One unchanged GLES 3.0 CTS case passes all 30 iterations on the M5 GPU. Full GLES 3.0 conformance has not been established."
+}
