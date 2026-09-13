@@ -1,0 +1,111 @@
+What:		/sys/bus/platform/devices/.../bringup_status
+Date:		September 2026
+Description:
+		"power-domain-only" for the experimental T8140 ANE driver.
+		With enable_engine_power=1, reports "engine-power-and-ce".
+		This opts into manual ANE CPU/subblock power sequencing and
+		the H17 CE initialization handshake during runtime resume.
+		Firmware, DART and command execution remain unimplemented in
+		this Linux driver; neither status establishes inference support.
+
+What:		/sys/bus/platform/devices/.../inference_available
+Date:		September 2026
+Description:
+		Always 0 for this driver version. No accelerator character
+		device, inference ioctl, or CPU fallback is provided.
+
+What:		/sys/bus/platform/devices/.../cluster_range
+Date:		September 2026
+Description:
+		Hexadecimal physical base and byte length of the validated
+		J700 ANE cluster resource. This range includes DART apertures;
+		the driver does not reserve, map or access it.
+
+What:		/sys/bus/platform/devices/.../runtime_transitions
+Date:		September 2026
+Description:
+		"resume=N suspend=N" counts driver runtime PM callbacks since
+		probe. These are not ANE computation or firmware counters.
+		The standard power/control interface holds ANE_SYS on with
+		"on" and releases it with "auto". ANE_SYS power alone does
+		not initialize the ANE engine.
+
+What:		/sys/bus/platform/devices/.../power_state
+Date:		September 2026
+Description:
+		Experimental T8140 PMGR diagnostic, available only when the
+		module is loaded with enable_power_snapshot=1. Otherwise reads
+		fail with EOPNOTSUPP. Format:
+		"sys=0xXXXXXXXX cpu=0xXXXXXXXX subblocks=0xXXXXXXXX".
+		Reads existing shared PMGR syscon offsets 0x290, 0xc000 and
+		0xc008, respectively. Each is a raw 32-bit register value;
+		bits 3:0 are requested state and bits 7:4 are actual state.
+		0 is power gated, 4 clock gated, and 15 active.
+		Reads do not power up the ANE or access its cluster aperture.
+		The three reads are sequential, not an atomic snapshot, and
+		their values do not establish firmware or compute readiness.
+
+What:		/sys/bus/platform/devices/.../ce_initializations
+Date:		September 2026
+Description:
+		Number of completed CE initialization handshakes since probe.
+		Always zero unless enable_engine_power=1. Reads return a cached
+		counter without waking the device or accessing engine registers.
+		This is not a firmware, command completion or inference counter.
+
+What:		/sys/bus/platform/devices/401600040.ane-fw-test/start_bootstrap
+Date:		September 2026
+Description:
+		Separate experimental firmware backend, present only with the
+		ordered RAM test overlays. Write exactly "25G83" once to start
+		the locally pinned firmware after memory/power/DAPF validation.
+		Loading the module alone does not start firmware. Once started,
+		DMA, power and module references are retained until a Neo reboot.
+		This is a bounded bring-up interface, not a stable userspace ABI.
+
+What:		/sys/bus/platform/devices/401600040.ane-fw-test/test_compute
+Date:		September 2026
+Description:
+		Present only when a SHA-pinned numerical case was built into the
+		experimental firmware backend. Requires completed startup and
+		accepts one attempt per boot. The original case accepts "conv16";
+		the separately compiled tiny language-model case accepts
+		"anemll-tiny". Each build accepts only its own action/package.
+		The tiny case performs three autoregressive transformer/head
+		jobs with CPU embedding lookup and greedy token selection.
+		Every output is poisoned before submission and compared with a
+		validated reference outside the ANE IOMMU domain. A failed job
+		retains all mappings until reboot; it must not be retried live.
+
+What:		/sys/bus/platform/devices/401600040.ane-fw-test/status
+Date:		September 2026
+Description:
+		Cached experimental firmware state and counters:
+		"state=... error=N started=N allocations=N shared_bytes=N
+		samples_passed=N shutdown_reply=N" on one line. Completion
+		requires three passed samples and a shutdown reply. The reply
+		does not establish safe hot unload or suspend; reboot still
+		ends the retained test lifetime. No arbitrary model API exists.
+
+What:		/dev/aurora-ane0
+Date:		September 2026
+Description:
+		Private experimental application interface, only in the
+		SHA-pinned tiny ANEMLL model build. Mode0600; CAP_SYS_RAWIO
+		required at open and every ioctl. Only one open owner; legacy
+		sysfs mutations return EBUSY while that owner exists. Structures
+		and command numbers are in the private apple-ane-user.h header;
+		this is not a stable upstream userspace ABI.
+		INFO returns cached capability/state/counters. LOAD starts the
+		pinned firmware and program. RUN copies one finite 4096-byte
+		input and returns 32768-byte logits with completion metadata.
+		There is no userspace DMA mapping or arbitrary-command input.
+		The model is fixed; input tensors are application supplied.
+		Sessions have at most 256 jobs. Bad validation/input reads do
+		not submit work. A copyback EFAULT can follow a completed job;
+		INFO still counts it, and callers must account for that before
+		retrying. Protocol/firmware failures block further submissions
+		and retain mappings. SHUTDOWN or final fd close requests native
+		program/firmware shutdown. DMA, power and module references
+		remain pinned until a Neo-only reboot. Normal unload, suspend
+		and automatic engine reset are not implemented.
