@@ -132,7 +132,8 @@ nine state/batch transitions and the decoded raster values. Fragment-uniform
 changes emit nine PPP records instead of eleven. This is a partial A4
 correction; native program and graphics-record publication remain coarse.
 See [raster-state evidence](M5_NATIVE_RASTER_STATE.md) for the source/build
-checks and candidate hash. Physical regression is still pending.
+checks and candidate hash. The physical v27 regression preserves all 2,275
+passes and the same 48 failures, with all 5,207 GPU retirements captured.
 
 ### A5 — Evidence rejection missed explicit draw-admission failures (fixed here)
 
@@ -195,6 +196,8 @@ is not proof of successful execution.
    required configurations with complete provenance, error and completion
    evidence. Review every non-pass and unrun case.
 
-None of these broader gates is complete. Hardware testing is idle at the end
-of this audit. The GPU/CTS objective remains unresolved; this document does
-not certify completion or remove the safety guards.
+None of these broader gates is complete. The subsequent v27 hardware
+regression qualifies command reservation and partial raster-state reuse,
+with complete printk capture, but does not resolve the other findings.
+The GPU/CTS objective remains unresolved; this document does not certify
+completion or remove the safety guards.

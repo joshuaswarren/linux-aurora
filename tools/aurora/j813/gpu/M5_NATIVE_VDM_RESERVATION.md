@@ -6,9 +6,10 @@ the M5 state block alone occupies **116 bytes**. The correction derives the
 M5 bound from its actual packet definitions and checks emitted bytes against
 that bound in assertion-enabled builds.
 
-This is a source/build and compiler-path qualification. The corrected driver
-has **not been installed or tested on the physical M5**. The installed v25
-driver and hardware CTS results remain unchanged.
+Source/build and compiler-path checks below preceded the physical v27
+regression, which includes this correction and raster-state reuse. All
+2,275 prior passes are preserved, with the same 48 failures and complete
+retirement evidence. See [v27 hardware evidence](M5_NATIVE_RASTER_STATE.md).
 
 ## Why the old estimate was wrong
 
@@ -77,7 +78,7 @@ Retained workbench evidence:
 
 Candidate: `artifacts/gpu/native/libgallium-m5-v26-audit.so`, SHA256
 `a7b8f900aaff7d4a97abdf3d1039f2c274d5dbe9bf764beac983ea4d8cf89067`.
-The next authorized physical regression must verify the actual loaded
-candidate, preserve the 2,323-case regression and capture complete kernel
-completion evidence. This correction does not resolve the 48 blend pixel
-failures or the scheduling/lifetime findings in the main audit.
+The v27 combined candidate verifies the actual loaded library, preserves the
+2,323-case regression and captures every GPU retirement. The standalone v26
+artifact above was not separately installed. This correction does not resolve
+the 48 blend pixel failures or the scheduling/lifetime findings in the main audit.

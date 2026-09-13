@@ -58,8 +58,47 @@ Retained workbench logs:
 Candidate: `artifacts/gpu/native/libgallium-m5-v27-raster-state.so`, SHA256
 `449b37c7381e7e8cf1ff954392125e03ad250cb91e027b872f30fdfc7dbf298b`.
 
-The candidate includes the preceding command-reservation correction. It has
-not yet been tested on physical hardware. The last hardware qualification
-remains v25: 2,275 Pass / 48 Fail from 2,323 cases. The 48 pixel failures,
-synchronous submission, restricted context lifetime and remaining GLES
-coverage are unresolved.
+## Physical regression
+
+The candidate includes the preceding command-reservation correction and has
+now completed the same unmodified 2,323-case selection on the physical M5:
+**2,275 Pass / 48 Fail**, in 307.925 seconds. The exact unique case set and every
+status match v25; all previous passes are preserved. The retained failure
+images also match v25. Native Apple M5 (G17G C0) renderer and loaded library
+provenance are verified. There are no driver errors, missing/unexpected cases,
+timeouts or thermal aborts. Sampled hottest-channel readings range from
+43.349 to 44.193 C.
+
+Continuous kernel capture retains **10,438 consecutive printk records** with
+zero overruns, sequence discontinuities or I/O errors. GPU generations
+**1 through 5,207** each report both queues retired exactly once. The 5,207
+submissions contain 15,625 draws; 5,185 are multi-draw, with a maximum of 394.
+These counts match v25. This establishes preserved batching and complete
+retirement evidence for this regression. It does not establish asynchronous
+submission or an M1/M2 performance comparison. The submit diagnostic's `bytes`
+field is the submission payload size, not the VDM stream size; the 16-byte
+state-update reduction above comes from the packet-inspection test.
+
+Published evidence beside this document:
+
+- `m5-native-gles3-state-reuse.qpa.gz`: lossless original CTS QPA.
+- `m5-native-gles3-state-reuse-kernel.log.gz`: complete original printk records.
+- `m5-native-gles3-state-reuse.json`: runner report and exact case list.
+
+QPA SHA256:
+`9086ec5e7bb9cbe0bd30a8ead2baefa397d8fcc4c6a5c4488423d549e6149a59`.
+CTS revision and configuration are unchanged from v25: commit
+`1942832354c96f0de379f491519734256fbd4f9d`, surfaceless
+`rgba8888d0s0ms0`, 64x64, base seed 1. Source for the hardware-tested change is
+Mesa `44866172af6d7f7a9136cda2a1adce4badfa8b84`.
+
+A subsequent test-only extension (`bb87fafac92c59795955f19f0b9e569c2db69b7b`)
+also verifies destination-only ZERO/ONE blending uses a translucent pass
+(`pass=1`, `no_op=0`) in both UNORM and sRGB Gallium framebuffers. All eleven
+draw/state transitions pass offline. This narrows one classification hypothesis;
+it does not prove the cause of the CTS pixel failures.
+
+The hardware ledger remains **2,275 Pass / 48 Fail / 52,476 NotRun** out of
+54,799. The 48 pixel failures, synchronous submission, restricted context
+lifetime and remaining GLES coverage are unresolved. This is a regression
+qualification of the efficiency corrections, not full GLES 3.0 conformance.
