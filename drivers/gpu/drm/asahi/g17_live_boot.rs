@@ -3590,7 +3590,8 @@ impl G17PLiveRuntime {
                 let mut announce = || Pin::new(&mut *rtkit).send_message(
                     g17_rtkit::ENDPOINT_GFX_INTERRUPTS, g17_rtkit::encode_primary_device_control());
                 let batch = drain_primary_firmware_event_batch(&pdev,
-                    self.manager.as_mut().ok_or(("no-manager", ENODEV))?, &secondary, &signal)
+                    self.manager.as_mut().ok_or(("no-manager", ENODEV))?, &secondary, &signal,
+                    &mut announce)
                     .map_err(step("drain-gfx1-event-ring"))?;
                 completion_masks[0] |= batch.completion_masks[0];
                 completion_masks[1] |= batch.completion_masks[1];
