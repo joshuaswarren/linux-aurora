@@ -6,8 +6,11 @@ still serializes submissions, retains its first rendering VM, and accepts a
 restricted render profile. These are unfinished bring-up mechanisms, not an
 acceptable final substitute for the M1/M2 driver model.
 
-This audit paused new hardware CTS runs. It changed the evidence validator,
-not GPU execution, shaders, CTS expectations, or the installed driver.
+The initial audit paused new hardware CTS runs and changed the evidence
+validator. The follow-up [HAL300 command reservation correction](M5_NATIVE_VDM_RESERVATION.md)
+fixes a reproduced 72-byte estimate for a draw path needing up to 164 bytes.
+It is built and checked in the compiler-only path; hardware qualification is
+pending. Shaders, CTS expectations and the installed driver are unchanged.
 
 ## Revisions and scope
 
