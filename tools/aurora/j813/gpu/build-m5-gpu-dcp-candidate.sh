@@ -30,10 +30,12 @@ for task_file in dockchannel-hid.c dockchannel-hid-protocol.h; do
 done
 "$task_src/scripts/config" --file "$task_build/.config" \
     --module DRM_APPLE --enable BACKLIGHT_CLASS_DEVICE --enable DRM_APPLE_DEBUG \
-    --enable APPLE_MAILBOX
+    --enable APPLE_MAILBOX --enable PWM --enable PWM_APPLE \
+    --enable LEDS_CLASS --enable LEDS_PWM --enable GPIOLIB
 make -C "$task_src" O="$task_build" olddefconfig
 for task_option in CONFIG_DRM_APPLE=m CONFIG_DRM_ASAHI=m CONFIG_APPLE_RTKIT=y \
-    CONFIG_ARM64_16K_PAGES=y CONFIG_APPLE_MAILBOX=y; do
+    CONFIG_ARM64_16K_PAGES=y CONFIG_APPLE_MAILBOX=y CONFIG_PWM_APPLE=y \
+    CONFIG_LEDS_PWM=y CONFIG_GPIOLIB=y; do
     grep -qx "$task_option" "$task_build/.config"
 done
 make -C "$task_src" O="$task_build" -j8 Image modules
