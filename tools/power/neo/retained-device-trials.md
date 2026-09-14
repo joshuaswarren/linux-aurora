@@ -194,3 +194,38 @@ explicit `start_oslog` write before AP wake or sleep; it queues endpoint 8
 only. It still refuses new shared buffers and latches failures. A queued
 endpoint start is not evidence of completed buffer negotiation or healthy
 firmware wake. Test these while awake before any sleep/clock experiment.
+
+The OSLOG-start probe on #33 removed the assertion: a fresh AP-ON ACK returned
+with AP/IOP 0x20. Firmware then advertised an existing OSLOG buffer at
+`0x100087b4000`, size `0x5ff8`. The old diagnostic deliberately rejected it,
+so its overall result remains failed. Capture: `dcp-oslog-awake/`; no clocks
+were stopped. The follow-up maps only already-translated, physically contiguous
+buffers through the inherited SID23 tables, checks the exact observed DART
+layout and ACTIVE display gates, and refuses allocation requests. It writes
+no DART control or PTEs and never frees firmware backing pages. The module
+remains pinned until reboot. Awake and sleep qualification are still required.
+
+## Longer PMP repeat and measurement duration
+
+All four 180-second intervals on #33 completed with RTC, six-CPU, panel and
+PMP checks passing. Alongside the six short tests this is ten returned cycles,
+eight with firmware idle enabled. None exercised the gate-wait fallback, so
+the original intermittent failure was not reproduced and its fix is not proven.
+
+With a fresh same-boot calibration of 3.600894309 raw units/uAh, the sequence was:
+
+| PMP firmware idle | Duration (s) | Calibrated battery power (W) |
+| --- | ---: | ---: |
+| enabled | 181.613 | 0.780460 |
+| disabled | 180.804 | 0.769984 |
+| disabled | 180.747 | 0.770269 |
+| enabled | 180.822 | 0.764663 |
+
+The paired reductions were -10.48 mW and +5.61 mW. The earlier provisional
+22 mW reduction is **not reproduced**: no repeatable saving from this PMP WFI
+mode is resolved at the current precision. Do not label the capacity-gauge
+estimate (3.827 W for the first interval) as measured sleep consumption.
+Captures and comparison hashes: `pmp-gate-wait/{cal60,pair1.json,pair2.json}`.
+
+The user requested **120-second power intervals** for subsequent comparisons.
+Use short functional cycles first; do not default back to 10-minute runs.

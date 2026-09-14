@@ -14,6 +14,7 @@
 #include <linux/of_address.h>
 #include <linux/platform_device.h>
 #include <linux/regmap.h>
+#include <linux/sizes.h>
 #include <linux/soc/apple/rtkit.h>
 
 static bool sleep_enabled;
@@ -31,6 +32,7 @@ static struct platform_device *adopted;
 struct neo_dcp {
 	struct device *dev;
 	void __iomem *control;
+	void __iomem *dart;
 	struct apple_rtkit *rtk;
 	struct mutex lock;
 	atomic_t failed;
@@ -43,6 +45,7 @@ struct neo_dcp {
 	unsigned int clocks_touched;
 	u64 requested_iova;
 	size_t requested_size;
+	u32 mapped_buffers;
 };
 static const unsigned int clock_offsets[] = { 0x10000, 0x318, 0x280 };
 
@@ -65,16 +68,110 @@ static int set_clock(struct neo_dcp *d, unsigned int i, bool on)
 	return ret;
 }
 
-static int deny_shmem(void *cookie, struct apple_rtkit_shmem *buffer)
+/* Read inherited SID23 tables only. Never reset DART, allocate firmware DMA,
+ * alter a PTE, or free loader-owned memory. This bounded diagnostic accepts
+ * only the observed J700 two-level 16K layout and contiguous existing buffers.
+ */
+static bool retained_ram(u64 pa, size_t size)
+{
+	return pa >= 0x10000000000ULL && pa < 0x10200000000ULL &&
+		size <= 0x10200000000ULL - pa;
+}
+
+static int retained_translate(u64 root, u64 va, u64 *pa)
+{
+	u64 *table, entry;
+	int shift;
+
+	for (shift = 25; shift >= 14; shift -= 11) {
+		if (!IS_ALIGNED(root, SZ_16K) || !retained_ram(root, SZ_16K))
+			return -ERANGE;
+		table = memremap(root, SZ_16K, MEMREMAP_WB);
+		if (!table)
+			return -ENOMEM;
+		entry = READ_ONCE(table[(va >> shift) & 2047]);
+		memunmap(table);
+		if (!(entry & 1))
+			return -ENOENT;
+		root = (entry & 0x3ffffffc00ULL) << 4;
+	}
+	*pa = root | (va & (SZ_16K - 1));
+	return 0;
+}
+
+static int retained_shmem(void *cookie, struct apple_rtkit_shmem *buffer)
 {
 	struct neo_dcp *d = cookie;
+	u64 root, first_pa = 0, pa;
+	u32 ttbr, state;
+	size_t offset, size;
+	unsigned int i;
+	int ret = -EOPNOTSUPP;
 
 	d->requested_iova = buffer->iova;
 	d->requested_size = buffer->size;
+	if ((buffer->iova & ~GENMASK_ULL(35, 0)) != BIT_ULL(40) ||
+	    !IS_ALIGNED(buffer->iova, SZ_16K) || !buffer->size ||
+	    buffer->size > SZ_1M ||
+	    (buffer->iova & GENMASK_ULL(35, 0)) + buffer->size > BIT_ULL(36) ||
+	    d->mapped_buffers >= 8)
+		goto fail;
+	for (i = 0; i < ARRAY_SIZE(clock_offsets); i++) {
+		ret = regmap_read(d->pmgr, clock_offsets[i], &state);
+		if (ret || (state & 0xff) != 0xff || (state & 0x80001c00)) {
+			ret = -EBUSY;
+			goto fail;
+		}
+	}
+	if (readl(d->dart + 8) != 0x2a2a0203 ||
+	    readl(d->dart + 12) != 0x10020 ||
+	    readl(d->dart + 0x1000 + 23 * 4) != 1) {
+		ret = -EINVAL;
+		goto fail;
+	}
+	ttbr = readl(d->dart + 0x1400 + 23 * 4);
+	if ((ttbr & 3) != 1) {
+		ret = -EINVAL;
+		goto fail;
+	}
+	root = (u64)(ttbr >> 2) << 14;
+	size = ALIGN(buffer->size, SZ_16K);
+	for (offset = 0; offset < size; offset += SZ_16K) {
+		ret = retained_translate(root, buffer->iova + offset, &pa);
+		if (ret)
+			goto fail;
+		if (!offset)
+			first_pa = pa;
+		if (pa != first_pa + offset || !retained_ram(pa, SZ_16K)) {
+			ret = -ERANGE;
+			goto fail;
+		}
+	}
+	if (readl(d->dart + 0x1400 + 23 * 4) != ttbr ||
+	    readl(d->dart + 0x1000 + 23 * 4) != 1) {
+		ret = -ESTALE;
+		goto fail;
+	}
+	buffer->buffer = memremap(first_pa, size, MEMREMAP_WB);
+	if (!buffer->buffer) {
+		ret = -ENOMEM;
+		goto fail;
+	}
+	buffer->is_mapped = true;
+	d->mapped_buffers++;
+	dev_info(d->dev, "Mapped existing DCP buffer DVA=%#llx PA=%#llx size=%#zx; SID23 tables unchanged\n",
+		 (u64)buffer->iova, first_pa, buffer->size);
+	return 0;
+fail:
 	atomic_set(&d->failed, 1);
-	dev_err(d->dev, "Shared-buffer request DVA=%#llx size=%#zx; refusing adoption side effect\n",
-		 d->requested_iova, d->requested_size);
-	return -EOPNOTSUPP;
+	dev_err(d->dev, "Cannot adopt existing buffer DVA=%#llx size=%#zx: %d\n",
+		 d->requested_iova, d->requested_size, ret);
+	return ret;
+}
+static void retained_shmem_destroy(void *cookie, struct apple_rtkit_shmem *buffer)
+{
+	/* Unmap the host view only; never release firmware-owned backing pages. */
+	memunmap(buffer->buffer);
 }
 static void application_message(void *cookie, u8 ep, u64 word)
 {
@@ -90,7 +187,8 @@ static void crashed(void *cookie, const void *log, size_t size)
 	atomic_set(&d->failed, 1);
 }
 static const struct apple_rtkit_ops ops = {
-	.shmem_setup = deny_shmem,
+	.shmem_setup = retained_shmem,
+	.shmem_destroy = retained_shmem_destroy,
 	.recv_message = application_message,
 	.crashed = crashed,
 };
@@ -285,6 +383,9 @@ static int probe(struct platform_device *pdev)
 	d->control = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(d->control))
 		return PTR_ERR(d->control);
+	d->dart = devm_ioremap(&pdev->dev, 0x412340000ULL, SZ_16K);
+	if (!d->dart)
+		return -ENOMEM;
 	if (!(readl(d->control + 0x44) & BIT(4)))
 		return -EINVAL;
 	platform_set_drvdata(pdev, d);
@@ -310,6 +411,11 @@ static int __init init(void)
 
 	if (!firmware || !of_machine_is_compatible("apple,j700"))
 		return -ENODEV;
+	node = of_find_node_by_path("/soc/iommu@412340000");
+	if (node) {
+		of_node_put(node);
+		return -EEXIST;
+	}
 	node = of_find_node_by_path("/soc/mailbox@412e08000");
 	if (node) {
 		of_node_put(node);
