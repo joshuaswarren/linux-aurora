@@ -93,3 +93,56 @@ unchanged. Recovery returned to the normal #6 kernel, battery 21%.
 The console-suspended depth-1 repeat also lost connectivity and required
 DebugUSB reset. Console suspension is necessary isolation hygiene, but did
 not resolve this hang. No deeper display clock depth has been attempted.
+
+## PMP sleep-mode discovery
+
+The #30 late/early test reached both idle ACKs, CPU_STATUS `0x6e`, and
+RUN clear; DART retention checks succeeded. AP wake still timed out after
+RUN restoration. Capture: `pmp-idle-late/platform/`. Thus moving callbacks
+and waiting for idle corrected admission/order but did not fix firmware wake.
+
+Disassembly of the exact PMP image identifies power context `0x104ff30`.
+Its word at +0x64 (`0x104ff94`) is 1 in the image and also 1 in a bounded,
+aligned, read-only live capture at physical `0x30054ff94`, translated using
+`apple,resident-segments`. The text maps wire `0x201` to internal state 8.
+At `0x1024ab4`, state 8 with mode 2 uses the returning idle implementation
+`0x1027068`; other modes branch through `0x10270ac` to the non-returning
+WFI loop at `0x100214c`. The interrupt PM callback at `0x102a9a0` also checks
+mode 2 and bypasses the mask-reset path. This explains a plausible cause of
+an acknowledged idle with unconsumed wake messages; the live program counter
+was not captured, so it is not a direct PC trace.
+
+`pmp_v2.fw_wfi_s2idle=1` is a boot-only, default-off experiment selecting the
+existing mode 2 before CPU RUN is first set. It requires the exact 25F84
+UUID/TEXT digest, writable resident translation, stopped CPU and original
+DATA word 1, then verifies the value 2. It does not change firmware TEXT,
+DMA ownership, frequency/voltage policy or unknown firmware revisions.
+Hardware qualification remains necessary; the switch is not a claim of a
+complete native sleep contract. Do not patch the word in a running firmware
+session. Decompiler output incorrectly merged the non-returning helper with
+its following function; use the retained instruction disassembly for this
+control-flow conclusion.
+
+The user observed 1TR after a DCP trial and manually returned Neo to Omarchy.
+DebugUSB reset returning successfully does not prove automatic OS recovery.
+
+Kernel #31 successfully booted with mode 2. Its platform-stage test acknowledged
+IDLE, then AP wake returned success with AP=0x20 and IOP=0x20. The generic
+trial helper nevertheless sent IOP INIT and timed out. `pmp-wfi-mode/platform/`
+retains the failed overall test; this is progress in wake protocol, not yet
+successful sleep qualification. The follow-up recognizes IOP ON after the
+fresh AP wake acknowledgement and does not issue the redundant INIT route.
+
+Kernel #32 (`9b3b5ed75`, Image SHA256
+`9bb66cce1e7515fb9798dd5241e8d6bb2a30c5216ab8a7e620cb213a0ad7ac07`)
+passed the platform-stage test and a real 10-second RTC sleep. All six CPUs
+entered s2idle; the panel restored; PMP remained `failed=0` with its DMA epoch
+retained. No ASC RUN stop or PMP domain gate is used with this returning mode.
+
+The first 180-second pair on the same #32 boot measured 0.78922 W with PMP
+retained normally and 0.76722 W with acknowledged firmware idle. The initial
+22 mW difference is provisional pending a reverse-order pair. Calibration was
+3.59453555 raw counter units/uAh. Both tests passed RTC, CPU and panel checks.
+PMP's PMGR word remained `0x1f0f03ff`; firmware WFI is not a full domain power
+gate. GFX actual remained zero; Wi-Fi and PMP IRQ counts stayed unchanged
+across the noirq intervals. Captures: `pmp-wfi-apwake/`.
