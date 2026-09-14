@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: GPL-2.0-only
 """Capture a bounded PM test stage on Neo; never request a real sleep.
 
-Run as root with --stage freezer or --stage devices and a new --output directory.
+Run as root with --stage freezer, devices or platform and a new --output directory.
+The platform stage includes late/noirq device callbacks, then returns before the
+s2idle loop. It does not qualify a wake source or a physical sleep state.
 Device callbacks still perform real transitions and can hang: the kernel's test
 delay is not a watchdog. A run left at status=running is not a successful resume.
 """
@@ -50,6 +52,9 @@ def snapshot():
              "/sys/kernel/debug/apple-pmp-v2/thermal_status",
              "/sys/kernel/debug/pm_genpd/pm_genpd_summary",
              "/sys/module/apple_dart/parameters/pmp_s2idle",
+             "/sys/module/apple_dart/parameters/inherited_s2idle",
+             "/sys/module/mt7932_fullmac/parameters/retained_s2idle",
+             "/sys/module/pmgr_pwrstate/parameters/retain_s2idle",
              "/sys/module/pmp_v2/parameters/retained_s2idle"]
     for pattern in ("/sys/power/suspend_stats/*", "/sys/power/suspend_stats/last_hw_sleep",
                     "/sys/devices/system/cpu/cpufreq/policy*/scaling_cur_freq",
@@ -65,7 +70,7 @@ def snapshot():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--stage', required=True, choices=('freezer', 'devices'))
+    parser.add_argument('--stage', required=True, choices=('freezer', 'devices', 'platform'))
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
     if os.geteuid():

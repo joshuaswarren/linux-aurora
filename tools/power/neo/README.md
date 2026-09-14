@@ -36,9 +36,9 @@ hung callback. J700 currently has no qualified RTC wake alarm; do not assume
 
 PMP owns a running firmware epoch, shared DMA buffers and retained DART streams.
 Its shutdown/restart or retained-state suspend contract is not implemented.
-Reject system sleep in `prepare`, before devices begin suspending. Keep the
-runtime and hibernation vetoes as well. Do not remove these checks just to let
-the test advance.
+By default, reject system sleep in `prepare`, before devices begin suspending.
+The opt-in retained s2idle path described below keeps its power domains, DMA
+and mailbox live. Runtime and hibernation remain unsupported.
 
 A retained-PMP s2idle implementation must establish power/clock and DART
 retention, mailbox processing, thermal admission and worker quiescence, then
@@ -176,7 +176,32 @@ callback restores policy after either resume or abort, requiring fresh thermal
 admission. All controls default off. Runtime suspend, hibernation and non-PMP
 inherited DART ownership are still rejected.
 
-The first device-stage test with these controls enabled did not return over SSH.
-The external log stopped after `PM: suspend entry (s2idle)` and filesystem sync;
-SSH userspace capture cannot observe callbacks while tasks are frozen. No failing
-device has been identified yet. Full system sleep is still unqualified.
+The first device-stage test returned `-EBUSY` in 0.897 seconds, but Wi-Fi did
+not reconnect and SSH was lost. After external recovery, the saved result and
+journal showed PMP prepare/suspend/complete success, its DART verification
+passing, and NVMe shutdown/reinitialization followed by a durable result write.
+The rejecting device was `390000000.iommu`, the radio DART. No full sleep took
+place. The apparent hang over SSH was not a hung suspend transition.
+
+The next candidate adds `apple_dart.inherited_s2idle=1` for the existing J700
+radio/MTP profiles with no managed clocks/domains. It snapshots and checks all
+stream roots, enables and protection registers rather than rewriting inherited
+mappings. The radio additionally requires the BOOT parameter
+`mt7932_fullmac.retained_s2idle=1`: its disconnected D0 firmware/DMA remain live,
+with NO_SUSPEND interrupt service and transport geometry checks. This mode does
+not save the radio's full power, implement firmware restart, or provide WoWLAN.
+
+Test `devices` before `platform`. The latter includes late/noirq callbacks but
+returns before the s2idle loop. Both can perform real hardware transitions.
+
+The radio/DART candidate (kernel build #18) passed the complete `devices` stage
+in 5.711 seconds. All three retained DART checks and the radio transport check
+passed, NVMe resumed, and Wi-Fi automatically reconnected. The following
+`platform` test, with all-CPU state 1/CPU PM enabled, left its durable result at
+`running` and required external recovery; there is no saved callback failure.
+
+A separate default-off `pmgr_pwrstate.retain_s2idle` switch rejects T8140 domain
+power-off during system s2idle, leaving genpd's state ON. Driver callbacks still
+execute and runtime PM outside the suspend window is unchanged. It isolates
+power gating from device suspend while qualifying a conservative retained
+platform. It is not evidence of a deeper physical power state.
