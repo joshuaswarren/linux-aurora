@@ -13,6 +13,7 @@ The later kernel #26 implementation now acknowledges HIF quiescence, hands
 ownership to radio firmware and recovers ownership/HIF service on wake.
 The measured same-kernel three-minute pair is 0.856 W HIF-only versus
 0.781 W with firmware ownership. L1.2 adds no measured saving (0.787 W).
+A ten-minute screen-off confirmation averaged 0.7625 W and woke successfully.
 See [Wi-Fi sleep qualification](wifi-sleep.md) for code, the retired TX16
 loader-ring fix, recovery evidence and longer measurements. The sections
 below retain the original #19 investigation; they are not a claim that the

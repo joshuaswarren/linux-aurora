@@ -172,3 +172,35 @@ no saving was established. Enabled L1.2 bits still do not prove physical
 L1.2 residency. `wifi-own-tx16/power-comparison-pcie.json` retains the nested
 sleep inputs and counter calculation; the outer PCIe capture retains policy
 and link restoration evidence.
+
+## Ten-minute confirmation
+
+The screen-off, firmware-owned run measured **0.762495 W** over a 601.454 s
+battery interval. Real s2idle returned in 601.123 s, RTC wake was observed, all
+six CPUs entered (counts 10/1/2/1/2/5), and the display off/on counters matched.
+During the 600.232 s noirq interval, Wi-Fi IRQ 58 stayed at 7135; RTC IRQ rose
+once, architectural timer rose 21, SMC rose 9, and GPU/PMP/NVMe/USB IRQs did
+not advance. No reboot occurred. This is a calibrated battery-counter estimate,
+not external-meter metrology, and includes transition overhead. Its lower
+average than the three-minute 0.781 W run is not a separate feature saving.
+
+After wake, live SSH, association, ten successful gateway pings, a retained
+SDDM/Hyprland greeter screenshot and the unchanged known-good Asahi module
+hash were verified. The RTC alarm was disarmed; PCIe policy was `default`.
+`power-confirmation-600.json`, `own-600/result.json`, `final-check.json` and
+`final-desktop.png` under `wifi-own-tx16/` retain the calculation and evidence.
+
+The outcome is working disconnected Wi-Fi firmware sleep/wake and a modest
+energy reduction. It does not establish a platform power floor or implement
+deep suspend for DCP, GPU, PMP, interconnect or DRAM. Both Wi-Fi opt-ins remain
+off by default in the driver and are enabled only in the running qualification
+session; the normal GRUB boot default is unchanged.
+
+The reusable runner subsequently passed its own ten-second RTC test and
+association/address recovery check (`runner-check/result.json`). On the final
+#26 boot, the PM counters recorded seven successful transitions and zero
+failures; these include one device-debug stage and six real RTC sleeps. Display
+off/on counters were 7/7 with state restored. The temporary SMC/IRQ measurement
+modules were unloaded and the test inhibitor stopped after confirming the lid
+was open. RTC/display/cpuidle support and both Wi-Fi sleep opt-ins remain active
+on this running test kernel. `cleanup.json` retains the final state.
