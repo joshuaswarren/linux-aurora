@@ -17,6 +17,10 @@ static bool neo_cpuidle;
 module_param_named(neo, neo_cpuidle, bool, 0444);
 MODULE_PARM_DESC(neo, "Enable experimental J700 CPU PM idle (default off)");
 
+static bool neo_cpu_pm;
+module_param_named(neo_cpu_pm, neo_cpu_pm, bool, 0444);
+MODULE_PARM_DESC(neo_cpu_pm, "Include CPU PM callbacks in J700 idle qualification");
+
 enum idle_state {
 	STATE_WFI,
 	STATE_PWRDOWN,
@@ -132,10 +136,13 @@ static __cpuidle int apple_neo_enter_wfi(struct cpuidle_device *dev,
 {
 	int ret;
 
-	/* Notify context owners while RCU is still watching this CPU. */
-	ret = cpu_pm_enter();
-	if (ret)
-		return ret;
+	/* Qualify CPU PM separately from the existing state-preserving WFI. */
+	if (neo_cpu_pm) {
+		/* Notify context owners while RCU is still watching this CPU. */
+		ret = cpu_pm_enter();
+		if (ret)
+			return ret;
+	}
 
 	ct_cpuidle_enter();
 	/*
@@ -144,7 +151,8 @@ static __cpuidle int apple_neo_enter_wfi(struct cpuidle_device *dev,
 	 */
 	cpu_do_idle();
 	ct_cpuidle_exit();
-	cpu_pm_exit();
+	if (neo_cpu_pm)
+		cpu_pm_exit();
 
 	return index;
 }
@@ -162,7 +170,8 @@ static struct cpuidle_driver apple_neo_idle_driver = {
 			.target_residency = 100,
 			.name = "WFI",
 			.desc = "State-preserving WFI",
-			.flags = CPUIDLE_FLAG_RCU_IDLE,
+			/* Enable per CPU through sysfs after reaching userspace. */
+			.flags = CPUIDLE_FLAG_RCU_IDLE | CPUIDLE_FLAG_OFF,
 		},
 	},
 	.safe_state_index = 0,

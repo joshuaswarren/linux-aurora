@@ -53,8 +53,13 @@ individual suspend/resume qualification before a complete sleep cycle.
 
 The optional `cpuidle_apple.neo=1` kernel parameter registers `apple_neo_idle`
 on J700. Without it, the working architectural idle fallback remains in use.
-The driver offers POLL plus the existing state-preserving WFI sequence, with
-CPU PM notifications around WFI. It does not use the older Apple driver's
+The driver offers POLL plus the existing state-preserving WFI sequence. WFI
+starts disabled on each CPU: after boot, write `0` to that CPU's
+`cpuidle/state1/disable` attribute to qualify it individually. A separate
+`cpuidle_apple.neo_cpu_pm=1` parameter includes CPU PM notifications around WFI;
+leave it off when first testing the governor and state-save path. This separates
+framework registration from the expanded CPU PM transition. The driver does not
+use the older Apple driver's
 locked CYC_OVRD register. Its latency/residency values are initial governor
 estimates, not measured hardware guarantees or proof of power-down depth.
 
