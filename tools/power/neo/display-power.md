@@ -190,6 +190,32 @@ Module SHA256:
 The combined LCD-plus-backlight cycle and 600-second suspend comparison have
 not yet been measured.
 
+The user subsequently watched a repeated `pmBL` off/on trial and confirmed
+that the backlight was truly off, not merely showing black pixels.
+
+## Combined system-sleep hook
+
+`overlay/neo-display-sleep.c` is an explicitly loaded qualification module,
+not a replacement for a complete DCP/panel driver. It creates an SMC-child
+platform device, owns the inherited output-high `gP16` GPIO, and validates
+the write-only `pmBL` metadata. Probe changes neither power control.
+Loading requires `experimental=1`; remove the separate backlight trial first.
+
+Its regular suspend callback acknowledges backlight off, then lowers LCD
+enable and checks GPIO readback. Resume raises LCD enable, waits 100 ms for
+settling, then acknowledges backlight on. It also respects a conservative
+300 ms minimum LCD-off interval and restores on a suspend error or removal.
+The SMC parent relationship orders these calls before SMC suspend and after
+SMC resume. GPIO reads validate only LCD enable; `pmBL` remains write-only.
+Hibernation and DCP firmware shutdown are not implemented by this module.
+
+`sleep-test.py --display-off` requires this bound device, timed RTC wake,
+and an initial restored state. It records and verifies exactly one off/on
+callback pair and a restored final state. `sleep-power.py --mode sleep
+--display-off` forwards the requirement. This replaces the unpublished
+GPIO-only helper integration, which could not extinguish the backlight.
+Both helpers can optionally retain the existing visual phase/context test.
+
 The earlier DWI WLED trial (`overlay/neo-dwi-trial.c`, `dwi-power-step.py`)
 completed native version-1 immediate commands at 1024, zero, and 1024, but
 power remained 3.58 W at every level. It is not a J700 backlight driver.

@@ -24,11 +24,15 @@ def main():
     parser.add_argument('--wake-after', type=int, metavar='SECONDS')
     parser.add_argument('--screen-directory', type=Path,
                         help='screen-sleep window control directory (explicit visual test)')
+    parser.add_argument('--display-off', action='store_true',
+                        help='require the qualified neo-display-sleep PM hook and verify restoration')
     args = parser.parse_args()
     if os.geteuid():
         parser.error('root is required')
     if args.wake_after is not None and not 5 <= args.wake_after <= 3600:
         parser.error('--wake-after must be between 5 and 3600 seconds')
+    if args.display_off and args.wake_after is None:
+        parser.error('--display-off requires a timed wake')
     screen_delay = 2 if args.screen_directory else 0
     if args.wake_after is not None and args.wake_after + screen_delay > 3600:
         parser.error('sleep plus the screen prelude must fit the one-hour RTC limit')
@@ -67,6 +71,18 @@ def main():
     result = {'status': 'ready' if args.check_only else 'running',
               'state': 'freeze', 'check_only': args.check_only, 'wake_after': args.wake_after,
               'before': pm.snapshot()}
+    display = Path('/sys/module/neo_display_sleep/parameters')
+
+    def display_snapshot():
+        return {key: int((display / key).read_text())
+                for key in ('state', 'off_count', 'on_count')}
+
+    if args.display_off:
+        if not Path('/sys/bus/platform/devices/neo-display-sleep/driver').exists():
+            parser.error('neo-display-sleep must be bound')
+        result['display_before'] = display_snapshot()
+        if result['display_before']['state'] != 1:
+            parser.error('display must start in its restored state')
     usage_paths = [f'/sys/devices/system/cpu/cpu{c}/cpuidle/state1/s2idle/usage' for c in range(6)]
     before_usage = [int(pm.read(p)) for p in usage_paths]
 
@@ -155,6 +171,17 @@ def main():
         pm.write_control('/sys/power/pm_async', old_async)
         pm.write_control('/sys/power/pm_debug_messages', old_debug)
         result['after'] = pm.snapshot()
+        if args.display_off:
+            try:
+                result['display_after'] = display_snapshot()
+                before, after = result['display_before'], result['display_after']
+                result['display_cycle_verified'] = (after['state'] == 1 and
+                    after['off_count'] - before['off_count'] == 1 and
+                    after['on_count'] - before['on_count'] == 1)
+                if not result['display_cycle_verified']:
+                    result.update(status='error', display_error='off/restore counters did not match')
+            except Exception as error:
+                result.update(status='error', display_error=str(error))
         result['s2idle_entries_per_cpu'] = [int(pm.read(p)) - before_usage[c]
                                           for c, p in enumerate(usage_paths)]
         result['all_cpus_entered_s2idle'] = all(n > 0 for n in result['s2idle_entries_per_cpu'])

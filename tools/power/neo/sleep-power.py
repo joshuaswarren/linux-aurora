@@ -37,9 +37,15 @@ def main():
     parser.add_argument('--mode', choices=('awake', 'sleep'), required=True)
     parser.add_argument('--seconds', type=int, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--display-off', action='store_true',
+                        help='require and verify the neo-display-sleep PM hook')
+    parser.add_argument('--screen-directory', type=Path,
+                        help='screen-sleep control directory for visible before/after phases')
     args = parser.parse_args()
     if not 10 <= args.seconds <= 3600:
         parser.error('seconds must be in 10..3600')
+    if (args.display_off or args.screen_directory) and args.mode != 'sleep':
+        parser.error('display options require --mode sleep')
     args.output.mkdir(parents=True, exist_ok=False)
     lock = open('/run/neo-power-measure.lock', 'w')
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -71,9 +77,14 @@ def main():
                 time.sleep(min(1, max(0, deadline - time.monotonic())))
                 result['samples'].append(sample())
         else:
+            command = [sys.executable, str(helper), '--wake-after', str(args.seconds),
+                       '--output', str(args.output / 'sleep')]
+            if args.display_off:
+                command.append('--display-off')
+            if args.screen_directory:
+                command += ['--screen-directory', str(args.screen_directory.resolve(strict=True))]
             with (args.output / 'sleep.log').open('w') as log:
-                p = subprocess.run([sys.executable, str(helper), '--wake-after', str(args.seconds),
-                                    '--output', str(args.output / 'sleep')], stdout=log,
+                p = subprocess.run(command, stdout=log,
                                    stderr=subprocess.STDOUT)
             result['samples'].append(sample())
             result['sleep_returncode'] = p.returncode
