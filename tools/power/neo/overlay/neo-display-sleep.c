@@ -5,6 +5,7 @@
  * See ../display-power.md for firmware evidence and measurement boundaries.
  */
 #include <linux/delay.h>
+#include <linux/console.h>
 #include <linux/gpio/consumer.h>
 #include <linux/gpio/machine.h>
 #include <linux/ktime.h>
@@ -132,6 +133,14 @@ static int clocks_off(struct device *dev)
 
 	if (!depth)
 		return 0;
+	/* The inherited framebuffer and dockchannel console are not owned by
+	 * this diagnostic. Never leave console writes live across clock gating.
+	 * Enable /sys/module/printk/parameters/console_suspend before the test.
+	 */
+	if (!READ_ONCE(console_suspend_enabled)) {
+		dev_err(dev, "display clock trial requires console suspension\n");
+		return -EBUSY;
+	}
 	if (depth > ARRAY_SIZE(clock_offsets) || !d->touched || READ_ONCE(state) != 0)
 		return -EINVAL;
 	for (i = 0; i < ARRAY_SIZE(owners); i++) {
