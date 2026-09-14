@@ -682,7 +682,18 @@ impl DrmGpu for G17PDrmGpu {
     }
 
     fn base_clock_hz(&self) -> u32 {
-        24_000_000
+        // `DRM_IOCTL_ASAHI_GET_TIME` scales CNTPCT_EL0 by this rate. T8140
+        // runs the architectural counter at its own CNTFRQ_EL0, not at the
+        // GPU's 24 MHz command timestamp rate.
+        let frequency: u64;
+        // SAFETY: CNTFRQ_EL0 is a read-only system register.
+        unsafe {
+            core::arch::asm!(
+                "mrs {x}, CNTFRQ_EL0",
+                x = out(reg) frequency
+            );
+        }
+        frequency as u32
     }
 
     fn new_vm(&self, kernel_range: Range<u64>) -> Result<mmu::Vm> {
