@@ -11,6 +11,7 @@
 #include <linux/mfd/macsmc.h>
 #include <linux/mfd/syscon.h>
 #include <linux/io.h>
+#include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
@@ -27,6 +28,9 @@ module_param(off_count, uint, 0444);
 module_param(on_count, uint, 0444);
 MODULE_PARM_DESC(state, "-1 unbound; 0 LCD low/backlight-off acknowledged; 1 restored; other negative errno");
 static unsigned int clock_depth, clock_off_count, clock_on_count;
+static bool pause_cpu;
+module_param(pause_cpu, bool, 0644);
+MODULE_PARM_DESC(pause_cpu, "Power-isolation trial: pause an unowned, hardware-idle DCP CPU without a firmware sleep request");
 module_param(clock_depth, uint, 0644);
 module_param(clock_off_count, uint, 0444);
 module_param(clock_on_count, uint, 0444);
@@ -46,6 +50,8 @@ struct neo_display {
 	void __iomem *coproc;
 	u32 clocks[3];
 	unsigned int clocks_touched;
+	bool cpu_paused;
+	u32 saved_cpu_control;
 };
 static struct platform_device *display_device;
 static struct gpiod_lookup_table display_gpio = {
@@ -101,6 +107,13 @@ static int clocks_on(struct device *dev)
 			return ret;
 		d->clocks_touched--;
 	}
+	if (d->cpu_paused) {
+		writel(d->saved_cpu_control, d->coproc + 0x44);
+		if (readl(d->coproc + 0x44) != d->saved_cpu_control)
+			return -EIO;
+		d->cpu_paused = false;
+		dev_info(dev, "DCP isolation pause ended; RUN restored (no firmware sleep claim)\n");
+	}
 	if (touched)
 		clock_on_count++;
 	return 0;
@@ -142,8 +155,31 @@ static int clocks_off(struct device *dev)
 	}
 	control = readl(d->coproc + 0x44);
 	dev_info(dev, "display clock trial depth=%u DCP CPU_CONTROL=%#x\n", depth, control);
-	if (control & BIT(4))
-		return -EBUSY;
+	if (control & BIT(4)) {
+		u32 idle;
+
+		if (!READ_ONCE(pause_cpu))
+			return -EBUSY;
+		/* Power characterization only: no firmware sleep assertion. The
+		 * entire context stays powered, mappings stay untouched, all AP
+		 * clients are frozen and no Linux DCP/mailbox/DART owner exists.
+		 * Native ASC idle must be observed before pausing execution.
+		 */
+		ret = readl_poll_timeout(d->coproc + 0x48, idle, idle & 3, 10, 10000);
+		if (ret)
+			return ret;
+		d->saved_cpu_control = control;
+		d->cpu_paused = true;
+		writel(control & ~BIT(4), d->coproc + 0x44);
+		control = readl(d->coproc + 0x44);
+		writel(control & ~BIT(5), d->coproc + 0x44);
+		control = readl(d->coproc + 0x44);
+		dev_info(dev, "DCP isolation pause: idle=%#x control=%#x\n", idle, control);
+		if (control & (BIT(4) | BIT(5))) {
+			clocks_on(dev);
+			return -EIO;
+		}
+	}
 	for (i = 0; i < depth; i++) {
 		d->clocks_touched = i + 1;
 		ret = clock_set(d, i, 4, false);
@@ -239,7 +275,7 @@ static int display_probe(struct platform_device *pdev)
 	of_node_put(node);
 	if (IS_ERR(d->pmgr))
 		return PTR_ERR(d->pmgr);
-	d->coproc = devm_ioremap(&pdev->dev, 0x412e00000ULL, 0x48);
+	d->coproc = devm_ioremap(&pdev->dev, 0x412e00000ULL, 0x4c);
 	if (!d->coproc)
 		return -ENOMEM;
 	d->smc = dev_get_drvdata(pdev->dev.parent);
