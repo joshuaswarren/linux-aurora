@@ -247,3 +247,77 @@ invent an ACK for this message. The next bounded trial uses the already-present
 ASC idle-status poll and RUN stop/start, with clock_depth=0. Generic helpers
 now capture DCP status/parameters and reject latched failure or an unrestored
 transition, rather than accepting a returned PM write as DCP recovery.
+
+
+## DCP AP-only follow-up and OSLOG flush
+
+The ASC stop/start repeat after full IOP IDLE also failed AP wake with -62,
+without any display clock gate (`dcp-asc-stop/platform/`). Restoring RUN alone
+is insufficient. On #34 (`2e36424e0`), AP-only IDLE, keeping IOP ON, passed the
+platform-stage cycle with DCP sleeps=1/wakes=2 and failed=0. The next real
+10-second attempt timed out waiting for AP IDLE before any CPU entered
+s2idle; rollback AP wake also timed out. Retain the failure under
+`dcp-ap-idle/short-10/`; there is no valid power estimate.
+
+Between those attempts DCP emitted endpoint-8 message `0x0200000000003418`.
+RTKit ignored this as unknown. Native RTBuddy's OSLOG `_messageHandler`
+(`fffffe000adf86b0`) dispatches type 2 to `_handleFlushRequest`
+(`fffffe000adf9460`). That handler copies the coalescer to a temporary buffer,
+then replies `(message & 0xf0000000ffffffff) | (2ULL << 56)` and advances its
+consumer position. Types 3/4/5 convey source metadata. This is a plausible
+unhandled logging backpressure dependency, not yet proven to cause the hang.
+
+The follow-up adds an explicitly installed OSLOG callback, separate from the
+existing external-module ops layout. The diagnostic admits only coalescer 0,
+a mapped buffer of at most 1 MiB and a producer offset within that buffer.
+It copies the entire ring before acknowledging, retains the latest snapshot
+in a root-readable sysfs binary attribute, and counts successful replies.
+Unknown protocol forms or allocation/send failures latch the trial failed.
+No ring contents are interpreted as format strings. Other RTKit users retain
+their existing behavior. Hardware qualification is pending.
+
+Firmware `FUN_04034dac` confirms the reply mechanism: type 2 updates the
+consumer at coalescer +0x10, clears the outstanding-flush bit in flags +1,
+and wakes the +0xb0 waiter. The OSLOG lifecycle callback `FUN_040346c8`
+waits on that same waiter while a flush is pending. Thus ignoring the flush
+can block a power transition; the next boot tests this causal hypothesis.
+
+
+Kernel #35 (`20f69df97`, Image SHA256
+`0d26d2e79dd757d4d277ad150c77257a1f52e6057bb7f37c5449233dbfd5592a`)
+passed the platform-stage cycle and three consecutive 10-second real RTC
+sleeps with AP-only DCP idle. Every real cycle entered s2idle on all six
+CPUs and restored the panel. DCP reached sleeps=4/wakes=5, failed=0,
+touched=0, log_flushes=3. This reproduces the previously failing repeat with
+log acknowledgements in place. Raw ring snapshots and explicit before/after
+DCP counter checks are retained in `dcp-oslog-flush/`. Full IOP idle and
+clock gating remain unqualified; these passes concern AP-only notification.
+
+
+The same #35 boot completed four **120-second** power intervals in ABBA
+order, with freshly calibrated raw-counter scaling 3.639572725 units/uAh:
+
+| DCP AP state during sleep | Elapsed seconds | Calibrated whole-system W |
+| --- | ---: | ---: |
+| ON (reference) | 120.719 | 0.782937 |
+| IDLE | 120.819 | 0.768238 |
+| IDLE | 121.515 | 0.779303 |
+| ON (reference) | 120.784 | 0.768734 |
+
+The paired savings are +14.70 mW and -10.57 mW: **no repeatable saving is
+resolved**. AP-only notification does not establish DCP processor or display
+clock power-down. These are internally calibrated battery-counter estimates,
+including transitions, not external-meter measurements. Capacity-gauge
+compensation produced misleading 4.6–6.8 W estimates and is retained separately.
+The control itself uses an adopted, AP-awake DCP; it is not proof of identity
+with the loader's original quiesced state.
+
+Every interval passed RTC wake, six-CPU entry, panel restoration and firmware
+health checks. Across the platform test, three short cycles and four power
+intervals, the boot completed eight PM cycles: six exercised DCP AP idle and
+two left it awake. Final DCP status: sleeps=6, wakes=7 (including initial
+adoption wake), failed=0, touched=0, log_flushes=7. Source identities, counter
+comparisons, DCP counter deltas and ring snapshots are retained under
+`dcp-oslog-flush/`. The measurement script disabled DCP sleep afterward;
+Neo remains awake on #35. PMP firmware idle, DCP CPU stop and display clock
+gating remain disabled. No upstream fetch or push occurred.
