@@ -7,6 +7,9 @@ Keep a boot entry with the working kernel and initramfs when testing it.
 `freeze` and `mem` select s2idle; their presence in sysfs alone is not evidence
 of a working transition or a physical deep power state.
 
+See `rtc-alarm.md` for the qualified timed wake setup, `screen-sleep.md` for
+the retained display test and `sleep-power.md` for battery measurements.
+
 ## Diagnostics and wake input
 
 Apply `arch/arm64/configs/j700-suspend.config` on top of the working J700 kernel
@@ -30,9 +33,9 @@ I/O may retry a failed flush during cleanup, repeating a rejected transition.
 `returned` means only that the requested test stage returned. Inspect the logs,
 boot ID, thermal state, storage, networking and desktop separately.
 
-Device tests execute real driver callbacks. The PM test delay cannot recover a
-hung callback. J700 currently has no qualified RTC wake alarm; do not assume
-`rtcwake` is an escape route.
+Device tests execute real driver callbacks. Neither the PM test delay nor the
+qualified RTC alarm can recover a hung callback. The RTC setup is experimental
+and loaded explicitly in the development boot; see `rtc-alarm.md`.
 
 ## PMP and device lifecycle
 
@@ -208,7 +211,7 @@ execute and runtime PM outside the suspend window is unchanged. It isolates
 power gating from device suspend while qualifying a conservative retained
 platform. It is not evidence of a deeper physical power state.
 
-## Current checkpoint: retained platform ready for a physical wake test
+## Earlier checkpoint: retained platform ready for a physical wake test
 
 Build #19 (`9a1b478a5`, with the previously retained GPU module) completed three
 `platform` tests with power domains retained. Two runs kept FPSIMD, streaming
@@ -230,11 +233,12 @@ that check passed on build #19. Without `--check-only`, the latter tool requests
 ONE real sleep, using the wakeup-count handshake and retaining per-CPU s2idle
 entry deltas. A returned request without those entries is not proof of sleep.
 
-Do not start the real test until a physical operator is ready to tap the power
-button. There is no qualified timed wakeup. Fedora Left-back remains the reset
-recovery path. The normal Dirtyroom GPU entry is still the boot default.
+At this checkpoint a physical operator was required for wake testing. Timed
+wakeup was subsequently qualified as described in `rtc-alarm.md`. Fedora
+Left-back remains the reset recovery path. The normal Dirtyroom GPU entry is
+still the boot default.
 During qualification, the transient `neo-suspend-qualification-inhibit` unit
 blocks automatic logind lid/power/sleep actions; direct test requests still work.
 Stop that unit when controlled testing is finished.
 
-No real sleep/wake cycle has yet been attempted by the prepared sleep helper.
+The first actual sleep/wake results are recorded in `rtc-alarm.md`.

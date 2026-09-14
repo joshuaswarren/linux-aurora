@@ -17,8 +17,9 @@ The caller owns the phase file. A renderer acknowledgement is written after
 each buffer swap and includes the process ID, context pointer and monotonic
 timestamp. This is a submission acknowledgement, not a physical panel timestamp.
 
-Display phase 0 and wait for the user's approval before starting a watched
-test. With the existing qualified RTC/s2idle configuration, run:
+Display phase 0 before starting a watched test. The first watched test required
+the user's approval; the user subsequently authorized autonomous testing without
+further approval prompts. With the qualified RTC/s2idle configuration, run:
 
 ```
 python3 sleep-test.py --wake-after 60 --screen-directory CONTROL_DIRECTORY \
