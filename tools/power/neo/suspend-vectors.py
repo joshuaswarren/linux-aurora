@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
-"""Keep all four arm64 vector selftests on each Neo CPU across one PM test stage.
+"""Keep all four arm64 vector selftests on each Neo CPU across one PM transition.
 
-Only devices/platform debug stages are allowed. Neither enters system sleep.
+devices/platform stop before sleep; s2idle uses a qualified 60-second RTC alarm.
 The userspace timeout cannot recover a hung kernel callback or frozen task.
 """
 import argparse
@@ -19,7 +19,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--tests', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--stage', choices=('devices', 'platform'), required=True)
+    parser.add_argument('--stage', choices=('devices', 'platform', 's2idle'), required=True)
     args = parser.parse_args()
     if os.geteuid() or sorted(os.sched_getaffinity(0)) != list(range(6)):
         parser.error('run as root with all six Neo CPUs available')
@@ -54,9 +54,14 @@ def main():
                     time.sleep(0.01)
         save()
         os.sync()
-        helper = Path(__file__).with_name('pm-test.py')
+        if args.stage == 's2idle':
+            helper = Path(__file__).with_name('sleep-test.py')
+            options = ['--wake-after', '60']
+        else:
+            helper = Path(__file__).with_name('pm-test.py')
+            options = ['--stage', args.stage]
         with (args.output / 'pm-stage.log').open('wb') as log:
-            test = subprocess.run([sys.executable, str(helper), '--stage', args.stage,
+            test = subprocess.run([sys.executable, str(helper), *options,
                                    '--output', str(args.output / 'pm-stage')],
                                   stdout=log, stderr=subprocess.STDOUT, timeout=90)
         result['pm_returncode'] = test.returncode

@@ -64,3 +64,43 @@ No bootloader image or normal-boot configuration is changed. The overlay
 borrows the inherited powered bus; use only the retained development boot.
 Do not run `pmu-read` after the controller has bound. Disarm before unloading
 the overlay or RTC module. A reboot discards these runtime additions.
+
+## First timed sleep result
+
+After delivery, cancellation and rearming tests passed while awake, the full
+platform debug stage returned in 5.87 seconds with the RTC driver loaded.
+The first actual sleep used:
+
+```
+python3 sleep-test.py --wake-after 60 --output NEW_DIRECTORY
+```
+
+It returned in 60.694 seconds of CLOCK_BOOTTIME and 0.734 seconds of
+CLOCK_MONOTONIC: about 59.960 seconds with timekeeping suspended. The boot ID
+was unchanged. All six CPUs recorded s2idle entries, the PMU alarm fired,
+its wakeup count advanced, and all suspend/resume failure counters stayed zero.
+Wi-Fi reconnected and the PMP firmware epoch remained running and pinned.
+No physical button press or external reset was used.
+
+This is retained-power suspend-to-idle, not complete platform power-down.
+PMP/radio firmware and unqualified power domains remain on. CPU 0/4 woke
+intermittently for retained interrupts during the interval. Display power-down
+is not implemented. No battery-life improvement is established by these tests.
+The existing PMP thermal producer still reports intermittent/stale ENODATA;
+minimum frequency caps remain enforced. SMC sensors read about 37–41 C after
+the first cycle; the PMP's old 73 C sample is not a fresh temperature reading.
+
+A second 60-second cycle returned in 60.678 seconds (0.802 seconds monotonic),
+again through the PMU alarm with the same boot ID and no PM failure counters.
+All 24 vector processes (FPSIMD, streaming SVE, ZA and ZT on all six CPUs)
+reported success after spanning this transition. Use `suspend-vectors.py
+--stage s2idle` with the existing `--tests` and `--output` arguments to repeat
+that experiment. The login compositor rendered a fresh screenshot afterward;
+Wi-Fi reconnected and root NVMe resumed. These are two successful retained
+sleep cycles, not qualification of arbitrary applications or long-duration sleep.
+
+The RTC driver and overlay are loaded in the current development boot only.
+The existing qualification inhibitor continues blocking automatic logind
+lid/power/sleep actions while these opt-ins are armed; the direct test helper
+still works. No alarm is left armed after a completed test. The normal GRUB
+default, its kernel/initramfs and stage-2 image remain unchanged.
