@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
-"""Request one real retained s2idle cycle on Neo, with a physical wake operator.
+"""Request one real retained s2idle cycle on Neo.
 
-Use --check-only to verify prerequisites without sleeping. There is no qualified
-RTC alarm or automatic timeout: a power-button wake or external reset is needed.
+Use --check-only to verify prerequisites without sleeping. --wake-after arms
+the experimental PMU RTC; without it a physical wake operator is required.
+An RTC alarm cannot recover a hung suspend/resume callback; retain external reset.
 The saved result distinguishes a returned request from actual s2idle entries.
 """
 import argparse
@@ -12,6 +13,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import subprocess
 import time
 
 
@@ -19,9 +21,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--check-only', action='store_true')
+    parser.add_argument('--wake-after', type=int, metavar='SECONDS')
     args = parser.parse_args()
     if os.geteuid():
         parser.error('root is required')
+    if args.wake_after is not None and not 5 <= args.wake_after <= 3600:
+        parser.error('--wake-after must be between 5 and 3600 seconds')
     spec = importlib.util.spec_from_file_location('neo_pm', Path(__file__).with_name('pm-test.py'))
     pm = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(pm)
@@ -45,11 +50,30 @@ def main():
             parser.error(f'{path} must be {value}')
     if '[none]' not in pm.read('/sys/power/pm_test') or '[s2idle]' not in pm.read('/sys/power/mem_sleep'):
         parser.error('require pm_test=none and mem_sleep=s2idle')
+    rtc = Path('/sys/class/rtc/rtc0')
+    if args.wake_after is not None:
+        if not pm.read(rtc / 'name').startswith('apple-pmu-rtc '):
+            parser.error('--wake-after requires the experimental PMU RTC')
+        if pm.read(rtc / 'device/power/wakeup') != 'enabled':
+            parser.error('PMU RTC wakeup must be enabled')
+        if pm.read(rtc / 'wakealarm'):
+            parser.error('an RTC alarm is already armed')
     args.output.mkdir(parents=True, exist_ok=False)
     result = {'status': 'ready' if args.check_only else 'running',
-              'state': 'freeze', 'check_only': args.check_only, 'before': pm.snapshot()}
+              'state': 'freeze', 'check_only': args.check_only, 'wake_after': args.wake_after,
+              'before': pm.snapshot()}
     usage_paths = [f'/sys/devices/system/cpu/cpu{c}/cpuidle/state1/s2idle/usage' for c in range(6)]
     before_usage = [int(pm.read(p)) for p in usage_paths]
+
+    def rtc_command(*options):
+        p = subprocess.run(['rtcwake', '-d', '/dev/rtc0', *options], text=True,
+                           capture_output=True, timeout=10)
+        if p.returncode:
+            raise RuntimeError(p.stdout + p.stderr)
+        return p.stdout + p.stderr
+
+    def rtc_events():
+        return int(pm.read(rtc / 'device/power/wakeup_count'))
 
     def save():
         temporary = args.output / 'result.tmp'
@@ -59,13 +83,22 @@ def main():
 
     save()
     if args.check_only:
-        print('Prerequisites ready; no sleep requested. Physical wake remains unqualified.')
+        print('Prerequisites ready; no sleep or wake alarm requested.')
         return 0
     old_async = pm.read('/sys/power/pm_async')
     old_debug = pm.read('/sys/power/pm_debug_messages')
+    alarm_attempted = False
     try:
         pm.write_control('/sys/power/pm_async', '0')
         pm.write_control('/sys/power/pm_debug_messages', '1')
+        if args.wake_after is not None:
+            result['rtc_events_before'] = rtc_events()
+            alarm_attempted = True
+            result['rtc_arm_log'] = rtc_command('-m', 'no', '-s', str(args.wake_after))
+            result['rtc_alarm_epoch'] = pm.read(rtc / 'wakealarm')
+            if not result['rtc_alarm_epoch']:
+                raise RuntimeError('RTC alarm did not remain armed')
+            save()
         # Serialize against intervening wake events. Do not retry a rejection.
         wake_count = Path('/sys/power/wakeup_count').read_text().strip()
         result['wakeup_count_before'] = wake_count
@@ -79,16 +112,28 @@ def main():
             result.update(status='error', errno=error.errno, error=str(error))
         result['boottime_elapsed_seconds'] = time.clock_gettime(time.CLOCK_BOOTTIME) - start
         result['monotonic_elapsed_seconds'] = time.monotonic() - awake_start
+    except Exception as error:
+        result.update(status='error', error=str(error))
     finally:
+        if alarm_attempted:
+            try:
+                result['rtc_events_delta'] = rtc_events() - result['rtc_events_before']
+                result['rtc_disarm_log'] = rtc_command('-m', 'disable')
+            except Exception as error:
+                result.update(status='error', rtc_cleanup_error=str(error))
         pm.write_control('/sys/power/pm_async', old_async)
         pm.write_control('/sys/power/pm_debug_messages', old_debug)
         result['after'] = pm.snapshot()
         result['s2idle_entries_per_cpu'] = [int(pm.read(p)) - before_usage[c]
                                           for c, p in enumerate(usage_paths)]
         result['all_cpus_entered_s2idle'] = all(n > 0 for n in result['s2idle_entries_per_cpu'])
+        if args.wake_after is not None:
+            result['timed_wake_observed'] = (result.get('rtc_events_delta', 0) > 0 and
+                args.wake_after - 2 <= result.get('boottime_elapsed_seconds', 0) <= args.wake_after + 30)
         save()
     print(json.dumps({k: v for k, v in result.items() if k not in ('before', 'after')}))
-    return int(result['status'] != 'returned' or not result['all_cpus_entered_s2idle'])
+    return int(result['status'] != 'returned' or not result['all_cpus_entered_s2idle'] or
+               (args.wake_after is not None and not result['timed_wake_observed']))
 
 
 if __name__ == '__main__':
