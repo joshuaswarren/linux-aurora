@@ -205,3 +205,34 @@ power-off during system s2idle, leaving genpd's state ON. Driver callbacks still
 execute and runtime PM outside the suspend window is unchanged. It isolates
 power gating from device suspend while qualifying a conservative retained
 platform. It is not evidence of a deeper physical power state.
+
+## Current checkpoint: retained platform ready for a physical wake test
+
+Build #19 (`9a1b478a5`, with the previously retained GPU module) completed three
+`platform` tests with power domains retained. Two runs kept FPSIMD, streaming
+SVE, ZA and ZT selftests active on each of the six CPUs across the transition:
+all 48 process runs passed, and the PM resume-failure counters remained zero.
+The Omarchy SDDM/Hyprland greeter was running during those two runs and rendered
+correctly in a post-test screenshot. Wi-Fi reconnected automatically.
+
+Observed domains retained in the headless test were `apcie_phy_sw`, `gfx`,
+`i2c2`, `gpio` and `atc0_usb`. Keeping these powered is a conservative starting
+point; it does not identify which individual domain caused the earlier stall.
+System sleep power consumption, display power-down and sustained desktop
+stability have not been measured or qualified.
+
+`suspend-vectors.py --stage platform --tests DIR --output NEWDIR` repeats the
+vector preservation test across a debug stage. `sleep-test.py --check-only
+--output NEWDIR` checks the actual-sleep prerequisites without requesting sleep;
+that check passed on build #19. Without `--check-only`, the latter tool requests
+ONE real sleep, using the wakeup-count handshake and retaining per-CPU s2idle
+entry deltas. A returned request without those entries is not proof of sleep.
+
+Do not start the real test until a physical operator is ready to tap the power
+button. There is no qualified timed wakeup. Fedora Left-back remains the reset
+recovery path. The normal Dirtyroom GPU entry is still the boot default.
+During qualification, the transient `neo-suspend-qualification-inhibit` unit
+blocks automatic logind lid/power/sleep actions; direct test requests still work.
+Stop that unit when controlled testing is finished.
+
+No real sleep/wake cycle has yet been attempted by the prepared sleep helper.
