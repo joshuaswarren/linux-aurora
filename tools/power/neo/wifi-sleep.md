@@ -1,10 +1,12 @@
 # MT7932 host-interface sleep qualification
 
-This is an opt-in J700 experiment on `eryk_neo_deepsleep`, not yet a
-qualified firmware power-down path. `mt7932_fullmac.hif_s2idle=1` adds an
-acknowledged host-interface suspend/resume exchange to the existing,
-disconnected, D0-retaining s2idle path. Default is off. DMA memory, IRQ
-service, PCI power and driver ownership remain retained.
+J700 now completes acknowledged HIF sleep, firmware ownership, driver
+ownership recovery and HIF wake on `eryk_neo_deepsleep`. Both
+`mt7932_fullmac.hif_s2idle` and `fw_own_s2idle` default off; enable both
+for the qualified firmware-owned experiment. HIF-only mode also works.
+PCI remains D0 and DMA memory stays pinned. This disconnects Wi-Fi during
+sleep and reconnects afterward; it does not implement WoWLAN, PCI D3 or
+whole-SoC deep sleep. The development record and retained captures follow.
 
 ## Native reference
 
@@ -162,3 +164,11 @@ interrupts during the firmware-owned noirq interval. This is a total-machine
 comparison, not an isolated absolute Wi-Fi wattage. The remaining-capacity
 gauge again produced implausible 2.25 W and 7.95 W estimates; the accumulated
 counter result is retained in `wifi-own-tx16/power-comparison-180.json`.
+
+With firmware ownership enabled, the coordinated PCIe `powersupersave`
+policy completed a three-minute RTC sleep and restored the original `default`
+policy. It measured 0.78666 W versus 0.78120 W without the policy change;
+no saving was established. Enabled L1.2 bits still do not prove physical
+L1.2 residency. `wifi-own-tx16/power-comparison-pcie.json` retains the nested
+sleep inputs and counter calculation; the outer PCIe capture retains policy
+and link restoration evidence.
