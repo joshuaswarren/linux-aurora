@@ -1182,6 +1182,8 @@ fn page_align(value: usize) -> Option<usize> {
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 struct G17PRenderStateLayout {
+    layermeta: usize,
+    layermeta_size: usize,
     heapmeta: usize,
     heapmeta_size: usize,
     tpc: usize,
@@ -1306,7 +1308,11 @@ fn g17p_render_state_layout(
         .checked_mul(16)?
         .checked_mul(layers)?
         .checked_mul(num_clusters as usize)?;
-    let heapmeta_size = 0x200usize.checked_add(if layers > 1 { 0x100 } else { 0 })?;
+    // AGXRenderTargetMemoryG16::halComputeGeometry: a layered target carries
+    // 0x100 bytes of per-layer tiler metadata beside the 0x200-byte heap
+    // metadata, which every target carries.
+    let layermeta_size = if layers > 1 { 0x100usize } else { 0 };
+    let heapmeta_size = 0x200usize;
 
     // TVB sizing, using the same formula the legacy path feeds to
     // `Buffer::ensure_blocks` (queue/render.rs:132): blocks scale with the tile
@@ -1340,15 +1346,18 @@ fn g17p_render_state_layout(
         .checked_mul(G17P_RENDER_TVB_BLOCK_STRIDE)?
         .checked_add(G17P_RENDER_TVB_BLOCK_SIZE)?;
 
-    // Native's one RT-memory allocation places the tilemap first and the
-    // heap metadata at the next 4-KiB subrange. For the launchgate triangle
-    // that is exactly TMAP+0x0000 and HMTA+0x1000 inside one 16-KiB UAT page.
-    // The previous inherited layout reversed them and separated them by
-    // 0x10000, even though the 3D fixed-function path consumes their native
-    // relationship directly.
+    // Native's one RT-memory allocation places the tilemap first, then the
+    // layer metadata at the next 4-KiB subrange and the heap metadata directly
+    // behind it (AGXRenderTargetMemory::updateRenderTarget, +0x2a8/+0x2b0/
+    // +0x2b8). For the launchgate triangle that is exactly TMAP+0x0000 and
+    // HMTA+0x1000 inside one 16-KiB UAT page, because a single layer has no
+    // layer metadata. The previous inherited layout reversed them and
+    // separated them by 0x10000, even though the 3D fixed-function path
+    // consumes their native relationship directly.
     let tilemap = G17P_RENDER_STATE_DYNAMIC;
     let tilemap_span = tilemap_size.checked_add(0xfff)? & !0xfff;
-    let heapmeta = tilemap.checked_add(tilemap_span)?;
+    let layermeta = tilemap.checked_add(tilemap_span)?;
+    let heapmeta = layermeta.checked_add(layermeta_size)?;
     let tpc = page_align(heapmeta.checked_add(heapmeta_size)?)?;
     // TMAP/HMTA rotate in `G17PRenderTargetMemory::rt_memory` and TPC has its
     // own stable object. They no longer occupy `render_state`; only their
@@ -1375,6 +1384,8 @@ fn g17p_render_state_layout(
         tvb_blocks,
         pm_scene_scratch,
         pm_discard,
+        layermeta,
+        layermeta_size,
         heapmeta,
         heapmeta_size,
         tpc,
@@ -2572,7 +2583,7 @@ impl G17PRenderTargetMemory {
         &mut self,
         submission_ordinal: u32,
         layout: &G17PRenderStateLayout,
-    ) -> Result<(u64, u64)> {
+    ) -> Result<G17PRenderTargetAddresses> {
         let slot = submission_ordinal as usize % G17P_RENDER_RT_EVENT_RECORD_COUNT;
         if self.rt_slot_ordinals[slot].is_some_and(|previous| {
             submission_ordinal
@@ -2599,20 +2610,11 @@ impl G17PRenderTargetMemory {
             Ok(())
         })?;
         self.rt_slot_ordinals[slot] = Some(submission_ordinal);
-        let tilemap = self
-            .rt_memory
-            .iova()
-            .checked_add(offset as u64)
-            .ok_or(EOVERFLOW)?;
-        let heapmeta = tilemap
-            .checked_add(
-                layout
-                    .heapmeta
-                    .checked_sub(layout.tilemap)
-                    .ok_or(EINVAL)? as u64,
-            )
-            .ok_or(EOVERFLOW)?;
-        Ok((tilemap, heapmeta))
+        Ok(G17PRenderTargetAddresses {
+            tilemap: self.tilemap_va(submission_ordinal)?,
+            layermeta: self.rt_region_va(submission_ordinal, layout, layout.layermeta)?,
+            heapmeta: self.heapmeta_va(submission_ordinal, layout)?,
+        })
     }
 
     fn tpc_va(&self) -> u64 {
@@ -2626,20 +2628,33 @@ impl G17PRenderTargetMemory {
             .ok_or(EOVERFLOW)
     }
 
+    fn rt_region_va(
+        &self,
+        submission_ordinal: u32,
+        layout: &G17PRenderStateLayout,
+        region: usize,
+    ) -> Result<u64> {
+        self.tilemap_va(submission_ordinal)?
+            .checked_add(region.checked_sub(layout.tilemap).ok_or(EINVAL)? as u64)
+            .ok_or(EOVERFLOW)
+    }
+
     fn heapmeta_va(
         &self,
         submission_ordinal: u32,
         layout: &G17PRenderStateLayout,
     ) -> Result<u64> {
-        self.tilemap_va(submission_ordinal)?
-            .checked_add(
-                layout
-                    .heapmeta
-                    .checked_sub(layout.tilemap)
-                    .ok_or(EINVAL)? as u64,
-            )
-            .ok_or(EOVERFLOW)
+        self.rt_region_va(submission_ordinal, layout, layout.heapmeta)
     }
+}
+
+/// The addresses one render-target-memory record publishes to TA and 3D.
+#[cfg(not(test))]
+#[derive(Debug, Copy, Clone)]
+struct G17PRenderTargetAddresses {
+    tilemap: u64,
+    layermeta: u64,
+    heapmeta: u64,
 }
 
 /// Keep the comparatively large owning mappings out of
@@ -6286,6 +6301,18 @@ impl G17PUserRenderStorage {
                 self.render_target_memory.tilemap_va(self.descriptor_ordinal)?,
             ),
             (
+                7,
+                rt_offset
+                    + self.render_layout.layermeta.checked_sub(self.render_layout.tilemap)
+                        .ok_or(EINVAL)?,
+                self.render_layout.layermeta_size,
+                self.render_target_memory.rt_region_va(
+                    self.descriptor_ordinal,
+                    &self.render_layout,
+                    self.render_layout.layermeta,
+                )?,
+            ),
+            (
                 6,
                 rt_offset
                     + self.render_layout.heapmeta.checked_sub(self.render_layout.tilemap)
@@ -6295,6 +6322,9 @@ impl G17PUserRenderStorage {
                     .heapmeta_va(self.descriptor_ordinal, &self.render_layout)?,
             ),
         ] {
+            if size == 0 {
+                continue;
+            }
             let mut item = meta;
             item.kind = TraceKind::RenderState;
             item.context = context;
@@ -6871,7 +6901,7 @@ impl G17PUserRenderStorage {
             "persistent render-target-memory allocation",
             new_g17p_render_target_memory(dev, vm, queue_pair)
         );
-        let (render_target_tilemap, render_target_heapmeta) = bootstrap_stage!(
+        let render_target_addresses = bootstrap_stage!(
             "render-target-memory record",
             render_target_memory.prepare_rt_slot(submission_ordinal, &render_layout)
         );
@@ -7098,12 +7128,13 @@ impl G17PUserRenderStorage {
         }
         translated.parameters.ta_status = render_state_va + G17P_RENDER_STATE_TA_STATUS as u64;
         translated.parameters.fragment_status = fragment_status_low.iova();
-        translated.parameters.heapmeta = render_target_heapmeta;
+        translated.parameters.layermeta = render_target_addresses.layermeta;
+        translated.parameters.heapmeta = render_target_addresses.heapmeta;
         translated.parameters.tpc = render_target_memory.tpc_va();
         translated.parameters.aux_fb = render_user_aliases.aux_fb_va();
         translated.parameters.aux_fb_page_count = G17P_RENDER_AUX_FB_PAGE_COUNT;
         translated.parameters.aux_fb_flags = g17p_aux_fb_flags(translated.flags);
-        translated.parameters.tilemap = render_target_tilemap;
+        translated.parameters.tilemap = render_target_addresses.tilemap;
         if let Some(pm) = parameter_management.as_ref() {
             translated.parameters.parameter_buffer = pm.selected_scene_va();
             let (cycle, record_index) = pm.scene_registers(
@@ -7114,7 +7145,7 @@ impl G17PUserRenderStorage {
         }
         dev_info!(
             dev.as_ref(),
-            "G17P render address domains: resource-base={:#x} state={:#x} deflake={:#x} fragment-status={:#x} scene={:#x} discard={:#x} tilemap={:#x} heapmeta={:#x} tpc={:#x} axfb={:#x} tvb={:#x}\n",
+            "G17P render address domains: resource-base={:#x} state={:#x} deflake={:#x} fragment-status={:#x} scene={:#x} discard={:#x} tilemap={:#x} layermeta={:#x} heapmeta={:#x} tpc={:#x} axfb={:#x} tvb={:#x}\n",
             translated.parameters.context_base,
             render_state_va,
             render_user_aliases.deflake_va(),
@@ -7122,6 +7153,7 @@ impl G17PUserRenderStorage {
             scene_scratch.as_ref().map_or(0, MappedObject::iova),
             discard.as_ref().map_or(0, MappedObject::iova),
             translated.parameters.tilemap,
+            translated.parameters.layermeta,
             translated.parameters.heapmeta,
             translated.parameters.tpc,
             translated.parameters.aux_fb,
@@ -7192,8 +7224,11 @@ impl G17PUserRenderStorage {
                 true,
             ),
             (
-                translated.parameters.heapmeta,
-                render_layout.heapmeta_size as u64,
+                translated.parameters.layermeta,
+                render_layout
+                    .layermeta_size
+                    .checked_add(render_layout.heapmeta_size)
+                    .ok_or(EOVERFLOW)? as u64,
                 true,
                 true,
             ),
@@ -7423,10 +7458,11 @@ impl G17PUserRenderStorage {
             Ok(())
         }));
         pr_info!(
-            "G17P render ta-inputs: context_base={:#x} encoder(vdm)={:#x} tilemap={:#x} heapmeta={:#x} tpc={:#x}\n",
+            "G17P render ta-inputs: context_base={:#x} encoder(vdm)={:#x} tilemap={:#x} layermeta={:#x} heapmeta={:#x} tpc={:#x}\n",
             translated.parameters.context_base,
             translated.parameters.encoder,
             translated.parameters.tilemap,
+            translated.parameters.layermeta,
             translated.parameters.heapmeta,
             translated.parameters.tpc,
         );
@@ -8315,7 +8351,7 @@ impl G17PUserRenderStorage {
         {
             return Err(ERANGE);
         }
-        let (render_target_tilemap, render_target_heapmeta) = restage_step!(
+        let render_target_addresses = restage_step!(
             "render-target-memory record",
             self.render_target_memory
                 .prepare_rt_slot(submission_ordinal, &render_layout)
@@ -8383,12 +8419,13 @@ impl G17PUserRenderStorage {
         }
         translated.parameters.ta_status = render_state_va + G17P_RENDER_STATE_TA_STATUS as u64;
         translated.parameters.fragment_status = self.fragment_status_low.iova();
-        translated.parameters.heapmeta = render_target_heapmeta;
+        translated.parameters.layermeta = render_target_addresses.layermeta;
+        translated.parameters.heapmeta = render_target_addresses.heapmeta;
         translated.parameters.tpc = self.render_target_memory.tpc_va();
         translated.parameters.aux_fb = aux_fb_va;
         translated.parameters.aux_fb_page_count = G17P_RENDER_AUX_FB_PAGE_COUNT;
         translated.parameters.aux_fb_flags = g17p_aux_fb_flags(translated.flags);
-        translated.parameters.tilemap = render_target_tilemap;
+        translated.parameters.tilemap = render_target_addresses.tilemap;
         if let Some(pm) = self.parameter_management.as_ref() {
             translated.parameters.parameter_buffer = pm.selected_scene_va();
             let (cycle, record_index) = pm.scene_registers(
@@ -9346,9 +9383,13 @@ impl G17PUserRenderStorage {
                 )
                 && vm.covers_range(
                     self.render_target_memory
-                        .heapmeta_va(self.descriptor_ordinal, &self.render_layout)
+                        .rt_region_va(
+                            self.descriptor_ordinal,
+                            &self.render_layout,
+                            self.render_layout.layermeta,
+                        )
                         .unwrap_or(0),
-                    self.render_layout.heapmeta_size as u64,
+                    (self.render_layout.layermeta_size + self.render_layout.heapmeta_size) as u64,
                     true,
                     true,
                 )
@@ -17608,6 +17649,8 @@ mod tests {
             Ok(0x2008020)
         );
         let render = G17PRenderStateLayout {
+            layermeta: 0,
+            layermeta_size: 0,
             heapmeta: 0,
             heapmeta_size: 0,
             tpc: 0,
@@ -18694,6 +18737,8 @@ mod tests {
         let layout = g17p_render_state_layout(&parameters, 2).unwrap();
         assert_eq!(layout.tilemap, 0x10000);
         assert_eq!(layout.tilemap_size, 0x500);
+        assert_eq!(layout.layermeta, 0x11000);
+        assert_eq!(layout.layermeta_size, 0);
         assert_eq!(layout.heapmeta, 0x11000);
         assert_eq!(layout.heapmeta_size, 0x200);
         assert_eq!(layout.tpc, 0x14000);
@@ -18707,6 +18752,15 @@ mod tests {
             g17p_aux_fb_flags(G17P_RENDER_DBIAS_IS_INT),
             0x4c000
         );
+
+        let mut layered_parameters = parameters;
+        layered_parameters.layers = 2;
+        let layered = g17p_render_state_layout(&layered_parameters, 2).unwrap();
+        assert_eq!(layered.tilemap_size, 0xa00);
+        assert_eq!(layered.layermeta, 0x11000);
+        assert_eq!(layered.layermeta_size, 0x100);
+        assert_eq!(layered.heapmeta, 0x11100);
+        assert_eq!(layered.heapmeta_size, 0x200);
 
         let mut large_parameters = parameters;
         large_parameters.width = 4096;
