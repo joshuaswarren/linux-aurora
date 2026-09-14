@@ -97,3 +97,51 @@ Noirq Wi-Fi counts changed from 364/180.060 s to 0/180.092 s. Eliminating these
 interrupts alone did not lower total battery power. The new awake calibration
 was 3.588375 raw units/uAh; the capacity gauge misleadingly implied 2.64 W
 and 6.19 W respectively. Full calculation: `wifi-hif/power-comparison.json`.
+
+Review of `_halSetDriverOwn` found a conditional SER/DMA reconstruction path
+(`wifi-resume-upper.dis` and `wifi-own-exact.dis`). Our retained-only mode now
+checks DMA global configuration and every ring base/count immediately after
+recovering ownership, **before** restoring interrupts or submitting HIF resume.
+A firmware reset that loses geometry is rejected with the IRQ still disabled;
+this path cannot yet recover such a reset. Kernel #22 booted with both HIF
+switches off, but ownership testing was deferred to the build with this guard.
+
+Kernel #23's first ownership device test **returned** in 5.821 s; it did not
+hang the system. FW ownership was acknowledged as 0x00000004, driver ownership
+as 0x00000000. The pre-HIF-resume DMA guard failed and deliberately disabled
+Wi-Fi; the durable result was recovered after Fedora's external reset.
+The original guard compared with fully running DMA configuration too early:
+HIF suspend may itself change enable bits. The next revision captures the
+acknowledged HIF DMA configuration immediately before ownership and compares
+against that on ownership return. The normal active-state check still runs
+after HIF resume. It also logs specific configuration/ring mismatches. No DMA
+reconstruction is attempted until the actual differing state is established.
+
+The #25 capture rules out a HIF enable-bit mismatch: DMA config stayed
+0x5030b875 across ownership. Only **TX16**, the boot firmware-download ring,
+changed: base became zero and count 512 instead of the host allocation's 256.
+Every active command/data/RX ring retained its geometry. The device test
+returned in 5.918 s; its network wrapper saved the failure and rebooted.
+
+TX16 is never submitted after `mt_runtime_rebuild` retires the loader epoch.
+The next candidate accepts only the exact observed inactive TX16 image, with
+both hardware cursors zero and all software cursors/queued/used zero, while
+keeping every live ring strict. `mt_scatter` now explicitly rejects runtime
+submissions. It does not rebuild live DMA or rewrite firmware's retired ring.
+
+## Firmware ownership round trip qualified
+
+Kernel #26 (`224778573`) passed the device stage after accepting the inactive
+loader ring. FW-own status was 0x4, driver-own status 0x0, both HIF events
+acknowledged, active DMA geometry retained, and Wi-Fi reconnected over SSH.
+The test wrapper initially treated `iw link`'s unsupported station-statistics
+request as failure despite its valid Connected output; it was stopped before
+its recovery reboot, and the complete partial output and live-SSH evidence
+were saved. The wrapper now accepts the association output independently.
+
+The following `sleep-10` passed actual RTC-woken s2idle, all six CPUs entering,
+and restored the display. Noirq interval 9.83416 s had zero Wi-Fi interrupts
+and one RTC interrupt. Firmware ownership was recovered and HIF resume
+acknowledged before Wi-Fi reconnected. Captures and installation identities
+are in workspace `artifacts/neo-suspend/wifi-own-tx16/`. Power measurement is
+still separate from these functional transition results.
