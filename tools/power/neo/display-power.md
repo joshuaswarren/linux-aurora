@@ -34,8 +34,8 @@ slave-select bit; completion clears bit 0. These offsets differ from the old
 Linux DWI backlight aperture. This alone does not prove DWI drives Neo's panel.
 
 The J700 ADT also describes EXBright and DCP-based brightness ownership.
-Further investigation must establish the actual panel off/on path before a
-screen-off sleep test can be claimed. No display power-down is qualified yet.
+The initial DWI inventory did not establish a panel off/on path. The later
+X3200 investigation below identifies a separate LCD-enable control.
 
 ## Firmware and SMC inventory
 
@@ -61,7 +61,7 @@ The image includes several prototype panel configurations. Neither the
 1520 x 1520 configuration at file offset `0x4d3e0c` nor DispTargetX1769's
 2560 x 1600 configuration at `0x4d4508` identifies J700. In particular, do not
 copy X1769's `gP13` LCD enable: J700's Linux DT and live GPIO consumer identify
-SMC GPIO 19 as the audio AFE reset. Generic firmware strings are not a board
+SMC GPIO 19 as the touchpad AFE reset. Generic firmware strings are not a board
 wiring map.
 
 Two offline helpers retain reproducible analysis:
@@ -95,6 +95,56 @@ panel/backlight operation, qualify a short off/on cycle with power evidence,
 then hook it into sleep and wake. Black framebuffer pixels, successful RTC
 wake, or a firmware transport acknowledgement alone do not establish that
 the panel was powered down.
+
+## X3200 LCD enable, 2026-09-14
+
+The J700 BuildManifest identifies `Baobab,TCON` as
+`Firmware/DP855/X3200/X3200.bin`. DCP's static initializer calls the
+DispTargetX3200 name helper at `0x0435dc88`, then deserializes the object at
+VA `0x0445c240` (file offset `0x45d240`), size `0xa04`. This configuration
+matches the live panel's **2408 x 1506** timing and specifies:
+
+```
+lcd-enable: { key: gP16, on: 1, off: 0 }
+lcd-off-on-ms: 260
+```
+
+The existing macsmc GPIO driver maps `gP16` to line 22 of the
+`macsmc-pmu-gpio` chip. A GPIO character-device query found the line unclaimed,
+already configured as an output, and high. `panel-gpio.c` uses that existing
+driver; it does not access SMC transport registers or change pin mode. Its
+`--read` operation preserves the direction. `--cycle SECONDS` accepts only
+J700, the expected chip/line, and inherited output-high; it holds the line,
+switches it low, then restores high. The helper respects at least 300 ms off
+even on SIGINT/SIGTERM. SIGKILL and machine failure still require recovery.
+
+The first 10-second awake cycle, boot
+`222e9ec0-d1d1-4348-bf74-ace919ce5b38`, returned zero, read low during the off
+interval, and restored high. Battery `power_now` settled at:
+
+* Before: 3.578 W (16 half-second samples).
+* Off: 2.8944 W (15 half-second samples after settling).
+* Restored: 3.5235 W (17 half-second samples after settling).
+
+This provides electrical evidence of approximately **0.68 W** removed by the
+LCD-enable control. A compositor screenshot alone cannot prove physical
+panel output after restoration. The 10-minute sleep comparison remains a
+separate experiment, not this short awake cycle.
+
+The earlier DWI WLED trial (`overlay/neo-dwi-trial.c`, `dwi-power-step.py`)
+completed native version-1 immediate commands at 1024, zero, and 1024, but
+power remained 3.58 W at every level. It is not a J700 backlight driver.
+The trial domain is no longer forced always-on; remove the trial and its
+overlay before measurements. The read-only `spmi-display-read.c` received
+valid SPMI replies from both candidate buses, but register `0x1e00` was zero
+on each while the panel was illuminated. Neither candidate is qualified for
+brightness writes.
+
+Additional offline analysis extracted the T8140 ExclaveCore shared cache
+from 25F84. SHA256:
+`2d227b8d7129bf7a11bd7798f122bf64cb14615932f6341aed6df2efeb2099f7`.
+`native/exclave-rebase-macho.py` resolves its 73974 format-12 chained pointers
+for analysis, including VM/file gaps. This is analysis tooling only.
 
 Native reference: Darwin 25.5 / XNU 12377.121.10~1, RELEASE_ARM64_T8140;
 kernelcache SHA256
