@@ -22,11 +22,16 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--check-only', action='store_true')
     parser.add_argument('--wake-after', type=int, metavar='SECONDS')
+    parser.add_argument('--screen-directory', type=Path,
+                        help='screen-sleep window control directory (explicit visual test)')
     args = parser.parse_args()
     if os.geteuid():
         parser.error('root is required')
     if args.wake_after is not None and not 5 <= args.wake_after <= 3600:
         parser.error('--wake-after must be between 5 and 3600 seconds')
+    screen_delay = 2 if args.screen_directory else 0
+    if args.wake_after is not None and args.wake_after + screen_delay > 3600:
+        parser.error('sleep plus the screen prelude must fit the one-hour RTC limit')
     spec = importlib.util.spec_from_file_location('neo_pm', Path(__file__).with_name('pm-test.py'))
     pm = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(pm)
@@ -88,17 +93,43 @@ def main():
     old_async = pm.read('/sys/power/pm_async')
     old_debug = pm.read('/sys/power/pm_debug_messages')
     alarm_attempted = False
+
+    def screen_phase(number, name):
+        marker = args.screen_directory / 'capture' / (name + '.ready')
+        marker.unlink(missing_ok=True)
+        (args.screen_directory / 'phase').write_text(str(number) + '\n')
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                return json.loads(marker.read_text())
+            except (FileNotFoundError, json.JSONDecodeError):
+                time.sleep(.01)
+        raise RuntimeError(f'screen did not acknowledge {name}')
+
     try:
+        if args.screen_directory:
+            if (args.screen_directory / 'phase').read_text().strip() != '0':
+                raise RuntimeError('screen must be showing BEFORE SLEEP')
+            result['screen_before'] = json.loads(
+                (args.screen_directory / 'capture/before.ready').read_text())
+            os.kill(result['screen_before']['pid'], 0)
         pm.write_control('/sys/power/pm_async', '0')
         pm.write_control('/sys/power/pm_debug_messages', '1')
         if args.wake_after is not None:
             result['rtc_events_before'] = rtc_events()
             alarm_attempted = True
-            result['rtc_arm_log'] = rtc_command('-m', 'no', '-s', str(args.wake_after))
+            result['rtc_arm_log'] = rtc_command('-m', 'no', '-s',
+                                               str(args.wake_after + screen_delay))
             result['rtc_alarm_epoch'] = pm.read(rtc / 'wakealarm')
             if not result['rtc_alarm_epoch']:
                 raise RuntimeError('RTC alarm did not remain armed')
             save()
+        if args.screen_directory:
+            result['screen_entering'] = screen_phase(1, 'entering')
+            result['screen_delay_seconds'] = screen_delay
+            time.sleep(max(0, result['screen_entering']['monotonic'] + screen_delay - time.monotonic()))
+            result['screen_entering_to_suspend_seconds'] = (
+                time.monotonic() - result['screen_entering']['monotonic'])
         # Serialize against intervening wake events. Do not retry a rejection.
         wake_count = Path('/sys/power/wakeup_count').read_text().strip()
         result['wakeup_count_before'] = wake_count
@@ -130,6 +161,18 @@ def main():
         if args.wake_after is not None:
             result['timed_wake_observed'] = (result.get('rtc_events_delta', 0) > 0 and
                 args.wake_after - 2 <= result.get('boottime_elapsed_seconds', 0) <= args.wake_after + 30)
+        if args.screen_directory:
+            try:
+                if (result['status'] == 'returned' and result['all_cpus_entered_s2idle'] and
+                        result.get('timed_wake_observed', True)):
+                    result['screen_after'] = screen_phase(2, 'after')
+                    for key in ('pid', 'context'):
+                        if result['screen_after'][key] != result['screen_before'][key]:
+                            raise RuntimeError(f'screen {key} changed across sleep')
+                else:
+                    screen_phase(4, 'failed')
+            except Exception as error:
+                result.update(status='error', screen_error=str(error))
         save()
     print(json.dumps({k: v for k, v in result.items() if k not in ('before', 'after')}))
     return int(result['status'] != 'returned' or not result['all_cpus_entered_s2idle'] or
