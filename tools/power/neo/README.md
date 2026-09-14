@@ -52,7 +52,17 @@ individual suspend/resume qualification before a complete sleep cycle.
 ## Experimental CPU idle
 
 The optional `cpuidle_apple.neo=1` kernel parameter registers `apple_neo_idle`
-on J700. Without it, the working architectural idle fallback remains in use.
+on J700. Without it, the working architectural idle fallback remains in use
+and the platform device stays unbound. Prefer activation after userspace starts
+so a separate SSH session can retain the kernel log:
+
+```sh
+echo Y > /sys/module/cpuidle_apple/parameters/neo
+echo cpuidle-apple > /sys/bus/platform/drivers/cpuidle-apple/bind
+```
+
+The `neo` parameter gates binding; clearing it does not unregister an already
+bound driver. Use each CPU's state-disable attributes to stop WFI experiments.
 The driver offers POLL plus the existing state-preserving WFI sequence. WFI
 starts disabled on each CPU: after boot, write `0` to that CPU's
 `cpuidle/state1/disable` attribute to qualify it individually. A separate
@@ -62,6 +72,10 @@ framework registration from the expanded CPU PM transition. The driver does not
 use the older Apple driver's
 locked CYC_OVRD register. Its latency/residency values are initial governor
 estimates, not measured hardware guarantees or proof of power-down depth.
+
+The `neo_cpu_pm` parameter can also be changed after boot. Disable the WFI
+states first to keep experiments separate. Each entry snapshots that setting
+so its CPU PM entry and exit notifications remain paired.
 
 Before enabling it routinely, check all six CPUs, integer and vector canaries,
 timer wakeups, migration/IPIs, idle accounting and the desktop. CPU PM also

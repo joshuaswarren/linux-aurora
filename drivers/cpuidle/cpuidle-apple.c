@@ -14,11 +14,11 @@
 
 /* Keep the qualified arch idle fallback until CPU PM is validated on J700. */
 static bool neo_cpuidle;
-module_param_named(neo, neo_cpuidle, bool, 0444);
-MODULE_PARM_DESC(neo, "Enable experimental J700 CPU PM idle (default off)");
+module_param_named(neo, neo_cpuidle, bool, 0644);
+MODULE_PARM_DESC(neo, "Allow experimental J700 cpuidle driver binding (default off)");
 
 static bool neo_cpu_pm;
-module_param_named(neo_cpu_pm, neo_cpu_pm, bool, 0444);
+module_param_named(neo_cpu_pm, neo_cpu_pm, bool, 0644);
 MODULE_PARM_DESC(neo_cpu_pm, "Include CPU PM callbacks in J700 idle qualification");
 
 enum idle_state {
@@ -134,10 +134,11 @@ static struct cpuidle_driver apple_idle_driver = {
 static __cpuidle int apple_neo_enter_wfi(struct cpuidle_device *dev,
 				       struct cpuidle_driver *drv, int index)
 {
+	bool notify = READ_ONCE(neo_cpu_pm);
 	int ret;
 
 	/* Qualify CPU PM separately from the existing state-preserving WFI. */
-	if (neo_cpu_pm) {
+	if (notify) {
 		/* Notify context owners while RCU is still watching this CPU. */
 		ret = cpu_pm_enter();
 		if (ret)
@@ -151,7 +152,7 @@ static __cpuidle int apple_neo_enter_wfi(struct cpuidle_device *dev,
 	 */
 	cpu_do_idle();
 	ct_cpuidle_exit();
-	if (neo_cpu_pm)
+	if (notify)
 		cpu_pm_exit();
 
 	return index;
@@ -181,6 +182,10 @@ static struct cpuidle_driver apple_neo_idle_driver = {
 static int apple_cpuidle_probe(struct platform_device *pdev)
 {
 	if (of_machine_is_compatible("apple,j700")) {
+		/* Leave an unbound device for controlled activation after boot. */
+		if (!READ_ONCE(neo_cpuidle))
+			return -ENODEV;
+
 		/* A nonzero state index also permits tick-freezing during s2idle. */
 		cpuidle_poll_state_init(&apple_neo_idle_driver);
 		return cpuidle_register(&apple_neo_idle_driver, NULL);
@@ -206,9 +211,6 @@ static int __init apple_cpuidle_init(void)
 		return ret;
 
 	if (!of_machine_is_compatible("apple,arm-platform"))
-		return 0;
-
-	if (of_machine_is_compatible("apple,j700") && !neo_cpuidle)
 		return 0;
 
 	if (!(of_machine_is_compatible("apple,j700") ||
