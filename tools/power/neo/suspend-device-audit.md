@@ -36,3 +36,10 @@ Continue with one device or dependency group at a time. Require returned
 callbacks, preserved data/context, functional work after wake, and measured
 battery reduction before removing its retention safeguard. Disabling every
 domain together would lose the evidence needed to locate a failed wake.
+
+Future `pm-test.py` snapshots also retain `/proc/interrupts`, `/proc/softirqs`,
+`/proc/stat`, and display callback counters at the endpoints. These help
+identify IRQ activity and CPU accounting without a sampling timer during
+sleep. The initial 10-second capture predates those additional fields; its
+timekeeping log shows repeated short returns to s2idle but does not identify
+their interrupt source. Do not infer the source from the interval alone.
