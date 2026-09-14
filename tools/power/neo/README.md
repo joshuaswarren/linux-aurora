@@ -57,9 +57,14 @@ and the platform device stays unbound. Prefer activation after userspace starts
 so a separate SSH session can retain the kernel log:
 
 ```sh
+echo 5 > /sys/module/cpuidle_apple/parameters/neo_cpu
 echo Y > /sys/module/cpuidle_apple/parameters/neo
 echo cpuidle-apple > /sys/bus/platform/drivers/cpuidle-apple/bind
 ```
+
+This example registers only CPU 5, leaving the other CPUs on the architectural
+fallback. `neo_cpu=-1` selects all CPUs. The selection applies at bind time;
+unbind the driver before selecting another CPU and binding again.
 
 The `neo` parameter gates binding; clearing it does not unregister an already
 bound driver. Use each CPU's state-disable attributes to stop WFI experiments.

@@ -21,6 +21,11 @@ static bool neo_cpu_pm;
 module_param_named(neo_cpu_pm, neo_cpu_pm, bool, 0644);
 MODULE_PARM_DESC(neo_cpu_pm, "Include CPU PM callbacks in J700 idle qualification");
 
+static int neo_cpu = -1;
+static cpumask_t neo_cpumask;
+module_param_named(neo_cpu, neo_cpu, int, 0644);
+MODULE_PARM_DESC(neo_cpu, "J700 CPU to register at bind time (-1 for all CPUs)");
+
 enum idle_state {
 	STATE_WFI,
 	STATE_PWRDOWN,
@@ -181,17 +186,36 @@ static struct cpuidle_driver apple_neo_idle_driver = {
 
 static int apple_cpuidle_probe(struct platform_device *pdev)
 {
+	struct cpuidle_driver *drv = &apple_idle_driver;
+	int ret;
+
 	if (of_machine_is_compatible("apple,j700")) {
+		int cpu = READ_ONCE(neo_cpu);
+
 		/* Leave an unbound device for controlled activation after boot. */
 		if (!READ_ONCE(neo_cpuidle))
 			return -ENODEV;
+		if (cpu < -1 || cpu >= nr_cpu_ids || (cpu >= 0 && !cpu_online(cpu)))
+			return -EINVAL;
 
 		/* A nonzero state index also permits tick-freezing during s2idle. */
 		cpuidle_poll_state_init(&apple_neo_idle_driver);
-		return cpuidle_register(&apple_neo_idle_driver, NULL);
+		drv = &apple_neo_idle_driver;
+		cpumask_copy(&neo_cpumask, cpu < 0 ? cpu_possible_mask : cpumask_of(cpu));
+		drv->cpumask = &neo_cpumask;
+		dev_info(&pdev->dev, "Registering idle CPUs %*pbl, WFI initially disabled\n",
+			 cpumask_pr_args(drv->cpumask));
 	}
 
-	return cpuidle_register(&apple_idle_driver, NULL);
+	ret = cpuidle_register(drv, NULL);
+	if (!ret)
+		platform_set_drvdata(pdev, drv);
+	return ret;
+}
+
+static void apple_cpuidle_remove(struct platform_device *pdev)
+{
+	cpuidle_unregister(platform_get_drvdata(pdev));
 }
 
 static struct platform_driver apple_cpuidle_driver = {
@@ -199,6 +223,7 @@ static struct platform_driver apple_cpuidle_driver = {
 		.name = "cpuidle-apple",
 	},
 	.probe = apple_cpuidle_probe,
+	.remove = apple_cpuidle_remove,
 };
 
 static int __init apple_cpuidle_init(void)
