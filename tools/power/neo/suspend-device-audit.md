@@ -6,6 +6,11 @@ saved `display-sleep-10-01/result.json` (before/after kernel logs) under
 `artifacts/neo-suspend/display/`. This is an audit of the current retained
 s2idle path, not a list of measured component wattages.
 
+See `component-power.md` for the subsequent SMC telemetry, noirq interrupt
+measurements, native DCP/PMP/Wi-Fi analysis, GPU idle-policy distinction and
+negative PCIe L1.2 power experiment. Wi-Fi is now a measured recurring
+interrupt source; none of the four components yet has isolated wattage.
+
 | Component | Current behavior | Remaining work |
 | --- | --- | --- |
 | Backlight and LCD enable | SMC `pmBL=0`, then `gP16=0`; reverse sequence on resume | Repeat long sleep measurements; integrate the qualified controls with the eventual panel driver |
