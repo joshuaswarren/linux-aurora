@@ -67,3 +67,33 @@ one, all CPUs entered s2idle, and the display restored. This establishes
 host-interface quiescence, not firmware ownership or a wattage saving.
 Captures are in workspace `artifacts/neo-suspend/wifi-hif/`; the manifest
 retains binary identities and the installation script saved the previous slot.
+
+## Separate firmware-ownership experiment
+
+`fw_own_s2idle=1` additionally requires `hif_s2idle=1`. After the successful
+HIF acknowledgement it requires all TX descriptors/tokens and calibration
+requests to be retired. IRQ service is synchronized and masked before the
+always-on register ownership request. It waits up to 500 ms for firmware
+ownership acknowledgement. PCI remains D0 and every DMA allocation remains
+pinned; neither device reset nor ring reconstruction is attempted.
+
+Resume, including rollback from a failed ownership request, first requests
+driver ownership through the always-on register and checks bit 2 cleared.
+Only then does it restore IRQ service and send the HIF resume command. Failed
+ownership recovery leaves the IRQ disabled, blocks command submission, skips
+transport MMIO diagnostics and fails the netdev rather than accessing gated
+registers. Deferred calibration is held across the HIF interval and scheduled
+again after an acknowledged resume. This switch is off by default and still
+requires hardware qualification.
+
+Native reference `wifi-own-exact.dis` retains the symbol-bounded ownership
+and IRQ functions. `_nicpmSetFWOwn` and `_nicpmSetDriverOwn` are tail branches
+to `_halSetFWOwn` and `_halSetDriverOwn`, not empty implementations.
+
+The same-kernel three-minute comparison completed both cycles and Wi-Fi
+reconnected after each. Calibrated accumulated-counter estimates were
+0.82113 W retained-only and 0.84469 W HIF-only; **no power saving established**.
+Noirq Wi-Fi counts changed from 364/180.060 s to 0/180.092 s. Eliminating these
+interrupts alone did not lower total battery power. The new awake calibration
+was 3.588375 raw units/uAh; the capacity gauge misleadingly implied 2.64 W
+and 6.19 W respectively. Full calculation: `wifi-hif/power-comparison.json`.
