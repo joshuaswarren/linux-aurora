@@ -22,20 +22,20 @@
 //! * **The timebase is derived, not assumed.** Occupancy is a ratio of two
 //!   spans in the same tick domain, so it needs no conversion at all, and the
 //!   report also divides the observed tick span by the observed nanosecond
-//!   span to state the tick rate it measured. `g17_drm::base_clock_hz` and
-//!   `file::get_time` both say 24 MHz; a report whose `tick_khz` comes back
-//!   near 24000 confirms that on hardware rather than trusting it.
+//!   span to state the tick rate it measured. The completion path publishes
+//!   these timestamps as 24 MHz ticks (`g17_job::G17P_COMMAND_TIMESTAMP_HZ`);
+//!   a report whose `tick_khz` comes back near 24000 confirms that on
+//!   hardware rather than trusting it.
 //!
 //! Every arithmetic path below stays inside `u64`. The kernel has no
 //! 128-bit division helper, so a `u128` divide would fail to link.
 
 /// Nominal GPU timestamp rate, in kHz.
 ///
-/// Grounded in this driver, not guessed: `G17PDrmGpu::base_clock_hz()` returns
-/// 24_000_000 and `file::get_time` scales a raw `CNTPCT_EL0` read by exactly
-/// that to answer `DRM_IOCTL_ASAHI_GET_TIME`. The render pass envelope comes
-/// from the same counter. `SubmitReport::tick_khz` re-derives the rate from
-/// each window so a wrong constant is visible instead of silent.
+/// The render pass envelope uses firmware's 24 MHz command-time counter, the
+/// rate `g17_job::G17P_COMMAND_TIMESTAMP_HZ` converts to UAPI nanoseconds.
+/// `SubmitReport::tick_khz` re-derives the rate from each window so a wrong
+/// constant is visible instead of silent.
 pub(crate) const NOMINAL_TICK_KHZ: u64 = 24_000;
 
 /// Backoff schedule for a completion poll loop.
