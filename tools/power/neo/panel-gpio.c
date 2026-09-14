@@ -36,7 +36,7 @@ int main(int argc, char **argv)
 	struct timespec delay = { .tv_sec = 1 };
 	char compatible[32], *end;
 	unsigned long seconds = 0;
-	int chipfd, fd, before, ret = 1;
+	int chipfd, fd, before, off, ret = 1;
 	FILE *f;
 
 	setbuf(stdout, NULL);
@@ -103,7 +103,12 @@ int main(int argc, char **argv)
 		perror("set LCD off");
 		goto restore;
 	}
-	printf("off readback=%d\n", value(fd, 0, 0));
+	off = value(fd, 0, 0);
+	printf("off readback=%d\n", off);
+	if (off != 0) {
+		fprintf(stderr, "LCD-enable did not read back low\n");
+		goto restore;
+	}
 	for (unsigned long i = 0; i < seconds && !stopped; i++)
 		nanosleep(&delay, NULL);
 	ret = 0;
