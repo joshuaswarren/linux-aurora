@@ -61,12 +61,12 @@ def main():
         touched = True
         (DRIVER / 'unbind').write_text(GPU + '\n')
         deadline = time.monotonic() + 10
-        while DOMAIN.read_text().strip() != 'off' and time.monotonic() < deadline:
+        while DOMAIN.read_text().strip() != 'off-0' and time.monotonic() < deadline:
             time.sleep(.1)
         result['domain_unbound'] = DOMAIN.read_text().strip()
         capture('unbound')
         assert not (DRIVER / GPU).exists(), 'GPU is still bound'
-        assert result['domain_unbound'] == 'off', 'genpd does not establish GPU off'
+        assert result['domain_unbound'] == 'off-0', 'genpd does not establish GPU off'
         result['status'] = 'measuring'
         save()
         command = ['python3', str(Path(__file__).with_name('sleep-power.py')),
@@ -76,7 +76,7 @@ def main():
             result['sleep_returncode'] = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT).returncode
         result['domain_after_sleep'] = DOMAIN.read_text().strip()
         assert result['sleep_returncode'] == 0, 'sleep qualification failed'
-        assert result['domain_after_sleep'] == 'off', 'GPU domain changed during sleep'
+        assert result['domain_after_sleep'] == 'off-0', 'GPU domain changed during sleep'
         result['status'] = 'measured'
     except Exception as error:
         result.update(status='error', error=str(error))
