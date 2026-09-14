@@ -145,3 +145,11 @@ and one RTC interrupt. Firmware ownership was recovered and HIF resume
 acknowledged before Wi-Fi reconnected. Captures and installation identities
 are in workspace `artifacts/neo-suspend/wifi-own-tx16/`. Power measurement is
 still separate from these functional transition results.
+
+`wifi-sleep-test.py --stage devices --output NEW` wraps the functional PM
+stage and waits up to 60 seconds after return for association plus a global
+IPv4 address. `--seconds 10` instead runs real RTC/display-off sleep. Optional
+`--recovery-boot-entry dirtyroom-gpu-suspend` saves evidence and reboots if
+network recovery fails. The helper cannot recover a hung callback and does
+not claim that association/address recovery proves throughput or application
+stability. Use `sleep-power.py` separately for energy measurements.
