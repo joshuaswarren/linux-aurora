@@ -153,3 +153,12 @@ IPv4 address. `--seconds 10` instead runs real RTC/display-off sleep. Optional
 network recovery fails. The helper cannot recover a hung callback and does
 not claim that association/address recovery proves throughput or application
 stability. Use `sleep-power.py` separately for energy measurements.
+
+The first same-kernel (#26) power pair measured **0.85598 W HIF-only** versus
+**0.78120 W HIF plus firmware ownership**, a 0.07478 W (8.74%) reduction.
+Battery intervals were 181.733 and 181.780 seconds; calibration was 3.603503
+raw units/uAh. Both real sleeps and network returns passed, with zero radio
+interrupts during the firmware-owned noirq interval. This is a total-machine
+comparison, not an isolated absolute Wi-Fi wattage. The remaining-capacity
+gauge again produced implausible 2.25 W and 7.95 W estimates; the accumulated
+counter result is retained in `wifi-own-tx16/power-comparison-180.json`.
