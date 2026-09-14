@@ -216,6 +216,21 @@ callback pair and a restored final state. `sleep-power.py --mode sleep
 GPIO-only helper integration, which could not extinguish the backlight.
 Both helpers can optionally retain the existing visual phase/context test.
 
+Initial qualification on build #19 (boot `eee6042d-cc10-4c2d-8cf4-66e01a884832`):
+
+* `pm_test=devices` returned after 5.848 s, with one matched display off/on
+  callback pair and successful Wi-Fi reconnection.
+* The 10-second RTC test returned after 11.015 s boottime versus 0.753 s
+  monotonic time. All six CPUs entered s2idle; the RTC reported an alarm;
+  display counters advanced from 1/1 to 2/2, final state 1. Kernel suspend
+  failure count remained zero.
+
+Captures: `display-pm-devices-01/` and `display-sleep-10-01/` beneath the
+workspace display artifacts directory. Module SHA256:
+`17ee7f6e12ce0146993d46abef27420e1e64a62f8342f270d7c8c4a320481309`.
+These checks establish the returned display/RTC sequence, not full SoC
+power collapse or long-term desktop stability.
+
 The earlier DWI WLED trial (`overlay/neo-dwi-trial.c`, `dwi-power-step.py`)
 completed native version-1 immediate commands at 1024, zero, and 1024, but
 power remained 3.58 W at every level. It is not a J700 backlight driver.
