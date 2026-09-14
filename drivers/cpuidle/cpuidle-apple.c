@@ -202,7 +202,8 @@ static int apple_cpuidle_probe(struct platform_device *pdev)
 		/* Leave an unbound device for controlled activation after boot. */
 		if (!READ_ONCE(neo_cpuidle))
 			return -ENODEV;
-		if (cpu < -1 || cpu >= nr_cpu_ids || (cpu >= 0 && !cpu_online(cpu)))
+		if (cpu < -1 || (cpu >= 0 &&
+				(cpu >= nr_cpu_ids || !cpu_online(cpu))))
 			return -EINVAL;
 
 		/* A nonzero state index also permits tick-freezing during s2idle. */
