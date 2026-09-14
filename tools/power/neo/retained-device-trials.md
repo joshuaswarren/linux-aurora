@@ -89,3 +89,7 @@ Set `/sys/module/printk/parameters/console_suspend` to `Y` before qualification.
 The previous boot's journal ended at module probe because journald was frozen;
 `display-clock-isolation/platform/result.json` remains `running` and is retained
 unchanged. Recovery returned to the normal #6 kernel, battery 21%.
+
+The console-suspended depth-1 repeat also lost connectivity and required
+DebugUSB reset. Console suspension is necessary isolation hygiene, but did
+not resolve this hang. No deeper display clock depth has been attempted.
