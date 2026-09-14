@@ -52,6 +52,7 @@ def snapshot():
              "/sys/module/printk/parameters/console_suspend",
              "/sys/kernel/debug/apple-pmp-v2/status",
              "/sys/kernel/debug/apple-pmp-v2/thermal_status",
+             "/sys/bus/platform/devices/412e00000.neo-dcp-retained/status",
              "/sys/kernel/debug/neo-sleep-irqs/stats",
              "/sys/kernel/debug/neo-pmgr-snapshot/stats",
              "/sys/kernel/debug/neo-smc-power/raw",
@@ -69,6 +70,7 @@ def snapshot():
                     "/sys/devices/system/cpu/cpu*/cpuidle/state*/usage",
                     "/sys/devices/system/cpu/cpu*/cpuidle/state*/s2idle/usage",
                     "/sys/module/neo_display_sleep/parameters/*",
+                    "/sys/module/neo_dcp_retained/parameters/*",
                     "/sys/module/mt7932_fullmac/parameters/*",
                     "/sys/bus/platform/devices/macsmc-input/power/wakeup"):
         paths.extend(str(p) for p in Path('/').glob(pattern.lstrip('/')) if p.is_file())
@@ -78,11 +80,17 @@ def snapshot():
 
 
 def check_firmware_health(capture):
-    status = capture['files'].get('/sys/kernel/debug/apple-pmp-v2/status')
-    if isinstance(status, str):
-        failed = re.search(r'\bfailed=(\d+)\b', status)
-        if failed and int(failed[1]):
-            raise RuntimeError('PMP firmware epoch failed; a returned PM write is not successful recovery')
+    for name, path in (
+        ('PMP', '/sys/kernel/debug/apple-pmp-v2/status'),
+        ('DCP', '/sys/bus/platform/devices/412e00000.neo-dcp-retained/status'),
+    ):
+        status = capture['files'].get(path)
+        if isinstance(status, str):
+            failed = re.search(r'\bfailed=(\d+)\b', status)
+            if failed and int(failed[1]):
+                raise RuntimeError(f'{name} firmware epoch failed; a returned PM write is not successful recovery')
+            if name == 'DCP' and re.search(r'\b(?:touched|clocks_touched)=[1-9]', status):
+                raise RuntimeError('DCP firmware transition has not been restored')
 
 
 def main():
