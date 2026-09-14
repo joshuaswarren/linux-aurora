@@ -5,7 +5,9 @@
 Build fpsimd-test, ssve-test, za-test and zt-test from selftests/arm64/fp first.
 SIGSTOP/SIGCONT retains streaming state without relying on a syscall ABI which
 clears streaming mode. State usage deltas must be checked separately to show
-that a particular CPU idle state was actually exercised.
+that a particular CPU idle state was actually exercised, or use --idle-state
+to require a positive usage delta during each test. A delta establishes that
+the state was used during the test, not that every stopped interval entered it.
 """
 import argparse
 import hashlib
@@ -35,18 +37,32 @@ def main():
     parser.add_argument('--tests', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--cycles', type=int, default=20)
+    parser.add_argument('--idle-state', type=int,
+                        help='require this cpuidle state to be exercised by each test')
     args = parser.parse_args()
     if args.cpu not in os.sched_getaffinity(0) or args.cycles <= 0:
         parser.error('select an available CPU and a positive cycle count')
+    state = None
+    if args.idle_state is not None:
+        if args.idle_state < 0:
+            parser.error('idle state must be nonnegative')
+        state = Path(f'/sys/devices/system/cpu/cpu{args.cpu}/cpuidle/state{args.idle_state}')
+        if not state.is_dir() or (state / 'disable').read_text().strip() != '0':
+            parser.error('the selected cpuidle state must exist and be enabled')
     args.output.mkdir(parents=True, exist_ok=False)
     results = {'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
                'kernel': Path('/proc/version').read_text().strip(),
                'cpu': args.cpu, 'tests': []}
+    if state is not None:
+        results['idle_state'] = {'index': args.idle_state,
+                                 'name': (state / 'name').read_text().strip()}
     failed = False
     for name in ('fpsimd-test', 'ssve-test', 'za-test', 'zt-test'):
         binary = (args.tests / name).resolve()
         record = {'name': name, 'sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
                   'cycles': 0, 'status': 'running'}
+        if state is not None:
+            record['idle_usage_before'] = int((state / 'usage').read_text())
         results['tests'].append(record)
         result_path = args.output / 'result.json'
         result_path.write_text(json.dumps(results, indent=2) + '\n')
@@ -75,6 +91,12 @@ def main():
                 output = log_path.read_text(errors='replace')
                 record['status'] = ('pass' if record['returncode'] == 0 and
                                     'no error' in output else 'fail')
+                if state is not None:
+                    record['idle_usage_after'] = int((state / 'usage').read_text())
+                    record['idle_entries'] = (record['idle_usage_after'] -
+                                              record['idle_usage_before'])
+                    if record['idle_entries'] <= 0:
+                        record.update(status='fail', error='selected idle state was not exercised')
             except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
                 record.update(status='fail', error=str(error))
             finally:
