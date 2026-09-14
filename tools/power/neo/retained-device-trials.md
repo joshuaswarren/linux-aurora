@@ -146,3 +146,51 @@ retained normally and 0.76722 W with acknowledged firmware idle. The initial
 PMP's PMGR word remained `0x1f0f03ff`; firmware WFI is not a full domain power
 gate. GFX actual remained zero; Wi-Fi and PMP IRQ counts stayed unchanged
 across the noirq intervals. Captures: `pmp-wfi-apwake/`.
+
+The next 180-second PMP-idle repeat woke via RTC and acknowledged AP/IOP ON,
+but DART retention admission returned -EBUSY and latched the epoch failed.
+The helper correctly rejected power for this run and skipped the reference
+repeat. Therefore the 22 mW reduction remains provisional, and #32 is not yet
+qualified for reliable repeated sleep. Both PMGR gates read ACTIVE afterward
+(PMP `0x1f0f03ff`, PMP-DART `0x1f0003ff`).
+
+The follow-up polls the always-accessible PMGR for up to 10 ms when an
+ACTIVE-target gate has not reached ACTIVE. It retains the ACTIVE requirement,
+rejects unexpected targets/reset/disable, does not write power registers,
+and only then reads DART/APF state. Captures now include PMP-DART's gate.
+A timeout still fails the epoch. This tests a transient gate hypothesis;
+the initial failed sample was not logged by #32.
+
+Kernel #33 (`aa1d9a9e7`, Image SHA256
+`f193cee4338ec23e92363cc260e8b6c2e46d874311998ccd610514acd6a9f4b3`)
+passed six consecutive 10-second RTC cycles with PMP firmware idle. All six
+CPUs entered s2idle, the panel restored, and PMP retained health after every
+cycle. None of these six cycles needed the new gate wait, so they do not yet
+prove that the intermittent gate failure is fixed. Longer paired measurements
+are required. Captures: `pmp-gate-wait/short-00` through `short-05`.
+
+## DCP crash capture and missing logging endpoint
+
+The #32 awake-wake trial's requested buffer at DVA `0x10008784000`, size
+`0x26000`, was captured read-only through the inherited DCP DART at
+`0x412340000`, SID 23. No DART control, table or firmware writes were made.
+The three display PMGR gates were ACTIVE before inspection. The exact capture
+SHA256 is `934a0535c617927c2ca130ac3cab7f9c36bc5c64434e269bbfdf76322c0dcbed`.
+Translation and binary are retained under `dcp-retained/`.
+
+The HGLC container includes a version-0x303 CLHE record at offset `0x1000`:
+`ASSERT!platform_logging_common.cpp:406 MBI_ENDPOINT_BUILT_IN_OSLOG not enabled!`
+The Cver UUID matches the analyzed DCP firmware; its explicit slide is
+`0x3b0000`. Subtract that slide from captured stack addresses before looking
+them up. The final entry in the primary mailbox history is our AP-ON request
+`0x00b0000000000020`. The firmware function at unslid `0x040179c4` checks
+the first AP transition from internal 0x20 to 0x21 and asserts unless the
+endpoint handle at `0x044d03d8` (endpoint 8) is enabled. This is an awake
+handshake failure, independent of attempting a DCP clock gate.
+
+`native/rtkit-crash-sections.py` retains bounded nested record offsets, UUIDs,
+slides, messages and raw mailbox history. The trial module now requires an
+explicit `start_oslog` write before AP wake or sleep; it queues endpoint 8
+only. It still refuses new shared buffers and latches failures. A queued
+endpoint start is not evidence of completed buffer negotiation or healthy
+firmware wake. Test these while awake before any sleep/clock experiment.
