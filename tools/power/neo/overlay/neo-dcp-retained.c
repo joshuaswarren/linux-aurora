@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Inherited J700 DCP management-only qualification, no display/DMA takeover.
- * No endpoint start, firmware reset, mapping change or new shared buffer.
+ * Explicit OSLOG endpoint start is available for awake qualification. No
+ * firmware reset, mapping change or new shared buffer.
  * Pins itself after adoption: remove the trial by reboot, not forced unload.
  */
 #include <linux/console.h>
@@ -34,6 +35,7 @@ struct neo_dcp {
 	struct mutex lock;
 	atomic_t failed;
 	bool touched;
+	bool oslog_started;
 	u32 sleeps, wakes;
 	struct regmap *pmgr;
 	bool stopped;
@@ -97,6 +99,9 @@ static int wake_dcp(struct neo_dcp *d)
 {
 	int ret;
 
+	/* J700's first AP-ON callback asserts if endpoint 8 is not enabled. */
+	if (!d->oslog_started)
+		return -EAGAIN;
 	while (d->clocks_touched) {
 		ret = set_clock(d, d->clocks_touched - 1, true);
 		if (ret) {
@@ -133,10 +138,28 @@ static ssize_t status_show(struct device *dev, struct device_attribute *a, char 
 	if (d->clocks_touched)
 		return sysfs_emit(buf, "failed=%d clocks_touched=%u (no gated ASC read)\n",
 			atomic_read(&d->failed), d->clocks_touched);
-	return sysfs_emit(buf, "failed=%d touched=%u sleeps=%u wakes=%u control=%#x status=%#x requested_iova=%#llx requested_size=%#zx\n",
+	return sysfs_emit(buf, "failed=%d touched=%u sleeps=%u wakes=%u control=%#x status=%#x requested_iova=%#llx requested_size=%#zx oslog_started=%u\n",
 		atomic_read(&d->failed), d->touched, d->sleeps, d->wakes,
 		readl(d->control + 0x44), readl(d->control + 0x48),
-		d->requested_iova, d->requested_size);
+		d->requested_iova, d->requested_size, d->oslog_started);
+}
+static ssize_t start_oslog_store(struct device *dev, struct device_attribute *a,
+				const char *buf, size_t count)
+{
+	struct neo_dcp *d = dev_get_drvdata(dev);
+	int ret;
+
+	if (!sysfs_streq(buf, "1"))
+		return -EINVAL;
+	guard(mutex)(&d->lock);
+	if (atomic_read(&d->failed) || d->touched || d->oslog_started)
+		return -EBUSY;
+	ret = apple_rtkit_start_ep(d->rtk, 8);
+	if (ret)
+		return ret;
+	d->oslog_started = true;
+	dev_info(dev, "OSLOG start queued; buffer/awake-wake qualification still required\n");
+	return count;
 }
 static ssize_t wake_store(struct device *dev, struct device_attribute *a, const char *buf, size_t count)
 {
@@ -153,7 +176,10 @@ static ssize_t wake_store(struct device *dev, struct device_attribute *a, const 
 }
 static DEVICE_ATTR_RO(status);
 static DEVICE_ATTR_WO(wake);
-static struct attribute *neo_dcp_attrs[] = { &dev_attr_status.attr, &dev_attr_wake.attr, NULL };
+static DEVICE_ATTR_WO(start_oslog);
+static struct attribute *neo_dcp_attrs[] = {
+	&dev_attr_status.attr, &dev_attr_wake.attr, &dev_attr_start_oslog.attr, NULL
+};
 ATTRIBUTE_GROUPS(neo_dcp);
 
 static int dcp_suspend(struct device *dev)
@@ -171,6 +197,8 @@ static int dcp_suspend(struct device *dev)
 		return -EBUSY;
 	if (atomic_read(&d->failed) || d->touched)
 		return -EIO;
+	if (!d->oslog_started || !d->wakes)
+		return -EAGAIN;
 	if (depth > 3 || (depth && !stop))
 		return -EINVAL;
 	for (i = 0; i < depth; i++) {
