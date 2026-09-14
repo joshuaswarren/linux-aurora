@@ -2629,8 +2629,6 @@ impl G17PManagerConstruction {
                     // user command buffers allocate from the session owner
                     // below and are not advanced by this bootstrap object.
                     [0, 1],
-                    [0; 4],
-                    KVec::new(),
                     0,
                     pm_generation.map(|plan| plan.0),
                     &mut no_retained_sksm_backing,
@@ -4975,8 +4973,6 @@ impl G17PManagerConstruction {
         queue_pair: g17_resources::G17PRenderQueuePair,
         execution_context: Arc<mmu::T8140ComputeExecutionContext>,
         command: &g17_uapi::TranslatedRenderCommand,
-        user_timestamps: [u64; 4],
-        user_timestamp_aliases: KVec<mmu::KernelMapping>,
         registers: &regs::Resources,
         registration_power: &mut impl FnMut(&mut Self) -> Result,
     ) -> Result<g17_submission::PreparedG17PPartialOpeningWorkPair> {
@@ -5062,8 +5058,6 @@ impl G17PManagerConstruction {
             &command,
             parameter_buffer_token,
             [command_buffer_state_word; 2],
-            user_timestamps,
-            user_timestamp_aliases,
             registers,
             registration_power,
         );
@@ -5091,8 +5085,6 @@ impl G17PManagerConstruction {
         command: &g17_uapi::TranslatedRenderCommand,
         parameter_buffer_token: u64,
         command_buffer_state_words: [u32; 2],
-        user_timestamps: [u64; 4],
-        user_timestamp_aliases: KVec<mmu::KernelMapping>,
         registers: &regs::Resources,
         registration_power: &mut impl FnMut(&mut Self) -> Result,
     ) -> Result<g17_submission::PreparedG17PPartialOpeningWorkPair> {
@@ -5211,8 +5203,6 @@ impl G17PManagerConstruction {
                     command,
                     self.num_clusters,
                     command_buffer_state_words,
-                    user_timestamps,
-                    Some(user_timestamp_aliases),
                     self.render_submission_ordinal,
                 )
                 .map_err(|error| Self::render_stage_fail("restage-command", error))?;
@@ -5245,8 +5235,6 @@ impl G17PManagerConstruction {
                 command,
                 self.num_clusters,
                 command_buffer_state_words,
-                user_timestamps,
-                user_timestamp_aliases,
                 self.render_submission_ordinal,
                 pm_generation.map(|plan| plan.0),
                 &mut retained_sksm_backing,
@@ -5298,8 +5286,6 @@ impl G17PManagerConstruction {
                         command,
                         self.num_clusters,
                         command_buffer_state_words,
-                        user_timestamps,
-                        None,
                         self.render_submission_ordinal,
                     )
                     .map_err(|error| Self::render_stage_fail("restage-new-vm-command", error))?;

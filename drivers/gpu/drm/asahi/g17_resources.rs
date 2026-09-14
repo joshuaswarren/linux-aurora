@@ -3639,7 +3639,6 @@ pub(crate) struct G17PUserRenderStorage {
     /// context-base +0x1a8000; it is not a subpage of generic render state.
     fragment_status: MappedObject,
     timestamps: MappedObject,
-    user_timestamp_aliases: KVec<mmu::KernelMapping>,
     fragment_mcache: Option<g17_submission::G17PClMcacheAperture>,
     tiling_mcache: Option<g17_submission::G17PClMcacheAperture>,
     /// HardwareBufferID owned by the currently staged TA command.  Retained
@@ -6679,8 +6678,6 @@ impl G17PUserRenderStorage {
         command: &g17_uapi::TranslatedRenderCommand,
         num_clusters: u32,
         owner_pid: u32,
-        user_timestamps: [u64; 4],
-        user_timestamp_aliases: KVec<mmu::KernelMapping>,
         command_context: G17PRenderCommandContext,
         descriptor_context_id: u16,
         render_root_slot: u8,
@@ -7173,12 +7170,8 @@ impl G17PUserRenderStorage {
         // start/end timestamps was still abandoned after 2000 polls.
         translated.parameters.ta_timestamp_start = timestamp_va;
         translated.parameters.ta_timestamp_end = 0;
-        translated.parameters.ta_user_timestamp_start = user_timestamps[0];
-        translated.parameters.ta_user_timestamp_end = user_timestamps[1];
         translated.parameters.fragment_timestamp_start = timestamp_va;
         translated.parameters.fragment_timestamp_end = timestamp_va + 8;
-        translated.parameters.fragment_user_timestamp_start = user_timestamps[2];
-        translated.parameters.fragment_user_timestamp_end = user_timestamps[3];
         let lifecycle_predecessor = g17p_allocate_object_id()?;
         let (fragment_lifecycle, tiling_lifecycle) =
             g17p_allocate_render_lifecycle_pair(lifecycle_predecessor)?;
@@ -7827,7 +7820,6 @@ impl G17PUserRenderStorage {
             fragment_status_low: fragment_status_low_info,
             fragment_status,
             timestamps,
-            user_timestamp_aliases,
             fragment_mcache,
             tiling_mcache,
             ta_hardware_buffer_id: translated.parameters.ta_hardware_buffer_id,
@@ -8263,8 +8255,6 @@ impl G17PUserRenderStorage {
         command: &g17_uapi::TranslatedRenderCommand,
         num_clusters: u32,
         command_buffer_state_words: [u32; 2],
-        user_timestamps: [u64; 4],
-        user_timestamp_aliases: Option<KVec<mmu::KernelMapping>>,
         submission_ordinal: u32,
     ) -> Result {
         macro_rules! restage_step {
@@ -8461,12 +8451,8 @@ impl G17PUserRenderStorage {
         // start/end timestamps was still abandoned after 2000 polls.
         translated.parameters.ta_timestamp_start = timestamp_va;
         translated.parameters.ta_timestamp_end = 0;
-        translated.parameters.ta_user_timestamp_start = user_timestamps[0];
-        translated.parameters.ta_user_timestamp_end = user_timestamps[1];
         translated.parameters.fragment_timestamp_start = timestamp_va;
         translated.parameters.fragment_timestamp_end = timestamp_va + 8;
-        translated.parameters.fragment_user_timestamp_start = user_timestamps[2];
-        translated.parameters.fragment_user_timestamp_end = user_timestamps[3];
         let (fragment_lifecycle, tiling_lifecycle) =
             g17p_allocate_render_lifecycle_pair(self.lifecycle_predecessor)?;
         translated.parameters.fragment_lifecycle = fragment_lifecycle;
@@ -8500,14 +8486,6 @@ impl G17PUserRenderStorage {
         ) || !uat
             .kernel_vm()
             .covers_range(timestamp_va, 32, true, true)
-        {
-            return Err(EFAULT);
-        }
-        if !user_timestamp_aliases.as_ref().is_none_or(|aliases| {
-            aliases
-                .iter()
-                .all(|mapping| vm.covers_range(mapping.iova(), mapping.size() as u64, false, true))
-        })
         {
             return Err(EFAULT);
         }
@@ -8876,16 +8854,12 @@ impl G17PUserRenderStorage {
 
         self.render_layout = render_layout;
         let old_timestamps = core::mem::replace(&mut self.timestamps, next_timestamps);
-        let old_aliases = user_timestamp_aliases.map(|aliases| {
-            core::mem::replace(&mut self.user_timestamp_aliases, aliases)
-        });
         self.fragment_mcache = fragment_mcache;
         self.pool_a_record_index = u8::try_from(record_a_index)?;
         self.ta_hardware_buffer_id = translated.parameters.ta_hardware_buffer_id;
         self.descriptor_ordinal = submission_ordinal;
         self.flist_generation = g17_submission::g17p_render_flist_generation(submission_ordinal);
         self.descriptor_context_id = descriptor_context_id;
-        drop(old_aliases);
         drop(old_timestamps);
         if g17p_retain_staging() {
             self.staging_descriptors = Some(next_descriptors);
@@ -9741,17 +9715,6 @@ impl G17PUserRenderStorage {
         checks
             .into_iter()
             .find_map(|(name, ok)| if ok { None } else { Some(name) })
-            .or_else(|| {
-                if self
-                    .user_timestamp_aliases
-                    .iter()
-                    .all(|mapping| vm.covers_range(mapping.iova(), mapping.size() as u64, false, true))
-                {
-                    None
-                } else {
-                    Some("user-timestamp-aliases")
-                }
-            })
     }
 
 
@@ -15792,8 +15755,6 @@ impl G17ResourceOwner {
         command: &g17_uapi::TranslatedRenderCommand,
         num_clusters: u32,
         command_buffer_state_words: [u32; 2],
-        user_timestamps: [u64; 4],
-        user_timestamp_aliases: KVec<mmu::KernelMapping>,
         submission_ordinal: u32,
         parameter_manager_generation: Option<u64>,
         retained_sksm_backing: &mut Option<G17PRenderSksmBacking>,
@@ -15886,8 +15847,6 @@ impl G17ResourceOwner {
             &command,
             num_clusters,
             owner_pid,
-            user_timestamps,
-            user_timestamp_aliases,
             command_context,
             descriptor_context_id,
             render_root_slot,

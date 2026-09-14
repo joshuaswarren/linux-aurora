@@ -257,12 +257,8 @@ pub(crate) struct G17pRenderParameters {
     pub(crate) process_empty_tiles: bool,
     pub(crate) ta_timestamp_start: u64,
     pub(crate) ta_timestamp_end: u64,
-    pub(crate) ta_user_timestamp_start: u64,
-    pub(crate) ta_user_timestamp_end: u64,
     pub(crate) fragment_timestamp_start: u64,
     pub(crate) fragment_timestamp_end: u64,
-    pub(crate) fragment_user_timestamp_start: u64,
-    pub(crate) fragment_user_timestamp_end: u64,
     /// Write the VDM control-stream register (0x1c880) as a full GPU virtual
     /// address instead of the native user-process compact form.
     ///
@@ -399,12 +395,8 @@ impl G17pRenderParameters {
             process_empty_tiles: true,
             ta_timestamp_start: 0xffff_fc20_0002_4c68,
             ta_timestamp_end: 0,
-            ta_user_timestamp_start: 0,
-            ta_user_timestamp_end: 0,
             fragment_timestamp_start: 0xffff_fc20_0002_4c68,
             fragment_timestamp_end: 0xffff_fc20_0002_4c70,
-            fragment_user_timestamp_start: 0,
-            fragment_user_timestamp_end: 0,
             absolute_pointers: false,
             bg_resource_prefix: 0,
             native_pm_bytes: false,
@@ -1164,8 +1156,9 @@ pub(crate) fn build_ta_descriptor(
     put_u8(raw, 0x094d, if parameters.native_pm_bytes { 3 } else { 1 });
     put_u64(raw, 0x08fe, parameters.ta_timestamp_start);
     put_u64(raw, 0x0906, parameters.ta_timestamp_end);
-    put_u64(raw, 0x090e, parameters.ta_user_timestamp_start);
-    put_u64(raw, 0x0916, parameters.ta_user_timestamp_end);
+    // +0x090e/+0x0916 are caller-visible timestamp destinations. Firmware
+    // writes them only inside its timestamp aperture, so they stay zero; the
+    // completion publishes the pass envelope to userspace instead.
     // AGXTAChannelSKSM::submitBuffer mirrors the same dependency/current pair
     // consumed by the TA RCE program into the firmware command. These fields
     // are deliberately unaligned in the native 0x9c0-byte command layout.
@@ -1365,8 +1358,7 @@ pub(crate) fn build_fragment_descriptor(
     put_u64(raw, 0x2168, parameters.fragment_lifecycle as u32 as u64);
     put_u64(raw, 0x2198, parameters.fragment_timestamp_start);
     put_u64(raw, 0x21a0, parameters.fragment_timestamp_end);
-    put_u64(raw, 0x21a8, parameters.fragment_user_timestamp_start);
-    put_u64(raw, 0x21b0, parameters.fragment_user_timestamp_end);
+    // +0x21a8/+0x21b0: caller-visible destinations, zero as in the TA record.
     put_u8(raw, 0x21cc, 0x53);
     put_u8(raw, 0x21d6, 1);
     put_u8(raw, 0x21e7, 1);

@@ -5258,8 +5258,6 @@ impl G17PLiveRuntime {
         defer_completion: bool,
         execution_context: Arc<mmu::T8140ComputeExecutionContext>,
         command: &g17_uapi::TranslatedRenderCommand,
-        timestamps: [u64; 4],
-        timestamp_aliases: KVec<mmu::KernelMapping>,
         completion: Arc<crate::g17_drm::G17PRenderCompletion>,
     ) -> Result {
         if !self.accepting_submissions {
@@ -5340,8 +5338,6 @@ impl G17PLiveRuntime {
             queue_pair,
             execution_context,
             command,
-            timestamps,
-            timestamp_aliases,
             &registers,
             &mut |manager| {
                 registration_powered = false;
