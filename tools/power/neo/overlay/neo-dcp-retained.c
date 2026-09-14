@@ -5,6 +5,7 @@
  */
 #include <linux/firmware.h>
 #include <linux/io.h>
+#include <linux/iopoll.h>
 #include <linux/mfd/syscon.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -15,6 +16,11 @@
 
 static bool sleep_enabled;
 module_param(sleep_enabled, bool, 0644);
+static bool stop_cpu;
+module_param(stop_cpu, bool, 0644);
+static unsigned int clock_depth;
+module_param(clock_depth, uint, 0644);
+MODULE_PARM_DESC(clock_depth, "0 retained firmware only; 1 CPU clocks, 2 plus FE, 3 plus SYS; requires stop_cpu");
 static char *firmware;
 module_param(firmware, charp, 0444);
 static int overlay_id;
@@ -28,7 +34,31 @@ struct neo_dcp {
 	atomic_t failed;
 	bool touched;
 	u32 sleeps, wakes;
+	struct regmap *pmgr;
+	bool stopped;
+	u32 saved_control, saved_clocks[3];
+	unsigned int clocks_touched;
 };
+static const unsigned int clock_offsets[] = { 0x10000, 0x318, 0x280 };
+
+static int set_clock(struct neo_dcp *d, unsigned int i, bool on)
+{
+	u32 value, target = on ? d->saved_clocks[i] & 15 : 4;
+	int ret = regmap_read(d->pmgr, clock_offsets[i], &value);
+
+	if (ret)
+		return ret;
+	value &= ~(15 | BIT(28) | BIT(11) | BIT(9) | BIT(8));
+	ret = regmap_write(d->pmgr, clock_offsets[i], value | target);
+	if (!ret)
+		ret = regmap_read_poll_timeout(d->pmgr, clock_offsets[i], value,
+			((value >> 4) & 15) == target && !(value & BIT(11)), 10, 10000);
+	if (!ret && on && (d->saved_clocks[i] & BIT(28)))
+		ret = regmap_write(d->pmgr, clock_offsets[i],
+			(value & ~(BIT(11) | BIT(9) | BIT(8))) | BIT(28));
+	dev_info(d->dev, "DCP retained clock offset=%#x target=%u result=%d\n", clock_offsets[i], target, ret);
+	return ret;
+}
 
 static int deny_shmem(void *cookie, struct apple_rtkit_shmem *buffer)
 {
@@ -59,7 +89,25 @@ static const struct apple_rtkit_ops ops = {
 
 static int wake_dcp(struct neo_dcp *d)
 {
-	int ret = apple_rtkit_unidle(d->rtk);
+	int ret;
+
+	while (d->clocks_touched) {
+		ret = set_clock(d, d->clocks_touched - 1, true);
+		if (ret) {
+			atomic_set(&d->failed, 1);
+			return ret; /* No ASC access until all its clocks are restored. */
+		}
+		d->clocks_touched--;
+	}
+	if (d->stopped) {
+		writel(d->saved_control, d->control + 0x44);
+		if (readl(d->control + 0x44) != d->saved_control) {
+			atomic_set(&d->failed, 1);
+			return -EIO;
+		}
+		d->stopped = false;
+	}
+	ret = apple_rtkit_unidle(d->rtk);
 
 	dev_info(d->dev, "DCP retained wake result=%d control=%#x status=%#x\n", ret,
 		 readl(d->control + 0x44), readl(d->control + 0x48));
@@ -76,6 +124,9 @@ static ssize_t status_show(struct device *dev, struct device_attribute *a, char 
 	struct neo_dcp *d = dev_get_drvdata(dev);
 
 	guard(mutex)(&d->lock);
+	if (d->clocks_touched)
+		return sysfs_emit(buf, "failed=%d clocks_touched=%u (no gated ASC read)\n",
+			atomic_read(&d->failed), d->clocks_touched);
 	return sysfs_emit(buf, "failed=%d touched=%u sleeps=%u wakes=%u control=%#x status=%#x\n",
 		atomic_read(&d->failed), d->touched, d->sleeps, d->wakes,
 		readl(d->control + 0x44), readl(d->control + 0x48));
@@ -101,6 +152,9 @@ ATTRIBUTE_GROUPS(neo_dcp);
 static int dcp_suspend(struct device *dev)
 {
 	struct neo_dcp *d = dev_get_drvdata(dev);
+	unsigned int depth = READ_ONCE(clock_depth), i;
+	bool stop = READ_ONCE(stop_cpu);
+	u32 value;
 	int ret;
 
 	guard(mutex)(&d->lock);
@@ -108,10 +162,35 @@ static int dcp_suspend(struct device *dev)
 		return 0;
 	if (atomic_read(&d->failed) || d->touched)
 		return -EIO;
+	if (depth > 3 || (depth && !stop))
+		return -EINVAL;
+	for (i = 0; i < depth; i++) {
+		ret = regmap_read(d->pmgr, clock_offsets[i], &d->saved_clocks[i]);
+		if (ret || (d->saved_clocks[i] & 0xff) != 0xff ||
+		    (d->saved_clocks[i] & (BIT(31) | BIT(12) | BIT(11) | BIT(10))))
+			return -EBUSY;
+	}
+	d->saved_control = readl(d->control + 0x44);
+	if (!(d->saved_control & BIT(4)))
+		return -EBUSY;
 	d->touched = true;
 	ret = apple_rtkit_idle(d->rtk);
 	dev_info(dev, "DCP retained idle result=%d control=%#x status=%#x\n", ret,
 		 readl(d->control + 0x44), readl(d->control + 0x48));
+	if (!ret && atomic_read(&d->failed))
+		ret = -EIO;
+	if (!ret && stop) {
+		d->stopped = true;
+		writel(d->saved_control & ~BIT(4), d->control + 0x44);
+		value = readl(d->control + 0x44);
+		writel(value & ~BIT(5), d->control + 0x44);
+		ret = readl_poll_timeout(d->control + 0x48, value, value & 3, 10, 10000);
+		dev_info(dev, "DCP retained ASC stop: idle=%#x result=%d\n", value, ret);
+	}
+	for (i = 0; !ret && i < depth; i++) {
+		d->clocks_touched = i + 1;
+		ret = set_clock(d, i, false);
+	}
 	if (ret)
 		wake_dcp(d);
 	else
@@ -160,6 +239,7 @@ static int probe(struct platform_device *pdev)
 	if (!d)
 		return -ENOMEM;
 	d->dev = &pdev->dev;
+	d->pmgr = pmgr;
 	mutex_init(&d->lock);
 	d->control = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(d->control))
