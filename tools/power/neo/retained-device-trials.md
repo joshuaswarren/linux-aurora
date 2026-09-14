@@ -229,3 +229,21 @@ Captures and comparison hashes: `pmp-gate-wait/{cal60,pair1.json,pair2.json}`.
 
 The user requested **120-second power intervals** for subsequent comparisons.
 Use short functional cycles first; do not default back to 10-minute runs.
+
+The existing-buffer follow-up (`2b1b654be`, module SHA256
+`ca6947c25d4cb57b55e55f397ee7f0378665e8fcb44b391c263981c7003cd5b0`)
+passed awake wake with `failed=0`. The two-page OSLOG host mapping translated
+to PA `0x101eb488000`; the original SID23 tables remained unchanged.
+
+The subsequent platform-stage test acknowledged both IDLE states (0x201),
+then sent management type 0x0c and stopped responding to AP wake. CPU_STATUS
+was `0x4e` afterward, RUN remained set. Linux, panel and Wi-Fi returned, but
+DCP remained failed/touched and the helper rejected the run. There was no
+real timed sleep or power measurement. Captures: `dcp-shmem-awake/platform/`.
+
+Native RTBuddy identifies type 0x0c as `_handlePowerIdleGated`: it sets an idle
+latch and wakes the waiting host thread, without sending a reply. Thus do not
+invent an ACK for this message. The next bounded trial uses the already-present
+ASC idle-status poll and RUN stop/start, with clock_depth=0. Generic helpers
+now capture DCP status/parameters and reject latched failure or an unrestored
+transition, rather than accepting a returned PM write as DCP recovery.
