@@ -12,6 +12,11 @@
 #include <linux/of.h>
 #include <asm/cpuidle.h>
 
+/* Keep the qualified arch idle fallback until CPU PM is validated on J700. */
+static bool neo_cpuidle;
+module_param_named(neo, neo_cpuidle, bool, 0444);
+MODULE_PARM_DESC(neo, "Enable experimental J700 CPU PM idle (default off)");
+
 enum idle_state {
 	STATE_WFI,
 	STATE_PWRDOWN,
@@ -122,8 +127,56 @@ static struct cpuidle_driver apple_idle_driver = {
 	.state_count = STATE_COUNT,
 };
 
+static __cpuidle int apple_neo_enter_wfi(struct cpuidle_device *dev,
+				       struct cpuidle_driver *drv, int index)
+{
+	int ret;
+
+	/* Notify context owners while RCU is still watching this CPU. */
+	ret = cpu_pm_enter();
+	if (ret)
+		return ret;
+
+	ct_cpuidle_enter();
+	/*
+	 * Use the same GPR/FPSIMD-preserving path as early boot. T8140 cannot
+	 * use apple_cpu_deep_wfi(): its CYC_OVRD register is locked.
+	 */
+	cpu_do_idle();
+	ct_cpuidle_exit();
+	cpu_pm_exit();
+
+	return index;
+}
+
+static struct cpuidle_driver apple_neo_idle_driver = {
+	.name = "apple_neo_idle",
+	.owner = THIS_MODULE,
+	.states = {
+		/* State 0 is initialized by cpuidle_poll_state_init(). */
+		[1] = {
+			.enter = apple_neo_enter_wfi,
+			.enter_s2idle = apple_neo_enter_wfi,
+			/* Initial governor estimates, not measured hardware limits. */
+			.exit_latency = 10,
+			.target_residency = 100,
+			.name = "WFI",
+			.desc = "State-preserving WFI",
+			.flags = CPUIDLE_FLAG_RCU_IDLE,
+		},
+	},
+	.safe_state_index = 0,
+	.state_count = 2,
+};
+
 static int apple_cpuidle_probe(struct platform_device *pdev)
 {
+	if (of_machine_is_compatible("apple,j700")) {
+		/* A nonzero state index also permits tick-freezing during s2idle. */
+		cpuidle_poll_state_init(&apple_neo_idle_driver);
+		return cpuidle_register(&apple_neo_idle_driver, NULL);
+	}
+
 	return cpuidle_register(&apple_idle_driver, NULL);
 }
 
@@ -146,7 +199,11 @@ static int __init apple_cpuidle_init(void)
 	if (!of_machine_is_compatible("apple,arm-platform"))
 		return 0;
 
-	if (!(of_machine_is_compatible("apple,t8103") ||
+	if (of_machine_is_compatible("apple,j700") && !neo_cpuidle)
+		return 0;
+
+	if (!(of_machine_is_compatible("apple,j700") ||
+	      of_machine_is_compatible("apple,t8103") ||
 	      of_machine_is_compatible("apple,t8112") ||
 	      of_machine_is_compatible("apple,t8122") ||
 	      of_machine_is_compatible("apple,t6000") ||
