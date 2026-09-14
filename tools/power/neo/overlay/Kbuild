@@ -1,3 +1,4 @@
 obj-m += neo-rtc-overlay.o
 obj-m += neo-dwi-probe.o
 obj-m += neo-smc-inventory.o
+obj-m += neo-dwi-trial.o
