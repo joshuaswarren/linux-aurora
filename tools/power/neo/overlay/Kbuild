@@ -3,3 +3,4 @@ obj-m += neo-dwi-probe.o
 obj-m += neo-smc-inventory.o
 obj-m += neo-dwi-trial.o
 obj-m += neo-backlight-trial.o
+obj-m += neo-display-sleep.o
