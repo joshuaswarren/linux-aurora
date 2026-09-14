@@ -100,15 +100,22 @@ def main():
         raw_counter_drop = before['charge_counter'] - after['charge_counter']
         dq = before['charge_now'] - after['charge_now']
         voltage = (before['voltage_now'] + after['voltage_now']) / 2e6
-        if dq <= 0 or voltage <= 0:
-            raise RuntimeError('counter did not record discharge')
+        if dt <= 0 or voltage <= 0 or raw_counter_drop <= 0:
+            raise RuntimeError('invalid interval, voltage, or accumulated discharge')
         result['elapsed_seconds'] = dt
         result['charge_loss_uAh'] = dq
         result['raw_charge_counter_drop'] = raw_counter_drop
         result['raw_charge_counter_units_qualified'] = False
         result['mean_endpoint_voltage_V'] = voltage
-        result['estimated_energy_Wh'] = dq / 1e6 * voltage
-        result['estimated_average_W'] = result['estimated_energy_Wh'] * 3600 / dt
+        # Remaining capacity can rise after removing the display load. Keep
+        # the signed delta, but do not turn gauge compensation into negative
+        # consumption or discard the independently accumulated discharge.
+        result['capacity_estimate_available'] = dq > 0
+        result['estimated_energy_Wh'] = dq / 1e6 * voltage if dq > 0 else None
+        result['estimated_average_W'] = (result['estimated_energy_Wh'] * 3600 / dt
+                                         if dq > 0 else None)
+        if dq <= 0:
+            result['capacity_estimate_note'] = 'remaining-capacity gauge did not fall; use calibrated accumulated counter'
         result['nominal_energy_loss_Wh'] = (before['energy_now'] - after['energy_now']) / 1e6
         result['nominal_energy_average_W'] = result['nominal_energy_loss_Wh'] * 3600 / dt
         if args.mode == 'awake':
