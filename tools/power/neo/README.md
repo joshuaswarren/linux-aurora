@@ -1,9 +1,11 @@
 # J700 suspend development
 
-This branch does not yet provide working system sleep. Keep a boot entry with
-the working kernel and initramfs when testing it. `freeze` and `mem` currently
-select s2idle; their presence in sysfs is not evidence of a working platform
-transition or a physical deep power state.
+This branch has an experimental retained-power s2idle path with a successful
+60-second PMU-alarm wake on J700. It requires the opt-ins and qualification
+setup below; it is not yet a normal-boot or deep power-down implementation.
+Keep a boot entry with the working kernel and initramfs when testing it.
+`freeze` and `mem` select s2idle; their presence in sysfs alone is not evidence
+of a working transition or a physical deep power state.
 
 ## Diagnostics and wake input
 

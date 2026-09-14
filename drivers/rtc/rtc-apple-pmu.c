@@ -30,6 +30,7 @@ MODULE_PARM_DESC(experimental, "Allow retained-power J700 RTC qualification");
 struct apple_pmu_rtc {
 	struct spmi_device *sdev;
 	struct rtc_device *rtc;
+	/* Serialize alarm transactions and the threaded interrupt handler. */
 	struct mutex lock;
 	s64 offset;
 	int irq;
