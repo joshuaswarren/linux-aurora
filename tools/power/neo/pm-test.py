@@ -52,6 +52,7 @@ def snapshot():
              "/sys/kernel/debug/apple-pmp-v2/status",
              "/sys/kernel/debug/apple-pmp-v2/thermal_status",
              "/sys/kernel/debug/neo-sleep-irqs/stats",
+             "/sys/kernel/debug/neo-pmgr-snapshot/stats",
              "/sys/kernel/debug/neo-smc-power/raw",
              "/sys/kernel/debug/pm_genpd/pm_genpd_summary",
              "/sys/module/apple_dart/parameters/pmp_s2idle",
@@ -59,6 +60,7 @@ def snapshot():
              "/sys/module/mt7932_fullmac/parameters/retained_s2idle",
              "/sys/module/pmgr_pwrstate/parameters/retain_s2idle",
              "/sys/module/pmp_v2/parameters/retained_s2idle"]
+    paths.append('/sys/module/pmp_v2/parameters/rtkit_idle_s2idle')
     for pattern in ("/sys/power/suspend_stats/*", "/sys/power/suspend_stats/last_hw_sleep",
                     "/sys/devices/system/cpu/cpufreq/policy*/scaling_cur_freq",
                     "/sys/class/thermal/thermal_zone*/mode",
@@ -71,6 +73,14 @@ def snapshot():
     return {"files": {p: read(p) for p in paths},
             "kernel_notes_sha256": hashlib.sha256(Path('/sys/kernel/notes').read_bytes()).hexdigest(),
             "dmesg": command(['dmesg']), "input": read('/proc/bus/input/devices')}
+
+
+def check_firmware_health(capture):
+    status = capture['files'].get('/sys/kernel/debug/apple-pmp-v2/status')
+    if isinstance(status, str):
+        failed = re.search(r'\bfailed=(\d+)\b', status)
+        if failed and int(failed[1]):
+            raise RuntimeError('PMP firmware epoch failed; a returned PM write is not successful recovery')
 
 
 def main():
@@ -103,6 +113,13 @@ def main():
 
     save()
     try:
+        check_firmware_health(result['before'])
+    except RuntimeError as error:
+        result.update(status='error', firmware_error=str(error))
+        save()
+        print(str(error))
+        return 1
+    try:
         # Serialize callbacks to make the first failing device unambiguous.
         write_control(pm_async, '0')
         write_control(pm_test, args.stage)
@@ -117,6 +134,10 @@ def main():
         write_control(pm_test, selected)
         write_control(pm_async, old_async)
         result['after'] = snapshot()
+        try:
+            check_firmware_health(result['after'])
+        except RuntimeError as error:
+            result.update(status='error', firmware_error=str(error))
         save()
     print(json.dumps({k: v for k, v in result.items() if k not in ('before', 'after')}))
     return 0 if result['status'] == 'returned' else 1
