@@ -1,1 +1,2 @@
 obj-m += neo-rtc-overlay.o
+obj-m += neo-dwi-probe.o
