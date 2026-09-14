@@ -120,3 +120,25 @@ device suspend and physical wake test.
   buffers when a test stalls.
 
 No successful full system sleep/resume cycle has been demonstrated.
+
+## External recovery host
+
+For this workstation setup, Neo is connected to **root@fedora-m1, Left-back**
+(the user confirmed the port). Left-front has another Apple device: do not
+send Neo reset commands there. Select the connector label, not an assumed I2C
+bus number:
+
+```sh
+ssh root@fedora-m1 \
+  /root/tuxvdmtool/target/release/tuxvdmtool --connector Left-back reboot serial
+```
+
+On 14 September this reset recovered Neo from the runtime polling experiment
+to the normal Dirtyroom GPU kernel; SSH returned with a new boot ID. The VDM
+command returning success alone is not proof that the target rebooted.
+
+The recovery host has a physical UART at `/dev/ttySAC0` (115200 baud). Serial
+capture is a separate qualification: the working Neo boot had no registered
+serial console despite its `console=ttySAC0` argument. Its device tree exposes
+`apple,t8140-uart` at `0x385200000`, for which the kernel has an early console
+implementation. Keep console-routing experiments separate from proof of reset.
