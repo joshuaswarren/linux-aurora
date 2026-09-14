@@ -7,3 +7,4 @@ obj-m += neo-display-sleep.o
 obj-m += neo-smc-power.o
 obj-m += neo-sleep-irqs.o
 obj-m += neo-pmgr-snapshot.o
+obj-m += neo-dcp-retained.o
