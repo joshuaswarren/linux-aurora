@@ -17,9 +17,10 @@ The caller owns the phase file. A renderer acknowledgement is written after
 each buffer swap and includes the process ID, context pointer and monotonic
 timestamp. This is a submission acknowledgement, not a physical panel timestamp.
 
-Display phase 0 before starting a watched test. The first watched test required
-the user's approval; the user subsequently authorized autonomous testing without
-further approval prompts. With the qualified RTC/s2idle configuration, run:
+Display phase 0 before starting a watched test and wait for the user's explicit
+readiness response; a countdown is not a substitute for that response.
+Autonomous power measurements require authorization in the current session.
+With the qualified RTC/s2idle configuration, run:
 
 ```
 python3 sleep-test.py --wake-after 60 --screen-directory CONTROL_DIRECTORY \
@@ -56,3 +57,6 @@ workspace `artifacts/neo-suspend/screen-sleep/` and on Neo in
 
 The user subsequently requested the 2-second prelude. It is installed and
 syntax-checked; the watched hardware result above used 0.5 seconds.
+
+The later combined LCD/backlight PM hook is described in `display-power.md`.
+Add `--display-off` to require and verify that hook during a visual sleep test.

@@ -3,25 +3,29 @@
 `sleep-power.py` measures one awake interval or one already-qualified timed
 s2idle cycle. Run it on battery, with AC reporting offline, and keep the panel
 brightness, displayed image and connected peripherals unchanged between runs.
-It does not configure sleep support or power down the panel. Use the retained
-development boot and RTC setup described in `rtc-alarm.md` first.
+It does not configure sleep support. Use the retained development boot and
+RTC setup described in `rtc-alarm.md` first. To measure with the display off,
+load the qualified `neo-display-sleep` module described in `display-power.md`
+and add `--display-off`; the helper verifies its off/resume callback counters.
 
 ```sh
 python3 sleep-power.py --mode awake --seconds 60 --output NEW_AWAKE_DIRECTORY
 python3 sleep-power.py --mode sleep --seconds 600 --output NEW_SLEEP_DIRECTORY
+python3 sleep-power.py --mode sleep --seconds 600 --display-off --output NEW_DISPLAY_OFF_DIRECTORY
 ```
 
 For sleep, launch the command through a service that survives SSH disconnects.
 The helper records the boot ID, kernel identity, sleep-helper hash, battery
 endpoints and nested sleep qualification. It samples no battery data during
-sleep and leaves the displayed image unchanged. The RTC provides the timed
+sleep. Optional `--screen-directory` forwards the existing visual phase test
+to the sleep helper; otherwise no visual test window is controlled. The RTC provides the timed
 wake; there is no userspace timeout capable of recovering a stuck kernel.
 Reject a failed sleep qualification, observed external power, changed boot ID
 or a nonpositive remaining-charge delta.
 
 ## Estimate and limitations
 
-The primary estimate is:
+The remaining-capacity estimate is:
 
 ```
 energy_Wh = (charge_now_before - charge_now_after) / 1e6
@@ -50,8 +54,10 @@ An initial 60.011-second awake calibration observed a raw counter drop of
 Treating the raw counter as uAh produced an invalid 13.020 W estimate, while
 sampled battery power averaged 3.617 W. Dividing the counter by 3.6 agrees
 closely with that rate, suggesting milliamp-seconds, but the native counter
-semantics are not yet qualified. This helper retains raw counter differences
-without using them for its primary power result. It does not change the driver.
+semantics are not yet confirmed. This helper retains raw counter differences
+separately from its capacity-based `estimated_average_W` field. It does not
+change the driver. The later display-off test below demonstrates why that
+capacity estimate must be cross-checked after a large load change.
 
 The original calibration JSON is preserved in the workspace at
 `artifacts/neo-suspend/power/awake-01.json`; its original counter-derived
@@ -82,6 +88,38 @@ the result, phase 2 was requested manually; an independent screenshot showed
 WOKEN UP! :D, with the same renderer PID 2105 and GLES context. Display
 power-down remains unimplemented. This is a screen-on retained-s2idle baseline,
 not a measurement of complete platform deep sleep.
+
+## Ten-minute display-off result and counter cross-check
+
+On the same #19 kernel, boot `eee6042d-cc10-4c2d-8cf4-66e01a884832`,
+the combined LCD/backlight hook completed a 600-second RTC s2idle test.
+Battery endpoints spanned 601.542 s. The raw accumulated counter dropped
+123,441 units, but remaining capacity dropped only 16 mAh while endpoint
+voltage rose from 3.883 to 3.896 V. The uncorrected capacity calculation
+therefore reported **0.372 W**. Do not use that as the headline result:
+the counters disagree substantially during this low-load interval.
+
+A new 60-second awake calibration on the same boot integrated 15,117.59 uAh
+and reproduced **3.600772 raw units/uAh**, with sampled power **3.51843 W**.
+Using that fitted scale gives **0.79798 W** for display-off sleep. The earlier
+screen-on capture gives **2.98789 W** using the same method: **2.18991 W /
+73.29% lower**. The first sensor sample immediately after wake was 0.790 W,
+which is a consistency observation, not a substitute for the accumulated
+counter measurement. Remaining-capacity gauge compensation is a possible
+explanation of the discrepancy; its exact internal algorithm is unverified.
+
+Use `power-counter-compare.py` with `--calibration`, `--sleep`, `--reference`,
+and a new `--output` path to reproduce the comparison without changing the
+original captures. It requires a completed awake calibration and the same
+kernel identity, retains source hashes and both estimates, and explicitly
+labels the result as internally calibrated rather than externally metered.
+The native unit interpretation remains unconfirmed. Different battery charge,
+voltage and temperature between the two sleep runs limit comparison precision;
+report approximately **0.80 W**, not the full fitted decimal precision.
+
+Evidence under `artifacts/neo-suspend/display/`:
+`display-power-sleep-600-01/`, `power-counter-calibration-01/`, and
+`display-power-sleep-600-comparison.json`. No battery sampler ran during sleep.
 
 Evidence: `artifacts/neo-suspend/power/power-sleep-600-01/` in the workspace,
 including endpoint data, nested kernel snapshots and the post-test screenshot.
