@@ -39,3 +39,28 @@ Do not run it concurrently with binding or using a kernel SPMI driver.
 Full local evidence, ADT values, disassembly and decompilation are retained
 under workspace `artifacts/neo-suspend/rtc-alarm/`. The alarm interrupt and
 suspended wake route remain unqualified at this checkpoint.
+
+## Experimental Linux driver
+
+`CONFIG_RTC_DRV_APPLE_PMU=m` builds `rtc-apple-pmu.ko`. The module requires
+`experimental=1` and a J700-specific device node. It preserves the hardware
+time and its scratchpad offset, supports alarms within one hour, reads back
+the comparator, and handles only retained-power s2idle. Its NO_SUSPEND
+threaded interrupt explicitly raises a system wake event after identifying
+the PMU alarm. This does not establish wake with SPMI/AIC powered off.
+
+The first awake 5-second `rtcwake -m on` test passed: peripheral IRQ 2 was
+delivered and the PMU event was acknowledged/disarmed. The controller uses
+AIC 487 (Linux IRQ 72), RTC Linux IRQ 73. Device time agrees with system UTC.
+Registering `rtc0` invokes the RTC core's HCTOSYS path, setting system time
+from the hardware clock; this may cause a subsecond journal time adjustment.
+
+For runtime qualification, build `overlay/` as an external kernel module.
+Replace `AIC_PHANDLE` in `overlay/rtc.dts.in` with the **current live** AIC
+phandle and compile with `dtc -I dts -O dtb` (without `-@`: the live J700
+tree has no `__symbols__`). Place the DTBO in `/lib/firmware`, load the RTC
+driver, then explicitly load `neo-rtc-overlay.ko firmware=NAME.dtbo`.
+No bootloader image or normal-boot configuration is changed. The overlay
+borrows the inherited powered bus; use only the retained development boot.
+Do not run `pmu-read` after the controller has bound. Disarm before unloading
+the overlay or RTC module. A reboot discards these runtime additions.
