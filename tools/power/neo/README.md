@@ -115,7 +115,7 @@ device suspend and physical wake test.
 - Runtime binding limited to CPU 5 returned successfully, then connectivity
   was lost while only generic POLL was available. This reproduces the issue
   without enabling the WFI experiment or CPU PM callbacks. State 0 now uses
-  the architectural WFI fallback; hardware qualification is pending. Use
+  the architectural WFI fallback; the qualification below passed. Use
   unbuffered log capture so short final messages do not remain in userspace
   buffers when a test stalls.
 
@@ -142,3 +142,41 @@ capture is a separate qualification: the working Neo boot had no registered
 serial console despite its `console=ttySAC0` argument. Its device tree exposes
 `apple,t8140-uart` at `0x385200000`, for which the kernel has an early console
 implementation. Keep console-routing experiments separate from proof of reset.
+
+## Retained PMP qualification (experimental, 14 September 2026)
+
+The all-CPU selector initially rejected `-1` through a signed/unsigned comparison;
+that is fixed. Kernel build #15 passed all six CPUs with architectural WFI and
+again with state 1 plus CPU PM notifications: 6,000 integer/FPSIMD timer-sleep
+canaries, 48 vector test runs (960 stopped-task intervals), and two six-worker
+timer/migration runs. Each vector test recorded positive usage of its selected
+idle state (1,149 entries across the baseline tests, 1,091 across CPU PM tests).
+These are CPU idle checks, not system suspend or physical residency measurements.
+
+The PMP policy now has a reversible pause. Ten one-second awake retention tests
+returned with the epoch running, DMA pinned, no protocol fault, policy unpaused,
+and minimum frequency guards in place. The existing intermittent `-ENODATA`
+thermal samples remain unresolved; successful firmware retention does not imply
+that temperature admission has recovered.
+
+With PM_DEBUG and PMP thermal enabled, the debugfs `retention_test_ms` write
+accepts 1..1000 milliseconds for an awake pause/check/resume interval. It does not
+suspend other devices. The opt-in system path requires BOTH controls:
+
+```sh
+echo Y > /sys/module/apple_dart/parameters/pmp_s2idle
+echo Y > /sys/module/pmp_v2/parameters/retained_s2idle
+```
+
+The DART path requires the pinned live SID0 profile and the two T8140 PMGR
+providers marked `apple,always-on`; it verifies DART/APF state before and after
+without resetting the running firmware's mappings. PMP pauses policy and host
+health work, while RTKit mailbox IRQ processing stays active. Its `complete`
+callback restores policy after either resume or abort, requiring fresh thermal
+admission. All controls default off. Runtime suspend, hibernation and non-PMP
+inherited DART ownership are still rejected.
+
+The first device-stage test with these controls enabled did not return over SSH.
+The external log stopped after `PM: suspend entry (s2idle)` and filesystem sync;
+SSH userspace capture cannot observe callbacks while tasks are frozen. No failing
+device has been identified yet. Full system sleep is still unqualified.
