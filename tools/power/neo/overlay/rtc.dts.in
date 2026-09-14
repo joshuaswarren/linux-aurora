@@ -1,0 +1,33 @@
+/dts-v1/;
+/plugin/;
+
+/* Substitute the live AIC phandle. Only load on the retained J700 test boot. */
+/ {
+	fragment@0 {
+		target-path = "/soc";
+		__overlay__ {
+			#address-cells = <2>;
+			#size-cells = <2>;
+			neo_spmi0: spmi@308714000 {
+				/* Avoid confusing dtc with the external AIC phandle. */
+				phandle = <0x10000>;
+				compatible = "apple,t8103-spmi";
+				reg = <3 0x08714000 0 0x100>;
+				#address-cells = <2>;
+				#size-cells = <0>;
+				#interrupt-cells = <2>;
+				interrupt-controller;
+				interrupt-parent = <AIC_PHANDLE>;
+				interrupts = <0 487 4>;
+
+				rtc@e {
+					compatible = "apple,j700-pmu-rtc";
+					reg = <14 0>;
+					interrupt-parent = <&neo_spmi0>;
+					interrupts = <2 1>;
+					wakeup-source;
+				};
+			};
+		};
+	};
+};
