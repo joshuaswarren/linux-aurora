@@ -68,6 +68,10 @@ pub(crate) struct G17pRenderParameters {
     pub(crate) height: u32,
     pub(crate) context_base: u64,
     pub(crate) tilemap: u64,
+    /// Per-layer tiler metadata, which native places between the tilemap and
+    /// the heap metadata. It is empty, and so equal to `heapmeta`, for a
+    /// single-layer target.
+    pub(crate) layermeta: u64,
     pub(crate) heapmeta: u64,
     pub(crate) tpc: u64,
     pub(crate) deflake_1: u64,
@@ -136,6 +140,7 @@ impl G17pRenderParameters {
             height: 64,
             context_base: 0x0000_0010_0000_0000,
             tilemap: 0x0000_0010_001b_0000,
+            layermeta: 0x0000_0010_001b_5000,
             heapmeta: 0x0000_0010_001b_5000,
             tpc: 0x0000_0010_0024_0000,
             deflake_1: 0x0000_0010_0006_82a0,
@@ -269,18 +274,33 @@ pub(crate) fn build_ta_registers(
     p: &G17pRenderParameters,
 ) -> Result<[RegisterWrite; TA_REGISTER_COUNT], RenderBuildError> {
     let g = geometry(p)?;
-    let tilemap = ta_offset(p, p.tilemap)?;
-    let heapmeta = ta_offset(p, p.heapmeta)?;
-    let tpc = ta_offset(p, p.tpc)?;
-    let deflake_1 = ta_offset(p, p.deflake_1)?;
-    let deflake_2 = ta_offset(p, p.deflake_2)?;
-    let deflake_3 = ta_offset(p, p.deflake_3)?;
-    let encoder = ta_offset(p, p.encoder)?;
-    let layer_mode = if p.layers > 1 {
-        0xe000 | (p.layers as u64 - 1)
+    let tilemap = ta_resource_offset(p, p.tilemap)?;
+    let layermeta = ta_resource_offset(p, p.layermeta)?;
+    let heapmeta = ta_resource_offset(p, p.heapmeta)?;
+    let tpc = ta_resource_offset(p, p.tpc)?;
+    let deflake_1 = ta_user_offset(p.deflake_1)?;
+    let deflake_2 = ta_user_offset(p.deflake_2)?;
+    let deflake_3 = ta_user_offset(p.deflake_3)?;
+    // The VDM control stream is the one pointer the 192-byte capture window
+    // does not reach (register 0x1c880 sits past the end of the dump), and it
+    // is the one that is not relative to the driver-private `context_base`.
+    // macOS first lowers the task VA to a task-relative offset, then maps the
+    // backing at 0x1000000000 + offset in the GART window. Linux userspace gives
+    // us that full alias VA, so this hardware encoder subtracts the GART base.
+    // Bit 39 selects the upper UAT root; refuse an offset that would silently
+    // change roots. Keep the full-address escape hatch diagnostic-only.
+    let encoder = if p.absolute_pointers {
+        p.encoder
     } else {
-        0x8000
+        vdm_user_offset(p.encoder)?
     };
+    // generateTARegisterListG16Common: the layer count less one with bit 15,
+    // plus bit 14 and a process-empty-tiles select for a layered target. The
+    // pipe mirror 0x1c9e8 keeps only the layered bit and the count.
+    let mut layer_mode = 0x8000 | (p.layers as u64 - 1);
+    if p.layers > 1 {
+        layer_mode |= 0x4000 | if p.process_empty_tiles { 0x2000 } else { 0x1000 };
+    }
 
     Ok([
         RegisterWrite::new(0x01748, 1),
@@ -302,8 +322,8 @@ pub(crate) fn build_ta_registers(
         RegisterWrite::new(0x1c950, deflake_3 | 0x0004_0000_0000_0000),
         RegisterWrite::new(0x1c930, 0),
         RegisterWrite::new(0x1c880, encoder),
-        RegisterWrite::new(0x1c079, heapmeta),
-        RegisterWrite::new(0x1c9d8, heapmeta),
+        RegisterWrite::new(0x1c079, layermeta),
+        RegisterWrite::new(0x1c9d8, layermeta),
         RegisterWrite::new(0x10151, 0),
         RegisterWrite::new(0x1c199, 0),
         RegisterWrite::new(0x1c1a1, 0),
@@ -328,7 +348,7 @@ pub(crate) fn build_ta_registers(
         RegisterWrite::new(0x1c8e8, u64::MAX),
         RegisterWrite::new(0x1c898, 0),
         RegisterWrite::new(0x101e1, 0x1c),
-        RegisterWrite::new(0x1c9e8, 0),
+        RegisterWrite::new(0x1c9e8, layer_mode & 0x47ff),
         RegisterWrite::new(0x1a099, 0),
         RegisterWrite::new(0x1a0a1, 0),
         RegisterWrite::new(0x1a069, 0),
@@ -424,7 +444,7 @@ pub(crate) fn build_fragment_registers(
         RegisterWrite::new(0x153d9, p.stencil_aux_buffer),
         RegisterWrite::new(0x15439, p.stencil_aux_stride),
         RegisterWrite::new(0x16429, p.tilemap),
-        RegisterWrite::new(0x16060, p.heapmeta),
+        RegisterWrite::new(0x16060, p.layermeta),
         RegisterWrite::new(0x16431, (4 * g.size1) << 24),
         RegisterWrite::new(0x10039, p.tile_config),
         RegisterWrite::new(0x16020, 0),
@@ -1119,8 +1139,125 @@ mod tests {
         let parameters = G17pRenderParameters::source_rsrc8();
         assert_eq!(parameters.store_pipeline_bind, 0x8);
         assert_eq!(parameters.load_pipeline_bind, 0x0007_8000_0000_0040);
-        assert_eq!(parameters.store_pipeline, 0x0000_0100_0199_0644);
-        assert_eq!(parameters.load_pipeline, 0x0000_0100_0199_0244);
+        assert_eq!(parameters.store_pipeline, 0x0000_0100_0199_0640);
+        assert_eq!(parameters.load_pipeline, 0x0000_0100_0199_0240);
+    }
+
+    #[test]
+    fn render_lifecycles_use_native_gid_predecessor_and_consecutive_currents() {
+        // AtomicU32(1): reserve-group returns predecessor 1 and advances the
+        // counter to 0x01000001. Native OSAddAtomic64 returns the old value,
+        // hence 3D current 0x01000001 and TA current 0x01000002.
+        assert_eq!(
+            g17p_render_lifecycle_pair(1, 0x0100_0001),
+            Some((0x0000_0001_0100_0001, 0x0000_0001_0100_0002))
+        );
+        // Exact first render pair from the working Metal capture.
+        assert_eq!(
+            g17p_render_lifecycle_pair(0x0700_c271, 0x0800_c294),
+            Some((0x0700_c271_0800_c294, 0x0700_c271_0800_c295))
+        );
+        assert_eq!(g17p_render_lifecycle_pair(0, 1), None);
+        assert_eq!(g17p_render_lifecycle_pair(1, u32::MAX), None);
+
+        let mut parameters = G17pRenderParameters::source_rsrc8();
+        parameters.lifecycle = 0x1111_2222_3333_4444;
+        parameters.fragment_lifecycle = 0x5555_6666_7777_8888;
+        let ta = build_ta_registers(&parameters).unwrap();
+        let fragment = build_fragment_registers(&parameters).unwrap();
+        assert!(ta.iter().filter(|write| write.value == parameters.lifecycle).count() >= 3);
+        assert_eq!(
+            fragment
+                .iter()
+                .filter(|write| write.value == parameters.fragment_lifecycle)
+                .count(),
+            3
+        );
+        let mut ta_descriptor = [0u8; TA_DESCRIPTOR_SIZE];
+        build_ta_descriptor(
+            &parameters,
+            objects(),
+            RenderDescriptorMetadata::source(RenderDescriptorKind::Tiling),
+            &mut ta_descriptor,
+        )
+        .unwrap();
+        assert_eq!(get_u32(&ta_descriptor, 0x086e), 0x1111_2222);
+        assert_eq!(get_u64(&ta_descriptor, 0x08ce), 0x3333_4444);
+
+        let mut descriptor = [0u8; FRAGMENT_DESCRIPTOR_SIZE];
+        build_fragment_descriptor(
+            &parameters,
+            objects(),
+            RenderDescriptorMetadata::source(RenderDescriptorKind::Fragment),
+            &mut descriptor,
+        )
+        .unwrap();
+        assert_eq!(get_u32(&descriptor, 0x2108), 0x5555_6666);
+        assert_eq!(get_u64(&descriptor, 0x2168), 0x7777_8888);
+    }
+
+    #[test]
+    fn vdm_user_offset_matches_g17p_compact_window() {
+        assert_eq!(vdm_user_offset(0x10_0186_0420).unwrap(), 0x0186_0420);
+        assert_eq!(
+            vdm_user_offset(0x4f_fff5_4400).unwrap(),
+            0x3f_fff5_4400
+        );
+        assert_eq!(
+            vdm_user_offset(0xbf_fff5_4400),
+            Err(RenderBuildError::VdmAddressOutOfRange)
+        );
+    }
+
+    #[test]
+    fn native_ta_addresses_use_split_resource_and_user_domains() {
+        let mut parameters = G17pRenderParameters::source_rsrc8();
+        parameters.context_base = 0x70_0000_0000;
+        parameters.tilemap = 0x70_011e_0a00;
+        parameters.layermeta = 0x70_011e_2a00;
+        parameters.heapmeta = 0x70_011e_2a00;
+        parameters.tpc = 0x70_0129_0000;
+        parameters.deflake_3 = 0x10_0009_ca60;
+        parameters.deflake_2 = 0x10_0009_ca80;
+        parameters.deflake_1 = 0x10_0009_cd00;
+
+        let registers = build_ta_registers(&parameters).unwrap();
+        let value = |number| {
+            registers
+                .iter()
+                .find(|write| write.number == number)
+                .unwrap()
+                .value
+        };
+        assert_eq!(value(0x1c039), 0x011e_0a00);
+        assert_eq!(value(0x1c031), 0x8000_0000_011e_2a00);
+        assert_eq!(value(0x1c0a1), 0x0129_0000);
+        assert_eq!(value(0x10111), 0x0009_cd00);
+        assert_eq!(value(0x10119), 0x0009_ca80);
+        assert_eq!(value(0x1c950), 0x0004_0000_0009_ca60);
+
+        let mut descriptor = [0u8; TA_DESCRIPTOR_SIZE];
+        build_ta_descriptor(
+            &parameters,
+            objects(),
+            RenderDescriptorMetadata {
+                context_id: 1,
+                submission_ordinal: 0,
+                command_buffer_state_word: 0,
+                ta_hardware_buffer_id: 0,
+                submit_sequence: 1,
+            },
+            &mut descriptor,
+        )
+        .unwrap();
+        assert_eq!(get_u32(&descriptor, 0x07d6), 0x0009_cd00);
+        assert_eq!(get_u64(&descriptor, 0x0780), parameters.tpc);
+
+        parameters.deflake_1 = 0x11_0000_0000;
+        assert_eq!(
+            build_ta_registers(&parameters),
+            Err(RenderBuildError::UserAddressOutOfRange)
+        );
     }
 
     #[test]

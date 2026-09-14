@@ -273,6 +273,8 @@ fn page_align(value: usize) -> Option<usize> {
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 struct G17PRenderStateLayout {
+    layermeta: usize,
+    layermeta_size: usize,
     heapmeta: usize,
     heapmeta_size: usize,
     tpc: usize,
@@ -327,14 +329,84 @@ fn g17p_render_state_layout(
         .checked_mul(16)?
         .checked_mul(layers)?
         .checked_mul(num_clusters as usize)?;
-    let heapmeta_size = 0x200usize.checked_add(if layers > 1 { 0x100 } else { 0 })?;
+    // AGXRenderTargetMemoryG16::halComputeGeometry: a layered target carries
+    // 0x100 bytes of per-layer tiler metadata beside the 0x200-byte heap
+    // metadata, which every target carries.
+    let layermeta_size = if layers > 1 { 0x100usize } else { 0 };
+    let heapmeta_size = 0x200usize;
 
-    let heapmeta = G17P_RENDER_STATE_DYNAMIC;
-    let tpc = heapmeta.checked_add(page_align(heapmeta_size)?)?;
-    let aux_fb = tpc.checked_add(page_align(tpc_size)?)?;
-    let tilemap = aux_fb.checked_add(G17P_RENDER_STATE_AUX_FB_SIZE)?;
-    let total_size = tilemap.checked_add(page_align(tilemap_size)?)?;
+    // TVB sizing, using the same formula the legacy path feeds to
+    // `Buffer::ensure_blocks` (queue/render.rs:132): blocks scale with the tile
+    // count, floored at 8, and multi-cluster parts need at least 7 + 2*layers.
+    let mut tvb_blocks = {
+        let tiles = tiles_x.checked_mul(tiles_y)?;
+        let blocks = tiles.checked_add(127)? / 128;
+        let blocks = blocks.checked_add(7)? & !7;
+        if blocks == 0 {
+            8
+        } else {
+            blocks
+        }
+    };
+    if num_clusters > 1 {
+        let floor = 7usize.checked_add(2usize.checked_mul(layers)?)?;
+        if tvb_blocks < floor {
+            tvb_blocks = floor;
+        }
+    }
+    // G17P does not derive the initial parameter-buffer pool solely from this
+    // command's tile count. halGetDefaultParameterBufferSizeMin supplies a
+    // chip-global 32-block floor, and the valid cold HWPB publishes exactly
+    // 32 blocks / 128 pages even before its first render. Linux's inherited
+    // eight-block floor left the TA with one quarter of the native pool.
+    if tvb_blocks < G17P_PM_BLOCK_COUNT {
+        tvb_blocks = G17P_PM_BLOCK_COUNT;
+    }
+    let tvb_size = tvb_blocks
+        .checked_sub(1)?
+        .checked_mul(G17P_RENDER_TVB_BLOCK_STRIDE)?
+        .checked_add(G17P_RENDER_TVB_BLOCK_SIZE)?;
+
+    // Native's one RT-memory allocation places the tilemap first, then the
+    // layer metadata at the next 4-KiB subrange and the heap metadata directly
+    // behind it (AGXRenderTargetMemory::updateRenderTarget, +0x2a8/+0x2b0/
+    // +0x2b8). For the launchgate triangle that is exactly TMAP+0x0000 and
+    // HMTA+0x1000 inside one 16-KiB UAT page, because a single layer has no
+    // layer metadata. The previous inherited layout reversed them and
+    // separated them by 0x10000, even though the 3D fixed-function path
+    // consumes their native relationship directly.
+    let tilemap = G17P_RENDER_STATE_DYNAMIC;
+    let tilemap_span = tilemap_size.checked_add(0xfff)? & !0xfff;
+    let layermeta = tilemap.checked_add(tilemap_span)?;
+    let heapmeta = layermeta.checked_add(layermeta_size)?;
+    let tpc = page_align(heapmeta.checked_add(heapmeta_size)?)?;
+    // TMAP/HMTA rotate in `G17PRenderTargetMemory::rt_memory` and TPC has its
+    // own stable object. They no longer occupy `render_state`; only their
+    // sizes and relative RT-record offsets remain in this layout. AXFB is the
+    // final region actually backed by render_state and therefore has one
+    // fixed offset/capacity for the graph's whole lifetime.
+    let aux_fb = G17P_RENDER_STATE_AUX_FB;
+    let after_tilemap = tilemap.checked_add(page_align(tilemap_size)?)?;
+    let after_aux_fb = aux_fb.checked_add(G17P_RENDER_STATE_AUX_FB_SIZE)?;
+    let (pm_scene_scratch, pm_discard, tvb, total_size) = if g17p_render_tvb_enabled() {
+        let scene_scratch = g17p_pm_page_align(after_aux_fb.max(after_tilemap))?;
+        let discard = scene_scratch.checked_add(G17P_PM_SCENE_SCRATCH_SIZE)?;
+        let tvb = discard.checked_add(G17P_PM_DISCARD_SIZE)?;
+        // TVB backing lives in a separate compact-GART allocation. Keep the
+        // offset as the end of the render-state object, but do not duplicate
+        // the potentially hundreds-of-megabytes TVB inside that object.
+        (scene_scratch, discard, tvb, after_aux_fb)
+    } else {
+        (after_aux_fb, after_aux_fb, after_aux_fb, after_aux_fb)
+    };
     Some(G17PRenderStateLayout {
+        tvb,
+        tvb_size,
+        tvb_blocks,
+        pm_scene_scratch,
+        pm_discard,
+        layermeta,
+        layermeta_size,
         heapmeta,
         heapmeta_size,
         tpc,
@@ -823,6 +895,129 @@ fn map_fixed_wc_object(
             Err(error)
         }
     }
+}
+
+#[cfg(not(test))]
+struct G17PRenderTargetMemory {
+    rt_memory: MappedObject,
+    tpc: MappedObject,
+    rt_slot_ordinals: [Option<u32>; G17P_RENDER_RT_EVENT_RECORD_COUNT],
+}
+
+#[cfg(not(test))]
+impl G17PRenderTargetMemory {
+    fn prepare_rt_slot(
+        &mut self,
+        submission_ordinal: u32,
+        layout: &G17PRenderStateLayout,
+    ) -> Result<G17PRenderTargetAddresses> {
+        let slot = submission_ordinal as usize % G17P_RENDER_RT_EVENT_RECORD_COUNT;
+        if self.rt_slot_ordinals[slot].is_some_and(|previous| {
+            submission_ordinal
+                .checked_sub(previous)
+                .is_none_or(|distance| {
+                    distance != 0 && distance < G17P_RENDER_RT_EVENT_RECORD_COUNT as u32
+                })
+        }) {
+            return Err(EBUSY);
+        }
+        let used = layout
+            .heapmeta
+            .checked_add(layout.heapmeta_size)
+            .and_then(|end| end.checked_sub(layout.tilemap))
+            .ok_or(EINVAL)?;
+        if used > G17P_RENDER_RT_REGION_STRIDE {
+            return Err(ERANGE);
+        }
+        let offset = g17p_render_rt_record_offset(submission_ordinal);
+        self.rt_memory.with_bytes_mut(|raw| {
+            raw.get_mut(offset..offset + G17P_RENDER_RT_REGION_STRIDE)
+                .ok_or(ERANGE)?
+                .fill(0);
+            Ok(())
+        })?;
+        self.rt_slot_ordinals[slot] = Some(submission_ordinal);
+        Ok(G17PRenderTargetAddresses {
+            tilemap: self.tilemap_va(submission_ordinal)?,
+            layermeta: self.rt_region_va(submission_ordinal, layout, layout.layermeta)?,
+            heapmeta: self.heapmeta_va(submission_ordinal, layout)?,
+        })
+    }
+
+    fn tpc_va(&self) -> u64 {
+        self.tpc.iova()
+    }
+
+    fn tilemap_va(&self, submission_ordinal: u32) -> Result<u64> {
+        self.rt_memory
+            .iova()
+            .checked_add(g17p_render_rt_record_offset(submission_ordinal) as u64)
+            .ok_or(EOVERFLOW)
+    }
+
+    fn rt_region_va(
+        &self,
+        submission_ordinal: u32,
+        layout: &G17PRenderStateLayout,
+        region: usize,
+    ) -> Result<u64> {
+        self.tilemap_va(submission_ordinal)?
+            .checked_add(region.checked_sub(layout.tilemap).ok_or(EINVAL)? as u64)
+            .ok_or(EOVERFLOW)
+    }
+
+    fn heapmeta_va(
+        &self,
+        submission_ordinal: u32,
+        layout: &G17PRenderStateLayout,
+    ) -> Result<u64> {
+        self.rt_region_va(submission_ordinal, layout, layout.heapmeta)
+    }
+}
+
+/// The addresses one render-target-memory record publishes to TA and 3D.
+#[cfg(not(test))]
+#[derive(Debug, Copy, Clone)]
+struct G17PRenderTargetAddresses {
+    tilemap: u64,
+    layermeta: u64,
+    heapmeta: u64,
+}
+
+/// Keep the comparatively large owning mappings out of
+/// `G17PUserRenderStorage::new`'s already deep construction frame. Descriptor
+/// dual-root collision retries can synchronously drop a temporary mapping and
+/// enter the page-table walker; retaining another full `MappedObject` local in
+/// that call chain exhausted the 32-KiB kernel stack on the second client.
+#[cfg(not(test))]
+#[inline(never)]
+fn new_g17p_render_target_memory(
+    dev: &AsahiDevice,
+    vm: &mmu::Vm,
+    queue_pair: G17PRenderQueuePair,
+) -> Result<KBox<G17PRenderTargetMemory>> {
+    let rt_memory = MappedObject::new_wc_at(
+        dev,
+        vm,
+        g17p_render_rt_memory_va(queue_pair).ok_or(EINVAL)?,
+        G17P_RENDER_RT_MEMORY_PAIR_SIZE,
+        mmu::PROT_GPU_FW_SHARED_RW,
+    )?;
+    let tpc = MappedObject::new_wc_at(
+            dev,
+            vm,
+            g17p_render_tpc_va(queue_pair).ok_or(EINVAL)?,
+            G17P_RENDER_TPC_CAPACITY,
+            mmu::PROT_GPU_FW_SHARED_RW,
+        )?;
+    Ok(KBox::new(
+        G17PRenderTargetMemory {
+            rt_memory,
+            tpc,
+            rt_slot_ordinals: [None; G17P_RENDER_RT_EVENT_RECORD_COUNT],
+        },
+        GFP_KERNEL,
+    )?)
 }
 
 #[cfg(not(test))]
@@ -1842,8 +2037,492 @@ impl G17PComputeDescriptorStorage {
 
 #[cfg(not(test))]
 impl G17PUserRenderStorage {
-    const TILING_QUEUE: usize = 0x0000;
-    const FRAGMENT_QUEUE: usize = 0x00c0;
+    fn sksm_backing_mut(&mut self) -> Result<&mut G17PRenderSksmBacking> {
+        self.sksm_backing.as_mut().ok_or(EIO)
+    }
+
+    /// Detach only the queue-address-stable part of a retired graph.  The
+    /// per-VM low mappings stay with this storage and disappear before the
+    /// incoming VM maps the same addresses.
+    pub(crate) fn take_sksm_backing(&mut self) -> Result<G17PRenderSksmBacking> {
+        self.sksm_backing.take().ok_or(EIO)
+    }
+
+    pub(crate) fn sksm_backing_detached(&self) -> bool { self.sksm_backing.is_none() }
+
+    pub(crate) fn claim_sksm_backing(
+        &mut self,
+        backing: &mut Option<G17PRenderSksmBacking>,
+    ) -> Result {
+        if self.sksm_backing.is_some()
+            || !backing
+                .as_ref()
+                .is_some_and(|backing| backing.matches_queue_pair(self.queue_pair))
+        {
+            return Err(EIO);
+        }
+        self.sksm_backing = backing.take();
+        Ok(())
+    }
+
+    fn descriptor_context_valid(context_id: u16) -> bool {
+        // A descriptor context is a queue execution context. The bind band and
+        // the render app context are owned by other allocators, so a
+        // descriptor naming one of them would be a cross-allocator collision,
+        // not a valid submission.
+        context_id
+            == g17_submission::G17P_PARTIAL_OPENING_CONTEXT.descriptor_context_id as u16
+            || (u32::from(context_id) >= crate::g17_queue_limits::COMPUTE_CONTEXT_FIRST
+                && u32::from(context_id) < crate::g17_queue_limits::BIND_CONTEXT_FIRST)
+    }
+
+    pub(crate) fn write_sksm_entry(
+        &mut self,
+        tiling: bool,
+        offset: usize,
+        zero_length: usize,
+        body: &[u8],
+    ) -> Result {
+        let backing = self.sksm_backing_mut()?;
+        let object = if tiling {
+            &mut backing.ta_context
+        } else {
+            &mut backing.fragment_context
+        };
+        let end = offset.checked_add(zero_length).ok_or(EINVAL)?;
+        if zero_length == 0
+            || offset % zero_length != 0
+            || end > G17P_BOOTSTRAP_CONTEXT_PEER_SIZE
+            || end > object.logical_size
+            || body.len() > zero_length
+        {
+            return Err(EINVAL);
+        }
+        object.with_bytes_mut(|bytes| {
+            bytes[offset..end].fill(0);
+            bytes[offset..offset + body.len()].copy_from_slice(body);
+            Ok(())
+        })?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    pub(crate) fn sksm_entry_low_va(&self, tiling: bool) -> u64 {
+        if tiling {
+            self.ta_context_low.iova()
+        } else {
+            self.fragment_context_low.iova()
+        }
+    }
+
+    pub(crate) fn sksm_entry_high_va(&self, tiling: bool) -> u64 {
+        let Some(backing) = self.sksm_backing.as_ref() else { return 0 };
+        if tiling { backing.ta_context.iova() } else { backing.fragment_context.iova() }
+    }
+
+    pub(crate) fn dump_sksm_entry(&mut self, dev: &AsahiDevice, tiling: bool, label: &str) {
+        let Ok(backing) = self.sksm_backing_mut() else { return };
+        let object = if tiling { &mut backing.ta_context } else { &mut backing.fragment_context };
+        let mut body = [0u8; 0x200];
+        let Ok(vmap) = object.object.vmap() else { return };
+        let bytes = unsafe {
+            // SAFETY: VMap spans the page-rounded object and the range below
+            // is checked against the logical allocation.
+            core::slice::from_raw_parts(vmap.as_ptr(), object.logical_size)
+        };
+        let Some(entry) = bytes.get(0x200..0x400) else { return };
+        body.copy_from_slice(entry);
+        for (row, chunk) in body.chunks(16).enumerate() {
+            dev_info!(
+                dev.as_ref(),
+                "G17PDUMP entry-{} {} {:#05x} {:02x?}\n",
+                if tiling { "TA" } else { "3D" },
+                label,
+                row * 16,
+                chunk,
+            );
+        }
+    }
+
+    pub(crate) fn log_sksm_entry(
+        &mut self,
+        dev: &AsahiDevice,
+        tiling: bool,
+        label: &str,
+        offset: usize,
+    ) {
+        let Ok(backing) = self.sksm_backing_mut() else { return };
+        let object = if tiling { &mut backing.ta_context } else { &mut backing.fragment_context };
+        let Ok(vmap) = object.object.vmap() else { return };
+        let bytes = unsafe {
+            // SAFETY: VMap spans the object and each word is bounds checked.
+            core::slice::from_raw_parts(vmap.as_ptr(), object.logical_size)
+        };
+        let mut words = [0u32; 24];
+        for (index, word) in words.iter_mut().enumerate() {
+            let at = offset + index * 4;
+            let Some(raw) = bytes.get(at..at + 4) else { return };
+            *word = u32::from_le_bytes(raw.try_into().unwrap());
+        }
+        for row in 0..2 {
+            let base = row * 12;
+            dev_info!(
+                dev.as_ref(),
+                "G17P sksm entry[{}] {} +{:#x}: {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x}\n",
+                label,
+                if tiling { "TA" } else { "3D" },
+                offset + row * 0x30,
+                words[base], words[base + 1], words[base + 2], words[base + 3],
+                words[base + 4], words[base + 5], words[base + 6], words[base + 7],
+                words[base + 8], words[base + 9], words[base + 10], words[base + 11],
+            );
+        }
+    }
+
+    /// First-stage raw capture of the retained host-authored render graph.
+    /// Descriptor pages include the actual embedded RCE arrays. The separate
+    /// fragment_rce diagnostic mirror is deliberately not substituted for them.
+    pub(crate) fn capture_owned_trace(
+        &mut self, archive: &mut TraceArchive<'_>, phase: TracePhase,
+        phase_sequence: u64, job_stamp: u64, clock: &mut impl FnMut() -> u64,
+    ) -> Result {
+        // The command-GART lease is independent of the queue execution
+        // context carried by this TA/3D pair. Both roots retain this VM.
+        let context = u32::from(self.descriptor_context_id);
+        let mut meta = TraceMeta::new(TraceKind::RenderDescriptors, phase, phase_sequence);
+        meta.role = 0;
+        meta.context = 0;
+        meta.job_stamp = job_stamp;
+        for (offset, dva, qid) in [
+            (0, self.descriptors.iova(), self.queue_pair.tiling),
+            (
+                G17P_RENDER_3D_DESCRIPTOR_OFFSET,
+                self.descriptors.iova() + G17P_RENDER_3D_DESCRIPTOR_OFFSET as u64,
+                self.queue_pair.fragment,
+            ),
+        ] {
+            let mut item = meta;
+            item.dva = dva;
+            item.qid = u32::from(qid);
+            self.descriptors.capture_trace_range(archive, item, offset, mmu::UAT_PGSZ, clock)?;
+        }
+        // Preserve the job-root alias identities too: RCE self pointers are
+        // low application-GART addresses, not descriptor high-root addresses.
+        for (offset, dva, qid, alias_context, instance) in [
+            (0, self.descriptor_ta_low.iova(), self.queue_pair.tiling, context, 1),
+            (mmu::UAT_PGSZ, self.descriptor_3d_low.iova(), self.queue_pair.fragment, context, 1),
+            (mmu::UAT_PGSZ, self.descriptor_3d_render.iova(), self.queue_pair.fragment, context, 2),
+        ] {
+            let mut item = meta;
+            item.dva = dva;
+            item.qid = u32::from(qid);
+            item.context = alias_context;
+            item.root = trace::ROOT_CONTEXT_LOW;
+            item.instance = instance;
+            self.descriptors.capture_trace_range(archive, item, offset, mmu::UAT_PGSZ, clock)?;
+        }
+        for (kind, object, object_context) in [
+            (TraceKind::RenderQueueGraph, &mut self.graph, 0),
+            (TraceKind::RenderSupport, &mut self.support, 0),
+            (TraceKind::RenderState, &mut self.render_state, context),
+            (TraceKind::RenderTimestamps, &mut self.timestamps, 0),
+            (TraceKind::FragmentStatus, &mut self.fragment_status, 0),
+        ] {
+            let mut item = meta;
+            item.kind = kind;
+            item.context = object_context;
+            object.capture_trace(archive, item, clock)?;
+        }
+        // Follow the exact retained alias owners/constructor source offsets.
+        // These compact addresses, not the generic backing allocation's DVA,
+        // are what the actual RCE arrays publish for command-owned DEFLAKE/AXFB.
+        for (instance, offset, mapping) in [
+            (1, G17P_RENDER_STATE_DEFLAKE, &self.render_user_aliases.deflake),
+            (4, self.render_layout.aux_fb, &self.render_user_aliases.aux_fb),
+        ] {
+            let mut item = meta;
+            item.kind = TraceKind::RenderState;
+            item.context = context;
+            item.root = trace::ROOT_CONTEXT_LOW;
+            item.instance = instance;
+            item.dva = mapping.iova();
+            self.render_state.capture_trace_range(archive, item, offset, mapping.size(), clock)?;
+        }
+        let rt_offset = g17p_render_rt_record_offset(self.descriptor_ordinal);
+        for (instance, offset, size, dva) in [
+            (
+                2,
+                rt_offset,
+                self.render_layout.tilemap_size,
+                self.render_target_memory.tilemap_va(self.descriptor_ordinal)?,
+            ),
+            (
+                7,
+                rt_offset
+                    + self.render_layout.layermeta.checked_sub(self.render_layout.tilemap)
+                        .ok_or(EINVAL)?,
+                self.render_layout.layermeta_size,
+                self.render_target_memory.rt_region_va(
+                    self.descriptor_ordinal,
+                    &self.render_layout,
+                    self.render_layout.layermeta,
+                )?,
+            ),
+            (
+                6,
+                rt_offset
+                    + self.render_layout.heapmeta.checked_sub(self.render_layout.tilemap)
+                        .ok_or(EINVAL)?,
+                self.render_layout.heapmeta_size,
+                self.render_target_memory
+                    .heapmeta_va(self.descriptor_ordinal, &self.render_layout)?,
+            ),
+        ] {
+            if size == 0 {
+                continue;
+            }
+            let mut item = meta;
+            item.kind = TraceKind::RenderState;
+            item.context = context;
+            item.root = trace::ROOT_CONTEXT_LOW;
+            item.instance = instance;
+            item.dva = dva;
+            self.render_target_memory.rt_memory.capture_trace_range(
+                archive, item, offset, size, clock,
+            )?;
+        }
+        let mut tpc_item = meta;
+        tpc_item.kind = TraceKind::RenderState;
+        tpc_item.context = context;
+        tpc_item.root = trace::ROOT_CONTEXT_LOW;
+        tpc_item.instance = 3;
+        tpc_item.dva = self.render_target_memory.tpc_va();
+        self.render_target_memory.tpc.capture_trace_range(
+            archive,
+            tpc_item,
+            0,
+            self.render_layout.tpc_size,
+            clock,
+        )?;
+        let mut item = meta;
+        item.kind = TraceKind::RenderState;
+        item.context = context;
+        item.root = trace::ROOT_CONTEXT_LOW;
+        item.instance = 5;
+        item.dva = self.render_state.iova() + G17P_RENDER_STATE_TA_STATUS as u64;
+        self.render_state.capture_trace_range(
+            archive,
+            item,
+            G17P_RENDER_STATE_TA_STATUS,
+            mmu::UAT_PGSZ,
+            clock,
+        )?;
+        let mut status = meta;
+        status.kind = TraceKind::FragmentStatus;
+        status.context = context;
+        status.root = trace::ROOT_CONTEXT_LOW;
+        status.instance = 1;
+        status.dva = self.fragment_status_low.iova();
+        self.fragment_status.capture_trace_range(
+            archive, status, 0, self.fragment_status_low.size(), clock)?;
+        for (kind, object, object_context) in [
+            (TraceKind::SceneScratch, self.scene_scratch.as_mut(), context),
+            (TraceKind::Discard, self.discard.as_mut(), context),
+            // PM descriptors/PoolA/Scene/HWPB are firmware-high objects.
+            (TraceKind::ParameterManagement, self.parameter_management.as_mut().map(|pm| &mut pm.backing), 0),
+        ] {
+            let mut item = meta;
+            item.kind = kind;
+            item.context = object_context;
+            if let Some(object) = object {
+                object.capture_trace(archive, item, clock)?;
+            } else {
+                archive.omit(item, TraceOmission::Unavailable).map_err(|_| EINVAL)?;
+            }
+        }
+        // These buffers require separate ownership-aware traversal; a missing
+        // payload must not turn into a fabricated all-zero native comparison.
+        for kind in [TraceKind::ClientObjects, TraceKind::TvbPayload] {
+            let mut item = meta;
+            item.kind = kind;
+            item.context = context;
+            item.root = trace::ROOT_CONTEXT_LOW;
+            if kind == TraceKind::TvbPayload {
+                if let Some(tvb) = &self.render_tvb {
+                    item.dva = tvb.iova();
+                    item.expected_len = (tvb.block_count * G17P_RENDER_TVB_BLOCK_SIZE) as u64;
+                }
+            }
+            archive.omit(item, TraceOmission::NotImplemented).map_err(|_| EINVAL)?;
+        }
+        Ok(())
+    }
+
+    /// DIAGNOSTIC. Read the render `channel_control` object the tag-15 record
+    /// names at `+0x4a`.
+    ///
+    /// Firmware RE of b1: the tag-15 tail binds this object into the scheduler
+    /// state, filling in fields the host leaves as `0xff` -- `[1]` the firmware
+    /// index (allocated at `0x12408`, published to `0x124ba8[idx]` at
+    /// `0x12460`), `[0]` the pid slot (`FUN_98f0` `0x99b0`), `[2] = 4`,
+    /// `[3] = priority`, `[4]` the class from `table_0x47467`, `+0x12` the
+    /// 128-bit qid mask, and `[0x33]` the HardwareBufferID. The firmware
+    /// cache-cleans the object back to host memory at `0x12488`, so a host read
+    /// after the first submit shows whether the bind actually ran. Fields still
+    /// reading `0xff` mean it did not.
+    /// DIAGNOSTIC. Pool-A record 0. The classic TA command handler dereferences
+    /// TA descriptor `+0x10` (the Pool-A record), invalidates 0xc8 bytes there,
+    /// and `FUN_16f7c` then does `ldr w8,[rec,#148]; cbnz w8, <bare return>` --
+    /// a non-zero `+0x94` makes the firmware DROP the TA work silently, with no
+    /// job inserted, no trace and no fault, which is exactly our symptom.
+    pub(crate) fn read_pool_a_record(&mut self, out: &mut [u8; 0x200]) -> Result {
+        self.support.with_bytes_mut(|bytes| {
+            out.copy_from_slice(
+                bytes
+                    .get(G17P_RENDER_POOL_A..G17P_RENDER_POOL_A + 0x200)
+                    .ok_or(ERANGE)?,
+            );
+            Ok(())
+        })
+    }
+
+    pub(crate) fn read_channel_control(&mut self, out: &mut [u8; 0x40]) -> Result {
+        self.support.with_bytes_mut(|bytes| {
+            out.copy_from_slice(
+                bytes
+                    .get(
+                        G17P_RENDER_CHANNEL_CONTROL
+                            ..G17P_RENDER_CHANNEL_CONTROL + 0x40,
+                    )
+                    .ok_or(ERANGE)?,
+            );
+            Ok(())
+        })
+    }
+
+    /// Same, for the descriptor object the kick entry names at +0x10.
+    pub(crate) fn dump_descriptor_region(
+        &mut self,
+        dev: &AsahiDevice,
+        who: &str,
+        label: &str,
+        offset: usize,
+        length: usize,
+    ) {
+        let Ok(vmap) = self.descriptors.object.vmap() else {
+            return;
+        };
+        let bytes = unsafe {
+            // SAFETY: the VMap covers the page-rounded descriptor object; the
+            // slice below is bounds-checked against logical_size.
+            core::slice::from_raw_parts(vmap.as_ptr(), self.descriptors.logical_size)
+        };
+        if offset + length > bytes.len() {
+            return;
+        }
+        for row in 0..(length / 16) {
+            let at = offset + row * 16;
+            dev_info!(
+                dev.as_ref(),
+                "G17PDUMP {} {} {:#05x} {:02x?}\n",
+                who,
+                label,
+                row * 16,
+                &bytes[at..at + 16],
+            );
+        }
+    }
+
+    /// Machine-parseable dump of any graph region, for byte-diffing against
+    /// the native capture. Lines are `G17PDUMP <who> <label> <off> <bytes>`.
+    pub(crate) fn dump_graph_region(
+        &mut self,
+        dev: &AsahiDevice,
+        who: &str,
+        label: &str,
+        offset: usize,
+        length: usize,
+    ) {
+        let Ok(vmap) = self.graph.object.vmap() else {
+            return;
+        };
+        let bytes = unsafe {
+            // SAFETY: the VMap covers the page-rounded graph object; the slice
+            // below is bounds-checked against logical_size.
+            core::slice::from_raw_parts(vmap.as_ptr(), self.graph.logical_size)
+        };
+        if offset + length > bytes.len() {
+            return;
+        }
+        for row in 0..(length / 16) {
+            let at = offset + row * 16;
+            dev_info!(
+                dev.as_ref(),
+                "G17PDUMP {} {} {:#05x} {:02x?}\n",
+                who,
+                label,
+                row * 16,
+                &bytes[at..at + 16],
+            );
+        }
+    }
+
+    /// Dump one render queue record, to diff against the native capture.
+    ///
+    /// macOS 2026-09-02 (`fullrecords-gfx.txt`) gives the same object for a
+    /// real Metal render pass, so a byte diff of this against native's is the
+    /// direct answer to "what is missing from the record the KSM reads".
+    pub(crate) fn log_render_queue_record(&mut self, dev: &AsahiDevice, tiling: bool, label: &str) {
+        let offset = self.queue_record_offset(tiling);
+        let mut words = [0u32; G17P_RENDER_QUEUE_RECORD_SIZE / 4];
+        let mut ok = false;
+        if let Ok(vmap) = self.graph.object.vmap() {
+            let bytes = unsafe {
+                // SAFETY: the VMap covers the page-rounded graph object and
+                // every index below is bounds-checked against it.
+                core::slice::from_raw_parts(vmap.as_ptr(), self.graph.logical_size)
+            };
+            for (index, slot) in words.iter_mut().enumerate() {
+                let at = offset + index * 4;
+                if at + 4 <= bytes.len() {
+                    *slot =
+                        u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
+                    ok = true;
+                }
+            }
+        }
+        if !ok {
+            return;
+        }
+        for row in 0..(G17P_RENDER_QUEUE_RECORD_SIZE / 32) {
+            let base = row * 8;
+            dev_info!(
+                dev.as_ref(),
+                "G17P render queue-record[{}] {} +{:#05x}: {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x}\n",
+                label,
+                if tiling { "TA" } else { "3D" },
+                row * 32,
+                words[base],
+                words[base + 1],
+                words[base + 2],
+                words[base + 3],
+                words[base + 4],
+                words[base + 5],
+                words[base + 6],
+                words[base + 7],
+            );
+        }
+    }
+
+    // The per-queue record is addressed by QUEUE ID, not by stage index.
+    // MEASURED ON macOS 2026-09-02: a native render's data-master ring slots
+    // name records at 0xfffffc20c0000540 for its TA (queue 7) and
+    // 0xfffffc20c0000600 for its 3D (queue 8) -- exactly base + qid * 0xc0
+    // in both cases, and the same addresses appear again in each kick entry's
+    // payload[1].  This driver placed them at index 0 and 1 instead, so every
+    // pointer it handed the firmware named a record 5 and 5 slots short of
+    // where a queue-id lookup would find one.  Keep our own base, index it the
+    // way native does.
     const TILING_POINTERS: usize = G17P_USER_TILING_POINTERS;
     const FRAGMENT_POINTERS: usize = 0x1080;
     const JOB_LIST: usize = 0x2000;
@@ -2009,7 +2688,20 @@ impl G17PUserRenderStorage {
         ));
         let render_layout = bootstrap_stage!(
             "state layout",
-            g17p_render_state_layout(&command.parameters, num_clusters).ok_or(EINVAL)
+            g17p_render_state_layout(&command.parameters, num_clusters).ok_or_else(|| render_build_fail(1))
+        );
+        if page_align(render_layout.tpc_size).ok_or(EOVERFLOW)?
+            > G17P_RENDER_TPC_CAPACITY
+        {
+            return Err(ERANGE);
+        }
+        let mut render_target_memory = bootstrap_stage!(
+            "persistent render-target-memory allocation",
+            new_g17p_render_target_memory(dev, vm, queue_pair)
+        );
+        let render_target_addresses = bootstrap_stage!(
+            "render-target-memory record",
+            render_target_memory.prepare_rt_slot(submission_ordinal, &render_layout)
         );
         let mut render_state = bootstrap_stage!("state allocation", MappedObject::new_wc_in_range(
             dev,
@@ -2069,14 +2761,50 @@ impl G17PUserRenderStorage {
         translated.parameters.deflake_2 = translated.parameters.deflake_3 + 0x20;
         translated.parameters.deflake_1 = translated.parameters.deflake_3 + 0x2a0;
         translated.parameters.ta_status = render_state_va + G17P_RENDER_STATE_TA_STATUS as u64;
-        translated.parameters.fragment_status =
-            render_state_va + G17P_RENDER_STATE_FRAGMENT_STATUS as u64;
-        translated.parameters.heapmeta = render_state_va + render_layout.heapmeta as u64;
-        translated.parameters.tpc = render_state_va + render_layout.tpc as u64;
-        translated.parameters.aux_fb = render_state_va + render_layout.aux_fb as u64;
+        translated.parameters.fragment_status = fragment_status_low.iova();
+        translated.parameters.layermeta = render_target_addresses.layermeta;
+        translated.parameters.heapmeta = render_target_addresses.heapmeta;
+        translated.parameters.tpc = render_target_memory.tpc_va();
+        translated.parameters.aux_fb = render_user_aliases.aux_fb_va();
         translated.parameters.aux_fb_page_count = G17P_RENDER_AUX_FB_PAGE_COUNT;
         translated.parameters.aux_fb_flags = g17p_aux_fb_flags(translated.flags);
-        translated.parameters.tilemap = render_state_va + render_layout.tilemap as u64;
+        translated.parameters.tilemap = render_target_addresses.tilemap;
+        if let Some(pm) = parameter_management.as_ref() {
+            translated.parameters.parameter_buffer = pm.selected_scene_va();
+            let (cycle, record_index) = pm.scene_registers(
+                scene_scratch.as_ref().map(MappedObject::iova).ok_or(EINVAL)?,
+            )?;
+            translated.parameters.cycle = cycle;
+            translated.parameters.record_index = record_index;
+        }
+        dev_info!(
+            dev.as_ref(),
+            "G17P render address domains: resource-base={:#x} state={:#x} deflake={:#x} fragment-status={:#x} scene={:#x} discard={:#x} tilemap={:#x} layermeta={:#x} heapmeta={:#x} tpc={:#x} axfb={:#x} tvb={:#x}\n",
+            translated.parameters.context_base,
+            render_state_va,
+            render_user_aliases.deflake_va(),
+            fragment_status_low.iova(),
+            scene_scratch.as_ref().map_or(0, MappedObject::iova),
+            discard.as_ref().map_or(0, MappedObject::iova),
+            translated.parameters.tilemap,
+            translated.parameters.layermeta,
+            translated.parameters.heapmeta,
+            translated.parameters.tpc,
+            translated.parameters.aux_fb,
+            render_tvb.as_ref().map_or(0, G17PRenderTvb::iova),
+        );
+        // NATIVE LAYOUT, macOS 26.6.2 2026-09-02 (recs3.txt, three passes,
+        // byte-stable): a render pass owns ONE (start, end) pair, not one per
+        // stage. The TA descriptor carries only a START pointer and leaves its
+        // end field ZERO (+0x08fe = 0xfffffc2000024c68, +0x0906 = 0); the 3D
+        // points its START at the SAME address and its END at start+8. The
+        // tiler stamps the pass start, the fragment stamps the pass end.
+        //
+        // This driver published four distinct qwords and required all four to
+        // be non-zero before calling a render complete, which the hardware can
+        // never satisfy because nothing writes a TA end. That is why a render
+        // whose completion ring showed BOTH stages finished with real
+        // start/end timestamps was still abandoned after 2000 polls.
         translated.parameters.ta_timestamp_start = timestamp_va;
         translated.parameters.ta_timestamp_end = timestamp_va + 8;
         translated.parameters.ta_user_timestamp_start = user_timestamps[0];
@@ -2130,8 +2858,11 @@ impl G17PUserRenderStorage {
                 true,
             ),
             (
-                translated.parameters.heapmeta,
-                render_layout.heapmeta_size as u64,
+                translated.parameters.layermeta,
+                render_layout
+                    .layermeta_size
+                    .checked_add(render_layout.heapmeta_size)
+                    .ok_or(EOVERFLOW)? as u64,
                 true,
                 true,
             ),
@@ -2285,10 +3016,131 @@ impl G17PUserRenderStorage {
             .map_err(|_| EINVAL)?;
             Ok(())
         }));
-        bootstrap_stage!("descriptor encoding", descriptors.with_bytes_mut(|raw| {
-            let (tiling, fragment) = raw.split_at_mut(0x4000);
-            g17_render::build_cold_opening_ta_descriptor(&translated.parameters, objects, tiling)
-                .map_err(|_| EINVAL)?;
+        pr_info!(
+            "G17P render ta-inputs: context_base={:#x} encoder(vdm)={:#x} tilemap={:#x} layermeta={:#x} heapmeta={:#x} tpc={:#x}\n",
+            translated.parameters.context_base,
+            translated.parameters.encoder,
+            translated.parameters.tilemap,
+            translated.parameters.layermeta,
+            translated.parameters.heapmeta,
+            translated.parameters.tpc,
+        );
+        // Enumerate what the tiling VDM will actually dereference. The MMU
+        // fault bank names no usable address on this part, so the only way to
+        // tell a bad pointer from a bad descriptor is to read the control
+        // stream the GPU is about to fetch and check every plausible pointer
+        // in it against this VM's own tables.
+        {
+            let encoder = translated.parameters.encoder;
+            let mut stream = [0u8; 0x100];
+            match vm.read_bytes(encoder, &mut stream) {
+                Ok(()) => {
+                    for chunk in 0..(stream.len() / 32) {
+                        let base = chunk * 32;
+                        if crate::util::g17p_verbose() {
+                            pr_info!(
+                                "G17P render vdm-stream +{:#05x}: {:02x?}\n",
+                                base,
+                                &stream[base..base + 32],
+                            );
+                        }
+                    }
+                    for word in 0..(stream.len() / 8) {
+                        let mut bytes = [0u8; 8];
+                        bytes.copy_from_slice(&stream[word * 8..word * 8 + 8]);
+                        let value = u64::from_le_bytes(bytes);
+                        if value == 0 {
+                            continue;
+                        }
+                        let mapped = vm.covers_range(value & !0x3fff, 0x4000, true, false);
+                        let rebased = value.checked_add(0x10_0000_0000).unwrap_or(0);
+                        let rebased_mapped =
+                            rebased != 0 && vm.covers_range(rebased & !0x3fff, 0x4000, true, false);
+                        if mapped || rebased_mapped {
+                            pr_info!(
+                                "G17P render vdm-pointer +{:#05x}: {:#x} mapped={} rebased({:#x})={}\n",
+                                word * 8,
+                                value,
+                                mapped,
+                                rebased,
+                                rebased_mapped,
+                            );
+                        }
+                    }
+                }
+                Err(error) => pr_info!(
+                    "G17P render vdm-stream: read at {:#x} failed ({:?})\n",
+                    encoder,
+                    error,
+                ),
+            }
+        }
+        pr_info!(
+            "G17P render ta-inputs: deflake={:#x}/{:#x}/{:#x} {}x{} layers={} utile={}x{} bootstrap_vdm={}\n",
+            translated.parameters.deflake_1,
+            translated.parameters.deflake_2,
+            translated.parameters.deflake_3,
+            translated.parameters.width,
+            translated.parameters.height,
+            translated.parameters.layers,
+            translated.parameters.utile_width,
+            translated.parameters.utile_height,
+            bootstrap_vdm,
+        );
+        // Allocate after render state/TVB so the entries-only diagnostic RCE
+        // mirror does not perturb their established low VAs. Native KSM binds
+        // the complete descriptor-local arrays instead.
+        let mut fragment_rce = bootstrap_stage!(
+            "3D external RCE program allocation",
+            MappedObject::new_wc_in_range(
+                dev,
+                vm,
+                g17p_cl_client_low_va_range(),
+                g17_render::G17P_FRAGMENT_RCE_STORAGE_SIZE,
+                mmu::UAT_PGSZ as u64,
+                mmu::PROT_GPU_SHARED_RO,
+            )
+        );
+        let fragment_rce_va = fragment_rce.iova();
+        let descriptor_3d_render = bootstrap_stage!(
+            "3D descriptor render-VM alias",
+            descriptors.object.map_range_into_range(
+                vm,
+                G17P_RENDER_3D_DESCRIPTOR_OFFSET
+                    ..G17P_RENDER_3D_DESCRIPTOR_OFFSET + mmu::UAT_PGSZ,
+                g17p_cl_client_low_va_range(),
+                mmu::UAT_PGSZ as u64,
+                mmu::PROT_GPU_SHARED_RO,
+                false,
+            )
+        );
+        let descriptor_3d_render_va = descriptor_3d_render.iova();
+        let descriptor_3d_rce_va = descriptor_3d_low.iova();
+        dev_info!(
+            dev.as_ref(),
+            "G17P render RCE: job descriptor={:#x}, retained diagnostic client alias={:#x}; diagnostic entry mirrors={:#x}/{:#x}/{:#x}/{:#x} stride={:#x}\n",
+            descriptor_3d_rce_va,
+            descriptor_3d_render_va,
+            fragment_rce_va,
+            fragment_rce_va + g17_render::G17P_FRAGMENT_RCE_PROGRAM_STRIDE,
+            fragment_rce_va + 2 * g17_render::G17P_FRAGMENT_RCE_PROGRAM_STRIDE,
+            fragment_rce_va + 3 * g17_render::G17P_FRAGMENT_RCE_PROGRAM_STRIDE,
+            g17_render::G17P_FRAGMENT_RCE_PROGRAM_STRIDE,
+        );
+        let (fragment_mcache, tiling_mcache) = bootstrap_stage!("descriptor encoding", descriptors.with_bytes_mut(|raw| {
+            let (ta_array, fragment_array) = raw.split_at_mut(G17P_RENDER_3D_DESCRIPTOR_OFFSET);
+            let tiling = ta_array.get_mut(..g17_render::TA_DESCRIPTOR_SIZE).ok_or(ERANGE)?;
+            let fragment = fragment_array
+                .get_mut(..g17_render::FRAGMENT_DESCRIPTOR_SIZE).ok_or(ERANGE)?;
+            g17_render::build_cold_opening_ta_descriptor(
+                &translated.parameters,
+                tiling_objects,
+                command_context_id,
+                command_buffer_state_words[0],
+                translated.parameters.ta_hardware_buffer_id,
+                tiling,
+            )
+                .map_err(|error| render_build_fail_named(16, error))?;
             g17_render::apply_g17p_retained_descriptor_fields(
                 g17_render::RenderDescriptorKind::Tiling,
                 G17P_BOOTSTRAP_TA_DESCRIPTOR_LOW_VA,
@@ -2817,7 +3669,113 @@ impl G17PUserRenderStorage {
         if submission_ordinal == 0 || submission_ordinal >= G17P_RETAINED_RENDER_ORDINALS {
             return Err(EINVAL);
         }
-        let mut next_descriptors = MappedObject::new_wc(
+        if !Self::descriptor_context_valid(descriptor_context_id) {
+            return Err(EINVAL);
+        }
+        // The retained graph keeps its VM's binding for its whole lifetime,
+        // so the bound root cannot move between submissions on it.
+        let render_root_slot = self.render_root_slot;
+        let plan = G17PRenderItemPlan::new(submission_ordinal, g17p_render_tag16_enabled())
+            .ok_or(EINVAL)?;
+        core::sync::atomic::fence(Ordering::Acquire);
+        let previous = self.snapshot()?;
+        if !previous.job_list_empty || !previous.tiling.idle() || !previous.fragment.idle()
+            || previous.tiling.write != plan.base || previous.fragment.write != plan.base
+        {
+            // This is the one place a render is refused because the PREVIOUS
+            // group on this retained storage has not finished. It used to
+            // return a bare EBUSY, which reaches Mesa as VK_ERROR_DEVICE_LOST
+            // and destroys the client's context -- so the one boot that
+            // reproduces it has to carry every input the guard tested, plus
+            // which owner's storage this is. Name the owner (its pid and queue
+            // pair), its ordinal, and each field with its actual value against
+            // what was required.
+            dev_err!(
+                dev.as_ref(),
+                "G17P render restage: previous group still owns this storage; owner-pid={} qids={}/{} ordinal={} base={} job-list-empty={} tiling done/read/write={}/{}/{} fragment done/read/write={}/{}/{} (required: job-list empty, both queues done==read==write, both writes == {})\n",
+                self.owner_pid,
+                self.queue_pair.tiling,
+                self.queue_pair.fragment,
+                submission_ordinal,
+                plan.base,
+                previous.job_list_empty,
+                previous.tiling.done,
+                previous.tiling.read,
+                previous.tiling.write,
+                previous.fragment.done,
+                previous.fragment.read,
+                previous.fragment.write,
+                plan.base,
+            );
+            return Err(EBUSY);
+        }
+        // The staging image is scratch whose address never leaves this
+        // function (see `staging_descriptors`). Take the retained one when
+        // there is one and zero it exactly as a fresh allocation is zeroed;
+        // otherwise allocate. It is handed back at the end of a successful
+        // restage, so an early error simply drops it and the next submission
+        // allocates again.
+        let mut next_descriptors = match self.staging_descriptors.take() {
+            Some(mut retained) if g17p_retain_staging() => {
+                restage_step!(
+                    "staging reset",
+                    retained.object.vmap().map(|mut view| view.memset(0))
+                );
+                retained
+            }
+            _ => restage_step!("descriptor allocation", MappedObject::new_wc(
+                dev,
+                uat,
+                G17P_RENDER_DESCRIPTOR_IMAGE_SIZE,
+                mmu::UAT_PGSZ as u64,
+                mmu::PROT_GPU_FW_SHARED_RW,
+            )),
+        };
+        let render_layout =
+            g17p_render_state_layout(&command.parameters, num_clusters).ok_or(EINVAL)?;
+        if page_align(render_layout.tpc_size).ok_or(EOVERFLOW)?
+            > self.render_target_memory.tpc.logical_size
+        {
+            return Err(ERANGE);
+        }
+        let render_target_addresses = restage_step!(
+            "render-target-memory record",
+            self.render_target_memory
+                .prepare_rt_slot(submission_ordinal, &render_layout)
+        );
+        // Native retains command descriptor memory maps with the work queue;
+        // DEFLAKE/TA-status/AXFB are graph-owned, not submission-parity
+        // allocations. TMAP/HMTA rotate in render_target_memory and TPC is
+        // separately persistent, so the surviving command-state layout is
+        // capacity-stable and can be refreshed in place for every restage.
+        if render_layout.total_size > self.render_state.logical_size
+            || render_layout.aux_fb != self.render_layout.aux_fb
+            || !self.render_user_aliases.all_reachable_from(vm)
+        {
+            dev_err!(
+                dev.as_ref(),
+                "G17P render restage: cached render-state layout is incompatible; old-size={:#x} new-size={:#x} old-aux={:#x} new-aux={:#x} aliases-reachable={} ordinal={}\n",
+                self.render_state.logical_size,
+                render_layout.total_size,
+                self.render_layout.aux_fb,
+                render_layout.aux_fb,
+                self.render_user_aliases.all_reachable_from(vm),
+                submission_ordinal,
+            );
+            return Err(ERANGE);
+        }
+        if g17p_render_tvb_enabled() {
+            let tvb = self.render_tvb.as_mut().ok_or(EIO)?;
+            if tvb.logical_size < render_layout.tvb_size
+                || render_layout.tvb_blocks > tvb.block_count
+                || !tvb.all_reachable_from(vm)
+            {
+                return Err(ERANGE);
+            }
+            // Native retains this pool and lets firmware recycle its pages.
+            // Clearing its contents would destroy retained PM-owned state.
+        }
+        let next_timestamps = restage_step!("timestamp allocation", MappedObject::new_wc(
             dev,
             uat,
             G17P_RENDER_DESCRIPTOR_STORAGE_SIZE,
@@ -2850,14 +3808,42 @@ impl G17PUserRenderStorage {
         translated.parameters.deflake_2 = translated.parameters.deflake_3 + 0x20;
         translated.parameters.deflake_1 = translated.parameters.deflake_3 + 0x2a0;
         translated.parameters.ta_status = render_state_va + G17P_RENDER_STATE_TA_STATUS as u64;
-        translated.parameters.fragment_status =
-            render_state_va + G17P_RENDER_STATE_FRAGMENT_STATUS as u64;
-        translated.parameters.heapmeta = render_state_va + render_layout.heapmeta as u64;
-        translated.parameters.tpc = render_state_va + render_layout.tpc as u64;
-        translated.parameters.aux_fb = render_state_va + render_layout.aux_fb as u64;
+        translated.parameters.fragment_status = self.fragment_status_low.iova();
+        translated.parameters.layermeta = render_target_addresses.layermeta;
+        translated.parameters.heapmeta = render_target_addresses.heapmeta;
+        translated.parameters.tpc = self.render_target_memory.tpc_va();
+        translated.parameters.aux_fb = aux_fb_va;
         translated.parameters.aux_fb_page_count = G17P_RENDER_AUX_FB_PAGE_COUNT;
         translated.parameters.aux_fb_flags = g17p_aux_fb_flags(translated.flags);
-        translated.parameters.tilemap = render_state_va + render_layout.tilemap as u64;
+        translated.parameters.tilemap = render_target_addresses.tilemap;
+        if let Some(pm) = self.parameter_management.as_ref() {
+            translated.parameters.parameter_buffer = pm.selected_scene_va();
+            let (cycle, record_index) = pm.scene_registers(
+                self.scene_scratch.as_ref().map(MappedObject::iova).ok_or(EINVAL)?,
+            )?;
+            translated.parameters.cycle = cycle;
+            translated.parameters.record_index = record_index;
+            if crate::util::g17p_verbose() {
+                dev_info!(
+                    dev.as_ref(),
+                    "G17P retained PM: owner={:#x} scene-index={} scene={:#x} cycle={:#x} metric-register={:#x} manager-generation={} (pool and PBDesc preserved)\n",
+                    pm.hwpb_state_va(), pm.selected_scene, pm.selected_scene_va(),
+                    cycle, record_index, pm.manager_generation,
+                );
+            }
+        }
+        // NATIVE LAYOUT, macOS 26.6.2 2026-09-02 (recs3.txt, three passes,
+        // byte-stable): a render pass owns ONE (start, end) pair, not one per
+        // stage. The TA descriptor carries only a START pointer and leaves its
+        // end field ZERO (+0x08fe = 0xfffffc2000024c68, +0x0906 = 0); the 3D
+        // points its START at the SAME address and its END at start+8. The
+        // tiler stamps the pass start, the fragment stamps the pass end.
+        //
+        // This driver published four distinct qwords and required all four to
+        // be non-zero before calling a render complete, which the hardware can
+        // never satisfy because nothing writes a TA end. That is why a render
+        // whose completion ring showed BOTH stages finished with real
+        // start/end timestamps was still abandoned after 2000 polls.
         translated.parameters.ta_timestamp_start = timestamp_va;
         translated.parameters.ta_timestamp_end = timestamp_va + 8;
         translated.parameters.ta_user_timestamp_start = user_timestamps[0];
@@ -3022,8 +4008,575 @@ impl G17PUserRenderStorage {
         Ok(())
     }
 
-    pub(crate) fn is_reachable_from(&self, uat: &mmu::Uat, vm: &mmu::Vm) -> bool {
-        G17PRenderStorageVaLayout {
+    /// Report which reachability condition fails, instead of a bare bool.
+    ///
+    /// `is_reachable_from` ANDs together a dozen checks and the caller turns a
+    /// false into EFAULT, which tells us nothing. Render currently fails here,
+    /// so print each clause.
+    /// Dump the two per-queue status pages the firmware would write.
+    ///
+    /// Plain DRAM reads of an object the driver allocated -- no sgx MMIO -- so
+    /// unlike the scheduler-gate probe this is safe at every point in a
+    /// submission, including after a timeout when the GPU cores have powered
+    /// back down. Going from all-zero to non-zero across the kick proves the
+    /// firmware touched them.
+    pub(crate) fn log_status_pages(&mut self, dev: &AsahiDevice, label: &str) {
+        if !crate::util::g17p_verbose() {
+            return;
+        }
+        let mut ta = [0u32; 8];
+        let mut fragment = [0u32; 8];
+        let ta_read = self.render_state.with_bytes_mut(|raw| {
+            for (index, slot) in ta.iter_mut().enumerate() {
+                let at = G17P_RENDER_STATE_TA_STATUS + index * 4;
+                *slot = u32::from_le_bytes([raw[at], raw[at + 1], raw[at + 2], raw[at + 3]]);
+            }
+            Ok(())
+        });
+        let fragment_read = self.fragment_status.with_bytes_mut(|raw| {
+            for (index, slot) in fragment.iter_mut().enumerate() {
+                let at = index * 4;
+                *slot = u32::from_le_bytes([raw[at], raw[at + 1], raw[at + 2], raw[at + 3]]);
+            }
+            Ok(())
+        });
+        let status_read_failed = ta_read.is_err() || fragment_read.is_err();
+        match (ta_read, fragment_read) {
+            (Ok(()), Ok(())) => {
+                dev_info!(
+                    dev.as_ref(),
+                    "G17P render status[{}]: TA  {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x}\n",
+                    label, ta[0], ta[1], ta[2], ta[3], ta[4], ta[5], ta[6], ta[7],
+                );
+                dev_info!(
+                    dev.as_ref(),
+                    "G17P render status[{}]: 3D  {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x}\n",
+                    label, fragment[0], fragment[1], fragment[2], fragment[3],
+                    fragment[4], fragment[5], fragment[6], fragment[7],
+                );
+            }
+            (ta_error, fragment_error) => dev_err!(
+                dev.as_ref(),
+                "G17P render status[{}]: read failed TA={:?} 3D={:?}\n",
+                label,
+                ta_error,
+                fragment_error,
+            ),
+        }
+        if g17p_render_target_scan_due(
+            label,
+            *crate::module_parameters::g17p_dep_records.value() != 0,
+            status_read_failed,
+        ) {
+            self.log_render_target_state(dev, label);
+        }
+    }
+
+    /// Dump the fixed-function render targets for diagnostic checkpoints.
+    /// These are the exact objects TA produces and 3D/dIPP
+    /// consumes, so a one-boot failure can distinguish an untouched RT graph
+    /// from a fragment-side decode failure without another instrumentation
+    /// rebuild.
+    fn log_render_target_state(&mut self, dev: &AsahiDevice, label: &str) {
+        let layout = self.render_layout;
+        let mut tilemap = [0u64; 8];
+        let mut heapmeta = [0u64; 8];
+        let mut tpc = [0u64; 8];
+        let mut axfb_head = [0u64; 8];
+        let mut axfb_480 = [0u64; 8];
+        let mut nonzero = [0usize; 4];
+        let state_read = self.render_state.with_bytes_mut(|raw| {
+            let copy_head = |offset: usize, out: &mut [u64; 8]| -> Result {
+                for (index, value) in out.iter_mut().enumerate() {
+                    let at = offset.checked_add(index * 8).ok_or(EOVERFLOW)?;
+                    *value = u64::from_le_bytes(
+                        raw.get(at..at + 8)
+                            .ok_or(ERANGE)?
+                            .try_into()
+                            .map_err(|_| EINVAL)?,
+                    );
+                }
+                Ok(())
+            };
+            copy_head(layout.aux_fb, &mut axfb_head)?;
+            copy_head(layout.aux_fb + 0x480, &mut axfb_480)?;
+            nonzero[3] = raw
+                .get(
+                    layout.aux_fb
+                        ..layout
+                            .aux_fb
+                            .checked_add(G17P_RENDER_STATE_AUX_FB_SIZE)
+                            .ok_or(EOVERFLOW)?,
+                )
+                .ok_or(ERANGE)?
+                .iter()
+                .filter(|byte| **byte != 0)
+                .count();
+            Ok(())
+        });
+        let rt_offset = g17p_render_rt_record_offset(self.descriptor_ordinal);
+        let rt_read = self.render_target_memory.rt_memory.with_bytes_mut(|raw| {
+            let tilemap_start = rt_offset;
+            let heapmeta_start = rt_offset
+                .checked_add(layout.heapmeta.checked_sub(layout.tilemap).ok_or(EINVAL)?)
+                .ok_or(EOVERFLOW)?;
+            let mut read_region =
+                |start: usize, size: usize, out: &mut [u64; 8], count_index: usize| -> Result {
+                for (index, value) in out.iter_mut().enumerate() {
+                    let at = start.checked_add(index * 8).ok_or(EOVERFLOW)?;
+                    *value = u64::from_le_bytes(
+                        raw.get(at..at + 8)
+                            .ok_or(ERANGE)?
+                            .try_into()
+                            .map_err(|_| EINVAL)?,
+                    );
+                }
+                nonzero[count_index] = raw
+                    .get(start..start.checked_add(size).ok_or(EOVERFLOW)?)
+                    .ok_or(ERANGE)?
+                    .iter()
+                    .filter(|byte| **byte != 0)
+                    .count();
+                Ok(())
+            };
+            read_region(tilemap_start, layout.tilemap_size, &mut tilemap, 0)?;
+            read_region(heapmeta_start, layout.heapmeta_size, &mut heapmeta, 1)?;
+            Ok(())
+        });
+        let tpc_read = self.render_target_memory.tpc.with_bytes_mut(|raw| {
+            for (index, value) in tpc.iter_mut().enumerate() {
+                let at = index.checked_mul(8).ok_or(EOVERFLOW)?;
+                *value = u64::from_le_bytes(
+                    raw.get(at..at + 8)
+                        .ok_or(ERANGE)?
+                        .try_into()
+                        .map_err(|_| EINVAL)?,
+                );
+            }
+            nonzero[2] = raw
+                .get(..layout.tpc_size)
+                .ok_or(ERANGE)?
+                .iter()
+                .filter(|byte| **byte != 0)
+                .count();
+            Ok(())
+        });
+        let read = state_read.and(rt_read).and(tpc_read);
+        // TMAP/HMTA rotate through the persistent render-target-memory ring;
+        // TPC lives in its separate stable mapping. The TILING VERTEX BUFFER
+        // is a separate object and was never
+        // scanned, so "the tiler wrote nothing" could not be distinguished
+        // from "the tiler wrote where we do not look" -- which matters,
+        // because KTrace 0x43 reports status 3 (executed) for the TA and 4
+        // (NOP-retired) only for the fragment, i.e. the tiler really does run.
+        let mut first = usize::MAX;
+        let mut window = [0u8; 64];
+        let tvb_nonzero = self.render_tvb.as_mut().map(|tvb| {
+            let block_count = tvb.block_count;
+            let size = block_count * G17P_RENDER_TVB_BLOCK_SIZE;
+            (|| -> Result<usize> {
+                let mut count=0usize;
+                for block in 0..block_count {
+                    count+=tvb.with_block_bytes(block,|bytes| {
+                        if first==usize::MAX {
+                            if let Some(at)=bytes.iter().position(|byte| *byte!=0) {
+                                first=block*G17P_RENDER_TVB_BLOCK_SIZE+at;
+                                let start=at & !0xf;
+                                for (index,slot) in window.iter_mut().enumerate() {
+                                    *slot=bytes.get(start+index).copied().unwrap_or(0);
+                                }
+                            }
+                        }
+                        Ok(bytes.iter().filter(|byte| **byte!=0).count())
+                    })?;
+                }
+                Ok(count)
+            })()
+            .map(|count| (count, size))
+            .unwrap_or((usize::MAX, size))
+        });
+        if let Some((count, size)) = tvb_nonzero {
+            // Where the tiler wrote matters as much as how much: 32 bytes in a
+            // 1.2MB buffer is either a bare header or a single minimal tile
+            // list, and the two say opposite things about whether geometry was
+            // processed. Report the first non-zero offset and the bytes there.
+            if first == usize::MAX {
+                dev_info!(
+                    dev.as_ref(),
+                    "G17P render TVB[{}]: nonzero={} of {} bytes (all zero)\n",
+                    label,
+                    count,
+                    size,
+                );
+            } else {
+                dev_info!(
+                    dev.as_ref(),
+                    "G17P render TVB[{}]: nonzero={} of {} bytes, first at {:#x}: {:02x?}\n",
+                    label,
+                    count,
+                    size,
+                    first,
+                    &window[..],
+                );
+            }
+        }
+        match read {
+            Ok(()) => {
+                dev_info!(
+                    dev.as_ref(),
+                    "G17P render RT[{}]: aliases tilemap={:#x} heapmeta={:#x} tpc={:#x} axfb={:#x} nonzero(T/H/P/A)={:?}\n",
+                    label,
+                    self.render_target_memory
+                        .tilemap_va(self.descriptor_ordinal).unwrap_or(0),
+                    self.render_target_memory
+                        .heapmeta_va(self.descriptor_ordinal, &layout).unwrap_or(0),
+                    self.render_target_memory.tpc_va(),
+                    self.render_user_aliases.aux_fb_va(),
+                    nonzero,
+                );
+                dev_info!(
+                    dev.as_ref(),
+                    "G17P render RT[{}]: tilemap={:x?} heapmeta={:x?} tpc={:x?}\n",
+                    label,
+                    tilemap,
+                    heapmeta,
+                    tpc,
+                );
+                dev_info!(
+                    dev.as_ref(),
+                    "G17P render RT[{}]: axfb+0={:x?} axfb+480={:x?}\n",
+                    label,
+                    axfb_head,
+                    axfb_480,
+                );
+            }
+            Err(error) => dev_warn!(
+                dev.as_ref(),
+                "G17P render RT[{}]: snapshot failed ({:?})\n",
+                label,
+                error,
+            ),
+        }
+    }
+
+    /// Read back the parameter-management state at the same launch checkpoints
+    /// as the queue status pages.
+    ///
+    /// Native Metal's `_AGFIParameterBufferState` is not a static descriptor:
+    /// TA writes its first five words while binning and the 3D admission path
+    /// consumes the resulting HWPB/Scene state.  Input-descriptor parity alone
+    /// therefore cannot distinguish a bad PM graph from a later KSM gate.  All
+    /// objects sampled here are driver-owned shared DRAM; no SGX MMIO is read,
+    /// so this remains safe after the cores have powered down for recovery.
+    pub(crate) fn log_parameter_management(&mut self, dev: &AsahiDevice, label: &str) {
+        let Some(pm) = self.parameter_management.as_mut() else {
+            return;
+        };
+        let mut hwpb_head = [0u32; 8];
+        let mut hwpb_config = [0u64; 12];
+        let mut block_control = [0u32; 8];
+        let mut stats = [0u32; 16];
+        let mut selected_scene = [0u64; 16];
+        let mut scene_trailer = [0u64; 8];
+        let mut page_list = [0u32; 8];
+        let mut block_bases = [0u64; 4];
+        let mut counter = 0u32;
+        let read = pm.backing.with_bytes_mut(|raw| {
+            let u32_at = |at: usize| -> Result<u32> {
+                Ok(u32::from_le_bytes(
+                    raw.get(at..at + 4)
+                        .ok_or(EINVAL)?
+                        .try_into()
+                        .map_err(|_| EINVAL)?,
+                ))
+            };
+            let u64_at = |at: usize| -> Result<u64> {
+                Ok(u64::from_le_bytes(
+                    raw.get(at..at + 8)
+                        .ok_or(EINVAL)?
+                        .try_into()
+                        .map_err(|_| EINVAL)?,
+                ))
+            };
+            for (index, value) in hwpb_head.iter_mut().enumerate() {
+                *value = u32_at(pm.layout.hwpb_state + index * 4)?;
+            }
+            // Pointers and scalar configuration from PBState +0x20..+0x8b.
+            for (index, offset) in [
+                0x20usize, 0x28, 0x30, 0x38, 0x40, 0x44,
+                0x4c, 0x54, 0x5c, 0x64, 0x7c, 0x84,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                hwpb_config[index] = u64_at(pm.layout.hwpb_state + offset)?;
+            }
+            for (index, value) in block_control.iter_mut().enumerate() {
+                *value = u32_at(pm.layout.shared_control + index * 4)?;
+            }
+            for (index, value) in stats.iter_mut().enumerate() {
+                *value = u32_at(pm.layout.shared_control + 0x40 + index * 4)?;
+            }
+            let selected = pm.layout.scene_states
+                + pm.selected_scene * G17P_PM_SCENE_ENTRY_SIZE;
+            for (index, value) in selected_scene.iter_mut().enumerate() {
+                *value = u64_at(selected + index * 8)?;
+            }
+            let trailer = pm.layout.scene_states
+                + G17P_PM_SCENE_COUNT * G17P_PM_SCENE_ENTRY_SIZE;
+            for (index, value) in scene_trailer.iter_mut().enumerate() {
+                *value = u64_at(trailer + index * 8)?;
+            }
+            for (index, value) in page_list.iter_mut().enumerate() {
+                *value = u32_at(pm.layout.page_list + index * 4)?;
+            }
+            for (index, value) in block_bases.iter_mut().enumerate() {
+                *value = u64_at(pm.layout.block_page_bases + index * 8)?;
+            }
+            counter = u32_at(pm.layout.counter)?;
+            Ok(())
+        });
+        match read {
+            Ok(()) => {
+                dev_info!(
+                    dev.as_ref(),
+                    "G17P render PM[{}]: HWPB head={:x?} config(+20,+28,+30,+38,+40,+44,+4c,+54,+5c,+64,+7c,+84)={:x?}\n",
+                    label,
+                    hwpb_head,
+                    hwpb_config,
+                );
+                dev_info!(
+                    dev.as_ref(),
+                    "G17P render PM[{}]: block-control={:x?} counter={:#x} scene-qwords={:x?}\n",
+                    label,
+                    block_control,
+                    counter,
+                    selected_scene,
+                );
+                dev_info!(
+                    dev.as_ref(),
+                    "G17P render PM[{}]: stats={:x?} scene-trailer={:x?}\n",
+                    label,
+                    stats,
+                    scene_trailer,
+                );
+                dev_info!(
+                    dev.as_ref(),
+                    "G17P render PM[{}]: page-list[0..8]={:x?} block-bases[0..4]={:x?}\n",
+                    label,
+                    page_list,
+                    block_bases,
+                );
+            }
+            Err(error) => dev_warn!(
+                dev.as_ref(),
+                "G17P render PM[{}]: snapshot failed ({:?})\n",
+                label,
+                error,
+            ),
+        }
+    }
+
+    pub(crate) fn log_reachability(&self, dev: &AsahiDevice, uat: &mmu::Uat, vm: &mmu::Vm) {
+        let layout = G17PRenderStorageVaLayout {
+            descriptors: self.descriptors.iova(),
+            graph: self.graph.iova(),
+            support: self.support.iova(),
+            render_state: self.render_state.iova(),
+            render_state_size: self.render_state.logical_size as u64,
+            timestamps: self.timestamps.iova(),
+        };
+        let ranges_ok = layout.all_referenced_ranges_reachable(
+            |address, size| uat.kernel_vm().covers_range(address, size, true, true),
+            |address, size| vm.covers_range(address, size, true, true),
+        ) && self.render_user_aliases.all_reachable_from(vm)
+            && self.scene_scratch.as_ref().map_or(true, |scene| {
+                scene.iova() == g17p_render_scene_scratch_va(self.queue_pair).unwrap_or(0)
+                    && scene.logical_size == G17P_RENDER_SCENE_SCRATCH_MAPPING_SIZE
+                    && vm.covers_range(
+                        scene.iova(),
+                        scene.logical_size as u64,
+                        true,
+                        true,
+                    )
+            })
+            && self.discard.as_ref().map_or(true, |discard| {
+                discard.iova() == g17p_render_discard_va(self.queue_pair).unwrap_or(0)
+                    && discard.logical_size == G17P_PM_DISCARD_SIZE
+                    && vm.covers_range(
+                        discard.iova(),
+                        discard.logical_size as u64,
+                        true,
+                        true,
+                    )
+            })
+            && uat.kernel_vm().covers_range(
+                self.fragment_status.iova(),
+                self.fragment_status.logical_size as u64,
+                false,
+                false,
+            )
+            && vm.covers_range(
+                self.fragment_status_low.iova(),
+                self.fragment_status_low.size() as u64,
+                true,
+                true,
+            )
+            && self.render_tvb.as_ref().map_or(true, |tvb| {
+                tvb.all_reachable_from(vm)
+            })
+            && vm.covers_range(
+                self.fragment_rce.iova(),
+                self.fragment_rce.logical_size as u64,
+                true,
+                false,
+            )
+            && vm.covers_range(
+                self.descriptor_3d_render.iova(),
+                self.descriptor_3d_render.size() as u64,
+                true,
+                false,
+            );
+        dev_info!(
+            dev.as_ref(),
+            "G17P render reach: ranges={} ta_high(iova={:#x} size={:#x} covered={}) 3d_high(iova={:#x} covered={})\n",
+            ranges_ok,
+            self.descriptors.iova(),
+            G17P_RENDER_TA_DESCRIPTOR_ARRAY_SIZE,
+            uat.kernel_vm().covers_range(self.descriptors.iova(),
+                G17P_RENDER_TA_DESCRIPTOR_ARRAY_SIZE as u64, true, true),
+            self.descriptors.iova() + G17P_RENDER_3D_DESCRIPTOR_OFFSET as u64,
+            uat.kernel_vm().covers_range(
+                self.descriptors.iova() + G17P_RENDER_3D_DESCRIPTOR_OFFSET as u64,
+                G17P_RENDER_3D_DESCRIPTOR_ARRAY_SIZE as u64, true, true),
+        );
+        dev_info!(
+            dev.as_ref(),
+            "G17P render reach: ta_low(iova={:#x} arena={:#x} covered={}) descriptors={:#x} graph={:#x} support={:#x} state={:#x}+{:#x} ts={:#x}\n",
+            self.descriptor_ta_low.iova(),
+            G17P_CL_CLIENT_LOW_VA_START,
+            vm.covers_range(self.descriptor_ta_low.iova(),
+                self.descriptor_ta_low.size() as u64, true, false),
+            layout.descriptors,
+            layout.graph,
+            layout.support,
+            layout.render_state,
+            layout.render_state_size,
+            layout.timestamps,
+        );
+        dev_info!(
+            dev.as_ref(),
+            "G17P render reach: compact deflake={:#x} 3d-status={:#x}/{:#x} scene={:#x} discard={:#x} tilemap={:#x} tpc={:#x} axfb={:#x} tvb-first={:#x} tvb-last={:#x} rce={:#x} descriptor3d={:#x} covered={}\n",
+            self.render_user_aliases.deflake_va(),
+            self.fragment_status_low.iova(),
+            self.fragment_status.iova(),
+            self.scene_scratch.as_ref().map_or(0, MappedObject::iova),
+            self.discard.as_ref().map_or(0, MappedObject::iova),
+            self.render_target_memory
+                .tilemap_va(self.descriptor_ordinal).unwrap_or(0),
+            self.render_target_memory.tpc_va(),
+            self.render_user_aliases.aux_fb_va(),
+            self.render_tvb.as_ref().map_or(0, G17PRenderTvb::iova),
+            self.render_tvb.as_ref().map_or(0, |_| {
+                g17p_render_tvb_block_va(self.queue_pair, G17P_PM_BLOCK_COUNT - 1).unwrap_or(0)
+            }),
+            self.fragment_rce.iova(),
+            self.descriptor_3d_render.iova(),
+            self.render_user_aliases.all_reachable_from(vm)
+                && (self.render_target_memory.tpc_va()
+                    == g17p_render_tpc_va(self.queue_pair).unwrap_or(0))
+                && (self.render_target_memory.tpc.logical_size >= self.render_layout.tpc_size)
+                && vm.covers_range(
+                    self.render_target_memory.tpc_va(),
+                    self.render_layout.tpc_size as u64,
+                    true,
+                    true,
+                )
+                && (self.render_target_memory.rt_memory.iova()
+                    == g17p_render_rt_memory_va(self.queue_pair).unwrap_or(0))
+                && vm.covers_range(
+                    self.render_target_memory
+                        .tilemap_va(self.descriptor_ordinal).unwrap_or(0),
+                    self.render_layout.tilemap_size as u64,
+                    true,
+                    true,
+                )
+                && vm.covers_range(
+                    self.render_target_memory
+                        .rt_region_va(
+                            self.descriptor_ordinal,
+                            &self.render_layout,
+                            self.render_layout.layermeta,
+                        )
+                        .unwrap_or(0),
+                    (self.render_layout.layermeta_size + self.render_layout.heapmeta_size) as u64,
+                    true,
+                    true,
+                )
+                && self.scene_scratch.as_ref().map_or(true, |scene| {
+                    scene.iova() == g17p_render_scene_scratch_va(self.queue_pair).unwrap_or(0)
+                        && scene.logical_size == G17P_RENDER_SCENE_SCRATCH_MAPPING_SIZE
+                        && vm.covers_range(
+                            scene.iova(),
+                            scene.logical_size as u64,
+                            true,
+                            true,
+                        )
+                })
+                && self.discard.as_ref().map_or(true, |discard| {
+                    discard.iova() == g17p_render_discard_va(self.queue_pair).unwrap_or(0)
+                        && discard.logical_size == G17P_PM_DISCARD_SIZE
+                        && vm.covers_range(
+                            discard.iova(),
+                            discard.logical_size as u64,
+                            true,
+                            true,
+                        )
+                })
+                && uat.kernel_vm().covers_range(
+                    self.fragment_status.iova(),
+                    self.fragment_status.logical_size as u64,
+                    false,
+                    false,
+                )
+                && vm.covers_range(
+                    self.fragment_status_low.iova(),
+                    self.fragment_status_low.size() as u64,
+                    true,
+                    true,
+                )
+                && self.render_tvb.as_ref().map_or(true, |tvb| {
+                    tvb.all_reachable_from(vm)
+                })
+                && vm.covers_range(
+                    self.fragment_rce.iova(),
+                    self.fragment_rce.logical_size as u64,
+                    true,
+                    false,
+                )
+                && vm.covers_range(
+                    self.descriptor_3d_render.iova(),
+                    self.descriptor_3d_render.size() as u64,
+                    true,
+                    false,
+                ),
+        );
+    }
+
+    /// Name the first mapping predicate a render submission fails, or `None`
+    /// when every one of them holds.
+    ///
+    /// This used to be a single anonymous `&&` chain behind
+    /// `is_reachable_from`, so any failure surfaced as a bare `EFAULT` from
+    /// `begin_translated_render` with nothing said about which of ~20
+    /// predicates was false. Every arm now carries a name.
+    pub(crate) fn first_unreachable(
+        &self,
+        uat: &mmu::Uat,
+        vm: &mmu::Vm,
+    ) -> Option<&'static str> {
+        let sksm_backing = self.sksm_backing.as_ref();
+        let layout_ok = G17PRenderStorageVaLayout {
             descriptors: self.descriptors.iova(),
             graph: self.graph.iova(),
             support: self.support.iova(),
@@ -5755,6 +7308,202 @@ mod tests {
     }
 
     #[test]
+    fn retained_descriptors_advance_through_native_stride_arrays() {
+        assert_eq!(G17P_RENDER_DESCRIPTOR_SLOT_COUNT, 32);
+        assert_eq!(G17P_RENDER_TA_DESCRIPTOR_ARRAY_SIZE, 0x14000);
+        assert_eq!(G17P_RENDER_3D_DESCRIPTOR_ARRAY_SIZE, 0x48000);
+        assert_eq!(G17P_RENDER_DESCRIPTOR_STORAGE_SIZE, 0x5c000);
+        assert_eq!(g17p_render_ta_descriptor_offset(0), 0);
+        assert_eq!(g17p_render_ta_descriptor_offset(1), 0x9c0);
+        assert_eq!(g17p_render_3d_descriptor_offset(0), 0x14000);
+        assert_eq!(g17p_render_3d_descriptor_offset(1), 0x16240);
+        assert_eq!(
+            g17p_render_ta_descriptor_high_va(1),
+            Some(g17_submission::G17P_COLD_OPENING_TA_DESCRIPTOR_BASE + 0x9c0),
+        );
+        assert_eq!(
+            g17p_render_3d_descriptor_low_va(1),
+            Some(G17P_BOOTSTRAP_3D_DESCRIPTOR_LOW_VA + 0x2240),
+        );
+        assert_eq!(G17P_RENDER_QUEUE_GRAPH_SIZE, 0x14000);
+        assert_eq!(g17p_render_optional_offset(true, 1), 0xc180);
+        assert_eq!(g17p_render_event_offset(true, 1), 0xf080);
+        assert_eq!(g17p_render_optional_offset(false, 1), 0x10180);
+        assert_eq!(g17p_render_event_offset(false, 1), 0x13080);
+        assert_eq!(g17p_render_descriptor_slot(32), 0);
+    }
+
+    #[test]
+    fn g17p_parameter_management_matches_the_native_object_graph() {
+        let pm = g17p_parameter_management_layout().unwrap();
+        assert_eq!(G17P_PM_HWPB_STATE_SIZE, 0xc0);
+        assert_eq!(pm.hwpb_state, 0);
+        assert_eq!(pm.page_list, 0x8000);
+        assert_eq!(pm.block_page_bases, 0x40000);
+        assert_eq!(pm.shared_control, 0x20000);
+        assert_eq!(pm.counter, 0x28000);
+        assert_eq!(pm.page_metrics, 0x30000);
+        assert_eq!(pm.scene_states, 0x38000);
+        assert_eq!(pm.total_size, 0x48000);
+        assert_eq!(G17P_PM_PAGE_LIST_SIZE, 0xd1a0);
+        assert_eq!(G17P_PM_BLOCK_PAGE_BASE_TABLE_SIZE, 0x68d0);
+        assert_eq!(G17P_PM_SCENE_ALLOCATION_SIZE, 0x2840);
+        let tvb_va = 0x10_0008_8000;
+        let scene_scratch_va = 0x10_0017_8000;
+        let discard_va = 0x10_0018_0000;
+        assert_eq!(g17p_render_cycle_pointer(scene_scratch_va), Ok(0x178020));
+        assert_eq!(
+            g17p_render_cycle_pointer(0x10_0200_8000),
+            Ok(0x2008020)
+        );
+        let render = G17PRenderStateLayout {
+            layermeta: 0,
+            layermeta_size: 0,
+            heapmeta: 0,
+            heapmeta_size: 0,
+            tpc: 0,
+            tpc_size: 0,
+            aux_fb: 0,
+            tilemap: 0,
+            tilemap_size: 0,
+            tvb: 0x88_000,
+            tvb_size: 31 * G17P_RENDER_TVB_BLOCK_STRIDE + G17P_RENDER_TVB_BLOCK_SIZE,
+            tvb_blocks: 32,
+            pm_scene_scratch: 0x178_000,
+            pm_discard: 0x180_000,
+            total_size: 0x2c0_000,
+        };
+        let high = 0xffff_fc20_c091_0000;
+        let page_list_vas = [0xffff_fc20_c097_8000, 0x10_0019_0000];
+        let metrics_vas = [
+            0xffff_fc20_016d_0000,
+            mmu::T8140_PARAMETER_METRICS_LOW_VA,
+        ];
+        let firmware_metrics_vas = [metrics_vas[1], metrics_vas[0]];
+        let mut raw = vec![0xa5; pm.total_size];
+        assert_eq!(
+            encode_g17p_parameter_management(
+                &mut raw,
+                high,
+                G17PRenderQueuePair::for_slot(0).unwrap(),
+                page_list_vas,
+                firmware_metrics_vas,
+                tvb_va,
+                scene_scratch_va,
+                discard_va,
+                5,
+                7,
+                &render,
+                &pm,
+            ),
+            Ok(())
+        );
+
+        let state = pm.hwpb_state;
+        assert_eq!(get_u32(&raw, state + 0x0c), 5);
+        assert_eq!(get_u64(&raw, state + 0x20), page_list_vas[0]);
+        assert_eq!(get_u64(&raw, state + 0x28), page_list_vas[1]);
+        assert_eq!(get_u32(&raw, state + 0x30), 0x10000);
+        assert_eq!(get_u32(&raw, state + 0x34), 0x80);
+        assert_eq!(get_u32(&raw, state + 0x38), 0xd1a);
+        assert_eq!(get_u32(&raw, state + 0x3c), 32);
+        assert_eq!(get_u32(&raw, state + 0x40), 0);
+        assert_eq!(
+            get_u64(&raw, state + 0x44),
+            high + pm.block_page_bases as u64
+        );
+        assert_eq!(
+            get_u64(&raw, state + 0x4c),
+            high + pm.shared_control as u64
+        );
+        assert_eq!(get_u32(&raw, state + 0x54), 0x7f);
+        assert_eq!(get_u32(&raw, state + 0x58), 0x20000);
+        assert_eq!(get_u64(&raw, state + 0x64), high + pm.counter as u64);
+        assert_eq!(get_u32(&raw, state + 0x7c), 0x3468);
+        assert_eq!(get_u32(&raw, state + 0x80), 0x1178);
+        assert_eq!(get_u64(&raw, state + 0x84), 0x180000);
+
+        for (block, first) in G17P_NATIVE_TVB_BLOCK_PAGE_IDS.into_iter().enumerate() {
+            assert_eq!(get_u32(&raw, pm.block_page_bases + block * 8), first);
+            assert_eq!(get_u32(&raw, pm.block_page_bases + block * 8 + 4), 0);
+            for page in 0..4 {
+                assert_eq!(
+                    get_u32(&raw, pm.page_list + (block * 4 + page) * 4),
+                    first + page as u32
+                );
+            }
+        }
+        for slot in G17P_PM_BLOCK_COUNT * G17P_PM_PAGES_PER_BLOCK..160 {
+            assert_eq!(get_u32(&raw, pm.page_list + slot * 4), 0);
+        }
+        assert_eq!(render.tvb_size, 0x4f_8000);
+        assert_eq!(G17P_PM_BLOCK_COUNT * G17P_RENDER_TVB_BLOCK_SIZE, 0x40_0000);
+        assert_eq!(get_u32(&raw, pm.shared_control), 32);
+        assert_eq!(get_u32(&raw, pm.shared_control + 4), 32);
+        assert_eq!(get_u32(&raw, pm.shared_control + 8), 0);
+        assert_eq!(get_u32(&raw, pm.shared_control + 0x60), 1);
+
+        let selected = pm.scene_states + G17P_PM_SCENE_ENTRY_SIZE;
+        assert_eq!(get_u64(&raw, selected), metrics_vas[1] + 4);
+        assert_eq!(get_u64(&raw, selected + 8), metrics_vas[0] + 4);
+        assert_eq!(get_u64(&raw, selected + 0x28), 0x178020);
+        assert_eq!(
+            get_u64(
+                &raw,
+                pm.scene_states + G17P_PM_SCENE_SCRATCH_SLOT_COUNT
+                    * G17P_PM_SCENE_ENTRY_SIZE
+                    + 0x28,
+            ),
+            0x178000
+        );
+        assert_eq!(
+            get_u64(&raw, selected + 0x40),
+            high + pm.shared_control as u64 + 0x40
+        );
+        assert_eq!(G17P_PM_INITIAL_HWPB_MANAGER_GENERATION, 1);
+        assert_eq!(get_u64(&raw, selected + 0x4c), 7);
+        assert_eq!(get_u64(&raw, pm.scene_states + 0x4c), 0);
+        assert_eq!(
+            get_u64(&raw, pm.scene_states + 2 * G17P_PM_SCENE_ENTRY_SIZE + 0x4c),
+            0
+        );
+        let trailer = pm.scene_states + G17P_PM_SCENE_COUNT * G17P_PM_SCENE_ENTRY_SIZE;
+        assert!(raw[trailer..trailer + G17P_PM_SCENE_TRAILER_SIZE]
+            .iter()
+            .all(|byte| *byte == 0));
+
+        // Scene ownership starts over when a replacement PM manager is built,
+        // even though the retained queue's producer ordinal does not. A fresh
+        // manager at either observed handoff ordinal therefore begins at
+        // Scene1. It reaches Scene0 only after 79 completed submissions of its
+        // own; the independent 36-slot scratch ring still wraps modulo 36 in
+        // g17p_render_scene_registers().
+        assert_eq!(g17p_render_scene_index(195, 195), Some(1));
+        assert_eq!(g17p_render_scene_index(195, 196), Some(2));
+        assert_eq!(g17p_render_scene_index(195, 274), Some(0));
+        assert_eq!(g17p_render_scene_index(195, 275), Some(1));
+        assert_eq!(g17p_render_scene_index(2022, 2022), Some(1));
+        assert_eq!(g17p_render_scene_index(2022, 2079), Some(58));
+        assert_eq!(g17p_render_scene_index(2022, 2101), Some(0));
+        assert_eq!(g17p_render_scene_index(2022, 2021), None);
+        assert_eq!(g17p_pm_manager_generation_plan(1), Ok((1, 2)));
+        assert_eq!(g17p_pm_manager_generation_plan(7), Ok((7, 8)));
+        assert_eq!(g17p_pm_manager_generation_plan(0), Err(EINVAL));
+        assert_eq!(g17p_pm_manager_generation_plan(u64::MAX), Err(EOVERFLOW));
+        // Firmware may overwrite PBState scratch between submissions. Native
+        // loadPBDesc restores the HardwareBufferID on every command, not only
+        // when constructing the retained manager.
+        put_u32(&mut raw, pm.hwpb_state + 0x0c, 0x38_0000);
+        assert_eq!(
+            prepare_g17p_retained_scene(&mut raw, &pm, 0, 8, 5),
+            Ok(())
+        );
+        assert_eq!(get_u32(&raw, pm.hwpb_state + 0x0c), 5);
+        assert_eq!(get_u64(&raw, pm.scene_states + 0x4c), 8);
+        assert_eq!(get_u64(&raw, pm.scene_states + 8), metrics_vas[0]);
+    }
+
+    #[test]
     fn g17p_cl_runtime_storage_has_native_ring_geometry() {
         assert_eq!(G17P_CL_ENTRY_STORAGE_SIZE, 256 * 0x200);
         assert_eq!(G17P_CL_SHARED_SUPPORT_SIZE, 0x4000);
@@ -6127,7 +7876,11 @@ mod tests {
     fn user_render_state_sizes_follow_the_legacy_scene_geometry() {
         let parameters = g17_render::G17pRenderParameters::source_rsrc8();
         let layout = g17p_render_state_layout(&parameters, 2).unwrap();
-        assert_eq!(layout.heapmeta, 0x10000);
+        assert_eq!(layout.tilemap, 0x10000);
+        assert_eq!(layout.tilemap_size, 0x500);
+        assert_eq!(layout.layermeta, 0x11000);
+        assert_eq!(layout.layermeta_size, 0);
+        assert_eq!(layout.heapmeta, 0x11000);
         assert_eq!(layout.heapmeta_size, 0x200);
         assert_eq!(layout.tpc, 0x14000);
         assert_eq!(layout.tpc_size, 0x1000);
@@ -6138,7 +7891,37 @@ mod tests {
         assert_eq!(G17P_RENDER_STATE_AUX_FB_SIZE, 0x8000);
         assert_eq!(G17P_RENDER_AUX_FB_PAGE_COUNT, 0x10_0000);
         assert_eq!(g17p_aux_fb_flags(0), 0xc000);
-        assert_eq!(g17p_aux_fb_flags(G17P_RENDER_DBIAS_IS_INT), 0xc001);
+        assert_eq!(
+            g17p_aux_fb_flags(G17P_RENDER_DBIAS_IS_INT),
+            0x4c000
+        );
+
+        let mut layered_parameters = parameters;
+        layered_parameters.layers = 2;
+        let layered = g17p_render_state_layout(&layered_parameters, 2).unwrap();
+        assert_eq!(layered.tilemap_size, 0xa00);
+        assert_eq!(layered.layermeta, 0x11000);
+        assert_eq!(layered.layermeta_size, 0x100);
+        assert_eq!(layered.heapmeta, 0x11100);
+        assert_eq!(layered.heapmeta_size, 0x200);
+
+        let mut large_parameters = parameters;
+        large_parameters.width = 4096;
+        large_parameters.height = 4096;
+        let large = g17p_render_state_layout(&large_parameters, 2).unwrap();
+        assert!(large.tpc_size > layout.tpc_size);
+        assert!(large.tilemap_size > layout.tilemap_size);
+        assert_eq!(large.aux_fb, layout.aux_fb);
+        assert_eq!(large.total_size, layout.total_size);
+
+        let mut runtime = vec![0xa5; layout.total_size];
+        assert_eq!(
+            encode_g17p_render_runtime_state(&mut runtime, &layout, 64, 64, 0),
+            Ok(())
+        );
+        assert!(runtime[layout.aux_fb..layout.aux_fb + G17P_RENDER_STATE_AUX_FB_SIZE]
+            .iter()
+            .all(|byte| *byte == 0));
 
         let mut viewport = [0u8; G17P_PAGE_SIZE];
         assert_eq!(apply_g17p_viewport(64, 64, &mut viewport), Some(()));
