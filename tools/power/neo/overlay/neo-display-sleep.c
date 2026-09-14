@@ -9,10 +9,14 @@
 #include <linux/gpio/machine.h>
 #include <linux/ktime.h>
 #include <linux/mfd/macsmc.h>
+#include <linux/mfd/syscon.h>
+#include <linux/io.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/of_address.h>
 #include <linux/platform_device.h>
 #include <linux/pm.h>
+#include <linux/regmap.h>
 
 static bool experimental;
 module_param(experimental, bool, 0444);
@@ -22,12 +26,26 @@ static unsigned int off_count, on_count;
 module_param(off_count, uint, 0444);
 module_param(on_count, uint, 0444);
 MODULE_PARM_DESC(state, "-1 unbound; 0 LCD low/backlight-off acknowledged; 1 restored; other negative errno");
+static unsigned int clock_depth, clock_off_count, clock_on_count;
+module_param(clock_depth, uint, 0644);
+module_param(clock_off_count, uint, 0444);
+module_param(clock_on_count, uint, 0444);
+MODULE_PARM_DESC(clock_depth, "Manual clock-retention trial: 0 off, 1 display CPU, 2 plus FE, 3 plus SYS; requires stopped DCP");
+static const unsigned int clock_offsets[] = { 0x10000, 0x318, 0x280 };
+#define CLOCK_TARGET GENMASK(3, 0)
+#define CLOCK_ACTUAL GENMASK(7, 4)
+#define CLOCK_AUTO BIT(28)
+#define CLOCK_STATUS (BIT(8) | BIT(9) | BIT(11))
 
 struct neo_display {
 	struct apple_smc *smc;
 	struct gpio_desc *lcd;
 	ktime_t off_time;
 	bool touched;
+	struct regmap *pmgr;
+	void __iomem *coproc;
+	u32 clocks[3];
+	unsigned int clocks_touched;
 };
 static struct platform_device *display_device;
 static struct gpiod_lookup_table display_gpio = {
@@ -43,6 +61,101 @@ static int backlight(struct neo_display *d, u32 on)
 	return apple_smc_write(d->smc, SMC_KEY(pmBL), &on, sizeof(on));
 }
 
+/* This deliberately never requests power state 0: scanout/DART context must
+ * remain intact. Only the always-accessible PMGR is touched while clocked off.
+ * Native/Linux PMGR definitions identify retained clock state 4. Whether the
+ * stopped J700 display pipeline admits it is the experiment, not an assumption.
+ */
+static int clock_set(struct neo_display *d, unsigned int index, u32 target, bool restore)
+{
+	u32 value, after;
+	int ret = regmap_read(d->pmgr, clock_offsets[index], &value);
+
+	if (ret)
+		return ret;
+	value &= ~(CLOCK_TARGET | CLOCK_AUTO | CLOCK_STATUS);
+	value |= target;
+	ret = regmap_write(d->pmgr, clock_offsets[index], value);
+	if (!ret)
+		ret = regmap_read_poll_timeout(d->pmgr, clock_offsets[index], after,
+			((after & CLOCK_ACTUAL) >> 4) == target && !(after & BIT(11)), 10, 10000);
+	if (!ret && restore && (d->clocks[index] & CLOCK_AUTO)) {
+		after &= ~CLOCK_STATUS;
+		ret = regmap_write(d->pmgr, clock_offsets[index], after | CLOCK_AUTO);
+	}
+	pr_info("neo-display clock: offset=%#x target=%u result=%d\n", clock_offsets[index], target, ret);
+	return ret;
+}
+
+static int clocks_on(struct device *dev)
+{
+	struct neo_display *d = dev_get_drvdata(dev);
+	bool touched = d->clocks_touched;
+	int ret;
+
+	while (d->clocks_touched) {
+		unsigned int i = d->clocks_touched - 1;
+
+		ret = clock_set(d, i, d->clocks[i] & CLOCK_TARGET, true);
+		if (ret)
+			return ret;
+		d->clocks_touched--;
+	}
+	if (touched)
+		clock_on_count++;
+	return 0;
+}
+
+static int clocks_off(struct device *dev)
+{
+	static const char * const owners[] = {
+		"412e00000.dcp", "412e08000.mailbox", "412300000.iommu",
+		"412320000.iommu", "412340000.iommu",
+	};
+	struct neo_display *d = dev_get_drvdata(dev);
+	unsigned int depth = READ_ONCE(clock_depth), i;
+	u32 control;
+	int ret;
+
+	if (!depth)
+		return 0;
+	if (depth > ARRAY_SIZE(clock_offsets) || !d->touched || READ_ONCE(state) != 0)
+		return -EINVAL;
+	for (i = 0; i < ARRAY_SIZE(owners); i++) {
+		struct device *owner = bus_find_device_by_name(&platform_bus_type, NULL, owners[i]);
+		bool bound = owner && owner->driver;
+
+		put_device(owner);
+		if (bound)
+			return -EBUSY;
+	}
+	/* Validate the complete inherited hierarchy before reading the ASC.
+	 * The three actual states must be ACTIVE; no speculative gated reads.
+	 */
+	for (i = 0; i < ARRAY_SIZE(clock_offsets); i++) {
+		ret = regmap_read(d->pmgr, clock_offsets[i], &d->clocks[i]);
+		if (ret)
+			return ret;
+		if ((d->clocks[i] & 0xff) != 0xff ||
+		    (d->clocks[i] & (BIT(31) | BIT(12) | BIT(11) | BIT(10))))
+			return -EBUSY;
+	}
+	control = readl(d->coproc + 0x44);
+	dev_info(dev, "display clock trial depth=%u DCP CPU_CONTROL=%#x\n", depth, control);
+	if (control & BIT(4))
+		return -EBUSY;
+	for (i = 0; i < depth; i++) {
+		d->clocks_touched = i + 1;
+		ret = clock_set(d, i, 4, false);
+		if (ret) {
+			clocks_on(dev);
+			return ret;
+		}
+	}
+	clock_off_count++;
+	return 0;
+}
+
 static int display_on(struct device *dev)
 {
 	struct neo_display *d = dev_get_drvdata(dev);
@@ -51,6 +164,12 @@ static int display_on(struct device *dev)
 
 	if (!d->touched)
 		return 0;
+	/* A failed clock restore must never illuminate a dead scanout engine. */
+	ret = clocks_on(dev);
+	if (ret) {
+		WRITE_ONCE(state, ret);
+		return ret;
+	}
 	/* Firmware requires 260 ms between LCD off and on, including aborts. */
 	elapsed = ktime_ms_delta(ktime_get_boottime(), d->off_time);
 	if (elapsed < 300)
@@ -104,9 +223,24 @@ static int display_probe(struct platform_device *pdev)
 	struct apple_smc_key_info info;
 	struct neo_display *d;
 	int ret;
+	struct device_node *node;
+	struct resource res;
 
 	d = devm_kzalloc(&pdev->dev, sizeof(*d), GFP_KERNEL);
 	if (!d)
+		return -ENOMEM;
+	node = of_find_node_by_path("/soc/power-management@300700000");
+	if (!node)
+		return -ENODEV;
+	ret = of_address_to_resource(node, 0, &res);
+	if (!ret && (res.start != 0x300700000ULL || resource_size(&res) < 0x10004))
+		ret = -EINVAL;
+	d->pmgr = ret ? ERR_PTR(ret) : syscon_node_to_regmap(node);
+	of_node_put(node);
+	if (IS_ERR(d->pmgr))
+		return PTR_ERR(d->pmgr);
+	d->coproc = devm_ioremap(&pdev->dev, 0x412e00000ULL, 0x48);
+	if (!d->coproc)
 		return -ENOMEM;
 	d->smc = dev_get_drvdata(pdev->dev.parent);
 	if (!d->smc)
@@ -138,6 +272,8 @@ static void display_remove(struct platform_device *pdev)
 static const struct dev_pm_ops display_pm = {
 	.suspend = display_off,
 	.resume = display_on,
+	.suspend_late = clocks_off,
+	.resume_early = clocks_on,
 };
 static struct platform_driver display_driver = {
 	.probe = display_probe,
