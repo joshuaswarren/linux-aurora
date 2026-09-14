@@ -144,6 +144,52 @@ on intervals and a bounded LCD-enable cycle, excluding the first five seconds
 of each stage from the reported averages. This measures whole-machine power,
 not a dedicated display rail, and is not a suspend measurement.
 
+## X3200 PMU backlight control
+
+The same DCP image selects `ControllerPMU` for `DispTargetX3200` in
+`0x0409e404`. Its static initializer at `0x0435f698..0x0435f774` constructs
+an X3200-specific `controller-pmu-frontend` dictionary with these properties:
+
+* `pmu-controller`: native u32 FourCC `melb` (Melbourne), bytes at file
+  offset `0x4d0261` / VA `0x044cf261`.
+* `smc-enable-key`: native u32 FourCC `pmBL`, bytes at file offset
+  `0x4d0265` / VA `0x044cf265`.
+
+The constructor at `0x0409e53c` selects Melbourne brightness registers
+`0x3406/0x3407`, auxiliary register `0x2490`, and `pmBL`. The on/off method
+at `0x0409d8ac` writes a four-byte native-endian boolean to that SMC key.
+Neo's live SMC inventory reports `pmBL`, type `ui32`, size 4, flags `0x50`
+(writable function, **not readable**). The earlier `gP12` default belongs
+to a different backlight controller and is not the X3200 selection.
+
+`overlay/neo-backlight-trial.c` uses the existing synchronized SMC driver.
+Loading with the default `seconds=0` only validates the board and key
+metadata. An explicit `seconds=1..600` requests off, schedules an independent
+kernel delayed-work restoration to on, and restores early on module removal.
+Its `state` parameter records acknowledged requests, not hardware readback.
+Use this only for awake qualification; do not suspend with the timed trial
+armed. `backlight-power-step.py` retains a 30/60/30-second battery experiment.
+This restores the explicit on state; the write-only key cannot establish its
+inherited value. Begin with an illuminated panel.
+
+The first 60-second `pmBL` trial completed on boot
+`eee6042d-cc10-4c2d-8cf4-66e01a884832` with LCD-enable left high:
+
+* Before: **3.52132 W**.
+* Backlight off requested: **1.9783889 W**.
+* Restored: **3.52052 W**.
+
+The paired on/off difference is **1.5425311 W**, approximately **43.8%**
+of the awake on baseline. Both SMC writes returned zero; the delayed work
+restored on and module removal succeeded. No reboot or sleep was involved.
+The battery response supports a separate backlight power control; there was
+no user visual confirmation for this second trial. Retained result and
+kernel log: `artifacts/neo-suspend/display/backlight-power-60-01/`.
+Module SHA256:
+`a7dd71d125e1d4433bb536cf394b95d47be7c442bb42f0d0c26611ffe7055df1`.
+The combined LCD-plus-backlight cycle and 600-second suspend comparison have
+not yet been measured.
+
 The earlier DWI WLED trial (`overlay/neo-dwi-trial.c`, `dwi-power-step.py`)
 completed native version-1 immediate commands at 1024, zero, and 1024, but
 power remained 3.58 W at every level. It is not a J700 backlight driver.
