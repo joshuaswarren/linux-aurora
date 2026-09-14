@@ -38,6 +38,8 @@ struct neo_dcp {
 	bool stopped;
 	u32 saved_control, saved_clocks[3];
 	unsigned int clocks_touched;
+	u64 requested_iova;
+	size_t requested_size;
 };
 static const unsigned int clock_offsets[] = { 0x10000, 0x318, 0x280 };
 
@@ -64,16 +66,19 @@ static int deny_shmem(void *cookie, struct apple_rtkit_shmem *buffer)
 {
 	struct neo_dcp *d = cookie;
 
+	d->requested_iova = buffer->iova;
+	d->requested_size = buffer->size;
 	atomic_set(&d->failed, 1);
-	dev_err(d->dev, "Unexpected shared-buffer request; refusing adoption side effect\n");
+	dev_err(d->dev, "Shared-buffer request DVA=%#llx size=%#zx; refusing adoption side effect\n",
+		 d->requested_iova, d->requested_size);
 	return -EOPNOTSUPP;
 }
 static void application_message(void *cookie, u8 ep, u64 word)
 {
 	struct neo_dcp *d = cookie;
 
-	atomic_set(&d->failed, 1);
-	dev_err(d->dev, "Unexpected application activity ep=%#x word=%#llx\n", ep, word);
+	if (!atomic_xchg(&d->failed, 1))
+		dev_err(d->dev, "Unexpected application activity ep=%#x word=%#llx\n", ep, word);
 }
 static void crashed(void *cookie, const void *log, size_t size)
 {
@@ -127,9 +132,10 @@ static ssize_t status_show(struct device *dev, struct device_attribute *a, char 
 	if (d->clocks_touched)
 		return sysfs_emit(buf, "failed=%d clocks_touched=%u (no gated ASC read)\n",
 			atomic_read(&d->failed), d->clocks_touched);
-	return sysfs_emit(buf, "failed=%d touched=%u sleeps=%u wakes=%u control=%#x status=%#x\n",
+	return sysfs_emit(buf, "failed=%d touched=%u sleeps=%u wakes=%u control=%#x status=%#x requested_iova=%#llx requested_size=%#zx\n",
 		atomic_read(&d->failed), d->touched, d->sleeps, d->wakes,
-		readl(d->control + 0x44), readl(d->control + 0x48));
+		readl(d->control + 0x44), readl(d->control + 0x48),
+		d->requested_iova, d->requested_size);
 }
 static ssize_t wake_store(struct device *dev, struct device_attribute *a, const char *buf, size_t count)
 {
@@ -179,6 +185,10 @@ static int dcp_suspend(struct device *dev)
 		 readl(d->control + 0x44), readl(d->control + 0x48));
 	if (!ret && atomic_read(&d->failed))
 		ret = -EIO;
+	if (!ret && stop) {
+		ret = readl_poll_timeout(d->control + 0x48, value, value & 3, 10, 10000);
+		dev_info(dev, "DCP firmware idle before ASC stop: status=%#x result=%d\n", value, ret);
+	}
 	if (!ret && stop) {
 		d->stopped = true;
 		writel(d->saved_control & ~BIT(4), d->control + 0x44);
