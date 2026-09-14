@@ -80,3 +80,12 @@ Wi-Fi's previously qualified marginal saving is approximately 75 mW; its
 or DCP wattage is established by these failed transitions. No macOS sleep
 measurement has been made. Battery-counter comparisons are whole-system
 marginal deltas, not additive per-rail meters.
+
+The first DCP clock trial boot used `no_console_suspend`, leaving framebuffer
+and dockchannel console output live. This is an admission defect, not proof
+of the hang's precise cause. Both display clock gating and DCP firmware sleep
+now require `console_suspend_enabled`; captures include its runtime value.
+Set `/sys/module/printk/parameters/console_suspend` to `Y` before qualification.
+The previous boot's journal ended at module probe because journald was frozen;
+`display-clock-isolation/platform/result.json` remains `running` and is retained
+unchanged. Recovery returned to the normal #6 kernel, battery 21%.

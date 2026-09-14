@@ -49,6 +49,7 @@ def snapshot():
              "/proc/interrupts", "/proc/softirqs", "/proc/stat",
              "/sys/power/state", "/sys/power/mem_sleep", "/sys/power/pm_test",
              "/sys/power/pm_async", "/sys/kernel/debug/wakeup_sources",
+             "/sys/module/printk/parameters/console_suspend",
              "/sys/kernel/debug/apple-pmp-v2/status",
              "/sys/kernel/debug/apple-pmp-v2/thermal_status",
              "/sys/kernel/debug/neo-sleep-irqs/stats",
@@ -60,7 +61,8 @@ def snapshot():
              "/sys/module/mt7932_fullmac/parameters/retained_s2idle",
              "/sys/module/pmgr_pwrstate/parameters/retain_s2idle",
              "/sys/module/pmp_v2/parameters/retained_s2idle"]
-    paths.append('/sys/module/pmp_v2/parameters/rtkit_idle_s2idle')
+    paths.extend('/sys/module/pmp_v2/parameters/' + name for name in
+                 ('rtkit_idle_s2idle', 'rtkit_stop_s2idle'))
     for pattern in ("/sys/power/suspend_stats/*", "/sys/power/suspend_stats/last_hw_sleep",
                     "/sys/devices/system/cpu/cpufreq/policy*/scaling_cur_freq",
                     "/sys/class/thermal/thermal_zone*/mode",

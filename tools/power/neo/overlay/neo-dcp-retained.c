@@ -3,6 +3,7 @@
  * No endpoint start, firmware reset, mapping change or new shared buffer.
  * Pins itself after adoption: remove the trial by reboot, not forced unload.
  */
+#include <linux/console.h>
 #include <linux/firmware.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
@@ -166,6 +167,8 @@ static int dcp_suspend(struct device *dev)
 	guard(mutex)(&d->lock);
 	if (!READ_ONCE(sleep_enabled))
 		return 0;
+	if (!READ_ONCE(console_suspend_enabled))
+		return -EBUSY;
 	if (atomic_read(&d->failed) || d->touched)
 		return -EIO;
 	if (depth > 3 || (depth && !stop))
