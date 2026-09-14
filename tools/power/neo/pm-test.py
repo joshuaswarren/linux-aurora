@@ -65,6 +65,7 @@ def snapshot():
                     "/sys/devices/system/cpu/cpu*/cpuidle/state*/usage",
                     "/sys/devices/system/cpu/cpu*/cpuidle/state*/s2idle/usage",
                     "/sys/module/neo_display_sleep/parameters/*",
+                    "/sys/module/mt7932_fullmac/parameters/*",
                     "/sys/bus/platform/devices/macsmc-input/power/wakeup"):
         paths.extend(str(p) for p in Path('/').glob(pattern.lstrip('/')) if p.is_file())
     return {"files": {p: read(p) for p in paths},
