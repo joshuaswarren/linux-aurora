@@ -167,15 +167,22 @@ static struct cpuidle_driver apple_neo_idle_driver = {
 	.name = "apple_neo_idle",
 	.owner = THIS_MODULE,
 	.states = {
-		/* State 0 is initialized by cpuidle_poll_state_init(). */
+		[0] = {
+			.enter = apple_enter_wfi,
+			.exit_latency = 1,
+			.target_residency = 1,
+			.power_usage = UINT_MAX,
+			.name = "WFI",
+			.desc = "Architectural state-preserving WFI",
+		},
 		[1] = {
 			.enter = apple_neo_enter_wfi,
 			.enter_s2idle = apple_neo_enter_wfi,
 			/* Initial governor estimates, not measured hardware limits. */
 			.exit_latency = 10,
 			.target_residency = 100,
-			.name = "WFI",
-			.desc = "State-preserving WFI",
+			.name = "WFI-test",
+			.desc = "Experimental WFI with optional CPU PM",
 			/* Enable per CPU through sysfs after reaching userspace. */
 			.flags = CPUIDLE_FLAG_RCU_IDLE | CPUIDLE_FLAG_OFF,
 		},
@@ -199,11 +206,10 @@ static int apple_cpuidle_probe(struct platform_device *pdev)
 			return -EINVAL;
 
 		/* A nonzero state index also permits tick-freezing during s2idle. */
-		cpuidle_poll_state_init(&apple_neo_idle_driver);
 		drv = &apple_neo_idle_driver;
 		cpumask_copy(&neo_cpumask, cpu < 0 ? cpu_possible_mask : cpumask_of(cpu));
 		drv->cpumask = &neo_cpumask;
-		dev_info(&pdev->dev, "Registering idle CPUs %*pbl, WFI initially disabled\n",
+		dev_info(&pdev->dev, "Registering idle CPUs %*pbl, experimental state disabled\n",
 			 cpumask_pr_args(drv->cpumask));
 	}
 

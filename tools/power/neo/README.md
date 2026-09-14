@@ -57,6 +57,10 @@ and the platform device stays unbound. Prefer activation after userspace starts
 so a separate SSH session can retain the kernel log:
 
 ```sh
+# In a separate session, retain this output on the controller:
+stdbuf -o0 dmesg --follow
+
+# Then activate from the control session:
 echo 5 > /sys/module/cpuidle_apple/parameters/neo_cpu
 echo Y > /sys/module/cpuidle_apple/parameters/neo
 echo cpuidle-apple > /sys/bus/platform/drivers/cpuidle-apple/bind
@@ -67,9 +71,9 @@ fallback. `neo_cpu=-1` selects all CPUs. The selection applies at bind time;
 unbind the driver before selecting another CPU and binding again.
 
 The `neo` parameter gates binding; clearing it does not unregister an already
-bound driver. Use each CPU's state-disable attributes to stop WFI experiments.
-The driver offers POLL plus the existing state-preserving WFI sequence. WFI
-starts disabled on each CPU: after boot, write `0` to that CPU's
+bound driver. Use each CPU's state-disable attributes to stop experiments.
+State 0 uses the existing architectural state-preserving WFI sequence. The
+experimental state 1 starts disabled on each CPU: after boot, write `0` to its
 `cpuidle/state1/disable` attribute to qualify it individually. A separate
 `cpuidle_apple.neo_cpu_pm=1` parameter includes CPU PM notifications around WFI;
 leave it off when first testing the governor and state-save path. This separates
@@ -78,7 +82,7 @@ use the older Apple driver's
 locked CYC_OVRD register. Its latency/residency values are initial governor
 estimates, not measured hardware guarantees or proof of power-down depth.
 
-The `neo_cpu_pm` parameter can also be changed after boot. Disable the WFI
+The `neo_cpu_pm` parameter can also be changed after boot. Disable the experimental
 states first to keep experiments separate. Each entry snapshots that setting
 so its CPU PM entry and exit notifications remain paired.
 
@@ -102,7 +106,17 @@ device suspend and physical wake test.
   were already present before it; this does not establish suspend as the sole
   cause. The independent SMC thermal zone and minimum CPU caps remained active.
 - An initial boot with automatic J700 cpuidle registration did not return over
-  SSH during observation. Its boot progress and failure cause are unconfirmed.
-  Registration is now opt-in, pending isolation and hardware validation.
+  SSH and showed a black screen. A second boot with the experimental WFI state
+  and CPU PM callbacks disabled also failed. Both used generic POLL as state 0.
+- The same kernel with cpuidle left unbound booted to SDDM. The early PMP veto
+  was observed at `prepare`, and CPU 5 passed 500 integer/FPSIMD timer-sleep
+  checks plus 20 stopped-task intervals each with the existing arm64 FPSIMD,
+  streaming SVE, ZA and ZT register tests.
+- Runtime binding limited to CPU 5 returned successfully, then connectivity
+  was lost while only generic POLL was available. This reproduces the issue
+  without enabling the WFI experiment or CPU PM callbacks. State 0 now uses
+  the architectural WFI fallback; hardware qualification is pending. Use
+  unbuffered log capture so short final messages do not remain in userspace
+  buffers when a test stalls.
 
 No successful full system sleep/resume cycle has been demonstrated.
