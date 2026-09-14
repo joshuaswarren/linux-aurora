@@ -7,6 +7,17 @@ Raw evidence lives in the enclosing workspace's
 `artifacts/neo-suspend/components/`. Read `display-power.md` and
 `sleep-power.md` for the qualified panel controls and counter calibration.
 
+## Subsequent Wi-Fi implementation
+
+The later kernel #26 implementation now acknowledges HIF quiescence, hands
+ownership to radio firmware and recovers ownership/HIF service on wake.
+The measured same-kernel three-minute pair is 0.856 W HIF-only versus
+0.781 W with firmware ownership. L1.2 adds no measured saving (0.787 W).
+See [Wi-Fi sleep qualification](wifi-sleep.md) for code, the retired TX16
+loader-ring fix, recovery evidence and longer measurements. The sections
+below retain the original #19 investigation; they are not a claim that the
+Wi-Fi sleep path is still missing. Other component wattages remain unknown.
+
 ## What can actually be assigned watts
 
 The machine still consumes approximately **0.81 W in display-off s2idle**.
