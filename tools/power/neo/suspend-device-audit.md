@@ -9,6 +9,7 @@ s2idle path, not a list of measured component wattages.
 | Component | Current behavior | Remaining work |
 | --- | --- | --- |
 | Backlight and LCD enable | SMC `pmBL=0`, then `gP16=0`; reverse sequence on resume | Repeat long sleep measurements; integrate the qualified controls with the eventual panel driver |
+| DCP/display engine | Inherited framebuffer/firmware state remains; the new hook only controls the physical panel and backlight | Qualify DCP firmware sleep/wake and its DMA/power dependencies before stopping the display engine |
 | NVMe/ANS | Existing driver shuts down NVMe/RTKit, stops the coprocessor, and resets/restarts on resume; native firmware reports saved context | Verify physical power-domain residency and repeated storage integrity; do not replace a working shutdown path with retention |
 | CPUs | All six use state-preserving WFI with CPU PM callbacks; s2idle freezes timer timekeeping | Establish actual core/cluster residency and deeper platform transitions; the state name is not proof of power-down |
 | Wi-Fi MT7932 | Disconnects and drains host activity, but deliberately retains PCI D0, firmware, DMA and MSI; IRQ uses `IRQF_NO_SUSPEND` | Implement firmware sleep/wake or a complete restart contract before allowing D3 or removing power |

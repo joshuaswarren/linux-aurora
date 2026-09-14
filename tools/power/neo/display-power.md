@@ -231,6 +231,30 @@ workspace display artifacts directory. Module SHA256:
 These checks establish the returned display/RTC sequence, not full SoC
 power collapse or long-term desktop stability.
 
+The subsequent 600-second combined-display-off sleep also returned without
+a reboot. All six CPUs entered s2idle, the RTC alarm fired, display counters
+advanced from 2/2 to 3/3 with final state 1, and suspend failures stayed zero.
+Wi-Fi reconnected; the installed kernel image hash was unchanged and readable;
+the original Hyprland/SDDM processes remained running. A newly launched Zink
+GLES test rendered the expected magenta triangle and WOKEN UP message after
+resume, verified with an independent compositor screenshot. This was a fresh
+GPU context, not a claim that that test process existed before this sleep.
+
+The first post-wake test invocation used a stale binary which still aborted
+on the known zero `glReadPixels` result. Rebuilding the already-committed
+diagnostic source retained that discrepancy while allowing the visible frame
+to be checked. The first screenshot preceded presentation; the settled capture
+shows the expected frame. Retain both failures/timing observations rather than
+calling their early captures a rendering pass. The rebuilt helper is installed
+for future tests; binary SHA256:
+`2926781785ac4e520acc50ecbea5529f8292af4abce51969c75c2b8a947e5bea`.
+
+The working sleep-power estimate is **approximately 0.80 W**, versus **2.99 W**
+for the earlier screen-on sleep using the same calibrated-counter method.
+See `sleep-power.md` for the important capacity-counter discrepancy and
+calibration evidence. The combined display hook remains manually loaded on
+the development boot; it has not been added to normal boot autoloading.
+
 The earlier DWI WLED trial (`overlay/neo-dwi-trial.c`, `dwi-power-step.py`)
 completed native version-1 immediate commands at 1024, zero, and 1024, but
 power remained 3.58 W at every level. It is not a J700 backlight driver.
