@@ -125,12 +125,81 @@ pub(crate) struct G17pRenderParameters {
     pub(crate) process_empty_tiles: bool,
     pub(crate) ta_timestamp_start: u64,
     pub(crate) ta_timestamp_end: u64,
-    pub(crate) ta_user_timestamp_start: u64,
-    pub(crate) ta_user_timestamp_end: u64,
     pub(crate) fragment_timestamp_start: u64,
     pub(crate) fragment_timestamp_end: u64,
-    pub(crate) fragment_user_timestamp_start: u64,
-    pub(crate) fragment_user_timestamp_end: u64,
+    /// Write the VDM control-stream register (0x1c880) as a full GPU virtual
+    /// address instead of the native user-process compact form.
+    ///
+    /// SCOPE CORRECTED against the macOS oracle. This flag once covered every
+    /// register `ta_offset` feeds, justified from the legacy G14X path where
+    /// all of them are whole pointers. A real Metal render pass on THIS chip
+    /// says otherwise: the captured TA command record writes tilemap, TPC and
+    /// heapmeta as small context-relative offsets (see `ta_offset`). The legacy
+    /// encoding does not transfer to G17P, so those six registers are always
+    /// relative now and this flag applies to the VDM stream alone. Native first
+    /// lowers the task VA to a task-relative offset, maps the same backing at
+    /// 0x1000000000 + offset in the GART window, and writes that offset here.
+    /// Linux userspace supplies the full GART-alias VA; this kernel subtracts
+    /// the architectural 0x1000000000 base. Hardware adds it back for compact
+    /// pointers whose bit 39 is clear.
+    pub(crate) absolute_pointers: bool,
+    ///
+    /// Legacy diagnostic OR-mask for the BG resource-specifier high 17 bits.
+    /// Native calls this field PassControlMaskType and derives it from shader
+    /// outputs, including extension of the highest active pass bit; it is not
+    /// an address class or a universal constant. Main and partial shaders can
+    /// legitimately differ. Default zero preserves the userspace mask;
+    /// a nonzero value is an explicit diagnostic override only.
+    pub(crate) bg_resource_prefix: u64,
+    /// Use the single-capture witnessed values for the two TA descriptor bytes
+    /// `+0x93f` and `+0x94d` instead of the values this driver has always sent.
+    ///
+    /// DIAGNOSTIC, default false. `recs4096-gfx.txt` shows native TA descriptor
+    /// 0 with `+0x93f = 0x87` and `+0x94d = 0x03` where we write `0x91` and
+    /// `0x01`. That is the complete divergence set for literal writes on the TA
+    /// side: 9 literals inside `0x9c0`, 7 matching.
+    ///
+    /// It is NOT sufficient grounds to change the constants, because one
+    /// sighting cannot distinguish "our constant is wrong" from "this offset is
+    /// not a constant". The control is `+0x789`, which reads `0x10` in
+    /// `recs2048-gfx.txt` and `0x08` in `recs4096-gfx.txt`. Testing `0x10` on
+    /// 2026-09-01 produced a hardware result identical to the `0x08` baseline:
+    /// fault-free TA timeout, zero start timestamps, and the same recovery
+    /// entries. No safe derivation is known for this variable field, `0x93f`,
+    /// or `0x94d`. `recs2048`'s TA block stops at `0x800` and
+    /// `recs4096`'s descriptor 1 reaches only `0x640`.
+    ///
+    /// So this flag asks the hardware the answerable question -- do these bytes
+    /// have any effect -- rather than the unanswerable one.
+    pub(crate) native_pm_bytes: bool,
+    /// Hardware-buffer ID allocated for this TA command. Native allocates it
+    /// from the accelerator's 0x7f-entry `AGXHardwareBufferIDManager`, stores
+    /// it in the host-side `AGXTACommandDescriptor` at +0x1248/+0x928, and the
+    /// register generator emits that value as register 0x1c830. Those two host
+    /// offsets are not fields in this final 0x9c0-byte firmware command.
+    pub(crate) ta_hardware_buffer_id: u32,
+    /// HardwareBufferID of the retained USC private-memory FList shared by TA
+    /// and 3D. Native allocates this from the USC manager (accelerator
+    /// +0x133c8), independently of the TA parameter-buffer manager above, and
+    /// emits the same ID in TA register 0x14308 and fragment register 0x14048.
+    pub(crate) usc_flist_hardware_buffer_id: u32,
+    /// Diagnostic capture-value bitmask retained for fields whose proper
+    /// inputs are not modeled yet. In particular, the 0xa5a* values are
+    /// assembled from workload-derived USC pool limits. Their captured values
+    /// are not architectural literals and must not become defaults.
+    pub(crate) native_ta_registers: u32,
+    /// Retained GPU-ID diagnostic snapshot, not the fragment parameter-buffer
+    /// owner. The old 0x1c838 use confused host descriptor +0x928 with a
+    /// different object's transient raw-command +0x928 field.
+    pub(crate) gpc_perf_state_map: u32,
+    /// Low nibble of SGX 0xe01480, copied by native 3D submit to tail +0x210c.
+    pub(crate) gpc_perf_state_map_low: u32,
+    /// Bit 0 of SGX 0xe0141c, copied by native 3D submit to tail +0x2104.
+    pub(crate) gpc_perf_state_control: u32,
+    /// GPU address of the selected native 0x80 Scene-state entry, or 0 for
+    /// none. The command-record binding is carried by `RenderDescriptorObjects`
+    /// in both TA and 3D; this copy is retained for diagnostics.
+    pub(crate) parameter_buffer: u64,
 }
 
 impl G17pRenderParameters {
@@ -194,12 +263,18 @@ impl G17pRenderParameters {
             process_empty_tiles: true,
             ta_timestamp_start: 0xffff_fc20_0002_4c68,
             ta_timestamp_end: 0,
-            ta_user_timestamp_start: 0,
-            ta_user_timestamp_end: 0,
             fragment_timestamp_start: 0xffff_fc20_0002_4c68,
             fragment_timestamp_end: 0xffff_fc20_0002_4c70,
-            fragment_user_timestamp_start: 0,
-            fragment_user_timestamp_end: 0,
+            absolute_pointers: false,
+            bg_resource_prefix: 0,
+            native_pm_bytes: false,
+            ta_hardware_buffer_id: 0,
+            usc_flist_hardware_buffer_id: 0,
+            native_ta_registers: 0,
+            gpc_perf_state_map: 0,
+            gpc_perf_state_map_low: 0,
+            gpc_perf_state_control: 0,
+            parameter_buffer: 0,
         }
     }
 }
@@ -730,8 +805,15 @@ pub(crate) fn build_ta_descriptor(
     put_u8(raw, 0x094d, 1);
     put_u64(raw, 0x08fe, parameters.ta_timestamp_start);
     put_u64(raw, 0x0906, parameters.ta_timestamp_end);
-    put_u64(raw, 0x090e, parameters.ta_user_timestamp_start);
-    put_u64(raw, 0x0916, parameters.ta_user_timestamp_end);
+    // +0x090e/+0x0916 are caller-visible timestamp destinations. Firmware
+    // writes them only inside its timestamp aperture, so they stay zero; the
+    // completion publishes the pass envelope to userspace instead.
+    // AGXTAChannelSKSM::submitBuffer mirrors the same dependency/current pair
+    // consumed by the TA RCE program into the firmware command. These fields
+    // are deliberately unaligned in the native 0x9c0-byte command layout.
+    put_u32(raw, 0x086e, (parameters.lifecycle >> 32) as u32);
+    put_u64(raw, 0x08ce, parameters.lifecycle as u32 as u64);
+    apply_g17p_ta_oracle(raw);
     Ok(())
 }
 
@@ -853,8 +935,7 @@ pub(crate) fn build_fragment_descriptor(
     put_u8(raw, 0x2128, 1);
     put_u64(raw, 0x2198, parameters.fragment_timestamp_start);
     put_u64(raw, 0x21a0, parameters.fragment_timestamp_end);
-    put_u64(raw, 0x21a8, parameters.fragment_user_timestamp_start);
-    put_u64(raw, 0x21b0, parameters.fragment_user_timestamp_end);
+    // +0x21a8/+0x21b0: caller-visible destinations, zero as in the TA record.
     put_u8(raw, 0x21cc, 0x53);
     put_u8(raw, 0x21d6, 1);
     put_u8(raw, 0x21e7, 1);

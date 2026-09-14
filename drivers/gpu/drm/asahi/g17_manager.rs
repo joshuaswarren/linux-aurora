@@ -513,8 +513,14 @@ impl G17PManagerConstruction {
                     &vm,
                     &command,
                     self.num_clusters,
-                    [0; 4],
-                    KVec::new(),
+                    // The driver-owned opening command has its own Shared
+                    // state owner. Its first TA/3D pair uses native tags 0/1;
+                    // user command buffers allocate from the session owner
+                    // below and are not advanced by this bootstrap object.
+                    [0, 1],
+                    0,
+                    pm_generation.map(|plan| plan.0),
+                    &mut no_retained_sksm_backing,
                 )
                 .inspect_err(|error| {
                     dev_err!(
@@ -924,9 +930,138 @@ impl G17PManagerConstruction {
         dev: &AsahiDevice,
         vm: &mmu::Vm,
         command: &g17_uapi::TranslatedRenderCommand,
-        user_timestamps: [u64; 4],
-        user_timestamp_aliases: KVec<mmu::KernelMapping>,
+        registers: &regs::Resources,
+        registration_power: &mut impl FnMut(&mut Self) -> Result,
     ) -> Result<g17_submission::PreparedG17PPartialOpeningWorkPair> {
+        self.select_render_slot(queue_pair.slot())?;
+        let descriptor_context_id = execution_context.context_id() as u16;
+        if !execution_context.matches(vm) || !execution_context.is_current() {
+            return Err(EFAULT);
+        }
+        if descriptor_context_id < 64 {
+            self.released_render_contexts &= !(1u64 << descriptor_context_id);
+        }
+        if self.render_tracker.is_some() || self.render_hardware_buffer_id.is_some() {
+            return Err(EBUSY);
+        }
+        // Before anything is allocated for this submission, deal with a graph
+        // whose ring producer has drifted ahead of the ordinal. Nothing this
+        // function does later can recover from it, and leaving it retires the
+        // client for good.
+        self.recycle_desynced_render_storage()?;
+        if g17_resources::g17p_render_tvb_mode() >= 2 {
+            let required=g17_resources::required_render_tvb_blocks(&command.parameters,self.num_clusters).ok_or(EINVAL)?;
+            if self.render_storage.as_ref().is_some_and(|storage| storage.tvb_capacity()<required) {
+                self.require_retired_render_owner()?;
+                self.resources.grow_render_tvb(self.render_storage.as_mut().ok_or(EIO)?,vm,required)?;
+            }
+        }
+        self.render_auxiliary_timestamp = G17P_NATIVE_RENDER_KICK_AUXILIARY;
+        // The TA HardwareBufferID names this storage's PBDesc slot and its
+        // retained parameter-management graph was encoded against it, so it
+        // belongs to the storage for as long as the storage lives: a retained
+        // storage re-acquires its own reserved ID, and only a storage about to
+        // be built takes a fresh one.
+        //
+        // Allocating per submission handed out whichever ID the shared LIFO had
+        // on top, which is the same number only while a single client renders.
+        // As soon as another slot held an ID -- in flight, or pinned by an
+        // abandoned render -- the next restage here received a different ID
+        // and prepare_retained_scene refused it with ENOTSUPP, which reached
+        // the compositor as a lost device.
+        let retained_hardware_buffer_id = self
+            .render_storage
+            .as_ref()
+            .and_then(g17_resources::G17PUserRenderStorage::retained_hardware_buffer_id);
+        let (hardware_buffer_id, parameter_buffer_token) = match retained_hardware_buffer_id {
+            Some(id) => self
+                .render_hardware_buffer_ids
+                .acquire_reserved_with_token(id)
+                .map_err(|_| EBUSY)?,
+            None => self
+                .render_hardware_buffer_ids
+                .allocate_with_token()
+                .map_err(|_| EBUSY)?,
+        };
+        self.render_hardware_buffer_id = Some(hardware_buffer_id);
+        self.render_hardware_buffer_published = false;
+        let command_buffer_state_word = match self.allocate_active_render_command_buffer_state() {
+            Ok(word) => word,
+            Err(error) => {
+                self.render_hardware_buffer_id = None;
+                self.render_hardware_buffer_ids
+                    .release(hardware_buffer_id)
+                    .map_err(|_| EIO)?;
+                return Err(error);
+            }
+        };
+
+        let mut command = *command;
+        command.parameters.ta_hardware_buffer_id = hardware_buffer_id;
+        if crate::util::g17p_verbose() {
+            dev_info!(
+                dev.as_ref(),
+                "G17P render: allocated TA HardwareBufferID {} for ordinal {}\n",
+                hardware_buffer_id,
+                self.render_submission_ordinal,
+            );
+        }
+        let result = self.begin_translated_render_with_hardware_buffer(
+            dev,
+            vm,
+            queue_pair,
+            execution_context,
+            descriptor_context_id,
+            &command,
+            parameter_buffer_token,
+            [command_buffer_state_word; 2],
+            registers,
+            registration_power,
+        );
+        if result.is_err() && !self.render_hardware_buffer_published {
+            // acquire() stages a copy of the completed FList owner. Until
+            // outer publication it holds no firmware reference and must be
+            // cancelled with the HardwareBufferID reservation. Otherwise a
+            // fallible PM allocation leaves every later VM handoff EBUSY.
+            self.prepared_render_flist = None;
+            self.render_auxiliary_timestamp = 0;
+            self.release_active_render_command_buffer_states()?;
+            let id = self.render_hardware_buffer_id.take().ok_or(EIO)?;
+            self.render_hardware_buffer_ids.release(id).map_err(|_| EIO)?;
+        }
+        result
+    }
+
+    fn begin_translated_render_with_hardware_buffer(
+        &mut self,
+        dev: &AsahiDevice,
+        vm: &mmu::Vm,
+        queue_pair: g17_resources::G17PRenderQueuePair,
+        execution_context: Arc<mmu::T8140ComputeExecutionContext>,
+        descriptor_context_id: u16,
+        command: &g17_uapi::TranslatedRenderCommand,
+        parameter_buffer_token: u64,
+        command_buffer_state_words: [u32; 2],
+        registers: &regs::Resources,
+        registration_power: &mut impl FnMut(&mut Self) -> Result,
+    ) -> Result<g17_submission::PreparedG17PPartialOpeningWorkPair> {
+        let render_sksm = *crate::module_parameters::g17p_render_sksm.value();
+        let native_doorbell_mode =
+            *crate::module_parameters::g17p_render_native_doorbells.value();
+        let split_launch = *crate::module_parameters::g17p_render_split_launch.value() != 0;
+        if native_doorbell_mode > 3
+            || (native_doorbell_mode != 0 && split_launch)
+            || (g17p_native_fragment_first_mode(native_doorbell_mode) && render_sksm == 0)
+        {
+            return Err(EINVAL);
+        }
+        // Both render paths publish tag-16 when it is armed -- the SKSM
+        // staging path through `stage_fragment_kick`, and the plain path
+        // through `stage_fragment`. The absolute prefix includes all earlier
+        // groups in the retained ring; it is not merely this group's 3/4
+        // items. The same target feeds both outer slots and the tracker.
+        let published_prefix =
+            g17_resources::g17p_render_published_prefix(self.render_submission_ordinal)?;
         if self.render_tracker.is_some() {
             return Err(EBUSY);
         }
@@ -949,23 +1084,77 @@ impl G17PManagerConstruction {
                     vm,
                     command,
                     self.num_clusters,
-                    user_timestamps,
-                    user_timestamp_aliases,
+                    command_buffer_state_words,
                     self.render_submission_ordinal,
                 )?;
         } else {
             if self.render_submission_ordinal != 0 || self.render_bind.is_some() {
                 return Err(EIO);
             }
-            self.render_storage = Some(
-                self.resources
-                    .new_user_render_storage(
+            let mut retained_sksm_backing = self
+                .render_sksm
+                .as_mut()
+                .and_then(|queues| queues.backing.take());
+            let pm_generation = self.prepare_render_pm_manager_generation()?;
+            let storage = self.resources.new_user_render_storage(
+                dev,
+                vm,
+                queue_pair,
+                Some(execution_context.clone()),
+                descriptor_context_id,
+                Some(render_root_slot),
+                command,
+                self.num_clusters,
+                command_buffer_state_words,
+                self.render_submission_ordinal,
+                pm_generation.map(|plan| plan.0),
+                &mut retained_sksm_backing,
+            );
+            self.render_storage = Some(match storage {
+                Ok(storage) if retained_sksm_backing.is_none() => storage,
+                Ok(_) => return Err(Self::render_stage_fail(
+                    "new-user-render-sksm-backing-unclaimed", EIO,
+                )),
+                Err(error) => {
+                    if let Some(backing) = retained_sksm_backing.take() {
+                        let queues = self.render_sksm.as_mut().ok_or(EIO)?;
+                        if queues.backing.replace(backing).is_some() {
+                            return Err(EIO);
+                        }
+                    }
+                    return Err(Self::render_stage_fail("new-user-render-storage", error));
+                }
+            });
+            self.commit_render_pm_manager_generation(pm_generation)
+                .map_err(|error| Self::render_stage_fail("commit-pm-manager-generation", error))?;
+            // The fresh graph was encoded against this ID; keep the ID off the
+            // shared free list for as long as the storage lives.
+            if let Some(id) = self
+                .render_storage
+                .as_ref()
+                .and_then(g17_resources::G17PUserRenderStorage::retained_hardware_buffer_id)
+            {
+                self.render_hardware_buffer_ids
+                    .reserve(id)
+                    .map_err(|_| Self::render_stage_fail("reserve-hardware-buffer-id", EIO))?;
+            }
+            if self.render_submission_ordinal != 0 {
+                let parameter_page_list_vas = self
+                    .render_storage
+                    .as_ref()
+                    .ok_or(ENODEV)?
+                    .parameter_buffer_page_list_vas()?;
+                let storage = self.render_storage.as_mut().ok_or(ENODEV)?;
+                storage
+                    .rebase_empty_queue_cursors(self.render_submission_ordinal)
+                    .map_err(|error| Self::render_stage_fail("rebase-new-vm-queue", error))?;
+                storage.restage_command(
                         dev,
                         vm,
                         command,
                         self.num_clusters,
-                        user_timestamps,
-                        user_timestamp_aliases,
+                        command_buffer_state_words,
+                        self.render_submission_ordinal,
                     )
                     .inspect_err(|error| {
                         dev_err!(

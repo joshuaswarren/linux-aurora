@@ -3446,8 +3446,7 @@ impl G17PLiveRuntime {
         &mut self,
         vm: &mmu::Vm,
         command: &g17_uapi::TranslatedRenderCommand,
-        timestamps: [u64; 4],
-        timestamp_aliases: KVec<mmu::KernelMapping>,
+        completion: Arc<crate::g17_drm::G17PRenderCompletion>,
     ) -> Result {
         if !self.accepting_submissions {
             return Err(ENOTSUPP);
@@ -3468,10 +3467,71 @@ impl G17PLiveRuntime {
             .manager
             .as_mut()
             .ok_or(ENODEV)?
-            .begin_translated_render(&drm, vm, command, timestamps, timestamp_aliases)?;
-        if let Err(error) = Pin::new(self.gfx_rtkit.as_mut().ok_or(ENODEV)?)
-            .send_message(g17_rtkit::ENDPOINT_GFX_INTERRUPTS, prepared.paired_doorbell)
-        {
+            .select_render_slot(render_slot)?;
+        let drm = self.drm.as_ref().ok_or(ENODEV)?.clone();
+        // Temporarily own the manager and register aperture separately so the
+        // manager can ask the live runtime to perform ensurePoweredHardware at
+        // the exact configureHardware boundary.  The previous preamble did the
+        // power transaction before graph construction; verbose construction
+        // alone was long enough for firmware to close the aperture again.
+        let mut manager = self.manager.take().ok_or(ENODEV)?;
+        let registers = self.registers.take().ok_or(ENODEV)?;
+        let mut registration_powered = false;
+        let prepared = manager.begin_translated_render(
+            &drm,
+            vm,
+            queue_pair,
+            execution_context,
+            command,
+            &registers,
+            &mut |manager| {
+                registration_powered = false;
+                self.ensure_g17p_render_registration_power(manager, &registers)?;
+                registration_powered = true;
+                Ok(())
+            },
+        );
+        // `ensurePoweredHardware(true)` is a scoped native prerequisite. The
+        // IdlePowerOff(0) disables firmware idle descent around the direct
+        // KSMFE registration. Restore ordinary idle policy before any work
+        // doorbell.
+        if registration_powered {
+            if let Err(error) = self.release_g17p_render_registration_power(
+                &mut manager,
+                &registers,
+            ) {
+                if let Some(pdev) = self.pdev.as_ref() {
+                    dev_warn!(
+                        pdev.as_ref(),
+                        "G17P render registration: failed to restore ordinary idle policy ({:?}); idle descent remains disabled\n",
+                        error,
+                    );
+                }
+            }
+        }
+        self.manager = Some(manager);
+        self.registers = Some(registers);
+        let prepared = prepared?;
+        // Arm the exact fence after the tracker has been reset for this group,
+        // but before any control or work doorbell can report its retirement.
+        self.install_render_completion(render_slot, completion)?;
+        // Copy only before the FList wake and while both outers are deferred.
+        // Never insert this scan between producer publication and doorbell.
+        if let Some(manager) = self.manager.as_mut() {
+            if let Err(error) = manager.capture_prepared_render_trace(
+                native_doorbell_mode == 0 && !split_launch,
+            ) {
+                if let Some(pdev) = self.pdev.as_ref() {
+                    dev_warn!(pdev.as_ref(), "G17P prepared binary capture failed: {:?}\n", error);
+                }
+            }
+        }
+        // Native retires AGXUSCPrivMemFList::updateSubmitInfo and its type-13
+        // grow before exposing either render outer producer. The control-ring
+        // notification itself wakes the scheduler, so a merely staged final
+        // work doorbell is not a visibility barrier: the old ordering let TA
+        // run here against a half-grown FList and emit only an empty header.
+        if let Err(error) = self.publish_render_usc_freelist_request() {
             return match g17_lifecycle::recover_persistent_runtime(self) {
                 Ok(()) => Err(error),
                 Err(recovery_error) => Err(recovery_error),

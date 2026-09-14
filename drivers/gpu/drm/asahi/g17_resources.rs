@@ -1566,7 +1566,49 @@ pub(crate) struct G17PUserRenderStorage {
     render_ta_status: Option<mmu::KernelMapping>,
     render_3d_status: Option<mmu::KernelMapping>,
     timestamps: MappedObject,
-    user_timestamp_aliases: KVec<mmu::KernelMapping>,
+    fragment_mcache: Option<g17_submission::G17PClMcacheAperture>,
+    tiling_mcache: Option<g17_submission::G17PClMcacheAperture>,
+    /// HardwareBufferID owned by the currently staged TA command.  Retained
+    /// storage can outlive a command, so restaging replaces this together with
+    /// the descriptors before the next tag-15 record is built.
+    ta_hardware_buffer_id: u32,
+    /// Process PID captured when the retained channel pair is created.
+    owner_pid: u32,
+    /// Userspace-side predecessor returned by the native-style global-ID group
+    /// reservation. Every restaged command pair keeps this predecessor while
+    /// receiving fresh, consecutive 3D/TA current IDs.
+    lifecycle_predecessor: u32,
+    /// Retained staging image for the descriptor pair built by
+    /// `restage_command`.
+    ///
+    /// This buffer is pure scratch. Its GPU address is never written into a
+    /// descriptor, never published to firmware and never read by the RCE: the
+    /// function builds the TA and 3D records in it and then copies both into
+    /// the retained `descriptors` object, which is the storage the hardware
+    /// actually addresses. Allocating, mapping, zeroing and unmapping 32 KiB
+    /// of write-combining memory for that on every single submission is a page
+    /// table update, a TLB maintenance operation and a VA-allocator round trip
+    /// per frame, for a buffer whose contents are fully rewritten each time.
+    /// Retaining it and zeroing it in place is byte-for-byte the same input to
+    /// the descriptor builders -- `MappedObject::new_wc_in_range` zeroes a
+    /// fresh allocation with exactly the same `VMap::memset(0)`.
+    staging_descriptors: Option<MappedObject>,
+}
+
+#[cfg(not(test))]
+enum G17PRenderCommandContext {
+    Bootstrap(mmu::T8140AppContextLease),
+    Job(Arc<mmu::T8140ComputeExecutionContext>),
+}
+
+#[cfg(not(test))]
+impl G17PRenderCommandContext {
+    fn context_id(&self) -> u32 {
+        match self {
+            Self::Bootstrap(context) => context.context_id(),
+            Self::Job(context) => context.context_id(),
+        }
+    }
 }
 
 #[cfg(not(test))]
@@ -2540,8 +2582,14 @@ impl G17PUserRenderStorage {
         vm: &mmu::Vm,
         command: &g17_uapi::TranslatedRenderCommand,
         num_clusters: u32,
-        user_timestamps: [u64; 4],
-        user_timestamp_aliases: KVec<mmu::KernelMapping>,
+        owner_pid: u32,
+        command_context: G17PRenderCommandContext,
+        descriptor_context_id: u16,
+        render_root_slot: u8,
+        command_buffer_state_words: [u32; 2],
+        submission_ordinal: u32,
+        parameter_manager_generation: Option<u64>,
+        retained_sksm_backing: &mut Option<G17PRenderSksmBacking>,
     ) -> Result<Self> {
         macro_rules! bootstrap_stage {
             ($name:literal, $expression:expr) => {
@@ -2806,13 +2854,9 @@ impl G17PUserRenderStorage {
         // whose completion ring showed BOTH stages finished with real
         // start/end timestamps was still abandoned after 2000 polls.
         translated.parameters.ta_timestamp_start = timestamp_va;
-        translated.parameters.ta_timestamp_end = timestamp_va + 8;
-        translated.parameters.ta_user_timestamp_start = user_timestamps[0];
-        translated.parameters.ta_user_timestamp_end = user_timestamps[1];
-        translated.parameters.fragment_timestamp_start = timestamp_va + 16;
-        translated.parameters.fragment_timestamp_end = timestamp_va + 24;
-        translated.parameters.fragment_user_timestamp_start = user_timestamps[2];
-        translated.parameters.fragment_user_timestamp_end = user_timestamps[3];
+        translated.parameters.ta_timestamp_end = 0;
+        translated.parameters.fragment_timestamp_start = timestamp_va;
+        translated.parameters.fragment_timestamp_end = timestamp_va + 8;
         let lifecycle_predecessor = g17p_allocate_object_id()?;
         let (fragment_lifecycle, tiling_lifecycle) =
             g17p_allocate_render_lifecycle_pair(lifecycle_predecessor)?;
@@ -3244,7 +3288,16 @@ impl G17PUserRenderStorage {
             render_ta_status: Some(render_ta_status),
             render_3d_status: Some(render_3d_status),
             timestamps,
-            user_timestamp_aliases,
+            fragment_mcache,
+            tiling_mcache,
+            ta_hardware_buffer_id: translated.parameters.ta_hardware_buffer_id,
+            owner_pid,
+            lifecycle_predecessor,
+            _command_context: Some(command_context),
+            descriptor_context_id,
+            context_update_pending: true,
+            render_root_slot,
+            staging_descriptors: None,
         })
     }
 
@@ -3667,8 +3720,7 @@ impl G17PUserRenderStorage {
         vm: &mmu::Vm,
         command: &g17_uapi::TranslatedRenderCommand,
         num_clusters: u32,
-        user_timestamps: [u64; 4],
-        user_timestamp_aliases: KVec<mmu::KernelMapping>,
+        command_buffer_state_words: [u32; 2],
         submission_ordinal: u32,
     ) -> Result {
         if submission_ordinal == 0 || submission_ordinal >= G17P_RETAINED_RENDER_ORDINALS {
@@ -3850,20 +3902,31 @@ impl G17PUserRenderStorage {
         // whose completion ring showed BOTH stages finished with real
         // start/end timestamps was still abandoned after 2000 polls.
         translated.parameters.ta_timestamp_start = timestamp_va;
-        translated.parameters.ta_timestamp_end = timestamp_va + 8;
-        translated.parameters.ta_user_timestamp_start = user_timestamps[0];
-        translated.parameters.ta_user_timestamp_end = user_timestamps[1];
-        translated.parameters.fragment_timestamp_start = timestamp_va + 16;
-        translated.parameters.fragment_timestamp_end = timestamp_va + 24;
-        translated.parameters.fragment_user_timestamp_start = user_timestamps[2];
-        translated.parameters.fragment_user_timestamp_end = user_timestamps[3];
-
-        for (address, size, need_read, need_write) in [
-            (render_state_va, render_layout.total_size as u64, true, true),
-            (timestamp_va, 32, true, true),
-        ] {
-            if !vm.covers_range(address, size, need_read, need_write) {
-                return Err(EFAULT);
+        translated.parameters.ta_timestamp_end = 0;
+        translated.parameters.fragment_timestamp_start = timestamp_va;
+        translated.parameters.fragment_timestamp_end = timestamp_va + 8;
+        let (fragment_lifecycle, tiling_lifecycle) =
+            g17p_allocate_render_lifecycle_pair(self.lifecycle_predecessor)?;
+        translated.parameters.fragment_lifecycle = fragment_lifecycle;
+        translated.parameters.lifecycle = tiling_lifecycle;
+        if crate::util::g17p_verbose() {
+            dev_info!(
+                dev.as_ref(),
+                "G17P render lifecycle: predecessor={:#x} 3D current={:#x} TA current={:#x} ordinal={}\n",
+                self.lifecycle_predecessor,
+                fragment_lifecycle as u32,
+                tiling_lifecycle as u32,
+                submission_ordinal,
+            );
+        }
+        if *crate::module_parameters::g17p_render_eot_bind_zero.value() != 0 {
+            translated.parameters.store_pipeline_bind = 0;
+            translated.parameters.partial_store_pipeline_bind = 0;
+            if crate::util::g17p_verbose() {
+                dev_info!(
+                    dev.as_ref(),
+                    "G17P render EOT bind: forcing native-captured main/partial value 0\n",
+                );
             }
         }
         if !user_timestamp_aliases
@@ -3872,8 +3935,14 @@ impl G17PUserRenderStorage {
         {
             return Err(EFAULT);
         }
-        next_render_state.with_bytes_mut(|raw| {
-            apply_g17p_viewport(
+        if !self.render_user_aliases.all_reachable_from(vm) {
+            return Err(EFAULT);
+        }
+        let status_flag = *crate::module_parameters::g17p_render_status_flag.value();
+        self.render_state.with_bytes_mut(|raw| {
+            encode_g17p_render_runtime_state(
+                raw,
+                &render_layout,
                 translated.parameters.width,
                 translated.parameters.height,
                 &mut raw[G17P_RENDER_STATE_DEFLAKE..G17P_RENDER_STATE_DEFLAKE + mmu::UAT_PGSZ],
@@ -4045,9 +4114,12 @@ impl G17PUserRenderStorage {
 
         let old_render_state = core::mem::replace(&mut self.render_state, next_render_state);
         let old_timestamps = core::mem::replace(&mut self.timestamps, next_timestamps);
-        let old_aliases =
-            core::mem::replace(&mut self.user_timestamp_aliases, user_timestamp_aliases);
-        drop(old_aliases);
+        self.fragment_mcache = fragment_mcache;
+        self.pool_a_record_index = u8::try_from(record_a_index)?;
+        self.ta_hardware_buffer_id = translated.parameters.ta_hardware_buffer_id;
+        self.descriptor_ordinal = submission_ordinal;
+        self.flist_generation = g17_submission::g17p_render_flist_generation(submission_ordinal);
+        self.descriptor_context_id = descriptor_context_id;
         drop(old_timestamps);
         drop(old_render_state);
         Ok(())
@@ -4716,40 +4788,73 @@ impl G17PUserRenderStorage {
                         mmu::UAT_PGSZ as u64,
                         true,
                         true,
-                    )
-            })
-            && vm.covers_range(
-                G17P_CONTROL_DIRECTORY_VA,
-                G17P_CONTROL_DIRECTORY_SIZE as u64,
-                true,
-                true,
-            )
-            && vm.covers_range(
-                G17P_CONTROL_OPERAND_TABLE_VA,
-                g17_initdata::CONTROL_OPERAND_TABLE_SIZE as u64,
-                true,
-                true,
-            )
-            && (0..G17P_CONTROL_OPERAND_BUFFER_COUNT).all(|index| {
-                g17p_control_operand_buffer_va(index).is_some_and(|address| {
-                    vm.covers_range(
-                        address,
-                        G17P_CONTROL_OPERAND_BUFFER_SIZE as u64,
-                        true,
-                        true,
-                    )
-                })
-            })
-            && vm.covers_range(
-                g17_submission::G17P_PARTIAL_OPENING_PRIMARY_INDEX_GPU_VA,
-                mmu::UAT_PGSZ as u64,
-                true,
-                true,
-            )
-            && self
-                .user_timestamp_aliases
-                .iter()
-                .all(|mapping| vm.covers_range(mapping.iova(), mapping.size() as u64, false, true))
+                    ),
+            ),
+            (
+                "control-directory",
+                vm.covers_range(
+                    G17P_CONTROL_DIRECTORY_VA,
+                    G17P_CONTROL_DIRECTORY_SIZE as u64,
+                    true,
+                    true,
+                ),
+            ),
+            (
+                "control-operand-table",
+                vm.covers_range(
+                    G17P_CONTROL_OPERAND_TABLE_VA,
+                    g17_initdata::CONTROL_OPERAND_TABLE_SIZE as u64,
+                    true,
+                    true,
+                ),
+            ),
+            // The cold render FList publishes 17 initial blocks and five first-
+            // grow blocks. Their captured low addresses deliberately overlap
+            // context-0 aliases, but this check is against the client low root;
+            // native uses the same split-root topology.
+            (
+                "control-operand-buffers",
+                (0..G17P_CONTROL_OPERAND_ACTIVE_BLOCK_COUNT).all(|index| {
+                    g17p_control_operand_buffer_va(index).is_some_and(|address| {
+                        vm.covers_range(
+                            address,
+                            G17P_CONTROL_OPERAND_BUFFER_SIZE as u64,
+                            true,
+                            true,
+                        )
+                    })
+                }),
+            ),
+            (
+                "pm-page-list",
+                self.parameter_management.as_ref().map_or(
+                    g17p_render_tvb_mode() < 2,
+                    |pm| {
+                        pm.page_list_low_va()
+                            == g17p_render_page_list_va(self.queue_pair).unwrap_or(0)
+                            && vm.covers_range(
+                                pm.page_list_low_va(),
+                                page_align(G17P_PM_PAGE_LIST_SIZE).unwrap_or(0) as u64,
+                                true,
+                                true,
+                            )
+                    },
+                ),
+            ),
+            (
+                "pm-page-metrics-client-alias",
+                vm.covers_range(
+                    mmu::T8140_PARAMETER_METRICS_LOW_VA,
+                    mmu::T8140_PARAMETER_METRICS_SIZE as u64,
+                    true,
+                    true,
+                ),
+            ),
+        ];
+
+        checks
+            .into_iter()
+            .find_map(|(name, ok)| if ok { None } else { Some(name) })
     }
 
     fn optional_addresses(&self, tiling: bool) -> g17_submission::G17PColdOpeningOptionalAddresses {
@@ -6759,8 +6864,10 @@ impl G17ResourceOwner {
         vm: &mmu::Vm,
         command: &g17_uapi::TranslatedRenderCommand,
         num_clusters: u32,
-        user_timestamps: [u64; 4],
-        user_timestamp_aliases: KVec<mmu::KernelMapping>,
+        command_buffer_state_words: [u32; 2],
+        submission_ordinal: u32,
+        parameter_manager_generation: Option<u64>,
+        retained_sksm_backing: &mut Option<G17PRenderSksmBacking>,
     ) -> Result<G17PUserRenderStorage> {
         G17PUserRenderStorage::new(
             dev,
@@ -6770,8 +6877,7 @@ impl G17ResourceOwner {
             vm,
             command,
             num_clusters,
-            user_timestamps,
-            user_timestamp_aliases,
+            owner_pid,
             command_context,
             descriptor_context_id,
             render_root_slot,

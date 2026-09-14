@@ -49,6 +49,20 @@ pub(crate) struct TimestampDestination {
     pub(crate) offset: usize,
 }
 
+impl TimestampDestination {
+    /// Publish one completion timestamp into the bound timestamp object.
+    pub(crate) fn write(&self, timestamp: u64) -> Result {
+        self.mapping.with_cpu_bytes(|bytes| {
+            let end = self.offset.checked_add(8).ok_or(EINVAL)?;
+            bytes.get_mut(self.offset..end).ok_or(EINVAL)?
+                .copy_from_slice(&timestamp.to_le_bytes());
+            Ok(())
+        })?;
+        fence(Ordering::Release);
+        Ok(())
+    }
+}
+
 pub(crate) struct G17PJobCompletion {
     pub(crate) status: Arc<crate::g17_status::VmStatus>,
     fence: UserFence<crate::g17_drm::G17PSubmissionFence>,
@@ -106,12 +120,7 @@ impl G17PJobCompletion {
         let result = result.and_then(|timestamps| {
             for (destination, timestamp) in self.destinations.iter().zip(timestamps) {
                 if let Some(destination) = destination {
-                    destination.mapping.with_cpu_bytes(|bytes| {
-                        let end = destination.offset.checked_add(8).ok_or(EINVAL)?;
-                        bytes.get_mut(destination.offset..end).ok_or(EINVAL)?
-                            .copy_from_slice(&timestamp.to_le_bytes());
-                        Ok(())
-                    })?;
+                    destination.write(timestamp)?;
                 }
             }
             Ok(())
