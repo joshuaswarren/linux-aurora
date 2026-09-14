@@ -51,6 +51,8 @@ def snapshot():
              "/sys/power/pm_async", "/sys/kernel/debug/wakeup_sources",
              "/sys/kernel/debug/apple-pmp-v2/status",
              "/sys/kernel/debug/apple-pmp-v2/thermal_status",
+             "/sys/kernel/debug/neo-sleep-irqs/stats",
+             "/sys/kernel/debug/neo-smc-power/raw",
              "/sys/kernel/debug/pm_genpd/pm_genpd_summary",
              "/sys/module/apple_dart/parameters/pmp_s2idle",
              "/sys/module/apple_dart/parameters/inherited_s2idle",
