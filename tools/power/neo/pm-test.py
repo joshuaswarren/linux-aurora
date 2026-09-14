@@ -46,6 +46,7 @@ def write_control(path, value):
 
 def snapshot():
     paths = ["/proc/sys/kernel/random/boot_id", "/proc/version", "/proc/cmdline",
+             "/proc/interrupts", "/proc/softirqs", "/proc/stat",
              "/sys/power/state", "/sys/power/mem_sleep", "/sys/power/pm_test",
              "/sys/power/pm_async", "/sys/kernel/debug/wakeup_sources",
              "/sys/kernel/debug/apple-pmp-v2/status",
@@ -61,6 +62,7 @@ def snapshot():
                     "/sys/class/thermal/thermal_zone*/mode",
                     "/sys/devices/system/cpu/cpu*/cpuidle/state*/usage",
                     "/sys/devices/system/cpu/cpu*/cpuidle/state*/s2idle/usage",
+                    "/sys/module/neo_display_sleep/parameters/*",
                     "/sys/bus/platform/devices/macsmc-input/power/wakeup"):
         paths.extend(str(p) for p in Path('/').glob(pattern.lstrip('/')) if p.is_file())
     return {"files": {p: read(p) for p in paths},
