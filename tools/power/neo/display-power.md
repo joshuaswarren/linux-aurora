@@ -131,6 +131,19 @@ LCD-enable control. A compositor screenshot alone cannot prove physical
 panel output after restoration. The 10-minute sleep comparison remains a
 separate experiment, not this short awake cycle.
 
+The subsequent 60-second awake cycle established an important limitation:
+the user observed black pixels **with the backlight still illuminated**.
+Do not describe `gP16` alone as full display power-down. Settled battery
+samples measured 3.5748 W before, 2.88180 W while low, and 3.52482 W after
+restoring high. The reduction relative to the mean of both on intervals is
+0.66801 W. The helper exited successfully and restored the inherited value.
+Boot ID: `eee6042d-cc10-4c2d-8cf4-66e01a884832`; retained capture:
+`artifacts/neo-suspend/display/panel-power-60-01/result.json`.
+`panel-power-step.py` reproduces this awake battery experiment with 30-second
+on intervals and a bounded LCD-enable cycle, excluding the first five seconds
+of each stage from the reported averages. This measures whole-machine power,
+not a dedicated display rail, and is not a suspend measurement.
+
 The earlier DWI WLED trial (`overlay/neo-dwi-trial.c`, `dwi-power-step.py`)
 completed native version-1 immediate commands at 1024, zero, and 1024, but
 power remained 3.58 W at every level. It is not a J700 backlight driver.
