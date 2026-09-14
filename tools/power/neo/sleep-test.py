@@ -103,6 +103,13 @@ def main():
         os.sync()
 
     save()
+    try:
+        pm.check_firmware_health(result['before'])
+    except RuntimeError as error:
+        result.update(status='error', firmware_error=str(error))
+        save()
+        print(str(error))
+        return 1
     if args.check_only:
         print('Prerequisites ready; no sleep or wake alarm requested.')
         return 0
@@ -171,6 +178,10 @@ def main():
         pm.write_control('/sys/power/pm_async', old_async)
         pm.write_control('/sys/power/pm_debug_messages', old_debug)
         result['after'] = pm.snapshot()
+        try:
+            pm.check_firmware_health(result['after'])
+        except RuntimeError as error:
+            result.update(status='error', firmware_error=str(error))
         if args.display_off:
             try:
                 result['display_after'] = display_snapshot()
