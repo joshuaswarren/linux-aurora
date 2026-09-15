@@ -634,3 +634,25 @@ source d86b21fe2; capture `dcp-netconsole/el1-l2-capture.jsonl` and
 `el1-l2-panic.txt`. No error-status register was cleared or modified. One
 DebugUSB reset recovered the machine. Retention controls remain unmodified;
 the native caller/ownership path must be resolved before retrying CPU gating.
+
+On #39 boot 9f808394-c536-408c-9ce9-40f12261ba63, unchanged writes to
+DISP_FE (offset 0x318) and DISP_SYS (0x280) both completed with matching
+0xff readback, followed by successful module unload. The CPU-register
+failure is not a blanket inability to write the main PMGR syscon.
+A subsequent CPU trial used ioremap_np / writel (Device-nGnRnE), rather
+than regmap's default mapping. Its read succeeded, but the unchanged write
+again faulted: L2 status 0x80, address 0x2280400300710000, info 0x1400000002.
+Binary SHA256 `c9e6d161bd6a6cce1823b1a30a2246b6860de3c2576d54edbad555b726717fbf`;
+`dcp-netconsole/el1-np-capture.jsonl`, `el1-np-panic.txt` and
+`neo-pmgr-admission-np-tested.c` retain the comparison. The committed probe
+additionally rejects an unexpected non-posted readback before writing.
+Neither access privilege nor non-posted mapping solved CPU access.
+
+Further native caller inspection is retained in `dcp-pmgr-native/`:
+`enable-device.log`, `pmc-state.log`, `pmc-interfaces.log`, `regmap-init.log`,
+`adt-pmgr.json`, and `adt-dcp.json`. ApplePMGR's enable path includes PMP/PMC
+notifications before register transitions. ApplePMC::stateChange dispatches
+voter/boost/DVMR/BWR/cluster-rail operations. ADT boost, DVMR and BWR tables
+include DISP_SYS (device 0x3a), not DISP_CPU (0x84). These calls are not yet
+identified as a CPU-register access unlock. Avoid attributing the fault to
+an ownership or security policy without further evidence.

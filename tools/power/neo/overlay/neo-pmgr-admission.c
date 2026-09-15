@@ -14,8 +14,14 @@
 
 static bool same_value;
 static bool panic_registered;
+static bool nonposted;
+module_param(nonposted, bool, 0400);
+MODULE_PARM_DESC(nonposted, "Use ioremap_np for the unchanged write instead of syscon regmap");
+static unsigned int clock;
+module_param(clock, uint, 0400);
+MODULE_PARM_DESC(clock, "Unchanged write target: 0 DISP_CPU, 1 DISP_FE, 2 DISP_SYS");
 module_param(same_value, bool, 0400);
-MODULE_PARM_DESC(same_value, "Explicitly admit one unchanged DISP_CPU PS write while awake");
+MODULE_PARM_DESC(same_value, "Explicitly admit one unchanged display PS write while awake");
 
 /* Read-only Apple L2 error registers, as named by m1n1 cpu_regs.h.
  * Keep the error latched: this probe never writes or clears these registers.
@@ -46,12 +52,14 @@ static int __init neo_pmgr_admission(void)
 	static const unsigned int offsets[] = { 0x280, 0x318, 0x10000 };
 	struct device_node *node;
 	struct regmap *pmgr;
-	void __iomem *asc;
-	u32 value, control, status;
+	void __iomem *asc, *np = NULL;
+	u32 value, control, status, offset, expected;
 	int ret, i;
 
-	if (!of_machine_is_compatible("apple,j700"))
+	if (!of_machine_is_compatible("apple,j700") || clock > 2)
 		return -EINVAL;
+	offset = offsets[2 - clock];
+	expected = clock ? 0xff : 0x1f0000ff;
 	node = of_find_node_by_path("/soc/power-management@300700000");
 	if (!node)
 		return -ENODEV;
@@ -63,7 +71,7 @@ static int __init neo_pmgr_admission(void)
 		value = 0;
 		ret = regmap_read(pmgr, offsets[i], &value);
 		pr_info("NEO_PMGR_EL1: offset=%#x value=%#x ret=%d\n", offsets[i], value, ret);
-		if (ret || (value & 0xff) != 0xff || (value & 0x80001c00))
+		if (ret || value != (i == 2 ? 0x1f0000ff : 0xff))
 			return ret ?: -EBUSY;
 	}
 	if (value != 0x1f0000ff)
@@ -83,27 +91,52 @@ static int __init neo_pmgr_admission(void)
 		pr_info("NEO_PMGR_EL1: read-only admission complete\n");
 		return 0;
 	}
-	pr_info("NEO_PMGR_EL1: before same-value regmap write 0x1f0000ff\n");
+	pr_info("NEO_PMGR_EL1: before same-value regmap write offset=%#x value=%#x\n",
+		offset, expected);
 	msleep(500);
+	if (nonposted) {
+		np = ioremap_np(0x300700000ULL + offset, 4);
+		if (!np)
+			return -ENOMEM;
+		value = readl(np);
+		pr_info("NEO_PMGR_EL1: nonposted readback=%#x\n", value);
+		if (value != expected) {
+			iounmap(np);
+			return -EBUSY;
+		}
+		msleep(500);
+	}
 	ret = atomic_notifier_chain_register(&panic_notifier_list, &admission_notifier);
-	if (ret)
+	if (ret) {
+		if (np)
+			iounmap(np);
 		return ret;
+	}
 	panic_registered = true;
-	ret = regmap_write(pmgr, 0x10000, 0x1f0000ff);
+	if (np) {
+		writel(expected, np);
+		ret = 0;
+	} else {
+		ret = regmap_write(pmgr, offset, expected);
+	}
 	dsb(sy);
 	pr_info("NEO_PMGR_EL1: write returned %d\n", ret);
 	if (ret)
 		goto remove_observer;
-	ret = regmap_read(pmgr, 0x10000, &value);
+	ret = regmap_read(pmgr, offset, &value);
 	pr_info("NEO_PMGR_EL1: readback=%#x ret=%d\n", value, ret);
-	if (ret || value != 0x1f0000ff) {
+	if (ret || value != expected) {
 		ret = ret ?: -EIO;
 		goto remove_observer;
 	}
 	msleep(500);
+	if (np)
+		iounmap(np);
 	pr_info("NEO_PMGR_EL1: admission complete\n");
 	return 0;
 remove_observer:
+	if (np)
+		iounmap(np);
 	atomic_notifier_chain_unregister(&panic_notifier_list, &admission_notifier);
 	panic_registered = false;
 	return ret;
@@ -117,4 +150,4 @@ static void __exit neo_pmgr_admission_exit(void)
 module_init(neo_pmgr_admission);
 module_exit(neo_pmgr_admission_exit);
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("J700 awake unchanged-value PMGR access at kernel privilege");
+MODULE_DESCRIPTION("J700 awake unchanged-value display PMGR access at kernel privilege");
