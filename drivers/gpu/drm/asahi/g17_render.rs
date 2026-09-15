@@ -1229,6 +1229,11 @@ pub(crate) fn build_fragment_descriptor(
 
     put_u64(raw, 0x40, parameters.tilemap);
     put_u64(raw, 0x48, parameters.multisample_control);
+    // Native copies the render target's sample count through host +0x8c8
+    // into every fragment descriptor at +0x50 (25G83: 0x8839d80,
+    // 0x8837af8..0x8837b08). It is not first-work metadata. The UAPI has
+    // already encoded log2(samples) in UTILE_CONFIG bits [1:0].
+    put_u32(raw, 0x50, 1u32 << (parameters.utile_config & 3));
     put_u32(raw, 0x54, geometry.macro_size as u32);
     put_u32(raw, 0x68, parameters.merge_upper_x_bits);
     put_u32(raw, 0x6c, parameters.merge_upper_y_bits);
@@ -1366,7 +1371,6 @@ pub(crate) fn build_cold_opening_fragment_descriptor(
     metadata.context_id = context_id;
     metadata.command_buffer_state_word = command_buffer_state_word;
     build_fragment_descriptor(parameters, objects, metadata, raw)?;
-    put_u32(raw, 0x50, 1);
     put_u16(raw, 0x80, 0x56);
     put_u16(raw, 0x82, 0x57);
     put_u16(raw, 0x84, 0x57);
@@ -2145,6 +2149,33 @@ mod tests {
                 .unwrap();
                 assert_eq!(fragment[0x2100], 0);
             }
+        }
+    }
+
+    #[test]
+    fn fragment_sample_count_matches_tile_configuration_on_every_submission() {
+        for (sample_log2, samples) in [(0, 1), (1, 2), (2, 4)] {
+            let mut parameters = G17pRenderParameters::source_rsrc8();
+            parameters.utile_config = 0xa000 | sample_log2;
+            let mut fragment = [0u8; FRAGMENT_DESCRIPTOR_SIZE];
+
+            build_fragment_descriptor(
+                &parameters,
+                objects(),
+                RenderDescriptorMetadata::source(RenderDescriptorKind::Fragment),
+                &mut fragment,
+            )
+            .unwrap();
+            assert_eq!(get_u32(&fragment, 0x50), samples, "retained {samples}x");
+            assert_eq!(get_u32(&fragment, 0xac), 0x10009);
+            assert_eq!(get_u64(&fragment, 0xb0) & 3, sample_log2);
+
+            build_cold_opening_fragment_descriptor(
+                &parameters, objects(), 1, 1, &mut fragment,
+            )
+            .unwrap();
+            assert_eq!(get_u32(&fragment, 0x50), samples, "first {samples}x");
+            assert_eq!(get_u64(&fragment, 0xb0) & 3, sample_log2);
         }
     }
 

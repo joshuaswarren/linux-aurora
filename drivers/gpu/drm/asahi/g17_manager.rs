@@ -6927,6 +6927,33 @@ impl G17PManagerConstruction {
                     }
                     return Ok(G17PRenderPollOutcome::Pending);
                 }
+                // B1 clears EventControl membership BEFORE GPU cache
+                // maintenance. Its fragment stamp A write follows that
+                // maintenance (25G83 B1 0x16ea0); queue/list retirement alone
+                // therefore cannot authorize a userspace-visible fence.
+                // The physical slot retains its ordinal across VM switches,
+                // has one in-flight pair, and refuses 24-bit stamp overflow.
+                // Require this exact generation, never a stale nonzero stamp.
+                let pair = self.render_storage.as_ref().ok_or(ENODEV)?.queue_pair();
+                let expected_stamp = self.render_submission_ordinal
+                    .checked_add(1)
+                    .and_then(|value| value.checked_mul(0x100))
+                    .ok_or(EOVERFLOW)?;
+                let fragment_stamp = self.resources.render_fragment_completion_stamp(pair)?;
+                if fragment_stamp != expected_stamp {
+                    if crate::util::g17p_verbose() {
+                        dev_info!(
+                            self.resources.dev().as_ref(),
+                            "G17P render completion: fragment stamp pending qid={} observed={:#x} expected={:#x}\n",
+                            pair.fragment,
+                            fragment_stamp,
+                            expected_stamp,
+                        );
+                    }
+                    // The post-stamp type-1 notification wakes this job.
+                    // Keep its ownership and fence pending without polling.
+                    return Ok(G17PRenderPollOutcome::Pending);
+                }
                 // Publish the exact GPU-written pass envelope while the completed job's
                 // VM binding, ordinal and QIDs are still owned.  This is
                 // observation only: it neither gates completion nor changes
