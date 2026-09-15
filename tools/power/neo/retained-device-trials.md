@@ -608,3 +608,16 @@ five-second read-only control and then with `same_value=1` for one unchanged
 write. No firmware adoption, lower power target, RUN stop, AUTO change or
 retention-control write occurs. This distinguishes the tested kernel path
 from /dev/mem; privilege and mapping attributes are not independently varied.
+
+Awake kernel admission on boot 22e55b8d-4de6-4ddc-8bcc-621bc88d1038:
+read-only control completed and unloaded successfully. The subsequent
+same-value=1 probe faulted with SError 0xbe000000 on CPU2; the call trace
+includes init_module in neo_pmgr_admission and the EL1 error handler.
+Module SHA256 `ae38599065ee50123bc2eeb3ff0702e1f59385d3e70b7fd9738d11450d591027`,
+source 24e05b2a7. Capture: `dcp-netconsole/el1-capture.jsonl` and
+`el1-panic.txt`. No write-return marker reached the receiver. The failure
+therefore also occurs through kernel regmap with DCP fully awake, before
+any sleep handshake or lower power request. This rules out userspace-only
+access and a stopped-DCP prerequisite as sufficient explanations, but does
+not establish the underlying interconnect error cause. One DebugUSB reset
+returned Neo to #39, boot fdb9ad2b-2d95-4333-9c4f-0c315974c0fa.
