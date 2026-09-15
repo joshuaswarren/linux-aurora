@@ -5,6 +5,7 @@
  * Pins itself after adoption: remove the trial by reboot, not forced unload.
  */
 #include <linux/console.h>
+#include <crypto/sha2.h>
 #include <linux/firmware.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
@@ -15,12 +16,16 @@
 #include <linux/platform_device.h>
 #include <linux/regmap.h>
 #include <linux/sizes.h>
+#include <linux/vmalloc.h>
 #include <linux/soc/apple/rtkit.h>
 
 static bool sleep_enabled;
 module_param(sleep_enabled, bool, 0644);
 static bool stop_cpu;
 module_param(stop_cpu, bool, 0644);
+static bool ap_only;
+module_param(ap_only, bool, 0644);
+MODULE_PARM_DESC(ap_only, "Notify AP sleep only; keep IOP running, forbids CPU/clock stop");
 static unsigned int clock_depth;
 module_param(clock_depth, uint, 0644);
 MODULE_PARM_DESC(clock_depth, "0 retained firmware only; 1 CPU clocks, 2 plus FE, 3 plus SYS; requires stop_cpu");
@@ -46,6 +51,11 @@ struct neo_dcp {
 	u64 requested_iova;
 	size_t requested_size;
 	u32 mapped_buffers;
+	struct mutex log_lock;
+	void *log_copy;
+	size_t log_size;
+	atomic_t log_flushes;
+	u32 firmware_idle_mode;
 };
 static const unsigned int clock_offsets[] = { 0x10000, 0x318, 0x280 };
 
@@ -186,6 +196,65 @@ static void crashed(void *cookie, const void *log, size_t size)
 
 	atomic_set(&d->failed, 1);
 }
+
+/* Native RTBuddy::_handleFlushRequest copies the coalescer before replying
+ * with (message & 0xf0000000ffffffff) | (2ULL << 56). Retain a bounded raw
+ * snapshot rather than decode or print firmware format strings. This trial
+ * admits only coalescer zero and an in-range producer offset.
+ */
+static void oslog_message(void *cookie, u64 msg,
+			  const struct apple_rtkit_shmem *buffer)
+{
+	struct neo_dcp *d = cookie;
+	u64 producer = msg & GENMASK_ULL(35, 0);
+	u8 type = (msg >> 56) & 15;
+	int ret;
+
+	if (type == 3 || type == 4 || type == 5) {
+		dev_info(d->dev, "OSLOG source metadata %#llx\n", msg);
+		return;
+	}
+	if (type != 2 || (msg >> 60) || !buffer->buffer ||
+	    !buffer->size || buffer->size > SZ_1M || producer > buffer->size) {
+		atomic_set(&d->failed, 1);
+		dev_err(d->dev, "Unsupported OSLOG request %#llx size=%#zx\n",
+			msg, buffer->size);
+		return;
+	}
+	guard(mutex)(&d->log_lock);
+	if (!d->log_copy) {
+		d->log_copy = kvmalloc(buffer->size, GFP_KERNEL);
+		d->log_size = buffer->size;
+	}
+	if (!d->log_copy || d->log_size != buffer->size) {
+		atomic_set(&d->failed, 1);
+		return;
+	}
+	dma_rmb();
+	memcpy(d->log_copy, buffer->buffer, buffer->size);
+	ret = apple_rtkit_send_message(d->rtk, 8,
+		(msg & 0xf0000000ffffffffULL) | (2ULL << 56), NULL, false);
+	if (ret)
+		atomic_set(&d->failed, 1);
+	else
+		atomic_inc(&d->log_flushes);
+	dev_info(d->dev, "OSLOG flush copied=%#zx producer=%#llx reply=%d\n",
+		buffer->size, producer, ret);
+}
+
+static ssize_t oslog_snapshot_read(struct file *file, struct kobject *kobj,
+	const struct bin_attribute *attr, char *buf, loff_t off, size_t count)
+{
+	struct neo_dcp *d = dev_get_drvdata(kobj_to_dev(kobj));
+
+	guard(mutex)(&d->log_lock);
+	if (!d->log_copy || off >= d->log_size)
+		return 0;
+	count = min_t(size_t, count, d->log_size - off);
+	memcpy(buf, d->log_copy + off, count);
+	return count;
+}
+static BIN_ATTR_ADMIN_RO(oslog_snapshot, SZ_1M);
 static const struct apple_rtkit_ops ops = {
 	.shmem_setup = retained_shmem,
 	.shmem_destroy = retained_shmem_destroy,
@@ -236,10 +305,11 @@ static ssize_t status_show(struct device *dev, struct device_attribute *a, char 
 	if (d->clocks_touched)
 		return sysfs_emit(buf, "failed=%d clocks_touched=%u (no gated ASC read)\n",
 			atomic_read(&d->failed), d->clocks_touched);
-	return sysfs_emit(buf, "failed=%d touched=%u sleeps=%u wakes=%u control=%#x status=%#x requested_iova=%#llx requested_size=%#zx oslog_started=%u\n",
+	return sysfs_emit(buf, "failed=%d touched=%u sleeps=%u wakes=%u control=%#x status=%#x requested_iova=%#llx requested_size=%#zx oslog_started=%u log_flushes=%d firmware_idle_mode=%u\n",
 		atomic_read(&d->failed), d->touched, d->sleeps, d->wakes,
 		readl(d->control + 0x44), readl(d->control + 0x48),
-		d->requested_iova, d->requested_size, d->oslog_started);
+		d->requested_iova, d->requested_size, d->oslog_started,
+		atomic_read(&d->log_flushes), d->firmware_idle_mode);
 }
 static ssize_t start_oslog_store(struct device *dev, struct device_attribute *a,
 				const char *buf, size_t count)
@@ -272,19 +342,95 @@ static ssize_t wake_store(struct device *dev, struct device_attribute *a, const 
 	ret = wake_dcp(d);
 	return ret ? ret : count;
 }
+
+/* Exact J700 25F84 retained DATA page, located read-only in boot region 50.
+ * Its first 1 KiB and client version match the original Mach-O DATA page at
+ * VA 0x445d000. The native setter at 0x402fac0 is a single aligned store of
+ * 2 to 0x445d90c; state 8 then selects the returning idle path. No TEXT edit,
+ * CPU reset, page-table change or new firmware allocation is involved.
+ */
+static ssize_t returning_idle_store(struct device *dev,
+	struct device_attribute *a, const char *buf, size_t count)
+{
+	static const u8 expected_hash[SHA256_DIGEST_SIZE] = {
+		0x0a, 0x93, 0x75, 0x1f, 0x08, 0x99, 0x99, 0xa9,
+		0xb9, 0x41, 0x45, 0x98, 0x8a, 0x4e, 0x6a, 0x5b,
+		0x4e, 0x41, 0x68, 0xec, 0x40, 0xd5, 0xad, 0xcc,
+		0x71, 0x5d, 0xeb, 0xac, 0xa5, 0x4a, 0x58, 0x85,
+	};
+	static const char version[] = "AppleDCP-1041.120.7~1815-t8140dcp.RELEASE";
+	struct neo_dcp *d = dev_get_drvdata(dev);
+	u8 hash[SHA256_DIGEST_SIZE];
+	void *page;
+	u32 state;
+	int i, ret = -ESTALE;
+
+	if (!sysfs_streq(buf, "2"))
+		return -EINVAL;
+	guard(mutex)(&d->lock);
+	if (atomic_read(&d->failed) || d->touched || READ_ONCE(sleep_enabled) ||
+	    d->sleeps || d->wakes != 1 || d->firmware_idle_mode ||
+	    !d->oslog_started || !apple_rtkit_is_running(d->rtk))
+		return -EBUSY;
+	for (i = 0; i < ARRAY_SIZE(clock_offsets); i++) {
+		if (regmap_read(d->pmgr, clock_offsets[i], &state) ||
+		    (state & 0xff) != 0xff || (state & 0x80001c00))
+			return -EBUSY;
+	}
+	if (readl(d->control + 0x44) != BIT(4))
+		return -EBUSY;
+	page = memremap(0x101ea7e7000ULL, SZ_4K, MEMREMAP_WB);
+	if (!page)
+		return -ENOMEM;
+	sha256(page, 0x400, hash);
+	if (memcmp(hash, expected_hash, sizeof(hash)) ||
+	    memcmp(page + 0x87c, version, sizeof(version)) ||
+	    READ_ONCE(*(u32 *)(page + 0x90c)) != 1)
+		goto out;
+	if (atomic_read(&d->failed)) {
+		ret = -EIO;
+		goto out;
+	}
+	/* The management mutex excludes our PM requests; a fresh AP-ON ACK
+	 * above established the awake epoch. Match the firmware's own setter.
+	 */
+	WRITE_ONCE(*(u32 *)(page + 0x90c), 2);
+	dma_wmb();
+	if (READ_ONCE(*(u32 *)(page + 0x90c)) != 2) {
+		atomic_set(&d->failed, 1);
+		ret = -EIO;
+		goto out;
+	}
+	d->firmware_idle_mode = 2;
+	dev_info(dev, "DCP 25F84 retained DATA idle mode 1 -> 2; wake qualification required\n");
+	ret = 0;
+out:
+	memunmap(page);
+	return ret ? ret : count;
+}
 static DEVICE_ATTR_RO(status);
 static DEVICE_ATTR_WO(wake);
 static DEVICE_ATTR_WO(start_oslog);
+static DEVICE_ATTR_WO(returning_idle);
 static struct attribute *neo_dcp_attrs[] = {
-	&dev_attr_status.attr, &dev_attr_wake.attr, &dev_attr_start_oslog.attr, NULL
+	&dev_attr_status.attr, &dev_attr_wake.attr, &dev_attr_start_oslog.attr,
+	&dev_attr_returning_idle.attr, NULL
 };
-ATTRIBUTE_GROUPS(neo_dcp);
+static const struct bin_attribute *const neo_dcp_bin_attrs[] = {
+	&bin_attr_oslog_snapshot, NULL
+};
+static const struct attribute_group neo_dcp_group = {
+	.attrs = neo_dcp_attrs,
+	.bin_attrs = neo_dcp_bin_attrs,
+};
+__ATTRIBUTE_GROUPS(neo_dcp);
 
 static int dcp_suspend(struct device *dev)
 {
 	struct neo_dcp *d = dev_get_drvdata(dev);
 	unsigned int depth = READ_ONCE(clock_depth), i;
 	bool stop = READ_ONCE(stop_cpu);
+	bool ap = READ_ONCE(ap_only);
 	u32 value;
 	int ret;
 
@@ -297,7 +443,7 @@ static int dcp_suspend(struct device *dev)
 		return -EIO;
 	if (!d->oslog_started || !d->wakes)
 		return -EAGAIN;
-	if (depth > 3 || (depth && !stop))
+	if (depth > 3 || (depth && !stop) || (ap && (depth || stop)))
 		return -EINVAL;
 	for (i = 0; i < depth; i++) {
 		ret = regmap_read(d->pmgr, clock_offsets[i], &d->saved_clocks[i]);
@@ -309,8 +455,8 @@ static int dcp_suspend(struct device *dev)
 	if (!(d->saved_control & BIT(4)))
 		return -EBUSY;
 	d->touched = true;
-	ret = apple_rtkit_idle(d->rtk);
-	dev_info(dev, "DCP retained idle result=%d control=%#x status=%#x\n", ret,
+	ret = ap ? apple_rtkit_idle_ap(d->rtk) : apple_rtkit_idle(d->rtk);
+	dev_info(dev, "DCP retained idle ap_only=%u result=%d control=%#x status=%#x\n", ap, ret,
 		 readl(d->control + 0x44), readl(d->control + 0x48));
 	if (!ret && atomic_read(&d->failed))
 		ret = -EIO;
@@ -380,6 +526,7 @@ static int probe(struct platform_device *pdev)
 	d->dev = &pdev->dev;
 	d->pmgr = pmgr;
 	mutex_init(&d->lock);
+	mutex_init(&d->log_lock);
 	d->control = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(d->control))
 		return PTR_ERR(d->control);
@@ -392,6 +539,7 @@ static int probe(struct platform_device *pdev)
 	d->rtk = apple_rtkit_init_adopted(&pdev->dev, d, NULL, 0, &ops);
 	if (IS_ERR(d->rtk))
 		return PTR_ERR(d->rtk);
+	apple_rtkit_set_oslog_handler(d->rtk, oslog_message);
 	__module_get(THIS_MODULE);
 	adopted = pdev;
 	dev_info(d->dev, "Inherited DCP management transport adopted; module pinned until reboot\n");
