@@ -28,6 +28,11 @@ gate = load('gate-trial')
 PHY = Path('/sys/module/phy_apple_atc/parameters')
 CONTROL = Path('/sys/module/dwc3_apple/parameters/usb2_s2idle')
 USB = Path('/sys/bus/platform/devices/40a280000.usb')
+CLOCK = Path('/sys/module/pmgr_pwrstate/parameters')
+
+def clock_state():
+    return {k: (CLOCK / ('usb_clock_' + k)).read_text().strip()
+            for k in ('s2idle', 'pending', 'failed', 'offs', 'ons')}
 
 def counters():
     return {k: (PHY / k).read_text().strip() for k in
@@ -47,13 +52,20 @@ def main():
     ap.add_argument('--output', type=Path, required=True)
     ap.add_argument('--phy-off', action='store_true')
     ap.add_argument('--platform', action='store_true')
+    ap.add_argument('--clock-gate', action='store_true', help='also clock-gate the USB genpd leaf')
     ap.add_argument('--seconds', type=int, default=20)
     ap.add_argument('--scale', type=float)
     a = ap.parse_args()
+    if a.clock_gate and not a.phy_off:
+        ap.error('--clock-gate requires --phy-off')
     a.output.mkdir(parents=True, exist_ok=False)
     assert CONTROL.read_text().strip() == 'N', 'another USB trial is enabled'
     r = {'status': 'running', 'phy_off': a.phy_off, 'before': pm.snapshot(),
          'usb_before': inventory(), 'phy_before': counters(), 'wake_before': {}}
+    if a.clock_gate:
+        r['clock_before'] = clock_state()
+        assert r['clock_before']['s2idle'] == 'N'
+        assert r['clock_before']['pending'] == r['clock_before']['failed'] == 'N'
     assert r['usb_before'], 'USB inventory is empty'
     assert any(x['idVendor'] == '2109' for x in r['usb_before'].values()), 'internal VIA hub missing'
     assert r['phy_before']['usb2_sleep_failed'] == 'N'
@@ -77,6 +89,8 @@ def main():
             for w in r['wake_before']:
                 pm.write_control(w, 'disabled')
             pm.write_control(CONTROL, 'Y')
+        if a.clock_gate:
+            pm.write_control(CLOCK / 'usb_clock_s2idle', 'Y')
         cmd = [sys.executable, str(HERE / ('pm-test.py' if a.platform else 'sleep-smc.py'))]
         cmd += ['--stage', 'platform'] if a.platform else ['--seconds', str(a.seconds)]
         if a.scale and not a.platform:
@@ -88,6 +102,11 @@ def main():
         assert r['phy_after']['usb2_sleep_failed'] == 'N', 'PHY failure latched'
         for k in ('usb2_sleep_offs', 'usb2_sleep_ons'):
             assert int(r['phy_after'][k]) - int(r['phy_before'][k]) == int(a.phy_off), k + ' transition count mismatch'
+        if a.clock_gate:
+            r['clock_after'] = clock_state()
+            assert r['clock_after']['pending'] == r['clock_after']['failed'] == 'N'
+            for k in ('offs', 'ons'):
+                assert int(r['clock_after'][k]) - int(r['clock_before'][k]) == 1, 'USB clock ' + k + ' mismatch'
         deadline = time.monotonic() + 15
         while True:
             r['usb_after'] = inventory()
@@ -108,6 +127,8 @@ def main():
         r['error'] = repr(e)
         raise
     finally:
+        if a.clock_gate:
+            pm.write_control(CLOCK / 'usb_clock_s2idle', 'N')
         pm.write_control(CONTROL, 'N')
         for w, value in r['wake_before'].items():
             try:

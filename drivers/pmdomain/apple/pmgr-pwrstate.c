@@ -53,6 +53,8 @@ struct apple_pmgr_ps {
 	bool force_reset;
 	bool externally_clocked;
 	bool neo_nvme_phy;
+	bool neo_usb_leaf;
+	u32 usb_sleep_saved;
 };
 
 /*
@@ -78,6 +80,16 @@ MODULE_PARM_DESC(retain_s2idle, "Keep T8140 domains powered during s2idle qualif
 static bool nvme_phy_s2idle;
 module_param(nvme_phy_s2idle, bool, 0644);
 MODULE_PARM_DESC(nvme_phy_s2idle, "Allow only J700's NVMe PHY domain to gate during retained s2idle qualification");
+
+/* Clock-gate only the USB leaf after all genpd consumers have suspended. */
+static bool usb_clock_s2idle, usb_clock_pending, usb_clock_failed;
+static unsigned int usb_clock_offs, usb_clock_ons;
+module_param(usb_clock_s2idle, bool, 0644);
+module_param(usb_clock_pending, bool, 0444);
+module_param(usb_clock_failed, bool, 0444);
+module_param(usb_clock_offs, uint, 0444);
+module_param(usb_clock_ons, uint, 0444);
+MODULE_PARM_DESC(usb_clock_s2idle, "J700 USB leaf clock gating during retained s2idle qualification");
 
 #define APPLE_PMGR_T8140_DISP_SYS       BIT(0)
 #define APPLE_PMGR_T8140_DISPEXT0_SYS   BIT(1)
@@ -602,8 +614,84 @@ static void apple_pmgr_log_t8140_nvme_probe_state(struct apple_pmgr_ps *ps)
 		 !!(reg & APPLE_PMGR_WAS_PWRGATED));
 }
 
+static int apple_pmgr_usb_restore(struct apple_pmgr_ps *ps)
+{
+	u32 val;
+	int ret;
+
+	/* Reach ACTIVE before restoring the original automatic policy. */
+	ret = regmap_update_bits(ps->regmap, ps->offset,
+		APPLE_PMGR_PS_TARGET | APPLE_PMGR_AUTO_ENABLE | APPLE_PMGR_FLAGS,
+		APPLE_PMGR_PS_ACTIVE);
+	if (!ret)
+		ret = regmap_read_poll_timeout_atomic(ps->regmap, ps->offset, val,
+			FIELD_GET(APPLE_PMGR_PS_ACTUAL, val) == APPLE_PMGR_PS_ACTIVE,
+			1, APPLE_PMGR_PS_SET_TIMEOUT);
+	if (!ret)
+		ret = regmap_update_bits(ps->regmap, ps->offset,
+			APPLE_PMGR_AUTO_ENABLE | APPLE_PMGR_FLAGS,
+			ps->usb_sleep_saved & APPLE_PMGR_AUTO_ENABLE);
+	if (!ret)
+		ret = regmap_read(ps->regmap, ps->offset, &val);
+	if (!ret && ((val ^ ps->usb_sleep_saved) &
+		     (APPLE_PMGR_PS_TARGET | APPLE_PMGR_AUTO_ENABLE)))
+		ret = -EIO;
+	if (ret)
+		usb_clock_failed = true;
+	else
+		usb_clock_pending = false;
+	dev_info(ps->dev, "J700 USB clock restore result=%d\n", ret);
+	return ret;
+}
+
+static int apple_pmgr_usb_clock_off(struct apple_pmgr_ps *ps)
+{
+	u32 val;
+	int ret;
+
+	if (usb_clock_pending || usb_clock_failed)
+		return -EBUSY;
+	ret = regmap_read(ps->regmap, ps->offset, &val);
+	if (ret)
+		return ret;
+	if ((val & (APPLE_PMGR_RESET | APPLE_PMGR_PS_RESET |
+		    APPLE_PMGR_DEV_DISABLE | APPLE_PMGR_BUSY)) ||
+	    FIELD_GET(APPLE_PMGR_PS_TARGET, val) != APPLE_PMGR_PS_ACTIVE ||
+	    FIELD_GET(APPLE_PMGR_PS_ACTUAL, val) != APPLE_PMGR_PS_ACTIVE ||
+	    FIELD_GET(APPLE_PMGR_PS_MIN, val) > APPLE_PMGR_PS_CLKGATE)
+		return -EBUSY;
+	ps->usb_sleep_saved = val;
+	usb_clock_pending = true;
+	ret = regmap_update_bits(ps->regmap, ps->offset,
+		APPLE_PMGR_PS_TARGET | APPLE_PMGR_AUTO_ENABLE | APPLE_PMGR_FLAGS,
+		APPLE_PMGR_PS_CLKGATE);
+	if (!ret)
+		ret = regmap_read_poll_timeout_atomic(ps->regmap, ps->offset, val,
+			FIELD_GET(APPLE_PMGR_PS_ACTUAL, val) == APPLE_PMGR_PS_CLKGATE,
+			1, APPLE_PMGR_PS_SET_TIMEOUT);
+	dev_info(ps->dev, "J700 USB clock gate result=%d word=%#x\n", ret, val);
+	if (ret) {
+		/* genpd will not call power_on if power_off failed. */
+		usb_clock_failed = true;
+		apple_pmgr_usb_restore(ps);
+	} else {
+		usb_clock_offs++;
+	}
+	return ret;
+}
+
 static int apple_pmgr_ps_power_on(struct generic_pm_domain *genpd)
 {
+	struct apple_pmgr_ps *ps = genpd_to_apple_pmgr_ps(genpd);
+
+	if (ps->neo_usb_leaf && usb_clock_pending) {
+		int ret = apple_pmgr_usb_restore(ps);
+
+		if (!ret)
+			usb_clock_ons++;
+		return ret;
+	}
+
 	return apple_pmgr_ps_set(genpd, APPLE_PMGR_PS_ACTIVE, true);
 }
 
@@ -614,6 +702,9 @@ static int apple_pmgr_ps_power_off(struct generic_pm_domain *genpd)
 
 	if (READ_ONCE(retain_s2idle) && pm_suspend_target_state == PM_SUSPEND_TO_IDLE &&
 	    of_device_is_compatible(ps->dev->of_node, "apple,t8140-pmgr-pwrstate")) {
+		if (ps->neo_usb_leaf && READ_ONCE(usb_clock_s2idle))
+			return apple_pmgr_usb_clock_off(ps);
+
 		/*
 		 * ANS already drains NVMe, shuts down RTKit and stops its CPU in
 		 * the normal device suspend callback. Qualify only its PHY leaf;
@@ -761,6 +852,12 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	ps->neo_nvme_phy = of_machine_is_compatible("apple,j700") &&
 		of_device_is_compatible(node, "apple,t8140-pmgr-pwrstate") &&
 		ps->offset == 0x3c0 &&
+		!of_address_to_resource(node->parent, 0, &parent) &&
+		parent.start == 0x300700000ULL;
+
+	ps->neo_usb_leaf = of_machine_is_compatible("apple,j700") &&
+		of_device_is_compatible(node, "apple,t8140-pmgr-pwrstate") &&
+		ps->offset == 0x3f0 &&
 		!of_address_to_resource(node->parent, 0, &parent) &&
 		parent.start == 0x300700000ULL;
 

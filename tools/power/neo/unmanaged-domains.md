@@ -121,7 +121,81 @@ cycle. Do not operate the userspace gate helper on those domains while this
 hook is enabled. Its parameters expose pending/failed and cycle counters;
 PM snapshots and health validation check unresolved transitions.
 
-The module builds against #40; hardware qualification is pending. This is a
+The module built against #40 and passed a platform-stage cycle plus three
+10s RTC cycles on boot 9e018be2-2a9d-4f7a-b66a-6e91b2be4e60. Both counters
+reached 4, failed=N and pending=0; the hook was disabled after qualification. This is a
 board-specific experimental sidecar, not a replacement for eventual consumer
 drivers and genpd ownership. A failed restoration requires recovery rather
 than treating a module unload or successful PM write as a healthy machine.
+
+
+## Media confirmation and further screens
+
+A 120s ABBA on that same #40 boot, using fresh 60s awake calibration
+(scale 3.602878925772093 raw/uAh), measured transition-inclusive battery-counter
+means 0.803990 W baseline and 0.787860 W with PRORES+MSR gated. The paired
+savings were 0.00387 and 0.02839 W: noisy, but consistent in direction with
+first post-wake SMC savings around 13–15 mW. These runs used the userspace gate;
+the sleep-only hook has separate restoration qualification above. Neither
+measurement establishes <0.7 W. Captures: domain-gate-review/confirm-media/.
+
+UART1–3 and SPI0–2 restored correctly in separate 20s screens. First post-wake
+PSTR was 0.772576 and 0.768586 W respectively, with no resolved large sleep
+saving. Do not claim awake activity fluctuations as their power saving.
+
+## USB2 PHY sleep candidate
+
+Kernel #41 adds an opt-in dwc3_apple.usb2_s2idle path for the fixed USB2 host
+with multiple Type-C inputs. USB wake on the wrapper and xHCI child must be
+disabled for this RTC-only test. After xHCI suspends, the wrapper requests PHY
+power-off using the existing ATC USB2 isolation/SIDDQ/reset sequence. Resume
+restores the PHY, tunables and saved DWC3 USB2 configuration before xHCI.
+DWC3 context, dummy PIPE and power domains remain retained. Defaults are off;
+no normal boot policy changes. PHY readbacks and off/on counters distinguish
+actual transitions from a shared generic-PHY reference suppressing callbacks.
+Build passed; hardware and power qualification are pending. Captures belong
+in a fresh usb2-sleep/ stage, with internal VIA hub enumeration checked as well
+as RTC, all CPU entries, storage, Wi-Fi, panel and PM failure counters.
+
+
+#41 USB2 qualification completed with a platform-stage cycle, three 10s
+RTC wakes, and a 20s baseline/isolation/baseline sequence. All restoration,
+USB configuration, storage, network and PM checks passed. First PSTR was
+0.769923 / 0.766150 / 0.762377 W: isolation matches the mean of the bracketing
+baselines, with no resolved saving. Thus no long battery confirmation was
+warranted for PHY isolation alone. Defaults remain off. Early 10s samples
+were higher and the SMC rails varied independently; these screening reads
+must not be treated as a synchronous exhaustive rail budget.
+
+The next candidate adds pmgr_pwrstate.usb_clock_s2idle, default N. It allows
+only the J700 Main PMGR USB leaf at 0x3f0 to request actual CLKGATE (4) once
+genpd has suspended all consumers. Power/context and the two parent domains
+remain retained. Readbacks and original AUTO restoration are checked;
+failed power-off rolls back immediately because genpd will not call power-on
+for an unsuccessful off request. The harness combines it with PHY isolation,
+requires one clock-off/on pair, and rejects a latched failure/pending state.
+Hardware qualification is pending.
+
+
+#42 hardware qualification completed on boot
+741494a7-deaf-443b-a85a-bf463fd290ef. The platform trial read leaf word 0x244
+(actual4, target4), restored ACTIVE, and restored the USB PHY before xHCI.
+Three 10s RTC wakes and 20s baseline/clock/baseline screens also passed.
+PHY and clock counters both ended 5/5, failed=N and clock pending=N. All
+seven trials passed USB enumeration/configuration, storage, associated Wi-Fi
+with gateway response, restored panel and unchanged PM failure counters.
+Captures and filtered kernel excerpts are in usb-clock/.
+
+The 20s first-post-wake PSTR values were 0.768292 / 0.760760 / 0.764526 W.
+Compared with the bracket mean 0.766409 W, the apparent saving is 5.65 mW;
+this remains a screening lead, not a battery-counter-confirmed saving or a
+result below 0.7 W. No long confirmation was run for this small difference.
+The switches were restored to N after the tests. Normal #6 remains the GRUB
+default; the experimental slot now contains #42. Battery 23%, Discharging
+at completion. No trial is left running.
+
+One remaining driver gap is drivers/dma/apple-sio.c:sio_suspend: it contains
+only a TODO and returns0. Neo has no SIO node in the current Linux DTS.
+The saved ADT describes /arm-io/sio as iop,ascwrap-v6 with DMA shims and a
+virtual SIO gate. This is a lead for firmware/ownership research, not evidence
+of how many watts it uses, nor authorization to gate its CPU domain blindly.
