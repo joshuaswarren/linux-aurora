@@ -93,6 +93,38 @@ def check_firmware_health(capture):
                 raise RuntimeError('DCP firmware transition has not been restored')
 
 
+SUSPEND_STATS = '/sys/power/suspend_stats/'
+SUSPEND_FAILURE_COUNTERS = ('fail', 'failed_freeze', 'failed_prepare', 'failed_suspend',
+                            'failed_suspend_late', 'failed_suspend_noirq', 'failed_resume',
+                            'failed_resume_early', 'failed_resume_noirq')
+
+
+def check_suspend_stats(before, after):
+    # A returned write to /sys/power/state only means the kernel's suspend
+    # loop completed; a device that failed to resume still increments these.
+    summary = {'deltas': {}, 'last_failed': {}}
+    for name in SUSPEND_FAILURE_COUNTERS:
+        path = SUSPEND_STATS + name
+        values = [capture['files'].get(path) for capture in (before, after)]
+        if values == [None, None]:
+            continue
+        for value in values:
+            if not isinstance(value, str):
+                raise RuntimeError(f'{path} is unreadable or missing on one side: {value!r}')
+        summary['deltas'][name] = int(values[1]) - int(values[0])
+    for name in ('last_failed_dev', 'last_failed_errno', 'last_failed_step'):
+        summary['last_failed'][name] = after['files'].get(SUSPEND_STATS + name)
+    increased = {name: delta for name, delta in summary['deltas'].items() if delta > 0}
+    if increased:
+        details = ', '.join(f'{name} +{delta}' for name, delta in increased.items())
+        raise RuntimeError(f'suspend_stats recorded a failure ({details}); '
+                           f'last_failed_dev={summary["last_failed"]["last_failed_dev"]!r} '
+                           f'last_failed_errno={summary["last_failed"]["last_failed_errno"]!r} '
+                           f'last_failed_step={summary["last_failed"]["last_failed_step"]!r}; '
+                           'a returned PM write is not a successful resume')
+    return summary
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--stage', required=True, choices=('freezer', 'devices', 'platform'))
@@ -148,6 +180,10 @@ def main():
             check_firmware_health(result['after'])
         except RuntimeError as error:
             result.update(status='error', firmware_error=str(error))
+        try:
+            result['suspend_stats_check'] = check_suspend_stats(result['before'], result['after'])
+        except RuntimeError as error:
+            result.update(status='error', suspend_stats_error=str(error))
         save()
     print(json.dumps({k: v for k, v in result.items() if k not in ('before', 'after')}))
     return 0 if result['status'] == 'returned' else 1
