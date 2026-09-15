@@ -78,6 +78,7 @@ def snapshot():
                     "/sys/module/neo_media_sleep/parameters/*",
                     "/sys/module/phy_apple_atc/parameters/usb2_sleep*",
                     "/sys/module/dwc3_apple/parameters/usb2_s2idle",
+                    "/sys/module/pmgr_pwrstate/parameters/usb_clock_*",
                     "/sys/module/mt7932_fullmac/parameters/*",
                     "/sys/bus/platform/devices/macsmc-input/power/wakeup"):
         paths.extend(str(p) for p in Path('/').glob(pattern.lstrip('/')) if p.is_file())
@@ -89,6 +90,9 @@ def snapshot():
 
 
 def check_firmware_health(capture):
+    clock = '/sys/module/pmgr_pwrstate/parameters/usb_clock_'
+    if any(capture['files'].get(clock + k, 'N') != 'N' for k in ('failed', 'pending')):
+        raise RuntimeError('USB clock transition failed or was not restored')
     phy = '/sys/module/phy_apple_atc/parameters/'
     if capture['files'].get(phy + 'usb2_sleep_failed', 'N') != 'N':
         raise RuntimeError('USB2 PHY sleep failure is latched')
