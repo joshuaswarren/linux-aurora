@@ -439,3 +439,22 @@ The first awake diagnostic rejected the additional dockchannel console before
 any PM operation (EBUSY, sleeps=0, failed=0). Its console admission now handles
 that retained static boot console as well as tty0; all other active consoles
 remain rejected. Capture: `dcp-awake-trace/`.
+
+The second awake diagnostic retained its failure boundary across reset:
+`dcp-awake-trace-v2/live-kmsg.log`. AP/IOP IDLE, management idle-gated,
+transport pause, ASC idle and RUN stop all completed. The last synced marker
+is `clock-off write`; `clock-off poll` was never captured. This localizes the
+failure to the first gate write or its immediate aftermath, not an RTC wake
+or a later gated-register poll. It does not prove which hardware dependency
+caused it. The probe's ordinary result.json did not survive reset; the
+collector's O_DSYNC log and cycle.json did. Future probe snapshots also need
+explicit synchronization.
+
+Native ApplePMGR::_setPSLevel (0xfffffe000944b264), at 0xfffffe000944b588,
+clears AUTO while retaining target ACTIVE, polls actual ACTIVE, and only then
+writes the lower target. The observed DISP_CPU value was 0x1f0000ff; our old
+write combined AUTO removal and target 4. The diagnostic now separates those
+steps and logs exact register values before writes. It preserves the existing
+BUSY/status-write exclusions. Qualification is pending; this is a sequencing
+correction, not a claimed cure or a measured saving. Native retention-table
+handling and the J700 retention-workaround property still need further study.

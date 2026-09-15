@@ -84,7 +84,31 @@ static int set_clock(struct neo_dcp *d, unsigned int i, bool on)
 
 	if (ret)
 		return ret;
+	/* ApplePMGR::_setPSLevel first disables AUTO at target ACTIVE and
+	 * waits for actual ACTIVE, before requesting a lower manual state.
+	 * Combining the ownership change and clock drop in one write hung
+	 * J700's DISP_CPU trial. Keep BUSY and sticky status out of writes.
+	 */
+	if (!on && (value & BIT(28))) {
+		if ((value & 15) != 15 || (value & (BIT(31) | BIT(12) |
+						       BIT(11) | BIT(10))))
+			return -EBUSY;
+		value &= ~(BIT(28) | BIT(11) | BIT(9) | BIT(8));
+		dev_info(d->dev, "DCP manual ACTIVE offset=%#x write=%#x\n",
+			 clock_offsets[i], value);
+		trace_step(d, "disable AUTO at ACTIVE write");
+		ret = regmap_write(d->pmgr, clock_offsets[i], value);
+		trace_step(d, "disable AUTO at ACTIVE poll");
+		if (!ret)
+			ret = regmap_read_poll_timeout(d->pmgr, clock_offsets[i], value,
+				(value & 0xff) == 0xff && !(value & (BIT(28) | BIT(11))),
+				10, 10000);
+		if (ret)
+			return ret;
+	}
 	value &= ~(15 | BIT(28) | BIT(11) | BIT(9) | BIT(8));
+	dev_info(d->dev, "DCP manual target offset=%#x write=%#x\n",
+		 clock_offsets[i], value | target);
 	trace_step(d, on ? "clock-on write" : "clock-off write");
 	ret = regmap_write(d->pmgr, clock_offsets[i], value | target);
 	trace_step(d, on ? "clock-on poll" : "clock-off poll");
