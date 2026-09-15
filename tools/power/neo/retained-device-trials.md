@@ -701,3 +701,29 @@ order, following a fresh 60-second awake counter calibration. These measurements
 use the inherited DCP without adoption; they differ from the earlier adopted
 DCP AP-only comparison. No power-saving result is claimed until the paired
 measurements finish.
+
+
+The inherited-DCP force-wake ABBA completed on boot
+50a2e9df-9eb8-474f-818d-62c1e0a7a23c: reference 1.880853 W, released
+1.897226 W, released 1.912909 W, reference 1.736051 W. Elapsed intervals
+were 120.7–121.3 seconds; all six CPUs entered s2idle, RTC wake and panel
+restoration passed, and the force control restored after both enabled trials.
+Raw-counter calibration was 3.637474 units/uAh. This shows no saving from
+releasing the assertion alone. The elevated, drifting reference differs from
+the earlier adopted-DCP experiment; it cannot establish a regression or a
+new power floor. Raw results and complete logs are in `dcp-force-idle/`.
+
+## Isolated NVMe PHY gating candidate
+
+The blanket retained-s2idle veto keeps `apcie_phy_sw` powered even after
+apple_nvme_suspend has drained the controller, shut down RTKit and stopped
+ANS's CPU. The J700 DT gives NVMe ownership of this otherwise unreferenced
+PHY to keep the NAND link out of L1_IDLE while storage is active.
+
+A default-off `pmgr_pwrstate.nvme_phy_s2idle` exception allows just this leaf
+through the normal provider power-off path. It matches J700, T8140 PMGR,
+physical base 0x300700000 and offset 0x3c0. Parents and unrelated domains
+retain their existing veto. Consumer ordering remains under genpd, and
+normal power-on precedes NVMe resume. Build #40 passed; hardware qualification
+must first check a platform cycle, timed wake, and durable root-storage I/O.
+No power saving or successful PHY transition is claimed yet.
