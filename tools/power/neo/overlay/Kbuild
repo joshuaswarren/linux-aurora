@@ -10,3 +10,4 @@ obj-m += neo-pmgr-snapshot.o
 obj-m += neo-dcp-retained.o
 obj-m += neo-netconsole-prep.o
 obj-m += neo-pmgr-admission.o
+obj-m += neo-dcp-force-wake.o
