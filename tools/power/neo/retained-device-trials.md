@@ -552,3 +552,23 @@ Qualify packets while awake first. Enabling NETPOLL changes network structure
 layouts: rebuild affected modules and preload matching modules from the
 experimental initramfs, preserving the normal boot's module files. Keep
 network console diagnostics separate from Wi-Fi-off sleep power measurements.
+
+Build #39 Image SHA256
+`b57dfc74122a3dcd0b7b4b5b11d3ddbc614299a3a8c3dd4c32c1fbd3f9c5a6b5`
+boots with matching netfilter modules preloaded from an isolated initramfs.
+The normal module tree and known-good asahi.ko are unchanged. The first
+network-console admission received no kernel packets despite zero reported
+transmit errors. A retained dockchannel boot console prevented NBCON threads
+from starting. Removing keep_bootcon alone was insufficient because the
+preferred ttySAC0 console never registered. The guarded one-shot
+`neo-netconsole-prep` helper detaches the static dockchannel boot console only
+after VT and extended network console are enabled. It changes no hardware
+power state and lasts until reboot. Future capture boots should omit both
+the unavailable serial console and earlycon settings.
+
+After detaching the boot console, Fedora received all 20 numbered markers,
+with no missing IDs, and the network console reported zero transmit errors.
+`dcp-netconsole/awake-capture.jsonl` retains this admission. Source Neo
+10.129.154.39, receiver Fedora 10.129.154.47:6666, boot
+39eb27dd-429b-46aa-8b77-be8ef1e59e37. Awake delivery is qualified; panic-time
+delivery and the next unchanged-value PMGR probe remain unqualified.
