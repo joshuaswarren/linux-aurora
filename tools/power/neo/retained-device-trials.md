@@ -522,9 +522,33 @@ do not treat either mode as safe production power management.
 Neither /sys/fs/pstore nor the systemd archive contained a fault report.
 The next diagnostic build applies `crash-capture.config` and boots with
 `reserve_mem=2M:16384:neo_crash ramoops.mem_name=neo_crash`
-`ramoops.record_size=1048576 ramoops.console_size=1048576`. This explicitly
+`ramoops.record_size=1048576 ramoops.console_size=1048576`
+`ramoops.ftrace_size=0 ramoops.pmsg_size=0`. This explicitly
 reserves RAM before allocation, rather than borrowing firmware or allocated
 memory. Keep the same kernel and command line on capture and recovery boots,
 check the recorded physical address, and qualify persistence across reset
 before relying on it. Firmware may erase RAM during reboot; configuration
 alone does not prove that crash logs will survive.
+
+Build #38 booted successfully, but its first ramoops probe rejected the
+allocation: the default ftrace/pmsg areas consumed 8 KiB, leaving less than
+one complete 1 MiB dmesg record. The explicit zero sizes above correct that
+configuration. Do not mistake successful kernel boot for active crash capture.
+
+Ramoops registered successfully after that correction, but a unique console
+marker did not survive an ordinary reboot at physical address 0x101e6744000.
+A second qualification used `reserve_mem=2M:512M:neo_crash` to place the
+2 MiB reservation at 0x101e0000000, farther below the boot payload area. It
+also lost its marker. In both pairs the same Image, notes hash and reserved
+physical address were verified. Captures are in `dcp-write-crash/`; the first
+pair has an `unaligned-` prefix. This boot path has no qualified retained-RAM
+logger. No additional fatal PMGR probe was run using this failed capture path.
+
+The alternative is native netconsole with a separate Fedora receiver. The
+MT7932 transmit routine publishes preallocated descriptors directly rather
+than deferring submission to a worker; this makes an awake crash capture
+plausible, but does not guarantee panic-time delivery or netpoll support.
+Qualify packets while awake first. Enabling NETPOLL changes network structure
+layouts: rebuild affected modules and preload matching modules from the
+experimental initramfs, preserving the normal boot's module files. Keep
+network console diagnostics separate from Wi-Fi-off sleep power measurements.
