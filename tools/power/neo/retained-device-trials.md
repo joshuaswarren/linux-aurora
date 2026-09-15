@@ -369,3 +369,20 @@ failed sleep/wake qualification of mode 2. Crash SHA256
 awake-adoption writes with -EALREADY. PM wake after a touched IDLE transition
 continues to use a fresh AP acknowledgement. Reboot is required after this
 assertion; no in-place recovery is claimed.
+
+
+The corrected mode-2 probe passed awake admission and the duplicate-wake
+guard. Full IOP IDLE still timed out on AP wake at the platform stage
+(`dcp-returning-mode-v2/`). A separate read-only uncached capture confirmed
+the DATA word retained 2 and the context's current/target states were 8.
+Thus the mode switch alone is insufficient; CPU restart/domain sequencing
+remains to be qualified. No real sleep or wattage was measured.
+
+A subsequent register diagnostic lost connectivity. Inspection found it used
+byte accesses in the ASC register window; it had reused a RAM-dump loop.
+Output was buffered, so the exact failing read was not retained. Do not infer
+that mode 2 or a particular register caused the hang. The helper was corrected
+to aligned 32-bit reads with unbuffered output; no repeat is scheduled. One
+DebugUSB reset returned Neo to normal #6, followed by a one-shot #35 reboot.
+The next bounded trial adds ASC RUN stop/start to returning-mode idle, leaving
+all display clocks active.
